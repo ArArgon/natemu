@@ -1,0 +1,91 @@
+=== Raw run outputs captured 2026-08-08 ===
+=== G-1 Hypervisor.framework guest EL1 probe ===
+Host: macOS 26.5.2, SDK Hypervisor 259.5.15, hw.pagesize=16384
+
+--- SDK header / IPA granule config ---
+hv_vm_config_get_default_ipa_granule symbol: FOUND (macOS 26+)
+hv_vm_config_set_ipa_granule symbol: FOUND
+ hv_vm_config_get_default_ipa_granule() -> 0x1 ret=0x0
+   default granule = HV_IPA_GRANULE_16KB (1)
+ hv_vm_config_get_max_ipa_size -> 40 bits ret=0x0
+ hv_vm_config_get_default_ipa_size -> 36 bits ret=0x0
+  new config default granule -> 1 ret=0x0
+  set 4K granule -> ret=0x0 OK
+   verify -> 0 ret=0x0
+  set 16K granule -> ret=0x0 OK
+  hv_vm_create with 4K granule -> ret=0x0 OK
+
+--- Host ACTLR_EL1 path ---
+hv_vm_create(NULL) -> 0x0 HV_SUCCESS
+hv_vcpu_create -> 0x0
+ get ACTLR_EL1 -> r=0x0 val=0x0 (EnTSO=0)
+ set ACTLR_EL1=2 -> r=0x0 OK
+ re-get -> r=0x0 val=0x2 (EnTSO=1)
+ set ACTLR_EL1=0xffffffff -> r=0xfae94003 HV_BAD_ARGUMENT as expected (expected HV_BAD_ARGUMENT 0xfae94003)
+ re-get after bad -> val=0x2
+ reset to 0 -> val=0x0
+
+--- Guest EL1 self-service path ---
+ mmap host_mem=0x100e40000 size=16384 pagesz=16384
+ hv_vm_map -> 0x0
+ guest code 15 insns at IPA 0x400000
+  [0] 0xd5380700
+  [1] 0xd5380721
+  [2] 0xd5381022
+  [3] 0xd2800043
+  [4] 0xd5181023
+  [5] 0xd5033fdf
+  [6] 0xd5381023
+  [7] 0xd53900e4
+  [8] 0xd5380005
+  [9] 0xd53800a6
+  [10] 0xd2800007
+  [11] 0xd5181027
+  [12] 0xd5033fdf
+  [13] 0xd5381027
+  [14] 0xd4000002
+ Running guest at EL1...
+ hv_vcpu_run -> 0x0
+ exit reason=1 syndrome=0x5a000000 FAR=0x0 IPA=0x0
+  EC=0x16 (HVC) ISS=0x0
+  GUEST RAN OK (no trap on ACTLR/AIDR, reached HVC)
+  X0 = 0x000010000f100002
+  X1 = 0x0000000011212000
+  X2 = 0x0000000000000000
+  X3 = 0x0000000000000002
+  X4 = 0x000000006afd5797
+  X5 = 0x00000000610f0000
+  X6 = 0x0000000080000000
+  X7 = 0x0000000000000000
+  PC=0x40003c CPSR=0x3c5
+
+--- Decode ---
+  ID_AA64MMFR0_EL1 = 0x000010000f100002
+    TGran4  [31:28] = 0x0 (SUPPORTED (4K granule supported))
+    TGran64 [27:24] = 0xf (NOT SUPPORTED)
+    TGran16 [23:20] = 0x1 (NOT SUPPORTED)
+    PARange [3:0]   = 0x2 (32 bits, 0 GB)
+  ID_AA64MMFR1_EL1 = 0x0000000011212000 (X1)
+  ACTLR_EL1 before guest write (X2) = 0x0 EnTSO=0
+  ACTLR_EL1 after guest msr 2 (X3) = 0x2 EnTSO=1 PASS guest self-service works
+  AIDR_EL1 (X4) = 0x000000006afd5797 bit9 TSO-capable=1
+  MIDR_EL1 (X5) = 0x00000000610f0000 implementer=0x61 part=0x0
+  MPIDR_EL1 (X6)= 0x0000000080000000
+  ACTLR_EL1 after guest clear (X7)= 0x0 EnTSO=0
+  host hv_vcpu_get_sys_reg(ACTLR_EL1) after guest = 0x0 (should match X7)
+
+--- Coherence: host set -> guest read ---
+ hv_vcpu_run -> 0x0 reason 1 EC 0x16
+ guest read ACTLR after host set 2 -> X0=0x2 PASS coherent
+
+=== Probe complete ===
+--- granule2 ---
+=== granule 4K isolated map test ===
+create 4K vm 0
+m 0x1025d0000
+map 4K at 0x0 size 4096 -> 0x0 OK
+map with host VA +4096 (misaligned 4K but not 16K) -> 0x0 OK (4K host granularity)
+
+=== granule 16K map test (default) ===
+create 16K vm 0
+map 4K at 0x0 size 4096 in 16K VM -> 0xfae94003 BAD_ARGUMENT as expected (expected BAD_ARGUMENT)

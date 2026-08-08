@@ -1,5 +1,17 @@
 # 07 — Para-virtualization Design Space for Cross-ISA System Emulation
 
+> **RETRACTION NOTICE (2026-08-08).** This document's headline claim — *"Apple Silicon does not
+> implement the 4 KiB translation granule"*, inferred from `hw.pagesize = 16384` — is **false**. Host
+> OS page size does not determine which translation granules the architecture implements. Guest EL1
+> demonstrably runs a 4 KB-granule stage-1 regime, and `HV_IPA_GRANULE_4KB` enforces 4 KB stage-2
+> permissions; see `14-gate-results-verified.md`.
+>
+> Everything downstream of that premise is therefore void, in particular **§3.1 and §6.4's
+> `natemu-page-quads` recommendation** ("the one PV feature worth building"): with 4 KB available at
+> both stages, each guest PTE maps 1:1 to a shadow PTE and the `n:m` degraded path it existed to
+> avoid does not arise. The rest of the document — the analysis of classical PV being near-worthless
+> to a DBT, the Xen/KVM/Hyper-V survey, and the three-tier scope model — is unaffected.
+
 **Question:** the project premise is *"para-virtualization to reduce hardware emulation overheads"* for an
 x86-64 guest on an ARM64 (Apple Silicon) host. Para-virtualization means **the guest is modified**. That
 single word forecloses a large part of the product space. This document works out (a) what scope

@@ -1,5 +1,22 @@
 # 12 — Performance Concerns Ranked + Tracking
 
+> **CORRECTIONS (2026-08-08), see `13-audit-skeptical-review.md` and `14-gate-results-verified.md`:**
+> - **Rank 6 (PTE-quad homogeneity) is void.** 4 KB granule is available and enforced at both
+>   translation stages, so the "15-35% of the MMU win lost" penalty does not apply and
+>   `natemu-page-quads` is not needed.
+> - **Rank 2 (TSO) is upgraded to behavioural evidence**: MP litmus gave 1,706,240 reordering
+>   outcomes at `EnTSO=0` and 0 at `EnTSO=1`. The *cost* of running with TSO on remains unmeasured.
+> - **Rank 8 (A/D + TLB reach) is under-ranked.** `HAFDBS = 0` is now the only remaining
+>   hardware-assist gap in the MMU path. Also newly known: only **256 ASIDs** vs x86's 4096 PCIDs
+>   (`09` N-11), which is not costed anywhere in this table.
+> - **The "Net: Tier 2 2.5-5x" line double-counts.** Captive's 2.21x is already end-to-end (its JIT
+>   *and* its host-MMU offload); multiplying it by a separately-sourced codegen factor is not sound,
+>   and the multiplicands come from different guests, hosts and QEMU vintages. Replace with a single
+>   end-to-end comparison against a QEMU TCG baseline we measure ourselves.
+> - **Rank 1's `1.74x` softMMU microbenchmark is a lower bound on softmmu cost, not an estimate of
+>   it** — a hot fully-predicted loop omits I-cache bloat, slow-path mispredicts and register
+>   pressure. Its agreement with HSPT's 1.51x is coincidence, not corroboration.
+
 **Date:** 2026-08-08 · **Host:** M2 Max/Pro, macOS 26.5.2, HV 259.5.15, `hw.pagesize 16384`
 **Source:** live probes dispatched 2026-08-08 (multi-agent), artifacts in `/tmp/probe_mmu_tso.c`, `/tmp/probe_dram2.c`, `/tmp/hv_g1_probe/run.log`, `tools/g2_quad_measure.py`
 

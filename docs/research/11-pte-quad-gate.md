@@ -1,5 +1,18 @@
 # G-2 Gate: PTE-Quad Homogeneity — Measurement, Estimate & Go/No-Go
 
+> **SUPERSEDED (2026-08-08).** This gate is **moot**. Its stated premise (§1, first bullet) is that
+> 1:1 shadow paging needs 4 KB stage-1 *"but stage-2 `hv_vm_map` and host `mmap` default to 16K"*.
+> 16 KB is the **default**, not the only option: `HV_IPA_GRANULE_4KB` is selectable on macOS 26+ and
+> was measured **enforcing** 4 KB permissions between two adjacent 4 KB IPAs inside a single 16 KB
+> host page (`14-gate-results-verified.md` §G-1c). With 4 KB at both stages, PTE-quad homogeneity
+> `H` no longer gates anything and `natemu-page-quads` has no problem to solve.
+>
+> Additionally, the `H = 55-87%` figures below are **model output, not measurement** — produced by
+> `tools/g2_quad_measure.py --synthetic` with parameters chosen by the same author, and swinging 4x
+> (55% vs 14%) on the loose-vs-strict metric choice. They should not have been reported alongside
+> measured gate results. Retained for the buddy-allocator/COW/THP analysis, which stays useful if a
+> 16 KB-granule fallback is ever needed.
+
 **Work dir:** `/Users/liaozhiping/Documents/codex/natemu` · **Date:** 2026-08-08
 **Gate:** `G-2` (08 §5) — does the `natemu-page-quads` PV allocator need to be on the critical path?
 **Metric:** `H = homogeneous_quads / total_quads` where quad = 4× 4K PTEs aligned to 16K (`VA[13:12]=0..3`), homogeneous = all 4 `P=1` AND `PFN` contiguous (`n, n+1, n+2, n+3`, with `n%4==0`) AND identical `R/W, U/S, NX, PAT/PWT/PCD, G` (07 §3.1, 09 N-02, 06 §0.1/2.4). `A/D` excluded by default (see §3).
