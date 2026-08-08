@@ -43,7 +43,11 @@ A flat identity map of a full x86-64 address space into a macOS process is **not
   cores implement 48-bit VA at EL1 in a guest — see N-02).
 - Shadow paging into ARM stage-1 tables, which is only available if we own EL1 anyway.
 
-**Status.** Open — pivotal. Feeds the Design A vs Design B decision.
+**Status.** **RESOLVED 2026-08-08 — helper VM gets 48 bits.** `probes/g1_mmu4k` ran guest EL1 with
+`TCR_EL1.T0SZ=16` and successfully translated VA `0x0000_4000_0000_0000`, which is out of range
+under a 39-bit configuration. So Design B does escape the host's 47-bit limit. Ceiling is also 48:
+`ID_AA64MMFR2_EL1.VARange=0` (no `FEAT_LVA`), therefore **x86 LA57 5-level paging cannot be
+shadowed and must not be advertised**. See `14-gate-results-verified.md` §G-1a.
 
 ---
 
@@ -132,6 +136,9 @@ uses a global lock / signal-based backpatching scheme. Rare but correctness-crit
 *kernel* hitting this is a hang, not a slow path.
 
 **Status.** Open — solvable, cost is a rare slow path. `hw.optional.arm.FEAT_LSE2 = 1` here (`V`).
+TSO itself is now confirmed *behaviourally* (not just by register read-back): MP litmus across two
+vCPUs gave 1,706,240 reordering outcomes at `EnTSO=0` and **0** at `EnTSO=1`, with 11× *more* thread
+overlap in the TSO round. See `14-gate-results-verified.md` §G-4.
 
 ---
 
@@ -201,3 +208,40 @@ fast translator" and "reused correct system model" is where this project's real 
 lives.
 
 **Status.** Open — the central architecture question. To be settled in the design doc.
+
+
+---
+
+## N-11 — Only 256 ASIDs, against x86's 4096 PCIDs
+
+**What.** `ID_AA64MMFR0_EL1.ASIDBits = 0` as seen from guest EL1 → **8-bit ASIDs (256)** (`V`,
+`probes/g1_mmu4k ids`). x86 `PCID` is 12-bit (4096). `VMIDBits = 0` likewise → 8-bit VMID.
+
+**Why it bites.** A shadow-paging design that allocates one ARM ASID per guest `CR3` runs out 16×
+sooner than the guest's own model expects. ASID exhaustion means recycling, and recycling means a
+broadcast TLB invalidate — precisely the storm that using the hardware MMU was supposed to avoid.
+A Linux guest with a few hundred live processes will cycle continuously.
+
+**Mitigation sketch.** Treat ASIDs as a cache over `CR3` values with an LRU/generation scheme
+rather than a bijection, the way Linux's own arm64 ASID allocator does; or pin ASIDs to the hottest
+address spaces and fall back to a flushed shared ASID for the cold tail (`I`).
+
+**Status.** Open — new, surfaced by the audit. Not costed anywhere yet.
+
+---
+
+## N-12 — No hardware Access/Dirty bit management
+
+**What.** `ID_AA64MMFR1_EL1.HAFDBS = 0` (`V`) — Apple implements neither hardware Access-flag
+update nor hardware Dirty-bit management, on any generation checked.
+
+**Why it bites.** Every x86 `A` and `D` bit update must be produced by taking a fault in the shadow
+tables and emulating it. This is the last remaining hardware-assist gap in the MMU path now that
+4 KB granule and 4 KB permissions are confirmed working, and it is the main reason the shadow
+design cannot simply mirror x86 PTEs and walk away.
+
+**Consolation.** `FEAT_PAN2` is present (`PAN = 0x2`), so `AT S1E1RP`/`AT S1E1WP` are available for
+fault-free permission probing, and `FEAT_XNX` (`XNX = 0x1`) gives distinct EL0/EL1 execute-never,
+which maps cleanly onto x86 `SMEP`.
+
+**Status.** Open — `12` ranks A/D last; that ranking predates this being the *only* remaining gap.

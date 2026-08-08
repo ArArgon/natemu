@@ -1,6 +1,6 @@
 # Research Index — natemu x86-64 on Apple Silicon
 
-**Last updated:** 2026-08-08 (multi-agent gates+probes) · **Machine:** M2 Max / M2 Pro, macOS 26.5.2 (25F84) · **Status:** research phase — G-1/G-3 closed, G-2 synthetic done, perf ranking live
+**Last updated:** 2026-08-08 (post-audit; gates re-closed by experiment — read 13 and 14 first) · **Machine:** M2 Max / M2 Pro, macOS 26.5.2 (25F84) · **Status:** research phase — G-1/G-1b/G-1c/G-4 closed BY EXPERIMENT (see 14); G-2 moot; 07/11/12 need retraction pass
 **Artifacts:** `probe_g1_tgran_tso.c` (+ `probe_g1_granule.c`), `tools/g2_quad_measure.py`, `/tmp/hv_g1_probe/run.log`, `/tmp/probe_mmu_tso.c` (`12-performance-ranking.md`)
 
 ## Map
@@ -18,11 +18,14 @@
 | 09 | [architectural-nuances](09-architectural-nuances.md) | Sharp edges register | 10 nuances; N-01 (47-bit VA), N-02 (16K granule), N-06/07 are load-bearing. Updated 2026-08-08: N-02 resolved G-1=T Gran4 YES. |
 | 10 | [interrupt-timer-device](10-interrupt-timer-device-dossier.md) | Interrupt/timer/device placement per tier | GICv3 measured, vtimer→TSC_DEADLINE, virtio batching, exit-budget 1.2M/sec/core, minimal Tier 2 set. |
 | 11 | [pte-quad-gate](11-pte-quad-gate.md) | G-2: are 16K quads already homogeneous? | Synthetic 55–87% (kernel_build 55%, browser 67%, DB 87%) → **G-2 = mandatory** for Tier 2 ceiling. Tool: `tools/g2_quad_measure.py`. |
+| 13 | [audit-skeptical-review](13-audit-skeptical-review.md) | Does the corpus survive scrutiny? | **3 of 4 load-bearing conclusions did not, as stated.** Decoder bugs, G-1/G-2 closed on insufficient evidence, refuted premise in 07, speedup double-counting. |
+| 14 | [gate-results-verified](14-gate-results-verified.md) | G-1/G-4 closed by experiment | **4K stage-1 + 4K stage-2 permissions ENFORCED inside one 16K host page; T0SZ=16 (48-bit VA) works; TSO litmus 1.7M→0.** G-2 quads now MOOT. |
 | 12 | [performance-ranking](12-performance-ranking.md) | Perf concerns ranked + live tracking | **1. MMU 1.5× → 2. TSO 3.4×/2–5% → 3. Codegen 4.4× → 4. Precise 10–20% vs 2–5× → 5. SMC 4× → 6. Quad 15–35% → 7. Exits 1.2M/core → 8. A/D+TLB**. Live `/tmp/probe_mmu_tso.c`. |
 
 ## Reading order for a newcomer
 
-01 → 02 → 06 → 07 → 08. Read 03–05 only when you need to choose components. 10–11 are the Tier 2 device/PV gates, 12 is the perf triage.
+**Start with 13 (audit) and 14 (verified gate results)** — they correct several headline claims in 01–12.
+Then 01 → 02 → 06 → 07 → 08. Read 03–05 only when you need to choose components. 10–11 are the Tier 2 device/PV gates, 12 is the perf triage.
 
 ## Open gates (cheap experiments that decide the design)
 
