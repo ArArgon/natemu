@@ -1,0 +1,72 @@
+{
+ "label": "smoke",
+ "cmd": [
+  "/opt/homebrew/bin/qemu-system-x86_64",
+  "-machine",
+  "q35",
+  "-accel",
+  "tcg,thread=single",
+  "-m",
+  "2048",
+  "-smp",
+  "1",
+  "-kernel",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/pt_coherence/qemu/work/nb-x86_64/boot/vmlinuz-virt",
+  "-initrd",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/pt_coherence/qemu/work/initramfs-x86_64.cpio",
+  "-append",
+  "console=ttyS0 natemu.task=none panic=-1 rdinit=/init loglevel=3",
+  "-display",
+  "none",
+  "-serial",
+  "stdio",
+  "-no-reboot",
+  "-nodefaults",
+  "-monitor",
+  "none",
+  "-cpu",
+  "max",
+  "-d",
+  "plugin",
+  "-D",
+  "results/smoke.plugin.txt",
+  "-plugin",
+  "./plugin_inv.so"
+ ],
+ "host_total_s": 9.384692,
+ "events": {
+  "NATEMU_INIT_UP": 9.222796,
+  "NATEMU_SHELL_UP": 9.254293,
+  "NATEMU_TASK_BEGIN": 9.299851,
+  "NATEMU_TASK_END": 9.316628
+ },
+ "benches": [],
+ "returncode": 0,
+ "when": "2026-08-08T18:44:22",
+ "lines": [
+  [
+   9.222796,
+   "NATEMU_INIT_UP uptime=5.38"
+  ],
+  [
+   9.254293,
+   "NATEMU_SHELL_UP uptime=5.48"
+  ],
+  [
+   9.299851,
+   "NATEMU_TASK_BEGIN none"
+  ],
+  [
+   9.316628,
+   "NATEMU_TASK_END none uptime=5.54"
+  ],
+  [
+   9.343462,
+   "[    5.518579] sysrq: Power Off"
+  ],
+  [
+   9.363251,
+   "[    5.543339] reboot: Power down"
+  ]
+ ]
+}

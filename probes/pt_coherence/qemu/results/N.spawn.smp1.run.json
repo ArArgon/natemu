@@ -1,0 +1,42 @@
+{
+ "label": "spawn.smp1",
+ "cmd": [
+  "/opt/homebrew/bin/qemu-system-x86_64",
+  "-machine",
+  "q35",
+  "-accel",
+  "tcg,thread=single",
+  "-m",
+  "2048",
+  "-smp",
+  "1",
+  "-kernel",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/pt_coherence/qemu/work/nb-x86_64/boot/vmlinuz-virt",
+  "-initrd",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/pt_coherence/qemu/combined-x86_64.cpio",
+  "-append",
+  "console=ttyS0 natemu.task=spawn2000 panic=-1 rdinit=/init loglevel=3",
+  "-display",
+  "none",
+  "-serial",
+  "stdio",
+  "-no-reboot",
+  "-nodefaults",
+  "-monitor",
+  "none",
+  "-cpu",
+  "max"
+ ],
+ "host_total_s": 8.56793,
+ "events": {
+  "NATEMU_INIT_UP": 2.341025,
+  "NATEMU_SHELL_UP": 2.350393,
+  "NATEMU_TASK_BEGIN": 2.419061,
+  "BENCH": 8.501687,
+  "BENCHDONE": 8.501817,
+  "NATEMU_TASK_END": 8.505909
+ },
+ "benches": [],
+ "returncode": 0,
+ "when": "2026-08-08T18:46:32"
+}
