@@ -1,0 +1,93 @@
+##### scale2
+=== SMP scaling probe ===
+  host: Apple M2 Max
+  cores: 8 performance + 4 efficiency
+  hv_vm_get_max_vcpu_count = 64
+  payload 2264 bytes
+
+=== 1b. Same, with the naive handler that DOES issue TLBI VAAE1IS ===
+    N     p50 ns     max ns     p99 ns agg faults/s
+    1     369.79     369.79     895.83         2.70M   (1.00x N=1)
+    2     627.60     627.60    1023.44         3.19M   (1.70x N=1)
+    4     781.25     783.85    1210.94         5.15M   (2.11x N=1)
+    8    1213.54    1229.17    1799.48         6.58M   (3.28x N=1)
+
+  failures: 0
+##### litmus
+=== SMP scaling probe ===
+  host: Apple M2 Max
+  cores: 8 performance + 4 efficiency
+  hv_vm_get_max_vcpu_count = 64
+  payload 2264 bytes
+
+=== 4a. MP litmus at scale (r0(Y) > r1(X) is forbidden under TSO) ===
+     N variant                           EnTSO  weak outcomes        witness
+     2 N/2 independent pairs                 0        1057003         166096
+     2 N/2 independent pairs                 1              0        1167224
+     2 1 writer / N-1 readers                0        1019609         165528
+     2 1 writer / N-1 readers                1              0        1631094
+     4 N/2 independent pairs                 0        1245298         244040
+     4 N/2 independent pairs                 1              0        5489620
+     4 1 writer / N-1 readers                0         428241         185422
+     4 1 writer / N-1 readers                1              0        1461502
+     8 N/2 independent pairs                 0        4213751         542613
+     8 N/2 independent pairs                 1              0        7470297
+     8 1 writer / N-1 readers                0        7829111         336491
+     8 1 writer / N-1 readers                1              0        4199015
+
+  failures: 0
+##### entso
+=== SMP scaling probe ===
+  host: Apple M2 Max
+  cores: 8 performance + 4 efficiency
+  hv_vm_get_max_vcpu_count = 64
+  payload 2264 bytes
+
+=== 4b. Cost of EnTSO=1 under multi-core cache-line contention ===
+
+  -- private per vCPU buffer, streaming stp, 64 KiB
+     N  EnTSO=0 ns/8B  EnTSO=1 ns/8B      ratio
+     1         0.1787         0.2104      1.178x
+     2         0.2785         0.3471      1.247x
+     4         0.2982         0.2104      0.706x
+     8         0.1907         0.2282      1.197x
+
+  -- private per vCPU buffer, streaming ldp, 64 KiB
+     N  EnTSO=0 ns/8B  EnTSO=1 ns/8B      ratio
+     1         0.2969         0.3484      1.173x
+     2         0.2791         0.2785      0.998x
+     4         0.2785         0.4260      1.530x
+     8         0.4260         0.4260      1.000x
+
+  -- SHARED (all vCPUs write the same lines) buffer, streaming stp, 64 KiB
+     N  EnTSO=0 ns/8B  EnTSO=1 ns/8B      ratio
+     1         0.2308         0.5620      2.435x
+     2         0.4381         0.6593      1.505x
+     4         0.7490         1.1698      1.562x
+     8         1.3135        13.4824     10.264x
+
+  -- SHARED (all vCPUs write the same lines) buffer, streaming ldp, 64 KiB
+     N  EnTSO=0 ns/8B  EnTSO=1 ns/8B      ratio
+     1         0.3484         0.3490      1.002x
+     2         0.4279         0.3141      0.734x
+     4         0.2588         0.2594      1.002x
+     8         0.4279         0.4260      0.996x
+
+  failures: 0
+##### oversub
+=== SMP scaling probe ===
+  host: Apple M2 Max
+  cores: 8 performance + 4 efficiency
+  hv_vm_get_max_vcpu_count = 64
+  payload 2264 bytes
+
+=== 6. Oversubscription: vCPUs (+ host threads) beyond 8 P-cores ===
+     N   busy     p50 ns     p90 ns     p99 ns     max ns agg faults/s      ovl
+     8      0     169.27     171.88     208.33     171.88        48.42M     0.94
+     8      4     174.48     179.69     492.19     179.69        46.06M     0.89
+     8      8     158.85     174.48     210.94     174.48        51.11M     0.32
+    10      0     161.46     166.67     210.94     166.67        62.61M     0.87
+    12      0     166.67     182.29     484.38     182.29        73.08M     0.79
+    12      4     164.06     177.08     281.25     177.08        74.05M     0.39
+
+  failures: 0

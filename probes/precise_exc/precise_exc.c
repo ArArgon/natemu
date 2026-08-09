@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread/qos.h>
 
 #include "payload.h"
 __asm__(PAYLOAD_ASM);
@@ -539,33 +540,41 @@ static void exp_pf(uint64_t root) {
             if (AUX()[0] != 0)
                 printf("  !! control took %llu faults\n", (unsigned long long)AUX()[0]);
         }
+        // The DVFS state and doc 16's position-in-run effect both drift over a run, so every
+        // configuration is bracketed by a fresh minimal-handler baseline run immediately
+        // before it and the delta is taken against that neighbour, not against a global one.
         for (size_t i = 0; i < NV; i++) {
-            clear_params();
-            P()[0] = VA_RO; P()[1] = ITERS; P()[2] = ROUNDS; P()[3] = MASK;
-            set_handler_state(ITERS * ROUNDS + 16, RAM_IPA + OFF_TABLE, v[i].log2n,
-                              RAM_IPA + OFF_CTX);
-            install_vectors(v[i].h);
-            if (run_guest(4, root, 180)) return;
-            stat_t s = stats(R(), (int)ROUNDS, (double)ITERS);
-            med[i] = s.med;
-            if (!pass) continue;
-            row(v[i].name, s);
-            uint64_t nf = AUX()[0];
-            if (nf != ITERS * ROUNDS)
-                printf("      !! fault count %llu, expected %llu\n",
-                       (unsigned long long)nf, (unsigned long long)(ITERS * ROUNDS));
-            printf("      NET fault round trip: %8.3f ns", s.med - ctl.med);
-            if (i > 0) printf("   (+%.3f ns over the minimal handler)", s.med - med[0]);
-            printf("\n");
+            double base = 0;
+            for (int k = 0; k < 2; k++) {
+                int h = k ? v[i].h : H_SKIP_CNT;
+                uint64_t ln = k ? v[i].log2n : 0;
+                clear_params();
+                P()[0] = VA_RO; P()[1] = ITERS; P()[2] = ROUNDS; P()[3] = MASK;
+                set_handler_state(ITERS * ROUNDS + 16, RAM_IPA + OFF_TABLE, ln,
+                                  RAM_IPA + OFF_CTX);
+                install_vectors(h);
+                if (run_guest(4, root, 180)) return;
+                stat_t s = stats(R(), (int)ROUNDS, (double)ITERS);
+                if (!k) { base = s.med; continue; }
+                med[i] = s.med;
+                if (!pass) continue;
+                row(v[i].name, s);
+                uint64_t nf = AUX()[0];
+                if (nf != ITERS * ROUNDS)
+                    printf("      !! fault count %llu, expected %llu\n",
+                           (unsigned long long)nf, (unsigned long long)(ITERS * ROUNDS));
+                printf("      NET fault round trip %8.3f ns  |  adjacent minimal-handler "
+                       "baseline %.3f ns  ->  delta %+.3f ns\n",
+                       s.med - ctl.med, base, s.med - base);
+            }
         }
     }
-    printf("\n  ordering check: minimal handler first=%.3f last=%.3f ns (%.1f %% apart)\n",
-           med[0], med[NV-1], 100.0*(med[NV-1]-med[0])/med[0]);
 }
 
 // ------------------------------------------------------------------ main
 int main(int argc, char **argv) {
     const char *what = argc > 1 ? argv[1] : "all";
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     hv_vm_config_t cfg = hv_vm_config_create();
     HV(hv_vm_create(cfg));
     g_mem = aligned_alloc(0x4000, RAM_SIZE);

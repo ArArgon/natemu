@@ -1,0 +1,123 @@
+precise-exception cost probe — payload 3140 bytes
+
+=== 0. calibration ===
+  CNTFRQ_EL0                                24000000 Hz
+  {isb; mrs cntvct} back-to-back              11.548 ns
+  empty {subs;b.ne} loop iteration             0.367 ns
+  dependent ADD latency                        0.367 ns  -> clock ~2.72 GHz
+
+=== 1. strategy (a): conservative materialisation ===
+  All stores hit ONE 128-byte L1-resident context block: this is the BEST case
+  for spilling, so every figure here is a lower bound on the real cost.
+
+  4 ALU ops (baseline x86 insn body)               0.620 ns   [0.618 .. 0.670]      1.7 cyc
+    + 1 store                                      0.722 ns   [0.668 .. 0.768]      2.0 cyc
+    + 2 stores                                     0.923 ns   [0.802 .. 0.927]      2.5 cyc
+    + 4 stores                                     1.388 ns   [1.175 .. 1.725]      3.8 cyc
+    + 8 stores                                     2.575 ns   [2.348 .. 2.861]      7.0 cyc
+    + 16 stores                                    4.761 ns   [4.102 .. 5.532]     13.0 cyc
+    + 16 regs via 8 STP                            2.033 ns   [1.812 .. 2.152]      5.5 cyc
+    + 16 regs via 8 LDP                            1.465 ns   [1.439 .. 1.537]      4.0 cyc
+    + 8 STP then 8 LDP (store-all/load-all)        2.994 ns   [2.668 .. 3.230]      8.2 cyc
+  load+ALU+store (memory x86 insn)                 0.587 ns   [0.586 .. 0.614]      1.6 cyc
+    + 1 store (RIP materialised)                   0.565 ns   [0.565 .. 0.575]      1.5 cyc
+    + 3 stores (RIP + 2 flag operands)             1.034 ns   [1.033 .. 1.053]      2.8 cyc
+
+  marginal cost of one 8-byte store to a hot context block:
+    from 1 store    0.102 ns   from 4   0.192 ns   from 16  0.259 ns
+    16 regs as STP  1.413 ns total (0.088 ns/reg)
+    store-all + load-all round trip  2.374 ns
+
+  relative cost on a memory-touching x86 instruction:
+    +1 store    -3.7 %      +3 stores  +76.2 %
+    +16 regs (STP) would be +240.8 % of it
+
+=== 2. strategy (b)/(c): fault-path metadata lookup ===
+
+  -- (b) branchless binary search over N sorted uint32 host-PC keys --
+  key generation only (xorshift, control)          4.433 ns   [3.830 .. 4.749]     12.1 cyc
+  N=64      ( 6 steps,     0 KiB table)            7.060 ns   [5.844 .. 7.900]     19.2 cyc
+      net of key gen:    2.627 ns   (0.438 ns/step)
+  N=256     ( 8 steps,     1 KiB table)            7.450 ns   [6.451 .. 8.915]     20.3 cyc
+      net of key gen:    3.017 ns   (0.377 ns/step)
+  N=1024    (10 steps,     4 KiB table)            8.082 ns   [7.256 .. 9.484]     22.0 cyc
+      net of key gen:    3.650 ns   (0.365 ns/step)
+  N=4096    (12 steps,    16 KiB table)            9.539 ns   [8.884 .. 10.421]     26.0 cyc
+      net of key gen:    5.106 ns   (0.426 ns/step)
+  N=16384   (14 steps,    64 KiB table)           11.947 ns   [11.142 .. 13.078]     32.5 cyc
+      net of key gen:    7.514 ns   (0.537 ns/step)
+  N=65536   (16 steps,   256 KiB table)           21.147 ns   [19.188 .. 23.172]     57.6 cyc
+      net of key gen:   16.714 ns   (1.045 ns/step)
+  N=262144  (18 steps,  1024 KiB table)           26.951 ns   [24.672 .. 31.474]     73.4 cyc
+      net of key gen:   22.518 ns   (1.251 ns/step)
+
+  -- (b') open-addressed hash: 2 ALU + 1 dependent load of a 16-byte entry --
+  N=1024    (   16 KiB table)                      2.801 ns   [2.642 .. 2.817]      7.6 cyc
+      net of key gen:   -1.631 ns
+  N=8192    (  128 KiB table)                      3.058 ns   [3.001 .. 3.134]      8.3 cyc
+      net of key gen:   -1.374 ns
+  N=65536   ( 1024 KiB table)                      3.695 ns   [3.281 .. 3.706]     10.1 cyc
+      net of key gen:   -0.737 ns
+
+  -- (c) QEMU cpu_unwind_data_from_tb: linear sleb128 scan of the TB search table --
+     4 sleb128 values per guest insn (INSN_START_WORDS=3 + host-offset delta),
+     decoded from the start of the TB until iter_pc > host_pc.  Target = middle insn.
+  icount=4    (  17 B table, 3 rows walked)       16.273 ns   [16.260 .. 16.673]     44.3 cyc
+  icount=8    (  35 B table, 5 rows walked)       33.310 ns   [28.397 .. 33.343]     90.7 cyc
+  icount=16   (  73 B table, 9 rows walked)       41.180 ns   [36.697 .. 46.897]    112.1 cyc
+  icount=32   ( 149 B table, 17 rows walked)      70.170 ns   [64.560 .. 78.500]    191.0 cyc
+  icount=64   ( 295 B table, 33 rows walked)     120.183 ns   [108.803 .. 136.407]    327.2 cyc
+  icount=128  ( 578 B table, 65 rows walked)     178.580 ns   [171.960 .. 199.267]    486.2 cyc
+
+=== 3. probe-then-execute with AT S1E1WP ===
+
+  -- on a mapped read-write region (probe succeeds) --
+  plain STR (control)                              0.829 ns   [0.810 .. 0.930]      2.3 cyc
+  AT S1E1WP alone, no ISB, no PAR read             8.875 ns   [8.077 .. 9.270]     24.2 cyc
+  AT + ISB + MRS PAR_EL1 (1 probe)                23.543 ns   [21.487 .. 26.865]     64.1 cyc
+  AT + ISB + MRS PAR_EL1, then STR (1 operand)    26.792 ns   [25.477 .. 27.826]     72.9 cyc
+  2x{AT+ISB+MRS}, then STR (2 operands)           48.525 ns   [46.750 .. 53.176]    132.1 cyc
+  AT;AT;ISB;MRS then STR  [WRONG, bound only]     32.633 ns   [31.984 .. 33.665]     88.8 cyc
+
+  net cost of probing 1 operand before a store    25.963 ns  (32.33x the bare store)
+  net cost of probing 2 operands before a store   47.697 ns  (58.55x the bare store)
+  ISB+PAR share of one probe                      14.668 ns of 23.543 ns
+
+  -- the same probe on a region where it FAILS (cost of a negative probe) --
+  AT+ISB+MRS on read-write pages   (PAR.F=0)      21.894 ns   [20.676 .. 24.127]     59.6 cyc
+      last PAR_EL1 = 0xff0000004101fb80  (F=0)
+  AT+ISB+MRS on read-only pages    (PAR.F=1, perm)    20.955 ns   [20.240 .. 21.992]     57.1 cyc
+      last PAR_EL1 = 0x000000000000081f  (F=1)
+  AT+ISB+MRS on unmapped pages     (PAR.F=1, xlat)    42.331 ns   [40.931 .. 43.937]    115.3 cyc
+      last PAR_EL1 = 0x000000000000080b  (F=1)
+
+=== 5. AT correctness: does a failing probe stay fault-free? ===
+  read-write page  AT S1E1RP -> PAR=0xff00000041000b80 F=0 ok    | AT S1E1WP -> PAR=0xff00000041000b80 F=0 ok   
+  read-only page   AT S1E1RP -> PAR=0xff00000041000b80 F=0 ok    | AT S1E1WP -> PAR=0x000000000000081f F=1 FAULT
+      WP FST=0xf
+  unmapped page    AT S1E1RP -> PAR=0x000000000000080b F=1 FAULT | AT S1E1WP -> PAR=0x000000000000080b F=1 FAULT
+      RP FST=0x5
+      WP FST=0x5
+  faults actually taken during this mode: 0 (must be 0)
+
+=== 4. the fault path: permission fault -> recovery -> ERET ===
+
+  (pass 1 was a warm-up and is discarded; below is pass 2)
+
+  no-fault control (same stream, RW pages)         0.988 ns   [0.985 .. 1.073]      2.7 cyc
+  minimal handler (ELR+=4; ERET)                  37.648 ns   [35.308 .. 39.604]    102.5 cyc
+      NET fault round trip   36.660 ns  |  adjacent minimal-handler baseline 38.873 ns  ->  delta -1.225 ns
+    + spill/reload x0-x17, read ELR/FAR/ESR       38.760 ns   [36.073 .. 41.452]    105.5 cyc
+      NET fault round trip   37.773 ns  |  adjacent minimal-handler baseline 37.385 ns  ->  delta +1.375 ns
+    + permute 16 regs into guest CPUState         38.462 ns   [28.227 .. 42.817]    104.7 cyc
+      NET fault round trip   37.475 ns  |  adjacent minimal-handler baseline 37.673 ns  ->  delta +0.790 ns
+    + StackMap binary search, N=256               61.654 ns   [58.115 .. 67.225]    167.9 cyc
+      NET fault round trip   60.667 ns  |  adjacent minimal-handler baseline 38.981 ns  ->  delta +22.673 ns
+    + StackMap binary search, N=4096              70.527 ns   [65.719 .. 76.983]    192.0 cyc
+      NET fault round trip   69.540 ns  |  adjacent minimal-handler baseline 37.906 ns  ->  delta +32.621 ns
+    + StackMap binary search, N=65536             76.519 ns   [69.573 .. 82.188]    208.3 cyc
+      NET fault round trip   75.531 ns  |  adjacent minimal-handler baseline 35.248 ns  ->  delta +41.271 ns
+  minimal handler AGAIN (ordering check)          37.583 ns   [35.342 .. 39.002]    102.3 cyc
+      NET fault round trip   36.596 ns  |  adjacent minimal-handler baseline 33.931 ns  ->  delta +3.652 ns
+
+all runs completed
