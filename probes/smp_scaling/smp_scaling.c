@@ -385,7 +385,8 @@ static double overlap_frac(int n) {
 static const uint64_t SH_PAGES = 512;
 static uint64_t SH_GROUP = 16, SH_ROUNDS = 300, SH_CROUNDS = 60;
 
-typedef struct { double net_p50, net_p99, ctrl_p50, raw_p50; uint64_t faults; } shres_t;
+typedef struct { double net_p50, net_p90, net_p99, net_max, ctrl_p50, raw_p50, outlier;
+                 uint64_t faults; } shres_t;
 
 // shared_pt: 0 = private root per vCPU, 1 = one root shared by all
 static int exp_shadow_run(int n, int shared_pt, int with_tlbi, shres_t *out, double *agg,
@@ -435,7 +436,13 @@ static int exp_shadow_run(int n, int shared_pt, int with_tlbi, shres_t *out, dou
         st_t c = stats(RES2(i), nc, (double)SH_GROUP);
         out[i].raw_p50 = f.p50; out[i].ctrl_p50 = c.p50;
         out[i].net_p50 = f.p50 - c.p50;
+        out[i].net_p90 = f.p90 - c.p50;
         out[i].net_p99 = f.p99 - c.p50;
+        out[i].net_max = f.max - c.p50;
+        { uint64_t bad = 0; double thr = f.p50 * 5.0;
+          for (int k = 0; k < nf; k++)
+              if ((double)RES(i)[k] * 1e9 / g_cntfrq / SH_GROUP > thr) bad++;
+          out[i].outlier = 100.0 * (double)bad / nf; }
         out[i].faults  = AUX(i)[0];
         sum_rate += 1e9 / out[i].net_p50;
         if (!quiet)
@@ -892,10 +899,13 @@ static void *busy_thread(void *a) {
 
 static void exp_oversub(void) {
     printf("\n=== 6. Oversubscription: vCPUs (+ host threads) beyond 8 P-cores ===\n");
-    printf("  %4s %6s %10s %10s %10s %10s %12s %8s\n",
-           "N", "busy", "p50 ns", "p90 ns", "p99 ns", "max ns", "agg faults/s", "ovl");
+    printf("  Each timed sample covers %llu faults (~2.5 us), so a scheduler preemption shows up\n"
+           "  as a small number of very large samples, not as a shifted median.\n",
+           (unsigned long long)SH_GROUP);
+    printf("  %4s %6s %9s %9s %9s %11s %8s %12s %6s\n",
+           "N", "busy", "p50 ns", "p90 ns", "p99 ns", "max ns", ">5xp50", "agg faults/s", "ovl");
     struct { int n, busy; } cases[] = {
-        { 8, 0 }, { 8, 4 }, { 8, 8 }, { 10, 0 }, { 12, 0 }, { 12, 4 },
+        { 8, 0 }, { 8, 4 }, { 8, 8 }, { 10, 0 }, { 12, 0 }, { 12, 4 }, { 12, 8 },
     };
     for (unsigned k = 0; k < sizeof(cases)/sizeof(cases[0]); k++) {
         int n = cases[k].n, nb = cases[k].busy;
@@ -908,14 +918,16 @@ static void exp_oversub(void) {
         g_busy_stop = 1;
         for (int i = 0; i < nb; i++) pthread_join(bt[i], NULL);
         if (rc) { printf("  N=%d busy=%d FAILED\n", n, nb); continue; }
-        double p50[MAXV], p99[MAXV];
+        double p50[MAXV], p90[MAXV], p99[MAXV], ol[MAXV];
         double mx = 0;
         for (int i = 0; i < n; i++) {
-            p50[i] = r[i].net_p50; p99[i] = r[i].net_p99;
-            if (p50[i] > mx) mx = p50[i];
+            p50[i] = r[i].net_p50; p90[i] = r[i].net_p90; p99[i] = r[i].net_p99;
+            ol[i] = r[i].outlier;
+            if (r[i].net_max > mx) mx = r[i].net_max;
         }
-        printf("  %4d %6d %10.2f %10.2f %10.2f %10.2f %12.2fM %8.2f\n",
-               n, nb, med_d(p50, n), mx, med_d(p99, n), mx, agg / 1e6, ovl);
+        printf("  %4d %6d %9.2f %9.2f %9.2f %11.0f %7.2f%% %12.2fM %6.2f\n",
+               n, nb, med_d(p50, n), med_d(p90, n), med_d(p99, n), mx, med_d(ol, n),
+               agg / 1e6, ovl);
     }
 }
 

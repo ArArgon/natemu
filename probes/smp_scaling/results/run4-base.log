@@ -1,0 +1,54 @@
+=== SMP scaling probe ===
+  host: Apple M2 Max
+  cores: 8 performance + 4 efficiency
+  hv_vm_get_max_vcpu_count = 64
+  payload 2264 bytes
+
+=== 0. Single-vCPU cross-check against doc 16 ===
+  no-TLBI shadow-fill handler, one timed window per 512-page round (doc-16 method):
+    vcpu0   fault  159.02  ctrl  0.73  NET p50  158.28  p99  177.49 ns   faults 153600/153600
+    doc 16 measured 145.8 ns here.
+  no-TLBI shadow-fill handler, one timed window per 16 pages (this probe):
+    vcpu0   fault  169.27  ctrl  2.60  NET p50  166.67  p99  200.52 ns   faults 153600/153600
+    (finer windows so p99 tails are meaningful; costs a few ns of ISB overhead)
+  with TLBI VAAE1IS in the handler:
+    vcpu0   fault  471.35  ctrl  2.60  NET p50  468.75  p99  690.10 ns   faults 153600/153600
+    doc 16 measured 439.2 ns here.
+
+  failures: 0
+=== SMP scaling probe ===
+  host: Apple M2 Max
+  cores: 8 performance + 4 efficiency
+  hv_vm_get_max_vcpu_count = 64
+  payload 2264 bytes
+
+=== 0. Single-vCPU cross-check against doc 16 ===
+  no-TLBI shadow-fill handler, one timed window per 512-page round (doc-16 method):
+    vcpu0   fault  146.40  ctrl  0.73  NET p50  145.67  p99  152.10 ns   faults 153600/153600
+    doc 16 measured 145.8 ns here.
+  no-TLBI shadow-fill handler, one timed window per 16 pages (this probe):
+    vcpu0   fault  166.67  ctrl  2.60  NET p50  164.06  p99  190.10 ns   faults 153600/153600
+    (finer windows so p99 tails are meaningful; costs a few ns of ISB overhead)
+  with TLBI VAAE1IS in the handler:
+    vcpu0   fault  458.33  ctrl  2.60  NET p50  455.73  p99  778.65 ns   faults 153600/153600
+    doc 16 measured 439.2 ns here.
+
+  failures: 0
+=== SMP scaling probe ===
+  host: Apple M2 Max
+  cores: 8 performance + 4 efficiency
+  hv_vm_get_max_vcpu_count = 64
+  payload 2264 bytes
+
+=== 0. Single-vCPU cross-check against doc 16 ===
+  no-TLBI shadow-fill handler, one timed window per 512-page round (doc-16 method):
+    vcpu0   fault  142.58  ctrl  0.73  NET p50  141.85  p99  179.85 ns   faults 153600/153600
+    doc 16 measured 145.8 ns here.
+  no-TLBI shadow-fill handler, one timed window per 16 pages (this probe):
+    vcpu0   fault  153.65  ctrl  2.60  NET p50  151.04  p99  171.88 ns   faults 153600/153600
+    (finer windows so p99 tails are meaningful; costs a few ns of ISB overhead)
+  with TLBI VAAE1IS in the handler:
+    vcpu0   fault  450.52  ctrl  2.60  NET p50  447.92  p99  723.96 ns   faults 153600/153600
+    doc 16 measured 439.2 ns here.
+
+  failures: 0

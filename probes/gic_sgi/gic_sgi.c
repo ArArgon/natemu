@@ -165,6 +165,20 @@ __asm__(
 "2:  cbnz x27, Lrecv\n"
 // --- sender ---
 "Lsend:\n"
+// how much of the latency is the SGI1R write itself? aim it at a non-existent Aff1 so
+// nothing is ever delivered, and time 4096 back-to-back writes.
+"    mov  x0, #0xff0000\n"
+"    orr  x0, x0, #0x3000000\n"        // INTID 3, Aff1 = 0xff, TargetList = 0
+"    isb\n"
+"    mrs  x16, cntvct_el0\n"
+"    mov  x1, #4096\n"
+"5:  msr  S3_0_C12_C11_5, x0\n"
+"    subs x1, x1, #1\n"
+"    b.ne 5b\n"
+"    isb\n"
+"    mrs  x17, cntvct_el0\n"
+"    sub  x17, x17, x16\n"
+"    str  x17, [x28, #0xc78]\n"
 "    mov  x14, x23\n"
 "    mov  x15, #0\n"
 "    mov  x17, #0\n"                   // resend counter
@@ -179,7 +193,7 @@ __asm__(
 "    dsb  ish\n"
 "    msr  S3_0_C12_C11_5, x24\n"       // ICC_SGI1R_EL1
 "    isb\n"
-"    mov  x1, #0x00040000\n"           // ~ a few hundred microseconds
+"    mov  x1, #0x00002000\n"           // ~ tens of microseconds
 "3:  ldar x0, [x10]\n"                 // wait for the receiver's ack counter
 "    cmp  x0, x15\n"
 "    b.hs 4f\n"
@@ -190,7 +204,12 @@ __asm__(
 "    b.ne Lsend2\n"
 "    add  x13, x13, #1\n"              // gave up on this one; force the counters level
 "    stlr x15, [x10]\n"
-"4:  subs x14, x14, #1\n"
+"4:  mov  x0, #65\n"
+"    sub  x0, x0, x12\n"
+"    str  x0, [x11], #8\n"             // attempts this SGI needed
+"    str  x17, [x28, #0xc68]\n"
+"    str  x13, [x28, #0xc70]\n"
+"    subs x14, x14, #1\n"
 "    b.ne Lsend1\n"
 "    str  x17, [x28, #0xc68]\n"
 "    str  x13, [x28, #0xc70]\n"
@@ -432,8 +451,29 @@ int main(int argc, char **argv) {
     printf("  receiver IRQs taken: %llu / %llu   last ICC_IAR1_EL1 = 0x%llx\n",
            (unsigned long long)a1[8], (unsigned long long)iters,
            (unsigned long long)a1[9]);
+    printf("  cost of one MSR ICC_SGI1R_EL1 with no deliverable target: %.1f ns\n",
+           (double)a0[15] * 1e9 / 24000000.0 / 4096.0);
     printf("  sender resends: %llu, gave up on: %llu\n",
            (unsigned long long)a0[13], (unsigned long long)a0[14]);
+    {
+        uint64_t *at = (uint64_t *)(mem + OFF_RES);
+        uint64_t hist[8] = {0}; uint64_t seen = 0;
+        for (uint64_t i = 0; i < iters; i++) {
+            if (at[i] == 0) break;
+            seen++;
+            uint64_t b = at[i] == 1 ? 0 : at[i] == 2 ? 1 : at[i] <= 4 ? 2 :
+                         at[i] <= 8 ? 3 : at[i] <= 16 ? 4 : at[i] <= 32 ? 5 :
+                         at[i] < 64 ? 6 : 7;
+            hist[b]++;
+        }
+        printf("  SGIs completed: %llu; attempts needed  1:%llu 2:%llu 3-4:%llu 5-8:%llu "
+               "9-16:%llu 17-32:%llu 33-63:%llu 64(gave up):%llu\n",
+               (unsigned long long)seen, (unsigned long long)hist[0],
+               (unsigned long long)hist[1], (unsigned long long)hist[2],
+               (unsigned long long)hist[3], (unsigned long long)hist[4],
+               (unsigned long long)hist[5], (unsigned long long)hist[6],
+               (unsigned long long)hist[7]);
+    }
     printf("  hv_vcpu_run returns: vcpu0 = %d, vcpu1 = %d   (1 each = no host exit at all)\n",
            C[0].exits, C[1].exits);
     if (C[0].hvc || C[1].hvc)
