@@ -1,0 +1,23 @@
+NATEMU_INIT_UP uptime=1.58
+NATEMU_SHELL_UP uptime=1.59
+NATEMU_TASK_BEGIN bench:alu,alu,alu,alu,alu,alu,alu,alu,alu,alu,alu,alu,alu,alu,alu,alu,alu,alu,alu,alu,alu,alu,alu,alu,alu
+BENCHVER 4
+BENCH alu          0.9047 s       331.605 Mops  chk=874f08ae8ad6f007
+BENCH alu          0.8979 s       334.131 Mops  chk=874f08ae8ad6f007
+BENCH alu          0.9019 s       332.645 Mops  chk=874f08ae8ad6f007
+BENCH alu          0.9200 s       326.087 Mops  chk=874f08ae8ad6f007
+BENCH alu          0.9403 s       319.056 Mops  chk=874f08ae8ad6f007
+BENCH alu          0.9557 s       313.896 Mops  chk=874f08ae8ad6f007
+BENCH alu          0.9738 s       308.068 Mops  chk=874f08ae8ad6f007
+BENCH alu          0.9973 s       300.822 Mops  chk=874f08ae8ad6f007
+BENCH alu          1.0099 s       297.069 Mops  chk=874f08ae8ad6f007
+BENCH alu          0.9858 s       304.312 Mops  chk=874f08ae8ad6f007
+BENCH alu          0.9758 s       307.432 Mops  chk=874f08ae8ad6f007
+BENCH alu          0.9697 s       309.365 Mops  chk=874f08ae8ad6f007
+BENCH alu          0.9802 s       306.075 Mops  chk=874f08ae8ad6f007
+BENCH alu          1.0157 s       295.352 Mops  chk=874f08ae8ad6f007
+BENCH alu          0.9788 s       306.511 Mops  chk=874f08ae8ad6f007
+BENCH alu          1.0019 s       299.444 Mops  chk=874f08ae8ad6f007
+BENCH alu          0.9626 s       311.661 Mops  chk=874f08ae8ad6f007
+BENCH alu          0.9613 s       312.091 Mops  chk=874f08ae8ad6f007
+qemu-system-x86_64: terminating on signal 15 from pid 67058 (<unknown process>)

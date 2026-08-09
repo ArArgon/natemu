@@ -52,6 +52,17 @@ case "$TASK" in
         echo "BENCH par$N uptime_start=$S uptime_end=$E"
         echo "BENCHDONE"
         ;;
+    qemuuser)
+        # QEMU 11.0.1 linux-user x86-64 -> aarch64, running INSIDE the aarch64
+        # HVF guest. qemu-user has no software MMU (it uses the host MMU with a
+        # guest-base offset), so this isolates TCG code generation from the
+        # softmmu cost that the full-system numbers include.
+        /qemu-x86_64 --version | /bin/busybox head -1
+        /qemu-x86_64 /bench-x64 all
+        ;;
+    nativearm)
+        /bench all
+        ;;
     spawn)
         # kernel/syscall-heavy real workload: 400 fork+exec of a static binary
         S=$(/bin/busybox cut -d' ' -f1 /proc/uptime)

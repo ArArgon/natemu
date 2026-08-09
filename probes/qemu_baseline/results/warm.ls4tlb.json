@@ -1,0 +1,126 @@
+{
+ "label": "x86_64-tcg-bench:ls4tlb,ls4tlb,ls4tlb,ls4tlb-smp1-single",
+ "cmd": [
+  "/opt/homebrew/bin/qemu-system-x86_64",
+  "-machine",
+  "q35",
+  "-accel",
+  "tcg,thread=single",
+  "-m",
+  "3072",
+  "-smp",
+  "1",
+  "-kernel",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/nb-x86_64/boot/vmlinuz-virt",
+  "-initrd",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/initramfs-x86_64.cpio",
+  "-append",
+  "console=ttyS0 natemu.task=bench:ls4tlb,ls4tlb,ls4tlb,ls4tlb panic=-1 rdinit=/init loglevel=3",
+  "-display",
+  "none",
+  "-serial",
+  "stdio",
+  "-no-reboot",
+  "-nodefaults",
+  "-monitor",
+  "none",
+  "-cpu",
+  "max"
+ ],
+ "host_total_s": 131.016759,
+ "events": {
+  "NATEMU_INIT_UP": 2.300125,
+  "NATEMU_SHELL_UP": 2.308604,
+  "NATEMU_TASK_BEGIN": 2.316168,
+  "BENCHVER": 2.327261,
+  "BENCH": 36.226333,
+  "BENCHDONE": 130.990576,
+  "NATEMU_TASK_END": 130.9977
+ },
+ "benches": [
+  {
+   "name": "ls4tlb",
+   "guest_s": 33.7637,
+   "rate": 1.777,
+   "unit": "Mops",
+   "host_t_end": 36.226333,
+   "host_s": 33.910165
+  },
+  {
+   "name": "ls4tlb",
+   "guest_s": 33.657,
+   "rate": 1.783,
+   "unit": "Mops",
+   "host_t_end": 70.011139,
+   "host_s": 33.784806
+  },
+  {
+   "name": "ls4tlb",
+   "guest_s": 32.4815,
+   "rate": 1.847,
+   "unit": "Mops",
+   "host_t_end": 102.621016,
+   "host_s": 32.609877
+  },
+  {
+   "name": "ls4tlb",
+   "guest_s": 28.2433,
+   "rate": 2.124,
+   "unit": "Mops",
+   "host_t_end": 130.990159,
+   "host_s": 28.369143
+  }
+ ],
+ "returncode": 0,
+ "when": "2026-08-08T17:30:24",
+ "lines": [
+  [
+   2.300125,
+   "NATEMU_INIT_UP uptime=1.57"
+  ],
+  [
+   2.308604,
+   "NATEMU_SHELL_UP uptime=1.59"
+  ],
+  [
+   2.316168,
+   "NATEMU_TASK_BEGIN bench:ls4tlb,ls4tlb,ls4tlb,ls4tlb"
+  ],
+  [
+   2.327261,
+   "BENCHVER 4"
+  ],
+  [
+   36.226333,
+   "BENCH ls4tlb      33.7637 s         1.777 Mops  chk=bdc372d6000ce57d"
+  ],
+  [
+   70.011139,
+   "BENCH ls4tlb      33.6570 s         1.783 Mops  chk=bdc372d6000ce57d"
+  ],
+  [
+   102.621016,
+   "BENCH ls4tlb      32.4815 s         1.847 Mops  chk=bdc372d6000ce57d"
+  ],
+  [
+   130.990159,
+   "BENCH ls4tlb      28.2433 s         2.124 Mops  chk=bdc372d6000ce57d"
+  ],
+  [
+   130.990576,
+   "BENCHDONE"
+  ],
+  [
+   130.9977,
+   "NATEMU_TASK_END bench:ls4tlb,ls4tlb,ls4tlb,ls4tlb uptime=130.28"
+  ],
+  [
+   131.004442,
+   "[  130.309397] sysrq: Power Off"
+  ],
+  [
+   131.006988,
+   "[  130.312490] reboot: Power down"
+  ]
+ ]
+}

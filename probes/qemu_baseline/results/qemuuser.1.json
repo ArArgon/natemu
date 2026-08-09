@@ -1,0 +1,202 @@
+{
+ "label": "aarch64-hvf-qemuuser-smp1-single",
+ "cmd": [
+  "/opt/homebrew/bin/qemu-system-aarch64",
+  "-machine",
+  "virt,gic-version=3",
+  "-accel",
+  "hvf",
+  "-m",
+  "3072",
+  "-smp",
+  "1",
+  "-kernel",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/nb-aarch64/boot/vmlinuz-virt",
+  "-initrd",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/initramfs-aarch64.cpio",
+  "-append",
+  "console=ttyAMA0 natemu.task=qemuuser panic=-1 rdinit=/init loglevel=3",
+  "-display",
+  "none",
+  "-serial",
+  "stdio",
+  "-no-reboot",
+  "-nodefaults",
+  "-monitor",
+  "none",
+  "-cpu",
+  "host"
+ ],
+ "host_total_s": 21.336482,
+ "events": {
+  "NATEMU_INIT_UP": 0.174549,
+  "NATEMU_SHELL_UP": 0.174897,
+  "NATEMU_TASK_BEGIN": 0.175147,
+  "BENCHVER": 0.178872,
+  "BENCH": 1.060117,
+  "BENCHDONE": 21.331263,
+  "NATEMU_TASK_END": 21.331955
+ },
+ "benches": [
+  {
+   "name": "alu",
+   "guest_s": 0.8796,
+   "rate": 341.063,
+   "unit": "Mops",
+   "host_t_end": 1.060117,
+   "host_s": 0.88497
+  },
+  {
+   "name": "alu4",
+   "guest_s": 0.9785,
+   "rate": 306.604,
+   "unit": "Mops",
+   "host_t_end": 2.039099,
+   "host_s": 0.978982
+  },
+  {
+   "name": "ls4",
+   "guest_s": 1.6488,
+   "rate": 181.952,
+   "unit": "Mops",
+   "host_t_end": 3.688796,
+   "host_s": 1.649697
+  },
+  {
+   "name": "ls4tlb",
+   "guest_s": 1.5226,
+   "rate": 39.406,
+   "unit": "Mops",
+   "host_t_end": 5.335339,
+   "host_s": 1.646543
+  },
+  {
+   "name": "ptr8",
+   "guest_s": 0.2825,
+   "rate": 106.212,
+   "unit": "Mops",
+   "host_t_end": 5.618092,
+   "host_s": 0.282753
+  },
+  {
+   "name": "ptr256",
+   "guest_s": 3.6428,
+   "rate": 2.196,
+   "unit": "Mops",
+   "host_t_end": 9.261263,
+   "host_s": 3.643171
+  },
+  {
+   "name": "stream",
+   "guest_s": 2.9259,
+   "rate": 4587.277,
+   "unit": "MB/s",
+   "host_t_end": 12.187466,
+   "host_s": 2.926203
+  },
+  {
+   "name": "matmul",
+   "guest_s": 6.5923,
+   "rate": 596.476,
+   "unit": "Mops",
+   "host_t_end": 18.780192,
+   "host_s": 6.592726
+  },
+  {
+   "name": "nqueens",
+   "guest_s": 1.98,
+   "rate": 6.061,
+   "unit": "solves/s",
+   "host_t_end": 20.760563,
+   "host_s": 1.980371
+  },
+  {
+   "name": "syscall",
+   "guest_s": 0.5702,
+   "rate": 5.261,
+   "unit": "Mops",
+   "host_t_end": 21.331095,
+   "host_s": 0.570532
+  }
+ ],
+ "returncode": 0,
+ "when": "2026-08-08T17:10:20",
+ "lines": [
+  [
+   0.174549,
+   "NATEMU_INIT_UP uptime=0.03"
+  ],
+  [
+   0.174897,
+   "NATEMU_SHELL_UP uptime=0.03"
+  ],
+  [
+   0.175147,
+   "NATEMU_TASK_BEGIN qemuuser"
+  ],
+  [
+   0.176025,
+   "qemu-x86_64 version 11.0.1"
+  ],
+  [
+   0.178872,
+   "BENCHVER 4"
+  ],
+  [
+   1.060117,
+   "BENCH alu          0.8796 s       341.063 Mops  chk=874f08ae8ad6f007"
+  ],
+  [
+   2.039099,
+   "BENCH alu4         0.9785 s       306.604 Mops  chk=f9f040dc5f7a3b1b"
+  ],
+  [
+   3.688796,
+   "BENCH ls4          1.6488 s       181.952 Mops  chk=f9f04094fc9d000a"
+  ],
+  [
+   5.335339,
+   "BENCH ls4tlb       1.5226 s        39.406 Mops  chk=bdc372d6000ce57d"
+  ],
+  [
+   5.618092,
+   "BENCH ptr8         0.2825 s       106.212 Mops  chk=00000e4e1d789457"
+  ],
+  [
+   9.261263,
+   "BENCH ptr256       3.6428 s         2.196 Mops  chk=00007a0f78cfc5f4"
+  ],
+  [
+   12.187466,
+   "BENCH stream       2.9259 s      4587.277 MB/s  chk=a5ab2a3b6e000000"
+  ],
+  [
+   18.780192,
+   "BENCH matmul       6.5923 s       596.476 Mops  chk=0000001f5e05e316"
+  ],
+  [
+   20.760563,
+   "BENCH nqueens      1.9800 s         6.061 solves/s  chk=00000000000d7f40"
+  ],
+  [
+   21.331095,
+   "BENCH syscall      0.5702 s         5.261 Mops  chk=00000000002dc6c0"
+  ],
+  [
+   21.331263,
+   "BENCHDONE"
+  ],
+  [
+   21.331955,
+   "NATEMU_TASK_END qemuuser uptime=21.19"
+  ],
+  [
+   21.332251,
+   "[   21.195586] sysrq: Power Off"
+  ],
+  [
+   21.332394,
+   "[   21.195760] reboot: Power down"
+  ]
+ ]
+}

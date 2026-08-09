@@ -75,6 +75,7 @@ def slowpath_shares():
 
 def main():
     tcg = bench_medians("x86_64-tcg-single.*.json", "json")
+    solo = bench_medians("solo.*.json", "json")
     hvf = bench_medians("aarch64-hvf.*.json", "json")
     pc = plugin_counts()
     sp = slowpath_shares()
@@ -82,10 +83,13 @@ def main():
     fast_ns = (tcg["ls4"] - tcg["alu4"]) / 2.4e9 * 1e9
     print(f"fast-path marginal cost from ablation: {fast_ns:.3f} ns/guest memory access")
 
-    # boot + libc baseline: alu4's loop performs no memory ops, so its whole
-    # count is boot + process startup, common to every run.
-    base = pc.get("alu4", {}).get("guest_mem_ops", 0.0)
-    print(f"boot+startup baseline subtracted: {base/1e6:.1f} M memory ops\n")
+    # boot baseline measured directly with natemu.task=none, subtracted from
+    # every workload so the counts are the benchmark's own.
+    boot = pc.get("boot", {})
+    base = boot.get("guest_mem_ops", 0.0)
+    base_i = boot.get("guest_insns", 0.0)
+    print(f"boot baseline subtracted: {base/1e6:.1f} M memory ops, "
+          f"{base_i/1e6:.1f} M instructions (natemu.task=none)\n")
 
     print(f"{'bench':9s} {'t_tcg':>8s} {'memops(G)':>10s} {'insns(G)':>9s} "
           f"{'mem/insn':>9s} {'fast%':>7s} {'slow%':>7s} {'softmmu%':>9s} "
@@ -95,10 +99,10 @@ def main():
               "matmul", "nqueens", "syscall"]:
         if w not in tcg:
             continue
-        t = tcg[w]
+        t = solo.get(w, tcg[w])   # prefer the isolated run where we have one
         if w in pc:
             mem = max(pc[w]["guest_mem_ops"] - base, 0.0)
-            ins = pc[w]["guest_insns"]
+            ins = max(pc[w]["guest_insns"] - base_i, 1.0)
             mpi = pc[w]["mem_per_insn"]
         else:
             mem = ins = mpi = float("nan")

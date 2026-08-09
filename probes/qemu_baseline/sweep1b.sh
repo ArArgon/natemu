@@ -1,4 +1,12 @@
 #!/bin/bash
+# sweep1b.sh -- the CLEAN re-run of sweep.sh that produced every number published
+# in docs/research/15-qemu-tcg-baseline.md.
+#
+# sweep.sh's first execution overlapped with package downloads on the same host
+# and gave ptr8 a 50% coefficient of variation; that data is kept in
+# results/dirty/ and this script re-collected everything with the machine quiet.
+# It is deliberately minimal (no downloads, no builds) so nothing competes with
+# the measurement.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RES="$HERE/results"; mkdir -p "$RES"

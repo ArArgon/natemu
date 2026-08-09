@@ -15,3 +15,21 @@
 == plugin count nqueens
 == plugin count syscall
 PROFILE DONE
+SWEEP3 DONE
+ALL_DONE
+== sampling matmul
+== sampling ptr8
+== sampling alu
+== sampling sevenzip
+== plugin count alu
+== plugin count ptr8
+== plugin count sevenzip
+SWEEP4 DONE
+FINAL_DONE
+SWEEP5 DONE
+SWEEP5_OK
+SWEEP2_OK
+SWEEP6 DONE
+SWEEP6_OK
+SWEEP7 DONE
+SWEEP7_OK

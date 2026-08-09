@@ -1,0 +1,24 @@
+
+7-Zip (z) 26.01 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-04-27
+ 64-bit locale=en_US.UTF-8 Threads:12 OPEN_MAX:1048576
+
+ mt1 d=22
+Compiler:  CLANG 21.0.0 ver:Apple LLVM 21.0.0 (clang-2100.0.123.102) GCC 4.2.1 : SSE2
+Darwin : 25.5.0 : Darwin Kernel Version 25.5.0: Tue Jun  9 22:28:24 PDT 2026; root:xnu-12377.121.10~1/RELEASE_ARM64_T6020 : x86_64
+PageSize:4KB
+VirtualApple @ 2.50GHz 12C12T
+(206C0)
+
+1T CPU Freq (MHz):  3349  3349  3352  3282  3299  3294  3351
+
+RAM size:   32768 MB,  # CPU hardware threads:  12
+RAM usage:     57 MB,  # Benchmark threads:      1
+
+                       Compressing  |                  Decompressing
+Dict     Speed Usage    R/U Rating  |      Speed Usage    R/U Rating
+         KiB/s     %   MIPS   MIPS  |      KiB/s     %   MIPS   MIPS
+
+22:       6921   100   6707   6733  |      54551   100   4658   4658
+----------------------------------  | ------------------------------
+Avr:      6921   100   6707   6733  |      54551   100   4658   4658
+Tot:             100   5683   5695

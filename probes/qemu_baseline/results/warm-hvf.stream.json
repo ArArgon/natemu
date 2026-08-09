@@ -1,0 +1,114 @@
+{
+ "label": "aarch64-hvf-bench:stream,stream,stream-smp1-single",
+ "cmd": [
+  "/opt/homebrew/bin/qemu-system-aarch64",
+  "-machine",
+  "virt,gic-version=3",
+  "-accel",
+  "hvf",
+  "-m",
+  "3072",
+  "-smp",
+  "1",
+  "-kernel",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/nb-aarch64/boot/vmlinuz-virt",
+  "-initrd",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/initramfs-aarch64.cpio",
+  "-append",
+  "console=ttyAMA0 natemu.task=bench:stream,stream,stream panic=-1 rdinit=/init loglevel=3",
+  "-display",
+  "none",
+  "-serial",
+  "stdio",
+  "-no-reboot",
+  "-nodefaults",
+  "-monitor",
+  "none",
+  "-cpu",
+  "host"
+ ],
+ "host_total_s": 0.913457,
+ "events": {
+  "NATEMU_INIT_UP": 0.154547,
+  "NATEMU_SHELL_UP": 0.154933,
+  "NATEMU_TASK_BEGIN": 0.155243,
+  "BENCHVER": 0.155588,
+  "BENCH": 0.409763,
+  "BENCHDONE": 0.909265,
+  "NATEMU_TASK_END": 0.910088
+ },
+ "benches": [
+  {
+   "name": "stream",
+   "guest_s": 0.2538,
+   "rate": 52875.557,
+   "unit": "MB/s",
+   "host_t_end": 0.409763,
+   "host_s": 0.25452
+  },
+  {
+   "name": "stream",
+   "guest_s": 0.2386,
+   "rate": 56261.024,
+   "unit": "MB/s",
+   "host_t_end": 0.648584,
+   "host_s": 0.238821
+  },
+  {
+   "name": "stream",
+   "guest_s": 0.2603,
+   "rate": 51566.009,
+   "unit": "MB/s",
+   "host_t_end": 0.909212,
+   "host_s": 0.260628
+  }
+ ],
+ "returncode": 0,
+ "when": "2026-08-08T17:31:39",
+ "lines": [
+  [
+   0.154547,
+   "NATEMU_INIT_UP uptime=0.04"
+  ],
+  [
+   0.154933,
+   "NATEMU_SHELL_UP uptime=0.04"
+  ],
+  [
+   0.155243,
+   "NATEMU_TASK_BEGIN bench:stream,stream,stream"
+  ],
+  [
+   0.155588,
+   "BENCHVER 4"
+  ],
+  [
+   0.409763,
+   "BENCH stream       0.2538 s     52875.557 MB/s  chk=a5ab2a3b6e000000"
+  ],
+  [
+   0.648584,
+   "BENCH stream       0.2386 s     56261.024 MB/s  chk=a5ab2a3b6e000000"
+  ],
+  [
+   0.909212,
+   "BENCH stream       0.2603 s     51566.009 MB/s  chk=a5ab2a3b6e000000"
+  ],
+  [
+   0.909265,
+   "BENCHDONE"
+  ],
+  [
+   0.910088,
+   "NATEMU_TASK_END bench:stream,stream,stream uptime=0.79"
+  ],
+  [
+   0.910423,
+   "[    0.797843] sysrq: Power Off"
+  ],
+  [
+   0.910611,
+   "[    0.798058] reboot: Power down"
+  ]
+ ]
+}

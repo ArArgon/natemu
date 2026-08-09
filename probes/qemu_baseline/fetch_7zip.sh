@@ -24,6 +24,13 @@ for A in x86_64 aarch64; do
   cp -a "apk-$A"/usr/lib/libstdc++.so.6* "apk-$A"/usr/lib/libgcc_s.so.1 "overlay-$A/usr/lib/"
 done
 
+# QEMU 11.0.1 linux-user (statically linked, no deps) for the aarch64 guest
+[ -f qemu-x86_64-11.0.1-r0-aarch64.apk ] || curl -sS -L -o qemu-x86_64-11.0.1-r0-aarch64.apk \
+  "$CDN/$BR/community/aarch64/qemu-x86_64-11.0.1-r0.apk"
+mkdir -p qu && tar -xzf qemu-x86_64-11.0.1-r0-aarch64.apk -C qu 2>/dev/null || true
+cp qu/usr/bin/qemu-x86_64 overlay-aarch64/qemu-x86_64; chmod 755 overlay-aarch64/qemu-x86_64
+cp "$HERE/bin/bench.linux-x64" overlay-aarch64/bench-x64; chmod 755 overlay-aarch64/bench-x64
+
 [ -f 7z2601-mac.tar.xz ] || curl -sS -L -O https://www.7-zip.org/a/7z2601-mac.tar.xz
 mkdir -p mac7z && tar -xJf 7z2601-mac.tar.xz -C mac7z
 shasum -a 256 7z2601-mac.tar.xz 7zip-$SZV-*.apk mac7z/7zz

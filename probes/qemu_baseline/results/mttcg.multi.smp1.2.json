@@ -1,0 +1,110 @@
+{
+ "label": "x86_64-tcg-par1-smp1-multi",
+ "cmd": [
+  "/opt/homebrew/bin/qemu-system-x86_64",
+  "-machine",
+  "q35",
+  "-accel",
+  "tcg,thread=multi",
+  "-m",
+  "3072",
+  "-smp",
+  "1",
+  "-kernel",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/nb-x86_64/boot/vmlinuz-virt",
+  "-initrd",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/initramfs-x86_64.cpio",
+  "-append",
+  "console=ttyS0 natemu.task=par1 panic=-1 rdinit=/init loglevel=3",
+  "-display",
+  "none",
+  "-serial",
+  "stdio",
+  "-no-reboot",
+  "-nodefaults",
+  "-monitor",
+  "none",
+  "-cpu",
+  "max"
+ ],
+ "host_total_s": 5.95144,
+ "events": {
+  "NATEMU_INIT_UP": 2.192323,
+  "NATEMU_SHELL_UP": 2.202257,
+  "NATEMU_TASK_BEGIN": 2.209895,
+  "BENCHVER": 5.931458,
+  "BENCH": 5.931553,
+  "BENCHDONE": 5.931663,
+  "NATEMU_TASK_END": 5.936843
+ },
+ "benches": [
+  {
+   "name": "alu4",
+   "guest_s": 0.923,
+   "rate": 325.027,
+   "unit": "Mops",
+   "host_t_end": 5.931553,
+   "host_s": 3.721658
+  },
+  {
+   "name": "ls4",
+   "guest_s": 2.7713,
+   "rate": 108.253,
+   "unit": "Mops",
+   "host_t_end": 5.931634,
+   "host_s": 8.1e-05
+  }
+ ],
+ "returncode": 0,
+ "when": "2026-08-08T17:13:01",
+ "lines": [
+  [
+   2.192323,
+   "NATEMU_INIT_UP uptime=1.47"
+  ],
+  [
+   2.202257,
+   "NATEMU_SHELL_UP uptime=1.49"
+  ],
+  [
+   2.209895,
+   "NATEMU_TASK_BEGIN par1"
+  ],
+  [
+   5.931458,
+   "BENCHVER 4"
+  ],
+  [
+   5.931553,
+   "BENCH alu4         0.9230 s       325.027 Mops  chk=f9f040dc5f7a3b1b"
+  ],
+  [
+   5.931634,
+   "BENCH ls4          2.7713 s       108.253 Mops  chk=f9f04094fc9d000a"
+  ],
+  [
+   5.931663,
+   "BENCHDONE"
+  ],
+  [
+   5.93267,
+   "BENCH par1 uptime_start=1.50 uptime_end=5.21"
+  ],
+  [
+   5.932748,
+   "BENCHDONE"
+  ],
+  [
+   5.936843,
+   "NATEMU_TASK_END par1 uptime=5.22"
+  ],
+  [
+   5.941452,
+   "[    5.252694] sysrq: Power Off"
+  ],
+  [
+   5.943747,
+   "[    5.255361] reboot: Power down"
+  ]
+ ]
+}

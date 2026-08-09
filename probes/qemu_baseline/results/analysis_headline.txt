@@ -1,0 +1,21 @@
+ratio                    all-10  excl.matmul  scalar-int   memory
+tcg/hvf                   8.58x        7.19x       3.04x   13.43x
+tcg/native                8.99x        7.54x       3.04x   13.99x
+hvf/native                1.05x        1.05x       1.00x    1.04x
+atcg/hvf                  4.21x        3.60x       2.66x    2.96x
+rosetta/native            1.43x        1.32x       1.25x    1.28x
+tcg/rosetta               6.30x        5.72x       2.42x   10.93x
+quser/hvf                 3.51x        2.73x       3.16x    2.76x
+tcg/quser                 2.45x        2.63x       0.96x    4.86x
+
+bench         native   rosetta       hvf       tcg      atcg     quser
+alu            0.404     0.465     0.397     0.900     0.815     0.875
+alu4           0.400     0.555     0.425     0.921     0.967     0.924
+ls4            0.444     0.569     0.441     2.784     2.155     1.628
+ls4tlb         1.135     2.138     1.135    35.530     2.325     1.479
+ptr8           0.221     0.226     0.261     3.351     0.379     0.278
+ptr256         1.300     1.454     1.396    17.597     3.147     3.638
+stream         0.249     0.309     0.242     3.313     1.675     2.926
+matmul         0.182     0.527     0.190     8.005     3.274     6.306
+nqueens        0.313     0.387     0.301     1.716     1.218     1.980
+syscall        0.276     0.491     0.344     1.442     8.226     0.573

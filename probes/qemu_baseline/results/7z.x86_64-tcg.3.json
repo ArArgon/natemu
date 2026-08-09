@@ -1,0 +1,171 @@
+{
+ "label": "x86_64-tcg-sevenzip-smp1-single",
+ "cmd": [
+  "/opt/homebrew/bin/qemu-system-x86_64",
+  "-machine",
+  "q35",
+  "-accel",
+  "tcg,thread=single",
+  "-m",
+  "3072",
+  "-smp",
+  "1",
+  "-kernel",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/nb-x86_64/boot/vmlinuz-virt",
+  "-initrd",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/initramfs-x86_64.cpio",
+  "-append",
+  "console=ttyS0 natemu.task=sevenzip panic=-1 rdinit=/init loglevel=3",
+  "-display",
+  "none",
+  "-serial",
+  "stdio",
+  "-no-reboot",
+  "-nodefaults",
+  "-monitor",
+  "none",
+  "-cpu",
+  "max"
+ ],
+ "host_total_s": 29.783607,
+ "events": {
+  "NATEMU_INIT_UP": 2.195865,
+  "NATEMU_SHELL_UP": 2.204623,
+  "NATEMU_TASK_BEGIN": 2.21294,
+  "BENCHDONE": 29.762221,
+  "NATEMU_TASK_END": 29.766527
+ },
+ "benches": [],
+ "returncode": 0,
+ "when": "2026-08-08T17:27:55",
+ "lines": [
+  [
+   2.195865,
+   "NATEMU_INIT_UP uptime=1.48"
+  ],
+  [
+   2.204623,
+   "NATEMU_SHELL_UP uptime=1.50"
+  ],
+  [
+   2.21294,
+   "NATEMU_TASK_BEGIN sevenzip"
+  ],
+  [
+   2.242155,
+   ""
+  ],
+  [
+   2.242263,
+   "7-Zip (z) 26.01 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-04-27"
+  ],
+  [
+   2.243168,
+   " 64-bit locale=C.UTF-8 Threads:1 OPEN_MAX:4096"
+  ],
+  [
+   2.243201,
+   ""
+  ],
+  [
+   2.249204,
+   " mt1 d=22"
+  ],
+  [
+   2.250408,
+   "Compiler:  ver:15.2.0 GCC 15.2.0 : SSE2"
+  ],
+  [
+   2.256462,
+   "Linux : 6.18.35-0-virt : #1-Alpine SMP PREEMPT_DYNAMIC 2026-06-09 12:34:47 : x86_64 : TCGTCGTCGTCG : "
+  ],
+  [
+   2.256545,
+   "PageSize:4KB HPS:2MB THPS:2MB THP:always hwcap:FCBFBFD hwcap2:2"
+  ],
+  [
+   2.256588,
+   "QEMU TCG CPU version 2.5+"
+  ],
+  [
+   2.256619,
+   "(663)  (LP)"
+  ],
+  [
+   2.256655,
+   ""
+  ],
+  [
+   4.698162,
+   "1T CPU Freq (MHz):  1641  1659  1683  1653  1666  1689  1679"
+  ],
+  [
+   4.698301,
+   ""
+  ],
+  [
+   4.699277,
+   "RAM size:    2917 MB (LP),  # CPU hardware threads:   1"
+  ],
+  [
+   4.699892,
+   "RAM usage:     57 MB (LP),  # Benchmark threads:      1"
+  ],
+  [
+   4.699924,
+   ""
+  ],
+  [
+   4.700132,
+   "                       Compressing  |                  Decompressing"
+  ],
+  [
+   4.70032,
+   "Dict     Speed Usage    R/U Rating  |      Speed Usage    R/U Rating"
+  ],
+  [
+   4.700519,
+   "         KiB/s     %   MIPS   MIPS  |      KiB/s     %   MIPS   MIPS"
+  ],
+  [
+   4.70055,
+   ""
+  ],
+  [
+   29.751317,
+   "22:        939    99    924    914  |      17056    99   1475   1456"
+  ],
+  [
+   29.751579,
+   "----------------------------------  | ------------------------------"
+  ],
+  [
+   29.751759,
+   "Avr:       939    99    924    914  |      17056    99   1475   1456"
+  ],
+  [
+   29.751994,
+   "Tot:              99   1199   1185"
+  ],
+  [
+   29.762162,
+   "SEVENZIP_WALL start=1.51 end=29.05"
+  ],
+  [
+   29.762221,
+   "BENCHDONE"
+  ],
+  [
+   29.766527,
+   "NATEMU_TASK_END sevenzip uptime=29.06"
+  ],
+  [
+   29.771578,
+   "[   29.087552] sysrq: Power Off"
+  ],
+  [
+   29.77375,
+   "[   29.090109] reboot: Power down"
+  ]
+ ]
+}

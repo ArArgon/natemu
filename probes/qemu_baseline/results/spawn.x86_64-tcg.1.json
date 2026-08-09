@@ -1,0 +1,71 @@
+{
+ "label": "x86_64-tcg-spawn-smp1-single",
+ "cmd": [
+  "/opt/homebrew/bin/qemu-system-x86_64",
+  "-machine",
+  "q35",
+  "-accel",
+  "tcg,thread=single",
+  "-m",
+  "3072",
+  "-smp",
+  "1",
+  "-kernel",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/nb-x86_64/boot/vmlinuz-virt",
+  "-initrd",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/initramfs-x86_64.cpio",
+  "-append",
+  "console=ttyS0 natemu.task=spawn panic=-1 rdinit=/init loglevel=3",
+  "-display",
+  "none",
+  "-serial",
+  "stdio",
+  "-no-reboot",
+  "-nodefaults",
+  "-monitor",
+  "none",
+  "-cpu",
+  "max"
+ ],
+ "host_total_s": 3.601829,
+ "events": {
+  "NATEMU_INIT_UP": 2.313727,
+  "NATEMU_SHELL_UP": 2.326299,
+  "NATEMU_TASK_BEGIN": 2.33621,
+  "BENCH": 3.580903,
+  "NATEMU_TASK_END": 3.584909
+ },
+ "benches": [],
+ "returncode": 0,
+ "when": "2026-08-08T17:31:57",
+ "lines": [
+  [
+   2.313727,
+   "NATEMU_INIT_UP uptime=1.58"
+  ],
+  [
+   2.326299,
+   "NATEMU_SHELL_UP uptime=1.60"
+  ],
+  [
+   2.33621,
+   "NATEMU_TASK_BEGIN spawn"
+  ],
+  [
+   3.580903,
+   "BENCH spawn400 uptime_start=1.62 uptime_end=2.86"
+  ],
+  [
+   3.584909,
+   "NATEMU_TASK_END spawn uptime=2.86"
+  ],
+  [
+   3.590204,
+   "[    2.891112] sysrq: Power Off"
+  ],
+  [
+   3.592449,
+   "[    2.893767] reboot: Power down"
+  ]
+ ]
+}

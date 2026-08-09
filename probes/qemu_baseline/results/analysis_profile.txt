@@ -1,0 +1,202 @@
+========================================================================================================
+HOST-SIDE PROFILE OF THE QEMU TCG vCPU THREAD  (macOS `sample`, 1 ms, 12 s window)
+========================================================================================================
+
+--- alu   (vCPU-thread samples: 9969, classified 9969)
+       93.89%  translated code (TCG output, incl. inlined softmmu fast path)
+        0.37%  softmmu slow path: TLB refill + software page-table walk
+        0.03%  translation / codegen
+        0.79%  TB dispatch / lookup
+        0.08%  other guest-visible helpers
+        3.85%  host kernel / locks / idle
+        0.98%  unclassified
+                0.06%  _tlv_get_addr  (in libdyld.dylib) + 0,12  [0x180458388,0x180458394]
+                0.05%  x86_cpu_synchronize_from_tb  (in qemu-system-x86_64) + 0  [0x102651504]
+                0.03%  x86_cpu_pending_interrupt  (in qemu-system-x86_64) + 52,148,...  [0x10262a174,0x10262a1d
+                0.03%  x86_cpu_exec_interrupt  (in qemu-system-x86_64) + 0,192  [0x102603264,0x102603324]
+                0.03%  qemu_mutex_unlock_impl  (in qemu-system-x86_64) + 80,104  [0x1027f4c20,0x1027f4c38]
+                0.03%  qemu_mutex_unlock_impl  (in qemu-system-x86_64) + 16,36,...  [0x1027f4be0,0x1027f4bf4,..
+                0.03%  qemu_mutex_lock_impl  (in qemu-system-x86_64) + 20,84  [0x1027f49f8,0x1027f4a38]
+                0.03%  object_dynamic_cast_assert  (in qemu-system-x86_64) + 0,16,...  [0x102689914,0x102689924
+
+--- alu4   (vCPU-thread samples: 10000, classified 10000)
+       93.26%  translated code (TCG output, incl. inlined softmmu fast path)
+        0.52%  softmmu slow path: TLB refill + software page-table walk
+        0.03%  translation / codegen
+        0.84%  TB dispatch / lookup
+        0.08%  other guest-visible helpers
+        4.11%  host kernel / locks / idle
+        1.16%  unclassified
+                0.07%  do_interrupt_all  (in qemu-system-x86_64) + 0,104,...  [0x104f1eff8,0x104f1f060,...]
+                0.06%  runstate_is_running  (in qemu-system-x86_64) + 0,4  [0x104e1c8c0,0x104e1c8c4]
+                0.05%  x86_cpu_pending_interrupt  (in qemu-system-x86_64) + 76,0,...  [0x104efe18c,0x104efe140,
+                0.05%  cpu_thread_is_idle  (in qemu-system-x86_64) + 68,0,...  [0x104e00a2c,0x104e009e8,...]
+                0.05%  _tlv_get_addr  (in libdyld.dylib) + 0  [0x180458388]
+                0.04%  object_dynamic_cast_assert  (in qemu-system-x86_64) + 0,16,...  [0x104f5d914,0x104f5d924
+                0.04%  cpu_reset_interrupt  (in qemu-system-x86_64) + 0,8  [0x104bf2efc,0x104bf2f04]
+                0.04%  cpu_can_run  (in qemu-system-x86_64) + 28,0  [0x104e00fe0,0x104e00fc4]
+
+--- boot   (vCPU-thread samples: 1690, classified 1690)
+       35.44%  translated code (TCG output, incl. inlined softmmu fast path)
+       18.93%  softmmu slow path: TLB refill + software page-table walk
+       12.72%  translation / codegen
+       11.72%  TB dispatch / lookup
+        0.95%  other guest-visible helpers
+       10.06%  host kernel / locks / idle
+       10.18%  unclassified
+                0.36%  _tlv_get_addr  (in libdyld.dylib) + 12  [0x180458394]
+                0.24%  reachable_code_pass  (in qemu-system-x86_64) + 88,104,...  [0x102960d38,0x102960d48,...]
+                0.24%  access_with_adjusted_size  (in qemu-system-x86_64) + 348,300,...  [0x1028ef8ac,0x1028ef8
+                0.24%  _tlv_get_addr  (in libdyld.dylib) + 20  [0x18045839c]
+                0.18%  object_dynamic_cast_assert  (in qemu-system-x86_64) + 200,236  [0x102a459dc,0x102a45a00]
+                0.18%  object_class_dynamic_cast_assert  (in qemu-system-x86_64) + 92,16  [0x102a45b20,0x102a45
+                0.18%  get_bql_locked  (in qemu-system-x86_64) + 28  [0x1028e9398]
+                0.18%  g_hash_table_lookup  (in libglib-2.0.0.dylib) + 140  [0x1051017b4]
+
+--- ls4   (vCPU-thread samples: 9858, classified 9858)
+       93.89%  translated code (TCG output, incl. inlined softmmu fast path)
+        0.54%  softmmu slow path: TLB refill + software page-table walk
+        0.06%  translation / codegen
+        0.74%  TB dispatch / lookup
+        0.08%  other guest-visible helpers
+        3.85%  host kernel / locks / idle
+        0.83%  unclassified
+                0.05%  do_interrupt_all  (in qemu-system-x86_64) + 0,448,...  [0x1045daff8,0x1045db1b8,...]
+                0.04%  get_bql_locked  (in qemu-system-x86_64) + 16,28  [0x1044bd38c,0x1044bd398]
+                0.03%  x86_cpu_synchronize_from_tb  (in qemu-system-x86_64) + 0,32  [0x1045e1504,0x1045e1524]
+                0.03%  x86_cpu_exec_interrupt  (in qemu-system-x86_64) + 88,0  [0x1045932bc,0x104593264]
+                0.03%  qemu_thread_is_self  (in qemu-system-x86_64) + 28,0  [0x1047856f8,0x1047856dc]
+                0.03%  apic_get_ppr  (in qemu-system-x86_64) + 16  [0x10460d5f4]
+                0.02%  set_bql_locked  (in qemu-system-x86_64) + 32  [0x1044bd304]
+                0.02%  rr_start_kick_timer  (in qemu-system-x86_64) + 124,144  [0x1043138ac,0x1043138c0]
+
+--- ls4tlb   (vCPU-thread samples: 10185, classified 10185)
+        2.36%  translated code (TCG output, incl. inlined softmmu fast path)
+       88.55%  softmmu slow path: TLB refill + software page-table walk
+        0.04%  translation / codegen
+        0.55%  TB dispatch / lookup
+        0.01%  other guest-visible helpers
+        1.12%  host kernel / locks / idle
+        7.37%  unclassified
+                1.34%  _tlv_get_addr  (in libdyld.dylib) + 12,20  [0x180458394,0x18045839c]
+                0.78%  target_info  (in qemu-system-x86_64) + 0  [0x10438b508]
+                0.73%  target_big_endian  (in qemu-system-x86_64) + 24  [0x1040853f0]
+                0.55%  _tlv_get_addr  (in libdyld.dylib) + 20  [0x18045839c]
+                0.54%  qemu_ram_ptr_length  (in qemu-system-x86_64) + 276,288  [0x1042a2b50,0x1042a2b5c]
+                0.50%  qemu_ram_ptr_length  (in qemu-system-x86_64) + 40,56,...  [0x1042a2a64,0x1042a2a74,...]
+                0.46%  _tlv_get_addr  (in libdyld.dylib) + 20,12  [0x18045839c,0x180458394]
+                0.36%  cpu_watchpoint_address_matches  (in qemu-system-x86_64) + 0,68,...  [0x1040e7978,0x1040e
+
+--- matmul   (vCPU-thread samples: 10104, classified 10104)
+       47.98%  translated code (TCG output, incl. inlined softmmu fast path)
+        0.46%  softmmu slow path: TLB refill + software page-table walk
+        0.02%  translation / codegen
+        0.80%  TB dispatch / lookup
+       45.31%  other guest-visible helpers
+        4.84%  host kernel / locks / idle
+        0.59%  unclassified
+                0.06%  x86_cpu_synchronize_from_tb  (in qemu-system-x86_64) + 32,0  [0x100d9d524,0x100d9d504]
+                0.04%  x86_cpu_pending_interrupt  (in qemu-system-x86_64) + 0,88,...  [0x100d76140,0x100d76198,
+                0.03%  qemu_clock_enable  (in qemu-system-x86_64) + 52,108  [0x100f53ccc,0x100f53d04]
+                0.03%  do_interrupt_all  (in qemu-system-x86_64) + 0,2592,...  [0x100d96ff8,0x100d97a18,...]
+                0.02%  x86_cpu_exec_interrupt  (in qemu-system-x86_64) + 0,304  [0x100d4f264,0x100d4f394]
+                0.02%  x86_cpu_exec_exit  (in qemu-system-x86_64) + 0  [0x100d9d674]
+                0.02%  qemu_mutex_unlock_impl  (in qemu-system-x86_64) + 16,24  [0x100f40be0,0x100f40be8]
+                0.02%  object_dynamic_cast_assert  (in qemu-system-x86_64) + 80,184  [0x100dd5964,0x100dd59cc]
+
+--- nqueens   (vCPU-thread samples: 10078, classified 10078)
+       69.27%  translated code (TCG output, incl. inlined softmmu fast path)
+        2.95%  softmmu slow path: TLB refill + software page-table walk
+        0.03%  translation / codegen
+       22.36%  TB dispatch / lookup
+        0.12%  other guest-visible helpers
+        3.91%  host kernel / locks / idle
+        1.37%  unclassified
+                0.08%  do_interrupt_all  (in qemu-system-x86_64) + 412,2592,...  [0x10068f194,0x10068fa18,...]
+                0.07%  qemu_mutex_unlock_impl  (in qemu-system-x86_64) + 36,40,...  [0x100838bf4,0x100838bf8,..
+                0.06%  all_cpu_threads_idle  (in qemu-system-x86_64) + 0,20,...  [0x100570a6c,0x100570a80,...]
+                0.05%  _tlv_get_addr  (in libdyld.dylib) + 0  [0x180458388]
+                0.04%  x86_cpu_pending_interrupt  (in qemu-system-x86_64) + 0,4,...  [0x10066e140,0x10066e144,.
+                0.04%  object_dynamic_cast_assert  (in qemu-system-x86_64) + 80,16,...  [0x1006cd964,0x1006cd92
+                0.04%  get_bql_locked  (in qemu-system-x86_64) + 0,16  [0x10057137c,0x10057138c]
+                0.04%  _tlv_get_addr  (in libdyld.dylib) + 12,20  [0x180458394,0x18045839c]
+
+--- ptr256   (vCPU-thread samples: 10198, classified 10198)
+        7.83%  translated code (TCG output, incl. inlined softmmu fast path)
+       83.26%  softmmu slow path: TLB refill + software page-table walk
+        0.04%  translation / codegen
+        0.77%  TB dispatch / lookup
+        0.20%  other guest-visible helpers
+        3.09%  host kernel / locks / idle
+        4.81%  unclassified
+                0.61%  target_big_endian  (in qemu-system-x86_64) + 24  [0x102b413f0]
+                0.47%  _tlv_get_addr  (in libdyld.dylib) + 12,20  [0x180458394,0x18045839c]
+                0.39%  target_info  (in qemu-system-x86_64) + 0  [0x102e47508]
+                0.37%  _tlv_get_addr  (in libdyld.dylib) + 20,12  [0x18045839c,0x180458394]
+                0.35%  qemu_ram_ptr_length  (in qemu-system-x86_64) + 124,40,...  [0x102d5eab8,0x102d5ea64,...]
+                0.35%  _tlv_get_addr  (in libdyld.dylib) + 20  [0x18045839c]
+                0.29%  qemu_ram_ptr_length  (in qemu-system-x86_64) + 276  [0x102d5eb50]
+                0.24%  cpu_watchpoint_address_matches  (in qemu-system-x86_64) + 0,68,...  [0x102ba3978,0x102ba
+
+--- ptr8   (vCPU-thread samples: 494, classified 494)
+       89.07%  translated code (TCG output, incl. inlined softmmu fast path)
+        1.42%  softmmu slow path: TLB refill + software page-table walk
+        0.81%  translation / codegen
+        1.62%  TB dispatch / lookup
+        6.28%  host kernel / locks / idle
+        0.81%  unclassified
+                0.20%  remove_mem_copy_in  (in qemu-system-x86_64) + 156  [0x105100ef0]
+                0.20%  apic_get_ppr  (in qemu-system-x86_64) + 0  [0x1051e15e4]
+                0.20%  _tlv_get_addr  (in libdyld.dylib) + 20  [0x18045839c]
+                0.20%  DYLD-STUB$$pthread_equal  (in qemu-system-x86_64) + 4  [0x1053d74c8]
+
+--- sevenzip   (vCPU-thread samples: 10144, classified 10144)
+       48.58%  translated code (TCG output, incl. inlined softmmu fast path)
+       31.67%  softmmu slow path: TLB refill + software page-table walk
+        0.14%  translation / codegen
+        9.53%  TB dispatch / lookup
+        1.06%  other guest-visible helpers
+        6.27%  host kernel / locks / idle
+        2.74%  unclassified
+                0.28%  _tlv_get_addr  (in libdyld.dylib) + 12,20  [0x180458394,0x18045839c]
+                0.27%  _tlv_get_addr  (in libdyld.dylib) + 20  [0x18045839c]
+                0.16%  target_info  (in qemu-system-x86_64) + 0  [0x104403508]
+                0.16%  _tlv_get_addr  (in libdyld.dylib) + 12  [0x180458394]
+                0.15%  target_big_endian  (in qemu-system-x86_64) + 24  [0x1040fd3f0]
+                0.14%  cpu_watchpoint_address_matches  (in qemu-system-x86_64) + 0,68,...  [0x10415f978,0x10415
+                0.08%  cpu_watchpoint_address_matches  (in qemu-system-x86_64) + 0  [0x10415f978]
+                0.06%  qemu_ram_ptr_length  (in qemu-system-x86_64) + 40,124  [0x10431aa64,0x10431aab8]
+
+--- stream   (vCPU-thread samples: 10047, classified 10047)
+       80.90%  translated code (TCG output, incl. inlined softmmu fast path)
+       11.77%  softmmu slow path: TLB refill + software page-table walk
+        0.02%  translation / codegen
+        0.89%  TB dispatch / lookup
+        0.04%  other guest-visible helpers
+        4.40%  host kernel / locks / idle
+        1.98%  unclassified
+                0.12%  qemu_ram_ptr_length  (in qemu-system-x86_64) + 40,124,...  [0x100e86a64,0x100e86ab8,...]
+                0.12%  _tlv_get_addr  (in libdyld.dylib) + 12,20  [0x180458394,0x18045839c]
+                0.10%  target_big_endian  (in qemu-system-x86_64) + 24  [0x100c693f0]
+                0.09%  qemu_mutex_unlock_impl  (in qemu-system-x86_64) + 4,24,...  [0x10113cbd4,0x10113cbe8,...
+                0.08%  cpu_watchpoint_address_matches  (in qemu-system-x86_64) + 0,68,...  [0x100ccb978,0x100cc
+                0.06%  target_info  (in qemu-system-x86_64) + 8  [0x100f6f510]
+                0.06%  _tlv_get_addr  (in libdyld.dylib) + 20,12  [0x18045839c,0x180458394]
+                0.06%  _tlv_get_addr  (in libdyld.dylib) + 20  [0x18045839c]
+
+--- syscall   (vCPU-thread samples: 10191, classified 10191)
+       29.24%  translated code (TCG output, incl. inlined softmmu fast path)
+        4.97%  softmmu slow path: TLB refill + software page-table walk
+        0.05%  translation / codegen
+       30.40%  TB dispatch / lookup
+        6.27%  other guest-visible helpers
+       25.38%  host kernel / locks / idle
+        3.70%  unclassified
+                0.42%  cpu_get_ticks  (in qemu-system-x86_64) + 48,88,...  [0x102795ef4,0x102795f1c,...]
+                0.38%  cpu_sync_bndcs_hflags  (in qemu-system-x86_64) + 32,0,...  [0x102897464,0x102897444,...]
+                0.33%  cpu_load_eflags  (in qemu-system-x86_64) + 68,8,...  [0x1028b21d4,0x1028b2198,...]
+                0.19%  cpu_sync_bndcs_hflags  (in qemu-system-x86_64) + 32,80,...  [0x102897464,0x102897494,...
+                0.18%  DYLD-STUB$$pthread_jit_write_protect_np  (in qemu-system-x86_64) + 4  [0x102adb504]
+                0.13%  cpu_load_eflags  (in qemu-system-x86_64) + 68  [0x1028b21d4]
+                0.13%  DYLD-STUB$$clock_gettime  (in qemu-system-x86_64) + 4,8  [0x102ad8b88,0x102ad8b8c]
+                0.10%  cpu_cc_compute_all  (in qemu-system-x86_64) + 48  [0x10289ab74]

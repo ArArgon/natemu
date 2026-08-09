@@ -1,0 +1,15 @@
+alpine-minirootfs-3.24.1-x86_64.tar.gz  sha256=41f73e3cf5fa919b8aa5ca6b30dc48f0da2720776d7423e2a7748211456fe081
+alpine-minirootfs-3.24.1-aarch64.tar.gz  sha256=f55a90f69052c5bd6f92cb09a8f47065970830b194c917a006fb94028e721259
+alpine-netboot-3.24.1-x86_64.tar.gz  sha256=9a7769ea8fa1737b1b49d82f1bdd53d0a17338d6d3b7cfc6f2c3ec5158596d8b
+alpine-netboot-3.24.1-aarch64.tar.gz  sha256=54fe38fa41cce740ba379458ed63cfcd89ab06ae5e6a47a06dafe0a34e8427e8
+== zig 0.16.0
+a5ffc80714e0b8d5422c2eba4818481d1d8f5a789bb9b3a7e89d61641ef5e102  /Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/bin/bench.linux-arm64
+b9cb1d5847e10234446ad53c62151566783665219ec6f4f6e28f758eefc1add9  /Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/bin/bench.linux-x64
+956eef8edce8d4e9003225d8a8fa670f11748dab9957e76d4fa2aa398b60e497  /Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/bin/bench.macos-arm64
+3cb3d0bb4d91ffb4522b1f13e83daf5da7d6db9f8fea5dace9e55439a3760e70  /Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/bin/bench.macos-x64
+initramfs-x86_64.cpio  14583812 bytes  sha256=4f5b3ab4b7ef3d650f8b4f80183674922aa4390de241736eb165dfe480ec9f21
+initramfs-aarch64.cpio  20110604 bytes  sha256=832bda0ab1dafcacd844ecc9065c5472279152e35b68eba0c717e2d1d0d030e1
+== kernels
+x86_64   1e6bf9027720c75c3ed0d79171f21b5791ee40ca9795d07c7c6e04dc5ea2ae90  /Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/nb-x86_64/boot/vmlinuz-virt
+aarch64  47970e0ee0478fe5c60824a89f162d5a353fa29466e5d3bddb0f9c506f1ed756  /Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/nb-aarch64/boot/vmlinuz-virt
+OK

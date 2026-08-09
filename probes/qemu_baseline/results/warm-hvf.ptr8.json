@@ -1,0 +1,150 @@
+{
+ "label": "aarch64-hvf-bench:ptr8,ptr8,ptr8,ptr8,ptr8,ptr8-smp1-single",
+ "cmd": [
+  "/opt/homebrew/bin/qemu-system-aarch64",
+  "-machine",
+  "virt,gic-version=3",
+  "-accel",
+  "hvf",
+  "-m",
+  "3072",
+  "-smp",
+  "1",
+  "-kernel",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/nb-aarch64/boot/vmlinuz-virt",
+  "-initrd",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/initramfs-aarch64.cpio",
+  "-append",
+  "console=ttyAMA0 natemu.task=bench:ptr8,ptr8,ptr8,ptr8,ptr8,ptr8 panic=-1 rdinit=/init loglevel=3",
+  "-display",
+  "none",
+  "-serial",
+  "stdio",
+  "-no-reboot",
+  "-nodefaults",
+  "-monitor",
+  "none",
+  "-cpu",
+  "host"
+ ],
+ "host_total_s": 1.575993,
+ "events": {
+  "NATEMU_INIT_UP": 0.150066,
+  "NATEMU_SHELL_UP": 0.150414,
+  "NATEMU_TASK_BEGIN": 0.150822,
+  "BENCHVER": 0.15121,
+  "BENCH": 0.392906,
+  "BENCHDONE": 1.571598,
+  "NATEMU_TASK_END": 1.572121
+ },
+ "benches": [
+  {
+   "name": "ptr8",
+   "guest_s": 0.2414,
+   "rate": 124.256,
+   "unit": "Mops",
+   "host_t_end": 0.392906,
+   "host_s": 0.242084
+  },
+  {
+   "name": "ptr8",
+   "guest_s": 0.2363,
+   "rate": 126.961,
+   "unit": "Mops",
+   "host_t_end": 0.629439,
+   "host_s": 0.236533
+  },
+  {
+   "name": "ptr8",
+   "guest_s": 0.2347,
+   "rate": 127.822,
+   "unit": "Mops",
+   "host_t_end": 0.864347,
+   "host_s": 0.234908
+  },
+  {
+   "name": "ptr8",
+   "guest_s": 0.2325,
+   "rate": 129.01,
+   "unit": "Mops",
+   "host_t_end": 1.097125,
+   "host_s": 0.232778
+  },
+  {
+   "name": "ptr8",
+   "guest_s": 0.2388,
+   "rate": 125.626,
+   "unit": "Mops",
+   "host_t_end": 1.336173,
+   "host_s": 0.239048
+  },
+  {
+   "name": "ptr8",
+   "guest_s": 0.2352,
+   "rate": 127.567,
+   "unit": "Mops",
+   "host_t_end": 1.571559,
+   "host_s": 0.235386
+  }
+ ],
+ "returncode": 0,
+ "when": "2026-08-08T17:28:13",
+ "lines": [
+  [
+   0.150066,
+   "NATEMU_INIT_UP uptime=0.03"
+  ],
+  [
+   0.150414,
+   "NATEMU_SHELL_UP uptime=0.03"
+  ],
+  [
+   0.150822,
+   "NATEMU_TASK_BEGIN bench:ptr8,ptr8,ptr8,ptr8,ptr8,ptr8"
+  ],
+  [
+   0.15121,
+   "BENCHVER 4"
+  ],
+  [
+   0.392906,
+   "BENCH ptr8         0.2414 s       124.256 Mops  chk=00000e4e1d789457"
+  ],
+  [
+   0.629439,
+   "BENCH ptr8         0.2363 s       126.961 Mops  chk=00000e4e1d789457"
+  ],
+  [
+   0.864347,
+   "BENCH ptr8         0.2347 s       127.822 Mops  chk=00000e4e1d789457"
+  ],
+  [
+   1.097125,
+   "BENCH ptr8         0.2325 s       129.010 Mops  chk=00000e4e1d789457"
+  ],
+  [
+   1.336173,
+   "BENCH ptr8         0.2388 s       125.626 Mops  chk=00000e4e1d789457"
+  ],
+  [
+   1.571559,
+   "BENCH ptr8         0.2352 s       127.567 Mops  chk=00000e4e1d789457"
+  ],
+  [
+   1.571598,
+   "BENCHDONE"
+  ],
+  [
+   1.572121,
+   "NATEMU_TASK_END bench:ptr8,ptr8,ptr8,ptr8,ptr8,ptr8 uptime=1.46"
+  ],
+  [
+   1.572411,
+   "[    1.461626] sysrq: Power Off"
+  ],
+  [
+   1.572512,
+   "[    1.461772] reboot: Power down"
+  ]
+ ]
+}

@@ -1,0 +1,7 @@
+NATEMU_INIT_UP uptime=1.59
+NATEMU_SHELL_UP uptime=1.61
+NATEMU_TASK_BEGIN bench:matmul,matmul,matmul,matmul,matmul,matmul
+BENCHVER 4
+BENCH matmul       6.1900 s       635.241 Mops  chk=0000001f5e05e316
+BENCH matmul       6.8083 s       577.554 Mops  chk=0000001f5e05e316
+qemu-system-x86_64: terminating on signal 15 from pid 67058 (<unknown process>)

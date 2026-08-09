@@ -1,0 +1,114 @@
+{
+ "label": "x86_64-tcg-bench:ptr256,ptr256,ptr256-smp1-single",
+ "cmd": [
+  "/opt/homebrew/bin/qemu-system-x86_64",
+  "-machine",
+  "q35",
+  "-accel",
+  "tcg,thread=single",
+  "-m",
+  "3072",
+  "-smp",
+  "1",
+  "-kernel",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/nb-x86_64/boot/vmlinuz-virt",
+  "-initrd",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/initramfs-x86_64.cpio",
+  "-append",
+  "console=ttyS0 natemu.task=bench:ptr256,ptr256,ptr256 panic=-1 rdinit=/init loglevel=3",
+  "-display",
+  "none",
+  "-serial",
+  "stdio",
+  "-no-reboot",
+  "-nodefaults",
+  "-monitor",
+  "none",
+  "-cpu",
+  "max"
+ ],
+ "host_total_s": 53.548229,
+ "events": {
+  "NATEMU_INIT_UP": 2.235243,
+  "NATEMU_SHELL_UP": 2.243702,
+  "NATEMU_TASK_BEGIN": 2.252153,
+  "BENCHVER": 2.264918,
+  "BENCH": 20.131798,
+  "BENCHDONE": 53.516508,
+  "NATEMU_TASK_END": 53.524911
+ },
+ "benches": [
+  {
+   "name": "ptr256",
+   "guest_s": 17.8643,
+   "rate": 0.448,
+   "unit": "Mops",
+   "host_t_end": 20.131798,
+   "host_s": 17.879645
+  },
+  {
+   "name": "ptr256",
+   "guest_s": 17.3753,
+   "rate": 0.46,
+   "unit": "Mops",
+   "host_t_end": 37.507381,
+   "host_s": 17.375583
+  },
+  {
+   "name": "ptr256",
+   "guest_s": 16.0086,
+   "rate": 0.5,
+   "unit": "Mops",
+   "host_t_end": 53.516217,
+   "host_s": 16.008836
+  }
+ ],
+ "returncode": 0,
+ "when": "2026-08-08T17:31:22",
+ "lines": [
+  [
+   2.235243,
+   "NATEMU_INIT_UP uptime=1.49"
+  ],
+  [
+   2.243702,
+   "NATEMU_SHELL_UP uptime=1.51"
+  ],
+  [
+   2.252153,
+   "NATEMU_TASK_BEGIN bench:ptr256,ptr256,ptr256"
+  ],
+  [
+   2.264918,
+   "BENCHVER 4"
+  ],
+  [
+   20.131798,
+   "BENCH ptr256      17.8643 s         0.448 Mops  chk=00007a0f78cfc5f4"
+  ],
+  [
+   37.507381,
+   "BENCH ptr256      17.3753 s         0.460 Mops  chk=00007a0f78cfc5f4"
+  ],
+  [
+   53.516217,
+   "BENCH ptr256      16.0086 s         0.500 Mops  chk=00007a0f78cfc5f4"
+  ],
+  [
+   53.516508,
+   "BENCHDONE"
+  ],
+  [
+   53.524911,
+   "NATEMU_TASK_END bench:ptr256,ptr256,ptr256 uptime=52.79"
+  ],
+  [
+   53.530602,
+   "[   52.820315] sysrq: Power Off"
+  ],
+  [
+   53.532785,
+   "[   52.822840] reboot: Power down"
+  ]
+ ]
+}
