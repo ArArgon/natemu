@@ -1,0 +1,36 @@
+ISACLASS static_insns=496670 static_x87=8 tb_translations=92838 static_lo1M=4535 static_1M_4G=10329 static_4G_kern=17223 static_kernhalf=464583
+bucket                       user           kernel            total  pct_total
+ISACLASS total                   575090235        562374275       1137464510 100.000000
+ISACLASS x87                             6                2                8   0.000001
+ISACLASS x87_arith                       0                0                0   0.000000
+ISACLASS fxsave_grp                      0              243              243   0.000021
+ISACLASS xcr                             0                2                2   0.000000
+ISACLASS mmx                             0                0                0   0.000000
+ISACLASS sse_fp                        929                0              929   0.000082
+ISACLASS sse_int                      1221           248681           249902   0.021970
+ISACLASS avx128                          0                0                0   0.000000
+ISACLASS avx256                          0                0                0   0.000000
+ISACLASS seg_override                 2762          4484609          4487371   0.394506
+ISACLASS seg_movlar                  11043           185101           196144   0.017244
+ISACLASS descr_table                  1274               11             1285   0.000113
+ISACLASS far_ctrlflow                  812            92374            93186   0.008192
+ISACLASS mov_cr_dr                    1284            20810            22094   0.001942
+ISACLASS msr                            36              129              165   0.000015
+ISACLASS cpuid                         291              690              981   0.000086
+ISACLASS ioport                       2513           738238           740751   0.065123
+ISACLASS invlpg                          0            38451            38451   0.003380
+ISACLASS swapgs                          0            12102            12102   0.001064
+ISACLASS fsgsbase                        0             8542             8542   0.000751
+ISACLASS syscall_int                   482              416              898   0.000079
+ISACLASS cr0_write                     509                7              516   0.000045
+ISACLASS cr3_write                       5            19900            19905   0.001750
+ISACLASS cr4_write                       3               62               65   0.000006
+ISACLASS cr_read                       767              835             1602   0.000141
+ISACLASS va_below_1M               5324079                0          5324079   0.468066
+ISACLASS va_1M_to_4G             566463548                0        566463548  49.800547
+ISACLASS va_4G_to_kern             3302608                0          3302608   0.290348
+ISACLASS va_kernel_half                  0        562374275        562374275  49.441039
+X87MNEM distinct_executed=3 distinct_translated=3
+X87MNEM fninit       user=2 kernel=2 total=4
+X87MNEM fnstsw       user=2 kernel=0 total=2
+X87MNEM fnstcw       user=2 kernel=0 total=2
