@@ -23,7 +23,22 @@
 | 17 | [precise-exceptions](17-precise-exceptions.md) | Can we keep aggressive codegen AND precise faults? | **Yes — the hot fault needs no precise state at all.** A shadow miss is invisible to the guest: fill and retry. Only guest-visible faults reconstruct. Two-tier handler worth 19% of the hot path. Conservative spilling measured **+170-241%**; RIP-alone ~2%. `AT` probe-then-execute **refuted** as a general answer (24-55x a store). |
 | 13 | [audit-skeptical-review](13-audit-skeptical-review.md) | Does the corpus survive scrutiny? | **3 of 4 load-bearing conclusions did not, as stated.** Decoder bugs, G-1/G-2 closed on insufficient evidence, refuted premise in 07, speedup double-counting. |
 | 14 | [gate-results-verified](14-gate-results-verified.md) | G-1/G-4 closed by experiment | **4K stage-1 + 4K stage-2 permissions ENFORCED inside one 16K host page; T0SZ=16 (48-bit VA) works; TSO litmus 1.7M→0.** G-2 quads now MOOT. |
+| 19 | [smp-scaling](19-smp-scaling.md) | Does the design scale past one core? | **91–92% efficiency at 8 vCPUs.** TLBI broadcast is the wall (441–961 ns busy); cross-vCPU doorbells 68 ns. The "never TLBI on invalid→valid" rule is worth **6.8× at 8 vCPUs** vs 3.0× at one. Carries an auditor's note: the SGI-reliability claim did **not** reproduce at the probe's default `n`. |
 | 12 | [performance-ranking](12-performance-ranking.md) | Perf concerns ranked + live tracking | **1. MMU 1.5× → 2. TSO 3.4×/2–5% → 3. Codegen 4.4× → 4. Precise 10–20% vs 2–5× → 5. SMC 4× → 6. Quad 15–35% → 7. Exits 1.2M/core → 8. A/D+TLB**. Live `/tmp/probe_mmu_tso.c`. |
+
+## In flight (2026-08-08)
+
+| Doc | Question | State |
+|---|---|---|
+| 18 | What can a guest at EL1 under Hypervisor.framework *actually* do? | being probed |
+| 20 | Shadow page-table coherence — how do we learn the guest edited its own PTs? | being researched |
+| 21 | SMC detection and code invalidation | being researched |
+| 23 | Can FEXCore be retrofitted as the JIT? | being written from salvaged source analysis |
+| 26 | Guest fault/PT-write/CR3 **rates** — the missing half of every cost model | being measured |
+| 22, 24, 25 | Async interrupt injection · boot path & x87 · correctness oracle | queued |
+
+`docs/research/raw/` holds **raw, unaudited** sub-agent reports rescued from agents that died
+mid-run. They are inputs to 20/21/23, not evidence — see `raw/README.md`.
 
 ## Reading order for a newcomer
 
