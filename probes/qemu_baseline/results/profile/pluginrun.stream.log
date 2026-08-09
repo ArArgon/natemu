@@ -1,0 +1,9 @@
+NATEMU_INIT_UP uptime=1.79
+NATEMU_SHELL_UP uptime=1.81
+NATEMU_TASK_BEGIN bench:stream
+BENCHVER 4
+BENCH stream       3.7512 s      3577.972 MB/s  chk=a5ab2a3b6e000000
+BENCHDONE
+NATEMU_TASK_END bench:stream uptime=5.60
+[    5.639893] sysrq: Power Off
+[    5.643545] reboot: Power down

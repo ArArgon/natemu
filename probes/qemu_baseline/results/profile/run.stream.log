@@ -1,0 +1,9 @@
+NATEMU_INIT_UP uptime=1.49
+NATEMU_SHELL_UP uptime=1.50
+NATEMU_TASK_BEGIN bench:stream,stream,stream,stream,stream,stream,stream,stream
+BENCHVER 4
+BENCH stream       3.3261 s      4035.271 MB/s  chk=a5ab2a3b6e000000
+BENCH stream       3.5120 s      3821.686 MB/s  chk=a5ab2a3b6e000000
+BENCH stream       3.5466 s      3784.449 MB/s  chk=a5ab2a3b6e000000
+BENCH stream       3.5456 s      3785.444 MB/s  chk=a5ab2a3b6e000000
+qemu-system-x86_64: terminating on signal 15 from pid 65617 (<unknown process>)

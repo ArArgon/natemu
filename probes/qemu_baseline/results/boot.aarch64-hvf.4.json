@@ -1,0 +1,66 @@
+{
+ "label": "aarch64-hvf-none-smp1-single",
+ "cmd": [
+  "/opt/homebrew/bin/qemu-system-aarch64",
+  "-machine",
+  "virt,gic-version=3",
+  "-accel",
+  "hvf",
+  "-m",
+  "3072",
+  "-smp",
+  "1",
+  "-kernel",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/nb-aarch64/boot/vmlinuz-virt",
+  "-initrd",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/initramfs-aarch64.cpio",
+  "-append",
+  "console=ttyAMA0 natemu.task=none panic=-1 rdinit=/init loglevel=3",
+  "-display",
+  "none",
+  "-serial",
+  "stdio",
+  "-no-reboot",
+  "-nodefaults",
+  "-monitor",
+  "none",
+  "-cpu",
+  "host"
+ ],
+ "host_total_s": 0.162905,
+ "events": {
+  "NATEMU_INIT_UP": 0.157879,
+  "NATEMU_SHELL_UP": 0.158273,
+  "NATEMU_TASK_BEGIN": 0.158523,
+  "NATEMU_TASK_END": 0.158797
+ },
+ "benches": [],
+ "returncode": 0,
+ "when": "2026-08-08T16:49:57",
+ "lines": [
+  [
+   0.157879,
+   "NATEMU_INIT_UP uptime=0.04"
+  ],
+  [
+   0.158273,
+   "NATEMU_SHELL_UP uptime=0.04"
+  ],
+  [
+   0.158523,
+   "NATEMU_TASK_BEGIN none"
+  ],
+  [
+   0.158797,
+   "NATEMU_TASK_END none uptime=0.04"
+  ],
+  [
+   0.159059,
+   "[    0.042378] sysrq: Power Off"
+  ],
+  [
+   0.159174,
+   "[    0.042532] reboot: Power down"
+  ]
+ ]
+}

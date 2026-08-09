@@ -1,0 +1,5 @@
+BENCHVER 4
+BENCH alu          1.2512 s       239.764 Mops  chk=874f08ae8ad6f007
+BENCH alu4         1.1380 s       263.626 Mops  chk=f9f040dc5f7a3b1b
+BENCH ls4          1.4100 s       212.767 Mops  chk=f9f04094fc9d000a
+BENCHDONE

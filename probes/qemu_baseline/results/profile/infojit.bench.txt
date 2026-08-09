@@ -1,0 +1,25 @@
+QEMU 11.0.3 monitor - type 'help' for more information
+(qemu) i[K[Din[K[D[Dinf[K[D[D[Dinfo[K[D[D[D[Dinfo [K[D[D[D[D[Dinfo j[K[D[D[D[D[D[Dinfo ji[K[D[D[D[D[D[D[Dinfo jit[K
+Accelerator settings:
+one-insn-per-tb: off
+
+Translation buffer state:
+gen code size       59799608/1073724416
+TB count            90841
+TB avg target size  20 max=819 bytes
+TB avg host size    316 bytes (expansion ratio: 15.7)
+cross page TB count 295 (0%)
+direct jump count   54034 (59%) (2 jumps=43437 47%)
+TB hash buckets     29272/32768 (89.33% head buckets used)
+TB hash occupancy   49.45% avg chain occ. Histogram: [0,10)%|▃ ▆▁ █▂▆▁▃|[90,100]%
+TB hash avg chain   1.123 buckets. Histogram: 1|█▁▁|3
+
+Statistics:
+TB flush count      0
+TB invalidate count 17091
+TLB full flushes    0
+TLB partial flushes 41056
+TLB elided flushes  296992
+(qemu) i[K[Din[K[D[Dinf[K[D[D[Dinfo[K[D[D[D[Dinfo [K[D[D[D[D[Dinfo s[K[D[D[D[D[D[Dinfo st[K[D[D[D[D[D[D[Dinfo sta[K[D[D[D[D[D[D[D[Dinfo stat[K[D[D[D[D[D[D[D[D[Dinfo statu[K[D[D[D[D[D[D[D[D[D[Dinfo status[K
+VM status: running
+(qemu) 

@@ -1,0 +1,1 @@
+PLUGINCOUNT guest_insns=1116386131 guest_tb_exec=230870793 guest_mem_ops=465865145 tb_translations=89429 insns_per_tb=4.84 mem_per_insn=0.4173

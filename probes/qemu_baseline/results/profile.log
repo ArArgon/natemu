@@ -1,0 +1,17 @@
+== sampling alu4
+== sampling ls4
+== sampling ls4tlb
+== sampling stream
+== sampling ptr256
+== sampling nqueens
+== sampling syscall
+== sampling boot
+== plugin count alu4
+== plugin count ls4
+== plugin count ls4tlb
+== plugin count ptr256
+== plugin count stream
+== plugin count matmul
+== plugin count nqueens
+== plugin count syscall
+PROFILE DONE

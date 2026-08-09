@@ -1,0 +1,90 @@
+{
+ "label": "x86_64-tcg-bench:ptr8-smp1-single",
+ "cmd": [
+  "/opt/homebrew/bin/qemu-system-x86_64",
+  "-machine",
+  "q35",
+  "-accel",
+  "tcg,thread=single",
+  "-m",
+  "3072",
+  "-smp",
+  "1",
+  "-kernel",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/nb-x86_64/boot/vmlinuz-virt",
+  "-initrd",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/initramfs-x86_64.cpio",
+  "-append",
+  "console=ttyS0 natemu.task=bench:ptr8 panic=-1 rdinit=/init loglevel=3",
+  "-display",
+  "none",
+  "-serial",
+  "stdio",
+  "-no-reboot",
+  "-nodefaults",
+  "-monitor",
+  "none",
+  "-cpu",
+  "max"
+ ],
+ "host_total_s": 5.632088,
+ "events": {
+  "NATEMU_INIT_UP": 2.221489,
+  "NATEMU_SHELL_UP": 2.232476,
+  "NATEMU_TASK_BEGIN": 2.241709,
+  "BENCHVER": 2.255235,
+  "BENCH": 5.608625,
+  "BENCHDONE": 5.608943,
+  "NATEMU_TASK_END": 5.616208
+ },
+ "benches": [
+  {
+   "name": "ptr8",
+   "guest_s": 3.3507,
+   "rate": 8.953,
+   "unit": "Mops",
+   "host_t_end": 5.608625,
+   "host_s": 3.366916
+  }
+ ],
+ "returncode": 0,
+ "when": "2026-08-08T17:03:29",
+ "lines": [
+  [
+   2.221489,
+   "NATEMU_INIT_UP uptime=1.50"
+  ],
+  [
+   2.232476,
+   "NATEMU_SHELL_UP uptime=1.51"
+  ],
+  [
+   2.241709,
+   "NATEMU_TASK_BEGIN bench:ptr8"
+  ],
+  [
+   2.255235,
+   "BENCHVER 4"
+  ],
+  [
+   5.608625,
+   "BENCH ptr8         3.3507 s         8.953 Mops  chk=00000e4e1d789457"
+  ],
+  [
+   5.608943,
+   "BENCHDONE"
+  ],
+  [
+   5.616208,
+   "NATEMU_TASK_END bench:ptr8 uptime=4.90"
+  ],
+  [
+   5.621856,
+   "[    4.927600] sysrq: Power Off"
+  ],
+  [
+   5.624016,
+   "[    4.930157] reboot: Power down"
+  ]
+ ]
+}

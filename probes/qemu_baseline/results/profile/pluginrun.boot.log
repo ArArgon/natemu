@@ -1,0 +1,6 @@
+NATEMU_INIT_UP uptime=1.98
+NATEMU_SHELL_UP uptime=2.01
+NATEMU_TASK_BEGIN none
+NATEMU_TASK_END none uptime=2.02
+[    2.064179] sysrq: Power Off
+[    2.068590] reboot: Power down

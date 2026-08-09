@@ -1,0 +1,9 @@
+NATEMU_INIT_UP uptime=1.48
+NATEMU_SHELL_UP uptime=1.49
+NATEMU_TASK_BEGIN bench:ls4,ls4,ls4,ls4,ls4,ls4,ls4,ls4,ls4,ls4
+BENCHVER 4
+BENCH ls4          3.7329 s        80.366 Mops  chk=f9f04094fc9d000a
+BENCH ls4          3.3950 s        88.366 Mops  chk=f9f04094fc9d000a
+BENCH ls4          3.1082 s        96.520 Mops  chk=f9f04094fc9d000a
+BENCH ls4          3.1321 s        95.784 Mops  chk=f9f04094fc9d000a
+qemu-system-x86_64: terminating on signal 15 from pid 65617 (<unknown process>)

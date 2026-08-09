@@ -1,0 +1,90 @@
+{
+ "label": "x86_64-tcg-bench:ls4tlb-smp1-single",
+ "cmd": [
+  "/opt/homebrew/bin/qemu-system-x86_64",
+  "-machine",
+  "q35",
+  "-accel",
+  "tcg,thread=single",
+  "-m",
+  "3072",
+  "-smp",
+  "1",
+  "-kernel",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/nb-x86_64/boot/vmlinuz-virt",
+  "-initrd",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/initramfs-x86_64.cpio",
+  "-append",
+  "console=ttyS0 natemu.task=bench:ls4tlb panic=-1 rdinit=/init loglevel=3",
+  "-display",
+  "none",
+  "-serial",
+  "stdio",
+  "-no-reboot",
+  "-nodefaults",
+  "-monitor",
+  "none",
+  "-cpu",
+  "max"
+ ],
+ "host_total_s": 36.825877,
+ "events": {
+  "NATEMU_INIT_UP": 2.189967,
+  "NATEMU_SHELL_UP": 2.19965,
+  "NATEMU_TASK_BEGIN": 2.20784,
+  "BENCHVER": 2.219913,
+  "BENCH": 36.802884,
+  "BENCHDONE": 36.803212,
+  "NATEMU_TASK_END": 36.809857
+ },
+ "benches": [
+  {
+   "name": "ls4tlb",
+   "guest_s": 34.4449,
+   "rate": 1.742,
+   "unit": "Mops",
+   "host_t_end": 36.802884,
+   "host_s": 34.595044
+  }
+ ],
+ "returncode": 0,
+ "when": "2026-08-08T17:04:55",
+ "lines": [
+  [
+   2.189967,
+   "NATEMU_INIT_UP uptime=1.47"
+  ],
+  [
+   2.19965,
+   "NATEMU_SHELL_UP uptime=1.49"
+  ],
+  [
+   2.20784,
+   "NATEMU_TASK_BEGIN bench:ls4tlb"
+  ],
+  [
+   2.219913,
+   "BENCHVER 4"
+  ],
+  [
+   36.802884,
+   "BENCH ls4tlb      34.4449 s         1.742 Mops  chk=bdc372d6000ce57d"
+  ],
+  [
+   36.803212,
+   "BENCHDONE"
+  ],
+  [
+   36.809857,
+   "NATEMU_TASK_END bench:ls4tlb uptime=36.10"
+  ],
+  [
+   36.814989,
+   "[   36.130085] sysrq: Power Off"
+  ],
+  [
+   36.817166,
+   "[   36.132630] reboot: Power down"
+  ]
+ ]
+}

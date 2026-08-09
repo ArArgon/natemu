@@ -1,0 +1,16 @@
+NATEMU_INIT_UP uptime=1.61
+NATEMU_SHELL_UP uptime=1.62
+NATEMU_TASK_BEGIN bench
+BENCHVER 4
+BENCH alu          0.9036 s       332.015 Mops  chk=874f08ae8ad6f007
+BENCH alu4         0.9305 s       322.424 Mops  chk=f9f040dc5f7a3b1b
+BENCH ls4          2.7971 s       107.256 Mops  chk=f9f04094fc9d000a
+BENCH ls4tlb      38.5924 s         1.555 Mops  chk=bdc372d6000ce57d
+BENCH ptr8         3.1393 s         9.556 Mops  chk=00000e4e1d789457
+BENCH ptr256      18.5309 s         0.432 Mops  chk=00007a0f78cfc5f4
+BENCH stream       3.4987 s      3836.164 MB/s  chk=a5ab2a3b6e000000
+BENCH matmul       8.1101 s       484.849 Mops  chk=0000001f5e05e316
+BENCH nqueens      1.7153 s         6.996 solves/s  chk=00000000000d7f40
+BENCH syscall      1.4543 s         2.063 Mops  chk=00000000002dc6c0
+BENCHDONE
+NATEMU_TASK_END bench uptime=81.47

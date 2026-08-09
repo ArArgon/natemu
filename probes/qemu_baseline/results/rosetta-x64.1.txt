@@ -1,0 +1,12 @@
+BENCHVER 4
+BENCH alu          0.4652 s       644.896 Mops  chk=874f08ae8ad6f007
+BENCH alu4         0.5564 s       539.210 Mops  chk=f9f040dc5f7a3b1b
+BENCH ls4          0.5710 s       525.400 Mops  chk=f9f04094fc9d000a
+BENCH ls4tlb       2.1692 s        27.660 Mops  chk=bdc372d6000ce57d
+BENCH ptr8         0.2264 s       132.483 Mops  chk=00000e4e1d789457
+BENCH ptr256       1.4544 s         5.501 Mops  chk=00007a0f78cfc5f4
+BENCH stream       0.3086 s     43490.204 MB/s  chk=a5ab2a3b6e000000
+BENCH matmul       0.5318 s      7394.308 Mops  chk=0000001f5e05e316
+BENCH nqueens      0.3969 s        30.233 solves/s  chk=00000000000d7f40
+BENCH syscall      0.4913 s         6.106 Mops  chk=0000002cb4a0d440
+BENCHDONE

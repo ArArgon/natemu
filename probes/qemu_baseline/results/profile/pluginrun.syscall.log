@@ -1,0 +1,9 @@
+NATEMU_INIT_UP uptime=1.82
+NATEMU_SHELL_UP uptime=1.84
+NATEMU_TASK_BEGIN bench:syscall
+BENCHVER 4
+BENCH syscall      1.7310 s         1.733 Mops  chk=00000000002dc6c0
+BENCHDONE
+NATEMU_TASK_END bench:syscall uptime=3.61
+[    3.651399] sysrq: Power Off
+[    3.655289] reboot: Power down

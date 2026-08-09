@@ -1,0 +1,15 @@
+NATEMU_INIT_UP uptime=1.50
+NATEMU_SHELL_UP uptime=1.52
+NATEMU_TASK_BEGIN bench:syscall,syscall,syscall,syscall,syscall,syscall,syscall,syscall,syscall,syscall,syscall,syscall,syscall,syscall,syscall,syscall,syscall,syscall
+BENCHVER 4
+BENCH syscall      1.4614 s         2.053 Mops  chk=00000000002dc6c0
+BENCH syscall      1.4552 s         2.062 Mops  chk=00000000002dc6c0
+BENCH syscall      1.5023 s         1.997 Mops  chk=00000000002dc6c0
+BENCH syscall      1.5636 s         1.919 Mops  chk=00000000002dc6c0
+BENCH syscall      1.5775 s         1.902 Mops  chk=00000000002dc6c0
+BENCH syscall      1.5596 s         1.924 Mops  chk=00000000002dc6c0
+BENCH syscall      1.5477 s         1.938 Mops  chk=00000000002dc6c0
+BENCH syscall      1.5689 s         1.912 Mops  chk=00000000002dc6c0
+BENCH syscall      1.5252 s         1.967 Mops  chk=00000000002dc6c0
+BENCH syscall      1.5396 s         1.949 Mops  chk=00000000002dc6c0
+qemu-system-x86_64: terminating on signal 15 from pid 65617 (<unknown process>)
