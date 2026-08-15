@@ -1,6 +1,6 @@
 # Research Index — natemu x86-64 on Apple Silicon
 
-**Last updated:** 2026-08-15 (post-audit; gates re-closed by experiment — read 13 and 14 first) · **Machine:** M2 Max / M2 Pro, macOS 26.5.2 (25F84) · **Status:** research phase — gates closed by experiment (14); baseline measured (15); shadow-MMU costs measured (16); precise exceptions (17), SMP scaling (19), PT coherence (20), SMC (21), FEXCore retrofit (23), boot path (24) and the correctness oracle (25) all landed; 18/22 measured but unwritten, 26 unmeasured
+**Last updated:** 2026-08-15 (post-audit; gates re-closed by experiment — read 13 and 14 first) · **Machine:** M2 Max / M2 Pro, macOS 26.5.2 (25F84) · **Status:** research phase — gates closed by experiment (14); baseline measured (15); shadow-MMU costs measured (16); EL1 capability surface (18), precise exceptions (17), SMP scaling (19), PT coherence (20), SMC (21), async interrupts (22), FEXCore retrofit (23), boot path (24) and the correctness oracle (25) all landed; **26 is the only document still open**
 **Artifacts:** `probe_g1_tgran_tso.c` (+ `probe_g1_granule.c`), `tools/g2_quad_measure.py`, `/tmp/hv_g1_probe/run.log`, `/tmp/probe_mmu_tso.c` (`12-performance-ranking.md`)
 
 ## Map
@@ -24,6 +24,8 @@
 | 13 | [audit-skeptical-review](13-audit-skeptical-review.md) | Does the corpus survive scrutiny? | **3 of 4 load-bearing conclusions did not, as stated.** Decoder bugs, G-1/G-2 closed on insufficient evidence, refuted premise in 07, speedup double-counting. |
 | 14 | [gate-results-verified](14-gate-results-verified.md) | G-1/G-4 closed by experiment | **4K stage-1 + 4K stage-2 permissions ENFORCED inside one 16K host page; T0SZ=16 (48-bit VA) works; TSO litmus 1.7M→0.** G-2 quads now MOOT. |
 | 19 | [smp-scaling](19-smp-scaling.md) | Does the design scale past one core? | **91–92% efficiency at 8 vCPUs.** TLBI broadcast is the wall (441–961 ns busy); cross-vCPU doorbells 68 ns. The "never TLBI on invalid→valid" rule is worth **6.8× at 8 vCPUs** vs 3.0× at one. Carries an auditor's note: the SGI-reliability claim did **not** reproduce at the probe's default `n`. |
+| 18 | [el1-capability-surface](18-el1-capability-surface.md) | What can a guest at EL1 under HVF *actually* do? | **Out of 48 catalogued operations, exactly 6 leave the VM** — `CNTPCT`, `PMCCNTR`, `OSLAR`, `WFI`, `SMC`, `HVC`. All TLBI/IC/DC/AT/MMU-sysreg work is native, and 1M+ exceptions were taken into the guest's own vector with **0 host exits**. **No cycle counter at guest EL1** (whole PMU + every Apple IMPDEF reg traps). **Without a GIC the vtimer cannot reach the guest's vector at all.** `TLBI ASIDE1` 167.5 ns is the cheapest invalidation. |
+| 22 | [async-interrupt-injection](22-async-interrupt-injection.md) | How do we interrupt a translated guest, and what does it cost? | **Delivery is 50 ns; ARM EOI is 1912 ns — and we never need to pay it.** Every `ICC_*` access is a ~900 ns host exit, so run the x86 APIC in guest memory and never touch the GIC. 7.19M IRQs delivered against 2 host exits. A per-block **pinned-register poll is free** (≤2 checks / 5 x86 insns is below resolution); `REP MOVSQ` stays interruptible to **0.3 ns at ~0% cost**. Cross-vCPU boundary by killing a stage-1 mapping: **p50 83 ns, 500/500**. |
 | 20 | [shadow-pt-coherence](20-shadow-pt-coherence.md) | How do we learn the guest edited its own page tables? | **Do not write-protect guest PTs — resync lazily off the guest's own `INVLPG`/`MOV CR3`.** WP trap is 33.3–34.3 ns (install) / 231–274 ns (modify); Linux spends **18.1 `INVLPG` + 6.5 `MOV CR3` per `fork`+`exec`** against 500–2000 PTE writes — 30–110× fewer events for the same information. WP the **PML4 alone**. Burst break-even N≈32–64. |
 | 21 | [smc-detection](21-smc-detection.md) | What does SMC detection cost, and who triggers it? | **Steady-state SMC in a Linux guest is zero.** 17 086–17 313 TB invalidations during boot, then **exactly 0** across 5.6 s of benchmarks, 400 `fork`+`exec`, and 30.5 s of 7-Zip. Whole SMC turnaround 1650–2015 ns; `IC IALLU` beats per-line `IC IVAU` above ~1 KiB. `IC IVAU` does **not** degrade under SMP contention (0.62–0.93× at 8 vCPUs) — refutes N-05's fear. |
 | 23 | [fexcore-retrofit](23-fexcore-retrofit.md) | Can FEXCore be retrofitted as the JIT? | **Fork it — take the backend and user-mode frontend, rewrite dispatch/cache, run as a host compile server. But not yet.** 52/56 TUs compile on macOS/arm64. FEX's flat guest-VA==host-VA lowering is an *asset* under hardware stage-1. Real blockers: the never-changes-mode assert (89 sites) and a cache keyed on bare guest VA. x87 is already true 80-bit. |
@@ -35,9 +37,13 @@
 
 | Doc | Question | State |
 |---|---|---|
-| 18 | What can a guest at EL1 under Hypervisor.framework *actually* do? | **probe complete, write-up open** — `probes/el1_features/results/` |
-| 22 | Async interrupt injection · vtimer/GIC delivery latency | **probe complete, write-up open** — `probes/irq_inject/results/` |
-| 26 | Guest fault/PT-write/CR3 **rates** — the missing half of every cost model | harness built (`probes/guest_rates/`), **not yet run** |
+| 26 | Guest fault/PT-write/CR3 **rates** — the missing half of every cost model | instrument in bring-up (`probes/qemu_baseline/plugin_mmu.c` + `runmmu.py`); `results/mmu/` holds debug runs, **no measurements yet** |
+
+**Two measurement caveats now standing corpus-wide** (both from `18 §0.2` / `22 §6`): absolute
+nanoseconds are **power-state dependent** — the same `pt_wp` binary reports 3.22 GHz on wall power
+and 2.01 GHz on battery — so record `pmset -g ps` alongside machine and OS, and compare ratios
+rather than raw ns across sessions. And the two-vCPU poll-contention probe is **noise-dominated**;
+its control arm swings 2.2× on an identical workload.
 
 `docs/research/raw/` holds **raw, unaudited** sub-agent reports rescued from agents that died
 mid-run. They are inputs to 20/21/23, not evidence — see `raw/README.md`.
