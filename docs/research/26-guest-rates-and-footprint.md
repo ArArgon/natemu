@@ -1,8 +1,8 @@
 # 26 — Guest Rates: the Missing Half of Every Cost Model
 
-**Date:** 2026-08-15 · **Host:** Apple M2 Max, macOS 26.5.2 · **Guest:** Alpine 3.24.1, Linux 6.18.35 x86-64, `-smp 1`, QEMU 11.0.3 TCG
+**Date:** 2026-08-15 · **Host:** Apple M2 Max, macOS 26.5.2 · **Guest:** Alpine 3.24.1, Linux 6.18.35 x86-64, QEMU 11.0.3 TCG (§1–§9 at `-smp 1`; §10 at 1/2/4 vCPUs)
 **Instrument:** `probes/qemu_baseline/plugin_mmu.c` (TCG plugin) · `runmmu.py` (driver) · `analyze_mmu.py` (arithmetic)
-**Raw:** `probes/qemu_baseline/results/mmu/snap.M3.*.txt`, `analysis.M3.txt`, `sweep.M3.log`
+**Raw:** `probes/qemu_baseline/results/mmu/snap.M3.*.txt` (§1–§9), `snap.L*.txt` (§10), `analysis.M3.txt`, `sweep.M3.log`
 
 Every performance claim in `08`, `12`, `15`, `16` and `20` multiplies a carefully measured
 *per-event cost* by an *assumed event rate*. The costs are known to three significant figures. The
@@ -297,7 +297,9 @@ than 10×. The two are now split, because they are different events for the desi
 
 | # | Item | Closing experiment |
 |---|---|---|
-| 1 | **SMP rates are entirely unmeasured** (§0.1). The invalidation term is the one `19` says explodes at 8 vCPUs (441–961 ns vs 203–285) | The plugin is `-smp 1` by construction. Needs locking, or a different instrument. Highest priority — it can move Policy A from 10% to ~30% |
+| 1 | ~~SMP rates are entirely unmeasured~~ **CLOSED** (§10). Policy A is 6.8–18.9%, or 11.2–23.7% charging every invalidation at doc 19's broadcast cost. The predicted ~30% did not materialise | — |
+| 1b | **NEW, and now the binding constraint: the 256-ASID budget is exceeded at SMP.** `spawn400` at 2 vCPUs peaks at **520** live address spaces (§10.1 finding 4), against ARM's 256. Policy C's eviction path is load-bearing and still untested | Model eviction at 256 with the measured working sets; then decide between a generation/rollover scheme and pinning a subset. This is the top open item in this document |
+| 1c | The page-table walker is still single-root and segfaults at `-smp ≥ 3`, so §2's PT-write traffic is uniprocessor-only | Make `pt_ref`/`pt_unref` multi-root safe (a frame reachable from several CR3s), then re-run §2 at SMP |
 | 2 | **PCID is off; PCID→ASID is unexplored** (§6) | Re-run with PCID enabled, compare `cr3w_noflush`/`cr3w`. Then ask whether a guest PCID can be carried into an ARM ASID |
 | 3 | **The denominator is synthetic** (§0.1 item 3) | Derive ns-per-guest-instruction from a real execution measurement rather than `22`'s ALU loop |
 | 4 | The PTE-write upper bound is not provably one (§7.2) | One workload with the value filter disabled |
@@ -323,19 +325,6 @@ cc -O2 -shared -fPIC -o bin/plugin_mmu.so plugin_mmu.c \
 
 Needs `probes/qemu_baseline/work/` (fetched by that probe's `build.sh`) and QEMU 11.0.3.
 Whole sweep is ~17 minutes on an M2 Max.
-
-## References
-
-`08` feasibility synthesis (the cost model this supplies rates for); `12` performance ranking;
-`15` QEMU TCG baseline (§8a's 54.5% softmmu share, and the 7-Zip workload reused here);
-`16` shadow-MMU costs (fill and TLBI costs, the never-TLBI-on-invalid→valid rule);
-`18` EL1 capability surface (§6.2 TLBI costs per variant, and §0.2's sampling caveat);
-`19` SMP scaling (the multi-core TLBI figures that make §0.1 item 1 the priority);
-`20` shadow-PT coherence (the document this corrects and confirms);
-`22` async interrupt injection (§1.1's translated-instruction cost, the denominator here);
-`23` FEXCore retrofit (§0.4's "the MMU half is available without touching the JIT").
-
----
 
 ## 10. Multi-core (added 2026-08-15)
 
@@ -393,6 +382,8 @@ load-bearing and still untested.** This is the most important thing this section
 The page-table walker (`--pt 1`) remains single-root only and segfaults at `-smp ≥ 3`, so §2's
 PT-write traffic is uniprocessor-only. Fill and invalidation rates above are unaffected — they come
 from the shadow model, which is now multi-core correct.
+
+---
 
 ## References
 
