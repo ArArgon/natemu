@@ -1,6 +1,6 @@
 # Research Index — natemu x86-64 on Apple Silicon
 
-**Last updated:** 2026-08-08 (post-audit; gates re-closed by experiment — read 13 and 14 first) · **Machine:** M2 Max / M2 Pro, macOS 26.5.2 (25F84) · **Status:** research phase — gates closed by experiment (14); baseline measured (15); shadow-MMU costs measured (16); 17 (precise exceptions) + 19 (SMP scaling) in flight
+**Last updated:** 2026-08-15 (post-audit; gates re-closed by experiment — read 13 and 14 first) · **Machine:** M2 Max / M2 Pro, macOS 26.5.2 (25F84) · **Status:** research phase — gates closed by experiment (14); baseline measured (15); shadow-MMU costs measured (16); precise exceptions (17), SMP scaling (19), PT coherence (20), SMC (21), FEXCore retrofit (23), boot path (24) and the correctness oracle (25) all landed; 18/22 measured but unwritten, 26 unmeasured
 **Artifacts:** `probe_g1_tgran_tso.c` (+ `probe_g1_granule.c`), `tools/g2_quad_measure.py`, `/tmp/hv_g1_probe/run.log`, `/tmp/probe_mmu_tso.c` (`12-performance-ranking.md`)
 
 ## Map
@@ -24,18 +24,20 @@
 | 13 | [audit-skeptical-review](13-audit-skeptical-review.md) | Does the corpus survive scrutiny? | **3 of 4 load-bearing conclusions did not, as stated.** Decoder bugs, G-1/G-2 closed on insufficient evidence, refuted premise in 07, speedup double-counting. |
 | 14 | [gate-results-verified](14-gate-results-verified.md) | G-1/G-4 closed by experiment | **4K stage-1 + 4K stage-2 permissions ENFORCED inside one 16K host page; T0SZ=16 (48-bit VA) works; TSO litmus 1.7M→0.** G-2 quads now MOOT. |
 | 19 | [smp-scaling](19-smp-scaling.md) | Does the design scale past one core? | **91–92% efficiency at 8 vCPUs.** TLBI broadcast is the wall (441–961 ns busy); cross-vCPU doorbells 68 ns. The "never TLBI on invalid→valid" rule is worth **6.8× at 8 vCPUs** vs 3.0× at one. Carries an auditor's note: the SGI-reliability claim did **not** reproduce at the probe's default `n`. |
+| 20 | [shadow-pt-coherence](20-shadow-pt-coherence.md) | How do we learn the guest edited its own page tables? | **Do not write-protect guest PTs — resync lazily off the guest's own `INVLPG`/`MOV CR3`.** WP trap is 33.3–34.3 ns (install) / 231–274 ns (modify); Linux spends **18.1 `INVLPG` + 6.5 `MOV CR3` per `fork`+`exec`** against 500–2000 PTE writes — 30–110× fewer events for the same information. WP the **PML4 alone**. Burst break-even N≈32–64. |
+| 21 | [smc-detection](21-smc-detection.md) | What does SMC detection cost, and who triggers it? | **Steady-state SMC in a Linux guest is zero.** 17 086–17 313 TB invalidations during boot, then **exactly 0** across 5.6 s of benchmarks, 400 `fork`+`exec`, and 30.5 s of 7-Zip. Whole SMC turnaround 1650–2015 ns; `IC IALLU` beats per-line `IC IVAU` above ~1 KiB. `IC IVAU` does **not** degrade under SMP contention (0.62–0.93× at 8 vCPUs) — refutes N-05's fear. |
+| 23 | [fexcore-retrofit](23-fexcore-retrofit.md) | Can FEXCore be retrofitted as the JIT? | **Fork it — take the backend and user-mode frontend, rewrite dispatch/cache, run as a host compile server. But not yet.** 52/56 TUs compile on macOS/arm64. FEX's flat guest-VA==host-VA lowering is an *asset* under hardware stage-1. Real blockers: the never-changes-mode assert (89 sites) and a cache keyed on bare guest VA. x87 is already true 80-bit. |
+| 24 | [boot-path-and-modes](24-boot-path-and-modes.md) | How does the guest boot, and what modes must we implement? | **Direct kernel boot, no firmware, no real mode.** ~1,100–1,400 LoC of hand-off. SeaBIOS below 1 MB is 0.47% of a boot. **Not advertising LA57 is load-bearing** — it is what keeps a UP guest in long mode forever. SMP drags real mode back via the SIPI trampoline. x87 = 8 instructions per boot: correctness only, never performance. |
+| 25 | [correctness-oracle](25-correctness-oracle.md) | How do we know it is right, and debug it when it is not? | **The oracle is an engineer-week, not 10–16 pm — `08`'s sequencing is wrong.** A TCG-plugin hash chain localises the first differing instruction in a 1.218-B-instruction boot in ~35 s. Lockstep gdbstub is refuted (7.5 days/boot). `-icount` + pinned RTC gets 99.9987% determinism. **Strict EFLAGS comparison is ill-posed**: 16/69 groups disagree between two correct x86 implementations; 0/69 with SDM undefined-bit masking. |
 | 12 | [performance-ranking](12-performance-ranking.md) | Perf concerns ranked + live tracking | **1. MMU 1.5× → 2. TSO 3.4×/2–5% → 3. Codegen 4.4× → 4. Precise 10–20% vs 2–5× → 5. SMC 4× → 6. Quad 15–35% → 7. Exits 1.2M/core → 8. A/D+TLB**. Live `/tmp/probe_mmu_tso.c`. |
 
-## In flight (2026-08-08)
+## In flight (2026-08-15)
 
 | Doc | Question | State |
 |---|---|---|
-| 18 | What can a guest at EL1 under Hypervisor.framework *actually* do? | being probed |
-| 20 | Shadow page-table coherence — how do we learn the guest edited its own PTs? | being researched |
-| 21 | SMC detection and code invalidation | being researched |
-| 23 | Can FEXCore be retrofitted as the JIT? | being written from salvaged source analysis |
-| 26 | Guest fault/PT-write/CR3 **rates** — the missing half of every cost model | being measured |
-| 22, 24, 25 | Async interrupt injection · boot path & x87 · correctness oracle | queued |
+| 18 | What can a guest at EL1 under Hypervisor.framework *actually* do? | **probe complete, write-up open** — `probes/el1_features/results/` |
+| 22 | Async interrupt injection · vtimer/GIC delivery latency | **probe complete, write-up open** — `probes/irq_inject/results/` |
+| 26 | Guest fault/PT-write/CR3 **rates** — the missing half of every cost model | harness built (`probes/guest_rates/`), **not yet run** |
 
 `docs/research/raw/` holds **raw, unaudited** sub-agent reports rescued from agents that died
 mid-run. They are inputs to 20/21/23, not evidence — see `raw/README.md`.
