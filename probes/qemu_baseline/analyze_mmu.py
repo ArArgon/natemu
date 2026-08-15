@@ -126,22 +126,51 @@ def main():
     print(f"  shadow fill (translation)  : {fx} ns        [{COSTS['fill_xlat'][2]}]")
     print(f"  shadow fill (permission)   : {fpl}-{fph} ns [{COSTS['fill_perm'][2]}]")
     print()
-    print(f"{'workload':<16}{'exec ms':>10}{'A ms':>9}{'A %':>8}{'B ms':>9}{'B %':>8}{'C ms':>9}{'C %':>8}")
+    # Invalidation is NOT free and an earlier version of this script omitted it.
+    # Filling a shadow entry (invalid->valid) needs no TLBI -- that is doc 16's
+    # "never TLBI on invalid->valid" rule, worth 3x. But *dropping* one
+    # (valid->invalid) does, and shadow_inval counts exactly those. Two ways to
+    # pay for it, both real design options:
+    #   per-page : one TLBI VAAE1IS per invalidated page (doc 18 section 6.2: 203 ns;
+    #              doc 20/16: 279-285 ns).
+    #   batched  : accumulate, and issue one TLBI VMALLE1IS at the next context
+    #              switch (doc 18 section 6.2: 294 ns). Legal because VMALLE1IS flushes
+    #              the ARM TLB without destroying our shadow tables.
+    tlbi_page = (203.0, 285.0)
+    tlbi_all = 294.0
+    print(f"  TLBI per page              : {tlbi_page[0]}-{tlbi_page[1]} ns [18 section 6.2 / 20]")
+    print(f"  TLBI all (batched)         : {tlbi_all} ns        [18 section 6.2 VMALLE1IS]")
+    print()
+    print(f"{'workload':<14}{'exec ms':>9}{'A fill':>8}{'A+inv':>8}{'A%':>7}{'A+bat%':>8}"
+          f"{'B fill':>8}{'B+inv':>8}{'B%':>7}{'C%':>7}")
     for r in runs:
         i = r["insns"]
-        exec_ms_lo = i * xl / 1e6
-        exec_ms_hi = i * xh / 1e6
-        row = [f"{r['_label']:<16}{(exec_ms_lo+exec_ms_hi)/2:>10.0f}"]
+        exec_lo, exec_hi = i*xl/1e6, i*xh/1e6
+        exec_mid = (exec_lo+exec_hi)/2
+        inv = r.get("shadow_inval", 0)
+        inv_ms = inv*(tlbi_page[0]+tlbi_page[1])/2/1e6
+        bat_ms = r.get("cr3w", 0)*tlbi_all/1e6
+        out = [f"{r['_label']:<14}{exec_mid:>9.0f}"]
+        cells = {}
         for p in ("A", "B", "C"):
-            ms = (r.get(f"fill{p}_xlat",0)*fx + r.get(f"fill{p}_perm",0)*(fpl+fph)/2)/1e6
-            # worst case: cheap execution (fast core) vs same fill cost
-            pct_lo = 100*ms/exec_ms_hi
-            pct_hi = 100*ms/exec_ms_lo
-            row.append(f"{ms:>9.1f}{(pct_lo+pct_hi)/2:>8.1f}")
-        print("".join(row))
+            fill_ms = (r.get(f"fill{p}_xlat",0)*fx
+                       + r.get(f"fill{p}_perm",0)*(fpl+fph)/2)/1e6
+            # policy B wipes the whole shadow on CR3, so it pays the batched form
+            # by construction; A and C pay per-page unless they batch.
+            tot = fill_ms + (bat_ms if p == "B" else inv_ms)
+            cells[p] = (fill_ms, tot, 100*tot/exec_mid,
+                        100*(fill_ms+bat_ms)/exec_mid)
+        out.append(f"{cells['A'][0]:>8.1f}{cells['A'][1]:>8.1f}{cells['A'][2]:>7.1f}{cells['A'][3]:>8.1f}")
+        out.append(f"{cells['B'][0]:>8.1f}{cells['B'][1]:>8.1f}{cells['B'][2]:>7.1f}")
+        out.append(f"{cells['C'][2]:>7.1f}")
+        print("".join(out))
     print("\n  'exec ms' is guest instructions x the measured translated-instruction cost;")
-    print("  it is the denominator, NOT a prediction of natemu's runtime. The percentages")
-    print("  are the shadow-MMU tax on top of translation, per retention policy.")
+    print("  it is the denominator, NOT a prediction of natemu's runtime. It is also")
+    print("  OPTIMISTIC: doc 22 measured 0.25 ns/insn on a synthetic ALU+memory loop with")
+    print("  no branch or i-cache pressure, so real translated code is slower and these")
+    print("  percentages are correspondingly PESSIMISTIC (too high) by an unknown factor.")
+    print("  'A+inv'  = fills + one TLBI per invalidated shadow page")
+    print("  'A+bat%' = fills + one batched TLBI VMALLE1IS per CR3 load instead")
 
     print()
     print("=" * 100)

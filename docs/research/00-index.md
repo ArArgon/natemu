@@ -1,6 +1,6 @@
 # Research Index — natemu x86-64 on Apple Silicon
 
-**Last updated:** 2026-08-15 (post-audit; gates re-closed by experiment — read 13 and 14 first) · **Machine:** M2 Max / M2 Pro, macOS 26.5.2 (25F84) · **Status:** research phase — gates closed by experiment (14); baseline measured (15); shadow-MMU costs measured (16); EL1 capability surface (18), precise exceptions (17), SMP scaling (19), PT coherence (20), SMC (21), async interrupts (22), FEXCore retrofit (23), boot path (24) and the correctness oracle (25) all landed; **26 is the only document still open**
+**Last updated:** 2026-08-15 (post-audit; gates re-closed by experiment — read 13 and 14 first) · **Machine:** M2 Max / M2 Pro, macOS 26.5.2 (25F84) · **Status:** research phase — gates closed by experiment (14); baseline measured (15); shadow-MMU costs measured (16); EL1 capability surface (18), precise exceptions (17), SMP scaling (19), PT coherence (20), SMC (21), async interrupts (22), FEXCore retrofit (23), boot path (24) and the correctness oracle (25) all landed; **all 26 written**; the corpus is measurement-complete and prototype-empty
 **Artifacts:** `probe_g1_tgran_tso.c` (+ `probe_g1_granule.c`), `tools/g2_quad_measure.py`, `/tmp/hv_g1_probe/run.log`, `/tmp/probe_mmu_tso.c` (`12-performance-ranking.md`)
 
 ## Map
@@ -31,13 +31,16 @@
 | 23 | [fexcore-retrofit](23-fexcore-retrofit.md) | Can FEXCore be retrofitted as the JIT? | **Fork it — take the backend and user-mode frontend, rewrite dispatch/cache, run as a host compile server. But not yet.** 52/56 TUs compile on macOS/arm64. FEX's flat guest-VA==host-VA lowering is an *asset* under hardware stage-1. Real blockers: the never-changes-mode assert (89 sites) and a cache keyed on bare guest VA. x87 is already true 80-bit. |
 | 24 | [boot-path-and-modes](24-boot-path-and-modes.md) | How does the guest boot, and what modes must we implement? | **Direct kernel boot, no firmware, no real mode.** ~1,100–1,400 LoC of hand-off. SeaBIOS below 1 MB is 0.47% of a boot. **Not advertising LA57 is load-bearing** — it is what keeps a UP guest in long mode forever. SMP drags real mode back via the SIPI trampoline. x87 = 8 instructions per boot: correctness only, never performance. |
 | 25 | [correctness-oracle](25-correctness-oracle.md) | How do we know it is right, and debug it when it is not? | **The oracle is an engineer-week, not 10–16 pm — `08`'s sequencing is wrong.** A TCG-plugin hash chain localises the first differing instruction in a 1.218-B-instruction boot in ~35 s. Lockstep gdbstub is refuted (7.5 days/boot). `-icount` + pinned RTC gets 99.9987% determinism. **Strict EFLAGS comparison is ill-posed**: 16/69 groups disagree between two correct x86 implementations; 0/69 with SDM undefined-bit masking. |
+| 26 | [guest-rates-and-footprint](26-guest-rates-and-footprint.md) | What are the guest's actual fault / PT-write / CR3 **rates**? | **Shadow-MMU maintenance is 0.4–10.4% with per-address-space shadows, and up to 101% without.** Flush-on-CR3 doubles a build-like workload; 256 ASIDs suffice (peak 112, 0 evictions — so C's eviction path is untested). Corrects `20`: real PTE writes are **42.3/spawn**, not the inferred 500–2000 — but `clear_page` zeroing adds 430.9, so WP/lazy is **16.4×**, not 30–110×. **Uniprocessor only; guest never uses PCID.** |
 | 12 | [performance-ranking](12-performance-ranking.md) | Perf concerns ranked + live tracking | **1. MMU 1.5× → 2. TSO 3.4×/2–5% → 3. Codegen 4.4× → 4. Precise 10–20% vs 2–5× → 5. SMC 4× → 6. Quad 15–35% → 7. Exits 1.2M/core → 8. A/D+TLB**. Live `/tmp/probe_mmu_tso.c`. |
 
 ## In flight (2026-08-15)
 
-| Doc | Question | State |
-|---|---|---|
-| 26 | Guest fault/PT-write/CR3 **rates** — the missing half of every cost model | instrument in bring-up (`probes/qemu_baseline/plugin_mmu.c` + `runmmu.py`); `results/mmu/` holds debug runs, **no measurements yet** |
+**All 26 documents are written.** The corpus has now measured every mechanism it set out to
+measure. What it has never done is run a system: no line of natemu exists, and `23 §0.4`'s
+hardware-stage-1-under-unmodified-TCG experiment remains the cheapest thing that would convert the
+modelled case into a real number.
+
 
 **Two measurement caveats now standing corpus-wide** (`18 §0.2`, `22 §6`):
 

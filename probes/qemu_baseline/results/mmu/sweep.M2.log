@@ -1,0 +1,4 @@
+=== M2.boot (task=none)
+  console -> /Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/results/mmu/con.M2.boot.jsonl
+  snaps   -> /Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/results/mmu/snap.M2.boot.txt
+=== M2.bench (task=bench)
