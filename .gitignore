@@ -13,3 +13,7 @@ probes/**/bin/
 
 # QEMU baseline: downloaded guest images / kernels (1.8 GB, re-fetch with build.sh)
 probes/qemu_baseline/work/
+
+# Oracle probe: built test binaries + initramfs (regenerate with run_flagtorture.sh)
+probes/oracle/work/
+probes/oracle/*.so

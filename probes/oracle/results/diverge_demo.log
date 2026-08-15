@@ -1,0 +1,35 @@
+== stage 1: checkpointed state hash, A=qemu64 B=Nehalem
+
+real	0m9.457s
+user	0m9.317s
+sys	0m0.174s
+
+real	0m9.034s
+user	0m8.895s
+sys	0m0.170s
+STATEHASH insns=1218199293 final_hash=9a24859cbca6bb49 mode=pc ckpt_shift=16 skipped_other_vcpu=0
+STATEHASH insns=1225981156 final_hash=3d32983207d0f74e mode=pc ckpt_shift=16 skipped_other_vcpu=0
+  ckpt bytes: 503541 /tmp/dd_a.ckpt
+  ckpt bytes: 506845 /tmp/dd_b.ckpt
+
+== stage 2: bisect to the window
+A: 18589 checkpoints, 1218199293 insns total
+B: 18707 checkpoints, 1225981156 insns total
+last agreeing checkpoint : 196608
+first differing checkpoint: 262144
+window                    : [196608, 262144)  (65536 instructions)
+
+re-run both sides with:
+  ...,wlo=196608,whi=262144,wout=/tmp/X.win
+then: bisect.py win A.win B.win
+
+== stage 3: re-run both with a full-register window dump [196608,262144)
+  window bytes: 10886066
+
+== stage 4: first differing instruction
+FIRST DIVERGING INSTRUCTION at icount 201155
+  A pc=00000000000ea627
+  B pc=00000000000ea627
+  rbx     A=68747541           B=756e6547          
+  rcx     A=444d4163           B=6c65746e          
+  rdx     A=69746e65           B=49656e69          
