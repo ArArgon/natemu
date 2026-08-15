@@ -1,0 +1,124 @@
+=== SMC detection probe ===
+  host: Apple M2 Max
+  cores: 8 performance + 4 efficiency, max vCPUs 64
+  payload 3244 bytes
+
+=== 0. Machine facts read from inside the VM at guest EL1 ===
+  CNTFRQ_EL0            = 24000000 Hz  (41.67 ns/tick)
+  {isb; mrs CNTVCT_EL0} = 9.21 ns   empty loop iteration = 0.31 ns
+  dependent ADD latency = 0.3099 ns -> clock estimate 3.23 GHz
+  CTR_EL0               = 0x000000008444c004
+    IminLine = 64 bytes   DminLine = 64 bytes   CWG = 64 B  ERG = 64 B
+    IDC = 0  (DC CVAU to PoU is REQUIRED after writing code)
+    DIC = 0  (IC IVAU is REQUIRED after writing code)
+    L1Ip = 3 (PIPT)
+  EL2 traps during this run: 0 (none -- good)
+
+=== 3. I-cache / D-cache maintenance after rewriting code, solo ===
+  The region is real executable code (`add x0,x0,#1` x N, then `ret`), identity
+  mapped RW+X at EL1. Every figure is per WHOLE-REGION pass; the per-64-B-step and
+  per-4-KiB-page columns are that divided by the region size.
+
+  -- region = 64 bytes (1 64-B steps), 65536 passes per timed sample
+     sequence                                           ns/pass     ns/64B    ns/4KiB
+     dsb ish; isb                       (floor)           12.30          -          -
+     dc cvau + ic ivau interleaved, one dsb+isb          130.66   118.3586    7574.95
+     ic ivau x N;  dsb ish; isb                          124.65   112.3473    7190.23
+     dc cvau x N;  dsb ish; isb                           13.99     1.6899     108.15
+     ic iallu;     dsb ish; isb        (whole I-cache)      149.62   137.3234    8788.70
+     CANONICAL: dc x N; dsb; ic x N; dsb; isb            132.70   120.4001    7705.61
+     execute the region, I-cache warm  (floor)             1.01          .          .
+     ic ivau x N; dsb; isb; execute    (refill)          140.16          .          .
+     rewrite + dc + dsb + ic + dsb + isb + execute       144.12          .          .
+     rewrite only, no maintenance, no execute              0.31          .          .
+     ic iallu; dsb; isb; execute       (refill)          134.12          .          .
+     derived: I-cache REFILL of 64 B after IC IVAU  =    26.81 ns  (exec-after-ic - exec-warm - the ic loop)
+     derived: I-cache REFILL after IC IALLU           =    -4.22 ns  (exec-after-iallu - exec-warm - the iallu op)
+     derived: whole SMC turnaround per 64 B         =   143.11 ns  (rewrite + canonical maintenance + execute, minus a warm execute)
+
+  -- region = 256 bytes (4 64-B steps), 16384 passes per timed sample
+     sequence                                           ns/pass     ns/64B    ns/4KiB
+     dsb ish; isb                       (floor)           12.20          -          -
+     dc cvau + ic ivau interleaved, one dsb+isb          139.91    31.9265    2043.29
+     ic ivau x N;  dsb ish; isb                          136.27    31.0173    1985.11
+     dc cvau x N;  dsb ish; isb                           17.26     1.2646      80.93
+     ic iallu;     dsb ish; isb        (whole I-cache)      123.57    27.8416    1781.86
+     CANONICAL: dc x N; dsb; ic x N; dsb; isb            149.93    34.4302    2203.53
+     execute the region, I-cache warm  (floor)             6.16          .          .
+     ic ivau x N; dsb; isb; execute    (refill)          157.32          .          .
+     rewrite + dc + dsb + ic + dsb + isb + execute       188.19          .          .
+     rewrite only, no maintenance, no execute              1.79          .          .
+     ic iallu; dsb; isb; execute       (refill)          154.58          .          .
+     derived: I-cache REFILL of 256 B after IC IVAU  =    27.10 ns  (exec-after-ic - exec-warm - the ic loop)
+     derived: I-cache REFILL after IC IALLU           =    37.06 ns  (exec-after-iallu - exec-warm - the iallu op)
+     derived: whole SMC turnaround per 256 B         =   182.03 ns  (rewrite + canonical maintenance + execute, minus a warm execute)
+
+  -- region = 1024 bytes (16 64-B steps), 4096 passes per timed sample
+     sequence                                           ns/pass     ns/64B    ns/4KiB
+     dsb ish; isb                       (floor)           12.56          -          -
+     dc cvau + ic ivau interleaved, one dsb+isb          228.77    13.5129     864.83
+     ic ivau x N;  dsb ish; isb                          226.41    13.3654     855.39
+     dc cvau x N;  dsb ish; isb                           35.13     1.4102      90.25
+     ic iallu;     dsb ish; isb        (whole I-cache)      153.40     8.8024     563.35
+     CANONICAL: dc x N; dsb; ic x N; dsb; isb            254.85    15.1431     969.16
+     execute the region, I-cache warm  (floor)            49.20          .          .
+     ic ivau x N; dsb; isb; execute    (refill)          328.94          .          .
+     rewrite + dc + dsb + ic + dsb + isb + execute       490.44          .          .
+     rewrite only, no maintenance, no execute              5.66          .          .
+     ic iallu; dsb; isb; execute       (refill)          216.30          .          .
+     derived: I-cache REFILL of 1024 B after IC IVAU  =    65.89 ns  (exec-after-ic - exec-warm - the ic loop)
+     derived: I-cache REFILL after IC IALLU           =    26.26 ns  (exec-after-iallu - exec-warm - the iallu op)
+     derived: whole SMC turnaround per 1024 B         =   441.23 ns  (rewrite + canonical maintenance + execute, minus a warm execute)
+
+  -- region = 4096 bytes (64 64-B steps), 1024 passes per timed sample
+     sequence                                           ns/pass     ns/64B    ns/4KiB
+     dsb ish; isb                       (floor)           12.57          -          -
+     dc cvau + ic ivau interleaved, one dsb+isb          756.88    11.6297     744.30
+     ic ivau x N;  dsb ish; isb                          753.62    11.5789     741.05
+     dc cvau x N;  dsb ish; isb                          106.57     1.4687      93.99
+     ic iallu;     dsb ish; isb        (whole I-cache)      170.90     2.4738     158.33
+     CANONICAL: dc x N; dsb; ic x N; dsb; isb            849.53    13.0774     836.95
+     execute the region, I-cache warm  (floor)           268.76          .          .
+     ic ivau x N; dsb; isb; execute    (refill)          920.82          .          .
+     rewrite + dc + dsb + ic + dsb + isb + execute      1787.76          .          .
+     rewrite only, no maintenance, no execute             24.41          .          .
+     ic iallu; dsb; isb; execute       (refill)          625.69          .          .
+     derived: I-cache REFILL of 4096 B after IC IVAU  =   -88.99 ns  (exec-after-ic - exec-warm - the ic loop)
+     derived: I-cache REFILL after IC IALLU           =   198.61 ns  (exec-after-iallu - exec-warm - the iallu op)
+     derived: whole SMC turnaround per 4096 B         =  1519.00 ns  (rewrite + canonical maintenance + execute, minus a warm execute)
+
+  -- region = 16384 bytes (256 64-B steps), 256 passes per timed sample
+     sequence                                           ns/pass     ns/64B    ns/4KiB
+     dsb ish; isb                       (floor)           12.04          -          -
+     dc cvau + ic ivau interleaved, one dsb+isb         1991.05     7.7305     494.75
+     ic ivau x N;  dsb ish; isb                         2212.89     8.5971     550.21
+     dc cvau x N;  dsb ish; isb                          392.42     1.4858      95.09
+     ic iallu;     dsb ish; isb        (whole I-cache)      159.83     0.5773      36.95
+     CANONICAL: dc x N; dsb; ic x N; dsb; isb           2421.88     9.4134     602.46
+     execute the region, I-cache warm  (floor)          1195.15          .          .
+     ic ivau x N; dsb; isb; execute    (refill)         3960.94          .          .
+     rewrite + dc + dsb + ic + dsb + isb + execute      6812.01          .          .
+     rewrite only, no maintenance, no execute             86.75          .          .
+     ic iallu; dsb; isb; execute       (refill)         2000.00          .          .
+     derived: I-cache REFILL of 16384 B after IC IVAU  =   564.94 ns  (exec-after-ic - exec-warm - the ic loop)
+     derived: I-cache REFILL after IC IALLU           =   657.06 ns  (exec-after-iallu - exec-warm - the iallu op)
+     derived: whole SMC turnaround per 16384 B         =  5616.86 ns  (rewrite + canonical maintenance + execute, minus a warm execute)
+
+  -- region = 65536 bytes (1024 64-B steps), 64 passes per timed sample
+     sequence                                           ns/pass     ns/64B    ns/4KiB
+     dsb ish; isb                       (floor)           13.02          -          -
+     dc cvau + ic ivau interleaved, one dsb+isb         5217.45     5.0824     325.28
+     ic ivau x N;  dsb ish; isb                         7078.12     6.8995     441.57
+     dc cvau x N;  dsb ish; isb                         1580.73     1.5310      97.98
+     ic iallu;     dsb ish; isb        (whole I-cache)      173.83     0.1570      10.05
+     CANONICAL: dc x N; dsb; ic x N; dsb; isb           7537.11     7.3477     470.26
+     execute the region, I-cache warm  (floor)          4996.09          .          .
+     ic ivau x N; dsb; isb; execute    (refill)        14908.85          .          .
+     rewrite + dc + dsb + ic + dsb + isb + execute     26857.42          .          .
+     rewrite only, no maintenance, no execute            313.15          .          .
+     ic iallu; dsb; isb; execute       (refill)         7447.27          .          .
+     derived: I-cache REFILL of 65536 B after IC IVAU  =  2847.66 ns  (exec-after-ic - exec-warm - the ic loop)
+     derived: I-cache REFILL after IC IALLU           =  2290.36 ns  (exec-after-iallu - exec-warm - the iallu op)
+     derived: whole SMC turnaround per 65536 B         = 21861.33 ns  (rewrite + canonical maintenance + execute, minus a warm execute)
+
+  failures: 0   EL2 traps seen anywhere: 0

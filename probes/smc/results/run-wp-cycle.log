@@ -1,0 +1,117 @@
+### run 1
+=== 1. Revoking write permission on a code page and taking the write fault ===
+  512 distinct 4 KiB pages, 400 rounds, one timed sample per 128 stores.
+  The control runs the IDENTICAL instruction sequence over the IDENTICAL address
+  stream; only the shadow L3's AP[2] bit differs. NET is the difference.
+
+  control: page WRITABLE, store lands, no fault             0.65 ns   faults 0
+  RO page, handler skips the store (bare permission fault)     28.97 ns   NET    28.32 ns (   91 cyc)  faults 204800/204800
+    + read ESR_EL1 + FAR_EL1 + the faulting instruction word     29.62 ns   NET    28.97 ns (   93 cyc)  faults 204800/204800
+        ESR_EL1 = 0x9600004f  EC=0x25 (data abort current EL)  DFSC=0xf (permission fault, level 3)  WnR=1  ISV=0  SRT=0  SAS=0
+        FAR_EL1 = 0x4000001fffc0   faulting instruction word = 0xf9000021
+        -> ISV=0: the syndrome does NOT name the register; a software store emulator must fetch and decode the faulting instruction itself
+    + classify the frame: shadow-L3 -> OA -> per-frame kind byte     30.92 ns   NET    30.27 ns (   98 cyc)  faults 204800/204800
+        classified: code=204800  page-table=0  unknown=0
+    + emulate the store via a writable alias, Rt from ESR.ISS.SRT     30.60 ns   NET    29.95 ns (   97 cyc)  faults 204800/204800
+        NOTE: with ISV=0 this arm reads SRT=0 and therefore emulates the
+        store as if Rt were x0. It is reported as a COST measurement only --
+        it is not a correct store emulator on this platform. The insn-decode
+        arm below is the one that is semantically right.
+    + emulate the store via a writable alias, Rt decoded from the insn     29.30 ns   NET    28.65 ns (   92 cyc)  faults 204800/204800
+
+  Reference (doc 16 §1, same machine): bare in-VM permission fault 28.2 ns,
+  translation fault 94.4 ns, full shadow fill 145.8 ns.
+
+  failures: 0   EL2 traps seen anywhere: 0
+
+  control: page writable, no fault, no re-protect               2.60 ns   faults 0 (bare-store component 0.65 ns)
+  FULL cycle, handler unprotects with TLBI VAAE1IS            705.73 ns   NET   705.00   faults 51200/51200
+      component: bare store over the same VA stream            0.73 ns
+      component: RW->RO->RW descriptor edits, no barriers      0.49 ns
+      component: dsb + TLBI VAAE1IS + dsb + isb              268.39 ns
+      component: full permission round trip (2 edits+2 TLBI) 494.95 ns
+      => of the 705 ns, TLB maintenance is 537 ns (76%): one TLBI in the
+         handler to make the page writable, one in the loop to re-protect it.
+  FULL cycle, handler unprotects WITHOUT a TLBI               736.98 ns   NET   736.25   faults 102399 (expected 51200 if one per store)
+      retries that still faulted at the same FAR (stale RO entry was cached): 51199
+      -> the stale read-only entry WAS cached. Un-write-protecting a page REQUIRES a TLBI: unlike an invalid->valid shadow fill (doc 16 §2), this one cannot be elided, because a valid restrictive entry is architecturally cacheable.
+
+  failures: 0   EL2 traps seen anywhere: 0
+### run 2
+=== 1. Revoking write permission on a code page and taking the write fault ===
+  512 distinct 4 KiB pages, 400 rounds, one timed sample per 128 stores.
+  The control runs the IDENTICAL instruction sequence over the IDENTICAL address
+  stream; only the shadow L3's AP[2] bit differs. NET is the difference.
+
+  control: page WRITABLE, store lands, no fault             0.65 ns   faults 0
+  RO page, handler skips the store (bare permission fault)     28.97 ns   NET    28.32 ns (   91 cyc)  faults 204800/204800
+    + read ESR_EL1 + FAR_EL1 + the faulting instruction word     29.62 ns   NET    28.97 ns (   93 cyc)  faults 204800/204800
+        ESR_EL1 = 0x9600004f  EC=0x25 (data abort current EL)  DFSC=0xf (permission fault, level 3)  WnR=1  ISV=0  SRT=0  SAS=0
+        FAR_EL1 = 0x4000001fffc0   faulting instruction word = 0xf9000021
+        -> ISV=0: the syndrome does NOT name the register; a software store emulator must fetch and decode the faulting instruction itself
+    + classify the frame: shadow-L3 -> OA -> per-frame kind byte     30.92 ns   NET    30.27 ns (   98 cyc)  faults 204800/204800
+        classified: code=204800  page-table=0  unknown=0
+    + emulate the store via a writable alias, Rt from ESR.ISS.SRT     30.60 ns   NET    29.95 ns (   97 cyc)  faults 204800/204800
+        NOTE: with ISV=0 this arm reads SRT=0 and therefore emulates the
+        store as if Rt were x0. It is reported as a COST measurement only --
+        it is not a correct store emulator on this platform. The insn-decode
+        arm below is the one that is semantically right.
+    + emulate the store via a writable alias, Rt decoded from the insn     30.60 ns   NET    29.95 ns (   97 cyc)  faults 204800/204800
+
+  Reference (doc 16 §1, same machine): bare in-VM permission fault 28.2 ns,
+  translation fault 94.4 ns, full shadow fill 145.8 ns.
+
+  failures: 0   EL2 traps seen anywhere: 0
+
+  control: page writable, no fault, no re-protect               2.60 ns   faults 0 (bare-store component 0.65 ns)
+  FULL cycle, handler unprotects with TLBI VAAE1IS            682.29 ns   NET   681.56   faults 51200/51200
+      component: bare store over the same VA stream            0.73 ns
+      component: RW->RO->RW descriptor edits, no barriers      0.49 ns
+      component: dsb + TLBI VAAE1IS + dsb + isb              282.47 ns
+      component: full permission round trip (2 edits+2 TLBI) 635.90 ns
+      => of the 682 ns, TLB maintenance is 565 ns (83%): one TLBI in the
+         handler to make the page writable, one in the loop to re-protect it.
+  FULL cycle, handler unprotects WITHOUT a TLBI               828.12 ns   NET   827.39   faults 102400 (expected 51200 if one per store)
+      retries that still faulted at the same FAR (stale RO entry was cached): 51200
+      -> the stale read-only entry WAS cached. Un-write-protecting a page REQUIRES a TLBI: unlike an invalid->valid shadow fill (doc 16 §2), this one cannot be elided, because a valid restrictive entry is architecturally cacheable.
+
+  failures: 0   EL2 traps seen anywhere: 0
+### run 3
+=== 1. Revoking write permission on a code page and taking the write fault ===
+  512 distinct 4 KiB pages, 400 rounds, one timed sample per 128 stores.
+  The control runs the IDENTICAL instruction sequence over the IDENTICAL address
+  stream; only the shadow L3's AP[2] bit differs. NET is the difference.
+
+  control: page WRITABLE, store lands, no fault             0.65 ns   faults 0
+  RO page, handler skips the store (bare permission fault)     27.67 ns   NET    27.02 ns (   87 cyc)  faults 204800/204800
+    + read ESR_EL1 + FAR_EL1 + the faulting instruction word     29.62 ns   NET    28.97 ns (   93 cyc)  faults 204800/204800
+        ESR_EL1 = 0x9600004f  EC=0x25 (data abort current EL)  DFSC=0xf (permission fault, level 3)  WnR=1  ISV=0  SRT=0  SAS=0
+        FAR_EL1 = 0x4000001fffc0   faulting instruction word = 0xf9000021
+        -> ISV=0: the syndrome does NOT name the register; a software store emulator must fetch and decode the faulting instruction itself
+    + classify the frame: shadow-L3 -> OA -> per-frame kind byte     30.92 ns   NET    30.27 ns (   98 cyc)  faults 204800/204800
+        classified: code=204800  page-table=0  unknown=0
+    + emulate the store via a writable alias, Rt from ESR.ISS.SRT     29.30 ns   NET    28.65 ns (   92 cyc)  faults 204800/204800
+        NOTE: with ISV=0 this arm reads SRT=0 and therefore emulates the
+        store as if Rt were x0. It is reported as a COST measurement only --
+        it is not a correct store emulator on this platform. The insn-decode
+        arm below is the one that is semantically right.
+    + emulate the store via a writable alias, Rt decoded from the insn     30.60 ns   NET    29.95 ns (   97 cyc)  faults 204800/204800
+
+  Reference (doc 16 §1, same machine): bare in-VM permission fault 28.2 ns,
+  translation fault 94.4 ns, full shadow fill 145.8 ns.
+
+  failures: 0   EL2 traps seen anywhere: 0
+
+  control: page writable, no fault, no re-protect               2.60 ns   faults 0 (bare-store component 0.65 ns)
+  FULL cycle, handler unprotects with TLBI VAAE1IS            822.92 ns   NET   822.18   faults 51200/51200
+      component: bare store over the same VA stream            0.73 ns
+      component: RW->RO->RW descriptor edits, no barriers      0.49 ns
+      component: dsb + TLBI VAAE1IS + dsb + isb              250.24 ns
+      component: full permission round trip (2 edits+2 TLBI) 556.72 ns
+      => of the 822 ns, TLB maintenance is 500 ns (61%): one TLBI in the
+         handler to make the page writable, one in the loop to re-protect it.
+  FULL cycle, handler unprotects WITHOUT a TLBI               872.40 ns   NET   871.66   faults 102400 (expected 51200 if one per store)
+      retries that still faulted at the same FAR (stale RO entry was cached): 51200
+      -> the stale read-only entry WAS cached. Un-write-protecting a page REQUIRES a TLBI: unlike an invalid->valid shadow fill (doc 16 §2), this one cannot be elided, because a valid restrictive entry is architecturally cacheable.
+
+  failures: 0   EL2 traps seen anywhere: 0

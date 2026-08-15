@@ -1,0 +1,499 @@
+{
+ "task": "none",
+ "label": "boot.ftrace",
+ "smp": 1,
+ "cpu": "max",
+ "cmd": [
+  "/opt/homebrew/bin/qemu-system-x86_64",
+  "-machine",
+  "q35",
+  "-accel",
+  "tcg,thread=single",
+  "-cpu",
+  "max",
+  "-m",
+  "3072",
+  "-smp",
+  "1",
+  "-kernel",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/nb-x86_64/boot/vmlinuz-virt",
+  "-initrd",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/initramfs-x86_64.cpio",
+  "-append",
+  "console=ttyS0 natemu.task=none panic=-1 rdinit=/init loglevel=3 ftrace=function",
+  "-display",
+  "none",
+  "-serial",
+  "stdio",
+  "-no-reboot",
+  "-nodefaults",
+  "-monitor",
+  "none",
+  "-qmp",
+  "unix:/var/folders/tg/kk14ymm167ngfz6gwj8k788c0000gn/T/tmp21e3rtxc/qmp.sock,server,nowait"
+ ],
+ "wall": 2.4579,
+ "marks": {
+  "NATEMU_INIT_UP": 2.3720586670096964,
+  "NATEMU_TASK_BEGIN": 2.3907067090040073,
+  "NATEMU_TASK_END": 2.3962444170028903
+ },
+ "series": [
+  {
+   "gen_code_size": 1290232,
+   "tb_count": 2038,
+   "tb_flush": 0,
+   "tb_invalidate": 180,
+   "tlb_full": 0,
+   "tlb_partial": 522,
+   "tlb_elided": 10966,
+   "t": 0.0578
+  },
+  {
+   "gen_code_size": 2195880,
+   "tb_count": 3405,
+   "tb_flush": 0,
+   "tb_invalidate": 194,
+   "tlb_full": 0,
+   "tlb_partial": 930,
+   "tlb_elided": 17054,
+   "t": 0.1134
+  },
+  {
+   "gen_code_size": 2195880,
+   "tb_count": 3405,
+   "tb_flush": 0,
+   "tb_invalidate": 194,
+   "tlb_full": 0,
+   "tlb_partial": 930,
+   "tlb_elided": 17054,
+   "t": 0.1691
+  },
+  {
+   "gen_code_size": 2198984,
+   "tb_count": 3411,
+   "tb_flush": 0,
+   "tb_invalidate": 194,
+   "tlb_full": 0,
+   "tlb_partial": 930,
+   "tlb_elided": 17054,
+   "t": 0.2246
+  },
+  {
+   "gen_code_size": 2211704,
+   "tb_count": 3431,
+   "tb_flush": 0,
+   "tb_invalidate": 194,
+   "tlb_full": 0,
+   "tlb_partial": 930,
+   "tlb_elided": 17054,
+   "t": 0.2801
+  },
+  {
+   "gen_code_size": 2212184,
+   "tb_count": 3432,
+   "tb_flush": 0,
+   "tb_invalidate": 194,
+   "tlb_full": 0,
+   "tlb_partial": 930,
+   "tlb_elided": 17054,
+   "t": 0.3357
+  },
+  {
+   "gen_code_size": 2266824,
+   "tb_count": 3509,
+   "tb_flush": 0,
+   "tb_invalidate": 194,
+   "tlb_full": 0,
+   "tlb_partial": 930,
+   "tlb_elided": 17054,
+   "t": 0.388
+  },
+  {
+   "gen_code_size": 2266824,
+   "tb_count": 3509,
+   "tb_flush": 0,
+   "tb_invalidate": 194,
+   "tlb_full": 0,
+   "tlb_partial": 930,
+   "tlb_elided": 17054,
+   "t": 0.4435
+  },
+  {
+   "gen_code_size": 2268728,
+   "tb_count": 3512,
+   "tb_flush": 0,
+   "tb_invalidate": 194,
+   "tlb_full": 0,
+   "tlb_partial": 930,
+   "tlb_elided": 17054,
+   "t": 0.499
+  },
+  {
+   "gen_code_size": 3861336,
+   "tb_count": 5799,
+   "tb_flush": 0,
+   "tb_invalidate": 197,
+   "tlb_full": 0,
+   "tlb_partial": 942,
+   "tlb_elided": 17138,
+   "t": 0.5546
+  },
+  {
+   "gen_code_size": 5747800,
+   "tb_count": 8661,
+   "tb_flush": 0,
+   "tb_invalidate": 198,
+   "tlb_full": 0,
+   "tlb_partial": 960,
+   "tlb_elided": 17264,
+   "t": 0.6102
+  },
+  {
+   "gen_code_size": 6187096,
+   "tb_count": 9332,
+   "tb_flush": 0,
+   "tb_invalidate": 198,
+   "tlb_full": 0,
+   "tlb_partial": 960,
+   "tlb_elided": 17264,
+   "t": 0.6659
+  },
+  {
+   "gen_code_size": 7175928,
+   "tb_count": 10774,
+   "tb_flush": 0,
+   "tb_invalidate": 1720,
+   "tlb_full": 0,
+   "tlb_partial": 962,
+   "tlb_elided": 17278,
+   "t": 0.7218
+  },
+  {
+   "gen_code_size": 9297944,
+   "tb_count": 13888,
+   "tb_flush": 0,
+   "tb_invalidate": 1730,
+   "tlb_full": 0,
+   "tlb_partial": 962,
+   "tlb_elided": 17278,
+   "t": 0.7777
+  },
+  {
+   "gen_code_size": 13184776,
+   "tb_count": 19753,
+   "tb_flush": 0,
+   "tb_invalidate": 1749,
+   "tlb_full": 0,
+   "tlb_partial": 986,
+   "tlb_elided": 17446,
+   "t": 0.8336
+  },
+  {
+   "gen_code_size": 15257128,
+   "tb_count": 22975,
+   "tb_flush": 0,
+   "tb_invalidate": 2893,
+   "tlb_full": 0,
+   "tlb_partial": 986,
+   "tlb_elided": 17446,
+   "t": 0.8896
+  },
+  {
+   "gen_code_size": 15454984,
+   "tb_count": 23288,
+   "tb_flush": 0,
+   "tb_invalidate": 4303,
+   "tlb_full": 0,
+   "tlb_partial": 986,
+   "tlb_elided": 17446,
+   "t": 0.9455
+  },
+  {
+   "gen_code_size": 15616584,
+   "tb_count": 23522,
+   "tb_flush": 0,
+   "tb_invalidate": 5430,
+   "tlb_full": 0,
+   "tlb_partial": 7842,
+   "tlb_elided": 65438,
+   "t": 1.0016
+  },
+  {
+   "gen_code_size": 15619608,
+   "tb_count": 23526,
+   "tb_flush": 0,
+   "tb_invalidate": 5453,
+   "tlb_full": 0,
+   "tlb_partial": 21634,
+   "tlb_elided": 161982,
+   "t": 1.0576
+  },
+  {
+   "gen_code_size": 15627432,
+   "tb_count": 23536,
+   "tb_flush": 0,
+   "tb_invalidate": 5456,
+   "tlb_full": 0,
+   "tlb_partial": 35778,
+   "tlb_elided": 260990,
+   "t": 1.1136
+  },
+  {
+   "gen_code_size": 19769080,
+   "tb_count": 29585,
+   "tb_flush": 0,
+   "tb_invalidate": 5456,
+   "tlb_full": 0,
+   "tlb_partial": 40026,
+   "tlb_elided": 290726,
+   "t": 1.1696
+  },
+  {
+   "gen_code_size": 20043768,
+   "tb_count": 29996,
+   "tb_flush": 0,
+   "tb_invalidate": 5456,
+   "tlb_full": 0,
+   "tlb_partial": 40026,
+   "tlb_elided": 290726,
+   "t": 1.2257
+  },
+  {
+   "gen_code_size": 20359176,
+   "tb_count": 30488,
+   "tb_flush": 0,
+   "tb_invalidate": 5456,
+   "tlb_full": 0,
+   "tlb_partial": 40026,
+   "tlb_elided": 290726,
+   "t": 1.2782
+  },
+  {
+   "gen_code_size": 24508680,
+   "tb_count": 36697,
+   "tb_flush": 0,
+   "tb_invalidate": 5458,
+   "tlb_full": 0,
+   "tlb_partial": 40074,
+   "tlb_elided": 291062,
+   "t": 1.3315
+  },
+  {
+   "gen_code_size": 27501384,
+   "tb_count": 41159,
+   "tb_flush": 0,
+   "tb_invalidate": 5458,
+   "tlb_full": 0,
+   "tlb_partial": 40094,
+   "tlb_elided": 291202,
+   "t": 1.3884
+  },
+  {
+   "gen_code_size": 29157784,
+   "tb_count": 43750,
+   "tb_flush": 0,
+   "tb_invalidate": 5460,
+   "tlb_full": 0,
+   "tlb_partial": 40478,
+   "tlb_elided": 293890,
+   "t": 1.4406
+  },
+  {
+   "gen_code_size": 31373960,
+   "tb_count": 47258,
+   "tb_flush": 0,
+   "tb_invalidate": 5460,
+   "tlb_full": 0,
+   "tlb_partial": 40478,
+   "tlb_elided": 293890,
+   "t": 1.4965
+  },
+  {
+   "gen_code_size": 34020680,
+   "tb_count": 51353,
+   "tb_flush": 0,
+   "tb_invalidate": 5460,
+   "tlb_full": 0,
+   "tlb_partial": 40486,
+   "tlb_elided": 294074,
+   "t": 1.5514
+  },
+  {
+   "gen_code_size": 36666008,
+   "tb_count": 55254,
+   "tb_flush": 0,
+   "tb_invalidate": 5460,
+   "tlb_full": 0,
+   "tlb_partial": 40486,
+   "tlb_elided": 294074,
+   "t": 1.6071
+  },
+  {
+   "gen_code_size": 37089864,
+   "tb_count": 55917,
+   "tb_flush": 0,
+   "tb_invalidate": 5460,
+   "tlb_full": 0,
+   "tlb_partial": 40486,
+   "tlb_elided": 294074,
+   "t": 1.6643
+  },
+  {
+   "gen_code_size": 39642008,
+   "tb_count": 59618,
+   "tb_flush": 0,
+   "tb_invalidate": 5460,
+   "tlb_full": 0,
+   "tlb_partial": 40486,
+   "tlb_elided": 294074,
+   "t": 1.7219
+  },
+  {
+   "gen_code_size": 41981736,
+   "tb_count": 63157,
+   "tb_flush": 0,
+   "tb_invalidate": 5460,
+   "tlb_full": 0,
+   "tlb_partial": 40486,
+   "tlb_elided": 294074,
+   "t": 1.7747
+  },
+  {
+   "gen_code_size": 43069464,
+   "tb_count": 64873,
+   "tb_flush": 0,
+   "tb_invalidate": 5460,
+   "tlb_full": 0,
+   "tlb_partial": 40486,
+   "tlb_elided": 294074,
+   "t": 1.8319
+  },
+  {
+   "gen_code_size": 45014696,
+   "tb_count": 67788,
+   "tb_flush": 0,
+   "tb_invalidate": 5460,
+   "tlb_full": 0,
+   "tlb_partial": 40486,
+   "tlb_elided": 294074,
+   "t": 1.889
+  },
+  {
+   "gen_code_size": 45083944,
+   "tb_count": 67889,
+   "tb_flush": 0,
+   "tb_invalidate": 5460,
+   "tlb_full": 0,
+   "tlb_partial": 40486,
+   "tlb_elided": 294074,
+   "t": 1.9463
+  },
+  {
+   "gen_code_size": 45714552,
+   "tb_count": 68810,
+   "tb_flush": 0,
+   "tb_invalidate": 5466,
+   "tlb_full": 0,
+   "tlb_partial": 40582,
+   "tlb_elided": 294746,
+   "t": 2.0027
+  },
+  {
+   "gen_code_size": 46934088,
+   "tb_count": 70674,
+   "tb_flush": 0,
+   "tb_invalidate": 5466,
+   "tlb_full": 0,
+   "tlb_partial": 40582,
+   "tlb_elided": 294746,
+   "t": 2.0601
+  },
+  {
+   "gen_code_size": 52370872,
+   "tb_count": 78989,
+   "tb_flush": 0,
+   "tb_invalidate": 5466,
+   "tlb_full": 0,
+   "tlb_partial": 40598,
+   "tlb_elided": 294826,
+   "t": 2.1179
+  },
+  {
+   "gen_code_size": 54217992,
+   "tb_count": 81839,
+   "tb_flush": 0,
+   "tb_invalidate": 5471,
+   "tlb_full": 0,
+   "tlb_partial": 40634,
+   "tlb_elided": 295078,
+   "t": 2.1761
+  },
+  {
+   "gen_code_size": 54245128,
+   "tb_count": 81885,
+   "tb_flush": 0,
+   "tb_invalidate": 5471,
+   "tlb_full": 0,
+   "tlb_partial": 40634,
+   "tlb_elided": 295078,
+   "t": 2.2319
+  },
+  {
+   "gen_code_size": 54308392,
+   "tb_count": 81990,
+   "tb_flush": 0,
+   "tb_invalidate": 14012,
+   "tlb_full": 0,
+   "tlb_partial": 40646,
+   "tlb_elided": 295162,
+   "t": 2.2895
+  },
+  {
+   "gen_code_size": 56514872,
+   "tb_count": 85402,
+   "tb_flush": 0,
+   "tb_invalidate": 17238,
+   "tlb_full": 0,
+   "tlb_partial": 40727,
+   "tlb_elided": 295593,
+   "t": 2.3445
+  },
+  {
+   "gen_code_size": 58506952,
+   "tb_count": 88452,
+   "tb_flush": 0,
+   "tb_invalidate": 17238,
+   "tlb_full": 0,
+   "tlb_partial": 40926,
+   "tlb_elided": 296354,
+   "t": 2.4028
+  }
+ ],
+ "console": [
+  [
+   2.3721,
+   "NATEMU_INIT_UP uptime=1.62"
+  ],
+  [
+   2.3814,
+   "NATEMU_SHELL_UP uptime=1.63"
+  ],
+  [
+   2.3907,
+   "NATEMU_TASK_BEGIN none"
+  ],
+  [
+   2.3962,
+   "NATEMU_TASK_END none uptime=1.65"
+  ],
+  [
+   2.4061,
+   "[    1.685142] sysrq: Power Off"
+  ],
+  [
+   2.4083,
+   "[    1.688143] reboot: Power down"
+  ]
+ ]
+}

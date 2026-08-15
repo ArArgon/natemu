@@ -1,0 +1,77 @@
+=== SMC detection probe ===
+  host: Apple M2 Max
+  cores: 8 performance + 4 efficiency, max vCPUs 64
+  payload 3244 bytes
+
+=== 0. Machine facts read from inside the VM at guest EL1 ===
+  CNTFRQ_EL0            = 24000000 Hz  (41.67 ns/tick)
+  {isb; mrs CNTVCT_EL0} = 8.93 ns   empty loop iteration = 0.30 ns
+  dependent ADD latency = 0.3168 ns -> clock estimate 3.16 GHz
+  CTR_EL0               = 0x000000008444c004
+    IminLine = 64 bytes   DminLine = 64 bytes   CWG = 64 B  ERG = 64 B
+    IDC = 0  (DC CVAU to PoU is REQUIRED after writing code)
+    DIC = 0  (IC IVAU is REQUIRED after writing code)
+    L1Ip = 3 (PIPT)
+  EL2 traps during this run: 0 (none -- good)
+
+=== 4. The same at 1/2/4/8 vCPUs -- IC IVAU is broadcast to the inner-shareable domain ===
+  vCPU 0 measures; vCPUs 1..N-1 contend. Every N is bracketed by a freshly measured
+  N=1 run so drift cannot masquerade as scaling.
+
+  -- contenders: IDLE-spinning   (region 4 KiB = 64 steps, 64 passes/sample)
+     sequence                                               1         2         4         8   (ns/pass, and xsolo)
+     dsb ish; isb                       (floor)         12.37     13.02     13.02     12.37  |  1.00x  1.05x  1.00x  1.00x
+     dc cvau + ic ivau interleaved, one dsb+isb        658.85    608.72    421.88    422.53  |  1.00x  1.00x  0.92x  0.69x
+     ic ivau x N;  dsb ish; isb                        658.20    608.07    420.57    421.88  |  1.00x  1.00x  0.83x  0.70x
+     dc cvau x N;  dsb ish; isb                        106.77    110.03    110.03    110.03  |  1.00x  1.03x  1.00x  1.03x
+     ic iallu;     dsb ish; isb        (whole I-cache)    110.03    154.30    130.21    130.86  |  1.00x  1.36x  0.98x  1.01x
+     CANONICAL: dc x N; dsb; ic x N; dsb; isb          705.08    709.64    521.48    522.14  |  1.00x  0.98x  0.95x  0.62x
+     execute the region, I-cache warm  (floor)         279.95    288.41    288.41    288.41  |  1.00x  1.03x  1.03x  1.03x
+     ic ivau x N; dsb; isb; execute    (refill)       1034.51   1067.71    981.12    872.40  |  1.00x  1.02x  0.91x  0.74x
+     rewrite + dc + dsb + ic + dsb + isb + execute    1754.56   1804.04   1779.95   1600.26  |  1.00x  1.03x  0.93x  0.82x
+     rewrite only, no maintenance, no execute           24.74     25.39     25.39     25.39  |  1.00x  1.05x  1.05x  1.03x
+     ic iallu; dsb; isb; execute       (refill)        576.17    584.64    591.80    594.40  |  1.00x  1.01x  1.04x  0.97x
+
+  -- contenders: walking their own 4 KiB pages (4 MiB each)   (region 4 KiB = 64 steps, 64 passes/sample)
+     sequence                                               1         2         4         8   (ns/pass, and xsolo)
+     dsb ish; isb                       (floor)         12.37     13.02     12.37     13.02  |  1.00x  1.00x  0.83x  1.05x
+     dc cvau + ic ivau interleaved, one dsb+isb        608.07    657.55    744.14    424.48  |  1.00x  1.06x  1.22x  0.70x
+     ic ivau x N;  dsb ish; isb                        606.77    607.42    740.89    423.18  |  1.00x  1.00x  1.22x  0.70x
+     dc cvau x N;  dsb ish; isb                        106.77    110.03    110.03    110.03  |  1.00x  1.03x  1.03x  1.03x
+     ic iallu;     dsb ish; isb        (whole I-cache)    111.33    112.63    151.04    133.46  |  1.00x  0.72x  1.33x  1.20x
+     CANONICAL: dc x N; dsb; ic x N; dsb; isb          705.08    708.33    844.40    537.76  |  1.00x  1.00x  1.20x  0.76x
+     execute the region, I-cache warm  (floor)         280.60    288.41    288.41    288.41  |  1.00x  1.03x  1.03x  1.03x
+     ic ivau x N; dsb; isb; execute    (refill)       1035.81   1065.76    904.95    895.18  |  1.00x  0.94x  0.85x  0.86x
+     rewrite + dc + dsb + ic + dsb + isb + execute    2015.62   1796.88   1792.32   1639.97  |  1.00x  1.00x  1.01x  0.92x
+     rewrite only, no maintenance, no execute           25.39     24.74     25.39     24.74  |  1.00x  1.03x  1.03x  1.03x
+     ic iallu; dsb; isb; execute       (refill)        577.47    578.78    602.21    629.56  |  1.00x  0.95x  1.00x  1.13x
+
+  -- contenders: issuing their own IC IVAU storms over their own 4 KiB   (region 4 KiB = 64 steps, 64 passes/sample)
+     sequence                                               1         2         4         8   (ns/pass, and xsolo)
+     dsb ish; isb                       (floor)         12.37     13.02     13.02     13.67  |  1.00x  1.00x  1.05x  1.05x
+     dc cvau + ic ivau interleaved, one dsb+isb        608.07    653.65   1165.36   1387.37  |  1.00x  1.06x  1.55x  2.88x
+     ic ivau x N;  dsb ish; isb                        607.42    652.99   1164.71   1389.32  |  1.00x  1.08x  1.55x  2.44x
+     dc cvau x N;  dsb ish; isb                        106.77    110.03    110.03    110.68  |  1.00x  1.03x  1.03x  1.08x
+     ic iallu;     dsb ish; isb        (whole I-cache)    113.28    256.51    311.20    486.98  |  1.00x  2.26x  2.39x  3.80x
+     CANONICAL: dc x N; dsb; ic x N; dsb; isb          705.08    653.65   1165.36   1395.83  |  1.00x  0.93x  1.37x  2.10x
+     execute the region, I-cache warm  (floor)         280.60    288.41    288.41    288.41  |  1.00x  1.03x  1.03x  1.07x
+     ic ivau x N; dsb; isb; execute    (refill)       1044.27   1361.98   1483.72   1864.58  |  1.00x  1.30x  1.26x  1.91x
+     rewrite + dc + dsb + ic + dsb + isb + execute    1770.18   2078.78   2059.24   2421.88  |  1.00x  1.17x  1.08x  1.45x
+     rewrite only, no maintenance, no execute           24.74     27.34     29.95     33.20  |  1.00x  1.11x  1.21x  1.42x
+     ic iallu; dsb; isb; execute       (refill)        570.31    624.35    848.96    718.10  |  1.00x  1.09x  1.50x  1.31x
+
+  -- contenders: executing their own 4 KiB code region (I-fetch pressure)   (region 4 KiB = 64 steps, 64 passes/sample)
+     sequence                                               1         2         4         8   (ns/pass, and xsolo)
+     dsb ish; isb                       (floor)         12.37     13.02     13.02     12.37  |  1.00x  1.00x  1.00x  1.00x
+     dc cvau + ic ivau interleaved, one dsb+isb        615.89    443.36    601.56    421.88  |  1.00x  0.73x  0.92x  0.69x
+     ic ivau x N;  dsb ish; isb                        582.68    604.82    445.31    421.88  |  1.00x  1.00x  0.68x  0.70x
+     dc cvau x N;  dsb ish; isb                        106.77    110.68    110.03    110.68  |  1.00x  1.04x  1.00x  1.04x
+     ic iallu;     dsb ish; isb        (whole I-cache)    130.86    152.34    132.81    133.46  |  1.00x  1.34x  0.85x  0.97x
+     CANONICAL: dc x N; dsb; ic x N; dsb; isb          746.09    705.73    701.82    524.74  |  1.00x  1.00x  0.93x  0.74x
+     execute the region, I-cache warm  (floor)         276.69    280.60    289.06    289.71  |  1.00x  1.00x  1.00x  1.03x
+     ic ivau x N; dsb; isb; execute    (refill)       1031.25   1031.25   1067.06    880.21  |  1.00x  0.98x  0.90x  0.86x
+     rewrite + dc + dsb + ic + dsb + isb + execute    1832.68   1871.09   1796.88   1616.54  |  1.00x  1.05x  0.92x  0.91x
+     rewrite only, no maintenance, no execute           24.09     24.74     25.39     25.39  |  1.00x  1.00x  1.00x  1.05x
+     ic iallu; dsb; isb; execute       (refill)        575.52    685.55    644.53    643.88  |  1.00x  1.20x  0.88x  1.11x
+
+  failures: 0   EL2 traps seen anywhere: 0
