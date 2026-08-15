@@ -14,6 +14,10 @@ probes/**/bin/
 # QEMU baseline: downloaded guest images / kernels (1.8 GB, re-fetch with build.sh)
 probes/qemu_baseline/work/
 
+# Guest-rates probe: fetched Alpine apks + cross toolchain (547 MB, re-fetch with
+# fetch_toolchain.sh / fetch_src.sh)
+probes/guest_rates/work/
+
 # Oracle probe: built test binaries + initramfs (regenerate with run_flagtorture.sh)
 probes/oracle/work/
 probes/oracle/*.so

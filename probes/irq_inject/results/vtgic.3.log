@@ -1,0 +1,18 @@
+=== ARM virtual timer -> guest EL1, WITH framework GIC ===
+  hv_gic_create -> 0x0 OK
+  hv_vcpu_run returns: 2   of which VTIMER_ACTIVATED: 0, CANCELED: 0
+  guest IRQs taken (EL1 vector entries): 7191937
+  GICR_ISENABLER0 readback = 0xffffffff (bit27 = vtimer PPI: ENABLED)
+  deadline = now + 240 ticks (10000 ns).  lateness (delivery - deadline):
+    n=400  p10 958  p50 958  p90 958  p99 1208  min 917  max 1542 ns
+  phase IRQ counts: single-shot 400, after storm A 7171936, after storm B 7191937
+  storm A: IRQ entry -> VBAR_EL1 -> ERET, handler touches NO GIC register
+    7171536 IRQs in 360016 us -> 50.2 ns per IRQ round trip
+  storm B: same, but handler does ICC_IAR1_EL1 + ICC_EOIR1_EL1
+    20001 IRQs in 38622 us -> 1931.0 ns per IRQ round trip
+  MRS ICC_IAR1_EL1 (spurious, returned 1023): 923.1 ns
+  MSR ICC_EOIR1_EL1 (spurious id 1023):        903.1 ns
+  MSR ICC_PMR_EL1:                             903.6 ns
+  MRS ICC_PMR_EL1:                             904.3 ns
+  LDR GICR_ISENABLER0 (Device MMIO, stage 2):  983.0 ns
+  STR GICR_ISENABLER0 (Device MMIO, stage 2):  1000.4 ns

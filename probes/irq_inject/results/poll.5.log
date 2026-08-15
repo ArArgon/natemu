@@ -1,0 +1,56 @@
+=== per-block interrupt-poll cost, in a translated loop (guest EL1) ===
+  CNTFRQ_EL0 = 24000000 Hz
+
+  Each section retires exactly 2,000,000 translated x86 instructions
+  (1 x86 insn = 4 ARM ops; 40% memory-touching; 8 chained blocks/iteration)
+
+  x86/blk       none    ld+cbnz   hdr-only   cbnz-reg    ld/blk%     hdr% reg/blk%
+  5            499us       498us       500us       497us     -0.23%   +0.15%   -0.51%
+  10           516us       497us       499us       497us     -3.70%   -3.37%   -3.66%
+  20           498us       498us       500us       498us     -0.09%   +0.32%   -0.07%
+  40           498us       498us       499us       498us     +0.06%   +0.34%   +0.09%
+  80           499us       498us       499us       504us     -0.28%   -0.03%   +0.94%
+
+  per-x86-instruction cost, and per-check cost in ns:
+  x86/blk ns/x86insn  ns/ld-check ns/reg-check
+  5           0.250       -0.003       -0.006
+  10          0.258       -0.095       -0.094
+  20          0.249       -0.005       -0.003
+  40          0.249        0.006        0.009
+  80          0.250       -0.055        0.188
+
+  drift control (same section run twice, k=5 and k=80):
+    k=5  none 499us / 501us   ld+cbnz 498us / 498us  (-0.23% vs -0.64%)
+    k=80 none 499us / 498us   ld+cbnz 498us / 499us  (-0.28% vs +0.18%)
+
+  check-density slope: n checks inside every 5-x86-instruction block
+  (400,000 blocks per section; slope = marginal ns per check)
+  n/block    ld+cbnz us     ns/check    cbnz-reg us     ns/check
+  0                 499       0.0000              -            -
+  1                 498      -0.0033            497      -0.0061
+  2                 499      -0.0002            498      -0.0014
+  4                 516       0.0104            513       0.0082
+  8                 600       0.0315            603       0.0323
+  16                960       0.0720            966       0.0729
+  32               1917       0.1107           1913       0.1104
+  baseline (n=0) measured twice: 499 us / 500 us  (drift +0.03%)
+
+=== translated REP MOVSQ: how do you keep it interruptible? ===
+  4096 elements x 512 repeats = 2,097,152 8-byte element copies per section
+  strategy                            total    ns/elem   overhead worst-case IRQ
+  no check (uninterruptible)          634us      0.302      +0.0%      unbounded
+  load+cbnz every element             671us      0.320      +5.8%          0.3 ns
+  load+cbnz every 8                   783us      0.373     +23.4%          3.0 ns
+  load+cbnz every 64                  651us      0.311      +2.7%         19.9 ns
+  load+cbnz every 512                 699us      0.333     +10.2%        170.6 ns
+  cbnz reg every element              642us      0.306      +1.2%          0.3 ns
+  no check (repeat)                   636us      0.303      +0.2%      unbounded
+
+=== EL1 code-cache self-patch and timer-arm costs ===
+  bare STR to the code page                          0.78 ns
+  STR + DC CVAU + DSB ISH + IC IVAU + DSB + ISB    111.29 ns
+  ISB alone                                          8.94 ns
+  MRS CNTVCT_EL0                                     0.54 ns
+  arm a deadline (MRS CNTVCT + MSR CVAL + CTL)       4.77 ns
+
+  host exits during the whole run: 1
