@@ -39,8 +39,21 @@ for w in $($B cat /proc/cmdline); do
         natemu.task=*) TASK="${w#natemu.task=}" ;;
         natemu.hold=*) HOLD="${w#natemu.hold=}" ;;
         natemu.idle=*) IDLE="${w#natemu.idle=}" ;;
+        natemu.cpuinfo=1) CPUINFO=1 ;;
     esac
 done
+
+# Diagnostic only, off by default so the measured path stays byte-identical.
+# doc 26 section 6: the guest never used PCID (cr3w_noflush=0, invpcid=0 in all five
+# workloads) and this reports whether the CPU advertises it at all, versus the
+# kernel declining to use it.
+if [ "${CPUINFO:-0}" = "1" ]; then
+    echo "NATEMU_CPUFLAGS $($B awk '/^flags/{print; exit}' /proc/cpuinfo)"
+    for f in pcid invpcid pge pse36 la57 smep smap; do
+        if $B grep -qw "$f" /proc/cpuinfo; then echo "NATEMU_FEAT $f=yes"; else echo "NATEMU_FEAT $f=no"; fi
+    done
+    echo "NATEMU_PTI $($B cat /sys/devices/system/cpu/vulnerabilities/meltdown 2>/dev/null || echo unknown)"
+fi
 
 # ---- measured idle window: nothing runs but the kernel's own timer/RCU work.
 if [ "$IDLE" != "0" ]; then

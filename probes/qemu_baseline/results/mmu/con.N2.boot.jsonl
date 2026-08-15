@@ -1,0 +1,85 @@
+{"t_epoch": 1786788448.919019, "line": "__LAUNCH__", "cmd": ["/opt/homebrew/bin/qemu-system-x86_64", "-plugin", "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/bin/plugin_mmu.so,out=/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/results/mmu/snap.N2.boot.txt,pt=0,shadow=1,snap_ms=250", "-machine", "q35", "-accel", "tcg,thread=single", "-cpu", "max", "-m", "3072", "-smp", "2", "-kernel", "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/nb-x86_64/boot/vmlinuz-virt", "-initrd", "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/initramfs2-x86_64.cpio", "-append", "console=ttyS0 natemu.task=none natemu.idle=0 natemu.hold=0 panic=-1 rdinit=/init loglevel=3 nokaslr", "-display", "none", "-serial", "stdio", "-no-reboot", "-nodefaults", "-monitor", "none"]}
+{"t_epoch": 1786788468.0304902, "line": "[    7.125867] BUG: unable to handle page fault for address: ffa00000000042d8"}
+{"t_epoch": 1786788468.0318341, "line": "[    7.127728] #PF: supervisor read access in kernel mode"}
+{"t_epoch": 1786788468.032008, "line": "[    7.127983] #PF: error_code(0x0000) - not-present page"}
+{"t_epoch": 1786788468.0322418, "line": "[    7.129414] PGD 100000067 P4D 100124067 PUD 100125067 PMD 100126067 PTE 0"}
+{"t_epoch": 1786788468.032398, "line": "[    7.131853] Oops: Oops: 0000 [#1] SMP NOPTI"}
+{"t_epoch": 1786788468.0326772, "line": "[    7.135772] CPU: 0 UID: 0 PID: 1 Comm: swapper/0 Not tainted 6.18.35-0-virt #1-Alpine PREEMPT(none) "}
+{"t_epoch": 1786788468.03301, "line": "[    7.136955] Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org 04/01/2014"}
+{"t_epoch": 1786788468.03322, "line": "[    7.138196] RIP: 0010:__die_header+0x1d/0x88"}
+{"t_epoch": 1786788468.033789, "line": "[    7.141450] Code: 90 90 90 90 90 90 90 90 90 90 90 90 90 0f 1f 40 d6 8b 05 de 38 0e 02 49 89 fa 85 c0 75 0e 48 c7 c7 a0 59 2e 83 b9 2a 00 00 00 <f3> a5 48 8b 0d 62 05 9f 01 48 c7 c6 f8 6d 45 82 0f b7 d2 49 c7 c1"}
+{"t_epoch": 1786788468.0339682, "line": "[    7.142086] RSP: 0018:ffa0000000003e70 EFLAGS: 00010046"}
+{"t_epoch": 1786788468.034236, "line": "[    7.142320] RAX: 0000000000000000 RBX: ffffffff824569fd RCX: 0000000000000029"}
+{"t_epoch": 1786788468.034453, "line": "[    7.142457] RDX: 0000000000000000 RSI: ffa00000000042d8 RDI: ffffffff832e5da0"}
+{"t_epoch": 1786788468.034681, "line": "[    7.142593] RBP: ffa0000000003ed8 R08: 0000000000000000 R09: 0000000000000000"}
+{"t_epoch": 1786788468.0348978, "line": "[    7.142726] R10: ffffffff824569fd R11: 0000000000000000 R12: 0000000000000000"}
+{"t_epoch": 1786788468.0351229, "line": "[    7.142860] R13: 0000000000000000 R14: 0000000000000000 R15: 0000000000000000"}
+{"t_epoch": 1786788468.0353699, "line": "[    7.143561] FS:  0000000000000000(0000) GS:ff110001b995c000(0000) knlGS:0000000000000000"}
+{"t_epoch": 1786788468.035548, "line": "[    7.143720] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033"}
+{"t_epoch": 1786788468.035764, "line": "[    7.143857] CR2: ffa00000000042d8 CR3: 0000000002a36000 CR4: 0000000000351eb0"}
+{"t_epoch": 1786788468.0358558, "line": "[    7.145632] Call Trace:"}
+{"t_epoch": 1786788468.035938, "line": "[    7.147017]  <IRQ>"}
+{"t_epoch": 1786788468.036041, "line": "[    7.147640]  __die+0x16/0x30"}
+{"t_epoch": 1786788468.036139, "line": "[    7.149334]  die+0x2f/0x50"}
+{"t_epoch": 1786788468.0362618, "line": "[    7.149424]  exc_int3+0x12f/0x140"}
+{"t_epoch": 1786788468.036391, "line": "[    7.149511]  asm_exc_int3+0x39/0x40"}
+{"t_epoch": 1786788468.036544, "line": "[    7.150537] RIP: 0010:sched_clock_cpu+0x108/0x210"}
+{"t_epoch": 1786788468.0370839, "line": "[    7.150619] Code: 85 36 ff ff ff 0f 1f 44 00 00 e9 2c ff ff ff 48 83 c4 18 e9 9a cd f2 ff 48 8d 96 40 42 0f 00 48 89 c6 4c 89 cf 48 29 d6 48 29 <c7> 48 85 f6 0f 8e d8 00 00 00 48 89 c2 48 85 ff 7f ab eb b3 65 48"}
+{"t_epoch": 1786788468.03725, "line": "[    7.150672] RSP: 0018:ffa0000000003fb8 EFLAGS: 00000096"}
+{"t_epoch": 1786788468.037473, "line": "[    7.150741] RAX: 0000000000000001 RBX: ff110001001a8000 RCX: ffffffff810017e8"}
+{"t_epoch": 1786788468.037695, "line": "[    7.150794] RDX: ff110001b995c000 RSI: 0000000000010000 RDI: 0000000000000000"}
+{"t_epoch": 1786788468.037923, "line": "[    7.150845] RBP: 0000000000000000 R08: 0000000000000000 R09: 0000000000000000"}
+{"t_epoch": 1786788468.038144, "line": "[    7.150894] R10: 0000000000000000 R11: ffa0000000003ff8 R12: 0000000000000000"}
+{"t_epoch": 1786788468.038375, "line": "[    7.150944] R13: 0000000000000000 R14: 0000000000000000 R15: 0000000000000000"}
+{"t_epoch": 1786788468.038513, "line": "[    7.151163]  ? early_xen_iret_patch+0xc/0xc"}
+{"t_epoch": 1786788468.038647, "line": "[    7.151315]  ? sched_clock_cpu+0x108/0x210"}
+{"t_epoch": 1786788468.0387971, "line": "[    7.151419]  ? irqtime_account_irq+0x41/0xd0"}
+{"t_epoch": 1786788468.038929, "line": "[    7.151497]  irqtime_account_irq+0x41/0xd0"}
+{"t_epoch": 1786788468.039083, "line": "[    7.151596]  sysvec_apic_timer_interrupt+0x64/0x90"}
+{"t_epoch": 1786788468.0391722, "line": "[    7.152480]  </IRQ>"}
+{"t_epoch": 1786788468.039253, "line": "[    7.152557]  <TASK>"}
+{"t_epoch": 1786788468.039419, "line": "[    7.152596]  asm_sysvec_apic_timer_interrupt+0x1a/0x20"}
+{"t_epoch": 1786788468.039603, "line": "[    7.152680] RIP: 0010:smp_call_function_many_cond+0x141/0x520"}
+{"t_epoch": 1786788468.040158, "line": "[    7.152768] Code: 89 df e8 12 5a 44 00 3b 05 0c 44 80 01 48 89 c2 73 24 48 63 c2 48 8b 4d 00 48 03 0c c5 c0 d3 4a 82 8b 41 08 a8 01 74 09 f3 90 <8b> 41 08 a8 01 75 f7 83 c2 01 eb c0 48 83 c4 50 5b 5d 41 5c 41 5d"}
+{"t_epoch": 1786788468.0403268, "line": "[    7.152819] RSP: 0018:ffa0000000013d40 EFLAGS: 00010202"}
+{"t_epoch": 1786788468.040556, "line": "[    7.152888] RAX: 0000000000000011 RBX: ff1100013cc2ce88 RCX: ff1100013cd30500"}
+{"t_epoch": 1786788468.0407732, "line": "[    7.152941] RDX: 0000000000000001 RSI: 0000000000000000 RDI: 0000000000000000"}
+{"t_epoch": 1786788468.041, "line": "[    7.152989] RBP: ff1100013cc2ce80 R08: 0000000000000000 R09: 0000000000000000"}
+{"t_epoch": 1786788468.041227, "line": "[    7.153040] R10: ff1100013cc2cea8 R11: 0000000000000000 R12: 0000000000000000"}
+{"t_epoch": 1786788468.041446, "line": "[    7.153091] R13: 0000000000000000 R14: 0000000000000001 R15: 0000000000000002"}
+{"t_epoch": 1786788468.041582, "line": "[    7.153238]  ? __pfx_do_sync_core+0x10/0x10"}
+{"t_epoch": 1786788468.041748, "line": "[    7.153349]  ? __pfx_sched_clock_init_late+0x10/0x10"}
+{"t_epoch": 1786788468.0419, "line": "[    7.153448]  on_each_cpu_cond_mask+0x1f/0x60"}
+{"t_epoch": 1786788468.042068, "line": "[    7.153537]  smp_text_poke_batch_finish+0xda/0x330"}
+{"t_epoch": 1786788468.0422149, "line": "[    7.153637]  ? tcp_v4_send_reset+0x336/0x8b0"}
+{"t_epoch": 1786788468.0423732, "line": "[    7.153737]  ? __pfx_sched_clock_init_late+0x10/0x10"}
+{"t_epoch": 1786788468.042536, "line": "[    7.153824]  arch_jump_label_transform_apply+0x15/0x30"}
+{"t_epoch": 1786788468.042699, "line": "[    7.153918]  static_key_enable_cpuslocked+0x6e/0xa0"}
+{"t_epoch": 1786788468.04283, "line": "[    7.154003]  static_key_enable+0x1a/0x30"}
+{"t_epoch": 1786788468.042974, "line": "[    7.154080]  sched_clock_init_late+0xbe/0x140"}
+{"t_epoch": 1786788468.043103, "line": "[    7.154168]  do_one_initcall+0x56/0x320"}
+{"t_epoch": 1786788468.043252, "line": "[    7.154318]  kernel_init_freeable+0x2e5/0x3c0"}
+{"t_epoch": 1786788468.0434089, "line": "[    7.154411]  ? __pfx_kernel_init+0x10/0x10"}
+{"t_epoch": 1786788468.043553, "line": "[    7.154506]  kernel_init+0x15/0x130"}
+{"t_epoch": 1786788468.043692, "line": "[    7.154580]  ret_from_fork+0x243/0x270"}
+{"t_epoch": 1786788468.0438569, "line": "[    7.154673]  ? __pfx_kernel_init+0x10/0x10"}
+{"t_epoch": 1786788468.04402, "line": "[    7.154752]  ret_from_fork_asm+0x1a/0x30"}
+{"t_epoch": 1786788468.044109, "line": "[    7.154994]  </TASK>"}
+{"t_epoch": 1786788468.044228, "line": "[    7.155459] Modules linked in:"}
+{"t_epoch": 1786788468.044352, "line": "[    7.156500] CR2: ffa00000000042d8"}
+{"t_epoch": 1786788468.044509, "line": "[    7.158691] ---[ end trace 0000000000000000 ]---"}
+{"t_epoch": 1786788468.044651, "line": "[    7.159380] RIP: 0010:__die_header+0x1d/0x88"}
+{"t_epoch": 1786788468.045208, "line": "[    7.159479] Code: 90 90 90 90 90 90 90 90 90 90 90 90 90 0f 1f 40 d6 8b 05 de 38 0e 02 49 89 fa 85 c0 75 0e 48 c7 c7 a0 59 2e 83 b9 2a 00 00 00 <f3> a5 48 8b 0d 62 05 9f 01 48 c7 c6 f8 6d 45 82 0f b7 d2 49 c7 c1"}
+{"t_epoch": 1786788468.0453818, "line": "[    7.159532] RSP: 0018:ffa0000000003e70 EFLAGS: 00010046"}
+{"t_epoch": 1786788468.0456152, "line": "[    7.159600] RAX: 0000000000000000 RBX: ffffffff824569fd RCX: 0000000000000029"}
+{"t_epoch": 1786788468.045851, "line": "[    7.159653] RDX: 0000000000000000 RSI: ffa00000000042d8 RDI: ffffffff832e5da0"}
+{"t_epoch": 1786788468.0460758, "line": "[    7.159706] RBP: ffa0000000003ed8 R08: 0000000000000000 R09: 0000000000000000"}
+{"t_epoch": 1786788468.046292, "line": "[    7.159756] R10: ffffffff824569fd R11: 0000000000000000 R12: 0000000000000000"}
+{"t_epoch": 1786788468.0465238, "line": "[    7.159807] R13: 0000000000000000 R14: 0000000000000000 R15: 0000000000000000"}
+{"t_epoch": 1786788468.046783, "line": "[    7.159857] FS:  0000000000000000(0000) GS:ff110001b995c000(0000) knlGS:0000000000000000"}
+{"t_epoch": 1786788468.0469692, "line": "[    7.159920] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033"}
+{"t_epoch": 1786788468.047217, "line": "[    7.159975] CR2: ffa00000000042d8 CR3: 0000000002a36000 CR4: 0000000000351eb0"}
+{"t_epoch": 1786788468.0474188, "line": "[    7.161248] Kernel panic - not syncing: Fatal exception in interrupt"}
+{"t_epoch": 1786788468.0475452, "line": "[    8.468406] Shutting down cpus with NMI"}
+{"t_epoch": 1786788468.0476649, "line": "[    8.476275] Kernel Offset: disabled"}
+{"t_epoch": 1786788468.054688, "line": "__EXIT__", "rc": 0}

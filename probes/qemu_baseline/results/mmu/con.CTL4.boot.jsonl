@@ -1,0 +1,127 @@
+{"t_epoch": 1786788592.8865721, "line": "__LAUNCH__", "cmd": ["/opt/homebrew/bin/qemu-system-x86_64", "-machine", "q35", "-accel", "tcg,thread=single", "-cpu", "max", "-m", "3072", "-smp", "4", "-kernel", "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/nb-x86_64/boot/vmlinuz-virt", "-initrd", "/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/work/initramfs2-x86_64.cpio", "-append", "console=ttyS0 natemu.task=none natemu.idle=0 natemu.hold=0 panic=-1 rdinit=/init loglevel=3 nokaslr", "-display", "none", "-serial", "stdio", "-no-reboot", "-nodefaults", "-monitor", "none"]}
+{"t_epoch": 1786788595.454293, "line": "NATEMU_INIT_UP uptime=1.80"}
+{"t_epoch": 1786788595.459379, "line": "NATEMU_MARK boot_done uptime=1.81"}
+{"t_epoch": 1786788595.48212, "line": "NATEMU_VM boot_done numa_hit 8428"}
+{"t_epoch": 1786788595.4821818, "line": "NATEMU_VM boot_done numa_miss 0"}
+{"t_epoch": 1786788595.482202, "line": "NATEMU_VM boot_done numa_foreign 0"}
+{"t_epoch": 1786788595.482214, "line": "NATEMU_VM boot_done numa_interleave 791"}
+{"t_epoch": 1786788595.4822578, "line": "NATEMU_VM boot_done numa_local 8428"}
+{"t_epoch": 1786788595.482296, "line": "NATEMU_VM boot_done numa_other 0"}
+{"t_epoch": 1786788595.4886348, "line": "NATEMU_VM boot_done nr_page_table_pages 90"}
+{"t_epoch": 1786788595.4886642, "line": "NATEMU_VM boot_done pgalloc_dma 0"}
+{"t_epoch": 1786788595.488699, "line": "NATEMU_VM boot_done pgalloc_dma32 0"}
+{"t_epoch": 1786788595.488738, "line": "NATEMU_VM boot_done pgalloc_normal 14007"}
+{"t_epoch": 1786788595.488773, "line": "NATEMU_VM boot_done pgalloc_movable 0"}
+{"t_epoch": 1786788595.4899158, "line": "NATEMU_VM boot_done pgfree 751593"}
+{"t_epoch": 1786788595.4899468, "line": "NATEMU_VM boot_done pgactivate 0"}
+{"t_epoch": 1786788595.489982, "line": "NATEMU_VM boot_done pgfault 805"}
+{"t_epoch": 1786788595.4900138, "line": "NATEMU_VM boot_done pgmajfault 0"}
+{"t_epoch": 1786788595.4911842, "line": "NATEMU_VM boot_done pgreuse 60"}
+{"t_epoch": 1786788595.491217, "line": "NATEMU_VM boot_done pgsteal_kswapd 0"}
+{"t_epoch": 1786788595.491251, "line": "NATEMU_VM boot_done pgsteal_direct 0"}
+{"t_epoch": 1786788595.49129, "line": "NATEMU_VM boot_done pgsteal_khugepaged 0"}
+{"t_epoch": 1786788595.491329, "line": "NATEMU_VM boot_done pgsteal_proactive 0"}
+{"t_epoch": 1786788595.491366, "line": "NATEMU_VM boot_done pgsteal_anon 0"}
+{"t_epoch": 1786788595.4913988, "line": "NATEMU_VM boot_done pgsteal_file 0"}
+{"t_epoch": 1786788595.492506, "line": "NATEMU_VM boot_done numa_pte_updates 0"}
+{"t_epoch": 1786788595.4925492, "line": "NATEMU_VM boot_done numa_huge_pte_updates 0"}
+{"t_epoch": 1786788595.4925828, "line": "NATEMU_VM boot_done numa_hint_faults 0"}
+{"t_epoch": 1786788595.492626, "line": "NATEMU_VM boot_done numa_hint_faults_local 0"}
+{"t_epoch": 1786788595.492668, "line": "NATEMU_VM boot_done numa_pages_migrated 0"}
+{"t_epoch": 1786788595.492704, "line": "NATEMU_VM boot_done thp_fault_alloc 0"}
+{"t_epoch": 1786788595.501168, "line": "NATEMU_VM boot_done intr 4283"}
+{"t_epoch": 1786788595.501198, "line": "NATEMU_VM boot_done ctxt 2745"}
+{"t_epoch": 1786788595.5012329, "line": "NATEMU_VM boot_done processes 497"}
+{"t_epoch": 1786788595.507931, "line": "NATEMU_VM boot_done MemTotal: 2986900"}
+{"t_epoch": 1786788595.509242, "line": "NATEMU_VM boot_done MemFree: 2904920"}
+{"t_epoch": 1786788595.5092878, "line": "NATEMU_VM boot_done MemAvailable: 2788376"}
+{"t_epoch": 1786788595.5093188, "line": "NATEMU_VM boot_done Cached: 14384"}
+{"t_epoch": 1786788595.510435, "line": "NATEMU_VM boot_done AnonPages: 248"}
+{"t_epoch": 1786788595.510466, "line": "NATEMU_VM boot_done Mapped: 992"}
+{"t_epoch": 1786788595.51051, "line": "NATEMU_VM boot_done PageTables: 360"}
+{"t_epoch": 1786788595.512567, "line": "NATEMU_MARKEND boot_done"}
+{"t_epoch": 1786788595.522736, "line": "NATEMU_TASK_BEGIN none"}
+{"t_epoch": 1786788595.5273411, "line": "NATEMU_MARK task_begin uptime=1.88"}
+{"t_epoch": 1786788595.535081, "line": "NATEMU_VM task_begin numa_hit 9178"}
+{"t_epoch": 1786788595.535112, "line": "NATEMU_VM task_begin numa_miss 0"}
+{"t_epoch": 1786788595.536545, "line": "NATEMU_VM task_begin numa_foreign 0"}
+{"t_epoch": 1786788595.536586, "line": "NATEMU_VM task_begin numa_interleave 791"}
+{"t_epoch": 1786788595.536621, "line": "NATEMU_VM task_begin numa_local 9178"}
+{"t_epoch": 1786788595.5366552, "line": "NATEMU_VM task_begin numa_other 0"}
+{"t_epoch": 1786788595.53905, "line": "NATEMU_VM task_begin nr_page_table_pages 121"}
+{"t_epoch": 1786788595.541644, "line": "NATEMU_VM task_begin pgalloc_dma 0"}
+{"t_epoch": 1786788595.54169, "line": "NATEMU_VM task_begin pgalloc_dma32 0"}
+{"t_epoch": 1786788595.5417302, "line": "NATEMU_VM task_begin pgalloc_normal 14758"}
+{"t_epoch": 1786788595.541767, "line": "NATEMU_VM task_begin pgalloc_movable 0"}
+{"t_epoch": 1786788595.5429251, "line": "NATEMU_VM task_begin pgfree 752313"}
+{"t_epoch": 1786788595.542956, "line": "NATEMU_VM task_begin pgactivate 0"}
+{"t_epoch": 1786788595.542996, "line": "NATEMU_VM task_begin pgfault 1534"}
+{"t_epoch": 1786788595.5430279, "line": "NATEMU_VM task_begin pgmajfault 0"}
+{"t_epoch": 1786788595.54306, "line": "NATEMU_VM task_begin pgreuse 105"}
+{"t_epoch": 1786788595.543097, "line": "NATEMU_VM task_begin pgsteal_kswapd 0"}
+{"t_epoch": 1786788595.544193, "line": "NATEMU_VM task_begin pgsteal_direct 0"}
+{"t_epoch": 1786788595.544232, "line": "NATEMU_VM task_begin pgsteal_khugepaged 0"}
+{"t_epoch": 1786788595.54427, "line": "NATEMU_VM task_begin pgsteal_proactive 0"}
+{"t_epoch": 1786788595.544309, "line": "NATEMU_VM task_begin pgsteal_anon 0"}
+{"t_epoch": 1786788595.544349, "line": "NATEMU_VM task_begin pgsteal_file 0"}
+{"t_epoch": 1786788595.54439, "line": "NATEMU_VM task_begin numa_pte_updates 0"}
+{"t_epoch": 1786788595.5444329, "line": "NATEMU_VM task_begin numa_huge_pte_updates 0"}
+{"t_epoch": 1786788595.544472, "line": "NATEMU_VM task_begin numa_hint_faults 0"}
+{"t_epoch": 1786788595.544519, "line": "NATEMU_VM task_begin numa_hint_faults_local 0"}
+{"t_epoch": 1786788595.5445602, "line": "NATEMU_VM task_begin numa_pages_migrated 0"}
+{"t_epoch": 1786788595.545543, "line": "NATEMU_VM task_begin thp_fault_alloc 0"}
+{"t_epoch": 1786788595.550713, "line": "NATEMU_VM task_begin intr 4457"}
+{"t_epoch": 1786788595.551444, "line": "NATEMU_VM task_begin ctxt 2797"}
+{"t_epoch": 1786788595.551489, "line": "NATEMU_VM task_begin processes 502"}
+{"t_epoch": 1786788595.558374, "line": "NATEMU_VM task_begin MemTotal: 2986900"}
+{"t_epoch": 1786788595.55841, "line": "NATEMU_VM task_begin MemFree: 2904420"}
+{"t_epoch": 1786788595.558452, "line": "NATEMU_VM task_begin MemAvailable: 2787876"}
+{"t_epoch": 1786788595.558485, "line": "NATEMU_VM task_begin Cached: 14384"}
+{"t_epoch": 1786788595.5597062, "line": "NATEMU_VM task_begin AnonPages: 248"}
+{"t_epoch": 1786788595.5597372, "line": "NATEMU_VM task_begin Mapped: 992"}
+{"t_epoch": 1786788595.559785, "line": "NATEMU_VM task_begin PageTables: 484"}
+{"t_epoch": 1786788595.561745, "line": "NATEMU_MARKEND task_begin"}
+{"t_epoch": 1786788595.5668511, "line": "NATEMU_MARK task_end uptime=1.92"}
+{"t_epoch": 1786788595.575422, "line": "NATEMU_VM task_end numa_hit 9830"}
+{"t_epoch": 1786788595.5754611, "line": "NATEMU_VM task_end numa_miss 0"}
+{"t_epoch": 1786788595.575496, "line": "NATEMU_VM task_end numa_foreign 0"}
+{"t_epoch": 1786788595.575532, "line": "NATEMU_VM task_end numa_interleave 791"}
+{"t_epoch": 1786788595.575566, "line": "NATEMU_VM task_end numa_local 9830"}
+{"t_epoch": 1786788595.575596, "line": "NATEMU_VM task_end numa_other 0"}
+{"t_epoch": 1786788595.579595, "line": "NATEMU_VM task_end nr_page_table_pages 121"}
+{"t_epoch": 1786788595.580849, "line": "NATEMU_VM task_end pgalloc_dma 0"}
+{"t_epoch": 1786788595.580891, "line": "NATEMU_VM task_end pgalloc_dma32 0"}
+{"t_epoch": 1786788595.5809321, "line": "NATEMU_VM task_end pgalloc_normal 15409"}
+{"t_epoch": 1786788595.5809689, "line": "NATEMU_VM task_end pgalloc_movable 0"}
+{"t_epoch": 1786788595.582165, "line": "NATEMU_VM task_end pgfree 752991"}
+{"t_epoch": 1786788595.582198, "line": "NATEMU_VM task_end pgactivate 0"}
+{"t_epoch": 1786788595.582227, "line": "NATEMU_VM task_end pgfault 2199"}
+{"t_epoch": 1786788595.582256, "line": "NATEMU_VM task_end pgmajfault 0"}
+{"t_epoch": 1786788595.5835361, "line": "NATEMU_VM task_end pgreuse 139"}
+{"t_epoch": 1786788595.583571, "line": "NATEMU_VM task_end pgsteal_kswapd 0"}
+{"t_epoch": 1786788595.583606, "line": "NATEMU_VM task_end pgsteal_direct 0"}
+{"t_epoch": 1786788595.5836449, "line": "NATEMU_VM task_end pgsteal_khugepaged 0"}
+{"t_epoch": 1786788595.583682, "line": "NATEMU_VM task_end pgsteal_proactive 0"}
+{"t_epoch": 1786788595.583714, "line": "NATEMU_VM task_end pgsteal_anon 0"}
+{"t_epoch": 1786788595.5837498, "line": "NATEMU_VM task_end pgsteal_file 0"}
+{"t_epoch": 1786788595.583787, "line": "NATEMU_VM task_end numa_pte_updates 0"}
+{"t_epoch": 1786788595.586087, "line": "NATEMU_VM task_end numa_huge_pte_updates 0"}
+{"t_epoch": 1786788595.586126, "line": "NATEMU_VM task_end numa_hint_faults 0"}
+{"t_epoch": 1786788595.586168, "line": "NATEMU_VM task_end numa_hint_faults_local 0"}
+{"t_epoch": 1786788595.586208, "line": "NATEMU_VM task_end numa_pages_migrated 0"}
+{"t_epoch": 1786788595.586244, "line": "NATEMU_VM task_end thp_fault_alloc 0"}
+{"t_epoch": 1786788595.591891, "line": "NATEMU_VM task_end intr 4602"}
+{"t_epoch": 1786788595.5919209, "line": "NATEMU_VM task_end ctxt 2845"}
+{"t_epoch": 1786788595.5919518, "line": "NATEMU_VM task_end processes 506"}
+{"t_epoch": 1786788595.5983438, "line": "NATEMU_VM task_end MemTotal: 2986900"}
+{"t_epoch": 1786788595.598378, "line": "NATEMU_VM task_end MemFree: 2904120"}
+{"t_epoch": 1786788595.5998368, "line": "NATEMU_VM task_end MemAvailable: 2787576"}
+{"t_epoch": 1786788595.5998669, "line": "NATEMU_VM task_end Cached: 14384"}
+{"t_epoch": 1786788595.599916, "line": "NATEMU_VM task_end AnonPages: 124"}
+{"t_epoch": 1786788595.601108, "line": "NATEMU_VM task_end Mapped: 1116"}
+{"t_epoch": 1786788595.6011388, "line": "NATEMU_VM task_end PageTables: 484"}
+{"t_epoch": 1786788595.602761, "line": "NATEMU_MARKEND task_end"}
+{"t_epoch": 1786788595.6066701, "line": "NATEMU_TASK_END none uptime=1.96"}
+{"t_epoch": 1786788595.611991, "line": "[    1.986186] sysrq: Power Off"}
+{"t_epoch": 1786788595.6177878, "line": "[    1.992402] reboot: Power down"}
+{"t_epoch": 1786788595.6243148, "line": "__EXIT__", "rc": 0}

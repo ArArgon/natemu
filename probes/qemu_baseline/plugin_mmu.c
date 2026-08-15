@@ -176,17 +176,29 @@ static struct {
     uint64_t code_pages, phys_frames_touched;
 } C;
 
+/* Per-vCPU state. Everything else -- Aspaces, Cspaces, the policy-B shadow, ptframes,
+ * the footprint sets -- is legitimately shared, because a shadow page table is a
+ * translation of a guest page table and two vCPUs running the same process (same guest
+ * CR3) share it. What is per-vCPU is only WHICH address space is currently active.
+ * Getting this wrong was what confined the plugin to -smp 1: with one global cur_cr3
+ * every vCPU's memory accesses were attributed to whichever vCPU wrote CR3 last.
+ * Concurrency is still handled by -accel tcg,thread=single, which serialises all vCPUs
+ * onto one host thread; this fixes the SEMANTICS, not a data race. */
+#define MAX_VCPU 64
+static uint64_t cur_cr3_v[MAX_VCPU];
+static AS *Acur_v[MAX_VCPU];
+static AS *Ccur_v[MAX_VCPU];
+static unsigned n_vcpu = 1;
+
 /* policy B state (single flat shadow) */
 static U64Set Bpresent, Bwritable;
 /* policy C state */
 static GHashTable *Cspaces;         /* cr3 -> AS* */
-static AS *Ccur;
 static uint64_t Cstamp;
 #define ASID_BUDGET 256
 
 /* policy A state */
 static GHashTable *Aspaces;
-static AS *Acur;
 
 /* footprint sets */
 static U64Set codepages;            /* (cr3frame<<36)|vpage of executed code */
@@ -242,7 +254,7 @@ static void prewrite_take(uint64_t frame, uint64_t *pte, uint64_t *zero)
     *zero = x & 0xffffffffULL; *pte = x >> 32;
 }
 
-static uint64_t cur_cr3;            /* 0 = paging state unknown / off */
+/* cur_cr3 is now per-vCPU: see cur_cr3_v[] above. */
 static uint64_t pt_nodes_live, pt_nodes_peak, pt_read_fail;
 static uint64_t hw_check_n, hw_check_bad;
 static int narrow_dbg;
@@ -294,7 +306,7 @@ static void emit(const char *tag)
         " shadow_inval=%" PRIu64
         " as_live_A=%u as_live_C=%u"
         " codepages=%zu physframes=%zu"
-        " shl1=%zu shl2=%zu shl3=%zu\n",
+        " n_vcpu=%u shl1=%zu shl2=%zu shl3=%zu\n",
         tag, t, (t - t0_us) / 1e6,
         C.insns, C.tb_exec, C.tb_trans, C.ld, C.st,
         C.cr3_write, C.cr3_write_noflush, C.cr3_read, C.cr4_write,
@@ -312,7 +324,7 @@ static void emit(const char *tag)
         Aspaces ? g_hash_table_size(Aspaces) : 0,
         Cspaces ? g_hash_table_size(Cspaces) : 0,
         codepages.n, physframes.n,
-        shadow_l1.n, shadow_l2.n, shadow_l3.n);
+        n_vcpu, shadow_l1.n, shadow_l2.n, shadow_l3.n);
     fflush(outf);
 }
 
@@ -322,7 +334,12 @@ static const char *gpr_name[NGPR] = {
     "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
     "r8","r9","r10","r11","r12","r13","r14","r15"
 };
-static struct qemu_plugin_register *gpr_handle[NGPR];
+/* Register handles are PER-VCPU. Capturing them once from vCPU 0 and then calling
+ * qemu_plugin_read_register() while another vCPU is current corrupted the guest: at
+ * -smp 2 the kernel took a not-present supervisor write fault and panicked with
+ * "Kernel stack is corrupted". That, not the shadow model, is what confined this
+ * plugin to -smp 1. */
+static struct qemu_plugin_register *gpr_handle[MAX_VCPU][NGPR];
 static GByteArray *regbuf;
 
 static int gpr_index(const char *nm)
@@ -339,11 +356,11 @@ static int read_named(struct qemu_plugin_register *h, uint64_t *v)
     memcpy(v, regbuf->data, 8);
     return 1;
 }
-static int read_gpr(int idx, uint64_t *v)
+static int read_gpr(unsigned vcpu, int idx, uint64_t *v)
 {
-    if (idx < 0 || idx >= NGPR || !gpr_handle[idx]) return 0;
+    if (vcpu >= MAX_VCPU || idx < 0 || idx >= NGPR || !gpr_handle[vcpu][idx]) return 0;
     g_byte_array_set_size(regbuf, 0);
-    if (!qemu_plugin_read_register(gpr_handle[idx], regbuf)) return 0;
+    if (!qemu_plugin_read_register(gpr_handle[vcpu][idx], regbuf)) return 0;
     if (regbuf->len < 8) return 0;
     memcpy(v, regbuf->data, 8);
     return 1;
@@ -600,33 +617,41 @@ static void evict_lru(void)
     g_hash_table_iter_init(&it, Cspaces);
     while (g_hash_table_iter_next(&it, &k, &v)) {
         AS *a = v;
-        if (a == Ccur) continue;
+        int in_use = 0;
+        for (unsigned q = 0; q < n_vcpu; q++) if (a == Ccur_v[q]) in_use = 1;
+        if (in_use) continue;
         if (a->last_use < best) { best = a->last_use; victim = a; vkey = k; }
     }
     if (victim) { g_hash_table_remove(Cspaces, vkey); C.asid_evict++; }
 }
 
-static void set_cr3(uint64_t cr3)
+static void set_cr3(unsigned vcpu, uint64_t cr3)
 {
-    cur_cr3 = cr3 & PA_MASK;
+    if (vcpu >= MAX_VCPU) return;
+    uint64_t c3 = cr3 & PA_MASK;
+    cur_cr3_v[vcpu] = c3;
+    if (vcpu >= n_vcpu) n_vcpu = vcpu + 1;
     if (enable_shadow) {
-        Acur = as_get(Aspaces, cur_cr3);
-        Acur->last_use = ++Cstamp; Acur->activations++;
-        /* policy B: whole shadow dies */
+        Acur_v[vcpu] = as_get(Aspaces, c3);
+        Acur_v[vcpu]->last_use = ++Cstamp; Acur_v[vcpu]->activations++;
+        /* policy B: whole shadow dies. One flat shadow shared by all vCPUs, so any
+         * vCPU's CR3 load wipes it -- which is exactly what policy B means. */
         set_free(&Bpresent); set_init(&Bpresent, 1024);
         set_free(&Bwritable); set_init(&Bwritable, 1024);
         /* policy C: LRU over 256 live spaces */
-        Ccur = as_get(Cspaces, cur_cr3);
-        Ccur->last_use = Cstamp;
+        Ccur_v[vcpu] = as_get(Cspaces, c3);
+        Ccur_v[vcpu]->last_use = Cstamp;
         while (g_hash_table_size(Cspaces) > ASID_BUDGET) evict_lru();
     }
-    if (enable_pt) walk_cr3(cur_cr3);
+    if (enable_pt) walk_cr3(c3);
 }
 
 /* touch: is_write, is_exec */
-static inline void touch(uint64_t vaddr, int is_write)
+static inline void touch(unsigned vcpu, uint64_t vaddr, int is_write)
 {
-    if (!enable_shadow) return;
+    if (!enable_shadow || vcpu >= MAX_VCPU) return;
+    AS *Acur = Acur_v[vcpu], *Ccur = Ccur_v[vcpu];
+    uint64_t cur_cr3 = cur_cr3_v[vcpu];
     uint64_t p = VPG(vaddr);
     /* policy A */
     if (Acur) {
@@ -649,8 +674,10 @@ static inline void touch(uint64_t vaddr, int is_write)
     set_add(&shadow_l3, (c << 36) ^ (vaddr >> 39));
 }
 
-static void shadow_invalidate(uint64_t vaddr)
+static void shadow_invalidate(unsigned vcpu, uint64_t vaddr)
 {
+    if (vcpu >= MAX_VCPU) return;
+    AS *Acur = Acur_v[vcpu], *Ccur = Ccur_v[vcpu];
     uint64_t p = VPG(vaddr);
     if (Acur) { set_del(&Acur->present, p); set_del(&Acur->writable, p); }
     set_del(&Bpresent, p); set_del(&Bwritable, p);
@@ -664,7 +691,7 @@ static void cb_mem(unsigned int vcpu, qemu_plugin_meminfo_t info,
 {
     int is_st = qemu_plugin_mem_is_store(info);
     if (is_st) C.st++; else C.ld++;
-    touch(vaddr, is_st);
+    touch(vcpu, vaddr, is_st);
 
     if (!enable_pt) return;
     struct qemu_plugin_hwaddr *h = qemu_plugin_get_hwaddr(info, vaddr);
@@ -747,14 +774,14 @@ static void cb_mem(unsigned int vcpu, qemu_plugin_meminfo_t info,
         n->ents[idx] = nv;
         /* a leaf PTE changed: the shadow entry for that VA is now stale and a
          * real design must invalidate it (and pay a TLBI if it was valid). */
-        shadow_invalidate(n->va_base + ((uint64_t)idx << 12));
+        shadow_invalidate(vcpu, n->va_base + ((uint64_t)idx << 12));
     }
 }
 
 static void cb_tb_exec(unsigned int vcpu, void *ud)
 {
     uint64_t pc = (uint64_t)(uintptr_t)ud;
-    touch(pc, 0);
+    touch(vcpu, pc, 0);
     if ((C.tb_exec & 0xfffff) == 0) {
         uint64_t t = now_us();
         if (t >= next_snap_us) { emit("periodic"); next_snap_us = t + snap_every_us; }
@@ -766,9 +793,9 @@ static void cb_cr3_write(unsigned int vcpu, void *ud)
     int reg = (int)(intptr_t)ud;
     uint64_t v = 0;
     C.cr3_write++;
-    if (read_gpr(reg, &v)) {
+    if (read_gpr(vcpu, reg, &v)) {
         if (v & (1ULL << 63)) C.cr3_write_noflush++;
-        set_cr3(v);
+        set_cr3(vcpu, v);
     }
 }
 
@@ -777,7 +804,7 @@ static void cb_invlpg(unsigned int vcpu, void *ud)
     int reg = (int)(intptr_t)ud;
     uint64_t v = 0;
     C.invlpg++;
-    if (reg >= 0 && read_gpr(reg, &v)) { C.invlpg_addr_ok++; shadow_invalidate(v); }
+    if (reg >= 0 && read_gpr(vcpu, reg, &v)) { C.invlpg_addr_ok++; shadow_invalidate(vcpu, v); }
 }
 
 static void cb_simple(unsigned int vcpu, void *ud)
@@ -786,7 +813,7 @@ static void cb_simple(unsigned int vcpu, void *ud)
 }
 
 static GHashTable *excep_by_pc;
-static struct qemu_plugin_register *rip_handle;
+static struct qemu_plugin_register *rip_handle[MAX_VCPU];
 static int read_named(struct qemu_plugin_register *h, uint64_t *v);
 
 static void cb_discon(qemu_plugin_id_t id, unsigned int vcpu,
@@ -800,7 +827,7 @@ static void cb_discon(qemu_plugin_id_t id, unsigned int vcpu,
          * separated from every other exception -- QEMU does not hand the plugin
          * a vector number. */
         uint64_t rip = 0;
-        if (rip_handle && read_named(rip_handle, &rip)) to_pc = rip;
+        if (vcpu < MAX_VCPU && rip_handle[vcpu] && read_named(rip_handle[vcpu], &rip)) to_pc = rip;
         /* bucket by handler PC: on x86-64 the IDT entry for #PF is a distinct
          * address, so this separates page faults from every other trap without
          * needing QEMU to tell us the vector number (it does not). */
@@ -850,7 +877,10 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     for (size_t i = 0; i < n; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         uint64_t va = qemu_plugin_insn_vaddr(insn);
-        set_add(&codepages, ((cur_cr3 >> 12) << 36) ^ (va >> 12));
+        /* Translation time has no vCPU context. codepages is a footprint
+         * diagnostic only, so vCPU 0's CR3 is a good enough key; at -smp > 1 it
+         * under-counts distinct (AS, page) pairs and is not used in any cost model. */
+        set_add(&codepages, ((cur_cr3_v[0] >> 12) << 36) ^ (va >> 12));
 
         qemu_plugin_register_vcpu_mem_cb(insn, cb_mem, QEMU_PLUGIN_CB_NO_REGS,
                                          QEMU_PLUGIN_MEM_RW, NULL);
@@ -917,6 +947,7 @@ static void sync_counts(void)
 
 static void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu)
 {
+    if (vcpu < MAX_VCPU && vcpu + 1 > n_vcpu) n_vcpu = vcpu + 1;
     GArray *regs = qemu_plugin_get_registers();
     if (!regs) return;
     fprintf(outf, "REGS n=%u:", regs->len);
@@ -925,8 +956,8 @@ static void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu)
             &g_array_index(regs, qemu_plugin_reg_descriptor, i);
         fprintf(outf, " %s", r->name);
         int idx = gpr_index(r->name);
-        if (idx >= 0 && !gpr_handle[idx]) gpr_handle[idx] = r->handle;
-        if (!strcmp(r->name, "rip") && !rip_handle) rip_handle = r->handle;
+        if (idx >= 0 && vcpu < MAX_VCPU) gpr_handle[vcpu][idx] = r->handle;
+        if (!strcmp(r->name, "rip") && vcpu < MAX_VCPU) rip_handle[vcpu] = r->handle;
     }
     fprintf(outf, "\n"); fflush(outf);
     g_array_free(regs, TRUE);

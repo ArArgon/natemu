@@ -29,8 +29,13 @@ def main():
     p.add_argument("--hold", type=int, default=0)
     p.add_argument("--mem", type=int, default=3072)
     p.add_argument("--cpu", default="max")
+    p.add_argument("--smp", type=int, default=1,
+                   help="vCPU count. >1 needs the per-vCPU plugin state added 2026-08-15; "
+                        "TCG stays thread=single so vCPUs remain serialised.")
     p.add_argument("--label", required=True)
-    p.add_argument("--pt", type=int, default=1)
+    p.add_argument("--pt", type=int, default=1,
+                   help="page-table walker. MUST be 0 at --smp > 1: the refcounting is "
+                        "not multi-root safe and segfaults (see doc 26 section 8 item 1).")
     p.add_argument("--shadow", type=int, default=1)
     p.add_argument("--snap-ms", type=int, default=250)
     p.add_argument("--timeout", type=float, default=5400)
@@ -47,7 +52,7 @@ def main():
               f"nokaslr {a.extra_append}").strip()
 
     cmd = [QEMU, "-machine", "q35", "-accel", "tcg,thread=single",
-           "-cpu", a.cpu, "-m", str(a.mem), "-smp", "1",
+           "-cpu", a.cpu, "-m", str(a.mem), "-smp", str(a.smp),
            "-kernel", os.path.join(WORK, "nb-x86_64", "boot", "vmlinuz-virt"),
            "-initrd", os.path.join(WORK, "initramfs2-x86_64.cpio"),
            "-append", append,

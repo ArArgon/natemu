@@ -1,0 +1,55 @@
+PLUGIN plugin_mmu out=/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/results/mmu/snap.S2.spawn.txt pt=1 shadow=1 t0_epoch_us=1786788153734701
+REGS n=66: rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15 rip eflags cs ss ds es fs gs fs_base gs_base k_gs_base cr0 cr2 cr3 cr4 cr8 efer st0 st1 st2 st3 st4 st5 st6 st7 fctrl fstat ftag fiseg fioff foseg fooff fop xmm0 xmm1 xmm2 xmm3 xmm4 xmm5 xmm6 xmm7 xmm8 xmm9 xmm10 xmm11 xmm12 xmm13 xmm14 xmm15 mxcsr
+REGS n=66: rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15 rip eflags cs ss ds es fs gs fs_base gs_base k_gs_base cr0 cr2 cr3 cr4 cr8 efer st0 st1 st2 st3 st4 st5 st6 st7 fctrl fstat ftag fiseg fioff foseg fooff fop xmm0 xmm1 xmm2 xmm3 xmm4 xmm5 xmm6 xmm7 xmm8 xmm9 xmm10 xmm11 xmm12 xmm13 xmm14 xmm15 mxcsr
+SNAP tag=periodic t_epoch_us=1786788153741703 t_rel_s=0.007002 insns=1 tb_exec=1 tb_trans=1 ld=0 st=0 cr3w=0 cr3w_noflush=0 cr3r=0 cr4w=0 invlpg=0 invlpg_addr_ok=0 invpcid=0 wbinvd=0 hlt=0 excep=0 intr=0 fillA_xlat=0 fillA_perm=0 fillB_xlat=1 fillB_perm=0 fillC_xlat=0 fillC_perm=0 asid_evict=0 ptwrite=0 ptw1=0 ptw2=0 ptw3=0 ptw4=0 ptwrite_unwalked=0 ptwrite_unwalked_zero=0 ptw_narrow=0 ptw_noop=0 ptw_eff=0 pt_nodes_live=0 pt_nodes_peak=0 pt_read_fail=0 hwchk=0 hwchk_bad=0 root_retire=0 root_stale=0 roots=0 pt_frames=0 walks=0 shadow_inval=0 as_live_A=0 as_live_C=0 codepages=1 physframes=0 n_vcpu=2 shl1=1 shl2=1 shl3=1
+SNAP tag=final t_epoch_us=1786788239041355 t_rel_s=85.306654 insns=1452156750 tb_exec=246856560 tb_trans=81076 ld=317312952 st=265977383 cr3w=309 cr3w_noflush=0 cr3r=366 cr4w=61 invlpg=38204 invlpg_addr_ok=38204 invpcid=0 wbinvd=3 hlt=42191 excep=2809 intr=49787 fillA_xlat=67532 fillA_perm=61098 fillB_xlat=114724 fillB_perm=81513 fillC_xlat=67532 fillC_perm=61098 asid_evict=0 ptwrite=148 ptw1=138 ptw2=4 ptw3=4 ptw4=2 ptwrite_unwalked=1574 ptwrite_unwalked_zero=43658 ptw_narrow=0 ptw_noop=1 ptw_eff=147 pt_nodes_live=81 pt_nodes_peak=82 pt_read_fail=0 hwchk=64 hwchk_bad=0 root_retire=0 root_stale=0 roots=3 pt_frames=81 walks=3 shadow_inval=38341 as_live_A=5 as_live_C=5 codepages=2121 physframes=57735 n_vcpu=2 shl1=241 shl2=34 shl3=25
+EXCEP_PC pc=0xffffffff81370598 n=19
+EXCEP_PC pc=0xffffffff81385877 n=14
+EXCEP_PC pc=0xffffffff81e0ed00 n=1
+EXCEP_PC pc=0xff50 n=3
+EXCEP_PC pc=0xffffffff8300934b n=1
+EXCEP_PC pc=0xffffffff816e8058 n=2
+EXCEP_PC pc=0x1c4 n=1
+EXCEP_PC pc=0xffffffff812d7a60 n=155
+EXCEP_PC pc=0xd05f n=1
+EXCEP_PC pc=0xffffffff81e239c0 n=344
+EXCEP_PC pc=0xffffffff83001b30 n=1
+EXCEP_PC pc=0x2fe n=26
+EXCEP_PC pc=0xffffffff81835480 n=1
+EXCEP_PC pc=0xffffffff813724b4 n=2
+EXCEP_PC pc=0xffffffff81385885 n=14
+EXCEP_PC pc=0xffffffff8120b9a0 n=1903
+EXCEP_PC pc=0xffffffff81e239f2 n=2
+EXCEP_PC pc=0xffffffff81e379ab n=158
+EXCEP_PC pc=0xffffffff81835484 n=1
+EXCEP_PC pc=0xffffffff81e2cd50 n=2
+EXCEP_PC pc=0xe6ee n=1
+EXCEP_PC pc=0xffffffff830346a7 n=1
+EXCEP_PC pc=0xffffffff830346f3 n=1
+EXCEP_PC pc=0xffffffff812d7a6c n=155
+AS cr3=0x100056000 pages=27 wpages=7 fills=27 activations=145
+AS cr3=0x3603000 pages=12846 wpages=9734 fills=12846 activations=1
+AS cr3=0x30e8000 pages=2005 wpages=1783 fills=3510 activations=1
+AS cr3=0x101d07000 pages=523 wpages=138 fills=523 activations=1
+AS cr3=0x2a36000 pages=50328 wpages=49173 fills=50626 activations=147
+PTTOP frame=0x100125 level=1 refs=1 va_base=0xffffd00000000000 wr=131 narrow=0 eff=131
+PTTOP frame=0x100129 level=1 refs=1 va_base=0xffff888000800000 wr=2 narrow=0 eff=2
+PTTOP frame=0x101d07 level=4 refs=1 va_base=0x0 wr=2 narrow=0 eff=2
+PTTOP frame=0x101d0f level=3 refs=1 va_base=0x0 wr=2 narrow=0 eff=2
+PTTOP frame=0x101d11 level=1 refs=1 va_base=0x3ffea00000 wr=1 narrow=0 eff=1
+PTTOP frame=0x101d14 level=2 refs=1 va_base=0x2a80000000 wr=1 narrow=0 eff=1
+PTTOP frame=0x101d10 level=2 refs=1 va_base=0x3fc0000000 wr=1 narrow=0 eff=1
+PTTOP frame=0x1013d8 level=1 refs=1 va_base=0xffffe8ffffe00000 wr=1 narrow=0 eff=1
+PTTOP frame=0x101d15 level=1 refs=1 va_base=0x2aaca00000 wr=1 narrow=0 eff=1
+PTTOP frame=0x1013d7 level=2 refs=1 va_base=0xffffe8ffc0000000 wr=1 narrow=0 eff=1
+PTTOP frame=0x100031 level=3 refs=3 va_base=0xffffe88000000000 wr=1 narrow=0 eff=1
+PTTOP frame=0x2a3d level=1 refs=1 va_base=0xffffffffffe00000 wr=1 narrow=0 eff=1
+PTTOP frame=0x10002e level=3 refs=3 va_base=0xffffe70000000000 wr=0 narrow=0 eff=0
+PTTOP frame=0x10001b level=3 refs=3 va_base=0xffffdd8000000000 wr=0 narrow=0 eff=0
+PTTOP frame=0x32e0 level=2 refs=1 va_base=0xffffffff80000000 wr=0 narrow=0 eff=0
+PTTOP frame=0x13ffff level=1 refs=1 va_base=0xffff888000200000 wr=0 narrow=0 eff=0
+PTTOP frame=0x100004 level=3 refs=3 va_base=0xffffd20000000000 wr=0 narrow=0 eff=0
+PTTOP frame=0x100026 level=3 refs=3 va_base=0xffffe30000000000 wr=0 narrow=0 eff=0
+PTTOP frame=0x10001a level=3 refs=3 va_base=0xffffdd0000000000 wr=0 narrow=0 eff=0
+PTTOP frame=0x100009 level=3 refs=3 va_base=0xffffd48000000000 wr=0 narrow=0 eff=0
+PTFRAMES l1=13 l2=10 l3=55 l4=3 total=81 walk_entries=35840

@@ -1,0 +1,30 @@
+PLUGIN plugin_mmu out=/Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/results/mmu/snap.DBG2.min.txt pt=0 shadow=0 t0_epoch_us=1786788728680806
+REGS n=66: rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15 rip eflags cs ss ds es fs gs fs_base gs_base k_gs_base cr0 cr2 cr3 cr4 cr8 efer st0 st1 st2 st3 st4 st5 st6 st7 fctrl fstat ftag fiseg fioff foseg fooff fop xmm0 xmm1 xmm2 xmm3 xmm4 xmm5 xmm6 xmm7 xmm8 xmm9 xmm10 xmm11 xmm12 xmm13 xmm14 xmm15 mxcsr
+REGS n=66: rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15 rip eflags cs ss ds es fs gs fs_base gs_base k_gs_base cr0 cr2 cr3 cr4 cr8 efer st0 st1 st2 st3 st4 st5 st6 st7 fctrl fstat ftag fiseg fioff foseg fooff fop xmm0 xmm1 xmm2 xmm3 xmm4 xmm5 xmm6 xmm7 xmm8 xmm9 xmm10 xmm11 xmm12 xmm13 xmm14 xmm15 mxcsr
+SNAP tag=periodic t_epoch_us=1786788728688349 t_rel_s=0.007543 insns=1 tb_exec=1 tb_trans=1 ld=0 st=0 cr3w=0 cr3w_noflush=0 cr3r=0 cr4w=0 invlpg=0 invlpg_addr_ok=0 invpcid=0 wbinvd=0 hlt=0 excep=0 intr=0 fillA_xlat=0 fillA_perm=0 fillB_xlat=0 fillB_perm=0 fillC_xlat=0 fillC_perm=0 asid_evict=0 ptwrite=0 ptw1=0 ptw2=0 ptw3=0 ptw4=0 ptwrite_unwalked=0 ptwrite_unwalked_zero=0 ptw_narrow=0 ptw_noop=0 ptw_eff=0 pt_nodes_live=0 pt_nodes_peak=0 pt_read_fail=0 hwchk=0 hwchk_bad=0 root_retire=0 root_stale=0 roots=0 pt_frames=0 walks=0 shadow_inval=0 as_live_A=0 as_live_C=0 codepages=1 physframes=0 n_vcpu=2 shl1=0 shl2=0 shl3=0
+SNAP tag=final t_epoch_us=1786788738549576 t_rel_s=9.868770 insns=1095751518 tb_exec=182393298 tb_trans=79951 ld=234306959 st=216618696 cr3w=309 cr3w_noflush=0 cr3r=218 cr4w=61 invlpg=38207 invlpg_addr_ok=38207 invpcid=0 wbinvd=3 hlt=290 excep=1616 intr=4636 fillA_xlat=0 fillA_perm=0 fillB_xlat=0 fillB_perm=0 fillC_xlat=0 fillC_perm=0 asid_evict=0 ptwrite=0 ptw1=0 ptw2=0 ptw3=0 ptw4=0 ptwrite_unwalked=0 ptwrite_unwalked_zero=0 ptw_narrow=0 ptw_noop=0 ptw_eff=0 pt_nodes_live=0 pt_nodes_peak=0 pt_read_fail=0 hwchk=0 hwchk_bad=0 root_retire=0 root_stale=0 roots=0 pt_frames=0 walks=0 shadow_inval=38207 as_live_A=0 as_live_C=0 codepages=2060 physframes=0 n_vcpu=2 shl1=0 shl2=0 shl3=0
+EXCEP_PC pc=0xffffffff81370598 n=24
+EXCEP_PC pc=0xffffffff81385877 n=15
+EXCEP_PC pc=0xffffffff81e0ed00 n=1
+EXCEP_PC pc=0xff50 n=2
+EXCEP_PC pc=0xffffffff8300934b n=1
+EXCEP_PC pc=0xffffffff816e8058 n=1
+EXCEP_PC pc=0x1c4 n=1
+EXCEP_PC pc=0xffffffff813844c0 n=1
+EXCEP_PC pc=0xffffffff812d7a60 n=81
+EXCEP_PC pc=0xd05f n=1
+EXCEP_PC pc=0xffffffff81e239c0 n=199
+EXCEP_PC pc=0xffffffff83001b30 n=1
+EXCEP_PC pc=0x2fe n=26
+EXCEP_PC pc=0xffffffff81e272de n=1
+EXCEP_PC pc=0xffffffff813724b4 n=2
+EXCEP_PC pc=0xffffffff81385885 n=15
+EXCEP_PC pc=0xffffffff8120b9a0 n=1075
+EXCEP_PC pc=0xffffffff81e379ab n=82
+EXCEP_PC pc=0xffffffff81e2cd50 n=2
+EXCEP_PC pc=0xffffffff812d7a6c n=81
+EXCEP_PC pc=0xe6ee n=1
+EXCEP_PC pc=0xffffffff830346a7 n=1
+EXCEP_PC pc=0xffffffff830346f3 n=1
+EXCEP_PC pc=0xffffffff81e272d0 n=1
+PTFRAMES l1=0 l2=0 l3=0 l4=0 total=0 walk_entries=0
