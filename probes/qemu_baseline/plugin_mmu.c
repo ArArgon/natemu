@@ -168,7 +168,7 @@ static struct {
     /* policy C: 256 live address spaces, LRU */
     uint64_t fillC_xlat, fillC_perm, asid_evict;
     /* page-table traffic */
-    uint64_t ptwrite, ptwrite_l[5], ptwrite_unwalked;
+    uint64_t ptwrite, ptwrite_l[5], ptwrite_unwalked, ptwrite_unwalked_zero;
     uint64_t ptwrite_narrow, ptwrite_noop, ptwrite_eff;
     uint64_t pt_frames_marked, walks, walk_entries;
     uint64_t shadow_inval_pages;
@@ -197,6 +197,51 @@ static U64Set shadow_l1, shadow_l2, shadow_l3;  /* (cr3frame<<28)|(va>>21 / >>30
 /* page-table frame map: frame -> level (1..4) */
 static GHashTable *ptframes;        /* key = frame (phys>>12), value = PTNode* */
 
+/* Stores landing in a frame that is not (yet) a known page table are invisible to
+ * the ptwrite counter, because pt_find() misses and the store handler returns. That
+ * is not a rare corner: Linux allocates a page, populates it with PTEs, and only
+ * then links it into the hierarchy, so for fork+exec -- the workload doc 20's whole
+ * argument rests on -- most PTE stores happen BEFORE the frame is walkable. This
+ * table accumulates a per-frame count of those stores; when the frame is later
+ * promoted to a PTNode the accumulated count is credited to ptwrite_unwalked, which
+ * bounds the undercount instead of hiding it. ptwrite remains the lower bound and
+ * ptwrite + ptwrite_unwalked the upper bound. */
+static GHashTable *prewrites;       /* key = frame, value = (uint64_t) store count */
+
+/* The value packs two 32-bit counts: high half = stores of a present-looking PTE,
+ * low half = stores of zero. They must be separated, because they are semantically
+ * different events. A fresh page-table page is zeroed by clear_page() before it is
+ * populated -- 512 zero stores per level -- and measurement shows that zeroing
+ * dominates: boot logs ~1964 pre-promotion stores per address space, which is 3.8x
+ * 512, i.e. about one clear_page for each of the four paging levels. A shadow design
+ * that write-protects guest page tables traps on those zero stores; a lazy design
+ * (doc 20) ignores them entirely. Folding the two together would overstate the PTE
+ * update rate by more than an order of magnitude. */
+static void prewrite_bump(uint64_t frame, int is_zero)
+{
+    if (!prewrites) return;
+    gpointer k = GSIZE_TO_POINTER((gsize)frame);
+    gsize v = GPOINTER_TO_SIZE(g_hash_table_lookup(prewrites, k));
+    uint64_t zero = v & 0xffffffffULL, pte = v >> 32;
+    if (is_zero) zero++; else pte++;
+    g_hash_table_insert(prewrites, k, GSIZE_TO_POINTER((gsize)((pte << 32) | zero)));
+}
+
+/* Credit (and clear) a frame's pre-promotion stores. Called when the frame becomes a
+ * PTNode. Clearing matters: a frame that is freed and recycled must not carry its
+ * previous life's stores into the next one. */
+static void prewrite_take(uint64_t frame, uint64_t *pte, uint64_t *zero)
+{
+    *pte = *zero = 0;
+    if (!prewrites) return;
+    gpointer k = GSIZE_TO_POINTER((gsize)frame);
+    gpointer v = g_hash_table_lookup(prewrites, k);
+    if (!v) return;
+    g_hash_table_remove(prewrites, k);
+    gsize x = GPOINTER_TO_SIZE(v);
+    *zero = x & 0xffffffffULL; *pte = x >> 32;
+}
+
 static uint64_t cur_cr3;            /* 0 = paging state unknown / off */
 static uint64_t pt_nodes_live, pt_nodes_peak, pt_read_fail;
 static uint64_t hw_check_n, hw_check_bad;
@@ -210,6 +255,10 @@ static uint64_t t0_us;
 static uint64_t snap_every_us = 250000;
 static uint64_t next_snap_us;
 static int enable_pt = 1, enable_shadow = 1;
+/* Upper bound on guest physical addresses, used only by the PTE-shaped heuristic in
+ * the store handler. runmmu.py runs the guest with -m 3072, so 4 GiB is a safe cap;
+ * it only has to be tight enough to reject most data values, not to be exact. */
+static int ram_mb = 4096;
 
 static uint64_t now_us(void)
 {
@@ -235,7 +284,8 @@ static void emit(const char *tag)
         " fillB_xlat=%" PRIu64 " fillB_perm=%" PRIu64
         " fillC_xlat=%" PRIu64 " fillC_perm=%" PRIu64 " asid_evict=%" PRIu64
         " ptwrite=%" PRIu64 " ptw1=%" PRIu64 " ptw2=%" PRIu64 " ptw3=%" PRIu64 " ptw4=%" PRIu64
-        " ptwrite_unwalked=%" PRIu64 " ptw_narrow=%" PRIu64
+        " ptwrite_unwalked=%" PRIu64 " ptwrite_unwalked_zero=%" PRIu64
+        " ptw_narrow=%" PRIu64
         " ptw_noop=%" PRIu64 " ptw_eff=%" PRIu64 " pt_nodes_live=%" PRIu64
         " pt_nodes_peak=%" PRIu64 " pt_read_fail=%" PRIu64
         " hwchk=%" PRIu64 " hwchk_bad=%" PRIu64
@@ -253,7 +303,8 @@ static void emit(const char *tag)
         C.fillA_xlat, C.fillA_perm, C.fillB_xlat, C.fillB_perm,
         C.fillC_xlat, C.fillC_perm, C.asid_evict,
         C.ptwrite, C.ptwrite_l[1], C.ptwrite_l[2], C.ptwrite_l[3], C.ptwrite_l[4],
-        C.ptwrite_unwalked, C.ptwrite_narrow, C.ptwrite_noop, C.ptwrite_eff,
+        C.ptwrite_unwalked, C.ptwrite_unwalked_zero,
+        C.ptwrite_narrow, C.ptwrite_noop, C.ptwrite_eff,
         pt_nodes_live, pt_nodes_peak, pt_read_fail, hw_check_n, hw_check_bad,
         root_retire, root_stale, rootset ? g_hash_table_size(rootset) : 0,
         ptframes ? g_hash_table_size(ptframes) : 0, C.walks,
@@ -372,6 +423,12 @@ static void pt_ref(uint64_t frame, int level, uint64_t va_base, int *budget)
     memcpy(n->ents, ents, sizeof ents);
     uint64_t *k = g_new(uint64_t, 1); *k = frame;
     g_hash_table_insert(ptframes, k, n);
+    {
+        uint64_t upte, uzero;
+        prewrite_take(frame, &upte, &uzero);
+        C.ptwrite_unwalked += upte;
+        C.ptwrite_unwalked_zero += uzero;
+    }
     C.pt_frames_marked++;
     pt_nodes_live++;
     if (pt_nodes_live > pt_nodes_peak) pt_nodes_peak = pt_nodes_live;
@@ -618,7 +675,26 @@ static void cb_mem(unsigned int vcpu, qemu_plugin_meminfo_t info,
     if (!is_st) return;
 
     PTNode *n = pt_find(frame);
-    if (!n) return;
+    if (!n) {
+        /* Not a known page table. Before paying for a hash insert on what is
+         * usually just a data store, apply the cheapest filter that a PTE
+         * population write passes and ordinary data mostly does not: an aligned
+         * 64-bit store whose value is either zero (clear_page) or has P=1 with an
+         * output address inside guest RAM and no reserved bits set. This is a
+         * heuristic and it is reported as a bound, not as a measurement. */
+        if ((pa & 7) == 0) {
+            qemu_plugin_mem_value pv = qemu_plugin_mem_get_value(info);
+            if (pv.type == QEMU_PLUGIN_MEM_VALUE_U64) {
+                uint64_t v = pv.data.u64;
+                uint64_t oa = v & 0x000ffffffffff000ULL;
+                if (v == 0)
+                    prewrite_bump(frame, 1);
+                else if ((v & 1) && oa && oa < ((uint64_t)ram_mb << 20))
+                    prewrite_bump(frame, 0);
+            }
+        }
+        return;
+    }
     int lvl = n->level;
 
     qemu_plugin_mem_value val = qemu_plugin_mem_get_value(info);
@@ -938,6 +1014,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     regbuf = g_byte_array_new();
     pagebuf = g_byte_array_new();
     ptframes = g_hash_table_new_full(u64_hash, u64_eq, g_free, g_free);
+    prewrites = g_hash_table_new(g_direct_hash, g_direct_equal);
     rootset  = g_hash_table_new_full(u64_hash, u64_eq, g_free, NULL);
     rootq    = g_queue_new();
     root_lastuse = g_hash_table_new_full(u64_hash, u64_eq, g_free, NULL);
