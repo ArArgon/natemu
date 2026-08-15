@@ -1,0 +1,35 @@
+PLUGININV vcpus=4 tb_translations=103342 insns=1248562625 tbs=271384350 mem_r=278334763 mem_w=228442020 invlpg=38772 invlpga=0 invpcid=0 vmxinv=0 cr3_w=460 cr3_r=69 cr4_w=193 cr4_r=19 cr0_w=491 cr0_r=709 cr_other=1515 wbinvd=5 invd=0 hlt=7587 iret=103067 swapgs=22798
+PLUGININVCPU 0 insns=881389281 tbs=176873298 mem_r=171865071 mem_w=112323247 invlpg=38322 invlpga=0 invpcid=0 vmxinv=0 cr3_w=303 cr3_r=17 cr4_w=67 cr4_r=10 cr0_w=470 cr0_r=697 cr_other=209 wbinvd=2 invd=0 hlt=1482 iret=91655 swapgs=6614
+PLUGININVCPU 1 insns=204238442 tbs=54745664 mem_r=51781245 mem_w=30905615 invlpg=179 invlpga=0 invpcid=0 vmxinv=0 cr3_w=65 cr3_r=14 cr4_w=42 cr4_r=3 cr0_w=7 cr0_r=4 cr_other=492 wbinvd=1 invd=0 hlt=1869 iret=3929 swapgs=6246
+PLUGININVCPU 2 insns=82078634 tbs=19388955 mem_r=33907544 mem_w=56014827 invlpg=84 invlpga=0 invpcid=0 vmxinv=0 cr3_w=38 cr3_r=19 cr4_w=42 cr4_r=3 cr0_w=7 cr0_r=4 cr_other=257 wbinvd=1 invd=0 hlt=2358 iret=3991 swapgs=4538
+PLUGININVCPU 3 insns=80856268 tbs=20376433 mem_r=20780903 mem_w=29198331 invlpg=187 invlpga=0 invpcid=0 vmxinv=0 cr3_w=54 cr3_r=19 cr4_w=42 cr4_r=3 cr0_w=7 cr0_r=4 cr_other=557 wbinvd=1 invd=0 hlt=1878 iret=3492 swapgs=5400
+PLUGINHIST n_distinct=28
+PLUGINHIST       3  invlpg (%rdi)
+PLUGINHIST       4  movl %cr0, %eax
+PLUGINHIST       6  movl %cr0, %ecx
+PLUGINHIST       1  movl %cr0, %edx
+PLUGINHIST       2  movl %cr4, %eax
+PLUGINHIST       5  movl %eax, %cr0
+PLUGINHIST       2  movl %eax, %cr3
+PLUGINHIST       3  movl %eax, %cr4
+PLUGINHIST       6  movl %ecx, %cr0
+PLUGINHIST       1  movl %edi, %cr3
+PLUGINHIST       1  movl %edx, %cr0
+PLUGINHIST       6  movq %cr0, %rax
+PLUGINHIST       2  movq %cr2, %rax
+PLUGINHIST       2  movq %cr2, %rdi
+PLUGINHIST       6  movq %cr3, %rax
+PLUGINHIST       1  movq %cr3, %rdx
+PLUGINHIST       5  movq %cr4, %rax
+PLUGINHIST       2  movq %cr4, %rcx
+PLUGINHIST       2  movq %cr4, %rdi
+PLUGINHIST       1  movq %rax, %cr0
+PLUGINHIST       5  movq %rax, %cr3
+PLUGINHIST       1  movq %rax, %cr4
+PLUGINHIST       1  movq %rbp, %cr3
+PLUGINHIST       2  movq %rcx, %cr4
+PLUGINHIST       4  movq %rdi, %cr0
+PLUGINHIST       4  movq %rdi, %cr3
+PLUGINHIST       8  movq %rdi, %cr4
+PLUGINHIST       3  wbinvd 
+PLUGINUNMATCHED n_distinct=0

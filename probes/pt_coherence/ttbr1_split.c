@@ -209,7 +209,7 @@ __asm__(
 "    ldr  x9, [x0]\n"
 "    str  x9, [x28, #0x140]\n"
 "    ldr  x9, [x1]\n"
-"    str  x9, [x28, #0x141+7]\n"    // 0x148
+"    str  x9, [x28, #0x148]\n"
 "    mov  x13, x19\n"
 "    ldr  x9, [x2]\n"               // must fault
 "    sub  x14, x19, x13\n"
@@ -235,7 +235,7 @@ __asm__(
 "    b.lo Lswap\n"
 "    str  x9,  [x28, #0x180]\n"
 "    str  x10, [x28, #0x188]\n"
-"    str  x19, [x28, #0x18c+4]\n"   // 0x190? -- no: use 0x198
+"    str  x19, [x28, #0x198]\n"
 // T6 -- restore tree A; the user-half page must come back with its data intact
 "    msr  ttbr0_el1, x12\n"
 "    isb\n"
@@ -245,11 +245,12 @@ __asm__(
 "    hvc  #0\n"
 
 // subroutine at a TTBR1 VA, called while TTBR0 is the zero root
-"Lsub:\n"
+".globl _pt_sub\n"
+"_pt_sub:\n"
 "    ldr  x22, [x28, #0x000]\n"
 "    ldr  x23, [x22]\n"
 "    add  x23, x23, #0x100\n"
-"    str  x23, [x28, #0x148+8]\n"   // 0x150 is taken; use 0x1a0 below instead
+"    str  x23, [x28, #0x1a0]\n"
 "    ret\n"
 
 // ================= mode 1: timing ================================================================
@@ -376,7 +377,7 @@ __asm__(
 "_pt_end:\n"
 );
 
-extern const uint8_t pt_start[], pt_end[], pt_high[], pt_vec[], pt_vec_end[];
+extern const uint8_t pt_start[], pt_end[], pt_high[], pt_sub[], pt_vec[], pt_vec_end[];
 
 // ------------------------------------------------------------------------------------------------
 static int failures = 0;
@@ -481,8 +482,11 @@ static void build_common(struct vm *v) {
     map4k(v->root_k, VA_PARAM,      RAM_IPA + OFF_PARAM,    ATTR_DATA);
     map4k(v->root_k, VA_KDIRECT,    RAM_IPA + OFF_DATA_KD,  ATTR_DATA);
     map4k(v->root_k, VA_KTEXT_DATA, RAM_IPA + OFF_DATA_KT,  ATTR_DATA);
-    // User half: one data page, mapped ONLY in tree A.
-    map4k(v->root_a, VA_LOW,        RAM_IPA + OFF_DATA_LOW, ATTR_DATA);
+    // User half: one data page, mapped ONLY in tree A.  It MUST be nG=1: an nG=0 (global)
+    // entry is not ASID-tagged and survives a TTBR0 write, which is exactly the stale-mapping
+    // bug a shadow design must not have.  (The first run of this probe had nG=0 here and the
+    // user-half VA kept resolving after TTBR0 was pointed at an all-zero root.)
+    map4k(v->root_a, VA_LOW,        RAM_IPA + OFF_DATA_LOW, ATTR_DATA | D_nG);
 }
 
 static void load_code(void) {
@@ -525,13 +529,8 @@ static int run_func(void) {
     p[0x020 / 8] = (RAM_IPA + v.root_b) | (2ULL << 48);
     p[0x028 / 8] = (RAM_IPA + v.root_z) | (3ULL << 48);
     p[0x030 / 8] = MAGIC;
-    p[0x038 / 8] = hi((const uint8_t *)0) + 0;  // patched below
 
-    // address of Lsub: find it by symbol-free arithmetic -- we exported only a few labels, so
-    // instead we store the high alias of the whole payload and let the guest use a fixed offset.
-    // Simpler: export it.  (done via _pt_sub below)
-    extern const uint8_t pt_sub[];
-    p[0x038 / 8] = hi(pt_sub);
+    p[0x038 / 8] = hi(pt_sub);   // TTBR1 alias of the subroutine called under the zero root
 
     printf("  TCR_EL1  = 0x%llx  (T0SZ=%llu T1SZ=%llu TG0=%llu TG1=%llu EPD1=%llu A1=%llu)\n",
            (unsigned long long)TCR_VAL, TCR_VAL & 0x3f, (TCR_VAL >> 16) & 0x3f,
@@ -653,7 +652,7 @@ static int run_time(void) {
     for (int i = 0; i < CHASE_PAGES; i++) {
         map4k(v.root_k, VA_CHASE_HI_G  + (uint64_t)i * 4096, RAM_IPA + po_g  + (uint64_t)i * 4096, ATTR_DATA);
         map4k(v.root_k, VA_CHASE_HI_NG + (uint64_t)i * 4096, RAM_IPA + po_ng + (uint64_t)i * 4096, ATTR_DATA | D_nG);
-        map4k(v.root_a, VA_CHASE_LO    + (uint64_t)i * 4096, RAM_IPA + po_lo + (uint64_t)i * 4096, ATTR_DATA);
+        map4k(v.root_a, VA_CHASE_LO    + (uint64_t)i * 4096, RAM_IPA + po_lo + (uint64_t)i * 4096, ATTR_DATA | D_nG);
     }
     uint64_t head_g  = build_chase(VA_CHASE_HI_G,  po_g,  CHASE_PAGES);
     uint64_t head_ng = build_chase(VA_CHASE_HI_NG, po_ng, CHASE_PAGES);

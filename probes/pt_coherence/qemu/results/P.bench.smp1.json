@@ -1,0 +1,1956 @@
+{
+ "label": "bench.smp1",
+ "cmd": [
+  "/opt/homebrew/bin/qemu-system-x86_64",
+  "-machine",
+  "q35",
+  "-accel",
+  "tcg,thread=single",
+  "-m",
+  "2048",
+  "-smp",
+  "1",
+  "-kernel",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/pt_coherence/qemu/work/nb-x86_64/boot/vmlinuz-virt",
+  "-initrd",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/pt_coherence/qemu/combined-x86_64.cpio",
+  "-append",
+  "console=ttyS0 natemu.task=bench panic=-1 rdinit=/init loglevel=3",
+  "-display",
+  "none",
+  "-serial",
+  "stdio",
+  "-no-reboot",
+  "-nodefaults",
+  "-monitor",
+  "none",
+  "-cpu",
+  "max",
+  "-d",
+  "plugin",
+  "-D",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/pt_coherence/qemu/results/P.bench.smp1.plugin.txt",
+  "-plugin",
+  "/Users/liaozhiping/Documents/codex/natemu/probes/pt_coherence/qemu/plugin_inv.so"
+ ],
+ "host_total_s": 92.896159,
+ "events": {
+  "NATEMU_INIT_UP": 9.290141,
+  "NATEMU_SHELL_UP": 9.322764,
+  "NATEMU_TASK_BEGIN": 9.612933,
+  "BENCHVER": 9.664582,
+  "BENCH": 10.614552,
+  "BENCHDONE": 92.746378,
+  "NATEMU_TASK_END": 92.761233
+ },
+ "benches": [
+  {
+   "name": "alu",
+   "guest_s": 0.9228,
+   "rate": 325.093,
+   "unit": "Mops",
+   "host_t_end": 10.614552,
+   "host_s": 1.001619
+  },
+  {
+   "name": "alu4",
+   "guest_s": 1.0263,
+   "rate": 292.299,
+   "unit": "Mops",
+   "host_t_end": 11.648964,
+   "host_s": 1.034412
+  },
+  {
+   "name": "ls4",
+   "guest_s": 3.6714,
+   "rate": 81.712,
+   "unit": "Mops",
+   "host_t_end": 15.335021,
+   "host_s": 3.686057
+  },
+  {
+   "name": "ls4tlb",
+   "guest_s": 37.8349,
+   "rate": 1.586,
+   "unit": "Mops",
+   "host_t_end": 53.368632,
+   "host_s": 38.033611
+  },
+  {
+   "name": "ptr8",
+   "guest_s": 4.1901,
+   "rate": 7.16,
+   "unit": "Mops",
+   "host_t_end": 57.559565,
+   "host_s": 4.190933
+  },
+  {
+   "name": "ptr256",
+   "guest_s": 18.5225,
+   "rate": 0.432,
+   "unit": "Mops",
+   "host_t_end": 76.082796,
+   "host_s": 18.523231
+  },
+  {
+   "name": "stream",
+   "guest_s": 3.7459,
+   "rate": 3583.046,
+   "unit": "MB/s",
+   "host_t_end": 79.829452,
+   "host_s": 3.746656
+  },
+  {
+   "name": "matmul",
+   "guest_s": 8.758,
+   "rate": 448.977,
+   "unit": "Mops",
+   "host_t_end": 88.588275,
+   "host_s": 8.758823
+  },
+  {
+   "name": "nqueens",
+   "guest_s": 2.3854,
+   "rate": 5.031,
+   "unit": "solves/s",
+   "host_t_end": 90.974696,
+   "host_s": 2.386421
+  },
+  {
+   "name": "syscall",
+   "guest_s": 1.7677,
+   "rate": 1.697,
+   "unit": "Mops",
+   "host_t_end": 92.743149,
+   "host_s": 1.768453
+  }
+ ],
+ "returncode": 0,
+ "when": "2026-08-08T21:17:53",
+ "lines": [
+  [
+   9.290141,
+   "NATEMU_INIT_UP uptime=6.00"
+  ],
+  [
+   9.322764,
+   "NATEMU_SHELL_UP uptime=6.10"
+  ],
+  [
+   9.388658,
+   "PROCDUMP PRE uptime 6.16 0.00"
+  ],
+  [
+   9.534118,
+   "PROCDUMP PRE stat intr 5157 986 9 0 0 14 0 0 0 1 0 0 0 5 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
+  ],
+  [
+   9.53479,
+   "PROCDUMP PRE stat ctxt 1983"
+  ],
+  [
+   9.535038,
+   "PROCDUMP PRE stat processes 470"
+  ],
+  [
+   9.535191,
+   "PROCDUMP PRE stat procs_running 1"
+  ],
+  [
+   9.535348,
+   "PROCDUMP PRE stat procs_blocked 0"
+  ],
+  [
+   9.552837,
+   "PROCDUMP PRE vmstat nr_free_pages 491597"
+  ],
+  [
+   9.553201,
+   "PROCDUMP PRE vmstat nr_free_pages_blocks 490496"
+  ],
+  [
+   9.553339,
+   "PROCDUMP PRE vmstat nr_zone_inactive_anon 0"
+  ],
+  [
+   9.553475,
+   "PROCDUMP PRE vmstat nr_zone_active_anon 3634"
+  ],
+  [
+   9.553615,
+   "PROCDUMP PRE vmstat nr_zone_inactive_file 0"
+  ],
+  [
+   9.553758,
+   "PROCDUMP PRE vmstat nr_zone_active_file 0"
+  ],
+  [
+   9.553886,
+   "PROCDUMP PRE vmstat nr_zone_unevictable 0"
+  ],
+  [
+   9.554036,
+   "PROCDUMP PRE vmstat nr_zone_write_pending 0"
+  ],
+  [
+   9.55418,
+   "PROCDUMP PRE vmstat nr_mlock 0"
+  ],
+  [
+   9.554376,
+   "PROCDUMP PRE vmstat nr_zspages 0"
+  ],
+  [
+   9.554508,
+   "PROCDUMP PRE vmstat nr_free_cma 0"
+  ],
+  [
+   9.554639,
+   "PROCDUMP PRE vmstat numa_hit 8697"
+  ],
+  [
+   9.554756,
+   "PROCDUMP PRE vmstat numa_miss 0"
+  ],
+  [
+   9.554886,
+   "PROCDUMP PRE vmstat numa_foreign 0"
+  ],
+  [
+   9.555004,
+   "PROCDUMP PRE vmstat numa_interleave 741"
+  ],
+  [
+   9.555126,
+   "PROCDUMP PRE vmstat numa_local 8697"
+  ],
+  [
+   9.55525,
+   "PROCDUMP PRE vmstat numa_other 0"
+  ],
+  [
+   9.555382,
+   "PROCDUMP PRE vmstat nr_inactive_anon 0"
+  ],
+  [
+   9.555508,
+   "PROCDUMP PRE vmstat nr_active_anon 3634"
+  ],
+  [
+   9.55576,
+   "PROCDUMP PRE vmstat nr_inactive_file 0"
+  ],
+  [
+   9.555882,
+   "PROCDUMP PRE vmstat nr_active_file 0"
+  ],
+  [
+   9.556011,
+   "PROCDUMP PRE vmstat nr_unevictable 0"
+  ],
+  [
+   9.556137,
+   "PROCDUMP PRE vmstat nr_slab_reclaimable 125"
+  ],
+  [
+   9.556296,
+   "PROCDUMP PRE vmstat nr_slab_unreclaimable 2014"
+  ],
+  [
+   9.556481,
+   "PROCDUMP PRE vmstat nr_isolated_anon 0"
+  ],
+  [
+   9.556621,
+   "PROCDUMP PRE vmstat nr_isolated_file 0"
+  ],
+  [
+   9.556777,
+   "PROCDUMP PRE vmstat workingset_nodes 0"
+  ],
+  [
+   9.556954,
+   "PROCDUMP PRE vmstat workingset_refault_anon 0"
+  ],
+  [
+   9.557106,
+   "PROCDUMP PRE vmstat workingset_refault_file 0"
+  ],
+  [
+   9.557251,
+   "PROCDUMP PRE vmstat workingset_activate_anon 0"
+  ],
+  [
+   9.557397,
+   "PROCDUMP PRE vmstat workingset_activate_file 0"
+  ],
+  [
+   9.557537,
+   "PROCDUMP PRE vmstat workingset_restore_anon 0"
+  ],
+  [
+   9.557668,
+   "PROCDUMP PRE vmstat workingset_restore_file 0"
+  ],
+  [
+   9.557795,
+   "PROCDUMP PRE vmstat workingset_nodereclaim 0"
+  ],
+  [
+   9.557913,
+   "PROCDUMP PRE vmstat nr_anon_pages 26"
+  ],
+  [
+   9.558033,
+   "PROCDUMP PRE vmstat nr_mapped 268"
+  ],
+  [
+   9.558151,
+   "PROCDUMP PRE vmstat nr_file_pages 3609"
+  ],
+  [
+   9.558366,
+   "PROCDUMP PRE vmstat nr_dirty 0"
+  ],
+  [
+   9.558503,
+   "PROCDUMP PRE vmstat nr_writeback 0"
+  ],
+  [
+   9.558622,
+   "PROCDUMP PRE vmstat nr_shmem 3609"
+  ],
+  [
+   9.558756,
+   "PROCDUMP PRE vmstat nr_shmem_hugepages 0"
+  ],
+  [
+   9.55888,
+   "PROCDUMP PRE vmstat nr_shmem_pmdmapped 0"
+  ],
+  [
+   9.559003,
+   "PROCDUMP PRE vmstat nr_file_hugepages 0"
+  ],
+  [
+   9.559137,
+   "PROCDUMP PRE vmstat nr_file_pmdmapped 0"
+  ],
+  [
+   9.559279,
+   "PROCDUMP PRE vmstat nr_anon_transparent_hugepages 0"
+  ],
+  [
+   9.559415,
+   "PROCDUMP PRE vmstat nr_vmscan_write 0"
+  ],
+  [
+   9.55971,
+   "PROCDUMP PRE vmstat nr_vmscan_immediate_reclaim 0"
+  ],
+  [
+   9.559827,
+   "PROCDUMP PRE vmstat nr_dirtied 0"
+  ],
+  [
+   9.559944,
+   "PROCDUMP PRE vmstat nr_written 0"
+  ],
+  [
+   9.560072,
+   "PROCDUMP PRE vmstat nr_throttled_written 0"
+  ],
+  [
+   9.560213,
+   "PROCDUMP PRE vmstat nr_kernel_misc_reclaimable 0"
+  ],
+  [
+   9.560341,
+   "PROCDUMP PRE vmstat nr_foll_pin_acquired 0"
+  ],
+  [
+   9.56047,
+   "PROCDUMP PRE vmstat nr_foll_pin_released 0"
+  ],
+  [
+   9.560602,
+   "PROCDUMP PRE vmstat nr_kernel_stack 1152"
+  ],
+  [
+   9.560734,
+   "PROCDUMP PRE vmstat nr_page_table_pages 100"
+  ],
+  [
+   9.561019,
+   "PROCDUMP PRE vmstat nr_sec_page_table_pages 0"
+  ],
+  [
+   9.561139,
+   "PROCDUMP PRE vmstat nr_iommu_pages 0"
+  ],
+  [
+   9.561262,
+   "PROCDUMP PRE vmstat nr_swapcached 0"
+  ],
+  [
+   9.5614,
+   "PROCDUMP PRE vmstat pgpromote_success 0"
+  ],
+  [
+   9.561525,
+   "PROCDUMP PRE vmstat pgpromote_candidate 0"
+  ],
+  [
+   9.561662,
+   "PROCDUMP PRE vmstat pgpromote_candidate_nrl 0"
+  ],
+  [
+   9.561781,
+   "PROCDUMP PRE vmstat pgdemote_kswapd 0"
+  ],
+  [
+   9.5619,
+   "PROCDUMP PRE vmstat pgdemote_direct 0"
+  ],
+  [
+   9.562028,
+   "PROCDUMP PRE vmstat pgdemote_khugepaged 0"
+  ],
+  [
+   9.562309,
+   "PROCDUMP PRE vmstat pgdemote_proactive 0"
+  ],
+  [
+   9.562425,
+   "PROCDUMP PRE vmstat nr_hugetlb 0"
+  ],
+  [
+   9.562562,
+   "PROCDUMP PRE vmstat nr_balloon_pages 0"
+  ],
+  [
+   9.562702,
+   "PROCDUMP PRE vmstat nr_kernel_file_pages 0"
+  ],
+  [
+   9.562862,
+   "PROCDUMP PRE vmstat nr_dirty_threshold 94525"
+  ],
+  [
+   9.563657,
+   "PROCDUMP PRE vmstat nr_dirty_background_threshold 47205"
+  ],
+  [
+   9.563772,
+   "PROCDUMP PRE vmstat nr_memmap_pages 0"
+  ],
+  [
+   9.563915,
+   "PROCDUMP PRE vmstat nr_memmap_boot_pages 8192"
+  ],
+  [
+   9.564026,
+   "PROCDUMP PRE vmstat pgpgin 0"
+  ],
+  [
+   9.564139,
+   "PROCDUMP PRE vmstat pgpgout 0"
+  ],
+  [
+   9.56425,
+   "PROCDUMP PRE vmstat pswpin 0"
+  ],
+  [
+   9.564369,
+   "PROCDUMP PRE vmstat pswpout 0"
+  ],
+  [
+   9.564484,
+   "PROCDUMP PRE vmstat pgalloc_dma 0"
+  ],
+  [
+   9.56465,
+   "PROCDUMP PRE vmstat pgalloc_dma32 12400"
+  ],
+  [
+   9.564766,
+   "PROCDUMP PRE vmstat pgalloc_normal 0"
+  ],
+  [
+   9.564886,
+   "PROCDUMP PRE vmstat pgalloc_movable 0"
+  ],
+  [
+   9.565008,
+   "PROCDUMP PRE vmstat allocstall_dma 0"
+  ],
+  [
+   9.56513,
+   "PROCDUMP PRE vmstat allocstall_dma32 0"
+  ],
+  [
+   9.565246,
+   "PROCDUMP PRE vmstat allocstall_normal 0"
+  ],
+  [
+   9.565381,
+   "PROCDUMP PRE vmstat allocstall_movable 0"
+  ],
+  [
+   9.565503,
+   "PROCDUMP PRE vmstat pgskip_dma 0"
+  ],
+  [
+   9.56562,
+   "PROCDUMP PRE vmstat pgskip_dma32 0"
+  ],
+  [
+   9.565749,
+   "PROCDUMP PRE vmstat pgskip_normal 0"
+  ],
+  [
+   9.565869,
+   "PROCDUMP PRE vmstat pgskip_movable 0"
+  ],
+  [
+   9.566078,
+   "PROCDUMP PRE vmstat pgfree 510114"
+  ],
+  [
+   9.566204,
+   "PROCDUMP PRE vmstat pgactivate 0"
+  ],
+  [
+   9.566333,
+   "PROCDUMP PRE vmstat pgdeactivate 0"
+  ],
+  [
+   9.56646,
+   "PROCDUMP PRE vmstat pglazyfree 0"
+  ],
+  [
+   9.566568,
+   "PROCDUMP PRE vmstat pgfault 930"
+  ],
+  [
+   9.566682,
+   "PROCDUMP PRE vmstat pgmajfault 0"
+  ],
+  [
+   9.566807,
+   "PROCDUMP PRE vmstat pglazyfreed 0"
+  ],
+  [
+   9.566921,
+   "PROCDUMP PRE vmstat pgrefill 0"
+  ],
+  [
+   9.567066,
+   "PROCDUMP PRE vmstat pgreuse 97"
+  ],
+  [
+   9.567232,
+   "PROCDUMP PRE vmstat pgsteal_kswapd 0"
+  ],
+  [
+   9.567359,
+   "PROCDUMP PRE vmstat pgsteal_direct 0"
+  ],
+  [
+   9.567484,
+   "PROCDUMP PRE vmstat pgsteal_khugepaged 0"
+  ],
+  [
+   9.567606,
+   "PROCDUMP PRE vmstat pgsteal_proactive 0"
+  ],
+  [
+   9.567724,
+   "PROCDUMP PRE vmstat pgscan_kswapd 0"
+  ],
+  [
+   9.567849,
+   "PROCDUMP PRE vmstat pgscan_direct 0"
+  ],
+  [
+   9.567966,
+   "PROCDUMP PRE vmstat pgscan_khugepaged 0"
+  ],
+  [
+   9.568097,
+   "PROCDUMP PRE vmstat pgscan_proactive 0"
+  ],
+  [
+   9.568228,
+   "PROCDUMP PRE vmstat pgscan_direct_throttle 0"
+  ],
+  [
+   9.568344,
+   "PROCDUMP PRE vmstat pgscan_anon 0"
+  ],
+  [
+   9.568462,
+   "PROCDUMP PRE vmstat pgscan_file 0"
+  ],
+  [
+   9.568626,
+   "PROCDUMP PRE vmstat pgsteal_anon 0"
+  ],
+  [
+   9.568739,
+   "PROCDUMP PRE vmstat pgsteal_file 0"
+  ],
+  [
+   9.568875,
+   "PROCDUMP PRE vmstat zone_reclaim_success 0"
+  ],
+  [
+   9.569007,
+   "PROCDUMP PRE vmstat zone_reclaim_failed 0"
+  ],
+  [
+   9.569124,
+   "PROCDUMP PRE vmstat pginodesteal 0"
+  ],
+  [
+   9.569242,
+   "PROCDUMP PRE vmstat slabs_scanned 0"
+  ],
+  [
+   9.569364,
+   "PROCDUMP PRE vmstat kswapd_inodesteal 0"
+  ],
+  [
+   9.569499,
+   "PROCDUMP PRE vmstat kswapd_low_wmark_hit_quickly 0"
+  ],
+  [
+   9.569638,
+   "PROCDUMP PRE vmstat kswapd_high_wmark_hit_quickly 0"
+  ],
+  [
+   9.569753,
+   "PROCDUMP PRE vmstat pageoutrun 0"
+  ],
+  [
+   9.570023,
+   "PROCDUMP PRE vmstat pgrotated 0"
+  ],
+  [
+   9.570137,
+   "PROCDUMP PRE vmstat drop_pagecache 0"
+  ],
+  [
+   9.570257,
+   "PROCDUMP PRE vmstat drop_slab 0"
+  ],
+  [
+   9.5704,
+   "PROCDUMP PRE vmstat oom_kill 0"
+  ],
+  [
+   9.570521,
+   "PROCDUMP PRE vmstat numa_pte_updates 0"
+  ],
+  [
+   9.570648,
+   "PROCDUMP PRE vmstat numa_huge_pte_updates 0"
+  ],
+  [
+   9.570775,
+   "PROCDUMP PRE vmstat numa_hint_faults 0"
+  ],
+  [
+   9.570917,
+   "PROCDUMP PRE vmstat numa_hint_faults_local 0"
+  ],
+  [
+   9.571055,
+   "PROCDUMP PRE vmstat numa_pages_migrated 0"
+  ],
+  [
+   9.571223,
+   "PROCDUMP PRE vmstat pgmigrate_success 0"
+  ],
+  [
+   9.571343,
+   "PROCDUMP PRE vmstat pgmigrate_fail 0"
+  ],
+  [
+   9.571465,
+   "PROCDUMP PRE vmstat thp_migration_success 0"
+  ],
+  [
+   9.571599,
+   "PROCDUMP PRE vmstat thp_migration_fail 0"
+  ],
+  [
+   9.571725,
+   "PROCDUMP PRE vmstat thp_migration_split 0"
+  ],
+  [
+   9.571855,
+   "PROCDUMP PRE vmstat compact_migrate_scanned 0"
+  ],
+  [
+   9.571979,
+   "PROCDUMP PRE vmstat compact_free_scanned 0"
+  ],
+  [
+   9.572117,
+   "PROCDUMP PRE vmstat compact_isolated 0"
+  ],
+  [
+   9.572245,
+   "PROCDUMP PRE vmstat compact_stall 0"
+  ],
+  [
+   9.572358,
+   "PROCDUMP PRE vmstat compact_fail 0"
+  ],
+  [
+   9.572648,
+   "PROCDUMP PRE vmstat compact_success 0"
+  ],
+  [
+   9.5728,
+   "PROCDUMP PRE vmstat compact_daemon_wake 0"
+  ],
+  [
+   9.572947,
+   "PROCDUMP PRE vmstat compact_daemon_migrate_scanned 0"
+  ],
+  [
+   9.573115,
+   "PROCDUMP PRE vmstat compact_daemon_free_scanned 0"
+  ],
+  [
+   9.573253,
+   "PROCDUMP PRE vmstat htlb_buddy_alloc_success 0"
+  ],
+  [
+   9.57341,
+   "PROCDUMP PRE vmstat htlb_buddy_alloc_fail 0"
+  ],
+  [
+   9.573544,
+   "PROCDUMP PRE vmstat unevictable_pgs_culled 0"
+  ],
+  [
+   9.573711,
+   "PROCDUMP PRE vmstat unevictable_pgs_scanned 0"
+  ],
+  [
+   9.573837,
+   "PROCDUMP PRE vmstat unevictable_pgs_rescued 0"
+  ],
+  [
+   9.573964,
+   "PROCDUMP PRE vmstat unevictable_pgs_mlocked 0"
+  ],
+  [
+   9.574104,
+   "PROCDUMP PRE vmstat unevictable_pgs_munlocked 0"
+  ],
+  [
+   9.574234,
+   "PROCDUMP PRE vmstat unevictable_pgs_cleared 0"
+  ],
+  [
+   9.574362,
+   "PROCDUMP PRE vmstat unevictable_pgs_stranded 0"
+  ],
+  [
+   9.574481,
+   "PROCDUMP PRE vmstat thp_fault_alloc 0"
+  ],
+  [
+   9.574604,
+   "PROCDUMP PRE vmstat thp_fault_fallback 0"
+  ],
+  [
+   9.574746,
+   "PROCDUMP PRE vmstat thp_fault_fallback_charge 0"
+  ],
+  [
+   9.574869,
+   "PROCDUMP PRE vmstat thp_collapse_alloc 0"
+  ],
+  [
+   9.575044,
+   "PROCDUMP PRE vmstat thp_collapse_alloc_failed 0"
+  ],
+  [
+   9.575162,
+   "PROCDUMP PRE vmstat thp_file_alloc 0"
+  ],
+  [
+   9.575286,
+   "PROCDUMP PRE vmstat thp_file_fallback 0"
+  ],
+  [
+   9.575415,
+   "PROCDUMP PRE vmstat thp_file_fallback_charge 0"
+  ],
+  [
+   9.575539,
+   "PROCDUMP PRE vmstat thp_file_mapped 0"
+  ],
+  [
+   9.575672,
+   "PROCDUMP PRE vmstat thp_split_page 0"
+  ],
+  [
+   9.575799,
+   "PROCDUMP PRE vmstat thp_split_page_failed 0"
+  ],
+  [
+   9.57595,
+   "PROCDUMP PRE vmstat thp_deferred_split_page 0"
+  ],
+  [
+   9.576107,
+   "PROCDUMP PRE vmstat thp_underused_split_page 0"
+  ],
+  [
+   9.576239,
+   "PROCDUMP PRE vmstat thp_split_pmd 0"
+  ],
+  [
+   9.576449,
+   "PROCDUMP PRE vmstat thp_scan_exceed_none_pte 0"
+  ],
+  [
+   9.576577,
+   "PROCDUMP PRE vmstat thp_scan_exceed_swap_pte 0"
+  ],
+  [
+   9.576723,
+   "PROCDUMP PRE vmstat thp_scan_exceed_share_pte 0"
+  ],
+  [
+   9.576837,
+   "PROCDUMP PRE vmstat thp_split_pud 0"
+  ],
+  [
+   9.576961,
+   "PROCDUMP PRE vmstat thp_zero_page_alloc 0"
+  ],
+  [
+   9.577091,
+   "PROCDUMP PRE vmstat thp_zero_page_alloc_failed 0"
+  ],
+  [
+   9.577203,
+   "PROCDUMP PRE vmstat thp_swpout 0"
+  ],
+  [
+   9.577339,
+   "PROCDUMP PRE vmstat thp_swpout_fallback 0"
+  ],
+  [
+   9.577455,
+   "PROCDUMP PRE vmstat balloon_inflate 0"
+  ],
+  [
+   9.577633,
+   "PROCDUMP PRE vmstat balloon_deflate 0"
+  ],
+  [
+   9.577753,
+   "PROCDUMP PRE vmstat balloon_migrate 0"
+  ],
+  [
+   9.577872,
+   "PROCDUMP PRE vmstat swap_ra 0"
+  ],
+  [
+   9.577998,
+   "PROCDUMP PRE vmstat swap_ra_hit 0"
+  ],
+  [
+   9.578129,
+   "PROCDUMP PRE vmstat swpin_zero 0"
+  ],
+  [
+   9.578245,
+   "PROCDUMP PRE vmstat swpout_zero 0"
+  ],
+  [
+   9.578363,
+   "PROCDUMP PRE vmstat ksm_swpin_copy 0"
+  ],
+  [
+   9.57848,
+   "PROCDUMP PRE vmstat cow_ksm 0"
+  ],
+  [
+   9.57859,
+   "PROCDUMP PRE vmstat zswpin 0"
+  ],
+  [
+   9.578705,
+   "PROCDUMP PRE vmstat zswpout 0"
+  ],
+  [
+   9.578819,
+   "PROCDUMP PRE vmstat zswpwb 0"
+  ],
+  [
+   9.579006,
+   "PROCDUMP PRE vmstat direct_map_level2_splits 0"
+  ],
+  [
+   9.579401,
+   "PROCDUMP PRE vmstat direct_map_level3_splits 0"
+  ],
+  [
+   9.579536,
+   "PROCDUMP PRE vmstat direct_map_level2_collapses 0"
+  ],
+  [
+   9.579679,
+   "PROCDUMP PRE vmstat direct_map_level3_collapses 0"
+  ],
+  [
+   9.5798,
+   "PROCDUMP PRE vmstat nr_unstable 0"
+  ],
+  [
+   9.605074,
+   "PROCDUMP PRE irq            CPU0       "
+  ],
+  [
+   9.606055,
+   "PROCDUMP PRE irq   0:        986  IO-APIC   2-edge      timer"
+  ],
+  [
+   9.606255,
+   "PROCDUMP PRE irq   1:          9  IO-APIC   1-edge      i8042"
+  ],
+  [
+   9.606442,
+   "PROCDUMP PRE irq   4:        790  IO-APIC   4-edge      ttyS0"
+  ],
+  [
+   9.606752,
+   "PROCDUMP PRE irq   8:          1  IO-APIC   8-edge      rtc0"
+  ],
+  [
+   9.606946,
+   "PROCDUMP PRE irq   9:          0  IO-APIC   9-fasteoi   acpi"
+  ],
+  [
+   9.607116,
+   "PROCDUMP PRE irq  12:          5  IO-APIC  12-edge      i8042"
+  ],
+  [
+   9.607294,
+   "PROCDUMP PRE irq  24:          0 PCI-MSI-0000:00:1f.2   0-edge      ahci[0000:00:1f.2]"
+  ],
+  [
+   9.607443,
+   "PROCDUMP PRE irq NMI:          0   Non-maskable interrupts"
+  ],
+  [
+   9.607573,
+   "PROCDUMP PRE irq LOC:       4254   Local timer interrupts"
+  ],
+  [
+   9.607817,
+   "PROCDUMP PRE irq SPU:          0   Spurious interrupts"
+  ],
+  [
+   9.608067,
+   "PROCDUMP PRE irq PMI:          0   Performance monitoring interrupts"
+  ],
+  [
+   9.608209,
+   "PROCDUMP PRE irq IWI:          0   IRQ work interrupts"
+  ],
+  [
+   9.608383,
+   "PROCDUMP PRE irq RTR:          0   APIC ICR read retries"
+  ],
+  [
+   9.608537,
+   "PROCDUMP PRE irq RES:          0   Rescheduling interrupts"
+  ],
+  [
+   9.608682,
+   "PROCDUMP PRE irq CAL:          0   Function call interrupts"
+  ],
+  [
+   9.608813,
+   "PROCDUMP PRE irq TLB:          0   TLB shootdowns"
+  ],
+  [
+   9.608962,
+   "PROCDUMP PRE irq TRM:          0   Thermal event interrupts"
+  ],
+  [
+   9.60907,
+   "PROCDUMP PRE irq ERR:          0"
+  ],
+  [
+   9.609202,
+   "PROCDUMP PRE irq MIS:          0"
+  ],
+  [
+   9.609428,
+   "PROCDUMP PRE irq PIN:          0   Posted-interrupt notification event"
+  ],
+  [
+   9.609558,
+   "PROCDUMP PRE irq NPI:          0   Nested posted-interrupt event"
+  ],
+  [
+   9.609702,
+   "PROCDUMP PRE irq PIW:          0   Posted-interrupt wakeup event"
+  ],
+  [
+   9.611403,
+   "PROCDUMP PRE end"
+  ],
+  [
+   9.612933,
+   "NATEMU_TASK_BEGIN bench"
+  ],
+  [
+   9.664582,
+   "BENCHVER 4"
+  ],
+  [
+   10.614552,
+   "BENCH alu          0.9228 s       325.093 Mops  chk=874f08ae8ad6f007"
+  ],
+  [
+   11.648964,
+   "BENCH alu4         1.0263 s       292.299 Mops  chk=f9f040dc5f7a3b1b"
+  ],
+  [
+   15.335021,
+   "BENCH ls4          3.6714 s        81.712 Mops  chk=f9f04094fc9d000a"
+  ],
+  [
+   53.368632,
+   "BENCH ls4tlb      37.8349 s         1.586 Mops  chk=bdc372d6000ce57d"
+  ],
+  [
+   57.559565,
+   "BENCH ptr8         4.1901 s         7.160 Mops  chk=00000e4e1d789457"
+  ],
+  [
+   76.082796,
+   "BENCH ptr256      18.5225 s         0.432 Mops  chk=00007a0f78cfc5f4"
+  ],
+  [
+   79.829452,
+   "BENCH stream       3.7459 s      3583.046 MB/s  chk=a5ab2a3b6e000000"
+  ],
+  [
+   88.588275,
+   "BENCH matmul       8.7580 s       448.977 Mops  chk=0000001f5e05e316"
+  ],
+  [
+   90.974696,
+   "BENCH nqueens      2.3854 s         5.031 solves/s  chk=00000000000d7f40"
+  ],
+  [
+   92.743149,
+   "BENCH syscall      1.7677 s         1.697 Mops  chk=00000000002dc6c0"
+  ],
+  [
+   92.746378,
+   "BENCHDONE"
+  ],
+  [
+   92.761233,
+   "NATEMU_TASK_END bench uptime=89.54"
+  ],
+  [
+   92.767506,
+   "PROCDUMP POST uptime 89.54 0.00"
+  ],
+  [
+   92.782024,
+   "PROCDUMP POST stat intr 72046 986 9 0 0 946 0 0 0 1 0 0 0 5 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
+  ],
+  [
+   92.782212,
+   "PROCDUMP POST stat ctxt 4527"
+  ],
+  [
+   92.782425,
+   "PROCDUMP POST stat processes 480"
+  ],
+  [
+   92.782561,
+   "PROCDUMP POST stat procs_running 1"
+  ],
+  [
+   92.782695,
+   "PROCDUMP POST stat procs_blocked 0"
+  ],
+  [
+   92.787367,
+   "PROCDUMP POST vmstat nr_free_pages 485643"
+  ],
+  [
+   92.787545,
+   "PROCDUMP POST vmstat nr_free_pages_blocks 483328"
+  ],
+  [
+   92.787699,
+   "PROCDUMP POST vmstat nr_zone_inactive_anon 0"
+  ],
+  [
+   92.787848,
+   "PROCDUMP POST vmstat nr_zone_active_anon 3626"
+  ],
+  [
+   92.787993,
+   "PROCDUMP POST vmstat nr_zone_inactive_file 0"
+  ],
+  [
+   92.788136,
+   "PROCDUMP POST vmstat nr_zone_active_file 0"
+  ],
+  [
+   92.788296,
+   "PROCDUMP POST vmstat nr_zone_unevictable 0"
+  ],
+  [
+   92.788562,
+   "PROCDUMP POST vmstat nr_zone_write_pending 0"
+  ],
+  [
+   92.788723,
+   "PROCDUMP POST vmstat nr_mlock 0"
+  ],
+  [
+   92.788863,
+   "PROCDUMP POST vmstat nr_zspages 0"
+  ],
+  [
+   92.788988,
+   "PROCDUMP POST vmstat nr_free_cma 0"
+  ],
+  [
+   92.789125,
+   "PROCDUMP POST vmstat numa_hit 13350"
+  ],
+  [
+   92.789244,
+   "PROCDUMP POST vmstat numa_miss 0"
+  ],
+  [
+   92.789373,
+   "PROCDUMP POST vmstat numa_foreign 0"
+  ],
+  [
+   92.789503,
+   "PROCDUMP POST vmstat numa_interleave 741"
+  ],
+  [
+   92.789626,
+   "PROCDUMP POST vmstat numa_local 13350"
+  ],
+  [
+   92.789861,
+   "PROCDUMP POST vmstat numa_other 0"
+  ],
+  [
+   92.789993,
+   "PROCDUMP POST vmstat nr_inactive_anon 0"
+  ],
+  [
+   92.790115,
+   "PROCDUMP POST vmstat nr_active_anon 3626"
+  ],
+  [
+   92.790261,
+   "PROCDUMP POST vmstat nr_inactive_file 0"
+  ],
+  [
+   92.790419,
+   "PROCDUMP POST vmstat nr_active_file 0"
+  ],
+  [
+   92.790571,
+   "PROCDUMP POST vmstat nr_unevictable 0"
+  ],
+  [
+   92.790712,
+   "PROCDUMP POST vmstat nr_slab_reclaimable 129"
+  ],
+  [
+   92.790869,
+   "PROCDUMP POST vmstat nr_slab_unreclaimable 2023"
+  ],
+  [
+   92.791156,
+   "PROCDUMP POST vmstat nr_isolated_anon 0"
+  ],
+  [
+   92.791288,
+   "PROCDUMP POST vmstat nr_isolated_file 0"
+  ],
+  [
+   92.791417,
+   "PROCDUMP POST vmstat workingset_nodes 0"
+  ],
+  [
+   92.791555,
+   "PROCDUMP POST vmstat workingset_refault_anon 0"
+  ],
+  [
+   92.791691,
+   "PROCDUMP POST vmstat workingset_refault_file 0"
+  ],
+  [
+   92.791823,
+   "PROCDUMP POST vmstat workingset_activate_anon 0"
+  ],
+  [
+   92.79195,
+   "PROCDUMP POST vmstat workingset_activate_file 0"
+  ],
+  [
+   92.792078,
+   "PROCDUMP POST vmstat workingset_restore_anon 0"
+  ],
+  [
+   92.792245,
+   "PROCDUMP POST vmstat workingset_restore_file 0"
+  ],
+  [
+   92.792396,
+   "PROCDUMP POST vmstat workingset_nodereclaim 0"
+  ],
+  [
+   92.792515,
+   "PROCDUMP POST vmstat nr_anon_pages 28"
+  ],
+  [
+   92.792632,
+   "PROCDUMP POST vmstat nr_mapped 301"
+  ],
+  [
+   92.792752,
+   "PROCDUMP POST vmstat nr_file_pages 3609"
+  ],
+  [
+   92.792865,
+   "PROCDUMP POST vmstat nr_dirty 0"
+  ],
+  [
+   92.792981,
+   "PROCDUMP POST vmstat nr_writeback 0"
+  ],
+  [
+   92.793097,
+   "PROCDUMP POST vmstat nr_shmem 3609"
+  ],
+  [
+   92.79322,
+   "PROCDUMP POST vmstat nr_shmem_hugepages 0"
+  ],
+  [
+   92.793343,
+   "PROCDUMP POST vmstat nr_shmem_pmdmapped 0"
+  ],
+  [
+   92.793526,
+   "PROCDUMP POST vmstat nr_file_hugepages 0"
+  ],
+  [
+   92.793649,
+   "PROCDUMP POST vmstat nr_file_pmdmapped 0"
+  ],
+  [
+   92.793784,
+   "PROCDUMP POST vmstat nr_anon_transparent_hugepages 0"
+  ],
+  [
+   92.793902,
+   "PROCDUMP POST vmstat nr_vmscan_write 0"
+  ],
+  [
+   92.794072,
+   "PROCDUMP POST vmstat nr_vmscan_immediate_reclaim 0"
+  ],
+  [
+   92.794185,
+   "PROCDUMP POST vmstat nr_dirtied 0"
+  ],
+  [
+   92.794302,
+   "PROCDUMP POST vmstat nr_written 0"
+  ],
+  [
+   92.794427,
+   "PROCDUMP POST vmstat nr_throttled_written 0"
+  ],
+  [
+   92.794559,
+   "PROCDUMP POST vmstat nr_kernel_misc_reclaimable 0"
+  ],
+  [
+   92.794734,
+   "PROCDUMP POST vmstat nr_foll_pin_acquired 0"
+  ],
+  [
+   92.794877,
+   "PROCDUMP POST vmstat nr_foll_pin_released 0"
+  ],
+  [
+   92.795001,
+   "PROCDUMP POST vmstat nr_kernel_stack 1152"
+  ],
+  [
+   92.795127,
+   "PROCDUMP POST vmstat nr_page_table_pages 105"
+  ],
+  [
+   92.795253,
+   "PROCDUMP POST vmstat nr_sec_page_table_pages 0"
+  ],
+  [
+   92.79537,
+   "PROCDUMP POST vmstat nr_iommu_pages 0"
+  ],
+  [
+   92.795487,
+   "PROCDUMP POST vmstat nr_swapcached 0"
+  ],
+  [
+   92.795608,
+   "PROCDUMP POST vmstat pgpromote_success 0"
+  ],
+  [
+   92.795733,
+   "PROCDUMP POST vmstat pgpromote_candidate 0"
+  ],
+  [
+   92.795859,
+   "PROCDUMP POST vmstat pgpromote_candidate_nrl 0"
+  ],
+  [
+   92.796012,
+   "PROCDUMP POST vmstat pgdemote_kswapd 0"
+  ],
+  [
+   92.79614,
+   "PROCDUMP POST vmstat pgdemote_direct 0"
+  ],
+  [
+   92.796272,
+   "PROCDUMP POST vmstat pgdemote_khugepaged 0"
+  ],
+  [
+   92.796397,
+   "PROCDUMP POST vmstat pgdemote_proactive 0"
+  ],
+  [
+   92.796515,
+   "PROCDUMP POST vmstat nr_hugetlb 0"
+  ],
+  [
+   92.796637,
+   "PROCDUMP POST vmstat nr_balloon_pages 0"
+  ],
+  [
+   92.796763,
+   "PROCDUMP POST vmstat nr_kernel_file_pages 0"
+  ],
+  [
+   92.796931,
+   "PROCDUMP POST vmstat nr_dirty_threshold 93335"
+  ],
+  [
+   92.797072,
+   "PROCDUMP POST vmstat nr_dirty_background_threshold 46610"
+  ],
+  [
+   92.797193,
+   "PROCDUMP POST vmstat nr_memmap_pages 0"
+  ],
+  [
+   92.797371,
+   "PROCDUMP POST vmstat nr_memmap_boot_pages 8192"
+  ],
+  [
+   92.797481,
+   "PROCDUMP POST vmstat pgpgin 0"
+  ],
+  [
+   92.797593,
+   "PROCDUMP POST vmstat pgpgout 0"
+  ],
+  [
+   92.797703,
+   "PROCDUMP POST vmstat pswpin 0"
+  ],
+  [
+   92.797815,
+   "PROCDUMP POST vmstat pswpout 0"
+  ],
+  [
+   92.797931,
+   "PROCDUMP POST vmstat pgalloc_dma 0"
+  ],
+  [
+   92.798055,
+   "PROCDUMP POST vmstat pgalloc_dma32 189771"
+  ],
+  [
+   92.798179,
+   "PROCDUMP POST vmstat pgalloc_normal 0"
+  ],
+  [
+   92.7983,
+   "PROCDUMP POST vmstat pgalloc_movable 0"
+  ],
+  [
+   92.798422,
+   "PROCDUMP POST vmstat allocstall_dma 0"
+  ],
+  [
+   92.798602,
+   "PROCDUMP POST vmstat allocstall_dma32 0"
+  ],
+  [
+   92.798813,
+   "PROCDUMP POST vmstat allocstall_normal 0"
+  ],
+  [
+   92.799108,
+   "PROCDUMP POST vmstat allocstall_movable 0"
+  ],
+  [
+   92.799269,
+   "PROCDUMP POST vmstat pgskip_dma 0"
+  ],
+  [
+   92.79941,
+   "PROCDUMP POST vmstat pgskip_dma32 0"
+  ],
+  [
+   92.799533,
+   "PROCDUMP POST vmstat pgskip_normal 0"
+  ],
+  [
+   92.799653,
+   "PROCDUMP POST vmstat pgskip_movable 0"
+  ],
+  [
+   92.799831,
+   "PROCDUMP POST vmstat pgfree 687480"
+  ],
+  [
+   92.799968,
+   "PROCDUMP POST vmstat pgactivate 0"
+  ],
+  [
+   92.800103,
+   "PROCDUMP POST vmstat pgdeactivate 0"
+  ],
+  [
+   92.80022,
+   "PROCDUMP POST vmstat pglazyfree 0"
+  ],
+  [
+   92.800346,
+   "PROCDUMP POST vmstat pgfault 5226"
+  ],
+  [
+   92.800472,
+   "PROCDUMP POST vmstat pgmajfault 0"
+  ],
+  [
+   92.800592,
+   "PROCDUMP POST vmstat pglazyfreed 0"
+  ],
+  [
+   92.800714,
+   "PROCDUMP POST vmstat pgrefill 0"
+  ],
+  [
+   92.800868,
+   "PROCDUMP POST vmstat pgreuse 176"
+  ],
+  [
+   92.800993,
+   "PROCDUMP POST vmstat pgsteal_kswapd 0"
+  ],
+  [
+   92.801165,
+   "PROCDUMP POST vmstat pgsteal_direct 0"
+  ],
+  [
+   92.801288,
+   "PROCDUMP POST vmstat pgsteal_khugepaged 0"
+  ],
+  [
+   92.801415,
+   "PROCDUMP POST vmstat pgsteal_proactive 0"
+  ],
+  [
+   92.801538,
+   "PROCDUMP POST vmstat pgscan_kswapd 0"
+  ],
+  [
+   92.80166,
+   "PROCDUMP POST vmstat pgscan_direct 0"
+  ],
+  [
+   92.801787,
+   "PROCDUMP POST vmstat pgscan_khugepaged 0"
+  ],
+  [
+   92.801911,
+   "PROCDUMP POST vmstat pgscan_proactive 0"
+  ],
+  [
+   92.802042,
+   "PROCDUMP POST vmstat pgscan_direct_throttle 0"
+  ],
+  [
+   92.802169,
+   "PROCDUMP POST vmstat pgscan_anon 0"
+  ],
+  [
+   92.802285,
+   "PROCDUMP POST vmstat pgscan_file 0"
+  ],
+  [
+   92.802504,
+   "PROCDUMP POST vmstat pgsteal_anon 0"
+  ],
+  [
+   92.802625,
+   "PROCDUMP POST vmstat pgsteal_file 0"
+  ],
+  [
+   92.802754,
+   "PROCDUMP POST vmstat zone_reclaim_success 0"
+  ],
+  [
+   92.802883,
+   "PROCDUMP POST vmstat zone_reclaim_failed 0"
+  ],
+  [
+   92.803038,
+   "PROCDUMP POST vmstat pginodesteal 0"
+  ],
+  [
+   92.803196,
+   "PROCDUMP POST vmstat slabs_scanned 0"
+  ],
+  [
+   92.803337,
+   "PROCDUMP POST vmstat kswapd_inodesteal 0"
+  ],
+  [
+   92.803481,
+   "PROCDUMP POST vmstat kswapd_low_wmark_hit_quickly 0"
+  ],
+  [
+   92.803629,
+   "PROCDUMP POST vmstat kswapd_high_wmark_hit_quickly 0"
+  ],
+  [
+   92.803844,
+   "PROCDUMP POST vmstat pageoutrun 0"
+  ],
+  [
+   92.803966,
+   "PROCDUMP POST vmstat pgrotated 0"
+  ],
+  [
+   92.804112,
+   "PROCDUMP POST vmstat drop_pagecache 0"
+  ],
+  [
+   92.804231,
+   "PROCDUMP POST vmstat drop_slab 0"
+  ],
+  [
+   92.804393,
+   "PROCDUMP POST vmstat oom_kill 0"
+  ],
+  [
+   92.804533,
+   "PROCDUMP POST vmstat numa_pte_updates 0"
+  ],
+  [
+   92.804673,
+   "PROCDUMP POST vmstat numa_huge_pte_updates 0"
+  ],
+  [
+   92.804813,
+   "PROCDUMP POST vmstat numa_hint_faults 0"
+  ],
+  [
+   92.805009,
+   "PROCDUMP POST vmstat numa_hint_faults_local 0"
+  ],
+  [
+   92.805148,
+   "PROCDUMP POST vmstat numa_pages_migrated 0"
+  ],
+  [
+   92.805282,
+   "PROCDUMP POST vmstat pgmigrate_success 0"
+  ],
+  [
+   92.80542,
+   "PROCDUMP POST vmstat pgmigrate_fail 0"
+  ],
+  [
+   92.805561,
+   "PROCDUMP POST vmstat thp_migration_success 0"
+  ],
+  [
+   92.80569,
+   "PROCDUMP POST vmstat thp_migration_fail 0"
+  ],
+  [
+   92.805828,
+   "PROCDUMP POST vmstat thp_migration_split 0"
+  ],
+  [
+   92.805968,
+   "PROCDUMP POST vmstat compact_migrate_scanned 0"
+  ],
+  [
+   92.806099,
+   "PROCDUMP POST vmstat compact_free_scanned 0"
+  ],
+  [
+   92.806219,
+   "PROCDUMP POST vmstat compact_isolated 0"
+  ],
+  [
+   92.806388,
+   "PROCDUMP POST vmstat compact_stall 0"
+  ],
+  [
+   92.806507,
+   "PROCDUMP POST vmstat compact_fail 0"
+  ],
+  [
+   92.806637,
+   "PROCDUMP POST vmstat compact_success 0"
+  ],
+  [
+   92.806771,
+   "PROCDUMP POST vmstat compact_daemon_wake 0"
+  ],
+  [
+   92.806921,
+   "PROCDUMP POST vmstat compact_daemon_migrate_scanned 0"
+  ],
+  [
+   92.807065,
+   "PROCDUMP POST vmstat compact_daemon_free_scanned 0"
+  ],
+  [
+   92.807204,
+   "PROCDUMP POST vmstat htlb_buddy_alloc_success 0"
+  ],
+  [
+   92.807371,
+   "PROCDUMP POST vmstat htlb_buddy_alloc_fail 0"
+  ],
+  [
+   92.807502,
+   "PROCDUMP POST vmstat unevictable_pgs_culled 0"
+  ],
+  [
+   92.807664,
+   "PROCDUMP POST vmstat unevictable_pgs_scanned 0"
+  ],
+  [
+   92.807793,
+   "PROCDUMP POST vmstat unevictable_pgs_rescued 0"
+  ],
+  [
+   92.807922,
+   "PROCDUMP POST vmstat unevictable_pgs_mlocked 0"
+  ],
+  [
+   92.808052,
+   "PROCDUMP POST vmstat unevictable_pgs_munlocked 0"
+  ],
+  [
+   92.808178,
+   "PROCDUMP POST vmstat unevictable_pgs_cleared 0"
+  ],
+  [
+   92.808305,
+   "PROCDUMP POST vmstat unevictable_pgs_stranded 0"
+  ],
+  [
+   92.808423,
+   "PROCDUMP POST vmstat thp_fault_alloc 338"
+  ],
+  [
+   92.808542,
+   "PROCDUMP POST vmstat thp_fault_fallback 0"
+  ],
+  [
+   92.80867,
+   "PROCDUMP POST vmstat thp_fault_fallback_charge 0"
+  ],
+  [
+   92.808837,
+   "PROCDUMP POST vmstat thp_collapse_alloc 0"
+  ],
+  [
+   92.808978,
+   "PROCDUMP POST vmstat thp_collapse_alloc_failed 0"
+  ],
+  [
+   92.809097,
+   "PROCDUMP POST vmstat thp_file_alloc 0"
+  ],
+  [
+   92.809218,
+   "PROCDUMP POST vmstat thp_file_fallback 0"
+  ],
+  [
+   92.809351,
+   "PROCDUMP POST vmstat thp_file_fallback_charge 0"
+  ],
+  [
+   92.809469,
+   "PROCDUMP POST vmstat thp_file_mapped 0"
+  ],
+  [
+   92.809587,
+   "PROCDUMP POST vmstat thp_split_page 0"
+  ],
+  [
+   92.809713,
+   "PROCDUMP POST vmstat thp_split_page_failed 0"
+  ],
+  [
+   92.809876,
+   "PROCDUMP POST vmstat thp_deferred_split_page 0"
+  ],
+  [
+   92.810005,
+   "PROCDUMP POST vmstat thp_underused_split_page 0"
+  ],
+  [
+   92.810168,
+   "PROCDUMP POST vmstat thp_split_pmd 0"
+  ],
+  [
+   92.810297,
+   "PROCDUMP POST vmstat thp_scan_exceed_none_pte 0"
+  ],
+  [
+   92.810424,
+   "PROCDUMP POST vmstat thp_scan_exceed_swap_pte 0"
+  ],
+  [
+   92.810553,
+   "PROCDUMP POST vmstat thp_scan_exceed_share_pte 0"
+  ],
+  [
+   92.810668,
+   "PROCDUMP POST vmstat thp_split_pud 0"
+  ],
+  [
+   92.810792,
+   "PROCDUMP POST vmstat thp_zero_page_alloc 0"
+  ],
+  [
+   92.810922,
+   "PROCDUMP POST vmstat thp_zero_page_alloc_failed 0"
+  ],
+  [
+   92.81104,
+   "PROCDUMP POST vmstat thp_swpout 0"
+  ],
+  [
+   92.811171,
+   "PROCDUMP POST vmstat thp_swpout_fallback 0"
+  ],
+  [
+   92.811303,
+   "PROCDUMP POST vmstat balloon_inflate 0"
+  ],
+  [
+   92.81146,
+   "PROCDUMP POST vmstat balloon_deflate 0"
+  ],
+  [
+   92.811581,
+   "PROCDUMP POST vmstat balloon_migrate 0"
+  ],
+  [
+   92.811696,
+   "PROCDUMP POST vmstat swap_ra 0"
+  ],
+  [
+   92.81182,
+   "PROCDUMP POST vmstat swap_ra_hit 0"
+  ],
+  [
+   92.81194,
+   "PROCDUMP POST vmstat swpin_zero 0"
+  ],
+  [
+   92.812056,
+   "PROCDUMP POST vmstat swpout_zero 0"
+  ],
+  [
+   92.812178,
+   "PROCDUMP POST vmstat ksm_swpin_copy 0"
+  ],
+  [
+   92.812288,
+   "PROCDUMP POST vmstat cow_ksm 0"
+  ],
+  [
+   92.8124,
+   "PROCDUMP POST vmstat zswpin 0"
+  ],
+  [
+   92.812509,
+   "PROCDUMP POST vmstat zswpout 0"
+  ],
+  [
+   92.812625,
+   "PROCDUMP POST vmstat zswpwb 0"
+  ],
+  [
+   92.812857,
+   "PROCDUMP POST vmstat direct_map_level2_splits 0"
+  ],
+  [
+   92.813007,
+   "PROCDUMP POST vmstat direct_map_level3_splits 0"
+  ],
+  [
+   92.813141,
+   "PROCDUMP POST vmstat direct_map_level2_collapses 0"
+  ],
+  [
+   92.813274,
+   "PROCDUMP POST vmstat direct_map_level3_collapses 0"
+  ],
+  [
+   92.813393,
+   "PROCDUMP POST vmstat nr_unstable 0"
+  ],
+  [
+   92.820023,
+   "PROCDUMP POST irq            CPU0       "
+  ],
+  [
+   92.820194,
+   "PROCDUMP POST irq   0:        986  IO-APIC   2-edge      timer"
+  ],
+  [
+   92.820329,
+   "PROCDUMP POST irq   1:          9  IO-APIC   1-edge      i8042"
+  ],
+  [
+   92.82046,
+   "PROCDUMP POST irq   4:       1722  IO-APIC   4-edge      ttyS0"
+  ],
+  [
+   92.82081,
+   "PROCDUMP POST irq   8:          1  IO-APIC   8-edge      rtc0"
+  ],
+  [
+   92.820945,
+   "PROCDUMP POST irq   9:          0  IO-APIC   9-fasteoi   acpi"
+  ],
+  [
+   92.821072,
+   "PROCDUMP POST irq  12:          5  IO-APIC  12-edge      i8042"
+  ],
+  [
+   92.821239,
+   "PROCDUMP POST irq  24:          0 PCI-MSI-0000:00:1f.2   0-edge      ahci[0000:00:1f.2]"
+  ],
+  [
+   92.821353,
+   "PROCDUMP POST irq NMI:          0   Non-maskable interrupts"
+  ],
+  [
+   92.821474,
+   "PROCDUMP POST irq LOC:      70131   Local timer interrupts"
+  ],
+  [
+   92.821688,
+   "PROCDUMP POST irq SPU:          0   Spurious interrupts"
+  ],
+  [
+   92.821867,
+   "PROCDUMP POST irq PMI:          0   Performance monitoring interrupts"
+  ],
+  [
+   92.822004,
+   "PROCDUMP POST irq IWI:          0   IRQ work interrupts"
+  ],
+  [
+   92.822144,
+   "PROCDUMP POST irq RTR:          0   APIC ICR read retries"
+  ],
+  [
+   92.822277,
+   "PROCDUMP POST irq RES:          0   Rescheduling interrupts"
+  ],
+  [
+   92.8224,
+   "PROCDUMP POST irq CAL:          0   Function call interrupts"
+  ],
+  [
+   92.822516,
+   "PROCDUMP POST irq TLB:          0   TLB shootdowns"
+  ],
+  [
+   92.822641,
+   "PROCDUMP POST irq TRM:          0   Thermal event interrupts"
+  ],
+  [
+   92.822734,
+   "PROCDUMP POST irq ERR:          0"
+  ],
+  [
+   92.822828,
+   "PROCDUMP POST irq MIS:          0"
+  ],
+  [
+   92.823023,
+   "PROCDUMP POST irq PIN:          0   Posted-interrupt notification event"
+  ],
+  [
+   92.823159,
+   "PROCDUMP POST irq NPI:          0   Nested posted-interrupt event"
+  ],
+  [
+   92.823292,
+   "PROCDUMP POST irq PIW:          0   Posted-interrupt wakeup event"
+  ],
+  [
+   92.824097,
+   "PROCDUMP POST end"
+  ],
+  [
+   92.844868,
+   "[   89.561296] sysrq: Power Off"
+  ],
+  [
+   92.866759,
+   "[   89.587589] reboot: Power down"
+  ]
+ ]
+}
