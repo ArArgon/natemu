@@ -1,0 +1,5 @@
+=== host thread -> guest EL1 IRQ vector (hv_vcpus_exit + pending IRQ) ===
+  hv_vcpu_get_vtimer_offset = 0 (0 => guest CNTVCT == host mach_absolute_time)
+  n=200  host stamp -> guest EL1 IRQ vector:
+    p10 2000  p50 2042  p90 2083  p99 2250  min 1750  max 3625 ns
+  hv_vcpu_run returns: 402 (of which CANCELED 201)

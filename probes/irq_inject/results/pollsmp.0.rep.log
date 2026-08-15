@@ -1,0 +1,21 @@
+--- contended=0 run2
+  writer stores issued: 74057
+  k=5 x86/block, 2,000,000 x86 insns, 400,000 blocks per section:
+    no check              1220 us   (repeat 821 us)
+    ld+cbnz per block     1136 us   (repeat 822 us)  -6.90% / +0.17%
+    cbnz reg per block    1097 us                     -10.14%
+    density n=0 994 us, n=8 ld+cbnz 1500 us -> 0.1583 ns/check; n=8 cbnz-reg 1390 us -> 0.1240 ns/check
+--- contended=0 run3
+  writer stores issued: 77649
+  k=5 x86/block, 2,000,000 x86 insns, 400,000 blocks per section:
+    no check               842 us   (repeat 1025 us)
+    ld+cbnz per block      852 us   (repeat 831 us)  +1.19% / -18.93%
+    cbnz reg per block    1064 us                     +26.30%
+    density n=0 1179 us, n=8 ld+cbnz 1251 us -> 0.0223 ns/check; n=8 cbnz-reg 1225 us -> 0.0143 ns/check
+--- contended=0 run4
+  writer stores issued: 75338
+  k=5 x86/block, 2,000,000 x86 insns, 400,000 blocks per section:
+    no check               866 us   (repeat 815 us)
+    ld+cbnz per block      837 us   (repeat 760 us)  -3.33% / -6.81%
+    cbnz reg per block     827 us                     -4.42%
+    density n=0 823 us, n=8 ld+cbnz 1240 us -> 0.1305 ns/check; n=8 cbnz-reg 1242 us -> 0.1309 ns/check

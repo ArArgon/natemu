@@ -1,0 +1,6 @@
+=== cross-vCPU 'force a boundary' by killing a stage-1 mapping ===
+  vcpu0: store 0 to the L3 entry + TLBI VAAE1IS + DSB ISH
+  vcpu1: executing BLR into that page -> instruction abort at EL1
+  aborts taken on vcpu1: 500 / 500 rounds; host exits 1 + 1
+  vcpu0 stamp -> vcpu1 instruction-abort handler:
+    n=500  p10 83  p50 83  p90 125  p99 333  min 83  max 500 ns
