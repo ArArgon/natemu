@@ -55,7 +55,11 @@ def main():
               f"natemu.hold={a.hold} panic=-1 rdinit=/init loglevel=3 "
               f"nokaslr {a.extra_append}").strip()
 
-    cmd = [QEMU, "-machine", "q35", "-accel", "tcg,thread=single",
+    # thread=single corrupts the guest at -smp > 1 under any nontrivial plugin
+    # (0 NATEMU markers vs 123 with thread=multi, same plugin and guest). The plugin
+    # takes a coarse lock so thread=multi is safe for it.
+    accel = "tcg,thread=single" if a.smp == 1 else "tcg,thread=multi"
+    cmd = [QEMU, "-machine", "q35", "-accel", accel,
            "-cpu", a.cpu, "-m", str(a.mem), "-smp", str(a.smp),
            "-kernel", os.path.join(WORK, "nb-x86_64", "boot", "vmlinuz-virt"),
            "-initrd", os.path.join(WORK, "initramfs2-x86_64.cpio"),

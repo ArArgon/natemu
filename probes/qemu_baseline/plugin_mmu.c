@@ -281,6 +281,25 @@ static int enable_regs = 1;
  * assumptions at -smp > 1'. */
 static int enable_mem = 1;
 
+/* Multi-threaded TCG is REQUIRED at -smp > 1: with -accel tcg,thread=single the
+ * guest kernel corrupts and never reaches userspace under any nontrivial plugin
+ * (measured: 0 of ~123 NATEMU markers at thread=single, 123 at thread=multi, same
+ * plugin, same guest, same command otherwise). Under thread=multi the vCPUs really
+ * do run concurrently, so every mutation of this plugin's shared state must be
+ * serialised. One coarse lock is the right trade here: the instrument is already
+ * orders of magnitude slower than the guest, and correctness of the counts is the
+ * whole point of the instrument. */
+static GMutex plug_lock;
+
+/* Forward declarations for the locking wrappers defined at the bottom of the file;
+ * the TB-translate callback registers them before their definitions appear. */
+static void cb_mem(unsigned int vcpu, qemu_plugin_meminfo_t info,
+                   uint64_t vaddr, void *ud);
+static void cb_tb_exec(unsigned int vcpu, void *ud);
+static void cb_cr3_write(unsigned int vcpu, void *ud);
+static void cb_invlpg(unsigned int vcpu, void *ud);
+static void cb_simple(unsigned int vcpu, void *ud);
+
 static uint64_t now_us(void)
 {
     struct timeval tv; gettimeofday(&tv, NULL);
@@ -696,7 +715,7 @@ static void shadow_invalidate(unsigned vcpu, uint64_t vaddr)
 }
 
 /* ------------------------------------------------------------- callbacks */
-static void cb_mem(unsigned int vcpu, qemu_plugin_meminfo_t info,
+static void cb_mem_inner(unsigned int vcpu, qemu_plugin_meminfo_t info,
                    uint64_t vaddr, void *ud)
 {
     int is_st = qemu_plugin_mem_is_store(info);
@@ -788,7 +807,7 @@ static void cb_mem(unsigned int vcpu, qemu_plugin_meminfo_t info,
     }
 }
 
-static void cb_tb_exec(unsigned int vcpu, void *ud)
+static void cb_tb_exec_inner(unsigned int vcpu, void *ud)
 {
     uint64_t pc = (uint64_t)(uintptr_t)ud;
     touch(vcpu, pc, 0);
@@ -798,7 +817,7 @@ static void cb_tb_exec(unsigned int vcpu, void *ud)
     }
 }
 
-static void cb_cr3_write(unsigned int vcpu, void *ud)
+static void cb_cr3_write_inner(unsigned int vcpu, void *ud)
 {
     int reg = (int)(intptr_t)ud;
     uint64_t v = 0;
@@ -809,7 +828,7 @@ static void cb_cr3_write(unsigned int vcpu, void *ud)
     }
 }
 
-static void cb_invlpg(unsigned int vcpu, void *ud)
+static void cb_invlpg_inner(unsigned int vcpu, void *ud)
 {
     int reg = (int)(intptr_t)ud;
     uint64_t v = 0;
@@ -817,7 +836,7 @@ static void cb_invlpg(unsigned int vcpu, void *ud)
     if (reg >= 0 && read_gpr(vcpu, reg, &v)) { C.invlpg_addr_ok++; shadow_invalidate(vcpu, v); }
 }
 
-static void cb_simple(unsigned int vcpu, void *ud)
+static void cb_simple_inner(unsigned int vcpu, void *ud)
 {
     uint64_t *p = ud; (*p)++;
 }
@@ -826,7 +845,7 @@ static GHashTable *excep_by_pc;
 static struct qemu_plugin_register *rip_handle[MAX_VCPU];
 static int read_named(struct qemu_plugin_register *h, uint64_t *v);
 
-static void cb_discon(qemu_plugin_id_t id, unsigned int vcpu,
+static void cb_discon_inner(qemu_plugin_id_t id, unsigned int vcpu,
                       enum qemu_plugin_discon_type type,
                       uint64_t from_pc, uint64_t to_pc)
 {
@@ -1036,6 +1055,52 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
 static guint u64_hash(gconstpointer p) { return (guint)mix(*(const uint64_t *)p); }
 static gboolean u64_eq(gconstpointer a, gconstpointer b)
 { return *(const uint64_t *)a == *(const uint64_t *)b; }
+
+/* ---- locking wrappers: see plug_lock ---- */
+static void cb_mem(unsigned int vcpu, qemu_plugin_meminfo_t info,
+                   uint64_t vaddr, void *ud)
+{
+    g_mutex_lock(&plug_lock);
+    cb_mem_inner(vcpu, info, vaddr, ud);
+    g_mutex_unlock(&plug_lock);
+}
+
+static void cb_tb_exec(unsigned int vcpu, void *ud)
+{
+    g_mutex_lock(&plug_lock);
+    cb_tb_exec_inner(vcpu, ud);
+    g_mutex_unlock(&plug_lock);
+}
+
+static void cb_cr3_write(unsigned int vcpu, void *ud)
+{
+    g_mutex_lock(&plug_lock);
+    cb_cr3_write_inner(vcpu, ud);
+    g_mutex_unlock(&plug_lock);
+}
+
+static void cb_invlpg(unsigned int vcpu, void *ud)
+{
+    g_mutex_lock(&plug_lock);
+    cb_invlpg_inner(vcpu, ud);
+    g_mutex_unlock(&plug_lock);
+}
+
+static void cb_simple(unsigned int vcpu, void *ud)
+{
+    g_mutex_lock(&plug_lock);
+    cb_simple_inner(vcpu, ud);
+    g_mutex_unlock(&plug_lock);
+}
+
+static void cb_discon(qemu_plugin_id_t id, unsigned int vcpu,
+                      enum qemu_plugin_discon_type type,
+                      uint64_t from_pc, uint64_t to_pc)
+{
+    g_mutex_lock(&plug_lock);
+    cb_discon_inner(id, vcpu, type, from_pc, to_pc);
+    g_mutex_unlock(&plug_lock);
+}
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
                                            const qemu_info_t *info,

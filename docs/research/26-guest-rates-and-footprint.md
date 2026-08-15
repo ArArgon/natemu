@@ -22,11 +22,14 @@ decision, confirms another, and corrects a third.
 **Three limitations are individually capable of moving the headline by more than the headline
 itself.** They are stated first, not buried in a closing section:
 
-1. **Everything here is uniprocessor.** The plugin keeps global unlocked state and is valid only
-   at `-smp 1`, by construction. `19` measured TLBI broadcast at **441–961 ns with busy contenders
-   at 8 vCPUs** against the 203–285 ns single-core figure this document charges. The invalidation
-   term in §4 could therefore be **2–4× larger** on a real multi-core guest, taking Policy A on
-   `spawn400` from 10.4% to roughly 25–30%. `?`
+1. ~~Everything here is uniprocessor.~~ **CLOSED 2026-08-15 — see §10.** The `-smp 1`
+   restriction was not "global unlocked state" as the plugin's header claimed; it was the harness
+   forcing `-accel tcg,thread=single`, which corrupts the guest at `-smp > 1` under any nontrivial
+   plugin. With `thread=multi` and a coarse lock the plugin runs multi-core, and the answer is
+   **less bad than feared**: Policy A is 6.8–18.9% at 1–4 vCPUs, and 11.2–23.7% if every shadow
+   invalidation pays doc 19's 8-vCPU broadcast cost. The predicted 25–30% did not materialise.
+   **But a different limit did: the 256-ASID budget is exceeded at SMP** (520 live address spaces
+   on `spawn400` at 2 vCPUs against a budget of 256).
 2. **The guest never uses PCID.** `cr3w_noflush = 0` and `invpcid = 0` in **all five workloads**
    `M`. Linux has enabled PCID by default since 4.14, so every CR3 rate here comes from a
    configuration no shipping distribution runs. See §6 — this is also an unexplored design
@@ -320,6 +323,76 @@ cc -O2 -shared -fPIC -o bin/plugin_mmu.so plugin_mmu.c \
 
 Needs `probes/qemu_baseline/work/` (fetched by that probe's `build.sh`) and QEMU 11.0.3.
 Whole sweep is ~17 minutes on an M2 Max.
+
+## References
+
+`08` feasibility synthesis (the cost model this supplies rates for); `12` performance ranking;
+`15` QEMU TCG baseline (§8a's 54.5% softmmu share, and the 7-Zip workload reused here);
+`16` shadow-MMU costs (fill and TLBI costs, the never-TLBI-on-invalid→valid rule);
+`18` EL1 capability surface (§6.2 TLBI costs per variant, and §0.2's sampling caveat);
+`19` SMP scaling (the multi-core TLBI figures that make §0.1 item 1 the priority);
+`20` shadow-PT coherence (the document this corrects and confirms);
+`22` async interrupt injection (§1.1's translated-instruction cost, the denominator here);
+`23` FEXCore retrofit (§0.4's "the MMU half is available without touching the JIT").
+
+---
+
+## 10. Multi-core (added 2026-08-15)
+
+`M`, `-accel tcg,thread=multi`, coarse-locked plugin, `--pt 0` (the page-table walker is still
+single-root only, §8 item 8). All six runs reached 123 NATEMU markers, so all six guests are
+healthy — the check that invalidated an earlier attempt.
+
+| Run | vCPU | Ginsns | CR3 wr | `INVLPG` | fill A | fill B | B/A | shadow inval | **AS live** |
+|---|---|---|---|---|---|---|---|---|---|
+| boot | 1 | 1.21 | 20,009 | 39,812 | 164,732 | 1,005,732 | 6.11 | 40,218 | 26 |
+| boot | 2 | 1.27 | **456** | 39,866 | 181,303 | 310,585 | 1.71 | 39,866 | 45 |
+| boot | 4 | 1.64 | **668** | 40,055 | 184,184 | 433,756 | 2.36 | 40,055 | 37 |
+| spawn400 | 1 | 1.63 | 23,114 | 47,153 | 305,084 | 2,209,714 | 7.24 | 47,153 | 133 |
+| spawn400 | 2 | 1.80 | **2,673** | 47,550 | 642,821 | 1,514,882 | 2.36 | 47,550 | **520** |
+| spawn400 | 4 | 2.84 | **6,127** | 48,531 | 581,022 | 3,127,693 | 5.38 | 48,531 | **317** |
+
+### 10.1 Four findings
+
+**1. CR3 writes collapse 8–44× at SMP; `INVLPG` does not move at all.** Boot goes 20,009 → 456;
+`INVLPG` goes 39,812 → 40,055 (+0.6%). This reproduces `20`'s independent smp4 observation
+(cr3_w 20,009 → 460) on a healthy guest, so it is real guest behaviour: at one vCPU the single CPU
+must reload CR3 constantly to time-slice every runnable task, while at more vCPUs tasks run
+concurrently and idle CPUs sit in lazy-TLB mode. **Per-page invalidation work is unaffected by core
+count — only address-space switching is.**
+
+**2. Policy B's disadvantage largely evaporates.** B/A falls from 6.11 to 1.71–2.36 on boot and
+from 7.24 to 2.36–5.38 on spawn, because B's cost is driven by CR3 loads and those collapse.
+**§0.2's headline — that flushing on context switch doubles a build-like workload — is a
+uniprocessor result.** The recommendation does not change (A is still better everywhere) but the
+margin at one core is the worst case, not the typical one.
+
+**3. The feared multi-core blow-up did not happen.** Charging *every* shadow invalidation at doc
+19's 8-vCPU broadcast cost (700 ns, from its 441–961 ns band) instead of 244 ns:
+
+| Run | exec ms | fill ms | inval @1 core | **A %** | inval @broadcast | **A % broadcast** |
+|---|---|---|---|---|---|---|
+| boot ×1 | 308 | 16.4 | 9.8 | 8.5 | 28.2 | **14.5** |
+| boot ×4 | 415 | 18.6 | 9.8 | 6.8 | 28.0 | **11.2** |
+| spawn ×1 | 412 | 33.9 | 11.5 | 11.0 | 33.0 | **16.2** |
+| spawn ×2 | 457 | 74.9 | 11.6 | 18.9 | 33.3 | **23.7** |
+| spawn ×4 | 719 | 65.4 | 11.8 | 10.8 | 34.0 | **13.8** |
+
+§0.1 predicted 25–30% for spawn at SMP. The measured worst case is **23.7%**, and only at 2 vCPUs;
+at 4 it falls to 13.8% because instruction count grows faster than invalidation count. The
+prediction was pessimistic but the right order of magnitude.
+
+**4. The new binding constraint is the ASID budget, not time.** `spawn400` at 2 vCPUs peaks at
+**520 live address spaces against ARM's 256** (`ID_AA64MMFR0_EL1.ASIDBits = 0` → 8-bit ASID,
+confirmed from the G-1 probe). §5 reported peak 112 at one vCPU with 2.3× headroom and flagged that
+Policy C's eviction path was untested. **At SMP the budget is exceeded by 2×, so that path is now
+load-bearing and still untested.** This is the most important thing this section found.
+
+### 10.2 What is still not measured
+
+The page-table walker (`--pt 1`) remains single-root only and segfaults at `-smp ≥ 3`, so §2's
+PT-write traffic is uniprocessor-only. Fill and invalidation rates above are unaffected — they come
+from the shadow model, which is now multi-core correct.
 
 ## References
 
