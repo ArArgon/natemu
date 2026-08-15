@@ -271,6 +271,15 @@ static int enable_pt = 1, enable_shadow = 1;
  * the store handler. runmmu.py runs the guest with -m 3072, so 4 GiB is a safe cap;
  * it only has to be tight enough to reject most data values, not to be exact. */
 static int ram_mb = 4096;
+/* regs=0 disables every qemu_plugin_read_register() call. Bisect switch for the
+ * -smp > 1 guest corruption: with it off the plugin still counts instructions and
+ * memory but knows no CR3/INVLPG operand values. */
+static int enable_regs = 1;
+/* mem=0 skips registering the per-access memory callback entirely. That callback is
+ * the dominant slowdown, so this separates 'the plugin corrupts guest state at
+ * -smp > 1' from 'the plugin slows TCG enough that the guest breaks its own timing
+ * assumptions at -smp > 1'. */
+static int enable_mem = 1;
 
 static uint64_t now_us(void)
 {
@@ -358,6 +367,7 @@ static int read_named(struct qemu_plugin_register *h, uint64_t *v)
 }
 static int read_gpr(unsigned vcpu, int idx, uint64_t *v)
 {
+    if (!enable_regs) return 0;
     if (vcpu >= MAX_VCPU || idx < 0 || idx >= NGPR || !gpr_handle[vcpu][idx]) return 0;
     g_byte_array_set_size(regbuf, 0);
     if (!qemu_plugin_read_register(gpr_handle[vcpu][idx], regbuf)) return 0;
@@ -827,7 +837,8 @@ static void cb_discon(qemu_plugin_id_t id, unsigned int vcpu,
          * separated from every other exception -- QEMU does not hand the plugin
          * a vector number. */
         uint64_t rip = 0;
-        if (vcpu < MAX_VCPU && rip_handle[vcpu] && read_named(rip_handle[vcpu], &rip)) to_pc = rip;
+        if (enable_regs && vcpu < MAX_VCPU && rip_handle[vcpu] &&
+            read_named(rip_handle[vcpu], &rip)) to_pc = rip;
         /* bucket by handler PC: on x86-64 the IDT entry for #PF is a distinct
          * address, so this separates page faults from every other trap without
          * needing QEMU to tell us the vector number (it does not). */
@@ -882,8 +893,9 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
          * under-counts distinct (AS, page) pairs and is not used in any cost model. */
         set_add(&codepages, ((cur_cr3_v[0] >> 12) << 36) ^ (va >> 12));
 
-        qemu_plugin_register_vcpu_mem_cb(insn, cb_mem, QEMU_PLUGIN_CB_NO_REGS,
-                                         QEMU_PLUGIN_MEM_RW, NULL);
+        if (enable_mem)
+            qemu_plugin_register_vcpu_mem_cb(insn, cb_mem, QEMU_PLUGIN_CB_NO_REGS,
+                                             QEMU_PLUGIN_MEM_RW, NULL);
 
         char *d = qemu_plugin_insn_disas(insn);
         if (!d) continue;
@@ -895,7 +907,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             while (q > d && *q != '%') q--;
             int r = (*q == '%') ? parse_reg_at(q) : -1;
             qemu_plugin_register_vcpu_insn_exec_cb(insn, cb_cr3_write,
-                QEMU_PLUGIN_CB_R_REGS, (void *)(intptr_t)r);
+                enable_regs ? QEMU_PLUGIN_CB_R_REGS : QEMU_PLUGIN_CB_NO_REGS,
+                (void *)(intptr_t)r);
         } else if (strstr(d, "%cr3") != NULL) {
             qemu_plugin_register_vcpu_insn_exec_cb(insn, cb_simple,
                 QEMU_PLUGIN_CB_NO_REGS, &C.cr3_read);
@@ -903,7 +916,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             const char *q = strchr(d, '(');
             int r = q ? parse_reg_at(q + 1) : -1;
             qemu_plugin_register_vcpu_insn_exec_cb(insn, cb_invlpg,
-                QEMU_PLUGIN_CB_R_REGS, (void *)(intptr_t)r);
+                enable_regs ? QEMU_PLUGIN_CB_R_REGS : QEMU_PLUGIN_CB_NO_REGS,
+                (void *)(intptr_t)r);
         } else if (!strncmp(d, "invpcid", 7)) {
             qemu_plugin_register_vcpu_insn_exec_cb(insn, cb_simple,
                 QEMU_PLUGIN_CB_NO_REGS, &C.invpcid);
@@ -1031,6 +1045,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     for (int i = 0; i < argc; i++) {
         if (!strncmp(argv[i], "out=", 4)) path = argv[i] + 4;
         else if (!strncmp(argv[i], "pt=", 3)) enable_pt = atoi(argv[i] + 3);
+        else if (!strncmp(argv[i], "regs=", 5)) enable_regs = atoi(argv[i] + 5);
+        else if (!strncmp(argv[i], "mem=", 4)) enable_mem = atoi(argv[i] + 4);
         else if (!strncmp(argv[i], "shadow=", 7)) enable_shadow = atoi(argv[i] + 7);
         else if (!strncmp(argv[i], "snap_ms=", 8)) snap_every_us = atoll(argv[i] + 8) * 1000;
         else if (!strncmp(argv[i], "dbg=", 4)) dbg_max = atoi(argv[i] + 4);

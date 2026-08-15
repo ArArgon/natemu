@@ -37,6 +37,10 @@ def main():
                    help="page-table walker. MUST be 0 at --smp > 1: the refcounting is "
                         "not multi-root safe and segfaults (see doc 26 section 8 item 1).")
     p.add_argument("--shadow", type=int, default=1)
+    p.add_argument("--memcb", type=int, default=1,
+                   help="0 skips the per-access memory callback (SMP bisect)")
+    p.add_argument("--regs", type=int, default=1,
+                   help="0 disables all guest-register reads (bisect switch for SMP)")
     p.add_argument("--snap-ms", type=int, default=250)
     p.add_argument("--timeout", type=float, default=5400)
     p.add_argument("--no-plugin", action="store_true")
@@ -61,7 +65,7 @@ def main():
     if not a.no_plugin:
         cmd[1:1] = ["-plugin",
                     f"{HERE}/bin/plugin_mmu.so,out={snap},pt={a.pt},"
-                    f"shadow={a.shadow},snap_ms={a.snap_ms}"]
+                    f"shadow={a.shadow},regs={a.regs},mem={a.memcb},snap_ms={a.snap_ms}"]
 
     t_launch = time.time()
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
