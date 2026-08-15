@@ -39,11 +39,16 @@
 |---|---|---|
 | 26 | Guest fault/PT-write/CR3 **rates** — the missing half of every cost model | instrument in bring-up (`probes/qemu_baseline/plugin_mmu.c` + `runmmu.py`); `results/mmu/` holds debug runs, **no measurements yet** |
 
-**Two measurement caveats now standing corpus-wide** (both from `18 §0.2` / `22 §6`): absolute
-nanoseconds are **power-state dependent** — the same `pt_wp` binary reports 3.22 GHz on wall power
-and 2.01 GHz on battery — so record `pmset -g ps` alongside machine and OS, and compare ratios
-rather than raw ns across sessions. And the two-vCPU poll-contention probe is **noise-dominated**;
-its control arm swings 2.2× on an identical workload.
+**Two measurement caveats now standing corpus-wide** (`18 §0.2`, `22 §6`):
+
+1. **Core-clock-bound timings from `el1_features` carry ~2× run-to-run spread**, and power state,
+   QoS class and background load have all been **ruled out** as the cause (20 + 10 + 10 + 15 runs;
+   `probes/el1_features/results/clock-stability.txt`). An earlier version of `18 §0.2` blamed
+   battery-vs-wall-power; **that is withdrawn** — the battery readings sit inside the wall-power
+   distribution. Fabric-bound timings (`TLBI`) are stable to 1.09× across everything. Report
+   medians over n ≥ 10 with the range; read any single figure in `18 §4/§8/§9` as ±2×.
+2. The two-vCPU poll-contention probe is **noise-dominated**; its control arm swings 2.2× on an
+   identical workload, so `22`'s "the poll is free" holds only for an uncontended flag.
 
 `docs/research/raw/` holds **raw, unaudited** sub-agent reports rescued from agents that died
 mid-run. They are inputs to 20/21/23, not evidence — see `raw/README.md`.

@@ -37,6 +37,7 @@
 #include <inttypes.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -2385,6 +2386,11 @@ static void mode_exits(void) {
 // ------------------------------------------------------------------------------------------- //
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "all";
+
+    // Without this the vCPU lands on an E-core (~1.5 GHz) while pt_wp.c:1041 and
+    // irq_inject.c:984 ask for P-cores (~3.0 GHz), which made every absolute ns in
+    // doc 18 incomparable with docs 16/17/19/20/21.  See 18 section 0.2.
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 
     g_res = calloc(1, sizeof(res_t));
     g_mem = mmap(NULL, RAM_SIZE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);

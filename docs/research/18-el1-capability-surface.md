@@ -44,33 +44,64 @@ guest's vector never runs. Separately, `hv_vcpu_set_pending_interrupt` with `PST
 bare path; it is a host-side operation, which is what makes doc 22's GIC measurements the load-bearing
 ones.
 
-### 0.2 A corpus-wide caveat this session forced
+### 0.2 A measurement caveat — and a correction to the first version of this section
 
-Every absolute nanosecond in docs 16, 17, 19, 20 and 21 was taken with the host on **wall power**.
-This session ran on **battery at 67%**, and the same probes report a materially lower vCPU clock:
+**Raw output:** `probes/el1_features/results/clock-stability.txt`
 
-| Probe | Clock estimate, 2026-08-08 (wall power) | Clock estimate, 2026-08-15 (battery) |
+The first version of this document attributed a ~1.6× swing in this probe's absolute nanoseconds
+to **host power state** — battery versus wall power — on the strength of two `el1_features` runs
+that agreed with each other and one `pt_wp cal` run. **That attribution was wrong, and the
+investigation that refuted it is more useful than the claim it replaced.** Re-measured on wall
+power with proper sample counts:
+
+| Probe / condition | n | Clock estimate (GHz) |
 |---|---|---|
-| `pt_wp cal` (doc 20's own calibration) | 3.22 GHz `M` | **2.01 GHz** `M` |
-| `el1_features time`, run 1 | — | **2.20 GHz** `M` |
-| `el1_features time`, run 2 | — | **2.08 GHz** `M` |
+| `pt_wp cal`, **AC** | 20 | median **3.09**, range 2.68–3.33 (1.24×) |
+| `pt_wp cal`, **battery** | 1 | 2.01 |
+| `el1_features time`, **AC**, load avg 10.9 | 10 | 1.43 … 3.22 |
+| `el1_features time`, **AC**, load avg 2.4 | 10 | 1.16 … 1.67 |
+| `el1_features time`, **battery** | 2 | 2.20, 2.08 |
 
-That is a **~1.6× swing in the unit** every absolute figure in the corpus is quoted in, and it is
-not noise — the two `time` runs agree with each other, and `pt_wp` is the *same binary* that
-produced 3.22 GHz a week ago. Two consequences, stated plainly:
+**The battery readings sit inside and mostly above the wall-power distribution.** Power state does
+not explain the swing. Three further controls, all `M`:
 
-* **Ratios survive; absolute nanoseconds do not travel between sessions.** Every load-bearing
-  argument in 16/17/19/20/21 is a ratio (fill vs exit, trap-each vs resync, TLBI vs no TLBI), and
-  ratios measured within one session are unaffected.
-* **This document quotes cycles as the cross-document unit** wherever a comparison is made, and
-  labels its nanoseconds as battery-state. Corroborating evidence that this is a host power-state
-  effect and not a probe difference: the `HVC` round trip measures **1125 ns** here (§9) against
-  doc 02's **808 ns** — 1.39×, the same direction and rough magnitude as the clock ratio.
+* **QoS is not the cause.** `pt_wp.c:1041` and `irq_inject.c:984` both call
+  `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)`; `el1_features.c` did not. Adding
+  it (kept — it is correct either way) left the distribution unchanged: 1.16 … 1.67 GHz over 10 runs.
+* **Background load is not the cause.** The `el1_features` distribution is the same at load average
+  10.9 and 2.4.
+* **Forcing E-cores** (`taskpolicy -b`) reproduces the low readings for *both* probes (`pt_wp`
+  0.85–2.27, `el1_features` 0.85–2.33), which shows E-core placement *can* produce them but does
+  not establish that it does.
 
-**Action for the corpus:** `13 §D-4` already demands a one-machine caveat. It should be extended:
-absolute timings need the power state recorded alongside the machine and OS. No conclusion in
-14/16/17/19/20/21 is retracted by this — but a future session that re-runs a probe on battery and
-compares its raw nanoseconds against a wall-power number will conclude a regression that isn't there.
+**What is actually established:**
+
+1. **This probe's core-clock-bound timings carry ~2× run-to-run spread.** 15 paired samples on AC
+   at low load give `ISB` alone anywhere from **10.25 to 21.74 ns** and `DSB ISH` from **5.43 to
+   14.31 ns**, and the spread is **not** removed by converting to cycles (`ISB` 12.3–42.9 cyc) —
+   the calibration loop is as noisy as the thing it would normalise. A single-run nanosecond from
+   §4, §8 or §9 is good to about a factor of two, no better.
+2. **Fabric-bound timings are stable.** `TLBI VAAE1IS` measures **203.5 ns** on battery and
+   **206.2–225.1 ns** across 6 AC runs — a 1.09× spread spanning both power states. TLB and cache
+   maintenance costs in §6 are trustworthy; core-issue costs in §4 are not.
+3. **`pt_wp` is consistently tighter and higher than `el1_features`** (3.09 median, 1.24× spread vs
+   ~1.5 median, ~3× spread) across many batches. The cause is **not established** — QoS, load and
+   power state are all ruled out above. `?` UNRESOLVED.
+
+**Consequences, stated plainly.** Nothing in 14/16/17/19/20/21 is retracted: every load-bearing
+argument there is a ratio measured within one run, and §6's independent `TLBI` numbers land within
+1.1× of doc 20's across power states, which is the direct check. But **two claims in the first
+version of this document were wrong and are withdrawn**: that the swing is a power-state effect,
+and that doc 02's 808 ns versus this session's 1125 ns `HVC` corroborates it. Re-measured, `HVC` on
+AC is **1292–1458 ns** in `el1_features` (worse than the battery reading it was supposed to
+explain) and **913–1200 ns** in `irq_inject`. The two probes disagree in opposite directions; there
+is no clean power-state signal in either.
+
+**Action for the corpus:** `13 §D-4`'s one-machine caveat should be extended not to *power state*
+but to *sample count*. A core-clock-bound timing from this probe needs a median over n ≥ 10 with
+the range reported. Where a single figure appears in §4, §8 or §9 below, read it as ±2×; §5 and §6
+are firmer. This also removes the tidy explanation that was offered for the permission-fault
+discrepancy in §8 — see the revised item 4 in §11.
 
 ---
 
@@ -252,7 +283,9 @@ work at guest EL1 on this host.**
 
 ## 4. The in-guest clock
 
-`M`, `results/time.txt` + `results/time.run2.txt` (two runs, battery — see §0.2).
+`M`, `results/time.txt` + `results/time.run2.txt` (two runs, battery). **The two runs below agreed
+with each other, which is exactly what made the first version of §0.2 wrong — 15 later runs span
+1.05–3.24 GHz. Read every figure in this section as ±2×.**
 
 | Quantity | Run 1 | Run 2 |
 |---|---|---|
@@ -308,7 +341,7 @@ access, entirely in-guest with **zero host exits** (§9). As a *diagnostic* it i
 ### 5.2 Latency — and why doc 17's refutation holds
 
 Median of 41 rounds × 16,384 executions, loop floor subtracted, timed in-guest with `CNTVCT_EL0`
-so no host exit is inside the window. **Battery clock — see §0.2.**
+so no host exit is inside the window. **Single run; read as ±2× — see §0.2.**
 
 | Body | ns `D` | vs the LDR reference |
 |---|---|---|
@@ -372,7 +405,8 @@ hardware primitive here.
 ### 6.2 Latency
 
 Each body is `TLBI <op> ; DSB ISH ; ISB`, median of 41 rounds × 16,384, floor subtracted.
-**Battery clock — see §0.2.**
+**These are the firmest numbers in the document**: `TLBI VAAE1IS` reproduces to 1.09× across 7 runs
+spanning both power states (§0.2).
 
 | Body | ns `D` |
 |---|---|
@@ -454,7 +488,7 @@ implicitly assumed was there.
 
 `M`, `results/exc.txt`. N exceptions taken at EL1 into **our** `VBAR_EL1`, handled and returned
 from in-guest. "Host exits in window" counts `hv_vcpu_run` returns across all of them.
-**Battery clock — see §0.2.**
+**Single run; see the 5-run AC re-measurement below and §0.2.**
 
 | Exception | Cost `D` | Count | **Host exits** |
 |---|---|---|---|
@@ -474,17 +508,26 @@ host exit**. This is the property the entire two-tier fault design in doc 17 res
 now measured directly rather than inferred: a shadow-MMU miss can be serviced without HVF ever
 learning it happened.
 
-**A cross-probe discrepancy to record, not to paper over.** This section measures a permission
-fault at **104.91 ns**, while doc 20 item 4 measures "bare permission fault + `ERET`" at
-**25.3–27.3 ns** and doc 16 measures an in-VM fault at 28–95 ns. Adjusting for the ~1.6× clock
-difference (§0.2) closes some of the gap but not all of it: 104.91 ns here is ~65 ns at doc 20's
-clock, still 2.4× doc 20's floor. The likely reason is that the two probes measure different
-things — doc 20's item 4 is a *bare* fault-and-`ERET` with no handler body, and this probe's
-handler counts the exception and re-arms — but I have not isolated it. **`?` UNRESOLVED.** The
-closing experiment: run doc 20's `pt_wp` ladder and this probe's `exc` section back to back in one
-session so the clock is common, and diff the two handler bodies. Nothing in either document's
-conclusions turns on the absolute value — both argue from the ratio of fault cost to the 808–1125 ns
-host exit, and 105 ns is still 8–11× cheaper than an exit — but the corpus should not carry two
+**A cross-probe discrepancy to record, not to paper over — and the clock does not explain it.**
+This section's single battery run measured a permission fault at **104.91 ns**, while doc 20 item 4
+measures "bare permission fault + `ERET`" at **25.3–27.3 ns** and doc 16 measures an in-VM fault at
+28–95 ns. The first version of this document offered the clock difference as a partial explanation.
+**Re-measured on wall power with the QoS fix, over 5 runs, the gap does not close** `M`:
+
+| Exception | battery, n=1 | **AC, n=5 (range)** | doc 20 |
+|---|---|---|---|
+| `SVC #0` | 31.38 ns | **20.61 – 22.41** | — |
+| permission fault | 104.91 ns | **74.67 – 86.79** | **25.3 – 27.3** |
+| undefined instruction | 34.00 ns | **25.97 – 27.87** | — |
+
+Everything moves by ~1.3×, and the permission fault stays **~3× above doc 20's floor**. So this is
+a real difference in what the two probes measure, not a unit problem. **`?` UNRESOLVED.** The
+remaining hypothesis is the one the clock story was obscuring: doc 20's item 4 is a *bare*
+fault-and-`ERET` with no handler body, while this probe's handler counts the exception and re-arms,
+so the two are not the same event. Closing experiment: diff the two handler bodies instruction for
+instruction and add doc 20's bare form to this probe as a fourth row. Nothing in either document's
+conclusions turns on the absolute value — both argue from the ratio of fault cost to the ~900–1500 ns
+host exit, and even 105 ns is 9–14× cheaper than an exit — but the corpus should not carry two
 unreconciled numbers for the same event.
 
 The EL0→EL1 timeout is a probe bug, not a finding: 940 million in-guest exceptions against 1
@@ -536,13 +579,21 @@ without paying 1125 ns should use `WFE`+`SEV`, not `WFI`.
 ### 9.3 The exit itself
 
 `HVC` round trip (guest → host → guest), timed on the **host** across `hv_vcpu_run`:
-**median 1125 ns, p10 1000, p90 1292, min 917** `M`.
+**median 1125 ns, p10 1000, p90 1292, min 917** `M` (battery, n=1).
 
-Doc 02 §6.1 and doc 16 quote **808 ns** for the same measurement on wall power. The 1.39× ratio is
-consistent with the ~1.6× clock ratio in §0.2 and is the corroborating evidence that the swing is a
-host power-state effect rather than a probe difference. **The design number remains 808 ns**; 1125 ns
-is what it degrades to on battery, which is itself worth knowing for anyone benchmarking on a
-laptop that is not plugged in.
+Doc 02 §6.1 and doc 16 quote **808 ns** for the same measurement. The first version of this
+document read the difference as a power-state effect. **Re-measured on wall power, it is not** `M`:
+
+| Probe | battery | **AC (5 runs)** |
+|---|---|---|
+| `el1_features exits` | 1125 ns | **1292 – 1458 ns** (*slower* on AC) |
+| `irq_inject hvc` (`22 §5`) | 1487.6 ns | **913 – 1200 ns** (faster on AC) |
+
+The two probes move in **opposite directions**, so neither supports a power-state story; see §0.2.
+**The design number remains 808 ns** from doc 02, which measured it with the most samples and the
+tightest harness. Everything measured here is 1.1–1.8× that, and the honest reading is that this
+machine delivers an exit somewhere in the **0.8–1.5 µs** band depending on conditions nobody in
+this corpus has yet isolated.
 
 ---
 
@@ -550,13 +601,13 @@ laptop that is not plugged in.
 
 | Document | Claim | Effect of this document |
 |---|---|---|
-| `02` | 808 ns exit floor | **Confirmed in shape, 1125 ns on battery.** Adds §0.2's power-state caveat |
+| `02` | 808 ns exit floor | **Confirmed in shape**, but this probe measures 1125–1458 ns and `22 §5` measures 913–1488 ns for the same event. Doc 02's 808 ns remains the design number; the honest band on this machine is 0.8–1.5 µs (§9.3) |
 | `10` | vtimer → `TSC_DEADLINE`, exit-budget 1.2M/sec/core | **Constrained.** On the bare path a vtimer expiry is *always* a host exit; there is no in-guest delivery fallback (§7). Strengthens the case for the GICv3 path |
 | `12` | Perf ranking, rank 8 "A/D + TLB" | `TLBI` costs now measured per variant (§6.2); `ASIDE1` at 167.5 ns is the cheapest lever |
 | `14` | `ACTLR_EL1.EnTSO` writable at guest EL1 | **Confirmed on the register surface**: not trapped, round-trips, survives a host exit (§1.3) |
 | `16`, `20` | Shadow-MMU costs, "never TLBI on invalid→valid" | **Mechanism confirmed native** (§9): zero exits for `TLBI`, `AT`, `MSR TTBR0_EL1`. §6.2 shows the barriers are only ~22 ns of ~200 ns, so the rule is about the `TLBI` itself |
 | `17` | `AT` probe-then-execute refuted at 24–55× a store | **Independently corroborated** at 386× a load (§5.2) |
-| `20` | `TLBI VAAE1IS` at 279–285 ns; closing `VMALLE1IS` costs ~230–270 ns | Corroborated at 203 ns / 294 ns on battery (§6.2) |
+| `20` | `TLBI VAAE1IS` at 279–285 ns; closing `VMALLE1IS` costs ~230–270 ns | Corroborated at 203–225 ns / 294 ns, reproducing to 1.09× across 7 runs and both power states (§6.2). The residual 1.3× against doc 20 is real and unexplained |
 | `21` | SMC maintenance path; `IC IVAU`/`IALLU` native | **Confirmed with an explicit exit count of 0**, including `IC IALLUIS` (§9.1) |
 | `23` | FEXCore's backend emits `RNDR` among EL0-legal registers | **`RNDR` is absent on this host** (§3.2). A FEXCore-derived JIT must not emit it |
 | `24` | SMEP/SMAP → PAN/XN mapping | `PAN` and `UAO` confirmed settable from guest EL1 (§3.1) |
@@ -570,10 +621,10 @@ laptop that is not plugged in.
 | 1 | `TCR_EL1.EPD0` scored `?` although the evidence says it applies (§2.1) | Relocate payload + vectors into the TTBR1 half (`T0SZ=T1SZ=17`, proven in `20` item 16), then set `EPD0=1` and read a TTBR0 VA. Expect a **data** abort, `DFSC` level 0, execution continuing |
 | 2 | **LSE2 unaligned access faults despite `AT=1`** (§3.3) | Dump the leaf `AttrIndx` for the address under test; re-run with an explicitly Normal-WB attr and with `SCTLR_EL1.A` explicitly cleared in the same window |
 | 3 | Host-injected IRQ never delivered (§7) | Re-assert `hv_vcpu_set_pending_interrupt` immediately before each `hv_vcpu_run` re-entry; compare against doc 22's GICv3 path |
-| 4 | Permission fault 104.91 ns here vs 25.3–27.3 ns in `20` (§8) | Run `pt_wp`'s ladder and this probe's `exc` section back to back in one session; diff the handler bodies |
+| 4 | **Permission fault ~3× doc 20's floor, and the clock does not explain it** (§8). Re-measured on AC over 5 runs: 74.67–86.79 ns vs doc 20's 25.3–27.3 | Diff the two handler bodies instruction for instruction; add doc 20's *bare* fault-and-`ERET` form to this probe as a fourth row so the same binary measures both |
 | 5 | EL0 `TPIDRRO_EL0` write: undef in one run, EL2 trap in the next (§2.2) | Repeat n≥20; if genuinely bimodal, find what differs between the two paths |
 | 6 | EL0→EL1 transition test times out (§8) | Probe bug — the handler never clears the fault condition. Fix the handler, then measure |
-| 7 | **Absolute timings are power-state dependent** (§0.2) | Re-run `time`, `tlbi`, `at`, `exc`, `exits` on wall power and record both columns. This is the highest-value item here: it recalibrates the unit five other documents are written in |
+| 7 | ~~Absolute timings are power-state dependent~~ — **refuted and replaced** (§0.2). This probe's core-clock-bound timings carry ~2× run-to-run spread that power state, QoS and background load all fail to explain; `pt_wp` is consistently tighter and higher and nobody knows why | Instrument the probe to report the core it ran on (`MPIDR_EL1` on the host side, or `sysctlbyname("hw.perflevel*")` accounting around the run) so placement stops being a hidden variable. Until then, report medians over n ≥ 10 with the range |
 
 ---
 
