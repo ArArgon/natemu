@@ -124,7 +124,11 @@ the investigation's dominant method/context must never substitute for it.
 
 ## Newly surfaced questions
 
-- Backlog IDs created, or exact statement: `no new issues found`
+Consolidated roll-up only: aggregate the breadth-pass and later-stage
+discovery entries already recorded above; record new discoveries there, not
+here.
+
+- All backlog IDs from the entries above, or exact statement: `no new issues found`
 
 ## Limitations
 
@@ -132,18 +136,13 @@ the investigation's dominant method/context must never substitute for it.
 
 ## Applicable gates and review links
 
-Record every row. `not-applicable` requires an explicit reason. Preserve
-evidence-type applicability: question applies to every question; source to
-Source-backed claims; method, harness, and result to experiments; replication
-to load-bearing Observed findings; adversarial to every load-bearing candidate
-finding; synthesis to the final decision packet only.
+Record every row. `not-applicable` requires an explicit reason. Gate
+applicability by evidence type and the rule for when an applicable gate passes
+are defined normatively in the
+[evidence policy](../evidence-policy.md#gate-completion). The Verdict(s) cell
+records every required review's verdict, with the gate-closing verdict last.
 
-An applicable gate passes only when all required reviews have verdict `accept`,
-required independence is met, and all required changes are closed. Otherwise
-its status is not passed. A synthesis review is not an individual-finding
-prerequisite.
-
-| Gate | Applicable? | NA reason | Review ID(s) | Independence required/met | Verdict | Unresolved changes | Status |
+| Gate | Applicable? | NA reason | Review ID(s) | Independence required/met | Verdict(s) | Unresolved changes | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | question |  |  |  |  |  |  |  |
 | source |  |  |  |  |  |  |  |

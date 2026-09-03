@@ -42,7 +42,7 @@ research authorization. Do not treat the placeholders as an entry.
 
 | Identifier | Question | Why it matters | Dependencies | Downstream decisions | Applicability dimensions | Resolution method | Evidence status | Review status | Newly surfaced questions — breadth pass | Newly surfaced questions — source/method/execution/result work |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `<Q-ID>` | `<question>` | `<decision relevance>` | `<dependencies or none>` | `<decisions affected>` | `<host / OS / guest / CPU / topology / workload>` | `<primary-source analysis, controlled experiment, prototype spike, comparative audit, or other actual method>` | `<unstarted / claim labels and links>` | `<required gate and verdict>` | `<IDs, or no new issues found>` | `<stage and IDs, or no new issues found>` |
+| `<Q-ID>` | `<question>` | `<decision relevance>` | `<dependencies or none>` | `<decisions affected>` | `<host / OS / guest / CPU / topology / workload>` | `<primary-source analysis, controlled experiment, prototype spike, comparative audit, or other actual method>` | `<unstarted / claim labels and links>` | `<latest applicable gate and verdict, or pending gate>` | `<IDs, or no new issues found>` | `<stage and IDs, or no new issues found>` |
 
 ## Breadth-pass rule
 

@@ -20,19 +20,16 @@ review, finding, verdict, or gate completion.
 
 ## Gate completion, applicability, and independence
 
-Apply the question gate to every question; source to Source-backed claims;
-method, harness, and result to experiments; replication to load-bearing
-Observed findings; adversarial to every load-bearing candidate finding; and
-synthesis to the final decision packet. If a gate is `not-applicable`, the
-entry must state why. A self-review is required for every applicable gate, but
+Gate applicability by evidence type and the completion rule — an applicable
+gate passes only when all required reviews have verdict `accept`, required
+independence is met, and every required change is closed — are defined
+normatively in the [evidence policy](evidence-policy.md#gate-completion).
+
+This ledger adds the recording mechanics. A missing applicable entry means the
+corresponding gate has not passed. `not-applicable` is a verdict only with an
+explicit reason; it cannot stand in for an omitted review. A `not-applicable`
+gate is recorded directly in this ledger with its reason; no critique document
+is produced for it. A self-review is required for every applicable gate, but
 does not replace an independent review where policy requires one. An
 independent reviewer is a different author working in a separately recorded
 review context, able to challenge both evidence and method.
-
-For every investigation, all eight gate types must be explicitly recorded as
-applicable or `not-applicable` with a reason; a missing applicable gate is not
-passed. An applicable gate passes only when all required reviews have verdict
-`accept`, all required independent review is met, and every required change is
-closed. A review may not record `accept` when its required changes remain open
-or its required independence is unmet. `not-applicable` is a verdict only with
-an explicit reason; it cannot stand in for an omitted review.

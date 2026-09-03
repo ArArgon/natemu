@@ -7,20 +7,15 @@ the workflow. Any execution is conditional on separate research authorization.
 
 When separately authorized, use this sequence as the superset workflow. Apply
 only the conditional gates required by the evidence being considered; an
-inapplicable gate must be recorded as `not applicable` with its reason, never
+inapplicable gate must be recorded as `not-applicable` with its reason, never
 silently skipped:
 
 Select question → breadth pass → question gate → source gate → method proposal → method gate → harness implementation → harness gate → collect raw data → result gate → independent replication → adversarial critique (adversarial gate) → synthesis gate.
 
 The gate names are question, source, method, harness, result, replication,
-adversarial, and synthesis.
-
-- Apply the question gate to every question.
-- Apply the source gate to Source-backed claims.
-- Apply the method, harness, and result gates to experiments.
-- Apply the replication gate to load-bearing Observed findings.
-- Apply the adversarial gate to every load-bearing candidate finding.
-- Apply the synthesis gate only to the final decision packet.
+adversarial, and synthesis. Which gates apply to which evidence, and when an
+applicable gate passes, are defined normatively in the
+[evidence policy](evidence-policy.md#gate-completion).
 
 The breadth pass must cover product assumptions, adjacent systems, negative and
 boundary cases, host/guest matrices, multicore interactions, alternatives,
