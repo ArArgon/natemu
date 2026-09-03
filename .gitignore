@@ -28,3 +28,9 @@ probes/guest_rates/work/
 # Oracle probe: built test binaries + initramfs (regenerate with run_flagtorture.sh)
 probes/oracle/work/
 probes/oracle/*.so
+
+# Research outputs are external artifacts, not repository content
+artifacts/
+results/
+downloads/
+scratch/
