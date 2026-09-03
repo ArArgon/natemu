@@ -16,6 +16,7 @@ probes/**/results/
 
 # Tool scratch
 .playwright-mcp/
+.worktrees/
 
 # QEMU baseline: downloaded guest images / kernels (1.8 GB, re-fetch with build.sh)
 probes/qemu_baseline/work/
