@@ -10,8 +10,10 @@ and follows the [research governance](../README.md), the
 
 ## Comparison dimensions
 
-Each surviving option must be evaluated on every dimension below. Each
-dimension becomes questions in the
+A surviving option is an architecture family that Feasibility did not kill
+and whose rejection this track has not accepted; "option" here and in the
+later tracks means such a family. Every surviving option must be evaluated
+on every dimension below. Each dimension becomes questions in the
 [question backlog](../question-backlog.md), resolved with labelled evidence
 through the applicable gates (see
 [gate completion](../evidence-policy.md#gate-completion)):

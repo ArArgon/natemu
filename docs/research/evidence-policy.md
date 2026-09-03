@@ -15,6 +15,9 @@ organization work does not collect, assess, or promote evidence.
   Observed evidence; the reasoning and uncertainty are explicit.
 - **Hypothesis** — a testable proposition that has not yet been established.
 
+For inheritance and comparison, the labels are ordered by decreasing
+confidence: Source-backed, then Observed, then Inferred, then Hypothesis.
+
 Every substantive claim must carry one of these labels. Unlabelled claims are
 not evidence and cannot support a decision. Each Source-backed claim requires a
 claim-level citation, including source version and applicability to the defined

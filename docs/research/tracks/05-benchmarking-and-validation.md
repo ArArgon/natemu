@@ -1,7 +1,10 @@
 # Benchmarking and validation
 
 This track is a roadmap only. It defines how separately authorized research
-must measure the surviving options against the fair baselines defined by
+must measure the surviving options carried forward by
+[Architecture options](03-architecture-options.md) — the same set
+[Performance estimation](04-performance-estimation.md) estimates — against
+the fair baselines defined by
 [Scope and success](00-scope-and-success.md), QEMU TCG required among them;
 it records no findings and no results. Work on this track runs only under
 separate research authorization and follows the
@@ -11,8 +14,13 @@ separate research authorization and follows the
 
 ## Measurement progression
 
-Measurement proceeds in order; a later stage may not start before the
-earlier stage's evidence for the same mechanism is accepted. Each stage
+Measurement proceeds in order, and each stage unlocks the next: a mechanism
+may be microbenchmarked only after its capability check is accepted; a
+subsystem benchmark may start only with accepted microbenchmark evidence for
+every mechanism the subsystem combines; an integrated spike only when every
+subsystem it spans has accepted subsystem evidence; and an end-to-end
+workload only when every mechanism the measured configuration exercises has
+accepted evidence at all prior stages. Each stage
 becomes questions in the [question backlog](../question-backlog.md),
 resolved with labelled evidence through the applicable gates (see
 [gate completion](../evidence-policy.md#gate-completion)):
@@ -32,8 +40,9 @@ resolved with labelled evidence through the applicable gates (see
 
 ## Required coverage
 
-Every reported comparison must cover: at least two host machines and at
-least two guest configurations from the supported envelope; a vCPU ladder of
+Every reported comparison must cover: at least two host machines spanning at
+least two Apple Silicon generations, and at least two guest configurations
+from the supported envelope; a vCPU ladder of
 1, 2, 4, and 8+ vCPUs; and workload classes spanning compute, memory,
 fault- and syscall-heavy, I/O, and concurrency-dominated behavior, so no
 single benchmark-shaped workload carries a conclusion.

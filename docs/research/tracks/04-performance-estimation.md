@@ -1,11 +1,14 @@
 # Performance estimation
 
 This track is a roadmap only. It defines how separately authorized research
-must estimate, before full measurement, whether any surviving option can
-plausibly meet the "materially better" definition from
-[Scope and success](00-scope-and-success.md); it records no findings and no
-performance claims. Work on this track runs only under separate research
-authorization and follows the [research governance](../README.md), the
+must estimate, before full measurement, whether the surviving options
+carried forward by [Architecture options](03-architecture-options.md) — its
+recommendation, plus any family whose rejection a recorded falsifier has
+reopened — can plausibly meet the "materially better" definition from
+[Scope and success](00-scope-and-success.md); the track estimates only that
+set, and it records no findings and no performance claims. Work on this
+track runs only under separate research authorization and follows the
+[research governance](../README.md), the
 [evidence policy](../evidence-policy.md), and the
 [executor guide](../executor-guide.md).
 
@@ -14,27 +17,32 @@ authorization and follows the [research governance](../README.md), the
 Every estimate produced under this track must be a range with an explicit
 sensitivity analysis over its inputs, never a point claim. Each input carries
 its evidence label, and the estimate inherits the weakest label among its
-load-bearing inputs. Combining estimates must not multiply
-overlapping speedups: cost components that share a mechanism, a bottleneck,
-or a workload phase may not be composed as if independent, and every
-composition must state its independence argument. Estimates from
+load-bearing inputs, per the label ordering declared in the
+[evidence policy](../evidence-policy.md). Combining estimates must not
+multiply overlapping speedups: cost components that share a mechanism, a
+bottleneck, or a workload phase may not be composed as if independent, and
+every composition must state its independence argument. Estimates from
 configurations whose correctness status is unresolved cannot support
 conclusions, per the precondition in
 [Correctness](02-correctness.md).
 
 ## Cost components
 
-The track must model each component separately before any composition. Each
-component becomes questions in the
+The track must model each component separately, for each option under
+estimation, before any composition. A component an option family cannot
+exhibit is recorded `not-applicable` with a reason rather than silently
+skipped, so the component set favors no family in advance. Each component
+becomes questions in the
 [question backlog](../question-backlog.md), resolved with labelled evidence
 through the applicable gates (see
 [gate completion](../evidence-policy.md#gate-completion)):
 
-- **Translation.** The steady-state cost of executing translated guest code.
+- **Translated execution.** The steady-state cost of executing translated
+  guest code.
 - **Compilation.** The cost of producing translations, including warm-up and
   retranslation.
-- **Memory.** Guest memory access costs, including any softened or assisted
-  address translation.
+- **Memory.** Guest memory access costs, including any software-implemented
+  or hardware-assisted address translation.
 - **Faults and exceptions.** The cost of detecting, classifying, and
   delivering guest faults restartably.
 - **Exits.** The cost of leaving and re-entering guest execution for any
