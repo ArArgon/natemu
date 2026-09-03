@@ -27,7 +27,8 @@ applicable gates (see [gate completion](../evidence-policy.md#gate-completion)):
 - **Paging.** Page-table walks, permission checks, accessed/dirty behavior,
   invalidation semantics, and self-modifying or newly mapped code.
 - **Atomics and memory ordering.** Guest atomic operations and the guest
-  memory model as observed by multiple vCPUs on a host with a weaker model.
+  memory model as observed by multiple vCPUs on a host whose memory model
+  may differ from the guest's.
 - **Interrupts and timers.** Interrupt controller behavior, masking,
   priority, inter-processor interrupts, and timer semantics the guest kernel
   depends on for scheduling and timekeeping.

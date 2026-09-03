@@ -14,7 +14,9 @@ The starting envelope, subject to revision by this track's own outcomes:
   least two supported macOS releases;
 - unmodified modern x86-64 Linux guests with direct boot;
 - SMP as a baseline, not an extension; and
-- a minimal headless device set.
+- a minimal headless device set — timer/APIC, serial, block, network,
+  entropy, and shutdown, as enumerated in the
+  [research governance](../README.md).
 
 This envelope is an input to be questioned, not a settled scope. Every
 narrowing or widening must be recorded as a question in the
@@ -23,7 +25,8 @@ gates (see [gate completion](../evidence-policy.md#gate-completion)).
 
 ## Required definitions
 
-The track must produce, with evidence labels and review where applicable:
+The track must produce, with evidence labels, and with review where
+applicable:
 
 - **Users and workloads.** Who the emulator is for and which concrete,
   diverse workloads represent them. A single benchmark-shaped workload does
@@ -34,6 +37,9 @@ The track must produce, with evidence labels and review where applicable:
 - **Fair baselines.** Which existing systems the project is compared against,
   in which configurations, and what makes a comparison fair: same guest,
   same workload, same host conditions, tuning effort disclosed on both sides.
+  QEMU TCG is a required baseline, fixed by the decision question in the
+  [research governance](../README.md); the track selects any additional
+  baselines.
 - **Measurable "materially better."** A quantitative definition of what
   materially better than the baselines means — metrics, magnitudes,
   workloads, and confidence — agreed before any performance evidence is
@@ -42,12 +48,12 @@ The track must produce, with evidence labels and review where applicable:
   including deferred platforms, device classes, and security objectives
   beyond isolation and crash containment.
 - **Stop conditions.** Concrete, checkable conditions under which the honest
-  synthesis outcome is stop rather than continue, stated before feasibility
-  or performance work begins.
+  synthesis outcome is stop rather than continue targeted research or
+  authorize planning, stated before feasibility or performance work begins.
 
 ## Exit criteria
 
 The track is complete when each required definition above has an accepted,
-independently reviewed resolution, a recorded end-of-track breadth pass, and
-every surfaced question is filed in the question backlog. Downstream tracks
+independently reviewed resolution, the end-of-track breadth pass is recorded,
+and every surfaced question is filed in the question backlog. Downstream tracks
 inherit this scope; they may not silently widen or narrow it.
