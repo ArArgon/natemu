@@ -36,7 +36,7 @@ The preservation checkpoint retains the old documentation and source code withou
 
 Every future claim must have one of these labels:
 
-- **Source-backed:** directly supported by a primary specification, official API documentation, upstream source at a recorded revision, or a peer-reviewed paper.
+- **Source-backed:** directly supported by a primary specification, official documentation, versioned upstream source, or a peer-reviewed paper. Secondary sources may locate evidence but cannot carry load-bearing claims.
 - **Observed:** produced by a reproducible experiment with its code, environment manifest, raw output, and analysis recorded together.
 - **Inferred:** derived from source-backed or observed inputs with the derivation shown.
 - **Hypothesis:** plausible but unverified; paired with a falsifiable question and acceptance criteria.
@@ -48,8 +48,8 @@ Unlabelled claims are not admissible. Results from the preservation checkpoint m
 Natemu has three distinct phases:
 
 1. **Research:** establish scope, source-backed constraints, feasibility, correctness requirements, candidate architectures, performance models, and validated observations. This cleanup creates the research workspace only.
-2. **Planning:** convert reviewed research findings into an implementation specification, milestones, dependencies, and acceptance tests. Planning begins only after the research exit gate passes and will live under `docs/planning/`.
-3. **Implementation:** build and test the selected system under normal source and test directories, with implementation documentation under `docs/implementation/` when needed.
+2. **Planning:** convert reviewed research findings into an implementation specification, milestones, dependencies, and acceptance tests. Planning begins only after research authorizes planning and will live under `docs/planning/`.
+3. **Implementation:** build and test the selected system under normal source and test directories, with implementation documentation under `docs/implementation/` when needed. It begins only after research authorizes planning, planning is completed and approved, and implementation is separately authorized.
 
 Research notes must not masquerade as an implementation plan. Candidate designs remain alternatives until a reviewed research decision promotes one. The planning and implementation directories will not be created as empty placeholders during this cleanup.
 
@@ -64,7 +64,7 @@ The research phase exists to answer one decision:
 The initial product envelope is:
 
 - Apple Silicon hosts using public macOS APIs;
-- at least two silicon generations and two supported macOS releases;
+- at least two silicon generations and at least two supported macOS releases;
 - unmodified, modern x86-64 Linux guests;
 - direct kernel boot for the initial validation target;
 - SMP as a baseline requirement rather than a later extension;
@@ -201,8 +201,8 @@ Research items advance through explicit gates. A review records reviewer identit
 4. **Harness gate:** Review experiment code and configuration independently before collecting evidence. Validate the harness against known behavior, include negative and fault-injection controls, and check that instrumentation does not erase the phenomenon under study.
 5. **Result gate:** Audit raw-data completeness, provenance, statistical treatment, anomalous runs, alternative explanations, and agreement between the recorded method and the executed method. Correctness failures invalidate performance samples.
 6. **Replication gate:** Repeat load-bearing observations on an independently prepared harness and, when the claim is platform-sensitive, across the declared machine and OS matrix. A single-machine observation remains `Observed` with a narrow applicability statement; it cannot close a platform-wide gate.
-7. **Adversarial critique gate:** Assign an independent reviewer to construct the strongest counterargument, search for missing interactions and circular reasoning, and attempt to falsify the conclusion. The author responds with evidence or downgrades the claim.
-8. **Synthesis gate:** Before a finding affects architecture or planning, scan dependencies and the rest of the research corpus for contradictions. A new contradiction reopens the finding and every dependent decision.
+7. **Adversarial gate:** Assign an independent reviewer to construct the strongest counterargument, search for missing interactions and circular reasoning, and attempt to falsify the conclusion. The author responds with evidence or downgrades the claim.
+8. **Synthesis gate:** Eligible reviewed findings enter candidate synthesis according to their applicable gates: every question uses question; Source-backed evidence uses source; experiments use method, harness, and result; load-bearing Observed findings also use replication; and every load-bearing candidate finding uses adversarial review. The synthesis gate then approves, revises, or rejects the final decision packet. It is not an individual-finding prerequisite. A new contradiction reopens the finding and every dependent decision.
 
 Self-review is required at every gate but is not sufficient for load-bearing findings. No author or single agent session may approve its own method, harness, result, replication, and adversarial gates. Reviews should be small and frequent; a late omnibus audit is not a substitute.
 

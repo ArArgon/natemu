@@ -5,8 +5,10 @@ organization work does not collect, assess, or promote evidence.
 
 ## Evidence labels
 
-- **Source-backed** — a claim directly supported by an identified source, with
-  the relevant version, scope, and applicability recorded.
+- **Source-backed** — a claim directly supported by a primary specification,
+  official documentation, versioned upstream source, or peer-reviewed paper,
+  with the relevant version, scope, and applicability recorded. Secondary
+  sources may locate evidence but cannot carry load-bearing claims.
 - **Observed** — a result produced by an approved harness and method, with its
   raw-data manifest, environment, and limitations recorded.
 - **Inferred** — a reasoned conclusion from identified Source-backed and/or
@@ -25,11 +27,17 @@ it is not accepted evidence.
 
 ## Promotion and challenge
 
-If separately authorized research produces a candidate finding, it may influence
-synthesis only after accepted question, source, method, harness, result,
-replication, adversarial, and synthesis reviews. A contradiction reopens the
-finding and every dependent decision until the contradiction is resolved or the
-claim is withdrawn.
+The applicable gates depend on the evidence type. Every question requires the
+question gate. Source-backed evidence requires the source gate. An experiment
+requires the method, harness, and result gates. A load-bearing Observed finding
+also requires independent replication. Every load-bearing candidate finding
+requires adversarial review.
+
+Eligible reviewed findings may enter candidate synthesis. The synthesis gate
+then approves, revises, or rejects the final decision packet; it is not an
+individual-finding prerequisite. A contradiction reopens the finding and every
+dependent decision until the contradiction is resolved or the claim is
+withdrawn.
 
 No policy label converts a future action into authorization. Browsing, source
 acquisition, harness work, data collection, or synthesis remains conditional on

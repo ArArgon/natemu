@@ -25,7 +25,7 @@ Expected: non-zero exit because neither file exists.
 
 - [ ] **Step 2: Create the root documents**
 
-`README.md` must identify natemu as an unvalidated research project, state the decision question, link `docs/research/README.md`, explain the research → planning → implementation lifecycle, and point to `a121702` for untrusted historical material.
+`README.md` must identify natemu as an unvalidated research project, state the decision question, link `docs/research/README.md`, explain the research → planning → implementation lifecycle, require research authorization before planning, and require completed and approved planning plus separate implementation authorization before implementation begins. It must point to `a121702` for untrusted historical material.
 
 `AGENTS.md` must require executors to read the research policy, reject inherited probes and results as evidence, perform breadth passes, add discovered gaps, use primary sources, pass method and harness reviews before experiments, reject incorrect performance samples, obtain independent review for load-bearing findings, keep raw data outside Git, and treat SMP and platform dimensions explicitly.
 
@@ -77,14 +77,14 @@ Expected: old numbered reports and raw dossiers are staged for deletion.
 
 - [ ] **Step 2: Create the research index**
 
-The index must state the decision question and product envelope, warn that nothing inherited is verified, link the evidence policy and executor guide, link all ledgers and templates, list the seven tracks in order, list the eight review gates, and define the three synthesis outcomes: stop, continue research, or authorize planning.
+The index must state the decision question and product envelope, warn that nothing inherited is verified, link the evidence policy and executor guide, link all ledgers and templates, list these seven tracks in order — `00-scope-and-success`, `01-feasibility`, `02-correctness`, `03-architecture-options`, `04-performance-estimation`, `05-benchmarking-and-validation`, and `06-research-synthesis` — list the eight review gates, and define the three synthesis outcomes: stop, continue research, or authorize planning.
 
 - [ ] **Step 3: Create the evidence policy**
 
-Define `Source-backed`, `Observed`, `Inferred`, and `Hypothesis`. Prohibit unlabelled claims. Require claim-level sources, applicability statements, external immutable raw artifacts, and this promotion rule:
+Define `Source-backed`, `Observed`, `Inferred`, and `Hypothesis`. Restrict Source-backed evidence to primary specifications, official documentation, versioned upstream source, or peer-reviewed papers; secondary sources may locate evidence but cannot carry load-bearing claims. Prohibit unlabelled claims and require claim-level sources, applicability statements, and external immutable raw artifacts. Define applicable gates without making synthesis an individual-finding prerequisite:
 
 ```text
-A load-bearing finding may influence synthesis only after accepted question, source, method, harness, result, replication, adversarial, and synthesis reviews. A contradiction reopens the finding and dependent decisions.
+All questions use the question gate. Source-backed evidence uses the source gate. Experiments use method, harness, and result gates. Load-bearing observed findings use independent replication, and all load-bearing candidate findings use adversarial review. Eligible reviewed findings may enter candidate synthesis. The synthesis gate approves, revises, or rejects the final decision packet. A contradiction reopens the finding and dependent decisions.
 ```
 
 - [ ] **Step 4: Create the executor guide**
@@ -92,10 +92,10 @@ A load-bearing finding may influence synthesis only after accepted question, sou
 Define this workflow:
 
 ```text
-Select question → breadth pass → question gate → source review → method proposal → method gate → harness implementation → harness gate → collect raw data → result review → independent replication → adversarial critique → synthesis review
+Select question → breadth pass → question gate → source gate → method proposal → method gate → harness implementation → harness gate → collect raw data → result gate → independent replication → adversarial critique → synthesis gate
 ```
 
-Require breadth checks for product assumptions, adjacent systems, negative cases, boundaries, host and guest matrices, multicore interactions, alternatives, falsifiers, and harness failure modes. Require a second end-of-track pass from product, architecture, correctness, and methodology perspectives.
+Require an auditable breadth record and question-backlog updates, including `no new issues found` when true. Cover product assumptions, adjacent systems, negative cases, boundaries, host and guest matrices, multicore interactions, alternatives, falsifiers, and harness failure modes. Require and record a second end-of-track breadth pass from product, architecture, correctness, and methodology perspectives. Replication independently prepares and reviews its harness; platform-wide claims declare their platform matrix.
 
 - [ ] **Step 5: Validate and commit**
 
@@ -159,7 +159,7 @@ Expected: all checks pass and the commit succeeds.
 
 - [ ] **Step 1: Define scope and success**
 
-Use the initial target: public macOS APIs, unmodified modern x86-64 Linux, direct boot, SMP, minimal headless devices, at least two silicon generations and two supported macOS releases. Require user/workload definition, compatibility boundary, fair baselines, measurable “materially better,” non-goals, and stop conditions.
+Use the initial target: public macOS APIs, unmodified modern x86-64 Linux, direct boot, SMP, minimal headless devices, at least two silicon generations and at least two supported macOS releases. Require user/workload definition, compatibility boundary, fair baselines, measurable “materially better,” non-goals, and stop conditions.
 
 - [ ] **Step 2: Define feasibility**
 
