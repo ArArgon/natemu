@@ -144,7 +144,7 @@ its status is not passed. A synthesis review is not an individual-finding
 prerequisite.
 
 | Gate | Applicable? | NA reason | Review ID(s) | Independence required/met | Verdict | Unresolved changes | Status |
-| --- | --- | --- | --- | --- | --- | --- |
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | question |  |  |  |  |  |  |  |
 | source |  |  |  |  |  |  |  |
 | method |  |  |  |  |  |  |  |

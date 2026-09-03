@@ -22,7 +22,7 @@ requires separate rows, one for each claim. The placeholder row below is a
 non-entry example that describes the schema; it records no source or claim.
 
 | Source ID | Classification (primary/secondary) | Title | Publisher/owner | Stable URL or repo commit | Claim ID | Exact source section | Relationship (supports/contradicts) | Source revision/date | Applicability | Reviewer | Verdict |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `<SRC-ID>` | `<primary or secondary>` | `<title>` | `<owner>` | `<stable URL or commit>` | `<claim ID>` | `<exact section>` | `<supports or contradicts>` | `<revision/date>` | `<applicability boundaries>` | `<review ID>` | `<accept / revise / reject>` |
 
 The `verdict` is a review outcome, not a claim of truth. Claim-level citations,
