@@ -102,7 +102,7 @@ candidates; and synthesis applies only to the final decision packet. Record an
 inapplicable gate as `not applicable` with its reason rather than silently
 skipping it.
 
-Require an auditable breadth record and question-backlog updates, including `no new issues found` when true. Cover product assumptions, adjacent systems, negative cases, boundaries, host and guest matrices, multicore interactions, alternatives, falsifiers, and harness failure modes. Require and record a second end-of-track breadth pass from product, architecture, correctness, and methodology perspectives. Replication independently prepares and reviews its harness; platform-wide claims declare their platform matrix.
+Require an auditable breadth record and question-backlog updates, including `no new issues found` when true. Cover product assumptions, adjacent systems, negative cases, boundaries, host and guest matrices, multicore interactions, alternatives, falsifiers, and harness failure modes. Require and record a second end-of-track breadth pass from product, architecture, correctness, and methodology perspectives. Replication independently prepares and reviews its harness. Platform-sensitive load-bearing observations are independently replicated across the declared machine/OS matrix; without its completion, retain a narrow applicability statement and do not close a platform-wide gate. Require self-review at every applicable gate, explicitly not as a substitute for required independent review.
 
 - [ ] **Step 5: Validate and commit**
 

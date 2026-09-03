@@ -41,13 +41,18 @@ recorded review context and able to challenge the evidence and method. The
 originating author or originating session may not approve any load-bearing
 method, harness, result, replication, adversarial, or synthesis review.
 
+Self-review is required at every applicable gate, but it is not a substitute
+for required independent review.
+
 Independent replication must independently prepare and review its harness, then
 reproduce the claimed result from the approved question and documented method
-in its own reviewable execution record. A platform-wide claim must declare the
-platform matrix it covers. Adversarial critique actively seeks counterexamples,
-hidden assumptions, applicability failures, and harness defects. A failed
-review returns the work to the appropriate earlier step; it does not create a
-finding by itself.
+in its own reviewable execution record. Platform-sensitive load-bearing
+observations must be independently replicated across their declared machine/OS
+matrix. If that matrix is not completed, the finding retains a narrow
+applicability statement and cannot close a platform-wide gate. Adversarial
+critique actively seeks counterexamples, hidden assumptions, applicability
+failures, and harness defects. A failed review returns the work to the
+appropriate earlier step; it does not create a finding by itself.
 
 Eligible findings may enter candidate synthesis after their applicable gates.
 The synthesis gate approves, revises, or rejects the final decision packet and
