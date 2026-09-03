@@ -95,6 +95,13 @@ Define this workflow:
 Select question → breadth pass → question gate → source gate → method proposal → method gate → harness implementation → harness gate → collect raw data → result gate → independent replication → adversarial critique → synthesis gate
 ```
 
+Treat this as a superset workflow: source applies to Source-backed claims;
+method, harness, and result apply to experiments; replication applies to
+load-bearing Observed findings; adversarial applies to all load-bearing
+candidates; and synthesis applies only to the final decision packet. Record an
+inapplicable gate as `not applicable` with its reason rather than silently
+skipping it.
+
 Require an auditable breadth record and question-backlog updates, including `no new issues found` when true. Cover product assumptions, adjacent systems, negative cases, boundaries, host and guest matrices, multicore interactions, alternatives, falsifiers, and harness failure modes. Require and record a second end-of-track breadth pass from product, architecture, correctness, and methodology perspectives. Replication independently prepares and reviews its harness; platform-wide claims declare their platform matrix.
 
 - [ ] **Step 5: Validate and commit**
