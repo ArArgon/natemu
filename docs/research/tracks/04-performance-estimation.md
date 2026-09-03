@@ -67,7 +67,8 @@ pressure on both host and guest.
 ## Exit criteria
 
 The track is complete when every component and scaling question has an
-accepted range with sensitivity analysis, compositions carry accepted
+accepted range with sensitivity analysis or a recorded `not-applicable`,
+compositions carry accepted
 independence arguments, estimates are mapped to the stop conditions from
 Scope and success, the end-of-track breadth pass is recorded, and all
 surfaced questions are filed in the question backlog. Estimates guide where

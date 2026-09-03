@@ -28,11 +28,11 @@ from [Benchmarking and validation](05-benchmarking-and-validation.md).
 
 The packet must contain:
 
-- **Criteria comparison.** Each surviving option — per the definition in
-  Architecture options, the families it carried forward with rejections not
-  reopened — compared against the approved success criteria from Scope and
-  success. The comparison presents accepted findings, each identified by its
-  evidence label, and may not manufacture claims that passed no gate.
+- **Criteria comparison.** Each surviving option — the set carried forward
+  by Architecture options and measured by the later tracks — compared
+  against the approved success criteria from Scope and success. The
+  comparison presents accepted findings, each identified by its evidence
+  label, and may not manufacture claims that passed no gate.
 - **Rejected alternatives.** Every rejected option carried forward from the
   rejected-option record, with reasons and falsifiers intact.
 - **Unknowns.** Every material unknown, applicability limit, and unresolved
@@ -64,5 +64,4 @@ authorized.
 The track is complete when the packet contains every required analysis, the
 independent critique is resolved, the synthesis gate has recorded an
 `accept` verdict and its single outcome, the end-of-track breadth pass is
-recorded, and
-all surfaced questions are filed in the question backlog.
+recorded, and all surfaced questions are filed in the question backlog.
