@@ -21,9 +21,10 @@ decisions during research organization. Perform breadth passes, add identified
 gaps to the question backlog (`docs/research/question-backlog.md`), and use
 primary sources for load-bearing claims.
 
-When separately authorized to conduct research, method and harness reviews must
-pass before experiments begin. Correctness failures invalidate performance
-samples. Load-bearing findings require independent review.
+When separately authorized to conduct research, method and harness reviews
+must pass before experiments begin.
+Correctness failures invalidate performance samples.
+Load-bearing findings require independent review.
 
 When separately authorized to conduct research, keep newly generated raw data
 outside Git and treat SMP and platform dimensions explicitly in research
