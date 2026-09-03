@@ -1,7 +1,7 @@
 # Natemu Research Reset Design
 
-**Date:** 2026-09-02  
-**Status:** Approved direction, pending written-spec review  
+**Date:** 2026-09-02
+**Status:** Revised after written-spec review
 **Preservation checkpoint:** `a121702`
 
 ## Context
@@ -13,12 +13,15 @@ The preservation checkpoint retains the old documentation and source code withou
 ## Goals
 
 - Replace the current working layout with a fresh validation roadmap.
+- Make the cleaned checkout explicitly represent the research phase; planning and implementation will have separate future workspaces.
 - Treat all previous local measurements, source code, and architecture choices as unverified.
 - Retain only source-backed findings that can be traced to primary specifications, official documentation, upstream source at a named revision, or peer-reviewed papers.
 - Make correctness a first-class research track and a gate for performance work.
 - Make multicore behavior a required dimension wherever mechanisms can interact across vCPUs.
 - Keep future checkouts small by excluding generated data, downloads, binaries, and caches.
 - Preserve the old material through Git history rather than an attic in the current checkout.
+- Require executors to discover and record questions outside the initial roadmap rather than merely completing a fixed checklist.
+- Require systematic methodology, correctness, and adversarial critique before findings or decisions are promoted.
 
 ## Non-goals
 
@@ -40,22 +43,42 @@ Every future claim must have one of these labels:
 
 Unlabelled claims are not admissible. Results from the preservation checkpoint may suggest hypotheses but may not become evidence without independent reimplementation and rerun.
 
+## Lifecycle boundaries
+
+Natemu has three distinct phases:
+
+1. **Research:** establish scope, source-backed constraints, feasibility, correctness requirements, candidate architectures, performance models, and validated observations. This cleanup creates the research workspace only.
+2. **Planning:** convert reviewed research findings into an implementation specification, milestones, dependencies, and acceptance tests. Planning begins only after the research exit gate passes and will live under `docs/planning/`.
+3. **Implementation:** build and test the selected system under normal source and test directories, with implementation documentation under `docs/implementation/` when needed.
+
+Research notes must not masquerade as an implementation plan. Candidate designs remain alternatives until a reviewed research decision promotes one. The planning and implementation directories will not be created as empty placeholders during this cleanup.
+
 ## Target layout
 
 The cleaned checkout will contain:
 
 ```text
 README.md
+AGENTS.md
 .gitignore
 docs/
-  source-backed-findings.md
-  roadmap/
-    00-scope-and-success.md
-    01-feasibility.md
-    02-correctness.md
-    03-implementation-ideation.md
-    04-performance-estimation.md
-    05-benchmarking-and-validation.md
+  research/
+    README.md
+    evidence-policy.md
+    executor-guide.md
+    question-backlog.md
+    source-ledger.md
+    review-ledger.md
+    tracks/
+      00-scope-and-success.md
+      01-feasibility.md
+      02-correctness.md
+      03-implementation-ideation.md
+      04-performance-estimation.md
+      05-benchmarking-and-validation.md
+    templates/
+      investigation.md
+      critique.md
   superpowers/
     specs/
       2026-09-02-research-reset-design.md
@@ -63,7 +86,25 @@ docs/
       2026-09-02-research-reset.md
 ```
 
-The current `probes/`, `tools/`, `docs/research/`, `.agents/`, and `skills-lock.json` paths will be removed from the working tree. They remain recoverable from commit `a121702`.
+The current `probes/`, `tools/`, `.agents/`, and `skills-lock.json` paths will be removed from the working tree. The existing contents of `docs/research/` will be replaced by the research-phase workspace above. The removed material remains recoverable from commit `a121702`.
+
+`README.md` explains the phase model and current status. `AGENTS.md` gives future automated executors the mandatory research and review workflow. `docs/research/README.md` is the human entry point. The ledgers make questions, sources, findings, dependencies, and reviews inspectable rather than burying them in narrative reports.
+
+## Executor discovery mandate
+
+The initial roadmap is a seed, not a closed task list. Before answering a research question, the executor must perform a breadth pass that asks:
+
+- What assumptions does the question make about product scope, host, guest, workload, concurrency, or dependencies?
+- Which adjacent subsystem can change the answer when integrated?
+- What negative cases, boundary conditions, failure modes, and counterexamples are absent?
+- Which target machines, OS versions, guest configurations, CPU modes, and vCPU counts could produce a different answer?
+- What would falsify the current framing rather than merely refine a number?
+- Which primary sources, competing implementations, and prior-art alternatives have not been examined?
+- What might make the measurement harness report a plausible but wrong answer?
+
+Each investigation must add newly surfaced items to `question-backlog.md`, including why they matter, what they depend on, how they can be resolved, and whether they block another question. An executor may not mark an assigned item complete without recording the discovery pass, even when it found no new issues.
+
+At the end of each research track, the executor performs a second breadth pass from four perspectives: product-scope skeptic, architecture skeptic, correctness specialist, and experimental-method critic. This can be performed by independent people, agents, or sessions, but the author may not impersonate independence when reviewing a load-bearing result.
 
 ## Roadmap structure
 
@@ -122,6 +163,23 @@ Benchmarking is the validation method shared by every track. It proceeds from ca
 
 Every result must include the experiment revision, machine manifest, toolchain and dependency versions, configuration, raw output, analysis revision, and correctness status. Raw results are immutable artifacts stored outside Git or in a deliberately configured artifact store.
 
+## Review and critique gates
+
+Research items advance through explicit gates. A review records reviewer identity or session, evidence inspected, findings, required changes, and one of `accept`, `revise`, or `reject` in `review-ledger.md`.
+
+1. **Question gate:** Check that the question is decision-relevant, scoped, falsifiable, and not already answered by a primary source. Identify dependencies and downstream decisions.
+2. **Source gate:** Check primary-source coverage, versions and revisions, contradictory sources, applicability boundaries, and citation accuracy. Secondary sources may locate evidence but may not carry a load-bearing claim by themselves.
+3. **Method gate:** Review the proposed experiment before implementation. Require controls, confounders, workload and concurrency dimensions, sample plan, metrics, exclusion rules, expected failure signatures, and stop criteria.
+4. **Harness gate:** Review experiment code and configuration independently before collecting evidence. Validate the harness against known behavior, include negative and fault-injection controls, and check that instrumentation does not erase the phenomenon under study.
+5. **Result gate:** Audit raw-data completeness, provenance, statistical treatment, anomalous runs, alternative explanations, and agreement between the recorded method and the executed method. Correctness failures invalidate performance samples.
+6. **Replication gate:** Repeat load-bearing observations on an independently prepared harness and, when the claim is platform-sensitive, across the declared machine and OS matrix. A single-machine observation remains `Observed` with a narrow applicability statement; it cannot close a platform-wide gate.
+7. **Adversarial critique gate:** Assign an independent reviewer to construct the strongest counterargument, search for missing interactions and circular reasoning, and attempt to falsify the conclusion. The author responds with evidence or downgrades the claim.
+8. **Synthesis gate:** Before a finding affects architecture or planning, scan dependencies and the rest of the research corpus for contradictions. A new contradiction reopens the finding and every dependent decision.
+
+Self-review is required at every gate but is not sufficient for load-bearing findings. No author or single agent session may approve its own method, harness, result, replication, and adversarial gates. Reviews should be small and frequent; a late omnibus audit is not a substitute.
+
+The research phase exits only when its scope is explicit, blocking questions have accepted evidence, correctness requirements and test strategies are reviewable, candidate architectures have survived comparative critique, performance estimates expose their uncertainty, and the decision record identifies what remains unknown. Exit approval creates the input to the separate planning phase.
+
 ## Blind-spot register
 
 The roadmap must explicitly track, rather than silently omit:
@@ -141,6 +199,8 @@ The roadmap must explicitly track, rather than silently omit:
 
 Security remains recorded as deferred rather than silently assumed complete.
 
+This register is not exhaustive. `question-backlog.md` is the living gap register, and review gates must add newly discovered blind spots instead of forcing them into the original categories.
+
 ## Repository cleanup
 
 The first preservation commit has already removed tracked result directories, logs, shared objects, initramfs images, checkpoints, and other generated outputs. It also removed ignored downloads, binaries, caches, and browser scratch data from the local working tree.
@@ -151,7 +211,7 @@ The reset commit will remove the remaining historical source and prose from the 
 
 Before the reset is reported complete:
 
-1. Confirm the only current files match the target layout.
+1. Confirm the only current files match the research-phase target layout.
 2. Confirm no tracked file is binary or output-like.
 3. Confirm no ignored or untracked generated artifact remains.
 4. Confirm no personal absolute filesystem path remains in the current checkout.
@@ -165,9 +225,13 @@ If historical material is needed, it should be inspected or selectively restored
 ## Acceptance criteria
 
 - The current checkout describes an unvalidated concept and contains no old conclusions presented as current truth.
+- Research, planning, and implementation are separate phases, and only the research workspace exists in the cleaned checkout.
 - The roadmap gives feasibility, correctness, implementation ideation, performance estimation, and benchmarking distinct responsibilities.
 - Correctness gates precede performance evidence.
 - Multicore coverage is explicit in feasibility, correctness, estimation, and benchmarking.
+- Executors must perform and record breadth passes that can expand the initial question set.
+- Question, source, method, harness, result, replication, adversarial, and synthesis gates are defined with recorded verdicts.
+- Load-bearing findings cannot be approved solely by their author or originating agent session.
 - Generated data cannot be accidentally committed through the documented paths and extensions.
 - The preservation checkpoint remains recoverable.
 - The repository is small enough to transfer without any of the deleted 2.4 GB local artifact tree.
