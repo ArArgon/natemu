@@ -10,27 +10,12 @@ build/
 *.ckpt
 *.log
 
-# Compiled probes (sources are tracked, binaries are not)
-probes/**/bin/
-probes/**/results/
-
 # Tool scratch
 .playwright-mcp/
 .worktrees/
 
-# QEMU baseline: downloaded guest images / kernels (1.8 GB, re-fetch with build.sh)
-probes/qemu_baseline/work/
-
-# Guest-rates probe: fetched Alpine apks + cross toolchain (547 MB, re-fetch with
-# fetch_toolchain.sh / fetch_src.sh)
-probes/guest_rates/work/
-
-# Oracle probe: built test binaries + initramfs (regenerate with run_flagtorture.sh)
-probes/oracle/work/
-probes/oracle/*.so
-
-# Research outputs are untracked repository-root artifacts
-/artifacts/
-/results/
-/downloads/
-/scratch/
+# Research outputs are external artifacts, not repository content
+artifacts/
+results/
+downloads/
+scratch/

@@ -15,7 +15,9 @@ experiments, probes, or benchmarks. Begin with the
 
 The project lifecycle is research, then planning, then implementation. Research
 establishes evidence and constraints; planning turns those findings into a
-proposed approach; implementation follows only after planning.
+proposed approach only after research authorizes it; implementation begins only
+after planning is completed and approved and implementation is separately
+authorized.
 
 Material in historical commit `a121702` is untrusted history, not validated
 evidence or a current implementation direction.

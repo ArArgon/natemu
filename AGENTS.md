@@ -18,7 +18,8 @@ When separately authorized to conduct research, treat material at or before
 preservation commit `a121702` as inherited provenance, not evidence. Reject
 inherited probes and results as evidence. Do not make binding implementation
 decisions during research organization. Perform breadth passes, add identified
-gaps to the research workspace, and use primary sources for load-bearing claims.
+gaps to the question backlog (`docs/research/question-backlog.md`), and use
+primary sources for load-bearing claims.
 
 When separately authorized to conduct research, method and harness reviews must
 pass before experiments begin. Correctness failures invalidate performance
