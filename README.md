@@ -21,3 +21,8 @@ authorized.
 
 Material in historical commit `a121702` is untrusted history, not validated
 evidence or a current implementation direction.
+
+The reset design and plan under `docs/superpowers/` are kept as records of
+that decision and use older vocabulary: their "harness" is what the research
+documents now call experiment code (and the "harness gate" is the code gate),
+and their "spike" is now a prototype.

@@ -9,8 +9,8 @@ organization work does not collect, assess, or promote evidence.
   official documentation, versioned upstream source, or peer-reviewed paper,
   with the relevant version, scope, and applicability recorded. Secondary
   sources may locate evidence but cannot carry load-bearing claims.
-- **Observed** — a result produced by an approved harness and method, with its
-  raw-data manifest, environment, and limitations recorded.
+- **Observed** — a result produced by approved experiment code and method,
+  with its raw-data manifest, environment, and limitations recorded.
 - **Inferred** — a reasoned conclusion from identified Source-backed and/or
   Observed evidence; the reasoning and uncertainty are explicit.
 - **Hypothesis** — a testable proposition that has not yet been established.
@@ -29,15 +29,23 @@ An investigation may name a dominant method or context, but that never replaces
 the evidence label required on every individual claim.
 
 Raw data is an immutable external artifact, not Git content. Its manifest must
-identify the artifact, producing harness and version, method, environment,
-inputs, and integrity information. A prior checkpoint may seed hypotheses only;
+identify the artifact, producing experiment code and revision, method,
+environment, inputs, and integrity information.
+
+Raw artifacts are written under the external raw-data root, the directory named
+by the `NATEMU_RAW_ROOT` environment variable, which must lie outside this
+repository. Experiment code must refuse to run without it and must write
+nothing under `experiments/`. Each manifest lives in
+[`manifests/`](manifests/README.md) and records the artifact's path relative
+to that root and its SHA-256 digest; a manifest without a digest does not
+identify an artifact. A prior checkpoint may seed hypotheses only;
 it is not accepted evidence.
 
 ## Promotion and challenge
 
 The applicable gates depend on the evidence type. Every question requires the
 question gate. Source-backed evidence requires the source gate. An experiment
-requires the method, harness, and result gates. A load-bearing Observed finding
+requires the method, code, and result gates. A load-bearing Observed finding
 also requires independent replication. Every load-bearing candidate finding
 requires adversarial review.
 
@@ -58,5 +66,5 @@ gate records do not pass, and `not-applicable` never substitutes for an
 omitted reason.
 
 No policy label converts a future action into authorization. Browsing, source
-acquisition, harness work, data collection, or synthesis remains conditional on
-separate authorization for that research work.
+acquisition, experiment code, data collection, or synthesis remains
+conditional on separate authorization for that research work.

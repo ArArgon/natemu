@@ -6,7 +6,7 @@ passed; it may never be treated as silently satisfied.
 
 ## Review types
 
-Use one of: `question`, `source`, `method`, `harness`, `result`,
+Use one of: `question`, `source`, `method`, `code`, `result`,
 `replication`, `adversarial`, or `synthesis`.
 
 ## Reusable entry template

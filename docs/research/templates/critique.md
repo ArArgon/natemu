@@ -7,7 +7,7 @@ verdict.
 ## Metadata
 
 - Review ID:
-- Review type: `question | source | method | harness | result | replication | adversarial | synthesis`
+- Review type: `question | source | method | code | result | replication | adversarial | synthesis`
 - Subject ID(s):
 - Reviewer/session:
 - Date:
@@ -34,7 +34,7 @@ no applicable dimension may be omitted.
 | Scope and decision relevance |  |  |  |  |  |  |
 | Source applicability and claim-level support |  |  |  |  |  |  |
 | Method and controls |  |  |  |  |  |  |
-| Harness validation, including negative/fault-injection behavior |  |  |  |  |  |  |
+| Code validation, including negative/fault-injection behavior |  |  |  |  |  |  |
 | Statistics, samples, exclusions, and stop criteria |  |  |  |  |  |  |
 | Correctness criteria and failure modes |  |  |  |  |  |  |
 | Multicore behavior, vCPU/core placement, and topology assumptions |  |  |  |  |  |  |

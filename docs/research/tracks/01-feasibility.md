@@ -52,18 +52,19 @@ The track must maintain an explicit list of assumptions whose failure kills
 the project or an architecture family, each phrased falsifiably, each tested
 early, and each mapped to a stop condition from Scope and success.
 
-## Required spike
+## Required prototype
 
 Feasibility cannot be closed on paper. The track requires at least one
-integrated spike that combines translation, paging, exceptions, and
+integrated prototype that combines translation, paging, exceptions, and
 interrupts with at least two vCPUs running concurrently, executed under an
-approved method and harness and independently reviewed. A spike demonstrates
-mechanism viability only; it is not a performance result and not a design.
+approved method and experiment code and independently reviewed. A prototype
+demonstrates mechanism viability only; it is not a performance result and not
+a design.
 
 ## Exit criteria
 
 The track is complete when every area above has an accepted resolution or a
-recorded kill, the spike has passed its applicable gates including
+recorded kill, the prototype has passed its applicable gates including
 independent review, the end-of-track breadth pass is recorded, and all
 surfaced questions are filed in the question backlog. A recorded kill is an
 accepted finding that a kill assumption fails: a family-level kill removes

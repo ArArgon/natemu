@@ -39,7 +39,7 @@ applicable gates (see [gate completion](../evidence-policy.md#gate-completion)):
 
 ## Required verification methods
 
-For each area the track must apply, with approved methods and harnesses:
+For each area the track must apply, with approved methods and experiment code:
 
 - **Specification-derived tests**, traceable to the primary specification
   clause they check, not to another emulator's behavior alone;

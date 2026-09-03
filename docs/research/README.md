@@ -38,6 +38,14 @@ executor guide](executor-guide.md). Future work will record questions in the
 [review ledger](review-ledger.md). Use the [investigation template](templates/investigation.md)
 and [critique template](templates/critique.md) during separately authorized work.
 
+Each record type has one home. Investigation records live in
+[`investigations/`](investigations/README.md), review records in
+[`reviews/`](reviews/README.md), breadth-pass records in
+[`breadth-passes/`](breadth-passes/README.md), and raw-data manifests in
+[`manifests/`](manifests/README.md). Experiment code lives outside `docs/`, in
+[`experiments/`](../../experiments/README.md), one directory per investigation.
+Each directory's README fixes its identifier prefix and filename rule.
+
 ## Tracks
 
 The tracks are read in this order; their links are reserved for later,
@@ -56,7 +64,7 @@ separately authorized work.
 1. Question gate
 2. Source gate
 3. Method gate
-4. Harness gate
+4. Code gate
 5. Result gate
 6. Replication gate
 7. Adversarial gate

@@ -28,7 +28,7 @@ questions, methods, or results.
 
 - Breadth-pass record/artifact:
 - Product, architecture, correctness, methodology, boundary, alternative, and
-  harness-failure coverage:
+  measurement-failure coverage:
 - Backlog entries created for newly surfaced questions, or exact statement:
   `no new issues found`
 - Discoveries during source, method, execution, or result work, recorded
@@ -93,9 +93,9 @@ the investigation's dominant method/context must never substitute for it.
 - Predeclared exclusions:
 - Stop/failure conditions:
 
-## Harness validation
+## Code validation
 
-- Harness version and validation artifact:
+- Experiment code revision and validation artifact:
 - Negative and fault-injection checks:
 - Expected failure behavior and observed validation outcome:
 
@@ -103,8 +103,8 @@ the investigation's dominant method/context must never substitute for it.
 
 - Immutable raw artifact location:
 - Manifest location:
-- Manifest contents: producing harness/version, method, environment, inputs,
-  integrity information:
+- Manifest contents: producing experiment code/revision, method, environment,
+  inputs, integrity information:
 
 ## Results
 
@@ -148,7 +148,7 @@ records every required review's verdict, with the gate-closing verdict last.
 | question |  |  |  |  |  |  |  |
 | source |  |  |  |  |  |  |  |
 | method |  |  |  |  |  |  |  |
-| harness |  |  |  |  |  |  |  |
+| code |  |  |  |  |  |  |  |
 | result |  |  |  |  |  |  |  |
 | replication |  |  |  |  |  |  |  |
 | adversarial |  |  |  |  |  |  |  |

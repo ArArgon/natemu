@@ -17,7 +17,7 @@ separate research authorization and follows the
 Measurement proceeds in order, and each stage unlocks the next: a mechanism
 may be microbenchmarked only after its capability check is accepted; a
 subsystem benchmark may start only with accepted microbenchmark evidence for
-every mechanism the subsystem combines; an integrated spike only when every
+every mechanism the subsystem combines; an integrated prototype only when every
 subsystem it spans has accepted subsystem evidence; and an end-to-end
 workload only when every mechanism the measured configuration exercises has
 accepted evidence at all prior stages. Each stage
@@ -26,14 +26,14 @@ resolved with labelled evidence through the applicable gates (see
 [gate completion](../evidence-policy.md#gate-completion)):
 
 1. **Capability checks.** Whether a mechanism works at all under the
-   approved harness, before any timing of it is meaningful.
+   approved experiment code, before any timing of it is meaningful.
 2. **Microbenchmarks.** Isolated costs of single mechanisms, matched to the
    cost components in
    [Performance estimation](04-performance-estimation.md).
 3. **Subsystem benchmarks.** Combined costs of one subsystem — for example
    memory, faults, or interrupt delivery — under controlled load.
-4. **Integrated spikes.** Mechanisms combined across subsystems, extending
-   the feasibility spike from [Feasibility](01-feasibility.md) with
+4. **Integrated prototypes.** Mechanisms combined across subsystems, extending
+   the feasibility prototype from [Feasibility](01-feasibility.md) with
    measurement under an approved method.
 5. **End-to-end workloads.** The diverse workload set from Scope and
    success, run against the fair baselines under identical conditions.
