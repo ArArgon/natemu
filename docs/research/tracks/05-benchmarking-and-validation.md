@@ -47,6 +47,12 @@ from the supported envelope; a vCPU ladder of
 fault- and syscall-heavy, I/O, and concurrency-dominated behavior, so no
 single benchmark-shaped workload carries a conclusion.
 
+Host machines need not be available at the same time. Matrix coverage may be
+collected sequentially, one machine at a time, provided each run's manifest
+identifies its machine and OS and every comparison is made within one machine
+under identical conditions; cross-machine numbers are never compared
+directly.
+
 ## Result validity
 
 Every reported result must record: randomized repetition order with enough

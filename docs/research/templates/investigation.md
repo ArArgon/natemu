@@ -6,7 +6,8 @@ questions, methods, or results.
 
 ## Metadata
 
-- Investigation ID:
+- Investigation ID (`INV-<track>-<nn>`, per the
+  [identifier table](../README.md#identifiers)):
 - Owner/session:
 - Date range:
 - Status: `proposed | gated | investigating | review | accepted | rejected | blocked`
@@ -42,7 +43,8 @@ questions, methods, or results.
 
 ## Claim inventory
 
-Use one row per claim. The evidence label belongs to each individual claim;
+Use one row per claim, with identifier `CLM-<track>-<nn>-<nn>` under this
+investigation's number. The evidence label belongs to each individual claim;
 the investigation's dominant method/context must never substitute for it.
 
 | Claim ID | Exact claim | Evidence label | Source/artifact reference | Version/revision | Applicability | Derivation (if inferred) | Review status |

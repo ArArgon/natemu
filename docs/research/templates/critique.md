@@ -6,7 +6,7 @@ verdict.
 
 ## Metadata
 
-- Review ID:
+- Review ID (`REV-<nnn>`, per the [identifier table](../README.md#identifiers)):
 - Review type: `question | source | method | code | result | replication | adversarial | synthesis`
 - Subject ID(s):
 - Reviewer/session:

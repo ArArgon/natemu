@@ -44,7 +44,26 @@ Each record type has one home. Investigation records live in
 [`breadth-passes/`](breadth-passes/README.md), and raw-data manifests in
 [`manifests/`](manifests/README.md). Experiment code lives outside `docs/`, in
 [`experiments/`](../../experiments/README.md), one directory per investigation.
-Each directory's README fixes its identifier prefix and filename rule.
+Each directory's README fixes its filename rule.
+
+## Identifiers
+
+Every record uses one of these identifiers. `<track>` is the two-digit track
+number and `<nn>` a two-digit sequence; an investigation answers exactly one
+question and shares its number, so `INV-01-03` answers `Q-01-03`.
+
+| Record | Identifier | Example |
+| --- | --- | --- |
+| Question | `Q-<track>-<nn>` | `Q-01-03` |
+| Investigation | `INV-<track>-<nn>` | `INV-01-03` |
+| Claim | `CLM-<track>-<nn>-<nn>` | `CLM-01-03-02` |
+| Source | `SRC-<nnn>` | `SRC-014` |
+| Breadth pass | `BP-<track>-<nn>-start`, `BP-<track>-end` | `BP-01-03-start`, `BP-01-end` |
+| Manifest | `MAN-<track>-<nn>-<nn>` | `MAN-01-03-02` |
+| Review | `REV-<nnn>` | `REV-017` |
+
+Identifiers are never reused or renumbered; a withdrawn record keeps its
+identifier with a withdrawn status.
 
 ## Tracks
 

@@ -6,8 +6,9 @@ is answered, and the end-of-track pass from product, architecture,
 correctness, and methodology perspectives. This directory is empty until
 research is authorized.
 
-- Identifier: `BP-<investigation-id>-start` for the pass before a question,
-  `BP-<track>-end` for the end-of-track pass, for example `BP-INV-01-03-start`
+- Identifier: `BP-<track>-<nn>-start` for the pass before a question,
+  `BP-<track>-end` for the end-of-track pass, per the
+  [identifier table](../README.md#identifiers), for example `BP-01-03-start`
   and `BP-01-end`.
 - Filename: `<identifier>.md`.
 - Every newly surfaced issue is also filed in the

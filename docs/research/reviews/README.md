@@ -7,6 +7,6 @@ has not happened. This directory is empty until
 research is authorized.
 
 - Identifier: `REV-<nnn>`, a three-digit sequence across all review types,
-  for example `REV-017`.
+  per the [identifier table](../README.md#identifiers), for example `REV-017`.
 - Filename: `<identifier>.md`.
 - A `not-applicable` gate is recorded in the ledger only; it gets no file here.

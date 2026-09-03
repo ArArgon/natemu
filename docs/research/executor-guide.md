@@ -45,12 +45,13 @@ Independent replication must independently prepare and review its own
 experiment code, then reproduce the claimed result from the approved question
 and documented method in its own reviewable execution record.
 Platform-sensitive load-bearing observations must be independently replicated
-across their declared machine/OS matrix. If that matrix is not completed, the
-finding retains a narrow applicability statement and cannot close a
-platform-wide gate. Adversarial critique actively seeks counterexamples,
-hidden assumptions, applicability failures, and code defects. A failed
-review returns the work to the appropriate earlier step; it does not create a
-finding by itself.
+across their declared machine/OS matrix. That replication may run sequentially
+as machines become available; the matrix is complete when every declared cell
+has its own reviewed run. If that matrix is not completed, the finding retains
+a narrow applicability statement and cannot close a platform-wide gate.
+Adversarial critique actively seeks counterexamples, hidden assumptions,
+applicability failures, and code defects. A failed review returns the work to
+the appropriate earlier step; it does not create a finding by itself.
 
 Eligible findings may enter candidate synthesis after their applicable gates.
 The synthesis gate approves, revises, or rejects the final decision packet and

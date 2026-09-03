@@ -16,6 +16,10 @@ that relies on it.
 
 ## Claim-level mapping template
 
+Source identifiers are `SRC-<nnn>` and claim identifiers
+`CLM-<track>-<nn>-<nn>`, per the [identifier table](README.md#identifiers).
+A source keeps one identifier across every claim it maps to.
+
 Add one row for each source-to-claim mapping only after separate research
 authorization and source inspection. A source that supports multiple claims
 requires separate rows, one for each claim. The placeholder row below is a

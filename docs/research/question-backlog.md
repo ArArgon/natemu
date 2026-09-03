@@ -37,6 +37,10 @@ Use exactly one status per question:
 
 ## Reusable entry template
 
+Question identifiers are `Q-<track>-<nn>`, per the
+[identifier table](README.md#identifiers); the investigation answering a
+question shares its number.
+
 Copy this template into the applicable empty category only after separate
 research authorization. Do not treat the placeholders as an entry.
 
