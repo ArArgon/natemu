@@ -1,9 +1,0 @@
-NATEMU_INIT_UP uptime=1.79
-NATEMU_SHELL_UP uptime=1.81
-NATEMU_TASK_BEGIN bench:matmul
-BENCHVER 4
-BENCH matmul       8.5948 s       457.503 Mops  chk=0000001f5e05e316
-BENCHDONE
-NATEMU_TASK_END bench:matmul uptime=10.44
-[   10.481081] sysrq: Power Off
-[   10.484681] reboot: Power down

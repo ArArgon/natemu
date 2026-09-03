@@ -1,5 +1,0 @@
-NATEMU_INIT_UP uptime=1.26
-NATEMU_SHELL_UP uptime=1.28
-NATEMU_TASK_BEGIN bench:ls4tlb
-BENCHVER 4
-qemu-system-x86_64: terminating on signal 15 from pid 65617 (<unknown process>)

@@ -1,8 +1,0 @@
-  deadline = now + 24 ticks (1000 ns).  lateness (delivery - deadline):
-    n=400  p10 958  p50 958  p90 958  p99 1375  min 917  max 1667 ns
-  deadline = now + 240 ticks (10000 ns).  lateness (delivery - deadline):
-    n=400  p10 958  p50 1000  p90 1000  p99 1208  min 958  max 17875 ns
-  deadline = now + 2400 ticks (100000 ns).  lateness (delivery - deadline):
-    n=400  p10 958  p50 1000  p90 1042  p99 2792  min 917  max 22292 ns
-  deadline = now + 24000 ticks (1000000 ns).  lateness (delivery - deadline):
-    n=400  p10 1000  p50 1000  p90 1292  p99 4833  min 958  max 5542 ns

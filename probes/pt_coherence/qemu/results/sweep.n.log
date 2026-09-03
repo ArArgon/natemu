@@ -1,8 +1,0 @@
-=== N boot.smp1 (task=none smp=1 single)
-=== N spawn.smp1 (task=spawn2000 smp=1 single)
-=== N sevenzip.smp1 (task=sevenzip smp=1 single)
-=== N bench.smp1 (task=bench smp=1 single)
-=== N boot.smp4 (task=none smp=4 multi)
-=== N spawn.smp4 (task=spawn2000 smp=4 multi)
-=== N sevenzipmt.smp4 (task=sevenzipmt4 smp=4 multi)
-DONE

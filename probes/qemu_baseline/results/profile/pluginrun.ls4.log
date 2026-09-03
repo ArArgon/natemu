@@ -1,9 +1,0 @@
-NATEMU_INIT_UP uptime=1.89
-NATEMU_SHELL_UP uptime=1.91
-NATEMU_TASK_BEGIN bench:ls4
-BENCHVER 4
-BENCH ls4          3.6627 s        81.907 Mops  chk=f9f04094fc9d000a
-BENCHDONE
-NATEMU_TASK_END bench:ls4 uptime=5.62
-[    5.663990] sysrq: Power Off
-[    5.667679] reboot: Power down

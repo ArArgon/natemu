@@ -1,9 +1,0 @@
-NATEMU_INIT_UP uptime=1.83
-NATEMU_SHELL_UP uptime=1.85
-NATEMU_TASK_BEGIN bench:ptr256
-BENCHVER 4
-BENCH ptr256      18.2498 s         0.438 Mops  chk=00007a0f78cfc5f4
-BENCHDONE
-NATEMU_TASK_END bench:ptr256 uptime=20.14
-[   20.180034] sysrq: Power Off
-[   20.183830] reboot: Power down

@@ -1,12 +1,18 @@
 # Build artifacts
+.DS_Store
 __pycache__/
 *.pyc
 build/
 *.o
 *.dSYM/
+*.so
+*.cpio
+*.ckpt
+*.log
 
 # Compiled probes (sources are tracked, binaries are not)
 probes/**/bin/
+probes/**/results/
 
 # Tool scratch
 .playwright-mcp/

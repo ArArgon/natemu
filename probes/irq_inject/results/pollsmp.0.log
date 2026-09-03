@@ -1,8 +1,0 @@
-=== is the poll flag still free when another vCPU writes its cache line? ===
-  arm: writer stores to a line 4 KiB away (control)
-  writer stores issued: 72575
-  k=5 x86/block, 2,000,000 x86 insns, 400,000 blocks per section:
-    no check              1869 us   (repeat 882 us)
-    ld+cbnz per block     1330 us   (repeat 1252 us)  -28.85% / +41.93%
-    cbnz reg per block     881 us                     -52.84%
-    density n=0 1120 us, n=8 ld+cbnz 1489 us -> 0.1154 ns/check; n=8 cbnz-reg 1524 us -> 0.1263 ns/check

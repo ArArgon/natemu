@@ -1,5 +1,0 @@
-=== bare HVC round trip (the host-exit floor on THIS machine) ===
-  20000 HVC exits, 20001 hv_vcpu_run returns
-  whole process (incl. VM setup): 259.860 ms
-  guest-timed HVC round trip (CNTVCT_EL0 either side of the loop): 1487.6 ns
-  same loop shape with a local SVC to EL1 instead (no host involved): 36.1 ns

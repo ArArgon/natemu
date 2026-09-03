@@ -1,9 +1,0 @@
-=== M3.spawn (task=spawn400) 02:34:23
-  snaps   -> /Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/results/mmu/snap.M3.spawn.txt
-=== M3.buildproxy (task=buildproxy) 02:35:09
-  snaps   -> /Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/results/mmu/snap.M3.buildproxy.txt
-=== M3.bench (task=bench) 02:36:40
-  snaps   -> /Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/results/mmu/snap.M3.bench.txt
-=== M3.sevenzip (task=sevenzip:1) 02:45:06
-  snaps   -> /Users/liaozhiping/Documents/codex/natemu/probes/qemu_baseline/results/mmu/snap.M3.sevenzip.txt
-SWEEP DONE 02:51:50

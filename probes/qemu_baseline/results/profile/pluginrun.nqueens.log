@@ -1,9 +1,0 @@
-NATEMU_INIT_UP uptime=1.83
-NATEMU_SHELL_UP uptime=1.85
-NATEMU_TASK_BEGIN bench:nqueens
-BENCHVER 4
-BENCH nqueens      2.4153 s         4.968 solves/s  chk=00000000000d7f40
-BENCHDONE
-NATEMU_TASK_END bench:nqueens uptime=4.31
-[    4.349436] sysrq: Power Off
-[    4.353564] reboot: Power down
