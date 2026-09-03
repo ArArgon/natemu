@@ -53,6 +53,28 @@ Natemu has three distinct phases:
 
 Research notes must not masquerade as an implementation plan. Candidate designs remain alternatives until a reviewed research decision promotes one. The planning and implementation directories will not be created as empty placeholders during this cleanup.
 
+Research decides what must be true and which approaches remain viable. Planning makes the binding choice of what to build, including module boundaries, interfaces, data structures, dependencies, milestones, and task ordering. The research exit packet may recommend an architecture and reject disproven alternatives, but it does not make detailed implementation decisions.
+
+## Recommended research scope
+
+The research phase exists to answer one decision:
+
+> Is it technically and economically credible to build an unmodified x86-64 Linux system emulator on Apple Silicon that is materially better than QEMU TCG, and, if so, which architectural direction deserves planning?
+
+The initial product envelope is:
+
+- Apple Silicon hosts using public macOS APIs;
+- at least two silicon generations and two supported macOS releases;
+- unmodified, modern x86-64 Linux guests;
+- direct kernel boot for the initial validation target;
+- SMP as a baseline requirement rather than a later extension;
+- headless operation with timer/APIC, serial, block, network, entropy, and shutdown support sufficient for meaningful workloads;
+- compute, memory, process, JIT, storage, network, concurrent-I/O, and mixed workloads;
+- UEFI and Windows implications analyzed for architectural compatibility but not implemented during research;
+- security de-prioritized beyond safe host isolation and crash containment.
+
+The scope must be revisited at the question gate. If the intended product is patched Linux, arbitrary firmware, Windows, or broad legacy-x86 compatibility, that change reopens architecture and correctness conclusions rather than being absorbed silently.
+
 ## Target layout
 
 The cleaned checkout will contain:
@@ -73,9 +95,10 @@ docs/
       00-scope-and-success.md
       01-feasibility.md
       02-correctness.md
-      03-implementation-ideation.md
+      03-architecture-options.md
       04-performance-estimation.md
       05-benchmarking-and-validation.md
+      06-research-synthesis.md
     templates/
       investigation.md
       critique.md
@@ -110,7 +133,7 @@ At the end of each research track, the executor performs a second breadth pass f
 
 ### Scope and success
 
-The roadmap starts by choosing supported guests, boot methods, CPU modes and extensions, Apple Silicon generations, macOS versions, use cases, compatibility boundaries, and measurable go/no-go thresholds. Product decisions such as “patched Linux only” versus “arbitrary x86 operating systems” must be settled before architecture estimates are compared.
+The roadmap starts by validating or revising the recommended product envelope, then choosing CPU modes and extensions, use cases, compatibility boundaries, comparison baselines, and measurable go/no-go thresholds. It must define what “materially better than QEMU TCG” means before architecture estimates are compared. Rosetta may inform user-mode translation limits but is not a system-emulation baseline.
 
 ### Feasibility
 
@@ -122,6 +145,7 @@ Feasibility work will:
 - distinguish API availability from behavioral suitability;
 - test relevant mechanisms across target machine and OS combinations;
 - include single-vCPU and multicore configurations where concurrency changes the answer;
+- require an integrated feasibility spike that exercises translation, paging, exceptions, interrupts, and at least two vCPUs together;
 - finish with explicit evidence requirements and go/no-go gates.
 
 ### Correctness
@@ -139,9 +163,9 @@ Correctness is a standalone track that precedes performance conclusions. It cove
 
 Single-vCPU trace comparison may be used where determinism is valid. Multicore correctness must not depend on instruction-by-instruction deterministic replay because serialization changes the concurrency being tested. A run that fails its correctness gate cannot contribute performance evidence.
 
-### Implementation ideation
+### Architecture options
 
-Implementation ideation will compare candidate architectures and reusable components. Each proposal must state its dependencies, unsupported surface, failure modes, correctness burden, multicore implications, portability assumptions, and experiments that could falsify it. The first implementation milestone is the smallest end-to-end vertical slice, not a collection of disconnected optimized probes.
+Architecture research will compare candidate architectures, translators, host/guest partitioning, MMU strategies, code-cache designs, interrupt models, device approaches, and reusable components. Each proposal must state its dependencies, unsupported surface, failure modes, correctness burden, multicore implications, portability assumptions, licensing and maintenance implications, and experiments that could falsify it. Research prototypes are disposable evidence-generating instruments; they do not become production foundations automatically. The output is a reviewed recommendation and rejected-option record, not a detailed implementation design.
 
 ### Performance estimation
 
@@ -163,6 +187,10 @@ Benchmarking is the validation method shared by every track. It proceeds from ca
 
 Every result must include the experiment revision, machine manifest, toolchain and dependency versions, configuration, raw output, analysis revision, and correctness status. Raw results are immutable artifacts stored outside Git or in a deliberately configured artifact store.
 
+### Research synthesis
+
+The final track compares surviving architecture options against the agreed scope, correctness requirements, feasibility evidence, and performance bounds. It records rejected alternatives, remaining unknowns, accepted risks, and the confidence of each recommendation. Its reviewed decision packet recommends one of three outcomes: stop, continue targeted research, or authorize the planning phase.
+
 ## Review and critique gates
 
 Research items advance through explicit gates. A review records reviewer identity or session, evidence inspected, findings, required changes, and one of `accept`, `revise`, or `reject` in `review-ledger.md`.
@@ -178,7 +206,20 @@ Research items advance through explicit gates. A review records reviewer identit
 
 Self-review is required at every gate but is not sufficient for load-bearing findings. No author or single agent session may approve its own method, harness, result, replication, and adversarial gates. Reviews should be small and frequent; a late omnibus audit is not a substitute.
 
-The research phase exits only when its scope is explicit, blocking questions have accepted evidence, correctness requirements and test strategies are reviewable, candidate architectures have survived comparative critique, performance estimates expose their uncertainty, and the decision record identifies what remains unknown. Exit approval creates the input to the separate planning phase.
+The research phase exits only when:
+
+- product scope, comparison baselines, and performance thresholds are explicit;
+- blocking questions have accepted evidence;
+- at least one architecture has survived feasibility and adversarial review;
+- an integrated multicore spike has validated its critical mechanisms together;
+- correctness requirements and the validation strategy are credible and reviewable;
+- performance bounds use correctness-qualified evidence and expose their uncertainty;
+- platform-sensitive claims cover the declared host matrix or carry narrow applicability labels;
+- rejected alternatives and residual unknowns are recorded;
+- no unknown blocker is hidden inside a schedule or performance estimate;
+- independent reviewers approve the research decision packet.
+
+Exit approval creates the input to the separate planning phase. It does not approve production APIs, data structures, module boundaries, dependency pins, milestones, or task sequencing.
 
 ## Blind-spot register
 
@@ -226,7 +267,7 @@ If historical material is needed, it should be inspected or selectively restored
 
 - The current checkout describes an unvalidated concept and contains no old conclusions presented as current truth.
 - Research, planning, and implementation are separate phases, and only the research workspace exists in the cleaned checkout.
-- The roadmap gives feasibility, correctness, implementation ideation, performance estimation, and benchmarking distinct responsibilities.
+- The roadmap gives scope, feasibility, correctness, architecture options, performance estimation, benchmarking, and synthesis distinct responsibilities.
 - Correctness gates precede performance evidence.
 - Multicore coverage is explicit in feasibility, correctness, estimation, and benchmarking.
 - Executors must perform and record breadth passes that can expand the initial question set.
