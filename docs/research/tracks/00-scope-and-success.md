@@ -1,0 +1,53 @@
+# Scope and success
+
+This track is a roadmap only. It defines what separately authorized research
+must settle first; it records no findings, and nothing here is evidence. Work
+on this track runs only under separate research authorization and follows the
+[research governance](../README.md), the [evidence policy](../evidence-policy.md),
+and the [executor guide](../executor-guide.md).
+
+## Initial target
+
+The starting envelope, subject to revision by this track's own outcomes:
+
+- public macOS APIs only, on at least two Apple Silicon generations and at
+  least two supported macOS releases;
+- unmodified modern x86-64 Linux guests with direct boot;
+- SMP as a baseline, not an extension; and
+- a minimal headless device set.
+
+This envelope is an input to be questioned, not a settled scope. Every
+narrowing or widening must be recorded as a question in the
+[question backlog](../question-backlog.md) and resolved through the applicable
+gates (see [gate completion](../evidence-policy.md#gate-completion)).
+
+## Required definitions
+
+The track must produce, with evidence labels and review where applicable:
+
+- **Users and workloads.** Who the emulator is for and which concrete,
+  diverse workloads represent them. A single benchmark-shaped workload does
+  not qualify.
+- **Compatibility boundary.** Which guest kernels, configurations, features,
+  and device expectations are in scope, which are out, and how the boundary
+  is tested rather than asserted.
+- **Fair baselines.** Which existing systems the project is compared against,
+  in which configurations, and what makes a comparison fair: same guest,
+  same workload, same host conditions, tuning effort disclosed on both sides.
+- **Measurable "materially better."** A quantitative definition of what
+  materially better than the baselines means — metrics, magnitudes,
+  workloads, and confidence — agreed before any performance evidence is
+  collected, so success cannot be redefined after the fact.
+- **Non-goals.** What the project explicitly will not attempt in this phase,
+  including deferred platforms, device classes, and security objectives
+  beyond isolation and crash containment.
+- **Stop conditions.** Concrete, checkable conditions under which the honest
+  synthesis outcome is stop rather than continue, stated before feasibility
+  or performance work begins.
+
+## Exit criteria
+
+The track is complete when each required definition above has an accepted,
+independently reviewed resolution, a recorded end-of-track breadth pass, and
+every surfaced question is filed in the question backlog. Downstream tracks
+inherit this scope; they may not silently widen or narrow it.
