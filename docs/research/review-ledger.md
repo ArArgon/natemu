@@ -20,10 +20,12 @@ review, finding, verdict, or gate completion.
 
 ## Gate completion, applicability, and independence
 
-Gate applicability by evidence type and the completion rule — an applicable
-gate passes only when all required reviews have verdict `accept`, required
-independence is met, and every required change is closed — are defined
-normatively in the [evidence policy](evidence-policy.md#gate-completion).
+Gate applicability by evidence type is defined normatively in the evidence
+policy's [promotion and challenge](evidence-policy.md#promotion-and-challenge)
+section. The completion rule — an applicable gate passes only when all
+required reviews have verdict `accept`, required independence is met, and
+every required change is closed — is defined normatively in
+[gate completion](evidence-policy.md#gate-completion).
 
 This ledger adds the recording mechanics. A missing applicable entry means the
 corresponding gate has not passed. `not-applicable` is a verdict only with an

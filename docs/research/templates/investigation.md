@@ -137,9 +137,10 @@ here.
 ## Applicable gates and review links
 
 Record every row. `not-applicable` requires an explicit reason. Gate
-applicability by evidence type and the rule for when an applicable gate passes
-are defined normatively in the
-[evidence policy](../evidence-policy.md#gate-completion). The Verdict(s) cell
+applicability by evidence type is defined normatively in the evidence policy's
+[promotion and challenge](../evidence-policy.md#promotion-and-challenge)
+section; the rule for when an applicable gate passes is defined in
+[gate completion](../evidence-policy.md#gate-completion). The Verdict(s) cell
 records every required review's verdict, with the gate-closing verdict last.
 
 | Gate | Applicable? | NA reason | Review ID(s) | Independence required/met | Verdict(s) | Unresolved changes | Status |

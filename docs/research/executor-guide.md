@@ -13,9 +13,11 @@ silently skipped:
 Select question → breadth pass → question gate → source gate → method proposal → method gate → harness implementation → harness gate → collect raw data → result gate → independent replication → adversarial critique (adversarial gate) → synthesis gate.
 
 The gate names are question, source, method, harness, result, replication,
-adversarial, and synthesis. Which gates apply to which evidence, and when an
-applicable gate passes, are defined normatively in the
-[evidence policy](evidence-policy.md#gate-completion).
+adversarial, and synthesis. Which gates apply to which evidence is defined
+normatively in the evidence policy's
+[promotion and challenge](evidence-policy.md#promotion-and-challenge) section;
+when an applicable gate passes is defined in
+[gate completion](evidence-policy.md#gate-completion).
 
 The breadth pass must cover product assumptions, adjacent systems, negative and
 boundary cases, host/guest matrices, multicore interactions, alternatives,
