@@ -29,8 +29,8 @@ probes/guest_rates/work/
 probes/oracle/work/
 probes/oracle/*.so
 
-# Research outputs are external artifacts, not repository content
-artifacts/
-results/
-downloads/
-scratch/
+# Research outputs are untracked repository-root artifacts
+/artifacts/
+/results/
+/downloads/
+/scratch/
