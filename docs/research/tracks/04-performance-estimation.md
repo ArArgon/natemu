@@ -1,13 +1,13 @@
 # Performance estimation
 
-This track is a roadmap only. It defines how separately authorized research
-must estimate, before full measurement, whether the surviving options
-carried forward by [Architecture options](03-architecture-options.md) — its
+This track defines how research must estimate, before full measurement,
+whether the surviving options carried forward by
+[Architecture options](03-architecture-options.md) — its
 recommendation, plus any family whose rejection a recorded falsifier has
 reopened — can plausibly meet the "materially better" definition from
 [Scope and success](00-scope-and-success.md); the track estimates only that
-set, and it records no findings and no performance claims. Work on this
-track runs only under separate research authorization and follows the
+set. It is a roadmap, not a finding, and it makes no performance claims.
+Work on it follows the
 [research governance](../README.md), the
 [evidence policy](../evidence-policy.md), and the
 [executor guide](../executor-guide.md).

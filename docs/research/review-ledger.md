@@ -1,8 +1,8 @@
 # Review ledger
 
-This ledger is empty until separately authorized research produces work for
-review. A missing applicable entry means the corresponding gate has not
-passed; it may never be treated as silently satisfied.
+This ledger records every review. It starts empty. A missing applicable entry
+means the corresponding gate has not passed; it may never be treated as
+silently satisfied.
 
 ## Review types
 

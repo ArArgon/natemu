@@ -1,8 +1,7 @@
 # Experiment code
 
-Reviewed code for separately authorized experiments, one directory per
-investigation. This directory is empty until research is authorized; nothing
-here is inherited from commit `a121702`, and nothing here is implementation.
+Reviewed code for experiments, one directory per investigation. Nothing here
+is inherited from commit `a121702`, and nothing here is implementation.
 
 ```text
 experiments/

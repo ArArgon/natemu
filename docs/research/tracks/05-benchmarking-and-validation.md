@@ -1,13 +1,11 @@
 # Benchmarking and validation
 
-This track is a roadmap only. It defines how separately authorized research
-must measure the surviving options carried forward by
-[Architecture options](03-architecture-options.md) — the same set
+This track defines how research must measure the surviving options carried
+forward by [Architecture options](03-architecture-options.md) — the same set
 [Performance estimation](04-performance-estimation.md) estimates — against
 the fair baselines defined by
 [Scope and success](00-scope-and-success.md), QEMU TCG required among them;
-it records no findings and no results. Work on this track runs only under
-separate research authorization and follows the
+it is a roadmap, not a result. Work on it follows the
 [research governance](../README.md), the
 [evidence policy](../evidence-policy.md), and the
 [executor guide](../executor-guide.md).
@@ -40,18 +38,19 @@ resolved with labelled evidence through the applicable gates (see
 
 ## Required coverage
 
-Every reported comparison must cover: at least two host machines spanning at
-least two Apple Silicon generations, and at least two guest configurations
-from the supported envelope; a vCPU ladder of
-1, 2, 4, and 8+ vCPUs; and workload classes spanning compute, memory,
-fault- and syscall-heavy, I/O, and concurrency-dominated behavior, so no
-single benchmark-shaped workload carries a conclusion.
+A comparison is reported for the host it ran on; its manifest names the
+machine and OS, and both sides of the comparison run on that machine under
+identical conditions. Cross-machine numbers are never compared directly.
 
-Host machines need not be available at the same time. Matrix coverage may be
-collected sequentially, one machine at a time, provided each run's manifest
-identifies its machine and OS and every comparison is made within one machine
-under identical conditions; cross-machine numbers are never compared
-directly.
+Before synthesis treats a performance conclusion as platform-wide, the
+coverage must reach at least two host machines spanning at least two Apple
+Silicon generations, and at least two guest configurations from the
+supported envelope; a vCPU ladder of 1, 2, 4, and 8+ vCPUs; and workload
+classes spanning compute, memory, fault- and syscall-heavy, I/O, and
+concurrency-dominated behavior, so no single benchmark-shaped workload
+carries a conclusion. That coverage is built incrementally, one machine at a
+time as hosts become available; a conclusion that has not reached it is
+reported with the narrower applicability it has.
 
 ## Result validity
 

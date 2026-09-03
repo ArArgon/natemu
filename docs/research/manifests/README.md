@@ -2,8 +2,7 @@
 
 One file per immutable raw artifact, as required by the
 [evidence policy](../evidence-policy.md). The artifact itself stays outside
-Git under the external raw-data root; only the manifest is committed. This
-directory is empty until research is authorized.
+Git under the external raw-data root; only the manifest is committed.
 
 - Identifier: `MAN-<track>-<nn>-<nn>`, the investigation number then a
   sequence, per the [identifier table](../README.md#identifiers), for example

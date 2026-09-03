@@ -1,11 +1,10 @@
 # Executor guide
 
-This guide defines a future workflow only. Organization work does not execute
-the workflow. Any execution is conditional on separate research authorization.
+This guide defines the research workflow.
 
 ## Workflow
 
-When separately authorized, use this sequence as the superset workflow. Apply
+Use this sequence as the superset workflow. Apply
 only the conditional gates required by the evidence being considered; an
 inapplicable gate must be recorded as `not-applicable` with its reason, never
 silently skipped:
@@ -44,11 +43,11 @@ for required independent review.
 Independent replication must independently prepare and review its own
 experiment code, then reproduce the claimed result from the approved question
 and documented method in its own reviewable execution record.
-Platform-sensitive load-bearing observations must be independently replicated
-across their declared machine/OS matrix. That replication may run sequentially
-as machines become available; the matrix is complete when every declared cell
-has its own reviewed run. If that matrix is not completed, the finding retains
-a narrow applicability statement and cannot close a platform-wide gate.
+A platform-sensitive observation is valid for the host and OS it was measured
+on and states that applicability. Replication on further hosts widens the
+applicability statement and is done incrementally as machines become
+available; it is required only before synthesis relies on the finding as
+platform-wide.
 Adversarial critique actively seeks counterexamples, hidden assumptions,
 applicability failures, and code defects. A failed review returns the work to
 the appropriate earlier step; it does not create a finding by itself.

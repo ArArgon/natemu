@@ -3,8 +3,7 @@
 One file per review, copied from the
 [critique template](../templates/critique.md). Every file here has a matching
 row in the [review ledger](../review-ledger.md); a review not in the ledger
-has not happened. This directory is empty until
-research is authorized.
+has not happened.
 
 - Identifier: `REV-<nnn>`, a three-digit sequence across all review types,
   per the [identifier table](../README.md#identifiers), for example `REV-017`.

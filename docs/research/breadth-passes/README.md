@@ -3,8 +3,7 @@
 The auditable record of each breadth pass the
 [executor guide](../executor-guide.md) requires: the pass before a question
 is answered, and the end-of-track pass from product, architecture,
-correctness, and methodology perspectives. This directory is empty until
-research is authorized.
+correctness, and methodology perspectives.
 
 - Identifier: `BP-<track>-<nn>-start` for the pass before a question,
   `BP-<track>-end` for the end-of-track pass, per the

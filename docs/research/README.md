@@ -17,9 +17,8 @@ This research starts from an intentionally narrow product envelope:
 
 Security is deprioritized beyond isolation and crash containment for this phase.
 
-Nothing inherited in this repository is verified evidence, and this organization
-change has run no research. The preservation checkpoint is provenance only; it
-can seed questions, not conclusions.
+Nothing inherited in this repository is verified evidence. The preservation
+checkpoint is provenance only; it can seed questions, not conclusions.
 
 ## Boundaries
 
@@ -27,16 +26,15 @@ Research creates and evaluates evidence against approved questions. Planning,
 once research has authorized it, turns an accepted synthesis outcome into an
 architecture and delivery proposal. Implementation begins only after research
 authorizes planning, planning is completed and approved, and implementation is
-separately authorized. Organizing this workspace is none of those activities:
-it authorizes no browsing, source study, probes, experiments, benchmarks, or
-implementation decisions.
+separately authorized. Research makes no implementation decisions.
 
 The governing documents are [the evidence policy](evidence-policy.md) and [the
-executor guide](executor-guide.md). Future work will record questions in the
+executor guide](executor-guide.md). Questions are recorded in the
 [question backlog](question-backlog.md), sources in the
 [source ledger](source-ledger.md), and reviews in the
-[review ledger](review-ledger.md). Use the [investigation template](templates/investigation.md)
-and [critique template](templates/critique.md) during separately authorized work.
+[review ledger](review-ledger.md). Use the
+[investigation template](templates/investigation.md) and
+[critique template](templates/critique.md).
 
 Each record type has one home. Investigation records live in
 [`investigations/`](investigations/README.md), review records in
@@ -67,8 +65,7 @@ identifier with a withdrawn status.
 
 ## Tracks
 
-The tracks are read in this order; their links are reserved for later,
-separately authorized work.
+The tracks are read in this order.
 
 1. [Scope and success](tracks/00-scope-and-success.md)
 2. [Feasibility](tracks/01-feasibility.md)

@@ -1,8 +1,7 @@
 # Investigation records
 
-One file per separately authorized investigation, copied from the
-[investigation template](../templates/investigation.md). This directory is
-empty until research is authorized; its presence authorizes nothing.
+One file per investigation, copied from the
+[investigation template](../templates/investigation.md).
 
 - Identifier: `INV-<track>-<nn>`, per the
   [identifier table](../README.md#identifiers), for example `INV-01-03`. It

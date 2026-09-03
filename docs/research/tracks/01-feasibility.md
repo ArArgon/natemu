@@ -1,12 +1,10 @@
 # Feasibility
 
-This track is a roadmap only. It lists what separately authorized research
-must establish about the host platform before any architecture is proposed;
-it records no findings, and no claim about how the platform actually behaves
-belongs here. Work on this track runs only under separate research
-authorization and follows the [research governance](../README.md), the
-[evidence policy](../evidence-policy.md), and the
-[executor guide](../executor-guide.md).
+This track lists what research must establish about the host platform before
+any architecture is proposed. It is a roadmap, not a finding: no claim about
+how the platform actually behaves belongs here. Work on it follows the
+[research governance](../README.md), the [evidence policy](../evidence-policy.md),
+and the [executor guide](../executor-guide.md).
 
 ## Questions the track must answer
 

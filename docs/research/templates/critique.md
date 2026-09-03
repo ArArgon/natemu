@@ -1,8 +1,7 @@
 # Critique template
 
-Copy this file only for a separately authorized review. The intentional fields
-below are unpopulated; this template does not perform research or establish a
-verdict.
+Copy this file for each review. The fields below are intentionally
+unpopulated; the template itself establishes no verdict.
 
 ## Metadata
 

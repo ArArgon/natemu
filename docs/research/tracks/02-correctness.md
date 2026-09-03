@@ -1,10 +1,9 @@
 # Correctness
 
-This track is a roadmap only. It defines what separately authorized research
-must demonstrate about emulation fidelity before any performance claim can
-stand; it records no findings. Work on this track runs only under separate
-research authorization and follows the [research governance](../README.md),
-the [evidence policy](../evidence-policy.md), and the
+This track defines what research must demonstrate about emulation fidelity
+before any performance claim can stand. It is a roadmap, not a finding. Work
+on it follows the [research governance](../README.md), the
+[evidence policy](../evidence-policy.md), and the
 [executor guide](../executor-guide.md).
 
 ## Correctness surface

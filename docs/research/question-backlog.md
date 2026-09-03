@@ -1,17 +1,15 @@
 # Question backlog
 
-This backlog is intentionally empty until separately authorized research
-creates entries. Its presence organizes future work only; it does not
-authorize browsing, source acquisition, probes, experiments, benchmarking, or
-any other research activity.
+This backlog holds every research question. It starts empty; the first
+breadth pass on [Scope and success](tracks/00-scope-and-success.md) seeds it.
 
 ## Status vocabulary
 
 Use exactly one status per question:
 
-- `proposed` — recorded but not yet authorized for research.
-- `gated` — authorized question awaiting its question-gate review.
-- `investigating` — authorized evidence work is in progress.
+- `proposed` — recorded but not yet selected for work.
+- `gated` — selected question awaiting its question-gate review.
+- `investigating` — evidence work is in progress.
 - `review` — evidence work is awaiting an applicable review gate.
 - `accepted` — the question has an accepted, applicable resolution.
 - `rejected` — the question or its proposed resolution was rejected.
@@ -41,8 +39,8 @@ Question identifiers are `Q-<track>-<nn>`, per the
 [identifier table](README.md#identifiers); the investigation answering a
 question shares its number.
 
-Copy this template into the applicable empty category only after separate
-research authorization. Do not treat the placeholders as an entry.
+Copy this template into the applicable category. Do not treat the
+placeholders as an entry.
 
 | Identifier | Question | Why it matters | Dependencies | Downstream decisions | Applicability dimensions | Resolution method | Evidence status | Review status | Newly surfaced questions — breadth pass | Newly surfaced questions — source/method/execution/result work |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -50,7 +48,7 @@ research authorization. Do not treat the placeholders as an entry.
 
 ## Breadth-pass rule
 
-For each authorized question, the executor must record an auditable breadth
+For each selected question, the executor must record an auditable breadth
 pass and update this backlog with every newly surfaced issue. If the pass
 surfaces none, record the exact phrase `no new issues found`. A breadth pass
 organizes questions; it does not establish evidence or a conclusion.

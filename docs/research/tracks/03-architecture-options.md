@@ -1,10 +1,9 @@
 # Architecture options
 
-This track is a roadmap only. It defines how separately authorized research
-must compare the architecture families that survive
-[Feasibility](01-feasibility.md); it records no findings and makes no design
-decisions. Work on this track runs only under separate research authorization
-and follows the [research governance](../README.md), the
+This track defines how research must compare the architecture families that
+survive [Feasibility](01-feasibility.md). It is a roadmap, not a finding, and
+it makes no design decisions. Work on it follows the
+[research governance](../README.md), the
 [evidence policy](../evidence-policy.md), and the
 [executor guide](../executor-guide.md).
 

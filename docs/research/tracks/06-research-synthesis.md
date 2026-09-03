@@ -1,9 +1,7 @@
 # Research synthesis
 
-This track is a roadmap only. It defines how separately authorized research
-must assemble a final decision packet from the preceding tracks; it records
-no findings and reaches no decision here. Work on this track runs only under
-separate research authorization and follows the
+This track defines how research must assemble a final decision packet from
+the preceding tracks. It is a roadmap, not a decision. Work on it follows the
 [research governance](../README.md), the
 [evidence policy](../evidence-policy.md), and the
 [executor guide](../executor-guide.md).

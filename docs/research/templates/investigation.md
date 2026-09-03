@@ -1,8 +1,7 @@
 # Investigation template
 
-Copy this file for a separately authorized investigation. Every field below is
-intentional and blank by design; this template records no research, sources,
-questions, methods, or results.
+Copy this file for each investigation. Every field below is intentional and
+blank by design; the template itself records no research.
 
 ## Metadata
 
@@ -12,7 +11,6 @@ questions, methods, or results.
 - Date range:
 - Status: `proposed | gated | investigating | review | accepted | rejected | blocked`
 - Dominant investigation method/context (does not replace per-claim evidence labels):
-- Authorization reference:
 
 ## Question and decision relevance
 

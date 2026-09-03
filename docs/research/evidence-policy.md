@@ -1,8 +1,5 @@
 # Evidence policy
 
-This policy applies only when research has been separately authorized. This
-organization work does not collect, assess, or promote evidence.
-
 ## Evidence labels
 
 - **Source-backed** — a claim directly supported by a primary specification,
@@ -64,7 +61,3 @@ all required changes are closed. A review cannot record `accept` while it has
 unresolved required changes or unmet required independence. Missing applicable
 gate records do not pass, and `not-applicable` never substitutes for an
 omitted reason.
-
-No policy label converts a future action into authorization. Browsing, source
-acquisition, experiment code, data collection, or synthesis remains
-conditional on separate authorization for that research work.

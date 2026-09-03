@@ -1,8 +1,7 @@
 # Scope and success
 
-This track is a roadmap only. It defines what separately authorized research
-must settle first; it records no findings, and nothing here is evidence. Work
-on this track runs only under separate research authorization and follows the
+This track defines what research must settle first. It is a roadmap, not a
+finding: nothing here is evidence. Work on it follows the
 [research governance](../README.md), the [evidence policy](../evidence-policy.md),
 and the [executor guide](../executor-guide.md).
 
