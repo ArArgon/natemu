@@ -40,9 +40,9 @@ Use exactly one status per question:
 Copy this template into the applicable empty category only after separate
 research authorization. Do not treat the placeholders as an entry.
 
-| Identifier | Question | Why it matters | Dependencies | Downstream decisions | Applicability dimensions | Resolution method | Evidence status | Review status | Newly surfaced questions |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `<Q-ID>` | `<question>` | `<decision relevance>` | `<dependencies or none>` | `<decisions affected>` | `<host / OS / guest / CPU / topology / workload>` | `<source, observation, inference, or hypothesis>` | `<unstarted / label and links>` | `<required gate and verdict>` | `<IDs, or no new issues found>` |
+| Identifier | Question | Why it matters | Dependencies | Downstream decisions | Applicability dimensions | Resolution method | Evidence status | Review status | Newly surfaced questions — breadth pass | Newly surfaced questions — source/method/execution/result work |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `<Q-ID>` | `<question>` | `<decision relevance>` | `<dependencies or none>` | `<decisions affected>` | `<host / OS / guest / CPU / topology / workload>` | `<primary-source analysis, controlled experiment, prototype spike, comparative audit, or other actual method>` | `<unstarted / claim labels and links>` | `<required gate and verdict>` | `<IDs, or no new issues found>` | `<stage and IDs, or no new issues found>` |
 
 ## Breadth-pass rule
 
@@ -50,3 +50,8 @@ For each authorized question, the executor must record an auditable breadth
 pass and update this backlog with every newly surfaced issue. If the pass
 surfaces none, record the exact phrase `no new issues found`. A breadth pass
 organizes questions; it does not establish evidence or a conclusion.
+
+Record discoveries from the breadth pass in its own column. Record discoveries
+that arise later during source, method, execution, or result work in the other
+column, with the stage that surfaced them. Do not merge these two discovery
+paths: they have different audit value.

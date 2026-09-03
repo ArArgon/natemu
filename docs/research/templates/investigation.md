@@ -10,7 +10,7 @@ questions, methods, or results.
 - Owner/session:
 - Date range:
 - Status: `proposed | gated | investigating | review | accepted | rejected | blocked`
-- Evidence type: `Source-backed | Observed | Inferred | Hypothesis`
+- Dominant investigation method/context (does not replace per-claim evidence labels):
 - Authorization reference:
 
 ## Question and decision relevance
@@ -31,12 +31,23 @@ questions, methods, or results.
   harness-failure coverage:
 - Backlog entries created for newly surfaced questions, or exact statement:
   `no new issues found`
+- Discoveries during source, method, execution, or result work, recorded
+  separately with stage and backlog ID, or exact statement: `no new issues found`
 
 ## Source inventory
 
 | Source ID | Classification | Version/date | Exact sections | Claim use | Applicability limits |
 | --- | --- | --- | --- | --- | --- |
 |  |  |  |  |  |  |
+
+## Claim inventory
+
+Use one row per claim. The evidence label belongs to each individual claim;
+the investigation's dominant method/context must never substitute for it.
+
+| Claim ID | Exact claim | Evidence label | Source/artifact reference | Version/revision | Applicability | Derivation (if inferred) | Review status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+|  |  |  |  |  |  |  |  |
 
 ## Hypothesis and falsifier
 
@@ -121,6 +132,24 @@ questions, methods, or results.
 
 ## Applicable gates and review links
 
-| Gate | Applicable? | Review ID/link | Verdict or NA reason |
-| --- | --- | --- | --- |
-|  |  |  |  |
+Record every row. `not-applicable` requires an explicit reason. Preserve
+evidence-type applicability: question applies to every question; source to
+Source-backed claims; method, harness, and result to experiments; replication
+to load-bearing Observed findings; adversarial to every load-bearing candidate
+finding; synthesis to the final decision packet only.
+
+An applicable gate passes only when all required reviews have verdict `accept`,
+required independence is met, and all required changes are closed. Otherwise
+its status is not passed. A synthesis review is not an individual-finding
+prerequisite.
+
+| Gate | Applicable? | NA reason | Review ID(s) | Independence required/met | Verdict | Unresolved changes | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| question |  |  |  |  |  |  |  |
+| source |  |  |  |  |  |  |  |
+| method |  |  |  |  |  |  |  |
+| harness |  |  |  |  |  |  |  |
+| result |  |  |  |  |  |  |  |
+| replication |  |  |  |  |  |  |  |
+| adversarial |  |  |  |  |  |  |  |
+| synthesis |  |  |  |  |  |  |  |

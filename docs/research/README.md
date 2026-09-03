@@ -36,7 +36,7 @@ executor guide](executor-guide.md). Future work will record questions in the
 [question backlog](question-backlog.md), sources in the
 [source ledger](source-ledger.md), and reviews in the
 [review ledger](review-ledger.md). Use the [investigation template](templates/investigation.md)
-and [critique template](templates/critique.md) when those files are introduced.
+and [critique template](templates/critique.md) during separately authorized work.
 
 ## Tracks
 

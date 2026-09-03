@@ -20,6 +20,11 @@ not evidence and cannot support a decision. Each Source-backed claim requires a
 claim-level citation, including source version and applicability to the defined
 product envelope. Load-bearing claims require independent review.
 
+Record each source-to-claim mapping separately, including the exact section,
+support or contradiction relationship, source revision, and applicability.
+An investigation may name a dominant method or context, but that never replaces
+the evidence label required on every individual claim.
+
 Raw data is an immutable external artifact, not Git content. Its manifest must
 identify the artifact, producing harness and version, method, environment,
 inputs, and integrity information. A prior checkpoint may seed hypotheses only;
@@ -38,6 +43,16 @@ then approves, revises, or rejects the final decision packet; it is not an
 individual-finding prerequisite. A contradiction reopens the finding and every
 dependent decision until the contradiction is resolved or the claim is
 withdrawn.
+
+## Gate completion
+
+Each investigation must explicitly record all eight gate types as applicable
+or `not-applicable` with a reason. An applicable gate passes only when all
+required reviews have verdict `accept`, all required independence is met, and
+all required changes are closed. A review cannot record `accept` while it has
+unresolved required changes or unmet required independence. Missing applicable
+gate records do not pass, and `not-applicable` never substitutes for an
+omitted reason.
 
 No policy label converts a future action into authorization. Browsing, source
 acquisition, harness work, data collection, or synthesis remains conditional on
