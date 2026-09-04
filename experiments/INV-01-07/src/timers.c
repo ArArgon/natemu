@@ -33,6 +33,28 @@ static long g_n_clock = 200000; /* samples for clock read cost / resolution */
 
 static struct mach_timebase_info g_tb;
 
+static void fail_pthread(int rc, const char *what) {
+	if (rc == 0) return;
+	errno = rc;
+	perror(what);
+	exit(1);
+}
+static void *xmalloc(size_t size) {
+	void *p = malloc(size);
+	if (!p) { perror("malloc"); exit(1); }
+	return p;
+}
+static long parse_positive(const char *s, const char *what) {
+	char *end = NULL;
+	errno = 0;
+	long v = strtol(s, &end, 10);
+	if (errno || !end || *end != '\0' || v <= 0) {
+		fprintf(stderr, "%s must be a positive integer: %s\n", what, s);
+		exit(2);
+	}
+	return v;
+}
+
 static inline uint64_t abs_to_ns(uint64_t a) {
 	return (uint64_t)((__uint128_t)a * g_tb.numer / g_tb.denom);
 }
@@ -79,7 +101,8 @@ static void emit_stats(FILE *f, const char *name, const char *mech,
 /* ---------- QoS ---------- */
 
 static void set_qos(qos_class_t q) {
-	(void)pthread_set_qos_class_self_np(q, 0);
+	fail_pthread(pthread_set_qos_class_self_np(q, 0),
+	             "pthread_set_qos_class_self_np");
 }
 static const char *qos_name(qos_class_t q) {
 	return q == QOS_CLASS_USER_INTERACTIVE ? "user-interactive" : "background";
@@ -98,7 +121,7 @@ static uint64_t read_clock(const struct clockinfo *c) {
 	if (c->use_mach) return mach_absolute_time();
 	if (c->use_nsec_np) return clock_gettime_nsec_np(c->id);
 	struct timespec ts;
-	clock_gettime(c->id, &ts);
+	if (clock_gettime(c->id, &ts) != 0) { perror("clock_gettime"); exit(1); }
 	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
@@ -193,13 +216,15 @@ static void *xclock_thread(void *arg) {
 static void probe_cross_thread_clock(FILE *f) {
 	struct xclock s;
 	memset(&s, 0, sizeof s);
-	pthread_mutex_init(&s.m, NULL);
+	fail_pthread(pthread_mutex_init(&s.m, NULL), "pthread_mutex_init");
 	s.iters = 200000;
 	atomic_store(&s.inversions, 0);
 	atomic_store(&s.worst_backward_ns, 0);
 	pthread_t t[4];
-	for (int i = 0; i < 4; i++) pthread_create(&t[i], NULL, xclock_thread, &s);
-	for (int i = 0; i < 4; i++) pthread_join(t[i], NULL);
+	for (int i = 0; i < 4; i++)
+		fail_pthread(pthread_create(&t[i], NULL, xclock_thread, &s), "pthread_create");
+	for (int i = 0; i < 4; i++)
+		fail_pthread(pthread_join(t[i], NULL), "pthread_join");
 	long inv = atomic_load(&s.inversions);
 	long long worst = atomic_load(&s.worst_backward_ns);
 	if (g_negative) { inv += 1; worst = 137; } /* injected defect */
@@ -219,18 +244,23 @@ struct dt_ctx {
 
 static void wakeup_arm(FILE *f, const char *mech, long target_ns,
                        qos_class_t q, int last) {
-	int64_t *err = malloc(sizeof(int64_t) * (size_t)g_n);
+	int64_t *err = xmalloc(sizeof(int64_t) * (size_t)g_n);
 	set_qos(q);
 	for (long i = 0; i < g_n; i++) {
 		uint64_t deadline_abs = mach_absolute_time() + ns_to_abs((uint64_t)target_ns);
 		uint64_t woke;
 		if (strcmp(mech, "mach_wait_until") == 0) {
-			mach_wait_until(deadline_abs);
+			if (mach_wait_until(deadline_abs) != KERN_SUCCESS) {
+				fprintf(stderr, "mach_wait_until failed\n");
+				exit(1);
+			}
 			woke = mach_absolute_time();
 		} else if (strcmp(mech, "nanosleep") == 0) {
 			struct timespec ts = {target_ns / 1000000000L,
 			                      target_ns % 1000000000L};
-			while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
+			int rc;
+			do { rc = nanosleep(&ts, &ts); } while (rc == -1 && errno == EINTR);
+			if (rc == -1) { perror("nanosleep"); exit(1); }
 			woke = mach_absolute_time();
 		} else { /* dispatch_source timer, leeway 0 */
 			dispatch_queue_t qq = dispatch_get_global_queue(
@@ -241,6 +271,7 @@ static void wakeup_arm(FILE *f, const char *mech, long target_ns,
 			    DISPATCH_SOURCE_TYPE_TIMER, 0, 0, qq);
 			__block uint64_t fired = 0;
 			dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+			if (!src || !sem) { fprintf(stderr, "dispatch allocation failed\n"); exit(1); }
 			dispatch_source_set_event_handler(src, ^{
 				fired = mach_absolute_time();
 				dispatch_semaphore_signal(sem);
@@ -322,20 +353,21 @@ static void *spin_target(void *a) {
 static void signal_arm(FILE *f, const char *mech, qos_class_t q, int last) {
 	struct sig_ctx c;
 	memset(&c, 0, sizeof c);
-	pthread_mutex_init(&c.m, NULL);
-	pthread_cond_init(&c.cv, NULL);
+	fail_pthread(pthread_mutex_init(&c.m, NULL), "pthread_mutex_init");
+	fail_pthread(pthread_cond_init(&c.cv, NULL), "pthread_cond_init");
 	c.sem = dispatch_semaphore_create(0);
+	if (!c.sem) { fprintf(stderr, "dispatch_semaphore_create failed\n"); exit(1); }
 	c.q = q;
 	g_sig = &c;
 	void *(*fn)(void *) = strcmp(mech, "pthread_cond_signal") == 0 ? cond_target
 	                      : strcmp(mech, "dispatch_semaphore_signal") == 0
 	                          ? sem_target
 	                          : spin_target;
-	pthread_create(&c.target, NULL, fn, &c);
+	fail_pthread(pthread_create(&c.target, NULL, fn, &c), "pthread_create");
 	while (!atomic_load(&c.ready)) sched_yield();
 	usleep(20000);
 
-	int64_t *lat = malloc(sizeof(int64_t) * (size_t)g_n);
+	int64_t *lat = xmalloc(sizeof(int64_t) * (size_t)g_n);
 	long lost = 0, got = 0;
 	for (long i = 0; i < g_n; i++) {
 		atomic_store(&c.flag, 0);
@@ -348,7 +380,7 @@ static void signal_arm(FILE *f, const char *mech, qos_class_t q, int last) {
 		} else if (fn == sem_target) {
 			dispatch_semaphore_signal(c.sem);
 		} else {
-			pthread_kill(c.target, SIGUSR1);
+			fail_pthread(pthread_kill(c.target, SIGUSR1), "pthread_kill");
 		}
 		uint64_t spin_start = t0;
 		while (!atomic_load(&c.flag)) {
@@ -368,7 +400,7 @@ static void signal_arm(FILE *f, const char *mech, qos_class_t q, int last) {
 	} else if (fn == sem_target) {
 		dispatch_semaphore_signal(c.sem);
 	}
-	pthread_join(c.target, NULL);
+	fail_pthread(pthread_join(c.target, NULL), "pthread_join");
 
 	stats_t s = summarize(lat, got);
 	fprintf(f,
@@ -405,10 +437,21 @@ int main(int argc, char **argv) {
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--negative")) g_negative = 1;
 		else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
-		else if (!strcmp(argv[i], "--n") && i + 1 < argc) g_n = atol(argv[++i]);
+		else if (!strcmp(argv[i], "--n") && i + 1 < argc)
+			g_n = parse_positive(argv[++i], "--n");
 		else { fprintf(stderr, "usage: %s [--out F] [--n N] [--negative]\n", argv[0]); return 2; }
 	}
 	if (mach_timebase_info(&g_tb) != KERN_SUCCESS) { perror("timebase"); return 1; }
+	if (g_tb.numer == 0 || g_tb.denom == 0) {
+		fprintf(stderr, "invalid Mach timebase ratio\n");
+		return 1;
+	}
+	atomic_ullong lockfree_ullong;
+	atomic_int lockfree_int;
+	if (!atomic_is_lock_free(&lockfree_ullong) || !atomic_is_lock_free(&lockfree_int)) {
+		fprintf(stderr, "signal-handler atomics are not lock-free\n");
+		return 1;
+	}
 	struct sigaction sa;
 	memset(&sa, 0, sizeof sa);
 	sa.sa_handler = sigusr1_handler;

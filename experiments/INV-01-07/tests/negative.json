@@ -1,0 +1,42 @@
+{
+  "experiment": "INV-01-07",
+  "mode": "fixture-negative",
+  "timebase": {"numer": 1, "denom": 1},
+  "clocks": [
+    {"clock":"mach_absolute_time","backward_reads":0,"read_cost_p50_ns":50},
+    {"clock":"clock_gettime_nsec_np(CLOCK_UPTIME_RAW)","backward_reads":0,"read_cost_p50_ns":55},
+    {"clock":"clock_gettime(CLOCK_MONOTONIC_RAW)","backward_reads":0,"read_cost_p50_ns":60},
+    {"clock":"clock_gettime(CLOCK_MONOTONIC)","backward_reads":0,"read_cost_p50_ns":65},
+    {"clock":"clock_gettime(CLOCK_UPTIME_RAW)","backward_reads":0,"read_cost_p50_ns":70},
+    {"clock":"clock_gettime(CLOCK_REALTIME)","backward_reads":0,"read_cost_p50_ns":75}
+  ],
+  "cross_thread_clock": {"inversions":0,"worst_backward_ns":0},
+  "wakeup": [
+    {"mechanism":"mach_wait_until","target_ns":100000,"qos":"user-interactive","early":1,"n":2000,"p50_ns":-1},
+    {"mechanism":"mach_wait_until","target_ns":100000,"qos":"background","early":0,"n":2000,"p50_ns":20000},
+    {"mechanism":"mach_wait_until","target_ns":1000000,"qos":"user-interactive","early":0,"n":2000,"p50_ns":100000},
+    {"mechanism":"mach_wait_until","target_ns":1000000,"qos":"background","early":0,"n":2000,"p50_ns":200000},
+    {"mechanism":"mach_wait_until","target_ns":10000000,"qos":"user-interactive","early":0,"n":2000,"p50_ns":100000},
+    {"mechanism":"mach_wait_until","target_ns":10000000,"qos":"background","early":0,"n":2000,"p50_ns":200000},
+    {"mechanism":"nanosleep","target_ns":100000,"qos":"user-interactive","early":0,"n":2000,"p50_ns":10000},
+    {"mechanism":"nanosleep","target_ns":100000,"qos":"background","early":0,"n":2000,"p50_ns":20000},
+    {"mechanism":"nanosleep","target_ns":1000000,"qos":"user-interactive","early":0,"n":2000,"p50_ns":100000},
+    {"mechanism":"nanosleep","target_ns":1000000,"qos":"background","early":0,"n":2000,"p50_ns":200000},
+    {"mechanism":"nanosleep","target_ns":10000000,"qos":"user-interactive","early":0,"n":2000,"p50_ns":100000},
+    {"mechanism":"nanosleep","target_ns":10000000,"qos":"background","early":0,"n":2000,"p50_ns":200000},
+    {"mechanism":"dispatch_source_timer_leeway0","target_ns":100000,"qos":"user-interactive","early":0,"n":2000,"p50_ns":10000},
+    {"mechanism":"dispatch_source_timer_leeway0","target_ns":100000,"qos":"background","early":0,"n":2000,"p50_ns":20000},
+    {"mechanism":"dispatch_source_timer_leeway0","target_ns":1000000,"qos":"user-interactive","early":0,"n":2000,"p50_ns":100000},
+    {"mechanism":"dispatch_source_timer_leeway0","target_ns":1000000,"qos":"background","early":0,"n":2000,"p50_ns":200000},
+    {"mechanism":"dispatch_source_timer_leeway0","target_ns":10000000,"qos":"user-interactive","early":0,"n":2000,"p50_ns":100000},
+    {"mechanism":"dispatch_source_timer_leeway0","target_ns":10000000,"qos":"background","early":0,"n":2000,"p50_ns":200000}
+  ],
+  "signal": [
+    {"mechanism":"pthread_cond_signal","qos":"user-interactive","min_ns":-1,"p99_ns":60000,"lost":0,"n":2000},
+    {"mechanism":"pthread_cond_signal","qos":"background","min_ns":1,"p99_ns":70000,"lost":0,"n":2000},
+    {"mechanism":"dispatch_semaphore_signal","qos":"user-interactive","min_ns":1,"p99_ns":55000,"lost":0,"n":2000},
+    {"mechanism":"dispatch_semaphore_signal","qos":"background","min_ns":1,"p99_ns":65000,"lost":0,"n":2000},
+    {"mechanism":"pthread_kill_SIGUSR1_spinning","qos":"user-interactive","min_ns":1,"p99_ns":50000,"lost":0,"n":2000},
+    {"mechanism":"pthread_kill_SIGUSR1_spinning","qos":"background","min_ns":1,"p99_ns":80000,"lost":0,"n":2000}
+  ]
+}

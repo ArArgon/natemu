@@ -1,5 +1,5 @@
 CC      ?= clang
-CFLAGS  ?= -O2 -Wall -Wextra -std=c11 -fblocks
+CFLAGS  ?= -O2 -Wall -Wextra -Werror -std=c11 -fblocks
 LDFLAGS ?=
 BIN     ?= $(BUILD)/timers
 BUILD   ?= build
