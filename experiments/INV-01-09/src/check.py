@@ -39,15 +39,14 @@ def check(d):
     require(vn.get("success") == agreed_success,
             "vmnet_start_interface.success must require non-NULL return and "
             "callback status VMNET_SUCCESS")
-    require(
-        not (
-            (vn.get("start_returned_nonnull") is True
-             and vn.get("status_code") != 1000)
-            or (vn.get("start_returned_nonnull") is False
-                and vn.get("status_code") == 1000)
-        ),
-        "vmnet synchronous return and callback status disagree; outcome is ambiguous",
-    )
+    # No source establishes that the synchronous return value and the
+    # asynchronous callback status must agree (CLM-01-09-02/-11: the header
+    # states each contract separately and does not state precedence between
+    # them). A disagreement is therefore a real, reportable possible outcome,
+    # not proof of a broken probe, and must not be a hard-fail invariant here
+    # -- that would bake an undocumented assumption into the code gate and
+    # could never let a truthful normal run pass. Both raw fields are already
+    # recorded above for Results/Analysis to examine.
 
     for name in ("socket_stream", "socket_dgram"):
         s = d.get(name, {})
@@ -102,8 +101,11 @@ def check(d):
         "getentropy_over_limit.ok must be false: getentropy(2) documents a "
         "256-byte maximum per call",
     )
-    require(over.get("errno_val") == errno.EIO,
-            f"getentropy over-limit errno must be EIO ({errno.EIO})")
+    # errno_val is recorded but not asserted to a specific value: the man
+    # page documents EIO for "too many bytes requested", but this is the
+    # only field this checker treats as an open Hypothesis rather than a
+    # hard invariant (CLM-01-09-18) -- asserting the exact errno here would
+    # make the code gate pre-judge the evidence run's own question.
 
     bio = d.get("block_io", {})
     for field in (

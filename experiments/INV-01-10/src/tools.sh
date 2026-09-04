@@ -77,6 +77,8 @@ CODESIGN_PATH=$(resolve codesign || true)
 CODESIGN_VER=$( [ -n "$CODESIGN_PATH" ] && printf '(no --version option; present via xcrun --find)' || true)
 
 XCODE_SELECT_PATH=$(xcode-select -p 2>/dev/null || true)
+CLT_BUILD=$(pkgutil --pkg-info=com.apple.pkg.CLTools_Executables 2>/dev/null | \
+    awk -F': ' '/^version:/{print $2}' || true)
 
 XCTRACE_PATH=$(resolve xctrace || true)
 XCTRACE_FUNCTIONAL=false
@@ -133,5 +135,7 @@ printf '    "brew": {"present": %s, "path": %s, "version": %s}\n' \
     "$( [ -n "$BREW_PATH" ] && printf '"%s"' "$(json_escape "$BREW_VER")" || echo null )"
 printf '  },\n'
 printf '  "sdk_directory": "%s",\n' "$(json_escape "$SDK_DIR")"
-printf '  "sdk_directory_listing": [%s]\n' "$SDK_LIST"
+printf '  "sdk_directory_listing": [%s],\n' "$SDK_LIST"
+printf '  "clt_build": %s,\n' "$( [ -n "$CLT_BUILD" ] && printf '"%s"' "$(json_escape "$CLT_BUILD")" || echo null )"
+printf '  "path": "%s"\n' "$(json_escape "$PATH")"
 printf '}\n'

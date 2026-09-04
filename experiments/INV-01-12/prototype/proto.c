@@ -57,6 +57,7 @@ static int opt_timeout = DEFAULT_TIMEOUT;
 enum { CC_NONE = 0, CC_ADD, CC_SUB, CC_LOGIC, CC_INC, CC_DEC, CC_FLAGS };
 
 struct tlbe { uint64_t tag; uint8_t *host; uint64_t prot; }; /* prot: 1 read, 3 read+write */
+struct tbe { uint64_t gpa; void *code; };
 
 typedef struct cpu {
     /* --- fields addressed by generated code (offsets must stay under 32760) */
@@ -76,7 +77,7 @@ typedef struct cpu {
     /* --- host-only */
     int id;
     uint8_t *jit_base, *jit_ptr, *jit_end;
-    struct { uint64_t gpa; void *code; } *tb;
+    struct tbe *tb;
     struct tlbe *tlb;
     uint8_t *code_page;
     jmp_buf fault_jmp;
@@ -1196,7 +1197,7 @@ static void *tb_lookup(cpu_t *c, uint64_t gpa)
 {
     uint64_t h = (gpa * 0x9E3779B97F4A7C15ull) >> 48;
     for (int i = 0; i < 64; i++) {
-        struct { uint64_t gpa; void *code; } *s = &c->tb[(h + (uint64_t)i) & (TB_SLOTS - 1)];
+        struct tbe *s = &c->tb[(h + (uint64_t)i) & (TB_SLOTS - 1)];
         if (s->code && s->gpa == gpa) return s->code;
     }
     return NULL;
@@ -1205,7 +1206,7 @@ static void tb_insert(cpu_t *c, uint64_t gpa, void *code)
 {
     uint64_t h = (gpa * 0x9E3779B97F4A7C15ull) >> 48;
     for (int i = 0; i < 64; i++) {
-        struct { uint64_t gpa; void *code; } *s = &c->tb[(h + (uint64_t)i) & (TB_SLOTS - 1)];
+        struct tbe *s = &c->tb[(h + (uint64_t)i) & (TB_SLOTS - 1)];
         if (!s->code) { s->gpa = gpa; s->code = code; return; }
     }
     vabort(c, "code cache bucket full");

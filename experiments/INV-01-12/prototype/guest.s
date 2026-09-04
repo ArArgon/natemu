@@ -12,7 +12,6 @@
 
 .intel_syntax noprefix
 .text
-.globl _start
 
 .set IDT_BASE,   0x2000
 .set PT_ARENA,   0x10000
@@ -28,7 +27,7 @@
 .set KLOOP,      100000          // locked increments per vCPU
 .set NLOOP,      4096            // message-passing iterations per vCPU
 .set NIPI,       64              // IPIs vCPU 1 sends to vCPU 0
-.set SPINMAX,    20000000        // bounded spin, so a dropped event fails the
+.set SPINMAX,    1000000         // bounded spin, so a dropped event fails the
                                  // run through the checker rather than hanging
 .set CLISPIN,    300000
 
@@ -74,7 +73,8 @@ common:
     mov rax, LAPIC
     mov dword ptr [rax + 0x320], 0x20     // LVT timer vector
     mov dword ptr [rax + 0x380], 1        // start the host timer
-1:  mov edx, 0x10
+1:  sti                          // interrupts enabled for the concurrent phase
+    mov edx, 0x10
     out dx, eax                  // overlap window: begin
     call counter_loop
     call mp_loop
@@ -570,9 +570,10 @@ build_pt:
 
 // in: rdi = vector, rsi = handler address. clobbers rax, rcx, rdx.
 set_gate:
-    mov rax, rsi
-    and rax, 0xFFFF                       // offset 15:0
-    mov rcx, 8
+    mov rcx, rsi
+    and rcx, 0xFFFF                       // offset 15:0 (not via RAX: the
+    mov rax, rcx                          // accumulator short form is outside
+    mov rcx, 8                            // the documented subset)
     shl rcx, 16
     or rax, rcx                           // code selector
     mov rcx, 0x8E00                       // present, DPL 0, 64-bit interrupt gate
@@ -615,11 +616,9 @@ build_idt:
 // holding translated code and trigger the self-modifying-code path.
 
 .p2align 12
-.globl counter, mp_violations, mp_timeouts, pf_count, ud_count, gp_count
-.globl timer_ticks, timer_eois, ipi_recv, ipi_ack_timeouts, hlt_wakeups
-.globl cli_delta, smc_before, smc_after, cas_ok, cas_fail_rax
-.globl test_a_val, test_b_mem, test_c_mem, iters0, iters1
-.globl vcpu0_done, vcpu1_done, fault_log, loop_k, loop_n
+// Symbols stay local so that same-section references are resolved by the
+// assembler and the object needs no relocations; src/elfextract.py reads them
+// from .symtab regardless of binding.
 
 tables_ready:     .quad 0
 pml4_pa:          .quad 0

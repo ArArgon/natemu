@@ -61,6 +61,8 @@ def check(d):
         "sdk_directory_listing must contain at least one *.sdk entry",
     )
 
+    require(bool(d.get("path")), "path must be non-empty")
+
     return failures
 
 
