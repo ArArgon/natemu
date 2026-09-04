@@ -364,6 +364,8 @@ first (`REV-063` change 2).
 | `SRC-152` | `g6-apple-vz-running-linux.json` | `9feed704bc5d61a3ac10144eb1f6e321d432de46f24b76d31f8a802ebdcdab74` |
 | `SRC-153` | `g6-apple-vz-rosetta-directory-share.json` | `736a027ab90be941bee9a57b696784f69c64d7b24afc76ec7024249cb3aa4d93` |
 | `SRC-142` | `softfloat-copying-canonical.txt` (extracted from `SoftFloat-3e.zip`; CRLF, 1775 bytes — the registered claim source as of this addendum) | `1a9bde4daac8f2fd9593128ef605238471209e79c9fc2cabc22557d3da29fa65` |
+| `SRC-142` | `SoftFloat-3e.zip` (canonical distribution archive from `jhauser.us`) | `21130ce885d35c1fe73fc1e1bf2244178167e05c6747cad5f450cc991714c746` |
+| `SRC-142` | `softfloat-copying.txt` (superseded mirror capture, LF, 1738 bytes; identical to the canonical file after CRLF→LF normalisation; retained for provenance, `REV-069` change 1) | `145ea96b4a4a04a1a7738d2a2bf9e830f861971e69606187b018d9e8fc0b95c7` |
 
 The `verdict` is a review outcome, not a claim of truth. Claim-level citations,
 the required source gate, and an explicit relationship for both support and
