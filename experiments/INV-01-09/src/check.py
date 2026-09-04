@@ -20,6 +20,11 @@ def check(d):
         if not cond:
             failures.append(msg)
 
+    require(d.get("experiment") == "INV-01-09",
+            "experiment must be INV-01-09")
+    require(d.get("mode") in ("normal", "negative", "fixture-valid", "fixture-negative"),
+            "mode must identify a declared probe or fixture mode")
+
     host = d.get("host", {})
     require(host.get("hw_pagesize", 0) > 0, "host.hw_pagesize must be > 0")
     require(host.get("hw_ncpu", 0) >= 1, "host.hw_ncpu must be >= 1")

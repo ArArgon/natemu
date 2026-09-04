@@ -256,6 +256,11 @@ main(int argc, char **argv)
             g_label = argv[++i];
         } else if (strcmp(argv[i], "--scratch-dir") == 0 && i + 1 < argc) {
             scratch_dir = argv[++i];
+        } else {
+            fprintf(stderr,
+                "usage: %s [--negative] [--label LABEL] [--scratch-dir DIR]\n",
+                argv[0]);
+            return 2;
         }
     }
 
@@ -263,6 +268,7 @@ main(int argc, char **argv)
     sysctl_str("hw.model", model, sizeof(model));
 
     printf("{");
+    printf("\"experiment\":\"INV-01-09\",");
     printf("\"mode\":\"%s\",", g_negative ? "negative" : "normal");
     printf("\"label\":"); json_str(g_label); printf(",");
     printf("\"host\":{\"hw_pagesize\":%ld,\"hw_ncpu\":%ld,\"hw_model\":",
