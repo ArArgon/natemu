@@ -222,7 +222,6 @@ note records the recovery without creating duplicate source records.
 `SRC-080` was a duplicate registration of the `SRC-059` capture (same SHA-256
 `fbdda68c…`); its mapping rows now carry `SRC-059`, and `SRC-080` is reserved
 and must not be reused (`REV-040` change 6, `REV-055` change 1).
-| `SRC-028` | primary | Virtual I/O Device Version 1.4 | OASIS | existing CS01 source and capture | `CLM-01-13-13` | device IDs and feature layout | supports | Virtio 1.4 CS01 | Driver availability remains guest-specific. | pending | pending |
 | `SRC-035` | primary | `setrlimit(2)` | Apple | existing archived page and capture | `CLM-01-14-13` | `DESCRIPTION`: "The maximum number of simultaneous processes for this user id." (`RLIMIT_NPROC`) | supports | archived API documentation | Per-UID scope statement; current-OS enforcement is not probed by this investigation. | pending | pending |
 
 ## Review-date capture manifest
