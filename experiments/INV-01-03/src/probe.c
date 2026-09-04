@@ -7,6 +7,7 @@
  */
 #include <errno.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <mach/mach_vm.h>
 #include <mach/task_info.h>
 #include <setjmp.h>
@@ -31,7 +32,12 @@ static void emit_page_sizes(void) {
 	printf("    \"sysconf__SC_PAGESIZE\": %ld,\n", sysconf(_SC_PAGESIZE));
 	printf("    \"sysctl_hw_pagesize_ok\": %s,\n", hw_ok ? "true" : "false");
 	printf("    \"sysctl_hw_pagesize\": %zu,\n", hw_ok ? hw : (size_t)0);
-	printf("    \"compile_time_PAGE_SIZE\": %d\n", (int)PAGE_SIZE);
+	/* PAGE_SIZE is not an independent reading: <mach/arm/vm_param.h> defines it
+	 * as vm_page_size, so the pair cannot disagree. It is reported for the
+	 * record and excluded from the count and from the checker's comparison. */
+	printf("    \"compile_time_PAGE_SIZE\": %d,\n", (int)PAGE_SIZE);
+	printf("    \"compile_time_PAGE_SIZE_is_independent\": false,\n");
+	printf("    \"independent_reading_count\": %d\n", hw_ok ? 4 : 3);
 	printf("  },\n");
 }
 
@@ -222,14 +228,45 @@ static void emit_advice(void) {
 	errno = 0;
 	int mc = mincore(p, sz, vec);
 	int mce = errno;
+	unsigned b0 = (unsigned char)vec[0];
+	/* A second reading after clearing the vector and re-writing one page, so
+	 * the record shows whether MINCORE_MODIFIED tracks a fresh write. This is
+	 * the fault-free dirty-reporting candidate BP-01-05-start left open; the
+	 * bits are documented in mincore(2) and in <sys/mman.h>. */
+	memset(vec, 0, sizeof vec);
+	((volatile char *)p)[sz - 1] = 2;
+	errno = 0;
+	int mc2 = mincore(p, sz, vec);
+	unsigned bl = (unsigned char)vec[sz / (size_t)vm_page_size - 1];
 	errno = 0;
 	int mv = madvise(p, sz, MADV_FREE_REUSABLE);
 	int mve = errno;
+	memset(vec, 0, sizeof vec);
+	int mc3 = mincore(p, sz, vec);
+	unsigned b_after = (unsigned char)vec[0];
 	printf("    \"mapped\": true,\n");
 	printf("    \"mincore_rc\": %d, \"mincore_errno\": %d,\n", mc, mc == 0 ? 0 : mce);
-	printf("    \"mincore_first_byte\": %d,\n", (int)vec[0]);
-	printf("    \"madvise_free_reusable_rc\": %d, \"madvise_free_reusable_errno\": %d\n",
+	printf("    \"mincore_first_byte\": %u,\n", b0);
+	printf("    \"mincore_first_byte_flags\": {"
+	       "\"INCORE\": %s, \"REFERENCED\": %s, \"MODIFIED\": %s, "
+	       "\"REFERENCED_OTHER\": %s, \"MODIFIED_OTHER\": %s, "
+	       "\"PAGED_OUT\": %s, \"COPIED\": %s, \"ANONYMOUS\": %s},\n",
+	       b0 & MINCORE_INCORE ? "true" : "false",
+	       b0 & MINCORE_REFERENCED ? "true" : "false",
+	       b0 & MINCORE_MODIFIED ? "true" : "false",
+	       b0 & MINCORE_REFERENCED_OTHER ? "true" : "false",
+	       b0 & MINCORE_MODIFIED_OTHER ? "true" : "false",
+	       b0 & MINCORE_PAGED_OUT ? "true" : "false",
+	       b0 & MINCORE_COPIED ? "true" : "false",
+	       b0 & MINCORE_ANONYMOUS ? "true" : "false");
+	printf("    \"mincore_rc_after_write\": %d,\n", mc2);
+	printf("    \"mincore_written_page_byte\": %u,\n", bl);
+	printf("    \"mincore_written_page_modified\": %s,\n",
+	       bl & MINCORE_MODIFIED ? "true" : "false");
+	printf("    \"madvise_free_reusable_rc\": %d, \"madvise_free_reusable_errno\": %d,\n",
 	       mv, mv == 0 ? 0 : mve);
+	printf("    \"mincore_rc_after_madvise\": %d,\n", mc3);
+	printf("    \"mincore_first_byte_after_madvise\": %u\n", b_after);
 	printf("  }\n");
 	munmap(p, sz);
 }
@@ -240,6 +277,11 @@ int main(int argc, char **argv) {
 	printf("{\n");
 	printf("  \"investigation\": \"INV-01-03\",\n");
 	printf("  \"mode\": \"%s\",\n", negative ? "negative" : "normal");
+	mach_timebase_info_data_t tb;
+	mach_timebase_info(&tb);
+	printf("  \"mach_timebase_info\": {\"numer\": %u, \"denom\": %u, "
+	       "\"tick_ns\": %.6f},\n",
+	       tb.numer, tb.denom, (double)tb.numer / (double)tb.denom);
 	emit_page_sizes();
 	emit_reservations();
 	emit_commit_touch();

@@ -12,14 +12,18 @@ granularity, and their cost, for `Q-01-05` and kill assumption `KA-07`.
 | --- | --- |
 | write tracking | 64 MiB region set to `PROT_READ`; a `SIGSEGV`/`SIGBUS` handler records `si_addr`, re-protects the containing host page, and returns so the store retries. Fault count, address attribution, and round-trip time |
 | `mprotect` cost | alternating protections on one host page, timed per call |
-| concurrent tracking | two threads faulting on disjoint page ranges at once: fault count, per-thread address attribution, and per-thread round-trip time |
+| concurrent tracking | two threads faulting on disjoint page ranges at once: fault count, per-thread round-trip time, and attribution checked as *recorded thread identity against address range* — each thread stores its identity in thread-local storage before faulting, so the control can actually fail |
 | granularity | `mprotect` of a 4 KiB sub-range of a host page (return and `errno`), a host-page-aligned control, and the writability of each 4 KiB slot afterwards |
 | signal classes | write to a mapped read-only page versus write to an unmapped page: which signal and `si_code` each produces |
-| software alternative | per-store cost of a guest-page-granularity dirty bitmap against the same loop without it, with a discarded warm-up pass and alternating order |
+| software alternative | two paired measurements, 8 repetitions each with two discarded warm-up passes per variant and alternating order: a whole-loop pair (store versus store-plus-bitmap) whose difference is explicitly **not** interpretable as a bitmap cost, and an isolated pair (index arithmetic versus index arithmetic plus the bitmap update) from which a marginal can be read |
 
-The bitmap comparison reports its own resolution: the run-to-run spread of the
-unmodified loop bounds what the differential can mean, and the record declares
-whether the difference is resolvable at all.
+The whole-loop pair is reported for context only: its baseline is a
+cache-missing store whose retirement the added work perturbs, so its difference
+measures the pair of loops rather than the bitmap. The isolated pair removes
+that store from both sides. A marginal counts only if its sign is identical in
+every repetition and its median exceeds the mean of the two variants'
+run-to-run spreads; a resolvable *negative* marginal fails the run, because
+adding work cannot make a loop faster.
 
 ## Build and run
 
@@ -35,4 +39,6 @@ so nothing is written under `experiments/`.
 `./probe --negative` makes the fault handler record a null faulting address
 instead of `si_addr`, so the tracking mechanism cannot name the modified page.
 `src/check.py` must report `FAIL` on that output and `PASS` on the normal
-output. An absent platform capability is a `NOTE`, not a `FAIL`.
+output, and takes the expected mode as its second argument so a negative-mode
+artifact can never be checked as a normal one. An absent platform capability is
+a `NOTE`, not a `FAIL`.

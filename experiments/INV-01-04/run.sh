@@ -34,8 +34,8 @@ make -C "$(dirname "$0")" BUILD="$OUT" >"$OUT/build.log" 2>&1
 "$OUT/probe"            >"$OUT/result.json"
 "$OUT/probe" --negative >"$OUT/result-negative.json"
 
-python3 "$(dirname "$0")/src/check.py" "$OUT/result.json"          >"$OUT/check.txt" 2>&1 || true
-python3 "$(dirname "$0")/src/check.py" "$OUT/result-negative.json" >"$OUT/check-negative.txt" 2>&1 || true
+python3 "$(dirname "$0")/src/check.py" "$OUT/result.json"          normal   >"$OUT/check.txt" 2>&1 || true
+python3 "$(dirname "$0")/src/check.py" "$OUT/result-negative.json" negative >"$OUT/check-negative.txt" 2>&1 || true
 
 echo "normal:   $(tail -n1 "$OUT/check.txt")"
 echo "negative: $(tail -n1 "$OUT/check-negative.txt")  (must be FAIL)"

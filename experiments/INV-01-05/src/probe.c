@@ -44,12 +44,19 @@ static void stats(const char *name, uint64_t *v, size_t n, const char *tail) {
 
 /* ---- fault handling ---------------------------------------------------- */
 
-enum { M_TRACK, M_TRAP };
-static volatile int hmode = M_TRACK;
+enum { M_TRACK = 0, M_TRAP = 1 };
+/* Per-thread: a trapping probe on this thread must not change how a fault on
+ * another thread is handled. M_TRACK is the zero-initialized default. */
+static _Thread_local volatile int hmode = M_TRACK;
 
 #define MAXREC 8192
 static _Atomic size_t rec_n;
-static struct { uintptr_t addr; int signo; int code; } rec[MAXREC];
+static struct { uintptr_t addr; int signo; int code; int tid; } rec[MAXREC];
+
+/* Identity of the thread whose handler runs, assigned before any fault and read
+ * from thread-local storage inside the handler. Without it the per-thread
+ * attribution check is satisfied by construction. */
+static _Thread_local int t_id;
 
 static _Thread_local sigjmp_buf tjb;
 static _Thread_local volatile sig_atomic_t t_signo, t_code;
@@ -67,6 +74,7 @@ static void onfault(int s, siginfo_t *si, void *uc) {
 		rec[i].addr = negative ? 0 : a;    /* injected defect when --negative */
 		rec[i].signo = s;
 		rec[i].code = si ? si->si_code : 0;
+		rec[i].tid = t_id;
 	}
 	/* Unprotect the containing host page and let the faulting store retry. */
 	void *pg = (void *)(a & ~(uintptr_t)(PG - 1));
@@ -135,11 +143,12 @@ static void emit_mprotect_cost(void) {
 
 /* ---- concurrent faulting ----------------------------------------------- */
 
-struct tctx { size_t lo, hi, faults_seen; uint64_t *rt; size_t n; };
+struct tctx { size_t lo, hi, faults_seen; uint64_t *rt; size_t n; int id; };
 static atomic_int start_gate;
 
 static void *tfault(void *arg) {
 	struct tctx *c = arg;
+	t_id = c->id;
 	while (!atomic_load(&start_gate)) ;
 	for (size_t i = 0; i < c->n; i++) {
 		volatile char *p = region + (c->lo + i) * PG;
@@ -153,8 +162,8 @@ static void *tfault(void *arg) {
 static void emit_concurrent(void) {
 	enum { PER = 500 };
 	static uint64_t rt0[PER], rt1[PER];
-	struct tctx a = {0, PER, 0, rt0, PER};
-	struct tctx b = {region_pages / 2, region_pages / 2 + PER, 0, rt1, PER};
+	struct tctx a = {0, PER, 0, rt0, PER, 1};
+	struct tctx b = {region_pages / 2, region_pages / 2 + PER, 0, rt1, PER, 2};
 	if (region_pages / 2 + PER > region_pages) { printf("  \"concurrent\": null,\n"); return; }
 	atomic_store(&rec_n, 0);
 	atomic_store(&start_gate, 0);
@@ -165,13 +174,21 @@ static void emit_concurrent(void) {
 	atomic_store(&start_gate, 1);
 	pthread_join(t0, NULL); pthread_join(t1, NULL);
 	size_t got = atomic_load(&rec_n), inside = 0, in_a = 0, in_b = 0;
+	size_t matched = 0, mismatched = 0, no_id = 0;
 	for (size_t i = 0; i < got && i < MAXREC; i++) {
 		uintptr_t off = rec[i].addr - (uintptr_t)region;
 		if (rec[i].addr < (uintptr_t)region || off >= region_pages * PG) continue;
 		inside++;
 		size_t page = off / PG;
-		if (page >= a.lo && page < a.hi) in_a++;
-		if (page >= b.lo && page < b.hi) in_b++;
+		int in_range_of = (page >= a.lo && page < a.hi) ? 1
+		                : (page >= b.lo && page < b.hi) ? 2 : 0;
+		if (in_range_of == 1) in_a++;
+		if (in_range_of == 2) in_b++;
+		/* The control that can actually fail: the address must lie in the
+		 * range of the thread whose handler recorded it. */
+		if (rec[i].tid == 0) no_id++;
+		else if (rec[i].tid == in_range_of) matched++;
+		else mismatched++;
 	}
 	printf("  \"concurrent_tracking\": {\n");
 	printf("    \"threads\": 2,\n");
@@ -180,6 +197,9 @@ static void emit_concurrent(void) {
 	printf("    \"fault_addresses_inside_region\": %zu,\n", inside);
 	printf("    \"in_thread_a_range\": %zu,\n", in_a);
 	printf("    \"in_thread_b_range\": %zu,\n", in_b);
+	printf("    \"identity_matches_range\": %zu,\n", matched);
+	printf("    \"identity_mismatches_range\": %zu,\n", mismatched);
+	printf("    \"faults_without_thread_identity\": %zu,\n", no_id);
 	stats("fault_round_trip_thread_a", rt0, PER, ",");
 	stats("fault_round_trip_thread_b", rt1, PER, "");
 	printf("  },\n");
@@ -240,8 +260,11 @@ static void emit_signal_classes(void) {
 	hmode = M_TRACK;
 	printf("    \"write_to_mapped_read_only\": {\"faulted\": %s, \"signal\": %d, \"si_code\": %d},\n",
 	       a_ok ? "false" : "true", a_sig, a_code);
-	printf("    \"write_to_unmapped\": {\"faulted\": %s, \"signal\": %d, \"si_code\": %d}\n",
+	printf("    \"write_to_unmapped\": {\"faulted\": %s, \"signal\": %d, \"si_code\": %d,\n",
 	       b_ok ? "false" : "true", b_sig, b_code);
+	printf("      \"caveat\": \"the address was obtained by munmap of a prior "
+	       "mapping; a non-fault here may mean the range was remapped by another "
+	       "allocation rather than that the platform did not fault\"}\n");
 	printf("  },\n");
 	munmap(m, PG);
 }
@@ -252,14 +275,14 @@ static uint8_t sb_bitmap[1 << 20];
 
 static uint64_t run_plain(volatile char *r, size_t span, int n) {
 	uint64_t t0 = mach_absolute_time();
-	for (int i = 0; i < n; i++) r[(size_t)(i * 4096) % span] = (char)i;
+	for (int i = 0; i < n; i++) r[((size_t)i * 4096) % span] = (char)i;
 	return mach_absolute_time() - t0;
 }
 
 static uint64_t run_marked(volatile char *r, size_t span, int n) {
 	uint64_t t0 = mach_absolute_time();
 	for (int i = 0; i < n; i++) {
-		size_t off = (size_t)(i * 4096) % span;
+		size_t off = ((size_t)i * 4096) % span;
 		r[off] = (char)i;
 		size_t g = off / 4096;
 		sb_bitmap[g >> 3] |= (uint8_t)(1u << (g & 7));
@@ -267,18 +290,54 @@ static uint64_t run_marked(volatile char *r, size_t span, int n) {
 	return mach_absolute_time() - t0;
 }
 
+static int cmp_dbl(const void *a, const void *b) {
+	double x = *(const double *)a, y = *(const double *)b;
+	return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/* Reports two whole-loop per-store figures and their paired marginal
+ * difference. It asserts no bitmap cost: the marginal difference between a
+ * cache-missing store and the same store plus a bitmap update is below what
+ * this design resolves, and the record says so rather than attributing the
+ * difference to the bitmap. A powered per-store measurement is owed to
+ * Q-04-01. */
+static volatile size_t sb_sink;
+
+/* Index arithmetic only, no store to the region: the baseline against which the
+ * bitmap update alone is measured. */
+static uint64_t run_index_only(size_t span, int n) {
+	size_t acc = 0;
+	uint64_t t0 = mach_absolute_time();
+	for (int i = 0; i < n; i++) acc += ((size_t)i * 4096) % span / 4096;
+	uint64_t dt = mach_absolute_time() - t0;
+	sb_sink = acc;
+	return dt;
+}
+
+static uint64_t run_bitmap_only(size_t span, int n) {
+	size_t acc = 0;
+	uint64_t t0 = mach_absolute_time();
+	for (int i = 0; i < n; i++) {
+		size_t g = ((size_t)i * 4096) % span / 4096;
+		sb_bitmap[g >> 3] |= (uint8_t)(1u << (g & 7));
+		acc += g;
+	}
+	uint64_t dt = mach_absolute_time() - t0;
+	sb_sink = acc;
+	return dt;
+}
+
 static void emit_software_bitmap(void) {
-	enum { N = 1 << 20, REPS = 8 };
+	enum { N = 1 << 20, REPS = 8, WARMUP = 2 };
 	volatile char *r = region;
 	size_t span = region_pages * PG;
 	uint64_t plain[REPS], marked[REPS];
+	double paired[REPS];
 
-	/* Warm-up passes are discarded so first-touch and cache-cold cost is not
-	 * charged to whichever variant happens to run first, and the two variants
-	 * swap positions on alternate repetitions so a position effect (clock ramp)
-	 * cancels instead of biasing one variant. */
-	run_plain(r, span, N);
-	run_marked(r, span, N);
+	for (int w = 0; w < WARMUP; w++) {
+		run_plain(r, span, N);
+		run_marked(r, span, N);
+	}
 	for (int pass = 0; pass < REPS; pass++) {
 		if (pass & 1) {
 			marked[pass] = run_marked(r, span, N);
@@ -287,27 +346,68 @@ static void emit_software_bitmap(void) {
 			plain[pass] = run_plain(r, span, N);
 			marked[pass] = run_marked(r, span, N);
 		}
+		paired[pass] = (ns(marked[pass]) - ns(plain[pass])) / N;
 	}
+	/* Isolated pair: the bitmap update against index arithmetic alone. The
+	 * whole-loop pair above cannot yield a bitmap cost, because its baseline
+	 * is a cache-missing store whose retirement the extra work perturbs; this
+	 * pair removes that store from both sides. */
+	uint64_t base[REPS], bits[REPS];
+	double ipaired[REPS];
+	for (int w = 0; w < WARMUP; w++) { run_index_only(span, N); run_bitmap_only(span, N); }
+	for (int pass = 0; pass < REPS; pass++) {
+		if (pass & 1) {
+			bits[pass] = run_bitmap_only(span, N);
+			base[pass] = run_index_only(span, N);
+		} else {
+			base[pass] = run_index_only(span, N);
+			bits[pass] = run_bitmap_only(span, N);
+		}
+		ipaired[pass] = (ns(bits[pass]) - ns(base[pass])) / N;
+	}
+	int ipos = 0, ineg = 0;
+	for (int i = 0; i < REPS; i++) { if (ipaired[i] > 0) ipos++; if (ipaired[i] < 0) ineg++; }
+	qsort(ipaired, REPS, sizeof *ipaired, cmp_dbl);
+	qsort(base, REPS, sizeof *base, cmp_u64);
+	qsort(bits, REPS, sizeof *bits, cmp_u64);
+	double base_spread = (ns(base[REPS - 1]) - ns(base[0])) / N;
+	double bits_spread = (ns(bits[REPS - 1]) - ns(bits[0])) / N;
+	double icrit = (base_spread + bits_spread) / 2.0;
+	double imed = ipaired[REPS / 2];
+	int iconsistent = (ipos == REPS) || (ineg == REPS);
+	int iresolvable = iconsistent && (imed > icrit || imed < -icrit);
+
+	qsort(paired, REPS, sizeof *paired, cmp_dbl);
 	qsort(plain, REPS, sizeof *plain, cmp_u64);
 	qsort(marked, REPS, sizeof *marked, cmp_u64);
 	double pm = ns(plain[REPS / 2]) / N, mm = ns(marked[REPS / 2]) / N;
-	/* Run-to-run spread of the unmodified loop bounds what this microbenchmark
-	 * can resolve; a difference inside it is not a measurement of the bitmap. */
-	double spread = (ns(plain[REPS - 1]) - ns(plain[0])) / N;
-	double d = mm - pm;
+
 	printf("  \"software_dirty_bitmap\": {\n");
-	printf("    \"stores\": %d,\n", N);
+	printf("    \"stores_per_repetition\": %d,\n", N);
 	printf("    \"repetitions\": %d,\n", REPS);
-	printf("    \"warmup_pass\": true,\n");
-	printf("    \"order_alternated\": true,\n");
+	printf("    \"warmup_passes_per_variant\": %d,\n", WARMUP);
+	printf("    \"order_alternated_by_repetition\": true,\n");
 	printf("    \"guest_page_granularity\": 4096,\n");
-	printf("    \"plain_store_ns_per_store\": %.3f,\n", pm);
-	printf("    \"plain_store_ns_per_store_min\": %.3f,\n", ns(plain[0]) / N);
-	printf("    \"store_plus_bitmap_ns_per_store\": %.3f,\n", mm);
-	printf("    \"store_plus_bitmap_ns_per_store_min\": %.3f,\n", ns(marked[0]) / N);
-	printf("    \"resolution_ns_per_store\": %.3f,\n", spread);
-	printf("    \"overhead_ns_per_store\": %.3f,\n", d);
-	printf("    \"overhead_resolvable\": %s\n", (d > spread || d < -spread) ? "true" : "false");
+	printf("    \"bitmap_cost_asserted\": false,\n");
+	printf("    \"whole_loop\": {\n");
+	printf("      \"plain_ns_per_store\": %.4f,\n", pm);
+	printf("      \"marked_ns_per_store\": %.4f,\n", mm);
+	printf("      \"paired_marginal_median_ns_per_store\": %.4f,\n", paired[REPS / 2]);
+	printf("      \"interpretable_as_bitmap_cost\": false,\n");
+	printf("      \"why\": \"the baseline is a cache-missing store whose "
+	       "retirement the added work perturbs; the two loops differ in more "
+	       "than the bitmap update\"\n");
+	printf("    },\n");
+	printf("    \"isolated_bitmap_update\": {\n");
+	printf("      \"index_only_ns_per_op\": %.4f,\n", ns(base[REPS / 2]) / N);
+	printf("      \"index_plus_bitmap_ns_per_op\": %.4f,\n", ns(bits[REPS / 2]) / N);
+	printf("      \"paired_marginal_median_ns_per_op\": %.4f,\n", imed);
+	printf("      \"paired_marginal_min_ns_per_op\": %.4f,\n", ipaired[0]);
+	printf("      \"paired_marginal_max_ns_per_op\": %.4f,\n", ipaired[REPS - 1]);
+	printf("      \"paired_sign_consistent\": %s,\n", iconsistent ? "true" : "false");
+	printf("      \"resolution_criterion_ns_per_op\": %.4f,\n", icrit);
+	printf("      \"marginal_resolvable\": %s\n", iresolvable ? "true" : "false");
+	printf("    }\n");
 	printf("  }\n");
 }
 
@@ -323,6 +423,12 @@ int main(int argc, char **argv) {
 	printf("{\n");
 	printf("  \"investigation\": \"INV-01-05\",\n");
 	printf("  \"mode\": \"%s\",\n", negative ? "negative" : "normal");
+	{
+		mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+		printf("  \"mach_timebase_info\": {\"numer\": %u, \"denom\": %u, "
+		       "\"tick_ns\": %.6f},\n", tb.numer, tb.denom,
+		       (double)tb.numer / (double)tb.denom);
+	}
 	printf("  \"host_page_size\": %zu,\n", PG);
 	if (region == MAP_FAILED) { printf("  \"region_mapped\": false\n}\n"); return 0; }
 	printf("  \"region_mapped\": true,\n");

@@ -6,38 +6,51 @@ PC inside the stub that faulted, and must resume with the exact value the probe
 declared it wrote into the resumed register. Returning control without the
 requested state is not a restart, so a mismatch is a FAIL rather than a
 platform finding. Exit status 0 = PASS, 1 = FAIL.
+
+Usage: check.py <result.json> <expected-mode>
 """
 import json
 import sys
 
-MEMORY_CASES = ("unmapped_load_direct_pc", "unmapped_load_set_pc_fptr")
+MEMORY_CASES = ("unmapped_load",)
 
 def order_ok(st):
     return st["min_ns"] <= st["median_ns"] <= st["p99_ns"] <= st["max_ns"]
 
-def main(path):
+def main(path, expected_mode):
     with open(path) as f:
         d = json.load(f)
     fails, notes = [], []
 
     if d.get("investigation") != "INV-01-06":
         fails.append("wrong investigation id")
+    if d.get("mode") != expected_mode:
+        fails.append("mode is %r, expected %r: a negative-mode artifact must "
+                     "never be checked as a normal one"
+                     % (d.get("mode"), expected_mode))
+    tb = d.get("mach_timebase_info", {})
+    if not (tb.get("numer") and tb.get("denom")):
+        fails.append("mach_timebase_info not emitted")
     if d.get("end") is not True:
         fails.append("record truncated: probe did not reach the end")
 
     ss = d.get("state_structs", {})
     for k in ("__DARWIN_OPAQUE_ARM_THREAD_STATE64", "has_feature_ptrauth_calls",
-              "sizeof_esr_field", "sizeof_far_field", "exception_state_variant"):
+              "sizeof_esr_field", "sizeof_far_field",
+              "compiled_exception_state_variant", "sizeof_mcontext64"):
         if k not in ss:
             fails.append("state_structs: %s missing" % k)
+    rp = d.get("resume_path", {})
+    if "accessor_and_direct_assignment_identical_in_this_build" not in rp:
+        fails.append("resume_path: compile-time configuration not recorded")
 
     if not d.get("stubs_built"):
         notes.append("JIT stubs could not be built — platform finding")
         return report(fails, notes)
 
     cases = d.get("fault_and_resume", {})
-    if len(cases) < 4:
-        fails.append("fault_and_resume: expected 4 cases, got %d" % len(cases))
+    if len(cases) < 3:
+        fails.append("fault_and_resume: expected 3 cases, got %d" % len(cases))
     for name, c in cases.items():
         if not c.get("fault_seen"):
             fails.append("%s: no fault delivered" % name)
@@ -48,6 +61,15 @@ def main(path):
             fails.append("%s: reported PC is not the faulting stub" % name)
         if not c.get("sp_nonzero"):
             fails.append("%s: stack pointer not reported" % name)
+        if not c.get("handler_installed_state"):
+            fails.append("%s: handler did not attest it installed the resume state"
+                         % name)
+        # An observation about the delivered context, not about the header the
+        # probe compiled against.
+        if c.get("uc_mcsize") != ss.get("sizeof_mcontext64"):
+            notes.append("%s: delivered uc_mcsize %r differs from the compiled "
+                         "sizeof_mcontext64 %r — platform finding"
+                         % (name, c.get("uc_mcsize"), ss.get("sizeof_mcontext64")))
         # The restart control.
         if c.get("observed_return_value") != c.get("declared_resume_value"):
             fails.append("%s: resumed with %r, probe declared %r"
@@ -58,7 +80,11 @@ def main(path):
         if name not in MEMORY_CASES and c.get("far") not in ("0x0", None):
             notes.append("%s: FAR is %s on a non-memory fault" % (name, c.get("far")))
 
-    lat = d.get("delivery_latency", {}).get("signal_delivery")
+    dl = d.get("delivery_latency", {})
+    if dl.get("missed_faults"):
+        fails.append("delivery_latency: %r attempted faults were never delivered"
+                     % dl["missed_faults"])
+    lat = dl.get("signal_delivery")
     if not lat or lat.get("n", 0) < 1000:
         fails.append("delivery_latency: missing or sample too small")
     elif not order_ok(lat):
@@ -97,4 +123,4 @@ def report(fails, notes):
     return 1 if fails else 0
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1]))
+    sys.exit(main(sys.argv[1], sys.argv[2]))

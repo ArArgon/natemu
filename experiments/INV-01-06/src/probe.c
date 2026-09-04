@@ -70,18 +70,27 @@ static _Thread_local volatile int h_signo, h_code;
 static _Thread_local volatile uint64_t h_pc, h_sp, h_far, h_x0, h_x1;
 static _Thread_local volatile uint32_t h_esr;
 static _Thread_local volatile uint64_t h_enter_tick;
-static _Thread_local volatile int h_use_fptr_macro;   /* resume path selector */
 static _Thread_local volatile int h_resume_ok;
+/* The handler resumes only a fault this thread armed, at a PC inside the JIT
+ * region. Any other fault is a defect in the probe or an unrelated failure and
+ * must not be turned into a successful-looking resume. */
+static _Thread_local volatile int h_armed;
+static _Thread_local volatile uint64_t h_mcsize;
 
 static void onfault(int s, siginfo_t *si, void *ucv) {
 	uint64_t now = mach_absolute_time();
 	ucontext_t *uc = ucv;
 	_STRUCT_MCONTEXT64 *mc = (_STRUCT_MCONTEXT64 *)uc->uc_mcontext;
+	if (!h_armed) _exit(96);            /* unarmed fault: fail loudly */
+	uint64_t pc = (uint64_t)__darwin_arm_thread_state64_get_pc(mc->__ss);
+	if (pc < (uint64_t)(uintptr_t)jit ||
+	    pc >= (uint64_t)(uintptr_t)jit + jit_bytes) _exit(95);  /* not our code */
+	h_mcsize = (uint64_t)uc->uc_mcsize;
 	h_enter_tick = now;
 	h_seen = 1;
 	h_signo = s;
 	h_code = si ? si->si_code : 0;
-	h_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(mc->__ss);
+	h_pc = pc;
 	h_sp = (uint64_t)__darwin_arm_thread_state64_get_sp(mc->__ss);
 	h_x0 = mc->__ss.__x[0];
 	h_x1 = mc->__ss.__x[1];
@@ -92,10 +101,7 @@ static void onfault(int s, siginfo_t *si, void *ucv) {
 	 * x0. Both PC-write paths are exercised so the record shows whether a
 	 * resume PC must be a signed pointer on this host. */
 	uint64_t next = h_pc + 4;
-	if (h_use_fptr_macro)
-		__darwin_arm_thread_state64_set_pc_fptr(mc->__ss, (void *)(uintptr_t)next);
-	else
-		mc->__ss.__pc = next;
+	__darwin_arm_thread_state64_set_pc_fptr(mc->__ss, (void *)(uintptr_t)next);
 	mc->__ss.__x[0] = negative ? (uint64_t)(SENTINEL - 1) : (uint64_t)SENTINEL;
 	h_resume_ok = 1;
 }
@@ -130,10 +136,12 @@ static int build_stubs(void) {
 /* ---- one fault-and-resume case ----------------------------------------- */
 
 static void emit_case(const char *name, uint32_t *stub, void *arg,
-                      int use_fptr, const char *tail) {
-	h_seen = 0; h_resume_ok = 0; h_use_fptr_macro = use_fptr;
+                      const char *tail) {
+	h_seen = 0; h_resume_ok = 0;
+	h_armed = 1;
 	uint64_t t0 = mach_absolute_time();
 	long r = ((stub2_fn)stub)(0, arg);
+	h_armed = 0;
 	printf("    \"%s\": {\n", name);
 	printf("      \"fault_seen\": %s,\n", h_seen ? "true" : "false");
 	printf("      \"signal\": %d,\n", h_signo);
@@ -147,11 +155,14 @@ static void emit_case(const char *name, uint32_t *stub, void *arg,
 	printf("      \"far\": \"0x%llx\",\n", (unsigned long long)h_far);
 	printf("      \"far_matches_access\": %s,\n",
 	       (uint64_t)(uintptr_t)arg == h_far ? "true" : "false");
-	printf("      \"resume_path\": \"%s\",\n", use_fptr ? "set_pc_fptr_macro" : "direct___pc");
-	printf("      \"resumed\": true,\n");
+	printf("      \"handler_installed_state\": %s,\n", h_resume_ok ? "true" : "false");
+	printf("      \"uc_mcsize\": %llu,\n", (unsigned long long)h_mcsize);
 	printf("      \"declared_resume_value\": %ld,\n", (long)SENTINEL);
 	printf("      \"observed_return_value\": %ld,\n", r);
-	printf("      \"delivery_ns\": %.1f\n", ns(h_enter_tick - t0));
+	/* One cold observation. It supports no timing claim; the distribution is
+	 * in delivery_latency. */
+	printf("      \"cold_delivery_ns_single_observation\": %.1f\n",
+	       ns(h_enter_tick - t0));
 	printf("    }%s\n", tail);
 }
 
@@ -163,8 +174,10 @@ static atomic_int gate;
 static void *cthread(void *p) {
 	struct cctx *c = p;
 	while (!atomic_load(&gate)) ;
-	h_seen = 0; h_use_fptr_macro = 0;
+	h_seen = 0;
+	h_armed = 1;
 	c->ret = ((stub2_fn)stub_load)(0, c->bad);
+	h_armed = 0;
 	c->far = h_far;
 	c->ok = h_seen && h_far == (uint64_t)(uintptr_t)c->bad;
 	return NULL;
@@ -198,16 +211,23 @@ static void emit_concurrent(void) {
 static void emit_latency(void) {
 	enum { N = 3000 };
 	static uint64_t d[N];
-	h_use_fptr_macro = 0;
+	size_t got = 0, missed = 0;
 	for (int i = 0; i < N; i++) {
 		h_seen = 0;
+		h_armed = 1;
 		uint64_t t0 = mach_absolute_time();
 		((stub2_fn)stub_load)(0, (void *)BAD_ADDR);
-		d[i] = h_enter_tick - t0;
+		h_armed = 0;
+		if (!h_seen) { missed++; continue; }   /* never a wrapped stale timestamp */
+		d[got++] = h_enter_tick - t0;
 	}
 	printf("  \"delivery_latency\": {\n");
-	printf("    \"note\": \"faulting instruction to first statement of the handler\",\n");
-	stats("signal_delivery", d, N, "");
+	printf("    \"note\": \"faulting instruction to first statement of the handler; "
+	       "includes signal-frame construction and one timestamp read\",\n");
+	printf("    \"attempts\": %d,\n", N);
+	printf("    \"missed_faults\": %zu,\n", missed);
+	if (got) stats("signal_delivery", d, got, "");
+	else printf("    \"signal_delivery\": null\n");
 	printf("  },\n");
 }
 
@@ -232,15 +252,16 @@ static void *mach_probe_thread(void *unused) {
 		behaviors, flavors);
 
 	kern_return_t kr_set = KERN_FAILURE, kr_restore = KERN_FAILURE;
+	mach_port_t self = mach_thread_self();
 	if (kr_right == KERN_SUCCESS) {
 		/* Installed on this scratch thread only, which takes no fault, then
 		 * removed immediately. No exception is delivered through it here. */
 		kr_set = thread_set_exception_ports(
-			mach_thread_self(), EXC_MASK_BAD_ACCESS, p,
+			self, EXC_MASK_BAD_ACCESS, p,
 			(exception_behavior_t)(EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES),
 			ARM_THREAD_STATE64);
 		kr_restore = thread_set_exception_ports(
-			mach_thread_self(), EXC_MASK_BAD_ACCESS, MACH_PORT_NULL,
+			self, EXC_MASK_BAD_ACCESS, MACH_PORT_NULL,
 			EXCEPTION_DEFAULT, THREAD_STATE_NONE);
 	}
 	printf("  \"mach_exception_ports\": {\n");
@@ -252,6 +273,7 @@ static void *mach_probe_thread(void *unused) {
 	printf("    \"kr_thread_restore_exception_ports\": %d,\n", (int)kr_restore);
 	printf("    \"exception_delivered_through_port\": false\n");
 	printf("  },\n");
+	mach_port_deallocate(mach_task_self(), self);
 	if (p != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), p);
 	return NULL;
 }
@@ -265,6 +287,12 @@ int main(int argc, char **argv) {
 	printf("{\n");
 	printf("  \"investigation\": \"INV-01-06\",\n");
 	printf("  \"mode\": \"%s\",\n", negative ? "negative" : "normal");
+	{
+		mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+		printf("  \"mach_timebase_info\": {\"numer\": %u, \"denom\": %u, "
+		       "\"tick_ns\": %.6f},\n", tb.numer, tb.denom,
+		       (double)tb.numer / (double)tb.denom);
+	}
 	printf("  \"state_structs\": {\n");
 	printf("    \"__DARWIN_OPAQUE_ARM_THREAD_STATE64\": %d,\n",
 	       __DARWIN_OPAQUE_ARM_THREAD_STATE64);
@@ -281,9 +309,23 @@ int main(int argc, char **argv) {
 	       sizeof(((_STRUCT_ARM_EXCEPTION_STATE64 *)0)->__esr));
 	printf("    \"sizeof_far_field\": %zu,\n",
 	       sizeof(((_STRUCT_ARM_EXCEPTION_STATE64 *)0)->__far));
-	printf("    \"exception_state_variant\": \"%s\"\n",
+	printf("    \"compiled_exception_state_variant\": \"%s\",\n",
 	       sizeof(((_STRUCT_ARM_EXCEPTION_STATE64 *)0)->__esr) == 8
 	       ? "v2 (64-bit esr)" : "base (32-bit esr)");
+	printf("    \"sizeof_mcontext64\": %zu,\n", sizeof(_STRUCT_MCONTEXT64));
+	printf("    \"note\": \"the __esr width is a property of the header type this "
+	       "probe compiled against, not of the delivered state; uc_mcsize is "
+	       "recorded per fault case so the delivered context size can be compared "
+	       "with sizeof_mcontext64\"\n");
+	printf("  },\n");
+	printf("  \"resume_path\": {\n");
+	printf("    \"used\": \"__darwin_arm_thread_state64_set_pc_fptr\",\n");
+	printf("    \"accessor_and_direct_assignment_identical_in_this_build\": %s,\n",
+	       __DARWIN_OPAQUE_ARM_THREAD_STATE64 ? "false" : "true");
+	printf("    \"note\": \"in the non-opaque __DARWIN_UNIX03 form the accessor "
+	       "preprocesses to an assignment to __pc, so the two cannot be compared "
+	       "empirically here; whether a resume PC must be a signed pointer is owed "
+	       "to the ptrauth-enabled build cell and routed to Q-01-01 and Q-01-19\"\n");
 	printf("  },\n");
 
 	if (!build_stubs()) {
@@ -293,10 +335,9 @@ int main(int argc, char **argv) {
 	printf("  \"stubs_built\": true,\n");
 
 	printf("  \"fault_and_resume\": {\n");
-	emit_case("unmapped_load_direct_pc", stub_load, (void *)BAD_ADDR, 0, ",");
-	emit_case("unmapped_load_set_pc_fptr", stub_load, (void *)BAD_ADDR, 1, ",");
-	emit_case("undefined_instruction", stub_udf, (void *)BAD_ADDR, 0, ",");
-	emit_case("breakpoint_brk", stub_brk, (void *)BAD_ADDR, 0, "");
+	emit_case("unmapped_load", stub_load, (void *)BAD_ADDR, ",");
+	emit_case("undefined_instruction", stub_udf, (void *)BAD_ADDR, ",");
+	emit_case("breakpoint_brk", stub_brk, (void *)BAD_ADDR, "");
 	printf("  },\n");
 
 	emit_latency();

@@ -48,7 +48,7 @@ static void install_handlers(void) {
 	struct sigaction sa;
 	memset(&sa, 0, sizeof sa);
 	sa.sa_sigaction = onfault;
-	sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+	sa.sa_flags = SA_SIGINFO;   /* no sigaltstack is installed, so no SA_ONSTACK */
 	sigemptyset(&sa.sa_mask);
 	sigaction(SIGSEGV, &sa, NULL);
 	sigaction(SIGBUS, &sa, NULL);
@@ -67,15 +67,23 @@ static int cmp_u64(const void *a, const void *b) {
 	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
 	return x < y ? -1 : x > y ? 1 : 0;
 }
-static void emit_stats(const char *name, uint64_t *v, size_t n, const char *tail) {
+/* div is applied after the tick-to-nanosecond conversion: dividing in the tick
+ * domain would re-quantize a batched measurement to the clock tick and defeat
+ * the batching. */
+static void emit_stats_div(const char *name, uint64_t *v, size_t n, double div,
+                           const char *tail) {
 	qsort(v, n, sizeof *v, cmp_u64);
 	double sum = 0;
-	for (size_t i = 0; i < n; i++) sum += ticks_to_ns(v[i]);
-	printf("    \"%s\": {\"n\": %zu, \"min_ns\": %.1f, \"median_ns\": %.1f, "
-	       "\"p99_ns\": %.1f, \"max_ns\": %.1f, \"mean_ns\": %.1f}%s\n",
-	       name, n, ticks_to_ns(v[0]), ticks_to_ns(v[n / 2]),
-	       ticks_to_ns(v[(size_t)(n * 0.99)]), ticks_to_ns(v[n - 1]),
+	for (size_t i = 0; i < n; i++) sum += ticks_to_ns(v[i]) / div;
+	printf("    \"%s\": {\"n\": %zu, \"min_ns\": %.4f, \"median_ns\": %.4f, "
+	       "\"p99_ns\": %.4f, \"max_ns\": %.4f, \"mean_ns\": %.4f}%s\n",
+	       name, n, ticks_to_ns(v[0]) / div, ticks_to_ns(v[n / 2]) / div,
+	       ticks_to_ns(v[(size_t)(n * 0.99)]) / div, ticks_to_ns(v[n - 1]) / div,
 	       sum / (double)n, tail);
+}
+
+static void emit_stats(const char *name, uint64_t *v, size_t n, const char *tail) {
+	emit_stats_div(name, v, n, 1.0, tail);
 }
 
 /* ---- allocation limits ------------------------------------------------- */
@@ -122,6 +130,14 @@ static void write_stub(int value) {
 static atomic_int a_writable, b_done, a_release;
 static int b_result, b_signo, b_faulted;
 
+/* Witness: thread A stores a known word into the region while it holds write
+ * access. If A never acquired write access the store faults (unarmed, so the
+ * handler exits 97) or leaves the word unset, and the checker fails. Without
+ * this the cross-thread block reads the same whether or not A ever held write
+ * access. */
+#define WITNESS_WORD 0xC0FFEE01u
+#define WITNESS_SLOT 12
+
 static void *thread_b(void *arg) {
 	(void)arg;
 	while (!atomic_load(&a_writable)) usleep(200);
@@ -141,6 +157,7 @@ static void *thread_b(void *arg) {
 static void *thread_a(void *arg) {
 	(void)arg;
 	pthread_jit_write_protect_np(0);       /* this thread holds write access */
+	jit[WITNESS_SLOT] = WITNESS_WORD;      /* observable proof it holds it */
 	atomic_store(&a_writable, 1);
 	while (!atomic_load(&a_release)) usleep(200);
 	pthread_jit_write_protect_np(1);
@@ -155,7 +172,12 @@ static void emit_concurrency(void) {
 	atomic_store(&a_release, 1);
 	pthread_join(a, NULL);
 	pthread_join(b, NULL);
+	uint32_t witness = jit[WITNESS_SLOT];
 	printf("  \"concurrent_execute_while_other_thread_writable\": {\n");
+	printf("    \"witness_expected\": %u,\n", (unsigned)WITNESS_WORD);
+	printf("    \"witness_observed\": %u,\n", (unsigned)witness);
+	printf("    \"writer_held_write_access\": %s,\n",
+	       witness == WITNESS_WORD ? "true" : "false");
 	printf("    \"executed\": %s,\n", b_faulted ? "false" : "true");
 	printf("    \"return_value\": %d,\n", b_faulted ? -1 : b_result);
 	printf("    \"faulted\": %s,\n", b_faulted ? "true" : "false");
@@ -172,6 +194,8 @@ int main(int argc, char **argv) {
 	printf("{\n");
 	printf("  \"investigation\": \"INV-01-04\",\n");
 	printf("  \"mode\": \"%s\",\n", negative ? "negative" : "normal");
+	printf("  \"mach_timebase_info\": {\"numer\": %.0f, \"denom\": %.0f, "
+	       "\"tick_ns\": %.6f},\n", tb_num, tb_den, tb_num / tb_den);
 	printf("  \"pthread_jit_write_protect_supported_np\": %d,\n",
 	       pthread_jit_write_protect_supported_np());
 	emit_alloc_limits();
@@ -203,7 +227,7 @@ int main(int argc, char **argv) {
 	/* The raw single-toggle interval sits at or below the timebase tick, so a
 	 * batched form is measured as well: K pairs per timed interval, reported
 	 * as ticks per pair. */
-	enum { BN = 2000, BK = 100 };
+	enum { BN = 2000, BK = 1000, TICK_TARGET = 100 };
 	static uint64_t batch[BN];
 	for (int i = 0; i < BN; i++) {
 		uint64_t t0 = mach_absolute_time();
@@ -211,11 +235,17 @@ int main(int argc, char **argv) {
 			pthread_jit_write_protect_np(0);
 			pthread_jit_write_protect_np(1);
 		}
-		batch[i] = (mach_absolute_time() - t0) / BK;
+		batch[i] = mach_absolute_time() - t0;   /* total ticks, undivided */
 	}
+	uint64_t shortest = batch[0];
+	for (int i = 1; i < BN; i++) if (batch[i] < shortest) shortest = batch[i];
 	printf("  \"toggle_cost_batched\": {\n");
 	printf("    \"pairs_per_sample\": %d,\n", BK);
-	emit_stats("off_on_pair", batch, BN, "");
+	printf("    \"shortest_batch_ticks\": %llu,\n", (unsigned long long)shortest);
+	printf("    \"precision_target_ticks_per_batch\": %d,\n", TICK_TARGET);
+	printf("    \"precision_target_met\": %s,\n",
+	       shortest >= TICK_TARGET ? "true" : "false");
+	emit_stats_div("off_on_pair", batch, BN, (double)BK, "");
 	printf("  },\n");
 
 	/* write, invalidate, execute */

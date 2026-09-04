@@ -11,12 +11,12 @@ Measures what one host process can reserve, back, alias, and protect, for
 
 | Probe | Observable |
 | --- | --- |
-| page size | `vm_page_size`, `getpagesize`, `sysconf(_SC_PAGESIZE)`, `hw.pagesize`, compile-time `PAGE_SIZE` |
+| page size | the four independent readings `vm_page_size`, `getpagesize`, `sysconf(_SC_PAGESIZE)`, `hw.pagesize`; compile-time `PAGE_SIZE` is reported but not counted or compared, because `<mach/arm/vm_param.h>` defines it as `vm_page_size` |
 | reservation | `mmap` `PROT_NONE` at 8 GiB, 64 GiB, 1 TiB: success and `errno` |
 | commit and touch | 8 GiB `PROT_READ|PROT_WRITE` mapping, a bounded 2 GiB sample touched one host page at a time; resident size and `phys_footprint` from `task_info` before and after |
 | aliasing | `mach_vm_remap` of a region, write through one view and read through the other, in both directions, with a same-view read-back positive control |
 | sub-host-page protection | `mprotect` of a 4 KiB-aligned range that is not host-page-aligned: return value, `errno`, and the writability of each 4 KiB slot afterwards |
-| advice | `mincore` and `madvise(MADV_FREE_REUSABLE)` return values |
+| advice | `mincore` and `madvise(MADV_FREE_REUSABLE)` return values, with the `mincore` vector decoded into its documented bits (`MINCORE_MODIFIED` among them) and read before a write, after writing a page, and after the `madvise` |
 
 The 8 GiB mapping is touched over a bounded 2 GiB sample rather than in full:
 the mandatory 8 GiB guest cell is a *coverage* question (`Q-05-02`), and
