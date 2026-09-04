@@ -56,7 +56,7 @@ python3 src/check.py "$OUT/negative.json" > "$OUT/negative.check.txt" 2>&1 || tr
     echo "== sw_vers =="
     sw_vers
     echo "== sysctl =="
-    sysctl hw.model hw.memsize hw.ncpu hw.pagesize kern.osversion
+    sysctl hw.model hw.memsize hw.ncpu hw.pagesize kern.osversion || true
     echo "== clang --version =="
     clang --version
     echo "== git rev-parse HEAD =="

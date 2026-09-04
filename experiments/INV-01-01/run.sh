@@ -105,7 +105,7 @@ PYEOF
     echo "== sw_vers =="
     sw_vers
     echo "== sysctl =="
-    sysctl hw.model hw.memsize hw.ncpu hw.pagesize kern.osversion kern.hv_support
+    sysctl hw.model hw.memsize hw.ncpu hw.pagesize kern.osversion kern.hv_support || true
     echo "== clang --version =="
     clang --version
     echo "== git rev-parse HEAD =="
