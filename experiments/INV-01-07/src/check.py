@@ -131,17 +131,50 @@ def main(path):
     # the handler on another thread while the control is read after the
     # semaphore returns, so their delta legitimately includes a cross-thread
     # handoff and is reported but not enforced.
+    # Enforcement scope. The control's residual is whatever preemption lands
+    # inside its two paired-read windows, and a background-QoS thread has no
+    # protection against being descheduled there — smoke runs of the corrected
+    # bracket show background arms overshooting by tens of microseconds at the
+    # larger targets while the matched user-interactive arms sit at hundreds of
+    # nanoseconds. That residual is a scheduler property, not a conversion
+    # error. A timebase-ratio error, by contrast, is a property of the
+    # arithmetic: it would appear identically in every arm regardless of QoS.
+    # So the rule is enforced on the same-thread, user-interactive arms, where
+    # the windows are protected, and reported on the rest. Narrowing the scope
+    # this way loses no power to detect the thing the control exists for.
     SAME_THREAD = ("mach_wait_until", "nanosleep")
+    ENFORCED_QOS = "user-interactive"
+    # Tolerance derived from the quantity's own error sources, not from a flat
+    # fraction of the target (corrected at the MAN-01-07-01 return):
+    #
+    #   floor 2000 ns  — four clock reads quantized to one 41.67 ns timebase
+    #                    tick each (<=167 ns), plus the cost of the two reads
+    #                    inside the paired start and end windows, plus room for
+    #                    a short preemption in those windows. 2 us is ~48 ticks,
+    #                    an order of magnitude above the quantization floor.
+    #   + target/1000  — 0.1% proportional term. A timebase-ratio error scales
+    #                    with the interval, so this is the part that actually
+    #                    detects a conversion artefact.
+    #
+    # The old flat 10%-of-target rule was both too tight at 100 us (10 us is
+    # below ordinary scheduler noise, which is what failed MAN-01-07-01) and
+    # far too loose at 10 ms, where it would have let a 1 ms — i.e. a full
+    # 10% — conversion error pass unnoticed. This form is tighter where a
+    # conversion defect would actually show.
+    def ctrl_tol(target_ns):
+        return 2000 + target_ns // 1000
+
     ctrl = [(w["mechanism"], w["target_ns"], w["qos"],
-             w.get("timebase_control_worst_delta_ns"))
+             w.get("timebase_control_worst_delta_ns"), ctrl_tol(w["target_ns"]))
             for w in wakeup
-            if w["mechanism"] in SAME_THREAD
+            if w["mechanism"] in SAME_THREAD and w["qos"] == ENFORCED_QOS
             and (w.get("timebase_control_worst_delta_ns") is None
-                 or w["timebase_control_worst_delta_ns"] > w["target_ns"] // 10)]
+                 or w["timebase_control_worst_delta_ns"] > ctrl_tol(w["target_ns"]))]
     rule(not ctrl, "I16 timebase arithmetic agrees with an independent clock",
-         "same-thread arms whose mach-arithmetic error disagrees with an "
-         f"independent CLOCK_UPTIME_RAW elapsed measurement by more than 10% "
-         f"of the target: {ctrl[:4] or 'none'}")
+         "same-thread user-interactive arms where the same interval measured "
+         "in converted mach ticks and in CLOCK_UPTIME_RAW ns disagree by more "
+         "than 2 us + 0.1% of target "
+         f"(mechanism, target, qos, worst_delta, tolerance): {ctrl[:4] or 'none'}")
 
     # The round-trip control (REV-044 change 1): one-way latency subtracts two
     # threads' timestamps, so it must never exceed the sender-only round trip.

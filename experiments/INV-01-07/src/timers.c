@@ -247,16 +247,25 @@ static void wakeup_arm(FILE *f, const char *mech, long target_ns,
                        qos_class_t q, int last) {
 	int64_t *err = xmalloc(sizeof(int64_t) * (size_t)g_n);
 	int64_t setup_ns = 0, setup_n = 0;
-	/* Timebase-conversion control (REV-044 change 13): the same interval is
-	 * also measured with clock_gettime_nsec_np(CLOCK_UPTIME_RAW), which needs
-	 * no timebase arithmetic. A proportional overshoot that appears in the
-	 * mach path but not here would be a conversion artefact, not host
-	 * behaviour, and CLM-01-07-14 is precisely a proportional-overshoot claim. */
+	/* Timebase-conversion control (REV-044 change 13; bracket corrected at the
+	 * MAN-01-07-01 return). The SAME interval is measured two ways: in mach
+	 * ticks converted with the timebase ratio, and in
+	 * clock_gettime_nsec_np(CLOCK_UPTIME_RAW) ns, which needs no such
+	 * arithmetic. A proportional disagreement is a conversion artefact, and
+	 * CLM-01-07-14 is precisely a proportional-overshoot claim.
+	 *
+	 * The earlier form read ctrl0 BEFORE the deadline's mach_absolute_time(),
+	 * so the control's interval started earlier than the interval it checked
+	 * and absorbed any deschedule in between. That inflated the delta by a
+	 * scheduling artefact and failed rule I16 on one background-QoS arm in
+	 * MAN-01-07-01. The two starts and the two ends are now taken adjacent,
+	 * so only the cost of one clock read sits inside each paired window. */
 	int64_t ctrl_worst_delta_ns = 0;
 	set_qos(q);
 	for (long i = 0; i < g_n; i++) {
+		uint64_t base_abs = mach_absolute_time();
 		uint64_t ctrl0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-		uint64_t deadline_abs = mach_absolute_time() + ns_to_abs((uint64_t)target_ns);
+		uint64_t deadline_abs = base_abs + ns_to_abs((uint64_t)target_ns);
 		uint64_t woke;
 		if (strcmp(mech, "mach_wait_until") == 0) {
 			if (mach_wait_until(deadline_abs) != KERN_SUCCESS) {
@@ -304,10 +313,13 @@ static void wakeup_arm(FILE *f, const char *mech, long target_ns,
 			dispatch_release(sem);
 			woke = fired;
 		}
+		uint64_t ctrl1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 		int64_t e = (int64_t)abs_to_ns(woke) - (int64_t)abs_to_ns(deadline_abs);
-		int64_t ctrl_elapsed =
-		    (int64_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - ctrl0);
-		int64_t delta = (ctrl_elapsed - target_ns) - e;
+		/* Both quantities span base -> wake. No target_ns term appears, so
+		 * the comparison is of one interval measured two ways and nothing
+		 * else. */
+		int64_t delta = (int64_t)(ctrl1 - ctrl0) -
+		                (int64_t)abs_to_ns(woke - base_abs);
 		if (delta < 0) delta = -delta;
 		if (delta > ctrl_worst_delta_ns) ctrl_worst_delta_ns = delta;
 		if (g_negative) e -= target_ns / 4; /* injected defect: impossible early wake */
@@ -317,8 +329,10 @@ static void wakeup_arm(FILE *f, const char *mech, long target_ns,
 	emit_stats(f, "wakeup", mech, qos_name(q), target_ns, summarize(err, g_n));
 	fprintf(f,
 	        ",\"timebase_control_worst_delta_ns\":%lld,"
+	        "\"timebase_control_tolerance_ns\":%lld,"
 	        "\"setup_p_mean_ns\":%lld}%s\n",
 	        (long long)ctrl_worst_delta_ns,
+	        (long long)(2000 + target_ns / 1000),
 	        (long long)(setup_n ? setup_ns / setup_n : 0),
 	        last ? "" : ",");
 	free(err);
