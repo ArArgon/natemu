@@ -348,6 +348,14 @@ Track 01 captures are stored under `artifacts/research/track01/source-snapshots/
 | `SRC-141` | `xed-license.txt` (unchanged content; now cited at pinned commit `0bcb6237345c5066726dcc08b3d87928df3b5b26` instead of `main` HEAD — same file, same digest) | `7330526e510d83ee5da23f9653b67024fefab6d0a56bfa76dfdf2497aef647c6` |
 | `SRC-142` | `SoftFloat-3e.zip` (canonical distribution archive from `jhauser.us`) | `21130ce885d35c1fe73fc1e1bf2244178167e05c6747cad5f450cc991714c746` |
 
+Uncited captures retained for provenance under the Track 01 root, with no
+ledger row: `arm-ddi0487Mc-B2-2.json` and `arm-ddi0487Mc-B2-8.json` are the
+§B2.2 and §B2.8 landing pages (link lists fetched to locate subsection paths,
+no cited text); `arm-ddi0487Mc-B2-2-2.json` is §B2.2.2 "Properties of
+single-copy atomic accesses", fetched while scoping `CLM-01-08-05` but cited
+by no claim. A claim that later cites any of them must add a manifest row
+first (`REV-063` change 2).
+
 The `verdict` is a review outcome, not a claim of truth. Claim-level citations,
 the required source gate, and an explicit relationship for both support and
 contradiction remain mandatory.
