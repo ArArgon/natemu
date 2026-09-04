@@ -23,31 +23,56 @@ resolve() {
     command -v "$1" 2>/dev/null
 }
 
-# json_escape <string>: minimal escaping sufficient for --version output
-# (backslash, double quote, newline). ponytail: not a general JSON encoder,
-# upgrade if a captured string ever contains other control characters.
-json_escape() {
-    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n' ' '
+# provenance <path>: classifies where a resolved tool actually comes from —
+# CLT / OS / Homebrew / user-local / other — since "a tool exists on this
+# host" and "a tool is publicly available on the supported hosts" (what
+# KA-09/`sustainable` asks) are different claims (REV-053 M2). A tool
+# resolving from a developer's own home directory is not evidence of public
+# distribution.
+provenance() {
+    case "$1" in
+        "") printf 'none' ;;
+        /Library/Developer/CommandLineTools/*) printf 'CLT' ;;
+        /opt/homebrew/*|/usr/local/Cellar/*|/usr/local/Homebrew/*) printf 'Homebrew' ;;
+        "$HOME"/*) printf 'user-local' ;;
+        /usr/bin/*|/usr/sbin/*|/bin/*|/sbin/*) printf 'OS' ;;
+        *) printf 'other' ;;
+    esac
 }
 
-# tool_field <name> <path> <version>: prints one JSON object.
+# json_escape: minimal escaping sufficient for --version output (backslash,
+# double quote, newline escaped as the two-character sequence \n so a
+# multi-line value is preserved rather than silently flattened — REV-054
+# C7). Reads stdin, writes stdout. awk, not sed: BSD sed's `N` at end of
+# input drops the pattern space instead of printing it, which silently
+# emptied every field when this was first written with the classic sed
+# multi-line-join idiom (caught by smoke-testing before commit). ponytail:
+# not a general JSON encoder; upgrade if a captured string ever contains
+# other control characters.
+json_escape() {
+    awk 'BEGIN{ORS=""} {gsub(/\\/,"\\\\"); gsub(/"/,"\\\"")} NR>1{printf "\\n"} {printf "%s", $0}'
+}
+
+# tool_field <path> <version>: prints one JSON object, including the
+# resolved tool's provenance classification.
 tool_field() {
-    name=$1; path=$2; version=$3
+    path=$1; version=$2
     if [ -n "$path" ]; then
-        printf '{"present": true, "path": "%s", "version": "%s"}' \
-            "$(json_escape "$path")" "$(json_escape "$version")"
+        printf '{"present": true, "path": "%s", "version": "%s", "provenance": "%s"}' \
+            "$(printf '%s' "$path" | json_escape)" "$(printf '%s' "$version" | json_escape)" \
+            "$(provenance "$path")"
     else
-        printf '{"present": false, "path": null, "version": null}'
+        printf '{"present": false, "path": null, "version": null, "provenance": null}'
     fi
-    : "$name" # name only used for readability at call sites
 }
 
 presence_field() {
     path=$1
     if [ -n "$path" ]; then
-        printf '{"present": true, "path": "%s"}' "$(json_escape "$path")"
+        printf '{"present": true, "path": "%s", "provenance": "%s"}' \
+            "$(printf '%s' "$path" | json_escape)" "$(provenance "$path")"
     else
-        printf '{"present": false, "path": null}'
+        printf '{"present": false, "path": null, "provenance": null}'
     fi
 }
 
@@ -71,22 +96,36 @@ GIT_PATH=$(resolve git || true)
 GIT_VER=$( [ -n "$GIT_PATH" ] && "$GIT_PATH" --version 2>&1 | head -1 || true)
 
 CODESIGN_PATH=$(resolve codesign || true)
-# codesign has no --version option; record that plainly rather than a
-# fabricated version string (confirmed: `codesign --version` prints its
-# usage banner to stderr and exits nonzero).
-CODESIGN_VER=$( [ -n "$CODESIGN_PATH" ] && printf '(no --version option; present via xcrun --find)' || true)
+# codesign has no --version option (confirmed: `codesign --version` prints
+# its usage banner to stderr and exits nonzero). Report version as null with
+# a separate reason field instead of a fabricated/placeholder version
+# string a reader could mistake for real (REV-054 C6); check.py exempts
+# codesign from the non-empty-version rule accordingly.
+CODESIGN_VER=""
+CODESIGN_VER_UNAVAILABLE_REASON=""
+if [ -n "$CODESIGN_PATH" ]; then
+    CODESIGN_VER_UNAVAILABLE_REASON="no --version option"
+fi
 
 XCODE_SELECT_PATH=$(xcode-select -p 2>/dev/null || true)
 CLT_BUILD=$(pkgutil --pkg-info=com.apple.pkg.CLTools_Executables 2>/dev/null | \
     awk -F': ' '/^version:/{print $2}' || true)
 
+# xctrace: test the RESOLVED binary, not a fresh bare-`xctrace` PATH lookup
+# (REV-054 C2 / REV-053 M4) — on hosts where `xcrun --find xctrace` and
+# `command -v xctrace` disagree, a bare invocation can attribute a PATH miss
+# to Xcode. Capture and report the failure message itself so the record's
+# quoted reason is verifiable from the artifact, not asserted in prose.
 XCTRACE_PATH=$(resolve xctrace || true)
 XCTRACE_FUNCTIONAL=false
+XCTRACE_MESSAGE=""
 if [ -n "$XCTRACE_PATH" ]; then
-    if xctrace version >/tmp/.inv0110_xctrace.$$ 2>&1; then
+    XCTRACE_OUT=$(mktemp)
+    if "$XCTRACE_PATH" version >"$XCTRACE_OUT" 2>&1; then
         XCTRACE_FUNCTIONAL=true
     fi
-    rm -f /tmp/.inv0110_xctrace.$$
+    XCTRACE_MESSAGE=$(head -1 "$XCTRACE_OUT" 2>/dev/null || true)
+    rm -f "$XCTRACE_OUT"
 fi
 
 CMAKE_PATH=$(resolve cmake || true)
@@ -103,39 +142,49 @@ if [ -d "$SDK_DIR" ]; then
         [ -e "$entry" ] || continue
         base=$(basename "$entry")
         [ "$first" = 1 ] || SDK_LIST="$SDK_LIST,"
-        SDK_LIST="$SDK_LIST\"$(json_escape "$base")\""
+        SDK_LIST="$SDK_LIST\"$(printf '%s' "$base" | json_escape)\""
         first=0
     done
 fi
 
 printf '{\n'
-printf '  "schema_version": 1,\n'
+printf '  "schema_version": 2,\n'
 printf '  "negative_control": %s,\n' "$( [ "$NEGATIVE" = "1" ] && echo true || echo false )"
 printf '  "tools": {\n'
-printf '    "clang": %s,\n' "$(tool_field clang "$CLANG_PATH" "$CLANG_VER")"
-printf '    "lldb": %s,\n' "$(tool_field lldb "$LLDB_PATH" "$LLDB_VER")"
-printf '    "llvm_objdump": %s,\n' "$(tool_field llvm-objdump "$OBJDUMP_PATH" "$OBJDUMP_VER")"
-printf '    "python3": %s,\n' "$(tool_field python3 "$PY_PATH" "$PY_VER")"
-printf '    "rustc": %s,\n' "$(tool_field rustc "$RUSTC_PATH" "$RUSTC_VER")"
-printf '    "git": %s,\n' "$(tool_field git "$GIT_PATH" "$GIT_VER")"
-printf '    "codesign": %s\n' "$(tool_field codesign "$CODESIGN_PATH" "$CODESIGN_VER")"
+printf '    "clang": %s,\n' "$(tool_field "$CLANG_PATH" "$CLANG_VER")"
+printf '    "lldb": %s,\n' "$(tool_field "$LLDB_PATH" "$LLDB_VER")"
+printf '    "llvm_objdump": %s,\n' "$(tool_field "$OBJDUMP_PATH" "$OBJDUMP_VER")"
+printf '    "python3": %s,\n' "$(tool_field "$PY_PATH" "$PY_VER")"
+printf '    "rustc": %s,\n' "$(tool_field "$RUSTC_PATH" "$RUSTC_VER")"
+printf '    "git": %s,\n' "$(tool_field "$GIT_PATH" "$GIT_VER")"
+if [ -n "$CODESIGN_PATH" ]; then
+    printf '    "codesign": {"present": true, "path": "%s", "version": null, "version_unavailable_reason": "%s", "provenance": "%s"}\n' \
+        "$(printf '%s' "$CODESIGN_PATH" | json_escape)" \
+        "$(printf '%s' "$CODESIGN_VER_UNAVAILABLE_REASON" | json_escape)" \
+        "$(provenance "$CODESIGN_PATH")"
+else
+    printf '    "codesign": {"present": false, "path": null, "version": null, "version_unavailable_reason": null, "provenance": null}\n'
+fi
 printf '  },\n'
 printf '  "presence": {\n'
 printf '    "xcode_select_path": %s,\n' "$(presence_field "$XCODE_SELECT_PATH")"
-printf '    "xctrace": {"present": %s, "path": %s, "functional_without_xcode": %s},\n' \
+printf '    "xctrace": {"present": %s, "path": %s, "provenance": %s, "functional_without_xcode": %s, "message": %s},\n' \
     "$( [ -n "$XCTRACE_PATH" ] && echo true || echo false )" \
-    "$( [ -n "$XCTRACE_PATH" ] && printf '"%s"' "$(json_escape "$XCTRACE_PATH")" || echo null )" \
-    "$XCTRACE_FUNCTIONAL"
+    "$( [ -n "$XCTRACE_PATH" ] && printf '"%s"' "$(printf '%s' "$XCTRACE_PATH" | json_escape)" || echo null )" \
+    "$( [ -n "$XCTRACE_PATH" ] && printf '"%s"' "$(provenance "$XCTRACE_PATH")" || echo null )" \
+    "$XCTRACE_FUNCTIONAL" \
+    "$( [ -n "$XCTRACE_MESSAGE" ] && printf '"%s"' "$(printf '%s' "$XCTRACE_MESSAGE" | json_escape)" || echo null )"
 printf '    "cmake": %s,\n' "$(presence_field "$CMAKE_PATH")"
 printf '    "ninja": %s,\n' "$(presence_field "$NINJA_PATH")"
 printf '    "qemu_system_x86_64": %s,\n' "$(presence_field "$QEMU_PATH")"
-printf '    "brew": {"present": %s, "path": %s, "version": %s}\n' \
+printf '    "brew": {"present": %s, "path": %s, "provenance": %s, "version": %s}\n' \
     "$( [ -n "$BREW_PATH" ] && echo true || echo false )" \
-    "$( [ -n "$BREW_PATH" ] && printf '"%s"' "$(json_escape "$BREW_PATH")" || echo null )" \
-    "$( [ -n "$BREW_PATH" ] && printf '"%s"' "$(json_escape "$BREW_VER")" || echo null )"
+    "$( [ -n "$BREW_PATH" ] && printf '"%s"' "$(printf '%s' "$BREW_PATH" | json_escape)" || echo null )" \
+    "$( [ -n "$BREW_PATH" ] && printf '"%s"' "$(provenance "$BREW_PATH")" || echo null )" \
+    "$( [ -n "$BREW_PATH" ] && printf '"%s"' "$(printf '%s' "$BREW_VER" | json_escape)" || echo null )"
 printf '  },\n'
-printf '  "sdk_directory": "%s",\n' "$(json_escape "$SDK_DIR")"
+printf '  "sdk_directory": "%s",\n' "$(printf '%s' "$SDK_DIR" | json_escape)"
 printf '  "sdk_directory_listing": [%s],\n' "$SDK_LIST"
-printf '  "clt_build": %s,\n' "$( [ -n "$CLT_BUILD" ] && printf '"%s"' "$(json_escape "$CLT_BUILD")" || echo null )"
-printf '  "path": "%s"\n' "$(json_escape "$PATH")"
+printf '  "clt_build": %s,\n' "$( [ -n "$CLT_BUILD" ] && printf '"%s"' "$(printf '%s' "$CLT_BUILD" | json_escape)" || echo null )"
+printf '  "path": "%s"\n' "$(printf '%s' "$PATH" | json_escape)"
 printf '}\n'

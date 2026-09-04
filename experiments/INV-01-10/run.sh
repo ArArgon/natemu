@@ -5,7 +5,7 @@
 # brief's experiment rules for the contract this script must satisfy.
 set -eu
 cd "$(dirname "$0")"
-REPO_ROOT=$(cd ../.. && pwd)
+REPO_ROOT=$(git rev-parse --show-toplevel)
 
 if [ -z "${NATEMU_RAW_ROOT:-}" ]; then
     echo "refusing to run: NATEMU_RAW_ROOT is not set" >&2
@@ -15,14 +15,17 @@ if [ ! -d "$NATEMU_RAW_ROOT" ]; then
     echo "refusing to run: NATEMU_RAW_ROOT ($NATEMU_RAW_ROOT) is not an existing directory" >&2
     exit 1
 fi
-case "$NATEMU_RAW_ROOT" in
-    "$REPO_ROOT"|"$REPO_ROOT"/*)
-        echo "refusing to run: NATEMU_RAW_ROOT must be outside the repository ($REPO_ROOT)" >&2
+# Resolve before comparing (REV-054 C5, same fix as REV-039 C8 in
+# INV-01-01/run.sh): a symlink whose target is inside the repository must
+# not pass a string-prefix test on the unresolved path.
+RAW_ROOT_RESOLVED=$(cd "$NATEMU_RAW_ROOT" && pwd -P)
+REPO_ROOT_RESOLVED=$(cd "$REPO_ROOT" && pwd -P)
+case "$RAW_ROOT_RESOLVED" in
+    "$REPO_ROOT_RESOLVED"|"$REPO_ROOT_RESOLVED"/*)
+        echo "refusing to run: NATEMU_RAW_ROOT must be outside the repository ($REPO_ROOT_RESOLVED)" >&2
         exit 1
         ;;
 esac
-
-chmod +x src/tools.sh
 
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 REV=$(git -C "$REPO_ROOT" rev-parse --short HEAD)
@@ -30,11 +33,15 @@ RUN_ID="${TS}-${REV}"
 OUT="$NATEMU_RAW_ROOT/INV-01-10/$RUN_ID"
 mkdir -p "$OUT"
 
-# --- positive run ---
-src/tools.sh > "$OUT/tools.json"
+# --- positive run --- (invoke via the interpreter, not `./tools.sh`, so
+# this script never needs to chmod +x anything under experiments/ —
+# REV-054 C4; the file is already executable in the repository, but a
+# script that asserts it writes nothing under experiments/ should not
+# contain a write to experiments/ even a redundant one)
+sh src/tools.sh > "$OUT/tools.json"
 
 # --- negative control ---
-src/tools.sh --negative > "$OUT/negative.json"
+sh src/tools.sh --negative > "$OUT/negative.json"
 
 # --- checker over both ---
 python3 src/check.py "$OUT/tools.json" > "$OUT/tools.check.txt" 2>&1 || true
