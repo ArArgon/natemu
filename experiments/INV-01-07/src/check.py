@@ -19,12 +19,22 @@ CLOCKS = {
     "clock_gettime(CLOCK_REALTIME)",
 }
 QOS = {"user-interactive", "background"}
+MONOTONIC_CLOCKS = {
+    "mach_absolute_time",
+    "clock_gettime_nsec_np(CLOCK_UPTIME_RAW)",
+    "clock_gettime(CLOCK_MONOTONIC_RAW)",
+    "clock_gettime(CLOCK_MONOTONIC)",
+    "clock_gettime(CLOCK_UPTIME_RAW)",
+}
 WAKEUP_CASES = {
     (mechanism, target, qos)
-    for mechanism in ("mach_wait_until", "nanosleep", "dispatch_source_timer_leeway0")
+    for mechanism in ("mach_wait_until", "nanosleep",
+                      "dispatch_source_timer_leeway0",
+                      "dispatch_source_timer_strict")
     for target in (100000, 1000000, 10000000)
     for qos in QOS
 }
+CONCURRENT_THREADS = {2, 4, 8}
 SIGNAL_CASES = {
     (mechanism, qos)
     for mechanism in ("pthread_cond_signal", "dispatch_semaphore_signal",
@@ -100,9 +110,59 @@ def main(path):
            if s["n"] < 2000]
     rule(not ssz, "I12 signal sample size", f"arms below 2000 samples: {ssz[:4]}")
 
+    cw = d.get("concurrent_wakeup", [])
+    cw_threads = [c.get("threads") for c in cw]
+    rule(len(cw_threads) == len(CONCURRENT_THREADS)
+         and set(cw_threads) == CONCURRENT_THREADS,
+         "I13 exact concurrent-wakeup coverage",
+         f"expected {sorted(CONCURRENT_THREADS)} thread counts; got {cw_threads}")
+    cw_early = [(c["threads"], c["early"]) for c in cw if c["early"] > 0]
+    rule(not cw_early, "I14 no concurrent wake before deadline", f"{cw_early}")
+    cw_small = [(c["threads"], c["n"]) for c in cw
+                if c["n"] < 2000 * c.get("threads", 1)]
+    rule(not cw_small, "I15 concurrent-wakeup sample size",
+         f"arms below 2000 samples per thread: {cw_small}")
+
+    # The timebase-conversion control (REV-044 change 13): the mach-arithmetic
+    # error and an independent CLOCK_UPTIME_RAW elapsed measurement must agree,
+    # or a proportional overshoot could be a conversion artefact.
+    # Enforced only on the arms where the wake timestamp is taken by the
+    # measuring thread itself. In the dispatch arms the wake is timestamped in
+    # the handler on another thread while the control is read after the
+    # semaphore returns, so their delta legitimately includes a cross-thread
+    # handoff and is reported but not enforced.
+    SAME_THREAD = ("mach_wait_until", "nanosleep")
+    ctrl = [(w["mechanism"], w["target_ns"], w["qos"],
+             w.get("timebase_control_worst_delta_ns"))
+            for w in wakeup
+            if w["mechanism"] in SAME_THREAD
+            and (w.get("timebase_control_worst_delta_ns") is None
+                 or w["timebase_control_worst_delta_ns"] > w["target_ns"] // 10)]
+    rule(not ctrl, "I16 timebase arithmetic agrees with an independent clock",
+         "same-thread arms whose mach-arithmetic error disagrees with an "
+         f"independent CLOCK_UPTIME_RAW elapsed measurement by more than 10% "
+         f"of the target: {ctrl[:4] or 'none'}")
+
+    # The round-trip control (REV-044 change 1): one-way latency subtracts two
+    # threads' timestamps, so it must never exceed the sender-only round trip.
+    rt_bad = [(x["mechanism"], x["qos"], x["p99_ns"], x.get("roundtrip_p99_ns"))
+              for x in signal
+              if x.get("roundtrip_p99_ns") is None
+              or x["p99_ns"] > x["roundtrip_p99_ns"]]
+    rule(not rt_bad, "I17 one-way latency within the sender-only round trip",
+         f"{rt_bad[:4]}")
+
     print(f"INV-01-07 checker  mode={d.get('mode')}  file={path}")
     for line in notes + fails:
         print("  " + line)
+
+    if fails:
+        # A threshold computed from a run that failed an integrity rule is not
+        # interpretable, and a MEET printed next to a physically impossible
+        # value invites exactly the misreading REV-045 found. Suppress.
+        print("  -- decision thresholds suppressed: integrity failures present --")
+        print(f"RESULT: FAIL ({len(fails)} integrity failures)")
+        return 1
 
     # --- predeclared decision thresholds (reported, never a code FAIL) ---
     print("  -- decision thresholds (result gate adjudicates) --")
@@ -110,23 +170,39 @@ def main(path):
     def thr(name, ok, detail):
         print(f"  {'MEET' if ok else 'MISS'}  {name}: {detail}")
 
-    fastest = min((c["read_cost_p50_ns"] for c in clocks), default=None)
-    thr("T1 clock read cost p50 < 100 ns", fastest is not None and fastest < 100,
-        f"fastest clock read p50 = {fastest} ns")
+    # CLM-01-07-11 is about "the fastest documented monotonic clock", so the
+    # settable wall clock must not be able to satisfy it (REV-045 change 4).
+    mono = [c for c in clocks if c["clock"] in MONOTONIC_CLOCKS]
+    fastest = min((c["read_cost_p50_ns"] for c in mono), default=None)
+    thr("T1 fastest monotonic clock read p50 < 100 ns "
+        "(guest RDTSC budget: 1 kHz tick x 8 vCPUs plus in-guest reads must "
+        "stay under 1% of a core, so a read must cost far less than 1 us)",
+        fastest is not None and fastest < 100,
+        f"fastest monotonic clock read p50 = {fastest} ns over "
+        f"{len(mono)} monotonic clocks; CLOCK_REALTIME excluded")
 
     ui1ms = [w for w in d.get("wakeup", [])
              if w["target_ns"] == 1000000 and w["qos"] == "user-interactive"]
     best = min((w["p50_ns"] for w in ui1ms), default=None)
-    thr("T2 1 kHz tick: median wakeup error < 250 us at user-interactive",
+    thr("T2 1 kHz tick: median wakeup error < 250 us at user-interactive "
+        "(derived: one quarter of the 1 ms period of the declared 1 kHz "
+        "guest tick, so four ticks' error cannot accumulate into a lost tick)",
         best is not None and best < 250000,
         f"best median error at 1 ms target = {best} ns "
-        f"({[(w['mechanism'], w['p50_ns']) for w in ui1ms]})")
+        f"({[(w['mechanism'], w['p50_ns']) for w in ui1ms]}). "
+        "A miss routes per INV-01-07 Exclusion and stop criteria: first to "
+        "Q-01-22 (guest time-base policy) and Q-01-21 (power/background "
+        "state), then to a narrowed applicability stratum; it becomes a KA-05 "
+        "failure only if no admissible mechanism, including "
+        "DISPATCH_TIMER_STRICT, meets it at any accepted stratum.")
 
     ipi = [s for s in signal
            if s["qos"] == "user-interactive"
            and s["mechanism"] == "pthread_kill_SIGUSR1_spinning"]
     bp99 = min((s["p99_ns"] for s in ipi), default=None)
-    thr("T3 IPI analogue: p99 delivery < 100 us at user-interactive",
+    thr("T3 IPI analogue: p99 delivery < 100 us at user-interactive "
+        "(derived: one tenth of the 1 ms guest tick period, so a cross-vCPU "
+        "interrupt is delivered well inside the tick that raised it)",
         bp99 is not None and bp99 < 100000,
         f"pthread_kill spinning-target p99 = {bp99} ns")
 
@@ -134,14 +210,18 @@ def main(path):
     ratios = [
         by_arm[(m, t, "background")]["p50_ns"]
         / max(1, by_arm[(m, t, "user-interactive")]["p50_ns"])
-        for m in ("mach_wait_until", "nanosleep", "dispatch_source_timer_leeway0")
+        for m in ("mach_wait_until", "nanosleep",
+                  "dispatch_source_timer_leeway0", "dispatch_source_timer_strict")
         for t in (100000, 1000000, 10000000)
         if (m, t, "background") in by_arm and (m, t, "user-interactive") in by_arm
     ]
     if ratios:
         rb = max(ratios)
-        thr("T4 QoS sensitivity < 5x (placement/coalescing exposure)", rb < 5,
-            f"worst matched-arm background/user-interactive median ratio = {rb:.1f}x")
+        thr("T4 QoS-class effect on wakeup error < 5x", rb < 5,
+            f"worst matched-arm background/user-interactive median ratio = "
+            f"{rb:.1f}x. This is a QoS-class effect only; no part of it may be "
+            "attributed to core type (CLM-01-07-08 — placement is sampled, "
+            "never controlled or observed).")
 
     print(f"RESULT: {'FAIL' if fails else 'PASS'} ({len(fails)} integrity failures)")
     return 1 if fails else 0

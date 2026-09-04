@@ -12,6 +12,7 @@
  * flag that FAIL.
  */
 #include <mach/mach_init.h>
+#include <mach/mach_port.h>
 #include <mach/mach_time.h>
 #include <mach/thread_act.h>
 #include <mach/thread_policy.h>
@@ -89,8 +90,22 @@ struct lit {
 	int test;    /* 0 SB, 1 MP */
 	int sequential;
 	long relaxed, total;
+	/* Full outcome histogram, indexed (r0 != 0) * 2 + (r1 != 0), so all four
+	 * register-value combinations are recorded. BP-01-08-start requires this:
+	 * a bare "not observed" count is uninterpretable on its own. */
+	long hist[4];
+	uint64_t rng; /* xorshift state for per-iteration start-offset jitter */
 	qos_class_t q;
 };
+
+/* Small per-iteration delay on one side so the two sides do not always enter
+ * the body in lockstep. Without it the three-phase barrier fixes the entry
+ * offset and a whole class of interleavings is unreachable. */
+static inline void jitter(struct lit *L, int side) {
+	if (side != 1) return;
+	L->rng ^= L->rng << 13; L->rng ^= L->rng >> 7; L->rng ^= L->rng << 17;
+	for (unsigned n = (unsigned)(L->rng & 0x3f); n; n--) __asm__ volatile("nop");
+}
 
 static inline void barrier2(struct lit *L, int *local_sense) {
 	*local_sense = !*local_sense;
@@ -105,11 +120,22 @@ static inline void barrier2(struct lit *L, int *local_sense) {
 /* Each body is inline asm so the compiler cannot reorder, fold, or elide the
  * accesses under test. Verify with llvm-objdump before any evidence run. */
 #define ST_PLAIN(p, v) __asm__ volatile("str %1, [%0]" ::"r"(p), "r"((uint64_t)(v)) : "memory")
-#define LD_PLAIN(p, d) __asm__ volatile("ldr %0, [%1]" : "=r"(d) : "r"(p) : "memory")
+#define LD_PLAIN(p, d) __asm__ volatile("ldr %0, [%1]" : "=&r"(d) : "r"(p) : "memory")
 #define ST_REL(p, v)   __asm__ volatile("stlr %1, [%0]" ::"r"(p), "r"((uint64_t)(v)) : "memory")
-#define LD_ACQ(p, d)   __asm__ volatile("ldar %0, [%1]" : "=r"(d) : "r"(p) : "memory")
+#define LD_ACQ(p, d)   __asm__ volatile("ldar %0, [%1]" : "=&r"(d) : "r"(p) : "memory")
 #define DMB_ISH()      __asm__ volatile("dmb ish" ::: "memory")
 
+/* The evidence build inlines lit_body into lit_thread, where the C11
+ * sense-reversing barrier also emits LDAR/STLR/DMB — so a whole-symbol grep
+ * there cannot distinguish the litmus bodies from the barrier. `make disasm`
+ * builds a second, otherwise identical binary with -DLITMUS_VERIFY, which
+ * keeps lit_body a separate symbol so validate.sh can check the emitted
+ * sequence of the bodies alone. Inlining cannot change which mnemonics the
+ * inline-asm blocks emit; the verify build exists to prove a variant has not
+ * degenerated in source. The measured binary is built without it. */
+#ifdef LITMUS_VERIFY
+__attribute__((noinline))
+#endif
 static void lit_body(struct lit *L, int side) {
 	uint64_t d;
 	volatile uint64_t *a = L->test == 0 ? (side == 0 ? &L->x : &L->y)
@@ -150,12 +176,14 @@ static void *lit_thread(void *p) {
 	int ls = 0;
 	for (long i = 0; i < L->iters; i++) {
 		barrier2(L, &ls);          /* both sides ready, locations are zero */
+		jitter(L, a->side);
 		lit_body(L, a->side);
 		barrier2(L, &ls);          /* both sides done */
 		if (a->side == 0) {        /* side 0 scores and resets */
 			int relaxed = L->test == 0 ? (L->r0 == 0 && L->r1 == 0)
 			                           : (L->r0 == 1 && L->r1 == 0);
 			L->relaxed += relaxed;
+			L->hist[(L->r0 != 0) * 2 + (L->r1 != 0)]++;
 			L->total++;
 			L->x = L->y = 0;
 			L->r0 = L->r1 = 0;
@@ -174,6 +202,7 @@ static void lit_sequential(struct lit *L) {
 		int relaxed = L->test == 0 ? (L->r0 == 0 && L->r1 == 0)
 		                           : (L->r0 == 1 && L->r1 == 0);
 		L->relaxed += relaxed;
+		L->hist[(L->r0 != 0) * 2 + (L->r1 != 0)]++;
 		L->total++;
 		L->x = L->y = 0;
 		L->r0 = L->r1 = 0;
@@ -186,6 +215,8 @@ static void run_litmus(FILE *f, int test, int variant, qos_class_t q, int last) 
 	struct lit *L = xaligned(CL, ((sizeof(struct lit) + CL - 1) / CL) * CL);
 	memset(L, 0, sizeof *L);
 	L->iters = g_iters; L->variant = variant; L->test = test; L->q = q;
+	L->rng = 0x9e3779b97f4a7c15ull ^ ((uint64_t)test << 32) ^
+	         ((uint64_t)variant << 16) ^ (uint64_t)q;
 	atomic_store(&L->bar, 0); atomic_store(&L->sense, 0);
 	uint64_t t0 = now_ns();
 	if (g_negative) {
@@ -202,24 +233,32 @@ static void run_litmus(FILE *f, int test, int variant, qos_class_t q, int last) 
 	fprintf(f,
 	        "    {\"test\":\"%s\",\"variant\":\"%s\",\"qos\":\"%s\","
 	        "\"sequential\":%s,\"iterations\":%ld,\"relaxed_observed\":%ld,"
-	        "\"elapsed_ns\":%llu}%s\n",
+	        "\"histogram\":{\"r0=0,r1=0\":%ld,\"r0=0,r1!=0\":%ld,"
+	        "\"r0!=0,r1=0\":%ld,\"r0!=0,r1!=0\":%ld},"
+	        "\"start_offset_jitter\":true,\"elapsed_ns\":%llu}%s\n",
 	        tn[test], vn[variant], qos_name(q), L->sequential ? "true" : "false",
-	        L->total, L->relaxed, (unsigned long long)(now_ns() - t0),
+	        L->total, L->relaxed,
+	        L->hist[0], L->hist[1], L->hist[2], L->hist[3],
+	        (unsigned long long)(now_ns() - t0),
 	        last ? "" : ",");
 	free(L);
 }
 
 /* ---------------- LSE atomics contention ---------------- */
 
-struct lse { _Alignas(CL) volatile uint64_t c; long iters; int use_cas; qos_class_t q; };
+struct lse { _Alignas(CL) volatile uint64_t c;
+             _Alignas(CL) atomic_llong attempts;
+             long iters; int use_cas; qos_class_t q; };
 
 static void *lse_thread(void *p) {
 	struct lse *S = p;
 	set_qos(S->q);
 	volatile uint64_t *a = &S->c;
+	long local_attempts = 0;
 	for (long i = 0; i < S->iters; i++) {
 		if (S->use_cas) {
 			uint64_t old, want;
+			long tries = 0;
 			do {
 				old = __atomic_load_n(a, __ATOMIC_RELAXED);
 				want = old;
@@ -227,16 +266,20 @@ static void *lse_thread(void *p) {
 				                 : "+r"(want)
 				                 : "r"(a), "r"(old + 1)
 				                 : "memory");
+				tries++;
 			} while (want != old);
+			local_attempts += tries;
 		} else {
 			uint64_t one = 1, dst;
 			__asm__ volatile("ldadd %2, %0, [%1]"
-			                 : "=r"(dst)
+			                 : "=&r"(dst)
 			                 : "r"(a), "r"(one)
 			                 : "memory");
 			(void)dst;
+			local_attempts++;
 		}
 	}
+	atomic_fetch_add(&S->attempts, (long long)local_attempts);
 	return NULL;
 }
 
@@ -252,13 +295,21 @@ static void run_lse(FILE *f, int nthreads, int use_cas, qos_class_t q, int last)
 		fail_pthread(pthread_join(th[i], NULL), "pthread_join");
 	uint64_t el = now_ns() - t0;
 	long expected = (long)S->iters * nthreads;
+	long long attempts = atomic_load(&S->attempts);
+	/* ops/ns_per_op count successful increments; attempts/ns_per_attempt count
+	 * executed atomic instructions. For `cas` under contention the two differ
+	 * by retry amplification, and charging retries to the instruction's cost
+	 * would misattribute the scaling (REV-044/REV-045). */
 	fprintf(f,
 	        "    {\"op\":\"%s\",\"threads\":%d,\"qos\":\"%s\",\"ops\":%ld,"
+	        "\"attempts\":%lld,\"attempts_per_success\":%.4f,"
 	        "\"counter\":%llu,\"lost_updates\":%lld,\"elapsed_ns\":%llu,"
-	        "\"ns_per_op\":%.2f}%s\n",
+	        "\"ns_per_op\":%.2f,\"ns_per_attempt\":%.2f}%s\n",
 	        use_cas ? "cas" : "ldadd", nthreads, qos_name(q), expected,
+	        attempts, (double)attempts / (double)expected,
 	        (unsigned long long)S->c, (long long)(expected - (long)S->c),
 	        (unsigned long long)el, (double)el / (double)expected,
+	        (double)el / (double)(attempts ? attempts : 1),
 	        last ? "" : ",");
 	free(S);
 }
@@ -268,9 +319,17 @@ static void run_lse(FILE *f, int nthreads, int use_cas, qos_class_t q, int last)
 static sigjmp_buf g_jb;
 static volatile sig_atomic_t g_sig = 0, g_code = 0, g_in_probe = 0;
 
+static FILE *g_out;  /* flushed before an unprovoked-fault abort */
+
 static void fault_handler(int s, siginfo_t *si, void *uc) {
 	(void)uc;
-	if (!g_in_probe) _exit(90); /* never swallow a fault we did not provoke */
+	if (!g_in_probe) {
+		/* Never swallow a fault we did not provoke. Flush first: an abort
+		 * with a half-written result.json makes check.py die on a JSON parse
+		 * error instead of reporting FAIL. */
+		if (g_out) { fputs("\n  \"aborted\": \"unprovoked fault\"\n}\n", g_out); fflush(g_out); }
+		_exit(90);
+	}
 	g_sig = s;
 	g_code = si ? si->si_code : 0;
 	siglongjmp(g_jb, 1);
@@ -289,9 +348,9 @@ static void probe_one(volatile uint8_t *base, long off, const char *what,
 	if (sigsetjmp(g_jb, 1) == 0) {
 		uint32_t add = 1, dst = 0;
 		switch (kind) {
-		case 0: __asm__ volatile("ldaddal %w2, %w0, [%1]" : "=r"(dst) : "r"(p), "r"(add) : "memory"); break;
-		case 1: __asm__ volatile("ldr %w0, [%1]" : "=r"(dst) : "r"(p) : "memory"); break;
-		default: __asm__ volatile("ldar %w0, [%1]" : "=r"(dst) : "r"(p) : "memory"); break;
+		case 0: __asm__ volatile("ldaddal %w2, %w0, [%1]" : "=&r"(dst) : "r"(p), "r"(add) : "memory"); break;
+		case 1: __asm__ volatile("ldr %w0, [%1]" : "=&r"(dst) : "r"(p) : "memory"); break;
+		default: __asm__ volatile("ldar %w0, [%1]" : "=&r"(dst) : "r"(p) : "memory"); break;
 		}
 		out->val = dst;
 	} else {
@@ -319,12 +378,13 @@ static void *fallback_thread(void *a) {
 }
 
 static void run_alignment(FILE *f) {
-	struct sigaction sa;
+	struct sigaction sa, prev_bus, prev_segv;
 	memset(&sa, 0, sizeof sa);
 	sa.sa_sigaction = fault_handler;
 	sa.sa_flags = SA_SIGINFO | SA_NODEFER;
 	sigemptyset(&sa.sa_mask);
-	if (sigaction(SIGBUS, &sa, NULL) != 0 || sigaction(SIGSEGV, &sa, NULL) != 0) {
+	if (sigaction(SIGBUS, &sa, &prev_bus) != 0 ||
+	    sigaction(SIGSEGV, &sa, &prev_segv) != 0) {
 		perror("sigaction");
 		exit(1);
 	}
@@ -372,6 +432,13 @@ static void run_alignment(FILE *f) {
 	        fb.iters * 4, (unsigned long long)el,
 	        (double)el / (double)(fb.iters * 4));
 	munmap((void *)buf, 65536);
+	/* Restore the previous dispositions so later arms do not run under a
+	 * handler installed for this one (REV-045 required change 11). */
+	if (sigaction(SIGBUS, &prev_bus, NULL) != 0 ||
+	    sigaction(SIGSEGV, &prev_segv, NULL) != 0) {
+		perror("sigaction restore");
+		exit(1);
+	}
 }
 
 /* ---------------- cross-thread invalidation round trip ---------------- */
@@ -447,15 +514,21 @@ int main(int argc, char **argv) {
 	}
 	FILE *f = out ? fopen(out, "w") : stdout;
 	if (!f) { perror("open out"); return 1; }
+	g_out = f;
 	set_qos(QOS_CLASS_USER_INTERACTIVE);
 
 	fprintf(f, "{\n  \"experiment\": \"INV-01-08\",\n");
 	fprintf(f, "  \"mode\": \"%s\",\n", g_negative ? "negative" : "normal");
 	fprintf(f, "  \"litmus_iterations\": %ld,\n", g_iters);
 
+	fprintf(f, "  \"timebase\": {\"numer\":%u,\"denom\":%u},\n",
+	        g_tb.numer, g_tb.denom);
+
 	thread_affinity_policy_data_t ap = {1};
-	kern_return_t kr = thread_policy_set(mach_thread_self(), THREAD_AFFINITY_POLICY,
+	mach_port_t self = mach_thread_self();
+	kern_return_t kr = thread_policy_set(self, THREAD_AFFINITY_POLICY,
 	                                     (thread_policy_t)&ap, THREAD_AFFINITY_POLICY_COUNT);
+	mach_port_deallocate(mach_task_self(), self);
 	fprintf(f, "  \"thread_affinity_policy\": {\"kern_return_t\":%d,\"success\":%s},\n",
 	        (int)kr, kr == KERN_SUCCESS ? "true" : "false");
 

@@ -15,7 +15,9 @@ $(BUILD):
 # instructions they claim (plain LDR/STR, LDAR/STLR, DMB ISH, LDADDAL, CAS).
 disasm: $(BIN)
 	xcrun llvm-objdump -d --no-show-raw-insn $(BIN) > $(BUILD)/litmus.disasm
-	@echo wrote $(BUILD)/litmus.disasm
+	$(CC) $(CFLAGS) -DLITMUS_VERIFY -o $(BUILD)/litmus-verify src/litmus.c
+	xcrun llvm-objdump -d --no-show-raw-insn $(BUILD)/litmus-verify > $(BUILD)/litmus-verify.disasm
+	@echo wrote $(BUILD)/litmus.disasm and $(BUILD)/litmus-verify.disasm
 
 clean:
 	rm -rf $(BUILD)

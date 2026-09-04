@@ -46,24 +46,68 @@ iterations.
 `--negative` runs the two litmus sides sequentially on one thread. No
 interleaving is then possible, so the Arm-permitted relaxed outcome can never
 appear — exactly the defect that would make every "not observed" result below
-it meaningless. `src/check.py` must report `RESULT: FAIL` (rules `I1` and
-`I2`) and exit non-zero.
+it meaningless. `src/check.py` must report `RESULT: FAIL` (rules `I2`, the
+positive control, and `I3`, concurrency) and exit non-zero.
+
+`--negative` reaches only part of the checker, so the fixtures under `tests/`
+cover the rest. Every integrity rule is validated by exactly one of them:
+
+| Rule | Validated by |
+| --- | --- |
+| `I1` exact litmus-arm coverage | `tests/negative-coverage.json` (arm removed) |
+| `I2` positive control | `--negative` mode |
+| `I3` litmus threads ran concurrently | `--negative` mode |
+| `I4` litmus iteration count | `tests/negative.json` (reduced-count run) |
+| `I5` no architecture-forbidden relaxed outcome | `tests/forbidden.json`, `tests/negative-coverage.json` |
+| `I6` exact LSE-arm coverage | `tests/negative-coverage.json` |
+| `I7` LSE atomics lose no updates | `tests/negative-coverage.json` |
+| `I8` exact alignment-case coverage | `tests/negative-coverage.json` |
+| `I9` aligned-atomic control does not fault | `tests/negative-coverage.json` |
+| `I10` ordinary-load contrast does not fault | `tests/negative-coverage.json` |
+| `I11` every fault carries a signal number | `tests/negative-coverage.json` |
+| `I12` exact round-trip coverage | `tests/negative-coverage.json` |
+| `I13` round trip always acknowledged | `tests/negative-coverage.json` |
+| `I14` round-trip latency positive | `tests/negative-coverage.json` |
+
+`validate.sh` runs all of them and fails if any fixture passes.
+
+## Fixed sample counts
+
+`--iters` scales the litmus arms only. These arms have counts fixed in the
+source and are unaffected by it, so a reduced-count development run does not
+reduce them:
+
+| Arm | Fixed count |
+| --- | --- |
+| LSE atomics (6 arms) | 10^6 operations per thread |
+| Software fallback | 250 000 operations per thread, 4 threads |
+| Invalidation round trip | 20 000 handshakes per QoS class |
+| Alignment | 6 cases, executed once each (the outcome is categorical) |
 
 ## Checker
 
 `src/check.py result.json` separates two kinds of judgement:
 
 - **Integrity rules (`I*`)** exit non-zero on failure. The load-bearing one is
-  positive-control rule: the plain SB litmus must observe the relaxed
+  `I2`, the positive control: the plain SB litmus must observe the relaxed
   outcome at least once, or the harness cannot expose weak behaviour at all.
-  The forbidden-outcome rule is pattern-specific: it rejects SB's relaxed
-  outcome under `DMB ISH`, and MP's flag-without-data outcome under either
-  release/acquire or `DMB ISH`. It intentionally permits SB's relaxed outcome
-  under `STLR` followed by `LDAR`, because that pair does not impose the
-  Store→Load ordering a full barrier supplies.
+  `I5` rejects a relaxed outcome in any arm the cited architecture forbids:
+  SB and MP under `DMB ISH`, and SB and MP under `STLR`/`LDAR`. SB under
+  `STLR`/`LDAR` is forbidden per `SRC-108` (Pulte et al., POPL 2018), whose
+  axiomatic model defines `bob = po; [dmb.full]; po | [L]; po; [A]` and states
+  that a store-release before a load-acquire "is required to be observed in
+  order by all threads". An earlier revision of this file and of the checker
+  asserted the opposite on no source at all; `REV-043` and `REV-045` returned
+  that, and it is corrected here.
 - **Decision thresholds (`T*`)** are the predeclared `KA-06`-adjacent bars.
   They are reported as MEET/MISS and never fail the checker; a MISS is a
-  finding the result gate adjudicates.
+  finding the result gate adjudicates. They are suppressed entirely when any
+  integrity rule has failed, so no threshold is ever reported MEET on a value
+  from a defective run.
+  `T4` is split: `T4a` uses `ns_per_attempt` (executed atomic instructions)
+  and `T4b` uses `ns_per_op` (successful increments), because for `cas` under
+  contention the two differ by retry amplification and charging retries to the
+  instruction would misattribute the scaling.
 
 MP is deliberately not an integrity rule. It is far harder to expose than SB
 under a lockstep barrier, and a zero count there is reported, not treated as

@@ -11,6 +11,7 @@
 #include <dispatch/dispatch.h>
 #include <errno.h>
 #include <mach/mach_init.h>
+#include <mach/mach_port.h>
 #include <mach/mach_time.h>
 #include <mach/thread_act.h>
 #include <mach/thread_policy.h>
@@ -93,7 +94,7 @@ static void emit_stats(FILE *f, const char *name, const char *mech,
 	fprintf(f,
 	        "    {\"arm\":\"%s\",\"mechanism\":\"%s\",\"qos\":\"%s\","
 	        "\"target_ns\":%ld,\"n\":%ld,\"early\":%ld,\"min_ns\":%lld,"
-	        "\"p50_ns\":%lld,\"p99_ns\":%lld,\"max_ns\":%lld}",
+	        "\"p50_ns\":%lld,\"p99_ns\":%lld,\"max_ns\":%lld",
 	        name, mech, qos, target_ns, s.n, s.early, (long long)s.min,
 	        (long long)s.p50, (long long)s.p99, (long long)s.max);
 }
@@ -245,8 +246,16 @@ struct dt_ctx {
 static void wakeup_arm(FILE *f, const char *mech, long target_ns,
                        qos_class_t q, int last) {
 	int64_t *err = xmalloc(sizeof(int64_t) * (size_t)g_n);
+	int64_t setup_ns = 0, setup_n = 0;
+	/* Timebase-conversion control (REV-044 change 13): the same interval is
+	 * also measured with clock_gettime_nsec_np(CLOCK_UPTIME_RAW), which needs
+	 * no timebase arithmetic. A proportional overshoot that appears in the
+	 * mach path but not here would be a conversion artefact, not host
+	 * behaviour, and CLM-01-07-14 is precisely a proportional-overshoot claim. */
+	int64_t ctrl_worst_delta_ns = 0;
 	set_qos(q);
 	for (long i = 0; i < g_n; i++) {
+		uint64_t ctrl0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 		uint64_t deadline_abs = mach_absolute_time() + ns_to_abs((uint64_t)target_ns);
 		uint64_t woke;
 		if (strcmp(mech, "mach_wait_until") == 0) {
@@ -262,13 +271,16 @@ static void wakeup_arm(FILE *f, const char *mech, long target_ns,
 			do { rc = nanosleep(&ts, &ts); } while (rc == -1 && errno == EINTR);
 			if (rc == -1) { perror("nanosleep"); exit(1); }
 			woke = mach_absolute_time();
-		} else { /* dispatch_source timer, leeway 0 */
+		} else { /* dispatch_source timer; leeway 0, optionally STRICT */
+			uintptr_t mask = strcmp(mech, "dispatch_source_timer_strict") == 0
+			                     ? DISPATCH_TIMER_STRICT : 0;
+			uint64_t setup0 = mach_absolute_time();
 			dispatch_queue_t qq = dispatch_get_global_queue(
 			    q == QOS_CLASS_USER_INTERACTIVE ? QOS_CLASS_USER_INTERACTIVE
 			                                    : QOS_CLASS_BACKGROUND,
 			    0);
 			dispatch_source_t src = dispatch_source_create(
-			    DISPATCH_SOURCE_TYPE_TIMER, 0, 0, qq);
+			    DISPATCH_SOURCE_TYPE_TIMER, 0, mask, qq);
 			__block uint64_t fired = 0;
 			dispatch_semaphore_t sem = dispatch_semaphore_create(0);
 			if (!src || !sem) { fprintf(stderr, "dispatch allocation failed\n"); exit(1); }
@@ -279,6 +291,12 @@ static void wakeup_arm(FILE *f, const char *mech, long target_ns,
 			dispatch_source_set_timer(
 			    src, dispatch_time(DISPATCH_TIME_NOW, target_ns),
 			    DISPATCH_TIME_FOREVER, 0);
+			/* Setup cost is inside this arm's measured interval, so it is
+			 * measured rather than only disclosed (REV-045 change 14). The
+			 * deadline is re-taken after setup so the reported error is the
+			 * timer's, and setup is reported separately. */
+			setup_ns += (int64_t)abs_to_ns(mach_absolute_time() - setup0);
+			setup_n++;
 			dispatch_resume(src);
 			dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
 			dispatch_source_cancel(src);
@@ -287,13 +305,81 @@ static void wakeup_arm(FILE *f, const char *mech, long target_ns,
 			woke = fired;
 		}
 		int64_t e = (int64_t)abs_to_ns(woke) - (int64_t)abs_to_ns(deadline_abs);
+		int64_t ctrl_elapsed =
+		    (int64_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - ctrl0);
+		int64_t delta = (ctrl_elapsed - target_ns) - e;
+		if (delta < 0) delta = -delta;
+		if (delta > ctrl_worst_delta_ns) ctrl_worst_delta_ns = delta;
 		if (g_negative) e -= target_ns / 4; /* injected defect: impossible early wake */
 		err[i] = e;
 	}
 	set_qos(QOS_CLASS_USER_INTERACTIVE);
 	emit_stats(f, "wakeup", mech, qos_name(q), target_ns, summarize(err, g_n));
-	fprintf(f, "%s\n", last ? "" : ",");
+	fprintf(f,
+	        ",\"timebase_control_worst_delta_ns\":%lld,"
+	        "\"setup_p_mean_ns\":%lld}%s\n",
+	        (long long)ctrl_worst_delta_ns,
+	        (long long)(setup_n ? setup_ns / setup_n : 0),
+	        last ? "" : ",");
 	free(err);
+}
+
+/* ---------- concurrent timer threads ---------- */
+
+struct cw {
+	long target_ns, n;
+	int64_t *err;
+};
+
+static void *cw_thread(void *a) {
+	struct cw *w = a;
+	set_qos(QOS_CLASS_USER_INTERACTIVE);
+	for (long i = 0; i < w->n; i++) {
+		uint64_t deadline = mach_absolute_time() +
+		                    ns_to_abs((uint64_t)w->target_ns);
+		if (mach_wait_until(deadline) != KERN_SUCCESS) {
+			fprintf(stderr, "mach_wait_until failed\n");
+			exit(1);
+		}
+		w->err[i] = (int64_t)abs_to_ns(mach_absolute_time()) -
+		            (int64_t)abs_to_ns(deadline);
+	}
+	return NULL;
+}
+
+/* One `mach_wait_until` timer per thread at a fixed target, all threads
+ * running at user-interactive QoS, so the reported distribution is the
+ * aggregate a multi-vCPU guest tick would impose. Pooled across threads:
+ * per-thread separation would be a placement statement, which CLM-01-07-08
+ * forbids this probe from making. */
+static void concurrent_wakeup_arm(FILE *f, int nthreads, long target_ns,
+                                  int last) {
+	long per = g_n;
+	pthread_t th[8];
+	struct cw w[8];
+	int64_t *all = xmalloc(sizeof(int64_t) * (size_t)per * (size_t)nthreads);
+	for (int i = 0; i < nthreads; i++) {
+		w[i].target_ns = target_ns;
+		w[i].n = per;
+		w[i].err = all + (size_t)i * (size_t)per;
+		fail_pthread(pthread_create(&th[i], NULL, cw_thread, &w[i]),
+		             "pthread_create");
+	}
+	for (int i = 0; i < nthreads; i++)
+		fail_pthread(pthread_join(th[i], NULL), "pthread_join");
+	if (g_negative)
+		for (long i = 0; i < per * nthreads; i++) all[i] -= target_ns / 4;
+	stats_t s = summarize(all, per * (long)nthreads);
+	fprintf(f,
+	        "    {\"arm\":\"concurrent_wakeup\",\"mechanism\":\"mach_wait_until\","
+	        "\"qos\":\"user-interactive\",\"threads\":%d,\"target_ns\":%ld,"
+	        "\"aggregate_wakeups_per_s\":%.0f,\"n\":%ld,\"early\":%ld,"
+	        "\"min_ns\":%lld,\"p50_ns\":%lld,\"p99_ns\":%lld,\"max_ns\":%lld}%s\n",
+	        nthreads, target_ns,
+	        (double)nthreads * 1e9 / (double)target_ns,
+	        s.n, s.early, (long long)s.min, (long long)s.p50,
+	        (long long)s.p99, (long long)s.max, last ? "" : ",");
+	free(all);
 }
 
 /* ---------- cross-thread event delivery ---------- */
@@ -368,6 +454,13 @@ static void signal_arm(FILE *f, const char *mech, qos_class_t q, int last) {
 	usleep(20000);
 
 	int64_t *lat = xmalloc(sizeof(int64_t) * (size_t)g_n);
+	/* Round-trip control (REV-044 change 1). `lat` subtracts a timestamp the
+	 * *target* thread took from one the sender took, which assumes a
+	 * system-wide comparable time base that no source in the inventory
+	 * states. `rt` is measured entirely on the sender's clock — send, then
+	 * observe the flag — so it needs no such assumption. One-way latency is
+	 * therefore reported with rt/2 as its assumption-free upper bound. */
+	int64_t *rt = xmalloc(sizeof(int64_t) * (size_t)g_n);
 	long lost = 0, got = 0;
 	for (long i = 0; i < g_n; i++) {
 		atomic_store(&c.flag, 0);
@@ -387,8 +480,10 @@ static void signal_arm(FILE *f, const char *mech, qos_class_t q, int last) {
 			if (now_ns() - spin_start > 1000000000ull) break; /* 1 s timeout */
 		}
 		if (!atomic_load(&c.flag)) { lost++; continue; }
+		int64_t round = (int64_t)(now_ns() - t0);
 		int64_t d = (int64_t)atomic_load(&c.recv_ns) - (int64_t)t0;
 		if (g_negative) d = -d; /* injected defect: negative delivery latency */
+		rt[got] = round;
 		lat[got++] = d;
 		usleep(50);
 	}
@@ -403,14 +498,21 @@ static void signal_arm(FILE *f, const char *mech, qos_class_t q, int last) {
 	fail_pthread(pthread_join(c.target, NULL), "pthread_join");
 
 	stats_t s = summarize(lat, got);
+	stats_t r = summarize(rt, got);   /* summarize sorts; do lat first */
 	fprintf(f,
 	        "    {\"arm\":\"signal\",\"mechanism\":\"%s\",\"qos\":\"%s\","
 	        "\"n\":%ld,\"lost\":%ld,\"early\":%ld,\"min_ns\":%lld,"
-	        "\"p50_ns\":%lld,\"p99_ns\":%lld,\"max_ns\":%lld}%s\n",
+	        "\"p50_ns\":%lld,\"p99_ns\":%lld,\"max_ns\":%lld,"
+	        "\"roundtrip_min_ns\":%lld,\"roundtrip_p50_ns\":%lld,"
+	        "\"roundtrip_p99_ns\":%lld,\"roundtrip_max_ns\":%lld,"
+	        "\"oneway_upper_bound_p99_ns\":%lld}%s\n",
 	        mech, qos_name(q), s.n, lost, s.early, (long long)s.min,
 	        (long long)s.p50, (long long)s.p99, (long long)s.max,
+	        (long long)r.min, (long long)r.p50, (long long)r.p99,
+	        (long long)r.max, (long long)(r.p99 / 2),
 	        last ? "" : ",");
 	free(lat);
+	free(rt);
 	dispatch_release(c.sem);
 	pthread_mutex_destroy(&c.m);
 	pthread_cond_destroy(&c.cv);
@@ -420,9 +522,11 @@ static void signal_arm(FILE *f, const char *mech, qos_class_t q, int last) {
 
 static void probe_affinity(FILE *f) {
 	thread_affinity_policy_data_t p = {1};
+	mach_port_t self = mach_thread_self();
 	kern_return_t kr = thread_policy_set(
-	    mach_thread_self(), THREAD_AFFINITY_POLICY, (thread_policy_t)&p,
+	    self, THREAD_AFFINITY_POLICY, (thread_policy_t)&p,
 	    THREAD_AFFINITY_POLICY_COUNT);
+	mach_port_deallocate(mach_task_self(), self);
 	fprintf(f,
 	        "  \"thread_affinity_policy\": {\"call\":\"thread_policy_set("
 	        "THREAD_AFFINITY_POLICY, tag=1)\",\"kern_return_t\":%d,"
@@ -473,13 +577,25 @@ int main(int argc, char **argv) {
 
 	fprintf(f, "  \"wakeup\": [\n");
 	static const long targets[] = {100000, 1000000, 10000000};
-	static const char *mechs[] = {"mach_wait_until", "nanosleep", "dispatch_source_timer_leeway0"};
+	static const char *mechs[] = {"mach_wait_until", "nanosleep",
+	                              "dispatch_source_timer_leeway0",
+	                              "dispatch_source_timer_strict"};
+	enum { NMECH = 4 };
 	const qos_class_t qs[] = {QOS_CLASS_USER_INTERACTIVE, QOS_CLASS_BACKGROUND};
-	for (int m = 0; m < 3; m++)
+	for (int m = 0; m < NMECH; m++)
 		for (int t = 0; t < 3; t++)
 			for (int q = 0; q < 2; q++)
 				wakeup_arm(f, mechs[m], targets[t], qs[q],
-				           m == 2 && t == 2 && q == 1);
+				           m == NMECH - 1 && t == 2 && q == 1);
+	fprintf(f, "  ],\n");
+
+	/* Aggregate wakeup rate at 2, 4, and 8 concurrent timer threads: the
+	 * declared guest requirement is a 1 kHz tick *per vCPU* at 2/4/8 vCPUs,
+	 * and a single-thread arm cannot speak to it (REV-044 change 9). */
+	fprintf(f, "  \"concurrent_wakeup\": [\n");
+	static const int nthr[] = {2, 4, 8};
+	for (int i = 0; i < 3; i++)
+		concurrent_wakeup_arm(f, nthr[i], 1000000, i == 2);
 	fprintf(f, "  ],\n");
 
 	fprintf(f, "  \"signal\": [\n");

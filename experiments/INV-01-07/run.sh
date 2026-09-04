@@ -6,7 +6,16 @@
 # Output goes to $NATEMU_RAW_ROOT/INV-01-07/<UTC timestamp>-<git short rev>/.
 set -eu
 
-repo_root=$(cd "$(dirname "$0")/../.." && pwd)
+script_dir=$(cd "$(dirname "$0")" && pwd)
+# Ask git for the work tree rather than assuming the script sits two levels
+# below it: a relocated copy would otherwise silently change what counts as
+# "inside the repository" (REV-045 required change 9). Guard the call so an
+# invocation outside a work tree gives the documented exit-2 refusal instead
+# of git's own exit 128 under `set -eu`.
+if ! repo_root=$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null); then
+	echo "refusing to run: '$script_dir' is not inside a git work tree, so the raw-root containment check cannot be made" >&2
+	exit 2
+fi
 
 if [ -z "${NATEMU_RAW_ROOT:-}" ]; then
 	echo "refusing to run: NATEMU_RAW_ROOT is not set" >&2
@@ -67,7 +76,19 @@ bin="$build_dir/timers"
 		hw.perflevel0.logicalcpu hw.perflevel1.logicalcpu \
 		hw.optional.arm.FEAT_LSE hw.optional.arm.FEAT_LSE2 2>&1
 	echo "---- clang ----"; clang --version
-	echo "---- sdk ----"; xcrun --show-sdk-path; xcrun --show-sdk-version
+	echo "---- sdk ----"
+	sdk=$(xcrun --show-sdk-path)
+	echo "xcrun --show-sdk-path: $sdk"
+	# The path above is a symlink (MacOSX.sdk); the source inventories pin
+	# header digests to MacOSX26.4.sdk, so record the resolved target and the
+	# digests themselves (REV-045 required change 13).
+	echo "resolved: $(cd "$sdk" && pwd -P)"
+	xcrun --show-sdk-version
+	echo "---- cited header digests ----"
+	for h in usr/include/mach/mach_time.h usr/include/mach/thread_policy.h \
+		usr/include/pthread/qos.h; do
+		[ -f "$sdk/$h" ] && shasum -a 256 "$sdk/$h"
+	done
 	echo "---- codesign ----"; codesign -d --entitlements - "$bin" 2>&1 || true
 	echo "---- uptime/load ----"; uptime
 	echo "---- thermal/power ----"; pmset -g therm 2>&1 || true; pmset -g batt 2>&1 || true

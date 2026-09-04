@@ -22,6 +22,24 @@ LITMUS_CASES = {
     for qos in QOS
 }
 LSE_CASES = {(op, threads) for op in ("ldadd", "cas") for threads in (2, 4, 8)}
+# Arms whose relaxed outcome the cited architecture forbids, so a nonzero count
+# means the harness is broken (or the observation contradicts the source) and
+# must be investigated before anything rests on the run.
+#
+# SB/ldar-stlr is forbidden per SRC-108 (Pulte et al., POPL 2018), whose
+# axiomatic model defines bob = po; [dmb.full]; po | [L]; po; [A] and states
+# that "the [L];po;[A] case of the bob relation describes a store-release
+# appearing in program order before a load-acquire, which is required to be
+# observed in order by all threads". An earlier revision of this checker
+# omitted this arm on the unsourced assertion that STLR followed by LDAR gives
+# no Store->Load ordering; REV-043 and REV-045 returned that, and it is
+# restored here.
+FORBIDDEN_ARMS = {
+    ("SB", "ldar-stlr"),
+    ("SB", "dmb-ish"),
+    ("MP", "ldar-stlr"),
+    ("MP", "dmb-ish"),
+}
 ALIGNMENT_CASES = {
     "ldaddal aligned 4B (control)",
     "ldaddal misaligned within 16B granule",
@@ -62,13 +80,12 @@ def main(path):
     forbidden = [
         (l["test"], l["variant"], l["qos"], l["relaxed_observed"])
         for l in lit
-        if l["relaxed_observed"] > 0
-        and ((l["test"] == "SB" and l["variant"] == "dmb-ish")
-             or (l["test"] == "MP" and l["variant"] in ("ldar-stlr", "dmb-ish")))
+        if l["relaxed_observed"] > 0 and (l["test"], l["variant"]) in FORBIDDEN_ARMS
     ]
     rule(not forbidden,
          "I5 no architecture-forbidden relaxed outcome",
-         f"forbidden SB/DMB or MP/acquire-release-or-DMB outcomes: {forbidden[:4]}")
+         f"forbidden arms {sorted(FORBIDDEN_ARMS)} with a nonzero count: "
+         f"{forbidden[:4]}")
 
     lse = d.get("lse", [])
     lse_cases = [(a.get("op"), a.get("threads")) for a in lse]
@@ -95,6 +112,11 @@ def main(path):
          "I10 ordinary-load contrast does not fault",
          f"{plain[0] if plain else 'control missing'}")
     faulted_no_sig = [a for a in al if a["faulted"] and a["signal"] == 0]
+    unmapped = [a for a in al if a["faulted"]
+                and (a["signal"], a["si_code"]) != (10, 1)]
+    rule(True, "I11a fault symbol mapping (informational)",
+         "signal 10 = SIGBUS, si_code 1 = BUS_ADRALN on this platform; "
+         f"cases with a different (signal, si_code): {unmapped[:4] or 'none'}")
     rule(not faulted_no_sig, "I11 every fault carries a signal number",
          f"{faulted_no_sig[:2]}")
 
@@ -111,6 +133,14 @@ def main(path):
     print(f"INV-01-08 checker  mode={d.get('mode')}  file={path}")
     for line in notes + fails:
         print("  " + line)
+
+    if fails:
+        # A threshold computed from a run that failed an integrity rule is not
+        # interpretable, and a MEET printed next to a physically impossible
+        # value invites exactly the misreading REV-045 found. Suppress.
+        print("  -- decision thresholds suppressed: integrity failures present --")
+        print(f"RESULT: FAIL ({len(fails)} integrity failures)")
+        return 1
 
     print("  -- decision thresholds (result gate adjudicates) --")
 
@@ -130,20 +160,34 @@ def main(path):
         fb.get("ns_per_op", 1e9) < 500, f"{fb.get('ns_per_op')} ns/op")
 
     ui = [r for r in rt if r["qos"] == "user-interactive"]
+    tb = d.get("timebase", {})
+    tick = (tb.get("numer", 0) / tb.get("denom", 1)) if tb.get("denom") else 0
     thr("T3 cross-thread invalidation round trip p99 < 50 us",
-        ui and ui[0]["p99_ns"] < 50000,
-        f"{[(r['qos'], r['p50_ns'], r['p99_ns']) for r in rt]}")
+        bool(ui) and ui[0]["p99_ns"] < 50000,
+        f"{[(r['qos'], r['p50_ns'], r['p99_ns']) for r in rt]}; "
+        f"clock quantum {tick:.2f} ns/tick — separations of one or two ticks "
+        "are at the measurement floor and are not resolved differences")
 
     lse8 = [a for a in d.get("lse", []) if a["threads"] == 8]
     lse2 = [a for a in d.get("lse", []) if a["threads"] == 2]
     if lse8 and lse2:
-        for op in ("ldadd", "cas"):
+        # T4a is the instruction claim: ns per *attempt*, which for `cas`
+        # excludes retry amplification. T4b is the CAS-loop claim: ns per
+        # successful increment, which includes it. They are different
+        # measurements and carry different thresholds (INV-01-08, Metrics).
+        for op, key, label, bound in (
+                ("ldadd", "ns_per_attempt", "T4a ldadd", 20),
+                ("cas", "ns_per_attempt", "T4a cas instruction", 20),
+                ("cas", "ns_per_op", "T4b cas loop (retries included)", 60)):
             a8 = [x for x in lse8 if x["op"] == op]
             a2 = [x for x in lse2 if x["op"] == op]
-            if a8 and a2:
-                thr(f"T4 {op} 8-thread/2-thread cost ratio < 20x",
-                    a8[0]["ns_per_op"] / max(a2[0]["ns_per_op"], 1e-9) < 20,
-                    f"{a2[0]['ns_per_op']:.2f} -> {a8[0]['ns_per_op']:.2f} ns/op")
+            if a8 and a2 and key in a8[0] and key in a2[0]:
+                v2, v8 = a2[0][key], a8[0][key]
+                thr(f"{label} 8-thread/2-thread cost ratio < {bound}x",
+                    v8 / max(v2, 1e-9) < bound,
+                    f"{v2:.2f} -> {v8:.2f} ns ({key}); "
+                    f"attempts/success 2T={a2[0].get('attempts_per_success', 1):.2f} "
+                    f"8T={a8[0].get('attempts_per_success', 1):.2f}")
 
     print(f"RESULT: {'FAIL' if fails else 'PASS'} ({len(fails)} integrity failures)")
     return 1 if fails else 0
