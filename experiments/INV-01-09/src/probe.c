@@ -88,11 +88,30 @@ check_vmnet(void)
     /* vmnet_start_interface is documented to return a non-NULL handle only
      * on success; the completion handler still fires asynchronously. Wait
      * up to 5s for it. */
-    long timed_out = dispatch_semaphore_wait(sem,
+    long wait_rc = dispatch_semaphore_wait(sem,
         dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+    int timed_out = (wait_rc != 0);
 
-    if (iface != NULL) {
-        /* Only reachable if start somehow returned non-NULL; stop it. */
+    /* Only read the __block variables when the wait actually returned 0:
+     * dispatch_semaphore_signal/_wait supplies the synchronization edge for
+     * that read (REV-048 required change 9). On the timeout path the
+     * completion block may still be running, or may run after this process
+     * exits, so touching got_status/got_callback here would be an
+     * unsynchronized concurrent read of a concurrently written object --
+     * undefined behavior. Report the timeout from the wait result alone. */
+    int callback_fired = timed_out ? 0 : got_callback;
+    unsigned status_code = (!timed_out && got_callback) ? (unsigned)got_status : 0;
+    int success = (!timed_out && iface != NULL && got_callback
+        && got_status == VMNET_SUCCESS);
+
+    /* The header documents a non-NULL return only "on success"; a scratch
+     * run showed start_returned_nonnull and the callback status can
+     * disagree (nonnull with VMNET_FAILURE). Stop the interface only when
+     * the callback actually reported VMNET_SUCCESS, not merely because the
+     * synchronous return was non-NULL -- calling vmnet_stop_interface on a
+     * handle whose start reported failure is undefined by the header
+     * (REV-048 required change 5). */
+    if (success) {
         dispatch_semaphore_t stop_sem = dispatch_semaphore_create(0);
         vmnet_stop_interface(iface, q, ^(vmnet_return_t __unused s) {
             dispatch_semaphore_signal(stop_sem);
@@ -105,12 +124,10 @@ check_vmnet(void)
     printf("\"vmnet_start_interface\":{");
     printf("\"label\":"); json_str(g_label); printf(",");
     printf("\"start_returned_nonnull\":%s,", iface != NULL ? "true" : "false");
-    printf("\"callback_fired\":%s,", got_callback ? "true" : "false");
-    printf("\"timed_out\":%s,", timed_out != 0 ? "true" : "false");
-    printf("\"status_code\":%u,", got_callback ? (unsigned)got_status : 0);
-    printf("\"success\":%s",
-        (iface != NULL && got_callback && got_status == VMNET_SUCCESS)
-            ? "true" : "false");
+    printf("\"callback_fired\":%s,", callback_fired ? "true" : "false");
+    printf("\"timed_out\":%s,", timed_out ? "true" : "false");
+    printf("\"status_code\":%u,", status_code);
+    printf("\"success\":%s", success ? "true" : "false");
     printf("}");
 }
 
@@ -181,7 +198,13 @@ check_block_io(const char *scratch_dir)
     snprintf(path, sizeof(path), "%s/inv-01-09-block.tmp", scratch_dir);
 
     int open_ok = 0, nocache_ok = 0, fullfsync_ok = 0;
-    int pwrite_ok = 0, pread_ok = 0, data_match = 0, punchhole_ok = 0;
+    int pwrite_ok = 0, pread_ok = 0, data_match = 0;
+    long long st_blocks_before_punch = -1, st_blocks_after_punch = -1;
+    int punchhole_ok = 0, punchhole_freed_blocks = 0;
+    int ftruncate_ok = 0;
+    long long req_size = 100LL * 1024 * 1024;
+    long long st_size = -1, st_blocks_after_grow = -1;
+    int is_sparse = 0;
 
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fd >= 0) {
@@ -200,55 +223,66 @@ check_block_io(const char *scratch_dir)
         pread_ok = (rn == (ssize_t)sizeof(rbuf));
         data_match = pread_ok && (memcmp(wbuf, rbuf, sizeof(wbuf)) == 0);
 
+        /* F_PUNCHHOLE and the sparse ftruncate below both run on this same
+         * written file (not a second, never-written file), and st_blocks is
+         * captured immediately before and after the punch, so punchhole_ok
+         * means "a hole was actually created" rather than merely "fcntl did
+         * not return -1" (REV-048 required change 6). */
+        struct stat st_before;
+        if (fstat(fd, &st_before) == 0)
+            st_blocks_before_punch = (long long)st_before.st_blocks;
+
         fpunchhole_t ph;
         memset(&ph, 0, sizeof(ph));
         ph.fp_offset = 0;
-        ph.fp_length = 4096;
+        ph.fp_length = sizeof(wbuf);
         punchhole_ok = (fcntl(fd, F_PUNCHHOLE, &ph) != -1);
+
+        struct stat st_after;
+        if (fstat(fd, &st_after) == 0)
+            st_blocks_after_punch = (long long)st_after.st_blocks;
+        punchhole_freed_blocks = (st_blocks_before_punch >= 0
+            && st_blocks_after_punch >= 0
+            && st_blocks_after_punch < st_blocks_before_punch);
+
+        /* Grow this same written-then-punched file well beyond its current
+         * size without writing more, and confirm the grown region stays
+         * unallocated: the sparse-file property CLM-01-09-19 describes,
+         * tested on the file the chain actually wrote. */
+        ftruncate_ok = (ftruncate(fd, (off_t)req_size) == 0);
+        struct stat st_grow;
+        if (fstat(fd, &st_grow) == 0) {
+            st_size = (long long)st_grow.st_size;
+            st_blocks_after_grow = (long long)st_grow.st_blocks;
+            /* st_blocks is in 512-byte units regardless of st_blksize. */
+            is_sparse = (st_blocks_after_grow * 512 < st_size / 2);
+        }
 
         close(fd);
         unlink(path);
     }
 
     printf("\"block_io\":{\"open_ok\":%s,\"f_nocache_ok\":%s,\"f_fullfsync_ok\":%s,"
-        "\"pwrite_ok\":%s,\"pread_ok\":%s,\"data_match\":%s,\"punchhole_ok\":%s},",
+        "\"pwrite_ok\":%s,\"pread_ok\":%s,\"data_match\":%s,"
+        "\"st_blocks_before_punch\":%lld,\"st_blocks_after_punch\":%lld,"
+        "\"punchhole_ok\":%s,\"punchhole_freed_blocks\":%s},",
         open_ok ? "true" : "false", nocache_ok ? "true" : "false",
         fullfsync_ok ? "true" : "false", pwrite_ok ? "true" : "false",
         pread_ok ? "true" : "false", data_match ? "true" : "false",
-        punchhole_ok ? "true" : "false");
+        st_blocks_before_punch, st_blocks_after_punch,
+        punchhole_ok ? "true" : "false",
+        punchhole_freed_blocks ? "true" : "false");
 
-    /* sparse ftruncate: grow to 100 MiB without writing, check st_blocks. */
-    char path2[1024];
-    snprintf(path2, sizeof(path2), "%s/inv-01-09-sparse.tmp", scratch_dir);
-    int ftruncate_ok = 0;
-    long long req_size = 100LL * 1024 * 1024;
-    long long st_size = -1;
-    long long st_blocks = -1;
-    int is_sparse = 0;
-
-    int fd2 = open(path2, O_RDWR | O_CREAT | O_TRUNC, 0600);
-    if (fd2 >= 0) {
-        ftruncate_ok = (ftruncate(fd2, (off_t)req_size) == 0);
-        struct stat st;
-        if (fstat(fd2, &st) == 0) {
-            st_size = (long long)st.st_size;
-            st_blocks = (long long)st.st_blocks;
-            /* st_blocks is in 512-byte units regardless of st_blksize. */
-            is_sparse = (st_blocks * 512 < st_size / 2);
-        }
-        close(fd2);
-        unlink(path2);
-    }
     printf("\"sparse_ftruncate\":{\"ftruncate_ok\":%s,\"requested_size\":%lld,"
         "\"st_size\":%lld,\"st_blocks\":%lld,\"is_sparse\":%s}",
-        ftruncate_ok ? "true" : "false", req_size, st_size, st_blocks,
+        ftruncate_ok ? "true" : "false", req_size, st_size, st_blocks_after_grow,
         is_sparse ? "true" : "false");
 }
 
 int
 main(int argc, char **argv)
 {
-    const char *scratch_dir = ".";
+    const char *scratch_dir = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--negative") == 0) {
             g_negative = 1;
@@ -258,10 +292,18 @@ main(int argc, char **argv)
             scratch_dir = argv[++i];
         } else {
             fprintf(stderr,
-                "usage: %s [--negative] [--label LABEL] [--scratch-dir DIR]\n",
+                "usage: %s [--negative] [--label LABEL] --scratch-dir DIR\n",
                 argv[0]);
             return 2;
         }
+    }
+    /* --scratch-dir has no default: a direct invocation from the experiment
+     * tree must not be able to write temp files under experiments/
+     * (REV-048 required change 10). run.sh always passes it explicitly. */
+    if (scratch_dir == NULL) {
+        fprintf(stderr, "usage: %s [--negative] [--label LABEL] --scratch-dir DIR\n",
+            argv[0]);
+        return 2;
     }
 
     char model[256];

@@ -59,6 +59,16 @@ set -e
 echo "$NORMAL_RC" >"$OUT/normal.exit.txt"
 echo "$NEGATIVE_RC" >"$OUT/negative.exit.txt"
 
+# Score the negative arm as a demonstrated fault injection only when the
+# checker actually parsed the output and rejected it on a rule (exit 1 with
+# at least one violated rule reported), not merely "nonzero exit" -- a usage
+# error is scored as exit 2 by check.py, never 1, so this also rejects a
+# usage error (REV-048 required change 3).
+NEGATIVE_DEMONSTRATED=0
+if [ "$NEGATIVE_CHECK_RC" -eq 1 ] && grep -q "rule(s) violated" "$OUT/negative.check.txt"; then
+    NEGATIVE_DEMONSTRATED=1
+fi
+
 {
     echo "run_id=$RUN_ID"
     echo "git_head=$(git -C "$REPO_ROOT" rev-parse HEAD)"
@@ -78,7 +88,7 @@ VALIDATION_RC=0
 if [ "$NORMAL_RC" -ne 0 ] || [ "$NORMAL_CHECK_RC" -ne 0 ]; then
     VALIDATION_RC=1
 fi
-if [ "$NEGATIVE_RC" -ne 0 ] || [ "$NEGATIVE_CHECK_RC" -eq 0 ]; then
+if [ "$NEGATIVE_DEMONSTRATED" -ne 1 ]; then
     VALIDATION_RC=1
 fi
 {
@@ -86,6 +96,7 @@ fi
     echo "normal_checker_rc=$NORMAL_CHECK_RC"
     echo "negative_process_rc=$NEGATIVE_RC"
     echo "negative_checker_rc=$NEGATIVE_CHECK_RC"
+    echo "negative_demonstrated=$NEGATIVE_DEMONSTRATED"
     echo "validation_rc=$VALIDATION_RC"
 } >"$OUT/validation.txt"
 

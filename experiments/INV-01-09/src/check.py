@@ -31,11 +31,24 @@ def check(d):
     require(bool(host.get("hw_model")), "host.hw_model must be non-empty")
 
     vn = d.get("vmnet_start_interface", {})
-    require("status_code" in vn, "vmnet_start_interface.status_code must be present")
-    require(vn.get("callback_fired") is True,
-            "vmnet_start_interface callback must fire before the 5 s timeout")
-    require(vn.get("timed_out") is False,
-            "vmnet_start_interface must not time out")
+    require(
+        "status_code" in vn and "callback_fired" in vn and "timed_out" in vn
+        and "start_returned_nonnull" in vn,
+        "vmnet_start_interface must report status_code, callback_fired, "
+        "timed_out, and start_returned_nonnull",
+    )
+    # The completion handler failing to fire within the 5 s wait
+    # (callback_fired=false, timed_out=true) is a predeclared, reportable
+    # outcome (CLM-01-09-14/-20), not a checker failure -- REV-047 required
+    # change 5. The only structural invariant is that the two fields must be
+    # opposite: dispatch_semaphore_wait either got the signal (callback ran)
+    # or timed out (it did not), never both or neither.
+    require(
+        vn.get("callback_fired") is not None
+        and vn.get("timed_out") is not None
+        and vn.get("callback_fired") != vn.get("timed_out"),
+        "vmnet_start_interface.callback_fired and .timed_out must be opposite",
+    )
     agreed_success = (
         vn.get("start_returned_nonnull") is True
         and vn.get("callback_fired") is True
@@ -119,6 +132,13 @@ def check(d):
     ):
         require(bio.get(field) is True,
                 f"block_io.{field} must be true for the block-I/O positive control")
+    # punchhole_ok alone only means fcntl(F_PUNCHHOLE) did not return -1;
+    # punchhole_freed_blocks is derived from st_blocks captured immediately
+    # before/after the call on the file the chain actually wrote, and is the
+    # field that actually shows a hole was created (REV-048 required change 6).
+    require(bio.get("punchhole_freed_blocks") is True,
+            "block_io.punchhole_freed_blocks must be true: F_PUNCHHOLE must "
+            "reduce st_blocks on the written file")
 
     sp = d.get("sparse_ftruncate", {})
     require(sp.get("ftruncate_ok") is True,
