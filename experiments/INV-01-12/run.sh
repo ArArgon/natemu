@@ -68,7 +68,10 @@ run_one() {
 
 python3 "$here/src/check.py" --selftest | tee -a "$dir/summary.txt"
 
-run_one positive              PASS
+# Five repetitions of the positive run; all five must PASS. A flaky integrated
+# prototype is a failure, not a censored sample.
+for i in 1 2 3 4 5; do run_one "positive-$i" PASS; done
+
 run_one control-skip-restart  FAIL --inject-skip-restart
 run_one control-nonatomic-rmw FAIL --inject-nonatomic-rmw
 run_one control-drop-ipi      FAIL --inject-drop-ipi

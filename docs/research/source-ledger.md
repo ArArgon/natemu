@@ -202,6 +202,9 @@ only in interrupted, uncommitted authoring batches. They remain reserved and
 must not be reused. The latter four were duplicate allocations normalized to
 existing `SRC-089`, `SRC-084`, `SRC-089`, and `SRC-074`, respectively; this
 note records the recovery without creating duplicate source records.
+| `SRC-124` | primary | Linux kernel source | Linux kernel project | [tag v6.12](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tag/?h=v6.12); capture `linux-v6.12-trap_pf.h` | `CLM-01-12-01` | `arch/x86/include/asm/trap_pf.h` lines 21–29: `X86_PF_PROT = BIT(0)`, `X86_PF_WRITE = BIT(1)`, `X86_PF_USER = BIT(2)`, `X86_PF_RSVD = BIT(3)`, `X86_PF_INSTR = BIT(4)` | supports | tag `v6.12` | Names the page-fault error-code encoding a Linux guest interprets; establishes nothing about what any emulator produces. | pending | pending |
+| `SRC-124` | primary | Linux kernel source | Linux kernel project | same tag; capture `linux-v6.12-pgtable_types.h` | `CLM-01-12-02` | `arch/x86/include/asm/pgtable_types.h` lines 10, 11, 15, 16: `_PAGE_BIT_PRESENT 0`, `_PAGE_BIT_RW 1`, `_PAGE_BIT_ACCESSED 5 /* was accessed (raised by CPU) */`, `_PAGE_BIT_DIRTY 6 /* was written to (raised by CPU) */` | supports | tag `v6.12` | Bit positions, and that the CPU raises accessed and dirty. Says nothing about when a software MMU must raise them. | pending | pending |
+| `SRC-124` | primary | Linux kernel source | Linux kernel project | same tag; capture `linux-v6.12-uapi-ptrace.h` | `CLM-01-12-03` | `arch/x86/include/uapi/asm/ptrace.h`, `struct pt_regs`: the fields following `orig_rax` under the comment `/* Return frame for iretq */` — `rip`, `cs`, `eflags`, `rsp`, `ss` | supports | tag `v6.12` | Field order of the frame a Linux guest expects; not a statement about error-code pushing or gate types. | pending | pending |
 
 ## Review-date capture manifest
 
@@ -299,6 +302,9 @@ Track 01 captures are stored under `artifacts/research/track01/source-snapshots/
 | `SRC-124` | `linux-6.12-Kconfig-char.txt` | `3d0d03818d7e97243606c2003a55a3a3f537ea82ca992723ae721e0cd966c877` |
 | `SRC-124` | `linux-6.12-Kconfig-hwrandom.txt` | `4d97809a41c7487ec16f4bc60eb130a04ee7cdccd5bed6c518644ecd587a5d5a` |
 | `SRC-127` | `apple-dispatch-memorypressure.json` | `012420683d529bc59704b9ef7b14cb5bdbd87950a015ffe2bc6838bf0c0560d1` |
+| `SRC-124` | `linux-v6.12-trap_pf.h` | `6b2aca671c0f6b023a7c7eac274602b5b2113105d2ed00014677effaab28abc1` |
+| `SRC-124` | `linux-v6.12-pgtable_types.h` | `b5359cc96e73e08eed98d82a89cf5b0b4058110166a9b6488eb68fb24d0b4e6c` |
+| `SRC-124` | `linux-v6.12-uapi-ptrace.h` | `f6cd9410cbf61fd6c5103e8685f65afa20270cdf9cd067c908036ee722e77aae` |
 
 The `verdict` is a review outcome, not a claim of truth. Claim-level citations,
 the required source gate, and an explicit relationship for both support and

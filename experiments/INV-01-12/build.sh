@@ -13,7 +13,7 @@ out=${1:-${TMPDIR:-/tmp}/natemu-inv0112-build}
 mkdir -p "$out"
 
 clang -target x86_64-elf -c "$here/prototype/guest.s" -o "$out/guest.o"
-python3 "$here/src/elfextract.py" "$out/guest.o" "$out/guest_blob.h"
+python3 "$here/src/elfextract.py" "$out/guest.o" "$out/guest_blob.h" >&2
 
 clang -O2 -std=c11 -Wall -Wextra -Wno-unused-parameter -pthread \
       -I"$out" -o "$out/natemu_proto" "$here/prototype/proto.c"
