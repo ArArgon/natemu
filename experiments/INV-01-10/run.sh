@@ -47,10 +47,18 @@ sh src/tools.sh --negative > "$OUT/negative.json"
 python3 src/check.py "$OUT/tools.json" > "$OUT/tools.check.txt" 2>&1 || true
 python3 src/check.py "$OUT/negative.json" > "$OUT/negative.check.txt" 2>&1 || true
 
-# --- environment capture ---
+# --- environment capture --- (REV-094 R1: host identity was missing —
+# Mac16,10/hw.memsize/hw.ncpu/hw.pagesize appeared in none of the six
+# artifact files, so a result reviewer holding only this artifact could
+# not confirm the host the applicability statement names. Added the same
+# sysctl/clang block INV-01-01's run.sh already captures.)
 {
     echo "== sw_vers =="
     sw_vers
+    echo "== sysctl =="
+    sysctl hw.model hw.memsize hw.ncpu hw.pagesize kern.osversion
+    echo "== clang --version =="
+    clang --version
     echo "== git rev-parse HEAD =="
     git -C "$REPO_ROOT" rev-parse HEAD
     echo "== xcode-select -p =="
