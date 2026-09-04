@@ -337,6 +337,8 @@ Track 01 captures are stored under `artifacts/research/track01/source-snapshots/
 | `SRC-144` | `lwip-copying.txt` | `ef4aac92e05e87cd1cdc140870ed52206ba03d4a7fe46c1e11d7ffa6c87d252b` |
 | `SRC-145` | `cargo-manifest-reference.html` | `0cb39dac6bfd9cf8e763cff7aa4881fd1b4106108859fec73a62e9655a5b4431` |
 | `SRC-146` | `arm-ddi0487mc-metadata.json` (trimmed to the `document`/`metadata` fields; the full document-tree response is 9.7 MB and not itself the cited content) | `a285d4adb978d04110e267bef3654507ade95dd028427d7ab2f87bd0ee30d0a5` |
+| `SRC-102` | `sdk-mach-thread_policy.h` | `8f8a2086c7668bd0d377f303570ee77de8a644d69695d2eadff85eb24393a885` |
+| `SRC-104` | `sdk-pthread-qos.h` | `bfcfcf23501c328f5aa7f3bb39c0c8167730ab111393063c5b5fb4bd72d074f2` |
 
 The `verdict` is a review outcome, not a claim of truth. Claim-level citations,
 the required source gate, and an explicit relationship for both support and
