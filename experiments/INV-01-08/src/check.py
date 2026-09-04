@@ -14,6 +14,22 @@ import json
 import sys
 
 MIN_ITERS = 1000000
+QOS = {"user-interactive", "background"}
+LITMUS_CASES = {
+    (test, variant, qos)
+    for test in ("SB", "MP")
+    for variant in ("plain-ldr-str", "ldar-stlr", "dmb-ish")
+    for qos in QOS
+}
+LSE_CASES = {(op, threads) for op in ("ldadd", "cas") for threads in (2, 4, 8)}
+ALIGNMENT_CASES = {
+    "ldaddal aligned 4B (control)",
+    "ldaddal misaligned within 16B granule",
+    "ldaddal crossing 16-byte boundary",
+    "ldaddal crossing 64-byte cache line",
+    "plain ldr crossing 64-byte cache line",
+    "ldar crossing 64-byte cache line",
+}
 
 
 def main(path):
@@ -24,45 +40,73 @@ def main(path):
         (notes if ok else fails).append(f"{'PASS' if ok else 'FAIL'}  {name}: {detail}")
 
     lit = d.get("litmus", [])
+    litmus_cases = [(l.get("test"), l.get("variant"), l.get("qos")) for l in lit]
+    rule(len(litmus_cases) == len(LITMUS_CASES) and set(litmus_cases) == LITMUS_CASES,
+         "I1 exact litmus-arm coverage",
+         f"expected {len(LITMUS_CASES)} unique arms; got {len(litmus_cases)} rows / "
+         f"{len(set(litmus_cases))} unique")
     plain_sb = [l for l in lit if l["test"] == "SB" and l["variant"] == "plain-ldr-str"]
     rule(any(l["relaxed_observed"] > 0 for l in plain_sb),
-         "I1 positive control (plain SB observes the relaxed outcome)",
+         "I2 positive control (plain SB observes the relaxed outcome)",
          f"{[(l['qos'], l['relaxed_observed']) for l in plain_sb]}")
 
     seq = [l for l in lit if l.get("sequential")]
-    rule(not seq, "I2 litmus threads ran concurrently",
+    rule(not seq, "I3 litmus threads ran concurrently",
          f"{len(seq)} arms ran sequentially")
 
     small = [(l["test"], l["variant"], l["qos"], l["iterations"])
              for l in lit if l["iterations"] < MIN_ITERS]
-    rule(not small, "I3 litmus iteration count",
+    rule(not small, "I4 litmus iteration count",
          f"arms below {MIN_ITERS}: {small[:4]}")
 
-    strong = [(l["test"], l["variant"], l["qos"], l["relaxed_observed"])
-              for l in lit
-              if l["variant"] in ("ldar-stlr", "dmb-ish") and l["relaxed_observed"] > 0]
-    rule(not strong,
-         "I4 no relaxed outcome under acquire/release or DMB ISH",
-         f"contradicts the cited architecture, or the harness is broken: {strong[:4]}")
+    forbidden = [
+        (l["test"], l["variant"], l["qos"], l["relaxed_observed"])
+        for l in lit
+        if l["relaxed_observed"] > 0
+        and ((l["test"] == "SB" and l["variant"] == "dmb-ish")
+             or (l["test"] == "MP" and l["variant"] in ("ldar-stlr", "dmb-ish")))
+    ]
+    rule(not forbidden,
+         "I5 no architecture-forbidden relaxed outcome",
+         f"forbidden SB/DMB or MP/acquire-release-or-DMB outcomes: {forbidden[:4]}")
 
-    lost = [(a["op"], a["threads"], a["lost_updates"]) for a in d.get("lse", [])
+    lse = d.get("lse", [])
+    lse_cases = [(a.get("op"), a.get("threads")) for a in lse]
+    rule(len(lse_cases) == len(LSE_CASES) and set(lse_cases) == LSE_CASES,
+         "I6 exact LSE-arm coverage",
+         f"expected {len(LSE_CASES)} unique arms; got {len(lse_cases)} rows / "
+         f"{len(set(lse_cases))} unique")
+    lost = [(a["op"], a["threads"], a["lost_updates"]) for a in lse
             if a["lost_updates"] != 0]
-    rule(not lost, "I5 LSE atomics lose no updates", f"{lost[:4]}")
+    rule(not lost, "I7 LSE atomics lose no updates", f"{lost[:4]}")
 
     al = d.get("alignment", [])
+    alignment_cases = [a.get("case") for a in al]
+    rule(len(alignment_cases) == len(ALIGNMENT_CASES)
+         and set(alignment_cases) == ALIGNMENT_CASES,
+         "I8 exact alignment-case coverage",
+         f"expected {len(ALIGNMENT_CASES)} unique cases; got {len(alignment_cases)} rows / "
+         f"{len(set(alignment_cases))} unique")
     ctrl = [a for a in al if "aligned 4B (control)" in a["case"]]
-    rule(ctrl and not ctrl[0]["faulted"], "I6 aligned-atomic control does not fault",
+    rule(ctrl and not ctrl[0]["faulted"], "I9 aligned-atomic control does not fault",
          f"{ctrl[0] if ctrl else 'control missing'}")
-    rule(len(al) >= 6, "I7 alignment case coverage", f"{len(al)} cases recorded")
+    plain = [a for a in al if a.get("case") == "plain ldr crossing 64-byte cache line"]
+    rule(plain and not plain[0]["faulted"],
+         "I10 ordinary-load contrast does not fault",
+         f"{plain[0] if plain else 'control missing'}")
     faulted_no_sig = [a for a in al if a["faulted"] and a["signal"] == 0]
-    rule(not faulted_no_sig, "I8 every fault carries a signal number",
+    rule(not faulted_no_sig, "I11 every fault carries a signal number",
          f"{faulted_no_sig[:2]}")
 
     rt = d.get("roundtrip", [])
+    rt_qos = [r.get("qos") for r in rt]
+    rule(len(rt_qos) == len(QOS) and set(rt_qos) == QOS,
+         "I12 exact round-trip coverage",
+         f"expected {sorted(QOS)}; got {rt_qos}")
     to = [(r["qos"], r["timeouts"]) for r in rt if r["timeouts"] > 0]
-    rule(not to, "I9 invalidation round trip always acknowledged", f"{to}")
+    rule(not to, "I13 invalidation round trip always acknowledged", f"{to}")
     rule(all(r["min_ns"] > 0 for r in rt) and rt,
-         "I10 round-trip latency positive", f"{[(r['qos'], r['min_ns']) for r in rt]}")
+         "I14 round-trip latency positive", f"{[(r['qos'], r['min_ns']) for r in rt]}")
 
     print(f"INV-01-08 checker  mode={d.get('mode')}  file={path}")
     for line in notes + fails:
@@ -76,11 +120,10 @@ def main(path):
     cross16 = [a for a in al if "crossing 16-byte boundary" in a["case"]]
     if cross16:
         a = cross16[0]
-        thr("T1 misaligned atomic across a 16-byte granule has a definite outcome",
-            True,
+        thr("T1 cross-16-byte atomic faults on this host",
+            a["faulted"],
             f"faulted={a['faulted']} signal={a['signal']} si_code={a['si_code']} "
-            "(a fault is a usable divergence signal; a silent non-atomic access "
-            "is the dangerous outcome)")
+            "(categorical host outcome; a completion is not evidence of non-atomicity)")
 
     fb = d.get("fallback_global_lock", {})
     thr("T2 software fallback under 500 ns/op at 4 threads",

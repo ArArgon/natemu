@@ -15,6 +15,7 @@
 #include <mach/mach_time.h>
 #include <mach/thread_act.h>
 #include <mach/thread_policy.h>
+#include <errno.h>
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <setjmp.h>
@@ -32,6 +33,28 @@ static long g_iters = 1000000; /* litmus iterations per variant */
 static long g_rt = 20000;      /* round-trip samples */
 static struct mach_timebase_info g_tb;
 
+static void fail_pthread(int rc, const char *what) {
+	if (rc == 0) return;
+	errno = rc;
+	perror(what);
+	exit(1);
+}
+static void *xaligned(size_t alignment, size_t size) {
+	void *p = aligned_alloc(alignment, size);
+	if (!p) { perror("aligned_alloc"); exit(1); }
+	return p;
+}
+static long parse_positive(const char *s, const char *what) {
+	char *end = NULL;
+	errno = 0;
+	long v = strtol(s, &end, 10);
+	if (errno || !end || *end != '\0' || v <= 0) {
+		fprintf(stderr, "%s must be a positive integer: %s\n", what, s);
+		exit(2);
+	}
+	return v;
+}
+
 static inline uint64_t now_ns(void) {
 	return (uint64_t)((__uint128_t)mach_absolute_time() * g_tb.numer / g_tb.denom);
 }
@@ -39,7 +62,10 @@ static int cmp_i64(const void *a, const void *b) {
 	int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
 	return (x > y) - (x < y);
 }
-static void set_qos(qos_class_t q) { (void)pthread_set_qos_class_self_np(q, 0); }
+static void set_qos(qos_class_t q) {
+	fail_pthread(pthread_set_qos_class_self_np(q, 0),
+	             "pthread_set_qos_class_self_np");
+}
 static const char *qos_name(qos_class_t q) {
 	return q == QOS_CLASS_USER_INTERACTIVE ? "user-interactive" : "background";
 }
@@ -157,7 +183,7 @@ static void lit_sequential(struct lit *L) {
 static void run_litmus(FILE *f, int test, int variant, qos_class_t q, int last) {
 	static const char *tn[] = {"SB", "MP"};
 	static const char *vn[] = {"plain-ldr-str", "ldar-stlr", "dmb-ish"};
-	struct lit *L = aligned_alloc(CL, ((sizeof(struct lit) + CL - 1) / CL) * CL);
+	struct lit *L = xaligned(CL, ((sizeof(struct lit) + CL - 1) / CL) * CL);
 	memset(L, 0, sizeof *L);
 	L->iters = g_iters; L->variant = variant; L->test = test; L->q = q;
 	atomic_store(&L->bar, 0); atomic_store(&L->sense, 0);
@@ -168,10 +194,10 @@ static void run_litmus(FILE *f, int test, int variant, qos_class_t q, int last) 
 	} else {
 		pthread_t th[2];
 		struct litarg a0 = {L, 0}, a1 = {L, 1};
-		pthread_create(&th[0], NULL, lit_thread, &a0);
-		pthread_create(&th[1], NULL, lit_thread, &a1);
-		pthread_join(th[0], NULL);
-		pthread_join(th[1], NULL);
+		fail_pthread(pthread_create(&th[0], NULL, lit_thread, &a0), "pthread_create");
+		fail_pthread(pthread_create(&th[1], NULL, lit_thread, &a1), "pthread_create");
+		fail_pthread(pthread_join(th[0], NULL), "pthread_join");
+		fail_pthread(pthread_join(th[1], NULL), "pthread_join");
 	}
 	fprintf(f,
 	        "    {\"test\":\"%s\",\"variant\":\"%s\",\"qos\":\"%s\","
@@ -215,13 +241,15 @@ static void *lse_thread(void *p) {
 }
 
 static void run_lse(FILE *f, int nthreads, int use_cas, qos_class_t q, int last) {
-	struct lse *S = aligned_alloc(CL, ((sizeof *S + CL - 1) / CL) * CL);
+	struct lse *S = xaligned(CL, ((sizeof *S + CL - 1) / CL) * CL);
 	memset(S, 0, sizeof *S);
 	S->iters = 1000000; S->use_cas = use_cas; S->q = q;
 	pthread_t th[8];
 	uint64_t t0 = now_ns();
-	for (int i = 0; i < nthreads; i++) pthread_create(&th[i], NULL, lse_thread, S);
-	for (int i = 0; i < nthreads; i++) pthread_join(th[i], NULL);
+	for (int i = 0; i < nthreads; i++)
+		fail_pthread(pthread_create(&th[i], NULL, lse_thread, S), "pthread_create");
+	for (int i = 0; i < nthreads; i++)
+		fail_pthread(pthread_join(th[i], NULL), "pthread_join");
 	uint64_t el = now_ns() - t0;
 	long expected = (long)S->iters * nthreads;
 	fprintf(f,
@@ -296,11 +324,14 @@ static void run_alignment(FILE *f) {
 	sa.sa_sigaction = fault_handler;
 	sa.sa_flags = SA_SIGINFO | SA_NODEFER;
 	sigemptyset(&sa.sa_mask);
-	sigaction(SIGBUS, &sa, NULL);
-	sigaction(SIGSEGV, &sa, NULL);
+	if (sigaction(SIGBUS, &sa, NULL) != 0 || sigaction(SIGSEGV, &sa, NULL) != 0) {
+		perror("sigaction");
+		exit(1);
+	}
 
 	volatile uint8_t *buf = mmap(NULL, 65536, PROT_READ | PROT_WRITE,
 	                             MAP_PRIVATE | MAP_ANON, -1, 0);
+	if (buf == MAP_FAILED) { perror("mmap"); exit(1); }
 	memset((void *)buf, 0, 65536);
 	struct alignres r[6];
 	int n = 0;
@@ -330,8 +361,10 @@ static void run_alignment(FILE *f) {
 	struct fbarg fb = {buf + 78, 250000, 0};
 	uint64_t t0 = now_ns();
 	pthread_t th[4];
-	for (int i = 0; i < 4; i++) pthread_create(&th[i], NULL, fallback_thread, &fb);
-	for (int i = 0; i < 4; i++) pthread_join(th[i], NULL);
+	for (int i = 0; i < 4; i++)
+		fail_pthread(pthread_create(&th[i], NULL, fallback_thread, &fb), "pthread_create");
+	for (int i = 0; i < 4; i++)
+		fail_pthread(pthread_join(th[i], NULL), "pthread_join");
 	uint64_t el = now_ns() - t0;
 	fprintf(f,
 	        "  \"fallback_global_lock\": {\"threads\":4,\"ops\":%ld,"
@@ -364,14 +397,15 @@ static void *rt_peer(void *p) {
 }
 
 static void run_roundtrip(FILE *f, qos_class_t q, int last) {
-	struct rt *R = aligned_alloc(CL, ((sizeof *R + CL - 1) / CL) * CL);
+	struct rt *R = xaligned(CL, ((sizeof *R + CL - 1) / CL) * CL);
 	memset(R, 0, sizeof *R);
 	R->q = q;
 	atomic_store(&R->epoch, 0); atomic_store(&R->ack, 0); atomic_store(&R->stop, 0);
 	pthread_t th;
-	pthread_create(&th, NULL, rt_peer, R);
+	fail_pthread(pthread_create(&th, NULL, rt_peer, R), "pthread_create");
 	usleep(20000);
 	int64_t *lat = malloc(sizeof(int64_t) * (size_t)g_rt);
+	if (!lat) { perror("malloc"); exit(1); }
 	long got = 0, timeouts = 0;
 	for (long i = 0; i < g_rt; i++) {
 		unsigned long long e = (unsigned long long)i + 1;
@@ -384,7 +418,7 @@ static void run_roundtrip(FILE *f, qos_class_t q, int last) {
 		lat[got++] = (int64_t)(now_ns() - t0);
 	}
 	atomic_store(&R->stop, 1);
-	pthread_join(th, NULL);
+	fail_pthread(pthread_join(th, NULL), "pthread_join");
 	qsort(lat, (size_t)got, sizeof(int64_t), cmp_i64);
 	fprintf(f,
 	        "    {\"qos\":\"%s\",\"n\":%ld,\"timeouts\":%ld,\"min_ns\":%lld,"
@@ -403,10 +437,14 @@ int main(int argc, char **argv) {
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--negative")) g_negative = 1;
 		else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
-		else if (!strcmp(argv[i], "--iters") && i + 1 < argc) g_iters = atol(argv[++i]);
+		else if (!strcmp(argv[i], "--iters") && i + 1 < argc)
+			g_iters = parse_positive(argv[++i], "--iters");
 		else { fprintf(stderr, "usage: %s [--out F] [--iters N] [--negative]\n", argv[0]); return 2; }
 	}
-	mach_timebase_info(&g_tb);
+	if (mach_timebase_info(&g_tb) != KERN_SUCCESS || g_tb.numer == 0 || g_tb.denom == 0) {
+		fprintf(stderr, "mach_timebase_info failed or returned an invalid ratio\n");
+		return 1;
+	}
 	FILE *f = out ? fopen(out, "w") : stdout;
 	if (!f) { perror("open out"); return 1; }
 	set_qos(QOS_CLASS_USER_INTERACTIVE);

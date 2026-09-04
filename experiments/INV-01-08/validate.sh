@@ -18,4 +18,8 @@ if python3 "$SCRIPT_DIR/src/check.py" "$SCRIPT_DIR/tests/negative.json"; then
     echo "negative checker fixture unexpectedly passed" >&2
     exit 1
 fi
+if python3 "$SCRIPT_DIR/src/check.py" "$SCRIPT_DIR/tests/forbidden.json"; then
+    echo "forbidden-outcome checker fixture unexpectedly passed" >&2
+    exit 1
+fi
 echo "INV-01-08 preflight PASS"

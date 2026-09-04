@@ -1,5 +1,5 @@
 CC      ?= clang
-CFLAGS  ?= -O2 -Wall -Wextra -std=c11
+CFLAGS  ?= -O2 -Wall -Wextra -Werror -std=c11
 BUILD   ?= build
 BIN     ?= $(BUILD)/litmus
 

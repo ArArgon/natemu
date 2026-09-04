@@ -26,13 +26,24 @@ esac
 
 mode=normal
 extra=""
+if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--negative" ]; }; then
+	echo "usage: $0 [--negative]" >&2
+	exit 2
+fi
 if [ "${1:-}" = "--negative" ]; then
 	mode=negative
 	extra="--negative"
 fi
 
+dirty_detail=$(git -C "$repo_root" status --porcelain -- \
+	experiments/INV-01-07 docs/research/investigations/INV-01-07.md)
+if [ -n "$dirty_detail" ]; then
+	echo "refusing evidence run: commit the INV-01-07 method and code first" >&2
+	echo "$dirty_detail" >&2
+	exit 2
+fi
+
 rev=$(git -C "$repo_root" rev-parse --short HEAD)
-dirty=$(git -C "$repo_root" status --porcelain -- experiments/INV-01-07 | wc -l | tr -d ' ')
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$rev"
 out_dir="$raw_root/INV-01-07/$run_id"
 if [ -e "$out_dir" ]; then
@@ -50,7 +61,7 @@ bin="$build_dir/timers"
 	echo "run_id=$run_id"
 	echo "mode=$mode"
 	echo "git_head=$(git -C "$repo_root" rev-parse HEAD)"
-	echo "experiment_tree_dirty_files=$dirty"
+	echo "experiment_tree_dirty_files=0"
 	echo "---- sw_vers ----"; sw_vers
 	echo "---- sysctl ----"; sysctl hw.model hw.memsize hw.ncpu hw.pagesize kern.osversion \
 		hw.perflevel0.logicalcpu hw.perflevel1.logicalcpu \

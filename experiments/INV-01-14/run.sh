@@ -23,6 +23,14 @@ case "$RAW_ROOT/" in
         ;;
 esac
 
+DIRTY_DETAIL=$(git -C "$REPO_ROOT" status --porcelain -- \
+    experiments/INV-01-14 docs/research/investigations/INV-01-14.md)
+if [ -n "$DIRTY_DETAIL" ]; then
+    echo "refusing evidence run: commit the INV-01-14 method and code first" >&2
+    echo "$DIRTY_DETAIL" >&2
+    exit 2
+fi
+
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 REV=$(git -C "$REPO_ROOT" rev-parse --short HEAD)
 RUN_ID="${TS}-${REV}"
@@ -41,11 +49,11 @@ codesign -d --entitlements - "$BIN" >"$OUT/normal.codesign.txt" 2>&1 || true
 set +e
 "$BIN" --label normal >"$OUT/normal.json" 2>"$OUT/normal.stderr.txt"
 NORMAL_RC=$?
-python3 "$SCRIPT_DIR/src/check.py" "$OUT/normal.json" +    >"$OUT/normal.check.txt" 2>&1
+python3 "$SCRIPT_DIR/src/check.py" "$OUT/normal.json" >"$OUT/normal.check.txt" 2>&1
 NORMAL_CHECK_RC=$?
-"$BIN" --negative --label negative >"$OUT/negative.json" +    2>"$OUT/negative.stderr.txt"
+"$BIN" --negative --label negative >"$OUT/negative.json" 2>"$OUT/negative.stderr.txt"
 NEGATIVE_RC=$?
-python3 "$SCRIPT_DIR/src/check.py" "$OUT/negative.json" +    >"$OUT/negative.check.txt" 2>&1
+python3 "$SCRIPT_DIR/src/check.py" "$OUT/negative.json" >"$OUT/negative.check.txt" 2>&1
 NEGATIVE_CHECK_RC=$?
 set -e
 echo "$NORMAL_RC" >"$OUT/normal.exit.txt"
@@ -54,7 +62,7 @@ echo "$NEGATIVE_RC" >"$OUT/negative.exit.txt"
 {
     echo "run_id=$RUN_ID"
     echo "git_head=$(git -C "$REPO_ROOT" rev-parse HEAD)"
-    echo "experiment_tree_dirty_files=$(git -C "$REPO_ROOT" status --porcelain -- experiments/INV-01-14 | wc -l | tr -d ' ')"
+    echo "experiment_tree_dirty_files=0"
     echo "== sw_vers =="
     sw_vers
     echo "== sysctl =="

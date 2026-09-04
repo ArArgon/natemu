@@ -23,6 +23,14 @@ case "$RAW_ROOT/" in
         ;;
 esac
 
+DIRTY_DETAIL=$(git -C "$REPO_ROOT" status --porcelain -- \
+    experiments/INV-01-09 docs/research/investigations/INV-01-09.md)
+if [ -n "$DIRTY_DETAIL" ]; then
+    echo "refusing evidence run: commit the INV-01-09 method and code first" >&2
+    echo "$DIRTY_DETAIL" >&2
+    exit 2
+fi
+
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 REV=$(git -C "$REPO_ROOT" rev-parse --short HEAD)
 RUN_ID="${TS}-${REV}"
@@ -42,20 +50,20 @@ codesign -d --entitlements - "$BIN" >"$OUT/unentitled.codesign.txt" 2>&1 || true
 # the restricted entitlement, so code-gate validation cannot be pre-empted by
 # entitlement enforcement.
 set +e
-"$BIN" --label unentitled --scratch-dir "$OUT/scratch" +    >"$OUT/unentitled.json" 2>"$OUT/unentitled.stderr.txt"
+"$BIN" --label unentitled --scratch-dir "$OUT/scratch" >"$OUT/unentitled.json" 2>"$OUT/unentitled.stderr.txt"
 UNENTITLED_RC=$?
 set -e
 echo "$UNENTITLED_RC" >"$OUT/unentitled.exit.txt"
 
 set +e
-python3 "$SCRIPT_DIR/src/check.py" "$OUT/unentitled.json" +    >"$OUT/unentitled.check.txt" 2>&1
+python3 "$SCRIPT_DIR/src/check.py" "$OUT/unentitled.json" >"$OUT/unentitled.check.txt" 2>&1
 UNENTITLED_CHECK_RC=$?
 set -e
 
 set +e
-"$BIN" --negative --label negative --scratch-dir "$OUT/scratch" +    >"$OUT/negative.json" 2>"$OUT/negative.stderr.txt"
+"$BIN" --negative --label negative --scratch-dir "$OUT/scratch" >"$OUT/negative.json" 2>"$OUT/negative.stderr.txt"
 NEGATIVE_RC=$?
-python3 "$SCRIPT_DIR/src/check.py" "$OUT/negative.json" +    >"$OUT/negative.check.txt" 2>&1
+python3 "$SCRIPT_DIR/src/check.py" "$OUT/negative.json" >"$OUT/negative.check.txt" 2>&1
 NEGATIVE_CHECK_RC=$?
 set -e
 echo "$NEGATIVE_RC" >"$OUT/negative.exit.txt"
@@ -64,7 +72,7 @@ echo "$NEGATIVE_RC" >"$OUT/negative.exit.txt"
 # Record its process status and output rather than allowing set -e to erase
 # that outcome. If it exits normally, its JSON must pass the integrity checker.
 set +e
-codesign -s - --entitlements "$SCRIPT_DIR/src/vmnet.entitlements.plist" +    -f "$BIN" >"$OUT/entitled-sign.stdout.txt" +    2>"$OUT/entitled-sign.stderr.txt"
+codesign -s - --entitlements "$SCRIPT_DIR/src/vmnet.entitlements.plist" -f "$BIN" >"$OUT/entitled-sign.stdout.txt" 2>"$OUT/entitled-sign.stderr.txt"
 SIGN_RC=$?
 set -e
 echo "$SIGN_RC" >"$OUT/entitled-sign.exit.txt"
@@ -74,19 +82,19 @@ ENTITLED_RC=125
 ENTITLED_CHECK_RC=125
 if [ "$SIGN_RC" -eq 0 ]; then
     set +e
-    "$BIN" --label entitled-adhoc --scratch-dir "$OUT/scratch" +        >"$OUT/entitled-adhoc.json" 2>"$OUT/entitled-adhoc.stderr.txt"
+    "$BIN" --label entitled-adhoc --scratch-dir "$OUT/scratch" >"$OUT/entitled-adhoc.json" 2>"$OUT/entitled-adhoc.stderr.txt"
     ENTITLED_RC=$?
     set -e
     if [ "$ENTITLED_RC" -eq 0 ]; then
         set +e
-        python3 "$SCRIPT_DIR/src/check.py" "$OUT/entitled-adhoc.json" +            >"$OUT/entitled-adhoc.check.txt" 2>&1
+        python3 "$SCRIPT_DIR/src/check.py" "$OUT/entitled-adhoc.json" >"$OUT/entitled-adhoc.check.txt" 2>&1
         ENTITLED_CHECK_RC=$?
         set -e
     else
-        echo "checker skipped: process exit $ENTITLED_RC; process-level outcome retained" +            >"$OUT/entitled-adhoc.check.txt"
+        echo "checker skipped: process exit $ENTITLED_RC; process-level outcome retained" >"$OUT/entitled-adhoc.check.txt"
     fi
 else
-    echo "checker skipped: entitlement signing failed" +        >"$OUT/entitled-adhoc.check.txt"
+    echo "checker skipped: entitlement signing failed" >"$OUT/entitled-adhoc.check.txt"
 fi
 echo "$ENTITLED_RC" >"$OUT/entitled-adhoc.exit.txt"
 
@@ -95,7 +103,7 @@ rmdir "$OUT/scratch" 2>/dev/null || true
 {
     echo "run_id=$RUN_ID"
     echo "git_head=$(git -C "$REPO_ROOT" rev-parse HEAD)"
-    echo "experiment_tree_dirty_files=$(git -C "$REPO_ROOT" status --porcelain -- experiments/INV-01-09 | wc -l | tr -d ' ')"
+    echo "experiment_tree_dirty_files=0"
     echo "== sw_vers =="
     sw_vers
     echo "== sysctl =="

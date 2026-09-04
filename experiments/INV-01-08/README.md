@@ -8,8 +8,8 @@ What it measures, for `Q-01-08` and kill assumption `KA-06`. Method:
 This is a capability probe. It compares against no baseline, produces no
 performance result, and selects no design. It **corroborates** architectural
 statements cited from the Arm ARM (DDI 0487 M.c) and the Intel SDM Vol 3A; it
-never establishes them. Observing no relaxed outcome bounds a probability; it
-does not show that the architecture forbids one.
+never establishes them. A finite run that observes no relaxed outcome does not
+show that the architecture forbids one.
 
 ## Arms
 
@@ -54,12 +54,13 @@ it meaningless. `src/check.py` must report `RESULT: FAIL` (rules `I1` and
 `src/check.py result.json` separates two kinds of judgement:
 
 - **Integrity rules (`I*`)** exit non-zero on failure. The load-bearing one is
-  `I1`, the positive control: the plain SB litmus must observe the relaxed
+  positive-control rule: the plain SB litmus must observe the relaxed
   outcome at least once, or the harness cannot expose weak behaviour at all.
-  `I4` treats a relaxed outcome under `LDAR`/`STLR` or `DMB ISH` as a failure
-  requiring investigation — either the harness is broken or the observation
-  contradicts the cited architecture, and both must be resolved before any
-  claim rests on the run.
+  The forbidden-outcome rule is pattern-specific: it rejects SB's relaxed
+  outcome under `DMB ISH`, and MP's flag-without-data outcome under either
+  release/acquire or `DMB ISH`. It intentionally permits SB's relaxed outcome
+  under `STLR` followed by `LDAR`, because that pair does not impose the
+  Store→Load ordering a full barrier supplies.
 - **Decision thresholds (`T*`)** are the predeclared `KA-06`-adjacent bars.
   They are reported as MEET/MISS and never fail the checker; a MISS is a
   finding the result gate adjudicates.
