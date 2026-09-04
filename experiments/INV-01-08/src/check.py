@@ -147,6 +147,42 @@ def main(path):
     def thr(name, ok, detail):
         print(f"  {'MEET' if ok else 'MISS'}  {name}: {detail}")
 
+    # Predeclared histogram comparison (INV-01-08, Alternative explanations;
+    # REV-064 change 2). The both-observed cell measures how often the two
+    # sides actually overlapped, independently of the relaxed outcome. If a
+    # strengthened arm's fraction differs from its plain counterpart's by more
+    # than an order of magnitude, the two arms did not sample comparable
+    # interleaving distributions and the comparison is INCONCLUSIVE, not
+    # corroboration. Reported, never an integrity failure: a sharp difference
+    # is a finding about the harness, which returns to the method gate.
+    def both_observed(arm):
+        h = arm.get("histogram") or {}
+        n = sum(h.values()) or 1
+        return h.get("r0!=0,r1!=0", 0) / n
+
+    for test in ("SB", "MP"):
+        for qos in sorted(QOS):
+            plain = [l for l in lit if (l["test"], l["variant"], l["qos"])
+                     == (test, "plain-ldr-str", qos)]
+            if not plain:
+                continue
+            fp = both_observed(plain[0])
+            for variant in ("ldar-stlr", "dmb-ish"):
+                arm = [l for l in lit if (l["test"], l["variant"], l["qos"])
+                       == (test, variant, qos)]
+                if not arm:
+                    continue
+                fs = both_observed(arm[0])
+                lo, hi = sorted((fp, fs))
+                comparable = hi <= max(lo, 1e-9) * 10
+                print(f"  {'COMPARABLE' if comparable else 'INCONCLUSIVE'}  "
+                      f"H {test}/{variant}/{qos}: both-observed fraction "
+                      f"plain={fp:.4f} vs {variant}={fs:.4f}"
+                      + ("" if comparable else
+                         " — arms did not sample comparable interleaving "
+                         "distributions; the strengthened arm's zero "
+                         "corroborates nothing (see Alternative explanations)"))
+
     cross16 = [a for a in al if "crossing 16-byte boundary" in a["case"]]
     if cross16:
         a = cross16[0]

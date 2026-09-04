@@ -199,12 +199,24 @@ def main(path):
     ipi = [s for s in signal
            if s["qos"] == "user-interactive"
            and s["mechanism"] == "pthread_kill_SIGUSR1_spinning"]
-    bp99 = min((s["p99_ns"] for s in ipi), default=None)
-    thr("T3 IPI analogue: p99 delivery < 100 us at user-interactive "
-        "(derived: one tenth of the 1 ms guest tick period, so a cross-vCPU "
-        "interrupt is delivered well inside the tick that raised it)",
-        bp99 is not None and bp99 < 100000,
-        f"pthread_kill spinning-target p99 = {bp99} ns")
+    # T3 is the ROUND-TRIP quantity, matching the record's Metrics table and
+    # CLM-01-07-15. The one-way figure is not a standalone threshold: it
+    # subtracts two threads' timestamps and no source in the inventory states
+    # that the clock is a system-wide comparable time base. Rule I17 only
+    # requires one-way <= round trip, so evaluating T3 on the one-way p99
+    # would let a run with a 90 us one-way and a 250 us round trip print MEET
+    # while missing the record's bar (REV-064/REV-065 change 1).
+    rt99 = min((s["roundtrip_p99_ns"] for s in ipi
+                if s.get("roundtrip_p99_ns") is not None), default=None)
+    ow99 = min((s["p99_ns"] for s in ipi), default=None)
+    thr("T3 IPI analogue: round-trip p99 < 200 us at user-interactive "
+        "(derived: one fifth of the 1 ms guest tick period, so a cross-vCPU "
+        "interrupt and its acknowledgment complete inside the tick that "
+        "raised them)",
+        rt99 is not None and rt99 < 200000,
+        f"pthread_kill spinning-target round-trip p99 = {rt99} ns; one-way p99 "
+        f"= {ow99} ns, reported only as an observation bounded above by half "
+        f"the round trip ({None if rt99 is None else rt99 // 2} ns)")
 
     by_arm = {(w["mechanism"], w["target_ns"], w["qos"]): w for w in wakeup}
     ratios = [
