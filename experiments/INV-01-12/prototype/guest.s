@@ -253,6 +253,7 @@ send_ipi:
 
 phase3:
     call test_pf
+    call test_push
     call test_ud
     call test_smc
     call test_cas
@@ -299,6 +300,50 @@ tC: lock xadd [rcx], rax                  // write to read-only, error code 3
     mov rax, [rcx]
     lea rbx, [rip + test_c_mem]
     mov [rbx], rax
+
+    // Read the accessed and dirty bits back out of the guest's own PTEs.
+    mov rdi, ALIAS
+    call pte_ptr
+    mov rax, [rax]
+    mov rcx, 0x60
+    and rax, rcx
+    lea rbx, [rip + ad_a]
+    mov [rbx], rax
+    mov rdi, ALIAS + 0x1000
+    call pte_ptr
+    mov rax, [rax]
+    mov rcx, 0x60
+    and rax, rcx
+    lea rbx, [rip + ad_b]
+    mov [rbx], rax
+    mov rdi, ALIAS + 0x2000
+    call pte_ptr
+    mov rax, [rax]
+    mov rcx, 0x60
+    and rax, rcx
+    lea rbx, [rip + ad_c]
+    mov [rbx], rax
+    ret
+
+// A push whose store lands on a not-present page. The exception frame goes to
+// IST1, so delivery does not nest; the restarted push must decrement RSP
+// exactly once and leave its value at the right address.
+test_push:
+    mov r13, rsp
+    lea rax, [rip + tD]
+    lea rbx, [rip + fault_log]
+    mov [rbx + 120], rax
+    mov rsp, 0x40004000
+    mov rax, 0x5A5A5A5A
+tD: push rax
+    mov r14, rsp
+    mov rsp, r13
+    lea rbx, [rip + push_rsp_after]
+    mov [rbx], r14
+    mov rcx, 0x40003FF8
+    mov rax, [rcx]
+    lea rbx, [rip + push_val]
+    mov [rbx], rax
     ret
 
 test_ud:
@@ -310,7 +355,9 @@ test_smc:
     lea rbx, [rip + smc_before]
     mov [rbx], rax
     lea rcx, [rip + smc_target]
-    mov dword ptr [rcx + 1], 222          // rewrite the immediate in place
+    mov byte ptr [rcx + 1], 0xDE          // rewrite byte 0 of the immediate
+                                          // (111 -> 222); a 1-byte store is
+                                          // naturally aligned by construction
     call smc_target
     lea rbx, [rip + smc_after]
     mov [rbx], rax
@@ -562,13 +609,18 @@ build_pt:
     mov r13, FAULT_BACK + 0x2000
     mov r14, 1
     call map_page
+    mov rdi, ALIAS + 0x3000               // alias D: not present, writable;
+    mov r13, FAULT_BACK + 0x3000          // target of the faulting stack push
+    mov r14, 2
+    call map_page
     mov rdi, LAPIC                        // local APIC register block
     mov r13, LAPIC
     mov r14, 3
     call map_page
     ret
 
-// in: rdi = vector, rsi = handler address. clobbers rax, rcx, rdx.
+// in: rdi = vector, rsi = handler address, r11 = IST index (0 = none).
+// clobbers rax, rcx, rdx.
 set_gate:
     mov rcx, rsi
     and rcx, 0xFFFF                       // offset 15:0 (not via RAX: the
@@ -577,6 +629,7 @@ set_gate:
     shl rcx, 16
     or rax, rcx                           // code selector
     mov rcx, 0x8E00                       // present, DPL 0, 64-bit interrupt gate
+    or rcx, r11                           // IST slot in byte 4 of the gate
     shl rcx, 32
     or rax, rcx
     mov rcx, rsi
@@ -594,15 +647,18 @@ set_gate:
     ret
 
 build_idt:
+    mov r11, 0
     mov rdi, 6
     lea rsi, [rip + ud_handler]
     call set_gate
     mov rdi, 13
     lea rsi, [rip + gp_handler]
     call set_gate
-    mov rdi, 14
+    mov r11, 1                            // #PF is delivered on IST1, so a fault
+    mov rdi, 14                           // on the guest stack does not nest
     lea rsi, [rip + pf_handler]
     call set_gate
+    mov r11, 0
     mov rdi, 0x20
     lea rsi, [rip + timer_isr]
     call set_gate
@@ -653,6 +709,11 @@ vcpu0_done:       .quad 0
 vcpu1_done:       .quad 0
 loop_k:           .quad KLOOP
 loop_n:           .quad NLOOP
+push_rsp_after:   .quad 0
+push_val:         .quad 0
+ad_a:             .quad 0
+ad_b:             .quad 0
+ad_c:             .quad 0
 fault_log:        .zero 128
 idtr:             .short 4095
                   .quad IDT_BASE

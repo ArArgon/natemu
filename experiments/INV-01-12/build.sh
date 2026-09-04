@@ -18,6 +18,14 @@ python3 "$here/src/elfextract.py" "$out/guest.o" "$out/guest_blob.h" >&2
 clang -O2 -std=c11 -Wall -Wextra -Wno-unused-parameter -pthread \
       -I"$out" -o "$out/natemu_proto" "$here/prototype/proto.c"
 
+# A second binary under ThreadSanitizer. run.sh runs it once and records the
+# outcome; data races inside the mechanisms this record claims compose would
+# otherwise be invisible to every invariant.
+clang -O1 -g -std=c11 -fsanitize=thread -pthread \
+      -I"$out" -o "$out/natemu_proto_tsan" "$here/prototype/proto.c"
+codesign -s - --entitlements "$here/prototype/jit.entitlements" -f "$out/natemu_proto_tsan" \
+  >/dev/null 2>&1 || true
+
 # Ad-hoc signature with com.apple.security.cs.allow-jit. The unentitled outcome
 # is recorded too: run.sh keeps both the entitled binary and an unsigned copy so
 # the MAP_JIT dependency (KA-01, owned by Q-01-04) is observable either way.

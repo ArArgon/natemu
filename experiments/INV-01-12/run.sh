@@ -52,9 +52,21 @@ bin=$("$here/build.sh" "$dir/build")
 
 status=0
 run_one() {
-    name=$1; expect=$2; shift 2
-    "$bin" --timeout 180 --out "$dir/$name.json" "$@" > "$dir/$name.stdout" 2>&1 || true
-    if python3 "$here/src/check.py" "$dir/$name.json" > "$dir/$name.check" 2>&1; then
+    name=$1; expect=$2; targeted=$3; shift 3
+    if "$bin" --timeout 180 --out "$dir/$name.json" "$@" > "$dir/$name.stdout" 2>&1
+    then rc=0; else rc=$?; fi
+    # A host-level death (signal) writes no JSON at all. Synthesize an abort
+    # document so the checker reports a named invariant failure rather than a
+    # traceback, and so the raw artifact records what happened.
+    if [ ! -s "$dir/$name.json" ]; then
+        printf '{"record":"INV-01-12","injection":"unknown","jit_mapping":"unknown",\n' \
+            > "$dir/$name.json"
+        printf '"timed_out":false,"abort":"process exited %s without writing output",\n' "$rc" \
+            >> "$dir/$name.json"
+        printf '"host":{},"vcpu":[],"guest":{"fault_log":[]}}\n' >> "$dir/$name.json"
+    fi
+    if python3 "$here/src/check.py" "$dir/$name.json" ${targeted:+--expect "$targeted"} \
+        > "$dir/$name.check" 2>&1; then
         verdict=PASS
     else
         verdict=FAIL
@@ -70,15 +82,30 @@ python3 "$here/src/check.py" --selftest | tee -a "$dir/summary.txt"
 
 # Five repetitions of the positive run; all five must PASS. A flaky integrated
 # prototype is a failure, not a censored sample.
-for i in 1 2 3 4 5; do run_one "positive-$i" PASS; done
+for i in 1 2 3 4 5; do run_one "positive-$i" PASS ""; done
 
-run_one control-skip-restart  FAIL --inject-skip-restart
-run_one control-nonatomic-rmw FAIL --inject-nonatomic-rmw
-run_one control-drop-ipi      FAIL --inject-drop-ipi
-run_one control-stale-cache   FAIL --inject-stale-cache
+# Each control names the invariants it must break. Anything else it breaks is
+# collateral and is not a witness; check.py labels the targeted ones and fails
+# the run if a targeted invariant did not fire.
+run_one control-push-order    FAIL I6d,I6e     --inject-push-order
+run_one control-skip-restart  FAIL I5d,I6a,I6b,I6c --inject-skip-restart
+run_one control-nonatomic-rmw FAIL I3          --inject-nonatomic-rmw
+run_one control-drop-ipi      FAIL I11a,I11c   --inject-drop-ipi
+run_one control-stale-cache   FAIL I8b,I8c     --inject-stale-cache
 # The no-barrier control is stochastic by predeclaration: it does not carry the
 # code gate, and its verdict is recorded either way.
-run_one control-no-barrier    ""   --inject-no-barrier
+run_one control-no-barrier    ""   ""          --inject-no-barrier
+
+# ThreadSanitizer run: recorded, not gating. Any race report is a code-gate
+# failure, so the output is kept alongside the invariant verdicts.
+"$dir/build/natemu_proto_tsan" --timeout 600 --out "$dir/tsan.json" \
+    > "$dir/tsan.stdout" 2>&1 || true
+if grep -q "WARNING: ThreadSanitizer" "$dir/tsan.stdout"; then
+    echo "tsan: RACES REPORTED" | tee -a "$dir/summary.txt"
+    status=1
+else
+    echo "tsan: clean" | tee -a "$dir/summary.txt"
+fi
 
 # Also record the unentitled outcome for the MAP_JIT dependency (KA-01).
 "$dir/build/natemu_proto_unentitled" --timeout 180 --out "$dir/unentitled.json" \

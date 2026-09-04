@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/mman.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <libkern/OSCacheControl.h>
 #include <stdatomic.h>
@@ -47,9 +48,14 @@
 #define VEC_TIMER        0x20
 #define VEC_IPI          0x21
 #define TIMER_PERIOD_NS  1000000ull          /* 1 kHz */
-#define DEFAULT_TIMEOUT  120                 /* seconds */
+/* Per-vCPU interrupt-stack-table entry 1. Real x86 reads IST pointers from
+ * the TSS; this prototype fixes them per vCPU (declared simplification), so a
+ * fault on the guest stack can be delivered without re-faulting on the frame. */
+#define IST1_TOP(id)     (0x00070000ull + 0x1000ull * (uint64_t)(id) + 0x1000ull)
+#define DEFAULT_TIMEOUT  180                 /* seconds; matches the frozen method value */
 
 static int inj_skip_restart, inj_no_barrier, inj_nonatomic, inj_drop_ipi, inj_stale_cache;
+static int inj_push_order;
 static int opt_timeout = DEFAULT_TIMEOUT;
 
 /* ------------------------------------------------------------- guest state */
@@ -84,11 +90,14 @@ typedef struct cpu {
     int fault_vec, has_err;
     uint64_t fault_err;
     uint64_t mark_begin, mark_end;     /* host clock: overlap evidence */
+    uint64_t cpu_begin_ns, cpu_end_ns;  /* per-thread CPU time across the phase */
     uint64_t hlt_wakes, irq_delivered;
-    int halted_clean, finished;
-    const char *abort_reason;
+    int in_delivery, nested_fault;
+    _Atomic int halted_clean;
+    int finished;
+    _Atomic int has_abort;
     char abort_buf[192];
-    uint32_t ipi_vector;
+    _Atomic uint32_t ipi_vector;
     _Atomic uint32_t irr;              /* bit0 timer, bit1 IPI */
     _Atomic uint32_t isr;              /* vector in service, 0 = none */
 } cpu_t;
@@ -99,7 +108,7 @@ static _Atomic int g_stop;
 static _Atomic uint64_t dev_timer_posted, dev_ipi_sent, dev_ipi_dropped;
 static _Atomic uint32_t dev_timer_enabled;
 static _Atomic int dev_timer_stop;
-static uint32_t dev_timer_vector = VEC_TIMER;
+static _Atomic uint32_t dev_timer_vector = VEC_TIMER;
 static mach_timebase_info_data_t tb_info;
 
 static uint64_t now_ns(void)
@@ -107,14 +116,29 @@ static uint64_t now_ns(void)
     return mach_absolute_time() * tb_info.numer / tb_info.denom;
 }
 
+/* CPU time consumed by the calling thread, used to distinguish two threads
+ * running in parallel from one core time-slicing between them. */
+static uint64_t thread_cpu_ns(void)
+{
+    mach_port_t self = mach_thread_self();
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    uint64_t ns = 0;
+    if (thread_info(self, THREAD_BASIC_INFO, (thread_info_t)&info, &count) == KERN_SUCCESS)
+        ns = ((uint64_t)info.user_time.seconds + (uint64_t)info.system_time.seconds) * 1000000000ull
+           + ((uint64_t)info.user_time.microseconds + (uint64_t)info.system_time.microseconds) * 1000ull;
+    mach_port_deallocate(mach_task_self(), self);
+    return ns;
+}
+
 static void vabort(cpu_t *c, const char *fmt, ...)
 {
-    if (!c->abort_reason) {
+    if (!atomic_load(&c->has_abort)) {
         va_list ap;
         va_start(ap, fmt);
         vsnprintf(c->abort_buf, sizeof c->abort_buf, fmt, ap);
         va_end(ap);
-        c->abort_reason = c->abort_buf;
+        atomic_store(&c->has_abort, 1);
     }
     atomic_store(&g_stop, 1);
 }
@@ -207,6 +231,12 @@ static void emit_call(emit_t *m, void *fn) { emit_imm(m, X16, (uint64_t)(uintptr
 
 static void raise_exc(cpu_t *c, int vec, int has_err, uint64_t err)
 {
+    if (c->in_delivery) {
+        /* A fault while delivering a fault. Declared stop: never a livelock. */
+        c->nested_fault = 1;
+        vabort(c, "nested fault: vector %d raised while delivering vector %d", vec, c->fault_vec);
+        longjmp(c->fault_jmp, 2);
+    }
     c->fault_vec = vec;
     c->has_err = has_err;
     c->fault_err = err;
@@ -227,8 +257,8 @@ static uint64_t walk(cpu_t *c, uint64_t va, int write, int fetch)
     for (int level = 3; level >= 0; level--) {
         if (!gpa_is_ram(tbl)) { vabort(c, "page table outside RAM: 0x%llx", tbl); longjmp(c->fault_jmp, 2); }
         uint64_t idx = (va >> (12 + 9 * level)) & 511;
-        uint64_t *slot = (uint64_t *)(void *)(ram + tbl + idx * 8);
-        uint64_t ent = *slot;
+        _Atomic uint64_t *slot = (_Atomic uint64_t *)(void *)(ram + tbl + idx * 8);
+        uint64_t ent = atomic_load_explicit(slot, memory_order_acquire);
         if (!(ent & 1)) {
             c->cr2 = va;
             raise_exc(c, 14, 1, (write ? PF_W : 0u) | (fetch ? PF_I : 0u));
@@ -237,9 +267,12 @@ static uint64_t walk(cpu_t *c, uint64_t va, int write, int fetch)
             c->cr2 = va;
             raise_exc(c, 14, 1, PF_P | PF_W);
         }
-        uint64_t ne = ent | (1ull << 5);
-        if (level == 0 && write) ne |= (1ull << 6);
-        if (ne != ent) *slot = ne;
+        /* x86 performs accessed/dirty updates as locked read-modify-writes; the
+         * two vCPUs share one page-table tree, so a plain store would lose a
+         * concurrent PTE repair from the peer's #PF handler. */
+        uint64_t setbits = (1ull << 5) | ((level == 0 && write) ? (1ull << 6) : 0ull);
+        if ((ent & setbits) != setbits)
+            atomic_fetch_or_explicit(slot, setbits, memory_order_relaxed);
         uint64_t next = ent & 0x000FFFFFFFFFF000ull;
         if (level == 0) return next | (va & 0xFFFull);
         tbl = next;
@@ -247,12 +280,12 @@ static uint64_t walk(cpu_t *c, uint64_t va, int write, int fetch)
     return 0;
 }
 
-static uint8_t *tlb_lookup(cpu_t *c, uint64_t va, int write, int *is_ram)
+static uint8_t *tlb_lookup_ex(cpu_t *c, uint64_t va, int write, int fetch, int *is_ram)
 {
     struct tlbe *t = &c->tlb[(va >> 12) & (TLB_SLOTS - 1)];
     uint64_t tag = (va & ~0xFFFull) | 1;
     if (t->tag == tag && (!write || t->prot == 3)) { *is_ram = 1; return t->host + (va & 0xFFF); }
-    uint64_t gpa = walk(c, va, write, 0);
+    uint64_t gpa = walk(c, va, write, fetch);
     if (gpa_is_ram(gpa)) {
         c->tlb_fills++;
         t->tag = tag;
@@ -263,6 +296,11 @@ static uint8_t *tlb_lookup(cpu_t *c, uint64_t va, int write, int *is_ram)
     }
     *is_ram = 0;
     return (uint8_t *)(uintptr_t)gpa;
+}
+
+static uint8_t *tlb_lookup(cpu_t *c, uint64_t va, int write, int *is_ram)
+{
+    return tlb_lookup_ex(c, va, write, 0, is_ram);
 }
 
 static void tlb_flush_page(cpu_t *c, uint64_t va) { c->tlb[(va >> 12) & (TLB_SLOTS - 1)].tag = 0; }
@@ -282,11 +320,11 @@ static void lapic_write(cpu_t *c, uint64_t off, uint32_t val)
         if (target < 0 || target >= NVCPU) { vabort(c, "IPI to unknown vCPU %d", target); return; }
         uint64_t n = atomic_fetch_add(&dev_ipi_sent, 1) + 1;
         if (inj_drop_ipi && (n % 3) == 0) { atomic_fetch_add(&dev_ipi_dropped, 1); break; }
-        cpus[target].ipi_vector = vec;
+        atomic_store(&cpus[target].ipi_vector, vec);
         atomic_fetch_or(&cpus[target].irr, 2u);
         break;
     }
-    case 0x320: dev_timer_vector = val & 0xFF; break;
+    case 0x320: atomic_store(&dev_timer_vector, val & 0xFF); break;
     case 0x380: atomic_store(&dev_timer_enabled, val ? 1u : 0u); break;
     default: break;
     }
@@ -313,9 +351,13 @@ static void smc_check(cpu_t *c, uint64_t gpa)
     c->smc_flushes++;
 }
 
-static void straddle_check(cpu_t *c, uint64_t va, uint64_t size)
+/* Guest accesses must be naturally aligned and must not cross a guest page.
+ * Both are declared simplifications (see README): the emitted LDAR/STLR and LSE
+ * atomics are defined only within a 16-byte granule on this host, so anything
+ * else is converted into a visible #GP failure rather than left undefined. */
+static void access_check(cpu_t *c, uint64_t va, uint64_t size)
 {
-    if (((va & 0xFFF) + size) > 0x1000) raise_exc(c, 13, 1, 0);   /* #GP: see README */
+    if ((va & (size - 1)) || ((va & 0xFFF) + size) > 0x1000) raise_exc(c, 13, 1, 0);
 }
 
 /* Store path. Returns a host pointer for the inline release store, or NULL
@@ -323,7 +365,7 @@ static void straddle_check(cpu_t *c, uint64_t va, uint64_t size)
 static uint8_t *hst(cpu_t *c, uint64_t va, uint64_t val, uint64_t size)
 {
     c->tmp = val;
-    straddle_check(c, va, size);
+    access_check(c, va, size);
     int is_ram;
     uint8_t *p = tlb_lookup(c, va, 1, &is_ram);
     if (!is_ram) {
@@ -339,7 +381,7 @@ static uint8_t *hst(cpu_t *c, uint64_t va, uint64_t val, uint64_t size)
 /* Load path. Returns a host pointer the generated code reads with LDAR. */
 static uint8_t *hld(cpu_t *c, uint64_t va, uint64_t size)
 {
-    straddle_check(c, va, size);
+    access_check(c, va, size);
     int is_ram;
     uint8_t *p = tlb_lookup(c, va, 0, &is_ram);
     if (!is_ram) {
@@ -358,7 +400,7 @@ static uint8_t *hld(cpu_t *c, uint64_t va, uint64_t size)
  * effect of the instruction, which is what makes the restart exactly-once. */
 static uint8_t *hrmw(cpu_t *c, uint64_t va, uint64_t size)
 {
-    straddle_check(c, va, size);
+    access_check(c, va, size);
     int is_ram;
     uint8_t *p = tlb_lookup(c, va, 1, &is_ram);
     if (!is_ram) { vabort(c, "read-modify-write on MMIO 0x%llx", va); longjmp(c->fault_jmp, 2); }
@@ -433,8 +475,8 @@ static void hout(cpu_t *c, uint64_t port, uint64_t val)
 {
     (void)val;
     switch (port) {
-    case 0x10: c->mark_begin = now_ns(); break;
-    case 0x11: c->mark_end = now_ns(); break;
+    case 0x10: c->cpu_begin_ns = thread_cpu_ns(); c->mark_begin = now_ns(); break;
+    case 0x11: c->mark_end = now_ns(); c->cpu_end_ns = thread_cpu_ns(); break;
     case 0x13: c->finished = 1; break;
     default: vabort(c, "out to unknown port 0x%llx", port); break;
     }
@@ -477,12 +519,16 @@ static void deliver(cpu_t *c, int vec, int has_err, uint64_t err, uint64_t resum
     if (off == 0) { vabort(c, "IDT gate %d has a null handler", vec); return; }
     uint64_t rflags = compose_rflags(c);
     uint64_t rsp_before = c->regs[4];
+    if ((lo >> 32) & 7) c->regs[4] = IST1_TOP(c->id);    /* gate names an IST slot */
+    c->regs[4] &= ~0xFull;                               /* Intel SDM Vol. 3A 7.14.2 */
+    c->in_delivery = 1;
     gpush(c, 0x10);
     gpush(c, rsp_before);
     gpush(c, rflags);
     gpush(c, 0x08);
     gpush(c, resume);
     if (has_err) gpush(c, err);
+    c->in_delivery = 0;
     c->iflag = 0;
     c->rip = off;
 }
@@ -555,6 +601,26 @@ static void emit_load_mem(tr_t *t, int size)
     emit_imm(&t->m, X2, (uint64_t)size);
     emit_call(&t->m, (void *)hld);
     e(&t->m, inj_no_barrier ? a_ldr(X1, X0, 0, size) : a_ldar(X1, X0, size));
+}
+
+/* Push the 64-bit value in cpu->tmp2. The store is emitted *before* the RSP
+ * commit, so a faulting push leaves no guest-visible effect and the restarted
+ * instruction decrements RSP exactly once. --inject-push-order restores the
+ * defective ordering. */
+static void emit_push_tmp2(tr_t *t)
+{
+    emit_t *m = &t->m;
+    ld_greg(t, X4, 4);
+    e(m, A_SUBi(X4, X4, 8));
+    if (inj_push_order) st_greg(t, X4, 4);
+    e(m, A_MOVr(X1, X4));
+    emit_ld_cpu(m, X2, CPUOFF(tmp2));
+    emit_store_mem(t, 8);
+    if (!inj_push_order) {
+        ld_greg(t, X4, 4);                                /* X4 is caller-saved */
+        e(m, A_SUBi(X4, X4, 8));
+        st_greg(t, X4, 4);
+    }
 }
 
 static void emit_flags(tr_t *t, int op, int ra, int rb, int rres)
@@ -661,6 +727,11 @@ static int translate_insn(tr_t *t, uint64_t rip, const uint8_t *p, uint64_t avai
     }
     if (in.w) in.opsize = 8;
     uint8_t op = p[n++];
+    /* LOCK is honoured only on the forms emitted as a single atomic instruction
+     * (0F C1 xadd, 0F B1 cmpxchg); 87 xchg is atomic without the prefix. Any
+     * other LOCK is rejected rather than silently emitted non-atomically. */
+    if (in.lock && !(op == 0x0F && ((uint64_t)n < avail) && (p[n] == 0xC1 || p[n] == 0xB1))
+        && op != 0x87) return -1;
 
     if (op == 0x0F) {
         uint8_t op2 = p[n++];
@@ -726,7 +797,7 @@ static int translate_insn(tr_t *t, uint64_t rip, const uint8_t *p, uint64_t avai
         case 0xC1:                                        /* xadd r/m, r */
             n += decode_modrm(&in, p + n);
             in.next = rip + n;
-            if (!in.mem || (in.opsize != 4 && in.opsize != 8)) return -1;
+            if (!in.mem || in.opsize != 8) return -1;   /* 64-bit only: see README */
             emit_track_rip(t, &in);
             emit_addr(t, &in);
             e(m, A_MOVr(X0, X19));
@@ -747,7 +818,7 @@ static int translate_insn(tr_t *t, uint64_t rip, const uint8_t *p, uint64_t avai
         case 0xB1:                                        /* cmpxchg r/m, r */
             n += decode_modrm(&in, p + n);
             in.next = rip + n;
-            if (!in.mem || (in.opsize != 4 && in.opsize != 8)) return -1;
+            if (!in.mem || in.opsize != 8) return -1;   /* 64-bit only: see README */
             emit_track_rip(t, &in);
             emit_addr(t, &in);
             e(m, A_MOVr(X0, X19));
@@ -771,12 +842,7 @@ static int translate_insn(tr_t *t, uint64_t rip, const uint8_t *p, uint64_t avai
         emit_track_rip(t, &in);
         ld_greg(t, X2, g);
         emit_st_cpu(m, X2, CPUOFF(tmp2));
-        ld_greg(t, X4, 4);
-        e(m, A_SUBi(X4, X4, 8));
-        st_greg(t, X4, 4);
-        e(m, A_MOVr(X1, X4));
-        emit_ld_cpu(m, X2, CPUOFF(tmp2));
-        emit_store_mem(t, 8);
+        emit_push_tmp2(t);
         return 0;
     }
     if (op >= 0x58 && op <= 0x5F) {                        /* pop r64 */
@@ -1012,17 +1078,14 @@ static int translate_insn(tr_t *t, uint64_t rip, const uint8_t *p, uint64_t avai
         if (sub == 2 || sub == 4) {                        /* call/jmp r/m64 */
             if (in.mem) { emit_track_rip(t, &in); emit_addr(t, &in); emit_load_mem(t, 8); }
             else ld_greg(t, X1, in.rm);
-            emit_st_cpu(m, X1, CPUOFF(tmp2));
+            emit_st_cpu(m, X1, CPUOFF(tmp));
             if (sub == 2) {
                 emit_track_rip(t, &in);
-                ld_greg(t, X4, 4);
-                e(m, A_SUBi(X4, X4, 8));
-                st_greg(t, X4, 4);
-                e(m, A_MOVr(X1, X4));
                 emit_imm(m, X2, in.next);
-                emit_store_mem(t, 8);
+                emit_st_cpu(m, X2, CPUOFF(tmp2));
+                emit_push_tmp2(t);
             }
-            emit_ld_cpu(m, X1, CPUOFF(tmp2));
+            emit_ld_cpu(m, X1, CPUOFF(tmp));
             emit_st_cpu(m, X1, CPUOFF(rip));
             t->ended = 1;
             return 0;
@@ -1032,12 +1095,7 @@ static int translate_insn(tr_t *t, uint64_t rip, const uint8_t *p, uint64_t avai
             else ld_greg(t, X1, in.rm);
             emit_st_cpu(m, X1, CPUOFF(tmp2));
             emit_track_rip(t, &in);
-            ld_greg(t, X4, 4);
-            e(m, A_SUBi(X4, X4, 8));
-            st_greg(t, X4, 4);
-            e(m, A_MOVr(X1, X4));
-            emit_ld_cpu(m, X2, CPUOFF(tmp2));
-            emit_store_mem(t, 8);
+            emit_push_tmp2(t);
             return 0;
         }
         return -1;
@@ -1060,12 +1118,9 @@ static int translate_insn(tr_t *t, uint64_t rip, const uint8_t *p, uint64_t avai
         int64_t rel = rd_simm(p + n, 4); n += 4;
         in.next = rip + n;
         emit_track_rip(t, &in);
-        ld_greg(t, X4, 4);
-        e(m, A_SUBi(X4, X4, 8));
-        st_greg(t, X4, 4);
-        e(m, A_MOVr(X1, X4));
         emit_imm(m, X2, in.next);
-        emit_store_mem(t, 8);
+        emit_st_cpu(m, X2, CPUOFF(tmp2));
+        emit_push_tmp2(t);
         emit_end_block(t, in.next + (uint64_t)rel);
         return 0;
     }
@@ -1131,13 +1186,24 @@ static int translate_insn(tr_t *t, uint64_t rip, const uint8_t *p, uint64_t avai
 #undef in
 }
 
-static uint8_t *code_at(cpu_t *c, uint64_t va, uint64_t *left)
+/* Copy up to 16 bytes (the x86 maximum instruction length) starting at `va`
+ * into `buf`, translating the next guest page when the instruction would span
+ * a page boundary. Every decoder read is therefore inside a bounded buffer, and
+ * a not-present continuation page raises an instruction-fetch #PF rather than
+ * silently decoding whatever follows in host memory. */
+static uint64_t code_window(cpu_t *c, uint64_t va, uint8_t *buf)
 {
     int r;
-    uint8_t *p = tlb_lookup(c, va, 0, &r);
+    uint8_t *p = tlb_lookup_ex(c, va, 0, 1, &r);
     if (!r) { vabort(c, "instruction fetch from MMIO 0x%llx", va); longjmp(c->fault_jmp, 2); }
-    *left = 0x1000 - (va & 0xFFF);
-    return p;
+    uint64_t here = 0x1000 - (va & 0xFFF);
+    uint64_t n = here < 16 ? here : 16;
+    memcpy(buf, p, n);
+    if (n < 16) {
+        uint8_t *q = tlb_lookup_ex(c, (va + n) & ~0xFFFull, 0, 1, &r);
+        if (r) { memcpy(buf + n, q, 16 - n); n = 16; }
+    }
+    return n;
 }
 
 static void *translate_block(cpu_t *c, uint64_t va)
@@ -1159,14 +1225,14 @@ static void *translate_block(cpu_t *c, uint64_t va)
 
     uint64_t rip = va;
     int count = 0;
-    while (!t.ended && count < MAX_BLOCK_INSNS && !c->abort_reason) {
-        uint64_t avail;
-        const uint8_t *p = code_at(c, rip, &avail);
-        if (avail < 16 && count > 0) { emit_end_block(&t, rip); break; }
-        if (translate_insn(&t, rip, p, avail) < 0) {
+    while (!t.ended && count < MAX_BLOCK_INSNS && !atomic_load(&c->has_abort)) {
+        uint8_t win[16];
+        uint64_t avail = code_window(c, rip, win);
+        if (translate_insn(&t, rip, win, avail) < 0) {
             pthread_jit_write_protect_np(1);
             vabort(c, "unsupported instruction at guest RIP 0x%llx: %02x %02x %02x %02x",
-                   rip, p[0], avail > 1 ? p[1] : 0, avail > 2 ? p[2] : 0, avail > 3 ? p[3] : 0);
+                   rip, win[0], avail > 1 ? win[1] : 0, avail > 2 ? win[2] : 0,
+                   avail > 3 ? win[3] : 0);
             return NULL;
         }
         rip = t.in.next;
@@ -1184,7 +1250,7 @@ static void *translate_block(cpu_t *c, uint64_t va)
     e(m, A_RET);
 
     pthread_jit_write_protect_np(1);
-    if (c->abort_reason) return NULL;
+    if (atomic_load(&c->has_abort)) return NULL;
     sys_icache_invalidate(start, (size_t)((uint8_t *)m->p - (uint8_t *)start));
     c->jit_ptr = (uint8_t *)m->p;
     c->translations++;
@@ -1221,8 +1287,8 @@ static void check_irq(cpu_t *c)
     uint32_t irr = atomic_load(&c->irr);
     if (!irr) return;
     int vec;
-    if (irr & 1u) { atomic_fetch_and(&c->irr, ~1u); vec = (int)dev_timer_vector; }
-    else { atomic_fetch_and(&c->irr, ~2u); vec = (int)c->ipi_vector; }
+    if (irr & 1u) { atomic_fetch_and(&c->irr, ~1u); vec = (int)atomic_load(&dev_timer_vector); }
+    else { atomic_fetch_and(&c->irr, ~2u); vec = (int)atomic_load(&c->ipi_vector); }
     atomic_store(&c->isr, (uint32_t)vec);
     if (c->halted) { c->halted = 0; c->hlt_wakes++; }
     c->irq_delivered++;
@@ -1234,12 +1300,12 @@ static void *vcpu_thread(void *arg)
     cpu_t *c = (cpu_t *)arg;
     pthread_jit_write_protect_np(1);
     for (;;) {
-        if (atomic_load(&g_stop) || c->abort_reason) break;
+        if (atomic_load(&g_stop) || atomic_load(&c->has_abort)) break;
         int j = setjmp(c->fault_jmp);
         if (j == 0) {
             check_irq(c);
             if (c->halted) {
-                if (!c->iflag) { c->halted_clean = 1; break; }
+                if (!c->iflag) { atomic_store(&c->halted_clean, 1); break; }
                 struct timespec ts = { 0, 100000 };
                 nanosleep(&ts, NULL);
                 continue;
@@ -1278,7 +1344,7 @@ static void *timer_thread(void *unused)
             /* post-on-EOI: at most one timer interrupt outstanding, so the
              * host-posted count and the guest-observed count are comparable
              * exactly, with no coalescing rule needed. */
-            if (!(atomic_load(&c->irr) & 1u) && atomic_load(&c->isr) != dev_timer_vector) {
+            if (!(atomic_load(&c->irr) & 1u) && atomic_load(&c->isr) != atomic_load(&dev_timer_vector)) {
                 atomic_fetch_or(&c->irr, 1u);
                 atomic_fetch_add(&dev_timer_posted, 1);
             }
@@ -1319,6 +1385,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--inject-nonatomic-rmw")) { inj_nonatomic = 1; injection = "nonatomic-rmw"; }
         else if (!strcmp(argv[i], "--inject-drop-ipi")) { inj_drop_ipi = 1; injection = "drop-ipi"; }
         else if (!strcmp(argv[i], "--inject-stale-cache")) { inj_stale_cache = 1; injection = "stale-cache"; }
+        else if (!strcmp(argv[i], "--inject-push-order")) { inj_push_order = 1; injection = "push-order"; }
         else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) opt_timeout = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
         else { fprintf(stderr, "unknown argument: %s\n", argv[i]); return 2; }
@@ -1364,7 +1431,8 @@ int main(int argc, char **argv)
     uint64_t deadline = t0 + (uint64_t)opt_timeout * 1000000000ull;
     for (;;) {
         int live = 0;
-        for (int i = 0; i < NVCPU; i++) if (!cpus[i].halted_clean && !cpus[i].abort_reason) live = 1;
+        for (int i = 0; i < NVCPU; i++)
+            if (!atomic_load(&cpus[i].halted_clean) && !atomic_load(&cpus[i].has_abort)) live = 1;
         if (!live || atomic_load(&g_stop)) break;
         if (now_ns() > deadline) { timed_out = 1; atomic_store(&g_stop, 1); break; }
         struct timespec ts = { 0, 5000000 };
@@ -1377,7 +1445,7 @@ int main(int argc, char **argv)
 
     uint64_t timer_pending =
         ((atomic_load(&cpus[0].irr) & 1u) ? 1u : 0u) +
-        ((atomic_load(&cpus[0].isr) == dev_timer_vector) ? 1u : 0u);
+        ((atomic_load(&cpus[0].isr) == atomic_load(&dev_timer_vector)) ? 1u : 0u);
 
     FILE *f = out ? fopen(out, "w") : stdout;
     if (!f) { perror("open output"); return 2; }
@@ -1386,11 +1454,13 @@ int main(int argc, char **argv)
     fprintf(f, "  \"question\": \"Q-01-12\",\n");
     fprintf(f, "  \"injection\": \"%s\",\n", injection);
     fprintf(f, "  \"jit_mapping\": \"%s\",\n", jit_note);
+    fprintf(f, "  \"nvcpu\": %d,\n", NVCPU);
+    fprintf(f, "  \"timer_period_ns\": %llu,\n", TIMER_PERIOD_NS);
     fprintf(f, "  \"timed_out\": %s,\n", timed_out ? "true" : "false");
     fprintf(f, "  \"wall_ns\": %llu,\n", wall);
     fprintf(f, "  \"abort\": ");
-    if (cpus[0].abort_reason) fprintf(f, "\"vcpu0: %s\",\n", cpus[0].abort_reason);
-    else if (cpus[1].abort_reason) fprintf(f, "\"vcpu1: %s\",\n", cpus[1].abort_reason);
+    if (atomic_load(&cpus[0].has_abort)) fprintf(f, "\"vcpu0: %s\",\n", cpus[0].abort_buf);
+    else if (atomic_load(&cpus[1].has_abort)) fprintf(f, "\"vcpu1: %s\",\n", cpus[1].abort_buf);
     else fprintf(f, "null,\n");
     fprintf(f, "  \"host\": {\n");
     fprintf(f, "    \"timer_posted\": %llu,\n", atomic_load(&dev_timer_posted));
@@ -1404,11 +1474,15 @@ int main(int argc, char **argv)
         fprintf(f, "    {\"id\": %d, \"insns\": %llu, \"blocks\": %llu, \"translations\": %llu,"
                    " \"tlb_fills\": %llu, \"smc_flushes\": %llu, \"faults_raised\": %llu,"
                    " \"irq_delivered\": %llu, \"hlt_wakes\": %llu, \"halted_clean\": %s,"
-                   " \"finished\": %s, \"mark_begin_ns\": %llu, \"mark_end_ns\": %llu}%s\n",
+                   " \"finished\": %s, \"nested_fault\": %s, \"mark_begin_ns\": %llu,"
+                   " \"mark_end_ns\": %llu, \"cpu_ns\": %llu}%s\n",
                 i, c->insns, c->blocks, c->translations, c->tlb_fills, c->smc_flushes,
                 c->faults_raised, c->irq_delivered, c->hlt_wakes,
-                c->halted_clean ? "true" : "false", c->finished ? "true" : "false",
-                c->mark_begin, c->mark_end, i + 1 < NVCPU ? "," : "");
+                atomic_load(&c->halted_clean) ? "true" : "false",
+                c->finished ? "true" : "false", c->nested_fault ? "true" : "false",
+                c->mark_begin, c->mark_end,
+                c->cpu_end_ns > c->cpu_begin_ns ? c->cpu_end_ns - c->cpu_begin_ns : 0,
+                i + 1 < NVCPU ? "," : "");
     }
     fprintf(f, "  ],\n");
     fprintf(f, "  \"guest\": {\n");
@@ -1417,7 +1491,8 @@ int main(int argc, char **argv)
         "gp_count", "timer_ticks", "timer_eois", "ipi_recv", "ipi_ack_timeouts",
         "hlt_wakeups", "cli_delta", "smc_before", "smc_after", "cas_ok",
         "cas_fail_rax", "test_a_val", "test_b_mem", "test_c_mem",
-        "iters0", "iters1", "vcpu0_done", "vcpu1_done", "loop_k", "loop_n"
+        "iters0", "iters1", "vcpu0_done", "vcpu1_done", "loop_k", "loop_n",
+        "push_rsp_after", "push_val", "ad_a", "ad_b", "ad_c"
     };
     for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
         fprintf(f, "    \"%s\": %llu,\n", names[i], gread(names[i]));
@@ -1430,5 +1505,5 @@ int main(int argc, char **argv)
                 i < 3 ? "," : "");
     fprintf(f, "    ]\n  }\n}\n");
     if (out) fclose(f);
-    return (cpus[0].abort_reason || cpus[1].abort_reason || timed_out) ? 1 : 0;
+    return (atomic_load(&cpus[0].has_abort) || atomic_load(&cpus[1].has_abort) || timed_out) ? 1 : 0;
 }
