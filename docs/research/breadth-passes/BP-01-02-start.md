@@ -33,9 +33,19 @@ written later by another agent and inherits this pass unchanged.
   precedent for `F3`'s VM-entry mechanism but not for `F3`'s translated-code
   requirement; Apple's Rosetta 2 is an AOT-plus-JIT x86-64-to-arm64 user-mode
   translator, a partial precedent for `F4`'s ahead-of-time-plus-fallback shape
-  but not a full-system analog; and Apple's Virtualization.framework backs
-  guest operating systems Apple has certified (arm64 Linux, not x86-64), so it
-  cannot itself execute an x86-64 guest and is not a seventh family.
+  but not a full-system analog; and Apple's Virtualization.framework is an
+  adjacent system whose guest-architecture support this pass **questions**
+  rather than settles: whether it can host an x86-64 Linux guest on Apple
+  Silicon at all, and therefore whether it is a seventh family or no family, is
+  for `Q-01-02`'s investigation to establish from primary sources. This pass
+  takes no position on it. (Corrected at the `REV-114` S5 return: the bullet
+  previously asserted as fact that the framework "cannot itself execute an
+  x86-64 guest and is not a seventh family" — an unsourced documentary
+  conclusion in a pass whose own preamble establishes none, and one that
+  pre-empted the screen it was supposed to leave open. No claim depended on it:
+  `INV-01-02` derives the exclusion from its own captures, `SRC-151`/`SRC-152`,
+  rather than inheriting this pass's assertion, so this is a wording correction
+  and not a re-screen.)
 - **Alternatives:** the families are not mutually exclusive in the way this
   register might imply — a design could combine `F2`/`F4` translation with
   `F3`'s hardware-MMU EL1 execution mode; screening at the family level records
