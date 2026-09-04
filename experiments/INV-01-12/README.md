@@ -77,8 +77,10 @@ with a non-zero exit.
 | `--inject-no-barrier` | ordinary loads and stores emitted as `LDR`/`STR` instead of `LDAR`/`STLR` | `I4a`, if a violation surfaces | **stochastic** |
 
 `run.sh` passes each control's targeted invariants to `check.py --expect`, which
-labels them in the output and fails the run if a targeted invariant did **not**
-fire. Everything else a control breaks is **collateral and is not a witness**:
+labels them in the output and exits **2** if a targeted invariant did not fire.
+`run.sh` treats exit 2 as a failure and exits non-zero, so a control that
+silently stopped witnessing its own invariant cannot be recorded as an expected
+FAIL. Everything else a control breaks is **collateral and is not a witness**:
 `--inject-skip-restart` corrupts the guest and then aborts, so it also trips
 `I1a`, `I2b`, `I2c`, `I2f` and most of phase three; `--inject-drop-ipi` starves
 the peer through its bounded acknowledgement spin, so it also trips `I4b`
@@ -157,6 +159,7 @@ declared unwitnessed. Nothing is counted as passing merely because it passed.
 | `I12a`, `I12b` compare-and-exchange | `--selftest` mutations; collateral in `--inject-skip-restart` |
 | `I13a` window overlap, `I13b` parallelism floor | `--selftest` mutations (disjoint windows; halved thread CPU time) |
 | `I14` faults raised from translated code | `--selftest` mutation |
+| `I16` indirect call reaches its target | `--selftest` mutation. It also fires against the pre-fix revision: rebuilding with the indirect-branch target sharing `cpu->tmp` leaves the marker at `0` and `I16` reports it. |
 | `I15a`–`I15c` accessed/dirty bits | `--selftest` mutations |
 
 **Unwitnessed at runtime:** `I4a` has no deterministic control, so the

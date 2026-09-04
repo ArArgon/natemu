@@ -3,7 +3,8 @@
 
 Reads the prototype's JSON output and evaluates the invariants predeclared in
 docs/research/investigations/INV-01-12.md. Prints PASS or FAIL with the list of
-failed invariants; exits 0 on PASS and 1 on FAIL.
+failed invariants; exits 0 on PASS, 1 on FAIL, and 2 when an invariant named
+by --expect did not fire (the control stopped witnessing what it targets).
 
   check.py <result.json>
   check.py <result.json> --expect I6d,I6e    require those invariants to fail
@@ -34,6 +35,7 @@ PUSH_RSP_AFTER = 0x40003FF8
 PUSH_VAL = 0x5A5A5A5A
 AD_ACCESSED = 0x20
 AD_ACCESSED_DIRTY = 0x60
+ICALL_MARKER = 0x1234
 
 
 def check(d):
@@ -44,14 +46,21 @@ def check(d):
         if not cond:
             bad.append(desc)
 
+    # I1 the run completed under its own control.
+    req(d.get("abort") is None, "I1a run aborted: %s" % d.get("abort"))
+    req(d.get("timed_out") is False, "I1b run hit the watchdog timeout")
+    # run.sh synthesizes an abort-only document when the process dies without
+    # writing output. It has no per-vCPU or guest state to evaluate, so I1a is
+    # the whole verdict. A run that aborted after writing a full document is not
+    # this case and is evaluated in full, because its targeted invariants are
+    # exactly what a control needs to witness.
+    if not d.get("vcpu"):
+        return bad, notes
+
     g = d["guest"]
     h = d["host"]
     v = d["vcpu"]
     log = g["fault_log"]
-
-    # I1 the run completed under its own control
-    req(d["abort"] is None, "I1a run aborted: %s" % d["abort"])
-    req(d["timed_out"] is False, "I1b run hit the watchdog timeout")
     for c in v:
         req(not c["nested_fault"], "I1c vCPU %d took a nested fault" % c["id"])
 
@@ -174,6 +183,12 @@ def check(d):
     req(v[0]["faults_raised"] >= 5, "I14 vCPU 0 raised %d exceptions, expected at least 5"
         % v[0]["faults_raised"])
 
+    # I16 an indirect call transfers control to its target, not to the return
+    # address the same instruction pushes
+    req(g["icall_marker"] == ICALL_MARKER,
+        "I16 indirect call left marker 0x%x, expected 0x%x; the call did not reach "
+        "its target" % (g["icall_marker"], ICALL_MARKER))
+
     # I15 the software MMU raised accessed on every touched page and dirty only
     # on the written ones, observed by the guest reading back its own PTEs
     req(g["ad_a"] == AD_ACCESSED,
@@ -212,7 +227,7 @@ def report(d, expect=()):
         print("PASS")
     if missing:
         print("UNWITNESSED: expected invariant(s) did not fail: %s" % ", ".join(missing))
-        return 1
+        return 2
     return 1 if bad else 0
 
 
@@ -244,6 +259,7 @@ def selftest():
             "cas_ok": 1, "cas_fail_rax": 1, "test_a_val": 0xA5A5A5A5,
             "test_b_mem": 1, "test_c_mem": 1, "vcpu0_done": 1, "vcpu1_done": 1,
             "push_rsp_after": PUSH_RSP_AFTER, "push_val": PUSH_VAL,
+            "icall_marker": ICALL_MARKER,
             "ad_a": AD_ACCESSED, "ad_b": AD_ACCESSED_DIRTY, "ad_c": AD_ACCESSED_DIRTY,
             "fault_log": [{"cr2": FAULT_CR2[i], "err": FAULT_CODES[i],
                            "pushed_rip": 100 + i, "expected_rip": 100 + i} for i in range(4)],
@@ -269,7 +285,7 @@ def selftest():
         ("pf_count", 3, "I5a"), ("vcpu0_done", 0, "I2f"),
         ("loop_k", 1, "I2j"), ("loop_n", 1, "I2k"),
         ("ad_a", AD_ACCESSED_DIRTY, "I15a"), ("ad_b", AD_ACCESSED, "I15b"),
-        ("ad_c", AD_ACCESSED, "I15c"),
+        ("ad_c", AD_ACCESSED, "I15c"), ("icall_marker", 0, "I16"),
     ]:
         d = mutated()
         d["guest"][key] = val
@@ -305,6 +321,13 @@ def selftest():
         d = mutated()
         setter(d)
         assert any(b.startswith(tag) for b in check(d)[0]), (tag, check(d)[0])
+
+    # the abort-only document run.sh synthesizes on a host-level death must
+    # evaluate to I1a rather than raising
+    synthetic = {"record": "INV-01-12", "injection": "unknown", "jit_mapping": "unknown",
+                 "timed_out": False, "abort": "process exited 138 without writing output",
+                 "host": {}, "vcpu": [], "guest": {"fault_log": []}}
+    assert [b for b in check(synthetic)[0] if b.startswith("I1a")], check(synthetic)[0]
 
     print("selftest OK")
     return 0

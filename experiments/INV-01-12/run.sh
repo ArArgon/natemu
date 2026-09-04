@@ -66,10 +66,14 @@ run_one() {
         printf '"host":{},"vcpu":[],"guest":{"fault_log":[]}}\n' >> "$dir/$name.json"
     fi
     if python3 "$here/src/check.py" "$dir/$name.json" ${targeted:+--expect "$targeted"} \
-        > "$dir/$name.check" 2>&1; then
-        verdict=PASS
-    else
-        verdict=FAIL
+        > "$dir/$name.check" 2>&1
+    then verdict=PASS; crc=0; else crc=$?; verdict=FAIL; fi
+    # Exit status 2 means a targeted invariant did not fire: the control stopped
+    # witnessing what it targets. That is a code-gate failure even though the
+    # verdict is the expected FAIL, so it must not be swallowed here.
+    if [ "$crc" = 2 ]; then
+        echo "  UNWITNESSED targeted invariant for $name" >&2
+        status=1
     fi
     echo "$name: $verdict (expected ${expect:-any})" | tee -a "$dir/summary.txt"
     if [ -n "$expect" ] && [ "$verdict" != "$expect" ]; then

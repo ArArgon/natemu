@@ -254,6 +254,7 @@ send_ipi:
 phase3:
     call test_pf
     call test_push
+    call test_icall
     call test_ud
     call test_smc
     call test_cas
@@ -344,6 +345,19 @@ tD: push rax
     mov rax, [rcx]
     lea rbx, [rip + push_val]
     mov [rbx], rax
+    ret
+
+// Indirect call through a register: the target must reach RIP, not the return
+// address the same instruction pushes.
+test_icall:
+    lea rax, [rip + icall_target]
+    call rax
+    ret
+
+icall_target:
+    mov rcx, 0x1234
+    lea rbx, [rip + icall_marker]
+    mov [rbx], rcx
     ret
 
 test_ud:
@@ -709,6 +723,7 @@ vcpu0_done:       .quad 0
 vcpu1_done:       .quad 0
 loop_k:           .quad KLOOP
 loop_n:           .quad NLOOP
+icall_marker:     .quad 0
 push_rsp_after:   .quad 0
 push_val:         .quad 0
 ad_a:             .quad 0

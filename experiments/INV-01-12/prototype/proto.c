@@ -73,7 +73,10 @@ typedef struct cpu {
     uint64_t cur_next;       /* first byte after it */
     uint64_t cc_op, cc_a, cc_b, cc_res, cc_cf;
     uint64_t iflag;
-    uint64_t tmp, tmp2;      /* value stashes across a helper call */
+    uint64_t tmp, tmp2, tmp3; /* value stashes across a helper call: tmp is
+                              * written by hst(), tmp2 carries the pushed
+                              * value, tmp3 is the indirect-branch target and
+                              * is touched by no helper */
     uint64_t mmio_scratch;
     uint64_t insns, blocks, translations, tlb_fills, smc_flushes, faults_raised;
     uint64_t halted;
@@ -1078,14 +1081,14 @@ static int translate_insn(tr_t *t, uint64_t rip, const uint8_t *p, uint64_t avai
         if (sub == 2 || sub == 4) {                        /* call/jmp r/m64 */
             if (in.mem) { emit_track_rip(t, &in); emit_addr(t, &in); emit_load_mem(t, 8); }
             else ld_greg(t, X1, in.rm);
-            emit_st_cpu(m, X1, CPUOFF(tmp));
+            emit_st_cpu(m, X1, CPUOFF(tmp3));
             if (sub == 2) {
                 emit_track_rip(t, &in);
                 emit_imm(m, X2, in.next);
                 emit_st_cpu(m, X2, CPUOFF(tmp2));
                 emit_push_tmp2(t);
             }
-            emit_ld_cpu(m, X1, CPUOFF(tmp));
+            emit_ld_cpu(m, X1, CPUOFF(tmp3));
             emit_st_cpu(m, X1, CPUOFF(rip));
             t->ended = 1;
             return 0;
@@ -1194,6 +1197,7 @@ static int translate_insn(tr_t *t, uint64_t rip, const uint8_t *p, uint64_t avai
 static uint64_t code_window(cpu_t *c, uint64_t va, uint8_t *buf)
 {
     int r;
+    memset(buf, 0, 16);            /* a non-RAM continuation leaves a short window */
     uint8_t *p = tlb_lookup_ex(c, va, 0, 1, &r);
     if (!r) { vabort(c, "instruction fetch from MMIO 0x%llx", va); longjmp(c->fault_jmp, 2); }
     uint64_t here = 0x1000 - (va & 0xFFF);
@@ -1492,7 +1496,7 @@ int main(int argc, char **argv)
         "hlt_wakeups", "cli_delta", "smc_before", "smc_after", "cas_ok",
         "cas_fail_rax", "test_a_val", "test_b_mem", "test_c_mem",
         "iters0", "iters1", "vcpu0_done", "vcpu1_done", "loop_k", "loop_n",
-        "push_rsp_after", "push_val", "ad_a", "ad_b", "ad_c"
+        "push_rsp_after", "push_val", "ad_a", "ad_b", "ad_c", "icall_marker"
     };
     for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
         fprintf(f, "    \"%s\": %llu,\n", names[i], gread(names[i]));
