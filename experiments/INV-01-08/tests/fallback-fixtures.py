@@ -477,6 +477,30 @@ class Controls(unittest.TestCase):
         self.assertEqual(sup.MODES, {"normal":600, "negative":600, "fallback-only":60,
                                     "fallback-drop-write":60, "fallback-lock-error":60, "unexpected-fault":5})
 
+    def test_native_authorize_binds_compiled_bundle_before_launch(self):
+        # REV-210 R3 counterexample: a binary compiled from a different
+        # (e.g. dirty/unreviewed) source bundle must be refused even when
+        # the accepted revision string and environment digests both match --
+        # F08_CODE_REV alone never proved which bytes were actually compiled.
+        accepted = {"code_revision": "1" * 40, "code_bundle_sha256": "2" * 64}
+        with tempfile.TemporaryDirectory(prefix="inv08-native-authorize-fixture-") as directory:
+            directory = str(Path(directory).resolve())
+            destination = Path(directory) / "must-not-exist.json"
+            env = {"NATEMU_RAW_ROOT": directory, "NATEMU_F08_AUTH_SHA256": "3" * 64,
+                   "NATEMU_F08_BUNDLE_SHA256": "2" * 64}
+            good = ("auth.json", str(destination), "normal", "125", "3", "1" * 40, "2" * 64)
+            with patch.object(sup, "load_authorization", return_value=accepted), \
+                 patch.object(sup, "file_sha", return_value="3" * 64), \
+                 patch.dict(sup.os.environ, env):
+                self.assertEqual(sup.native_authorize(good), 0)
+                stale_bundle = good[:6] + ("stale-compiled-bundle-digest",)
+                with self.assertRaises(ValueError):
+                    sup.native_authorize(stale_bundle)
+                stale_revision = good[:5] + ("0" * 40, good[6])
+                with self.assertRaises(ValueError):
+                    sup.native_authorize(stale_revision)
+            self.assertFalse(destination.exists())
+
 
 class Authorization(unittest.TestCase):
     def test_supervisor_cli_refuses_missing_gate_before_build_or_spawn(self):
@@ -505,13 +529,13 @@ class Authorization(unittest.TestCase):
             a = {"schema":"INV-01-08-execution-authorization-v1", "kind":"evidence",
                  "code_bundle_sha256":auth.digest(auth.bundle()), "code_revision":"1"*40,
                  "method_review":{"path":"synthetic-only", "sha256":auth.METHOD_SHA},
-                 "code_review":reference,
+                 "code_review":reference, "code_self_review":reference,
                  "clock":{"applicability_review":reference, "packet":{
                      "schema":"INV-01-07-clock-prerequisite-v1", "consumer":"INV-01-08 F08-2",
                      "reviews":{kind:dict(reference, path=kind) for kind in ("method","code","result","replication","adversarial")},
                      "raw":[reference], "context":context, "scope_justification":"synthetic parser case"}}}
 
-            def mocked_review(base, ref, kind, binding=None, expected_id=None):
+            def mocked_review(base, ref, kind, binding=None, expected_id=None, independence="independent"):
                 return Path(directory)/(expected_id or ref["path"])
 
             def git(args, **kwargs):
@@ -526,7 +550,8 @@ class Authorization(unittest.TestCase):
                         return auth.load_authorization(path, "normal", 125, 3)
                 self.assertEqual(load(a), a)
                 variants = []
-                for key in ("clock", "code_bundle_sha256", "method_review", "code_revision"):
+                for key in ("clock", "code_bundle_sha256", "method_review", "code_revision",
+                            "code_review", "code_self_review"):
                     b = copy.deepcopy(a)
                     b.pop(key)
                     variants.append(b)
@@ -556,58 +581,15 @@ class Authorization(unittest.TestCase):
     def test_campaign_members_hashes_and_recomputed_controls(self):
         with tempfile.TemporaryDirectory(prefix="inv08-campaign-parser-fixture-") as directory:
             parent = Path(directory).resolve()
-            packet = {"schema":"INV-01-08-campaign-v1", "members":{}}
-            def write(path, value):
-                path.write_bytes(auth.canonical(value))
-            for mode in ("normal", "negative", "fallback-drop-write", "fallback-lock-error", "unexpected-fault"):
-                location = parent/mode
-                location.mkdir()
-                (location/"build").mkdir()
-                for name in ("build/litmus", "build/litmus.disasm", "build/litmus.s", "build/litmus-verify", "build/litmus-verify.disasm",
-                             "build.log", "check.txt", "stderr.txt", "invocation.json", "environment-before.json", "environment-after.json"):
-                    (location/name).write_text("synthetic parser fixture, never executed")
-                (location/"stdout.txt").write_text("")
-                d = valid()
-                code = 0
-                if mode == "negative":
-                    d.update(mode=mode, completed_normal=False)
-                    for row in d["litmus"]:
-                        row.update(sequential=True, relaxed_observed=0)
-                elif mode == "fallback-drop-write":
-                    d.update(mode=mode, completed_normal=False, standalone=True)
-                    f = d["fallback_global_lock"]
-                    f.update(injected=True, completed_normal=False, actual_writes=999999, final_value=999999, lost_updates=1)
-                    f["workers"][0]["actual_writes"] = 249999
-                    code = 1
-                elif mode == "fallback-lock-error":
-                    d.update(mode=mode, completed_normal=False, standalone=True)
-                    f = d["fallback_global_lock"]
-                    f.update(injected=True, completed_normal=False, ops=0, completed_ops=0, actual_writes=0, final_value=0, lost_updates=1000000)
-                    for w in f["workers"]:
-                        w.update(completed=False, completed_iterations=0, actual_writes=0, successful_locks=0, successful_unlocks=0)
-                    f["workers"][0]["first_error"] = {"operation":"lock", "iteration":0, "rc":errno.EIO, "injected":True}
-                    code = 1
-                if mode != "unexpected-fault":
-                    write(location/"result.json", d)
-                else:
-                    code = 90
-                write(location/"result.supervisor.json", {"mode":mode, "returncode":code, "timed_out":False,
-                      "authorization":{"sha256":"0"*64}, "authorization_validated_before_spawn":True,
-                      "result_sha256":auth.file_sha(location/"result.json") if mode != "unexpected-fault" else None})
-                manifest = {"schema":"INV-01-08-execution-manifest-v1", "mode":mode,
-                            "classification_returncode":0, "code_bundle":auth.bundle(),
-                            "artifacts":{str(p.relative_to(location)):auth.file_sha(p) for p in location.rglob("*") if p.is_file()}}
-                write(location/"manifest.json", manifest)
-                packet["members"][mode] = {"path":str(location/"manifest.json"), "sha256":auth.file_sha(location/"manifest.json")}
-            write(parent/"campaign.json", packet)
+            packet, a, auth_sha, write = build_synthetic_campaign(parent)
             normal = parent/"normal/result.json"
-            auth.validate_campaign(normal, "0"*64)
+            auth.validate_campaign(normal, auth_sha, a)
             for mode in packet["members"]:
                 b = copy.deepcopy(packet)
                 b["members"].pop(mode)
                 write(parent/"campaign.json", b)
                 with self.assertRaises(ValueError):
-                    auth.validate_campaign(normal, "0"*64)
+                    auth.validate_campaign(normal, auth_sha, a)
             write(parent/"campaign.json", packet)
             # Even rehashed summary files cannot bless the wrong fault exit.
             location = parent/"unexpected-fault"
@@ -620,7 +602,66 @@ class Authorization(unittest.TestCase):
             packet["members"]["unexpected-fault"]["sha256"] = auth.file_sha(location/"manifest.json")
             write(parent/"campaign.json", packet)
             with self.assertRaises(ValueError):
-                auth.validate_campaign(normal, "0"*64)
+                auth.validate_campaign(normal, auth_sha, a)
+
+    def test_campaign_rejects_cross_authorization_bundle_revision_transplant(self):
+        # REV-210 R4 counterexample: transplant a different authorization/
+        # bundle/revision digest into one control's raw and rehash the whole
+        # raw -> receipt -> manifest -> campaign chain around it. Only
+        # normal's own binding was checked before; the control member's own
+        # producer identity was never cross-checked against the authorization
+        # actually used for the campaign.
+        with tempfile.TemporaryDirectory(prefix="inv08-campaign-transplant-fixture-") as directory:
+            parent = Path(directory).resolve()
+            packet, a, auth_sha, write = build_synthetic_campaign(parent)
+            normal = parent/"normal/result.json"
+            auth.validate_campaign(normal, auth_sha, a)  # sanity: baseline still accepted
+            location = parent/"fallback-drop-write"
+            d = json.loads((location/"result.json").read_text())
+            d.update(authorization_sha256="a"*64, code_bundle_sha256="b"*64, code_revision="c"*40)
+            write(location/"result.json", d)
+            r = json.loads((location/"result.supervisor.json").read_text())
+            r["result_sha256"] = auth.file_sha(location/"result.json")
+            write(location/"result.supervisor.json", r)
+            m = json.loads((location/"manifest.json").read_text())
+            m["artifacts"]["result.json"] = auth.file_sha(location/"result.json")
+            m["artifacts"]["result.supervisor.json"] = auth.file_sha(location/"result.supervisor.json")
+            write(location/"manifest.json", m)
+            packet["members"]["fallback-drop-write"]["sha256"] = auth.file_sha(location/"manifest.json")
+            write(parent/"campaign.json", packet)
+            with self.assertRaises(ValueError):
+                auth.validate_campaign(normal, auth_sha, a)
+
+    def test_campaign_rejects_non_json_invocation_placeholder(self):
+        # REV-210 R4 counterexample: invocation.json was only ever hashed,
+        # never parsed, so a non-JSON placeholder passed unnoticed.
+        with tempfile.TemporaryDirectory(prefix="inv08-campaign-invocation-fixture-") as directory:
+            parent = Path(directory).resolve()
+            packet, a, auth_sha, write = build_synthetic_campaign(parent)
+            normal = parent/"normal/result.json"
+            location = parent/"fallback-lock-error"
+            (location/"invocation.json").write_text("synthetic parser fixture, never executed")
+            m = json.loads((location/"manifest.json").read_text())
+            m["artifacts"]["invocation.json"] = auth.file_sha(location/"invocation.json")
+            write(location/"manifest.json", m)
+            packet["members"]["fallback-lock-error"]["sha256"] = auth.file_sha(location/"manifest.json")
+            write(parent/"campaign.json", packet)
+            with self.assertRaises(ValueError):
+                auth.validate_campaign(normal, auth_sha, a)
+
+    def test_review_independence_self_vs_independent(self):
+        # REV-210 R5: the self-review Independence field never satisfies an
+        # independent-review check, and vice versa, so self approval cannot
+        # be substituted for the required independent record.
+        independent_ref = {"path": str(auth.REPO/"docs/research/reviews/REV-207.md"), "sha256": auth.METHOD_SHA}
+        auth.review(Path("/tmp"), independent_ref, "method", expected_id="REV-207")
+        with self.assertRaises(ValueError):
+            auth.review(Path("/tmp"), independent_ref, "method", independence="self")
+        self_path = auth.REPO/"docs/research/reviews/REV-209.md"
+        self_ref = {"path": str(self_path), "sha256": auth.file_sha(self_path)}
+        with self.assertRaises(ValueError):
+            auth.review(Path("/tmp"), self_ref, "code")
+        auth.review(Path("/tmp"), self_ref, "code", independence="self")
 
     def test_canonical_bundle_determinism(self):
         self.assertEqual(auth.digest({"b":2,"a":1}), auth.digest({"a":1,"b":2}))
