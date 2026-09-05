@@ -29,8 +29,10 @@ Current return delta, 2026-09-05: `INV-01-02` source passed at REV-159;
 adversarial REV-151 returned candidate/class counting, conditional F3
 dependencies, kill eligibility, helper-order inference and status corrections.
 REV-171 accepted the corrections and finite register closure, including bounded
-F5 adoption. Twelve original investigations are now accepted; this does not
-prove any untested mechanism or every other premise of a project-stop input.
+F5 adoption. Twelve original bounded packets are accepted; this does not close their
+new supplemental scope or prove untested mechanisms. INV06's delivered-Mach
+supplement passed source187/method188; its code and delivered evidence remain
+open, and corrected original claim05 is documentary only.
 
 `INV-01-07` retains two I16-failed runs with no admissible result. Containment
 method/code REV-139/145 and directional-bound method/code REV-153/162 passed.
@@ -39,10 +41,20 @@ MAN-01-07-03 identifies its immutable artifacts. Independent inspection found
 checker coverage gaps (strict-dispatch early wakeups and positive round-trip
 minimum) plus nominal-rate/dispatch interpretation issues. No finding is
 promoted; the negative companion MAN-01-07-04 is terminal with expected failures;
-method/code/result review remains open.
+method/code/result review remains open. REV193 further reproduced malformed
+clock-field PASS outcomes; fresh clock-only prerequisite M07-C1 passed method194,
+with code195/196 in progress. It is not an accepted instrument or substitute
+timer resolution. Source192/212
+supply qualified documentary premises only.
 
-`INV-01-08` source/method/result corrections passed REV-166/167/168;
-amended checker code passed REV-198; adversarial review remains owed. Both MP LDAR/STLR histograms are
+`INV-01-08` source/method/result corrections passed REV-166/167/168 historically;
+amended reporting code passed REV-198. Adversarial REV202 returned missing
+fallback correctness oracles, unsafe handler stdio, source/cost/scope claims
+and an unmet clock prerequisite. F08-2 source206/method207 and the corrected
+historical interpretation208 are accepted; no new F08-2 result is accepted.
+Producer209/code210 and fresh correctness-qualified data/replication remain
+required. Historical fallback cost and T3 latency are unqualified diagnostics,
+not inputs to a cost model or KA-06 disposition. Both MP LDAR/STLR histograms are
 COMPARABLE, but user-interactive plain MP exposed zero relaxed outcomes in
 both runs and cannot corroborate its strengthened counterpart under the
 method's prerequisite. All four SB comparisons stay INCONCLUSIVE; KA-06
@@ -122,7 +134,7 @@ magnitude out of it.
 
 | Unresolved implication | Records and sections | Owning backlog question |
 | --- | --- | --- |
-| `KA-06` is open and the rule that would close it can flip on noise. All four SB strengthened pairs adjudicated INCONCLUSIVE under the frozen histogram rule, because the plain and strengthened arms sampled interleaving distributions differing by three to six orders of magnitude, so these SB comparisons provide no corroboration of the strengthened mapping; the former claim that this is the entirety of the ordering divergence is withdrawn (`INV-01-08`, "Provisional resolution", "Correctness status"). Replication then flipped `MP`/`DMB ISH`/background INCONCLUSIVE→COMPARABLE (28.3×→9.0×) by straddling the 10× boundary (`REV-086`), and the method amendment adding an INDETERMINATE band is accepted by REV-167, with checker implementation and its independent code review still owed. `INV-01-12`'s one litmus pattern, whose stochastic control did not fire, must not be read upward into a disposition. | `INV-01-08` ("Provisional resolution", "Correctness status", method gate row), `INV-01-12` ("Kill-assumption dispositions and family implication"), `INV-01-02` (`KA-06` row) | `Q-01-08`, `Q-02-02` |
+| `KA-06` is open and the rule that would close it can flip on noise. All four SB strengthened pairs adjudicated INCONCLUSIVE under the frozen histogram rule, because their count-weighted both-observed cell fractions fail the predeclared comparability screen; this is not a comparison of complete interleaving distributions or a causal overlap test, so these SB comparisons provide no corroboration of the strengthened mapping; the former claim that this is the entirety of the ordering divergence is withdrawn (`INV-01-08`, "Provisional resolution", "Correctness status"). Replication then flipped `MP`/`DMB ISH`/background INCONCLUSIVE→COMPARABLE (28.3×→9.0×) by straddling the 10× boundary (`REV-086`), and the method amendment adding an INDETERMINATE band was accepted by REV-167 and implemented/reviewed at REV-198. Later adversarial REV202 reopened separate fallback/handler/source/result dependencies; the band does not supply missing correctness or clock evidence. `INV-01-12`'s one litmus pattern, whose stochastic control did not fire, must not be read upward into a disposition. | `INV-01-08` ("Provisional resolution", "Correctness status", method gate row), `INV-01-12` ("Kill-assumption dispositions and family implication"), `INV-01-02` (`KA-06` row) | `Q-01-08`, `Q-02-02` |
 | **Pending re-run.** `KA-05` has no disposition, and four other records' timer-bearing cells rest on that absence. Both `MAN-01-07-01` and `MAN-01-07-02` failed integrity rule `I16`; the second failure exposed scheduling ambiguity between adjacent cross-clock reads and reopened the method gate — so no resolution, read cost, wakeup-error, delivery-latency, or multi-vCPU wakeup-rate figure exists, and `KA-05` is specifically *not* falsified either (`INV-01-07`, "`KA-05` disposition and family implications"). Consequently: `KA-08`'s timer/APIC class is untested (`INV-01-09`, "Implications for `KA-08`…"); `INV-01-13`'s clocksource, RTC, and wall-clock rows have no measured host input ("Limitations"); `Q-01-22`'s time-base policy and `Q-01-21`'s power-state continuity have no facts to derive from; and the interrupt limb of `KA-11` rests on the prototype's own host timer rather than on a characterized facility. | `INV-01-07`, `INV-01-09`, `INV-01-13`, `INV-01-12`, `INV-01-02` (`KA-05` row) | `Q-01-07`, `Q-01-22` |
 | "Precise and restartable" is established only over a bounded instruction set, split across two records that each disclaim the other's half. `INV-01-06` catches faults with full register state and resumes at a chosen PC for three fault classes on two threads, but states plainly that the commit-discipline half "is a property of a translator's commit discipline, not of macOS" and that its probe *skips* the faulting instruction rather than restarting it ("Kill-assumption disposition and family implications"). `INV-01-12` supplies exactly-once restart for a load, two locked read-modify-writes, and a stack `push` — bounded to naturally aligned accesses that do not cross a guest page, since anything else raises `#GP` ("Limitations", items 6–8). x86 permits arbitrary unaligned accesses and a Linux guest performs them. | `INV-01-06`, `INV-01-12`, `INV-01-02` (`KA-04` row) | `Q-02-01`, `Q-01-06` |
 | Host and guest page granularity disagree, and the only guest-granular hardware candidate carries a data-loss hazard. Protection tracking is sound but operates at the 16 KiB host page, covering exactly four guest pages per notification; software checks at 4 KiB guest granularity are the second mechanism, and their isolated marginal is the one cost figure in the group that reproduced (`INV-01-05`, "Kill-assumption disposition and family implications"). `mincore`'s `MINCORE_MODIFIED` was removed from the `KA-07` disposition at the `REV-092` return and re-filed as an unevaluated candidate: its only observed re-arm, `MADV_FREE_REUSABLE`, is a memory-reclaim advisory whose header text reads "pages can be reused (by anyone)", so using it to re-arm tracking may discard live guest RAM — a correctness failure, not a cost. It is also undocumented in `madvise(2)`. | `INV-01-05`, `INV-01-03` (`CLM-01-03-14`), `INV-01-02` (`KA-07` row) | `Q-01-05`, `Q-04-01` |
