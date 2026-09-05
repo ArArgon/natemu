@@ -161,6 +161,17 @@ def main(path, data=None, integrity_only=False, historical=False):
         # A threshold computed from a run that failed an integrity rule is not
         # interpretable, and a MEET printed next to a physically impossible
         # value invites exactly the misreading REV-045 found. Suppress.
+        #
+        # REV-210 R1: an intended failure (e.g. the sequential-negative
+        # control's exact I2/I3) must not be a blank check for the rest of
+        # the input. Require the unaffected histogram cells to still be a
+        # valid, self-consistent accounting before this return is trusted as
+        # "only the intended rule failed"; a corrupted/missing/mismatched
+        # histogram is reported as its own failure, never silently ignored.
+        try:
+            validate_histograms(d)
+        except (KeyError, TypeError, ValueError) as exc:
+            print(f"  FAIL  H-input reporting validation: {exc}")
         print("  -- decision thresholds suppressed: integrity failures present --")
         print(f"RESULT: FAIL ({len(fails)} integrity failures)")
         return 1

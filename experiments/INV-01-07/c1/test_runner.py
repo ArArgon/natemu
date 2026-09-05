@@ -107,33 +107,69 @@ class RunnerTests(unittest.TestCase):
         data = text.encode()
         expected_hash = hashlib.sha256(data).hexdigest()
         with mock.patch.object(runner.artifact, "read_regular", return_value=data):
-            self.assertEqual(runner.review_record("196", expected_hash, independent=True), text)
-            self.invalid("review-independence", runner.review_record, "196", expected_hash, independent=False)
-            self.invalid("review-hash", runner.review_record, "196", "0" * 64, independent=True)
+            self.assertEqual(runner.review_record("/fake", "196", expected_hash, independent=True), text)
+            self.invalid("review-independence", runner.review_record, "/fake", "196", expected_hash, independent=False)
+            self.invalid("review-hash", runner.review_record, "/fake", "196", "0" * 64, independent=True)
         for bad_text, code in ((text.replace("`accept`", "`revise`"), "review-not-accepted"),
                                (text + "- Verdict: `accept`\n", "review-not-accepted"),
                                (text.replace("REV-196", "REV-195"), "review-id")):
             payload = bad_text.encode()
             with mock.patch.object(runner.artifact, "read_regular", return_value=payload):
-                self.invalid(code, runner.review_record, "196", hashlib.sha256(payload).hexdigest(), independent=True)
+                self.invalid(code, runner.review_record, "/fake", "196", hashlib.sha256(payload).hexdigest(), independent=True)
+        # A deliberately non-`accept` expected verdict (the frozen revise196
+        # critique) must accept exactly that verdict and reject the others.
+        revise_text = text.replace("`accept`", "`revise`")
+        revise_data = revise_text.encode()
+        with mock.patch.object(runner.artifact, "read_regular", return_value=revise_data):
+            self.assertEqual(runner.review_record("/fake", "196", hashlib.sha256(revise_data).hexdigest(),
+                                                  independent=True, verdict="revise"), revise_text)
+            self.invalid("review-not-accepted", runner.review_record, "/fake", "196",
+                        hashlib.sha256(revise_data).hexdigest(), independent=True, verdict="accept")
         receipt = "- C1 source SHA-256: `" + "a" * 64 + "`\n"
         runner.receipt(receipt, "C1 source SHA-256", "a" * 64)
         self.invalid("review-receipt:C1 source SHA-256", runner.receipt,
                      receipt + receipt, "C1 source SHA-256", "a" * 64)
 
-    def gate_fixture(self):
-        build_dir = self.raw / "build"
-        build_dir.mkdir()
-        sdk = self.raw / "gate-sdk"
+    def write_review(self, number, *, independent, verdict, mentions=()):
+        reviews = self.repo / "docs/research/reviews"
+        reviews.mkdir(parents=True, exist_ok=True)
+        text = (f"# Synthetic REV-{number}\n- Review ID: `REV-{number}`\n"
+                f"- Independence: `{'independent' if independent else 'self'}`\n"
+                f"- Verdict: `{verdict}`.\n" + "".join(f"{line}\n" for line in mentions))
+        path = reviews / f"REV-{number}.md"
+        path.write_text(text, encoding="utf-8")
+        return hashlib.sha256(text.encode()).hexdigest()
+
+    def gate_fixture(self, *, return_number="219", return_independent=True,
+                     return_verdict="accept", mentions_critique=True):
+        # A fresh subtree per call: tests exercise gate_fixture() repeatedly
+        # against the same self.raw external root.
+        unique = self.raw / hashlib.sha256(os.urandom(16)).hexdigest()[:12]
+        build_dir = unique / "build"
+        build_dir.mkdir(parents=True)
+        sdk = unique / "gate-sdk"
         sdk.mkdir()
-        gate_path = self.raw / "gate.json"
+        gate_path = unique / "gate.json"
         gate_path.write_text("{}")
         sources = {runner.SOURCE_PREFIX + "producer.c": "a" * 64,
                    runner.SOURCE_PREFIX + "runner.py": "b" * 64}
         source_digest = hashlib.sha256(json.dumps(sources, sort_keys=True, separators=(",", ":"),
                                                  ensure_ascii=True).encode()).hexdigest()
+        return_mentions = (f"- Return against `REV-{runner.CRITIQUE_REVIEW}`.",
+                           f"- C1 source SHA-256: `{source_digest}`",
+                           "- C1 build SHA-256: `" + "f" * 64 + "`",
+                           "- C1 method SHA-256: `" + "d" * 64 + "`") if mentions_critique else (
+                           f"- C1 source SHA-256: `{source_digest}`",
+                           "- C1 build SHA-256: `" + "f" * 64 + "`",
+                           "- C1 method SHA-256: `" + "d" * 64 + "`")
+        return_hash = self.write_review(return_number, independent=return_independent,
+                                        verdict=return_verdict, mentions=return_mentions)
         gate = {"schema": runner.GATE_SCHEMA, "revision": "c" * 40, "source_files": sources,
                 "method_sha256": "d" * 64, "reviews": {key: "e" * 64 for key in runner.REVIEWS},
+                "independent_return": {"review_id": return_number,
+                                       "file": f"docs/research/reviews/REV-{return_number}.md",
+                                       "sha256": return_hash, "expected_verdict": "accept",
+                                       "independence": "independent"},
                 "build_directory": str(build_dir), "build_sha256": "f" * 64,
                 "required_changes_closed": True}
         build = {"schema": runner.BUILD_SCHEMA, "source_files": sources, "source_revision": "1" * 40,
@@ -144,17 +180,26 @@ class RunnerTests(unittest.TestCase):
                      "CommonCrypto/CommonDigest.h")},
                  "commands": [], "sdk": str(sdk), "compiler": "synthetic",
                  "validation_exit": 0, "native_executed": False}
-        text = (f"- C1 source SHA-256: `{source_digest}`\n"
-                f"- C1 build SHA-256: `{'f' * 64}`\n- C1 method SHA-256: `{'d' * 64}`\n")
-        return gate_path, gate, build, sources, text
+        return gate_path, gate, build, sources, None
 
     def gate_mocks(self, fixture):
-        path, gate, build, sources, text = fixture
+        path, gate, build, sources, unused = fixture
+        real_review_record = runner.review_record
+        def dispatch_review(rpath, number, expected_hash, *, independent, verdict="accept"):
+            # The four fixed reviews (193-196) are trivially satisfied here;
+            # `test_review_acceptance_...` covers review_record's own regex
+            # logic directly. The independent-return review, whose id/file
+            # are gate-supplied, runs the real function against a real file
+            # so the missing/revise/self-only fixtures below exercise it.
+            if number == gate["independent_return"]["review_id"]:
+                return real_review_record(rpath, number, expected_hash, independent=independent, verdict=verdict)
+            return (f"- Review ID: `REV-{number}`\n- Independence: "
+                    f"`{'independent' if independent else 'self'}`\n- Verdict: `{verdict}`.\n")
         stack = contextlib.ExitStack()
         stack.enter_context(mock.patch.object(runner, "clean_scope"))
         stack.enter_context(mock.patch.object(runner, "revision", return_value="c" * 40))
         stack.enter_context(mock.patch.object(runner, "source_files", return_value=sources))
-        stack.enter_context(mock.patch.object(runner, "review_record", return_value=text))
+        stack.enter_context(mock.patch.object(runner, "review_record", side_effect=dispatch_review))
         stack.enter_context(mock.patch.object(runner.artifact, "read_json", side_effect=lambda p:
                                                gate if Path(p) == path else build))
         stack.enter_context(mock.patch.object(runner, "file_digest", side_effect=lambda p, *args:
@@ -169,7 +214,7 @@ class RunnerTests(unittest.TestCase):
         with self.gate_mocks(fixture):
             accepted, executable = runner.load_gate(str(path), self.raw)
             self.assertEqual(accepted, gate)
-            self.assertEqual(executable, self.raw / "build/clock_c1")
+            self.assertEqual(executable, Path(gate["build_directory"]) / "clock_c1")
             with mock.patch.object(runner, "revision", return_value="0" * 40):
                 self.invalid("revision-changed", runner.load_gate, str(path), self.raw)
             with mock.patch.object(runner, "source_files", return_value={**sources, "unexpected": "a" * 64}):
@@ -179,6 +224,49 @@ class RunnerTests(unittest.TestCase):
             build["native_executed"] = False
             gate["required_changes_closed"] = False
             self.invalid("gate-status", runner.load_gate, str(path), self.raw)
+
+    def test_gate_requires_accepted_independent_return_against_critique196(self):
+        # Missing return entirely: no `independent_return` key in the gate.
+        fixture = self.gate_fixture()
+        path, gate, build, sources, unused = fixture
+        del gate["independent_return"]
+        with self.gate_mocks(fixture):
+            self.invalid("gate-fields", runner.load_gate, str(path), self.raw)
+
+        # A real return review that is still `revise` (R2 not actually closed)
+        # must refuse, even though the gate JSON *declares* expected accept.
+        fixture = self.gate_fixture(return_verdict="revise")
+        path, gate, build, sources, unused = fixture
+        with self.gate_mocks(fixture):
+            self.invalid("review-not-accepted", runner.load_gate, str(path), self.raw)
+
+        # A self-authored "acceptance" of the code packet cannot substitute
+        # for independent return review, no matter its declared verdict.
+        fixture = self.gate_fixture(return_independent=False)
+        path, gate, build, sources, unused = fixture
+        with self.gate_mocks(fixture):
+            self.invalid("review-independence", runner.load_gate, str(path), self.raw)
+
+        # The return review must actually address the frozen critique196,
+        # not merely claim independent acceptance of something else.
+        fixture = self.gate_fixture(mentions_critique=False)
+        path, gate, build, sources, unused = fixture
+        with self.gate_mocks(fixture):
+            self.invalid("independent-return-not-against-critique", runner.load_gate, str(path), self.raw)
+
+        # The gate cannot reuse one of the fixed review numbers as the return
+        # (checked directly at the unit level: real load_gate would first
+        # bind the reused number to its own fixed-review meaning above it).
+        reused_hash = self.write_review("196", independent=True, verdict="accept",
+                                        mentions=(f"- Return against `REV-{runner.CRITIQUE_REVIEW}`.",))
+        self.invalid("independent-return-review-id", runner.independent_return_record,
+                     {"review_id": "196", "file": "docs/research/reviews/REV-196.md",
+                      "sha256": reused_hash, "expected_verdict": "accept", "independence": "independent"})
+
+        # Nor may it point its `file` at a path other than its declared number.
+        self.invalid("independent-return-file", runner.independent_return_record,
+                     {"review_id": "219", "file": "docs/research/reviews/REV-999.md",
+                      "sha256": "a" * 64, "expected_verdict": "accept", "independence": "independent"})
 
     def test_dirty_or_uncommitted_scope_refuses(self):
         with mock.patch.object(runner, "git", return_value=" M experiments/INV-01-07/c1/core.py\0"):

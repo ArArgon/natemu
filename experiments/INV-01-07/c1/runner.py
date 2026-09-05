@@ -30,8 +30,16 @@ import core
 REPOSITORY = Path(__file__).resolve().parents[3]
 SOURCE_PREFIX = "experiments/INV-01-07/c1/"
 METHOD_PATH = "docs/research/investigations/INV-01-07.md"
+# Fixed, known-number reviews. REV-196 is the independent critique that opened
+# R2; it is permanently `revise` in this repository (REV-196.md is frozen).
+# The independent RETURN that closes R2 gets a new number each cycle and is
+# therefore supplied by the gate JSON, not hardcoded here (see
+# `independent_return`).
 REVIEWS = {name: "docs/research/reviews/REV-" + name + ".md"
            for name in ("193", "194", "195", "196")}
+EXPECTED_VERDICT = {"193": "accept", "194": "accept", "195": "accept", "196": "revise"}
+INDEPENDENT_REVIEWS = ("194", "196")
+CRITIQUE_REVIEW = "196"
 MODES = ("backward", "zero-nsec", "omit-clock", "omit-contention",
          "pthread-error", "global-inversion")
 SCHEDULE = tuple((seed, "normal") for seed in (70701, 70702, 70703)) + tuple(
@@ -39,7 +47,7 @@ SCHEDULE = tuple((seed, "normal") for seed in (70701, 70702, 70703)) + tuple(
 CHILD_SECONDS = 300
 EXPECTED_ARRAY_BYTES = 226962048
 BUILD_SCHEMA = "INV-01-07-clock-c1-build-v1"
-GATE_SCHEMA = "INV-01-07-clock-c1-gate-v1"
+GATE_SCHEMA = "INV-01-07-clock-c1-gate-v2"
 FAILURE_SCHEMA = "INV-01-07-clock-c1-failure-v1"
 SDK_HEADERS = ("mach/mach_time.h", "time.h", "pthread.h", "pthread/qos.h", "sys/qos.h",
                "CommonCrypto/CommonDigest.h")
@@ -48,6 +56,8 @@ PUBLIC_CODES = frozenset("""
 dirty-reviewed-scope uncommitted-review-or-method review-hash review-id
 review-not-accepted review-independence gate-location gate-fields gate-status
 gate-reviews revision-changed reviewed-source-mismatch method-changed
+independent-return-fields independent-return-review-id independent-return-file
+independent-return-not-against-critique
 build-manifest-hash build-fields build-status-or-source build-artifact-inventory
 build-artifact-path build-artifact-hash build-header-inventory sdk-header-changed
 producer-not-executable unresolved-revision unresolved-repository git-command-failed
@@ -187,16 +197,18 @@ def clean_scope():
                 "uncommitted-review-or-method")
 
 
-def review_record(number, expected_hash, *, independent):
-    path = REPOSITORY / REVIEWS[number]
+def review_record(path, number, expected_hash, *, independent, verdict="accept"):
+    """`path` is passed explicitly: fixed reviews resolve it from REVIEWS,
+    but the independent return review's number/path are gate-supplied."""
     data = artifact.read_regular(path, artifact.METADATA_LIMIT)
     require(type(expected_hash) is str and HEX.fullmatch(expected_hash)
             and digest(data) == expected_hash, "review-hash")
     text = data.decode("utf-8", errors="strict")
     require(len(re.findall(r"^- Review ID(?: \([^\n]*\))?:\s*`REV-" + number + r"`", text, re.M)) == 1,
             "review-id")
-    require(len(re.findall(r"^- Verdict:\s*`accept`(?:[.\s]|$)", text, re.M)) == 1
-            and not re.search(r"^- Verdict:\s*`(?:revise|reject)`", text, re.M),
+    other_verdicts = "|".join(sorted({"accept", "revise", "reject"} - {verdict}))
+    require(len(re.findall(r"^- Verdict:\s*`" + verdict + r"`(?:[.\s]|$)", text, re.M)) == 1
+            and not re.search(r"^- Verdict:\s*`(?:" + other_verdicts + r")`", text, re.M),
             "review-not-accepted")
     label = "independent" if independent else "self"
     require(len(re.findall(r"^- Independence:\s*`" + label + r"`", text, re.M)) == 1,
@@ -209,13 +221,33 @@ def receipt(text, label, value):
     require(matches == [value], "review-receipt:" + label)
 
 
+def independent_return_record(entry):
+    """The independent RETURN review (against the fixed critique196) gets a
+    new number each cycle, so its id/file/verdict/independence are supplied
+    by the gate JSON itself and independently re-verified here, not assumed."""
+    cells.fields(entry, ("review_id", "file", "sha256", "expected_verdict", "independence"),
+                 "independent-return-fields")
+    number = entry["review_id"]
+    require(type(number) is str and re.fullmatch(r"[1-9][0-9]{1,4}", number)
+            and number not in REVIEWS, "independent-return-review-id")
+    require(entry["file"] == "docs/research/reviews/REV-" + number + ".md",
+            "independent-return-file")
+    require(entry["expected_verdict"] == "accept", "independent-return-fields")
+    require(entry["independence"] == "independent", "independent-return-fields")
+    text = review_record(REPOSITORY / entry["file"], number, entry["sha256"],
+                         independent=True, verdict="accept")
+    require("REV-" + CRITIQUE_REVIEW in text, "independent-return-not-against-critique")
+    return text
+
+
 def load_gate(path, root):
     gate_path = Path(path)
     require(gate_path.is_absolute() and gate_path.resolve(strict=True) == gate_path
             and gate_path.is_relative_to(root), "gate-location")
     gate = artifact.read_json(gate_path)
-    cells.fields(gate, ("schema", "revision", "source_files", "method_sha256",
-                       "reviews", "build_directory", "build_sha256", "required_changes_closed"),
+    cells.fields(gate, ("schema", "revision", "source_files", "method_sha256", "reviews",
+                       "independent_return", "build_directory", "build_sha256",
+                       "required_changes_closed"),
                  "gate-fields")
     require(gate["schema"] == GATE_SCHEMA and gate["required_changes_closed"] is True,
             "gate-status")
@@ -228,8 +260,10 @@ def load_gate(path, root):
     cells.fields(gate["reviews"], ("193", "194", "195", "196"), "gate-reviews")
     review_text = {}
     for number in REVIEWS:
-        review_text[number] = review_record(number, gate["reviews"][number],
-                                            independent=number in ("194", "196"))
+        review_text[number] = review_record(REPOSITORY / REVIEWS[number], number, gate["reviews"][number],
+                                            independent=number in INDEPENDENT_REVIEWS,
+                                            verdict=EXPECTED_VERDICT[number])
+    return_text = independent_return_record(gate["independent_return"])
     build_dir = artifact.canonical_directory(gate["build_directory"], "build-directory")
     require(build_dir.is_relative_to(root) and build_dir != root, "build-outside-root")
     require(file_digest(build_dir / "build.json", artifact.METADATA_LIMIT)
@@ -261,9 +295,11 @@ def load_gate(path, root):
                 and type(expected) is str and HEX.fullmatch(expected)
                 and file_digest(Path(path)) == expected,
                 "sdk-header-changed")
-    receipt(review_text["196"], "C1 source SHA-256", digest(canonical_json(current_sources)))
-    receipt(review_text["196"], "C1 build SHA-256", gate["build_sha256"])
-    receipt(review_text["196"], "C1 method SHA-256", method_hash)
+    # Receipts bind the independent RETURN (not the frozen revise196 critique)
+    # to these exact bytes: 196 will never carry a post-completion receipt.
+    receipt(return_text, "C1 source SHA-256", digest(canonical_json(current_sources)))
+    receipt(return_text, "C1 build SHA-256", gate["build_sha256"])
+    receipt(return_text, "C1 method SHA-256", method_hash)
     require(os.access(build_dir / "clock_c1", os.X_OK), "producer-not-executable")
     return gate, build_dir / "clock_c1"
 
@@ -619,7 +655,8 @@ def build(args):
     output = new_destination(args.output, root)
     # Method is accepted before authoring/building; code196 is deliberately
     # not required to create the binary/disassembly which it must inspect.
-    review_record("194", file_digest(REPOSITORY / REVIEWS["194"]), independent=True)
+    review_record(REPOSITORY / REVIEWS["194"], "194", file_digest(REPOSITORY / REVIEWS["194"]),
+                  independent=True)
     sources = source_files()
     require(git("status", "--porcelain=v1", "-z", "--untracked-files=all", "--", SOURCE_PREFIX) == "",
             "build-source-not-committed-clean")

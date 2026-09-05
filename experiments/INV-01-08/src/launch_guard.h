@@ -14,7 +14,8 @@ static void authorize_native(const char *out, const char *mode) {
 	if (pid == -1) { perror("authorization fork"); exit(2); }
 	if (!pid) {
 		execlp("python3", "python3", F08_REPO "/experiments/INV-01-08/src/supervisor.py",
-		       "--native-authorize", authorization, out, mode, numer, denom, F08_CODE_REV, (char *)NULL);
+		       "--native-authorize", authorization, out, mode, numer, denom, F08_CODE_REV,
+		       F08_COMPILED_BUNDLE, (char *)NULL);
 		_exit(127);
 	}
 	int status;

@@ -37,6 +37,9 @@
 #ifndef F08_CODE_REV
 #error F08_CODE_REV must identify the producing revision
 #endif
+#ifndef F08_COMPILED_BUNDLE
+#error F08_COMPILED_BUNDLE must bind the compiled source-bundle digest
+#endif
 
 static int g_negative = 0;
 static long g_iters = 1000000; /* litmus iterations per variant */
@@ -512,8 +515,9 @@ int main(int argc, char **argv) {
 
 	fprintf(f, "  \"schema\":\"INV-01-08-result-v2\",\"method\":\"F08-2\","
 	        "\"code_revision\":\"%s\",\"authorization_sha256\":\"%s\","
-	        "\"code_bundle_sha256\":\"%s\",\n",
-	        F08_CODE_REV, getenv("NATEMU_F08_AUTH_SHA256"), getenv("NATEMU_F08_BUNDLE_SHA256"));
+	        "\"code_bundle_sha256\":\"%s\",\"compiled_bundle_sha256\":\"%s\",\n",
+	        F08_CODE_REV, getenv("NATEMU_F08_AUTH_SHA256"), getenv("NATEMU_F08_BUNDLE_SHA256"),
+	        F08_COMPILED_BUNDLE);
 
 	if (standalone) {
 		int okay = run_fallback(f, control);

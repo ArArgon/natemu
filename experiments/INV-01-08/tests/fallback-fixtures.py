@@ -52,6 +52,90 @@ def valid():
     return d
 
 
+def sequentialize(row):
+    """Force an intended-negative sequential row while keeping its histogram
+    a valid, self-consistent accounting (REV-210 R1): the relaxed-outcome
+    cell must actually become zero, not merely the summary field."""
+    row["sequential"] = True
+    key = "r0=0,r1=0" if row["test"] == "SB" else "r0!=0,r1=0"
+    moved = row["histogram"][key]
+    row["histogram"][key] = 0
+    row["histogram"]["r0=0,r1!=0"] += moved
+    row["relaxed_observed"] = 0
+
+
+def build_synthetic_campaign(parent):
+    """Author-created parser fixture only; no native execution. Builds a
+    complete five-member campaign directory and returns (packet, authorization,
+    authorization_sha, write) for validate_campaign tests to mutate further."""
+    context = {"host_id": "synthetic", "host_model": "synthetic", "os_build": "synthetic",
+               "architecture": "arm64", "timebase": {"numer": 125, "denom": 3}}
+    a = {"code_revision": "1" * 40, "code_bundle_sha256": auth.digest(auth.bundle()),
+         "clock": {"packet": {"context": context}}}
+    auth_sha = "0" * 64
+    packet = {"schema": "INV-01-08-campaign-v1", "members": {}}
+
+    def write(path, value):
+        path.write_bytes(auth.canonical(value))
+
+    for mode in ("normal", "negative", "fallback-drop-write", "fallback-lock-error", "unexpected-fault"):
+        location = parent / mode
+        location.mkdir()
+        (location / "build").mkdir()
+        for name in ("build/litmus", "build/litmus.disasm", "build/litmus.s", "build/litmus-verify",
+                     "build/litmus-verify.disasm", "build.log", "check.txt", "stderr.txt",
+                     "environment-before.json", "environment-after.json"):
+            (location / name).write_text("synthetic parser fixture, never executed")
+        (location / "stdout.txt").write_text("")
+        d = valid()
+        d.update(authorization_sha256=auth_sha, code_bundle_sha256=a["code_bundle_sha256"])
+        code = 0
+        if mode == "negative":
+            d.update(mode=mode, completed_normal=False)
+            for row in d["litmus"]:
+                sequentialize(row)
+        elif mode == "fallback-drop-write":
+            d.update(mode=mode, completed_normal=False, standalone=True)
+            f = d["fallback_global_lock"]
+            f.update(injected=True, completed_normal=False, actual_writes=999999, final_value=999999, lost_updates=1)
+            f["workers"][0]["actual_writes"] = 249999
+            code = 1
+        elif mode == "fallback-lock-error":
+            d.update(mode=mode, completed_normal=False, standalone=True)
+            f = d["fallback_global_lock"]
+            f.update(injected=True, completed_normal=False, ops=0, completed_ops=0, actual_writes=0,
+                     final_value=0, lost_updates=1000000)
+            for w in f["workers"]:
+                w.update(completed=False, completed_iterations=0, actual_writes=0, successful_locks=0,
+                          successful_unlocks=0)
+            f["workers"][0]["first_error"] = {"operation": "lock", "iteration": 0, "rc": errno.EIO, "injected": True}
+            code = 1
+        if mode != "unexpected-fault":
+            write(location / "result.json", d)
+        else:
+            code = 90
+        binary_sha = auth.file_sha(location / "build/litmus")
+        write(location / "invocation.json", {
+            "schema": "INV-01-08-invocation-v1",
+            "command": [str(location / "build/litmus"), "--mode", mode, "--out", str(location / "result.json")],
+            "code_revision": a["code_revision"], "binary_sha256": binary_sha, "code_bundle": auth.bundle(),
+            "authorization": {"path": "synthetic-authorization", "sha256": auth_sha}, "context": context})
+        write(location / "result.supervisor.json", {
+            "schema": "INV-01-08-supervisor-v1", "mode": mode, "returncode": code, "timed_out": False,
+            "authorization": {"sha256": auth_sha}, "authorization_validated_before_spawn": True,
+            "context": context,
+            "result_sha256": auth.file_sha(location / "result.json") if mode != "unexpected-fault" else None})
+        manifest = {"schema": "INV-01-08-execution-manifest-v1", "mode": mode,
+                    "classification_returncode": 0, "code_bundle": auth.bundle(),
+                    "artifacts": {str(p.relative_to(location)): auth.file_sha(p)
+                                  for p in location.rglob("*") if p.is_file()}}
+        write(location / "manifest.json", manifest)
+        packet["members"][mode] = {"path": str(location / "manifest.json"),
+                                    "sha256": auth.file_sha(location / "manifest.json")}
+    write(parent / "campaign.json", packet)
+    return packet, a, auth_sha, write
+
+
 class Fallback(unittest.TestCase):
     def rejected(self, d, group=None):
         errors = validate_fallback(d)
@@ -235,8 +319,7 @@ class Controls(unittest.TestCase):
         d = valid()
         d.update(mode="negative", completed_normal=False)
         for row in d["litmus"]:
-            row["sequential"] = True
-            row["relaxed_observed"] = 0
+            sequentialize(row)
         receipt = {"returncode":0, "timed_out":False}
         self.assertEqual(validate_full_counts(d), [])
         self.assertTrue(sup.sequential_oracle(d, receipt))
@@ -245,6 +328,34 @@ class Controls(unittest.TestCase):
         d["lse"][0]["lost_updates"] = 0
         d["fallback_global_lock"]["final_value"] -= 1
         self.assertFalse(sup.sequential_oracle(d, receipt))
+
+    def test_sequential_control_rejects_corrupted_histogram(self):
+        # REV-210 R1 counterexample: every row's histogram cells forced to
+        # (-1, 0, 0, 1000001) while the summary fields still show exactly the
+        # intended I2/I3 shape. check.main used to return on I2/I3 before
+        # validate_histograms ever ran, so this was wrongly accepted.
+        d = valid()
+        d.update(mode="negative", completed_normal=False)
+        for row in d["litmus"]:
+            sequentialize(row)
+        for row in d["litmus"]:
+            row["histogram"] = {"r0=0,r1=0": -1, "r0=0,r1!=0": 0, "r0!=0,r1=0": 0, "r0!=0,r1!=0": 1000001}
+        receipt = {"returncode": 0, "timed_out": False}
+        self.assertFalse(sup.sequential_oracle(d, receipt))
+
+    def test_sequential_control_rejects_missing_and_mismatched_histogram(self):
+        d = valid()
+        d.update(mode="negative", completed_normal=False)
+        for row in d["litmus"]:
+            sequentialize(row)
+        receipt = {"returncode": 0, "timed_out": False}
+        self.assertTrue(sup.sequential_oracle(d, receipt))
+        missing = copy.deepcopy(d)
+        del missing["litmus"][0]["histogram"]
+        self.assertFalse(sup.sequential_oracle(missing, receipt))
+        mismatched = copy.deepcopy(d)
+        mismatched["litmus"][0]["histogram"]["r0=0,r1!=0"] += 1  # sum now != iterations
+        self.assertFalse(sup.sequential_oracle(mismatched, receipt))
 
     def test_full_counts_types_coverage_not_reduced(self):
         self.assertEqual(validate_full_counts(valid()), [])
@@ -284,6 +395,64 @@ class Controls(unittest.TestCase):
         self.assertTrue(sup.control_oracle(d["mode"], receipt, d, ""))
         f["workers"][0]["actual_writes"] = 1
         self.assertFalse(sup.control_oracle(d["mode"], receipt, d, ""))
+
+    def test_drop_write_rejects_concealed_original_status_and_bool_confusion(self):
+        # REV-210 R2 counterexample: a drop-write raw with standalone/nested
+        # completed_normal set to 'invalid', and lost_updates a bool (True
+        # spuriously == 1), used to be accepted because the repaired copy
+        # blindly restamps those exact fields before validate_fallback ever
+        # inspects them.
+        def base():
+            d = valid()
+            d.update(mode="fallback-drop-write", completed_normal=False, standalone=True)
+            f = d["fallback_global_lock"]
+            f.update(injected=True, completed_normal=False, actual_writes=999999, final_value=999999, lost_updates=1)
+            f["workers"][0]["actual_writes"] = 249999
+            return d
+        receipt = {"returncode": 1, "timed_out": False}
+        self.assertTrue(sup.control_oracle("fallback-drop-write", receipt, base(), ""))
+        for mutate in (
+                lambda x: x.update(standalone="invalid"),
+                lambda x: x.__delitem__("standalone"),
+                lambda x: x["fallback_global_lock"].update(completed_normal="invalid"),
+                lambda x: x["fallback_global_lock"].__delitem__("completed_normal"),
+                lambda x: x["fallback_global_lock"].update(lost_updates=True)):
+            mutated = base()
+            mutate(mutated)
+            self.assertFalse(sup.control_oracle("fallback-drop-write", receipt, mutated, ""))
+
+    def test_lock_error_rejects_concealed_original_status_and_bool_confusion(self):
+        # REV-210 R2 counterexample: a lock-error raw with
+        # ops/completed_ops/actual_writes/final_value and worker0's counts
+        # all bools instead of ints (False spuriously == 0), plus
+        # first_error.iteration as False, used to be accepted.
+        def base():
+            d = valid()
+            d.update(mode="fallback-lock-error", completed_normal=False, standalone=True)
+            f = d["fallback_global_lock"]
+            for w in f["workers"]:
+                w.update(completed=False, completed_iterations=0, actual_writes=0, successful_locks=0,
+                          successful_unlocks=0)
+            f["workers"][0]["first_error"] = {"operation": "lock", "iteration": 0, "rc": errno.EIO, "injected": True}
+            f.update(injected=True, completed_normal=False, ops=0, completed_ops=0, actual_writes=0,
+                     final_value=0, lost_updates=1000000)
+            return d
+        receipt = {"returncode": 1, "timed_out": False}
+        self.assertTrue(sup.control_oracle("fallback-lock-error", receipt, base(), ""))
+        for mutate in (
+                lambda x: x.update(standalone="invalid"),
+                lambda x: x.__delitem__("standalone"),
+                lambda x: x["fallback_global_lock"].update(completed_normal="invalid"),
+                lambda x: x["fallback_global_lock"].update(ops=False, completed_ops=False,
+                                                            actual_writes=False, final_value=False),
+                lambda x: x["fallback_global_lock"]["workers"][0].update(
+                    completed_iterations=False, actual_writes=False, successful_locks=False,
+                    successful_unlocks=False),
+                lambda x: x["fallback_global_lock"]["workers"][0]["first_error"].update(iteration=False),
+                lambda x: x["fallback_global_lock"]["workers"][0]["first_error"].__delitem__("rc")):
+            mutated = base()
+            mutate(mutated)
+            self.assertFalse(sup.control_oracle("fallback-lock-error", receipt, mutated, ""))
 
     def test_unexpected_fault_u1(self):
         r = {"returncode": 90, "timed_out": False, "result_sha256": None}

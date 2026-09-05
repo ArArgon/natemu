@@ -68,14 +68,14 @@ def artifact(base, ref):
     return path
 
 
-def review(base, ref, kind, binding=None, expected_id=None):
+def review(base, ref, kind, binding=None, expected_id=None, independence="independent"):
     path = artifact(base, ref)
     require(path.parent == REPO / "docs/research/reviews", "review must be canonical repository record")
     if expected_id:
         require(path.name == expected_id + ".md", "wrong review identity")
     content = path.read_text()
     fields = {"Review ID": f"`{path.stem}`", "Review type": f"`{kind}`",
-              "Independence": "`independent`", "Verdict": "`accept`"}
+              "Independence": f"`{independence}`", "Verdict": "`accept`"}
     if binding:
         fields.update(binding)
     for key, expected in fields.items():
@@ -121,8 +121,18 @@ def load_authorization(path, mode, numer=None, denom=None, live=True):
     require(a.get("code_bundle_sha256") == digest(bundle()), "implementation bundle differs from authorization")
     require(a.get("method_review", {}).get("sha256") == METHOD_SHA, "accepted F08-2 method identity")
     review(path.parent, a["method_review"], "method", expected_id="REV-207")
+    # REV-210 R5: an independent accept RETURN and the author's own self
+    # review of this exact bundle are both required; neither substitutes for
+    # the other (the "Independence" field enforced by `review()` differs),
+    # and the required independent review is identified by its content
+    # binding to this exact accepted bundle -- never a hard-coded filename --
+    # so a later accepted return (e.g. REV-218, after REV-210's revise) can
+    # satisfy this without a code change here. REV-210 itself is `revise`
+    # and therefore cannot satisfy the accept-verdict requirement below.
     review(path.parent, a["code_review"], "code",
-           {"Code bundle SHA-256": f"`{a['code_bundle_sha256']}`"}, "REV-210")
+           {"Code bundle SHA-256": f"`{a['code_bundle_sha256']}`"})
+    review(path.parent, a["code_self_review"], "code",
+           {"Code bundle SHA-256": f"`{a['code_bundle_sha256']}`"}, independence="self")
     revision = subprocess.check_output(["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True).strip()
     require(a.get("code_revision") == revision, "authorization not current revision")
     # No performance/evidence collection from an uncommitted producing bundle.
@@ -180,16 +190,28 @@ def validate_result_binding(path, data):
     require(data.get("authorization_sha256") == file_sha(auth_path) and
             data.get("code_bundle_sha256") == a["code_bundle_sha256"] and
             data.get("code_revision") == a["code_revision"], "producer authorization mismatch")
+    # REV-210 R3: the raw's stamped compiled-source digest (baked into the
+    # binary at build time, checked pre-launch by native_authorize) must
+    # still match the accepted bundle here too, independent of that gate.
+    require(data.get("compiled_bundle_sha256") == a["code_bundle_sha256"],
+            "compiled source-bundle digest mismatch")
     require(data.get("timebase") == a["clock"]["packet"]["context"]["timebase"], "producer timebase mismatch")
     require(receipt.get("context") == a["clock"]["packet"]["context"], "supervisor live context mismatch")
     require(receipt.get("authorization_validated_before_spawn") is True,
             "no prior authorization receipt")
-    validate_campaign(path, file_sha(auth_path))
+    validate_campaign(path, file_sha(auth_path), a)
     return a
 
 
-def validate_campaign(normal_path, authorization_sha):
-    """Recompute all required control oracles; summary booleans are not proof."""
+def validate_campaign(normal_path, authorization_sha, authorization):
+    """Recompute all required control oracles; summary booleans are not proof.
+
+    REV-210 R4: agreeing with the campaign summary is not enough. Every
+    member's own raw producer identity and invocation are bound to the
+    SAME accepted authorization explicitly here, so rehashing a raw/receipt/
+    manifest chain after transplanting a different authorization/bundle/
+    revision/timebase into one control cannot pass.
+    """
     import contextlib
     import io
     import check
@@ -201,6 +223,8 @@ def validate_campaign(normal_path, authorization_sha):
     modes = {"normal", "negative", "fallback-drop-write", "fallback-lock-error", "unexpected-fault"}
     members = packet.get("members")
     require(isinstance(members, dict) and set(members) == modes, "campaign exact control coverage")
+    context = authorization["clock"]["packet"]["context"]
+    timebase = context["timebase"]
     seen = set()
     for mode, ref in members.items():
         manifest_path = artifact(parent, ref)
@@ -224,12 +248,29 @@ def validate_campaign(normal_path, authorization_sha):
             require(candidate.is_relative_to(manifest_path.parent) and sha(expected) and file_sha(candidate) == expected,
                     "campaign artifact digest/location mismatch")
         r = json_read(manifest_path.parent/"result.supervisor.json")
-        require(r.get("mode") == mode and r.get("timed_out") is False and
+        require(r.get("schema") == "INV-01-08-supervisor-v1" and r.get("mode") == mode and r.get("timed_out") is False and
                 r.get("authorization", {}).get("sha256") == authorization_sha and
-                r.get("authorization_validated_before_spawn") is True, "control prerequisite/receipt mismatch")
+                r.get("authorization_validated_before_spawn") is True and
+                r.get("context") == context, "control prerequisite/receipt mismatch")
+        # A placeholder that is never actually parsed cannot bind anything;
+        # json_read raises on non-JSON content instead of only hashing bytes.
+        invocation = json_read(manifest_path.parent/"invocation.json")
+        require(invocation.get("schema") == "INV-01-08-invocation-v1", "campaign invocation schema")
         raw_path = manifest_path.parent/"result.json"
+        expected_command = [str(manifest_path.parent/"build/litmus"), "--mode", mode, "--out", str(raw_path)]
+        require(invocation.get("command") == expected_command, "campaign invocation mode/output-path mismatch")
+        require(invocation.get("binary_sha256") == files.get("build/litmus"),
+                "campaign invocation binary hash differs from its manifested build")
+        require(invocation.get("authorization", {}).get("sha256") == authorization_sha and
+                invocation.get("code_revision") == authorization["code_revision"] and
+                invocation.get("code_bundle") == bundle(), "campaign invocation provenance mismatch")
         d = json_read(raw_path) if raw_path.exists() else None
         require(r.get("result_sha256") == (file_sha(raw_path) if d is not None else None), "control raw receipt mismatch")
+        if d is not None:
+            require(d.get("authorization_sha256") == authorization_sha and
+                    d.get("code_bundle_sha256") == authorization["code_bundle_sha256"] and
+                    d.get("code_revision") == authorization["code_revision"] and
+                    d.get("timebase") == timebase, "control raw producer binding mismatch")
         if mode == "normal":
             require(raw_path == normal_path and type(r.get("returncode")) is int and r["returncode"] == 0,
                     "normal campaign identity/status")

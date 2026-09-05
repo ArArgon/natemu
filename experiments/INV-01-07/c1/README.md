@@ -1,8 +1,12 @@
 # M07-C1 clock-instrument implementation
 
-Status: method accepted by REV-194; complete producer/runner draft is being
-built and inspected for self195 and independent196. **No native execution or evidence collection is authorized
-by this directory.** These Python modules and synthetic tests are not a clock
+Status: method accepted by REV-194; the complete producer/runner/gate packet
+is frozen and self-reviewed at REV-195. Independent critique REV-196 found
+the earlier draft incomplete (`revise`; R1 closed, R2 open); this packet
+closes R2. Independent return review REV-219 against REV-196 must accept
+before native execution is authorized. **No native execution or evidence
+collection is authorized by this directory.** These Python modules, the
+compiled-but-unexecuted producer, and synthetic tests are not a clock
 finding, an accepted instrument, or full Q07 completion. No historical timer
 entry point is reused.
 
@@ -33,10 +37,20 @@ entry point is reused.
 - `test_negative_routing.py`: labelled injections reach real raw oracles;
   an undetected injection cannot return a positive finding.
 - `test_runner.py`: separate-author synthetic supervision, control identity,
-  review binding, lifecycle, resource and transactional-output tests. Native
-  process/compiler operations are mocked in these tests.
+  review binding (including the v2 gate's independent-return requirement),
+  lifecycle, resource and transactional-output tests. Native process/compiler
+  operations are mocked in these tests.
+- `test_producer_accounting.py`: compiles a throwaway sizeof/arithmetic probe
+  against the real producer.c struct layouts and independently re-derives the
+  named-local-buffer accounting table below; fails if `named_stack` ever
+  under-counts it. No producer execution or `NATEMU_RAW_ROOT` use.
 
-The complete build/disassembly and independent code review remain required.
+A real `xcrun clang` build of `producer.c` (the exact reviewed flags) and its
+`otool -tvV` disassembly were inspected for this packet: `read_value` and the
+contended `pthread_mutex_lock`/`mach_absolute_time` loop each keep one real
+`bl` call per iteration (no vectorization, hoisting, or removed barriers);
+see REV-195 for the exact instruction ranges and file hash.
+
 No module asserts that gate approvals or manifest claims
 are authentic merely because they occur in JSON. Structural PASS is not review
 acceptance. Three complete normal children, separate native controls, result,
@@ -86,6 +100,54 @@ pthread stack mappings, allocator/library overhead, or native RSS.
 Reading code allocates binary payload bytes separately from derived Python
 values; the native allocation cap is not a claim about total checker RSS.
 
+### Stack-buffer accounting table (closes REV-196 R2's preliminary note)
+
+R2's preliminary accounting note observed that `maximum_owned_buffer_bytes`
+counted only heap/global buffers (`sizeof metadata` plus `allocate()`d
+arrays) and omitted simultaneous local C buffers: main's/preflight's own
+`struct json out`, and clock_cell's `elapsed[200]`. `preflight()` now also
+sums a `named_stack` term, over every named local declared anywhere in
+`producer.c` (summed as if simultaneous, even across functions whose scopes
+cannot actually overlap, so no call-graph reasoning can shrink it), and
+requires `named_stack <= STACK_BUFFER_RESERVE` (1 MiB) before any array is
+allocated. `maximum_owned_buffer_bytes` is `sizeof metadata + STACK_BUFFER_RESERVE
++ max(single clock_cell allocation, single contention_cell allocation)`, i.e.
+every named local is covered by the reserve term, not folded into the
+per-cell heap arithmetic. Real Apple-Silicon sizes (`clang -O2`, this SDK):
+`sizeof(struct json)=65544`, `sizeof(struct quality)=24`,
+`sizeof(struct scan)=32`, `sizeof(struct contention)=744`, `PATH_MAX=1024`.
+
+| Local buffer | Function | Bytes |
+| --- | --- | --- |
+| `struct json out` (×2: main's and preflight's own) | `main`, `preflight` | 131088 |
+| `received`, `expected` (`PATH_MAX+256` each) | `authorize` | 2560 |
+| `root`, `repo`, `parent`, `resolved`, `identity` (`PATH_MAX` each) | `open_output` | 5120 |
+| `elapsed[BATCHES]` (`uint64_t`) | `clock_cell` | 1600 |
+| `temporary[4]` (`uint64_t`) | `clock_cell` | 32 |
+| `struct quality quality` | `clock_cell` | 24 |
+| `struct contention shared` (includes `worker[8]`) | `contention_cell` | 744 |
+| `global`, `workers[8]` (`struct scan`, ×9) | `contention_cell` | 288 |
+| `previous[8]`, `counts[8]`, `transitions` (`uint64_t`, ×17) | `contention_cell` | 136 |
+| `buffer[1024]` | `die` | 1024 |
+| `record[256]` | `clock_failure` | 256 |
+| `digest[32]`, `hex[65]`, `name[96]` | `array` | 193 |
+| `text[40]` | `integer128` | 40 |
+| `order[CELLS]` (`unsigned`) | `main` | 80 |
+| Small-record/scratch/alignment allowance | (fudge) | 65536 |
+| **Total (`named_stack`)** | | **208625** |
+
+`named_stack` (208625 bytes) is independently checked against real compiled
+`sizeof()` values, not producer's own arithmetic, by
+`test_producer_accounting.py`; it compiles a throwaway probe (no
+`NATEMU_RAW_ROOT`, no producer execution) that re-derives this same table's
+sum from the real ABI and fails if `named_stack` ever falls below it. It
+comfortably clears `STACK_BUFFER_RESERVE=1048576` and the formula's own
+generous over-counts (all eight worker `quality` records counted even though
+only one is live outside `struct contention`; both `struct json` instances
+counted even though `preflight()` returns before `main`'s is declared) more
+than offset its few loosely itemized small buffers, which the 64 KiB fudge
+term alone exceeds by orders of magnitude.
+
 The adapter requires canonical absolute external-root, child and repository
 paths, rejects internal roots, symlink payload files, aliased descriptors,
 wrong hashes/sizes/encodings and nonregular files. It neither creates nor
@@ -111,11 +173,49 @@ the distinct actual POSIX return and errno in `api-failure.json`.
 
 The build-only subcommand requires clean committed C1 sources, compiles with
 recorded-O2 flags/resolved SDK, signs ad hoc, captures disassembly/header
-hashes and runs only synthetic tests. It never executes the producer. Campaign
-execution additionally requires genuine accepted current self193/195 and
-independent194/196 records, exact code/build/method receipts and committed
-clean scope. No accepted gate envelope ships with this code. Reviewers must
-establish actual independence and closed changes; matching bytes alone do not.
+hashes and runs only synthetic tests. It never executes the producer.
+
+### Gate schema `INV-01-07-clock-c1-gate-v2`
+
+REV-196 is a preliminary independent code critique, not an acceptance: its
+own verdict is `revise` and it says so explicitly ("No final196 acceptance is
+issued for an incomplete packet"). It stays `revise` in this repository even
+after this packet closes R2 — returns get new review numbers here, not an
+edited verdict on the original critique. The v1 gate schema wrongly required
+`REV-196` itself to read `Verdict: accept`, which REV-196 can never satisfy.
+
+The v2 gate loader (`runner.load_gate`) instead requires, as separate
+fields:
+
+- `reviews.193`, `.194`, `.195`: the fixed self-method/independent-method/
+  self-code reviews, each still required to read `accept` (self/independent/
+  self respectively).
+- `reviews.196`: the fixed independent critique, required to read `revise`
+  (`Independence: independent`) — present as the record R2 is closing
+  against, not as an acceptance.
+- `independent_return`: `{review_id, file, sha256, expected_verdict,
+  independence}`, supplied by the gate JSON itself because the review number
+  that finally accepts the packet is assigned only when that independent
+  return is written (this packet reserves `REV-219` for it). The loader
+  independently re-verifies every one of those fields against the real file:
+  `review_id` must not reuse one of the four fixed numbers above; `file` must
+  be exactly `docs/research/reviews/REV-<review_id>.md`; the review at that
+  path must have `Independence: independent` and `Verdict: accept`; and its
+  text must mention `REV-196` (the critique it returns against). A gate
+  lacking `independent_return`, one whose return review is still `revise`,
+  or one whose "return" is independence `self` all refuse to load
+  (`gate-fields`, `review-not-accepted`, `review-independence`
+  respectively) — see `test_gate_requires_accepted_independent_return_against_critique196`
+  in `test_runner.py`. The C1 source/build/method-hash receipts that used to
+  live in REV-196 now must appear in the independent return review instead,
+  since 196 never receives them.
+
+Campaign execution additionally requires genuine accepted current self193/195
+and independent194 records, the independent196 critique present at its
+pinned revise hashes, an accepted independent return against it, exact
+code/build/method receipts and committed clean scope. No accepted gate
+envelope ships with this code. Reviewers must establish actual independence
+and closed changes; matching bytes alone do not.
 
 ## Development checks
 
@@ -130,10 +230,12 @@ binary tests create synthetic files only in fresh external temporary
 directories, then remove those directories. The full binary test visits the
 prescribed arrays through the real CLI, first accepting the synthetic record
 structurally and then rejecting a corrupted final required summary with no
-finding/T1/PASS prefix. These tests do not establish native runtime behavior.
-Fixture authors cannot independently approve their own
-fixture code in REV196.
+finding/T1/PASS prefix. `test_producer_accounting.py` compiles a throwaway
+probe (real `xcrun clang`, no `NATEMU_RAW_ROOT`) but launches no producer.
+These tests do not establish native runtime behavior. Fixture authors cannot
+independently approve their own fixture code in REV196.
 
 Historical development checkpoint `d49a95b`: the then-current48 tests passed
-in58.528s. The expanded draft has70 tests; its exact full build/validation
-packet belongs in self195 and independent196, not an inferred runtime result.
+in58.528s. REV-195 (self code review) pins the frozen packet's exact test
+count, wall time and per-file SHA-256; independent return REV-219 against
+REV-196 must accept before native execution is authorized.

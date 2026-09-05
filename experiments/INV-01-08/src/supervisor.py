@@ -42,6 +42,11 @@ def supervise(command, stdout, stderr, timeout, env=None):
             "watchdog_seconds": timeout, "supervisor_elapsed_ns": time.monotonic_ns() - start}
 
 
+def exact_int(value, expected):
+    """Strict int equality: True/False must never satisfy a 0/1 expectation."""
+    return type(value) is int and value == expected
+
+
 def control_oracle(mode, receipt, data, output):
     """Pure control classification; a successful negative is not a valid sample."""
     if receipt.get("timed_out") is not False:
@@ -51,21 +56,32 @@ def control_oracle(mode, receipt, data, output):
                 data is None and receipt.get("result_sha256") is None and not output.strip())
     if not isinstance(data, dict) or data.get("mode") != mode or data.get("completed_normal") is not False:
         return False
+    # REV-210 R2: `standalone` and the nested fallback `completed_normal` are
+    # both restamped unconditionally by the repaired copy below, so a
+    # malformed original value here would otherwise never be inspected by
+    # anything (the copy conceals it before validate_fallback ever runs).
+    if data.get("standalone") is not True:
+        return False
     f = data.get("fallback_global_lock", {})
+    if not isinstance(f, dict) or f.get("completed_normal") is not False:
+        return False
     failures = validate_fallback(data)
     if mode == "fallback-drop-write":
         if type(receipt.get("returncode")) is not int or receipt["returncode"] != 1 or f.get("injected") is not True:
             return False
         # Do not accept arbitrary failed runs as the intended omitted-store
-        # control: all other fields must pass the same positive oracle.
+        # control: all other fields must pass the same positive oracle, and
+        # every count here is checked as an actual int (never a bool that
+        # happens to equal 0/1 under Python's `==`).
+        if not (exact_int(f.get("completed_ops"), 1000000) and exact_int(f.get("ops"), 1000000) and
+                exact_int(f.get("actual_writes"), 999999) and exact_int(f.get("final_value"), 999999) and
+                exact_int(f.get("lost_updates"), 1)):
+            return False
         import copy
         repaired = copy.deepcopy(data)
         r = repaired["fallback_global_lock"]
-        if not (f.get("completed_ops") == f.get("ops") == 1000000 and
-                f.get("actual_writes") == f.get("final_value") == 999999 and f.get("lost_updates") == 1):
-            return False
         workers = r.get("workers", [])
-        if len(workers) != 4 or any(w.get("actual_writes") != (249999 if w.get("id") == 0 else 250000)
+        if len(workers) != 4 or any(not exact_int(w.get("actual_writes"), 249999 if w.get("id") == 0 else 250000)
                                     for w in workers):
             return False
         repaired.update(mode="normal", completed_normal=True, standalone=False)
@@ -80,9 +96,13 @@ def control_oracle(mode, receipt, data, output):
             return False
         w = next(w for w in workers if w["id"] == 0)
         import errno
-        if w.get("first_error") != {"operation": "lock", "iteration": 0, "rc": errno.EIO, "injected": True}:
+        fe = w.get("first_error")
+        if (not isinstance(fe, dict) or set(fe) != {"operation", "iteration", "rc", "injected"}
+                or fe.get("operation") != "lock" or not exact_int(fe.get("iteration"), 0)
+                or not exact_int(fe.get("rc"), errno.EIO) or fe.get("injected") is not True):
             return False
-        if any(w.get(k) != 0 for k in ("completed_iterations", "actual_writes", "successful_locks", "successful_unlocks")):
+        if any(not exact_int(w.get(k), 0)
+               for k in ("completed_iterations", "actual_writes", "successful_locks", "successful_unlocks")):
             return False
         # Coordinator abort may stop other workers at different iterations;
         # inspect actual counts and lifetime rather than assume scheduling.
@@ -94,13 +114,14 @@ def control_oracle(mode, receipt, data, output):
             if any(type(worker.get(k)) is not int or worker[k] != n
                    for k in ("actual_writes", "successful_locks", "successful_unlocks")):
                 return False
-            if worker.get("ready") is not True or worker.get("qos_rc") != 0:
+            if worker.get("ready") is not True or not exact_int(worker.get("qos_rc"), 0):
                 return False
             if worker["id"] != 0 and worker.get("first_error") is not None:
                 return False
             total += n
-        consistent = (f.get("ops") == f.get("completed_ops") == f.get("actual_writes") == f.get("final_value") == total
-                and f.get("lost_updates") == 1000000 - total
+        consistent = (exact_int(f.get("ops"), total) and exact_int(f.get("completed_ops"), total) and
+                exact_int(f.get("actual_writes"), total) and exact_int(f.get("final_value"), total) and
+                exact_int(f.get("lost_updates"), 1000000 - total)
                 and f.get("created") == f.get("joined") == 4
                 and f.get("create_rc") == f.get("join_rc") == [0] * 4
                 and f.get("init_rc") == f.get("destroy_rc") == 0
@@ -147,8 +168,15 @@ def sequential_oracle(data, receipt):
     capture = io.StringIO()
     with contextlib.redirect_stdout(capture):
         code = check.main("sequential-control", data=data, integrity_only=True, historical=True)
-    failed = [line for line in capture.getvalue().splitlines() if line.startswith("  FAIL  I")]
-    return code == 1 and len(failed) == 2 and any("FAIL  I2 " in line for line in failed) and any("FAIL  I3 " in line for line in failed)
+    lines = capture.getvalue().splitlines()
+    failed = [line for line in lines if line.startswith("  FAIL  I")]
+    # REV-210 R1: exactly I2/I3 failing is not sufficient on its own -- those
+    # are the only two rules a real sequential run always trips, so a
+    # corrupted/missing/mismatched histogram elsewhere (reported as a
+    # "FAIL  H-input" line by check.main) must also independently reject.
+    other_fails = [line for line in lines if line.startswith("  FAIL") and line not in failed]
+    return (code == 1 and len(failed) == 2 and not other_fails
+            and any("FAIL  I2 " in line for line in failed) and any("FAIL  I3 " in line for line in failed))
 
 
 def environment():
@@ -171,12 +199,18 @@ def environment():
 
 
 def native_authorize(args):
-    auth_path, out, mode, numer, denom, revision = args
+    auth_path, out, mode, numer, denom, revision, compiled_bundle = args
     root = os.environ["NATEMU_RAW_ROOT"]
     destination = external(out, root)
     require(not destination.exists(), "result must not exist before launch")
     a = load_authorization(auth_path, mode, int(numer), int(denom))
     require(a["code_revision"] == revision, "binary built from a different revision")
+    # REV-210 R3: this is the actual compiled-source digest baked into the
+    # binary at build time (Makefile's F08_COMPILED_BUNDLE), independently of
+    # whatever environment variable it is about to be launched with. A
+    # binary compiled from dirty/unreviewed source cannot pass this even if
+    # the tree is later restored to the accepted, clean revision.
+    require(a["code_bundle_sha256"] == compiled_bundle, "compiled source-bundle digest differs from authorization")
     require(os.environ.get("NATEMU_F08_AUTH_SHA256") == file_sha(auth_path) and
             os.environ.get("NATEMU_F08_BUNDLE_SHA256") == a["code_bundle_sha256"], "native provenance environment mismatch")
     return 0
@@ -324,7 +358,7 @@ def cli(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     try:
         if argv and argv[0] == "--native-authorize":
-            require(len(argv) == 7, "native authorization arguments")
+            require(len(argv) == 8, "native authorization arguments")
             return native_authorize(argv[1:])
         if argv == ["--bundle"]:
             print(json.dumps({"files": bundle(), "sha256": digest(bundle())}, sort_keys=True, indent=2))
