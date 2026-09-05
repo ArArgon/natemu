@@ -55,11 +55,14 @@ checker that passes a `--negative` run has not been validated.
 checker matrix in `tests/control-fixtures.py`. A raw-timestamp seam shared with
 production conversion and aggregation derives the fixtures: ±1% conversion
 errors in both directions at every target; all four paired-read gap placements
-at every target; and all-wide non-vacuity failure. The C self-test also drives
-raw inversion, conversion overflow, and signed-residual overflow through that
-seam. The checker matrix covers malformed aggregate domains, the slack cap,
-both exact inclusive boundaries, and the rule that even malformed dispatch
-diagnostics are report-only. These are preflight, not evidence.
+at every target; and all-wide non-vacuity failure. Each gap case asserts its
+raw observation's exact quantized width equals the baseline width plus the
+injected 5% gap before aggregation, then retains exactly one tight baseline
+sample. The C self-test uses branch-specific error bits to prove raw inversion,
+conversion overflow, and both positive/negative signed-residual range paths
+through that seam. The checker matrix covers malformed aggregate domains, the
+slack cap, both exact inclusive boundaries, and the rule that even malformed
+dispatch diagnostics are report-only. These are preflight, not evidence.
 
 ## Fixed sample counts
 

@@ -78,14 +78,22 @@ static int mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
 	return 0;
 }
 
-static int interval_to_ns_ratio(uint64_t start, uint64_t end,
-                                uint64_t numer, uint64_t denom,
-                                uint64_t *out) {
-	if (end < start || numer == 0 || denom == 0) return -1;
+enum interval_status {
+	INTERVAL_OK = 0,
+	INTERVAL_INVERTED,
+	INTERVAL_RATIO_DOMAIN,
+	INTERVAL_OVERFLOW
+};
+
+static enum interval_status interval_to_ns_ratio(
+    uint64_t start, uint64_t end, uint64_t numer, uint64_t denom,
+    uint64_t *out) {
+	if (end < start) return INTERVAL_INVERTED;
+	if (numer == 0 || denom == 0) return INTERVAL_RATIO_DOMAIN;
 	__uint128_t value = (__uint128_t)(end - start) * numer / denom;
-	if (value > UINT64_MAX) return -1;
+	if (value > UINT64_MAX) return INTERVAL_OVERFLOW;
 	*out = (uint64_t)value;
-	return 0;
+	return INTERVAL_OK;
 }
 
 static int abs_interval_to_ns(uint64_t start, uint64_t end, uint64_t *out) {
@@ -101,34 +109,77 @@ static int derive_control_slack(uint64_t numer, uint64_t denom,
 	return mul_u64(quantum, 6, out);
 }
 
-static int diff_u64_i64(uint64_t a, uint64_t b, int64_t *out) {
+enum diff_status { DIFF_OK = 0, DIFF_POSITIVE_OVERFLOW, DIFF_NEGATIVE_OVERFLOW };
+
+static enum diff_status diff_u64_i64(uint64_t a, uint64_t b, int64_t *out) {
 	if (a >= b) {
 		uint64_t d = a - b;
-		if (d > INT64_MAX) return -1;
+		if (d > INT64_MAX) return DIFF_POSITIVE_OVERFLOW;
 		*out = (int64_t)d;
 	} else {
 		uint64_t d = b - a;
-		if (d > (uint64_t)INT64_MAX) return -1;
+		if (d > (uint64_t)INT64_MAX) return DIFF_NEGATIVE_OVERFLOW;
 		*out = -(int64_t)d;
 	}
-	return 0;
+	return DIFF_OK;
 }
 
+enum control_error {
+	CTRL_C_INVERTED = 1u << 0,
+	CTRL_INNER_INVERTED = 1u << 1,
+	CTRL_OUTER_INVERTED = 1u << 2,
+	CTRL_RATIO_DOMAIN = 1u << 3,
+	CTRL_INNER_CONVERSION_OVERFLOW = 1u << 4,
+	CTRL_OUTER_CONVERSION_OVERFLOW = 1u << 5,
+	CTRL_INNER_EXCEEDS_OUTER = 1u << 6,
+	CTRL_INDEPENDENT_ADD_OVERFLOW = 1u << 7,
+	CTRL_OUTER_ADD_OVERFLOW = 1u << 8,
+	CTRL_LOWER_POSITIVE_RANGE = 1u << 9,
+	CTRL_LOWER_NEGATIVE_RANGE = 1u << 10,
+	CTRL_UPPER_POSITIVE_RANGE = 1u << 11,
+	CTRL_UPPER_NEGATIVE_RANGE = 1u << 12
+};
+
+typedef struct {
+	uint64_t inner, independent, outer, width;
+	int64_t lower_residual, upper_residual;
+} control_observation_t;
+
 /* Evaluate one already-converted containment sample. Residuals are positive
- * exactly when their corresponding inclusive bound is violated. */
-static int control_evaluate(uint64_t inner, uint64_t independent,
-                            uint64_t outer, uint64_t slack,
-                            int64_t *lower_residual,
-                            int64_t *upper_residual, uint64_t *width) {
+ * exactly when their corresponding inclusive bound is violated. Every
+ * reachable range branch is evaluated so self-tests can identify it. */
+static unsigned control_evaluate(uint64_t inner, uint64_t independent,
+                                 uint64_t outer, uint64_t slack,
+                                 control_observation_t *observation) {
 	uint64_t independent_plus_slack, outer_plus_slack;
-	if (inner > outer ||
-	    add_u64(independent, slack, &independent_plus_slack) != 0 ||
-	    add_u64(outer, slack, &outer_plus_slack) != 0 ||
-	    diff_u64_i64(inner, independent_plus_slack, lower_residual) != 0 ||
-	    diff_u64_i64(independent, outer_plus_slack, upper_residual) != 0)
-		return -1;
-	*width = outer - inner;
-	return 0;
+	unsigned errors = 0;
+	int independent_sum_ok =
+	    add_u64(independent, slack, &independent_plus_slack) == 0;
+	int outer_sum_ok = add_u64(outer, slack, &outer_plus_slack) == 0;
+	if (inner > outer) errors |= CTRL_INNER_EXCEEDS_OUTER;
+	if (!independent_sum_ok) errors |= CTRL_INDEPENDENT_ADD_OVERFLOW;
+	if (!outer_sum_ok) errors |= CTRL_OUTER_ADD_OVERFLOW;
+	if (independent_sum_ok) {
+		enum diff_status status = diff_u64_i64(
+		    inner, independent_plus_slack, &observation->lower_residual);
+		if (status == DIFF_POSITIVE_OVERFLOW)
+			errors |= CTRL_LOWER_POSITIVE_RANGE;
+		else if (status == DIFF_NEGATIVE_OVERFLOW)
+			errors |= CTRL_LOWER_NEGATIVE_RANGE;
+	}
+	if (outer_sum_ok) {
+		enum diff_status status = diff_u64_i64(
+		    independent, outer_plus_slack, &observation->upper_residual);
+		if (status == DIFF_POSITIVE_OVERFLOW)
+			errors |= CTRL_UPPER_POSITIVE_RANGE;
+		else if (status == DIFF_NEGATIVE_OVERFLOW)
+			errors |= CTRL_UPPER_NEGATIVE_RANGE;
+	}
+	observation->inner = inner;
+	observation->independent = independent;
+	observation->outer = outer;
+	observation->width = inner <= outer ? outer - inner : 0;
+	return errors;
 }
 
 typedef struct {
@@ -148,29 +199,56 @@ static void control_stats_init(control_stats_t *s) {
 	s->min_width = UINT64_MAX;
 }
 
+static unsigned interval_error(enum interval_status status, int inner) {
+	if (status == INTERVAL_OK) return 0;
+	if (status == INTERVAL_INVERTED)
+		return inner ? CTRL_INNER_INVERTED : CTRL_OUTER_INVERTED;
+	if (status == INTERVAL_RATIO_DOMAIN) return CTRL_RATIO_DOMAIN;
+	return inner ? CTRL_INNER_CONVERSION_OVERFLOW
+	             : CTRL_OUTER_CONVERSION_OVERFLOW;
+}
+
 /* This raw-timestamp seam is shared by production and fault injection. */
-static int control_add_raw(control_stats_t *stats, control_sample_t sample,
-                           uint64_t numer, uint64_t denom, uint64_t slack,
-                           uint64_t tight_limit) {
-	uint64_t inner, outer, width;
-	int64_t lower, upper;
+static unsigned control_observe_raw(control_sample_t sample,
+                                    uint64_t numer, uint64_t denom,
+                                    uint64_t slack,
+                                    control_observation_t *observation) {
+	memset(observation, 0, sizeof *observation);
+	uint64_t inner = 0, outer = 0;
+	enum interval_status inner_status = interval_to_ns_ratio(
+	    sample.base_abs, sample.woke, numer, denom, &inner);
+	enum interval_status outer_status = interval_to_ns_ratio(
+	    sample.m0_outer, sample.m1_outer, numer, denom, &outer);
+	unsigned errors = interval_error(inner_status, 1) |
+	                  interval_error(outer_status, 0);
+	if (sample.c1 < sample.c0) errors |= CTRL_C_INVERTED;
+	if (errors) return errors;
+	return control_evaluate(inner, sample.c1 - sample.c0, outer, slack,
+	                        observation);
+}
+
+static unsigned control_add_raw(control_stats_t *stats,
+                                control_sample_t sample,
+                                uint64_t numer, uint64_t denom,
+                                uint64_t slack, uint64_t tight_limit) {
+	control_observation_t observation;
 	stats->n++;
-	if (sample.c1 < sample.c0 ||
-	    interval_to_ns_ratio(sample.base_abs, sample.woke, numer, denom,
-	                         &inner) != 0 ||
-	    interval_to_ns_ratio(sample.m0_outer, sample.m1_outer, numer, denom,
-	                         &outer) != 0 ||
-	    control_evaluate(inner, sample.c1 - sample.c0, outer, slack,
-	                     &lower, &upper, &width) != 0) {
+	unsigned errors = control_observe_raw(sample, numer, denom, slack,
+	                                      &observation);
+	if (errors) {
 		stats->invalid++;
-		return -1;
+		return errors;
 	}
 	stats->valid++;
-	if (lower > 0 || upper > 0) stats->violations++;
-	if (lower > stats->max_lower_residual) stats->max_lower_residual = lower;
-	if (upper > stats->max_upper_residual) stats->max_upper_residual = upper;
-	if (width < stats->min_width) stats->min_width = width;
-	if (width <= tight_limit) stats->tight++;
+	if (observation.lower_residual > 0 || observation.upper_residual > 0)
+		stats->violations++;
+	if (observation.lower_residual > stats->max_lower_residual)
+		stats->max_lower_residual = observation.lower_residual;
+	if (observation.upper_residual > stats->max_upper_residual)
+		stats->max_upper_residual = observation.upper_residual;
+	if (observation.width < stats->min_width)
+		stats->min_width = observation.width;
+	if (observation.width <= tight_limit) stats->tight++;
 	return 0;
 }
 
@@ -257,6 +335,15 @@ static int synthetic_stats(enum synthetic_kind kind, uint64_t target_ns,
 		} else {
 			return -1;
 		}
+		control_observation_t base_observation, gap_observation;
+		uint64_t expected_width;
+		if (control_observe_raw(base, numer, denom, slack,
+		                        &base_observation) != 0 ||
+		    control_observe_raw(sample, numer, denom, slack,
+		                        &gap_observation) != 0 ||
+		    add_u64(base_observation.width, gap_ns, &expected_width) != 0 ||
+		    gap_observation.width != expected_width)
+			return -1;
 	}
 	long first = kind >= SYN_GAP_M0_C0 && kind <= SYN_GAP_C1_M1 ? 1 : 0;
 	for (long i = first; i < 2000; i++)
@@ -337,34 +424,48 @@ static int control_selftest(void) {
 		    control_width(&stats) <= t / 200)
 			return 1;
 	}
-	int64_t lower, upper;
-	uint64_t width;
-	if (control_evaluate(1000, 748, 1000, 252,
-	                     &lower, &upper, &width) != 0 ||
-	    lower != 0 || upper > 0)
+	control_observation_t observation;
+	if (control_evaluate(1000, 748, 1000, 252, &observation) != 0 ||
+	    observation.lower_residual != 0 ||
+	    observation.upper_residual > 0)
 		return 1;
-	if (control_evaluate(1000, 1252, 1000, 252,
-	                     &lower, &upper, &width) != 0 ||
-	    lower > 0 || upper != 0)
+	if (control_evaluate(1000, 1252, 1000, 252, &observation) != 0 ||
+	    observation.lower_residual > 0 ||
+	    observation.upper_residual != 0)
 		return 1;
 	/* Raw inversion, conversion overflow, and signed-residual overflow all
 	 * reach the same production seam and are recorded invalid. */
 	control_stats_t stats;
 	control_sample_t bad = synthetic_sample(100000);
 	control_stats_init(&stats);
-	bad.m1_outer = bad.m0_outer;
-	if (control_add_raw(&stats, bad, 125, 3, 252, 500) == 0 ||
+	bad.m0_outer = bad.m1_outer + 1;
+	unsigned errors = control_add_raw(&stats, bad, 125, 3, 252, 500);
+	if ((errors & CTRL_OUTER_INVERTED) == 0 ||
 	    stats.invalid != 1)
 		return 1;
 	control_stats_init(&stats);
 	bad = synthetic_sample(100000);
 	bad.m1_outer = UINT64_MAX;
-	if (control_add_raw(&stats, bad, UINT32_MAX, 1, 252, 500) == 0 ||
+	errors = control_add_raw(&stats, bad, UINT32_MAX, 1, 252, 500);
+	if ((errors & CTRL_OUTER_CONVERSION_OVERFLOW) == 0 ||
+	    stats.invalid != 1)
+		return 1;
+	/* Both range helpers are evaluated even when the first one fails. The two
+	 * samples reverse which residual is the large positive direction. */
+	control_stats_init(&stats);
+	bad = (control_sample_t){0, 0, 0, (uint64_t)INT64_MAX + 2,
+	                         0, (uint64_t)INT64_MAX + 2};
+	errors = control_add_raw(&stats, bad, 1, 1, 1, 500);
+	if ((errors & CTRL_LOWER_POSITIVE_RANGE) == 0 ||
+	    (errors & CTRL_UPPER_NEGATIVE_RANGE) == 0 ||
 	    stats.invalid != 1)
 		return 1;
 	control_stats_init(&stats);
-	bad = (control_sample_t){0, 0, 0, UINT64_MAX, 0, UINT64_MAX};
-	if (control_add_raw(&stats, bad, 1, 1, 1, 500) == 0 ||
+	bad = (control_sample_t){0, 0, 0, 0,
+	                         (uint64_t)INT64_MAX + 2, 0};
+	errors = control_add_raw(&stats, bad, 1, 1, 1, 500);
+	if ((errors & CTRL_LOWER_NEGATIVE_RANGE) == 0 ||
+	    (errors & CTRL_UPPER_POSITIVE_RANGE) == 0 ||
 	    stats.invalid != 1)
 		return 1;
 	return 0;
