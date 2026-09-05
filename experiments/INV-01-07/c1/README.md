@@ -1,14 +1,14 @@
 # M07-C1 clock-instrument implementation
 
-Status: method accepted by REV-194; the complete producer/runner/gate packet
-is frozen and self-reviewed at REV-195. Independent critique REV-196 found
-the earlier draft incomplete (`revise`; R1 closed, R2 open); this packet
-closes R2. Independent return review REV-219 against REV-196 must accept
-before native execution is authorized. **No native execution or evidence
-collection is authorized by this directory.** These Python modules, the
-compiled-but-unexecuted producer, and synthetic tests are not a clock
-finding, an accepted instrument, or full Q07 completion. No historical timer
-entry point is reused.
+Status: method accepted by REV-194; the producer/runner/gate packet was
+self-reviewed at REV-195 (closing REV-196 R2) and then returned independently
+at REV-219 (`revise`; five required changes R1-R5). This packet closes
+R1-R5 and is self-reviewed at REV-236. Independent return review REV-237
+against REV-219 must accept before native execution is authorized.
+**No native execution or evidence collection is authorized by this
+directory.** These Python modules, the compiled-but-unexecuted producer, and
+synthetic tests are not a clock finding, an accepted instrument, or full Q07
+completion. No historical timer entry point is reused.
 
 ## Implemented layers
 
