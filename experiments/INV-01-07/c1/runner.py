@@ -57,7 +57,7 @@ dirty-reviewed-scope uncommitted-review-or-method review-hash review-id
 review-not-accepted review-independence gate-location gate-fields gate-status
 gate-reviews revision-changed reviewed-source-mismatch method-changed
 independent-return-fields independent-return-review-id independent-return-file
-independent-return-not-against-critique
+independent-return-not-against-critique independent-return-type independent-return-subject
 build-manifest-hash build-fields build-status-or-source build-artifact-inventory
 build-artifact-path build-artifact-hash build-header-inventory sdk-header-changed
 producer-not-executable unresolved-revision unresolved-repository git-command-failed
@@ -188,8 +188,12 @@ def source_files():
     return result
 
 
-def clean_scope():
-    paths = [SOURCE_PREFIX, METHOD_PATH, *REVIEWS.values()]
+def clean_scope(extra_paths=()):
+    """`extra_paths` covers gate-supplied files not known at import time (the
+    independent return review, whose number/path are assigned per cycle) so
+    a campaign cannot collect while its own authorising review is an
+    untracked or otherwise dirty working-tree file."""
+    paths = [SOURCE_PREFIX, METHOD_PATH, *REVIEWS.values(), *extra_paths]
     require(git("status", "--porcelain=v1", "-z", "--untracked-files=all", "--", *paths) == "",
             "dirty-reviewed-scope")
     for path in paths[1:]:
@@ -221,10 +225,10 @@ def receipt(text, label, value):
     require(matches == [value], "review-receipt:" + label)
 
 
-def independent_return_record(entry):
-    """The independent RETURN review (against the fixed critique196) gets a
-    new number each cycle, so its id/file/verdict/independence are supplied
-    by the gate JSON itself and independently re-verified here, not assumed."""
+def independent_return_shape(entry):
+    """Structural checks only (no disk read): derives (number, file) so
+    `load_gate` can fold the gate-supplied review path into `clean_scope()`
+    before trusting its content."""
     cells.fields(entry, ("review_id", "file", "sha256", "expected_verdict", "independence"),
                  "independent-return-fields")
     number = entry["review_id"]
@@ -234,8 +238,23 @@ def independent_return_record(entry):
             "independent-return-file")
     require(entry["expected_verdict"] == "accept", "independent-return-fields")
     require(entry["independence"] == "independent", "independent-return-fields")
-    text = review_record(REPOSITORY / entry["file"], number, entry["sha256"],
+    return number, entry["file"]
+
+
+def independent_return_record(entry):
+    """The independent RETURN review (against the fixed critique196) gets a
+    new number each cycle, so its id/file/verdict/independence are supplied
+    by the gate JSON itself and independently re-verified here, not assumed.
+    It must also be a `code` review of this exact subject: nothing else pins
+    its type/subject, since (unlike reviews193-196) its number is not fixed."""
+    number, file = independent_return_shape(entry)
+    text = review_record(REPOSITORY / file, number, entry["sha256"],
                          independent=True, verdict="accept")
+    require(len(re.findall(r"^- Review type:\s*`code`(?:[.\s]|$)", text, re.M)) == 1,
+            "independent-return-type")
+    subject = re.search(r"^- Subject ID\(s\)[^\n]*:(.*?)(?=\n- |\n\n|\Z)", text, re.M | re.S)
+    require(subject is not None and "INV-01-07" in subject.group(1)
+            and "M07-C1" in subject.group(1), "independent-return-subject")
     require("REV-" + CRITIQUE_REVIEW in text, "independent-return-not-against-critique")
     return text
 
@@ -251,7 +270,8 @@ def load_gate(path, root):
                  "gate-fields")
     require(gate["schema"] == GATE_SCHEMA and gate["required_changes_closed"] is True,
             "gate-status")
-    clean_scope()
+    _, return_file = independent_return_shape(gate["independent_return"])
+    clean_scope(extra_paths=(return_file,))
     require(gate["revision"] == revision(), "revision-changed")
     current_sources = source_files()
     require(gate["source_files"] == current_sources, "reviewed-source-mismatch")

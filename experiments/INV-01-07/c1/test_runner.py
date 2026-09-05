@@ -130,10 +130,13 @@ class RunnerTests(unittest.TestCase):
         self.invalid("review-receipt:C1 source SHA-256", runner.receipt,
                      receipt + receipt, "C1 source SHA-256", "a" * 64)
 
-    def write_review(self, number, *, independent, verdict, mentions=()):
+    def write_review(self, number, *, independent, verdict, mentions=(),
+                     review_type="code", subject="`INV-01-07` M07-C1 clock producer"):
         reviews = self.repo / "docs/research/reviews"
         reviews.mkdir(parents=True, exist_ok=True)
         text = (f"# Synthetic REV-{number}\n- Review ID: `REV-{number}`\n"
+                f"- Review type: `{review_type}`\n"
+                f"- Subject ID(s): {subject}\n"
                 f"- Independence: `{'independent' if independent else 'self'}`\n"
                 f"- Verdict: `{verdict}`.\n" + "".join(f"{line}\n" for line in mentions))
         path = reviews / f"REV-{number}.md"
@@ -141,7 +144,8 @@ class RunnerTests(unittest.TestCase):
         return hashlib.sha256(text.encode()).hexdigest()
 
     def gate_fixture(self, *, return_number="219", return_independent=True,
-                     return_verdict="accept", mentions_critique=True):
+                     return_verdict="accept", mentions_critique=True,
+                     return_type="code", return_subject="`INV-01-07` M07-C1 clock producer"):
         # A fresh subtree per call: tests exercise gate_fixture() repeatedly
         # against the same self.raw external root.
         unique = self.raw / hashlib.sha256(os.urandom(16)).hexdigest()[:12]
@@ -163,7 +167,8 @@ class RunnerTests(unittest.TestCase):
                            "- C1 build SHA-256: `" + "f" * 64 + "`",
                            "- C1 method SHA-256: `" + "d" * 64 + "`")
         return_hash = self.write_review(return_number, independent=return_independent,
-                                        verdict=return_verdict, mentions=return_mentions)
+                                        verdict=return_verdict, mentions=return_mentions,
+                                        review_type=return_type, subject=return_subject)
         gate = {"schema": runner.GATE_SCHEMA, "revision": "c" * 40, "source_files": sources,
                 "method_sha256": "d" * 64, "reviews": {key: "e" * 64 for key in runner.REVIEWS},
                 "independent_return": {"review_id": return_number,
@@ -268,11 +273,56 @@ class RunnerTests(unittest.TestCase):
                      {"review_id": "219", "file": "docs/research/reviews/REV-999.md",
                       "sha256": "a" * 64, "expected_verdict": "accept", "independence": "independent"})
 
+        # R4: the return review's own `Review type`/`Subject ID(s)` lines are
+        # bound. Reproduction from REV-219: a `method` review of an unrelated
+        # investigation (INV-01-18) must not load as this packet's code
+        # return, even though it is independent, accepting, and mentions the
+        # critique it is (falsely) claimed to return against.
+        fixture = self.gate_fixture(return_type="method",
+                                    return_subject="`INV-01-18` F18 harness")
+        path, gate, build, sources, unused = fixture
+        with self.gate_mocks(fixture):
+            self.invalid("independent-return-type", runner.load_gate, str(path), self.raw)
+
+        fixture = self.gate_fixture(return_subject="`INV-01-18` F18 harness")
+        path, gate, build, sources, unused = fixture
+        with self.gate_mocks(fixture):
+            self.invalid("independent-return-subject", runner.load_gate, str(path), self.raw)
+
+    def test_load_gate_includes_independent_return_review_in_clean_scope(self):
+        # R5: clean_scope() used to cover only the four fixed reviews, so the
+        # gate-supplied return review could be an uncommitted working-tree
+        # file at collection. load_gate must fold its resolved path into the
+        # same clean/committed scope check.
+        fixture = self.gate_fixture(return_number="219")
+        path, gate, build, sources, unused = fixture
+        with self.gate_mocks(fixture):
+            runner.load_gate(str(path), self.raw)
+            runner.clean_scope.assert_called_once_with(
+                extra_paths=("docs/research/reviews/REV-219.md",))
+
     def test_dirty_or_uncommitted_scope_refuses(self):
         with mock.patch.object(runner, "git", return_value=" M experiments/INV-01-07/c1/core.py\0"):
             self.invalid("dirty-reviewed-scope", runner.clean_scope)
         with mock.patch.object(runner, "git", side_effect=["", "wrong-path"]):
             self.invalid("uncommitted-review-or-method", runner.clean_scope)
+
+        # The gate-supplied independent-return review must be in scope too.
+        extra = "docs/research/reviews/REV-219.md"
+
+        def dirty_because_extra(*args):
+            self.assertIn(extra, args)
+            return " M " + extra + "\0"
+        with mock.patch.object(runner, "git", side_effect=dirty_because_extra):
+            self.invalid("dirty-reviewed-scope", runner.clean_scope, extra_paths=(extra,))
+
+        def clean_status_but_extra_untracked(*args):
+            if args[0] == "status":
+                return ""
+            queried = args[-1]
+            return queried if queried != extra else "wrong-path"
+        with mock.patch.object(runner, "git", side_effect=clean_status_but_extra_untracked):
+            self.invalid("uncommitted-review-or-method", runner.clean_scope, extra_paths=(extra,))
 
     def fake_launch(self, output, returncode=0, wait_effect=None):
         def launch(argv, **kwargs):

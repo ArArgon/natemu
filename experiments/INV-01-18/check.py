@@ -2,6 +2,19 @@
 
 Two passes deliberately tolerate collector interleaving between actor streams.
 Actor sequence numbers are local order, never a global timestamp/SC-order proof.
+
+Bound (REV-200 R2): retirement-before-execution is enforced only by the
+in-process state read at admission time (protocol.c:410, mirrored here as
+RETIRED_ADMISSION) and by per-page version floors (STALE_ADMISSION). This
+streamed checker has no cross-actor invariant relating a coordinator `retire`
+record to a reader's later `admit`/`call` records of the same token -- doing
+so soundly would need genuine cross-actor ordering evidence (e.g. a per-page
+admission index tied to the retiring epoch), which is a method/instrumentation
+change, not a checker fix, and is not implemented here. A native lifetime
+violation whose reader loaded `life` before the retiring store is therefore
+not detectable by this checker. See README.md's pressure/retirement section
+for the same bound and tests.py's `retired_before_admit_is_undetected`
+characterization fixture for what is and is not rejected.
 """
 import collections
 import json
@@ -371,6 +384,25 @@ def check(path, job):
     scratch_count=2 if pressure=="near-full" else 0
     replacement_count=int(pressure=="near-full" and header["arm"] not in "SM")
     setup_publications=held_count+replacement_count
+    # R1: the cap plan is re-derived from data the checker already holds, not
+    # merely self-reported. tokens/request_cap follow protocol.c:1028-1034's
+    # formula exactly from header/job fields; a falsified plan (e.g. tokens
+    # collapsed to 1 against a much larger actual descriptor count) is caught
+    # by the exact-equality and actual-usage checks below regardless of what
+    # `bytes` claims. `bytes` itself depends on compiled Trace/Worker struct
+    # layout (padding, pointer size) that this checker deliberately does not
+    # hardcode -- it is instead cross-checked against the independently
+    # emitted setup-plan record and lower-bounded by the already-validated
+    # per-token/per-request sizes, which is enough to reject an inconsistent
+    # or undersized plan without duplicating fragile ABI-specific arithmetic.
+    total_plan = expected_warmup + expected_publications + 16
+    expected_tokens = total_plan*owners + held_count + scratch_count + replacement_count + 1
+    expected_request_cap = total_plan*3 + 16 + 2*held_count + 2*replacement_count
+    require(allocation[0] == expected_tokens, "ALLOCATION_PLAN_TOKENS")
+    require(allocation[1] == expected_request_cap, "ALLOCATION_PLAN_REQUEST_CAP")
+    require(allocation[0] >= complete[4] and allocation[1] >= complete[5], "ALLOCATION_PLAN_UNDERCOUNTS")
+    require(setup_plan is not None and setup_plan[4] == allocation[2], "ALLOCATION_PLAN_INCONSISTENT")
+    require(allocation[2] >= allocation[0]*allocation[4] + allocation[1]*allocation[5], "ALLOCATION_PLAN_BYTES_UNDERCOUNTS")
     require(len(published)==(expected_warmup+expected_publications+2)*owners+setup_publications, "PUBLICATION_COUNT")
     require(not (published & scratch_reserved.keys()) and not (built & scratch_reserved.keys()), "SCRATCH_ACQUIRED_EXECUTION_RIGHT")
     if pressure!="normal":
@@ -429,6 +461,12 @@ def check(path, job):
             resumed_epochs[actor]=v[0]
         elif kind == "admit":
             require(actor in expected_workers and actor not in pending, "ADMISSION_IDENTITY")
+            # Bound (module docstring, R2): this rejects only an admission whose
+            # OWN recorded native state field already reads RETIRED/DISCARDED.
+            # It cannot detect that this token's `retire` record precedes this
+            # admission in real time -- actor-local sequence is not a global
+            # order -- so a fabricated early `retire` ahead of genuine later
+            # admissions of the same token is not caught here.
             require(v[0] in descriptors and v[1] in (2,3), "RETIRED_ADMISSION")
             slot,version,owner,page = descriptors[v[0]]
             require(page == v[3] and version >= v[4], "STALE_ADMISSION")

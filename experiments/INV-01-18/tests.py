@@ -6,12 +6,13 @@ do not execute native code, allocate executable memory, or start threads.
 import collections
 import copy
 import json
+import os
 from pathlib import Path
 import signal
 import tempfile
 
 from check import Invalid, check, clock_result, instruction_words, pair
-from run import negative_result,protection_result
+from run import HERE, REPO, command, negative_result, protection_result
 
 
 def protection_fixture(arm,pages,control):
@@ -49,7 +50,11 @@ def fixture(arm="I"):
     streams=collections.defaultdict(list)
     def emit(actor,kind,*values):
         streams[actor].append(dict(kind=kind,actor=actor,seq=len(streams[actor]),v=list(values)+[0]*(6-len(values))))
-    emit(0,"allocation-plan",100,100,10000,256<<20,24,16)
+    # tokens/request_cap follow check.py's re-derivation of protocol.c's
+    # formula for n=1, pressure=normal, control mode (warmup=4,publications=32):
+    # total=4+32+16=52; tokens=52*1+1=53; request_cap=52*3+16=172.
+    emit(0,"allocation-plan",53,172,10000,256<<20,24,16)
+    emit(0,"setup-plan",0,0,0,0,10000,0)
     emit(0,"participants",1,1,1,0,0,0)
     for actor in (0,1,12): emit(actor,"qos",21,21,0)
     versions=[1,1]; current=[0,0]; nonces={}; epoch=0; token=0
@@ -122,6 +127,206 @@ def fixture(arm="I"):
     return job,[header]+streams[0]+streams[1]+streams[12]
 
 
+def pressure_fixture(pressure="near-full"):
+    """R5: synthetic M18-P1 pressure-mode trace, arm I only. tests.py otherwise
+    emits only pressure="normal" jobs, so check.py's ~55 near-full/fragmented
+    lines (check.py:191-215, :366-397, added by REV-214) ship with zero
+    fixture coverage. Reuses REV-200's own minimal topology: a 2 MiB header
+    page size gives slot_count=4, H={3} (near-full and fragmented coincide at
+    this size), actives at slots {0,1}, scratch at slot 2.
+
+    Not covered here (disclosed gap, REV-226): S/M's in-place no-replacement
+    branch and V's owner-transfer branch. Only arm I's near-full-with-
+    replacement and fragmented-without-replacement paths are exercised.
+    """
+    arm="I"
+    page_size=2*1024*1024
+    job=dict(cell="pressure-fixture",mode="preflight",kind="preflight",n=1,seed=18001,
+             arm=arm,signing="A",size=64,rate=1,pressure=pressure)
+    header=dict(kind="header",investigation="INV-01-18",method="M18-2",page_size=page_size,
+                numer=125,denom=3,code_offset=0,**{k:job[k] for k in ("cell","mode","n","seed","signing","size")},arm=arm[0])
+    streams=collections.defaultdict(list)
+    def emit(actor,kind,*values):
+        streams[actor].append(dict(kind=kind,actor=actor,seq=len(streams[actor]),v=list(values)+[0]*(6-len(values))))
+
+    slots=(16<<20)//(2*page_size)                     # 4
+    owners=1
+    H=sorted(s for s in range(2*owners+1,slots) if pressure=="near-full" or (pressure=="fragmented" and s%2))
+    scratch_count=2 if pressure=="near-full" else 0
+    replacement=pressure=="near-full"                 # arm I is not in "SM"
+    held_count=len(H)
+    setup_publications=held_count+int(replacement)
+    total_plan=4+32+16                                # control-mode warmup+publications+16
+    tokens_plan=total_plan*owners+held_count+scratch_count+int(replacement)+1
+    request_cap_plan=total_plan*3+16+2*held_count+2*int(replacement)
+    bytes_plan=tokens_plan*24+request_cap_plan*16+50000
+
+    emit(0,"allocation-plan",tokens_plan,request_cap_plan,bytes_plan,256<<20,24,16)
+    emit(0,"participants",1,1,1,0,0,0)
+    for actor in (0,1,12): emit(actor,"qos",21,21,0)
+    emit(0,"setup-plan",held_count,scratch_count,int(replacement),2*held_count+2*int(replacement),bytes_plan,0)
+
+    versions=[1,1]; current=[0,0]; nonces={}; epoch=0; token=0; floors=[0,0]
+    slot_of={}; page_slot=[0,1]
+
+    def request(page):
+        nonlocal epoch
+        epoch+=1
+        emit(0,"request",epoch,page,versions[page],0)
+        emit(0,"all-ack",epoch,page,versions[page],0)
+        emit(1,"ack",epoch,page,versions[page])
+        floors[page]=versions[page]
+
+    def publish(page):
+        nonlocal token
+        slot=page_slot[page]; prior=current[page]
+        token+=1; nonce=0
+        if prior:
+            previous=pair(prior,job["seed"],nonces[prior])
+            while any((a>>(16*h))&65535 == (b>>(16*h))&65535
+                      for a,b in zip(previous,pair(token,job["seed"],nonce)) for h in range(4)):
+                nonce+=1
+            emit(0,"retire",prior,page,epoch)
+            emit(0,"reuse",prior,token,slot)
+        nonces[token]=nonce; slot_of[token]=slot
+        emit(0,"descriptor",token,slot,versions[page],0,page,nonce)
+        x,y=pair(token,job["seed"],nonce)
+        emit(0,"built",token,page,versions[page],0,x,y)
+        if token<=2:
+            for index,word in instruction_words((x,y),64,False).items():
+                emit(0,"code-word",token,index,word)
+        emit(0,"publish",token,page,0,prior,versions[page])
+        current[page]=token
+        return token,x,y
+
+    def call_once(t,x,y,page):
+        emit(1,"admit",t,2,epoch,page,floors[page],t)
+        emit(1,"call",t,versions[page],x,y,1,slot_of[t])
+
+    # --- M18-P1 pressure prefix: populate H one member at a time ---
+    emit(0,"stage",1,0,0,0,0,0)
+    h_tokens=[]
+    for slot in H:
+        token+=1; t=token; nonce=0
+        nonces[t]=nonce; slot_of[t]=slot
+        emit(0,"descriptor",t,slot,versions[0],0,0,nonce)
+        x,y=pair(t,job["seed"],nonce)
+        emit(0,"built",t,0,versions[0],0,x,y)
+        emit(0,"publish",t,0,0,0,versions[0])
+        current[0]=t
+        call_once(t,x,y,0)
+        emit(0,"setup-call-witness",t,0,0,1,0,0)
+        versions[0]+=1
+        emit(0,"invalidate-start",0,versions[0],versions[1])
+        request(0)
+        emit(0,"invalidate-complete",0,versions[0],epoch,versions[1],versions[1])
+        emit(0,"retire",t,slot,epoch,0,0,0)
+        emit(0,"pressure-hold",t,slot,0,0,0,0)
+        current[0]=0
+        h_tokens.append(t)
+    emit(0,"stage",2,held_count,held_count,epoch,0,0)
+
+    # --- ordinary bootstrap actives (slots 0 and 1) ---
+    t2,x2,y2=publish(0); call_once(t2,x2,y2,0)
+    t3,x3,y3=publish(1); call_once(t3,x3,y3,1)
+
+    # --- pressure_diagnostic: allocator-only scratch dance + genuine swap ---
+    if pressure=="near-full":
+        scratch_slot=2*owners
+        token+=1; s1=token; nonce=0
+        nonces[s1]=nonce; slot_of[s1]=scratch_slot
+        emit(0,"descriptor",s1,scratch_slot,versions[0],0,0,nonce)
+        emit(0,"scratch-reserve",s1,scratch_slot,1,0,0,0)
+        emit(0,"allocator-reject",s1,scratch_slot,0,1,0,0)
+        emit(0,"scratch-discard",s1,scratch_slot,0,0,0,0)
+
+        token+=1; s2=token; nonce=0
+        nonces[s2]=nonce; slot_of[s2]=scratch_slot
+        emit(0,"descriptor",s2,scratch_slot,versions[0],0,0,nonce)
+        emit(0,"scratch-reserve",s2,scratch_slot,2,0,0,0)
+        emit(0,"allocator-reject",s2,scratch_slot,0,1,0,0)
+        emit(0,"scratch-reuse",s1,s2,scratch_slot,0,0,0)
+
+        if replacement:
+            released=h_tokens[0]; old_active=current[0]
+            token+=1; new=token; nonce=0
+            previous=pair(released,job["seed"],nonces[released])
+            while any((a>>(16*h))&65535 == (b>>(16*h))&65535
+                      for a,b in zip(previous,pair(new,job["seed"],nonce)) for h in range(4)):
+                nonce+=1
+            nonces[new]=nonce; slot_of[new]=slot_of[released]
+            emit(0,"backpressure",new,slots,0,0,0,0)
+            emit(0,"pressure-release",released,slot_of[released],new,0,0,0)
+            emit(0,"reuse",released,new,slot_of[released],0,0,0)
+            emit(0,"descriptor",new,slot_of[released],versions[0],0,0,nonce)
+            xn,yn=pair(new,job["seed"],nonce)
+            emit(0,"built",new,0,versions[0],0,xn,yn)
+            emit(0,"publish",new,0,0,old_active,versions[0])
+            current[0]=new; page_slot[0]=slot_of[new]
+            call_once(new,xn,yn,0)
+            emit(0,"setup-call-witness",new,0,0,1,0,0)
+            emit(0,"retire",old_active,slot_of[old_active],epoch,0,0,0)
+            emit(0,"pressure-hold",old_active,slot_of[old_active],1,0,0,0)
+            emit(0,"pressure-swap",released,new,old_active,0,s2,0)
+        emit(0,"scratch-discard",s2,scratch_slot,0,0,0,0)
+
+    # --- final per-slot layout, exactly the slots this fixture ever touches ---
+    if pressure=="near-full":
+        layout={0:(old_active,1,4),1:(t3,0,2),2:(0,0,0),3:(new,0,2)}
+    else:
+        layout={0:(t2,0,2),1:(t3,0,2),2:(0,0,0),3:(h_tokens[0],1,4)}
+    for s in range(slots):
+        t,held,life=layout[s]
+        emit(0,"pressure-layout",s,t,held,life,0,0)
+    emit(0,"setup-summary",held_count,setup_publications,scratch_count,epoch,1,0)
+    emit(0,"stage",5,0,0,0,0,0)
+
+    # --- unchanged warmup/stress: 36 rounds, alternating pages ---
+    backing=[1,2]
+    for round_number in range(36):
+        page=round_number%2; kind=round_number%4
+        before=backing[page]; backing[page]+=int(kind==2)
+        emit(0,"guest-stimulus",round_number+1,kind,page,before,backing[page],int(kind==1))
+        if kind==1:
+            emit(1,"stimulus-worker",round_number+1,page,round_number,round_number+1,0)
+        versions[page]+=1
+        emit(0,"invalidate-start",page,versions[page],versions[page^1])
+        request(page)
+        emit(0,"invalidate-complete",page,versions[page],epoch,versions[page^1],versions[page^1])
+        publish(page)
+        emit(0,"round",round_number,page,int(round_number>=4))
+        emit(0,"retention",round_number,0,0,0)
+    for index in range(128):
+        page=index%2; t=current[page]
+        x,y=pair(t,job["seed"],nonces[t])
+        call_once(t,x,y,page)
+    setup_calls=held_count+int(pressure=="near-full" and replacement)
+    total_calls=setup_calls+2+128
+    emit(0,"stress-begin",0,0,4)
+    emit(1,"worker-done",total_calls,epoch)
+    emit(0,"complete",4,32,128,1,token,epoch)
+    return job,[header]+streams[0]+streams[1]+streams[12]
+
+
+def git_cwd_regression():
+    """R3: run.command() must resolve git relative to REPO, never the caller's
+    cwd -- otherwise `git status --porcelain -- <nested path>` run from a
+    different directory can silently miss a dirty packet (fail open) or raise
+    an unhandled error. Proves the fix by making a real untracked file dirty
+    the packet, then calling command() from an unrelated directory."""
+    scratch=HERE/".rev226_r3_scratch_dirty"
+    scratch.write_text("temporary untracked marker for the REV-226 R3 regression check\n")
+    previous=os.getcwd()
+    try:
+        os.chdir(tempfile.gettempdir())
+        assert command(["git","rev-parse","--show-toplevel"])==str(REPO), "producing_revision must resolve to the reviewed repo regardless of caller cwd"
+        changed=command(["git","status","--porcelain","--",str(HERE)])
+        assert scratch.name in changed, "dirty packet file must be detected regardless of caller cwd"
+    finally:
+        os.chdir(previous)
+        scratch.unlink()
+
+
 def main():
     checks=0
     protection_checks=0
@@ -140,6 +345,22 @@ def main():
             checks+=1
         for arm in ("I","S","E","V","M-data-map","M-data-protect","M-jit-protect"):
             job,rows=fixture(arm); execute(job,rows)
+        for pressure_mode in ("near-full","fragmented"):
+            job,rows=pressure_fixture(pressure_mode); execute(job,rows)
+        job,rows=pressure_fixture("near-full")
+        for kind,column,value,expected in [
+                ("allocator-reject",3,0,"ALLOCATOR_REJECTION_CAUSE"),
+                ("setup-plan",0,2,"SETUP_CAP_ACCOUNTING"),
+                ("pressure-hold",2,0,"PRESSURE_HOLD_BEFORE_CALL_WITNESS")]:
+            changed=copy.deepcopy(rows)
+            matches=[row for row in changed if row["kind"]==kind]
+            matches[-1]["v"][column]=value
+            execute(job,changed,expected)
+        changed=copy.deepcopy(rows)
+        changed.pop(max(i for i,row in enumerate(changed) if row["kind"]=="allocator-reject"))
+        seq=collections.Counter()
+        for row in changed[1:]: row["seq"]=seq[row["actor"]]; seq[row["actor"]]+=1
+        execute(job,changed,"NEAR_FULL_REJECTION_AND_RESTORE")
         job,rows=fixture()
         mutations=[("call",2,0,"CALL_GENERATION"), ("admit",1,4,"RETIRED_ADMISSION"),
                    ("admit",4,99,"STALE_ADMISSION"), ("admit",5,0,"I_UNPROTECTED_ADMISSION"),
@@ -147,6 +368,11 @@ def main():
                    ("code-word",2,0,"CODE_INSTRUCTIONS"), ("allocation-plan",2,300<<20,"ALLOCATION_CAP"),
                    ("worker-done",0,127,"CALL_FLOOR"), ("invalidate-complete",4,99,"UNRELATED_PAGE_INVALIDATED")]
         mutations.append(("stress-begin",1,1,"POST_WARMUP_CALL_FLOOR"))
+        # R1/REV-200 M4b: a falsified allocation-plan (tokens collapsed to 1
+        # against the real 42-descriptor trace) must be rejected, not merely
+        # checked against its own self-reported cap.
+        mutations.append(("allocation-plan",0,1,"ALLOCATION_PLAN_TOKENS"))
+        mutations.append(("setup-plan",4,1,"ALLOCATION_PLAN_INCONSISTENT"))
         for kind,column,value,expected in mutations:
             changed=copy.deepcopy(rows)
             next(row for row in changed if row["kind"]==kind)["v"][column]=value
@@ -173,6 +399,23 @@ def main():
         seq=collections.Counter()
         for row in changed[1:]: row["seq"]=seq[row["actor"]]; seq[row["actor"]]+=1
         execute(job,changed,"ADMISSION_BEFORE_RESUME")
+        # R2/REV-200 M3 characterization: a well-formed `retire` record for the
+        # live page-0 token, inserted before its first admission, is currently
+        # ACCEPTED -- documenting the disclosed bound (module docstring, R2)
+        # rather than a live defect. `check.py:432`'s RETIRED_ADMISSION check
+        # only reads the admission's OWN recorded state field; it has no
+        # cross-actor invariant relating this `retire` record to the many
+        # ordinary admissions/calls of the same token that follow it in the
+        # trace. If this ever starts being rejected, update this fixture and
+        # the docstring/README bound it documents together.
+        job,rows=fixture("I")
+        changed=copy.deepcopy(rows)
+        live_token=next(row["v"][0] for row in reversed(changed) if row["kind"]=="publish" and row["v"][1]==0)
+        first_admit=next(i for i,row in enumerate(changed) if row["kind"]=="admit" and row["v"][0]==live_token)
+        changed.insert(first_admit,dict(kind="retire",actor=0,seq=0,v=[live_token,0,0,0,0,0]))
+        seq=collections.Counter()
+        for row in changed[1:]: row["seq"]=seq[row["actor"]]; seq[row["actor"]]+=1
+        execute(job,changed)
         def protection_test(job,rows,status,invalid=False):
             nonlocal protection_checks
             path.write_text("".join(json.dumps(row)+"\n" for row in rows))
@@ -220,7 +463,8 @@ def main():
     assert not negative_result(job,timeout,{},"unrelated failure")
     assert negative_result(job,timeout,{},"INV18 NEGATIVE 8 token=1 detail=0\n")
     assert not negative_result(job,dict(timeout,timed_out=False),{},"INV18 NEGATIVE 8 token=1 detail=0\n")
-    print(json.dumps(dict(kind="synthetic-fixtures",evidence=False,trace_checks=checks,protection_checks=protection_checks,clock_cases=6,negative_classification_cases=3)))
+    git_cwd_regression()
+    print(json.dumps(dict(kind="synthetic-fixtures",evidence=False,trace_checks=checks,protection_checks=protection_checks,clock_cases=6,negative_classification_cases=3,git_cwd_cases=1)))
 
 
 if __name__=="__main__": main()

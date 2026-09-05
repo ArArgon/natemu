@@ -36,7 +36,7 @@ def sha(path):
 
 
 def command(args):
-    return subprocess.check_output(args,text=True,stderr=subprocess.STDOUT).strip()
+    return subprocess.check_output(args,text=True,stderr=subprocess.STDOUT,cwd=REPO).strip()
 
 
 def raw_root():
@@ -129,14 +129,38 @@ def qualify(campaigns,output,sources):
     print(output)
 
 
-def review_gate(path,expected,kind):
+def review_gate(path,expected,kind,review_id=None,reviewer=None,cites=None):
     text=Path(path).read_text()
     review_type="code" if kind=="code" else "result"
     if (not re.search(r"^- Verdict: `accept`\.?\s*$",text,re.M) or
         not re.search(r"^- Independence: `independent`\.?\s*$",text,re.M) or
         not re.search(rf"^- Review type: `{review_type}`\s*$",text,re.M) or expected not in text):
         raise SystemExit(f"{kind} gate lacks independent acceptance of exact digest {expected}")
-    return dict(path=str(Path(path).resolve()),sha256=sha(path),accepted_packet=expected)
+    found_id=re.search(r"^- Review ID: `([^`]+)`",text,re.M)
+    found_reviewer=re.search(r"^- Reviewer/session: (.+?)\s*$",text,re.M)
+    if review_id is not None and (not found_id or found_id[1]!=review_id):
+        raise SystemExit(f"{kind} gate must be exactly review {review_id}, not "+(found_id[1] if found_id else "an unidentified review"))
+    if reviewer is not None and (not found_reviewer or reviewer not in found_reviewer[1]):
+        raise SystemExit(f"{kind} gate reviewer/session does not match the pinned value {reviewer!r}")
+    if cites is not None and cites not in text:
+        raise SystemExit(f"{kind} gate must cite the exact critique review {cites} it is closing")
+    return dict(path=str(Path(path).resolve()),sha256=sha(path),accepted_packet=expected,
+                review_id=found_id[1] if found_id else None,reviewer=found_reviewer[1] if found_reviewer else None)
+
+
+def self_review_gate(path,expected,review_id="REV-199"):
+    """Independence never substitutes for self-review or vice versa: this pins
+    the author's own self review (accept/self) separately from review_gate's
+    independent-acceptance check, so one document cannot satisfy both roles."""
+    text=Path(path).read_text()
+    if (not re.search(r"^- Verdict: `accept`\.?\s*$",text,re.M) or
+        not re.search(r"^- Independence: `self`\.?\s*$",text,re.M) or
+        not re.search(r"^- Review type: `code`\s*$",text,re.M) or expected not in text):
+        raise SystemExit(f"self-review gate lacks self acceptance of exact digest {expected}")
+    found_id=re.search(r"^- Review ID: `([^`]+)`",text,re.M)
+    if not found_id or found_id[1]!=review_id:
+        raise SystemExit(f"self-review must be exactly {review_id}, not "+(found_id[1] if found_id else "an unidentified review"))
+    return dict(path=str(Path(path).resolve()),sha256=sha(path),review_id=found_id[1])
 
 
 def environment():
@@ -375,6 +399,9 @@ def main():
     parser.add_argument("--mode",choices=("preflight","hooks","negative","protection","sensitivity","correctness","cost"))
     parser.add_argument("--binary-dir",type=Path)
     parser.add_argument("--code-review",type=Path)
+    parser.add_argument("--review-id")
+    parser.add_argument("--reviewer")
+    parser.add_argument("--self-review",type=Path)
     parser.add_argument("--timer-packet",type=Path)
     parser.add_argument("--timer-review",type=Path)
     parser.add_argument("--qualification",type=Path)
@@ -393,7 +420,11 @@ def main():
         return
     if not args.mode or not args.binary_dir or not args.code_review:
         parser.error("run needs mode, binary-dir and code-review")
-    approval=review_gate(args.code_review,sources["sha256"],"code")
+    if not args.review_id or not args.reviewer or not args.self_review:
+        parser.error("run needs --review-id, --reviewer and --self-review; self approval never substitutes for independence")
+    approval=review_gate(args.code_review,sources["sha256"],"code",
+                         review_id=args.review_id,reviewer=args.reviewer,cites="REV-200")
+    self_approval=self_review_gate(args.self_review,sources["sha256"])
     build_manifest=args.binary_dir.resolve()/"build-manifest.json"
     build=json.loads(build_manifest.read_text())
     if sha(build_manifest) not in args.code_review.read_text():
@@ -428,6 +459,8 @@ def main():
         timer_data=json.loads(args.timer_packet.read_text())
         if timer_data.get("status")!="accepted-valid" or any(timer_data.get(key)!=host[key] for key in ("model","os_build")):
             raise SystemExit("valid accepted exact-host/OS timer prerequisite missing")
+    if command(["git","rev-parse","--show-toplevel"])!=str(REPO):
+        raise SystemExit("git worktree root does not match the reviewed repository; refusing to trust its gates")
     changed=command(["git","status","--porcelain","--",str(HERE)])
     if changed:
         raise SystemExit("commit the full experiment packet before evidence/runtime preflight")
@@ -442,7 +475,7 @@ def main():
     write_new(campaign/"code-packet.json",sources)
     write_new(campaign/"environment.json",host)
     write_new(campaign/"signatures.json",signed)
-    write_new(campaign/"gates.json",dict(code=approval,timer=timer,build_manifest_sha256=sha(build_manifest),
+    write_new(campaign/"gates.json",dict(code=approval,self_review=self_approval,timer=timer,build_manifest_sha256=sha(build_manifest),
                                         producing_revision=command(["git","rev-parse","HEAD"]),
                                         qualification_sha256=sha(args.qualification) if args.qualification else None))
     write_new(campaign/"schedule.json",dict(jobs=schedule,planned=len(schedule),child_ceiling_seconds=30,

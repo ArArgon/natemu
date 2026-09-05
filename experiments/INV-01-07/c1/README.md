@@ -46,10 +46,13 @@ entry point is reused.
   under-counts it. No producer execution or `NATEMU_RAW_ROOT` use.
 
 A real `xcrun clang` build of `producer.c` (the exact reviewed flags) and its
-`otool -tvV` disassembly were inspected for this packet: `read_value` and the
-contended `pthread_mutex_lock`/`mach_absolute_time` loop each keep one real
-`bl` call per iteration (no vectorization, hoisting, or removed barriers);
-see REV-195 for the exact instruction ranges and file hash.
+`otool -tvV` disassembly were inspected for this packet: the per-cell timed
+reader (`reader_mach`/`reader_nsec_np`/`reader_generic`, resolved once per
+cell before the timed loop by `resolve_reader`) and the contended
+`pthread_mutex_lock`/`mach_absolute_time` loop each keep one real `bl` call
+per iteration (no vectorization, hoisting, removed barriers, or cell/mode
+classification inside the timed path); see REV-236 for the exact instruction
+ranges and file hash.
 
 No module asserts that gate approvals or manifest claims
 are authentic merely because they occur in JSON. Structural PASS is not review
@@ -117,6 +120,13 @@ per-cell heap arithmetic. Real Apple-Silicon sizes (`clang -O2`, this SDK):
 `sizeof(struct json)=65544`, `sizeof(struct quality)=24`,
 `sizeof(struct scan)=32`, `sizeof(struct contention)=744`, `PATH_MAX=1024`.
 
+This table is an **independent enumeration**, not `named_stack` itself: it is
+the real sum of every named local >= 8 bytes that a plain reading of
+`producer.c` finds, using real compiled `sizeof()` values, not the
+producer's own `named_stack` expression or its 64 KiB fudge allowance.
+`sizeof(struct stat)=144`, `sizeof(struct timespec)=16`, `sizeof(va_list)=8`
+on this ABI.
+
 | Local buffer | Function | Bytes |
 | --- | --- | --- |
 | `struct json out` (×2: main's and preflight's own) | `main`, `preflight` | 131088 |
@@ -125,6 +135,7 @@ per-cell heap arithmetic. Real Apple-Silicon sizes (`clang -O2`, this SDK):
 | `elapsed[BATCHES]` (`uint64_t`) | `clock_cell` | 1600 |
 | `temporary[4]` (`uint64_t`) | `clock_cell` | 32 |
 | `struct quality quality` | `clock_cell` | 24 |
+| `uptime_resolution`, `resolution` (`struct timespec`, ×2) | `clock_cell` | 32 |
 | `struct contention shared` (includes `worker[8]`) | `contention_cell` | 744 |
 | `global`, `workers[8]` (`struct scan`, ×9) | `contention_cell` | 288 |
 | `previous[8]`, `counts[8]`, `transitions` (`uint64_t`, ×17) | `contention_cell` | 136 |
@@ -133,20 +144,26 @@ per-cell heap arithmetic. Real Apple-Silicon sizes (`clang -O2`, this SDK):
 | `digest[32]`, `hex[65]`, `name[96]` | `array` | 193 |
 | `text[40]` | `integer128` | 40 |
 | `order[CELLS]` (`unsigned`) | `main` | 80 |
-| Small-record/scratch/alignment allowance | (fudge) | 65536 |
-| **Total (`named_stack`)** | | **208625** |
+| `info`, `s` (`struct stat`, ×2) | `authorize`, `open_output` | 288 |
+| `tag[32]` | `phase_json` | 32 |
+| `name[32]` | `main` | 32 |
+| `value` (`struct timespec`) | per-cell timed reader | 16 |
+| `arguments` (`va_list`) | `add` | 8 |
+| **Total (independent enumeration)** | | **143593** |
 
-`named_stack` (208625 bytes) is independently checked against real compiled
-`sizeof()` values, not producer's own arithmetic, by
-`test_producer_accounting.py`; it compiles a throwaway probe (no
-`NATEMU_RAW_ROOT`, no producer execution) that re-derives this same table's
-sum from the real ABI and fails if `named_stack` ever falls below it. It
-comfortably clears `STACK_BUFFER_RESERVE=1048576` and the formula's own
-generous over-counts (all eight worker `quality` records counted even though
-only one is live outside `struct contention`; both `struct json` instances
-counted even though `preflight()` returns before `main`'s is declared) more
-than offset its few loosely itemized small buffers, which the 64 KiB fudge
-term alone exceeds by orders of magnitude.
+This 143593-byte figure is exactly what `test_producer_accounting.py`
+independently re-derives from the real ABI: it does not read this table, it
+recomputes each term itself and requires the two sums to agree. It then
+requires the producer's own `named_stack` expression, compiled from
+`producer.c:586-589`, to dominate that sum. On this toolchain
+`named_stack` is 208625, which is not the sum of this table's rows — it is a
+separately conservative formula that also folds in all eight worker
+`quality` records (only one is live outside `struct contention`), both
+`struct json` instances even though `preflight()` returns before `main`'s is
+declared, and its own 65536-byte allowance for small/scratch buffers this
+enumeration does not itemize. `named_stack` (208625) exceeds this
+independent enumeration (143593) by 65032 bytes and comfortably clears
+`STACK_BUFFER_RESERVE=1048576`.
 
 The adapter requires canonical absolute external-root, child and repository
 paths, rejects internal roots, symlink payload files, aliased descriptors,
@@ -237,7 +254,11 @@ independently approve their own fixture code in REV196.
 
 Historical development checkpoint `d49a95b`: the then-current48 tests passed
 in58.528s (inspected as-is at REV-196). The draft had grown to70 tests before
-this packet; this frozen packet adds the v2 gate's independent-return fixtures
-and `test_producer_accounting.py`, for72 tests passing in95.117s. REV-195
-(self code review) pins the exact per-file SHA-256. Independent return
-REV-219 against REV-196 must accept before native execution is authorized.
+REV-195's packet; that packet added the v2 gate's independent-return fixtures
+and `test_producer_accounting.py`, for72 tests passing in95.117s. Independent
+critique REV-219 found five further required changes (R1-R5: a per-QoS timed
+seam, the stack-accounting table's own arithmetic and enumeration claims, and
+two gate-binding gaps); this return closes all five and adds a bypass fixture
+for each of R4 and R5, for73 tests passing in95.983s. REV-236 (self code
+return) pins the exact per-file SHA-256. Independent return REV-237 against
+REV-219 must accept before native execution is authorized.

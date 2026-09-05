@@ -57,7 +57,12 @@ restoration are experimental candidates, not source-proved complete protocols.
 I uses only SC entry/hazard accesses: load, advertise, revalidate, ISB/call,
 clear. A protected superseded call may finish. A pre-advertisement stale load
 retries; it cannot dereference code before revalidation. I retirement requires
-an actual empty matching-token scan. S/M use release STOP, exact acquired
+an actual empty matching-token scan, checked in-process at admission time
+(`protocol.c:410`) and by per-page version floors. `check.py` verifies each
+admission's own recorded state and floor but has no cross-actor invariant
+tying a `retire` record to a later admission of the same token, so it cannot
+by itself detect a native reader that raced ahead of the retiring store; see
+`check.py`'s module docstring. S/M use release STOP, exact acquired
 ACKs, mutation, entry installation, matching release RESUME and fresh admission.
 E uses publication then exact acquired epochs with no artificial RESUME. V
 constructs and executes each slot on its designated reader; a waiting builder
@@ -111,7 +116,9 @@ remains separate. Seed-selected zero-to-three dispatcher yields are recorded;
 they are schedule perturbations, not latency bounds.
 
 Each held pressure slot is genuinely published, called by its intended reader
-set, removed, acknowledged, retired and retained. Near-full scratch
+set, removed, acknowledged, retired and retained. This retirement is the same
+in-process/version-floor property described above, not an additional
+cross-actor guarantee the streamed checker independently verifies. Near-full scratch
 reservations are explicitly BUILDING→DISCARDED without execution rights; they
 never count as retirement or executable reuse. I/E/V additionally require an
 actual no-free→H release→new-token publication/call chain and exact retained-set
@@ -196,7 +203,15 @@ PYTHONDONTWRITEBYTECODE=1 python3 build.py --output "$NATEMU_RAW_ROOT/build-INV1
 ```
 
 After independent code acceptance, `run.py run --mode preflight|hooks|negative|
-protection` takes `--binary-dir` and `--code-review`. `run.py qualify` takes one
+protection` takes `--binary-dir`, `--code-review`, `--review-id`, `--reviewer`
+and `--self-review`. The code gate binds three documents, never letting self
+approval substitute for independence: the pinned self review (`--self-review`,
+must be exactly the recorded self-review ID, `- Independence: \`self\``,
+verdict `accept`), the independent return review passed as `--code-review`
+(must be exactly `--review-id`, from reviewer/session `--reviewer`, verdict
+`accept`, and must cite the independent critique review it closes), and that
+cited critique itself (present by ID only; its own verdict may be `revise`,
+since it is the finding being closed, not re-approved). `run.py qualify` takes one
 full `--campaign` for each required stage and a fresh `--output`. Pass that
 artifact as `--qualification` for correctness. Qualify again including its
 full correctness campaign before cost, which also needs `--timer-packet` and

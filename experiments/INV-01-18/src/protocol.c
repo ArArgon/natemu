@@ -551,18 +551,26 @@ static void guest_stimulus(uint64_t sequence,unsigned page) {
     invalidate(target);
 }
 
+/* The single real eligibility test the allocator ever applies to a slot,
+ * shared by the ordinary search below and by the M18-P1 step-4 diagnostic
+ * (scratch_reserve) so the diagnostic exercises the allocator's own decision
+ * -- including arm I's live hazard-retire attempt -- rather than a separately
+ * maintained recomputation that could silently drift from it (REV-200 R4). */
+static bool find_eligible_slot(uint32_t *out) {
+    for(uint32_t s=0;s<slot_count;s++) {
+        uint32_t t=slot_token[s];
+        if(t==UINT32_MAX) continue; /* Deliberately retained pressure slot. */
+        if(!t||atomic_load(&life[t])==RETIRED||(cfg.arm=='I'&&retire(t))) { *out=s; return true; }
+    }
+    return false;
+}
 static uint32_t allocate_desc(unsigned page,unsigned worker) {
     REQUIRE(next_token<max_token,"immutable metadata capacity");
     uint32_t slot=UINT32_MAX;
     if(forced_slot!=UINT32_MAX) { slot=forced_slot; forced_slot=UINT32_MAX; }
     else if(stopping()) slot=page;
     else for(;;) {
-        for(uint32_t s=0;s<slot_count;s++) {
-            uint32_t t=slot_token[s];
-            if(t==UINT32_MAX) continue; /* Deliberately retained pressure slot. */
-            if(!t||atomic_load(&life[t])==RETIRED||(cfg.arm=='I'&&retire(t))) { slot=s; break; }
-        }
-        if(slot!=UINT32_MAX) break;
+        if(find_eligible_slot(&slot)) break;
         emit("backpressure",next_token,slot_count,0,0,0,0);
         if(!strcmp(cfg.pressure,"near-full")) {
             for(uint32_t s=0;s<slot_count;s++) if(pressure_token[s]) {
@@ -807,7 +815,13 @@ static uint32_t scratch_reserve(uint32_t slot,unsigned ordinal) {
     uint32_t t=allocate_desc(0,0);
     ++scratch_generations;
     emit("scratch-reserve",t,slot,ordinal,free_slots(),0,0);
-    REQUIRE(free_slots()==0,"scratch no-free attempt");
+    /* M18-P1 step 4: an actual second allocation request, not a recomputed
+     * free-count assertion. find_eligible_slot is the identical predicate
+     * allocate_desc's own search loop uses; calling it here (without the
+     * near-full release fallback) is a genuine allocator request that must
+     * find no free slot and must never return a protected/retained slot. */
+    uint32_t refused=UINT32_MAX;
+    REQUIRE(!find_eligible_slot(&refused),"second allocation request must report no free slot");
     emit("allocator-reject",t,slot,0,1,0,0); /* cause 1: scratch + retained capacity */
     return t;
 }

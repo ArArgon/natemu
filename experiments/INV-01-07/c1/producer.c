@@ -287,20 +287,27 @@ static uint64_t uptime(void) {
     return value;
 }
 
-static __attribute__((noinline)) uint64_t read_value(int clock, uint64_t *row) {
-    if (clock == 0) return row[0] = mach_absolute_time();
-    if (clock == 1) {
-        uint64_t value = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        if (!injected && current_cell == 1 && strcmp(mode, "zero-nsec") == 0) {
-            injected = true;
-            value = 0;
-            errno = EINVAL;  /* Explicit injected API seam, not an OS failure. */
-        }
-        if (!value) clock_failure("nsec-zero", "clock_gettime_nsec_np", 0, errno);
-        return row[0] = value;
-    }
+/* Per-cell timed readers. Each cell resolves exactly one of these via
+ * `resolve_reader` once, before its timed loop starts; every read in that
+ * loop then calls the same function pointer with no cell/mode branch and no
+ * string work. This is the only place clock-kind or injected-mode
+ * classification may happen for a timed read (see R1, REV-219/REV-236). */
+typedef uint64_t (*reader_fn)(uint64_t *row);
+
+static __attribute__((noinline)) uint64_t reader_mach(uint64_t *row) {
+    return row[0] = mach_absolute_time();
+}
+
+static __attribute__((noinline)) uint64_t reader_nsec_np(uint64_t *row) {
+    uint64_t value = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (!value) clock_failure("nsec-zero", "clock_gettime_nsec_np", 0, errno);
+    return row[0] = value;
+}
+
+static clockid_t generic_clock_id;
+static __attribute__((noinline)) uint64_t reader_generic(uint64_t *row) {
     struct timespec value;
-    int status = clock_gettime(clock_ids[clock], &value);
+    int status = clock_gettime(generic_clock_id, &value);
     if (status) clock_failure("clock-read-api", "clock_gettime", status, errno);
     uint64_t ns = to_ns(value);
     row[0] = (uint64_t)value.tv_sec;
@@ -308,6 +315,21 @@ static __attribute__((noinline)) uint64_t read_value(int clock, uint64_t *row) {
     row[2] = ns;
     row[3] = (uint64_t)status;
     return ns;
+}
+
+/* Resolved once per cell, strictly before the timed loop. All cell-id/mode
+ * string comparisons for fault injection happen only here, never inside a
+ * reader. The zero-nsec seam fires on cell1's very first nsec_np read either
+ * way (nothing meaningful precedes it), so failing here instead of inside
+ * the timed loop is observably identical and pays zero per-read cost. */
+static reader_fn resolve_reader(int id, int clock) {
+    if (clock == 0) return reader_mach;
+    if (clock != 1) { generic_clock_id = clock_ids[clock]; return reader_generic; }
+    if (id == 1 && strcmp(mode, "zero-nsec") == 0) {
+        injected = true;
+        clock_failure("nsec-zero", "clock_gettime_nsec_np", 0, EINVAL);
+    }
+    return reader_nsec_np;
 }
 
 struct scan { uint64_t forward, zero, backward, minimum; };
@@ -397,18 +419,19 @@ static void clock_cell(int id) {
     uint64_t *batches = allocate(BATCHES, 3);
     uint64_t *before = allocate(PAIRS, 3), *after = allocate(PAIRS, 3);
     uint64_t *pre_control = allocate(CONTROLS, 7), *post_control = allocate(CONTROLS, 7);
+    reader_fn reader = resolve_reader(id, clock);
     volatile uint64_t sink = 0;
     for (uint64_t i = 0; i < READS; ++i) {
         uint64_t *row = readings + columns * i;
         row[0] = i;
-        sink += read_value(clock, row + 1);  /* Defined modulo2^64 liveness sink. */
+        sink += reader(row + 1);  /* Defined modulo2^64 liveness sink. */
     }
     noise(before); controls(pre_control);
     for (uint64_t i = 0; i < BATCHES; ++i) {
         uint64_t temporary[4];
         batches[3 * i] = i;
         batches[3 * i + 1] = mach_absolute_time();
-        for (uint64_t j = 0; j < PER_BATCH; ++j) sink += read_value(clock, temporary);
+        for (uint64_t j = 0; j < PER_BATCH; ++j) sink += reader(temporary);
         batches[3 * i + 2] = mach_absolute_time();
     }
     noise(after); controls(post_control);
