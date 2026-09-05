@@ -267,9 +267,16 @@ def validate_campaign(normal_path, authorization_sha, authorization):
         d = json_read(raw_path) if raw_path.exists() else None
         require(r.get("result_sha256") == (file_sha(raw_path) if d is not None else None), "control raw receipt mismatch")
         if d is not None:
+            # RC1 (REV-218): the R3 compiled-source binding
+            # (validate_result_binding, above) checks only the normal raw;
+            # bind every campaign member's compiled_bundle_sha256 to the same
+            # accepted bundle here too, or a control raw stamped by a foreign
+            # compiled binary passes as long as the rest of its identity is
+            # honest.
             require(d.get("authorization_sha256") == authorization_sha and
                     d.get("code_bundle_sha256") == authorization["code_bundle_sha256"] and
                     d.get("code_revision") == authorization["code_revision"] and
+                    d.get("compiled_bundle_sha256") == authorization["code_bundle_sha256"] and
                     d.get("timebase") == timebase, "control raw producer binding mismatch")
         if mode == "normal":
             require(raw_path == normal_path and type(r.get("returncode")) is int and r["returncode"] == 0,

@@ -88,7 +88,8 @@ def build_synthetic_campaign(parent):
             (location / name).write_text("synthetic parser fixture, never executed")
         (location / "stdout.txt").write_text("")
         d = valid()
-        d.update(authorization_sha256=auth_sha, code_bundle_sha256=a["code_bundle_sha256"])
+        d.update(authorization_sha256=auth_sha, code_bundle_sha256=a["code_bundle_sha256"],
+                 compiled_bundle_sha256=a["code_bundle_sha256"])
         code = 0
         if mode == "negative":
             d.update(mode=mode, completed_normal=False)
@@ -449,7 +450,15 @@ class Controls(unittest.TestCase):
                     completed_iterations=False, actual_writes=False, successful_locks=False,
                     successful_unlocks=False),
                 lambda x: x["fallback_global_lock"]["workers"][0]["first_error"].update(iteration=False),
-                lambda x: x["fallback_global_lock"]["workers"][0]["first_error"].__delitem__("rc")):
+                lambda x: x["fallback_global_lock"]["workers"][0]["first_error"].__delitem__("rc"),
+                # REV-218 RC2: deleting first_error from a non-injected worker
+                # satisfies `worker.get("first_error") is not None` (a missing
+                # key returns None) and the repaired copy then unconditionally
+                # restamps first_error=None before validate_fallback ever
+                # inspects it -- the same omission validate_fallback's F3
+                # rejects on the original, and the drop-write branch already
+                # rejects the identical omission.
+                lambda x: [w.pop("first_error") for w in x["fallback_global_lock"]["workers"] if w["id"] != 0]):
             mutated = base()
             mutate(mutated)
             self.assertFalse(sup.control_oracle("fallback-lock-error", receipt, mutated, ""))
@@ -628,6 +637,37 @@ class Authorization(unittest.TestCase):
             m["artifacts"]["result.supervisor.json"] = auth.file_sha(location/"result.supervisor.json")
             write(location/"manifest.json", m)
             packet["members"]["fallback-drop-write"]["sha256"] = auth.file_sha(location/"manifest.json")
+            write(parent/"campaign.json", packet)
+            with self.assertRaises(ValueError):
+                auth.validate_campaign(normal, auth_sha, a)
+
+    def test_campaign_rejects_control_compiled_bundle_transplant(self):
+        # REV-218 RC1 counterexample: validate_result_binding
+        # (src/authorization.py:196) requires the normal raw's
+        # compiled_bundle_sha256 to match the accepted bundle, but the
+        # per-member producer-binding tuple in validate_campaign
+        # (src/authorization.py:270-273) never checked it for the four
+        # control raws, so a control raw stamped by a foreign compiled
+        # binary was still accepted whenever its authorization/bundle/
+        # revision/timebase fields were honest.
+        with tempfile.TemporaryDirectory(prefix="inv08-campaign-compiled-bundle-fixture-") as directory:
+            parent = Path(directory).resolve()
+            packet, a, auth_sha, write = build_synthetic_campaign(parent)
+            normal = parent/"normal/result.json"
+            auth.validate_campaign(normal, auth_sha, a)  # sanity: honest baseline accepted
+            for mode in ("negative", "fallback-drop-write", "fallback-lock-error"):
+                location = parent/mode
+                d = json.loads((location/"result.json").read_text())
+                d["compiled_bundle_sha256"] = "0"*64
+                write(location/"result.json", d)
+                r = json.loads((location/"result.supervisor.json").read_text())
+                r["result_sha256"] = auth.file_sha(location/"result.json")
+                write(location/"result.supervisor.json", r)
+                m = json.loads((location/"manifest.json").read_text())
+                m["artifacts"]["result.json"] = auth.file_sha(location/"result.json")
+                m["artifacts"]["result.supervisor.json"] = auth.file_sha(location/"result.supervisor.json")
+                write(location/"manifest.json", m)
+                packet["members"][mode]["sha256"] = auth.file_sha(location/"manifest.json")
             write(parent/"campaign.json", packet)
             with self.assertRaises(ValueError):
                 auth.validate_campaign(normal, auth_sha, a)

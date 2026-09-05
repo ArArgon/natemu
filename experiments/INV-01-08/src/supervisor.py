@@ -116,7 +116,14 @@ def control_oracle(mode, receipt, data, output):
                 return False
             if worker.get("ready") is not True or not exact_int(worker.get("qos_rc"), 0):
                 return False
-            if worker["id"] != 0 and worker.get("first_error") is not None:
+            # RC2 (REV-218): `.get(...) is not None` is satisfied by a
+            # missing key, and the repair below unconditionally restamps
+            # first_error=None, so an original raw that simply omits the
+            # field on a non-injected worker was concealed before
+            # validate_fallback's F3 (which requires the key present) ever
+            # saw it. Require the key present, matching the drop-write
+            # branch's already-correct behavior.
+            if worker["id"] != 0 and ("first_error" not in worker or worker["first_error"] is not None):
                 return False
             total += n
         consistent = (exact_int(f.get("ops"), total) and exact_int(f.get("completed_ops"), total) and

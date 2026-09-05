@@ -86,10 +86,11 @@ probe is a placement observation.
 ## Build, preflight and gated execution
 
 `sh validate.sh` compiles normal/verification binaries outside Git, checks
-the isolated litmus/LSE/alignment instruction bodies, and runs16 retained
-reporting tests plus27 F08-2 pure tests. It never launches a native binary.
-All fixtures are author-created synthetic inputs, not independent oracle
-approval or research evidence. Watchdog tests mock a child; they do not run
+the isolated litmus/LSE/alignment instruction bodies, and runs 16 retained
+reporting tests plus 36 F08-2 pure tests (52 total). It never launches a
+native binary. All fixtures are author-created synthetic inputs, not
+independent oracle approval or research evidence. Watchdog tests mock a
+child; they do not run
 the native fault or fallback control.
 
 ```sh
@@ -147,15 +148,30 @@ them separately. `supervisor.py --bundle` emits the mapping and digest.
 The external authorization object has schema
 `INV-01-08-execution-authorization-v1`, `kind` evidence or validation,
 `code_revision` equal to the producing current committed clean revision,
-`code_bundle_sha256`, and `method_review`/`code_review` references. Each
-reference is exactly `{"path": "...", "sha256": "..."}`. Method review is pinned
-to the actual independently accepted REV-207 bytes. Code review must be the
-actual canonical repository REV-210 with unique accepted independent code
-metadata and the exact additional line:
+`code_bundle_sha256`, and `method_review`/`code_review`/`code_self_review`
+references. Each reference is exactly `{"path": "...", "sha256": "..."}`.
+Method review is pinned to the actual independently accepted REV-207 bytes.
+`code_review` is a mandatory independent slot and `code_self_review` is a
+mandatory self slot; both must be actual canonical repository records with an
+`accept` verdict, `Review type: code`, the matching `Independence` field
+(`independent`/`self`), and the exact additional line:
 
 ```text
 - Code bundle SHA-256: `FULL_BUNDLE_DIGEST`
 ```
+
+Neither review is a hard-coded identity (there is no "must be REV-210"):
+the loader identifies each by its content binding to the exact accepted
+bundle digest above, so whichever accepted independent and self records
+carry that binding satisfy the gate. A `revise` verdict, the wrong
+independence, or an absent `code_self_review` is refused. Separately from
+this review binding, a retained binary's `compiled_bundle_sha256` (baked in
+at build time from the `F08_COMPILED_BUNDLE` macro, `Makefile:13-14`) must
+equal `code_bundle_sha256` -- checked pre-launch by `native_authorize`, again
+for the normal raw by `validate_result_binding`, and again for every
+campaign control raw by `validate_campaign` -- so a binary compiled from
+dirty or unreviewed source cannot pass even if the tree is later restored to
+the accepted revision.
 
 Evidence authorization additionally contains `clock: {packet,
 applicability_review}`. Packet schema is
