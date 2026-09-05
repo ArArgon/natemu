@@ -29,10 +29,12 @@
 /* mach_wait_until is declared in <mach/mach_time.h> on macOS. */
 
 static int g_negative = 0;
+static int g_control_selftest = 0;
 static long g_n = 2000;         /* samples per wakeup/signal arm */
 static long g_n_clock = 200000; /* samples for clock read cost / resolution */
 
 static struct mach_timebase_info g_tb;
+static uint64_t g_uptime_raw_resolution_ns;
 
 static void fail_pthread(int rc, const char *what) {
 	if (rc == 0) return;
@@ -63,6 +65,103 @@ static inline uint64_t ns_to_abs(uint64_t n) {
 	return (uint64_t)((__uint128_t)n * g_tb.denom / g_tb.numer);
 }
 static inline uint64_t now_ns(void) { return abs_to_ns(mach_absolute_time()); }
+
+static int add_u64(uint64_t a, uint64_t b, uint64_t *out) {
+	if (UINT64_MAX - a < b) return -1;
+	*out = a + b;
+	return 0;
+}
+
+static int mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
+	if (a != 0 && b > UINT64_MAX / a) return -1;
+	*out = a * b;
+	return 0;
+}
+
+static int abs_interval_to_ns(uint64_t start, uint64_t end, uint64_t *out) {
+	if (end < start || g_tb.denom == 0) return -1;
+	__uint128_t value = (__uint128_t)(end - start) * g_tb.numer / g_tb.denom;
+	if (value > UINT64_MAX) return -1;
+	*out = (uint64_t)value;
+	return 0;
+}
+
+static int diff_u64_i64(uint64_t a, uint64_t b, int64_t *out) {
+	if (a >= b) {
+		uint64_t d = a - b;
+		if (d > INT64_MAX) return -1;
+		*out = (int64_t)d;
+	} else {
+		uint64_t d = b - a;
+		if (d > (uint64_t)INT64_MAX) return -1;
+		*out = -(int64_t)d;
+	}
+	return 0;
+}
+
+/* Evaluate one already-converted containment sample. Residuals are positive
+ * exactly when their corresponding inclusive bound is violated. */
+static int control_evaluate(uint64_t inner, uint64_t independent,
+                            uint64_t outer, uint64_t slack,
+                            int64_t *lower_residual,
+                            int64_t *upper_residual, uint64_t *width) {
+	uint64_t independent_plus_slack, outer_plus_slack;
+	if (inner > outer ||
+	    add_u64(independent, slack, &independent_plus_slack) != 0 ||
+	    add_u64(outer, slack, &outer_plus_slack) != 0 ||
+	    diff_u64_i64(inner, independent_plus_slack, lower_residual) != 0 ||
+	    diff_u64_i64(independent, outer_plus_slack, upper_residual) != 0)
+		return -1;
+	*width = outer - inner;
+	return 0;
+}
+
+static int control_selftest(void) {
+	static const uint64_t targets[] = {100000, 1000000, 10000000};
+	const uint64_t slack = 252;
+	for (size_t i = 0; i < sizeof targets / sizeof targets[0]; i++) {
+		uint64_t t = targets[i], width;
+		int64_t lower, upper;
+		/* Both inclusive boundaries must pass. */
+		if (control_evaluate(t, t - slack, t, slack,
+		                     &lower, &upper, &width) != 0 ||
+		    lower != 0 || upper > 0)
+			return 1;
+		if (control_evaluate(t, t + slack, t, slack,
+		                     &lower, &upper, &width) != 0 ||
+		    lower > 0 || upper != 0)
+			return 1;
+		/* A ±1% converted-Mach error must cross the appropriate bound. */
+		uint64_t high = t + t / 100;
+		uint64_t low = t - t / 100;
+		if (control_evaluate(high, t, high + 1, slack,
+		                     &lower, &upper, &width) != 0 || lower <= 0)
+			return 1;
+		if (control_evaluate(low, t, low + 1, slack,
+		                     &lower, &upper, &width) != 0 || upper <= 0)
+			return 1;
+		/* Gaps in either paired-read window widen a valid bracket. */
+		uint64_t gap = t / 20;
+		if (control_evaluate(t, t, t + gap, slack,
+		                     &lower, &upper, &width) != 0 ||
+		    lower > 0 || upper > 0 || width != gap)
+			return 1;
+		if (control_evaluate(t, t + gap, t + gap, slack,
+		                     &lower, &upper, &width) != 0 ||
+		    lower > 0 || upper > 0 || width != gap)
+			return 1;
+		/* An all-wide arm passes containment but fails non-vacuity. */
+		if (width <= t / 200) return 1;
+	}
+	int64_t lower, upper;
+	uint64_t width;
+	if (control_evaluate(2, 1, 1, slack, &lower, &upper, &width) == 0)
+		return 1;
+	if (control_evaluate(1, UINT64_MAX, 1, slack,
+	                     &lower, &upper, &width) == 0)
+		return 1;
+	return 0;
+}
 
 /* ---------- small stats helpers ---------- */
 
@@ -140,6 +239,21 @@ static void probe_clocks(FILE *f) {
 		struct timespec res;
 		int have_res = (cl[k].use_mach == 0 &&
 		                clock_getres(cl[k].id, &res) == 0);
+		if (cl[k].use_nsec_np) {
+			if (!have_res || res.tv_sec < 0 || res.tv_nsec < 0 ||
+			    res.tv_nsec >= 1000000000L ||
+			    (uint64_t)res.tv_sec >
+			        (UINT64_MAX - (uint64_t)res.tv_nsec) / 1000000000ull) {
+				fprintf(stderr, "invalid CLOCK_UPTIME_RAW resolution\n");
+				exit(1);
+			}
+			g_uptime_raw_resolution_ns =
+			    (uint64_t)res.tv_sec * 1000000000ull + (uint64_t)res.tv_nsec;
+			if (g_uptime_raw_resolution_ns == 0) {
+				fprintf(stderr, "zero CLOCK_UPTIME_RAW resolution\n");
+				exit(1);
+			}
+		}
 		/* read cost: median over batches of 1000 reads */
 		enum { B = 200, PER = 1000 };
 		int64_t cost[B];
@@ -247,25 +361,34 @@ static void wakeup_arm(FILE *f, const char *mech, long target_ns,
                        qos_class_t q, int last) {
 	int64_t *err = xmalloc(sizeof(int64_t) * (size_t)g_n);
 	int64_t setup_ns = 0, setup_n = 0;
-	/* Timebase-conversion control (REV-044 change 13; bracket corrected at the
-	 * MAN-01-07-01 return). The SAME interval is measured two ways: in mach
-	 * ticks converted with the timebase ratio, and in
-	 * clock_gettime_nsec_np(CLOCK_UPTIME_RAW) ns, which needs no such
-	 * arithmetic. A proportional disagreement is a conversion artefact, and
-	 * CLM-01-07-14 is precisely a proportional-overshoot claim.
-	 *
-	 * The earlier form read ctrl0 BEFORE the deadline's mach_absolute_time(),
-	 * so the control's interval started earlier than the interval it checked
-	 * and absorbed any deschedule in between. That inflated the delta by a
-	 * scheduling artefact and failed rule I16 on one background-QoS arm in
-	 * MAN-01-07-01. The two starts and the two ends are now taken adjacent,
-	 * so only the cost of one clock read sits inside each paired window. */
-	int64_t ctrl_worst_delta_ns = 0;
+	/* Accepted containment control (REV-139). The independent interval is
+	 * bracketed by converted-Mach inner and outer intervals; paired-read
+	 * scheduling can widen the bracket but cannot create a false violation. */
+	uint64_t mach_quantum =
+	    ((uint64_t)g_tb.numer + (uint64_t)g_tb.denom - 1) / g_tb.denom;
+	uint64_t quantum = mach_quantum > g_uptime_raw_resolution_ns
+	                       ? mach_quantum : g_uptime_raw_resolution_ns;
+	uint64_t ctrl_slack_ns;
+	if (quantum == 0 || mul_u64(quantum, 6, &ctrl_slack_ns) != 0) {
+		fprintf(stderr, "invalid timebase-control slack\n");
+		exit(1);
+	}
+	uint64_t tight_limit_ns = (uint64_t)target_ns / 200;
+	long ctrl_violations = 0, ctrl_tight_count = 0;
+	int64_t ctrl_max_lower_residual = INT64_MIN;
+	int64_t ctrl_max_upper_residual = INT64_MIN;
+	uint64_t ctrl_min_width = UINT64_MAX;
 	set_qos(q);
 	for (long i = 0; i < g_n; i++) {
-		uint64_t base_abs = mach_absolute_time();
+		uint64_t m0_outer = mach_absolute_time();
 		uint64_t ctrl0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-		uint64_t deadline_abs = base_abs + ns_to_abs((uint64_t)target_ns);
+		uint64_t base_abs = mach_absolute_time();
+		uint64_t deadline_abs;
+		if (add_u64(base_abs, ns_to_abs((uint64_t)target_ns),
+		            &deadline_abs) != 0) {
+			fprintf(stderr, "wakeup deadline overflow\n");
+			exit(1);
+		}
 		uint64_t woke;
 		if (strcmp(mech, "mach_wait_until") == 0) {
 			if (mach_wait_until(deadline_abs) != KERN_SUCCESS) {
@@ -314,25 +437,54 @@ static void wakeup_arm(FILE *f, const char *mech, long target_ns,
 			woke = fired;
 		}
 		uint64_t ctrl1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-		int64_t e = (int64_t)abs_to_ns(woke) - (int64_t)abs_to_ns(deadline_abs);
-		/* Both quantities span base -> wake. No target_ns term appears, so
-		 * the comparison is of one interval measured two ways and nothing
-		 * else. */
-		int64_t delta = (int64_t)(ctrl1 - ctrl0) -
-		                (int64_t)abs_to_ns(woke - base_abs);
-		if (delta < 0) delta = -delta;
-		if (delta > ctrl_worst_delta_ns) ctrl_worst_delta_ns = delta;
+		uint64_t m1_outer = mach_absolute_time();
+		uint64_t error_magnitude;
+		int64_t e;
+		if ((woke >= deadline_abs
+		         ? abs_interval_to_ns(deadline_abs, woke, &error_magnitude)
+		         : abs_interval_to_ns(woke, deadline_abs, &error_magnitude)) != 0 ||
+		    error_magnitude > INT64_MAX) {
+			fprintf(stderr, "wakeup error overflow\n");
+			exit(1);
+		}
+		e = woke >= deadline_abs ? (int64_t)error_magnitude
+		                         : -(int64_t)error_magnitude;
+		uint64_t inner, outer, width;
+		int64_t lower_residual, upper_residual;
+		if (ctrl1 < ctrl0 ||
+		    abs_interval_to_ns(base_abs, woke, &inner) != 0 ||
+		    abs_interval_to_ns(m0_outer, m1_outer, &outer) != 0 ||
+		    control_evaluate(inner, ctrl1 - ctrl0, outer, ctrl_slack_ns,
+		                     &lower_residual, &upper_residual, &width) != 0) {
+			fprintf(stderr, "invalid timebase-control sample\n");
+			exit(1);
+		}
+		if (lower_residual > 0 || upper_residual > 0) ctrl_violations++;
+		if (lower_residual > ctrl_max_lower_residual)
+			ctrl_max_lower_residual = lower_residual;
+		if (upper_residual > ctrl_max_upper_residual)
+			ctrl_max_upper_residual = upper_residual;
+		if (width < ctrl_min_width) ctrl_min_width = width;
+		if (width <= tight_limit_ns) ctrl_tight_count++;
 		if (g_negative) e -= target_ns / 4; /* injected defect: impossible early wake */
 		err[i] = e;
 	}
 	set_qos(QOS_CLASS_USER_INTERACTIVE);
 	emit_stats(f, "wakeup", mech, qos_name(q), target_ns, summarize(err, g_n));
 	fprintf(f,
-	        ",\"timebase_control_worst_delta_ns\":%lld,"
-	        "\"timebase_control_tolerance_ns\":%lld,"
+	        ",\"timebase_control_n\":%ld,"
+	        "\"timebase_control_slack_ns\":%llu,"
+	        "\"timebase_control_invalid_count\":0,"
+	        "\"timebase_control_violation_count\":%ld,"
+	        "\"timebase_control_max_lower_residual_ns\":%lld,"
+	        "\"timebase_control_max_upper_residual_ns\":%lld,"
+	        "\"timebase_control_min_width_ns\":%llu,"
+	        "\"timebase_control_tight_count\":%ld,"
 	        "\"setup_p_mean_ns\":%lld}%s\n",
-	        (long long)ctrl_worst_delta_ns,
-	        (long long)(2000 + target_ns / 1000),
+	        g_n, (unsigned long long)ctrl_slack_ns, ctrl_violations,
+	        (long long)ctrl_max_lower_residual,
+	        (long long)ctrl_max_upper_residual,
+	        (unsigned long long)ctrl_min_width, ctrl_tight_count,
 	        (long long)(setup_n ? setup_ns / setup_n : 0),
 	        last ? "" : ",");
 	free(err);
@@ -554,10 +706,20 @@ int main(int argc, char **argv) {
 	const char *out = NULL;
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--negative")) g_negative = 1;
+		else if (!strcmp(argv[i], "--control-selftest")) g_control_selftest = 1;
 		else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
 		else if (!strcmp(argv[i], "--n") && i + 1 < argc)
 			g_n = parse_positive(argv[++i], "--n");
-		else { fprintf(stderr, "usage: %s [--out F] [--n N] [--negative]\n", argv[0]); return 2; }
+		else { fprintf(stderr, "usage: %s [--out F] [--n N] [--negative] [--control-selftest]\n", argv[0]); return 2; }
+	}
+	if (g_control_selftest) {
+		if (out || g_negative || g_n != 2000) {
+			fprintf(stderr, "--control-selftest does not accept other options\n");
+			return 2;
+		}
+		int rc = control_selftest();
+		fprintf(stderr, "INV-01-07 control self-test %s\n", rc ? "FAIL" : "PASS");
+		return rc;
 	}
 	if (mach_timebase_info(&g_tb) != KERN_SUCCESS) { perror("timebase"); return 1; }
 	if (g_tb.numer == 0 || g_tb.denom == 0) {

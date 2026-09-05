@@ -19,6 +19,9 @@ CLOCKS = {
     "clock_gettime(CLOCK_REALTIME)",
 }
 QOS = {"user-interactive", "background"}
+UINT64_MAX = (1 << 64) - 1
+INT64_MIN = -(1 << 63)
+INT64_MAX = (1 << 63) - 1
 MONOTONIC_CLOCKS = {
     "mach_absolute_time",
     "clock_gettime_nsec_np(CLOCK_UPTIME_RAW)",
@@ -43,6 +46,17 @@ SIGNAL_CASES = {
 }
 
 
+def is_u64(value, *, positive=False):
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and (value > 0 if positive else value >= 0)
+            and value <= UINT64_MAX)
+
+
+def is_i64(value):
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and INT64_MIN <= value <= INT64_MAX)
+
+
 def main(path):
     d = json.load(open(path))
     fails, notes = [], []
@@ -54,8 +68,9 @@ def main(path):
     rule(d.get("experiment") == "INV-01-07", "I0 experiment identity",
          f"experiment={d.get('experiment')}")
     tb = d.get("timebase", {})
-    rule(tb.get("numer", 0) > 0 and tb.get("denom", 0) > 0, "I1 timebase",
-         f"numer={tb.get('numer')} denom={tb.get('denom')}")
+    tb_numer, tb_denom = tb.get("numer"), tb.get("denom")
+    tb_ok = is_u64(tb_numer, positive=True) and is_u64(tb_denom, positive=True)
+    rule(tb_ok, "I1 timebase", f"numer={tb_numer} denom={tb_denom}")
 
     clocks = d.get("clocks", [])
     clock_names = [c.get("clock") for c in clocks]
@@ -123,58 +138,84 @@ def main(path):
     rule(not cw_small, "I15 concurrent-wakeup sample size",
          f"arms below 2000 samples per thread: {cw_small}")
 
-    # The timebase-conversion control (REV-044 change 13): the mach-arithmetic
-    # error and an independent CLOCK_UPTIME_RAW elapsed measurement must agree,
-    # or a proportional overshoot could be a conversion artefact.
-    # Enforced only on the arms where the wake timestamp is taken by the
-    # measuring thread itself. In the dispatch arms the wake is timestamped in
-    # the handler on another thread while the control is read after the
-    # semaphore returns, so their delta legitimately includes a cross-thread
-    # handoff and is reported but not enforced.
-    # Enforcement scope. The control's residual is whatever preemption lands
-    # inside its two paired-read windows, and a background-QoS thread has no
-    # protection against being descheduled there — smoke runs of the corrected
-    # bracket show background arms overshooting by tens of microseconds at the
-    # larger targets while the matched user-interactive arms sit at hundreds of
-    # nanoseconds. That residual is a scheduler property, not a conversion
-    # error. A timebase-ratio error, by contrast, is a property of the
-    # arithmetic: it would appear identically in every arm regardless of QoS.
-    # So the rule is enforced on the same-thread, user-interactive arms, where
-    # the windows are protected, and reported on the rest. Narrowing the scope
-    # this way loses no power to detect the thing the control exists for.
+    # Accepted containment control (REV-139). For ordered reads
+    # m0,c0,base ... woke,c1,m1, the independently measured c1-c0 interval must
+    # be contained between the converted-Mach inner and outer intervals. The
+    # producer emits aggregate diagnostics; the checker derives slack from the
+    # recorded timebase and CLOCK_UPTIME_RAW resolution and checks both QoS
+    # classes for the same-thread mechanisms. Dispatch remains report-only
+    # because its wake timestamp is taken on another thread.
     SAME_THREAD = ("mach_wait_until", "nanosleep")
-    ENFORCED_QOS = "user-interactive"
-    # Tolerance derived from the quantity's own error sources, not from a flat
-    # fraction of the target (corrected at the MAN-01-07-01 return):
-    #
-    #   floor 2000 ns  — four clock reads quantized to one 41.67 ns timebase
-    #                    tick each (<=167 ns), plus the cost of the two reads
-    #                    inside the paired start and end windows, plus room for
-    #                    a short preemption in those windows. 2 us is ~48 ticks,
-    #                    an order of magnitude above the quantization floor.
-    #   + target/1000  — 0.1% proportional term. A timebase-ratio error scales
-    #                    with the interval, so this is the part that actually
-    #                    detects a conversion artefact.
-    #
-    # The old flat 10%-of-target rule was both too tight at 100 us (10 us is
-    # below ordinary scheduler noise, which is what failed MAN-01-07-01) and
-    # far too loose at 10 ms, where it would have let a 1 ms — i.e. a full
-    # 10% — conversion error pass unnoticed. This form is tighter where a
-    # conversion defect would actually show.
-    def ctrl_tol(target_ns):
-        return 2000 + target_ns // 1000
+    raw_rows = [c for c in clocks
+                if c.get("clock") == "clock_gettime_nsec_np(CLOCK_UPTIME_RAW)"]
+    raw_resolution = raw_rows[0].get("getres_ns") if len(raw_rows) == 1 else None
+    control_slack = None
+    if tb_ok and is_u64(raw_resolution, positive=True):
+        mach_quantum = (tb_numer + tb_denom - 1) // tb_denom
+        quantum = max(mach_quantum, raw_resolution)
+        if quantum <= UINT64_MAX // 6:
+            control_slack = quantum * 6
 
-    ctrl = [(w["mechanism"], w["target_ns"], w["qos"],
-             w.get("timebase_control_worst_delta_ns"), ctrl_tol(w["target_ns"]))
-            for w in wakeup
-            if w["mechanism"] in SAME_THREAD and w["qos"] == ENFORCED_QOS
-            and (w.get("timebase_control_worst_delta_ns") is None
-                 or w["timebase_control_worst_delta_ns"] > ctrl_tol(w["target_ns"]))]
-    rule(not ctrl, "I16 timebase arithmetic agrees with an independent clock",
-         "same-thread user-interactive arms where the same interval measured "
-         "in converted mach ticks and in CLOCK_UPTIME_RAW ns disagree by more "
-         "than 2 us + 0.1% of target "
-         f"(mechanism, target, qos, worst_delta, tolerance): {ctrl[:4] or 'none'}")
+    control_fields = (
+        "timebase_control_n",
+        "timebase_control_slack_ns",
+        "timebase_control_invalid_count",
+        "timebase_control_violation_count",
+        "timebase_control_max_lower_residual_ns",
+        "timebase_control_max_upper_residual_ns",
+        "timebase_control_min_width_ns",
+        "timebase_control_tight_count",
+    )
+    malformed, containment_bad, nonvacuous_bad = [], [], []
+    for w in wakeup:
+        ident = (w.get("mechanism"), w.get("target_ns"), w.get("qos"))
+        values = {name: w.get(name) for name in control_fields}
+        n = values["timebase_control_n"]
+        slack = values["timebase_control_slack_ns"]
+        invalid = values["timebase_control_invalid_count"]
+        violations = values["timebase_control_violation_count"]
+        lower = values["timebase_control_max_lower_residual_ns"]
+        upper = values["timebase_control_max_upper_residual_ns"]
+        min_width = values["timebase_control_min_width_ns"]
+        tight = values["timebase_control_tight_count"]
+        shape_ok = (
+            is_u64(n, positive=True)
+            and is_u64(w.get("n"), positive=True) and n == w.get("n")
+            and is_u64(slack, positive=True) and slack == control_slack
+            and is_u64(invalid) and invalid <= n
+            and is_u64(violations) and violations <= n
+            and is_i64(lower) and is_i64(upper)
+            and is_u64(min_width)
+            and is_u64(tight) and tight <= n
+        )
+        if not shape_ok:
+            malformed.append((ident, values, control_slack))
+            continue
+        if w.get("mechanism") not in SAME_THREAD:
+            continue
+        target = w.get("target_ns")
+        if not is_u64(target, positive=True):
+            malformed.append((ident, values, control_slack))
+            continue
+        tight_limit = target // 200
+        if (slack > tight_limit or invalid != 0 or violations != 0
+                or lower > 0 or upper > 0):
+            containment_bad.append((ident, invalid, violations, lower, upper,
+                                    slack, tight_limit))
+        if tight < 1 or min_width > tight_limit:
+            nonvacuous_bad.append((ident, tight, min_width, tight_limit))
+
+    rule(not malformed and not containment_bad,
+         "I16a per-sample timebase containment",
+         "all wakeup diagnostics well-formed and every same-thread sample at "
+         "both QoS classes contained; "
+         f"malformed={malformed[:2] or 'none'} "
+         f"violations={containment_bad[:4] or 'none'}")
+    rule(not malformed and not nonvacuous_bad,
+         "I16b per-arm timebase non-vacuity",
+         "every same-thread arm has at least one bracket no wider than 0.5% "
+         f"of target; malformed={malformed[:2] or 'none'} "
+         f"wide={nonvacuous_bad[:4] or 'none'}")
 
     # The round-trip control (REV-044 change 1): one-way latency subtracts two
     # threads' timestamps, so it must never exceed the sender-only round trip.

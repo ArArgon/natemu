@@ -16,7 +16,7 @@ performance result, and selects no design.
 | Clocks | `mach_absolute_time`; `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)`; `clock_gettime` with `CLOCK_MONOTONIC_RAW`, `CLOCK_MONOTONIC`, `CLOCK_UPTIME_RAW`, `CLOCK_REALTIME`. Per clock: `clock_getres`, read cost (p50/p99 ns over 200 batches of 1000 reads), smallest observed forward step, and backward-read count over 200 000 reads. |
 | Cross-thread clock | 4 threads × 200 000 timestamps taken under one mutex; counts inversions and the worst backward step. Routed here by `BP-01-12-start` as the overlap-evidence comparability question. |
 | Wakeup | {`mach_wait_until`, `nanosleep`, `dispatch_source` timer with leeway 0, `dispatch_source` timer with `DISPATCH_TIMER_STRICT`} × {100 µs, 1 ms, 10 ms} × {user-interactive, background} QoS. 2000 samples per arm. Reports min/p50/p99/max of (wake − deadline) and a count of samples that returned before the deadline. The strict arm is required because the cited man page documents leeway 0 as leaving "the lower limit ... under the control of the system" and names `DISPATCH_TIMER_STRICT` as the documented opt-out; without it a threshold miss attributed to dispatch would be confounded with an unexercised mitigation. Each arm also emits its own dispatch setup cost and a timebase-conversion control measured on `CLOCK_UPTIME_RAW`, which needs no timebase arithmetic. |
-| Timebase-conversion control | The accepted next method brackets each same-thread wait with ordered reads `m0_outer,c0,base_abs … woke,c1,m1_outer`. `I16a` requires the independent `c1-c0` interval to lie between the converted-Mach inner and outer intervals with six-quantum slack, independently derived and capped at 0.5% of target. `I16b` requires at least one bracket no wider than 0.5% per same-thread arm. Both QoS classes are enforced; dispatch is report-only because its wake timestamp is cross-thread. The current code still implements the failed point comparison and must not be run as evidence until the containment method is implemented and independently code-reviewed. |
+| Timebase-conversion control | The accepted method brackets each same-thread wait with ordered reads `m0_outer,c0,base_abs … woke,c1,m1_outer`. `I16a` requires the independent `c1-c0` interval to lie between the converted-Mach inner and outer intervals with six-quantum slack, independently derived and capped at 0.5% of target. `I16b` requires at least one bracket no wider than 0.5% per same-thread arm. Both QoS classes are enforced; dispatch is report-only because its wake timestamp is cross-thread. The candidate code implements this contract and has passed self preflight, but must not be run as evidence until an independent code review accepts it. |
 | Cross-thread events | {`pthread_cond_signal`, `dispatch_semaphore_signal`, `pthread_kill(SIGUSR1)` to a **spinning** thread} × {user-interactive, background}. Each sample also records a **round trip** measured entirely on the sender's clock, because the one-way figure subtracts two threads' timestamps and no source in the inventory states that the clock is a system-wide comparable time base; half the round trip is reported as the assumption-free upper bound on one-way latency. 2000 samples per arm. The `pthread_kill` arm measures one documented per-thread signal mechanism against two parked-thread wake mechanisms. Within the mechanism set this investigation surveys it is the only member that reaches an executing rather than a parked target (`CLM-01-07-18`); the source set does not establish that it is the only such public mechanism overall, and no claim says so. |
 | Concurrent wakeup | `mach_wait_until` at a 1 ms target, user-interactive, with 2, 4, and 8 concurrent timer threads, 2000 samples per thread. The declared guest requirement is a 1 kHz tick *per vCPU* at 2/4/8 vCPUs, so a single-thread arm cannot speak to the aggregate rate. Samples are pooled across threads: reporting per-thread separately would be a placement statement, which `CLM-01-07-08` forbids. |
 | Affinity | `thread_policy_set(THREAD_AFFINITY_POLICY, tag=1)` return code, recorded so the P/E placement stratum question (`Q-05-06`) has a platform fact rather than an assumption. |
@@ -30,7 +30,7 @@ output of this probe is a placement observation.
 ```sh
 make BUILD=/tmp/inv0107            # build outside the repo
 export NATEMU_RAW_ROOT=/Users/liaozping/orca/natemu-raw
-# Do not run yet: containment implementation and code review are pending.
+# Do not run yet: independent code review is pending.
 ```
 
 `run.sh` refuses to start unless `NATEMU_RAW_ROOT` is set, is an existing
@@ -51,6 +51,12 @@ their deadline, which is impossible), and cross-thread delivery latency is
 negated. `src/check.py` must report `RESULT: FAIL` and exit non-zero. A
 checker that passes a `--negative` run has not been validated.
 
+`validate.sh` additionally runs the producer's `--control-selftest` and the
+checker matrix in `tests/control-fixtures.py`. These exercise ±1% conversion
+errors in both directions at every target, all four paired-read scheduling-gap
+placements, all-wide non-vacuity failure, malformed/domain/overflow failures,
+and both exact inclusive boundaries. They are preflight, not evidence.
+
 ## Fixed sample counts
 
 `--n` scales the wakeup, signal, and concurrent-wakeup arms. These counts are
@@ -65,12 +71,11 @@ does not reduce them:
 
 ## Per-rule checker validation
 
-This table is the validation contract for the next containment revision.
+This table describes the candidate containment revision.
 `--negative` reaches only part of the checker, so fixtures under `tests/`
-must cover the rest and `validate.sh` must fail if any invalid fixture passes.
-The current checker and fixtures validate only the obsolete point-comparison
-`I16`; they do not yet implement or validate `I16a`/`I16b` and are ineligible
-for evidence execution.
+cover the rest and `validate.sh` fails if any invalid fixture passes. The
+candidate has passed this self preflight, but remains ineligible for evidence
+execution until independent code acceptance.
 
 | Rule | Validated by |
 | --- | --- |
@@ -90,15 +95,14 @@ for evidence execution.
 | `I13` exact concurrent-wakeup coverage | `tests/negative-coverage.json` |
 | `I14` no concurrent wake before deadline | `--negative` mode |
 | `I15` concurrent-wakeup sample size | `--negative` mode (reduced-count run) |
-| `I16a` per-sample timebase containment | pending containment fixtures |
-| `I16b` per-arm non-vacuity | pending all-wide fixture |
+| `I16a` per-sample timebase containment | `--control-selftest`; `tests/control-fixtures.py` conversion, gap, malformed, overflow, and boundary cases |
+| `I16b` per-arm non-vacuity | `--control-selftest`; `tests/control-fixtures.py` all-wide and boundary cases |
 | `I17` one-way latency within the sender-only round trip | `tests/negative-coverage.json` |
 
 ## Checker
 
-The next revision of `src/check.py result.json` must separate two kinds of
-judgement as follows. This is a prospective contract, not a description of
-the current obsolete checker:
+The candidate `src/check.py result.json` separates two kinds of judgement as
+follows. It remains subject to independent code review:
 
 - **Integrity rules (`I0`–`I17`, with `I16a`/`I16b`)** detect a defective measurement; any failure
   exits non-zero. They cover experiment identity, timebase sanity, arm

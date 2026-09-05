@@ -9,7 +9,10 @@ trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM
 
 sh -n "$SCRIPT_DIR/run.sh"
 make -C "$SCRIPT_DIR" BUILD="$TMP_DIR/build"
+"$TMP_DIR/build/timers" --control-selftest
 python3 "$SCRIPT_DIR/src/check.py" "$SCRIPT_DIR/tests/valid.json"
+python3 "$SCRIPT_DIR/tests/control-fixtures.py" \
+    "$SCRIPT_DIR/src/check.py" "$SCRIPT_DIR/tests/valid.json"
 # tests/negative.json is a recorded --negative run: it validates the rules the
 # injected defect reaches. tests/negative-coverage.json validates the rest, so
 # together they exercise every integrity rule (REV-045 required change 5; the
