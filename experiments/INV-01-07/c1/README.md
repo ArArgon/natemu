@@ -236,6 +236,8 @@ These tests do not establish native runtime behavior. Fixture authors cannot
 independently approve their own fixture code in REV196.
 
 Historical development checkpoint `d49a95b`: the then-current48 tests passed
-in58.528s. REV-195 (self code review) pins the frozen packet's exact test
-count, wall time and per-file SHA-256; independent return REV-219 against
-REV-196 must accept before native execution is authorized.
+in58.528s (inspected as-is at REV-196). The draft had grown to70 tests before
+this packet; this frozen packet adds the v2 gate's independent-return fixtures
+and `test_producer_accounting.py`, for72 tests passing in95.117s. REV-195
+(self code review) pins the exact per-file SHA-256. Independent return
+REV-219 against REV-196 must accept before native execution is authorized.
