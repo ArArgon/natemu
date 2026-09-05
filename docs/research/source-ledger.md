@@ -294,6 +294,8 @@ and must not be reused (`REV-040` change 6, `REV-055` change 1).
 | `SRC-099` | primary | `dispatch_source_set_timer` | Apple | same capture and digest as the `CLM-01-22-09` row | `CLM-01-22-12` | start-clock, leeway, and residual latency clauses | supports one premise of the inference | captured 2026-09-03 | Supplies host timer clauses only. | `REV-132` | revise; bounded inference prepared, independent return pending |
 | `SRC-100` | primary | `dispatch_source_create(3)` | Apple | same capture and digest as the `CLM-01-22-09` row | `CLM-01-22-12` | timer deferral/strict/start-clock clauses | supports one premise of the inference | SDK 26.4 page | Supplies host timer clauses only. | `REV-132` | revise; bounded inference prepared, independent return pending |
 | `SRC-089` | primary | Intel SDM Vol. 3A | Intel | same capture and digests as the `CLM-01-22-10` row | `CLM-01-22-12` | §§13.5.4–13.5.4.1 | supports one premise of the inference | Order 253668-092US, June 2026 | Supplies guest timer mechanisms only. | `REV-132` | revise; bounded inference prepared, independent return pending |
+| `SRC-161` | primary | Arm A-profile Architecture Registers: ID_AA64MMFR0_EL1 | Arm | [DDI 0601 2025-12 register page](https://developer.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/ID-AA64MMFR0-EL1--AArch64-Memory-Model-Feature-Register-0); external captures and digests below | `CLM-01-02-16` | Named field headings/tables: TGran4, TGran64, TGran16, ASIDBits, PARange; separate TGran*_2 headings | supports | DDI 0601, 2025-12, revision 1; captured 2026-09-04 | Architectural field semantics only; metadata quality code `BET` retained without interpretation; no Apple API or host capability conclusion | `REV-133` (self), `REV-134` (independent) | accept; independently reviewed within stated bounds |
+| `SRC-161` | primary | Arm A-profile Architecture Registers: ID_AA64MMFR0_EL1 | Arm | same capture and revision | `CLM-01-02-17` | Same field positions and encoding tables | supports documentary premise | DDI 0601, 2025-12, revision 1 | Combined only with accepted `INV-01-01` `CLM-01-01-11` and digest-matched `MAN-01-01-01`; interpretation applies to the API-returned value, not a proved EL1 mechanism | `REV-133` (self), `REV-134` (independent) | source/derivation accept; adversarial pending |
 
 ## Review-date capture manifest
 
@@ -431,6 +433,18 @@ first (`REV-063` change 2).
 | `SRC-158` | `setjmp.3` (local SDK manual page, cited by resolved path + digest; no separate snapshot) | `10c344ae3ca39de323c3b4bb61aa82c1913b98a3921495b5ae1291fca48279f8` |
 | `SRC-159` | external raw capture `sources/Q-01-22/linux-v6.12-timekeeping.rst` | `ee39e07844c805393fb1e4015d5fc8d528acbc3e0d91d7c94cd35d550e01fb97` |
 | `SRC-160` | external raw capture `sources/Q-01-22/linux-v6.12-kvm-x86-timekeeping.rst` | `b8080d4d434bd40b90a0b7ee07d79dbbce99706458a149bb96ceef812de7246c` |
+
+`SRC-161` captures are under `NATEMU_RAW_ROOT=/Users/liaozping/orca/natemu-raw`:
+
+| Source ID | Path relative to external raw root | SHA-256 |
+| --- | --- | --- |
+| `SRC-161` | `sources/Q-01-02/register-20260904/arm-id-aa64mmfr0.json` | `958962fd43c97186d0a075308a6618f7f0a9a6d7d404f4fb604d54fea4ddfe36` |
+| `SRC-161` | `sources/Q-01-02/register-20260904/arm-ddi0601-metadata.json` | `cb12fc96224b704b11cca2dc988f05d7fb189d984ad1f54e0c5e6676f2c22c46` |
+
+The description was retrieved from `https://documentation-service.arm.com/documentation/ddi0601/2025-12/AArch64-Registers/ID-AA64MMFR0-EL1--AArch64-Memory-Model-Feature-Register-0?lang=en`;
+its self link adds `rev=1`. Metadata was retrieved from
+`https://documentation-service.arm.com/documentation/ddi0601/2025-12?lang=en`
+and identifies `document: ddi0601`, `version: 2025-12`, `revision: 1`.
 
 The `verdict` is a review outcome, not a claim of truth. Claim-level citations,
 the required source gate, and an explicit relationship for both support and
