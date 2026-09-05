@@ -52,10 +52,14 @@ negated. `src/check.py` must report `RESULT: FAIL` and exit non-zero. A
 checker that passes a `--negative` run has not been validated.
 
 `validate.sh` additionally runs the producer's `--control-selftest` and the
-checker matrix in `tests/control-fixtures.py`. These exercise ±1% conversion
-errors in both directions at every target, all four paired-read scheduling-gap
-placements, all-wide non-vacuity failure, malformed/domain/overflow failures,
-and both exact inclusive boundaries. They are preflight, not evidence.
+checker matrix in `tests/control-fixtures.py`. A raw-timestamp seam shared with
+production conversion and aggregation derives the fixtures: ±1% conversion
+errors in both directions at every target; all four paired-read gap placements
+at every target; and all-wide non-vacuity failure. The C self-test also drives
+raw inversion, conversion overflow, and signed-residual overflow through that
+seam. The checker matrix covers malformed aggregate domains, the slack cap,
+both exact inclusive boundaries, and the rule that even malformed dispatch
+diagnostics are report-only. These are preflight, not evidence.
 
 ## Fixed sample counts
 
@@ -95,8 +99,8 @@ execution until independent code acceptance.
 | `I13` exact concurrent-wakeup coverage | `tests/negative-coverage.json` |
 | `I14` no concurrent wake before deadline | `--negative` mode |
 | `I15` concurrent-wakeup sample size | `--negative` mode (reduced-count run) |
-| `I16a` per-sample timebase containment | `--control-selftest`; `tests/control-fixtures.py` conversion, gap, malformed, overflow, and boundary cases |
-| `I16b` per-arm non-vacuity | `--control-selftest`; `tests/control-fixtures.py` all-wide and boundary cases |
+| `I16a` per-sample timebase containment | `--control-selftest`; producer-derived `tests/control-fixtures.py` conversion/gap cases; malformed, overflow, boundary, and dispatch-report-only cases |
+| `I16b` per-arm non-vacuity | `--control-selftest`; producer-derived all-wide/gap cases; boundary and dispatch-report-only cases |
 | `I17` one-way latency within the sender-only round trip | `tests/negative-coverage.json` |
 
 ## Checker

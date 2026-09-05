@@ -169,6 +169,10 @@ def main(path):
     malformed, containment_bad, nonvacuous_bad = [], [], []
     for w in wakeup:
         ident = (w.get("mechanism"), w.get("target_ns"), w.get("qos"))
+        # Dispatch wake timestamps are captured on another thread. Its control
+        # object is diagnostic only: no value or shape in it may affect I16.
+        if w.get("mechanism") not in SAME_THREAD:
+            continue
         values = {name: w.get(name) for name in control_fields}
         n = values["timebase_control_n"]
         slack = values["timebase_control_slack_ns"]
@@ -190,8 +194,6 @@ def main(path):
         )
         if not shape_ok:
             malformed.append((ident, values, control_slack))
-            continue
-        if w.get("mechanism") not in SAME_THREAD:
             continue
         target = w.get("target_ns")
         if not is_u64(target, positive=True):

@@ -78,12 +78,27 @@ static int mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
 	return 0;
 }
 
-static int abs_interval_to_ns(uint64_t start, uint64_t end, uint64_t *out) {
-	if (end < start || g_tb.denom == 0) return -1;
-	__uint128_t value = (__uint128_t)(end - start) * g_tb.numer / g_tb.denom;
+static int interval_to_ns_ratio(uint64_t start, uint64_t end,
+                                uint64_t numer, uint64_t denom,
+                                uint64_t *out) {
+	if (end < start || numer == 0 || denom == 0) return -1;
+	__uint128_t value = (__uint128_t)(end - start) * numer / denom;
 	if (value > UINT64_MAX) return -1;
 	*out = (uint64_t)value;
 	return 0;
+}
+
+static int abs_interval_to_ns(uint64_t start, uint64_t end, uint64_t *out) {
+	return interval_to_ns_ratio(start, end, g_tb.numer, g_tb.denom, out);
+}
+
+static int derive_control_slack(uint64_t numer, uint64_t denom,
+                                uint64_t clock_resolution, uint64_t *out) {
+	if (numer == 0 || denom == 0 || clock_resolution == 0) return -1;
+	uint64_t mach_quantum = numer / denom + (numer % denom != 0);
+	uint64_t quantum = mach_quantum > clock_resolution
+	                       ? mach_quantum : clock_resolution;
+	return mul_u64(quantum, 6, out);
 }
 
 static int diff_u64_i64(uint64_t a, uint64_t b, int64_t *out) {
@@ -116,49 +131,241 @@ static int control_evaluate(uint64_t inner, uint64_t independent,
 	return 0;
 }
 
+typedef struct {
+	uint64_t m0_outer, c0, base_abs, woke, c1, m1_outer;
+} control_sample_t;
+
+typedef struct {
+	long n, valid, invalid, violations, tight;
+	int64_t max_lower_residual, max_upper_residual;
+	uint64_t min_width;
+} control_stats_t;
+
+static void control_stats_init(control_stats_t *s) {
+	memset(s, 0, sizeof *s);
+	s->max_lower_residual = INT64_MIN;
+	s->max_upper_residual = INT64_MIN;
+	s->min_width = UINT64_MAX;
+}
+
+/* This raw-timestamp seam is shared by production and fault injection. */
+static int control_add_raw(control_stats_t *stats, control_sample_t sample,
+                           uint64_t numer, uint64_t denom, uint64_t slack,
+                           uint64_t tight_limit) {
+	uint64_t inner, outer, width;
+	int64_t lower, upper;
+	stats->n++;
+	if (sample.c1 < sample.c0 ||
+	    interval_to_ns_ratio(sample.base_abs, sample.woke, numer, denom,
+	                         &inner) != 0 ||
+	    interval_to_ns_ratio(sample.m0_outer, sample.m1_outer, numer, denom,
+	                         &outer) != 0 ||
+	    control_evaluate(inner, sample.c1 - sample.c0, outer, slack,
+	                     &lower, &upper, &width) != 0) {
+		stats->invalid++;
+		return -1;
+	}
+	stats->valid++;
+	if (lower > 0 || upper > 0) stats->violations++;
+	if (lower > stats->max_lower_residual) stats->max_lower_residual = lower;
+	if (upper > stats->max_upper_residual) stats->max_upper_residual = upper;
+	if (width < stats->min_width) stats->min_width = width;
+	if (width <= tight_limit) stats->tight++;
+	return 0;
+}
+
+static int64_t control_lower(const control_stats_t *s) {
+	return s->valid ? s->max_lower_residual : 0;
+}
+static int64_t control_upper(const control_stats_t *s) {
+	return s->valid ? s->max_upper_residual : 0;
+}
+static uint64_t control_width(const control_stats_t *s) {
+	return s->valid ? s->min_width : 0;
+}
+
+static void emit_control_object(FILE *f, const control_stats_t *s,
+                                uint64_t slack) {
+	fprintf(f,
+	        "{\"timebase_control_n\":%ld,"
+	        "\"timebase_control_slack_ns\":%llu,"
+	        "\"timebase_control_invalid_count\":%ld,"
+	        "\"timebase_control_violation_count\":%ld,"
+	        "\"timebase_control_max_lower_residual_ns\":%lld,"
+	        "\"timebase_control_max_upper_residual_ns\":%lld,"
+	        "\"timebase_control_min_width_ns\":%llu,"
+	        "\"timebase_control_tight_count\":%ld}",
+	        s->n, (unsigned long long)slack, s->invalid, s->violations,
+	        (long long)control_lower(s), (long long)control_upper(s),
+	        (unsigned long long)control_width(s), s->tight);
+}
+
+enum synthetic_kind {
+	SYN_VALID, SYN_CONVERSION_PLUS, SYN_CONVERSION_MINUS,
+	SYN_GAP_M0_C0, SYN_GAP_C0_BASE, SYN_GAP_WOKE_C1, SYN_GAP_C1_M1,
+	SYN_ALL_WIDE
+};
+
+static control_sample_t synthetic_sample(uint64_t target_ns) {
+	uint64_t ticks = target_ns * 3 / 125;
+	control_sample_t sample = {
+	    .m0_outer = 0,
+	    .c0 = 1000,
+	    .base_abs = 2,
+	    .woke = 2 + ticks,
+	    .c1 = 1000 + target_ns + 83,
+	    .m1_outer = ticks + 4,
+	};
+	return sample;
+}
+
+static int synthetic_stats(enum synthetic_kind kind, uint64_t target_ns,
+                           control_stats_t *stats, uint64_t *slack_out) {
+	uint64_t slack;
+	if (derive_control_slack(125, 3, 42, &slack) != 0) return -1;
+	control_stats_init(stats);
+	control_sample_t base = synthetic_sample(target_ns);
+	control_sample_t sample = base;
+	uint64_t numer = 125, denom = 3;
+	if (kind == SYN_CONVERSION_PLUS) {
+		numer = 12625;
+		denom = 300;
+	} else if (kind == SYN_CONVERSION_MINUS) {
+		numer = 12375;
+		denom = 300;
+	} else if (kind != SYN_VALID) {
+		uint64_t gap_ns = target_ns / 20;
+		uint64_t gap_ticks = gap_ns * 3 / 125;
+		if (kind != SYN_ALL_WIDE &&
+		    control_add_raw(stats, base, numer, denom, slack,
+		                    target_ns / 200) != 0)
+			return -1;
+		if (kind == SYN_GAP_M0_C0 || kind == SYN_ALL_WIDE) {
+			sample.base_abs += gap_ticks;
+			sample.woke += gap_ticks;
+			sample.m1_outer += gap_ticks;
+		} else if (kind == SYN_GAP_C0_BASE) {
+			sample.base_abs += gap_ticks;
+			sample.woke += gap_ticks;
+			sample.m1_outer += gap_ticks;
+			sample.c1 += gap_ns;
+		} else if (kind == SYN_GAP_WOKE_C1) {
+			sample.c1 += gap_ns;
+			sample.m1_outer += gap_ticks;
+		} else if (kind == SYN_GAP_C1_M1) {
+			sample.m1_outer += gap_ticks;
+		} else {
+			return -1;
+		}
+	}
+	long first = kind >= SYN_GAP_M0_C0 && kind <= SYN_GAP_C1_M1 ? 1 : 0;
+	for (long i = first; i < 2000; i++)
+		if (control_add_raw(stats, sample, numer, denom, slack,
+		                    target_ns / 200) != 0)
+			return -1;
+	*slack_out = slack;
+	return 0;
+}
+
+static int parse_synthetic_kind(const char *name, enum synthetic_kind *kind,
+                                uint64_t *target) {
+	static const struct { const char *prefix; enum synthetic_kind kind; } cases[] = {
+	    {"valid-", SYN_VALID},
+	    {"conversion-plus-", SYN_CONVERSION_PLUS},
+	    {"conversion-minus-", SYN_CONVERSION_MINUS},
+	    {"gap-m0-c0-", SYN_GAP_M0_C0},
+	    {"gap-c0-base-", SYN_GAP_C0_BASE},
+	    {"gap-woke-c1-", SYN_GAP_WOKE_C1},
+	    {"gap-c1-m1-", SYN_GAP_C1_M1},
+	    {"all-wide-", SYN_ALL_WIDE},
+	};
+	for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+		size_t n = strlen(cases[i].prefix);
+		if (strncmp(name, cases[i].prefix, n) != 0) continue;
+		const char *number = name + n;
+		char *end = NULL;
+		errno = 0;
+		unsigned long long value = strtoull(number, &end, 10);
+		if (errno || !end || *end != '\0' ||
+		    (value != 100000 && value != 1000000 && value != 10000000))
+			return -1;
+		*kind = cases[i].kind;
+		*target = (uint64_t)value;
+		return 0;
+	}
+	return -1;
+}
+
+static int emit_synthetic_case(const char *name) {
+	enum synthetic_kind kind;
+	uint64_t target, slack;
+	control_stats_t stats;
+	if (parse_synthetic_kind(name, &kind, &target) != 0 ||
+	    synthetic_stats(kind, target, &stats, &slack) != 0)
+		return -1;
+	emit_control_object(stdout, &stats, slack);
+	fputc('\n', stdout);
+	return 0;
+}
+
 static int control_selftest(void) {
 	static const uint64_t targets[] = {100000, 1000000, 10000000};
-	const uint64_t slack = 252;
 	for (size_t i = 0; i < sizeof targets / sizeof targets[0]; i++) {
-		uint64_t t = targets[i], width;
-		int64_t lower, upper;
-		/* Both inclusive boundaries must pass. */
-		if (control_evaluate(t, t - slack, t, slack,
-		                     &lower, &upper, &width) != 0 ||
-		    lower != 0 || upper > 0)
+		uint64_t t = targets[i], slack;
+		control_stats_t stats;
+		if (synthetic_stats(SYN_VALID, t, &stats, &slack) != 0 ||
+		    stats.invalid != 0 || stats.violations != 0 ||
+		    stats.tight != 2000)
 			return 1;
-		if (control_evaluate(t, t + slack, t, slack,
-		                     &lower, &upper, &width) != 0 ||
-		    lower > 0 || upper != 0)
+		if (synthetic_stats(SYN_CONVERSION_PLUS, t, &stats, &slack) != 0 ||
+		    stats.invalid != 0 || stats.violations != 2000 ||
+		    control_lower(&stats) <= 0)
 			return 1;
-		/* A ±1% converted-Mach error must cross the appropriate bound. */
-		uint64_t high = t + t / 100;
-		uint64_t low = t - t / 100;
-		if (control_evaluate(high, t, high + 1, slack,
-		                     &lower, &upper, &width) != 0 || lower <= 0)
+		if (synthetic_stats(SYN_CONVERSION_MINUS, t, &stats, &slack) != 0 ||
+		    stats.invalid != 0 || stats.violations != 2000 ||
+		    control_upper(&stats) <= 0)
 			return 1;
-		if (control_evaluate(low, t, low + 1, slack,
-		                     &lower, &upper, &width) != 0 || upper <= 0)
+		for (enum synthetic_kind kind = SYN_GAP_M0_C0;
+		     kind <= SYN_GAP_C1_M1; kind++) {
+			if (synthetic_stats(kind, t, &stats, &slack) != 0 ||
+			    stats.invalid != 0 || stats.violations != 0 ||
+			    stats.tight != 1 || control_width(&stats) > t / 200)
+				return 1;
+		}
+		if (synthetic_stats(SYN_ALL_WIDE, t, &stats, &slack) != 0 ||
+		    stats.invalid != 0 || stats.violations != 0 || stats.tight != 0 ||
+		    control_width(&stats) <= t / 200)
 			return 1;
-		/* Gaps in either paired-read window widen a valid bracket. */
-		uint64_t gap = t / 20;
-		if (control_evaluate(t, t, t + gap, slack,
-		                     &lower, &upper, &width) != 0 ||
-		    lower > 0 || upper > 0 || width != gap)
-			return 1;
-		if (control_evaluate(t, t + gap, t + gap, slack,
-		                     &lower, &upper, &width) != 0 ||
-		    lower > 0 || upper > 0 || width != gap)
-			return 1;
-		/* An all-wide arm passes containment but fails non-vacuity. */
-		if (width <= t / 200) return 1;
 	}
 	int64_t lower, upper;
 	uint64_t width;
-	if (control_evaluate(2, 1, 1, slack, &lower, &upper, &width) == 0)
+	if (control_evaluate(1000, 748, 1000, 252,
+	                     &lower, &upper, &width) != 0 ||
+	    lower != 0 || upper > 0)
 		return 1;
-	if (control_evaluate(1, UINT64_MAX, 1, slack,
-	                     &lower, &upper, &width) == 0)
+	if (control_evaluate(1000, 1252, 1000, 252,
+	                     &lower, &upper, &width) != 0 ||
+	    lower > 0 || upper != 0)
+		return 1;
+	/* Raw inversion, conversion overflow, and signed-residual overflow all
+	 * reach the same production seam and are recorded invalid. */
+	control_stats_t stats;
+	control_sample_t bad = synthetic_sample(100000);
+	control_stats_init(&stats);
+	bad.m1_outer = bad.m0_outer;
+	if (control_add_raw(&stats, bad, 125, 3, 252, 500) == 0 ||
+	    stats.invalid != 1)
+		return 1;
+	control_stats_init(&stats);
+	bad = synthetic_sample(100000);
+	bad.m1_outer = UINT64_MAX;
+	if (control_add_raw(&stats, bad, UINT32_MAX, 1, 252, 500) == 0 ||
+	    stats.invalid != 1)
+		return 1;
+	control_stats_init(&stats);
+	bad = (control_sample_t){0, 0, 0, UINT64_MAX, 0, UINT64_MAX};
+	if (control_add_raw(&stats, bad, 1, 1, 1, 500) == 0 ||
+	    stats.invalid != 1)
 		return 1;
 	return 0;
 }
@@ -364,20 +571,18 @@ static void wakeup_arm(FILE *f, const char *mech, long target_ns,
 	/* Accepted containment control (REV-139). The independent interval is
 	 * bracketed by converted-Mach inner and outer intervals; paired-read
 	 * scheduling can widen the bracket but cannot create a false violation. */
-	uint64_t mach_quantum =
-	    ((uint64_t)g_tb.numer + (uint64_t)g_tb.denom - 1) / g_tb.denom;
-	uint64_t quantum = mach_quantum > g_uptime_raw_resolution_ns
-	                       ? mach_quantum : g_uptime_raw_resolution_ns;
 	uint64_t ctrl_slack_ns;
-	if (quantum == 0 || mul_u64(quantum, 6, &ctrl_slack_ns) != 0) {
+	if (derive_control_slack(g_tb.numer, g_tb.denom,
+	                         g_uptime_raw_resolution_ns,
+	                         &ctrl_slack_ns) != 0) {
 		fprintf(stderr, "invalid timebase-control slack\n");
 		exit(1);
 	}
 	uint64_t tight_limit_ns = (uint64_t)target_ns / 200;
-	long ctrl_violations = 0, ctrl_tight_count = 0;
-	int64_t ctrl_max_lower_residual = INT64_MIN;
-	int64_t ctrl_max_upper_residual = INT64_MIN;
-	uint64_t ctrl_min_width = UINT64_MAX;
+	int enforce_control = strcmp(mech, "mach_wait_until") == 0 ||
+	                      strcmp(mech, "nanosleep") == 0;
+	control_stats_t ctrl_stats;
+	control_stats_init(&ctrl_stats);
 	set_qos(q);
 	for (long i = 0; i < g_n; i++) {
 		uint64_t m0_outer = mach_absolute_time();
@@ -449,23 +654,20 @@ static void wakeup_arm(FILE *f, const char *mech, long target_ns,
 		}
 		e = woke >= deadline_abs ? (int64_t)error_magnitude
 		                         : -(int64_t)error_magnitude;
-		uint64_t inner, outer, width;
-		int64_t lower_residual, upper_residual;
-		if (ctrl1 < ctrl0 ||
-		    abs_interval_to_ns(base_abs, woke, &inner) != 0 ||
-		    abs_interval_to_ns(m0_outer, m1_outer, &outer) != 0 ||
-		    control_evaluate(inner, ctrl1 - ctrl0, outer, ctrl_slack_ns,
-		                     &lower_residual, &upper_residual, &width) != 0) {
+		control_sample_t control_sample = {
+		    .m0_outer = m0_outer,
+		    .c0 = ctrl0,
+		    .base_abs = base_abs,
+		    .woke = woke,
+		    .c1 = ctrl1,
+		    .m1_outer = m1_outer,
+		};
+		if (control_add_raw(&ctrl_stats, control_sample,
+		                    g_tb.numer, g_tb.denom, ctrl_slack_ns,
+		                    tight_limit_ns) != 0 && enforce_control) {
 			fprintf(stderr, "invalid timebase-control sample\n");
 			exit(1);
 		}
-		if (lower_residual > 0 || upper_residual > 0) ctrl_violations++;
-		if (lower_residual > ctrl_max_lower_residual)
-			ctrl_max_lower_residual = lower_residual;
-		if (upper_residual > ctrl_max_upper_residual)
-			ctrl_max_upper_residual = upper_residual;
-		if (width < ctrl_min_width) ctrl_min_width = width;
-		if (width <= tight_limit_ns) ctrl_tight_count++;
 		if (g_negative) e -= target_ns / 4; /* injected defect: impossible early wake */
 		err[i] = e;
 	}
@@ -474,17 +676,18 @@ static void wakeup_arm(FILE *f, const char *mech, long target_ns,
 	fprintf(f,
 	        ",\"timebase_control_n\":%ld,"
 	        "\"timebase_control_slack_ns\":%llu,"
-	        "\"timebase_control_invalid_count\":0,"
+	        "\"timebase_control_invalid_count\":%ld,"
 	        "\"timebase_control_violation_count\":%ld,"
 	        "\"timebase_control_max_lower_residual_ns\":%lld,"
 	        "\"timebase_control_max_upper_residual_ns\":%lld,"
 	        "\"timebase_control_min_width_ns\":%llu,"
 	        "\"timebase_control_tight_count\":%ld,"
 	        "\"setup_p_mean_ns\":%lld}%s\n",
-	        g_n, (unsigned long long)ctrl_slack_ns, ctrl_violations,
-	        (long long)ctrl_max_lower_residual,
-	        (long long)ctrl_max_upper_residual,
-	        (unsigned long long)ctrl_min_width, ctrl_tight_count,
+	        ctrl_stats.n, (unsigned long long)ctrl_slack_ns,
+	        ctrl_stats.invalid, ctrl_stats.violations,
+	        (long long)control_lower(&ctrl_stats),
+	        (long long)control_upper(&ctrl_stats),
+	        (unsigned long long)control_width(&ctrl_stats), ctrl_stats.tight,
 	        (long long)(setup_n ? setup_ns / setup_n : 0),
 	        last ? "" : ",");
 	free(err);
@@ -704,22 +907,36 @@ static void probe_affinity(FILE *f) {
 
 int main(int argc, char **argv) {
 	const char *out = NULL;
+	const char *control_case = NULL;
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--negative")) g_negative = 1;
 		else if (!strcmp(argv[i], "--control-selftest")) g_control_selftest = 1;
+		else if (!strcmp(argv[i], "--control-case") && i + 1 < argc)
+			control_case = argv[++i];
 		else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
 		else if (!strcmp(argv[i], "--n") && i + 1 < argc)
 			g_n = parse_positive(argv[++i], "--n");
-		else { fprintf(stderr, "usage: %s [--out F] [--n N] [--negative] [--control-selftest]\n", argv[0]); return 2; }
+		else { fprintf(stderr, "usage: %s [--out F] [--n N] [--negative] [--control-selftest | --control-case NAME]\n", argv[0]); return 2; }
 	}
 	if (g_control_selftest) {
-		if (out || g_negative || g_n != 2000) {
+		if (out || control_case || g_negative || g_n != 2000) {
 			fprintf(stderr, "--control-selftest does not accept other options\n");
 			return 2;
 		}
 		int rc = control_selftest();
 		fprintf(stderr, "INV-01-07 control self-test %s\n", rc ? "FAIL" : "PASS");
 		return rc;
+	}
+	if (control_case) {
+		if (out || g_negative || g_n != 2000) {
+			fprintf(stderr, "--control-case does not accept other options\n");
+			return 2;
+		}
+		if (emit_synthetic_case(control_case) != 0) {
+			fprintf(stderr, "unknown or invalid control case: %s\n", control_case);
+			return 2;
+		}
+		return 0;
 	}
 	if (mach_timebase_info(&g_tb) != KERN_SUCCESS) { perror("timebase"); return 1; }
 	if (g_tb.numer == 0 || g_tb.denom == 0) {

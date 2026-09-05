@@ -47,40 +47,58 @@ def changed(base, mutate):
     return payload
 
 
+def producer_case(producer, name):
+    proc = subprocess.run(
+        [str(producer), "--control-case", name],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"producer control case {name} failed: {proc.stderr.strip()}")
+    return json.loads(proc.stdout)
+
+
+def install_control(row, values):
+    for key, value in values.items():
+        row[key] = value
+
+
 def main():
-    if len(sys.argv) != 3:
-        print(f"usage: {sys.argv[0]} CHECKER VALID_FIXTURE", file=sys.stderr)
+    if len(sys.argv) != 4:
+        print(f"usage: {sys.argv[0]} CHECKER VALID_FIXTURE PRODUCER",
+              file=sys.stderr)
         return 2
-    checker, fixture = map(Path, sys.argv[1:])
+    checker, fixture, producer = map(Path, sys.argv[1:])
     base = json.loads(fixture.read_text())
     cases = [(base, True, "baseline")]
 
     # A ±1% conversion defect must fail in both directions at every target.
     for target in (100000, 1000000, 10000000):
-        for direction, field in (("plus", "timebase_control_max_lower_residual_ns"),
-                                 ("minus", "timebase_control_max_upper_residual_ns")):
-            def inject(payload, target=target, field=field):
-                row = arm(payload, target=target)
-                row["timebase_control_violation_count"] = 1
-                row[field] = target // 100 - row["timebase_control_slack_ns"]
+        for direction in ("plus", "minus"):
+            derived = producer_case(
+                producer, f"conversion-{direction}-{target}")
+            def inject(payload, target=target, derived=derived):
+                install_control(arm(payload, target=target), derived)
             cases.append((changed(base, inject), False,
                           f"conversion-{direction}-1pct-{target}"))
 
-    # Each paired-read scheduling gap may widen one sample while another
-    # sample keeps the arm non-vacuous. Producer arithmetic is checked by the
-    # C self-test; these cases verify checker acceptance of the aggregates.
-    for location in ("m0-c0", "c0-base", "woke-c1", "c1-m1"):
-        def widen(payload):
-            row = arm(payload)
-            row["timebase_control_tight_count"] = row["n"] - 1
-        cases.append((changed(base, widen), True, f"scheduling-gap-{location}"))
+    # Every placement is a distinct raw timestamp tuple driven through the
+    # same conversion and aggregation seam production uses. One tight sample
+    # in each derived aggregate preserves I16b.
+    for target in (100000, 1000000, 10000000):
+        for location in ("m0-c0", "c0-base", "woke-c1", "c1-m1"):
+            derived = producer_case(producer, f"gap-{location}-{target}")
+            def widen(payload, target=target, derived=derived):
+                install_control(arm(payload, target=target), derived)
+            cases.append((changed(base, widen), True,
+                          f"scheduling-gap-{location}-{target}"))
 
-    def all_wide(payload):
-        for row in payload["wakeup"]:
-            if row["mechanism"] in ("mach_wait_until", "nanosleep"):
-                row["timebase_control_tight_count"] = 0
-                row["timebase_control_min_width_ns"] = row["target_ns"] // 200 + 1
-    cases.append((changed(base, all_wide), False, "all-wide"))
+    derived_wide = producer_case(producer, "all-wide-100000")
+    cases.append((changed(base, lambda p: install_control(
+        arm(p), derived_wide)), False, "all-wide"))
 
     # Inclusive exact boundaries are valid.
     cases.append((changed(base, lambda p: arm(p).__setitem__(
@@ -129,6 +147,15 @@ def main():
         for row in payload["wakeup"]:
             row["timebase_control_slack_ns"] = 6000
     cases.append((changed(base, coarse_resolution), False, "slack-cap"))
+
+    # No dispatch diagnostic, however malformed, can affect I16a/I16b.
+    def erase_dispatch_control(payload):
+        row = arm(payload, mechanism="dispatch_source_timer_leeway0")
+        for key in list(row):
+            if key.startswith("timebase_control_"):
+                del row[key]
+    cases.append((changed(base, erase_dispatch_control), True,
+                  "dispatch-report-only"))
 
     ok = True
     for payload, expect_pass, label in cases:
