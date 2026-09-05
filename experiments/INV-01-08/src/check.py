@@ -10,8 +10,13 @@ uninterpretable.
 Non-observation is never proof of prohibition; the architectural claims come
 from the cited Arm ARM and Intel SDM sections, not from this checker.
 """
+import argparse
+import contextlib
+import io
 import json
 import sys
+
+from histogram import load_cohort, report, validate_histograms
 
 MIN_ITERS = 1000000
 QOS = {"user-interactive", "background"}
@@ -50,8 +55,11 @@ ALIGNMENT_CASES = {
 }
 
 
-def main(path):
-    d = json.load(open(path))
+def main(path, data=None, integrity_only=False):
+    if data is None:
+        with open(path) as stream:
+            data = json.load(stream)
+    d = data
     fails, notes = [], []
 
     def rule(ok, name, detail):
@@ -142,46 +150,23 @@ def main(path):
         print(f"RESULT: FAIL ({len(fails)} integrity failures)")
         return 1
 
+    try:
+        validate_histograms(d)
+    except (KeyError, TypeError, ValueError) as exc:
+        print(f"  FAIL  H-input reporting validation: {exc}")
+        print("  -- histogram and decision thresholds suppressed: invalid reporting input --")
+        print("RESULT: FAIL (reporting input)")
+        return 1
+    if integrity_only:
+        return 0
+
     print("  -- decision thresholds (result gate adjudicates) --")
 
     def thr(name, ok, detail):
         print(f"  {'MEET' if ok else 'MISS'}  {name}: {detail}")
 
-    # Predeclared histogram comparison (INV-01-08, Alternative explanations;
-    # REV-064 change 2). The both-observed cell measures how often the two
-    # sides actually overlapped, independently of the relaxed outcome. If a
-    # strengthened arm's fraction differs from its plain counterpart's by more
-    # than an order of magnitude, the two arms did not sample comparable
-    # interleaving distributions and the comparison is INCONCLUSIVE, not
-    # corroboration. Reported, never an integrity failure: a sharp difference
-    # is a finding about the harness, which returns to the method gate.
-    def both_observed(arm):
-        h = arm.get("histogram") or {}
-        n = sum(h.values()) or 1
-        return h.get("r0!=0,r1!=0", 0) / n
-
-    for test in ("SB", "MP"):
-        for qos in sorted(QOS):
-            plain = [l for l in lit if (l["test"], l["variant"], l["qos"])
-                     == (test, "plain-ldr-str", qos)]
-            if not plain:
-                continue
-            fp = both_observed(plain[0])
-            for variant in ("ldar-stlr", "dmb-ish"):
-                arm = [l for l in lit if (l["test"], l["variant"], l["qos"])
-                       == (test, variant, qos)]
-                if not arm:
-                    continue
-                fs = both_observed(arm[0])
-                lo, hi = sorted((fp, fs))
-                comparable = hi <= max(lo, 1e-9) * 10
-                print(f"  {'COMPARABLE' if comparable else 'INCONCLUSIVE'}  "
-                      f"H {test}/{variant}/{qos}: both-observed fraction "
-                      f"plain={fp:.4f} vs {variant}={fs:.4f}"
-                      + ("" if comparable else
-                         " — arms did not sample comparable interleaving "
-                         "distributions; the strengthened arm's zero "
-                         "corroborates nothing (see Alternative explanations)"))
+    # REV-167: exact three-way diagnostic and separate exposure eligibility.
+    report([d])
 
     cross16 = [a for a in al if "crossing 16-byte boundary" in a["case"]]
     if cross16:
@@ -229,5 +214,50 @@ def main(path):
     return 1 if fails else 0
 
 
+def run_selected(args):
+    if not args.cohort:
+        return main(args.path or "result.json")
+    identity, digest, review_path, runs = load_cohort(args.cohort)
+    for path, data in runs:
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            rc = main(path, data=data, integrity_only=True)
+        if rc:
+            print(captured.getvalue(), end="")
+            print("RESULT: FAIL (entire cohort suppressed; failed member)")
+            return 1
+    print(f"INV-01-08 pooled histogram cohort={identity} sha256={digest} review={review_path}")
+    for path, _ in runs:
+        print(f"  member={path}")
+    report([data for _, data in runs])
+    print("RESULT: PASS (reviewed cohort histogram only; no pooled timing thresholds)")
+    return 0
+
+
+def cli(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("path", nargs="?", help="one result.json; no automatic pooling")
+    parser.add_argument("--cohort", help="explicit digest-bound independently reviewed cohort JSON")
+    args = parser.parse_args(argv)
+    if args.path and args.cohort:
+        parser.error("choose one result or --cohort")
+    # REV-182: late input/arithmetic/rendering errors must not leak earlier
+    # eligible histogram rows or timing claims. Buffer the entire selected
+    # report, including the pooled path; publish only after normal completion.
+    output = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output):
+            rc = run_selected(args)
+    except Exception as exc:
+        # Also cover unexpected rendering failures, not just schema errors.
+        # Exception details may contain input/partially rendered report text;
+        # emit only the exception type so they cannot reintroduce claim rows.
+        print("RESULT: FAIL (input/report rejected; no histogram/threshold claims): "
+              f"{type(exc).__name__}")
+        return 1
+    print(output.getvalue(), end="")
+    return rc
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "result.json"))
+    sys.exit(cli())

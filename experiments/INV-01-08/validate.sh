@@ -44,6 +44,7 @@ for sym_mnemonic in '_lse_thread:ldadd' '_lse_thread:cas' '_probe_one:ldaddal'; 
 done
 
 python3 "$SCRIPT_DIR/src/check.py" "$SCRIPT_DIR/tests/valid.json"
+python3 "$SCRIPT_DIR/tests/histogram-fixtures.py"
 for fixture in negative forbidden negative-coverage; do
     if python3 "$SCRIPT_DIR/src/check.py" "$SCRIPT_DIR/tests/$fixture.json"; then
         echo "$fixture checker fixture unexpectedly passed" >&2
