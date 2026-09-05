@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""Author-created synthetic F08-2 fixtures, not independent oracle approval.
+
+No native probe/control is launched. Mocked watchdog/process cases exercise
+supervision logic without running a timer or generating research evidence.
+"""
+import contextlib
+import copy
+import errno
+import io
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+import authorization as auth
+import check
+from fallback import validate_fallback, fallback_ratio, validate_full_counts
+import supervisor as sup
+
+
+def valid():
+    d = json.loads((ROOT / "tests/valid.json").read_text())
+    d.update(schema="INV-01-08-result-v2", method="F08-2", mode="normal",
+             code_revision="1" * 40, completed_normal=True, standalone=False,
+             timebase={"numer": 125, "denom": 3})
+    d["fallback_global_lock"] = {
+        "schema": "INV-01-08-fallback-v2", "threads": 4, "allocation_size": 256,
+        "allocation_alignment": 128, "allocation_address": 4096, "target_offset": 78,
+        "target_width": 4, "initial_value": 0, "final_value": 1000000,
+        "expected_value": 1000000, "expected_ops": 1000000, "ops": 1000000,
+        "completed_ops": 1000000, "actual_writes": 1000000, "lost_updates": 0,
+        "canary_before_initial": 0xa5a5a5a5, "canary_before_final": 0xa5a5a5a5,
+        "canary_after_initial": 0x5a5a5a5a, "canary_after_final": 0x5a5a5a5a,
+        "created": 4, "joined": 4, "init_rc": 0, "destroy_rc": 0,
+        "create_rc": [0] * 4, "join_rc": [0] * 4,
+        "start_ticks": 100, "end_ticks": 12000100, "elapsed_ns": 500000000,
+        "timebase_numer": 125, "timebase_denom": 3, "timebase_rc": 0,
+        "timing_valid": True, "injected": False, "completed_normal": True,
+        "workers": [{"id": i, "qos": "user-interactive", "qos_rc": 0,
+                     "ready": True, "completed": True, "requested_iterations": 250000,
+                     "completed_iterations": 250000, "actual_writes": 250000,
+                     "successful_locks": 250000, "successful_unlocks": 250000,
+                     "first_error": None} for i in range(4)],
+    }
+    return d
+
+
+class Fallback(unittest.TestCase):
+    def rejected(self, d, group=None):
+        errors = validate_fallback(d)
+        self.assertTrue(errors)
+        if group:
+            self.assertTrue(any(group in line for line in errors), errors)
+
+    def test_positive_and_strict_exact_boundary(self):
+        d = valid()
+        self.assertEqual(validate_fallback(d), [])
+        self.assertEqual(fallback_ratio(d), 500)
+        self.assertFalse(fallback_ratio(d) < 500)
+        for delta in (-1, 1):
+            r = copy.deepcopy(d)
+            f = r["fallback_global_lock"]
+            f["end_ticks"] += delta
+            f["elapsed_ns"] = (f["end_ticks"] - f["start_ticks"]) * 125 // 3
+            self.assertEqual(validate_fallback(r), [])
+            self.assertEqual(fallback_ratio(r) < 500, delta < 0)
+
+    def test_full_cli_exact_t2_screen_with_explicit_binding_mock(self):
+        for delta, decision in ((0, "MISS"), (-1, "MEET"), (1, "MISS")):
+            d = valid()
+            f = d["fallback_global_lock"]
+            f["end_ticks"] += delta
+            f["elapsed_ns"] = (f["end_ticks"] - f["start_ticks"]) * 125 // 3
+            output = io.StringIO()
+            with patch.object(check, "json_read", return_value=d), \
+                 patch.object(check, "validate_result_binding"), contextlib.redirect_stdout(output):
+                self.assertEqual(check.cli(["synthetic-render-fixture"]), 0)
+            self.assertIn(decision + "  T2", output.getvalue())
+
+    def test_retained_i1_i4_direct_fixture_mutations(self):
+        for mutation, expected in ((lambda d:d["litmus"].pop(), "FAIL  I1"),
+                                   (lambda d:d["litmus"][0].update(iterations=999999), "FAIL  I4")):
+            d = json.loads((ROOT/"tests/valid.json").read_text())
+            mutation(d)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(check.main("synthetic", data=d, historical=True), 1)
+            self.assertIn(expected, output.getvalue())
+            self.assertNotIn("corroboration=", output.getvalue())
+
+    def test_every_required_fallback_field_missing(self):
+        for key in valid()["fallback_global_lock"]:
+            with self.subTest(key=key):
+                d = valid()
+                d["fallback_global_lock"].pop(key)
+                self.rejected(d)
+
+    def test_every_required_worker_field_missing(self):
+        for key in valid()["fallback_global_lock"]["workers"][0]:
+            d = valid()
+            d["fallback_global_lock"]["workers"][0].pop(key)
+            self.rejected(d)
+
+    def test_integer_types_bounds_and_boolean_confusion(self):
+        original = valid()["fallback_global_lock"]
+        for key, value in original.items():
+            if type(value) is int:
+                for bad in (True, False, -1, 1 << 64, "0", None, 0.0):
+                    with self.subTest(key=key, value=bad):
+                        d = valid()
+                        d["fallback_global_lock"][key] = bad
+                        self.rejected(d)
+        for key, value in original["workers"][0].items():
+            if type(value) is int:
+                for bad in (True, -1, "0", None, 1 << 64):
+                    d = valid()
+                    d["fallback_global_lock"]["workers"][0][key] = bad
+                    self.rejected(d)
+
+    def test_api_count_canary_and_state_corruption(self):
+        original = valid()["fallback_global_lock"]
+        for key in original:
+            if type(original[key]) is int:
+                d = valid()
+                d["fallback_global_lock"][key] += 1
+                self.rejected(d)
+        for key in ("create_rc", "join_rc"):
+            for values in ([0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, None], [0, 0, 0, errno.EIO], [False]*4):
+                d = valid()
+                d["fallback_global_lock"][key] = values
+                self.rejected(d, "F3")
+        for key in ("ready", "completed", "first_error", "qos", "qos_rc"):
+            d = valid()
+            d["fallback_global_lock"]["workers"][0][key] = "bad"
+            self.rejected(d, "F3")
+        for key in ("completed_normal", "injected", "timing_valid"):
+            d = valid()
+            d["fallback_global_lock"][key] = not d["fallback_global_lock"][key]
+            self.rejected(d)
+
+    def test_worker_coverage_and_all_top_level_fields(self):
+        for bad in ([], [{}]*4, None, "workers", valid()["fallback_global_lock"]["workers"][:3]):
+            d = valid()
+            d["fallback_global_lock"]["workers"] = bad
+            self.rejected(d, "F1")
+        d = valid()
+        d["fallback_global_lock"]["workers"][3]["id"] = 0
+        self.rejected(d, "F1")
+        for key in ("experiment", "schema", "method", "code_revision", "mode", "completed_normal", "standalone", "timebase"):
+            d = valid()
+            d.pop(key)
+            self.rejected(d)
+
+    def test_optional_display_ties_even_and_nonfinite(self):
+        for elapsed, display in ((5000000, 5.0), (5005000, 5.0), (5015000, 5.02)):
+            d = valid()
+            d["timebase"] = {"numer": 1, "denom": 1}
+            f = d["fallback_global_lock"]
+            f.update(timebase_numer=1, timebase_denom=1, end_ticks=100+elapsed,
+                     elapsed_ns=elapsed, ns_per_op=display)
+            self.assertEqual(validate_fallback(d), [])
+        for bad in (float("nan"), float("inf"), -1, 0, True, "500", 499.99):
+            d = valid()
+            d["fallback_global_lock"]["ns_per_op"] = bad
+            self.rejected(d, "F1")
+
+    def test_zero_reverse_overflow_ticks(self):
+        for changes in ({"start_ticks": 0}, {"end_ticks": 100}, {"end_ticks": 99},
+                        {"end_ticks": (1 << 64)-1, "timebase_numer": (1 << 32)-1},
+                        {"timebase_denom": 0}, {"elapsed_ns": 0}):
+            d = valid()
+            d["fallback_global_lock"].update(changes)
+            self.rejected(d, "F1")
+
+    def test_counterexample_and_new_run_failclosed_cli(self):
+        d = valid()
+        d["fallback_global_lock"] = {"threads": 0, "ops": 0, "elapsed_ns": 0, "ns_per_op": -1}
+        self.rejected(d)
+        for item in (d, valid()):
+            output = io.StringIO()
+            # No review mock: even a positive synthetic object has no actual
+            # prerequisite receipt, so normal CLI cannot promote it.
+            with patch.object(check, "json_read", return_value=item), contextlib.redirect_stdout(output):
+                self.assertEqual(check.cli(["synthetic-not-evidence.json"]), 1)
+            for forbidden in ("corroboration=", "  H ", "  MEET", "  MISS", "RESULT: PASS"):
+                self.assertNotIn(forbidden, output.getvalue())
+
+    def test_historical_explicit_no_upgrade(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(check.cli([str(ROOT / "tests/valid.json")]), 1)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(check.cli(["--historical", str(ROOT / "tests/valid.json")]), 0)
+        text = output.getvalue()
+        self.assertIn("T2/T3 UNQUALIFIED", text)
+        self.assertNotIn("MEET  T2", text)
+        self.assertNotIn("MISS  T2", text)
+        self.assertNotIn("MEET  T3", text)
+        self.assertNotIn("RESULT: PASS", text)
+        with patch.object(check, "json_read", return_value=valid()), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(check.cli(["--historical", "synthetic"]), 1)
+
+    def test_v2_historical_cohort_bypass_rejected(self):
+        cohort = ("synthetic", "0"*64, "not-an-approval", [("synthetic", valid())])
+        output = io.StringIO()
+        with patch.object(check, "load_cohort", return_value=cohort), contextlib.redirect_stdout(output):
+            self.assertEqual(check.cli(["--historical", "--cohort", "synthetic"]), 1)
+        self.assertNotIn("corroboration=", output.getvalue())
+
+    def test_v2_full_cli_late_render_failure_with_explicit_binding_mock(self):
+        original = check.report
+        def broken(data):
+            original(data)
+            raise RuntimeError("corroboration=ELIGIBLE MEET T2")
+        output = io.StringIO()
+        with patch.object(check, "json_read", return_value=valid()), \
+             patch.object(check, "validate_result_binding"), \
+             patch.object(check, "report", side_effect=broken), contextlib.redirect_stdout(output):
+            self.assertEqual(check.cli(["synthetic-not-evidence"]), 1)
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        for marker in ("corroboration=", "MEET", "MISS", " H "):
+            self.assertNotIn(marker, output.getvalue())
+
+
+class Controls(unittest.TestCase):
+    def test_sequential_control_rejects_unrelated_failure(self):
+        d = valid()
+        d.update(mode="negative", completed_normal=False)
+        for row in d["litmus"]:
+            row["sequential"] = True
+            row["relaxed_observed"] = 0
+        receipt = {"returncode":0, "timed_out":False}
+        self.assertEqual(validate_full_counts(d), [])
+        self.assertTrue(sup.sequential_oracle(d, receipt))
+        d["lse"][0]["lost_updates"] = 1
+        self.assertFalse(sup.sequential_oracle(d, receipt))
+        d["lse"][0]["lost_updates"] = 0
+        d["fallback_global_lock"]["final_value"] -= 1
+        self.assertFalse(sup.sequential_oracle(d, receipt))
+
+    def test_full_counts_types_coverage_not_reduced(self):
+        self.assertEqual(validate_full_counts(valid()), [])
+        changes = (("litmus", "iterations", 999999), ("litmus", "sequential", 0),
+                   ("lse", "ops", 1), ("lse", "counter", 1), ("lse", "attempts", 0),
+                   ("alignment", "offset", 79), ("alignment", "faulted", 0),
+                   ("roundtrip", "n", 19999), ("roundtrip", "timeouts", False),
+                   ("roundtrip", "p99_ns", -1))
+        for arm, key, value in changes:
+            d = valid()
+            d[arm][0][key] = value
+            self.assertTrue(validate_full_counts(d), (arm, key, value))
+
+    def test_drop_write_exact_oracle(self):
+        d = valid()
+        d.update(mode="fallback-drop-write", completed_normal=False, standalone=True)
+        f = d["fallback_global_lock"]
+        f.update(injected=True, completed_normal=False, actual_writes=999999, final_value=999999, lost_updates=1)
+        f["workers"][0]["actual_writes"] = 249999
+        receipt = {"returncode": 1, "timed_out": False}
+        self.assertTrue(sup.control_oracle(d["mode"], receipt, d, ""))
+        for key in ("final_value", "actual_writes", "completed_ops", "canary_after_final"):
+            mutated = copy.deepcopy(d)
+            mutated["fallback_global_lock"][key] -= 1
+            self.assertFalse(sup.control_oracle(d["mode"], receipt, mutated, ""))
+        self.assertFalse(sup.control_oracle(d["mode"], dict(receipt, timed_out=True), d, ""))
+
+    def test_injected_lock_error_no_rmw_or_claim(self):
+        d = valid()
+        d.update(mode="fallback-lock-error", completed_normal=False, standalone=True)
+        f = d["fallback_global_lock"]
+        for w in f["workers"]:
+            w.update(completed=False, completed_iterations=0, actual_writes=0, successful_locks=0, successful_unlocks=0)
+        f["workers"][0]["first_error"] = {"operation": "lock", "iteration": 0, "rc": errno.EIO, "injected": True}
+        f.update(injected=True, completed_normal=False, ops=0, completed_ops=0, actual_writes=0, final_value=0, lost_updates=1000000)
+        receipt = {"returncode": 1, "timed_out": False}
+        self.assertTrue(sup.control_oracle(d["mode"], receipt, d, ""))
+        f["workers"][0]["actual_writes"] = 1
+        self.assertFalse(sup.control_oracle(d["mode"], receipt, d, ""))
+
+    def test_unexpected_fault_u1(self):
+        r = {"returncode": 90, "timed_out": False, "result_sha256": None}
+        self.assertTrue(sup.control_oracle("unexpected-fault", r, None, ""))
+        for mutated in (dict(r, returncode=0), dict(r, returncode=-10), dict(r, timed_out=True),
+                        dict(r, result_sha256="0"*64)):
+            self.assertFalse(sup.control_oracle("unexpected-fault", mutated, None, ""))
+        self.assertFalse(sup.control_oracle("unexpected-fault", r, {"completed_normal": True}, ""))
+        self.assertFalse(sup.control_oracle("unexpected-fault", r, None, "MEET T2"))
+
+    def test_watchdog_kills_and_reaps_exact_mock_child(self):
+        child = Mock()
+        child.wait.side_effect = [subprocess.TimeoutExpired("fixture", 5), -9]
+        with tempfile.TemporaryDirectory(prefix="inv08-pure-watchdog-") as directory:
+            with patch.object(sup.subprocess, "Popen", return_value=child) as spawn:
+                r = sup.supervise(["synthetic-never-executed"], Path(directory)/"out", Path(directory)/"err", 5)
+        self.assertTrue(r["timed_out"])
+        self.assertEqual(r["returncode"], -9)
+        child.kill.assert_called_once_with()
+        self.assertEqual(child.wait.call_count, 2)
+        spawn.assert_called_once()
+        self.assertEqual(sup.MODES, {"normal":600, "negative":600, "fallback-only":60,
+                                    "fallback-drop-write":60, "fallback-lock-error":60, "unexpected-fault":5})
+
+
+class Authorization(unittest.TestCase):
+    def test_supervisor_cli_refuses_missing_gate_before_build_or_spawn(self):
+        with tempfile.TemporaryDirectory(prefix="inv08-cli-refusal-fixture-") as directory:
+            p = Path(directory)/"synthetic-unapproved.json"
+            p.write_text('{"kind":"validation"}')
+            destination = Path(directory)/"must-not-exist"
+            with patch.object(sup.subprocess, "Popen") as native, \
+                 patch.object(sup.subprocess, "run") as build, \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = sup.cli(["--authorization",str(p),"--directory",str(destination),"--mode","fallback-only"])
+            self.assertEqual(code, 2)
+            native.assert_not_called()
+            build.assert_not_called()
+            self.assertFalse(destination.exists())
+
+    def test_clock_gate_schema_and_applicability_with_explicit_review_mocks(self):
+        # Parser branch test only. Review/artifact functions are explicitly
+        # mocked; this does not create an accepted envelope/review on disk.
+        with tempfile.TemporaryDirectory(prefix="inv08-clock-parser-fixture-") as directory:
+            path = Path(directory)/"synthetic-envelope.json"
+            path.write_text("{}")
+            context = {"host_id":"synthetic", "host_model":"synthetic", "os_build":"synthetic",
+                       "architecture":"arm64", "timebase":{"numer":125,"denom":3}}
+            reference = {"path":"synthetic-only", "sha256":"0"*64}
+            a = {"schema":"INV-01-08-execution-authorization-v1", "kind":"evidence",
+                 "code_bundle_sha256":auth.digest(auth.bundle()), "code_revision":"1"*40,
+                 "method_review":{"path":"synthetic-only", "sha256":auth.METHOD_SHA},
+                 "code_review":reference,
+                 "clock":{"applicability_review":reference, "packet":{
+                     "schema":"INV-01-07-clock-prerequisite-v1", "consumer":"INV-01-08 F08-2",
+                     "reviews":{kind:dict(reference, path=kind) for kind in ("method","code","result","replication","adversarial")},
+                     "raw":[reference], "context":context, "scope_justification":"synthetic parser case"}}}
+
+            def mocked_review(base, ref, kind, binding=None, expected_id=None):
+                return Path(directory)/(expected_id or ref["path"])
+
+            def git(args, **kwargs):
+                return "1"*40 if "rev-parse" in args else ""
+
+            with patch.object(auth, "review", side_effect=mocked_review), \
+                 patch.object(auth, "artifact", return_value=Path(directory)/"synthetic-raw"), \
+                 patch.object(auth.subprocess, "check_output", side_effect=git), \
+                 patch.object(auth, "live_context", return_value=context):
+                def load(value):
+                    with patch.object(auth, "json_read", return_value=value):
+                        return auth.load_authorization(path, "normal", 125, 3)
+                self.assertEqual(load(a), a)
+                variants = []
+                for key in ("clock", "code_bundle_sha256", "method_review", "code_revision"):
+                    b = copy.deepcopy(a)
+                    b.pop(key)
+                    variants.append(b)
+                for key in ("consumer", "schema", "scope_justification", "context", "raw", "reviews"):
+                    b = copy.deepcopy(a)
+                    b["clock"]["packet"].pop(key)
+                    variants.append(b)
+                for kind in a["clock"]["packet"]["reviews"]:
+                    b = copy.deepcopy(a)
+                    b["clock"]["packet"]["reviews"].pop(kind)
+                    variants.append(b)
+                for key in ("host_id", "host_model", "os_build", "architecture", "timebase"):
+                    b = copy.deepcopy(a)
+                    b["clock"]["packet"]["context"][key] = "different"
+                    variants.append(b)
+                for b in variants:
+                    with self.assertRaises((ValueError, KeyError, TypeError)):
+                        load(b)
+                b = copy.deepcopy(a)
+                b.update(kind="validation")
+                b.pop("clock")
+                with patch.object(auth, "json_read", return_value=b):
+                    self.assertEqual(auth.load_authorization(path, "fallback-only", live=False), b)
+                    with self.assertRaises(ValueError):
+                        auth.load_authorization(path, "normal", live=False)
+
+    def test_campaign_members_hashes_and_recomputed_controls(self):
+        with tempfile.TemporaryDirectory(prefix="inv08-campaign-parser-fixture-") as directory:
+            parent = Path(directory).resolve()
+            packet = {"schema":"INV-01-08-campaign-v1", "members":{}}
+            def write(path, value):
+                path.write_bytes(auth.canonical(value))
+            for mode in ("normal", "negative", "fallback-drop-write", "fallback-lock-error", "unexpected-fault"):
+                location = parent/mode
+                location.mkdir()
+                (location/"build").mkdir()
+                for name in ("build/litmus", "build/litmus.disasm", "build/litmus.s", "build/litmus-verify", "build/litmus-verify.disasm",
+                             "build.log", "check.txt", "stderr.txt", "invocation.json", "environment-before.json", "environment-after.json"):
+                    (location/name).write_text("synthetic parser fixture, never executed")
+                (location/"stdout.txt").write_text("")
+                d = valid()
+                code = 0
+                if mode == "negative":
+                    d.update(mode=mode, completed_normal=False)
+                    for row in d["litmus"]:
+                        row.update(sequential=True, relaxed_observed=0)
+                elif mode == "fallback-drop-write":
+                    d.update(mode=mode, completed_normal=False, standalone=True)
+                    f = d["fallback_global_lock"]
+                    f.update(injected=True, completed_normal=False, actual_writes=999999, final_value=999999, lost_updates=1)
+                    f["workers"][0]["actual_writes"] = 249999
+                    code = 1
+                elif mode == "fallback-lock-error":
+                    d.update(mode=mode, completed_normal=False, standalone=True)
+                    f = d["fallback_global_lock"]
+                    f.update(injected=True, completed_normal=False, ops=0, completed_ops=0, actual_writes=0, final_value=0, lost_updates=1000000)
+                    for w in f["workers"]:
+                        w.update(completed=False, completed_iterations=0, actual_writes=0, successful_locks=0, successful_unlocks=0)
+                    f["workers"][0]["first_error"] = {"operation":"lock", "iteration":0, "rc":errno.EIO, "injected":True}
+                    code = 1
+                if mode != "unexpected-fault":
+                    write(location/"result.json", d)
+                else:
+                    code = 90
+                write(location/"result.supervisor.json", {"mode":mode, "returncode":code, "timed_out":False,
+                      "authorization":{"sha256":"0"*64}, "authorization_validated_before_spawn":True,
+                      "result_sha256":auth.file_sha(location/"result.json") if mode != "unexpected-fault" else None})
+                manifest = {"schema":"INV-01-08-execution-manifest-v1", "mode":mode,
+                            "classification_returncode":0, "code_bundle":auth.bundle(),
+                            "artifacts":{str(p.relative_to(location)):auth.file_sha(p) for p in location.rglob("*") if p.is_file()}}
+                write(location/"manifest.json", manifest)
+                packet["members"][mode] = {"path":str(location/"manifest.json"), "sha256":auth.file_sha(location/"manifest.json")}
+            write(parent/"campaign.json", packet)
+            normal = parent/"normal/result.json"
+            auth.validate_campaign(normal, "0"*64)
+            for mode in packet["members"]:
+                b = copy.deepcopy(packet)
+                b["members"].pop(mode)
+                write(parent/"campaign.json", b)
+                with self.assertRaises(ValueError):
+                    auth.validate_campaign(normal, "0"*64)
+            write(parent/"campaign.json", packet)
+            # Even rehashed summary files cannot bless the wrong fault exit.
+            location = parent/"unexpected-fault"
+            r = json.loads((location/"result.supervisor.json").read_text())
+            r["returncode"] = 0
+            write(location/"result.supervisor.json", r)
+            m = json.loads((location/"manifest.json").read_text())
+            m["artifacts"]["result.supervisor.json"] = auth.file_sha(location/"result.supervisor.json")
+            write(location/"manifest.json", m)
+            packet["members"]["unexpected-fault"]["sha256"] = auth.file_sha(location/"manifest.json")
+            write(parent/"campaign.json", packet)
+            with self.assertRaises(ValueError):
+                auth.validate_campaign(normal, "0"*64)
+
+    def test_canonical_bundle_determinism(self):
+        self.assertEqual(auth.digest({"b":2,"a":1}), auth.digest({"a":1,"b":2}))
+        self.assertNotEqual(auth.digest({"a":1}), auth.digest({"a":True}))
+        self.assertEqual(len(auth.BUNDLE_FILES), len(set(auth.BUNDLE_FILES)))
+        self.assertEqual(set(auth.bundle()), set(auth.BUNDLE_FILES))
+
+    def test_actual_method_only_not_code_authorization(self):
+        ref = {"path": str(auth.REPO/"docs/research/reviews/REV-207.md"), "sha256": auth.METHOD_SHA}
+        auth.review(Path("/tmp"), ref, "method", expected_id="REV-207")
+        for kind in ("code", "result"):
+            with self.assertRaises(ValueError):
+                auth.review(Path("/tmp"), ref, kind)
+        with self.assertRaises(ValueError):
+            auth.review(Path("/tmp"), ref, "method", {"Code bundle SHA-256": "`" + "0"*64 + "`"})
+
+    def test_missing_and_declared_approval_failclosed(self):
+        with tempfile.TemporaryDirectory(prefix="inv08-authorization-fixture-") as directory:
+            p = Path(directory)/"not-approved.json"
+            for declaration in ({}, {"schema":"INV-01-08-execution-authorization-v1", "kind":"evidence",
+                                     "approved":True, "code_bundle_sha256":auth.digest(auth.bundle())}):
+                p.write_text(json.dumps(declaration))
+                with self.assertRaises((ValueError, KeyError)):
+                    auth.load_authorization(p, "normal", live=False)
+            p.write_text('{"kind":"validation","kind":"evidence"}')
+            with self.assertRaises(ValueError):
+                auth.json_read(p)
+
+    def test_external_root_boundary(self):
+        with tempfile.TemporaryDirectory(prefix="inv08-root-fixture-") as directory:
+            root = Path(directory).resolve()
+            self.assertEqual(auth.external(root/"result.json", root), root/"result.json")
+            for destination, raw in ((auth.REPO/"bad.json", root), (root/"result.json", "/"),
+                                     (root/"result.json", auth.REPO), (root, root)):
+                with self.assertRaises(ValueError):
+                    auth.external(destination, raw)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

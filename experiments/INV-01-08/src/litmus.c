@@ -28,6 +28,15 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <limits.h>
+#ifndef F08_REPO
+#error F08_REPO must name the canonical reviewed workspace
+#endif
+#ifndef F08_CODE_REV
+#error F08_CODE_REV must identify the producing revision
+#endif
 
 static int g_negative = 0;
 static long g_iters = 1000000; /* litmus iterations per variant */
@@ -319,17 +328,15 @@ static void run_lse(FILE *f, int nthreads, int use_cas, qos_class_t q, int last)
 static sigjmp_buf g_jb;
 static volatile sig_atomic_t g_sig = 0, g_code = 0, g_in_probe = 0;
 
-static FILE *g_out;  /* flushed before an unprovoked-fault abort */
+_Static_assert(ATOMIC_LONG_LOCK_FREE == 2 && sizeof(uintptr_t) == sizeof(unsigned long),
+               "signal probe address requires always-lock-free word atomic");
+static _Atomic uintptr_t g_probe_address;
 
 static void fault_handler(int s, siginfo_t *si, void *uc) {
 	(void)uc;
-	if (!g_in_probe) {
-		/* Never swallow a fault we did not provoke. Flush first: an abort
-		 * with a half-written result.json makes check.py die on a JSON parse
-		 * error instead of reporting FAIL. */
-		if (g_out) { fputs("\n  \"aborted\": \"unprovoked fault\"\n}\n", g_out); fflush(g_out); }
-		_exit(90);
-	}
+	if (!g_in_probe || !si) _exit(90);
+	uintptr_t address = atomic_load_explicit(&g_probe_address, memory_order_relaxed);
+	if ((uintptr_t)si->si_addr < address || (uintptr_t)si->si_addr - address >= 4) _exit(90);
 	g_sig = s;
 	g_code = si ? si->si_code : 0;
 	siglongjmp(g_jb, 1);
@@ -344,8 +351,10 @@ static void probe_one(volatile uint8_t *base, long off, const char *what,
 	out->code = 0; out->val = 0;
 	g_sig = g_code = 0;
 	volatile uint8_t *p = base + off;
-	g_in_probe = 1;
+	g_in_probe = 0;
+	atomic_store_explicit(&g_probe_address, (uintptr_t)p, memory_order_relaxed);
 	if (sigsetjmp(g_jb, 1) == 0) {
+		g_in_probe = 1;
 		uint32_t add = 1, dst = 0;
 		switch (kind) {
 		case 0: __asm__ volatile("ldaddal %w2, %w0, [%1]" : "=&r"(dst) : "r"(p), "r"(add) : "memory"); break;
@@ -359,23 +368,7 @@ static void probe_one(volatile uint8_t *base, long off, const char *what,
 	g_in_probe = 0;
 }
 
-/* fallback worker for the hardware-refused-atomic case */
-static pthread_mutex_t g_glob = PTHREAD_MUTEX_INITIALIZER;
-struct fbarg { volatile uint8_t *p; long iters; int striped; };
-static void *fallback_thread(void *a) {
-	struct fbarg *F = a;
-	(void)F->striped;
-	for (long i = 0; i < F->iters; i++) {
-		pthread_mutex_t *m = &g_glob;
-		pthread_mutex_lock(m);
-		uint32_t v;
-		memcpy(&v, (const void *)F->p, 4);
-		v++;
-		memcpy((void *)F->p, &v, 4);
-		pthread_mutex_unlock(m);
-	}
-	return NULL;
-}
+#include "fallback.h"
 
 static void run_alignment(FILE *f) {
 	struct sigaction sa, prev_bus, prev_segv;
@@ -410,27 +403,6 @@ static void run_alignment(FILE *f) {
 		        r[i].code, i + 1 == n ? "" : ",");
 	fprintf(f, "  ],\n");
 
-	/* Software fallback cost for a case the hardware refuses: 4 threads doing
-	 * a read-modify-write on a misaligned address under a global lock, then
-	 * under a 64-way striped lock. */
-	/* Cost of the software fallback a hardware-refused atomic would need.
-	 * One global lock: a single contended address cannot be helped by
-	 * address striping, so striping is not measured here. If a fallback ever
-	 * has to cover many addresses, per-address striping is the upgrade path
-	 * and needs its own arm. */
-	struct fbarg fb = {buf + 78, 250000, 0};
-	uint64_t t0 = now_ns();
-	pthread_t th[4];
-	for (int i = 0; i < 4; i++)
-		fail_pthread(pthread_create(&th[i], NULL, fallback_thread, &fb), "pthread_create");
-	for (int i = 0; i < 4; i++)
-		fail_pthread(pthread_join(th[i], NULL), "pthread_join");
-	uint64_t el = now_ns() - t0;
-	fprintf(f,
-	        "  \"fallback_global_lock\": {\"threads\":4,\"ops\":%ld,"
-	        "\"elapsed_ns\":%llu,\"ns_per_op\":%.2f},\n",
-	        fb.iters * 4, (unsigned long long)el,
-	        (double)el / (double)(fb.iters * 4));
 	munmap((void *)buf, 65536);
 	/* Restore the previous dispositions so later arms do not run under a
 	 * handler installed for this one (REV-045 required change 11). */
@@ -498,32 +470,57 @@ static void run_roundtrip(FILE *f, qos_class_t q, int last) {
 }
 
 /* ---------------- main ---------------- */
+#include "launch_guard.h"
 
 int main(int argc, char **argv) {
 	const char *out = NULL;
+	const char *mode = "normal";
+	int control = 0, standalone = 0, mode_seen = 0;
 	for (int i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "--negative")) g_negative = 1;
+		if (!strcmp(argv[i], "--negative")) { if (mode_seen++) return 2; mode = "negative"; }
+		else if (!strcmp(argv[i], "--mode") && i + 1 < argc) { if (mode_seen++) return 2; mode = argv[++i]; }
 		else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
 		else if (!strcmp(argv[i], "--iters") && i + 1 < argc)
 			g_iters = parse_positive(argv[++i], "--iters");
 		else { fprintf(stderr, "usage: %s [--out F] [--iters N] [--negative]\n", argv[0]); return 2; }
 	}
+	if (!strcmp(mode, "negative")) g_negative = 1;
+	else if (!strcmp(mode, "fallback-drop-write")) { control = 1; standalone = 1; }
+	else if (!strcmp(mode, "fallback-lock-error")) { control = 2; standalone = 1; }
+	else if (!strcmp(mode, "fallback-only")) standalone = 1;
+	else if (strcmp(mode, "normal") && strcmp(mode, "unexpected-fault")) return 2;
+	if (g_iters != 1000000) { fputs("F08-2 requires fixed full litmus count\n", stderr); return 2; }
 	if (mach_timebase_info(&g_tb) != KERN_SUCCESS || g_tb.numer == 0 || g_tb.denom == 0) {
 		fprintf(stderr, "mach_timebase_info failed or returned an invalid ratio\n");
 		return 1;
 	}
-	FILE *f = out ? fopen(out, "w") : stdout;
-	if (!f) { perror("open out"); return 1; }
-	g_out = f;
+	authorize_native(out, mode);
+	if (!strcmp(mode, "unexpected-fault")) unexpected_fault_control();
+	int output_fd = open(out, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+	if (output_fd == -1) { perror("exclusive output"); return 2; }
+	FILE *f = fdopen(output_fd, "w");
+	if (!f) { perror("fdopen"); close(output_fd); return 2; }
 	set_qos(QOS_CLASS_USER_INTERACTIVE);
 
 	fprintf(f, "{\n  \"experiment\": \"INV-01-08\",\n");
-	fprintf(f, "  \"mode\": \"%s\",\n", g_negative ? "negative" : "normal");
+	fprintf(f, "  \"mode\": \"%s\",\n", mode);
 	fprintf(f, "  \"litmus_iterations\": %ld,\n", g_iters);
 
 	fprintf(f, "  \"timebase\": {\"numer\":%u,\"denom\":%u},\n",
 	        g_tb.numer, g_tb.denom);
 
+
+	fprintf(f, "  \"schema\":\"INV-01-08-result-v2\",\"method\":\"F08-2\","
+	        "\"code_revision\":\"%s\",\"authorization_sha256\":\"%s\","
+	        "\"code_bundle_sha256\":\"%s\",\n",
+	        F08_CODE_REV, getenv("NATEMU_F08_AUTH_SHA256"), getenv("NATEMU_F08_BUNDLE_SHA256"));
+
+	if (standalone) {
+		int okay = run_fallback(f, control);
+		fprintf(f, "  \"completed_normal\":false,\"standalone\":true}\n");
+		if (fclose(f)) return 2;
+		return okay ? 0 : 1;
+	}
 	thread_affinity_policy_data_t ap = {1};
 	mach_port_t self = mach_thread_self();
 	kern_return_t kr = thread_policy_set(self, THREAD_AFFINITY_POLICY,
@@ -548,10 +545,14 @@ int main(int argc, char **argv) {
 	fprintf(f, "  ],\n");
 
 	run_alignment(f);
+	if (!run_fallback(f, 0)) {
+		fputs("  \"completed_normal\":false}\n", f);
+		fclose(f); return 1;
+	}
 
 	fprintf(f, "  \"roundtrip\": [\n");
 	for (int q = 0; q < 2; q++) run_roundtrip(f, qs[q], q == 1);
-	fprintf(f, "  ]\n}\n");
-	if (out) fclose(f);
+	fprintf(f, "  ],\n  \"completed_normal\":%s,\"standalone\":false}\n", g_negative ? "false" : "true");
+	if (fclose(f)) return 2;
 	return 0;
 }

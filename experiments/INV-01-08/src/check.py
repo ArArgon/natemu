@@ -15,8 +15,12 @@ import contextlib
 import io
 import json
 import sys
+import math
+from fractions import Fraction
 
 from histogram import load_cohort, report, validate_histograms
+from fallback import validate_fallback, fallback_ratio, validate_full_counts
+from authorization import json_read, validate_result_binding
 
 MIN_ITERS = 1000000
 QOS = {"user-interactive", "background"}
@@ -32,7 +36,8 @@ LSE_CASES = {(op, threads) for op in ("ldadd", "cas") for threads in (2, 4, 8)}
 # must be investigated before anything rests on the run.
 #
 # SB/ldar-stlr is forbidden per SRC-108 (Pulte et al., POPL 2018), whose
-# axiomatic model defines bob = po; [dmb.full]; po | [L]; po; [A] and states
+# axiomatic model's full bob union includes po; [dmb.full]; po and
+# [L]; po; [A] (these are two relevant clauses, not the full definition), and states
 # that "the [L];po;[A] case of the bob relation describes a store-release
 # appearing in program order before a load-acquire, which is required to be
 # observed in order by all threads". An earlier revision of this checker
@@ -55,12 +60,22 @@ ALIGNMENT_CASES = {
 }
 
 
-def main(path, data=None, integrity_only=False):
+def main(path, data=None, integrity_only=False, historical=False):
     if data is None:
-        with open(path) as stream:
-            data = json.load(stream)
+        data = json_read(path)
     d = data
     fails, notes = [], []
+
+    if historical and not integrity_only and "schema" in d:
+        raise ValueError("historical mode cannot bypass F08-2 integrity")
+
+    if not historical:
+        failures = validate_fallback(d) + validate_full_counts(d)
+        if failures:
+            print("\n".join(failures))
+            print("RESULT: FAIL (F08-2 integrity; all histogram/threshold claims suppressed)")
+            return 1
+        validate_result_binding(path, d)
 
     def rule(ok, name, detail):
         (notes if ok else fails).append(f"{'PASS' if ok else 'FAIL'}  {name}: {detail}")
@@ -177,51 +192,70 @@ def main(path, data=None, integrity_only=False):
             "(categorical host outcome; a completion is not evidence of non-atomicity)")
 
     fb = d.get("fallback_global_lock", {})
-    thr("T2 software fallback under 500 ns/op at 4 threads",
-        fb.get("ns_per_op", 1e9) < 500, f"{fb.get('ns_per_op')} ns/op")
+    if historical:
+        # Check any historical display's syntax without treating it as an
+        # observed correctness oracle or qualified timing measurement.
+        if "ns_per_op" in fb and (type(fb["ns_per_op"]) not in (int, float) or
+                                  not math.isfinite(fb["ns_per_op"])):
+            raise TypeError("malformed historical display")
+        print("  T2/T3 UNQUALIFIED: historical fallback oracle and prior clock prerequisite absent")
+    else:
+        ratio = fallback_ratio(d)
+        thr("T2 software fallback aggregate harness cost under 500 ns/op at 4 threads",
+            ratio < 500, f"{ratio.numerator}/{ratio.denominator} ns/completed-op (exact)")
 
     ui = [r for r in rt if r["qos"] == "user-interactive"]
     tb = d.get("timebase", {})
     tick = (tb.get("numer", 0) / tb.get("denom", 1)) if tb.get("denom") else 0
-    thr("T3 cross-thread invalidation round trip p99 < 50 us",
-        bool(ui) and ui[0]["p99_ns"] < 50000,
-        f"{[(r['qos'], r['p50_ns'], r['p99_ns']) for r in rt]}; "
-        f"clock quantum {tick:.2f} ns/tick — separations of one or two ticks "
-        "are at the measurement floor and are not resolved differences")
+    if not historical:
+        thr("T3 cross-thread invalidation round trip p99 < 50 us",
+            bool(ui) and ui[0]["p99_ns"] < 50000,
+            f"{[(r['qos'], r['p50_ns'], r['p99_ns']) for r in rt]}; "
+            f"clock quantum {tick:.2f} ns/tick; prior instrument bound in authorization; "
+            "differences at its floor are unresolved")
 
     lse8 = [a for a in d.get("lse", []) if a["threads"] == 8]
     lse2 = [a for a in d.get("lse", []) if a["threads"] == 2]
     if lse8 and lse2:
-        # T4a is the instruction claim: ns per *attempt*, which for `cas`
-        # excludes retry amplification. T4b is the CAS-loop claim: ns per
-        # successful increment, which includes it. They are different
-        # measurements and carry different thresholds (INV-01-08, Metrics).
+        # Both denominators describe aggregate harness cost, including
+        # creation/join, scheduling, loops and CAS loads/retries. Neither
+        # isolates instruction latency or a guest workload cost floor.
         for op, key, label, bound in (
                 ("ldadd", "ns_per_attempt", "T4a ldadd", 20),
-                ("cas", "ns_per_attempt", "T4a cas instruction", 20),
+                ("cas", "ns_per_attempt", "T4a cas harness per-attempt", 20),
                 ("cas", "ns_per_op", "T4b cas loop (retries included)", 60)):
             a8 = [x for x in lse8 if x["op"] == op]
             a2 = [x for x in lse2 if x["op"] == op]
             if a8 and a2 and key in a8[0] and key in a2[0]:
-                v2, v8 = a2[0][key], a8[0][key]
+                denominator = "attempts" if key == "ns_per_attempt" else "ops"
+                for a in (a2[0], a8[0]):
+                    if any(type(a.get(k)) is not int or a[k] <= 0 for k in ("elapsed_ns", denominator)):
+                        raise ValueError("invalid aggregate primitive denominator")
+                v2 = Fraction(a2[0]["elapsed_ns"], a2[0][denominator])
+                v8 = Fraction(a8[0]["elapsed_ns"], a8[0][denominator])
+                ratio = v8 / v2
                 thr(f"{label} 8-thread/2-thread cost ratio < {bound}x",
-                    v8 / max(v2, 1e-9) < bound,
-                    f"{v2:.2f} -> {v8:.2f} ns ({key}); "
+                    ratio < bound,
+                    f"{float(v2):.2f} -> {float(v8):.2f} ns ({key}); exact ratio="
+                    f"{ratio.numerator}/{ratio.denominator} ({float(ratio):.13g}x); "
                     f"attempts/success 2T={a2[0].get('attempts_per_success', 1):.2f} "
                     f"8T={a8[0].get('attempts_per_success', 1):.2f}")
 
-    print(f"RESULT: {'FAIL' if fails else 'PASS'} ({len(fails)} integrity failures)")
+    print("HISTORICAL: bounded I/H and aggregate ratios checked; not F08-2 PASS" if historical else
+          "RESULT: PASS (F08-2 I/H/F integrity; result/replication gates remain separate)")
     return 1 if fails else 0
 
 
 def run_selected(args):
     if not args.cohort:
-        return main(args.path or "result.json")
+        return main(args.path or "result.json", historical=args.historical)
     identity, digest, review_path, runs = load_cohort(args.cohort)
+    if args.historical and any("schema" in data for _, data in runs):
+        raise ValueError("historical cohort cannot bypass F08-2 integrity")
     for path, data in runs:
         captured = io.StringIO()
         with contextlib.redirect_stdout(captured):
-            rc = main(path, data=data, integrity_only=True)
+            rc = main(path, data=data, integrity_only=True, historical=args.historical)
         if rc:
             print(captured.getvalue(), end="")
             print("RESULT: FAIL (entire cohort suppressed; failed member)")
@@ -230,7 +264,8 @@ def run_selected(args):
     for path, _ in runs:
         print(f"  member={path}")
     report([data for _, data in runs])
-    print("RESULT: PASS (reviewed cohort histogram only; no pooled timing thresholds)")
+    print("RESULT: PASS (reviewed cohort histogram only; no pooled timing thresholds; "
+          + ("historical, not F08-2" if args.historical else "F08-2 member integrity") + ")")
     return 0
 
 
@@ -238,6 +273,7 @@ def cli(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", nargs="?", help="one result.json; no automatic pooling")
     parser.add_argument("--cohort", help="explicit digest-bound independently reviewed cohort JSON")
+    parser.add_argument("--historical", action="store_true", help="explicit legacy I/H interpretation; no F08-2/T2/T3 qualification")
     args = parser.parse_args(argv)
     if args.path and args.cohort:
         parser.error("choose one result or --cohort")

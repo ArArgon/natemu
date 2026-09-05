@@ -43,10 +43,24 @@ for sym_mnemonic in '_lse_thread:ldadd' '_lse_thread:cas' '_probe_one:ldaddal'; 
     fi
 done
 
-python3 "$SCRIPT_DIR/src/check.py" "$SCRIPT_DIR/tests/valid.json"
+# The expected-probe handler may recover through siglongjmp, but its
+# unexpected branch must not regain the unsafe stdio calls returned by202.
+# Mach-O objdump may display unresolved import stubs under unrelated symbol
+# names. Inspect the same optimized compiler assembly's named calls instead.
+awk '/^_fault_handler:/{inrange=1;next} inrange && /[.]cfi_endproc/{inrange=0} inrange' \
+    "$TMP_DIR/build/litmus.s" > "$TMP_DIR/fault_handler.disasm"
+if [ ! -s "$TMP_DIR/fault_handler.disasm" ] || \
+   ! grep -q '_exit' "$TMP_DIR/fault_handler.disasm" || \
+   grep -Eq '(_fputs|_fflush|_fprintf|_malloc|_pthread_mutex|_mach_absolute_time)' "$TMP_DIR/fault_handler.disasm"; then
+    echo "fault handler missing or contains forbidden unexpected-path services" >&2
+    exit 1
+fi
+
+python3 "$SCRIPT_DIR/src/check.py" --historical "$SCRIPT_DIR/tests/valid.json"
 python3 "$SCRIPT_DIR/tests/histogram-fixtures.py"
+python3 "$SCRIPT_DIR/tests/fallback-fixtures.py"
 for fixture in negative forbidden negative-coverage; do
-    if python3 "$SCRIPT_DIR/src/check.py" "$SCRIPT_DIR/tests/$fixture.json"; then
+    if python3 "$SCRIPT_DIR/src/check.py" --historical "$SCRIPT_DIR/tests/$fixture.json"; then
         echo "$fixture checker fixture unexpectedly passed" >&2
         exit 1
     fi

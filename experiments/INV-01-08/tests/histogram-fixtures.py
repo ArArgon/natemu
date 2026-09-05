@@ -45,7 +45,7 @@ class Reporting(unittest.TestCase):
     def cli(self, args):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            rc = check.cli(args)
+            rc = check.cli(["--historical"] + args)
         return rc, output.getvalue()
 
     def test_exact_boundaries_and_symmetry(self):
@@ -154,7 +154,7 @@ class Reporting(unittest.TestCase):
         counts(arm(d, variant="ldar-stlr"), 1_000_000, 100)
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            rc = check.main("synthetic", data=d)
+            rc = check.main("synthetic", data=d, historical=True)
         self.assertEqual(rc, 1)
         self.assertIn("FAIL  I2", output.getvalue())
         self.assertNotIn("corroboration=", output.getvalue())
@@ -163,7 +163,7 @@ class Reporting(unittest.TestCase):
     def test_late_malformed_field_cannot_leak_prior_claims(self):
         d = valid()
         d["fallback_global_lock"]["ns_per_op"] = "malformed"
-        with patch.object(check.json, "load", return_value=d):
+        with patch.object(check, "json_read", return_value=d):
             rc, output = self.cli([str(ROOT / "tests/valid.json")])
         self.assertEqual(rc, 1)
         self.assertIn("TypeError", output)
