@@ -291,8 +291,10 @@ def main(path):
         "raised them)",
         rt99 is not None and rt99 < 200000,
         f"pthread_kill spinning-target round-trip p99 = {rt99} ns; one-way p99 "
-        f"= {ow99} ns, reported only as an observation bounded above by half "
-        f"the round trip ({None if rt99 is None else rt99 // 2} ns)")
+        f"= {ow99} ns (cross-thread timestamp diagnostic only); full sender "
+        f"round-trip p99 ({rt99} ns) bounds the causal forward component's "
+        f"empirical p99 for the same completed samples, not future or "
+        f"worst-case delivery; no half-round-trip directional bound")
 
     by_arm = {(w["mechanism"], w["target_ns"], w["qos"]): w for w in wakeup}
     ratios = [

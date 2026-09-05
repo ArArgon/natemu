@@ -17,6 +17,9 @@ Method and code reviews must pass before experiments begin.
 Correctness failures invalidate performance samples.
 Load-bearing findings require independent review.
 
+Use subagents by default for independent research reviews and replication;
+keep authors and reviewers separate.
+
 Keep newly generated raw data outside Git and treat SMP and platform
 dimensions explicitly in research questions, methods, evidence, and
 conclusions.

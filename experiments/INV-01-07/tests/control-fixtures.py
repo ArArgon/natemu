@@ -30,6 +30,23 @@ def run_case(checker, payload, expect_pass, label):
               file=sys.stderr)
         print(proc.stdout, file=sys.stderr)
         return False
+    if label == "signal-asymmetric":
+        required = (
+            "MEET  T3", "= 90001 ns (cross-thread timestamp diagnostic only)",
+            "full sender round-trip p99 (100001 ns)",
+            "not future or worst-case delivery",
+            "no half-round-trip directional bound",
+        )
+        if not all(item in proc.stdout for item in required):
+            print(proc.stdout, file=sys.stderr)
+            return False
+    if label == "signal-above-roundtrip":
+        failed_rules = [line for line in proc.stdout.splitlines()
+                        if line.startswith("  FAIL")]
+        if (len(failed_rules) != 1 or "I17" not in failed_rules[0]
+                or "decision thresholds suppressed" not in proc.stdout):
+            print(proc.stdout, file=sys.stderr)
+            return False
     print(f"control fixture {label}: {'PASS' if expect_pass else 'rejected'}")
     return True
 
@@ -74,6 +91,29 @@ def main():
     checker, fixture, producer = map(Path, sys.argv[1:])
     base = json.loads(fixture.read_text())
     cases = [(base, True, "baseline")]
+
+    # Exercise production summarize/emission rather than copying its formula.
+    # Odd values catch integer-halving/truncation regressions as well.
+    for name, expected_forward, expect_pass in (
+        ("asymmetric", 90001, True),
+        ("above-roundtrip", 110001, False),
+    ):
+        proc = subprocess.run(
+            [str(producer), "--signal-summary-case", name],
+            text=True, capture_output=True, check=True,
+        )
+        derived = json.loads(proc.stdout)
+        assert derived["n"] == 2000
+        assert derived["p99_ns"] == expected_forward
+        assert derived["roundtrip_p99_ns"] == 100001
+        assert derived["oneway_upper_bound_p99_ns"] == 100001
+        assert derived["p99_ns"] > derived["roundtrip_p99_ns"] / 2
+        payload = copy.deepcopy(base)
+        idx = next(i for i, row in enumerate(payload["signal"])
+                   if row["mechanism"] == derived["mechanism"]
+                   and row["qos"] == derived["qos"])
+        payload["signal"][idx] = derived
+        cases.append((payload, expect_pass, f"signal-{name}"))
 
     # A ±1% conversion defect must fail in both directions at every target.
     for target in (100000, 1000000, 10000000):

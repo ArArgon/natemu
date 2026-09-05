@@ -496,6 +496,22 @@ static stats_t summarize(int64_t *v, long n) {
 	return s;
 }
 
+static void emit_signal_summary(FILE *f, const char *mech, const char *qos,
+                                stats_t s, stats_t r, long lost, int last) {
+	fprintf(f,
+	        "    {\"arm\":\"signal\",\"mechanism\":\"%s\",\"qos\":\"%s\","
+	        "\"n\":%ld,\"lost\":%ld,\"early\":%ld,\"min_ns\":%lld,"
+	        "\"p50_ns\":%lld,\"p99_ns\":%lld,\"max_ns\":%lld,"
+	        "\"roundtrip_min_ns\":%lld,\"roundtrip_p50_ns\":%lld,"
+	        "\"roundtrip_p99_ns\":%lld,\"roundtrip_max_ns\":%lld,"
+	        "\"oneway_upper_bound_p99_ns\":%lld}%s\n",
+	        mech, qos, s.n, lost, s.early, (long long)s.min,
+	        (long long)s.p50, (long long)s.p99, (long long)s.max,
+	        (long long)r.min, (long long)r.p50, (long long)r.p99,
+	        (long long)r.max, (long long)r.p99,
+	        last ? "" : ",");
+}
+
 static void emit_stats(FILE *f, const char *name, const char *mech,
                        const char *qos, long target_ns, stats_t s) {
 	fprintf(f,
@@ -929,7 +945,8 @@ static void signal_arm(FILE *f, const char *mech, qos_class_t q, int last) {
 	 * system-wide comparable time base that no source in the inventory
 	 * states. `rt` is measured entirely on the sender's clock — send, then
 	 * observe the flag — so it needs no such assumption. One-way latency is
-	 * therefore reported with rt/2 as its assumption-free upper bound. */
+	 * a diagnostic only. Full rt bounds the causal forward component for
+	 * the same completed event; rt/2 does not without symmetry. */
 	int64_t *rt = xmalloc(sizeof(int64_t) * (size_t)g_n);
 	long lost = 0, got = 0;
 	for (long i = 0; i < g_n; i++) {
@@ -969,18 +986,7 @@ static void signal_arm(FILE *f, const char *mech, qos_class_t q, int last) {
 
 	stats_t s = summarize(lat, got);
 	stats_t r = summarize(rt, got);   /* summarize sorts; do lat first */
-	fprintf(f,
-	        "    {\"arm\":\"signal\",\"mechanism\":\"%s\",\"qos\":\"%s\","
-	        "\"n\":%ld,\"lost\":%ld,\"early\":%ld,\"min_ns\":%lld,"
-	        "\"p50_ns\":%lld,\"p99_ns\":%lld,\"max_ns\":%lld,"
-	        "\"roundtrip_min_ns\":%lld,\"roundtrip_p50_ns\":%lld,"
-	        "\"roundtrip_p99_ns\":%lld,\"roundtrip_max_ns\":%lld,"
-	        "\"oneway_upper_bound_p99_ns\":%lld}%s\n",
-	        mech, qos_name(q), s.n, lost, s.early, (long long)s.min,
-	        (long long)s.p50, (long long)s.p99, (long long)s.max,
-	        (long long)r.min, (long long)r.p50, (long long)r.p99,
-	        (long long)r.max, (long long)(r.p99 / 2),
-	        last ? "" : ",");
+	emit_signal_summary(f, mech, qos_name(q), s, r, lost, last);
 	free(lat);
 	free(rt);
 	dispatch_release(c.sem);
@@ -1007,6 +1013,22 @@ static void probe_affinity(FILE *f) {
 /* ---------- main ---------- */
 
 int main(int argc, char **argv) {
+	/* Non-evidence regression seam: production summary and emitter, with
+	 * asymmetric paired synthetic values. No clock or thread probe runs. */
+	if (argc == 3 && !strcmp(argv[1], "--signal-summary-case")) {
+		int64_t forward[2000], round[2000];
+		int invalid = !strcmp(argv[2], "above-roundtrip");
+		if (!invalid && strcmp(argv[2], "asymmetric")) return 2;
+		for (long i = 0; i < 2000; i++) {
+			forward[i] = (invalid ? 110000 : 90000) + (i % 2);
+			round[i] = 100000 + (i % 2);
+		}
+		stats_t s = summarize(forward, 2000);
+		stats_t rt = summarize(round, 2000);
+		emit_signal_summary(stdout, "pthread_kill_SIGUSR1_spinning",
+		                    "user-interactive", s, rt, 0, 1);
+		return 0;
+	}
 	const char *out = NULL;
 	const char *control_case = NULL;
 	for (int i = 1; i < argc; i++) {
