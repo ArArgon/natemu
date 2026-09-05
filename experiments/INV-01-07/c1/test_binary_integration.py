@@ -72,6 +72,27 @@ class BinaryIntegration(unittest.TestCase):
             for result in report["findings"]["T1"].values():
                 self.assertEqual(result, {"best_p50_ns": {"numerator": 100, "denominator": 1},
                                           "strict_100ns_meet": False})
+            # Launch a separate Python process through the same main/real
+            # artifact path, injecting failure only when an exact Fraction
+            # reaches the final JSON encoder after every required cell passed.
+            for error_type, label in (("RuntimeError", "runtime"), ("OverflowError", "overflow")):
+                script = (
+                    "import sys; sys.path.insert(0, sys.argv[1]); import check\n"
+                    "def broken(value):\n"
+                    f"    raise {error_type}('partial: STRUCTURAL_PASS findings T1 strict_100ns_meet=true')\n"
+                    "check.encode = broken\n"
+                    "raise SystemExit(check.main([sys.argv[2]]))\n"
+                )
+                rendering = subprocess.run(
+                    [sys.executable, "-B", "-c", script, str(Path(__file__).parent), str(child)],
+                    env=environment, capture_output=True, text=True, timeout=120, check=False)
+                self.assertEqual(rendering.returncode, 1, rendering.stdout + rendering.stderr)
+                self.assertEqual(rendering.stderr, "")
+                self.assertEqual(json.loads(rendering.stdout),
+                                 {"status": "INVALID", "errors": [f"unexpected-{label}-error"]})
+                self.assertNotIn("findings", rendering.stdout)
+                self.assertNotIn("T1", rendering.stdout)
+                self.assertNotIn("PASS", rendering.stdout)
             # Only the final required contention summary is corrupted: every
             # array remains complete/hash-correct, so this reaches a genuinely
             # late validator rejection after preceding cells were evaluated.

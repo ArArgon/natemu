@@ -141,6 +141,30 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(json.loads(json.dumps({"cost": Fraction(100000, 1001)}, default=check.encode)),
                          {"cost": {"numerator": 100000, "denominator": 1001}})
 
+    def test_arbitrary_late_exception_messages_never_enter_failure_output(self):
+        for error, status, code, name in (
+            (TypeError("partial: STRUCTURAL_PASS findings T1 strict_100ns_meet=true"),
+             "INVALID", 1, "unexpected-type-error"),
+            (RuntimeError("partial: STRUCTURAL_PASS findings T1"),
+             "INVALID", 1, "unexpected-runtime-error"),
+            (OverflowError("partial: STRUCTURAL_PASS findings T1"),
+             "INVALID", 1, "unexpected-overflow-error"),
+            (core.Invalid("STRUCTURAL_PASS findings T1"), "INVALID", 1, "validator-error"),
+            (core.Unresolved("STRUCTURAL_PASS findings T1"), "UNRESOLVED", 2, "validator-error"),
+        ):
+            output = io.StringIO()
+            with self.subTest(error=type(error).__name__), \
+                 patch.dict("os.environ", {"NATEMU_RAW_ROOT": str(self.root)}), \
+                 patch("artifact.load_child", return_value=({}, {})), \
+                 patch("cells.validate_child", side_effect=error), \
+                 contextlib.redirect_stdout(output):
+                actual = check.main([str(self.root)])
+            self.assertEqual(actual, code)
+            self.assertEqual(json.loads(output.getvalue()), {"status": status, "errors": [name]})
+            self.assertNotIn("T1", output.getvalue())
+            self.assertNotIn("PASS", output.getvalue())
+            self.assertNotIn("findings", output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

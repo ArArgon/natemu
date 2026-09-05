@@ -11,6 +11,8 @@ import core
 
 SCHEMA = "INV-01-07-clock-c1-v1"
 WORKERS = (1, 2, 4, 8)
+NEGATIVE_MODES = ("backward", "zero-nsec", "omit-clock", "omit-contention",
+                  "pthread-error", "global-inversion")
 
 
 def fields(value, names, code):
@@ -190,7 +192,8 @@ def validate_child(record):
                     "clock_cells", "contention_cells"), "child-fields")
     core.require(record["schema"] == SCHEMA, "schema")
     core.require(core.uint(record["seed"], "seed") in core.SEEDS, "seed")
-    core.require(record["mode"] == "normal", "injected-or-unknown-mode")
+    core.require(type(record["mode"]) is str and record["mode"] in ("normal", *NEGATIVE_MODES),
+                 "injected-or-unknown-mode")
     terminal = fields(record["terminal"], ("exit_status", "signal", "timeout", "complete"),
                       "terminal-fields")
     status(terminal["exit_status"], "child-exit")
@@ -203,6 +206,9 @@ def validate_child(record):
     matrix(record["contention_cells"], core.QOS, WORKERS, "contention-matrix")
     clocks = [clock_cell(cell, tick) for cell in record["clock_cells"]]
     traces = [contention_cell(cell) for cell in record["contention_cells"]]
+    # Known negative modes traverse the real raw oracles first. An injection
+    # that reaches here was not detected and must never return positive timing.
+    core.require(record["mode"] == "normal", "injection-not-detected")
     thresholds = {}
     for quality in core.QOS:
         candidates = [cell for cell in clocks if cell["qos"] == quality
