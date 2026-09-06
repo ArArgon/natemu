@@ -100,6 +100,8 @@ directly and disclose the edit. Pending review is work status, not a defect.
 Judge claims against evidence rather than prior approval. An accept verdict has
 no unresolved substantive blockers and satisfies the required independence.
 Synthesis review is a separate project decision, not an extra per-investigation gate.
+Files under `notes/` are outside the review workflow and inadmissible as support
+for any claim; they hold candidate ideas only.
 
 ## Evidence and direct references
 
