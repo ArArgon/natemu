@@ -1,8 +1,8 @@
 # natemu
 
 natemu is an unvalidated research project. Its decision question is whether an
-unmodified x86-64 Linux system emulator on Apple Silicon using public macOS APIs
-can be materially better than QEMU TCG while meeting an explicit correctness
+unmodified x86-64 Linux system emulator on Apple Silicon using documented Apple
+silicon capabilities can be materially better than QEMU TCG while meeting an explicit correctness
 scope.
 
 The SMP baseline is in scope from the outset: research must treat

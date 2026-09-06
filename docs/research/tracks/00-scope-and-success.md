@@ -7,13 +7,22 @@ finding: nothing here is evidence. Work on it follows the [research workflow](..
 
 The starting envelope, subject to revision by this track's own outcomes:
 
-- public macOS APIs only, on at least two Apple Silicon generations and at
-  least two supported macOS releases;
+- documented Apple silicon and macOS capabilities, including hardware controls
+  reachable from a Hypervisor.framework guest, on Apple silicon under macOS 26;
+  the host of record for research is the M4, with an M2 Pro/Max as the second
+  generation when available; no App Store or distribution constraint (experiment
+  project); a second macOS release is not a research or product requirement;
 - unmodified modern x86-64 Linux guests with direct boot;
 - SMP as a baseline, not an extension; and
 - a minimal headless device set — timer/APIC, serial, block, network,
   entropy, and shutdown, as enumerated in the
   [research governance](../README.md).
+
+Design direction: a thin EL1 shim inside a Hypervisor.framework VM that uses the
+native stage-1 page tables, exceptions, timer/interrupt controller and TSO switch,
+with translation on the host. Feasibility is judged for this design against QEMU
+TCG; other families are comparators, not co-equal candidates. A mechanism missing
+on one chip generation narrows applicability; it does not kill the design.
 
 This envelope is an input to be questioned, not a settled scope. Every
 narrowing or widening must be recorded as a question in the

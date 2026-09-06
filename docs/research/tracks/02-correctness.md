@@ -22,10 +22,13 @@ applicable gates:
   error codes, and delivery, with faulting instructions restartable so guest
   fault handling (demand paging above all) works.
 - **Paging.** Page-table walks, permission checks, accessed/dirty behavior,
-  invalidation semantics, and self-modifying or newly mapped code.
+  invalidation semantics, and self-modifying or newly mapped code. Under the
+  shim design this includes cross-vCPU shootdown of shadow tables and the
+  ASID/VMID budget.
 - **Atomics and memory ordering.** Guest atomic operations and the guest
   memory model as observed by multiple vCPUs on a host whose memory model
-  may differ from the guest's.
+  may differ from the guest's. Under the shim design this includes code
+  published to vCPUs that may be executing it.
 - **Interrupts and timers.** Interrupt controller behavior, masking,
   priority, inter-processor interrupts, and timer semantics the guest kernel
   depends on for scheduling and timekeeping.

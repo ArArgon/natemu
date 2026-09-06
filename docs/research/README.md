@@ -9,12 +9,13 @@ historical review only for a specific unresolved finding, contradiction, or audi
 ## Decision and product envelope
 
 Determine whether an unmodified x86-64 Linux system emulator on Apple Silicon,
-using public macOS APIs, can credibly be materially better than QEMU TCG in
+using documented Apple silicon capabilities, can credibly be materially better than QEMU TCG in
 technical and economic terms, and which architecture deserves planning.
 
 The envelope remains:
 
-- at least two Apple Silicon generations and two supported macOS releases;
+- Apple silicon under macOS 26; the M4 is the host of record and an M2 Pro/Max is
+  the second generation when available;
 - unmodified modern x86-64 Linux guests, direct boot, and an SMP baseline;
 - headless timer/APIC, serial, block, network, entropy, and shutdown support;
 - diverse workloads, with UEFI and Windows implications analyzed but not implemented;
@@ -36,7 +37,8 @@ This workflow migration neither completes Track 01 nor adds experimental evidenc
    falsifiers, and measurement failure modes. Classify discoveries as current
    blockers, downstream questions, or retained unknowns. Record each once in its
    owning investigation or the [question backlog](question-backlog.md); if there
-   are none, say so. Existing identifiers are retained.
+   are none, say so. Existing identifiers are retained. Every kill assumption and
+   finding names the design it applies to.
 2. Explain the relevant source contracts, assumptions, method, controls, and limits.
    For experiments, declare inputs, correctness oracles, sample/exclusion rules,
    resource/time budgets, failure behavior, and stopping conditions. Every open
@@ -44,7 +46,11 @@ This workflow migration neither completes Track 01 nor adds experimental evidenc
    its stopping condition. A missing execution budget is explicit work to finish
    before execution, not permission for an unlimited campaign.
 3. Obtain **pre-execution review** from an independent reviewer of the question,
-   relevant sources, method, controls, and code before experimental execution. Authors may prepare code, compile, and perform synthetic validation
+   relevant sources, method, controls, and code before experimental execution.
+   The review must answer three screening items before anything else: (a) does
+   QEMU TCG or an ordinary VM on this platform share the problem; (b) does a
+   documented platform capability already answer it; (c) which design does the
+   finding apply to. A question failing (a) or (b) is reframed, not executed. Authors may prepare code, compile, and perform synthetic validation
    beforehand. Record these self-checks briefly with the submitted work; do not
    create separate self-review documents. Source-only work proceeds directly to
    findings review.
@@ -64,9 +70,11 @@ This workflow migration neither completes Track 01 nor adds experimental evidenc
 
 At track completion, perform a breadth check from product, architecture,
 correctness, and methodology perspectives. Carry unresolved implications and
-disagreements to their owners and synthesis. Track 01 still requires a reviewed
-integrated translation/paging/exception/interrupt prototype with at least two
-concurrent vCPUs; mechanism viability establishes neither performance nor a design.
+disagreements to their owners and synthesis. Track 01 answers its questions inside
+one growing, disposable test program: each question's test is added on top of the
+previous questions' working result with every earlier mechanism left on, so the
+mechanisms are exercised together without a prototype deliverable. Mechanism
+viability establishes neither performance nor a design.
 A track closes only when its questions have accepted scoped resolutions or
 accepted kills and the completion breadth check is addressed. A family kill
 removes that family; a project kill routes to synthesis, not automatic track completion.
