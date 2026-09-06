@@ -35,6 +35,21 @@ question of this track.
   the second generation, available later; every question is replicated there
   when it is. A "no" on every available generation is a kill; a "no" on one
   narrows applicability (`Q-00-11`).
+- The x86 memory model comes from the hardware TSO switch, and the design's
+  correctness rests on it. The switch is a documented platform control whose
+  stated use, Rosetta inside Linux VMs toggling it per guest thread, requires
+  the hypervisor to preserve it across host scheduling; it is therefore not a
+  question of this track. It is set in the starting point and stays on for
+  every later question, so every multi-vCPU test in the track runs under it.
+  Ordering evidence proper (litmus, stress) is filed under
+  [Correctness](02-correctness.md) and runs on the same foundation.
+- The virtual interrupt controller and per-vCPU timer are shared with every
+  VM on macOS 15 and later. Whether a timer expiry exits to the host is
+  recorded as a bring-up fact for the cost model, not asked as a question.
+- Guest kernels that predate the 64-bit multiprocessor wakeup are out of
+  scope. `Q-01-34` cites the upstream version where it landed as the minimum
+  guest kernel; vendor backports are not audited. 16-bit support may be added
+  later as a recorded scope widening.
 
 ## Identifiers
 
@@ -94,6 +109,8 @@ One growing, disposable test program inside the VM.
 - **Status of the program**: a scratch pad. It is thrown away when the track
   closes. No architecture decision is made in it; expedient choices are recorded
   as such. What carries forward is knowledge in the investigation records.
+  Timings the program records are diagnostic; they are not qualified and are
+  not cited outside this track.
 
 Candidate mechanisms discussed while framing this track are collected in
 [architecture candidates](../notes/architecture-candidates.md), which is

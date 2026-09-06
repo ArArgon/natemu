@@ -64,6 +64,9 @@ This workflow migration neither completes Track 01 nor adds experimental evidenc
    alternative explanations, replication, and adversarial challenges before
    accepting conclusions. Load-bearing observed findings require independent
    replication whose preparation and code were also independently checked.
+   For Track 01, replication means an independent agent rebuilds from the
+   retained snapshot and reruns on the same host; cross-generation replication
+   is added when the second host is available.
    Record the accepted finding and remaining substantive issues in the investigation.
    A contradiction reopens the affected claim and any conclusion relying on it
    until resolved or withdrawn; migration and previous approval cannot resolve it.
