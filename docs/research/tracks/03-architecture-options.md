@@ -2,10 +2,7 @@
 
 This track defines how research must compare the architecture families that
 survive [Feasibility](01-feasibility.md). It is a roadmap, not a finding, and
-it makes no design decisions. Work on it follows the
-[research governance](../README.md), the
-[evidence policy](../evidence-policy.md), and the
-[executor guide](../executor-guide.md).
+it makes no design decisions. Work on it follows the [research workflow](../README.md).
 
 ## Comparison dimensions
 
@@ -14,8 +11,7 @@ and whose rejection this track has not accepted; "option" here and in the
 later tracks means such a family. Every surviving option must be evaluated
 on every dimension below. Each dimension becomes questions in the
 [question backlog](../question-backlog.md), resolved with labelled evidence
-through the applicable gates (see
-[gate completion](../evidence-policy.md#gate-completion)):
+through the applicable gates:
 
 - **Translator approach.** Which translation or interpretation strategy the
   option uses, and what evidence bounds its correctness and cost.

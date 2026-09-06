@@ -1,8 +1,9 @@
 # Research workflow
 
 This is the authoritative workflow for new research. Read it, then the assigned
-[investigation](investigations/README.md). That investigation owns its current
-question, conclusion, applicability, blockers, and next action. Consult a
+[feasibility charter](tracks/01-feasibility.md) and the investigation it assigns.
+That investigation owns its current question, conclusion, applicability, blockers,
+and next action. Consult a
 historical review only for a specific unresolved finding, contradiction, or audit.
 
 ## Decision and product envelope
@@ -60,10 +61,6 @@ This workflow migration neither completes Track 01 nor adds experimental evidenc
    Record the accepted finding and remaining substantive issues in the investigation.
    A contradiction reopens the affected claim and any conclusion relying on it
    until resolved or withdrawn; migration and previous approval cannot resolve it.
-
-Track 01 keeps explicit falsifiable kill assumptions in the
-[family register](investigations/INV-01-02.md), tests them early, and maps each
-to the stop conditions in [Scope and success](tracks/00-scope-and-success.md).
 
 At track completion, perform a breadth check from product, architecture,
 correctness, and methodology perspectives. Carry unresolved implications and
@@ -140,30 +137,23 @@ Reviewers assess clock applicability in prose. Runners retain output boundaries,
 non-overwrite behavior, child supervision, timeout/resource limits, partial-failure
 records, and substantive correctness/control checks. Changed formats use explicit
 new versions; missing historical approval fields never imply new-format success.
-Historical artifacts keep their original interpretation and remain recoverable
-with their original readers and code recorded in Git/manifests.
-
-Experiment READMEs explain operation, inputs, controls, failure behavior, and output
-interpretation. They point to the investigation for research status.
 
 ## Navigation and historical records
 
-Track 01 indices contain titles and links only. Its investigations are the sole
-live status authority. Other tracks retain existing investigation content; their
-migration is outside this change, while their new work follows this workflow.
-Historical [reviews](reviews/README.md), [review ledger](review-ledger.md),
-[source ledger](source-ledger.md), and [manifests](manifests/README.md) remain at
-their existing locations for provenance and recovery. New work has no obligation
-to update historical ledgers or eight-gate tables. Old review verdicts remain
-historical facts; substantive unresolved findings belong in the current investigation.
+Two historical bodies of work live only in git history and are not evidence or
+current direction: the August 2026 corpus at commit `a121702`, and the September
+2026 Track 01 process-design investigations, reviews, manifests, ledgers and
+experiments at tag `track01-archive-2026-09-06`. Do not read them unless auditing
+a specific old finding. Other tracks retain their existing question content; their
+new work follows this workflow.
 
 ## Identifiers
 
 Keep existing `Q-<track>-<nn>`, `INV-<track>-<nn>`, and `CLM-<track>-<nn>-<nn>`
 identifiers. An investigation answers the question with the same number.
-Historical `SRC-<nnn>`, `REV-<nnn>`, and `MAN-<track>-<nn>-<nn>` identifiers remain
-recoverable and are never reassigned. Breadth records may use
-`BP-<track>-<nn>-start` and `BP-<track>-end`. Withdrawn identifiers remain recorded.
+Historical `SRC-<nnn>`, `REV-<nnn>`, `MAN-<track>-<nn>-<nn>`, `BP-<track>-<nn>-start`
+and `BP-<track>-end` identifiers are recoverable at tag `track01-archive-2026-09-06`
+and are never reassigned. Withdrawn identifiers remain recorded.
 
 ## Tracks
 

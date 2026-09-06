@@ -1,21 +1,3 @@
 # Feasibility
 
-- [INV-01-01 — platform-facts capability probe](../investigations/INV-01-01.md)
-- [INV-01-02 — admissible emulator architecture families](../investigations/INV-01-02.md)
-- [INV-01-03 — guest address-space representation and its limits](../investigations/INV-01-03.md)
-- [INV-01-04 — executable generated code and the cost of write/execute transitions](../investigations/INV-01-04.md)
-- [INV-01-05 — guest paging, invalidation, and modification tracking](../investigations/INV-01-05.md)
-- [INV-01-06 — precise, restartable delivery of faults raised in generated code](../investigations/INV-01-06.md)
-- [INV-01-07 — host timekeeping and asynchronous-event facilities](../investigations/INV-01-07.md)
-- [INV-01-08 — x86-TSO on the Arm memory model, atomics, and cross-vCPU events](../investigations/INV-01-08.md)
-- [INV-01-09 — device-backing admissibility](../investigations/INV-01-09.md)
-- [INV-01-10 — toolchain existence and sustainability](../investigations/INV-01-10.md)
-- [INV-01-11 — dependency and source-of-study license audit](../investigations/INV-01-11.md)
-- [INV-01-12 — integrated mechanism prototype](../investigations/INV-01-12.md)
-- [INV-01-13 — guest machine contract option analysis](../investigations/INV-01-13.md)
-- [INV-01-14 — per-instance resource-budget admissibility and limit proposal](../investigations/INV-01-14.md)
-- [INV-01-18 — shared-code publication, live patching, and quiescence](../investigations/INV-01-18.md)
-- [INV-01-19 — fault delivery during JIT writing and live patching](../investigations/INV-01-19.md)
-- [INV-01-21 — host power-state and background-execution transitions](../investigations/INV-01-21.md)
-- [INV-01-22 — guest time-base policy admissibility](../investigations/INV-01-22.md)
-- [INV-01-23 — vCPU scheduling and guest-visible liveness](../investigations/INV-01-23.md)
+This charter is being redrafted for the shim design. See the [research workflow](../README.md).

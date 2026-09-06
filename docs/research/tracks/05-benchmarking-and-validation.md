@@ -5,10 +5,7 @@ forward by [Architecture options](03-architecture-options.md) — the same set
 [Performance estimation](04-performance-estimation.md) estimates — against
 the fair baselines defined by
 [Scope and success](00-scope-and-success.md), QEMU TCG required among them;
-it is a roadmap, not a result. Work on it follows the
-[research governance](../README.md), the
-[evidence policy](../evidence-policy.md), and the
-[executor guide](../executor-guide.md).
+it is a roadmap, not a result. Work on it follows the [research workflow](../README.md).
 
 ## Measurement progression
 
@@ -20,8 +17,7 @@ subsystem it spans has accepted subsystem evidence; and an end-to-end
 workload only when every mechanism the measured configuration exercises has
 accepted evidence at all prior stages. Each stage
 becomes questions in the [question backlog](../question-backlog.md),
-resolved with labelled evidence through the applicable gates (see
-[gate completion](../evidence-policy.md#gate-completion)):
+resolved with labelled evidence through the applicable gates:
 
 1. **Capability checks.** Whether a mechanism works at all under the
    approved experiment code, before any timing of it is meaningful.
@@ -59,7 +55,7 @@ repetitions to state uncertainty; documented experimental controls,
 including host state and disclosed tuning on both sides of a comparison;
 uncertainty intervals, never bare means; a raw-data manifest referencing
 immutable external raw artifacts, as required by the
-[evidence policy](../evidence-policy.md); and the correctness status of the
+[research workflow](../README.md); and the correctness status of the
 measured configuration per [Correctness](02-correctness.md) — a result from
 a configuration with an unresolved or failing correctness status cannot
 support a performance conclusion.

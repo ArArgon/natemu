@@ -2,9 +2,7 @@
 
 This track defines what research must demonstrate about emulation fidelity
 before any performance claim can stand. It is a roadmap, not a finding. Work
-on it follows the [research governance](../README.md), the
-[evidence policy](../evidence-policy.md), and the
-[executor guide](../executor-guide.md).
+on it follows the [research workflow](../README.md).
 
 ## Correctness surface
 
@@ -12,7 +10,7 @@ The track must define, and then demonstrate coverage of, the guest-visible
 behavior inside the compatibility boundary set by
 [Scope and success](00-scope-and-success.md). Each area becomes questions in
 the [question backlog](../question-backlog.md), resolved through the
-applicable gates (see [gate completion](../evidence-policy.md#gate-completion)):
+applicable gates:
 
 - **ISA.** Instruction semantics, including flags, edge operands, and
   undefined-versus-defined behavior distinctions the specification makes.

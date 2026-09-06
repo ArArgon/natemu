@@ -7,10 +7,7 @@ recommendation, plus any family whose rejection a recorded falsifier has
 reopened — can plausibly meet the "materially better" definition from
 [Scope and success](00-scope-and-success.md); the track estimates only that
 set. It is a roadmap, not a finding, and it makes no performance claims.
-Work on it follows the
-[research governance](../README.md), the
-[evidence policy](../evidence-policy.md), and the
-[executor guide](../executor-guide.md).
+Work on it follows the [research workflow](../README.md).
 
 ## Estimation rules
 
@@ -18,7 +15,7 @@ Every estimate produced under this track must be a range with an explicit
 sensitivity analysis over its inputs, never a point claim. Each input carries
 its evidence label, and the estimate inherits the weakest label among its
 load-bearing inputs, per the label ordering declared in the
-[evidence policy](../evidence-policy.md). Combining estimates must not
+[research workflow](../README.md). Combining estimates must not
 multiply overlapping speedups: cost components that share a mechanism, a
 bottleneck, or a workload phase may not be composed as if independent, and
 every composition must state its independence argument. Estimates from
@@ -34,8 +31,7 @@ exhibit is recorded `not-applicable` with a reason rather than silently
 skipped, so the component set favors no family in advance. Each component
 becomes questions in the
 [question backlog](../question-backlog.md), resolved with labelled evidence
-through the applicable gates (see
-[gate completion](../evidence-policy.md#gate-completion)):
+through the applicable gates:
 
 - **Translated execution.** The steady-state cost of executing translated
   guest code.

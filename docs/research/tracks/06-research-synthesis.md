@@ -1,15 +1,11 @@
 # Research synthesis
 
 This track defines how research must assemble a final decision packet from
-the preceding tracks. It is a roadmap, not a decision. Work on it follows the
-[research governance](../README.md), the
-[evidence policy](../evidence-policy.md), and the
-[executor guide](../executor-guide.md).
+the preceding tracks. It is a roadmap, not a decision. Work on it follows the [research workflow](../README.md).
 
 ## Inputs
 
-Synthesis consumes only findings that have passed their applicable gates
-(see [gate completion](../evidence-policy.md#gate-completion)); unlabelled
+Synthesis consumes only findings that have passed their applicable gates; unlabelled
 or ungated material cannot enter the packet. Open items raised during
 synthesis become entries in the
 [question backlog](../question-backlog.md). The inputs are the accepted
@@ -39,13 +35,13 @@ The packet must contain:
   reopened finding identifies every dependent conclusion.
 - **Contradiction scan.** A deliberate search for findings that contradict
   each other or the recommendation; any contradiction reopens the affected
-  findings per the [evidence policy](../evidence-policy.md).
+  findings per the [research workflow](../README.md).
 
 ## Independent critique
 
 Before the synthesis gate, the packet requires adversarial critique by an
 independent reviewer, per the independence requirements in the
-[executor guide](../executor-guide.md). The critique and its resolution
+[research workflow](../README.md). The critique and its resolution
 remain part of the packet.
 
 ## Outcome

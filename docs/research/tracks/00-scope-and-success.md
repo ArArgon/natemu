@@ -1,9 +1,7 @@
 # Scope and success
 
 This track defines what research must settle first. It is a roadmap, not a
-finding: nothing here is evidence. Work on it follows the
-[research governance](../README.md), the [evidence policy](../evidence-policy.md),
-and the [executor guide](../executor-guide.md).
+finding: nothing here is evidence. Work on it follows the [research workflow](../README.md).
 
 ## Initial target
 
@@ -20,7 +18,7 @@ The starting envelope, subject to revision by this track's own outcomes:
 This envelope is an input to be questioned, not a settled scope. Every
 narrowing or widening must be recorded as a question in the
 [question backlog](../question-backlog.md) and resolved through the applicable
-gates (see [gate completion](../evidence-policy.md#gate-completion)).
+gates.
 
 ## Required definitions
 

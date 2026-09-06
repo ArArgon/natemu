@@ -17,10 +17,11 @@ proposed approach only after research authorizes it; implementation begins only
 after planning is completed and approved and implementation is separately
 authorized.
 
-Material in historical commit `a121702` is untrusted history, not validated
-evidence or a current implementation direction.
+Two historical bodies of work live only in git history and are not evidence or
+current direction: the August 2026 corpus at commit `a121702`, and the September
+2026 Track 01 process-design investigations at tag `track01-archive-2026-09-06`.
+Do not read them unless auditing a specific old finding.
 
 The reset design and plan under `docs/superpowers/` are kept as records of
 that decision and use older vocabulary: their "harness" is what the research
-documents now call experiment code (and the "harness gate" is the code gate),
-and their "spike" is now a prototype.
+documents now call experiment code (and the "harness gate" is the code gate).
