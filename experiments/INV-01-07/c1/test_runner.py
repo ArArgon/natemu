@@ -1,4 +1,4 @@
-"""Synthetic supervisor/gate tests. Popen is always mocked; no native launch.
+"""Synthetic supervisor/build tests. Popen is always mocked; no native launch.
 
 Temporary files are synthetic fixtures, not raw evidence. These tests do not
 establish host watchdog, direct-binary validation, native API/control behavior
@@ -102,227 +102,28 @@ class RunnerTests(unittest.TestCase):
         with runner.CampaignLock(path):
             self.assertTrue(path.exists())
 
-    def test_review_acceptance_independence_hash_and_receipt(self):
-        text = "# Synthetic review, not evidence\n- Review ID: `REV-196`\n- Independence: `independent`\n- Verdict: `accept`.\n"
-        data = text.encode()
-        expected_hash = hashlib.sha256(data).hexdigest()
-        with mock.patch.object(runner.artifact, "read_regular", return_value=data):
-            self.assertEqual(runner.review_record("/fake", "196", expected_hash, independent=True), text)
-            self.invalid("review-independence", runner.review_record, "/fake", "196", expected_hash, independent=False)
-            self.invalid("review-hash", runner.review_record, "/fake", "196", "0" * 64, independent=True)
-        for bad_text, code in ((text.replace("`accept`", "`revise`"), "review-not-accepted"),
-                               (text + "- Verdict: `accept`\n", "review-not-accepted"),
-                               (text.replace("REV-196", "REV-195"), "review-id")):
-            payload = bad_text.encode()
-            with mock.patch.object(runner.artifact, "read_regular", return_value=payload):
-                self.invalid(code, runner.review_record, "/fake", "196", hashlib.sha256(payload).hexdigest(), independent=True)
-        # A deliberately non-`accept` expected verdict (the frozen revise196
-        # critique) must accept exactly that verdict and reject the others.
-        revise_text = text.replace("`accept`", "`revise`")
-        revise_data = revise_text.encode()
-        with mock.patch.object(runner.artifact, "read_regular", return_value=revise_data):
-            self.assertEqual(runner.review_record("/fake", "196", hashlib.sha256(revise_data).hexdigest(),
-                                                  independent=True, verdict="revise"), revise_text)
-            self.invalid("review-not-accepted", runner.review_record, "/fake", "196",
-                        hashlib.sha256(revise_data).hexdigest(), independent=True, verdict="accept")
-        receipt = "- C1 source SHA-256: `" + "a" * 64 + "`\n"
-        runner.receipt(receipt, "C1 source SHA-256", "a" * 64)
-        self.invalid("review-receipt:C1 source SHA-256", runner.receipt,
-                     receipt + receipt, "C1 source SHA-256", "a" * 64)
-
-    def write_review(self, number, *, independent, verdict, mentions=(),
-                     review_type="code", subject="`INV-01-07` M07-C1 clock producer"):
-        reviews = self.repo / "docs/research/reviews"
-        reviews.mkdir(parents=True, exist_ok=True)
-        text = (f"# Synthetic REV-{number}\n- Review ID: `REV-{number}`\n"
-                f"- Review type: `{review_type}`\n"
-                f"- Subject ID(s): {subject}\n"
-                f"- Independence: `{'independent' if independent else 'self'}`\n"
-                f"- Verdict: `{verdict}`.\n" + "".join(f"{line}\n" for line in mentions))
-        path = reviews / f"REV-{number}.md"
-        path.write_text(text, encoding="utf-8")
-        return hashlib.sha256(text.encode()).hexdigest()
-
-    def gate_fixture(self, *, return_number="219", return_independent=True,
-                     return_verdict="accept", mentions_critique=True,
-                     return_type="code", return_subject="`INV-01-07` M07-C1 clock producer"):
-        # A fresh subtree per call: tests exercise gate_fixture() repeatedly
-        # against the same self.raw external root.
-        unique = self.raw / hashlib.sha256(os.urandom(16)).hexdigest()[:12]
-        build_dir = unique / "build"
-        build_dir.mkdir(parents=True)
-        sdk = unique / "gate-sdk"
-        sdk.mkdir()
-        gate_path = unique / "gate.json"
-        gate_path.write_text("{}")
-        sources = {runner.SOURCE_PREFIX + "producer.c": "a" * 64,
-                   runner.SOURCE_PREFIX + "runner.py": "b" * 64}
-        source_digest = hashlib.sha256(json.dumps(sources, sort_keys=True, separators=(",", ":"),
-                                                 ensure_ascii=True).encode()).hexdigest()
-        return_mentions = (f"- Return against `REV-{runner.CRITIQUE_REVIEW}`.",
-                           f"- C1 source SHA-256: `{source_digest}`",
-                           "- C1 build SHA-256: `" + "f" * 64 + "`",
-                           "- C1 method SHA-256: `" + "d" * 64 + "`") if mentions_critique else (
-                           f"- C1 source SHA-256: `{source_digest}`",
-                           "- C1 build SHA-256: `" + "f" * 64 + "`",
-                           "- C1 method SHA-256: `" + "d" * 64 + "`")
-        return_hash = self.write_review(return_number, independent=return_independent,
-                                        verdict=return_verdict, mentions=return_mentions,
-                                        review_type=return_type, subject=return_subject)
-        gate = {"schema": runner.GATE_SCHEMA, "revision": "c" * 40, "source_files": sources,
-                "method_sha256": "d" * 64, "reviews": {key: "e" * 64 for key in runner.REVIEWS},
-                "independent_return": {"review_id": return_number,
-                                       "file": f"docs/research/reviews/REV-{return_number}.md",
-                                       "sha256": return_hash, "expected_verdict": "accept",
-                                       "independence": "independent"},
-                "build_directory": str(build_dir), "build_sha256": "f" * 64,
-                "required_changes_closed": True}
-        build = {"schema": runner.BUILD_SCHEMA, "source_files": sources, "source_revision": "1" * 40,
-                 "files": {key: "a" * 64 for key in (
-                     "clock_c1", "disassembly.stdout", "validation.stdout", "validation.stderr")},
-                 "headers": {str(sdk / "usr/include" / name): "a" * 64 for name in (
-                     "mach/mach_time.h", "time.h", "pthread.h", "pthread/qos.h", "sys/qos.h",
-                     "CommonCrypto/CommonDigest.h")},
-                 "commands": [], "sdk": str(sdk), "compiler": "synthetic",
-                 "validation_exit": 0, "native_executed": False}
-        return gate_path, gate, build, sources, None
-
-    def gate_mocks(self, fixture):
-        path, gate, build, sources, unused = fixture
-        real_review_record = runner.review_record
-        def dispatch_review(rpath, number, expected_hash, *, independent, verdict="accept"):
-            # The four fixed reviews (193-196) are trivially satisfied here;
-            # `test_review_acceptance_...` covers review_record's own regex
-            # logic directly. The independent-return review, whose id/file
-            # are gate-supplied, runs the real function against a real file
-            # so the missing/revise/self-only fixtures below exercise it.
-            if number == gate["independent_return"]["review_id"]:
-                return real_review_record(rpath, number, expected_hash, independent=independent, verdict=verdict)
-            return (f"- Review ID: `REV-{number}`\n- Independence: "
-                    f"`{'independent' if independent else 'self'}`\n- Verdict: `{verdict}`.\n")
-        stack = contextlib.ExitStack()
-        stack.enter_context(mock.patch.object(runner, "clean_scope"))
-        stack.enter_context(mock.patch.object(runner, "revision", return_value="c" * 40))
-        stack.enter_context(mock.patch.object(runner, "source_files", return_value=sources))
-        stack.enter_context(mock.patch.object(runner, "review_record", side_effect=dispatch_review))
-        stack.enter_context(mock.patch.object(runner.artifact, "read_json", side_effect=lambda p:
-                                               gate if Path(p) == path else build))
-        stack.enter_context(mock.patch.object(runner, "file_digest", side_effect=lambda p, *args:
-                                               "f" * 64 if Path(p).name == "build.json" else
-                                               "d" * 64 if Path(p).name == "INV-01-07.md" else "a" * 64))
-        stack.enter_context(mock.patch.object(runner.os, "access", return_value=True))
-        return stack
-
-    def test_complete_gate_binds_sources_build_method_reviews_and_revision(self):
-        fixture = self.gate_fixture()
-        path, gate, build, sources, unused = fixture
-        with self.gate_mocks(fixture):
-            accepted, executable = runner.load_gate(str(path), self.raw)
-            self.assertEqual(accepted, gate)
-            self.assertEqual(executable, Path(gate["build_directory"]) / "clock_c1")
-            with mock.patch.object(runner, "revision", return_value="0" * 40):
-                self.invalid("revision-changed", runner.load_gate, str(path), self.raw)
-            with mock.patch.object(runner, "source_files", return_value={**sources, "unexpected": "a" * 64}):
-                self.invalid("reviewed-source-mismatch", runner.load_gate, str(path), self.raw)
-            build["native_executed"] = True
-            self.invalid("build-status-or-source", runner.load_gate, str(path), self.raw)
-            build["native_executed"] = False
-            gate["required_changes_closed"] = False
-            self.invalid("gate-status", runner.load_gate, str(path), self.raw)
-
-    def test_gate_requires_accepted_independent_return_against_critique196(self):
-        # Missing return entirely: no `independent_return` key in the gate.
-        fixture = self.gate_fixture()
-        path, gate, build, sources, unused = fixture
-        del gate["independent_return"]
-        with self.gate_mocks(fixture):
-            self.invalid("gate-fields", runner.load_gate, str(path), self.raw)
-
-        # A real return review that is still `revise` (R2 not actually closed)
-        # must refuse, even though the gate JSON *declares* expected accept.
-        fixture = self.gate_fixture(return_verdict="revise")
-        path, gate, build, sources, unused = fixture
-        with self.gate_mocks(fixture):
-            self.invalid("review-not-accepted", runner.load_gate, str(path), self.raw)
-
-        # A self-authored "acceptance" of the code packet cannot substitute
-        # for independent return review, no matter its declared verdict.
-        fixture = self.gate_fixture(return_independent=False)
-        path, gate, build, sources, unused = fixture
-        with self.gate_mocks(fixture):
-            self.invalid("review-independence", runner.load_gate, str(path), self.raw)
-
-        # The return review must actually address the frozen critique196,
-        # not merely claim independent acceptance of something else.
-        fixture = self.gate_fixture(mentions_critique=False)
-        path, gate, build, sources, unused = fixture
-        with self.gate_mocks(fixture):
-            self.invalid("independent-return-not-against-critique", runner.load_gate, str(path), self.raw)
-
-        # The gate cannot reuse one of the fixed review numbers as the return
-        # (checked directly at the unit level: real load_gate would first
-        # bind the reused number to its own fixed-review meaning above it).
-        reused_hash = self.write_review("196", independent=True, verdict="accept",
-                                        mentions=(f"- Return against `REV-{runner.CRITIQUE_REVIEW}`.",))
-        self.invalid("independent-return-review-id", runner.independent_return_record,
-                     {"review_id": "196", "file": "docs/research/reviews/REV-196.md",
-                      "sha256": reused_hash, "expected_verdict": "accept", "independence": "independent"})
-
-        # Nor may it point its `file` at a path other than its declared number.
-        self.invalid("independent-return-file", runner.independent_return_record,
-                     {"review_id": "219", "file": "docs/research/reviews/REV-999.md",
-                      "sha256": "a" * 64, "expected_verdict": "accept", "independence": "independent"})
-
-        # R4: the return review's own `Review type`/`Subject ID(s)` lines are
-        # bound. Reproduction from REV-219: a `method` review of an unrelated
-        # investigation (INV-01-18) must not load as this packet's code
-        # return, even though it is independent, accepting, and mentions the
-        # critique it is (falsely) claimed to return against.
-        fixture = self.gate_fixture(return_type="method",
-                                    return_subject="`INV-01-18` F18 harness")
-        path, gate, build, sources, unused = fixture
-        with self.gate_mocks(fixture):
-            self.invalid("independent-return-type", runner.load_gate, str(path), self.raw)
-
-        fixture = self.gate_fixture(return_subject="`INV-01-18` F18 harness")
-        path, gate, build, sources, unused = fixture
-        with self.gate_mocks(fixture):
-            self.invalid("independent-return-subject", runner.load_gate, str(path), self.raw)
-
-    def test_load_gate_includes_independent_return_review_in_clean_scope(self):
-        # R5: clean_scope() used to cover only the four fixed reviews, so the
-        # gate-supplied return review could be an uncommitted working-tree
-        # file at collection. load_gate must fold its resolved path into the
-        # same clean/committed scope check.
-        fixture = self.gate_fixture(return_number="219")
-        path, gate, build, sources, unused = fixture
-        with self.gate_mocks(fixture):
-            runner.load_gate(str(path), self.raw)
-            runner.clean_scope.assert_called_once_with(
-                extra_paths=("docs/research/reviews/REV-219.md",))
-
-    def test_dirty_or_uncommitted_scope_refuses(self):
-        with mock.patch.object(runner, "git", return_value=" M experiments/INV-01-07/c1/core.py\0"):
-            self.invalid("dirty-reviewed-scope", runner.clean_scope)
-        with mock.patch.object(runner, "git", side_effect=["", "wrong-path"]):
-            self.invalid("uncommitted-review-or-method", runner.clean_scope)
-
-        # The gate-supplied independent-return review must be in scope too.
-        extra = "docs/research/reviews/REV-219.md"
-
-        def dirty_because_extra(*args):
-            self.assertIn(extra, args)
-            return " M " + extra + "\0"
-        with mock.patch.object(runner, "git", side_effect=dirty_because_extra):
-            self.invalid("dirty-reviewed-scope", runner.clean_scope, extra_paths=(extra,))
-
-        def clean_status_but_extra_untracked(*args):
-            if args[0] == "status":
-                return ""
-            queried = args[-1]
-            return queried if queried != extra else "wrong-path"
-        with mock.patch.object(runner, "git", side_effect=clean_status_but_extra_untracked):
-            self.invalid("uncommitted-review-or-method", runner.clean_scope, extra_paths=(extra,))
+    def test_retained_build_ignores_editorial_state_and_rejects_mixed_bytes(self):
+        directory = self.raw / "build"
+        directory.mkdir()
+        (directory / "sources").mkdir()
+        names = ("clock_c1", "sources/producer.c", "sources/runner.py", "sources/source-context.json", "sources/artifact.py", "sources/core.py", "sources/cells.py",
+                 "sources/check.py", "sources/clock_evidence.py", "disassembly.stdout",
+                 "validation.stdout", "validation.stderr")
+        for name in names:
+            (directory / name).write_bytes(b"synthetic")
+        (directory / "clock_c1").chmod(0o700)
+        record = {"schema": runner.BUILD_SCHEMA, "build_id": "a" * 32,
+                  "files": {name: runner.file_digest(directory / name) for name in names},
+                  "commands": [], "sdk": "synthetic", "compiler": "synthetic", "headers": {},
+                  "validation_exit": 0, "native_executed": False}
+        self.put(directory / "build.json", record)
+        (self.repo / "README.md").write_text("uncommitted editorial change")
+        self.assertEqual(runner.load_build(str(directory), self.raw)[0], record)
+        (directory / "clock_c1").write_bytes(b"different build")
+        self.invalid("build-artifact-hash", runner.load_build, str(directory), self.raw)
+        record["schema"] = "INV-01-07-clock-c1-build-v1"
+        self.put(directory / "build.json", record)
+        self.invalid("build-status-or-source", runner.load_build, str(directory), self.raw)
 
     def fake_launch(self, output, returncode=0, wait_effect=None):
         def launch(argv, **kwargs):
@@ -485,10 +286,8 @@ class RunnerTests(unittest.TestCase):
                 Path(argv[argv.index("-o") + 1]).write_bytes(b"not-machine-code: synthetic build fixture")
             return subprocess.CompletedProcess(argv, 0, stdout, b"")
         with (mock.patch.dict(os.environ, {"NATEMU_RAW_ROOT": str(self.raw)}),
-              mock.patch.object(runner, "review_record", return_value="accepted synthetic method"),
-              mock.patch.object(runner, "source_files", return_value={"synthetic": "a" * 64}),
-              mock.patch.object(runner, "git", return_value=""),
-              mock.patch.object(runner, "revision", return_value="b" * 40),
+              mock.patch.object(runner, "snapshot_sources", return_value=output / "sources"),
+              mock.patch.object(runner.artifact, "read_regular", return_value=b"synthetic-header"),
               mock.patch.object(runner, "file_digest", return_value="a" * 64),
               mock.patch.object(runner, "command", side_effect=command),
               mock.patch.object(runner.subprocess, "Popen") as launch):
@@ -502,6 +301,21 @@ class RunnerTests(unittest.TestCase):
         self.assertIs(result["native_executed"], False)
         self.assertEqual(result["validation_exit"], 0)
         self.assertIn("clock_c1", result["files"])
+
+    def test_partial_snapshot_failure_retains_checksums(self):
+        output = self.raw / "partial-build"
+        def fail_snapshot(directory):
+            (directory / "sources").mkdir()
+            (directory / "sources/partial.c").write_bytes(b"partial")
+            raise OSError("synthetic copy failure")
+        with (mock.patch.dict(os.environ, {"NATEMU_RAW_ROOT": str(self.raw)}),
+              mock.patch.object(runner, "snapshot_sources", side_effect=fail_snapshot)):
+            with self.assertRaises(OSError):
+                runner.build(argparse.Namespace(output=str(output)))
+        record = json.loads((output / "build-failure.json").read_text())
+        self.assertEqual(record["schema"], "INV-01-07-clock-c1-build-failure-v2")
+        self.assertTrue(record["hashing_complete"])
+        self.assertEqual(record["files"]["sources/partial.c"], hashlib.sha256(b"partial").hexdigest())
 
     def test_omission_is_exactly_one_short_and_designated_cell(self):
         def record():
@@ -535,7 +349,7 @@ class RunnerTests(unittest.TestCase):
     def test_whole_campaign_fixed_schedule_and_failure_no_retries(self):
         for fail_at, render_failure in ((None, False), (3, False), (3, True)):
             destination = self.raw / ("success" if fail_at is None else "render" if render_failure else "failure")
-            args = argparse.Namespace(output=str(destination), gate=str(self.raw / "gate"),
+            args = argparse.Namespace(output=str(destination), build=str(self.raw / "build"),
                                       no_other_native_benchmarks=True)
             launched = []
             def supervise(exe, directory, seed, mode, campaign, root):
@@ -543,6 +357,7 @@ class RunnerTests(unittest.TestCase):
                 directory.mkdir()
                 process = {"exit_status": 0, "signal": None, "timeout": False, "complete": True}
                 self.put(directory / "process.json", process)
+                self.put(directory / "record.json", {"timebase": {"numer": 1, "denom": 1}})
                 return process
             def inspect(directory, root, seed, mode, terminal):
                 if fail_at is not None and len(launched) - 1 == fail_at:
@@ -555,10 +370,11 @@ class RunnerTests(unittest.TestCase):
             with contextlib.ExitStack() as stack:
                 stack.enter_context(mock.patch.dict(os.environ, {"NATEMU_RAW_ROOT": str(self.raw)}))
                 stack.enter_context(mock.patch.object(runner, "CampaignLock", return_value=contextlib.nullcontext()))
-                stack.enter_context(mock.patch.object(runner, "load_gate", return_value=({"synthetic": True}, Path("/not-executed"))))
+                stack.enter_context(mock.patch.object(runner, "load_build", return_value=({"build_id": "a" * 32}, Path("/not-executed"))))
                 stack.enter_context(mock.patch.object(runner, "file_digest", return_value="a" * 64))
                 stack.enter_context(mock.patch.object(runner.shutil, "disk_usage", return_value=mock.Mock(free=10**12)))
                 stack.enter_context(mock.patch.object(runner, "environment_snapshot", return_value=snapshot))
+                stack.enter_context(mock.patch.object(runner, "command", return_value=subprocess.CompletedProcess([], 0, b"synthetic", b"")))
                 stack.enter_context(mock.patch.object(runner, "supervise", side_effect=supervise))
                 stack.enter_context(mock.patch.object(runner, "inspect_child", side_effect=inspect))
                 if render_failure:

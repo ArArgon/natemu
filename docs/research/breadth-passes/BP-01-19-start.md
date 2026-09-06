@@ -1,5 +1,10 @@
 # BP-01-19-start — fault delivery during JIT writing and patching breadth pass
 
+> Historical question-opening coverage. Findings and current work belong to
+> [INV-01-19](../investigations/INV-01-19.md); this pass is not a live status
+> record and new work need not update it.
+
+
 ## Metadata
 
 - Breadth-pass ID: `BP-01-19-start`

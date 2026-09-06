@@ -1,5 +1,10 @@
 # BP-01-02-start — architecture-families breadth pass
 
+> Historical question-opening coverage. Findings and current work belong to
+> [INV-01-02](../investigations/INV-01-02.md); this pass is not a live status
+> record and new work need not update it.
+
+
 ## Metadata
 
 - Breadth-pass ID: `BP-01-02-start`

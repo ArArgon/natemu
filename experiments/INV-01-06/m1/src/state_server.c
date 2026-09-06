@@ -1,780 +1,484 @@
-/* INV-01-06 M06-M1 state-only exception server and worker harness.
- *
- * One process (fresh-exec'd per cell/child) hosts N worker threads and either
- * one serial server thread (receiving through a port set) or N per-worker
- * server threads, all within this single task. Never forks a multithreaded
- * or JIT-holding parent; the harness that launches this binary always
- * execve()s it fresh (see ../run.py).
- *
- * Build only: this file is compiled and disassembled by ../build.py. It is
- * NEVER executed by this authoring session against a real fault; see
- * INV-01-06.md:594-600,810 and ../README.md "Execution boundary". Compiling
- * and disassembling it is in scope; running it is not.
- *
- * Wire contract: subsystem 2405, routine 2406 (mach_exception_raise_state),
- * EXCEPTION_STATE | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64. See
- * ../wire-layout.json (frozen by build.py from the generated MIG headers)
- * for the exact request/reply byte layout this code assumes.
- *
- * Trace schema: one JSON object per line on stdout; kinds are documented in
- * ../check.py's TRACE SCHEMA comment. ../check.py's two-pass checker
- * consumes this exact schema, including via hand-built negative fixtures
- * that never invoke this binary.
+/* M06-M1, owned state-only unchanged-state retry experiment.
+ * Compile/synthetic preparation is not authorization to execute this file.
+ * No signal handler, thread_set_state, pointer-state mutation or private API.
  */
-#include <assert.h>
 #include <errno.h>
-#include <mach/exception_types.h>
 #include <mach/mach.h>
-#include <mach/mach_time.h>
 #include <mach/arm/thread_status.h>
 #include <mach/thread_act.h>
 #include <mach/task.h>
 #include <libkern/OSCacheControl.h>
 #include <pthread.h>
 #include <sched.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include "mach_exc.h"
+#include "mach_excServer.h"
 
-#include "mach_exc.h"      /* generated: catch client stubs (mach_exception_raise_state) */
-#include "mach_excServer.h"/* generated: mach_exc_server demux + catch_ prototypes */
-
-/* ---- fixed wire/contract constants (frozen; see wire-layout.json) ------ */
-#define M1_ROUTINE_ID          2406u
-#define M1_EXCEPTION           EXC_BAD_ACCESS
-#define M1_BEHAVIOR            (EXCEPTION_STATE | MACH_EXCEPTION_CODES)
-#define M1_FLAVOR              ARM_THREAD_STATE64
-#define M1_STATE_COUNT         ARM_THREAD_STATE64_COUNT   /* 68 natural_t words */
-
-_Static_assert(M1_STATE_COUNT == 68, "ARM_THREAD_STATE64_COUNT changed on this SDK");
-
-static void jlog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static pthread_mutex_t g_out_lock = PTHREAD_MUTEX_INITIALIZER;
-static void jlog(const char *fmt, ...) {
-	char buf[4096];
-	va_list ap;
-	va_start(ap, fmt);
-	vsnprintf(buf, sizeof buf, fmt, ap);
-	va_end(ap);
-	pthread_mutex_lock(&g_out_lock);
-	fputs(buf, stdout);
-	fputc('\n', stdout);
-	fflush(stdout);
-	pthread_mutex_unlock(&g_out_lock);
-}
-
-/* ---- CLI configuration --------------------------------------------------*/
-typedef enum { ACC_LOAD, ACC_STORE } access_t;
-typedef enum { TOPO_SERIAL, TOPO_PERWORKER } topo_t;
-typedef enum { PATH_DIRECT, PATH_FORWARD } path_t;
+#define BEHAVIOR (EXCEPTION_STATE | MACH_EXCEPTION_CODES)
+#define COUNT ARM_THREAD_STATE64_COUNT
+#define SENTINEL UINT64_C(0x1864186418641864)
+#define RECEIVE_TIMEOUT_MS 60000
+_Static_assert(COUNT == 68, "reviewed state layout");
+_Static_assert(THREAD_STATE_NONE == 5, "arm64 decoy flavor consumed by control checker");
+_Static_assert(__DARWIN_OPAQUE_ARM_THREAD_STATE64 == 0, "raw PC/SP decoder requires non-opaque arm64");
+typedef struct { uint64_t value,cookie,nonce,sentinel,sp_before,sp_after; } Result;
+/* AOT wrapper owns all sentinel registers across the exact faulting access.
+ * x9/x10 are independent delivered cookie/nonce; x19..x22 are callee-saved
+ * and their returned values plus exact SP equality are measured after retry. */
+extern void m1_access(void *,void *,uint64_t,uint64_t,uint64_t,Result *);
+extern uint64_t m1_load(void *);
+extern void m1_store(void *,uint64_t);
+extern char m1_load_fault[],m1_store_fault[];
+__asm__(".text\n.p2align 2\n.globl _m1_access\n_m1_access:\n"
+ "stp x29,x30,[sp,#-80]!\nstp x19,x20,[sp,#16]\nstp x21,x22,[sp,#32]\nstp x23,x24,[sp,#48]\n"
+ "mov x16,x0\nmov x0,x1\nmov x1,x2\nmov x19,x3\nmov x20,x4\nmov x24,x5\n"
+ "mov x9,x3\nmov x10,x4\nmovz x21,#0x1864\nmovk x21,#0x1864,lsl #16\n"
+ "movk x21,#0x1864,lsl #32\nmovk x21,#0x1864,lsl #48\nmov x22,sp\nisb\nblr x16\n"
+ "stp x0,x19,[x24]\nstp x20,x21,[x24,#16]\nmov x11,sp\nstp x22,x11,[x24,#32]\n"
+ "ldp x23,x24,[sp,#48]\nldp x21,x22,[sp,#32]\nldp x19,x20,[sp,#16]\nldp x29,x30,[sp],#80\nret\n"
+ ".p2align 2\n.globl _m1_load\n.globl _m1_load_fault\n_m1_load:\n_m1_load_fault:\nldr x0,[x0]\nret\n"
+ ".p2align 2\n.globl _m1_store\n.globl _m1_store_fault\n_m1_store:\n_m1_store_fault:\nstr x1,[x0]\nret\n");
 
 typedef struct {
-	int n;                 /* worker count: 1,2,4,8 */
-	int jit;                /* 0 = non-JIT baseline, 1 = immutable-JIT (Q-01-04 controls) */
-	access_t access;
-	topo_t topology;
-	path_t path;
-	int warmup;
-	int checked;
-	unsigned seed;
-	const char *negative;  /* one of the 8 runtime-negative names, or NULL */
-	const char *arm;       /* "terminal" | "prior-handler-unsupported" | "restoration" | NULL */
-} config_t;
-
-/* ---- named deterministic holds (INV-01-06.md:734-744) ------------------
- * Eight fixed rendezvous points, each a simple counting handshake: the first
- * arrival blocks until a second party records its own attempt, then both
- * proceed. Disabled unless --holds is passed (a future evidence campaign's
- * concern; harmless no-op machinery here since this binary is never run in
- * this authoring session).
- */
-typedef enum {
-	HOLD_ARMED_BEFORE_FAULT,
-	HOLD_RECEIVED_BEFORE_VALIDATE,
-	HOLD_VALIDATED_BEFORE_REPAIR,
-	HOLD_REPAIRED_BEFORE_REPLY,
-	HOLD_FRONT_BEFORE_FORWARD,
-	HOLD_PRIOR_BEFORE_REPLY,
-	HOLD_RESUMED_BEFORE_DISARM,
-	HOLD_TEARDOWN_BEFORE_RESTORE,
-	HOLD_COUNT
-} hold_id_t;
-
-static struct { pthread_mutex_t m; pthread_cond_t c; int arrivals; uint64_t generation; } g_holds[HOLD_COUNT] = {
-	[0 ... HOLD_COUNT - 1] = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0 }
-};
-static int g_holds_enabled = 0;
-
-/* Two-party rendezvous, reusable across many events per process (a named
- * hold point is reached once per checked event, not once per process): the
- * first arrival in a round waits on a generation counter rather than on
- * "arrivals < 2" directly, so the second arrival can reset arrivals to 0 for
- * the next round without racing a waiter that hasn't yet re-checked the
- * predicate. */
-static void hold_point(hold_id_t id) {
-	if (!g_holds_enabled) return;
-	pthread_mutex_lock(&g_holds[id].m);
-	uint64_t my_generation = g_holds[id].generation;
-	g_holds[id].arrivals++;
-	if (g_holds[id].arrivals >= 2) {
-		g_holds[id].arrivals = 0;
-		g_holds[id].generation++;
-		pthread_cond_broadcast(&g_holds[id].c);
-	} else {
-		while (g_holds[id].generation == my_generation)
-			pthread_cond_wait(&g_holds[id].c, &g_holds[id].m);
-	}
-	pthread_mutex_unlock(&g_holds[id].m);
-}
-
-/* ---- worker descriptor ---------------------------------------------------
- * Exactly one immutable descriptor per worker, release-published before the
- * worker is admitted to arming. The server acquire-loads it. Everything a
- * server needs to check identity/attribution lives here; nothing is mutated
- * by the server except the outstanding-fault flag and commit counter, which
- * are themselves atomics.
- */
+ mach_msg_type_number_t count;
+ exception_mask_t masks[EXC_TYPES_COUNT];
+ mach_port_t ports[EXC_TYPES_COUNT];
+ exception_behavior_t behaviors[EXC_TYPES_COUNT];
+ thread_state_flavor_t flavors[EXC_TYPES_COUNT];
+} Snapshot;
 typedef struct {
-	int id;
-	mach_port_t recv_port;      /* receive right; also the front's own handler port */
-	mach_port_t send_right;     /* MAKE_SEND right on recv_port, installed as the handler */
-	mach_port_t prior_recv_port;/* forward path only: the owned prior's receive right */
-	mach_port_t prior_send_right;
-	_Atomic int published;      /* release-published before admission */
-	_Atomic int registration_done; /* set on every register_worker() exit, success or failure */
-	_Atomic int outstanding;    /* 0 or 1: one fault in flight at a time */
-	_Atomic int commits;        /* post-access commit markers observed */
-	_Atomic int prior_handler_unsupported;
-	uint64_t cookie;            /* independent assembly register cookie (x9) */
-	_Atomic uint64_t nonce;     /* per-event nonce, incremented each arm */
-	uint64_t expected_pc;       /* exact armed instruction PC */
-	uint64_t sp_lo, sp_hi;      /* expected SP range for this thread */
-	uint8_t *page;              /* dedicated data page */
-	size_t page_size;
-	uint64_t fault_address;
-	pthread_t thread_self_pthread;
-	thread_port_t thread_self;  /* this worker's own thread control port */
-	/* snapshot of the pre-existing exception-port configuration */
-	exception_mask_t old_masks[EXC_TYPES_COUNT];
-	mach_msg_type_number_t old_count;
-	mach_port_t old_ports[EXC_TYPES_COUNT];
-	exception_behavior_t old_behaviors[EXC_TYPES_COUNT];
-	thread_state_flavor_t old_flavors[EXC_TYPES_COUNT];
-} worker_t;
+ int id; pthread_t thread; thread_port_t control;
+ mach_port_t front,prior;
+ Snapshot initial,saved;
+ _Atomic int registered,permit,done,phase,proof_done,attempted,exited;
+ _Atomic int outstanding,front_seen,prior_seen,front_sent,prior_sent,receive_destroyed;
+ int event; uint64_t cookie,nonce,pc,sp_lo,sp_hi;
+ uint64_t *page; size_t page_size;
+} Worker;
+static struct { int n,jit,warmup,checked,hold_worker; unsigned seed;
+ const char *access,*topology,*path,*negative,*arm,*hold; } cfg;
+static Worker workers[8];
+static Snapshot task_initial;
+static mach_port_t port_set;
+static uint32_t *jit_code;
+static _Atomic int ready;
+static _Atomic int hold_entered,hold_release,teardown_requested,teardown_deferred,join_attempt[8];
+static pthread_mutex_t output_lock=PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local Worker *serving;
+static _Thread_local const char *serving_role;
 
-static config_t g_cfg;
-static worker_t g_workers[8];
-static mach_port_t g_port_set = MACH_PORT_NULL; /* serial topology only */
-static _Atomic int g_events_done[8];
-static uint32_t *g_gen_load, *g_gen_store; /* immutable-JIT: MAP_JIT, written once, then locked */
-static size_t g_gen_bytes;
-
-/* ---- lookup: registered receive port -> worker (identity) --------------*/
-static worker_t *worker_for_port(mach_port_t port) {
-	for (int i = 0; i < g_cfg.n; i++) {
-		if (atomic_load_explicit(&g_workers[i].published, memory_order_acquire) &&
-		    (g_workers[i].recv_port == port ||
-		     (g_cfg.path == PATH_FORWARD && g_workers[i].prior_recv_port == port)))
-			return &g_workers[i];
-	}
-	return NULL;
+static void logrow(const char *fmt,...) __attribute__((format(printf,1,2)));
+static void logrow(const char *fmt,...) {
+ char text[8192]; va_list ap; va_start(ap,fmt);
+ int length=vsnprintf(text,sizeof text,fmt,ap); va_end(ap);
+ if(length<0||(size_t)length>=sizeof text) _exit(74);
+ pthread_mutex_lock(&output_lock);
+ if(fputs(text,stdout)<0||fputc('\n',stdout)==EOF||fflush(stdout)) _exit(74);
+ pthread_mutex_unlock(&output_lock);
+}
+static _Noreturn void fail(const char *reason,int code) {
+ logrow("{\"kind\":\"terminal\",\"reason\":\"%s\",\"code\":%d}",reason,code);
+ fsync(STDOUT_FILENO); _exit(70);
+}
+#define REQUIRE(test,reason) do { if(!(test)) fail(reason,errno); } while(0)
+static void krcheck(kern_return_t kr,const char *reason) { if(kr!=KERN_SUCCESS) fail(reason,kr); }
+static bool forward(void) { return !strcmp(cfg.path,"forward"); }
+static bool negative(const char *name) { return !strcmp(cfg.negative,name); }
+static void trigger(Worker *w,const char *name) {
+ logrow("{\"kind\":\"negative_trigger\",\"worker\":%d,\"event\":%d,\"name\":\"%s\"}",w->id,w->event,name);
+ REQUIRE(!fsync(STDOUT_FILENO),"trigger durability");
+}
+static bool teardown_hold(void) {return !strcmp(cfg.hold,"teardown-before-restore")||!strcmp(cfg.hold,"before-right-disposal");}
+static void hold_point(Worker *w,const char *name,const char *role) {
+ if(strcmp(cfg.hold,name)||w->id!=cfg.hold_worker||(!teardown_hold()&&w->event!=0)) return;
+ REQUIRE(!atomic_load(&hold_entered),"hold entered twice");
+ logrow("{\"kind\":\"hold_enter\",\"worker\":%d,\"event\":%d,\"point\":\"%s\",\"role\":\"%s\",\"outstanding\":%d}",w->id,w->event,name,role,atomic_load(&w->outstanding));
+ atomic_store_explicit(&hold_entered,1,memory_order_release);
+ while(!atomic_load_explicit(&hold_release,memory_order_acquire)) sched_yield();
+ logrow("{\"kind\":\"hold_exit\",\"worker\":%d,\"event\":%d,\"point\":\"%s\"}",w->id,w->event,name);
+}
+static void wait_done(Worker *w,int event_number) {
+ while(atomic_load_explicit(&w->done,memory_order_acquire)<=event_number) {
+  if(atomic_load_explicit(&teardown_requested,memory_order_acquire)&&!atomic_load(&teardown_deferred)) {
+   Worker *held=&workers[cfg.hold_worker];
+   int armed=atomic_load_explicit(&held->outstanding,memory_order_acquire);
+   int done=atomic_load_explicit(&held->done,memory_order_acquire);
+   REQUIRE(armed==1&&done==0,"held teardown request not pending");
+   logrow("{\"kind\":\"teardown_deferred\",\"worker\":%d,\"outstanding\":%d,\"completed\":%d}",held->id,armed,done);
+   atomic_store_explicit(&teardown_deferred,1,memory_order_release);
+  }
+  sched_yield();
+ }
+}
+static void *hold_controller(void *unused) {
+ (void)unused;Worker *held=&workers[cfg.hold_worker];
+ while(!atomic_load_explicit(&hold_entered,memory_order_acquire)) sched_yield();
+ if(teardown_hold()) {
+  while(!atomic_load_explicit(&join_attempt[held->id],memory_order_acquire)) sched_yield();
+  REQUIRE(!atomic_load_explicit(&held->exited,memory_order_acquire),"held worker already exited");
+  logrow("{\"kind\":\"hold_competitor\",\"worker\":%d,\"operation\":\"join\",\"target\":%d}",held->id,held->id);
+ } else {
+  logrow("{\"kind\":\"teardown_request\",\"worker\":%d}",held->id);
+  atomic_store_explicit(&teardown_requested,1,memory_order_release);
+  while(!atomic_load_explicit(&teardown_deferred,memory_order_acquire)) sched_yield();
+  if(cfg.n>1) {
+   int competitor=(held->id+1)%cfg.n;
+   for(int i=0;i<cfg.n;i++) if(i!=held->id) atomic_store_explicit(&workers[i].permit,1,memory_order_release);
+   while(!atomic_load_explicit(&workers[competitor].attempted,memory_order_acquire)) sched_yield();
+   bool independent=!strcmp(cfg.topology,"perworker");
+   if(independent) while(atomic_load_explicit(&workers[competitor].done,memory_order_acquire)<1) sched_yield();
+   logrow("{\"kind\":\"hold_competitor\",\"worker\":%d,\"operation\":\"fault\",\"target\":%d,\"completed\":%d,\"independent_server\":%s}",held->id,competitor,atomic_load(&workers[competitor].done),independent?"true":"false");
+  } else logrow("{\"kind\":\"hold_competitor\",\"worker\":%d,\"operation\":\"teardown\",\"target\":%d}",held->id,held->id);
+ }
+ logrow("{\"kind\":\"hold_release\",\"worker\":%d,\"point\":\"%s\"}",held->id,cfg.hold);
+ atomic_store_explicit(&hold_release,1,memory_order_release);return NULL;
+}
+static void words(const natural_t *state,mach_msg_type_number_t count,char *out,size_t size) {
+ size_t used=0; out[used++]='[';
+ for(unsigned i=0;i<count;i++) {
+  int n=snprintf(out+used,size-used,"%s%u",i?",":"",state[i]);
+  REQUIRE(n>0&&(size_t)n<size-used,"state trace size"); used+=(size_t)n;
+ }
+ REQUIRE(used+2<size,"state trace tail"); out[used++]=']';out[used]=0;
+}
+static void snapshot(Worker *w,Snapshot *s,const char *label,bool task) {
+ s->count=EXC_TYPES_COUNT;
+ kern_return_t kr=task?task_get_exception_ports(mach_task_self(),EXC_MASK_BAD_ACCESS,s->masks,&s->count,s->ports,s->behaviors,s->flavors):
+ thread_get_exception_ports(w->control,EXC_MASK_BAD_ACCESS,s->masks,&s->count,s->ports,s->behaviors,s->flavors);
+ krcheck(kr,"snapshot");
+ logrow("{\"kind\":\"snapshot\",\"worker\":%d,\"label\":\"%s\",\"count\":%u}",task?-1:w->id,label,s->count);
+ for(unsigned i=0;i<s->count;i++) logrow("{\"kind\":\"snapshot_tuple\",\"worker\":%d,\"label\":\"%s\",\"index\":%u,\"mask\":%u,\"port\":%u,\"behavior\":%d,\"flavor\":%d}",task?-1:w->id,label,i,s->masks[i],s->ports[i],s->behaviors[i],s->flavors[i]);
+}
+static bool same_snapshot(const Snapshot *a,const Snapshot *b) {
+ /* Selected mask is one bit. Normalize absent/null rows and row ordering. */
+ for(unsigned bit=0;bit<32;bit++) if(EXC_MASK_BAD_ACCESS&(1u<<bit)) {
+  mach_port_t ap=0,bp=0; int ab=0,bb=0,af=0,bf=0;
+  for(unsigned i=0;i<a->count;i++) if(a->masks[i]&(1u<<bit)) {ap=a->ports[i];ab=a->behaviors[i];af=a->flavors[i];}
+  for(unsigned i=0;i<b->count;i++) if(b->masks[i]&(1u<<bit)) {bp=b->ports[i];bb=b->behaviors[i];bf=b->flavors[i];}
+  if(ap!=bp||(ap&&(ab!=bb||af!=bf))) return false;
+ }
+ return true;
+}
+static void dispose(int id,const char *right,kern_return_t kr) {
+ logrow("{\"kind\":\"disposal\",\"worker\":%d,\"right\":\"%s\",\"kr\":%d}",id,right,kr); krcheck(kr,"disposal");
+}
+static void release_snapshot(int id,Snapshot *s,const char *label) {
+ for(unsigned i=0;i<s->count;i++) if(MACH_PORT_VALID(s->ports[i])) {
+  char name[80];snprintf(name,sizeof name,"%s-%u",label,i);
+  dispose(id,name,mach_port_deallocate(mach_task_self(),s->ports[i]));
+ }
+}
+static void restore(Worker *w,const Snapshot *saved,const char *label) {
+ REQUIRE(!atomic_load(&w->outstanding),"restore while armed");
+ krcheck(thread_set_exception_ports(w->control,EXC_MASK_BAD_ACCESS,MACH_PORT_NULL,EXCEPTION_DEFAULT,THREAD_STATE_NONE),"clear selected mask");
+ for(unsigned i=0;i<saved->count;i++) if(MACH_PORT_VALID(saved->ports[i]))
+  krcheck(thread_set_exception_ports(w->control,saved->masks[i]&EXC_MASK_BAD_ACCESS,saved->ports[i],saved->behaviors[i],saved->flavors[i]),"restore tuple");
+ Snapshot observed; snapshot(w,&observed,label,false);
+ bool equal=same_snapshot(saved,&observed);
+ logrow("{\"kind\":\"teardown_restore\",\"worker\":%d,\"label\":\"%s\",\"semantic_equal\":%s,\"alive\":true,\"disarmed\":true}",w->id,label,equal?"true":"false");
+ REQUIRE(equal,"restoration mismatch"); release_snapshot(w->id,&observed,label);
+}
+static mach_port_t owned_port(void) {
+ mach_port_t port; krcheck(mach_port_allocate(mach_task_self(),MACH_PORT_RIGHT_RECEIVE,&port),"receive allocation");
+ krcheck(mach_port_insert_right(mach_task_self(),port,port,MACH_MSG_TYPE_MAKE_SEND),"insert send"); return port;
+}
+static void register_worker(Worker *w) {
+ if(!strcmp(cfg.arm,"prior-handler-unsupported")) {
+  w->control=mach_thread_self();Snapshot before;snapshot(w,&before,"before-decoy",false);
+  for(unsigned i=0;i<before.count;i++) if(MACH_PORT_VALID(before.ports[i])) fail("preexisting handler before decoy",0);
+  mach_port_t decoy=owned_port();
+  krcheck(thread_set_exception_ports(w->control,EXC_MASK_BAD_ACCESS,decoy,EXCEPTION_DEFAULT,THREAD_STATE_NONE),"install owned decoy");
+  logrow("{\"kind\":\"decoy_installed\",\"worker\":%d,\"port\":%u,\"mask\":%u,\"behavior\":%d,\"flavor\":%d}",w->id,decoy,EXC_MASK_BAD_ACCESS,EXCEPTION_DEFAULT,THREAD_STATE_NONE);
+  /* The ordinary admission check below must refuse this actual owned route.
+   * The child exits without faulting or invoking the deliberately unserved port. */
+  dispose(w->id,"decoy-control-inspection",mach_port_deallocate(mach_task_self(),w->control));
+ }
+ w->control=mach_thread_self();snapshot(w,&w->initial,"initial",false);
+ for(unsigned i=0;i<w->initial.count;i++) if(MACH_PORT_VALID(w->initial.ports[i])) {
+  logrow("{\"kind\":\"prior_handler_unsupported\",\"worker\":%d}",w->id);
+  fsync(STDOUT_FILENO); _exit(78); /* fatal child: kernel reclaims owned resources */
+ }
+ if(forward()) {
+  w->prior=owned_port();
+  krcheck(thread_set_exception_ports(w->control,EXC_MASK_BAD_ACCESS,w->prior,BEHAVIOR,ARM_THREAD_STATE64),"install prior");
+  snapshot(w,&w->saved,"saved-prior",false);
+  REQUIRE(w->saved.count==1&&w->saved.ports[0]==w->prior&&w->saved.behaviors[0]==(exception_behavior_t)BEHAVIOR&&w->saved.flavors[0]==ARM_THREAD_STATE64,"captured prior contract");
+ }
+ w->front=owned_port();
+ krcheck(thread_set_exception_ports(w->control,EXC_MASK_BAD_ACCESS,w->front,BEHAVIOR,ARM_THREAD_STATE64),"install front");
+ logrow("{\"kind\":\"register\",\"worker\":%d,\"recv_port\":%u,\"prior_recv_port\":%u,\"published\":true}",w->id,w->front,w->prior);
+ atomic_store_explicit(&w->registered,1,memory_order_release);
+}
+static Worker *lookup(mach_port_t port) {
+ for(int i=0;i<cfg.n;i++) if(atomic_load_explicit(&workers[i].registered,memory_order_acquire)&&
+ (workers[i].front==port||workers[i].prior==port)) return &workers[i];
+ return NULL;
 }
 
-/* ---- exact instructions under test --------------------------------------
- * Non-JIT baseline: plain functions compiled into this binary's own __TEXT
- * segment (never MAP_JIT, never written after link). One load, one store.
- */
-__attribute__((noinline)) static uint64_t asm_load(volatile uint64_t *p) {
-	uint64_t v;
-	__asm__ volatile("ldr %0, [%1]" : "=r"(v) : "r"(p) : "memory");
-	return v;
+kern_return_t catch_mach_exception_raise(mach_port_t p,mach_port_t t,mach_port_t k,exception_type_t e,mach_exception_data_t c,mach_msg_type_number_t n) {
+ (void)p;(void)t;(void)k;(void)e;(void)c;(void)n;fail("unexpected routine",2405);
 }
-__attribute__((noinline)) static void asm_store(volatile uint64_t *p, uint64_t v) {
-	__asm__ volatile("str %0, [%1]" : : "r"(v), "r"(p) : "memory");
+kern_return_t catch_mach_exception_raise_state_identity(mach_port_t p,mach_port_t t,mach_port_t k,exception_type_t e,mach_exception_data_t c,mach_msg_type_number_t n,int *f,thread_state_t o,mach_msg_type_number_t oc,thread_state_t r,mach_msg_type_number_t *rc) {
+ (void)p;(void)t;(void)k;(void)e;(void)c;(void)n;(void)f;(void)o;(void)oc;(void)r;(void)rc;fail("unexpected routine",2407);
 }
-
-/* Immutable-JIT baseline: same two instructions, but generated at runtime
- * into a MAP_JIT region using the exact accepted Q-01-04 procedure (allocate
- * MAP_JIT, disable write-protect on this thread, write, invalidate icache,
- * re-enable write-protect) -- see experiments/INV-01-04/src/probe.c and
- * experiments/INV-01-06/src/probe.c's build_stubs(). The region is then
- * NEVER toggled back to writable for the rest of this process's life:
- * that immutability, not the MAP_JIT allocation itself, is what "immutable
- * generated code" means in INV-01-06.md:594-598. A write-window toggle
- * mid-campaign is INV-01-19's distinct composition question, out of scope.
- */
-#define I_LDR_X0_X0   0xF9400000u /* ldr x0, [x0]     */
-#define I_RET         0xD65F03C0u
-#define I_STR_X1_X0   0xF9000001u /* str x1, [x0]     */
-typedef uint64_t (*gen_load_fn)(uint64_t *);
-typedef void (*gen_store_fn)(uint64_t *, uint64_t);
-
-static int build_immutable_jit(void) {
-	g_gen_bytes = (size_t)getpagesize();
-	void *m = mmap(NULL, g_gen_bytes, PROT_READ | PROT_WRITE | PROT_EXEC,
-	               MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
-	if (m == MAP_FAILED) return 0;
-	pthread_jit_write_protect_np(0);
-	uint32_t *code = m;
-	g_gen_load = code;       code[0] = I_LDR_X0_X0; code[1] = I_RET;
-	g_gen_store = code + 4;  code[4] = I_STR_X1_X0;  code[5] = I_RET;
-	pthread_jit_write_protect_np(1); /* locked for the remainder of this process */
-	sys_icache_invalidate(m, 8 * sizeof(uint32_t));
-	return 1;
-}
-
-/* ---- registration --------------------------------------------------------
- * Snapshot -> (maybe decline for PRIOR-HANDLER-UNSUPPORTED) -> install ->
- * release-publish. Runs on the worker's own thread before it is admitted to
- * arming.
- */
-static void register_worker(worker_t *w) {
-	w->thread_self = mach_thread_self();
-	w->old_count = EXC_TYPES_COUNT;
-	kern_return_t kr = thread_get_exception_ports(
-		w->thread_self, EXC_MASK_BAD_ACCESS, w->old_masks, &w->old_count,
-		w->old_ports, w->old_behaviors, w->old_flavors);
-	if (kr != KERN_SUCCESS) {
-		jlog("{\"kind\":\"terminal\",\"worker\":%d,\"reason\":\"thread_get_exception_ports:%d\"}", w->id, kr);
-		goto done;
-	}
-	/* An unknown pre-existing handler on this exact mask blocks a positive
-	 * baseline (INV-01-06.md:669-673). The prior-handler-unsupported arm
-	 * simulates that by installing a decoy handler on this same thread
-	 * before register_worker() runs; a real deployment would find a foreign
-	 * crash-reporter/debugger handler here instead. */
-	for (mach_msg_type_number_t i = 0; i < w->old_count; i++) {
-		if (w->old_ports[i] != MACH_PORT_NULL) {
-			atomic_store_explicit(&w->prior_handler_unsupported, 1, memory_order_relaxed);
-			jlog("{\"kind\":\"prior_handler_unsupported\",\"worker\":%d}", w->id);
-			goto done;
-		}
-	}
-
-	{
-	kern_return_t kr_alloc = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &w->recv_port);
-	kern_return_t kr_right = kr_alloc == KERN_SUCCESS
-		? mach_port_insert_right(mach_task_self(), w->recv_port, w->recv_port, MACH_MSG_TYPE_MAKE_SEND)
-		: KERN_FAILURE;
-	if (kr_alloc != KERN_SUCCESS || kr_right != KERN_SUCCESS) {
-		jlog("{\"kind\":\"terminal\",\"worker\":%d,\"reason\":\"port_setup:%d/%d\"}", w->id, kr_alloc, kr_right);
-		goto done;
-	}
-	}
-	w->send_right = w->recv_port; /* same name; send right inserted onto it */
-
-	if (g_cfg.path == PATH_FORWARD) {
-		kern_return_t kr2 = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &w->prior_recv_port);
-		kern_return_t kr3 = kr2 == KERN_SUCCESS
-			? mach_port_insert_right(mach_task_self(), w->prior_recv_port, w->prior_recv_port, MACH_MSG_TYPE_MAKE_SEND)
-			: KERN_FAILURE;
-		if (kr2 != KERN_SUCCESS || kr3 != KERN_SUCCESS) {
-			jlog("{\"kind\":\"terminal\",\"worker\":%d,\"reason\":\"prior_port_setup:%d/%d\"}", w->id, kr2, kr3);
-			goto done;
-		}
-		w->prior_send_right = w->prior_recv_port;
-	}
-
-	kr = thread_set_exception_ports(w->thread_self, EXC_MASK_BAD_ACCESS, w->send_right,
-	                                 (exception_behavior_t)M1_BEHAVIOR, M1_FLAVOR);
-	if (kr != KERN_SUCCESS) {
-		jlog("{\"kind\":\"terminal\",\"worker\":%d,\"reason\":\"thread_set_exception_ports:%d\"}", w->id, kr);
-		goto done;
-	}
-
-	w->cookie = ((uint64_t)0x9a5f000000000000ULL) | (uint64_t)(uint32_t)(w->id * 0x1000193u + (int)g_cfg.seed);
-	atomic_store_explicit(&w->nonce, 0, memory_order_relaxed);
-	atomic_store_explicit(&w->outstanding, 0, memory_order_relaxed);
-	atomic_store_explicit(&w->commits, 0, memory_order_relaxed);
-
-	jlog("{\"kind\":\"register\",\"worker\":%d,\"recv_port\":%u,\"prior_recv_port\":%u,"
-	     "\"old_count\":%u,\"published\":true}",
-	     w->id, w->recv_port, w->prior_recv_port, w->old_count);
-
-	/* Release-publish: everything above is visible to any thread that
-	 * observes published==1 with acquire semantics. */
-	atomic_store_explicit(&w->published, 1, memory_order_release);
-done:
-	/* Set on every exit path (success, prior-handler-unsupported, or any
-	 * terminal failure) so a waiter never spins forever on a worker that
-	 * will never publish (see main()'s registration wait below). */
-	atomic_store_explicit(&w->registration_done, 1, memory_order_release);
+kern_return_t catch_mach_exception_raise_state(mach_port_t port,exception_type_t exception,const mach_exception_data_t code,mach_msg_type_number_t codes,int *flavor,const thread_state_t old_state,mach_msg_type_number_t count,thread_state_t new_state,mach_msg_type_number_t *new_count) {
+ Worker *w=lookup(port);REQUIRE(w&&w==serving,"registered receive identity");
+ bool prior=port==w->prior;const char *role=prior?"prior":"front";
+ REQUIRE(exception==EXC_BAD_ACCESS&&codes==2&&*flavor==ARM_THREAD_STATE64&&count==COUNT,"state shape");
+ REQUIRE(atomic_load_explicit(&w->outstanding,memory_order_acquire)==1,"unarmed fault");
+ _Atomic int *seen=prior?&w->prior_seen:&w->front_seen;
+ if(atomic_exchange(seen,1)) fail("repeated fault before commit",0);
+ arm_thread_state64_t state;memcpy(&state,old_state,sizeof state);
+ uint64_t pc=arm_thread_state64_get_pc(state),sp=arm_thread_state64_get_sp(state);
+ bool valid=pc==w->pc&&sp>=w->sp_lo&&sp<w->sp_hi&&state.__x[9]==w->cookie&&state.__x[10]==w->nonce&&
+ state.__x[19]==w->cookie&&state.__x[20]==w->nonce&&state.__x[21]==SENTINEL&&state.__x[22]==sp&&
+ code[0]==KERN_PROTECTION_FAILURE&&(uint64_t)code[1]==(uintptr_t)w->page;
+ char old_words[1600];words(old_state,count,old_words,sizeof old_words);
+ logrow("{\"kind\":\"receive\",\"worker\":%d,\"event\":%d,\"role\":\"%s\",\"port\":%u,\"routine_id\":2406,\"exception\":%d,\"codeCnt\":%u,\"code\":[%lld,%llu],\"flavor\":%d,\"old_stateCnt\":%u,\"state\":%s}",w->id,w->event,role,port,exception,codes,(long long)code[0],(unsigned long long)code[1],*flavor,count,old_words);
+ logrow("{\"kind\":\"identity\",\"worker\":%d,\"event\":%d,\"role\":\"%s\",\"pc\":%llu,\"sp\":%llu,\"cookie\":%llu,\"nonce\":%llu,\"valid\":%s}",w->id,w->event,role,(unsigned long long)pc,(unsigned long long)sp,(unsigned long long)state.__x[9],(unsigned long long)state.__x[10],valid?"true":"false");
+ REQUIRE(valid,"identity mismatch");
+ if(prior||!forward()) hold_point(w,"server-before-repair",role);
+ if(negative("server-stall")&&!prior) {trigger(w,cfg.negative);for(;;) pause();}
+ if(negative("prior-server-failure")&&prior) {trigger(w,cfg.negative);fail("prior server failure",0);}
+ if(!strcmp(cfg.arm,"terminal")) {trigger(w,"terminal");return KERN_FAILURE;}
+ if(!prior&&forward()) {
+  hold_point(w,"front-before-forward",role);
+  REQUIRE(w->saved.ports[0]==w->prior&&w->prior!=w->front,"one-hop owned chain");
+  int f=*flavor; natural_t returned[COUNT];mach_msg_type_number_t returned_count=COUNT;
+  mach_exception_data_type_t c[2]={code[0],code[1]};
+  kern_return_t kr=mach_exception_raise_state(w->saved.ports[0],exception,c,2,&f,old_state,count,returned,&returned_count);
+  REQUIRE(kr==KERN_SUCCESS&&f==*flavor&&returned_count==count&&!memcmp(returned,old_state,sizeof returned),"forward reply failure");
+  char result[1600];words(returned,returned_count,result,sizeof result);
+  logrow("{\"kind\":\"forward_call\",\"worker\":%d,\"event\":%d,\"prior_kr\":%d,\"prior_flavor\":%d,\"prior_stateCnt\":%u,\"state\":%s}",w->id,w->event,kr,f,returned_count,result);
+ } else {
+  bool skip=negative("skipped-repair-nominal-success");
+  if(skip) trigger(w,cfg.negative);
+  errno=0;int result=skip?0:mprotect(w->page,w->page_size,PROT_READ|PROT_WRITE);int error=errno;
+  logrow("{\"kind\":\"repair\",\"worker\":%d,\"event\":%d,\"role\":\"%s\",\"address\":%llu,\"length\":%zu,\"mprotect_result\":%d,\"errno\":%d,\"skipped\":%s}",w->id,w->event,role,(unsigned long long)(uintptr_t)w->page,w->page_size,result,error,skip?"true":"false");
+  REQUIRE(result==0,"repair failed");
+  if(negative("corrupted-repair-result")) {trigger(w,cfg.negative);*w->page^=1;}
+ }
+ if(prior) hold_point(w,"prior-before-reply",role);
+ else hold_point(w,"server-before-reply",role);
+ REQUIRE(*new_count>=count,"reply capacity");*new_count=count;
+ memcpy(new_state,old_state,count*sizeof(natural_t));
+ char reply[1600];words(new_state,*new_count,reply,sizeof reply);
+ logrow("{\"kind\":\"reply\",\"worker\":%d,\"event\":%d,\"role\":\"%s\",\"kr\":0,\"flavor\":%d,\"new_stateCnt\":%u,\"state\":%s}",w->id,w->event,role,*flavor,*new_count,reply);
+ return KERN_SUCCESS;
 }
 
-/* ---- teardown / restore --------------------------------------------------
- * Stop admissions, confirm disarmed, restore the exact saved tuple
- * (including originally-null entries), re-inspect, and compare semantic
- * equality without depending on row order.
- */
-static int masks_equal(worker_t *w, exception_mask_t *m2, mach_msg_type_number_t c2,
-                        mach_port_t *p2, exception_behavior_t *b2, thread_state_flavor_t *f2) {
-	if (c2 != w->old_count) return 0;
-	int matched[EXC_TYPES_COUNT] = {0};
-	for (mach_msg_type_number_t i = 0; i < w->old_count; i++) {
-		int found = 0;
-		for (mach_msg_type_number_t j = 0; j < c2; j++) {
-			if (matched[j]) continue;
-			if (m2[j] == w->old_masks[i] && p2[j] == w->old_ports[i] &&
-			    b2[j] == w->old_behaviors[i] && f2[j] == w->old_flavors[i]) {
-				matched[j] = 1; found = 1; break;
-			}
-		}
-		if (!found) return 0;
-	}
-	return 1;
+static _Noreturn void receive_failure(mach_port_t port,mach_msg_return_t mr) {
+ Worker *w=lookup(port);
+ bool owned=negative("receive-right-destruction")&&w==&workers[0]&&port==w->front&&
+            (mr==MACH_RCV_PORT_DIED||mr==MACH_RCV_INVALID_NAME||mr==MACH_RCV_PORT_CHANGED);
+ /* Published XNU maps THREAD_RESTART on an invalidated receive waitq to
+  * PORT_CHANGED despite the SDK's obsolete-error comment. Preserve attribution
+  * before termination; this never attributes a later process signal's cause. */
+ if(owned) while(!atomic_load_explicit(&w->receive_destroyed,memory_order_acquire)) sched_yield();
+ int destroyed=w?atomic_load_explicit(&w->receive_destroyed,memory_order_acquire):0;
+ logrow("{\"kind\":\"receive_failure\",\"schema\":\"M06-M1-receive-failure-v1\",\"worker\":%d,\"port\":%u,\"role\":\"%s\",\"code\":%d,\"destruction_observed\":%s}",
+        w?w->id:-1,port,w?(port==w->front?"front":"prior"):"unknown",mr,destroyed?"true":"false");
+ fail(owned?"owned receive right invalidated":"receive failure",mr);
 }
 
-static void teardown_worker(worker_t *w, const char *restoration_mismatch_negative) {
-	if (atomic_load_explicit(&w->prior_handler_unsupported, memory_order_relaxed)) return;
-	hold_point(HOLD_TEARDOWN_BEFORE_RESTORE);
-
-	kern_return_t kr = thread_set_exception_ports(w->thread_self, EXC_MASK_BAD_ACCESS,
-		w->old_count ? w->old_ports[0] : MACH_PORT_NULL,
-		w->old_count ? w->old_behaviors[0] : EXCEPTION_DEFAULT,
-		w->old_count ? w->old_flavors[0] : THREAD_STATE_NONE);
-
-	exception_mask_t m2[EXC_TYPES_COUNT]; mach_port_t p2[EXC_TYPES_COUNT];
-	exception_behavior_t b2[EXC_TYPES_COUNT]; thread_state_flavor_t f2[EXC_TYPES_COUNT];
-	mach_msg_type_number_t c2 = EXC_TYPES_COUNT;
-	kern_return_t kr2 = thread_get_exception_ports(w->thread_self, EXC_MASK_BAD_ACCESS, m2, &c2, p2, b2, f2);
-
-	int equal = (kr == KERN_SUCCESS && kr2 == KERN_SUCCESS) && masks_equal(w, m2, c2, p2, b2, f2);
-	/* Checker-fixture-facing negative: force an unequal restored snapshot to
-	 * exercise the "restoration mismatch" record shape (see check.py). This
-	 * never happens on a real teardown path unless injected. */
-	if (restoration_mismatch_negative && strcmp(g_cfg.negative ? g_cfg.negative : "", restoration_mismatch_negative) == 0)
-		equal = 0;
-
-	jlog("{\"kind\":\"teardown_restore\",\"worker\":%d,\"restored_count\":%u,\"semantic_equal\":%s}",
-	     w->id, c2, equal ? "true" : "false");
-	if (!equal) {
-		jlog("{\"kind\":\"terminal\",\"worker\":%d,\"reason\":\"restoration mismatch: child invalidated\"}", w->id);
-	}
-
-	/* Disposal: every acquired right, exactly once, after restoration is
-	 * confirmed (or the child is already invalidated above). See README.md
-	 * "Disposal and reference accounting". */
-	kern_return_t d1 = mach_port_mod_refs(mach_task_self(), w->recv_port, MACH_PORT_RIGHT_SEND, -1);
-	kern_return_t d2 = mach_port_deallocate(mach_task_self(), w->thread_self);
-	kern_return_t d3 = mach_port_mod_refs(mach_task_self(), w->recv_port, MACH_PORT_RIGHT_RECEIVE, -1);
-	jlog("{\"kind\":\"disposal\",\"worker\":%d,\"right\":\"send\",\"action\":\"mod_refs(-1)\",\"kr\":%d}", w->id, d1);
-	jlog("{\"kind\":\"disposal\",\"worker\":%d,\"right\":\"thread_self\",\"action\":\"deallocate\",\"kr\":%d}", w->id, d2);
-	jlog("{\"kind\":\"disposal\",\"worker\":%d,\"right\":\"receive\",\"action\":\"mod_refs(-1)\",\"kr\":%d}", w->id, d3);
-	if (g_cfg.path == PATH_FORWARD) {
-		kern_return_t d4 = mach_port_mod_refs(mach_task_self(), w->prior_recv_port, MACH_PORT_RIGHT_SEND, -1);
-		kern_return_t d5 = mach_port_mod_refs(mach_task_self(), w->prior_recv_port, MACH_PORT_RIGHT_RECEIVE, -1);
-		jlog("{\"kind\":\"disposal\",\"worker\":%d,\"right\":\"prior_send\",\"action\":\"mod_refs(-1)\",\"kr\":%d}", w->id, d4);
-		jlog("{\"kind\":\"disposal\",\"worker\":%d,\"right\":\"prior_receive\",\"action\":\"mod_refs(-1)\",\"kr\":%d}", w->id, d5);
-	}
-	if (w->page) {
-		int dm = munmap(w->page, w->page_size);
-		jlog("{\"kind\":\"disposal\",\"worker\":%d,\"right\":\"data_page\",\"action\":\"munmap\",\"kr\":%d}", w->id, dm);
-	}
+/* Keep MIG's generated parser. This wrapper validates only the admitted fixed
+ * routine envelope and owns the received reply right until successful send.
+ * Successful MOVE_SEND_ONCE consumes it. Failed send/rejected request exits
+ * the whole owned child; no ambiguous right is reused or deallocated twice. */
+static void serve(mach_port_t port,int events) {
+ union { union __RequestUnion__catch_mach_exc_subsystem request;
+         unsigned char bytes[sizeof(union __RequestUnion__catch_mach_exc_subsystem)+MAX_TRAILER_SIZE]; } in;
+ union __ReplyUnion__catch_mach_exc_subsystem out;
+ for(int i=0;i<events;i++) {
+  memset(&in,0,sizeof in);memset(&out,0,sizeof out);
+  mach_msg_header_t *head=(void *)&in,*reply=(void *)&out;
+  /* The parent's 30s total/5s no-progress watchdog owns containment, including
+   * an idle peer receiver while only the deliberately stalled worker is admitted. */
+  mach_msg_return_t mr=mach_msg(head,MACH_RCV_MSG|MACH_RCV_TIMEOUT|MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0)|MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_NULL),0,sizeof in,port,RECEIVE_TIMEOUT_MS,MACH_PORT_NULL);
+  if(mr!=MACH_MSG_SUCCESS) receive_failure(port,mr);
+  Worker *w=lookup(head->msgh_local_port);REQUIRE(w,"unregistered wire port");
+  int outstanding=atomic_load_explicit(&w->outstanding,memory_order_acquire);
+  serving=w;serving_role=head->msgh_local_port==w->prior?"prior":"front";
+  REQUIRE(head->msgh_size>=sizeof *head&&head->msgh_size<=sizeof in,"receive buffer bounds");
+  char raw[sizeof in.bytes*2+1];
+  for(unsigned b=0;b<head->msgh_size;b++) snprintf(raw+2*b,3,"%02x",in.bytes[b]);
+  if(outstanding==1&&!strcmp(cfg.hold,"server-after-receive")&&w->id==cfg.hold_worker&&w->event==0&&!strcmp(serving_role,"front")) {
+   logrow("{\"kind\":\"received_message\",\"worker\":%d,\"event\":%d,\"role\":\"front\",\"size\":%u,\"raw\":\"%s\"}",w->id,w->event,head->msgh_size,raw);
+   hold_point(w,"server-after-receive",serving_role);
+  }
+  REQUIRE(outstanding==1,"wire before admission");
+  typedef __Request__mach_exception_raise_state_t Request;
+  size_t size=offsetof(Request,old_state)+COUNT*sizeof(natural_t);
+  REQUIRE(!(head->msgh_bits&MACH_MSGH_BITS_COMPLEX)&&head->msgh_id==2406&&head->msgh_size==size&&
+   MACH_MSGH_BITS_REMOTE(head->msgh_bits)==MACH_MSG_TYPE_MOVE_SEND_ONCE&&MACH_PORT_VALID(head->msgh_remote_port),"wire envelope");
+  Request *request=(void *)head;
+  REQUIRE(!memcmp(&request->NDR,&NDR_record,sizeof NDR_record)&&request->codeCnt==2&&request->old_stateCnt==COUNT,"wire NDR/count");
+  mach_msg_trailer_t trailer;memcpy(&trailer,in.bytes+round_msg(head->msgh_size),sizeof trailer);
+  REQUIRE(trailer.msgh_trailer_type==MACH_MSG_TRAILER_FORMAT_0&&trailer.msgh_trailer_size==sizeof trailer,"wire trailer");
+  logrow("{\"kind\":\"wire\",\"worker\":%d,\"event\":%d,\"role\":\"%s\",\"size\":%u,\"bits\":%u,\"ndr_exact\":true,\"trailer_size\":%u,\"reply_right\":%u,\"raw\":\"%s\"}",w->id,w->event,serving_role,head->msgh_size,head->msgh_bits,trailer.msgh_trailer_size,head->msgh_remote_port,raw);
+  REQUIRE(mach_exc_server(head,reply),"generated demux rejection");
+  if(negative("reply-send-failure")) {
+   trigger(w,cfg.negative);
+   mach_port_t dropped=reply->msgh_remote_port;
+   kern_return_t dropped_kr=mach_port_deallocate(mach_task_self(),dropped);
+   logrow("{\"kind\":\"negative_action\",\"worker\":%d,\"event\":%d,\"action\":\"drop-reply-right\",\"port\":%u,\"kr\":%d}",w->id,w->event,dropped,dropped_kr);
+   krcheck(dropped_kr,"drop owned reply right");
+   reply->msgh_remote_port=MACH_PORT_NULL;
+  }
+  mr=mach_msg(reply,MACH_SEND_MSG|MACH_SEND_TIMEOUT,reply->msgh_size,0,MACH_PORT_NULL,1000,MACH_PORT_NULL);
+  logrow("{\"kind\":\"send\",\"worker\":%d,\"event\":%d,\"role\":\"%s\",\"kr\":%d,\"disposition\":\"move-send-once\"}",w->id,w->event,serving_role,mr);
+  if(mr!=MACH_MSG_SUCCESS) fail("reply send failure",mr);
+  atomic_store_explicit(!strcmp(serving_role,"prior")?&w->prior_sent:&w->front_sent,1,memory_order_release);
+ }
 }
-
-/* ---- catch_ implementations (MIG server-side entry points) --------------
- * catch_mach_exception_raise_state is the only routine this method uses; the
- * other two are always generated by mach_exc.defs and must be defined for
- * the link to succeed. They reject immediately -- a real reply carrying
- * KERN_FAILURE, never MIG_NO_REPLY -- so an unexpected routine id (2405 or
- * 2407 instead of the expected 2406) fails loudly rather than being
- * silently absorbed. This is the wrong-routine-id negative's runtime side;
- * check.py's fixture exercises the trace-record shape independently.
- */
-kern_return_t catch_mach_exception_raise(
-	mach_port_t exception_port, mach_port_t thread, mach_port_t task,
-	exception_type_t exception, mach_exception_data_t code, mach_msg_type_number_t codeCnt) {
-	(void)thread; (void)task; (void)exception; (void)code; (void)codeCnt;
-	jlog("{\"kind\":\"reply\",\"role\":\"reject\",\"port\":%u,\"routine_id\":2405,\"kr\":%d}",
-	     exception_port, KERN_FAILURE);
-	return KERN_FAILURE;
+typedef struct { mach_port_t port;int count; } Server;
+static void *server_thread(void *arg) {Server *s=arg;serve(s->port,s->count);return NULL;}
+static void event(Worker *w,int number,bool proof) {
+ w->event=number;w->nonce=(uint64_t)number+1;
+ w->pc=cfg.jit?(uintptr_t)(jit_code+(!strcmp(cfg.access,"store")?4:0)):
+  (uintptr_t)(!strcmp(cfg.access,"store")?m1_store_fault:m1_load_fault);
+ atomic_store(&w->front_seen,0);atomic_store(&w->prior_seen,0);atomic_store(&w->front_sent,0);atomic_store(&w->prior_sent,0);
+ *w->page=UINT64_C(0x1111111111111111);
+ uint64_t expected=!strcmp(cfg.access,"load")?*w->page:UINT64_C(0x2222222222222222)^w->nonce;
+ REQUIRE(mprotect(w->page,w->page_size,PROT_NONE)==0,"arm protection");
+ if(negative("wrong-event-descriptor")) {trigger(w,cfg.negative);w->pc+=4;}
+ logrow("{\"kind\":\"arm\",\"worker\":%d,\"event\":%d,\"warmup\":%s,\"proof\":%s,\"address\":%llu,\"page_size\":%zu,\"access\":\"%s\",\"cookie\":%llu,\"nonce\":%llu,\"expected_pc\":%llu,\"sp_lo\":%llu,\"sp_hi\":%llu,\"expected_data\":%llu}",w->id,number,number<cfg.warmup?"true":"false",proof?"true":"false",(unsigned long long)(uintptr_t)w->page,w->page_size,cfg.access,(unsigned long long)w->cookie,(unsigned long long)w->nonce,(unsigned long long)w->pc,(unsigned long long)w->sp_lo,(unsigned long long)w->sp_hi,(unsigned long long)expected);
+ atomic_store_explicit(&w->outstanding,1,memory_order_release);
+ hold_point(w,"worker-armed-before-fault","worker");
+ if(*cfg.hold) {
+  logrow("{\"kind\":\"fault_attempt\",\"worker\":%d,\"event\":%d}",w->id,number);
+  atomic_store_explicit(&w->attempted,number+1,memory_order_release);
+ }
+ if(negative("receive-right-destruction")) {
+  trigger(w,cfg.negative);kern_return_t destroyed=mach_port_mod_refs(mach_task_self(),w->front,MACH_PORT_RIGHT_RECEIVE,-1);
+  logrow("{\"kind\":\"negative_action\",\"worker\":%d,\"event\":%d,\"action\":\"destroy-receive\",\"port\":%u,\"kr\":%d}",w->id,w->event,w->front,destroyed);
+  krcheck(destroyed,"destroy receive");
+  atomic_store_explicit(&w->receive_destroyed,1,memory_order_release);
+ }
+ if(negative("unexpected-helper-fault")) {
+  uint64_t *other=mmap(NULL,w->page_size,PROT_NONE,MAP_PRIVATE|MAP_ANON,-1,0);
+  REQUIRE(other!=MAP_FAILED,"helper owned mapping");trigger(w,cfg.negative);
+  logrow("{\"kind\":\"negative_action\",\"worker\":%d,\"event\":%d,\"action\":\"helper-access\",\"address\":%llu,\"length\":%zu,\"protection\":0}",w->id,w->event,(unsigned long long)(uintptr_t)other,w->page_size);
+  volatile uint64_t value=*other;(void)value;
+ }
+ void *fn=cfg.jit?(void *)(jit_code+(!strcmp(cfg.access,"store")?4:0)):
+  (!strcmp(cfg.access,"store")?(void *)m1_store:(void *)m1_load);
+ Result r={0};m1_access(fn,w->page,expected,w->cookie,w->nonce,&r);
+ bool data=(!strcmp(cfg.access,"load")?r.value:*w->page)==expected;
+ bool sentinels=r.cookie==w->cookie&&r.nonce==w->nonce&&r.sentinel==SENTINEL;
+ bool sp=r.sp_before==r.sp_after&&r.sp_before>=w->sp_lo&&r.sp_before<w->sp_hi;
+ logrow("{\"kind\":\"resume\",\"worker\":%d,\"event\":%d,\"data_ok\":%s,\"sentinels_ok\":%s,\"sp_ok\":%s,\"data\":%llu,\"cookie\":%llu,\"nonce\":%llu,\"sentinel\":%llu,\"sp_before\":%llu,\"sp_after\":%llu}",w->id,number,data?"true":"false",sentinels?"true":"false",sp?"true":"false",(unsigned long long)(!strcmp(cfg.access,"load")?r.value:*w->page),(unsigned long long)r.cookie,(unsigned long long)r.nonce,(unsigned long long)r.sentinel,(unsigned long long)r.sp_before,(unsigned long long)r.sp_after);
+ REQUIRE(data&&sentinels&&sp,"resumed state/data mismatch");
+ /* A reply can resume the worker before mach_msg returns on its server.
+  * Wait for explicit successful send completion before reusing event fields. */
+ while(!atomic_load_explicit(proof?&w->prior_sent:&w->front_sent,memory_order_acquire)) sched_yield();
+ if(forward()) while(!atomic_load_explicit(&w->prior_sent,memory_order_acquire)) sched_yield();
+ hold_point(w,"worker-resumed-before-disarm","worker");
+ logrow("{\"kind\":\"commit\",\"worker\":%d,\"event\":%d}",w->id,number);
+ atomic_store_explicit(&w->outstanding,0,memory_order_release);
+ logrow("{\"kind\":\"disarm\",\"worker\":%d,\"event\":%d}",w->id,number);
 }
-
-kern_return_t catch_mach_exception_raise_state_identity(
-	mach_port_t exception_port, mach_port_t thread, mach_port_t task,
-	exception_type_t exception, mach_exception_data_t code, mach_msg_type_number_t codeCnt,
-	int *flavor, thread_state_t old_state, mach_msg_type_number_t old_stateCnt,
-	thread_state_t new_state, mach_msg_type_number_t *new_stateCnt) {
-	(void)thread; (void)task; (void)exception; (void)code; (void)codeCnt;
-	(void)flavor; (void)old_state; (void)old_stateCnt; (void)new_state; (void)new_stateCnt;
-	jlog("{\"kind\":\"reply\",\"role\":\"reject\",\"port\":%u,\"routine_id\":2407,\"kr\":%d}",
-	     exception_port, KERN_FAILURE);
-	return KERN_FAILURE;
+static void *worker_thread(void *arg) {
+ Worker *w=arg;w->control=MACH_PORT_NULL;w->page_size=(size_t)getpagesize();
+ w->page=mmap(NULL,w->page_size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);REQUIRE(w->page!=MAP_FAILED,"worker page");
+ w->sp_hi=(uintptr_t)pthread_get_stackaddr_np(pthread_self());w->sp_lo=w->sp_hi-pthread_get_stacksize_np(pthread_self());
+ w->cookie=UINT64_C(0x9a5f000000000000)|(uint64_t)(cfg.seed+(unsigned)w->id*0x1000193u);
+ register_worker(w);while(!atomic_load_explicit(&ready,memory_order_acquire)) sched_yield();
+ int total=cfg.warmup+cfg.checked;
+ for(int e=0;e<total;e++) {while(atomic_load_explicit(&w->permit,memory_order_acquire)<=e) sched_yield();event(w,e,false);atomic_store_explicit(&w->done,e+1,memory_order_release);}
+ logrow("{\"kind\":\"worker_parked\",\"worker\":%d,\"completed\":%d,\"disarmed\":true}",w->id,total);
+ while(atomic_load_explicit(&w->phase,memory_order_acquire)<1) sched_yield();
+ if(forward()) {
+  restore(w,&w->saved,"restored-prior");event(w,total,true);
+  logrow("{\"kind\":\"restoration_proof\",\"worker\":%d,\"event\":%d}",w->id,total);
+ }
+ atomic_store_explicit(&w->proof_done,1,memory_order_release);
+ while(atomic_load_explicit(&w->phase,memory_order_acquire)<2) sched_yield();
+ hold_point(w,"teardown-before-restore","worker");
+ restore(w,&w->initial,"restored-initial");
+ hold_point(w,"before-right-disposal","worker");
+ release_snapshot(w->id,&w->initial,"initial");if(forward()) release_snapshot(w->id,&w->saved,"saved-prior");
+ dispose(w->id,"send",mach_port_mod_refs(mach_task_self(),w->front,MACH_PORT_RIGHT_SEND,-1));
+ dispose(w->id,"receive",mach_port_mod_refs(mach_task_self(),w->front,MACH_PORT_RIGHT_RECEIVE,-1));
+ if(forward()) {dispose(w->id,"prior_send",mach_port_mod_refs(mach_task_self(),w->prior,MACH_PORT_RIGHT_SEND,-1));dispose(w->id,"prior_receive",mach_port_mod_refs(mach_task_self(),w->prior,MACH_PORT_RIGHT_RECEIVE,-1));}
+ dispose(w->id,"thread_self",mach_port_deallocate(mach_task_self(),w->control));
+ dispose(w->id,"data_page",munmap(w->page,w->page_size));
+ logrow("{\"kind\":\"worker_exit\",\"worker\":%d}",w->id);atomic_store_explicit(&w->exited,1,memory_order_release);return NULL;
 }
-
-/* role: "front" repairs directly (PATH_DIRECT) or forwards one hop
- * (PATH_FORWARD); "prior" always repairs directly. Chosen by which port the
- * message arrived on (worker_for_port distinguishes recv_port vs
- * prior_recv_port). */
-kern_return_t catch_mach_exception_raise_state(
-	mach_port_t exception_port, exception_type_t exception,
-	const mach_exception_data_t code, mach_msg_type_number_t codeCnt,
-	int *flavor, const thread_state_t old_state, mach_msg_type_number_t old_stateCnt,
-	thread_state_t new_state, mach_msg_type_number_t *new_stateCnt) {
-
-	worker_t *w = worker_for_port(exception_port);
-	if (!w) {
-		jlog("{\"kind\":\"terminal\",\"reason\":\"unattributed port %u\"}", exception_port);
-		return KERN_FAILURE;
-	}
-	int is_prior = (g_cfg.path == PATH_FORWARD && exception_port == w->prior_recv_port);
-	const char *role = is_prior ? "prior" : "front";
-
-	jlog("{\"kind\":\"receive\",\"role\":\"%s\",\"worker\":%d,\"routine_id\":%u,\"exception\":%d,"
-	     "\"codeCnt\":%u,\"flavor\":%d,\"old_stateCnt\":%u}",
-	     role, w->id, M1_ROUTINE_ID, exception, codeCnt, *flavor, old_stateCnt);
-	hold_point(HOLD_RECEIVED_BEFORE_VALIDATE);
-
-	/* Wire/application validation before any field is trusted further. */
-	int valid = exception == M1_EXCEPTION && codeCnt == 2 && *flavor == M1_FLAVOR &&
-	            old_stateCnt == M1_STATE_COUNT;
-	/* Attribution: cookie is embedded by convention at old_state word 0 for
-	 * this harness's own bookkeeping (not a kernel-supplied field); a real
-	 * campaign instead compares PC/SP/address/nonce captured out-of-band at
-	 * arm time against this event, which is what the two checks below do. */
-	uint64_t nonce_now = atomic_load_explicit(&w->nonce, memory_order_acquire);
-	int outstanding = atomic_load_explicit(&w->outstanding, memory_order_acquire);
-	if (strcmp(g_cfg.negative ? g_cfg.negative : "", "double-outstanding-fault") == 0 && !is_prior)
-		outstanding = 1; /* force the negative: reject a second overlapping event */
-	if (!outstanding) valid = 0; /* "double outstanding fault" / stray event guard */
-
-	jlog("{\"kind\":\"identity\",\"role\":\"%s\",\"worker\":%d,\"nonce\":%llu,\"outstanding\":%s,\"valid\":%s}",
-	     role, w->id, (unsigned long long)nonce_now, outstanding ? "true" : "false", valid ? "true" : "false");
-	if (!valid) return KERN_FAILURE;
-
-	hold_point(HOLD_VALIDATED_BEFORE_REPAIR);
-
-	if (!is_prior && g_cfg.path == PATH_FORWARD) {
-		/* Front forwards one hop to its owned prior using the generated
-		 * same-flavor client stub -- no legacy 32-bit codes, no other
-		 * flavor, no identity-token conversion. */
-		hold_point(HOLD_FRONT_BEFORE_FORWARD);
-		int fwd_flavor = *flavor;
-		natural_t fwd_new_state[M1_STATE_COUNT];
-		mach_msg_type_number_t fwd_new_count = M1_STATE_COUNT;
-		mach_exception_data_type_t fwd_code[2] = { code[0], code[1] };
-		kern_return_t kr = mach_exception_raise_state(
-			w->prior_send_right, exception, fwd_code, 2, &fwd_flavor,
-			old_state, old_stateCnt, fwd_new_state, &fwd_new_count);
-		int unchanged = kr == KERN_SUCCESS && fwd_flavor == M1_FLAVOR &&
-		                fwd_new_count == old_stateCnt &&
-		                memcmp(fwd_new_state, old_state, old_stateCnt * sizeof(natural_t)) == 0;
-		jlog("{\"kind\":\"forward_call\",\"worker\":%d,\"prior_kr\":%d,\"prior_flavor\":%d,"
-		     "\"prior_stateCnt\":%u,\"prior_state_unchanged\":%s}",
-		     w->id, kr, fwd_flavor, fwd_new_count, unchanged ? "true" : "false");
-		if (!unchanged) {
-			jlog("{\"kind\":\"terminal\",\"worker\":%d,\"reason\":\"forward reply failure\"}", w->id);
-			return KERN_FAILURE;
-		}
-		*flavor = fwd_flavor;
-		*new_stateCnt = fwd_new_count;
-		memcpy(new_state, fwd_new_state, fwd_new_count * sizeof(natural_t));
-		atomic_store_explicit(&w->outstanding, 0, memory_order_release);
-		hold_point(HOLD_REPAIRED_BEFORE_REPLY);
-		jlog("{\"kind\":\"reply\",\"role\":\"front\",\"worker\":%d,\"kr\":0,\"flavor\":%d,"
-		     "\"new_stateCnt\":%u,\"state_unchanged\":true}", w->id, *flavor, *new_stateCnt);
-		return KERN_SUCCESS;
-	}
-
-	/* Direct/terminal repair: mprotect the dedicated page back to
-	 * read+write in ordinary thread context, then hand back an exact,
-	 * unchanged copy of the delivered general state. */
-	int repair_forced_fail = strcmp(g_cfg.negative ? g_cfg.negative : "", "skipped-repair-nominal-success") == 0;
-	int repair_corrupted = strcmp(g_cfg.negative ? g_cfg.negative : "", "corrupted-repair-result") == 0;
-	int mp = repair_forced_fail ? 0 : mprotect(w->page, w->page_size, PROT_READ | PROT_WRITE);
-	jlog("{\"kind\":\"repair\",\"role\":\"%s\",\"worker\":%d,\"mprotect_result\":%d,\"errno\":%d,\"skipped\":%s}",
-	     role, w->id, mp, mp == 0 ? 0 : errno, repair_forced_fail ? "true" : "false");
-	if (mp != 0 && !repair_forced_fail) {
-		jlog("{\"kind\":\"terminal\",\"worker\":%d,\"reason\":\"repair mprotect failed\"}", w->id);
-		return KERN_FAILURE;
-	}
-
-	*new_stateCnt = old_stateCnt;
-	memcpy(new_state, old_state, old_stateCnt * sizeof(natural_t));
-	if (repair_corrupted) new_state[0] ^= 1; /* "reply with changed general state" negative */
-
-	atomic_store_explicit(&w->outstanding, 0, memory_order_release);
-	/* Distinct named holds (INV-01-06.md:736-737): the front's own
-	 * post-repair-before-reply point, and the prior's own before-its-reply
-	 * point in the forwarding arm are two different rendezvous, not one. */
-	hold_point(is_prior ? HOLD_PRIOR_BEFORE_REPLY : HOLD_REPAIRED_BEFORE_REPLY);
-	int unchanged = memcmp(new_state, old_state, old_stateCnt * sizeof(natural_t)) == 0;
-	jlog("{\"kind\":\"reply\",\"role\":\"%s\",\"worker\":%d,\"kr\":0,\"flavor\":%d,"
-	     "\"new_stateCnt\":%u,\"state_unchanged\":%s}",
-	     role, w->id, *flavor, *new_stateCnt, unchanged ? "true" : "false");
-	return KERN_SUCCESS;
+static int write_jit(void *unused) {
+ (void)unused;jit_code[0]=0xf9400000;jit_code[1]=0xd65f03c0;jit_code[4]=0xf9000001;jit_code[5]=0xd65f03c0;return 0;
 }
-
-/* ---- server threads ------------------------------------------------------
- * Per-worker: each worker's own server thread receives only from that
- * worker's port (or, for the forwarded path, the prior server thread
- * receives only from that worker's prior port). Serial: one server thread
- * receives from a port set containing every worker's port, retaining
- * distinct receive-port attribution per message.
- */
-static void serve_n(mach_port_t port, int n_events) {
-	for (int i = 0; i < n_events; i++) {
-		mach_msg_return_t mr = mach_msg_server_once(
-			mach_exc_server, sizeof(union __RequestUnion__catch_mach_exc_subsystem) > sizeof(union __ReplyUnion__catch_mach_exc_subsystem)
-				? sizeof(union __RequestUnion__catch_mach_exc_subsystem) : sizeof(union __ReplyUnion__catch_mach_exc_subsystem),
-			port, MACH_MSG_OPTION_NONE);
-		if (mr != MACH_MSG_SUCCESS) {
-			jlog("{\"kind\":\"terminal\",\"reason\":\"mach_msg_server_once:%d\"}", mr);
-			return;
-		}
-	}
-}
-
-typedef struct { worker_t *w; int events; } server_arg_t;
-static void *perworker_server_thread(void *argp) {
-	server_arg_t *a = argp;
-	serve_n(a->w->recv_port, a->events);
-	if (g_cfg.path == PATH_FORWARD)
-		serve_n(a->w->prior_recv_port, a->events); /* prior served on its own thread too, see main() */
-	return NULL;
-}
-static void *prior_server_thread(void *argp) {
-	server_arg_t *a = argp;
-	serve_n(a->w->prior_recv_port, a->events);
-	return NULL;
-}
-typedef struct { int events_per_worker; } serial_arg_t;
-static void *serial_server_thread(void *argp) {
-	serial_arg_t *a = argp;
-	serve_n(g_port_set, a->events_per_worker * g_cfg.n);
-	return NULL;
-}
-
-/* ---- worker thread --------------------------------------------------------
- * Register, publish, then run warmup+checked events: arm the page, fault,
- * verify resumption, disarm, repeat.
- */
-typedef struct { int id; } worker_arg_t;
-static void *worker_thread(void *argp) {
-	worker_arg_t *a = argp;
-	worker_t *w = &g_workers[a->id];
-	w->id = a->id;
-	w->page_size = (size_t)getpagesize();
-	w->page = mmap(NULL, w->page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-	if (w->page == MAP_FAILED) {
-		jlog("{\"kind\":\"terminal\",\"worker\":%d,\"reason\":\"mmap page failed\"}", w->id);
-		return NULL;
-	}
-	memset(w->page, 0x11, w->page_size);
-	w->fault_address = (uint64_t)(uintptr_t)w->page;
-
-	register_worker(w);
-	if (atomic_load_explicit(&w->prior_handler_unsupported, memory_order_relaxed))
-		return NULL;
-	if (!atomic_load_explicit(&w->published, memory_order_acquire))
-		return NULL; /* register_worker already logged the terminal reason */
-
-	int total = g_cfg.warmup + g_cfg.checked;
-	int helper_fault_negative = strcmp(g_cfg.negative ? g_cfg.negative : "", "unexpected-helper-fault") == 0;
-	for (int e = 0; e < total; e++) {
-		uint64_t nonce = e + 1;
-		atomic_store_explicit(&w->nonce, nonce, memory_order_relaxed);
-		mprotect(w->page, w->page_size, PROT_NONE);
-		atomic_store_explicit(&w->outstanding, 1, memory_order_release);
-		w->expected_pc = g_cfg.jit
-			? (uint64_t)(uintptr_t)(g_cfg.access == ACC_LOAD ? (void *)g_gen_load : (void *)g_gen_store)
-			: (uint64_t)(uintptr_t)(g_cfg.access == ACC_LOAD ? (void *)asm_load : (void *)asm_store);
-
-		jlog("{\"kind\":\"arm\",\"worker\":%d,\"event\":%d,\"warmup\":%s,\"address\":%llu,"
-		     "\"access\":\"%s\",\"cookie\":%llu,\"nonce\":%llu,\"expected_pc\":%llu}",
-		     w->id, e, e < g_cfg.warmup ? "true" : "false", (unsigned long long)w->fault_address,
-		     g_cfg.access == ACC_LOAD ? "load" : "store", (unsigned long long)w->cookie,
-		     (unsigned long long)nonce, (unsigned long long)w->expected_pc);
-		hold_point(HOLD_ARMED_BEFORE_FAULT);
-
-		int data_ok, sp_ok = 1;
-		if (helper_fault_negative && e == g_cfg.warmup) {
-			/* Inject an unrelated helper fault on a second, undeclared
-			 * address between arming and the declared access -- must be
-			 * rejected by identity, not silently treated as this event. */
-			volatile uint64_t *bad = (volatile uint64_t *)(uintptr_t)0x1;
-			(void)bad; /* not actually dereferenced here: this binary is
-			              never executed in this authoring session. A real
-			              campaign performs the stray access on a spare
-			              mapping and expects a terminal classification. */
-		}
-		if (g_cfg.access == ACC_LOAD) {
-			uint64_t v = g_cfg.jit ? ((gen_load_fn)g_gen_load)((uint64_t *)w->page)
-			                        : asm_load((volatile uint64_t *)w->page);
-			data_ok = (v == 0x1111111111111111ULL);
-		} else {
-			uint64_t sentinel = 0x2222222222222222ULL ^ nonce;
-			if (g_cfg.jit) ((gen_store_fn)g_gen_store)((uint64_t *)w->page, sentinel);
-			else asm_store((volatile uint64_t *)w->page, sentinel);
-			data_ok = (*(volatile uint64_t *)w->page == sentinel);
-		}
-
-		int commit_before = atomic_fetch_add_explicit(&w->commits, 1, memory_order_relaxed);
-		hold_point(HOLD_RESUMED_BEFORE_DISARM);
-		jlog("{\"kind\":\"resume\",\"worker\":%d,\"event\":%d,\"data_ok\":%s,\"sentinels_ok\":true,"
-		     "\"sp_ok\":%s,\"commit_count\":%d}",
-		     w->id, e, data_ok ? "true" : "false", sp_ok ? "true" : "false", commit_before + 1);
-		jlog("{\"kind\":\"commit\",\"worker\":%d,\"event\":%d}", w->id, e);
-
-		if (!data_ok) {
-			jlog("{\"kind\":\"terminal\",\"worker\":%d,\"reason\":\"resume without correct data\"}", w->id);
-			break;
-		}
-	}
-	atomic_fetch_add_explicit(&g_events_done[w->id], g_cfg.checked, memory_order_relaxed);
-	return NULL;
-}
-
-/* ---- restoration-proof arm ------------------------------------------------
- * After normal teardown+restore, deliver one final event to the restored
- * prior server and confirm it still answers, proving restoration rather than
- * merely asserting it (INV-01-06.md:709-711). Only meaningful for path=forward.
- */
-static void restoration_proof(worker_t *w) {
-	if (g_cfg.path != PATH_FORWARD) return;
-	/* The prior's own receive port is disposed at teardown in the normal
-	 * arm; the restoration arm keeps it alive one extra round-trip before
-	 * disposal to demonstrate the prior still answers post-restore. */
-	jlog("{\"kind\":\"restoration_proof\",\"worker\":%d,\"event_after_restore_ok\":true}", w->id);
-}
-
-/* ---- terminal diagnostic arm -----------------------------------------------
- * A predeclared fault with no installed handler at all: records KERN_FAILURE
- * / downstream signal without resuming through an old handler.
- */
-static void run_terminal_diagnostic(void) {
-	jlog("{\"kind\":\"terminal\",\"worker\":-1,\"reason\":\"unhandled diagnostic: predeclared fault, no resume through old handler\"}");
-}
-
-/* ---- CLI -------------------------------------------------------------- */
-static void usage(void) {
-	fprintf(stderr, "usage: state_server --n N --jit 0|1 --access load|store "
-	                "--topology serial|perworker --path direct|forward "
-	                "--warmup W --checked C --seed S [--negative NAME] [--arm NAME] [--holds]\n");
-}
-
-int main(int argc, char **argv) {
-	g_cfg.n = 1; g_cfg.jit = 0; g_cfg.access = ACC_LOAD; g_cfg.topology = TOPO_SERIAL;
-	g_cfg.path = PATH_DIRECT; g_cfg.warmup = 10; g_cfg.checked = 100; g_cfg.seed = 60601;
-	g_cfg.negative = NULL; g_cfg.arm = NULL;
-	for (int i = 1; i < argc; i++) {
-		#define ARG(name) (strcmp(argv[i], name) == 0 && i + 1 < argc)
-		if (ARG("--n")) g_cfg.n = atoi(argv[++i]);
-		else if (ARG("--jit")) g_cfg.jit = atoi(argv[++i]);
-		else if (ARG("--access")) g_cfg.access = strcmp(argv[++i], "store") == 0 ? ACC_STORE : ACC_LOAD;
-		else if (ARG("--topology")) g_cfg.topology = strcmp(argv[++i], "perworker") == 0 ? TOPO_PERWORKER : TOPO_SERIAL;
-		else if (ARG("--path")) g_cfg.path = strcmp(argv[++i], "forward") == 0 ? PATH_FORWARD : PATH_DIRECT;
-		else if (ARG("--warmup")) g_cfg.warmup = atoi(argv[++i]);
-		else if (ARG("--checked")) g_cfg.checked = atoi(argv[++i]);
-		else if (ARG("--seed")) g_cfg.seed = (unsigned)atoi(argv[++i]);
-		else if (ARG("--negative")) g_cfg.negative = argv[++i];
-		else if (ARG("--arm")) g_cfg.arm = argv[++i];
-		else if (strcmp(argv[i], "--holds") == 0) g_holds_enabled = 1;
-		else { usage(); return 2; }
-		#undef ARG
-	}
-	if (g_cfg.n < 1 || g_cfg.n > 8) { usage(); return 2; }
-
-	jlog("{\"kind\":\"meta\",\"investigation\":\"INV-01-06-M1\",\"n\":%d,\"jit\":%d,\"access\":\"%s\","
-	     "\"topology\":\"%s\",\"path\":\"%s\",\"seed\":%u,\"warmup\":%d,\"checked\":%d,"
-	     "\"negative\":\"%s\",\"arm\":\"%s\",\"routine_id\":%u}",
-	     g_cfg.n, g_cfg.jit, g_cfg.access == ACC_LOAD ? "load" : "store",
-	     g_cfg.topology == TOPO_SERIAL ? "serial" : "perworker",
-	     g_cfg.path == PATH_DIRECT ? "direct" : "forward", g_cfg.seed, g_cfg.warmup, g_cfg.checked,
-	     g_cfg.negative ? g_cfg.negative : "", g_cfg.arm ? g_cfg.arm : "", M1_ROUTINE_ID);
-
-	if (g_cfg.arm && strcmp(g_cfg.arm, "terminal") == 0) {
-		run_terminal_diagnostic();
-		jlog("{\"kind\":\"summary\",\"events_checked\":0,\"events_warmup\":0,\"commits_total\":0,"
-		     "\"zero_unclassified\":true,\"status\":\"terminal\"}");
-		return 0;
-	}
-
-	if (g_cfg.jit) {
-		if (!build_immutable_jit()) {
-			jlog("{\"kind\":\"terminal\",\"worker\":-1,\"reason\":\"MAP_JIT unavailable on this signing cell\"}");
-			jlog("{\"kind\":\"summary\",\"events_checked\":0,\"events_warmup\":0,\"commits_total\":0,"
-			     "\"zero_unclassified\":true,\"status\":\"unavailable\"}");
-			return 78;
-		}
-	}
-
-	pthread_t workers[8];
-	worker_arg_t wargs[8];
-	for (int i = 0; i < g_cfg.n; i++) { wargs[i].id = i; pthread_create(&workers[i], NULL, worker_thread, &wargs[i]); }
-
-	/* Register workers before arming (INV-01-06.md:600): every worker's
-	 * register_worker() call (success, PRIOR-HANDLER-UNSUPPORTED, or any
-	 * terminal failure) must complete before any server reads recv_port for
-	 * its port-set membership or receive loop. Waiting on registration_done
-	 * (set on every register_worker() exit path) rather than published
-	 * alone avoids spinning forever on a worker whose registration failed
-	 * outright. ponytail: busy-wait, not a semaphore -- this harness never
-	 * runs in this authoring session and registration is a one-time,
-	 * microsecond-scale event; switch to a condvar if a real campaign shows
-	 * measurable spin cost. */
-	for (int i = 0; i < g_cfg.n; i++)
-		while (!atomic_load_explicit(&g_workers[i].registration_done, memory_order_acquire))
-			sched_yield();
-
-	pthread_t servers[8], priors[8], serial_thread;
-	server_arg_t sargs[8];
-	int events = g_cfg.warmup + g_cfg.checked;
-	if (g_cfg.topology == TOPO_PERWORKER) {
-		for (int i = 0; i < g_cfg.n; i++) {
-			sargs[i].w = &g_workers[i]; sargs[i].events = events;
-			pthread_create(&servers[i], NULL, perworker_server_thread, &sargs[i]);
-			if (g_cfg.path == PATH_FORWARD)
-				pthread_create(&priors[i], NULL, prior_server_thread, &sargs[i]);
-		}
-	} else {
-		mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_PORT_SET, &g_port_set);
-		for (int i = 0; i < g_cfg.n; i++) {
-			mach_port_move_member(mach_task_self(), g_workers[i].recv_port, g_port_set);
-			if (g_cfg.path == PATH_FORWARD) {
-				sargs[i].w = &g_workers[i]; sargs[i].events = events;
-				pthread_create(&priors[i], NULL, prior_server_thread, &sargs[i]);
-			}
-		}
-		serial_arg_t serial_a = { events };
-		pthread_create(&serial_thread, NULL, serial_server_thread, &serial_a);
-	}
-
-	for (int i = 0; i < g_cfg.n; i++) pthread_join(workers[i], NULL);
-	if (g_cfg.topology == TOPO_PERWORKER) {
-		for (int i = 0; i < g_cfg.n; i++) {
-			pthread_join(servers[i], NULL);
-			if (g_cfg.path == PATH_FORWARD) pthread_join(priors[i], NULL);
-		}
-	} else {
-		pthread_join(serial_thread, NULL);
-		if (g_cfg.path == PATH_FORWARD)
-			for (int i = 0; i < g_cfg.n; i++) pthread_join(priors[i], NULL);
-	}
-
-	int total_checked = 0, total_commits = 0;
-	for (int i = 0; i < g_cfg.n; i++) {
-		if (g_cfg.arm && strcmp(g_cfg.arm, "restoration") == 0) restoration_proof(&g_workers[i]);
-		teardown_worker(&g_workers[i], "restoration-mismatch-forced");
-		total_checked += atomic_load_explicit(&g_events_done[i], memory_order_relaxed);
-		total_commits += atomic_load_explicit(&g_workers[i].commits, memory_order_relaxed);
-	}
-	if (g_cfg.topology == TOPO_SERIAL && g_port_set != MACH_PORT_NULL) {
-		/* The port set is a right too: dispose of it only after every
-		 * worker's own receive right has already been torn down above. */
-		kern_return_t dps = mach_port_mod_refs(mach_task_self(), g_port_set, MACH_PORT_RIGHT_PORT_SET, -1);
-		jlog("{\"kind\":\"disposal\",\"worker\":-1,\"right\":\"port_set\",\"action\":\"mod_refs(-1)\",\"kr\":%d}", dps);
-	}
-
-	jlog("{\"kind\":\"summary\",\"events_checked\":%d,\"events_warmup\":%d,\"commits_total\":%d,"
-	     "\"zero_unclassified\":%s,\"status\":\"completed\"}",
-	     total_checked, g_cfg.warmup * g_cfg.n, total_commits,
-	     total_commits == (g_cfg.warmup + g_cfg.checked) * g_cfg.n ? "true" : "false");
-	return 0;
+PTHREAD_JIT_WRITE_ALLOW_CALLBACKS_NP(write_jit);
+static unsigned number(const char *arg) {char *end;unsigned long value=strtoul(arg,&end,10);REQUIRE(*arg&&!*end&&value<=100000,"numeric argument");return (unsigned)value;}
+int main(int argc,char **argv) {
+ cfg.n=1;cfg.warmup=10;cfg.checked=100;cfg.seed=60601;cfg.access="load";cfg.topology="serial";cfg.path="direct";cfg.negative="";cfg.arm="";cfg.hold="";
+ for(int i=1;i<argc;i+=2) {
+  REQUIRE(i+1<argc,"argument value");const char *k=argv[i],*v=argv[i+1];
+  if(!strcmp(k,"--n")) cfg.n=(int)number(v);else if(!strcmp(k,"--jit")) cfg.jit=(int)number(v);
+  else if(!strcmp(k,"--warmup")) cfg.warmup=(int)number(v);else if(!strcmp(k,"--checked")) cfg.checked=(int)number(v);else if(!strcmp(k,"--seed")) cfg.seed=number(v);
+  else if(!strcmp(k,"--access")) cfg.access=v;else if(!strcmp(k,"--topology")) cfg.topology=v;else if(!strcmp(k,"--path")) cfg.path=v;
+  else if(!strcmp(k,"--negative")) cfg.negative=v;else if(!strcmp(k,"--arm")) cfg.arm=v;
+  else if(!strcmp(k,"--hold")) cfg.hold=v;else if(!strcmp(k,"--hold_worker")) cfg.hold_worker=(int)number(v);else fail("unsupported argument",64);
+ }
+ REQUIRE((cfg.n==1||cfg.n==2||cfg.n==4||cfg.n==8)&&(cfg.jit==0||cfg.jit==1)&&cfg.checked>0,"configuration");
+ REQUIRE(!strcmp(cfg.access,"load")||!strcmp(cfg.access,"store"),"access");
+ REQUIRE(!strcmp(cfg.topology,"serial")||!strcmp(cfg.topology,"perworker"),"topology");
+ REQUIRE(!strcmp(cfg.path,"direct")||!strcmp(cfg.path,"forward"),"path");
+ REQUIRE(cfg.hold_worker>=0&&cfg.hold_worker<cfg.n,"held worker");
+ if(*cfg.hold) {
+  const char *points[]={"worker-armed-before-fault","server-after-receive","server-before-repair","server-before-reply","front-before-forward","prior-before-reply","worker-resumed-before-disarm","teardown-before-restore","before-right-disposal"};
+  bool known=false;for(unsigned i=0;i<sizeof points/sizeof points[0];i++) if(!strcmp(cfg.hold,points[i])) known=true;
+  REQUIRE(known&&!*cfg.negative&&!*cfg.arm,"hold configuration");
+  REQUIRE(forward()||(strcmp(cfg.hold,"front-before-forward")&&strcmp(cfg.hold,"prior-before-reply")),"hold requires prior");
+ }
+ logrow("{\"kind\":\"meta\",\"schema\":\"M06-M1-trace-v3\",\"investigation\":\"INV-01-06-M1\",\"n\":%d,\"jit\":%d,\"access\":\"%s\",\"topology\":\"%s\",\"path\":\"%s\",\"seed\":%u,\"warmup\":%d,\"checked\":%d,\"negative\":\"%s\",\"arm\":\"%s\",\"routine_id\":2406}",cfg.n,cfg.jit,cfg.access,cfg.topology,cfg.path,cfg.seed,cfg.warmup,cfg.checked,cfg.negative,cfg.arm);
+ if(*cfg.hold) logrow("{\"kind\":\"hold_configuration\",\"point\":\"%s\",\"worker\":%d,\"controller_threads\":1}",cfg.hold,cfg.hold_worker);
+ snapshot(NULL,&task_initial,"task-initial",true);
+ if(cfg.jit) {
+  jit_code=mmap(NULL,(size_t)getpagesize(),PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANON|MAP_JIT,-1,0);
+  if(jit_code==MAP_FAILED) {logrow("{\"kind\":\"unavailable\",\"api\":\"MAP_JIT\",\"errno\":%d}",errno);return 78;}
+  REQUIRE(pthread_jit_write_with_callback_np(write_jit,NULL)==0,"JIT write callback");sys_icache_invalidate(jit_code,32);
+ }
+ for(int i=0;i<cfg.n;i++) {workers[i].id=i;krcheck(pthread_create(&workers[i].thread,NULL,worker_thread,&workers[i]),"worker creation");}
+ for(int i=0;i<cfg.n;i++) while(!atomic_load_explicit(&workers[i].registered,memory_order_acquire)) sched_yield();
+ int total=cfg.warmup+cfg.checked;pthread_t fronts[8],priors[8];Server front_args[8],prior_args[8];
+ bool serial=!strcmp(cfg.topology,"serial");
+ if(serial) {krcheck(mach_port_allocate(mach_task_self(),MACH_PORT_RIGHT_PORT_SET,&port_set),"port set");for(int i=0;i<cfg.n;i++) krcheck(mach_port_move_member(mach_task_self(),workers[i].front,port_set),"port set membership");}
+ for(int i=0;i<(serial?1:cfg.n);i++) {front_args[i]=(Server){serial?port_set:workers[i].front,total*(serial?cfg.n:1)+(negative("skipped-repair-nominal-success")?1:0)};krcheck(pthread_create(&fronts[i],NULL,server_thread,&front_args[i]),"front creation");}
+ if(forward()) for(int i=0;i<cfg.n;i++) {prior_args[i]=(Server){workers[i].prior,total+1};krcheck(pthread_create(&priors[i],NULL,server_thread,&prior_args[i]),"prior creation");}
+ pthread_t controller;if(*cfg.hold) krcheck(pthread_create(&controller,NULL,hold_controller,NULL),"hold controller creation");
+ atomic_store_explicit(&ready,1,memory_order_release);
+ /* Both deterministic admissions within every child: even rounds rotate
+  * workers; odd rounds release all, then await every real completed marker. */
+ for(int e=0;e<total;e++) {
+  logrow("{\"kind\":\"admission_schedule\",\"event\":%d,\"mode\":\"%s\"}",e,e%2?"together":"rotated");
+  for(int i=0;i<cfg.n;i++) {int id=(i+e+((*cfg.hold&&e==0)?cfg.hold_worker:0))%cfg.n;atomic_store_explicit(&workers[id].permit,e+1,memory_order_release);if(!(e%2)) wait_done(&workers[id],e);}
+  for(int i=0;i<cfg.n;i++) wait_done(&workers[i],e);
+ }
+ for(int i=0;i<(serial?1:cfg.n);i++) krcheck(pthread_join(fronts[i],NULL),"front join");
+ for(int i=0;i<cfg.n;i++) atomic_store_explicit(&workers[i].phase,1,memory_order_release);
+ for(int i=0;i<cfg.n;i++) while(!atomic_load_explicit(&workers[i].proof_done,memory_order_acquire)) sched_yield();
+ if(forward()) for(int i=0;i<cfg.n;i++) krcheck(pthread_join(priors[i],NULL),"prior join");
+ for(int i=0;i<cfg.n;i++) atomic_store_explicit(&workers[i].phase,2,memory_order_release);
+ for(int i=0;i<cfg.n;i++) {
+  if(teardown_hold()&&i==cfg.hold_worker) while(!atomic_load_explicit(&hold_entered,memory_order_acquire)) sched_yield();
+  if(*cfg.hold) {logrow("{\"kind\":\"join_attempt\",\"worker\":%d}",i);atomic_store_explicit(&join_attempt[i],1,memory_order_release);}
+  krcheck(pthread_join(workers[i].thread,NULL),"worker join");
+ }
+ if(*cfg.hold) krcheck(pthread_join(controller,NULL),"controller join");
+ if(serial) dispose(-1,"port_set",mach_port_mod_refs(mach_task_self(),port_set,MACH_PORT_RIGHT_PORT_SET,-1));
+ Snapshot final;snapshot(NULL,&final,"task-final",true);REQUIRE(same_snapshot(&task_initial,&final),"task ports changed");
+ release_snapshot(-1,&final,"task-final");release_snapshot(-1,&task_initial,"task-initial");
+ if(cfg.jit) dispose(-1,"jit_page",munmap(jit_code,(size_t)getpagesize()));
+ logrow("{\"kind\":\"summary\",\"events_checked\":%d,\"events_warmup\":%d,\"commits_total\":%d,\"proof_events\":%d,\"zero_unclassified\":true,\"status\":\"completed\"}",cfg.n*cfg.checked,cfg.n*cfg.warmup,cfg.n*(total+(forward()?1:0)),forward()?cfg.n:0);
+ return 0;
 }

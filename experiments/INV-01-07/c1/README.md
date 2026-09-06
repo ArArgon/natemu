@@ -1,63 +1,53 @@
-# M07-C1 clock-instrument implementation
+# M07-C1 clock experiment
 
-Status: method accepted by REV-194; the producer/runner/gate packet was
-self-reviewed at REV-195 (closing REV-196 R2) and then returned independently
-at REV-219 (`revise`; five required changes R1-R5). This packet closes
-R1-R5 and is self-reviewed at REV-236. Independent return review REV-237
-against REV-219 must accept before native execution is authorized.
-**No native execution or evidence collection is authorized by this
-directory.** These Python modules, the compiled-but-unexecuted producer, and
-synthetic tests are not a clock finding, an accepted instrument, or full Q07
-completion. No historical timer entry point is reused.
+Read [INV-01-07](../../../docs/research/investigations/INV-01-07.md) for the
+question, applicability, unresolved findings and next action; follow the
+[research workflow](../../../docs/research/README.md) for independent review.
+This README describes operation. A structural pass does not accept a finding.
 
-## Implemented layers
+`producer.c` emits six clocks at two QoS levels and 1/2/4/8-worker contention
+cells. `core.py`, `cells.py`, and `artifact.py` check arithmetic, completeness,
+array checksums and controls. `runner.py` builds and supervises the fixed
+three-normal/six-negative schedule, retaining actual exit/timeout records.
+`clock_evidence.py` checks factual context and retained v2 campaign integrity
+for consumers; it never interprets review documents.
 
-- `core.py`: exact arithmetic, sample scans, fixed noise floor, containment,
-  serialized global/per-worker trace checks.
-- `cells.py`: complete six-clock/two-QoS and 1/2/4/8-worker/two-QoS matrices,
-  strict types, API/QoS/count/oracle validation, exact summary comparisons,
-  transactionally returned per-child findings and strict T1 by QoS.
-- `artifact.py`: read-only adapter for fixed binary arrays and separate
-  producer/process records. Hashes and sizes are checked before interpretation.
-- `check.py`: structural-check CLI with exact JSON fractions and all-or-nothing
-  output. It explicitly emits `evidence_approval: false`; it is not a runner.
-- `producer.c`: all20 native cells, explicit raw records, checked API/pthread
-  paths, exact fraction summaries, six fixed negative seams and direct-launch
-  binding/external-root enforcement. No signal handler is installed.
-- `runner.py`: build-only pipeline and separately gated fixed3-normal/6-negative
-  campaign with300s child watchdog, exact-child kill/reap, environment capture,
-  source/build/review binding, exclusive lock and durable partial inventory.
-- `test_core_independent.py`: independently authored arithmetic tests; expected
-  values are hand-derived without calling the tested helpers as an oracle.
-- `test_cells_independent.py`: independent fixed-cardinality complete-cell
-  fixtures and malformed inputs, including a late required-cell rejection.
-- `test_artifact.py` and `test_binary_integration.py`: author-side parser and
-  complete80-file binary/real-CLI round trip with a late summary corruption
-  and hostile RuntimeError/OverflowError during final rendering.
-- `test_negative_routing.py`: labelled injections reach real raw oracles;
-  an undetected injection cannot return a positive finding.
-- `test_runner.py`: separate-author synthetic supervision, control identity,
-  review binding (including the v2 gate's independent-return requirement),
-  lifecycle, resource and transactional-output tests. Native process/compiler
-  operations are mocked in these tests.
-- `test_producer_accounting.py`: compiles a throwaway sizeof/arithmetic probe
-  against the real producer.c struct layouts and independently re-derives the
-  named-local-buffer accounting table below; fails if `named_stack` ever
-  under-counts it. No producer execution or `NATEMU_RAW_ROOT` use.
+## Build and run
 
-A real `xcrun clang` build of `producer.c` (the exact reviewed flags) and its
-`otool -tvV` disassembly were inspected for this packet: the per-cell timed
-reader (`reader_mach`/`reader_nsec_np`/`reader_generic`, resolved once per
-cell before the timed loop by `resolve_reader`) and the contended
-`pthread_mutex_lock`/`mach_absolute_time` loop each keep one real `bl` call
-per iteration (no vectorization, hoisting, removed barriers, or cell/mode
-classification inside the timed path); see REV-236 for the exact instruction
-ranges and file hash.
+Choose a new canonical directory below an existing external `NATEMU_RAW_ROOT`:
 
-No module asserts that gate approvals or manifest claims
-are authentic merely because they occur in JSON. Structural PASS is not review
-acceptance. Three complete normal children, separate native controls, result,
-independent replication and adversarial gates remain unfulfilled.
+```sh
+export NATEMU_RAW_ROOT=/absolute/external/raw
+python3 -B experiments/INV-01-07/c1/runner.py build "$NATEMU_RAW_ROOT/c1-build"
+# After pre-execution review, when an investigation authorizes its bounded campaign:
+python3 -B experiments/INV-01-07/c1/runner.py campaign "$NATEMU_RAW_ROOT/c1-run" --build "$NATEMU_RAW_ROOT/c1-build" --no-other-native-benchmarks
+```
+
+Build copies local Python/C sources and repository-boundary context into
+`sources/`, compiles **that snapshot**, runs its synthetic tests, signs the
+binary ad hoc, and retains flags, compiler/SDK versions, selected SDK headers,
+disassembly and checksums. Build executes no clock producer. Campaign execs
+the retained runner and uses its retained checkers. Editorial edits and unrelated
+commits do not invalidate this build; changes to retained build bytes do.
+
+Output paths must be canonical, external and unused. The project lock and
+operator assertion prevent overlapping project campaigns; they do not detect
+arbitrary external benchmarks. The 300-second child watchdog kills and reaps
+the process group. Fixed count, resource, mode, seed and negative-oracle checks
+remain mandatory. Failures stop the campaign without replacement samples;
+partial files, process records, diagnostics and a checksummed inventory remain.
+
+`build.json` uses `INV-01-07-clock-c1-build-v2`; `plan.json` and `campaign.json`
+use `INV-01-07-clock-c1-campaign-v2`. A run ID and producing build ID bind every
+child, schedule, check and result. Raw producer/array formats are unchanged.
+The v2 reader rejects historical build/campaign formats rather than inventing
+missing approval fields. Historical gate JSON and reviews retain their original
+meaning and can be read using their producing code revision from Git.
+
+Clock consumers may call `clock_evidence.validate(campaign_json, context)`.
+Missing, incomplete, corrupted or mismatched evidence returns `unqualified`;
+a factual context match remains subject to findings review for instrument,
+resolution and applicability. It is not automatic timing qualification.
 
 ## Record layout for the producer implementation
 
@@ -92,24 +82,24 @@ records. Metadata files are bounded at 1 MiB each.
 
 Across twelve clock and eight contention cells, the complete array payload is
 226962048 bytes (below 512 MiB), independent of seed. Native allocations must
-pass independent review of the separate256MiB probe-buffer cap before collection.
-The draft's maximum heap/global buffers are39710880 bytes. A separate1MiB
+pass independent review of the separate 256 MiB probe-buffer cap before collection.
+The draft's maximum heap/global buffers are 39710880 bytes. A separate 1 MiB
 reserve conservatively covers probe-owned automatic arrays/records (large
-named buffers plus64KiB of small scratch/copy allowance must fit that reserve),
-giving a40759456-byte planned upper bound. Preflight and final resource
+named buffers plus 64 KiB of small scratch/copy allowance must fit that reserve),
+giving a 40759456-byte planned upper bound. Preflight and final resource
 records keep the measured heap/global allocation count distinct from this
 conservative automatic-buffer allowance. Neither is a claim about total
 pthread stack mappings, allocator/library overhead, or native RSS.
 Reading code allocates binary payload bytes separately from derived Python
 values; the native allocation cap is not a claim about total checker RSS.
 
-### Stack-buffer accounting table (closes REV-196 R2's preliminary note)
+### Stack-buffer accounting
 
 R2's preliminary accounting note observed that `maximum_owned_buffer_bytes`
 counted only heap/global buffers (`sizeof metadata` plus `allocate()`d
 arrays) and omitted simultaneous local C buffers: main's/preflight's own
 `struct json out`, and clock_cell's `elapsed[200]`. `preflight()` now also
-sums a `named_stack` term, over every named local declared anywhere in
+sums a `named_stack` term, over the enumerated major local buffers/records in
 `producer.c` (summed as if simultaneous, even across functions whose scopes
 cannot actually overlap, so no call-graph reasoning can shrink it), and
 requires `named_stack <= STACK_BUFFER_RESERVE` (1 MiB) before any array is
@@ -121,7 +111,7 @@ per-cell heap arithmetic. Real Apple-Silicon sizes (`clang -O2`, this SDK):
 `sizeof(struct scan)=32`, `sizeof(struct contention)=744`, `PATH_MAX=1024`.
 
 This table is an **independent enumeration**, not `named_stack` itself: it is
-the real sum of every named local >= 8 bytes that a plain reading of
+a sum of the enumerated major local buffers/records that a plain reading of
 `producer.c` finds, using real compiled `sizeof()` values, not the
 producer's own `named_stack` expression or its 64 KiB fudge allowance.
 `sizeof(struct stat)=144`, `sizeof(struct timespec)=16`, `sizeof(va_list)=8`
@@ -168,10 +158,10 @@ independent enumeration (143593) by 65032 bytes and comfortably clears
 The adapter requires canonical absolute external-root, child and repository
 paths, rejects internal roots, symlink payload files, aliased descriptors,
 wrong hashes/sizes/encodings and nonregular files. It neither creates nor
-rewrites artifacts. Actual code/build/SDK/host/environment/review identities,
-clean committed revision, direct-binary raw-root enforcement, no overlapping
+rewrites artifacts. Actual code/build/SDK/host/environment identities,
+direct-binary raw-root enforcement, no overlapping
 native benchmark, watchdog kill/reap and all prescribed negative seams belong
-to the producer/supervisor's independent code gate, not structural checker
+to the producer/supervisor's pre-execution review, not structural checker
 acceptance. The parent pipe record prevents accidental unsupervised launch;
 it is not authentication against a hostile parent. The lock does not detect
 arbitrary external benchmarks, so an explicit operator no-overlap assertion
@@ -188,77 +178,45 @@ metadata retains its actual mode; an undetected injection never receives T1.
 `failure.json` retains the named error; clock failures additionally retain
 the distinct actual POSIX return and errno in `api-failure.json`.
 
-The build-only subcommand requires clean committed C1 sources, compiles with
-recorded-O2 flags/resolved SDK, signs ad hoc, captures disassembly/header
-hashes and runs only synthetic tests. It never executes the producer.
-
-### Gate schema `INV-01-07-clock-c1-gate-v2`
-
-REV-196 is a preliminary independent code critique, not an acceptance: its
-own verdict is `revise` and it says so explicitly ("No final196 acceptance is
-issued for an incomplete packet"). It stays `revise` in this repository even
-after this packet closes R2 — returns get new review numbers here, not an
-edited verdict on the original critique. The v1 gate schema wrongly required
-`REV-196` itself to read `Verdict: accept`, which REV-196 can never satisfy.
-
-The v2 gate loader (`runner.load_gate`) instead requires, as separate
-fields:
-
-- `reviews.193`, `.194`, `.195`: the fixed self-method/independent-method/
-  self-code reviews, each still required to read `accept` (self/independent/
-  self respectively).
-- `reviews.196`: the fixed independent critique, required to read `revise`
-  (`Independence: independent`) — present as the record R2 is closing
-  against, not as an acceptance.
-- `independent_return`: `{review_id, file, sha256, expected_verdict,
-  independence}`, supplied by the gate JSON itself because the review number
-  that finally accepts the packet is assigned only when that independent
-  return is written (this packet reserves `REV-219` for it). The loader
-  independently re-verifies every one of those fields against the real file:
-  `review_id` must not reuse one of the four fixed numbers above; `file` must
-  be exactly `docs/research/reviews/REV-<review_id>.md`; the review at that
-  path must have `Independence: independent` and `Verdict: accept`; and its
-  text must mention `REV-196` (the critique it returns against). A gate
-  lacking `independent_return`, one whose return review is still `revise`,
-  or one whose "return" is independence `self` all refuse to load
-  (`gate-fields`, `review-not-accepted`, `review-independence`
-  respectively) — see `test_gate_requires_accepted_independent_return_against_critique196`
-  in `test_runner.py`. The C1 source/build/method-hash receipts that used to
-  live in REV-196 now must appear in the independent return review instead,
-  since 196 never receives them.
-
-Campaign execution additionally requires genuine accepted current self193/195
-and independent194 records, the independent196 critique present at its
-pinned revise hashes, an accepted independent return against it, exact
-code/build/method receipts and committed clean scope. No accepted gate
-envelope ships with this code. Reviewers must establish actual independence
-and closed changes; matching bytes alone do not.
-
-## Development checks
-
-Run synthetic development checks only:
+## Development validation and historical provenance
 
 ```sh
 python3 -B -m unittest discover -s experiments/INV-01-07/c1 -p 'test_*.py' -v
 ```
 
-These tests collect no host timings and write no raw evidence. Adapter and
-binary tests create synthetic files only in fresh external temporary
-directories, then remove those directories. The full binary test visits the
-prescribed arrays through the real CLI, first accepting the synthetic record
-structurally and then rejecting a corrupted final required summary with no
-finding/T1/PASS prefix. `test_producer_accounting.py` compiles a throwaway
-probe (real `xcrun clang`, no `NATEMU_RAW_ROOT`) but launches no producer.
-These tests do not establish native runtime behavior. Fixture authors cannot
-independently approve their own fixture code in REV196.
+Synthetic tests cover fixed numeric/control oracles, array parsing, output
+boundaries, non-overwrite, build identity, missing/mixed raw data, timeouts and
+partial failures. The accounting test compiles and runs only a small sizeof
+probe. No test collects clock findings or launches the native clock producer.
 
-Historical development checkpoint `d49a95b`: the then-current48 tests passed
-in58.528s (inspected as-is at REV-196). The draft had grown to70 tests before
-REV-195's packet; that packet added the v2 gate's independent-return fixtures
-and `test_producer_accounting.py`, for72 tests passing in95.117s. Independent
-critique REV-219 found five further required changes (R1-R5: a per-QoS timed
-seam, the stack-accounting table's own arithmetic and enumeration claims, and
-two gate-binding gaps); this return closes all five and adds a bypass fixture
-for each of R4 and R5, for73 tests passing in95.983s. REV-236 (self code
-return) pins the exact per-file SHA-256. Independent return REV-237 against
-REV-219 must accept before native execution is authorized.
+The pre-migration README's uncommitted correction recorded that REV-219
+returned five changes and named REV-237 as the subsequent return (with
+REV-236 self review). It also clarified the old gate's type/subject parsing.
+That provenance is preserved here; current substantive dispositions live in
+the investigation. The gate parser, review parameters and document-hash
+receipts have been retired. Historical REV-196/219/236/237 records, where
+present, remain at their original locations and are not updated by runners.
+
+## Native review return preparation — 2026-09-05
+
+Normal clock readers resolve once per cell, with no per-read mode/cell/string
+branch. Both nsec-np QoS cells share the same reader and non-inlined zero-value
+validator; its call and guard overhead is included in the measured wrapper cost.
+The zero-nsec negative selects a synthetic-zero reader that calls that same
+validator. It no longer calls the failure reporter directly. A synthetic C
+fixture supplies 42 and zero without invoking a clock API; the zero case exits
+with the API-failure record, while removing the real guard makes the negative
+return normally and fail the fixture. This tests control sensitivity independently
+of the native experiment.
+
+The buffer enumeration is intentionally conservative rather than exhaustive:
+small scalar/local records and compiler copies are covered by the separate
+64 KiB allowance within the 1 MiB reserve. The table and ABI test agree on
+143593 enumerated bytes, below the 208625 formula bound and 1 MiB reserve.
+
+The fixed campaign has nine children: three normal and six negative. Its total
+native child ceiling is 2700 seconds; a complete-child payload upper estimate
+for all nine is 2042658432 bytes, with at least 4869586944 bytes of free disk
+required by the runner before launch. The retained-tree check caps campaign
+files at 5 GiB. Python checking and environment capture are outside the native
+child ceiling; this is not a claim of a 45-minute end-to-end wall bound.

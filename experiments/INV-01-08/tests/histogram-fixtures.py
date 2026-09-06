@@ -216,14 +216,8 @@ class Cohorts(unittest.TestCase):
         (self.base / member["path"]).write_bytes(raw)
         member["sha256"] = hashlib.sha256(raw).hexdigest()
 
-    def prepare(self, review_transform=lambda s: s):
-        review = ("Synthetic parser fixture; not an actual review or research evidence.\n"
-                  "- Review ID: `REV-000`\n- Independence: `independent`\n- Verdict: `accept`\n"
-                  f"- Cohort SHA-256: `{h.cohort_digest(self.cohort)}`\n")
-        raw = review_transform(review).encode()
-        (self.base / "review.md").write_bytes(raw)
-        self.envelope = {"schema": "INV-01-08-cohort-v1", "cohort": self.cohort,
-                         "review": {"path": "review.md", "sha256": hashlib.sha256(raw).hexdigest()}}
+    def prepare(self):
+        self.envelope={"schema":"INV-01-08-cohort-v2","cohort":self.cohort}
         return self.write_envelope()
 
     def write_envelope(self):
@@ -273,19 +267,6 @@ class Cohorts(unittest.TestCase):
             context[field] = "synthetic-not-evidence"
         context.pop("sdk")
         self.rejected(self.prepare())
-
-    def test_review_binding_and_uniqueness(self):
-        for transform in (lambda s: s.replace("`accept`", "`revise`"),
-                          lambda s: s.replace("`independent`", "`self`"),
-                          lambda s: s + "- Verdict: `revise`\n",
-                          lambda s: s.replace("Cohort SHA-256:", "Unbound SHA-256:")):
-            self.rejected(self.prepare(transform))
-        path = self.prepare()
-        self.envelope["review"]["sha256"] = "0" * 64
-        self.rejected(self.write_envelope())
-        path = self.prepare()
-        self.cohort["compatibility_justification"] += " tampered"
-        self.rejected(self.write_envelope())
 
     def test_member_hash_mode_duplicates_and_failed_integrity(self):
         original = copy.deepcopy(self.cohort)

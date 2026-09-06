@@ -113,6 +113,18 @@ static void unavailable(const char *api,int error) {
     emit("unavailable",(uint64_t)(unsigned)error,0,0,0,0,0);
     fprintf(stderr,"INV18 UNAVAILABLE %s errno=%d\n",api,error); fflush(stderr); _exit(78);
 }
+
+/* The asynchronous trace may not drain before terminal _exit. Preserve both
+ * syscall outcomes synchronously without pretending a skipped restore ran. */
+static void mprotect_failure(void *target,size_t length,int original,int a,int ea,int b,int eb) {
+    fprintf(stderr,"INV18 MPROTECT_RESULT {\"schema\":\"INV-01-18-mprotect-failure-v1\",\"address\":%"PRIuPTR",\"length\":%zu,"
+            "\"protect_protection\":%d,\"restore_protection\":%d,"
+            "\"protect_result\":%d,\"protect_errno\":%d,\"restore_attempted\":%s,",
+            (uintptr_t)target,length,PROT_NONE,original,a,ea,a?"false":"true");
+    if(a) fprintf(stderr,"\"restore_result\":null,\"restore_errno\":null}\n");
+    else fprintf(stderr,"\"restore_result\":%d,\"restore_errno\":%d}\n",b,eb);
+    fflush(stderr);
+}
 #define REQUIRE(test,why) do { if(!(test)) die(why); } while(0)
 
 /* Durable, cause-specific witness, including failures before the collector
@@ -622,7 +634,10 @@ static void mapping_change(void) {
         errno=0; int a=mprotect(target,length,PROT_NONE),ea=errno;
         errno=0; int b=a? -1:mprotect(target,length,original),eb=errno;
         emit("mapping",target==(void *)arena?3:2,(uintptr_t)target,length,a==0,b==0,((uint64_t)(uint32_t)ea<<32)|(uint32_t)eb);
-        if(a||b) unavailable("mprotect roundtrip",a?ea:eb);
+        if(a||b) {
+            mprotect_failure(target,length,original,a,ea,b,eb);
+            unavailable("mprotect roundtrip",a?ea:eb);
+        }
         if(target==(void *)arena) {
             REQUIRE(pthread_jit_write_with_callback_np(write_callback,NULL)==0,"coordinator restore");
             emit("restore-thread",epoch,0,1,0,0,0);
@@ -994,26 +1009,30 @@ static void parse(int argc,char **argv) {
     if(!strcmp(cfg.mode,"preflight")||cfg.hook[0]||cfg.negative[0]) { cfg.warmup=4; cfg.publications=32; cfg.call_floor=128; }
 }
 
+#ifndef INV18_BUILD_ID
+#define INV18_BUILD_ID "validation-build"
+#endif
 int main(int argc,char **argv) {
     parse(argc,argv);
-    const char *raw=getenv("NATEMU_RAW_ROOT"),*gate=getenv("INV18_RUNTIME_AUTHORIZED"),*repo=getenv("INV18_REPO_ROOT");
+    const char *raw=getenv("NATEMU_RAW_ROOT"),*repo=getenv("INV18_REPO_ROOT");
     char resolved_raw[PATH_MAX],resolved_repo[PATH_MAX];
-    if(!raw||!repo||!gate||strcmp(gate,"independent-code-gate")||!realpath(raw,resolved_raw)||!realpath(repo,resolved_repo)) {
-        fprintf(stderr,"runtime gate/raw root absent\n"); return 77;
+    if(!raw||!repo||!realpath(raw,resolved_raw)||!realpath(repo,resolved_repo)) {
+        fprintf(stderr,"external raw root absent\n"); return 77;
     }
     size_t repo_len=strlen(resolved_repo);
     if(!strncmp(resolved_raw,resolved_repo,repo_len)&&(resolved_raw[repo_len]=='/'||resolved_raw[repo_len]==0)) {
         fprintf(stderr,"repository-internal raw root rejected\n"); return 77;
     }
-    if(!strcmp(cfg.mode,"cost")&&!getenv("INV18_TIMER_PREREQUISITE")) { fprintf(stderr,"cost prerequisite absent\n"); return 77; }
+    const char *run_id=getenv("INV18_RUN_ID");
+    if(!run_id || strlen(run_id)!=32 || strspn(run_id,"0123456789abcdef")!=32) return 77;
     setvbuf(stdout,NULL,_IOLBF,0);
     host_page=(size_t)getpagesize(); stride=host_page*2;
     size_t prologue=cfg.hook[0]?20:0;
     code_offset=!strcmp(cfg.layout,"page-boundary")?host_page-16-prologue:(!strcmp(cfg.layout,"cache-boundary")?48-prologue:0);
     slot_count=ARENA_BYTES/stride; data_length=cfg.pages*host_page;
     REQUIRE(mach_timebase_info(&timebase)==KERN_SUCCESS&&timebase.numer&&timebase.denom,"timebase");
-    printf("{\"kind\":\"header\",\"investigation\":\"INV-01-18\",\"method\":\"M18-2\",\"cell\":\"%s\",\"mode\":\"%s\",\"arm\":\"%c\",\"n\":%u,\"seed\":%"PRIu64",\"page_size\":%zu,\"size\":%u,\"code_offset\":%zu,\"numer\":%u,\"denom\":%u,\"signing\":\"%c\",\"negative\":\"%s\",\"hook\":\"%s\",\"baseline\":\"%s\"}\n",
-           cfg.cell,cfg.mode,cfg.arm,cfg.n,cfg.seed,host_page,cfg.size,code_offset,timebase.numer,timebase.denom,cfg.signing,cfg.negative,cfg.hook,cfg.baseline);
+    printf("{\"schema\":\"INV-01-18-trace-v2\",\"run_id\":\"%s\",\"build_id\":\"%s\",\"kind\":\"header\",\"investigation\":\"INV-01-18\",\"method\":\"M18-2\",\"cell\":\"%s\",\"mode\":\"%s\",\"arm\":\"%c\",\"n\":%u,\"seed\":%"PRIu64",\"page_size\":%zu,\"size\":%u,\"code_offset\":%zu,\"numer\":%u,\"denom\":%u,\"signing\":\"%c\",\"negative\":\"%s\",\"hook\":\"%s\",\"baseline\":\"%s\"}\n",
+           run_id,INV18_BUILD_ID,cfg.cell,cfg.mode,cfg.arm,cfg.n,cfg.seed,host_page,cfg.size,code_offset,timebase.numer,timebase.denom,cfg.signing,cfg.negative,cfg.hook,cfg.baseline);
     if(!strncmp(cfg.negative,"protection-",11)) return protection_control();
     atomic_store(&running,true);
     if(pthread_create(&collector_thread,NULL,collect,NULL)) return 71;

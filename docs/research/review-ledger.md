@@ -1,8 +1,12 @@
 # Review ledger
 
-This ledger records every review. It starts empty. A missing applicable entry
-means the corresponding gate has not passed; it may never be treated as
-silently satisfied.
+> Historical ledger. Preserved entries describe prior work and impose no update
+> obligation on new research. Current findings and substantive open issues live
+> in each investigation; [the workflow](README.md) governs new work. Former gate
+> rules and templates below are historical context, not current instructions.
+
+
+This ledger records the former eight-gate review history.
 
 ## Review types
 

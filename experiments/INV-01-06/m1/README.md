@@ -1,160 +1,163 @@
-# INV-01-06 M06-M1 — delivered-Mach state-only exception baseline
+# M06-M1 delivered Mach baseline
 
-Method record: `docs/research/investigations/INV-01-06.md`, "Delivered-Mach
-supplement M06-M1" (lines 524-814). Self method review `REV-186`, independent
-method acceptance `REV-188`. This directory is the code deliverable that
-method acceptance authorized; it is a **new** experiment beneath
-`experiments/INV-01-06/`, separate from the accepted signal probe in
-`experiments/INV-01-06/{src,replication}` and `run.sh`, which this work does
-not modify.
+The [investigation](../../../docs/research/investigations/INV-01-06.md) owns current status; the [research workflow](../../../docs/research/README.md) governs new execution.
 
-## Execution boundary
+Compile-only: `python3 -B build.py --output "$NATEMU_RAW_ROOT/fresh-build"`. Synthetic validation: `python3 -B -m unittest discover -s . -p "test_*.py" -v`. `run.py plan` enumerates the full retained scope; after independent review, `run.py run --build <retained-build> --output <fresh-external-directory>` executes only the declared first tranche.
 
-**No code here has been run against a real fault.** `build.py` compiles this
-experiment's C source against MIG-generated code, verifies the generated
-routine id, freezes the wire layout, and disassembles the result — it never
-executes the produced `state_server` binary. `run.py`'s `run` action, which
-would execute it, refuses before doing so unless **both** an accepted self
-code review (`REV-228`) and an accepted **independent** code review
-(`REV-229`, reserved, not yet written) bind the exact source-packet digest —
-per `INV-01-06.md:806-814` ("no runtime preflight/evidence before independent
-code acceptance") and this experiment's own authoring boundary. `python3
-run.py plan` is pure Python (coverage enumeration only) and is the only
-action safe to run before REV-229 exists.
+## Native return under preparation — 2026-09-05
 
-## What it measures
+The v3 implementation replaces the previous success-label scaffold. No native
+M06-M1 experiment is approved or executed by this author return. The first
+proposed execution tranche is **six original positive children**: n=1, local
+plain ad-hoc signing, non-JIT, serial server, direct path; load/store × fixed
+seeds 60601–60603, with the unchanged ten warmup and 100 checked events each.
+Its six children have 180 s summed total ceilings and a 900 s stage timer;
+each uses a 5 s no-output-progress and 30 s total watchdog, 64 MiB per
+stdout/stderr file, 1 GiB stage threshold and 1 GiB free-space reserve. All
+other original positive cells and every negative/control/hold remain explicit
+not-run obligations. This stage cannot complete M06-M1 or supply Q19's Mach
+composition prerequisite. Independent review of this return precedes any run.
 
-A state-only Mach exception server (`EXCEPTION_STATE | MACH_EXCEPTION_CODES`,
-`ARM_THREAD_STATE64`, MIG routine 2406 `mach_exception_raise_state`) that
-repairs one worker's dedicated `PROT_NONE` data page and replies with an
-exact, unchanged copy of the delivered general state, so the faulting
-load/store retries exactly once and the worker resumes with the right data
-and untouched sentinels/SP. Everything (workers, servers, the owned prior
-handler) runs as threads inside one fresh-exec'd process — an own-process
-exception-port installation, never a foreign task or elevated entitlement.
-See `INV-01-06.md:539-544,600-663` for the exact scope and boundary; this is
-CLM-01-06-22/-23, a Hypothesis until code and result gates pass.
+The AOT `m1_access` assembly wrapper places cookie/nonce in x9/x10 and retains
+cookie/nonce/sentinel/SP in x19–x22 across a call to one exact exported load or
+store label. The descriptor, exact PC and stack bounds precede release arming.
+The server acquires arming, validates exception category, address, count/flavor,
+SDK-accessor PC/SP and actual delivered registers, and retains all 68 old and
+new general-state words. It copies the general state unchanged. The worker
+records measured result, preserved registers and exact before/after SP equality.
+A second delivery for the same event is terminal. Commit and disarm occur only
+after actual send completion, and descriptor fields are not reused earlier.
 
-## Layout
+Main registers all workers before opening admission. Even rounds admit one
+rotated worker at a time; odd rounds release every worker before waiting for
+all completions. Workers remain alive and disarmed while main joins front
+servers. Every forwarding worker then restores its actually installed/saved
+owned prior, delivers one extra proof event, and parks until the prior server
+joins. It finally restores its initial selected mask, verifies snapshots and
+disposes resources on the still-living worker. Server arguments live through
+join; exactly one thread consumes each prior queue. Initial task ports are
+captured and compared after teardown, without installation on the task.
 
-| File | Role |
-| --- | --- |
-| `src/state_server.c` | worker + server harness; the only hand-written native source |
-| `build.py` | MIG generation, routine-id verification, wire-layout freeze, compile, disassemble — build only, never executes |
-| `coverage.py` | pure-Python coverage manifest (signing × n × jit × access × topology × path, plus the 11 auxiliary arms) |
-| `check.py` | pure-Python two-pass checker (wire pass + semantic pass) with its own negative-fixture self-test |
-| `run.py` | supervisor: `plan` (pure Python) and `run` (gated; refuses without independent REV-229) |
-| `wire-layout.json` | build.py output: frozen request/reply byte layout (not checked in; regenerate via `build.py`) |
+The build produces and actually inspects separate plain and hardened+allow-jit
+binaries. Both local JIT/signing combinations remain capability questions.
+The immutable JIT path uses the public approved write callback, cache
+invalidation and reader ISB; it is outside the first non-JIT tranche.
 
-## Build
+### Message/right ownership of the new wrapper
 
-    export NATEMU_RAW_ROOT=/Users/liaozping/orca/natemu-raw   # external, outside this repo
-    python3 build.py --output "$NATEMU_RAW_ROOT/INV-01-06/m1/<stamp>"
+The retained SDK `mach/message.h` defines the public `mach_msg` API,
+`MACH_MSG_TYPE_MOVE_SEND_ONCE`, timeout and trailer options. Retained generated
+`mach_excServer.c` supplies the state routine demux and reply-header construction;
+retained generated headers plus `verify_layout.c` fix the admitted routine's
+field layout. The wrapper retains that parser and accepts only routine 2406,
+a simple fixed two-code/68-word message, exact native NDR and the requested
+format-0/null trailer. The raw request bytes and decoded state are both retained.
+A catch's prepared reply record is distinct from a successful IPC send record.
 
-`build.py` refuses to run without `NATEMU_RAW_ROOT` set to an existing
-directory outside the repository (same refusal shape as the sibling
-`experiments/INV-01-06/run.sh`), and refuses if the pinned SDK's
-`mach/mach_exc.defs` hash no longer matches the accepted `SRC-162` value
-(`3ddbd5d01091643dab842d6b153fe3ae0de65498f28fb4afc51dd3c6d6637b4d`). It
-writes generated MIG sources, `wire-layout.json`, `verify_layout.c` (a
-`-fsyntax-only` translation unit whose `_Static_assert`s cross-check every
-frozen offset/size against the real generated headers), `disassembly.txt`
-(the fault-site `asm_load`/`asm_store` and the repair/reply routine), and
-`build-manifest.json` (file hashes, pinned MIG/compiler versions, the
-verified routine id, and `runtime_executed: false`).
-
-## Plan / coverage
-
-    python3 run.py plan
-
-Prints the full coverage manifest and the exact source-packet digest as
-canonical JSON. See `coverage.py` for the cross-product and sample plan:
-96 eligible positive cells (32 combinations requiring immutable-JIT on the
-non-hardened signing cell are recorded `invalid`, never dropped), 3 fresh
-children per eligible cell at seeds 60601-60603 with 10 warm-up + 100 checked
-events per worker, and 11 auxiliary arms (8 runtime negatives + terminal +
-restoration + prior-handler-unsupported) at 3 fresh children each.
-
-## Negative control
-
-`check.py`'s self-test (`python3 check.py`, no arguments) is the runnable
-check this experiment leaves behind. It builds one minimal valid trace,
-confirms the two-pass checker reports it clean, then applies five named
-mutations plus two structural ones and confirms each is independently
-rejected with a distinct reason: wrong routine id, a reply carrying changed
-general state, a double outstanding fault (two arms with no resume between),
-an unreleased right, a duplicated disposal, a restoration mismatch, and a
-receive with no reply or terminal record (a MIG_NO_REPLY-shaped omission).
-None of this launches `state_server`; the fixtures are hand-built JSONL rows
-matching the trace schema documented at the top of `check.py`.
-
-## Disposal and reference accounting
-
-No success path in `catch_mach_exception_raise_state` (or its two sibling
-routines) ever returns `MIG_NO_REPLY`: every receive is answered by a real
-reply (a repair success, a forwarded reply, or `KERN_FAILURE` for a rejected
-event) or an explicit terminal record — `check.py`'s
-`check_no_mig_no_reply` enforces this on every trace. Every right this
-harness acquires is disposed exactly once, after restoration is confirmed
-(`teardown_worker` in `src/state_server.c`):
-
-| Right | Acquired | Disposed | How |
+| Owned object/path | Acquisition | Successful disposition | Error disposition |
 | --- | --- | --- | --- |
-| Worker receive right (`recv_port`) | `mach_port_allocate(..., RECEIVE, ...)` in `register_worker` | `teardown_worker` | `mach_port_mod_refs(..., RECEIVE, -1)` |
-| Worker send right (same name) | `mach_port_insert_right(..., MAKE_SEND)` in `register_worker` | `teardown_worker` | `mach_port_mod_refs(..., SEND, -1)` |
-| Worker thread control port (`thread_self`) | `mach_thread_self()` in `register_worker` | `teardown_worker` | `mach_port_deallocate` |
-| Prior receive right (`prior_recv_port`, forward path only) | `mach_port_allocate` in `register_worker` | `teardown_worker` | `mach_port_mod_refs(..., RECEIVE, -1)` |
-| Prior send right (forward path only) | `mach_port_insert_right` in `register_worker` | `teardown_worker` | `mach_port_mod_refs(..., SEND, -1)` |
-| Port set (serial topology only) | `mach_port_allocate(..., PORT_SET, ...)` in `main` | end of `main`, after every worker's teardown | `mach_port_mod_refs(..., PORT_SET, -1)` |
-| Dedicated data page | `mmap` in `worker_thread` | `teardown_worker` | `munmap` |
-| Pre-existing exception-port entries (snapshot) | never acquired — inspected only via `thread_get_exception_ports` | n/a: not owned by this experiment | `thread_set_exception_ports` restores the exact saved tuple; the saved `mach_port_t` values are not separately deallocated because they were never given an extra reference by the snapshot call |
+| Front/prior receive right | `mach_port_allocate(RECEIVE)` | One `mod_refs(RECEIVE,-1)` after servers join and living-worker restoration | Entire owned child terminates; no success disposal assertion |
+| Inserted handler send right | `mach_port_insert_right(MAKE_SEND)` | One `mod_refs(SEND,-1)` after restoration | Terminal child; no reuse |
+| Worker control send right | `mach_thread_self()` | One `mach_port_deallocate` on the living worker after restore | Terminal child |
+| Each non-null snapshot tuple | `thread_get_exception_ports` or `task_get_exception_ports` | One deallocation per acquired tuple, including repeated names across separate inspections | Terminal child; never reported as restored/cleaned |
+| Received reply send-once right | Successful simple receive, remote disposition checked | Generated reply moves that same right; successful `mach_msg` send is recorded before event metadata reuse | Rejected wire/demux or failed send exits the whole child, without guessing whether a failed transfer consumed a right |
+| Forced reply-send-failure seam | Same received owned reply right | Explicitly deallocate only this owned reference, clear remote name, attempt send; outcome remains unreviewed negative evidence | Terminal child, never a positive reply |
+| Port set | `mach_port_allocate(PORT_SET)` | One decrement after all receive users join | Terminal child |
+| Owned data/JIT mappings | Checked `mmap` | Checked `munmap` after users join | Terminal child |
 
-`check.py`'s `check_disposal` fails a trace missing any of the first five
-rows' disposal record for a worker that reached `register`, and separately
-fails a right disposed more than once. The port set and data page are
-recorded for completeness but are not Mach send/receive rights, so they are
-not part of that automated check (see `check.py`'s `EXPECTED_DISPOSALS`).
+Null handler tuples are semantically no handler; their inactive behavior/flavor
+fields are not interpreted as an active route. Active tuples compare full
+mask/port/behavior/flavor. Only EXC_MASK_BAD_ACCESS is modified. Fatal paths
+rely on whole-child containment, claim no successful in-process restoration,
+and do not attempt ambiguous duplicate right cleanup. This table describes
+instrument policy; no server-death recovery guarantee is inferred.
 
-## Baselines: non-JIT then immutable-JIT
+### N4/N5 author return — independent review required
 
-The non-JIT baseline (`asm_load`/`asm_store` in `src/state_server.c`) is two
-plain functions compiled into this binary's own `__TEXT` segment — never
-`MAP_JIT`, never written after link. The immutable-JIT baseline
-(`build_immutable_jit`) uses the exact accepted Q-01-04 procedure already in
-use by `experiments/INV-01-06/src/probe.c` and `experiments/INV-01-04/src/
-probe.c`: allocate `MAP_JIT`, `pthread_jit_write_protect_np(0)`, write the
-generated bytes, `sys_icache_invalidate`, `pthread_jit_write_protect_np(1)`.
-"Immutable" here means that lock is never reopened for the rest of the
-process's life — a write-window toggle mid-campaign is INV-01-19's distinct
-composition question, explicitly out of scope (`INV-01-06.md:594-598,648-649`).
+The accepted six-child baseline and its retained producing builds remain
+separate from this new return. `run.py` still defaults to that exact baseline.
+No control or hold native execution is authorized by the implementation below.
 
-## Known limitation: routine ids entirely outside this subsystem
+`--stage controls` proposes all 33 original auxiliary children: eight negatives
+plus terminal, restoration and unsupported-prior controls, each with three
+fixed seeds. Its native child ceilings sum to 990 s and its stage ceiling is
+1,800 s. `--stage holds` proposes 96 complete held children: n=2, plain ad-hoc,
+non-JIT load, both topologies and both paths, held worker 0, every applicable
+point, three fixed seeds, ten warmup and 100 checked events. Its native ceilings
+sum to 2,880 s and its stage ceiling is 3,600 s. Both retain 5 s no-progress/
+30 s child ceilings, kernel 64 MiB per output file, 1 GiB stage output threshold
+and 1 GiB free reserve. Stop on the first unexpected outcome; remaining rows
+stay not-run. Neither stage completes the method. The complete schedule still
+contains 384 positive, 33 auxiliary and 11,520 applicable held children.
 
-`serve_n` uses `mach_msg_server_once(mach_exc_server, ...)`, the standard MIG
-receive/dispatch/reply loop, rather than hand-rolling message receive. For a
-message whose routine falls inside subsystem 2405-2410 but is not 2406
-(`mach_exception_raise`/`mach_exception_raise_state_identity`), our own
-`catch_mach_exception_raise`/`catch_mach_exception_raise_state_identity`
-stubs run and log a real `reply` record with `role: "reject"` — this is the
-traced, checked path for a same-subsystem wrong-routine-id event. For a
-`msgh_id` entirely outside that range, `mach_exc_server` itself returns
-`FALSE` before calling any `catch_` function, and `mach_msg_server_once`
-answers it with the standard `MIG_BAD_ID` error reply on its own — correctly
-(no `MIG_NO_REPLY`, no hang), but without one of this experiment's own
-`jlog` trace records. This is a disclosed observability gap in the trace,
-not a functional defect: the reply is still always sent, and it always
-carries an error, never a success. Re-implementing MIG's receive loop by
-hand to add a trace line for that specific edge case was judged a worse
-trade than reusing the standard, already-correct implementation; an
-independent reviewer may reasonably ask for it before REV-229.
+The unsupported-prior control installs an owned, unserved default-behavior
+decoy only after inspecting an empty selected thread route. The ordinary
+registration guard then inspects and refuses it before any admission or fault.
+It never invokes that route or replaces an unknown pre-existing handler.
+Receive destruction, reply-right release and unexpected helper mapping retain
+actual API/action fields. `controls.py` separately decodes raw message bytes,
+checks event/state attribution and demands the specific observed corruption,
+repeated fault, rejected PC, owned helper address, failed send or contained
+stall. Exit status or a trigger marker alone never qualifies a negative.
+Unhandled and receive-death outcomes remain categorical parent observations,
+without predicting a downstream signal or claiming successful cleanup.
 
-## Method question this author could not resolve without deciding the method
+The held actor releases the trace lock before waiting. For event holds, round
+0 admits the selected worker first. The controller issues a real teardown
+request; main consumes it while waiting for that unfinished worker and records
+that the outstanding event prevents teardown. At n>1 the controller admits
+other workers only after hold entry and waits for the selected competitor's
+actual fault-attempt record. With independent servers it also requires that
+competitor's completed/disarmed event before releasing the held actor. Shared
+serial service may queue, and its checker rejects another front receive while
+the shared server is held. At n=1 the consumed/deferred teardown request is
+the competing operation. No elapsed duration substitutes for the handshake.
 
-INV-01-06.md does not name a specific list of local signing cells beyond "ad
-hoc non-Hardened Runtime" and "ad hoc Hardened Runtime+allow-jit"
-(`INV-01-06.md:719-723`). `coverage.py` names these `adhoc-plain` and
-`adhoc-hardened-allow-jit` and treats `jit=1` on `adhoc-plain` as an eligible
-but `invalid` cell rather than omitting it, so no coverage cell is silently
-dropped; that naming is this author's own choice, not a method-text quote,
-and an independent code reviewer or the method author should confirm it
-matches what M06-M1 intended before REV-229.
+Teardown holds occur before initial-route restoration or before disposal of
+the retained snapshot/handler/control/mapping resources. The temporary
+inspection reference returned by restoration is still released after that
+inspection; it is not the retained original/prior reference. Main waits for
+the selected teardown hold before recording its actual join attempt, and the
+controller releases only after observing that attempt on a still-live worker.
+All selected workers, both server topologies and every named point remain in
+the full held matrix. `holds.py` verifies the full normal trace plus exact
+hold/competitor/progress/restore orders and missing or duplicate records.
+
+Synthetic fixtures now include complete direct/forwarded traces at 1/2/4/8
+workers, load/store and both topologies; every applicable held identity and
+point; full 110-event warmup/proof samples; and destructive control/hold
+mutations. Real dummy children exercise the retained runner's restoration,
+negative, held and mismatch consumers. These are fabricated inputs, not
+Mach/publication execution or host evidence.
+
+The R1–R5 return raises internal receive timeout to60s so it cannot preempt
+the parent's30s total/5s no-progress watchdog. In receive-right destruction,
+the receiver waits for the worker's completed action record before emitting
+its specific owned-port-death terminal record. Consumers reject unrelated
+explicit exits and resource signals; memory-fault signals, the declared parent
+watchdog, and the exact owned-port-death API result remain distinct categories.
+Other terminal outcomes stay unresolved rather than being counted as controls.
+
+Forwarding must follow front attribution and prior delivery/reply, then precede
+the front reply. The restored-prior proof must finish commit/disarm before its
+proof marker and initial-route restoration. Send-completion logging may still
+follow recipient resumption. Raw PC/SP checks are tied to the asserted
+non-opaque arm64 layout; the native build refuses an opaque layout.
+
+The after-receive hold now retains a bounded `received_message` record after
+successful receive and owned-port lookup, before envelope/NDR/count/trailer
+validation. Its bytes must match the later validated `wire` record, which the
+hold consumer requires after release. Other hold points retain their original
+positions. These corrections still require independent return acceptance.
+
+Full topology/signing/JIT observations, all remaining held identities/cells,
+transport-spoofing preflight fixtures, replication and independent findings
+review remain owed. No source or synthetic acceptance proves Q19 composition,
+foreign-handler compatibility, broad state completeness or any timing result.
+
+The receive-error correction records the actual attempted receive port, registered
+owner/role, Mach return and successful destruction publication in an explicit
+`M06-M1-receive-failure-v1` record. The investigation owns its pending review and
+failed-run interpretation. Build-only reporter validation (no Mach receive or
+fault execution) is `python3 -B test_receive_failure.py --build <retained-build>`;
+it uses that build's retained production source and generated MIG inputs.

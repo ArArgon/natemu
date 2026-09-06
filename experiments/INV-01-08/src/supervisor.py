@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""F08-2 external exact-child watchdog and pre-execution review gate.
-
-No invocation is authorized by this program's presence. An external envelope
-binding actual accepted reviews is mandatory, including instrument evidence
-for full runs. Validation controls never authorize timing findings.
-"""
+"""External snapshot build and exact-child watchdog; reviews live in the investigation."""
 import argparse
 import json
 import os
@@ -12,33 +7,70 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import shutil
+import uuid
+import signal
 
 sys.dont_write_bytecode = True
-from authorization import (EXPERIMENT, REPO, bundle, canonical, digest, external,
-                           file_sha, json_read, live_context, load_authorization, require)
+from evidence import (EXPERIMENT, REPO, bundle, canonical, digest, external,
+                           file_sha, json_read, live_context, require)
 from fallback import validate_fallback, validate_full_counts
 
 MODES = {"normal": 600, "negative": 600, "fallback-only": 60,
          "fallback-drop-write": 60, "fallback-lock-error": 60, "unexpected-fault": 5}
 
 
-def supervise(command, stdout, stderr, timeout, env=None):
-    """Only this exact child is killed/reaped. Files avoid pipe saturation."""
+CAMPAIGN_MODES = ("normal", "negative", "fallback-drop-write", "fallback-lock-error", "unexpected-fault")
+CAMPAIGN_SECONDS = 45 * 60
+CAMPAIGN_BYTES = 128 * 1024 * 1024
+
+
+def output_bytes(directory):
+    return sum(p.stat().st_size for p in Path(directory).rglob("*") if p.is_file())
+
+
+def supervise(command, stdout, stderr, timeout, env=None, *, output_root=None, max_bytes=None):
+    """A campaign owns a process group; ordinary native children inherit it."""
     start = time.monotonic_ns()
+    grouped = output_root is not None
+    timed_out = limited = False
+    size = 0
     with open(stdout, "xb") as out, open(stderr, "xb") as err:
-        child = subprocess.Popen(command, stdout=out, stderr=err, env=env)
-        timed_out = False
+        child = subprocess.Popen(command, stdout=out, stderr=err, env=env, start_new_session=grouped)
+        def stop():
+            if grouped:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                child.kill()
         try:
-            code = child.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            child.kill()
-            code = child.wait()
+            if grouped:
+                while True:
+                    size = output_bytes(output_root)
+                    limited = size >= max_bytes
+                    timed_out = (time.monotonic_ns() - start) / 1e9 >= timeout
+                    code = child.poll()
+                    if limited or timed_out or code is not None:
+                        break
+                    time.sleep(0.02)
+                # Also clean any descendant that survived its direct parent.
+                stop()
+                code = child.wait()
+            else:
+                try:
+                    code = child.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    stop()
+                    code = child.wait()
         except BaseException:
-            child.kill()
+            stop()
             child.wait()
             raise
-    return {"returncode": code, "timed_out": timed_out,
+    return {"returncode": code, "timed_out": timed_out, "output_limited": limited,
+            "output_bytes": size, "output_limit_bytes": max_bytes,
             "watchdog_seconds": timeout, "supervisor_elapsed_ns": time.monotonic_ns() - start}
 
 
@@ -199,77 +231,91 @@ def environment():
     for command in commands:
         p = subprocess.run(command, capture_output=True, text=True, timeout=10)
         result.append({"command": command, "returncode": p.returncode, "stdout": p.stdout, "stderr": p.stderr})
-    sdk = Path(subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()).resolve(strict=True)
-    return {"commands": result, "sdk_resolved": str(sdk), "header_sha256": {
-        name: file_sha(sdk / name) for name in ("usr/include/mach/mach_time.h", "usr/include/mach/thread_policy.h",
-                                               "usr/include/pthread/qos.h")}}
+    return {"commands": result}
 
 
-def native_authorize(args):
-    auth_path, out, mode, numer, denom, revision, compiled_bundle = args
-    root = os.environ["NATEMU_RAW_ROOT"]
-    destination = external(out, root)
+def native_check(args):
+    out, compiled = args
+    destination=external(out, os.environ["NATEMU_RAW_ROOT"])
     require(not destination.exists(), "result must not exist before launch")
-    a = load_authorization(auth_path, mode, int(numer), int(denom))
-    require(a["code_revision"] == revision, "binary built from a different revision")
-    # REV-210 R3: this is the actual compiled-source digest baked into the
-    # binary at build time (Makefile's F08_COMPILED_BUNDLE), independently of
-    # whatever environment variable it is about to be launched with. A
-    # binary compiled from dirty/unreviewed source cannot pass this even if
-    # the tree is later restored to the accepted, clean revision.
-    require(a["code_bundle_sha256"] == compiled_bundle, "compiled source-bundle digest differs from authorization")
-    require(os.environ.get("NATEMU_F08_AUTH_SHA256") == file_sha(auth_path) and
-            os.environ.get("NATEMU_F08_BUNDLE_SHA256") == a["code_bundle_sha256"], "native provenance environment mismatch")
+    require(os.environ.get("NATEMU_F08_SOURCE_SHA256")==compiled, "compiled source differs from producing build")
+    require(__import__("re").fullmatch(r"[0-9a-f]{32}",os.environ.get("NATEMU_F08_RUN_ID","")), "run identity missing")
     return 0
 
 
+def prepare(directory, run_id):
+    directory.mkdir(mode=0o700)
+    try:
+        snapshot=directory/"snapshot"
+        sources=bundle()
+        for name in sources:
+            target=snapshot/name
+            target.parent.mkdir(parents=True,exist_ok=True)
+            shutil.copy2(EXPERIMENT/name,target)
+        # Clock checker is a local build input, retained alongside the consumer.
+        clock=REPO/"experiments/INV-01-07/c1/clock_evidence.py"
+        shutil.copy2(clock,snapshot/"src/clock_evidence.py")
+        sources["src/clock_evidence.py"]=file_sha(clock)
+        require(all(file_sha(snapshot/name)==expected for name,expected in sources.items()), "snapshot changed during preparation")
+        sdk=subprocess.check_output(["xcrun","--sdk","macosx","--show-sdk-path"],text=True,timeout=10).strip()
+        command=["make","-C",str(snapshot),"BUILD="+str(directory/"build"),"REPO="+str(REPO),
+                 "BUNDLE="+digest(sources),"CC=clang","CFLAGS=-O2 -Wall -Wextra -Werror -std=c11 -isysroot "+sdk,"all","disasm"]
+        outcome="failed"
+        try:
+            with open(directory/"build.log","xb") as log:
+                subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=60)
+            outcome="built"
+        finally:
+            write_new(directory/"build-manifest.json",dict(schema="INV-01-08-build-v2",run_id=run_id,
+                      source_sha256=digest(sources),sources=sources,command=command,outcome=outcome,
+                      environment=environment(),artifacts={str(p.relative_to(directory)):file_sha(p)
+                                for p in sorted(directory.rglob("*")) if p.is_file()}))
+        return directory/"build-manifest.json"
+    except BaseException as exc:
+        if not (directory/"build-manifest.json").exists():
+            write_new(directory/"build-manifest.json",dict(schema="INV-01-08-build-v2",run_id=run_id,
+                      outcome="failed",error=dict(type=type(exc).__name__,message=str(exc)),
+                      artifacts={str(p.relative_to(directory)):file_sha(p) for p in directory.rglob("*") if p.is_file()}))
+        raise
+
+
 def run_child(args):
-    auth_path = Path(args.authorization).resolve(strict=True)
-    # Inspect reviewed timebase first; native guard verifies this against the
-    # actual mach_timebase_info response before it can measure or create raw.
-    prelim = json_read(auth_path)
-    if prelim.get("kind") == "evidence":
-        tb = prelim["clock"]["packet"]["context"]["timebase"]
-        numer, denom = tb["numer"], tb["denom"]
-        a = load_authorization(auth_path, args.mode, numer, denom)
-        context = live_context(numer, denom)
-    else:
-        a = load_authorization(auth_path, args.mode, live=False)
-        context = None
-    root = Path(os.environ["NATEMU_RAW_ROOT"]).resolve(strict=True)
-    require(subprocess.check_output(["sysctl", "-n", "hw.optional.arm.FEAT_LSE"], text=True).strip() == "1",
-            "required LSE host feature unavailable")
-    destination = external(args.directory, root)
-    destination.mkdir(mode=0o700)  # exclusive; never overwrite/reuse a run
-    args.created_directory = destination
-    result = destination / "result.json"
-    build = destination / "build"
-    build_command = ["make", "-C", str(EXPERIMENT), "BUILD=" + str(build), "CC=clang",
-                     "CFLAGS=-O2 -Wall -Wextra -Werror -std=c11", "all", "disasm"]
-    with open(destination / "build.log", "xb") as log:
-        subprocess.run(build_command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=60)
-    binary = build / "litmus"
+    root=Path(os.environ["NATEMU_RAW_ROOT"]).resolve(strict=True)
+    destination=external(args.directory,root)
+    destination.mkdir(mode=0o700)
+    args.created_directory=destination
+    result=destination/"result.json"
+    build_manifest=Path(args.build_manifest).resolve(strict=True)
+    build_data=json_read(build_manifest)
+    require(build_data["outcome"]=="built", "build incomplete")
+    from evidence import verify_files
+    verify_files(build_manifest.parent,build_data["artifacts"])
+    binary=build_manifest.parent/"build/litmus"
+    context=live_context(None,None)
+    require(subprocess.check_output(["sysctl","-n","hw.optional.arm.FEAT_LSE"],text=True,timeout=10).strip()=="1", "required LSE feature unavailable")
     before = environment()
     signing = subprocess.run(["codesign", "-d", "--entitlements", "-", str(binary)], capture_output=True, text=True, timeout=10)
     before["signing"] = {"returncode": signing.returncode, "stdout": signing.stdout, "stderr": signing.stderr}
     write_new(destination / "environment-before.json", before)
-    env = dict(os.environ, NATEMU_F08_AUTHORIZATION=str(auth_path),
-               NATEMU_F08_AUTH_SHA256=file_sha(auth_path), NATEMU_F08_BUNDLE_SHA256=a["code_bundle_sha256"],
-               NATEMU_RAW_ROOT=str(root))
-    command = [str(binary), "--mode", args.mode, "--out", str(result)]
-    write_new(destination / "invocation.json", {
-        "schema": "INV-01-08-invocation-v1", "command": command, "code_revision": a["code_revision"],
-        "binary_sha256": file_sha(binary), "code_bundle": bundle(), "build_command": build_command,
-        "authorization": {"path": str(auth_path), "sha256": file_sha(auth_path)},
-        "context": context, "load_average_before": os.getloadavg(),
-        "started_utc_ns": time.time_ns(), "prerequisite_validated_before_spawn": True})
-    receipt = supervise(command, destination / "stdout.txt", destination / "stderr.txt", MODES[args.mode], env)
-    receipt.update(schema="INV-01-08-supervisor-v1", mode=args.mode, context=context,
-                   authorization={"path": str(auth_path), "sha256": file_sha(auth_path)},
-                   authorization_validated_before_spawn=True, load_average_after=os.getloadavg(),
-                   result_sha256=file_sha(result) if result.exists() else None,
-                   stdout_sha256=file_sha(destination / "stdout.txt"), stderr_sha256=file_sha(destination / "stderr.txt"))
-    write_new(destination / "result.supervisor.json", receipt)
+    env=dict(os.environ,NATEMU_F08_SOURCE_SHA256=build_data["source_sha256"],
+             NATEMU_F08_RUN_ID=build_data["run_id"],NATEMU_F08_REPO=str(REPO),NATEMU_RAW_ROOT=str(root))
+    command=[str(binary),"--mode",args.mode,"--out",str(result)]
+    write_new(destination/"invocation.json",dict(schema="INV-01-08-invocation-v2",run_id=build_data["run_id"],
+              command=command,binary_sha256=file_sha(binary),build={"path":str(build_manifest),"sha256":file_sha(build_manifest)},
+              context=context,started_utc_ns=time.time_ns()))
+    receipt=supervise(command,destination/"stdout.txt",destination/"stderr.txt",MODES[args.mode],env)
+    if result.exists():
+        try: context["timebase"]=json_read(result)["timebase"]
+        except (ValueError,KeyError): pass
+    # Unexpected-fault emits no result; record the campaign's known timebase.
+    if context["timebase"]=={"numer":None,"denom":None} and getattr(args,"timebase",None):
+        context["timebase"]=args.timebase
+    sys.path.insert(0,str(build_manifest.parent/"snapshot/src"))
+    from clock_evidence import validate
+    timing=validate(args.clock,context)
+    receipt.update(schema="INV-01-08-supervisor-v2",mode=args.mode,run_id=build_data["run_id"],context=context,
+                   timing=timing,result_sha256=file_sha(result) if result.exists() else None)
+    write_new(destination/"result.supervisor.json",receipt)
     write_new(destination / "environment-after.json", environment())
     data = None
     if result.exists():
@@ -323,8 +369,9 @@ def run(args):
         with open(destination / "check.txt", "x") as stream:
             stream.write(output.getvalue())
         write_new(destination / "manifest.json", {
-            "schema": "INV-01-08-execution-manifest-v1", "mode": args.mode,
-            "classification_returncode": code, "code_bundle": bundle(),
+            "schema": "INV-01-08-execution-manifest-v2", "mode": args.mode,
+            "run_id": json_read(args.build_manifest)["run_id"],
+            "classification_returncode": code,
             "artifacts": {str(p.relative_to(destination)): file_sha(p)
                           for p in sorted(destination.rglob("*")) if p.is_file()}})
     print(output.getvalue(), end="")
@@ -332,52 +379,117 @@ def run(args):
 
 
 def campaign(args):
-    # All five runs are new and explicit. A failure stops promotion and is
-    # retained; no automatic rerun, exclusion or successful-arm rescue.
-    a = load_authorization(args.authorization, "normal", live=False)
-    require(a["kind"] == "evidence", "campaign requires prior clock evidence")
-    parent = external(args.directory, os.environ["NATEMU_RAW_ROOT"])
-    parent.mkdir(mode=0o700)
-    modes = ("normal", "negative", "fallback-drop-write", "fallback-lock-error", "unexpected-fault")
-    members = {}
-    for mode in modes:
-        child_args = argparse.Namespace(authorization=args.authorization, mode=mode, directory=str(parent/mode))
-        code = run(child_args)
+    parent=external(args.directory,os.environ["NATEMU_RAW_ROOT"])
+    if not args.campaign_worker:
+        campaign_start=time.monotonic_ns()
+        require(not args.prepared_build, "a campaign must prepare its own build")
+        parent.mkdir(mode=0o700)
+        run_id=uuid.uuid4().hex
+        write_new(parent/"schedule.json", dict(schema="INV-01-08-schedule-v3", run_id=run_id,
+                  modes=list(CAMPAIGN_MODES), native_seconds=1325,
+                  wall_seconds=CAMPAIGN_SECONDS, output_limit_bytes=CAMPAIGN_BYTES))
+        command=[sys.executable,"-B",str(Path(__file__).resolve()),"--campaign",
+                 "--directory",str(parent),"--campaign-worker"]
+        if args.clock:
+            command += ["--clock",str(args.clock)]
+        receipt={"returncode":None,"timed_out":False,"output_limited":False}
+        try:
+            receipt=supervise(command,parent/"campaign.stdout.txt",parent/"campaign.stderr.txt",
+                              CAMPAIGN_SECONDS,output_root=parent,max_bytes=CAMPAIGN_BYTES)
+        except BaseException as exc:
+            receipt["error"]={"type":type(exc).__name__,"message":str(exc)}
+        okay=(receipt.get("returncode")==0 and not receipt.get("timed_out") and
+              not receipt.get("output_limited") and not receipt.get("error"))
+        states={}
+        for mode in CAMPAIGN_MODES:
+            member=parent/mode/"manifest.json"
+            try:
+                states[mode]="completed" if json_read(member)["classification_returncode"]==0 else "invalid"
+            except (OSError,ValueError,KeyError):
+                states[mode]="interrupted" if (parent/mode).exists() else "not-run"
+        okay=okay and all(v=="completed" for v in states.values()) and (parent/"campaign.json").is_file()
+        receipt.update(schema="INV-01-08-campaign-supervisor-v3",run_id=run_id,
+                       status="completed" if okay else "failed",modes=states,
+                       artifacts={str(p.relative_to(parent)):file_sha(p)
+                                  for p in sorted(parent.rglob("*")) if p.is_file()})
+        receipt["supervisor_elapsed_ns"]=time.monotonic_ns()-campaign_start
+        receipt["output_bytes"]=output_bytes(parent)
+        if receipt["supervisor_elapsed_ns"] >= CAMPAIGN_SECONDS*10**9:
+            receipt["timed_out"]=True
+        # Include final accounting in successful-campaign admission. Failure
+        # diagnostics are retained even when the operational threshold was hit.
+        if receipt["output_bytes"]+len(canonical(receipt))+1 >= CAMPAIGN_BYTES:
+            receipt["output_limited"]=True
+        if receipt["timed_out"] or receipt["output_limited"]:
+            okay=False
+            receipt["status"]="failed"
+        write_new(parent/"campaign.supervisor.json",receipt)
+        print("Campaign checks completed; findings review required." if okay else
+              "Campaign failed; partial artifacts and not-run cells retained; no findings.")
+        return 0 if okay else 1
+    schedule=json_read(parent/"schedule.json")
+    run_id=schedule["run_id"]
+    if args.prepared_build:
+        build=args.prepared_build.resolve(strict=True)
+        require(json_read(build)["run_id"]==run_id,"prepared build identity differs")
+    else:
+        build=prepare(parent/"producing-build",run_id)
+        os.environ["NATEMU_F08_REPO"]=str(REPO)
+        command=[sys.executable,"-B",str(build.parent/"snapshot/src/supervisor.py"),
+                 "--campaign","--campaign-worker","--directory",str(parent),
+                 "--prepared-build",str(build)]
+        if args.clock:
+            command += ["--clock",str(args.clock)]
+        os.execv(sys.executable,command)
+    members={}; tb=None
+    for mode in CAMPAIGN_MODES:
+        child_args=argparse.Namespace(mode=mode,directory=str(parent/mode),build_manifest=build,clock=args.clock,timebase=tb)
+        code=run(child_args)
         if code:
-            write_new(parent / "campaign-failure.json", {"mode": mode, "returncode": code, "timing_eligible": False})
+            write_new(parent/"campaign-failure.json",dict(schema="INV-01-08-campaign-failure-v3",run_id=run_id,mode=mode,returncode=code,timing_eligible=False))
             return 1
-        manifest = parent/mode/"manifest.json"
-        members[mode] = {"path": str(manifest), "sha256": file_sha(manifest)}
-    write_new(parent / "campaign.json", {"schema": "INV-01-08-campaign-v1", "members": members})
-    import check
-    import contextlib
-    import io
-    output = io.StringIO()
-    with contextlib.redirect_stdout(output):
-        code = check.cli([str(parent/"normal/result.json")])
-    with open(parent / "campaign-check.txt", "x") as stream:
-        stream.write(output.getvalue())
-    print(output.getvalue(), end="")
-    return code
+        receipt=json_read(parent/mode/"result.supervisor.json")
+        tb=receipt["context"]["timebase"]
+        manifest=parent/mode/"manifest.json"
+        members[mode]={"path":str(manifest),"sha256":file_sha(manifest)}
+    write_new(parent/"campaign.json",dict(schema="INV-01-08-campaign-v3",run_id=run_id,members=members))
+    # Full packet/control validation runs inside the outer budget. This private
+    # pre-finalization check cannot qualify a result: consumers require the
+    # outer receipt, which only the waiting parent writes after this exits.
+    from evidence import validate_campaign
+    validate_campaign(parent/"normal/result.json",json_read(build),supervision_required=False)
+    return 0
 
 
 def cli(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     try:
-        if argv and argv[0] == "--native-authorize":
-            require(len(argv) == 8, "native authorization arguments")
-            return native_authorize(argv[1:])
+        if argv and argv[0] == "--native-check":
+            require(len(argv) == 3, "native output/build check arguments")
+            return native_check(argv[1:])
         if argv == ["--bundle"]:
             print(json.dumps({"files": bundle(), "sha256": digest(bundle())}, sort_keys=True, indent=2))
             return 0
         parser = argparse.ArgumentParser(description=__doc__)
-        parser.add_argument("--authorization", required=True)
+        parser.add_argument("--clock", type=Path)
+        parser.add_argument("--prepared-build", type=Path, help=argparse.SUPPRESS)
+        parser.add_argument("--campaign-worker", action="store_true", help=argparse.SUPPRESS)
         parser.add_argument("--directory", required=True)
         group = parser.add_mutually_exclusive_group(required=True)
         group.add_argument("--mode", choices=MODES)
         group.add_argument("--campaign", action="store_true")
         args = parser.parse_args(argv)
-        return campaign(args) if args.campaign else run(args)
+        if args.campaign:
+            return campaign(args)
+        destination=external(args.directory,os.environ["NATEMU_RAW_ROOT"])
+        # Keep the selected result directory fresh; build is its fresh sibling.
+        if not args.prepared_build:
+            build=prepare(destination.with_name(destination.name+"-build"),uuid.uuid4().hex)
+            os.environ["NATEMU_F08_REPO"]=str(REPO)
+            os.execv(sys.executable,[sys.executable,"-B",str(build.parent/"snapshot/src/supervisor.py"),
+                      *sys.argv[1:],"--prepared-build",str(build)])
+        args.build_manifest=args.prepared_build
+        return run(args)
     except Exception as exc:
         print(f"F08 refused/invalid ({type(exc).__name__}); no findings", file=sys.stderr)
         return 2

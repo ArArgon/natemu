@@ -46,7 +46,7 @@ def main(argv=None):
     try:
         raw_root = os.environ.get("NATEMU_RAW_ROOT")
         core.require(bool(raw_root), "missing-NATEMU_RAW_ROOT")
-        repository = Path(__file__).resolve().parents[3]
+        repository = artifact.repository()
         record, hashes = artifact.load_child(args.child_directory, raw_root, str(repository))
         findings = cells.validate_child(record)
         output = {"status": "STRUCTURAL_PASS", "evidence_approval": False,

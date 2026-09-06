@@ -9,7 +9,8 @@ adjudicated at the result gate.
 import json
 import sys
 
-DEADLINE_MECHS = ("mach_wait_until", "dispatch_source_timer_leeway0")
+DEADLINE_MECHS = ("mach_wait_until", "dispatch_source_timer_leeway0",
+                  "dispatch_source_timer_strict")
 CLOCKS = {
     "mach_absolute_time",
     "clock_gettime_nsec_np(CLOCK_UPTIME_RAW)",
@@ -116,6 +117,14 @@ def main(path):
     neg = [(s["mechanism"], s["qos"], s["min_ns"]) for s in signal
            if s["min_ns"] < 0]
     rule(not neg, "I10 signal latency non-negative", f"{neg[:4]}")
+
+    bad_rtt = [(s.get("mechanism"), s.get("qos")) for s in signal
+               if not all(is_u64(s.get(key), positive=True) for key in
+                          ("roundtrip_min_ns", "roundtrip_p50_ns",
+                           "roundtrip_p99_ns", "roundtrip_max_ns"))
+               or not (s["roundtrip_min_ns"] <= s["roundtrip_p50_ns"]
+                       <= s["roundtrip_p99_ns"] <= s["roundtrip_max_ns"])]
+    rule(not bad_rtt, "I10b positive ordered sender round-trip domains", str(bad_rtt))
 
     lost = [(s["mechanism"], s["qos"], s["lost"]) for s in signal
             if s["lost"] > 0]

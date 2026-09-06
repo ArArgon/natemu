@@ -196,13 +196,14 @@ static void authorize(const char *output) {
     demand(size > 0 && (size_t)size < sizeof expected && offset == (size_t)size
            && memcmp(received, expected, offset) == 0, "launch-binding-mismatch");
     /* An exact matching parent is an accidental-bypass guard, not proof that
-     * a hostile parent is trusted. Runner196 verifies actual reviewed bytes. */
+     * a hostile parent is trusted. The runner verifies retained build bytes. */
 }
 
 static void open_output(const char *output) {
     char root[PATH_MAX], repo[PATH_MAX], parent[PATH_MAX], resolved[PATH_MAX];
     canonical(getenv("NATEMU_RAW_ROOT"), root, "raw-root");
-    canonical(C1_REPO, repo, "repository");
+    demand(C1_REPO[0] == '/' && strlen(C1_REPO) < sizeof repo, "repository-path");
+    memcpy(repo, C1_REPO, strlen(C1_REPO) + 1);
     demand(strcmp(root, "/") != 0 && !within(root, repo) && !within(repo, root), "root-overlap");
     demand(output && output[0] == '/' && strlen(output) < sizeof parent, "output-path");
     memcpy(parent, output, strlen(output) + 1);
@@ -219,8 +220,9 @@ static void open_output(const char *output) {
     struct stat s;
     demand(stat(root, &s) == 0 && S_ISDIR(s.st_mode), "raw-root-directory");
     char identity[PATH_MAX];
-    int n = snprintf(identity, sizeof identity, "%s/.git", repo);
-    demand(n > 0 && (size_t)n < sizeof identity && stat(identity, &s) == 0, "repository-identity");
+    /* Keep the original output exclusion even after its checkout is removed. */
+    if (realpath(repo, identity)) demand(strcmp(identity, repo) == 0, "repository-alias");
+    else demand(errno == ENOENT, "repository-path");
     if (mkdir(output, 0700)) die("output-not-fresh", "mkdir", errno);
     directory_fd = open(output, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
     if (directory_fd < 0) die("output-directory", "open", errno);
@@ -298,10 +300,19 @@ static __attribute__((noinline)) uint64_t reader_mach(uint64_t *row) {
     return row[0] = mach_absolute_time();
 }
 
-static __attribute__((noinline)) uint64_t reader_nsec_np(uint64_t *row) {
-    uint64_t value = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+static __attribute__((noinline)) uint64_t checked_nsec(uint64_t *row, uint64_t value) {
     if (!value) clock_failure("nsec-zero", "clock_gettime_nsec_np", 0, errno);
     return row[0] = value;
+}
+
+static __attribute__((noinline)) uint64_t reader_nsec_np(uint64_t *row) {
+    return checked_nsec(row, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+}
+
+static __attribute__((noinline)) uint64_t reader_zero_nsec(uint64_t *row) {
+    injected = true;
+    errno = EINVAL;
+    return checked_nsec(row, 0);
 }
 
 static clockid_t generic_clock_id;
@@ -319,16 +330,13 @@ static __attribute__((noinline)) uint64_t reader_generic(uint64_t *row) {
 
 /* Resolved once per cell, strictly before the timed loop. All cell-id/mode
  * string comparisons for fault injection happen only here, never inside a
- * reader. The zero-nsec seam fires on cell1's very first nsec_np read either
- * way (nothing meaningful precedes it), so failing here instead of inside
- * the timed loop is observably identical and pays zero per-read cost. */
+ * reader. The negative reader supplies zero to the same checked return path
+ * as the real API. It must not call clock_failure directly: that would test
+ * only error reporting and could miss a broken zero-return guard. */
 static reader_fn resolve_reader(int id, int clock) {
     if (clock == 0) return reader_mach;
     if (clock != 1) { generic_clock_id = clock_ids[clock]; return reader_generic; }
-    if (id == 1 && strcmp(mode, "zero-nsec") == 0) {
-        injected = true;
-        clock_failure("nsec-zero", "clock_gettime_nsec_np", 0, EINVAL);
-    }
+    if (id == 1 && strcmp(mode, "zero-nsec") == 0) return reader_zero_nsec;
     return reader_nsec_np;
 }
 

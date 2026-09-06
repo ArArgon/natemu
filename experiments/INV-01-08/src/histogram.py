@@ -9,7 +9,7 @@ import re
 CELLS = {"r0=0,r1=0", "r0=0,r1!=0", "r0!=0,r1=0", "r0!=0,r1!=0"}
 CONTEXT_FIELDS = {
     "host_id", "host_model", "os_build", "sdk", "features", "signing",
-    "topology", "stimulus_layout", "method_revision", "code_revision",
+    "topology", "stimulus_layout", "method_revision", "build_id",
 }
 
 
@@ -94,15 +94,10 @@ def verified_bytes(base, item):
 
 
 def load_cohort(path):
-    """A review binds exact declarations; it is not inferred from host labels.
-
-    Review authenticity/independence and declarations' factual support remain
-    research-review obligations. Here we check the explicit accepted record,
-    its digest and exact cohort binding, run identities, and equal strata.
-    """
+    """Check explicit cohort artifacts and equal strata; review judges applicability."""
     path = Path(path).resolve()
     envelope = json.loads(path.read_text())
-    if envelope.get("schema") != "INV-01-08-cohort-v1":
+    if envelope.get("schema") != "INV-01-08-cohort-v2":
         raise ValueError("cohort: unsupported schema")
     cohort = envelope["cohort"]
     if not isinstance(cohort.get("id"), str) or not cohort["id"].strip():
@@ -111,20 +106,8 @@ def load_cohort(path):
         raise ValueError("cohort: missing compatibility justification")
     members = cohort.get("runs")
     if not isinstance(members, list) or len(members) < 2:
-        raise ValueError("cohort: at least two explicitly reviewed runs required")
-    review_path, review_bytes = verified_bytes(path.parent, envelope["review"])
-    review = review_bytes.decode("utf-8")
+        raise ValueError("cohort: at least two explicitly identified runs required")
     digest = cohort_digest(cohort)
-    required = {
-        "Review ID": r"`REV-\d{3}`",
-        "Independence": "`independent`",
-        "Verdict": "`accept`",
-        "Cohort SHA-256": f"`{digest}`",
-    }
-    if not all(len(values := re.findall(rf"^- {key}: (.*)$", review, re.MULTILINE)) == 1
-               and re.fullmatch(pattern, values[0].strip())
-               for key, pattern in required.items()):
-        raise ValueError("cohort: independently accepted review does not bind this exact cohort")
     runs, seen_paths, seen_hashes, seen_manifests = [], set(), set(), set()
     expected_context = None
     for member in members:
@@ -136,8 +119,8 @@ def load_cohort(path):
             raise ValueError("cohort: incompatible contexts (reviewed exceptions are not implemented)")
         expected_context = context
         manifest = member.get("manifest")
-        if not isinstance(manifest, str) or not re.fullmatch(r"MAN-01-08-\d{2}", manifest):
-            raise ValueError("cohort: missing INV-01-08 manifest identity")
+        if not isinstance(manifest, str) or not manifest.strip():
+            raise ValueError("cohort: missing retained run identity")
         result_path, raw = verified_bytes(path.parent, member)
         sha = member["sha256"]
         if result_path in seen_paths or sha in seen_hashes or manifest in seen_manifests:
@@ -148,5 +131,15 @@ def load_cohort(path):
         data = json.loads(raw)
         if data.get("mode") != "normal" or data.get("experiment") != "INV-01-08":
             raise ValueError("cohort: only normal INV-01-08 runs can pool")
+        if data.get("schema")=="INV-01-08-result-v3":
+            invocation=json.loads((result_path.parent/"invocation.json").read_text())
+            receipt=json.loads((result_path.parent/"result.supervisor.json").read_text())
+            if context["build_id"]!=invocation["build"]["sha256"]:
+                raise ValueError("cohort: declared build differs from producing build")
+            for key in ("host_id","host_model","os_build"):
+                if context[key]!=receipt["context"][key]:
+                    raise ValueError("cohort: declared host differs from producer")
+        elif "schema" in data:
+            raise ValueError("cohort: historical formats require original reader")
         runs.append((str(result_path), data))
-    return cohort["id"], digest, str(review_path), runs
+    return cohort["id"], digest, str(path), runs

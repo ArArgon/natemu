@@ -22,6 +22,12 @@ NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}\.bin\Z")
 DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
 
+def repository():
+    context = Path(__file__).resolve().parent / "source-context.json"
+    return (Path(json.loads(context.read_text())["repository"]) if context.exists()
+            else Path(__file__).resolve().parents[3])
+
+
 def object_pairs(pairs):
     result = {}
     for key, value in pairs:
@@ -43,15 +49,12 @@ def canonical_directory(value, code):
 
 def validate_locations(directory, external_root, repository):
     root = canonical_directory(external_root, "raw-root")
-    repo = canonical_directory(repository, "repository")
+    repo = Path(repository)
+    core.require(repo.is_absolute() and repo.resolve(strict=False) == repo, "repository-canonical")
     child = canonical_directory(directory, "child-directory")
     core.require(root != repo and not root.is_relative_to(repo), "repository-internal-root")
     core.require(child != root and child.is_relative_to(root)
                  and not child.is_relative_to(repo), "child-outside-external-root")
-    # A caller cannot label an arbitrary directory as the project identity.
-    core.require((repo / "AGENTS.md").is_file()
-                 and (repo / "docs/research/investigations/INV-01-07.md").is_file()
-                 and (repo / ".git").exists(), "unresolved-repository")
     return child
 
 

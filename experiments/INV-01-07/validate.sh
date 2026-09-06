@@ -11,6 +11,7 @@ sh -n "$SCRIPT_DIR/run.sh"
 make -C "$SCRIPT_DIR" BUILD="$TMP_DIR/build"
 "$TMP_DIR/build/timers" --control-selftest
 python3 "$SCRIPT_DIR/src/check.py" "$SCRIPT_DIR/tests/valid.json"
+python3 "$SCRIPT_DIR/tests/rev184-regressions.py"
 python3 "$SCRIPT_DIR/tests/control-fixtures.py" \
     "$SCRIPT_DIR/src/check.py" "$SCRIPT_DIR/tests/valid.json" \
     "$TMP_DIR/build/timers"

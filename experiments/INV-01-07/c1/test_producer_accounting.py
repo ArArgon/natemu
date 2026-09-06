@@ -5,7 +5,7 @@ C buffers (main's/preflight's own struct json, clock_cell's elapsed[200]).
 producer.c's preflight() now sums named, sizeof-based local-buffer terms into
 `named_stack` and asserts it fits STACK_BUFFER_RESERVE. This test does not
 trust that formula: it independently re-derives, from a plain reading of
-every named local >= 8 bytes in producer.c, the true worst-case sum of
+the enumerated major automatic buffers/records in producer.c, the sum of
 locals that could be live in one probe run, using real compiled sizeof()
 values (not producer.c's own arithmetic) for the platform ABI, and requires
 the declared named_stack expression to dominate it. No producer execution,
@@ -18,7 +18,8 @@ and `open_output()`'s `struct stat`, `phase_json`'s `tag[32]`, `main`'s
 `resolution`, and the per-cell timed reader's own local), and `add()`'s
 `va_list` (~408 bytes). `true_sum` below now includes them and its value
 (`README.md`'s "Total (independent enumeration)" row) is asserted directly,
-not merely dominated, so a future omission cannot silently narrow the claim.
+not merely dominated, so changes to this enumeration remain visible. Small omitted locals are covered
+by the separate conservative scratch allowance; this is not an exhaustive list.
 """
 import re
 import subprocess
@@ -38,13 +39,54 @@ def compiler_available():
 
 @unittest.skipUnless(compiler_available(), "no Apple clang toolchain on this host")
 class ProducerStackAccounting(unittest.TestCase):
+    def test_zero_return_control_uses_real_guard(self):
+        # Synthetic values only: neither variant invokes a host clock API.
+        # Removing the production guard must make this control fail to fail.
+        source = PRODUCER.read_text(encoding="utf-8")
+        guard = 'if (!value) clock_failure("nsec-zero", "clock_gettime_nsec_np", 0, errno);'
+        start = source.index('uint64_t checked_nsec(')
+        position = source.index(guard, start)
+        mutated = source[:position] + source[position:].replace(guard, '(void)value;', 1)
+        harness = '''
+#undef main
+int main(int argc, char **argv) {
+    if (argc != 2) return 98;
+    directory_fd = open(argv[1], O_RDONLY | O_DIRECTORY);
+    if (directory_fd < 0) return 97;
+    uint64_t row[4] = {0};
+    if (checked_nsec(row, 42) != 42 || row[0] != 42) return 96;
+    mode = "zero-nsec";
+    current_cell = 1;
+    reader_fn reader = resolve_reader(1, 1);
+    reader(row);
+    return 99;
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="c1-zero-guard-") as tmp:
+            directory = Path(tmp)
+            for name, text, expected in (("guarded", source, 2), ("mutated", mutated, 99)):
+                code = directory / (name + ".c")
+                code.write_text('#define main producer_main\n' + text + harness)
+                binary = directory / name
+                compiled = subprocess.run(
+                    ["xcrun", "clang", "-std=c11", "-O2", "-pthread",
+                     '-DC1_REPO="/synthetic/repository"', str(code), "-o", str(binary)],
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(compiled.returncode, 0, compiled.stderr)
+                output = directory / (name + "-output")
+                output.mkdir()
+                result = subprocess.run([str(binary), str(output)],
+                                        capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual((output / "api-failure.json").exists(), name == "guarded")
+
     def test_named_stack_formula_dominates_independently_enumerated_locals(self):
         source = PRODUCER.read_text(encoding="utf-8")
         match = re.search(r"uint64_t named_stack = (.*?);\n", source, re.S)
         self.assertIsNotNone(match, "producer.c's named_stack statement moved or was renamed")
         expression = match.group(1)
 
-        # A second, independent enumeration of every named local >= 8 bytes
+        # A second, independent enumeration of major local buffers/records
         # in producer.c, read function by function (not copied from the
         # producer's own comment/formula):
         #   die(): buffer[1024]

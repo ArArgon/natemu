@@ -1,13 +1,15 @@
 # INV-01-07 — host clock, timer, and cross-thread event probe
 
-What it measures, for `Q-01-07` and kill assumption `KA-05`. Method:
-[`docs/research/investigations/INV-01-07.md`](../../docs/research/investigations/INV-01-07.md),
-"Method" and "Metrics". Existing manifests
-`docs/research/manifests/MAN-01-07-01.md` and `MAN-01-07-02.md` both record
-integrity failures and produce no claim.
+Current execution stages are the accepted clock-only [C1](c1/README.md) and
+proposed raw timer/event [T2](t2/README.md). T2 requires independent pre-execution
+review; no new timer execution is authorized by this README. The owning
+[investigation](../../docs/research/investigations/INV-01-07.md) governs scope.
 
-This is a capability probe. It compares against no baseline, produces no
-performance result, and selects no design.
+The following documents the **historical combined probe**, including its old
+commands and output. REV-184 found omitted strict no-early/positive-RTT checks,
+unretained actual dispatch deadlines, and nominal concurrent rates with no
+per-worker observations. The new aggregate checker predicates have synthetic
+regressions; that change does not rehabilitate the old measurement or its claims.
 
 ## Arms
 
@@ -16,9 +18,9 @@ performance result, and selects no design.
 | Clocks | `mach_absolute_time`; `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)`; `clock_gettime` with `CLOCK_MONOTONIC_RAW`, `CLOCK_MONOTONIC`, `CLOCK_UPTIME_RAW`, `CLOCK_REALTIME`. Per clock: `clock_getres`, read cost (p50/p99 ns over 200 batches of 1000 reads), smallest observed forward step, and backward-read count over 200 000 reads. |
 | Cross-thread clock | 4 threads × 200 000 timestamps taken under one mutex; counts inversions and the worst backward step. Routed here by `BP-01-12-start` as the overlap-evidence comparability question. |
 | Wakeup | {`mach_wait_until`, `nanosleep`, `dispatch_source` timer with leeway 0, `dispatch_source` timer with `DISPATCH_TIMER_STRICT`} × {100 µs, 1 ms, 10 ms} × {user-interactive, background} QoS. 2000 samples per arm. Reports min/p50/p99/max of (wake − deadline) and a count of samples that returned before the deadline. The strict arm is required because the cited man page documents leeway 0 as leaving "the lower limit ... under the control of the system" and names `DISPATCH_TIMER_STRICT` as the documented opt-out; without it a threshold miss attributed to dispatch would be confounded with an unexercised mitigation. Each arm also emits its own dispatch setup cost and a timebase-conversion control measured on `CLOCK_UPTIME_RAW`, which needs no timebase arithmetic. |
-| Timebase-conversion control | The accepted method brackets each same-thread wait with ordered reads `m0_outer,c0,base_abs … woke,c1,m1_outer`. `I16a` requires the independent `c1-c0` interval to lie between the converted-Mach inner and outer intervals with six-quantum slack, independently derived and capped at 0.5% of target. `I16b` requires at least one bracket no wider than 0.5% per same-thread arm. Both QoS classes are enforced; dispatch is report-only because its wake timestamp is cross-thread. Independent code return `REV-145` accepts the implementation at `626bbe1`; that containment acceptance is historical. The later directional-bound method was accepted at `REV-153`. Its reporting-code implementation is independently accepted at `REV-162`; a fresh run is eligible after the reviewed method/code are committed. |
-| Cross-thread events | {`pthread_cond_signal`, `dispatch_semaphore_signal`, `pthread_kill(SIGUSR1)` to a **spinning** thread} × {user-interactive, background}. Each sample also records a **round trip** measured entirely on the sender's clock, because the one-way figure subtracts two threads' timestamps and no source in the inventory states that the clock is a system-wide comparable time base; the full round trip bounds the causal forward component for the same completed sample, while half does not without an unestablished symmetry assumption. Cross-thread timestamp differences remain diagnostic only; empirical quantiles are not future or worst-case bounds. `REV-153` accepts the directional-bound correction. The current reporting implementation emits the full round-trip p99 and passed independent code return `REV-162`. 2000 samples per arm. The `pthread_kill` arm measures one documented per-thread signal mechanism against two parked-thread wake mechanisms. Within the mechanism set this investigation surveys it is the only member that reaches an executing rather than a parked target (`CLM-01-07-18`); the source set does not establish that it is the only such public mechanism overall, and no claim says so. |
-| Concurrent wakeup | `mach_wait_until` at a 1 ms target, user-interactive, with 2, 4, and 8 concurrent timer threads, 2000 samples per thread. The declared guest requirement is a 1 kHz tick *per vCPU* at 2/4/8 vCPUs, so a single-thread arm cannot speak to the aggregate rate. Samples are pooled across threads: reporting per-thread separately would be a placement statement, which `CLM-01-07-08` forbids. |
+| Timebase-conversion control | The accepted method brackets each same-thread wait with ordered reads `m0_outer,c0,base_abs … woke,c1,m1_outer`. `I16a` requires the independent `c1-c0` interval to lie between the converted-Mach inner and outer intervals with six-quantum slack, independently derived and capped at 0.5% of target. `I16b` requires at least one bracket no wider than 0.5% per same-thread arm. Both QoS classes are enforced; dispatch is report-only because its wake timestamp is cross-thread. |
+| Cross-thread events | {`pthread_cond_signal`, `dispatch_semaphore_signal`, `pthread_kill(SIGUSR1)` to a **spinning** thread} × {user-interactive, background}. Each sample also records a **round trip** measured entirely on the sender's clock, because the one-way figure subtracts two threads' timestamps and no source in the inventory states that the clock is a system-wide comparable time base; the full round trip bounds the causal forward component for the same completed sample, while half does not without an unestablished symmetry assumption. Cross-thread timestamp differences remain diagnostic only; empirical quantiles are not future or worst-case bounds. The implementation emits the full round-trip p99. 2000 samples per arm. The `pthread_kill` arm measures one documented per-thread signal mechanism against two parked-thread wake mechanisms. Within the mechanism set this investigation surveys it is the only member that reaches an executing rather than a parked target (`CLM-01-07-18`); the source set does not establish that it is the only such public mechanism overall, and no claim says so. |
+| Concurrent wakeup | `mach_wait_until` at a 1 ms target, user-interactive, with 2, 4, and 8 concurrent timer threads, 2000 samples per thread. The declared guest requirement is a 1 kHz tick *per vCPU* at 2/4/8 vCPUs, so a single-thread arm cannot speak to the aggregate rate. Historical samples are pooled across threads. Thread identity is not core placement; achieved cadence and per-thread distributions were not collected and cannot be recovered from that pooled output. |
 | Affinity | `thread_policy_set(THREAD_AFFINITY_POLICY, tag=1)` return code, recorded so the P/E placement stratum question (`Q-05-06`) has a platform fact rather than an assumption. |
 
 Core placement is not directly requested anywhere. QoS is the documented
@@ -87,10 +89,10 @@ does not reduce them:
 
 ## Per-rule checker validation
 
-This table describes the containment revision accepted at `REV-145`.
+This table describes the retained containment checker.
 `--negative` reaches only part of the checker, so fixtures under `tests/`
-cover the rest and `validate.sh` fails if any invalid fixture passes. Both
-self and independent preflight passed; the code gate is closed.
+cover the rest and `validate.sh` fails if any invalid fixture passes. Current
+limitations and research status belong to the investigation.
 
 | Rule | Validated by |
 | --- | --- |
@@ -116,7 +118,7 @@ self and independent preflight passed; the code gate is closed.
 
 ## Checker
 
-The accepted `src/check.py result.json` separates two kinds of judgement as
+The historical `src/check.py result.json` separates two kinds of judgement as
 follows:
 
 - **Integrity rules (`I0`–`I17`, with `I16a`/`I16b`)** detect a defective measurement; any failure
@@ -128,7 +130,7 @@ follows:
 - **Decision thresholds (`T1`–`T4`)** are the predeclared `KA-05` bars from the
   investigation, each printed with its derivation. They are reported as
   MEET/MISS and never fail the checker: a MISS is a finding about the host that
-  the result gate adjudicates, not a code defect. They are suppressed entirely
+  findings review adjudicates. They are suppressed entirely
   when any integrity rule has failed, so no threshold is ever reported MEET on
   a value from a defective run. `T1` is restricted to the monotonic clocks,
   because `CLM-01-07-11` is a claim about a monotonic clock and the settable

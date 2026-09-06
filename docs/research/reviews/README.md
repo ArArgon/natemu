@@ -1,11 +1,12 @@
 # Review records
 
-One file per review, copied from the
-[critique template](../templates/critique.md). Every file here has a matching
-row in the [review ledger](../review-ledger.md); a review not in the ledger
-has not happened.
+New reviews follow [the workflow](../README.md#review-practice) and
+[review template](../templates/critique.md): one thread per investigation and step,
+created when needed, with corrections and returns in that thread.
+Use `INV-<track>-<nn>-pre-execution.md` or `INV-<track>-<nn>-findings.md`.
 
-- Identifier: `REV-<nnn>`, a three-digit sequence across all review types,
-  per the [identifier table](../README.md#identifiers), for example `REV-017`.
-- Filename: `<identifier>.md`.
-- A `not-applicable` gate is recorded in the ledger only; it gets no file here.
+Existing `REV-*.md` records and their identifiers are historical, preserved at
+these paths for specific unresolved findings, contradictions and audits. Their
+verdicts describe the material inspected at the time, not the live status of
+an investigation. New work need not register in or update the historical
+[review ledger](../review-ledger.md).

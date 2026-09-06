@@ -102,10 +102,9 @@ def validate_fallback(data):
         rule(all(type(f.get("canary_" + side + suffix)) is int and
                  f["canary_" + side + suffix] == expected for suffix in ("_initial", "_final")),
              "F3", side + " canary unchanged")
-    rule(data.get("experiment") == "INV-01-08" and data.get("schema") == "INV-01-08-result-v2" and
-         data.get("method") == "F08-2" and isinstance(data.get("code_revision"), str) and
-         len(data["code_revision"]) == 40 and all(c in "0123456789abcdef" for c in data["code_revision"]),
-         "F4", "producing method/code schema")
+    rule(data.get("experiment")=="INV-01-08" and data.get("schema")=="INV-01-08-result-v3" and
+         data.get("method")=="F08-2" and isinstance(data.get("run_id"),str) and len(data["run_id"])==32,
+         "F4", "producing method/run schema")
     rule(data.get("mode") == "normal" and data.get("completed_normal") is True and
          data.get("standalone") is False and f.get("completed_normal") is True and
          f.get("injected") is False, "F4", "complete uninjected normal run only")

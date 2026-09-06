@@ -1,21 +1,23 @@
-# Experiment code
+# Research experiments
 
-Reviewed code for experiments, one directory per investigation. Nothing here
-is inherited from commit `a121702`, and nothing here is implementation.
+Experiment code lives in `experiments/INV-<track>-<nn>/`. Each README describes
+operation, inputs, controls, failure behavior and output interpretation. The
+[owning investigation](../docs/research/investigations/README.md) records scientific
+conclusions, applicability and current work. Follow [the research workflow](../docs/research/README.md)
+for pre-execution and findings reviews. Synthetic validation and compilation are
+preparation, not experimental evidence.
 
-```text
-experiments/
-  <investigation-id>/
-    README.md       what it measures, method reference, manifest links
-    src/            the code the code gate reviews
-    prototype/      only when the experiment measures prototype code
-    replication/    the independent second run's code, when one exists
-```
+New evidence runs use `NATEMU_RAW_ROOT` outside Git, retain a source/dependency
+and build-input snapshot, build from that snapshot, and associate build, controls
+and results through one run identity. Keep artifacts and checksums even when a
+run fails. Correctness and timing qualification are separate outputs.
 
-- Directory name: the investigation identifier, for example `INV-01-03`.
-- The code gate reviews `src/` at a recorded Git revision; manifests cite
-  that revision.
-- Runs write raw data only under the external raw-data root named by
-  `NATEMU_RAW_ROOT`, never under this directory.
-- Prototype code exists to test a mechanism and is discarded afterward; it
-  never becomes the emulator.
+The active Mach (`INV-01-06/m1`), clock prerequisite (`INV-01-07/c1`), SMP
+(`INV-01-08`) and shared-code (`INV-01-18`) runners use explicit new formats.
+Other retained runners are historical readers/producers: their documented
+commands explain recovery, and their original code remains recoverable in Git.
+Before new evidence collection with a historical runner, apply the retained-run
+requirements in the workflow and obtain pre-execution review.
+
+No experiment result is implementation or an architecture choice. Inherited
+material at or before `a121702` remains provenance only.

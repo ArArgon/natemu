@@ -86,7 +86,7 @@ class AdapterTests(unittest.TestCase):
 
     def test_location_rejects_internal_or_unresolved_repository(self):
         # Uses the real read-only repository identity, never a fabricated review.
-        repository = Path(__file__).resolve().parents[3]
+        repository = artifact.repository()
         child = self.root / "child"
         child.mkdir()
         self.assertEqual(artifact.validate_locations(str(child), str(self.root),
@@ -96,8 +96,8 @@ class AdapterTests(unittest.TestCase):
                                         str(repository), str(repository))
         unknown_repository = self.root / "unknown-repository"
         unknown_repository.mkdir()
-        with self.assertRaisesRegex(core.Invalid, "unresolved-repository"):
-            artifact.validate_locations(str(child), str(self.root), str(unknown_repository))
+        with self.assertRaisesRegex(core.Invalid, "repository-canonical"):
+            artifact.validate_locations(str(child), str(self.root), "relative-repository")
 
     def test_fixed_payload_matches_documented_budget(self):
         # Literal independent column/count accounting, no producer helper.
@@ -107,7 +107,7 @@ class AdapterTests(unittest.TestCase):
         self.assertLess(size, artifact.PAYLOAD_LIMIT)
 
     def test_load_rejects_incomplete_matrix_before_reading_arrays(self):
-        repository = Path(__file__).resolve().parents[3]
+        repository = artifact.repository()
         child = self.root / "incomplete"
         child.mkdir()
         record = {"schema": "INV-01-07-clock-c1-v1", "seed": 70701,

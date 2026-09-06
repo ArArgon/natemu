@@ -1,7 +1,7 @@
 """Build/MIG-generate/disassemble only; never executes the resulting binary.
 
 Pipeline:
-  1. Verify the pinned SDK's mach_exc.defs hash matches SRC-162 exactly.
+  1. Retain the selected SDK mach_exc.defs and source/build inputs.
   2. Run MIG with every MACH_EXC_SERVER_* extension off and
      KERNEL_USER/KERNEL_SERVER/KOBJECT_SERVER false, arm64 target.
   3. Grep the generated dispatcher for the literal routine-id declaration to
@@ -21,12 +21,12 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import shutil
+import plistlib
+import uuid
 
-from run import HERE, REPO, raw_root, packet, sha, write_new, command
+from run import HERE, REPO, raw_root, snapshot_sources, file_manifest, sha, write_new, command
 
-SDK = Path("/Library/Developer/CommandLineTools/SDKs/MacOSX26.4.sdk")
-DEFS = SDK / "usr/include/mach/mach_exc.defs"
-SRC_162_SHA256 = "3ddbd5d01091643dab842d6b153fe3ae0de65498f28fb4afc51dd3c6d6637b4d"
 
 MIG_DEFINES = [
     "-DKERNEL_USER=0", "-DKERNEL_SERVER=0", "-DKOBJECT_SERVER=0",
@@ -88,7 +88,7 @@ def wire_layout():
         arm_thread_state64_count=68, arm_thread_state64_flavor=6,
         exc_bad_access=1, exception_state_behavior=2, mach_exception_codes_flag="0x80000000",
         mig_pack=MIG_PACK,
-        source_of_truth="generated mach_excServer.h/.c from the pinned SDK's mach_exc.defs; "
+        source_of_truth="generated mach_excServer.h/.c from the selected SDK's mach_exc.defs; "
                         "cross-checked at build time by _Static_assert/offsetof against those "
                         "exact generated headers via -fsyntax-only (never a linked/run binary)",
     )
@@ -118,82 +118,119 @@ def static_assert_source(layout):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--sdk", type=Path, help="SDK directory; default xcrun macosx SDK")
     args = parser.parse_args()
-    if not SDK.is_dir():
-        raise SystemExit("exact pinned SDK26.4 unavailable; no silent SDK replacement")
-    actual = sha(DEFS)
-    if actual != SRC_162_SHA256:
-        raise SystemExit(f"mach_exc.defs hash changed: got {actual}, pinned SRC-162 is {SRC_162_SHA256}")
-
+    SDK = (args.sdk or Path(command(["xcrun", "--sdk", "macosx", "--show-sdk-path"]))).resolve(strict=True)
+    DEFS = SDK / "usr/include/mach/mach_exc.defs"
     root = raw_root()
-    output = args.output.resolve()
-    if output == REPO or REPO in output.parents or not (output == root or root in output.parents):
+    output = args.output
+    if not output.is_absolute() or output.parent.resolve(strict=True) != output.parent:
+        raise SystemExit("build output must be canonical and absolute")
+    if output == REPO or REPO in output.parents or not root in output.parents:
         raise SystemExit("build output must be a new path in external NATEMU_RAW_ROOT")
     output.mkdir(parents=True, exist_ok=False)
 
-    sources = packet()
     commands = []
+    try:
+        sources = snapshot_sources(output)
+        defs = output / "mach_exc.defs"
+        with defs.open("xb") as stream:
+            stream.write(DEFS.read_bytes())
+        # 1. MIG generation.
+        mig_argv = (["xcrun", "mig", "-arch", "arm64", "-isysroot", str(SDK)] + MIG_DEFINES +
+                    ["-header", str(output / "mach_exc.h"),
+                     "-user", str(output / "mach_excUser.c"),
+                     "-server", str(output / "mach_excServer.c"),
+                     "-sheader", str(output / "mach_excServer.h"),
+                     str(defs)])
+        with (output / "build.log").open("xb") as log:
+            subprocess.run(mig_argv, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=120)
+        commands.append(mig_argv)
 
-    # 1. MIG generation.
-    mig_argv = (["xcrun", "mig", "-arch", "arm64", "-isysroot", str(SDK)] + MIG_DEFINES +
-                ["-header", str(output / "mach_exc.h"),
-                 "-user", str(output / "mach_excUser.c"),
-                 "-server", str(output / "mach_excServer.c"),
-                 "-sheader", str(output / "mach_excServer.h"),
-                 str(DEFS)])
-    with (output / "build.log").open("xb") as log:
-        subprocess.run(mig_argv, stdout=log, stderr=subprocess.STDOUT, check=True)
-    commands.append(mig_argv)
+        # 2. Verify routine id 2406 in the generated dispatcher text.
+        dispatcher = (output / "mach_excServer.c").read_text()
+        if '__DeclareRcvRpc(2406, "mach_exception_raise_state")' not in dispatcher:
+            raise SystemExit("generated dispatcher does not declare routine 2406 for mach_exception_raise_state")
 
-    # 2. Verify routine id 2406 in the generated dispatcher text.
-    dispatcher = (output / "mach_excServer.c").read_text()
-    if '__DeclareRcvRpc(2406, "mach_exception_raise_state")' not in dispatcher:
-        raise SystemExit("generated dispatcher does not declare routine 2406 for mach_exception_raise_state")
+        # 3. Freeze and cross-check the wire layout.
+        layout = wire_layout()
+        write_new(output / "wire-layout.json", layout)
+        assert_src = output / "verify_layout.c"
+        assert_src.write_text(static_assert_source(layout))
+        verify_argv = ["xcrun", "clang", "-arch", "arm64", "-isysroot", str(SDK), "-fsyntax-only",
+                       "-I", str(output), str(assert_src)]
+        with (output / "verify_layout.log").open("xb") as log:
+            subprocess.run(verify_argv, stdout=log, stderr=subprocess.STDOUT, check=True, cwd=output, timeout=120)
+        commands.append(verify_argv)
 
-    # 3. Freeze and cross-check the wire layout.
-    layout = wire_layout()
-    write_new(output / "wire-layout.json", layout)
-    assert_src = output / "verify_layout.c"
-    assert_src.write_text(static_assert_source(layout))
-    verify_argv = ["xcrun", "clang", "-arch", "arm64", "-isysroot", str(SDK), "-fsyntax-only",
-                   "-I", str(output), str(assert_src)]
-    with (output / "verify_layout.log").open("xb") as log:
-        subprocess.run(verify_argv, stdout=log, stderr=subprocess.STDOUT, check=True, cwd=output)
-    commands.append(verify_argv)
+        # 4. Compile the server binary (not executed).
+        binary = output / "state_server"
+        cc = (["xcrun", "clang", "-arch", "arm64", "-isysroot", str(SDK), "-O1", "-g", "-std=c11",
+               "-Wall", "-Wextra", "-Werror", "-pthread",
+               "-I", str(output), str(sources / "src/state_server.c"),
+               str(output / "mach_excServer.c"), str(output / "mach_excUser.c"),
+               "-o", str(binary)])
+        with (output / "compile.log").open("xb") as log:
+            subprocess.run(cc, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=120)
+        commands.append(cc)
 
-    # 4. Compile the server binary (not executed).
-    binary = output / "state_server"
-    cc = (["xcrun", "clang", "-arch", "arm64", "-isysroot", str(SDK), "-O1", "-g", "-std=c11",
-           "-Wall", "-Wextra", "-Werror", "-pthread",
-           "-I", str(output), str(HERE / "src/state_server.c"),
-           str(output / "mach_excServer.c"), str(output / "mach_excUser.c"),
-           "-o", str(binary)])
-    with (output / "compile.log").open("xb") as log:
-        subprocess.run(cc, stdout=log, stderr=subprocess.STDOUT, check=True)
-    commands.append(cc)
+        # Actual local capability cells: plain ad-hoc, and hardened+allow-jit.
+        signing = {}
+        for name, executable, entitlements in (
+                ("adhoc-plain", binary, {}),
+                ("adhoc-hardened-allow-jit", output / "state_server-hardened",
+                 {"com.apple.security.cs.allow-jit": True})):
+            if executable != binary:
+                shutil.copy2(binary, executable)
+            argv = ["codesign", "--force", "--sign", "-"]
+            if entitlements:
+                plist = output / "hardened-entitlements.plist"
+                plist.write_bytes(plistlib.dumps(entitlements))
+                argv += ["--options", "runtime", "--entitlements", str(plist)]
+            argv.append(str(executable))
+            subprocess.run(argv, check=True, capture_output=True, timeout=30)
+            commands.append(argv)
+            subprocess.run(["codesign", "--verify", "--strict", str(executable)], check=True, capture_output=True, timeout=30)
+            details = subprocess.run(["codesign", "-d", "--verbose=4", "--entitlements", ":-", str(executable)], check=True, capture_output=True, timeout=30)
+            raw = details.stdout + details.stderr
+            (output / (name + "-signature.txt")).write_bytes(raw)
+            start,end = raw.find(b"<?xml"),raw.find(b"</plist>")
+            actual = plistlib.loads(raw[start:end+8]) if start>=0 and end>=start else {}
+            hardened = b"(runtime)" in raw or b",runtime)" in raw
+            if actual != entitlements or hardened != bool(entitlements):
+                raise ValueError("actual local signature mismatch")
+            signing[name] = dict(binary=executable.name, sha256=sha(executable),
+                                 entitlements=actual, hardened_runtime=hardened)
 
-    # 5. Disassemble the fault-site load/store and the retry path.
-    disasm = subprocess.run(["xcrun", "llvm-objdump", "-d", "--no-show-raw-insn",
-                              "--disassemble-symbols=_asm_load,_asm_store,_catch_mach_exception_raise_state",
-                              str(binary)], capture_output=True, text=True, check=True)
-    (output / "disassembly.txt").write_text(disasm.stdout)
-    commands.append(["xcrun", "llvm-objdump", "-d", str(binary)])
-    retry_path_pc_unchanged = (
-        "memcpy(new_state, old_state" in (HERE / "src/state_server.c").read_text() and
-        "set_pc" not in (HERE / "src/state_server.c").read_text().lower()
-    )
+        # 5. Disassemble the fault-site load/store and the retry path.
+        disasm = subprocess.run(["xcrun", "llvm-objdump", "-d", "--no-show-raw-insn",
+                                  "--disassemble-symbols=_m1_access,_m1_load,_m1_store,_catch_mach_exception_raise_state",
+                                  str(binary)], capture_output=True, text=True, check=True, timeout=120)
+        (output / "disassembly.txt").write_text(disasm.stdout)
+        commands.append(["xcrun", "llvm-objdump", "-d", str(binary)])
+        retry_path_pc_unchanged = (
+            "memcpy(new_state, old_state" in (sources / "src/state_server.c").read_text() and
+            "set_pc" not in (sources / "src/state_server.c").read_text().lower()
+        )
 
-    files = {p.name: sha(p) for p in output.iterdir() if p.is_file()}
-    write_new(output / "build-manifest.json", dict(
-        code_packet=sources, commands=[list(map(str, c)) for c in commands], files=files,
-        runtime_executed=False, sdk=str(SDK), mach_exc_defs_sha256=actual,
-        mig_version=command(["xcrun", "mig", "-version"]),
-        compiler=command(["xcrun", "clang", "--version"]),
-        routine_id_verified=2406,
-        retry_path_pc_unchanged=retry_path_pc_unchanged,
-        source_revision=command(["git", "rev-parse", "HEAD"]),
-        source_worktree_status=command(["git", "status", "--porcelain", "--", str(HERE)]),
-    ))
+        files = file_manifest(output)
+        write_new(output / "build-manifest.json", dict(
+            schema="INV-01-06-m1-build-v3", signing=signing, build_id=uuid.uuid4().hex, commands=[list(map(str, c)) for c in commands], files=files,
+            runtime_executed=False, sdk=str(SDK), mach_exc_defs_sha256=sha(defs), sdk_version=command(["xcrun", "--sdk", str(SDK), "--show-sdk-version"]),
+            mig_version=command(["xcrun", "mig", "-version"]),
+            compiler=command(["xcrun", "clang", "--version"]),
+            routine_id_verified=2406,
+            retry_path_pc_unchanged=retry_path_pc_unchanged,
+        ))
+    except BaseException as error:
+        try:
+            files, hashing_complete = file_manifest(output), True
+        except (OSError, ValueError):
+            files, hashing_complete = {}, False
+        write_new(output / "build-failure.json", dict(schema="INV-01-06-m1-build-failure-v2",
+                  error=dict(type=type(error).__name__, message=str(error)), commands=commands,
+                  files=files, hashing_complete=hashing_complete, runtime_executed=False))
+        raise
     print(output)
 
 

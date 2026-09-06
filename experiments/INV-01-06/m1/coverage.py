@@ -2,11 +2,8 @@
 native code: it only enumerates the coverage manifest and, given results,
 checks that all specified cells are present.
 
-Cross-product per INV-01-06.md:765-774: signing x n x non-JIT/immutable-JIT x
-load/store x serial/per-worker server x direct/forwarded path. jit=1 requires
-the hardened-runtime+allow-jit signing cell (Q-01-04's MAP_JIT toggle needs
-that entitlement on a hardened binary); the non-hardened x jit=1 combination
-is recorded as an eligible-but-invalid cell, never silently dropped.
+All local signing × n × code × access × topology × path cells are retained.
+Capability failures are observations, not precomputed exclusions.
 
 n=1 is retained as the diagnostic cell alongside the required n=2/4/8
 (INV-01-06.md:715). Warm-up/checked counts and seeds are frozen exactly as
@@ -36,6 +33,10 @@ RUNTIME_NEGATIVES = (
     "reply-send-failure", "prior-server-failure", "unexpected-helper-fault",
 )
 # Terminal/restoration/prior-handler arms, from INV-01-06.md:669-673,690-696,709-711.
+HOLDS = ("worker-armed-before-fault", "server-after-receive", "server-before-repair",
+         "server-before-reply", "front-before-forward", "prior-before-reply",
+         "worker-resumed-before-disarm", "teardown-before-restore", "before-right-disposal")
+
 AUXILIARY_ARMS = ("terminal", "restoration", "prior-handler-unsupported")
 
 
@@ -48,8 +49,8 @@ def digest(value):
 
 
 def cell_eligible(signing, jit):
-    if jit and signing != "adhoc-hardened-allow-jit":
-        return "immutable-JIT requires the hardened-runtime+allow-jit signing cell"
+    # Both local cells are capability questions; lack of hardened runtime
+    # does not itself exclude an immutable-JIT allocation.
     return None
 
 
@@ -80,9 +81,17 @@ def auxiliary_arms():
 def manifest():
     cells = positive_cells()
     arms = auxiliary_arms()
+    holds=[]
+    for cell in cells:
+        for hold in HOLDS:
+            applicable=not (hold in ("front-before-forward","prior-before-reply") and cell["path"]!="forward")
+            for worker in range(cell["n"]):
+                holds.append(dict(cell_id=cell["cell_id"],hold=hold,worker=worker,
+                    status="planned" if applicable else "NA",repetitions=3 if applicable else 0,
+                    reason="held-actor controller return requires review" if applicable else "no forwarding path"))
     result = dict(
         investigation="INV-01-06", method=METHOD, routine_id=2406,
-        cells=cells, auxiliary_arms=arms,
+        cells=cells, auxiliary_arms=arms, holds=holds,
         positive_sample_plan=dict(children_per_cell=3, seeds=list(POSITIVE_SEEDS),
                                   warmup_events_per_worker=WARMUP,
                                   checked_events_per_worker=CHECKED,
@@ -94,6 +103,8 @@ def manifest():
                   "second-machine-replication", "protected-identity-behavior",
                   "arbitrary-foreign-prior-handler", "JIT-write-window-composition",
                   "cost/latency-measurement"],
+        first_stage="six plain/non-JIT/serial/direct n=1 children: load/store x three seeds",
+        later_stages_require_review=True,
         watchdog_seconds=dict(no_progress=5, total=30),
         no_outcome_driven_replenishment=True,
     )

@@ -308,23 +308,244 @@ def pressure_fixture(pressure="near-full"):
     return job,[header]+streams[0]+streams[1]+streams[12]
 
 
-def git_cwd_regression():
-    """R3: run.command() must resolve git relative to REPO, never the caller's
-    cwd -- otherwise `git status --porcelain -- <nested path>` run from a
-    different directory can silently miss a dirty packet (fail open) or raise
-    an unhandled error. Proves the fix by making a real untracked file dirty
-    the packet, then calling command() from an unrelated directory."""
-    scratch=HERE/".rev226_r3_scratch_dirty"
-    scratch.write_text("temporary untracked marker for the REV-226 R3 regression check\n")
-    previous=os.getcwd()
-    try:
-        os.chdir(tempfile.gettempdir())
-        assert command(["git","rev-parse","--show-toplevel"])==str(REPO), "producing_revision must resolve to the reviewed repo regardless of caller cwd"
-        changed=command(["git","status","--porcelain","--",str(HERE)])
-        assert scratch.name in changed, "dirty packet file must be detected regardless of caller cwd"
-    finally:
-        os.chdir(previous)
-        scratch.unlink()
+def retained_campaign_fixtures():
+    import run
+    from unittest.mock import patch
+    def write(path,value):
+        path.write_text(json.dumps(value))
+    with tempfile.TemporaryDirectory(prefix="inv18-retention-") as temporary:
+        root=Path(temporary).resolve(); directory=root/"campaign"; directory.mkdir()
+        build_dir=root/"build"; build_dir.mkdir()
+        sources={"files":{},"sha256":"synthetic"}
+        for signing in "ABC": (build_dir/("protocol-"+signing)).write_text("synthetic binary "+signing)
+        build=dict(schema="INV-01-18-build-v2",run_id="b"*32,outcome="built",code_packet=sources,
+                   files={path.name:run.sha(path) for path in build_dir.iterdir()})
+        write(build_dir/"build-manifest.json",build)
+        schedule=list(run.jobs(run.manifest(),"preflight"))
+        write(directory/"schedule.json",dict(jobs=schedule))
+        write(directory/"code-packet.json",sources)
+        write(directory/"environment.json",dict(host_id="synthetic",model="synthetic",os_build="synthetic",sdk="synthetic"))
+        write(directory/"run.json",dict(schema="INV-01-18-run-v2",run_id="a"*32,build_directory=str(build_dir),
+                                      build_manifest_sha256=run.sha(build_dir/"build-manifest.json")))
+        results=[]
+        for index,job in enumerate(schedule):
+            child=directory/f"{index:06d}"; child.mkdir()
+            result=dict(status="correctness-qualified")
+            results.append(dict(index=index,**result))
+            write(child/"invocation.json",dict(schema="INV-01-18-invocation-v2",run_id="a"*32,
+                  binary_sha256=build["files"]["protocol-"+job["signing"]],
+                  argv=run.native_args(build_dir/("protocol-"+job["signing"]),job)))
+            write(child/"trace.jsonl",dict(schema="INV-01-18-trace-v2",run_id="a"*32,build_id="b"*32))
+            write(child/"manifest.json",dict(schema="INV-01-18-child-v2",run_id="a"*32,
+                  job_sha256=run.digest(job),result=result))
+        write(directory/"results.json",dict(evidence_mode="preflight",results=results))
+        write(directory/"budget.json",dict(schema="INV-01-18-budget-v1",run_id="a"*32,
+                                          mode="preflight",limits=run.STAGE_BUDGETS["preflight"]))
+        def restamp():
+            write(directory/"manifest.json",dict(schema="INV-01-18-campaign-v3",run_id="a"*32,files=run.file_manifest(directory)))
+        def rejected():
+            try: run.verified_campaign(directory,sources)
+            except (SystemExit,ValueError,KeyError): return
+            raise AssertionError("mixed/invalid campaign accepted")
+        restamp(); run.verified_campaign(directory,sources)
+        # Unrelated commit/editorial bytes do not participate in retained identity.
+        (root/"README.md").write_text("unrelated editorial revision")
+        with patch.object(run,"command",side_effect=AssertionError("git must not be consulted")):
+            run.verified_campaign(directory,sources)
+        child=directory/"000000"
+        original=json.loads((child/"trace.jsonl").read_text())
+        for key,value in (("run_id","c"*32),("build_id","d"*32),("schema","historical")):
+            write(child/"trace.jsonl",dict(original,**{key:value})); restamp(); rejected()
+        write(child/"trace.jsonl",original); restamp()
+        with patch.dict(os.environ,NATEMU_RAW_ROOT=str(root)):
+            try: run.qualify([directory],root/"qualification.json",sources)
+            except SystemExit as exc: assert "full preflight/hooks/negative/protection" in str(exc)
+            else: raise AssertionError("missing controls qualified")
+        try: run.qualification([],sources)
+        except SystemExit as exc: assert "full preflight/hooks/negative/protection" in str(exc)
+        else: raise AssertionError("caller-declared eligibility can bypass missing controls")
+        original_schedule=list(schedule)
+        write(directory/"schedule.json",dict(jobs=schedule[:-1])); restamp(); rejected()
+        write(directory/"schedule.json",dict(jobs=original_schedule)); restamp()
+        (build_dir/"protocol-A").write_text("different producing binary"); rejected()
+        # Unknown historical schemas cannot inherit v2 success from omitted fields.
+        write(directory/"manifest.json",dict(files=run.file_manifest(directory))); rejected()
+
+
+def qualification_consumer_fixtures():
+    """Independent review reproduction: the consumer must rederive controls.
+
+    Author: /root/investigations. Synthetic build and host only; child launch
+    is replaced by a failure. This exercises main(), not just its helper.
+    """
+    import contextlib
+    import sys
+    import run
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory(prefix="inv18-qualification-consumer-") as temporary:
+        root=Path(temporary).resolve(); directory=root/"build"; snapshot=directory/"snapshot"
+        snapshot.mkdir(parents=True)
+        sources={"files":{},"sha256":"synthetic-only"}
+        build=dict(schema="INV-01-18-build-v2",outcome="built",files={},code_packet=sources)
+        (directory/"build-manifest.json").write_text(json.dumps(build))
+        host=dict(host_id="fixture",model="fixture",os_build="fixture",sdk="fixture")
+        base=dict(schema="INV-01-18-qualification-v2",kind="control-qualification",code_packet=sources,
+                  host=host,build_manifest_sha256=run.sha(directory/"build-manifest.json"),campaigns=[],
+                  eligible_cells=["fabricated"],blocked_cells={},correctness_stage_included=True,
+                  evidence=False,completed_question=False)
+        qualification=root/"qualification.json"
+        def consume(supplied,expected=None):
+            qualification.write_text(json.dumps(supplied))
+            argv=["run.py","run","--mode","cost","--binary-dir",str(directory),"--qualification",str(qualification)]
+            with contextlib.ExitStack() as stack:
+                for target,value in [("HERE",snapshot),("packet",lambda *args:sources),("environment",lambda:host),
+                                     ("signatures",lambda *args:{}),("raw_root",lambda:root)]:
+                    stack.enter_context(patch.object(run,target,value))
+                stack.enter_context(patch.object(sys,"argv",argv))
+                stack.enter_context(patch.object(run.os,"execv",side_effect=AssertionError("reexec unexpected")))
+                stack.enter_context(patch.object(run,"run_child",side_effect=AssertionError("child must never launch")))
+                if expected is not None:
+                    stack.enter_context(patch.object(run,"qualification",return_value=expected))
+                try: run.main()
+                except SystemExit as exc: return str(exc)
+                raise AssertionError("fabricated qualification accepted")
+        assert "full preflight/hooks/negative/protection" in consume(base)
+        expected=dict(base,eligible_cells=[],correctness_stage_included=False)
+        for supplied in (base,dict(expected,eligible_cells=["fabricated"]),dict(expected,correctness_stage_included=True)):
+            assert "differs from recomputed controls/correctness" in consume(supplied,expected)
+
+
+def remaining_preflight_fixtures():
+    """The continuation preserves the original suffix and cannot replace preflight."""
+    import random
+    import run
+    from unittest.mock import patch
+    plan=run.manifest()
+    original=list(run.jobs(plan,"preflight"))
+    random.Random(18001).shuffle(original)
+    remaining=list(run.jobs(plan,"preflight-remaining"))
+    assert [job["arm"] for job in original[:3]]==["E","S","M-jit-protect"]
+    assert remaining==original[3:] and len(remaining)==4
+    assert 30*len(remaining)==120
+    assert run.STAGE_BUDGETS["preflight-remaining"]==run.STAGE_BUDGETS["preflight"]
+    with tempfile.TemporaryDirectory(prefix="inv18-remaining-qualification-") as temporary:
+        directory=Path(temporary)
+        (directory/"environment.json").write_text(json.dumps(dict(host_id="fixture",model="fixture",os_build="fixture",sdk="fixture")))
+        (directory/"run.json").write_text(json.dumps(dict(build_manifest_sha256="fixture")))
+        (directory/"manifest.json").write_text("{}")
+        results=[dict(index=i,status="correctness-qualified") for i in range(4)]
+        with patch.object(run,"verified_campaign",return_value=(directory,remaining,results,"preflight-remaining")):
+            try: run.qualification([directory],{})
+            except SystemExit as exc: assert "full preflight/hooks/negative/protection" in str(exc)
+            else: raise AssertionError("remaining subset promoted to full qualification")
+
+
+def budget_fixtures():
+    """Synthetic owned children only; no generated code or host experiment."""
+    import run
+    import subprocess
+    import sys
+    import time
+    from unittest.mock import patch
+    # Preserve the original twelve controls and all three seeds; this stage
+    # cannot silently select a favorable control or shrink its denominator.
+    negative_jobs=list(run.jobs(run.manifest(),"negative"))
+    assert len(negative_jobs)==36
+    assert {(j['negative'],j['seed']) for j in negative_jobs}=={
+        (name,seed) for name in run.NEGATIVES for seed in (18001,18002,18003)}
+    assert all(j['arm']=='I' and j['n']==j['producers']==2 and j['signing']=='A' for j in negative_jobs)
+    assert run.STAGE_BUDGETS['negative']==dict(wall_seconds=1800,output_bytes=2<<30,
+        child_file_bytes=128<<20,free_reserve_bytes=1<<30)
+    assert len(negative_jobs)*30==1080<run.STAGE_BUDGETS['negative']['wall_seconds']
+    with tempfile.TemporaryDirectory(prefix="inv18-budget-") as temporary:
+        root=Path(temporary)
+        limits=dict(run.STAGE_BUDGETS["preflight"],output_bytes=4096,free_reserve_bytes=0)
+        child=subprocess.Popen([sys.executable,"-c","pass"],start_new_session=True)
+        assert run.wait_child(child,root,root,limits)==(0,False)
+        child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(10)"],start_new_session=True)
+        try:
+            with run.wall_budget(.05): run.wait_child(child,root,root,limits)
+        except run.BudgetExceeded as exc: assert "wall" in str(exc)
+        else: raise AssertionError("wall deadline missed")
+        assert child.poll()==-signal.SIGKILL
+        (root/"overflow").write_bytes(b"x"*8192)
+        child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(10)"],start_new_session=True)
+        try: run.wait_child(child,root,root,limits)
+        except run.BudgetExceeded as exc: assert "output" in str(exc)
+        else: raise AssertionError("output cap missed")
+        assert child.poll()==-signal.SIGKILL
+        (root/"overflow").unlink()
+        with patch.object(run.shutil,"disk_usage",return_value=type("Disk",(),{"free":0})()):
+            try: run.check_budget(root,dict(limits,free_reserve_bytes=1))
+            except run.BudgetExceeded as exc: assert "reserve" in str(exc)
+            else: raise AssertionError("low disk reserve missed")
+        # The actual launcher applies an OS per-file bound, independently of polling.
+        writer=[sys.executable,"-c", "import os,signal; signal.signal(signal.SIGXFSZ,signal.SIG_DFL); os.write(1,b'x'*8192); os.write(1,b'y')"]
+        with patch.object(run,"native_args",return_value=writer):
+            try:
+                run.run_child(Path(sys.executable),{},root/"limited",limits=dict(limits,output_bytes=1<<20,child_file_bytes=128))
+            except run.BudgetExceeded as exc: assert "file limit" in str(exc)
+            else: raise AssertionError("native file cap missed")
+        assert (root/"limited/trace.jsonl").stat().st_size==128
+
+
+def mprotect_failure_fixtures():
+    """Exercise synchronous reporting with fabricated API outcomes only."""
+    import run
+    import subprocess
+    job={"arm":"M-jit-protect","pages":1,"kind":"preflight"}
+    with tempfile.TemporaryDirectory(prefix="inv18-mprotect-witness-") as temporary:
+        directory=Path(temporary)
+        source=directory/"witness.c"
+        source.write_text('#define main protocol_main\n#include "'+str(HERE/"src/protocol.c")+'"\n'
+            '#undef main\nint main(int argc,char **argv) { (void)argv;\n'
+            'if(argc==1) mprotect_failure((void*)16384,16<<20,7,-1,13,-1,0);\n'
+            'else mprotect_failure((void*)16384,16<<20,7,0,0,-1,13);\nreturn 0; }\n')
+        binary=directory/"witness"
+        subprocess.run(["xcrun","clang","-O2","-std=c11","-pthread",str(source),"-o",str(binary)],
+                       check=True,capture_output=True,timeout=30)
+        for args,attempted in (([],False),(["restore"],True)):
+            output=subprocess.run([str(binary),*args],check=True,capture_output=True,text=True,timeout=5)
+            actual=run.mprotect_failure_witness(output.stderr,job,16384)
+            assert actual["restore_attempted"] is attempted
+            assert actual["protect_result"]==(0 if attempted else -1)
+            assert actual["restore_result"]==(-1 if attempted else None)
+            assert actual["restore_errno"]==(13 if attempted else None)
+            for key in actual:
+                changed=dict(actual);del changed[key]
+                try: run.mprotect_failure_witness("INV18 MPROTECT_RESULT "+json.dumps(changed),job,16384)
+                except Invalid: pass
+                else: raise AssertionError("missing failure field accepted: "+key)
+            changed=dict(actual,restore_attempted=not attempted)
+            try: run.mprotect_failure_witness("INV18 MPROTECT_RESULT "+json.dumps(changed),job,16384)
+            except Invalid: pass
+            else: raise AssertionError("attempted/skipped restore confused")
+        try: run.mprotect_failure_witness("INV18 UNAVAILABLE mprotect roundtrip errno=13",job,16384)
+        except Invalid: pass
+        else: raise AssertionError("historical ambiguous witness accepted")
+
+        # Exercise the real child consumer: exit 78 cannot overwrite bad identity.
+        import sys
+        import types
+        from unittest.mock import patch
+        header=dict(schema="INV-01-18-trace-v2",run_id="run",build_id="build",
+                    page_size=16384,numer=125,denom=3)
+        command_code="import sys; print(sys.argv[1]) if sys.argv[1] else None; sys.stderr.write(sys.argv[2]); sys.exit(78)"
+        stderr=output.stderr+"INV18 UNAVAILABLE mprotect roundtrip errno=13\n"
+        variants=[header,dict(header,run_id="other"),dict(header,build_id="other"),None]
+        for index,candidate in enumerate(variants):
+            argv=[sys.executable,"-c",command_code,json.dumps(candidate) if candidate else "",stderr]
+            with patch.object(run,"native_args",return_value=argv), \
+                 patch.object(run,"check",return_value=dict(status="INVALID",invariant="INCOMPLETE")), \
+                 patch.object(run,"command",return_value="synthetic"), \
+                 patch.dict(sys.modules,clock_evidence=types.SimpleNamespace(validate=lambda *args:dict(status="unqualified"))):
+                result=run.run_child(Path(sys.executable),job,directory/f"child-{index}",
+                                     run_id="run",build_id="build",limits=run.STAGE_BUDGETS["preflight"])
+            assert result["status"]==("unavailable" if index==0 else "INVALID"),result
+        for changed in (dict(actual,length=16384),dict(actual,restore_protection=1)):
+            try: run.mprotect_failure_witness("INV18 MPROTECT_RESULT "+json.dumps(changed),job,16384)
+            except Invalid: pass
+            else: raise AssertionError("wrong failure subarm context accepted")
 
 
 def main():
@@ -463,8 +684,12 @@ def main():
     assert not negative_result(job,timeout,{},"unrelated failure")
     assert negative_result(job,timeout,{},"INV18 NEGATIVE 8 token=1 detail=0\n")
     assert not negative_result(job,dict(timeout,timed_out=False),{},"INV18 NEGATIVE 8 token=1 detail=0\n")
-    git_cwd_regression()
-    print(json.dumps(dict(kind="synthetic-fixtures",evidence=False,trace_checks=checks,protection_checks=protection_checks,clock_cases=6,negative_classification_cases=3,git_cwd_cases=1)))
+    retained_campaign_fixtures()
+    qualification_consumer_fixtures()
+    remaining_preflight_fixtures()
+    budget_fixtures()
+    mprotect_failure_fixtures()
+    print(json.dumps(dict(kind="synthetic-fixtures",evidence=False,trace_checks=checks,protection_checks=protection_checks,clock_cases=6,negative_classification_cases=3)))
 
 
 if __name__=="__main__": main()

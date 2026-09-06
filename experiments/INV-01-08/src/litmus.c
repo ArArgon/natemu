@@ -34,8 +34,8 @@
 #ifndef F08_REPO
 #error F08_REPO must name the canonical reviewed workspace
 #endif
-#ifndef F08_CODE_REV
-#error F08_CODE_REV must identify the producing revision
+#ifndef F08_SUPERVISOR
+#error F08_SUPERVISOR must identify the retained boundary checker
 #endif
 #ifndef F08_COMPILED_BUNDLE
 #error F08_COMPILED_BUNDLE must bind the compiled source-bundle digest
@@ -497,7 +497,7 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "mach_timebase_info failed or returned an invalid ratio\n");
 		return 1;
 	}
-	authorize_native(out, mode);
+	check_native(out);
 	if (!strcmp(mode, "unexpected-fault")) unexpected_fault_control();
 	int output_fd = open(out, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
 	if (output_fd == -1) { perror("exclusive output"); return 2; }
@@ -513,11 +513,9 @@ int main(int argc, char **argv) {
 	        g_tb.numer, g_tb.denom);
 
 
-	fprintf(f, "  \"schema\":\"INV-01-08-result-v2\",\"method\":\"F08-2\","
-	        "\"code_revision\":\"%s\",\"authorization_sha256\":\"%s\","
-	        "\"code_bundle_sha256\":\"%s\",\"compiled_bundle_sha256\":\"%s\",\n",
-	        F08_CODE_REV, getenv("NATEMU_F08_AUTH_SHA256"), getenv("NATEMU_F08_BUNDLE_SHA256"),
-	        F08_COMPILED_BUNDLE);
+	fprintf(f, "  \"schema\":\"INV-01-08-result-v3\",\"method\":\"F08-2\","
+	        "\"run_id\":\"%s\",\"compiled_bundle_sha256\":\"%s\",\n",
+	        getenv("NATEMU_F08_RUN_ID"), F08_COMPILED_BUNDLE);
 
 	if (standalone) {
 		int okay = run_fallback(f, control);

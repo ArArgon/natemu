@@ -1,19 +1,15 @@
 # INV-01-18 research instrument
 
-Code author: `/root/register_02`. This is an experiment, not an emulator
-architecture choice. Governing method: M18-2 / independent REV-180; pressure
-supplement M18-P1 / REV-214; accessible-control clarification M18-N1 / REV-216.
-Independent code/model/oracle review REV-200 is required before **any native
-invocation**, including runtime preflight. A build or an abstract fixture is
-not host evidence. The separate cost prerequisite is not assumed satisfied.
+The [investigation](../../docs/research/investigations/INV-01-18.md) owns the
+question, conclusions, limitations and next action. Follow the
+[research workflow](../../docs/research/README.md) before native execution.
+This experiment selects no emulator architecture. A build or synthetic fixture
+is not host evidence; inherited probes/results are excluded.
 
-The source packet is every file in this directory, excluding Python cache
-files. `run.py plan` prints its canonical SHA-256 and complete coverage
-manifest without executing native code. Build/sign/disassembly artifacts and
-all runtime output must be fresh and outside Git. No inherited probe or raw
-result is used.
+`run.py plan` prints the source inventory and coverage without executing native
+code. Build/sign/disassembly and runtime outputs are fresh external artifacts.
 
-## Files and gates
+## Files
 
 - `src/protocol.c`: actual I/S/E/V/M worker protocols, generated instructions,
   immutable metadata, bounded trace collector, deterministic holds and
@@ -30,27 +26,12 @@ result is used.
   cause-specific negatives and N1 protection controls. Never host evidence.
 - `validate.py`: captures syntax/model/fixture checks in a fresh external
   manifest; it never invokes the native instrument.
-- `build.py`: exact SDK26.4 compile, A/B/C local ad-hoc signing, captured actual
+- `build.py`: selected SDK compile, A/B/C local ad-hoc signing, captured actual
   entitlements, disassembly and hashed build manifest. It does not run binaries.
-- `run.py`: source/build/signature/method-result prerequisites, external raw
+- `run.py`: source/build/signature integrity, external raw
   manifests, fresh children, 30-second watchdog, partial-output preservation,
   cause classification, and per-cell control/correctness qualification.
 
-Accepted method input identities (historical, before later gate integration):
-
-| Input | SHA-256 |
-| --- | --- |
-| M18-2 reviewed subject | `f2f9ba7879abe1148cc57e4b246ef7eebb6637f798da4c207d61ed1613bc06bd` |
-| REV-180 | `4e18ec53d9f9930a774ec091b598cec09b78681e0d2f85c93e315b5069a692b1` |
-| M18-P1 reviewed subject | `78893591eded7eaa999a5a369de892d670af7bab938c55772309e823fc74f966` |
-| REV-214 | `2a7c81aedcac9876d9e12a5fbe1a3874327237da18f294ea860f372ae8c0f705` |
-| M18-N1 reviewed subject | `6684fdab773666e9cf9be3bace7f76555231978886251400dead7ebf591f5452` |
-| REV-216 | `9e215ee324f649e79005406ba79796d7d18a3beb41685f125fcc073bce395e66` |
-
-Primary documentary premises remain INV18 claims04–13, accepted narrowly by
-REV-154/173. Their Apple, SDK, Arm and C source limits remain operative. Public
-callback/cache/ISB composition, thread migration and whole-JIT protection
-restoration are experimental candidates, not source-proved complete protocols.
 
 ## Protocol and instruction details
 
@@ -153,11 +134,10 @@ of mprotect plus empty callback restoration is not assumed from documentation.
 
 ## Cost and qualification
 
-Quantitative execution needs an independently result-accepted valid INV07
-packet for the exact model/OS plus local calibration. The adapter JSON must
-contain `status: accepted-valid`, exact `model` and `os_build`, and its exact
-SHA-256 must appear in the independent result review. This is an explicit
-required input, not a placeholder fabricated from failed timer data.
+Optional `--timer-packet` names a retained INV-01-07 C1 v2 campaign. The
+runner checks its artifacts and factual host/OS/architecture/timebase context.
+Missing or mismatched evidence leaves timing unqualified; correctness remains
+separately classified. Reviewers judge applicability and accepted conclusions.
 
 Each cost child retains 10,000 pre/post pairs per worker/coordinator. All
 coordinator zeros participate in p99; an all-zero set is unresolved, while
@@ -181,13 +161,27 @@ Baselines are separately identified data indirection (real immutable pair-array
 loads) and metadata-only protocol handshakes with no code/mapping operation.
 Neither is pure API latency. Single-reader immutable I is the diagnostic base.
 
-Native commands require an accepted independent code review pinning **both**
-the source-packet SHA-256 and the exact build/signature/disassembly-manifest
-SHA-256. The full experiment source must be committed before runtime. Runtime
-checks actual binary signatures/entitlements and artifact hashes. Correctness
-requires full preflight/hook/negative/protection qualification on the same
-source/build/host. Cost also requires the full correctness campaign. Unavailable
-or failed cells remain visible as blocked/not-run, never removed or passed.
+Runtime checks actual binary signatures/entitlements and artifact checksums.
+Correctness requires complete preflight/hook/negative/protection controls on
+the same retained source/build/host. Cost additionally requires the complete
+correctness campaign. Unavailable or failed cells remain blocked/not-run.
+
+### Proposed remaining preflight stage
+
+`--mode preflight-remaining` retains exactly the four original seed18001
+schedule entries after M-jit-protect: M-data-protect, M-data-map, V, I, in
+that order. Its purpose and pre-execution review status are in INV-01-18.
+The earlier partial campaigns and failed MAP_JIT attempt remain immutable;
+this stage cannot replace a complete `preflight` in control qualification.
+There is no native producer change or altered per-child sample count.
+
+The four native ceilings sum to120s; the existing900s stage,2GiB output
+threshold,128MiB per-file limit and1GiB free reserve apply. The first
+unavailable/invalid correctness outcome stops admission and retains the rest
+as not-run. Timing remains unqualified without applicable evidence. Synthetic
+checks compare all four complete job records to the original shuffled suffix
+and confirm that even four positive results cannot qualify a full preflight.
+This stage is proposed preparation until independent review accepts it.
 
 Safe authoring checks from this directory:
 
@@ -202,22 +196,32 @@ Build-only, with an explicitly set external `NATEMU_RAW_ROOT` and fresh output:
 PYTHONDONTWRITEBYTECODE=1 python3 build.py --output "$NATEMU_RAW_ROOT/build-INV18"
 ```
 
-After independent code acceptance, `run.py run --mode preflight|hooks|negative|
-protection` takes `--binary-dir`, `--code-review`, `--review-id`, `--reviewer`
-and `--self-review`. The code gate binds three documents, never letting self
-approval substitute for independence: the pinned self review (`--self-review`,
-must be exactly the recorded self-review ID, `- Independence: \`self\``,
-verdict `accept`), the independent return review passed as `--code-review`
-(must be exactly `--review-id`, from reviewer/session `--reviewer`, verdict
-`accept`, and must cite the independent critique review it closes), and that
-cited critique itself (present by ID only; its own verdict may be `revise`,
-since it is the finding being closed, not re-approved). `run.py qualify` takes one
-full `--campaign` for each required stage and a fresh `--output`. Pass that
-artifact as `--qualification` for correctness. Qualify again including its
-full correctness campaign before cost, which also needs `--timer-packet` and
-`--timer-review`. No outcome-driven campaign replacement or sample replenishment
-is implemented. All runs retain the entire frozen schedule and a final hash
-manifest; exact-child watchdog kills preserve partial stdout/stderr/status.
+After pre-execution review, run a stage with:
+
+```sh
+python3 -B run.py run --mode preflight --binary-dir "$NATEMU_RAW_ROOT/build-INV18"
+```
+
+Other stages are hooks, negative, protection, sensitivity, correctness and cost.
+`run.py qualify` takes one full `--campaign` per required stage and a fresh
+`--output`; pass that artifact as `--qualification` for correctness. Qualify
+again including its full correctness campaign before cost. Optional
+`--timer-packet` supplies a retained C1 v2 campaign for factual timing context.
+There are no review-file, review-ID, self-review or current-HEAD parameters.
+
+Build v2 retains the experiment sources, checker/coverage code, entitlements,
+Makefile and local clock checker; compilation/signing use those retained files.
+Build commands, flags, SDK/compiler and outcome are recoverable in the build
+manifest. Runtime and qualification execute the retained runner. Campaign,
+child, invocation, qualification and build records use explicit v2 schemas;
+old records require their original Git readers and are never silently upgraded.
+One campaign identity associates children and the exact producing build.
+README edits and unrelated repository commits cannot invalidate that build.
+
+All runs retain the frozen schedule and checksum manifest. Exact-child watchdogs
+preserve partial stdout/stderr/status. A campaign never replenishes samples or
+replaces unfavorable controls. Raw and build directories are exclusive beneath
+external `NATEMU_RAW_ROOT`. No native campaign is part of migration validation.
 
 The current covering design has 482 cells: 42,876 hook children, 36 negatives,
 1,944 protection children, 1,446 sensitivity children, 2,410 correctness children
@@ -233,3 +237,73 @@ are not inferred. Multiple non-core interactions, executable remapping, write-
 region faults, cancellation, lifecycle and real guest semantics remain debt.
 Neither a finite pass nor a timeout completes the full question or selects
 an architecture.
+
+## Bounded first native stage — 2026-09-05
+
+Only the existing complete `preflight` stage has an execution budget in this
+return: seven children, one each for I/S/E/V/M-data-map/M-data-protect/
+M-jit-protect, with unchanged one-reader/rate-one/signing-A cell selection,
+seed 18001, four warmups, 32 publications and 128 minimum calls. This stage
+can expose a basic instrument/protocol failure; successful preflight alone
+qualifies no stress/cost cell and establishes no shared-code protocol finding.
+
+The per-child ceiling remains 30 s (210 s aggregate child ceilings). A 900 s
+parent wall timer covers the stage loop, per-job environment capture, native
+waiting and checking. Initial source/build/signature checks precede this timer;
+their platform commands each have 10 s timeouts. Each native output file has
+an inherited 128 MiB RLIMIT_FSIZE ceiling, so stdout and stderr total at most
+256 MiB per child. Seven such pairs total at most 1792 MiB, leaving 256 MiB
+for metadata inside the 2 GiB campaign output threshold. The runner monitors
+total output and a 1 GiB free-disk reserve while waiting and between children.
+Polling thresholds are stop conditions, not filesystem quotas; terminal
+failure metadata and partial artifacts are retained even after a cutoff.
+
+Any invalid, timed-out, unavailable or other unqualified preflight outcome
+stops later jobs, which remain explicitly not-run. A deadline/output/reserve
+cutoff kills and reaps the owned child process group. Failure records and
+checksums remain; there are no replacement children. Campaign v3 requires
+a matching stage budget; historical v2 campaigns keep their original readers.
+
+Full plan expansion still totals 55,949 children and 1,678,470 s (19.43 days)
+of child timeout ceilings. Planning estimates for hooks/correctness/cost are
+not storage caps, and extra dispatcher calls can exceed those estimates. All
+other full stages retain their original cells/counts but refuse execution until
+their aggregate resource schedules are explicitly budgeted and reviewed.
+Cost also awaits applicable accepted clocks and controls. This staged return
+does not resolve those outstanding obligations or complete INV-01-18.
+
+Author checks: existing 34 trace, 22 protection, six clock and three negative
+classification fixtures pass, along with retained-identity/qualification checks
+and synthetic child success, wall deadline, output threshold, kernel file cap
+and low-disk-reserve fixtures. No native experiment ran during preparation.
+
+## R18-F1 failure-path correction and fixed follow-up
+
+The first preflight stopped on M-jit-protect's exit78/errno13 before its queued
+mapping records drained. Its immutable artifact remains incomplete. A new
+synchronous `INV-01-18-mprotect-failure-v1` stderr record now retains address,
+length, both requested protections, first-call result/errno and whether the
+restore was attempted. A skipped restore has null result/errno; it is never
+fabricated as a failed actual call. The reporter runs before terminal exit.
+The consumer requires matching producer run/build identity and selected
+JIT/data extent/protection before attaching a failure witness. Exit78 cannot
+overwrite an invalid producer identity.
+
+Synthetic reporter fixtures fabricate first-call and restore-call failures,
+with no mprotect invocation, and reject missing fields, wrong extent/protection
+and confused attempted/skipped restore. Real dummy-child consumer fixtures
+show wrong/missing run/build headers remain INVALID despite a plausible witness.
+The complete existing fixture suite also remains required before execution.
+
+Proposed follow-up: one newly built seven-child preflight, identical frozen
+counts/order/cells and the same 900s/2GiB limits, after independent review of
+this correction. Its purpose is to distinguish the previously unrecorded syscall
+outcome, not replace the original partial campaign or recover its timings.
+Stop on the first unavailable/invalid result; preserve all unrun jobs. No further
+repeat or replica follows automatically from this diagnostic collection.
+
+The proposed full36-child negative stage now has explicit1,800-second/2GiB
+aggregate thresholds,128MiB per output file and1GiB free reserve. Its inputs
+and controls are unchanged; independent pre-execution acceptance is still
+required as recorded by the investigation. Other unbudgeted stages still refuse
+execution, and a completed negative stage alone cannot qualify stress/cost.

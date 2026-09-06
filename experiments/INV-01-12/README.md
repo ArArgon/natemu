@@ -5,9 +5,9 @@ Experiment code for `INV-01-12`, answering `Q-01-12` and testing kill assumption
 branch of `KA-04`).
 
 Prototype code exists to test a mechanism and is discarded after Track 01. It is
-not the emulator, not a design, and produces no performance result. Nothing here
-is evidence until the method and code gates pass and an evidence run produces a
-manifest.
+not the emulator, not a design, and produces no performance result. New evidence collection follows the [research workflow](../../docs/research/README.md);
+the [investigation](../../docs/research/investigations/INV-01-12.md) owns findings
+and current work.
 
 ## What it does
 

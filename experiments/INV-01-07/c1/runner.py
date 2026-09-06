@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""M07-C1 build-only pipeline and reviewed fixed-campaign supervisor.
+"""M07-C1 build-only pipeline and fixed-campaign supervisor.
 
-This code is NOT independently accepted merely because it exists. Build runs
-synthetic tests/compiler/signing/disassembly, never the producer. Campaign
-requires an exact reviewed gate receipt; structural output is never evidence
-approval. File hashes/receipt syntax prevent accidental mismatches, not fraud
-by a malicious parent/operator. No arbitrary external benchmark detector is
-claimed: the explicit operator assertion and project lock are both required.
+Review is a human workflow prerequisite. Runtime validates retained build
+integrity, child identity and controls; it does not interpret approval prose.
 """
 import argparse
 import errno
@@ -21,58 +17,44 @@ import signal
 import stat
 import subprocess
 import sys
+import uuid
+import platform
+import socket
 
 import artifact
 import cells
 import check
 import core
 
-REPOSITORY = Path(__file__).resolve().parents[3]
+REPOSITORY = artifact.repository()
 SOURCE_PREFIX = "experiments/INV-01-07/c1/"
-METHOD_PATH = "docs/research/investigations/INV-01-07.md"
-# Fixed, known-number reviews. REV-196 is the independent critique that opened
-# R2; it is permanently `revise` in this repository (REV-196.md is frozen).
-# The independent RETURN that closes R2 gets a new number each cycle and is
-# therefore supplied by the gate JSON, not hardcoded here (see
-# `independent_return`).
-REVIEWS = {name: "docs/research/reviews/REV-" + name + ".md"
-           for name in ("193", "194", "195", "196")}
-EXPECTED_VERDICT = {"193": "accept", "194": "accept", "195": "accept", "196": "revise"}
-INDEPENDENT_REVIEWS = ("194", "196")
-CRITIQUE_REVIEW = "196"
 MODES = ("backward", "zero-nsec", "omit-clock", "omit-contention",
          "pthread-error", "global-inversion")
 SCHEDULE = tuple((seed, "normal") for seed in (70701, 70702, 70703)) + tuple(
     (70701, mode) for mode in MODES)
 CHILD_SECONDS = 300
 EXPECTED_ARRAY_BYTES = 226962048
-BUILD_SCHEMA = "INV-01-07-clock-c1-build-v1"
-GATE_SCHEMA = "INV-01-07-clock-c1-gate-v2"
+BUILD_SCHEMA = "INV-01-07-clock-c1-build-v2"
+CAMPAIGN_SCHEMA = "INV-01-07-clock-c1-campaign-v2"
 FAILURE_SCHEMA = "INV-01-07-clock-c1-failure-v1"
 SDK_HEADERS = ("mach/mach_time.h", "time.h", "pthread.h", "pthread/qos.h", "sys/qos.h",
                "CommonCrypto/CommonDigest.h")
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 PUBLIC_CODES = frozenset("""
-dirty-reviewed-scope uncommitted-review-or-method review-hash review-id
-review-not-accepted review-independence gate-location gate-fields gate-status
-gate-reviews revision-changed reviewed-source-mismatch method-changed
-independent-return-fields independent-return-review-id independent-return-file
-independent-return-not-against-critique independent-return-type independent-return-subject
-build-manifest-hash build-fields build-status-or-source build-artifact-inventory
-build-artifact-path build-artifact-hash build-header-inventory sdk-header-changed
+build-fields build-status-or-source build-artifact-inventory build-identity
+build-artifact-path build-artifact-hash build-changed build-changed-during-child timebase-changed
 producer-not-executable unresolved-revision unresolved-repository git-command-failed
 source-path source-symlink incomplete-source-inventory missing-NATEMU_RAW_ROOT
 repository-internal-root destination-type destination-absolute
 destination-parent-canonical destination-outside-root destination-exists
 native-exclusivity-not-asserted preflight-payload-cap insufficient-disk-space
-gate-changed disk-space-lost environment-identity-changed gate-changed-during-child
+disk-space-lost environment-identity-changed
 child-destination-exists child-directory-changed child-not-completed
 producer-command-mismatch unexpected-control-rejection control-wrong-process-status
 failure-fields failure-identity control-wrong-failure failure-domain
 control-wrong-pthread-injection control-wrong-zero-nsec-status failure-with-completed-record
 control-wrong-omission-size control-wrong-omission-target execution-fields
 execution-identity execution-order resource-preflight resource-complete resource-payload
-build-source-not-committed-clean build-source-changed build-source-became-dirty
 lock-identity launch-parent launch-mode-seed launch-output launch-message-size
 launch-pipe-short-write command-output-cap output-symlink output-not-regular
 output-file-cap campaign-payload-cap injection-not-detected
@@ -138,8 +120,6 @@ def external_root(value):
     root = artifact.canonical_directory(value, "raw-root")
     require(root != REPOSITORY and not root.is_relative_to(REPOSITORY),
             "repository-internal-root")
-    require(REPOSITORY.resolve(strict=True) == REPOSITORY
-            and (REPOSITORY / ".git").exists(), "unresolved-repository")
     return root
 
 
@@ -162,166 +142,43 @@ def command(args, *, timeout=60, cwd=None):
     return completed
 
 
-def git(*args):
-    result = command(["git", "-C", str(REPOSITORY), *args])
-    require(result.returncode == 0, "git-command-failed")
-    return result.stdout.decode("utf-8", errors="strict")
+def snapshot_sources(output):
+    source = REPOSITORY / SOURCE_PREFIX
+    destination = output / "sources"
+    destination.mkdir()
+    for path in sorted(source.iterdir()):
+        if path.suffix in (".py", ".c"):
+            require(path.resolve(strict=True) == path, "source-symlink")
+            write_new(destination / path.name, artifact.read_regular(path, artifact.PAYLOAD_LIMIT))
+    require((destination / "producer.c").is_file() and (destination / "runner.py").is_file(),
+            "incomplete-source-inventory")
+    write_json(destination / "source-context.json", {"repository": str(REPOSITORY)})
+    return destination
 
 
-def revision():
-    value = git("rev-parse", "HEAD").strip()
-    require(re.fullmatch(r"[0-9a-f]{40}", value) is not None, "unresolved-revision")
-    return value
-
-
-def source_files():
-    names = git("ls-files", "-z", "--", SOURCE_PREFIX).split("\0")
-    result = {}
-    for name in filter(None, names):
-        require(name.startswith(SOURCE_PREFIX) and ".." not in Path(name).parts,
-                "source-path")
-        path = REPOSITORY / name
-        require(path.resolve(strict=True) == path, "source-symlink")
-        result[name] = file_digest(path)
-    require(SOURCE_PREFIX + "producer.c" in result
-            and SOURCE_PREFIX + "runner.py" in result, "incomplete-source-inventory")
-    return result
-
-
-def clean_scope(extra_paths=()):
-    """`extra_paths` covers gate-supplied files not known at import time (the
-    independent return review, whose number/path are assigned per cycle) so
-    a campaign cannot collect while its own authorising review is an
-    untracked or otherwise dirty working-tree file."""
-    paths = [SOURCE_PREFIX, METHOD_PATH, *REVIEWS.values(), *extra_paths]
-    require(git("status", "--porcelain=v1", "-z", "--untracked-files=all", "--", *paths) == "",
-            "dirty-reviewed-scope")
-    for path in paths[1:]:
-        require(git("ls-files", "--error-unmatch", "--", path).strip() == path,
-                "uncommitted-review-or-method")
-
-
-def review_record(path, number, expected_hash, *, independent, verdict="accept"):
-    """`path` is passed explicitly: fixed reviews resolve it from REVIEWS,
-    but the independent return review's number/path are gate-supplied."""
-    data = artifact.read_regular(path, artifact.METADATA_LIMIT)
-    require(type(expected_hash) is str and HEX.fullmatch(expected_hash)
-            and digest(data) == expected_hash, "review-hash")
-    text = data.decode("utf-8", errors="strict")
-    require(len(re.findall(r"^- Review ID(?: \([^\n]*\))?:\s*`REV-" + number + r"`", text, re.M)) == 1,
-            "review-id")
-    other_verdicts = "|".join(sorted({"accept", "revise", "reject"} - {verdict}))
-    require(len(re.findall(r"^- Verdict:\s*`" + verdict + r"`(?:[.\s]|$)", text, re.M)) == 1
-            and not re.search(r"^- Verdict:\s*`(?:" + other_verdicts + r")`", text, re.M),
-            "review-not-accepted")
-    label = "independent" if independent else "self"
-    require(len(re.findall(r"^- Independence:\s*`" + label + r"`", text, re.M)) == 1,
-            "review-independence")
-    return text
-
-
-def receipt(text, label, value):
-    matches = re.findall(r"^- " + re.escape(label) + r":\s*`([0-9a-f]{64})`\s*$", text, re.M)
-    require(matches == [value], "review-receipt:" + label)
-
-
-def independent_return_shape(entry):
-    """Structural checks only (no disk read): derives (number, file) so
-    `load_gate` can fold the gate-supplied review path into `clean_scope()`
-    before trusting its content."""
-    cells.fields(entry, ("review_id", "file", "sha256", "expected_verdict", "independence"),
-                 "independent-return-fields")
-    number = entry["review_id"]
-    require(type(number) is str and re.fullmatch(r"[1-9][0-9]{1,4}", number)
-            and number not in REVIEWS, "independent-return-review-id")
-    require(entry["file"] == "docs/research/reviews/REV-" + number + ".md",
-            "independent-return-file")
-    require(entry["expected_verdict"] == "accept", "independent-return-fields")
-    require(entry["independence"] == "independent", "independent-return-fields")
-    return number, entry["file"]
-
-
-def independent_return_record(entry):
-    """The independent RETURN review (against the fixed critique196) gets a
-    new number each cycle, so its id/file/verdict/independence are supplied
-    by the gate JSON itself and independently re-verified here, not assumed.
-    It must also be a `code` review of this exact subject: nothing else pins
-    its type/subject, since (unlike reviews193-196) its number is not fixed."""
-    number, file = independent_return_shape(entry)
-    text = review_record(REPOSITORY / file, number, entry["sha256"],
-                         independent=True, verdict="accept")
-    require(len(re.findall(r"^- Review type:\s*`code`(?:[.\s]|$)", text, re.M)) == 1,
-            "independent-return-type")
-    subject = re.search(r"^- Subject ID\(s\)[^\n]*:(.*?)(?=\n- |\n\n|\Z)", text, re.M | re.S)
-    require(subject is not None and "INV-01-07" in subject.group(1)
-            and "M07-C1" in subject.group(1), "independent-return-subject")
-    require("REV-" + CRITIQUE_REVIEW in text, "independent-return-not-against-critique")
-    return text
-
-
-def load_gate(path, root):
-    gate_path = Path(path)
-    require(gate_path.is_absolute() and gate_path.resolve(strict=True) == gate_path
-            and gate_path.is_relative_to(root), "gate-location")
-    gate = artifact.read_json(gate_path)
-    cells.fields(gate, ("schema", "revision", "source_files", "method_sha256", "reviews",
-                       "independent_return", "build_directory", "build_sha256",
-                       "required_changes_closed"),
-                 "gate-fields")
-    require(gate["schema"] == GATE_SCHEMA and gate["required_changes_closed"] is True,
-            "gate-status")
-    _, return_file = independent_return_shape(gate["independent_return"])
-    clean_scope(extra_paths=(return_file,))
-    require(gate["revision"] == revision(), "revision-changed")
-    current_sources = source_files()
-    require(gate["source_files"] == current_sources, "reviewed-source-mismatch")
-    method_hash = file_digest(REPOSITORY / METHOD_PATH)
-    require(gate["method_sha256"] == method_hash, "method-changed")
-    cells.fields(gate["reviews"], ("193", "194", "195", "196"), "gate-reviews")
-    review_text = {}
-    for number in REVIEWS:
-        review_text[number] = review_record(REPOSITORY / REVIEWS[number], number, gate["reviews"][number],
-                                            independent=number in INDEPENDENT_REVIEWS,
-                                            verdict=EXPECTED_VERDICT[number])
-    return_text = independent_return_record(gate["independent_return"])
-    build_dir = artifact.canonical_directory(gate["build_directory"], "build-directory")
-    require(build_dir.is_relative_to(root) and build_dir != root, "build-outside-root")
-    require(file_digest(build_dir / "build.json", artifact.METADATA_LIMIT)
-            == gate["build_sha256"], "build-manifest-hash")
-    build = artifact.read_json(build_dir / "build.json")
-    cells.fields(build, ("schema", "source_files", "source_revision", "files", "commands",
-                        "sdk", "compiler", "headers", "validation_exit", "native_executed"),
-                 "build-fields")
-    require(build["schema"] == BUILD_SCHEMA and build["source_files"] == current_sources
-            and type(build["validation_exit"]) is int and build["validation_exit"] == 0
-            and build["native_executed"] is False, "build-status-or-source")
-    require(type(build["files"]) is dict and {"clock_c1", "disassembly.stdout", "validation.stdout",
-                                             "validation.stderr"}.issubset(build["files"]),
+def load_build(path, root):
+    directory = artifact.canonical_directory(path, "build-directory")
+    require(directory != root and directory.is_relative_to(root), "build-outside-root")
+    record = artifact.read_json(directory / "build.json")
+    cells.fields(record, ("schema", "build_id", "files", "commands", "sdk", "compiler",
+                          "headers", "validation_exit", "native_executed"), "build-fields")
+    require(record["schema"] == BUILD_SCHEMA and record["validation_exit"] == 0
+            and type(record["validation_exit"]) is int and record["native_executed"] is False,
+            "build-status-or-source")
+    require(type(record["build_id"]) is str and re.fullmatch(r"[0-9a-f]{32}", record["build_id"]),
+            "build-identity")
+    require(type(record["files"]) is dict and {"clock_c1", "sources/producer.c", "sources/runner.py", "sources/source-context.json",
+            "sources/artifact.py", "sources/core.py", "sources/cells.py", "sources/check.py", "sources/clock_evidence.py",
+            "disassembly.stdout", "validation.stdout", "validation.stderr"}.issubset(record["files"]),
             "build-artifact-inventory")
-    for name, expected in build["files"].items():
-        require(type(name) is str and Path(name).name == name and name not in (".", ".."),
-                "build-artifact-path")
-        require(type(expected) is str and HEX.fullmatch(expected)
-                and file_digest(build_dir / name) == expected, "build-artifact-hash")
-    sdk = artifact.canonical_directory(build["sdk"], "build-sdk")
-    expected_headers = {str(sdk / "usr/include" / name) for name in SDK_HEADERS}
-    clockid = sdk / "usr/include/sys/_types/_clockid_t.h"
-    if clockid.exists():
-        expected_headers.add(str(clockid))
-    require(type(build["headers"]) is dict and set(build["headers"]) == expected_headers,
-            "build-header-inventory")
-    for path, expected in build["headers"].items():
-        require(type(path) is str and Path(path).is_absolute()
-                and type(expected) is str and HEX.fullmatch(expected)
-                and file_digest(Path(path)) == expected,
-                "sdk-header-changed")
-    # Receipts bind the independent RETURN (not the frozen revise196 critique)
-    # to these exact bytes: 196 will never carry a post-completion receipt.
-    receipt(return_text, "C1 source SHA-256", digest(canonical_json(current_sources)))
-    receipt(return_text, "C1 build SHA-256", gate["build_sha256"])
-    receipt(return_text, "C1 method SHA-256", method_hash)
-    require(os.access(build_dir / "clock_c1", os.X_OK), "producer-not-executable")
-    return gate, build_dir / "clock_c1"
+    for name, expected in record["files"].items():
+        item = directory / name
+        require(type(name) is str and not Path(name).is_absolute() and ".." not in Path(name).parts
+                and item.resolve(strict=True) == item, "build-artifact-path")
+        require(type(expected) is str and HEX.fullmatch(expected) and file_digest(item) == expected,
+                "build-artifact-hash")
+    require(os.access(directory / "clock_c1", os.X_OK), "producer-not-executable")
+    return record, directory / "clock_c1"
 
 
 class CampaignLock:
@@ -359,7 +216,7 @@ def launch_message(output, seed, mode, parent_pid):
 
 
 def supervise(executable, output, seed, mode, campaign, root):
-    """Only called by campaign after gate checks; tests use a mocked process."""
+    """Only called by campaign after retained build checks; tests use a mocked process."""
     require(not output.exists(), "child-destination-exists")
     stem = output.name
     message = launch_message(output, seed, mode, os.getpid())
@@ -605,22 +462,28 @@ def campaign(args):
     require(shutil.disk_usage(root).free >= len(SCHEDULE) * (artifact.PAYLOAD_LIMIT + 4 * 1024 * 1024),
             "insufficient-disk-space")
     with CampaignLock():
-        gate, executable = load_gate(args.gate, root)
+        build_record, executable = load_build(args.build, root)
+        run_id = uuid.uuid4().hex
+        build_id = build_record["build_id"]
         output.mkdir(mode=0o700)
-        rows = [{"index": i, "seed": seed, "mode": mode, "status": "NOT_RUN"}
+        rows = [{"index": i, "seed": seed, "mode": mode, "status": "NOT_RUN", "run_id": run_id, "build_id": build_id}
                 for i, (seed, mode) in enumerate(SCHEDULE)]
-        write_json(output / "plan.json", {"schema": "INV-01-07-clock-c1-campaign-v1",
-                   "schedule": rows, "gate": gate, "gate_sha256": file_digest(Path(args.gate)),
+        write_json(output / "plan.json", {"schema": CAMPAIGN_SCHEMA, "run_id": run_id, "build_id": build_id,
+                   "schedule": rows, "build_directory": args.build, "build": build_record,
                    "expected_array_bytes_per_complete_child": EXPECTED_ARRAY_BYTES,
                    "child_watchdog_seconds": CHILD_SECONDS, "native_overlap_operator_assertion": True,
                    "evidence_approval": False})
         error = None
+        context = {}
         try:
             before = environment_snapshot()
             write_json(output / "environment-before.json", before)
+            context = {"host_id": socket.gethostname(), "architecture": platform.machine(),
+                       "host_model": command(["/usr/sbin/sysctl", "-n", "hw.model"]).stdout.decode().strip(),
+                       "os_build": command(["/usr/bin/sw_vers", "-buildVersion"]).stdout.decode().strip()}
             for row in rows:
-                repeated_gate, repeated_exe = load_gate(args.gate, root)
-                require(repeated_gate == gate and repeated_exe == executable, "gate-changed")
+                repeated_build, repeated_exe = load_build(args.build, root)
+                require(repeated_build == build_record and repeated_exe == executable, "build-changed")
                 require(shutil.disk_usage(root).free >= artifact.PAYLOAD_LIMIT + 4 * 1024 * 1024,
                         "disk-space-lost")
                 current = environment_snapshot()
@@ -631,15 +494,22 @@ def campaign(args):
                 row["status"] = "STARTED"
                 terminal = supervise(executable, directory, row["seed"], row["mode"], output, root)
                 row["process"] = terminal
+                write_json(directory / "identity.json", {"run_id": run_id, "build_id": build_id,
+                           "index": row["index"], "seed": row["seed"], "mode": row["mode"]})
                 after = environment_snapshot()
                 write_json(output / (stem + ".environment-after.json"), after)
                 require(environment_identity(after) == environment_identity(before), "environment-identity-changed")
-                post_gate, post_exe = load_gate(args.gate, root)
-                require(post_gate == gate and post_exe == executable, "gate-changed-during-child")
+                post_build, post_exe = load_build(args.build, root)
+                require(post_build == build_record and post_exe == executable, "build-changed-during-child")
                 result = inspect_child(directory, root, row["seed"], row["mode"], terminal)
                 serialized = json.dumps(result, default=check.encode, sort_keys=True, allow_nan=False).encode() + b"\n"
                 write_new(directory / "check.json", serialized)
                 row["status"] = result["status"]
+                if row["mode"] == "normal":
+                    timebase = artifact.read_json(directory / "record.json")["timebase"]
+                    timebase = {key: timebase[key] for key in ("numer", "denom")}
+                    require("timebase" not in context or context["timebase"] == timebase, "timebase-changed")
+                    context["timebase"] = timebase
                 write_json(output / (stem + ".receipt.json"), row)
         except BaseException as caught:
             error = public_error(caught)
@@ -663,7 +533,8 @@ def campaign(args):
             write_json(output / "inventory-failure.json", error)
         public_rows = rows if complete else [{**row, "status": "CHECKED_NOT_PROMOTED"
                                                if row["status"] == "STRUCTURAL_PASS" else row["status"]} for row in rows]
-        write_json(output / "campaign.json", {"status": "COMPLETE_STRUCTURAL_CAMPAIGN" if complete else "INCOMPLETE",
+        write_json(output / "campaign.json", {"schema": CAMPAIGN_SCHEMA, "run_id": run_id,
+                   "build_id": build_id, "context": context, "status": "COMPLETE_STRUCTURAL_CAMPAIGN" if complete else "INCOMPLETE",
                    "children": public_rows, "failure": error, "sha256": hashes, "hashing_complete": hashing_complete,
                    "evidence_approval": False, "replication_or_result_review": False})
         return 0 if complete else 1
@@ -673,34 +544,28 @@ def build(args):
     """Compiler/signing/synthetic validation only; no execution of clock_c1."""
     root = external_root(os.environ.get("NATEMU_RAW_ROOT"))
     output = new_destination(args.output, root)
-    # Method is accepted before authoring/building; code196 is deliberately
-    # not required to create the binary/disassembly which it must inspect.
-    review_record(REPOSITORY / REVIEWS["194"], "194", file_digest(REPOSITORY / REVIEWS["194"]),
-                  independent=True)
-    sources = source_files()
-    require(git("status", "--porcelain=v1", "-z", "--untracked-files=all", "--", SOURCE_PREFIX) == "",
-            "build-source-not-committed-clean")
-    source_revision = revision()
     output.mkdir(mode=0o700)
+    sources = output / "sources"
     calls = []
     def run(label, argv, timeout=60):
         calls.append({"stage": label, "argv": argv})
-        result = command(argv, timeout=timeout, cwd=REPOSITORY)
+        result = command(argv, timeout=timeout, cwd=sources)
         write_new(output / (label + ".stdout"), result.stdout)
         write_new(output / (label + ".stderr"), result.stderr)
         require(result.returncode == 0, "build-stage:" + label)
         return result.stdout.decode("utf-8", errors="strict").strip()
     try:
+        snapshot_sources(output)
         sdk = str(Path(run("sdk", ["xcrun", "--sdk", "macosx", "--show-sdk-path"])).resolve(strict=True))
         run("sdk-version", ["xcrun", "--sdk", "macosx", "--show-sdk-version"])
         compiler = run("compiler", ["xcrun", "--sdk", "macosx", "clang", "--version"])
         run("validation", [sys.executable, "-B", "-m", "unittest", "discover", "-s",
-                           SOURCE_PREFIX.rstrip("/"), "-p", "test_*.py", "-v"], timeout=240)
+                           str(sources), "-p", "test_*.py", "-v"], timeout=240)
         run("compile", ["xcrun", "--sdk", "macosx", "clang", "-std=c11", "-O2", "-g",
                         "-Wall", "-Wextra", "-Werror", "-Wno-deprecated-declarations", "-pthread",
                         "-isysroot", sdk,
                         '-DC1_REPO="' + str(REPOSITORY) + '"',
-                        str(REPOSITORY / SOURCE_PREFIX / "producer.c"), "-o", str(output / "clock_c1")])
+                        str(sources / "producer.c"), "-o", str(output / "clock_c1")])
         run("sign", ["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", str(output / "clock_c1")])
         run("signature", ["/usr/bin/codesign", "-d", "--verbose=4", str(output / "clock_c1")])
         run("entitlements", ["/usr/bin/codesign", "-d", "--entitlements", ":-", str(output / "clock_c1")])
@@ -708,20 +573,27 @@ def build(args):
         header_names = list(SDK_HEADERS)
         if (Path(sdk) / "usr/include/sys/_types/_clockid_t.h").exists():
             header_names.append("sys/_types/_clockid_t.h")
-        headers = {str(Path(sdk) / "usr/include" / name): file_digest(Path(sdk) / "usr/include" / name)
+        headers = {str(Path(sdk) / "usr/include" / name): file_digest((Path(sdk) / "usr/include" / name).resolve())
                    for name in header_names}
-        require(sources == source_files() and revision() == source_revision, "build-source-changed")
-        require(git("status", "--porcelain=v1", "-z", "--untracked-files=all", "--", SOURCE_PREFIX) == "",
-                "build-source-became-dirty")
-        write_json(output / "build.json", {"schema": BUILD_SCHEMA, "source_files": sources,
-                   "source_revision": source_revision, "files": hash_tree(output), "commands": calls,
+        # Retain the selected SDK declarations as recoverable build inputs.
+        for name in header_names:
+            target = output / "sdk-headers" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            write_new(target, artifact.read_regular((Path(sdk) / "usr/include" / name).resolve(), artifact.PAYLOAD_LIMIT))
+        write_json(output / "build.json", {"schema": BUILD_SCHEMA, "build_id": uuid.uuid4().hex,
+                   "files": hash_tree(output), "commands": calls,
                    "sdk": sdk, "compiler": compiler, "headers": headers,
                    "validation_exit": 0, "native_executed": False})
         return 0
     except BaseException as error:
         diagnostic(output, "build-error", error)
-        write_json(output / "build-failure.json", {"error": public_error(error),
-                   "commands": calls, "source_files": sources, "native_executed": False})
+        try:
+            files, hashing_complete = hash_tree(output), True
+        except (OSError, ValueError, core.Invalid):
+            files, hashing_complete = {}, False
+        write_json(output / "build-failure.json", {"schema": "INV-01-07-clock-c1-build-failure-v2",
+                   "error": public_error(error), "files": files, "hashing_complete": hashing_complete,
+                   "commands": calls, "source_snapshot": str(sources), "native_executed": False})
         raise
 
 
@@ -732,10 +604,17 @@ def main(argv=None):
         item = sub.add_parser(name)
         item.add_argument("output", help="new canonical absolute destination below NATEMU_RAW_ROOT")
         if name == "campaign":
-            item.add_argument("--gate", required=True, help="exact external reviewed gate JSON")
+            item.add_argument("--build", required=True, help="retained v2 build directory")
             item.add_argument("--no-other-native-benchmarks", action="store_true")
     args = parser.parse_args(argv)
     try:
+        if args.action == "campaign":
+            _, executable = load_build(args.build, external_root(os.environ.get("NATEMU_RAW_ROOT")))
+            retained_runner = executable.parent / "sources" / "runner.py"
+            if Path(__file__).resolve() != retained_runner:
+                os.execv(sys.executable, [sys.executable, "-B", str(retained_runner), "campaign",
+                         args.output, "--build", args.build,
+                         *(["--no-other-native-benchmarks"] if args.no_other_native_benchmarks else [])])
         return build(args) if args.action == "build" else campaign(args)
     except Exception as error:
         print(json.dumps({"status": "REFUSED_OR_FAILED", "error": public_error(error),

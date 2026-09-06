@@ -1,7 +1,12 @@
 # Source ledger
 
-This ledger maps every inspected source to the claims it supports or
-contradicts. It starts empty.
+> Historical ledger. Preserved entries describe prior work and impose no update
+> obligation on new research. Current findings and substantive open issues live
+> in each investigation; [the workflow](README.md) governs new work. Former gate
+> rules and templates below are historical context, not current instructions.
+
+
+This ledger preserves prior source-to-claim mappings for recovery and audit.
 
 ## Admissibility
 

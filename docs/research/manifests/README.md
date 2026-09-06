@@ -1,13 +1,10 @@
 # Raw-data manifests
 
-One file per immutable raw artifact, as required by the
-[evidence policy](../evidence-policy.md). The artifact itself stays outside
-Git under the external raw-data root; only the manifest is committed.
+Existing `MAN-<track>-<nn>-<nn>.md` manifests are historical artifact locators,
+preserved at these paths with their original checksums, interpretation and
+producing-code references. They impose no ledger maintenance on new work.
 
-- Identifier: `MAN-<track>-<nn>-<nn>`, the investigation number then a
-  sequence, per the [identifier table](../README.md#identifiers), for example
-  `MAN-01-03-02`.
-- Filename: `<identifier>.md`.
-- Required contents: artifact path relative to the raw-data root, SHA-256
-  digest, producing experiment code and revision, method, environment,
-  inputs, and the investigation and result it belongs to.
+New evidence follows [the retained-run contract](../README.md#retained-experiment-runs).
+Its investigation links directly to external artifacts under `NATEMU_RAW_ROOT`,
+with checksums, run identity, retained source/build inputs, toolchain/SDK, flags,
+environment, controls and outcome. Raw data stays outside Git.

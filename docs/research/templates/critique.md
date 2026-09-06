@@ -1,66 +1,29 @@
-# Critique template
+# INV-<track>-<nn> — pre-execution / findings review
 
-Copy this file for each review. The fields below are intentionally
-unpopulated; the template itself establishes no verdict.
+- Reviewer and independent context:
+- Subject and material inspected (named sections, code, fixtures, artifacts):
+- Date and verdict: accept / revise / reject
 
-## Metadata
+For pre-execution review examine question, sources, method, controls, and code.
+For findings review examine results/source-only conclusions, applicability,
+alternatives, independent replication, and adversarial challenges. In both cases
+consider correctness, reproduction, platform/SMP limits, and stopping conditions.
 
-- Review ID (`REV-<nnn>`, per the [identifier table](../README.md#identifiers)):
-- Review type: `question | source | method | code | result | replication | adversarial | synthesis`
-- Subject ID(s):
-- Reviewer/session:
-- Date:
+## Substantive blockers
 
-## Reviewer independence
+For each blocker: consequence; evidence and reusable reproduction/fixture;
+smallest remedy; closure condition. Pending review is work status, not a defect.
+Fix editorial issues directly and disclose them below.
 
-- Independence: `self | independent`
-- Different author and separately recorded review context (if independent):
-- Conflicts, prior involvement, and limits on independence:
+## Editorial edits and limits
 
-## Artifacts inspected
+Disclose direct edits and inspection limits. A load-bearing change authored by
+this reviewer requires another independent reviewer.
 
-| Artifact | Version/manifest | Exact sections or outputs inspected | Integrity/location |
-| --- | --- | --- | --- |
-|  |  |  |  |
+## Returns
 
-## Challenge checklist
-
-Record a disposition for every dimension. `not-applicable` requires a reason;
-no applicable dimension may be omitted.
-
-| Challenge dimension | Disposition (`issue` / `clear` / `not-applicable`) | NA reason | Evidence/artifact reference | Finding | Required action | Action status |
-| --- | --- | --- | --- | --- | --- | --- |
-| Scope and decision relevance |  |  |  |  |  |  |
-| Source applicability and claim-level support |  |  |  |  |  |  |
-| Method and controls |  |  |  |  |  |  |
-| Code validation, including negative/fault-injection behavior |  |  |  |  |  |  |
-| Statistics, samples, exclusions, and stop criteria |  |  |  |  |  |  |
-| Correctness criteria and failure modes |  |  |  |  |  |  |
-| Multicore behavior, vCPU/core placement, and topology assumptions |  |  |  |  |  |  |
-| Integration assumptions and product-envelope boundaries |  |  |  |  |  |  |
-| Alternative explanations and falsifiers |  |  |  |  |  |  |
-| Contradictions, unresolved evidence, and confidence |  |  |  |  |  |  |
-| Synthesis dependency chain from claims to decision |  |  |  |  |  |  |
-| Synthesis contradictions and phase-boundary review |  |  |  |  |  |  |
-
-## Synthesis-specific checks
-
-For synthesis reviews, complete the two synthesis rows in the challenge table.
-The phase-boundary finding must verify that the research outcome is `stop`,
-`continue targeted research`, or `authorize planning`; it does not authorize
-implementation.
-
-## Required changes
-
-- Required changes, owners, and return gate:
-
-## Verdict
-
-- Verdict: `accept | revise | reject`
-- Rationale:
-- Applicability limitations:
-
-`accept` is prohibited if any required action remains unresolved, any
-applicable challenge dimension lacks a disposition, or required reviewer
-independence is unmet. Use `revise` or `reject` instead, and return the work
-to the applicable earlier gate.
+Append corrections, the changed material/affected assumptions inspected by the
+same independent reviewer, each blocker disposition, and the updated verdict.
+An accept verdict requires no unresolved substantive blockers and the required
+independence. Keep this thread through returns; use no separate self-review file
+or new global review number for each exchange.

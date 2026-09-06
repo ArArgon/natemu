@@ -9,6 +9,8 @@ import copy
 import errno
 import io
 import json
+import os
+import time
 from pathlib import Path
 import subprocess
 import sys
@@ -19,7 +21,7 @@ from unittest.mock import Mock, patch
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-import authorization as auth
+import evidence as auth
 import check
 from fallback import validate_fallback, fallback_ratio, validate_full_counts
 import supervisor as sup
@@ -27,8 +29,8 @@ import supervisor as sup
 
 def valid():
     d = json.loads((ROOT / "tests/valid.json").read_text())
-    d.update(schema="INV-01-08-result-v2", method="F08-2", mode="normal",
-             code_revision="1" * 40, completed_normal=True, standalone=False,
+    d.update(schema="INV-01-08-result-v3", method="F08-2", mode="normal",
+             run_id="1" * 32, completed_normal=True, standalone=False,
              timebase={"numer": 125, "denom": 3})
     d["fallback_global_lock"] = {
         "schema": "INV-01-08-fallback-v2", "threads": 4, "allocation_size": 256,
@@ -66,14 +68,19 @@ def sequentialize(row):
 
 def build_synthetic_campaign(parent):
     """Author-created parser fixture only; no native execution. Builds a
-    complete five-member campaign directory and returns (packet, authorization,
-    authorization_sha, write) for validate_campaign tests to mutate further."""
+    complete five-member campaign directory and returns its packet, build,
+    build digest and writer for integrity mutations."""
     context = {"host_id": "synthetic", "host_model": "synthetic", "os_build": "synthetic",
                "architecture": "arm64", "timebase": {"numer": 125, "denom": 3}}
-    a = {"code_revision": "1" * 40, "code_bundle_sha256": auth.digest(auth.bundle()),
-         "clock": {"packet": {"context": context}}}
-    auth_sha = "0" * 64
-    packet = {"schema": "INV-01-08-campaign-v1", "members": {}}
+    a={"schema":"INV-01-08-build-v2","outcome":"built","run_id":"1"*32,"source_sha256":"2"*64}
+    build_dir=parent/"producing-build"
+    (build_dir/"build").mkdir(parents=True)
+    (build_dir/"build/litmus").write_text("dummy build, never executed")
+    a["artifacts"]={"build/litmus":auth.file_sha(build_dir/"build/litmus")}
+    build_manifest=build_dir/"build-manifest.json"
+    build_manifest.write_bytes(auth.canonical(a))
+    auth_sha=auth.file_sha(build_manifest)
+    packet={"schema":"INV-01-08-campaign-v3","run_id":a["run_id"],"members":{}}
 
     def write(path, value):
         path.write_bytes(auth.canonical(value))
@@ -81,15 +88,11 @@ def build_synthetic_campaign(parent):
     for mode in ("normal", "negative", "fallback-drop-write", "fallback-lock-error", "unexpected-fault"):
         location = parent / mode
         location.mkdir()
-        (location / "build").mkdir()
-        for name in ("build/litmus", "build/litmus.disasm", "build/litmus.s", "build/litmus-verify",
-                     "build/litmus-verify.disasm", "build.log", "check.txt", "stderr.txt",
-                     "environment-before.json", "environment-after.json"):
-            (location / name).write_text("synthetic parser fixture, never executed")
-        (location / "stdout.txt").write_text("")
+        for name in ("check.txt","stderr.txt","environment-before.json","environment-after.json"):
+            (location/name).write_text("synthetic")
+        (location/"stdout.txt").write_text("")
         d = valid()
-        d.update(authorization_sha256=auth_sha, code_bundle_sha256=a["code_bundle_sha256"],
-                 compiled_bundle_sha256=a["code_bundle_sha256"])
+        d.update(run_id=a["run_id"],compiled_bundle_sha256=a["source_sha256"])
         code = 0
         if mode == "negative":
             d.update(mode=mode, completed_normal=False)
@@ -115,25 +118,26 @@ def build_synthetic_campaign(parent):
             write(location / "result.json", d)
         else:
             code = 90
-        binary_sha = auth.file_sha(location / "build/litmus")
-        write(location / "invocation.json", {
-            "schema": "INV-01-08-invocation-v1",
-            "command": [str(location / "build/litmus"), "--mode", mode, "--out", str(location / "result.json")],
-            "code_revision": a["code_revision"], "binary_sha256": binary_sha, "code_bundle": auth.bundle(),
-            "authorization": {"path": "synthetic-authorization", "sha256": auth_sha}, "context": context})
-        write(location / "result.supervisor.json", {
-            "schema": "INV-01-08-supervisor-v1", "mode": mode, "returncode": code, "timed_out": False,
-            "authorization": {"sha256": auth_sha}, "authorization_validated_before_spawn": True,
-            "context": context,
-            "result_sha256": auth.file_sha(location / "result.json") if mode != "unexpected-fault" else None})
-        manifest = {"schema": "INV-01-08-execution-manifest-v1", "mode": mode,
-                    "classification_returncode": 0, "code_bundle": auth.bundle(),
+        write(location/"invocation.json",dict(schema="INV-01-08-invocation-v2",run_id=a["run_id"],
+               command=[str(build_dir/"build/litmus"),"--mode",mode,"--out",str(location/"result.json")],
+               binary_sha256=a["artifacts"]["build/litmus"],build={"path":str(build_manifest),"sha256":auth_sha}))
+        write(location/"result.supervisor.json",dict(schema="INV-01-08-supervisor-v2",run_id=a["run_id"],
+               mode=mode,returncode=code,timed_out=False,context=context,
+               result_sha256=auth.file_sha(location/"result.json") if mode!="unexpected-fault" else None))
+        manifest = {"schema": "INV-01-08-execution-manifest-v2", "mode": mode,
+                    "classification_returncode": 0, "run_id": a["run_id"],
                     "artifacts": {str(p.relative_to(location)): auth.file_sha(p)
                                   for p in location.rglob("*") if p.is_file()}}
         write(location / "manifest.json", manifest)
         packet["members"][mode] = {"path": str(location / "manifest.json"),
                                     "sha256": auth.file_sha(location / "manifest.json")}
     write(parent / "campaign.json", packet)
+    write(parent / "schedule.json", {"run_id":a["run_id"]})
+    write(parent / "campaign.supervisor.json", dict(schema="INV-01-08-campaign-supervisor-v3",
+          run_id=a["run_id"],status="completed",returncode=0,timed_out=False,output_limited=False,
+          watchdog_seconds=2700,output_limit_bytes=128*1024*1024,supervisor_elapsed_ns=1000,output_bytes=1000,
+          modes={mode:"completed" for mode in packet["members"]},
+          artifacts={str(p.relative_to(parent)):auth.file_sha(p) for p in parent.rglob("*") if p.is_file()}))
     return packet, a, auth_sha, write
 
 
@@ -165,7 +169,7 @@ class Fallback(unittest.TestCase):
             f["elapsed_ns"] = (f["end_ticks"] - f["start_ticks"]) * 125 // 3
             output = io.StringIO()
             with patch.object(check, "json_read", return_value=d), \
-                 patch.object(check, "validate_result_binding"), contextlib.redirect_stdout(output):
+                 patch.object(check, "validate_result_binding", return_value={"status":"context-matched"}), contextlib.redirect_stdout(output):
                 self.assertEqual(check.cli(["synthetic-render-fixture"]), 0)
             self.assertIn(decision + "  T2", output.getvalue())
 
@@ -238,7 +242,7 @@ class Fallback(unittest.TestCase):
         d = valid()
         d["fallback_global_lock"]["workers"][3]["id"] = 0
         self.rejected(d, "F1")
-        for key in ("experiment", "schema", "method", "code_revision", "mode", "completed_normal", "standalone", "timebase"):
+        for key in ("experiment", "schema", "method", "run_id", "mode", "completed_normal", "standalone", "timebase"):
             d = valid()
             d.pop(key)
             self.rejected(d)
@@ -307,7 +311,7 @@ class Fallback(unittest.TestCase):
             raise RuntimeError("corroboration=ELIGIBLE MEET T2")
         output = io.StringIO()
         with patch.object(check, "json_read", return_value=valid()), \
-             patch.object(check, "validate_result_binding"), \
+             patch.object(check, "validate_result_binding", return_value={"status":"context-matched"}), \
              patch.object(check, "report", side_effect=broken), contextlib.redirect_stdout(output):
             self.assertEqual(check.cli(["synthetic-not-evidence"]), 1)
         self.assertEqual(len(output.getvalue().splitlines()), 1)
@@ -486,249 +490,116 @@ class Controls(unittest.TestCase):
         self.assertEqual(sup.MODES, {"normal":600, "negative":600, "fallback-only":60,
                                     "fallback-drop-write":60, "fallback-lock-error":60, "unexpected-fault":5})
 
-    def test_native_authorize_binds_compiled_bundle_before_launch(self):
-        # REV-210 R3 counterexample: a binary compiled from a different
-        # (e.g. dirty/unreviewed) source bundle must be refused even when
-        # the accepted revision string and environment digests both match --
-        # F08_CODE_REV alone never proved which bytes were actually compiled.
-        accepted = {"code_revision": "1" * 40, "code_bundle_sha256": "2" * 64}
-        with tempfile.TemporaryDirectory(prefix="inv08-native-authorize-fixture-") as directory:
-            directory = str(Path(directory).resolve())
-            destination = Path(directory) / "must-not-exist.json"
-            env = {"NATEMU_RAW_ROOT": directory, "NATEMU_F08_AUTH_SHA256": "3" * 64,
-                   "NATEMU_F08_BUNDLE_SHA256": "2" * 64}
-            good = ("auth.json", str(destination), "normal", "125", "3", "1" * 40, "2" * 64)
-            with patch.object(sup, "load_authorization", return_value=accepted), \
-                 patch.object(sup, "file_sha", return_value="3" * 64), \
-                 patch.dict(sup.os.environ, env):
-                self.assertEqual(sup.native_authorize(good), 0)
-                stale_bundle = good[:6] + ("stale-compiled-bundle-digest",)
-                with self.assertRaises(ValueError):
-                    sup.native_authorize(stale_bundle)
-                stale_revision = good[:5] + ("0" * 40, good[6])
-                with self.assertRaises(ValueError):
-                    sup.native_authorize(stale_revision)
-            self.assertFalse(destination.exists())
-
-
-class Authorization(unittest.TestCase):
-    def test_supervisor_cli_refuses_missing_gate_before_build_or_spawn(self):
-        with tempfile.TemporaryDirectory(prefix="inv08-cli-refusal-fixture-") as directory:
-            p = Path(directory)/"synthetic-unapproved.json"
-            p.write_text('{"kind":"validation"}')
-            destination = Path(directory)/"must-not-exist"
-            with patch.object(sup.subprocess, "Popen") as native, \
-                 patch.object(sup.subprocess, "run") as build, \
-                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                code = sup.cli(["--authorization",str(p),"--directory",str(destination),"--mode","fallback-only"])
-            self.assertEqual(code, 2)
-            native.assert_not_called()
-            build.assert_not_called()
-            self.assertFalse(destination.exists())
-
-    def test_clock_gate_schema_and_applicability_with_explicit_review_mocks(self):
-        # Parser branch test only. Review/artifact functions are explicitly
-        # mocked; this does not create an accepted envelope/review on disk.
-        with tempfile.TemporaryDirectory(prefix="inv08-clock-parser-fixture-") as directory:
-            path = Path(directory)/"synthetic-envelope.json"
-            path.write_text("{}")
-            context = {"host_id":"synthetic", "host_model":"synthetic", "os_build":"synthetic",
-                       "architecture":"arm64", "timebase":{"numer":125,"denom":3}}
-            reference = {"path":"synthetic-only", "sha256":"0"*64}
-            a = {"schema":"INV-01-08-execution-authorization-v1", "kind":"evidence",
-                 "code_bundle_sha256":auth.digest(auth.bundle()), "code_revision":"1"*40,
-                 "method_review":{"path":"synthetic-only", "sha256":auth.METHOD_SHA},
-                 "code_review":reference, "code_self_review":reference,
-                 "clock":{"applicability_review":reference, "packet":{
-                     "schema":"INV-01-07-clock-prerequisite-v1", "consumer":"INV-01-08 F08-2",
-                     "reviews":{kind:dict(reference, path=kind) for kind in ("method","code","result","replication","adversarial")},
-                     "raw":[reference], "context":context, "scope_justification":"synthetic parser case"}}}
-
-            def mocked_review(base, ref, kind, binding=None, expected_id=None, independence="independent"):
-                return Path(directory)/(expected_id or ref["path"])
-
-            def git(args, **kwargs):
-                return "1"*40 if "rev-parse" in args else ""
-
-            with patch.object(auth, "review", side_effect=mocked_review), \
-                 patch.object(auth, "artifact", return_value=Path(directory)/"synthetic-raw"), \
-                 patch.object(auth.subprocess, "check_output", side_effect=git), \
-                 patch.object(auth, "live_context", return_value=context):
-                def load(value):
-                    with patch.object(auth, "json_read", return_value=value):
-                        return auth.load_authorization(path, "normal", 125, 3)
-                self.assertEqual(load(a), a)
-                variants = []
-                for key in ("clock", "code_bundle_sha256", "method_review", "code_revision",
-                            "code_review", "code_self_review"):
-                    b = copy.deepcopy(a)
-                    b.pop(key)
-                    variants.append(b)
-                for key in ("consumer", "schema", "scope_justification", "context", "raw", "reviews"):
-                    b = copy.deepcopy(a)
-                    b["clock"]["packet"].pop(key)
-                    variants.append(b)
-                for kind in a["clock"]["packet"]["reviews"]:
-                    b = copy.deepcopy(a)
-                    b["clock"]["packet"]["reviews"].pop(kind)
-                    variants.append(b)
-                for key in ("host_id", "host_model", "os_build", "architecture", "timebase"):
-                    b = copy.deepcopy(a)
-                    b["clock"]["packet"]["context"][key] = "different"
-                    variants.append(b)
-                for b in variants:
-                    with self.assertRaises((ValueError, KeyError, TypeError)):
-                        load(b)
-                b = copy.deepcopy(a)
-                b.update(kind="validation")
-                b.pop("clock")
-                with patch.object(auth, "json_read", return_value=b):
-                    self.assertEqual(auth.load_authorization(path, "fallback-only", live=False), b)
-                    with self.assertRaises(ValueError):
-                        auth.load_authorization(path, "normal", live=False)
-
-    def test_campaign_members_hashes_and_recomputed_controls(self):
-        with tempfile.TemporaryDirectory(prefix="inv08-campaign-parser-fixture-") as directory:
-            parent = Path(directory).resolve()
-            packet, a, auth_sha, write = build_synthetic_campaign(parent)
-            normal = parent/"normal/result.json"
-            auth.validate_campaign(normal, auth_sha, a)
+    def test_v2_campaign_integrity_and_run_build_mixing(self):
+        with tempfile.TemporaryDirectory(prefix="inv08-v2-fixture-") as directory:
+            parent=Path(directory).resolve()
+            packet,build,_,write=build_synthetic_campaign(parent)
+            normal=parent/"normal/result.json"
+            auth.validate_campaign(normal,build)
+            self.assertEqual(auth.validate_result_binding(normal,auth.json_read(normal))["status"],"unqualified")
             for mode in packet["members"]:
-                b = copy.deepcopy(packet)
-                b["members"].pop(mode)
-                write(parent/"campaign.json", b)
+                bad=copy.deepcopy(packet); bad["members"].pop(mode); write(parent/"campaign.json",bad)
+                with self.assertRaises(ValueError): auth.validate_campaign(normal,build)
+            write(parent/"campaign.json",packet)
+            location=parent/"fallback-drop-write"
+            original=auth.json_read(location/"result.json")
+            def restamp(raw):
+                write(location/"result.json",raw)
+                receipt=auth.json_read(location/"result.supervisor.json")
+                receipt["result_sha256"]=auth.file_sha(location/"result.json")
+                write(location/"result.supervisor.json",receipt)
+                manifest=auth.json_read(location/"manifest.json")
+                for name in ("result.json","result.supervisor.json"):
+                    manifest["artifacts"][name]=auth.file_sha(location/name)
+                write(location/"manifest.json",manifest)
+                packet["members"]["fallback-drop-write"]["sha256"]=auth.file_sha(location/"manifest.json")
+                write(parent/"campaign.json",packet)
+            for key,value in (("run_id","3"*32),("compiled_bundle_sha256","4"*64),("schema","INV-01-08-result-v2")):
+                bad=copy.deepcopy(original); bad[key]=value; restamp(bad)
+                with self.assertRaises(ValueError): auth.validate_campaign(normal,build)
+            restamp(original)
+            auth.validate_campaign(normal,build)
+            (parent/"producing-build/build/litmus").write_text("tampered")
+            with self.assertRaises(ValueError): auth.validate_result_binding(normal,auth.json_read(normal))
+
+    def test_missing_clock_keeps_correctness_without_timing_claim(self):
+        with patch.object(check,"validate_result_binding",return_value={"status":"unqualified"}), \
+             patch.object(check,"json_read",return_value=valid()),contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(check.cli(["synthetic"]),0)
+        self.assertIn("TIMING UNQUALIFIED",output.getvalue())
+        self.assertNotIn("MEET  T",output.getvalue())
+        self.assertNotIn("MISS  T",output.getvalue())
+
+    def test_watchdog_real_dummy_children(self):
+        with tempfile.TemporaryDirectory(prefix="inv08-dummy-child-") as directory:
+            root=Path(directory)
+            good=sup.supervise([sys.executable,"-c","print('synthetic child')"],root/"out",root/"err",1)
+            self.assertEqual(good["returncode"],0)
+            self.assertFalse(good["timed_out"])
+            timed=sup.supervise([sys.executable,"-c","import time; time.sleep(10)"],root/"out2",root/"err2",0.01)
+            self.assertTrue(timed["timed_out"])
+            self.assertLess(timed["returncode"],0)
+            with self.assertRaises(FileExistsError):
+                sup.supervise([sys.executable,"-c","pass"],root/"out",root/"err",1)
+
+    def test_aggregate_dummy_success_timeout_tree_and_output(self):
+        with tempfile.TemporaryDirectory(prefix="inv08-aggregate-") as directory:
+            root=Path(directory)
+            good=sup.supervise([sys.executable,"-c","print('synthetic')"],root/"out",root/"err",2,
+                               output_root=root,max_bytes=1024*1024)
+            self.assertEqual(good["returncode"],0)
+            self.assertFalse(good["output_limited"])
+            # Descendant keeps appending after its parent starts waiting. Killing
+            # only the direct child would let this heartbeat continue growing.
+            heartbeat=root/"heartbeat"
+            program="import time; f=open(%r,'a'); [(f.write('x'),f.flush(),time.sleep(.01)) for _ in range(1000)]" % str(heartbeat)
+            parent="import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',%r]); time.sleep(10)" % program
+            timed=sup.supervise([sys.executable,"-c",parent],root/"out2",root/"err2",.3,
+                                output_root=root,max_bytes=1024*1024)
+            self.assertTrue(timed["timed_out"])
+            self.assertLess(timed["returncode"],0)
+            count=heartbeat.stat().st_size
+            time.sleep(.1)
+            self.assertEqual(heartbeat.stat().st_size,count)
+            limited=sup.supervise([sys.executable,"-c","import os,time; os.write(1,b'x'*8192); time.sleep(10)"],
+                                  root/"out3",root/"err3",2,output_root=root,max_bytes=4096)
+            self.assertTrue(limited["output_limited"])
+            self.assertLess(limited["returncode"],0)
+
+    def test_aggregate_failure_retains_partial_schedule(self):
+        with tempfile.TemporaryDirectory(prefix="inv08-retained-failure-") as directory:
+            root=Path(directory).resolve()
+            campaign=root/"campaign"
+            def stopped(command, stdout, stderr, timeout, **kwargs):
+                Path(stdout).write_text("synthetic partial build")
+                Path(stderr).write_text("synthetic output limit")
+                (campaign/"producing-build").mkdir()
+                (campaign/"producing-build/partial").write_text("partial")
+                return dict(returncode=-9,timed_out=False,output_limited=True,
+                            watchdog_seconds=2700,output_limit_bytes=128*1024*1024)
+            args=__import__("argparse").Namespace(directory=str(campaign),campaign_worker=False,
+                                                 prepared_build=None,clock=None)
+            with patch.dict(os.environ,NATEMU_RAW_ROOT=str(root)), patch.object(sup,"supervise",side_effect=stopped):
+                self.assertEqual(sup.campaign(args),1)
+            receipt=auth.json_read(campaign/"campaign.supervisor.json")
+            self.assertEqual(receipt["status"],"failed")
+            self.assertEqual(receipt["modes"],{mode:"not-run" for mode in sup.CAMPAIGN_MODES})
+            self.assertIn("producing-build/partial",receipt["artifacts"])
+            auth.verify_files(campaign,receipt["artifacts"])
+
+    def test_missing_failed_outer_cannot_accept_campaign(self):
+        with tempfile.TemporaryDirectory(prefix="inv08-outer-fixture-") as directory:
+            root=Path(directory).resolve()
+            _,build,_,write=build_synthetic_campaign(root)
+            receipt=root/"campaign.supervisor.json"
+            value=auth.json_read(receipt)
+            for change in ({"status":"failed"},{"timed_out":True},{"output_limited":True},{"run_id":"9"*32}):
+                write(receipt,dict(value,**change))
                 with self.assertRaises(ValueError):
-                    auth.validate_campaign(normal, auth_sha, a)
-            write(parent/"campaign.json", packet)
-            # Even rehashed summary files cannot bless the wrong fault exit.
-            location = parent/"unexpected-fault"
-            r = json.loads((location/"result.supervisor.json").read_text())
-            r["returncode"] = 0
-            write(location/"result.supervisor.json", r)
-            m = json.loads((location/"manifest.json").read_text())
-            m["artifacts"]["result.supervisor.json"] = auth.file_sha(location/"result.supervisor.json")
-            write(location/"manifest.json", m)
-            packet["members"]["unexpected-fault"]["sha256"] = auth.file_sha(location/"manifest.json")
-            write(parent/"campaign.json", packet)
-            with self.assertRaises(ValueError):
-                auth.validate_campaign(normal, auth_sha, a)
-
-    def test_campaign_rejects_cross_authorization_bundle_revision_transplant(self):
-        # REV-210 R4 counterexample: transplant a different authorization/
-        # bundle/revision digest into one control's raw and rehash the whole
-        # raw -> receipt -> manifest -> campaign chain around it. Only
-        # normal's own binding was checked before; the control member's own
-        # producer identity was never cross-checked against the authorization
-        # actually used for the campaign.
-        with tempfile.TemporaryDirectory(prefix="inv08-campaign-transplant-fixture-") as directory:
-            parent = Path(directory).resolve()
-            packet, a, auth_sha, write = build_synthetic_campaign(parent)
-            normal = parent/"normal/result.json"
-            auth.validate_campaign(normal, auth_sha, a)  # sanity: baseline still accepted
-            location = parent/"fallback-drop-write"
-            d = json.loads((location/"result.json").read_text())
-            d.update(authorization_sha256="a"*64, code_bundle_sha256="b"*64, code_revision="c"*40)
-            write(location/"result.json", d)
-            r = json.loads((location/"result.supervisor.json").read_text())
-            r["result_sha256"] = auth.file_sha(location/"result.json")
-            write(location/"result.supervisor.json", r)
-            m = json.loads((location/"manifest.json").read_text())
-            m["artifacts"]["result.json"] = auth.file_sha(location/"result.json")
-            m["artifacts"]["result.supervisor.json"] = auth.file_sha(location/"result.supervisor.json")
-            write(location/"manifest.json", m)
-            packet["members"]["fallback-drop-write"]["sha256"] = auth.file_sha(location/"manifest.json")
-            write(parent/"campaign.json", packet)
-            with self.assertRaises(ValueError):
-                auth.validate_campaign(normal, auth_sha, a)
-
-    def test_campaign_rejects_control_compiled_bundle_transplant(self):
-        # REV-218 RC1 counterexample: validate_result_binding
-        # (src/authorization.py:196) requires the normal raw's
-        # compiled_bundle_sha256 to match the accepted bundle, but the
-        # per-member producer-binding tuple in validate_campaign
-        # (src/authorization.py:270-273) never checked it for the four
-        # control raws, so a control raw stamped by a foreign compiled
-        # binary was still accepted whenever its authorization/bundle/
-        # revision/timebase fields were honest.
-        with tempfile.TemporaryDirectory(prefix="inv08-campaign-compiled-bundle-fixture-") as directory:
-            parent = Path(directory).resolve()
-            packet, a, auth_sha, write = build_synthetic_campaign(parent)
-            normal = parent/"normal/result.json"
-            auth.validate_campaign(normal, auth_sha, a)  # sanity: honest baseline accepted
-            for mode in ("negative", "fallback-drop-write", "fallback-lock-error"):
-                location = parent/mode
-                d = json.loads((location/"result.json").read_text())
-                d["compiled_bundle_sha256"] = "0"*64
-                write(location/"result.json", d)
-                r = json.loads((location/"result.supervisor.json").read_text())
-                r["result_sha256"] = auth.file_sha(location/"result.json")
-                write(location/"result.supervisor.json", r)
-                m = json.loads((location/"manifest.json").read_text())
-                m["artifacts"]["result.json"] = auth.file_sha(location/"result.json")
-                m["artifacts"]["result.supervisor.json"] = auth.file_sha(location/"result.supervisor.json")
-                write(location/"manifest.json", m)
-                packet["members"][mode]["sha256"] = auth.file_sha(location/"manifest.json")
-            write(parent/"campaign.json", packet)
-            with self.assertRaises(ValueError):
-                auth.validate_campaign(normal, auth_sha, a)
-
-    def test_campaign_rejects_non_json_invocation_placeholder(self):
-        # REV-210 R4 counterexample: invocation.json was only ever hashed,
-        # never parsed, so a non-JSON placeholder passed unnoticed.
-        with tempfile.TemporaryDirectory(prefix="inv08-campaign-invocation-fixture-") as directory:
-            parent = Path(directory).resolve()
-            packet, a, auth_sha, write = build_synthetic_campaign(parent)
-            normal = parent/"normal/result.json"
-            location = parent/"fallback-lock-error"
-            (location/"invocation.json").write_text("synthetic parser fixture, never executed")
-            m = json.loads((location/"manifest.json").read_text())
-            m["artifacts"]["invocation.json"] = auth.file_sha(location/"invocation.json")
-            write(location/"manifest.json", m)
-            packet["members"]["fallback-lock-error"]["sha256"] = auth.file_sha(location/"manifest.json")
-            write(parent/"campaign.json", packet)
-            with self.assertRaises(ValueError):
-                auth.validate_campaign(normal, auth_sha, a)
-
-    def test_review_independence_self_vs_independent(self):
-        # REV-210 R5: the self-review Independence field never satisfies an
-        # independent-review check, and vice versa, so self approval cannot
-        # be substituted for the required independent record.
-        independent_ref = {"path": str(auth.REPO/"docs/research/reviews/REV-207.md"), "sha256": auth.METHOD_SHA}
-        auth.review(Path("/tmp"), independent_ref, "method", expected_id="REV-207")
-        with self.assertRaises(ValueError):
-            auth.review(Path("/tmp"), independent_ref, "method", independence="self")
-        self_path = auth.REPO/"docs/research/reviews/REV-209.md"
-        self_ref = {"path": str(self_path), "sha256": auth.file_sha(self_path)}
-        with self.assertRaises(ValueError):
-            auth.review(Path("/tmp"), self_ref, "code")
-        auth.review(Path("/tmp"), self_ref, "code", independence="self")
-
-    def test_canonical_bundle_determinism(self):
-        self.assertEqual(auth.digest({"b":2,"a":1}), auth.digest({"a":1,"b":2}))
-        self.assertNotEqual(auth.digest({"a":1}), auth.digest({"a":True}))
-        self.assertEqual(len(auth.BUNDLE_FILES), len(set(auth.BUNDLE_FILES)))
-        self.assertEqual(set(auth.bundle()), set(auth.BUNDLE_FILES))
-
-    def test_actual_method_only_not_code_authorization(self):
-        ref = {"path": str(auth.REPO/"docs/research/reviews/REV-207.md"), "sha256": auth.METHOD_SHA}
-        auth.review(Path("/tmp"), ref, "method", expected_id="REV-207")
-        for kind in ("code", "result"):
-            with self.assertRaises(ValueError):
-                auth.review(Path("/tmp"), ref, kind)
-        with self.assertRaises(ValueError):
-            auth.review(Path("/tmp"), ref, "method", {"Code bundle SHA-256": "`" + "0"*64 + "`"})
-
-    def test_missing_and_declared_approval_failclosed(self):
-        with tempfile.TemporaryDirectory(prefix="inv08-authorization-fixture-") as directory:
-            p = Path(directory)/"not-approved.json"
-            for declaration in ({}, {"schema":"INV-01-08-execution-authorization-v1", "kind":"evidence",
-                                     "approved":True, "code_bundle_sha256":auth.digest(auth.bundle())}):
-                p.write_text(json.dumps(declaration))
-                with self.assertRaises((ValueError, KeyError)):
-                    auth.load_authorization(p, "normal", live=False)
-            p.write_text('{"kind":"validation","kind":"evidence"}')
-            with self.assertRaises(ValueError):
-                auth.json_read(p)
+                    auth.validate_campaign(root/"normal/result.json",build)
+            receipt.unlink()
+            with self.assertRaises(OSError):
+                auth.validate_campaign(root/"normal/result.json",build)
 
     def test_external_root_boundary(self):
         with tempfile.TemporaryDirectory(prefix="inv08-root-fixture-") as directory:

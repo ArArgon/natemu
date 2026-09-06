@@ -20,7 +20,7 @@ from fractions import Fraction
 
 from histogram import load_cohort, report, validate_histograms
 from fallback import validate_fallback, fallback_ratio, validate_full_counts
-from authorization import json_read, validate_result_binding
+from evidence import json_read, validate_result_binding
 
 MIN_ITERS = 1000000
 QOS = {"user-interactive", "background"}
@@ -75,7 +75,7 @@ def main(path, data=None, integrity_only=False, historical=False):
             print("\n".join(failures))
             print("RESULT: FAIL (F08-2 integrity; all histogram/threshold claims suppressed)")
             return 1
-        validate_result_binding(path, d)
+        timing = validate_result_binding(path, d)
 
     def rule(ok, name, detail):
         (notes if ok else fails).append(f"{'PASS' if ok else 'FAIL'}  {name}: {detail}")
@@ -186,7 +186,10 @@ def main(path, data=None, integrity_only=False, historical=False):
     if integrity_only:
         return 0
 
-    print("  -- decision thresholds (result gate adjudicates) --")
+    if not historical and timing.get("status")!="context-matched":
+        print("  TIMING UNQUALIFIED: applicable clock evidence absent; correctness checks passed")
+        return 0
+    print("  -- decision thresholds (findings review adjudicates) --")
 
     def thr(name, ok, detail):
         print(f"  {'MEET' if ok else 'MISS'}  {name}: {detail}")
@@ -222,7 +225,7 @@ def main(path, data=None, integrity_only=False, historical=False):
         thr("T3 cross-thread invalidation round trip p99 < 50 us",
             bool(ui) and ui[0]["p99_ns"] < 50000,
             f"{[(r['qos'], r['p50_ns'], r['p99_ns']) for r in rt]}; "
-            f"clock quantum {tick:.2f} ns/tick; prior instrument bound in authorization; "
+            f"clock quantum {tick:.2f} ns/tick; prior instrument context matched; "
             "differences at its floor are unresolved")
 
     lse8 = [a for a in d.get("lse", []) if a["threads"] == 8]
@@ -260,7 +263,7 @@ def main(path, data=None, integrity_only=False, historical=False):
 def run_selected(args):
     if not args.cohort:
         return main(args.path or "result.json", historical=args.historical)
-    identity, digest, review_path, runs = load_cohort(args.cohort)
+    identity, digest, cohort_path, runs = load_cohort(args.cohort)
     if args.historical and any("schema" in data for _, data in runs):
         raise ValueError("historical cohort cannot bypass F08-2 integrity")
     for path, data in runs:
@@ -271,11 +274,11 @@ def run_selected(args):
             print(captured.getvalue(), end="")
             print("RESULT: FAIL (entire cohort suppressed; failed member)")
             return 1
-    print(f"INV-01-08 pooled histogram cohort={identity} sha256={digest} review={review_path}")
+    print(f"INV-01-08 pooled histogram cohort={identity} sha256={digest} source={cohort_path}")
     for path, _ in runs:
         print(f"  member={path}")
     report([data for _, data in runs])
-    print("RESULT: PASS (reviewed cohort histogram only; no pooled timing thresholds; "
+    print("RESULT: PASS (explicit cohort histogram only; no pooled timing thresholds; "
           + ("historical, not F08-2" if args.historical else "F08-2 member integrity") + ")")
     return 0
 
