@@ -8,6 +8,22 @@ those belong to [Performance estimation](04-performance-estimation.md),
 [Correctness](02-correctness.md). Work on it follows the
 [research workflow](../README.md).
 
+**Track 01 is complete for its recorded M4 scope as of September 7, 2026.**
+All five questions have independently accepted scoped resolutions at two and
+four vCPUs: paging, precise faults, interrupts, host-produced code and
+secondary-CPU startup without real mode. The separate final four-vCPU run
+passed the complete composite oracle and independent findings review. Completion
+breadth is addressed, downstream questions are filed, and the working scratch
+program is retired from development, with a frozen reproduction snapshot now
+retained in the repository at the owner's request.
+
+The host is Apple M4 Mac16,10, macOS 26.6.2 (25G83), SDK 26.4, with uncontrolled
+core placement. These finite mechanism findings do not establish stock-kernel
+boot, complete ISA correctness, performance or a production architecture.
+Unavailable M2 replication remains with Q-05-02. Next work belongs to the named
+downstream investigations; planning and implementation require their separate
+authorization under the research workflow.
+
 ## Design under test
 
 A thin shim running at EL1 inside a Hypervisor.framework VM that uses the
@@ -26,8 +42,9 @@ question of this track.
   track uses no translator; where translated code is needed, tests use
   hand-written arm64 blocks shaped like translator output.
 - The first CPU enters the guest kernel in 64-bit mode. Secondary CPUs are
-  started by the mechanism established under `Q-01-34`. Real mode is out of
-  scope pending that question.
+  started by the mechanism accepted under `Q-01-34`. Real mode remains out of
+  scope; the audited Ubuntu startup path still requires a small 32-bit
+  compatibility/protected-mode transition.
 - The ISA ceiling is AVX2. Floating point behaves as the eventual code
   generator provides; nothing floating-point is hand-written.
 - August 2026 code and results (commit `a121702`) are not reused.
@@ -106,9 +123,11 @@ One growing, disposable test program inside the VM.
 - **Required scenario**: code-page handling (writes to pages holding
   translations, including the same-page write-and-execute pattern) is exercised
   under `Q-01-31` and `Q-01-32` as a correctness scenario.
-- **Status of the program**: a scratch pad. It is thrown away when the track
-  closes. No architecture decision is made in it; expedient choices are recorded
-  as such. What carries forward is knowledge in the investigation records.
+- **Status of the program**: a research scratch pad, retired from development
+  at closure. The owner subsequently requested repository preservation for
+  reproduction; retain the accepted final source and checker snapshot under
+  `experiments/track01`. No architecture decision is made in it; expedient
+  choices are recorded as such. Findings remain in the investigation records.
   Timings the program records are diagnostic; they are not qualified and are
   not cited outside this track.
 
@@ -124,6 +143,108 @@ resolution or accepted kill on at least one available host with per-host
 applicability recorded, the final test runs with all established mechanisms
 on, the end-of-track breadth check is recorded, and all surfaced questions are
 filed in the [question backlog](../question-backlog.md).
+
+## Completion breadth — September 7
+
+The completion check is **addressed**. Q30–Q34 findings and independent
+replication are accepted, and the final integrated four-vCPU result received
+independent acceptance after its full checker passed at 22:13:56 UTC. The
+[Q34 findings thread](../reviews/INV-01-34-findings.md) records the final
+correctness/methodology and combined-scope verdict. No substantive return remains.
+`/root/retained_runner` reviewed product/architecture implications independently
+of root's completion synthesis, but authored the Q34 integration and therefore
+does not supply its independent correctness acceptance. Root inspected the
+current charter, scope and backlog; neither context searched archived history.
+
+The resumed product/architecture breadth review by `/root/q34_oracle` found
+no additional Track 01 question or unowned implication. That context authored
+the Q34 oracle and therefore reviews only the product/architecture scope here;
+it does not supply independent correctness or method acceptance of its own
+checker. It inspected the current scope, charter checklist, backlog and
+accepted CLM-01-34-11, and confirmed the distinctions between source-indexed
+startup and stock-image boot, mailbox feature floor and distribution support,
+x86 AP startup and native vCPU creation, no-real-mode and startup32 handling,
+resource guards and performance, and M4 evidence and later M2 coverage.
+Independent reviewer `/root/q34_review` accepted combined correctness/
+methodology breadth and the actual replica/final integration findings.
+
+No sixth Track 01 question emerged. The five mechanism questions retain their
+specific falsifiers and per-host scope. A fixture coverage failure requires
+resolution or withdrawal of the affected observation; it is not automatically
+an architecture kill. A scoped success establishes mechanism viability, not
+stock boot, a production translator, speedup, reliability rate or a design
+selection. The independent final review found no new contradiction, missing
+mechanism or unowned implication; the prior negative outcomes remain retained.
+
+The existing backlog owns the carryforward work: stock compatibility and
+direct-boot/device/CPU contracts (`Q-00-02`, `Q-02-01/03`); translator recovery
+metadata, startup32 handling, floating point, adaptation effort and cache
+reclamation (`Q-03-02/04`, `Q-06-06`); SMP ordering and containment (`Q-02-02/04`);
+qualified costs, clock and placement (`Q-04-*`, `Q-05-*`); and later M2 coverage
+(`Q-05-02`). Linux 5.19 is the audited mailbox-feature floor, not an unconditional
+distribution-compatibility promise. UEFI/Windows analysis remains `Q-00-09`.
+
+Three backlog wording corrections align those owners with the current scope:
+no second macOS-release requirement, fresh qualified Track 04 measurements
+instead of reuse of Track 01 diagnostic timings, and actual chosen wait/exit
+behavior instead of a WFI-to-host assumption inferred from a WFE fixture.
+No new evidence or downstream resolution is created by those edits. Planning
+and implementation remain separate later decisions under the research workflow.
+
+## Completion evidence checklist
+
+All exit criteria below are satisfied within the recorded host and fixture scope.
+Each investigation and its findings review remain authoritative for its claims.
+
+| Requirement | Current evidence and disposition |
+| --- | --- |
+| Q30 paging, including SMP | Accepted scoped M4 2/4-vCPU finding and independent replication in INV-01-30. |
+| Q31 precise faults and restart | Accepted scoped M4 2/4-vCPU finding and independent replication in INV-01-31. |
+| Q32 interrupt boundaries, masking and priority | Accepted scoped finding; later after-WFE return reclosed by reviewed corrected primaries and refreshed 2/4-vCPU replicas, recorded in INV-01-32 and INV-01-33. |
+| Q33 publication, live links and miss continuation | Accepted scoped M4 2/4-vCPU finding and independently rebuilt replicas in INV-01-33. Shared staging remains an unestablished alternative, not a prerequisite to the accepted register-transfer path. |
+| Q34 startup without real mode | Accepted scoped source and observed M4 2/4-vCPU findings after complete primary and independently rebuilt replica checks in INV-01-34. |
+| Final program with all established mechanisms active | Accepted `q34-startup-final-01` / `q34-startup-final-01-check-01`: all five nested mechanism checks PASS, 404404 operations / 5489617 records, unsupported[]. One separately budgeted VM/check pair completed without retry. Exact evidence is in INV-01-34. |
+| Product, architecture, correctness and methodology breadth | All four perspectives addressed above and accepted in the final independent findings review; no new question or unresolved substantive return. |
+| Every surfaced question filed | Final review confirms the existing owners above; the backlog explicitly records the current carryforward implications. No sixth feasibility question emerged. |
+| Disposable scratch program retired | Complete after final acceptance; original working directories were archived and removed. At the owner's subsequent request, unchanged producer/runtime-oracle code and the adapted supervisor are now preserved in a frozen repository reproduction snapshot. Historical raw evidence remains external. |
+
+
+## Retained evidence and scratch retirement
+
+Raw evidence remains outside Git under `/Users/liaozping/orca/natemu-raw`.
+Each historical run retains its own producing sources, build inputs, manifest,
+outputs and checksums, including failed and partial outcomes. Final producer
+`q34-startup-build-05/source`, independent `q34-startup-oracle-01` and bounded
+`q34-startup-supervisor-01` remain available for reproduction; the final run,
+checker and campaign inventories are recorded in [INV-01-34](../investigations/INV-01-34.md).
+A future experiment needs its own reviewed budget and fresh output identity.
+
+After final independent acceptance, root removed only `experiments/track01`
+and `experiments/track01-replication`. Immediately before removal, every current
+file and file-set was compared with the sealed
+[retirement archive](/Users/liaozping/orca/natemu-raw/track01-scratch-retirement-01).
+All 36 working files are recoverable; the 37-entry archive inventory is
+`e0451acf8128000784cfcc474e9e9ec6ceab2c337a883ad1d4c1a7fbb8c96247`.
+The independent reviewer also verified the archive against the working files.
+This archive preserves the final working copies; it does not change any
+historical run's producing identity. No scratch implementation carries forward
+as a prototype or architecture decision.
+
+
+### Repository reproduction copy — owner-requested preservation
+
+Following closure, the owner requested keeping the program in the repository
+for reproduction on another machine. This supersedes the earlier source-deletion
+requirement; the program remains retired from development. The
+[frozen reproduction snapshot](../../../experiments/track01/README.md) contains
+all final producer sources and the complete runtime oracle chain, byte-identical
+to their retained accepted versions. The bounded supervisor is adapted to use
+Git-versioned oracle sources without separate source checksum files, as the
+owner requested. Per-run source snapshots and raw-result integrity checks remain.
+Its README records provenance, host/SDK/resource requirements and commands.
+Original evidence identities remain unchanged. Raw RAM, traces and compiled
+outputs stay outside Git.
+
 
 ## Filed to other tracks
 

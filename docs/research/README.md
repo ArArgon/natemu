@@ -27,7 +27,8 @@ and results, is provenance only and cannot serve as evidence. It may seed questi
 Research makes no binding implementation decisions. Final synthesis separately
 selects **stop**, **continue targeted research**, or **authorize planning**.
 Implementation requires completed, approved planning and separate authorization.
-This workflow migration neither completes Track 01 nor adds experimental evidence.
+The workflow migration itself did not complete Track 01 or add experimental
+evidence.
 
 ## Conduct an investigation
 
@@ -76,8 +77,11 @@ correctness, and methodology perspectives. Carry unresolved implications and
 disagreements to their owners and synthesis. Track 01 answers its questions inside
 one growing, disposable test program: each question's test is added on top of the
 previous questions' working result with every earlier mechanism left on, so the
-mechanisms are exercised together without a prototype deliverable. Mechanism
-viability establishes neither performance nor a design.
+mechanisms are exercised together without a prototype deliverable. At the
+owner's subsequent request, the closed Track 01 program is retained as a
+[frozen reproduction snapshot](../../experiments/track01/README.md); its raw
+outputs remain external. Mechanism viability establishes neither performance
+nor a design.
 A track closes only when its questions have accepted scoped resolutions or
 accepted kills and the completion breadth check is addressed. A family kill
 removes that family; a project kill routes to synthesis, not automatic track completion.
