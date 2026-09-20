@@ -25,6 +25,18 @@ The September 19 owner policies in the [workflow](README.md#work-order-and-archi
 supersede documented-only capability and general cross-generation requirements
 in historical rows below; licensing is a warning. Historical rulings retain their dates.
 
+The historical `INV-00-*` acceptance labels below do not supply currently
+unavailable investigation artifacts. Before using a workload, compatibility,
+baseline or quantitative-success resolution in synthesis, its owning question
+must bind an extant applicable record or explicitly resolve the missing input.
+The current Track00/workflow envelope remains authoritative; no historical label
+by itself supplies a benchmark portfolio or success threshold. See
+[INV03-01 scope handling](investigations/INV-03-01.md#assumptions-and-breadth).
+Q-00-01/02/03/04 own workload, compatibility, baseline and success inputs;
+Q-04-01 owns cost ranges, Q-05-01 owns the qualified benchmark method, and
+Q-06-03/06 own lifecycle estimates and the adaptation budget before synthesis
+or implementation uses those inputs.
+
 | Identifier | Question | Why it matters | Dependencies | Downstream decisions | Applicability dimensions | Resolution method | Evidence status | Review status | Newly surfaced questions — breadth pass | Newly surfaced questions — source/method/execution/result work |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `Q-00-01` | Which intended user classes and concrete, diverse workloads must the emulator represent? | Performance and compatibility evidence is meaningless if optimized for an unrepresentative job. | Initial product envelope | Compatibility boundary, benchmark suite, success aggregation | User class / workload / guest / vCPU topology / host constraints | Primary-source and upstream-workload audit followed by an explicit scope resolution | Source-backed and Inferred claims in `INV-00-01`; source gate passed (`REV-024`) | accepted; question `REV-001` accept; source `REV-024` accept (independent); adversarial `REV-025` accept (independent) | `Q-00-02`, `Q-00-03`, `Q-00-04`, `Q-00-07`, `Q-05-01` | source: `Q-05-03`, `Q-06-02` |
@@ -75,12 +87,17 @@ answers the questions nor supplies new evidence.
 
 ### Architecture
 
+Use the [twelve-question Track 03 inventory](investigations/INV-03-01.md#current-design-choices-and-evidence-ownership)
+for current architectural decisions. The four identifiers below group detailed
+evidence; they do not replace the charter questions or imply four completion
+gates. Each linked investigation has one current summary and bounded next action.
+
 | Identifier | Question | Why it matters | Dependencies | Downstream decisions | Applicability dimensions | Resolution method | Evidence status | Review status | Newly surfaced questions — breadth pass | Newly surfaced questions — source/method/execution/result work |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `Q-03-01` | Which coherent architecture and implementation direction should we select, preserving required behavior and interactions, with acceptable costs and adaptation effort against QEMU TCG? | Architectural choices must preserve correctness individually and together; construction and delivery remain planning work. | Current scope and applicable Track 01 evidence; candidate investigations proceed together | Architecture record INV-03-01 for synthesis; alternatives and falsifiers | Host/OS / guest / SMP / dependency / maintenance / workload | Comparative evidence audit with explicit falsifiers and independent review | unstarted | proposed | `Q-04-01`, `Q-06-01` | no new issues found |
-| `Q-03-02` | Which existing x86-to-arm64 code generator (FEX, Box64/Box32, an LLVM-based translator, or a minimal in-house one) should the shim design adapt, judged by adaptation effort for system mode, instruction and floating-point behavior, licensing warnings, and candidate ideas listed in [architecture candidates](notes/architecture-candidates.md)? | The translator adaptation is the largest single effort in the project and nothing bounds it yet. | Track 01 closed; `Q-00-02` | Translator choice for planning; `Q-06-06` stop rule | Guest ISA tier / license | Source-level comparison with a bounded effort estimate per candidate; independent review | unstarted | proposed | none | none |
-| `Q-03-03` | Which guest device-register accesses does the shim handle inside the VM and which exit to the host, and at what cost and rate under the scoped workloads? | Every exit is host-side latency; the split decides the device-path cost. | Track 01 closed | Device model placement for planning | Workload / device class | Design comparison with measurement under Track 04 | unstarted | proposed | none | none |
-| `Q-03-04` | Which paging and code-page mechanisms (lazy, eager, apply-at-announcement, two-state pages, execute-fault linking, escalation rungs) should the design adopt? Candidates are inventoried in [architecture candidates](notes/architecture-candidates.md), which is outside review and inadmissible as support. | The choice sets the design's steady-state and JIT-warm-up cost. | `Q-01-30`, `Q-01-31`, `Q-01-33` | Mechanism choice for planning | Workload / guest kernel behavior | Design comparison with Track 04 measurements; independent review | unstarted | proposed | none | none |
+| `Q-03-01` | [Combined architecture and implementation direction](investigations/INV-03-01.md) | Current question, applicability, conclusion and next action are owned by the linked investigation. | — | — | — | — | — | — | — | — |
+| `Q-03-02` | [Codegen and semantic components within the captive runtime](investigations/INV-03-02.md) | Current question, applicability, conclusion and next action are owned by the linked investigation. | — | — | — | — | — | — | — | — |
+| `Q-03-03` | [Machine, device placement, clocks and containment](investigations/INV-03-03.md) | Current question, applicability, conclusion and next action are owned by the linked investigation. | — | — | — | — | — | — | — | — |
+| `Q-03-04` | [Shadow memory, atomicity and translated-code lifetime](investigations/INV-03-04.md) | Current question, applicability, conclusion and next action are owned by the linked investigation. | — | — | — | — | — | — | — | — |
 
 ### Performance
 
@@ -93,7 +110,7 @@ answers the questions nor supplies new evidence.
 | `Q-04-05` | If a host generation lacks hardware accessed/dirty management, what does emulating the bits by fault cost? | One extra fault per page per first access and first write. | `Q-01-30` | Mechanism choice `Q-03-04` | Host generation | Measurement | unstarted | proposed | none | none |
 | `Q-04-06` | What is the overhead of interrupt injection by per-block polling versus a forced boundary, and the resulting latency bound? | Sets guest scheduling latency and per-block cost. | `Q-01-32` | Interrupt mechanism for planning | vCPU count / workload | Measurement | unstarted | proposed | none | none |
 | `Q-04-07` | What are the translation-request round trip and throughput during boot, and do they force an in-VM cold-code tier? | Boot touches very many unique blocks. | `Q-01-33` | Host/guest split for planning | Workload | Measurement | unstarted | proposed | none | none |
-| `Q-04-08` | What are the device exit rate and cost under the scoped workloads? | Every exit is microseconds of host-side latency. | `Q-03-03` | Device placement | Workload / device class | Measurement | unstarted | proposed | none | none |
+| `Q-04-08` | What are the device exit rate and cost under the scoped workloads? | Exit frequency and cross-domain service latency require qualification; no fixed per-exit cost is established. | `Q-03-03` | Device placement | Workload / device class | Measurement | unstarted | proposed | none | none |
 | `Q-04-09` | What idle-wait, host-exit and wake costs follow from the selected wait mechanism on each applicable host? | Sets idle responsiveness; record actual wait/exit behavior instead of assuming that the Track 01 WFE fixture establishes a WFI-to-host contract. | `Q-01-32` | Workload scope note | Host / macOS release | Measurement | unstarted | proposed | none | none |
 | `Q-04-10` | What does JIT warm-up (code-cache growth and call-site patching under a JVM or Node workload) cost under the chosen code-page handling and its escalation rungs? | JIT workloads are in scope and are the case most exposed to code-page protection. | `Q-03-04` | Escalation-rung choice | Workload | Measurement against the QEMU baseline | unstarted | proposed | none | none |
 
@@ -120,7 +137,7 @@ answers the questions nor supplies new evidence.
 | `Q-06-03` | What five-year lifecycle effort and cost distribution covers delivery, correctness validation, platform coverage, release engineering, support, maintenance, CI, test hardware, and distribution? | Public prices cannot supply project-specific build and lifecycle cost. | `Q-00-07`, `Q-03-01` | Economic decision-rule inputs | Architecture family / staffing / host matrix / release cadence / support level | Bottom-up estimate with independently reviewed ranges and sensitivity analysis | unstarted | proposed | `BP-00-end` (unresolved cross-record implication owned here); `BP-01-end` (open cross-record implications; working pass, not track closure) | source analysis in `INV-00-07`: `Q-06-03` |
 | `Q-06-04` | Which adjacent user-job alternatives are economic comparators for each accepted user class without entering the emulator speedup aggregate? | The cheapest correctness-equivalent alternative may be remote, native, cross-compiled, or user-mode even when it is not a fair emulator baseline. | `Q-00-01`, `Q-00-03`, `Q-00-07` | Economic benefit and stop tests | User / workload / semantics / local-or-remote / price / latency | Per-job alternative audit using primary terms/prices and observed correctness equivalence | unstarted | proposed | no new issues found | source analysis in `INV-00-03`: `Q-06-04`; adversarial `REV-034`: guest-side activation preconditions and macOS 14+ AOT-caching variance of the Intel-translation control |
 | `Q-06-05` | What bounded research-extension budget and recurrence rule distinguishes “continue targeted research” from indefinite deferral? | An unconstrained gray zone defeats predeclared stop conditions. | `Q-00-06`, accepted research budget | Synthesis outcome | Unknown / failure mode / owner / equipment / time / remaining budget | Decision rule and retrospective falsifier audit | unstarted | proposed | `BP-00-end` (unresolved cross-record implication owned here) | source analysis in `INV-00-06`: `Q-06-05` |
-| `Q-06-06` | What effort budget for adapting a translator to a first single-vCPU Linux shell, if exceeded, is a stop signal? | The adaptation is the largest unbounded effort; the rule must exist before the work starts. | `Q-03-02`, `Q-06-03` | Stop condition | n/a | Owner-set budget recorded before adaptation; independent review of the rule | unstarted | proposed | none | none |
+| `Q-06-06` | What effort budget for adapting a translator to a first single-vCPU Linux shell, if exceeded, is a stop signal? | The adaptation is the largest unbounded effort; the rule must exist before the work starts. | `Q-03-02`, `Q-06-03` | Stop condition | n/a | Owner-set budget recorded before implementation adaptation; independent review of the rule. The single-vCPU shell is a delivery milestone, not a reduction of the required SMP envelope | unstarted | proposed | none | none |
 
 ### Deferred security
 

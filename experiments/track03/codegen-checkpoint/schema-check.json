@@ -1,0 +1,92 @@
+{
+  "method": "static upstream schema generation only; no C++ build/FEX compiler/guest execution",
+  "command": [
+    "/Library/Developer/CommandLineTools/usr/bin/python3",
+    "/private/tmp/natemu-track03-checkpoint-static-20260920T094625Z/json_ir_generator.py",
+    "/private/tmp/natemu-track03-checkpoint-static-20260920T094625Z/source/FEXCore/Source/Interface/IR/IR.json",
+    "/private/tmp/natemu-track03-checkpoint-static-20260920T094625Z/IRDefines.inc",
+    "/private/tmp/natemu-track03-checkpoint-static-20260920T094625Z/IRDefines_Dispatch.inc"
+  ],
+  "python": "3.9.6",
+  "returncode": 0,
+  "files": {
+    "IRDefines.inc": {
+      "bytes": 880106,
+      "sha256": "1821da0c1c4b9e7af0c57b842b5a41c9d88845650aa270c4167d4ff06a73e58c"
+    },
+    "IRDefines_Dispatch.inc": {
+      "bytes": 19242,
+      "sha256": "5f561b48f2900957c2a914f77fc9b937c058ca827c7e2aa1283acbfb69840b9b"
+    },
+    "JITClass.h": {
+      "bytes": 23857,
+      "sha256": "b72eafbb3b8ec87bedb56082c76c0d193da4be79d3110482a77d4e80c2abc183"
+    },
+    "LogManager.h": {
+      "bytes": 4913,
+      "sha256": "34d1e5ac075c00742325d0dc0fed770ba09051858cc382d8a6eb47c1a86a3d89"
+    },
+    "input.patch": {
+      "bytes": 13507,
+      "sha256": "e01b7655ef4c0507596fa24c9a1385f89619f1fd606f260eea71e977890319e1"
+    },
+    "json_ir_generator.py": {
+      "bytes": 34528,
+      "sha256": "74ceb46cfecd33b2875119bb9cf885d3afbcd406ba4eb00716e8185bfc8862c7"
+    },
+    "source/FEXCore/Source/Interface/Core/JIT/JIT.cpp": {
+      "bytes": 48936,
+      "sha256": "03d7b678b37ddb2486b9e5749f199396b3852334e7c2e95122e7ea7eaf4db6e2"
+    },
+    "source/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp": {
+      "bytes": 98547,
+      "sha256": "7c68ef210c3468de4b82ebbf892143a17bbbd4dbaba7137695398195a8476a0f"
+    },
+    "source/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp": {
+      "bytes": 191470,
+      "sha256": "061cc551902a732a761ce8b55dc97b3dc23accee55dfe46f8c60639cb62d152d"
+    },
+    "source/FEXCore/Source/Interface/IR/IR.json": {
+      "bytes": 149390,
+      "sha256": "594145128598cee16f03976c8cf2428f02ea47d97dc4e840f718e775867b1d65"
+    },
+    "source/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp": {
+      "bytes": 31882,
+      "sha256": "78b23043178ae125749e4ec20cd24549aa473c9330336ff2d8636cea14cfd437"
+    },
+    "source/Source/Tools/CodeSizeValidation/Main.cpp": {
+      "bytes": 29856,
+      "sha256": "c9e1df855050613f92ee3db9fb5655c9bd0700382e5f2c44fcada0b2a2658c00"
+    },
+    "source-manifest.json": {
+      "bytes": 1227,
+      "sha256": "70dc92acdd6e3c6defed22744f24c6d310dda271429d507ecea68c4bc7b04ac8"
+    },
+    "static-check.py": {
+      "bytes": 2026,
+      "sha256": "80a4d606686372fa3d879d28fb2014fd44e6b6b907ebf911db93c5294ae79eeb"
+    },
+    "stderr.txt": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "stdout.txt": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "raw_directory": "/private/tmp/natemu-track03-checkpoint-static-20260920T094625Z",
+  "limits": "Static upstream schema generation only; no C++ build, FEX compiler invocation, native emission, observed map or guest execution.",
+  "superseded_record": {
+    "directory": "/private/tmp/natemu-track03-checkpoint-static-20260920T093906Z",
+    "issue": "An early manifest included a stale hash/size for itself. The author overwrote that temporary manifest before receiving the independent review return; the failed original was not retained. This new nonoverwriting run is independent; the old result is not retroactively a passing retention record.",
+    "reviewer_observed_self_entry": {
+      "bytes": 2609,
+      "sha256": "25e7cc9b04a3b81edec6feaa52adf09f19161963fb84b21494d74c9122f9a908"
+    },
+    "reviewer_observed_actual_file": {
+      "bytes": 2743,
+      "sha256": "c588cc442c6ec608b5376f0ef2aa047ac4d4ada6da8fbac293fc8c02d282a961"
+    }
+  }
+}

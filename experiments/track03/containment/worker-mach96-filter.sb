@@ -1,0 +1,20 @@
+(version 1)
+; Candidate, not validated on macOS 26. No automatic widening on failure.
+(deny default)
+; Some operations are default-allowed: make these denials explicit.
+(deny process-info*)
+(allow process-info-pidinfo (target self))
+(deny signal)
+(allow signal (target self))
+(deny mach-lookup)
+(deny network*)
+(deny file-read* file-write*)
+; Exact library/framework trees only; no user, run-directory or disk path grant.
+(allow file-read* file-map-executable
+  (subpath "/System/Library/Frameworks/Hypervisor.framework")
+  (subpath "/System/Library/PrivateFrameworks/Hypervisor.framework")
+  (subpath "/usr/lib"))
+; No speculative 'allow hypervisor' rule: test whether this policy permits HVF.
+
+; Alternate CONTROL acquisition entry only.
+(deny syscall-mach (machtrap-number 96))

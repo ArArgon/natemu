@@ -1,0 +1,336 @@
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -28,6 +28,16 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstdint>
++#include <cstdlib>
++#include <cstdio>
++#include <cstring>
++
++static void NatemuRequire(bool Condition, const char* Message) {
++  if (!Condition) {
++    std::fprintf(stderr, "NATEMU_REJECT %s\n", Message);
++    std::abort();
++  }
++}
+ 
+ namespace FEXCore::IR {
+ 
+@@ -4687,6 +4697,32 @@
+ }
+ 
+ void OpDispatchBuilder::MOVGPROp(OpcodeArgs, uint32_t SrcIndex) {
++  // Disposable one-fixture preparation, not a general recovery implementation.
++  // CodeSizeValidation validates the entire input before reaching this hook.
++  if (std::getenv("NATEMU_CHECKPOINT_ROOT_PREP")) {
++    static constexpr uint8_t Load[] = {0x48, 0x8b, 0x03};
++    NatemuRequire(Op->PC == Entry + 7 && Op->InstSize == sizeof(Load) &&
++                        std::memcmp(reinterpret_cast<const void*>(Op->PC), Load, sizeof(Load)) == 0,
++                      "NATEMU root preparation only accepts the live_load MOV");
++    NatemuRequire(GetGPROpSize() == OpSize::i64Bit && !CTX->HostFeatures.SupportsSVE128 &&
++                        !CTX->HostFeatures.SupportsSVE256 && !CTX->HostFeatures.SupportsRCPC && !CTX->HostFeatures.SupportsTSOImm9,
++                      "NATEMU root preparation requires the declared 64-bit non-SVE/RCpc fixture");
++    static constexpr uint32_t GPRs[] = {X86State::REG_RAX, X86State::REG_RBX, X86State::REG_RCX, X86State::REG_RDX, X86State::REG_RSI, X86State::REG_RDI, X86State::REG_RBP, X86State::REG_RSP, X86State::REG_R8, X86State::REG_R9, X86State::REG_R10, X86State::REG_R11, X86State::REG_R12, X86State::REG_R13, X86State::REG_R14, X86State::REG_R15};
++    std::array<Ref, 32> Roots;
++    for (unsigned i = 0; i < 16; ++i) {
++      Roots[i] = LoadGPRRegister(GPRs[i], OpSize::i64Bit);
++      Roots[16 + i] = LoadXMMRegister(i);
++    }
++    Ref Src = LoadSourceGPR(Op, Op->Src[SrcIndex], Op->Flags, {.Align = OpSize::i8Bit, .AllowUpperGarbage = true});
++    const auto Header = GetOpHeader(WrapNode(Src));
++    NatemuRequire(Header->Op == OP_LOADMEMTSO && Header->Size == OpSize::i64Bit,
++                      "NATEMU root preparation requires a single 64-bit LoadMemTSO result");
++    // Post-access uses keep the pre-MOV values alive conservatively. The access
++    // result is a provisional identity link, NOT an optimizer-stable fault label.
++    _NatemuRecoveryUse(Roots[0], Roots[1], Roots[2], Roots[3], Roots[4], Roots[5], Roots[6], Roots[7], Roots[8], Roots[9], Roots[10], Roots[11], Roots[12], Roots[13], Roots[14], Roots[15], Roots[16], Roots[17], Roots[18], Roots[19], Roots[20], Roots[21], Roots[22], Roots[23], Roots[24], Roots[25], Roots[26], Roots[27], Roots[28], Roots[29], Roots[30], Roots[31], Src, 7);
++    StoreResultGPR(Op, Src, OpSize::i8Bit);
++    return;
++  }
+   // StoreResult will store with the same size as the input, so we allow upper
+   // garbage on the input. The zero extension would be pointless.
+   Ref Src = LoadSourceGPR(Op, Op->Src[SrcIndex], Op->Flags, {.Align = OpSize::i8Bit, .AllowUpperGarbage = true});
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -190,6 +190,12 @@
+         "JITDispatchOverride": "NoOp"
+       },
+ 
++      "NatemuRecoveryUse GPR:$Root0, GPR:$Root1, GPR:$Root2, GPR:$Root3, GPR:$Root4, GPR:$Root5, GPR:$Root6, GPR:$Root7, GPR:$Root8, GPR:$Root9, GPR:$Root10, GPR:$Root11, GPR:$Root12, GPR:$Root13, GPR:$Root14, GPR:$Root15, FPR:$Root16, FPR:$Root17, FPR:$Root18, FPR:$Root19, FPR:$Root20, FPR:$Root21, FPR:$Root22, FPR:$Root23, FPR:$Root24, FPR:$Root25, FPR:$Root26, FPR:$Root27, FPR:$Root28, FPR:$Root29, FPR:$Root30, FPR:$Root31, GPR:$AccessValue, u32:$GuestEntryOffset, u32:$AccessNode{0}, u64:$LocationKinds{0}, u64:$Location0{0}, u64:$Location1{0}, u64:$Location2{0}, u64:$Location3{0}, u64:$Location4{0}, u64:$Location5{0}, u64:$Location6{0}, u64:$Location7{0}, u64:$Location8{0}, u64:$Location9{0}, u64:$Location10{0}, u64:$Location11{0}, u64:$Location12{0}, u64:$Location13{0}, u64:$Location14{0}, u64:$Location15{0}, u64:$Location16{0}, u64:$Location17{0}, u64:$Location18{0}, u64:$Location19{0}, u64:$Location20{0}, u64:$Location21{0}, u64:$Location22{0}, u64:$Location23{0}, u64:$Location24{0}, u64:$Location25{0}, u64:$Location26{0}, u64:$Location27{0}, u64:$Location28{0}, u64:$Location29{0}, u64:$Location30{0}, u64:$Location31{0}": {
++        "Desc": ["Unbuilt fixture-only recovery roots; allocation replaces SSA roots with diagnostic location fields"],
++        "HasSideEffects": true,
++        "JITDispatchOverride": "NoOp"
++      },
++
+       "GuestOpcode u32:$GuestEntryOffset": {
+         "Desc": ["Marks the beginning of a guest opcode"],
+         "HasSideEffects": true
+--- a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+@@ -18,8 +18,17 @@
+ #include <FEXCore/fextl/vector.h>
+ #include <bit>
+ #include <cstdint>
++#include <cstdlib>
++#include <cstdio>
+ 
+ using namespace FEXCore;
++
++static void NatemuRequire(bool Condition, const char* Message) {
++  if (!Condition) {
++    std::fprintf(stderr, "NATEMU_REJECT %s\n", Message);
++    std::abort();
++  }
++}
+ 
+ namespace FEXCore::IR {
+ namespace {
+@@ -659,9 +668,99 @@
+     // Last nontrivial instruction, for merging as we go.
+     Ref LastNode = nullptr;
+ 
++    Ref NatemuPrevious = nullptr;
++
+     // Forward pass: Assign registers, spilling & optimizing as we go.
+     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+       bool AnySpilledBeforeThisInstruction = AnySpilled;
++      Ref Previous = NatemuPrevious;
++      NatemuPrevious = CodeNode;
++      if (IROp->Op == OP_NATEMURECOVERYUSE) {
++        auto Meta = IROp->CW<IROp_NatemuRecoveryUse>();
++        auto AccessArg = Meta->AccessValue;
++        AccessArg.ClearKill();
++        Ref Access = IR->GetNode(AccessArg);
++        NatemuRequire(Previous == Access && LastNode == Access &&
++                            IR->GetOp<IROp_Header>(Access)->Op == OP_LOADMEMTSO,
++                          "NATEMU access was moved/replaced; this diagnostic cannot bind it");
++        Meta->AccessNode = IR->GetID(Access).Value;
++        uint64_t Locations[32] {};
++        // At this point only the load's destination is newly reserved. All 32
++        // roots are live past it; snapshot their occupied register or prior spill.
++        for (unsigned s = 0; s < 32; ++s) {
++          auto Arg = IROp->Args[s];
++          Arg.ClearKill();
++          NatemuRequire(IsValidArg(Arg), "NATEMU unsupported inline/invalid root");
++          Ref Root = IR->GetNode(Arg);
++          const auto ID = Arg.ID().Value;
++          const auto Reg = SSAToReg[ID];
++          const auto Width = IR->GetOp<IROp_Header>(Root)->Size;
++          NatemuRequire(Width == (s >= 16 ? OpSize::i128Bit : OpSize::i64Bit), "NATEMU unexpected root width");
++          if (!Reg.IsInvalid() && IsInRegisterFile(Root)) {
++            Locations[s] = Reg.Raw;
++            Meta->LocationKinds |= uint64_t{1} << (2 * s); // allocated register, not a native register number
++          } else {
++            NatemuRequire(ID < SpillSlots.size() && SpillSlots[ID] != 0,
++                              "NATEMU root has no occupied register or initialized spill");
++            Locations[s] = SpillSlots[ID] - 1;
++            Meta->LocationKinds |= uint64_t{2} << (2 * s); // unique slot initialized by an earlier spill op
++          }
++        }
++        Meta->Location0 = Locations[0];
++        Meta->Location1 = Locations[1];
++        Meta->Location2 = Locations[2];
++        Meta->Location3 = Locations[3];
++        Meta->Location4 = Locations[4];
++        Meta->Location5 = Locations[5];
++        Meta->Location6 = Locations[6];
++        Meta->Location7 = Locations[7];
++        Meta->Location8 = Locations[8];
++        Meta->Location9 = Locations[9];
++        Meta->Location10 = Locations[10];
++        Meta->Location11 = Locations[11];
++        Meta->Location12 = Locations[12];
++        Meta->Location13 = Locations[13];
++        Meta->Location14 = Locations[14];
++        Meta->Location15 = Locations[15];
++        Meta->Location16 = Locations[16];
++        Meta->Location17 = Locations[17];
++        Meta->Location18 = Locations[18];
++        Meta->Location19 = Locations[19];
++        Meta->Location20 = Locations[20];
++        Meta->Location21 = Locations[21];
++        Meta->Location22 = Locations[22];
++        Meta->Location23 = Locations[23];
++        Meta->Location24 = Locations[24];
++        Meta->Location25 = Locations[25];
++        Meta->Location26 = Locations[26];
++        Meta->Location27 = Locations[27];
++        Meta->Location28 = Locations[28];
++        Meta->Location29 = Locations[29];
++        Meta->Location30 = Locations[30];
++        Meta->Location31 = Locations[31];
++        // Consume the normal next-use stream, but never fill metadata-only roots.
++        // Capture above precedes all kills; duplicate roots therefore remain valid.
++        for (int s = 0; s < GetRAArgs(IROp->Op); ++s) {
++          auto Arg = IROp->Args[s];
++          const bool Kill = Arg.HasKill();
++          Arg.ClearKill();
++          if (IsValidArg(Arg)) {
++            if (AnySpilledBeforeThisInstruction) {
++              --SourceIndex;
++              NatemuRequire(SourceIndex >= 0, "Consistent metadata source count");
++              NextUses[Arg.ID().Value] = SourcesNextUses[SourceIndex];
++            }
++            Ref Root = IR->GetNode(Arg);
++            const auto Reg = SSAToReg[Arg.ID().Value];
++            if (Kill && !Reg.IsInvalid() && IsInRegisterFile(Root)) {
++              FreeReg(Reg);
++            }
++          }
++          IROp->Args[s].SetImmediate(0); // no SSA arguments remain after allocation
++        }
++        LastNode = nullptr; // do not merge across the checkpoint
++        continue;
++      }
+ 
+       // These do not read or write registers, and must be skipped for merging.
+       // Since we'd be doing this check anyway for merging, do the check now so
+@@ -761,6 +860,12 @@
+       // Assign destinations.
+       if (GetHasDest(IROp->Op) && PhysicalRegister(CodeNode).IsInvalid()) {
+         AssignReg(IROp, BlockIROp, CodeNode, IROp);
++      }
++
++      // Preserve the selected access's identity and instruction boundary.
++      if (std::getenv("NATEMU_CHECKPOINT_ROOT_PREP") && IROp->Op == OP_LOADMEMTSO) {
++        LastNode = CodeNode;
++        continue;
+       }
+ 
+       if (IsTrivial(CodeNode, IROp)) {
+--- a/Source/Tools/CodeSizeValidation/Main.cpp
++++ b/Source/Tools/CodeSizeValidation/Main.cpp
+@@ -13,6 +13,16 @@
+ #include <FEXCore/Utils/SignalScopeGuards.h>
+ 
+ #include <sys/stat.h>
++#include <cstdlib>
++#include <cstdio>
++#include <cstring>
++
++static void NatemuRequire(bool Condition, const char* Message) {
++  if (!Condition) {
++    std::fprintf(stderr, "NATEMU_REJECT %s\n", Message);
++    std::abort();
++  }
++}
+ 
+ namespace CodeSize {
+ class CodeSizeValidation final {
+@@ -48,6 +58,16 @@
+ 
+   InstructionData CompileAndGetStats(FEXCore::Context::Context* CTX, FEXCore::Core::InternalThreadState* Thread, const void* Data,
+                                      size_t SizeBytes, int32_t MaxInst = -1) {
++    if (std::getenv("NATEMU_CHECKPOINT_ROOT_PREP")) {
++      static constexpr uint8_t Fixture[] = {
++        0x66, 0x0f, 0xef, 0xc1, 0x48, 0x01, 0xd1, 0x48, 0x8b, 0x03,
++        0x0f, 0x94, 0xc2, 0xf3, 0x0f, 0x7f, 0x07,
++      };
++      const bool NOPControl = SizeBytes == 1 && MaxInst == 1 && *static_cast<const uint8_t*>(Data) == 0x90;
++      const bool SelectedFixture = SizeBytes == sizeof(Fixture) && MaxInst == 5 &&
++                                   std::memcmp(Data, Fixture, sizeof(Fixture)) == 0;
++      NatemuRequire(NOPControl || SelectedFixture, "NATEMU root preparation rejects other inputs");
++    }
+     if (SizeBytes > MAX_CODE_SIZE) {
+       LogMan::Msg::AFmt("x86 code too large!");
+     }
+--- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+@@ -14,6 +14,8 @@
+ #include "Interface/IR/RegisterAllocationData.h"
+ #include <FEXCore/Utils/CompilerDefs.h>
+ #include <FEXCore/Utils/MathUtils.h>
++#include <cstdio>
++#include <cstdlib>
+ 
+ namespace FEXCore::CPU {
+ 
+@@ -822,7 +824,14 @@
+       switch (OpSize) {
+       case IR::OpSize::i16Bit: ldarh(Dst, MemReg); break;
+       case IR::OpSize::i32Bit: ldar(Dst.W(), MemReg); break;
+-      case IR::OpSize::i64Bit: ldar(Dst.X(), MemReg); break;
++      case IR::OpSize::i64Bit:
++        if (std::getenv("NATEMU_CHECKPOINT_ROOT_PREP")) {
++          std::fprintf(stderr, "NATEMU_SITE entry=%llx access=%u offset=%zu dst=x%u address=x%u\n",
++                       static_cast<unsigned long long>(Entry), IR->GetID(Node).Value,
++                       static_cast<size_t>(GetCursorOffset()), unsigned(Dst.Idx()), unsigned(MemReg.Idx()));
++        }
++        ldar(Dst.X(), MemReg);
++        break;
+       default: LOGMAN_MSG_A_FMT("Unhandled LoadMemTSO size: {}", OpSize); break;
+       }
+       // Half-barrier once back-patched.
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -35,6 +35,7 @@
+ #include <FEXCore/HLE/SyscallHandler.h>
+ 
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <optional>
+ #include <type_traits>
+@@ -44,6 +45,13 @@
+ #else
+ #include <FEXHeaderUtils/Syscalls.h>
+ #endif
++
++static void NatemuRequire(bool Condition, const char* Message) {
++  if (!Condition) {
++    std::fprintf(stderr, "NATEMU_REJECT %s\n", Message);
++    std::abort();
++  }
++}
+ 
+ namespace {
+ struct DivRem {
+@@ -930,6 +938,10 @@
+ 
+   CodeData.BlockBegin = GetCursorAddress<uint8_t*>();
+   LOGMAN_THROW_A_FMT(GetCursorOffset() == 0, "Needs to be zero");
++  if (std::getenv("NATEMU_CHECKPOINT_ROOT_PREP")) {
++    std::fprintf(stderr, "NATEMU_BEGIN entry=%llx format=working32-v2\n", static_cast<unsigned long long>(Entry));
++    std::fprintf(stderr, "NATEMU_AUTHORITY entry=%llx status=missing\n", static_cast<unsigned long long>(Entry));
++  }
+ 
+   // Put the code header at the start of the data block.
+   ARMEmitter::BackwardLabel JITCodeHeaderLabel {};
+@@ -1015,6 +1027,27 @@
+     }
+ 
+     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
++      if (IROp->Op == IR::OP_NATEMURECOVERYUSE) {
++        const auto Meta = IROp->C<IR::IROp_NatemuRecoveryUse>();
++        const uint64_t Locations[] = {Meta->Location0, Meta->Location1, Meta->Location2, Meta->Location3, Meta->Location4, Meta->Location5, Meta->Location6, Meta->Location7, Meta->Location8, Meta->Location9, Meta->Location10, Meta->Location11, Meta->Location12, Meta->Location13, Meta->Location14, Meta->Location15, Meta->Location16, Meta->Location17, Meta->Location18, Meta->Location19, Meta->Location20, Meta->Location21, Meta->Location22, Meta->Location23, Meta->Location24, Meta->Location25, Meta->Location26, Meta->Location27, Meta->Location28, Meta->Location29, Meta->Location30, Meta->Location31};
++        const char* Names[] = {"RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "RSP", "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15", "XMM0.low", "XMM1.low", "XMM2.low", "XMM3.low", "XMM4.low", "XMM5.low", "XMM6.low", "XMM7.low", "XMM8.low", "XMM9.low", "XMM10.low", "XMM11.low", "XMM12.low", "XMM13.low", "XMM14.low", "XMM15.low"};
++        for (unsigned s = 0; s < 32; ++s) {
++          const auto Kind = (Meta->LocationKinds >> (2 * s)) & 3;
++          NatemuRequire(Kind == 1 || Kind == 2, "NATEMU missing location descriptor");
++          if (Kind == 1) {
++            const auto Reg = IR::OrderedNodeWrapper::FromImmediate(Locations[s]);
++            const auto Index = s >= 16 ? GetVReg(Reg).Idx() : GetReg(Reg).Idx();
++            std::fprintf(stderr, "NATEMU_ROOT entry=%llx access=%u guest_offset=%u role=%s location=%c%u\n",
++                         static_cast<unsigned long long>(Entry), Meta->AccessNode, Meta->GuestEntryOffset,
++                         Names[s], s >= 16 ? 'v' : 'x', unsigned(Index));
++          } else {
++            std::fprintf(stderr, "NATEMU_ROOT entry=%llx access=%u guest_offset=%u role=%s location=sp+%llu\n",
++                         static_cast<unsigned long long>(Entry), Meta->AccessNode, Meta->GuestEntryOffset, Names[s],
++                         static_cast<unsigned long long>(Locations[s] * MaxSpillSlotSize));
++          }
++        }
++        continue; // metadata contributes no native instruction
++      }
+       switch (IROp->Op) {
+ #define REGISTER_OP(op, x) \
+   case FEXCore::IR::IROps::OP_##op: Op_##x(IROp, CodeNode); break
+@@ -1195,6 +1228,9 @@
+   DebugData->HostCodeSize = CodeData.Size;
+   DebugData->Relocations = &Relocations;
+ 
++  if (std::getenv("NATEMU_CHECKPOINT_ROOT_PREP")) {
++    std::fprintf(stderr, "NATEMU_END entry=%llx size=%zu\n", static_cast<unsigned long long>(Entry), static_cast<size_t>(CodeData.Size));
++  }
+   this->IR = nullptr;
+ 
+   return std::move(CodeData);

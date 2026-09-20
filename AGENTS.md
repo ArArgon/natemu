@@ -9,3 +9,6 @@ keep authors and reviewers separate.
 
 Do not read or search git history for the archived Track 01 material unless the
 task names it.
+
+Before creating or revising error or learning records, read
+[the error documentation guidance](docs/retrospectives/README.md).

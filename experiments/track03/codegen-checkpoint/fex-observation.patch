@@ -1,0 +1,86 @@
+--- a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+@@ -18,6 +18,8 @@
+ #include <FEXCore/fextl/vector.h>
+ #include <bit>
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
+ 
+ using namespace FEXCore;
+ 
+@@ -371,6 +373,35 @@
+ 
+     RemapReg(Node, Reg);
+     Node->Reg = Reg.Raw;
++  }
++
++  // Diagnostic observations only: reservations are not a guest fault-state map.
++  void DumpNatemuAllocation(const char* Phase, Ref Node) const {
++    if (!std::getenv("NATEMU_CHECKPOINT_TRACE")) {
++      return;
++    }
++    const auto* Header = IR->GetOp<IROp_Header>(Node);
++    std::fprintf(stderr, "NATEMU_RA phase=%s node=%u op=%u", Phase,
++                 static_cast<unsigned>(IR->GetID(Node).Value), static_cast<unsigned>(Header->Op));
++    if (Header->Op == OP_GUESTOPCODE) {
++      std::fprintf(stderr, " guest_offset=%u", Header->C<IROp_GuestOpcode>()->GuestEntryOffset);
++    }
++    for (unsigned C = 0; C < IR::NumClasses; ++C) {
++      const auto& Class = Classes[C];
++      for (unsigned R = 0; R < Class.Count; ++R) {
++        if (!(Class.Available & (1u << R))) {
++          std::fprintf(stderr, " occupied:%u:%u=ssa:%u", C, R,
++                       static_cast<unsigned>(IR->GetID(Class.RegToSSA[R]).Value));
++        }
++      }
++    }
++    // Assigned slots can belong to another point/block: no validity is inferred.
++    for (size_t I = 0; I < SpillSlots.size(); ++I) {
++      if (SpillSlots[I]) {
++        std::fprintf(stderr, " assigned_slot:ssa:%zu=%u", I, SpillSlots[I] - 1);
++      }
++    }
++    std::fputc('\n', stderr);
+   }
+ 
+   // Assign a register for a given Node, spilling if necessary.
+@@ -662,6 +693,7 @@
+     // Forward pass: Assign registers, spilling & optimizing as we go.
+     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+       bool AnySpilledBeforeThisInstruction = AnySpilled;
++      DumpNatemuAllocation("before", CodeNode);
+ 
+       // These do not read or write registers, and must be skipped for merging.
+       // Since we'd be doing this check anyway for merging, do the check now so
+@@ -762,6 +794,8 @@
+       if (GetHasDest(IROp->Op) && PhysicalRegister(CodeNode).IsInvalid()) {
+         AssignReg(IROp, BlockIROp, CodeNode, IROp);
+       }
++
++      DumpNatemuAllocation("reserved_before_merge", CodeNode);
+ 
+       if (IsTrivial(CodeNode, IROp)) {
+         // Delete instructions that only exist for RA
+--- a/Source/Tools/CodeSizeValidation/Main.cpp
++++ b/Source/Tools/CodeSizeValidation/Main.cpp
+@@ -13,6 +13,8 @@
+ #include <FEXCore/Utils/SignalScopeGuards.h>
+ 
+ #include <sys/stat.h>
++#include <cstdio>
++#include <cstdlib>
+ 
+ namespace CodeSize {
+ class CodeSizeValidation final {
+@@ -196,6 +198,10 @@
+   const char* CharLevel {LogMan::DebugLevelStr(Level)};
+ 
+   if (Level == LogMan::INFO) {
++    // Retain raw diagnostics before header/tail removal and address sanitizing.
++    if (std::getenv("NATEMU_CHECKPOINT_TRACE")) {
++      std::fprintf(stderr, "NATEMU_RAW_INFO %s\n", Message);
++    }
+     // Disassemble information is sent through the Info log level.
+     if (!CodeSize::Validation->ParseMessage(Message)) {
+       return;

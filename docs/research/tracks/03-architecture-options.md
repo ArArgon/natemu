@@ -13,6 +13,11 @@ Start with the host-translator/EL1-shim direction and the accepted, scoped
 chosen mechanism and conditions match. Changes to those mechanisms need their
 own correctness assessment. The frozen reproduction program remains retired.
 
+The host-codegen/captive-VM-shim architecture is fixed. QEMU TCG, FEX and other
+generators are component choices within it, not end-to-end alternatives. Select
+semantic/helper reuse separately; upstream system coverage does not by itself
+establish suitability, correctness after adaptation or lower cost.
+
 The target is unmodified modern x86-64 Linux, direct boot and SMP, with timer/APIC,
 serial, block, network, entropy and shutdown support. Preserve the required
 startup32 transition where applicable; real mode remains out of scope. AVX2 is
@@ -123,7 +128,14 @@ expose additional interactions; record them with the affected decision.
 
 ## Decision record and completion
 
-Keep the current architecture in `INV-03-01`, created when design work begins.
+Keep the current architecture in [INV-03-01](../investigations/INV-03-01.md).
+Its [twelve-question inventory](../investigations/INV-03-01.md#current-design-choices-and-evidence-ownership)
+is the main entry point for current decisions: fixed requirements, open choices,
+applicable evidence and next closure work. The four investigation identifiers
+are evidence work areas, not replacements for these twelve charter questions.
+Their current summaries own active work; historical pass-local next actions
+are not concurrent assignments. Scoped source acceptance is distinct from
+acceptance of a design choice or the combined architecture.
 For each choice record the mechanism/implementation direction, required behavior
 and interactions, supporting evidence, material alternatives and rejection
 reasons, cost/adaptation implications, and unresolved issues or falsifiers.
