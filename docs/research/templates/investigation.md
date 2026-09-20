@@ -1,5 +1,9 @@
 # INV-<track>-<nn> — title
 
+During exploration, use only the relevant sections for the brief record required
+by the [workflow](../README.md#conduct-an-investigation), and label runs exploratory.
+Expand the method and review record when seeking acceptance of a finding.
+
 ## Current summary
 
 - **Question:** Q-<track>-<nn>, the question and decision it affects.

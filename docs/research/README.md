@@ -1,15 +1,16 @@
 # Research workflow
 
-This is the authoritative workflow for new research. Read it, then the assigned
-[feasibility charter](tracks/01-feasibility.md) and the investigation it assigns.
-That investigation owns its current question, conclusion, applicability, blockers,
-and next action. Consult a
+This is the authoritative workflow for new research. Read it, then the charter
+for the assigned track and its owning investigation. The completed
+[feasibility charter](tracks/01-feasibility.md) supplies inherited findings where
+applicable. Each investigation owns its question, conclusion, applicability,
+blockers and next action. Consult a
 historical review only for a specific unresolved finding, contradiction, or audit.
 
 ## Decision and product envelope
 
 Determine whether an unmodified x86-64 Linux system emulator on Apple Silicon,
-using documented Apple silicon capabilities, can credibly be materially better than QEMU TCG in
+using Apple silicon capabilities, documented or undocumented, can credibly be materially better than QEMU TCG in
 technical and economic terms, and which architecture deserves planning.
 
 The envelope remains:
@@ -24,13 +25,61 @@ The envelope remains:
 The detailed accepted scope remains in [Track 00](tracks/00-scope-and-success.md).
 Material at or before preservation commit `a121702`, including inherited probes
 and results, is provenance only and cannot serve as evidence. It may seed questions.
-Research makes no binding implementation decisions. Final synthesis separately
+Track 03 makes architectural decisions and establishes their correctness; planning
+owns construction details and delivery. Final synthesis separately
 selects **stop**, **continue targeted research**, or **authorize planning**.
 Implementation requires completed, approved planning and separate authorization.
 The workflow migration itself did not complete Track 01 or add experimental
 evidence.
 
+## Work order and architecture
+
+Tracks organize responsibilities, not sequential phases. Track 02 is retired;
+[Track 03](tracks/03-architecture-options.md) owns architectural choices and their
+correctness, including interactions. Tracks 04/05 contribute estimates and
+measurements while candidates develop. Follow specific evidence dependencies,
+not whole-track completion gates; keep affected choices provisional while
+unrelated work continues. Use existing investigations and direct evidence links,
+without a separate dependency ledger.
+
+The owner's September 19 revision admits documented and undocumented Apple
+capabilities. Establish the behavior a selected mechanism relies on. Discuss
+M2/M4 discrepancies when key features depend on them; M2 parity is not a general
+prerequisite. Record license implications as warnings, not selection blockers.
+These policies supersede earlier scope wording for new work; accepted Track 01
+findings and their original experimental conditions remain unchanged.
+
 ## Conduct an investigation
+
+The local working unit is a **design choice**, or a tightly coupled group of
+choices. The **architecture** is the combined result. Assess a choice with the
+surrounding mechanisms it depends on, state those assumptions, and revisit its
+acceptance when they change. Architecture acceptance still requires the combined
+choices and their interactions to preserve the required behavior.
+
+Distinguish **exploration** from **decision evidence** before running an experiment:
+
+- **Exploration:** source inspection, disposable code and bounded probes may
+  proceed without prior independent review. Briefly record the question,
+  relevant assumptions, expected observations, time/resource limits and stopping
+  condition in the owning investigation. Use the relevant parts of its template;
+  a complete experimental-method submission is unnecessary at this stage.
+  Retain producing code, inputs, outputs and failures under the run rules below,
+  and mark the run exploratory. Results guide hypotheses, priorities and design
+  revisions; they cannot establish correctness, a definitive design rejection
+  or a performance claim. Investigate contrary observations, including any that
+  challenge an accepted finding; exploratory status is no reason to dismiss them.
+- **Decision evidence:** when an experiment is needed to settle a choice, obtain
+  independent pre-execution review and collect fresh evidence under the reviewed
+  method. Exploratory results motivate that run; relabeling them cannot promote
+  them into accepted evidence. Findings review and independent replication of
+  load-bearing observations remain required. Applicable accepted findings and
+  reviewed source contracts may settle a choice without a new experiment.
+
+Keep exploration notes short in the existing investigation. This distinction
+changes work order, not scope, questions, required behaviors or the standard for
+accepting a design choice or the architecture. Experimental work remains bounded;
+full implementation retains its separate authorization requirement.
 
 1. Open one question in a self-contained [investigation](templates/investigation.md).
    State its decision consequence and perform a breadth check of product assumptions,
@@ -41,21 +90,26 @@ evidence.
    are none, say so. Existing identifiers are retained. Every kill assumption and
    finding names the design it applies to.
 2. Explain the relevant source contracts, assumptions, method, controls, and limits.
-   For experiments, declare inputs, correctness oracles, sample/exclusion rules,
+   Exploration uses the brief record above. For decision-evidence experiments,
+   declare inputs, correctness oracles, sample/exclusion rules,
    resource/time budgets, failure behavior, and stopping conditions. Every open
    investigation has one bounded next step, the decision it could change, and
    its stopping condition. A missing execution budget is explicit work to finish
    before execution, not permission for an unlimited campaign.
-3. Obtain **pre-execution review** from an independent reviewer of the question,
-   relevant sources, method, controls, and code before experimental execution.
-   The review must answer three screening items before anything else: (a) does
-   QEMU TCG or an ordinary VM on this platform share the problem; (b) does a
-   documented platform capability already answer it; (c) which design does the
-   finding apply to. A question failing (a) or (b) is reframed, not executed. Authors may prepare code, compile, and perform synthetic validation
-   beforehand. Record these self-checks briefly with the submitted work; do not
+3. Before a **decision-evidence experiment**, obtain **pre-execution review**
+   from an independent reviewer of the question, relevant sources, method,
+   controls and code. Exploratory runs do not require this review.
+   The review first asks: (a) what is shared with QEMU TCG or ordinary VMs;
+   (b) what specifications, platform contracts or accepted evidence already
+   answer; (c) what uncertainty remains for this design. Execute only when the
+   remaining uncertainty can change a decision. A shared problem can still need
+   a design-specific experiment; undocumented capabilities are admissible.
+   Authors may prepare code, compile and perform synthetic validation beforehand.
+   Record these self-checks briefly with the submitted work; do not
    create separate self-review documents. Source-only work proceeds directly to
    findings review.
-4. Run the reviewed experiment with retained inputs and artifacts as below.
+4. Run the bounded exploratory probe or reviewed decision-evidence experiment
+   with retained inputs and artifacts as below.
    Correctness failures invalidate affected performance samples. Preserve negative
    outcomes, partial failures, exclusions, and contradictions; a checker PASS is
    not acceptance of a scientific conclusion. Report correctness independently
@@ -93,6 +147,12 @@ created when needed: `reviews/INV-<track>-<nn>-pre-execution.md` or
 `reviews/INV-<track>-<nn>-findings.md`. Keep returns in that thread; no new global
 review number is needed per exchange. Record the reviewer identity/context,
 material inspected, evidence, verdict, and return disposition.
+
+Review coherent design choices and their relevant interactions together. Editorial
+edits need no separate review round; substantive changes to claims, code, controls,
+methods or assumptions relied on for acceptance require the affected material to
+be rechecked in the same thread. Recheck substantive changes to experimental code,
+controls or methods before further decision-evidence execution.
 
 An independent reviewer is a different author working in a separately recorded
 context and able to challenge the submission. Use subagents for independent
@@ -134,7 +194,8 @@ provenance, but new claims cite their supporting material directly.
 State host generation/model, macOS/SDK, guest, vCPU count and placement, workload,
 and relevant signing/API context explicitly. One-host results stay one-host
 results. Additional hosts widen applicability incrementally as available;
-unavailable-host replication must precede platform-wide synthesis use. SMP
+generation-dependent claims require evidence for the generations they cover;
+otherwise keep the narrower applicability. SMP
 results do not follow from single-thread tests, and placement requests do not
 establish actual core placement.
 
@@ -142,11 +203,14 @@ establish actual core placement.
 
 Write new raw data outside Git beneath `NATEMU_RAW_ROOT`. Runners refuse absent
 or repository-contained output roots, overwrites, and mixed-run/build evidence.
-Keep checksums for retained artifacts. Each evidence run retains a small snapshot
+Keep checksums for retained artifacts. Each experimental run, exploratory or
+decision evidence, retains a small snapshot
 of its experiment sources, local dependencies, and build inputs and **builds from
 that snapshot**. Record toolchain/SDK versions, flags, inputs, environment,
 execution outcome, and one run identity associating the producing build, controls,
-and results. Record failed/partial runs as well as successful ones.
+and results, including its exploratory or decision-evidence purpose. Record
+failed/partial runs as well as successful ones. Reuse the same retention and
+supervision mechanisms for both; exploration needs no separate runner framework.
 
 Repository HEAD and a clean tree are not approval conditions. Runtime checks
 validate factual context and data integrity, not review prose or approval receipts.
@@ -161,8 +225,8 @@ Two historical bodies of work live only in git history and are not evidence or
 current direction: the August 2026 corpus at commit `a121702`, and the September
 2026 Track 01 process-design investigations, reviews, manifests, ledgers and
 experiments at tag `track01-archive-2026-09-06`. Do not read them unless auditing
-a specific old finding. Other tracks retain their existing question content; their
-new work follows this workflow.
+a specific old finding. Track 02 identifiers now redirect to Track 03 obligations; remaining historical
+rows are migrated when used. New work follows this workflow.
 
 ## Identifiers
 
@@ -176,8 +240,8 @@ and are never reassigned. Withdrawn identifiers remain recorded.
 
 1. [Scope and success](tracks/00-scope-and-success.md)
 2. [Feasibility](tracks/01-feasibility.md)
-3. [Correctness](tracks/02-correctness.md)
-4. [Architecture options](tracks/03-architecture-options.md)
+3. [Correctness — retired into Track 03](tracks/02-correctness.md)
+4. [Architecture and implementation direction](tracks/03-architecture-options.md)
 5. [Performance estimation](tracks/04-performance-estimation.md)
 6. [Benchmarking and validation](tracks/05-benchmarking-and-validation.md)
 7. [Research synthesis](tracks/06-research-synthesis.md)

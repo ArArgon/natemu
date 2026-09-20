@@ -1,35 +1,32 @@
 # Benchmarking and validation
 
-This track defines how research must measure the surviving options carried
-forward by [Architecture options](03-architecture-options.md) — the same set
-[Performance estimation](04-performance-estimation.md) estimates — against
-the fair baselines defined by
-[Scope and success](00-scope-and-success.md), QEMU TCG required among them;
-it is a roadmap, not a result. Work on it follows the [research workflow](../README.md).
+This track supplies fair baselines and measurement methods for the design
+questions in [Track 03](03-architecture-options.md) and estimates in
+[Track 04](04-performance-estimation.md). QEMU TCG remains the required baseline.
+Work follows the [research workflow](../README.md).
 
-## Measurement progression
+## Measurement choices
 
-Measurement proceeds in order, and each stage unlocks the next: a mechanism
-may be microbenchmarked only after its capability check is accepted; a
-subsystem benchmark may start only with accepted microbenchmark evidence for
-every mechanism the subsystem combines; an integrated prototype (a later-phase integrated build, not a Track 01 deliverable) only when every
-subsystem it spans has accepted subsystem evidence; and an end-to-end
-workload only when every mechanism the measured configuration exercises has
-accepted evidence at all prior stages. Each stage
-becomes questions in the [question backlog](../question-backlog.md),
-resolved with labelled evidence through the applicable gates:
+Choose the smallest experiment that can change the decision. Capability checks,
+microbenchmarks, subsystem tests and integrated experiments are tools, not a
+mandatory sequence. Each method states its actual evidence prerequisites,
+correctness checks, timing qualification, budget and stopping condition. Design
+experiments can run within Track 03 before architecture selection. Full product
+implementation retains its separate planning and authorization requirements.
+The workflow's exploration/decision-evidence distinction applies to every method
+below: exploratory probes need no pre-execution review, while experiments used
+to settle a choice do. Exploratory results remain provisional.
 
-1. **Capability checks.** Whether a mechanism works at all under the
-   approved experiment code, before any timing of it is meaningful.
+1. **Capability checks.** Whether the configured mechanism works at all;
+   performance conclusions require correctness of the behavior measured.
 2. **Microbenchmarks.** Isolated costs of single mechanisms, matched to the
    cost components in
    [Performance estimation](04-performance-estimation.md).
 3. **Subsystem benchmarks.** Combined costs of one subsystem — for example
    memory, faults, or interrupt delivery — under controlled load.
-4. **Integrated prototypes** (a later-phase integrated build, not a Track 01
-   deliverable). Mechanisms combined across subsystems, extending the Track 01
-   test program's established mechanisms from [Feasibility](01-feasibility.md) with
-   measurement under an approved method.
+4. **Integrated experiments.** Combine mechanisms to test interactions or
+   costs. Reuse applicable feasibility evidence; the
+   frozen Track 01 program remains retired from development.
 5. **End-to-end workloads.** The diverse workload set from Scope and
    success, run against the fair baselines under identical conditions.
 
@@ -39,33 +36,35 @@ A comparison is reported for the host it ran on; its manifest names the
 machine and OS, and both sides of the comparison run on that machine under
 identical conditions. Cross-machine numbers are never compared directly.
 
-Before synthesis treats a performance conclusion as platform-wide, the
-coverage must reach at least two host machines spanning at least two Apple
-Silicon generations, and at least two guest configurations from the
-supported envelope; a vCPU ladder of 1, 2, 4, and 8+ vCPUs; and workload
-classes spanning compute, memory, fault- and syscall-heavy, I/O, and
-concurrency-dominated behavior, so no single benchmark-shaped workload
-carries a conclusion. That coverage is built incrementally, one machine at a
-time as hosts become available; a conclusion that has not reached it is
-reported with the narrower applicability it has.
+Select host, guest, vCPU and workload coverage for the claim. M4 is the host of
+record; investigate M2/M4 differences when a key feature affects the design.
+Broader applicability needs corresponding evidence, not extrapolation from one
+host. SMP and scaling claims must cover the concurrency they assert. Product-wide
+performance qualification retains at least two guest configurations, the
+1/2/4/8+ vCPU ladder, and compute, memory, fault/syscall, I/O and concurrency
+workloads. Research experiments may support narrower claims. Missing cells narrow
+the conclusion rather than blocking unrelated architectural work.
 
 ## Result validity
 
-Every reported result must record: randomized repetition order with enough
+Decision-bearing performance results must record: randomized repetition order with enough
 repetitions to state uncertainty; documented experimental controls,
 including host state and disclosed tuning on both sides of a comparison;
 uncertainty intervals, never bare means; a raw-data manifest referencing
 immutable external raw artifacts, as required by the
 [research workflow](../README.md); and the correctness status of the
-measured configuration per [Correctness](02-correctness.md) — a result from
-a configuration with an unresolved or failing correctness status cannot
-support a performance conclusion.
+behavior measured under [Track 03](03-architecture-options.md). Quarantine
+potentially affected results when correctness fails; establish impact, correct
+the defect and rerun affected measurements. Exploratory observations use the
+workflow's brief record and retained-run rules; logging diagnostic timings does
+not make them performance evidence. Correctness-only findings use the controls
+and oracles appropriate to their claim, without irrelevant statistical demands.
 
 ## Exit criteria
 
-The track is complete when each stage has accepted evidence across the
-required coverage, results are mapped to the "materially better" definition
-and stop conditions from Scope and success, the end-of-track breadth pass is
-recorded, and all surfaced questions are filed in the question backlog. The
-results feed [Research synthesis](06-research-synthesis.md); they decide
-nothing by themselves.
+The research measurement work is complete when the measurements needed for the
+synthesis decision have accepted results with applicability limits, mapped to
+success and stop criteria, and the breadth check is addressed. Explicitly hand
+later implementation qualification to planning; this does not establish product
+performance before integrated evidence exists. Results feed
+[Research synthesis](06-research-synthesis.md).

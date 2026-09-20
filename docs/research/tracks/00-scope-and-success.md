@@ -7,11 +7,12 @@ finding: nothing here is evidence. Work on it follows the [research workflow](..
 
 The starting envelope, subject to revision by this track's own outcomes:
 
-- documented Apple silicon and macOS capabilities, including hardware controls
+- Apple silicon and macOS capabilities, documented or undocumented, including hardware controls
   reachable from a Hypervisor.framework guest, on Apple silicon under macOS 26;
   the host of record for research is the M4, with an M2 Pro/Max as the second
   generation when available; no App Store or distribution constraint (experiment
-  project); a second macOS release is not a research or product requirement;
+  project); a second macOS release is not a research or product requirement; assess M2/M4
+  discrepancies when key features depend on them, without a general M2 parity gate;
 - unmodified modern x86-64 Linux guests with direct boot;
 - SMP as a baseline, not an extension; and
 - a minimal headless device set — timer/APIC, serial, block, network,
@@ -28,6 +29,8 @@ This envelope is an input to be questioned, not a settled scope. Every
 narrowing or widening must be recorded as a question in the
 [question backlog](../question-backlog.md) and resolved through the applicable
 gates.
+
+Licensing implications are recorded as warnings, not candidate-selection blockers.
 
 ## Required definitions
 

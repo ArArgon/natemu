@@ -1,9 +1,9 @@
 # natemu
 
 natemu is an unvalidated research project. Its decision question is whether an
-unmodified x86-64 Linux system emulator on Apple Silicon using documented Apple
-silicon capabilities can be materially better than QEMU TCG while meeting an explicit correctness
-scope.
+unmodified x86-64 Linux system emulator on Apple Silicon using Apple silicon
+capabilities, documented or undocumented, can be materially better than QEMU TCG
+while meeting an explicit correctness scope.
 
 The SMP baseline is in scope from the outset: research must treat
 multi-processor guest behavior and relevant platform dimensions explicitly.
@@ -12,8 +12,8 @@ The project is in its research phase. Begin with the
 [research workspace](docs/research/README.md).
 
 The project lifecycle is research, then planning, then implementation. Research
-establishes evidence and constraints; planning turns those findings into a
-proposed approach only after research authorizes it; implementation begins only
+establishes evidence and architectural choices; planning defines construction
+and delivery only after research authorizes it; implementation begins only
 after planning is completed and approved and implementation is separately
 authorized.
 

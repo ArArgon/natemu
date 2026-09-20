@@ -1,27 +1,24 @@
 # Performance estimation
 
-This track defines how research must estimate, before full measurement,
-whether the surviving options carried forward by
-[Architecture options](03-architecture-options.md) — its
-recommendation, plus any family whose rejection a recorded falsifier has
-reopened — can plausibly meet the "materially better" definition from
-[Scope and success](00-scope-and-success.md); the track estimates only that
-set. It is a roadmap, not a finding, and it makes no performance claims.
-Work on it follows the [research workflow](../README.md).
+This track estimates costs and sensitivities for candidates being developed in
+[Architecture and implementation direction](03-architecture-options.md), against
+the success criteria in [Scope and success](00-scope-and-success.md). Estimates
+inform architectural choices before a final selection. Work follows the
+[research workflow](../README.md); projections are distinguished from measured
+performance.
 
 ## Estimation rules
 
 Every estimate produced under this track must be a range with an explicit
-sensitivity analysis over its inputs, never a point claim. Each input carries
-its evidence label, and the estimate inherits the weakest label among its
-load-bearing inputs, per the label ordering declared in the
-[research workflow](../README.md). Combining estimates must not
+sensitivity analysis over its inputs, never a point claim. Each input carries its evidence type, applicability and uncertainty under the
+[research workflow](../README.md). State which assumptions drive the estimate;
+evidence types have no universal ranking. Combining estimates must not
 multiply overlapping speedups: cost components that share a mechanism, a
 bottleneck, or a workload phase may not be composed as if independent, and
-every composition must state its independence argument. Estimates from
-configurations whose correctness status is unresolved cannot support
-conclusions, per the precondition in
-[Correctness](02-correctness.md).
+every composition must state its independence argument. Conditional models may explore provisional designs with explicit assumptions.
+They cannot establish measured speedup or acceptance of a design whose required
+correctness is unresolved. Measurements must qualify the behavior measured under
+[Track 03](03-architecture-options.md).
 
 ## Cost components
 

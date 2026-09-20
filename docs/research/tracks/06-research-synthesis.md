@@ -5,16 +5,18 @@ the preceding tracks. It is a roadmap, not a decision. Work on it follows the [r
 
 ## Inputs
 
-Synthesis consumes only findings that have passed their applicable gates; unlabelled
-or ungated material cannot enter the packet. Open items raised during
+Only findings that have passed their applicable reviews may support synthesis
+conclusions. Include unreviewed exploratory observations as explicitly unresolved
+concerns where relevant, never as accepted findings; do not hide contradictory
+observations merely because they are unreviewed. Open items raised during
 synthesis become entries in the
 [question backlog](../question-backlog.md). The inputs are the accepted
 outputs of the preceding tracks: the scope, baselines, "materially better"
 definition, and stop conditions from
 [Scope and success](00-scope-and-success.md); the resolutions and recorded
-kills from [Feasibility](01-feasibility.md); the coverage evidence from
-[Correctness](02-correctness.md); the recommendation and rejected-option
-record from [Architecture options](03-architecture-options.md); the ranges
+kills from [Feasibility](01-feasibility.md); the architecture decisions,
+correctness and interaction evidence, alternatives and falsifiers from
+[Track 03](03-architecture-options.md); the ranges
 from [Performance estimation](04-performance-estimation.md); and the results
 from [Benchmarking and validation](05-benchmarking-and-validation.md).
 
@@ -23,7 +25,7 @@ from [Benchmarking and validation](05-benchmarking-and-validation.md).
 The packet must contain:
 
 - **Criteria comparison.** Each surviving option — the set carried forward
-  by Architecture options and measured by the later tracks — compared
+  by Track 03, with applicable estimates and measurements — compared
   against the approved success criteria from Scope and success. The
   comparison presents accepted findings, each identified by its evidence
   label, and may not manufacture claims that passed no gate.
@@ -48,10 +50,14 @@ remain part of the packet.
 
 The synthesis gate selects exactly one outcome: stop, continue targeted
 research, or authorize planning. No other outcome exists, and no outcome may
-be implied without the gate. The packet excludes production implementation
-details — architecture and delivery design belong to planning, which begins
-only if the outcome is authorize planning and planning is separately
-authorized.
+be implied without the gate. The packet carries Track 03 architectural decisions into planning. Planning
+owns construction details and delivery and requires its separate authorization.
+A planning decision may rest on reviewed cost projections and scoped experiments;
+it must not present them as measured end-to-end superiority. Unresolved issues
+that could invalidate the selected architecture require targeted research, not
+relabeling as later validation. Record remaining implementation and qualification
+obligations with their acceptance conditions and consequences. The eventual
+product success thresholds remain unchanged.
 
 ## Exit criteria
 
