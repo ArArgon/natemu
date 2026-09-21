@@ -2156,3 +2156,190 @@ frame store visible in this AMD/KVM/Linux exploratory observation**. It neither
 settles claim51's selected Intel rule nor supplies claim55's missing general
 ordinary-RAM permission. Those limitations are material, not removed by passing
 controls or by this independent artifact review.
+
+## September 20 — bounded setup and Box64 export preparation review
+
+**Reviewer:** `/root/comparison_sources`, separate context from root, who authored
+`experiments/track03/codegen-comparison/{setup.py,setup.sh,check_setup.py,run.py,make-fixtures.py,box64-export.py,box64.sh}`.
+Two preparation checks were capped at five minutes each with bounded correction
+verification, within the owning setup/candidate allowances. This is preparation
+review for exploration, not a review of observed generator output.
+
+**Evidence validity: accepted in this scope after corrections.** Inspected the
+retention helper reuse, external fresh-run allocation, source/package retention,
+pinned image/context checks, Docker CPU/memory/swap controls and forced cleanup.
+Found a broken awk URI matcher that bypassed package-size admission; root fixed
+it and added checks of the actual expression. Reviewer reran `check_setup.py`:
+success/failure retention, overwrite refusal and bounded/excess/malformed/empty
+URI cases PASS. Root also changed container names to unique UUIDs and enables
+cleanup before creation so a timed-out create is not omitted from cleanup.
+
+For Box64, inspected the minimal ELF fixture producer and compile-only patch
+against retained pinned initialization and emission source. The branch precedes
+symbol export, preloads, needed-library loading and deferred ELF initialization;
+the fixtures contain no interpreter, dependencies or constructors. The exact
+instruction limit replaces only `CreateDBnoAlt`'s `FillBlock64` call, and emitted
+length/instruction count are checked. Identified that an `emulate` guard alone
+misses earlier guest callbacks. Root added guards to `DynaCall`, `DynaRun`,
+`EmuRun` and interpreter `Run`. Reviewer read the complete pinned archive at
+`/private/tmp/natemu-track03-comparison-raw/box64-source-01/source/upstream.tar.gz`
+and independently checked all four exact guard anchors. Also inspected
+`GetEntryPoint`: `maplib` is unused and the result is `h->entrypoint + h->delta`,
+so this static ELF path does not require the later `AddSymbols` call.
+No material preparation return remains in the inspected scope. Native byte
+extent includes alignment padding and excludes following literal tables; it is
+not a complete relocated executable object. Build success remains unobserved
+by this review.
+
+**Decision relevance: accepted only as bounded exploratory preparation.** These
+changes make obtaining actual Box64 output and retaining failures possible within
+the fixed host-codegen/captive-shim architecture. Performance remains the selection
+criterion; neither setup success, source familiarity, byte counts nor this code
+review selects a generator/helper. The next result is usable output or a concrete
+build/export failure within the existing candidate budget. No new recovery audit,
+unbounded build repair, captive execution authorization, performance acceptance
+or whole-architecture conclusion follows from this verdict.
+
+### September21 — native binary64 specialization and numerical-service source review
+
+`/root/direction_review`, independent source review for the00:22UTC integrated
+package. The reviewer authored the earlier TCG helper build, not this proposed
+numerical contract; no execution or producer acceptance is supplied here.
+Inspected the retained QEMU pin's `fpu/softfloat.c:can_use_fpu`, `float64_gen2`,
+add/sub/mul/div pre/post predicates and `float64_sqrt`,
+`include/fpu/softfloat-types.h`, `target/arm/tcg/vfp_helper.c` AFP behavior,
+FEX `Vector.cpp:GetMXCSR/RestoreMXCSRState`, and existing claims47/48/53.
+
+**Evidence validity — accept the conditional SSE specialization.** For scalar
+binary64 ADD/SUB/MUL/DIV/SQRT, admit only all six guest exception masks set,
+nearest-even rounding, DAZ/FTZ clear, already-sticky inexact, normal nonzero
+inputs (exponent1..2046), and positive input for SQRT. Retain the operands and
+old destination, compute through the actual inherited/native operation into
+staged state, and commit only if the result exponent is2..2046. Other cases
+use the checked inherited semantic service.
+
+This is a conservative refinement of the pinned QEMU normal fast path.
+`can_use_fpu` requires inexact already set and nearest-even; the proposed inputs
+satisfy the operation-specific prechecks (including normal nonzero divisor).
+The result range strictly excludes infinity and the `abs(result)<=DBL_MIN`
+region in `float64_gen2` that may require software underflow handling. Invalid,
+denormal operand and divide-by-zero are excluded by admission; overflow and
+tininess are excluded by postclassification. The only remaining possible new
+exception is inexact, which is already sticky and masked. Therefore preserving
+the complete old MXCSR status is correct in this admitted domain. Positive
+normal SQRT also reaches QEMU's native path; its guard is conservative.
+
+FPCR6 supplies nearest rounding, FIZ/FZ clear and the AFP merging behavior used
+by the retained scalar code. The inspected ARM AFP source distinguishes AH's
+NaN, zero-times-infinity and tiny-result handling; the admitted domain excludes
+those distinctions. Preserve the host AFP/readback applicability and exact
+scalar upper-lane binding. This reasoning does not establish packed arithmetic,
+FMA, comparisons, MIN/MAX, conversion or general nonfinite behavior.
+
+Required details are part of acceptance: admission and commit occur per guest
+instruction, including each member of a two-operation fixture; a late fallback
+must not replay an earlier committed operation or an input memory read. Native
+FPSR after a rejected trial is not guest MXCSR and cannot contaminate fresh
+operation-local fallback status. The full-MXCSR owner bypasses FEX's status-bit
+masking, preserves prior sticky bits, and stages suppressed destinations under
+claim48. Unmasked operations cannot use an old sticky flag as a new fault.
+Legacy upper-vector state remains preserved. Comparing TCG requires the same
+initial sticky-inexact/control state, rather than the earlier forced-soft state.
+
+**Decision relevance:** the contract supplies a concrete way to price the missing
+status/recovery work without changing required SSE behavior or implementing new
+floating-point arithmetic. Its ordinary costs include control/input/result
+classification, scratch/result staging, extended operand lifetimes, control-flow
+edges and code size; fallback frequency and service cost remain explicit. These
+costs must be measured as part of the compared adapter, not called cold merely
+because an exception is uncommon. No performance preference follows from the
+source proof alone, and no execution is authorized by this review.
+
+**x87 return — one correction required.** Retaining cheaper inherited binary64
+libm transcendental behavior is consistent with the owner's accuracy/cost
+priority if the numerical limitation is disclosed. It neither establishes full80
+accuracy nor waives stack/control/status/exception effects. However, limiting
+Bochs reuse only to scaled exceptional results omits an already recorded API
+gap: claim53 identifies the missing generic QEMU round-up C1 result for rounded
+arithmetic and conversions, as well as massive FSCALE handling. Cover these
+with the existing status-capable primitive where required, or obtain an explicit
+semantic-scope concession; the x87 numerical-accuracy instruction alone is not
+that concession. This is a component-capability requirement, not a demand for
+Bochs transcendentals, a full80 gate, a TCG generator preference, or an assertion
+that one numerical provider is fastest. Once that boundary is explicit, the
+existing staged owner supplies a finite architectural direction; implementation
+conformance and measured costs remain separately scoped.
+
+**Claim57 return — accept the actual source/design contract.** Read root's
+appended claim57 in full. It incorporates per-instruction staging, complete
+MXCSR ownership, equal competing status inputs, discard of rejected speculative
+FPSR, and the unresolved x87 C1 boundary. The x87 return above is therefore
+addressed as an explicit unresolved policy/provider question, not falsely closed.
+The SSE construction is independently acceptable without waiting for that answer.
+
+Also directly checked the parallel `float32_gen2`, operation predicates and
+`float32_sqrt`: binary32 input exponents1..254 and result exponents2..254 supply
+the same conservative argument using FLT_MIN. Accept that scalar binary32
+source construction too; this adds no claim that binary32 emitted bindings were
+built or exercised. The accepted operations are scalar ADD/SUB/MUL/DIV and
+positive SQRT in the stated binary32/binary64 domain, with actual native precision
+and lane behavior required by the eventual binding. Packed and other instruction
+families remain service-bound as the text states.
+
+**Paired verdict:** evidence validity accepted for this conditional inherited
+arithmetic/status design; decision relevance accepted because it makes the
+previously missing hot-path work concrete and comparable without an SSE waiver.
+Neither component ranking nor experimental execution/implementation conformance
+is accepted. No substantive source-contract return remains on claim57. Total
+charge9 agent-minutes within this15-minute allocation; no execution or download.
+
+### Root independent review — claim56 recovery construction, September21
+
+**Evidence validity: ACCEPT within the stated native envelope.** Root reviewed
+comparison_sources' source-authored claim56 and correction against pinned FEX
+RegisterAllocationPass.cpp last-use/free-before-destination and spill allocation,
+CPUBackend.h's32-byte maximum slot, Box64's actual instruction-prefix mapping,
+and the retained original/live and consolidated branch fixtures. GuestOpcode
+alone cannot keep a dead current root alive; metadata-only recovery uses must
+participate in allocation and actual native-site validation. The39-value ceiling
+is a count of named values, not extra registers or compulsory stores. The64-slot
+cap is checked after allocation because allocation can consume fresh slots;
+shortening/rejection, not assumed coloring, enforces the bound.
+
+The author's correction properly distinguishes original ADD/PXOR-before-LDR
+from consolidated ADD-or-XOR/LDR/PXOR: the latter needs incoming XMM0 at the LDR
+fault. Root also checked the existing six-instruction scalar guard uses x1/x2
+and leaves NZCV unchanged. It does not require the FP guard's NZCV and candidate
+before-image treatment. Equal/backward-edge checks plus bounded lowering and
+external veneers supply bounded stop opportunities without universal per-guest-
+instruction polling. Non-admitted instructions retain checked semantic execution.
+
+**Decision relevance: ACCEPT as source constructibility, not measured full-adapter
+cost.** Already surviving current roots need no forced canonical publication;
+local liveness repair and service frequency remain explicit cost terms. This
+removes a universal-spill premise from comparison and supplies the actual
+recovery construction required for a conditional component inference. No full
+ISA native coverage, general emitter conformance or speedup is accepted here.
+
+### Extension versus hybrid comparison — root source/findings review, September21
+
+**Evidence validity: ACCEPT the scoped source comparison authored by
+extension_comparison; no new measurements.** Root independently inspected pinned
+FEX IRETOp, POPFOp (forcing IF), HLT handling and typed FallbackOpHandler guidance;
+QEMU check_cpl0, emit.c.inc CR-write helper emission/block exit and misc_helper.c
+CR/APIC/BQL/CPUState dependencies. These support the distinction between opcode
+recognition, frontend semantics and resident helper execution. Borrowing selected
+helpers does not require TCG, but preserving a complete instruction needs its
+frontend checks and all effects. The fourth alternative's compile-time IR bridge
+is a proposal, not an implemented or benchmarked backend binding.
+
+**Decision relevance: ACCEPT comparative insufficiency, not a replacement
+selection.** Both extended FEX and the hybrid can reuse the measured ordinary
+FEX bodies. The prior comparison therefore cannot establish a hybrid preference
+against extension. A second ABI has structural costs, but its count alone does
+not prove more effort than adding the missing semantics to FEX. Actual semantic
+delta, service frequency and bridge/adaptation costs remain unranked. Claim20's
+preference and Track03 closure are withdrawn as current direction; retain its
+candidate construction and finite observations. No new implementation, benchmark,
+Intel acquisition or automatically renewed research campaign follows. The bounded
+source comparison ends with this answer and synchronized current records.

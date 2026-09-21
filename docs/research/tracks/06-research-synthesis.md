@@ -5,6 +5,12 @@ the preceding tracks. It is a roadmap, not a decision. Work on it follows the [r
 
 ## Inputs
 
+Track03's prior [claim20 closure](../investigations/INV-03-01.md#clm-03-01-20--performance-led-component-choice-and-current-recomposition)
+is withdrawn; the extension-versus-hybrid comparison ended with insufficiency.
+The owner now defers codegen selection while establishing an execution ABI and
+resident VM. Retain scoped constructions, measurements and cost falsifiers; do
+not consume historical closure as an accepted final component selection.
+
 Only findings that have passed their applicable reviews may support synthesis
 conclusions. Include unreviewed exploratory observations as explicitly unresolved
 concerns where relevant, never as accepted findings; do not hide contradictory

@@ -37,6 +37,14 @@ Q-04-01 owns cost ranges, Q-05-01 owns the qualified benchmark method, and
 Q-06-03/06 own lifecycle estimates and the adaptation budget before synthesis
 or implementation uses those inputs.
 
+Track03's historical September21 [completion handoff](investigations/INV-03-01.md#track03-completion-and-synthesis-handoff--september21)
+retains concrete inputs to those existing owners (final component selection is
+reopened by the extension-versus-hybrid comparison): bounded binary64 x87 numerical
+limits and status-observation costs; native eligibility/recovery/service/compile
+frequencies; dual-compiler effort; named platform premises and retained Intel
+semantic limits. These are disclosed synthesis/conformance obligations, not new
+automatically authorized Track03 campaigns.
+
 | Identifier | Question | Why it matters | Dependencies | Downstream decisions | Applicability dimensions | Resolution method | Evidence status | Review status | Newly surfaced questions — breadth pass | Newly surfaced questions — source/method/execution/result work |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `Q-00-01` | Which intended user classes and concrete, diverse workloads must the emulator represent? | Performance and compatibility evidence is meaningless if optimized for an unrepresentative job. | Initial product envelope | Compatibility boundary, benchmark suite, success aggregation | User class / workload / guest / vCPU topology / host constraints | Primary-source and upstream-workload audit followed by an explicit scope resolution | Source-backed and Inferred claims in `INV-00-01`; source gate passed (`REV-024`) | accepted; question `REV-001` accept; source `REV-024` accept (independent); adversarial `REV-025` accept (independent) | `Q-00-02`, `Q-00-03`, `Q-00-04`, `Q-00-07`, `Q-05-01` | source: `Q-05-03`, `Q-06-02` |

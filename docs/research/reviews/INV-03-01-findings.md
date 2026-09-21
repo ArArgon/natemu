@@ -955,3 +955,943 @@ acceptance. Before synthesis makes a material-benefit or authorize-planning
 recommendation, bind its actual scope/workload/threshold/cost/budget inputs to
 available reviewed records. This audit adds no new indefinite research task and
 does not convert downstream implementation checks into architectural blockers.
+
+## Current-direction reconciliation — September 20 owner corrections
+
+Reviewer `/root/direction_review`, independent of root's edits, inspected the
+workflow, Track01/Track03 charters, INV03-01..04 active summaries/inventories,
+investigation/review templates and the framing/decision-displacement retrospectives.
+No archived history was inspected. Review used one inspection and one final
+changed-material review; no experiment was run.
+
+**Evidence verdict: accept as documentation reconciliation only.** Scoped
+findings, unresolved semantic claims and historical reviews remain intact. No
+new correctness, performance or whole-architecture acceptance is asserted.
+
+**Decision/direction verdict: supports the corrected next step.** Active records
+withdraw the TCG/QEMU/Bochs preference and automatic native-Intel dependency.
+Performance comparison covers viable generators and separately chosen numerical
+helpers, with the owner's x87 cost tradeoff explicit. The existing workflow now
+requires selective lesson retrieval, in-place current-status corrections and
+separate evidence/relevance judgments. The work areas contribute to one bounded
+comparison-method pass; experiment budgets still need to be specified before
+runs. No substantive blocker or unresolved return remains for this correction.
+
+Comparative justification remains unfinished technical work in INV-03-01/02.
+This review does not turn the documentation fix into resolution of the recurrence.
+
+## Performance-comparison method review — September 20
+
+**Reviewer:** `/root/direction_review`, independent of the method and source-entry
+authors. Inspected the current workflow and Track01/03 charters, INV03-01's
+performance-led method, INV03-02's emission-route appendix, and the two relevant
+retrospectives. One review and one correction verification within the shared
+30-minute reviewer allowance; no archived history, build or execution inspected.
+
+**Evidence verdict: accept as a bounded exploratory method.** The method keeps
+actual artifacts, unimplemented adaptation estimates and captive timing distinct.
+This verdict does not independently accept every appendix source claim, approve
+unwritten export patches or establish buildability, performance or correctness.
+The proposed patches still require their recorded preparation/inspection. Source
+availability and successful compilation cannot rank candidates.
+
+**Decision/direction verdict: supports the proposed build/emission step.** The
+three generators receive the same fixture/feature requirements and bounded effort;
+their own state and helper conventions remain visible. Obtaining full upstream
+output is a finite prerequisite to a valid execution comparison, not another
+recovery-exporter campaign. Six MOV/live-state fixtures test export readiness,
+not representative performance. Later selection requires actual captive timing
+of useful work and accounting for missing adapter costs. Numerical-helper costs
+and the owner's x87 accuracy tradeoff are independent of generator preference.
+
+**Returns resolved:** the first draft bounded wall time but left diagnostic and
+review effort implicit and could read as automatically opening another campaign.
+The corrected method caps the entire follow-on exploration at both180 wall
+minutes and180 aggregate agent-minutes. Shared setup, each candidate's export
+patch/inspection/build/correction, and analysis all consume that allowance.
+Retained artifacts plus an execution proposal or insufficiency end the campaign;
+an extension requires the owner's additional-budget decision. The separately
+bounded method preparation does not reset either allowance.
+
+Container memory/jobs, transfer and disk ceilings, snapshot builds, failure
+retention and container cleanup are explicit method requirements, not verified
+runner behavior. Candidate-specific failure remains an unknown rather than a
+performance loss. No substantive blocker remains for this method; no component
+winner, execution-code approval or Track03 completion is implied.
+
+## Compile-only exploration findings — September20
+
+Independent reviewers inspected fresh retained outputs, not just prior claims.
+`/root/direction_review` checked FEX/Box64 (about4 minutes), including exact input
+bytes/counts, object bounds, relevant hashes and preserved failures.
+`/root/comparison_sources` checked TCG (22:41:24–22:42:29UTC), all12,401 hashes,
+native/disassembly byte agreement and independently decoded search records.
+Each reviewer excluded the exporter they authored from their independent verdict.
+
+**Evidence validity: accept exploratory acquisition only.** All three generators
+built and exported seven fixtures. No translated guest execution or timing took
+place. FEX's expected-count/cache mismatch exit remains visible and is not counted
+as an upstream test pass. TCG's direct-memory Linux-user context is not a captive
+system-semantics proof. Failures and corrections have separate retained identities.
+
+**Decision relevance: acquisition uncertainty resolved; selection remains open.**
+Raw sizes use different boundaries, ordering and state conventions. FEX includes
+CI traps/linker data; Box64 excludes table metadata; TCG omits a shared prologue.
+Neither instruction counts nor NOP subtraction establish relative useful-work
+cost. Both reviewers support bounded captive body execution with explicit state,
+entry/return and excluded-cost accounting; residual adapter/helper/reuse costs
+may reverse a fixture result. No generic recovery-field audit is needed before
+that experiment. The completed campaign ends with a concrete proposal, not an
+automatic extension or component choice.
+
+Final current-record check by `/root/direction_review` confirmed the artifact
+matrix and proposal limits, and caught one stale inventory-row instruction to
+rerun completed emission work. Root replaced that instruction with the additional
+execution-budget decision and changed prospective preparation wording to recorded
+status. This correction illustrates the direction check; it adds no evidence.
+
+## Captive paired-body exploration review — September20
+
+`/root/comparison_sources` checked root's execution integration and caught unequal
+FEX input flag encoding before execution. It independently verified the focused
+host-counter correction in the actual binary, all hardware-profile slice hashes,
+exact instruction changes and shifted fault sites. `/root/decision_audit` authored
+the independent complete-output oracle, including native fault partial effects,
+retained-input/profile/hash admission, schedules and separate clock sanity; root
+checked it against real disassembly. `/root/direction_review` independently checked
+paired run hashes, reran its retained oracle read-only and recomputed timings and
+scaling. It did not self-accept its hardware-profile patch. This is review of
+exploratory evidence, not independent experimental replication.
+
+**Evidence validity: accept the scoped exploratory observations.** Retained
+`execution-paired-01` passes288 admission and756 longer output checks. Long clock
+sanity passes, short admission timing does not. The earlier host-counter defect
+is preserved in `execution-software-01`; its one-line correction produced fresh
+`-02` and was verified in machine code. No complete captive recovery, stock boot,
+formal timing qualification or whole architecture acceptance follows.
+
+**Decision relevance:** FEX leads the inspected live cached-state fixtures after
+removable software-ordering costs are addressed. The former TCG/Bochs preference
+still lacks performance justification. The next consequential uncertainty is
+whether guard/boundary/materialization costs erase that lead; the approximately
+0.84ns/body FEX–TCG difference gives an explicit break-even test. Source familiarity,
+raw object lengths, rare Intel quirks and perfect x87 accuracy cannot replace it.
+Broader control flow, translation/reuse and helper costs remain selection limits.
+No winner is accepted and no generic recovery audit is requested.
+
+The final report narrows the sealed checker's overbroad “no adapted-TSO” wording:
+a specific hardware-dependent lowering profile was tested, while full adaptation
+and general TSO correctness were not. Reporting correction only; raw data remain
+sealed. The campaign closed inside its recorded allowance; further work has its
+own explicit proposed budget and decision consequence.
+
+## Guard/resident-boundary results review — September20
+
+Reviewer `/root/direction_review` inspected the current method and retained
+`boundary-execution-01` manifest, relevant producer/checker/output hashes, oracle
+contracts and actual output records. The reviewer authored the guard construction,
+but not the helper adapters or result checker; this review does not independently
+reaccept that guard. No experiment or oracle execution was repeated. Four agent
+minutes are charged to the current60-minute campaign.
+
+**Evidence validity: accept the scoped exploratory result.** The retained phases
+report612 admission and1260 longer correctness checks passing. All90 reported
+long-batch medians were independently recomputed from actual counter differences
+and match. Both clock frequencies are24MHz; long host-clock ratio is
+1.000–1.001744. Short admission timing fails its sanity criterion and is not timing
+evidence. Fourfold iteration increases give median total-time ratios3.62–4.21
+across configurations, with individual variation; this remains exploratory timing,
+not independent replication, formal clock qualification or confidence intervals.
+
+**Decision relevance: the prior FEX lead survives some boundaries, not all.**
+Across all three live fixtures, FEX remains fastest by the reported medians with
+guards alone, with the read-only resident view at every tested K, and with forced
+canonical-record publication at K=4/16/64. At forced publication every body
+(K=1), that ordering reverses: FEX is7.13–7.26ns/body, versus Box64's4.65–4.97
+and TCG's4.81–5.04. The relatively small Box64/TCG differences in that regime
+are not a robust universal ranking. The substantial FEX reversal is a concrete
+boundary-contract/frequency sensitivity, not evidence against cached-state
+residency or permission to mandate spills every block.
+
+This answers the campaign's reversal question and supports stopping it. The next
+selection-sensitive missing input is whether an actual required resident helper
+and representative block sequence require the expensive publication/clobber
+contract often enough to enter the reversal regime. A separately bounded next
+comparison should replace the synthetic digest with one concrete required helper
+and its declared live-root contract, measuring representative boundary frequency
+and useful control flow. Keep cached-root preservation available; do not impose
+an every-block canonical image by construction. Another repetition of the same
+synthetic sweep or a rare-instruction source audit would not answer that question.
+Broader workloads, compilation/reuse, true dispatch and numerical-helper tradeoffs
+still limit final generator selection. No automatic follow-on is authorized by
+this review, and no component winner or whole-emulator speedup is accepted.
+
+
+### September20 — required-boundary proposal direction review
+
+`/root/comparison_sources`, independent of the proposal author; bounded review
+started23:33:53UTC, charged four agent-minutes within the ten-minute preparation
+allowance. No code changes or execution. This reviews direction, not a completed
+method or generator selection.
+
+**Accept the proposed next discriminator.** INV-03-01 claim14 requires actual
+per-guest-commit stop checkpoints and external-entry admission/pin handover;
+INV-03-02 claim37 requires the warmed target veneer to preserve qualified native
+roots while validating admission under the coordinator. An uncontended admission
+transaction plus those checkpoints measures required work omitted by the digest
+probe. Preserve native/deferred roots on success; do not invent a mandatory
+canonical snapshot. Include the mutex, complete declared identities and pin
+handover, rather than substitute a pending-bit read for admission. Rejection must
+preserve the prior execution ownership and guest state. Object sizes1/4/16/64
+are controlled sensitivity inputs, not established workload frequencies. One vCPU
+can price the uncontended path, not contention or reclamation closure.
+
+Per-cut recovery is the critical admission condition. Current sealed
+`fex-hardware-01/outputs/fex.log` lines66–74 show vector EOR, ADD, scalar load,
+SETZ and vector store in guest order, with CFINV only after that final store.
+Post-ADD checkpoints therefore need the direct-carry flag recipe until CFINV,
+not the final-body inverted-carry recipe everywhere. An earlier review message
+incorrectly suggested FEX placed vector EOR after ADD; the retained log refutes
+that recollection. Box64 and TCG likewise require actual intermediate roots,
+not assumed final memory slots. The proposal correctly stops timing a candidate
+without valid prefix cuts instead of placing arbitrary checks at its tail.
+Use the actual entry identity for next guest RIP: INV-03-02 claim12 explains why
+stored EIP may be stale on direct chaining. Slow semantic event delivery stays
+explicitly outside this narrow stop/admission measurement. The proposed finite
+budget, run limit and consolidated remaining comparison scope are appropriate;
+this review does not authorize a new execution or supply independent acceptance
+of previously authored FEX binding code.
+
+### September20 — claim19 queued-fault protocol review
+
+`/root/decision_audit`, independent of root's claim19 authorship; eight agent-minutes
+charged to the bounded source/protocol review, including challenge and returns.
+Read the current owner challenge, claim14's execution/lifetime construction,
+INV03-04 rendezvous revisions1/2, admitted-route/remap rules, and the complete
+claim19 proposal and returned edits. No code or experiment was authored or run.
+
+**Accept claim19 as a conditional architectural revision.** No remaining
+substantive blocker requires a universal hot per-instruction stop poll. Peers may
+finish bounded old-view execution before mutation; a faulting requester retains
+its admitted instruction and cold-completes only that instruction before current-
+source dispatch. This reuses revision2 PAUSED/DRAIN_SERVICE rather than adding a
+second state machine or rediscovering native-state retention.
+
+Two concrete returns are closed in the inspected final text:
+
+- **Admitted route is stronger than an inactive frame.** CPU0 can admit route R
+  and shadow-fault before its access while CPU1 requests R→S. Merely dropping an
+  active grant would permit incorrect rebinding or stale retry after remap.
+  Claim19 now retains a separate completion obligation: bounded old-route service
+  or semantically permitted effect-free cancellation precedes the conflicting
+  remap, acknowledgement and reuse. Only an unadmitted next phase can rebind.
+- **Mutex release is not guest progress.** Releasing a lock between indefinitely
+  queued backend requests could leave ordinary admission closed forever. The
+  final bounded-batch rule admits an actual round-robin ordinary interval after
+  at most eight heads, under the stated healthy-host premise. New requests queue;
+  faults remain serviceable. This closes algorithmic starvation without a
+  per-instruction polling requirement.
+
+The simultaneous-fault schedule is coherent only with safely detachable phases,
+no drain-needed lock retained, actual memory-completion acknowledgements, and
+bounded dependency service rather than recursive coordinator acquisition.
+Self-modifying A cannot resume stale following B; the saved decode and completed
+MMIO identities must survive every queue/revalidation step. Finite code size does
+not bound an internal spin CFG, REP or helper: their bounded stop opportunities
+remain load-bearing. Synchronous debug/trap and interrupt-shadow obligations keep
+their precise boundaries through specialized lowering or cold exits; ordinary
+asynchronous-event deferral does not absorb them.
+
+Pinned native frames, code/metadata, routes and in-flight targets remain lifetime
+references. Existing finite per-vCPU and service reserves must cover them before
+admission; inactivity is not reclaimability. The accepted change is the protocol
+and its explicit premises, not proof that an arbitrary emitter supplies the cold
+completion recipes, full-ISA correctness, latency bound or speedup. A lowering
+that cannot preserve an admitted phase is a counterexample to that lowering,
+not permission to use routine VM termination or to assert blanket polling is
+unavoidable. Synchronize claim14 and the active INV03-04 direction to this scoped
+revision; no experimental or generator-selection conclusion follows.
+
+### September20 — numerical-02 independent result and method review
+
+`/root/decision_audit`, independent of numerical producer author
+`/root/comparison_sources`; six agent-minutes charged within the ten-minute
+subtask cap and shared consolidated-review budget. Inspected retained
+`numerical-02/source/numerical.cpp`, `numerical.py`, `numerical.sh`, inherited
+FEX/SoftFloat/Cephes source bindings, manifest, platform/compiler/library records,
+all output rows, linked executable disassembly and analysis beneath
+`/private/tmp/natemu-track03-comparison-raw`. Recomputed the numerical oracle and
+timing checks locally without invoking either timed executable or a VM.
+
+**Accept the finite exploratory account and its direction, not a generator or
+whole-emulator performance conclusion.** All37 retained artifact checksums match.
+The producing C++ is unchanged in the working tree; the subsequent Python change
+only suppresses bytecode files and does not alter the retained computation.
+`numerical-02` records successful bounded container execution and cleanup. The
+failed container-creation/cleanup attempt remains separately recorded in
+`numerical-01`; it is not a numerical result.
+
+The independent calculation used exact rational decoding and a rational sine
+series with the next-term remainder below10^-110, rather than the producer's
+120-digit Decimal calculation or the tested Cephes/libm implementations. All26
+reference values and both absolute-error columns agree within10^-108. The twelve
+nearest-rounding cancellation cases give `(2^p+1)-2^p=1` in the tested extended
+kernel for p=52..63; native binary64 returns1 only at52 and0 at53..63. At the
+fourteen sine points, the retained extended outputs lie within half an extended
+ulp of that independent reference (largest nonzero case approximately0.4561ulp).
+This is a finite sample, not a numerical bound or Intel x87 conformance proof.
+
+**Input precision is part of one control.** Sine case13 feeds `1+2^-60` to the
+extended path and its rounded binary64 value1 to libm. Its reported binary64
+error therefore includes input rounding; it must not be presented as libm's
+approximation error for an identical input. The other listed sine arguments are
+exactly representable in both formats. No exception/status, nonfinite, extreme
+argument-reduction, subnormal or other rounding-mode contract was qualified.
+
+All56 timing records have the declared batch/order/length/variant identity, and
+their cyclic-output checksums independently match the26 point results. In the
+retained executable, the binary64 cancellation kernel contains actual FADD then
+FSUB. Both length loops call the selected kernels on indexed inputs and consume
+each output; neither cancellation nor sine has been folded into constants or
+hoisted out of its loop. The extended cancellation calls the retained add/sub
+kernels; extended sine performs the retained ext80→f128/Cephes/f128→ext80 path.
+The native sine wrapper tail-calls dynamically linked glibc libm. Thus these are
+indexed kernel/call/checksum throughput measurements, not isolated operation
+latencies or timings of FEX's full x87 frontend/state/profile adapter.
+
+| Kernel | Long-batch median ns/call | Observed long-batch range |
+| --- | --- | --- |
+| Native binary64 cancellation pair |0.770105|0.763020–3.295833|
+| Inherited extended cancellation pair |14.490938|14.451978–29.085833|
+| glibc binary64 sine |3.570825|3.415625–3.686450|
+| Inherited extended/Cephes sine path |228.171875|227.829175–229.530200|
+
+The medians reproduce the author's report. Fourfold loop lengths give median
+total-time ratios4.0333,4.0346,3.9176 and3.9208 respectively. Preserve the large
+cancellation outliers; seven alternating-order batches do not establish precise
+ratios or confidence intervals. Timing uses CLOCK_MONOTONIC_RAW inside the
+recorded OrbStack Linux ARM64 container, with CPU quota and uncontrolled
+placement/scheduling. It is not a captive-EL1 timing, qualified cross-clock
+measurement or independent timing replication. Timing does not include per-call
+x87 state admission/status reset; the SoftFloat flags are sticky in the loop.
+
+The supported direction is to keep numerical precision/cost as an explicit
+workload-sensitive component choice: this sample demonstrates both a substantial
+cost difference and a concrete information-loss case. It supplies no reason to
+mandate extended precision everywhere, no proof that binary64 satisfies all
+required x87 behavior, and no ranking of FEX versus TCG or Box64. Required numeric
+behavior and how often these paths execute remain separate inputs to selection.
+
+### Consolidated branch/FP/DIV retained-result audit — 2026-09-21
+
+**Verdict: ACCEPT the scoped exploratory result and performance consequence;
+no generator selection or timing qualification.** Reviewer `decision_audit`
+used the remaining 5 agent-minutes of its 20-minute oracle allowance. Together
+with the preceding numerical review, this charges 26 agent-minutes against the
+shared 30-minute review cap. This reviewer authored `check_comparison.py`; it
+therefore does not independently approve that checker. The root reviewer
+separately inspected its input models, preservation rules and recurrences before
+execution, and reviewed the linked helper implementation and compiled adapters.
+This follow-up independently audits retained output identities, guest-result
+projections and statistics without importing the checker or producer.
+
+For `/private/tmp/natemu-track03-comparison-raw/comparison-execution-01`, all 114
+retained SHA256 entries match. Both native executions returned successfully with
+168 admission and 294 timing samples. Independent schedule reconstruction gives
+exact case/variant/length/order coverage and matches teardown API accounting.
+Direct decoding of all 462 output records independently reproduces the integer
+results, branch counts and final path, total completed bodies, final guest RIP,
+vector parity and finite FP values/high-lane sentinels. FPCR remains 6 and FPSR
+remains zero. These are projections checked independently of the full-state
+checker; the root-reviewed checker supplies the broader preserved-state checks.
+
+All 42 short/long medians independently reproduce the manifest. At the retained
+24 MHz counter frequency, the long-batch medians convert as follows (ns per
+completed fixture, including its declared wrapper/adapters):
+
+| Fixture | Box64 | FEX | TCG |
+| --- | ---: | ---: | ---: |
+| Empty body/control | 0.925382 | 0.927130 | 0.936190 |
+| Zero branch | 1.719316 | 0.659307 | 2.232393 |
+| Carry branch | 1.096249 | 0.731786 | 1.922925 |
+| Scalar FP add/sub | 2.953688 | 0.956535 | 37.587802 |
+| Scalar FP multiply/divide | 4.782359 | 3.172239 | 42.527199 |
+| Scalar FP square root | 2.944787 | 2.951463 | 23.304303 |
+| Integer divide | 1.382987 | 0.494639 | 1.683235 |
+
+Long timing clock ratios span 1.000000–1.013049. Short correctness admission
+ratios reach 1.409091, so admission timing sanity fails while correctness passes;
+that failure must remain visible. Fourfold-length median total-time ratios for
+the six substantive fixtures span approximately 3.77–4.32, with individual
+outliers retained. Some substantive bodies run faster than the empty control,
+which reinforces that NOP subtraction and additive isolated-instruction latency
+claims are invalid here. No confidence intervals, scheduling control, independent
+runtime repetition, or qualified clock evidence were added.
+
+The supported performance consequence is material: the inherited TCG scalar FP
+helper path is substantially more expensive on these exact normal inputs than
+the retained Box64 and FEX native FP leaves. Its actual helper calls and state
+work are included; it was not replaced with handwritten native FP. FEX also has
+lower measured medians for these branch and restricted divide fixtures. Square
+root gives almost identical Box64/FEX medians, so this sample does not support a
+useful ordering between those two there. These observations justify treating
+component cost and adapter shape as real selection evidence rather than awarding
+TCG a provenance preference.
+
+The tested branch-zero stream alternates outcomes, while branch-carry takes only
+the first iteration for one variant; it is not a general branch distribution.
+DIV always has a zero high dividend and a nonzero divisor. FP arguments are
+finite and exact, with default rounding and AFP controls; NaNs, exceptions,
+subnormals and other rounding modes were not exercised. Translation, dispatch,
+helper cold paths, complete recovery and full guest workloads remain outside the
+measurement. The result supports a cheaper native normal path with required
+cold semantics supplied separately; it does not establish that any candidate
+already implements the complete product contract or wins overall.
+
+### September21 — consolidated comparison direction and finite selection boundary
+
+`/root/direction_review`; independent of the consolidated VM producer/oracle,
+but author of the TCG helper binding, earlier ordering-profile preparation and
+compile instrumentation. This is a direction review, not independent acceptance
+of those authored artifacts. Inspected the current workflow, Track03 charter,
+INV03-01/02 summaries and inventory, retained `comparison-execution-01` manifest,
+case bindings and guest oracle, the prior boundary verdict, and the independently
+reviewed `numerical-02` account. No new experiment or download.
+
+**Evidence validity:** the latest manifest records168 admission and294 longer
+correctness passes. Long clock sanity passes (ratio1..1.01305); admission timing
+sanity does not. This remains exploration, with no fresh decision-evidence run
+or independent timing replication. The scalar-FP oracle uses exactly representable
+normal values and exact results; it does not qualify exceptional operands,
+rounding/status, or the complete SSE contract. Some branch length ratios are far
+from4, so the clock-sanity boolean does not establish precision of their timing
+estimates. Actual linked QEMU helper execution removes the prior unbound-call
+uncertainty for these paths; it does not qualify exceptional recovery. The x87
+kernel account separately demonstrates concrete binary64 information loss and
+large sampled extended-path cost, under its Linux-worker context; it cannot rank
+whole generators or set a universal accuracy tolerance.
+
+**Decision relevance:** this is meaningful comparative progress. The ordinary
+live-state, branch and native scalar-FP results motivate FEX as the default
+component for the resident-state design. Neither the older TCG/Bochs preference
+nor unconditional full80 fidelity follows from the evidence. Numerical machinery
+is a separate choice; selection of a generator need not settle every optional
+numerical profile at the same time.
+
+The dense canonical/clobber/reload reversal is a real sensitivity result, but
+claim19 removes universal canonical materialization as an architectural premise.
+It must not become an unavoidable cost charged to FEX. Similarly, absence of
+measured whole-workload distributions is not by itself a reason to keep component
+selection open indefinitely. A design choice can be an explicit inference under
+stated intended-use assumptions; it need not assert universal dominance or prove
+the correctness of unwritten emitter code.
+
+A finite route to component acceptance has three parts, assessed together:
+
+1. Establish by reviewed pinned-source/interface reasoning that the selected
+   emitter can preserve live state while providing the per-instruction recovery,
+   bounded control flow and system-mode interception required by claim19. Name
+   any unavoidable hot-path additions. A requirement that the future compiler
+   export metadata is a design contract; a source restriction that prevents that
+   metadata or requires hot rollback is a substantive counterexample. Actual
+   implementation conformance remains planning/validation work once the design
+   is shown constructible. The concurrently assigned candidate-binding review
+   addresses this question; do not create another generic field audit.
+2. Obtain one fresh, independently reviewed finite comparison and independent
+   replication of its load-bearing performance observations. Freeze the current
+   combined ordinary/boundary/branch/helper scope, measurement controls and
+   exclusions before execution. Qualify its clock/uncertainty claims; do not
+   promote exploratory files or retry until a ranking appears. If numerical
+   fast-path repairs required by the selected SSE contract would change measured
+   costs, include their bounded accounting or leave that performance premise
+   unaccepted. This does not require full ISA implementation.
+3. Record the component preference as an inference for resident cached execution,
+   with explicit falsifiers: an unavoidable hot spill/guard/recovery cost that
+   erases the advantage, insufficient translation reuse, or a required semantic
+   repair that changes the ordering. Compile timings currently have unmatched
+   cache/diagnostic contexts; they supply no numeric cold-compile ranking or
+   crossover. Keep that term explicit rather than assigning arbitrary weights.
+   Unknown distributions do not invalidate a conditional design preference;
+   an identified required regime in which the alternative wins does require
+   reconsideration. A cold/JIT-heavy performance promise needs its own support.
+
+These parts constitute one decision package, not a queue of per-cell campaigns.
+Cap any proposed completion package once, including source corrections, fresh
+execution, independent replication and findings review; stop with acceptance of
+its exact component claim or named substantive insufficiency. No new execution
+is authorized by this review. A FEX default may therefore become a justified
+architectural selection without a whole-emulator speedup claim. Today its
+performance support is exploratory and its recovery binding is under review,
+so the present verdict is a preferred hypothesis, not accepted selection.
+
+Track03 closure additionally requires acceptance of the selected recovery
+composition and the charter's combined breadth check. Missing implementation
+coverage is a later validation obligation; an unresolved architectural
+contradiction is not. This distinction gives the investigation a finite endpoint
+without weakening its behavior requirements or requiring an endless workload
+survey. Charged8 agent-minutes within the allocated12-minute direction review.
+
+**Concrete proposed binding clarification:** a FEX normal generator with a
+permanent checked semantic service for REP/partial effects, privileged/startup32
+operations and unsupported FP cases is a coherent component proposal, conditional
+on the concurrent binding review. TCG frontend/helper semantics may supply that
+service independently of generator choice. The required numerical boundary must
+be explicit: masking SSE exceptions does not remove MXCSR status/rounding or
+DAZ/FTZ and special-value obligations. Even normal inexact arithmetic can require
+status updates. Native lowering must preserve the selected SSE contract, or its
+admission/repair/service cost must be included; the owner's x87 accuracy tradeoff
+does not silently relax SSE. The latest exact normal-result fixtures establish
+neither that broader numerical contract nor its repair cost. Root's proposed
+single reviewed fresh primary plus single independent replica can consume the
+remaining consolidated allowance after binding acceptance, without restarting
+the clock or expanding fixtures. Failure to finish yields the exact remaining
+insufficiency, not another automatic campaign.
+
+### September21 — final source correction and campaign stopping verdict
+
+`/root/direction_review`, four additional agent-minutes, completing the12-minute
+direction allocation. Read the new claim19 adaptation and numerical/before-image
+addendum in `consolidated-bindings.md`; directly checked retained QEMU
+`fpu/softfloat.c:231`, `include/fpu/softfloat-types.h`, FEX
+`OpcodeDispatcher/Vector.cpp:GetMXCSR/RestoreMXCSRState`, helper initialization
+bytes, and existing INV03-02 claim28. No execution or new producer change.
+
+**Evidence:** accept the two factual corrections. QEMU's `can_use_fpu` requires
+sticky `float_flag_inexact` (0x10) and nearest-even rounding, unless hardfloat is
+disabled entirely. The retained environment begins with zero exception flags,
+and these exact normal operations never set inexact. Their repeated execution
+therefore stays on the software path. The observed roughly37/42ns add-sub/mul-div
+body costs are costs of this initialized state and path; they are not general
+QEMU helper costs. This correction does not itself measure the alternative path.
+FEX GetMXCSR and RestoreMXCSRState explicitly mask with0xFFC0, discarding sticky
+status bits. Exact normal-result PASS does not test that mismatch. Neither source
+fact establishes Box64 conformance or a TCG performance preference.
+
+**Existing bounded architectural resolution:** claim28 already selects an
+allocation-visible value-root/native-site contract for FEX MOV recovery; claim19
+provides queued cold completion, and the new adaptation notes identify a bounded
+semantic-service route for REP. There is no need to rediscover these interfaces
+or require a completed system translator. However, claim28 explicitly does not
+bound added spills, and its safe lifetime construction can itself add avoidable
+cost. The latest FP status/before-image requirement extends beyond the accepted
+MOV case. Cold native-frame retention cannot resurrect an overwritten value.
+These records resolve how an adapter could be constructed, not the remaining
+matched cost of the required FP/recovery paths.
+
+**Direction verdict:** accept closing this consolidated exploration now with
+explicit selection insufficiency. Withdraw the earlier suggestion that simply
+repeating the frozen exact fixtures as a reviewed primary and replica would
+complete the decision package: those runs cannot resolve the now-identified
+FP status and recovery-liveness burden, or QEMU's unmeasured alternative FP path.
+FEX remains a concrete performance-led candidate; no generator is selected by
+source familiarity, full80 fidelity, or the unequal numerical paths just tested.
+The next action is an owner-visible choice about the intended semantic/service
+scope and an additional total resource allowance if that concrete comparison is
+worth pursuing. Show the existing contract, missing cost and possible selection
+consequence together. Do not start another automatic fixture campaign, restart
+the current clock, or reinterpret x87 accuracy priority as permission to drop SSE
+status. The current scoped results and architectural contracts remain useful;
+this stopping verdict does not imply a technical impossibility or a project kill.
+
+### September21 — combined architecture and completion breadth, integrated package
+
+`/root/direction_review`, independent combined-design review. Inspected current
+INV03-01/02 summaries and twelve-question inventory, claim18 composition,
+claim19's queued revision, proposed02claim56 native eligibility/root envelope,
+accepted02claim57 numerical contract, and the relevant existing state/recovery,
+capacity and virtual-CPU contracts. No new experiment or broad source reaudit.
+This reviewer authored the earlier helper-build tooling and reviewed claim57;
+this section does not independently accept that helper implementation or any
+experimental result. The separate method/findings/replication reviews own those.
+
+**Evidence validity:** the accepted queued protocol distinguishes active memory
+authority, retained references and admitted-route completion obligations. A
+PAUSED native frame releases only detachable active authority. A conflicting
+remap cannot commit until the recorded admitted-route obligation completes or
+is permissibly cancelled. Code/metadata/stack pins remain until their last
+consumer disappears. Reconstructing only from canonical slots would violate
+this design, but claim56 explicitly preserves current register/spill/constant
+bindings and before-images. Its35 current roots are the fields the admitted
+native domain may change, not the whole guest state. Upper vectors, control,
+segment, x87 and other unchanged state retain their authoritative backing owner.
+
+No inspected new condition requires universal canonical publication or pending
+polling at every ordinary instruction. Bounded internal cycles and checked
+external entries permit closure before mutation; precise debug, single-step,
+synchronous faults and control transitions keep their special boundaries.
+A management pause does not retire an instruction or freeze guest time. Retained
+code identity prevents stale following instructions after cold completion. These
+are coherent interactions with the accepted memory/event/lifetime owners,
+conditional on the actual lowering obeying the selected contracts.
+
+**One actual architectural gap identified, with a concrete proposed resolution:**
+'checked semantic service' alone did not select an execution engine for the large
+native-declined domain. Many QEMU frontend semantics are generated sequences,
+not directly callable resident helpers. Root's proposed hybrid resolves that
+choice: adapted host QEMU frontend/TCG AArch64 generation produces checked service
+objects for captured instruction/context, with resident system/numerical helpers
+and the same state/access/effect/lifetime owners. No FEX-to-TCG IR translation or
+upstream CPU-loop ownership is required. REP retains admitted decode and partial
+progress through bounded service steps; required startup32/system/AVX behavior
+is routed there rather than removed from the guest profile. Full implementation
+of those bindings is later conformance work, not a prerequisite to selecting this
+specific engine and interface.
+
+The following details must be explicit in that source-reviewed service proposal:
+
+- Compilation/miss waits occur outside EXCLUSIVE with no active RAM grant.
+  Native admission already reserves executable completion paths and storage for
+  every potentially queued suffix. Drain completion cannot discover a dependency
+  on a host compilation that it must wait for. REP/service instructions pin the
+  code/helper/phase continuations needed to finish admitted effects before entry.
+- Service transitions materialize the actual current state once, and return all
+  modified fields/context to their authoritative bindings. A35-root ordinary
+  map is not permission to lose a service's upper-vector, control, status or
+  segment changes. A completed memory effect is never reconstructed by replay.
+- Service objects and continuations join claim14's reference census and finite
+  object/storage bounds. Both compiler providers share the finite admitted-job
+  bound. A second generator does not create an uncounted allocation/pin class.
+
+**Decision relevance and finite completion requirements:** a conditional FEX
+ordinary-generator default with this TCG service engine can close architecture
+selection without proving whole-emulator speedup or implementing the full ISA.
+It still needs accepted comparative justification for that preference and an
+explicit numerical-provider/policy disposition. Neither hypothetical universal
+materialization nor source familiarity establishes the winner. Dual compiler
+maintenance/footprint, state bridges, service frequency and compile misses are
+real costs and preference falsifiers. A finite performance claim remains scoped
+to its independently reviewed and replicated experiment; the architecture choice
+is a separately identified inference under its stated intended-use assumptions.
+
+Complete the service proposal and claim56 source review, settle the x87 provider/
+policy question without silently relaxing SSE, then assess that one finite
+comparison and update current composition/inventory. Claim18's original TCG/Bochs
+binding is historical and needs a current recomposition paragraph linking the
+new choices. Clarify claim56's one-access limit as applying to each admitted
+**guest instruction's lowering**, not separately to each AArch64 instruction.
+No additional generic correctness survey, native Intel acquisition, M2 gate,
+stock-boot prototype or full-ISA implementation is required by this breadth pass.
+
+Product applicability remains the selected virtual CPU/machine and named M4
+platform. Discovery and service coverage must agree; reduced native eligibility
+cannot reduce exposed features. The retained exact-Intel semantic uncertainties
+remain scoped compatibility questions, not evidence for an Intel-machine gate.
+The actual loader, complete field/site bindings, emitted guards, service handlers,
+resource admission and combined guest tests remain implementation-validation
+obligations. An incompatible interface or new wait/reference cycle would reopen
+architecture; missing unwritten code alone does not. No unconditional Track03
+completion verdict is given before the named selection/service/policy items close.
+
+**Claim58 composition return — accepted conditionally, preference still pending.**
+Read the actual appended02claim58 and the corrected56 native eligibility wording.
+The proposed service engine is now concrete: the existing QEMU system frontend
+and TCG AArch64 backend produce resident service objects, with the previously
+specified access/state/exception adapters. Service generation happens outside
+active grants/EXCLUSIVE; completion code and storage are reserved before effects.
+Pre-effect handoff releases the FEX execution/return reference, queued FEX suffix
+completion uses permanent handlers, and TCG continuations stay in the admitted
+allocation or permanent code. Both producers share the existing finite job slots
+and reference census. Full modified state/context is returned to its owner.
+These changes address the named execution-engine, drain-wait and capacity returns
+without introducing an IR bridge, second guest owner or nested service-object
+stack. Claim56 now restricts each guest instruction's native lowering and sends
+other mode contexts to the service rather than dropping them from exposure.
+
+**Evidence validity:** accept this conditional architectural composition against
+claims14/19 and the existing state/memory/event contracts. The proposal supplies
+an engine and finite ownership/control-flow construction; it does not claim that
+all opcode handlers, adapter fields or generated phase maps are implemented.
+No new remap-obligation, stale-code, clock/event or teardown contradiction remains
+from this review. An actual lowering that cannot provide the required detachable
+phase/bounded completion is an implementation-discovered counterexample that
+reopens its admission, not permission to violate the contract.
+
+**Decision relevance:** accepted as a concrete candidate architecture. Generator
+preference still needs the separately reviewed finite comparative evidence and
+stated cost assumptions; the service's cost, dual compiler maintenance and
+low-reuse cases remain explicit falsifiers. This review does not accept a speed
+ranking or x87 policy. Once those decisions close, updating claim18's current
+composition to these accepted bindings and carrying their applicability into the
+twelve-question inventory can complete this breadth return. No additional
+architecture experiment or generic source pass is requested. Actual complete
+emitter/service conformance remains implementation validation.
+
+Total charge16 agent-minutes, including this return, at the allocation limit.
+
+### September21 — integrated finite comparison preexecution review
+
+`/root/comparison_sources`, independent of the method/producer author and oracle
+and helper-blob authors. Reviewed the current “Integrated package: reviewed
+finite comparison method”, `comparison.py`, COMPARISON/GUARDED_FP paths in
+`execution.c`, `check_comparison.py`, and retained `tcg-helpers-03` producing
+code/linked layout. This review does not independently accept my claim56 or
+my earlier source-binding propositions; root owns their review. It assesses
+this finite integration and inference before the new primary/replica execute.
+
+**Accept for the scoped primary and independently rebuilt replica, with the
+observation scope stated precisely.** The producer uses actual frozen emitted
+words, declared edge/helper relocations, full resident status inputs and timed
+FP pre/post checks with staged destination/rollback. The scalar six-instruction
+guard preserves NZCV; FP predicates save it in declared scratch. FEX rollback
+restores the retained low vector, Box64 stages results in d24 before INS/store,
+and negative controls return a registered contained rejection. These negatives
+exercise rejection before the first tested instruction commits, not every
+second-instruction prefix or completed semantic fallback.
+
+Actual helper calls use the retained QEMU implementations and closed link blob,
+not handwritten arithmetic replacements. Verified six helper artifact hashes
+against sealed SHA256SUMS and exact ELF-to-raw-blob bytes; the10556-byte blob
+occupies0x40008000..0x4000a93b and contains code/read-only data with explicit
+contained exception/assertion stubs. QEMU's can_use_fpu requires sticky inexact
+and nearest rounding; those controls are present. The finite positive operands
+exercise its native path. All code, tables,32KiB state and stack regions fit the
+recorded256KiB layout, and helper calls preserve the x29 loop count through the
+ordinary ABI. The source checker admits all21 combinations and the executable
+self-check passes2800 semantic cases,144 guarded cases and3960 rejected mutants.
+
+The frozen-source rebuild verifies every primary source file and its manifest,
+requires byte-identical driver code, and rebuilds without importing newer emitter
+artifacts. Correctness admission precedes timing; counter frequencies, register
+controls, outcome identities and teardown are checked. Seven randomized paired
+batches at two lengths and a separately rebuilt run support the method's finite
+relative-cost inference, provided the declared clock and stability conditions
+hold. They do not support NOP subtraction, universal cost ratios, service
+frequency estimates, recovery conformance or a whole-generator ranking.
+
+One wording correction was sent to the author: the current producer/checker
+observes the complete32KiB state and a512-byte DATA window, not all4096 input
+DATA bytes. The finite bodies access that window, but the method must name it
+rather than claim full guest-memory observation. This scope correction does
+not require a new experiment. No other blocking integration defect found in
+this bounded review. Eight review agent-minutes are charged; the remaining12
+of the assigned20 cover the independently rebuilt replica and result review.
+
+### September21 — independent frozen-source replica and finite-cost acceptance
+
+`/root/comparison_sources` executed the approved replica from
+`comparison-guarded-primary-01` using the byte-identical driver and
+`--guarded-fp --purpose decision-evidence --rebuild-from ... --execute`.
+Replica: `/private/tmp/natemu-track03-comparison-raw/comparison-guarded-replica-01`.
+This is the one independently rebuilt replica authorized by the reviewed method;
+no rerun, new fixture or emitter acquisition occurred. Replica work began00:49:27UTC.
+Three review agent-minutes are charged for rebuilding, execution and results
+review, in addition to the eight preexecution minutes:11 of the20 allocated.
+The source-author work on claim56 is separately accounted, not accepted here.
+
+**Evidence validity: accept the reviewed finite comparison.** Both primary and
+replica completed204 correctness-admission and294 timing samples with all
+outcomes passing. Every one of150 retained file hashes per run was verified;
+the121-file source sets are byte-identical. The replica independently compiles,
+signs/verifies and executes its new binary; all commands terminate successfully.
+Both builds report43324 bytes of guest code in the same bounded layout and
+41185 accounted API calls for each294-sample timing phase. The observed state is
+the complete32KiB resident state and512-byte data window specified by the corrected
+method, plus the native/stack observation contract. These checks do not imply
+unobserved memory or full-ISA conformance.
+
+Both runs report24MHz host/guest counter frequency and the same admitted TSO/AFP/
+FPCR controls. Long-phase host-clock ratios are1.000–1.001832 in primary and
+1.000–1.001984 in replica. Short admission timing fails its aggregate sanity
+criterion and is excluded from timing inference; its correctness remains valid.
+All294 timing samples in each run were retained. Medians below were independently
+recomputed from raw counter differences, without NOP subtraction or exclusions.
+Ranges contain the four medians (two lengths, two independently built runs), in
+nominal ns per body at the observed frequency.
+
+| Fixture | Box64 | FEX | TCG |
+| --- | ---: | ---: | ---: |
+| branch_zero |1.459–1.752|0.624–0.660|2.194–2.252|
+| branch_carry |1.010–1.085|0.695–0.745|1.793–1.945|
+| guarded add/sub |2.243–2.473|1.239–1.354|6.221–6.290|
+| guarded mul/div |4.037–4.260|3.143–3.299|7.732–7.997|
+| guarded SQRT |2.916–3.097|2.948–3.087|1.546–1.609|
+| restricted unsigned DIV |1.346–1.471|0.481–0.495|1.612–1.693|
+
+**Decision relevance:** FEX's lower finite cost for both branches, guarded FP
+add/sub and mul/div, and restricted integer DIV holds at both lengths in both
+runs. For those comparisons, even the observed individual-sample ranges do not
+overlap the competing candidates' ranges. TCG's SQRT advantage is likewise
+separated. FEX versus Box64 SQRT overlaps and changes order; no winner is assigned
+there. The finite native guard/before-image costs therefore do not erase all of
+FEX's earlier advantage, and actual helper lowering can win a particular
+operation. This supports a conditional, mixed component direction instead of
+an assumed all-operation winner.
+
+These are costs of the retained dependency patterns, controls, native code,
+adapters and actual linked helpers. They do not price the frequency of native
+eligibility, cold semantic fallback, queued recovery, startup32, compilation,
+SMP or realistic block distributions. Negative cases prove the specified
+first-instruction guard rejection controls, not completed cold service or all
+FP exception paths. Claim56's implementation obligations remain with its source/
+architecture review. No whole-emulator speed ratio or general FEX conformance is
+accepted by this finite-cost result. The primary/replica experiment is complete;
+unused review allowance does not authorize another run.
+
+### Lazy x87 C1 source-construction review — 2026-09-21
+
+**Verdict: conditional ACCEPT of the supplied design's source-level
+constructibility, not runtime acceptance or a performance conclusion.**
+Independent reviewer `decision_audit`; allocation capped at 10 agent-minutes from
+the integrated package's reserve. This review examines the root author's stated
+claim59 proposal and retained primary sources. Final claim text was not yet
+present when these findings were prepared, so this is not approval of unseen
+wording. The following premises are load-bearing.
+
+Intel089 Vol1 §8.1.3.2 and Table8-1 distinguish instruction-written C1 from the
+sticky numeric exception flags (§8.1.3.3). A single pending C1 producer is
+therefore sufficient if each following instruction explicitly preserves,
+replaces, clears or defines that bit. There is no growing arithmetic history:
+the record copies the actual original ext80 operand value(s), instruction-specific
+provider ID and original FCW. Two 16-byte operand slots plus control/identity
+metadata fit the proposed 64-byte cap. A later numerical instruction captures
+its actual architectural operands, even when those are earlier approximate
+results; it must not reconstruct a hypothetical all-extended computation chain.
+The immutable value record requires no old code, guest RAM or retirement pin.
+
+Retained Bochs `softfloat.h` exposes `RAISE_SW_C1` and rounding-up set/clear
+operations; its extended packer clears earlier-stage hints when the final
+rounding decision becomes authoritative. A cold replay can therefore obtain the
+same C1 that the previously selected status-capable primitive would produce for
+the captured original operands/control. Replay needs fresh local status, the
+exact instruction-specific primitive and captured FCW. Merge **only C1** into
+current state; discard numerical results and other replay flags, and do not
+repeat stack actions, guest memory accesses, pending-exception delivery or
+instruction metadata updates. FSIN/FCOS must not substitute for FSINCOS: the
+retained Bochs trig source explicitly distinguishes these computations and their
+final-rounding status. Existing uncertainty about that provider's exact silicon
+transcendental behavior is inherited, not resolved by deferral.
+
+The approximate committed value and deferred C1 deliberately refer to different
+numerical calculations: the value uses the owner-permitted approximation, while
+C1 comes from the original80 operands under captured FCW. This must be explicit;
+it is not C1 for the rounded binary64 candidate. The proposal does not need a
+status waiver if the agreed value-only relaxation permits this separation. It
+must not silently reinterpret that relaxation as permission to discard C1.
+
+For canonical normal ext80 inputs that convert to finite normal binary64,
+ordinary add/subtract/multiply/divide results lie far inside the extended
+exponent range. Even cancellation is bounded by the finite 64-bit input
+significands; there is no route from these operands to extended underflow merely
+because the exact difference is small. Nonzero normal divisors exclude divide
+by zero; normal operand classification excludes denormal/unsupported/NaN cases.
+With all exceptions masked and PE already sticky, a newly inexact arithmetic
+result adds no numeric exception bit. The native candidate still needs its
+stated post-classification and staged commit. For actual80
+`2^-100 <= abs(x) <= 1`, sin/tan are nonzero and safely normal, cos is bounded
+away from zero, and the input is inside the x87 C2 range. The inherited QEMU
+helpers provide the existing double/libm numerical routes. This establishes a
+narrow status-domain argument, not broad numeric conformance or measured speed.
+Stack admission, existing pending-exception checks, TOP changes, FIP/FDP/FOP and
+trig C2 clearing remain owner operations. Thus “other status unchanged” can refer
+to the numeric exception bits, not every bit of FSW.
+
+All status observers must materialize first, including **FSTENV/FNSTENV** as
+well as FSTSW/FNSTSW, FXSAVE/XSAVE, FSAVE/FNSAVE and canonical host exports.
+Intel's retained environment description explicitly includes FSW. Restore paths
+(FLDENV/FRSTOR/FXRSTOR/XRSTOR), reset paths and known C1 writers replace/invalidate
+the descriptor at their architectural commit. Per-instruction undefined C1
+behavior must also have a deliberate policy; blanket preservation is not a
+substitute for this classification. A save attempt that faults must not perform
+its completion/reset actions. Pure C1 materialization before such a fault is
+semantically harmless, provided the old architectural value remains available.
+Control changes do not alter the captured replay control, and exception/fault
+handlers may observe the record only through the same materialization boundary.
+
+Acceptance requires these observer and transition obligations in the final
+proposal, a permanent bounded replay handler without compilation/queue
+self-dependency, and ordinary resource accounting for the fixed record. Neither
+the hot descriptor-write cost nor the cold observation frequency is measured.
+This design removes a need to calculate full extended arithmetic eagerly solely
+to produce an otherwise unobserved C1; it does not demonstrate that deferral wins
+for workloads that observe status after every operation.
+
+Primary sources inspected locally: Intel combined SDM089 extraction at
+`/private/tmp/natemu-track03-compound-01/intel089.txt`; pinned QEMU
+`target/i386/tcg/fpu_helper.c` at
+`/private/tmp/natemu-translator-audit/qemu`; and pinned Bochs status/rounding/trig
+files retained in `/private/tmp/natemu-track03-fp49` and
+`/private/tmp/natemu-track03-fp48`. No new download, experiment or VM run.
+
+**Final-text review:** the subsequently appended CLM-03-02-59 was inspected
+within the same allowance. It incorporates the required observer list,
+transactional restore/save behavior, instruction-specific C1 disposition with
+checked fallback for missing entries, captured-control/fresh-status replay,
+original80 C1 versus approximate value distinction, numeric-exception-only
+invariance, stack/pending-exception ownership, bounded lifetime and unmeasured
+costs. **Final verdict: ACCEPT claim59 as the scoped source construction stated.**
+Implementation conformance and performance remain unproved; the earlier
+qualification about unseen final wording is now discharged. Total review charge:
+10 agent-minutes, no additional research or experiment.
+
+### September21 — claim20 selection and final charter breadth review
+
+`/root/comparison_sources`, independent of claim20's author. Reviewed claim20,
+its current claim18 recomposition, the twelve-question inventory and Track03
+completion criteria. For claim56 I rely on root's recorded independent review,
+not my own authorship; claims57/58 and59 rely on their separate accepted source/
+composition reviews. The finite matched primary/replica evidence was independently
+reviewed and replicated above. No new source acquisition or experiment.
+
+**Evidence validity: ACCEPT the corrected claim20 inference at its stated
+scope.** The preference is supported by repeated matched advantages across
+several ordinary shapes with actual guards, staged FP/status checks and linked
+competing helpers. It is not based merely on FEX being constructible, source
+familiarity, or the availability of fallback. The accepted recovery construction
+removes the false premise that every normal boundary must publish a dense
+canonical image; it still charges real root preservation and service transitions.
+The concrete TCG service engine preserves exposed behavior outside native
+eligibility, rather than renaming an unimplemented generic library as coverage.
+
+One material correction was requested and verified in the final claim20 text:
+TCG's measured SQRT advantage applies within its tested state/entry binding.
+It cannot justify an unconditional FEX-to-TCG handoff, whose materialization,
+admission and reload can cost more than the~1.4ns body gain. The corrected text
+retains TCG SQRT in the service binding, permits the native path and makes any
+cross-producer choice include its bridge costs. No substantive selection return
+remains from this review.
+
+**Decision relevance: ACCEPT questions2/5 and the recomposed architecture as a
+conditional implementation direction.** FEX ordinary execution plus concrete
+TCG system/compound service is a justified place to invest implementation effort;
+it is not a demonstrated optimum for an unspecified workload. Claim20 explicitly
+states the gain-versus-adaptation/service/reuse condition and small finite branch
+saving thresholds. Native shapes that fail admission earn no assumed saving.
+Low-reuse, service-heavy or status-observing workloads can favor another path.
+These are retained economic/implementation falsifiers for synthesis, not hidden
+claims of workload-wide dominance. No weighted application speedup or uniform
+FP winner is inferred.
+
+The lazy-C1 x87 policy is accepted through the separate claim59 source review and
+the owner's explicit accuracy-versus-cost direction. It retains instruction-
+specific status/stack/exception ownership while allowing the stated approximate
+committed values. The original-operand C1 versus approximate-result distinction,
+loss of cancellation residuals and strict-provider option remain disclosed.
+The earlier primitive measurements motivate the policy but do not measure its
+conversions, guards, descriptor writes, cold resolution or application tolerance.
+No claim that the complete lazy-C1 adapter is faster is accepted here; synthesis
+must preserve those uncertainty/cost terms and the numerical applicability limit.
+
+### Charter breadth disposition
+
+| Breadth | Review outcome |
+| --- | --- |
+| Product | The selected virtual CPU/machine, required startup32, kernel/userspace, SMP, JIT/source mutation and required devices remain covered by their accepted owners. Restricting native eligibility does not remove guest instructions; checked service supplies the other paths. x87 approximation is an explicit owner-directed numerical policy, not a waiver of SSE status or arbitrary guest behavior. |
+| Architecture | The current selection binds questions2/5 to the accepted execution/state, memory, ordering, lifetime, event/time, boot/device and containment contracts of questions1,3,4,6–12. Claim18's ten interaction rows are recomposed through56–59 and claim19. Both producers share one resident authority, finite job/reference census and nonnesting service; reserved completion machinery prevents a drain-time compilation dependency. No new unowned execution engine or wait/reference cycle remains in the reviewed construction. |
+| Correctness | Current-root/phase maps, staged effects, admitted-route completion, exact event ownership and full changed-state handoff have concrete conditional contracts. Actual field/site mappings, emitted guards and complete service implementations still require conformance validation. Those are unwritten-code obligations, not permission to assume native frames recover lost values. Retained exact-Intel uncertainties and platform premises retain their stated compatibility/applicability scopes and reopen their owners if a concrete target dependence arises; they do not require a Haswell machine by default. |
+| Methodology | The scoped comparative premise uses actual code and independent controls/rebuild, distinguishes primary evidence from architecture inference and standalone numerical costs, and records alternatives, costs and falsifiers. No NOP subtraction, unsupported native coverage, unmatched compilation ranking or repeated microcampaign is used to manufacture selection. |
+
+**Final Track03 judgment:** the coherent architecture and implementation direction
+can close under the charter's explicitly conditional architectural scope. No
+remaining issue identified in this review invalidates the selected construction
+or the limited comparative reason for the preference. This does not close later
+implementation conformance or economic/workload acceptance, prove end-to-end
+performance, or authorize implementation. Missing workload weights must remain
+missing, not be invented to turn the direction into a universal winner.
+
+Before publishing completion, synchronize the current summaries, twelve-question
+inventory and claim18 supersession labels: their old “no selected generator” and
+“questions2/5 open” entries are now stale. Preserve historical insufficiency
+records with their original scope. This is editorial reconciliation of the
+accepted result, not another research gate. Five decision-review agent-minutes
+are charged within the remaining nine; total independent method/replica/decision
+review charge is16 of20. No further experiment is recommended by this verdict.

@@ -12,8 +12,12 @@ Expand the method and review record when seeking acceptance of a finding.
   Distinguish accepted original scope from open supplements.
 - **Material blockers:** substantive defects and their consequences; none if clear.
   State pending review separately as work status.
-- **Next action:** one bounded step, decision consequence, budget and stopping
-  condition. Missing execution budgets must be resolved before running.
+- **Decision test and budget:** alternatives, selection criterion and which
+  possible outcomes change the decision; total investigation budget and remaining
+  allowance, including preparation, experiments, review and corrections.
+- **Next action:** one step within that budget and its stopping condition.
+  Follow-ups consume the same allowance. Missing execution budgets must be
+  resolved before running; report insufficiency when the allowance is exhausted.
 
 ## Assumptions and breadth
 

@@ -6,6 +6,16 @@ work formerly organized under [Track 02](02-correctness.md). This charter sets
 requirements; it is not evidence that an architecture already satisfies them.
 Work follows the [research workflow](../README.md).
 
+**Owner-agreed direction, September21: defer codegen selection and establish
+the ARM64 execution ABI and resident VM first.** Hand-written ARM64 payloads
+will exercise explicit state/recovery/lifetime contracts, with FEX-friendly
+bindings where useful. Other architectural findings supply runtime requirements.
+The next deliverable is a provisional ABI and bounded runtime milestone, not a
+complete universal compiler interface. This is a sequencing decision, not an
+accepted ABI or implemented x86 guest. The earlier hybrid preference and Track03
+closure remain withdrawn; no generator is selected by this change. The owner
+requested committing findings before further work.
+
 ## Starting point and boundaries
 
 Start with the host-translator/EL1-shim direction and the accepted, scoped
@@ -24,7 +34,11 @@ startup32 transition where applicable; real mode remains out of scope. AVX2 is
 the ISA ceiling, not a requirement to expose every feature. Inherit floating-point
 machinery from the chosen translator, record its actual behavior, and reconcile
 any mismatch with the guest/workload requirements rather than silently changing
-the compatibility boundary. Isolation and crash containment remain required.
+the compatibility boundary. Under the owner's September 20 clarification,
+x87 numerical accuracy is secondary when its performance or adaptation cost is
+too high: compare cheaper inherited choices and disclose workload effects rather
+than requiring full80 fidelity before selection. Concrete tolerances and cost
+thresholds remain to be established. Isolation and crash containment remain required.
 Optional lifecycle features require an explicit scope decision. UEFI and Windows
 implications are analyzed without implementing either.
 
@@ -143,6 +157,13 @@ Keep detailed evidence in its owning investigation and link it rather than
 duplicating status. Existing `Q-03-02/03/04` investigations may feed this record;
 open another only when a concrete uncertainty needs separate work. The retired
 `Q-02-*` identifiers remain references to obligations absorbed here.
+
+Component selection requires a matched comparison against the owner's performance
+criterion, with x87 accuracy assessed under the recorded cost tradeoff. Evidence
+must justify the preference, not merely show that one candidate could work.
+Source familiarity, upstream system coverage and a reversible policy do not
+substitute for comparative justification. State uncertainty and adaptation cost
+alongside performance; qualify any estimates separately from observations.
 
 A choice is accepted only when reviewed evidence establishes preservation of its
 required behavior and relevant interactions. A correctness uncertainty capable

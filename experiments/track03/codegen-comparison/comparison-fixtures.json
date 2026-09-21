@@ -1,0 +1,64 @@
+{
+  "Features": {
+    "Bitness": 64,
+    "EnabledHostFeatures": [
+      "TSO"
+    ],
+    "DisabledHostFeatures": [
+      "SVE128",
+      "SVE256",
+      "LRCPC",
+      "LRCPC2"
+    ]
+  },
+  "Instructions": {
+    "branch_zero": {
+      "x86Insts": [
+        "xor rcx, 1",
+        "mov rax, [rbx]",
+        "pxor xmm0, xmm1",
+        "test rcx, rcx",
+        "jz short $+18"
+      ],
+      "ExpectedBytes": "4883f101488b03660fefc14885c97410"
+    },
+    "branch_carry": {
+      "x86Insts": [
+        "add rcx, rdx",
+        "mov rax, [rbx]",
+        "pxor xmm0, xmm1",
+        "setz dl",
+        "jc short $+18"
+      ],
+      "ExpectedBytes": "4801d1488b03660fefc10f94c27210"
+    },
+    "fp_addsub": {
+      "x86Insts": [
+        "addsd xmm0, xmm1",
+        "subsd xmm0, xmm1"
+      ],
+      "ExpectedBytes": "f20f58c1f20f5cc1"
+    },
+    "fp_muldiv": {
+      "x86Insts": [
+        "mulsd xmm0, xmm1",
+        "divsd xmm0, xmm1"
+      ],
+      "ExpectedBytes": "f20f59c1f20f5ec1"
+    },
+    "fp_sqrt": {
+      "x86Insts": [
+        "sqrtsd xmm0, xmm1"
+      ],
+      "ExpectedBytes": "f20f51c1"
+    },
+    "integer_div": {
+      "x86Insts": [
+        "xor edx, edx",
+        "mov rax, rcx",
+        "div rbx"
+      ],
+      "ExpectedBytes": "31d24889c848f7f3"
+    }
+  }
+}

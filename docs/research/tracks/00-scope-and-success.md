@@ -32,6 +32,16 @@ gates.
 
 Licensing implications are recorded as warnings, not candidate-selection blockers.
 
+**Owner clarification, September 20 — x87 accuracy versus cost:** x87 numerical
+accuracy is secondary when its performance or adaptation cost is too high.
+Full80 numerical fidelity is not an unconditional acceptance requirement.
+Compare cheaper inherited implementations using measured cost, numerical limits
+and effects on target workloads; disclose the selected accuracy/compatibility
+tradeoff. No specific error tolerance or cost threshold is fixed by this ruling.
+This is permission to trade x87 numerical accuracy, not a blanket relaxation of
+CPU state, memory safety or unrelated instruction semantics. INV-03-02 owns the
+component assessment and Q-00-02 owns the resulting compatibility boundary.
+
 ## Required definitions
 
 The track must produce, with evidence labels, and with review where

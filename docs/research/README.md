@@ -7,6 +7,21 @@ applicable. Each investigation owns its question, conclusion, applicability,
 blockers and next action. Consult a
 historical review only for a specific unresolved finding, contradiction, or audit.
 
+## Start and resume
+
+After this workflow and the applicable charter, read the owning investigation's
+current summary and decision inventory. Follow evidence and retrospective links
+only for a relevant premise, contradiction or recurring failure; a full
+retrospective read-through is not required for each session.
+
+When a lesson changes practice, put its actionable rule in the governing workflow
+or template and update affected current conclusions, inventory rows and next
+actions in place. Link the retrospective for rationale. Keep superseded choices
+in clearly marked evidence history, not as competing current instructions.
+Before reporting status or continuing work, resolve contradictions in those active
+sections against owner instructions and scoped evidence; prior approval alone is
+not a reason to repeat a superseded choice.
+
 ## Decision and product envelope
 
 Determine whether an unmodified x86-64 Linux system emulator on Apple Silicon,
@@ -147,6 +162,26 @@ created when needed: `reviews/INV-<track>-<nn>-pre-execution.md` or
 `reviews/INV-<track>-<nn>-findings.md`. Keep returns in that thread; no new global
 review number is needed per exchange. Record the reviewer identity/context,
 material inspected, evidence, verdict, and return disposition.
+
+Every substantive review records two judgments in the same thread: **evidence
+validity** and **decision relevance**. First identify the fixed architecture,
+owner's selection criterion, alternatives and exact decision the work can change.
+Assess alternatives against comparable conditions and burdens of proof; uneven
+source familiarity or accepted-claim counts do not establish a preference.
+For a proposed blocker or follow-up, name the possible outcomes and how they
+change selection, required compatibility or feasibility. Otherwise retain the
+unknown without making it the next assignment. Evidence may be accepted while
+a selection inference or further work is rejected.
+
+At each return, check the cumulative investigation budget, including preparation,
+experiments, review and corrections. Follow-ups consume that budget rather than
+starting it again. Stop when the decision is supported or the budget is exhausted;
+report the scoped conclusion or insufficiency. Any proposed extension must state
+its additional budget and decision consequence under the applicable authorization.
+This check belongs to existing reviews, not a new gate on bounded exploration.
+The [framing retrospective](../retrospectives/track03-architecture-drift.md) and
+[decision-displacement recurrence](../retrospectives/track03-decision-displacement.md)
+explain the failures these checks address.
 
 Review coherent design choices and their relevant interactions together. Editorial
 edits need no separate review round; substantive changes to claims, code, controls,

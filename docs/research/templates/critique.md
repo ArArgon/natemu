@@ -2,7 +2,13 @@
 
 - Reviewer and independent context:
 - Subject and material inspected (named sections, code, fixtures, artifacts):
-- Date and verdict: accept / revise / reject
+- Date:
+- Evidence verdict: accept / revise / reject, with scope.
+- Decision/direction verdict: supports the choice or next step / revise / reject.
+  Apply the workflow's [review practice](../README.md#review-practice): identify
+  the owner criterion, alternatives, what possible outcomes change the decision,
+  and cumulative budget remaining. State when sound evidence does not justify
+  selection or more work.
 
 For pre-execution review examine question, sources, method, controls, and code.
 For findings review examine results/source-only conclusions, applicability,
@@ -24,6 +30,8 @@ this reviewer requires another independent reviewer.
 
 Append corrections, the changed material/affected assumptions inspected by the
 same independent reviewer, each blocker disposition, and the updated verdict.
-An accept verdict requires no unresolved substantive blockers and the required
-independence. Keep this thread through returns; use no separate self-review file
-or new global review number for each exchange.
+Acceptance of the proposed choice or next step requires both judgments to
+support it, no unresolved substantive blockers and the required independence.
+A scoped evidence acceptance may stand while the direction is rejected. Keep this
+thread through returns; use no separate self-review file or new global review
+number for each exchange.
