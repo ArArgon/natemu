@@ -1,5 +1,46 @@
 # INV-03-01 — source findings review
 
+## Current return — I1 first execution, October 25, 2026
+
+Root authored the Rust host/shared ABI/resident runtime, assembly gates and
+retained runner. Independent `/root/i1_fex_inputs` reproduced the pinned FEX
+fragment and authored the semantic oracle from the x86 operation and producer
+bindings. A third context, `/root/i1_code_review`, reviewed the implementation,
+oracle, emitted gateways, SDK FFI widths, mapping permissions and run outputs.
+It did not author source changes.
+
+**Verdict: ACCEPT for finite I1 development; no unresolved substantive blocker.**
+Two findings were corrected and rechecked: expected entry state must come from
+the preserved host seed rather than VM-writable memory, and builds must pin the
+compiler/control inherited overrides rather than merely report a pinned version.
+The final runner also isolates Cargo state/output and verifies snapshot driver/
+helper identity. Reviewer confirmed capture precedes Rust and emitted Rust stack
+frames fit the declared stacks. Editorial formatting was handled directly.
+
+**Independent rebuild:** `/root/i1_code_review` executed
+`i1-independent-20261025-01` under the declared external wall/RSS supervision,
+22:22:46–22:22:49UTC, from a fresh durable source snapshot. All23 jobs passed:
+four Rust tests, four worker tests, oracle controls, build/sign/disassembly,
+14 native cells and unsupported-N rejection. The reviewer verified all446
+retained checksums, equality of frozen sources with the workspace and exact
+correspondence of the44-byte FEX body to producer `outputs/002.native[12:56]`.
+It independently rechecked all14 result JSONs. Root rechecked the final manifest,
+source equality and all checksums. Producing files are under
+`/Users/liaozping/orca/natemu-raw/i1-independent-20261025-01`; earlier developmental
+run `i1-development-20261025-01` is retained separately. Frozen Track01 files were
+reused unchanged, not edited.
+
+**Evidence validity:** the finite one-vCPU development results are reproducible
+on M4/macOS26.6.2, SDK26.4, Rust1.97.0. They remain exploratory development results;
+this review does not promote them to general architecture or performance evidence.
+The contained fault is a UDF control, not a generated-load recovery test. Preserved
+bank bytes are opaque sentinels, not a complete x86 state implementation.
+**Decision relevance:** I1 is complete and I2 can connect the actual producer
+loop to this working path. No generator winner, general recovery, paging, helper
+restoration, concurrent execution, boot or speed claim follows. The broader ABI
+milestone and Track03 remain open. Work and replication stayed within the I1 bound.
+
+
 ## Current return — implementation plan and setup, October 25, 2026
 
 The owner requested project setup changes reflecting the subsequent Rust,

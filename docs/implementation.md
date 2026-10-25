@@ -3,8 +3,8 @@
 Grow one working emulator through bounded, tested increments. The owner decisions
 of October 25, 2026 are: Rust for most new code, host-side FEX first, ABI and
 producer/runtime development together, early performance feedback, and configurable
-N-vCPU design with progressively wider tests. These are implementation directions,
-not claims of working code, general correctness or superiority over QEMU.
+N-vCPU design with progressively wider tests. These are implementation directions. I1 now has a finite working path; this
+does not establish general correctness or superiority over QEMU.
 
 This is the implementation order and setup entry point. The
 [workflow](research/README.md) governs development and evidence; [INV-03-01](research/investigations/INV-03-01.md#current-direction--build-first-october-25-2026)
@@ -145,10 +145,56 @@ python3 -B -m unittest discover -s tools -p 'test_check_setup.py'
 
 The host of record is M4/macOS26, with SDK26.4 in inherited evidence. New Rust
 builds must record/admit their actual SDK/toolchain; the frozen Track01 checker
-retains its exact original SDK requirement. The first implementation creates a
-small Cargo workspace for host, `no_std` runtime and shared ABI definitions, with
-assembly offsets generated from that same layout. Add real build/run commands
-to this section as they become available; placeholder binaries are not milestones.
+retains its exact original SDK requirement. The workspace now contains `crates/host`, `crates/runtime` and `crates/abi`.
+Rust 1.97.0 and the bare-metal target are pinned in `rust-toolchain.toml`; Cargo
+has no registry dependencies. Assembly offsets come from the shared Rust layout.
+The first C consumer/header belongs with the I2 producer bridge.
+
+Ordinary local checks/builds, from the repository root:
+
+```sh
+./tools/with-env cargo test --offline --locked
+./tools/with-env cargo build --offline --locked --release -p natemu-runtime --target aarch64-unknown-none
+python3 -B -m unittest discover -s tools -p 'test_*.py'
+python3 -B tools/check_i1.py --self-test
+```
+
+The retained development runner snapshots sources, builds and signs the host,
+checks the emitted image, then supervises each native cell and runs the independent
+oracle. Use a fresh name; existing output directories are refused:
+
+```sh
+./tools/with-env python3 -B tools/run_i1.py \
+  --name "i1-local-$(date +%Y%m%d-%H%M%S)" \
+  --fragment ../natemu-raw/i1-fex-fragment-20261025-02/live_load.arm64
+```
+
+The fragment path above is this machine's durable reproduced input; supply its
+actual location when using a different raw root. Its exact producer, extraction,
+bytes and manual site maps are in `fixtures/i1/live_load.json`. A missing fragment
+is an acquisition requirement, not permission to substitute handwritten code.
+Use `--snapshot PATH_TO_RETAINED_SOURCE` to rebuild the same checked sources;
+invoke that snapshot's runner if its runner/helper versions differ from the
+working tree. Runs retain manifests, source/build outputs, disassembly, per-cell
+JSON, supervision records and checksums. Build overrides are controlled and
+Cargo state/output isolated under the retained run.
+
+**I1 scope:** one immutable object per fresh VM, configured/admitted/tested N=1,
+1MiB guest backing and fixed private native mappings. Runtime text/generated code
+are RX; private state/stacks and guest data are NX. Startup removes its temporary
+low identity alias before admitting guest addresses. Generated code runs EL1t;
+exceptions use SP_EL1. Entry/return/exception gates cover all 31 GPRs, 32 Q registers,
+SP, NZCV, FPCR and FPSR before ordinary Rust. The 512-byte state bank is a preserved
+opaque sentinel region, not a complete x86 architectural state implementation.
+
+The finite descriptor admits exact control/FEX/fault bytes and fixed entry/data
+addresses, rejects other profiles/counts/targets, and appends only RET to the
+unchanged 44-byte FEX computation. Four ADD inputs cover zero, carry, signed
+overflow and ordinary results. Eight malformed object/address cases, an undefined
+instruction fault and unsupported N=2 supplement the positive cases. A native
+fault stops this VM with captured diagnostics; it does not recover or inject an
+invented x86 exception. Each executed cell finishes with one HVC to the host.
+This is development coverage of I1, not the full ABI coverage matrix.
 
 Use `./tools/with-env COMMAND ...` for project builds, checks and runs. It supplies
 the durable sibling `../natemu-raw` as `NATEMU_RAW_ROOT`, independently of the
@@ -186,8 +232,9 @@ working route during I2; do not postpone the producer loop until the ABI is comp
 
 ## Next assignment and reporting
 
-Start I1: run the setup check, resolve its relevant inputs, pin/admit the toolchain,
-build the minimal Rust/assembly path and execute a real fragment. At assignment
+Next is I2: connect a real host-side FEX request/generate/publish/resume loop to
+the existing runtime; retain I1 as regression coverage. Changed input/context,
+stale replies, cancellation and finite capacity must be observable checks. At assignment
 start record a realistic total work/resource bound, checks and stop condition in
 INV-03-01; existing direction authorizes routine choices without another approval
 round. Stop at a demonstrated slice, its bound, or a concrete blocking failure,

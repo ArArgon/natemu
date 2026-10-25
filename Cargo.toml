@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/abi", "crates/host", "crates/runtime"]
+default-members = ["crates/abi", "crates/host"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+
+[profile.dev]
+panic = "abort"

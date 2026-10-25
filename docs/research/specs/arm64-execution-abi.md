@@ -9,9 +9,10 @@ runtime conformance. Generator selection remains deferred.
 Owner: [INV-03-01](../investigations/INV-03-01.md). Status: independently reviewed
 and accepted for owner delivery as a provisional design/method proposal on
 September 28, 2026; the subsequent paging amendment also passed focused review.
-No implementation or experiment has run under this ABI.
-This accepts a concrete experimental design, not a working ABI, actual-code
-pre-execution approval or permission for production implementation.
+I1 now implements a finite Rust/assembly entry, capture, admission and pinned-FEX
+path; its exploratory development results are recorded in INV-03-01. The full
+ABI below remains provisional and unimplemented outside that scope. The original
+review accepts a concrete experimental design, not full runtime conformance.
 
 **Current implementation direction, October25:** develop this provisional ABI,
 the Rust runtime and host-side FEX adapter together using the
@@ -229,8 +230,9 @@ the context even while its execution test is deferred.
 Draft 0 is a same-build experimental ABI, not a stable plugin or on-disk format.
 One versioned runtime header will define record offsets for both producer adapters
 and runtime; generated assembly offsets must come from it. A mismatched version,
-profile, size or field catalog rejects the object before entry. The header and
-actual offsets are implementation deliverables, not evidence already supplied here.
+profile, size or field catalog rejects the object before entry. I1 supplies the shared Rust records in `crates/abi` and assembly offsets through
+`offset_of!`/`global_asm!`; its exact-byte fixture profiles are not a general object
+or producer metadata format. Extend the records and consumers together during I2/I3.
 
 | Native resource | Draft 0 rule |
 | --- | --- |
@@ -682,10 +684,10 @@ acceptance; no whole-architecture or performance claim follows from it.
 
 ## 9. What remains provisional
 
-The ABI makes its ownership and continuation choices now. Exact record offsets,
-machine-code gateways, instruction-site maps, barriers for the actual mapping
-layout, interrupt bring-up and every capacity check must still be implemented and
-reviewed before evidence execution. They are explicit conformance work, not
+The ABI makes its ownership and continuation choices now. I1 supplies finite record layouts, machine-code entry/capture gates and an
+initial mapping/publication path. General instruction-site recovery, helper
+transitions, interrupt bring-up, paging and concurrent capacity/lifetime protocols
+still require implementation and review before their evidence execution. They are explicit conformance work, not
 permission to leave guest-visible behavior unspecified.
 
 This experiment does not establish full exception delivery, arbitrary compound
