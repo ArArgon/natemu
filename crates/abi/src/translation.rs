@@ -2,7 +2,7 @@
 use crate::{DATA_VA, FEX_BODY, FEX_OR_BODY, PROFILE, VERSION};
 
 pub const MODE: u64 = 2;
-pub const SOURCE_VA: u64 = DATA_VA + 512;
+pub const SOURCE_VA: u64 = DATA_VA + 8192;
 pub const XOR: [u8; 17] = [
     0x66, 0x0f, 0xef, 0xc1, 0x48, 0x01, 0xd1, 0x48, 0x8b, 0x03, 0x0f, 0x94, 0xc2, 0xf3, 0x0f, 0x7f,
     0x07,
@@ -64,7 +64,12 @@ impl Lifecycle {
         }
     }
     pub fn source(&self) -> [u8; 17] {
-        if self.variant == 0 { XOR } else { OR }
+        match self.variant {
+            0 => XOR,
+            1 => OR,
+            2 => crate::pressure::ALIAS,
+            _ => crate::pressure::FP_ALIAS,
+        }
     }
     pub fn packet(&self) -> Packet {
         let mut p = command(self.event);
@@ -72,9 +77,9 @@ impl Lifecycle {
         p[3] = self.source_generation;
         p[4] = self.context_generation;
         p[5] = self.vm;
-        p[6] = 17;
+        p[6] = if self.variant == 3 { 16 } else { 17 };
         put_bytes(&mut p[7..10], &self.source());
-        p[10] = PROFILE as u64;
+        p[10] = if self.variant >= 2 { 2 } else { PROFILE as u64 };
         p[11] = 0;
         p[12] = SOURCE_VA;
         p[13] = self.requests;
@@ -123,7 +128,7 @@ impl Lifecycle {
     }
     // Invalid/late deliveries never consume or mutate a currently occupied slot.
     pub fn validate_reply(&self, p: &Packet) -> Result<[u8; 44], u64> {
-        if p[0] != DELIVER || p[1] != VERSION as u64 {
+        if self.variant >= 2 || p[0] != DELIVER || p[1] != VERSION as u64 {
             return Err(BAD_REPLY);
         }
         if self.pending == 0

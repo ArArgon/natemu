@@ -7,7 +7,7 @@ import fex_worker as worker
 
 
 def packet():
-    p = [11,2,1,1,1,9,17,*struct.unpack('<3Q', worker.XOR+bytes(7)),1,0,0x100200,1,0,1]
+    p = [11,3,1,1,1,9,17,*struct.unpack('<3Q', worker.XOR+bytes(7)),1,0,0x102000,1,0,1]
     return p
 
 

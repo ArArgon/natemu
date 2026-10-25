@@ -1,5 +1,58 @@
 # INV-03-01 — source findings review
 
+
+## Current return — I3 recovery and paging, October 25, 2026
+
+Root authored the Rust host/ABI/runtime, assembly gates and integration. Separate
+`/root/i1_fex_inputs` reproduced actual FEX allocation output and adapted its
+exporter/worker; `/root/i3_paging_oracle` authored independent expected-state,
+walker/table, native instruction, helper and partial-effect checks. Independent
+`/root/i1_code_review` inspected consequential source/contract changes, emitted
+code, bounds and retained results without authoring runtime changes.
+
+**Verdict: ACCEPT bounded I3 implementation increment; no substantive blocker.**
+Review corrected missing CR4.OSFXSR for admitted SSE, a proposed return trampoline
+that destroyed x30's RDI root, in-range but incorrect map acceptance, and container
+cleanup that initially covered only I2 labels. Full ERET entry preserves x16/R12;
+direct branch return preserves x30/RDI; SP_EL1 capture preserves live producer
+spills. Both code and allocation-map admission artifacts match machine-produced
+fresh exports. BL/x30-only-link draft rules were updated to the actual profile.
+These are implementation-driven ABI changes, not a final generator selection.
+
+**Independent reproduction:** `i3-independent-20261025-01`,23:34:47–23:35:05UTC,
+under the durable raw root. All56 jobs passed, including15 Rust tests, independent
+oracle controls,14 I1 native cells plus N2 rejection, six I2 scenarios,12 paging
+scenarios and10 pressure/FP/helper/REP cases. Reviewer verified all1312 checksums
+and56 snapshot files against the workspace,31 fresh compiler invocations, exact
+runtime-request/input/body/map/reply association, and admission artifacts against
+actual allocated maps. Both live Docker label queries were empty. Root separately
+checked the final manifest, all1312 checksums and executable-source identity.
+After reproduction, only the captured producer README changed, to describe the
+already-tested direct-branch return and admission-artifact provenance; the other
+55 captured inputs remain byte-identical. Project result/spec documents were
+updated after the verdict. These editorial updates do not change execution.
+
+**Evidence validity:** these independently reproduced exploratory development
+results establish the declared one-vCPU finite behaviors. Complete guest/native
+state and earlier effects are checked, including direct/inverted carry, all35
+allocated roots, initialized spills, overwritten RAX, unchanged banks, helper
+output staging, FP sticky status and counted REP progress. The partial fixture
+faults after its second device read and resumes only the pending STRB; both
+fault-time progress and final counts/bytes are independently constrained.
+Final emitted stack maxima were12,496 bytes on SP_EL0 and9,920 on SP_EL1, within
+16KiB each. Maximum observed supervised group RSS was312.8MB; retained replica
+size35.6MB. These diagnostics do not qualify a performance comparison.
+
+**Decision relevance:** I3 is complete as a bounded implementation increment and
+I4 can develop concurrent composition on the same runtime. The pressure strategy
+is deliberately conservative; maps are automatic but only exact finite profiles
+are admitted. REP is a resident fixture, not FEX-generated REP. No general paging
+mutation, code/route change during a retained operation, full FP/x87, IDT delivery,
+SMP, boot or full ABI/architecture conformance follows. Native macOS FEX integration
+and performance selection remain open. Review/reproduction stayed inside I3's
+allowance; historical failures remain retained and unpromoted.
+
+
 ## Current return — I2 live producer, October 25, 2026
 
 Root authored the versioned request lifecycle, host worker binding, resident

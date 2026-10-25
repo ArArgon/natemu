@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Snapshot, build and check the growing runtime (I1, optionally I2)."""
+"""Snapshot, build and check the growing runtime (I1/I2 and finite I3 profiles)."""
 import argparse
 import hashlib
 import importlib.util
@@ -51,6 +51,9 @@ def main():
     parser.add_argument('--name', help='fresh retained run name')
     parser.add_argument('--fragment', type=Path, help='reproduced live_load.arm64')
     parser.add_argument('--snapshot', type=Path, help='rebuild an existing retained source snapshot')
+    parser.add_argument('--i3-allocated', action='store_true', help='also test automatic allocated maps and admitted FP status')
+    parser.add_argument('--allocated-producer',type=Path,help='pinned pressure-map CodeSizeValidation')
+    parser.add_argument('--i3-paging', action='store_true', help='also test the initial I3 paging subset (not full I3)')
     parser.add_argument('--i2', action='store_true', help='also test the actual FEX producer loop')
     parser.add_argument('--producer', type=Path, help='pinned CodeSizeValidation binary for I2')
     parser.add_argument('--worker', type=Path, help=argparse.SUPPRESS)
@@ -62,6 +65,10 @@ def main():
         parser.error('--name and --fragment are required')
     if resource.getrlimit(resource.RLIMIT_CPU) != (resource.RLIM_INFINITY, resource.RLIM_INFINITY):
         parser.error('HVF requires unlimited inherited CPU limits; external wall/RSS supervision bounds execution')
+    args.i3_paging = args.i3_paging or args.i3_allocated
+    args.i2 = args.i2 or args.i3_paging
+    if args.i3_allocated and not args.allocated_producer:
+        parser.error("--i3-allocated requires --allocated-producer")
     if args.i2 and not args.producer:
         parser.error('--i2 requires --producer')
     retention = module(REPO / 'experiments/track01/source/run.py', 'retention')
@@ -69,8 +76,8 @@ def main():
     run = retention.allocate(os.environ.get('NATEMU_RAW_ROOT'), REPO, args.name)
     record = {'format': 'natemu-runtime-run-v2', 'purpose': 'exploratory-development', 'status': 'preparing',
               'started_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-              'increments': ['I1','I2'] if args.i2 else ['I1'], 'configured_vcpus': 1, 'tested_vcpus': 1, 'commands': [], 'jobs': [],
-              'limits': {'cell_seconds': 20, 'bundle_seconds': 300, 'worker_rss_bytes': 512*1024**2,
+              'increments': ['I1','I2','I3'] if args.i3_paging else ['I1','I2'] if args.i2 else ['I1'], 'configured_vcpus': 1, 'tested_vcpus': 1, 'commands': [], 'jobs': [],
+              'limits': {'cell_seconds': 20, 'bundle_seconds': 1200 if args.i3_paging else 900 if args.i2 else 300, 'worker_rss_bytes': 512*1024**2,
                          'build_jobs': 2, 'build_rss_bytes': 8*1024**3, 'run_disk_bytes': 1024**3,
                          'guest_ram_bytes': 1024**2}}
     retention.save(run, record)
@@ -84,6 +91,10 @@ def main():
                      'experiments/track01/run_check.py')
         if args.i2:
             names += ('tools/check_i2.py','tools/fex_worker.py','tools/test_fex_worker.py')
+        if args.i3_paging:
+            names += ('tools/check_i3_paging.py',)
+        if args.i3_allocated:
+            names += ('tools/i3_worker.py','tools/i3_producer','tools/check_i3_pressure.py')
         for name in names:
             path = origin / name
             if path.is_symlink() or (path.is_dir() and any(p.is_symlink() for p in path.rglob('*'))):
@@ -112,6 +123,13 @@ def main():
             (run / 'CodeSizeValidation').write_bytes(producer_bytes)
             (run / 'CodeSizeValidation').chmod(0o755)
             record['producer_origin'] = str(producer)
+        if args.i3_allocated:
+            pin=json.loads((source/'tools/i3_producer/producer.json').read_text())
+            allocated=args.allocated_producer.resolve().read_bytes()
+            if len(allocated)>16*1024**2 or hashlib.sha256(allocated).hexdigest()!=pin['binary_sha256']:
+                raise ValueError('allocated producer differs from pin')
+            (run/'AllocatedCodeSizeValidation').write_bytes(allocated)
+            (run/'AllocatedCodeSizeValidation').chmod(0o755)
         record['source_origin'] = str(origin)
         record['fragment_origin'] = str(args.fragment.resolve())
         record['producer'] = metadata
@@ -121,18 +139,26 @@ def main():
 
         build_env = {'CARGO_HOME': str(run / 'cargo-home'), 'CARGO_TARGET_DIR': str(source / 'target'),
                      'CARGO_BUILD_JOBS': '2', 'RUSTUP_TOOLCHAIN': '1.97.0',
-                     'MACOSX_DEPLOYMENT_TARGET': '26.0', 'NATEMU_I2_RUN': args.name}
+                     'MACOSX_DEPLOYMENT_TARGET': '26.0', 'NATEMU_I2_RUN': args.name, 'NATEMU_I3_RUN': args.name}
         record['build_environment'] = build_env
         record['inherited_platform_environment'] = {k: os.environ[k] for k in ('PATH','RUSTUP_HOME','DEVELOPER_DIR','SDKROOT') if k in os.environ}
 
+        execution_deadline=None
+
         def job(label, argv, *, wall=600, rss=8*1024**3, oracle=False, expected_exit=0, expected_error=None):
+            if execution_deadline is not None:
+                wall=min(wall,execution_deadline-time.monotonic())
+                if wall<=0:
+                    raise RuntimeError('combined execution bundle bound reached')
             directory = run / label
             directory.mkdir()
             data = {'argv': list(map(str, argv)), 'cwd': str(source), 'expected_exit': expected_exit, 'environment': build_env}
             if oracle:
-                data['oracle'] = str(source / ('tools/check_i2.py' if oracle == 'i2' else 'tools/check_i1.py'))
-            if oracle == 'i2':
+                data['oracle'] = str(source / ('tools/check_i3_pressure.py' if oracle == 'allocated' else 'tools/check_i3_paging.py' if oracle == 'i3' else 'tools/check_i2.py' if oracle == 'i2' else 'tools/check_i1.py'))
+            if oracle in ('i2','i3'):
                 data['producer_check'] = str(source / 'tools/fex_worker.py')
+            if oracle == 'allocated':
+                data['producer_check']=str(source/'tools/i3_worker.py')
             if expected_error:
                 data['expected_error'] = expected_error
             job_path = directory / 'job.json'
@@ -153,6 +179,11 @@ def main():
         if args.i2:
             job('producer-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_fex_worker.py'])
             job('i2-oracle-self-test', [sys.executable, '-B', 'tools/check_i2.py', '--self-test'])
+        if args.i3_allocated:
+            job('allocated-producer-tests',[sys.executable,'-B','-m','unittest','discover','-s','tools/i3_producer','-p','test_*.py'])
+            job('allocated-oracle-self-test',[sys.executable,'-B','tools/check_i3_pressure.py','--self-test'])
+        if args.i3_paging:
+            job('i3-paging-oracle-self-test', [sys.executable, '-B', 'tools/check_i3_paging.py', '--self-test'])
         job('oracle-self-test', [sys.executable, '-B', 'tools/check_i1.py', '--self-test'])
         job('build-host', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-host'])
         job('build-runtime', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'])
@@ -164,6 +195,7 @@ def main():
         record['status'] = 'built'
         retention.save(run, record)
         start = time.monotonic()
+        execution_deadline=start+record['limits']['bundle_seconds']
         cells = [('control', 0, 'none'), *[('live_load', n, 'none') for n in range(4)], ('fault', 0, 'none'),
                  *[('live_load', 0, mutation) for mutation in ('version','profile','size','target','entry','code','address','vcpu')]]
         for index, (case, vector, mutation) in enumerate(cells):
@@ -187,6 +219,26 @@ def main():
                 job('i2-'+scenario, [host,runtime,'i2',scenario,source / 'tools/fex_worker.py',run / 'CodeSizeValidation',run / ('compiler-'+scenario)],
                     wall=min(120, remaining), rss=512*1024**2, oracle='i2')
             record['i2_scenarios_passed'] = len(scenarios)
+        if args.i3_paging:
+            start_i3 = time.monotonic()
+            paging_cases=('cold','load_np','store_ro','parent_ro','wp_off','user_denied','reserved','fetch_nx','smep','carry','overflow','large')
+            for scenario in paging_cases:
+                remaining=1200-(time.monotonic()-start_i3)
+                if remaining<=0:
+                    raise RuntimeError('I3 paging bundle bound reached')
+                job('i3-'+scenario, [host,runtime,'i3',scenario,source/'tools/fex_worker.py',run/'CodeSizeValidation',run/('paging-compiler-'+scenario)],
+                    wall=min(120,remaining),rss=512*1024**2,oracle='i3')
+            record['i3_paging_subset_passed']=len(paging_cases)
+            record['i3_increment_checks_passed']=False
+        if args.i3_allocated:
+            for profile in ('i3-pressure','i3-fp','i3-helper'):
+                for scenario in ('cold','load_np','store_ro'):
+                    label=profile+'-'+scenario
+                    job(label,[host,runtime,profile,scenario,source/'tools/i3_worker.py',run/'AllocatedCodeSizeValidation',run/('compiler-'+label)],wall=120,rss=512*1024**2,oracle='allocated')
+            job('i3-partial-cold',[host,runtime,'i3-partial','cold',source/'tools/i3_worker.py',run/'AllocatedCodeSizeValidation',run/'compiler-i3-partial-cold'],wall=120,rss=512*1024**2,oracle='allocated')
+            record['i3_allocated_cells']=10
+            record['i3_increment_checks_passed']=True
+            record['full_abi_complete']=False
         record['status'] = 'passed'
         record['cells_passed'] = len(cells)
     except BaseException as error:
@@ -198,7 +250,10 @@ def main():
         record['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         if args.i2:
             try:
-                containers = subprocess.check_output(['docker','ps','-aq','--filter',f'label=natemu.i2.run={args.name}'],text=True,timeout=10).split()
+                containers=[]
+                for label in ('natemu.i2.run','natemu.i3.run'):
+                    containers.extend(subprocess.check_output(['docker','ps','-aq','--filter',f'label={label}={args.name}'],text=True,timeout=10).split())
+                containers=sorted(set(containers))
                 record['remaining_containers'] = containers
                 if containers:
                     subprocess.run(['docker','rm','--force','--volumes',*containers],check=True,capture_output=True,timeout=20)
@@ -211,6 +266,10 @@ def main():
         retention.checksums(run)
     if record['status']=='passed':
         extra=f", {record['i2_scenarios_passed']} live-producer scenarios" if args.i2 else ''
+        if args.i3_paging:
+            extra+=f", {record['i3_paging_subset_passed']} paging scenarios"
+        if args.i3_allocated:
+            extra+=f", {record['i3_allocated_cells']} allocated/helper/REP scenarios"
         print(f"PASS: {record['cells_passed']} I1 native cells, unsupported-count rejection{extra}", flush=True)
         return 0
     return 1

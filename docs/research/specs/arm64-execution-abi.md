@@ -9,8 +9,9 @@ runtime conformance. Generator selection remains deferred.
 Owner: [INV-03-01](../investigations/INV-03-01.md). Status: independently reviewed
 and accepted for owner delivery as a provisional design/method proposal on
 September 28, 2026; the subsequent paging amendment also passed focused review.
-I1/I2 now implement finite Rust/assembly entry/capture, admission, actual FEX
-requests, publication and cancellation. Exploratory development results are
+I1–I3 now implement finite Rust/assembly entry/capture, admission, actual FEX
+requests, publication/cancellation, allocated recovery, paging, helpers and
+partial/FP paths. Exploratory development results are
 recorded in INV-03-01. The full
 ABI below remains provisional and unimplemented outside that scope. The original
 review accepts a concrete experimental design, not full runtime conformance.
@@ -228,19 +229,35 @@ the context even while its execution test is deferred.
 
 ## 3. Native register and state contract
 
+**I3 profile adaptation:** real allocation assigns guest R12 to x16 at entry and
+RDI to x30 at the store/return map. The former x16 branch-scratch and x30-only-link
+conventions are therefore not universal ABI rules. Full ERET entry preserves x16;
+a checked direct branch leaves the body without destroying x30. Return capture
+uses SP_EL1 because an ordinary stack capture below SP_EL0 would overwrite the
+producer's still-live 768-byte spill frame. Fault and helper captures use the same
+separate stack; all GPR/Q/native flags/FP controls are restored before continuation.
+The two 35-root maps are emitted by the actual FEX allocator. This finite profile
+admits exact generated body/map artifacts, binds fresh worker output to them, and
+consumes the delivered maps. It does not claim arbitrary FEX-program coverage or
+an efficient final spill strategy. The typed bank retains unchanged YMM high,
+x87, MXCSR, control and segment fields; including them in the catalog does not
+implement instructions that modify all of those fields.
+
+
 Draft 0 is a same-build experimental ABI, not a stable plugin or on-disk format.
 One versioned runtime header will define record offsets for both producer adapters
 and runtime; generated assembly offsets must come from it. A mismatched version,
 profile, size or field catalog rejects the object before entry. I1/I2 supply the shared Rust records in `crates/abi` and assembly offsets through
 `offset_of!`/`global_asm!`; its exact-byte fixture profiles are not a general object
-or producer metadata format. I2 uses ABI version2 and a bounded 128-byte
-little-endian packet. Extend records and consumers together during I3.
+or producer metadata format. Current I3 uses ABI version3 and the same bounded
+128-byte register packet, with request-bound chunks for a 1168-byte code/map
+export. Historical I2 runs used version2. Extend records and consumers together.
 
 | Native resource | Draft 0 rule |
 | --- | --- |
 | x28 | Producer state-bank base. Its layout is identified by the producer profile; this is not permission to treat upstream FEX offsets as natemu's runtime structure. |
 | SP | Private resident stack, 16-byte aligned; never guest RSP. Each object declares its maximum frame and exact spill-base relation to entry SP. |
-| x30 | Native link/return resource, not an architectural guest root. A helper-call adapter saves a prior native return when needed. Inter-object transfers are tail transfers. |
+| x30 | Profile-declared resource. It may carry an architectural root: the I3 FEX store map places guest RDI here. Such profiles enter helpers and return gates with direct branches and registered continuations, preserving x30. A BL/RET adapter is permitted only when its maps prove the overwritten link value is not live or preserve it first. |
 | Other GPRs, Q0–Q31, NZCV | Available according to the producer's declared entry map and clobber set. No assumption that platform C calling conventions preserve guest values. |
 | FPCR/FPSR | Explicit native control/status owned by the executing profile, captured before runtime FP work and restored for native resumption. Guest MXCSR/x87 state is separate. |
 | Stack header | Resident-owned vCPU handle, frame incarnation and allocation bounds, reachable from the declared entry frame. Generated spill addresses cannot overwrite it. |
@@ -355,8 +372,9 @@ map, profile state-bank pointer and private stack. A warmed link uses the same g
 miss goes to permanent resident service; it does not retain a guest-RAM grant
 while waiting for host compilation.
 
-**Call a helper.** A site-specific gateway is entered with BL, preserving x30
-where required. The call-site map describes the state before argument setup and
+**Call a helper.** Enter a site-specific gateway using the profile-declared
+transfer. The I3 allocated profile uses a direct B and registered continuation;
+BL is valid only after preserving any live x30 root. The call-site map describes the state before argument setup and
 every temporary that setup could destroy. The gateway first saves live roots in
 the helper's declared clobber set, including flags and full vector widths, then
 passes a resident-owned call-frame pointer in x0 to the helper. Other arguments

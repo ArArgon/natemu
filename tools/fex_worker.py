@@ -25,8 +25,8 @@ def require(condition, message):
 def parse_request(raw):
     require(len(raw) == 128, 'request must contain exactly sixteen words')
     p = struct.unpack('<16Q', raw)
-    require(p[0] == 11 and p[1] == 2 and all(p[n] > 0 for n in (2, 3, 4, 5)), 'invalid request identity')
-    require(p[6] == 17 and p[10:13] == (1, 0, 0x100200), 'unsupported source/profile/vCPU/RIP')
+    require(p[0] == 11 and p[1] == 3 and all(p[n] > 0 for n in (2, 3, 4, 5)), 'invalid request identity')
+    require(p[6] == 17 and p[10:13] == (1, 0, 0x102000), 'unsupported source/profile/vCPU/RIP')
     padded = struct.pack('<3Q', *p[7:10])
     source = padded[:17]
     require(not any(padded[17:]) and source in (XOR, OR), 'unsupported source bytes/padding')
@@ -101,7 +101,7 @@ def compile_request(directory, producer):
         record['container_state'] = state
         require(not state['Running'] and not state['OOMKilled'] and state['ExitCode'] == 0, 'compiler container did not succeed')
         body, obj = extract(directory, (directory / 'producer.log').read_text(), source)
-        reply = [2, 2, *p[2:6], 44, *struct.unpack('<6Q', body+bytes(4)), *p[7:10]]
+        reply = [2, 3, *p[2:6], 44, *struct.unpack('<6Q', body+bytes(4)), *p[7:10]]
         require(len(reply) == 16, 'internal reply size')
         with (directory / 'reply.bin').open('xb') as out:
             out.write(struct.pack('<16Q', *reply))
@@ -138,7 +138,7 @@ def verify_compilations(root, requests):
         require(record['status']=='passed' and record['producer_sha256']==PRODUCER_SHA and record['image']==IMAGE, 'wrong producer or failed invocation')
         require(record['request']==expected and record['object']==obj and record['native_sha256']==hashlib.sha256(body).hexdigest(), 'producer record does not bind output')
         require(all(c.get('returncode')==0 for c in record['commands']) and len(record['commands'])==4, 'incomplete compiler command lifecycle')
-        reply=[2,2,*p[2:6],44,*struct.unpack('<6Q',body+bytes(4)),*p[7:10]]
+        reply=[2,3,*p[2:6],44,*struct.unpack('<6Q',body+bytes(4)),*p[7:10]]
         require(record['reply']==reply and (directory/'reply.bin').read_bytes()==struct.pack('<16Q',*reply), 'reply is not fresh compiler output')
         require((directory/'body.arm64').read_bytes()==body, 'installed body differs from extracted output')
 

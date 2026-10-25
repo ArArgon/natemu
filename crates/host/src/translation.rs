@@ -102,10 +102,11 @@ impl Session {
         self.event(expected)
     }
     fn capture(&mut self, s: Shared) -> Result<()> {
-        let case = if s.lifecycle.variant == 0 {
-            "live_load"
-        } else {
-            "live_or"
+        let case = match s.lifecycle.variant {
+            0 => "live_load",
+            1 => "live_or",
+            2 => "allocated_xor",
+            _ => "allocated_fp",
         };
         let after = self.vm.memory.read::<256>(DATA_OFFSET);
         let bank_after = self.vm.memory.read::<512>(BANK_OFFSET);
@@ -147,6 +148,61 @@ impl Session {
             request,
         })
     }
+    fn deliver_export(&mut self, request: wire::Packet, terminal: u64) -> Result<()> {
+        use natemu_abi::pressure::*;
+        let mut worker = self.start_producer(request)?;
+        if !worker.child.wait().map_err(|e| e.to_string())?.success() {
+            return Err("allocated FEX worker failed".into());
+        }
+        let echoed = read_input(
+            worker
+                .directory
+                .join("reply-request.bin")
+                .to_str()
+                .ok_or("reply path")?,
+            128,
+        )?;
+        if echoed
+            != request
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<_>>()
+        {
+            return Err("export not bound to original request".into());
+        }
+        let bytes = read_input(
+            worker
+                .directory
+                .join("export.bin")
+                .to_str()
+                .ok_or("export path")?,
+            EXPORT_BYTES,
+        )?;
+        if bytes.len() != EXPORT_BYTES {
+            return Err("bad export size".into());
+        }
+        let export = unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<Export>()) };
+        let source = self.vm.shared().lifecycle.source();
+        export
+            .validate(&source)
+            .map_err(|e| format!("bad allocated export: {e}"))?;
+        let packet = |command| {
+            let mut p = wire::command(command);
+            p[2..6].copy_from_slice(&request[2..6]);
+            p
+        };
+        let mut begin = packet(BEGIN);
+        begin[6] = EXPORT_BYTES as u64;
+        self.send(begin, ACK)?;
+        for (i, chunk) in bytes.chunks(72).enumerate() {
+            let mut p = packet(CHUNK);
+            p[6] = (i * 72) as u64;
+            wire::put_bytes(&mut p[7..], chunk);
+            self.send(p, ACK)?;
+        }
+        self.send(packet(COMMIT), terminal)?;
+        Ok(())
+    }
     fn deliver(&mut self, reply: wire::Packet, expected: u64) -> Result<()> {
         match self.vm.shared().lifecycle.validate_reply(&reply) {
             Ok(_) => {
@@ -179,15 +235,22 @@ impl Session {
 
 pub fn run(args: &[String]) -> Result<()> {
     let scenario = args[3].as_str();
-    if ![
-        "live",
-        "source_stale",
-        "context_stale",
-        "cancel",
-        "capacity",
-        "bad_reply",
-    ]
-    .contains(&scenario)
+    let allocated = args[2] == "i3-pressure"
+        || args[2] == "i3-fp"
+        || args[2] == "i3-helper"
+        || args[2] == "i3-partial";
+    let fp = args[2] == "i3-fp";
+    let i3 = args[2] == "i3" || allocated;
+    if !i3
+        && ![
+            "live",
+            "source_stale",
+            "context_stale",
+            "cancel",
+            "capacity",
+            "bad_reply",
+        ]
+        .contains(&scenario)
     {
         return Err("unknown I2 scenario".into());
     }
@@ -196,13 +259,37 @@ pub fn run(args: &[String]) -> Result<()> {
     let memory = Memory::new()?;
     load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
     page_tables(&memory);
-    let (initial, bank, data) = seed(3);
+    let (mut initial, bank, data) = seed(match scenario {
+        "carry" => 1,
+        "overflow" => 2,
+        _ => 3,
+    });
+    if allocated {
+        initial.x[4] = DATA_VA;
+    }
+    if fp {
+        for i in 0..4 {
+            initial.q[16][i * 4..i * 4 + 4].copy_from_slice(&0x3f800000u32.to_le_bytes());
+            initial.q[17][i * 4..i * 4 + 4].copy_from_slice(&0x33000000u32.to_le_bytes());
+        }
+    }
     memory.copy(BANK_OFFSET, &bank);
     memory.copy(DATA_OFFSET, &data);
     let mut cookie = 0u64;
     if unsafe { getentropy((&mut cookie as *mut u64).cast(), 8) } != 0 || cookie == 0 {
         return Err("VM incarnation entropy unavailable".into());
     }
+    let paging_before = if i3 {
+        Some(super::recovery::prepare(
+            &memory, &initial, scenario, allocated,
+        )?)
+    } else {
+        None
+    };
+    if args[2] == "i3-partial" {
+        memory.copy(natemu_abi::recovery::SOURCE_OFFSET + 256, &[0xf3, 0xa4]);
+    }
+    let tables_before = memory.read::<16384>(natemu_abi::recovery::TABLE_OFFSET);
     let shared = Shared {
         object: Object::new(LIVE_LOAD),
         initial,
@@ -219,7 +306,21 @@ pub fn run(args: &[String]) -> Result<()> {
         actlr: 0,
         tcr: 0,
         service_pc: 0,
-        mode: wire::MODE,
+        mode: if args[2] == "i3-partial" {
+            natemu_abi::recovery::PARTIAL_MODE
+        } else if args[2] == "i3-helper" {
+            natemu_abi::recovery::HELPER_MODE
+        } else if allocated {
+            if fp {
+                natemu_abi::pressure::FP_MODE
+            } else {
+                natemu_abi::pressure::MODE
+            }
+        } else if i3 {
+            natemu_abi::recovery::MODE
+        } else {
+            wire::MODE
+        },
         lifecycle: wire::Lifecycle::new(cookie),
     };
     unsafe {
@@ -253,55 +354,91 @@ pub fn run(args: &[String]) -> Result<()> {
         output,
     };
     session.event(wire::READY)?;
-    let first = session.send(wire::command(wire::DISPATCH), wire::MISS)?;
-    match scenario {
-        "live" => {
-            session.compile_and_deliver(first)?;
-            session.send(wire::command(wire::DISPATCH), wire::EXECUTED)?;
-            session.source_change()?;
-            let next = session.send(wire::command(wire::DISPATCH), wire::MISS)?;
-            session.compile_and_deliver(next)?;
-            session.send(wire::command(wire::CONTEXT), wire::CHANGED)?;
-            let next = session.send(wire::command(wire::DISPATCH), wire::MISS)?;
-            session.compile_and_deliver(next)?;
-        }
-        "source_stale" | "context_stale" | "cancel" => {
-            let old = session.start_producer(first)?;
-            if scenario == "source_stale" {
-                session.source_change()?;
-            } else if scenario == "context_stale" {
-                session.send(wire::command(wire::CONTEXT), wire::CHANGED)?;
+    if i3 {
+        let early = matches!(scenario, "fetch_nx" | "smep");
+        let terminal = if matches!(scenario, "cold" | "wp_off" | "carry" | "overflow" | "large") {
+            wire::EXECUTED
+        } else {
+            natemu_abi::recovery::PAGE_FAULT
+        };
+        let request = session.send(
+            wire::command(wire::DISPATCH),
+            if early { terminal } else { wire::MISS },
+        )?;
+        if !early {
+            if allocated {
+                session.deliver_export(request, terminal)?;
             } else {
-                let mut p = wire::command(wire::CANCEL);
-                p[2] = first[2];
-                p[5] = first[5];
-                session.send(p, wire::CANCELLED)?;
+                let reply = session.start_producer(request)?.finish()?;
+                session
+                    .vm
+                    .shared()
+                    .lifecycle
+                    .validate_reply(&reply)
+                    .map_err(|e| format!("I3 host reply admission: {e}"))?;
+                session.send(reply, terminal)?;
             }
-            let next = session.send(wire::command(wire::DISPATCH), wire::MISS)?;
-            let stale = old.finish()?;
-            session.deliver(stale, wire::STALE)?;
-            // Adversarial transport injection independently exercises resident guard.
-            session.send(stale, wire::STALE)?;
-            session.compile_and_deliver(next)?;
+            if scenario == "cold" && !allocated {
+                session.send(wire::command(wire::DISPATCH), wire::EXECUTED)?;
+            }
         }
-        "capacity" => {
-            session.send(wire::command(wire::DISPATCH), wire::BUSY)?;
-            session.compile_and_deliver(first)?;
-            session.send(wire::command(wire::DISPATCH), wire::EXECUTED)?;
+    } else {
+        let first = session.send(wire::command(wire::DISPATCH), wire::MISS)?;
+        match scenario {
+            "live" => {
+                session.compile_and_deliver(first)?;
+                session.send(wire::command(wire::DISPATCH), wire::EXECUTED)?;
+                session.source_change()?;
+                let next = session.send(wire::command(wire::DISPATCH), wire::MISS)?;
+                session.compile_and_deliver(next)?;
+                session.send(wire::command(wire::CONTEXT), wire::CHANGED)?;
+                let next = session.send(wire::command(wire::DISPATCH), wire::MISS)?;
+                session.compile_and_deliver(next)?;
+            }
+            "source_stale" | "context_stale" | "cancel" => {
+                let old = session.start_producer(first)?;
+                if scenario == "source_stale" {
+                    session.source_change()?;
+                } else if scenario == "context_stale" {
+                    session.send(wire::command(wire::CONTEXT), wire::CHANGED)?;
+                } else {
+                    let mut p = wire::command(wire::CANCEL);
+                    p[2] = first[2];
+                    p[5] = first[5];
+                    session.send(p, wire::CANCELLED)?;
+                }
+                let next = session.send(wire::command(wire::DISPATCH), wire::MISS)?;
+                let stale = old.finish()?;
+                session.deliver(stale, wire::STALE)?;
+                // Adversarial transport injection independently exercises resident guard.
+                session.send(stale, wire::STALE)?;
+                session.compile_and_deliver(next)?;
+            }
+            "capacity" => {
+                session.send(wire::command(wire::DISPATCH), wire::BUSY)?;
+                session.compile_and_deliver(first)?;
+                session.send(wire::command(wire::DISPATCH), wire::EXECUTED)?;
+            }
+            "bad_reply" => {
+                let good = session.start_producer(first)?.finish()?;
+                let mut bad = good;
+                bad[5] ^= 1;
+                session.deliver(bad, wire::STALE)?;
+                session.send(bad, wire::STALE)?;
+                bad = good;
+                bad[7] ^= 1;
+                session.deliver(bad, wire::BAD_REPLY)?;
+                session.send(bad, wire::BAD_REPLY)?;
+                session.deliver(good, wire::EXECUTED)?;
+            }
+            _ => unreachable!(),
         }
-        "bad_reply" => {
-            let good = session.start_producer(first)?.finish()?;
-            let mut bad = good;
-            bad[5] ^= 1;
-            session.deliver(bad, wire::STALE)?;
-            session.send(bad, wire::STALE)?;
-            bad = good;
-            bad[7] ^= 1;
-            session.deliver(bad, wire::BAD_REPLY)?;
-            session.send(bad, wire::BAD_REPLY)?;
-            session.deliver(good, wire::EXECUTED)?;
-        }
-        _ => unreachable!(),
+    }
+    if args[2] == "i3-partial" {
+        session.send(
+            wire::command(natemu_abi::recovery::PARTIAL_COMMAND),
+            natemu_abi::recovery::PARTIAL_DONE,
+        )?;
     }
     let p = wire::command(wire::SHUTDOWN);
     for (i, &v) in p.iter().enumerate() {
@@ -318,8 +455,59 @@ pub fn run(args: &[String]) -> Result<()> {
     {
         return Err("bad final runtime state/profile".into());
     }
+    let extra = if let Some(before) = paging_before {
+        format!(
+            ",\"paging\":{}",
+            super::recovery::report(&session.vm, &before, &tables_before)
+        )
+    } else {
+        String::new()
+    };
+    let extra = if allocated {
+        format!(
+            "{extra},\"allocated\":{}",
+            super::recovery::allocated_report(
+                &session.vm,
+                &initial,
+                if s.lifecycle.executions > 0 {
+                    &session.initial
+                } else {
+                    &s.captured
+                }
+            )
+        )
+    } else {
+        extra
+    };
+    let extra = if args[2] == "i3-helper" {
+        format!(
+            "{extra},\"helper\":{}",
+            super::recovery::helper_report(&session.vm)
+        )
+    } else {
+        extra
+    };
+    let extra = if args[2] == "i3-partial" {
+        format!(
+            "{extra},\"partial\":{}",
+            super::recovery::partial_report(&session.vm)
+        )
+    } else {
+        extra
+    };
+    let case = if args[2] == "i3-partial" {
+        "i3-partial"
+    } else if args[2] == "i3-helper" {
+        "i3-helper"
+    } else if allocated {
+        if fp { "i3-fp" } else { "i3-pressure" }
+    } else if i3 {
+        "i3"
+    } else {
+        "i2"
+    };
     println!(
-        "{{\"case\":\"i2\",\"scenario\":\"{scenario}\",\"vm\":{cookie},\"events\":[{}],\"executions\":[{}],\"requests\":{:?},\"final_pending\":{},\"final_executions\":{},\"final_status\":{}}}",
+        "{{\"case\":\"{case}\",\"scenario\":\"{scenario}\",\"vm\":{cookie},\"events\":[{}],\"executions\":[{}],\"requests\":{:?},\"final_pending\":{},\"final_executions\":{},\"final_status\":{}{extra}}}",
         session.events.join(","),
         session.executions.join(","),
         session.requests,
@@ -327,6 +515,7 @@ pub fn run(args: &[String]) -> Result<()> {
         s.lifecycle.executions,
         s.status
     );
+
     Ok(())
 }
 

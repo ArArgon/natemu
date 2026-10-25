@@ -3,7 +3,7 @@
 Grow one working emulator through bounded, tested increments. The owner decisions
 of October 25, 2026 are: Rust for most new code, host-side FEX first, ABI and
 producer/runtime development together, early performance feedback, and configurable
-N-vCPU design with progressively wider tests. These are implementation directions. I1/I2 now have a finite working path; this
+N-vCPU design with progressively wider tests. These are implementation directions. I1–I3 now have finite working paths; this
 does not establish general correctness or superiority over QEMU.
 
 This is the implementation order and setup entry point. The
@@ -254,6 +254,63 @@ Code replacement occurs only after complete capture, with no retained continuati
 into the old slot. Those wider protocols, helper/fault recovery and SMP remain
 I3/I4 work.
 
+### I3 recovery, paging and allocated maps
+
+Run all earlier checks plus the finite I3 matrix with:
+
+```sh
+./tools/with-env python3 -B tools/run_i1.py \
+  --name "i3-local-$(date +%Y%m%d-%H%M%S)" \
+  --fragment ../natemu-raw/i1-fex-fragment-20261025-02/live_load.arm64 \
+  --i3-allocated \
+  --producer ../natemu-raw/i1-fex-export-20261025-01/build/Bin/CodeSizeValidation \
+  --allocated-producer ../natemu-raw/i3-producer-probe-20261025-04/build/Bin/CodeSizeValidation
+```
+
+`--i3-paging` runs only the paging subset; it does not satisfy I3. The full command
+adds 12 paging scenarios and 10 allocated-map/FP/helper/partial-effect scenarios.
+The runner snapshots and rebuilds sources, binds both producer binaries, retains
+fresh per-request inputs/outputs and supervises the combined execution bundle
+for at most20 minutes. Both compiler container families use run-specific cleanup.
+The new [producer package](../tools/i3_producer/README.md) records exact inputs,
+adaptation, actual allocation maps and reproduction instructions.
+
+**Implemented finite behavior:** the runtime distinguishes missing ARM shadows
+from x86 #PF using a four-level, 48-bit virtual/40-bit physical walker, 4KiB/2MiB
+leaves, aggregate permissions, WP, NX, SMEP and A/D updates. Read fills stay
+read-only until a write walk establishes permission and dirty state. Faults
+capture all native state and resume only the faulting instruction. Guest faults
+materialize RIP/CR2/error and earlier effects; actual IDT delivery is later work.
+Independent checks cover nonpresent/reserved/permission faults, carry/overflow,
+source-fetch denial and complete unchanged banks. The typed state catalog covers
+GPRs, RIP/RFLAGS, full YMM storage, MXCSR/x87, controls and segment fields.
+
+Fresh FEX compilations now export two35-root maps, with24 real spill slots in a
+768-byte frame and an overwritten load destination. The runtime consumes the
+actual supplied maps. The finite admission profile compares code/maps with
+machine-produced pinned artifacts; it does not accept arbitrary FEX output.
+Request-bound chunks transport the1168-byte export without host writes to VM RAM.
+Full-register ERET entry and direct-branch return preserve allocated x16/x30 roots;
+separate-stack capture preserves spills. This intentionally conservative recovery
+profile is not a measured optimal register-allocation policy.
+
+A resident SETZ helper stages overlapping outputs, deliberately clobbers every
+native GPR/Q register plus flags/FP controls, then restores the caller and commits
+only its declared outputs. The admitted ADDPS case checks RN rounding and native
+inexact status becoming guest MXCSR.PE, with caller native FP controls restored.
+A separate resident REP MOVSB fixture uses a counted, changed-on-read device:
+its second byte-store faults after the read, retains that value, and resumes only
+the store. Exact fault-time progress and two reads/two writes are checked.
+The REP input is explicitly admitted through the fixture control interface; it
+is not FEX-generated REP coverage or a complete device backend.
+
+**Remaining scope:** immutable guest tables during each admitted execution,
+aligned same-page generated accesses, one pending object and N=1. General
+instruction coverage, paging/control transitions and invalidation, split accesses,
+code/route changes during retained operations, concurrent composition, complete
+FP/x87 semantics, guest exception delivery, boot and workload performance remain
+open. These finite I3 checks do not complete the full ABI milestone or Track03.
+
 Use `./tools/with-env COMMAND ...` for project builds, checks and runs. It supplies
 the durable sibling `../natemu-raw` as `NATEMU_RAW_ROOT`, independently of the
 caller's working directory, and preserves a nonempty explicit override. It
@@ -290,16 +347,14 @@ working route during I2; do not postpone the producer loop until the ABI is comp
 
 ## Next assignment and reporting
 
-Next is I3: extend this same live producer/runtime path with a bounded generated
-load-fault recovery slice and real x86-table-driven shadow translation. Preserve
-prior effects and current roots, distinguish internal misses from guest faults,
-and keep I1/I2 as regressions. Expand producer metadata with its consumers; finite
-manual bindings do not satisfy the automatic recovery-map requirement. At assignment
-start record a realistic total work/resource bound, checks and stop condition in
-INV-03-01; existing direction authorizes routine choices without another approval
-round. Stop at a demonstrated slice, its bound, or a concrete blocking failure,
-and report the smallest next change. Missing FEX inputs can block its execution
-while independent Rust bring-up proceeds. Do not resurrect historical allowances.
+Next is I4: extend the same runtime to configurable per-vCPU state, stacks and
+queues; first exercise two participants, then three/four with delayed peers,
+concurrent faults and mutation/invalidation. Keep I1–I3 as regressions. Begin with
+one bounded shared-map mutation and acknowledgement path, including a retained
+continuation that cannot reenter stale code. Record its work/resource bound and
+stopping condition in INV-03-01 before execution. N=1 is the only currently
+admitted profile; additional participants must be implemented and tested before
+admission. Final generator selection and boot are not prerequisites to I4.
 
 For each increment record implemented behavior, passed/failed/untested checks,
 tested N, material interface changes, measurements with qualification, and the

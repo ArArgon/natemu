@@ -1,7 +1,7 @@
 #![no_std]
 
 // Same-build I1/I2 records. Pointers are owned native addresses, never guest GPAs.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const PROFILE: u32 = 1;
 pub const IPA: u64 = 0x4000_0000;
 pub const PRIVATE: u64 = 0x0000_8000_4000_0000;
@@ -33,6 +33,9 @@ pub const FEX_OR_BODY: [u8; 44] = {
     body[3] = 0x4e;
     body
 };
+pub mod paging;
+pub mod pressure;
+pub mod recovery;
 pub mod translation;
 pub const SUCCESS: u64 = 1;
 pub const REJECTED: u64 = 2;

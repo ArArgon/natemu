@@ -1,6 +1,7 @@
 use natemu_abi::*;
 use std::{env, ffi::c_void, fs, mem::size_of, ptr};
 
+mod recovery;
 mod translation;
 
 type Result<T> = std::result::Result<T, String>;
@@ -272,14 +273,16 @@ fn page_tables(memory: &Memory) {
         0x16000 + 256 * 8,
         (IPA + DATA_OFFSET as u64) | attrs | (3 << 53),
     );
+    memory.word(0x16000 + 258 * 8, (IPA + 0x72000) | attrs | (3 << 53));
     memory.word(0x12000 + 8, table(0x13000));
     memory.word(0x13000, table(0x14000));
     // Private aliases cover only declared text, tables, state and stacks.
     for offset in (0..RAM_SIZE).step_by(4096) {
         let text = offset < 0x10000 || offset == CODE_OFFSET;
         let writable = (0x10000..0x17000).contains(&offset)
-            || offset == SHARED_OFFSET
-            || offset == BANK_OFFSET
+            || (SHARED_OFFSET..SHARED_OFFSET + 0x8000).contains(&offset)
+            || (BANK_OFFSET..BANK_OFFSET + 0x2000).contains(&offset)
+            || (0x70000..0x84000).contains(&offset)
             || (0x50000..0x54000).contains(&offset)
             || (0x60000..0x64000).contains(&offset);
         if text || writable {
@@ -335,7 +338,13 @@ fn run() -> Result<()> {
     if a.len() != 7 {
         return Err("usage: natemu-host RUNTIME.elf FEX.arm64 control|live_load|fault VECTOR none|version|profile|size|target|entry|code|address|vcpu N".into());
     }
-    if a[2] == "i2" {
+    if a[2] == "i2"
+        || a[2] == "i3"
+        || a[2] == "i3-pressure"
+        || a[2] == "i3-fp"
+        || a[2] == "i3-helper"
+        || a[2] == "i3-partial"
+    {
         return translation::run(&a);
     }
     let configured: usize = a[6].parse().map_err(|_| "invalid vCPU count")?;

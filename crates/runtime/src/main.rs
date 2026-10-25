@@ -7,6 +7,10 @@ use core::{
     ptr,
 };
 use natemu_abi::*;
+mod helper;
+mod partial;
+mod pressure;
+mod recovery;
 mod translation;
 
 global_asm!(include_str!("gates.S"),
@@ -28,6 +32,27 @@ unsafe extern "C" {
     fn returned();
 }
 
+// Copy quiescent owner records without LLVM expanding aggregate volatile loads
+// into thousands of byte instructions. MaybeUninit preserves structure padding.
+#[inline(never)]
+unsafe fn copy_record(dst: *mut u8, src: *const u8, count: usize) {
+    for i in 0..count {
+        unsafe {
+            let b = ptr::read_volatile(src.add(i).cast::<core::mem::MaybeUninit<u8>>());
+            ptr::write_volatile(dst.add(i).cast::<core::mem::MaybeUninit<u8>>(), b);
+        }
+    }
+}
+unsafe fn read_record<T: Copy>(src: *const T) -> T {
+    let mut result = core::mem::MaybeUninit::<T>::uninit();
+    unsafe {
+        copy_record(result.as_mut_ptr().cast(), src.cast(), size_of::<T>());
+        result.assume_init()
+    }
+}
+unsafe fn write_record<T: Copy>(dst: *mut T, value: T) {
+    unsafe { copy_record(dst.cast(), (&raw const value).cast(), size_of::<T>()) }
+}
 fn shared() -> *mut Shared {
     (PRIVATE + SHARED_OFFSET as u64) as *mut Shared
 }
@@ -58,11 +83,11 @@ unsafe extern "C" fn runtime_main() -> ! {
         if current_el != 4 || sctlr & 0x1005 != 0x1005 || actlr & 2 != 2 {
             stop(PANIC, 10);
         }
-        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::translation::MODE {
+        if ptr::read_volatile(&raw const (*s).mode) >= natemu_abi::translation::MODE {
             translation::initialize();
         }
         let object = ptr::read_volatile(&raw const (*s).object);
-        let mut initial = ptr::read_volatile(&raw const (*s).initial);
+        let mut initial = read_record(&raw const (*s).initial);
         if object.code_length > 48 {
             stop(REJECTED, 3);
         }
@@ -73,7 +98,7 @@ unsafe extern "C" fn runtime_main() -> ! {
         let capture_pc = returned as *const () as u64;
         initial.x[16] = CODE_VA;
         initial.x[30] = capture_pc;
-        ptr::write_volatile(&raw mut (*s).initial, initial);
+        write_record(&raw mut (*s).initial, initial);
         ptr::write_volatile(&raw mut (*s).capture_pc, capture_pc);
         asm!("dsb ish", "ic iallu", "dsb ish", "isb");
         enter(&raw const (*s).initial);
@@ -84,7 +109,7 @@ unsafe extern "C" fn runtime_main() -> ! {
 unsafe extern "C" fn finish(frame: *const NativeFrame, fault: u64) -> ! {
     unsafe {
         let s = shared();
-        ptr::write_volatile(&raw mut (*s).captured, ptr::read_volatile(frame));
+        write_record(&raw mut (*s).captured, read_record(frame));
         if fault != 0 {
             let esr: u64;
             let far: u64;
@@ -96,9 +121,22 @@ unsafe extern "C" fn finish(frame: *const NativeFrame, fault: u64) -> ! {
             ptr::write_volatile(&raw mut (*s).far, far);
             ptr::write_volatile(&raw mut (*s).elr, elr);
             ptr::write_volatile(&raw mut (*s).spsr, spsr);
+            if ptr::read_volatile(&raw const (*s).mode) >= natemu_abi::recovery::MODE {
+                if partial::owns(elr) {
+                    partial::fault();
+                }
+                recovery::fault();
+            }
             stop(NATIVE_FAULT, 0);
         }
-        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::translation::MODE {
+        if ptr::read_volatile(&raw const (*s).mode) >= natemu_abi::translation::MODE {
+            if ptr::read_volatile(&raw const (*s).mode) >= natemu_abi::recovery::MODE {
+                if pressure::enabled() {
+                    pressure::completed()
+                } else {
+                    recovery::completed()
+                };
+            }
             translation::completed();
         }
         stop(SUCCESS, 0);

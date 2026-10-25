@@ -81,8 +81,8 @@ def reference(scenario, vm):
             packet_event = EVENTS[action]
         padded = source + bytes(24 - len(source))
         words = [int.from_bytes(padded[i:i + 8], "little") for i in (0, 8, 16)]
-        packet = [packet_event, 2, pending, source_generation, context_generation,
-                  vm, 17, *words, 1, 0, DATA + 512, issued, completed, issued]
+        packet = [packet_event, 3, pending, source_generation, context_generation,
+                  vm, 17, *words, 1, 0, DATA + 8192, issued, completed, issued]
         rows.append({"origin": "host" if host else "resident", "event": EVENTS[action],
                      "packet": packet, "pending": pending, "cached": cached,
                      "rejections": rejected, "busy": busy, "cancellations": cancelled})

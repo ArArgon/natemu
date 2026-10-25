@@ -14,9 +14,17 @@ pub unsafe fn initialize() -> ! {
         if vm == 0 {
             stop(PANIC, 20);
         }
-        ptr::write_volatile(&raw mut (*s).lifecycle, wire::Lifecycle::new(vm));
+        let mut state = wire::Lifecycle::new(vm);
+        if pressure::enabled() {
+            state.variant = if pressure::fp() { 3 } else { 2 };
+            pressure::initialize();
+        }
+        ptr::write_volatile(&raw mut (*s).lifecycle, state);
         ptr::write_volatile(&raw mut (*s).service_pc, service_resume as *const () as u64);
-        ptr::copy_nonoverlapping(wire::XOR.as_ptr(), wire::SOURCE_VA as *mut u8, 17);
+        ptr::copy_nonoverlapping(state.source().as_ptr(), wire::SOURCE_VA as *mut u8, 17);
+        if ptr::read_volatile(&raw const (*s).mode) >= natemu_abi::recovery::MODE {
+            super::recovery::initialize();
+        }
         restart_dispatch();
     }
 }
@@ -31,16 +39,16 @@ pub unsafe fn completed() -> ! {
             .unwrap_or_else(|| stop(PANIC, 21));
         state.event = wire::EXECUTED;
         // Return has captured the current roots. Never restore the original seed.
-        ptr::write_volatile(
-            &raw mut (*s).initial,
-            ptr::read_volatile(&raw const (*s).captured),
-        );
+        write_record(&raw mut (*s).initial, read_record(&raw const (*s).captured));
         ptr::write_volatile(&raw mut (*s).lifecycle, state);
+        if pressure::enabled() {
+            pressure::dispatch_after_completion();
+        }
         restart_dispatch();
     }
 }
 
-unsafe fn replace_code(body: &[u8; 44]) {
+pub unsafe fn replace_bytes(body: &[u8]) {
     unsafe {
         let pte = (PRIVATE + 0x14000 + (CODE_OFFSET / 4096 * 8) as u64) as *mut u64;
         let attrs = 3 | 1 << 10 | 3 << 8;
@@ -52,15 +60,15 @@ unsafe fn replace_code(body: &[u8; 44]) {
         };
         // No execution or saved native continuation into the slot is live here.
         update((IPA + CODE_OFFSET as u64) | attrs | (3 << 53));
-        ptr::copy_nonoverlapping(body.as_ptr(), CODE_VA as *mut u8, 44);
-        ptr::copy_nonoverlapping(RET.as_ptr(), (CODE_VA + 44) as *mut u8, 4);
+        ptr::copy_nonoverlapping(body.as_ptr(), CODE_VA as *mut u8, body.len());
+
         // Four-byte stepping covers every cache line without a host-line-size premise.
-        for offset in (0..48).step_by(4) {
-            asm!("dc cvau, {0}",in(reg)CODE_VA+offset);
+        for offset in (0..body.len()).step_by(4) {
+            asm!("dc cvau, {0}",in(reg)CODE_VA+offset as u64);
         }
         asm!("dsb ish");
-        for offset in (0..48).step_by(4) {
-            asm!("ic ivau, {0}",in(reg)CODE_VA+offset);
+        for offset in (0..body.len()).step_by(4) {
+            asm!("ic ivau, {0}",in(reg)CODE_VA+offset as u64);
         }
         asm!("dsb ish", "isb");
         update((IPA + CODE_OFFSET as u64) | attrs | (1 << 7));
@@ -69,6 +77,9 @@ unsafe fn replace_code(body: &[u8; 44]) {
 
 unsafe fn execute(state: wire::Lifecycle) -> ! {
     unsafe {
+        if pressure::enabled() {
+            pressure::execute(state);
+        }
         let s = shared();
         let kind = if state.variant == 0 {
             LIVE_LOAD
@@ -76,7 +87,7 @@ unsafe fn execute(state: wire::Lifecycle) -> ! {
             LIVE_OR
         };
         let object = Object::new(kind);
-        let mut frame = ptr::read_volatile(&raw const (*s).initial);
+        let mut frame = read_record(&raw const (*s).initial);
         let code = core::slice::from_raw_parts(CODE_VA as *const u8, 48);
         if state.pending != 0 || state.cached != 1 {
             stop(PANIC, 22);
@@ -88,7 +99,7 @@ unsafe fn execute(state: wire::Lifecycle) -> ! {
         frame.x[16] = CODE_VA;
         frame.x[30] = returned as *const () as u64;
         ptr::write_volatile(&raw mut (*s).object, object);
-        ptr::write_volatile(&raw mut (*s).initial, frame);
+        write_record(&raw mut (*s).initial, frame);
         ptr::write_volatile(&raw mut (*s).capture_pc, frame.x[30]);
         ptr::write_volatile(&raw mut (*s).lifecycle, state);
         enter(&raw const (*s).initial);
@@ -112,7 +123,15 @@ pub unsafe extern "C" fn runtime_dispatch() -> ! {
                 state.event = wire::BAD_REPLY;
             } else {
                 state.event = match packet[0] {
-                    wire::DISPATCH => match state.dispatch() {
+                    wire::DISPATCH => match if ptr::read_volatile(&raw const (*s).mode)
+                        >= natemu_abi::recovery::MODE
+                        && state.cached == 0
+                        && !super::recovery::fetch()
+                    {
+                        Ok(natemu_abi::recovery::PAGE_FAULT)
+                    } else {
+                        state.dispatch()
+                    } {
                         Ok(wire::EXECUTED) => execute(state),
                         Ok(event) => event,
                         Err(_) => stop(PANIC, 23),
@@ -124,7 +143,14 @@ pub unsafe extern "C" fn runtime_dispatch() -> ! {
                             }
                             ptr::copy_nonoverlapping(
                                 source.as_ptr(),
-                                wire::SOURCE_VA as *mut u8,
+                                if ptr::read_volatile(&raw const (*s).mode)
+                                    >= natemu_abi::recovery::MODE
+                                {
+                                    (PRIVATE + natemu_abi::recovery::SOURCE_OFFSET as u64)
+                                        as *mut u8
+                                } else {
+                                    wire::SOURCE_VA as *mut u8
+                                },
                                 17,
                             );
                             asm!("dsb ish");
@@ -148,13 +174,27 @@ pub unsafe extern "C" fn runtime_dispatch() -> ! {
                             if actual != state.source() {
                                 stop(PANIC, 26);
                             }
-                            replace_code(&body);
+                            let mut code = [0u8; 48];
+                            code[..44].copy_from_slice(&body);
+                            code[44..].copy_from_slice(&RET);
+                            replace_bytes(&code);
                             state.cached = 1;
                             state.pending = 0;
                             execute(state);
                         }
                         Err(e) => e,
                     },
+                    natemu_abi::pressure::BEGIN
+                    | natemu_abi::pressure::CHUNK
+                    | natemu_abi::pressure::COMMIT
+                        if pressure::enabled() =>
+                    {
+                        match pressure::receive(&mut state, &packet) {
+                            Ok(()) => natemu_abi::pressure::ACK,
+                            Err(e) => e,
+                        }
+                    }
+                    natemu_abi::recovery::PARTIAL_COMMAND if partial::enabled() => partial::run(),
                     wire::SHUTDOWN => {
                         if state.pending != 0 {
                             stop(REJECTED, 27);

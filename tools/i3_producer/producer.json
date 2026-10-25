@@ -1,0 +1,68 @@
+{
+  "schema": "natemu.i3.producer-inputs.v1",
+  "pin": "48d71752e2a363d5535181f803b0b0e9666c1825",
+  "image": "sha256:27475cb39ecb4500d02b7c6e73c9d598e8d9f0736f0dc217d2d985e5cbe01aac",
+  "binary_sha256": "cef6a909ad1427018f33c2896a97975e2244e4ba776439d661cd7f75a83f6fe2",
+  "binary": "/Users/liaozping/orca/natemu-raw/i3-producer-probe-20261025-04/build/Bin/CodeSizeValidation",
+  "run": "/Users/liaozping/orca/natemu-raw/i3-producer-probe-20261025-04",
+  "run_manifest_sha256": "5e682b84940feb64a565da49d7f38baf7426314280bf07ff7515c689d1f583e2",
+  "source_archive_sha256": "97df6a9ccd3b870b7616a294afc8e637aeab8cb1d85bb70fb4ca0538942b6079",
+  "dependency_overlay_sha256": "17434ad9b7e62abaea61613ce35fda968e12b55c8d7314e9fba7a8c47d6cc701",
+  "profile": "conservative 35-root recovery copies; actual FEX allocator spills; not a natural/minimal-overhead profile",
+  "build_order": [
+    "Populate a fresh pinned upstream tree with the exact retained dependency overlay.",
+    "sh tools/i3_producer/build.sh upstream build inside the pinned ARM64 Linux image.",
+    "No guest execution is part of this producer build."
+  ],
+  "compiler": "Clang19.1.7;LinuxARM64",
+  "entry_gpr_bindings": {
+    "RAX": 4,
+    "RBX": 6,
+    "RCX": 7,
+    "RDX": 5,
+    "RSI": 10,
+    "RDI": 11,
+    "RBP": 9,
+    "RSP": 8,
+    "R8": 12,
+    "R9": 13,
+    "R10": 14,
+    "R11": 15,
+    "R12": 16,
+    "R13": 17,
+    "R14": 19,
+    "R15": 29
+  },
+  "entry_vector_bindings": {
+    "XMM0.low": 16,
+    "XMM1.low": 17,
+    "XMM2.low": 18,
+    "XMM3.low": 19,
+    "XMM4.low": 20,
+    "XMM5.low": 21,
+    "XMM6.low": 22,
+    "XMM7.low": 23,
+    "XMM8.low": 24,
+    "XMM9.low": 25,
+    "XMM10.low": 26,
+    "XMM11.low": 27,
+    "XMM12.low": 28,
+    "XMM13.low": 29,
+    "XMM14.low": 30,
+    "XMM15.low": 31
+  },
+  "entry_flags": {
+    "pf_raw": "x26",
+    "af_raw": "x27",
+    "nzcv": "native NZCV; carry inverted at entry"
+  },
+  "canonical_state_accesses_in_body": [],
+  "excluded_prefix": "ADR x0; STR x0,[x28,#0] writes FEX InlineJITBlockHeader. Body begins afterward; no FEX canonical-bank layout required.",
+  "publication_requirements": [
+    "bind immutable code/maps and native spill frame lifetime",
+    "bind runtime-owned unchanged banks; metadata alone does not establish bank currency",
+    "preserve/restore return target: x30 is allocator scratch",
+    "admit aligned16byte same-page vector destination before faultable execution",
+    "map nativeFPSR sticky bits into admitted x86MXCSR status; upstream GetMXCSR is not used"
+  ]
+}

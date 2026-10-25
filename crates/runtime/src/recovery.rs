@@ -1,0 +1,208 @@
+use super::*;
+use natemu_abi::{
+    paging::{self, Access, Fault, Tables},
+    recovery::*,
+};
+
+unsafe extern "C" {
+    fn resume_exception(frame: *const NativeFrame, pc: u64, spsr: u64) -> !;
+    fn leave_exception() -> !;
+}
+fn state() -> *mut Recovery {
+    STATE_VA as *mut Recovery
+}
+fn guest() -> *mut GuestState {
+    GUEST_VA as *mut GuestState
+}
+struct OwnedTables;
+impl Tables for OwnedTables {
+    fn read(&mut self, gpa: u64) -> Option<u64> {
+        if !(0x1000..0x5000).contains(&gpa) || gpa & 7 != 0 {
+            return None;
+        }
+        Some(unsafe {
+            ptr::read_volatile((PRIVATE + TABLE_OFFSET as u64 + gpa - 0x1000) as *const u64)
+        })
+    }
+    fn write(&mut self, gpa: u64, value: u64) -> bool {
+        if !(0x1000..0x5000).contains(&gpa) || gpa & 7 != 0 {
+            return false;
+        }
+        unsafe {
+            ptr::write_volatile(
+                (PRIVATE + TABLE_OFFSET as u64 + gpa - 0x1000) as *mut u64,
+                value,
+            );
+            asm!("dsb ish");
+        }
+        true
+    }
+}
+unsafe fn mapping(page: u64, entry: u64) {
+    unsafe {
+        let pte = (PRIVATE + 0x16000 + (page >> 12) * 8) as *mut u64;
+        ptr::write_volatile(pte, 0);
+        asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
+        ptr::write_volatile(pte, entry);
+        asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
+    }
+}
+pub unsafe fn initialize() {
+    unsafe {
+        mapping(DATA_VA, 0);
+    }
+}
+pub unsafe fn walk(address: u64, access: Access) -> Result<paging::Translation, Fault> {
+    unsafe {
+        let r = state();
+        let n = ptr::read_volatile(&raw const (*r).walks);
+        ptr::write_volatile(&raw mut (*r).walks, n + 1);
+        paging::walk(
+            &mut OwnedTables,
+            ptr::read_volatile(&raw const (*r).control),
+            address,
+            access,
+        )
+    }
+}
+pub unsafe fn guest_fault(address: u64, error: u64, rip: u64) {
+    unsafe {
+        let r = state();
+        ptr::write_volatile(&raw mut (*r).vector, 14);
+        ptr::write_volatile(&raw mut (*r).error, error);
+        ptr::write_volatile(&raw mut (*r).linear, address);
+        ptr::write_volatile(&raw mut (*r).rip, rip);
+        ptr::write_volatile(&raw mut (*guest()).control[1], address);
+        ptr::write_volatile(&raw mut (*guest()).rip, rip);
+    }
+}
+pub unsafe fn fetch() -> bool {
+    unsafe {
+        let rip = natemu_abi::translation::SOURCE_VA;
+        match walk(rip, Access::Fetch) {
+            Ok(t) if t.gpa == rip && t.wb => true,
+            Err(Fault::Page { address, error }) => {
+                guest_fault(address, error, rip);
+                false
+            }
+            _ => stop(REJECTED, 40),
+        }
+    }
+}
+pub unsafe fn completed() {
+    unsafe {
+        let mut g = read_record(guest());
+        let f = read_record(&raw const (*shared()).captured);
+        g.materialize(&f, 17, true);
+        write_record(guest(), g);
+    }
+}
+pub unsafe fn fault() -> ! {
+    unsafe {
+        let s = shared();
+        let r = state();
+        let frame = &*(&raw const (*s).captured);
+        let esr = ptr::read_volatile(&raw const (*s).esr);
+        let far = ptr::read_volatile(&raw const (*s).far);
+        let pc = ptr::read_volatile(&raw const (*s).elr);
+        let spsr = ptr::read_volatile(&raw const (*s).spsr);
+        let (access, width, operand, guest_offset) = if pressure::enabled() {
+            let (i, w, o, g) = pressure::site(pc, frame);
+            (if i == 0 { Access::Read } else { Access::Write }, w, o, g)
+        } else {
+            match pc.checked_sub(CODE_VA) {
+                Some(16) => (Access::Read, 8, frame.x[6], 7),
+                Some(36) => (Access::Write, 16, frame.x[11], 13),
+                _ => stop(NATIVE_FAULT, 41),
+            }
+        };
+        let write = access == Access::Write;
+        if esr >> 26 != 0x25
+            || ((esr >> 6) & 1) != u64::from(write)
+            || !matches!(esr&63,4..=7|12..=15)
+            || far != operand
+            || operand & (width - 1) != 0
+            || operand < DATA_VA
+            || operand + width > DATA_VA + 256
+            || spsr & 15 != 4
+            || frame.sp
+                != if pressure::enabled() {
+                    STACK_TOP - 768
+                } else {
+                    STACK_TOP
+                }
+        {
+            stop(NATIVE_FAULT, 42);
+        }
+        let count = ptr::read_volatile(&raw const (*r).faults) as usize;
+        if count >= MAX_FAULTS {
+            stop(PANIC, 43);
+        }
+        if pressure::enabled() {
+            pressure::materialize(frame, usize::from(write), false);
+            pressure::snapshot(count);
+        } else {
+            let mut g = read_record(guest());
+            g.materialize(frame, guest_offset, false);
+            write_record(guest(), g);
+        }
+        let result = walk(far, access);
+        let (outcome, error) = match result {
+            Ok(_) => (1, 0),
+            Err(Fault::Page { error, .. }) => (2, error),
+            _ => (3, 0),
+        };
+        write_record(
+            &raw mut (*r).trace[count],
+            FaultTrace {
+                frame: *frame,
+                esr,
+                far,
+                elr: pc,
+                spsr,
+                outcome,
+                error,
+            },
+        );
+        ptr::write_volatile(&raw mut (*r).faults, (count + 1) as u64);
+        match result {
+            Ok(t) => {
+                if !t.wb || !(DATA_VA..DATA_VA + 0x3000).contains(&t.gpa) {
+                    stop(REJECTED, 44);
+                }
+                install(far, t);
+                let retries = ptr::read_volatile(&raw const (*r).retries);
+                ptr::write_volatile(&raw mut (*r).retries, retries + 1);
+                resume_exception(&raw const (*s).captured, pc, spsr);
+            }
+            Err(Fault::Page { address, error }) => {
+                guest_fault(
+                    address,
+                    error,
+                    natemu_abi::translation::SOURCE_VA + guest_offset,
+                );
+                write_record(&raw mut (*s).initial, *frame);
+                ptr::write_volatile(&raw mut (*s).lifecycle.event, PAGE_FAULT);
+                if pressure::enabled() {
+                    pressure::restore_native_fp();
+                }
+                leave_exception();
+            }
+            _ => stop(REJECTED, 45),
+        }
+    }
+}
+
+pub unsafe fn install(address: u64, t: paging::Translation) {
+    unsafe {
+        if !t.wb || !(DATA_VA..DATA_VA + 0x3000).contains(&t.gpa) {
+            stop(REJECTED, 44)
+        }
+        let native = IPA + DATA_OFFSET as u64 + (t.gpa - DATA_VA);
+        let rights = if t.writable && t.dirty { 0 } else { 1 << 7 };
+        mapping(
+            address & !4095,
+            (native & !4095) | 3 | (1 << 10) | (3 << 8) | (3 << 53) | rights,
+        );
+    }
+}

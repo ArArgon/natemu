@@ -13,3 +13,7 @@ opt-level = 2
 
 [profile.dev]
 panic = "abort"
+
+# Bounded resident text: avoid unrolling volatile architectural-state copies.
+[profile.release.package.natemu-runtime]
+opt-level = "s"
