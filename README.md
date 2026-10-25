@@ -4,11 +4,11 @@ natemu is building an x86-64 Linux system emulator for Apple Silicon/macOS26,
 using host-side translation and a resident ARM64 runtime inside a VM. The goal is
 material improvement over QEMU TCG within an explicit correctness scope.
 
-**Current state:** I1 runs a real pinned FEX fragment through the Rust host,
-resident runtime and assembly gates on one M4 vCPU. Development checks cover
-register/memory results, rejected objects and contained native faults. The next
-increment connects the live producer loop. Stock Linux boot, concurrent execution
-and end-to-end performance remain ahead; FEX remains a provisional choice.
+**Current state:** I2 connects the Rust resident runtime to a real host-side FEX
+compiler worker. Misses compile admitted x86 bytes, validate replies and execute
+the resulting ARM64 code; checks cover cache reuse, stale replies, cancellation
+and capacity. This is a finite one-vCPU development profile. Paging recovery,
+concurrent execution, stock Linux boot and workload performance remain ahead.
 
 Start with the [implementation plan and local setup](docs/implementation.md).
 It records Rust/assembly/C++ ownership, the early producer loop, N-vCPU design,

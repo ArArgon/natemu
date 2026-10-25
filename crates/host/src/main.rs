@@ -1,6 +1,8 @@
 use natemu_abi::*;
 use std::{env, ffi::c_void, fs, mem::size_of, ptr};
 
+mod translation;
+
 type Result<T> = std::result::Result<T, String>;
 
 #[repr(C)]
@@ -39,6 +41,7 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn munmap(address: *mut c_void, length: usize) -> i32;
     fn sys_icache_invalidate(start: *const c_void, length: usize);
+    fn getentropy(buffer: *mut c_void, length: usize) -> i32;
 }
 
 fn hv(code: i32, operation: &str) -> Result<()> {
@@ -137,13 +140,26 @@ impl Vm {
         }
         Ok(value)
     }
-    fn run(&self) -> Result<()> {
+    fn read_reg(&self, reg: u32) -> Result<u64> {
+        let mut value = 0;
+        unsafe {
+            hv(
+                hv_vcpu_get_reg(self.cpu.unwrap(), reg, &mut value),
+                "read register",
+            )?;
+        }
+        Ok(value)
+    }
+    fn shared(&self) -> Shared {
+        unsafe { ptr::read_volatile(self.memory.0.add(SHARED_OFFSET).cast::<Shared>()) }
+    }
+    fn run(&self, expected: u64) -> Result<()> {
         unsafe {
             hv(hv_vcpu_run(self.cpu.unwrap()), "hv_vcpu_run")?;
             let exit = &*self.exit;
             if exit.reason != 1
                 || exit.exception.syndrome >> 26 != 0x16
-                || exit.exception.syndrome & 0xffff != 0x49
+                || exit.exception.syndrome & 0xffff != expected
             {
                 let mut pc = 0;
                 hv(
@@ -282,39 +298,8 @@ fn frame_json(f: &NativeFrame) -> String {
         f.x, f.q, f.sp, f.nzcv, f.fpcr, f.fpsr
     )
 }
-fn run() -> Result<()> {
-    let a: Vec<_> = env::args().collect();
-    if a.len() != 7 {
-        return Err("usage: natemu-host RUNTIME.elf FEX.arm64 control|live_load|fault VECTOR none|version|profile|size|target|entry|code|address|vcpu N".into());
-    }
-    let configured: usize = a[6].parse().map_err(|_| "invalid vCPU count")?;
-    if configured != 1 {
-        return Err("I1 admits exactly one vCPU; N-vCPU execution is not tested".into());
-    }
-    let kind = match a[3].as_str() {
-        "control" => CONTROL,
-        "live_load" => LIVE_LOAD,
-        "fault" => FAULT,
-        _ => return Err("unknown case".into()),
-    };
-    let index: usize = a[4].parse().map_err(|_| "invalid vector")?;
-    let (left, right) = *[(0, 0), (u64::MAX, 1), (i64::MAX as u64, 1), (1, 2)]
-        .get(index)
-        .ok_or("unknown input vector")?;
-    let fex = read_input(&a[2], 44)?;
-    if fex != FEX_BODY {
-        return Err("FEX artifact does not match pinned I1 producer bytes".into());
-    }
-    let memory = Memory::new()?;
-    load_elf(&memory, &read_input(&a[1], 2 * 1024 * 1024)?)?;
-    page_tables(&memory);
-    let mut code = match kind {
-        CONTROL => NOP.to_vec(),
-        LIVE_LOAD => fex,
-        FAULT => UDF.to_vec(),
-        _ => unreachable!(),
-    };
-    code.extend_from_slice(&RET);
+fn seed(index: usize) -> (NativeFrame, [u8; 512], [u8; 256]) {
+    let (left, right) = [(0, 0), (u64::MAX, 1), (i64::MAX as u64, 1), (1, 2)][index];
     let mut bank = [0; 512];
     for (i, b) in bank.iter_mut().enumerate() {
         *b = (i.wrapping_mul(37) + 19) as u8;
@@ -324,11 +309,8 @@ fn run() -> Result<()> {
         *b = (i.wrapping_mul(13) + 7) as u8;
     }
     data[..8].copy_from_slice(&(0xcafe_1234_5678_9000u64 + index as u64).to_le_bytes());
-    memory.copy(BANK_OFFSET, &bank);
-    memory.copy(DATA_OFFSET, &data);
-    // Each configured participant owns its complete entry/capture storage.
-    let mut frames = vec![NativeFrame::ZERO; configured];
-    let initial = &mut frames[0];
+    let mut frame = NativeFrame::ZERO;
+    let initial = &mut frame;
     for (i, x) in initial.x.iter_mut().enumerate() {
         *x = 0x1234_0000_0000_0000 + (i as u64) * 0x0101_0101;
     }
@@ -346,6 +328,49 @@ fn run() -> Result<()> {
     initial.nzcv = 0xa0000000;
     initial.fpcr = 0x01000000;
     initial.fpsr = 0x08000001;
+    (frame, bank, data)
+}
+fn run() -> Result<()> {
+    let a: Vec<_> = env::args().collect();
+    if a.len() != 7 {
+        return Err("usage: natemu-host RUNTIME.elf FEX.arm64 control|live_load|fault VECTOR none|version|profile|size|target|entry|code|address|vcpu N".into());
+    }
+    if a[2] == "i2" {
+        return translation::run(&a);
+    }
+    let configured: usize = a[6].parse().map_err(|_| "invalid vCPU count")?;
+    if configured != 1 {
+        return Err("I1 admits exactly one vCPU; N-vCPU execution is not tested".into());
+    }
+    let kind = match a[3].as_str() {
+        "control" => CONTROL,
+        "live_load" => LIVE_LOAD,
+        "fault" => FAULT,
+        _ => return Err("unknown case".into()),
+    };
+    let index: usize = a[4].parse().map_err(|_| "invalid vector")?;
+    if index >= 4 {
+        return Err("unknown input vector".into());
+    }
+    let fex = read_input(&a[2], 44)?;
+    if fex != FEX_BODY {
+        return Err("FEX artifact does not match pinned I1 producer bytes".into());
+    }
+    let memory = Memory::new()?;
+    load_elf(&memory, &read_input(&a[1], 2 * 1024 * 1024)?)?;
+    page_tables(&memory);
+    let mut code = match kind {
+        CONTROL => NOP.to_vec(),
+        LIVE_LOAD => fex,
+        FAULT => UDF.to_vec(),
+        _ => unreachable!(),
+    };
+    code.extend_from_slice(&RET);
+    let (frame, bank, data) = seed(index);
+    memory.copy(BANK_OFFSET, &bank);
+    memory.copy(DATA_OFFSET, &data);
+    let mut frames = vec![frame; configured];
+    let initial = &mut frames[0];
     let mut object = Object::new(kind);
     match a[5].as_str() {
         "none" => {}
@@ -375,6 +400,9 @@ fn run() -> Result<()> {
         sctlr: 0,
         actlr: 0,
         tcr: 0,
+        service_pc: 0,
+        mode: 0,
+        lifecycle: natemu_abi::translation::Lifecycle::new(0),
     };
     unsafe {
         ptr::write(memory.0.add(SHARED_OFFSET).cast::<Shared>(), shared);
@@ -395,7 +423,7 @@ fn run() -> Result<()> {
     vm.sys(0xc081, 2)?;
     vm.sys(0xc082, 3 << 20)?;
     vm.sys(0xdf19, 0)?;
-    vm.run()?;
+    vm.run(0x49)?;
     let result = unsafe { ptr::read_volatile(vm.memory.0.add(SHARED_OFFSET).cast::<Shared>()) };
     if result.status == SUCCESS || result.status == NATIVE_FAULT {
         let mut expected_initial = shared.initial;

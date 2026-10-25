@@ -1,5 +1,53 @@
 # INV-03-01 — source findings review
 
+## Current return — I2 live producer, October 25, 2026
+
+Root authored the versioned request lifecycle, host worker binding, resident
+service/publication path, producer worker and retained runner integration.
+Separate `/root/i1_fex_inputs` reproduced fresh XOR/OR compiler inputs and authored
+the semantic and lifecycle/continuity oracles. Independent `/root/i1_code_review`
+reviewed source, SDK/assembly contracts, emitted stack use, oracle coverage and
+producing artifacts, without authoring implementation changes.
+
+**Verdict: ACCEPT finite I2 development; no unresolved substantive blocker.**
+The reviewer found one host-boundary gap: a reply was checked against current
+resident state but not the exact original request issued to its worker. Root
+added immutable per-worker request binding and regressions, including an old
+worker attempting to impersonate a newer context/request. Reviewer rechecked
+and accepted the fix before the final replica. Actual guest-source snapshot reads
+and runtime-request/producer-input/output associations were also checked.
+
+**Independent replica:** `i2-independent-20261025-01`, 22:44:02–22:44:10UTC,
+under the declared external wall/RSS and container limits. All 31 jobs pass:
+nine Rust tests, worker/producer tests, independent oracle controls, builds and
+signing, 14 I1 native cells plus unsupported-N rejection, and six I2 scenarios.
+The reviewer verified 11 fresh FEX invocations in distinct clean containers,
+both XOR/OR native variants, ten I2 executions, all 749 retained checksums and
+25 frozen source files matching the workspace. It rechecked all result oracles,
+request/input/object/reply bindings and the emitted 10,464-byte maximum reviewed
+return/capture path within the 16KiB stack. No replica compiler container remains.
+Root independently verified the final manifest, source equality and checksums.
+The primary development run remains separately retained as
+`i2-development-20261025-01`; producer input replication is
+`i2-producer-probe-20261025-01`. All are under the durable sibling raw root.
+
+**Evidence validity:** independently reproduced exploratory one-vCPU results
+support I2's declared development behavior. Cancellation and changed source/
+context cannot let a late reply consume an occupied replacement slot; the fresh
+reply succeeds afterward. Cache reuse preserves current captured guest state and
+performs no new compile. Invalid host-boundary and resident-transfer controls
+remain distinct. Actual generated computation is preserved inside the admitted
+44-byte leaf; producer prefixes/dispatcher suffix and their relocations are excluded.
+
+**Decision relevance:** I2 is complete and I3 can add recovery/paging to this same
+runtime. The selected worker runs on ARM64 Linux outside the captive VM; it does
+not establish native-macOS compilation latency. Source/context controls and explicit
+fixture redispatch are not general x86 control-flow, self-modification or paging.
+General FEX coverage, automatic recovery maps, helper transitions, concurrency,
+boot and qualified performance remain unestablished. The full ABI milestone and
+Track03 remain open. Review and reproduction stayed within the I2 allowance.
+
+
 ## Current return — I1 first execution, October 25, 2026
 
 Root authored the Rust host/shared ABI/resident runtime, assembly gates and

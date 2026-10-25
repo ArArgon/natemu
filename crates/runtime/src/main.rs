@@ -7,6 +7,7 @@ use core::{
     ptr,
 };
 use natemu_abi::*;
+mod translation;
 
 global_asm!(include_str!("gates.S"),
     frame_size=const size_of::<NativeFrame>(),
@@ -57,6 +58,9 @@ unsafe extern "C" fn runtime_main() -> ! {
         if current_el != 4 || sctlr & 0x1005 != 0x1005 || actlr & 2 != 2 {
             stop(PANIC, 10);
         }
+        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::translation::MODE {
+            translation::initialize();
+        }
         let object = ptr::read_volatile(&raw const (*s).object);
         let mut initial = ptr::read_volatile(&raw const (*s).initial);
         if object.code_length > 48 {
@@ -93,6 +97,9 @@ unsafe extern "C" fn finish(frame: *const NativeFrame, fault: u64) -> ! {
             ptr::write_volatile(&raw mut (*s).elr, elr);
             ptr::write_volatile(&raw mut (*s).spsr, spsr);
             stop(NATIVE_FAULT, 0);
+        }
+        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::translation::MODE {
+            translation::completed();
         }
         stop(SUCCESS, 0);
     }

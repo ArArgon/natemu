@@ -1,7 +1,7 @@
 #![no_std]
 
-// Same-build I1 records. Pointers are owned native addresses, never guest GPAs.
-pub const VERSION: u32 = 1;
+// Same-build I1/I2 records. Pointers are owned native addresses, never guest GPAs.
+pub const VERSION: u32 = 2;
 pub const PROFILE: u32 = 1;
 pub const IPA: u64 = 0x4000_0000;
 pub const PRIVATE: u64 = 0x0000_8000_4000_0000;
@@ -26,6 +26,14 @@ pub const UDF: [u8; 4] = 0u32.to_le_bytes();
 pub const CONTROL: u32 = 1;
 pub const LIVE_LOAD: u32 = 2;
 pub const FAULT: u32 = 3;
+pub const LIVE_OR: u32 = 4;
+pub const FEX_OR_BODY: [u8; 44] = {
+    let mut body = FEX_BODY;
+    body[2] = 0xb1;
+    body[3] = 0x4e;
+    body
+};
+pub mod translation;
 pub const SUCCESS: u64 = 1;
 pub const REJECTED: u64 = 2;
 pub const NATIVE_FAULT: u64 = 3;
@@ -78,7 +86,11 @@ impl Object {
             size: core::mem::size_of::<Self>() as u32,
             kind,
             code_address: CODE_VA,
-            code_length: if kind == LIVE_LOAD { 48 } else { 8 },
+            code_length: if kind == LIVE_LOAD || kind == LIVE_OR {
+                48
+            } else {
+                8
+            },
             entry_offset: 0,
             vcpu_id: 0,
             configured_vcpus: 1,
@@ -107,6 +119,7 @@ impl Object {
         let body: &[u8] = match self.kind {
             CONTROL => &NOP,
             LIVE_LOAD => &FEX_BODY,
+            LIVE_OR => &FEX_OR_BODY,
             FAULT => &UDF,
             _ => return Err(4),
         };
@@ -117,7 +130,9 @@ impl Object {
         if frame.sp != STACK_TOP || frame.x[28] != BANK_VA || frame.reserved != 0 {
             return Err(6);
         }
-        if self.kind == LIVE_LOAD && (frame.x[6] != DATA_VA || frame.x[11] != DATA_VA + 128) {
+        if (self.kind == LIVE_LOAD || self.kind == LIVE_OR)
+            && (frame.x[6] != DATA_VA || frame.x[11] != DATA_VA + 128)
+        {
             return Err(7);
         }
         Ok(())
@@ -141,6 +156,9 @@ pub struct Shared {
     pub sctlr: u64,
     pub actlr: u64,
     pub tcr: u64,
+    pub service_pc: u64,
+    pub mode: u64,
+    pub lifecycle: translation::Lifecycle,
 }
 
 const _: () = assert!(core::mem::size_of::<Shared>() <= 4096);

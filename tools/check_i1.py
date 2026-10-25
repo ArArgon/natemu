@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Independent semantic oracle for finite I1 host JSON cells; executes no guest.
+"""Independent semantic oracle for finite I1/I2 host JSON cells; executes no guest.
 
 The x86 fixture is PXOR xmm0,xmm1; ADD rcx,rdx; MOV rax,[rbx];
 SETZ dl; MOVDQU [rdi],xmm0. Expected guest effects use integer/byte arithmetic.
+I2's live_or substitutes POR xmm0,xmm1; it has the same scalar/flags effects.
 FEX pin 48d71752e2a363d5535181f803b0b0e9666c1825 binds RAX/RCX/RDX/RBX/RDI
 to x4/x7/x5/x6/x11 and XMM0/1 to q16/17. Its unchanged 44-byte body also
 leaves the ADD result in x26, the original operands' XOR in x27, and SETZ
@@ -15,6 +16,8 @@ PF is even low-byte parity; AF is carry from the low nibble. We compare those
 independent definitions with the captured FEX deferred-root reconstruction.
 Source/bindings: experiments/track03/codegen-checkpoint/fixtures.json and
 experiments/track03/codegen-comparison/README.md, "Captive leaf extraction".
+The fresh i2-producer-probe-20261025-01 run verifies POR changes only the first
+native instruction (EOR to ORR), retaining the same producer roots and sites.
 """
 
 import argparse
@@ -81,7 +84,7 @@ def add_flags(lhs, rhs):
 def check(cell):
     require(type(cell) is dict, "expected one JSON object per file")
     case = cell["case"]
-    statuses = {"control": 1, "live_load": 1, "fault": 3, "reject": 2}
+    statuses = {"control": 1, "live_load": 1, "live_or": 1, "fault": 3, "reject": 2}
     require(case in statuses, f"unsupported case: {case!r}")
     equal(uint(cell["status"], 32, "status"), statuses[case], "status")
     before = values(cell["memory_before"], 256, 8, "memory_before")
@@ -103,7 +106,7 @@ def check(cell):
     expected["x"][16] = cell["object_pc"]
     expected["x"][30] = cell["capture_pc"]
 
-    if case == "live_load":
+    if case in ("live_load", "live_or"):
         base = uint(cell["memory_base"], 64, "memory_base")
         require(base <= (1 << 64) - 256, "memory range wraps")
         load_address, store_address = initial["x"][6], initial["x"][11]
@@ -113,7 +116,8 @@ def check(cell):
         require(load + 8 <= store or store + 16 <= load, "overlapping operand regions outside I1 profile")
         lhs, rhs = initial["x"][7], initial["x"][5]
         result, flags = add_flags(lhs, rhs)
-        vector = [a ^ b for a, b in zip(initial["q"][16], initial["q"][17])]
+        vector = [(a | b) if case == "live_or" else (a ^ b)
+                  for a, b in zip(initial["q"][16], initial["q"][17])]
         expected["x"][4] = int.from_bytes(bytes(before[load:load + 8]), "little")
         expected["x"][7] = result
         expected["x"][5] = (rhs & ~255) | flags["ZF"]
@@ -186,6 +190,15 @@ def self_test():
     out["q"][16] = [a ^ b for a, b in zip(initial["q"][16], initial["q"][17])]
     live["memory_after"][64:80] = out["q"][16]
     check(live)
+    live_or = copy.deepcopy(live)
+    live_or["case"] = "live_or"
+    live_or["initial"]["q"][16] = [0xAA] * 16
+    for s in (live_or["initial"], live_or["captured"]):
+        s["q"][17] = [0x0F] * 16
+    # Known answer in every lane: AA OR 0F = AF; AA XOR 0F would be A5.
+    live_or["captured"]["q"][16] = [0xAF] * 16
+    live_or["memory_after"][64:80] = [0xAF] * 16
+    check(live_or)
     for lhs, rhs, result, flags in (
         (0, 0, 0, (0, 1, 0, 0, 1, 0)),
         (0x7FFFFFFFFFFFFFFF, 1, 0x8000000000000000, (0, 0, 1, 1, 1, 1)),
@@ -212,6 +225,10 @@ def self_test():
         ("fault mode", fault, lambda c: c["fault"].__setitem__("spsr", 0)),
         ("reject side effect", rejected, lambda c: c["memory_after"].__setitem__(0, 1)),
         ("panic", cell, lambda c: c.__setitem__("status", 4)),
+        ("OR lower lane", live_or, lambda c: c["captured"]["q"][16].__setitem__(0, 0xA5)),
+        ("OR upper lane", live_or, lambda c: c["captured"]["q"][16].__setitem__(15, 0xA5)),
+        ("OR store", live_or, lambda c: c["memory_after"].__setitem__(79, 0xA5)),
+        ("XOR mislabeled OR", live, lambda c: c.__setitem__("case", "live_or")),
     ]
     for name, original, mutate in mutations:
         bad = copy.deepcopy(original)
@@ -221,7 +238,7 @@ def self_test():
         except ValueError:
             continue
         raise ValueError("failed to reject corruption: " + name)
-    print(f"PASS: four valid cases, four ADD known answers, {len(mutations)} corruption controls")
+    print(f"PASS: five valid cases, four ADD known answers, {len(mutations)} corruption controls")
 
 
 def main():
