@@ -44,6 +44,15 @@ component assessment and Q-00-02 owns the resulting compatibility boundary.
 
 ## Required definitions
 
+The [backlog's scope record](../question-backlog.md#scope) identifies historical
+acceptance labels whose supporting records are unavailable. Before relying on
+them, bind an extant applicable record or resolve the missing definition under
+its existing question. ABI drafting may proceed within the current envelope;
+fixture coverage does not narrow product scope. Concrete workload, compatibility,
+quantitative success and economic inputs remain required before dependent
+comparisons or synthesis use them. Raise consequential scope choices at the
+workflow's [owner checkpoints](../README.md#owner-alignment).
+
 The track must produce, with evidence labels, and with review where
 applicable:
 
@@ -61,8 +70,10 @@ applicable:
   baselines.
 - **Measurable "materially better."** A quantitative definition of what
   materially better than the baselines means — metrics, magnitudes,
-  workloads, and confidence — agreed before any performance evidence is
-  collected, so success cannot be redefined after the fact.
+  workloads, and confidence — agreed before collecting evidence intended to
+  judge product success, so success cannot be redefined after the fact. Bounded
+  component comparisons may proceed with their own predeclared decision criteria;
+  they do not establish that the product is materially better.
 - **Non-goals.** What the project explicitly will not attempt in this phase,
   including deferred platforms, device classes, and security objectives
   beyond isolation and crash containment.

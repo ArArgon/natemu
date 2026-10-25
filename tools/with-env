@@ -1,0 +1,11 @@
+#!/bin/sh
+# Supply project defaults to every child tool, including the frozen runners.
+set -eu
+if [ "$#" -eq 0 ]; then
+    echo "Usage: tools/with-env COMMAND [ARG ...]" >&2
+    exit 2
+fi
+project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+: "${NATEMU_RAW_ROOT:=$project_root/../natemu-raw}"
+export NATEMU_RAW_ROOT
+exec "$@"

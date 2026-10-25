@@ -6,15 +6,73 @@ work formerly organized under [Track 02](02-correctness.md). This charter sets
 requirements; it is not evidence that an architecture already satisfies them.
 Work follows the [research workflow](../README.md).
 
-**Owner-agreed direction, September21: defer codegen selection and establish
-the ARM64 execution ABI and resident VM first.** Hand-written ARM64 payloads
-will exercise explicit state/recovery/lifetime contracts, with FEX-friendly
-bindings where useful. Other architectural findings supply runtime requirements.
-The next deliverable is a provisional ABI and bounded runtime milestone, not a
-complete universal compiler interface. This is a sequencing decision, not an
-accepted ABI or implemented x86 guest. The earlier hybrid preference and Track03
-closure remain withdrawn; no generator is selected by this change. The owner
-requested committing findings before further work.
+**Owner direction, October25: Rust-first construction, host-side FEX first,
+ABI/producer/runtime co-development and configured N-vCPU ownership.** Follow the
+[implementation plan](../../implementation.md) for executable order and setup. Use actual FEX fragments early alongside
+hand-written controls. Existing architectural findings supply requirements;
+unknowns are investigated when they affect the next slice. The earlier hybrid
+preference and Track03 closure remain withdrawn. FEX-first is an implementation
+choice to test, not a final comparative selection or full-emulator result.
+
+## Current milestone — execution ABI and experimental runtime
+
+Track 03 owns both the provisional ABI specification and the bounded experimental
+resident runtime that tests it. [INV-03-01](../investigations/INV-03-01.md) owns
+the decisions, budget, results and next action. Keep the specification in a
+separate document linked from that investigation, with a readable behavior
+contract followed by technical detail. Follow the workflow's
+[owner checkpoints](../README.md#owner-alignment); the owner reviews intended
+behavior and material tradeoffs, while independent reviewers check the details.
+
+[ABI draft 0](../specs/arm64-execution-abi.md) supplies the contract, proposed
+core coverage and producer/Rust/N-vCPU extensions; INV-03-01 owns review status
+and the next assignment. Record fresh per-increment resource bounds; the old
+whole-campaign allowance is not active.
+The specification covers block entry and state locations, resident helper calls, involuntary
+fault capture and recovery metadata, legal event/coordination points, MMU/control
+transitions, and code publication/retirement. Support register-resident guest
+state; distinguish internal block/helper transfers from exits to the host.
+The producer remains responsible for x86 semantics and truthful metadata.
+FEX bindings are concrete first-adapter choices; they do not import its userspace
+policies or require a universal interface for other generators.
+
+Develop the smallest executable slice under the implementation plan: actual FEX
+output through Rust/assembly, an early live producer loop, recovery/paging and
+concurrent composition. Hand-written payloads are controls, not a substitute for
+the producer. Build N-vCPU ownership from the outset; test two then three/four
+before broad ISA expansion. Core T1–T12 and the spec's producer/Rust/N-vCPU
+extensions are acceptance coverage, not prerequisites to the first runnable slice.
+Manual fixture maps do not establish an automatic exporter. Use live generated
+maps and independent expected outcomes as coverage grows.
+
+Measure supported paths throughout, including fragment/helper costs before boot,
+compile/dispatch once the producer loop exists, and small userspace workloads
+from a stock kernel plus initramfs before completing the device set. Boot time
+alone cannot rank general code generation. Preserve the full guest/device target.
+
+Before each increment, record its total preparation, implementation, execution,
+review and correction budget, resource limits and stopping conditions in
+INV-03-01. Previous comparison budgets are exhausted and do not fund this work.
+Use existing experimental infrastructure and retain producing artifacts under
+the workflow; leave the frozen Track 01 program unchanged. Exploration and
+decision evidence keep their respective review and fresh-run requirements.
+
+The milestone completes only when independent findings review accepts the scoped
+ABI and evidence that the declared runtime behaviors, live producer/recovery
+coverage and tested N-vCPU profiles meet their predeclared criteria, with no unresolved defect
+that invalidates that scope. Require independent replication of load-bearing
+observations and a readable report of coverage and limitations. A failed core
+behavior or unestablished fragment fit leaves the milestone incomplete; revise
+and review the design within budget, using owner alignment for material changes.
+If an increment exhausts its bound, report partial results and the precise next
+change; broader construction proceeds through subsequent scoped increments. The ABI remains provisional outside
+its demonstrated scope. This milestone establishes neither stock Linux boot nor
+workload speedup, generator selection or Track 03 closure.
+
+Plan later translator, stock-guest and device slices as the running implementation
+exposes their dependencies. They need concrete scope and checks, not completion
+of every research track first. The current slice does not implicitly include
+the full device set or a complete translator adaptation.
 
 ## Starting point and boundaries
 
@@ -181,6 +239,6 @@ research without inventing an accepted architecture.
 
 The output goes to [synthesis](06-research-synthesis.md). It establishes design
 choices, not correctness of unwritten code or measured end-to-end superiority.
-Planning owns construction details and delivery; implementation still needs its
-separate authorization. Editorial errors are fixed without blocking acceptance;
+Planning and implementation proceed per executable slice under the current
+workflow. Editorial errors are fixed without blocking acceptance;
 substantive correctness, evidence and reproduction defects remain blocking.

@@ -7,9 +7,18 @@ the preceding tracks. It is a roadmap, not a decision. Work on it follows the [r
 
 Track03's prior [claim20 closure](../investigations/INV-03-01.md#clm-03-01-20--performance-led-component-choice-and-current-recomposition)
 is withdrawn; the extension-versus-hybrid comparison ended with insufficiency.
-The owner now defers codegen selection while establishing an execution ABI and
-resident VM. Retain scoped constructions, measurements and cost falsifiers; do
+The owner now directs build-first increments with FEX as the first adapter while
+final codegen selection stays open. Retain scoped constructions, measurements and cost falsifiers; do
 not consume historical closure as an accepted final component selection.
+
+Synthesis remains pending. The ABI-first milestone will contribute its readable
+contract, reviewed specification, scoped runtime/fragment results, unresolved
+assumptions and cost sensitivities. Completing that milestone alone supplies
+neither a final generator choice nor acceptance of the combined architecture.
+The next synthesis task is to assess those inputs when available alongside the
+remaining scope, performance and economic evidence, identifying the exact gap
+that changes stop, further development/research or investment in delivery. No synthesis campaign or budget
+is started by the workflow revision.
 
 Only findings that have passed their applicable reviews may support synthesis
 conclusions. Include unreviewed exploratory observations as explicitly unresolved
@@ -54,11 +63,11 @@ remain part of the packet.
 
 ## Outcome
 
-The synthesis gate selects exactly one outcome: stop, continue targeted
-research, or authorize planning. No other outcome exists, and no outcome may
-be implied without the gate. The packet carries Track 03 architectural decisions into planning. Planning
-owns construction details and delivery and requires its separate authorization.
-A planning decision may rest on reviewed cost projections and scoped experiments;
+Under the October25 build-first direction, synthesis selects stop, continue
+targeted development/research, or invest in product delivery. It judges the
+project's direction and claims rather than gating each reversible implementation
+increment. Plan construction and validation alongside those increments.
+An investment decision may rest on reviewed cost projections and scoped experiments;
 it must not present them as measured end-to-end superiority. Unresolved issues
 that could invalidate the selected architecture require targeted research, not
 relabeling as later validation. Record remaining implementation and qualification

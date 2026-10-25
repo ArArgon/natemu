@@ -127,3 +127,58 @@ inspected revision. `git diff --check` passed independently.
 This acceptance concerns document requirements and consistency only; it accepts
 no experimental result, platform capability, architecture finding or implementation.
 Only this review record was edited by this reviewer.
+
+## ABI-first workflow alignment — September 28, 2026
+
+- Reviewer: `/root/workflow_review`, an independent context from author `/root`.
+  The reviewer provided critique but authored none of the governing changes.
+- Subject: the owner's workflow/track alignment request, including readable
+  checkpoints and Track 03 ownership of a provisional ABI and bounded experimental
+  runtime. The fixed architecture remains host code generation plus captive-VM
+  execution; generator selection is deferred and performance-led. This review
+  decides readiness to draft the ABI and its method, not component selection.
+- Inspected: the full working diff for `AGENTS.md`, root/research READMEs,
+  Tracks 00/03/04/05/06, the backlog, investigation template and current sections
+  of INV-03-01/03/04; surrounding Track 01/02 charters and INV-03-02 summary and
+  inventory. The twelve architecture questions and interactions remain intact.
+- **Evidence validity: revise for R1 below.** Existing findings retain their
+  original scope; stale current architecture-closure and synthesis instructions
+  are corrected without inventing results. The exploration/decision-evidence
+  distinction, fresh-run requirements and independent replication remain intact.
+  The milestone completion wording needs the acceptance distinction below.
+- **Decision relevance: accept.** The next step is one readable behavior
+  contract, provisional spec and bounded method. Track 04 cost sensitivity and
+  Track 05 controls contribute to that same milestone, not separate campaigns.
+  The new runtime budget is explicitly unassigned; closed comparison allowances
+  do not fund it. Owner visibility covers material behavior, scope and budget
+  choices while routine internals remain autonomous. Track 00's clarification
+  permits predeclared scoped component comparisons without weakening the product
+  success criterion or the workload/QEMU baseline obligations. Synthesis and
+  production authorization remain separate.
+
+**R1 — Assessed checks do not establish milestone completion.** Track 03's
+completion paragraph requires a “reviewed scoped ABI” and runtime checks and
+generated-fragment fit “assessed.” Review or assessment alone can include a failed
+core behavior or an incompatible producer; that must not count as a successful
+runtime/ABI milestone. Require independent acceptance against the declared
+behavior and generated-fragment criteria, with no unresolved defect invalidating
+the milestone scope. Retain partial-result reporting at the budget stop and the
+distinction from whole-generator fit and Track 03 closure. Closure requires
+reinspection of that paragraph and its budget-stop consequence.
+
+No experiments, external sources, raw artifacts or archived history were read or
+executed. `git diff --check` passed. No platform behavior, ABI design, experiment
+budget, generator choice, completed architecture or production work is accepted
+by this document review. Only this review record was edited by this reviewer.
+
+**September 28 — R1 closed; final evidence-validity and decision-relevance
+verdicts: accept.** Reinspected Track 03's milestone completion and budget-stop
+paragraphs. Independent findings acceptance now requires the declared runtime
+behaviors and representative generated-fragment fit to meet predeclared criteria,
+with no unresolved defect invalidating the scope. Failed core behavior or
+unestablished fit leaves the milestone incomplete; revision stays within budget
+and material changes use owner alignment. Track 04 also now calls the native
+execution advantage potential rather than established. `git diff --check` passed
+again. No substantive blocker remains for the next drafting step. This accepts
+the workflow's readiness and consistency, with all review limits above; it does
+not make the as-yet unwritten ABI or unbudgeted experiment ready to execute.

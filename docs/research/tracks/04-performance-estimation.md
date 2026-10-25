@@ -7,6 +7,24 @@ inform architectural choices before a final selection. Work follows the
 [research workflow](../README.md); projections are distinguished from measured
 performance.
 
+## Contribution to the ABI-first milestone
+
+Support [Track 03's current milestone](03-architecture-options.md#current-milestone--execution-abi-and-experimental-runtime)
+through Q-04-01 and the [implementation plan](../../implementation.md#performance-alongside-construction).
+Start with counters/costs of the supported fragment and helper paths, then actual
+compilation, dispatch, recovery and shared coordination. Measure during development
+when the result changes a choice; boot is not a prerequisite to component costs.
+Separate event cost from frequency, cold compilation from warmed execution and
+codegen from runtime/backend effects. Explore N-vCPU sensitivity through
+coordinator waits, drain latency, queue/backlog and retained memory. Use actual
+observations when available and label unknown inputs rather than inventing rates.
+
+The milestone can proceed without a completed whole-emulator cost model.
+Q-04-01 still owns full component ranges and scaling analysis; the ABI experiment
+does not settle them. Workload-wide or economic comparisons also need Track 00's
+extant workload, success and stop criteria. Missing historical scope records must
+be resolved by their owners before those criteria are used.
+
 ## Estimation rules
 
 Every estimate produced under this track must be a range with an explicit

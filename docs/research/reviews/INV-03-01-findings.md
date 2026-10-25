@@ -1,5 +1,84 @@
 # INV-03-01 — source findings review
 
+## Current return — implementation plan and setup, October 25, 2026
+
+The owner requested project setup changes reflecting the subsequent Rust,
+host-side FEX/live-producer, early performance and N-vCPU decisions, followed by
+reviews without editorial blockers. Root authored the documentation; separate
+`/root/setup_check_author` authored the read-only diagnostic and regression tests.
+The implementation order/setup now lives in `docs/implementation.md`; the current
+investigation inventory has moved ahead of historical campaigns. Historical
+observations and the frozen Track01 sources remain unchanged.
+
+- **Technical reviewer `/root/plan_technical_review`: ACCEPT, no substantive
+  blocker for I1.** Inspected AGENTS, workflow, implementation plan, current
+  investigation/inventory, Tracks01/03/05, full ABI draft, setup code/tests and
+  FEX fixture/exporter documentation. The Rust capture/FFI/shared-memory contract,
+  actual host producer loop, allocated-site recovery, N-dependent capacity and
+  early adverse schedules are sufficient requirements for incremental work.
+  Diagnostic versus qualified timing and Linux-worker versus native-macOS costs
+  remain distinguished. No history, edits or runtime experiments were performed.
+- **Setup reviewer `/root/setup_workflow_review`: ACCEPT, no substantive
+  blocker.** Independently inspected the entry points, current summary/inventory,
+  Tracks01/03/04/05, ABI opening/sections7–9 and diagnostic source/tests. Ran all
+  four regression tests successfully and the actual diagnostic, which returned1
+  for missing bare-metal Rust target and unset raw root. Checked bounded queries,
+  disabled implicit Rust installation, symlink-resolved output containment and
+  explicit unverified capabilities. A fresh executor can start I1 without
+  reconstructing historical campaigns or a whole-research gate. No edits made.
+
+**Evidence validity:** accepted for plan/setup adequacy only. Neither review
+establishes actual Rust/EL1t capture, general recovery-exporter fit, native-macOS
+FEX integration, N-vCPU runtime correctness, Linux boot or performance. The local
+diagnostic checks known prerequisites and its tests check diagnostic behavior.
+**Decision relevance:** proceed with I1 and the early I2 producer loop; retain
+scoped correctness tests and independent claim acceptance while allowing ordinary
+development. Concrete failures block affected paths only. No substantive returns
+or editorial blockers remain; no prior experimental allowance is activated.
+
+**Validation:** root also ran the four tests, the diagnostic and whitespace checks.
+The diagnostic leaves toolchain installation, environment configuration, builds,
+VMs and containers untouched. Runtime compilation/admission belongs to I1.
+
+## Current return — adequacy and build-first iteration, October 25, 2026
+
+The owner requested a fresh adequacy assessment, build-first development and an
+assessment of the provisional ABI under FEX-first incremental integration.
+Root authored the current workflow/investigation revisions; two separate fresh
+contexts supplied read-only assessments, without history searches or experiments.
+
+- `/root/fresh_adequacy` inspected the workflow, Track03/Track01 charters,
+  current twelve-question inventory, supporting investigation summaries, ABI
+  fragment method and checkpoint limitations. Its conclusion is that sufficient
+  context exists to start incremental construction; no identified research
+  unknown blocks the first executable slice. It distinguishes selected contracts
+  awaiting implementation, missing inputs, integration uncertainties and owner
+  product choices. Complete guest correctness, FEX fit and economics remain open.
+  Its targeted recheck accepted the revised adequacy summary and workflow for
+  documentation adequacy and decision relevance, with no substantive correction.
+  The optional wording clarification to say "Before each increment" in the
+  charter was incorporated.
+- `/root/abi_iteration_review` independently inspected the ABI, current direction,
+  charter interactions and fragment/checkpoint bindings. It found a coherent
+  provisional seam, with actual recovery/exporter fit and combined runtime
+  behavior still unvalidated. It recommended early real FEX execution, fault/helper/
+  paging checks, then two-vCPU adverse interactions and automatic recovery-map
+  tests. It performed a targeted recheck of the revised workflow, current
+  investigation/progression, charter and ABI iteration note: **accept for this
+  scoped workflow/design update, with no substantive correction required**.
+
+**Evidence validity:** existing scoped findings support starting implementation;
+this review adds no runtime, general-exporter, full-fit or speed observation.
+Manual fixture maps do not establish automatic recovery metadata. The ABI's
+state/effect/isolation/lifetime requirements and full T1–T12 coverage target remain.
+**Decision relevance:** proceed in executable increments with FEX first, allowing
+the interface to evolve. Whole-track completion, a universal ABI and final
+generator selection are not prerequisites to ordinary development. Fresh reviewed
+evidence is still required for architectural acceptance; partial coverage stays
+partial. No historical runtime budget is activated by this review.
+
+Earlier returns below retain their original scope and chronology.
+
 - **Reviewer and independent context:** `/root/machine`; independent of author
   `/root`. Reviewer authored INV-03-03 and therefore does not accept its findings
   or the combined machine proposal in this review. No changes to INV-03-01 made.
@@ -1895,3 +1974,117 @@ records with their original scope. This is editorial reconciliation of the
 accepted result, not another research gate. Five decision-review agent-minutes
 are charged within the remaining nine; total independent method/replica/decision
 review charge is16 of20. No further experiment is recommended by this verdict.
+
+## ABI draft 0 — independent design/method review, September 28, 2026
+
+**Reviewer/context:** `/root/abi_review`, independent of root's specification
+authorship and `/root/abi_contract_audit`'s supporting extraction. Inspected the
+workflow, Track03 milestone, inherited Track01 scope, INV03-01 current summary
+and inventory, claims14/15/19, and the complete
+[ARM64 execution ABI draft](../specs/arm64-execution-abi.md). This is a source/design
+review; no code execution, replication or historical archive search was performed.
+
+**Decision and alternatives:** the host-translator/captive-VM architecture and
+ABI-first sequence are fixed. The decision here is whether the readable contract,
+technical interface and finite validation proposal are concrete enough to present
+to the owner and guide a subsequent bounded runtime assignment. Live roots and
+resident gateways are compared with universal publication, unrestricted native
+calls and a generic interface; the draft discloses their costs without selecting
+FEX/TCG or claiming runtime correctness or speedup.
+
+**One consolidated return:** two defects threatened the promised live-state
+contract. First, installing a destination entry map without moving values could
+silently reinterpret registers or release their old spill frame. The minimum
+remedy was an explicit bounded map conversion preserving copy-cycle inputs and
+both maps/references until handover. Second, committing a helper result before
+restoring its old saved destination could erase that result. The minimum remedy
+was outcome-specific restoration and output installation, retaining staged values
+and phase metadata until the post-call map becomes authoritative. Closure required
+matching adverse controls inside existing T2, not new experiments or test cells.
+An editorial clarification identified SP_EL0 as the interrupted stack after
+hardware selects SP_EL1 on exception entry.
+
+**Targeted recheck: closed.** Section4 now explicitly reconciles entry maps,
+rejects unsupported conversions before transfer and retains map/frame references.
+Its gateway restores non-output roots before installing permitted outputs; failed
+outputs preserve their prior authority, and staged results survive intermediate
+capture. T2 now includes register swaps/vector-spill movement and output/register
+overlap. The exception-stack wording is corrected. No further substantive return.
+
+**Evidence validity: ACCEPT as a provisional design and method proposal.** The
+draft consistently distinguishes current roots from backing slots, native stops
+from guest boundaries, retry from suffix completion, and inactive frames from
+reclaimable storage. It preserves admitted-route completion before remap, cold
+dispatch after source mutation, bounded queue fairness and forced-exit ownership.
+The T1–T11 mapping covers the declared milestone behaviors and negative cases.
+The finite fragment test uses actual producer bytes or reports acquisition failure;
+hand-derived maps and an inserted helper explicitly do not prove an automated
+exporter or upstream helper integration. The 27-cell bundle, independent oracle,
+fresh primary/replica, retention and failure rules are internally consistent.
+Exact code, inputs, schedules and barrier bindings still require their declared
+pre-execution review; this verdict is not that approval.
+
+**Decision relevance: ACCEPT delivery of this self-contained draft.** The proposed
+six-working-hour/480-agent-minute runtime ceiling includes all six stages, review,
+correction and acquisition, with finite build/run/storage limits and explicit
+incomplete outcomes. Its adequacy is unmeasured; exhaustion must produce a scoped
+insufficiency, never fixture substitution or a self-renewing review campaign.
+Readability and declared limitations support an owner decision without requiring
+the owner to audit register maps. Runtime milestone completion, generator choice,
+full x86 semantics, stock boot, performance and Track03 closure remain unestablished.
+
+**Bounded disposition:** one consolidated review and one targeted recheck complete.
+Charge10 active reviewer minutes, including context reading and this record, within
+the15-minute reviewer cap and the assignment's90 aggregate minutes. The proposed
+runtime allowance has not started. No new campaign or blocking follow-up is opened;
+only synchronize the draft/current-summary review status and deliver the spec.
+
+### Owner-identified paging omission — focused amendment review
+
+**Reviewer/context:** `/root/abi_review`, continuing the same independent draft
+review. The owner correctly identified that the initial document and its review
+did not make the mandatory x86 paging interface or its experimental coverage
+explicit. Inherited memory contracts and ARM remap tests did not make that draft
+self-contained on guest virtual-to-physical translation. This return corrects
+the earlier acceptance scope; it does not claim the omission was already covered.
+
+Inspected the new readable paging explanation, section2's paging interface,
+T12/P1–P8, the amended35-cell method and limits, and INV03-04 claims41/42. No
+specification authorship, new architecture selection, execution or replication.
+The decision is whether the amendment now specifies and tests the actual guest
+paging/runtime boundary, without turning the finite experiment into all-mode
+walker implementation.
+
+**Evidence validity: ACCEPT the amendment as proposed design/method.** The
+interface distinguishes guest linear address, x86 table walk, GPA/owned physical
+route and resident ARM shadow. Context includes architectural permission state
+and lifetime generations; access requests preserve intent, privilege, span and
+progress. The runtime's committed state controls admission. Miss serialization
+extends from first paging read through A/D and access/fault/shadow publication;
+read fills cannot bypass first-write D requirements. Internal repair is distinct
+from guest #PF/CR2 effects, and ACCESS_COMPLETED applies to one subaccess rather
+than erasing an instruction's remaining effects. All writers, CR3/INVLPG/control
+changes, admitted old routes and native identity reuse share the stated authority.
+Guest fetch permissions do not make x86 RAM native executable. Non-direct routes
+remain typed service; hidden PAE state remains architectural rather than a cache.
+
+P1–P8 now require actual guest paging entries to drive the walker and observable
+native accesses, table/A-D changes and exception packets. They cover hit versus
+miss, write admission, permissions/reserved faults, alias mutation, context reuse,
+two-vCPU shootdown, partial/service effects and fragmented large leaves. Manual
+ARM remapping expressly cannot satisfy T12. Exact vectors and source/native
+maintenance bindings remain required in the actual-code pre-execution submission;
+none is being accepted as observed behavior here. Legacy modes and full type
+semantics remain inherited obligations with explicitly narrower tested coverage.
+
+**Decision relevance: ACCEPT the corrected self-contained draft for delivery.**
+The27 original cells plus eight paging cells total35. Page-pool/run limits and
+the proposed six-hour/480-agent-minute ceiling remain finite and internally
+consistent. Budget adequacy is unmeasured; the amendment explicitly forbids
+omitting paging or silently extending work to make completion fit. No generator,
+runtime-conformance, performance or full-emulator conclusion follows.
+
+**Disposition:** no substantive correction or targeted recheck is needed for
+this focused return. Charge6 active reviewer minutes within its8-minute allowance;
+the runtime budget remains proposed and inactive. Synchronize amendment status
+and deliver the corrected contract; no additional review campaign is opened.

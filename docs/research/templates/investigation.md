@@ -1,5 +1,9 @@
 # INV-<track>-<nn> — title
 
+For an ordinary implementation increment, use the current summary only: behavior,
+checks, admitted/tested N, work/resource bounds, results and next runnable step.
+A separate investigation is needed only for a consequential unanswered question.
+
 During exploration, use only the relevant sections for the brief record required
 by the [workflow](../README.md#conduct-an-investigation), and label runs exploratory.
 Expand the method and review record when seeking acceptance of a finding.
@@ -18,6 +22,9 @@ Expand the method and review record when seeking acceptance of a finding.
 - **Next action:** one step within that budget and its stopping condition.
   Follow-ups consume the same allowance. Missing execution budgets must be
   resolved before running; report insufficiency when the allowance is exhausted.
+- **Owner alignment (when designing a specification):** link the readable behavior
+  contract and technical spec; record material decisions under the workflow's
+  [checkpoints](../README.md#owner-alignment), including any unresolved owner choice.
 
 ## Assumptions and breadth
 

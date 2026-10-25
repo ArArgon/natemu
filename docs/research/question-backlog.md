@@ -3,7 +3,9 @@
 Track 01 entries link to their owning investigations; current question content,
 conclusions and work status live there. Track 02 identifiers redirect to Track 03; other historical rows are migrated
 when used. Current workflow policies override their old whole-track dependencies.
-New questions follow [the research workflow](README.md).
+New questions follow [the workflow](README.md). The [implementation plan](../implementation.md)
+owns executable order: Rust-first, an early host FEX producer loop, configured N
+and performance alongside development. Historical dependencies do not gate it.
 
 ## Status vocabulary
 
@@ -39,7 +41,7 @@ or implementation uses those inputs.
 
 Track03's historical September21 [completion handoff](investigations/INV-03-01.md#track03-completion-and-synthesis-handoff--september21)
 retains concrete inputs to those existing owners (final component selection is
-reopened by the extension-versus-hybrid comparison): bounded binary64 x87 numerical
+deferred after the comparison's insufficiency, under the ABI-first sequence): bounded binary64 x87 numerical
 limits and status-observation costs; native eligibility/recovery/service/compile
 frequencies; dual-compiler effort; named platform premises and retained Intel
 semantic limits. These are disclosed synthesis/conformance obligations, not new
@@ -99,6 +101,14 @@ Use the [twelve-question Track 03 inventory](investigations/INV-03-01.md#current
 for current architectural decisions. The four identifiers below group detailed
 evidence; they do not replace the charter questions or imply four completion
 gates. Each linked investigation has one current summary and bounded next action.
+
+The current assignment is [Track 03's ABI-first milestone](tracks/03-architecture-options.md#current-milestone--execution-abi-and-experimental-runtime),
+owned by INV-03-01: [ABI draft 0](specs/arm64-execution-abi.md) supplies the readable
+contract, provisional spec and proposed method/budget before runtime implementation.
+INV-03-01 owns its review status and next action. Q-04-01 contributes
+cost sensitivity and Q-05-01 contributes controls within that milestone's budget.
+Their broader questions, the Q-05-09 workload baseline and synthesis remain open;
+this assignment supplies no new results or automatic follow-on campaign.
 
 | Identifier | Question | Why it matters | Dependencies | Downstream decisions | Applicability dimensions | Resolution method | Evidence status | Review status | Newly surfaced questions — breadth pass | Newly surfaced questions — source/method/execution/result work |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
