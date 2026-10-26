@@ -1,5 +1,32 @@
 # INV-03-01 — source findings review
 
+## Plan review — concurrent guest control transitions, October 26, 2026 UTC
+
+`/root/i4v_upstream` independently checked the recorded
+[next-slice contract](../investigations/INV-03-01.md#next-i4-v-slice--concurrent-guest-control-transitions)
+against the proposed schedule and existing concurrency boundaries.
+**ACCEPT as an implementation plan; no new execution evidence is claimed.**
+
+The contract separates a retained peer access across a local control commit
+from coordinated shared-source/table mutation after route drain. It requires
+unchanged peer architectural state, exactly-once retained completion, admission
+and actual execution of a still-current peer reply, and context-only stale-reply
+rejection after actor ABA. A separate pending compilation crosses source mutation;
+the plan does not replay a committed store to demonstrate peer admission.
+
+Per-owner route derivation preserves hidden PAE lifetime; remappable descriptor
+and far-pointer metadata requires both backing copies and actual read GPAs.
+Role rotation, N=1 limits, pending events, real ordinary-instruction progress,
+bounded fairness and retained-reference reclamation remain explicit. Rejected
+CR0 profile3 supplements the legal families at N=1/2/3/4 without claiming the
+short rejection program supplies the longer maintenance schedule. Direct
+paging-off-to-IA-32e remains primary; PAE composition is separate.
+
+No substantive correction remains in this plan review. Implementation,
+independent semantic review and fresh execution replication are still required.
+Remaining V1/V2 boundaries and broader memory-model validation stay within the
+full I4-V objective; this entry does not complete that objective or V3.
+
 ## Intermediate I4-V return — long-mode transactions, October 26, 2026 UTC
 
 Root authored ABI/runtime and runner changes, `/root/i4v_producer` authored
