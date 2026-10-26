@@ -1,0 +1,5 @@
+{
+  "source": "/Users/liaozping/orca/natemu-raw/i4v-coherence-dev-20261026-03/coherence-ad-four-n3-actor1/command.stdout",
+  "sha256": "09fd21a2b662c9bbf6c69ad0bb069b4ab7e7b6ddde9cd0d77ded114d56b8c999",
+  "scope": "Actual native three-owner four-level cached A/D and explicit invalidation diagnostic, including terminal code-pin control; retained unchanged."
+}

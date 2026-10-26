@@ -6,11 +6,14 @@ use natemu_abi::{alias, shadow, stack, stack_concurrent};
 mod address;
 mod fence;
 mod fence_producer;
+mod coherence;
+pub use coherence::run as run_coherence;
 pub use fence::run as run_fence;
 #[derive(Clone, Copy)]
 enum NativeProfile {
     Ordering(natemu_abi::ordering::Config),
     Fence(natemu_abi::fence::Config),
+    Coherence(natemu_abi::coherence::Config),
 }
 mod ordering;
 pub use ordering::run as run_ordering;
@@ -90,7 +93,10 @@ impl Cpu {
                         for (r, v) in packet.iter_mut().enumerate() {
                             hv(hv_vcpu_get_reg(self.id, r as u32, v), "read service packet")?;
                         }
-                        let expected = if compiler.as_ref().is_some_and(|c| c.is_fence()) {
+                        let expected = if compiler.as_ref().is_some_and(|c| c.is_coherence()) {
+                            (*((shared_address - SHARED_OFFSET + natemu_abi::coherence::OWNER_OFFSET)
+                                as *const natemu_abi::coherence::Owner)).expected
+                        } else if compiler.as_ref().is_some_and(|c| c.is_fence()) {
                             (*((shared_address - SHARED_OFFSET + natemu_abi::fence::OWNER_OFFSET)
                                 as *const natemu_abi::fence::Owner))
                                 .expected
@@ -288,6 +294,13 @@ fn run_owners(
                                     )?
                                 }
                                 NativeProfile::Fence(config) => producer::Compiler::new_fence(
+                                    binary,
+                                    worker,
+                                    output.join(format!("cpu-{id}")),
+                                    id as u64,
+                                    config,
+                                )?,
+                                NativeProfile::Coherence(config) => producer::Compiler::new_coherence(
                                     binary,
                                     worker,
                                     output.join(format!("cpu-{id}")),

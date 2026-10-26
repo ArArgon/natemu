@@ -10,6 +10,19 @@ export=importlib.util.module_from_spec(spec);spec.loader.exec_module(export)
 DATA=Path(__file__).with_name('testdata')
 
 class ExportChecks(unittest.TestCase):
+    def test_coherence_dword_access_keeps_actual_64bit_address_decoding(self):
+        for name, offset, write in [('store', 4, True), ('load', 0, False)]:
+            for index, rip in enumerate((0x102000, 0x102310)):
+                directory = DATA / f'coherence-{name}-{index}'
+                result = export.verify(directory, dict(case=f'fex_{name}_eax_rbx64', bitness=64, guest_rip=rip))
+                self.assertEqual([(s['native_offset'], s['width'], s['write'], s['address_register']) for s in result['sites']],
+                                 [(offset, 4, write, 6)])
+                with self.assertRaises(ValueError):
+                    export.verify(directory, dict(bitness=32))
+                with self.assertRaises(ValueError):
+                    export.verify(directory, dict(case=f'fex_{name}_eax_ebx32'))
+            self.mutated(f'coherence-{name}-0', 'producer.log', lambda b:b.replace(b'bitness=64', b'bitness=32'))
+
     def test_lfence_suffix_consumes_real_deferred_flag_and_vector_roots(self):
         for index,rip in enumerate((0x102000,0x102100)):
             result=export.verify(DATA/f'lfence-{index}',dict(case='fex_lfence_dependencies',bitness=64,guest_rip=rip))

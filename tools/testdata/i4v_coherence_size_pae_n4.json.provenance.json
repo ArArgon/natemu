@@ -1,0 +1,5 @@
+{
+  "source": "/Users/liaozping/orca/natemu-raw/i4v-coherence-dev-20261026-02/coherence-size-pae-n4-actor3/command.stdout",
+  "sha256": "fc26f484395e360322db23857601c7264c74a466e66dc06b92c14d62ce56c78d",
+  "scope": "Actual native four-owner PAE page-size diagnostic including terminal held-reference rejection; retained unchanged."
+}

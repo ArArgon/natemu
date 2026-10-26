@@ -66,7 +66,7 @@ impl Compiler {
     pub fn is_controls(&self) -> bool {
         self.controls
             .as_ref()
-            .is_some_and(|compiler| !compiler.is_address() && !compiler.is_ordering())
+            .is_some_and(|compiler| !compiler.is_address() && !compiler.is_ordering() && !compiler.is_coherence())
     }
     pub fn new_address(
         producer: PathBuf,
@@ -103,6 +103,22 @@ impl Compiler {
         self.controls
             .as_ref()
             .is_some_and(|compiler| compiler.is_ordering())
+    }
+    pub fn new_coherence(
+        producer: PathBuf,
+        worker: PathBuf,
+        output: PathBuf,
+        owner: u64,
+        config: natemu_abi::coherence::Config,
+    ) -> Result<Self> {
+        let mut compiler = Self::new(producer.clone(), output.clone())?;
+        compiler.controls = Some(crate::i4v_controls::producer::Compiler::new_coherence(
+            producer, worker, output, owner, config,
+        ));
+        Ok(compiler)
+    }
+    pub fn is_coherence(&self) -> bool {
+        self.controls.as_ref().is_some_and(|compiler| compiler.is_coherence())
     }
     pub fn new_fence(
         producer: PathBuf,

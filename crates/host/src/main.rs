@@ -356,6 +356,9 @@ fn seed(index: usize) -> (NativeFrame, [u8; 512], [u8; 256]) {
 }
 fn run() -> Result<()> {
     let a: Vec<_> = env::args().collect();
+    if a.len() == 9 && a[2] == "i4v-coherence" {
+        return concurrent::run_coherence(&a);
+    }
     if a.len() == 8 && a[2] == "i4v-fence" {
         return concurrent::run_fence(&a);
     }

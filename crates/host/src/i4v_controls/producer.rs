@@ -3,7 +3,7 @@ use crate::i4v_stack::{read_packet, write_packet};
 use crate::*;
 use natemu_abi::concurrency::{DEFER_COMPILE, POLL_COMPILE, TAKE_COMPILE};
 use natemu_abi::translation as wire;
-use natemu_abi::{address_concurrent as address, controls, ordering};
+use natemu_abi::{address_concurrent as address, coherence, controls, ordering};
 use std::{
     fs::File,
     path::PathBuf,
@@ -21,6 +21,7 @@ enum Protocol {
     Controls,
     Address(address::Config),
     Ordering(ordering::Config),
+    Coherence(coherence::Config),
 }
 impl Protocol {
     fn reply(self, request: &wire::Packet) -> Option<wire::Packet> {
@@ -28,6 +29,7 @@ impl Protocol {
             Self::Controls => controls::reply(request),
             Self::Address(_) => address::reply(request),
             Self::Ordering(_) => ordering::reply(request),
+            Self::Coherence(_) => coherence::reply(request),
         }
     }
 }
@@ -118,6 +120,20 @@ impl Compiler {
     pub fn is_ordering(&self) -> bool {
         matches!(self.protocol, Protocol::Ordering(_))
     }
+    pub fn new_coherence(
+        producer: PathBuf,
+        worker: PathBuf,
+        output: PathBuf,
+        owner: u64,
+        config: coherence::Config,
+    ) -> Self {
+        let mut compiler = Self::new_owner(producer, worker, output, owner, 1);
+        compiler.protocol = Protocol::Coherence(config);
+        compiler
+    }
+    pub fn is_coherence(&self) -> bool {
+        matches!(self.protocol, Protocol::Coherence(_))
+    }
     fn start(&mut self, request: wire::Packet) -> Result<Job> {
         let directory = self
             .output
@@ -150,6 +166,7 @@ impl Compiler {
             Protocol::Controls => controls::MISS,
             Protocol::Address(_) => address::MISS,
             Protocol::Ordering(_) => ordering::MISS,
+            Protocol::Coherence(_) => coherence::MISS,
         };
         packet[0] = miss;
         if packet[3] != self.owner
@@ -158,6 +175,7 @@ impl Compiler {
             || self.protocol.reply(&packet).is_none()
             || matches!(self.protocol, Protocol::Address(config) if address::decode(&packet).map(|(actual, _)| actual) != Some(config))
             || matches!(self.protocol, Protocol::Ordering(config) if ordering::decode(&packet) != Some(config))
+            || matches!(self.protocol, Protocol::Coherence(config) if coherence::decode(&packet) != Some(config))
         {
             return Err("control request changes configured owner/mode/profile".into());
         }
@@ -213,6 +231,30 @@ impl Compiler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn coherence_worker_launch_is_bound_to_configured_owner_and_profile() {
+        let config = coherence::Config::new(4, 0, 1).unwrap();
+        for kind in 0..2 {
+            let good = coherence::request(37, config, 2, kind).unwrap();
+            for index in [1,3,4,6,7,8,9,10,11,12,13,14,15] {
+                let mut bad = good;
+                bad[index] ^= 1;
+                let mut compiler = Compiler::new_coherence(
+                    "unused".into(), "unused".into(), "unused".into(), 2, config);
+                assert!(compiler.exchange(bad).is_err());
+                assert!(compiler.requests.is_empty());
+            }
+            for other in [coherence::Config::new(3,0,1).unwrap(),
+                          coherence::Config::new(4,3,1).unwrap(),
+                          coherence::Config::new(4,0,2).unwrap()] {
+                let bad = coherence::request(37,other,2,kind).unwrap();
+                let mut compiler = Compiler::new_coherence(
+                    "unused".into(), "unused".into(), "unused".into(), 2, config);
+                assert!(compiler.exchange(bad).is_err());
+                assert!(compiler.requests.is_empty());
+            }
+        }
+    }
     fn compiler() -> Compiler {
         Compiler::new(
             "unused-producer".into(),

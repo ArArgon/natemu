@@ -554,10 +554,13 @@ fence controls and full native-state LFENCE sinks. Fresh independent rebuilds
 preserve all454 earlier native cases and87 legacy checks, giving628 distinct
 native cases. Independent artifact audit and findings review accept this finite
 checkpoint.
-The next translation-coherence slice is being built for shared parent changes,
-A/D clearing and4KiB/2MiB transitions with retained work and delayed shootdowns
-at N1/2/3/4. Broader recovery/lifetime and seeded adversarial progress coverage
-remain required; these native cases do not establish whole-emulator correctness.
+The translation-coherence checkpoint adds60 independently reproduced cases:
+shared parent changes, A/D clearing and4KiB/2MiB transitions with retained work
+and delayed shootdowns at N1/2/3/4. All688 distinct native cases and87 legacy
+jobs pass fresh independent rebuilds and artifact review. The remaining pass
+implements72 seeded scheduling/recovery cases and25 deliberate containment
+cases, followed by the final contract-to-test audit and independent review.
+These finite cases do not establish whole-emulator correctness.
 Declare execution bounds, adapt existing tests and add missing adversarial cases
 as each slice is built. Independent I5 preparation can proceed. Accepted finite
 checkpoints do not complete V1 or I4-V; unfinished cells remain explicit.

@@ -1,5 +1,116 @@
 # INV-03-01 — source findings review
 
+## Intermediate I4-V return — translation coherence, October 26, 2026 UTC
+
+`/root/i4v_upstream` authored the coherence ABI/runtime and the preceding Python
+translation reference; root authored the host/compiler/runner integration and
+actual producer probes. `/root/i4v_producer` authored the separate native-report
+replay and corruption controls. `/root/i4v_contract_review` reviewed the model,
+implementation and oracle, audited actual compiler artifacts and emitted code,
+and owned four serialized fresh reproduction/regression campaigns. **ACCEPT
+this finite parent/A-D/page-size coherence checkpoint. Full I4-V remains
+incomplete.** The report oracle is independently authored; the earlier reference
+model and resident implementation share an author and are not represented as
+two independently authored implementations.
+
+Primary `i4v-coherence-dev-20261026-04` passes 142 jobs/104 native cases:
+60 coherence cases and 44 preserved baselines. Independent audit verifies all
+386 actual exports, 398 report associations, 360 coherence deliveries, 8,891
+checksums and 776 producing inputs. The fresh reviewer-owned runs are:
+
+| Retained run | Jobs | Native cases or legacy reports | Verified checksums | Seconds |
+| --- | ---: | ---: | ---: | ---: |
+| `i4v-coherence-independent-20261026-01` | 316 | 278 cases | 18,907 | 424 |
+| `i4v-coherence-independent-20261026-02` | 432 | 394 cases | 45,163 | 837 |
+| `i4v-coherence-independent-20261026-03` | 142 | 104 cases | 23,611 | 424 |
+| `i4v-coherence-regression-independent-20261026-01` | 87 | 70 legacy reports | 2,551 | 50 |
+
+The three I4-V case lists have an exact union of **688 distinct native cases:
+all 628 earlier cases plus 60 new coherence cases**. Their 776 executions include
+44 identical baselines in each bundle, hence 88 repeated baseline executions.
+The final bundle preserves the exact 87-job legacy list and its count-rejection
+checks. Every process was polled to successful termination before the next
+campaign began; execution was serialized from 14:10:49 to 14:40:41 UTC.
+
+All 90,232 replica checksums verify. The I4-V bundles contain 4,586 actual exports
+and 4,622 checked report associations, including exact resident request,
+compiler-source/mode/RIP and delivered-reply bindings. Each bundle's 776 inputs
+matches the final primary and workspace at audit time. The legacy snapshot has
+119 inputs: 95 shared inputs match the producing primary and 24 legacy-only
+inputs match both the workspace and preceding legacy snapshot. Its fragment and
+two producer binaries match the specified durable pins exactly. No FEX rebuild
+is claimed. All four fresh runtime ELFs equal SHA256
+`b02eb91194a6820a2c9fd8fa4bf0422d83346f9df9c6fc87e1940529b99d1cde`.
+
+The six profiles run N=1/2/3/4 with every mutation-actor position. Across the
+60 cases, 180 owner instances perform 2,880 visits, 2,520 commits, 2,160 native
+faults, 1,800 retries, including 720 retained-route retries, and 360 actual
+compilations. Replay checks 1,400 full memory/table snapshots, 6,840 ordered
+walks, 20,460 recorded table reads and 650 table writes. Counts support the
+individual full-state checks; matching aggregate counts alone cannot pass.
+
+The parent profile makes PT-A/PT-B/A route changes observable by swapping two
+data pages, then restricts parent write permission. A/D profiles cover legacy32,
+legacy PAE and four-level paging: warm dirty translations execute cached writes
+after guest A/D clearing without a data rewalk; explicit invalidation clears the
+recorded native history, fresh reads establish A without D, and subsequent first
+writes establish D. Page-size profiles promote 4KiB leaves to a 2MiB leaf,
+demote them and restrict a large leaf. Both native 4KiB subpages and low/high
+aliases are checked where admitted. High aliases execute actual 64-bit-address
+DWORD FEX instructions; separately retained compile-only probes verify four
+exports and all 46 checksums, without relabeling protected32 producer output.
+
+All owners detach real native faults before FIFO retained-route service. The
+old operation completes exactly once through its saved physical route before
+table mutation. Delayed final acknowledgements reject entry until required
+local invalidations complete, including an N1 self-delay control. PAE backing
+PDPT memory changes to a different valid route after the hidden snapshot is
+loaded; every later walk retains the old snapshot, with exactly one four-entry
+load per owner. Source bytes remain immutable and independently fetched through
+the current guest translation before each generated entry.
+
+Review found missing private upper-table mappings and TTBR1 links; the author
+fixed and tested all four pages and owner-specific links before the first native
+diagnostic. Review also replaced hard-coded starting code/leaf observations with
+actual host captures and added a terminal reclamation rejection with execution
+finished, all acknowledgements complete and only the actor's final code pin
+held. Event 75 and unchanged code bytes establish this rejection separately from
+the earlier unfinished-program guard. After the final release, actual private
+code bytes are cleared and cached entry is rejected. Guest RAM/table backing
+remains owned: physical recycling of that backing is not claimed.
+
+The three exploratory diagnostics retain their original failed manifests because
+their captured public checkers were closed. The first predates the terminal pin
+control. Corrected N4 PAE-size and N3 four-level A/D diagnostics were independently
+replayed with their actual compiler deliveries before public enablement. The
+final strict checker always binds requested profile/count/actor and requires the
+complete replay, schemas, terminal pin test and full state. Its 28 oracle tests
+and 14 reference tests include corrupted routes, hidden roots, page sizes,
+A/D histories, native syndromes, preserved frames, compiler identities, FIFO
+selection, delayed acknowledgements and premature release/reclamation. The
+reviewer independently reran all 28 oracle tests and the actual strict AD CLI.
+
+The producing ELF has RX spans of 168 and 201,308 bytes within the split resident
+windows. Reviewed emitted stack remains bounded by 14,992/16,384 bytes; coherence
+initialize's direct call chain is 1,248 bytes and finish's is 928 before the outer
+capture gate. Across the four replicas, peak observed RSS is 543,539,200 bytes
+in the 8GiB build/test class and 444,727,296 in the 512MiB worker class. Total
+retained replica size is 1,062,915,928 bytes; every bundle meets its 20-minute
+bound. Every compiler removal record verifies, the legacy manifest reports no
+remaining containers, and the final independent global `natemu-i4v-` query is
+empty. No reviewer process remained when the execution slot was returned.
+
+This evidence qualifies the declared finite WB-memory profiles. It does not
+claim every legal paging-cache policy, physical guest-backing recycling, seeded
+adversarial progress, failure containment, broader partial-helper composition or
+whole-emulator correctness. The next reviewed 72 healthy/25 containment proposal
+must distinguish N1 capacity coverage, use actor rotation independent of seed
+residues, bind eligible seeded decisions to real protocol cuts, preserve original
+failure causes and bound cleanup. It must not fabricate normal lock/reference
+drain in a VM abandoned after a resident panic. That next proposal and isolated
+preparation code are not accepted by this coherence result; final I4-V coverage
+inventory and integrated review remain required.
+
 ## Intermediate I4-V return — native ordering and LFENCE completion, October 26, 2026 UTC
 
 `/root/i4v_producer` and root authored the retained FEX probes, ABI/runtime/gates
