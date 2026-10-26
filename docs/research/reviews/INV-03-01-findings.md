@@ -1,5 +1,81 @@
 # INV-03-01 — source findings review
 
+## Intermediate I4-V return — concurrent address aliases, October 26, 2026 UTC
+
+Root authored the ABI/runtime and runner, `/root/i4v_producer` authored host and
+compiler bindings, and `/root/i4v_upstream` authored the independent alias checker.
+`/root/i4v_contract_review` reviewed the changes read-only and independently ran
+the corrected primary's retained source snapshot, with no overlapping build.
+**ACCEPT the finite same-permission alias checkpoint at N=1/2/3/4; V1 and I4-V
+remain incomplete.**
+
+Independent `i4v-alias-independent-20261026-01` passes 149 jobs and 134 native
+cells, including all prior load/stack cells and eight low/high-source alias
+compositions. The reviewer rechecked every report, all 124 actual compilations,
+136 cell-to-compile associations and 174 stack transfers. All 4,044 checksums
+verify; all 134 retained source inputs match both the corrected primary snapshot
+and reviewed workspace. The reused FEX executable matches its pin; this is a
+fresh host/runtime rebuild and fresh compilation campaign, not another FEX build.
+No I4-V compiler containers remain running.
+
+Each owner prewarms its inactive alias with the old physical route. The campaign
+checks 560 per-owner acknowledgements containing both exact replacement native
+descriptors, 180 maintenance heads and 28 actual generated ordinary intervals.
+Local shadow repair/TLBI precedes acknowledgements; generated accesses alternate
+aliases. The unchanged I4 checker still validates retained routes/code, delayed
+acknowledgements, source-stale replies, events, capacity and eight-head fairness
+after the alias checker first validates every address it normalizes. Full native
+roots and leaves remain unnormalized. All eight compositions reject an actual
+replacement reply with the opposite guest RIP, preserving pending identity and
+blank replacement code before publishing the valid reply.
+
+Review found that the initial alias record at 0x2a000 overlapped maintenance
+interval storage. `i4v-alias-dev-20261026-01` preserves the resulting first-alias
+failure, status4/detail153, after 126 prior cells passed. The record moved to
+0x2f000; compile-time assertions exclude the entire interval reserve, baseline
+extent and code page. Corrected primary02 and the independent replica pass.
+No substantive correctness or reproduction blocker remains in this scope.
+
+The independent run retained about65MB and finished in63 seconds under its
+20-minute bundle limit. Observed peak build/worker process-group RSS was below
+386MB/96MB, respectively; declared per-job limits and two-job builds remained
+in force. Root's subsequent serial `i4v-alias-regression-20261026-01` reports all
+87 legacy jobs passed; the reviewer inspected that manifest, without claiming a
+second independent legacy execution. These are correctness runs, not performance
+measurements.
+
+The aliases deliberately share all guest permissions and lower tables; reusing
+one walk for both mappings is scoped to that fixture. Source mutation performs
+a protected runtime write through the actual opposite alias, not a translated
+guest self-modifying instruction. Mixed-permission aliases, concurrent stack
+prefix/recovery paths, V2 paging-off execution, V3 transitions and the broader
+I4-V campaign remain explicit obligations. No full V1/I4-V acceptance follows.
+
+## Plan follow-up review — I4-V concurrent address and mode coverage
+
+Root amended the implementation plan and INV-03-01 next action. Fresh independent
+`/root/i4v_plan_followup_review` reviewed them read-only against the workflow,
+Track03 scope, ABI paging/control interface and INV-03-04 mode contract.
+**ACCEPT the plan; no substantive blockers.**
+
+**Evidence validity:** the plan requires actual generated execution, separate
+fetch/data/stack checks, independent expectations, precise effects/faults and
+N=1 then N=2/3/4 schedules. It distinguishes local architectural transitions
+from shared-source invalidation and preserves hidden-PAE lifetime requirements.
+No runtime success follows from this review.
+
+**Decision relevance:** explicit concurrent stack-prefix recovery, aliases with
+different permissions, mixed paged/paging-off CPUs and return to a previously
+used context close acceptance ambiguities. Stale replies/entries, delayed
+acknowledgements, retained lifetimes and pending events remain required. Bounded
+slices and independent I5 preparation preserve build-first execution.
+
+Root applied the reviewer's two nonblocking wording clarifications: illegal
+transitions have a rejection boundary, and paging-off excludes implicit walk/A/D
+effects without excluding deliberate data writes to table backing. Documentation
+whitespace checks pass. Runtime implementation and native campaigns were outside
+this plan review; existing finite results retain their original scope.
+
 ## Intermediate I4-V return — live stack prefixes, October 26, 2026 UTC
 
 Root authored the ABI/runtime and runner, `/root/i4v_producer` authored the host

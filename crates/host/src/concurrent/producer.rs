@@ -9,6 +9,8 @@ pub struct Compiler {
     pending: Option<translation::Producer>,
     foreground: Option<translation::Producer>,
     pub requests: Vec<wire::Packet>,
+    guest_rip: u64,
+    address_profile: bool,
 }
 impl Compiler {
     pub fn new(producer: PathBuf, output: PathBuf) -> Result<Self> {
@@ -20,7 +22,16 @@ impl Compiler {
             pending: None,
             foreground: None,
             requests: Vec::new(),
+            guest_rip: wire::SOURCE_VA,
+            address_profile: false,
         })
+    }
+    pub fn new_alias(producer: PathBuf, output: PathBuf, guest_rip: u64) -> Result<Self> {
+        let mut compiler = Self::new(producer, output)?;
+        compiler.worker = PathBuf::from("tools/i4v_alias_worker.py");
+        compiler.guest_rip = guest_rip;
+        compiler.address_profile = true;
+        Ok(compiler)
     }
     pub fn exchange(&mut self, mut packet: wire::Packet) -> Result<wire::Packet> {
         let operation = packet[0];
@@ -55,7 +66,17 @@ impl Compiler {
         let directory = self
             .output
             .join(format!("request-{:03}", self.requests.len()));
-        let job = translation::start_worker(&self.worker, &self.producer, &directory, packet)?;
+        let job = if self.address_profile {
+            translation::start_worker_at(
+                &self.worker,
+                &self.producer,
+                &directory,
+                packet,
+                self.guest_rip,
+            )?
+        } else {
+            translation::start_worker(&self.worker, &self.producer, &directory, packet)?
+        };
         self.requests.push(packet);
         if operation == DEFER_COMPILE {
             self.pending = Some(job);

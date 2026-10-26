@@ -123,6 +123,32 @@ progress, including stale native mapping and mode/context-cache reuse attempts.
 A host-only walker or state-machine test supplements actual generated execution;
 it cannot satisfy these slice acceptance checks.
 
+Make the concurrent cases concrete in each slice's acceptance matrix:
+
+- **V1:** cover instruction fetch, ordinary data and stack accesses separately.
+  Suspend a generated stack access after an earlier instruction has committed,
+  remap or revoke its backing from a peer, then resume and check the permitted
+  prefix, RSP, fault and exactly-once effects. Low/high alias tests must include
+  differing parent/leaf permissions as well as shared permissions; equal physical
+  backing does not justify copying one alias's access decision to the other.
+- **V2:** use the same physical code/data through paged and paging-off CPUs while
+  delaying a compiler reply and a retained access. Check each CPU's fetch and
+  access rules independently, shared-source invalidation, and absence of implicit
+  guest page-table walk/A/D effects on the paging-off path, including native
+  miss/retry. Deliberate guest data writes to table backing remain ordinary writes.
+- **V3:** record the old state, commit or rejection boundary and first subsequent
+  fetch/access for each legal or illegal control sequence. Pause old compilation
+  across that point, force an old-context cache lookup, and check peer state and
+  pending-event eligibility. Include a transition back to a previously used
+  mode/address-space identity so stale work cannot pass merely because numerical
+  control values match again. Declare the permitted outcome of retained work
+  on each side of commit before executing the schedule.
+
+For each case record the address/mode/privilege profile, initial state, forced
+interleaving, expected effects or fault, tested N and actual producer/runtime
+path. Load-only concurrency does not discharge stack coverage, and host-side
+context-field mutation does not discharge guest control-instruction execution.
+
 Build V1/V2 first where independent, then V3 and their combined schedules. Record
 the exact supported modes/control sequences, vectors, oracles and per-slice bounds
 in INV-03-01 before execution. Unsupported cases reject explicitly and remain

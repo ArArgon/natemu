@@ -53,6 +53,9 @@ pub unsafe fn initialize() {
         mapping(DATA_VA, 0);
     }
 }
+pub unsafe fn clear_mapping(address: u64) {
+    unsafe { mapping(address & !4095, 0) }
+}
 pub unsafe fn walk(address: u64, access: Access) -> Result<paging::Translation, Fault> {
     unsafe {
         let r = state();

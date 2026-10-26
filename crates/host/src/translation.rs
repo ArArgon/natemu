@@ -11,6 +11,8 @@ pub(super) struct Producer {
     child: Child,
     directory: PathBuf,
     request: wire::Packet,
+    guest_rip: u64,
+    address_profile: bool,
 }
 impl Producer {
     pub(super) fn ready(&mut self) -> Result<bool> {
@@ -30,7 +32,11 @@ impl Producer {
                 .ok_or("non-UTF8 reply path")?,
             128,
         )?;
-        bind_reply(&self.request, &raw)
+        if self.address_profile {
+            bind_reply_at(&self.request, &raw, self.guest_rip)
+        } else {
+            bind_reply(&self.request, &raw)
+        }
     }
 }
 impl Drop for Producer {
@@ -41,6 +47,19 @@ impl Drop for Producer {
 }
 
 fn bind_reply(request: &wire::Packet, raw: &[u8]) -> Result<wire::Packet> {
+    bind_reply_using(request, raw, wire::SOURCE_VA, false)
+}
+
+fn bind_reply_at(request: &wire::Packet, raw: &[u8], guest_rip: u64) -> Result<wire::Packet> {
+    bind_reply_using(request, raw, guest_rip, true)
+}
+
+fn bind_reply_using(
+    request: &wire::Packet,
+    raw: &[u8],
+    guest_rip: u64,
+    address_profile: bool,
+) -> Result<wire::Packet> {
     if raw.len() != 128 {
         return Err("wrong reply packet size".into());
     }
@@ -50,7 +69,12 @@ fn bind_reply(request: &wire::Packet, raw: &[u8]) -> Result<wire::Packet> {
     }
     let mut body = [0; 44];
     wire::get_bytes(&packet[7..13], &mut body);
-    let expected = wire::reply(request, &body).map_err(|_| "unsupported worker output")?;
+    let expected = if address_profile {
+        wire::reply_at(request, &body, guest_rip)
+    } else {
+        wire::reply(request, &body)
+    }
+    .map_err(|_| "unsupported worker output")?;
     if packet != expected {
         return Err("worker reply differs from its original request identity/source".into());
     }
@@ -63,8 +87,23 @@ pub(super) fn start_worker(
     directory: &Path,
     request: wire::Packet,
 ) -> Result<Producer> {
+    let mut job = start_worker_at(worker, producer, directory, request, wire::SOURCE_VA)?;
+    job.address_profile = false;
+    Ok(job)
+}
+
+pub(super) fn start_worker_at(
+    worker: &Path,
+    producer: &Path,
+    directory: &Path,
+    request: wire::Packet,
+    guest_rip: u64,
+) -> Result<Producer> {
     if request[0] != wire::MISS {
         return Err("compiler requested without a resident miss".into());
+    }
+    if request[12] != guest_rip {
+        return Err("compiler request differs from configured guest RIP".into());
     }
     fs::create_dir(directory).map_err(|e| e.to_string())?;
     let mut file = File::create_new(directory.join("request.bin")).map_err(|e| e.to_string())?;
@@ -88,6 +127,8 @@ pub(super) fn start_worker(
         child,
         directory: directory.to_path_buf(),
         request,
+        guest_rip,
+        address_profile: true,
     })
 }
 
@@ -564,6 +605,22 @@ mod tests {
             let mut wrong = good;
             wrong[index] ^= 1 << 32;
             assert!(bind_reply(&request, &bytes(wrong)).is_err());
+        }
+    }
+    #[test]
+    fn address_reply_is_bound_to_configured_rip_and_not_legacy_profile() {
+        let high = natemu_abi::shadow::HIGH_BASE + wire::SOURCE_VA;
+        let mut state = wire::Lifecycle::new_at(17, high);
+        state.dispatch().unwrap();
+        let request = state.packet();
+        let good = wire::reply_at(&request, &FEX_BODY, high).unwrap();
+        assert_eq!(bind_reply_at(&request, &bytes(good), high), Ok(good));
+        assert!(bind_reply_at(&request, &bytes(good), wire::SOURCE_VA).is_err());
+        assert!(bind_reply(&request, &bytes(good)).is_err());
+        for field in [13, 14, 15] {
+            let mut bad = good;
+            bad[field] ^= 1;
+            assert!(bind_reply_at(&request, &bytes(bad), high).is_err());
         }
     }
 }

@@ -122,7 +122,10 @@ unsafe fn drive(id: u64) -> ! {
                             {
                                 stop(PANIC, 138);
                             }
-                            recovery::install(address, route);
+                            aliases::install_pair(address, route);
+                            if c.alias_profile != 0 {
+                                aliases::acknowledge(s.epoch);
+                            }
                             asm!("dsb ish", "isb");
                             checked(s.acknowledge(id as usize));
                             checked(g.trace(26, id));
@@ -166,10 +169,19 @@ unsafe fn drive(id: u64) -> ! {
                             r.initial = read_record(&raw const (*shared()).captured);
                             r.initial.x[16] = CODE_NEXT;
                             r.initial.sp = STACK_TOP;
-                            checked(validate_object(
+                            if c.alias_profile != 0 {
+                                r.initial.x[6] = natemu_abi::alias::data_address(
+                                    c.alias_profile,
+                                    id,
+                                    s.intervals[id as usize] + 2,
+                                );
+                                r.initial.x[11] = r.initial.x[6] + 128;
+                            }
+                            checked(aliases::validate(
                                 &ptr::read_volatile(&raw const (*shared()).object),
                                 &r.initial,
                                 core::slice::from_raw_parts(CODE_NEXT as *const u8, 48),
+                                s.intervals[id as usize] + 2,
                             ));
                             write_record(at, r);
                             run = Some(r.initial);
@@ -212,7 +224,7 @@ pub unsafe fn finish(fault: u64) -> ! {
                 || esr & (1 << 6) == 0
                 || !matches!(esr & 63, 12..=15)
                 || pc != CODE_NEXT + 36
-                || far != DATA_VA + id * 256 + 128
+                || far != (*at).initial.x[11]
                 || spsr & 15 != 4
                 || ptr::read_volatile(&raw const (*at).faults) != 0
             {

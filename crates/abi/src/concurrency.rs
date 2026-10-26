@@ -53,6 +53,7 @@ pub fn validate_object(object: &Object, frame: &NativeFrame, code: &[u8]) -> Res
 pub struct Coordinator {
     pub participants: u64,
     pub scenario: u64,
+    pub alias_profile: u64,
     pub ready: AtomicU64,
     pub finished: AtomicU64,
     pub lock: AtomicU64,
@@ -91,6 +92,7 @@ impl Coordinator {
         Some(Self {
             participants: n as u64,
             scenario: 0,
+            alias_profile: 0,
             ready: AtomicU64::new(0),
             finished: AtomicU64::new(0),
             lock: AtomicU64::new(0),

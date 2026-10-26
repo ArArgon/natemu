@@ -43,6 +43,9 @@ pub unsafe fn materialize(frame: &NativeFrame) {
     unsafe {
         let mut state = read_record(guest());
         state.materialize(frame, 17, true);
+        if coordinator().alias_profile != 0 {
+            state.rip = natemu_abi::alias::source_rip(coordinator().alias_profile) + 17;
+        }
         write_record(guest(), state);
     }
 }

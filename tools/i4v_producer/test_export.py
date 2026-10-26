@@ -16,6 +16,13 @@ class ExportChecks(unittest.TestCase):
             self.assertEqual(len(result['sites']),site_count)
             self.assertEqual(result['entry_gprs']['rsp'],8)
 
+    def test_actual_alias_objects_bind_both_guest_rips(self):
+        for kind in ('xor','or'):
+            for half,rip in [('low',0x102000),('high',0xffff800000102000)]:
+                result=export.verify(DATA/(kind+'-'+half),dict(case='fex_alias_'+kind+'64',guest_rip=rip))
+                self.assertEqual([site['native_offset'] for site in result['sites']],[16,36])
+                self.assertEqual(len(bytes.fromhex(result['body_hex'])),44)
+
     def mutated(self,name,relative,mutator):
         with tempfile.TemporaryDirectory() as tmp:
             directory=Path(tmp)/name;shutil.copytree(DATA/name,directory)

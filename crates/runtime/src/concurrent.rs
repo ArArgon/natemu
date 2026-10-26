@@ -2,6 +2,7 @@ use super::*;
 use core::sync::atomic::Ordering;
 use natemu_abi::concurrency::*;
 use natemu_abi::paging::Access;
+mod aliases;
 mod events;
 mod maintenance;
 mod source;
@@ -30,6 +31,8 @@ pub unsafe fn initialize() -> ! {
             || c.participants > MAX_CPUS as u64
             || o.configured_vcpus as u64 != c.participants
             || o.vcpu_id >= o.configured_vcpus
+            || c.alias_profile > 2
+            || (c.alias_profile != 0 && c.scenario != 5)
         {
             stop(REJECTED, 80);
         }
@@ -51,10 +54,11 @@ pub unsafe fn initialize() -> ! {
                 asm!("yield", options(nomem, nostack));
             }
         }
-        if let Err(reason) = validate_object(
+        if let Err(reason) = aliases::validate(
             &o,
             &frame,
             core::slice::from_raw_parts(CODE_VA as *const u8, 48),
+            0,
         ) {
             stop(REJECTED, reason);
         }
@@ -65,11 +69,17 @@ pub unsafe fn initialize() -> ! {
         if c.scenario >= 1 {
             recovery::initialize();
             let guard = coordinator::lock(c);
+            if c.alias_profile != 0 {
+                aliases::fetch();
+            }
             if c.scenario >= 4 {
                 events::initial_boundary(&guard, o.vcpu_id as u64);
             }
             let route =
                 recovery::walk(frame.x[6], Access::Read).unwrap_or_else(|_| stop(PANIC, 94));
+            if c.alias_profile != 0 {
+                aliases::prepare(o.vcpu_id as u64, route);
+            }
             ptr::write_volatile(&raw mut (*round()).old_gpa, route.gpa);
             checked(guard.admit(o.vcpu_id as u64));
         }
@@ -126,7 +136,7 @@ unsafe fn queued(fault: u64) -> ! {
                 || esr & (1 << 6) != 0
                 || !matches!(esr & 63, 4..=7)
                 || pc != CODE_VA + 16
-                || far != DATA_VA + id * 256
+                || far != natemu_abi::alias::data_address(c.alias_profile, id, 0)
                 || frame.sp != STACK_TOP
                 || spsr & 15 != 4
                 || ptr::read_volatile(&raw const (*round()).faults) != 0
@@ -242,13 +252,16 @@ unsafe fn remap_wait(id: u64) -> ! {
                     && (id != c.participants - 1
                         || c.acknowledgements.load(Ordering::Relaxed) == all ^ bit)
                 {
-                    let address = DATA_VA + id * 256;
+                    let address = natemu_abi::alias::data_address(c.alias_profile, id, 1);
                     let route =
                         recovery::walk(address, Access::Read).unwrap_or_else(|_| stop(PANIC, 98));
-                    if route.gpa != address + 4096 {
+                    if route.gpa != DATA_VA + id * 256 + 4096 {
                         stop(PANIC, 99);
                     }
-                    recovery::install(address, route);
+                    aliases::install_pair(address, route);
+                    if c.alias_profile != 0 {
+                        aliases::acknowledge(2);
+                    }
                     asm!("dsb ish", "ic iallu", "dsb ish", "isb");
                     c.acknowledgements.fetch_or(bit, Ordering::Relaxed);
                     checked(g.trace(9, id));
@@ -318,13 +331,18 @@ unsafe fn remap_wait(id: u64) -> ! {
         frame.x[16] = if c.scenario >= 3 { CODE_NEXT } else { CODE_VA };
         frame.x[30] = returned as *const () as u64;
         frame.sp = STACK_TOP;
+        if c.alias_profile != 0 {
+            frame.x[6] = natemu_abi::alias::data_address(c.alias_profile, id, 1);
+            frame.x[11] = frame.x[6] + 128;
+        }
         let mut object = ptr::read_volatile(&raw const (*s).object);
         object.kind = if c.scenario >= 3 { LIVE_OR } else { LIVE_LOAD };
         object.code_address = frame.x[16];
-        checked(validate_object(
+        checked(aliases::validate(
             &object,
             &frame,
             core::slice::from_raw_parts(frame.x[16] as *const u8, 48),
+            1,
         ));
         ptr::write_volatile(&raw mut (*s).object, object);
         write_record(&raw mut (*round()).new_initial, frame);
@@ -347,7 +365,7 @@ unsafe fn new_completed(fault: u64) -> ! {
                 || esr & (1 << 6) == 0
                 || !matches!(esr & 63, 12..=15)
                 || pc != (if c.scenario >= 3 { CODE_NEXT } else { CODE_VA }) + 36
-                || far != DATA_VA + id * 256 + 128
+                || far != natemu_abi::alias::data_address(c.alias_profile, id, 1) + 128
                 || spsr & 15 != 4
                 || ptr::read_volatile(&raw const (*round()).dirty_faults) != 0
             {
@@ -375,7 +393,7 @@ unsafe fn new_completed(fault: u64) -> ! {
                 }
                 t
             };
-            if route.gpa != far + 4096 {
+            if route.gpa != DATA_VA + id * 256 + 128 + 4096 {
                 stop(PANIC, 104);
             }
             recovery::install(far, route);

@@ -1,0 +1,85 @@
+{
+  "schema": "natemu-i4v-program-v1",
+  "case": "fex_alias_or64",
+  "guest_rip": 1056768,
+  "bitness": 64,
+  "source_hex": "660febc14801d1488b030f94c2f30f7f07",
+  "source_sha256": "08e0cb4de605d5eb8b4762e67a103f7e94f7d6d6ca186c439df77494de301275",
+  "body_hex": "101eb14efb0005cafa0005abe7031aaac4fcdfc81f2003d5f4179f9a851e40b3bf3b03d57001803d1f4000d5",
+  "body_sha256": "2ebcf1a98e1b6af24eb7401959a587d755969663da05fce5dc5344ee97ce17cd",
+  "producer_sha256": "b614bac26ef89bb8b3d2812a2708a5541314e77e06b6c6771d135ab0424cdc33",
+  "object": {
+    "index": 1,
+    "bytes": 160,
+    "code_bytes": 108,
+    "code_offset": 4,
+    "guest_instructions": 5,
+    "relocation_bytes": 144,
+    "block_address": 281471971491968
+  },
+  "native_object_sha256": "1b897f39fece247085340798629c6a9666c76632ac042a4fce69c6709386e28a",
+  "relocations_sha256": "da934846a258848098cbecbc7b2c0040ecfb5b088050d32b92d9d8bbc37e5dc4",
+  "extraction": [
+    12,
+    56
+  ],
+  "guest_pc": [
+    {
+      "guest_offset": 0,
+      "native_offset": 4
+    },
+    {
+      "guest_offset": 7,
+      "native_offset": 28
+    },
+    {
+      "guest_offset": 13,
+      "native_offset": 44
+    }
+  ],
+  "entry_gprs": {
+    "rax": 4,
+    "rbx": 6,
+    "rcx": 7,
+    "rdx": 5,
+    "rsi": 10,
+    "rdi": 11,
+    "rbp": 9,
+    "rsp": 8,
+    "r8": 12,
+    "r9": 13,
+    "r10": 14,
+    "r11": 15,
+    "r12": 16,
+    "r13": 17,
+    "r14": 19,
+    "r15": 29
+  },
+  "flags": "ADD updates flags; SETZ observes ZF; final CFINV",
+  "sites": [
+    {
+      "native_offset": 16,
+      "guest_offset": 7,
+      "guest_rip": 1056775,
+      "width": 8,
+      "write": false,
+      "address_register": 6,
+      "address_displacement": 0,
+      "continuation": 20,
+      "phase": "precommit",
+      "guest_rsp_register": 8
+    },
+    {
+      "native_offset": 36,
+      "guest_offset": 13,
+      "guest_rip": 1056781,
+      "width": 16,
+      "write": true,
+      "address_register": 11,
+      "address_displacement": 0,
+      "continuation": 40,
+      "phase": "precommit",
+      "guest_rsp_register": 8
+    }
+  ]
+}

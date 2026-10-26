@@ -62,6 +62,15 @@ pub unsafe fn initialize() {
         if state.vm == 0 {
             stop(PANIC, 111);
         }
+        if coordinator().alias_profile != 0 {
+            if state.guest_rip != natemu_abi::alias::source_rip(coordinator().alias_profile)
+                || state.reply_profile != wire::ADDRESS_PROFILE
+            {
+                stop(PANIC, 157);
+            }
+            let _guard = coordinator::lock(coordinator());
+            aliases::fetch();
+        }
         if ptr::read_volatile(
             (PRIVATE + natemu_abi::recovery::SOURCE_OFFSET as u64) as *const [u8; 17],
         ) != state.source()
@@ -107,11 +116,15 @@ pub unsafe fn invalidate() {
         c.old_eligible.store(0, Ordering::Relaxed);
         let mut state = ptr::read_volatile(&raw const (*shared()).lifecycle);
         checked(state.change_source(wire::OR));
-        ptr::copy_nonoverlapping(
-            wire::OR.as_ptr(),
-            (PRIVATE + natemu_abi::recovery::SOURCE_OFFSET as u64) as *mut u8,
-            17,
-        );
+        if c.alias_profile != 0 {
+            aliases::rewrite_source(&wire::OR);
+        } else {
+            ptr::copy_nonoverlapping(
+                wire::OR.as_ptr(),
+                (PRIVATE + natemu_abi::recovery::SOURCE_OFFSET as u64) as *mut u8,
+                17,
+            );
+        }
         checked(state.dispatch());
         ptr::write_volatile(&raw mut (*shared()).lifecycle, state);
         asm!("dsb ish");
@@ -141,6 +154,10 @@ pub unsafe fn replacement() {
             || c.old_eligible.load(Ordering::Relaxed) != 0
         {
             stop(PANIC, 114);
+        }
+        if c.alias_profile != 0 {
+            aliases::fetch();
+            aliases::check_wrong_rip(&state, &current);
         }
         // Source/context are stable under the same authority that publishes.
         if ptr::read_volatile(

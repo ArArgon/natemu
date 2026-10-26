@@ -28,6 +28,7 @@ def main():
     parser.add_argument('--name', required=True)
     parser.add_argument('--producer', type=Path, required=True)
     parser.add_argument('--stack', action='store_true', help='also execute the stack/prefix and staged-reply slice')
+    parser.add_argument('--aliases', action='store_true', help='also execute N=1..4 alias/remap/source composition')
     args = parser.parse_args()
     if resource.getrlimit(resource.RLIMIT_CPU) != (resource.RLIM_INFINITY,) * 2:
         parser.error('HVF requires unlimited inherited CPU limits; external supervision bounds runs')
@@ -35,10 +36,11 @@ def main():
     supervisor = module(REPO / 'experiments/track01/run_check.py', 'supervisor')
     run = retention.allocate(os.environ.get('NATEMU_RAW_ROOT'), REPO, args.name)
     record = dict(format='natemu-i4v-run-v1', purpose='exploratory-development',
-                  status='preparing', full_i4v_complete=False, tested_vcpus=[1],
+                  status='preparing', full_i4v_complete=False, tested_vcpus=[1,2,3,4] if args.aliases else [1],
                   started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                   source_origin=str(REPO), jobs=[], commands=[], compilations=[], cells=[],
                   stack_enabled=args.stack,
+                  aliases_enabled=args.aliases,
                   limits=dict(build_jobs=2, build_rss_bytes=8*1024**3,
                               worker_rss_bytes=512*1024**2, cell_seconds=120,
                               bundle_seconds=1200, run_disk_bytes=2*1024**3))
@@ -52,6 +54,10 @@ def main():
                      'tools/i4v_worker.py', 'tools/test_i4v_worker.py',
                      'tools/i4v_stack_worker.py', 'tools/test_i4v_stack_worker.py',
                      'tools/i4v_stack_check.py', 'tools/test_i4v_stack_check.py',
+                     'tools/i4v_alias_worker.py', 'tools/test_i4v_alias_worker.py',
+                     'tools/check_i4v_alias.py', 'tools/test_check_i4v_alias.py',
+                     'tools/check_i4.py', 'tools/check_i4_pressure.py', 'tools/check_i1.py',
+                     'tools/check_i2.py', 'tools/check_i3_paging.py',
                      'tools/run_i1.py', 'tools/i4v_check.py', 'tools/test_i4v_check.py',
                      'experiments/track01/source/run.py', 'experiments/track01/run_check.py'):
             origin, target = REPO / name, source / name
@@ -86,7 +92,8 @@ def main():
             directory.mkdir()
             specification = dict(argv=list(map(str, argv)), cwd=str(source), environment=environment)
             if oracle:
-                specification['oracle'] = str(source / ('tools/i4v_stack_check.py' if oracle == 'stack' else 'tools/i4v_check.py'))
+                specification['oracle'] = str(source / ('tools/i4v_stack_check.py' if oracle == 'stack'
+                    else 'tools/check_i4v_alias.py' if oracle == 'aliases' else 'tools/i4v_check.py'))
             path = directory / 'job.json'
             path.write_text(json.dumps(specification, indent=2)+'\n')
             remaining = min(wall, deadline - time.monotonic())
@@ -110,7 +117,9 @@ def main():
                                        ('oracle-tests', 'tools', 'test_i4v_check.py'),
                                        ('worker-tests', 'tools', 'test_i4v_worker.py'),
                                        ('stack-oracle-tests', 'tools', 'test_i4v_stack_check.py'),
-                                       ('stack-worker-tests', 'tools', 'test_i4v_stack_worker.py')):
+                                       ('stack-worker-tests', 'tools', 'test_i4v_stack_worker.py'),
+                                       ('alias-oracle-tests', 'tools', 'test_check_i4v_alias.py'),
+                                       ('alias-worker-tests', 'tools', 'test_i4v_alias_worker.py')):
             job(label, [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', folder, '-p', pattern])
         job('build-host', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-host'], wall=600, rss=8*1024**3)
         job('build-runtime', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], wall=600, rss=8*1024**3)
@@ -204,6 +213,28 @@ def main():
                         raise ValueError('stack compilation differs from actual requested RIP/body')
                     record['compilations'].append(dict(directory=str(directory.relative_to(run)), export=exported))
                 record['cells'].append(dict(name=label, producer=str(output.relative_to(run)), reply_mutation=mutation))
+        if args.aliases:
+            sys.path.insert(0, str(source / 'tools'))
+            alias_worker = module(source / 'tools/i4v_alias_worker.py', 'alias_worker')
+            sys.path.pop(0)
+            for profile, scenario, rip in ((1,'alias-low',0x102000), (2,'alias-high',0xffff800000102000)):
+                for n in (1,2,3,4):
+                    label = f'{scenario}-n{n}'
+                    output = run / (label+'-producer')
+                    result = job(label, [host, runtime, 'i4', scenario, str(n), producer, output], oracle='aliases')
+                    report = json.loads((result/'command.stdout').read_text())
+                    if (report['profile'] != 'i4-'+scenario or report['alias_profile'] != profile
+                            or report['source_rip'] != rip or report['configured_vcpus'] != n
+                            or report['tested_vcpus'] != n or report['delayed_owner_ms'] != 50):
+                        raise ValueError('alias report differs from requested N/address profile')
+                    alias_worker.verify_compilations(output, report['requests'])
+                    for index, request in enumerate(report['requests']):
+                        directory = output / f'request-{index:03}'
+                        exported = alias_worker.verify_request(directory, request)
+                        if exported['guest_rip'] != rip:
+                            raise ValueError('alias compilation does not use requested full RIP')
+                        record['compilations'].append(dict(directory=str(directory.relative_to(run)), export=exported))
+                    record['cells'].append(dict(name=label, producer=str(output.relative_to(run)), vcpus=n))
         record['status'] = 'passed'
     except BaseException as error:
         record.update(status='failed', error=str(error))

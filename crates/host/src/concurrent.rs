@@ -2,6 +2,7 @@
 use super::*;
 use natemu_abi::concurrency::*;
 use natemu_abi::translation as wire;
+use natemu_abi::{alias, shadow};
 mod producer;
 use std::{
     sync::{atomic::Ordering, mpsc},
@@ -99,7 +100,7 @@ impl Drop for Cpu {
 
 // Each root has its own boot alias and private state/stacks. The immutable
 // native object, guest data and coordinator deliberately share physical pages.
-fn tables(memory: &Memory, base: usize) {
+fn tables(memory: &Memory, base: usize, aliases: bool) {
     let word = |at, value| memory.word(base + at, value);
     let table = |offset| IPA + base as u64 + offset + 3;
     let attrs = 3 | 1 << 10 | 3 << 8;
@@ -114,9 +115,14 @@ fn tables(memory: &Memory, base: usize) {
     );
     word(0x12008, table(0x13000));
     word(0x13000, table(0x14000));
+    if aliases {
+        word(shadow::UPPER_ROOT + 256 * 8, table(shadow::UPPER_L1 as u64));
+        word(shadow::UPPER_L1, table(shadow::UPPER_L2 as u64));
+        word(shadow::UPPER_L2, table(shadow::UPPER_LEAF as u64));
+    }
     for offset in (0..RAM_SIZE).step_by(4096) {
         let text = offset < 0x10000 || (CODE_OFFSET..CODE_OFFSET + 8192).contains(&offset);
-        let writable = (0x10000..0x17000).contains(&offset)
+        let writable = (0x10000..if aliases { 0x1b000 } else { 0x17000 }).contains(&offset)
             || (SHARED_OFFSET..SHARED_OFFSET + 0x10000).contains(&offset)
             || (BANK_OFFSET..BANK_OFFSET + 0x2000).contains(&offset)
             || (0x70000..0x84000).contains(&offset)
@@ -165,7 +171,7 @@ fn run_owners(
     tcr: u64,
     delay: u64,
     memory: usize,
-    compiler_config: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    compiler_config: Option<(std::path::PathBuf, std::path::PathBuf, u64)>,
 ) -> Result<Vec<wire::Packet>> {
     thread::scope(|scope| {
         let (prepared_tx, prepared_rx) = mpsc::channel();
@@ -199,8 +205,16 @@ fn run_owners(
                         if id == n - 1 {
                             thread::sleep(Duration::from_millis(delay));
                         }
-                        if let Some((binary, output)) = compiler_config {
-                            compiler = Some(producer::Compiler::new(binary, output)?);
+                        if let Some((binary, output, profile)) = compiler_config {
+                            compiler = Some(if profile == 0 {
+                                producer::Compiler::new(binary, output)?
+                            } else {
+                                producer::Compiler::new_alias(
+                                    binary,
+                                    output,
+                                    alias::source_rip(profile),
+                                )?
+                            });
                         }
                         cpu.run(memory + id * RAM_SIZE + SHARED_OFFSET, &mut compiler)
                     }))
@@ -309,10 +323,20 @@ pub fn run(args: &[String]) -> Result<()> {
         "remap" => 2,
         "compose" => 3,
         "events" => 4,
-        "pressure" => 5,
+        "pressure" | "alias-low" | "alias-high" => 5,
         _ => return Err("unsupported I4 scenario".into()),
     };
-    let compose = matches!(args[3].as_str(), "compose" | "events" | "pressure");
+    let alias_profile = match args[3].as_str() {
+        "alias-low" => 1,
+        "alias-high" => 2,
+        _ => 0,
+    };
+    coord.alias_profile = alias_profile;
+    let source_rip = alias::source_rip(alias_profile);
+    let compose = matches!(
+        args[3].as_str(),
+        "compose" | "events" | "pressure" | "alias-low" | "alias-high"
+    );
     if compose {
         coord.published.store(0, Ordering::Relaxed);
     }
@@ -347,7 +371,7 @@ pub fn run(args: &[String]) -> Result<()> {
     if unsafe { getentropy((&raw mut vm_id).cast(), 8) } != 0 || vm_id == 0 {
         return Err("VM identity entropy unavailable".into());
     }
-    let pressure = args[3] == "pressure";
+    let pressure = matches!(args[3].as_str(), "pressure" | "alias-low" | "alias-high");
     if pressure {
         unsafe {
             ptr::write(
@@ -366,13 +390,13 @@ pub fn run(args: &[String]) -> Result<()> {
         if id != 0 {
             memory.copy(base, &image);
         }
-        tables(&memory, base);
+        tables(&memory, base, alias_profile != 0);
         let (mut frame, mut bank, data) = seed(id);
         for b in &mut bank {
             *b ^= id as u8;
         }
-        frame.x[6] += (id * 256) as u64;
-        frame.x[11] += (id * 256) as u64;
+        frame.x[6] = alias::data_address(alias_profile, id as u64, 0);
+        frame.x[11] = frame.x[6] + 128;
         memory.copy(base + BANK_OFFSET, &bank);
         memory.copy(DATA_OFFSET + id * 256, &data);
         let mut replacement = data.map(|b| b ^ 0x5a);
@@ -399,15 +423,28 @@ pub fn run(args: &[String]) -> Result<()> {
             tcr: 0,
             service_pc: 0,
             mode: MODE,
-            lifecycle: natemu_abi::translation::Lifecycle::new(vm_id),
+            lifecycle: if alias_profile != 0 {
+                natemu_abi::translation::Lifecycle::new_at(vm_id, source_rip)
+            } else {
+                natemu_abi::translation::Lifecycle::new(vm_id)
+            },
         };
         unsafe {
             ptr::write(memory.0.add(base + SHARED_OFFSET).cast::<Shared>(), shared);
+            if alias_profile != 0 {
+                ptr::write(
+                    memory.0.add(base + alias::OFFSET).cast::<alias::Record>(),
+                    alias::Record::ZERO,
+                );
+            }
         }
         seeds.push((frame, bank, data));
     }
     if args[3] != "entry" {
         recovery::prepare(&memory, &seeds[0].0, "cold", false)?;
+        if alias_profile != 0 {
+            memory.word(natemu_abi::recovery::TABLE_OFFSET + 256 * 8, 0x2007);
+        }
         for id in 0..n {
             unsafe {
                 ptr::write(
@@ -421,8 +458,12 @@ pub fn run(args: &[String]) -> Result<()> {
                         .cast::<natemu_abi::recovery::Recovery>(),
                     natemu_abi::recovery::Recovery::new(0),
                 );
-                if matches!(args[3].as_str(), "events" | "pressure") {
+                if matches!(
+                    args[3].as_str(),
+                    "events" | "pressure" | "alias-low" | "alias-high"
+                ) {
                     let mut guest = natemu_abi::recovery::GuestState::seed(&seeds[id].0);
+                    guest.rip = source_rip;
                     if id == 0 {
                         guest.rflags &= !0x200;
                     }
@@ -433,12 +474,14 @@ pub fn run(args: &[String]) -> Result<()> {
                             .cast::<natemu_abi::recovery::GuestState>(),
                         guest,
                     );
+                    let mut event = EventRecord::new(&seeds[id].0, id);
+                    event.packet.rip = source_rip;
                     ptr::write(
                         memory
                             .0
                             .add(id * RAM_SIZE + EVENT_OFFSET)
                             .cast::<EventRecord>(),
-                        EventRecord::new(&seeds[id].0, id),
+                        event,
                     );
                 }
             }
@@ -455,14 +498,22 @@ pub fn run(args: &[String]) -> Result<()> {
             "map concurrent backing",
         )?;
     }
-    let tcr = 16 | 1 << 8 | 1 << 10 | 3 << 12 | 1 << 23 | 2 << 32;
+    let tcr = if alias_profile != 0 {
+        shadow::TCR_BOTH
+    } else {
+        16 | 1 << 8 | 1 << 10 | 3 << 12 | 1 << 23 | 2 << 32
+    };
     let requests = run_owners(
         n,
         tcr,
         delay,
         memory.0 as usize,
         if compose {
-            Some((args[5].clone().into(), args[6].clone().into()))
+            Some((
+                args[5].clone().into(),
+                args[6].clone().into(),
+                alias_profile,
+            ))
         } else {
             None
         },
@@ -473,6 +524,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut faults = Vec::new();
     let mut new_cells = Vec::new();
     let mut event_records = Vec::new();
+    let mut alias_records = Vec::new();
     for (id, (frame, bank, data)) in seeds.iter().enumerate() {
         let base = id * RAM_SIZE;
         let s = unsafe { ptr::read(memory.0.add(base + SHARED_OFFSET).cast::<Shared>()) };
@@ -484,18 +536,31 @@ pub fn run(args: &[String]) -> Result<()> {
         entry.x[30] = s.capture_pc;
         if !matches!(
             args[3].as_str(),
-            "remap" | "compose" | "events" | "pressure"
+            "remap" | "compose" | "events" | "pressure" | "alias-low" | "alias-high"
         ) && s.initial != entry
         {
             return Err(format!("CPU{id}: entry state changed"));
         }
         let r = unsafe { ptr::read(memory.0.add(base + ROUND_OFFSET).cast::<Round>()) };
-        if matches!(args[3].as_str(), "events" | "pressure") {
+        if matches!(
+            args[3].as_str(),
+            "events" | "pressure" | "alias-low" | "alias-high"
+        ) {
             let e = unsafe { ptr::read(memory.0.add(base + EVENT_OFFSET).cast::<EventRecord>()) };
             event_records.push(format!("{{\"id\":{id},\"pending\":{},\"token_state\":{},\"notifications\":{},\"consumed\":{},\"deliveries\":{},\"boundary\":{},\"blocked\":{},\"wait_checks\":{},\"shadow\":{},\"priority\":{},\"vector\":{},\"packet\":{}}}",
                 u64::from(c.event_pending[id].load(Ordering::Acquire)==1),c.event_pending[id].load(Ordering::Acquire),c.event_notifications[id].load(Ordering::Acquire),
                 e.consumed,e.deliveries,e.boundary,e.blocked,e.wait_checks,e.shadow,e.priority,0x40+id,
                 recovery::guest_json(&e.packet)));
+        }
+        if alias_profile != 0 {
+            let a =
+                unsafe { ptr::read(memory.0.add(base + alias::OFFSET).cast::<alias::Record>()) };
+            alias_records.push(format!("{{\"id\":{id},\"current_el\":{},\"sctlr\":{},\"actlr\":{},\"tcr\":{},\"ttbr1\":{},\"warm\":{:?},\"ack_count\":{},\"acks\":{:?},\"wrong_rip_rejections\":{},\"blank_before_publish\":{},\"source_address\":{},\"source_gpa\":{},\"source_leaf_before\":{},\"source_leaf_after\":{},\"source_before\":{:?},\"source_after\":{:?},\"upper_root\":{:?},\"upper_l1\":{:?},\"upper_l2\":{:?},\"upper_leaf\":{:?},\"lower_leaf\":{:?}}}",
+                s.current_el,s.sctlr,s.actlr,s.tcr,a.ttbr1,a.warm,a.ack_count,a.acks,
+                a.wrong_rip_rejections,a.blank_before_publish,a.source_address,a.source_gpa,a.source_leaf_before,a.source_leaf_after,a.source_before,a.source_after,
+                i4v::words(&memory,base+shadow::UPPER_ROOT),i4v::words(&memory,base+shadow::UPPER_L1),
+                i4v::words(&memory,base+shadow::UPPER_L2),i4v::words(&memory,base+shadow::UPPER_LEAF),
+                i4v::words(&memory,base+shadow::LOWER_LEAF)));
         }
         if args[3] != "entry" {
             faults.push(format!("{{\"id\":{id},\"faults\":{},\"old_gpa\":{},\"frame\":{},\"esr\":{},\"far\":{},\"pc\":{},\"spsr\":{}}}",
@@ -524,7 +589,7 @@ pub fn run(args: &[String]) -> Result<()> {
         );
         if matches!(
             args[3].as_str(),
-            "remap" | "compose" | "events" | "pressure"
+            "remap" | "compose" | "events" | "pressure" | "alias-low" | "alias-high"
         ) {
             if !pressure && s.initial != r.new_initial {
                 return Err("new entry state changed".into());
@@ -540,19 +605,19 @@ pub fn run(args: &[String]) -> Result<()> {
                 r.dirty_spsr
             );
             new_cells.push(format!("{{\"dirty_fault\":{dirty},\"id\":{id},\"dirty_faults\":{},\"case\":\"{case}\",\"status\":{},\"initial\":{},\"captured\":{},\"memory_base\":{},\"memory_before\":{:?},\"memory_after\":{:?},\"bank_before\":{bank:?},\"bank_after\":{:?},\"object_pc\":{code},\"capture_pc\":{}}}",
-                r.dirty_faults,s.status,frame_json(&r.new_initial),frame_json(second_frame),DATA_VA+(id*256) as u64,
+                r.dirty_faults,s.status,frame_json(&r.new_initial),frame_json(second_frame),r.new_initial.x[6],
                 new_data[id],second_memory,memory.read::<512>(base+BANK_OFFSET),s.capture_pc));
         }
         let old_frame = if matches!(
             args[3].as_str(),
-            "remap" | "compose" | "events" | "pressure"
+            "remap" | "compose" | "events" | "pressure" | "alias-low" | "alias-high"
         ) {
             &r.first_frame
         } else {
             &s.captured
         };
         cells.push(format!("{{\"id\":{id},\"case\":\"live_load\",\"status\":{},\"initial\":{},\"captured\":{},\"memory_base\":{},\"memory_before\":{data:?},\"memory_after\":{:?},\"bank_before\":{bank:?},\"bank_after\":{:?},\"object_pc\":{CODE_VA},\"capture_pc\":{}}}",
-            s.status,frame_json(frame),frame_json(old_frame),DATA_VA+(id*256) as u64,
+            s.status,frame_json(frame),frame_json(old_frame),frame.x[6],
             first_memory,memory.read::<512>(base+BANK_OFFSET),s.capture_pc));
     }
     let trace: Vec<_> = c
@@ -610,7 +675,7 @@ pub fn run(args: &[String]) -> Result<()> {
                     )
                 };
                 intervals.push(format!("{{\"id\":{id},\"ordinal\":{},\"heads\":{},\"epoch\":{},\"gpa\":{},\"case\":\"live_or\",\"status\":1,\"initial\":{},\"captured\":{},\"memory_base\":{},\"memory_before\":{:?},\"memory_after\":{:?},\"bank_before\":{:?},\"bank_after\":{:?},\"object_pc\":{CODE_NEXT},\"capture_pc\":{},\"dirty_faults\":{},\"dirty_fault\":{{\"frame\":{},\"esr\":{},\"far\":{},\"pc\":{},\"spsr\":{}}}}}",
-                    r.ordinal,r.heads,r.epoch,r.gpa,frame_json(&r.initial),frame_json(&r.captured),DATA_VA+(id*256) as u64,
+                    r.ordinal,r.heads,r.epoch,r.gpa,frame_json(&r.initial),frame_json(&r.captured),r.initial.x[6],
                     r.before,r.after,seeds[id].1,memory.read::<512>(id*RAM_SIZE+BANK_OFFSET),state.capture_pc,
                     r.faults,frame_json(&r.dirty_frame),r.esr,r.far,r.pc,r.spsr));
             }
@@ -657,7 +722,8 @@ pub fn run(args: &[String]) -> Result<()> {
         compose_leaf
     );
     println!(
-        "{{\"maintenance\":{maintenance_json},\"events\":[{}],\"source\":{source_summary},\"requests\":{requests:?},\"coherence\":{summary},\"new_cells\":[{}],\"profile\":\"i4-{scenario}\",\"trace\":{trace:?},\"faults\":[{}],\"retained\":{},\"configured_vcpus\":{n},\"tested_vcpus\":{n},\"delayed_owner_ms\":{delay},\"ready\":{},\"finished\":{},\"cells\":[{}]}}",
+        "{{\"alias_profile\":{alias_profile},\"source_rip\":{source_rip},\"aliases\":[{}],\"maintenance\":{maintenance_json},\"events\":[{}],\"source\":{source_summary},\"requests\":{requests:?},\"coherence\":{summary},\"new_cells\":[{}],\"profile\":\"i4-{scenario}\",\"trace\":{trace:?},\"faults\":[{}],\"retained\":{},\"configured_vcpus\":{n},\"tested_vcpus\":{n},\"delayed_owner_ms\":{delay},\"ready\":{},\"finished\":{},\"cells\":[{}]}}",
+        alias_records.join(","),
         event_records.join(","),
         new_cells.join(","),
         faults.join(","),

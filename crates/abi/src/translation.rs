@@ -27,11 +27,14 @@ pub const CHANGED: u64 = 14;
 pub const CANCELLED: u64 = 15;
 pub const STALE: u64 = 16;
 pub const BAD_REPLY: u64 = 17;
+pub const ADDRESS_PROFILE: u64 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct Lifecycle {
     pub vm: u64,
+    pub guest_rip: u64,
+    pub reply_profile: u64,
     pub source_generation: u64,
     pub context_generation: u64,
     pub serial: u64,
@@ -49,6 +52,8 @@ impl Lifecycle {
     pub const fn new(vm: u64) -> Self {
         Self {
             vm,
+            guest_rip: SOURCE_VA,
+            reply_profile: PROFILE as u64,
             source_generation: 1,
             context_generation: 1,
             serial: 0,
@@ -62,6 +67,13 @@ impl Lifecycle {
             cancellations: 0,
             event: READY,
         }
+    }
+    pub const fn new_at(vm: u64, guest_rip: u64) -> Self {
+        assert!(guest_rip == SOURCE_VA || guest_rip == crate::shadow::HIGH_BASE + SOURCE_VA);
+        let mut result = Self::new(vm);
+        result.guest_rip = guest_rip;
+        result.reply_profile = ADDRESS_PROFILE;
+        result
     }
     pub fn source(&self) -> [u8; 17] {
         match self.variant {
@@ -79,9 +91,13 @@ impl Lifecycle {
         p[5] = self.vm;
         p[6] = if self.variant == 3 { 16 } else { 17 };
         put_bytes(&mut p[7..10], &self.source());
-        p[10] = if self.variant >= 2 { 2 } else { PROFILE as u64 };
+        p[10] = if self.variant >= 2 {
+            2
+        } else {
+            self.reply_profile
+        };
         p[11] = 0;
-        p[12] = SOURCE_VA;
+        p[12] = self.guest_rip;
         p[13] = self.requests;
         p[14] = self.executions;
         p[15] = self.serial;
@@ -139,9 +155,20 @@ impl Lifecycle {
         {
             return Err(STALE);
         }
-        let source = source_words(&p[13..16])?;
-        if source != self.source() {
-            return Err(STALE);
+        if self.reply_profile == ADDRESS_PROFILE {
+            if p[13] != self.guest_rip {
+                return Err(STALE);
+            }
+            if p[14] != 64 || p[15] != ADDRESS_PROFILE {
+                return Err(BAD_REPLY);
+            }
+        } else if self.reply_profile == PROFILE as u64 {
+            let source = source_words(&p[13..16])?;
+            if source != self.source() {
+                return Err(STALE);
+            }
+        } else {
+            return Err(BAD_REPLY);
         }
         if p[6] != 44 || p[12] >> 32 != 0 {
             return Err(BAD_REPLY);
@@ -196,12 +223,19 @@ pub fn source_words(words: &[u64]) -> Result<[u8; 17], u64> {
     Ok(source)
 }
 pub fn reply(request: &Packet, body: &[u8]) -> Result<Packet, u64> {
+    reply_for(request, body, SOURCE_VA, PROFILE as u64)
+}
+pub fn reply_at(request: &Packet, body: &[u8], guest_rip: u64) -> Result<Packet, u64> {
+    reply_for(request, body, guest_rip, ADDRESS_PROFILE)
+}
+fn reply_for(request: &Packet, body: &[u8], guest_rip: u64, profile: u64) -> Result<Packet, u64> {
     if request[0] != MISS
         || request[1] != VERSION as u64
         || request[6] != 17
-        || request[10] != PROFILE as u64
+        || request[10] != profile
         || request[11] != 0
-        || request[12] != SOURCE_VA
+        || (guest_rip != SOURCE_VA && guest_rip != crate::shadow::HIGH_BASE + SOURCE_VA)
+        || request[12] != guest_rip
         || body.len() != 44
     {
         return Err(BAD_REPLY);
@@ -220,13 +254,36 @@ pub fn reply(request: &Packet, body: &[u8]) -> Result<Packet, u64> {
     p[2..6].copy_from_slice(&request[2..6]);
     p[6] = 44;
     put_bytes(&mut p[7..13], body);
-    p[13..16].copy_from_slice(&request[7..10]);
+    if profile == ADDRESS_PROFILE {
+        p[13..16].copy_from_slice(&[guest_rip, 64, ADDRESS_PROFILE]);
+    } else {
+        p[13..16].copy_from_slice(&request[7..10]);
+    }
     Ok(p)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn high_rip_requires_explicit_request_binding() {
+        let rip = crate::shadow::HIGH_BASE + SOURCE_VA;
+        let mut s = Lifecycle::new_at(41, rip);
+        s.dispatch().unwrap();
+        let request = s.packet();
+        assert_eq!(request[12], rip);
+        assert_eq!(reply(&request, &FEX_BODY), Err(BAD_REPLY));
+        assert!(
+            s.validate_reply(&reply_at(&request, &FEX_BODY, rip).unwrap())
+                .is_ok()
+        );
+        assert_eq!(reply_at(&request, &FEX_BODY, SOURCE_VA), Err(BAD_REPLY));
+        let mut low_request = request;
+        low_request[12] = SOURCE_VA;
+        let wrong_rip = reply_at(&low_request, &FEX_BODY, SOURCE_VA).unwrap();
+        assert_eq!(s.validate_reply(&wrong_rip), Err(STALE));
+        assert_eq!(s.pending, 1);
+    }
     #[test]
     fn stale_source_and_context_do_not_consume_replacement() {
         for source_change in [true, false] {

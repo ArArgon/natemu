@@ -1,4 +1,4 @@
-"""Admit two finite native bodies and bind their sites to actual FEX output."""
+"""Admit four finite native bodies and bind their sites to actual FEX output."""
 import hashlib
 import json
 from pathlib import Path
@@ -9,6 +9,16 @@ ENTRY_GPRS = dict(zip(('rax','rbx','rcx','rdx','rsi','rdi','rbp','rsp',
                       'r8','r9','r10','r11','r12','r13','r14','r15'),
                      (4,6,7,5,10,11,9,8,12,13,14,15,16,17,19,29)))
 CASES = {
+    'fex_alias_xor64': dict(source='660fefc14801d1488b030f94c2f30f7f07', instructions=5, host_count=11,
+        body='101e316efb0005cafa0005abe7031aaac4fcdfc81f2003d5f4179f9a851e40b3bf3b03d57001803d1f4000d5',
+        object_bytes=160, code_bytes=108, pc=[(0,4),(7,28),(13,44)],
+        sites=[(16,7,8,False,6,0),(36,13,16,True,11,0)],
+        flags='ADD updates flags; SETZ observes ZF; final CFINV'),
+    'fex_alias_or64': dict(source='660febc14801d1488b030f94c2f30f7f07', instructions=5, host_count=11,
+        body='101eb14efb0005cafa0005abe7031aaac4fcdfc81f2003d5f4179f9a851e40b3bf3b03d57001803d1f4000d5',
+        object_bytes=160, code_bytes=108, pc=[(0,4),(7,28),(13,44)],
+        sites=[(16,7,8,False,6,0),(36,13,16,True,11,0)],
+        flags='ADD updates flags; SETZ observes ZF; final CFINV'),
     'fex_memory_data64': dict(source='488b03', instructions=1, host_count=2,
         body='c4fcdfc81f2003d5', object_bytes=128, code_bytes=76,
         pc=[(0,4),(0,12)], sites=[(0,0,8,False,6,0)]),
@@ -77,7 +87,7 @@ def parse(directory, case):
                 source_hex=source.hex(),source_sha256=sha(source),body_hex=body.hex(),body_sha256=sha(body),
                 producer_sha256=record['producer_sha256'],object=obj,native_object_sha256=sha(raw),
                 relocations_sha256=sha(reloc),extraction=[12,end],guest_pc=[dict(guest_offset=g,native_offset=n) for g,n in pc],
-                entry_gprs=ENTRY_GPRS,flags='unchanged',sites=sites)
+                entry_gprs=ENTRY_GPRS,flags=spec.get('flags','unchanged'),sites=sites)
 
 def export_program(directory, case):
     directory=Path(directory); result=parse(directory,case)

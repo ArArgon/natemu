@@ -30,7 +30,15 @@ python3 tools/i4v_producer/compile.py \
   --case fex_memory_data64 --rip 0xffff800000102000
 ```
 
-The other admitted case is `fex_push_immediates64`. `--source HEX` and
+Additional admitted cases are `fex_push_immediates64`, `fex_alias_xor64`, and
+`fex_alias_or64`. The alias cases preserve the existing I4 44-byte fragment
+and bind it to the actual low/high guest RIP using the same source-window seam.
+Their final-producer probes are retained in
+`/Users/liaozping/orca/natemu-raw/i4v-alias-producer-20261026-01`.
+`../i4v_alias_worker.py` consumes the resident's profile-3 packet and returns
+the generated body with an explicit RIP/mode/profile trailer; its verifier
+reparses the original packet and actual producing artifacts.
+`--source HEX` and
 `--instructions N` can be supplied with a case and must match it. Case admission
 requires the exact expected host instruction count. The worker retains source,
 packed input, commands, container outcome, full object/relocations, compiler log,
@@ -73,13 +81,15 @@ The existing input header already supports 32-bit protected-mode compilation.
 FEX asserts a fixed mode within each context, so each request uses a fresh
 context. This does not implement runtime mode switching. The generic compile
 probe accepts `--bitness 32 --source HEX --instructions N --expected-host N`,
-but runtime body admission currently covers only the two 64-bit cases.
+but body admission currently covers only the four finite 64-bit cases.
 
 Final-build controls retain high/low load compilations, high/low RIP-relative
 LEA (the emitted value is the requested RIP + 7), a 32-bit moffs-load case, and
 a truncated-prefix negative control. These prove compilation/address handling,
 not execution, memory ordering, boot support or complete recovery semantics.
-FEX's count test is not a semantic correctness oracle.
+FEX's count test is not a semantic correctness oracle. The alias cases update
+flags and are admitted through the existing I4 native-state contract; their
+site locations are not general allocated recovery maps.
 
 ## Checks
 
