@@ -10,7 +10,7 @@ use std::{
 
 const BODY: [u8; 8] = [0xc4, 0xfc, 0xdf, 0xc8, 0x1f, 0x20, 0x03, 0xd5];
 
-fn words(memory: &Memory, offset: usize) -> [u64; 512] {
+pub(super) fn words(memory: &Memory, offset: usize) -> [u64; 512] {
     let bytes = memory.read::<4096>(offset);
     core::array::from_fn(|i| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap()))
 }
@@ -19,7 +19,7 @@ fn word(memory: &Memory, offset: usize) -> u64 {
     u64::from_le_bytes(memory.read::<8>(offset))
 }
 
-fn upper_links(memory: &Memory) -> [u64; 3] {
+pub(super) fn upper_links(memory: &Memory) -> [u64; 3] {
     [
         word(memory, shadow::UPPER_ROOT + 256 * 8),
         word(memory, shadow::UPPER_L1),
@@ -27,7 +27,7 @@ fn upper_links(memory: &Memory) -> [u64; 3] {
     ]
 }
 
-fn prepare_shadow(memory: &Memory) {
+pub(super) fn prepare_shadow(memory: &Memory) {
     page_tables(memory);
     let descriptor = |offset: usize| IPA + offset as u64 + 3;
     memory.word(shadow::UPPER_ROOT + 256 * 8, descriptor(shadow::UPPER_L1));

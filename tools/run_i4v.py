@@ -27,6 +27,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--name', required=True)
     parser.add_argument('--producer', type=Path, required=True)
+    parser.add_argument('--stack', action='store_true', help='also execute the stack/prefix and staged-reply slice')
     args = parser.parse_args()
     if resource.getrlimit(resource.RLIMIT_CPU) != (resource.RLIM_INFINITY,) * 2:
         parser.error('HVF requires unlimited inherited CPU limits; external supervision bounds runs')
@@ -37,6 +38,7 @@ def main():
                   status='preparing', full_i4v_complete=False, tested_vcpus=[1],
                   started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                   source_origin=str(REPO), jobs=[], commands=[], compilations=[], cells=[],
+                  stack_enabled=args.stack,
                   limits=dict(build_jobs=2, build_rss_bytes=8*1024**3,
                               worker_rss_bytes=512*1024**2, cell_seconds=120,
                               bundle_seconds=1200, run_disk_bytes=2*1024**3))
@@ -48,6 +50,8 @@ def main():
         for name in ('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo', 'crates',
                      'fixtures/i4v', 'tools/i4v_producer', 'tools/run_i4v.py',
                      'tools/i4v_worker.py', 'tools/test_i4v_worker.py',
+                     'tools/i4v_stack_worker.py', 'tools/test_i4v_stack_worker.py',
+                     'tools/i4v_stack_check.py', 'tools/test_i4v_stack_check.py',
                      'tools/run_i1.py', 'tools/i4v_check.py', 'tools/test_i4v_check.py',
                      'experiments/track01/source/run.py', 'experiments/track01/run_check.py'):
             origin, target = REPO / name, source / name
@@ -82,7 +86,7 @@ def main():
             directory.mkdir()
             specification = dict(argv=list(map(str, argv)), cwd=str(source), environment=environment)
             if oracle:
-                specification['oracle'] = str(source / 'tools/i4v_check.py')
+                specification['oracle'] = str(source / ('tools/i4v_stack_check.py' if oracle == 'stack' else 'tools/i4v_check.py'))
             path = directory / 'job.json'
             path.write_text(json.dumps(specification, indent=2)+'\n')
             remaining = min(wall, deadline - time.monotonic())
@@ -104,7 +108,9 @@ def main():
         for label, folder, pattern in (('producer-tests', 'tools/i4v_producer', 'test_*.py'),
                                        ('expectation-tests', 'fixtures/i4v', 'test_*.py'),
                                        ('oracle-tests', 'tools', 'test_i4v_check.py'),
-                                       ('worker-tests', 'tools', 'test_i4v_worker.py')):
+                                       ('worker-tests', 'tools', 'test_i4v_worker.py'),
+                                       ('stack-oracle-tests', 'tools', 'test_i4v_stack_check.py'),
+                                       ('stack-worker-tests', 'tools', 'test_i4v_stack_worker.py')):
             job(label, [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', folder, '-p', pattern])
         job('build-host', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-host'], wall=600, rss=8*1024**3)
         job('build-runtime', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], wall=600, rss=8*1024**3)
@@ -159,6 +165,45 @@ def main():
                     raise ValueError('runtime reply differs from producer delivery/control mutation')
                 record['compilations'].append(dict(directory=str(directory.relative_to(run)), export=exported))
             record['cells'].append(dict(name=label, producer=str(output.relative_to(run)), reply_mutation=mutation))
+        if args.stack:
+            # The verifier's imports must come from the retained snapshot too.
+            sys.path.insert(0, str(source / 'tools'))
+            stack_worker = module(source / 'tools/i4v_stack_worker.py', 'stack_worker')
+            sys.path.pop(0)
+            scenarios = ('cold', 'low_stack', 'ro_first', 'ro_after_first', 'np_after_first',
+                         'wp_off', 'user_ro', 'user_denied', 'user_ok', 'parent_ro',
+                         'fetch_nx', 'smep', 'ss_first', 'ss_after_first', 'ss_span',
+                         'gp_after_pushes', 'read_np_after_pushes')
+            stack_cells = [(region, rip, scenario, -1)
+                           for region, rip in (('high', 0xffff800000102000), ('low', 0x102000))
+                           for scenario in scenarios]
+            stack_cells += [('high', 0xffff800000102000, 'cold', i) for i in range(48)]
+            for region, rip, scenario, mutation in stack_cells:
+                label = f'stack-{region}-{scenario}' + (f'-reply-{mutation}' if mutation >= 0 else '')
+                output = run / (label + '-producer')
+                argv = [host, runtime, 'i4v-stack-live', producer, scenario, hex(rip), '1',
+                        source / 'tools/i4v_stack_worker.py', output]
+                if mutation >= 0:
+                    argv.append(str(mutation))
+                result = job(label, argv, oracle='stack')
+                report = json.loads((result / 'command.stdout').read_text())
+                expected_requests = int(scenario not in ('fetch_nx', 'smep', 'ss_first', 'ss_span'))
+                transfers = 0 if not expected_requests else mutation//16+1 if mutation >= 0 else 3
+                if (report['case'] != 'fex_push_immediates64' or report['live'] != 1
+                        or report['scenario'] != scenario or report['rip'] != rip
+                        or report['reply_mutation'] != mutation or report['requests'] != expected_requests
+                        or report['stack']['transfers'] != transfers):
+                    raise ValueError('stack runtime does not match requested cell/transfer count')
+                directories = list(output.glob('request-*'))
+                if len(directories) != expected_requests:
+                    raise ValueError('stack requests and compilations differ')
+                for directory in directories:
+                    exported = stack_worker.verify_transfers(directory,
+                        report['stack']['requests'][:transfers], report['stack']['replies'][:transfers])
+                    if exported['guest_rip'] != rip or exported['body_hex'] != report['body_hex']:
+                        raise ValueError('stack compilation differs from actual requested RIP/body')
+                    record['compilations'].append(dict(directory=str(directory.relative_to(run)), export=exported))
+                record['cells'].append(dict(name=label, producer=str(output.relative_to(run)), reply_mutation=mutation))
         record['status'] = 'passed'
     except BaseException as error:
         record.update(status='failed', error=str(error))

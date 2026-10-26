@@ -10,20 +10,22 @@ unsafe extern "C" {
     fn service(packet: *mut Packet);
     fn service_resume();
 }
-fn state() -> *mut State {
+pub(super) fn state() -> *mut State {
     (PRIVATE + STATE_OFFSET as u64) as *mut State
 }
-fn recovery_state() -> *mut Recovery {
+pub(super) fn recovery_state() -> *mut Recovery {
     STATE_VA as *mut Recovery
 }
-fn guest() -> *mut GuestState {
+pub(super) fn guest() -> *mut GuestState {
     GUEST_VA as *mut GuestState
 }
 
 unsafe fn exception(vector: u64, address: u64, error: u64) -> ! {
+    unsafe { exception_at(vector, address, error, (*state()).guest_rip) }
+}
+pub(super) unsafe fn exception_at(vector: u64, address: u64, error: u64, rip: u64) -> ! {
     unsafe {
         let r = recovery_state();
-        let rip = (*state()).guest_rip;
         ptr::write_volatile(&raw mut (*r).vector, vector);
         ptr::write_volatile(&raw mut (*r).error, error);
         ptr::write_volatile(&raw mut (*r).linear, address);
@@ -39,6 +41,9 @@ unsafe fn exception(vector: u64, address: u64, error: u64) -> ! {
 
 pub unsafe fn initialize() -> ! {
     unsafe {
+        if (*state()).case == natemu_abi::stack::CASE {
+            super::stack::initialize()
+        }
         let s = shared();
         let v = state();
         let g = guest();
@@ -128,6 +133,9 @@ pub unsafe fn initialize() -> ! {
 
 pub unsafe fn finish(fault: u64) -> ! {
     unsafe {
+        if (*state()).case == natemu_abi::stack::CASE {
+            super::stack::finish(fault)
+        }
         let s = shared();
         let r = recovery_state();
         let v = state();

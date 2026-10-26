@@ -1,5 +1,45 @@
 # INV-03-01 — source findings review
 
+## Intermediate I4-V return — live stack prefixes, October 26, 2026 UTC
+
+Root authored the ABI/runtime and runner, `/root/i4v_producer` authored the host
+and worker, and `/root/i4v_upstream` authored independent expectations/checks.
+`/root/i4v_contract_review` reviewed these changes read-only and then performed
+a fresh, serial retained host/runtime rebuild and execution.
+**ACCEPT this finite N=1 stack checkpoint; V1 and I4-V remain incomplete.**
+
+Independent `i4v-stack-independent-20261026-01` passes 139 jobs and 126 native
+cells: the prior 44 load cells plus 34 stack scenario/address combinations and
+48 corrupted stack-reply deliveries. The reviewer independently rechecked every
+report, all 100 actual compilations, 112 cell-to-compile associations and 174
+observed stack chunk transfers. All 3,559 checksums and 91 retained source inputs
+match; the producer binary matches its existing pin. No compiler containers remain
+running. This is a fresh host/runtime build and fresh compilation campaign using
+the retained FEX executable, not another FEX rebuild.
+
+The unchanged generated push/store/load instructions execute in five slots with
+resident returns only between guest instructions. Due-access guards preserve
+earlier effects. Real preindexed-store fault frames retain the old guest RSP while
+containing the generated immediate in scratch x20. Both complete physical data
+pages, canonical state, native prefixes, A/D bytes and shadow permissions match
+independent expectations. Tests distinguish supervisor CR0.WP override from CPL3
+read-only denial, exercise source NX/SMEP and parent permissions, and preserve
+the committed prefix across later #SS, #GP and #PF. In particular, late #SS retains
+one push and RSP=HIGH_BASE; late #GP retains three pushes. Both preserve CR2.
+
+One actual resident compile request produces three identity-bound chunks. Runtime
+publication waits for all chunks, the complete emitted body and source recheck.
+All 48 per-word corruption controls reject before publication, including failures
+after one or two valid chunks. No substantive correctness or reproduction blocker
+remains for this checkpoint; review required no additional execution-code fix.
+
+Instruction-boundary returns are an explicit fixture mechanism, not evidence for
+unsegmented-block execution or performance. Live generations remain immutable.
+N=2/3/4 aliases/remap/source/retained-event/fairness composition, broader address
+and access boundaries, V2 paging-off execution, V3 mode transitions and the wider
+I4-V validation campaign remain required. No full V1/I4-V or emulator correctness
+claim follows from these results.
+
 ## Intermediate I4-V return — first live address slice, October 26, 2026 UTC
 
 Root authored the ABI/runtime and retained runner; `/root/i4v_producer` authored

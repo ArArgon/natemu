@@ -111,5 +111,12 @@ every request identity/body field is enforced before publication. Exact requests
 compiler artifacts, native reports and independent checks are retained together.
 Run independent rebuilds serially with other builds to preserve the two-job bound.
 
-The first load slice has native N=1 evidence; stack exports and legacy32 sources
-remain preparation for subsequent slices. It does not complete V1 or I4-V.
+Add `--stack` to include the five-instruction push case, instruction-prefix
+recovery, WP/CPL permissions, late #SS/#GP/#PF and all48 malformed chunk replies.
+This publishes original FEX instruction segments in separate slots with resident
+returns at guest-instruction boundaries. Every transfer is retained and bound to
+its one actual compilation; later rejection must leave all slots blank.
+
+The load and stack slices have independently reproduced N=1 evidence. Legacy32
+sources remain preparation for subsequent slices. Concurrent aliases and the
+remaining V1/V2/V3 coverage are still required; this does not complete I4-V.

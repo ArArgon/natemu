@@ -39,6 +39,7 @@ pub mod paging;
 pub mod pressure;
 pub mod recovery;
 pub mod shadow;
+pub mod stack;
 pub mod translation;
 pub mod validation;
 pub const SUCCESS: u64 = 1;
