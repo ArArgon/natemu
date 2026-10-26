@@ -1,23 +1,13 @@
 //! One asynchronous compilation per source snapshot, followed by three chunks.
 use super::*;
+use crate::translation::process_owner::OwnedChild;
 use natemu_abi::stack;
-use std::{
-    fs::{File, OpenOptions},
-    io::Write,
-    path::PathBuf,
-    process::{Child, Command, Stdio},
-};
+use std::{fs::OpenOptions, io::Write, path::PathBuf};
 
 struct Job {
-    child: Child,
+    child: OwnedChild,
     directory: PathBuf,
     request: wire::Packet,
-}
-impl Drop for Job {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 struct Ready {
     directory: PathBuf,
@@ -58,6 +48,7 @@ impl Job {
                 return Err("concurrent stack reply changed request/body".into());
             }
         }
+        self.child.cleanup()?;
         Ok(Ready {
             directory: self.directory.clone(),
             request: self.request,
@@ -70,17 +61,19 @@ pub struct Compiler {
     producer: PathBuf,
     output: PathBuf,
     rip: u64,
+    owner: u64,
     pending: Option<Job>,
     foreground: Option<Job>,
     ready: Option<Ready>,
     pub requests: Vec<wire::Packet>,
 }
 impl Compiler {
-    pub fn new(producer: PathBuf, output: PathBuf, rip: u64) -> Self {
+    pub fn new(producer: PathBuf, output: PathBuf, rip: u64, owner: u64) -> Self {
         Self {
             producer,
             output,
             rip,
+            owner,
             pending: None,
             foreground: None,
             ready: None,
@@ -93,18 +86,11 @@ impl Compiler {
             .join(format!("request-{:03}", self.requests.len()));
         fs::create_dir(&directory).map_err(|e| e.to_string())?;
         packet_file(&directory.join("request.bin"), &request)?;
-        let child = Command::new("python3")
-            .arg("-B")
-            .arg("tools/i4v_stack_worker.py")
-            .arg("--request-dir")
-            .arg(&directory)
-            .arg("--producer")
-            .arg(&self.producer)
-            .stdin(Stdio::null())
-            .stdout(File::create_new(directory.join("worker.stdout")).map_err(|e| e.to_string())?)
-            .stderr(File::create_new(directory.join("worker.stderr")).map_err(|e| e.to_string())?)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        let child = OwnedChild::spawn(
+            std::path::Path::new("tools/i4v_stack_worker.py"),
+            &self.producer,
+            &directory,
+        )?;
         self.requests.push(request);
         Ok(Job {
             child,
@@ -142,7 +128,10 @@ impl Compiler {
     pub fn exchange(&mut self, mut packet: wire::Packet) -> Result<wire::Packet> {
         let operation = packet[0];
         packet[0] = stack::MISS;
-        if packet[7] != self.rip || stack::reply_context(&packet).is_none() {
+        if packet[3] != self.owner
+            || packet[7] != self.rip
+            || stack::reply_context(&packet).is_none()
+        {
             return Err("invalid configured concurrent stack request".into());
         }
         if operation == POLL_COMPILE {
@@ -195,6 +184,32 @@ impl Compiler {
 mod tests {
     use super::*;
     #[test]
+    fn rotated_compiler_rejects_self_consistent_request_from_another_owner() {
+        for owner in 0..4 {
+            let rip = alias::source_rip(2);
+            let mut compiler = Compiler::new(PathBuf::new(), PathBuf::new(), rip, owner);
+            let mut request = stack::request_context(73, owner, 1, 1, 1, 1, rip, 0, 0);
+            request[0] = POLL_COMPILE;
+            assert!(
+                compiler
+                    .exchange(request)
+                    .unwrap_err()
+                    .contains("no stack foreground")
+            );
+            request[3] = (owner + 1) % 4;
+            let mut miss = request;
+            miss[0] = stack::MISS;
+            assert!(stack::reply_context(&miss).is_some());
+            assert!(
+                compiler
+                    .exchange(request)
+                    .unwrap_err()
+                    .contains("configured concurrent stack")
+            );
+            assert!(compiler.requests.is_empty());
+        }
+    }
+    #[test]
     fn chunk_identity_and_order_fail_without_consuming_ready_output() {
         let directory = std::env::temp_dir().join(format!(
             "natemu-stack-chunks-{}-{}",
@@ -211,7 +226,7 @@ mod tests {
             p[15] = i as u64;
             stack::reply_context(&p).unwrap()
         });
-        let mut compiler = Compiler::new(PathBuf::new(), directory.clone(), request[7]);
+        let mut compiler = Compiler::new(PathBuf::new(), directory.clone(), request[7], 0);
         compiler.ready = Some(Ready {
             directory: directory.clone(),
             request,

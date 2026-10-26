@@ -41,7 +41,7 @@ def probe(root, producer):
                   instructions=INSTRUCTIONS, semantic_suffix_hex='0fae5f20',
                   live_root_audit='pending emitted-code inspection', outputs=[])
     try:
-        for name in ('compile.py', 'export.py', 'producer.json', 'probe_lfence.py'):
+        for name in ('compile.py', 'ownership.py', 'export.py', 'producer.json', 'probe_lfence.py'):
             shutil.copyfile(Path(__file__).with_name(name), snapshot / name)
         shutil.copyfile(producer, root / 'CodeSizeValidation')
         (root / 'CodeSizeValidation').chmod(0o755)

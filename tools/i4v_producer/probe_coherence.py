@@ -13,7 +13,7 @@ def probe(root, producer):
     root.mkdir()
     snapshot = root / 'source'
     snapshot.mkdir()
-    for name in ('compile.py', 'export.py', 'producer.json', 'probe_coherence.py'):
+    for name in ('compile.py', 'ownership.py', 'export.py', 'producer.json', 'probe_coherence.py'):
         shutil.copyfile(Path(__file__).with_name(name), snapshot / name)
     shutil.copyfile(producer, root / 'CodeSizeValidation')
     (root / 'CodeSizeValidation').chmod(0o755)

@@ -270,16 +270,19 @@ def numeric_transport(value):
         uint(value, 64, 'ABI numeric value')
 
 
-def audit_development(record, producer_directory=None):
+def audit_development(record, producer_directory=None, *, atomic_mode=False):
     """Complete finite report validation; does not assert universal conformance."""
     require(type(record) is dict, 'ordering report object')
     numeric_transport(record)
     exact(set(record), {'case', 'n', 'configured_vcpus', 'tested_vcpus', 'profile', 'rotation', 'seed',
                         'trial_count', 'vm_nonce', 'owners', 'images', 'source_before', 'source_after',
-                        'tables_before', 'tables_after', 'common'}, 'complete ordering report schema')
+                        'tables_before', 'tables_after', 'common'} | ({'image_bytes','atomic'} if atomic_mode else set()), 'complete ordering report schema')
     exact(record['case'], 'ordering', 'report kind')
     config = configuration(record['profile'], record['n'], record['rotation'], record['seed'])
     n, p = config['n'], config['profile']
+    if atomic_mode:
+        exact(p,9,'atomic composition uses XCHG/postcommit-store body')
+        exact(record['image_bytes'],12288,'three physical pages')
     exact(record['configured_vcpus'], n, 'configured participants')
     exact(record['tested_vcpus'], n, 'actual participants')
     exact(record['trial_count'], TRIALS, 'fixed trial count')
@@ -291,7 +294,10 @@ def audit_development(record, producer_directory=None):
     for key in ('source_before', 'source_after'):
         exact(record[key], source_image(config), 'immutable actual guest source.' + key)
     for key in ('tables_before', 'tables_after'):
-        exact(record[key], initial_tables(), 'warm preaccessed/dirty guest tables remain unchanged.' + key)
+        tables=initial_tables()
+        if atomic_mode and key=='tables_after':
+            tables[12288+257*8:12288+258*8]=(0x103067).to_bytes(8,'little')
+        exact(record[key], tables, 'exact guest tables.' + key)
     exact(record['common'], {'compiled': (1 << n) - 1, 'epoch': TRIALS,
                              'ready': [TRIALS] * n + [0] * (4 - n),
                              'done': [TRIALS] * n + [0] * (4 - n),
@@ -299,7 +305,7 @@ def audit_development(record, producer_directory=None):
     require(type(record['images']) is list and len(record['images']) == TRIALS, 'one full RAM snapshot per trial')
     images = []
     for raw in record['images']:
-        require(type(raw) is str and len(raw) == 16384 and all(c in '0123456789abcdef' for c in raw), 'exact8192-byte RAM hex image')
+        require(type(raw) is str and len(raw) == (24576 if atomic_mode else 16384) and all(c in '0123456789abcdef' for c in raw), 'exact8192-byte RAM hex image')
         images.append(bytes.fromhex(raw))
     captures = {}
     initial = {}
@@ -315,12 +321,14 @@ def audit_development(record, producer_directory=None):
         image, length = code_image(v)
         bank = [((i * 37 + 19) & 255) ^ cpu for i in range(512)]
         expected = {'id': cpu, 'variant': v, 'trial': TRIALS, 'completed': TRIALS,
-                    'expected': req, 'request': req, 'reply': rep, 'walks': 3, 'table_reads': 12, 'table_writes': 0,
-                    'routes': [DATA, RESULTS, RIP + cpu * 256, pointers(config, cpu)[2]],
+                    'expected': req, 'request': req, 'reply': rep, 'walks': 4 if atomic_mode else 3, 'table_reads': 16 if atomic_mode else 12, 'table_writes': 0,
+                    'routes': [DATA, 0x103000 if atomic_mode else RESULTS, RIP + cpu * 256, pointers(config, cpu)[2]],
                     'initial': initial[cpu], 'code': image, 'code_length': length, 'published_code': image,
                     'status': 1, 'detail': 0, 'current_el': 4, 'tcr': TCR,
                     'bank_before': bank, 'bank_after': bank, 'final_native_leaf': native_leaf(),
                     'compiler_requests': [req]}
+        if atomic_mode:
+            expected['final_native_leaf'][257] += 8192
         for key, value in expected.items():
             exact(cell[key], value, f'owner{cpu}.' + key)
         captures[cpu] = uint(cell['capture_pc'], 64, 'capture PC')
@@ -347,6 +355,15 @@ def audit_development(record, producer_directory=None):
             expected_ram = expected_image(config, trial, values, final)
         else:
             expected_ram = expected_image(config, trial)
+        if atomic_mode:
+            spare=[0x5a]*4096
+            for cpu in range(n):spare[cpu*128:cpu*128+4]=[0]*4
+            if trial:
+                for cpu in range(n):
+                    at=4096+cpu*128
+                    spare[cpu*128:cpu*128+4]=expected_ram[at:at+4]
+                    expected_ram[at:at+4]=[0]*4
+            expected_ram+=spare
         exact(images[trial], bytes(expected_ram), f'trial{trial} full physical RAM and untouched bytes')
         for cpu in range(n):
             cell, t = cells[cpu], cells[cpu]['trials'][trial]
@@ -358,7 +375,7 @@ def audit_development(record, producer_directory=None):
             observations = (frames[cpu]['x'][4], frames[cpu]['x'][7]) if v == 2 else ((frames[cpu]['x'][4],) if v in (0, 3, 5, 6, 7) else ())
             expected_frame = expected_native(entered, v, observations)
             exact(t['captured'], expected_frame, 'whole native result, scratch, flags/vector/control preservation')
-            which = p - 7 if p in (8, 9) and cpu == config['rotation'] else 0
+            which = 2 if atomic_mode and trial==0 else p - 7 if p in (8, 9) and cpu == config['rotation'] else 0
             for key, expected in (('epoch', trial + 1), ('token', value), ('completed', 1), ('faults', int(which != 0)),
                                   ('fence_completed', int(p >= 10))):
                 exact(t[key], expected, 'trial.' + key)

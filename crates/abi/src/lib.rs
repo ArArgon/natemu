@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod atomic_progress;
+
 // Same-build I1/I2 records. Pointers are owned native addresses, never guest GPAs.
 pub const VERSION: u32 = 3;
 pub const PROFILE: u32 = 1;
@@ -49,6 +51,9 @@ pub mod pressure;
 pub mod recovery;
 pub mod resident;
 pub mod shadow;
+pub mod schedule;
+pub mod partial_progress;
+pub mod containment;
 pub mod stack;
 pub mod stack_concurrent;
 pub mod stack_boundary;
@@ -179,6 +184,8 @@ pub struct Shared {
     pub service_pc: u64,
     pub mode: u64,
     pub lifecycle: translation::Lifecycle,
+    /// Zero for all ordinary fixtures. Opt-in progress runs use schedule::MAGIC.
+    pub schedule: u64,
 }
 
 const _: () = assert!(core::mem::size_of::<Shared>() <= 4096);

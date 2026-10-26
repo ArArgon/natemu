@@ -99,7 +99,22 @@ unsafe fn source_matches() -> bool {
 }
 unsafe fn mapping(address: u64, present: bool, writable: bool) {
     unsafe {
-        if !matches!(address, o::DATA | o::RESULTS) {
+        let gpa = if address == o::RESULTS {
+            atomic_progress::result_gpa()
+        } else {
+            address
+        };
+        mapping_gpa(address, gpa, present, writable);
+    }
+}
+pub(super) unsafe fn mapping_gpa(address: u64, gpa: u64, present: bool, writable: bool) {
+    unsafe {
+        if !matches!(address, o::DATA | o::RESULTS)
+            || (gpa != address
+                && !(atomic_progress::enabled()
+                    && address == o::RESULTS
+                    && gpa == natemu_abi::atomic_progress::NEW_RESULTS))
+        {
             stop(PANIC, 503)
         }
         let slot = shadow::leaf_offset(address).unwrap_or_else(|| stop(PANIC, 503));
@@ -107,7 +122,7 @@ unsafe fn mapping(address: u64, present: bool, writable: bool) {
         ptr::write_volatile(pte, 0);
         asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
         if present {
-            let pa = IPA + o::RAM_OFFSET as u64 + address - o::DATA;
+            let pa = IPA + o::RAM_OFFSET as u64 + gpa - o::DATA;
             let entry = pa | 3 | 1 << 10 | 3 << 8 | 3 << 53 | if writable { 0 } else { 1 << 7 };
             ptr::write_volatile(pte, entry);
         }
@@ -210,6 +225,9 @@ pub unsafe fn initialize() -> ! {
         if (*r).table_reads != 12 || (*r).table_writes != 0 || !source_matches() {
             stop(REJECTED, 509)
         }
+        if atomic_progress::enabled() {
+            atomic_progress::initialize();
+        }
         compile();
         common().compiled.value.fetch_or(1 << cpu, AcqRel);
         while common().compiled.value.load(Acquire) != all() {
@@ -231,6 +249,9 @@ unsafe fn reset() {
             ptr::write_volatile(base.add(256 + role * 128).cast::<u32>(), 0);
             ptr::write_volatile(base.add(4096 + role * 128).cast::<u32>(), 0);
         }
+        if atomic_progress::enabled() {
+            atomic_progress::reset_spare();
+        }
         asm!("dsb sy");
     }
 }
@@ -250,7 +271,11 @@ unsafe fn begin_trial() -> ! {
         (*r).current.x[4] = c.token(id(), index);
         (*r).current.x[16] = CODE_VA;
         (*r).current.x[30] = returned as *const () as u64;
-        let fault = c.fault(id());
+        let fault = if atomic_progress::first() {
+            2
+        } else {
+            c.fault(id())
+        };
         mapping(o::DATA, true, fault != 1);
         mapping(o::RESULTS, fault != 2, true);
         (*trial()).epoch = index + 1;
@@ -261,6 +286,9 @@ unsafe fn begin_trial() -> ! {
         asm!("mrs {0},ACTLR_EL1",out(reg)actlr);
         if actlr & 2 == 0 {
             stop(PANIC, 511)
+        }
+        if atomic_progress::enabled() {
+            atomic_progress::admit(index);
         }
         common().ready[id() as usize]
             .value
@@ -285,7 +313,11 @@ unsafe fn recover() -> ! {
     unsafe {
         let r = owner();
         let t = trial();
-        let fault = config().fault(id());
+        let fault = if atomic_progress::first() {
+            2
+        } else {
+            config().fault(id())
+        };
         let (esr, far, pc, spsr): (u64, u64, u64, u64);
         asm!("mrs {0},ESR_EL1","mrs {1},FAR_EL1","mrs {2},ELR_EL1","mrs {3},SPSR_EL1",out(reg)esr,out(reg)far,out(reg)pc,out(reg)spsr);
         let expected_pc = CODE_VA + if fault == 1 { 4 } else { 16 };
@@ -318,6 +350,9 @@ unsafe fn recover() -> ! {
         (*f).spsr = spsr;
         (*f).resume = pc;
         (*t).faults = 1;
+        if atomic_progress::first() {
+            atomic_progress::park(pc, spsr);
+        }
         mapping(if fault == 1 { o::DATA } else { o::RESULTS }, true, true);
         // Post-RMW result-store repair resumes only STLR, never the prior SWPAL.
         resume_exception(&raw const (*r).current, pc, spsr)
@@ -336,7 +371,7 @@ pub unsafe fn finish(fault: u64) -> ! {
         if fault != 0 {
             recover()
         }
-        if (*t).faults != u64::from(config().fault(id()) != 0) {
+        if (*t).faults != u64::from(atomic_progress::first() || config().fault(id()) != 0) {
             stop(PANIC, 514)
         }
         // Actual native return capture supplies stores consuming all admitted live
@@ -354,21 +389,37 @@ pub unsafe fn finish(fault: u64) -> ! {
         }
         (*t).completed = 1;
         (*r).completed += 1;
+        if atomic_progress::enabled() {
+            atomic_progress::returned(index);
+        }
         asm!("dsb sy");
         common().done[id() as usize].value.store(index + 1, Release);
         if id() == 0 {
             while !all_gate(&common().done, index + 1) {
                 pause();
             }
-            copy_record(
-                (PRIVATE + o::IMAGE_VA_OFFSET as u64 + index * o::IMAGE_BYTES as u64) as *mut u8,
-                (PRIVATE + o::RAM_OFFSET as u64) as *const u8,
-                o::IMAGE_BYTES,
-            );
+            if atomic_progress::enabled() {
+                atomic_progress::copy_image(
+                    (PRIVATE
+                        + o::IMAGE_VA_OFFSET as u64
+                        + index * natemu_abi::atomic_progress::IMAGE_BYTES as u64)
+                        as *mut u8,
+                );
+            } else {
+                copy_record(
+                    (PRIVATE + o::IMAGE_VA_OFFSET as u64 + index * o::IMAGE_BYTES as u64)
+                        as *mut u8,
+                    (PRIVATE + o::RAM_OFFSET as u64) as *const u8,
+                    o::IMAGE_BYTES,
+                );
+            }
             asm!("dsb sy");
         }
         (*r).trial += 1;
         if (*r).trial == o::TRIALS as u64 {
+            if atomic_progress::enabled() {
+                atomic_progress::stopped();
+            }
             common().stopped.value.fetch_or(1 << id(), AcqRel);
             while common().stopped.value.load(Acquire) != all() {
                 pause();

@@ -71,6 +71,7 @@ class Elf:
         h = struct.unpack_from('<16sHHIQQQIHHHHHH', data)
         require(h[0][:7] == b'\x7fELF\x02\x01\x01' and h[1:4] == (2, 183, 1), 'not AArch64 LE executable ELF')
         require(h[8] == 64 and h[9] == 56 and h[11] == 64 and 0 < h[10] < 64 and 0 < h[12] < 1024, 'ELF header geometry')
+        self.entry = h[4]
         self.loads = []
         for i in range(h[10]):
             at = h[5] + i * 56
@@ -99,7 +100,7 @@ class Elf:
                     continue
                 require(name < len(names) and b'\0' in names[name:], 'unterminated symbol name')
                 text = names[name:names.index(0, name)].decode('ascii')
-                if text not in ('fence_sink_gate','fence_sink_handler','enter_allocated','resume_exception','returned_allocated','finish'):
+                if text not in ('fence_sink_gate','fence_sink_handler','enter_allocated','resume_exception','returned_allocated','finish','partial_store','_start','private_start','vectors','exception_capture','runtime_main'):
                     continue
                 if text in self.symbols:
                     require(self.symbols[text] == (value, size), 'ambiguous symbol')
@@ -180,12 +181,97 @@ def validate(data):
                 restore_sha256=hashlib.sha256(elf.read(resume, 59 * 4)).hexdigest())
 
 
+def adr(pc, target, register=9):
+    delta = target - pc
+    require(-(1 << 20) <= delta < 1 << 20, 'ADR range')
+    immediate = delta & 0x1fffff
+    return 0x10000000 | ((immediate & 3) << 29) | ((immediate >> 2) << 5) | register
+
+
+def exception_words(pc, finish):
+    # save_native, without the allocated gate's software SPSel switch: hardware
+    # exception entry already selected SP_EL1. Every scratch root is saved first.
+    words = [0xd10003ff | (FRAME << 10)]
+    words += [pair(0xa9000000, i, 31, i * 8, 8) for i in range(0, 30, 2)]
+    words += [scalar(0xf9000000, 30, 31, 240)]
+    words += [pair(0xad000000, i, 31, 256 + i * 16, 16) for i in range(0, 32, 2)]
+    words += [0xd53b4409, scalar(0xf9000000, 9, 31, 776),
+              0xd53b4429, scalar(0xf9000000, 9, 31, 784),
+              scalar(0xf9000000, 31, 31, 792),
+              0xd5384109, scalar(0xf9000000, 9, 31, 248),
+              0xd5384009, 0x92640d29, scalar(0xf9000000, 9, 31, 768),
+              0x910003e0, 0xd2800021]  # x0=full frame; x1=exception, not return
+    words += [branch(pc + len(words) * 4, finish, True), 0x14000000]
+    return words
+
+
+def validate_boot(elf, vectors):
+    start, _ = elf.symbol('_start')
+    private, _ = elf.symbol('private_start')
+    main, _ = elf.symbol('runtime_main')
+    require(start == PRIVATE and private == start + 60 and elf.entry == start,
+            'bounded boot entry/private continuation')
+    elf.read(main, 4)
+    actual = elf.words(start, 32)
+    # Exact straight-line setup, including the only BR (whose literal target is
+    # checked), so a matching but unreachable VBAR write is not sufficient.
+    expected = [0xd5034fdf, 0xd5182000, 0x91401c09, 0xd5182029,
+                0xd5182041, 0xd518a202, ISB, 0xd5381009,
+                0xb2400129, 0xb27e0129, 0xb2740129, 0xd5181009, ISB,
+                actual[13], 0xd61f0120, actual[15], 0xf900013f,
+                0xd5033a9f, 0xd508871f, 0xd5033b9f, ISB,
+                adr(start + 84, vectors), 0xd518c009, actual[23],
+                0xd518d089, actual[25], 0x9100013f, actual[27],
+                0xd5184109, 0xd50040bf,
+                branch(start + 120, main, True), 0x14000000]
+    require(actual == expected, 'boot path/TTBR/VBAR/stack/runtime entry mismatch')
+    for index, target in ((13, private), (15, PRIVATE + 0x11008),
+                          (23, PRIVATE + 0x20000), (25, PRIVATE + 0x64000),
+                          (27, PRIVATE + 0x54000)):
+        word = actual[index]
+        require(word & 0xff00001f == 0x58000009, 'boot LDR literal must target x9')
+        address = start + index * 4 + signed((word >> 5) & 0x7ffff, 19) * 4
+        require(struct.unpack('<Q', elf.read(address, 8))[0] == target,
+                'boot literal target mismatch')
+    return start
+
+
+def validate_partial(data):
+    result = validate(data)  # Existing allocated capture and exact ERET restore.
+    elf = Elf(data)
+    pc, _ = elf.symbol('partial_store')
+    require(elf.words(pc, 2) == [0x39000001, 0xd65f03c0],
+            'partial helper must be STRB W1,[X0]; RET')
+    capture, _ = elf.symbol('exception_capture')
+    finish, _ = elf.symbol('finish')
+    expected = exception_words(capture, finish)
+    require(elf.words(capture, len(expected)) == expected,
+            'generic exception save/SP_EL0/SPSR/NZCV/fault dispatch mismatch')
+    vectors, _ = elf.symbol('vectors')
+    require(vectors & 2047 == 0, 'VBAR vector alignment')
+    elf.read(vectors, 2048)
+    for slot in range(16):
+        address = vectors + slot * 128
+        require(elf.words(address, 1) == [branch(address, capture)],
+                'vector must enter full exception capture, not its middle')
+    boot = validate_boot(elf, vectors)
+    result.update(partial_store_pc=pc, exception_capture_pc=capture,
+                  exception_capture_bytes=len(expected) * 4, vectors_pc=vectors,
+                  vector_slots=16, boot_pc=boot, vbar_write_pc=boot + 88,
+                  exception_status_source='SP_EL0 and SPSR_EL1.NZCV',
+                  exception_capture_sha256=hashlib.sha256(elf.read(capture, len(expected) * 4)).hexdigest(),
+                  vectors_sha256=hashlib.sha256(elf.read(vectors, 2048)).hexdigest(),
+                  boot_sha256=hashlib.sha256(elf.read(boot, 128)).hexdigest())
+    return result
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('elf', type=Path)
+    parser.add_argument('--partial',action='store_true')
     args = parser.parse_args()
     try:
-        print(json.dumps(validate(args.elf.read_bytes()), indent=2))
+        print(json.dumps((validate_partial if args.partial else validate)(args.elf.read_bytes()), indent=2))
     except (ValueError, struct.error, UnicodeError) as error:
         print(json.dumps(dict(status='FAIL', error=str(error))))
         raise SystemExit(1)

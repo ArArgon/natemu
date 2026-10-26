@@ -19,6 +19,9 @@ pub fn lock(c: &Coordinator) -> Guard<'_> {
     Guard(c)
 }
 impl Guard<'_> {
+    pub fn trace_length(&self) -> u64 {
+        self.0.trace_length.load(Relaxed)
+    }
     pub fn trace(&self, event: u64, id: u64) -> Result<(), u64> {
         let c = self.0;
         let at = c.trace_length.load(Relaxed) as usize;

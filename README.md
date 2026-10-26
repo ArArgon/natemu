@@ -4,15 +4,18 @@ natemu is building an x86-64 Linux system emulator for Apple Silicon/macOS26,
 using host-side translation and a resident ARM64 runtime inside a VM. The goal is
 material improvement over QEMU TCG within an explicit correctness scope.
 
-**Current state:** I1–I4 are implemented and independently reproduced in finite
-profiles. A real host-side FEX worker feeds the Rust resident runtime; tests cover
-precise recovery/paging and N=1/2/3/4 concurrent faults, remaps, code retirement,
-pending events and sustained maintenance fairness. The post-I4 validation pass
-is underway: 294 native scenarios pass independent reproduction, covering
-selected high-address, paging-off and mode-transition paths. The earlier 87-job
-regression suite also passes. Concurrent mode transitions, remaining boundaries
-and broader memory-model validation remain open. Arbitrary guest programs,
-stock Linux boot and workload performance remain ahead.
+**Current state:** I1–I4 and the post-I4 integrated validation pass are complete
+within their declared finite profiles on M4. A host-side FEX worker feeds the
+Rust resident runtime. Independent rebuilds pass 760 distinct native cases,
+25 intentional failures with fresh recovery controls, and 87 legacy jobs. Coverage
+includes kernel addresses, paging-off execution, concurrent mode transitions,
+ordering, translation coherence, precise recovery, lifetime and progress at
+N=1/2/3/4. A separate six-profile pinned-QEMU comparison also passes independent
+reproduction. The [validation report](docs/research/reviews/INV-03-01-i4v-coverage.md)
+records exact coverage, retained evidence and limitations.
+
+Next is I5: stock-kernel boot and small userspace workloads. Arbitrary guest
+programs, broad ISA/device support and workload performance remain unestablished.
 
 Start with the [implementation plan and local setup](docs/implementation.md).
 It records Rust/assembly/C++ ownership, the early producer loop, N-vCPU design,

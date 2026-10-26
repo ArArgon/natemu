@@ -26,10 +26,23 @@ def program(cpu, initial, before, replacement, capture, stack_profile=1):
     return cell, prefixes
 
 
-def fixture(n=4, profile=2, stack_profile=1):
+def fixture(n=4, profile=2, stack_profile=1, actor=None):
     # This alternative legal FIFO schedule comes from the existing independent
     # reference. Its old scalar guest effects are replaced by real stack effects.
     record = check_i4_pressure.known_result(n)
+    scheduled = actor is not None
+    actor = 0 if actor is None else actor
+    if scheduled:
+        record.update(actor=actor, delayed_owner=(actor+n-1)%n)
+        # Rotate logical protocol roles, leaving physical memory owners and
+        # round-robin maintenance identities unchanged.
+        start = next(i for i,w in enumerate(record['trace']) if w>>8>=23)
+        record['trace'][:start] = [(w & ~255) | (0 if w>>8==3 else ((w&255)+actor)%n)
+                                  for w in record['trace'][:start]]
+        for event in record['events']:
+            event['id']=(event['id']+actor)%n
+            event['vector']=64+event['id']
+        record['events'].sort(key=lambda e:e['id'])
     rip = oracle.SOURCE + (oracle.HIGH if profile == 2 else 0)
     name = {1: "stack", 2: "stack-parent", 3: "stack-leaf"}[stack_profile]
     record.update(profile="i4-" + name + ("-low" if profile == 1 else "-high"), alias_profile=profile,
@@ -67,20 +80,27 @@ def fixture(n=4, profile=2, stack_profile=1):
     record["maintenance"]["intervals"] = intervals
     for event in record["events"]:
         cpu = event["id"]
-        event["packet"] = oracle.canonical_seed(cpu, rip, stack_profile) if cpu in (1, 3) else oracle.canonical_after(cpu, rip, second_frames[cpu], stack_profile=stack_profile)
-    requests = [oracle.request_packet(vm, rip, serial) for serial in (1, 2, 3)]
-    replies = [[oracle.reply_packet(vm, rip, serial, chunk) for chunk in range(3)] for serial in (1, 2, 3)]
+        event["packet"] = oracle.canonical_seed(cpu, rip, stack_profile, actor) if (cpu+n-actor)%n in (1, 3) else oracle.canonical_after(cpu, rip, second_frames[cpu], stack_profile=stack_profile, actor=actor)
+    requests = [oracle.request_packet(vm, rip, serial, owner=actor) for serial in (1, 2, 3)]
+    replies = [[oracle.reply_packet(vm, rip, serial, chunk, actor) for chunk in range(3)] for serial in (1, 2, 3)]
     record["requests"] = copy.deepcopy(requests)
     record["source"].update(bytes=list(oracle.NEW_SOURCE), old_code=[0] * 320, new_code=oracle.code_image(True))
     record["aliases"] = check_i4v_alias.expected_aliases(record, n)
+    if scheduled and actor:
+        source_fields=('source_address','source_gpa','source_leaf_before','source_leaf_after',
+                       'source_before','source_after')
+        first,chosen=record['aliases'][0],record['aliases'][actor]
+        for key in source_fields:first[key],chosen[key]=chosen[key],first[key]
+        for side in ('lower_leaf','upper_leaf'):
+            first[side][258],chosen[side][258]=chosen[side][258],first[side][258]
     page = int(record["maintenance"]["total"] % 2 == 0)
     for item in record["aliases"]:
         cpu = item["id"]
         warm = [oracle.descriptor(0), 0] if stack_profile == 1 and cpu % 2 == 0 else [0, oracle.descriptor(0)]
         item.update(sctlr=0x30D01985, actlr=2, warm=warm,
                     wrong_rip_rejections=0, blank_before_publish=0,
-                    source_before=list(oracle.OLD_SOURCE[:17]) if cpu == 0 else [0] * 17,
-                    source_after=list(oracle.NEW_SOURCE[:17]) if cpu == 0 else [0] * 17)
+                    source_before=list(oracle.OLD_SOURCE[:17]) if cpu == actor else [0] * 17,
+                    source_after=list(oracle.NEW_SOURCE[:17]) if cpu == actor else [0] * 17)
         item["lower_leaf"][256] = item["upper_leaf"][256] = oracle.descriptor(page)
     if stack_profile == 1:
         last_cpu = intervals[-1]["id"]
@@ -99,10 +119,10 @@ def fixture(n=4, profile=2, stack_profile=1):
             record["trace"].extend([32 << 8 | cpu, 33 << 8 | cpu])
     stacks = []
     for cpu in range(n):
-        compiler = cpu == 0
+        compiler = cpu == actor
         count = len(programs[cpu])
         stacks.append({"id": cpu, "step": 4, "pass": count - 1, "code": oracle.CODE_NEXT,
-                       "expected": oracle.request_packet(vm, rip, 3, 2) if compiler else [0] * 16,
+                       "expected": oracle.request_packet(vm, rip, 3, 2, actor) if compiler else [0] * 16,
                        "compile_requests": copy.deepcopy(requests) if compiler else [[0] * 16 for _ in range(3)],
                        "replies": copy.deepcopy(replies) if compiler else [[[0] * 16 for _ in range(3)] for _ in range(3)],
                        "programs": programs[cpu] + [{"entries": 0, "completed": 0, "prefixes": [[0] * 4 for _ in range(5)]} for _ in range(6 - count)],
@@ -110,7 +130,7 @@ def fixture(n=4, profile=2, stack_profile=1):
                        "blank_before_publish": int(compiler),
                        "source_before": list(oracle.OLD_SOURCE) if compiler else [0] * 20,
                        "source_after": list(oracle.NEW_SOURCE) if compiler else [0] * 20,
-                       "guest_before": oracle.canonical_seed(cpu, rip, stack_profile), "guest_after": oracle.canonical_after(cpu, rip, frames[cpu], stack_profile=stack_profile)})
+                       "guest_before": oracle.canonical_seed(cpu, rip, stack_profile, actor), "guest_after": oracle.canonical_after(cpu, rip, frames[cpu], stack_profile=stack_profile, actor=actor)})
     for cpu, item in enumerate(stacks):
         probe = oracle.probe_expectation(cpu, rip, frames[cpu], stack_profile, page, capture)
         probe.update(esr=(0x25 << 26) | 64 | 15, spsr=frames[cpu]["nzcv"] | 0x3C4)
@@ -137,6 +157,41 @@ def change(path, value):
 
 
 class ConcurrentStackTests(unittest.TestCase):
+    def test_actual_actor_rotation_changes_protocol_and_owned_evidence(self):
+        for n in range(1,5):
+            for actor in range(n):
+                for profile in (1,2):
+                    with self.subTest(n=n,actor=actor,profile=profile):
+                        r=fixture(n,profile,actor=actor)
+                        oracle.check(r,n,profile,1,actor=actor)
+                        self.assertEqual(r['requests'][0][3],actor)
+                        self.assertEqual(next(w&255 for w in r['trace'] if w>>8==16),actor)
+                        self.assertEqual(next(w&255 for w in r['trace'] if w>>8==7),(actor+n-1)%n)
+
+    def test_rotation_cannot_be_satisfied_by_labels(self):
+        original=fixture(4,1,actor=2)
+        mutations={
+            'actor label':lambda r:r.update(actor=0),
+            'delayed label':lambda r:r.update(delayed_owner=3),
+            'compiler identity':lambda r:r['requests'][0].__setitem__(3,0),
+            'reply identity':lambda r:r['stacks'][2]['replies'][0][0].__setitem__(3,0),
+            'compiler record owner':lambda r:r['stacks'][2].__setitem__('stale_chunks',0),
+            'source writer':lambda r:r['aliases'][2].__setitem__('source_gpa',0),
+            'IF owner':lambda r:r['stacks'][2]['guest_before'].__setitem__('rflags',0x202),
+            'event wait owner':lambda r:r['events'][2].__setitem__('wait_checks',0),
+            'shadow role':lambda r:r['events'][3].__setitem__('blocked',2|16|32|64),
+        }
+        for kind in (7,8,16,22):
+            mutations['trace role '+str(kind)]=lambda r,kind=kind:r['trace'].__setitem__(
+                next(i for i,w in enumerate(r['trace']) if w>>8==kind),kind<<8)
+        for name,change in mutations.items():
+            with self.subTest(name=name):
+                r=copy.deepcopy(original);change(r)
+                with self.assertRaises(ValueError):oracle.check(r,4,1,1,actor=2)
+        with self.assertRaises(ValueError):oracle.check(original,4,1,1)
+        r=fixture(4,1);r.update(actor=2,delayed_owner=1)
+        with self.assertRaises(ValueError):oracle.check(r,4,1,1,actor=2)
+
     def test_all_counts_and_regimes(self):
         for n in range(1, 5):
             for profile in (1, 2):

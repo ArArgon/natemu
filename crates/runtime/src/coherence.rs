@@ -476,13 +476,25 @@ unsafe fn begin() -> ! {
         let cfg = config();
         let kind = c::kind(i);
         let address = cfg.address(id(), i);
-        {
+        loop {
             let g = coordinator::lock(coord());
             if (*common()).index != i as u64
                 || (*common()).prepared & (1 << id()) != 0
                 || coord().phase.load(Relaxed) != n::OPEN
             {
                 stop(PANIC, 718)
+            }
+            if !crate::schedule::permit(
+                &g,
+                natemu_abi::schedule::ADMIT | i as u64,
+                all(),
+                all(),
+                coord().phase.load(Relaxed),
+                i as u64,
+            ) {
+                drop(g);
+                pause();
+                continue;
             }
             ptr::write(v, c::Visit::ZERO);
             (*v).index = i as u64;
@@ -528,6 +540,7 @@ unsafe fn begin() -> ! {
             (*v).admitted = 1;
             (*common()).prepared |= 1 << id();
             checked(g.trace(0x2000 + i as u64, id()));
+            break;
         }
         loop {
             let g = coordinator::lock(coord());
@@ -569,7 +582,7 @@ unsafe fn recover() -> ! {
         let v = visit();
         let o = owner();
         if c::retained(index()) {
-            {
+            loop {
                 let g = coordinator::lock(coord());
                 if (*v).saved_gpa == 0
                     || (*v).saved_writable != 1
@@ -577,8 +590,21 @@ unsafe fn recover() -> ! {
                 {
                     stop(PANIC, 723)
                 }
+                if !crate::schedule::permit(
+                    &g,
+                    natemu_abi::schedule::DETACH | index() as u64,
+                    all(),
+                    all(),
+                    coord().phase.load(Relaxed),
+                    index() as u64,
+                ) {
+                    drop(g);
+                    pause();
+                    continue;
+                }
                 checked(g.detach_fault(id()));
                 checked(g.trace(c::RETAINED, id()));
+                break;
             }
             loop {
                 let g = coordinator::lock(coord());
@@ -766,6 +792,18 @@ unsafe fn advance() -> ! {
                         }
                         if (*common()).acknowledgements & (1 << id()) == 0
                             && (id() != delayed || (*common()).blocked == 1)
+                            && crate::schedule::permit(
+                                &g,
+                                natemu_abi::schedule::ACK | mutation,
+                                all(),
+                                crate::schedule::except_last(
+                                    all(),
+                                    delayed,
+                                    (*common()).acknowledgements,
+                                ),
+                                coord().phase.load(Relaxed),
+                                mutation,
+                            )
                         {
                             if !(cfg.ad() && mutation == 1) {
                                 invalidate();
@@ -847,7 +885,11 @@ unsafe fn retire() -> ! {
                 {
                     stop(PANIC, 736)
                 }
-                copy_record((*owner()).code_while_held.as_mut_ptr(), CODE_VA as *const u8, c::CODE_BYTES);
+                copy_record(
+                    (*owner()).code_while_held.as_mut_ptr(),
+                    CODE_VA as *const u8,
+                    c::CODE_BYTES,
+                );
                 if (*owner()).code_while_held != (*owner()).code {
                     stop(PANIC, 737)
                 }
@@ -856,6 +898,14 @@ unsafe fn retire() -> ! {
             }
             if (*owner()).released == 0
                 && (id() != delayed || (*common()).released == all() ^ (1 << delayed))
+                && crate::schedule::permit(
+                    &g,
+                    natemu_abi::schedule::RELEASE,
+                    all(),
+                    crate::schedule::except_last(all(), delayed, (*common()).released),
+                    coord().phase.load(Relaxed),
+                    c::VISITS as u64,
+                )
             {
                 (*owner()).released = 1;
                 (*common()).released |= 1 << id();

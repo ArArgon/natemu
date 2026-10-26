@@ -356,6 +356,12 @@ fn seed(index: usize) -> (NativeFrame, [u8; 512], [u8; 256]) {
 }
 fn run() -> Result<()> {
     let a: Vec<_> = env::args().collect();
+    if a.len() == 9 && a[2] == "i4v-containment" {
+        return concurrent::containment::run(&a);
+    }
+    if a.len() == 9 && a[2] == "i4v-progress" {
+        return concurrent::run_progress(&a);
+    }
     if a.len() == 9 && a[2] == "i4v-coherence" {
         return concurrent::run_coherence(&a);
     }
@@ -455,6 +461,7 @@ fn run() -> Result<()> {
     }
     memory.copy(CODE_OFFSET, &code);
     let shared = Shared {
+        schedule: 0,
         object,
         initial: *initial,
         captured: NativeFrame::ZERO,

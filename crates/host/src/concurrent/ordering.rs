@@ -1,6 +1,6 @@
 //! Whole generated participant blocks with synchronization outside guest accesses.
 use super::*;
-use natemu_abi::ordering as o;
+use natemu_abi::{atomic_progress as a, ordering as o};
 
 macro_rules! fields {
     ($s:ident; $($field:ident),* $(,)?) => {{
@@ -8,6 +8,16 @@ macro_rules! fields {
         $(out.push(format!("\"{}\":{:?}", stringify!($field), $s.$field));)*
         out
     }};
+}
+fn atomic_config() -> Option<natemu_abi::schedule::Config> {
+    progress::configuration().filter(|c| c.family == natemu_abi::schedule::ATOMIC)
+}
+fn image_bytes() -> usize {
+    if atomic_config().is_some() {
+        a::IMAGE_BYTES
+    } else {
+        o::IMAGE_BYTES
+    }
 }
 fn record<T: Copy>(memory: &Memory, offset: usize) -> T {
     unsafe { ptr::read_volatile(memory.0.add(offset).cast()) }
@@ -29,7 +39,7 @@ pub(super) fn owner_mappings(memory: &Memory, id: usize, n: usize) {
             (IPA + offset as u64) | attrs,
         );
     }
-    for offset in (0..o::TRIALS * o::IMAGE_BYTES).step_by(4096) {
+    for offset in (0..o::TRIALS * image_bytes()).step_by(4096) {
         memory.word(
             base + 0x14000 + (o::IMAGE_VA_OFFSET + offset) / 4096 * 8,
             (IPA + (n * RAM_SIZE + offset) as u64) | attrs,
@@ -94,6 +104,45 @@ fn owner_json(memory: &Memory, id: usize, bank: &[u8; 512], requests: &[wire::Pa
     f.push(format!("\"trials\":[{trials}]"));
     format!("{{{}}}", f.join(","))
 }
+fn atomic_json(memory: &Memory, n: usize) -> String {
+    let state = unsafe {
+        &*memory
+            .0
+            .add(n * RAM_SIZE + a::BACKING_OFFSET)
+            .cast::<a::State>()
+    };
+    let mut out = fields!(state; magic,n,actor,writer,parked,requested,drained,mutated,acknowledged,blocked,opened,delivered,snapshot_count,tables_before,tables_after);
+    let owners=state.owners.iter().map(|v| {
+        let mut f=fields!(v; saved_gpa,saved_leaf,fault_pc,resume_pc,queued,resumed,completed,ack_leaf,new_leaf);
+        f.push(format!("\"fault_frame\":{}",frame_json(&v.fault_frame)));
+        f.push(format!("\"before_guest\":{},\"completed_guest\":{}",crate::recovery::guest_json(&v.before_guest),crate::recovery::guest_json(&v.completed_guest)));
+        let e=&v.event;
+        let mut event=fields!(e; consumed,deliveries,boundary,blocked,wait_checks,shadow,priority);
+        event.push(format!("\"packet\":{}",crate::recovery::guest_json(&e.packet)));
+        let w=&v.walk;
+        f.push(format!("\"event\":{{{}}},\"walk\":{{{}}}",event.join(","),fields!(w; address,gpa,leaf_bytes,writable,dirty,read_count,writes,reads).join(",")));
+        format!("{{{}}}",f.join(","))
+    }).collect::<Vec<_>>().join(",");
+    let cuts = state
+        .cuts
+        .iter()
+        .map(|b| {
+            format!(
+                "\"{}\"",
+                b.iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    out.push(format!(
+        "\"owners\":[{owners}],\"cuts\":[{cuts}],\"coordinator\":{}",
+        controls::coordinator_json(&state.coordinator)
+    ));
+    format!("{{{}}}", out.join(","))
+}
+
 pub fn run(args: &[String]) -> Result<()> {
     let profile = args[4].parse().map_err(|_| "invalid ordering profile")?;
     let n: usize = args[5].parse().map_err(|_| "invalid ordering vCPU count")?;
@@ -144,6 +193,7 @@ pub fn run(args: &[String]) -> Result<()> {
         object.configured_vcpus = n as u32;
         object.vcpu_id = id as u32;
         let shared = Shared {
+            schedule: 0,
             object,
             initial: frame,
             captured: NativeFrame::ZERO,
@@ -183,6 +233,40 @@ pub fn run(args: &[String]) -> Result<()> {
             o::Common::new(config),
         );
     }
+    if let Some(scheduled) = atomic_config() {
+        if profile != 9 || rotation != scheduled.actor || scheduled.n != n as u64 {
+            return Err("atomic progress fixture mismatch".into());
+        }
+        let frames = core::array::from_fn(|id| {
+            if id < n {
+                unsafe {
+                    (*memory
+                        .0
+                        .add(id * RAM_SIZE + o::OWNER_OFFSET)
+                        .cast::<o::Owner>())
+                    .initial
+                }
+            } else {
+                NativeFrame::ZERO
+            }
+        });
+        let supplemental = n * RAM_SIZE + a::BACKING_OFFSET;
+        let attrs = 3 | 1 << 10 | 3 << 8 | 3 << 53;
+        for id in 0..n {
+            for page in (0..a::BYTES).step_by(4096) {
+                memory.word(
+                    id * RAM_SIZE + 0x14000 + (a::OFFSET + page) / 4096 * 8,
+                    (IPA + (supplemental + page) as u64) | attrs,
+                );
+            }
+        }
+        unsafe {
+            ptr::write(
+                memory.0.add(supplemental).cast(),
+                a::State::new(scheduled, &frames).ok_or("atomic state admission")?,
+            );
+        }
+    }
     fs::create_dir(&args[9]).map_err(|e| e.to_string())?;
     unsafe {
         sys_icache_invalidate(memory.0.cast(), memory.1);
@@ -220,11 +304,15 @@ pub fn run(args: &[String]) -> Result<()> {
         .map(|i| {
             format!(
                 "\"{}\"",
-                memory
-                    .read::<{ o::IMAGE_BYTES }>(n * RAM_SIZE + i * o::IMAGE_BYTES)
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
+                unsafe {
+                    core::slice::from_raw_parts(
+                        memory.0.add(n * RAM_SIZE + i * image_bytes()),
+                        image_bytes(),
+                    )
+                }
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
             )
         })
         .collect::<Vec<_>>()
@@ -238,8 +326,17 @@ pub fn run(args: &[String]) -> Result<()> {
         .done
         .each_ref()
         .map(|g| g.value.load(Ordering::Relaxed));
+    let atomic = if atomic_config().is_some() {
+        format!(
+            ",\"image_bytes\":{},\"atomic\":{}",
+            a::IMAGE_BYTES,
+            atomic_json(&memory, n)
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "{{\"case\":\"ordering\",\"n\":{n},\"configured_vcpus\":{n},\"tested_vcpus\":{n},\"profile\":{profile},\"rotation\":{rotation},\"seed\":{trial_seed},\"trial_count\":{},\"vm_nonce\":{vm_nonce},\"owners\":[{owners}],\"images\":[{images}],\"source_before\":{source_before:?},\"source_after\":{:?},\"tables_before\":{tables_before:?},\"tables_after\":{:?},\"common\":{{\"compiled\":{},\"epoch\":{},\"ready\":{ready:?},\"done\":{done:?},\"stopped\":{}}}}}",
+        "{{\"case\":\"ordering\",\"n\":{n},\"configured_vcpus\":{n},\"tested_vcpus\":{n},\"profile\":{profile},\"rotation\":{rotation},\"seed\":{trial_seed},\"trial_count\":{},\"vm_nonce\":{vm_nonce},\"owners\":[{owners}],\"images\":[{images}],\"source_before\":{source_before:?},\"source_after\":{:?},\"tables_before\":{tables_before:?},\"tables_after\":{:?},\"common\":{{\"compiled\":{},\"epoch\":{},\"ready\":{ready:?},\"done\":{done:?},\"stopped\":{}}}{atomic}}}",
         o::TRIALS,
         memory.read::<4096>(o::RAM_OFFSET + 8192),
         memory.read::<16384>(o::TABLE_OFFSET),

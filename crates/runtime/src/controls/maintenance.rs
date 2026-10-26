@@ -218,7 +218,13 @@ pub(super) unsafe fn boundary() {
                 (*p).compose_leaf = leaves()[if (*state()).profile < 13 { 0 } else { 2 }];
             }
             if (*p).pending[id() as usize] == 0 && (*p).ordinary != id() {
-                if checked((*p).enqueue(id() as usize)).is_some() {
+                let admitted = crate::schedule::enqueue(&g, &mut *p, id() as usize);
+                let admitted = if crate::schedule::enabled() && admitted == Err(m::FULL) {
+                    None
+                } else {
+                    checked(admitted)
+                };
+                if admitted.is_some() {
                     // Duplicate admission is checked against the live queue,
                     // and cannot consume a second slot or serial.
                     let serial = (*p).serial;
@@ -233,7 +239,7 @@ pub(super) unsafe fn boundary() {
                     checked(g.trace(23, id()));
                 }
             }
-            if (*p).maximum_depth == (*p).n
+            if crate::schedule::pool_ready(&g, &*p)
                 && (*p).current.serial == 0
                 && (*p).ordinary == n::NO_CPU
             {
@@ -257,6 +263,14 @@ pub(super) unsafe fn boundary() {
             if (*p).current.serial != 0
                 && (*p).acknowledgements & (1 << id()) == 0
                 && (id() != (*p).epoch % (*p).n || (*p).acknowledgements == all() ^ (1 << id()))
+                && crate::schedule::permit(
+                    &g,
+                    natemu_abi::schedule::MAINTENANCE_ACK | (*p).epoch,
+                    all(),
+                    crate::schedule::except_last(all(), (*p).epoch % (*p).n, (*p).acknowledgements),
+                    c.phase.load(Relaxed),
+                    (*p).epoch,
+                )
             {
                 if c.active.load(Relaxed) != 0 || (*common()).semantic_active != 0 {
                     stop(PANIC, 335);

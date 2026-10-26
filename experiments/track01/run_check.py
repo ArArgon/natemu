@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Retain and supervise a read-only Track 01 oracle; never launches/retries a VM."""
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -76,27 +78,106 @@ def group_rss(pgid, timeout=5):
     return sum(rss for _, rss in members), members
 
 
-def supervise(argv, directory, wall=WALL_SECONDS, rss_limit=RSS_BYTES, period=PERIOD_SECONDS):
+class _DarwinSiginfo(ctypes.Structure):
+    # Local Darwin sys/signal.h: six 32-bit fields, then ten pointer/long slots.
+    _fields_ = [('si_signo', ctypes.c_int), ('si_errno', ctypes.c_int),
+                ('si_code', ctypes.c_int), ('si_pid', ctypes.c_int),
+                ('si_uid', ctypes.c_uint), ('si_status', ctypes.c_int),
+                ('remaining', ctypes.c_uint64 * 10)]
+
+
+def peek_child(child):
+    """Observe only our live Popen lease; never reap before group signalling."""
+    if child.returncode is not None:
+        raise ChildProcessError(errno.ECHILD, 'supervisor child lease already reaped')
+    while True:
+        try:
+            if hasattr(os, 'waitid'):
+                info = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            elif sys.platform == 'darwin':
+                if ctypes.sizeof(_DarwinSiginfo) != 104:
+                    raise RuntimeError('unsupported Darwin siginfo layout')
+                libc = ctypes.CDLL(None, use_errno=True)
+                waitid = libc.waitid
+                waitid.argtypes = (ctypes.c_uint, ctypes.c_uint,
+                                   ctypes.POINTER(_DarwinSiginfo), ctypes.c_int)
+                waitid.restype = ctypes.c_int
+                info = _DarwinSiginfo()
+                if waitid(1, child.pid, ctypes.byref(info), 0x4 | 0x1 | 0x20) != 0:
+                    error = ctypes.get_errno()
+                    raise OSError(error, os.strerror(error))
+            else:
+                raise RuntimeError('non-reaping child observation unavailable')
+            break
+        except InterruptedError:
+            continue
+    if info is None or info.si_pid == 0:
+        return None
+    if info.si_pid != child.pid or info.si_code not in (1, 2, 3):
+        raise RuntimeError('unexpected non-reaping child identity/status')
+    return info.si_status if info.si_code == 1 else -info.si_status
+
+
+def exited_group_members(child, timeout):
+    """Darwin can return EPERM for an all-zombie group. Prove no live member.
+
+    Keep the leader waitable across the entire observation; RSS zero alone says
+    nothing about liveness and is deliberately not used here.
+    """
+    if peek_child(child) is None:
+        raise RuntimeError('signalling failed while owned leader remains live')
+    output = subprocess.check_output(
+        ['/bin/ps', '-A', '-o', 'pid=,pgid=,stat='], text=True, timeout=timeout)
+    members = []
+    for line in output.splitlines():
+        pid, group, state = line.split()
+        if int(group) == child.pid:
+            members.append(dict(pid=int(pid), pgid=int(group), state=state))
+    if any(not member['state'].startswith('Z') for member in members):
+        raise RuntimeError('signalling failed with a live owned-group member')
+    if peek_child(child) is None:
+        raise RuntimeError('owned leader changed during group observation')
+    return members
+
+
+def supervise(argv, directory, wall=WALL_SECONDS, rss_limit=RSS_BYTES, period=PERIOD_SECONDS,
+              gate_file=None):
     record = {'command': argv, 'cwd': str(directory), 'wall_seconds': wall,
               'rss_bytes': rss_limit, 'sample_period_seconds': period,
               'ps_timeout_seconds': 5, 'peak_observed_group_rss_bytes': 0,
+              'process_reaped': False,
               'rss_samples': 0, 'status': 'running', 'started_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
     start = time.monotonic()
     child = None
+    gate_deadline = None
     with (directory / 'stdout').open('xb') as stdout, (directory / 'stderr').open('xb') as stderr, \
             (directory / 'rss.jsonl').open('x') as samples:
         try:
             child = subprocess.Popen(argv, cwd=directory, stdout=stdout, stderr=stderr,
                                      start_new_session=True, preexec_fn=child_limits)
             record['pid'] = child.pid
-            while child.poll() is None:
+            while True:
                 elapsed = time.monotonic() - start
+                if gate_file is not None and gate_deadline is None and Path(gate_file).exists():
+                    gate=json.loads(Path(gate_file).read_text())
+                    remaining=gate['deadline_unix_ms']/1000-time.time()
+                    if not (type(gate['host_pid']) is int and gate['host_pid']>0 and remaining<=10):
+                        raise ValueError('invalid containment watchdog gate')
+                    gate_deadline=time.monotonic()+max(0,remaining)
+                    record['gate']=gate
+                if gate_deadline is not None and time.monotonic()>=gate_deadline:
+                    record['status']='containment_outer_limit'
+                    break
                 if elapsed >= wall:
                     record['status'] = 'wall_limit'
                     break
+                if peek_child(child) is not None:
+                    break
                 sample_start = time.monotonic()
-                rss, members = group_rss(child.pid, min(5, wall - elapsed))
-                if not members and child.poll() is None:
+                sample_bound=min(.25 if gate_file is not None else 5,wall-elapsed)
+                if gate_deadline is not None:sample_bound=min(sample_bound,max(.001,gate_deadline-time.monotonic()))
+                rss, members = group_rss(child.pid, sample_bound)
+                if not members and peek_child(child) is None:
                     raise RuntimeError('live oracle missing from process-group sample')
                 record['peak_observed_group_rss_bytes'] = max(record['peak_observed_group_rss_bytes'], rss)
                 record['rss_samples'] += 1
@@ -106,20 +187,48 @@ def supervise(argv, directory, wall=WALL_SECONDS, rss_limit=RSS_BYTES, period=PE
                 if rss > rss_limit:
                     record['status'] = 'rss_limit'
                     break
-                try:
-                    child.wait(timeout=max(0, min(sample_start + period, start + wall) - time.monotonic()))
-                except subprocess.TimeoutExpired:
-                    pass
+                time.sleep(max(0, min(sample_start + period, start + wall,
+                    gate_deadline if gate_deadline is not None else start+wall) - time.monotonic()))
         except BaseException as error:
-            record['status'] = 'wall_limit' if time.monotonic() - start >= wall else 'supervisor_error'
+            record['status'] = ('containment_outer_limit'
+                if isinstance(error,subprocess.TimeoutExpired) and gate_deadline is not None and time.monotonic()>=gate_deadline
+                else 'wall_limit' if time.monotonic() - start >= wall else 'supervisor_error')
             record['error'] = type(error).__name__ + ': ' + str(error)
         finally:
             if child is not None:
+                lease = False
                 try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                record['returncode'] = child.wait(timeout=5)
+                    # Recheck ownership even on monitor errors. ECHILD cannot
+                    # authorize a signal to a potentially reused numeric PGID.
+                    peek_child(child)
+                    lease = True
+                except BaseException as error:
+                    record['lease_error'] = type(error).__name__ + ': ' + str(error)
+                    if record['status'] == 'running':record['status'] = 'supervisor_error'
+                if lease:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                        record['group_signalled'] = True
+                    except ProcessLookupError:
+                        record['group_absent'] = True
+                    except OSError as error:
+                        proved_quiescent = False
+                        if sys.platform == 'darwin' and error.errno == errno.EPERM:
+                            try:
+                                record['quiescent_group_members'] = exited_group_members(child, .25 if gate_file else 5)
+                                record['group_quiescent'] = True
+                                proved_quiescent = True
+                            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as observation:
+                                record['group_observation_error'] = str(observation)
+                        if not proved_quiescent:
+                            record['signal_error'] = str(error)
+                            if record['status'] == 'running':record['status'] = 'supervisor_error'
+                    try:
+                        record['returncode'] = child.wait(timeout=5)
+                        record['process_reaped'] = True
+                    except (OSError, subprocess.TimeoutExpired) as error:
+                        record['reap_error'] = str(error)
+                        if record['status'] == 'running':record['status'] = 'supervisor_error'
             record['elapsed_seconds'] = time.monotonic() - start
             record['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     if record['status'] == 'running':

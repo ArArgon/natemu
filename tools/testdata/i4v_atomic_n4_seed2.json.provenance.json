@@ -1,0 +1,8 @@
+{
+  "purpose": "development regression fixture; not independent checkpoint acceptance",
+  "run": "/Users/liaozping/orca/natemu-raw/i4v-progress-dev-20261026-06",
+  "report": "progress-atomic-n4-seed2/command.stdout",
+  "report_sha256": "af3b0373bc4da682657b56fb528740b75a2323d57cd645fe444a033fdeadcfa7",
+  "runtime_sha256": "bc28b8bd8893f3c391229a178120abe6c096e2b0fb8f7129e3ac523f7a5f1489",
+  "retained_result": "passed"
+}

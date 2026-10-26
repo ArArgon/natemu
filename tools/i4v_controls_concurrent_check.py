@@ -456,7 +456,7 @@ class ConcurrentReplay:
     contracts preceding the positive current-entry/source rejection control.
     They are never substitutes for full campaign acceptance.
     """
-    def __init__(self,family,n,actor,vm,captures,source_control='positive',revision=0,maintenance=False,peer_reply_control=True):
+    def __init__(self,family,n,actor,vm,captures,source_control='positive',revision=0,maintenance=False,peer_reply_control=True,capacity=None):
         require(family in FAMILIES and 1<=n<=4 and 0<=actor<n,'bounded concurrent family')
         require(source_control in ('none','retire','positive'),'explicit source-control evidence scope')
         require(len(captures)==n,'one native capture per owner')
@@ -464,6 +464,8 @@ class ConcurrentReplay:
         self.source_control=source_control
         self.peer_reply_control=peer_reply_control
         self.revision=revision
+        self.capacity=n if capacity is None else uint(capacity,32,"declared pool capacity")
+        require(1<=self.capacity<=n,"pool capacity within owner count")
         self.maintenance=maintenance;self.pressure=empty_maintenance(n)
         self.maintenance_started=0;self.maintenance_leaves=[[0]*5 for _ in range(36)]
         self.source,self.data,self.tables=initial_memory(family,n,revision)
@@ -755,7 +757,7 @@ class ConcurrentReplay:
         if kind==23:
             require(m['pending'][cpu]==0 and m['ordinary']!=cpu and m['submitted'][cpu]<9 and not m['finished'],
                     'one bounded outstanding request per owner')
-            require(m['length']<self.n,'bounded FIFO capacity')
+            require(m['length']+int(m['current']['serial']!=0)<self.capacity,'bounded outstanding FIFO capacity')
             m['serial']+=1;m['submitted'][cpu]+=1;m['pending'][cpu]=m['serial']
             m['queue'][(m['head']+m['length'])%self.n]=dict(cpu=cpu,serial=m['serial']);m['length']+=1
             m['duplicate_rejections']+=1;m['maximum_depth']=max(m['maximum_depth'],m['length']+int(m['current']['serial']!=0))
@@ -1008,13 +1010,13 @@ class ConcurrentReplay:
                 exact(m['completed'],m['submitted'],'every original request completes')
                 exact(m['finished'],1,'bounded pressure finishes after generated ordinary work')
                 require(m['current']['serial']==0 and m['ordinary']==NO_CPU and m['length']==0
-                        and m['pending']==[0]*4 and m['maximum_depth']==self.n,'all queue slots exercised and fully drained')
+                        and m['pending']==[0]*4 and m['maximum_depth']==self.capacity,'all queue slots exercised and fully drained')
                 require(m['ordinary_total']>=(m['total']+7)//8 and all(m['intervals'][:self.n]),
                         'eight-head bound and ordinary progress for every owner')
         return self
 
 
-def audit_development(record,producer_directory=None,source_control='positive',revision=0,maintenance=False,peer_reply_control=True):
+def audit_development(record,producer_directory=None,source_control='positive',revision=0,maintenance=False,peer_reply_control=True,capacity=None):
     """Exact architectural/source evidence audit; maintenance acceptance is separate."""
     family,n,actor,vm=(record[k] for k in ('profile','configured_vcpus','actor','vm_nonce'))
     exact(record['case'],'controls-concurrent','concurrent report identity')
@@ -1025,7 +1027,7 @@ def audit_development(record,producer_directory=None,source_control='positive',r
     require(all(scalar.resident_pc(pc) for pc in captures),'all native capture PCs lie in resident text')
     coord=record['coordinator'];length=coord['trace_length']
     require(type(length) is int and 0<length<=len(coord['trace']),'bounded recorded schedule')
-    model=ConcurrentReplay(family,n,actor,vm,captures,source_control,revision,maintenance,peer_reply_control).run(coord['trace'][:length])
+    model=ConcurrentReplay(family,n,actor,vm,captures,source_control,revision,maintenance,peer_reply_control,capacity).run(coord['trace'][:length])
     before_source,before_data,before_tables=initial_memory(family,n,revision)
     for key,value in (('source_before',before_source),('source_after',model.source),
                       ('data_before',before_data),('data_after',model.data)):
@@ -1155,7 +1157,7 @@ def audit_development(record,producer_directory=None,source_control='positive',r
         maintenance_heads=model.pressure['total'],ordinary_intervals=model.pressure['ordinary_total'],
         event_deliveries=sum(s['event']['deliveries'] for s in model.owners))
 
-def check(record,expected_profile=None,expected_vcpus=None,expected_actor=None,expected_revision=1):
+def check(record,expected_profile=None,expected_vcpus=None,expected_actor=None,expected_revision=1,*,capacity=None):
     """Admit only the complete current bounded concurrent-control contract."""
     require(type(record) is dict,'expected one concurrent-control report object')
     fields={'case','program_revision','profile','configured_vcpus','tested_vcpus','actor','vm_nonce',
@@ -1184,7 +1186,7 @@ def check(record,expected_profile=None,expected_vcpus=None,expected_actor=None,e
             for key in ('id','capture_pc','service_pc','sctlr','actlr'):uint(owner[key],64,'owner '+key)
             for key in ('owner','controls','pae','modes','event','recovery'):
                 require(type(owner[key]) is dict,'owner '+key+' must be an object')
-        result=audit_development(record,source_control='positive',revision=1,maintenance=True,peer_reply_control=True)
+        result=audit_development(record,source_control='positive',revision=1,maintenance=True,peer_reply_control=True,capacity=capacity)
     except (KeyError,IndexError,TypeError) as error:
         raise ValueError(f'malformed concurrent-control report: {error}') from error
     result['scope']='complete bounded concurrent-control case; not whole-emulator validation'

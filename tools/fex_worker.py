@@ -9,6 +9,7 @@ import struct
 import subprocess
 import time
 import uuid
+from i4v_producer.ownership import Container, atomic_json, cleanup_containers
 
 IMAGE = 'sha256:27475cb39ecb4500d02b7c6e73c9d598e8d9f0736f0dc217d2d985e5cbe01aac'
 PRODUCER_SHA = '35d187ac6a2498ced8afebd167f230357880d7b78fcfa6d0560fc2065fce9496'
@@ -64,7 +65,7 @@ def compile_request(directory, producer):
               'producer_sha256': PRODUCER_SHA, 'image': IMAGE, 'commands': [],
               'started_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
     def save():
-        (directory / 'compiler.json').write_text(json.dumps(record, indent=2)+'\n')
+        atomic_json(directory / 'compiler.json', record)
     def command(argv, timeout=10, output=None):
         item = {'argv': argv, 'timeout_seconds': timeout}
         record['commands'].append(item); save()
@@ -85,17 +86,20 @@ def compile_request(directory, producer):
             item['elapsed_seconds'] = time.monotonic()-start
             save()
     container = 'natemu-i2-'+uuid.uuid4().hex
+    owned = Container(directory, container)
     try:
         (directory / 'input.x86').write_bytes(source)
         header = struct.pack('<6Q', 64, 25, 1, 8192, 49155, 0)
         entry = struct.pack('<128sqQQI', b'natemu-live-request', 11, len(source), 5, 0x41424344)
         (directory / 'input.bin').write_bytes(header+entry+source)
-        command(['docker','create','--name',container,'--label',f'natemu.i2.run={os.environ.get("NATEMU_I2_RUN", "manual")}', '--cpus=2','--memory=512m','--memory-swap=512m','--pids-limit=128',
+        owned.creating()
+        created = command(['docker','create','--name',container,'--label',owned.label,'--label',f'natemu.i2.run={os.environ.get("NATEMU_I2_RUN", "manual")}', '--cpus=2','--memory=512m','--memory-swap=512m','--pids-limit=128',
                  '--network=none','--read-only','--tmpfs','/tmp:rw,size=64m','--tmpfs','/var/lib/postgresql/data:rw,size=1m',
                  '--mount',f'type=bind,src={directory},dst=/work',
                  '--mount',f'type=bind,src={producer},dst=/producer,readonly',
                  '--entrypoint=/usr/bin/env',IMAGE,'-i','PATH=/usr/bin:/bin','HOME=/work/empty-home',
                  'NATEMU_EXPORT=/work/outputs','timeout','30','/producer','/work/input.bin','/work/normalized.json'])
+        owned.created(created)
         command(['docker','start','--attach',container],timeout=40,output='producer.log')
         state = json.loads(command(['docker','inspect',container]))[0]['State']
         record['container_state'] = state
@@ -113,7 +117,13 @@ def compile_request(directory, producer):
         raise
     finally:
         try:
-            command(['docker','rm','--force','--volumes',container])
+            identity=owned.record.get('container_id')
+            if identity is not None:
+                command(['docker','rm','--force','--volumes',identity])
+                owned.removed()
+            else:
+                record['cleanup']=cleanup_containers(owned.registry)
+                require(record['cleanup']['complete'],'unacknowledged owned container cleanup')
         except Exception as error:
             record['cleanup_error'] = str(error)
             record['status'] = 'failed'

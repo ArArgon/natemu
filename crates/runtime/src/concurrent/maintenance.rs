@@ -97,7 +97,14 @@ unsafe fn drive(id: u64) -> ! {
                         done = true;
                     } else {
                         if s.pending[id as usize] == 0 && s.ordinary != id {
-                            if checked(s.enqueue(id as usize)).is_some() {
+                            let admitted = crate::schedule::enqueue(&g, &mut s, id as usize);
+                            let admitted = if crate::schedule::enabled() && admitted == Err(m::FULL)
+                            {
+                                None
+                            } else {
+                                checked(admitted)
+                            };
+                            if admitted.is_some() {
                                 checked(g.trace(23, id));
                                 let saved = s;
                                 if s.enqueue(id as usize) != Err(m::DUPLICATE) || s != saved {
@@ -107,7 +114,10 @@ unsafe fn drive(id: u64) -> ! {
                                 checked(g.trace(24, id));
                             }
                         }
-                        if s.maximum_depth == s.n && s.current.serial == 0 && s.ordinary == NO_CPU {
+                        if crate::schedule::pool_ready(&g, &s)
+                            && s.current.serial == 0
+                            && s.ordinary == NO_CPU
+                        {
                             if s.ordinary_due() {
                                 let owner = checked(s.begin_ordinary());
                                 if c.active.load(Ordering::Relaxed) != 0 {
@@ -140,6 +150,18 @@ unsafe fn drive(id: u64) -> ! {
                         if s.current.serial != 0
                             && s.acknowledgements & (1 << id) == 0
                             && (id != s.epoch % s.n || s.acknowledgements == all ^ (1 << id))
+                            && crate::schedule::permit(
+                                &g,
+                                natemu_abi::schedule::MAINTENANCE_ACK | s.epoch,
+                                all,
+                                crate::schedule::except_last(
+                                    all,
+                                    s.epoch % s.n,
+                                    s.acknowledgements,
+                                ),
+                                c.phase.load(Ordering::Relaxed),
+                                s.epoch,
+                            )
                         {
                             if c.active.load(Ordering::Relaxed) != 0 {
                                 stop(PANIC, 136);

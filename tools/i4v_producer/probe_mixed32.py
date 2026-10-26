@@ -13,7 +13,7 @@ SOURCES={'old':bytes.fromhex('89c1890b8b02'),'replacement':bytes.fromhex('89c189
 def probe(root,producer,rips):
     root=Path(root).resolve();root.mkdir()
     source=Path(__file__).resolve().parent;snapshot=root/'source';snapshot.mkdir()
-    for name in ('compile.py','export.py','producer.json','probe_mixed32.py'):
+    for name in ('compile.py','ownership.py','export.py','producer.json','probe_mixed32.py'):
         shutil.copyfile(source/name,snapshot/name)
     shutil.copyfile(producer,root/'CodeSizeValidation');(root/'CodeSizeValidation').chmod(0o755)
     sys.path.insert(0,str(snapshot))

@@ -1,0 +1,9 @@
+{
+  "purpose": "development regression fixture; not independent acceptance",
+  "run": "/Users/liaozping/orca/natemu-raw/i4v-progress-dev-20261026-04",
+  "report": "progress-partial-n2-seed0/command.stdout",
+  "report_sha256": "d8417649a26700c8ce7f372358c3c2656c35bf482878a12411e9b546a3a4d45d",
+  "runtime_sha256": "f218c13c95cc232f1d31492f88481513c7b42ec3c6b41dc7441db3f7ddd33de8",
+  "original_result": "oracle_failed: missing pending_events field in expected common schema",
+  "correction": "require final pending_events exactly zero"
+}

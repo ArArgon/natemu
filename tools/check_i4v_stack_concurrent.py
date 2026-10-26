@@ -39,13 +39,13 @@ def seed(cpu, stack_profile=1):
     return frame, bank, [0xA5] * 256
 
 
-def canonical_seed(cpu, rip, stack_profile=1):
+def canonical_seed(cpu, rip, stack_profile=1, actor=0):
     guest = base_guest_seed("cold")
     frame, _, _ = seed(cpu, stack_profile)
     copy_live(guest, frame)
     guest["gpr"][4] = frame["x"][8]
     guest["rip"] = rip
-    if cpu == 0:
+    if cpu == actor:
         guest["rflags"] &= ~0x200
     return guest
 
@@ -95,8 +95,8 @@ def compact_prefixes(prefixes):
     return [[frame["x"][index] for index in (8, 4, 6, 20)] for frame in prefixes]
 
 
-def canonical_after(cpu, rip, frame, cleared=True, stack_profile=1):
-    guest = canonical_seed(cpu, rip, stack_profile)
+def canonical_after(cpu, rip, frame, cleared=True, stack_profile=1, actor=0):
+    guest = canonical_seed(cpu, rip, stack_profile, actor)
     for guest_reg, native_reg in ((0, 4), (3, 6), (4, 8)):
         guest["gpr"][guest_reg] = frame["x"][native_reg]
     guest["rip"] = rip + 20
@@ -105,8 +105,10 @@ def canonical_after(cpu, rip, frame, cleared=True, stack_profile=1):
     return guest
 
 
-def check_schedule(record, n, visit_interval):
+def check_schedule(record, n, visit_interval, capacity=None, actor=0, delayed_owner=None):
     """Replay FIFO ownership, independently of the resident reservation policy."""
+    capacity = n if capacity is None else uint(capacity, 32, "declared pool capacity")
+    require(1 <= capacity <= n, "pool capacity within owner count")
     trace = record["trace"]
     require(type(trace) is list and 0 < len(trace) <= 512, "bounded ownership trace")
     for word in trace:
@@ -135,7 +137,7 @@ def check_schedule(record, n, visit_interval):
         require(not active, "terminal native probe grant remains live")
     start = next((i for i, word in enumerate(trace) if word >> 8 >= 23), None)
     require(start is not None, "missing ordinary execution under maintenance")
-    check_i4.check_fault_trace(trace[:start], n, remap=True, compose=True, events=True)
+    check_i4.check_fault_trace(trace[:start], n, remap=True, compose=True, events=True, actor=actor, delayed_owner=delayed_owner)
     m = record["maintenance"]
     intervals = m["intervals"]
     require(type(intervals) is list and 0 < len(intervals) <= 4 * n, "bounded ordinary intervals")
@@ -159,7 +161,7 @@ def check_schedule(record, n, visit_interval):
             pending[cpu] = serial
             queue.append((cpu, serial))
             depth = max(depth, len(pending))
-            require(len(pending) <= n, "pending capacity exceeded")
+            require(len(pending) <= capacity, "pending capacity exceeded")
         elif event == 24:
             require(previous == (23, cpu) and cpu in pending, "duplicate must preserve submitted identity")
             duplicates += 1
@@ -214,29 +216,29 @@ def check_schedule(record, n, visit_interval):
     exact(completed, [9] * n, "nine completions per owner")
     require(ordinary_total >= math.ceil(total / 8) and all(counts), "ordinary work starved")
     exact(ordinary_total, len(intervals), "all ordinary executions accounted for")
-    exact(depth, n, "pending storage saturation")
+    exact(depth, capacity, "pending storage saturation")
     exact(duplicates, serial, "one duplicate rejection per request")
     expected = {"ready": (1 << n) - 1, "serial": serial, "submitted": [9] * n + [0] * (4 - n),
                 "completed": [9] * n + [0] * (4 - n), "pending": [0] * 4,
                 "length": 0, "current": [NO_CPU, 0], "epoch": 2 + total, "total": total,
                 "batch": 0, "next_ordinary": ordinary_total % n, "ordinary": NO_CPU,
                 "ordinary_total": ordinary_total, "interval_counts": counts + [0] * (4 - n),
-                "finished": 1, "duplicate_rejections": duplicates, "maximum_depth": n,
+                "finished": 1, "duplicate_rejections": duplicates, "maximum_depth": capacity,
                 "leaf_history": leaves, "leaf_final": leaves[-1] | 64,
                 "request_history": history}
     exact({key: value for key, value in m.items() if key != "intervals"}, expected, "maintenance ownership")
     return counts
 
 
-def request_packet(vm, rip, serial, chunk=0):
+def request_packet(vm, rip, serial, chunk=0, owner=0):
     variant = int(serial == 3)
     source = (NEW_SOURCE if variant else OLD_SOURCE) + bytes(4)
     words = [int.from_bytes(source[i:i + 8], "little") for i in (0, 8, 16)]
-    return [0x49345611, 1, vm, 0, 1, 1 + variant, 1, rip, 64, 20, *words, serial, 52, chunk]
+    return [0x49345611, 1, vm, owner, 1, 1 + variant, 1, rip, 64, 20, *words, serial, 52, chunk]
 
 
-def reply_packet(vm, rip, serial, chunk):
-    request = request_packet(vm, rip, serial, chunk)
+def reply_packet(vm, rip, serial, chunk, owner=0):
+    request = request_packet(vm, rip, serial, chunk, owner)
     body = NEW_BODY if serial == 3 else OLD_BODY
     part = body[chunk * 24:(chunk + 1) * 24]
     padded = part + bytes(24 - len(part))
@@ -274,7 +276,7 @@ def check_fault(fault, frame, address, pc, permission):
     exact(spsr & 0x3DF, 0x3C4, "masked EL1t")
 
 
-def check_events(record, n, rip, second_frames, stack_profile=1):
+def check_events(record, n, rip, second_frames, stack_profile=1, actor=0):
     events = record["events"]
     require(type(events) is list and len(events) == n, "one event record per owner")
     seen = set()
@@ -282,21 +284,22 @@ def check_events(record, n, rip, second_frames, stack_profile=1):
         cpu = uint(event["id"], 32, "event owner")
         require(cpu < n and cpu not in seen, "invalid event participant")
         seen.add(cpu)
-        initial = cpu in (1, 3)
+        role = (cpu + n - actor) % n
+        initial = role in (1, 3)
         for field, expected in (("pending", 0), ("token_state", 2), ("notifications", 2),
                                 ("consumed", 1), ("deliveries", 1), ("shadow", 0), ("priority", 0),
                                 ("vector", 64 + cpu), ("boundary", 3 if initial else 2)):
             exact(event[field], expected, "event." + field)
         waits = uint(event["wait_checks"], 64, "event wait checks")
-        if cpu == 0:
+        if cpu == actor:
             require(waits > 0, "compiler owner did not recheck pending events")
-        exact(event["blocked"], [2 | 4 | 32 | 64, 8, 2 | 16 | 32 | 64, 0][cpu] | int(waits > 0),
+        exact(event["blocked"], [2 | 4 | 32 | 64, 8, 2 | 16 | 32 | 64, 0][role] | int(waits > 0),
               "exact event blockers")
-        expected = canonical_seed(cpu, rip, stack_profile) if initial else canonical_after(cpu, rip, second_frames[cpu], stack_profile=stack_profile)
+        expected = canonical_seed(cpu, rip, stack_profile, actor) if initial else canonical_after(cpu, rip, second_frames[cpu], stack_profile=stack_profile, actor=actor)
         exact(event["packet"], expected, "canonical stack event packet")
 
 
-def check_aliases(record, n):
+def check_aliases(record, n, actor=0):
     aliases = record["aliases"]
     require(type(aliases) is list and len(aliases) == n, "one root/alias snapshot per owner")
     profile = record["alias_profile"]
@@ -329,7 +332,7 @@ def check_aliases(record, n):
         base = IPA + cpu * 0x100000
         root[256], l1[0], l2[0] = [base + offset + 3 for offset in (0x18000, 0x19000, 0x1A000)]
         lower[256], upper[257 if stack_profile == 3 else 256] = pair[cpu]
-        writer = cpu == 0
+        writer = cpu == actor
         if writer:
             (upper if profile == 1 and stack_profile != 2 else lower)[258] = descriptor(2, False)
         acks = acknowledgements[cpu]
@@ -404,11 +407,22 @@ def owners(items, n, label):
     return result
 
 
-def check(record, expected_vcpus=None, expected_alias_profile=None, expected_stack_profile=None, *, before_wave=False):
+def check(record, expected_vcpus=None, expected_alias_profile=None, expected_stack_profile=None, *, before_wave=False, capacity=None, actor=None):
     require(type(record) is dict, "expected concurrent stack report")
     require(type(before_wave) is bool, "before-wave mode must be explicit")
     n = uint(record["configured_vcpus"], 32, "configured_vcpus")
     require(1 <= n <= 4, "finite participant range is1..4")
+    if actor is None:
+        require('actor' not in record and 'delayed_owner' not in record,
+                'scheduled stack roles require an explicit requested actor')
+        actor, delayed_owner = 0, n - 1
+    else:
+        uint(actor, 32, 'requested actor')
+        require(actor < n, 'actor belongs to VM')
+        delayed_owner = (actor + n - 1) % n
+        exact((uint(record['actor'],32,'reported actor'),
+               uint(record['delayed_owner'],32,'reported delayed owner')), (actor, delayed_owner),
+              'actual compiler and delayed owner match requested rotation')
     profile = uint(record["alias_profile"], 32, "alias_profile")
     require(profile in (1, 2), "source address profile must be1or2")
     if expected_vcpus is not None:
@@ -461,9 +475,9 @@ def check(record, expected_vcpus=None, expected_alias_profile=None, expected_sta
         exact(len(programs[cpu]), index + 2, "continuous per-owner program sequence")
         programs[cpu].append({"entries": 31, "completed": 31, "prefixes": compact_prefixes(prefixes)})
 
-    counts = check_schedule(record, n, ordinary)
-    check_events(record, n, rip, second_frames, stack_profile)
-    check_aliases(record, n)
+    counts = check_schedule(record, n, ordinary, capacity, actor, delayed_owner)
+    check_events(record, n, rip, second_frames, stack_profile, actor)
+    check_aliases(record, n, actor)
     exact(record["coherence"], {"generation": 2, "acknowledgements": (1 << n) - 1,
                                "active": 0, "new_entries": (1 << n) - 1, "new_completed": (1 << n) - 1,
                                "new_references": 0, "reclaimed": 1, "leaf": (DATA + 4096) | 0x67},
@@ -473,26 +487,26 @@ def check(record, expected_vcpus=None, expected_alias_profile=None, expected_sta
     require(type(requests[0]) is list and len(requests[0]) == 16, "compile packet shape")
     vm = uint(requests[0][2], 64, "compiler VM nonce")
     require(vm != 0, "zero VM nonce")
-    expected_requests = [request_packet(vm, rip, serial) for serial in range(1, 4)]
+    expected_requests = [request_packet(vm, rip, serial, owner=actor) for serial in range(1, 4)]
     exact(requests, expected_requests, "actual source/owner/incarnation/generation/RIP compile identities")
-    replies = [[reply_packet(vm, rip, serial, chunk) for chunk in range(3)] for serial in range(1, 4)]
+    replies = [[reply_packet(vm, rip, serial, chunk, actor) for chunk in range(3)] for serial in range(1, 4)]
     exact(record["source"], {"old_eligible": 0, "published": 2, "stale_replies": 1,
                             "stale_entries": (1 << n) - 1, "reuse_blocked": (1 << n) - 1,
                             "bytes": list(NEW_SOURCE), "old_code": [0] * 320, "new_code": code_image(True)},
           "actual stack source replacement and old-code retirement")
     for cpu in range(n):
-        compiler = cpu == 0
+        compiler = cpu == actor
         expected_programs = programs[cpu] + [{"entries": 0, "completed": 0, "prefixes": [[0] * 4 for _ in range(5)]}
                                           for _ in range(6 - len(programs[cpu]))]
         expected = {"id": cpu, "step": 4, "pass": counts[cpu] + 1, "code": CODE_NEXT,
-                    "expected": request_packet(vm, rip, 3, 2) if compiler else [0] * 16,
+                    "expected": request_packet(vm, rip, 3, 2, actor) if compiler else [0] * 16,
                     "compile_requests": expected_requests if compiler else [[0] * 16 for _ in range(3)],
                     "replies": replies if compiler else [[[0] * 16 for _ in range(3)] for _ in range(3)],
                     "programs": expected_programs, "stale_chunks": 3 if compiler else 0,
                     "wrong_owner_rejections": int(compiler), "blank_before_publish": int(compiler),
                     "source_before": list(OLD_SOURCE) if compiler else [0] * 20,
                     "source_after": list(NEW_SOURCE) if compiler else [0] * 20,
-                    "guest_before": canonical_seed(cpu, rip, stack_profile), "guest_after": canonical_after(cpu, rip, frames[cpu], stack_profile=stack_profile)}
+                    "guest_before": canonical_seed(cpu, rip, stack_profile, actor), "guest_after": canonical_after(cpu, rip, frames[cpu], stack_profile=stack_profile, actor=actor)}
         if stack_profile >= 2:
             expected["guest_after"] = probe_expectation(cpu, rip, frames[cpu], stack_profile,
                 int(record["maintenance"]["total"] % 2 == 0), captures[cpu])["guest_after"]

@@ -1,12 +1,9 @@
 //! One actual compilation, followed by four identity-bound resident deliveries.
 use super::*;
 use crate::i4v_stack::{read_packet, write_packet};
+use crate::translation::process_owner::OwnedChild;
 use natemu_abi::fence as f;
-use std::{
-    fs::File,
-    path::PathBuf,
-    process::{Child, Command, Stdio},
-};
+use std::path::PathBuf;
 
 pub struct Compiler {
     config: f::Config,
@@ -14,18 +11,10 @@ pub struct Compiler {
     producer: PathBuf,
     worker: PathBuf,
     output: PathBuf,
-    child: Option<Child>,
+    child: Option<OwnedChild>,
     original: Option<wire::Packet>,
     replies: Option<[wire::Packet; 4]>,
     pub requests: Vec<wire::Packet>,
-}
-impl Drop for Compiler {
-    fn drop(&mut self) {
-        if let Some(child) = &mut self.child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
 }
 impl Compiler {
     pub fn new(
@@ -54,18 +43,7 @@ impl Compiler {
         let directory = self.output.join("request-000");
         fs::create_dir(&directory).map_err(|e| e.to_string())?;
         write_packet(&directory.join("request.bin"), &p)?;
-        let child = Command::new("python3")
-            .arg("-B")
-            .arg(&self.worker)
-            .arg("--request-dir")
-            .arg(&directory)
-            .arg("--producer")
-            .arg(&self.producer)
-            .stdin(Stdio::null())
-            .stdout(File::create_new(directory.join("worker.stdout")).map_err(|e| e.to_string())?)
-            .stderr(File::create_new(directory.join("worker.stderr")).map_err(|e| e.to_string())?)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        let child = OwnedChild::spawn(&self.worker, &self.producer, &directory)?;
         self.child = Some(child);
         self.original = Some(p);
         self.requests.push(p);
@@ -116,7 +94,6 @@ impl Compiler {
         if !status.success() {
             return Err("fence worker failed".into());
         }
-        self.child.take();
         let mut replies = [[0; 16]; 4];
         for (i, packet) in replies.iter_mut().enumerate() {
             *packet = read_packet(&self.output.join(format!("request-000/reply-{i}.bin")))?;
@@ -125,6 +102,7 @@ impl Compiler {
                 return Err("fence body chunk differs from compilation contract".into());
             }
         }
+        self.child.take().unwrap().cleanup()?;
         self.replies = Some(replies);
         self.deliver(p)
     }

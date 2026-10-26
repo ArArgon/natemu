@@ -14,7 +14,7 @@ def probe(root,producer):
     root=Path(root).resolve();root.mkdir()
     source=Path(__file__).resolve().parent
     snapshot=root/'source';snapshot.mkdir()
-    for name in ('compile.py','export.py','producer.json','probe_steps.py'):
+    for name in ('compile.py','ownership.py','export.py','producer.json','probe_steps.py'):
         shutil.copyfile(source/name,snapshot/name)
     fixture=source.parents[1]/'fixtures/i4v/cases.json'
     shutil.copyfile(fixture,snapshot/'cases.json')

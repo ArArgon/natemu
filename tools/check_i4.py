@@ -158,9 +158,14 @@ def check_faults(record, n):
                       record["profile"] in ("i4-compose", "i4-events"), record["profile"] == "i4-events")
 
 
-def check_fault_trace(trace, n, remap=False, compose=False, events=False):
+def check_fault_trace(trace, n, remap=False, compose=False, events=False, *, actor=0, delayed_owner=None):
     """Model ownership as sets and FIFO history, independently of runtime fields."""
     require(type(trace) is list and 0 < len(trace) <= 128, "bounded nonempty fault trace")
+    uint(actor, 32, 'actor')
+    require(actor < n, 'actor belongs to owner set')
+    delayed_owner = n - 1 if delayed_owner is None else uint(delayed_owner, 32, 'delayed owner')
+    require(delayed_owner < n, 'delayed owner belongs to owner set')
+    early = set(range(n)) - {delayed_owner}
     admitted, active, retained, detached, completed, released = (set() for _ in range(6))
     queued = []
     phase = "open"
@@ -175,6 +180,7 @@ def check_fault_trace(trace, n, remap=False, compose=False, events=False):
     for word in trace:
         uint(word, 64, "trace word")
         event, cpu = word >> 8, word & 255
+        role = (cpu + n - actor) % n
         require(cpu < n, "trace participant outside admitted set")
         if events and event == 18:
             require(phase == "open" and not admitted and cpu not in posted,
@@ -187,10 +193,10 @@ def check_fault_trace(trace, n, remap=False, compose=False, events=False):
         elif events and event == 20:
             require(cpu in posted and cpu not in delivered and cpu not in active,
                     "event delivery without request, duplicated or during active execution")
-            if cpu in (1, 3):
+            if role in (1, 3):
                 require(phase == "open" and cpu not in admitted,
                         "initially eligible event must precede first native entry")
-                if cpu == 1:
+                if role == 1:
                     require(cpu in shadow_cleared, "delivery while fixture shadow is set")
             else:
                 require(phase == "reopened" and cpu in new_completed and cpu in cleared,
@@ -201,14 +207,14 @@ def check_fault_trace(trace, n, remap=False, compose=False, events=False):
                     "fixture controls cleared before completion or twice")
             cleared.add(cpu)
         elif events and event == 22:
-            require(cpu == 1 and phase == "open" and cpu not in admitted
+            require(role == 1 and phase == "open" and cpu not in admitted
                     and cpu not in delivered and cpu not in shadow_cleared,
                     "fixture shadow must clear once before any guest instruction")
             shadow_cleared.add(cpu)
         elif event == 1:
             if events:
                 equal(posted, set(range(n)), "all initial requests precede admission")
-                if cpu in (1, 3):
+                if role in (1, 3):
                     require(cpu in delivered, "guest entry skipped eligible initial event")
             require(phase == "open" and cpu not in admitted, "invalid or duplicate admission")
             admitted.add(cpu)
@@ -218,7 +224,7 @@ def check_fault_trace(trace, n, remap=False, compose=False, events=False):
             equal(admitted, set(range(n)), "all grants admitted before faults")
             require(phase in ("open", "closing") and cpu in active,
                     "detach requires active grant before exclusive service")
-            if cpu == n - 1:
+            if cpu == delayed_owner:
                 require(delayed, "last grant detached before forced delay point")
             active.remove(cpu)
             detached.add(cpu)
@@ -245,7 +251,7 @@ def check_fault_trace(trace, n, remap=False, compose=False, events=False):
             require(cpu in retained and cpu not in released, "duplicate reference release")
             if remap:
                 require(mutated and phase == "reopened", "old route release before covering invalidation")
-                if cpu == n - 1 and n > 1:
+                if cpu == delayed_owner and n > 1:
                     require(new_entries, "delayed old reference did not overlap a new admission")
             if compose:
                 require(cpu in rejected, "old reference released before stale entry/reuse rejection")
@@ -253,11 +259,12 @@ def check_fault_trace(trace, n, remap=False, compose=False, events=False):
             released.add(cpu)
             last_release = cpu
         elif event == 7:
-            require(not delayed and cpu == n - 1 and cpu in active,
+            require(not delayed and cpu == delayed_owner and cpu in active,
                     "invalid delayed-grant point")
-            equal(detached, set(range(n - 1)), "all peers detached before delayed grant proceeds")
+            equal(detached, early, "all peers detached before delayed grant proceeds")
             delayed = True
         elif remap and event == 8:
+            if compose:equal(cpu, actor, "source mutation belongs to actual compiler owner")
             require(not mutated and phase == "exclusive" and not active and servicing is None,
                     "mutation without exclusive drained ownership")
             equal(completed, set(range(n)), "old effects must complete before conflicting mutation")
@@ -267,8 +274,8 @@ def check_fault_trace(trace, n, remap=False, compose=False, events=False):
         elif remap and event == 9:
             require(phase == "invalidating" and cpu not in acknowledgements,
                     "duplicate or premature mapping acknowledgement")
-            if cpu == n - 1:
-                equal(acknowledgements, set(range(n - 1)), "last participant acknowledges after peers")
+            if cpu == delayed_owner:
+                equal(acknowledgements, early, "last participant acknowledges after peers")
             acknowledgements.add(cpu)
         elif remap and event == 10:
             require(phase == "invalidating", "duplicate or premature admission reopen")
@@ -294,7 +301,7 @@ def check_fault_trace(trace, n, remap=False, compose=False, events=False):
                     "dirty fault outside an admitted new access or duplicated")
             dirty.add(cpu)
         elif compose and event == 16:
-            require(cpu == 0 and phase == "compiling" and not published,
+            require(cpu == actor and phase == "compiling" and not published,
                     "replacement publication outside stopped mutation or duplicated")
             if events:
                 equal(renotified, set(range(n)), "all repeated notifications precede publication")
@@ -324,7 +331,7 @@ def check_fault_trace(trace, n, remap=False, compose=False, events=False):
         equal(renotified, set(range(n)), "one repeated notification per CPU")
         equal(delivered, set(range(n)), "one canonical event handoff per CPU")
         equal(cleared, set(range(n)), "all fixture controls cleared")
-        equal(shadow_cleared, {1} if n > 1 else set(), "fixture shadow clear")
+        equal(shadow_cleared, {(actor+1)%n} if n > 1 else set(), "fixture shadow clear")
 
 
 def replacement_seed(cpu):

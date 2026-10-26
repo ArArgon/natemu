@@ -1,17 +1,14 @@
 //! Bounded per-owner instruction compilation for control and address profiles.
 use crate::i4v_stack::{read_packet, write_packet};
+use crate::translation::process_owner::OwnedChild;
 use crate::*;
 use natemu_abi::concurrency::{DEFER_COMPILE, POLL_COMPILE, TAKE_COMPILE};
 use natemu_abi::translation as wire;
 use natemu_abi::{address_concurrent as address, coherence, controls, ordering};
-use std::{
-    fs::File,
-    path::PathBuf,
-    process::{Child, Command, Stdio},
-};
+use std::path::PathBuf;
 
 struct Job {
-    child: Child,
+    child: OwnedChild,
     directory: PathBuf,
     request: wire::Packet,
     protocol: Protocol,
@@ -33,14 +30,18 @@ impl Protocol {
         }
     }
 }
-impl Drop for Job {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 impl Job {
     fn finish(mut self) -> Result<wire::Packet> {
+        let result = self.validate_reply();
+        if let Err(error) = &result {
+            crate::concurrent::containment::latch(error);
+        }
+        let reply = result?;
+        write_packet(&self.directory.join("reply-delivered.bin"), &reply)?;
+        self.child.cleanup()?;
+        Ok(reply)
+    }
+    fn validate_reply(&mut self) -> Result<wire::Packet> {
         if !self.child.wait().map_err(|e| e.to_string())?.success() {
             return Err("control worker failed".into());
         }
@@ -48,7 +49,6 @@ impl Job {
         if self.protocol.reply(&self.request) != Some(reply) {
             return Err("control reply changed request or emitted body".into());
         }
-        write_packet(&self.directory.join("reply-delivered.bin"), &reply)?;
         Ok(reply)
     }
 }
@@ -135,23 +135,31 @@ impl Compiler {
         matches!(self.protocol, Protocol::Coherence(_))
     }
     fn start(&mut self, request: wire::Packet) -> Result<Job> {
+        self.start_inner(request, false)
+    }
+    fn start_inner(&mut self, request: wire::Packet, deferred: bool) -> Result<Job> {
         let directory = self
             .output
             .join(format!("request-{:03}", self.requests.len()));
         fs::create_dir(&directory).map_err(|e| e.to_string())?;
         write_packet(&directory.join("request.bin"), &request)?;
-        let child = Command::new("python3")
-            .arg("-B")
-            .arg(&self.worker)
-            .arg("--request-dir")
-            .arg(&directory)
-            .arg("--producer")
-            .arg(&self.producer)
-            .stdin(Stdio::null())
-            .stdout(File::create_new(directory.join("worker.stdout")).map_err(|e| e.to_string())?)
-            .stderr(File::create_new(directory.join("worker.stderr")).map_err(|e| e.to_string())?)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        let hold = deferred
+            && crate::concurrent::containment::deferred_request(self.owner, &request)
+            && crate::concurrent::containment::configuration().is_some_and(|c| {
+                c.actor == self.owner && c.failure == natemu_abi::containment::WORKER_EXIT
+            });
+        let hold_container = deferred
+            && crate::concurrent::containment::deferred_request(self.owner, &request)
+            && crate::concurrent::containment::configuration()
+                .is_some_and(|c| c.failure == natemu_abi::containment::CANCEL);
+        let mut child = OwnedChild::spawn_injected(
+            &self.worker,
+            &self.producer,
+            &directory,
+            hold,
+            hold_container,
+        )?;
+        if hold { child.wait_registered()?; }
         self.requests.push(request);
         Ok(Job {
             child,
@@ -180,6 +188,49 @@ impl Compiler {
             return Err("control request changes configured owner/mode/profile".into());
         }
         match operation {
+            natemu_abi::containment::PEEK_CONTAINER => {
+                if !crate::concurrent::containment::configuration()
+                    .is_some_and(|c| c.failure == natemu_abi::containment::CANCEL)
+                    || !crate::concurrent::containment::service_request(
+                        self.owner, &packet, operation,
+                    )
+                {
+                    return Err("container observation outside containment request".into());
+                }
+                let job = self.pending.as_mut().ok_or("no deferred container job")?;
+                if packet != job.request {
+                    return Err("container observation changed identity".into());
+                }
+                Ok(wire::command(if job.child.container_ready()? {
+                    natemu_abi::containment::PRODUCER_READY
+                } else {
+                    wire::BUSY
+                }))
+            }
+            natemu_abi::containment::PEEK_DEFERRED => {
+                if !crate::concurrent::containment::configuration()
+                    .is_some_and(|c| c.failure == natemu_abi::containment::MALFORMED)
+                    || !crate::concurrent::containment::service_request(
+                        self.owner, &packet, operation,
+                    )
+                {
+                    return Err("deferred observation outside containment request".into());
+                }
+                let job = self
+                    .pending
+                    .as_mut()
+                    .ok_or("no control deferred job to observe")?;
+                if packet != job.request {
+                    return Err("control deferred observation changed identity".into());
+                }
+                match job.child.try_wait().map_err(|e| e.to_string())? {
+                    Some(status) if status.success() => {
+                        Ok(wire::command(natemu_abi::containment::PRODUCER_READY))
+                    }
+                    Some(_) => Err("deferred control worker failed before observation".into()),
+                    None => Ok(wire::command(wire::BUSY)),
+                }
+            }
             POLL_COMPILE => {
                 let job = self
                     .foreground
@@ -206,6 +257,35 @@ impl Compiler {
                 {
                     return Err("control take changed identity".into());
                 }
+                if let Some(config) =
+                    crate::concurrent::containment::injection_request(self.owner, &packet)
+                {
+                    let job = self.pending.as_mut().unwrap();
+                    if config.failure == natemu_abi::containment::WORKER_EXIT {
+                        job.child.inject_exit()?;
+                    } else if config.failure == natemu_abi::containment::MALFORMED {
+                        let path = job.directory.join("reply.bin");
+                        let original = fs::read(&path).map_err(|e| e.to_string())?;
+                        if original.len() != 128 {
+                            return Err("malformed injection needs complete reply".into());
+                        }
+                        let mut changed = original.clone();
+                        changed[0] ^= 1;
+                        fs::write(job.directory.join("reply-before-injection.bin"), original)
+                            .map_err(|e| e.to_string())?;
+                        fs::write(&path, &changed).map_err(|e| e.to_string())?;
+                        fs::write(job.directory.join("reply-after-injection.bin"), changed)
+                            .map_err(|e| e.to_string())?;
+                        fs::write(
+                            job.directory.join(".ownership/injection.json"),
+                            format!(
+                                "{{\"kind\":\"malformed\",\"owner\":{},\"request\":{:?}}}\n",
+                                self.owner, packet
+                            ),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                }
                 self.foreground = self.pending.take();
                 Ok(wire::command(wire::BUSY))
             }
@@ -213,7 +293,7 @@ impl Compiler {
                 if self.pending.is_some() {
                     return Err("control deferred slot full".into());
                 }
-                self.pending = Some(self.start(packet)?);
+                self.pending = Some(self.start_inner(packet, true)?);
                 Ok(wire::command(wire::BUSY))
             }
             operation if operation == miss => {
@@ -236,20 +316,32 @@ mod tests {
         let config = coherence::Config::new(4, 0, 1).unwrap();
         for kind in 0..2 {
             let good = coherence::request(37, config, 2, kind).unwrap();
-            for index in [1,3,4,6,7,8,9,10,11,12,13,14,15] {
+            for index in [1, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
                 let mut bad = good;
                 bad[index] ^= 1;
                 let mut compiler = Compiler::new_coherence(
-                    "unused".into(), "unused".into(), "unused".into(), 2, config);
+                    "unused".into(),
+                    "unused".into(),
+                    "unused".into(),
+                    2,
+                    config,
+                );
                 assert!(compiler.exchange(bad).is_err());
                 assert!(compiler.requests.is_empty());
             }
-            for other in [coherence::Config::new(3,0,1).unwrap(),
-                          coherence::Config::new(4,3,1).unwrap(),
-                          coherence::Config::new(4,0,2).unwrap()] {
-                let bad = coherence::request(37,other,2,kind).unwrap();
+            for other in [
+                coherence::Config::new(3, 0, 1).unwrap(),
+                coherence::Config::new(4, 3, 1).unwrap(),
+                coherence::Config::new(4, 0, 2).unwrap(),
+            ] {
+                let bad = coherence::request(37, other, 2, kind).unwrap();
                 let mut compiler = Compiler::new_coherence(
-                    "unused".into(), "unused".into(), "unused".into(), 2, config);
+                    "unused".into(),
+                    "unused".into(),
+                    "unused".into(),
+                    2,
+                    config,
+                );
                 assert!(compiler.exchange(bad).is_err());
                 assert!(compiler.requests.is_empty());
             }
@@ -264,11 +356,27 @@ mod tests {
     }
     fn job(request: wire::Packet) -> Job {
         Job {
-            child: Command::new("/usr/bin/true").spawn().unwrap(),
+            child: OwnedChild::inert_for_test(),
             directory: "unused-job".into(),
             request,
             protocol: Protocol::Controls,
         }
+    }
+    #[test]
+    fn deferred_observation_is_not_an_ordinary_protocol_operation() {
+        let request =
+            controls::request(37, 1, 0, controls::RIP, &[0xb8, 0x11, 0, 1, 0], 2).unwrap();
+        let mut compiler = compiler();
+        compiler.pending = Some(job(request));
+        let mut observed = request;
+        observed[0] = natemu_abi::containment::PEEK_DEFERRED;
+        assert_eq!(
+            compiler.exchange(observed).unwrap_err(),
+            "deferred observation outside containment request"
+        );
+        assert_eq!(compiler.pending.as_ref().unwrap().request, request);
+        assert!(compiler.foreground.is_none());
+        assert!(compiler.requests.is_empty());
     }
     #[test]
     fn deferred_take_and_poll_preserve_saved_context_before_consuming_job() {

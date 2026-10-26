@@ -2,6 +2,38 @@
 use crate::{NativeFrame, stack, validation::Packet};
 pub const OFFSET: usize = 0x23000;
 pub const MAX_PROGRAMS: usize = 6;
+/// Logical fixture roles; shared physical backing is independent of these IDs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Roles {
+    pub n: u64,
+    pub actor: u64,
+    pub delayed: u64,
+}
+impl Roles {
+    pub fn for_fixture(n: u64, schedule: Option<crate::schedule::Config>) -> Option<Self> {
+        if n == 0 || n > crate::concurrency::MAX_CPUS as u64 {
+            return None;
+        }
+        let actor = match schedule {
+            Some(config)
+                if config.valid() && config.family == crate::schedule::STACK && config.n == n =>
+            {
+                config.actor
+            }
+            Some(_) => return None,
+            None => 0,
+        };
+        Some(Self {
+            n,
+            actor,
+            delayed: (actor + n - 1) % n,
+        })
+    }
+    pub fn event_role(self, id: u64) -> u64 {
+        (id + self.n - self.actor) % self.n
+    }
+}
+
 pub fn initial_rsp(id: u64) -> u64 {
     initial_rsp_for(1, id)
 }
@@ -119,6 +151,48 @@ const _: () = assert!(OFFSET + core::mem::size_of::<State>() <= crate::concurren
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn seeded_roles_rotate_actor_and_delayed_peer_without_changing_defaults() {
+        for n in 1..=4 {
+            let default = Roles::for_fixture(n, None).unwrap();
+            assert_eq!((default.actor, default.delayed), (0, n - 1));
+            for ordinal in 0..4 {
+                let config =
+                    crate::schedule::Config::new(crate::schedule::STACK, n, ordinal).unwrap();
+                let roles = Roles::for_fixture(n, Some(config)).unwrap();
+                assert_eq!(
+                    (roles.actor, roles.delayed),
+                    (ordinal % n, (ordinal + n - 1) % n)
+                );
+                assert_eq!(roles.event_role(roles.actor), 0);
+                for role in 0..n {
+                    assert_eq!(roles.event_role((roles.actor + role) % n), role);
+                }
+                let request = stack::request_context(83, roles.actor, 1, 2, 1, 3, 0x102000, 1, 0);
+                let reply = stack::reply_context(&request).unwrap();
+                assert!(validate_reply(&request, &reply).is_some());
+                let mut other = reply;
+                other[3] = (roles.actor + 1) % 4;
+                assert!(validate_reply(&request, &other).is_none());
+            }
+        }
+        assert!(Roles::for_fixture(0, None).is_none());
+        assert!(Roles::for_fixture(5, None).is_none());
+        assert!(
+            Roles::for_fixture(
+                2,
+                crate::schedule::Config::new(crate::schedule::CONTROLS, 2, 0)
+            )
+            .is_none()
+        );
+        assert!(
+            Roles::for_fixture(
+                3,
+                crate::schedule::Config::new(crate::schedule::STACK, 2, 0)
+            )
+            .is_none()
+        );
+    }
     #[test]
     fn chunks_are_bound_to_stored_owner_and_generation() {
         let p =

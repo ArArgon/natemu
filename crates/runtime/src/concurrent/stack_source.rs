@@ -10,9 +10,12 @@ fn state() -> *mut sc::State {
 }
 unsafe fn request(serial: u64, variant: u64, chunk: u64) -> Packet {
     unsafe {
+        if (*shared()).object.vcpu_id as u64 != roles().actor {
+            stop(PANIC, 162);
+        }
         p::request_context(
             (*shared()).lifecycle.vm,
-            0,
+            roles().actor,
             1,
             variant + 1,
             1,
@@ -108,7 +111,7 @@ pub unsafe fn initialize() {
         if deferred[0] != natemu_abi::translation::BUSY {
             stop(PANIC, 164);
         }
-        while coordinator().event_pending[0].load(Ordering::Acquire) == 0 {
+        while coordinator().event_pending[roles().actor as usize].load(Ordering::Acquire) == 0 {
             events::wait_check();
             asm!("yield", options(nomem, nostack));
         }
@@ -147,7 +150,7 @@ pub unsafe fn replacement() {
         source::publish_slot(CODE_NEXT, &p::image(&body));
         c.stale_replies.store(1, Ordering::Relaxed);
         c.published.store(2, Ordering::Relaxed);
-        checked(g.trace(16, 0));
+        checked(g.trace(16, roles().actor));
         c.phase.store(RELEASING, Ordering::Relaxed);
     }
 }

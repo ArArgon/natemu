@@ -142,7 +142,7 @@ pub unsafe fn advance(fault: u64) {
             recovery::clear_mapping(frame.x[8]);
             let c = coordinator();
             let id = (*s).object.vcpu_id as u64;
-            if id == c.participants - 1 {
+            if id == roles().delayed {
                 while c.queued.load(Ordering::Acquire).count_ones() as u64 != c.participants - 1 {
                     asm!("yield", options(nomem, nostack));
                 }

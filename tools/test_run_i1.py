@@ -69,6 +69,18 @@ class WorkerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('PASS', result.stdout)
 
+    def test_json_lines_is_explicit_and_each_record_is_checked(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            oracle = Path(temporary) / 'oracle.py'
+            oracle.write_text('def check(records):\n    assert records == [{"a": 1}, {"b": 2}]\n')
+            good = 'print(\'{"a":1}\\n{"b":2}\')'
+            _, result = self.run_job(good, oracle=str(oracle), oracle_json_lines=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for script, options in ((good, {}), ('print(\'{"a":1}\\n{"b":3}\')', {'oracle_json_lines': True}),
+                                    ('print(\'{"a":1}\\ninvalid\')', {'oracle_json_lines': True})):
+                _, result = self.run_job(script, oracle=str(oracle), **options)
+                self.assertNotEqual(result.returncode, 0)
+
 
 if __name__ == '__main__':
     unittest.main()

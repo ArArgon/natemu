@@ -41,9 +41,16 @@ impl Compiler {
         compiler.address_profile = true;
         Ok(compiler)
     }
-    pub fn new_stack(producer: PathBuf, output: PathBuf, guest_rip: u64) -> Result<Self> {
+    pub fn new_stack(
+        producer: PathBuf,
+        output: PathBuf,
+        guest_rip: u64,
+        owner: u64,
+    ) -> Result<Self> {
         let mut compiler = Self::new(producer.clone(), output.clone())?;
-        compiler.stack = Some(stack_producer::Compiler::new(producer, output, guest_rip));
+        compiler.stack = Some(stack_producer::Compiler::new(
+            producer, output, guest_rip, owner,
+        ));
         Ok(compiler)
     }
     pub fn new_mixed(producer: PathBuf, output: PathBuf, owner: u64, mode: u64) -> Result<Self> {
@@ -64,9 +71,9 @@ impl Compiler {
         Ok(c)
     }
     pub fn is_controls(&self) -> bool {
-        self.controls
-            .as_ref()
-            .is_some_and(|compiler| !compiler.is_address() && !compiler.is_ordering() && !compiler.is_coherence())
+        self.controls.as_ref().is_some_and(|compiler| {
+            !compiler.is_address() && !compiler.is_ordering() && !compiler.is_coherence()
+        })
     }
     pub fn new_address(
         producer: PathBuf,
@@ -118,7 +125,9 @@ impl Compiler {
         Ok(compiler)
     }
     pub fn is_coherence(&self) -> bool {
-        self.controls.as_ref().is_some_and(|compiler| compiler.is_coherence())
+        self.controls
+            .as_ref()
+            .is_some_and(|compiler| compiler.is_coherence())
     }
     pub fn new_fence(
         producer: PathBuf,

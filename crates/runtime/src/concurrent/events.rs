@@ -69,7 +69,7 @@ pub unsafe fn clear_fixture_controls() {
 pub unsafe fn initial_boundary(g: &coordinator::Guard<'_>, id: u64) {
     unsafe {
         attempt(g, id, 3);
-        if id == 1 {
+        if roles().event_role(id) == 1 {
             // Eligibility-predicate fixture, not an implementation of x86
             // shadow expiry: toggle it before any guest instruction executes.
             ptr::write_volatile(&raw mut (*record()).shadow, 0);

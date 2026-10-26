@@ -9,10 +9,10 @@ except ImportError:
     import check_i4v_fence_gate as gate
 
 
-def fixture():
+def fixture(extra=()):
     """Wrap retained actual emitted snippets in a minimal ELF for corruption tests."""
     record = json.loads(Path(__file__).with_name('testdata').joinpath('i4v_fence_gate.json').read_text())
-    segments = record['segments']
+    segments = record['segments']+list(extra)
     data = bytearray(64 + 56 * len(segments))
     names = bytearray(b'\0')
     symbols = bytearray(24)
@@ -41,6 +41,39 @@ def fixture():
     return data
 
 
+def partial_fixture():
+    """Synthetic generic gates plus unchanged retained allocated gate snippets."""
+    record = json.loads(Path(__file__).with_name('testdata').joinpath('i4v_fence_gate.json').read_text())
+    finish = next(s['address'] for s in record['segments'] if s['name'] == 'finish')
+    start, capture, vectors, main, store = (gate.PRIVATE + offset for offset in (0,0xc0000,0xc0800,0xc2000,0xc3000))
+    def packed(words):return struct.pack('<'+'I'*len(words),*words).hex()
+    literals = [start+60,start+0x11008,start+0x20000,start+0x64000,start+0x54000]
+    loads = {index:0x58000009|(((128+j*8-index*4)//4)<<5) for j,index in enumerate((13,15,23,25,27))}
+    boot = [0xd5034fdf,0xd5182000,0x91401c09,0xd5182029,0xd5182041,0xd518a202,
+            0xd5033fdf,0xd5381009,0xb2400129,0xb27e0129,0xb2740129,0xd5181009,0xd5033fdf,
+            loads[13],0xd61f0120,loads[15],0xf900013f,0xd5033a9f,0xd508871f,0xd5033b9f,0xd5033fdf,
+            gate.adr(start+84,vectors),0xd518c009,loads[23],0xd518d089,loads[25],0x9100013f,
+            loads[27],0xd5184109,0xd50040bf,gate.branch(start+120,main,True),0x14000000]
+    # Literal instruction encodings copied from disassembly of save_native,
+    # independently enumerating every register-pair save and status operation.
+    save = [0xd10c83ff] + [0xa90007e0+i*0x10802 for i in range(15)] + [0xf9007bfe]
+    save += [0xad0807e0+i*0x10802 for i in range(16)]
+    save += [0xd53b4409,0xf90187e9,0xd53b4429,0xf9018be9,0xf9018fff,
+             0xd5384109,0xf9007fe9,0xd5384009,0x92640d29,0xf90183e9,0x910003e0,0xd2800021]
+    save += [gate.branch(capture+len(save)*4,finish,True),0x14000000]
+    vector_words=[gate.NOP]*512
+    for slot in range(16):vector_words[slot*32]=gate.branch(vectors+slot*128,capture)
+    data=fixture([
+        dict(name='_start',address=start,symbol_size=0,hex=packed(boot)+struct.pack('<5Q',*literals).hex()),
+        dict(name='private_start',address=start+60,symbol_size=0,hex=''),
+        dict(name='exception_capture',address=capture,symbol_size=0,hex=packed(save)),
+        dict(name='vectors',address=vectors,symbol_size=0,hex=packed(vector_words)),
+        dict(name='runtime_main',address=main,symbol_size=4,hex='00000014'),
+        dict(name='partial_store',address=store,symbol_size=8,hex='01000039c0035fd6')])
+    struct.pack_into('<Q',data,24,start)
+    return data
+
+
 class GateTests(unittest.TestCase):
     def setUp(self):
         self.data = fixture()
@@ -58,6 +91,51 @@ class GateTests(unittest.TestCase):
         self.assertEqual(result['stored_gprs'], list(range(31)))
         self.assertEqual(result['stored_q'], list(range(32)))
         self.assertEqual(result['frame_bytes'], 800)
+
+    def test_partial_store_requires_generic_exception_path(self):
+        pc=gate.PRIVATE+0xf0000
+        incomplete=fixture([dict(name='partial_store',address=pc,symbol_size=8,hex='01000039c0035fd6')])
+        with self.assertRaises(ValueError):gate.validate_partial(incomplete)
+        data=partial_fixture();result=gate.validate_partial(data)
+        self.assertEqual(result['exception_capture_bytes'],188)
+        self.assertEqual(result['vector_slots'],16)
+        elf=gate.Elf(data);pc=elf.symbol('partial_store')[0]
+        for at in (pc,pc+4,elf.symbol('resume_exception')[0]+4):
+            bad=data.copy();struct.pack_into('<I',bad,elf.offset(at,4),gate.NOP)
+            with self.assertRaises(ValueError):gate.validate_partial(bad)
+
+    def test_generic_capture_every_instruction_and_fault_dispatch(self):
+        data=partial_fixture();elf=gate.Elf(data);pc=elf.symbol('exception_capture')[0]
+        for i in range(47):
+            bad=data.copy();struct.pack_into('<I',bad,elf.offset(pc+i*4,4),gate.NOP)
+            with self.subTest(word=i),self.assertRaises(ValueError):gate.validate_partial(bad)
+        finish=elf.symbol('finish')[0]
+        for word in (gate.branch(pc+45*4,finish+4,True),gate.branch(pc+45*4,finish)):
+            bad=data.copy();struct.pack_into('<I',bad,elf.offset(pc+45*4,4),word)
+            with self.assertRaises(ValueError):gate.validate_partial(bad)
+
+    def test_all_vectors_must_target_first_capture_instruction(self):
+        data=partial_fixture();elf=gate.Elf(data)
+        vectors=elf.symbol('vectors')[0];capture=elf.symbol('exception_capture')[0]
+        for slot in range(16):
+            pc=vectors+slot*128
+            for word in (gate.NOP,gate.branch(pc,capture+4),gate.branch(pc,capture,True)):
+                bad=data.copy();struct.pack_into('<I',bad,elf.offset(pc,4),word)
+                with self.subTest(slot=slot,word=word),self.assertRaises(ValueError):gate.validate_partial(bad)
+
+    def test_boot_vbar_reachability_stack_literals_and_finish_binding(self):
+        data=partial_fixture();elf=gate.Elf(data);start=gate.PRIVATE
+        for i in range(32):
+            bad=data.copy();struct.pack_into('<I',bad,elf.offset(start+i*4,4),gate.NOP)
+            with self.subTest(word=i),self.assertRaises(ValueError):gate.validate_partial(bad)
+        for i in range(5):
+            bad=data.copy();struct.pack_into('<Q',bad,elf.offset(start+128+i*8,8),0)
+            with self.subTest(literal=i),self.assertRaises(ValueError):gate.validate_partial(bad)
+        bad=data.copy();struct.pack_into('<Q',bad,24,start+60)
+        with self.assertRaises(ValueError):gate.validate_partial(bad)
+        bad=data.copy();vectors=elf.symbol('vectors')[0]
+        struct.pack_into('<I',bad,elf.offset(start+84,4),gate.adr(start+84,vectors+128))
+        with self.assertRaises(ValueError):gate.validate_partial(bad)
 
     def test_every_gpr_vector_and_status_sink_store_is_required(self):
         sink = self.elf.symbol('fence_sink_gate')[0]

@@ -3,8 +3,10 @@
 Grow one working emulator through bounded, tested increments. The owner decisions
 of October 25, 2026 are: Rust for most new code, host-side FEX first, ABI and
 producer/runtime development together, early performance feedback, and configurable
-N-vCPU design with progressively wider tests. These are implementation directions. I1–I4 now have independently reproduced finite working paths; this
-does not establish general correctness or superiority over QEMU.
+N-vCPU design with progressively wider tests. These are implementation
+directions. I1–I4 and the post-I4 validation pass now
+have independently reproduced finite working paths; this does not establish
+general correctness or superiority over QEMU.
 
 This is the implementation order and setup entry point. The
 [workflow](research/README.md) governs development and evidence; [INV-03-01](research/investigations/INV-03-01.md#current-direction--build-first-october-25-2026)
@@ -492,6 +494,40 @@ remain later work. I4-V deepens integrated validation before dependent boot work
 The runner's increment-check flag reports execution coverage; independent review
 and acceptance remain recorded in INV-03-01.
 
+### I4-V validation runs
+
+Use the [pinned I4-V producer](../tools/i4v_producer/README.md), rather than the
+earlier I1/I3 executables, for the new profiles. For a focused development check:
+
+```sh
+./tools/with-env python3 -B tools/run_i4v.py \
+  --name "i4v-local-$(date +%Y%m%d-%H%M%S)" \
+  --producer ../natemu-raw/i4v-producer-20261026-02/build/Bin/CodeSizeValidation \
+  --progress --focus progress-stack-n4-seed3
+```
+
+The focus selects one native case while retaining the runner's build and unit
+checks. It cannot establish full I4-V coverage. Omit `--focus` and use the following
+flag groups in separate, sequential runs with unique names for the full native
+campaign; each group stays within the existing20-minute bundle bound.
+
+| Flag group | Manifest cells, including44 repeated baseline cells per group |
+| --- | --- |
+| `--progress` | 116:72 seeded stack/control/coherence/atomic/partial-helper cases plus baseline. |
+| `--containment` | 69:25 declared failures plus baseline; each failure also requires a separate fresh-control execution. |
+| `--coherence --fence --ordering` | 278 translation, ordering and fence cases. |
+| `--stack --aliases --concurrent-stack --mixed-aliases --paging-off --paging-off-steps --mixed-modes --controls --concurrent-controls --stack-boundaries` | 394 address, stack and mode/control cases. |
+| `--address-forms` | 104 protected32 address cases. |
+
+Also run the87-job legacy `run_i1.py --i4-pressure --i3-allocated` matrix above
+with its original producer pins. Do not run the groups concurrently or combine
+all flags into one bundle that exceeds the declared limit. Count repeated baselines and fresh controls
+separately from distinct coverage. A bundle's `full_i4v_complete: false` does not
+claim aggregate milestone acceptance; that judgment belongs to the
+[contract matrix and independent review](research/reviews/INV-03-01-i4v-coverage.md).
+The separate [QEMU comparison](../fixtures/i4v-qemu/README.md) binds passed native
+reports and has its own producing snapshot, checksums and bounded execution.
+
 Use `./tools/with-env COMMAND ...` for project builds, checks and runs. It supplies
 the durable sibling `../natemu-raw` as `NATEMU_RAW_ROOT`, independently of the
 caller's working directory, and preserves a nonempty explicit override. It
@@ -534,36 +570,36 @@ review and a fresh87-job rebuild including all I1–I3 regressions. The
 records exact evidence and unsupported behavior. Keep legacy I1–I3 N=1 profiles
 separate; arbitrary concurrent guest code and the full ABI remain unestablished.
 
-The [I4-V validation pass](#post-i4-integrated-validation) is underway. Finite V1
-load, stack-prefix and shared/mixed-permission alias checkpoints have independent
-acceptance; [INV-03-01](research/investigations/INV-03-01.md#i4-v-active-development--first-v1-slice-october-25-2026)
-records their exact coverage and remaining work. Complete the remaining V1
-address/permission/boundary cases and extend the accepted flat mixed
-paged/paging-off concurrency to the wider V2 address/service profiles. V3 now
-includes protected32/legacy32, hidden-PAE and IA-32e transactions, descriptor-checked
-far transfers and 50 concurrent family/actor cases at N=1/2/3/4. The subsequent
-terminal-stack/split-store and protected32 address checkpoints bring primary and
-independent rebuilds to 454 distinct native cases, followed by 87 legacy checks;
-INV-03-01 owns the exact evidence and review scope. Concurrent terminal #SS/#GP,
-checked split-page stores, subpage segment bases, fixed A20-off and address
-wrapping are accepted within their finite profiles. The new address cases use
-checked memory service; they do not qualify native ordering. The subsequent
-native ordering and live-dependency LFENCE implementation passes174 new cells:
-seven whole-block litmus profiles, aligned XCHG32 pre/post-commit recovery, raw
-fence controls and full native-state LFENCE sinks. Fresh independent rebuilds
-preserve all454 earlier native cases and87 legacy checks, giving628 distinct
-native cases. Independent artifact audit and findings review accept this finite
-checkpoint.
-The translation-coherence checkpoint adds60 independently reproduced cases:
-shared parent changes, A/D clearing and4KiB/2MiB transitions with retained work
-and delayed shootdowns at N1/2/3/4. All688 distinct native cases and87 legacy
-jobs pass fresh independent rebuilds and artifact review. The remaining pass
-implements72 seeded scheduling/recovery cases and25 deliberate containment
-cases, followed by the final contract-to-test audit and independent review.
-These finite cases do not establish whole-emulator correctness.
-Declare execution bounds, adapt existing tests and add missing adversarial cases
-as each slice is built. Independent I5 preparation can proceed. Accepted finite
-checkpoints do not complete V1 or I4-V; unfinished cells remain explicit.
+The [I4-V validation pass](#post-i4-integrated-validation) is complete within its
+declared finite profiles. Independent final-source rebuilds preserve all 688
+preceding native cases and add 72 seeded recovery/progress cases, giving 760
+distinct healthy cases. All 25 intentional failure cases and their separate-process
+fresh controls pass containment checks, and the 87-job legacy suite passes.
+The five native bundles execute 986 cases including repeated baselines and fresh
+controls; these repeats do not inflate distinct coverage. Both independent
+reviews accept the source/contracts, producing artifacts and complete finite
+scope with no unresolved substantive blocker. The separate six-profile
+pinned-QEMU comparison also passes fresh independent reproduction with exact
+full-flags checks. The
+[contract-to-test matrix](research/reviews/INV-03-01-i4v-coverage.md) records
+configurations, explicit exclusions and retained evidence.
+
+**Next increment: I5, boot and small workloads.** Select an exact stock kernel
+and external initramfs containing `/init` and small test programs. Define the
+first bounded direct-boot slice using the accepted startup and machine contracts;
+implement required semantics, exception delivery/return, startup32, timer/APIC
+and serial as the boot path reaches them. Bring up uniprocessor boot and userspace
+outputs, then SMP, retaining I1–I4-V regressions throughout. Kernel boot alone
+is not application coverage or a code-generator performance verdict.
+[INV-03-01](research/investigations/INV-03-01.md#current-direction--build-first-october-25-2026)
+owns current results and assignments. No whole-project research phase is a
+prerequisite to that next executable slice.
+
+The finite validation does not establish arbitrary guest programs, general
+ISA/FP or exception delivery, production devices, larger-N scaling, M2 parity,
+performance or whole-emulator correctness. The ABI remains provisional outside
+its tested profiles; dependent work must preserve their contracts and add its
+required semantics and tests.
 
 For each increment record implemented behavior, passed/failed/untested checks,
 tested N, material interface changes, measurements with qualification, and the

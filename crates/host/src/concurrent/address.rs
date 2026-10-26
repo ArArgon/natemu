@@ -231,6 +231,7 @@ pub fn run(args: &[String]) -> Result<()> {
         object.configured_vcpus = n as u32;
         object.vcpu_id = id as u32;
         let shared = Shared {
+            schedule: 0,
             object,
             initial: frame,
             captured: NativeFrame::ZERO,

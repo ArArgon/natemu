@@ -23,6 +23,16 @@ def module(path, name):
     return result
 
 
+def bind_partial_store(report, expected_pc):
+    """Bind populated fault sites to the independently audited producing ELF."""
+    if report['case']!='partial-progress':return
+    for owner in report['owners']:
+        if owner['faults'] not in (1,2) or owner['store_pc']!=expected_pc:
+            raise ValueError('partial helper store differs from producing ELF')
+        if any(fault['pc']!=expected_pc for fault in owner['fault'][:owner['faults']]):
+            raise ValueError('partial helper fault differs from producing ELF')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--name', required=True)
@@ -41,6 +51,8 @@ def main():
     parser.add_argument('--fence', action='store_true', help='execute full live-result LFENCE dependency cases')
     parser.add_argument('--ordering', action='store_true', help='execute native litmus, XCHG fault/retry and fence controls')
     parser.add_argument('--coherence', action='store_true', help='execute parent, A/D and page-size coherence at N=1..4')
+    parser.add_argument('--progress', action='store_true', help='execute seeded stack/control/coherence schedules')
+    parser.add_argument('--containment', action='store_true', help='execute 25 injected failures and fresh control VMs')
     parser.add_argument('--focus', help='retain only one selected alias/stack concurrency cell for diagnosis')
     args = parser.parse_args()
     selected = [f'{family}-{region}-n{n}' for family,enabled in (('alias',args.aliases),('stack',args.concurrent_stack))
@@ -84,6 +96,12 @@ def main():
         for n in range(1, 5) for actor in range(n)]
     if args.coherence:
         selected += [f'coherence-{name}-n{n}-actor{actor}' for _, name, n, actor in coherence_cells]
+    progress_cells=[(family,n,ordinal) for family in ('stack','controls','coherence','atomic','partial') for n in range(1,5) for ordinal in range(2 if family=='partial' else 4)]
+    if args.progress:
+        selected += [f'progress-{family}-n{n}-seed{ordinal}' for family,n,ordinal in progress_cells]
+    containment_cells=[(failure,n,actor) for failure in range(1,6) for n,actor in ((1,0),(2,0),(2,1),(4,0),(4,3))]
+    if args.containment:
+        selected += [f'containment-f{failure}-n{n}-actor{actor}' for failure,n,actor in containment_cells]
     if args.focus and args.focus not in selected:
         parser.error('--focus must name a cell enabled by its selected profile')
     if resource.getrlimit(resource.RLIMIT_CPU) != (resource.RLIM_INFINITY,) * 2:
@@ -95,6 +113,7 @@ def main():
                   status='preparing', full_i4v_complete=False, tested_vcpus=[],
                   started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                   source_origin=str(REPO), jobs=[], commands=[], compilations=[], cells=[],
+                  standalone_compilers={},
                   stack_enabled=args.stack,
                   aliases_enabled=args.aliases,
                   concurrent_stack_enabled=args.concurrent_stack,
@@ -109,6 +128,8 @@ def main():
                   ordering_enabled=args.ordering,
                   fence_enabled=args.fence,
                   coherence_enabled=args.coherence,
+                  progress_enabled=args.progress,
+                  containment_enabled=args.containment,
                   focus=args.focus,
                   limits=dict(build_jobs=2, build_rss_bytes=8*1024**3,
                               worker_rss_bytes=512*1024**2, cell_seconds=120,
@@ -150,6 +171,18 @@ def main():
                      'tools/i4v_coherence_worker.py', 'tools/test_i4v_coherence_worker.py',
                      'tools/i4v_coherence_model.py', 'tools/test_i4v_coherence_model.py',
                      'tools/check_i4v_coherence.py', 'tools/test_check_i4v_coherence.py',
+                     'tools/check_i4v_schedule.py', 'tools/test_check_i4v_schedule.py',
+                     'tools/check_i4v_progress_protocols.py', 'tools/test_check_i4v_progress_protocols.py',
+                     'tools/test_run_i1.py',
+                     'tools/check_i4v_partial_progress.py', 'tools/test_check_i4v_partial_progress.py',
+                     'tools/testdata/i4v_partial_n2.json.gz', 'tools/testdata/i4v_partial_n2.json.provenance.json',
+                     'tools/i4v_atomic_schema.py',
+                     'tools/check_i4v_containment.py', 'tools/test_check_i4v_containment.py',
+                     'tools/testdata/i4v_containment_panic_n1.json.gz', 'tools/testdata/i4v_containment_panic_n1.json.provenance.json',
+                     'tools/test_containment_supervisor.py',
+                     'tools/test_supervisor_ownership.py', 'tools/test_run_i4v.py',
+                     'tools/check_i4v_atomic_progress.py', 'tools/test_check_i4v_atomic_progress.py',
+                     'tools/testdata/i4v_atomic_n4_seed2.json.gz', 'tools/testdata/i4v_atomic_n4_seed2.json.provenance.json',
                      'tools/testdata/i4v_coherence_parent_n1.json.gz',
                      'tools/testdata/i4v_coherence_parent_n1.json.provenance.json',
                      'tools/testdata/i4v_coherence_size_pae_n4.json.gz',
@@ -187,12 +220,16 @@ def main():
         record['build_environment'] = environment
         deadline = time.monotonic() + record['limits']['bundle_seconds']
 
-        def job(label, argv, oracle=False, wall=120, rss=512*1024**2):
+        def job(label, argv, oracle=False, wall=120, rss=512*1024**2, expected_exit=0, gate_file=None):
             directory = run / label
             directory.mkdir()
             specification = dict(argv=list(map(str, argv)), cwd=str(source), environment=environment)
+            specification['expected_exit']=expected_exit
             if oracle:
-                specification['oracle'] = str(source / ('tools/check_i4v_coherence.py' if oracle == 'coherence'
+                if oracle == 'progress':
+                    specification['oracle_json_lines'] = True
+                specification['oracle'] = str(source / ('tools/check_i4v_schedule.py' if oracle == 'progress'
+                    else 'tools/check_i4v_coherence.py' if oracle == 'coherence'
                     else 'tools/check_i4v_fence.py' if oracle == 'fence'
                     else 'tools/check_i4v_ordering.py' if oracle == 'ordering'
                     else 'tools/check_i4v_address_concurrent.py' if oracle == 'address'
@@ -212,7 +249,7 @@ def main():
                 raise RuntimeError('I4-V execution bundle bound reached')
             result = supervisor.supervise(
                 [sys.executable, '-B', str(source / 'tools/run_i1.py'), '--worker', str(path)],
-                directory, wall=remaining, rss_limit=rss, period=.05)
+                directory, wall=remaining, rss_limit=rss, period=.02 if gate_file else .05, gate_file=gate_file)
             (directory / 'supervision.json').write_text(json.dumps(result, indent=2)+'\n')
             record['jobs'].append(dict(name=label, **result))
             retention.save(run, record)
@@ -223,6 +260,13 @@ def main():
             return directory
 
         job('rust-tests', ['cargo', '+1.97.0', 'test', '--offline', '--locked'], wall=600, rss=8*1024**3)
+        job('runner-tests', [sys.executable,'-B','-m','unittest','discover','-s','tools','-p','test_run_i1.py'])
+        job('i4v-runner-tests', [sys.executable,'-B','-m','unittest','discover','-s','tools','-p','test_run_i4v.py'])
+        job('progress-protocol-tests', [sys.executable,'-B','-m','unittest','discover','-s','tools','-p','test_check_i4v_progress_protocols.py'])
+        job('atomic-progress-tests', [sys.executable,'-B','-m','unittest','discover','-s','tools','-p','test_check_i4v_atomic_progress.py'],wall=180)
+        job('containment-supervisor-tests',[sys.executable,'-B','-m','unittest','discover','-s','tools','-p','test_containment_supervisor.py'])
+        job('supervisor-ownership-tests',[sys.executable,'-B','-m','unittest','discover','-s','tools','-p','test_supervisor_ownership.py'])
+        job('containment-oracle-tests',[sys.executable,'-B','-m','unittest','discover','-s','tools','-p','test_check_i4v_containment.py'])
         for label, folder, pattern in (('producer-tests', 'tools/i4v_producer', 'test_*.py'),
                                        ('expectation-tests', 'fixtures/i4v', 'test_*.py'),
                                        ('oracle-tests', 'tools', 'test_i4v_check.py'),
@@ -245,17 +289,64 @@ def main():
         job('concurrent-controls-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_controls_concurrent_check.py'])
         job('address-worker-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_address_worker.py'])
         job('address-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_check_i4v_address_concurrent.py'])
-        for name in ('i4v_ordering_worker', 'i4v_ordering_model', 'check_i4v_ordering', 'i4v_fence_worker', 'check_i4v_fence', 'check_i4v_fence_gate', 'i4v_coherence_worker', 'i4v_coherence_model', 'check_i4v_coherence'):
+        for name in ('i4v_ordering_worker', 'i4v_ordering_model', 'check_i4v_ordering', 'i4v_fence_worker', 'check_i4v_fence', 'check_i4v_fence_gate', 'i4v_coherence_worker', 'i4v_coherence_model', 'check_i4v_coherence', 'check_i4v_schedule', 'check_i4v_partial_progress'):
             job(name+'-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_'+name+'.py'])
         job('build-host', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-host'], wall=600, rss=8*1024**3)
         job('build-runtime', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], wall=600, rss=8*1024**3)
         host = source / 'target/release/natemu-host'
         runtime = source / 'target/aarch64-unknown-none/release/natemu-runtime'
-        gate_job=job('fence-gate-audit', [sys.executable, '-B', 'tools/check_i4v_fence_gate.py', runtime])
+        gate_job=job('fence-gate-audit', [sys.executable, '-B', 'tools/check_i4v_fence_gate.py', runtime]+(['--partial'] if args.progress or args.containment else []))
         fence_gates=json.loads((gate_job/'command.stdout').read_text())
         job('sign', ['codesign', '--force', '--sign', '-', '--entitlements', 'crates/host/entitlements.plist', host])
         job('verify-signature', ['codesign', '--verify', '--verbose=2', host])
         exporter = module(source / 'tools/i4v_producer/export.py', 'exporter')
+        if args.containment:
+            sys.path.insert(0,str(source/'tools'))
+            containment=module(source/'tools/check_i4v_containment.py','containment_checker')
+            scheduling=module(source/'tools/check_i4v_schedule.py','scheduling')
+            for failure,n,actor in containment_cells:
+                label=f'containment-f{failure}-n{n}-actor{actor}'
+                if args.focus and label!=args.focus:continue
+                output=run/(label+'-producer')
+                result=job(label,[host,runtime,'i4v-containment',producer,failure,n,actor,source/'tools/i4v_controls_worker.py',output],
+                    expected_exit=1,gate_file=output/'containment-gate.json')
+                reports=[json.loads(line) for line in (result/'command.stdout').read_text().splitlines()]
+                cfg=containment.configuration(failure,n,actor)
+                containment.check(reports,cfg)
+                bind_partial_store(reports[2],fence_gates['partial_store_pc'])
+                for directory,exported in containment.verify_artifacts(reports,output):
+                    record['compilations'].append(dict(directory=str(directory.relative_to(run)),export=exported))
+                # A separate host process resets process-local cancellation state.
+                fresh_output=run/(label+'-fresh-producer')
+                fresh_cfg=containment.scheduler(cfg)
+                family='partial' if cfg['family']==4 else 'controls'
+                fresh=job(label+'-fresh',[host,runtime,'i4v-progress',producer,family,n,fresh_cfg['seed_ordinal'],
+                    source/'tools/i4v_controls_worker.py',fresh_output],oracle='progress')
+                fresh_reports=[json.loads(line) for line in (fresh/'command.stdout').read_text().splitlines()]
+                bind_partial_store(fresh_reports[1],fence_gates['partial_store_pc'])
+                containment.verify_fresh(reports,fresh_reports,fresh_output)
+                for directory,exported in scheduling.verify_producer(fresh_reports,fresh_output):
+                    record['compilations'].append(dict(directory=str(directory.relative_to(run)),export=exported))
+                record['cells'].append(dict(name=label,producer=str(output.relative_to(run)),fresh_producer=str(fresh_output.relative_to(run)),
+                    vcpus=n,failure=failure,actor=actor))
+        if args.progress:
+            sys.path.insert(0,str(source/'tools'))
+            scheduling = module(source/'tools/check_i4v_schedule.py','scheduling')
+            for family,n,ordinal in progress_cells:
+                label=f'progress-{family}-n{n}-seed{ordinal}'
+                if args.focus and label != args.focus:
+                    continue
+                output=run/(label+'-producer')
+                worker={'stack':'i4v_stack_worker.py','controls':'i4v_controls_worker.py','coherence':'i4v_coherence_worker.py','atomic':'i4v_ordering_worker.py','partial':'i4v_coherence_worker.py'}[family]
+                result=job(label,[host,runtime,'i4v-progress',producer,family,n,ordinal,source/'tools'/worker,output],oracle='progress')
+                reports=[json.loads(line) for line in (result/'command.stdout').read_text().splitlines() if line.strip()]
+                cfg=scheduling.configuration(('stack','controls','coherence','atomic','partial').index(family),n,ordinal)
+                scheduling.check(reports,cfg)
+                if family=='partial':
+                    bind_partial_store(reports[1],fence_gates['partial_store_pc'])
+                for directory,exported in scheduling.verify_producer(reports,output):
+                    record['compilations'].append(dict(directory=str(directory.relative_to(run)),export=exported))
+                record['cells'].append(dict(name=label,producer=str(output.relative_to(run)),vcpus=n,family=family,seed_ordinal=ordinal,seed=cfg['seed'],actor=cfg['actor']))
         if args.coherence:
             sys.path.insert(0, str(source / 'tools'))
             coherence_worker = module(source / 'tools/i4v_coherence_worker.py', 'coherence_worker')
@@ -410,6 +501,7 @@ def main():
                         record['cells'].append(dict(name=label,producer=str(output.relative_to(run)),vcpus=n,actor=actor,profile=profile))
         for region, rip in (() if args.focus else (('high', 0xffff800000102000), ('low', 0x102000))):
             directory = run / ('compile-' + region)
+            record['standalone_compilers'][str(directory.relative_to(run))]='producer-'+region
             job('producer-' + region, [sys.executable, '-B', source / 'tools/i4v_producer/compile.py',
                                        '--directory', directory, '--producer', producer,
                                        '--case', 'fex_memory_data64', '--rip', hex(rip)])
@@ -686,18 +778,37 @@ def main():
         raise
     finally:
         record['tested_vcpus'] = sorted({cell.get('vcpus',1) for cell in record['cells']})
-        # An externally terminated compiler worker may not reach its cleanup.
-        for path in run.rglob('compiler.json'):
-            if source in path.parents:
-                continue
-            compiler = json.loads(path.read_text())
-            commands = compiler.get('commands', [])
-            if commands and not any(c['argv'][:2] == ['docker', 'rm'] and c.get('returncode') == 0 for c in commands):
-                argv = commands[0]['argv']
-                name = argv[argv.index('--name')+1]
-                cleanup = subprocess.run(['docker', 'rm', '--force', '--volumes', name], capture_output=True, text=True, timeout=30)
-                record.setdefault('emergency_cleanup', []).append(dict(container=name, returncode=cleanup.returncode, stderr=cleanup.stderr))
-                record['status'] = 'failed'
+        # Exact registries survive interrupted compiler logs. Cleanup never
+        # signals a PID inferred from stale metadata or enumerates global jobs.
+        cleanup_deadline=time.monotonic()+10
+        registries=[path for path in sorted(run.rglob('.ownership/job.json')) if source not in path.parents]
+        ownership=None
+        if registries:
+            try:
+                ownership=module(source/'tools/i4v_producer/ownership.py','owned_cleanup')
+            except Exception as error:
+                record.setdefault('owned_cleanup',[]).append(dict(error='cleanup helper unavailable: '+str(error)))
+                record['status']='failed'
+        for path in registries if ownership is not None else []:
+            left=max(0,cleanup_deadline-time.monotonic())
+            try:
+                if ownership.job(path.parent).get('kind')=='standalone-container':
+                    root=path.parent.parent
+                    label=record['standalone_compilers'].get(str(root.relative_to(run)))
+                    receipt=next((j for j in record['jobs'] if j['name']==label),None)
+                    if receipt is None:
+                        cleanup=ownership.cleanup_containers(path.parent,budget=left)
+                        cleanup.update(complete=False,error='standalone compiler has no explicit supervised-job binding')
+                    else:
+                        cleanup=ownership.cleanup_standalone(path.parent,expected_root=root,supervision=receipt,budget=left)
+                else:
+                    cleanup=ownership.cleanup_job(path.parent,budget=left)
+                record.setdefault('owned_cleanup',[]).append(dict(registry=str(path.parent.relative_to(run)),report=cleanup))
+                if not cleanup['complete']:
+                    record['status']='failed'
+            except Exception as error:
+                record.setdefault('owned_cleanup',[]).append(dict(registry=str(path.parent.relative_to(run)),error=str(error)))
+                record['status']='failed'
         record['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         retention.save(run, record)
         retention.checksums(run)

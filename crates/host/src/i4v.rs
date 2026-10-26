@@ -1,12 +1,7 @@
 //! First I4-V harness: eager controls and resident-requested high/low guest loads.
 use super::*;
 use natemu_abi::{recovery as recover, shadow, validation};
-use std::{
-    fs::OpenOptions,
-    io::Write,
-    path::Path,
-    process::{Command, Stdio},
-};
+use std::{fs::OpenOptions, io::Write, path::Path};
 
 const BODY: [u8; 8] = [0xc4, 0xfc, 0xdf, 0xc8, 0x1f, 0x20, 0x03, 0xd5];
 
@@ -127,6 +122,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut object = Object::new(LIVE_LOAD);
     object.code_length = native.len() as u64;
     let shared = Shared {
+        schedule: 0,
         object,
         initial: frame,
         captured: NativeFrame::ZERO,
@@ -282,28 +278,12 @@ fn compile_request(
             .map_err(|e| e.to_string())?;
     }
     drop(file);
-    let stdout = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(directory.join("worker.stdout"))
-        .map_err(|e| e.to_string())?;
-    let stderr = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(directory.join("worker.stderr"))
-        .map_err(|e| e.to_string())?;
-    let result = Command::new("python3")
-        .arg("-B")
-        .arg(worker)
-        .arg("--request-dir")
-        .arg(&directory)
-        .arg("--producer")
-        .arg(producer)
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr)
-        .status()
-        .map_err(|e| e.to_string())?;
+    let mut child = translation::process_owner::OwnedChild::spawn(
+        Path::new(worker),
+        Path::new(producer),
+        &directory,
+    )?;
+    let result = child.wait().map_err(|e| e.to_string())?;
     if !result.success() {
         return Err(format!("I4-V worker failed: {}", directory.display()));
     }
@@ -317,6 +297,7 @@ fn compile_request(
     if raw.len() != 128 {
         return Err("I4-V worker reply length differs from packet".into());
     }
+    child.cleanup()?;
     Ok(core::array::from_fn(|i| {
         u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap())
     }))

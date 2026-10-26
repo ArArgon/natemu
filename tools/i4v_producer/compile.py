@@ -9,6 +9,13 @@ import struct
 import subprocess
 import time
 import uuid
+try:
+    from .ownership import Container, atomic_json, cleanup_containers
+except ImportError:
+    try:
+        from i4v_producer.ownership import Container, atomic_json, cleanup_containers
+    except ImportError:
+        from ownership import Container, atomic_json, cleanup_containers
 
 IMAGE = 'sha256:27475cb39ecb4500d02b7c6e73c9d598e8d9f0736f0dc217d2d985e5cbe01aac'
 
@@ -31,7 +38,7 @@ def compile_source(directory, producer, source, guest_rip, bitness, instructions
     record = dict(schema='natemu-i4v-compile-v1', guest_rip=guest_rip, bitness=bitness,
                   source_hex=source.hex(), instructions=instructions, expected_host=expected_host,
                   image=IMAGE, producer_sha256=hashlib.sha256(producer.read_bytes()).hexdigest(), commands=[], status='running')
-    def save(): (directory/'compiler.json').write_text(json.dumps(record, indent=2)+'\n')
+    def save(): atomic_json(directory/'compiler.json', record)
     def run(argv, timeout=30, allowed=(0,)):
         item = dict(argv=argv, timeout_seconds=timeout); record['commands'].append(item); save()
         start=time.monotonic()
@@ -40,13 +47,18 @@ def compile_source(directory, producer, source, guest_rip, bitness, instructions
         assert result.returncode in allowed, (argv[:2], result.returncode, result.stdout, result.stderr)
         return result
     container='natemu-i4v-'+uuid.uuid4().hex
+    owned = Container(directory, container)
+    primary = None
     try:
-        run(['docker','create','--name',container,'--cpus=2','--memory=512m','--memory-swap=512m','--pids-limit=128',
+        owned.creating()
+        created = run(['docker','create','--name',container,'--label',owned.label,'--cpus=2','--memory=512m','--memory-swap=512m','--pids-limit=128',
              '--network=none','--read-only','--tmpfs','/tmp:rw,size=64m','--tmpfs','/var/lib/postgresql/data:rw,size=1m',
              '--mount',f'type=bind,src={directory},dst=/work','--mount',f'type=bind,src={producer},dst=/producer,readonly',
              '--entrypoint=/usr/bin/env',IMAGE,'-i','PATH=/usr/bin:/bin','HOME=/work/empty-home',
              'NATEMU_EXPORT=/work/outputs',f'NATEMU_GUEST_RIP={guest_rip}',
              'timeout','30','/producer','/work/input.bin'])
+        owned.created(created.stdout)
+        owned.wait_before_start()
         result=run(['docker','start','--attach',container],40,allowed=(0,1))
         log=result.stdout+result.stderr; (directory/'producer.log').write_text(log)
         state=json.loads(run(['docker','inspect',container]).stdout)[0]['State']; record['container_state']=state
@@ -72,12 +84,35 @@ def compile_source(directory, producer, source, guest_rip, bitness, instructions
         assert pc and all(0 <= p['guest_offset'] < len(source) and 0 <= p['native_offset'] < obj['bytes'] for p in pc)
         record.update(status='exported_not_executed', instruction_count_check=result.returncode, object=obj, guest_pc=pc)
     except BaseException as error:
-        record.update(status='failed', error=str(error)); raise
+        primary = error
+        record.update(status='failed', error=f'{type(error).__name__}: {error}'); raise
     finally:
-        try: run(['docker','rm','--force','--volumes',container])
-        except BaseException:
-            record['status']='cleanup_failed'; raise
-        finally: save()
+        try:
+            identity = owned.record.get('container_id')
+            if identity is not None:
+                # Docker names may be rebound after creation. The acknowledged
+                # immutable identity remains the object this request owns.
+                run(['docker','rm','--force','--volumes',identity])
+                owned.removed()
+            else:
+                # Creation may have reached the daemon without its reply reaching
+                # us. Resolve only this journal's exact name+ownership label and
+                # remove the inspected immutable Id, never the unverified name.
+                def cleanup_run(argv, *, timeout, **kwargs):
+                    return run(argv, timeout, allowed=(0, 1))
+                cleanup = cleanup_containers(owned.registry, run=cleanup_run)
+                record['cleanup'] = cleanup
+                if not cleanup['complete']:
+                    raise RuntimeError('unacknowledged owned container cleanup')
+        except BaseException as error:
+            record['cleanup_error'] = f'{type(error).__name__}: {error}'
+            if primary is None:
+                record['status']='cleanup_failed'
+                raise
+        finally:
+            try: save()
+            except BaseException:
+                if primary is None: raise
     return record
 
 def parse_args(argv=None):

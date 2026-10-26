@@ -92,6 +92,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut object = Object::new(LIVE_LOAD);
     object.code_length = off::CODE_BYTES as u64;
     let shared = Shared {
+            schedule: 0,
         object,
         initial: frame,
         captured: NativeFrame::ZERO,

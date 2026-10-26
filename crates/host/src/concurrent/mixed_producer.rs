@@ -1,23 +1,14 @@
 //! Bounded per-owner compilation, including an independently retained stale job.
 use super::*;
 use crate::i4v_stack::{read_packet, write_packet};
+use crate::translation::process_owner::OwnedChild;
 use natemu_abi::mixed32;
-use std::{
-    fs::File,
-    path::PathBuf,
-    process::{Child, Command, Stdio},
-};
+use std::path::PathBuf;
 
 struct Job {
-    child: Child,
+    child: OwnedChild,
     directory: PathBuf,
     request: wire::Packet,
-}
-impl Drop for Job {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 impl Job {
     fn finish(mut self) -> Result<wire::Packet> {
@@ -29,6 +20,7 @@ impl Job {
             return Err("mixed reply changed request or emitted body".into());
         }
         write_packet(&self.directory.join("reply-delivered.bin"), &reply)?;
+        self.child.cleanup()?;
         Ok(reply)
     }
 }
@@ -59,18 +51,11 @@ impl Compiler {
             .join(format!("request-{:03}", self.requests.len()));
         fs::create_dir(&directory).map_err(|e| e.to_string())?;
         write_packet(&directory.join("request.bin"), &request)?;
-        let child = Command::new("python3")
-            .arg("-B")
-            .arg("tools/i4v_mixed32_worker.py")
-            .arg("--request-dir")
-            .arg(&directory)
-            .arg("--producer")
-            .arg(&self.producer)
-            .stdin(Stdio::null())
-            .stdout(File::create_new(directory.join("worker.stdout")).map_err(|e| e.to_string())?)
-            .stderr(File::create_new(directory.join("worker.stderr")).map_err(|e| e.to_string())?)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        let child = OwnedChild::spawn(
+            std::path::Path::new("tools/i4v_mixed32_worker.py"),
+            &self.producer,
+            &directory,
+        )?;
         self.requests.push(request);
         Ok(Job {
             child,

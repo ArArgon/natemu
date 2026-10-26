@@ -91,6 +91,14 @@ impl State {
         })
     }
     pub fn enqueue(&mut self, id: usize) -> Result<Option<Request>, u64> {
+        self.enqueue_limit(id, self.n)
+    }
+    /// The fixture may lower the real outstanding-request capacity. Readiness
+    /// remains an N-owner rendezvous; it is not an admission count.
+    pub fn enqueue_limit(&mut self, id: usize, capacity: u64) -> Result<Option<Request>, u64> {
+        if capacity == 0 || capacity > self.n {
+            return Err(BAD);
+        }
         if id >= self.n as usize || self.finished != 0 {
             return Err(BAD);
         }
@@ -105,7 +113,7 @@ impl State {
         if id as u64 == self.next_ordinary && self.batch >= 8 - self.n {
             return Ok(None);
         }
-        if self.length >= self.n {
+        if self.length + u64::from(self.current.serial != 0) >= capacity {
             return Err(FULL);
         }
         self.serial = self.serial.checked_add(1).ok_or(BAD)?;

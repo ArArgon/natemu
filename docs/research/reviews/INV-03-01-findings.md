@@ -1,5 +1,586 @@
 # INV-03-01 — source findings review
 
+## Final acceptance — complete finite I4-V integrated pass, October 26, 2026 UTC
+
+**ACCEPT I4-V within the original implementation plan's admitted finite scope.**
+`/root/i4v_final_review` independently reviewed the implementation, oracles,
+primary artifacts, final contract matrix and all six reproduction bundles,
+and independently executed the supporting QEMU comparison. No substantive
+correctness, execution or reproduction defect remains open in that scope.
+This verdict supersedes the pending final-candidate status below. It completes
+I4-V; it does not complete I5, the full ABI milestone, Track03 or the emulator.
+
+### Requirement-by-requirement judgment
+
+| Original required area | Final evidence and judgment |
+| --- | --- |
+| V1 address domains, permissions and boundaries | **Pass in the admitted profiles.** Actual generated low/high fetch, data and stack paths retain full guest addresses, independently resolve parent/leaf permissions and exact faults, preserve committed stack/split-store prefixes and reject private/noncanonical accesses. Final-source reproduction preserves the earlier cases; seeded stack runs bind the real rotated actor, compiler/source writer, delayed peer and event roles. |
+| V2 paging-off and mixed owners | **Pass in the admitted protected32 profiles.** Segment/address-size/wrap/A20 fixtures, bounded RAM/device/hole effects and exact nonpaging faults reproduce. Mixed paged/off owners retain their separate fetch/access/context rules while sharing physical source/data; native miss/retry does not fabricate guest page-table reads or A/D effects. |
+| V3 control transitions and peer independence | **Pass in the declared transition profiles.** Actual control instructions and far transfers commit or reject precisely, preserve transactional hidden PAE state and next-fetch semantics, and reject stale work across ABA/context/source changes. Fifty actor rotations and seeded control compositions retain peer architectural state, routes and pending-event cuts. |
+| Guest ordering, supported atomics and fences | **Pass as finite conformance evidence.** The 154 ordering/atomic cells and twenty live-dependency LFENCE cells reproduce against independent expectations and producing artifacts. Postcommit XCHG recovery resumes only the saved store; it does not repeat the exchange. Finite outcome histograms do not prove universal ordering. |
+| Translation coherence | **Pass in the sixty declared parent/A-D/page-size profiles and preserved alias cases.** Independent full-state checks cover table bytes, cached versus invalidated A/D behavior, 4KiB/2MiB routes, delayed repair/acknowledgement and old-route completion. Actual code clearing remains distinct from unimplemented physical table/data recycling. |
+| Recovery, partial effects and lifetime | **Pass in the supported compositions.** The eight partial-helper cases retain changed-on-read values and the already committed first write across real second-store faults; no resampling, duplicate write or premature mutation/release is accepted. Stack/control/coherence/atomic cases preserve canonical/native prefixes, stale reply/entry exclusion and retained references; actual fault sites bind the producing ELF. |
+| Healthy N-vCPU progress and events | **Pass for N1/2/3/4.** All 72 seeded cases replay exact retained decisions against independently reconstructed eligibility and native actions. Actual reduced maintenance pools exercise identity-preserving FULL/re-admission in stack/control N≥2, with bounded fairness and event eligibility. N1 FULL is explicitly inapplicable. Offline replay is established; saved-ledger native playback is unimplemented and unclaimed. |
+| Terminal failure containment | **Pass for the 25 predeclared injections plus their separate-host/new-VM controls.** Actual worker exit, malformed reply, held-authority panic, withheld acknowledgement and cancellation retain the intended gate/prefix and original cause. Every owner is joined/destroyed and actual compiler resources are cleaned. Abandoned locks/references remain failed state; healthy/setup failures are never relabeled as successful injections. N3 containment remains untested. |
+| Native synchronization, publication and reclamation | **Accept the reviewed finite code/contract argument.** Ticket-lock release/acquire authority, waits outside that authority, closed admission before mutation, completed mapping/cache maintenance before acknowledgement/publication, guarded entry and reference-aware retirement remain bound to the final sources/emitted paths. These conclusions are not inferred from guest litmus frequencies or scheduler counts. |
+| Upstream reuse, independent expectations and supporting comparison | **Pass.** Pinned FEX and kvm-unit-tests adaptations retain provenance/licenses and independent expectations. Final strict QEMU primary03 and independent02 reproduce six sequential defined outcomes with exact full RFLAGS and no masked output bits. QEMU adds no privileged paging, retry, concurrent ordering, fence-completion or native-synchronization qualification. No complete upstream suite or native-x86 comparison is claimed. |
+| Reproduction and preservation | **Pass.** The exact earlier 688 native case definitions and 87 legacy jobs are preserved on final sources; new coverage, repeated baselines and fresh controls remain separately counted. Producing code, compiler/packet associations, ELF gates, resource receipts, checksums and failed development diagnostics are retained and independently reviewed. |
+
+### Final producing evidence
+
+The five fresh native bundles `i4v-progress-independent-20261026-01` through
+`-05` preserve **760 distinct healthy cases = 688 prior + 72 new**, plus **25
+intentional failure cases**. Their 961 manifest executions include 176 repeated
+baselines; the 25 additional fresh-control executions bring actual native
+executions to 986. `i4v-progress-regression-independent-20261026-01` separately
+preserves the exact 87-job legacy list. This reviewer independently verifies
+every cell definition against the prior accepted matrices, all 1,308 outer jobs
+as passed/reaped/quiescent, 203,545 native checksums and 3,428 legacy checksums.
+
+All five native source sets contain the same 811 producing paths as primary14;
+all 132 legacy source paths match their frozen inputs, with exact older fragment
+and producer pins. All six rebuilt runtime ELFs have SHA-256
+`0e8c0a5bcd03bfdc02f4bb0acbdb8ad6e93bb35c18384b700cac13928ca3b945`.
+The separate replicator's full semantic/artifact audits verify 6,512 native
+compiler exports and 6,572 report/export associations. Its ownership audits
+cover 6,522 native cleanup records plus 67 legacy owned processes and 57 legacy
+containers; no remaining container is recorded. Those receipts and scripts are
+retained with exact hashes in this review's manifest, not represented as a second
+execution by this reviewer.
+
+Native execution was serialized. Bundle04 finishes within its unchanged
+1,200-second limit at 1,178 seconds; each other bundle also stays within its bound.
+The conservative upper edge of second-rounded containment completion timestamps
+places every reproduced outer teardown within 4,338 ms of the actual gate, below
+10 seconds; the prefix oracle separately enforces the 3-second detection bound.
+Resource receipts retain per-job caps and observed outer-group RSS. They are
+not an aggregate process-tree memory measurement. Aggregate agent-minutes were
+not authoritatively measured and are not claimed. Passing counts or time bounds
+alone are not the basis for the semantic acceptance above.
+
+Final QEMU evidence is `i4v-qemu-dev-20261026-03` and reviewer-executed
+`i4v-qemu-independent-20261026-02`, both after legacy06. Each passes all six cases,
+134 checksums, actual setup/capture/ELF/listing/instruction-log bindings and **420
+actual-output corruption controls**, including all 64 RFLAGS bits in every case
+(384 flags controls plus 36 others). The newly assembled programs and outputs
+match exactly between the runs. Both use final-source resident reports, complete
+exact-ID container/volume cleanup, and retain exact RFLAGS `0x202`. Load/stack
+canonical flags match that value; ordering's full QEMU flags remain QEMU-only
+while the native ordering report establishes NZCV preservation. The historical
+masked comparator runs remain unchanged and are not substituted for this pair.
+
+### Independence, durable review and limits
+
+The final reviewer authored none of the runtime or production oracle changes.
+Runtime/host/producer/oracle authorship is separated throughout the earlier
+reviews. `/root/i4v_contract_review` authored the atomic-progress oracle and
+expanded partial ELF validator; root reviewed those changes independently, and
+this reviewer reviewed the final combined candidate. That agent is not described
+as an independent author-reviewer of its own files. `/root/i4v_upstream` authored
+the QEMU comparator; this reviewer reviewed it and owned fresh reproduction.
+
+The [final durable audit](../../../../natemu-raw/i4v-final-scope-review-20261026-01/README.md)
+retains independent scope/flags/artifact scripts, actual logs and hashed links
+to the separate native replication audits. Its `SHA256SUMS` digest is
+`add8b54903166c140dc92d207ea89edf6687d9d75f20393e2cf642007a1f4cef`.
+The strict QEMU independent bundle's checksum-index digest is
+`969ac275d77e9b89985d5298b23ded939d04c5b5c492ecfde706f6ab46b159c3`;
+its [execution/audit receipt](../../../../natemu-raw/i4v-qemu-independent-review-20261026-02/manifest.json)
+has digest `4538b0aa5804d2a66a5d9ae4df1324c9f75b6e420f0dc0b15ab6ebbddbc5e5a3`.
+
+The final matrix's contract scope matches the original implementation plan.
+Root and the replicator reconciled the draft/pending labels and superseded QEMU
+references in the matrix, current investigation, README and implementation plan
+to these final receipts; this required no more execution or expanded scope.
+Preserve the explicit unimplemented/untested cells: general ISA/FP and exception
+delivery, boot/devices, arbitrary guest concurrency, other atomic widths/routes,
+dynamic A20/general segmentation, physical table/data recycling, native saved-ledger
+playback, other host generations and performance/code-generator selection.
+These finite M4 results do not narrow the eventual emulator target or establish
+universal correctness.
+
+## Pre-execution tightening — full defined QEMU flags, October 26, 2026 UTC
+
+Root requires exact full RFLAGS for these fixed scalar profiles, consistent with
+the implementation plan's rule that only architecturally undefined results may
+be masked. `/root/i4v_final_review` independently accepts the narrow comparator
+delta before the new primary/independent comparison pair. **Historical passed
+outputs remain valid observations, but final comparison closure will use the
+two fresh bundles under this stricter validator.** Native source inputs and
+native reproduction requirements are unchanged.
+
+All six profiles have defined preserved flags and produce full RFLAGS `0x202`.
+The comparator now requires exact equality, removing the earlier `0xcd5` mask.
+Load/stack also require the same complete canonical value in the resident report;
+ordering's complete QEMU flags remain QEMU-only, while native ordering claims
+only recorded NZCV preservation. No arbitrary CPL3 IF-restoration claim is added.
+The assembly/setup and container execution code are unchanged. The reviewed
+runner SHA-256 is
+`3baff0fc1d64c9f39b9bbaf3535454bae0f85628c28e0228f13a2c5fbf2397ef`,
+and model SHA-256 is
+`6dfa0832077b5ff0e5c66a447ff8b5b495908e534165535a7ec99d14bc671a75`.
+All seven focused tests pass independently. Applying the strict checker to all
+twelve actual historical outputs passes and rejects all 768 single-flag-bit
+corruptions, covering every bit in each output, including IF/control/reserved/high
+bits. Those read-only checks are not represented as fresh comparison execution.
+The new comparison pair waits for the native05/legacy06 slot to finish.
+
+The [durable strict-validator review](../../../../natemu-raw/i4v-qemu-strict-review-20261026-01/README.md)
+retains the reviewed sources, exact delta-audit script and passing 768-corruption
+log, plus the updated independent artifact auditor. That auditor adds every
+flags bit explicitly to the fresh checks: 384 flags controls and 36 other output
+controls across six cases. The review `SHA256SUMS` digest is
+`eaf1cd06ff2547b9cdd6bfb1ad96ef907fd4720b7472faaf572a5722f151331f`.
+
+## Accepted supporting comparison — independent QEMU reproduction, October 26, 2026 UTC
+
+`/root/i4v_final_review`, independent of comparator author `/root/i4v_upstream`,
+prepared and executed fresh `i4v-qemu-independent-20261026-01` after root's explicit
+exclusive-slot handoff. The reviewed orchestration was also checked by root before
+execution. **Accept the plan's bounded pinned-QEMU supporting comparison in its
+six declared scalar profiles. This closes the comparison evidence gap identified
+in the final-candidate review; full I4-V acceptance still awaits the remaining
+native/legacy replicas and aggregate review.** No native x86 result is claimed.
+
+Fresh preparation binds the final-source stack report from native independent04,
+ordering reports from independent03 and the load report from primary14. All source
+files match the reviewed primary QEMU snapshot before preparation; execution uses
+the new bundle's retained runner and container source. Preparation, execution and
+independent artifact audit each exit 0 with their host process reaped. The complete
+review runs at 17:44:14–17:44:16 UTC, after native04's terminal pass and before the
+slot returns for native05/legacy06. Runtime execution and exact-ID container/volume
+cleanup complete successfully; the container identity differs from primary02.
+
+All 134 fresh checksums and all nine review-artifact checksums verify. Each of the
+six newly assembled ELFs and captured binary outputs is byte-identical to primary02,
+despite independently binding the new final-source stack report. The independent
+byte-level setup/capture, ELF, listing, instruction-log, pinned-binary, resident
+projection and full native-validator checks pass again. All 42 actual-output
+corruption controls are rejected. No broader semantic claim follows from this
+agreement: load/stack canonical registers and admitted memory, aligned DWORD XCHG
+with result store, and scalar LFENCE/SFENCE/MFENCE preservation are the evidence.
+Concurrent atomicity/ordering, privileged faults, retries, fence completion and
+native synchronization retain their separate native contracts and tests.
+
+The [fresh comparison](../../../../natemu-raw/i4v-qemu-independent-20261026-01/manifest.json)
+has `SHA256SUMS` digest
+`5022aef9667a432880a3c42d5528cf948ad43ef76af66390a6d4f7f29dcee87d`.
+The [independent execution/audit receipt](../../../../natemu-raw/i4v-qemu-independent-review-20261026-01/manifest.json)
+retains orchestration, command PIDs/timestamps, stdout/stderr and the independent
+audit script; its `SHA256SUMS` digest is
+`917707c64abdf93f50255587bb849a85f68737a2600a806ac547a69ea2aabfab`.
+Primary failed run01 remains unchanged and excluded; the version-format correction,
+passing primary02 and fresh reproduction are separately recorded below.
+
+## Findings review — primary QEMU supporting comparison, October 26, 2026 UTC
+
+`/root/i4v_final_review` independently accepts the retained artifact bindings and
+six finite scalar outcomes in `i4v-qemu-dev-20261026-02`. **The supporting QEMU
+obligation still awaits fresh independent execution with the final-source stack
+report; this primary audit alone does not complete I4-V.** The reviewer ran only
+read-only artifact checks, not QEMU, compilation or container operations.
+
+All 134 checksums pass. The actual package/static binary, QEMU 7.2.22 Debian
+version, `qemu64` CPU option, NASM 2.16.03, Python 3.13.5 and pinned container image
+bind the retained invocation. Independent byte encoding verifies the complete
+initial-register setup and sixteen-register save sequence, safe stack switch,
+PUSHFQ capture and LEA-derived actual end PC in every emitted ELF. NASM listing
+bytes and QEMU instruction-log bytes agree with that ELF; logged coverage includes
+every guest, setup and capture byte. Exact final GPRs, admitted flags, end PC and
+memory pass the independent scalar expectations and resident projections.
+Forty-two in-memory corruptions of the actual outputs are rejected.
+
+The original resident reports match their retained checksums and pass the full
+native validators from the audited final native source snapshot. Load binds
+primary14, ordering binds fresh independent03, and stack explicitly binds the
+earlier accepted `i4v-coherence-independent-20261026-02`. The latter is not
+relabeled as a final-source run. The created immutable container identity agrees
+with the successful exact-ID cleanup receipt; the retained create command
+shadows the image's inherited PostgreSQL volume with tmpfs, and the reviewed
+removal includes anonymous volumes. No cleanup error is hidden.
+
+The durable [audit bundle](../../../../natemu-raw/i4v-qemu-review-20261026-01/README.md)
+contains the independently authored read-only audit script and compact results.
+Its `SHA256SUMS` digest is
+`54b8e1f81b7c500ac454815bb8fb0f1f0017bccb8b3695b225f1ac36754b0019`.
+The successful comparison supports these sequential defined outcomes only:
+it adds no evidence for privileged paging, fault retries, concurrent ordering,
+atomic indivisibility across participants, fence completion or native publication.
+The final completion matrix must preserve those boundaries.
+
+## Pre-execution review — bounded QEMU supporting comparison, October 26, 2026 UTC
+
+`/root/i4v_final_review`, independent of comparator author `/root/i4v_upstream`,
+accepts the method and source for the six declared scalar comparisons before
+execution. The reviewed runner SHA-256 is
+`4291adde0173f6df4908e7c755e9eab99b854d3f2546568b2a592393d74c41bb`;
+the independent scalar model is
+`58d12e56d1f105859998b4610c5925d91769b1e53274ea95fdc3695a8a76a6c5`.
+All seven focused Python tests pass independently. No native, compiler or
+container operation was performed by this reviewer. **This is pre-execution
+method acceptance, not acceptance of outcomes or closure of the QEMU evidence
+gap.**
+
+**Pre-execution cleanup addendum:** root identified the pinned image's inherited
+`/var/lib/postgresql/data` volume. This reviewer accepts the author's narrow fix:
+an explicit bounded 1 MiB tmpfs shadows that destination, and exact-ID removal
+uses `--force --volumes`. Thus the known inherited destination does not allocate
+anonymous persistent storage, while removal also covers defensive anonymous
+volume cleanup without deleting the bind-mounted comparison directory. The
+new accepted runner SHA-256 is
+`fba6b829c3452b01915d06369164465ff42c3e27ccb15c8740a0ed8de4a9256a`.
+The model, container driver and tests are unchanged; all seven Python tests pass
+again independently. No comparison execution preceded this correction.
+
+**First execution correction:** `i4v-qemu-dev-20261026-01` remains failed before
+assembly or guest execution. The retained version line is exactly
+`NASM version 2.16.03` followed by a newline; the initial predicate required a
+space after the version. This reviewer verifies all retained checksums, that
+specific traceback, absence of assembled harnesses and successful exact-ID
+container removal. The sole source correction strips surrounding whitespace
+then requires exact equality with the pinned version, without accepting other
+versions. All seven Python tests pass again. The accepted container-driver
+SHA-256 is `e5e6d77b02667c3a5107bcfeb320d6b824566c6addd0165f235386aa83546b1a`.
+Fresh run02 is authorized under the already reviewed method; failed run01 is
+not repaired or counted as comparison evidence.
+
+The selected programs are the existing load, five-instruction PUSH/MOV sequence,
+aligned DWORD XCHG/result store and three scalar fence-preservation profiles.
+Literal source bytes, initial state, final registers, final RIP and memory are
+compared against independently specified effects and actual retained resident
+results. Load/stack expose all sixteen canonical GPRs; ordering exposes the eight
+actual allocated roots. Additional ordering registers and load memory are labeled
+QEMU-only canaries. The selected instructions preserve defined flags; the Linux
+user comparison mask `0xcd5` covers CF/PF/AF/ZF/SF/OF/DF while recording and
+excluding privilege-dependent control bits. Native ordering NZCV preservation
+is not mislabeled as a canonical RFLAGS comparison.
+
+All sixteen GPRs are saved before scratch use, including a passive noncanonical
+RSP. MOV switches to mapped harness stack before PUSHFQ; no flag-changing
+instruction intervenes. LEA records the actual capture label after flags are
+saved, replacing the initial hardcoded expected-PC output. The ELF mapping and
+exact guest bytes are checked, with emitted capture inspection still required
+after assembly. The package, static QEMU binary, source archive, Debian patches
+and source descriptor are pinned; the executed container image and CPU profile
+are explicit. Time and resource limits, lack of network and immutable container
+identity constrain the run.
+
+Review corrections reserve an ownership name/token before container creation,
+retain its CID file and recover the exact token-owned object after a creation
+error, preventing the prior `cid=None` cleanup omission. Absence matching handles
+actual lowercase Docker diagnostics while unrelated inspection errors fail.
+Offline audit now checks exactly six cases, pinned binaries, retained resident
+bindings, producing payload/ELF identity and exact QEMU invocation, rather than
+accepting a partial case set or checking output alone. Original failures remain
+failed and cleanup failure prevents acceptance.
+
+Primary comparison may use the previously accepted stack report before the
+final-source stack replica is available; its original bundle identity must remain
+visible. The independent fresh comparison must bind the final-source stack
+report alongside final-source load/ordering evidence. Both comparison bundles,
+actual assembly/output checks and owned cleanup must pass before this supporting
+obligation closes. This method supplies no privileged paging, fault retry,
+concurrent atomicity, fence ordering or native publication qualification.
+
+## Final-candidate review — primary progress/containment campaign, October 26, 2026 UTC
+
+`/root/i4v_final_review` independently audited unchanged
+`i4v-progress-dev-20261026-14` against the current Rust/Python implementation and
+the original I4-V requirements. This reviewer authored none of the implementation
+or validators and ran no build, native execution or compiler job. **The complete
+primary development campaign passes its declared scope. Final I4-V acceptance
+remains pending the six independent fresh-source reproduction bundles and the
+plan's bounded pinned-QEMU supporting comparison.** This review does not promote
+exploratory executions into independently reproduced decision evidence.
+
+The durable [review bundle](../../../../natemu-raw/i4v-final-review-20261026-01/README.md)
+retains the original primary audit script, its frozen-import replay, reconstructed
+focused run11/run13 checks, fresh logs and a compact command manifest. All three
+offline commands pass at 17:12 UTC, without modifying the producing runs. The
+review `SHA256SUMS` digest is
+`157d6e806bc4903db4ffca85d8a00aed6830ce18b80e33672afd2076f1785775`.
+The focused repeat includes seven corruption checks; it does not claim to recreate
+the original inline transcript or every earlier corruption test. Its integrity
+log preserves the expected older partial-host source differences in run11/run13
+and the exact 811-path match for run14.
+
+All 57,053 retained checksum entries verify. The 807 captured inputs under
+crates/tools/fixtures/experiments plus the four root build inputs (`.cargo/config.toml`,
+`Cargo.lock`, `Cargo.toml`, `rust-toolchain.toml`) match the workspace: 811 producing
+source paths in total. The runtime SHA-256 remains
+`0e8c0a5bcd03bfdc02f4bb0acbdb8ad6e93bb35c18384b700cac13928ca3b945`.
+Revalidation of its emitted capture/restore/vector/boot/helper gates binds every
+populated partial-helper fault to the actual STRB site `0x8000400aecb4`.
+
+The independently enumerated cell names exactly match 72 healthy seeded cases,
+25 intentional failures and 44 baseline cases; all 25 separate fresh controls
+also replay successfully. Configuration, actor, actual request/source/compiler
+owner, delayed peer, event role and native protocol effects are checked rather
+than inferred from runner counts. The healthy ledgers contain 5,132 decisions:
+1,240 stack, 1,472 controls, 960 coherence, 1,360 atomic and 100 partial. Actual
+maintenance FULL/re-admission occurs 216 times in stack and 206 in controls;
+other families correctly claim none. The partial helper preserves its sampled
+second value and committed first write; the atomic continuation resumes only
+the saved post-exchange store. Their fault sites and native/canonical prefixes
+remain bound to the producing programs and ELF.
+
+All 1,900 manifest compilation associations exactly equal independently verified
+artifact exports and actual packet deliveries, including malformed-reply origins
+and completed failure prefixes. All 1,910 ownership journals have distinct tokens,
+cover the exact retained registry set and acknowledge complete child/container
+cleanup. Standalone compiler records bind their external supervisor receipts;
+ordinary jobs retain their owned process-group and resource identities. All 213
+outer jobs passed, reaped their child and recorded a quiescent group. The 122
+healthy/failure/fresh host identities are distinct. Each failure retains its
+specified actual gate and original cause, successful owner/VM destruction, and
+a subsequent independently started control with a new VM incarnation.
+
+Maximum observed gate-relative failure detection is 2,814 ms and joined stop is
+2,815 ms. Every outer gate PID matches its failed host. Even using the
+conservative upper edge of second-rounded completion timestamps, every whole
+outer job finishes within 4,066 ms of its gate, below the 10-second limit. These
+are observed finite bounds, not a guarantee for arbitrary future workloads.
+
+The candidate contract-to-test matrix preserves the admitted V1/V2/V3 profiles,
+finite ordering/atomic/fence checks, translation/lifetime invariants and explicit
+unsupported paths. Reviewed release/acquire, authority, publication/acknowledgement
+and reclamation arguments remain necessary alongside the finite observations;
+healthy histograms cannot prove universal ordering. Offline exact ledger replay
+satisfies the retained-seed/trace obligation and is distinguished from unimplemented
+native recorded-decision playback. The original 688-case baseline and 87 legacy
+jobs still require the pending final-source reproduction; the primary campaign's
+44 repeated baselines do not substitute for them.
+
+**Substantive completion gap:** [the original plan](../../implementation.md#post-i4-integrated-validation)
+separately requires comparison of defined outcomes with native x86 where
+available **and a pinned QEMU configuration**. Candidate status of the upstream
+QEMU test corpus does not waive this later supporting-comparison requirement.
+Neither reviewer found retained applicable I4-V QEMU outcome evidence or an
+explicit owner waiver. The smallest faithful correction is a bounded comparison
+of selected already-admitted instruction outcomes, retaining exact QEMU revision,
+configuration, input/output and defined-state masks, checked against resident
+results and independent expectations. It need not import a complete upstream
+suite or claim privileged paging, retry, concurrency or native synchronization
+qualification. The contract reviewer has corrected the draft matrix to retain
+this obligation. No additional substantive runtime/oracle defect was found in
+the complete primary artifact audit.
+
+## Development review — partial-helper cancellation setup, October 26, 2026 UTC
+
+`/root/i4v_final_review` independently reviewed the containment-only output-parent
+creation in `concurrent/partial_progress.rs`, the unchanged failed run12 report,
+and focused `i4v-progress-dev-20261026-13`. **The setup integration defect is
+closed at source and focused development execution; complete campaign acceptance
+and independent native reproduction remain pending.** No build, compiler or
+native execution was launched by this reviewer.
+
+Run12 correctly remains failed after 21 completed containment/fresh-control
+cells. Its partial cancellation stopped before the injection gate with the
+original ENOENT cause, witness readiness 0, both native status fields 0, successful
+destruction of both owners and the VM, and no fresh-control execution. The output
+parent was absent. Replaying that unchanged report with the current oracle
+rejects the missing Release-published witness. The fix creates the parent only
+for containment, before VM/owner startup, matching the control fixture's existing
+non-overwrite setup; the per-owner compiler still owns its child directory.
+Healthy partial-helper execution creates no compiler work or output root.
+
+**Evidence validity:** all 2,158 run13 checksums verify and all 47 jobs are terminal
+passed. Of 807 captured code/tool/fixture inputs, the sole workspace difference is
+the two-line module comment clarifying that containment adds compile-only work;
+the executable source is unchanged. The actual failed prefix retains two device
+reads and one committed write per owner, second-subaccess samples 110/142, one
+native fault each, retained references and no release, second write, remap or
+fabricated completion. Its 27-operation trace, saved routes, canonical/native
+state and pending events pass the independent prefix and scheduling replay.
+
+The single actor 0 compiler request binds the fetched compile-only source and
+current VM identity. The live creation-hold marker, ownership token and immutable
+container ID agree with the registered resource that was removed; the worker
+group is acknowledged gone and its leader reaped. No completed compiler export
+is claimed. The observed gate and original cancellation detection occur at 282 ms;
+all owners are joined at 422 ms. Both native-owner destruction calls and VM
+destruction succeed. The outer supervised job completes in 0.721 seconds with its
+gate bound to host PID 25720 and records process reaping and a quiescent group.
+The native command retains its required failure exit 1.
+
+The subsequent healthy partial control runs in PID 25773 with a new VM nonce
+`11897847499402808037`, distinct from failed nonce `14382727715825048732`. Its four
+helper elements, two post-remap probes and ten scheduling decisions pass, with
+no compiler exports or inherited worker state. Revalidating the actual producing
+ELF and binding all populated failed/fresh helper fault PCs confirms the STRB
+site `0x8000400aecb4`. Its runtime SHA-256 is
+`0e8c0a5bcd03bfdc02f4bb0acbdb8ad6e93bb35c18384b700cac13928ca3b945`.
+Six in-memory corruptions of the actual failed report—missing gate, extra read,
+changed sample, fabricated second write, premature release and substituted
+setup-error cause—are rejected; retained artifacts were not modified.
+
+**Decision relevance:** this observation now exercises the intended partial
+helper cancellation and clean subsequent control, rather than counting setup
+failure as the injection. No substantive blocker remains for that correction.
+It supports proceeding with the bounded combined campaign; it does not accept
+all 72 healthy / 25 containment cells, preserved regressions, independent native
+reproduction or full I4-V. Offline evidence replay is not a new native run.
+
+## Development review — actual stack actor rotation, October 26, 2026 UTC
+
+`/root/i4v_final_review` independently reviewed the current changes against
+`168e208`, then rechecked the corrected Rust role bindings, Python oracles and
+unchanged retained run `i4v-progress-dev-20261026-11`. The reviewer authored none
+of the implementation or oracle changes and launched no build, compiler or
+native job. **The stack actor-rotation source and demonstrated native coverage
+gap is closed for this development checkpoint; full I4-V acceptance remains
+pending the complete campaign, regressions and independent reproduction.**
+
+The initial review found that stack scheduling reported a seed-rotated actor
+while execution still fixed compilation/mutation to owner0 and the delayed peer
+to N−1. The correction binds compiler allocation, resident request identity,
+source initialization/mutation/publication and IF-masked event role to the actual
+configured actor. The delayed peer and relative shadow/priority/event roles
+rotate with it. Physical source/code/table backing remains shared at its original
+location; private roots, frames, data spans and event vectors retain actual CPU
+identities. The independent oracle checks these effects and producer deliveries,
+not merely the actor labels. Ordinary unscheduled fixtures retain actor0 and
+delayed N−1 defaults. No substantive source/oracle defect remains in this recheck.
+
+**Evidence validity:** all2,236 retained checksums verify, all807 captured
+code/tool/fixture inputs match the workspace at audit time, and all46 recorded
+jobs are terminal passed. The current independent oracle accepts the unchanged
+N4/seed-ordinal3 native report: compiler request owners are `[3,3,3]`, actual
+source writer and publication owner are3, and the delayed owner is2. All160
+scheduling decisions and21 distinct FULL/re-admitted identities replay against
+the actual protocol trace and queue states. Three actual producer exports and
+all nine delivered chunks bind the resident requests/replies; each owned worker
+and container journal acknowledges completed cleanup. All four native owners
+report success, completion, join and successful destruction, with no cancellation
+or supervisor error; the joined report elapsed time is1,238ms.
+
+The producing runtime SHA-256 is
+`0e8c0a5bcd03bfdc02f4bb0acbdb8ad6e93bb35c18384b700cac13928ca3b945`.
+Eight in-memory corruptions of the actual report—actor/delayed labels, request
+and reply owners, source writer, actor IF state, publication owner and delayed
+fault owner—are all rejected. The retained report and artifacts were not changed.
+This audit replays existing evidence; it is not an independent native rebuild or
+re-execution, nor a claim of universal ordering or all actor/seed combinations.
+
+The separate Docker absence-diagnostic correction also passes source review:
+case-insensitive explicit absence permits cleanup acknowledgement, while daemon,
+permission and timeout errors remain failures. Six independent read-only mocked
+responses verify that distinction; unacknowledged creation, immutable identity
+and ownership-label checks remain intact. Failed run09 stays failed and is not
+relabelled by this correction.
+
+**Decision relevance:** the corrected path now supplies actual rotated stack
+composition for the declared progress campaign, instead of counting labels as
+coverage. Run11 supports continuing the bounded combined validation. The full
+72 healthy /25 containment cells and fresh controls, preserved regressions,
+independent reproduction and final contract-to-test review remain required;
+no result is inferred from the currently running combined campaign.
+
+## Development review — containment prefix admission, October 26, 2026 UTC
+
+At 15:57 UTC, `/root/i4v_contract_review` independently reviewed the
+producer-authored containment oracle, root-authored host/runner integration and
+the actual locked-panic diagnostic `i4v-progress-dev-20261026-08`. No native,
+compiler or build job was launched by the reviewer. **This is development
+evidence and approval of the corrected checker wiring, not containment or
+I4-V acceptance.** The retained diagnostic remains failed because its captured
+public checker deliberately rejected all acceptance; it did not run the fresh
+control VM.
+
+The actual frozen prefix and all 11 compiler exports/deliveries passed the
+independent audit; all 2,415 retained checksums matched. The N1 actor stopped
+with the intended resident panic detail 880, its real code reference and pending
+event retained, no fabricated completion/reclamation, and the ticket lock still
+held at lock 121 / next-ticket 122. Native-owner destruction and VM destruction
+both reported success. Gate observation, cause detection and joined-stop times
+were all 3,155 ms after execution began. The truncated scheduling ledger still
+checks the seeded draws, independently derived eligibility and consumed native
+actions; it does not bypass these checks for failure reports.
+
+Review found and verified two evidence corrections before the next snapshot:
+
+- The containment prefix now applies the healthy family's finite EL, SCTLR,
+  ACTLR and TCR admission plus resident capture/service-PC checks. All six
+  zero-corruptions of those actual08 fields are now rejected. The partial
+  family checks its reported store span without inventing a service-PC field.
+- The runner now binds populated partial-helper fault PCs and `store_pc` to the
+  validated producing ELF in the failed containment report, its separate fresh
+  control and ordinary healthy partial runs. The one- and two-fault controls
+  reject either an incorrect helper address or a changed populated fault site.
+
+Ten containment tests and the runner binding test passed. The corrected public
+checker accepts actual08's frozen prefix, and actual export/cleanup association
+still returns 11 exports. Returning that audited prefix summary is sound only
+with the runner's mandatory artifact/ownership verification and separate-host,
+new-incarnation healthy control; the summary itself is not the complete
+containment decision. The joined-stop timestamp precedes VM destruction, so the
+successful gate-relative outer-supervisor result must also bound the whole host
+process, including final teardown. The external supervisor's revised PID-lease
+implementation requires its own retained evidence. The full 72 healthy / 25
+containment campaign, current-source regressions and independent reproduction
+remain pending; no result is inferred from the currently running campaign.
+
+## Development review — progress exception paths and stack envelope, October 26, 2026 UTC
+
+At 15:22 UTC, `/root/i4v_contract_review` independently inspected the emitted
+runtime from `i4v-progress-dev-20261026-04` without rebuilding or executing a VM.
+The exact ELF SHA-256 is
+`f218c13c95cc232f1d31492f88481513c7b42ec3c6b41dc7441db3f7ddd33de8`.
+**This is a developmental static review, not checkpoint acceptance.** Run04
+remains an immutable failed diagnostic: its native partial-helper execution
+completed, but its captured oracle omitted the expected `pending_events` field.
+Run05 has newer inputs and requires its own emitted-code and evidence checks.
+
+The earlier disassembly audit and an additional scan covering generic symbols
+and all downward SP adjustments agree on the largest conservative direct chain:
+**15,040 bytes of the 16,384-byte stack**, leaving 1,344 bytes. The chain is
+capture (800), `finish` (32), `concurrent::completed` (32), `queued` (1,744),
+`maintenance::finish` (2,528), `maintenance::drive` (8,224), `stack::start` (16),
+and `stack::enter_step` (1,664). Stack-reset gates terminate this accounting;
+tail transfers conservatively retain their caller frame. The existing
+profile-18/19 exception continuation is bounded by its one-shot handled flag,
+and `source_bytes` generation two can recurse into generation one. Accounting
+for those bounded paths does not raise this ceiling. The scan found SP
+assignments only in the known boot/entry/restore gates; indirect calls are the
+formatting callbacks outside these admitted execution paths. This is a finite
+emitted-path envelope, not a general proof for arbitrary future dispatch or
+exception nesting.
+
+The new paths fit comfortably within that existing maximum:
+
+| Path in the producing ELF | Conservative bytes |
+| --- | ---: |
+| Partial-helper initialization, including `runtime_main` | 3,600 |
+| Generic exception capture through partial finish/deferred validation | 2,560 |
+| Atomic ordering finish subtree | 560 |
+| Atomic recovery subtree | 464 |
+| Atomic trial-entry subtree | 384 |
+| Containment deferred-gate subtree | 1,280 |
+| Containment witness subtree | 192 |
+
+Both actual partial owners saved SP `0x800040053450` at both faults: exactly
+2,992 bytes below the normal stack top, consistent with the emitted retained
+helper continuation. The ELF's two RX loads contain 168 and 223,724 bytes,
+within the separate boot-page and 256-KiB resident-text reservations.
+
+The compressed partial-N2 regression fixture exactly matches the immutable
+run04 report, and both recorded report/ELF hashes verify. The corrected
+standalone partial oracle and its five tests pass, including read/sample/route,
+canonical-prefix, and missing/duplicate blocked-event corruptions. Current
+full scheduling-schema validation rejects that historical report because it
+predates the newly required `supervision.host_pid`; no field was synthesized
+to turn it into current-schema evidence.
+
+The reviewer separately **authored** the expanded `--partial` ELF validator:
+all 47 generic exception-capture instructions, all 16 vector entry branches,
+the boot path installing VBAR and both stacks, the exact STRB/RET helper, and
+the existing complete ERET restore. Its 11 tests pass and it accepts the exact
+run04 ELF; every reported helper fault PC binds to that producing instruction.
+Root independently reviews this new validator. Authorship of that extension
+is kept separate from the independent emitted-stack review above; neither
+unit results nor this diagnostic establish completion of the new progress or
+containment campaign.
+
 ## Intermediate I4-V return — translation coherence, October 26, 2026 UTC
 
 `/root/i4v_upstream` authored the coherence ABI/runtime and the preceding Python
@@ -3706,3 +4287,27 @@ runtime-conformance, performance or full-emulator conclusion follows.
 this focused return. Charge6 active reviewer minutes within its8-minute allowance;
 the runtime budget remains proposed and inactive. Synchronize amendment status
 and deliver the corrected contract; no additional review campaign is opened.
+
+### October 26, 2026 — containment watchdog development correction
+
+**Independent reviewer:** `/root/i4v_upstream`; reviewed the root-authored outer
+watchdog and host gate integration. This is a development review, not acceptance
+of the containment matrix or full I4-V.
+
+The prior watchdog could report `passed` after its gate-relative deadline when a
+successful but slow process sampler returned after the child had exited. An inert
+reproduction used a 100 ms deadline, child exit at approximately 150 ms and sampler
+return at 250 ms; the old loop accepted the late exit. The correction checks the
+gate and deadline before `child.poll()` on every iteration, including the final
+iteration after sampling. Independent recheck passes the new late-success
+negative, the sampler-timeout-at-deadline case and the invalid-future-gate case
+(three tests). These checks use inert children and mocked sampling; no VM, build,
+compiler or Docker execution was performed by this reviewer. The separate test
+using real `ps` could not run in this reviewer's sandbox; the author reports all
+four supervisor tests passing with that access.
+
+**Disposition:** the reproduced false-success race is corrected. The host's
+withheld-ack cause text also differed from the independent oracle's exact expected
+text; that integration correction was reported to both authors and is not claimed
+verified here. Complete failure injection, owned-resource cleanup, fresh-control
+VM evidence and the remaining I4-V acceptance requirements remain outstanding.

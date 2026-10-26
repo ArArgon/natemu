@@ -231,6 +231,29 @@ pub(super) unsafe fn admit(source: &[u8]) {
         loop {
             let g = lock().unwrap();
             if coordinator().phase.load(Relaxed) == n::OPEN {
+                let (key, cohort) = if first {
+                    (
+                        natemu_abi::schedule::ADMIT | 0x100 | (*state()).visits,
+                        peers(),
+                    )
+                } else {
+                    (
+                        natemu_abi::schedule::ADMIT | 0x10000 | ((*state()).visits << 8) | id(),
+                        1 << id(),
+                    )
+                };
+                if !crate::schedule::permit(
+                    &g,
+                    key,
+                    cohort,
+                    cohort,
+                    coordinator().phase.load(Relaxed),
+                    (*state()).generation,
+                ) {
+                    drop(g);
+                    core::hint::spin_loop();
+                    continue;
+                }
                 let access = if source[0] == 0x89 {
                     Access::Write
                 } else {
@@ -295,10 +318,35 @@ pub(super) unsafe fn fault() -> (u64, bool) {
         let first = id() != actor()
             && (*owner()).local_cut == 0
             && (*state()).visits == cc::first_memory_visit((*state()).profile).unwrap();
-        {
+        loop {
             let g = lock().unwrap();
             if (*owner()).admitted != 1 || (*owner()).detached != 0 {
                 stop(PANIC, 313);
+            }
+            let delayed = (actor() + coordinator().participants - 1) % coordinator().participants;
+            let early = peers() & !(1 << delayed);
+            let (key, cohort) = if first && coordinator().participants >= 3 && id() != delayed {
+                (
+                    natemu_abi::schedule::DETACH | 0x100 | (*state()).visits,
+                    early,
+                )
+            } else {
+                (
+                    natemu_abi::schedule::DETACH | 0x10000 | ((*state()).visits << 8) | id(),
+                    1 << id(),
+                )
+            };
+            if !crate::schedule::permit(
+                &g,
+                key,
+                cohort,
+                cohort,
+                coordinator().phase.load(Relaxed),
+                (*state()).generation,
+            ) {
+                drop(g);
+                core::hint::spin_loop();
+                continue;
             }
             (*owner()).detached = 1;
             checked(g.detach_fault(id()));
@@ -307,6 +355,7 @@ pub(super) unsafe fn fault() -> (u64, bool) {
                 (*owner()).before_local = snapshot();
                 (*common()).before[id() as usize] = snapshot();
             }
+            break;
         }
         if first {
             loop {
@@ -479,6 +528,25 @@ pub(super) unsafe fn source_cut(expected: &wire::Packet, reply: &wire::Packet) -
         }
         loop {
             let g = lock().unwrap();
+            if (*common()).final_ready == all() && crate::containment::source_cut() {
+                if id() == actor() {
+                    if c.active.load(Relaxed) != 0
+                        || (*common()).semantic_active != 0
+                        || c.queued.load(Relaxed) != 0
+                        || c.servicing.load(Relaxed) != n::NO_CPU
+                        || c.retained.load(Relaxed) != all()
+                    {
+                        stop(PANIC, 319);
+                    }
+                    crate::containment::panic_at_source(&g, *expected);
+                    let packet = crate::containment::controls_request(*expected);
+                    drop(g);
+                    crate::containment::deferred_gate(packet, natemu_abi::containment::SOURCE_GATE);
+                }
+                drop(g);
+                core::hint::spin_loop();
+                continue;
+            }
             if (*common()).final_ready == all()
                 && id() == actor()
                 && (*common()).source_generation == 1
@@ -513,11 +581,28 @@ pub(super) unsafe fn source_cut(expected: &wire::Packet, reply: &wire::Packet) -
             drop(g);
             core::hint::spin_loop();
         }
-        let delayed = (actor() + c.participants - 1) % c.participants;
+        let delayed = crate::containment::delayed((actor() + c.participants - 1) % c.participants);
         loop {
             let g = lock().unwrap();
+            if crate::containment::withhold_ack(&g, *expected) {
+                drop(g);
+                crate::containment::park();
+            }
             let others = all() ^ (1 << id());
-            if id() != delayed || (*common()).source_acknowledgements == others {
+            if (id() != delayed || (*common()).source_acknowledgements == others)
+                && crate::schedule::permit(
+                    &g,
+                    natemu_abi::schedule::SOURCE_ACK,
+                    all(),
+                    crate::schedule::except_last(
+                        all(),
+                        delayed,
+                        (*common()).source_acknowledgements,
+                    ),
+                    c.phase.load(Relaxed),
+                    2,
+                )
+            {
                 (*o).source_generation = 2;
                 invalidate();
                 (*common()).source_acknowledgements |= 1 << id();
@@ -552,7 +637,20 @@ pub(super) unsafe fn source_cut(expected: &wire::Packet, reply: &wire::Packet) -
                     checked(g.trace(117, id()));
                 }
                 let others = all() ^ (1 << id());
-                if id() != delayed || c.retained.load(Relaxed) & others == 0 {
+                if (id() != delayed || c.retained.load(Relaxed) & others == 0)
+                    && crate::schedule::permit(
+                        &g,
+                        natemu_abi::schedule::SOURCE_RELEASE,
+                        all(),
+                        crate::schedule::except_last(
+                            all(),
+                            delayed,
+                            all() ^ c.retained.load(Relaxed),
+                        ),
+                        c.phase.load(Relaxed),
+                        2,
+                    )
+                {
                     c.retained.fetch_and(!(1 << id()), Relaxed);
                     (*o).released_code = 1;
                     checked(g.trace(118, id()));
@@ -634,7 +732,16 @@ pub(super) unsafe fn after_native() {
                 if (*pae_state()).hidden != hidden {
                     stop(PANIC, 318);
                 }
-                if (*common()).pae_acknowledgements[index] & (1 << id()) == 0 {
+                if (*common()).pae_acknowledgements[index] & (1 << id()) == 0
+                    && crate::schedule::permit(
+                        &g,
+                        natemu_abi::schedule::ACK | index as u64,
+                        all(),
+                        all(),
+                        coordinator().phase.load(Relaxed),
+                        index as u64 + 1,
+                    )
+                {
                     (*common()).pae_acknowledgements[index] |= 1 << id();
                     checked(g.trace(112 + index as u64, id()));
                 }

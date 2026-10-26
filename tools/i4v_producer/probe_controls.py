@@ -15,7 +15,7 @@ SOURCES.update(store_eax_ebx=bytes.fromhex('8903'),load_eax_ebx=bytes.fromhex('8
 def probe(root,producer,rips,bitness=32,extra_sources=()):
     root=Path(root).resolve();root.mkdir()
     source=Path(__file__).resolve().parent;snapshot=root/'source';snapshot.mkdir()
-    for name in ('compile.py','export.py','producer.json','probe_controls.py',*extra_sources):
+    for name in ('compile.py','ownership.py','export.py','producer.json','probe_controls.py',*extra_sources):
         shutil.copyfile(source/name,snapshot/name)
     shutil.copyfile(producer,root/'CodeSizeValidation');(root/'CodeSizeValidation').chmod(0o755)
     sys.path.insert(0,str(snapshot))

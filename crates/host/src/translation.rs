@@ -1,14 +1,15 @@
+pub(crate) mod process_owner;
 use super::*;
 use natemu_abi::translation as wire;
+use process_owner::OwnedChild;
 use std::{
     fs::File,
     io::Write,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
 };
 
 pub(super) struct Producer {
-    child: Child,
+    child: OwnedChild,
     directory: PathBuf,
     request: wire::Packet,
     guest_rip: u64,
@@ -32,17 +33,13 @@ impl Producer {
                 .ok_or("non-UTF8 reply path")?,
             128,
         )?;
-        if self.address_profile {
+        let reply = if self.address_profile {
             bind_reply_at(&self.request, &raw, self.guest_rip)
         } else {
             bind_reply(&self.request, &raw)
-        }
-    }
-}
-impl Drop for Producer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        }?;
+        self.child.cleanup()?;
+        Ok(reply)
     }
 }
 
@@ -111,18 +108,7 @@ pub(super) fn start_worker_at(
         file.write_all(&word.to_le_bytes())
             .map_err(|e| e.to_string())?;
     }
-    let child = Command::new("python3")
-        .arg("-B")
-        .arg(worker)
-        .arg("--request-dir")
-        .arg(directory)
-        .arg("--producer")
-        .arg(producer)
-        .stdin(Stdio::null())
-        .stdout(File::create_new(directory.join("worker.stdout")).map_err(|e| e.to_string())?)
-        .stderr(File::create_new(directory.join("worker.stderr")).map_err(|e| e.to_string())?)
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    let child = OwnedChild::spawn(worker, producer, directory)?;
     Ok(Producer {
         child,
         directory: directory.to_path_buf(),
@@ -347,6 +333,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     let tables_before = memory.read::<16384>(natemu_abi::recovery::TABLE_OFFSET);
     let shared = Shared {
+        schedule: 0,
         object: Object::new(LIVE_LOAD),
         initial,
         captured: NativeFrame::ZERO,

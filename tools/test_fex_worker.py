@@ -3,6 +3,9 @@ from pathlib import Path
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
+import hashlib
+import subprocess
 import fex_worker as worker
 
 
@@ -12,6 +15,25 @@ def packet():
 
 
 class WorkerProtocolTests(unittest.TestCase):
+    def test_failed_legacy_compilation_removes_immutable_created_container(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);producer=root/'producer';producer.write_bytes(b'fixture')
+            request=root/'request';request.mkdir()
+            (request/'request.bin').write_bytes(struct.pack('<16Q',*packet()))
+            calls=[];identity='a'*64
+            def run(argv,**kwargs):
+                calls.append(argv)
+                if argv[1]=='create':return subprocess.CompletedProcess(argv,0,identity+'\n','')
+                if argv[1]=='start':raise RuntimeError('injected compilation failure')
+                self.assertEqual(argv,['docker','rm','--force','--volumes',identity])
+                return subprocess.CompletedProcess(argv,0,'','')
+            with patch.dict(worker.os.environ,{},clear=True),patch.object(worker,'PRODUCER_SHA',hashlib.sha256(b'fixture').hexdigest()),patch.object(worker.subprocess,'run',run):
+                with self.assertRaisesRegex(RuntimeError,'injected compilation failure'):
+                    worker.compile_request(request,producer)
+            self.assertEqual(calls[-1][-1],identity)
+            containers=list((request/'.ownership/containers').glob('*.json'))
+            self.assertEqual(json.loads(containers[0].read_text())['state'],'removed')
+
     def test_request_rejects_profile_source_and_padding(self):
         p = packet()
         self.assertEqual(worker.parse_request(struct.pack('<16Q', *p))[1], worker.XOR)

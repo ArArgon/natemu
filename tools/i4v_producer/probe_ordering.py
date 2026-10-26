@@ -27,7 +27,7 @@ SOURCES = {
 def probe(root, producer):
     root = Path(root).resolve(); root.mkdir()
     snapshot = root / 'source'; snapshot.mkdir()
-    for name in ('compile.py', 'export.py', 'producer.json', 'probe_ordering.py'):
+    for name in ('compile.py', 'ownership.py', 'export.py', 'producer.json', 'probe_ordering.py'):
         shutil.copyfile(Path(__file__).with_name(name), snapshot / name)
     shutil.copyfile(producer, root / 'CodeSizeValidation'); (root / 'CodeSizeValidation').chmod(0o755)
     sys.path.insert(0, str(snapshot))

@@ -27,6 +27,10 @@ fn coordinator() -> &'static Coordinator {
     unsafe { &*(COORD_VA as *const Coordinator) }
 }
 
+fn roles() -> natemu_abi::stack_concurrent::Roles {
+    crate::schedule::stack_roles(coordinator().participants)
+}
+
 pub unsafe fn initialize() -> ! {
     unsafe {
         if address_concurrent::enabled() {
@@ -51,10 +55,13 @@ pub unsafe fn initialize() -> ! {
         }
         let mut frame = read_record(&raw const (*s).initial);
         if c.scenario >= 3 {
-            if o.vcpu_id == 0 {
+            if o.vcpu_id as u64 == roles().actor {
                 source::initialize();
             }
-            if c.scenario >= 4 && o.vcpu_id as u64 == c.participants - 1 && o.vcpu_id != 0 {
+            if c.scenario >= 4
+                && o.vcpu_id as u64 == roles().delayed
+                && o.vcpu_id as u64 != roles().actor
+            {
                 while c.translation_wait.load(Ordering::Acquire) == 0 {
                     asm!("yield", options(nomem, nostack));
                 }
@@ -81,26 +88,42 @@ pub unsafe fn initialize() -> ! {
         ptr::write_volatile(&raw mut (*s).capture_pc, frame.x[30]);
         if c.scenario >= 1 {
             recovery::initialize();
-            let guard = coordinator::lock(c);
-            if c.alias_profile != 0 {
-                aliases::fetch();
+            loop {
+                let guard = coordinator::lock(c);
+                let all = (1 << c.participants) - 1;
+                if !crate::schedule::permit(
+                    &guard,
+                    natemu_abi::schedule::ADMIT,
+                    all,
+                    all,
+                    c.phase.load(Ordering::Relaxed),
+                    1,
+                ) {
+                    drop(guard);
+                    core::hint::spin_loop();
+                    continue;
+                }
+                if c.alias_profile != 0 {
+                    aliases::fetch();
+                }
+                if c.scenario >= 4 {
+                    events::initial_boundary(&guard, o.vcpu_id as u64);
+                }
+                let route =
+                    recovery::walk(frame.x[6], Access::Read).unwrap_or_else(|_| stop(PANIC, 94));
+                if c.alias_profile != 0 {
+                    aliases::prepare(o.vcpu_id as u64, route);
+                }
+                ptr::write_volatile(&raw mut (*round()).old_gpa, route.gpa);
+                checked(guard.admit(o.vcpu_id as u64));
+                break;
             }
-            if c.scenario >= 4 {
-                events::initial_boundary(&guard, o.vcpu_id as u64);
-            }
-            let route =
-                recovery::walk(frame.x[6], Access::Read).unwrap_or_else(|_| stop(PANIC, 94));
-            if c.alias_profile != 0 {
-                aliases::prepare(o.vcpu_id as u64, route);
-            }
-            ptr::write_volatile(&raw mut (*round()).old_gpa, route.gpa);
-            checked(guard.admit(o.vcpu_id as u64));
         }
         c.ready.fetch_or(1 << o.vcpu_id, Ordering::AcqRel);
         while c.ready.load(Ordering::Acquire) != (1 << c.participants) - 1 {
             asm!("yield", options(nomem, nostack));
         }
-        if !stack::enabled() && c.scenario >= 1 && o.vcpu_id as u64 == c.participants - 1 {
+        if !stack::enabled() && c.scenario >= 1 && o.vcpu_id as u64 == roles().delayed {
             // Force a drain to wait for a still-admitted peer, rather than
             // relying on host timing to happen to expose the interleaving.
             while c.queued.load(Ordering::Acquire).count_ones() as u64 != c.participants - 1 {
@@ -191,12 +214,31 @@ unsafe fn queued(fault: u64) -> ! {
             ptr::write_volatile(&raw mut (*round()).fault_pc, pc);
             ptr::write_volatile(&raw mut (*round()).fault_spsr, spsr);
             asm!("dsb ish");
-            {
+            loop {
                 let g = coordinator::lock(c);
+                let last = roles().delayed;
+                let cohort = if id == last {
+                    1 << last
+                } else {
+                    ((1 << c.participants) - 1) ^ (1 << last)
+                };
+                if !crate::schedule::permit(
+                    &g,
+                    natemu_abi::schedule::DETACH | u64::from(id == last),
+                    cohort,
+                    cohort,
+                    c.phase.load(Ordering::Relaxed),
+                    1,
+                ) {
+                    drop(g);
+                    core::hint::spin_loop();
+                    continue;
+                }
                 checked(g.detach_fault(id));
                 if c.scenario >= 4 {
                     events::attempt(&g, id, 0);
                 }
+                break;
             }
             loop {
                 let selected = {
@@ -277,7 +319,7 @@ unsafe fn remap_wait(id: u64) -> ! {
                 let g = coordinator::lock(c);
                 if c.phase.load(Ordering::Relaxed) == EXCLUSIVE
                     && c.completed.load(Ordering::Relaxed) == all
-                    && (c.scenario < 3 || id == 0)
+                    && (c.scenario < 3 || id == roles().actor)
                 {
                     aliases::set_leaf((DATA_VA + 4096) | 7);
                     asm!("dsb ish");
@@ -292,8 +334,20 @@ unsafe fn remap_wait(id: u64) -> ! {
                 }
                 if c.phase.load(Ordering::Relaxed) == RELEASING
                     && c.acknowledgements.load(Ordering::Relaxed) & bit == 0
-                    && (id != c.participants - 1
+                    && (id != roles().delayed
                         || c.acknowledgements.load(Ordering::Relaxed) == all ^ bit)
+                    && crate::schedule::permit(
+                        &g,
+                        natemu_abi::schedule::ACK,
+                        all,
+                        crate::schedule::except_last(
+                            all,
+                            roles().delayed,
+                            c.acknowledgements.load(Ordering::Relaxed),
+                        ),
+                        c.phase.load(Ordering::Relaxed),
+                        2,
+                    )
                 {
                     let address = aliases::data_address(id, 1);
                     let route =
@@ -315,7 +369,10 @@ unsafe fn remap_wait(id: u64) -> ! {
                 }
                 c.phase.load(Ordering::Relaxed) == OPEN
             };
-            if c.scenario >= 3 && id == 0 && c.phase.load(Ordering::Acquire) == COMPILING {
+            if c.scenario >= 3
+                && id == roles().actor
+                && c.phase.load(Ordering::Acquire) == COMPILING
+            {
                 source::replacement();
             }
             if open {
@@ -324,18 +381,36 @@ unsafe fn remap_wait(id: u64) -> ! {
             asm!("yield", options(nomem, nostack));
         }
         // Force old retained references to overlap a new ordinary entry.
-        if id == c.participants - 1 && c.participants > 1 {
+        if id == roles().delayed && c.participants > 1 {
             while c.new_entries.load(Ordering::Acquire) == 0 {
                 asm!("yield", options(nomem, nostack));
             }
         }
-        {
+        loop {
             let g = coordinator::lock(c);
             if c.phase.load(Ordering::Relaxed) != OPEN
                 || c.generation.load(Ordering::Relaxed) != 2
                 || c.acknowledgements.load(Ordering::Relaxed) != all
             {
                 stop(PANIC, 100);
+            }
+            let last = roles().delayed;
+            let cohort = if id == last {
+                1 << last
+            } else {
+                all ^ (1 << last)
+            };
+            if !crate::schedule::permit(
+                &g,
+                natemu_abi::schedule::RELEASE | u64::from(id == last),
+                cohort,
+                cohort,
+                c.phase.load(Ordering::Relaxed),
+                2,
+            ) {
+                drop(g);
+                core::hint::spin_loop();
+                continue;
             }
             if c.scenario >= 3 {
                 if source::eligible(1, CODE_VA) || !source::eligible(2, CODE_NEXT) {
@@ -368,6 +443,7 @@ unsafe fn remap_wait(id: u64) -> ! {
             c.new_references.fetch_or(bit, Ordering::Relaxed);
             c.new_entries.fetch_or(bit, Ordering::Release);
             checked(g.trace(11, id));
+            break;
         }
         let s = shared();
         let mut frame = read_record(&raw const (*s).captured);

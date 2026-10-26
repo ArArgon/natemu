@@ -5,7 +5,6 @@ use std::{
     fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
 
 pub(super) fn write_packet(path: &Path, packet: &[u64; 16]) -> Result<()> {
@@ -41,31 +40,16 @@ pub(super) fn start_worker_numbered(
     let directory = output.join(format!("request-{number:03}"));
     fs::create_dir(&directory).map_err(|e| e.to_string())?;
     write_packet(&directory.join("request.bin"), request)?;
-    let stdout = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(directory.join("worker.stdout"))
-        .map_err(|e| e.to_string())?;
-    let stderr = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(directory.join("worker.stderr"))
-        .map_err(|e| e.to_string())?;
-    let status = Command::new("python3")
-        .arg("-B")
-        .arg(worker)
-        .arg("--request-dir")
-        .arg(&directory)
-        .arg("--producer")
-        .arg(producer)
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr)
-        .status()
-        .map_err(|e| e.to_string())?;
+    let mut child = translation::process_owner::OwnedChild::spawn(
+        Path::new(worker),
+        Path::new(producer),
+        &directory,
+    )?;
+    let status = child.wait().map_err(|e| e.to_string())?;
     if !status.success() {
         return Err(format!("I4-V stack worker failed: {}", directory.display()));
     }
+    child.cleanup()?;
     Ok(directory)
 }
 
@@ -202,6 +186,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut object = Object::new(LIVE_LOAD);
     object.code_length = stack::CODE_BYTES as u64;
     let shared = Shared {
+        schedule: 0,
         object,
         initial: frame,
         captured: NativeFrame::ZERO,

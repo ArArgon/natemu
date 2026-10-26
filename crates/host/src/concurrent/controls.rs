@@ -434,7 +434,7 @@ pub fn run(args: &[String]) -> Result<()> {
     if n > host_limit as usize {
         return Err("control count exceeds host vCPU limit".into());
     }
-    let memory = Memory::with_size(n * RAM_SIZE)?;
+    let memory = Memory::with_size(super::progress::backing_size(n))?;
     load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
     let mut vm_nonce = 0u64;
     if unsafe { getentropy((&mut vm_nonce as *mut u64).cast(), 8) } != 0 || vm_nonce == 0 {
@@ -469,6 +469,7 @@ pub fn run(args: &[String]) -> Result<()> {
         object.configured_vcpus = n as u32;
         object.vcpu_id = id as u32;
         let shared = Shared {
+            schedule: 0,
             object,
             initial: frame,
             captured: NativeFrame::ZERO,
@@ -571,8 +572,9 @@ pub fn run(args: &[String]) -> Result<()> {
         None,
         None,
     );
-    let requests = match execution {
-        Ok(requests) => requests,
+    let (requests, containment_error) = match execution {
+        Ok(requests) => (requests, None),
+        Err(error) if containment::configuration().is_some() => (Vec::new(), Some(error)),
         Err(error) => {
             // run_owners has joined every owner; failure snapshots cannot race native writes.
             let concurrent: cc::Shared = record(&memory, cc::SHARED_OFFSET);
@@ -623,6 +625,14 @@ pub fn run(args: &[String]) -> Result<()> {
         memory.read::<{ pae::TABLE_BYTES }>(pae::TABLE_OFFSET),
         memory.read::<{ modes::TABLE_BYTES }>(modes::TABLE_OFFSET)
     );
+    if containment::configuration().is_some() {
+        if let Err(error) = containment::destroy(_machine) {
+            eprintln!("secondary containment destruction failure: {error}");
+        }
+        return Err(
+            containment_error.unwrap_or_else(|| "containment unexpectedly completed".into())
+        );
+    }
     for id in 0..n {
         let s: Shared = record(&memory, id * RAM_SIZE + SHARED_OFFSET);
         if s.current_el != 4
@@ -632,7 +642,7 @@ pub fn run(args: &[String]) -> Result<()> {
         {
             return Err(format!("control owner{id} machine profile mismatch"));
         }
-        if s.status == 0 || s.status == PANIC {
+        if s.status != SUCCESS {
             return Err(format!(
                 "control owner{id} failed status={} detail={}",
                 s.status, s.detail

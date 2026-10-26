@@ -27,7 +27,7 @@ def snapshot_inputs(args):
                  'tools/run_i1.py', 'tools/check_i1.py', 'tools/test_run_i1.py', 'experiments/track01/source/run.py',
                  'experiments/track01/run_check.py')
     if args.i2:
-        names += ('tools/fex_worker.py','tools/test_fex_worker.py')
+        names += ('tools/fex_worker.py','tools/test_fex_worker.py','tools/i4v_producer/ownership.py')
     if args.i2 or args.i4_entry:
         names += ('tools/check_i2.py',)
     if args.i3_paging or args.i4_entry:
@@ -55,7 +55,9 @@ def worker(job_path):
         if job['expected_error'] not in (here / 'command.stderr').read_text():
             raise ValueError('wrong rejection diagnostic')
     if job.get('oracle'):
-        cell=json.loads((here / 'command.stdout').read_text())
+        output = (here / 'command.stdout').read_text()
+        cell = ([json.loads(line) for line in output.splitlines()]
+                if job.get('oracle_json_lines') else json.loads(output))
         checker=module(Path(job['oracle']), 'runtime_oracle')
         if job.get('i4_expected'):
             checker.check(cell, *job['i4_expected'])
