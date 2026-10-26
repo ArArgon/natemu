@@ -63,7 +63,7 @@ do not accumulate unrelated throwaway demonstrations as a substitute for integra
 | I2 — Live producer loop | A runtime miss requests translation of admitted x86 bytes/context; an actual FEX worker generates a new object; the host validates, publishes and resumes it. Change source/context and reject the stale reply. Exercise cancellation and finite request capacity. This is not replay of a fixed export. |
 | I3 — Recovery and paging | Add live helpers, real x86-table-driven shadow misses versus guest faults, allocation-pressure maps with spills/overwritten destinations, partial-effect completion and an admitted FP-status path. Check exact current state and effect counts. Manual maps are permitted for finite bring-up fixtures; they do not satisfy automated exporter coverage. |
 | I4 — Concurrent composition | Exercise two vCPUs, then three/four before broad ISA expansion: queued faults, remap/shootdown, source invalidation, pending events and retained references. Force adverse schedules and stalled peers. The same ownership/progress rules apply to every configured participant. |
-| I4-V — Integrated validation | After I4, deepen memory-model, translation, recovery and lifetime coverage across the integrated producer/runtime. Adapt upstream tests, add independent models and adversarial schedules, and retain reproducible counterexamples. This bounded checkpoint qualifies the tested profile for dependent I5 work; it does not establish whole-emulator correctness. |
+| I4-V — Integrated validation | Start with executable kernel-address, paging-off and mode-transition slices, including N-vCPU interactions; then deepen memory-model, translation, recovery and lifetime coverage across the integrated producer/runtime. Adapt upstream tests, add independent models and adversarial schedules, and retain reproducible counterexamples. This bounded checkpoint qualifies the tested profile for dependent I5 work; it does not establish whole-emulator correctness. |
 | I5 — Boot and small workloads | Select an exact stock kernel and external initramfs with `/init` and small test programs. Add required system semantics, exception delivery/return, startup32, timer/APIC and serial toward uniprocessor then SMP boot. Observe boot milestones and successful userspace outputs; kernel boot alone is not application coverage. |
 | I6 — Broader compatibility and devices | Grow instruction coverage and required block/network/entropy/shutdown paths; retain prior tests. Add workloads and device errors as paths become available. Resolve product-specific compatibility/numerical tradeoffs before accepting them. |
 
@@ -90,6 +90,46 @@ them for boot. Record its selected coverage, work/resource bound and stopping
 condition in INV-03-01 at execution start. Independent I5 preparation may overlap;
 defects block the paths that depend on them. Continue expanding conformance tests
 during I5/I6 rather than waiting for an exhaustive architecture proof.
+
+### Early address-space and execution-mode slices
+
+Make kernel-space addresses, paging-off execution and mode transitions explicit
+early I4-V work. They extend I3's memory/recovery paths and I4's coordination
+paths; their absence from the completed finite profiles is not evidence that
+userspace assumptions are safe for a system emulator. Implement the missing
+paths alongside their tests, before dependent I5 boot execution. Full kernel
+startup, general exception delivery and devices remain I5 work.
+
+Keep guest privilege, address range and paging mode separate. A high address
+does not grant supervisor access; kernel code can use low addresses too. Paging
+off bypasses the guest x86 page-table walk, while the native ARM MMU and guest
+physical ownership checks remain active. Follow the existing
+[mode/permission contract](research/investigations/INV-03-04.md#mode-permission-and-cache-publication-composition)
+and [ABI paging interface](research/specs/arm64-execution-abi.md#paging-interface).
+
+| Slice | Executable behavior and decisive checks | Concurrent extension |
+| --- | --- | --- |
+| V1 — Kernel-space addresses | Execute actual translated code with upper-canonical guest RIP and high-address data/stack operands; guest RIP remains distinct from the native code-cache address. Exercise native upper-address shadow fills, low/high aliases of the same GPA, CPL0/CPL3 permissions, CR0.WP, NX/SMEP and precise fault addresses. Reject noncanonical/private-gap and invalid boundary-spanning accesses with their proper fault/effect behavior. Audit FEX decode, lookup, helper and address formation assumptions for high bits or accidental host-pointer use. | Repeat remap/shootdown and source invalidation through low/high aliases while another CPU retains a fault/continuation or code reference. Delay acknowledgements; check old-route completion, new accesses using the current mapping and no stale code entry or early reuse. |
+| V2 — Paging-off execution | Run an admitted protected-mode 32-bit fragment with guest paging disabled through the live producer/runtime. Apply required segmentation, address-size/wrap and A20 policy, then resolve linear-to-guest-physical identity routing into owned RAM or bounded device/hole service fixtures. Check fetch/read/write, private-backing exclusion, exact effects and fault classification; translation must not read guest page tables, fabricate PTE A/D updates or invent paging faults. A missing native mapping may still need internal repair. | Run paged and paging-off CPUs together, including aliases to shared physical code/data. Interleave a retained access, source write and translation request; preserve per-CPU mode/context identity and reject stale compiler replies. Mapping/code retirement and capacity rules apply to both paths. |
+| V3 — Mode and context transitions | Execute legal bounded guest control sequences through the semantic adapter/runtime: paging off/on, selected legacy32/PAE/IA-32e transitions, CR3 switches and same-value reloads, and relevant permission/privilege changes. Check CR0/CR4/EFER and required segment state together, including instruction/address/stack widths and the next fetch. Validate before committing illegal transitions and preserve their exact exception and permitted prior effects. For legacy PAE, check hidden PDPTE load/reload lifetime separately from shadow eviction/INVLPG. | Transition one CPU while peers retain old-context routes/code or compile old work. Check source/context generations, required shadow invalidation, stale reply/entry rejection and retained-object lifetime. A local CR3/CPL/mode change must not change a peer's architectural state; shared backing/source changes and guest-requested shootdowns still receive their required coordination. |
+
+Bring each slice up at N=1, then run targeted N=2 and combined N=3/4 schedules
+before accepting it. Force pauses before/after transition commit, native
+invalidation acknowledgement, publication and reference release. Combine these
+with queued faults, pending-event eligibility, a delayed peer and saturated
+request storage; preserve the at-most-eight-head ordinary-work fairness rule.
+Check guest-visible state, table bytes, exact fault packets/effect counts and
+progress, including stale native mapping and mode/context-cache reuse attempts.
+A host-only walker or state-machine test supplements actual generated execution;
+it cannot satisfy these slice acceptance checks.
+
+Build V1/V2 first where independent, then V3 and their combined schedules. Record
+the exact supported modes/control sequences, vectors, oracles and per-slice bounds
+in INV-03-01 before execution. Unsupported cases reject explicitly and remain
+visible obligations. The early I4-V coverage matrix must include all three slices;
+a budget stop or an unimplemented slice reports partial coverage, not I4-V
+completion. This does not reopen the scoped I3/I4 acceptance or make full boot a
+validation prerequisite. Independent I5 preparation can continue throughout.
 
 Use many targeted cases and generated variations, with coverage measured by
 distinct contracts and interactions rather than a test-count quota. Keep a fast
@@ -468,9 +508,10 @@ review and a fresh87-job rebuild including all I1–I3 regressions. The
 records exact evidence and unsupported behavior. Keep legacy I1–I3 N=1 profiles
 separate; arbitrary concurrent guest code and the full ABI remain unestablished.
 
-Next is the [I4-V validation pass](#post-i4-integrated-validation): select its
-coverage and execution bound, adapt existing tests and add integrated adversarial
-cases. Independent I5 preparation can proceed. I4-V is planned work; its additional
+Next is the [I4-V validation pass](#post-i4-integrated-validation): begin with
+the kernel-address, paging-off and mode-transition slices and their concurrent
+schedules. Select execution bounds, adapt existing tests and add integrated
+adversarial cases. Independent I5 preparation can proceed. I4-V is planned work; its additional
 test coverage has not yet been collected.
 
 For each increment record implemented behavior, passed/failed/untested checks,

@@ -1,5 +1,32 @@
 # INV-03-01 — source findings review
 
+## Plan review — I4-V address and mode coverage, October 25, 2026
+
+Root authored the implementation-plan and current-next-action changes. Independent
+`/root/i4v_modes_plan_review` reviewed the exact two-file diff against the ABI
+paging interface, INV-03-04's mode/permission contract and the workflow.
+**ACCEPT; no substantive blockers.**
+
+**Evidence validity:** V1/V2/V3 separate guest privilege, address range and paging
+mode; guest paging-off execution retains native mapping and physical ownership
+checks. The plan requires legal control sequences, precise failed-transition
+state and hidden-PAE lifetime checks. Local architectural changes are distinguished
+from shared source/backing invalidation. Actual generated execution and independent
+expectations are required; host-only models cannot establish the promised paths.
+
+**Decision relevance:** the three early slices cover the owner's kernel-address,
+paging-off and mode-transition requirements, including N=2/3/4 retained-access,
+stale-code/reply, acknowledgement, pending-event and fairness tests. Partial-result
+rules keep unfinished slices visible. Missing implementation grows with its tests;
+full boot remains I5 and independent I5 preparation can proceed. The update does
+not reopen finite I3/I4 acceptance or establish new runtime correctness.
+
+Documentation checks: `git diff --check` and new relative-link targets pass.
+No runtime code changed, no upstream tests were imported and no runtime tests were
+executed for this plan update. Execution vectors and per-slice resource bounds
+remain work to declare when starting I4-V, as the plan requires.
+
+
 ## Current return — I4 concurrent composition, October 26, 2026 UTC
 
 Root authored runtime/host integration. Independent `/root/i4_contract_review`
