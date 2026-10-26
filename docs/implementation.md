@@ -417,14 +417,14 @@ working route during I2; do not postpone the producer loop until the ABI is comp
 
 ## Next assignment and reporting
 
-Next is I4: extend the same runtime to configurable per-vCPU state, stacks and
-queues; first exercise two participants, then three/four with delayed peers,
-concurrent faults and mutation/invalidation. Keep I1–I3 as regressions. Begin with
-one bounded shared-map mutation and acknowledgement path, including a retained
-continuation that cannot reenter stale code. Record its work/resource bound and
-stopping condition in INV-03-01 before execution. N=1 is the only currently
-admitted profile; additional participants must be implemented and tested before
-admission. Final generator selection and boot are not prerequisites to I4.
+I4 is active under the bound in INV-03-01. Its finite development profiles now
+exercise per-vCPU state/stacks, queued native faults, one shared remap/shootdown,
+live source invalidation/publication and retained references at N=1/2/3/4.
+Next add durable eligible pending events, sustained fairness/capacity and the
+remaining combined adverse schedules, then independent final review/rebuild.
+Keep I1–I3 as regressions with their separate N=1 admission. The new finite
+profiles do not admit arbitrary concurrent guest code or complete I4. Final
+generator selection and boot are not prerequisites to this work.
 Follow I4 with the [I4-V validation pass](#post-i4-integrated-validation), adapting
 existing tests and adding integrated adversarial cases while independent I5 work
 can proceed. This is planned work; no additional test coverage is claimed yet.

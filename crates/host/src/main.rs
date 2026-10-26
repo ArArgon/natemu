@@ -1,6 +1,12 @@
 use natemu_abi::*;
-use std::{env, ffi::c_void, fs, mem::size_of, ptr};
+#[cfg(test)]
+use std::mem::size_of;
+use std::{env, ffi::c_void, fs, ptr};
 
+mod concurrent;
+#[cfg(test)]
+#[path = "../../runtime/src/coordinator.rs"]
+mod coordinator_tests;
 mod recovery;
 mod translation;
 
@@ -30,6 +36,8 @@ unsafe extern "C" {
     fn hv_vcpu_set_sys_reg(vcpu: u64, reg: u16, value: u64) -> i32;
     fn hv_vcpu_get_sys_reg(vcpu: u64, reg: u16, value: *mut u64) -> i32;
     fn hv_vcpu_run(vcpu: u64) -> i32;
+    fn hv_vcpus_exit(vcpus: *mut u64, count: u32) -> i32;
+    fn hv_vm_get_max_vcpu_count(count: *mut u32) -> i32;
 }
 unsafe extern "C" {
     fn mmap(
@@ -53,20 +61,23 @@ fn hv(code: i32, operation: &str) -> Result<()> {
     }
 }
 
-struct Memory(*mut u8);
+struct Memory(*mut u8, usize);
 impl Memory {
     fn new() -> Result<Self> {
-        let p = unsafe { mmap(ptr::null_mut(), RAM_SIZE, 3, 0x1002, -1, 0) };
+        Self::with_size(RAM_SIZE)
+    }
+    fn with_size(size: usize) -> Result<Self> {
+        let p = unsafe { mmap(ptr::null_mut(), size, 3, 0x1002, -1, 0) };
         if p as isize == -1 {
             return Err(format!("mmap: {}", std::io::Error::last_os_error()));
         }
-        Ok(Self(p.cast()))
+        Ok(Self(p.cast(), size))
     }
     fn copy(&self, offset: usize, bytes: &[u8]) {
         assert!(
             offset
                 .checked_add(bytes.len())
-                .is_some_and(|end| end <= RAM_SIZE)
+                .is_some_and(|end| end <= self.1)
         );
         unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), self.0.add(offset), bytes.len()) };
     }
@@ -74,7 +85,7 @@ impl Memory {
         self.copy(offset, &value.to_le_bytes());
     }
     fn read<const N: usize>(&self, offset: usize) -> [u8; N] {
-        assert!(offset + N <= RAM_SIZE);
+        assert!(offset + N <= self.1);
         let mut result = [0; N];
         unsafe { ptr::copy_nonoverlapping(self.0.add(offset), result.as_mut_ptr(), N) };
         result
@@ -83,7 +94,7 @@ impl Memory {
 impl Drop for Memory {
     fn drop(&mut self) {
         unsafe {
-            munmap(self.0.cast(), RAM_SIZE);
+            munmap(self.0.cast(), self.1);
         }
     }
 }
@@ -337,6 +348,9 @@ fn run() -> Result<()> {
     let a: Vec<_> = env::args().collect();
     if a.len() != 7 {
         return Err("usage: natemu-host RUNTIME.elf FEX.arm64 control|live_load|fault VECTOR none|version|profile|size|target|entry|code|address|vcpu N".into());
+    }
+    if a[2] == "i4" {
+        return concurrent::run(&a);
     }
     if a[2] == "i2"
         || a[2] == "i3"

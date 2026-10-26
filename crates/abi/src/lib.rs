@@ -33,6 +33,7 @@ pub const FEX_OR_BODY: [u8; 44] = {
     body[3] = 0x4e;
     body
 };
+pub mod concurrency;
 pub mod paging;
 pub mod pressure;
 pub mod recovery;

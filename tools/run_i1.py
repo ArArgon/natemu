@@ -39,7 +39,11 @@ def worker(job_path):
             raise ValueError('wrong rejection diagnostic')
     if job.get('oracle'):
         cell=json.loads((here / 'command.stdout').read_text())
-        module(Path(job['oracle']), 'runtime_oracle').check(cell)
+        checker=module(Path(job['oracle']), 'runtime_oracle')
+        if job.get('i4_expected'):
+            checker.check(cell, *job['i4_expected'])
+        else:
+            checker.check(cell)
         if job.get('producer_check'):
             checker=module(Path(job['producer_check']), 'producer_checker')
             checker.verify_compilations(Path(job['argv'][-1]),cell['requests'])
@@ -52,12 +56,19 @@ def main():
     parser.add_argument('--fragment', type=Path, help='reproduced live_load.arm64')
     parser.add_argument('--snapshot', type=Path, help='rebuild an existing retained source snapshot')
     parser.add_argument('--i3-allocated', action='store_true', help='also test automatic allocated maps and admitted FP status')
+    parser.add_argument('--i4-entry', action='store_true', help='also test concurrent entry at N=1/2/3/4 (not full I4)')
+    parser.add_argument('--i4-faults', action='store_true', help='also test detached native fault queues (not full I4)')
+    parser.add_argument('--i4-remap', action='store_true', help='also test concurrent guest remap and local shootdown acknowledgements (not full I4)')
+    parser.add_argument('--i4-compose', action='store_true', help='also test live source invalidation/publication with retained references (not full I4)')
     parser.add_argument('--allocated-producer',type=Path,help='pinned pressure-map CodeSizeValidation')
     parser.add_argument('--i3-paging', action='store_true', help='also test the initial I3 paging subset (not full I3)')
     parser.add_argument('--i2', action='store_true', help='also test the actual FEX producer loop')
     parser.add_argument('--producer', type=Path, help='pinned CodeSizeValidation binary for I2')
     parser.add_argument('--worker', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    args.i4_remap = args.i4_remap or args.i4_compose
+    args.i4_faults = args.i4_faults or args.i4_remap
+    args.i4_entry = args.i4_entry or args.i4_faults
     if args.worker:
         worker(args.worker)
         return 0
@@ -66,7 +77,7 @@ def main():
     if resource.getrlimit(resource.RLIMIT_CPU) != (resource.RLIM_INFINITY, resource.RLIM_INFINITY):
         parser.error('HVF requires unlimited inherited CPU limits; external wall/RSS supervision bounds execution')
     args.i3_paging = args.i3_paging or args.i3_allocated
-    args.i2 = args.i2 or args.i3_paging
+    args.i2 = args.i2 or args.i3_paging or args.i4_compose
     if args.i3_allocated and not args.allocated_producer:
         parser.error("--i3-allocated requires --allocated-producer")
     if args.i2 and not args.producer:
@@ -81,6 +92,15 @@ def main():
                          'build_jobs': 2, 'build_rss_bytes': 8*1024**3, 'run_disk_bytes': 1024**3,
                          'guest_ram_bytes': 1024**2}}
     retention.save(run, record)
+    if args.i4_entry:
+        record['increments'].append('I4-partial')
+        record['configured_vcpus'] = 4
+        record['tested_vcpus'] = [1,2,3,4]
+        record['profile_vcpu_counts'] = {'legacy': [1], 'i4': [1,2,3,4]}
+        record['i4_entry_counts'] = [1,2,3,4]
+        record['i4_increment_checks_passed'] = False
+        record['limits']['guest_ram_bytes'] = 4*1024**2
+        record['limits'].update(i4_scenario_seconds=30,bundle_seconds=1200)
     print(run, flush=True)
     try:
         origin = (args.snapshot or REPO).resolve()
@@ -95,6 +115,8 @@ def main():
             names += ('tools/check_i3_paging.py',)
         if args.i3_allocated:
             names += ('tools/i3_worker.py','tools/i3_producer','tools/check_i3_pressure.py')
+        if args.i4_entry:
+            names += ('tools/check_i4.py',)
         for name in names:
             path = origin / name
             if path.is_symlink() or (path.is_dir() and any(p.is_symlink() for p in path.rglob('*'))):
@@ -154,7 +176,11 @@ def main():
             directory.mkdir()
             data = {'argv': list(map(str, argv)), 'cwd': str(source), 'expected_exit': expected_exit, 'environment': build_env}
             if oracle:
-                data['oracle'] = str(source / ('tools/check_i3_pressure.py' if oracle == 'allocated' else 'tools/check_i3_paging.py' if oracle == 'i3' else 'tools/check_i2.py' if oracle == 'i2' else 'tools/check_i1.py'))
+                data['oracle'] = str(source / ('tools/check_i4.py' if oracle == 'i4' else 'tools/check_i3_pressure.py' if oracle == 'allocated' else 'tools/check_i3_paging.py' if oracle == 'i3' else 'tools/check_i2.py' if oracle == 'i2' else 'tools/check_i1.py'))
+            if oracle == 'i4':
+                data['i4_expected'] = [int(argv[4]), 50 if argv[3]=='compose' else int(argv[6]), 'i4-'+argv[3]]
+                if argv[3]=='compose':
+                    data['producer_check']=str(source/'tools/fex_worker.py')
             if oracle in ('i2','i3'):
                 data['producer_check'] = str(source / 'tools/fex_worker.py')
             if oracle == 'allocated':
@@ -185,6 +211,8 @@ def main():
         if args.i3_paging:
             job('i3-paging-oracle-self-test', [sys.executable, '-B', 'tools/check_i3_paging.py', '--self-test'])
         job('oracle-self-test', [sys.executable, '-B', 'tools/check_i1.py', '--self-test'])
+        if args.i4_entry:
+            job('i4-oracle-self-test', [sys.executable, '-B', 'tools/check_i4.py', '--self-test'])
         job('build-host', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-host'])
         job('build-runtime', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'])
         host = source / 'target/release/natemu-host'
@@ -208,6 +236,28 @@ def main():
         job('unsupported-vcpu-count', [host, runtime, run / 'live_load.arm64', 'control', 0, 'none', 2],
             wall=min(20, max(.01, 300-(time.monotonic()-start))), rss=512*1024**2,
             expected_exit=1, expected_error='I1 admits exactly one vCPU')
+        if args.i4_entry:
+            for count in (1,2,3,4):
+                for delay in (0,50):
+                    job(f'i4-entry-n{count}-delay{delay}',
+                        [host,runtime,'i4','entry',count,run/'live_load.arm64',delay],
+                        wall=30,rss=512*1024**2,oracle='i4')
+            for count in (0,5):
+                job(f'i4-reject-n{count}', [host,runtime,'i4','entry',count,run/'live_load.arm64',0],
+                    wall=30,rss=512*1024**2,expected_exit=1,expected_error='I4 admits 1..=4 vCPUs')
+        if args.i4_faults:
+            for count in (1,2,3,4):
+                job(f'i4-faults-n{count}', [host,runtime,'i4','faults',count,run/'live_load.arm64',50],
+                    wall=30,rss=512*1024**2,oracle='i4')
+        if args.i4_remap:
+            for count in (1,2,3,4):
+                job(f'i4-remap-n{count}', [host,runtime,'i4','remap',count,run/'live_load.arm64',50],
+                    wall=30,rss=512*1024**2,oracle='i4')
+        if args.i4_compose:
+            record['limits']['i4_compiler_scenario_seconds']=120
+            for count in (1,2,3,4):
+                job(f'i4-compose-n{count}', [host,runtime,'i4','compose',count,run/'CodeSizeValidation',run/f'i4-compiler-n{count}'],
+                    wall=120,rss=512*1024**2,oracle='i4')
         if args.i2:
             start_i2 = time.monotonic()
             scenarios = ('live','source_stale','context_stale','cancel','capacity','bad_reply')
@@ -270,6 +320,14 @@ def main():
             extra+=f", {record['i3_paging_subset_passed']} paging scenarios"
         if args.i3_allocated:
             extra+=f", {record['i3_allocated_cells']} allocated/helper/REP scenarios"
+        if args.i4_entry:
+            extra+=", 8 concurrent-entry cells and 2 count rejections"
+        if args.i4_faults:
+            extra+=", 4 queued-fault cells (partial I4)"
+        if args.i4_remap:
+            extra+=", 4 remap/shootdown cells (partial I4)"
+        if args.i4_compose:
+            extra+=", 4 live source-publication cells (partial I4)"
         print(f"PASS: {record['cells_passed']} I1 native cells, unsupported-count rejection{extra}", flush=True)
         return 0
     return 1

@@ -7,13 +7,13 @@ use std::{
     process::{Child, Command, Stdio},
 };
 
-struct Producer {
+pub(super) struct Producer {
     child: Child,
     directory: PathBuf,
     request: wire::Packet,
 }
 impl Producer {
-    fn finish(mut self) -> Result<wire::Packet> {
+    pub(super) fn finish(mut self) -> Result<wire::Packet> {
         if !self.child.wait().map_err(|e| e.to_string())?.success() {
             return Err(format!("FEX worker failed: {}", self.directory.display()));
         }
@@ -49,6 +49,40 @@ fn bind_reply(request: &wire::Packet, raw: &[u8]) -> Result<wire::Packet> {
         return Err("worker reply differs from its original request identity/source".into());
     }
     Ok(packet)
+}
+
+pub(super) fn start_worker(
+    worker: &Path,
+    producer: &Path,
+    directory: &Path,
+    request: wire::Packet,
+) -> Result<Producer> {
+    if request[0] != wire::MISS {
+        return Err("compiler requested without a resident miss".into());
+    }
+    fs::create_dir(directory).map_err(|e| e.to_string())?;
+    let mut file = File::create_new(directory.join("request.bin")).map_err(|e| e.to_string())?;
+    for word in request {
+        file.write_all(&word.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+    }
+    let child = Command::new("python3")
+        .arg("-B")
+        .arg(worker)
+        .arg("--request-dir")
+        .arg(directory)
+        .arg("--producer")
+        .arg(producer)
+        .stdin(Stdio::null())
+        .stdout(File::create_new(directory.join("worker.stdout")).map_err(|e| e.to_string())?)
+        .stderr(File::create_new(directory.join("worker.stderr")).map_err(|e| e.to_string())?)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(Producer {
+        child,
+        directory: directory.to_path_buf(),
+        request,
+    })
 }
 
 struct Session {
@@ -116,37 +150,12 @@ impl Session {
         Ok(())
     }
     fn start_producer(&mut self, request: wire::Packet) -> Result<Producer> {
-        if request[0] != wire::MISS {
-            return Err("compiler requested without a resident miss".into());
-        }
         let directory = self
             .output
             .join(format!("request-{:03}", self.requests.len()));
-        fs::create_dir(&directory).map_err(|e| e.to_string())?;
-        let mut file =
-            File::create_new(directory.join("request.bin")).map_err(|e| e.to_string())?;
-        for word in request {
-            file.write_all(&word.to_le_bytes())
-                .map_err(|e| e.to_string())?;
-        }
-        let child = Command::new("python3")
-            .arg("-B")
-            .arg(&self.worker)
-            .arg("--request-dir")
-            .arg(&directory)
-            .arg("--producer")
-            .arg(&self.producer)
-            .stdin(Stdio::null())
-            .stdout(File::create_new(directory.join("worker.stdout")).map_err(|e| e.to_string())?)
-            .stderr(File::create_new(directory.join("worker.stderr")).map_err(|e| e.to_string())?)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        let worker = start_worker(&self.worker, &self.producer, &directory, request)?;
         self.requests.push(request);
-        Ok(Producer {
-            child,
-            directory,
-            request,
-        })
+        Ok(worker)
     }
     fn deliver_export(&mut self, request: wire::Packet, terminal: u64) -> Result<()> {
         use natemu_abi::pressure::*;

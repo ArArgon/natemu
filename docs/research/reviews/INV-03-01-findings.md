@@ -1,5 +1,31 @@
 # INV-03-01 — source findings review
 
+## Current partial I4 return — October 26, 2026 UTC
+
+Root authored per-vCPU host/runtime integration and coordinator/source paths.
+Independent `/root/i4_contract_review` reviewed contracts/code and authored
+`tools/check_i4.py`, keeping semantic expectations separate from runtime logic.
+**ACCEPT the finite entry/fault/remap/source development scope; I4 incomplete.**
+Review fixed failed-owner startup handling, omitted object admission guards,
+an initial shared-code publication/read race, and a negative reuse assertion that
+did not originally exercise the real overwrite guard. Per-owner setup precedes
+native entry; owner IDs remain alive through cancellation. External process
+supervision is the final bound for panic-abort or failed hypervisor cancellation.
+
+The reviewer independently rechecked `i4-compose-dev-20261026-01`: N=1/2/3/4
+requested profiles, semantic/fault/coherence/lifetime checks,12 actual compiler
+invocations with complete request/input/native-code/reply associations, all1174
+checksums,54 passed jobs and matching reviewed runtime/host/ABI sources. No
+remaining containers were recorded. The independent checker has65 corruption
+controls. This is evidence inspection, not an independent rebuild.
+
+Root's subsequent `i4-compose-regression-20261026-01` passes all79 jobs, including
+the full I1–I3 matrix and current I4 profiles. No source/publication behavior is
+inferred from a host-only model: these paths execute in the resident runtime with
+real FEX code and actual native faults. Pending eligible events, sustained queue
+fairness/capacity, remaining combined schedules and final independent review and
+reproduction remain required before accepting full I4. I4-V stays separate.
+
 ## Plan review — post-I4 integrated validation, October 25, 2026
 
 Independent `/root/post_i4_plan_review` reviewed root's I4-V plan addition and
