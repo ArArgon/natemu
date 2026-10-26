@@ -40,7 +40,8 @@ impl Tables for OwnedTables {
 }
 unsafe fn mapping(page: u64, entry: u64) {
     unsafe {
-        let pte = (PRIVATE + 0x16000 + (page >> 12) * 8) as *mut u64;
+        let slot = natemu_abi::shadow::leaf_offset(page).unwrap_or_else(|| stop(REJECTED, 46));
+        let pte = (PRIVATE + slot as u64) as *mut u64;
         ptr::write_volatile(pte, 0);
         asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
         ptr::write_volatile(pte, entry);

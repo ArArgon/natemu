@@ -1,0 +1,115 @@
+# I4-V bounded FEX producer
+
+This adapter compiles retained guest bytes with their actual guest RIP, including
+upper-canonical x86 addresses. The input buffer stays at host address `0x10000`;
+the native object has a separate address. It never executes guest code in FEX.
+`producer.json` pins the upstream commit, source/dependency archives, adapter
+inputs, Linux image and final executable. Build from a fresh populated source
+tree with `build.sh SOURCE BUILD`; the script reuses the existing raw exporter
+in `../i3_producer/fex_export.py` and applies `adapt.py`.
+
+The retained final build is
+`/Users/liaozping/orca/natemu-raw/i4v-producer-20261026-02`.
+The preceding `i4v-producer-20261026-01` retains a failed initial compile
+(incorrect return type in the new decoder guard), its corrected build, an
+overstrict probe-log check, and successful exploratory outputs. The final fresh
+build additionally removes pointer arithmetic on logical guest addresses and
+guards resolver failures in diagnostic/SMC paths. Both builds stayed within two
+jobs, 8 GiB memory and a 30-minute per-build deadline; together their retained
+trees occupy about 1.9 GiB. Container inspection and cleanup records are retained
+in the final build directory.
+
+## Runtime admission
+
+Run one fresh request directory:
+
+```sh
+python3 tools/i4v_producer/compile.py \
+  --directory "$NATEMU_RAW_ROOT/new-v1-request" \
+  --producer "$NATEMU_RAW_ROOT/i4v-producer-20261026-02/build/Bin/CodeSizeValidation" \
+  --case fex_memory_data64 --rip 0xffff800000102000
+```
+
+The other admitted case is `fex_push_immediates64`. `--source HEX` and
+`--instructions N` can be supplied with a case and must match it. Case admission
+requires the exact expected host instruction count. The worker retains source,
+packed input, commands, container outcome, full object/relocations, compiler log,
+and emits `body.bin` plus `export.json`. It uses a fresh FEX context in one
+bounded, network-disabled container per request. `export.verify(directory,
+expected={...})` reparses those artifacts and compares the actual output and
+requested case/RIP; `compile.compile_source(...)` and
+`export.export_program(directory, case)` are the corresponding Python APIs.
+
+`export.json` carries source/RIP/mode identity, hashes, raw object metadata,
+extraction boundaries, FEX guest/native PC associations, static entry GPR
+bindings, and memory sites. Site native offsets are relative to `body.bin`;
+FEX's retained PC offsets are relative to the full native object. Sites include
+guest instruction offset, width/direction, address register and displacement,
+native continuation, and current guest RSP register. They are a finite profile
+contract checked against every emitted instruction, not a general allocator
+recovery-map format.
+
+The load body is `ldar x4,[x6]; nop`: RBX is x6 and RAX is x4. The stack body
+uses preindexed stores through x8 (guest RSP), then loads through x20. On a
+synchronous store fault, recovery expects x8 to retain the pre-instruction RSP;
+the runtime must test that assertion. Completed pushes advance x8 by -8, -10,
+then -12 relative to entry. The supplied cases preserve flags. Native x20 is
+scratch; canonical guest banks, vectors and flag registers retain their entry
+authority. Only ordinary RAM accesses contained in one page are admitted;
+cross-page partial effects and device writes need separate handling.
+
+## Source-window and mode limits
+
+Upstream CodeSizeValidation compiles from a fixed host buffer, uses a permissive
+executable range, and treats instruction-count mismatches as test failures. The
+adapter provides an immutable bounded source window, resolves decoder and
+diagnostic/SMC code reads, and calls CompileRIPCount with the actual guest RIP.
+It exports the JIT entry and guest/native PC table. Partial instruction decoding
+is rejected. Excluded FEX header/tail instructions access its own frame and
+dispatcher; they are retained for provenance but are not installed in the
+resident runtime.
+
+The existing input header already supports 32-bit protected-mode compilation.
+FEX asserts a fixed mode within each context, so each request uses a fresh
+context. This does not implement runtime mode switching. The generic compile
+probe accepts `--bitness 32 --source HEX --instructions N --expected-host N`,
+but runtime body admission currently covers only the two 64-bit cases.
+
+Final-build controls retain high/low load compilations, high/low RIP-relative
+LEA (the emitted value is the requested RIP + 7), a 32-bit moffs-load case, and
+a truncated-prefix negative control. These prove compilation/address handling,
+not execution, memory ordering, boot support or complete recovery semantics.
+FEX's count test is not a semantic correctness oracle.
+
+## Checks
+
+```sh
+python3 -B -m unittest discover -s tools/i4v_producer -p 'test_*.py' -v
+```
+
+The checked-in testdata is actual final-producer output with hashes and retained
+origin in `testdata/provenance.json`. Negative checks alter the native opcode,
+guest/native PC association, actual guest RIP, packed source, delivered body,
+compiler lifecycle and requested identity. Runtime execution and independent
+architectural expectations are owned by the I4-V runner and `fixtures/i4v/`.
+
+## First native validation slice
+
+From the repository root:
+
+```sh
+./tools/with-env python3 -B tools/run_i4v.py \
+  --name NEW-RETAINED-RUN \
+  --producer /Users/liaozping/orca/natemu-raw/i4v-producer-20261026-02/build/Bin/CodeSizeValidation
+```
+
+This rebuilds and signs the runtime, tests low/high guest RIP and operands,
+and checks precise missing-page, permission, NX/SMEP and private-address faults.
+The live cells compile only after a resident request, then publish the verified
+reply through the resident runtime. Sixteen malformed-reply controls check that
+every request identity/body field is enforced before publication. Exact requests,
+compiler artifacts, native reports and independent checks are retained together.
+Run independent rebuilds serially with other builds to preserve the two-job bound.
+
+The first load slice has native N=1 evidence; stack exports and legacy32 sources
+remain preparation for subsequent slices. It does not complete V1 or I4-V.

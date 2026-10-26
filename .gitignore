@@ -9,6 +9,8 @@ build/
 *.cpio
 *.ckpt
 *.log
+# Retained compiler fixture output is input to the producer admission tests.
+!/tools/i4v_producer/testdata/*/producer.log
 
 # Tool scratch
 .playwright-mcp/

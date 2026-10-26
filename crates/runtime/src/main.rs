@@ -14,6 +14,7 @@ mod partial;
 mod pressure;
 mod recovery;
 mod translation;
+mod validation;
 
 global_asm!(include_str!("gates.S"),
     frame_size=const size_of::<NativeFrame>(),
@@ -27,6 +28,7 @@ global_asm!(include_str!("gates.S"),
     stack_top=const STACK_TOP,
     exception_stack_top=const EXCEPTION_STACK_TOP,
     identity_entry=const PRIVATE+0x11008,
+    upper_root_pages=const (shadow::UPPER_ROOT-shadow::LOWER_ROOT)/4096,
 );
 
 unsafe extern "C" {
@@ -88,6 +90,9 @@ unsafe extern "C" fn runtime_main() -> ! {
         if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::concurrency::MODE {
             concurrent::initialize();
         }
+        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::validation::MODE {
+            validation::initialize();
+        }
         if ptr::read_volatile(&raw const (*s).mode) >= natemu_abi::translation::MODE {
             translation::initialize();
         }
@@ -129,6 +134,9 @@ unsafe extern "C" fn finish(frame: *const NativeFrame, fault: u64) -> ! {
             ptr::write_volatile(&raw mut (*s).far, far);
             ptr::write_volatile(&raw mut (*s).elr, elr);
             ptr::write_volatile(&raw mut (*s).spsr, spsr);
+            if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::validation::MODE {
+                validation::finish(fault);
+            }
             if ptr::read_volatile(&raw const (*s).mode) >= natemu_abi::recovery::MODE {
                 if partial::owns(elr) {
                     partial::fault();
@@ -136,6 +144,9 @@ unsafe extern "C" fn finish(frame: *const NativeFrame, fault: u64) -> ! {
                 recovery::fault();
             }
             stop(NATIVE_FAULT, 0);
+        }
+        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::validation::MODE {
+            validation::finish(fault);
         }
         if ptr::read_volatile(&raw const (*s).mode) >= natemu_abi::translation::MODE {
             if ptr::read_volatile(&raw const (*s).mode) >= natemu_abi::recovery::MODE {

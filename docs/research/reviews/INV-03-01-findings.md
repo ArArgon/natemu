@@ -1,5 +1,52 @@
 # INV-03-01 — source findings review
 
+## Intermediate I4-V return — first live address slice, October 26, 2026 UTC
+
+Root authored the ABI/runtime and retained runner; `/root/i4v_producer` authored
+the bounded FEX adapter and host worker, and `/root/i4v_upstream` independently
+authored the semantic expectations and checker. `/root/i4v_contract_review`
+reviewed these changes without authoring execution code, then performed a fresh
+retained host/runtime rebuild and execution.
+**ACCEPT this finite N=1 load checkpoint; V1 and I4-V remain incomplete.**
+
+Independent `i4v-live-independent-20261026-01` passes 55 jobs and 44 native cells:
+14 eager, 14 live-mode and 16 deliberately corrupted reply deliveries.
+The reviewer rechecked every report, all 26 actual compilations, 38 cell-to-compile
+associations, all 1,350 retained checksums and 84 exact source inputs. The pinned
+producer binary and adapter-input hashes match. This replica rebuilds host/runtime
+and performs fresh FEX compilations with the retained producer; it does not
+independently rebuild FEX. No I4-V compiler containers remain running.
+
+The tested load executes with actual low/high guest RIP and upper-address data,
+using a distinct TTBR1 root and owned guest-physical backing. Checks cover a real
+high native fault/install/retry, low alias access, source NX/SMEP faults, data
+nonpresence/user denial, and private-gap #GP before native entry. Full seeded
+guest/native state, table A effects, fault packets and unchanged memory are
+checked. The live path starts with blank native code, binds the resident request
+to actual source/RIP compilation and publishes only after an exact reply. All
+16 word-corruption controls reach resident rejection without publication or
+guest execution. Context/source generations are immutable in this checkpoint;
+these controls do not establish concurrent stale-work exclusion.
+
+Review corrected logical guest-pointer arithmetic and unchecked resolver failure
+in the producer adaptation, missing tracking of required compiler fixture logs,
+and required explicit live-mode association at the runner boundary. No substantive
+correctness or reproduction blocker remains for this checkpoint. Primary eager
+evidence was also independently rechecked: 14 cells, 24 jobs and 763 checksums.
+
+Resource qualification: the independent and legacy-regression builds briefly
+overlapped around 02:37:20–21 UTC. Each build used two-job configuration and its
+declared supervision, but an aggregate two-job ceiling is not established for
+that interval. Serialize later build jobs when applying that aggregate bound.
+These runs make no performance claim.
+
+Remaining V1 work includes actual stack operations, writes/CR0.WP, boundary and
+additional permission cases, and N=2/3/4 remap/source/retained-event/fairness
+composition. V2 paging-off execution, V3 mode transitions and the broader ordering,
+coherence, recovery and progress campaign remain required. This checkpoint does
+not establish full kernel execution, general guest programs or whole-emulator
+correctness.
+
 ## Plan review — I4-V address and mode coverage, October 25, 2026
 
 Root authored the implementation-plan and current-next-action changes. Independent

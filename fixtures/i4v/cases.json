@@ -1,0 +1,312 @@
+{
+  "schema": "natemu.i4v.upstream-cases.v1",
+  "upstream": {
+    "name": "FEX",
+    "repository": "https://github.com/FEX-Emu/FEX",
+    "revision": "48d71752e2a363d5535181f803b0b0e9666c1825",
+    "license": "MIT",
+    "license_path": "upstream/FEX/LICENSE",
+    "license_sha256": "f34a779f56b36d22b20e1b990d23e583a6a7ca071331925fa46156441c77a1ee"
+  },
+  "oracle": "Original expected registers plus a separately authored case-specific ISA model. Generated FEX output is the system under test, not an independent oracle.",
+  "execution_status": "Fixture definitions only; execution evidence belongs to the I4-V runner report.",
+  "cases": [
+    {
+      "id": "fex_memory_data64",
+      "bitness": 64,
+      "source_path": "fex_memory_data64.s",
+      "x86_hex": "488b03",
+      "x86_sha256": "661bfb535f274b2f64fff6d66f60a35572940497328ef6390963839a7c8217fe",
+      "instruction_offsets": [
+        0
+      ],
+      "instruction_count": 1,
+      "upstream_path": "unittests/ASM/MemoryData.asm",
+      "upstream_url": "https://github.com/FEX-Emu/FEX/blob/48d71752e2a363d5535181f803b0b0e9666c1825/unittests/ASM/MemoryData.asm",
+      "upstream_copy": "upstream/FEX/unittests/ASM/MemoryData.asm",
+      "upstream_sha256": "66bdad4663d1134b4fd2b64f49ca8e213695eb4c027a214215c5f5b2b7c038ad",
+      "original_expected_registers": {
+        "RAX": "0xddccbbaa"
+      },
+      "adaptation": "Replace fixed absolute address with initialized RBX so the same load runs at low and high guest addresses. Explicitly initialize all eight bytes to aa bb cc dd 00 00 00 00; remove HLT. This preserves the upstream qword load result, but does not test its absolute encoding or config loader.",
+      "seed": {
+        "registers": {
+          "RBX": "data_address"
+        },
+        "memory": [
+          {
+            "address": "data_address",
+            "hex": "aabbccdd00000000"
+          }
+        ]
+      },
+      "expected": {
+        "registers": {
+          "RAX": "0xddccbbaa"
+        },
+        "memory": "unchanged"
+      },
+      "memory_instructions": [
+        {
+          "offset": 0,
+          "access": "read",
+          "size": 8,
+          "address": "RBX"
+        }
+      ],
+      "flags": "unchanged",
+      "register_comparison_bits": 64,
+      "requirements": [
+        "64-bit execution; canonical data/stack and instruction addresses",
+        "Ordinary mapped memory for complete execution; inject missing/permission routes separately"
+      ]
+    },
+    {
+      "id": "fex_push_immediates64",
+      "bitness": 64,
+      "source_path": "fex_push_immediates64.s",
+      "x86_hex": "68bbbcbdbe6668525166686261488b42f88b5af4",
+      "x86_sha256": "2be7b23c84f4de3f0b1a2c22d7a666af7ccdb6d802f7521e6fd85e1eb412a9c1",
+      "instruction_offsets": [
+        0,
+        5,
+        9,
+        13,
+        17
+      ],
+      "instruction_count": 5,
+      "upstream_path": "unittests/ASM/Primary/Primary_68.asm",
+      "upstream_url": "https://github.com/FEX-Emu/FEX/blob/48d71752e2a363d5535181f803b0b0e9666c1825/unittests/ASM/Primary/Primary_68.asm",
+      "upstream_copy": "upstream/FEX/unittests/ASM/Primary/Primary_68.asm",
+      "upstream_sha256": "8c00088f7bac3c05a890bd00487861745def17743a240bf41f523dd4f74328d8",
+      "original_expected_registers": {
+        "RAX": "0xffffffffbebdbcbb",
+        "RBX": "0x51526162",
+        "RSP": "0xe0000014"
+      },
+      "adaptation": "Replace fixed RSP/RDX initialization with seeded RSP=RDX=stack_top; remove HLT. Preserve the five stack/memory operations, sign extension, operand widths, and byte order; generalize RSP from 0xe0000014 to stack_top-12.",
+      "seed": {
+        "registers": {
+          "RSP": "stack_top",
+          "RDX": "stack_top"
+        },
+        "memory": [
+          {
+            "address": "stack_top - 16",
+            "hex": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+          }
+        ]
+      },
+      "expected": {
+        "registers": {
+          "RAX": "0xffffffffbebdbcbb",
+          "RBX": "0x51526162",
+          "RSP": "stack_top - 12"
+        },
+        "memory": [
+          {
+            "address": "stack_top - 12",
+            "hex": "62615251bbbcbdbeffffffff"
+          }
+        ]
+      },
+      "memory_instructions": [
+        {
+          "offset": 0,
+          "access": "write",
+          "size": 8,
+          "address": "stack_top - 8"
+        },
+        {
+          "offset": 5,
+          "access": "write",
+          "size": 2,
+          "address": "stack_top - 10"
+        },
+        {
+          "offset": 9,
+          "access": "write",
+          "size": 2,
+          "address": "stack_top - 12"
+        },
+        {
+          "offset": 13,
+          "access": "read",
+          "size": 8,
+          "address": "stack_top - 8"
+        },
+        {
+          "offset": 17,
+          "access": "read",
+          "size": 4,
+          "address": "stack_top - 12"
+        }
+      ],
+      "flags": "unchanged",
+      "register_comparison_bits": 64,
+      "requirements": [
+        "64-bit execution; canonical data/stack and instruction addresses",
+        "Ordinary mapped memory for complete execution; inject missing/permission routes separately"
+      ]
+    },
+    {
+      "id": "fex_moffs_load32",
+      "bitness": 32,
+      "source_path": "fex_moffs_load32.s",
+      "x86_hex": "ba00001000b8420000008902b8ffffffffa10000100089c2b8ffffffff66a10000100089c1",
+      "x86_sha256": "9da7648fc836399bef8362606c4ff10268afa2c193b0184ff3500c3820e2e722",
+      "instruction_offsets": [
+        0,
+        5,
+        10,
+        12,
+        17,
+        22,
+        24,
+        29,
+        35
+      ],
+      "instruction_count": 9,
+      "upstream_path": "unittests/32Bit_ASM/Primary/Primary_A0.asm",
+      "upstream_url": "https://github.com/FEX-Emu/FEX/blob/48d71752e2a363d5535181f803b0b0e9666c1825/unittests/32Bit_ASM/Primary/Primary_A0.asm",
+      "upstream_copy": "upstream/FEX/unittests/32Bit_ASM/Primary/Primary_A0.asm",
+      "upstream_sha256": "7594abbc5750df4a7697f19d6edd80663307e2aefe7f531d8f43a2ff5bdf7faa",
+      "original_expected_registers": {
+        "RCX": "0xffff0042",
+        "RDX": "0x42"
+      },
+      "adaptation": "Relocate every absolute 0xe0000000 operand to owned physical 0x100000 and remove HLT. Preserve all active upstream instructions, including explicit moffs encodings and 16-bit destination merge. The commented-out 16-bit addressing case remains out of scope.",
+      "seed": {
+        "registers": {},
+        "memory": [
+          {
+            "address": "0x100000",
+            "hex": "a5a5a5a5a5a5a5a5"
+          }
+        ]
+      },
+      "expected": {
+        "registers": {
+          "RAX": "0xffff0042",
+          "RCX": "0xffff0042",
+          "RDX": "0x42"
+        },
+        "memory": [
+          {
+            "address": "0x100000",
+            "hex": "42000000"
+          }
+        ]
+      },
+      "memory_instructions": [
+        {
+          "offset": 10,
+          "access": "write",
+          "size": 4,
+          "address": "0x100000"
+        },
+        {
+          "offset": 17,
+          "access": "read",
+          "size": 4,
+          "address": "0x100000"
+        },
+        {
+          "offset": 29,
+          "access": "read",
+          "size": 2,
+          "address": "0x100000"
+        }
+      ],
+      "flags": "unchanged",
+      "register_comparison_bits": 32,
+      "requirements": [
+        "Protected mode with 32-bit default operand/address size; flat DS base zero",
+        "For V2, guest CR0.PG=0 and A20 enabled; 0x100000 is owned RAM",
+        "Compare low 32 bits of GPRs; upper halves are outside this legacy-mode fixture claim"
+      ]
+    },
+    {
+      "id": "fex_moffs_store32",
+      "bitness": 32,
+      "source_path": "fex_moffs_store32.s",
+      "x86_hex": "b842000000a300001000ba000010008b12b84300ffff66a300001000b9000010008b09",
+      "x86_sha256": "3b96cda46621055cb3080023f1e0adb97a1a235e86414d995364b44828ee5b53",
+      "instruction_offsets": [
+        0,
+        5,
+        10,
+        15,
+        17,
+        22,
+        28,
+        33
+      ],
+      "instruction_count": 8,
+      "upstream_path": "unittests/32Bit_ASM/Primary/Primary_A2.asm",
+      "upstream_url": "https://github.com/FEX-Emu/FEX/blob/48d71752e2a363d5535181f803b0b0e9666c1825/unittests/32Bit_ASM/Primary/Primary_A2.asm",
+      "upstream_copy": "upstream/FEX/unittests/32Bit_ASM/Primary/Primary_A2.asm",
+      "upstream_sha256": "dbfa716022cc4ca4cc066fd9769356eaccd39b3e9e25955f628ec6f1541e5357",
+      "original_expected_registers": {
+        "RCX": "0x43",
+        "RDX": "0x42"
+      },
+      "adaptation": "Relocate every absolute 0xe0000000 operand to owned physical 0x100000 and remove HLT. Preserve all active upstream instructions, explicit moffs encodings and 16-bit partial store. The commented-out 16-bit addressing case remains out of scope.",
+      "seed": {
+        "registers": {},
+        "memory": [
+          {
+            "address": "0x100000",
+            "hex": "a5a5a5a5a5a5a5a5"
+          }
+        ]
+      },
+      "expected": {
+        "registers": {
+          "RAX": "0xffff0043",
+          "RCX": "0x43",
+          "RDX": "0x42"
+        },
+        "memory": [
+          {
+            "address": "0x100000",
+            "hex": "43000000"
+          }
+        ]
+      },
+      "memory_instructions": [
+        {
+          "offset": 5,
+          "access": "write",
+          "size": 4,
+          "address": "0x100000"
+        },
+        {
+          "offset": 15,
+          "access": "read",
+          "size": 4,
+          "address": "0x100000"
+        },
+        {
+          "offset": 22,
+          "access": "write",
+          "size": 2,
+          "address": "0x100000"
+        },
+        {
+          "offset": 33,
+          "access": "read",
+          "size": 4,
+          "address": "0x100000"
+        }
+      ],
+      "flags": "unchanged",
+      "register_comparison_bits": 32,
+      "requirements": [
+        "Protected mode with 32-bit default operand/address size; flat DS base zero",
+        "For V2, guest CR0.PG=0 and A20 enabled; 0x100000 is owned RAM",
+        "Compare low 32 bits of GPRs; upper halves are outside this legacy-mode fixture claim"
+      ]
+    }
+  ]
+}

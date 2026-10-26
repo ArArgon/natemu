@@ -4,6 +4,9 @@
 _start:
     msr daifset, #15
     msr ttbr0_el1, x0
+    // Separate upper root; legacy profiles keep TTBR1 disabled in TCR.
+    add x9, x0, #{upper_root_pages}, lsl #12
+    msr ttbr1_el1, x9
     msr tcr_el1, x1
     msr mair_el1, x2
     isb

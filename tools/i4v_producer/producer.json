@@ -1,0 +1,28 @@
+{
+  "schema": "natemu-i4v-producer-v1",
+  "upstream_commit": "48d71752e2a363d5535181f803b0b0e9666c1825",
+  "image": "sha256:27475cb39ecb4500d02b7c6e73c9d598e8d9f0736f0dc217d2d985e5cbe01aac",
+  "binary_sha256": "b614bac26ef89bb8b3d2812a2708a5541314e77e06b6c6771d135ab0424cdc33",
+  "retained_build": "/Users/liaozping/orca/natemu-raw/i4v-producer-20261026-02",
+  "source_inputs": {
+    "source/upstream.tar.gz": "97df6a9ccd3b870b7616a294afc8e637aeab8cb1d85bb70fb4ca0538942b6079",
+    "source/dependency-overlay.tar": "17434ad9b7e62abaea61613ce35fda968e12b55c8d7314e9fba7a8c47d6cc701",
+    "source/i4v_producer/build.sh": "e2857e06b8b334b0a6269a3acd3e7dd69da78cf8609a474a408d01cd9a7f6900",
+    "source/i4v_producer/adapt.py": "61f45657e7eb6d3fae37ddb37700d69cea3915f26dcd91bc1ae2f09a1dc9fed1",
+    "source/i3_producer/fex_export.py": "01920904ccaf93623b21a00d0590f0ff4817b39862f04188c90a85c19209e3d2"
+  },
+  "prior_build": "/Users/liaozping/orca/natemu-raw/i4v-producer-20261026-01",
+  "limits": {
+    "build_jobs": 2,
+    "memory_gib": 8,
+    "build_seconds": 1800,
+    "new_raw_limit_gib": 8
+  },
+  "limitations": [
+    "compile-only; no guest execution in FEX",
+    "fresh FEX context per request; no in-context mode transition",
+    "64-bit exported runtime admission limited to two exact emitted bodies",
+    "32-bit compilation probe is not runtime validation",
+    "ordinary RAM same-page memory accesses only; no cross-page partial-effect claims"
+  ]
+}

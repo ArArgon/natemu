@@ -7,6 +7,7 @@ mod concurrent;
 #[cfg(test)]
 #[path = "../../runtime/src/coordinator.rs"]
 mod coordinator_tests;
+mod i4v;
 mod recovery;
 mod translation;
 
@@ -166,13 +167,19 @@ impl Vm {
         unsafe { ptr::read_volatile(self.memory.0.add(SHARED_OFFSET).cast::<Shared>()) }
     }
     fn run(&self, expected: u64) -> Result<()> {
+        let event = self.run_any()?;
+        if event != expected {
+            return Err(format!(
+                "unexpected HVC immediate {event:#x}, expected {expected:#x}"
+            ));
+        }
+        Ok(())
+    }
+    fn run_any(&self) -> Result<u64> {
         unsafe {
             hv(hv_vcpu_run(self.cpu.unwrap()), "hv_vcpu_run")?;
             let exit = &*self.exit;
-            if exit.reason != 1
-                || exit.exception.syndrome >> 26 != 0x16
-                || exit.exception.syndrome & 0xffff != expected
-            {
+            if exit.reason != 1 || exit.exception.syndrome >> 26 != 0x16 {
                 let mut pc = 0;
                 hv(
                     hv_vcpu_get_reg(self.cpu.unwrap(), 31, &mut pc),
@@ -186,8 +193,8 @@ impl Vm {
                     exit.exception.physical_address
                 ));
             }
+            Ok(exit.exception.syndrome & 0xffff)
         }
-        Ok(())
     }
 }
 impl Drop for Vm {
@@ -346,11 +353,17 @@ fn seed(index: usize) -> (NativeFrame, [u8; 512], [u8; 256]) {
 }
 fn run() -> Result<()> {
     let a: Vec<_> = env::args().collect();
+    if (a.len() == 9 || a.len() == 10) && a[2] == "i4v-live" {
+        return i4v::run(&a);
+    }
     if a.len() != 7 {
         return Err("usage: natemu-host RUNTIME.elf FEX.arm64 control|live_load|fault VECTOR none|version|profile|size|target|entry|code|address|vcpu N".into());
     }
     if a[2] == "i4" {
         return concurrent::run(&a);
+    }
+    if a[2] == "i4v" {
+        return i4v::run(&a);
     }
     if a[2] == "i2"
         || a[2] == "i3"

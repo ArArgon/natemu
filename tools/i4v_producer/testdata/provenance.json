@@ -1,0 +1,21 @@
+{
+  "retained_root": "/Users/liaozping/orca/natemu-raw/i4v-producer-20261026-02",
+  "files": {
+    "load-high/source.x86": "661bfb535f274b2f64fff6d66f60a35572940497328ef6390963839a7c8217fe",
+    "load-high/body.bin": "5ca671962621681001f6c3fd97f1b6334878b2a36a66cc134cd93f497d0e4e44",
+    "load-high/export.json": "2f4b08a428a09495f7eff3fb1d83ba629f3cfaf0a7c597b6f714d14d53b5c550",
+    "load-high/input.bin": "e3446fa168b5e8f457dc7a6996e550ed44cf4afe5327f2d0b834ef240b5533f9",
+    "load-high/compiler.json": "1c1149d4467697ec797e447f11e788a73e9f0f0755d092b1431aacf24dc78a24",
+    "load-high/producer.log": "eb1538602ce4e8a967c65ca728fd88405200c4a05a785530a5e44c455f55f755",
+    "load-high/outputs/001.relocations": "d8a1ec4d575e4b40b60a8e498d485fa9126a80c057d9a934bdcf8ba6c550a394",
+    "load-high/outputs/001.native": "e21c853fa430af73276c7bc6113dd5139a5830ae8dfea2927064b0225e94449c",
+    "push-high/source.x86": "2be7b23c84f4de3f0b1a2c22d7a666af7ccdb6d802f7521e6fd85e1eb412a9c1",
+    "push-high/body.bin": "b457cc37287290a329bdb577f18dea078fa41c83da94485611c7cdb5119bb17d",
+    "push-high/export.json": "b81d48edd68fa7bd2fa19ad4b4983a3ee53f9f846f3153c8de888347f2ca2cea",
+    "push-high/input.bin": "c5dc7289422eaf3498c40b015795fdd2da71f77fdcef73d965ff93bfd3a91b8e",
+    "push-high/compiler.json": "232942f6af62c9f616b90715ca92332acfa7d4ef88c257e72607387309e1f7ce",
+    "push-high/producer.log": "92fb9779940e01f00b750f7de235c8aed2ea2cf01a2a1fafaab19fdf8d8f4b00",
+    "push-high/outputs/001.relocations": "0b3dcbc0a3d9a737d786145c2cda7d73362b80f09ee2d7e398967ec6c3ba1e6c",
+    "push-high/outputs/001.native": "b5659ab720a70b13255fa6d119c5edfc8db7e442331123561fba39ff3c3ff989"
+  }
+}

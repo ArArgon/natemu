@@ -4,6 +4,19 @@ pub const PA_MASK: u64 = 0x0000_00ff_ffff_f000;
 pub const ACCESSED: u64 = 1 << 5;
 pub const DIRTY: u64 = 1 << 6;
 
+pub fn canonical(address: u64) -> bool {
+    address >> 47 == 0 || address >> 47 == 0x1ffff
+}
+
+/// Guard one due long-mode subaccess, not the effects of a whole guest block.
+/// Address-size wrapping/segmentation must already have been applied.
+pub fn canonical_span(address: u64, bytes: u64) -> bool {
+    bytes != 0
+        && address
+            .checked_add(bytes - 1)
+            .is_some_and(|end| canonical(address) && canonical(end) && address >> 47 == end >> 47)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct Control {
@@ -49,7 +62,7 @@ pub fn walk<T: Tables>(
     if !matches!(c.cpl, 0 | 3) || c.wp > 1 || c.nxe > 1 || c.smep > 1 || c.cr3 & !PA_MASK != 0 {
         return Err(Fault::Unsupported);
     }
-    if va >> 47 != 0 && va >> 47 != 0x1ffff {
+    if !canonical(va) {
         return Err(Fault::Noncanonical);
     }
     let base_error: u64 = if access == Access::Write { 2 } else { 0 }
@@ -118,6 +131,19 @@ pub fn walk<T: Tables>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn canonical_spans_exclude_hole_crossings_and_wraparound() {
+        assert!(canonical_span(0x7fff_ffff_fff8, 8));
+        assert!(!canonical_span(0x7fff_ffff_fff8, 9));
+        assert!(!canonical_span(0x8000_0000_0000, 1));
+        assert!(!canonical_span(0xffff_7fff_ffff_ffff, 2));
+        assert!(canonical_span(0xffff_8000_0000_0000, 16));
+        assert!(canonical_span(u64::MAX - 7, 8));
+        assert!(!canonical_span(u64::MAX - 7, 9));
+        assert!(!canonical_span(0, 0));
+        // Both endpoints can be canonical while the interval crosses the hole.
+        assert!(!canonical_span(0, 0xffff_8000_0000_0001));
+    }
     struct Ram([u64; 2048]);
     impl Tables for Ram {
         fn read(&mut self, p: u64) -> Option<u64> {
