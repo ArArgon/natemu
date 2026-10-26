@@ -1,0 +1,85 @@
+{
+  "schema": "natemu-i4v-program-v1",
+  "case": "fex_mixed32_old",
+  "guest_rip": 1056768,
+  "bitness": 32,
+  "source_hex": "89c1890b8b02",
+  "source_sha256": "54c0e96b234334c1c3cf4ca88c885402b6068ed10fa8b5cec6ef0d8b5fd52586",
+  "body_hex": "e70304aa1f2003d5c7fc9f88a4fcdf881f2003d5",
+  "body_sha256": "5973797b9a02a6f0993a66d3f647fb211bc88a465a2f4bf5dc7d11a97e9b7b27",
+  "producer_sha256": "b614bac26ef89bb8b3d2812a2708a5541314e77e06b6c6771d135ab0424cdc33",
+  "object": {
+    "index": 1,
+    "bytes": 144,
+    "code_bytes": 84,
+    "code_offset": 4,
+    "guest_instructions": 3,
+    "relocation_bytes": 144,
+    "block_address": 281471984074880
+  },
+  "native_object_sha256": "05993bd4b6ec8d1d59d4d3b33013948c084ce11189b39fee5a3ad805173e79b0",
+  "relocations_sha256": "4fe9074258d8a72af199e6dd4598fbf4bac7f2b078759975e1036fd312b3c7ab",
+  "extraction": [
+    12,
+    32
+  ],
+  "guest_pc": [
+    {
+      "guest_offset": 0,
+      "native_offset": 4
+    },
+    {
+      "guest_offset": 2,
+      "native_offset": 16
+    },
+    {
+      "guest_offset": 4,
+      "native_offset": 24
+    }
+  ],
+  "entry_gprs": {
+    "rax": 4,
+    "rbx": 6,
+    "rcx": 7,
+    "rdx": 5,
+    "rsi": 10,
+    "rdi": 11,
+    "rbp": 9,
+    "rsp": 8,
+    "r8": 12,
+    "r9": 13,
+    "r10": 14,
+    "r11": 15,
+    "r12": 16,
+    "r13": 17,
+    "r14": 19,
+    "r15": 29
+  },
+  "flags": "unchanged",
+  "sites": [
+    {
+      "native_offset": 8,
+      "guest_offset": 2,
+      "guest_rip": 1056770,
+      "width": 4,
+      "write": true,
+      "address_register": 6,
+      "address_displacement": 0,
+      "continuation": 12,
+      "phase": "precommit",
+      "guest_rsp_register": 8
+    },
+    {
+      "native_offset": 12,
+      "guest_offset": 4,
+      "guest_rip": 1056772,
+      "width": 4,
+      "write": false,
+      "address_register": 5,
+      "address_displacement": 0,
+      "continuation": 16,
+      "phase": "precommit",
+      "guest_rsp_register": 8
+    }
+  ]
+}

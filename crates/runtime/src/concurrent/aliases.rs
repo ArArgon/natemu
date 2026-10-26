@@ -39,6 +39,9 @@ pub unsafe fn set_leaf(value: u64) {
     }
 }
 pub fn validate(object: &Object, frame: &NativeFrame, code: &[u8], pass: u64) -> Result<(), u64> {
+    if mixed::enabled() {
+        return unsafe { mixed::validate(object, frame, pass) };
+    }
     if stack::enabled() {
         return unsafe { stack::validate(object, frame, pass) };
     }

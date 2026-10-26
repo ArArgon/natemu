@@ -36,6 +36,7 @@ pub const FEX_OR_BODY: [u8; 44] = {
 pub mod alias;
 pub mod concurrency;
 pub mod maintenance;
+pub mod mixed32;
 pub mod paging;
 pub mod paging_off32;
 pub mod paging_off_steps;

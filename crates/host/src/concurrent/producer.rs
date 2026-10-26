@@ -12,6 +12,7 @@ pub struct Compiler {
     guest_rip: u64,
     address_profile: bool,
     stack: Option<stack_producer::Compiler>,
+    mixed: Option<mixed_producer::Compiler>,
 }
 impl Compiler {
     pub fn new(producer: PathBuf, output: PathBuf) -> Result<Self> {
@@ -26,6 +27,7 @@ impl Compiler {
             guest_rip: wire::SOURCE_VA,
             address_profile: false,
             stack: None,
+            mixed: None,
         })
     }
     pub fn new_alias(producer: PathBuf, output: PathBuf, guest_rip: u64) -> Result<Self> {
@@ -40,10 +42,23 @@ impl Compiler {
         compiler.stack = Some(stack_producer::Compiler::new(producer, output, guest_rip));
         Ok(compiler)
     }
+    pub fn new_mixed(producer: PathBuf, output: PathBuf, owner: u64, mode: u64) -> Result<Self> {
+        let mut c = Self::new(producer.clone(), output.clone())?;
+        c.mixed = Some(mixed_producer::Compiler::new(producer, output, owner, mode));
+        Ok(c)
+    }
+    pub fn is_mixed(&self) -> bool {
+        self.mixed.is_some()
+    }
     pub fn is_stack(&self) -> bool {
         self.stack.is_some()
     }
     pub fn exchange(&mut self, mut packet: wire::Packet) -> Result<wire::Packet> {
+        if let Some(mixed) = self.mixed.as_mut() {
+            let reply = mixed.exchange(packet)?;
+            self.requests.clone_from(&mixed.requests);
+            return Ok(reply);
+        }
         if let Some(stack) = self.stack.as_mut() {
             let reply = stack.exchange(packet)?;
             self.requests.clone_from(&stack.requests);

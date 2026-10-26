@@ -370,7 +370,7 @@ fn run() -> Result<()> {
     if a.len() != 7 {
         return Err("usage: natemu-host RUNTIME.elf FEX.arm64 control|live_load|fault VECTOR none|version|profile|size|target|entry|code|address|vcpu N".into());
     }
-    if a[2] == "i4" {
+    if a[2] == "i4" || a[2] == "i4v-mixed" {
         return concurrent::run(&a);
     }
     if a[2] == "i4v" {

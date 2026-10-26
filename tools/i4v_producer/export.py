@@ -9,6 +9,12 @@ ENTRY_GPRS = dict(zip(('rax','rbx','rcx','rdx','rsi','rdi','rbp','rsp',
                       'r8','r9','r10','r11','r12','r13','r14','r15'),
                      (4,6,7,5,10,11,9,8,12,13,14,15,16,17,19,29)))
 CASES = {
+    'fex_mixed32_old': dict(bitness=32, source='89c1890b8b02', instructions=3, host_count=5,
+        body='e70304aa1f2003d5c7fc9f88a4fcdf881f2003d5', object_bytes=144, code_bytes=84,
+        pc=[(0,4),(2,16),(4,24)], sites=[(8,2,4,True,6,0),(12,4,4,False,5,0)]),
+    'fex_mixed32_changed': dict(bitness=32, source='89c189138b02', instructions=3, host_count=5,
+        body='e70304aa1f2003d5c5fc9f88a4fcdf881f2003d5', object_bytes=144, code_bytes=84,
+        pc=[(0,4),(2,16),(4,24)], sites=[(8,2,4,True,6,0),(12,4,4,False,5,0)]),
     'fex_moffs_load32_step0': dict(bitness=32, source='ba00001000', instructions=1, host_count=1,
         body='0502a052', object_bytes=128, code_bytes=68,
         pc=[(0, 4)], sites=[]),

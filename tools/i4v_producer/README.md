@@ -100,7 +100,8 @@ The existing input header already supports 32-bit protected-mode compilation.
 FEX asserts a fixed mode within each context, so each request uses a fresh
 context. This does not implement runtime mode switching. The generic compile
 probe accepts `--bitness 32 --source HEX --instructions N --expected-host N`,
-and body admission includes the five finite 64-bit cases plus `fex_moffs_load32`.
+and body admission includes the five finite 64-bit cases, `fex_moffs_load32`,
+its per-instruction exports and the two mixed-mode register-addressed variants.
 
 Final-build controls retain high/low load compilations, high/low RIP-relative
 LEA (the emitted value is the requested RIP + 7), a 32-bit moffs-load case, and
@@ -162,7 +163,16 @@ use page-aligned bases and do not establish general address-size or maximum-limi
 crossing semantics. Every instruction prefix and physical page is independently
 checked, alongside unchanged guest page tables and CR2.
 
+Add `--mixed-modes` for both paging-mode arrangements at N=1/2/3/4. Each owner
+compiles its old, deferred-old and replacement requests independently. The shared
+source is `mov ecx,eax; mov [ebx],ecx; mov eax,[edx]`; replacement stores EDX.
+Each body is20 bytes, with store/load at native offsets8/12 and guest offsets2/4.
+Private code slots retain owner/context identity even though the two paging modes
+produce identical bytes. Shared data/table mutations use the existing coordinator;
+paging-off identity routes must remain unchanged when paged routes move.
+`probe_mixed32.py` retains count discovery, checked exports and disassembly.
+
 Exact results and independent acceptance live in INV-03-01. Broader segment and
-address forms, mixed paged/off concurrency and mode transitions remain further
-work alongside remaining V1 boundaries and the broader campaign. This does not
-complete V1, V2 or I4-V.
+address forms and mode transitions remain further work alongside remaining V1
+boundaries and the broader campaign. These finite profiles do not complete V1,
+V2 or I4-V.

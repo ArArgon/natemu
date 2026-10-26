@@ -5,6 +5,7 @@ use natemu_abi::paging::Access;
 mod aliases;
 mod events;
 mod maintenance;
+mod mixed;
 mod source;
 mod stack;
 mod stack_source;
@@ -29,6 +30,9 @@ pub unsafe fn initialize() -> ! {
         let s = shared();
         let o = ptr::read_volatile(&raw const (*s).object);
         let c = coordinator();
+        if c.mixed_profile != 0 {
+            mixed::initialize();
+        }
         if c.participants == 0
             || c.participants > MAX_CPUS as u64
             || o.configured_vcpus as u64 != c.participants
@@ -117,6 +121,9 @@ pub unsafe fn initialize() -> ! {
 
 pub unsafe fn completed(fault: u64) -> ! {
     unsafe {
+        if mixed::enabled() {
+            mixed::completed(fault);
+        }
         if ptr::read_volatile(&raw const (*round()).stage) == 4 {
             stack::probe_finish(fault);
         }

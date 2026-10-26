@@ -182,6 +182,17 @@ to compiled code and shadow validity even when there is no guest paging root.
 Finite V2 profiles admit flat protected32 and selected segment/A20/service paths;
 unsupported segment and address policies remain explicit coverage obligations.
 
+Equal decode width does not imply equal address-space identity. The mixed V2
+profile uses 32-bit FEX output for both protected32 paging-off and IA-32e
+compatibility32 owners. It admits the complete fixed control/segment profile
+before resolving accesses and entering code; each request binds VM, owner,
+incarnation, source/context generations, architectural EIP, mode and source GPA.
+Each owner publishes into its private native code slots. Shared-source changes
+invalidate both modes, while an x86 PTE remap changes only paged routes.
+An intentionally read-only native identity mapping may trap for internal repair
+without creating a guest dirty bit. This fixed-context profile does not establish
+mode-transition or context-generation reuse correctness.
+
 In protected32, architectural EIP is a segment offset. Keep it distinct from the
 CS-derived linear fetch address and the resolved source GPA, and bind all three
 to the admitted context. Exception state and FEX's logical compilation PC use

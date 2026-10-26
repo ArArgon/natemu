@@ -14,7 +14,7 @@ fn state() -> *mut Recovery {
 fn guest() -> *mut GuestState {
     GUEST_VA as *mut GuestState
 }
-struct OwnedTables;
+pub(super) struct OwnedTables;
 impl Tables for OwnedTables {
     fn read(&mut self, gpa: u64) -> Option<u64> {
         if !(0x1000..0x5000).contains(&gpa) || gpa & 7 != 0 {

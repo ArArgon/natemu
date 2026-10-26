@@ -3,6 +3,8 @@ use super::*;
 use natemu_abi::concurrency::*;
 use natemu_abi::translation as wire;
 use natemu_abi::{alias, shadow, stack, stack_concurrent};
+mod mixed;
+mod mixed_producer;
 mod producer;
 mod stack_producer;
 use std::{
@@ -69,7 +71,13 @@ impl Cpu {
                         for (r, v) in packet.iter_mut().enumerate() {
                             hv(hv_vcpu_get_reg(self.id, r as u32, v), "read service packet")?;
                         }
-                        let expected = if compiler.as_ref().is_some_and(|c| c.is_stack()) {
+                        let expected = if compiler.as_ref().is_some_and(|c| c.is_mixed()) {
+                            ptr::read_volatile(
+                                (shared_address - SHARED_OFFSET + natemu_abi::mixed32::OFFSET)
+                                    as *const natemu_abi::mixed32::State,
+                            )
+                            .expected
+                        } else if compiler.as_ref().is_some_and(|c| c.is_stack()) {
                             ptr::read_volatile(
                                 (shared_address - SHARED_OFFSET + stack_concurrent::OFFSET)
                                     as *const stack_concurrent::State,
@@ -180,6 +188,7 @@ fn run_owners(
     delay: u64,
     memory: usize,
     compiler_config: Option<(std::path::PathBuf, std::path::PathBuf, u64, bool)>,
+    mixed_profile: u64,
 ) -> Result<Vec<wire::Packet>> {
     thread::scope(|scope| {
         let (prepared_tx, prepared_rx) = mpsc::channel();
@@ -192,7 +201,7 @@ fn run_owners(
             let (release_tx, release_rx) = mpsc::channel::<()>();
             let prepared = prepared_tx.clone();
             let done = done_tx.clone();
-            let compiler_config = if id == 0 {
+            let compiler_config = if id == 0 || mixed_profile != 0 {
                 compiler_config.clone()
             } else {
                 None
@@ -214,7 +223,15 @@ fn run_owners(
                             thread::sleep(Duration::from_millis(delay));
                         }
                         if let Some((binary, output, profile, is_stack)) = compiler_config {
-                            compiler = Some(if is_stack {
+                            compiler = Some(if mixed_profile != 0 {
+                                producer::Compiler::new_mixed(
+                                    binary,
+                                    output.join(format!("cpu-{id}")),
+                                    id as u64,
+                                    natemu_abi::mixed32::owner_mode(mixed_profile, id as u64)
+                                        .unwrap(),
+                                )?
+                            } else if is_stack {
                                 producer::Compiler::new_stack(
                                     binary,
                                     output,
@@ -353,14 +370,28 @@ pub fn run(args: &[String]) -> Result<()> {
     if n > host_limit as usize {
         return Err("I4 count exceeds host vCPU limit".into());
     }
-    let (scenario_id, alias_profile, stack_kind) = profiles(&args[3])?;
+    let mixed_profile = if args[2] == "i4v-mixed" {
+        match args[3].as_str() {
+            "off-first" => 1,
+            "paged-first" => 2,
+            _ => return Err("unsupported mixed arrangement".into()),
+        }
+    } else {
+        0
+    };
+    let (scenario_id, alias_profile, stack_kind) = if mixed_profile != 0 {
+        (5, 0, 0)
+    } else {
+        profiles(&args[3])?
+    };
+    coord.mixed_profile = mixed_profile;
     let stack_profile = stack_kind != 0;
     coord.stack_profile = stack_kind;
     coord.scenario = scenario_id;
     coord.alias_profile = alias_profile;
     let source_rip = alias::source_rip(alias_profile);
     let compose = scenario_id >= 3;
-    if compose {
+    if compose && mixed_profile == 0 {
         coord.published.store(0, Ordering::Relaxed);
     }
     let delay: u64 = if compose {
@@ -371,28 +402,33 @@ pub fn run(args: &[String]) -> Result<()> {
     if delay > 1000 {
         return Err("owner delay exceeds 1000ms".into());
     }
-    let body = if stack_profile {
+    let body = if stack_profile || mixed_profile != 0 {
         Vec::new()
     } else if compose {
         FEX_BODY.to_vec()
     } else {
         read_input(&args[5], 44)?
     };
-    if !stack_profile && body != FEX_BODY {
+    if !stack_profile && mixed_profile == 0 && body != FEX_BODY {
         return Err("I4 requires pinned FEX fragment".into());
     }
     let memory = Memory::with_size(n * RAM_SIZE)?;
     load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
-    if !stack_profile {
+    if !stack_profile && mixed_profile == 0 {
         memory.copy(CODE_OFFSET, &body);
         memory.copy(CODE_OFFSET + 44, &RET);
     } else {
         memory.copy(DATA_OFFSET, &[0xa5; 8192]);
     }
+    if mixed_profile != 0 {
+        memory.copy(DATA_OFFSET + 4096, &[0x5a; 4096]);
+    }
     if compose {
         memory.copy(
             natemu_abi::recovery::SOURCE_OFFSET,
-            if stack_profile {
+            if mixed_profile != 0 {
+                &natemu_abi::mixed32::SOURCE[..]
+            } else if stack_profile {
                 &stack::SOURCE[..]
             } else {
                 &wire::XOR[..]
@@ -430,6 +466,9 @@ pub fn run(args: &[String]) -> Result<()> {
             }
         }
         tables(&memory, base, alias_profile != 0);
+        if mixed_profile != 0 {
+            mixed::private_code(&memory, base);
+        }
         let (mut frame, mut bank, mut data) = seed(id);
         for b in &mut bank {
             *b ^= id as u8;
@@ -445,10 +484,15 @@ pub fn run(args: &[String]) -> Result<()> {
             frame.x[5] = frame.x[8];
             data.fill(0xa5);
         }
+        if mixed_profile != 0 {
+            mixed::seed_owner(&mut frame, &mut data, id);
+        }
         memory.copy(base + BANK_OFFSET, &bank);
         memory.copy(DATA_OFFSET + id * 256, &data);
         let mut replacement = data.map(|b| b ^ 0x5a);
-        if stack_profile {
+        if mixed_profile != 0 {
+            replacement = mixed::replacement(id);
+        } else if stack_profile {
             replacement.fill(0xa5);
         } else {
             replacement[..8].copy_from_slice(&(0xd00d_9876_5432_1000u64 + id as u64).to_le_bytes());
@@ -456,6 +500,9 @@ pub fn run(args: &[String]) -> Result<()> {
         memory.copy(DATA_OFFSET + 4096 + id * 256, &replacement);
         new_data.push(replacement);
         let mut object = Object::new(LIVE_LOAD);
+        if mixed_profile != 0 {
+            object.code_length = 24;
+        }
         if stack_profile {
             object.code_length = stack::CODE_BYTES as u64;
         }
@@ -486,6 +533,22 @@ pub fn run(args: &[String]) -> Result<()> {
         };
         unsafe {
             ptr::write(memory.0.add(base + SHARED_OFFSET).cast::<Shared>(), shared);
+            if mixed_profile != 0 {
+                let mode = natemu_abi::mixed32::owner_mode(mixed_profile, id as u64).unwrap();
+                let mut m = natemu_abi::mixed32::State::ZERO;
+                m.mode = mode;
+                m.incarnation = 1;
+                m.context = mode + 1;
+                m.a20 = 1;
+                m.initial = frame;
+                ptr::write(
+                    memory
+                        .0
+                        .add(base + natemu_abi::mixed32::OFFSET)
+                        .cast::<natemu_abi::mixed32::State>(),
+                    m,
+                );
+            }
             if stack_profile {
                 ptr::write(
                     memory
@@ -533,7 +596,11 @@ pub fn run(args: &[String]) -> Result<()> {
                     natemu_abi::recovery::Recovery::new(0),
                 );
                 if scenario_id >= 4 {
-                    let mut guest = natemu_abi::recovery::GuestState::seed(&seeds[id].0);
+                    let mut guest = if mixed_profile != 0 {
+                        mixed::guest(&seeds[id].0, id, mixed_profile)
+                    } else {
+                        natemu_abi::recovery::GuestState::seed(&seeds[id].0)
+                    };
                     guest.rip = source_rip;
                     if stack_profile {
                         guest.gpr[4] = seeds[id].0.x[8];
@@ -550,6 +617,9 @@ pub fn run(args: &[String]) -> Result<()> {
                     );
                     let mut event = EventRecord::new(&seeds[id].0, id);
                     event.packet.rip = source_rip;
+                    if mixed_profile != 0 {
+                        event.packet = guest;
+                    }
                     if stack_profile {
                         event.packet.gpr[4] = seeds[id].0.x[8];
                     }
@@ -563,6 +633,21 @@ pub fn run(args: &[String]) -> Result<()> {
                 }
             }
         }
+    }
+    let mixed_pages_before = if mixed_profile != 0 {
+        memory.read::<8192>(DATA_OFFSET).to_vec()
+    } else {
+        Vec::new()
+    };
+    let mixed_tables_before = if mixed_profile != 0 {
+        memory
+            .read::<16384>(natemu_abi::recovery::TABLE_OFFSET)
+            .to_vec()
+    } else {
+        Vec::new()
+    };
+    if mixed_profile != 0 {
+        fs::create_dir(&args[6]).map_err(|e| e.to_string())?;
     }
     unsafe {
         sys_icache_invalidate(memory.0.cast(), memory.1);
@@ -595,6 +680,7 @@ pub fn run(args: &[String]) -> Result<()> {
         } else {
             None
         },
+        mixed_profile,
     )?;
     // Every owner has exited and destroyed its vCPU before host reads guest RAM.
     let c = unsafe { &*memory.0.add(COORD_OFFSET).cast::<Coordinator>() };
@@ -604,6 +690,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut event_records = Vec::new();
     let mut alias_records = Vec::new();
     let mut stack_records = Vec::new();
+    let mut mixed_records = Vec::new();
     for (id, (frame, bank, data)) in seeds.iter().enumerate() {
         let base = id * RAM_SIZE;
         let s = unsafe { ptr::read(memory.0.add(base + SHARED_OFFSET).cast::<Shared>()) };
@@ -617,6 +704,9 @@ pub fn run(args: &[String]) -> Result<()> {
             return Err(format!("CPU{id}: entry state changed"));
         }
         let r = unsafe { ptr::read(memory.0.add(base + ROUND_OFFSET).cast::<Round>()) };
+        if mixed_profile != 0 {
+            mixed_records.push(mixed::report(&memory, id, mixed_profile, frame));
+        }
         if scenario_id >= 4 {
             let e = unsafe { ptr::read(memory.0.add(base + EVENT_OFFSET).cast::<EventRecord>()) };
             event_records.push(format!("{{\"id\":{id},\"pending\":{},\"token_state\":{},\"notifications\":{},\"consumed\":{},\"deliveries\":{},\"boundary\":{},\"blocked\":{},\"wait_checks\":{},\"shadow\":{},\"priority\":{},\"vector\":{},\"packet\":{}}}",
@@ -709,20 +799,29 @@ pub fn run(args: &[String]) -> Result<()> {
             None
         };
         let second_frame = baseline.as_ref().map_or(&s.captured, |b| &b.frame);
-        let second_memory = baseline.as_ref().map_or_else(
+        let mut second_memory = baseline.as_ref().map_or_else(
             || memory.read::<256>(DATA_OFFSET + 4096 + id * 256),
             |b| b.new_memory,
         );
-        let first_memory = baseline.as_ref().map_or_else(
+        let mut first_memory = baseline.as_ref().map_or_else(
             || memory.read::<256>(DATA_OFFSET + id * 256),
             |b| b.old_memory,
         );
+        let mut second_before = new_data[id];
+        if mixed_profile != 0 {
+            let observed = mixed::state(&memory, base);
+            first_memory = observed.old_memory_after;
+            second_before = observed.new_memory_before;
+            second_memory = observed.new_memory_after;
+        }
         if scenario_id >= 2 {
             if !pressure && s.initial != r.new_initial {
                 return Err("new entry state changed".into());
             }
             let code = if compose { CODE_NEXT } else { CODE_VA };
-            let case = if stack_profile {
+            let case = if mixed_profile != 0 {
+                "fex_mixed32_changed"
+            } else if stack_profile {
                 "fex_push_immediates64_changed"
             } else if compose {
                 "live_or"
@@ -739,14 +838,16 @@ pub fn run(args: &[String]) -> Result<()> {
             );
             new_cells.push(format!("{{\"dirty_fault\":{dirty},\"id\":{id},\"dirty_faults\":{},\"case\":\"{case}\",\"status\":{},\"initial\":{},\"captured\":{},\"memory_base\":{},\"memory_before\":{:?},\"memory_after\":{:?},\"bank_before\":{bank:?},\"bank_after\":{:?},\"object_pc\":{code},\"capture_pc\":{}}}",
                 r.dirty_faults,s.status,frame_json(&r.new_initial),frame_json(second_frame),if stack_profile {stack_concurrent::initial_rsp_for(stack_kind,id as u64)-0x80} else {r.new_initial.x[6]},
-                new_data[id],second_memory,memory.read::<512>(base+BANK_OFFSET),s.capture_pc));
+                second_before,second_memory,memory.read::<512>(base+BANK_OFFSET),s.capture_pc));
         }
         let old_frame = if scenario_id >= 2 {
             &r.first_frame
         } else {
             &s.captured
         };
-        let case = if stack_profile {
+        let case = if mixed_profile != 0 {
+            "fex_mixed32_old"
+        } else if stack_profile {
             "fex_push_immediates64"
         } else {
             "live_load"
@@ -769,7 +870,11 @@ pub fn run(args: &[String]) -> Result<()> {
         c.stale_replies.load(Ordering::Acquire),
         c.stale_entries.load(Ordering::Acquire),
         c.reuse_blocked.load(Ordering::Acquire),
-        if stack_profile {
+        if mixed_profile != 0 {
+            memory
+                .read::<6>(natemu_abi::recovery::SOURCE_OFFSET)
+                .to_vec()
+        } else if stack_profile {
             memory
                 .read::<20>(natemu_abi::recovery::SOURCE_OFFSET)
                 .to_vec()
@@ -778,12 +883,16 @@ pub fn run(args: &[String]) -> Result<()> {
                 .read::<17>(natemu_abi::recovery::SOURCE_OFFSET)
                 .to_vec()
         },
-        if stack_profile {
+        if mixed_profile != 0 {
+            memory.read::<24>(CODE_OFFSET).to_vec()
+        } else if stack_profile {
             memory.read::<{ stack::CODE_BYTES }>(CODE_OFFSET).to_vec()
         } else {
             memory.read::<48>(CODE_OFFSET).to_vec()
         },
-        if stack_profile {
+        if mixed_profile != 0 {
+            memory.read::<24>(CODE_OFFSET + 4096).to_vec()
+        } else if stack_profile {
             memory
                 .read::<{ stack::CODE_BYTES }>(CODE_OFFSET + 4096)
                 .to_vec()
@@ -827,7 +936,9 @@ pub fn run(args: &[String]) -> Result<()> {
                             .cast::<natemu_abi::maintenance::Interval>(),
                     )
                 };
-                let case = if stack_profile {
+                let case = if mixed_profile != 0 {
+                    "fex_mixed32_changed"
+                } else if stack_profile {
                     "fex_push_immediates64_changed"
                 } else {
                     "live_or"
@@ -879,6 +990,20 @@ pub fn run(args: &[String]) -> Result<()> {
         c.reclaimed.load(Ordering::Acquire),
         compose_leaf
     );
+    let mixed_pages_after = if mixed_profile != 0 {
+        memory.read::<8192>(DATA_OFFSET).to_vec()
+    } else {
+        Vec::new()
+    };
+    let mixed_tables_after = if mixed_profile != 0 {
+        memory
+            .read::<16384>(natemu_abi::recovery::TABLE_OFFSET)
+            .to_vec()
+    } else {
+        Vec::new()
+    };
+    let mixed_compiled = c.mixed_compiled.load(Ordering::Acquire);
+    let mixed_json = mixed_records.join(",");
     let stack_flag = stack_kind;
     let stack_memory_before = if stack_profile {
         vec![0xa5u8; 8192]
@@ -891,7 +1016,7 @@ pub fn run(args: &[String]) -> Result<()> {
         Vec::new()
     };
     println!(
-        "{{\"stack_profile\":{stack_flag},\"stacks\":[{}],\"stack_memory_before\":{stack_memory_before:?},\"stack_memory_after\":{stack_memory_after:?},\"alias_profile\":{alias_profile},\"source_rip\":{source_rip},\"aliases\":[{}],\"maintenance\":{maintenance_json},\"events\":[{}],\"source\":{source_summary},\"requests\":{requests:?},\"coherence\":{summary},\"new_cells\":[{}],\"profile\":\"i4-{scenario}\",\"trace\":{trace:?},\"faults\":[{}],\"retained\":{},\"configured_vcpus\":{n},\"tested_vcpus\":{n},\"delayed_owner_ms\":{delay},\"ready\":{},\"finished\":{},\"cells\":[{}]}}",
+        "{{\"mixed_profile\":{mixed_profile},\"mixed_compiled\":{mixed_compiled},\"mixed\":[{mixed_json}],\"mixed_pages_before\":{mixed_pages_before:?},\"mixed_pages_after\":{mixed_pages_after:?},\"mixed_tables_before\":{mixed_tables_before:?},\"mixed_tables_after\":{mixed_tables_after:?},\"stack_profile\":{stack_flag},\"stacks\":[{}],\"stack_memory_before\":{stack_memory_before:?},\"stack_memory_after\":{stack_memory_after:?},\"alias_profile\":{alias_profile},\"source_rip\":{source_rip},\"aliases\":[{}],\"maintenance\":{maintenance_json},\"events\":[{}],\"source\":{source_summary},\"requests\":{requests:?},\"coherence\":{summary},\"new_cells\":[{}],\"profile\":\"i4-{scenario}\",\"trace\":{trace:?},\"faults\":[{}],\"retained\":{},\"configured_vcpus\":{n},\"tested_vcpus\":{n},\"delayed_owner_ms\":{delay},\"ready\":{},\"finished\":{},\"cells\":[{}]}}",
         stack_records.join(","),
         alias_records.join(","),
         event_records.join(","),

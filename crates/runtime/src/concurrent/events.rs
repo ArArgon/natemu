@@ -41,6 +41,9 @@ pub unsafe fn wait_check() {
 
 pub unsafe fn materialize(frame: &NativeFrame) {
     unsafe {
+        if mixed::enabled() {
+            return mixed::materialize(frame, 6);
+        }
         if stack::enabled() {
             return stack::materialize(frame, 20);
         }

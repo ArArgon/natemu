@@ -16,6 +16,23 @@ class ExportChecks(unittest.TestCase):
             self.assertEqual(len(result['sites']),site_count)
             self.assertEqual(result['entry_gprs']['rsp'],8)
 
+    def test_mixed32_source_change_and_both_memory_sites_are_exact(self):
+        for index,rip in enumerate((0x102000,0x102080)):
+            old=export.verify(DATA/f'mixed32-old-{index}',dict(case='fex_mixed32_old',guest_rip=rip,bitness=32))
+            changed=export.verify(DATA/f'mixed32-replacement-{index}',dict(case='fex_mixed32_changed',guest_rip=rip,bitness=32))
+            a,b=bytes.fromhex(old['body_hex']),bytes.fromhex(changed['body_hex'])
+            self.assertEqual(len(a),20)
+            self.assertEqual([(i,x,y) for i,(x,y) in enumerate(zip(a,b)) if x!=y],[(8,0xc7,0xc5)])
+            self.assertEqual([(s['native_offset'],s['guest_rip'],s['width'],s['write'],s['address_register']) for s in old['sites']],
+                             [(8,rip+2,4,True,6),(12,rip+4,4,False,5)])
+            self.assertEqual(old['sites'],changed['sites'])
+
+    def test_mixed32_source_mode_and_emitted_register_changes_reject(self):
+        self.mutated('mixed32-old-0','source.x86',lambda b:b[:3]+b'\x13'+b[4:])
+        self.mutated('mixed32-old-0','outputs/001.native',lambda b:b[:20]+b'\xc5'+b[21:])
+        self.mutated('mixed32-replacement-0','producer.log',lambda b:b.replace(b'bitness=32',b'bitness=64'))
+        with self.assertRaises(ValueError):export.verify(DATA/'mixed32-old-0',dict(case='fex_mixed32_changed'))
+
     def test_protected32_steps_keep_actual_guest_rip_and_memory_sites(self):
         offsets=(0,5,10,12,17,22,24,29,35)
         for step,offset in enumerate(offsets):

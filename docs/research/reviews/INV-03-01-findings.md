@@ -1,5 +1,72 @@
 # INV-03-01 — source findings review
 
+## Intermediate I4-V return — mixed paging-mode concurrency, October 26, 2026 UTC
+
+Root authored ABI/runtime and runner changes, `/root/i4v_producer` authored
+host/compiler integration and `/root/i4v_upstream` authored the independent
+oracle. `/root/i4v_contract_review` reviewed source, contracts and emitted code,
+then independently rebuilt and executed primary02's retained snapshot.
+**ACCEPT the finite flat protected32/compatibility32 mixed-mode checkpoint;
+V2 and I4-V remain incomplete.**
+
+Independent `i4v-mixed-modes-independent-20261026-01` passes277 jobs and255 native
+cells, preserving247 prior cells and adding both mode arrangements at N=1/2/3/4.
+The reviewer independently rechecked all255 reports,556 actual compilations,
+568 report-to-compile associations,810 delivered transfers and12,952 checksums.
+All310 retained inputs match primary02 exactly; subsequent workspace differences
+are limited to the producer and fixture READMEs. The reused FEX executable matches
+its pin, and no compiler containers remain.
+
+The eight new cases cover20 CPU instances: ten paging-off owners perform zero
+guest walks, while ten paged owners perform348 checked walks. They execute68
+programs with68 native store faults,180 maintenance heads and60 contextual
+compilations/deliveries. The oracle derives complete physical memory histories,
+native frames, canonical event/final state and shared guest-table effects from
+the declared instructions and mode assignment. It retains the FIFO, capacity,
+delayed-acknowledgement and at-most-eight-head fairness replay. Paging-off owners
+retain identity routing while paged owners follow shared leaf remaps; deliberate
+maintenance writes to guest PTEs are fixture actions, distinct from implicit
+walk A/D updates. Native read-only identity mappings produce internal repair
+faults without inventing guest dirty bits or guest page faults.
+
+Compatibility32 uses the existing four-level walker only after exact control,
+flat-segment and VM-wide A20-on admission. CS.L=0/CS.D=1 changes decode defaults
+while retaining IA-32e paging, as specified in
+[Intel SDM Volume3A section11.8.5.3](https://cdrdv2-public.intel.com/850978/253668-087-sdm-vol-3a.pdf).
+Each owner compiles the shared physical source with its own mode/context identity
+and private native code slots. All admitted old stores complete before source
+mutation; actual deferred replies are rejected against replacement identity,
+every replacement publishes before release, and private old-code reuse is blocked
+until its owner's retained reference is released. Wrong-owner/mode replies leave
+the replacement unpublished. Source writes remain explicit runtime fixture
+writes, not translated self-modifying guest instructions.
+
+Review found and corrected three issues before native collection: TAKE/POLL used
+the replacement identity instead of the deferred job's original identity;
+ordinary-interval faults omitted canonical materialization of the committed MOV
+prefix; and the early private-code reuse control did not exercise a guarded
+reclamation helper. The corrected implementation drains the actual old request,
+materializes EIP+2 and ECX before retry, and checks unchanged old bytes after a
+rejected reuse attempt. Compiler resource wording now matches the bounded
+per-owner worker topology. The independent reviewer also ran all six mixed-oracle
+test methods successfully.
+
+Primary02, the independent rebuild and serialized legacy rebuild share runtime
+SHA256 `66221dfc86504704edd1bdf52b8c96c37e360ab918e9e3c0a07ad79630c9bb00`.
+The two RX segments contain168 boot bytes and87,940 main-image bytes; emitted
+return/exception stack usage is conservatively bounded at14,992 of16,384 bytes,
+leaving1,392. Root's `i4v-mixed-modes-regression-20261026-01` passes87 legacy jobs
+from05:34:07–05:34:49UTC; the reviewer inspected its manifest and matching ELF,
+without claiming another independent legacy execution.
+
+The independent run lasted213 seconds, from05:30:15–05:33:48UTC, and retained
+130,546,128 bytes. Observed peak build/worker process-group RSS was
+461,291,520/385,138,688 bytes, within the declared limits. No substantive blocker
+remains within this finite scope. Mixed nonflat segmentation, A20-off and wider
+address/service profiles, actual guest mode/control transitions, context-generation
+reuse and remaining V1/broader validation remain obligations. This checkpoint
+does not establish full V2/I4-V correctness or performance.
+
 ## Intermediate I4-V return — protected32 instruction boundaries, October 26, 2026 UTC
 
 Root authored ABI/runtime and runner changes, `/root/i4v_producer` authored

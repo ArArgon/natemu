@@ -30,3 +30,14 @@ Boundary addresses in these host-side checks exercise the expectation helpers,
 not the runtime's MMU. A fixture definition or passing expectation self-check is
 not a translated-execution result. FEX output is the system under test; FEX
 execution is not an independent oracle for these cases.
+
+The mixed paging-mode concurrency driver additionally combines the retained
+`Primary_A0.asm` dword store/read and ECX-copy expectations with the
+register-indirect access form in `Primary_A2.asm`. Its six-byte adapted source is
+`89c1890b8b02` (`mov ecx,eax; mov [ebx],ecx; mov eax,[edx]`). Replacement source
+`89c189138b02` stores EDX instead, making old-code entry observable. This is a
+new combined fixture and source-coherence control, not an imported upstream
+concurrency test. The independent semantics and complete physical-memory history
+are checked by `tools/check_i4v_mixed.py`; the existing four-case prefix model
+remains unchanged. The mixed driver uses flat segments/A20-on with distinct
+per-owner operand spans and old/new physical-page read sentinels.

@@ -11,6 +11,37 @@ fn interval(index: u64) -> *mut m::Interval {
 fn leaf() -> *mut u64 {
     (PRIVATE + natemu_abi::recovery::TABLE_OFFSET as u64 + 0x3000 + 256 * 8) as *mut u64
 }
+unsafe fn route_gpa(address: u64, access: Access) -> u64 {
+    unsafe {
+        if mixed::enabled() {
+            let route = mixed::resolve(address, 4, access);
+            // Read admission deliberately leaves a native RO mapping in both modes.
+            recovery::install_ram(
+                address,
+                route.gpa(),
+                access == Access::Write && route.writable(),
+            );
+            route.gpa()
+        } else {
+            let route = recovery::walk(address, access).unwrap_or_else(|_| stop(PANIC, 137));
+            if access == Access::Read {
+                aliases::install_pair(address, route);
+            } else {
+                recovery::install(address, route);
+            }
+            route.gpa
+        }
+    }
+}
+unsafe fn expected_gpa(address: u64) -> u64 {
+    unsafe {
+        if mixed::enabled() {
+            mixed::expected_gpa(address)
+        } else {
+            (ptr::read_volatile(leaf()) & natemu_abi::paging::PA_MASK) + (address & 4095)
+        }
+    }
+}
 
 pub unsafe fn start(id: u64) -> ! {
     unsafe {
@@ -114,15 +145,10 @@ unsafe fn drive(id: u64) -> ! {
                                 stop(PANIC, 136);
                             }
                             let address = DATA_VA + id * 256;
-                            let route = recovery::walk(address, Access::Read)
-                                .unwrap_or_else(|_| stop(PANIC, 137));
-                            if route.gpa
-                                != (ptr::read_volatile(leaf()) & natemu_abi::paging::PA_MASK)
-                                    + id * 256
-                            {
+                            let gpa = route_gpa(address, Access::Read);
+                            if gpa != expected_gpa(address) {
                                 stop(PANIC, 138);
                             }
-                            aliases::install_pair(address, route);
                             if c.alias_profile != 0 {
                                 aliases::acknowledge(s.epoch);
                             }
@@ -153,8 +179,7 @@ unsafe fn drive(id: u64) -> ! {
                             r.ordinal = s.ordinary_total + 1;
                             r.heads = s.total;
                             r.epoch = s.epoch;
-                            r.gpa = (ptr::read_volatile(leaf()) & natemu_abi::paging::PA_MASK)
-                                + id * 256;
+                            r.gpa = expected_gpa(DATA_VA + id * 256);
                             let address = PRIVATE + DATA_OFFSET as u64 + r.gpa - DATA_VA;
                             // Declared fixture input makes a skipped/idempotent
                             // OR body observable without inventing register state.
@@ -228,7 +253,9 @@ pub unsafe fn finish(fault: u64) -> ! {
             let (esr, far, pc, spsr): (u64, u64, u64, u64);
             asm!("mrs {0}, ESR_EL1","mrs {1}, FAR_EL1","mrs {2}, ELR_EL1","mrs {3}, SPSR_EL1",
                 out(reg)esr,out(reg)far,out(reg)pc,out(reg)spsr);
-            let valid = if stack::enabled() {
+            let valid = if mixed::enabled() {
+                mixed::fault_valid(esr, far, pc, spsr, false)
+            } else if stack::enabled() {
                 stack::fault_valid(esr, far, pc, spsr, false)
             } else {
                 !(esr >> 26 != 0x25
@@ -241,6 +268,9 @@ pub unsafe fn finish(fault: u64) -> ! {
             if !valid || ptr::read_volatile(&raw const (*at).faults) != 0 {
                 stop(NATIVE_FAULT, 141);
             }
+            if mixed::enabled() {
+                mixed::materialize(&(*owner).captured, 2);
+            }
             write_record(
                 &raw mut (*at).dirty_frame,
                 read_record(&raw const (*owner).captured),
@@ -249,7 +279,7 @@ pub unsafe fn finish(fault: u64) -> ! {
             ptr::write_volatile(&raw mut (*at).far, far);
             ptr::write_volatile(&raw mut (*at).pc, pc);
             ptr::write_volatile(&raw mut (*at).spsr, spsr);
-            let route = {
+            {
                 let g = coordinator::lock(c);
                 let s = read_record(state());
                 if s.epoch != snapshot.epoch
@@ -258,17 +288,21 @@ pub unsafe fn finish(fault: u64) -> ! {
                 {
                     stop(PANIC, 142);
                 }
-                let route = recovery::walk(far, Access::Write).unwrap_or_else(|_| stop(PANIC, 143));
-                if route.gpa
+                let gpa = route_gpa(far, Access::Write);
+                if gpa
                     != ptr::read_volatile(&raw const (*at).gpa)
-                        + if stack::enabled() { far & 255 } else { 128 }
+                        + if mixed::enabled() {
+                            0
+                        } else if stack::enabled() {
+                            far & 255
+                        } else {
+                            128
+                        }
                 {
                     stop(PANIC, 144);
                 }
                 checked(g.trace(31, id));
-                route
-            };
-            recovery::install(far, route);
+            }
             ptr::write_volatile(&raw mut (*at).faults, 1);
             resume_exception(&raw const (*owner).captured, pc, spsr);
         }
@@ -276,6 +310,9 @@ pub unsafe fn finish(fault: u64) -> ! {
             &raw mut (*at).captured,
             read_record(&raw const (*owner).captured),
         );
+        if mixed::enabled() {
+            mixed::materialize(&(*owner).captured, 6);
+        }
         let address =
             PRIVATE + DATA_OFFSET as u64 + ptr::read_volatile(&raw const (*at).gpa) - DATA_VA;
         write_record(
