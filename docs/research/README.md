@@ -67,8 +67,9 @@ The current work develops the provisional ABI, Rust resident runtime and host-si
 FEX adapter together under [Track03](tracks/03-architecture-options.md#current-milestone--execution-abi-and-experimental-runtime).
 Follow the [implementation order](../implementation.md#executable-increments):
 actual generated code, an early live producer loop, recovery/paging, N-vCPU
-composition and boot/userspace, with performance feedback throughout. Final
-generator selection remains open. INV-03-01 records the next bounded slice and
+composition, bounded post-I4 integrated validation and boot/userspace, with
+performance feedback throughout. Final generator selection remains open.
+INV-03-01 records the next bounded slice and
 results; a milestone pass establishes only its tested scope.
 
 ### Build-first iteration

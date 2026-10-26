@@ -1,5 +1,15 @@
 # INV-03-01 — source findings review
 
+## Plan review — post-I4 integrated validation, October 25, 2026
+
+Independent `/root/post_i4_plan_review` reviewed root's I4-V plan addition and
+current-summary/workflow links. **ACCEPT; no substantive blockers.** The plan
+keeps continuous I4 testing and independent I5 progress, bounds the integrated
+pass, separates semantic and implementation checks, and covers memory ordering,
+translation coherence, recovery/lifetime and progress. Upstream reuse retains
+pins, attribution, expectations and harness limits; FEX/QEMU execution alone is
+not an authoritative oracle. Documentation checks pass. No tests were imported
+or executed for this update, and no new architectural correctness is established.
 
 ## Current return — I3 recovery and paging, October 25, 2026
 

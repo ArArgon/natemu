@@ -63,6 +63,7 @@ do not accumulate unrelated throwaway demonstrations as a substitute for integra
 | I2 — Live producer loop | A runtime miss requests translation of admitted x86 bytes/context; an actual FEX worker generates a new object; the host validates, publishes and resumes it. Change source/context and reject the stale reply. Exercise cancellation and finite request capacity. This is not replay of a fixed export. |
 | I3 — Recovery and paging | Add live helpers, real x86-table-driven shadow misses versus guest faults, allocation-pressure maps with spills/overwritten destinations, partial-effect completion and an admitted FP-status path. Check exact current state and effect counts. Manual maps are permitted for finite bring-up fixtures; they do not satisfy automated exporter coverage. |
 | I4 — Concurrent composition | Exercise two vCPUs, then three/four before broad ISA expansion: queued faults, remap/shootdown, source invalidation, pending events and retained references. Force adverse schedules and stalled peers. The same ownership/progress rules apply to every configured participant. |
+| I4-V — Integrated validation | After I4, deepen memory-model, translation, recovery and lifetime coverage across the integrated producer/runtime. Adapt upstream tests, add independent models and adversarial schedules, and retain reproducible counterexamples. This bounded checkpoint qualifies the tested profile for dependent I5 work; it does not establish whole-emulator correctness. |
 | I5 — Boot and small workloads | Select an exact stock kernel and external initramfs with `/init` and small test programs. Add required system semantics, exception delivery/return, startup32, timer/APIC and serial toward uniprocessor then SMP boot. Observe boot milestones and successful userspace outputs; kernel boot alone is not application coverage. |
 | I6 — Broader compatibility and devices | Grow instruction coverage and required block/network/entropy/shutdown paths; retain prior tests. Add workloads and device errors as paths become available. Resolve product-specific compatibility/numerical tradeoffs before accepting them. |
 
@@ -80,6 +81,75 @@ completion or universal ABI compatibility. The ABI representation may change
 alongside consumers; state ownership, precise effects, isolation, event eligibility
 and lifetime guarantees remain explicit. Reconsider FEX for a demonstrated
 compatibility, recovery, cost or maintenance problem, not a hypothetical second adapter.
+
+## Post-I4 integrated validation
+
+I4-V is the first deep integrated validation pass. Add regression tests as each
+I4 mechanism is built; this pass systematically combines them before relying on
+them for boot. Record its selected coverage, work/resource bound and stopping
+condition in INV-03-01 at execution start. Independent I5 preparation may overlap;
+defects block the paths that depend on them. Continue expanding conformance tests
+during I5/I6 rather than waiting for an exhaustive architecture proof.
+
+Use many targeted cases and generated variations, with coverage measured by
+distinct contracts and interactions rather than a test-count quota. Keep a fast
+deterministic regression subset and a broader bounded campaign. Select cases
+from the ABI coverage matrix and current decision inventory, including:
+
+| Area | Required validation focus within the admitted profile |
+| --- | --- |
+| Memory ordering and atomicity | Guest x86 ordering litmus tests, supported atomics/fences, alignment and page-boundary behavior; combine with faults and retries to detect duplicated or reordered effects. Separately check native synchronization/publication contracts. |
+| Translation coherence | Leaf and parent table mutations, aliases/shared tables, permissions, A/D updates and clearing, supported page sizes, remap/shootdown and delayed acknowledgements. Check guest-visible table bytes and allowed translation behavior across invalidation boundaries. |
+| Recovery and lifetime | Fault/helper/partial-effect state, suspended accesses during mutation, stale compiler replies and code entry, retained maps/code and reclamation. Force interruptions at supported effect and publication phases. |
+| Progress and containment | N=1/2/3/4 as admitted, simultaneous faults, delayed peers, queue/pool exhaustion and pending events. Check eventual progress under declared healthy scheduling and bounded diagnostics/containment on failure. |
+
+Keep semantic tests independent of shadow-table layout, dirty-tracking strategy,
+native register allocation and other replaceable mechanisms. Check guest-visible
+state, effects, faults, ordering and lifetime guarantees. Label exact native-byte,
+spill-location and internal fault-count checks as implementation/profile checks;
+update those when an implementation changes without weakening semantic coverage.
+
+### Reuse existing tests and author the missing interactions
+
+Start with the retained pinned FEX checkout; select small cases that the admitted
+profile can execute. These are candidate sources, not suites already imported or
+passed:
+
+| Source | Intended adaptation and limits |
+| --- | --- |
+| [FEX assembly tests](https://github.com/FEX-Emu/FEX/tree/48d71752e2a363d5535181f803b0b0e9666c1825/unittests/ASM) | Reuse instruction sequences and expected register/memory results for supported instructions, flags and FP behavior. Adapt setup/termination to our runner. FEX's own execution is not an independent oracle for our FEX-based producer, and these cases do not establish system paging or ABI recovery. |
+| [QEMU TCG tests](https://github.com/qemu/qemu/tree/master/tests/tcg) | Select x86 regression cases for a second corpus; identify syscall, library and system-mode harness requirements before adapting. Defer cases needing unimplemented services explicitly. |
+| [kvm-unit-tests x86 access tests](https://github.com/kvm-unit-tests/kvm-unit-tests/blob/master/x86/access.c) | Adapt selected permission, paging and fault cases into finite fixtures. Full privileged test execution needs system/exception support; do not make its complete harness a prerequisite to pre-boot validation. |
+| [herdtools7](https://github.com/herd/herdtools7) | Use model-checked litmus expectations and generated cases for guest x86 ordering and, separately, native Arm synchronization. Pin the model and its applicability; Linux's kernel memory model is not the x86 architectural model. |
+
+For each adapted case retain upstream revision/path, applicable license notices
+and attribution, original expectation, adaptation rationale and required guest
+features. Pin sources before importing; preserve meaningful checks and mark
+unsupported cases as skipped/unimplemented, never passed. An upstream harness
+assumption must not silently become an emulator requirement or a weakened test.
+
+Author our ABI-specific fault, mutation, event and lifetime scenarios alongside
+these imports. Use independently derived expectations and small reference/state
+models; compare defined outcomes with native x86 where available and a pinned
+QEMU configuration as supporting evidence. Mask only architecturally undefined
+results under an explicit guest profile, and investigate disagreements rather
+than treating either emulator as authoritative. Keep test oracles separate from
+implementation helpers, and include deliberately corrupted outputs to check that
+the validators can detect violations.
+
+Combine controlled interleavings with seeded randomized schedules and stress.
+Retain seeds, traces, source/build/model pins and minimized failing cases under
+the durable raw root; rerunning until a failure disappears is not acceptance.
+Stress passing cannot prove absence of a forbidden outcome: review synchronization
+and lifetime arguments alongside model results and real generated-code execution.
+
+Exit with a contract-to-test matrix recording passed, failed, unimplemented and
+untested cells, tested N and configurations, reproducible defects, and independent
+review/replication of load-bearing claims. Fix correctness failures in the profile
+needed by the next increment; retain unrelated future obligations explicitly.
+Reaching the time/resource bound reports partial coverage and a next bounded
+slice, not a pass. No new global research gate or universal correctness claim is
+introduced by I4-V.
 
 ## N-vCPU design and scaling
 
@@ -355,6 +425,9 @@ continuation that cannot reenter stale code. Record its work/resource bound and
 stopping condition in INV-03-01 before execution. N=1 is the only currently
 admitted profile; additional participants must be implemented and tested before
 admission. Final generator selection and boot are not prerequisites to I4.
+Follow I4 with the [I4-V validation pass](#post-i4-integrated-validation), adapting
+existing tests and adding integrated adversarial cases while independent I5 work
+can proceed. This is planned work; no additional test coverage is claimed yet.
 
 For each increment record implemented behavior, passed/failed/untested checks,
 tested N, material interface changes, measurements with qualification, and the
