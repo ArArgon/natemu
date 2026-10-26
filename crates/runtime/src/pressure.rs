@@ -172,6 +172,7 @@ pub unsafe fn restore_native_fp() {
         asm!("msr fpcr, {0}","msr fpsr, {1}",in(reg)c,in(reg)s);
     }
 }
+#[inline(never)]
 pub unsafe fn completed() {
     unsafe {
         let f = read_record(&raw const (*shared()).captured);

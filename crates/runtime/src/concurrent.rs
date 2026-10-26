@@ -35,7 +35,7 @@ pub unsafe fn initialize() -> ! {
             || o.vcpu_id >= o.configured_vcpus
             || c.alias_profile > 2
             || (c.alias_profile != 0 && c.scenario != 5)
-            || c.stack_profile > 1
+            || c.stack_profile > 3
             || (c.stack_profile != 0 && (c.alias_profile == 0 || c.scenario != 5))
         {
             stop(REJECTED, 80);
@@ -117,6 +117,9 @@ pub unsafe fn initialize() -> ! {
 
 pub unsafe fn completed(fault: u64) -> ! {
     unsafe {
+        if ptr::read_volatile(&raw const (*round()).stage) == 4 {
+            stack::probe_finish(fault);
+        }
         if stack::enabled() {
             stack::advance(fault);
         }
@@ -258,11 +261,7 @@ unsafe fn remap_wait(id: u64) -> ! {
                     && c.completed.load(Ordering::Relaxed) == all
                     && (c.scenario < 3 || id == 0)
                 {
-                    ptr::write_volatile(
-                        (PRIVATE + natemu_abi::recovery::TABLE_OFFSET as u64 + 0x3000 + 256 * 8)
-                            as *mut u64,
-                        (DATA_VA + 4096) | 7,
-                    );
+                    aliases::set_leaf((DATA_VA + 4096) | 7);
                     asm!("dsb ish");
                     c.generation.store(2, Ordering::Relaxed);
                     if c.scenario >= 3 {
@@ -278,7 +277,7 @@ unsafe fn remap_wait(id: u64) -> ! {
                     && (id != c.participants - 1
                         || c.acknowledgements.load(Ordering::Relaxed) == all ^ bit)
                 {
-                    let address = natemu_abi::alias::data_address(c.alias_profile, id, 1);
+                    let address = aliases::data_address(id, 1);
                     let route =
                         recovery::walk(address, Access::Read).unwrap_or_else(|_| stop(PANIC, 98));
                     if route.gpa != DATA_VA + id * 256 + 4096 {

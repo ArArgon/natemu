@@ -149,7 +149,7 @@ impl Session {
         self.vm.run(0x4a)?;
         let s = self.vm.shared();
         let pc = self.vm.read_reg(31)?;
-        if s.service_pc < PRIVATE || s.service_pc >= PRIVATE + 0x10000 || pc != s.service_pc {
+        if !resident::contains(s.service_pc, 4) || pc != s.service_pc {
             return Err(format!(
                 "not at transfer service: PC={pc:#x} expected={:#x}",
                 s.service_pc

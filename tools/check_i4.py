@@ -16,6 +16,8 @@ import argparse
 import copy
 import json
 from pathlib import Path
+
+from check_i1 import resident_pc
 import sys
 
 from check_i1 import add_flags, check as check_instruction
@@ -87,7 +89,7 @@ def check(record, expected_vcpus=None, expected_delay=None, expected_profile=Non
         equal(uint(cell["memory_base"], 64, "memory_base"), DATA + cpu * 256, "participant data base")
         equal(uint(cell["object_pc"], 64, "object_pc"), CODE, "object_pc")
         capture = uint(cell["capture_pc"], 64, "capture_pc")
-        require(PRIVATE <= capture < PRIVATE + 0x10000 and capture % 4 == 0,
+        require(resident_pc(capture),
                 "capture target outside resident text")
         initial, bank, data = seed(cpu)
         actual = state(cell["initial"], "initial")

@@ -12,6 +12,8 @@ import copy
 import json
 from pathlib import Path
 
+from check_i1 import resident_pc
+
 PRIVATE = 0x0000800040000000
 CODE = PRIVATE + 0x30000
 DATA = 0x100000
@@ -190,7 +192,7 @@ def check_service(cell, scenario, rip):
     exact(cell["requests"], requested, "producer requests")
     service_pc = uint(cell["service_pc"], 64, "service_pc")
     if requested:
-        require(PRIVATE <= service_pc < PRIVATE + 0x10000 and service_pc % 4 == 0,
+        require(resident_pc(service_pc),
                 "service continuation outside resident text")
         request = [0x49345601, 1, nonce, 0, 1, 1, 1, rip, 64, 3, 0x038B48, 0, 0, 1, 0, 0]
         reply = list(request)
@@ -234,7 +236,7 @@ def check(cell):
     require(type(recovery) is dict, "recovery: expected object")
     capture = uint(recovery["capture_pc"], 64, "recovery.capture_pc")
     if faults:
-        require(PRIVATE <= capture < PRIVATE + 0x10000 and capture % 4 == 0,
+        require(resident_pc(capture),
                 "capture PC outside resident text")
     else:
         exact(capture, 0, "no native entry for pre-execution exception")

@@ -30,10 +30,13 @@ def main():
     parser.add_argument('--stack', action='store_true', help='also execute the stack/prefix and staged-reply slice')
     parser.add_argument('--aliases', action='store_true', help='also execute N=1..4 alias/remap/source composition')
     parser.add_argument('--concurrent-stack', action='store_true', help='also execute N=1..4 stack recovery/source/maintenance composition')
+    parser.add_argument('--mixed-aliases', action='store_true', help='also execute N=1..4 parent/leaf permission aliases and terminal fault probes')
     parser.add_argument('--focus', help='retain only one selected alias/stack concurrency cell for diagnosis')
     args = parser.parse_args()
     selected = [f'{family}-{region}-n{n}' for family,enabled in (('alias',args.aliases),('stack',args.concurrent_stack))
                 if enabled for region in ('low','high') for n in (1,2,3,4)]
+    if args.mixed_aliases:
+        selected += [f'stack-{kind}-{region}-n{n}' for kind in ('parent','leaf') for region in ('low','high') for n in (1,2,3,4)]
     if args.focus and args.focus not in selected:
         parser.error('--focus must name a concurrency cell enabled by --aliases or --concurrent-stack')
     if resource.getrlimit(resource.RLIMIT_CPU) != (resource.RLIM_INFINITY,) * 2:
@@ -48,6 +51,7 @@ def main():
                   stack_enabled=args.stack,
                   aliases_enabled=args.aliases,
                   concurrent_stack_enabled=args.concurrent_stack,
+                  mixed_aliases_enabled=args.mixed_aliases,
                   focus=args.focus,
                   limits=dict(build_jobs=2, build_rss_bytes=8*1024**3,
                               worker_rss_bytes=512*1024**2, cell_seconds=120,
@@ -250,11 +254,16 @@ def main():
                             raise ValueError('alias compilation does not use requested full RIP')
                         record['compilations'].append(dict(directory=str(directory.relative_to(run)), export=exported))
                     record['cells'].append(dict(name=label, producer=str(output.relative_to(run)), vcpus=n))
-        if args.concurrent_stack:
+        if args.concurrent_stack or args.mixed_aliases:
             sys.path.insert(0, str(source / 'tools'))
             concurrent_worker = module(source / 'tools/i4v_stack_worker.py', 'concurrent_stack_worker')
             sys.path.pop(0)
-            for profile, scenario, rip in ((1,'stack-low',0x102000), (2,'stack-high',0xffff800000102000)):
+            profiles = [(1,profile,'stack-'+region,rip) for profile,region,rip in
+                        ((1,'low',0x102000),(2,'high',0xffff800000102000))] if args.concurrent_stack else []
+            if args.mixed_aliases:
+                profiles += [(kind,profile,f'stack-{family}-{region}',rip) for kind,family in ((2,'parent'),(3,'leaf'))
+                             for profile,region,rip in ((1,'low',0x102000),(2,'high',0xffff800000102000))]
+            for kind, profile, scenario, rip in profiles:
                 for n in (1,2,3,4):
                     label = f'{scenario}-n{n}'
                     if args.focus and label != args.focus:
@@ -263,7 +272,7 @@ def main():
                     result = job(label, [host, runtime, 'i4', scenario, str(n), producer, output], oracle='concurrent-stack')
                     report = json.loads((result/'command.stdout').read_text())
                     if (report['profile'] != 'i4-'+scenario or report['alias_profile'] != profile
-                            or report['stack_profile'] != 1 or report['source_rip'] != rip
+                            or report['stack_profile'] != kind or report['source_rip'] != rip
                             or report['configured_vcpus'] != n or report['tested_vcpus'] != n
                             or report['delayed_owner_ms'] != 50):
                         raise ValueError('concurrent stack report differs from requested profile')

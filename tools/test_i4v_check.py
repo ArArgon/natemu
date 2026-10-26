@@ -12,7 +12,7 @@ def synthetic(scenario="cold", rip=oracle.HIGH + oracle.SOURCE, live=None, mutat
     rejected = mutation >= 0
     if rejected:
         completed, faults, walks, retries, vector, error = 0, 0, 1, 0, 0, 0
-    capture = oracle.PRIVATE + 0x1000 if faults else 0
+    capture = oracle.PRIVATE + 0xA0080 if faults else 0
     entered = oracle.native_seed(scenario) if rejected else oracle.entered_frame(scenario, capture)
     final = copy.deepcopy(entered) if faults else oracle.zero_frame()
     if completed:
@@ -63,7 +63,7 @@ def synthetic(scenario="cold", rip=oracle.HIGH + oracle.SOURCE, live=None, mutat
                 reply[mutation] ^= 1
         code = list(bytes.fromhex(oracle.BODY + "c0035fd6"))
         cell.update(live=live, vm_nonce=nonce, requests=requested, request=request, reply=reply,
-                    service_pc=oracle.PRIVATE + 0x1100 if requested else 0,
+                    service_pc=oracle.PRIVATE + 0xA0180 if requested else 0,
                     reply_mutation=mutation, code_before=[0] * 12 if live else code,
                     code_after=code if not live or (requested and not rejected) else [0] * 12)
     return cell
@@ -130,7 +130,7 @@ class I4VCheckTests(unittest.TestCase):
             ("wrong PF address", "load_np", change(["recovery", "guest_after", "control", 1], oracle.DATA)),
             ("PF instruction committed", "load_np", change(["recovery", "guest_after", "gpr", 0], 0xDDCCBBAA)),
             ("GP changed CR2", "private_operand", change(["recovery", "guest_after", "control", 1], oracle.PRIVATE)),
-            ("GP executed native", "private_operand", change(["recovery", "capture_pc"], oracle.PRIVATE + 0x1000)),
+            ("GP executed native", "private_operand", change(["recovery", "capture_pc"], oracle.PRIVATE + 0xA0080)),
             ("fetch failure did data walk", "fetch_nx", change(["recovery", "walks"], 2)),
             ("noncanonical RIP did table walk", "noncanonical_rip", change(["recovery", "walks"], 1)),
         ]

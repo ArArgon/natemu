@@ -24,8 +24,9 @@ pub unsafe fn validate(o: &Object, frame: &NativeFrame, pass: u64) -> Result<(),
             || frame.sp != STACK_TOP
             || frame.x[28] != BANK_VA
             || frame.reserved != 0
-            || frame.x[8] != sc::initial_rsp(o.vcpu_id as u64) - pass * 12
-            || frame.x[5] != sc::initial_rsp(o.vcpu_id as u64)
+            || frame.x[8]
+                != sc::initial_rsp_for(coordinator().stack_profile, o.vcpu_id as u64) - pass * 12
+            || frame.x[5] != sc::initial_rsp_for(coordinator().stack_profile, o.vcpu_id as u64)
         {
             return Err(170);
         }
@@ -65,7 +66,7 @@ unsafe fn enter_step() -> ! {
         let operand = sc::due(&frame, step);
         let width = p::WIDTHS[step];
         let id = (*s).object.vcpu_id as u64;
-        let start = sc::initial_rsp(id) - 0x80;
+        let start = sc::initial_rsp_for(coordinator().stack_profile, id) - 0x80;
         if !natemu_abi::paging::canonical_span(operand, width)
             || operand < start
             || operand + width > start + 256
@@ -179,5 +180,139 @@ pub unsafe fn fault_valid(esr: u64, far: u64, pc: u64, spsr: u64, old: bool) -> 
                 == natemu_abi::alias::source_rip(coordinator().alias_profile)
                     + p::GUEST_OFFSETS[step]
             && guest.gpr[4] == initial.x[8]
+    }
+}
+
+unsafe fn tables() -> [u64; 4] {
+    unsafe {
+        let base = PRIVATE + natemu_abi::recovery::TABLE_OFFSET as u64;
+        [0, 256 * 8, 0x3000 + 256 * 8, 0x3000 + 257 * 8]
+            .map(|offset| ptr::read_volatile((base + offset) as *const u64))
+    }
+}
+
+// Borrow/copy private records in place: the maintenance caller has a bounded,
+// large frame that must not also retain temporary guest/native snapshots.
+#[inline(never)]
+pub unsafe fn probe_start() -> ! {
+    unsafe {
+        let c = coordinator();
+        let s = shared();
+        let id = (*s).object.vcpu_id as u64;
+        let bit = 1 << id;
+        let p = &raw mut (*state()).probe;
+        let guest = natemu_abi::recovery::GUEST_VA as *mut GuestState;
+        {
+            let g = coordinator::lock(c);
+            if c.stack_profile < 2
+                || (*p).done != 0
+                || !source::eligible(2, CODE_NEXT)
+                || c.active.load(Ordering::Relaxed) & bit != 0
+                || c.new_references.load(Ordering::Relaxed) & bit != 0
+            {
+                stop(PANIC, 180);
+            }
+            let address = (*s).captured.x[8] - 8;
+            let route = recovery::walk(address, Access::Read).unwrap_or_else(|_| stop(PANIC, 181));
+            if !route.dirty || !route.writable {
+                stop(PANIC, 181);
+            }
+            aliases::install_pair(address, route);
+            write_record(&raw mut (*p).pair, aliases::leaves());
+            write_record(&raw mut (*p).tables_before, tables());
+            c.active.fetch_or(bit, Ordering::Relaxed);
+            c.new_references.fetch_or(bit, Ordering::Relaxed);
+            checked(g.trace(32, id));
+        }
+        copy_record(
+            (&raw mut (*p).guest_before).cast(),
+            guest.cast(),
+            size_of::<GuestState>(),
+        );
+        copy_record(
+            (&raw mut (*s).initial).cast(),
+            (&raw const (*s).captured).cast(),
+            size_of::<NativeFrame>(),
+        );
+        (*s).initial.x[8] = aliases::other((*s).initial.x[8]);
+        (*s).initial.x[16] = CODE_NEXT;
+        (*s).initial.x[30] = returned as *const () as u64;
+        copy_record(
+            (&raw mut (*p).initial).cast(),
+            (&raw const (*s).initial).cast(),
+            size_of::<NativeFrame>(),
+        );
+        materialize(&*(&raw const (*s).initial), 0);
+        (*round()).stage = 4;
+        enter(&raw const (*s).initial)
+    }
+}
+
+#[inline(never)]
+pub unsafe fn probe_finish(fault: u64) -> ! {
+    unsafe {
+        let c = coordinator();
+        let s = shared();
+        let id = (*s).object.vcpu_id as u64;
+        let bit = 1 << id;
+        let p = &raw mut (*state()).probe;
+        let (esr, far, pc, spsr): (u64, u64, u64, u64);
+        asm!("mrs {0}, ESR_EL1","mrs {1}, FAR_EL1","mrs {2}, ELR_EL1","mrs {3}, SPSR_EL1",
+            out(reg)esr,out(reg)far,out(reg)pc,out(reg)spsr);
+        if fault == 0
+            || c.stack_profile < 2
+            || (*p).done != 0
+            || esr >> 26 != 0x25
+            || esr & (1 << 6) == 0
+            || !matches!(esr & 63, 12..=15)
+            || far != (*p).initial.x[8] - 8
+            || pc != CODE_NEXT + 8
+            || spsr & 15 != 4
+            || (*s).captured.x[8] != (*p).initial.x[8]
+        {
+            stop(NATIVE_FAULT, 182);
+        }
+        let g = coordinator::lock(c);
+        if c.active.load(Ordering::Relaxed) & bit == 0
+            || c.new_references.load(Ordering::Relaxed) & bit == 0
+        {
+            stop(PANIC, 183);
+        }
+        if recovery::walk(far, Access::Write)
+            != Err(natemu_abi::paging::Fault::Page {
+                address: far,
+                error: 3,
+            })
+        {
+            stop(PANIC, 184);
+        }
+        let rip = natemu_abi::alias::source_rip(c.alias_profile);
+        recovery::guest_fault(far, 3, rip);
+        copy_record(
+            (&raw mut (*p).captured).cast(),
+            (&raw const (*s).captured).cast(),
+            size_of::<NativeFrame>(),
+        );
+        copy_record(
+            (&raw mut (*p).guest_after).cast(),
+            natemu_abi::recovery::GUEST_VA as *const u8,
+            size_of::<GuestState>(),
+        );
+        write_record(&raw mut (*p).tables_after, tables());
+        (*p).vector = 14;
+        (*p).error = 3;
+        (*p).address = far;
+        (*p).rip = rip;
+        (*p).esr = esr;
+        (*p).far = far;
+        (*p).pc = pc;
+        (*p).spsr = spsr;
+        (*p).done = 1;
+        c.active.fetch_and(!bit, Ordering::Relaxed);
+        c.new_references.fetch_and(!bit, Ordering::Relaxed);
+        checked(g.trace(33, id));
+        c.finished.fetch_or(bit, Ordering::Release);
+        drop(g);
+        stop(SUCCESS, 0)
     }
 }

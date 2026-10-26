@@ -12,6 +12,8 @@ import json
 import math
 from pathlib import Path
 
+from check_i1 import resident_pc
+
 import check_i4
 from check_i3_paging import guest_seed as base_guest_seed, copy_live
 from i4v_check import HIGH, IPA, PRIVATE, SOURCE, TCR, exact, require, uint
@@ -26,20 +28,20 @@ NEW_SOURCE = OLD_SOURCE[:7] + b"\x53" + OLD_SOURCE[8:]
 NEW_BODY = OLD_BODY[:12] + b"\x74" + OLD_BODY[13:]
 
 
-def span(cpu):
-    return (HIGH if cpu % 2 == 0 else 0) + DATA + cpu * 256
+def span(cpu, stack_profile=1):
+    return (HIGH if stack_profile == 1 and cpu % 2 == 0 else 0) + DATA + cpu * 256
 
 
-def seed(cpu):
+def seed(cpu, stack_profile=1):
     frame, bank, _ = check_i4.seed(cpu)
-    frame["x"][6] = span(cpu)
-    frame["x"][5] = frame["x"][8] = frame["x"][11] = span(cpu) + 0x80
+    frame["x"][6] = span(cpu, stack_profile)
+    frame["x"][5] = frame["x"][8] = frame["x"][11] = span(cpu, stack_profile) + 0x80
     return frame, bank, [0xA5] * 256
 
 
-def canonical_seed(cpu, rip):
+def canonical_seed(cpu, rip, stack_profile=1):
     guest = base_guest_seed("cold")
-    frame, _, _ = seed(cpu)
+    frame, _, _ = seed(cpu, stack_profile)
     copy_live(guest, frame)
     guest["gpr"][4] = frame["x"][8]
     guest["rip"] = rip
@@ -57,7 +59,7 @@ def code_image(replacement=False):
     return result
 
 
-def execute(initial, before, cpu, code, capture, replacement):
+def execute(initial, before, cpu, code, capture, replacement, stack_profile=1):
     """Return five complete native frames and memory using literal x86 effects."""
     frame, memory, prefixes = copy.deepcopy(initial), list(before), []
     require(len(memory) == 256, "one owned physical span required")
@@ -66,7 +68,7 @@ def execute(initial, before, cpu, code, capture, replacement):
         if step < 3:
             width = (8, 2, 2)[step]
             value = (0xFFFFFFFFBEBDBCBB, 0x5153 if replacement else 0x5152, 0x6162)[step]
-            offset = frame["x"][8] - width - span(cpu)
+            offset = frame["x"][8] - width - span(cpu, stack_profile)
             require(0 <= offset <= 256 - width, "stack write escapes owner span")
             memory[offset:offset + width] = value.to_bytes(width, "little")
             frame["x"][8] -= width
@@ -74,7 +76,7 @@ def execute(initial, before, cpu, code, capture, replacement):
         else:
             width, displacement, destination = (8, 8, 4) if step == 3 else (4, 12, 6)
             address = frame["x"][5] - displacement
-            offset = address - span(cpu)
+            offset = address - span(cpu, stack_profile)
             require(0 <= offset <= 256 - width, "stack load escapes owner span")
             frame["x"][20] = address
             frame["x"][destination] = int.from_bytes(bytes(memory[offset:offset + width]), "little")
@@ -93,8 +95,8 @@ def compact_prefixes(prefixes):
     return [[frame["x"][index] for index in (8, 4, 6, 20)] for frame in prefixes]
 
 
-def canonical_after(cpu, rip, frame, cleared=True):
-    guest = canonical_seed(cpu, rip)
+def canonical_after(cpu, rip, frame, cleared=True, stack_profile=1):
+    guest = canonical_seed(cpu, rip, stack_profile)
     for guest_reg, native_reg in ((0, 4), (3, 6), (4, 8)):
         guest["gpr"][guest_reg] = frame["x"][native_reg]
     guest["rip"] = rip + 20
@@ -109,6 +111,28 @@ def check_schedule(record, n, visit_interval):
     require(type(trace) is list and 0 < len(trace) <= 512, "bounded ownership trace")
     for word in trace:
         uint(word, 64, "trace event")
+    if record["stack_profile"] >= 2:
+        begin = next((i for i, word in enumerate(trace) if word >> 8 == 32), None)
+        require(begin is not None, "missing native denied-alias probes")
+        tail, trace = trace[begin:], trace[:begin]
+        require(len(tail) == 2 * n, "exactly one terminal probe per owner")
+        begun, active, completed = set(), set(), set()
+        for word in tail:
+            uint(word, 64, "probe trace event")
+            event, cpu = word >> 8, word & 255
+            require(cpu < n, "probe owner outside configured set")
+            if event == 32:
+                require(cpu not in begun, "duplicate terminal probe grant")
+                begun.add(cpu)
+                active.add(cpu)
+            elif event == 33:
+                require(cpu in active, "probe completion without retained grant")
+                active.remove(cpu)
+                completed.add(cpu)
+            else:
+                raise ValueError("pressure mutation after terminal probes began")
+        exact(completed, set(range(n)), "all native denied-alias probes completed")
+        require(not active, "terminal native probe grant remains live")
     start = next((i for i, word in enumerate(trace) if word >> 8 >= 23), None)
     require(start is not None, "missing ordinary execution under maintenance")
     check_i4.check_fault_trace(trace[:start], n, remap=True, compose=True, events=True)
@@ -220,13 +244,13 @@ def reply_packet(vm, rip, serial, chunk):
     return [0x49345612, *request[1:9], 52, *words, serial, chunk, len(part)]
 
 
-def check_program(cell, initial, before, cpu, replacement, capture):
+def check_program(cell, initial, before, cpu, replacement, capture, stack_profile=1):
     code = CODE_NEXT if replacement else CODE
-    prefixes, after = execute(initial, before, cpu, code, capture, replacement)
-    _, bank, _ = seed(cpu)
+    prefixes, after = execute(initial, before, cpu, code, capture, replacement, stack_profile)
+    _, bank, _ = seed(cpu, stack_profile)
     for field, expected in (("id", cpu), ("case", "fex_push_immediates64_changed" if replacement else "fex_push_immediates64"),
                             ("status", 1), ("initial", initial), ("captured", prefixes[-1]),
-                            ("memory_base", span(cpu)), ("memory_before", before), ("memory_after", after),
+                            ("memory_base", span(cpu, stack_profile)), ("memory_before", before), ("memory_after", after),
                             ("bank_before", bank), ("bank_after", bank), ("object_pc", code), ("capture_pc", capture)):
         exact(cell[field], expected, f"CPU{cpu} program." + field)
     if replacement:
@@ -250,7 +274,7 @@ def check_fault(fault, frame, address, pc, permission):
     exact(spsr & 0x3DF, 0x3C4, "masked EL1t")
 
 
-def check_events(record, n, rip, second_frames):
+def check_events(record, n, rip, second_frames, stack_profile=1):
     events = record["events"]
     require(type(events) is list and len(events) == n, "one event record per owner")
     seen = set()
@@ -268,7 +292,7 @@ def check_events(record, n, rip, second_frames):
             require(waits > 0, "compiler owner did not recheck pending events")
         exact(event["blocked"], [2 | 4 | 32 | 64, 8, 2 | 16 | 32 | 64, 0][cpu] | int(waits > 0),
               "exact event blockers")
-        expected = canonical_seed(cpu, rip) if initial else canonical_after(cpu, rip, second_frames[cpu])
+        expected = canonical_seed(cpu, rip, stack_profile) if initial else canonical_after(cpu, rip, second_frames[cpu], stack_profile=stack_profile)
         exact(event["packet"], expected, "canonical stack event packet")
 
 
@@ -276,6 +300,7 @@ def check_aliases(record, n):
     aliases = record["aliases"]
     require(type(aliases) is list and len(aliases) == n, "one root/alias snapshot per owner")
     profile = record["alias_profile"]
+    stack_profile = record["stack_profile"]
     pair = [[descriptor(0), descriptor(0)] for _ in range(n)]
     acknowledgements = [[] for _ in range(n)]
     total = 0
@@ -287,9 +312,11 @@ def check_aliases(record, n):
             pair[cpu] = [route, route]
             acknowledgements[cpu].append([epoch, route, route])
         elif event in (15, 31):
-            pair[cpu][int(cpu % 2 == 0)] = descriptor(1 if event == 15 else int(total % 2 == 0), False)
+            pair[cpu][int(stack_profile == 1 and cpu % 2 == 0)] = descriptor(1 if event == 15 else int(total % 2 == 0), False)
         elif event == 27:
             total += 1
+        elif event == 32:
+            pair[cpu] = [descriptor(int(total % 2 == 0), False), descriptor(int(total % 2 == 0))]
     seen = set()
     for a in aliases:
         cpu = uint(a["id"], 32, "alias owner")
@@ -301,19 +328,19 @@ def check_aliases(record, n):
         root, l1, l2, lower, upper = ([0] * 512 for _ in range(5))
         base = IPA + cpu * 0x100000
         root[256], l1[0], l2[0] = [base + offset + 3 for offset in (0x18000, 0x19000, 0x1A000)]
-        lower[256], upper[256] = pair[cpu]
+        lower[256], upper[257 if stack_profile == 3 else 256] = pair[cpu]
         writer = cpu == 0
         if writer:
-            (upper if profile == 1 else lower)[258] = descriptor(2, False)
+            (upper if profile == 1 and stack_profile != 2 else lower)[258] = descriptor(2, False)
         acks = acknowledgements[cpu]
         exact(len(acks), 1 + 9 * n, "all paired-route acknowledgements")
         warm = [0, 0]
-        warm[0 if cpu % 2 == 0 else 1] = descriptor(0)
+        warm[0 if stack_profile == 1 and cpu % 2 == 0 else 1] = descriptor(0)
         expected = {"id": cpu, "current_el": 4, "tcr": TCR, "ttbr1": base + 0x17000,
                     "warm": warm, "ack_count": len(acks),
                     "acks": acks + [[0] * 3 for _ in range(37 - len(acks))],
                     "wrong_rip_rejections": 0, "blank_before_publish": 0,
-                    "source_address": SOURCE + (HIGH if profile == 1 else 0) if writer else 0,
+                    "source_address": SOURCE + (HIGH if profile == 1 and stack_profile != 2 else 0) if writer else 0,
                     "source_gpa": SOURCE if writer else 0,
                     "source_leaf_before": SOURCE | 0x27 if writer else 0,
                     "source_leaf_after": SOURCE | 0x67 if writer else 0,
@@ -322,6 +349,49 @@ def check_aliases(record, n):
                     "upper_root": root, "upper_l1": l1, "upper_l2": l2,
                     "upper_leaf": upper, "lower_leaf": lower}
         exact({k: v for k, v in a.items() if k not in ("sctlr", "actlr")}, expected, "stack alias mappings")
+
+
+def zeros(value):
+    """Zero-valued ABI transport, preserving every field and array dimension."""
+    if isinstance(value, dict):
+        return {key: zeros(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [zeros(item) for item in value]
+    return 0
+
+
+def probe_expectation(cpu, rip, frame, stack_profile, page, capture):
+    # Explicit fixture rebinding precedes the actual instruction. The failed
+    # PUSH may materialize its scratch immediate, but cannot commit guest RSP.
+    initial = copy.deepcopy(frame)
+    initial["x"][8] += HIGH + (4096 if stack_profile == 3 else 0)
+    initial["x"][16], initial["x"][30] = CODE_NEXT, capture
+    captured = copy.deepcopy(initial)
+    captured["x"][20] = 0xFFFFFFFFBEBDBCBB
+    before = canonical_after(cpu, rip, frame, stack_profile=stack_profile)
+    after = copy.deepcopy(before)
+    after["gpr"][4], after["rip"] = initial["x"][8], rip
+    address = initial["x"][8] - 8
+    after["control"][1] = address
+    gpa = DATA + page * 4096
+    tables = [0x2027, 0x2025 if stack_profile == 2 else 0x2027, gpa | 0x67,
+              gpa | 0x25 if stack_profile == 3 else (DATA + 4096) | 7]
+    return {"initial": initial, "captured": captured, "guest_before": before, "guest_after": after,
+            "pair": [descriptor(page, False), descriptor(page)], "tables_before": tables,
+            "tables_after": list(tables), "vector": 14, "error": 3, "address": address,
+            "rip": rip, "far": address, "pc": CODE_NEXT + 8, "done": 1}
+
+
+def check_probe(probe, cpu, rip, frame, stack_profile, page, capture):
+    expected = probe_expectation(cpu, rip, frame, stack_profile, page, capture)
+    if stack_profile == 1:
+        expected.update(esr=0, spsr=0)
+        exact(probe, zeros(expected), "unused permission probe must remain zero")
+        return
+    exact({k: v for k, v in probe.items() if k not in ("esr", "spsr")}, expected,
+          "denied alias PUSH preserves every committed prefix and memory effect")
+    check_fault({"frame": probe["captured"], **{k: probe[k] for k in ("esr", "spsr", "far", "pc")}},
+                expected["captured"], expected["address"], CODE_NEXT + 8, permission=True)
 
 
 def owners(items, n, label):
@@ -334,7 +404,7 @@ def owners(items, n, label):
     return result
 
 
-def check(record, expected_vcpus=None, expected_alias_profile=None):
+def check(record, expected_vcpus=None, expected_alias_profile=None, expected_stack_profile=None):
     require(type(record) is dict, "expected concurrent stack report")
     n = uint(record["configured_vcpus"], 32, "configured_vcpus")
     require(1 <= n <= 4, "finite participant range is1..4")
@@ -344,9 +414,14 @@ def check(record, expected_vcpus=None, expected_alias_profile=None):
         exact(n, expected_vcpus, "requested participant count")
     if expected_alias_profile is not None:
         exact(profile, expected_alias_profile, "requested source regime")
+    stack_profile = uint(record["stack_profile"], 32, "stack_profile")
+    require(stack_profile in (1, 2, 3), "known stack permission profile")
+    if expected_stack_profile is not None:
+        exact(stack_profile, expected_stack_profile, "requested stack permission profile")
+    name = {1: "stack", 2: "stack-parent", 3: "stack-leaf"}[stack_profile]
     rip = SOURCE + (HIGH if profile == 2 else 0)
-    for field, expected in (("profile", "i4-stack-low" if profile == 1 else "i4-stack-high"),
-                            ("stack_profile", 1), ("source_rip", rip), ("tested_vcpus", n),
+    for field, expected in (("profile", "i4-" + name + ("-low" if profile == 1 else "-high")),
+                            ("stack_profile", stack_profile), ("source_rip", rip), ("tested_vcpus", n),
                             ("delayed_owner_ms", 50), ("ready", (1 << n) - 1),
                             ("finished", (1 << n) - 1), ("retained", 0)):
         exact(record[field], expected, field)
@@ -356,11 +431,11 @@ def check(record, expected_vcpus=None, expected_alias_profile=None):
     stacks = owners(record["stacks"], n, "stack records")
     frames, second_frames, programs, memory, captures = {}, {}, {}, {}, {}
     for cpu in range(n):
-        initial, _, before = seed(cpu)
+        initial, _, before = seed(cpu, stack_profile)
         capture = uint(old[cpu]["capture_pc"], 64, "capture PC")
-        require(PRIVATE <= capture < PRIVATE + 0x10000 and capture % 4 == 0, "capture outside resident text")
+        require(resident_pc(capture), "capture outside resident text")
         captures[cpu] = capture
-        prefixes, after = check_program(old[cpu], initial, before, cpu, False, capture)
+        prefixes, after = check_program(old[cpu], initial, before, cpu, False, capture, stack_profile)
         exact(faults[cpu]["faults"], 1, "one queued second-push fault")
         exact(faults[cpu]["old_gpa"], DATA + cpu * 256, "retained old physical span")
         check_fault(faults[cpu], precommit(initial, prefixes, 1, CODE, capture, False),
@@ -369,7 +444,7 @@ def check(record, expected_vcpus=None, expected_alias_profile=None):
         programs[cpu] = [{"entries": 31, "completed": 31, "prefixes": compact_prefixes(prefixes)}]
         next_initial = copy.deepcopy(prefixes[-1])
         next_initial["x"][16] = CODE_NEXT
-        prefixes, after = check_program(new[cpu], next_initial, before, cpu, True, capture)
+        prefixes, after = check_program(new[cpu], next_initial, before, cpu, True, capture, stack_profile)
         memory[(1, cpu)] = after
         programs[cpu].append({"entries": 31, "completed": 31, "prefixes": compact_prefixes(prefixes)})
         frames[cpu] = copy.deepcopy(prefixes[-1])
@@ -379,13 +454,13 @@ def check(record, expected_vcpus=None, expected_alias_profile=None):
         exact(cell["gpa"], DATA + page * 4096 + cpu * 256, "ordinary physical route")
         initial = copy.deepcopy(frames[cpu])
         initial["x"][16] = CODE_NEXT
-        prefixes, after = check_program(cell, initial, memory[(page, cpu)], cpu, True, captures[cpu])
+        prefixes, after = check_program(cell, initial, memory[(page, cpu)], cpu, True, captures[cpu], stack_profile)
         memory[(page, cpu)], frames[cpu] = after, copy.deepcopy(prefixes[-1])
         exact(len(programs[cpu]), index + 2, "continuous per-owner program sequence")
         programs[cpu].append({"entries": 31, "completed": 31, "prefixes": compact_prefixes(prefixes)})
 
     counts = check_schedule(record, n, ordinary)
-    check_events(record, n, rip, second_frames)
+    check_events(record, n, rip, second_frames, stack_profile)
     check_aliases(record, n)
     exact(record["coherence"], {"generation": 2, "acknowledgements": (1 << n) - 1,
                                "active": 0, "new_entries": (1 << n) - 1, "new_completed": (1 << n) - 1,
@@ -415,9 +490,15 @@ def check(record, expected_vcpus=None, expected_alias_profile=None):
                     "wrong_owner_rejections": int(compiler), "blank_before_publish": int(compiler),
                     "source_before": list(OLD_SOURCE) if compiler else [0] * 20,
                     "source_after": list(NEW_SOURCE) if compiler else [0] * 20,
-                    "guest_before": canonical_seed(cpu, rip), "guest_after": canonical_after(cpu, rip, frames[cpu])}
-        exact(stacks[cpu], expected, f"CPU{cpu} precise stack progress and publication evidence")
-        exact(frames[cpu]["x"][8], span(cpu) + 128 - 12 * len(programs[cpu]), "continuous RSP across every remap")
+                    "guest_before": canonical_seed(cpu, rip, stack_profile), "guest_after": canonical_after(cpu, rip, frames[cpu], stack_profile=stack_profile)}
+        if stack_profile >= 2:
+            expected["guest_after"] = probe_expectation(cpu, rip, frames[cpu], stack_profile,
+                int(record["maintenance"]["total"] % 2 == 0), captures[cpu])["guest_after"]
+        exact({k: v for k, v in stacks[cpu].items() if k != "probe"}, expected, f"CPU{cpu} precise stack progress and publication evidence")
+        if stack_profile >= 2 or "probe" in stacks[cpu]:
+            check_probe(stacks[cpu]["probe"], cpu, rip, frames[cpu], stack_profile,
+                        int(record["maintenance"]["total"] % 2 == 0), captures[cpu])
+        exact(frames[cpu]["x"][8], span(cpu, stack_profile) + 128 - 12 * len(programs[cpu]), "continuous RSP across every remap")
     physical = [0xA5] * 8192
     for (page, cpu), contents in memory.items():
         offset = page * 4096 + cpu * 256
@@ -430,11 +511,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("paths", nargs="+", type=Path)
     parser.add_argument("--vcpus", type=int)
+    parser.add_argument("--stack-profile", type=int, choices=(1, 2, 3))
     parser.add_argument("--alias-profile", type=int, choices=(1, 2))
     args = parser.parse_args()
     for path in args.paths:
         try:
-            check(json.loads(path.read_text()), args.vcpus, args.alias_profile)
+            check(json.loads(path.read_text()), args.vcpus, args.alias_profile, args.stack_profile)
         except (OSError, KeyError, TypeError, ValueError) as error:
             raise SystemExit(f"{path}: FAIL: {error}") from error
         print(f"{path}: PASS (finite N-vCPU stack pressure only)")

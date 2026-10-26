@@ -534,11 +534,15 @@ review and a fresh87-job rebuild including all I1–I3 regressions. The
 records exact evidence and unsupported behavior. Keep legacy I1–I3 N=1 profiles
 separate; arbitrary concurrent guest code and the full ABI remain unestablished.
 
-Next is the [I4-V validation pass](#post-i4-integrated-validation): begin with
-the kernel-address, paging-off and mode-transition slices and their concurrent
-schedules. Select execution bounds, adapt existing tests and add integrated
-adversarial cases. Independent I5 preparation can proceed. I4-V is planned work; its additional
-test coverage has not yet been collected.
+The [I4-V validation pass](#post-i4-integrated-validation) is underway. Finite V1
+load, stack-prefix and shared/mixed-permission alias checkpoints have independent
+acceptance; [INV-03-01](research/investigations/INV-03-01.md#i4-v-active-development--first-v1-slice-october-25-2026)
+records their exact coverage and remaining work. Complete the remaining V1
+address/permission/boundary cases, V2 paging-off execution and V3 mode transitions,
+including each slice's N-vCPU schedules, then the broader integrated campaign.
+Declare execution bounds, adapt existing tests and add missing adversarial cases
+as each slice is built. Independent I5 preparation can proceed. Accepted finite
+checkpoints do not complete V1 or I4-V; unfinished cells remain explicit.
 
 For each increment record implemented behavior, passed/failed/untested checks,
 tested N, material interface changes, measurements with qualification, and the

@@ -30,6 +30,18 @@ MASK64 = (1 << 64) - 1
 NZCV_MASK = 0xF0000000
 
 
+def resident_pc(pc):
+    """Aligned instruction in the boot page or reserved resident text only.
+
+    Private ABI records, generated code and stacks occupy the gap. Keeping the
+    two executable extents explicit prevents a private data pointer passing as
+    a capture/helper/compiler continuation after resident-text relocation.
+    """
+    base = 0x0000800040000000
+    return (type(pc) is int and pc % 4 == 0 and
+            (base <= pc < base + 0x1000 or base + 0xA0000 <= pc < base + 0xE0000))
+
+
 def require(condition, message):
     if not condition:
         raise ValueError(message)
@@ -154,6 +166,13 @@ def check(cell):
 
 
 def self_test():
+    base = 0x0000800040000000
+    for offset in (0, 0x80, 0xFFC, 0xA0000, 0xA0080, 0xDFFFC):
+        require(resident_pc(base + offset), "resident executable boundary rejected")
+    for offset in (-4, 1, 0xFFF, 0x1000, 0x10000, 0x30000, 0x31000,
+                   0x54000, 0x90000, 0x9FFFC, 0xA0001, 0xE0000, 0xFFFFC):
+        require(not resident_pc(base + offset), "non-text/unaligned resident pointer accepted")
+    require(not resident_pc(True), "boolean resident pointer accepted")
     initial = {
         "x": [0x1020304050607000 + i for i in range(31)],
         "q": [[(r * 17 + b * 13) % 256 for b in range(16)] for r in range(32)],

@@ -11,7 +11,7 @@ def synthetic(scenario="cold", rip=oracle.HIGH + oracle.SOURCE, mutation=-1):
     vector, error = expected["vector"], expected["error"]
     due, requested, rejected = expected["due"], expected["requested"], expected["rejected"]
     nonce = 0x123456789ABCDEF
-    capture = oracle.PRIVATE + 0x1000 if any(expected["entries"]) else 0
+    capture = oracle.PRIVATE + 0xA0080 if any(expected["entries"]) else 0
     prefixes = oracle.native_prefixes(scenario, capture)
     entered, final = oracle.native_seed(scenario), oracle.zero_frame()
     if any(expected["entries"]):
@@ -46,7 +46,7 @@ def synthetic(scenario="cold", rip=oracle.HIGH + oracle.SOURCE, mutation=-1):
     return {
         "case": "fex_push_immediates64", "scenario": scenario, "rip": rip,
         "live": 1, "requests": requested, "request": list(requests[0]), "reply": list(replies[0]),
-        "vm_nonce": nonce, "service_pc": oracle.PRIVATE + 0x1100 if requested else 0,
+        "vm_nonce": nonce, "service_pc": oracle.PRIVATE + 0xA0180 if requested else 0,
         "reply_mutation": mutation, "code_before": [0] * 320,
         "code_after": oracle.code_image() if requested and not rejected else [0] * 320,
         "body_hex": oracle.BODY.hex(), "initial": oracle.native_seed(scenario),
@@ -115,7 +115,7 @@ class StackOracleTests(unittest.TestCase):
 
     def test_precise_fault_native_writeback_and_scratch(self):
         for step, scratch, decrement in ((0, 0xFFFFFFFFBEBDBCBB, 0), (1, 0x5152, 8), (2, 0x6162, 10)):
-            frame = oracle.native_fault("cold", step, oracle.PRIVATE + 0x1000)
+            frame = oracle.native_fault("cold", step, oracle.PRIVATE + 0xA0080)
             self.assertEqual(frame["x"][8], oracle.stack_top("cold") - decrement)
             self.assertEqual(frame["x"][20], scratch)
             self.assertNotEqual(frame["x"][8], oracle.address("cold", step))

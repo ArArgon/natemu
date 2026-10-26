@@ -5,17 +5,37 @@ use natemu_abi::{alias as profile, paging::Translation, recovery as r, shadow};
 fn record() -> *mut profile::Record {
     (PRIVATE + profile::OFFSET as u64) as *mut profile::Record
 }
-unsafe fn leaves() -> [u64; 2] {
+pub unsafe fn leaves() -> [u64; 2] {
     unsafe {
         [
             ptr::read_volatile(
                 (PRIVATE + shadow::leaf_offset(DATA_VA).unwrap() as u64) as *const u64,
             ),
             ptr::read_volatile(
-                (PRIVATE + shadow::leaf_offset(shadow::HIGH_BASE + DATA_VA).unwrap() as u64)
-                    as *const u64,
+                (PRIVATE + shadow::leaf_offset(other(DATA_VA)).unwrap() as u64) as *const u64,
             ),
         ]
+    }
+}
+pub fn data_address(id: u64, pass: u64) -> u64 {
+    if coordinator().stack_profile >= 2 {
+        DATA_VA + id * 256
+    } else {
+        profile::data_address(coordinator().alias_profile, id, pass)
+    }
+}
+pub fn other(address: u64) -> u64 {
+    natemu_abi::stack_concurrent::other_alias(coordinator().stack_profile, address)
+        .unwrap_or_else(|| stop(PANIC, 152))
+}
+// Caller holds mutation authority; the two leaf entries are one physical alias.
+pub unsafe fn set_leaf(value: u64) {
+    unsafe {
+        let base = PRIVATE + r::TABLE_OFFSET as u64 + 0x3000;
+        ptr::write_volatile((base + 256 * 8) as *mut u64, value);
+        if coordinator().stack_profile == 3 {
+            ptr::write_volatile((base + 257 * 8) as *mut u64, value & !2);
+        }
     }
 }
 pub fn validate(object: &Object, frame: &NativeFrame, code: &[u8], pass: u64) -> Result<(), u64> {
@@ -49,22 +69,31 @@ pub unsafe fn prepare(id: u64, route: Translation) {
         }
         ptr::write_volatile(&raw mut (*record()).ttbr1, ttbr1);
         recovery::clear_mapping(DATA_VA);
-        recovery::clear_mapping(shadow::HIGH_BASE + DATA_VA);
-        let address = profile::data_address(coordinator().alias_profile, id, 0);
-        recovery::install(profile::other_address(address).unwrap(), route);
+        recovery::clear_mapping(other(DATA_VA));
+        let address = data_address(id, 0);
+        let alternate = other(address);
+        let alternate_route =
+            recovery::walk(alternate, Access::Read).unwrap_or_else(|_| stop(PANIC, 152));
+        if alternate_route.gpa != route.gpa {
+            stop(PANIC, 152);
+        }
+        recovery::install(alternate, alternate_route);
         write_record(&raw mut (*record()).warm, leaves());
     }
 }
+#[inline(never)]
 pub unsafe fn install_pair(address: u64, route: Translation) {
     unsafe {
-        // shortcut: fixture aliases share every guest permission; walk each alias
-        // separately when admitting distinct parent or leaf permissions.
         recovery::install(address, route);
         if coordinator().alias_profile != 0 {
-            recovery::install(
-                profile::other_address(address).unwrap_or_else(|| stop(PANIC, 152)),
-                route,
-            );
+            let alternate = other(address);
+            // Physical identity does not confer the other alias's permissions.
+            let alternate_route =
+                recovery::walk(alternate, Access::Read).unwrap_or_else(|_| stop(PANIC, 152));
+            if alternate_route.gpa != route.gpa {
+                stop(PANIC, 152);
+            }
+            recovery::install(alternate, alternate_route);
         }
     }
 }
@@ -91,7 +120,7 @@ pub unsafe fn rewrite_source(source: &[u8]) {
             stop(PANIC, 154)
         }
         let address = natemu_abi::translation::SOURCE_VA
-            + if c.alias_profile == 2 {
+            + if c.alias_profile == 2 || c.stack_profile == 2 {
                 0
             } else {
                 shadow::HIGH_BASE

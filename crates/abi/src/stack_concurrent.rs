@@ -3,7 +3,48 @@ use crate::{NativeFrame, stack, validation::Packet};
 pub const OFFSET: usize = 0x23000;
 pub const MAX_PROGRAMS: usize = 6;
 pub fn initial_rsp(id: u64) -> u64 {
-    crate::alias::data_address(1, id, 0) + 0x80
+    initial_rsp_for(1, id)
+}
+pub fn initial_rsp_for(profile: u64, id: u64) -> u64 {
+    (if profile >= 2 {
+        crate::DATA_VA + id * 256
+    } else {
+        crate::alias::data_address(1, id, 0)
+    }) + 0x80
+}
+pub fn other_alias(profile: u64, address: u64) -> Option<u64> {
+    if profile < 2 {
+        return crate::alias::other_address(address);
+    }
+    if !(crate::DATA_VA..crate::DATA_VA + 4096).contains(&address) {
+        return None;
+    }
+    Some(address + crate::shadow::HIGH_BASE + if profile == 3 { 4096 } else { 0 })
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Probe {
+    pub initial: NativeFrame,
+    pub captured: NativeFrame,
+    pub guest_before: crate::recovery::GuestState,
+    pub guest_after: crate::recovery::GuestState,
+    pub pair: [u64; 2],
+    // Low/upper PML4, low leaf256, companion leaf257.
+    pub tables_before: [u64; 4],
+    pub tables_after: [u64; 4],
+    pub vector: u64,
+    pub error: u64,
+    pub address: u64,
+    pub rip: u64,
+    pub esr: u64,
+    pub far: u64,
+    pub pc: u64,
+    pub spsr: u64,
+    pub done: u64,
+}
+impl Probe {
+    // Every field is an integer transport value; zero denotes an unused probe.
+    pub const ZERO: Self = unsafe { core::mem::zeroed() };
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -35,6 +76,7 @@ pub struct State {
     pub blank_before_publish: u64,
     pub source_before: [u8; 20],
     pub source_after: [u8; 20],
+    pub probe: Probe,
 }
 impl State {
     pub const ZERO: Self = Self {
@@ -50,6 +92,7 @@ impl State {
         blank_before_publish: 0,
         source_before: [0; 20],
         source_after: [0; 20],
+        probe: Probe::ZERO,
     };
 }
 pub fn due(frame: &NativeFrame, step: usize) -> u64 {

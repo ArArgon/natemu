@@ -39,6 +39,7 @@ pub mod maintenance;
 pub mod paging;
 pub mod pressure;
 pub mod recovery;
+pub mod resident;
 pub mod shadow;
 pub mod stack;
 pub mod stack_concurrent;

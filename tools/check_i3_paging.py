@@ -20,6 +20,8 @@ import argparse
 import copy
 import json
 from pathlib import Path
+
+from check_i1 import resident_pc
 import sys
 
 from check_i1 import add_flags, check as check_execution, require, uint
@@ -210,7 +212,7 @@ def check(cell):
     require(type(p) is dict, "paging: expected object")
     pc = uint(p["capture_pc"], 64, "paging.capture_pc")
     if faults:
-        require(PRIVATE <= pc < PRIVATE + 0x10000 and pc % 4 == 0,
+        require(resident_pc(pc),
                 "capture target outside resident text")
     else:
         exact(pc, 0, "no native entry before fetch fault")
@@ -276,7 +278,7 @@ def check(cell):
 def synthetic(scenario):
     """Build valid oracle inputs; corruption tests below challenge each boundary."""
     completed, faults, walks, retries, error, offset = CASES[scenario]
-    pc = PRIVATE + 0x1000 if faults else 0
+    pc = PRIVATE + 0xA0080 if faults else 0
     vm = 0x123456789ABCDEF
     rows, requests = events(scenario, vm)
     before, after = tables(scenario)

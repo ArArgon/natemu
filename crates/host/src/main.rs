@@ -256,9 +256,8 @@ fn load_elf(memory: &Memory, data: &[u8]) -> Result<()> {
         let memsz = u64_at(header, 40)?;
         let end = va.checked_add(memsz).ok_or("ELF address overflow")?;
         let fileend = file.checked_add(filesz).ok_or("ELF file overflow")?;
-        if memsz == 0
-            || va < PRIVATE
-            || end > PRIVATE + 0x10000
+        if u32::from_le_bytes(header[4..8].try_into().unwrap()) != 5
+            || !resident::contains(va, memsz)
             || filesz > memsz
             || fileend > data.len() as u64
         {
@@ -297,7 +296,7 @@ fn page_tables(memory: &Memory) {
     memory.word(0x13000, table(0x14000));
     // Private aliases cover only declared text, tables, state and stacks.
     for offset in (0..RAM_SIZE).step_by(4096) {
-        let text = offset < 0x10000 || offset == CODE_OFFSET;
+        let text = resident::executable_offset(offset) || offset == CODE_OFFSET;
         let writable = (0x10000..0x17000).contains(&offset)
             || (SHARED_OFFSET..SHARED_OFFSET + 0x8000).contains(&offset)
             || (BANK_OFFSET..BANK_OFFSET + 0x2000).contains(&offset)
@@ -528,6 +527,98 @@ mod tests {
             assert!(load_elf(&memory, &vec![0; length]).is_err());
         }
     }
+    fn resident_elf(segments: &[(u64, u64)]) -> Vec<u8> {
+        let payload = 64 + segments.len() * 56;
+        let mut data = vec![0; payload + segments.len() * 4];
+        data[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        data[16..18].copy_from_slice(&2u16.to_le_bytes());
+        data[18..20].copy_from_slice(&183u16.to_le_bytes());
+        data[24..32].copy_from_slice(&PRIVATE.to_le_bytes());
+        data[32..40].copy_from_slice(&64u64.to_le_bytes());
+        data[54..56].copy_from_slice(&56u16.to_le_bytes());
+        data[56..58].copy_from_slice(&(segments.len() as u16).to_le_bytes());
+        for (i, &(address, size)) in segments.iter().enumerate() {
+            let at = 64 + i * 56;
+            data[at..at + 4].copy_from_slice(&1u32.to_le_bytes());
+            data[at + 4..at + 8].copy_from_slice(&5u32.to_le_bytes());
+            data[at + 8..at + 16].copy_from_slice(&((payload + i * 4) as u64).to_le_bytes());
+            data[at + 16..at + 24].copy_from_slice(&address.to_le_bytes());
+            data[at + 32..at + 40].copy_from_slice(&4u64.to_le_bytes());
+            data[at + 40..at + 48].copy_from_slice(&size.to_le_bytes());
+            data[payload + i * 4..payload + i * 4 + 4].fill(0x40 + i as u8);
+        }
+        data
+    }
+
+    #[test]
+    fn resident_elf_loads_boot_and_extended_text() {
+        let memory = Memory::new().unwrap();
+        let data = resident_elf(&[
+            (PRIVATE, resident::BOOT_END as u64),
+            (
+                PRIVATE + resident::TEXT_OFFSET as u64,
+                (resident::TEXT_END - resident::TEXT_OFFSET) as u64,
+            ),
+        ]);
+        load_elf(&memory, &data).unwrap();
+        assert_eq!(memory.read::<4>(0), [0x40; 4]);
+        assert_eq!(memory.read::<4>(resident::TEXT_OFFSET), [0x41; 4]);
+        assert_eq!(memory.read::<4>(resident::BOOT_END), [0; 4]);
+        assert_eq!(memory.read::<4>(resident::TEXT_END - 4), [0; 4]);
+    }
+
+    #[test]
+    fn resident_elf_rejects_gaps_private_tables_and_overflow() {
+        for (address, size) in [
+            (PRIVATE, resident::BOOT_END as u64 + 1),
+            (PRIVATE + resident::BOOT_END as u64, 4),
+            (PRIVATE + 0x10000, 4096),
+            (PRIVATE + resident::TEXT_OFFSET as u64 - 4, 8),
+            (PRIVATE + resident::TEXT_END as u64 - 4, 8),
+            (PRIVATE + resident::TEXT_END as u64, 4),
+            (u64::MAX - 3, 8),
+            (PRIVATE + resident::TEXT_OFFSET as u64, 0),
+        ] {
+            let memory = Memory::new().unwrap();
+            let data = resident_elf(&[(PRIVATE, 4), (address, size)]);
+            assert!(
+                load_elf(&memory, &data).is_err(),
+                "admitted {address:#x}+{size:#x}"
+            );
+        }
+        let memory = Memory::new().unwrap();
+        assert!(
+            load_elf(
+                &memory,
+                &resident_elf(&[(PRIVATE + resident::TEXT_OFFSET as u64, 4)])
+            )
+            .is_err()
+        );
+        assert!(load_elf(&memory, &resident_elf(&[(PRIVATE, 8), (PRIVATE + 4, 4)])).is_err());
+        for flags in [0u32, 4, 6, 7] {
+            let mut data = resident_elf(&[(PRIVATE, 4)]);
+            data[64 + 4..64 + 8].copy_from_slice(&flags.to_le_bytes());
+            assert!(load_elf(&memory, &data).is_err());
+        }
+    }
+
+    #[test]
+    fn private_resident_mapping_has_no_executable_gap() {
+        let memory = Memory::new().unwrap();
+        page_tables(&memory);
+        let leaf = |offset| u64::from_le_bytes(memory.read::<8>(0x14000 + offset / 4096 * 8));
+        for offset in (0..RAM_SIZE).step_by(4096) {
+            let pte = leaf(offset);
+            if resident::executable_offset(offset) {
+                assert_eq!(pte, (IPA + offset as u64) | 3 | 1 << 10 | 3 << 8 | 1 << 7);
+            } else if (resident::BOOT_END..0x10000).contains(&offset) {
+                assert_eq!(pte, 0);
+            } else if pte != 0 && offset != CODE_OFFSET {
+                assert_eq!(pte & (3 << 53), 3 << 53);
+            }
+        }
+    }
+
     #[test]
     fn ffi_layout_matches_sdk() {
         assert_eq!(size_of::<HvExit>(), 32);

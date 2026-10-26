@@ -12,6 +12,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+from check_i1 import resident_pc
+
 from i4v_check import CODE, DATA, HIGH, IPA, PRIVATE, SOURCE, TCR, exact, require, uint, zero_frame
 from i4v_check import guest_seed as load_guest_seed, native_seed as load_native_seed
 
@@ -257,7 +259,7 @@ def check(cell):
     require(nonce != 0, "zero stack VM nonce")
     service_pc = uint(cell["service_pc"], 64, "service_pc")
     if requested:
-        require(PRIVATE <= service_pc < PRIVATE + 0x10000 and service_pc % 4 == 0,
+        require(resident_pc(service_pc),
                 "service continuation outside resident text")
     else:
         exact(service_pc, 0, "no compile before source/first-stack fault")
@@ -268,7 +270,7 @@ def check(cell):
     recovery = cell["recovery"]
     capture = uint(recovery["capture_pc"], 64, "capture_pc")
     if any(outcome["entries"]):
-        require(PRIVATE <= capture < PRIVATE + 0x10000 and capture % 4 == 0,
+        require(resident_pc(capture),
                 "capture outside resident text")
     else:
         exact(capture, 0, "no native entry")

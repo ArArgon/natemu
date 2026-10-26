@@ -265,7 +265,7 @@ pub fn run(args: &[String]) -> Result<()> {
             return Err(format!("unexpected stack transfer event {event:#x}"));
         }
         let resident = vm.shared();
-        if !(PRIVATE..PRIVATE + 0x10000).contains(&resident.service_pc)
+        if !natemu_abi::resident::contains(resident.service_pc, 4)
             || vm.read_reg(31)? != resident.service_pc
         {
             return Err("stack request outside service boundary".into());

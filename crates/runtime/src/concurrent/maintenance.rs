@@ -101,7 +101,7 @@ unsafe fn drive(id: u64) -> ! {
                                 } else {
                                     DATA_VA
                                 };
-                                ptr::write_volatile(leaf(), new | 7);
+                                aliases::set_leaf(new | 7);
                                 asm!("dsb ish");
                                 checked(g.trace(25, r.cpu));
                             }
@@ -193,6 +193,9 @@ unsafe fn drive(id: u64) -> ! {
                 }
             }
             if done {
+                if c.stack_profile >= 2 {
+                    stack::probe_start();
+                }
                 c.finished.fetch_or(1 << id, Ordering::Release);
                 stop(SUCCESS, 0);
             }

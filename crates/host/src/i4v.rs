@@ -182,7 +182,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let event = vm.run_any()?;
     if live && event == 0x4a {
         let resident = vm.shared();
-        if !(PRIVATE..PRIVATE + 0x10000).contains(&resident.service_pc)
+        if !natemu_abi::resident::contains(resident.service_pc, 4)
             || vm.read_reg(31)? != resident.service_pc
         {
             return Err("I4-V request did not exit at the resident service PC".into());

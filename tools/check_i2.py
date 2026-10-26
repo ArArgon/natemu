@@ -17,6 +17,8 @@ import argparse
 import copy
 import json
 from pathlib import Path
+
+from check_i1 import resident_pc
 import sys
 
 from check_i1 import check as check_execution, equal, require, state, uint, values
@@ -144,7 +146,7 @@ def check(cell):
                                 ("memory_base", DATA), ("object_pc", CODE)):
             equal(uint(execution[field], 64, name + "." + field), expected, name + "." + field)
         pc = uint(execution["capture_pc"], 64, name + ".capture_pc")
-        require(PRIVATE <= pc < PRIVATE + 0x10000 and pc % 4 == 0,
+        require(resident_pc(pc),
                 name + ": capture target outside resident text")
         if capture_pc is not None:
             equal(pc, capture_pc, name + ": changed return gateway")
@@ -178,7 +180,7 @@ def synthetic(scenario):
         captured["x"][5] = captured["x"][20] = 0
         for reg in (7, 26, 27):
             captured["x"][reg] = 3
-        captured["x"][16], captured["x"][30] = CODE, PRIVATE + 0x1000
+        captured["x"][16], captured["x"][30] = CODE, PRIVATE + 0xA0080
         captured["nzcv"] = 0x20000000  # SF/ZF/OF/CF0; final native C is inverted.
         captured["q"][16] = [(a | b) if case == "live_or" else (a ^ b)
                               for a, b in zip(frame["q"][16], frame["q"][17])]
@@ -187,7 +189,7 @@ def synthetic(scenario):
         executions.append({"case": case, "status": 1, "initial": copy.deepcopy(frame),
                            "captured": captured, "memory_base": DATA, "memory_before": list(memory),
                            "memory_after": after, "bank_before": list(bank), "bank_after": list(bank),
-                           "object_pc": CODE, "capture_pc": PRIVATE + 0x1000,
+                           "object_pc": CODE, "capture_pc": PRIVATE + 0xA0080,
                            "source_generation": source, "context_generation": context})
         frame, memory = copy.deepcopy(captured), after
     return {"case": "i2", "scenario": scenario, "vm": vm, "events": events,

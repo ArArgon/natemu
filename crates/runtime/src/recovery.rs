@@ -93,6 +93,7 @@ pub unsafe fn fetch() -> bool {
         }
     }
 }
+#[inline(never)]
 pub unsafe fn completed() {
     unsafe {
         let mut g = read_record(guest());

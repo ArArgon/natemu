@@ -62,10 +62,7 @@ impl Cpu {
                         // Only this owner writes its private record, and is
                         // stopped at the explicit register-transfer gateway.
                         let s = ptr::read_volatile(shared_address as *const Shared);
-                        if s.service_pc < PRIVATE
-                            || s.service_pc >= PRIVATE + 0x10000
-                            || pc != s.service_pc
-                        {
+                        if !resident::contains(s.service_pc, 4) || pc != s.service_pc {
                             return Err("compiler service outside explicit gateway".into());
                         }
                         let mut packet = [0; 16];
@@ -131,7 +128,8 @@ fn tables(memory: &Memory, base: usize, aliases: bool) {
         word(shadow::UPPER_L2, table(shadow::UPPER_LEAF as u64));
     }
     for offset in (0..RAM_SIZE).step_by(4096) {
-        let text = offset < 0x10000 || (CODE_OFFSET..CODE_OFFSET + 8192).contains(&offset);
+        let text = resident::executable_offset(offset)
+            || (CODE_OFFSET..CODE_OFFSET + 8192).contains(&offset);
         let writable = (0x10000..if aliases { 0x1b000 } else { 0x17000 }).contains(&offset)
             || (SHARED_OFFSET..SHARED_OFFSET + 0x10000).contains(&offset)
             || (BANK_OFFSET..BANK_OFFSET + 0x2000).contains(&offset)
@@ -320,6 +318,28 @@ fn run_owners(
     })
 }
 
+// Keep profile admission explicit: source address selection and permission setup
+// are independent fixture inputs, not values inferred from compiler replies.
+fn profiles(name: &str) -> Result<(u64, u64, u64)> {
+    Ok(match name {
+        "entry" => (0, 0, 0),
+        "faults" => (1, 0, 0),
+        "remap" => (2, 0, 0),
+        "compose" => (3, 0, 0),
+        "events" => (4, 0, 0),
+        "pressure" => (5, 0, 0),
+        "alias-low" => (5, 1, 0),
+        "alias-high" => (5, 2, 0),
+        "stack-low" => (5, 1, 1),
+        "stack-high" => (5, 2, 1),
+        "stack-parent-low" => (5, 1, 2),
+        "stack-parent-high" => (5, 2, 2),
+        "stack-leaf-low" => (5, 1, 3),
+        "stack-leaf-high" => (5, 2, 3),
+        _ => return Err("unsupported I4 scenario".into()),
+    })
+}
+
 pub fn run(args: &[String]) -> Result<()> {
     let n: usize = args[4].parse().map_err(|_| "invalid I4 vCPU count")?;
     let mut coord = Coordinator::new(n).ok_or("I4 admits 1..=4 vCPUs")?;
@@ -333,28 +353,13 @@ pub fn run(args: &[String]) -> Result<()> {
     if n > host_limit as usize {
         return Err("I4 count exceeds host vCPU limit".into());
     }
-    let stack_profile = matches!(args[3].as_str(), "stack-low" | "stack-high");
-    coord.stack_profile = u64::from(stack_profile);
-    coord.scenario = match args[3].as_str() {
-        "entry" => 0,
-        "faults" => 1,
-        "remap" => 2,
-        "compose" => 3,
-        "events" => 4,
-        "pressure" | "alias-low" | "alias-high" | "stack-low" | "stack-high" => 5,
-        _ => return Err("unsupported I4 scenario".into()),
-    };
-    let alias_profile = match args[3].as_str() {
-        "alias-low" | "stack-low" => 1,
-        "alias-high" | "stack-high" => 2,
-        _ => 0,
-    };
+    let (scenario_id, alias_profile, stack_kind) = profiles(&args[3])?;
+    let stack_profile = stack_kind != 0;
+    coord.stack_profile = stack_kind;
+    coord.scenario = scenario_id;
     coord.alias_profile = alias_profile;
     let source_rip = alias::source_rip(alias_profile);
-    let compose = matches!(
-        args[3].as_str(),
-        "compose" | "events" | "pressure" | "alias-low" | "alias-high" | "stack-low" | "stack-high"
-    );
+    let compose = scenario_id >= 3;
     if compose {
         coord.published.store(0, Ordering::Relaxed);
     }
@@ -378,7 +383,6 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     let memory = Memory::with_size(n * RAM_SIZE)?;
     load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
-    let image = memory.read::<0x10000>(0);
     if !stack_profile {
         memory.copy(CODE_OFFSET, &body);
         memory.copy(CODE_OFFSET + 44, &RET);
@@ -402,10 +406,7 @@ pub fn run(args: &[String]) -> Result<()> {
     if unsafe { getentropy((&raw mut vm_id).cast(), 8) } != 0 || vm_id == 0 {
         return Err("VM identity entropy unavailable".into());
     }
-    let pressure = matches!(
-        args[3].as_str(),
-        "pressure" | "alias-low" | "alias-high" | "stack-low" | "stack-high"
-    );
+    let pressure = scenario_id == 5;
     if pressure {
         unsafe {
             ptr::write(
@@ -422,17 +423,25 @@ pub fn run(args: &[String]) -> Result<()> {
     for id in 0..n {
         let base = id * RAM_SIZE;
         if id != 0 {
-            memory.copy(base, &image);
+            for offset in (0..RAM_SIZE).step_by(4096) {
+                if resident::executable_offset(offset) {
+                    memory.copy(base + offset, &memory.read::<4096>(offset));
+                }
+            }
         }
         tables(&memory, base, alias_profile != 0);
         let (mut frame, mut bank, mut data) = seed(id);
         for b in &mut bank {
             *b ^= id as u8;
         }
-        frame.x[6] = alias::data_address(alias_profile, id as u64, 0);
+        frame.x[6] = if stack_profile {
+            stack_concurrent::initial_rsp_for(stack_kind, id as u64) - 0x80
+        } else {
+            alias::data_address(alias_profile, id as u64, 0)
+        };
         frame.x[11] = frame.x[6] + 128;
         if stack_profile {
-            frame.x[8] = stack_concurrent::initial_rsp(id as u64);
+            frame.x[8] = stack_concurrent::initial_rsp_for(stack_kind, id as u64);
             frame.x[5] = frame.x[8];
             data.fill(0xa5);
         }
@@ -498,7 +507,17 @@ pub fn run(args: &[String]) -> Result<()> {
     if args[3] != "entry" {
         recovery::prepare(&memory, &seeds[0].0, "cold", false)?;
         if alias_profile != 0 {
-            memory.word(natemu_abi::recovery::TABLE_OFFSET + 256 * 8, 0x2007);
+            memory.word(
+                natemu_abi::recovery::TABLE_OFFSET + 256 * 8,
+                if stack_kind == 2 { 0x2005 } else { 0x2007 },
+            );
+            if stack_kind == 3 {
+                // A distinct high leaf aliases the writable low GPA but denies writes.
+                memory.word(
+                    natemu_abi::recovery::TABLE_OFFSET + 0x3000 + 257 * 8,
+                    DATA_VA | 5,
+                );
+            }
         }
         for id in 0..n {
             unsafe {
@@ -513,10 +532,7 @@ pub fn run(args: &[String]) -> Result<()> {
                         .cast::<natemu_abi::recovery::Recovery>(),
                     natemu_abi::recovery::Recovery::new(0),
                 );
-                if matches!(
-                    args[3].as_str(),
-                    "events" | "pressure" | "alias-low" | "alias-high" | "stack-low" | "stack-high"
-                ) {
+                if scenario_id >= 4 {
                     let mut guest = natemu_abi::recovery::GuestState::seed(&seeds[id].0);
                     guest.rip = source_rip;
                     if stack_profile {
@@ -597,25 +613,11 @@ pub fn run(args: &[String]) -> Result<()> {
         let mut entry = *frame;
         entry.x[16] = CODE_VA;
         entry.x[30] = s.capture_pc;
-        if !matches!(
-            args[3].as_str(),
-            "remap"
-                | "compose"
-                | "events"
-                | "pressure"
-                | "alias-low"
-                | "alias-high"
-                | "stack-low"
-                | "stack-high"
-        ) && s.initial != entry
-        {
+        if scenario_id < 2 && s.initial != entry {
             return Err(format!("CPU{id}: entry state changed"));
         }
         let r = unsafe { ptr::read(memory.0.add(base + ROUND_OFFSET).cast::<Round>()) };
-        if matches!(
-            args[3].as_str(),
-            "events" | "pressure" | "alias-low" | "alias-high" | "stack-low" | "stack-high"
-        ) {
+        if scenario_id >= 4 {
             let e = unsafe { ptr::read(memory.0.add(base + EVENT_OFFSET).cast::<EventRecord>()) };
             event_records.push(format!("{{\"id\":{id},\"pending\":{},\"token_state\":{},\"notifications\":{},\"consumed\":{},\"deliveries\":{},\"boundary\":{},\"blocked\":{},\"wait_checks\":{},\"shadow\":{},\"priority\":{},\"vector\":{},\"packet\":{}}}",
                 u64::from(c.event_pending[id].load(Ordering::Acquire)==1),c.event_pending[id].load(Ordering::Acquire),c.event_notifications[id].load(Ordering::Acquire),
@@ -666,7 +668,27 @@ pub fn run(args: &[String]) -> Result<()> {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
-            stack_records.push(format!("{{\"id\":{id},\"step\":{},\"pass\":{},\"code\":{},\"expected\":{:?},\"compile_requests\":{:?},\"replies\":{:?},\"programs\":[{programs}],\"stale_chunks\":{},\"wrong_owner_rejections\":{},\"blank_before_publish\":{},\"source_before\":{:?},\"source_after\":{:?},\"guest_before\":{},\"guest_after\":{}}}",
+            let p = &state.probe;
+            let probe = format!(
+                "{{\"initial\":{},\"captured\":{},\"guest_before\":{},\"guest_after\":{},\"pair\":{:?},\"tables_before\":{:?},\"tables_after\":{:?},\"vector\":{},\"error\":{},\"address\":{},\"rip\":{},\"esr\":{},\"far\":{},\"pc\":{},\"spsr\":{},\"done\":{}}}",
+                frame_json(&p.initial),
+                frame_json(&p.captured),
+                recovery::guest_json(&p.guest_before),
+                recovery::guest_json(&p.guest_after),
+                p.pair,
+                p.tables_before,
+                p.tables_after,
+                p.vector,
+                p.error,
+                p.address,
+                p.rip,
+                p.esr,
+                p.far,
+                p.pc,
+                p.spsr,
+                p.done
+            );
+            stack_records.push(format!("{{\"id\":{id},\"step\":{},\"pass\":{},\"code\":{},\"expected\":{:?},\"compile_requests\":{:?},\"replies\":{:?},\"programs\":[{programs}],\"probe\":{probe},\"stale_chunks\":{},\"wrong_owner_rejections\":{},\"blank_before_publish\":{},\"source_before\":{:?},\"source_after\":{:?},\"guest_before\":{},\"guest_after\":{}}}",
                 state.step,state.pass,state.code,state.expected,state.compile_requests,state.replies,state.stale_chunks,state.wrong_owner_rejections,state.blank_before_publish,
                 state.source_before,state.source_after,recovery::guest_json(&before),recovery::guest_json(&after)));
         }
@@ -695,17 +717,7 @@ pub fn run(args: &[String]) -> Result<()> {
             || memory.read::<256>(DATA_OFFSET + id * 256),
             |b| b.old_memory,
         );
-        if matches!(
-            args[3].as_str(),
-            "remap"
-                | "compose"
-                | "events"
-                | "pressure"
-                | "alias-low"
-                | "alias-high"
-                | "stack-low"
-                | "stack-high"
-        ) {
+        if scenario_id >= 2 {
             if !pressure && s.initial != r.new_initial {
                 return Err("new entry state changed".into());
             }
@@ -726,20 +738,10 @@ pub fn run(args: &[String]) -> Result<()> {
                 r.dirty_spsr
             );
             new_cells.push(format!("{{\"dirty_fault\":{dirty},\"id\":{id},\"dirty_faults\":{},\"case\":\"{case}\",\"status\":{},\"initial\":{},\"captured\":{},\"memory_base\":{},\"memory_before\":{:?},\"memory_after\":{:?},\"bank_before\":{bank:?},\"bank_after\":{:?},\"object_pc\":{code},\"capture_pc\":{}}}",
-                r.dirty_faults,s.status,frame_json(&r.new_initial),frame_json(second_frame),if stack_profile {alias::data_address(alias_profile,id as u64,0)} else {r.new_initial.x[6]},
+                r.dirty_faults,s.status,frame_json(&r.new_initial),frame_json(second_frame),if stack_profile {stack_concurrent::initial_rsp_for(stack_kind,id as u64)-0x80} else {r.new_initial.x[6]},
                 new_data[id],second_memory,memory.read::<512>(base+BANK_OFFSET),s.capture_pc));
         }
-        let old_frame = if matches!(
-            args[3].as_str(),
-            "remap"
-                | "compose"
-                | "events"
-                | "pressure"
-                | "alias-low"
-                | "alias-high"
-                | "stack-low"
-                | "stack-high"
-        ) {
+        let old_frame = if scenario_id >= 2 {
             &r.first_frame
         } else {
             &s.captured
@@ -831,7 +833,7 @@ pub fn run(args: &[String]) -> Result<()> {
                     "live_or"
                 };
                 intervals.push(format!("{{\"id\":{id},\"ordinal\":{},\"heads\":{},\"epoch\":{},\"gpa\":{},\"case\":\"{case}\",\"status\":1,\"initial\":{},\"captured\":{},\"memory_base\":{},\"memory_before\":{:?},\"memory_after\":{:?},\"bank_before\":{:?},\"bank_after\":{:?},\"object_pc\":{CODE_NEXT},\"capture_pc\":{},\"dirty_faults\":{},\"dirty_fault\":{{\"frame\":{},\"esr\":{},\"far\":{},\"pc\":{},\"spsr\":{}}}}}",
-                    r.ordinal,r.heads,r.epoch,r.gpa,frame_json(&r.initial),frame_json(&r.captured),if stack_profile {alias::data_address(alias_profile,id as u64,0)} else {r.initial.x[6]},
+                    r.ordinal,r.heads,r.epoch,r.gpa,frame_json(&r.initial),frame_json(&r.captured),if stack_profile {stack_concurrent::initial_rsp_for(stack_kind,id as u64)-0x80} else {r.initial.x[6]},
                     r.before,r.after,seeds[id].1,memory.read::<512>(id*RAM_SIZE+BANK_OFFSET),state.capture_pc,
                     r.faults,frame_json(&r.dirty_frame),r.esr,r.far,r.pc,r.spsr));
             }
@@ -877,7 +879,7 @@ pub fn run(args: &[String]) -> Result<()> {
         c.reclaimed.load(Ordering::Acquire),
         compose_leaf
     );
-    let stack_flag = u64::from(stack_profile);
+    let stack_flag = stack_kind;
     let stack_memory_before = if stack_profile {
         vec![0xa5u8; 8192]
     } else {
@@ -901,4 +903,60 @@ pub fn run(args: &[String]) -> Result<()> {
         cells.join(",")
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_owner_maps_its_extended_resident_text_read_only() {
+        let memory = Memory::with_size(2 * RAM_SIZE).unwrap();
+        for id in 0..2 {
+            let base = id * RAM_SIZE;
+            tables(&memory, base, true);
+            for offset in (0..RAM_SIZE).step_by(4096) {
+                let pte = u64::from_le_bytes(memory.read::<8>(base + 0x14000 + offset / 4096 * 8));
+                if resident::executable_offset(offset) {
+                    assert_eq!(
+                        pte,
+                        (IPA + (base + offset) as u64) | 3 | 1 << 10 | 3 << 8 | 1 << 7
+                    );
+                } else if (resident::BOOT_END..0x10000).contains(&offset) {
+                    assert_eq!(pte, 0);
+                } else if pte != 0 && !(CODE_OFFSET..CODE_OFFSET + 8192).contains(&offset) {
+                    assert_eq!(pte & (3 << 53), 3 << 53);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_permissions_are_admitted_only_as_full_pressure_profiles() {
+        for (name, stack_kind, alias_kind) in [
+            ("stack-parent-low", 2, 1),
+            ("stack-parent-high", 2, 2),
+            ("stack-leaf-low", 3, 1),
+            ("stack-leaf-high", 3, 2),
+        ] {
+            assert_eq!(profiles(name).unwrap(), (5, alias_kind, stack_kind));
+            for id in 0..4 {
+                assert_eq!(
+                    stack_concurrent::initial_rsp_for(stack_kind, id),
+                    DATA_VA + id * 256 + 0x80,
+                );
+            }
+        }
+        for unsupported in [
+            "stack-parent",
+            "stack-leaf",
+            "stack-parent-low-extra",
+            "stack-leaf-middle",
+        ] {
+            assert!(profiles(unsupported).is_err());
+        }
+        assert_eq!(profiles("stack-low").unwrap(), (5, 1, 1));
+        assert_eq!(profiles("stack-high").unwrap(), (5, 2, 1));
+        assert_eq!(profiles("pressure").unwrap(), (5, 0, 0));
+    }
 }

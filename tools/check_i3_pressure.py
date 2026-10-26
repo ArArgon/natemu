@@ -13,6 +13,8 @@ import argparse
 import copy
 import json
 from pathlib import Path
+
+from check_i1 import resident_pc
 import struct
 import sys
 
@@ -213,7 +215,7 @@ def check(cell):
     exact(a["initial"], initial, "allocated.initial controlled seed")
     exact(a["native_fp_restored"], [initial["fpcr"], initial["fpsr"]], "native FP restoration")
     pc = uint(p["capture_pc"], 64, "capture_pc")
-    require(PRIVATE <= pc < PRIVATE + 0x10000 and pc % 4 == 0, "return gateway outside resident text")
+    require(resident_pc(pc), "return gateway outside resident text")
     sites = export_decode(a["export"], fp)
     snapshots, final_frame, final_spills, final_memory, helper_before = simulate(fp, pc)
     if cell["case"] == "i3-helper":
@@ -304,7 +306,7 @@ def check_partial(cell):
     expected_tables[0x3000 + 257 * 8] |= 0x60
     exact(p["tables_after"], expected_tables, "partial table effects")
     store_pc = uint(partial["store_pc"], 64, "partial.store_pc")
-    require(PRIVATE <= store_pc < PRIVATE + 0x10000 and store_pc % 4 == 0,
+    require(resident_pc(store_pc),
             "registered partial store outside resident text")
     t = partial["trace"]
     f = state(t["frame"], "partial.trace.frame")
@@ -377,7 +379,7 @@ def helper_expected(before, scenario):
 
 def synthetic(fp, scenario, helper=False):
     done, faults, walks, retries, error = CASES[scenario]
-    pc, vm = PRIVATE + 0x1000, 0x123456789ABCDEF
+    pc, vm = PRIVATE + 0xA0080, 0x123456789ABCDEF
     rows = event_rows(fp, scenario, vm)
     initial, memory, bank = seed(fp)
     snapshots, final, spill, after, helper_before = simulate(fp, pc)
@@ -439,7 +441,7 @@ def synthetic_partial():
     cell["events"].append(terminal)
     frame, _, _ = first_seed()
     frame["x"][0], frame["x"][1], frame["sp"] = DATA + 4096, 0x6E, STACK - 4096
-    store_pc = PRIVATE + 0x2000
+    store_pc = PRIVATE + 0xA0280
     cell["partial"] = {"prefix": prefix, "before": before, "at_fault": interrupted,
                        "at_fault_counts": [2, 1, 1, 0x6E], "reads": 2, "writes": 2,
                        "faults": 1, "retries": 1, "phase": 0, "value": 0x6E,
@@ -472,7 +474,7 @@ def self_test():
         ("bank clobber", True, "cold", ("paging", "bank_after", 0), 0),
         ("YMM high clobber", True, "cold", ("paging", "guest_after", "ymm", 15, 31), 0),
         ("native scratch clobber", False, "load_np", ("paging", "traces", 0, "frame", "x", 18), 0),
-        ("return trailer destroys live RDI", False, "cold", ("allocated", "final_frame", "x", 30), PRIVATE + 0x1000),
+        ("return trailer destroys live RDI", False, "cold", ("allocated", "final_frame", "x", 30), PRIVATE + 0xA0080),
         ("missing stream ack", False, "cold", ("events",), []),
         ("extra execution", False, "cold", ("final_executions",), 2),
     ]

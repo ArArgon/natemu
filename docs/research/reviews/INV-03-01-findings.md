@@ -1,5 +1,89 @@
 # INV-03-01 — source findings review
 
+## Intermediate I4-V return — mixed-permission aliases, October 26, 2026 UTC
+
+Root authored ABI/runtime, layout and runner changes; `/root/i4v_producer`
+authored host/loader bindings and `/root/i4v_upstream` authored independent
+expectations. `/root/i4v_contract_review` reviewed these changes read-only and
+performed a fresh serial rebuild and native replication from primary03's
+retained snapshot. **ACCEPT the finite mixed-permission alias and resident-layout
+checkpoint; V1 and I4-V remain incomplete.**
+
+Independent `i4v-mixed-independent-20261026-01` passes 174 jobs and 158 native
+cells: the prior 142 cells plus 16 parent/leaf permission compositions at
+N=1/2/3/4 and low/high source RIP. The reviewer rechecked every report, all
+196 actual compilations, 208 cell-to-compile associations, 390 observed stack
+transfers and 5,962 checksums. All 157 retained inputs match primary03 and the
+reviewed workspace. The reused FEX executable matches its pin; all compiler
+artifacts and container cleanup verify. No compiler containers remain running.
+
+The new matrix covers 40 owners, 1,120 paired-route acknowledgements, 360
+maintenance heads and 56 ordinary generated programs. Both aliases are walked
+independently before repair/acknowledgement: shared GPA identity does not transfer
+parent or leaf write permission. All previous prefix, full-frame, physical-memory,
+source/chunk identity, events, lifetime and fairness checks remain active. After
+maintenance, each owner explicitly rebinds its fixture RSP to the read-only alias
+and executes the actual generated first PUSH. All 40 probes take a native
+permission fault, then guest #PF/error3, without committing that PUSH or changing
+the previous memory effects. Native descriptors, guest ancestor/leaf entries,
+CR2/RIP and complete precommit state match independent expectations. The code
+reference and active grant remain owned through guest-fault materialization.
+
+Resident code outgrew the original 64KiB reserve. The replacement layout has two
+disjoint RX ELF segments: a 168-byte boot entry within the first private page and
+a 68,308-byte main image within private offsets 0xa0000–0xe0000. Existing state,
+stacks and generated-code slots retain their addresses. Loader admission rejects
+spans crossing the gap and non-RX segments; host mapping and continuation checks
+use the same two windows, while independent checkers retain their own predicate.
+Emitted boot ADR resolves exactly to aligned vectors at offset0xa4800 and BL to
+runtime_main at0xa7b78. Primary03, independent replica and the subsequent legacy
+rebuild have identical runtime SHA256:
+`924329f9a4d864646ea58ecc5364b8251fea2235042c98b1acd5816462c6df0b`.
+
+The failed first mixed focus remains retained with PANIC175. Independent emitted
+inspection found that changed inlining had enlarged the shared `finish` frame,
+creating an 18,144-byte call chain on a 16,384-byte stack. Explicitly outlining
+pressure/recovery completion helpers restores the shared frame to832 bytes.
+The accepted ELF's conservative return/exception call-chain bound is15,824 bytes,
+leaving560 bytes; runtime entry, dispatch and helper entry bounds are lower.
+Future generated-code changes must recheck stack bounds as well as text extents.
+Corrected focused02, primary03 and the independent full replica pass.
+
+The independent run lasted95 seconds and retained79,086,730 bytes. Observed peak
+build/worker process-group RSS was343,195,648/96,403,456 bytes. Builds and native
+campaigns were serialized. Root then ran `i4v-mixed-regression-20261026-01`,
+passing all87 legacy jobs from04:22:11–04:22:50UTC; the reviewer inspected its
+manifest and matching ELF, without claiming another independent legacy run.
+No substantive correctness or reproduction blocker remains within this scope.
+
+Source mutation remains an explicit runtime fixture write; parent-RO profiles
+use the writable low source alias. Terminal permission probes run after pressure
+completion and do not establish revocation during an in-flight instruction.
+Concurrent cross-page/terminal-prefix coverage, remaining V1 boundaries, V2
+paging-off execution, V3 transitions and the broader campaign remain obligations.
+These are finite correctness results, not full V1/I4-V or performance acceptance.
+
+## Plan re-review — address and mode concurrency, October 26, 2026 UTC
+
+At the owner's plan-update request, `/root/i4v_contract_review` independently
+rechecked the current I4-V section and ending status in `docs/implementation.md`,
+INV-03-01's current direction and the Track03 charter. **ACCEPT the plan;
+evidence validity and decision relevance both pass, with no substantive blocker.**
+
+V1 requires actual high-address fetch/data/stack execution and differing alias
+permissions; V2 requires paging-off execution with mixed paged/paging-off peers;
+V3 requires actual legal/illegal guest control sequences, precise commit/fault
+boundaries and return to a previously used context. Each includes retained work,
+source/context identity, stale replies/entries, events and N=1/2/3/4 schedules.
+Independent expectations, upstream provenance, bounded slices and explicit
+unfinished coverage preserve build-first execution without a whole-kernel gate.
+
+Root corrected the stale ending that said no I4-V coverage had been collected.
+It now distinguishes independently accepted finite V1 checkpoints from remaining
+V1/V2/V3 and broader campaign obligations, consistent with INV-03-01. This return
+reviews the plan only: it adds no runtime result, implementation acceptance or
+claim that V1/I4-V is complete.
+
 ## Intermediate I4-V return — concurrent stack prefixes, October 26, 2026 UTC
 
 Root authored the ABI/runtime and runner, `/root/i4v_producer` authored host and

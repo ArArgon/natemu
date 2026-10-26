@@ -11,13 +11,13 @@ def native_fault(frame, far, pc, permission):
             "spsr": frame["nzcv"] | 0x3C4}
 
 
-def program(cpu, initial, before, replacement, capture):
+def program(cpu, initial, before, replacement, capture, stack_profile=1):
     code = oracle.CODE_NEXT if replacement else oracle.CODE
-    prefixes, after = oracle.execute(initial, before, cpu, code, capture, replacement)
-    _, bank, _ = oracle.seed(cpu)
+    prefixes, after = oracle.execute(initial, before, cpu, code, capture, replacement, stack_profile)
+    _, bank, _ = oracle.seed(cpu, stack_profile)
     cell = {"id": cpu, "case": "fex_push_immediates64_changed" if replacement else "fex_push_immediates64",
             "status": 1, "initial": copy.deepcopy(initial), "captured": copy.deepcopy(prefixes[-1]),
-            "memory_base": oracle.span(cpu), "memory_before": list(before), "memory_after": after,
+            "memory_base": oracle.span(cpu, stack_profile), "memory_before": list(before), "memory_after": after,
             "bank_before": bank, "bank_after": list(bank), "object_pc": code, "capture_pc": capture}
     if replacement:
         cell["dirty_faults"] = 1
@@ -26,18 +26,19 @@ def program(cpu, initial, before, replacement, capture):
     return cell, prefixes
 
 
-def fixture(n=4, profile=2):
+def fixture(n=4, profile=2, stack_profile=1):
     # This alternative legal FIFO schedule comes from the existing independent
     # reference. Its old scalar guest effects are replaced by real stack effects.
     record = check_i4_pressure.known_result(n)
     rip = oracle.SOURCE + (oracle.HIGH if profile == 2 else 0)
-    record.update(profile="i4-stack-low" if profile == 1 else "i4-stack-high", alias_profile=profile,
-                  stack_profile=1, source_rip=rip)
+    name = {1: "stack", 2: "stack-parent", 3: "stack-leaf"}[stack_profile]
+    record.update(profile="i4-" + name + ("-low" if profile == 1 else "-high"), alias_profile=profile,
+                  stack_profile=stack_profile, source_rip=rip)
     capture, vm = oracle.PRIVATE + 0x400, 0x123456789ABCDEF
     frames, memory, programs, second_frames = {}, {}, {}, {}
     for cpu in range(n):
-        initial, _, before = oracle.seed(cpu)
-        old, prefixes = program(cpu, initial, before, False, capture)
+        initial, _, before = oracle.seed(cpu, stack_profile)
+        old, prefixes = program(cpu, initial, before, False, capture, stack_profile)
         record["cells"][cpu] = old
         memory[(0, cpu)] = old["memory_after"]
         fault = native_fault(oracle.precommit(initial, prefixes, 1, oracle.CODE, capture, False),
@@ -47,7 +48,7 @@ def fixture(n=4, profile=2):
         programs[cpu] = [{"entries": 31, "completed": 31, "prefixes": oracle.compact_prefixes(prefixes)}]
         initial = copy.deepcopy(prefixes[-1])
         initial["x"][16] = oracle.CODE_NEXT
-        new, prefixes = program(cpu, initial, before, True, capture)
+        new, prefixes = program(cpu, initial, before, True, capture, stack_profile)
         record["new_cells"][cpu] = new
         memory[(1, cpu)] = new["memory_after"]
         programs[cpu].append({"entries": 31, "completed": 31, "prefixes": oracle.compact_prefixes(prefixes)})
@@ -58,7 +59,7 @@ def fixture(n=4, profile=2):
         cpu, page = original["id"], int(original["heads"] % 2 == 0)
         initial = copy.deepcopy(frames[cpu])
         initial["x"][16] = oracle.CODE_NEXT
-        cell, prefixes = program(cpu, initial, memory[(page, cpu)], True, capture)
+        cell, prefixes = program(cpu, initial, memory[(page, cpu)], True, capture, stack_profile)
         cell.update({key: original[key] for key in ("ordinal", "heads", "epoch", "gpa")})
         intervals.append(cell)
         frames[cpu], memory[(page, cpu)] = copy.deepcopy(prefixes[-1]), cell["memory_after"]
@@ -66,7 +67,7 @@ def fixture(n=4, profile=2):
     record["maintenance"]["intervals"] = intervals
     for event in record["events"]:
         cpu = event["id"]
-        event["packet"] = oracle.canonical_seed(cpu, rip) if cpu in (1, 3) else oracle.canonical_after(cpu, rip, second_frames[cpu])
+        event["packet"] = oracle.canonical_seed(cpu, rip, stack_profile) if cpu in (1, 3) else oracle.canonical_after(cpu, rip, second_frames[cpu], stack_profile=stack_profile)
     requests = [oracle.request_packet(vm, rip, serial) for serial in (1, 2, 3)]
     replies = [[oracle.reply_packet(vm, rip, serial, chunk) for chunk in range(3)] for serial in (1, 2, 3)]
     record["requests"] = copy.deepcopy(requests)
@@ -75,14 +76,27 @@ def fixture(n=4, profile=2):
     page = int(record["maintenance"]["total"] % 2 == 0)
     for item in record["aliases"]:
         cpu = item["id"]
-        warm = [oracle.descriptor(0), 0] if cpu % 2 == 0 else [0, oracle.descriptor(0)]
+        warm = [oracle.descriptor(0), 0] if stack_profile == 1 and cpu % 2 == 0 else [0, oracle.descriptor(0)]
         item.update(sctlr=0x30D01985, actlr=2, warm=warm,
                     wrong_rip_rejections=0, blank_before_publish=0,
                     source_before=list(oracle.OLD_SOURCE[:17]) if cpu == 0 else [0] * 17,
                     source_after=list(oracle.NEW_SOURCE[:17]) if cpu == 0 else [0] * 17)
         item["lower_leaf"][256] = item["upper_leaf"][256] = oracle.descriptor(page)
-    last_cpu = intervals[-1]["id"]
-    record["aliases"][last_cpu]["upper_leaf" if last_cpu % 2 == 0 else "lower_leaf"][256] = oracle.descriptor(page, False)
+    if stack_profile == 1:
+        last_cpu = intervals[-1]["id"]
+        record["aliases"][last_cpu]["upper_leaf" if last_cpu % 2 == 0 else "lower_leaf"][256] = oracle.descriptor(page, False)
+    else:
+        for item in record["aliases"]:
+            item["lower_leaf"][256] = oracle.descriptor(page, False)
+            if stack_profile == 3:
+                item["upper_leaf"][256] = 0
+                item["upper_leaf"][257] = oracle.descriptor(page)
+            if stack_profile == 2 and item["id"] == 0:
+                item["source_address"] = oracle.SOURCE
+                item["upper_leaf"][258] = 0
+                item["lower_leaf"][258] = oracle.descriptor(2, False)
+        for cpu in reversed(range(n)):
+            record["trace"].extend([32 << 8 | cpu, 33 << 8 | cpu])
     stacks = []
     for cpu in range(n):
         compiler = cpu == 0
@@ -96,7 +110,13 @@ def fixture(n=4, profile=2):
                        "blank_before_publish": int(compiler),
                        "source_before": list(oracle.OLD_SOURCE) if compiler else [0] * 20,
                        "source_after": list(oracle.NEW_SOURCE) if compiler else [0] * 20,
-                       "guest_before": oracle.canonical_seed(cpu, rip), "guest_after": oracle.canonical_after(cpu, rip, frames[cpu])})
+                       "guest_before": oracle.canonical_seed(cpu, rip, stack_profile), "guest_after": oracle.canonical_after(cpu, rip, frames[cpu], stack_profile=stack_profile)})
+    for cpu, item in enumerate(stacks):
+        probe = oracle.probe_expectation(cpu, rip, frames[cpu], stack_profile, page, capture)
+        probe.update(esr=(0x25 << 26) | 64 | 15, spsr=frames[cpu]["nzcv"] | 0x3C4)
+        item["probe"] = oracle.zeros(probe) if stack_profile == 1 else probe
+        if stack_profile >= 2:
+            item["guest_after"] = copy.deepcopy(probe["guest_after"])
     record["stacks"] = stacks
     record["stack_memory_before"] = [0xA5] * 8192
     physical = [0xA5] * 8192
@@ -120,8 +140,9 @@ class ConcurrentStackTests(unittest.TestCase):
     def test_all_counts_and_regimes(self):
         for n in range(1, 5):
             for profile in (1, 2):
-                with self.subTest(n=n, profile=profile):
-                    oracle.check(fixture(n, profile), n, profile)
+                for stack_profile in (1, 2, 3):
+                    with self.subTest(n=n, profile=profile, stack_profile=stack_profile):
+                        oracle.check(fixture(n, profile, stack_profile), n, profile, stack_profile)
 
     def test_literal_old_and_replacement_vectors(self):
         for cpu in range(4):
@@ -200,6 +221,70 @@ class ConcurrentStackTests(unittest.TestCase):
                 mutate(record)
                 with self.assertRaises(ValueError):
                     oracle.check(record, 4, 2)
+
+    def test_mixed_alias_probe_literal_effects_and_overlapping_grants(self):
+        for stack_profile in (2, 3):
+            record = fixture(4, 1, stack_profile)
+            record["trace"][-8:] = [32 << 8 | cpu for cpu in range(4)] + [33 << 8 | cpu for cpu in reversed(range(4))]
+            oracle.check(record, 4, 1, stack_profile)
+            for cpu, stack in enumerate(record["stacks"]):
+                probe = stack["probe"]
+                programs = sum(p["completed"] == 31 for p in stack["programs"])
+                low_rsp = 0x100000 + cpu * 256 + 128 - 12 * programs
+                high_rsp = 0xFFFF800000000000 + low_rsp + (4096 if stack_profile == 3 else 0)
+                self.assertEqual(probe["guest_before"]["gpr"][4], low_rsp)
+                self.assertEqual(probe["initial"]["x"][8], high_rsp)
+                self.assertEqual(probe["captured"]["x"][8], high_rsp)
+                self.assertEqual(probe["captured"]["x"][20], 0xFFFFFFFFBEBDBCBB)
+                self.assertEqual(probe["guest_after"]["control"][1], high_rsp - 8)
+                self.assertEqual(probe["guest_after"]["gpr"][2], 0x100000 + cpu * 256 + 128)
+                self.assertEqual(probe["guest_after"]["rip"], 0x102000)
+                self.assertEqual((probe["vector"], probe["error"]), (14, 3))
+                self.assertEqual(probe["pair"][0] & 128, 0)
+                self.assertEqual(probe["pair"][1] & 128, 128)
+                self.assertEqual(probe["tables_after"][3] & 64, 0)
+
+    def test_mixed_alias_fault_permission_and_prefix_corruptions_fail(self):
+        for stack_profile in (2, 3):
+            source = fixture(4, 2, stack_profile)
+            probe = source["stacks"][0]["probe"]
+            upper_index = 257 if stack_profile == 3 else 256
+            mutations = [
+                ("other alias inherited writable", change(["aliases", 0, "upper_leaf", upper_index], oracle.descriptor(1, False))),
+                ("other alias wrong physical page", change(["aliases", 0, "upper_leaf", upper_index], oracle.descriptor(0))),
+                ("low route lost dirty writability", change(["aliases", 0, "lower_leaf", 256], oracle.descriptor(1))),
+                ("probe pair writable denial", change(["stacks", 0, "probe", "pair", 1], oracle.descriptor(1, False))),
+                ("probe companion D set", lambda r: r["stacks"][0]["probe"]["tables_after"].__setitem__(3, r["stacks"][0]["probe"]["tables_after"][3] | 64)),
+                ("probe permission bypass", change(["stacks", 0, "probe", "error"], 0)),
+                ("probe exception absent", change(["stacks", 0, "probe", "vector"], 0)),
+                ("probe fabricated native fault", change(["stacks", 0, "probe", "esr"], 0)),
+                ("probe translation instead of permission", change(["stacks", 0, "probe", "esr"], (0x25 << 26) | 64 | 7)),
+                ("probe wrong native site", change(["stacks", 0, "probe", "pc"], oracle.CODE_NEXT)),
+                ("probe wrong FAR", change(["stacks", 0, "probe", "far"], oracle.DATA)),
+                ("probe wrong CR2", change(["stacks", 0, "probe", "guest_after", "control", 1], oracle.DATA)),
+                ("probe preindex wrote RSP", change(["stacks", 0, "probe", "captured", "x", 8], probe["address"])),
+                ("probe preindex committed guest RSP", change(["stacks", 0, "probe", "guest_after", "gpr", 4], probe["address"])),
+                ("probe scratch absent", change(["stacks", 0, "probe", "captured", "x", 20], 0)),
+                ("probe RDX incorrectly rebound", change(["stacks", 0, "probe", "initial", "x", 5], probe["initial"]["x"][8])),
+                ("probe lost committed prefix", change(["stacks", 0, "probe", "guest_before", "gpr", 4], oracle.DATA + 128)),
+                ("probe advanced RIP", change(["stacks", 0, "probe", "guest_after", "rip"], source["source_rip"] + 5)),
+                ("probe completed instruction bit", change(["stacks", 0, "programs", 5, "completed"], 1)),
+                ("probe silently wrote physical byte", change(["stack_memory_after", 4100], 0)),
+                ("probe lacked completion", change(["stacks", 0, "probe", "done"], 0)),
+                ("probe completion without grant", change(["trace", -8], 33 << 8 | 3)),
+                ("probe duplicate owner", change(["trace", -2], 32 << 8 | 1)),
+                ("pressure resumed after terminal grant", change(["trace", -3], 26 << 8 | 1)),
+            ]
+            for name, mutate in mutations:
+                with self.subTest(stack_profile=stack_profile, corruption=name):
+                    record = copy.deepcopy(source)
+                    mutate(record)
+                    with self.assertRaises(ValueError):
+                        oracle.check(record, 4, 2, stack_profile)
+        record = fixture(1, 1, 1)
+        record["stacks"][0]["probe"]["done"] = 1
+        with self.assertRaises(ValueError):
+            oracle.check(record)
 
     def test_chunk_identity_and_fifo_cannot_be_forged(self):
         for serial in range(3):
