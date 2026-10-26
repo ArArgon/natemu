@@ -80,21 +80,30 @@ def compile_source(directory, producer, source, guest_rip, bitness, instructions
         finally: save()
     return record
 
-if __name__=='__main__':
-    from export import CASES, export_program
+def parse_args(argv=None):
+    from export import CASES
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--directory',required=True);p.add_argument('--producer',required=True)
     p.add_argument('--source');p.add_argument('--rip',type=lambda s:int(s,0),required=True)
-    p.add_argument('--bitness',type=int,choices=(32,64),default=64);p.add_argument('--instructions',type=int)
+    p.add_argument('--bitness',type=int,choices=(32,64));p.add_argument('--instructions',type=int)
     p.add_argument('--case',choices=CASES)
     p.add_argument('--expected-host',type=int,default=0)
-    a=p.parse_args()
+    a=p.parse_args(argv)
     if a.case:
         spec=CASES[a.case]
+        bitness=spec.get('bitness',64)
+        if a.bitness is not None and a.bitness!=bitness: p.error('bitness does not match case')
+        a.bitness=bitness
         if a.source is not None and a.source!=spec['source']: p.error('source does not match case')
         if a.instructions is not None and a.instructions!=spec['instructions']: p.error('instruction count does not match case')
         a.source,a.instructions,a.expected_host=spec['source'],spec['instructions'],spec['host_count']
     if a.source is None or a.instructions is None: p.error('provide --case or --source and --instructions')
+    if a.bitness is None: a.bitness=64
+    return a
+
+if __name__=='__main__':
+    from export import export_program
+    a=parse_args()
     record=compile_source(a.directory,a.producer,bytes.fromhex(a.source),a.rip,a.bitness,a.instructions,a.expected_host)
     if a.case: record=export_program(a.directory,a.case)
     print(json.dumps(record,indent=2))

@@ -16,6 +16,31 @@ class ExportChecks(unittest.TestCase):
             self.assertEqual(len(result['sites']),site_count)
             self.assertEqual(result['entry_gprs']['rsp'],8)
 
+    def test_actual_protected32_object_and_sparse_pc_map(self):
+        result=export.verify(DATA/'load32',dict(case='fex_moffs_load32',guest_rip=0x102000,bitness=32))
+        self.assertEqual(len(bytes.fromhex(result['body_hex'])),64)
+        self.assertEqual([(s['native_offset'],s['guest_offset'],s['width'],s['write']) for s in result['sites']],
+                         [(16,10,4,True),(24,17,4,False),(48,29,2,False)])
+        self.assertEqual(result['guest_pc'],[dict(guest_offset=0,native_offset=4),dict(guest_offset=10,native_offset=20)])
+
+    def test_protected32_modes_source_and_body_are_bound(self):
+        def mode(raw):
+            record=json.loads(raw);record['bitness']=64
+            return json.dumps(record).encode()
+        self.mutated('load32','compiler.json',mode)
+        self.mutated('load32','producer.log',lambda b:b.replace(b'NATEMU_MODE bitness=32',b'NATEMU_MODE bitness=64'))
+        self.mutated('load32','input.bin',lambda b:(64).to_bytes(8,'little')+b[8:])
+        self.mutated('load32','source.x86',lambda b:b[:-1]+bytes([b[-1]^1]))
+        self.mutated('load32','outputs/001.native',lambda b:b[:28]+bytes([b[28]^1])+b[29:])
+        with self.assertRaises(ValueError): export.verify(DATA/'load32',dict(bitness=64))
+
+    def test_protected32_rejects_source_window_outside_32_bits(self):
+        for rip in (0x100000000,0xffffffff-35,0xffff800000102000):
+            def change(raw):
+                record=json.loads(raw);record['guest_rip']=rip
+                return json.dumps(record).encode()
+            self.mutated('load32','compiler.json',change)
+
     def test_actual_alias_objects_bind_both_guest_rips(self):
         for kind in ('xor','or'):
             for half,rip in [('low',0x102000),('high',0xffff800000102000)]:

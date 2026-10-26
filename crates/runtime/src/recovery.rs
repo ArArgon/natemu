@@ -200,11 +200,21 @@ pub unsafe fn fault() -> ! {
 
 pub unsafe fn install(address: u64, t: paging::Translation) {
     unsafe {
-        if !t.wb || !(DATA_VA..DATA_VA + 0x3000).contains(&t.gpa) {
+        if !t.wb {
             stop(REJECTED, 44)
         }
-        let native = IPA + DATA_OFFSET as u64 + (t.gpa - DATA_VA);
-        let rights = if t.writable && t.dirty { 0 } else { 1 << 7 };
+        install_ram(address, t.gpa, t.writable && t.dirty);
+    }
+}
+
+// Physical ownership and native permissions do not require a guest PTE or D bit.
+pub unsafe fn install_ram(address: u64, gpa: u64, writable: bool) {
+    unsafe {
+        if !(DATA_VA..DATA_VA + 0x3000).contains(&gpa) {
+            stop(REJECTED, 44)
+        }
+        let native = IPA + DATA_OFFSET as u64 + (gpa - DATA_VA);
+        let rights = if writable { 0 } else { 1 << 7 };
         mapping(
             address & !4095,
             (native & !4095) | 3 | (1 << 10) | (3 << 8) | (3 << 53) | rights,

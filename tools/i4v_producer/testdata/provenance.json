@@ -64,8 +64,17 @@
     "push-high/compiler.json": "232942f6af62c9f616b90715ca92332acfa7d4ef88c257e72607387309e1f7ce",
     "push-high/producer.log": "92fb9779940e01f00b750f7de235c8aed2ea2cf01a2a1fafaab19fdf8d8f4b00",
     "push-high/outputs/001.relocations": "0b3dcbc0a3d9a737d786145c2cda7d73362b80f09ee2d7e398967ec6c3ba1e6c",
-    "push-high/outputs/001.native": "b5659ab720a70b13255fa6d119c5edfc8db7e442331123561fba39ff3c3ff989"
+    "push-high/outputs/001.native": "b5659ab720a70b13255fa6d119c5edfc8db7e442331123561fba39ff3c3ff989",
+    "load32/body.bin": "2af402f2cc5d710040b1c404e116ab625100caba041cc7763847ac0e9037af39",
+    "load32/compiler.json": "586c7639f3d940dbca837b166c5170d691ebffdc30df159627a3891a9266b144",
+    "load32/export.json": "e2993e74c8d2cca4759de03be447246f485f5cd94acfa55ec7168b044ca24b3d",
+    "load32/input.bin": "f660fc0da432617ca9ced377d13d38fbebebb90fa719eec6a7f26a32bc3a260e",
+    "load32/outputs/001.native": "9f768e93051d22a261df1f82f632ca2db07e7b4919a808572b73a91f28c3285a",
+    "load32/outputs/001.relocations": "4b6fbfe5a8a9ab5023516dc9c85276020f90bb29b25648d26b3be5913c0512c3",
+    "load32/producer.log": "08ea15025680cb16cf2c0386b9dcf6892172883ffe8af9051c1ed19289761eac",
+    "load32/source.x86": "9da7648fc836399bef8362606c4ff10268afa2c193b0184ff3500c3820e2e722"
   },
   "alias_retained_root": "/Users/liaozping/orca/natemu-raw/i4v-alias-producer-20261026-01",
-  "replacement_retained_root": "/Users/liaozping/orca/natemu-raw/i4v-stack-concurrent-producer-20261026-01"
+  "replacement_retained_root": "/Users/liaozping/orca/natemu-raw/i4v-stack-concurrent-producer-20261026-01",
+  "load32_retained_root": "/Users/liaozping/orca/natemu-raw/i4v-producer-20261026-02/load32"
 }

@@ -1,4 +1,4 @@
-"""Admit five finite native bodies and bind their sites to actual FEX output."""
+"""Admit finite native bodies and bind their sites to actual FEX output."""
 import hashlib
 import json
 from pathlib import Path
@@ -9,6 +9,14 @@ ENTRY_GPRS = dict(zip(('rax','rbx','rcx','rdx','rsi','rdi','rbp','rsp',
                       'r8','r9','r10','r11','r12','r13','r14','r15'),
                      (4,6,7,5,10,11,9,8,12,13,14,15,16,17,19,29)))
 CASES = {
+    'fex_moffs_load32': dict(bitness=32,
+        source='ba00001000b8420000008902b8ffffffffa10000100089c2b8ffffffff66a10000100089c1',
+        instructions=9, host_count=16,
+        body='0502a05244088052f40305aa1f2003d5a4fc9f880400801295fedf881f2003d5f60304aae40315aae50304aae40316aa94fedf481f2003d5843e40b3e70304aa',
+        object_bytes=192, code_bytes=132, pc=[(0,4),(10,20)],
+        # Exact retained instruction sequences identify these memory sites; the
+        # sparse FEX PC table does not provide nine instruction boundaries.
+        sites=[(16,10,4,True,5,0),(24,17,4,False,20,0),(48,29,2,False,20,0)]),
     'fex_alias_xor64': dict(source='660fefc14801d1488b030f94c2f30f7f07', instructions=5, host_count=11,
         body='101e316efb0005cafa0005abe7031aaac4fcdfc81f2003d5f4179f9a851e40b3bf3b03d57001803d1f4000d5',
         object_bytes=160, code_bytes=108, pc=[(0,4),(7,28),(13,44)],
@@ -47,22 +55,22 @@ def bounded(path, size):
 def parse(directory, case):
     directory=Path(directory)
     require(case in CASES,'unsupported finite case')
-    spec=CASES[case]
+    spec=CASES[case]; bitness=spec.get('bitness',64)
     record=json.loads(bounded(directory/'compiler.json',256*1024))
     pin=json.loads(Path(__file__).with_name('producer.json').read_text())
     require(record['status']=='exported_not_executed' and record['instruction_count_check']==0,'incomplete or count-mismatched compile')
     require(record['producer_sha256']==pin['binary_sha256'] and record['image']==pin['image'],'wrong producer/image')
     rip=record['guest_rip']; source=bytes.fromhex(spec['source'])
-    require(record['bitness']==64 and record['source_hex']==source.hex() and record['instructions']==spec['instructions'], 'case/source/mode mismatch')
+    require(record['bitness']==bitness and record['source_hex']==source.hex() and record['instructions']==spec['instructions'], 'case/source/mode mismatch')
     require(record['expected_host']==spec['host_count'], 'wrong expected host count')
-    require(0 <= rip <= 2**64-1-len(source) and rip>>47 in (0,0x1ffff),'noncanonical source window')
+    require(0 <= rip <= 2**bitness-1-len(source) and (bitness==32 or rip>>47 in (0,0x1ffff)),'invalid source address window')
     require(bounded(directory/'source.x86',64)==source, 'source artifact mismatch')
-    expected=struct.pack('<6Q',64,25,1,8192,49155,0)
+    expected=struct.pack('<6Q',bitness,25,1,8192,49155,0)
     expected+=struct.pack('<128sqQQI',b'natemu-i4v-request',spec['host_count'],len(source),spec['instructions'],0x41424344)+source
     require(bounded(directory/'input.bin',268)==expected,'packed FEX input mismatch')
     log=bounded(directory/'producer.log',128*1024).decode()
     require(f'NATEMU_WINDOW index=1 guest_rip={rip} source_address=65536 bytes={len(source)} instructions={spec["instructions"]}' in log,'source/guest address binding absent')
-    require(f'NATEMU_ENTRY index=1 guest_rip={rip}' in log and 'NATEMU_MODE bitness=64' in log, 'actual compilation entry/mode mismatch')
+    require(f'NATEMU_ENTRY index=1 guest_rip={rip}' in log and f'NATEMU_MODE bitness={bitness}' in log, 'actual compilation entry/mode mismatch')
     require('NATEMU_COMPLETED tests=1 result=0' in log and 'NATEMU_FEATURES sve128=0 sve256=0 rcpc=0 imm9=0' in log, 'incomplete/wrong-feature compilation')
     objects=[json.loads(line[len('NATEMU_OBJECT '):]) for line in log.splitlines() if line.startswith('NATEMU_OBJECT ')]
     require(len(objects)==2 and [o['index'] for o in objects]==[0,1], 'unexpected object count')
@@ -88,7 +96,7 @@ def parse(directory, case):
         sites.append(dict(native_offset=native,guest_offset=guest,guest_rip=rip+guest,width=width,
                           write=write,address_register=reg,address_displacement=disp,
                           continuation=native+4,phase='precommit',guest_rsp_register=8))
-    return dict(schema='natemu-i4v-program-v1',case=case,guest_rip=rip,bitness=64,
+    return dict(schema='natemu-i4v-program-v1',case=case,guest_rip=rip,bitness=bitness,
                 source_hex=source.hex(),source_sha256=sha(source),body_hex=body.hex(),body_sha256=sha(body),
                 producer_sha256=record['producer_sha256'],object=obj,native_object_sha256=sha(raw),
                 relocations_sha256=sha(reloc),extraction=[12,end],guest_pc=[dict(guest_offset=g,native_offset=n) for g,n in pc],

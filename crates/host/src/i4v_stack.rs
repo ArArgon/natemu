@@ -8,7 +8,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-fn write_packet(path: &Path, packet: &[u64; 16]) -> Result<()> {
+pub(super) fn write_packet(path: &Path, packet: &[u64; 16]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -21,14 +21,24 @@ fn write_packet(path: &Path, packet: &[u64; 16]) -> Result<()> {
     Ok(())
 }
 
-fn start_worker(
+pub(super) fn start_worker(
     worker: &str,
     producer: &str,
     output: &Path,
     request: &[u64; 16],
 ) -> Result<PathBuf> {
+    start_worker_numbered(worker, producer, output, request, 1)
+}
+
+pub(super) fn start_worker_numbered(
+    worker: &str,
+    producer: &str,
+    output: &Path,
+    request: &[u64; 16],
+    number: usize,
+) -> Result<PathBuf> {
     fs::create_dir_all(output).map_err(|e| e.to_string())?;
-    let directory = output.join("request-001");
+    let directory = output.join(format!("request-{number:03}"));
     fs::create_dir(&directory).map_err(|e| e.to_string())?;
     write_packet(&directory.join("request.bin"), request)?;
     let stdout = OpenOptions::new()
@@ -59,7 +69,7 @@ fn start_worker(
     Ok(directory)
 }
 
-fn read_packet(path: &Path) -> Result<[u64; 16]> {
+pub(super) fn read_packet(path: &Path) -> Result<[u64; 16]> {
     let raw = read_input(path.to_str().ok_or("non-UTF8 packet path")?, 128)?;
     if raw.len() != 128 {
         return Err("stack reply packet length differs".into());

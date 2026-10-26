@@ -1,5 +1,65 @@
 # INV-03-01 — source findings review
 
+## Intermediate I4-V return — first paging-off32 execution, October 26, 2026 UTC
+
+Root authored the ABI/runtime and runner, `/root/i4v_producer` authored host and
+worker integration, and `/root/i4v_upstream` authored independent expectations.
+`/root/i4v_contract_review` reviewed the complete path and independently rebuilt
+and executed primary02's retained snapshot. **ACCEPT the finite N=1 flat
+protected32/A20-on checkpoint; V2 and I4-V remain incomplete.**
+
+Independent `i4v-off32-independent-20261026-01` passes230 jobs and212 native
+cells, preserving158 prior cells and adding54 paging-off cells: cold, native
+read-only and warm mappings at two guest RIPs, plus48 corrupted reply controls.
+The reviewer independently rechecked every report,250 actual compilations,
+262 cell-to-compile associations,504 observed stack/paging-off transfers and
+7,534 checksums. The new slice contributes54 compilations and114 transfers.
+All173 retained inputs match primary02. Executable inputs still match the
+workspace; the producer README alone received a subsequent documentation update.
+The reused FEX executable matches its pin, and no compiler containers remain.
+
+Each live request carries all37 source bytes and complete admitted identity,
+including protected32 mode and actual guest RIP. Three chunks are checked before
+the complete64-byte FEX body plus RET is published. The body executes without
+inserted guest-instruction returns. The independent architectural model checks
+all nine instructions, including the16-bit AX merge, while a separate native
+model checks scratch roots and complete frames. Sparse upstream PC metadata is
+used only for the admitted first-store recovery, not invented later boundaries.
+
+The four cold/read-only executions fault before the first store commits. Their
+canonical prefix contains the earlier MOV effects, RAX=0x42 and RDX=0x100000,
+at RIP+10; flags and CR2 remain unchanged. All16 bytes captured immediately before
+retry retain their initial contents. Identity physical routing repairs the
+native mapping and retries the exact store once. The two warm executions need
+no repair. All successful executions produce RAX/RCX=0xffff0042 and RDX=0x42,
+with the exact four-byte data write and all other page bytes preserved. All
+16KiB of poisoned guest table backing remains unchanged and guest walk counts
+stay zero. Corrupting any word in any reply chunk leaves all68 code bytes blank
+and produces no guest effects, including after earlier chunks were staged.
+
+Source, data and native mapping ownership remain enforced despite disabled guest
+paging. Exact mode/segment/A20 admission rejects unsupported profiles rather than
+inventing a guest #PF. The ABI clarification correctly separates this physical
+path and current I4-V coverage from the original P1–P8 paging experiment.
+
+Primary02, the independent replica and subsequent legacy rebuild have identical
+runtime SHA256
+`403465e488c3dcd9a9cbc3dc69803fb0987ad573d9c391f88bdd29d7b7214142`.
+The two RX segments contain168 boot bytes and72,564 main-image bytes. Emitted
+return/exception stack usage is conservatively bounded at15,888 of16,384 bytes,
+leaving496 bytes; the paging-off initialization/completion helpers stay outlined.
+Root's serialized `i4v-off32-regression-20261026-01` passes all87 legacy jobs
+from04:37:06–04:37:46UTC. The reviewer inspected its manifest and matching ELF,
+without claiming a second independent legacy execution.
+
+The independent campaign lasted122 seconds and retained97,735,167 bytes; observed
+peak build/worker process-group RSS was339,738,624/96,239,616 bytes. No substantive
+correctness or reproduction blocker remains in this finite scope. Nonflat
+segmentation, wrapping, A20-off, device/hole routing, mixed paged/paging-off
+concurrency, V3 transitions and remaining V1/broader coverage remain obligations.
+This is neither general protected-mode conformance nor V2/I4-V completion or
+performance acceptance.
+
 ## Intermediate I4-V return — mixed-permission aliases, October 26, 2026 UTC
 
 Root authored ABI/runtime, layout and runner changes; `/root/i4v_producer`

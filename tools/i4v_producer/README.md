@@ -45,6 +45,12 @@ under `i4v-stack-concurrent-producer-20261026-01`. The stack worker admits both
 exact sources, preserves positive incarnation/generation/serial identities and
 bounded vCPU IDs, and emits three chunks from one compilation. N=1 resident
 admission remains strict; concurrent admission compares the stored full context.
+The protected32 case `fex_moffs_load32` admits its complete 64-byte body from
+37 source bytes. Case selection supplies its required bitness; a conflicting
+explicit `--bitness` rejects before compilation. The paging-off worker carries
+all source bytes plus VM/owner/generation/RIP/mode identity, and stages three
+chunks from one fresh compilation. Its finite first-store recovery map does not
+claim all nine guest/native instruction boundaries: the upstream PC table is sparse.
 `--source HEX` and
 `--instructions N` can be supplied with a case and must match it. Case admission
 requires the exact expected host instruction count. The worker retains source,
@@ -88,7 +94,7 @@ The existing input header already supports 32-bit protected-mode compilation.
 FEX asserts a fixed mode within each context, so each request uses a fresh
 context. This does not implement runtime mode switching. The generic compile
 probe accepts `--bitness 32 --source HEX --instructions N --expected-host N`,
-but body admission currently covers only the five finite 64-bit cases.
+and body admission includes the five finite 64-bit cases plus `fex_moffs_load32`.
 
 Final-build controls retain high/low load compilations, high/low RIP-relative
 LEA (the emitted value is the requested RIP + 7), a 32-bit moffs-load case, and
@@ -134,6 +140,15 @@ This publishes original FEX instruction segments in separate slots with resident
 returns at guest-instruction boundaries. Every transfer is retained and bound to
 its one actual compilation; later rejection must leave all slots blank.
 
-The load and stack slices have independently reproduced N=1 evidence. Legacy32
-sources remain preparation for subsequent slices. Concurrent aliases and the
-remaining V1/V2/V3 coverage are still required; this does not complete I4-V.
+Add `--aliases --concurrent-stack --mixed-aliases` for the reviewed N=1/2/3/4
+alias/remap/source and stack-pressure profiles. Add `--paging-off` for the first
+live flat protected32/A20-on profile: two RIPs, cold/read-only/warm native data
+mappings, zero guest page walks, unchanged poisoned tables and48 malformed chunk
+replies. The runtime verifies physical ownership and repairs native mappings
+without synthesizing guest PTE A/D state. It executes the complete body without
+inserted instruction-boundary returns.
+
+Exact results and independent acceptance live in INV-03-01. Nonflat segmentation,
+address wrapping, A20-off, device/hole routes, mixed paged/off concurrency and
+mode transitions remain further work alongside remaining V1 boundaries and the
+broader campaign. This does not complete V1, V2 or I4-V.

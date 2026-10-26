@@ -10,6 +10,7 @@ use natemu_abi::*;
 mod concurrent;
 mod coordinator;
 mod helper;
+mod paging_off32;
 mod partial;
 mod pressure;
 mod recovery;

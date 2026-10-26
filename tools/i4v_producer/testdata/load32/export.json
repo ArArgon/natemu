@@ -1,0 +1,93 @@
+{
+  "schema": "natemu-i4v-program-v1",
+  "case": "fex_moffs_load32",
+  "guest_rip": 1056768,
+  "bitness": 32,
+  "source_hex": "ba00001000b8420000008902b8ffffffffa10000100089c2b8ffffffff66a10000100089c1",
+  "source_sha256": "9da7648fc836399bef8362606c4ff10268afa2c193b0184ff3500c3820e2e722",
+  "body_hex": "0502a05244088052f40305aa1f2003d5a4fc9f880400801295fedf881f2003d5f60304aae40315aae50304aae40316aa94fedf481f2003d5843e40b3e70304aa",
+  "body_sha256": "2af402f2cc5d710040b1c404e116ab625100caba041cc7763847ac0e9037af39",
+  "producer_sha256": "b614bac26ef89bb8b3d2812a2708a5541314e77e06b6c6771d135ab0424cdc33",
+  "object": {
+    "index": 1,
+    "bytes": 192,
+    "code_bytes": 132,
+    "code_offset": 4,
+    "guest_instructions": 9,
+    "relocation_bytes": 144,
+    "block_address": 281472277676160
+  },
+  "native_object_sha256": "9f768e93051d22a261df1f82f632ca2db07e7b4919a808572b73a91f28c3285a",
+  "relocations_sha256": "4b6fbfe5a8a9ab5023516dc9c85276020f90bb29b25648d26b3be5913c0512c3",
+  "extraction": [
+    12,
+    76
+  ],
+  "guest_pc": [
+    {
+      "guest_offset": 0,
+      "native_offset": 4
+    },
+    {
+      "guest_offset": 10,
+      "native_offset": 20
+    }
+  ],
+  "entry_gprs": {
+    "rax": 4,
+    "rbx": 6,
+    "rcx": 7,
+    "rdx": 5,
+    "rsi": 10,
+    "rdi": 11,
+    "rbp": 9,
+    "rsp": 8,
+    "r8": 12,
+    "r9": 13,
+    "r10": 14,
+    "r11": 15,
+    "r12": 16,
+    "r13": 17,
+    "r14": 19,
+    "r15": 29
+  },
+  "flags": "unchanged",
+  "sites": [
+    {
+      "native_offset": 16,
+      "guest_offset": 10,
+      "guest_rip": 1056778,
+      "width": 4,
+      "write": true,
+      "address_register": 5,
+      "address_displacement": 0,
+      "continuation": 20,
+      "phase": "precommit",
+      "guest_rsp_register": 8
+    },
+    {
+      "native_offset": 24,
+      "guest_offset": 17,
+      "guest_rip": 1056785,
+      "width": 4,
+      "write": false,
+      "address_register": 20,
+      "address_displacement": 0,
+      "continuation": 28,
+      "phase": "precommit",
+      "guest_rsp_register": 8
+    },
+    {
+      "native_offset": 48,
+      "guest_offset": 29,
+      "guest_rip": 1056797,
+      "width": 2,
+      "write": false,
+      "address_register": 20,
+      "address_displacement": 0,
+      "continuation": 52,
+      "phase": "precommit",
+      "guest_rsp_register": 8
+    }
+  ]
+}

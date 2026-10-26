@@ -19,7 +19,10 @@ heads, all-participant invalidation acknowledgements and guarded retained-code
 reuse. Event input is an identified level-request fixture, not native IRQ or full
 APIC/IDT delivery. The [I4 setup/profile](../../implementation.md#i4-concurrent-composition)
 records capacity and unsupported behavior. Exploratory development results are
-recorded in INV-03-01. The full
+recorded in INV-03-01. I4-V extends those profiles with reviewed kernel-address
+load/stack and concurrent alias paths; its
+[current coverage and next slices](../investigations/INV-03-01.md#i4-v-active-development--first-v1-slice-october-25-2026)
+remain distinct from the original experiment matrix below. The full
 ABI below remains provisional and unimplemented outside that scope. The original
 review accepts a concrete experimental design, not full runtime conformance.
 
@@ -170,6 +173,15 @@ fault or eligible shadow publication. This intentionally serializes misses, not
 every guest access. Walks cannot hold that authority while waiting for disk,
 network, compilation or guest progress.
 
+For an admitted guest paging-off mode, apply the required segmentation,
+address-width and A20 rules, then resolve the resulting guest physical address
+directly. A native mapping miss can still require repair; it must not trigger an
+x86 page-table walk, PTE A/D update or fabricated #PF. Physical ownership and
+native access permissions remain enforced. Guest mode/context identity belongs
+to compiled code and shadow validity even when there is no guest paging root.
+The first V2 implementation admits flat protected32 with A20 enabled; unsupported
+segment and address policies remain explicit coverage obligations.
+
 | Interface item | Mandatory information |
 | --- | --- |
 | Address-space context | VM/vCPU and context incarnation; paging mode; CR3 and applicable hidden root state; permission controls including CPL, CR0.WP, EFER.NXE and CR4.SMEP; invalidation and memory-policy generations. Numeric CR3 alone is not identity. |
@@ -228,7 +240,8 @@ linear and 40-bit guest-physical addresses, four-level long-mode paging with
 4-KiB/2-MiB leaves, and no LA57, PCID/INVPCID or 1-GiB pages. Larger guest leaves
 can use 4-KiB native shadow pieces, split at permission, type and physical-route
 boundaries. Paging-off startup, legacy32 and legacy PAE remain required inherited
-contracts; this runtime slice tests four-level paging. In particular, legacy PAE's
+contracts; the original P1–P8 experiment tests four-level paging. I4-V's separately
+bounded V2/V3 slices extend execution-mode coverage. In particular, legacy PAE's
 four hidden PDPTEs are guest architectural state: shadow eviction or INVLPG cannot
 reload them; a required CR3/control transition performs their validated load.
 This differs from a disposable shadow cache and must remain representable in
@@ -621,7 +634,7 @@ Use a finite pool of 16 guest page-table pages, 32 native shadow-table pages and
 64 installed native 4-KiB leaf mappings. A large guest leaf is filled on demand;
 this cap does not require prepopulating every piece. Pool exhaustion is tested
 through T9's existing capacity path. Legacy32, paging-off and hidden-PAE behavior
-remain explicit untested coverage, not implied by P1–P8.
+are not implied by P1–P8; their actual I4-V coverage is recorded in INV-03-01.
 
 The oracle's synthetic self-check must reject a lost vector high half, incorrect
 flag recipe, duplicated effect, early remap acknowledgement, stale entry and
