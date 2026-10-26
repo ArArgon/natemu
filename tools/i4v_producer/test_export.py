@@ -16,6 +16,27 @@ class ExportChecks(unittest.TestCase):
             self.assertEqual(len(result['sites']),site_count)
             self.assertEqual(result['entry_gprs']['rsp'],8)
 
+    def test_protected32_steps_keep_actual_guest_rip_and_memory_sites(self):
+        offsets=(0,5,10,12,17,22,24,29,35)
+        for step,offset in enumerate(offsets):
+            case=f'fex_moffs_load32_step{3 if step==6 else step}'
+            result=export.verify(DATA/f'step-{step}-low',dict(case=case,guest_rip=0x102000+offset,bitness=32))
+            self.assertEqual(bytes.fromhex(result['source_hex']),bytes.fromhex(export.CASES['fex_moffs_load32']['source'])[offset:(*offsets,37)[step+1]])
+            self.assertEqual(len(result['sites']),int(step in (2,4,7)))
+            for site in result['sites']:
+                self.assertEqual((site['guest_rip'],site['guest_offset'],site['native_offset']),(0x102000+offset,0,4))
+            if step in (2,7):
+                shifted=export.verify(DATA/f'step-{step}-shifted',dict(case=case,guest_rip=0x102080+offset))
+                self.assertEqual(shifted['body_hex'],result['body_hex'])
+        self.assertEqual(export.verify(DATA/'step-3-low')['body_hex'],export.verify(DATA/'step-6-low')['body_hex'])
+
+    def test_step_source_site_and_requested_rip_mismatches_reject(self):
+        self.mutated('step-2-low','outputs/001.native',lambda b:b[:16]+bytes([b[16]^1])+b[17:])
+        self.mutated('step-7-low','source.x86',lambda b:b[1:])
+        self.mutated('step-2-low','producer.log',lambda b:b.replace(b'guest_offset=0 native_offset=12',b'guest_offset=1 native_offset=12'))
+        with self.assertRaises(ValueError):export.verify(DATA/'step-7-low',dict(guest_rip=0x102000))
+        with self.assertRaises(ValueError):export.verify(DATA/'step-7-low',dict(case='fex_moffs_load32_step4'))
+
     def test_actual_protected32_object_and_sparse_pc_map(self):
         result=export.verify(DATA/'load32',dict(case='fex_moffs_load32',guest_rip=0x102000,bitness=32))
         self.assertEqual(len(bytes.fromhex(result['body_hex'])),64)

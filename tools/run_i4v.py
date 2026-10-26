@@ -32,6 +32,7 @@ def main():
     parser.add_argument('--concurrent-stack', action='store_true', help='also execute N=1..4 stack recovery/source/maintenance composition')
     parser.add_argument('--mixed-aliases', action='store_true', help='also execute N=1..4 parent/leaf permission aliases and terminal fault probes')
     parser.add_argument('--paging-off', action='store_true', help='also execute the live protected32 paging-off slice')
+    parser.add_argument('--paging-off-steps', action='store_true', help='also execute protected32 segment/A20 and serviced-route instruction cases')
     parser.add_argument('--focus', help='retain only one selected alias/stack concurrency cell for diagnosis')
     args = parser.parse_args()
     selected = [f'{family}-{region}-n{n}' for family,enabled in (('alias',args.aliases),('stack',args.concurrent_stack))
@@ -40,6 +41,9 @@ def main():
         selected += [f'stack-{kind}-{region}-n{n}' for kind in ('parent','leaf') for region in ('low','high') for n in (1,2,3,4)]
     if args.paging_off:
         selected += [f'off32-{region}-{scenario}' for region in ('base','offset') for scenario in ('cold','readonly','warm')]
+    step_scenarios = ('segments','a20-off','ds-limit','cs-before-load','cs-inside-load','cs-first','ds-readonly','device','hole','linear-wrap')
+    if args.paging_off_steps:
+        selected += ['off-steps-'+scenario for scenario in step_scenarios]
     if args.focus and args.focus not in selected:
         parser.error('--focus must name a cell enabled by its selected profile')
     if resource.getrlimit(resource.RLIMIT_CPU) != (resource.RLIM_INFINITY,) * 2:
@@ -56,6 +60,7 @@ def main():
                   concurrent_stack_enabled=args.concurrent_stack,
                   mixed_aliases_enabled=args.mixed_aliases,
                   paging_off_enabled=args.paging_off,
+                  paging_off_steps_enabled=args.paging_off_steps,
                   focus=args.focus,
                   limits=dict(build_jobs=2, build_rss_bytes=8*1024**3,
                               worker_rss_bytes=512*1024**2, cell_seconds=120,
@@ -71,6 +76,8 @@ def main():
                      'tools/i4v_stack_worker.py', 'tools/test_i4v_stack_worker.py',
                      'tools/i4v_off_worker.py', 'tools/test_i4v_off_worker.py',
                      'tools/i4v_off_check.py', 'tools/test_i4v_off_check.py',
+                     'tools/i4v_off_steps_worker.py', 'tools/test_i4v_off_steps_worker.py',
+                     'tools/i4v_off_steps_check.py', 'tools/test_i4v_off_steps_check.py',
                      'tools/i4v_stack_check.py', 'tools/test_i4v_stack_check.py',
                      'tools/i4v_alias_worker.py', 'tools/test_i4v_alias_worker.py',
                      'tools/check_i4v_alias.py', 'tools/test_check_i4v_alias.py',
@@ -111,7 +118,8 @@ def main():
             directory.mkdir()
             specification = dict(argv=list(map(str, argv)), cwd=str(source), environment=environment)
             if oracle:
-                specification['oracle'] = str(source / ('tools/i4v_off_check.py' if oracle == 'off32'
+                specification['oracle'] = str(source / ('tools/i4v_off_steps_check.py' if oracle == 'off-steps'
+                    else 'tools/i4v_off_check.py' if oracle == 'off32'
                     else 'tools/i4v_stack_check.py' if oracle == 'stack'
                     else 'tools/check_i4v_alias.py' if oracle == 'aliases'
                     else 'tools/check_i4v_stack_concurrent.py' if oracle == 'concurrent-stack' else 'tools/i4v_check.py'))
@@ -145,6 +153,8 @@ def main():
         job('concurrent-stack-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_check_i4v_stack_concurrent.py'])
         job('off32-worker-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_off_worker.py'])
         job('off32-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_off_check.py'])
+        job('off-steps-worker-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_off_steps_worker.py'])
+        job('off-steps-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_off_steps_check.py'])
         job('build-host', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-host'], wall=600, rss=8*1024**3)
         job('build-runtime', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], wall=600, rss=8*1024**3)
         host = source / 'target/release/natemu-host'
@@ -272,6 +282,40 @@ def main():
                         report['off']['requests'][:transfers],report['off']['replies'][:transfers])
                     if exported['guest_rip'] != rip or exported['bitness'] != 32 or exported['body_hex'] != report['body_hex']:
                         raise ValueError('paging-off compile differs from actual RIP/mode/body')
+                    record['compilations'].append(dict(directory=str(directory.relative_to(run)),export=exported))
+                record['cells'].append(dict(name=label,producer=str(output.relative_to(run)),reply_mutation=mutation))
+        if args.paging_off_steps:
+            sys.path.insert(0, str(source / 'tools'))
+            steps_worker = module(source / 'tools/i4v_off_steps_worker.py', 'steps_worker')
+            sys.path.pop(0)
+            step_cells = [(scenario,-1) for scenario in step_scenarios]
+            if not args.focus:
+                step_cells += [('segments',mutation) for mutation in range(25)]
+            for scenario,mutation in step_cells:
+                label = 'off-steps-'+scenario + (f'-reply-{mutation}' if mutation >= 0 else '')
+                if args.focus and label != args.focus:
+                    continue
+                output = run / (label+'-producer')
+                argv = [host,runtime,'i4v-off-steps',producer,scenario,'1',
+                        source / 'tools/i4v_off_steps_worker.py',output]
+                if mutation >= 0:
+                    argv.append(str(mutation))
+                result = job(label,argv,oracle='off-steps')
+                report = json.loads((result/'command.stdout').read_text())
+                transfers = report['steps']['transfers']
+                if (report['case'] != 'fex_moffs_load32_steps' or report['live'] != 1
+                        or report['scenario'] != scenario or report['rip'] != 0x2000
+                        or report['reply_mutation'] != mutation or report['requests'] != transfers
+                        or report['steps']['profile'] != step_scenarios.index(scenario)):
+                    raise ValueError('instruction report differs from requested identity/transfers')
+                requests = report['steps']['requests'][:transfers]
+                replies = report['steps']['replies'][:transfers]
+                steps_worker.verify_compilations(output,requests,replies)
+                for index,request in enumerate(requests):
+                    directory = output / f'request-{index:03}'
+                    exported = steps_worker.verify_request(directory,request)
+                    if exported['guest_rip'] != request[7] or exported['bitness'] != 32:
+                        raise ValueError('instruction compile differs from actual EIP/mode')
                     record['compilations'].append(dict(directory=str(directory.relative_to(run)),export=exported))
                 record['cells'].append(dict(name=label,producer=str(output.relative_to(run)),reply_mutation=mutation))
         if args.aliases:

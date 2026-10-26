@@ -51,6 +51,12 @@ explicit `--bitness` rejects before compilation. The paging-off worker carries
 all source bytes plus VM/owner/generation/RIP/mode identity, and stages three
 chunks from one fresh compilation. Its finite first-store recovery map does not
 claim all nine guest/native instruction boundaries: the upstream PC table is sparse.
+The `fex_moffs_load32_step0` through `step8` cases (step6 reuses step3) instead
+compile each guest instruction separately. Retained probes at two RIP bases and
+LLVM disassembly establish their exact bodies and memory sites. The step worker
+compiles at architectural EIP, binds CS-derived linear fetch and source GPA plus
+the admitted context, and checks the exact one-instruction reply before publishing
+that slot. A rejected later reply preserves earlier committed instructions.
 `--source HEX` and
 `--instructions N` can be supplied with a case and must match it. Case admission
 requires the exact expected host instruction count. The worker retains source,
@@ -148,7 +154,15 @@ replies. The runtime verifies physical ownership and repairs native mappings
 without synthesizing guest PTE A/D state. It executes the complete body without
 inserted instruction-boundary returns.
 
-Exact results and independent acceptance live in INV-03-01. Nonflat segmentation,
-address wrapping, A20-off, device/hole routes, mixed paged/off concurrency and
-mode transitions remain further work alongside remaining V1 boundaries and the
-broader campaign. This does not complete V1, V2 or I4-V.
+Add `--paging-off-steps` for per-instruction segment/A20 tests: nonzero bases,
+precise CS/DS faults, linear base addition wrapping, distinct A20-selected RAM,
+bounded device/hole service and25 late-reply rejection controls. Only the active
+source page contains valid code; the inactive page stays poisoned. These fixtures
+use page-aligned bases and do not establish general address-size or maximum-limit
+crossing semantics. Every instruction prefix and physical page is independently
+checked, alongside unchanged guest page tables and CR2.
+
+Exact results and independent acceptance live in INV-03-01. Broader segment and
+address forms, mixed paged/off concurrency and mode transitions remain further
+work alongside remaining V1 boundaries and the broader campaign. This does not
+complete V1, V2 or I4-V.

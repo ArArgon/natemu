@@ -41,6 +41,9 @@ pub(super) unsafe fn exception_at(vector: u64, address: u64, error: u64, rip: u6
 
 pub unsafe fn initialize() -> ! {
     unsafe {
+        if (*state()).case == natemu_abi::paging_off_steps::CASE {
+            super::paging_off_steps::initialize()
+        }
         if (*state()).case == natemu_abi::paging_off32::CASE {
             super::paging_off32::initialize()
         }
@@ -136,6 +139,9 @@ pub unsafe fn initialize() -> ! {
 
 pub unsafe fn finish(fault: u64) -> ! {
     unsafe {
+        if (*state()).case == natemu_abi::paging_off_steps::CASE {
+            super::paging_off_steps::finish(fault)
+        }
         if (*state()).case == natemu_abi::paging_off32::CASE {
             super::paging_off32::finish(fault)
         }

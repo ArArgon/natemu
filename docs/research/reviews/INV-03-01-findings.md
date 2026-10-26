@@ -1,5 +1,75 @@
 # INV-03-01 — source findings review
 
+## Intermediate I4-V return — protected32 instruction boundaries, October 26, 2026 UTC
+
+Root authored ABI/runtime and runner changes, `/root/i4v_producer` authored
+producer/host integration and `/root/i4v_upstream` authored independent expected
+effects. `/root/i4v_contract_review` reviewed the contracts, source and emitted
+code, then independently rebuilt and executed primary02's retained snapshot.
+**ACCEPT the finite N=1 protected32 per-instruction checkpoint; V2 and I4-V
+remain incomplete.**
+
+Independent `i4v-off-steps-independent-20261026-01` passes267 jobs and247 native
+cells, preserving212 prior cells and adding35: ten address/service profiles and
+25 malformed-reply controls. The reviewer rechecked every report,496 actual
+compilations,508 cell-to-compile associations,750 delivered transfers and11,841
+checksums. All269 retained inputs match primary02; only the producer README
+subsequently changed in the workspace. The reused FEX executable matches its
+pin and no compiler containers remain. The separate27-compilation discovery and
+disassembly bundle also has224 verified checksums; the native campaign freshly
+compiles each requested instruction at its actual architectural EIP.
+
+The new cells contain246 instruction compilations/deliveries,221 committed
+prefixes and76 native faults:70 owned-RAM repairs and six device/hole services.
+The independent oracle checks all native and canonical prefixes, three complete
+data pages, both complete source pages, unchanged poisoned table backing and
+zero guest walks. DS-limit and read-only denial preserve two instructions at
+EIP0x200a; both later CS-limit cases preserve four at0x2011; first-fetch denial
+preserves none at0x2000. Each reports #GP/error0 with CR2 unchanged. Late rejected
+replies preserve earlier code/effects and leave the rejected slot unpublished.
+
+Nonzero CS/DS bases, A20 masking and32-bit segment-base addition wrapping use
+distinct owned physical backings. Review found that initially identical source
+bytes in both A20 source pages would not expose a wrong backing selection. Before
+native collection, the host seeded only the selected source page and poisoned
+the inactive page; the independent oracle checks both pages and rejects swapped,
+duplicated or incorrectly addressed source data. Native FAR remains the generated
+operand offset, while recorded linear/GPA identities reflect segment/A20 rules.
+Matching native/physical page offsets is an explicit admission condition.
+
+Each original guest instruction is separately compiled; no whole-block recovery
+boundaries are guessed. For device/hole cases, the bounded service completes only
+the faulting memory subaccess and resumes at the next native instruction, so the
+original generated AX merge still runs. The device retains the declared dword
+value; the declared hole discards writes and returns all ones. These fixtures
+establish the service boundary, not a complete device implementation.
+
+The reviewed address contract checks segment rights and width-aware limits before
+base addition and physical A20 masking. The selected limit cases avoid ambiguous
+maximum-limit crossings; broader wrapping behavior remains explicitly untested.
+These premises follow [Intel SDM Volume3A, sections3.4,6.3.1 and10.7](https://cdrdv2-public.intel.com/850978/253668-087-sdm-vol-3a.pdf).
+The ABI clarification correctly distinguishes architectural EIP, linear fetch,
+source GPA and declared native operand form.
+
+The direct common-frame copy is safe for the three capture gates: each source is
+a stable native/exception-stack frame disjoint from `Shared.captured`. It removes
+the full-frame temporary, reducing the common completion frame to32 bytes.
+Primary02, independent replica and subsequent legacy rebuild share runtime SHA256
+`897032afde16460ef3055fbe5b0b9dda6be7f3aeb2670b746056075107335e8c`.
+The two RX segments contain168 boot bytes and78,932 main-image bytes; the
+conservative return/exception stack bound is15,024 of16,384 bytes, leaving1,360.
+Root's serialized `i4v-off-steps-regression-20261026-01` passes87 legacy jobs from
+05:04:31–05:05:13UTC. The reviewer inspected its manifest and matching ELF,
+without claiming a second independent legacy execution.
+
+The independent run lasted193 seconds and retained121,970,202 bytes; observed
+peak build/worker process-group RSS was411,353,088/96,272,384 bytes. No substantive
+correctness or reproduction blocker remains within this finite scope. Mixed
+paged/paging-off N-vCPU execution, general address-size wrapping, maximum-limit
+crossings, subpage segment bases, other segment forms, V3 transitions and remaining
+V1/broader coverage remain obligations. No V2/I4-V completion or performance
+acceptance follows.
+
 ## Intermediate I4-V return — first paging-off32 execution, October 26, 2026 UTC
 
 Root authored the ABI/runtime and runner, `/root/i4v_producer` authored host and

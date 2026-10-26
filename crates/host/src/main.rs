@@ -9,6 +9,7 @@ mod concurrent;
 mod coordinator_tests;
 mod i4v;
 mod i4v_off;
+mod i4v_off_steps;
 mod i4v_stack;
 mod recovery;
 mod translation;
@@ -354,6 +355,9 @@ fn seed(index: usize) -> (NativeFrame, [u8; 512], [u8; 256]) {
 }
 fn run() -> Result<()> {
     let a: Vec<_> = env::args().collect();
+    if (a.len() == 8 || a.len() == 9) && a[2] == "i4v-off-steps" {
+        return i4v_off_steps::run(&a);
+    }
     if (a.len() == 9 || a.len() == 10) && a[2] == "i4v-off-live" {
         return i4v_off::run(&a);
     }

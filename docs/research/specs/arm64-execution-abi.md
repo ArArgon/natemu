@@ -150,8 +150,8 @@ resident handles or scalar values. A pointer-sized guest value remains guest dat
 ### Paging interface
 
 The runtime owns x86 translation semantics and native shadows. The producer owns
-address formation and supplies the architectural intent of each access, including
-implicit helper accesses. The ordinary path is:
+the effective-address expression and supplies the architectural intent and address
+form of each access, including implicit helper accesses. The ordinary paged path is:
 
 ```text
 x86 instruction computes a guest linear address
@@ -179,8 +179,19 @@ directly. A native mapping miss can still require repair; it must not trigger an
 x86 page-table walk, PTE A/D update or fabricated #PF. Physical ownership and
 native access permissions remain enforced. Guest mode/context identity belongs
 to compiled code and shadow validity even when there is no guest paging root.
-The first V2 implementation admits flat protected32 with A20 enabled; unsupported
-segment and address policies remain explicit coverage obligations.
+Finite V2 profiles admit flat protected32 and selected segment/A20/service paths;
+unsupported segment and address policies remain explicit coverage obligations.
+
+In protected32, architectural EIP is a segment offset. Keep it distinct from the
+CS-derived linear fetch address and the resolved source GPA, and bind all three
+to the admitted context. Exception state and FEX's logical compilation PC use
+the architectural offset; source ownership uses the resolved physical identity.
+Likewise, a registered native operand may carry a segment offset rather than a
+linear address. The semantic adapter must declare that form, and the runtime
+applies the admitted segment rights/limit/base before physical resolution. Native
+FAR alone is not the architectural linear fault address. The per-instruction V2
+direct-mapping profile admits only matching native/GPA page offsets; other bases
+need explicit address formation or service rather than dropping low address bits.
 
 | Interface item | Mandatory information |
 | --- | --- |

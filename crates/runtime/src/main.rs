@@ -11,6 +11,7 @@ mod concurrent;
 mod coordinator;
 mod helper;
 mod paging_off32;
+mod paging_off_steps;
 mod partial;
 mod pressure;
 mod recovery;
@@ -121,7 +122,11 @@ unsafe extern "C" fn runtime_main() -> ! {
 unsafe extern "C" fn finish(frame: *const NativeFrame, fault: u64) -> ! {
     unsafe {
         let s = shared();
-        write_record(&raw mut (*s).captured, read_record(frame));
+        copy_record(
+            (&raw mut (*s).captured).cast(),
+            frame.cast(),
+            size_of::<NativeFrame>(),
+        );
         if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::concurrency::MODE {
             concurrent::completed(fault);
         }
