@@ -1,5 +1,91 @@
 # INV-03-01 — source findings review
 
+## Intermediate I4-V return — long-mode transactions, October 26, 2026 UTC
+
+Root authored ABI/runtime and runner changes, `/root/i4v_producer` authored
+host/compiler integration, and `/root/i4v_upstream` authored independent expected
+effects. `/root/i4v_contract_review` checked the architectural transaction rules,
+implementation, oracle and emitted code, then independently rebuilt and executed
+primary02's retained snapshot. **ACCEPT the finite N=1 IA-32e transaction
+checkpoint; broader V3 and I4-V remain incomplete.**
+
+Independent `i4v-longmode-independent-20261026-01` passes318 jobs and294 native
+cells, retaining277 prior cells and adding17 programs. The reviewer independently
+rechecked all294 reports,744 actual compilations,756 report-to-compile
+associations,998 delivered transfers and16,495 checksums. All498 retained inputs
+match primary02 and the workspace at audit time. The reused FEX binary matches
+its pin and no compiler containers remain. Subsequent documentation updates do
+not change execution evidence.
+
+The17 new programs contain169 visits,155 completed guest instructions,81 native
+entries,13 native faults,71 guest walks and73 context invalidations. All82 new
+actual compilations and delivered replies bind source, EIP, context and decode
+width:76 use32-bit decoding and six use64-bit decoding. Reports check15 descriptor
+reads, four pointer reads and two explicit fixture mutations. Fourteen terminal
+guest faults comprise ten#GP, one#NP, one#UD and two#PF.
+
+Direct entry follows paging-off → IA-32e compatibility →64-bit execution →
+compatibility → paging-off. The separate legacy-PAE composition retains its
+loaded hidden roots without treating PAE execution as a boot prerequisite.
+Generated64-bit loads return0xa5a5a5a511220000; subsequent32-bit loads return
+0x11220000. The return-to-context case revisits the same numerical controls and
+source PC with context5, rejecting context1's entry and its actual delayed reply,
+including a copy with only the serial rebound. Native bodies execute actual FEX
+output in their requested width; privileged controls and far transfers belong to
+the resident semantic owner.
+
+The resident reads the actual far pointer and GDT descriptor through the current
+guest translation before committing CS/RIP/context. Pointer#PF retains CS64 and
+the old RIP; target-fetch#PF after successful transfer retains committed CS64 and
+target RIP. Noncanonical-target#GP preserves CR2 and the earlier generated load.
+The finite direct-code checks distinguish selector-limit/type/privilege and L/D
+errors from nonpresence, and target errors from selector errors. Immediate far
+jump in64-bit mode produces#UD. MOV-CR/WRMSR checks preserve state on prohibited
+LME/PG/PAE combinations,16-bit-TSS activation and other admitted rejection cases.
+These rules were independently checked against
+[Intel SDM Volume2A, JMP](https://cdrdv2-public.intel.com/922480/253666-092-sdm-vol-2a.pdf),
+[Volume2B, MOV Control Registers](https://cdrdv2-public.intel.com/922481/253667-092-sdm-vol-2b.pdf)
+and [Volume3A §5.1.2](https://cdrdv2-public.intel.com/922487/253668-092-sdm-vol-3a.pdf).
+
+Review found one oracle priority error before the full run: combined L=D=1/P=0
+must produce#GP(selector) before the presence test can produce#NP. The author
+corrected the independent model and added a combined test preserving CS/RIP/
+context. All17 checker methods pass independently. Focused
+`i4v-longmode-dev-20261026-01` passes with1,506 checksums and eight actual
+compilation/delivery associations independently verified. Its valid-descriptor
+trace is unaffected by the later oracle correction; full primary02 and the fresh
+replica contain that correction and supply acceptance evidence.
+
+The specification accurately describes the finite capture policy: outside64-bit
+mode, the first four canonical GPR roots receive their low32 bits on native
+capture. This is a deterministic policy for undefined upper halves, not a
+preservation promise across compatibility execution. Full64-bit capture and
+32-bit destination results are checked separately. Legal descriptor forms outside
+flat, accessed, nonconforming admission remain Unsupported. Descriptor accessed-
+bit writes, full guest IDT delivery and general all-address invalidation are not
+claimed. Pinned KVM `test_ljmp` contributes the memory far-pointer expectation;
+its retained excerpt, license/hash and adaptation explanation explicitly separate
+that source from project-authored mode changes and rejection schedules.
+
+Primary02, the independent rebuild and legacy rebuild share runtime SHA256
+`0253d559816b9c497747282315034c26e32fab144ce87e54d85512f0e7d5b98b`.
+The two RX loads contain168 boot bytes and117,100 main-image bytes. Boot ADR
+resolves the aligned vectors inside the main window; added state/table regions
+remain disjoint. Conservative maximum return/exception stack use remains14,992
+of16,384 bytes, leaving1,392. New far-transfer/read helpers use176/48-byte frames;
+controls finish uses176 and dispatch/compile use1,872/1,232. Root's serialized
+`i4v-longmode-regression-20261026-01` passes87 jobs from07:29:27–07:30:10UTC;
+the reviewer inspected its terminal manifest and matching ELF without claiming
+a second independent legacy execution.
+
+The independent run lasted287 seconds,07:24:25–07:29:12UTC, retaining171,101,816
+bytes. Peak observed build/worker process-group RSS was457,310,208/388,415,488
+bytes, within the limits. No substantive blocker remains for this finite scope.
+Concurrent mode/hidden-state transitions, remaining V1/V2 address and boundary
+cases, broader descriptor/exception behavior and the integrated memory-ordering/
+coherence campaign remain required. This is neither full V3/I4-V completion nor
+a performance result.
+
 ## Intermediate I4-V return — hidden PAE state, October 26, 2026 UTC
 
 Root authored ABI/runtime and runner changes, `/root/i4v_producer` authored

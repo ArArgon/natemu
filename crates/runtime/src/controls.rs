@@ -6,6 +6,7 @@ use natemu_abi::{
     paging::{Access, Control, Fault},
     paging32, recovery as r, translation as wire,
 };
+mod long_mode;
 unsafe extern "C" {
     fn service(packet: *mut wire::Packet);
     fn service_resume();
@@ -118,7 +119,7 @@ unsafe fn route(address: u64, bytes: u64, access: Access) -> Result<(u64, bool),
                 cr3: g.control[2],
                 cpl: (*state()).cpl,
                 wp: (g.control[0] >> 16) & 1,
-                nxe: 0,
+                nxe: (g.control[4] >> 11) & 1,
                 smep: 0,
             };
             let t = if mode == 2 {
@@ -132,6 +133,10 @@ unsafe fn route(address: u64, bytes: u64, access: Access) -> Result<(u64, bool),
                     address,
                     access,
                 )?
+            } else if mode >= 3 {
+                let mut control = control;
+                control.cr3 &= natemu_abi::paging::PA_MASK;
+                long_mode::walk(control, address, access)?
             } else {
                 paging32::walk(&mut Tables, control, address, access)?
             };
@@ -158,6 +163,9 @@ unsafe fn summarize() {
         (*v).generation_after = (*state()).generation;
         (*v).gpr_after.copy_from_slice(&(&(*g).gpr)[..4]);
         (*v).flags_after = (*g).rflags;
+        if (*state()).profile >= 22 {
+            long_mode::summarize();
+        }
         if (*state()).profile >= 13 {
             (*pae_visit()).after = (*pae_state()).hidden;
             (*pae_visit()).attempts_after = (*pae_state()).attempts;
@@ -262,7 +270,10 @@ unsafe fn compile(source: &[u8]) {
         let v = visit();
         let p = next_request(source);
         (*v).request = p;
-        if ((*r).profile == 0 && (*r).visits == 16) || ((*r).profile == 21 && (*r).visits == 12) {
+        if ((*r).profile == 0 && (*r).visits == 16)
+            || ((*r).profile == 21 && (*r).visits == 12)
+            || ((*r).profile == 24 && (*r).visits == 11)
+        {
             let old_index = if (*r).profile == 21 { 4 } else { 0 };
             let old_rip = if (*r).profile == 21 {
                 c::RIP + 16
@@ -310,7 +321,9 @@ unsafe fn compile(source: &[u8]) {
         image[start..start + count].copy_from_slice(&reply[14].to_le_bytes()[..count]);
         image[start + count..start + count + 4].copy_from_slice(&RET);
         translation::replace_bytes(&image);
-        if ((*r).profile == 0 && (*r).visits == 1) || ((*r).profile == 21 && (*r).visits == 5) {
+        if (matches!((*r).profile, 0 | 24) && (*r).visits == 1)
+            || ((*r).profile == 21 && (*r).visits == 5)
+        {
             (*r).old_slot_context = (*r).generation;
             (*r).old_controls = (*guest()).control;
             let deferred = next_request(source);
@@ -337,6 +350,9 @@ unsafe fn begin_visit() {
         (*at).generation_before = (*s).generation;
         (*at).gpr_before.copy_from_slice(&(&(*g).gpr)[..4]);
         (*at).flags_before = (*g).rflags;
+        if (*s).profile >= 22 {
+            long_mode::begin();
+        }
         if (*s).profile >= 13 {
             (*pae_visit()).before = (*pae_state()).hidden;
             (*pae_visit()).attempts_before = (*pae_state()).attempts;
@@ -371,7 +387,16 @@ unsafe fn control(source: &[u8]) {
         (*visit()).kind = 1;
         let operation = c::decode(source).and_then(|op| {
             let before = (*guest()).control;
-            let after = c::prepare(&*guest(), (*state()).cpl, op, (*state()).profile >= 13)?;
+            let after = if (*state()).profile >= 22 {
+                natemu_abi::modes::prepare(
+                    &*guest(),
+                    &(*long_mode::state()).tr,
+                    (*state()).cpl,
+                    op,
+                )?
+            } else {
+                c::prepare(&*guest(), (*state()).cpl, op, (*state()).profile >= 13)?
+            };
             let generation = (*state())
                 .generation
                 .checked_add(1)
@@ -403,7 +428,10 @@ unsafe fn control(source: &[u8]) {
         match operation {
             Ok(op) => {
                 invalidate();
-                (*guest()).rip = (*guest()).rip.wrapping_add(op.bytes as u64) & 0xffff_ffff;
+                (*guest()).rip = (*guest()).rip.wrapping_add(op.bytes as u64);
+                if c::mode(&*guest()) != Some(4) {
+                    (*guest()).rip &= 0xffff_ffff;
+                }
                 complete_visit();
             }
             Err(c::Error::GeneralProtection) => exception(13, 0, 0),
@@ -427,13 +455,15 @@ pub unsafe fn initialize() -> ! {
             || (*g).rip != c::RIP
             || (*g).control[0] != 0x10011
             || (*g).control[2]
-                != if (*r).profile >= 13 {
+                != if (*r).profile == 24 {
+                    natemu_abi::modes::ROOT
+                } else if (*r).profile >= 13 {
                     pae::ROOT
                 } else {
                     0x1000
                 }
-            || (*g).control[3] != 0x600
-            || (*g).control[4] != 0
+            || (*g).control[3] != if (*r).profile == 24 { 0x620 } else { 0x600 }
+            || (*g).control[4] != if (*r).profile == 24 { 0x100 } else { 0 }
             || (*s).initial.x[6] != DATA_VA
             || (*s).initial.x[4] > u32::MAX as u64
             || (*s).initial.sp != STACK_TOP
@@ -474,6 +504,9 @@ pub unsafe fn initialize() -> ! {
                 stop(REJECTED, 290);
             }
         }
+        if !long_mode::initial_valid((*r).profile) {
+            stop(REJECTED, 309);
+        }
         (*s).service_pc = service_resume as *const () as u64;
         recovery::clear_mapping(DATA_VA);
         dispatch()
@@ -488,6 +521,7 @@ unsafe fn dispatch() -> ! {
             let (_, bytes) = c::source((*r).profile).unwrap();
             if ((*r).profile == 0 && (*r).completed == 17)
                 || ((*r).profile == 21 && (*r).completed == 12)
+                || ((*r).profile == 24 && (*r).completed == 11)
                 || ((*r).profile != 0 && (*g).rip == c::RIP + bytes as u64)
             {
                 (*validation()).stage = 2;
@@ -510,6 +544,9 @@ unsafe fn dispatch() -> ! {
             (*visit()).bytes = instruction.len as u64;
             (*visit()).source = u64::from_le_bytes(actual);
             let source = &actual[..instruction.len];
+            if long_mode::instruction(source) {
+                continue;
+            }
             if source == [0x0f, 1, 0x3b] {
                 if (*r).profile != 14 || (*r).cpl != 0 || (*r).current.x[6] != DATA_VA {
                     stop(REJECTED, 291);
@@ -536,7 +573,7 @@ unsafe fn dispatch() -> ! {
                 control(source);
                 continue;
             }
-            if matches!(actual[0], 0x89 | 0x8b) && (*r).current.x[6] != DATA_VA {
+            if matches!(actual[0], 0x89 | 0x8b | 0x48) && (*r).current.x[6] != DATA_VA {
                 stop(REJECTED, 284);
             }
             compile(source);
@@ -552,7 +589,7 @@ unsafe fn dispatch() -> ! {
             (*shared()).capture_pc = frame.x[30];
             (*visit()).entries = 1;
             (*validation()).stage = 1;
-            if matches!(actual[0], 0x89 | 0x8b) && (*r).mapping != 0 {
+            if matches!(actual[0], 0x89 | 0x8b | 0x48) && (*r).mapping != 0 {
                 memory_before((*r).mapping);
             }
             enter(&raw const (*shared()).initial)
@@ -585,7 +622,12 @@ pub unsafe fn finish(fault: u64) -> ! {
             size_of::<NativeFrame>(),
         );
         for (guest, native) in [(0, 4), (1, 7), (2, 5), (3, 6)] {
-            (*g).gpr[guest] = (*r).current.x[native] & 0xffff_ffff;
+            (*g).gpr[guest] = (*r).current.x[native]
+                & if c::mode(&*g) == Some(4) {
+                    u64::MAX
+                } else {
+                    0xffff_ffff
+                };
         }
         let opcode = (*v).source as u8;
         if fault != 0 {
@@ -593,7 +635,7 @@ pub unsafe fn finish(fault: u64) -> ! {
             let site =
                 CODE_VA + ((*r).visits - 1) * c::SLOT_BYTES as u64 + if write { 4 } else { 0 };
             let (esr, far, pc, spsr) = ((*s).esr, (*s).far, (*s).elr, (*s).spsr);
-            if !matches!(opcode, 0x89 | 0x8b)
+            if !matches!(opcode, 0x89 | 0x8b | 0x48)
                 || esr >> 26 != 0x25
                 || (esr >> 6) & 1 != u64::from(write)
                 || !matches!(esr&63,4..=7|12..=15)
@@ -611,14 +653,17 @@ pub unsafe fn finish(fault: u64) -> ! {
                 (&raw const (*s).captured).cast(),
                 size_of::<NativeFrame>(),
             );
-            let (gpa, writable) =
-                route_or_fault(far, 4, if write { Access::Write } else { Access::Read });
+            let (gpa, writable) = route_or_fault(
+                far,
+                if opcode == 0x48 { 8 } else { 4 },
+                if write { Access::Write } else { Access::Read },
+            );
             memory_before(gpa);
             (*r).mapping = gpa;
             recovery::install_ram(far, gpa, writable);
             resume_exception(&raw const (*s).captured, pc, spsr)
         }
-        if matches!(opcode, 0x89 | 0x8b) {
+        if matches!(opcode, 0x89 | 0x8b | 0x48) {
             if (*v).gpa == 0 || (*v).gpa != (*r).mapping {
                 stop(PANIC, 288);
             }
@@ -630,6 +675,7 @@ pub unsafe fn finish(fault: u64) -> ! {
         }
         (*g).rip += (*v).bytes;
         complete_visit();
+        long_mode::after_native(opcode);
         if (*r).profile == 1 && (*r).completed == 3 {
             let at = (PRIVATE + shadow::leaf_offset(DATA_VA).unwrap() as u64) as *const u64;
             (*r).warm_before_reload = ptr::read_volatile(at);

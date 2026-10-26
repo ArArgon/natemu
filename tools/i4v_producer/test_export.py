@@ -17,8 +17,8 @@ class ExportChecks(unittest.TestCase):
             self.assertEqual(result['entry_gprs']['rsp'],8)
 
     def test_generated_control_values_decode_to_exact_zero_extended_eax(self):
-        for value in (0x10011,0x80010011,0x1000,0x3000,0,0x80010010,0x20010011,0xffffffff,0x600,0x1003,0x11,0x80000011,0x680,0x620,0x6a0,0x1020):
-            result=export.verify(DATA/f'control-imm-{value:08x}',dict(case=f'fex_mov_eax_{value:08x}',guest_rip=0x102000 if value in (0x1003,0x11,0x80000011,0x680,0x620,0x6a0,0x1020) else 0x2000,bitness=32))
+        for value in (0x10011,0x80010011,0x1000,0x3000,0,0x80010010,0x20010011,0xffffffff,0x600,0x1003,0x11,0x80000011,0x680,0x620,0x6a0,0x1020,0x100,0x6000):
+            result=export.verify(DATA/f'control-imm-{value:08x}',dict(case=f'fex_mov_eax_{value:08x}',guest_rip=0x102000 if value in (0x1003,0x11,0x80000011,0x680,0x620,0x6a0,0x1020,0x100,0x6000) else 0x2000,bitness=32))
             self.assertEqual(bytes.fromhex(result['source_hex']),b'\xb8'+value.to_bytes(4,'little'))
             body=bytes.fromhex(result['body_hex']);eax=None
             for offset in range(0,len(body),4):
@@ -34,6 +34,15 @@ class ExportChecks(unittest.TestCase):
                 else:self.fail(f'non-MOV-wide native instruction {word:#x}')
             self.assertEqual(eax,value)
             self.assertEqual(result['sites'],[])
+
+    def test_identical_control_bytes_keep_distinct_real_compiler_modes(self):
+        directory=DATA/'control-imm-00010011-mode64'
+        result=export.verify(directory,dict(case='fex_mov_eax_00010011_mode64',bitness=64,guest_rip=0x102000))
+        self.assertEqual(result['body_hex'],'240280522400a072')
+        self.assertEqual(result['source_hex'],'b811000100')
+        with self.assertRaises(ValueError):export.verify(directory,dict(bitness=32))
+        with self.assertRaises(ValueError):export.verify(directory,dict(case='fex_mov_eax_00010011'))
+        self.mutated('control-imm-00010011-mode64','producer.log',lambda b:b.replace(b'bitness=64',b'bitness=32'))
 
     def test_control_prefix_memory_and_operand_mutations(self):
         for name,offset,write in [('store_eax_ebx',4,True),('load_eax_ebx',0,False)]:

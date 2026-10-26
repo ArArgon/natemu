@@ -173,7 +173,7 @@ produce identical bytes. Shared data/table mutations use the existing coordinato
 paging-off identity routes must remain unchanged when paged routes move.
 `probe_mixed32.py` retains count discovery, checked exports and disassembly.
 
-Add `--controls` for the single-vCPU protected32/legacy32/PAE programs. The
+Add `--controls` for the single-vCPU protected32/legacy32/PAE/IA-32e programs. The
 resident runtime fetches and handles MOV-to-CR0/CR3/CR4; ordinary instructions
 between those controls are freshly compiled by FEX at their actual EIP. Cases
 `fex_mov_eax_HEX8`, `fex_store_eax_ebx32` and `fex_load_eax_ebx32` admit the
@@ -203,7 +203,17 @@ The PAE A/B/A case also retains an actual deferred compilation across reloads.
 Native PAE coverage is4-KiB/NXE-off; larger-page/NX walker unit tests do not imply
 native coverage. PAE concurrency and full exception delivery remain unimplemented.
 
+Seventeen IA-32e programs add direct paging-off entry, descriptor-checked far
+transfers, return to compatibility mode and paging-off, plus a separate legacy
+PAE composition. WRMSR EFER and far jumps use resident system semantics. The
+worker selects an export by source bytes and decoding width: wire mode 3 is
+compatibility32, while mode 4 selects the 64-bit producer. New actual probes cover
+32-bit MOV-immediate 0x100/0x6000 and 64-bit-decoded MOV EAX,0x10011; the retained 64-bit
+load checks full-width state. Identical emitted bytes never justify substituting
+a 32-bit compilation for a 64-bit request. Illegal transitions, pointer/descriptor
+faults, postcommit fetch faults and stale-context replies have independent checks.
+
 Exact results and independent acceptance live in INV-03-01. Broader segment and
-address forms, IA-32e and concurrent transitions remain further work alongside remaining V1
+address forms and concurrent transitions remain further work alongside remaining V1
 boundaries and the broader campaign. These finite profiles do not complete V1,
 V2, V3 or I4-V.

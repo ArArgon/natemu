@@ -41,6 +41,7 @@ pub mod mixed32;
 pub mod paging;
 pub mod paging32;
 pub mod pae;
+pub mod modes;
 pub mod paging_off32;
 pub mod paging_off_steps;
 pub mod pressure;

@@ -1,6 +1,6 @@
 //! Actual guest control instructions around freshly generated ordinary instructions.
 use super::*;
-use natemu_abi::{controls as control, pae, recovery as recover, shadow, validation};
+use natemu_abi::{controls as control, modes, pae, recovery as recover, shadow, validation};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -12,7 +12,7 @@ const PAE_TABLE_BYTES: usize = pae::TABLE_BYTES;
 
 fn pae_tables(profile: u64) -> [u8; PAE_TABLE_BYTES] {
     let mut bytes = [0; PAE_TABLE_BYTES];
-    if (13..=21).contains(&profile) {
+    if profile >= 13 {
         for (gpa, value) in [
             (
                 0x1020,
@@ -35,6 +35,61 @@ fn pae_tables(profile: u64) -> [u8; PAE_TABLE_BYTES] {
         }
     }
     bytes
+}
+
+fn mode_tables(profile: u64) -> [u8; modes::TABLE_BYTES] {
+    let mut bytes = [0; modes::TABLE_BYTES];
+    if profile >= 22 {
+        for (gpa, value) in [
+            (0x6000, 0x7007u64),
+            (0x7000, 0x8007),
+            (0x8000, 0x9007),
+            (0x9000 + 256 * 8, 0x100007),
+            (0x9000 + 258 * 8, 0x102007),
+        ] {
+            let offset = gpa - 0x6000;
+            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    bytes
+}
+fn mode_fixture(profile: u64, data: &mut [u8; 8192]) -> modes::State {
+    let mut state = modes::State::ZERO;
+    if profile < 22 {
+        return state;
+    }
+    state.gdtr = [DATA_VA + 0x200, 0x37];
+    state.tr = [0x28, 0, 0x67, if profile == 36 { 0x83 } else { 0x8b }];
+    state.pointer = DATA_VA + 0x100;
+    data[0x200..0x238].fill(0);
+    let cs64 = match profile {
+        32 => 0x00af1b000000ffff,
+        33 => 0x00ef9b000000ffff,
+        _ => 0x00af9b000000ffff,
+    };
+    for (selector, descriptor) in [
+        (8, 0x00cf9b000000ffffu64),
+        (0x10, 0x00cf93000000ffff),
+        (0x18, cs64),
+        (0x28, 0x00008b0000000067),
+    ] {
+        data[0x200 + selector..0x208 + selector].copy_from_slice(&descriptor.to_le_bytes());
+    }
+    let mut at = control::RIP;
+    let mut target = control::RIP;
+    for instruction in control::instructions(profile).unwrap() {
+        if instruction.bytes[..instruction.len] == [0x48, 0xff, 0x2e] {
+            target = at + instruction.len as u64;
+            break;
+        }
+        at += instruction.len as u64;
+    }
+    if profile == 38 {
+        target = 0x0000_8000_0000_0000;
+    }
+    data[0x100..0x108].copy_from_slice(&target.to_le_bytes());
+    data[0x108..0x10a].copy_from_slice(&(if profile == 38 { 0x18u16 } else { 8 }).to_le_bytes());
+    state
 }
 
 macro_rules! fields {
@@ -70,6 +125,12 @@ fn pae_json(state: &pae::State) -> String {
     fields.push(format!("\"visits\":[{visits}]"));
     format!("{{{}}}", fields.join(","))
 }
+fn modes_json(state: &modes::State) -> String {
+    let mut fields = fields!(state; gdtr,tr,pointer,reads,pointer_reads,descriptor_reads,mutations);
+    let visits = state.visits.iter().map(|visit| format!("{{{}}}",fields!(visit; cs_before,cs_after,mode_before,mode_after,pointer_address,pointer_bytes,descriptor_address,descriptor).join(","))).collect::<Vec<_>>().join(",");
+    fields.push(format!("\"visits\":[{visits}]"));
+    format!("{{{}}}", fields.join(","))
+}
 fn read_state(memory: &Memory) -> control::State {
     unsafe { ptr::read_volatile(memory.0.add(control::OFFSET).cast()) }
 }
@@ -100,6 +161,7 @@ pub fn run(args: &[String]) -> Result<()> {
     data_before[4096..].fill(0x5a);
     data_before[..4].copy_from_slice(&0x11220000u32.to_le_bytes());
     data_before[4096..4100].copy_from_slice(&0x33440000u32.to_le_bytes());
+    let mode_state = mode_fixture(profile, &mut data_before);
     memory.copy(DATA_OFFSET, &data_before);
     let mut tables_before = [0u8; 16384];
     for (offset, word) in [
@@ -118,11 +180,18 @@ pub fn run(args: &[String]) -> Result<()> {
     memory.copy(recover::TABLE_OFFSET, &tables_before);
     let pae_tables_before = pae_tables(profile);
     memory.copy(PAE_TABLE_OFFSET, &pae_tables_before);
+    let mode_tables_before = mode_tables(profile);
+    memory.copy(modes::TABLE_OFFSET, &mode_tables_before);
     let (mut frame, bank, _) = seed(3);
     for &native in &natemu_abi::pressure::ENTRY[..8] {
         frame.x[native] &= u32::MAX as u64;
     }
     frame.x[6] = DATA_VA;
+    if profile >= 22 {
+        frame.x[7] = 0xc0000080;
+        frame.x[5] = 0;
+        frame.x[10] = DATA_VA + 0x100;
+    }
     memory.copy(BANK_OFFSET, &bank);
     let mut guest = recover::GuestState::seed(&frame);
     for (role, &native) in natemu_abi::pressure::ENTRY[..8].iter().enumerate() {
@@ -133,6 +202,11 @@ pub fn run(args: &[String]) -> Result<()> {
     guest.control[2] = if profile >= 13 { 0x1020 } else { 0x1000 };
     guest.control[3] = 0x600;
     guest.control[4] = 0;
+    if profile == 24 {
+        guest.control[2] = modes::ROOT;
+        guest.control[3] = 0x620;
+        guest.control[4] = 0x100;
+    }
     guest.segments[0] = [8 | cpl, 0, 0xffff_ffff, 0xc09b | (cpl << 5)];
     for segment in &mut guest.segments[1..] {
         *segment = [0x10 | cpl, 0, 0xffff_ffff, 0xc093 | (cpl << 5)];
@@ -192,6 +266,7 @@ pub fn run(args: &[String]) -> Result<()> {
         );
         ptr::write(memory.0.add(control::OFFSET).cast(), state);
         ptr::write(memory.0.add(pae::OFFSET).cast(), pae::State::ZERO);
+        ptr::write(memory.0.add(modes::OFFSET).cast(), mode_state);
         ptr::write(memory.0.add(SHARED_OFFSET).cast(), shared);
         sys_icache_invalidate(memory.0.cast(), RAM_SIZE);
     }
@@ -241,6 +316,8 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     let pae_state =
         unsafe { ptr::read_volatile(vm.memory.0.add(pae::OFFSET).cast::<pae::State>()) };
+    let mode_state =
+        unsafe { ptr::read_volatile(vm.memory.0.add(modes::OFFSET).cast::<modes::State>()) };
     let result = vm.shared();
     let state = read_state(&vm.memory);
     let v = unsafe {
@@ -294,6 +371,12 @@ pub fn run(args: &[String]) -> Result<()> {
     );
     add!("data_before", data_before);
     add!("data_after", vm.memory.read::<8192>(DATA_OFFSET));
+    add!("mode_tables_before", mode_tables_before);
+    add!(
+        "mode_tables_after",
+        vm.memory
+            .read::<{ modes::TABLE_BYTES }>(modes::TABLE_OFFSET)
+    );
     add!("pae_tables_before", pae_tables_before);
     add!(
         "pae_tables_after",
@@ -314,6 +397,7 @@ pub fn run(args: &[String]) -> Result<()> {
     add!("bank_before", bank);
     report.push(format!("\"controls\":{},\"visits\":[{}],\"initial\":{},\"entered\":{},\"final_frame\":{},\"guest_before\":{},\"guest_after\":{},\"recovery\":{}",state_json(&state),visits,frame_json(&frame),frame_json(&result.initial),frame_json(&result.captured),recovery::guest_json(&guest),recovery::guest_json(&guest_after),recovery::report(&vm,&guest,&tables_before)));
     report.push(format!("\"pae\":{}", pae_json(&pae_state)));
+    report.push(format!("\"modes\":{}", modes_json(&mode_state)));
     println!("{{{}}}", report.join(","));
     if result.current_el != 4
         || result.sctlr & 0x1005 != 0x1005
@@ -335,6 +419,71 @@ pub fn run(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mode_fixture_preserves_old_profiles_and_seeds_real_descriptor_controls() {
+        for profile in 0..22 {
+            let mut data = [0xa5; 8192];
+            let state = mode_fixture(profile, &mut data);
+            assert_eq!(data, [0xa5; 8192]);
+            assert_eq!(state.gdtr, [0; 2]);
+            assert_eq!(state.tr, [0; 4]);
+            assert_eq!(state.pointer, 0);
+            assert_eq!(mode_tables(profile), [0; modes::TABLE_BYTES]);
+        }
+        for profile in 22..=38 {
+            let mut data = [0xa5; 8192];
+            let state = mode_fixture(profile, &mut data);
+            assert_eq!(state.gdtr, [DATA_VA + 0x200, 0x37]);
+            assert_eq!(state.pointer, DATA_VA + 0x100);
+            assert_eq!(state.tr[3], if profile == 36 { 0x83 } else { 0x8b });
+            let descriptor = u64::from_le_bytes(data[0x218..0x220].try_into().unwrap());
+            assert_eq!(
+                descriptor & (1 << 47),
+                if profile == 32 { 0 } else { 1 << 47 }
+            );
+            assert_eq!((descriptor >> 53) & 3, if profile == 33 { 3 } else { 1 });
+            let target = u64::from_le_bytes(data[0x100..0x108].try_into().unwrap());
+            let (source, len) = control::source(profile).unwrap();
+            let expected = source[..len]
+                .windows(3)
+                .position(|p| p == [0x48, 0xff, 0x2e])
+                .map_or(control::RIP, |at| control::RIP + at as u64 + 3);
+            assert_eq!(
+                target,
+                if profile == 38 {
+                    0x0000_8000_0000_0000
+                } else {
+                    expected
+                }
+            );
+            assert_eq!(
+                u16::from_le_bytes(data[0x108..0x10a].try_into().unwrap()),
+                if profile == 38 { 0x18 } else { 8 }
+            );
+            for (index, byte) in data.iter().enumerate() {
+                if !(0x100..0x10a).contains(&index) && !(0x200..0x238).contains(&index) {
+                    assert_eq!(*byte, 0xa5);
+                }
+            }
+        }
+        let tables = mode_tables(22);
+        for (gpa, expected) in [
+            (0x6000, 0x7007u64),
+            (0x7000, 0x8007),
+            (0x8000, 0x9007),
+            (0x9000 + 256 * 8, 0x100007),
+            (0x9000 + 258 * 8, 0x102007),
+        ] {
+            let at = gpa - 0x6000;
+            assert_eq!(
+                u64::from_le_bytes(tables[at..at + 8].try_into().unwrap()),
+                expected
+            );
+        }
+        assert_eq!(PAE_TABLE_OFFSET + PAE_TABLE_BYTES, modes::TABLE_OFFSET);
+        assert!(modes::TABLE_OFFSET + modes::TABLE_BYTES <= recover::TABLE_OFFSET);
+    }
+
     #[test]
     fn pae_fixture_uses_distinct_pages_and_nonzero_pdpt_offset() {
         let bytes = pae_tables(13);

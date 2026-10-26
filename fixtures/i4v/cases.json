@@ -389,6 +389,45 @@
       "adaptation": "Retain the WP0-success/WP1-fault sequence using actual fetched MOV CR0 between generated scalar operations, a legacy32 read-only 4-KiB leaf at DATA=0x100000, and a warm native writable mapping from the first store. Verify the later write faults with PF3, keeps EAX=0xffffffff and CR2=DATA, preserves the earlier dword0x10011, and revokes native write permission on control commit. The independent model also checks user WP0 writes fail with PF7 in host-side semantic tests.",
       "differences": "No upstream harness, KVM forced-emulation prefix, EFER.NX toggles, VMX-specific ownership mechanism, high virtual address or full permission matrix is imported. Exact control transaction, prefix, same-value CR3, next-fetch and stale compiler expectations are newly authored from the architectural contract. SVM VMRUN admission tests are not reused.",
       "execution_status": "Retained source and adapted expectations only; actual translated execution evidence belongs to the I4-V controls runner."
+    },
+    {
+      "upstream": "kvm-unit-tests",
+      "repository": "https://gitlab.com/kvm-unit-tests/kvm-unit-tests",
+      "retained_mirror": "https://android-kvm.googlesource.com/kvm-unit-tests",
+      "revision": "734fe13536d0fc41185723c63bde17ec6364fa1d",
+      "license": "GPL-2.0-only (package COPYRIGHT default; this source file has no alternate notice)",
+      "license_files": [
+        {
+          "path": "upstream/kvm-unit-tests/COPYRIGHT",
+          "sha256": "b3c9ca9e257f2eaae070cf0ccdf8770764f05a947a39a835e633413750a5777b"
+        },
+        {
+          "path": "upstream/kvm-unit-tests/LICENSE",
+          "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
+        }
+      ],
+      "id": "v3_memory_far_jump",
+      "oracle": "tools/i4v_modes_model.py",
+      "upstream_path": "x86/emulator64.c",
+      "upstream_url": "https://android-kvm.googlesource.com/kvm-unit-tests/+/734fe13536d0fc41185723c63bde17ec6364fa1d/x86/emulator64.c",
+      "upstream_full_sha256": "9ffc21a30a5308c06be127e921659f4ff89e11122f31547c15626dfc31ee1d11",
+      "excerpts": [
+        {
+          "path": "upstream/kvm-unit-tests/emulator64-ljmp.excerpt.c",
+          "sha256": "fc09fbb861c39c32f3d9c7d9f5860785a8fcca92fb47f129eb588fcd164d0ab5",
+          "upstream_lines": [
+            121,
+            132
+          ],
+          "symbols": [
+            "test_ljmp"
+          ]
+        }
+      ],
+      "original_expectation": "A REX.W memory far jump reads a 64-bit target and 16-bit code selector from memory and transfers to the target, skipping the fall-through assignment that would make the test fail.",
+      "adaptation": "Use the actual 48ff2e memory far-jump source with RSI pointing to a ten-byte target/selector pair. The resident instruction owner reads that pointer and the GDT descriptor through the current guest translation, commits CS/RIP together on success, and dispatches actual FEX scalar loads in the resulting mode. The successful adaptation targets the following instruction with selector8 to leave 64-bit execution for compatibility32; companion cases test pointer-page absence and a noncanonical target.",
+      "differences": "The upstream case retains the current CS and does not test paging-mode changes, EFER, descriptor rejection, or stale code. Those expectations are newly authored from the accepted architectural contract. The upstream KVM harness is not imported; far jumps remain resident semantic instructions, not FEX-generated scalar code.",
+      "execution_status": "Retained source and adapted expectations only; actual execution evidence belongs to the I4-V controls runner."
     }
   ]
 }

@@ -49,7 +49,8 @@ def main():
     if args.mixed_modes:
         selected += [f'mixed-{arrangement}-n{n}' for arrangement in ('off-first','paged-first') for n in (1,2,3,4)]
     control_scenarios = ('roundtrip','reload','wp','bad-pg','bad-nw','bad-cr4','privilege','fetch-np','ignored-cr3','operand-mod','lock','reserved-cr','pge',
-                         'pae-activate','pae-invlpg','pae-eviction','pae-wp-pge','pae-bad-activate','pae-bad-cr3','pae-bad-cr4','pae-nonpresent','pae-aba')
+                         'pae-activate','pae-invlpg','pae-eviction','pae-wp-pge','pae-bad-activate','pae-bad-cr3','pae-bad-cr4','pae-nonpresent','pae-aba',
+                         'long-direct','long-via-pae','long-aba','long-bad-lme','long-no-pae','long-clear-pae','long-clear-pg','long-bad-efer','long-ea64','long-gdt-limit','long-not-present','long-ld','long-pointer-np','long-target-np','long-tss16','long-data-selector','long-target-noncanonical')
     if args.controls:
         selected += ['controls-'+name for name in control_scenarios]
     if args.focus and args.focus not in selected:
@@ -93,6 +94,7 @@ def main():
                      'tools/i4v_controls_worker.py', 'tools/test_i4v_controls_worker.py',
                      'tools/i4v_controls_check.py', 'tools/test_i4v_controls_check.py',
                      'tools/i4v_pae_model.py',
+                     'tools/i4v_modes_model.py',
                      'tools/i4v_stack_check.py', 'tools/test_i4v_stack_check.py',
                      'tools/i4v_alias_worker.py', 'tools/test_i4v_alias_worker.py',
                      'tools/check_i4v_alias.py', 'tools/test_check_i4v_alias.py',
@@ -353,7 +355,7 @@ def main():
                 if report['case'] != 'controls32' or report['controls']['profile'] != profile:
                     raise ValueError('control report differs from requested program')
                 pairs=[(v['request'],v['reply']) for v in report['visits'] if v['entries']]
-                if profile in (0,21):
+                if profile in (0,21,24):
                     pairs.append((report['controls']['deferred'],report['controls']['late_reply']))
                 pairs.sort(key=lambda pair:pair[0][12])
                 requests=[p[0] for p in pairs];replies=[p[1] for p in pairs]
@@ -363,7 +365,7 @@ def main():
                 for index,request in enumerate(requests):
                     directory=output/f'request-{index:03}'
                     exported=controls_worker.verify_request(directory,request)
-                    if exported['guest_rip'] != request[7] or exported['bitness'] != 32:
+                    if exported['guest_rip'] != request[7] or exported['bitness'] != (64 if request[8] == 4 else 32):
                         raise ValueError('control ordinary compilation EIP/mode differs')
                     record['compilations'].append(dict(directory=str(directory.relative_to(run)),export=exported))
                 record['cells'].append(dict(name=label,producer=str(output.relative_to(run))))

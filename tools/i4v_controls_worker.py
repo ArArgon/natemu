@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile one owner-bound control paging-mode32 source snapshot."""
+"""Compile one owner-bound source snapshot in its actual32/64-bit decoding mode."""
 import argparse
 import json
 from pathlib import Path
@@ -8,13 +8,20 @@ from i4v_producer.compile import compile_source
 from i4v_producer.export import CASES, bounded, export_program, require, verify
 MISS=0x49345651
 DELIVER=0x49345652
-SOURCE_CASES={bytes.fromhex(spec['source']):name for name,spec in CASES.items()
-              if name.startswith('fex_mov_eax_') or name in ('fex_store_eax_ebx32','fex_load_eax_ebx32')}
+SOURCE_CASES={(bytes.fromhex(spec['source']),spec.get('bitness',64)):name for name,spec in CASES.items()
+              if name.startswith('fex_mov_eax_') or name in ('fex_store_eax_ebx32','fex_load_eax_ebx32','fex_memory_data64')}
+
+def bitness(mode):
+    require(mode in (0,1,2,3,4),'unsupported control decoding mode')
+    return 64 if mode==4 else 32
+
+def case_of(packet):
+    return SOURCE_CASES[(source_of(packet),bitness(packet[8]))]
 
 def request(vm,generation,mode,rip,source,serial):
-    require(vm>0 and generation>0 and mode in (0,1,2) and serial>0,'unsupported control compile identity')
-    require(source in SOURCE_CASES and 0x102000<=rip and rip+len(source)<=0x103000,'unsupported ordinary source/address')
-    body=bytes.fromhex(CASES[SOURCE_CASES[source]]['body'])
+    require(vm>0 and generation>0 and mode in (0,1,2,3,4) and serial>0,'unsupported control compile identity')
+    require((source,bitness(mode)) in SOURCE_CASES and 0x102000<=rip and rip+len(source)<=0x103000,'unsupported ordinary source/address')
+    body=bytes.fromhex(CASES[SOURCE_CASES[(source,bitness(mode))]]['body'])
     return (MISS,1,vm,0,1,1,generation,rip,mode,int.from_bytes(source.ljust(8,b'\0'),'little'),len(source),rip,serial,len(body),0,0)
 
 def source_of(packet):
@@ -29,16 +36,16 @@ def parse_request(raw):
 
 def make_reply(packet,body):
     parse_request(struct.pack('<16Q',*packet))
-    require(body==bytes.fromhex(CASES[SOURCE_CASES[source_of(packet)]]['body']),'control emitted body mismatch')
+    require(body==bytes.fromhex(CASES[case_of(packet)]['body']),'control emitted body mismatch')
     out=list(packet);out[0]=DELIVER;out[14:16]=struct.unpack('<2Q',body.ljust(16,b'\0'))
     return struct.pack('<16Q',*out)
 
 def compile_request(directory,producer):
     directory=Path(directory).resolve();packet=parse_request(bounded(directory/'request.bin',128))
-    case=SOURCE_CASES[source_of(packet)];spec=CASES[case]
-    compile_source(directory/'compile',Path(producer),bytes.fromhex(spec['source']),packet[7],32,1,spec['host_count'])
+    case=case_of(packet);spec=CASES[case]
+    compile_source(directory/'compile',Path(producer),bytes.fromhex(spec['source']),packet[7],bitness(packet[8]),1,spec['host_count'])
     export_program(directory/'compile',case)
-    program=verify(directory/'compile',dict(case=case,guest_rip=packet[7],bitness=32,source_hex=spec['source']))
+    program=verify(directory/'compile',dict(case=case,guest_rip=packet[7],bitness=bitness(packet[8]),source_hex=spec['source']))
     raw=make_reply(packet,bytes.fromhex(program['body_hex']))
     with (directory/'reply.bin').open('xb') as f:f.write(raw)
     record=dict(schema='natemu-i4v-controls-worker-v1',request=packet,reply=struct.unpack('<16Q',raw),producer_sha256=program['producer_sha256'],body_sha256=program['body_sha256'])
@@ -48,8 +55,8 @@ def compile_request(directory,producer):
 def verify_request(directory,expected):
     directory=Path(directory);packet=parse_request(bounded(directory/'request.bin',128))
     require(list(packet)==list(expected),'control compilation differs from resident request')
-    case=SOURCE_CASES[source_of(packet)];spec=CASES[case]
-    program=verify(directory/'compile',dict(case=case,guest_rip=packet[7],bitness=32,source_hex=spec['source']))
+    case=case_of(packet);spec=CASES[case]
+    program=verify(directory/'compile',dict(case=case,guest_rip=packet[7],bitness=bitness(packet[8]),source_hex=spec['source']))
     raw=make_reply(packet,bytes.fromhex(program['body_hex']))
     require(bounded(directory/'reply.bin',128)==raw,'control reply differs from actual compilation')
     record=dict(schema='natemu-i4v-controls-worker-v1',request=list(packet),reply=list(struct.unpack('<16Q',raw)),producer_sha256=program['producer_sha256'],body_sha256=program['body_sha256'])

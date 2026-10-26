@@ -43,7 +43,7 @@ remains unchanged. The mixed driver uses flat segments/A20-on with distinct
 per-owner operand spans and old/new physical-page read sentinels.
 
 
-The V3 control campaign records two additional adaptations in the manifest's
+The V3 control campaign records additional adaptations in the manifest's
 `validation_adaptations` section. Its generated scalar instructions reuse the
 retained FEX `Primary_A0.asm` / `Primary_A2.asm` expectations. The separate
 `tools/i4v_controls_check.py` oracle owns the new control-transition programs;
@@ -61,3 +61,11 @@ KVM/VMX and NX-toggle harness with actual guest control instructions and the
 resident/FEX boundary. Newly authored CR3, invalid-control and next-fetch cases
 are not attributed to that upstream test. No SVM VMRUN control-state test is
 claimed as reused MOV-CR execution coverage.
+
+The same pinned KVM revision's `x86/emulator64.c::test_ljmp` supplies a memory
+far-jump expectation: read the target and selector, transfer to the target, and
+skip the fall-through instruction. Its exact twelve-line source is retained as
+`upstream/kvm-unit-tests/emulator64-ljmp.excerpt.c`. The V3 adaptation changes
+the selector to exercise a return from 64-bit execution to compatibility32;
+the upstream case itself retains CS. Mode transitions, descriptor rejection,
+pointer faults and stale-code checks are separately authored expectations.

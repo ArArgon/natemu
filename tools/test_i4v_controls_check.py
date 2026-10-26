@@ -2,6 +2,7 @@ import copy
 import unittest
 import i4v_controls_check as oracle
 import i4v_pae_model as pae
+import i4v_modes_model as modes
 
 
 def fixture(profile):
@@ -10,7 +11,7 @@ def fixture(profile):
     result={key:copy.deepcopy(e[key]) for key in
         ('initial','entered','final_frame','guest_before','guest_after','code_before','code_after',
          'data_before','data_after','tables_before','tables_after','source_before','source_after','visits',
-         'pae','pae_tables_before','pae_tables_after')}
+         'pae','pae_tables_before','pae_tables_after','modes','mode_tables_before','mode_tables_after')}
     result.update(case='controls32',profile=profile,rip=oracle.SOURCE,vm_nonce=123,capture_pc=capture,
                   service_pc=oracle.PRIVATE+0xa0180,status=1,detail=0,live=1,current_el=4,
                   tcr=0x2b5103510,ttbr1=0x40017000,sctlr=0x30d01985,actlr=2,
@@ -39,6 +40,115 @@ def change(path,value):
 
 
 class ControlSemanticsTests(unittest.TestCase):
+    def test_modes_program_prefixes_and_lifecycle(self):
+        # visits, completed, context, walks, native faults, descriptor/pointer reads,
+        # terminal vector, error; exact values independently enumerated per program.
+        vectors=[(15,15,8,11,3,3,0,0),(20,20,10,15,4,3,0,0),
+                 (11,11,5,11,4,3,0,0),(10,9,5,2,0,0,13,0),
+                 (4,3,2,0,0,0,13,0),(10,9,5,2,0,0,13,0),
+                 (11,10,6,4,0,1,13,0),(2,1,1,0,0,0,13,0),
+                 (10,9,6,3,0,1,6,0),(9,8,5,1,0,0,13,0x38),
+                 (9,8,5,2,0,1,11,0x18),(9,8,5,2,0,1,13,0x18),
+                 (11,10,6,6,1,1,14,0),(10,9,6,3,0,1,14,0),
+                 (8,7,4,0,0,0,13,0),(9,8,5,2,0,1,13,0x10),
+                 (11,10,6,7,1,3,13,0)]
+        for profile,wanted in enumerate(vectors,22):
+            answer=oracle.model(profile,0x04040404);last=answer['records'][-1]
+            with self.subTest(profile=profile):
+                self.assertEqual((len(answer['records']),answer['completed'],answer['generation'],
+                    answer['walks'],sum(r['native_fault'] for r in answer['records']),
+                    answer['modes']['reads'],last['vector'],last['error']),wanted)
+                self.assertEqual(answer['tables'],oracle.tables(profile))
+                self.assertEqual(answer['pae']['attempts'],int(profile==23))
+        ordinary=oracle.model(22,0)['records']
+        self.assertEqual([ordinary[i]['eax_after'] for i in (9,11,14)],
+                         [0xa5a5a5a511220000,0x11220000,0x11220000])
+        self.assertEqual((ordinary[7]['efer_after'],ordinary[7]['cs_after']),
+                         (0x500,modes.CS32))
+        self.assertEqual(ordinary[8]['cs_after'],modes.CS64)
+        self.assertEqual(ordinary[10]['cs_after'],modes.CS32)
+        self.assertEqual(ordinary[13]['efer_after'],0x100)
+        pae_answer=oracle.model(23,0)
+        self.assertEqual((pae_answer['pae']['reads'],pae_answer['pae']['walk_reads'],
+                          pae_answer['pae']['walk_writes']),(4,8,3))
+        self.assertEqual(pae_answer['pae']['hidden'],{'entries':[0x2001,0,0,0],'generation':1})
+        aba=oracle.model(24,0)['records']
+        self.assertEqual((aba[0]['rip'],aba[10]['rip']),(oracle.SOURCE,oracle.SOURCE))
+        self.assertEqual((aba[0]['before'],aba[0]['efer_before']),
+                         (aba[10]['before'],aba[10]['efer_before']))
+        self.assertEqual((aba[0]['generation_before'],aba[10]['generation_before']),(1,5))
+
+    def test_modes_decoding_seed_and_pointer_bytes(self):
+        r=fixture(22)
+        self.assertEqual(r['initial']['x'][7],0xc0000080)
+        self.assertEqual(r['initial']['x'][5],0)
+        self.assertEqual(r['initial']['x'][10],oracle.DATA+0x100)
+        self.assertEqual(oracle.program(22)[8],bytes.fromhex('ea262010001800'))
+        self.assertEqual(r['data_before'][0x100:0x10a],list(bytes.fromhex('2c201000000000000800')))
+        self.assertEqual(oracle.body(bytes.fromhex('488b03')).hex(),'c4fcdfc81f2003d5')
+        self.assertEqual([r['visits'][i]['request'][8] for i in (6,9,11,14)],[0,4,3,0])
+        self.assertEqual(r['modes']['visits'][8]['descriptor_address'],oracle.DATA+0x218)
+        self.assertEqual(r['modes']['visits'][10]['pointer_address'],oracle.DATA+0x100)
+        self.assertEqual(r['modes']['visits'][10]['descriptor_address'],oracle.DATA+0x208)
+
+    def test_invalid_long_default_precedes_nonpresent_descriptor(self):
+        memory=oracle.data_pages(32)
+        pae.qword(memory,0x218,0x00ef1b000000ffff)
+        answer=modes.model(32,0x04040404,memory)
+        fault=answer['records'][-1]
+        self.assertEqual((fault['vector'],fault['error']),(13,0x18))
+        self.assertEqual(fault['cs_after'],modes.CS32)
+        self.assertEqual(fault['generation_before'],fault['generation_after'])
+        self.assertEqual(fault['next_rip'],fault['rip'])
+        self.assertEqual(answer['modes']['descriptor_reads'],1)
+        self.assertEqual(oracle.model(32,0)['records'][-1]['vector'],11)
+        self.assertEqual(oracle.model(33,0)['records'][-1]['vector'],13)
+
+    def test_modes_corrupted_reports_are_rejected(self):
+        cases=[
+            (22,'PG activation selected long too early',['modes','visits',7,'mode_after'],4),
+            (22,'LMA missing',['visits',7,'after',4],0x100),
+            (22,'long source compiled32',['visits',9,'request',8],3),
+            (22,'qword load truncated',['visits',9,'gpr_after',0],0x11220000),
+            (22,'compat load retained upperhalf',['visits',11,'gpr_after',0],0xa5a5a5a511220000),
+            (22,'far jump not invalidated',['controls','invalidations'],6),
+            (22,'pointer read omitted',['modes','pointer_reads'],0),
+            (22,'descriptor source fabricated',['modes','visits',8,'descriptor'],0),
+            (22,'GDT byte changed',['data_after',0x208],0),
+            (22,'LMA retained after PGoff',['guest_after','control',4],0x500),
+            (22,'unused PAE loaded',['pae','attempts'],1),
+            (23,'PAE state lost after switch',['pae','hidden','entries',0],0),
+            (23,'PAE reloaded by IA32e activation',['pae','hidden','generation'],2),
+            (24,'ABA old native entry admitted',['controls','stale_entry'],0),
+            (24,'ABA old reply rebound admitted',['controls','stale_reply'],1),
+            (24,'ABA same tuple wrongly reused',['visits',10,'request',6],1),
+            (25,'active LME clear committed',['guest_after','control',4],0x400),
+            (26,'PG without PAE committed',['guest_after','control',0],0x80010011),
+            (27,'active PAE clear committed',['guest_after','control',3],0x600),
+            (28,'long PGclear committed',['guest_after','control',0],0x10011),
+            (29,'reserved EFER accepted',['visits',1,'vector'],0),
+            (30,'immediate far accepted64',['visits',9,'vector'],0),
+            (31,'descriptor read beyond GDT',['modes','descriptor_reads'],1),
+            (31,'wrong selector error',['recovery','error'],0),
+            (32,'nonpresent code became GP',['recovery','vector'],13),
+            (33,'L=D accepted',['guest_after','segments',0,0],0x18),
+            (34,'failed pointer read claimed',['modes','pointer_reads'],1),
+            (34,'pointer PF wrong CR2',['guest_after','control',1],oracle.DATA),
+            (34,'pointer fault committed CS',['guest_after','segments',0,0],8),
+            (34,'pointer fault bytes fabricated',['modes','visits',10,'pointer_bytes',0],1),
+            (35,'postcommit fetch rolled CS back',['guest_after','segments',0,0],8),
+            (35,'postcommit fetch compiled',['visits',9,'entries'],1),
+            (35,'source PTE not cleared',['mode_tables_after',0x3810],7),
+            (36,'16bit TSS activation committed',['guest_after','control',0],0x80010011),
+            (37,'data selector error lost',['recovery','error'],0),
+            (38,'noncanonical target committed',['guest_after','rip'],0x800000000000),
+            (38,'noncanonical target changed CR2',['guest_after','control',1],0x800000000000),
+            (38,'target validation skipped descriptor',['modes','descriptor_reads'],1),
+        ]
+        for profile,name,path,value in cases:
+            report=fixture(profile);change(path,value)(report)
+            with self.subTest(name=name),self.assertRaises(ValueError):oracle.check(report)
+
     def test_pae_reload_is_distinct_from_eviction(self):
         memory = pae.tables(13)
         addresses, hidden, error = pae.load(memory, 0x1020)
@@ -142,7 +252,7 @@ class ControlSemanticsTests(unittest.TestCase):
             with self.subTest(name=name),self.assertRaises(ValueError):oracle.check(report)
 
     def test_full_reports_for_every_program(self):
-        for profile in range(22):
+        for profile in range(39):
             with self.subTest(profile=profile):oracle.check(fixture(profile),profile)
 
     def test_corrupted_observation_controls(self):

@@ -7,9 +7,12 @@ material improvement over QEMU TCG within an explicit correctness scope.
 **Current state:** I1–I4 are implemented and independently reproduced in finite
 profiles. A real host-side FEX worker feeds the Rust resident runtime; tests cover
 precise recovery/paging and N=1/2/3/4 concurrent faults, remaps, code retirement,
-pending events and sustained maintenance fairness. The complete regression run
-passes87 jobs. Next is the post-I4 integrated validation pass. Arbitrary guest
-programs, stock Linux boot and workload performance remain ahead.
+pending events and sustained maintenance fairness. The post-I4 validation pass
+is underway: 294 native scenarios pass independent reproduction, covering
+selected high-address, paging-off and mode-transition paths. The earlier 87-job
+regression suite also passes. Concurrent mode transitions, remaining boundaries
+and broader memory-model validation remain open. Arbitrary guest programs,
+stock Linux boot and workload performance remain ahead.
 
 Start with the [implementation plan and local setup](docs/implementation.md).
 It records Rust/assembly/C++ ownership, the early producer loop, N-vCPU design,

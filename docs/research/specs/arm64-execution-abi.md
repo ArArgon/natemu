@@ -482,7 +482,28 @@ native programs use4-KiB pages with NXE off; separate ABI tests cover2-MiB and N
 walker behavior. Two failed-active-reload programs use a one-shot handler fixture
 that records#GP, skips the faulting MOV and executes a generated load after native
 eviction. This demonstrates old-root recovery without claiming full guest IDT
-delivery. PAE concurrency and IA-32e transitions remain required extensions.
+delivery. PAE concurrency remains a required extension.
+
+The next finite V3 profile enters IA-32e directly from paging-off through fetched
+MOV-CR and WRMSR EFER instructions. Descriptor-checked far transfers select
+64-bit or compatibility execution; compatibility mode can then disable paging.
+Legacy PAE execution is a separate composition case, not a boot prerequisite.
+The resident reads actual guest GDT descriptors and far pointers through the
+current guest translation before committing CS/RIP/context together. A pointer
+or descriptor fault preserves the old state; a target-fetch fault preserves the
+already committed transfer. Legal forms outside the admitted flat, accessed,
+nonconforming descriptors reject as unsupported rather than inventing a guest
+fault. General descriptor accessed-bit writes and IDT delivery remain future work.
+
+Compiler admission binds source bytes and decoding width: compatibility bodies
+use the 32-bit producer and long-mode bodies use the 64-bit producer, even where
+native bytes happen to match. The finite capture policy zeroes upper halves of
+the first four GPR roots outside 64-bit mode; this is a deterministic policy for
+undefined upper halves, not a promise to preserve them across compatibility
+execution. Full-width long-mode loads and 32-bit destination zero-extension are
+checked separately. The single-operand invalidation limit above still applies.
+INV-03-01 records native validation and review status; these N=1 profiles do not
+establish concurrent mode-transition correctness.
 
 ## 5. Faults, completion and event delivery
 

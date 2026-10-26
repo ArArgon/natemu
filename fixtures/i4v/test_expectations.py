@@ -45,6 +45,14 @@ class FixtureTests(unittest.TestCase):
                 for symbol in item["symbols"]:
                     self.assertIn(symbol.encode(), data)
         self.assertEqual(wp["profile"], 2)
+        far = adaptations['v3_memory_far_jump']
+        self.assertEqual(far['revision'], wp['revision'])
+        for item in far['excerpts'] + far['license_files']:
+            data = (ROOT / item['path']).read_bytes()
+            self.assertEqual(hashlib.sha256(data).hexdigest(), item['sha256'])
+            if 'upstream_lines' in item:
+                self.assertEqual(len(data.splitlines()), item['upstream_lines'][1]-item['upstream_lines'][0]+1)
+                self.assertIn(b'rex64 ljmp', data)
 
     def test_load_at_low_high_and_page_boundaries(self):
         for base in (0x100000, 0x100FF9, 0x7FFFFFFFFFF8, 0xFFFF800000000000, 0xFFFFFFFFFFFFF000):

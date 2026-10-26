@@ -56,20 +56,7 @@ pub fn decode(source: &[u8]) -> Result<ControlOp, Error> {
     })
 }
 pub fn mode(g: &GuestState) -> Option<u64> {
-    if g.control[4] != 0
-        || g.control[3] & !0x6a0 != 0
-        || g.control[0] & !0x80010011 != 0
-        || g.control[0] & 0x11 != 0x11
-    {
-        return None;
-    }
-    Some(if g.control[0] >> 31 == 0 {
-        0
-    } else if g.control[3] & 32 != 0 {
-        2
-    } else {
-        1
-    })
+    crate::modes::mode(g)
 }
 pub fn prepare(
     g: &GuestState,
@@ -152,6 +139,8 @@ pub fn immediate(value: u32) -> Option<([u8; 8], usize)> {
         0x620 => &[0x5280c404],
         0x6a0 => &[0x5280d404],
         0x1020 => &[0x52820404],
+        0x100 => &[0x52802004],
+        0x6000 => &[0x528c0004],
         _ => return None,
     };
     let mut bytes = [0; 8];
@@ -165,22 +154,32 @@ pub fn body(source: &[u8]) -> Option<([u8; 8], usize)> {
         [0xb8, a, b, c, d] => immediate(u32::from_le_bytes([*a, *b, *c, *d])),
         [0x89, 0x03] => Some(([0x1f, 0x20, 3, 0xd5, 0xc4, 0xfc, 0x9f, 0x88], 8)),
         [0x8b, 0x03] => Some(([0xc4, 0xfc, 0xdf, 0x88, 0x1f, 0x20, 3, 0xd5], 8)),
+        [0x48, 0x8b, 0x03] => Some(([0xc4, 0xfc, 0xdf, 0xc8, 0x1f, 0x20, 3, 0xd5], 8)),
         _ => None,
     }
+}
+pub fn body_for(source: &[u8], mode: u64) -> Option<([u8; 8], usize)> {
+    if mode > 4
+        || (mode == 4 && !matches!(source, [0x48, 0x8b, 3] | [0xb8, 0x11, 0, 1, 0]))
+        || (mode != 4 && source.first() == Some(&0x48))
+    {
+        return None;
+    }
+    body(source)
 }
 #[derive(Clone, Copy)]
 pub struct Instruction {
     pub bytes: [u8; 8],
     pub len: usize,
 }
-const fn mov(value: u32) -> Instruction {
+pub(crate) const fn mov(value: u32) -> Instruction {
     let v = value.to_le_bytes();
     Instruction {
         bytes: [0xb8, v[0], v[1], v[2], v[3], 0, 0, 0],
         len: 5,
     }
 }
-const fn cr(reg: u8) -> Instruction {
+pub(crate) const fn cr(reg: u8) -> Instruction {
     Instruction {
         bytes: [0x0f, 0x22, 0xc0 | (reg << 3), 0, 0, 0, 0, 0],
         len: 3,
@@ -190,11 +189,11 @@ const STORE: Instruction = Instruction {
     bytes: [0x89, 3, 0, 0, 0, 0, 0, 0],
     len: 2,
 };
-const LOAD: Instruction = Instruction {
+pub(crate) const LOAD: Instruction = Instruction {
     bytes: [0x8b, 3, 0, 0, 0, 0, 0, 0],
     len: 2,
 };
-const JUMP: Instruction = Instruction {
+pub(crate) const JUMP: Instruction = Instruction {
     bytes: [0xe9, 0, 0, 0, 0, 0, 0, 0],
     len: 5,
 };
@@ -203,6 +202,9 @@ const INVLPG: Instruction = Instruction {
     len: 3,
 };
 pub fn instructions(profile: u64) -> Option<&'static [Instruction]> {
+    if profile >= 22 {
+        return crate::modes::instructions(profile);
+    }
     const PROGRAMS: [&[Instruction]; 22] = [
         &[
             mov(0x10011),
@@ -371,6 +373,10 @@ pub fn source(profile: u64) -> Option<([u8; 128], usize)> {
             source[size + 1..size + 5]
                 .copy_from_slice(&(destination - (size as i32 + 5)).to_le_bytes());
         }
+        if inst.bytes[0] == 0xea {
+            source[size + 1..size + 5]
+                .copy_from_slice(&((RIP + size as u64 + inst.len as u64) as u32).to_le_bytes());
+        }
         size += inst.len;
     }
     Some((source, size))
@@ -397,8 +403,8 @@ pub fn request(
     source: &[u8],
     serial: u64,
 ) -> Option<Packet> {
-    let (_, len) = body(source)?;
-    if vm == 0 || generation == 0 || mode > 2 || serial == 0 || source.len() > 8 {
+    let (_, len) = body_for(source, mode)?;
+    if vm == 0 || generation == 0 || serial == 0 || source.len() > 8 {
         return None;
     }
     let mut bytes = [0; 8];
