@@ -6,7 +6,9 @@ use natemu_abi::{
     paging::{Access, Control, Fault},
     paging32, recovery as r, translation as wire,
 };
+mod concurrent;
 mod long_mode;
+mod maintenance;
 unsafe extern "C" {
     fn service(packet: *mut wire::Packet);
     fn service_resume();
@@ -14,6 +16,20 @@ unsafe extern "C" {
 }
 fn state() -> *mut c::State {
     (PRIVATE + c::OFFSET as u64) as *mut c::State
+}
+fn source_base() -> u64 {
+    if concurrent::enabled() {
+        natemu_abi::control_concurrent::source(concurrent::id())
+    } else {
+        c::RIP
+    }
+}
+fn operand() -> u64 {
+    if concurrent::enabled() {
+        natemu_abi::control_concurrent::data(concurrent::id())
+    } else {
+        DATA_VA
+    }
 }
 fn at(index: usize) -> *mut c::Visit {
     (PRIVATE + c::RECORD_OFFSET as u64 + index as u64 * size_of::<c::Visit>() as u64)
@@ -97,6 +113,14 @@ impl paging32::Tables for Tables {
     }
 }
 unsafe fn route(address: u64, bytes: u64, access: Access) -> Result<(u64, bool), Fault> {
+    let _guard = concurrent::lock();
+    unsafe { route_under_authority(address, bytes, access) }
+}
+unsafe fn route_under_authority(
+    address: u64,
+    bytes: u64,
+    access: Access,
+) -> Result<(u64, bool), Fault> {
     unsafe {
         let base = if access == Access::Fetch {
             c::RIP
@@ -202,6 +226,13 @@ unsafe fn exception(vector: u64, address: u64, error: u64) -> ! {
             dispatch()
         }
         (*validation()).stage = 3;
+        maintenance::semantic_end();
+        if concurrent::enabled() {
+            if (*visit()).kind != 0 {
+                concurrent::semantic_done(false);
+            }
+            concurrent::finished();
+        }
         stop(SUCCESS, 0)
     }
 }
@@ -222,6 +253,7 @@ unsafe fn exchange(expected: wire::Packet, action: u64) -> wire::Packet {
         service(&mut p);
         if action != natemu_abi::concurrency::DEFER_COMPILE {
             while p[0] == wire::BUSY {
+                maintenance::compiler_wait();
                 for _ in 0..16 {
                     asm!("yield", options(nomem, nostack));
                 }
@@ -242,8 +274,11 @@ unsafe fn next_request(source: &[u8]) -> wire::Packet {
             .serial
             .checked_add(1)
             .unwrap_or_else(|| stop(REJECTED, 271));
-        c::request(
+        c::request_owner(
             (*shared()).lifecycle.vm,
+            concurrent::id(),
+            concurrent::incarnation(),
+            concurrent::source_generation(),
             (*state()).generation,
             c::mode(&*guest()).unwrap(),
             (*guest()).rip,
@@ -257,28 +292,46 @@ unsafe fn next_request(source: &[u8]) -> wire::Packet {
 unsafe fn eligible(index: usize) -> bool {
     unsafe {
         let r = &*at(index);
-        r.request[6] == (*state()).generation
+        r.request[2] == (*shared()).lifecycle.vm
+            && r.request[3] == concurrent::id()
+            && r.request[4] == concurrent::incarnation()
+            && r.request[5] == concurrent::source_generation()
+            && r.request[6] == (*state()).generation
             && r.request[7] == (*guest()).rip
             && r.request[8] == c::mode(&*guest()).unwrap_or(u64::MAX)
             && c::valid(&r.request, &r.reply)
     }
 }
 #[inline(never)]
-unsafe fn compile(source: &[u8]) {
+unsafe fn publish_reply(index: usize, request: &wire::Packet, reply: &wire::Packet) {
+    unsafe {
+        let mut image = read_record(CODE_VA as *const [u8; c::MAX_VISITS * c::SLOT_BYTES]);
+        let start = index * c::SLOT_BYTES;
+        let count = request[13] as usize;
+        if image[start..start + c::SLOT_BYTES] != [0; c::SLOT_BYTES] {
+            stop(REJECTED, 277);
+        }
+        image[start..start + count].copy_from_slice(&reply[14].to_le_bytes()[..count]);
+        image[start + count..start + count + 4].copy_from_slice(&RET);
+        translation::replace_bytes_for_owner(&image, concurrent::id());
+    }
+}
+#[inline(never)]
+unsafe fn compile(source: &[u8]) -> [u8; 8] {
     unsafe {
         let r = state();
         let v = visit();
-        let p = next_request(source);
+        let mut p = next_request(source);
         (*v).request = p;
         if ((*r).profile == 0 && (*r).visits == 16)
-            || ((*r).profile == 21 && (*r).visits == 12)
-            || ((*r).profile == 24 && (*r).visits == 11)
+            || ((*r).profile == 21 && (*r).visits == if concurrent::enabled() { 15 } else { 12 })
+            || ((*r).profile == 24 && (*r).visits == if concurrent::enabled() { 12 } else { 11 })
         {
             let old_index = if (*r).profile == 21 { 4 } else { 0 };
             let old_rip = if (*r).profile == 21 {
-                c::RIP + 16
+                source_base() + 16
             } else {
-                c::RIP
+                source_base()
             };
             if (*guest()).control != (*r).old_controls
                 || (*guest()).rip != old_rip
@@ -306,21 +359,56 @@ unsafe fn compile(source: &[u8]) {
             (*r).stale_reply = 2;
         }
         (*validation()).requests += 1;
-        let reply = exchange(p, c::MISS);
+        let mut reply = exchange(p, c::MISS);
         (*v).reply = reply;
         if !c::valid(&p, &reply) {
             stop(REJECTED, 276);
         }
-        let index = (*r).visits as usize - 1;
-        let mut image = read_record(CODE_VA as *const [u8; c::MAX_VISITS * c::SLOT_BYTES]);
-        let start = index * c::SLOT_BYTES;
-        let count = p[13] as usize;
-        if image[start..start + c::SLOT_BYTES] != [0; c::SLOT_BYTES] {
-            stop(REJECTED, 277);
+        concurrent::hold_reply(&p, &reply);
+        if concurrent::enabled()
+            && natemu_abi::control_concurrent::final_visit((*r).profile) == Some((*r).visits)
+            && concurrent::source_generation() == 1
+        {
+            publish_reply((*r).visits as usize - 1, &p, &reply);
+            if !eligible((*r).visits as usize - 1) {
+                stop(PANIC, 325);
+            }
+            (*concurrent::owner()).cached_before_source = 1;
+            concurrent::trace_visit(0x7000);
         }
-        image[start..start + count].copy_from_slice(&reply[14].to_le_bytes()[..count]);
-        image[start + count..start + count + 4].copy_from_slice(&RET);
-        translation::replace_bytes(&image);
+        if concurrent::source_cut(&p, &reply) {
+            let replacement = natemu_abi::control_concurrent::replacement((*r).profile).unwrap();
+            let mut actual = [0; 8];
+            {
+                let guard = concurrent::lock().unwrap();
+                let (gpa, _) =
+                    route_under_authority((*guest()).rip, replacement.len as u64, Access::Fetch)
+                        .unwrap_or_else(|_| stop(PANIC, 322));
+                copy_record(
+                    actual.as_mut_ptr(),
+                    (PRIVATE + r::SOURCE_OFFSET as u64 + gpa - c::RIP) as *const u8,
+                    replacement.len,
+                );
+                if actual != replacement.bytes {
+                    stop(PANIC, 323);
+                }
+                (*v).fetch_gpa = gpa;
+                (*v).source = u64::from_le_bytes(actual);
+                guard
+                    .trace(0x1000 + (*r).visits, concurrent::id())
+                    .unwrap_or_else(|e| stop(PANIC, e));
+            }
+            p = next_request(&actual[..replacement.len]);
+            (*v).request = p;
+            (*validation()).requests += 1;
+            reply = exchange(p, c::MISS);
+            (*v).reply = reply;
+            if !c::valid(&p, &reply) {
+                stop(REJECTED, 276);
+            }
+        }
+        let index = (*r).visits as usize - 1;
+        publish_reply(index, &p, &reply);
         if (matches!((*r).profile, 0 | 24) && (*r).visits == 1)
             || ((*r).profile == 21 && (*r).visits == 5)
         {
@@ -333,6 +421,7 @@ unsafe fn compile(source: &[u8]) {
                 stop(PANIC, 278);
             }
         }
+        (*v).source.to_le_bytes()
     }
 }
 #[inline(never)]
@@ -366,6 +455,7 @@ unsafe fn complete_visit() {
         summarize();
         (*state()).completed += 1;
         (*validation()).completed = (*state()).completed;
+        maintenance::semantic_end();
     }
 }
 unsafe fn invalidate() {
@@ -385,46 +475,50 @@ unsafe fn evict() {
 unsafe fn control(source: &[u8]) {
     unsafe {
         (*visit()).kind = 1;
-        let operation = c::decode(source).and_then(|op| {
-            let before = (*guest()).control;
-            let after = if (*state()).profile >= 22 {
-                natemu_abi::modes::prepare(
-                    &*guest(),
-                    &(*long_mode::state()).tr,
-                    (*state()).cpl,
-                    op,
-                )?
-            } else {
-                c::prepare(&*guest(), (*state()).cpl, op, (*state()).profile >= 13)?
-            };
-            let generation = (*state())
-                .generation
-                .checked_add(1)
-                .ok_or(c::Error::Unsupported)?;
-            let mut hidden = (*pae_state()).hidden;
-            if pae::reload(&before, &after, op.cr) {
-                let next = hidden
+        concurrent::before_control();
+        let operation = {
+            let _guard = concurrent::lock();
+            c::decode(source).and_then(|op| {
+                let before = (*guest()).control;
+                let after = if (*state()).profile >= 22 {
+                    natemu_abi::modes::prepare(
+                        &*guest(),
+                        &(*long_mode::state()).tr,
+                        (*state()).cpl,
+                        op,
+                    )?
+                } else {
+                    c::prepare(&*guest(), (*state()).cpl, op, (*state()).profile >= 13)?
+                };
+                let generation = (*state())
                     .generation
                     .checked_add(1)
                     .ok_or(c::Error::Unsupported)?;
-                (*pae_state()).attempts += 1;
-                let entries = pae::load(
-                    &mut PaeTables {
-                        loading: true,
-                        index: 0,
-                    },
-                    after[2],
-                )?;
-                hidden = pae::Hidden {
-                    entries,
-                    generation: next,
-                };
-            }
-            (*guest()).control = after;
-            (*state()).generation = generation;
-            (*pae_state()).hidden = hidden;
-            Ok(op)
-        });
+                let mut hidden = (*pae_state()).hidden;
+                if pae::reload(&before, &after, op.cr) {
+                    let next = hidden
+                        .generation
+                        .checked_add(1)
+                        .ok_or(c::Error::Unsupported)?;
+                    (*pae_state()).attempts += 1;
+                    let entries = pae::load(
+                        &mut PaeTables {
+                            loading: true,
+                            index: 0,
+                        },
+                        after[2],
+                    )?;
+                    hidden = pae::Hidden {
+                        entries,
+                        generation: next,
+                    };
+                }
+                (*guest()).control = after;
+                (*state()).generation = generation;
+                (*pae_state()).hidden = hidden;
+                Ok(op)
+            })
+        };
         match operation {
             Ok(op) => {
                 invalidate();
@@ -433,6 +527,7 @@ unsafe fn control(source: &[u8]) {
                     (*guest()).rip &= 0xffff_ffff;
                 }
                 complete_visit();
+                concurrent::semantic_done(true);
             }
             Err(c::Error::GeneralProtection) => exception(13, 0, 0),
             Err(c::Error::Undefined) => exception(6, 0, 0),
@@ -452,7 +547,7 @@ pub unsafe fn initialize() -> ! {
             || (*r).visits != 0
             || (*r).completed != 0
             || (*r).serial != 0
-            || (*g).rip != c::RIP
+            || (*g).rip != source_base()
             || (*g).control[0] != 0x10011
             || (*g).control[2]
                 != if (*r).profile == 24 {
@@ -464,12 +559,12 @@ pub unsafe fn initialize() -> ! {
                 }
             || (*g).control[3] != if (*r).profile == 24 { 0x620 } else { 0x600 }
             || (*g).control[4] != if (*r).profile == 24 { 0x100 } else { 0 }
-            || (*s).initial.x[6] != DATA_VA
+            || (*s).initial.x[6] != operand()
             || (*s).initial.x[4] > u32::MAX as u64
             || (*s).initial.sp != STACK_TOP
             || (*s).initial.x[28] != BANK_VA
-            || (*s).object.configured_vcpus != 1
-            || (*s).object.vcpu_id != 0
+            || (!concurrent::enabled()
+                && ((*s).object.configured_vcpus != 1 || (*s).object.vcpu_id != 0))
             || (*s).object.version != VERSION
             || (*s).object.profile != PROFILE
             || (*s).object.size != size_of::<Object>() as u32
@@ -509,6 +604,7 @@ pub unsafe fn initialize() -> ! {
         }
         (*s).service_pc = service_resume as *const () as u64;
         recovery::clear_mapping(DATA_VA);
+        concurrent::initialize();
         dispatch()
     }
 }
@@ -518,25 +614,64 @@ unsafe fn dispatch() -> ! {
         loop {
             let r = state();
             let g = guest();
-            let (_, bytes) = c::source((*r).profile).unwrap();
+            maintenance::boundary();
+            let (_, bytes) = if concurrent::enabled() {
+                natemu_abi::control_concurrent::source_bytes(
+                    (*r).profile,
+                    concurrent::id(),
+                    concurrent::source_generation(),
+                )
+            } else {
+                c::source_at((*r).profile, source_base())
+            }
+            .unwrap();
             if ((*r).profile == 0 && (*r).completed == 17)
-                || ((*r).profile == 21 && (*r).completed == 12)
-                || ((*r).profile == 24 && (*r).completed == 11)
-                || ((*r).profile != 0 && (*g).rip == c::RIP + bytes as u64)
+                || ((*r).profile == 21
+                    && (*r).completed == if concurrent::enabled() { 15 } else { 12 })
+                || ((*r).profile == 24
+                    && (*r).completed == if concurrent::enabled() { 12 } else { 11 })
+                || ((*r).profile != 0 && (*g).rip == source_base() + bytes as u64)
             {
                 (*validation()).stage = 2;
+                concurrent::finished();
                 stop(SUCCESS, 0);
             }
             begin_visit();
-            let instruction =
-                c::instruction((*r).profile, (*g).rip).unwrap_or_else(|| stop(REJECTED, 282));
-            let (gpa, _) = route_or_fault((*g).rip, instruction.len as u64, Access::Fetch);
+            let instruction = if concurrent::enabled() {
+                natemu_abi::control_concurrent::instruction(
+                    (*r).profile,
+                    concurrent::id(),
+                    concurrent::source_generation(),
+                    (*g).rip,
+                )
+            } else {
+                c::instruction_at((*r).profile, source_base(), (*g).rip)
+            }
+            .unwrap_or_else(|| stop(REJECTED, 282));
+            maintenance::semantic_begin(&instruction.bytes[..instruction.len]);
             let mut actual = [0; 8];
-            copy_record(
-                actual.as_mut_ptr(),
-                (PRIVATE + r::SOURCE_OFFSET as u64 + gpa - c::RIP) as *const u8,
-                instruction.len,
-            );
+            let fetched = {
+                let guard = concurrent::lock();
+                let result = route_under_authority((*g).rip, instruction.len as u64, Access::Fetch);
+                if let Ok((gpa, _)) = result {
+                    copy_record(
+                        actual.as_mut_ptr(),
+                        (PRIVATE + r::SOURCE_OFFSET as u64 + gpa - c::RIP) as *const u8,
+                        instruction.len,
+                    );
+                }
+                if let Some(guard) = guard {
+                    guard
+                        .trace(0x1000 + (*r).visits, concurrent::id())
+                        .unwrap_or_else(|e| stop(PANIC, e));
+                }
+                result
+            };
+            let (gpa, _) = match fetched {
+                Ok(v) => v,
+                Err(Fault::Page { address, error }) => exception(14, address, error),
+                _ => stop(REJECTED, 270),
+            };
             if actual[..instruction.len] != instruction.bytes[..instruction.len] {
                 stop(REJECTED, 283);
             }
@@ -567,16 +702,18 @@ unsafe fn dispatch() -> ! {
                 let delta = i32::from_le_bytes(actual[1..5].try_into().unwrap()) as i64;
                 (*g).rip = ((*g).rip + 5).wrapping_add(delta as u64) & 0xffff_ffff;
                 complete_visit();
+                concurrent::trace_visit(0x3000);
                 continue;
             }
             if c::body(source).is_none() {
                 control(source);
                 continue;
             }
-            if matches!(actual[0], 0x89 | 0x8b | 0x48) && (*r).current.x[6] != DATA_VA {
+            if matches!(actual[0], 0x89 | 0x8b | 0x48) && (*r).current.x[6] != operand() {
                 stop(REJECTED, 284);
             }
-            compile(source);
+            actual = compile(source);
+            let source = &actual[..instruction.len];
             let index = (*r).visits as usize - 1;
             if !eligible(index) {
                 stop(REJECTED, 285);
@@ -589,6 +726,8 @@ unsafe fn dispatch() -> ! {
             (*shared()).capture_pc = frame.x[30];
             (*visit()).entries = 1;
             (*validation()).stage = 1;
+            concurrent::admit(source);
+            maintenance::before_native(source);
             if matches!(actual[0], 0x89 | 0x8b | 0x48) && (*r).mapping != 0 {
                 memory_before((*r).mapping);
             }
@@ -639,7 +778,7 @@ pub unsafe fn finish(fault: u64) -> ! {
                 || esr >> 26 != 0x25
                 || (esr >> 6) & 1 != u64::from(write)
                 || !matches!(esr&63,4..=7|12..=15)
-                || far != DATA_VA
+                || far != operand()
                 || pc != site
                 || spsr & 15 != 4
                 || (*v).faults != 0
@@ -653,11 +792,15 @@ pub unsafe fn finish(fault: u64) -> ! {
                 (&raw const (*s).captured).cast(),
                 size_of::<NativeFrame>(),
             );
-            let (gpa, writable) = route_or_fault(
-                far,
-                if opcode == 0x48 { 8 } else { 4 },
-                if write { Access::Write } else { Access::Read },
-            );
+            let (gpa, writable) = if concurrent::enabled() {
+                concurrent::fault()
+            } else {
+                route_or_fault(
+                    far,
+                    if opcode == 0x48 { 8 } else { 4 },
+                    if write { Access::Write } else { Access::Read },
+                )
+            };
             memory_before(gpa);
             (*r).mapping = gpa;
             recovery::install_ram(far, gpa, writable);
@@ -675,6 +818,9 @@ pub unsafe fn finish(fault: u64) -> ! {
         }
         (*g).rip += (*v).bytes;
         complete_visit();
+        concurrent::completed();
+        maintenance::native_done();
+        concurrent::after_native();
         long_mode::after_native(opcode);
         if (*r).profile == 1 && (*r).completed == 3 {
             let at = (PRIVATE + shadow::leaf_offset(DATA_VA).unwrap() as u64) as *const u64;
@@ -695,7 +841,7 @@ pub unsafe fn finish(fault: u64) -> ! {
         let first = (matches!(profile, 14 | 15 | 16 | 21) && completed == 5)
             || (matches!(profile, 18 | 19) && completed == 7);
         let second = profile == 21 && completed == 8;
-        if first || second {
+        if (first || second) && !concurrent::enabled() {
             // Fixture changes memory roots without changing the loaded hidden set.
             let at = (PRIVATE + pae::TABLE_OFFSET as u64 + pae::ROOT - 0x1000) as *mut u64;
             ptr::write_volatile(at, if second { 0x2001 } else { 0x4001 });

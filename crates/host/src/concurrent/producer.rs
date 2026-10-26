@@ -13,6 +13,7 @@ pub struct Compiler {
     address_profile: bool,
     stack: Option<stack_producer::Compiler>,
     mixed: Option<mixed_producer::Compiler>,
+    controls: Option<crate::i4v_controls::producer::Compiler>,
 }
 impl Compiler {
     pub fn new(producer: PathBuf, output: PathBuf) -> Result<Self> {
@@ -28,6 +29,7 @@ impl Compiler {
             address_profile: false,
             stack: None,
             mixed: None,
+            controls: None,
         })
     }
     pub fn new_alias(producer: PathBuf, output: PathBuf, guest_rip: u64) -> Result<Self> {
@@ -47,6 +49,21 @@ impl Compiler {
         c.mixed = Some(mixed_producer::Compiler::new(producer, output, owner, mode));
         Ok(c)
     }
+    pub fn new_controls(
+        producer: PathBuf,
+        worker: PathBuf,
+        output: PathBuf,
+        owner: u64,
+    ) -> Result<Self> {
+        let mut c = Self::new(producer.clone(), output.clone())?;
+        c.controls = Some(crate::i4v_controls::producer::Compiler::new_owner(
+            producer, worker, output, owner, 1,
+        ));
+        Ok(c)
+    }
+    pub fn is_controls(&self) -> bool {
+        self.controls.is_some()
+    }
     pub fn is_mixed(&self) -> bool {
         self.mixed.is_some()
     }
@@ -54,6 +71,11 @@ impl Compiler {
         self.stack.is_some()
     }
     pub fn exchange(&mut self, mut packet: wire::Packet) -> Result<wire::Packet> {
+        if let Some(controls) = self.controls.as_mut() {
+            let reply = controls.exchange(packet)?;
+            self.requests.clone_from(&controls.requests);
+            return Ok(reply);
+        }
         if let Some(mixed) = self.mixed.as_mut() {
             let reply = mixed.exchange(packet)?;
             self.requests.clone_from(&mixed.requests);

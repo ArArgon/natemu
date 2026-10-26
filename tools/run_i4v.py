@@ -35,6 +35,7 @@ def main():
     parser.add_argument('--paging-off-steps', action='store_true', help='also execute protected32 segment/A20 and serviced-route instruction cases')
     parser.add_argument('--mixed-modes', action='store_true', help='also execute paged/paging-off owners with shared source and data')
     parser.add_argument('--controls', action='store_true', help='also execute fetched guest control instructions and legacy32 transitions')
+    parser.add_argument('--concurrent-controls', action='store_true', help='also compose guest controls with retained peer work at N=1..4')
     parser.add_argument('--focus', help='retain only one selected alias/stack concurrency cell for diagnosis')
     args = parser.parse_args()
     selected = [f'{family}-{region}-n{n}' for family,enabled in (('alias',args.aliases),('stack',args.concurrent_stack))
@@ -53,6 +54,9 @@ def main():
                          'long-direct','long-via-pae','long-aba','long-bad-lme','long-no-pae','long-clear-pae','long-clear-pg','long-bad-efer','long-ea64','long-gdt-limit','long-not-present','long-ld','long-pointer-np','long-target-np','long-tss16','long-data-selector','long-target-noncanonical')
     if args.controls:
         selected += ['controls-'+name for name in control_scenarios]
+    concurrent_profiles = ((0, 'legacy'), (21, 'pae'), (24, 'long-aba'), (22, 'long-direct'), (3, 'rejected'))
+    if args.concurrent_controls:
+        selected += [f'controls-concurrent-{name}-n{n}-actor{actor}' for _, name in concurrent_profiles for n in (1,2,3,4) for actor in range(n)]
     if args.focus and args.focus not in selected:
         parser.error('--focus must name a cell enabled by its selected profile')
     if resource.getrlimit(resource.RLIMIT_CPU) != (resource.RLIM_INFINITY,) * 2:
@@ -72,6 +76,7 @@ def main():
                   paging_off_steps_enabled=args.paging_off_steps,
                   mixed_modes_enabled=args.mixed_modes,
                   controls_enabled=args.controls,
+                  concurrent_controls_enabled=args.concurrent_controls,
                   focus=args.focus,
                   limits=dict(build_jobs=2, build_rss_bytes=8*1024**3,
                               worker_rss_bytes=512*1024**2, cell_seconds=120,
@@ -93,6 +98,7 @@ def main():
                      'tools/check_i4v_mixed.py', 'tools/test_check_i4v_mixed.py',
                      'tools/i4v_controls_worker.py', 'tools/test_i4v_controls_worker.py',
                      'tools/i4v_controls_check.py', 'tools/test_i4v_controls_check.py',
+                     'tools/i4v_controls_concurrent_check.py', 'tools/test_i4v_controls_concurrent_check.py',
                      'tools/i4v_pae_model.py',
                      'tools/i4v_modes_model.py',
                      'tools/i4v_stack_check.py', 'tools/test_i4v_stack_check.py',
@@ -135,7 +141,8 @@ def main():
             directory.mkdir()
             specification = dict(argv=list(map(str, argv)), cwd=str(source), environment=environment)
             if oracle:
-                specification['oracle'] = str(source / ('tools/i4v_controls_check.py' if oracle == 'controls'
+                specification['oracle'] = str(source / ('tools/i4v_controls_concurrent_check.py' if oracle == 'concurrent-controls'
+                    else 'tools/i4v_controls_check.py' if oracle == 'controls'
                     else 'tools/check_i4v_mixed.py' if oracle == 'mixed'
                     else 'tools/i4v_off_steps_check.py' if oracle == 'off-steps'
                     else 'tools/i4v_off_check.py' if oracle == 'off32'
@@ -178,6 +185,7 @@ def main():
         job('mixed-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_check_i4v_mixed.py'])
         job('controls-worker-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_controls_worker.py'])
         job('controls-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_controls_check.py'])
+        job('concurrent-controls-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_controls_concurrent_check.py'])
         job('build-host', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-host'], wall=600, rss=8*1024**3)
         job('build-runtime', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], wall=600, rss=8*1024**3)
         host = source / 'target/release/natemu-host'
@@ -185,6 +193,39 @@ def main():
         job('sign', ['codesign', '--force', '--sign', '-', '--entitlements', 'crates/host/entitlements.plist', host])
         job('verify-signature', ['codesign', '--verify', '--verbose=2', host])
         exporter = module(source / 'tools/i4v_producer/export.py', 'exporter')
+        # Exercise new control composition before the earlier regression families.
+        if args.concurrent_controls:
+            sys.path.insert(0,str(source/'tools'))
+            controls_worker = module(source/'tools/i4v_controls_worker.py','controls_worker')
+            sys.path.pop(0)
+            for profile, scenario in concurrent_profiles:
+                for n in (1,2,3,4):
+                    for actor in range(n):
+                        label=f'controls-concurrent-{scenario}-n{n}-actor{actor}'
+                        if args.focus and label != args.focus:
+                            continue
+                        output=run/(label+'-producer')
+                        result=job(label,[host,runtime,'i4v-controls-concurrent',producer,profile,n,actor,source/'tools/i4v_controls_worker.py',output],oracle='concurrent-controls')
+                        report=json.loads((result/'command.stdout').read_text())
+                        if (report['case'],report['program_revision'],report['profile'],report['configured_vcpus'],report['tested_vcpus'],report['actor']) != ('controls-concurrent',1,profile,n,n,actor):
+                            raise ValueError('concurrent control report differs from requested program/owners')
+                        for owner in report['owners']:
+                            directory=output/f"cpu-{owner['id']}"
+                            requests=owner['compiler_requests']
+                            pairs=[(v['request'],v['reply']) for v in owner['visits'] if v['entries']]
+                            if profile in (0,21,24):
+                                pairs.append((owner['controls']['deferred'],owner['controls']['late_reply']))
+                            if owner['owner']['source_rejections']:
+                                pairs.append((owner['owner']['source_expected'],owner['owner']['source_reply']))
+                            pairs.sort(key=lambda pair:pair[0][12])
+                            if [p[0] for p in pairs] != requests or len(requests) != owner['requests']:
+                                raise ValueError('concurrent compiler requests differ from resident deliveries')
+                            controls_worker.verify_compilations(directory,requests,[p[1] for p in pairs])
+                            for index,request in enumerate(requests):
+                                item=directory/f'request-{index:03}'
+                                exported=controls_worker.verify_request(item,request)
+                                record['compilations'].append(dict(directory=str(item.relative_to(run)),export=exported))
+                        record['cells'].append(dict(name=label,producer=str(output.relative_to(run)),vcpus=n,actor=actor,profile=profile))
         for region, rip in (() if args.focus else (('high', 0xffff800000102000), ('low', 0x102000))):
             directory = run / ('compile-' + region)
             job('producer-' + region, [sys.executable, '-B', source / 'tools/i4v_producer/compile.py',

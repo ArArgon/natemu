@@ -35,6 +35,9 @@ impl Job {
     }
 }
 pub struct Compiler {
+    owner: u64,
+    incarnation: u64,
+    concurrent: bool,
     producer: PathBuf,
     worker: PathBuf,
     output: PathBuf,
@@ -45,6 +48,9 @@ pub struct Compiler {
 impl Compiler {
     pub fn new(producer: PathBuf, worker: PathBuf, output: PathBuf) -> Self {
         Self {
+            owner: 0,
+            incarnation: 1,
+            concurrent: false,
             producer,
             worker,
             output,
@@ -52,6 +58,19 @@ impl Compiler {
             pending: None,
             requests: Vec::new(),
         }
+    }
+    pub fn new_owner(
+        producer: PathBuf,
+        worker: PathBuf,
+        output: PathBuf,
+        owner: u64,
+        incarnation: u64,
+    ) -> Self {
+        let mut compiler = Self::new(producer, worker, output);
+        compiler.owner = owner;
+        compiler.incarnation = incarnation;
+        compiler.concurrent = true;
+        compiler
     }
     fn start(&mut self, request: wire::Packet) -> Result<Job> {
         let directory = self
@@ -81,7 +100,11 @@ impl Compiler {
     pub fn exchange(&mut self, mut packet: wire::Packet) -> Result<wire::Packet> {
         let operation = packet[0];
         packet[0] = controls::MISS;
-        if controls::reply(&packet).is_none() {
+        if packet[3] != self.owner
+            || packet[4] != self.incarnation
+            || (!self.concurrent && packet[5] != 1)
+            || controls::reply(&packet).is_none()
+        {
             return Err("control request changes configured owner/mode/profile".into());
         }
         match operation {
@@ -184,5 +207,38 @@ mod tests {
             assert!(compiler.exchange(bad).is_err());
             assert!(compiler.requests.is_empty());
         }
+    }
+
+    #[test]
+    fn configured_owner_and_incarnation_are_not_taken_from_worker_packet() {
+        let mut compiler =
+            Compiler::new_owner("unused".into(), "unused".into(), "unused".into(), 2, 7);
+        let packet =
+            controls::request_owner(37, 2, 7, 3, 8, 2, controls::RIP + 512, &[0x89, 0x03], 4)
+                .unwrap();
+        compiler.pending = Some(job(packet));
+        for (owner, incarnation) in [(1, 7), (2, 6)] {
+            let mut wrong = controls::request_owner(
+                37,
+                owner,
+                incarnation,
+                3,
+                8,
+                2,
+                controls::RIP + owner * 256,
+                &[0x89, 0x03],
+                4,
+            )
+            .unwrap();
+            wrong[0] = TAKE_COMPILE;
+            assert!(compiler.exchange(wrong).is_err());
+            assert!(compiler.pending.is_some());
+            assert!(compiler.foreground.is_none());
+        }
+        let mut take = packet;
+        take[0] = TAKE_COMPILE;
+        assert_eq!(compiler.exchange(take).unwrap(), wire::command(wire::BUSY));
+        assert!(compiler.pending.is_none());
+        assert_eq!(compiler.foreground.as_ref().unwrap().request, packet);
     }
 }

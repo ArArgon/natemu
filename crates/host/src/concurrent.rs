@@ -3,6 +3,7 @@ use super::*;
 use natemu_abi::concurrency::*;
 use natemu_abi::translation as wire;
 use natemu_abi::{alias, shadow, stack, stack_concurrent};
+mod controls;
 mod mixed;
 mod mixed_producer;
 mod producer;
@@ -59,7 +60,13 @@ impl Cpu {
                     ));
                 }
                 match e.exception.syndrome & 0xffff {
-                    0x49 => return Ok(()),
+                    0x49 => {
+                        let s = ptr::read_volatile(shared_address as *const Shared);
+                        if s.status == PANIC {
+                            return Err(format!("resident owner panic detail={}", s.detail));
+                        }
+                        return Ok(());
+                    }
                     0x4a => {
                         // Only this owner writes its private record, and is
                         // stopped at the explicit register-transfer gateway.
@@ -71,7 +78,13 @@ impl Cpu {
                         for (r, v) in packet.iter_mut().enumerate() {
                             hv(hv_vcpu_get_reg(self.id, r as u32, v), "read service packet")?;
                         }
-                        let expected = if compiler.as_ref().is_some_and(|c| c.is_mixed()) {
+                        let expected = if compiler.as_ref().is_some_and(|c| c.is_controls()) {
+                            ptr::read_volatile(
+                                (shared_address - SHARED_OFFSET + natemu_abi::controls::OFFSET)
+                                    as *const natemu_abi::controls::State,
+                            )
+                            .expected
+                        } else if compiler.as_ref().is_some_and(|c| c.is_mixed()) {
                             ptr::read_volatile(
                                 (shared_address - SHARED_OFFSET + natemu_abi::mixed32::OFFSET)
                                     as *const natemu_abi::mixed32::State,
@@ -189,6 +202,7 @@ fn run_owners(
     memory: usize,
     compiler_config: Option<(std::path::PathBuf, std::path::PathBuf, u64, bool)>,
     mixed_profile: u64,
+    controls_config: Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>,
 ) -> Result<Vec<wire::Packet>> {
     thread::scope(|scope| {
         let (prepared_tx, prepared_rx) = mpsc::channel();
@@ -201,6 +215,7 @@ fn run_owners(
             let (release_tx, release_rx) = mpsc::channel::<()>();
             let prepared = prepared_tx.clone();
             let done = done_tx.clone();
+            let controls_config = controls_config.clone();
             let compiler_config = if id == 0 || mixed_profile != 0 {
                 compiler_config.clone()
             } else {
@@ -222,7 +237,14 @@ fn run_owners(
                         if id == n - 1 {
                             thread::sleep(Duration::from_millis(delay));
                         }
-                        if let Some((binary, output, profile, is_stack)) = compiler_config {
+                        if let Some((binary, worker, output)) = controls_config {
+                            compiler = Some(producer::Compiler::new_controls(
+                                binary,
+                                worker,
+                                output.join(format!("cpu-{id}")),
+                                id as u64,
+                            )?);
+                        } else if let Some((binary, output, profile, is_stack)) = compiler_config {
                             compiler = Some(if mixed_profile != 0 {
                                 producer::Compiler::new_mixed(
                                     binary,
@@ -306,7 +328,11 @@ fn run_owners(
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             if began.elapsed()
-                > Duration::from_secs(if compiler_config.is_some() { 100 } else { 10 })
+                > Duration::from_secs(if compiler_config.is_some() || controls_config.is_some() {
+                    100
+                } else {
+                    10
+                })
             {
                 error.get_or_insert("concurrent execution exceeded its deadline".into());
             }
@@ -320,10 +346,11 @@ fn run_owners(
         }
         drop(releases);
         let mut requests = Vec::new();
-        for h in owners {
+        for (id, h) in owners.into_iter().enumerate() {
             match h.join() {
                 Ok(Ok(mut r)) => requests.append(&mut r),
                 Ok(Err(e)) => {
+                    eprintln!("owner {id}: {e}");
                     error.get_or_insert(e);
                 }
                 Err(_) => {
@@ -355,6 +382,10 @@ fn profiles(name: &str) -> Result<(u64, u64, u64)> {
         "stack-leaf-high" => (5, 2, 3),
         _ => return Err("unsupported I4 scenario".into()),
     })
+}
+
+pub fn run_controls(args: &[String]) -> Result<()> {
+    controls::run(args)
 }
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -681,6 +712,7 @@ pub fn run(args: &[String]) -> Result<()> {
             None
         },
         mixed_profile,
+        None,
     )?;
     // Every owner has exited and destroyed its vCPU before host reads guest RAM.
     let c = unsafe { &*memory.0.add(COORD_OFFSET).cast::<Coordinator>() };

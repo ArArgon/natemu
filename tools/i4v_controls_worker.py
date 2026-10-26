@@ -18,11 +18,15 @@ def bitness(mode):
 def case_of(packet):
     return SOURCE_CASES[(source_of(packet),bitness(packet[8]))]
 
-def request(vm,generation,mode,rip,source,serial):
-    require(vm>0 and generation>0 and mode in (0,1,2,3,4) and serial>0,'unsupported control compile identity')
-    require((source,bitness(mode)) in SOURCE_CASES and 0x102000<=rip and rip+len(source)<=0x103000,'unsupported ordinary source/address')
+def request_owner(vm,owner,incarnation,source_generation,context,mode,rip,source,serial):
+    require(vm>0 and 0<=owner<4 and incarnation>0 and source_generation>0 and context>0 and mode in (0,1,2,3,4) and serial>0,'unsupported control compile identity')
+    base=0x102000+owner*0x100
+    require((source,bitness(mode)) in SOURCE_CASES and base<=rip and rip+len(source)<=base+0x100,'unsupported ordinary source/address')
     body=bytes.fromhex(CASES[SOURCE_CASES[(source,bitness(mode))]]['body'])
-    return (MISS,1,vm,0,1,1,generation,rip,mode,int.from_bytes(source.ljust(8,b'\0'),'little'),len(source),rip,serial,len(body),0,0)
+    return (MISS,1,vm,owner,incarnation,source_generation,context,rip,mode,int.from_bytes(source.ljust(8,b'\0'),'little'),len(source),rip,serial,len(body),0,0)
+
+def request(vm,generation,mode,rip,source,serial):
+    return request_owner(vm,0,1,1,generation,mode,rip,source,serial)
 
 def source_of(packet):
     require(packet[10]<=8,'oversized control source')
@@ -31,7 +35,7 @@ def source_of(packet):
 def parse_request(raw):
     require(len(raw)==128,'control request must contain sixteen words')
     p=struct.unpack('<16Q',raw)
-    require(p==request(p[2],p[6],p[8],p[7],source_of(p),p[12]),'control source/mode/address/identity mismatch')
+    require(p==request_owner(p[2],p[3],p[4],p[5],p[6],p[8],p[7],source_of(p),p[12]),'control source/mode/address/identity mismatch')
     return p
 
 def make_reply(packet,body):

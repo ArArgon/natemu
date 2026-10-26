@@ -539,10 +539,13 @@ load, stack-prefix and shared/mixed-permission alias checkpoints have independen
 acceptance; [INV-03-01](research/investigations/INV-03-01.md#i4-v-active-development--first-v1-slice-october-25-2026)
 records their exact coverage and remaining work. Complete the remaining V1
 address/permission/boundary cases and extend the accepted flat mixed
-paged/paging-off concurrency to the wider V2 address/service profiles. V3's first
-protected32/legacy32 and hidden-PAE control-transition checkpoints have independent
-acceptance; add IA-32e transitions and descriptor-checked far transfers,
-including each slice's N-vCPU schedules, then the broader integrated campaign.
+paged/paging-off concurrency to the wider V2 address/service profiles. V3 now
+includes protected32/legacy32, hidden-PAE and IA-32e transactions, descriptor-checked
+far transfers and 50 concurrent family/actor cases at N=1/2/3/4. Primary and
+independent rebuilds pass 344 native cases, followed by 87 legacy checks;
+INV-03-01 owns the exact evidence and review scope. Next implement concurrent
+terminal #SS/#GP and checked split-page stack stores, then continue the broader
+integrated campaign.
 Declare execution bounds, adapt existing tests and add missing adversarial cases
 as each slice is built. Independent I5 preparation can proceed. Accepted finite
 checkpoints do not complete V1 or I4-V; unfinished cells remain explicit.

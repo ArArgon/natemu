@@ -201,7 +201,8 @@ accesses. Failed-active-reload cases use an explicit one-shot handler fixture;
 the next generated load must still use old hidden roots after native eviction.
 The PAE A/B/A case also retains an actual deferred compilation across reloads.
 Native PAE coverage is4-KiB/NXE-off; larger-page/NX walker unit tests do not imply
-native coverage. PAE concurrency and full exception delivery remain unimplemented.
+native coverage. Concurrent PAE composition is described below; full exception
+delivery remains unimplemented.
 
 Seventeen IA-32e programs add direct paging-off entry, descriptor-checked far
 transfers, return to compatibility mode and paging-off, plus a separate legacy
@@ -213,7 +214,19 @@ load checks full-width state. Identical emitted bytes never justify substituting
 a 32-bit compilation for a 64-bit request. Illegal transitions, pointer/descriptor
 faults, postcommit fetch faults and stale-context replies have independent checks.
 
-Exact results and independent acceptance live in INV-03-01. Broader segment and
-address forms and concurrent transitions remain further work alongside remaining V1
-boundaries and the broader campaign. These finite profiles do not complete V1,
-V2, V3 or I4-V.
+Add `--concurrent-controls` for five control-program families at N=1/2/3/4 with
+every actor position: legacy ABA, hidden-PAE ABA, IA-32e ABA, direct IA-32e entry/exit
+and rejected CR0. Each owner requests actual FEX output for its private source
+window and dynamic decoding mode. Its incarnation/source/context identity is
+checked independently from other owners; source and data backing remain shared.
+Program revision 1 adds ordinary instructions needed to compose sustained table
+maintenance with actual guest progress, pending-event handoff and source retirement.
+The rejected-control supplement checks prior stores and retained peers separately.
+Reports retain all per-owner compiler requests, deliveries, control/hidden state,
+physical metadata reads, native effects and one ordered shared trace. The checker
+replays shared table changes and A/D effects in that order.
+
+Exact results and independent acceptance live in INV-03-01; implementation alone
+does not establish concurrent acceptance. Broader segment/address forms, remaining
+V1 boundaries and the memory-model campaign remain further work. These finite
+profiles do not complete V1, V2, V3 or I4-V.

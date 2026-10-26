@@ -1,5 +1,120 @@
 # INV-03-01 — source findings review
 
+## Intermediate I4-V return — concurrent control transactions, October 26, 2026 UTC
+
+Root authored ABI/runtime, coordination and runner changes;
+`/root/i4v_producer` authored host/compiler integration and
+`/root/i4v_upstream` authored the independent architectural replay.
+`/root/i4v_contract_review` reviewed implementation, emitted code, oracle and
+artifacts, then independently rebuilt and executed the retained primary10
+snapshot. **ACCEPT this finite concurrent-control checkpoint. V3 and I4-V remain
+incomplete; this does not establish general guest transition correctness.**
+
+Independent `i4v-control-concurrent-independent-20261026-01` passes369 jobs and
+344 native cells:50 new rotations plus294 prior cases. The reviewer rechecked
+all344 reports,2,244 actual compilations,2,256 report associations,2,498 delivered
+transfers and40,886 checksums. All504 retained producing inputs match primary10
+and the workspace at audit time. The producer matches its existing pin; compiler
+cleanup records pass and no compiler containers remain. This is fresh generation
+from the pinned producer, not a fresh upstream FEX build.
+
+The new matrix covers five families at N=1/2/3/4 and every actor position:
+legacy ABA, hidden-PAE ABA, IA-32e ABA, direct paging-off/IA-32e transitions and
+rejected CR0. Across150 owners it records1,980 visits,1,950 completed guest
+instructions,1,290 native entries,480 native faults,1,500 compilations,
+4,546 walks,90 hidden-root loads/360 root reads,2,780 lower-table reads,
+340 lower-table writes and180 physical metadata reads. The legal families add
+1,080 maintenance heads,160 actual generated progress intervals and150 event
+handoffs across all families. N1 is the no-peer control; the rejected supplement
+does not claim maintenance pressure. Maximum trace use is586/768; replica trace
+total15,779 versus primary15,781 reflects permitted scheduling differences.
+
+The replay checks actual local commits across retained peer accesses, unchanged
+peer state, still-current peer replies executing after actor transitions,
+context-only ABA rejection, shared-table effects with private hidden roots,
+positive current-entry eligibility followed by source-only rejection, and old
+reference release before code reclamation. It also checks full canonical/native
+frames, physical memory images, FIFO identities, the eight-head progress bound,
+round-robin intervals and event eligibility at the actual handoff. Program
+revision1 and requested family/N/actor bind the report; every compiler delivery
+binds its resident request and actual exported body.
+
+Review corrected two oracle gaps: rejecting actual semantic commits made before
+peers detach, and recomputing eligibility when an event is handed off. A later
+legal N3 schedule exposed a distinction between another waiter selecting the
+FIFO head and that owner actually resuming. The oracle now permits preselection
+but rejects execution before the owner's isolation check. All18 checker tests
+pass, including the reproduced corruptions. Preserved development05–07 record
+the unaligned page-base lookup panic and diagnostics;08 verifies its fix.
+Development09 remains a failed partial campaign, not retroactive acceptance.
+
+Primary, independent replica and legacy regression share runtime SHA-256
+`e181033a9c36f5d3e4899e8a599a53b1c64a8819b80591a4b2291a78e773ed5d`.
+The two RX loads occupy168 boot bytes and143,260 main bytes within their reserved
+windows, with a valid boot ADR to vectors. Conservative emitted-call accounting
+remains14,992/16,384 stack bytes. Replica execution runs09:21:22–09:32:32UTC
+(670 seconds), retains269,570,577 bytes and observes peak build/worker RSS of
+590,872,576/438,501,376 bytes, within declared limits. Its process exited0 before
+the execution slot was released. Root subsequently ran
+`i4v-control-concurrent-regression-20261026-01`,09:32:54–09:33:41UTC; the reviewer
+verified its passed87-job manifest and identical ELF. No builds/native campaigns
+overlapped, and the reviewer did not duplicate the legacy execution.
+
+Remaining V1 terminal/split-access concurrency, V2 address forms and broader
+memory-model, coherence and lifetime validation remain in the full I4-V scope.
+The event mechanism is a canonical-state handoff fixture, not guest IDT delivery;
+bounded modes, operand mappings and descriptors do not imply full kernel boot.
+
+## Plan review — terminal stack faults and split stores, October 26, 2026 UTC
+
+`/root/i4v_contract_review` independently reviewed the next bounded V1 contract.
+**ACCEPT as an implementation plan; no new execution result is claimed.**
+It preserves committed prefixes and precise #SS(0)/#GP(0) state, including
+unchanged CR2, while peers drain and maintenance uses saved routes without
+mutating the terminal actor's canonical state. Both split-store fragments share
+one admitted context/lifetime; readiness preserves existing A/D, admits lawful
+new A effects and defers new D effects until both fragments are ready. The
+checked-service success/fault contract is explicitly separate from uncertain
+native cross-page partial-store behavior. Disjoint backing and expectations
+derived from prior memory effects prevent fixture resets from hiding errors.
+
+Five outcomes across all N/actor positions form50 cases; low/high source forms
+must be reported per case, without implying a100-case address cross-product.
+Existing344 native cases and87 legacy jobs remain regressions, and the broader
+I4-V obligations remain active. No substantive plan blocker remains after the
+state-preservation and shared-lifetime clarifications.
+
+## Development review — concurrent source lifetime, October 26, 2026 UTC
+
+`/root/i4v_contract_review` independently audited retained
+`i4v-control-concurrent-dev-20261026-04`, the N=3 legacy-control program with
+actor1, without another build or native run. All three owners report runtime
+success and17 completed instructions. All42 actual compiler requests, exported
+bodies and delivered replies bind to the resident records;2,070 retained
+checksums pass. **This is development evidence, not checkpoint acceptance:**
+the retained manifest remains failed because the unfinished full oracle fails
+closed. Maintenance, events and the complete role/profile matrix remain pending.
+
+The source-only rejection now has a positive control: each owner's current
+context/body is published in the same final visit slot and is eligible before
+mutation. Its source-generation change then rejects both that entry and the
+actual old reply. Trace ordering places all source acknowledgements before
+reference release and all old-reference releases before any private code clear.
+The recorded cleared images are zero; fresh generation2 bodies actually execute
+MOV17 followed by STORE17 in each owner's data span. Only the expected source
+immediate byte changes in each256-byte source span. Peer local-control and held
+reply snapshots remain equal across the actor's commits. Old and new reference
+masks both finish zero; new admissions no longer repopulate old references.
+
+The audited ELF SHA-256 is
+`b951f88909c8f16983fe84d4d681a124579b3bacee50f20d0365e86c7b511acb`.
+Its two RX loads occupy168 boot bytes and137,468 main bytes within the declared
+windows; the boot ADR reaches the actual vectors. Conservative emitted-call
+accounting remains14,992 bytes against the16,384-byte stack. The new source-cut
+frame is224 bytes and publication is outlined. No substantive blocker was found
+in this development cut; fresh complete-oracle replication and legacy regression
+are still required before accepting the concurrent checkpoint.
+
 ## Plan review — concurrent guest control transitions, October 26, 2026 UTC
 
 `/root/i4v_upstream` independently checked the recorded

@@ -505,6 +505,32 @@ checked separately. The single-operand invalidation limit above still applies.
 INV-03-01 records native validation and review status; these N=1 profiles do not
 establish concurrent mode-transition correctness.
 
+The concurrent V3 extension runs one control-program family per VM at configured
+N=1/2/3/4, rotating the transitioning owner. Every owner keeps private canonical
+state, hidden PDPTEs, native mappings and compiled-code slots; guest source,
+data and page tables are shared. Requests and entry guards bind VM, owner,
+incarnation, source generation, local context, guest RIP and decoding mode.
+A local control commit leaves peer architectural state unchanged. An admitted
+peer fault completes once on its retained route; a still-current peer compiler
+reply may be published and executed after the actor's local transition.
+
+Shared table/source writers separately close admission and exclude native routes
+and complete semantic transactions, including descriptor reads through commit.
+Table acknowledgements resolve each owner's current mode, CR3 and hidden roots.
+Nine maintenance requests per owner yield after at most eight heads to an actual
+next generated instruction; semantic prefixes do not count as that progress.
+Source invalidation first demonstrates a currently eligible real entry, rejects
+that same entry and its old reply after the generation change, and retains its
+code until all references release. Only then may replacement code be published.
+Pending-event handoff records canonical state at an eligible boundary without
+changing guest IF. This is a bounded handoff fixture, not guest IDT delivery.
+
+Concurrent program revision 1 adds generated instructions to supply these ordinary
+intervals without resetting guest execution. The report identifies the revision;
+older development programs retain their original interpretation. The rejected
+control supplement preserves earlier stores but does not claim maintenance
+pressure coverage. INV-03-01 owns validation status and remaining broader V3 work.
+
 ## 5. Faults, completion and event delivery
 
 The permanent exception landing captures X0–X30, original SP and native PC,

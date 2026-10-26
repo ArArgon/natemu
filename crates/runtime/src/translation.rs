@@ -49,7 +49,14 @@ pub unsafe fn completed() -> ! {
 }
 
 pub unsafe fn replace_bytes(body: &[u8]) {
+    unsafe { replace_bytes_for_owner(body, 0) }
+}
+pub unsafe fn replace_bytes_for_owner(body: &[u8], owner: u64) {
     unsafe {
+        if owner >= natemu_abi::concurrency::MAX_CPUS as u64 || body.len() > 4096 {
+            stop(REJECTED, 310);
+        }
+        let physical = IPA + owner * RAM_SIZE as u64 + CODE_OFFSET as u64;
         let pte = (PRIVATE + 0x14000 + (CODE_OFFSET / 4096 * 8) as u64) as *mut u64;
         let attrs = 3 | 1 << 10 | 3 << 8;
         let update = |entry| {
@@ -59,7 +66,7 @@ pub unsafe fn replace_bytes(body: &[u8]) {
             asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
         };
         // No execution or saved native continuation into the slot is live here.
-        update((IPA + CODE_OFFSET as u64) | attrs | (3 << 53));
+        update(physical | attrs | (3 << 53));
         ptr::copy_nonoverlapping(body.as_ptr(), CODE_VA as *mut u8, body.len());
 
         // Four-byte stepping covers every cache line without a host-line-size premise.
@@ -71,7 +78,7 @@ pub unsafe fn replace_bytes(body: &[u8]) {
             asm!("ic ivau, {0}",in(reg)CODE_VA+offset as u64);
         }
         asm!("dsb ish", "isb");
-        update((IPA + CODE_OFFSET as u64) | attrs | (1 << 7));
+        update(physical | attrs | (1 << 7));
     }
 }
 

@@ -364,6 +364,9 @@ pub fn instructions(profile: u64) -> Option<&'static [Instruction]> {
     PROGRAMS.get(usize::try_from(profile).ok()?).copied()
 }
 pub fn source(profile: u64) -> Option<([u8; 128], usize)> {
+    source_at(profile, RIP)
+}
+pub fn source_at(profile: u64, base: u64) -> Option<([u8; 128], usize)> {
     let mut source = [0; 128];
     let mut size = 0;
     for inst in instructions(profile)? {
@@ -375,17 +378,20 @@ pub fn source(profile: u64) -> Option<([u8; 128], usize)> {
         }
         if inst.bytes[0] == 0xea {
             source[size + 1..size + 5]
-                .copy_from_slice(&((RIP + size as u64 + inst.len as u64) as u32).to_le_bytes());
+                .copy_from_slice(&((base + size as u64 + inst.len as u64) as u32).to_le_bytes());
         }
         size += inst.len;
     }
     Some((source, size))
 }
 pub fn instruction(profile: u64, rip: u64) -> Option<Instruction> {
-    let (source, size) = source(profile)?;
+    instruction_at(profile, RIP, rip)
+}
+pub fn instruction_at(profile: u64, base: u64, rip: u64) -> Option<Instruction> {
+    let (source, size) = source_at(profile, base)?;
     let mut at = 0;
     for inst in instructions(profile)? {
-        if RIP + at as u64 == rip {
+        if base + at as u64 == rip {
             let mut out = *inst;
             out.bytes[..out.len].copy_from_slice(&source[at..at + out.len]);
             return Some(out);
@@ -403,8 +409,25 @@ pub fn request(
     source: &[u8],
     serial: u64,
 ) -> Option<Packet> {
+    request_owner(vm, 0, 1, 1, generation, mode, rip, source, serial)
+}
+pub fn request_owner(
+    vm: u64,
+    owner: u64,
+    incarnation: u64,
+    source_generation: u64,
+    generation: u64,
+    mode: u64,
+    rip: u64,
+    source: &[u8],
+    serial: u64,
+) -> Option<Packet> {
     let (_, len) = body_for(source, mode)?;
-    if vm == 0 || generation == 0 || serial == 0 || source.len() > 8 {
+    if vm == 0 || owner >= crate::concurrency::MAX_CPUS as u64
+        || incarnation == 0 || source_generation == 0 || generation == 0
+        || serial == 0 || source.len() > 8
+        || rip < RIP + owner * 256 || rip.checked_add(source.len() as u64)? > RIP + (owner + 1) * 256
+    {
         return None;
     }
     let mut bytes = [0; 8];
@@ -413,9 +436,9 @@ pub fn request(
         MISS,
         1,
         vm,
-        0,
-        1,
-        1,
+        owner,
+        incarnation,
+        source_generation,
         generation,
         rip,
         mode,
@@ -435,7 +458,7 @@ pub fn reply(p: &Packet) -> Option<Packet> {
     }
     let bytes = p[9].to_le_bytes();
     let src = &bytes[..len];
-    if Some(*p) != request(p[2], p[6], p[8], p[7], src, p[12]) {
+    if Some(*p) != request_owner(p[2], p[3], p[4], p[5], p[6], p[8], p[7], src, p[12]) {
         return None;
     }
     let (body, _) = body(src)?;
@@ -514,6 +537,38 @@ const _: () = assert!(RECORD_OFFSET + MAX_VISITS * core::mem::size_of::<Visit>()
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owner_lifetime_and_source_are_independent_reply_bindings() {
+        let source = [0x8b, 3];
+        let p = request_owner(7, 3, 4, 5, 6, 3, RIP + 3 * 256, &source, 9).unwrap();
+        assert!(valid(&p, &reply(&p).unwrap()));
+        for word in [3, 4, 5, 6, 8, 12] {
+            let mut wrong = reply(&p).unwrap();
+            wrong[word] ^= 1;
+            assert!(!valid(&p, &wrong));
+        }
+        assert!(request_owner(7, 2, 4, 5, 6, 3, RIP + 3 * 256, &source, 9).is_none());
+        assert!(request_owner(7, 4, 4, 5, 6, 3, RIP + 4 * 256, &source, 9).is_none());
+        for (incarnation, source_generation) in [(0, 1), (1, 0)] {
+            assert!(request_owner(7, 0, incarnation, source_generation, 6, 3, RIP, &source, 9).is_none());
+        }
+    }
+    #[test]
+    fn owner_program_relocates_far_targets_but_preserves_relative_backedges() {
+        let base = RIP + 3 * 256;
+        let mut at = base;
+        for inst in instructions(22).unwrap() {
+            let actual = instruction_at(22, base, at).unwrap();
+            if actual.bytes[0] == 0xea {
+                assert_eq!(u32::from_le_bytes(actual.bytes[1..5].try_into().unwrap()) as u64, at + actual.len as u64);
+            }
+            at += inst.len as u64;
+        }
+        let (a, n) = source(24).unwrap();
+        let (b, m) = source_at(24, base).unwrap();
+        assert_eq!(n, m);
+        assert_eq!(&a[n - 5..n], &b[m - 5..m]);
+    }
     #[test]
     fn decoder_ignores_mod_and_operand_size_but_keeps_fault_classes() {
         for modbits in [0, 0x40, 0x80, 0xc0] {

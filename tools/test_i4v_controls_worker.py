@@ -65,6 +65,21 @@ class ControlWorkerChecks(unittest.TestCase):
             changed=list(packet);changed[8]=3
             with self.assertRaises(ValueError):worker.verify_request(directory,changed)
 
+    def test_owner_window_and_all_lifetime_fields_survive_dynamic_modes(self):
+        for owner in range(4):
+            for mode,source in [(0,bytes.fromhex('b811000100')),(2,bytes.fromhex('8b03')),(3,bytes.fromhex('8b03')),(4,bytes.fromhex('488b03'))]:
+                packet=worker.request_owner(37,owner,3,2,7,mode,0x102000+owner*0x100+0x20,source,9)
+                self.assertEqual(worker.parse_request(struct.pack('<16Q',*packet)),packet)
+                body=bytes.fromhex(worker.CASES[worker.case_of(packet)]['body'])
+                reply=struct.unpack('<16Q',worker.make_reply(packet,body))
+                self.assertEqual(reply[1:14],packet[1:14])
+                for index,value in [(3,(owner+1)%4),(4,0),(5,0),(6,0),(7,0x102000+owner*0x100-1),(7,0x102000+(owner+1)*0x100-1)]:
+                    bad=list(packet);bad[index]=value
+                    if index==7:bad[11]=value
+                    with self.subTest(owner=owner,mode=mode,index=index),self.assertRaises(ValueError):worker.parse_request(struct.pack('<16Q',*bad))
+        legacy=worker.request(37,7,0,0x102037,bytes.fromhex('8b03'),9)
+        self.assertEqual(legacy,worker.request_owner(37,0,1,1,7,0,0x102037,bytes.fromhex('8b03'),9))
+
     def test_numeric_mode_return_does_not_erase_generation(self):
         source=b'\xb8\x11\x00\x01\x00'
         old=worker.request(37,1,0,0x102000,source,2)

@@ -5,12 +5,12 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
-mod producer;
+pub(super) mod producer;
 const CODE_BYTES: usize = control::MAX_VISITS * control::SLOT_BYTES;
 const PAE_TABLE_OFFSET: usize = pae::TABLE_OFFSET;
 const PAE_TABLE_BYTES: usize = pae::TABLE_BYTES;
 
-fn pae_tables(profile: u64) -> [u8; PAE_TABLE_BYTES] {
+pub(super) fn pae_tables(profile: u64) -> [u8; PAE_TABLE_BYTES] {
     let mut bytes = [0; PAE_TABLE_BYTES];
     if profile >= 13 {
         for (gpa, value) in [
@@ -37,7 +37,7 @@ fn pae_tables(profile: u64) -> [u8; PAE_TABLE_BYTES] {
     bytes
 }
 
-fn mode_tables(profile: u64) -> [u8; modes::TABLE_BYTES] {
+pub(super) fn mode_tables(profile: u64) -> [u8; modes::TABLE_BYTES] {
     let mut bytes = [0; modes::TABLE_BYTES];
     if profile >= 22 {
         for (gpa, value) in [
@@ -99,13 +99,13 @@ macro_rules! fields {
         out
     }};
 }
-fn visit_json(v: &control::Visit) -> String {
+pub(super) fn visit_json(v: &control::Visit) -> String {
     let mut fields = fields!(v; rip,bytes,kind,source,fetch_gpa,before,after,generation_before,generation_after,gpr_before,gpr_after,flags_before,flags_after,exception,request,reply,entries,faults,gpa,memory_before,memory_after,vector,error,linear);
     fields.push(format!("\"frame\":{}", frame_json(&v.frame)));
     fields.push(format!("\"fault_frame\":{}", frame_json(&v.fault_frame)));
     format!("{{{}}}", fields.join(","))
 }
-fn state_json(s: &control::State) -> String {
+pub(super) fn state_json(s: &control::State) -> String {
     let mut fields = fields!(s; profile,cpl,generation,visits,completed,transfers,serial,walks,invalidations,mapping,fixture_mutated,warm_before_reload,stale_reply,stale_entry,expected,deferred,late_reply,rebound_reply,old_slot_context,old_controls);
     fields.push(format!("\"initial\":{}", frame_json(&s.initial)));
     fields.push(format!("\"current\":{}", frame_json(&s.current)));
@@ -114,7 +114,7 @@ fn state_json(s: &control::State) -> String {
 fn hidden_json(hidden: &pae::Hidden) -> String {
     format!("{{{}}}", fields!(hidden; entries,generation).join(","))
 }
-fn pae_json(state: &pae::State) -> String {
+pub(super) fn pae_json(state: &pae::State) -> String {
     let mut fields = fields!(state; attempts,reads,walk_reads,walk_writes,invlpg,evictions,mutations,handled_faults);
     fields.push(format!("\"hidden\":{}", hidden_json(&state.hidden)));
     let visits = state.visits.iter().map(|visit| {
@@ -125,7 +125,7 @@ fn pae_json(state: &pae::State) -> String {
     fields.push(format!("\"visits\":[{visits}]"));
     format!("{{{}}}", fields.join(","))
 }
-fn modes_json(state: &modes::State) -> String {
+pub(super) fn modes_json(state: &modes::State) -> String {
     let mut fields = fields!(state; gdtr,tr,pointer,reads,pointer_reads,descriptor_reads,mutations);
     let visits = state.visits.iter().map(|visit| format!("{{{}}}",fields!(visit; cs_before,cs_after,mode_before,mode_after,pointer_address,pointer_bytes,descriptor_address,descriptor).join(","))).collect::<Vec<_>>().join(",");
     fields.push(format!("\"visits\":[{visits}]"));

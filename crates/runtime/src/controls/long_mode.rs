@@ -46,9 +46,19 @@ pub(super) unsafe fn initial_valid(profile: u64) -> bool {
     unsafe {
         let p = state();
         let start = if profile >= 22 {
-            if (*p).gdtr != [DATA_VA + 0x200, 0x37]
+            let gdt = if concurrent::enabled() {
+                natemu_abi::control_concurrent::gdt(concurrent::id())
+            } else {
+                DATA_VA + 0x200
+            };
+            let pointer = if concurrent::enabled() {
+                natemu_abi::control_concurrent::pointer(concurrent::id())
+            } else {
+                DATA_VA + 0x100
+            };
+            if (*p).gdtr != [gdt, 0x37]
                 || (*p).tr != [0x28, 0, 0x67, if profile == 36 { 0x83 } else { 0x8b }]
-                || (*p).pointer != DATA_VA + 0x100
+                || (*p).pointer != pointer
                 || (*guest()).gpr[1] != 0xc0000080
                 || (*guest()).gpr[2] != 0
                 || (*guest()).gpr[6] != (*p).pointer
@@ -82,7 +92,17 @@ unsafe fn transfer_error(error: m::TransferError) -> ! {
 }
 unsafe fn read_guest(address: u64, bytes: usize) -> [u8; 16] {
     unsafe {
-        let (gpa, _) = route_or_fault(address, bytes as u64, Access::Read);
+        let guard = concurrent::lock();
+        let (gpa, _) = match route_under_authority(address, bytes as u64, Access::Read) {
+            Ok(v) => v,
+            Err(e) => {
+                drop(guard);
+                match e {
+                    Fault::Page { address, error } => exception(14, address, error),
+                    _ => stop(REJECTED, 270),
+                }
+            }
+        };
         let mut value = [0; 16];
         copy_record(
             value.as_mut_ptr(),
@@ -90,6 +110,13 @@ unsafe fn read_guest(address: u64, bytes: usize) -> [u8; 16] {
             bytes,
         );
         (*state()).reads += 1;
+        if let Some(guard) = guard {
+            (*concurrent::owner()).metadata_gpas[(*super::state()).visits as usize - 1]
+                [usize::from(bytes != 10)] = gpa;
+            guard
+                .trace(0x6000 + (*super::state()).visits, concurrent::id())
+                .unwrap_or_else(|e| stop(PANIC, e));
+        }
         value
     }
 }
@@ -101,6 +128,7 @@ pub(super) unsafe fn instruction(source: &[u8]) -> bool {
         let g = guest();
         if source == [0x0f, 0x30] {
             (*super::visit()).kind = 4;
+            concurrent::before_control();
             let next = match m::write_efer(&*g, (*super::state()).cpl) {
                 Ok(next) => next,
                 Err(c::Error::GeneralProtection) => exception(13, 0, 0),
@@ -115,12 +143,14 @@ pub(super) unsafe fn instruction(source: &[u8]) -> bool {
             invalidate();
             (*g).rip += 2;
             complete_visit();
+            concurrent::semantic_done(true);
             return true;
         }
         if source.first() != Some(&0xea) && source != [0x48, 0xff, 0x2e] {
             return false;
         }
         (*super::visit()).kind = 5;
+        concurrent::before_control();
         let mode = c::mode(&*g).unwrap_or_else(|| stop(REJECTED, 305));
         let (target, selector) = if source[0] == 0xea {
             if mode == 4 {
@@ -177,6 +207,7 @@ pub(super) unsafe fn instruction(source: &[u8]) -> bool {
             (*state()).mutations += 1;
         }
         complete_visit();
+        concurrent::semantic_done(true);
         true
     }
 }
