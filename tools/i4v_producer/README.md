@@ -261,3 +261,22 @@ Observed barriers and native register writes are explicit metadata, separate
 from FEX's sparse PC map. These exact-byte admissions neither qualify LSE as the
 complete x86 locked-operation implementation nor turn DMB LD into the selected
 LFENCE completion construction. Those are resident-contract/review obligations.
+
+`probe_lfence.py` retains the generated live-result candidate at both RIPs in
+`i4v-lfence-producer-20261026-01`, with external supervision in its sibling
+`-supervision` directory. The 25-byte input produces 120 native bytes; the
+following four STMXCSR bytes are a separately declared semantic suffix. Small
+checked inputs, original objects, disassembly and exports are in `testdata/lfence-*`.
+No producer rebuild was needed.
+
+The actual prefix computes ADDPS into Q16, ADD into X7/X26, XOR-of-ADD-inputs into
+X27, and NZCV/FPSR before DMB LD at native16. LAHF/SETO after the fence consume
+X26/X27 and NZCV, including deferred AF/PF and OF. Stores at88/100/112 publish
+RCX, AX and XMM0; final CFINV at116 changes the carry representation. The finite
+export labels these roots separately from FEX's sparse guest-PC map. The MODE11
+resident adaptation preserves DMB LD and all generated words, inserts a direct
+branch to the full-frame dependency sink, completes its private stores with
+DSB SY/ISB, and resumes the shifted suffix. This is a bounded admission, not a
+general FEX liveness analysis. Pinned FEX GetMXCSR masks exception-status bits;
+the semantic STMXCSR suffix instead uses the existing masked-RN FPSR mapping
+and preserves the admitted incoming guest sticky flags.

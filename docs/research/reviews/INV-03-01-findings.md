@@ -1,6 +1,106 @@
 # INV-03-01 — source findings review
 
+## Intermediate I4-V return — native ordering and LFENCE completion, October 26, 2026 UTC
+
+`/root/i4v_producer` and root authored the retained FEX probes, ABI/runtime/gates
+and host/worker/runner integration in their assigned modules;
+`/root/i4v_upstream` authored the independent TSO and architectural report models.
+`/root/i4v_contract_review` independently reviewed these components, reproduced
+consequential validator defects, checked emitted code and artifacts, then owned
+four serialized fresh builds/execution campaigns. **ACCEPT this finite native
+ordering, aligned XCHG32 recovery and live-result LFENCE checkpoint. Broader I4-V
+remains incomplete.** This acceptance supersedes the preliminary status below.
+
+The final primary `i4v-fence-dev-20261026-02` passes 253 jobs/218 cases. The
+reviewer verifies all 526 actual exports, 538 report associations, 650 ordering
+and fence deliveries, 12,508 checksums and 720 producing inputs. Independent
+reproduction then uses the unchanged executable inputs in these fresh bundles:
+
+| Retained run | Jobs | Native cases or legacy reports | Verified checksums | Seconds |
+| --- | ---: | ---: | ---: | ---: |
+| `i4v-fence-independent-20261026-01` | 253 | 218 cases | 12,508 | 298 |
+| `i4v-fence-independent-20261026-02` | 429 | 394 cases | 45,064 | 834 |
+| `i4v-fence-independent-20261026-03` | 139 | 104 cases | 23,512 | 394 |
+| `i4v-fence-regression-independent-20261026-01` | 87 | 70 legacy reports | 2,526 | 49 |
+
+The three I4-V case lists have an exact union of **628 distinct cases: all 454
+earlier cases plus 174 new cases**. Their 716 executions include the same 44
+baseline cases in each bundle, hence 88 repeated baseline executions; these are
+not additional distinct cases. The fourth bundle preserves the exact earlier
+87-job legacy list, including its native reports and count-rejection checks.
+Every process exited successfully before the next campaign started. The sequence
+ran 13:11:46–13:38:58 UTC without overlapping build/native/compiler campaigns.
+
+All 83,610 replica checksums verify. The three I4-V bundles contain 4,226 actual
+compiler exports and 4,262 checked report associations; every resident request
+and delivered chunk is tied to its producing artifact. Each has 720 inputs
+identical to the final primary and workspace at audit time. The legacy snapshot
+has 116 inputs: 92 shared inputs match the final primary, while its 24 additional
+legacy tools/fixtures match both the workspace and preceding legacy snapshot.
+Its fragment and two producer binaries match the specified durable pins exactly.
+No upstream FEX rebuild is claimed. All four freshly built runtime ELFs equal
+SHA256 `2ed0ca0a4df66b7046d3ff916c8060cbe4a31cfedc8ff14bf9c839b2a95bb56c`.
+
+The 154 ordering cases cover all 77 declared profile/count/role-rotation
+configurations at seeds 1 and 37: 450 owner compilations, 14,400 whole-block
+entries, 1,280 designated native faults, 1,920 exchange chains and 5,760 raw
+fence-control entries. The independent FIFO TSO model checks the seven litmus
+families. The reviewer verifies private trial records, warmed ordinary RAM,
+explicit LSE encoding 2 admission, preserved generated bodies and surrounding
+DMB SY pairs for the admitted exchanges. Ready/reset/done synchronization stays
+outside the participant blocks. The precommit permission fault retries SWPAL;
+the postcommit absent-result-page fault resumes only the later STLR. Complete
+native frames, unique-token chains and final physical images check exact-once
+effects without assuming peers leave the shared word unchanged.
+
+The 20 live LFENCE cases cover N=1/2/3/4 and five input rotations, yielding 50
+actual compilations, 200 delivered body chunks and 800 generated entries,
+completion sinks and continuations. All five input cases occur within every
+owner's 16 trials. The original 120-byte body is preserved around two direct
+branches. Full native stores consume the live vector result, sum, deferred AF/PF
+sources, NZCV, FPSR and preserved roots before DSB SY/ISB. ERET restores the full
+frame, including x16/x30, and resumes the original LAHF/SETO/store suffix. The
+final CFINV representation is checked separately. Actual scalar, flag and vector
+stores, all output canaries, the pre-suffix poison image and initial/sink/final
+frames verify the boundary. The separately recorded semantic STMXCSR preserves
+guest sticky status while adding the computed inexact status; it is not described
+as FEX-generated STMXCSR. No peer rendezvous occurs inside this local fence.
+
+The emitted-gate validator binds the actual producing ELF, full sink capture,
+DSB/ISB, handler continuation, full ERET restoration and allocated return capture.
+Every reported sink/return/capture PC is bound to those ELF symbols. Review found
+that its first conditional-edge scan omitted TBZ/TBNZ; an in-memory ELF mutation
+reproduced acceptance of a bypass. The author rejected that family, BC.cond and
+unexpected register/exception transfers and added corruption controls. The
+reviewer repeated the original bypass mutations and verified rejection, seven
+gate tests and the real emitted ELF. Earlier reserved-LSE admission was also
+corrected. The originally closed-checker diagnostics remain failed records;
+none was relabeled as an accepted native campaign.
+
+The final ELF occupies RX spans of 168 and 181,860 bytes within the split
+resident windows. Conservative emitted stack depth is 14,944/16,384 bytes;
+the LFENCE sink/handler needs 832 bytes and initialize needs 1,184. Across the
+four fresh bundles, peak observed RSS is 537,968,640 bytes in the 8GiB build/test
+class and 442,875,904 in the 512MiB worker class. The bundles retain 891,909,203
+bytes in total and individually remain within the 20-minute limit. All compiler
+cleanup records verify; the final legacy manifest and independent global query
+show no remaining `natemu-i4v-` compiler containers.
+
+This is bounded normal-memory evidence on the named host, not universal TSO or
+ISA proof. In replica01, store buffering observed only `(1,0)` and `(0,1)`;
+the permitted `(0,0)` outcome was not observed or required. IRIW and WRC exhibit
+multiple allowed outcomes, and no forbidden outcome is accepted. Model reasoning,
+actual emitted ordering and observed trials remain distinct evidence. LFENCE
+qualification covers the admitted positive-normal masked round-to-nearest
+exact/inexact inputs and already-stored sticky state; broader FP, device/service,
+locked-family, width, alignment and route semantics are not inferred. The earlier
+454 cases retain their existing finite limits. Translation-coherence expansion
+and remaining integrated recovery/progress obligations still belong to I4-V.
+
 ## Preliminary I4-V return — native ordering and atomic recovery, October 26, 2026 UTC
+
+Historical preliminary return; its pending-acceptance status is superseded by
+the completed independent return above.
 
 `/root/i4v_contract_review` independently reviewed the ordering ABI, resident
 runtime, host mappings/compiler protocol, retained FEX bodies and bounded TSO

@@ -417,3 +417,18 @@ helper_gate:
 partial_store:
     strb w1, [x0]
     ret
+
+// Direct-branch LFENCE sink: save computed roots before any Rust/helper work.
+.global fence_sink_gate
+fence_sink_gate:
+    msr spsel, #1
+    save_native
+    mrs x9, sp_el0
+    str x9, [sp, #{sp_offset}]
+    mrs x9, nzcv
+    str x9, [sp, #{nzcv_offset}]
+    dsb sy
+    isb
+    mov x0, sp
+    bl fence_sink_handler
+    b .

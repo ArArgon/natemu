@@ -1,0 +1,99 @@
+RAW RIP: 0x10000
+RAW Guest Code instructions: 1
+RAW Host Code instructions: 17
+RAW Blow-up Amt: 17x
+RAW Disassemble Begin
+RAW adr x0, #-0x4 (addr 0xffff61c00000)
+RAW str x0, [x28]
+RAW udf #0x420f
+RAW b #+0x8 (addr 0xffff61c00018)
+RAW udf #0x0
+RAW b #+0x8 (addr 0xffff61c00020)
+RAW br x0
+RAW ldr x0, pc+32 (addr 0xffff61c00040)
+RAW blr x0
+RAW udf #0x0
+RAW udf #0x0
+RAW unallocated (Unallocated)
+RAW udf #0x0
+RAW unallocated (Unallocated)
+RAW unallocated (Unallocated)
+RAW cbz x4, #-0x10ddc (addr 0xffff61bef264)
+RAW udf #0xffff
+RAW Disassemble End
+NATEMU_MODE bitness=64
+NATEMU_FEATURES sve128=0 sve256=0 rcpc=0 imm9=0 atomics=1 preserve_all=1
+NATEMU_WINDOW index=0 guest_rip=65536 source_address=65536 bytes=1 instructions=1
+NATEMU_OBJECT {"index":0,"bytes":128,"code_bytes":68,"code_offset":4,"guest_instructions":1,"relocation_bytes":144,"block_address":281472321716224}
+NATEMU_ENTRY index=0 guest_rip=65536
+NATEMU_GUEST_PC index=0 guest_offset=0 native_offset=4
+RAW Compiling code
+I Compiling code
+RAW Compiling instruction 'natemu-i4v-request'
+I Compiling instruction 'natemu-i4v-request'
+RAW RIP: 0x102100
+RAW Guest Code instructions: 8
+RAW Host Code instructions: 47
+I Host Code instructions: 47
+RAW Blow-up Amt: 5.875x
+RAW Disassemble Begin
+RAW adr x0, #-0x4 (addr 0xffff61c00080)
+RAW str x0, [x28]
+RAW fadd v16.4s, v16.4s, v17.4s
+RAW eor x27, x7, x5
+RAW adds x26, x7, x5
+RAW mov x7, x26
+RAW dmb ld
+RAW cset x20, hs
+RAW eor x21, x27, x26
+RAW ubfx w21, w21, #4, #1
+RAW orr x20, x20, x21, lsl #4
+RAW eor w0, w26, w26, lsr #4
+RAW eor w0, w0, w0, lsr #2
+RAW eor w21, w0, w0, lsr #1
+RAW orr x21, x21, #0xfffffffffffffffe
+RAW orn x20, x20, x21, ror #62
+RAW mrs x21, nzcv
+RAW and x21, x21, #0xc0000000
+RAW orr x20, x20, x21, lsr #24
+RAW orr x20, x20, #0x2
+RAW bfi x4, x20, #8, #8
+RAW cset x20, vs
+RAW bfxil x4, x20, #0, #8
+RAW nop
+RAW stlr x7, [x11]
+RAW add x20, x11, #0x8 (8)
+RAW nop
+RAW stlrh w4, [x20]
+RAW mov w20, #0x10
+RAW dmb ish
+RAW str q16, [x11, x20, sxtx]
+RAW cfinv
+RAW udf #0x420f
+RAW b #+0x8 (addr 0xffff61c00110)
+RAW udf #0x0
+RAW b #+0x8 (addr 0xffff61c00118)
+RAW br x0
+RAW ldr x0, pc+32 (addr 0xffff61c00138)
+RAW blr x0
+RAW udf #0x0
+RAW udf #0x0
+RAW unallocated (Unallocated)
+RAW udf #0x0
+RAW unallocated (Unallocated)
+RAW unallocated (Unallocated)
+RAW cbz x4, #-0x10ddc (addr 0xffff61bef35c)
+RAW udf #0xffff
+RAW Disassemble End
+NATEMU_COMPILE index=0 ns=617956 clock=monotonic scope=CompileRIP-or-CompileRIPCount diagnostics=included export_io=included policy=NOP-then-six-sequential-compiles cache=range-invalidated-before-each-compile
+NATEMU_WINDOW index=1 guest_rip=1057024 source_address=65536 bytes=25 instructions=8
+NATEMU_OBJECT {"index":1,"bytes":240,"code_bytes":188,"code_offset":4,"guest_instructions":8,"relocation_bytes":144,"block_address":281472321716352}
+NATEMU_ENTRY index=1 guest_rip=1057024
+NATEMU_GUEST_PC index=1 guest_offset=0 native_offset=4
+NATEMU_GUEST_PC index=1 guest_offset=13 native_offset=96
+NATEMU_GUEST_PC index=1 guest_offset=16 native_offset=104
+NATEMU_GUEST_PC index=1 guest_offset=20 native_offset=116
+RAW Testing instruction 'natemu-i4v-request': 30 host instructions
+I Testing instruction 'natemu-i4v-request': 30 host instructions
+NATEMU_COMPILE index=1 ns=335480 clock=monotonic scope=CompileRIP-or-CompileRIPCount diagnostics=included export_io=included policy=NOP-then-six-sequential-compiles cache=range-invalidated-before-each-compile
+NATEMU_COMPLETED tests=1 result=0

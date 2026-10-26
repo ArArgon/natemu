@@ -4,6 +4,14 @@ use natemu_abi::concurrency::*;
 use natemu_abi::translation as wire;
 use natemu_abi::{alias, shadow, stack, stack_concurrent};
 mod address;
+mod fence;
+mod fence_producer;
+pub use fence::run as run_fence;
+#[derive(Clone, Copy)]
+enum NativeProfile {
+    Ordering(natemu_abi::ordering::Config),
+    Fence(natemu_abi::fence::Config),
+}
 mod ordering;
 pub use ordering::run as run_ordering;
 mod boundary;
@@ -82,7 +90,11 @@ impl Cpu {
                         for (r, v) in packet.iter_mut().enumerate() {
                             hv(hv_vcpu_get_reg(self.id, r as u32, v), "read service packet")?;
                         }
-                        let expected = if compiler.as_ref().is_some_and(|c| c.is_ordering()) {
+                        let expected = if compiler.as_ref().is_some_and(|c| c.is_fence()) {
+                            (*((shared_address - SHARED_OFFSET + natemu_abi::fence::OWNER_OFFSET)
+                                as *const natemu_abi::fence::Owner))
+                                .expected
+                        } else if compiler.as_ref().is_some_and(|c| c.is_ordering()) {
                             (*((shared_address - SHARED_OFFSET + natemu_abi::ordering::OWNER_OFFSET)
                                 as *const natemu_abi::ordering::Owner))
                                 .expected
@@ -226,7 +238,7 @@ fn run_owners(
         std::path::PathBuf,
         std::path::PathBuf,
         std::path::PathBuf,
-        natemu_abi::ordering::Config,
+        NativeProfile,
     )>,
 ) -> Result<Vec<wire::Packet>> {
     thread::scope(|scope| {
@@ -265,13 +277,24 @@ fn run_owners(
                             thread::sleep(Duration::from_millis(delay));
                         }
                         if let Some((binary, worker, output, config)) = ordering_config {
-                            compiler = Some(producer::Compiler::new_ordering(
-                                binary,
-                                worker,
-                                output.join(format!("cpu-{id}")),
-                                id as u64,
-                                config,
-                            )?);
+                            compiler = Some(match config {
+                                NativeProfile::Ordering(config) => {
+                                    producer::Compiler::new_ordering(
+                                        binary,
+                                        worker,
+                                        output.join(format!("cpu-{id}")),
+                                        id as u64,
+                                        config,
+                                    )?
+                                }
+                                NativeProfile::Fence(config) => producer::Compiler::new_fence(
+                                    binary,
+                                    worker,
+                                    output.join(format!("cpu-{id}")),
+                                    id as u64,
+                                    config,
+                                )?,
+                            });
                         } else if let Some((binary, worker, output, config)) = address_config {
                             compiler = Some(producer::Compiler::new_address(
                                 binary,
@@ -371,11 +394,17 @@ fn run_owners(
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             if began.elapsed()
-                > Duration::from_secs(if compiler_config.is_some() || controls_config.is_some() || address_config.is_some() || ordering_config.is_some() {
-                    100
-                } else {
-                    10
-                })
+                > Duration::from_secs(
+                    if compiler_config.is_some()
+                        || controls_config.is_some()
+                        || address_config.is_some()
+                        || ordering_config.is_some()
+                    {
+                        100
+                    } else {
+                        10
+                    },
+                )
             {
                 error.get_or_insert("concurrent execution exceeded its deadline".into());
             }

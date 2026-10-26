@@ -360,7 +360,25 @@
     "control-imm-00010011-mode64/compiler.json": "72f1567e7c0f8795a9443449016019bc3832cd9e0db8f0643219ff39d7481a1d",
     "control-imm-00010011-mode64/producer.log": "a82af2bbb7927b6331dc3eae62650d21778bf693d0275acdee19a7ee215cdb14",
     "control-imm-00010011-mode64/outputs/001.native": "236829c6b7eae5671bbdb87a4f12795f3798497a0d9001177efeead9f18f5aba",
-    "control-imm-00010011-mode64/outputs/001.relocations": "1228ac5d1771cf45e20f109d6a6288553ab965f233df0135ed12076a15bbf014"
+    "control-imm-00010011-mode64/outputs/001.relocations": "1228ac5d1771cf45e20f109d6a6288553ab965f233df0135ed12076a15bbf014",
+    "lfence-0/source.x86": "51c37adfa12278826c6de9d3046dd2a378cf168f8ff906f267f2cd66567ebed3",
+    "lfence-0/body.bin": "07af68b2f92e3667e5fb251fb8e7a156e1eecc11d6967d2a763a97abd16678c6",
+    "lfence-0/export.json": "47a2792d953fa0e9bae369fdfeb48d05489bd4505f4deb565d2a01585e49c61f",
+    "lfence-0/disassembly.json": "d46537204ab1bb6500351f968a5ddcb56277c399c1e5911acd1e1172b49bd1ef",
+    "lfence-0/input.bin": "6d5fbedda69baf86f067a0003ea2b91261a1c9acf5fea09f3f165c381199f030",
+    "lfence-0/compiler.json": "81698f54f54e2e59e255730f575a60a1a140f140ebac60e0a1aad4d3c465718c",
+    "lfence-0/producer.log": "2354eb909d03dca74cdc582d31d906e2b77131c1c450ff448e854a557b53bb36",
+    "lfence-0/outputs/001.relocations": "cf33b5823e9ebee654f5b9d46bd5331a69140eae3591ce801c408c7a11c0bdaa",
+    "lfence-0/outputs/001.native": "ccd2d6aaa5f7cd53951014886a96240ac84def691b6889920f366f484a994bae",
+    "lfence-1/source.x86": "51c37adfa12278826c6de9d3046dd2a378cf168f8ff906f267f2cd66567ebed3",
+    "lfence-1/body.bin": "07af68b2f92e3667e5fb251fb8e7a156e1eecc11d6967d2a763a97abd16678c6",
+    "lfence-1/export.json": "b294c8ee7ad72198468937638e81725a891c347dc202c6e58db4779d5b08913b",
+    "lfence-1/disassembly.json": "9eeb753aff923079b867f3a519b8022d03a4799b831a1bf1afda2c1ed0b18d0a",
+    "lfence-1/input.bin": "6d5fbedda69baf86f067a0003ea2b91261a1c9acf5fea09f3f165c381199f030",
+    "lfence-1/compiler.json": "14bb036c3cbe8c9471cf5ef702ab4318f6919b5a0a33a227d5c99fd62a475761",
+    "lfence-1/producer.log": "2ad148afcfa0d5826328e194d9665454a83adec99d5f4cccc82e33f94fc89993",
+    "lfence-1/outputs/001.relocations": "c1602837bb7d208070888dcc9d5a11de40d567af59dcac0901a8ca92d96ffb9e",
+    "lfence-1/outputs/001.native": "f9efa2c545333759c3f1edd3938d7911c691967b72d08be8d3248c47c7c9239c"
   },
   "alias_retained_root": "/Users/liaozping/orca/natemu-raw/i4v-alias-producer-20261026-01",
   "replacement_retained_root": "/Users/liaozping/orca/natemu-raw/i4v-stack-concurrent-producer-20261026-01",
@@ -387,5 +405,6 @@
     ],
     "mode": 64,
     "retained_fixture_rip": 1056768
-  }
+  },
+  "lfence_retained_root": "/Users/liaozping/orca/natemu-raw/i4v-lfence-producer-20261026-01"
 }

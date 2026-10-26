@@ -547,14 +547,17 @@ independent rebuilds to 454 distinct native cases, followed by 87 legacy checks;
 INV-03-01 owns the exact evidence and review scope. Concurrent terminal #SS/#GP,
 checked split-page stores, subpage segment bases, fixed A20-off and address
 wrapping are accepted within their finite profiles. The new address cases use
-checked memory service; they do not qualify native ordering. Next implement the
-reviewed native litmus, atomic-recovery and local-fence slice, then continue the
-remaining translation, recovery/lifetime and adversarial progress coverage.
-The first ordering development campaign now passes154 new native cells plus44
-baseline cases: seven whole-block litmus profiles, aligned XCHG32 pre/post-commit
-fault recovery, and raw fence controls. Independent artifact inspection passes;
-full live-dependency LFENCE adaptation, all earlier regressions and a fresh
-independent rebuild remain required before accepting this ordering checkpoint.
+checked memory service; they do not qualify native ordering. The subsequent
+native ordering and live-dependency LFENCE implementation passes174 new cells:
+seven whole-block litmus profiles, aligned XCHG32 pre/post-commit recovery, raw
+fence controls and full native-state LFENCE sinks. Fresh independent rebuilds
+preserve all454 earlier native cases and87 legacy checks, giving628 distinct
+native cases. Independent artifact audit and findings review accept this finite
+checkpoint.
+The next translation-coherence slice is being built for shared parent changes,
+A/D clearing and4KiB/2MiB transitions with retained work and delayed shootdowns
+at N1/2/3/4. Broader recovery/lifetime and seeded adversarial progress coverage
+remain required; these native cases do not establish whole-emulator correctness.
 Declare execution bounds, adapt existing tests and add missing adversarial cases
 as each slice is built. Independent I5 preparation can proceed. Accepted finite
 checkpoints do not complete V1 or I4-V; unfinished cells remain explicit.

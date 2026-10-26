@@ -356,6 +356,9 @@ fn seed(index: usize) -> (NativeFrame, [u8; 512], [u8; 256]) {
 }
 fn run() -> Result<()> {
     let a: Vec<_> = env::args().collect();
+    if a.len() == 8 && a[2] == "i4v-fence" {
+        return concurrent::run_fence(&a);
+    }
     if a.len() == 10 && a[2] == "i4v-ordering" {
         return concurrent::run_ordering(&a);
     }

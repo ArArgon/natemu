@@ -10,6 +10,25 @@ export=importlib.util.module_from_spec(spec);spec.loader.exec_module(export)
 DATA=Path(__file__).with_name('testdata')
 
 class ExportChecks(unittest.TestCase):
+    def test_lfence_suffix_consumes_real_deferred_flag_and_vector_roots(self):
+        for index,rip in enumerate((0x102000,0x102100)):
+            result=export.verify(DATA/f'lfence-{index}',dict(case='fex_lfence_dependencies',bitness=64,guest_rip=rip))
+            body=bytes.fromhex(result['body_hex'])
+            self.assertEqual(len(body),120)
+            self.assertEqual(result['barriers'][0],[16,6,'dmb ld'])
+            self.assertEqual(body[4:16].hex(),'fb0005cafa0005abe7031aaa')
+            # AF consumes x27 xor x26, parity consumes w26, and OF is read after LAHF.
+            self.assertEqual(body[24:32].hex(),'75031acab5120453')
+            self.assertEqual(body[36:40].hex(),'40135a4a')
+            self.assertEqual(body[76:80].hex(),'f4779f9a')
+            self.assertEqual(body[116:].hex(),'1f4000d5')
+            self.assertEqual(result['fence_roots']['pf_result'],26)
+            self.assertEqual([(s['native_offset'],s['width']) for s in result['sites']],[(88,8),(100,2),(112,16)])
+            with self.assertRaises(ValueError):export.verify(DATA/f'lfence-{index}',dict(bitness=32))
+        self.mutated('lfence-0','source.x86',lambda b:b[:9]+b'\x90'+b[10:])
+        for at in (16,24,36,76,116):
+            self.mutated('lfence-0','outputs/001.native',lambda b,at=at:b[:12+at]+bytes([b[12+at]^1])+b[13+at:])
+
     def test_address_size_override_has_real_masked_scratch_and_memory_site(self):
         for name,site,reg in [('store_ecx',4,6),('store_edx',4,6),('load_edx',0,5),('store_ecx16',12,20),('store_edx16',12,20),('load16',8,20)]:
             result=export.verify(DATA/f'address-{name}',dict(case=f'fex_address_{name}',guest_rip=0x2002,bitness=32))

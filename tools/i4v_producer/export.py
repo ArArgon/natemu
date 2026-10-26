@@ -9,6 +9,11 @@ ENTRY_GPRS = dict(zip(('rax','rbx','rcx','rdx','rsi','rdi','rbp','rsp',
                       'r8','r9','r10','r11','r12','r13','r14','r15'),
                      (4,6,7,5,10,11,9,8,12,13,14,15,16,17,19,29)))
 CASES = {
+    'fex_lfence_dependencies': dict(bitness=64, source='0f58c14801d10faee89f0f90c048890f66894708f30f7f4710', instructions=8, host_count=30,
+        body='10d6314efb0005cafa0005abe7031aaabf3d03d5f4379f9a75031acab5120453941215aa40135a4a0008404a1504404ab5fa7fb294faf5aa15423bd5b5066292946255aa94027fb2841e78b3f4779f9a841e40b31f2003d567fd9fc8742100911f2003d584fe9f4814028052bf3b03d570e9b43c1f4000d5', object_bytes=240, code_bytes=188,
+        pc=[(0,4),(13,96),(16,104),(20,116)], sites=[(88,13,8,True,11,0),(100,16,2,True,20,0),(112,20,16,True,11,16)],
+        flags='add_rcx_rdx', native_writes=[0,4,7,20,21,26,27], barriers=[(16,6,'dmb ld'),(108,20,'dmb ish')],
+        fence_roots=dict(native_offset=16, guest_offset=6, rcx=7, pf_result=26, af_inputs_xor=27, xmm0=16, status=['NZCV','FPSR'], native_carry='x86_cf_before_final_cfinv')),
     'fex_order_sb': dict(bitness=64, source='c703010000008b02', instructions=2, host_count=5,
         body='340080521f2003d5d4fc9f88a4fcdf881f2003d5', object_bytes=144, code_bytes=84,
         pc=[(0, 4), (0, 12), (6, 24)], sites=[(8, 0, 4, True, 6, 0), (12, 6, 4, False, 5, 0)],
@@ -251,7 +256,7 @@ def parse(directory, case):
                 producer_sha256=record['producer_sha256'],object=obj,native_object_sha256=sha(raw),
                 relocations_sha256=sha(reloc),extraction=[12,end],guest_pc=[dict(guest_offset=g,native_offset=n) for g,n in pc],
                 entry_gprs=ENTRY_GPRS,flags=spec.get('flags','unchanged'),sites=sites)
-    for field in ('native_writes','barriers'):
+    for field in ('native_writes','barriers','fence_roots'):
         if field in spec: result[field]=json.loads(json.dumps(spec[field]))
     return result
 

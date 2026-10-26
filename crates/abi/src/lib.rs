@@ -241,3 +241,5 @@ mod tests {
 
 pub mod address_concurrent;
 pub mod ordering;
+
+pub mod fence;

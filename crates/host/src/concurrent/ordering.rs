@@ -12,7 +12,7 @@ macro_rules! fields {
 fn record<T: Copy>(memory: &Memory, offset: usize) -> T {
     unsafe { ptr::read_volatile(memory.0.add(offset).cast()) }
 }
-fn owner_mappings(memory: &Memory, id: usize, n: usize) {
+pub(super) fn owner_mappings(memory: &Memory, id: usize, n: usize) {
     let base = id * RAM_SIZE;
     tables(memory, base, false);
     mixed::private_code(memory, base);
@@ -39,7 +39,7 @@ fn owner_mappings(memory: &Memory, id: usize, n: usize) {
         memory.word(base + shadow::LOWER_LEAF + entry * 8, 0);
     }
 }
-fn guest_tables() -> [u8; 16384] {
+pub(super) fn guest_tables() -> [u8; 16384] {
     let mut bytes = [0; 16384];
     for (offset, value) in [
         (0, 0x2027u64),
@@ -208,7 +208,7 @@ pub fn run(args: &[String]) -> Result<()> {
             args[3].clone().into(),
             args[8].clone().into(),
             args[9].clone().into(),
-            config,
+            NativeProfile::Ordering(config),
         )),
     );
     let requests = execution.as_ref().map(Vec::as_slice).unwrap_or(&[]);

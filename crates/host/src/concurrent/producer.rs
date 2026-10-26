@@ -12,6 +12,7 @@ pub struct Compiler {
     guest_rip: u64,
     address_profile: bool,
     stack: Option<stack_producer::Compiler>,
+    fence: Option<fence_producer::Compiler>,
     mixed: Option<mixed_producer::Compiler>,
     controls: Option<crate::i4v_controls::producer::Compiler>,
 }
@@ -28,6 +29,7 @@ impl Compiler {
             guest_rip: wire::SOURCE_VA,
             address_profile: false,
             stack: None,
+            fence: None,
             mixed: None,
             controls: None,
         })
@@ -102,6 +104,22 @@ impl Compiler {
             .as_ref()
             .is_some_and(|compiler| compiler.is_ordering())
     }
+    pub fn new_fence(
+        producer: PathBuf,
+        worker: PathBuf,
+        output: PathBuf,
+        owner: u64,
+        config: natemu_abi::fence::Config,
+    ) -> Result<Self> {
+        let mut compiler = Self::new(producer.clone(), output.clone())?;
+        compiler.fence = Some(fence_producer::Compiler::new(
+            producer, worker, output, owner, config,
+        ));
+        Ok(compiler)
+    }
+    pub fn is_fence(&self) -> bool {
+        self.fence.is_some()
+    }
     pub fn is_mixed(&self) -> bool {
         self.mixed.is_some()
     }
@@ -109,6 +127,11 @@ impl Compiler {
         self.stack.is_some()
     }
     pub fn exchange(&mut self, mut packet: wire::Packet) -> Result<wire::Packet> {
+        if let Some(fence) = self.fence.as_mut() {
+            let reply = fence.exchange(packet)?;
+            self.requests.clone_from(&fence.requests);
+            return Ok(reply);
+        }
         if let Some(controls) = self.controls.as_mut() {
             let reply = controls.exchange(packet)?;
             self.requests.clone_from(&controls.requests);

@@ -38,6 +38,7 @@ def main():
     parser.add_argument('--concurrent-controls', action='store_true', help='also compose guest controls with retained peer work at N=1..4')
     parser.add_argument('--stack-boundaries', action='store_true', help='also execute terminal stack faults and checked split stores at N=1..4')
     parser.add_argument('--address-forms', action='store_true', help='also execute segmented protected32 address formation at N=1..4')
+    parser.add_argument('--fence', action='store_true', help='execute full live-result LFENCE dependency cases')
     parser.add_argument('--ordering', action='store_true', help='execute native litmus, XCHG fault/retry and fence controls')
     parser.add_argument('--focus', help='retain only one selected alias/stack concurrency cell for diagnosis')
     args = parser.parse_args()
@@ -75,6 +76,8 @@ def main():
         for rotation in range(n) for seed in (1,37)]
     if args.ordering:
         selected += [f'ordering-{name}-n{n}-rotation{rotation}-seed{seed}' for _,name,n,rotation,seed in ordering_cells]
+    if args.fence:
+        selected += [f'fence-case{case}-n{n}' for case in range(5) for n in range(1,5)]
     if args.focus and args.focus not in selected:
         parser.error('--focus must name a cell enabled by its selected profile')
     if resource.getrlimit(resource.RLIMIT_CPU) != (resource.RLIM_INFINITY,) * 2:
@@ -98,6 +101,7 @@ def main():
                   stack_boundaries_enabled=args.stack_boundaries,
                   address_forms_enabled=args.address_forms,
                   ordering_enabled=args.ordering,
+                  fence_enabled=args.fence,
                   focus=args.focus,
                   limits=dict(build_jobs=2, build_rss_bytes=8*1024**3,
                               worker_rss_bytes=512*1024**2, cell_seconds=120,
@@ -129,6 +133,10 @@ def main():
                      'tools/check_i4v_stack_boundary.py', 'tools/test_i4v_stack_boundary_check.py',
                      'tools/i4v_address_worker.py', 'tools/test_i4v_address_worker.py',
                      'tools/check_i4v_address_concurrent.py', 'tools/test_check_i4v_address_concurrent.py',
+                     'tools/i4v_fence_worker.py', 'tools/test_i4v_fence_worker.py',
+                     'tools/check_i4v_fence.py', 'tools/test_check_i4v_fence.py',
+                     'tools/check_i4v_fence_gate.py', 'tools/test_check_i4v_fence_gate.py',
+                     'tools/testdata/i4v_fence_gate.json',
                      'tools/i4v_ordering_worker.py', 'tools/test_i4v_ordering_worker.py',
                      'tools/i4v_ordering_model.py', 'tools/test_i4v_ordering_model.py',
                      'tools/check_i4v_ordering.py', 'tools/test_check_i4v_ordering.py',
@@ -168,7 +176,8 @@ def main():
             directory.mkdir()
             specification = dict(argv=list(map(str, argv)), cwd=str(source), environment=environment)
             if oracle:
-                specification['oracle'] = str(source / ('tools/check_i4v_ordering.py' if oracle == 'ordering'
+                specification['oracle'] = str(source / ('tools/check_i4v_fence.py' if oracle == 'fence'
+                    else 'tools/check_i4v_ordering.py' if oracle == 'ordering'
                     else 'tools/check_i4v_address_concurrent.py' if oracle == 'address'
                     else 'tools/check_i4v_stack_boundary.py' if oracle == 'boundary'
                     else 'tools/i4v_controls_concurrent_check.py' if oracle == 'concurrent-controls'
@@ -219,15 +228,36 @@ def main():
         job('concurrent-controls-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_controls_concurrent_check.py'])
         job('address-worker-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_address_worker.py'])
         job('address-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_check_i4v_address_concurrent.py'])
-        for name in ('i4v_ordering_worker', 'i4v_ordering_model', 'check_i4v_ordering'):
+        for name in ('i4v_ordering_worker', 'i4v_ordering_model', 'check_i4v_ordering', 'i4v_fence_worker', 'check_i4v_fence', 'check_i4v_fence_gate'):
             job(name+'-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_'+name+'.py'])
         job('build-host', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-host'], wall=600, rss=8*1024**3)
         job('build-runtime', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], wall=600, rss=8*1024**3)
         host = source / 'target/release/natemu-host'
         runtime = source / 'target/aarch64-unknown-none/release/natemu-runtime'
+        gate_job=job('fence-gate-audit', [sys.executable, '-B', 'tools/check_i4v_fence_gate.py', runtime])
+        fence_gates=json.loads((gate_job/'command.stdout').read_text())
         job('sign', ['codesign', '--force', '--sign', '-', '--entitlements', 'crates/host/entitlements.plist', host])
         job('verify-signature', ['codesign', '--verify', '--verbose=2', host])
         exporter = module(source / 'tools/i4v_producer/export.py', 'exporter')
+        if args.fence:
+            sys.path.insert(0,str(source/'tools'))
+            fence_worker=module(source/'tools/i4v_fence_worker.py','fence_worker')
+            sys.path.pop(0)
+            for case in range(5):
+                for n in range(1,5):
+                    label=f'fence-case{case}-n{n}'
+                    if args.focus and label!=args.focus:continue
+                    output=run/(label+'-producer')
+                    result=job(label,[host,runtime,'i4v-fence',producer,case,n,source/'tools/i4v_fence_worker.py',output],oracle='fence')
+                    report=json.loads((result/'command.stdout').read_text())
+                    if (report['case'],report['profile'],report['n'])!=('fence',case,n):raise ValueError('fence report differs from requested identity')
+                    for owner in report['owners']:
+                        if (owner['sink_pc'],owner['return_pc'],owner['capture_pc'])!=(fence_gates['sink_pc'],fence_gates['return_pc'],fence_gates['return_pc']):raise ValueError('fence report gates differ from producing ELF')
+                        directory=output/f"cpu-{owner['id']}"
+                        if owner['compiler_requests']!=owner['requests']:raise ValueError('fence request/delivery identities differ')
+                        exported=fence_worker.verify_compilations(directory,owner['requests'],owner['replies'])
+                        record['compilations'].append(dict(directory=str((directory/'request-000').relative_to(run)),export=exported))
+                    record['cells'].append(dict(name=label,producer=str(output.relative_to(run)),profile=case,vcpus=n))
         if args.ordering:
             sys.path.insert(0,str(source/'tools'))
             ordering_worker=module(source/'tools/i4v_ordering_worker.py','ordering_worker')

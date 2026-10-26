@@ -1,0 +1,135 @@
+{
+  "schema": "natemu-i4v-program-v1",
+  "case": "fex_lfence_dependencies",
+  "guest_rip": 1057024,
+  "bitness": 64,
+  "source_hex": "0f58c14801d10faee89f0f90c048890f66894708f30f7f4710",
+  "source_sha256": "51c37adfa12278826c6de9d3046dd2a378cf168f8ff906f267f2cd66567ebed3",
+  "body_hex": "10d6314efb0005cafa0005abe7031aaabf3d03d5f4379f9a75031acab5120453941215aa40135a4a0008404a1504404ab5fa7fb294faf5aa15423bd5b5066292946255aa94027fb2841e78b3f4779f9a841e40b31f2003d567fd9fc8742100911f2003d584fe9f4814028052bf3b03d570e9b43c1f4000d5",
+  "body_sha256": "07af68b2f92e3667e5fb251fb8e7a156e1eecc11d6967d2a763a97abd16678c6",
+  "producer_sha256": "b614bac26ef89bb8b3d2812a2708a5541314e77e06b6c6771d135ab0424cdc33",
+  "object": {
+    "index": 1,
+    "bytes": 240,
+    "code_bytes": 188,
+    "code_offset": 4,
+    "guest_instructions": 8,
+    "relocation_bytes": 144,
+    "block_address": 281472321716352
+  },
+  "native_object_sha256": "f9efa2c545333759c3f1edd3938d7911c691967b72d08be8d3248c47c7c9239c",
+  "relocations_sha256": "c1602837bb7d208070888dcc9d5a11de40d567af59dcac0901a8ca92d96ffb9e",
+  "extraction": [
+    12,
+    132
+  ],
+  "guest_pc": [
+    {
+      "guest_offset": 0,
+      "native_offset": 4
+    },
+    {
+      "guest_offset": 13,
+      "native_offset": 96
+    },
+    {
+      "guest_offset": 16,
+      "native_offset": 104
+    },
+    {
+      "guest_offset": 20,
+      "native_offset": 116
+    }
+  ],
+  "entry_gprs": {
+    "rax": 4,
+    "rbx": 6,
+    "rcx": 7,
+    "rdx": 5,
+    "rsi": 10,
+    "rdi": 11,
+    "rbp": 9,
+    "rsp": 8,
+    "r8": 12,
+    "r9": 13,
+    "r10": 14,
+    "r11": 15,
+    "r12": 16,
+    "r13": 17,
+    "r14": 19,
+    "r15": 29
+  },
+  "flags": "add_rcx_rdx",
+  "sites": [
+    {
+      "native_offset": 88,
+      "guest_offset": 13,
+      "guest_rip": 1057037,
+      "width": 8,
+      "write": true,
+      "address_register": 11,
+      "address_displacement": 0,
+      "continuation": 92,
+      "phase": "precommit",
+      "guest_rsp_register": 8
+    },
+    {
+      "native_offset": 100,
+      "guest_offset": 16,
+      "guest_rip": 1057040,
+      "width": 2,
+      "write": true,
+      "address_register": 20,
+      "address_displacement": 0,
+      "continuation": 104,
+      "phase": "precommit",
+      "guest_rsp_register": 8
+    },
+    {
+      "native_offset": 112,
+      "guest_offset": 20,
+      "guest_rip": 1057044,
+      "width": 16,
+      "write": true,
+      "address_register": 11,
+      "address_displacement": 16,
+      "continuation": 116,
+      "phase": "precommit",
+      "guest_rsp_register": 8
+    }
+  ],
+  "native_writes": [
+    0,
+    4,
+    7,
+    20,
+    21,
+    26,
+    27
+  ],
+  "barriers": [
+    [
+      16,
+      6,
+      "dmb ld"
+    ],
+    [
+      108,
+      20,
+      "dmb ish"
+    ]
+  ],
+  "fence_roots": {
+    "native_offset": 16,
+    "guest_offset": 6,
+    "rcx": 7,
+    "pf_result": 26,
+    "af_inputs_xor": 27,
+    "xmm0": 16,
+    "status": [
+      "NZCV",
+      "FPSR"
+    ],
+    "native_carry": "x86_cf_before_final_cfinv"
+  }
+}
