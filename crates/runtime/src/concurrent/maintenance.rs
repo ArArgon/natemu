@@ -158,18 +158,20 @@ unsafe fn drive(id: u64) -> ! {
                             let address = PRIVATE + DATA_OFFSET as u64 + r.gpa - DATA_VA;
                             // Declared fixture input makes a skipped/idempotent
                             // OR body observable without inventing register state.
-                            ptr::write_volatile(
-                                address as *mut u64,
-                                0x4a00_0000_0000_0000 | s.total << 16 | id,
-                            );
-                            for b in 128..144 {
-                                ptr::write_volatile((address + b) as *mut u8, 0xa5);
+                            if !stack::enabled() {
+                                ptr::write_volatile(
+                                    address as *mut u64,
+                                    0x4a00_0000_0000_0000 | s.total << 16 | id,
+                                );
+                                for b in 128..144 {
+                                    ptr::write_volatile((address + b) as *mut u8, 0xa5);
+                                }
                             }
                             r.before = read_record(address as *const [u8; 256]);
                             r.initial = read_record(&raw const (*shared()).captured);
                             r.initial.x[16] = CODE_NEXT;
                             r.initial.sp = STACK_TOP;
-                            if c.alias_profile != 0 {
+                            if c.alias_profile != 0 && !stack::enabled() {
                                 r.initial.x[6] = natemu_abi::alias::data_address(
                                     c.alias_profile,
                                     id,
@@ -184,7 +186,7 @@ unsafe fn drive(id: u64) -> ! {
                                 s.intervals[id as usize] + 2,
                             ));
                             write_record(at, r);
-                            run = Some(r.initial);
+                            run = Some((r.initial, s.intervals[id as usize] + 2));
                         }
                     }
                     write_record(state(), s);
@@ -194,8 +196,11 @@ unsafe fn drive(id: u64) -> ! {
                 c.finished.fetch_or(1 << id, Ordering::Release);
                 stop(SUCCESS, 0);
             }
-            if let Some(frame) = run {
+            if let Some((frame, pass)) = run {
                 write_record(&raw mut (*shared()).initial, frame);
+                if stack::enabled() {
+                    stack::start(pass, CODE_NEXT);
+                }
                 enter(&raw const (*shared()).initial)
             }
             asm!("yield", options(nomem, nostack));
@@ -220,14 +225,17 @@ pub unsafe fn finish(fault: u64) -> ! {
             let (esr, far, pc, spsr): (u64, u64, u64, u64);
             asm!("mrs {0}, ESR_EL1","mrs {1}, FAR_EL1","mrs {2}, ELR_EL1","mrs {3}, SPSR_EL1",
                 out(reg)esr,out(reg)far,out(reg)pc,out(reg)spsr);
-            if esr >> 26 != 0x25
-                || esr & (1 << 6) == 0
-                || !matches!(esr & 63, 12..=15)
-                || pc != CODE_NEXT + 36
-                || far != (*at).initial.x[11]
-                || spsr & 15 != 4
-                || ptr::read_volatile(&raw const (*at).faults) != 0
-            {
+            let valid = if stack::enabled() {
+                stack::fault_valid(esr, far, pc, spsr, false)
+            } else {
+                !(esr >> 26 != 0x25
+                    || esr & (1 << 6) == 0
+                    || !matches!(esr & 63, 12..=15)
+                    || pc != CODE_NEXT + 36
+                    || far != (*at).initial.x[11]
+                    || spsr & 15 != 4)
+            };
+            if !valid || ptr::read_volatile(&raw const (*at).faults) != 0 {
                 stop(NATIVE_FAULT, 141);
             }
             write_record(
@@ -248,7 +256,10 @@ pub unsafe fn finish(fault: u64) -> ! {
                     stop(PANIC, 142);
                 }
                 let route = recovery::walk(far, Access::Write).unwrap_or_else(|_| stop(PANIC, 143));
-                if route.gpa != ptr::read_volatile(&raw const (*at).gpa) + 128 {
+                if route.gpa
+                    != ptr::read_volatile(&raw const (*at).gpa)
+                        + if stack::enabled() { far & 255 } else { 128 }
+                {
                     stop(PANIC, 144);
                 }
                 checked(g.trace(31, id));

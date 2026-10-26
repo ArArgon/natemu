@@ -25,42 +25,86 @@ pub const WIDTHS: [u64; 5] = [8, 2, 2, 8, 4];
 pub const MISS: u64 = 0x49345611;
 pub const DELIVER: u64 = 0x49345612;
 
+pub fn source(variant: u64) -> [u8; 20] {
+    assert!(variant <= 1);
+    let mut bytes = SOURCE;
+    bytes[7] += variant as u8;
+    bytes
+}
+pub fn body(variant: u64) -> [u8; 52] {
+    assert!(variant <= 1);
+    let mut bytes = BODY;
+    bytes[12] += (variant * 32) as u8;
+    bytes
+}
+
 pub fn request(vm: u64, rip: u64, chunk: u64) -> Packet {
+    request_context(vm, 0, 1, 1, 1, 1, rip, 0, chunk)
+}
+
+pub fn request_context(
+    vm: u64,
+    id: u64,
+    incarnation: u64,
+    source_generation: u64,
+    context_generation: u64,
+    serial: u64,
+    rip: u64,
+    variant: u64,
+    chunk: u64,
+) -> Packet {
     let mut source = [0; 24];
-    source[..SOURCE.len()].copy_from_slice(&SOURCE);
+    source[..SOURCE.len()].copy_from_slice(&self::source(variant));
     [
         MISS,
         1,
         vm,
-        0,
-        1,
-        1,
-        1,
+        id,
+        incarnation,
+        source_generation,
+        context_generation,
         rip,
         64,
         SOURCE.len() as u64,
         u64::from_le_bytes(source[..8].try_into().unwrap()),
         u64::from_le_bytes(source[8..16].try_into().unwrap()),
         u64::from_le_bytes(source[16..24].try_into().unwrap()),
-        1,
+        serial,
         BODY.len() as u64,
         chunk,
     ]
 }
 
 pub fn reply(p: &Packet) -> Option<Packet> {
+    if *p != request(p[2], p[7], p[15]) {
+        return None;
+    }
+    reply_context(p)
+}
+
+pub fn reply_context(p: &Packet) -> Option<Packet> {
     let chunk = p[15];
+    let variant = match p[10] {
+        x if x == request(p[2], p[7], chunk)[10] => 0,
+        x if x == request_context(p[2], p[3], p[4], p[5], p[6], p[13], p[7], 1, chunk)[10] => 1,
+        _ => return None,
+    };
     if p[2] == 0
+        || p[3] >= 4
+        || p[4] == 0
+        || p[5] == 0
+        || p[6] == 0
+        || p[13] == 0
         || chunk >= 3
         || !crate::paging::canonical_span(p[7], SOURCE.len() as u64)
-        || *p != request(p[2], p[7], chunk)
+        || *p != request_context(p[2], p[3], p[4], p[5], p[6], p[13], p[7], variant, chunk)
     {
         return None;
     }
     let offset = chunk as usize * 24;
     let count = (BODY.len() - offset).min(24);
     let mut data = [0; 24];
-    data[..count].copy_from_slice(&BODY[offset..offset + count]);
+    data[..count].copy_from_slice(&body(variant)[offset..offset + count]);
     let mut result = *p;
     result[0] = DELIVER;
     result[9] = BODY.len() as u64;

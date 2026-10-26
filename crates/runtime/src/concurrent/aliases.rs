@@ -19,6 +19,9 @@ unsafe fn leaves() -> [u64; 2] {
     }
 }
 pub fn validate(object: &Object, frame: &NativeFrame, code: &[u8], pass: u64) -> Result<(), u64> {
+    if stack::enabled() {
+        return unsafe { stack::validate(object, frame, pass) };
+    }
     let profile = coordinator().alias_profile;
     if profile == 0 {
         validate_object(object, frame, code)
@@ -78,10 +81,13 @@ pub unsafe fn acknowledge(epoch: u64) {
     }
 }
 
-pub unsafe fn rewrite_source(source: &[u8; 17]) {
+pub unsafe fn rewrite_source(source: &[u8]) {
     unsafe {
         let c = coordinator();
-        if c.phase.load(Ordering::Relaxed) != EXCLUSIVE || c.active.load(Ordering::Relaxed) != 0 {
+        if source.len() != if c.stack_profile != 0 { 20 } else { 17 }
+            || c.phase.load(Ordering::Relaxed) != EXCLUSIVE
+            || c.active.load(Ordering::Relaxed) != 0
+        {
             stop(PANIC, 154)
         }
         let address = natemu_abi::translation::SOURCE_VA
@@ -104,7 +110,7 @@ pub unsafe fn rewrite_source(source: &[u8; 17]) {
         recovery::install(address, route);
         // A protected fixture mutation, routed through the actual opposite
         // guest alias; this is not a translated guest self-modifying store.
-        ptr::copy_nonoverlapping(source.as_ptr(), address as *mut u8, 17);
+        ptr::copy_nonoverlapping(source.as_ptr(), address as *mut u8, source.len());
         asm!("dsb ish");
         ptr::write_volatile(&raw mut (*at).source_address, address);
         ptr::write_volatile(&raw mut (*at).source_gpa, route.gpa);

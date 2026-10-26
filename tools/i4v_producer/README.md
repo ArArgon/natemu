@@ -38,6 +38,13 @@ Their final-producer probes are retained in
 `../i4v_alias_worker.py` consumes the resident's profile-3 packet and returns
 the generated body with an explicit RIP/mode/profile trailer; its verifier
 reparses the original packet and actual producing artifacts.
+The concurrent-stack replacement case `fex_push_immediates64_changed` changes
+source byte 7 from `0x52` to `0x53` (the pushed word becomes `0x5153`). Fresh
+low/high-RIP probes retain the resulting native byte change at body offset 12
+under `i4v-stack-concurrent-producer-20261026-01`. The stack worker admits both
+exact sources, preserves positive incarnation/generation/serial identities and
+bounded vCPU IDs, and emits three chunks from one compilation. N=1 resident
+admission remains strict; concurrent admission compares the stored full context.
 `--source HEX` and
 `--instructions N` can be supplied with a case and must match it. Case admission
 requires the exact expected host instruction count. The worker retains source,
@@ -81,7 +88,7 @@ The existing input header already supports 32-bit protected-mode compilation.
 FEX asserts a fixed mode within each context, so each request uses a fresh
 context. This does not implement runtime mode switching. The generic compile
 probe accepts `--bitness 32 --source HEX --instructions N --expected-host N`,
-but body admission currently covers only the four finite 64-bit cases.
+but body admission currently covers only the five finite 64-bit cases.
 
 Final-build controls retain high/low load compilations, high/low RIP-relative
 LEA (the emitted value is the requested RIP + 7), a 32-bit moffs-load case, and

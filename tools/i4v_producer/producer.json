@@ -21,7 +21,7 @@
   "limitations": [
     "compile-only; no guest execution in FEX",
     "fresh FEX context per request; no in-context mode transition",
-    "64-bit exported runtime admission limited to four exact emitted bodies",
+    "64-bit exported runtime admission limited to five exact emitted bodies",
     "32-bit compilation probe is not runtime validation",
     "ordinary RAM same-page memory accesses only; no cross-page partial-effect claims"
   ]

@@ -41,6 +41,9 @@ pub unsafe fn wait_check() {
 
 pub unsafe fn materialize(frame: &NativeFrame) {
     unsafe {
+        if stack::enabled() {
+            return stack::materialize(frame, 20);
+        }
         let mut state = read_record(guest());
         state.materialize(frame, 17, true);
         if coordinator().alias_profile != 0 {

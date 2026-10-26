@@ -16,12 +16,20 @@ class StackWorkerChecks(unittest.TestCase):
         self.assertEqual(body,worker.BODY)
 
     def test_bad_request_identity_and_body_rejected(self):
-        for index in set(range(16))-{2,7,15}:
+        for index in set(range(16))-{2,3,4,5,6,7,13,15}:
             changed=REQUEST.copy();changed[index]^=1
             with self.subTest(index=index),self.assertRaises(ValueError):worker.parse_request(struct.pack('<16Q',*changed))
-        for index,value in [(2,0),(7,0x800000102000),(15,3)]:
+        for index,value in [(2,0),(3,4),(4,0),(5,0),(6,0),(7,0x800000102000),(13,0),(15,3)]:
             changed=REQUEST.copy();changed[index]=value
             with self.assertRaises(ValueError):worker.parse_request(struct.pack('<16Q',*changed))
         with self.assertRaises(ValueError):worker.make_reply(REQUEST,bytes(52))
+
+    def test_each_context_field_and_replacement_source_survive_reply(self):
+        for source,case in worker.SOURCES.items():
+            request=REQUEST.copy();request[3:7]=[3,7,2,11];request[13]=9
+            request[10:13]=struct.unpack('<3Q',source.ljust(24,b'\0'))
+            reply=struct.unpack('<16Q',worker.make_reply(request,bytes.fromhex(worker.CASES[case]['body'])))
+            self.assertEqual(reply[2:9],tuple(request[2:9]))
+            self.assertEqual(reply[13],9)
 
 if __name__=='__main__':unittest.main()

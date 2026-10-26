@@ -1,4 +1,4 @@
-"""Admit four finite native bodies and bind their sites to actual FEX output."""
+"""Admit five finite native bodies and bind their sites to actual FEX output."""
 import hashlib
 import json
 from pathlib import Path
@@ -24,6 +24,11 @@ CASES = {
         pc=[(0,4),(0,12)], sites=[(0,0,8,False,6,0)]),
     'fex_push_immediates64': dict(source='68bbbcbdbe6668525166686261488b42f88b5af4', instructions=5, host_count=13,
         body='94688892b4d7b7f2148d1ff8542a8a5214ed1f78542c8c5214ed1f78b42000d184fedfc81f2003d5b43000d186fedf881f2003d5',
+        object_bytes=176, code_bytes=116, pc=[(0,4),(0,12),(5,24),(9,32),(13,40),(17,52)],
+        sites=[(8,0,8,True,8,-8),(16,5,2,True,8,-2),(24,9,2,True,8,-2),
+               (32,13,8,False,20,0),(44,17,4,False,20,0)]),
+    'fex_push_immediates64_changed': dict(source='68bbbcbdbe6668535166686261488b42f88b5af4', instructions=5, host_count=13,
+        body='94688892b4d7b7f2148d1ff8742a8a5214ed1f78542c8c5214ed1f78b42000d184fedfc81f2003d5b43000d186fedf881f2003d5',
         object_bytes=176, code_bytes=116, pc=[(0,4),(0,12),(5,24),(9,32),(13,40),(17,52)],
         sites=[(8,0,8,True,8,-8),(16,5,2,True,8,-2),(24,9,2,True,8,-2),
                (32,13,8,False,20,0),(44,17,4,False,20,0)]),

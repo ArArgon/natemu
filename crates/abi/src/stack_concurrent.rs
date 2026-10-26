@@ -1,0 +1,101 @@
+//! Per-owner evidence and staged compilation for the concurrent stack profile.
+use crate::{NativeFrame, stack, validation::Packet};
+pub const OFFSET: usize = 0x23000;
+pub const MAX_PROGRAMS: usize = 6;
+pub fn initial_rsp(id: u64) -> u64 {
+    crate::alias::data_address(1, id, 0) + 0x80
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Program {
+    pub entries: u64,
+    pub completed: u64,
+    // RSP, RAX, RBX, generated scratch x20 after each guest instruction.
+    pub prefixes: [[u64; 4]; 5],
+}
+impl Program {
+    pub const ZERO: Self = Self {
+        entries: 0,
+        completed: 0,
+        prefixes: [[0; 4]; 5],
+    };
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct State {
+    pub step: u64,
+    pub pass: u64,
+    pub code: u64,
+    pub expected: Packet,
+    pub compile_requests: [Packet; 3],
+    pub replies: [[Packet; 3]; 3],
+    pub programs: [Program; MAX_PROGRAMS],
+    pub stale_chunks: u64,
+    pub wrong_owner_rejections: u64,
+    pub blank_before_publish: u64,
+    pub source_before: [u8; 20],
+    pub source_after: [u8; 20],
+}
+impl State {
+    pub const ZERO: Self = Self {
+        step: 0,
+        pass: 0,
+        code: 0,
+        expected: [0; 16],
+        compile_requests: [[0; 16]; 3],
+        replies: [[[0; 16]; 3]; 3],
+        programs: [Program::ZERO; MAX_PROGRAMS],
+        stale_chunks: 0,
+        wrong_owner_rejections: 0,
+        blank_before_publish: 0,
+        source_before: [0; 20],
+        source_after: [0; 20],
+    };
+}
+pub fn due(frame: &NativeFrame, step: usize) -> u64 {
+    if step < 3 {
+        frame.x[8].wrapping_sub(stack::WIDTHS[step])
+    } else {
+        frame.x[5].wrapping_sub(if step == 3 { 8 } else { 12 })
+    }
+}
+pub fn validate_reply(expected: &Packet, actual: &Packet) -> Option<[u8; 24]> {
+    if stack::reply_context(expected)? != *actual {
+        return None;
+    }
+    let mut bytes = [0; 24];
+    for i in 0..3 {
+        bytes[i * 8..i * 8 + 8].copy_from_slice(&actual[10 + i].to_le_bytes());
+    }
+    Some(bytes)
+}
+const _: () = assert!(
+    OFFSET >= crate::validation::STATE_OFFSET + core::mem::size_of::<crate::validation::State>()
+);
+const _: () = assert!(OFFSET + core::mem::size_of::<State>() <= crate::concurrency::ROUND_OFFSET);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn chunks_are_bound_to_stored_owner_and_generation() {
+        let p =
+            stack::request_context(83, 2, 7, 2, 3, 9, crate::shadow::HIGH_BASE + 0x102000, 1, 2);
+        let good = stack::reply_context(&p).unwrap();
+        assert!(validate_reply(&p, &good).is_some());
+        for word in [2, 3, 4, 5, 6, 7, 8, 13, 14, 15] {
+            let mut bad = good;
+            bad[word] ^= 1;
+            assert!(validate_reply(&p, &bad).is_none());
+        }
+        assert!(stack::reply(&p).is_none());
+    }
+    #[test]
+    fn all_program_stacks_stay_in_the_owner_span() {
+        for id in 0..4 {
+            let s = initial_rsp(id);
+            let base = crate::alias::data_address(1, id, 0);
+            assert!(s - 12 * MAX_PROGRAMS as u64 >= base);
+            assert!(s <= base + 256);
+        }
+    }
+}

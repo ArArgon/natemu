@@ -33,6 +33,14 @@ class ExportChecks(unittest.TestCase):
         def change(raw): return raw[:12]+bytes([raw[12]^1])+raw[13:]
         self.mutated('load-high','outputs/001.native',change)
 
+    def test_replacement_stack_is_a_distinct_actual_emission(self):
+        original=bytes.fromhex(export.CASES['fex_push_immediates64']['body'])
+        for half,rip in [('low',0x102000),('high',0xffff800000102000)]:
+            result=export.verify(DATA/('replacement-'+half),dict(case='fex_push_immediates64_changed',guest_rip=rip))
+            changed=bytes.fromhex(result['body_hex'])
+            self.assertEqual([i for i,(a,b) in enumerate(zip(original,changed)) if a!=b],[12])
+            self.assertEqual(changed[12],0x74)
+
     def test_guest_pc_mismatch_rejected(self):
         self.mutated('push-high','producer.log',lambda b:b.replace(b'guest_offset=5 native_offset=24',b'guest_offset=6 native_offset=24'))
 

@@ -6,6 +6,8 @@ mod aliases;
 mod events;
 mod maintenance;
 mod source;
+mod stack;
+mod stack_source;
 
 unsafe extern "C" {
     fn resume_exception(frame: *const NativeFrame, pc: u64, spsr: u64) -> !;
@@ -33,6 +35,8 @@ pub unsafe fn initialize() -> ! {
             || o.vcpu_id >= o.configured_vcpus
             || c.alias_profile > 2
             || (c.alias_profile != 0 && c.scenario != 5)
+            || c.stack_profile > 1
+            || (c.stack_profile != 0 && (c.alias_profile == 0 || c.scenario != 5))
         {
             stop(REJECTED, 80);
         }
@@ -87,7 +91,7 @@ pub unsafe fn initialize() -> ! {
         while c.ready.load(Ordering::Acquire) != (1 << c.participants) - 1 {
             asm!("yield", options(nomem, nostack));
         }
-        if c.scenario >= 1 && o.vcpu_id as u64 == c.participants - 1 {
+        if !stack::enabled() && c.scenario >= 1 && o.vcpu_id as u64 == c.participants - 1 {
             // Force a drain to wait for a still-admitted peer, rather than
             // relying on host timing to happen to expose the interleaving.
             while c.queued.load(Ordering::Acquire).count_ones() as u64 != c.participants - 1 {
@@ -97,12 +101,25 @@ pub unsafe fn initialize() -> ! {
             checked(g.trace(7, o.vcpu_id as u64));
         }
         asm!("dsb ish", "ic iallu", "dsb ish", "isb");
+        if stack::enabled() {
+            // All warm snapshots precede the first shared guest D update.
+            let address = natemu_abi::stack_concurrent::due(&frame, 0);
+            let route = {
+                let _g = coordinator::lock(c);
+                recovery::walk(address, Access::Write).unwrap_or_else(|_| stop(PANIC, 177))
+            };
+            recovery::install(address, route);
+            stack::start(0, CODE_VA);
+        }
         enter(&raw const (*s).initial)
     }
 }
 
 pub unsafe fn completed(fault: u64) -> ! {
     unsafe {
+        if stack::enabled() {
+            stack::advance(fault);
+        }
         if coordinator().scenario >= 1 {
             queued(fault);
         }
@@ -132,15 +149,18 @@ unsafe fn queued(fault: u64) -> ! {
             asm!("mrs {0}, ESR_EL1", "mrs {1}, FAR_EL1", "mrs {2}, ELR_EL1", "mrs {3}, SPSR_EL1",
                 out(reg)esr,out(reg)far,out(reg)pc,out(reg)spsr);
             let frame = read_record(&raw const (*s).captured);
-            if esr >> 26 != 0x25
-                || esr & (1 << 6) != 0
-                || !matches!(esr & 63, 4..=7)
-                || pc != CODE_VA + 16
-                || far != natemu_abi::alias::data_address(c.alias_profile, id, 0)
-                || frame.sp != STACK_TOP
-                || spsr & 15 != 4
-                || ptr::read_volatile(&raw const (*round()).faults) != 0
-            {
+            let valid = if stack::enabled() {
+                stack::fault_valid(esr, far, pc, spsr, true)
+            } else {
+                !(esr >> 26 != 0x25
+                    || esr & (1 << 6) != 0
+                    || !matches!(esr & 63, 4..=7)
+                    || pc != CODE_VA + 16
+                    || far != natemu_abi::alias::data_address(c.alias_profile, id, 0)
+                    || frame.sp != STACK_TOP
+                    || spsr & 15 != 4)
+            };
+            if !valid || ptr::read_volatile(&raw const (*round()).faults) != 0 {
                 stop(NATIVE_FAULT, 95);
             }
             ptr::write_volatile(&raw mut (*round()).faults, 1);
@@ -165,10 +185,16 @@ unsafe fn queued(fault: u64) -> ! {
                 if selected {
                     let route = {
                         let _g = coordinator::lock(c);
-                        recovery::walk(frame.x[11], Access::Write)
-                            .unwrap_or_else(|_| stop(PANIC, 96))
+                        recovery::walk(
+                            if stack::enabled() { far } else { frame.x[11] },
+                            Access::Write,
+                        )
+                        .unwrap_or_else(|_| stop(PANIC, 96))
                     };
-                    if route.gpa != ptr::read_volatile(&raw const (*round()).old_gpa) + 128 {
+                    if route.gpa
+                        != ptr::read_volatile(&raw const (*round()).old_gpa)
+                            + if stack::enabled() { far & 255 } else { 128 }
+                    {
                         stop(PANIC, 97);
                     }
                     // Exclusive service finishes this admitted old route. No
@@ -331,7 +357,7 @@ unsafe fn remap_wait(id: u64) -> ! {
         frame.x[16] = if c.scenario >= 3 { CODE_NEXT } else { CODE_VA };
         frame.x[30] = returned as *const () as u64;
         frame.sp = STACK_TOP;
-        if c.alias_profile != 0 {
+        if c.alias_profile != 0 && !stack::enabled() {
             frame.x[6] = natemu_abi::alias::data_address(c.alias_profile, id, 1);
             frame.x[11] = frame.x[6] + 128;
         }
@@ -348,6 +374,9 @@ unsafe fn remap_wait(id: u64) -> ! {
         write_record(&raw mut (*round()).new_initial, frame);
         write_record(&raw mut (*s).initial, frame);
         ptr::write_volatile(&raw mut (*round()).stage, 2);
+        if stack::enabled() {
+            stack::start(1, CODE_NEXT);
+        }
         enter(&raw const (*s).initial)
     }
 }
@@ -361,14 +390,17 @@ unsafe fn new_completed(fault: u64) -> ! {
             let (esr, far, pc, spsr): (u64, u64, u64, u64);
             asm!("mrs {0}, ESR_EL1", "mrs {1}, FAR_EL1", "mrs {2}, ELR_EL1", "mrs {3}, SPSR_EL1",
                 out(reg)esr,out(reg)far,out(reg)pc,out(reg)spsr);
-            if esr >> 26 != 0x25
-                || esr & (1 << 6) == 0
-                || !matches!(esr & 63, 12..=15)
-                || pc != (if c.scenario >= 3 { CODE_NEXT } else { CODE_VA }) + 36
-                || far != natemu_abi::alias::data_address(c.alias_profile, id, 1) + 128
-                || spsr & 15 != 4
-                || ptr::read_volatile(&raw const (*round()).dirty_faults) != 0
-            {
+            let valid = if stack::enabled() {
+                stack::fault_valid(esr, far, pc, spsr, false)
+            } else {
+                !(esr >> 26 != 0x25
+                    || esr & (1 << 6) == 0
+                    || !matches!(esr & 63, 12..=15)
+                    || pc != (if c.scenario >= 3 { CODE_NEXT } else { CODE_VA }) + 36
+                    || far != natemu_abi::alias::data_address(c.alias_profile, id, 1) + 128
+                    || spsr & 15 != 4)
+            };
+            if !valid || ptr::read_volatile(&raw const (*round()).dirty_faults) != 0 {
                 stop(NATIVE_FAULT, 101);
             }
             write_record(
@@ -393,7 +425,9 @@ unsafe fn new_completed(fault: u64) -> ! {
                 }
                 t
             };
-            if route.gpa != DATA_VA + id * 256 + 128 + 4096 {
+            if route.gpa
+                != DATA_VA + id * 256 + 4096 + if stack::enabled() { far & 255 } else { 128 }
+            {
                 stop(PANIC, 104);
             }
             recovery::install(far, route);

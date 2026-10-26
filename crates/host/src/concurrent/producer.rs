@@ -11,6 +11,7 @@ pub struct Compiler {
     pub requests: Vec<wire::Packet>,
     guest_rip: u64,
     address_profile: bool,
+    stack: Option<stack_producer::Compiler>,
 }
 impl Compiler {
     pub fn new(producer: PathBuf, output: PathBuf) -> Result<Self> {
@@ -24,6 +25,7 @@ impl Compiler {
             requests: Vec::new(),
             guest_rip: wire::SOURCE_VA,
             address_profile: false,
+            stack: None,
         })
     }
     pub fn new_alias(producer: PathBuf, output: PathBuf, guest_rip: u64) -> Result<Self> {
@@ -33,7 +35,20 @@ impl Compiler {
         compiler.address_profile = true;
         Ok(compiler)
     }
+    pub fn new_stack(producer: PathBuf, output: PathBuf, guest_rip: u64) -> Result<Self> {
+        let mut compiler = Self::new(producer.clone(), output.clone())?;
+        compiler.stack = Some(stack_producer::Compiler::new(producer, output, guest_rip));
+        Ok(compiler)
+    }
+    pub fn is_stack(&self) -> bool {
+        self.stack.is_some()
+    }
     pub fn exchange(&mut self, mut packet: wire::Packet) -> Result<wire::Packet> {
+        if let Some(stack) = self.stack.as_mut() {
+            let reply = stack.exchange(packet)?;
+            self.requests.clone_from(&stack.requests);
+            return Ok(reply);
+        }
         let operation = packet[0];
         if operation == POLL_COMPILE {
             if self

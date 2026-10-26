@@ -1,5 +1,62 @@
 # INV-03-01 — source findings review
 
+## Intermediate I4-V return — concurrent stack prefixes, October 26, 2026 UTC
+
+Root authored the ABI/runtime and runner, `/root/i4v_producer` authored host and
+compiler bindings, and `/root/i4v_upstream` authored the independent stack oracle.
+`/root/i4v_contract_review` reviewed these changes read-only and independently
+rebuilt and ran the corrected primary's retained snapshot, with no overlapping
+build. **ACCEPT this finite N=1/2/3/4 concurrent-stack checkpoint; V1 and I4-V
+remain incomplete.**
+
+Independent `i4v-stack-concurrent-independent-20261026-01` passes 158 jobs and
+142 native cells: 44 load, 82 N=1 stack, eight alias compositions and eight
+concurrent-stack compositions at low/high source RIP. The reviewer rechecked
+every report, all 148 actual compilations, 160 cell-to-compile associations and
+246 observed stack chunk transfers. All 4,717 checksums verify; all 156 retained
+source inputs match both corrected primary02 and the reviewed workspace. The
+reused FEX executable matches its pin, and all compiler containers were removed.
+This is a fresh host/runtime rebuild and fresh compilation campaign, not another
+FEX build. The rebuilt runtime ELF exactly matches primary02.
+
+The new eight compositions cover 20 owners, 560 paired-alias acknowledgements,
+180 maintenance heads and 28 ordinary generated programs. Each old program
+commits its first push, faults on its second, retains its original grant, route
+and code through the remaining instructions, and completes before replacement.
+Later programs retain a continuously descending RSP across physical remaps;
+RDX stays fixed, so the oracle independently models loads from the original
+positions in the current physical page. Full native fault frames, five precise
+prefixes, all 8,192 bytes of both physical pages, events, FIFO capacity and
+eight-head fairness are checked. Actual same-page unaligned stores execute with
+alignment checking disabled. Three stale chunks are rejected, a wrong-owner
+reply is rejected, and all replacement chunks are validated before publication.
+The runner binds all nine transferred packets to the resident observations.
+
+Review fixed missing bank/reserved admission checks and reset canonical RIP at
+each whole-program entry. The first complete development run preserves a legacy
+alias timeout after 126 prior cells passed. Focused debug01 and emitted-code
+inspection identified a native-stack overflow caused by inlining stack-prefix
+temporaries into the common completion path. Separate non-inlined helpers and
+borrowing the initial frame remove that growth. In the accepted replica, the
+conservative emitted call-chain bound is 15,808 bytes on each 16,384-byte native
+stack, leaving 576 bytes; the resident image occupies 63,804 of 65,536 reserved
+bytes. Future code growth must recheck both bounds. Focused debug03 preserves an
+oracle failure: the inactive alias alone was prewarmed, while its expectation
+incorrectly required both aliases warm. The corrected oracle checks inactive RO
+and active absent, with corruption controls. Temporary diagnostics and shortened
+deadlines are absent from the accepted campaign.
+
+The independent run lasted 75 seconds and retained about70MB. Observed peak
+build/worker process-group RSS was below348MB/97MB; declared limits and two-job
+builds remained in force. These are correctness runs, not performance evidence.
+No substantive correctness or reproduction blocker remains in this finite scope.
+
+This fixture retains shared alias permissions and bounded per-owner stack spans;
+source mutation is a protected runtime write, not translated guest self-modifying
+code. Concurrent terminal/cross-page faults, mixed-permission aliases, V2
+paging-off execution, V3 mode transitions and the broader I4-V campaign remain
+obligations. No full V1/I4-V acceptance follows.
+
 ## Intermediate I4-V return — concurrent address aliases, October 26, 2026 UTC
 
 Root authored the ABI/runtime and runner, `/root/i4v_producer` authored host and

@@ -29,18 +29,26 @@ def main():
     parser.add_argument('--producer', type=Path, required=True)
     parser.add_argument('--stack', action='store_true', help='also execute the stack/prefix and staged-reply slice')
     parser.add_argument('--aliases', action='store_true', help='also execute N=1..4 alias/remap/source composition')
+    parser.add_argument('--concurrent-stack', action='store_true', help='also execute N=1..4 stack recovery/source/maintenance composition')
+    parser.add_argument('--focus', help='retain only one selected alias/stack concurrency cell for diagnosis')
     args = parser.parse_args()
+    selected = [f'{family}-{region}-n{n}' for family,enabled in (('alias',args.aliases),('stack',args.concurrent_stack))
+                if enabled for region in ('low','high') for n in (1,2,3,4)]
+    if args.focus and args.focus not in selected:
+        parser.error('--focus must name a concurrency cell enabled by --aliases or --concurrent-stack')
     if resource.getrlimit(resource.RLIMIT_CPU) != (resource.RLIM_INFINITY,) * 2:
         parser.error('HVF requires unlimited inherited CPU limits; external supervision bounds runs')
     retention = module(REPO / 'experiments/track01/source/run.py', 'retention')
     supervisor = module(REPO / 'experiments/track01/run_check.py', 'supervisor')
     run = retention.allocate(os.environ.get('NATEMU_RAW_ROOT'), REPO, args.name)
     record = dict(format='natemu-i4v-run-v1', purpose='exploratory-development',
-                  status='preparing', full_i4v_complete=False, tested_vcpus=[1,2,3,4] if args.aliases else [1],
+                  status='preparing', full_i4v_complete=False, tested_vcpus=[],
                   started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                   source_origin=str(REPO), jobs=[], commands=[], compilations=[], cells=[],
                   stack_enabled=args.stack,
                   aliases_enabled=args.aliases,
+                  concurrent_stack_enabled=args.concurrent_stack,
+                  focus=args.focus,
                   limits=dict(build_jobs=2, build_rss_bytes=8*1024**3,
                               worker_rss_bytes=512*1024**2, cell_seconds=120,
                               bundle_seconds=1200, run_disk_bytes=2*1024**3))
@@ -56,6 +64,7 @@ def main():
                      'tools/i4v_stack_check.py', 'tools/test_i4v_stack_check.py',
                      'tools/i4v_alias_worker.py', 'tools/test_i4v_alias_worker.py',
                      'tools/check_i4v_alias.py', 'tools/test_check_i4v_alias.py',
+                     'tools/check_i4v_stack_concurrent.py', 'tools/test_check_i4v_stack_concurrent.py',
                      'tools/check_i4.py', 'tools/check_i4_pressure.py', 'tools/check_i1.py',
                      'tools/check_i2.py', 'tools/check_i3_paging.py',
                      'tools/run_i1.py', 'tools/i4v_check.py', 'tools/test_i4v_check.py',
@@ -93,7 +102,8 @@ def main():
             specification = dict(argv=list(map(str, argv)), cwd=str(source), environment=environment)
             if oracle:
                 specification['oracle'] = str(source / ('tools/i4v_stack_check.py' if oracle == 'stack'
-                    else 'tools/check_i4v_alias.py' if oracle == 'aliases' else 'tools/i4v_check.py'))
+                    else 'tools/check_i4v_alias.py' if oracle == 'aliases'
+                    else 'tools/check_i4v_stack_concurrent.py' if oracle == 'concurrent-stack' else 'tools/i4v_check.py'))
             path = directory / 'job.json'
             path.write_text(json.dumps(specification, indent=2)+'\n')
             remaining = min(wall, deadline - time.monotonic())
@@ -121,6 +131,7 @@ def main():
                                        ('alias-oracle-tests', 'tools', 'test_check_i4v_alias.py'),
                                        ('alias-worker-tests', 'tools', 'test_i4v_alias_worker.py')):
             job(label, [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', folder, '-p', pattern])
+        job('concurrent-stack-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_check_i4v_stack_concurrent.py'])
         job('build-host', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-host'], wall=600, rss=8*1024**3)
         job('build-runtime', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], wall=600, rss=8*1024**3)
         host = source / 'target/release/natemu-host'
@@ -128,7 +139,7 @@ def main():
         job('sign', ['codesign', '--force', '--sign', '-', '--entitlements', 'crates/host/entitlements.plist', host])
         job('verify-signature', ['codesign', '--verify', '--verbose=2', host])
         exporter = module(source / 'tools/i4v_producer/export.py', 'exporter')
-        for region, rip in (('high', 0xffff800000102000), ('low', 0x102000)):
+        for region, rip in (() if args.focus else (('high', 0xffff800000102000), ('low', 0x102000))):
             directory = run / ('compile-' + region)
             job('producer-' + region, [sys.executable, '-B', source / 'tools/i4v_producer/compile.py',
                                        '--directory', directory, '--producer', producer,
@@ -146,6 +157,8 @@ def main():
                       for region, rip in (('high', 0xffff800000102000), ('low', 0x102000))
                       for scenario in ('cold', 'load_np', 'user_denied', 'fetch_nx', 'smep', 'low_operand', 'private_operand')]
         live_cells += [('high', 0xffff800000102000, 'cold', i) for i in range(16)]
+        if args.focus:
+            live_cells = []
         for region, rip, scenario, mutation in live_cells:
             label = f'live-{region}-{scenario}' + (f'-reply-{mutation}' if mutation is not None else '')
             output = run / (label + '-producer')
@@ -174,7 +187,7 @@ def main():
                     raise ValueError('runtime reply differs from producer delivery/control mutation')
                 record['compilations'].append(dict(directory=str(directory.relative_to(run)), export=exported))
             record['cells'].append(dict(name=label, producer=str(output.relative_to(run)), reply_mutation=mutation))
-        if args.stack:
+        if args.stack and not args.focus:
             # The verifier's imports must come from the retained snapshot too.
             sys.path.insert(0, str(source / 'tools'))
             stack_worker = module(source / 'tools/i4v_stack_worker.py', 'stack_worker')
@@ -220,6 +233,8 @@ def main():
             for profile, scenario, rip in ((1,'alias-low',0x102000), (2,'alias-high',0xffff800000102000)):
                 for n in (1,2,3,4):
                     label = f'{scenario}-n{n}'
+                    if args.focus and label != args.focus:
+                        continue
                     output = run / (label+'-producer')
                     result = job(label, [host, runtime, 'i4', scenario, str(n), producer, output], oracle='aliases')
                     report = json.loads((result/'command.stdout').read_text())
@@ -235,11 +250,41 @@ def main():
                             raise ValueError('alias compilation does not use requested full RIP')
                         record['compilations'].append(dict(directory=str(directory.relative_to(run)), export=exported))
                     record['cells'].append(dict(name=label, producer=str(output.relative_to(run)), vcpus=n))
+        if args.concurrent_stack:
+            sys.path.insert(0, str(source / 'tools'))
+            concurrent_worker = module(source / 'tools/i4v_stack_worker.py', 'concurrent_stack_worker')
+            sys.path.pop(0)
+            for profile, scenario, rip in ((1,'stack-low',0x102000), (2,'stack-high',0xffff800000102000)):
+                for n in (1,2,3,4):
+                    label = f'{scenario}-n{n}'
+                    if args.focus and label != args.focus:
+                        continue
+                    output = run / (label+'-producer')
+                    result = job(label, [host, runtime, 'i4', scenario, str(n), producer, output], oracle='concurrent-stack')
+                    report = json.loads((result/'command.stdout').read_text())
+                    if (report['profile'] != 'i4-'+scenario or report['alias_profile'] != profile
+                            or report['stack_profile'] != 1 or report['source_rip'] != rip
+                            or report['configured_vcpus'] != n or report['tested_vcpus'] != n
+                            or report['delayed_owner_ms'] != 50):
+                        raise ValueError('concurrent stack report differs from requested profile')
+                    concurrent_worker.verify_compilations(output, report['requests'])
+                    for index, request in enumerate(report['requests']):
+                        directory = output / f'request-{index:03}'
+                        exported = concurrent_worker.verify_request(directory, request)
+                        compiler_owner = next(owner for owner in report['stacks'] if owner['id'] == 0)
+                        concurrent_worker.verify_transfers(directory,
+                            concurrent_worker.requests_for(tuple(request)), compiler_owner['replies'][index])
+                        if exported['guest_rip'] != rip:
+                            raise ValueError('concurrent stack compilation uses wrong full RIP')
+                        record['compilations'].append(dict(directory=str(directory.relative_to(run)),export=exported))
+                    record['cells'].append(dict(name=label,producer=str(output.relative_to(run)),vcpus=n))
+        record['tested_vcpus'] = sorted({cell.get('vcpus',1) for cell in record['cells']})
         record['status'] = 'passed'
     except BaseException as error:
         record.update(status='failed', error=str(error))
         raise
     finally:
+        record['tested_vcpus'] = sorted({cell.get('vcpus',1) for cell in record['cells']})
         # An externally terminated compiler worker may not reach its cleanup.
         for path in run.rglob('compiler.json'):
             if source in path.parents:

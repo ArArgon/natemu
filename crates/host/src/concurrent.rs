@@ -2,8 +2,9 @@
 use super::*;
 use natemu_abi::concurrency::*;
 use natemu_abi::translation as wire;
-use natemu_abi::{alias, shadow};
+use natemu_abi::{alias, shadow, stack, stack_concurrent};
 mod producer;
+mod stack_producer;
 use std::{
     sync::{atomic::Ordering, mpsc},
     thread,
@@ -71,8 +72,17 @@ impl Cpu {
                         for (r, v) in packet.iter_mut().enumerate() {
                             hv(hv_vcpu_get_reg(self.id, r as u32, v), "read service packet")?;
                         }
-                        let mut expected = s.lifecycle.packet();
-                        expected[0] = packet[0];
+                        let expected = if compiler.as_ref().is_some_and(|c| c.is_stack()) {
+                            ptr::read_volatile(
+                                (shared_address - SHARED_OFFSET + stack_concurrent::OFFSET)
+                                    as *const stack_concurrent::State,
+                            )
+                            .expected
+                        } else {
+                            let mut expected = s.lifecycle.packet();
+                            expected[0] = packet[0];
+                            expected
+                        };
                         if packet != expected {
                             return Err("compiler request differs from resident identity".into());
                         }
@@ -171,7 +181,7 @@ fn run_owners(
     tcr: u64,
     delay: u64,
     memory: usize,
-    compiler_config: Option<(std::path::PathBuf, std::path::PathBuf, u64)>,
+    compiler_config: Option<(std::path::PathBuf, std::path::PathBuf, u64, bool)>,
 ) -> Result<Vec<wire::Packet>> {
     thread::scope(|scope| {
         let (prepared_tx, prepared_rx) = mpsc::channel();
@@ -205,8 +215,14 @@ fn run_owners(
                         if id == n - 1 {
                             thread::sleep(Duration::from_millis(delay));
                         }
-                        if let Some((binary, output, profile)) = compiler_config {
-                            compiler = Some(if profile == 0 {
+                        if let Some((binary, output, profile, is_stack)) = compiler_config {
+                            compiler = Some(if is_stack {
+                                producer::Compiler::new_stack(
+                                    binary,
+                                    output,
+                                    alias::source_rip(profile),
+                                )?
+                            } else if profile == 0 {
                                 producer::Compiler::new(binary, output)?
                             } else {
                                 producer::Compiler::new_alias(
@@ -317,25 +333,27 @@ pub fn run(args: &[String]) -> Result<()> {
     if n > host_limit as usize {
         return Err("I4 count exceeds host vCPU limit".into());
     }
+    let stack_profile = matches!(args[3].as_str(), "stack-low" | "stack-high");
+    coord.stack_profile = u64::from(stack_profile);
     coord.scenario = match args[3].as_str() {
         "entry" => 0,
         "faults" => 1,
         "remap" => 2,
         "compose" => 3,
         "events" => 4,
-        "pressure" | "alias-low" | "alias-high" => 5,
+        "pressure" | "alias-low" | "alias-high" | "stack-low" | "stack-high" => 5,
         _ => return Err("unsupported I4 scenario".into()),
     };
     let alias_profile = match args[3].as_str() {
-        "alias-low" => 1,
-        "alias-high" => 2,
+        "alias-low" | "stack-low" => 1,
+        "alias-high" | "stack-high" => 2,
         _ => 0,
     };
     coord.alias_profile = alias_profile;
     let source_rip = alias::source_rip(alias_profile);
     let compose = matches!(
         args[3].as_str(),
-        "compose" | "events" | "pressure" | "alias-low" | "alias-high"
+        "compose" | "events" | "pressure" | "alias-low" | "alias-high" | "stack-low" | "stack-high"
     );
     if compose {
         coord.published.store(0, Ordering::Relaxed);
@@ -348,21 +366,34 @@ pub fn run(args: &[String]) -> Result<()> {
     if delay > 1000 {
         return Err("owner delay exceeds 1000ms".into());
     }
-    let body = if compose {
+    let body = if stack_profile {
+        Vec::new()
+    } else if compose {
         FEX_BODY.to_vec()
     } else {
         read_input(&args[5], 44)?
     };
-    if body != FEX_BODY {
+    if !stack_profile && body != FEX_BODY {
         return Err("I4 requires pinned FEX fragment".into());
     }
     let memory = Memory::with_size(n * RAM_SIZE)?;
     load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
     let image = memory.read::<0x10000>(0);
-    memory.copy(CODE_OFFSET, &body);
-    memory.copy(CODE_OFFSET + 44, &RET);
+    if !stack_profile {
+        memory.copy(CODE_OFFSET, &body);
+        memory.copy(CODE_OFFSET + 44, &RET);
+    } else {
+        memory.copy(DATA_OFFSET, &[0xa5; 8192]);
+    }
     if compose {
-        memory.copy(natemu_abi::recovery::SOURCE_OFFSET, &wire::XOR);
+        memory.copy(
+            natemu_abi::recovery::SOURCE_OFFSET,
+            if stack_profile {
+                &stack::SOURCE[..]
+            } else {
+                &wire::XOR[..]
+            },
+        );
     }
     unsafe {
         ptr::write(memory.0.add(COORD_OFFSET).cast::<Coordinator>(), coord);
@@ -371,7 +402,10 @@ pub fn run(args: &[String]) -> Result<()> {
     if unsafe { getentropy((&raw mut vm_id).cast(), 8) } != 0 || vm_id == 0 {
         return Err("VM identity entropy unavailable".into());
     }
-    let pressure = matches!(args[3].as_str(), "pressure" | "alias-low" | "alias-high");
+    let pressure = matches!(
+        args[3].as_str(),
+        "pressure" | "alias-low" | "alias-high" | "stack-low" | "stack-high"
+    );
     if pressure {
         unsafe {
             ptr::write(
@@ -391,19 +425,31 @@ pub fn run(args: &[String]) -> Result<()> {
             memory.copy(base, &image);
         }
         tables(&memory, base, alias_profile != 0);
-        let (mut frame, mut bank, data) = seed(id);
+        let (mut frame, mut bank, mut data) = seed(id);
         for b in &mut bank {
             *b ^= id as u8;
         }
         frame.x[6] = alias::data_address(alias_profile, id as u64, 0);
         frame.x[11] = frame.x[6] + 128;
+        if stack_profile {
+            frame.x[8] = stack_concurrent::initial_rsp(id as u64);
+            frame.x[5] = frame.x[8];
+            data.fill(0xa5);
+        }
         memory.copy(base + BANK_OFFSET, &bank);
         memory.copy(DATA_OFFSET + id * 256, &data);
         let mut replacement = data.map(|b| b ^ 0x5a);
-        replacement[..8].copy_from_slice(&(0xd00d_9876_5432_1000u64 + id as u64).to_le_bytes());
+        if stack_profile {
+            replacement.fill(0xa5);
+        } else {
+            replacement[..8].copy_from_slice(&(0xd00d_9876_5432_1000u64 + id as u64).to_le_bytes());
+        }
         memory.copy(DATA_OFFSET + 4096 + id * 256, &replacement);
         new_data.push(replacement);
         let mut object = Object::new(LIVE_LOAD);
+        if stack_profile {
+            object.code_length = stack::CODE_BYTES as u64;
+        }
         object.vcpu_id = id as u32;
         object.configured_vcpus = n as u32;
         let shared = Shared {
@@ -431,6 +477,15 @@ pub fn run(args: &[String]) -> Result<()> {
         };
         unsafe {
             ptr::write(memory.0.add(base + SHARED_OFFSET).cast::<Shared>(), shared);
+            if stack_profile {
+                ptr::write(
+                    memory
+                        .0
+                        .add(base + stack_concurrent::OFFSET)
+                        .cast::<stack_concurrent::State>(),
+                    stack_concurrent::State::ZERO,
+                );
+            }
             if alias_profile != 0 {
                 ptr::write(
                     memory.0.add(base + alias::OFFSET).cast::<alias::Record>(),
@@ -460,10 +515,13 @@ pub fn run(args: &[String]) -> Result<()> {
                 );
                 if matches!(
                     args[3].as_str(),
-                    "events" | "pressure" | "alias-low" | "alias-high"
+                    "events" | "pressure" | "alias-low" | "alias-high" | "stack-low" | "stack-high"
                 ) {
                     let mut guest = natemu_abi::recovery::GuestState::seed(&seeds[id].0);
                     guest.rip = source_rip;
+                    if stack_profile {
+                        guest.gpr[4] = seeds[id].0.x[8];
+                    }
                     if id == 0 {
                         guest.rflags &= !0x200;
                     }
@@ -476,6 +534,9 @@ pub fn run(args: &[String]) -> Result<()> {
                     );
                     let mut event = EventRecord::new(&seeds[id].0, id);
                     event.packet.rip = source_rip;
+                    if stack_profile {
+                        event.packet.gpr[4] = seeds[id].0.x[8];
+                    }
                     ptr::write(
                         memory
                             .0
@@ -513,6 +574,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 args[5].clone().into(),
                 args[6].clone().into(),
                 alias_profile,
+                stack_profile,
             ))
         } else {
             None
@@ -525,6 +587,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut new_cells = Vec::new();
     let mut event_records = Vec::new();
     let mut alias_records = Vec::new();
+    let mut stack_records = Vec::new();
     for (id, (frame, bank, data)) in seeds.iter().enumerate() {
         let base = id * RAM_SIZE;
         let s = unsafe { ptr::read(memory.0.add(base + SHARED_OFFSET).cast::<Shared>()) };
@@ -536,7 +599,14 @@ pub fn run(args: &[String]) -> Result<()> {
         entry.x[30] = s.capture_pc;
         if !matches!(
             args[3].as_str(),
-            "remap" | "compose" | "events" | "pressure" | "alias-low" | "alias-high"
+            "remap"
+                | "compose"
+                | "events"
+                | "pressure"
+                | "alias-low"
+                | "alias-high"
+                | "stack-low"
+                | "stack-high"
         ) && s.initial != entry
         {
             return Err(format!("CPU{id}: entry state changed"));
@@ -544,7 +614,7 @@ pub fn run(args: &[String]) -> Result<()> {
         let r = unsafe { ptr::read(memory.0.add(base + ROUND_OFFSET).cast::<Round>()) };
         if matches!(
             args[3].as_str(),
-            "events" | "pressure" | "alias-low" | "alias-high"
+            "events" | "pressure" | "alias-low" | "alias-high" | "stack-low" | "stack-high"
         ) {
             let e = unsafe { ptr::read(memory.0.add(base + EVENT_OFFSET).cast::<EventRecord>()) };
             event_records.push(format!("{{\"id\":{id},\"pending\":{},\"token_state\":{},\"notifications\":{},\"consumed\":{},\"deliveries\":{},\"boundary\":{},\"blocked\":{},\"wait_checks\":{},\"shadow\":{},\"priority\":{},\"vector\":{},\"packet\":{}}}",
@@ -561,6 +631,44 @@ pub fn run(args: &[String]) -> Result<()> {
                 i4v::words(&memory,base+shadow::UPPER_ROOT),i4v::words(&memory,base+shadow::UPPER_L1),
                 i4v::words(&memory,base+shadow::UPPER_L2),i4v::words(&memory,base+shadow::UPPER_LEAF),
                 i4v::words(&memory,base+shadow::LOWER_LEAF)));
+        }
+        if stack_profile {
+            let state = unsafe {
+                ptr::read(
+                    memory
+                        .0
+                        .add(base + stack_concurrent::OFFSET)
+                        .cast::<stack_concurrent::State>(),
+                )
+            };
+            let mut before = natemu_abi::recovery::GuestState::seed(frame);
+            before.rip = source_rip;
+            before.gpr[4] = frame.x[8];
+            if id == 0 {
+                before.rflags &= !0x200;
+            }
+            let after = unsafe {
+                ptr::read(
+                    memory
+                        .0
+                        .add(base + natemu_abi::recovery::GUEST_OFFSET)
+                        .cast::<natemu_abi::recovery::GuestState>(),
+                )
+            };
+            let programs = state
+                .programs
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{{\"entries\":{},\"completed\":{},\"prefixes\":{:?}}}",
+                        p.entries, p.completed, p.prefixes
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            stack_records.push(format!("{{\"id\":{id},\"step\":{},\"pass\":{},\"code\":{},\"expected\":{:?},\"compile_requests\":{:?},\"replies\":{:?},\"programs\":[{programs}],\"stale_chunks\":{},\"wrong_owner_rejections\":{},\"blank_before_publish\":{},\"source_before\":{:?},\"source_after\":{:?},\"guest_before\":{},\"guest_after\":{}}}",
+                state.step,state.pass,state.code,state.expected,state.compile_requests,state.replies,state.stale_chunks,state.wrong_owner_rejections,state.blank_before_publish,
+                state.source_before,state.source_after,recovery::guest_json(&before),recovery::guest_json(&after)));
         }
         if args[3] != "entry" {
             faults.push(format!("{{\"id\":{id},\"faults\":{},\"old_gpa\":{},\"frame\":{},\"esr\":{},\"far\":{},\"pc\":{},\"spsr\":{}}}",
@@ -589,13 +697,26 @@ pub fn run(args: &[String]) -> Result<()> {
         );
         if matches!(
             args[3].as_str(),
-            "remap" | "compose" | "events" | "pressure" | "alias-low" | "alias-high"
+            "remap"
+                | "compose"
+                | "events"
+                | "pressure"
+                | "alias-low"
+                | "alias-high"
+                | "stack-low"
+                | "stack-high"
         ) {
             if !pressure && s.initial != r.new_initial {
                 return Err("new entry state changed".into());
             }
             let code = if compose { CODE_NEXT } else { CODE_VA };
-            let case = if compose { "live_or" } else { "live_load" };
+            let case = if stack_profile {
+                "fex_push_immediates64_changed"
+            } else if compose {
+                "live_or"
+            } else {
+                "live_load"
+            };
             let dirty = format!(
                 "{{\"frame\":{},\"esr\":{},\"far\":{},\"pc\":{},\"spsr\":{}}}",
                 frame_json(&r.dirty_frame),
@@ -605,18 +726,30 @@ pub fn run(args: &[String]) -> Result<()> {
                 r.dirty_spsr
             );
             new_cells.push(format!("{{\"dirty_fault\":{dirty},\"id\":{id},\"dirty_faults\":{},\"case\":\"{case}\",\"status\":{},\"initial\":{},\"captured\":{},\"memory_base\":{},\"memory_before\":{:?},\"memory_after\":{:?},\"bank_before\":{bank:?},\"bank_after\":{:?},\"object_pc\":{code},\"capture_pc\":{}}}",
-                r.dirty_faults,s.status,frame_json(&r.new_initial),frame_json(second_frame),r.new_initial.x[6],
+                r.dirty_faults,s.status,frame_json(&r.new_initial),frame_json(second_frame),if stack_profile {alias::data_address(alias_profile,id as u64,0)} else {r.new_initial.x[6]},
                 new_data[id],second_memory,memory.read::<512>(base+BANK_OFFSET),s.capture_pc));
         }
         let old_frame = if matches!(
             args[3].as_str(),
-            "remap" | "compose" | "events" | "pressure" | "alias-low" | "alias-high"
+            "remap"
+                | "compose"
+                | "events"
+                | "pressure"
+                | "alias-low"
+                | "alias-high"
+                | "stack-low"
+                | "stack-high"
         ) {
             &r.first_frame
         } else {
             &s.captured
         };
-        cells.push(format!("{{\"id\":{id},\"case\":\"live_load\",\"status\":{},\"initial\":{},\"captured\":{},\"memory_base\":{},\"memory_before\":{data:?},\"memory_after\":{:?},\"bank_before\":{bank:?},\"bank_after\":{:?},\"object_pc\":{CODE_VA},\"capture_pc\":{}}}",
+        let case = if stack_profile {
+            "fex_push_immediates64"
+        } else {
+            "live_load"
+        };
+        cells.push(format!("{{\"id\":{id},\"case\":\"{case}\",\"status\":{},\"initial\":{},\"captured\":{},\"memory_base\":{},\"memory_before\":{data:?},\"memory_after\":{:?},\"bank_before\":{bank:?},\"bank_after\":{:?},\"object_pc\":{CODE_VA},\"capture_pc\":{}}}",
             s.status,frame_json(frame),frame_json(old_frame),frame.x[6],
             first_memory,memory.read::<512>(base+BANK_OFFSET),s.capture_pc));
     }
@@ -634,9 +767,27 @@ pub fn run(args: &[String]) -> Result<()> {
         c.stale_replies.load(Ordering::Acquire),
         c.stale_entries.load(Ordering::Acquire),
         c.reuse_blocked.load(Ordering::Acquire),
-        memory.read::<17>(natemu_abi::recovery::SOURCE_OFFSET),
-        memory.read::<48>(CODE_OFFSET),
-        memory.read::<48>(CODE_OFFSET + 4096)
+        if stack_profile {
+            memory
+                .read::<20>(natemu_abi::recovery::SOURCE_OFFSET)
+                .to_vec()
+        } else {
+            memory
+                .read::<17>(natemu_abi::recovery::SOURCE_OFFSET)
+                .to_vec()
+        },
+        if stack_profile {
+            memory.read::<{ stack::CODE_BYTES }>(CODE_OFFSET).to_vec()
+        } else {
+            memory.read::<48>(CODE_OFFSET).to_vec()
+        },
+        if stack_profile {
+            memory
+                .read::<{ stack::CODE_BYTES }>(CODE_OFFSET + 4096)
+                .to_vec()
+        } else {
+            memory.read::<48>(CODE_OFFSET + 4096).to_vec()
+        }
     );
     let maintenance = if pressure {
         Some(unsafe {
@@ -674,8 +825,13 @@ pub fn run(args: &[String]) -> Result<()> {
                             .cast::<natemu_abi::maintenance::Interval>(),
                     )
                 };
-                intervals.push(format!("{{\"id\":{id},\"ordinal\":{},\"heads\":{},\"epoch\":{},\"gpa\":{},\"case\":\"live_or\",\"status\":1,\"initial\":{},\"captured\":{},\"memory_base\":{},\"memory_before\":{:?},\"memory_after\":{:?},\"bank_before\":{:?},\"bank_after\":{:?},\"object_pc\":{CODE_NEXT},\"capture_pc\":{},\"dirty_faults\":{},\"dirty_fault\":{{\"frame\":{},\"esr\":{},\"far\":{},\"pc\":{},\"spsr\":{}}}}}",
-                    r.ordinal,r.heads,r.epoch,r.gpa,frame_json(&r.initial),frame_json(&r.captured),r.initial.x[6],
+                let case = if stack_profile {
+                    "fex_push_immediates64_changed"
+                } else {
+                    "live_or"
+                };
+                intervals.push(format!("{{\"id\":{id},\"ordinal\":{},\"heads\":{},\"epoch\":{},\"gpa\":{},\"case\":\"{case}\",\"status\":1,\"initial\":{},\"captured\":{},\"memory_base\":{},\"memory_before\":{:?},\"memory_after\":{:?},\"bank_before\":{:?},\"bank_after\":{:?},\"object_pc\":{CODE_NEXT},\"capture_pc\":{},\"dirty_faults\":{},\"dirty_fault\":{{\"frame\":{},\"esr\":{},\"far\":{},\"pc\":{},\"spsr\":{}}}}}",
+                    r.ordinal,r.heads,r.epoch,r.gpa,frame_json(&r.initial),frame_json(&r.captured),if stack_profile {alias::data_address(alias_profile,id as u64,0)} else {r.initial.x[6]},
                     r.before,r.after,seeds[id].1,memory.read::<512>(id*RAM_SIZE+BANK_OFFSET),state.capture_pc,
                     r.faults,frame_json(&r.dirty_frame),r.esr,r.far,r.pc,r.spsr));
             }
@@ -721,8 +877,20 @@ pub fn run(args: &[String]) -> Result<()> {
         c.reclaimed.load(Ordering::Acquire),
         compose_leaf
     );
+    let stack_flag = u64::from(stack_profile);
+    let stack_memory_before = if stack_profile {
+        vec![0xa5u8; 8192]
+    } else {
+        Vec::new()
+    };
+    let stack_memory_after = if stack_profile {
+        memory.read::<8192>(DATA_OFFSET).to_vec()
+    } else {
+        Vec::new()
+    };
     println!(
-        "{{\"alias_profile\":{alias_profile},\"source_rip\":{source_rip},\"aliases\":[{}],\"maintenance\":{maintenance_json},\"events\":[{}],\"source\":{source_summary},\"requests\":{requests:?},\"coherence\":{summary},\"new_cells\":[{}],\"profile\":\"i4-{scenario}\",\"trace\":{trace:?},\"faults\":[{}],\"retained\":{},\"configured_vcpus\":{n},\"tested_vcpus\":{n},\"delayed_owner_ms\":{delay},\"ready\":{},\"finished\":{},\"cells\":[{}]}}",
+        "{{\"stack_profile\":{stack_flag},\"stacks\":[{}],\"stack_memory_before\":{stack_memory_before:?},\"stack_memory_after\":{stack_memory_after:?},\"alias_profile\":{alias_profile},\"source_rip\":{source_rip},\"aliases\":[{}],\"maintenance\":{maintenance_json},\"events\":[{}],\"source\":{source_summary},\"requests\":{requests:?},\"coherence\":{summary},\"new_cells\":[{}],\"profile\":\"i4-{scenario}\",\"trace\":{trace:?},\"faults\":[{}],\"retained\":{},\"configured_vcpus\":{n},\"tested_vcpus\":{n},\"delayed_owner_ms\":{delay},\"ready\":{},\"finished\":{},\"cells\":[{}]}}",
+        stack_records.join(","),
         alias_records.join(","),
         event_records.join(","),
         new_cells.join(","),

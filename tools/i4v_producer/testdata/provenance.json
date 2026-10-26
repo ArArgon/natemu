@@ -1,6 +1,14 @@
 {
   "retained_root": "/Users/liaozping/orca/natemu-raw/i4v-producer-20261026-02",
   "files": {
+    "replacement-high/source.x86": "77b1c9fc116ca424cdf5e1924d1e9ac946e38725493a50bd55fd876efeab9e09",
+    "replacement-high/body.bin": "66306a422f30967988c63755630ae63690f286876ea527992f0e22a8969b3ef8",
+    "replacement-high/export.json": "17eab78a058be315ab2f6f4d98b2448554357e36a32f63cc61216eda1ad09c59",
+    "replacement-high/input.bin": "de6432322053e7b4fac3daa2ce42231edf45be30588ede76584e8070e76b7016",
+    "replacement-high/compiler.json": "1c237ff2cc0e6d12e3f9adea1d80e8404393d6a020338ba9911880c3d64062c8",
+    "replacement-high/producer.log": "1762275124ba17e2d643e21e437b97db1bd50eb43af5550fc2d38758f88abf6a",
+    "replacement-high/outputs/001.relocations": "0b3dcbc0a3d9a737d786145c2cda7d73362b80f09ee2d7e398967ec6c3ba1e6c",
+    "replacement-high/outputs/001.native": "598b6683e529225be1c64ee45740268db9afaf31751107e82c80a8751a398541",
     "load-high/source.x86": "661bfb535f274b2f64fff6d66f60a35572940497328ef6390963839a7c8217fe",
     "load-high/body.bin": "5ca671962621681001f6c3fd97f1b6334878b2a36a66cc134cd93f497d0e4e44",
     "load-high/export.json": "2f4b08a428a09495f7eff3fb1d83ba629f3cfaf0a7c597b6f714d14d53b5c550",
@@ -17,6 +25,14 @@
     "or-low/producer.log": "66fbb643c26b61002a61bef8c53f833e08e4c0afdf40eba514fb5de1b5cb16d3",
     "or-low/outputs/001.relocations": "da934846a258848098cbecbc7b2c0040ecfb5b088050d32b92d9d8bbc37e5dc4",
     "or-low/outputs/001.native": "1b897f39fece247085340798629c6a9666c76632ac042a4fce69c6709386e28a",
+    "replacement-low/source.x86": "77b1c9fc116ca424cdf5e1924d1e9ac946e38725493a50bd55fd876efeab9e09",
+    "replacement-low/body.bin": "66306a422f30967988c63755630ae63690f286876ea527992f0e22a8969b3ef8",
+    "replacement-low/export.json": "e78fc45965c560bb7c30d9533bdd422d9bdd1ce44d0cfd98461201503a18a8ea",
+    "replacement-low/input.bin": "de6432322053e7b4fac3daa2ce42231edf45be30588ede76584e8070e76b7016",
+    "replacement-low/compiler.json": "d5739974794d076ac3fed906c1d59f97f67b091fe72e4a02f6e0a634d71cea9a",
+    "replacement-low/producer.log": "8bda67e50a252a488763f9084b5eeb58a6f3132c656d2f296b6f871da938c802",
+    "replacement-low/outputs/001.relocations": "ebbf9ea89ad67d3ada0970e0cda54f72a51cc698e2388ae77375df6aec27d872",
+    "replacement-low/outputs/001.native": "d5677b84f10531f247b128cf89362b3d9e9595478ccbc55e16d1f53a65fc2ae7",
     "or-high/source.x86": "08e0cb4de605d5eb8b4762e67a103f7e94f7d6d6ca186c439df77494de301275",
     "or-high/body.bin": "2ebcf1a98e1b6af24eb7401959a587d755969663da05fce5dc5344ee97ce17cd",
     "or-high/export.json": "44fb1fcaafb45535e61028236e2240bb730e8ca77fefbe622502f9a39e498821",
@@ -50,5 +66,6 @@
     "push-high/outputs/001.relocations": "0b3dcbc0a3d9a737d786145c2cda7d73362b80f09ee2d7e398967ec6c3ba1e6c",
     "push-high/outputs/001.native": "b5659ab720a70b13255fa6d119c5edfc8db7e442331123561fba39ff3c3ff989"
   },
-  "alias_retained_root": "/Users/liaozping/orca/natemu-raw/i4v-alias-producer-20261026-01"
+  "alias_retained_root": "/Users/liaozping/orca/natemu-raw/i4v-alias-producer-20261026-01",
+  "replacement_retained_root": "/Users/liaozping/orca/natemu-raw/i4v-stack-concurrent-producer-20261026-01"
 }

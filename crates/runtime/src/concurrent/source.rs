@@ -7,9 +7,17 @@ unsafe extern "C" {
     fn service_resume();
 }
 
-unsafe fn publish_slot(address: u64, body: &[u8]) {
+pub(super) unsafe fn publish_slot(address: u64, body: &[u8]) {
     unsafe {
-        if !matches!(address, CODE_VA | CODE_NEXT) || body.len() != 44 {
+        let is_stack = coordinator().stack_profile != 0;
+        if !matches!(address, CODE_VA | CODE_NEXT)
+            || body.len()
+                != if is_stack {
+                    natemu_abi::stack::CODE_BYTES
+                } else {
+                    44
+                }
+        {
             stop(PANIC, 110);
         }
         let offset = address - PRIVATE;
@@ -22,14 +30,17 @@ unsafe fn publish_slot(address: u64, body: &[u8]) {
             asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
         };
         replace((IPA + offset) | attrs | (3 << 53));
-        ptr::copy_nonoverlapping(body.as_ptr(), address as *mut u8, 44);
-        ptr::copy_nonoverlapping(RET.as_ptr(), (address + 44) as *mut u8, 4);
-        for off in (0..48).step_by(4) {
-            asm!("dc cvau, {0}",in(reg)address+off);
+        ptr::copy_nonoverlapping(body.as_ptr(), address as *mut u8, body.len());
+        if !is_stack {
+            ptr::copy_nonoverlapping(RET.as_ptr(), (address + 44) as *mut u8, 4);
+        }
+        let count = if is_stack { body.len() } else { 48 };
+        for off in (0..count).step_by(4) {
+            asm!("dc cvau, {0}",in(reg)address+off as u64);
         }
         asm!("dsb ish");
-        for off in (0..48).step_by(4) {
-            asm!("ic ivau, {0}",in(reg)address+off);
+        for off in (0..count).step_by(4) {
+            asm!("ic ivau, {0}",in(reg)address+off as u64);
         }
         asm!("dsb ish", "isb");
         replace((IPA + offset) | attrs | (1 << 7));
@@ -56,6 +67,9 @@ unsafe fn exchange_wait(state: &wire::Lifecycle, mut packet: wire::Packet) -> wi
 
 pub unsafe fn initialize() {
     unsafe {
+        if coordinator().stack_profile != 0 {
+            return stack_source::initialize();
+        }
         let s = shared();
         ptr::write_volatile(&raw mut (*s).service_pc, service_resume as *const () as u64);
         let mut state = ptr::read_volatile(&raw const (*s).lifecycle);
@@ -112,6 +126,9 @@ pub unsafe fn initialize() {
 // Called with coordinator authority, before changing source bytes.
 pub unsafe fn invalidate() {
     unsafe {
+        if coordinator().stack_profile != 0 {
+            return stack_source::invalidate();
+        }
         let c = coordinator();
         c.old_eligible.store(0, Ordering::Relaxed);
         let mut state = ptr::read_volatile(&raw const (*shared()).lifecycle);
@@ -133,6 +150,9 @@ pub unsafe fn invalidate() {
 
 pub unsafe fn replacement() {
     unsafe {
+        if coordinator().stack_profile != 0 {
+            return stack_source::replacement();
+        }
         let c = coordinator();
         let s = shared();
         let mut state = ptr::read_volatile(&raw const (*s).lifecycle);
@@ -201,7 +221,11 @@ pub unsafe fn try_reuse_old(_guard: &coordinator::Guard<'_>) -> bool {
         return false;
     }
     unsafe {
-        publish_slot(CODE_VA, &[0; 44]);
+        if c.stack_profile != 0 {
+            publish_slot(CODE_VA, &[0; natemu_abi::stack::CODE_BYTES]);
+        } else {
+            publish_slot(CODE_VA, &[0; 44]);
+        }
     }
     true
 }

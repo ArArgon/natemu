@@ -6,25 +6,33 @@ from pathlib import Path
 import struct
 
 from i4v_producer.compile import compile_source
-from i4v_producer.export import bounded, export_program, require, verify
+from i4v_producer.export import CASES, bounded, export_program, require, verify
 
 MISS = 0x49345611
 COMPILED = 0x49345612
 SOURCE = bytes.fromhex('68bbbcbdbe6668525166686261488b42f88b5af4')
 BODY = bytes.fromhex('94688892b4d7b7f2148d1ff8542a8a5214ed1f78542c8c5214ed1f78b42000d184fedfc81f2003d5b43000d186fedf881f2003d5')
 SOURCE_WORDS = struct.unpack('<3Q',SOURCE.ljust(24,b'\0'))
+SOURCES = {bytes.fromhex(CASES[name]['source']):name for name in
+           ('fex_push_immediates64','fex_push_immediates64_changed')}
+
+def request_source(request):
+    return struct.pack('<3Q',*request[10:13])[:20]
 
 def parse_request(raw):
     require(len(raw)==128,'stack request must contain exactly sixteen words')
     p=struct.unpack('<16Q',raw)
     require(p[0]==MISS and p[1]==1 and p[2]>0,'invalid stack request version/VM')
-    require(p[3:7]==(0,1,1,1),'unsupported stack participant/generations')
+    require(p[3]<4 and all(p[i]>0 for i in (4,5,6,13)),'unsupported stack participant/generations/serial')
     require(p[7] in (0x102000,0xffff800000102000),'unsupported stack guest RIP')
-    require(p[8:15]==(64,20,*SOURCE_WORDS,1,52) and 0<=p[15]<3,'invalid stack mode/source/serial/chunk')
+    require(p[8:10]==(64,20) and p[14]==52 and 0<=p[15]<3,'invalid stack mode/length/chunk')
+    padded=struct.pack('<3Q',*p[10:13])
+    require(padded[:20] in SOURCES and not any(padded[20:]),'unsupported stack source/padding')
     return p
 
 def make_reply(request,body):
-    parse_request(struct.pack('<16Q',*request));require(body==BODY,'unsupported stack body')
+    parse_request(struct.pack('<16Q',*request))
+    require(body==bytes.fromhex(CASES[SOURCES[request_source(request)]]['body']),'unsupported stack body')
     chunk=request[15];part=body[24*chunk:24*(chunk+1)]
     reply=list(request);reply[0]=COMPILED;reply[9]=len(body)
     reply[10:13]=struct.unpack('<3Q',part.ljust(24,b'\0'))
@@ -37,9 +45,10 @@ def requests_for(first):
 def compile_request(directory,producer):
     directory=Path(directory).resolve();first=parse_request(bounded(directory/'request.bin',128))
     require(first[15]==0,'compilation must begin with chunk zero')
-    compile_source(directory/'compile',Path(producer),SOURCE,first[7],64,5,13)
-    export_program(directory/'compile','fex_push_immediates64')
-    program=verify(directory/'compile',dict(case='fex_push_immediates64',guest_rip=first[7],source_hex=SOURCE.hex()))
+    source=request_source(first);case=SOURCES[source]
+    compile_source(directory/'compile',Path(producer),source,first[7],64,5,13)
+    export_program(directory/'compile',case)
+    program=verify(directory/'compile',dict(case=case,guest_rip=first[7],source_hex=source.hex()))
     requests=requests_for(first);replies=[]
     for chunk,request in enumerate(requests):
         reply=make_reply(request,bytes.fromhex(program['body_hex']));replies.append(list(struct.unpack('<16Q',reply)))
@@ -52,7 +61,8 @@ def compile_request(directory,producer):
 def verify_request(directory,expected_first):
     directory=Path(directory);first=parse_request(bounded(directory/'request.bin',128))
     require(first[15]==0 and list(first)==list(expected_first),'stack compilation differs from first resident request')
-    program=verify(directory/'compile',dict(case='fex_push_immediates64',guest_rip=first[7],source_hex=SOURCE.hex()))
+    source=request_source(first);case=SOURCES[source]
+    program=verify(directory/'compile',dict(case=case,guest_rip=first[7],source_hex=source.hex()))
     requests=requests_for(first);replies=[]
     for chunk,request in enumerate(requests):
         reply=make_reply(request,bytes.fromhex(program['body_hex']))
@@ -62,6 +72,13 @@ def verify_request(directory,expected_first):
                   producer_sha256=program['producer_sha256'],body_sha256=program['body_sha256'])
     require(json.loads(bounded(directory/'worker.json',8192))==expected,'stack worker record differs from producing artifacts')
     return program
+
+def verify_compilations(root,requests):
+    directories=sorted(Path(root).glob('request-*'))
+    require(len(directories)==len(requests),'stack compilation count differs')
+    for index,(directory,request) in enumerate(zip(directories,requests)):
+        require(directory.name==f'request-{index:03}','stack compilation directory order differs')
+        verify_request(directory,request)
 
 def verify_transfers(directory,expected_requests,expected_replies=None):
     require(1<=len(expected_requests)<=3,'stack transfer requires one to three observed requests')
