@@ -1,6 +1,9 @@
 """Check the new worker boundary without starting Hypervisor.framework."""
 import json
 import os
+import argparse
+import importlib.util
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -24,6 +27,24 @@ class WorkerTests(unittest.TestCase):
         result = subprocess.run([sys.executable, '-B', str(RUNNER), '--worker', str(path)],
                                 env=env, capture_output=True, text=True, timeout=5)
         return root, result
+
+    @unittest.skipUnless(RUNNER.with_name('check_i4.py').exists(),
+                         'I4 oracle is outside this retained profile')
+    def test_entry_only_snapshot_keeps_oracle_dependencies(self):
+        spec = importlib.util.spec_from_file_location('runner', RUNNER)
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        args = argparse.Namespace(i2=False, i3_paging=False, i3_allocated=False, i4_entry=True)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in runner.snapshot_inputs(args):
+                if name.startswith('tools/check_'):
+                    shutil.copy2(RUNNER.parent.parent / name, root / Path(name).name)
+            env = dict(os.environ)
+            env.pop('PYTHONPATH', None)
+            result = subprocess.run([sys.executable, '-B', str(root / 'check_i4.py'), '--self-test'],
+                                    cwd=root, env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_build_overrides_are_removed_or_pinned(self):
         root, result = self.run_job("import os,json; print(json.dumps({k:os.environ.get(k) for k in ['RUSTFLAGS','CARGO_TARGET_DIR','CARGO_BUILD_JOBS','RUSTUP_TOOLCHAIN','RUSTC_WRAPPER']}))")

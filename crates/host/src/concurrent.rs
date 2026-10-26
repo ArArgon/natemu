@@ -122,10 +122,10 @@ fn tables(memory: &Memory, base: usize) {
             || (0x70000..0x84000).contains(&offset)
             || (0x50000..0x54000).contains(&offset)
             || (0x60000..0x64000).contains(&offset)
-            || offset == COORD_OFFSET;
+            || (COORD_OFFSET..0x93000).contains(&offset);
         if text || writable {
             let common = (CODE_OFFSET..CODE_OFFSET + 8192).contains(&offset)
-                || offset == COORD_OFFSET
+                || (COORD_OFFSET..0x93000).contains(&offset)
                 || (DATA_OFFSET..0x84000).contains(&offset);
             let pa = IPA + offset as u64 + if common { 0 } else { base as u64 };
             word(
@@ -308,9 +308,11 @@ pub fn run(args: &[String]) -> Result<()> {
         "faults" => 1,
         "remap" => 2,
         "compose" => 3,
+        "events" => 4,
+        "pressure" => 5,
         _ => return Err("unsupported I4 scenario".into()),
     };
-    let compose = args[3] == "compose";
+    let compose = matches!(args[3].as_str(), "compose" | "events" | "pressure");
     if compose {
         coord.published.store(0, Ordering::Relaxed);
     }
@@ -344,6 +346,18 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut vm_id = 0u64;
     if unsafe { getentropy((&raw mut vm_id).cast(), 8) } != 0 || vm_id == 0 {
         return Err("VM identity entropy unavailable".into());
+    }
+    let pressure = args[3] == "pressure";
+    if pressure {
+        unsafe {
+            ptr::write(
+                memory
+                    .0
+                    .add(natemu_abi::maintenance::OFFSET)
+                    .cast::<natemu_abi::maintenance::State>(),
+                natemu_abi::maintenance::State::new(n).unwrap(),
+            );
+        }
     }
     let mut seeds = Vec::new();
     let mut new_data = Vec::new();
@@ -407,6 +421,26 @@ pub fn run(args: &[String]) -> Result<()> {
                         .cast::<natemu_abi::recovery::Recovery>(),
                     natemu_abi::recovery::Recovery::new(0),
                 );
+                if matches!(args[3].as_str(), "events" | "pressure") {
+                    let mut guest = natemu_abi::recovery::GuestState::seed(&seeds[id].0);
+                    if id == 0 {
+                        guest.rflags &= !0x200;
+                    }
+                    ptr::write(
+                        memory
+                            .0
+                            .add(id * RAM_SIZE + natemu_abi::recovery::GUEST_OFFSET)
+                            .cast::<natemu_abi::recovery::GuestState>(),
+                        guest,
+                    );
+                    ptr::write(
+                        memory
+                            .0
+                            .add(id * RAM_SIZE + EVENT_OFFSET)
+                            .cast::<EventRecord>(),
+                        EventRecord::new(&seeds[id].0, id),
+                    );
+                }
             }
         }
     }
@@ -438,6 +472,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut cells = Vec::new();
     let mut faults = Vec::new();
     let mut new_cells = Vec::new();
+    let mut event_records = Vec::new();
     for (id, (frame, bank, data)) in seeds.iter().enumerate() {
         let base = id * RAM_SIZE;
         let s = unsafe { ptr::read(memory.0.add(base + SHARED_OFFSET).cast::<Shared>()) };
@@ -447,16 +482,51 @@ pub fn run(args: &[String]) -> Result<()> {
         let mut entry = *frame;
         entry.x[16] = CODE_VA;
         entry.x[30] = s.capture_pc;
-        if !matches!(args[3].as_str(), "remap" | "compose") && s.initial != entry {
+        if !matches!(
+            args[3].as_str(),
+            "remap" | "compose" | "events" | "pressure"
+        ) && s.initial != entry
+        {
             return Err(format!("CPU{id}: entry state changed"));
         }
         let r = unsafe { ptr::read(memory.0.add(base + ROUND_OFFSET).cast::<Round>()) };
+        if matches!(args[3].as_str(), "events" | "pressure") {
+            let e = unsafe { ptr::read(memory.0.add(base + EVENT_OFFSET).cast::<EventRecord>()) };
+            event_records.push(format!("{{\"id\":{id},\"pending\":{},\"token_state\":{},\"notifications\":{},\"consumed\":{},\"deliveries\":{},\"boundary\":{},\"blocked\":{},\"wait_checks\":{},\"shadow\":{},\"priority\":{},\"vector\":{},\"packet\":{}}}",
+                u64::from(c.event_pending[id].load(Ordering::Acquire)==1),c.event_pending[id].load(Ordering::Acquire),c.event_notifications[id].load(Ordering::Acquire),
+                e.consumed,e.deliveries,e.boundary,e.blocked,e.wait_checks,e.shadow,e.priority,0x40+id,
+                recovery::guest_json(&e.packet)));
+        }
         if args[3] != "entry" {
             faults.push(format!("{{\"id\":{id},\"faults\":{},\"old_gpa\":{},\"frame\":{},\"esr\":{},\"far\":{},\"pc\":{},\"spsr\":{}}}",
                 r.faults,r.old_gpa,frame_json(&r.fault_frame),r.fault_esr,r.fault_far,r.fault_pc,r.fault_spsr));
         }
-        if matches!(args[3].as_str(), "remap" | "compose") {
-            if s.initial != r.new_initial {
+        let baseline = if pressure {
+            Some(unsafe {
+                ptr::read(
+                    memory
+                        .0
+                        .add(base + natemu_abi::maintenance::BASELINE_OFFSET)
+                        .cast::<natemu_abi::maintenance::Baseline>(),
+                )
+            })
+        } else {
+            None
+        };
+        let second_frame = baseline.as_ref().map_or(&s.captured, |b| &b.frame);
+        let second_memory = baseline.as_ref().map_or_else(
+            || memory.read::<256>(DATA_OFFSET + 4096 + id * 256),
+            |b| b.new_memory,
+        );
+        let first_memory = baseline.as_ref().map_or_else(
+            || memory.read::<256>(DATA_OFFSET + id * 256),
+            |b| b.old_memory,
+        );
+        if matches!(
+            args[3].as_str(),
+            "remap" | "compose" | "events" | "pressure"
+        ) {
+            if !pressure && s.initial != r.new_initial {
                 return Err("new entry state changed".into());
             }
             let code = if compose { CODE_NEXT } else { CODE_VA };
@@ -470,17 +540,20 @@ pub fn run(args: &[String]) -> Result<()> {
                 r.dirty_spsr
             );
             new_cells.push(format!("{{\"dirty_fault\":{dirty},\"id\":{id},\"dirty_faults\":{},\"case\":\"{case}\",\"status\":{},\"initial\":{},\"captured\":{},\"memory_base\":{},\"memory_before\":{:?},\"memory_after\":{:?},\"bank_before\":{bank:?},\"bank_after\":{:?},\"object_pc\":{code},\"capture_pc\":{}}}",
-                r.dirty_faults,s.status,frame_json(&r.new_initial),frame_json(&s.captured),DATA_VA+(id*256) as u64,
-                new_data[id],memory.read::<256>(DATA_OFFSET+4096+id*256),memory.read::<512>(base+BANK_OFFSET),s.capture_pc));
+                r.dirty_faults,s.status,frame_json(&r.new_initial),frame_json(second_frame),DATA_VA+(id*256) as u64,
+                new_data[id],second_memory,memory.read::<512>(base+BANK_OFFSET),s.capture_pc));
         }
-        let old_frame = if matches!(args[3].as_str(), "remap" | "compose") {
+        let old_frame = if matches!(
+            args[3].as_str(),
+            "remap" | "compose" | "events" | "pressure"
+        ) {
             &r.first_frame
         } else {
             &s.captured
         };
         cells.push(format!("{{\"id\":{id},\"case\":\"live_load\",\"status\":{},\"initial\":{},\"captured\":{},\"memory_base\":{},\"memory_before\":{data:?},\"memory_after\":{:?},\"bank_before\":{bank:?},\"bank_after\":{:?},\"object_pc\":{CODE_VA},\"capture_pc\":{}}}",
             s.status,frame_json(frame),frame_json(old_frame),DATA_VA+(id*256) as u64,
-            memory.read::<256>(DATA_OFFSET+id*256),memory.read::<512>(base+BANK_OFFSET),s.capture_pc));
+            first_memory,memory.read::<512>(base+BANK_OFFSET),s.capture_pc));
     }
     let trace: Vec<_> = c
         .trace
@@ -500,6 +573,78 @@ pub fn run(args: &[String]) -> Result<()> {
         memory.read::<48>(CODE_OFFSET),
         memory.read::<48>(CODE_OFFSET + 4096)
     );
+    let maintenance = if pressure {
+        Some(unsafe {
+            ptr::read(
+                memory
+                    .0
+                    .add(natemu_abi::maintenance::OFFSET)
+                    .cast::<natemu_abi::maintenance::State>(),
+            )
+        })
+    } else {
+        None
+    };
+    let final_leaf =
+        u64::from_le_bytes(memory.read::<8>(natemu_abi::recovery::TABLE_OFFSET + 0x3000 + 256 * 8));
+    let compose_leaf = maintenance.as_ref().map_or(final_leaf, |m| m.compose_leaf);
+    let maintenance_json = if let Some(m) = maintenance {
+        let mut intervals = Vec::new();
+        for id in 0..n {
+            if m.intervals[id] > natemu_abi::maintenance::MAX_INTERVALS as u64 {
+                return Err("interval reserve exceeded".into());
+            }
+            let state =
+                unsafe { ptr::read(memory.0.add(id * RAM_SIZE + SHARED_OFFSET).cast::<Shared>()) };
+            for index in 0..m.intervals[id] as usize {
+                let r = unsafe {
+                    ptr::read(
+                        memory
+                            .0
+                            .add(
+                                id * RAM_SIZE
+                                    + natemu_abi::maintenance::RECORD_OFFSET
+                                    + index * 4096,
+                            )
+                            .cast::<natemu_abi::maintenance::Interval>(),
+                    )
+                };
+                intervals.push(format!("{{\"id\":{id},\"ordinal\":{},\"heads\":{},\"epoch\":{},\"gpa\":{},\"case\":\"live_or\",\"status\":1,\"initial\":{},\"captured\":{},\"memory_base\":{},\"memory_before\":{:?},\"memory_after\":{:?},\"bank_before\":{:?},\"bank_after\":{:?},\"object_pc\":{CODE_NEXT},\"capture_pc\":{},\"dirty_faults\":{},\"dirty_fault\":{{\"frame\":{},\"esr\":{},\"far\":{},\"pc\":{},\"spsr\":{}}}}}",
+                    r.ordinal,r.heads,r.epoch,r.gpa,frame_json(&r.initial),frame_json(&r.captured),DATA_VA+(id*256) as u64,
+                    r.before,r.after,seeds[id].1,memory.read::<512>(id*RAM_SIZE+BANK_OFFSET),state.capture_pc,
+                    r.faults,frame_json(&r.dirty_frame),r.esr,r.far,r.pc,r.spsr));
+            }
+        }
+        let request_history: Vec<[u64; 2]> = m.request_history[..(m.total as usize).min(36)]
+            .iter()
+            .map(|r| [r.cpu, r.serial])
+            .collect();
+        format!(
+            "{{\"serial\":{},\"request_history\":{request_history:?},\"ready\":{},\"submitted\":{:?},\"completed\":{:?},\"pending\":{:?},\"length\":{},\"current\":[{},{}],\"epoch\":{},\"total\":{},\"batch\":{},\"next_ordinary\":{},\"ordinary\":{},\"ordinary_total\":{},\"interval_counts\":{:?},\"finished\":{},\"duplicate_rejections\":{},\"maximum_depth\":{},\"leaf_history\":{:?},\"leaf_final\":{final_leaf},\"intervals\":[{}]}}",
+            m.serial,
+            m.ready,
+            m.submitted,
+            m.completed,
+            m.pending,
+            m.length,
+            m.current.cpu,
+            m.current.serial,
+            m.epoch,
+            m.total,
+            m.batch,
+            m.next_ordinary,
+            m.ordinary,
+            m.ordinary_total,
+            m.intervals,
+            m.finished,
+            m.duplicate_rejections,
+            m.maximum_depth,
+            &m.leaf_history[..(m.total as usize).min(36)],
+            intervals.join(",")
+        )
+    } else {
+        "null".into()
+    };
     let summary = format!(
         "{{\"generation\":{},\"acknowledgements\":{},\"active\":{},\"new_entries\":{},\"new_completed\":{},\"new_references\":{},\"reclaimed\":{},\"leaf\":{}}}",
         c.generation.load(Ordering::Acquire),
@@ -509,10 +654,11 @@ pub fn run(args: &[String]) -> Result<()> {
         c.new_completed.load(Ordering::Acquire),
         c.new_references.load(Ordering::Acquire),
         c.reclaimed.load(Ordering::Acquire),
-        u64::from_le_bytes(memory.read::<8>(natemu_abi::recovery::TABLE_OFFSET + 0x3000 + 256 * 8))
+        compose_leaf
     );
     println!(
-        "{{\"source\":{source_summary},\"requests\":{requests:?},\"coherence\":{summary},\"new_cells\":[{}],\"profile\":\"i4-{scenario}\",\"trace\":{trace:?},\"faults\":[{}],\"retained\":{},\"configured_vcpus\":{n},\"tested_vcpus\":{n},\"delayed_owner_ms\":{delay},\"ready\":{},\"finished\":{},\"cells\":[{}]}}",
+        "{{\"maintenance\":{maintenance_json},\"events\":[{}],\"source\":{source_summary},\"requests\":{requests:?},\"coherence\":{summary},\"new_cells\":[{}],\"profile\":\"i4-{scenario}\",\"trace\":{trace:?},\"faults\":[{}],\"retained\":{},\"configured_vcpus\":{n},\"tested_vcpus\":{n},\"delayed_owner_ms\":{delay},\"ready\":{},\"finished\":{},\"cells\":[{}]}}",
+        event_records.join(","),
         new_cells.join(","),
         faults.join(","),
         c.retained.load(Ordering::Acquire),

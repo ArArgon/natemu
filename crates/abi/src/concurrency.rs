@@ -9,7 +9,7 @@ pub const COORD_OFFSET: usize = 0x90000;
 pub const COORD_VA: u64 = PRIVATE + COORD_OFFSET as u64;
 pub const ROUND_OFFSET: usize = 0x28000;
 pub const ROUND_VA: u64 = PRIVATE + ROUND_OFFSET as u64;
-pub const TRACE_CAPACITY: usize = 128;
+pub const TRACE_CAPACITY: usize = 512;
 pub const OPEN: u64 = 0;
 pub const CLOSING: u64 = 1;
 pub const EXCLUSIVE: u64 = 2;
@@ -18,6 +18,9 @@ pub const NO_CPU: u64 = u64::MAX;
 pub const COMPILING: u64 = 4;
 pub const DEFER_COMPILE: u64 = 80;
 pub const TAKE_COMPILE: u64 = 81;
+pub const POLL_COMPILE: u64 = 82;
+pub const EVENT_OFFSET: usize = 0x29000;
+pub const EVENT_VA: u64 = PRIVATE + EVENT_OFFSET as u64;
 pub const CODE_NEXT: u64 = crate::CODE_VA + 4096;
 
 pub fn validate_object(object: &Object, frame: &NativeFrame, code: &[u8]) -> Result<(), u64> {
@@ -53,6 +56,7 @@ pub struct Coordinator {
     pub ready: AtomicU64,
     pub finished: AtomicU64,
     pub lock: AtomicU64,
+    pub next_ticket: AtomicU64,
     pub phase: AtomicU64,
     pub active: AtomicU64,
     pub queued: AtomicU64,
@@ -73,6 +77,9 @@ pub struct Coordinator {
     pub stale_replies: AtomicU64,
     pub stale_entries: AtomicU64,
     pub reuse_blocked: AtomicU64,
+    pub translation_wait: AtomicU64,
+    pub event_pending: [AtomicU64; MAX_CPUS],
+    pub event_notifications: [AtomicU64; MAX_CPUS],
     pub trace_length: AtomicU64,
     pub trace: [AtomicU64; TRACE_CAPACITY],
 }
@@ -87,6 +94,7 @@ impl Coordinator {
             ready: AtomicU64::new(0),
             finished: AtomicU64::new(0),
             lock: AtomicU64::new(0),
+            next_ticket: AtomicU64::new(0),
             phase: AtomicU64::new(OPEN),
             active: AtomicU64::new(0),
             queued: AtomicU64::new(0),
@@ -107,12 +115,15 @@ impl Coordinator {
             stale_replies: AtomicU64::new(0),
             stale_entries: AtomicU64::new(0),
             reuse_blocked: AtomicU64::new(0),
+            translation_wait: AtomicU64::new(0),
+            event_pending: [const { AtomicU64::new(0) }; MAX_CPUS],
+            event_notifications: [const { AtomicU64::new(0) }; MAX_CPUS],
             trace_length: AtomicU64::new(0),
             trace: [const { AtomicU64::new(0) }; TRACE_CAPACITY],
         })
     }
 }
-const _: () = assert!(core::mem::size_of::<Coordinator>() <= 4096);
+const _: () = assert!(core::mem::size_of::<Coordinator>() <= 8192);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -156,6 +167,50 @@ impl Round {
 }
 const _: () = assert!(core::mem::size_of::<Round>() <= 4096);
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EventRecord {
+    pub consumed: u64,
+    pub deliveries: u64,
+    pub boundary: u64,
+    pub blocked: u64,
+    pub wait_checks: u64,
+    pub shadow: u64,
+    pub priority: u64,
+    pub packet: crate::recovery::GuestState,
+}
+impl EventRecord {
+    pub fn new(frame: &NativeFrame, id: usize) -> Self {
+        Self {
+            consumed: 0,
+            deliveries: 0,
+            boundary: 0,
+            blocked: 0,
+            wait_checks: 0,
+            shadow: u64::from(id == 1),
+            priority: if id == 2 { 4 } else { 0 },
+            packet: crate::recovery::GuestState::seed(frame),
+        }
+    }
+}
+const _: () = assert!(core::mem::size_of::<EventRecord>() <= 4096);
+
+pub fn event_blockers(
+    phase: u64,
+    active: bool,
+    complete: bool,
+    rflags: u64,
+    shadow: u64,
+    priority: u64,
+) -> u64 {
+    u64::from(phase != OPEN) * 2
+        | u64::from(rflags & 0x200 == 0) * 4
+        | u64::from(shadow != 0) * 8
+        | u64::from(priority >= 4) * 16
+        | u64::from(!complete) * 32
+        | u64::from(active) * 64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +222,19 @@ mod tests {
         for n in 1..=MAX_CPUS {
             assert_eq!(Coordinator::new(n).unwrap().participants, n as u64);
         }
+    }
+    #[test]
+    fn pending_delivery_requires_completed_unmasked_owner() {
+        assert_eq!(event_blockers(OPEN, false, true, 0x202, 0, 0), 0);
+        assert_eq!(
+            event_blockers(CLOSING, true, false, 2, 1, 4),
+            2 | 4 | 8 | 16 | 32 | 64
+        );
+        // Clearing IF or priority alone cannot bypass another delivery gate.
+        assert_eq!(event_blockers(OPEN, false, true, 0x202, 1, 4), 8 | 16);
+        assert_eq!(event_blockers(OPEN, false, true, 0x202, 0, 4), 16);
+        assert_eq!(event_blockers(OPEN, true, true, 0x202, 0, 0), 64);
+        assert_eq!(event_blockers(OPEN, false, false, 0x202, 0, 0), 32);
     }
     #[test]
     fn concurrent_admission_keeps_object_and_operand_guards() {

@@ -6,15 +6,14 @@ use natemu_abi::concurrency::*;
 pub struct Guard<'a>(&'a Coordinator);
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
-        self.0.lock.store(0, Release);
+        self.0.lock.fetch_add(1, Release);
     }
 }
 pub fn lock(c: &Coordinator) -> Guard<'_> {
-    while c
-        .lock
-        .compare_exchange_weak(0, 1, Acquire, Relaxed)
-        .is_err()
-    {
+    // FIFO handoff prevents a hot polling owner from repeatedly overtaking the
+    // peer whose acknowledgement or ordinary interval it is waiting for.
+    let ticket = c.next_ticket.fetch_add(1, Relaxed);
+    while c.lock.load(Acquire) != ticket {
         core::hint::spin_loop();
     }
     Guard(c)
@@ -111,6 +110,29 @@ impl Guard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn contended_waiters_receive_ordered_grants() {
+        let c = Coordinator::new(4).unwrap();
+        std::thread::scope(|scope| {
+            let held = lock(&c);
+            for id in 0..4 {
+                let shared = &c;
+                scope.spawn(move || {
+                    let g = lock(shared);
+                    g.trace(99, id).unwrap();
+                });
+                while c.next_ticket.load(Acquire) != id + 2 {
+                    std::thread::yield_now();
+                }
+            }
+            drop(held);
+        });
+        assert_eq!(c.trace_length.load(Relaxed), 4);
+        for id in 0..4 {
+            assert_eq!(c.trace[id].load(Relaxed), (99 << 8) | id as u64);
+        }
+    }
+
     #[test]
     fn delayed_grant_blocks_service_and_fifo_detaches_once() {
         let c = Coordinator::new(4).unwrap();

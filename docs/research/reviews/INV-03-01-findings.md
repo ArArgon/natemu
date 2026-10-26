@@ -1,6 +1,45 @@
 # INV-03-01 — source findings review
 
-## Current partial I4 return — October 26, 2026 UTC
+## Current return — I4 concurrent composition, October 26, 2026 UTC
+
+Root authored runtime/host integration. Independent `/root/i4_contract_review`
+reviewed coordination and wrote the FIFO/state/effect oracles; separate
+`/root/i4_events_review` checked pending-event semantics and its retained native
+results. Fresh `/root/i4_final_review` reviewed the complete implementation and
+oracles without authoring execution changes, then performed independent rebuilds.
+**ACCEPT finite I4 completion; no substantive blockers remain.**
+
+**Evidence validity:** full retained `i4-independent-20261026-01` passes87 jobs,
+including all I1–I3 regressions,21 Rust tests,113 I4 corruption controls and every
+I4 profile at N=1/2/3/4. Reviewer and root verified2119 checksums and67 exact source
+inputs. Reviewer independently rechecked40 producer-backed cells and67 compiler
+associations, including36 I4 associations. Pressure completes9/18/27/36 actual
+PTE mutations and2/3/4/5 generated ordinary intervals with FIFO identities,
+all-participant acknowledgements, dirty retry during closure and final reference
+release. An entry-only fresh rebuild passes34 jobs and766 checksums without FEX
+inputs. Both runs leave no compiler containers.
+
+Review corrected incomplete snapshot dependencies and added an isolated retained
+import test. Initial pressure run01's four-CPU100-second deadline failure remains
+retained. Ordered ticket handoff fixes overtaking by hot polling owners; a
+contended-grant test checks the order. Primary run02 and the independent replica
+then pass pressure cells in about one second with unchanged deadlines. Those
+elapsed times are diagnostics, not a qualified performance claim. The final
+emitted stack audit bounds the largest inspected chain to15040/16384 bytes after
+moving baseline temporaries out of the live dispatch chain.
+
+**Decision relevance:** evidence satisfies the I4 row and configured-N composition
+requirements in the implementation plan, as mapped in INV-03-01's completion
+audit. No whole-ABI, whole-emulator or generator-selection conclusion follows.
+Broad memory-ordering conformance, arbitrary programs, native IRQ/forced-exit
+architectural delivery, sleeping waits, full APIC/IDT, boot and larger-N scaling
+remain explicit later work. I4-V remains a separate bounded deep validation pass.
+The event fixture changes its controls explicitly; it does not claim x86 shadow
+expiry. Queue saturation plus duplicate rejection does not cover a separately
+reachable FULL branch. Only result/setup documentation changed after replication.
+
+
+## Intermediate I4 return — October 26, 2026 UTC
 
 Root authored per-vCPU host/runtime integration and coordinator/source paths.
 Independent `/root/i4_contract_review` reviewed contracts/code and authored

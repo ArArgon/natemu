@@ -3,7 +3,7 @@
 Grow one working emulator through bounded, tested increments. The owner decisions
 of October 25, 2026 are: Rust for most new code, host-side FEX first, ABI and
 producer/runtime development together, early performance feedback, and configurable
-N-vCPU design with progressively wider tests. These are implementation directions. I1–I3 now have finite working paths; this
+N-vCPU design with progressively wider tests. These are implementation directions. I1–I4 now have independently reproduced finite working paths; this
 does not establish general correctness or superiority over QEMU.
 
 This is the implementation order and setup entry point. The
@@ -381,6 +381,51 @@ code/route changes during retained operations, concurrent composition, complete
 FP/x87 semantics, guest exception delivery, boot and workload performance remain
 open. These finite I3 checks do not complete the full ABI milestone or Track03.
 
+### I4 concurrent composition
+
+Run the complete finite I4 matrix with all I1–I3 regressions:
+
+```sh
+./tools/with-env python3 -B tools/run_i1.py \
+  --name "i4-local-$(date +%Y%m%d-%H%M%S)" \
+  --fragment ../natemu-raw/i1-fex-fragment-20261025-02/live_load.arm64 \
+  --producer ../natemu-raw/i3-independent-20261025-01/CodeSizeValidation \
+  --allocated-producer ../natemu-raw/i3-independent-20261025-01/AllocatedCodeSizeValidation \
+  --i4-pressure --i3-allocated
+```
+
+`--i4-pressure` includes entry, queued faults, remap, live source publication and
+pending-event profiles at N=1/2/3/4. Smaller `--i4-entry`, `--i4-faults`,
+`--i4-remap`, `--i4-compose` and `--i4-events` options retain earlier applicable
+profiles. The legacy I1–I3 profiles still admit only N=1; I4 rejects N=0/5 before
+creating the VM. Host/API admission and per-owner backing precede execution.
+
+The pressure profile performs nine protected page-table changes per CPU. Every
+head receives all local invalidation acknowledgements before completion or slot
+reuse; one rotating peer acknowledges last. At most eight heads precede a real
+ordinary FEX interval, granted round-robin to an owner with no pending operation.
+Dirty-fault repair completes that admitted route while closure waits. Duplicate
+requests at full occupancy preserve the original FIFO identities. This tests
+saturation and duplicate rejection, not an independent reachable `FULL` branch.
+
+One resident coordinator serializes maintenance. Ordered ticket handoff prevents
+hot polling owners from overtaking waiting peers. Source mutation, stale replies,
+new entry and delayed old-reference release share that authority. Code reuse is
+checked before overwriting the retired slot. Event tests use a durable identified
+level request with repeated notifications, IF/shadow/priority eligibility and
+canonical handoff; fixture control changes do not implement architectural shadow
+expiry. Tests verify actual generated-code effects and precise captured frames.
+
+**Finite limits:** four admitted CPUs, 1MiB backing per CPU, two shared code slots,
+one outstanding maintenance request per CPU, 512 trace records, four recorded
+pressure intervals per CPU and 16KiB native stacks. Compiler-backed scenarios
+retain a 120-second supervisor bound and a 100-second host cancellation deadline.
+Native IRQ/forced-exit delivery, sleeping waits, full APIC/IDT delivery, arbitrary
+concurrent guest programs, broad memory-ordering conformance and larger-N scaling
+remain later work. I4-V deepens integrated validation before dependent boot work.
+The runner's increment-check flag reports execution coverage; independent review
+and acceptance remain recorded in INV-03-01.
+
 Use `./tools/with-env COMMAND ...` for project builds, checks and runs. It supplies
 the durable sibling `../natemu-raw` as `NATEMU_RAW_ROOT`, independently of the
 caller's working directory, and preserves a nonempty explicit override. It
@@ -417,17 +462,16 @@ working route during I2; do not postpone the producer loop until the ABI is comp
 
 ## Next assignment and reporting
 
-I4 is active under the bound in INV-03-01. Its finite development profiles now
-exercise per-vCPU state/stacks, queued native faults, one shared remap/shootdown,
-live source invalidation/publication and retained references at N=1/2/3/4.
-Next add durable eligible pending events, sustained fairness/capacity and the
-remaining combined adverse schedules, then independent final review/rebuild.
-Keep I1–I3 as regressions with their separate N=1 admission. The new finite
-profiles do not admit arbitrary concurrent guest code or complete I4. Final
-generator selection and boot are not prerequisites to this work.
-Follow I4 with the [I4-V validation pass](#post-i4-integrated-validation), adapting
-existing tests and adding integrated adversarial cases while independent I5 work
-can proceed. This is planned work; no additional test coverage is claimed yet.
+I4 is complete within its declared finite N=1/2/3/4 profiles, with independent
+review and a fresh87-job rebuild including all I1–I3 regressions. The
+[completion audit](research/investigations/INV-03-01.md#i4-completed-development-increment--october-26-2026-utc)
+records exact evidence and unsupported behavior. Keep legacy I1–I3 N=1 profiles
+separate; arbitrary concurrent guest code and the full ABI remain unestablished.
+
+Next is the [I4-V validation pass](#post-i4-integrated-validation): select its
+coverage and execution bound, adapt existing tests and add integrated adversarial
+cases. Independent I5 preparation can proceed. I4-V is planned work; its additional
+test coverage has not yet been collected.
 
 For each increment record implemented behavior, passed/failed/untested checks,
 tested N, material interface changes, measurements with qualification, and the

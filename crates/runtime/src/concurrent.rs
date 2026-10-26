@@ -2,6 +2,8 @@ use super::*;
 use core::sync::atomic::Ordering;
 use natemu_abi::concurrency::*;
 use natemu_abi::paging::Access;
+mod events;
+mod maintenance;
 mod source;
 
 unsafe extern "C" {
@@ -32,11 +34,20 @@ pub unsafe fn initialize() -> ! {
             stop(REJECTED, 80);
         }
         let mut frame = read_record(&raw const (*s).initial);
-        if c.scenario == 3 {
+        if c.scenario >= 3 {
             if o.vcpu_id == 0 {
                 source::initialize();
             }
+            if c.scenario >= 4 && o.vcpu_id as u64 == c.participants - 1 && o.vcpu_id != 0 {
+                while c.translation_wait.load(Ordering::Acquire) == 0 {
+                    asm!("yield", options(nomem, nostack));
+                }
+                events::post_all(18);
+            }
             while c.published.load(Ordering::Acquire) == 0 {
+                if c.scenario >= 4 {
+                    events::wait_check();
+                }
                 asm!("yield", options(nomem, nostack));
             }
         }
@@ -54,6 +65,9 @@ pub unsafe fn initialize() -> ! {
         if c.scenario >= 1 {
             recovery::initialize();
             let guard = coordinator::lock(c);
+            if c.scenario >= 4 {
+                events::initial_boundary(&guard, o.vcpu_id as u64);
+            }
             let route =
                 recovery::walk(frame.x[6], Access::Read).unwrap_or_else(|_| stop(PANIC, 94));
             ptr::write_volatile(&raw mut (*round()).old_gpa, route.gpa);
@@ -97,6 +111,9 @@ unsafe fn queued(fault: u64) -> ! {
         let c = coordinator();
         let s = shared();
         let id = ptr::read_volatile(&raw const (*s).object.vcpu_id) as u64;
+        if ptr::read_volatile(&raw const (*round()).stage) == 3 {
+            maintenance::finish(fault);
+        }
         if ptr::read_volatile(&raw const (*round()).stage) == 2 {
             new_completed(fault);
         }
@@ -126,6 +143,9 @@ unsafe fn queued(fault: u64) -> ! {
             {
                 let g = coordinator::lock(c);
                 checked(g.detach_fault(id));
+                if c.scenario >= 4 {
+                    events::attempt(&g, id, 0);
+                }
             }
             loop {
                 let selected = {
@@ -153,11 +173,17 @@ unsafe fn queued(fault: u64) -> ! {
             &raw mut (*round()).first_frame,
             read_record(&raw const (*s).captured),
         );
+        if c.scenario >= 4 {
+            events::materialize(&read_record(&raw const (*s).captured));
+        }
         ptr::write_volatile(&raw mut (*round()).stage, 1);
         asm!("dsb ish");
         {
             let g = coordinator::lock(c);
             checked(g.complete(id));
+            if c.scenario >= 4 {
+                events::attempt(&g, id, 1);
+            }
         }
         if c.scenario >= 2 {
             remap_wait(id);
@@ -194,7 +220,7 @@ unsafe fn remap_wait(id: u64) -> ! {
                 let g = coordinator::lock(c);
                 if c.phase.load(Ordering::Relaxed) == EXCLUSIVE
                     && c.completed.load(Ordering::Relaxed) == all
-                    && (c.scenario != 3 || id == 0)
+                    && (c.scenario < 3 || id == 0)
                 {
                     ptr::write_volatile(
                         (PRIVATE + natemu_abi::recovery::TABLE_OFFSET as u64 + 0x3000 + 256 * 8)
@@ -203,7 +229,7 @@ unsafe fn remap_wait(id: u64) -> ! {
                     );
                     asm!("dsb ish");
                     c.generation.store(2, Ordering::Relaxed);
-                    if c.scenario == 3 {
+                    if c.scenario >= 3 {
                         source::invalidate();
                         c.phase.store(COMPILING, Ordering::Relaxed);
                     } else {
@@ -233,7 +259,7 @@ unsafe fn remap_wait(id: u64) -> ! {
                 }
                 c.phase.load(Ordering::Relaxed) == OPEN
             };
-            if c.scenario == 3 && id == 0 && c.phase.load(Ordering::Acquire) == COMPILING {
+            if c.scenario >= 3 && id == 0 && c.phase.load(Ordering::Acquire) == COMPILING {
                 source::replacement();
             }
             if open {
@@ -255,7 +281,7 @@ unsafe fn remap_wait(id: u64) -> ! {
             {
                 stop(PANIC, 100);
             }
-            if c.scenario == 3 {
+            if c.scenario >= 3 {
                 if source::eligible(1, CODE_VA) || !source::eligible(2, CODE_NEXT) {
                     stop(PANIC, 116);
                 }
@@ -271,13 +297,16 @@ unsafe fn remap_wait(id: u64) -> ! {
             c.retained.fetch_and(!bit, Ordering::Relaxed);
             checked(g.trace(6, id));
             if c.retained.load(Ordering::Relaxed) == 0 {
-                if c.scenario == 3 {
+                if c.scenario >= 3 {
                     if !source::try_reuse_old(&g) {
                         stop(PANIC, 119);
                     }
                 }
                 c.reclaimed.store(1, Ordering::Relaxed);
                 checked(g.trace(14, id));
+            }
+            if c.scenario >= 4 {
+                events::attempt(&g, id, 1);
             }
             c.active.fetch_or(bit, Ordering::Relaxed);
             c.new_references.fetch_or(bit, Ordering::Relaxed);
@@ -286,11 +315,11 @@ unsafe fn remap_wait(id: u64) -> ! {
         }
         let s = shared();
         let mut frame = read_record(&raw const (*s).captured);
-        frame.x[16] = if c.scenario == 3 { CODE_NEXT } else { CODE_VA };
+        frame.x[16] = if c.scenario >= 3 { CODE_NEXT } else { CODE_VA };
         frame.x[30] = returned as *const () as u64;
         frame.sp = STACK_TOP;
         let mut object = ptr::read_volatile(&raw const (*s).object);
-        object.kind = if c.scenario == 3 { LIVE_OR } else { LIVE_LOAD };
+        object.kind = if c.scenario >= 3 { LIVE_OR } else { LIVE_LOAD };
         object.code_address = frame.x[16];
         checked(validate_object(
             &object,
@@ -317,7 +346,7 @@ unsafe fn new_completed(fault: u64) -> ! {
             if esr >> 26 != 0x25
                 || esr & (1 << 6) == 0
                 || !matches!(esr & 63, 12..=15)
-                || pc != (if c.scenario == 3 { CODE_NEXT } else { CODE_VA }) + 36
+                || pc != (if c.scenario >= 3 { CODE_NEXT } else { CODE_VA }) + 36
                 || far != DATA_VA + id * 256 + 128
                 || spsr & 15 != 4
                 || ptr::read_volatile(&raw const (*round()).dirty_faults) != 0
@@ -341,6 +370,9 @@ unsafe fn new_completed(fault: u64) -> ! {
                 }
                 let t = recovery::walk(far, Access::Write).unwrap_or_else(|_| stop(PANIC, 103));
                 checked(g.trace(15, id));
+                if c.scenario >= 4 {
+                    events::attempt(&g, id, 0);
+                }
                 t
             };
             if route.gpa != far + 4096 {
@@ -349,6 +381,9 @@ unsafe fn new_completed(fault: u64) -> ! {
             recovery::install(far, route);
             ptr::write_volatile(&raw mut (*round()).dirty_faults, 1);
             resume_exception(&raw const (*s).captured, pc, spsr);
+        }
+        if c.scenario >= 4 {
+            events::materialize(&read_record(&raw const (*s).captured));
         }
         asm!("dsb ish");
         {
@@ -360,6 +395,14 @@ unsafe fn new_completed(fault: u64) -> ! {
             c.new_references.fetch_and(!(1 << id), Ordering::Relaxed);
             c.new_completed.fetch_or(1 << id, Ordering::Relaxed);
             checked(g.trace(12, id));
+            if c.scenario >= 4 {
+                events::clear_fixture_controls();
+                checked(g.trace(21, id));
+                events::attempt(&g, id, 2);
+            }
+        }
+        if c.scenario >= 5 {
+            maintenance::start(id);
         }
         c.finished.fetch_or(1 << id, Ordering::Release);
         stop(SUCCESS, 0)

@@ -11,7 +11,14 @@ and accepted for owner delivery as a provisional design/method proposal on
 September 28, 2026; the subsequent paging amendment also passed focused review.
 I1–I3 now implement finite Rust/assembly entry/capture, admission, actual FEX
 requests, publication/cancellation, allocated recovery, paging, helpers and
-partial/FP paths. Exploratory development results are
+partial/FP paths. I4 adds finite N=1/2/3/4 concurrent faults, remap/source
+publication, pending-event handoff and sustained maintenance profiles; independent
+completion review is recorded in INV-03-01. These use one resident coordinator
+with ordered ticket handoff, real FEX execution between at most eight protected
+heads, all-participant invalidation acknowledgements and guarded retained-code
+reuse. Event input is an identified level-request fixture, not native IRQ or full
+APIC/IDT delivery. The [I4 setup/profile](../../implementation.md#i4-concurrent-composition)
+records capacity and unsupported behavior. Exploratory development results are
 recorded in INV-03-01. The full
 ABI below remains provisional and unimplemented outside that scope. The original
 review accepts a concrete experimental design, not full runtime conformance.

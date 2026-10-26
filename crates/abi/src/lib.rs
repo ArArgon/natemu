@@ -34,6 +34,7 @@ pub const FEX_OR_BODY: [u8; 44] = {
     body
 };
 pub mod concurrency;
+pub mod maintenance;
 pub mod paging;
 pub mod pressure;
 pub mod recovery;

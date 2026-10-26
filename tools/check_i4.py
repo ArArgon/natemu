@@ -2,13 +2,14 @@
 """Independent oracle for finite I4 entry, faults, remapping and code retirement.
 
 Checks the externally declared participant set and per-participant seed vectors,
-then reuses I1's instruction semantics checker. This is entry/state isolation
+then reuses I1's instruction semantics checker for entry/state isolation.
 The faults profile additionally checks exact pre-load state and an independent
 ownership/FIFO trace model. Remapping additionally checks old/new memory effects,
 per-owner invalidation acknowledgements and retained-route release ordering.
 Composition additionally checks live compiler identities, source replacement,
-stale entry/reuse rejection and the retired code bytes. These profiles do not
-establish fairness or event delivery.
+stale entry/reuse rejection and the retired code bytes. Events adds one identified
+level request per CPU, coalesced notifications, eligibility and canonical handoff.
+It does not establish native IRQ arrival, sleeping waits, IDT/APIC delivery or fairness.
 """
 
 import argparse
@@ -58,7 +59,10 @@ def seed(cpu):
 
 def check(record, expected_vcpus=None, expected_delay=None, expected_profile=None):
     require(type(record) is dict, "expected one I4 result object")
-    require(record["profile"] in ("i4-entry", "i4-faults", "i4-remap", "i4-compose"), "unknown I4 profile")
+    if record.get("profile") == "i4-pressure":
+        from check_i4_pressure import check as check_pressure
+        return check_pressure(record, expected_vcpus, expected_delay, expected_profile)
+    require(record["profile"] in ("i4-entry", "i4-faults", "i4-remap", "i4-compose", "i4-events"), "unknown I4 profile")
     if expected_profile is not None:
         equal(record["profile"], expected_profile, "requested I4 profile")
     n = uint(record["configured_vcpus"], 32, "configured_vcpus")
@@ -95,10 +99,12 @@ def check(record, expected_vcpus=None, expected_delay=None, expected_profile=Non
     equal(seen, set(range(n)), "participant set")
     if record["profile"] != "i4-entry":
         check_faults(record, n)
-        if record["profile"] in ("i4-remap", "i4-compose"):
+        if record["profile"] in ("i4-remap", "i4-compose", "i4-events"):
             check_remap(record, n)
-        if record["profile"] == "i4-compose":
+        if record["profile"] in ("i4-compose", "i4-events"):
             check_source(record, n)
+        if record["profile"] == "i4-events":
+            check_events(record, n)
     else:
         for field, expected in (("trace", []), ("faults", []), ("retained", 0)):
             if field in record:
@@ -146,11 +152,11 @@ def check_faults(record, n):
         equal(spsr & 0x3DF, 0x3C4, "fault SPSR masked EL1t")
     equal(seen, set(range(n)), "fault participant set")
     equal(uint(record["retained"], 64, "retained"), 0, "all references released")
-    check_fault_trace(record["trace"], n, record["profile"] in ("i4-remap", "i4-compose"),
-                      record["profile"] == "i4-compose")
+    check_fault_trace(record["trace"], n, record["profile"] in ("i4-remap", "i4-compose", "i4-events"),
+                      record["profile"] in ("i4-compose", "i4-events"), record["profile"] == "i4-events")
 
 
-def check_fault_trace(trace, n, remap=False, compose=False):
+def check_fault_trace(trace, n, remap=False, compose=False, events=False):
     """Model ownership as sets and FIFO history, independently of runtime fields."""
     require(type(trace) is list and 0 < len(trace) <= 128, "bounded nonempty fault trace")
     admitted, active, retained, detached, completed, released = (set() for _ in range(6))
@@ -163,11 +169,45 @@ def check_fault_trace(trace, n, remap=False, compose=False):
     last_release = None
     published = False
     rejected = set()
+    posted, renotified, delivered, cleared, shadow_cleared = (set() for _ in range(5))
     for word in trace:
         uint(word, 64, "trace word")
         event, cpu = word >> 8, word & 255
         require(cpu < n, "trace participant outside admitted set")
-        if event == 1:
+        if events and event == 18:
+            require(phase == "open" and not admitted and cpu not in posted,
+                    "initial event must arrive before admission, once per CPU")
+            posted.add(cpu)
+        elif events and event == 19:
+            require(phase == "compiling" and cpu in posted and cpu not in renotified,
+                    "repeated notification must occur during stopped replacement compilation")
+            renotified.add(cpu)
+        elif events and event == 20:
+            require(cpu in posted and cpu not in delivered and cpu not in active,
+                    "event delivery without request, duplicated or during active execution")
+            if cpu in (1, 3):
+                require(phase == "open" and cpu not in admitted,
+                        "initially eligible event must precede first native entry")
+                if cpu == 1:
+                    require(cpu in shadow_cleared, "delivery while fixture shadow is set")
+            else:
+                require(phase == "reopened" and cpu in new_completed and cpu in cleared,
+                        "IF/priority-blocked event delivered before final boundary/control clear")
+            delivered.add(cpu)
+        elif events and event == 21:
+            require(cpu in new_completed and cpu not in cleared,
+                    "fixture controls cleared before completion or twice")
+            cleared.add(cpu)
+        elif events and event == 22:
+            require(cpu == 1 and phase == "open" and cpu not in admitted
+                    and cpu not in delivered and cpu not in shadow_cleared,
+                    "fixture shadow must clear once before any guest instruction")
+            shadow_cleared.add(cpu)
+        elif event == 1:
+            if events:
+                equal(posted, set(range(n)), "all initial requests precede admission")
+                if cpu in (1, 3):
+                    require(cpu in delivered, "guest entry skipped eligible initial event")
             require(phase == "open" and cpu not in admitted, "invalid or duplicate admission")
             admitted.add(cpu)
             active.add(cpu)
@@ -254,6 +294,8 @@ def check_fault_trace(trace, n, remap=False, compose=False):
         elif compose and event == 16:
             require(cpu == 0 and phase == "compiling" and not published,
                     "replacement publication outside stopped mutation or duplicated")
+            if events:
+                equal(renotified, set(range(n)), "all repeated notifications precede publication")
             published = True
             phase = "invalidating"
         elif compose and event == 17:
@@ -274,6 +316,13 @@ def check_fault_trace(trace, n, remap=False, compose=False):
     if compose:
         require(published, "replacement code never published")
         equal(rejected, set(range(n)), "all stale target/reuse attempts rejected")
+
+    if events:
+        equal(posted, set(range(n)), "one initial event per CPU")
+        equal(renotified, set(range(n)), "one repeated notification per CPU")
+        equal(delivered, set(range(n)), "one canonical event handoff per CPU")
+        equal(cleared, set(range(n)), "all fixture controls cleared")
+        equal(shadow_cleared, {1} if n > 1 else set(), "fixture shadow clear")
 
 
 def replacement_seed(cpu):
@@ -300,7 +349,7 @@ def store_fault_frame(initial, memory, use_or=False):
 
 
 def check_remap(record, n):
-    compose = record["profile"] == "i4-compose"
+    compose = record["profile"] in ("i4-compose", "i4-events")
     code = CODE_NEXT if compose else CODE
     old_cells = {cell["id"]: cell for cell in record["cells"]}
     new_cells = record["new_cells"]
@@ -378,6 +427,54 @@ def check_source(record, n):
     require(vm != 0, "compiler requests need nonzero VM identity")
     for i, (actual, expected) in enumerate(zip(requests, compiler_requests(vm))):
         equal(actual, expected, f"request[{i}] identity/source/sequence")
+
+
+def event_packet(cpu):
+    """Independent canonical state from declared inputs and x86 arithmetic.
+
+    Reuse the earlier preservation oracle, never a reported packet/native result.
+    Initial boundary3 precedes all instructions; boundary2 follows both bodies.
+    """
+    from check_i3_paging import copy_live, guest_seed
+    guest = guest_seed("cold")
+    initial, _, memory = seed(cpu)
+    if cpu in (1, 3):
+        copy_live(guest, initial)
+        return guest
+    old = store_fault_frame(initial, memory)
+    new = store_fault_frame(old, replacement_seed(cpu), True)
+    copy_live(guest, new)
+    _, flags = add_flags(old["x"][7], old["x"][5])
+    guest["rflags"] = 0x202 | sum(flags[name] << bit for name, bit in
+        (("CF", 0), ("PF", 2), ("AF", 4), ("ZF", 6), ("SF", 7), ("OF", 11)))
+    guest["rip"] = DATA + 8192 + 17
+    return guest
+
+
+def check_events(record, n):
+    from check_i3_paging import exact
+    events = record["events"]
+    require(type(events) is list and len(events) == n, "one event result per participant")
+    seen = set()
+    for event in events:
+        cpu = uint(event["id"], 32, "event participant")
+        require(cpu < n and cpu not in seen, "duplicate or unconfigured event participant")
+        seen.add(cpu)
+        for field, expected in {"pending": 0, "token_state": 2, "notifications": 2,
+                                "consumed": 1, "deliveries": 1, "shadow": 0, "priority": 0,
+                                "vector": 64 + cpu,
+                                "boundary": 3 if cpu in (1, 3) else 2}.items():
+            equal(uint(event[field], 64, field), expected, f"CPU{cpu} event {field}")
+        waits = uint(event["wait_checks"], 64, "wait checks")
+        if cpu == 0:
+            require(waits > 0, "compiler owner must recheck pending events while waiting")
+        # CPU0/2 remain pending through closure, incomplete faults and active
+        # second-body execution. CPU1/3 consume before any native instruction.
+        expected_blocked = [2 | 4 | 32 | 64, 8, 2 | 16 | 32 | 64, 0][cpu]
+        equal(uint(event["blocked"], 64, "blocked"), expected_blocked | int(waits > 0),
+              f"CPU{cpu} exact eligibility/wait blockers")
+        exact(event["packet"], event_packet(cpu), f"CPU{cpu} canonical event packet")
+    equal(seen, set(range(n)), "event participant set")
 
 
 def known_result(n, delay):
@@ -492,12 +589,42 @@ def known_remap_result(n, delay, compose=False):
     return record
 
 
+def known_events_result(n, delay):
+    record = known_remap_result(n, delay, True)
+    record["profile"] = "i4-events"
+    trace = [(18 << 8) | cpu for cpu in range(n)]
+    for word in record["trace"]:
+        event, cpu = word >> 8, word & 255
+        if event == 1 and cpu in (1, 3):
+            if cpu == 1:
+                trace.append((22 << 8) | cpu)
+            trace.append((20 << 8) | cpu)
+        trace.append(word)
+        if event == 8:
+            trace += [(19 << 8) | peer for peer in range(n)]
+        if event == 12:
+            trace.append((21 << 8) | cpu)
+            if cpu in (0, 2):
+                trace.append((20 << 8) | cpu)
+    record["trace"] = trace
+    record["events"] = [{"id": cpu, "pending": 0, "token_state": 2, "notifications": 2,
+                         "consumed": 1, "deliveries": 1, "shadow": 0, "priority": 0,
+                         "vector": 64 + cpu, "boundary": 3 if cpu in (1, 3) else 2,
+                         "wait_checks": int(cpu == 0),
+                         "blocked": [103, 8, 114, 0][cpu], "packet": event_packet(cpu)}
+                        for cpu in range(n)]
+    return record
+
+
 def self_test():
+    from check_i4_pressure import self_test as pressure_self_test
+    pressure_self_test()
     for n in range(1, 5):
         check(known_result(n, 25), n, 25)
         check(known_fault_result(n, 25), n, 25)
         check(known_remap_result(n, 25), n, 25)
         check(known_remap_result(n, 25, True), n, 25)
+        check(known_events_result(n, 25), n, 25)
     for cpu, flags in enumerate((0x40000000, 0x60000000, 0x90000000, 0)):
         equal(load_fault_frame(cpu, PRIVATE + 0x400)["nzcv"], flags,
               "known pre-CFINV carry representation")
@@ -610,8 +737,46 @@ def self_test():
         except (ValueError, KeyError, TypeError):
             continue
         raise ValueError("accepted corruption: " + label)
-    controls = len(mutations) + len(fault_mutations) + len(remap_mutations) + len(compose_mutations)
-    print(f"PASS: N=1/2/3/4 entry/fault/remap/compose answers; {controls} corruption controls")
+    original = known_events_result(4, 25)
+    event_mutations = [
+        ("missing event result", lambda r: r["events"].pop()),
+        ("duplicate event CPU", lambda r: r["events"][1].__setitem__("id", 0)),
+        ("pending request lost", lambda r: r["events"][0].__setitem__("consumed", 0)),
+        ("duplicate delivery", lambda r: r["events"][0].__setitem__("deliveries", 2)),
+        ("rearmed consumed request", lambda r: r["events"][1].__setitem__("token_state", 1)),
+        ("missing renotification", lambda r: r["events"][3].__setitem__("notifications", 1)),
+        ("no compiler wait recheck", lambda r: r["events"][0].__setitem__("wait_checks", 0)),
+        ("missing IF gate", lambda r: r["events"][0].__setitem__("blocked", 99)),
+        ("missing shadow gate", lambda r: r["events"][1].__setitem__("blocked", 0)),
+        ("missing priority gate", lambda r: r["events"][2].__setitem__("blocked", 98)),
+        ("wrong boundary", lambda r: r["events"][3].__setitem__("boundary", 1)),
+        ("wrong vector", lambda r: r["events"][2].__setitem__("vector", 64)),
+        ("stale canonical GPR", lambda r: r["events"][0]["packet"]["gpr"].__setitem__(0, 0)),
+        ("stale arithmetic flags", lambda r: r["events"][2]["packet"].__setitem__("rflags", 0x202)),
+        ("wrong initial RIP", lambda r: r["events"][3]["packet"].__setitem__("rip", DATA + 8192 + 17)),
+        ("lost preserved upper YMM", lambda r: r["events"][0]["packet"]["ymm"][0].__setitem__(31, 0)),
+        ("lost x87", lambda r: r["events"][0]["packet"]["x87_regs"][7].__setitem__(9, 0)),
+        ("lost segment state", lambda r: r["events"][0]["packet"]["segments"][0].__setitem__(3, 0)),
+        ("lost control state", lambda r: r["events"][0]["packet"]["control"].__setitem__(2, 0)),
+        ("bool-as-integer packet", lambda r: r["events"][0]["packet"].__setitem__("reserved", False)),
+        ("request unposted", lambda r: r["trace"].remove(18 << 8)),
+        ("renotify outside compilation", lambda r: r["trace"].insert(0, 19 << 8)),
+        ("initial eligible event skipped", lambda r: r["trace"].remove((20 << 8) | 3)),
+        ("duplicate delivery trace", lambda r: r["trace"].append(20 << 8)),
+        ("IF event delivered before completion", lambda r: r["trace"].insert(4, 20 << 8)),
+        ("fixture shadow not cleared", lambda r: r["trace"].remove((22 << 8) | 1)),
+        ("early fixture control clear", lambda r: r["trace"].insert(4, 21 << 8)),
+    ]
+    for label, mutate in event_mutations:
+        bad = copy.deepcopy(original)
+        mutate(bad)
+        try:
+            check(bad, 4, 25)
+        except (ValueError, KeyError, TypeError):
+            continue
+        raise ValueError("accepted corruption: " + label)
+    controls = len(event_mutations) + len(mutations) + len(fault_mutations) + len(remap_mutations) + len(compose_mutations)
+    print(f"PASS: N=1/2/3/4 entry/fault/remap/compose/events answers; {controls} corruption controls")
 
 
 def main():
@@ -619,7 +784,7 @@ def main():
     parser.add_argument("paths", nargs="*", type=Path)
     parser.add_argument("--vcpus", type=int)
     parser.add_argument("--delay-ms", type=int)
-    parser.add_argument("--profile", choices=("i4-entry", "i4-faults", "i4-remap", "i4-compose"))
+    parser.add_argument("--profile", choices=("i4-entry", "i4-faults", "i4-remap", "i4-compose", "i4-events", "i4-pressure"))
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if not args.paths and not args.self_test:

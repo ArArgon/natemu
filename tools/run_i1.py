@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Snapshot, build and check the growing runtime (I1/I2 and finite I3 profiles)."""
+"""Snapshot, build and check the growing runtime (I1–I4 finite profiles)."""
 import argparse
 import hashlib
 import importlib.util
@@ -20,6 +20,23 @@ def module(path, name):
     result = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(result)
     return result
+
+
+def snapshot_inputs(args):
+    names = ('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo', 'crates', 'fixtures/i1',
+                 'tools/run_i1.py', 'tools/check_i1.py', 'tools/test_run_i1.py', 'experiments/track01/source/run.py',
+                 'experiments/track01/run_check.py')
+    if args.i2:
+        names += ('tools/fex_worker.py','tools/test_fex_worker.py')
+    if args.i2 or args.i4_entry:
+        names += ('tools/check_i2.py',)
+    if args.i3_paging or args.i4_entry:
+        names += ('tools/check_i3_paging.py',)
+    if args.i3_allocated:
+        names += ('tools/i3_worker.py','tools/i3_producer','tools/check_i3_pressure.py')
+    if args.i4_entry:
+        names += ('tools/check_i4.py','tools/check_i4_pressure.py')
+    return names
 
 
 def worker(job_path):
@@ -59,6 +76,8 @@ def main():
     parser.add_argument('--i4-entry', action='store_true', help='also test concurrent entry at N=1/2/3/4 (not full I4)')
     parser.add_argument('--i4-faults', action='store_true', help='also test detached native fault queues (not full I4)')
     parser.add_argument('--i4-remap', action='store_true', help='also test concurrent guest remap and local shootdown acknowledgements (not full I4)')
+    parser.add_argument('--i4-pressure', action='store_true', help='also test repeated protected writes, bounded queues and real ordinary-work fairness')
+    parser.add_argument('--i4-events', action='store_true', help='also test durable pending events during concurrent compile/drain (not full I4)')
     parser.add_argument('--i4-compose', action='store_true', help='also test live source invalidation/publication with retained references (not full I4)')
     parser.add_argument('--allocated-producer',type=Path,help='pinned pressure-map CodeSizeValidation')
     parser.add_argument('--i3-paging', action='store_true', help='also test the initial I3 paging subset (not full I3)')
@@ -66,6 +85,8 @@ def main():
     parser.add_argument('--producer', type=Path, help='pinned CodeSizeValidation binary for I2')
     parser.add_argument('--worker', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    args.i4_events = args.i4_events or args.i4_pressure
+    args.i4_compose = args.i4_compose or args.i4_events
     args.i4_remap = args.i4_remap or args.i4_compose
     args.i4_faults = args.i4_faults or args.i4_remap
     args.i4_entry = args.i4_entry or args.i4_faults
@@ -106,17 +127,7 @@ def main():
         origin = (args.snapshot or REPO).resolve()
         source = run / 'source'
         source.mkdir()
-        names = ('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo', 'crates', 'fixtures/i1',
-                     'tools/run_i1.py', 'tools/check_i1.py', 'tools/test_run_i1.py', 'experiments/track01/source/run.py',
-                     'experiments/track01/run_check.py')
-        if args.i2:
-            names += ('tools/check_i2.py','tools/fex_worker.py','tools/test_fex_worker.py')
-        if args.i3_paging:
-            names += ('tools/check_i3_paging.py',)
-        if args.i3_allocated:
-            names += ('tools/i3_worker.py','tools/i3_producer','tools/check_i3_pressure.py')
-        if args.i4_entry:
-            names += ('tools/check_i4.py',)
+        names = snapshot_inputs(args)
         for name in names:
             path = origin / name
             if path.is_symlink() or (path.is_dir() and any(p.is_symlink() for p in path.rglob('*'))):
@@ -178,8 +189,8 @@ def main():
             if oracle:
                 data['oracle'] = str(source / ('tools/check_i4.py' if oracle == 'i4' else 'tools/check_i3_pressure.py' if oracle == 'allocated' else 'tools/check_i3_paging.py' if oracle == 'i3' else 'tools/check_i2.py' if oracle == 'i2' else 'tools/check_i1.py'))
             if oracle == 'i4':
-                data['i4_expected'] = [int(argv[4]), 50 if argv[3]=='compose' else int(argv[6]), 'i4-'+argv[3]]
-                if argv[3]=='compose':
+                data['i4_expected'] = [int(argv[4]), 50 if argv[3] in ('compose','events','pressure') else int(argv[6]), 'i4-'+argv[3]]
+                if argv[3] in ('compose','events','pressure'):
                     data['producer_check']=str(source/'tools/fex_worker.py')
             if oracle in ('i2','i3'):
                 data['producer_check'] = str(source / 'tools/fex_worker.py')
@@ -258,6 +269,14 @@ def main():
             for count in (1,2,3,4):
                 job(f'i4-compose-n{count}', [host,runtime,'i4','compose',count,run/'CodeSizeValidation',run/f'i4-compiler-n{count}'],
                     wall=120,rss=512*1024**2,oracle='i4')
+        if args.i4_events:
+            for count in (1,2,3,4):
+                job(f'i4-events-n{count}',[host,runtime,'i4','events',count,run/'CodeSizeValidation',run/f'i4-events-compiler-n{count}'],
+                    wall=120,rss=512*1024**2,oracle='i4')
+        if args.i4_pressure:
+            for count in (1,2,3,4):
+                job(f'i4-pressure-n{count}',[host,runtime,'i4','pressure',count,run/'CodeSizeValidation',run/f'i4-pressure-compiler-n{count}'],
+                    wall=120,rss=512*1024**2,oracle='i4')
         if args.i2:
             start_i2 = time.monotonic()
             scenarios = ('live','source_stale','context_stale','cancel','capacity','bad_reply')
@@ -289,6 +308,14 @@ def main():
             record['i3_allocated_cells']=10
             record['i3_increment_checks_passed']=True
             record['full_abi_complete']=False
+        if args.i4_pressure:
+            record['i4_profile_checks_passed'] = True
+            # Execution coverage only; independent acceptance is recorded in
+            # the investigation, never inferred by this runner.
+            record['i4_increment_checks_passed'] = bool(args.i3_allocated)
+            if args.i3_allocated:
+                record['increments'].remove('I4-partial')
+                record['increments'].append('I4')
         record['status'] = 'passed'
         record['cells_passed'] = len(cells)
     except BaseException as error:
@@ -323,11 +350,15 @@ def main():
         if args.i4_entry:
             extra+=", 8 concurrent-entry cells and 2 count rejections"
         if args.i4_faults:
-            extra+=", 4 queued-fault cells (partial I4)"
+            extra+=", 4 queued-fault cells"
         if args.i4_remap:
-            extra+=", 4 remap/shootdown cells (partial I4)"
+            extra+=", 4 remap/shootdown cells"
         if args.i4_compose:
-            extra+=", 4 live source-publication cells (partial I4)"
+            extra+=", 4 live source-publication cells"
+        if args.i4_events:
+            extra+=", 4 pending-event cells"
+        if args.i4_pressure:
+            extra+=", 4 sustained-maintenance cells"
         print(f"PASS: {record['cells_passed']} I1 native cells, unsupported-count rejection{extra}", flush=True)
         return 0
     return 1

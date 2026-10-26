@@ -13,6 +13,12 @@ pub(super) struct Producer {
     request: wire::Packet,
 }
 impl Producer {
+    pub(super) fn ready(&mut self) -> Result<bool> {
+        self.child
+            .try_wait()
+            .map(|s| s.is_some())
+            .map_err(|e| e.to_string())
+    }
     pub(super) fn finish(mut self) -> Result<wire::Packet> {
         if !self.child.wait().map_err(|e| e.to_string())?.success() {
             return Err(format!("FEX worker failed: {}", self.directory.display()));

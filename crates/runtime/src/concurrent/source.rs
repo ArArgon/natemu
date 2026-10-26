@@ -36,6 +36,24 @@ unsafe fn publish_slot(address: u64, body: &[u8]) {
     }
 }
 
+unsafe fn exchange_wait(state: &wire::Lifecycle, mut packet: wire::Packet) -> wire::Packet {
+    unsafe {
+        service(&mut packet);
+        while packet[0] == wire::BUSY {
+            if coordinator().scenario >= 4 {
+                events::wait_check();
+            }
+            for _ in 0..16 {
+                asm!("yield", options(nomem, nostack));
+            }
+            packet = state.packet();
+            packet[0] = POLL_COMPILE;
+            service(&mut packet);
+        }
+        packet
+    }
+}
+
 pub unsafe fn initialize() {
     unsafe {
         let s = shared();
@@ -52,8 +70,11 @@ pub unsafe fn initialize() {
         }
         checked(state.dispatch());
         ptr::write_volatile(&raw mut (*s).lifecycle, state);
-        let mut p = state.packet();
-        service(&mut p);
+        coordinator().translation_wait.store(1, Ordering::Release);
+        if coordinator().scenario >= 4 && coordinator().participants == 1 {
+            events::post_all(18);
+        }
+        let p = exchange_wait(&state, state.packet());
         let bytes = checked(state.validate_reply(&p));
         publish_slot(CODE_VA, &bytes);
         state.pending = 0;
@@ -69,6 +90,12 @@ pub unsafe fn initialize() {
             stop(PANIC, 112);
         }
         ptr::write_volatile(&raw mut (*s).lifecycle, state);
+        if coordinator().scenario >= 4 {
+            while coordinator().event_pending[0].load(Ordering::Acquire) == 0 {
+                events::wait_check();
+                asm!("yield", options(nomem, nostack));
+            }
+        }
         coordinator().published.store(1, Ordering::Release);
     }
 }
@@ -98,13 +125,15 @@ pub unsafe fn replacement() {
         let mut state = ptr::read_volatile(&raw const (*s).lifecycle);
         let mut late = state.packet();
         late[0] = TAKE_COMPILE;
-        service(&mut late);
+        if c.scenario >= 4 {
+            events::post_all(19);
+        }
+        late = exchange_wait(&state, late);
         if state.validate_reply(&late) != Err(wire::STALE) {
             stop(PANIC, 113);
         }
         state.rejections += 1;
-        let mut current = state.packet();
-        service(&mut current);
+        let current = exchange_wait(&state, state.packet());
         let body = checked(state.validate_reply(&current));
         let g = coordinator::lock(c);
         if c.phase.load(Ordering::Relaxed) != COMPILING
@@ -150,7 +179,7 @@ pub unsafe fn try_reuse_old(_guard: &coordinator::Guard<'_>) -> bool {
         || c.retained.load(Ordering::Relaxed) != 0
         || c.published.load(Ordering::Relaxed) != 2
         || c.reclaimed.load(Ordering::Relaxed) != 0
-        || c.active.load(Ordering::Relaxed) != c.new_references.load(Ordering::Relaxed)
+        || c.active.load(Ordering::Relaxed) & !c.new_references.load(Ordering::Relaxed) != 0
     {
         return false;
     }

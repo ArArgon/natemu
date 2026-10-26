@@ -83,7 +83,7 @@ pub fn prepare(
     }
     Ok(guest)
 }
-fn guest_json(g: &GuestState) -> String {
+pub(super) fn guest_json(g: &GuestState) -> String {
     format!(
         "{{\"gpr\":{:?},\"rip\":{},\"rflags\":{},\"ymm\":{:?},\"mxcsr\":{},\"x87\":[{},{},{},{},{},{}],\"x87_regs\":{:?},\"control\":{:?},\"segments\":{:?},\"reserved\":{}}}",
         g.gpr,
