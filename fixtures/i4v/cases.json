@@ -308,5 +308,87 @@
         "Compare low 32 bits of GPRs; upper halves are outside this legacy-mode fixture claim"
       ]
     }
+  ],
+  "validation_adaptations": [
+    {
+      "id": "v3_control_scalar_moves",
+      "oracle": "tools/i4v_controls_check.py",
+      "upstream": "FEX",
+      "revision": "48d71752e2a363d5535181f803b0b0e9666c1825",
+      "upstream_cases": [
+        "fex_moffs_load32",
+        "fex_moffs_store32"
+      ],
+      "original_expectations": {
+        "Primary_A0.asm": {
+          "RCX": "0xffff0042",
+          "RDX": "0x42"
+        },
+        "Primary_A2.asm": {
+          "RCX": "0x43",
+          "RDX": "0x42"
+        }
+      },
+      "adaptation": "Reuse the retained immediate-register and dword memory-move expectations with EAX/EBX register-indirect forms. V3 uses actual separately compiled b8 imm32, 8903 and 8b03 at their architectural guest RIPs. Control values and transition programs are newly authored; these upstream files do not test MOV CR, context invalidation or mode switching.",
+      "source_forms": [
+        "b8<imm32-le>",
+        "8903",
+        "8b03"
+      ],
+      "comparison": "Exact admitted zero-extended canonical32 representation plus preserved native roots; ordinary MOV flags unchanged. Successful MOV CR arithmetic flags are undefined architecturally and preserved only by the chosen emulator policy."
+    },
+    {
+      "id": "v3_wp_toggle",
+      "oracle": "tools/i4v_controls_check.py",
+      "profile": 2,
+      "upstream": "kvm-unit-tests",
+      "repository": "https://gitlab.com/kvm-unit-tests/kvm-unit-tests",
+      "retained_mirror": "https://android-kvm.googlesource.com/kvm-unit-tests",
+      "revision": "734fe13536d0fc41185723c63bde17ec6364fa1d",
+      "upstream_path": "x86/access.c",
+      "upstream_url": "https://android-kvm.googlesource.com/kvm-unit-tests/+/734fe13536d0fc41185723c63bde17ec6364fa1d/x86/access.c",
+      "upstream_full_sha256": "123b15ad8db763ff7dca5caaec1d4a305fabb903da7353faf22d67bbbe1ac8cd",
+      "license": "GPL-2.0-only (package COPYRIGHT default; this source file has no alternate notice)",
+      "license_files": [
+        {
+          "path": "upstream/kvm-unit-tests/COPYRIGHT",
+          "sha256": "b3c9ca9e257f2eaae070cf0ccdf8770764f05a947a39a835e633413750a5777b"
+        },
+        {
+          "path": "upstream/kvm-unit-tests/LICENSE",
+          "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
+        }
+      ],
+      "excerpts": [
+        {
+          "path": "upstream/kvm-unit-tests/access-permissions.excerpt.c",
+          "sha256": "f7e61babbdabda20d87d7f927a2abe80a7046d4e98aebbe47db6eabc2f208c02",
+          "upstream_lines": [
+            470,
+            506
+          ],
+          "symbols": [
+            "ac_test_permissions"
+          ]
+        },
+        {
+          "path": "upstream/kvm-unit-tests/access-toggle-wp.excerpt.c",
+          "sha256": "873b9a674ab98c0a293b1506070242bc2d71c1b27d5425b68feed7b1e58946bd",
+          "upstream_lines": [
+            1082,
+            1134
+          ],
+          "symbols": [
+            "TOGGLE_CR0_WP_TEST_BASE_FLAGS",
+            "do_cr0_wp_access",
+            "check_toggle_cr0_wp"
+          ]
+        }
+      ],
+      "original_expectation": "check_toggle_cr0_wp requires supervisor writes to present read-only pages to succeed with CR0.WP=0 and fault with CR0.WP=1. Its ac_test_permissions model permits supervisor WP0 writes, denies user writes to read-only pages, and adds leaf A/D only when access succeeds.",
+      "adaptation": "Retain the WP0-success/WP1-fault sequence using actual fetched MOV CR0 between generated scalar operations, a legacy32 read-only 4-KiB leaf at DATA=0x100000, and a warm native writable mapping from the first store. Verify the later write faults with PF3, keeps EAX=0xffffffff and CR2=DATA, preserves the earlier dword0x10011, and revokes native write permission on control commit. The independent model also checks user WP0 writes fail with PF7 in host-side semantic tests.",
+      "differences": "No upstream harness, KVM forced-emulation prefix, EFER.NX toggles, VMX-specific ownership mechanism, high virtual address or full permission matrix is imported. Exact control transaction, prefix, same-value CR3, next-fetch and stale compiler expectations are newly authored from the architectural contract. SVM VMRUN admission tests are not reused.",
+      "execution_status": "Retained source and adapted expectations only; actual translated execution evidence belongs to the I4-V controls runner."
+    }
   ]
 }

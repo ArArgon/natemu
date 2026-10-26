@@ -447,6 +447,24 @@ then redispatch. An old specialized object cannot continue after that transition
 Unsupported native lowering transfers to a pre-admitted resident handler; lack
 of a handler rejects that experimental object, not an otherwise valid x86 instruction.
 
+The first V3 implementation admits fetched MOV-to-CR0/CR3/CR4 between actual
+FEX-generated protected32 instructions. Pinned FEX's userspace privileged-op
+handler is not reused as system semantics. The resident handler reads canonical
+operands, checks legality before committing controls, advances context identity
+even for same-value CR3 writes, and redispatches through the next guest fetch.
+A rejected control preserves prior generated effects; a subsequent fetch fault
+preserves a successfully committed control. Successful MOV-CR preserves its
+architecturally undefined arithmetic flags as an explicit deterministic policy.
+
+This finite profile evicts its admitted operand shadow leaf on each successful
+control write and guards retained code/replies by context generation. The common
+host initializer's RW/NX source alias remains installed; admitted generated
+memory instructions cannot address it, and every source fetch separately checks
+guest translation before reading private backing. This is not a general
+all-address shadow invalidation implementation. Legacy PAE hidden-state lifetime,
+IA-32e transitions and concurrent transition schedules remain separate required
+extensions. INV-03-01 owns execution results and acceptance of this profile.
+
 ## 5. Faults, completion and event delivery
 
 The permanent exception landing captures X0–X30, original SP and native PC,

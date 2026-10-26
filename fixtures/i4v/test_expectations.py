@@ -28,6 +28,24 @@ class FixtureTests(unittest.TestCase):
         license_info = manifest["upstream"]
         self.assertEqual(hashlib.sha256((ROOT / license_info["license_path"]).read_bytes()).hexdigest(), license_info["license_sha256"])
 
+    def test_control_adaptation_provenance(self):
+        manifest = json.loads((ROOT / "cases.json").read_text())
+        adaptations = {case["id"]: case for case in manifest["validation_adaptations"]}
+        scalar = adaptations["v3_control_scalar_moves"]
+        self.assertEqual(scalar["revision"], manifest["upstream"]["revision"])
+        self.assertEqual(set(scalar["upstream_cases"]), {"fex_moffs_load32", "fex_moffs_store32"})
+        wp = adaptations["v3_wp_toggle"]
+        self.assertEqual(wp["revision"], "734fe13536d0fc41185723c63bde17ec6364fa1d")
+        for item in wp["excerpts"] + wp["license_files"]:
+            data = (ROOT / item["path"]).read_bytes()
+            self.assertEqual(hashlib.sha256(data).hexdigest(), item["sha256"])
+            if "upstream_lines" in item:
+                first, last = item["upstream_lines"]
+                self.assertEqual(len(data.splitlines()), last - first + 1)
+                for symbol in item["symbols"]:
+                    self.assertIn(symbol.encode(), data)
+        self.assertEqual(wp["profile"], 2)
+
     def test_load_at_low_high_and_page_boundaries(self):
         for base in (0x100000, 0x100FF9, 0x7FFFFFFFFFF8, 0xFFFF800000000000, 0xFFFFFFFFFFFFF000):
             with self.subTest(base=hex(base)):

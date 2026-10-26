@@ -16,6 +16,33 @@ class ExportChecks(unittest.TestCase):
             self.assertEqual(len(result['sites']),site_count)
             self.assertEqual(result['entry_gprs']['rsp'],8)
 
+    def test_generated_control_values_decode_to_exact_zero_extended_eax(self):
+        for value in (0x10011,0x80010011,0x1000,0x3000,0,0x80010010,0x20010011,0xffffffff,0x600,0x1003,0x11,0x80000011,0x680):
+            result=export.verify(DATA/f'control-imm-{value:08x}',dict(case=f'fex_mov_eax_{value:08x}',guest_rip=0x102000 if value in (0x1003,0x11,0x80000011,0x680) else 0x2000,bitness=32))
+            self.assertEqual(bytes.fromhex(result['source_hex']),b'\xb8'+value.to_bytes(4,'little'))
+            body=bytes.fromhex(result['body_hex']);eax=None
+            for offset in range(0,len(body),4):
+                word=int.from_bytes(body[offset:offset+4],'little')
+                self.assertEqual(word&31,4)
+                self.assertEqual(word>>31,0)
+                shift=((word>>21)&3)*16;self.assertIn(shift,(0,16))
+                immediate=((word>>5)&0xffff)<<shift;op=word&0x7f800000
+                if op==0x52800000:eax=immediate
+                elif op==0x12800000:eax=(~immediate)&0xffffffff
+                elif op==0x72800000:
+                    self.assertIsNotNone(eax);eax=(eax&~(0xffff<<shift))|immediate
+                else:self.fail(f'non-MOV-wide native instruction {word:#x}')
+            self.assertEqual(eax,value)
+            self.assertEqual(result['sites'],[])
+
+    def test_control_prefix_memory_and_operand_mutations(self):
+        for name,offset,write in [('store_eax_ebx',4,True),('load_eax_ebx',0,False)]:
+            result=export.verify(DATA/f'control-{name}',dict(case=f'fex_{name}32'))
+            self.assertEqual([(s['native_offset'],s['width'],s['write'],s['address_register']) for s in result['sites']],[(offset,4,write,6)])
+        self.mutated('control-imm-80010011','source.x86',lambda b:b[:1]+b'\x10'+b[2:])
+        self.mutated('control-imm-80010011','outputs/001.native',lambda b:b[:19]+bytes([b[19]^0x80])+b[20:])
+        with self.assertRaises(ValueError):export.verify(DATA/'control-imm-00001000',dict(case='fex_mov_eax_00003000'))
+
     def test_mixed32_source_change_and_both_memory_sites_are_exact(self):
         for index,rip in enumerate((0x102000,0x102080)):
             old=export.verify(DATA/f'mixed32-old-{index}',dict(case='fex_mixed32_old',guest_rip=rip,bitness=32))

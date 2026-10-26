@@ -1,5 +1,88 @@
 # INV-03-01 — source findings review
 
+## Intermediate I4-V return — first guest control transitions, October 26, 2026 UTC
+
+Root authored ABI/runtime and runner changes, `/root/i4v_producer` authored
+host/compiler integration, and `/root/i4v_upstream` authored independent expected
+effects. `/root/i4v_contract_review` reviewed contracts, code and emitted stack
+usage, then independently rebuilt and executed primary02's retained snapshot.
+**ACCEPT the finite N=1 protected32/legacy32 control-transition checkpoint;
+V3 and I4-V remain incomplete.**
+
+Independent `i4v-controls-independent-20261026-01` passes292 jobs and268 native
+cells, preserving255 prior cells and adding thirteen control programs. The
+reviewer independently rechecked all268 reports,612 actual compilations,
+624 report-to-compile associations,866 delivered transfers and14,115 checksums.
+All444 retained inputs match primary02 exactly; only the producer README received
+a subsequent workspace update. The reused FEX executable matches its pin and
+no compiler containers remain.
+
+The thirteen programs contain79 visits,71 completed guest instructions,55 native
+entries,21 native faults and16 successful control invalidations. All56 new actual
+compilations and delivered replies bind the requested EIP, source, mode and context.
+The resident semantic owner executes fetched MOV-to-CR0/CR3/CR4; the surrounding
+ordinary MOV-immediate/load/store instructions execute actual FEX output. Four
+#GP and two #UD cases preserve prior generated stores and the rejected control's
+old state. WP denial produces #PF3 without undoing its earlier permitted store;
+the next-fetch #PF0 retains the successfully committed CR3=0x3000. Full guest
+tables, source/data pages, canonical state and native frames are independently
+checked at the recorded boundaries.
+
+The A/B/A/off roundtrip returns to the original source PC and numerical controls
+with context5, rejects the original context1 cache entry, and rejects an actual
+deferred reply even after its serial alone is rebound to the current request.
+Same-value CR3 reload is observable: an explicit fixture writer changes the PTE
+while the old native leaf remains warm, and the post-reload load reaches the new
+physical page. PGE and WP changes use the same admission/commit/invalidation
+boundary. This is actual guest control-instruction execution through a semantic
+adapter, not reuse of FEX's userspace privileged-instruction behavior.
+
+Review corrected the architectural CR4 mask before native collection: already
+exposed FSGSBASE/OSXSAVE controls must return Unsupported while unimplemented,
+rather than a fabricated reserved-bit #GP. Separate tests preserve the old state
+and generation on rejection. MOV-CR's ignored ModR/M.mod and non-64-bit operand
+width are exercised; arithmetic-flag preservation is expressly a deterministic
+implementation policy because those flags are architecturally undefined on
+successful MOV CR. These instruction premises follow
+[Intel SDM Volume2B, MOV to/from Control Registers](https://cdrdv2-public.intel.com/922481/253667-092-sdm-vol-2b.pdf).
+CR3 low ignored bits are excluded from root selection; this checkpoint does not
+claim MOV-from-CR3 readback equivalence.
+
+The initial focused `i4v-controls-dev-20261026-01` remains failed provenance,
+with all1,500 checksums verified. Its checker incorrectly expected the common
+initializer's RW/NX source alias to be absent; the correction requires its exact
+descriptor before/after and rejects missing, erased, misrouted and executable
+variants. The runner also needed to compare the request list with
+`compiler_requests`, separately checking the numeric request count. The retained
+trace rechecks successfully, including13 actual compilation/delivery associations;
+fresh primary02 and the independent run provide acceptance evidence. No runtime
+change was needed for these two corrections. All nine checker test methods pass
+independently.
+
+Invalidation covers the admitted operand leaf. The static source alias is not
+reachable by admitted generated memory operands, and every source fetch checks
+the current guest translation before reading private backing. This finite result
+does not establish general all-address shadow invalidation. The ABI and README
+clarifications preserve that limit and distinguish control rejection from a later
+fetch failure after successful commit.
+
+Primary02, the independent rebuild and subsequent legacy rebuild share runtime
+SHA256 `39f33e5c7c630805acfc6eae5602aa6a3d636ad9c8012702a702923d78f0a8ab`.
+The two RX segments contain168 boot bytes and101,188 main-image bytes. Conservative
+maximum return/exception stack use remains14,992 of16,384 bytes, leaving1,392;
+the controls completion subtree uses3,920 bytes before capture/common callers.
+Root's serialized `i4v-controls-regression-20261026-01` passes87 jobs from
+06:15:13–06:15:56UTC. The reviewer inspected its terminal manifest and matching
+ELF, without claiming another independent legacy execution.
+
+The independent run lasted236 seconds, from06:11:00–06:14:56UTC, and retained
+142,189,661 bytes. Observed peak build/worker process-group RSS was
+434,552,832/350,519,296 bytes, within the limits. No substantive blocker remains
+within this finite scope. Hidden-PAE load/reload/failure lifetime, IA-32e and far
+transitions, concurrent transition/ABA schedules, wider address forms and the
+remaining V1/broader validation campaign remain required. No full V3/I4-V or
+performance acceptance follows.
+
 ## Intermediate I4-V return — mixed paging-mode concurrency, October 26, 2026 UTC
 
 Root authored ABI/runtime and runner changes, `/root/i4v_producer` authored

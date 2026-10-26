@@ -8,6 +8,7 @@ mod concurrent;
 #[path = "../../runtime/src/coordinator.rs"]
 mod coordinator_tests;
 mod i4v;
+mod i4v_controls;
 mod i4v_off;
 mod i4v_off_steps;
 mod i4v_stack;
@@ -355,6 +356,9 @@ fn seed(index: usize) -> (NativeFrame, [u8; 512], [u8; 256]) {
 }
 fn run() -> Result<()> {
     let a: Vec<_> = env::args().collect();
+    if a.len() == 8 && a[2] == "i4v-controls" {
+        return i4v_controls::run(&a);
+    }
     if (a.len() == 8 || a.len() == 9) && a[2] == "i4v-off-steps" {
         return i4v_off_steps::run(&a);
     }

@@ -1,0 +1,52 @@
+{
+  "schema": "natemu-i4v-program-v1",
+  "case": "fex_mov_eax_00000011",
+  "guest_rip": 1056768,
+  "bitness": 32,
+  "source_hex": "b811000000",
+  "source_sha256": "af28c54d237c1d64c9588dfe3c2d1c3266bd41f8e39a4151c326cee5695db7cb",
+  "body_hex": "24028052",
+  "body_sha256": "b2afc69d5da25b547e57fd3758a0ff3e8eab60107c861425526c15d6cc253cfe",
+  "producer_sha256": "b614bac26ef89bb8b3d2812a2708a5541314e77e06b6c6771d135ab0424cdc33",
+  "object": {
+    "index": 1,
+    "bytes": 128,
+    "code_bytes": 68,
+    "code_offset": 4,
+    "guest_instructions": 1,
+    "relocation_bytes": 144,
+    "block_address": 281471564644480
+  },
+  "native_object_sha256": "a71302f233af9a3ba2bddbea9d0a90df59f2d724a862f94c43527444ce59d099",
+  "relocations_sha256": "f0f6afe5eec76d891716d059db3ca508427a53775ef20acbc754d7a54572ad38",
+  "extraction": [
+    12,
+    16
+  ],
+  "guest_pc": [
+    {
+      "guest_offset": 0,
+      "native_offset": 4
+    }
+  ],
+  "entry_gprs": {
+    "rax": 4,
+    "rbx": 6,
+    "rcx": 7,
+    "rdx": 5,
+    "rsi": 10,
+    "rdi": 11,
+    "rbp": 9,
+    "rsp": 8,
+    "r8": 12,
+    "r9": 13,
+    "r10": 14,
+    "r11": 15,
+    "r12": 16,
+    "r13": 17,
+    "r14": 19,
+    "r15": 29
+  },
+  "flags": "unchanged",
+  "sites": []
+}

@@ -101,7 +101,8 @@ FEX asserts a fixed mode within each context, so each request uses a fresh
 context. This does not implement runtime mode switching. The generic compile
 probe accepts `--bitness 32 --source HEX --instructions N --expected-host N`,
 and body admission includes the five finite 64-bit cases, `fex_moffs_load32`,
-its per-instruction exports and the two mixed-mode register-addressed variants.
+its per-instruction exports, the two mixed-mode register-addressed variants and
+the control-profile MOV-immediate/load/store exports.
 
 Final-build controls retain high/low load compilations, high/low RIP-relative
 LEA (the emitted value is the requested RIP + 7), a 32-bit moffs-load case, and
@@ -172,7 +173,25 @@ produce identical bytes. Shared data/table mutations use the existing coordinato
 paging-off identity routes must remain unchanged when paged routes move.
 `probe_mixed32.py` retains count discovery, checked exports and disassembly.
 
+Add `--controls` for thirteen single-vCPU protected32/legacy32 programs. The
+resident runtime fetches and handles MOV-to-CR0/CR3/CR4; ordinary instructions
+between those controls are freshly compiled by FEX at their actual EIP. Cases
+`fex_mov_eax_HEX8`, `fex_store_eax_ebx32` and `fex_load_eax_ebx32` admit the
+specific immediates in `export.py`, with 32-bit operand zero-extension checked
+against actual native instructions. `probe_controls.py` retains count discovery,
+checked exports and disassembly. A compile reply binds VM, source, mode, context,
+EIP and serial; a return to numerically identical controls still has a new
+context generation. The worker retains actual delayed replies across that return.
+
+The runtime tests paging off/on/off, CR3 A/B/A and same-value reload, WP/PGE,
+illegal/privileged encodings and a next-fetch fault after successful commit.
+The unchanged FEX userspace privileged-op handler does not implement those system
+semantics. The independent checker compares every guest-instruction prefix,
+full guest tables/data/source, native fault sites and canonical state. Shadow
+eviction covers the admitted operand leaf; this profile does not establish a
+general all-address invalidation path or concurrent control transitions.
+
 Exact results and independent acceptance live in INV-03-01. Broader segment and
-address forms and mode transitions remain further work alongside remaining V1
+address forms, PAE/IA-32e and concurrent transitions remain further work alongside remaining V1
 boundaries and the broader campaign. These finite profiles do not complete V1,
-V2 or I4-V.
+V2, V3 or I4-V.

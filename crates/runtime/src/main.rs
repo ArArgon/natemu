@@ -9,6 +9,7 @@ use core::{
 use natemu_abi::*;
 mod concurrent;
 mod coordinator;
+mod controls;
 mod helper;
 mod paging_off32;
 mod paging_off_steps;

@@ -538,9 +538,10 @@ The [I4-V validation pass](#post-i4-integrated-validation) is underway. Finite V
 load, stack-prefix and shared/mixed-permission alias checkpoints have independent
 acceptance; [INV-03-01](research/investigations/INV-03-01.md#i4-v-active-development--first-v1-slice-october-25-2026)
 records their exact coverage and remaining work. Complete the remaining V1
-address/permission/boundary cases, compose the accepted N=1 V2 address/service
-profiles with mixed paged/paging-off concurrency and wider address forms, and
-implement V3 mode transitions,
+address/permission/boundary cases and extend the accepted flat mixed
+paged/paging-off concurrency to the wider V2 address/service profiles. V3's first
+protected32/legacy32 control-transition checkpoint has independent acceptance;
+add hidden-PAE and IA-32e transitions,
 including each slice's N-vCPU schedules, then the broader integrated campaign.
 Declare execution bounds, adapt existing tests and add missing adversarial cases
 as each slice is built. Independent I5 preparation can proceed. Accepted finite

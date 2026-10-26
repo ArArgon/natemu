@@ -41,3 +41,23 @@ concurrency test. The independent semantics and complete physical-memory history
 are checked by `tools/check_i4v_mixed.py`; the existing four-case prefix model
 remains unchanged. The mixed driver uses flat segments/A20-on with distinct
 per-owner operand spans and old/new physical-page read sentinels.
+
+
+The V3 control campaign records two additional adaptations in the manifest's
+`validation_adaptations` section. Its generated scalar instructions reuse the
+retained FEX `Primary_A0.asm` / `Primary_A2.asm` expectations. The separate
+`tools/i4v_controls_check.py` oracle owns the new control-transition programs;
+the existing four-case prefix API remains unchanged.
+
+For write protection, `kvm-unit-tests` revision
+`734fe13536d0fc41185723c63bde17ec6364fa1d`, `x86/access.c`, supplies the actual
+`check_toggle_cr0_wp` case and its permission expectation. Exact source excerpts,
+line ranges, hashes, package copyright and GPLv2 license are retained under
+`upstream/kvm-unit-tests/`. These excerpts are provenance, not linked runtime
+code or a standalone imported suite. The adapted V3 profile first writes through
+a read-only guest PTE with supervisor WP=0, then restores WP and requires a
+precise protection fault with the earlier write intact. It replaces the upstream
+KVM/VMX and NX-toggle harness with actual guest control instructions and the
+resident/FEX boundary. Newly authored CR3, invalid-control and next-fetch cases
+are not attributed to that upstream test. No SVM VMRUN control-state test is
+claimed as reused MOV-CR execution coverage.

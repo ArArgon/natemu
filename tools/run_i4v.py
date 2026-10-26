@@ -34,6 +34,7 @@ def main():
     parser.add_argument('--paging-off', action='store_true', help='also execute the live protected32 paging-off slice')
     parser.add_argument('--paging-off-steps', action='store_true', help='also execute protected32 segment/A20 and serviced-route instruction cases')
     parser.add_argument('--mixed-modes', action='store_true', help='also execute paged/paging-off owners with shared source and data')
+    parser.add_argument('--controls', action='store_true', help='also execute fetched guest control instructions and legacy32 transitions')
     parser.add_argument('--focus', help='retain only one selected alias/stack concurrency cell for diagnosis')
     args = parser.parse_args()
     selected = [f'{family}-{region}-n{n}' for family,enabled in (('alias',args.aliases),('stack',args.concurrent_stack))
@@ -47,6 +48,9 @@ def main():
         selected += ['off-steps-'+scenario for scenario in step_scenarios]
     if args.mixed_modes:
         selected += [f'mixed-{arrangement}-n{n}' for arrangement in ('off-first','paged-first') for n in (1,2,3,4)]
+    control_scenarios = ('roundtrip','reload','wp','bad-pg','bad-nw','bad-cr4','privilege','fetch-np','ignored-cr3','operand-mod','lock','reserved-cr','pge')
+    if args.controls:
+        selected += ['controls-'+name for name in control_scenarios]
     if args.focus and args.focus not in selected:
         parser.error('--focus must name a cell enabled by its selected profile')
     if resource.getrlimit(resource.RLIMIT_CPU) != (resource.RLIM_INFINITY,) * 2:
@@ -65,6 +69,7 @@ def main():
                   paging_off_enabled=args.paging_off,
                   paging_off_steps_enabled=args.paging_off_steps,
                   mixed_modes_enabled=args.mixed_modes,
+                  controls_enabled=args.controls,
                   focus=args.focus,
                   limits=dict(build_jobs=2, build_rss_bytes=8*1024**3,
                               worker_rss_bytes=512*1024**2, cell_seconds=120,
@@ -84,6 +89,8 @@ def main():
                      'tools/i4v_off_steps_check.py', 'tools/test_i4v_off_steps_check.py',
                      'tools/i4v_mixed32_worker.py', 'tools/test_i4v_mixed32_worker.py',
                      'tools/check_i4v_mixed.py', 'tools/test_check_i4v_mixed.py',
+                     'tools/i4v_controls_worker.py', 'tools/test_i4v_controls_worker.py',
+                     'tools/i4v_controls_check.py', 'tools/test_i4v_controls_check.py',
                      'tools/i4v_stack_check.py', 'tools/test_i4v_stack_check.py',
                      'tools/i4v_alias_worker.py', 'tools/test_i4v_alias_worker.py',
                      'tools/check_i4v_alias.py', 'tools/test_check_i4v_alias.py',
@@ -124,7 +131,8 @@ def main():
             directory.mkdir()
             specification = dict(argv=list(map(str, argv)), cwd=str(source), environment=environment)
             if oracle:
-                specification['oracle'] = str(source / ('tools/check_i4v_mixed.py' if oracle == 'mixed'
+                specification['oracle'] = str(source / ('tools/i4v_controls_check.py' if oracle == 'controls'
+                    else 'tools/check_i4v_mixed.py' if oracle == 'mixed'
                     else 'tools/i4v_off_steps_check.py' if oracle == 'off-steps'
                     else 'tools/i4v_off_check.py' if oracle == 'off32'
                     else 'tools/i4v_stack_check.py' if oracle == 'stack'
@@ -164,6 +172,8 @@ def main():
         job('off-steps-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_off_steps_check.py'])
         job('mixed-worker-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_mixed32_worker.py'])
         job('mixed-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_check_i4v_mixed.py'])
+        job('controls-worker-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_controls_worker.py'])
+        job('controls-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_controls_check.py'])
         job('build-host', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-host'], wall=600, rss=8*1024**3)
         job('build-runtime', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], wall=600, rss=8*1024**3)
         host = source / 'target/release/natemu-host'
@@ -327,6 +337,34 @@ def main():
                         raise ValueError('instruction compile differs from actual EIP/mode')
                     record['compilations'].append(dict(directory=str(directory.relative_to(run)),export=exported))
                 record['cells'].append(dict(name=label,producer=str(output.relative_to(run)),reply_mutation=mutation))
+        if args.controls:
+            sys.path.insert(0,str(source/'tools'))
+            controls_worker = module(source/'tools/i4v_controls_worker.py','controls_worker')
+            sys.path.pop(0)
+            for profile,scenario in enumerate(control_scenarios):
+                label='controls-'+scenario
+                if args.focus and label != args.focus:
+                    continue
+                output=run/(label+'-producer')
+                result=job(label,[host,runtime,'i4v-controls',producer,str(profile),'1',source/'tools/i4v_controls_worker.py',output],oracle='controls')
+                report=json.loads((result/'command.stdout').read_text())
+                if report['case'] != 'controls32' or report['controls']['profile'] != profile:
+                    raise ValueError('control report differs from requested program')
+                pairs=[(v['request'],v['reply']) for v in report['visits'] if v['entries']]
+                if profile==0:
+                    pairs.append((report['controls']['deferred'],report['controls']['late_reply']))
+                pairs.sort(key=lambda pair:pair[0][12])
+                requests=[p[0] for p in pairs];replies=[p[1] for p in pairs]
+                controls_worker.verify_compilations(output,requests,replies)
+                if requests != report['compiler_requests'] or len(requests) != report['requests']:
+                    raise ValueError('control actual compiler sequence differs from resident records')
+                for index,request in enumerate(requests):
+                    directory=output/f'request-{index:03}'
+                    exported=controls_worker.verify_request(directory,request)
+                    if exported['guest_rip'] != request[7] or exported['bitness'] != 32:
+                        raise ValueError('control ordinary compilation EIP/mode differs')
+                    record['compilations'].append(dict(directory=str(directory.relative_to(run)),export=exported))
+                record['cells'].append(dict(name=label,producer=str(output.relative_to(run))))
         if args.mixed_modes:
             sys.path.insert(0, str(source / 'tools'))
             mixed_worker = module(source / 'tools/i4v_mixed32_worker.py', 'mixed_worker')
