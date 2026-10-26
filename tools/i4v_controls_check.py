@@ -13,6 +13,7 @@ from pathlib import Path
 from check_i1 import resident_pc
 from i4v_check import exact, require, uint, zero_frame
 from check_i4v_alias import descriptor
+import i4v_pae_model as pae
 
 PRIVATE = 0x0000800040000000
 DATA = 0x100000
@@ -20,7 +21,9 @@ SOURCE = 0x102000
 CODE = PRIVATE + 0x30000
 RET = bytes.fromhex('c0035fd6')
 NAMES = ('roundtrip','reload','wp','bad-pg','bad-nw','bad-cr4','cpl3','fetch-np',
-         'ignored-cr3','operand-mod','lock','reserved-cr1','pge')
+         'ignored-cr3','operand-mod','lock','reserved-cr1','pge','pae-enable',
+         'pae-invlpg','pae-evict','pae-wp-pge','pae-invalid-enable',
+         'pae-invalid-cr3','pae-invalid-cr4','pae-nonpresent','pae-aba')
 
 
 def immediate(value):
@@ -32,6 +35,7 @@ def program(profile):
     store, load = bytes.fromhex('8903'), bytes.fromhex('8b03')
     cr0, cr3, cr4 = [bytes.fromhex(s) for s in ('0f22c0','0f22d8','0f22e0')]
     prefix = [mov(0x10011),store]
+    activation = [mov(0x620),cr4,mov(0x80010011),cr0,load]
     programs = [
         [*prefix,mov(0x80010011),cr0,load,mov(0x3000),cr3,load,mov(0x1000),cr3,load,mov(0x10011),cr0,load],
         [mov(0x80010011),cr0,load,mov(0x1000),cr3,load],
@@ -46,10 +50,21 @@ def program(profile):
         [*prefix,mov(0x80010011),bytes.fromhex('f00f22c0')],
         [*prefix,mov(0x80010011),bytes.fromhex('0f22c8')],
         [mov(0x80010011),cr0,load,mov(0x680),cr4,load,mov(0x600),cr4,load],
+        activation,
+        [*activation,bytes.fromhex('0f013b'),load,mov(0x1020),cr3,load],
+        [*activation,load,mov(0x1020),cr3,load],
+        [*activation,mov(0x80000011),cr0,load,mov(0x6a0),cr4,load],
+        [*prefix,mov(0x620),cr4,mov(0x80010011),cr0],
+        [*activation,*prefix,mov(0x1020),cr3,load],
+        [*activation,*prefix,mov(0x6a0),cr4,load],
+        activation,
+        [*activation,mov(0x1020),cr3,load,mov(0x1020),cr3],
     ]
     result=programs[profile]
     if profile==0:
         result.append(b'\xe9'+(-(sum(map(len,result))+5)).to_bytes(4,'little',signed=True))
+    if profile==21:
+        result.append(b'\xe9'+(16-sum(map(len,result))-5).to_bytes(4,'little',signed=True))
     return result
 
 
@@ -145,6 +160,10 @@ def data_pages():
 
 def model(profile,initial_eax):
     """Instruction-order architectural reference, independent of dispatch layout."""
+    if profile>=13:
+        result=pae.model(profile,initial_eax,program(profile),data_pages())
+        result['tables']=tables(profile)
+        return result
     source=program(profile);offsets=positions(profile)
     memory=data_pages();table=tables(profile)
     cr0,cr3,cr4=0x10011,0x1000,0x600
@@ -213,6 +232,7 @@ def seed():
 
 def guest_before(profile):
     guest=seed()[2]
+    if profile>=13:guest['control'][2]=0x1020
     if profile==6:
         guest['segments'][0]=[0xb,0,0xffffffff,0xc0fb]
         guest['segments'][1:]=[[0x13,0,0xffffffff,0xc0f3] for _ in range(7)]
@@ -236,13 +256,16 @@ def expectations(profile,vm,capture):
     current=copy.deepcopy(initial);entered=copy.deepcopy(initial)
     visits=[];code=[0]*640;serial=0;packets=[];replies=[]
     deferred=late=rebound=None
+    defer_at=0 if profile==0 else 4 if profile==21 else -1
+    replay_at=15 if profile==0 else 11 if profile==21 else -1
     expected=[0]*16
     for number,rec in enumerate(answer['records']):
         instruction=rec['source'];scalar=instruction[:1]==b'\xb8' or instruction in (b'\x89\x03',b'\x8b\x03')
         fetched=rec['fetch_gpa'] is not None
         before=copy.deepcopy(guest)
         v=dict(rip=rec['rip'],bytes=len(instruction) if fetched else 0,
-               kind=0 if scalar or not fetched else (2 if instruction[:1]==b'\xe9' else 1),
+               kind=0 if scalar or not fetched else (2 if instruction[:1]==b'\xe9' else
+                    3 if instruction==b'\x0f\x01\x3b' else 1),
                source=int.from_bytes(instruction,'little') if fetched else 0,
                fetch_gpa=rec['fetch_gpa'] or 0,before=before['control'],after=None,
                generation_before=rec['generation_before'],generation_after=rec['generation_after'],
@@ -253,11 +276,12 @@ def expectations(profile,vm,capture):
                vector=rec['vector'],error=rec['error'],linear=rec['linear'])
         if scalar and fetched:
             serial+=1
-            p=request(vm,rec['generation_before'],rec['before'][0]>>31,rec['rip'],instruction,serial)
+            mode=(2 if rec['before'][2]&32 else 1) if rec['before'][0]>>31 else 0
+            p=request(vm,rec['generation_before'],mode,rec['rip'],instruction,serial)
             q=reply(p,instruction)
             packets.append(p);replies.append(q);expected=p
-            if number==15 and profile==0:
-                late=reply(deferred,program(0)[0]);rebound=list(late);rebound[12]=serial
+            if number==replay_at:
+                late=reply(deferred,program(profile)[defer_at]);rebound=list(late);rebound[12]=serial
             v['request'],v['reply'],v['entries']=p,q,1
             native=body(instruction)+RET
             code[number*32:number*32+len(native)]=native
@@ -265,11 +289,12 @@ def expectations(profile,vm,capture):
             current=copy.deepcopy(entered)
             if rec['native_fault']:
                 v['fault_frame']=copy.deepcopy(entered)
-                v['exception']=[(0x25<<26)|(64 if instruction[0]==0x89 else 0)|7,DATA,
+                fault_status=15 if rec.get('native_permission',False) else 7
+                v['exception']=[(0x25<<26)|(64 if instruction[0]==0x89 else 0)|fault_status,DATA,
                                 CODE+number*32+(4 if instruction[0]==0x89 else 0),entered['nzcv']|0x3c4]
             current['x'][4]=rec['eax_after']
-            if number==0 and profile==0:
-                serial+=1;deferred=request(vm,1,0,SOURCE,instruction,serial)
+            if number==defer_at:
+                serial+=1;deferred=request(vm,rec['generation_before'],mode,rec['rip'],instruction,serial)
                 packets.append(deferred);replies.append(reply(deferred,instruction))
                 expected=deferred
         guest['control'][0],guest['control'][2],guest['control'][3]=rec['after']
@@ -285,10 +310,12 @@ def expectations(profile,vm,capture):
                walks=answer['walks'],invalidations=answer['generation']-1,
                mapping=answer['mapping'][0] if answer['mapping'] else 0,
                fixture_mutated=int(profile==1),warm_before_reload=descriptor(0) if profile==1 else 0,
-               stale_reply=2 if profile==0 else 0,stale_entry=int(profile==0),expected=expected,
+               stale_reply=2 if profile in (0,21) else 0,stale_entry=int(profile in (0,21)),expected=expected,
                deferred=deferred or [0]*16,late_reply=late or [0]*16,rebound_reply=rebound or [0]*16,
-               old_slot_context=int(profile==0),initial=initial,current=current,
+               old_slot_context=3 if profile==21 else int(profile==0),initial=initial,current=current,
                old_controls=guest_before(profile)['control'])
+    if profile==21:
+        state['old_controls']=list(visits[4]['after'])
     # Common host setup retains a native RW/NX source-page alias. Controls
     # invalidate the operand leaf only; this source alias is not a guest PTE.
     lower_before=[0]*512
@@ -304,13 +331,17 @@ def expectations(profile,vm,capture):
                 tables_before=tables(profile),tables_after=answer['tables'],
                 source_before=source_page,source_after=list(source_page),lower_leaf_before=lower_before,lower_leaf=leaves,
                 compile_requests=packets,compile_replies=replies,bank=bank,
+                pae=answer.get('pae',pae.empty_state()),
+                pae_tables_before=pae.tables(profile) if profile>=13 else [0]*20480,
+                pae_tables_after=answer.get('pae_tables',[0]*20480),
+                exception_record=visits[8] if profile in (18,19) else visits[len(answer['records'])-1],
                 stage=3 if answer['records'][-1]['vector'] else 2)
 
 
 def check(record,expected_profile=None):
     require(type(record) is dict,'expected one controls report')
     profile=uint(record['profile'],32,'profile')
-    require(profile<13,'finite transition profile')
+    require(profile<22,'finite transition profile')
     if expected_profile is not None:exact(profile,expected_profile,'requested program profile')
     vm=uint(record['vm_nonce'],64,'VM incarnation');require(vm>0,'nonzero VM identity')
     capture=uint(record['capture_pc'],64,'capture PC')
@@ -327,7 +358,8 @@ def check(record,expected_profile=None):
     require(uint(record['sctlr'],64,'SCTLR')&2==0,'admitted native unaligned access setting')
     require(uint(record['actlr'],64,'ACTLR')&2==2,'native ordering setting')
     for field in ('initial','entered','final_frame','guest_before','guest_after','code_before','code_after',
-                  'data_before','data_after','tables_before','tables_after','source_before','source_after'):
+                  'data_before','data_after','tables_before','tables_after','source_before','source_after',
+                  'pae','pae_tables_before','pae_tables_after'):
         exact(record[field],expected[field],field)
     exact(record['controls'],controls,'all context, cache, pending and progress state')
     exact(record['bank_before'],expected['bank'],'initial private bank')
@@ -344,7 +376,10 @@ def check(record,expected_profile=None):
             exact(esr>>26,0x25,'same-EL data abort')
             write=(wanted['source']&255)==0x89
             exact((esr>>6)&1,int(write),'native read/write intent')
-            require(esr&63 in range(4,8),'fault must use the invalidated/cold native mapping')
+            permission=(wanted['exception'][0]&63)==15
+            require(esr&63 in (range(12,16) if permission else range(4,8)),
+                    'native fault must match the prior read-only mapping' if permission else
+                    'native fault must use the invalidated/cold native mapping')
             exact(esr&((1<<10)|(1<<8)|(1<<7)),0,'direct valid native FAR')
             exact(far,DATA,'guest operand native address')
             exact(pc,CODE+index*32+(4 if write else 0),'actual generated memory instruction')
@@ -354,7 +389,7 @@ def check(record,expected_profile=None):
             last_exception=list(exception)
         exact(observed,wanted,f'visit{index} precise source/context/control/native/memory effects')
     exact([record[field] for field in ('esr','far','elr','spsr')],last_exception,'last native exception association')
-    last=expected['visits'][controls['visits']-1]
+    last=expected['exception_record']
     recovery={'capture_pc':capture,'guest_before':expected['guest_before'],'guest_after':expected['guest_after'],
               'control':[0x1000,0,1,0,0],'faults':0,'walks':0,'retries':0,'traces':[],
               'vector':last['vector'],'error':last['error'],'linear':last['linear'],
@@ -368,7 +403,7 @@ def check(record,expected_profile=None):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('reports',nargs='+',type=Path)
-    parser.add_argument('--profile',type=int,choices=range(13))
+    parser.add_argument('--profile',type=int,choices=range(22))
     args=parser.parse_args()
     for path in args.reports:
         try:check(json.loads(path.read_text()),args.profile)

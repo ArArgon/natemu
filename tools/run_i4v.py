@@ -48,7 +48,8 @@ def main():
         selected += ['off-steps-'+scenario for scenario in step_scenarios]
     if args.mixed_modes:
         selected += [f'mixed-{arrangement}-n{n}' for arrangement in ('off-first','paged-first') for n in (1,2,3,4)]
-    control_scenarios = ('roundtrip','reload','wp','bad-pg','bad-nw','bad-cr4','privilege','fetch-np','ignored-cr3','operand-mod','lock','reserved-cr','pge')
+    control_scenarios = ('roundtrip','reload','wp','bad-pg','bad-nw','bad-cr4','privilege','fetch-np','ignored-cr3','operand-mod','lock','reserved-cr','pge',
+                         'pae-activate','pae-invlpg','pae-eviction','pae-wp-pge','pae-bad-activate','pae-bad-cr3','pae-bad-cr4','pae-nonpresent','pae-aba')
     if args.controls:
         selected += ['controls-'+name for name in control_scenarios]
     if args.focus and args.focus not in selected:
@@ -91,6 +92,7 @@ def main():
                      'tools/check_i4v_mixed.py', 'tools/test_check_i4v_mixed.py',
                      'tools/i4v_controls_worker.py', 'tools/test_i4v_controls_worker.py',
                      'tools/i4v_controls_check.py', 'tools/test_i4v_controls_check.py',
+                     'tools/i4v_pae_model.py',
                      'tools/i4v_stack_check.py', 'tools/test_i4v_stack_check.py',
                      'tools/i4v_alias_worker.py', 'tools/test_i4v_alias_worker.py',
                      'tools/check_i4v_alias.py', 'tools/test_check_i4v_alias.py',
@@ -351,7 +353,7 @@ def main():
                 if report['case'] != 'controls32' or report['controls']['profile'] != profile:
                     raise ValueError('control report differs from requested program')
                 pairs=[(v['request'],v['reply']) for v in report['visits'] if v['entries']]
-                if profile==0:
+                if profile in (0,21):
                     pairs.append((report['controls']['deferred'],report['controls']['late_reply']))
                 pairs.sort(key=lambda pair:pair[0][12])
                 requests=[p[0] for p in pairs];replies=[p[1] for p in pairs]

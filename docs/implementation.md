@@ -540,8 +540,8 @@ acceptance; [INV-03-01](research/investigations/INV-03-01.md#i4-v-active-develop
 records their exact coverage and remaining work. Complete the remaining V1
 address/permission/boundary cases and extend the accepted flat mixed
 paged/paging-off concurrency to the wider V2 address/service profiles. V3's first
-protected32/legacy32 control-transition checkpoint has independent acceptance;
-add hidden-PAE and IA-32e transitions,
+protected32/legacy32 and hidden-PAE control-transition checkpoints have independent
+acceptance; add IA-32e transitions and descriptor-checked far transfers,
 including each slice's N-vCPU schedules, then the broader integrated campaign.
 Declare execution bounds, adapt existing tests and add missing adversarial cases
 as each slice is built. Independent I5 preparation can proceed. Accepted finite

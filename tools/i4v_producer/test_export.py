@@ -17,8 +17,8 @@ class ExportChecks(unittest.TestCase):
             self.assertEqual(result['entry_gprs']['rsp'],8)
 
     def test_generated_control_values_decode_to_exact_zero_extended_eax(self):
-        for value in (0x10011,0x80010011,0x1000,0x3000,0,0x80010010,0x20010011,0xffffffff,0x600,0x1003,0x11,0x80000011,0x680):
-            result=export.verify(DATA/f'control-imm-{value:08x}',dict(case=f'fex_mov_eax_{value:08x}',guest_rip=0x102000 if value in (0x1003,0x11,0x80000011,0x680) else 0x2000,bitness=32))
+        for value in (0x10011,0x80010011,0x1000,0x3000,0,0x80010010,0x20010011,0xffffffff,0x600,0x1003,0x11,0x80000011,0x680,0x620,0x6a0,0x1020):
+            result=export.verify(DATA/f'control-imm-{value:08x}',dict(case=f'fex_mov_eax_{value:08x}',guest_rip=0x102000 if value in (0x1003,0x11,0x80000011,0x680,0x620,0x6a0,0x1020) else 0x2000,bitness=32))
             self.assertEqual(bytes.fromhex(result['source_hex']),b'\xb8'+value.to_bytes(4,'little'))
             body=bytes.fromhex(result['body_hex']);eax=None
             for offset in range(0,len(body),4):

@@ -173,7 +173,7 @@ produce identical bytes. Shared data/table mutations use the existing coordinato
 paging-off identity routes must remain unchanged when paged routes move.
 `probe_mixed32.py` retains count discovery, checked exports and disassembly.
 
-Add `--controls` for thirteen single-vCPU protected32/legacy32 programs. The
+Add `--controls` for the single-vCPU protected32/legacy32/PAE programs. The
 resident runtime fetches and handles MOV-to-CR0/CR3/CR4; ordinary instructions
 between those controls are freshly compiled by FEX at their actual EIP. Cases
 `fex_mov_eax_HEX8`, `fex_store_eax_ebx32` and `fex_load_eax_ebx32` admit the
@@ -191,7 +191,19 @@ full guest tables/data/source, native fault sites and canonical state. Shadow
 eviction covers the admitted operand leaf; this profile does not establish a
 general all-address invalidation path or concurrent control transitions.
 
+Nine PAE programs extend those thirteen legacy programs. Three additional
+MOV-immediate exports (`620`, `6a0`, `1020`) select PAE/PGE and a root that is
+32-byte aligned but not page aligned. Wire mode2 keeps FEX's32-bit decode width
+while distinguishing PAE context from legacy paging and paging off. Guest
+INVLPG remains a resident semantic operation. Hidden roots are compared with
+their independent memory image through source fetches and real generated data
+accesses. Failed-active-reload cases use an explicit one-shot handler fixture;
+the next generated load must still use old hidden roots after native eviction.
+The PAE A/B/A case also retains an actual deferred compilation across reloads.
+Native PAE coverage is4-KiB/NXE-off; larger-page/NX walker unit tests do not imply
+native coverage. PAE concurrency and full exception delivery remain unimplemented.
+
 Exact results and independent acceptance live in INV-03-01. Broader segment and
-address forms, PAE/IA-32e and concurrent transitions remain further work alongside remaining V1
+address forms, IA-32e and concurrent transitions remain further work alongside remaining V1
 boundaries and the broader campaign. These finite profiles do not complete V1,
 V2, V3 or I4-V.

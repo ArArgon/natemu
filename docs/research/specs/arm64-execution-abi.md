@@ -461,9 +461,28 @@ control write and guards retained code/replies by context generation. The common
 host initializer's RW/NX source alias remains installed; admitted generated
 memory instructions cannot address it, and every source fetch separately checks
 guest translation before reading private backing. This is not a general
-all-address shadow invalidation implementation. Legacy PAE hidden-state lifetime,
-IA-32e transitions and concurrent transition schedules remain separate required
-extensions. INV-03-01 owns execution results and acceptance of this profile.
+all-address shadow invalidation implementation. PAE hidden-state lifetime is the
+separate extension below; IA-32e and concurrent transitions remain required.
+INV-03-01 owns execution results and acceptance of these profiles.
+
+The V3 PAE extension stores four hidden PDPTEs and their successful-load
+generation in each owner's private state. Control transactions stage all four
+entries and validate the complete candidate before committing controls, context
+and hidden state. Rejected loads publish none of the candidate. Preserving the
+old snapshot on failure is the selected inference from the no-load and
+restartable-fault rules, as clarified in INV-03-01 claim12. It does not require
+preserving physical TLB contents. A disposable native mapping can be evicted
+without reloading the hidden roots. The finite implementation reads all four
+candidates before validation; its exact read count/order is a testable policy,
+not a claim about hardware bus transactions.
+
+PAE reports distinguish raw root memory, hidden entries, attempted and successful
+loads, lower-table walks, guest INVLPG and internal shadow eviction. The initial
+native programs use4-KiB pages with NXE off; separate ABI tests cover2-MiB and NX
+walker behavior. Two failed-active-reload programs use a one-shot handler fixture
+that records#GP, skips the faulting MOV and executes a generated load after native
+eviction. This demonstrates old-root recovery without claiming full guest IDT
+delivery. PAE concurrency and IA-32e transitions remain required extensions.
 
 ## 5. Faults, completion and event delivery
 

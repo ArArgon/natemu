@@ -2,7 +2,7 @@
 use super::validation::{guest, recovery_state, state as validation};
 use super::*;
 use natemu_abi::{
-    controls as c,
+    controls as c, pae,
     paging::{Access, Control, Fault},
     paging32, recovery as r, translation as wire,
 };
@@ -20,6 +20,56 @@ fn at(index: usize) -> *mut c::Visit {
 }
 fn visit() -> *mut c::Visit {
     unsafe { at((*state()).visits as usize - 1) }
+}
+fn pae_state() -> *mut pae::State {
+    (PRIVATE + pae::OFFSET as u64) as *mut pae::State
+}
+unsafe fn pae_visit() -> *mut pae::Visit {
+    unsafe {
+        (&raw mut (*pae_state()).visits)
+            .cast::<pae::Visit>()
+            .add((*state()).visits as usize - 1)
+    }
+}
+struct PaeTables {
+    loading: bool,
+    index: usize,
+}
+impl natemu_abi::paging::Tables for PaeTables {
+    fn read(&mut self, gpa: u64) -> Option<u64> {
+        if !(0x1000..0x6000).contains(&gpa) || gpa & 7 != 0 {
+            return None;
+        }
+        unsafe {
+            if self.loading {
+                if self.index >= 4 {
+                    return None;
+                }
+                (&mut (*pae_visit()).load_addresses)[self.index] = gpa;
+                self.index += 1;
+                (*pae_state()).reads += 1;
+            } else {
+                (*pae_state()).walk_reads += 1;
+            }
+            Some(ptr::read_volatile(
+                (PRIVATE + pae::TABLE_OFFSET as u64 + gpa - 0x1000) as *const u64,
+            ))
+        }
+    }
+    fn write(&mut self, gpa: u64, value: u64) -> bool {
+        if self.loading || !(0x1000..0x6000).contains(&gpa) || gpa & 7 != 0 {
+            return false;
+        }
+        unsafe {
+            ptr::write_volatile(
+                (PRIVATE + pae::TABLE_OFFSET as u64 + gpa - 0x1000) as *mut u64,
+                value,
+            );
+            (*pae_state()).walk_writes += 1;
+            asm!("dsb ish");
+        }
+        true
+    }
 }
 struct Tables;
 impl paging32::Tables for Tables {
@@ -64,18 +114,27 @@ unsafe fn route(address: u64, bytes: u64, access: Access) -> Result<(u64, bool),
         } else {
             (*state()).walks += 1;
             let g = &*guest();
-            let t = paging32::walk(
-                &mut Tables,
-                Control {
-                    cr3: g.control[2],
-                    cpl: (*state()).cpl,
-                    wp: (g.control[0] >> 16) & 1,
-                    nxe: 0,
-                    smep: 0,
-                },
-                address,
-                access,
-            )?;
+            let control = Control {
+                cr3: g.control[2],
+                cpl: (*state()).cpl,
+                wp: (g.control[0] >> 16) & 1,
+                nxe: 0,
+                smep: 0,
+            };
+            let t = if mode == 2 {
+                pae::walk(
+                    &mut PaeTables {
+                        loading: false,
+                        index: 0,
+                    },
+                    &(*pae_state()).hidden,
+                    control,
+                    address,
+                    access,
+                )?
+            } else {
+                paging32::walk(&mut Tables, control, address, access)?
+            };
             if !t.wb {
                 return Err(Fault::Unsupported);
             }
@@ -99,6 +158,11 @@ unsafe fn summarize() {
         (*v).generation_after = (*state()).generation;
         (*v).gpr_after.copy_from_slice(&(&(*g).gpr)[..4]);
         (*v).flags_after = (*g).rflags;
+        if (*state()).profile >= 13 {
+            (*pae_visit()).after = (*pae_state()).hidden;
+            (*pae_visit()).attempts_after = (*pae_state()).attempts;
+            (*pae_visit()).reads_after = (*pae_state()).reads;
+        }
         copy_record(
             (&raw mut (*v).frame).cast(),
             (&raw const (*state()).current).cast(),
@@ -119,6 +183,16 @@ unsafe fn exception(vector: u64, address: u64, error: u64) -> ! {
             (*guest()).control[1] = address;
         }
         summarize();
+        if matches!((*state()).profile, 18 | 19)
+            && vector == 13
+            && (*pae_state()).handled_faults == 0
+        {
+            // Bounded exception-handler fixture; no IDT delivery is claimed.
+            (*pae_state()).handled_faults = 1;
+            evict();
+            (*guest()).rip += (*visit()).bytes;
+            dispatch()
+        }
         (*validation()).stage = 3;
         stop(SUCCESS, 0)
     }
@@ -188,14 +262,20 @@ unsafe fn compile(source: &[u8]) {
         let v = visit();
         let p = next_request(source);
         (*v).request = p;
-        if (*r).profile == 0 && (*r).visits == 16 {
+        if ((*r).profile == 0 && (*r).visits == 16) || ((*r).profile == 21 && (*r).visits == 12) {
+            let old_index = if (*r).profile == 21 { 4 } else { 0 };
+            let old_rip = if (*r).profile == 21 {
+                c::RIP + 16
+            } else {
+                c::RIP
+            };
             if (*guest()).control != (*r).old_controls
-                || (*guest()).rip != c::RIP
+                || (*guest()).rip != old_rip
                 || (*r).generation == (*r).old_slot_context
             {
                 stop(PANIC, 273);
             }
-            if eligible(0) {
+            if eligible(old_index) {
                 stop(PANIC, 274);
             }
             (*r).stale_entry = 1;
@@ -230,8 +310,9 @@ unsafe fn compile(source: &[u8]) {
         image[start..start + count].copy_from_slice(&reply[14].to_le_bytes()[..count]);
         image[start + count..start + count + 4].copy_from_slice(&RET);
         translation::replace_bytes(&image);
-        if (*r).profile == 0 && (*r).visits == 1 {
+        if ((*r).profile == 0 && (*r).visits == 1) || ((*r).profile == 21 && (*r).visits == 5) {
             (*r).old_slot_context = (*r).generation;
+            (*r).old_controls = (*guest()).control;
             let deferred = next_request(source);
             (*r).deferred = deferred;
             (*validation()).requests += 1;
@@ -256,6 +337,11 @@ unsafe fn begin_visit() {
         (*at).generation_before = (*s).generation;
         (*at).gpr_before.copy_from_slice(&(&(*g).gpr)[..4]);
         (*at).flags_before = (*g).rflags;
+        if (*s).profile >= 13 {
+            (*pae_visit()).before = (*pae_state()).hidden;
+            (*pae_visit()).attempts_before = (*pae_state()).attempts;
+            (*pae_visit()).reads_before = (*pae_state()).reads;
+        }
         (*validation()).stage = 0;
     }
 }
@@ -273,16 +359,45 @@ unsafe fn invalidate() {
         (*state()).invalidations += 1;
     }
 }
+unsafe fn evict() {
+    unsafe {
+        recovery::clear_mapping(DATA_VA);
+        (*state()).mapping = 0;
+        (*pae_state()).evictions += 1;
+    }
+}
 unsafe fn control(source: &[u8]) {
     unsafe {
         (*visit()).kind = 1;
         let operation = c::decode(source).and_then(|op| {
-            c::apply(
-                &mut *guest(),
-                &mut (*state()).generation,
-                (*state()).cpl,
-                op,
-            )?;
+            let before = (*guest()).control;
+            let after = c::prepare(&*guest(), (*state()).cpl, op, (*state()).profile >= 13)?;
+            let generation = (*state())
+                .generation
+                .checked_add(1)
+                .ok_or(c::Error::Unsupported)?;
+            let mut hidden = (*pae_state()).hidden;
+            if pae::reload(&before, &after, op.cr) {
+                let next = hidden
+                    .generation
+                    .checked_add(1)
+                    .ok_or(c::Error::Unsupported)?;
+                (*pae_state()).attempts += 1;
+                let entries = pae::load(
+                    &mut PaeTables {
+                        loading: true,
+                        index: 0,
+                    },
+                    after[2],
+                )?;
+                hidden = pae::Hidden {
+                    entries,
+                    generation: next,
+                };
+            }
+            (*guest()).control = after;
+            (*state()).generation = generation;
+            (*pae_state()).hidden = hidden;
             Ok(op)
         });
         match operation {
@@ -311,7 +426,12 @@ pub unsafe fn initialize() -> ! {
             || (*r).serial != 0
             || (*g).rip != c::RIP
             || (*g).control[0] != 0x10011
-            || (*g).control[2] != 0x1000
+            || (*g).control[2]
+                != if (*r).profile >= 13 {
+                    pae::ROOT
+                } else {
+                    0x1000
+                }
             || (*g).control[3] != 0x600
             || (*g).control[4] != 0
             || (*s).initial.x[6] != DATA_VA
@@ -349,6 +469,11 @@ pub unsafe fn initialize() -> ! {
                 stop(REJECTED, 281);
             }
         }
+        for i in 0..size_of::<pae::State>() / 8 {
+            if ptr::read_volatile(pae_state().cast::<u64>().add(i)) != 0 {
+                stop(REJECTED, 290);
+            }
+        }
         (*s).service_pc = service_resume as *const () as u64;
         recovery::clear_mapping(DATA_VA);
         dispatch()
@@ -362,6 +487,7 @@ unsafe fn dispatch() -> ! {
             let g = guest();
             let (_, bytes) = c::source((*r).profile).unwrap();
             if ((*r).profile == 0 && (*r).completed == 17)
+                || ((*r).profile == 21 && (*r).completed == 12)
                 || ((*r).profile != 0 && (*g).rip == c::RIP + bytes as u64)
             {
                 (*validation()).stage = 2;
@@ -384,6 +510,21 @@ unsafe fn dispatch() -> ! {
             (*visit()).bytes = instruction.len as u64;
             (*visit()).source = u64::from_le_bytes(actual);
             let source = &actual[..instruction.len];
+            if source == [0x0f, 1, 0x3b] {
+                if (*r).profile != 14 || (*r).cpl != 0 || (*r).current.x[6] != DATA_VA {
+                    stop(REJECTED, 291);
+                }
+                (*visit()).kind = 3;
+                (*r).generation = (*r)
+                    .generation
+                    .checked_add(1)
+                    .unwrap_or_else(|| stop(REJECTED, 292));
+                (*pae_state()).invlpg += 1;
+                invalidate();
+                (*g).rip += 3;
+                complete_visit();
+                continue;
+            }
             if actual[0] == 0xe9 {
                 (*visit()).kind = 2;
                 let delta = i32::from_le_bytes(actual[1..5].try_into().unwrap()) as i64;
@@ -502,6 +643,24 @@ pub unsafe fn finish(fault: u64) -> ! {
             );
             asm!("dsb ish");
             (*r).fixture_mutated = 1;
+        }
+        let profile = (*r).profile;
+        let completed = (*r).completed;
+        let first = (matches!(profile, 14 | 15 | 16 | 21) && completed == 5)
+            || (matches!(profile, 18 | 19) && completed == 7);
+        let second = profile == 21 && completed == 8;
+        if first || second {
+            // Fixture changes memory roots without changing the loaded hidden set.
+            let at = (PRIVATE + pae::TABLE_OFFSET as u64 + pae::ROOT - 0x1000) as *mut u64;
+            ptr::write_volatile(at, if second { 0x2001 } else { 0x4001 });
+            if matches!(profile, 18 | 19) {
+                ptr::write_volatile(at.add(3), 0x21);
+            }
+            asm!("dsb ish");
+            (*pae_state()).mutations += 1;
+            if profile == 15 {
+                evict();
+            }
         }
         dispatch()
     }

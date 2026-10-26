@@ -1,12 +1,41 @@
 //! Actual guest control instructions around freshly generated ordinary instructions.
 use super::*;
-use natemu_abi::{controls as control, recovery as recover, shadow, validation};
+use natemu_abi::{controls as control, pae, recovery as recover, shadow, validation};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
 mod producer;
 const CODE_BYTES: usize = control::MAX_VISITS * control::SLOT_BYTES;
+const PAE_TABLE_OFFSET: usize = pae::TABLE_OFFSET;
+const PAE_TABLE_BYTES: usize = pae::TABLE_BYTES;
+
+fn pae_tables(profile: u64) -> [u8; PAE_TABLE_BYTES] {
+    let mut bytes = [0; PAE_TABLE_BYTES];
+    if (13..=21).contains(&profile) {
+        for (gpa, value) in [
+            (
+                0x1020,
+                if profile == 20 {
+                    0xffff_ffff_ffff_fffeu64
+                } else {
+                    0x2001
+                },
+            ),
+            (0x1038, if profile == 17 { 0x21 } else { 0 }),
+            (0x2000, 0x3007),
+            (0x3000 + 256 * 8, 0x100007),
+            (0x3000 + 258 * 8, 0x102007),
+            (0x4000, 0x5007),
+            (0x5000 + 256 * 8, 0x101007),
+            (0x5000 + 258 * 8, 0x102007),
+        ] {
+            let offset = gpa - 0x1000;
+            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    bytes
+}
 
 macro_rules! fields {
     ($record:ident; $($field:ident),* $(,)?) => {{
@@ -25,6 +54,20 @@ fn state_json(s: &control::State) -> String {
     let mut fields = fields!(s; profile,cpl,generation,visits,completed,transfers,serial,walks,invalidations,mapping,fixture_mutated,warm_before_reload,stale_reply,stale_entry,expected,deferred,late_reply,rebound_reply,old_slot_context,old_controls);
     fields.push(format!("\"initial\":{}", frame_json(&s.initial)));
     fields.push(format!("\"current\":{}", frame_json(&s.current)));
+    format!("{{{}}}", fields.join(","))
+}
+fn hidden_json(hidden: &pae::Hidden) -> String {
+    format!("{{{}}}", fields!(hidden; entries,generation).join(","))
+}
+fn pae_json(state: &pae::State) -> String {
+    let mut fields = fields!(state; attempts,reads,walk_reads,walk_writes,invlpg,evictions,mutations,handled_faults);
+    fields.push(format!("\"hidden\":{}", hidden_json(&state.hidden)));
+    let visits = state.visits.iter().map(|visit| {
+        let mut fields = fields!(visit; load_addresses,attempts_before,attempts_after,reads_before,reads_after);
+        fields.push(format!("\"before\":{},\"after\":{}",hidden_json(&visit.before),hidden_json(&visit.after)));
+        format!("{{{}}}",fields.join(","))
+    }).collect::<Vec<_>>().join(",");
+    fields.push(format!("\"visits\":[{visits}]"));
     format!("{{{}}}", fields.join(","))
 }
 fn read_state(memory: &Memory) -> control::State {
@@ -73,6 +116,8 @@ pub fn run(args: &[String]) -> Result<()> {
         tables_before[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
     }
     memory.copy(recover::TABLE_OFFSET, &tables_before);
+    let pae_tables_before = pae_tables(profile);
+    memory.copy(PAE_TABLE_OFFSET, &pae_tables_before);
     let (mut frame, bank, _) = seed(3);
     for &native in &natemu_abi::pressure::ENTRY[..8] {
         frame.x[native] &= u32::MAX as u64;
@@ -85,7 +130,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     guest.rip = control::RIP;
     guest.control[0] = 0x10011;
-    guest.control[2] = 0x1000;
+    guest.control[2] = if profile >= 13 { 0x1020 } else { 0x1000 };
     guest.control[3] = 0x600;
     guest.control[4] = 0;
     guest.segments[0] = [8 | cpl, 0, 0xffff_ffff, 0xc09b | (cpl << 5)];
@@ -146,6 +191,7 @@ pub fn run(args: &[String]) -> Result<()> {
             validation_state,
         );
         ptr::write(memory.0.add(control::OFFSET).cast(), state);
+        ptr::write(memory.0.add(pae::OFFSET).cast(), pae::State::ZERO);
         ptr::write(memory.0.add(SHARED_OFFSET).cast(), shared);
         sys_icache_invalidate(memory.0.cast(), RAM_SIZE);
     }
@@ -193,6 +239,8 @@ pub fn run(args: &[String]) -> Result<()> {
             vm.reg(i as u32, word)?;
         }
     }
+    let pae_state =
+        unsafe { ptr::read_volatile(vm.memory.0.add(pae::OFFSET).cast::<pae::State>()) };
     let result = vm.shared();
     let state = read_state(&vm.memory);
     let v = unsafe {
@@ -246,6 +294,11 @@ pub fn run(args: &[String]) -> Result<()> {
     );
     add!("data_before", data_before);
     add!("data_after", vm.memory.read::<8192>(DATA_OFFSET));
+    add!("pae_tables_before", pae_tables_before);
+    add!(
+        "pae_tables_after",
+        vm.memory.read::<PAE_TABLE_BYTES>(PAE_TABLE_OFFSET)
+    );
     add!("tables_before", tables_before);
     add!(
         "tables_after",
@@ -260,6 +313,7 @@ pub fn run(args: &[String]) -> Result<()> {
     );
     add!("bank_before", bank);
     report.push(format!("\"controls\":{},\"visits\":[{}],\"initial\":{},\"entered\":{},\"final_frame\":{},\"guest_before\":{},\"guest_after\":{},\"recovery\":{}",state_json(&state),visits,frame_json(&frame),frame_json(&result.initial),frame_json(&result.captured),recovery::guest_json(&guest),recovery::guest_json(&guest_after),recovery::report(&vm,&guest,&tables_before)));
+    report.push(format!("\"pae\":{}", pae_json(&pae_state)));
     println!("{{{}}}", report.join(","));
     if result.current_el != 4
         || result.sctlr & 0x1005 != 0x1005
@@ -276,4 +330,35 @@ pub fn run(args: &[String]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn pae_fixture_uses_distinct_pages_and_nonzero_pdpt_offset() {
+        let bytes = pae_tables(13);
+        let word = |gpa: usize| {
+            u64::from_le_bytes(bytes[gpa - 0x1000..gpa - 0x1000 + 8].try_into().unwrap())
+        };
+        assert_eq!(word(0x1000), 0);
+        assert_eq!(word(0x1020), 0x2001);
+        assert_eq!(word(0x2000), 0x3007);
+        assert_eq!(word(0x4000), 0x5007);
+        assert_eq!(word(0x3000 + 256 * 8), 0x100007);
+        assert_eq!(word(0x5000 + 256 * 8), 0x101007);
+        assert_eq!(word(0x3000 + 258 * 8), word(0x5000 + 258 * 8));
+        assert!(PAE_TABLE_OFFSET + PAE_TABLE_BYTES <= recover::TABLE_OFFSET);
+        assert_eq!(pae_tables(12), [0; PAE_TABLE_BYTES]);
+        let invalid = pae_tables(17);
+        assert_eq!(
+            u64::from_le_bytes(invalid[0x38..0x40].try_into().unwrap()),
+            0x21
+        );
+        let absent = pae_tables(20);
+        assert_eq!(
+            u64::from_le_bytes(absent[0x20..0x28].try_into().unwrap()),
+            0xffff_ffff_ffff_fffe
+        );
+    }
 }

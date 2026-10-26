@@ -12,7 +12,7 @@ SOURCE_CASES={bytes.fromhex(spec['source']):name for name,spec in CASES.items()
               if name.startswith('fex_mov_eax_') or name in ('fex_store_eax_ebx32','fex_load_eax_ebx32')}
 
 def request(vm,generation,mode,rip,source,serial):
-    require(vm>0 and generation>0 and mode in (0,1) and serial>0,'unsupported control compile identity')
+    require(vm>0 and generation>0 and mode in (0,1,2) and serial>0,'unsupported control compile identity')
     require(source in SOURCE_CASES and 0x102000<=rip and rip+len(source)<=0x103000,'unsupported ordinary source/address')
     body=bytes.fromhex(CASES[SOURCE_CASES[source]]['body'])
     return (MISS,1,vm,0,1,1,generation,rip,mode,int.from_bytes(source.ljust(8,b'\0'),'little'),len(source),rip,serial,len(body),0,0)

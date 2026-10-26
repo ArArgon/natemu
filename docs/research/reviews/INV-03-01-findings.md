@@ -1,5 +1,90 @@
 # INV-03-01 — source findings review
 
+## Intermediate I4-V return — hidden PAE state, October 26, 2026 UTC
+
+Root authored ABI/runtime and runner changes, `/root/i4v_producer` authored
+host/compiler integration, and `/root/i4v_upstream` authored the independent
+expected-effects model. `/root/i4v_contract_review` reviewed the transaction,
+walker, compiler bindings and emitted stack usage, then independently rebuilt
+and executed primary02's retained snapshot. **ACCEPT the finite N=1 hidden-PAE
+checkpoint; V3 and I4-V remain incomplete.**
+
+Independent `i4v-pae-independent-20261026-01` passes301 jobs and277 native cells,
+preserving268 prior cells and adding nine PAE programs. The reviewer independently
+rechecked all277 reports,662 actual compilations,674 report-to-compile
+associations,916 delivered transfers and15,022 checksums. All470 retained inputs
+match primary02 exactly; only the producer README differs in the subsequent
+workspace. The reused FEX executable matches its pin and no compiler containers
+remain. Specification, README and current-investigation wording consistently
+separate the finite result from required later coverage.
+
+The nine programs contain78 visits,74 completed guest instructions,49 native
+entries and20 native faults, including two permission faults after read-only
+native fills. All50 new actual compilations and delivered replies bind EIP,
+source, mode and context. The reports independently establish16 hidden-load
+attempts,13 successful publications,64 root reads,116 lower-table reads,35 A/D
+writes,seven fixture mutations,one guest INVLPG and three explicit native
+evictions. No root A/D write is fabricated. The root at0x1020 verifies32-byte
+alignment independently of page alignment; nonpresent root payload is accepted
+at load and faults at subsequent fetch without following a directory.
+
+The four candidate entries are staged and validated before controls, hidden
+snapshot and generations commit. Invalid fourth-entry activation leaves the old
+mode and prior store intact. Failed active CR3 and CR4 reloads preserve the old
+snapshot and control/context state. An explicit one-shot handler fixture records
+#GP, skips the rejected MOV without counting it completed, evicts the disposable
+native operand mapping and resumes actual generated code. Its next load faults
+natively and returns the earlier stored0x10011 from GPA0x100000, although root
+memory now points to the alternative directory and has an invalid fourth entry.
+This tests old-root recovery without claiming guest IDT delivery.
+
+The distinction follows accepted claim41's staged hidden-state contract. Intel
+§5.4.1 specifies that an invalid present candidate causes#GP and is not loaded;
+old-snapshot preservation is the selected inference from that rule and restartable
+fault semantics, not a quotation asserting hidden validity-bit behavior. This
+clarifies the earlier review phrase “leaves the PDPTE set unloaded”: it describes
+rejection of the candidate, not clearing a previously loaded set. Native cache
+contents need not survive the failure. Exact four-read ordering is the runtime's
+policy, not a claim about hardware bus transactions.
+[Intel SDM Volume3A §§5.4.1 and7.4](https://cdrdv2-public.intel.com/922487/253668-092-sdm-vol-3a.pdf).
+
+INVLPG, internal eviction and WP changes retain the hidden snapshot; required
+same-value CR3 and PGE changes reload it. The A/B/A program returns to the same
+source PC and numerical controls with contexts3/4/5, rejects the old eligible
+entry, and rejects an actual delayed reply both originally and with only its
+serial rebound. Mode2 remains a distinct compiler identity while FEX decodes
+ordinary instructions at32-bit width. Existing instruction/permission fixtures
+retain their attribution; hidden-root schedules and the handler are authored
+project tests, not claimed imported upstream PAE tests.
+
+Before collection, review tightened the control-state extent assertion to
+protect adjacent PAE state at0x24000. A fourth ABI test covers2-MiB translation,
+reserved alignment, NX fetch denial and supervisor WP denial/bypass. Native
+coverage remains4-KiB/NXE-off. The checker correctly distinguishes permission
+faults from missing-native-mapping faults and has negative controls for both;
+all13 checker test methods also pass independently. Focused
+`i4v-pae-dev-20261026-01` passes with all1,448 checksums and seven actual
+compilation/delivery associations independently verified.
+
+Primary02, the independent rebuild and serialized legacy rebuild share runtime
+SHA256 `0c5bc1dfd93894537d5e993190acf95e2576dc557040f21d3e811e6c35999211`.
+The two RX loads contain168 boot bytes and105,100 main-image bytes; boot ADR
+resolves the aligned vector table inside the main window. Conservative maximum
+return/exception stack use remains14,992 of16,384 bytes, leaving1,392. The
+controls dispatch/compile/exception frames use1,872/1,232/48 bytes; the bounded
+handler admits only one extra dispatch activation and remains below that limit.
+Root's `i4v-pae-regression-20261026-01` passes87 jobs from06:44:09–06:44:52UTC;
+the reviewer inspected its terminal manifest and matching ELF, without claiming
+another independent legacy execution.
+
+The independent run lasted255 seconds,06:39:33–06:43:48UTC, and retained
+152,554,029 bytes. Observed peak build/worker process-group RSS was
+445,136,896/409,042,944 bytes, within the limits. No substantive blocker remains
+within this scope. IA-32e and far transitions, concurrent control/hidden-state
+schedules, general address/invalidation forms, remaining V1 boundaries and the
+broader ordering/coherence campaign remain required. No full V3/I4-V or
+performance acceptance follows.
+
 ## Intermediate I4-V return — first guest control transitions, October 26, 2026 UTC
 
 Root authored ABI/runtime and runner changes, `/root/i4v_producer` authored

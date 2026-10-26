@@ -57,20 +57,26 @@ pub fn decode(source: &[u8]) -> Result<ControlOp, Error> {
 }
 pub fn mode(g: &GuestState) -> Option<u64> {
     if g.control[4] != 0
-        || g.control[3] & !0x680 != 0
+        || g.control[3] & !0x6a0 != 0
         || g.control[0] & !0x80010011 != 0
         || g.control[0] & 0x11 != 0x11
     {
         return None;
     }
-    Some((g.control[0] >> 31) & 1)
+    Some(if g.control[0] >> 31 == 0 {
+        0
+    } else if g.control[3] & 32 != 0 {
+        2
+    } else {
+        1
+    })
 }
-pub fn apply(
-    g: &mut GuestState,
-    generation: &mut u64,
+pub fn prepare(
+    g: &GuestState,
     cpl: u64,
     op: ControlOp,
-) -> Result<(), Error> {
+    allow_pae: bool,
+) -> Result<[u64; 8], Error> {
     if cpl != 0 {
         return Err(Error::GeneralProtection);
     }
@@ -89,7 +95,7 @@ pub fn apply(
             value
         }
         3 => {
-            if value & 0x18 != 0 {
+            if g.control[3] & 32 == 0 && value & 0x18 != 0 {
                 return Err(Error::Unsupported);
             }
             value
@@ -98,22 +104,33 @@ pub fn apply(
             if value & !CR4_EXPOSED != 0 {
                 return Err(Error::GeneralProtection);
             }
-            if value & !0x680 != 0 {
+            if value & !(if allow_pae { 0x6a0 } else { 0x680 }) != 0 {
                 return Err(Error::Unsupported);
             }
             value
         }
         _ => return Err(Error::Unsupported),
     };
-    let new_generation = generation.checked_add(1).ok_or(Error::Unsupported)?;
+    let mut controls = g.control;
     // Architectural register indices differ from the transport CR array indices.
-    g.control[match op.cr {
+    controls[match op.cr {
         0 => 0,
         3 => 2,
         4 => 3,
         _ => unreachable!(),
     }] = next;
-    *generation = new_generation;
+    Ok(controls)
+}
+pub fn apply(
+    g: &mut GuestState,
+    generation: &mut u64,
+    cpl: u64,
+    op: ControlOp,
+) -> Result<(), Error> {
+    let controls = prepare(g, cpl, op, false)?;
+    let next = generation.checked_add(1).ok_or(Error::Unsupported)?;
+    g.control = controls;
+    *generation = next;
     // Deterministic policy: preserve MOV-CR's undefined arithmetic flags.
     Ok(())
 }
@@ -132,6 +149,9 @@ pub fn immediate(value: u32) -> Option<([u8; 8], usize)> {
         0x11 => &[0x52800224],
         0x80000011 => &[0x52800224, 0x72b00004],
         0x680 => &[0x5280d004],
+        0x620 => &[0x5280c404],
+        0x6a0 => &[0x5280d404],
+        0x1020 => &[0x52820404],
         _ => return None,
     };
     let mut bytes = [0; 8];
@@ -178,8 +198,12 @@ const JUMP: Instruction = Instruction {
     bytes: [0xe9, 0, 0, 0, 0, 0, 0, 0],
     len: 5,
 };
+const INVLPG: Instruction = Instruction {
+    bytes: [0x0f, 1, 0x3b, 0, 0, 0, 0, 0],
+    len: 3,
+};
 pub fn instructions(profile: u64) -> Option<&'static [Instruction]> {
-    const PROGRAMS: [&[Instruction]; 13] = [
+    const PROGRAMS: [&[Instruction]; 22] = [
         &[
             mov(0x10011),
             STORE,
@@ -251,6 +275,89 @@ pub fn instructions(profile: u64) -> Option<&'static [Instruction]> {
             cr(4),
             LOAD,
         ],
+        &[mov(0x620), cr(4), mov(0x80010011), cr(0), LOAD],
+        &[
+            mov(0x620),
+            cr(4),
+            mov(0x80010011),
+            cr(0),
+            LOAD,
+            INVLPG,
+            LOAD,
+            mov(0x1020),
+            cr(3),
+            LOAD,
+        ],
+        &[
+            mov(0x620),
+            cr(4),
+            mov(0x80010011),
+            cr(0),
+            LOAD,
+            LOAD,
+            mov(0x1020),
+            cr(3),
+            LOAD,
+        ],
+        &[
+            mov(0x620),
+            cr(4),
+            mov(0x80010011),
+            cr(0),
+            LOAD,
+            mov(0x80000011),
+            cr(0),
+            LOAD,
+            mov(0x6a0),
+            cr(4),
+            LOAD,
+        ],
+        &[
+            mov(0x10011),
+            STORE,
+            mov(0x620),
+            cr(4),
+            mov(0x80010011),
+            cr(0),
+        ],
+        &[
+            mov(0x620),
+            cr(4),
+            mov(0x80010011),
+            cr(0),
+            LOAD,
+            mov(0x10011),
+            STORE,
+            mov(0x1020),
+            cr(3),
+            LOAD,
+        ],
+        &[
+            mov(0x620),
+            cr(4),
+            mov(0x80010011),
+            cr(0),
+            LOAD,
+            mov(0x10011),
+            STORE,
+            mov(0x6a0),
+            cr(4),
+            LOAD,
+        ],
+        &[mov(0x620), cr(4), mov(0x80010011), cr(0), LOAD],
+        &[
+            mov(0x620),
+            cr(4),
+            mov(0x80010011),
+            cr(0),
+            LOAD,
+            mov(0x1020),
+            cr(3),
+            LOAD,
+            mov(0x1020),
+            cr(3),
+            JUMP,
+        ],
     ];
     PROGRAMS.get(usize::try_from(profile).ok()?).copied()
 }
@@ -260,7 +367,9 @@ pub fn source(profile: u64) -> Option<([u8; 128], usize)> {
     for inst in instructions(profile)? {
         source[size..size + inst.len].copy_from_slice(&inst.bytes[..inst.len]);
         if inst.bytes[0] == 0xe9 {
-            source[size + 1..size + 5].copy_from_slice(&(-(size as i32 + 5)).to_le_bytes());
+            let destination = if profile == 21 { 16 } else { 0 };
+            source[size + 1..size + 5]
+                .copy_from_slice(&(destination - (size as i32 + 5)).to_le_bytes());
         }
         size += inst.len;
     }
@@ -289,7 +398,7 @@ pub fn request(
     serial: u64,
 ) -> Option<Packet> {
     let (_, len) = body(source)?;
-    if vm == 0 || generation == 0 || mode > 1 || serial == 0 || source.len() > 8 {
+    if vm == 0 || generation == 0 || mode > 2 || serial == 0 || source.len() > 8 {
         return None;
     }
     let mut bytes = [0; 8];
@@ -394,7 +503,7 @@ pub struct State {
 impl State {
     pub const ZERO: Self = unsafe { core::mem::zeroed() };
 }
-const _: () = assert!(OFFSET + core::mem::size_of::<State>() <= 0x28000);
+const _: () = assert!(OFFSET + core::mem::size_of::<State>() <= crate::pae::OFFSET);
 const _: () = assert!(RECORD_OFFSET + MAX_VISITS * core::mem::size_of::<Visit>() <= 0x90000);
 #[cfg(test)]
 mod tests {
