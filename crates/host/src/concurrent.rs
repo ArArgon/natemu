@@ -3,6 +3,7 @@ use super::*;
 use natemu_abi::concurrency::*;
 use natemu_abi::translation as wire;
 use natemu_abi::{alias, shadow, stack, stack_concurrent};
+mod boundary;
 mod controls;
 mod mixed;
 mod mixed_producer;
@@ -390,6 +391,7 @@ pub fn run_controls(args: &[String]) -> Result<()> {
 
 pub fn run(args: &[String]) -> Result<()> {
     let n: usize = args[4].parse().map_err(|_| "invalid I4 vCPU count")?;
+    let boundary_config = boundary::Config::parse(args, n)?;
     let mut coord = Coordinator::new(n).ok_or("I4 admits 1..=4 vCPUs")?;
     let mut host_limit = 0;
     unsafe {
@@ -410,7 +412,9 @@ pub fn run(args: &[String]) -> Result<()> {
     } else {
         0
     };
-    let (scenario_id, alias_profile, stack_kind) = if mixed_profile != 0 {
+    let (scenario_id, alias_profile, stack_kind) = if let Some(config) = &boundary_config {
+        (5, config.alias_profile, 1)
+    } else if mixed_profile != 0 {
         (5, 0, 0)
     } else {
         profiles(&args[3])?
@@ -497,6 +501,9 @@ pub fn run(args: &[String]) -> Result<()> {
             }
         }
         tables(&memory, base, alias_profile != 0);
+        if boundary_config.is_some() {
+            boundary::prepare_owner(&memory, id);
+        }
         if mixed_profile != 0 {
             mixed::private_code(&memory, base);
         }
@@ -665,6 +672,9 @@ pub fn run(args: &[String]) -> Result<()> {
             }
         }
     }
+    if let Some(config) = &boundary_config {
+        boundary::prepare_shared(&memory, config, n);
+    }
     let mixed_pages_before = if mixed_profile != 0 {
         memory.read::<8192>(DATA_OFFSET).to_vec()
     } else {
@@ -696,7 +706,7 @@ pub fn run(args: &[String]) -> Result<()> {
     } else {
         16 | 1 << 8 | 1 << 10 | 3 << 12 | 1 << 23 | 2 << 32
     };
-    let requests = run_owners(
+    let execution = run_owners(
         n,
         tcr,
         delay,
@@ -713,9 +723,20 @@ pub fn run(args: &[String]) -> Result<()> {
         },
         mixed_profile,
         None,
-    )?;
+    );
+    let requests = match execution {
+        Ok(requests) => requests,
+        Err(error) => {
+            if let Some(config) = &boundary_config {
+                // run_owners joins all owners before returning an error.
+                eprintln!("boundary failure state: {}", boundary::report(&memory, config, n, "null"));
+            }
+            return Err(error);
+        }
+    };
     // Every owner has exited and destroyed its vCPU before host reads guest RAM.
     let c = unsafe { &*memory.0.add(COORD_OFFSET).cast::<Coordinator>() };
+    let boundary_shared = boundary_config.as_ref().map(|_| boundary::shared(&memory));
     let mut cells = Vec::new();
     let mut faults = Vec::new();
     let mut new_cells = Vec::new();
@@ -725,6 +746,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut mixed_records = Vec::new();
     for (id, (frame, bank, data)) in seeds.iter().enumerate() {
         let base = id * RAM_SIZE;
+        let boundary_owner = boundary_config.as_ref().map(|_| boundary::owner(&memory, id));
         let s = unsafe { ptr::read(memory.0.add(base + SHARED_OFFSET).cast::<Shared>()) };
         if s.status != SUCCESS || s.current_el != 4 || s.actlr & 2 != 2 || s.tcr != tcr {
             return Err(format!("CPU{id}: status={} detail={}", s.status, s.detail));
@@ -753,8 +775,9 @@ pub fn run(args: &[String]) -> Result<()> {
                 s.current_el,s.sctlr,s.actlr,s.tcr,a.ttbr1,a.warm,a.ack_count,a.acks,
                 a.wrong_rip_rejections,a.blank_before_publish,a.source_address,a.source_gpa,a.source_leaf_before,a.source_leaf_after,a.source_before,a.source_after,
                 i4v::words(&memory,base+shadow::UPPER_ROOT),i4v::words(&memory,base+shadow::UPPER_L1),
-                i4v::words(&memory,base+shadow::UPPER_L2),i4v::words(&memory,base+shadow::UPPER_LEAF),
-                i4v::words(&memory,base+shadow::LOWER_LEAF)));
+                i4v::words(&memory,base+shadow::UPPER_L2),
+                boundary_owner.as_ref().map_or_else(|| i4v::words(&memory,base+shadow::UPPER_LEAF), |o| o.upper_before),
+                boundary_owner.as_ref().map_or_else(|| i4v::words(&memory,base+shadow::LOWER_LEAF), |o| o.lower_before)));
         }
         if stack_profile {
             let state = unsafe {
@@ -771,14 +794,14 @@ pub fn run(args: &[String]) -> Result<()> {
             if id == 0 {
                 before.rflags &= !0x200;
             }
-            let after = unsafe {
+            let after = boundary_owner.as_ref().map_or_else(|| unsafe {
                 ptr::read(
                     memory
                         .0
                         .add(base + natemu_abi::recovery::GUEST_OFFSET)
                         .cast::<natemu_abi::recovery::GuestState>(),
                 )
-            };
+            }, |o| o.before_guest);
             let programs = state
                 .programs
                 .iter()
@@ -894,7 +917,9 @@ pub fn run(args: &[String]) -> Result<()> {
         .take(c.trace_length.load(Ordering::Acquire) as usize)
         .map(|v| v.load(Ordering::Relaxed))
         .collect();
-    let scenario = &args[3];
+    let scenario = boundary_config.as_ref().map_or(args[3].as_str(), |config| {
+        if config.alias_profile == 1 { "stack-low" } else { "stack-high" }
+    });
     let source_summary = format!(
         "{{\"old_eligible\":{},\"published\":{},\"stale_replies\":{},\"stale_entries\":{},\"reuse_blocked\":{},\"bytes\":{:?},\"old_code\":{:?},\"new_code\":{:?}}}",
         c.old_eligible.load(Ordering::Acquire),
@@ -924,6 +949,8 @@ pub fn run(args: &[String]) -> Result<()> {
         },
         if mixed_profile != 0 {
             memory.read::<24>(CODE_OFFSET + 4096).to_vec()
+        } else if let Some(b) = boundary_shared {
+            b.code_before.to_vec()
         } else if stack_profile {
             memory
                 .read::<{ stack::CODE_BYTES }>(CODE_OFFSET + 4096)
@@ -944,8 +971,10 @@ pub fn run(args: &[String]) -> Result<()> {
     } else {
         None
     };
-    let final_leaf =
-        u64::from_le_bytes(memory.read::<8>(natemu_abi::recovery::TABLE_OFFSET + 0x3000 + 256 * 8));
+    let final_leaf = boundary_shared.map_or_else(
+        || u64::from_le_bytes(memory.read::<8>(natemu_abi::recovery::TABLE_OFFSET + 0x3000 + 256 * 8)),
+        |b| u64::from_le_bytes(b.tables_before[0x3800..0x3808].try_into().unwrap()),
+    );
     let compose_leaf = maintenance.as_ref().map_or(final_leaf, |m| m.compose_leaf);
     let maintenance_json = if let Some(m) = maintenance {
         let mut intervals = Vec::new();
@@ -1043,11 +1072,11 @@ pub fn run(args: &[String]) -> Result<()> {
         Vec::new()
     };
     let stack_memory_after = if stack_profile {
-        memory.read::<8192>(DATA_OFFSET).to_vec()
+        boundary_shared.map_or_else(|| memory.read::<8192>(DATA_OFFSET).to_vec(), |b| b.data_before.to_vec())
     } else {
         Vec::new()
     };
-    println!(
+    let prefix = format!(
         "{{\"mixed_profile\":{mixed_profile},\"mixed_compiled\":{mixed_compiled},\"mixed\":[{mixed_json}],\"mixed_pages_before\":{mixed_pages_before:?},\"mixed_pages_after\":{mixed_pages_after:?},\"mixed_tables_before\":{mixed_tables_before:?},\"mixed_tables_after\":{mixed_tables_after:?},\"stack_profile\":{stack_flag},\"stacks\":[{}],\"stack_memory_before\":{stack_memory_before:?},\"stack_memory_after\":{stack_memory_after:?},\"alias_profile\":{alias_profile},\"source_rip\":{source_rip},\"aliases\":[{}],\"maintenance\":{maintenance_json},\"events\":[{}],\"source\":{source_summary},\"requests\":{requests:?},\"coherence\":{summary},\"new_cells\":[{}],\"profile\":\"i4-{scenario}\",\"trace\":{trace:?},\"faults\":[{}],\"retained\":{},\"configured_vcpus\":{n},\"tested_vcpus\":{n},\"delayed_owner_ms\":{delay},\"ready\":{},\"finished\":{},\"cells\":[{}]}}",
         stack_records.join(","),
         alias_records.join(","),
@@ -1056,9 +1085,14 @@ pub fn run(args: &[String]) -> Result<()> {
         faults.join(","),
         c.retained.load(Ordering::Acquire),
         c.ready.load(Ordering::Acquire),
-        c.finished.load(Ordering::Acquire),
+        boundary_shared.map_or_else(|| c.finished.load(Ordering::Acquire), |b| b.finished_before),
         cells.join(",")
     );
+    if let Some(config) = &boundary_config {
+        println!("{}", boundary::report(&memory, config, n, &prefix));
+    } else {
+        println!("{prefix}");
+    }
     Ok(())
 }
 

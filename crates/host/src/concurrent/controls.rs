@@ -170,7 +170,7 @@ fn concurrent_json(s: &cc::Shared) -> String {
     }
     format!("{{{}}}", f.join(","))
 }
-fn coordinator_json(c: &Coordinator) -> String {
+pub(super) fn coordinator_json(c: &Coordinator) -> String {
     let mut f = fields!(c; participants,scenario,alias_profile,stack_profile,mixed_profile);
     macro_rules! atomic {($($name:ident),*)=>{$(f.push(format!("\"{}\":{}",stringify!($name),c.$name.load(Ordering::Acquire)));)*};}
     atomic!(

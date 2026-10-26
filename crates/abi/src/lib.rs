@@ -51,6 +51,7 @@ pub mod resident;
 pub mod shadow;
 pub mod stack;
 pub mod stack_concurrent;
+pub mod stack_boundary;
 pub mod translation;
 pub mod validation;
 pub const SUCCESS: u64 = 1;

@@ -1,5 +1,93 @@
 # INV-03-01 — source findings review
 
+## Intermediate I4-V return — terminal stack faults and split stores, October 26, 2026 UTC
+
+`/root/i4v_producer` authored the boundary ABI/runtime, root authored host and
+runner integration, and `/root/i4v_upstream` authored the independent replay.
+`/root/i4v_contract_review` reviewed the implementation, oracle, emitted code
+and retained artifacts, then independently rebuilt and ran primary04's snapshot.
+**ACCEPT this finite V1 checkpoint. The broader V1/V2/V3 and I4-V campaign remains
+incomplete; this is not general cross-page native-store or full-emulator proof.**
+
+Independent `i4v-stack-boundary-independent-20261026-01` passes420 jobs and
+394 native cells:50 new cases plus344 prior cases. Independent replay and
+artifact checks validate all394 reports,2,394 actual compiler exports,2,406
+report associations,2,948 delivered transfers and44,724 checksums. The exact
+case/job lists and all509 retained producing inputs match primary04; producing
+inputs also match the workspace at audit time. The pinned compiler binary,
+compiler cleanup records and actual exported-source/body bindings pass; no
+compiler containers remain. This is fresh generation from the existing pinned
+FEX producer, not a new upstream FEX build.
+
+The exact new matrix is five outcomes at N=1/2/3/4 and every actor position:
+late #SS, late #GP, checked split-store success, second-fragment absence and
+second-fragment read-only denial. The declared parity assignment selects26 high
+and24 low source forms; this does not imply a100-case source-address cross-product.
+Across150 owners the boundary wave commits590 guest instructions, records130
+native store faults and30 checked-service attempts, of which10 succeed. It uses
+1,415 trace events, at most38 per wave. Each case retains three actual source
+compilations and nine delivered chunks, totaling150/450 for the new matrix.
+
+The replay validates the explicitly captured before-wave state and the actual
+final state separately, including full physical memory, page tables, canonical
+and native registers, code and per-owner lower/upper shadow leaves. The late
+#SS(0)/#GP(0) packets preserve the committed prefix and CR2. Split readiness
+preserves preexisting A/D and lawful new A effects, defers new D and operand
+writes until both fragments are valid, and preserves bytes/RSP when the second
+fragment fails. Success resumes the unchanged generated continuation after the
+checked store service; it does not claim that the original native split store
+completed. Retained peers resume their saved routes in FIFO order, keep whole
+program grants, and complete before remap, delayed acknowledgements, reference
+release and actual code reclamation. Terminal actor state is not overwritten by
+maintenance cleanup. Requested profile/N/actor/source form and actual compiler
+requests/replies bind every report.
+
+Review found missing explicit S1PTW/CM/FnV rejection in direct-store abort
+admission. The runtime and oracle now reject each flag, with negative controls
+for actor and peer reports. Deferred-dirty unit controls also check two initially
+clean leaves and rejection when the second staged PTE changes before commit.
+Development01–03 remain failed diagnostic bundles because their captured
+checkers were deliberately closed; successful retrospective inspection does not
+rewrite those manifests. Fresh primary04 and the independent campaign use the
+completed strict checker and final guard.
+
+Primary04, the fresh independent replica and legacy regression share runtime
+SHA-256 `b9370bb261695da4ffd397b1a6399c83a59ec994613eb0a2a9c456c4d92b2095`.
+The two RX loads occupy168 boot bytes and154,044 main bytes within reserved
+windows; the boot ADR remains valid. Conservative emitted-call accounting is
+14,944/16,384 stack bytes. The independent campaign runs10:22:26–10:34:55UTC
+(749 seconds), retains312,932,246 bytes and observes peak build/worker RSS of
+563,265,536/438,550,528 bytes, within the declared limits. Its owning process
+exited0 before the native/build slot was released. Primary04 runs748 seconds;
+all campaigns are serialized.
+
+The reviewer separately verified root's prior serialized
+`i4v-stack-boundary-regression-20261026-01`:87 passed jobs,2,450 checksums,
+10:20:17–10:21:04UTC, identical runtime and no remaining containers. No reviewer
+legacy rerun or overlapping native/build campaign was needed. Remaining V2
+address formation and broader ordering, coherence, recovery/lifetime and progress
+coverage remain required. The canonical event handoff is still a fixture, not
+architectural guest interrupt delivery.
+
+## Plan review — protected32 address formation, October 26, 2026 UTC
+
+`/root/i4v_contract_review` independently reviewed the next60-case plan.
+**ACCEPT as a bounded implementation plan; no new execution coverage is claimed.**
+It preserves prior394 native cases and87 legacy jobs, shared source/data and
+retained peer lifetimes, precise committed prefixes, stale reply/entry rejection,
+events, delayed acknowledgements, nine-head pressure and ordinary-work fairness.
+Actual per-instruction FEX emission must establish recovery sites. Offset,
+segment-derived linear address and final physical address remain separate;
+fixed A20 masking must be observable for both paging-off actors and paged peers.
+Terminal CS fetch reports #GP(0) at the second instruction with CR2 unchanged
+before any operand access. The maximum-limit DS #GP(0) policy is correctly
+separated from mandatory finite-limit faults: independent inspection of
+[Intel SDM087 Vol3A §6.3, pp.6-4–6-5](https://cdrdv2-public.intel.com/850978/253668-087-sdm-vol-3a.pdf)
+confirms implementation-specific behavior at effective limit0xffffffff.
+The plan explicitly keeps general A20 transitions/split accesses, expand-down
+segments and concurrent device effects outside this finite slice while retaining
+the broader I4-V obligations. No substantive blocker remains.
+
 ## Intermediate I4-V return — concurrent control transactions, October 26, 2026 UTC
 
 Root authored ABI/runtime, coordination and runner changes;

@@ -218,6 +218,9 @@ unsafe fn drive(id: u64) -> ! {
                 }
             }
             if done {
+                if stack_boundary::enabled() {
+                    stack_boundary::start();
+                }
                 if c.stack_profile >= 2 {
                     stack::probe_start();
                 }

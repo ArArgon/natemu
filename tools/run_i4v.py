@@ -36,6 +36,7 @@ def main():
     parser.add_argument('--mixed-modes', action='store_true', help='also execute paged/paging-off owners with shared source and data')
     parser.add_argument('--controls', action='store_true', help='also execute fetched guest control instructions and legacy32 transitions')
     parser.add_argument('--concurrent-controls', action='store_true', help='also compose guest controls with retained peer work at N=1..4')
+    parser.add_argument('--stack-boundaries', action='store_true', help='also execute terminal stack faults and checked split stores at N=1..4')
     parser.add_argument('--focus', help='retain only one selected alias/stack concurrency cell for diagnosis')
     args = parser.parse_args()
     selected = [f'{family}-{region}-n{n}' for family,enabled in (('alias',args.aliases),('stack',args.concurrent_stack))
@@ -57,6 +58,11 @@ def main():
     concurrent_profiles = ((0, 'legacy'), (21, 'pae'), (24, 'long-aba'), (22, 'long-direct'), (3, 'rejected'))
     if args.concurrent_controls:
         selected += [f'controls-concurrent-{name}-n{n}-actor{actor}' for _, name in concurrent_profiles for n in (1,2,3,4) for actor in range(n)]
+    boundary_profiles = tuple(enumerate(('ss','gp','split','split-np','split-ro'), 1))
+    boundary_cases = [(profile, name, n, actor, 'high' if (profile+actor)%2 else 'low')
+                      for profile,name in boundary_profiles for n in (1,2,3,4) for actor in range(n)]
+    if args.stack_boundaries:
+        selected += [f'boundary-{name}-n{n}-actor{actor}-{region}' for _,name,n,actor,region in boundary_cases]
     if args.focus and args.focus not in selected:
         parser.error('--focus must name a cell enabled by its selected profile')
     if resource.getrlimit(resource.RLIMIT_CPU) != (resource.RLIM_INFINITY,) * 2:
@@ -77,6 +83,7 @@ def main():
                   mixed_modes_enabled=args.mixed_modes,
                   controls_enabled=args.controls,
                   concurrent_controls_enabled=args.concurrent_controls,
+                  stack_boundaries_enabled=args.stack_boundaries,
                   focus=args.focus,
                   limits=dict(build_jobs=2, build_rss_bytes=8*1024**3,
                               worker_rss_bytes=512*1024**2, cell_seconds=120,
@@ -105,6 +112,7 @@ def main():
                      'tools/i4v_alias_worker.py', 'tools/test_i4v_alias_worker.py',
                      'tools/check_i4v_alias.py', 'tools/test_check_i4v_alias.py',
                      'tools/check_i4v_stack_concurrent.py', 'tools/test_check_i4v_stack_concurrent.py',
+                     'tools/check_i4v_stack_boundary.py', 'tools/test_i4v_stack_boundary_check.py',
                      'tools/check_i4.py', 'tools/check_i4_pressure.py', 'tools/check_i1.py',
                      'tools/check_i2.py', 'tools/check_i3_paging.py',
                      'tools/run_i1.py', 'tools/i4v_check.py', 'tools/test_i4v_check.py',
@@ -141,7 +149,8 @@ def main():
             directory.mkdir()
             specification = dict(argv=list(map(str, argv)), cwd=str(source), environment=environment)
             if oracle:
-                specification['oracle'] = str(source / ('tools/i4v_controls_concurrent_check.py' if oracle == 'concurrent-controls'
+                specification['oracle'] = str(source / ('tools/check_i4v_stack_boundary.py' if oracle == 'boundary'
+                    else 'tools/i4v_controls_concurrent_check.py' if oracle == 'concurrent-controls'
                     else 'tools/i4v_controls_check.py' if oracle == 'controls'
                     else 'tools/check_i4v_mixed.py' if oracle == 'mixed'
                     else 'tools/i4v_off_steps_check.py' if oracle == 'off-steps'
@@ -177,6 +186,7 @@ def main():
                                        ('alias-worker-tests', 'tools', 'test_i4v_alias_worker.py')):
             job(label, [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', folder, '-p', pattern])
         job('concurrent-stack-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_check_i4v_stack_concurrent.py'])
+        job('stack-boundary-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_stack_boundary_check.py'])
         job('off32-worker-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_off_worker.py'])
         job('off32-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_off_check.py'])
         job('off-steps-worker-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_off_steps_worker.py'])
@@ -193,6 +203,35 @@ def main():
         job('sign', ['codesign', '--force', '--sign', '-', '--entitlements', 'crates/host/entitlements.plist', host])
         job('verify-signature', ['codesign', '--verify', '--verbose=2', host])
         exporter = module(source / 'tools/i4v_producer/export.py', 'exporter')
+        if args.stack_boundaries:
+            sys.path.insert(0, str(source / 'tools'))
+            boundary_worker = module(source / 'tools/i4v_stack_worker.py', 'boundary_stack_worker')
+            sys.path.pop(0)
+            for profile, outcome, n, actor, region in boundary_cases:
+                label = f'boundary-{outcome}-n{n}-actor{actor}-{region}'
+                if args.focus and label != args.focus:
+                    continue
+                output = run / (label+'-producer')
+                result = job(label, [host,runtime,'i4v-stack-boundary',outcome,n,producer,output,actor,region], oracle='boundary')
+                report = json.loads((result/'command.stdout').read_text())
+                identity = (report['case'],report['profile'],report['outcome'],report['region'],report['configured_vcpus'],report['tested_vcpus'],report['actor'])
+                if identity != ('stack-boundary',profile,outcome,region,n,n,actor):
+                    raise ValueError('stack boundary report differs from requested outcome/owners')
+                prefix = report['prefix']
+                rip = 0x102000 + (0xffff800000000000 if region == 'high' else 0)
+                if (prefix['profile'],prefix['alias_profile'],prefix['stack_profile'],prefix['source_rip'],prefix['configured_vcpus'],prefix['tested_vcpus'],prefix['delayed_owner_ms']) != ('i4-stack-'+region, 2 if region == 'high' else 1,1,rip,n,n,50):
+                    raise ValueError('stack boundary pressure prefix differs from requested profile')
+                boundary_worker.verify_compilations(output, prefix['requests'])
+                compiler_owner = next(owner for owner in prefix['stacks'] if owner['id'] == 0)
+                for index, request in enumerate(prefix['requests']):
+                    directory = output / f'request-{index:03}'
+                    exported = boundary_worker.verify_request(directory, request)
+                    boundary_worker.verify_transfers(directory,
+                        boundary_worker.requests_for(tuple(request)), compiler_owner['replies'][index])
+                    if exported['guest_rip'] != rip:
+                        raise ValueError('stack boundary compilation uses wrong full RIP')
+                    record['compilations'].append(dict(directory=str(directory.relative_to(run)),export=exported))
+                record['cells'].append(dict(name=label,producer=str(output.relative_to(run)),vcpus=n,profile=profile,actor=actor,region=region))
         # Exercise new control composition before the earlier regression families.
         if args.concurrent_controls:
             sys.path.insert(0,str(source/'tools'))

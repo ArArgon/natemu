@@ -8,6 +8,7 @@ mod maintenance;
 mod mixed;
 mod source;
 mod stack;
+mod stack_boundary;
 mod stack_source;
 
 unsafe extern "C" {
@@ -121,6 +122,9 @@ pub unsafe fn initialize() -> ! {
 
 pub unsafe fn completed(fault: u64) -> ! {
     unsafe {
+        if (*round()).stage == natemu_abi::stack_boundary::STAGE {
+            stack_boundary::finish(fault);
+        }
         if mixed::enabled() {
             mixed::completed(fault);
         }

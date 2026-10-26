@@ -404,8 +404,9 @@ def owners(items, n, label):
     return result
 
 
-def check(record, expected_vcpus=None, expected_alias_profile=None, expected_stack_profile=None):
+def check(record, expected_vcpus=None, expected_alias_profile=None, expected_stack_profile=None, *, before_wave=False):
     require(type(record) is dict, "expected concurrent stack report")
+    require(type(before_wave) is bool, "before-wave mode must be explicit")
     n = uint(record["configured_vcpus"], 32, "configured_vcpus")
     require(1 <= n <= 4, "finite participant range is1..4")
     profile = uint(record["alias_profile"], 32, "alias_profile")
@@ -416,6 +417,7 @@ def check(record, expected_vcpus=None, expected_alias_profile=None, expected_sta
         exact(profile, expected_alias_profile, "requested source regime")
     stack_profile = uint(record["stack_profile"], 32, "stack_profile")
     require(stack_profile in (1, 2, 3), "known stack permission profile")
+    require(not before_wave or stack_profile == 1, "boundary prefix uses ordinary stack aliases")
     if expected_stack_profile is not None:
         exact(stack_profile, expected_stack_profile, "requested stack permission profile")
     name = {1: "stack", 2: "stack-parent", 3: "stack-leaf"}[stack_profile]
@@ -423,7 +425,7 @@ def check(record, expected_vcpus=None, expected_alias_profile=None, expected_sta
     for field, expected in (("profile", "i4-" + name + ("-low" if profile == 1 else "-high")),
                             ("stack_profile", stack_profile), ("source_rip", rip), ("tested_vcpus", n),
                             ("delayed_owner_ms", 50), ("ready", (1 << n) - 1),
-                            ("finished", (1 << n) - 1), ("retained", 0)):
+                            ("finished", 0 if before_wave else (1 << n) - 1), ("retained", 0)):
         exact(record[field], expected, field)
     old = owners(record["cells"], n, "old programs")
     new = owners(record["new_cells"], n, "new programs")
