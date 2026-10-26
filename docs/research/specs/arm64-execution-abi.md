@@ -20,7 +20,8 @@ reuse. Event input is an identified level-request fixture, not native IRQ or ful
 APIC/IDT delivery. The [I4 setup/profile](../../implementation.md#i4-concurrent-composition)
 records capacity and unsupported behavior. Exploratory development results are
 recorded in INV-03-01. I4-V extends those profiles with reviewed kernel-address
-load/stack and concurrent alias paths; its
+load/stack, concurrent aliases, protected32 address formation and mode/control
+transactions; its
 [current coverage and next slices](../investigations/INV-03-01.md#i4-v-active-development--first-v1-slice-october-25-2026)
 remain distinct from the original experiment matrix below. The full
 ABI below remains provisional and unimplemented outside that scope. The original

@@ -223,7 +223,7 @@ pub(super) fn coordinator_json(c: &Coordinator) -> String {
     ));
     format!("{{{}}}", f.join(","))
 }
-fn maintenance_json(s: &maintenance_abi::State) -> String {
+pub(super) fn maintenance_json(s: &maintenance_abi::State) -> String {
     let mut f = fields!(s; n,ready,serial,head,length,pending,submitted,completed,epoch,acknowledgements,total,batch,next_ordinary,ordinary,intervals,ordinary_total,closing,finished,duplicate_rejections,maximum_depth,leaf_history,compose_leaf);
     let request =
         |r: &maintenance_abi::Request| format!("{{\"cpu\":{},\"serial\":{}}}", r.cpu, r.serial);
@@ -568,6 +568,7 @@ pub fn run(args: &[String]) -> Result<()> {
             args[7].clone().into(),
             args[8].clone().into(),
         )),
+        None,
     );
     let requests = match execution {
         Ok(requests) => requests,

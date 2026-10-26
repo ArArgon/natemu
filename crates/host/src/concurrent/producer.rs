@@ -62,7 +62,23 @@ impl Compiler {
         Ok(c)
     }
     pub fn is_controls(&self) -> bool {
-        self.controls.is_some()
+        self.controls.as_ref().is_some_and(|compiler| !compiler.is_address())
+    }
+    pub fn new_address(
+        producer: PathBuf,
+        worker: PathBuf,
+        output: PathBuf,
+        owner: u64,
+        config: natemu_abi::address_concurrent::Config,
+    ) -> Result<Self> {
+        let mut compiler = Self::new(producer.clone(), output.clone())?;
+        compiler.controls = Some(crate::i4v_controls::producer::Compiler::new_address(
+            producer, worker, output, owner, config,
+        ));
+        Ok(compiler)
+    }
+    pub fn is_address(&self) -> bool {
+        self.controls.as_ref().is_some_and(|compiler| compiler.is_address())
     }
     pub fn is_mixed(&self) -> bool {
         self.mixed.is_some()

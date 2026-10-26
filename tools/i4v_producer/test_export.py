@@ -10,6 +10,17 @@ export=importlib.util.module_from_spec(spec);spec.loader.exec_module(export)
 DATA=Path(__file__).with_name('testdata')
 
 class ExportChecks(unittest.TestCase):
+    def test_address_size_override_has_real_masked_scratch_and_memory_site(self):
+        for name,site,reg in [('store_ecx',4,6),('store_edx',4,6),('load_edx',0,5),('store_ecx16',12,20),('store_edx16',12,20),('load16',8,20)]:
+            result=export.verify(DATA/f'address-{name}',dict(case=f'fex_address_{name}',guest_rip=0x2002,bitness=32))
+            self.assertEqual([(s['native_offset'],s['address_register'],s['continuation']) for s in result['sites']],[(site,reg,site+4)])
+            if name.endswith('16'):
+                self.assertEqual(result['body_hex'][:16],'d4000a0b943e0053')
+                with self.assertRaises(ValueError):export.verify(DATA/f'address-{name}',dict(bitness=64))
+        self.mutated('address-store_ecx16','source.x86',lambda b:b[1:])
+        self.mutated('address-store_edx16','outputs/001.native',lambda b:b[:24]+bytes([b[24]^2])+b[25:])
+        self.mutated('address-load16','outputs/001.native',lambda b:b[:16]+bytes([b[16]^1])+b[17:])
+
     def test_real_retained_outputs(self):
         for name,case,site_count in [('load-high','fex_memory_data64',1),('push-high','fex_push_immediates64',5)]:
             result=export.verify(DATA/name,dict(case=case,guest_rip=0xffff800000102000))

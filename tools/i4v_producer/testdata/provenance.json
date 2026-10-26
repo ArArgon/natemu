@@ -371,5 +371,11 @@
   "controls_extra_retained_root": "/Users/liaozping/orca/natemu-raw/i4v-controls-extra-producer-20261026-01",
   "pae_retained_root": "/Users/liaozping/orca/natemu-raw/i4v-pae-producer-20261026-01",
   "longmode32_retained_root": "/Users/liaozping/orca/natemu-raw/i4v-longmode32-producer-20261026-01",
-  "longmode64_retained_root": "/Users/liaozping/orca/natemu-raw/i4v-longmode64-producer-20261026-01"
+  "longmode64_retained_root": "/Users/liaozping/orca/natemu-raw/i4v-longmode64-producer-20261026-01",
+  "address_instructions": {
+    "probe": "i4v-address-producer-20261026-01",
+    "exports": "i4v-address-export-20261026-01",
+    "rip": 8194,
+    "mode": 32
+  }
 }

@@ -3,6 +3,7 @@ use super::*;
 use natemu_abi::concurrency::*;
 use natemu_abi::translation as wire;
 use natemu_abi::{alias, shadow, stack, stack_concurrent};
+mod address;
 mod boundary;
 mod controls;
 mod mixed;
@@ -79,7 +80,10 @@ impl Cpu {
                         for (r, v) in packet.iter_mut().enumerate() {
                             hv(hv_vcpu_get_reg(self.id, r as u32, v), "read service packet")?;
                         }
-                        let expected = if compiler.as_ref().is_some_and(|c| c.is_controls()) {
+                        let expected = if compiler.as_ref().is_some_and(|c| c.is_address()) {
+                            (*((shared_address - SHARED_OFFSET + natemu_abi::address_concurrent::OWNER_OFFSET)
+                                as *const natemu_abi::address_concurrent::Owner)).expected
+                        } else if compiler.as_ref().is_some_and(|c| c.is_controls()) {
                             ptr::read_volatile(
                                 (shared_address - SHARED_OFFSET + natemu_abi::controls::OFFSET)
                                     as *const natemu_abi::controls::State,
@@ -204,6 +208,7 @@ fn run_owners(
     compiler_config: Option<(std::path::PathBuf, std::path::PathBuf, u64, bool)>,
     mixed_profile: u64,
     controls_config: Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>,
+    address_config: Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, natemu_abi::address_concurrent::Config)>,
 ) -> Result<Vec<wire::Packet>> {
     thread::scope(|scope| {
         let (prepared_tx, prepared_rx) = mpsc::channel();
@@ -217,6 +222,7 @@ fn run_owners(
             let prepared = prepared_tx.clone();
             let done = done_tx.clone();
             let controls_config = controls_config.clone();
+            let address_config = address_config.clone();
             let compiler_config = if id == 0 || mixed_profile != 0 {
                 compiler_config.clone()
             } else {
@@ -238,7 +244,11 @@ fn run_owners(
                         if id == n - 1 {
                             thread::sleep(Duration::from_millis(delay));
                         }
-                        if let Some((binary, worker, output)) = controls_config {
+                        if let Some((binary, worker, output, config)) = address_config {
+                            compiler = Some(producer::Compiler::new_address(
+                                binary, worker, output.join(format!("cpu-{id}")), id as u64, config,
+                            )?);
+                        } else if let Some((binary, worker, output)) = controls_config {
                             compiler = Some(producer::Compiler::new_controls(
                                 binary,
                                 worker,
@@ -387,6 +397,9 @@ fn profiles(name: &str) -> Result<(u64, u64, u64)> {
 
 pub fn run_controls(args: &[String]) -> Result<()> {
     controls::run(args)
+}
+pub fn run_address(args: &[String]) -> Result<()> {
+    address::run(args)
 }
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -722,6 +735,7 @@ pub fn run(args: &[String]) -> Result<()> {
             None
         },
         mixed_profile,
+        None,
         None,
     );
     let requests = match execution {

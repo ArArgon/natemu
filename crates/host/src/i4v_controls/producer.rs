@@ -1,8 +1,8 @@
-//! Bounded per-owner compilation, including an independently retained stale job.
+//! Bounded per-owner instruction compilation for control and address profiles.
 use crate::i4v_stack::{read_packet, write_packet};
 use crate::*;
 use natemu_abi::concurrency::{DEFER_COMPILE, POLL_COMPILE, TAKE_COMPILE};
-use natemu_abi::controls;
+use natemu_abi::{address_concurrent as address, controls};
 use natemu_abi::translation as wire;
 use std::{
     fs::File,
@@ -14,6 +14,20 @@ struct Job {
     child: Child,
     directory: PathBuf,
     request: wire::Packet,
+    protocol: Protocol,
+}
+#[derive(Clone, Copy)]
+enum Protocol {
+    Controls,
+    Address(address::Config),
+}
+impl Protocol {
+    fn reply(self, request: &wire::Packet) -> Option<wire::Packet> {
+        match self {
+            Self::Controls => controls::reply(request),
+            Self::Address(_) => address::reply(request),
+        }
+    }
 }
 impl Drop for Job {
     fn drop(&mut self) {
@@ -27,7 +41,7 @@ impl Job {
             return Err("control worker failed".into());
         }
         let reply = read_packet(&self.directory.join("reply.bin"))?;
-        if controls::reply(&self.request) != Some(reply) {
+        if self.protocol.reply(&self.request) != Some(reply) {
             return Err("control reply changed request or emitted body".into());
         }
         write_packet(&self.directory.join("reply-delivered.bin"), &reply)?;
@@ -35,6 +49,7 @@ impl Job {
     }
 }
 pub struct Compiler {
+    protocol: Protocol,
     owner: u64,
     incarnation: u64,
     concurrent: bool,
@@ -48,6 +63,7 @@ pub struct Compiler {
 impl Compiler {
     pub fn new(producer: PathBuf, worker: PathBuf, output: PathBuf) -> Self {
         Self {
+            protocol: Protocol::Controls,
             owner: 0,
             incarnation: 1,
             concurrent: false,
@@ -72,6 +88,20 @@ impl Compiler {
         compiler.concurrent = true;
         compiler
     }
+    pub fn new_address(
+        producer: PathBuf,
+        worker: PathBuf,
+        output: PathBuf,
+        owner: u64,
+        config: address::Config,
+    ) -> Self {
+        let mut compiler = Self::new_owner(producer, worker, output, owner, 1);
+        compiler.protocol = Protocol::Address(config);
+        compiler
+    }
+    pub fn is_address(&self) -> bool {
+        matches!(self.protocol, Protocol::Address(_))
+    }
     fn start(&mut self, request: wire::Packet) -> Result<Job> {
         let directory = self
             .output
@@ -95,15 +125,18 @@ impl Compiler {
             child,
             directory,
             request,
+            protocol: self.protocol,
         })
     }
     pub fn exchange(&mut self, mut packet: wire::Packet) -> Result<wire::Packet> {
         let operation = packet[0];
-        packet[0] = controls::MISS;
+        let miss = if self.is_address() { address::MISS } else { controls::MISS };
+        packet[0] = miss;
         if packet[3] != self.owner
             || packet[4] != self.incarnation
             || (!self.concurrent && packet[5] != 1)
-            || controls::reply(&packet).is_none()
+            || self.protocol.reply(&packet).is_none()
+            || matches!(self.protocol, Protocol::Address(config) if address::decode(&packet).map(|(actual, _)| actual) != Some(config))
         {
             return Err("control request changes configured owner/mode/profile".into());
         }
@@ -144,7 +177,7 @@ impl Compiler {
                 self.pending = Some(self.start(packet)?);
                 Ok(wire::command(wire::BUSY))
             }
-            controls::MISS => {
+            operation if operation == miss => {
                 if self.foreground.is_some() {
                     return Err("control foreground slot full".into());
                 }
@@ -171,6 +204,7 @@ mod tests {
             child: Command::new("/usr/bin/true").spawn().unwrap(),
             directory: "unused-job".into(),
             request,
+            protocol: Protocol::Controls,
         }
     }
     #[test]
@@ -239,6 +273,34 @@ mod tests {
         take[0] = TAKE_COMPILE;
         assert_eq!(compiler.exchange(take).unwrap(), wire::command(wire::BUSY));
         assert!(compiler.pending.is_none());
+        assert_eq!(compiler.foreground.as_ref().unwrap().request, packet);
+    }
+
+    #[test]
+    fn address_worker_cannot_choose_a_different_configured_actor_or_profile() {
+        let config = address::Config::new(4, 3, 2).unwrap();
+        let packet = address::request(37, config, 1, 1, 2, false, 0,
+            config.fetch(1, false, 0).unwrap().gpa).unwrap();
+        let mut compiler = Compiler::new_address("unused".into(), "unused".into(), "unused".into(), 1, config);
+        let mut pending = job(packet);
+        pending.protocol = Protocol::Address(config);
+        compiler.pending = Some(pending);
+        for other in [address::Config::new(3, 3, 2).unwrap(), address::Config::new(4, 4, 2).unwrap(), address::Config::new(4, 3, 3).unwrap()] {
+            let mut wrong = address::request(37, other, 1, 1, 2, false, 0,
+                other.fetch(1, false, 0).unwrap().gpa).unwrap();
+            assert!(address::reply(&wrong).is_some());
+            wrong[0] = TAKE_COMPILE;
+            assert!(compiler.exchange(wrong).is_err());
+            assert!(compiler.pending.is_some());
+            assert!(compiler.requests.is_empty());
+        }
+        let mut take = packet;
+        take[0] = TAKE_COMPILE;
+        assert_eq!(compiler.exchange(take).unwrap(), wire::command(wire::BUSY));
+        let mut wrong = packet;
+        wrong[0] = POLL_COMPILE;
+        wrong[2] += 1;
+        assert!(compiler.exchange(wrong).is_err());
         assert_eq!(compiler.foreground.as_ref().unwrap().request, packet);
     }
 }

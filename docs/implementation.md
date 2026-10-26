@@ -541,11 +541,15 @@ records their exact coverage and remaining work. Complete the remaining V1
 address/permission/boundary cases and extend the accepted flat mixed
 paged/paging-off concurrency to the wider V2 address/service profiles. V3 now
 includes protected32/legacy32, hidden-PAE and IA-32e transactions, descriptor-checked
-far transfers and 50 concurrent family/actor cases at N=1/2/3/4. Primary and
-independent rebuilds pass 344 native cases, followed by 87 legacy checks;
-INV-03-01 owns the exact evidence and review scope. Next implement concurrent
-terminal #SS/#GP and checked split-page stack stores, then continue the broader
-integrated campaign.
+far transfers and 50 concurrent family/actor cases at N=1/2/3/4. The subsequent
+terminal-stack/split-store and protected32 address checkpoints bring primary and
+independent rebuilds to 454 distinct native cases, followed by 87 legacy checks;
+INV-03-01 owns the exact evidence and review scope. Concurrent terminal #SS/#GP,
+checked split-page stores, subpage segment bases, fixed A20-off and address
+wrapping are accepted within their finite profiles. The new address cases use
+checked memory service; they do not qualify native ordering. Next implement the
+reviewed native litmus, atomic-recovery and local-fence slice, then continue the
+remaining translation, recovery/lifetime and adversarial progress coverage.
 Declare execution bounds, adapt existing tests and add missing adversarial cases
 as each slice is built. Independent I5 preparation can proceed. Accepted finite
 checkpoints do not complete V1 or I4-V; unfinished cells remain explicit.

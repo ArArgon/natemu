@@ -2,6 +2,7 @@ use super::*;
 use core::sync::atomic::Ordering;
 use natemu_abi::concurrency::*;
 use natemu_abi::paging::Access;
+mod address_concurrent;
 mod aliases;
 mod events;
 mod maintenance;
@@ -28,6 +29,9 @@ fn coordinator() -> &'static Coordinator {
 
 pub unsafe fn initialize() -> ! {
     unsafe {
+        if address_concurrent::enabled() {
+            address_concurrent::initialize();
+        }
         let s = shared();
         let o = ptr::read_volatile(&raw const (*s).object);
         let c = coordinator();
@@ -122,6 +126,9 @@ pub unsafe fn initialize() -> ! {
 
 pub unsafe fn completed(fault: u64) -> ! {
     unsafe {
+        if address_concurrent::enabled() {
+            address_concurrent::finish(fault);
+        }
         if (*round()).stage == natemu_abi::stack_boundary::STAGE {
             stack_boundary::finish(fault);
         }

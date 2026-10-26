@@ -1,5 +1,98 @@
 # INV-03-01 — source findings review
 
+## Intermediate I4-V return — protected32 address formation, October 26, 2026 UTC
+
+`/root/i4v_producer` authored the retained instruction probes and address
+ABI/runtime; root authored host/compiler/runner integration; `/root/i4v_upstream`
+authored the independent architectural replay. `/root/i4v_contract_review`
+reviewed code, emitted stack/layout, oracle and actual artifacts, then rebuilt
+and executed fresh retained replicas. **ACCEPT this finite protected32 address
+checkpoint. Broader V2 and I4-V validation remains incomplete.**
+
+The primary05 campaign passes 482 jobs/454 native cases, with 3,674 actual
+compiler exports, 3,686 report associations, 4,228 delivered records and 65,838
+verified checksums. Its 1,145-second wall time is close to the unchanged
+1,200-second bundle limit, so independent replication uses two fresh retained
+snapshots/builds from exactly the same producing source:
+
+- `i4v-address-concurrent-independent-20261026-01`: 132 jobs/104 cases,
+  comprising all 60 new address cases plus 44 baseline cases; 1,306 exports,
+  1,318 report associations, 1,280 delivered records and 23,266 checksums.
+- `i4v-address-concurrent-independent-20261026-02`: 422 jobs/394 earlier cases;
+  2,394 exports, 2,406 report associations, 2,948 delivered records and 44,818
+  checksums.
+
+The reviewer verifies exact case-list equality against the selected primary
+subsets: their union is all 454 distinct cases and their intersection is exactly
+the declared 44 baseline cases. The resulting 498 executions are not described
+as 498 distinct cases. Every report and actual compiler/transfer association
+passes; all 68,084 replica checksums verify. Both sets of 565 retained inputs
+match primary05 and the workspace at audit time. The producer matches the
+existing pin and every compiler cleanup record passes. This is fresh generation
+from the pinned producer, not another upstream FEX build.
+
+The exact new 60-case matrix covers subpage CS/DS bases, fixed A20-off, linear-base
+wrap, address-size16 wrap, terminal DS and terminal CS at N=1/2/3/4 and every
+actor position. Across 180 owners it records 1,960 visits,1,940 committed guest
+instructions, 1,280 real native faults and checked services,1,280 actual
+compilations, 6,116 legacy walks/12,232 table reads/2,034 table writes,
+1,620 maintenance heads,240 ordinary programs and 180 canonical event handoffs.
+Trace use totals 20,246 events, at most 504/768 per case. All 60 paging-off actors
+have zero walks; paged peers use legacy32, not relabeled IA-32e compatibility.
+
+The replay independently separates truncated effective offset, segment-derived
+linear address, raw paged/identity GPA, final A20 masking and owned backing.
+It checks the actual selected source against the poisoned inactive source page,
+per-instruction EIP/context/source-generation identity, complete native/canonical
+frames and physical memory/table images. Address16 accesses use the emitted
+truncated scratch address and preserve upper BX/SI bits. The terminal actor
+commits its ECX-copy prefix, reports #GP(0) at EIP 0x2002 with CR2 unchanged, and
+keeps that packet while all peers drain their saved store/load routes. Source
+mutation follows old completion; actual deferred COPY replies reject on source
+generation even though their body is unchanged. Private old code remains intact
+until its own reference release, then is physically cleared. Delayed owner
+acknowledgements, FIFO maintenance, eight-head progress, ordinary intervals and
+coalesced events retain their required state predicates.
+
+Every memory access in this selected slice deliberately encounters an unmapped
+native operand and uses checked service, then resumes after the inspected actual
+STLR/LDAR instruction. The native address calculation and continuation execute;
+this does not establish a general native shadow mapping for arbitrary subpage
+segment bases. The maximum-limit DS #GP is the declared deterministic policy,
+not a universal hardware result. Dynamic A20 changes, A20-crossing accesses,
+expand-down segments and concurrent device effects remain outside this slice.
+
+The strict checker binds requested profile/N/actor, rejects unknown or malformed
+transport fields and validates all reported compiler deliveries against retained
+actual exports. Its 23 tests include literal subpage/address16/CS diagnostics,
+an explicitly synthetic DS variation, state/syndrome/context/route corruptions,
+early source mutation, premature terminal fault/service/stop and strict identity
+controls. Review also verifies actual captured pre-run shadow leaves rather than
+constant substituted snapshots. Development01/03/04 remain failed diagnostic
+bundles because their captured checker was closed. Development02 remains the
+preserved RSS-limit failure; the producer now admits only two expensive compiler
+lifecycles through shared file locks while up to eight lightweight requests may
+remain pending. Lock release does not depend on deferred reply delivery.
+
+Primary and both independent bundles share runtime SHA-256
+`70e96c495713ddc03c30427483af8fe246a651f01693b5d93914f8c34b9f3337`.
+The emitted RX windows contain 168 boot bytes and 171,964 main bytes; the boot
+ADR is in range and conservative stack accounting remains 14,944/16,384 bytes.
+Bundle01 runs 11:31:31–11:37:25 UTC (354 seconds), retaining 158,257,566 bytes
+with peak build/worker RSS of 517,046,272/388,202,496 bytes. Bundle02 starts only
+after its predecessor exits, runs 11:37:36–11:50:24 UTC (768 seconds), and retains
+317,257,434 bytes with peaks of 519,028,736/438,501,376 bytes. Each bundle stays
+within the unchanged 20-minute and memory limits. Both owning processes exited 0
+before the execution slot was released; no compiler containers remain.
+
+Root's separately serialized `i4v-address-concurrent-regression-20261026-01`
+passes 87 jobs at 11:29:28–11:30:16UTC. The reviewer independently verifies all 2,477
+checksums, the matching runtime and empty remaining-container list. No legacy
+rerun or overlapping native/build campaign was needed. Remaining integrated
+memory-ordering, coherence, recovery/lifetime and progress obligations retain
+their full I4-V scope; canonical event handoff is not guest interrupt delivery,
+and these finite execution modes do not establish full kernel boot.
+
 ## Intermediate I4-V return — terminal stack faults and split stores, October 26, 2026 UTC
 
 `/root/i4v_producer` authored the boundary ABI/runtime, root authored host and

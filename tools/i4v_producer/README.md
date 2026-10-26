@@ -230,3 +230,18 @@ Exact results and independent acceptance live in INV-03-01; implementation alone
 does not establish concurrent acceptance. Broader segment/address forms, remaining
 V1 boundaries and the memory-model campaign remain further work. These finite
 profiles do not complete V1, V2, V3 or I4-V.
+
+The protected32 address-form slice compiles each instruction separately with
+`probe_address.py`. `i4v-address-producer-20261026-01` retains count discovery and
+checked emissions at EIP 0x2000/0x2002/0x2005; the separate immutable
+`i4v-address-export-20261026-01` contains checked exports and independent LLVM
+body disassembly. No producer rebuild was needed. The first discovery bundle
+uses the generic controls probe snapshot; the export bundle additionally retains
+the address-probe invocation script and its exact selected sources.
+
+Address-size16 stores emit ADD W20,W6,W10; UXTH W20,W20; NOP; STLR W7/W5,[X20].
+The load uses the same address prefix, LDAR W4,[X20], then NOP. Only the effective
+address is narrowed to16bits; the data operation remains32bit. Store/load sites
+are12/8 and their continuations16/12. Ordinary32 store/load sites are4/0 with
+continuations8/4. The finite exporter retains these exact sequences; it does not
+infer missing instruction boundaries from the old three-instruction block.
