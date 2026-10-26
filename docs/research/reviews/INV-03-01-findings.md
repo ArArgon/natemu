@@ -1,5 +1,90 @@
 # INV-03-01 — source findings review
 
+## Preliminary I4-V return — native ordering and atomic recovery, October 26, 2026 UTC
+
+`/root/i4v_contract_review` independently reviewed the ordering ABI, resident
+runtime, host mappings/compiler protocol, retained FEX bodies and bounded TSO
+model/report oracle. **No remaining static blocker to the exploratory native
+campaign; native acceptance remains pending.** This return does not accept the
+new checkpoint or complete I4-V.
+
+All 24 retained source/body pairs match the ABI literals, and all 323 checksums
+in `i4v-ordering-export-20261026-01` verify. The seven litmus role/pointer mappings
+match the independent FIFO store-buffer model, including youngest same-location
+forwarding, own-buffer drain before fence/XCHG and indivisible exchange. Its
+weakened-ordering controls and the report oracle's forbidden-outcome, full-frame,
+RAM, packet, retry and corruption checks are relevant to the finite claims.
+The report checker initially remained fail-closed pending actual native/artifact
+audit; synthetic coverage of all 77 declared configurations is not native
+evidence. It was enabled after the retained positive, precommit and postcommit
+diagnostic audits, before primary04 below.
+
+Runtime inspection confirms that ready/release and done/reset synchronization
+surround whole participant blocks. Owner0 awaits every completion before the
+physical image snapshot and next reset. Trial records are private; ordinary
+data, tables and collected images use explicitly shared backing. Unexpected
+faults reject ordinary litmus trials. The adapted XCHG permission fault retries
+SWPAL at code offset 4; the later absent result-store fault resumes STLR at
+offset 16 without replaying SWPAL. Unique-token chain checks do not assume the
+shared word remains unchanged while peers execute.
+
+Review identified overbroad admission of reserved Atomic feature encodings.
+The author corrected admission to exactly encoding 2 and added all 16 field
+controls; the independent atomic oracle rejects the other 15 encodings. The
+pre-fix emitted ELF inspected here had RX loads 168/178684 bytes and a conservative
+maximum stack of 14992/16384 bytes; ordering initialize needed 1408 bytes and its
+finish path 304 plus the 832-byte capture/dispatcher prefix. The reviewer then
+checked the corrected producing ELF from focus01 and primary04: both are identical,
+SHA256 `2d57608a982671c9389081a97f59c670b3e58990ce38c8644af4c1e050b3f340`,
+with the same RX spans and stack bound. Emitted instructions compare the masked
+Atomic field to `0x200000` and reject inequality.
+
+The completed `i4v-ordering-dev-20261026-04` primary passes the independent
+read-only audit of all 229 jobs/198 native reports, 476 actual compiler exports,
+488 report-to-export associations and 11,005 artifact checksums. All 691 retained
+inputs equal the workspace at audit time. The exact new matrix is all 77 declared
+profile/count/rotation configurations at each seed 1 and 37: 154 ordering cases
+plus 44 existing baseline cases. It contains 450 owner compilations and delivered
+ordering replies, 14,400 whole-block entries, 1,280 designated native faults,
+1,920 serialization chains and 5,760 raw fence-control entries. Baseline eager,
+live and mutated-reply reports and their producing associations also verify.
+
+The primary ran 12:34:32–12:38:54 UTC (262 seconds), retaining 298,663,544 bytes.
+Classifying resource use by each job's declared limit gives 511,524,864 bytes peak
+for the 8GiB build/test class and 201,900,032 bytes for the 512MiB worker class.
+The previously reported 454,279,168-byte job was Rust tests in the 8GiB class,
+not a 512MiB worker. Every current compiler cleanup record verifies. A subsequent
+root global check found one Created/Pid0 container belonging to the old failed
+`i4v-address-concurrent-dev-20261026-02` RSS-limit diagnostic. The inspected
+`i4v-ordering-cleanup-20261026-01` record retains its identity, successful removal
+and empty final global compiler list. This corrects historical residue reporting;
+it does not change current runtime evidence or relabel the failed diagnostic.
+
+**The primary development result is supported; checkpoint acceptance remains
+pending LFENCE implementation, the preserved 454 native/87 legacy regression
+scope and independent fresh rebuild/execution.** The reviewer performed no new
+compiler, build or native run for this primary audit.
+
+Raw fence-body controls and their finite capture/completion path do not establish
+the full LFENCE live-dependency contract. Finite absence of forbidden outcomes is
+not universal memory-model proof, and LSE is reviewed on its own emitted sequence
+rather than inheriting the earlier exclusive-loop qualification. All earlier
+454 native cases and 87 legacy checks remain required alongside the new campaign.
+
+Follow-up compile-only LFENCE candidate review verifies all 38 checksums in
+`i4v-lfence-producer-20261026-01` and identical 120-byte bodies at both retained
+RIPs. Before DMB LD at offset 16, live dependencies include q16's FADD result,
+x7/x26's sum and parity source, x27's auxiliary-carry source, NZCV and FPSR.
+A private full-native-frame sink can consume these dependencies, provided its
+direct branch/continuation preserves all roots and restores status exactly before
+resuming the original suffix. In particular, ordinary call/entry conventions
+must not silently overwrite x30/x16 or deferred flags. LAHF/SETO exposes all six
+arithmetic flags; the final CFINV at offset 116 changes their native representation
+and must be modeled separately from the boundary capture. A separately admitted
+semantic STMXCSR suffix must combine the captured FP status with guest control
+and sticky state, without being described as generated STMXCSR. This is a viable
+finite implementation seam, **not implemented/native LFENCE acceptance**.
+
 ## Intermediate I4-V return — protected32 address formation, October 26, 2026 UTC
 
 `/root/i4v_producer` authored the retained instruction probes and address

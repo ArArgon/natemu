@@ -38,6 +38,7 @@ def main():
     parser.add_argument('--concurrent-controls', action='store_true', help='also compose guest controls with retained peer work at N=1..4')
     parser.add_argument('--stack-boundaries', action='store_true', help='also execute terminal stack faults and checked split stores at N=1..4')
     parser.add_argument('--address-forms', action='store_true', help='also execute segmented protected32 address formation at N=1..4')
+    parser.add_argument('--ordering', action='store_true', help='execute native litmus, XCHG fault/retry and fence controls')
     parser.add_argument('--focus', help='retain only one selected alias/stack concurrency cell for diagnosis')
     args = parser.parse_args()
     selected = [f'{family}-{region}-n{n}' for family,enabled in (('alias',args.aliases),('stack',args.concurrent_stack))
@@ -67,6 +68,13 @@ def main():
     address_profiles = tuple(enumerate(('subpage','a20-off','linear-wrap','address16','ds-boundary','cs-boundary')))
     if args.address_forms:
         selected += [f'address-{name}-n{n}-actor{actor}' for _,name in address_profiles for n in (1,2,3,4) for actor in range(n)]
+    ordering_names=('sb','mp','lb','wrc','iriw','sb-mfence','sb-xchg','xchg','xchg-pre','xchg-post','lfence','sfence','mfence')
+    ordering_cells=[(profile,name,n,rotation,seed)
+        for profile,name in enumerate(ordering_names) for n in range(1,5)
+        if profile>=7 or n==(2,2,2,3,4,2,2)[profile]
+        for rotation in range(n) for seed in (1,37)]
+    if args.ordering:
+        selected += [f'ordering-{name}-n{n}-rotation{rotation}-seed{seed}' for _,name,n,rotation,seed in ordering_cells]
     if args.focus and args.focus not in selected:
         parser.error('--focus must name a cell enabled by its selected profile')
     if resource.getrlimit(resource.RLIMIT_CPU) != (resource.RLIM_INFINITY,) * 2:
@@ -89,6 +97,7 @@ def main():
                   concurrent_controls_enabled=args.concurrent_controls,
                   stack_boundaries_enabled=args.stack_boundaries,
                   address_forms_enabled=args.address_forms,
+                  ordering_enabled=args.ordering,
                   focus=args.focus,
                   limits=dict(build_jobs=2, build_rss_bytes=8*1024**3,
                               worker_rss_bytes=512*1024**2, cell_seconds=120,
@@ -120,6 +129,9 @@ def main():
                      'tools/check_i4v_stack_boundary.py', 'tools/test_i4v_stack_boundary_check.py',
                      'tools/i4v_address_worker.py', 'tools/test_i4v_address_worker.py',
                      'tools/check_i4v_address_concurrent.py', 'tools/test_check_i4v_address_concurrent.py',
+                     'tools/i4v_ordering_worker.py', 'tools/test_i4v_ordering_worker.py',
+                     'tools/i4v_ordering_model.py', 'tools/test_i4v_ordering_model.py',
+                     'tools/check_i4v_ordering.py', 'tools/test_check_i4v_ordering.py',
                      'tools/check_i4.py', 'tools/check_i4_pressure.py', 'tools/check_i1.py',
                      'tools/check_i2.py', 'tools/check_i3_paging.py',
                      'tools/run_i1.py', 'tools/i4v_check.py', 'tools/test_i4v_check.py',
@@ -156,7 +168,8 @@ def main():
             directory.mkdir()
             specification = dict(argv=list(map(str, argv)), cwd=str(source), environment=environment)
             if oracle:
-                specification['oracle'] = str(source / ('tools/check_i4v_address_concurrent.py' if oracle == 'address'
+                specification['oracle'] = str(source / ('tools/check_i4v_ordering.py' if oracle == 'ordering'
+                    else 'tools/check_i4v_address_concurrent.py' if oracle == 'address'
                     else 'tools/check_i4v_stack_boundary.py' if oracle == 'boundary'
                     else 'tools/i4v_controls_concurrent_check.py' if oracle == 'concurrent-controls'
                     else 'tools/i4v_controls_check.py' if oracle == 'controls'
@@ -206,6 +219,8 @@ def main():
         job('concurrent-controls-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_controls_concurrent_check.py'])
         job('address-worker-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_i4v_address_worker.py'])
         job('address-oracle-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_check_i4v_address_concurrent.py'])
+        for name in ('i4v_ordering_worker', 'i4v_ordering_model', 'check_i4v_ordering'):
+            job(name+'-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_'+name+'.py'])
         job('build-host', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-host'], wall=600, rss=8*1024**3)
         job('build-runtime', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], wall=600, rss=8*1024**3)
         host = source / 'target/release/natemu-host'
@@ -213,6 +228,26 @@ def main():
         job('sign', ['codesign', '--force', '--sign', '-', '--entitlements', 'crates/host/entitlements.plist', host])
         job('verify-signature', ['codesign', '--verify', '--verbose=2', host])
         exporter = module(source / 'tools/i4v_producer/export.py', 'exporter')
+        if args.ordering:
+            sys.path.insert(0,str(source/'tools'))
+            ordering_worker=module(source/'tools/i4v_ordering_worker.py','ordering_worker')
+            sys.path.pop(0)
+            for profile,name,n,rotation,seed in ordering_cells:
+                label=f'ordering-{name}-n{n}-rotation{rotation}-seed{seed}'
+                if args.focus and label!=args.focus: continue
+                output=run/(label+'-producer')
+                result=job(label,[host,runtime,'i4v-ordering',producer,profile,n,rotation,seed,source/'tools/i4v_ordering_worker.py',output],oracle='ordering')
+                report=json.loads((result/'command.stdout').read_text())
+                if (report['case'],report['profile'],report['n'],report['rotation'],report['seed'])!=('ordering',profile,n,rotation,seed):
+                    raise ValueError('ordering report differs from declared configuration')
+                for owner in report['owners']:
+                    directory=output/f"cpu-{owner['id']}"
+                    requests=owner['compiler_requests']
+                    if requests != [owner['request']]:raise ValueError('ordering requests differ from resident record')
+                    ordering_worker.verify_compilations(directory,requests,[owner['reply']])
+                    exported=ordering_worker.verify_request(directory/'request-000',requests[0])
+                    record['compilations'].append(dict(directory=str((directory/'request-000').relative_to(run)),export=exported))
+                record['cells'].append(dict(name=label,producer=str(output.relative_to(run)),profile=profile,vcpus=n,rotation=rotation,seed=seed))
         if args.address_forms:
             sys.path.insert(0,str(source/'tools'))
             address_worker = module(source/'tools/i4v_address_worker.py','address_worker')

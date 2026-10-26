@@ -1,0 +1,149 @@
+{
+  "schema": "natemu-i4v-ordering-fixtures-v1",
+  "upstream_revision": "48d71752e2a363d5535181f803b0b0e9666c1825",
+  "license": "../upstream/FEX/LICENSE",
+  "originals": [
+    {
+      "path": "unittests/ASM/Secondary/15_XX_5.asm",
+      "copy": "upstream/unittests/ASM/Secondary/15_XX_5.asm",
+      "sha256": "811f8dadf782654def9e7f98765ec68369e2707702d5eb5ed8b3751f82097de5"
+    },
+    {
+      "path": "unittests/ASM/Secondary/15_XX_6.asm",
+      "copy": "upstream/unittests/ASM/Secondary/15_XX_6.asm",
+      "sha256": "9c6585c2065e1c593c1810139e4946621fad7d7e2b74662d64cbc4d6b5d0e15e"
+    },
+    {
+      "path": "unittests/ASM/Secondary/15_XX_7.asm",
+      "copy": "upstream/unittests/ASM/Secondary/15_XX_7.asm",
+      "sha256": "59c833a5f9c2b9f52b3e9ac31daa1f243d1a659a230325ce1c9539f40fc58851"
+    },
+    {
+      "path": "unittests/ASM/Primary/Primary_87_Atomic32.asm",
+      "copy": "upstream/unittests/ASM/Primary/Primary_87_Atomic32.asm",
+      "sha256": "a08765a0cbf702987de202c49ec51da93c591038b131a46b5ce99359ea3632a9"
+    }
+  ],
+  "cases": [
+    {
+      "id": "fex_order_sb",
+      "bitness": 64,
+      "data_width": 32,
+      "source_hex": "c703010000008b02",
+      "source_sha256": "e143b0bc0d54d9fdd6818e4e3e9fa61a61f958f43fbe8d9e6b2050d06027e9ae",
+      "assembly": "sb.s",
+      "instructions": 2,
+      "provenance": "New finite litmus participant. No upstream test pass or original expected-register result is claimed."
+    },
+    {
+      "id": "fex_order_mp_writer",
+      "bitness": 64,
+      "data_width": 32,
+      "source_hex": "c70301000000c70201000000",
+      "source_sha256": "5634115d63219f90381dd87d6b36ef49c4d691ba3f6066eb7c03649a85b114ab",
+      "assembly": "mp_writer.s",
+      "instructions": 2,
+      "provenance": "New finite litmus participant. No upstream test pass or original expected-register result is claimed."
+    },
+    {
+      "id": "fex_order_reader",
+      "bitness": 64,
+      "data_width": 32,
+      "source_hex": "8b038b0a",
+      "source_sha256": "61010e31e8143e2f39737a310f18ecdf61c4f709c03ea9b270d78e34912d3918",
+      "assembly": "reader.s",
+      "instructions": 2,
+      "provenance": "New finite litmus participant. No upstream test pass or original expected-register result is claimed."
+    },
+    {
+      "id": "fex_order_wrc_middle",
+      "bitness": 64,
+      "data_width": 32,
+      "source_hex": "8b03c70201000000",
+      "source_sha256": "5a211baf25ae10b5bfb3328c0a240438c313aec1bce4113ceeab7b665909d9dd",
+      "assembly": "wrc_middle.s",
+      "instructions": 2,
+      "provenance": "New finite litmus participant. No upstream test pass or original expected-register result is claimed."
+    },
+    {
+      "id": "fex_order_writer",
+      "bitness": 64,
+      "data_width": 32,
+      "source_hex": "c70301000000",
+      "source_sha256": "d261f37daf9dd974f671e06bd79e64b06991e9a7a870c0b95c6bf3fe9a44d967",
+      "assembly": "writer.s",
+      "instructions": 1,
+      "provenance": "New finite litmus participant. No upstream test pass or original expected-register result is claimed."
+    },
+    {
+      "id": "fex_order_sb_mfence",
+      "bitness": 64,
+      "data_width": 32,
+      "source_hex": "c703010000000faef08b02",
+      "source_sha256": "f2689cf98c68b58ad28aa80f460b03466eef859e2a445c2ccfc57e7733c57ac6",
+      "assembly": "sb_mfence.s",
+      "instructions": 3,
+      "provenance": "New finite litmus participant. No upstream test pass or original expected-register result is claimed."
+    },
+    {
+      "id": "fex_order_sb_xchg",
+      "bitness": 64,
+      "data_width": 32,
+      "source_hex": "c7030100000087068b02",
+      "source_sha256": "b956f078e74f275a46d2f2879a7168d56f70ea33acdc51a8abff275e740263dc",
+      "assembly": "sb_xchg.s",
+      "instructions": 3,
+      "provenance": "Reduce retained FEX Primary_87_Atomic32 memory-XCHG form to an initialized register-addressed DWORD operation. Remove fixed setup, repeated offsets, result-gather loads and HLT; prefix/suffix MOVs are authored integration fixtures. Original CONFIG expected registers remain in the retained source and are not claimed unchanged. This aligned reduction does not cover the original unaligned offsets."
+    },
+    {
+      "id": "fex_order_xchg_result",
+      "bitness": 64,
+      "data_width": 32,
+      "source_hex": "87038902",
+      "source_sha256": "966fb46e3f3492d0d828c0cd929542ab643d2353f3459aedaa588717586de35a",
+      "assembly": "xchg_result.s",
+      "instructions": 2,
+      "provenance": "Reduce retained FEX Primary_87_Atomic32 memory-XCHG form to an initialized register-addressed DWORD operation. Remove fixed setup, repeated offsets, result-gather loads and HLT; prefix/suffix MOVs are authored integration fixtures. Original CONFIG expected registers remain in the retained source and are not claimed unchanged. This aligned reduction does not cover the original unaligned offsets."
+    },
+    {
+      "id": "fex_order_lfence",
+      "bitness": 64,
+      "data_width": 32,
+      "source_hex": "0faee8",
+      "source_sha256": "f40ed1d3134f3b942801c39c6cf4ace585b148c9687490e5ad9c12be4e062cb7",
+      "assembly": "lfence.s",
+      "instructions": 1,
+      "provenance": "Adapt corresponding retained FEX Secondary/15_XX fence case by removing HLT. Original expectation only ensures execution; ordering expectations are separately authored from the architecture contract."
+    },
+    {
+      "id": "fex_order_sfence",
+      "bitness": 64,
+      "data_width": 32,
+      "source_hex": "0faef8",
+      "source_sha256": "7962bfe8956ac6a12573b0a9b7e68bb281e7c51ee607d9f80b9fb355e6d395b0",
+      "assembly": "sfence.s",
+      "instructions": 1,
+      "provenance": "Adapt corresponding retained FEX Secondary/15_XX fence case by removing HLT. Original expectation only ensures execution; ordering expectations are separately authored from the architecture contract."
+    },
+    {
+      "id": "fex_order_mfence",
+      "bitness": 64,
+      "data_width": 32,
+      "source_hex": "0faef0",
+      "source_sha256": "c04a0add32c0d39d2781fe65e6a7f4a9471ca958a57d5bfbc36b5cb34b0707a0",
+      "assembly": "mfence.s",
+      "instructions": 1,
+      "provenance": "Adapt corresponding retained FEX Secondary/15_XX fence case by removing HLT. Original expectation only ensures execution; ordering expectations are separately authored from the architecture contract."
+    },
+    {
+      "id": "fex_order_xchg",
+      "bitness": 64,
+      "data_width": 32,
+      "source_hex": "8703",
+      "source_sha256": "d3a2ea6c88fa7e04084596e455559581f3690eba06f3295d7209e8aba40ceba7",
+      "assembly": "xchg.s",
+      "instructions": 1,
+      "provenance": "Reduce retained FEX Primary_87_Atomic32 memory-XCHG form to an initialized register-addressed DWORD operation. Remove fixed setup, repeated offsets, result-gather loads and HLT; prefix/suffix MOVs are authored integration fixtures. Original CONFIG expected registers remain in the retained source and are not claimed unchanged. This aligned reduction does not cover the original unaligned offsets."
+    }
+  ]
+}

@@ -4,6 +4,8 @@ use natemu_abi::concurrency::*;
 use natemu_abi::translation as wire;
 use natemu_abi::{alias, shadow, stack, stack_concurrent};
 mod address;
+mod ordering;
+pub use ordering::run as run_ordering;
 mod boundary;
 mod controls;
 mod mixed;
@@ -80,9 +82,15 @@ impl Cpu {
                         for (r, v) in packet.iter_mut().enumerate() {
                             hv(hv_vcpu_get_reg(self.id, r as u32, v), "read service packet")?;
                         }
-                        let expected = if compiler.as_ref().is_some_and(|c| c.is_address()) {
-                            (*((shared_address - SHARED_OFFSET + natemu_abi::address_concurrent::OWNER_OFFSET)
-                                as *const natemu_abi::address_concurrent::Owner)).expected
+                        let expected = if compiler.as_ref().is_some_and(|c| c.is_ordering()) {
+                            (*((shared_address - SHARED_OFFSET + natemu_abi::ordering::OWNER_OFFSET)
+                                as *const natemu_abi::ordering::Owner))
+                                .expected
+                        } else if compiler.as_ref().is_some_and(|c| c.is_address()) {
+                            (*((shared_address - SHARED_OFFSET
+                                + natemu_abi::address_concurrent::OWNER_OFFSET)
+                                as *const natemu_abi::address_concurrent::Owner))
+                                .expected
                         } else if compiler.as_ref().is_some_and(|c| c.is_controls()) {
                             ptr::read_volatile(
                                 (shared_address - SHARED_OFFSET + natemu_abi::controls::OFFSET)
@@ -208,7 +216,18 @@ fn run_owners(
     compiler_config: Option<(std::path::PathBuf, std::path::PathBuf, u64, bool)>,
     mixed_profile: u64,
     controls_config: Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>,
-    address_config: Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, natemu_abi::address_concurrent::Config)>,
+    address_config: Option<(
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        natemu_abi::address_concurrent::Config,
+    )>,
+    ordering_config: Option<(
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        natemu_abi::ordering::Config,
+    )>,
 ) -> Result<Vec<wire::Packet>> {
     thread::scope(|scope| {
         let (prepared_tx, prepared_rx) = mpsc::channel();
@@ -223,6 +242,7 @@ fn run_owners(
             let done = done_tx.clone();
             let controls_config = controls_config.clone();
             let address_config = address_config.clone();
+            let ordering_config = ordering_config.clone();
             let compiler_config = if id == 0 || mixed_profile != 0 {
                 compiler_config.clone()
             } else {
@@ -244,9 +264,21 @@ fn run_owners(
                         if id == n - 1 {
                             thread::sleep(Duration::from_millis(delay));
                         }
-                        if let Some((binary, worker, output, config)) = address_config {
+                        if let Some((binary, worker, output, config)) = ordering_config {
+                            compiler = Some(producer::Compiler::new_ordering(
+                                binary,
+                                worker,
+                                output.join(format!("cpu-{id}")),
+                                id as u64,
+                                config,
+                            )?);
+                        } else if let Some((binary, worker, output, config)) = address_config {
                             compiler = Some(producer::Compiler::new_address(
-                                binary, worker, output.join(format!("cpu-{id}")), id as u64, config,
+                                binary,
+                                worker,
+                                output.join(format!("cpu-{id}")),
+                                id as u64,
+                                config,
                             )?);
                         } else if let Some((binary, worker, output)) = controls_config {
                             compiler = Some(producer::Compiler::new_controls(
@@ -339,7 +371,7 @@ fn run_owners(
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             if began.elapsed()
-                > Duration::from_secs(if compiler_config.is_some() || controls_config.is_some() {
+                > Duration::from_secs(if compiler_config.is_some() || controls_config.is_some() || address_config.is_some() || ordering_config.is_some() {
                     100
                 } else {
                     10
@@ -737,13 +769,17 @@ pub fn run(args: &[String]) -> Result<()> {
         mixed_profile,
         None,
         None,
+        None,
     );
     let requests = match execution {
         Ok(requests) => requests,
         Err(error) => {
             if let Some(config) = &boundary_config {
                 // run_owners joins all owners before returning an error.
-                eprintln!("boundary failure state: {}", boundary::report(&memory, config, n, "null"));
+                eprintln!(
+                    "boundary failure state: {}",
+                    boundary::report(&memory, config, n, "null")
+                );
             }
             return Err(error);
         }
@@ -760,7 +796,9 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut mixed_records = Vec::new();
     for (id, (frame, bank, data)) in seeds.iter().enumerate() {
         let base = id * RAM_SIZE;
-        let boundary_owner = boundary_config.as_ref().map(|_| boundary::owner(&memory, id));
+        let boundary_owner = boundary_config
+            .as_ref()
+            .map(|_| boundary::owner(&memory, id));
         let s = unsafe { ptr::read(memory.0.add(base + SHARED_OFFSET).cast::<Shared>()) };
         if s.status != SUCCESS || s.current_el != 4 || s.actlr & 2 != 2 || s.tcr != tcr {
             return Err(format!("CPU{id}: status={} detail={}", s.status, s.detail));
@@ -808,14 +846,17 @@ pub fn run(args: &[String]) -> Result<()> {
             if id == 0 {
                 before.rflags &= !0x200;
             }
-            let after = boundary_owner.as_ref().map_or_else(|| unsafe {
-                ptr::read(
-                    memory
-                        .0
-                        .add(base + natemu_abi::recovery::GUEST_OFFSET)
-                        .cast::<natemu_abi::recovery::GuestState>(),
-                )
-            }, |o| o.before_guest);
+            let after = boundary_owner.as_ref().map_or_else(
+                || unsafe {
+                    ptr::read(
+                        memory
+                            .0
+                            .add(base + natemu_abi::recovery::GUEST_OFFSET)
+                            .cast::<natemu_abi::recovery::GuestState>(),
+                    )
+                },
+                |o| o.before_guest,
+            );
             let programs = state
                 .programs
                 .iter()
@@ -932,7 +973,11 @@ pub fn run(args: &[String]) -> Result<()> {
         .map(|v| v.load(Ordering::Relaxed))
         .collect();
     let scenario = boundary_config.as_ref().map_or(args[3].as_str(), |config| {
-        if config.alias_profile == 1 { "stack-low" } else { "stack-high" }
+        if config.alias_profile == 1 {
+            "stack-low"
+        } else {
+            "stack-high"
+        }
     });
     let source_summary = format!(
         "{{\"old_eligible\":{},\"published\":{},\"stale_replies\":{},\"stale_entries\":{},\"reuse_blocked\":{},\"bytes\":{:?},\"old_code\":{:?},\"new_code\":{:?}}}",
@@ -986,7 +1031,11 @@ pub fn run(args: &[String]) -> Result<()> {
         None
     };
     let final_leaf = boundary_shared.map_or_else(
-        || u64::from_le_bytes(memory.read::<8>(natemu_abi::recovery::TABLE_OFFSET + 0x3000 + 256 * 8)),
+        || {
+            u64::from_le_bytes(
+                memory.read::<8>(natemu_abi::recovery::TABLE_OFFSET + 0x3000 + 256 * 8),
+            )
+        },
         |b| u64::from_le_bytes(b.tables_before[0x3800..0x3808].try_into().unwrap()),
     );
     let compose_leaf = maintenance.as_ref().map_or(final_leaf, |m| m.compose_leaf);
@@ -1086,7 +1135,10 @@ pub fn run(args: &[String]) -> Result<()> {
         Vec::new()
     };
     let stack_memory_after = if stack_profile {
-        boundary_shared.map_or_else(|| memory.read::<8192>(DATA_OFFSET).to_vec(), |b| b.data_before.to_vec())
+        boundary_shared.map_or_else(
+            || memory.read::<8192>(DATA_OFFSET).to_vec(),
+            |b| b.data_before.to_vec(),
+        )
     } else {
         Vec::new()
     };

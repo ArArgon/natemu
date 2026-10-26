@@ -8,9 +8,10 @@ use core::{
 };
 use natemu_abi::*;
 mod concurrent;
-mod coordinator;
 mod controls;
+mod coordinator;
 mod helper;
+mod ordering;
 mod paging_off32;
 mod paging_off_steps;
 mod partial;
@@ -91,6 +92,9 @@ unsafe extern "C" fn runtime_main() -> ! {
         if current_el != 4 || sctlr & 0x1005 != 0x1005 || actlr & 2 != 2 {
             stop(PANIC, 10);
         }
+        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::ordering::MODE {
+            ordering::initialize();
+        }
         if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::concurrency::MODE {
             concurrent::initialize();
         }
@@ -128,6 +132,9 @@ unsafe extern "C" fn finish(frame: *const NativeFrame, fault: u64) -> ! {
             frame.cast(),
             size_of::<NativeFrame>(),
         );
+        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::ordering::MODE {
+            ordering::finish(fault);
+        }
         if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::concurrency::MODE {
             concurrent::completed(fault);
         }

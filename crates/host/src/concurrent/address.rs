@@ -304,6 +304,7 @@ pub fn run(args: &[String]) -> Result<()> {
             args[8].clone().into(),
             config,
         )),
+        None,
     );
     // All owners have joined before snapshots are read, including on failure.
     let common = unsafe { &*memory.0.add(a::SHARED_OFFSET).cast::<a::Shared>() };

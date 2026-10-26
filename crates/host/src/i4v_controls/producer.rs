@@ -2,8 +2,8 @@
 use crate::i4v_stack::{read_packet, write_packet};
 use crate::*;
 use natemu_abi::concurrency::{DEFER_COMPILE, POLL_COMPILE, TAKE_COMPILE};
-use natemu_abi::{address_concurrent as address, controls};
 use natemu_abi::translation as wire;
+use natemu_abi::{address_concurrent as address, controls, ordering};
 use std::{
     fs::File,
     path::PathBuf,
@@ -20,12 +20,14 @@ struct Job {
 enum Protocol {
     Controls,
     Address(address::Config),
+    Ordering(ordering::Config),
 }
 impl Protocol {
     fn reply(self, request: &wire::Packet) -> Option<wire::Packet> {
         match self {
             Self::Controls => controls::reply(request),
             Self::Address(_) => address::reply(request),
+            Self::Ordering(_) => ordering::reply(request),
         }
     }
 }
@@ -102,6 +104,20 @@ impl Compiler {
     pub fn is_address(&self) -> bool {
         matches!(self.protocol, Protocol::Address(_))
     }
+    pub fn new_ordering(
+        producer: PathBuf,
+        worker: PathBuf,
+        output: PathBuf,
+        owner: u64,
+        config: ordering::Config,
+    ) -> Self {
+        let mut compiler = Self::new_owner(producer, worker, output, owner, 1);
+        compiler.protocol = Protocol::Ordering(config);
+        compiler
+    }
+    pub fn is_ordering(&self) -> bool {
+        matches!(self.protocol, Protocol::Ordering(_))
+    }
     fn start(&mut self, request: wire::Packet) -> Result<Job> {
         let directory = self
             .output
@@ -130,13 +146,18 @@ impl Compiler {
     }
     pub fn exchange(&mut self, mut packet: wire::Packet) -> Result<wire::Packet> {
         let operation = packet[0];
-        let miss = if self.is_address() { address::MISS } else { controls::MISS };
+        let miss = match self.protocol {
+            Protocol::Controls => controls::MISS,
+            Protocol::Address(_) => address::MISS,
+            Protocol::Ordering(_) => ordering::MISS,
+        };
         packet[0] = miss;
         if packet[3] != self.owner
             || packet[4] != self.incarnation
             || (!self.concurrent && packet[5] != 1)
             || self.protocol.reply(&packet).is_none()
             || matches!(self.protocol, Protocol::Address(config) if address::decode(&packet).map(|(actual, _)| actual) != Some(config))
+            || matches!(self.protocol, Protocol::Ordering(config) if ordering::decode(&packet) != Some(config))
         {
             return Err("control request changes configured owner/mode/profile".into());
         }
@@ -279,21 +300,80 @@ mod tests {
     #[test]
     fn address_worker_cannot_choose_a_different_configured_actor_or_profile() {
         let config = address::Config::new(4, 3, 2).unwrap();
-        let packet = address::request(37, config, 1, 1, 2, false, 0,
-            config.fetch(1, false, 0).unwrap().gpa).unwrap();
-        let mut compiler = Compiler::new_address("unused".into(), "unused".into(), "unused".into(), 1, config);
+        let packet = address::request(
+            37,
+            config,
+            1,
+            1,
+            2,
+            false,
+            0,
+            config.fetch(1, false, 0).unwrap().gpa,
+        )
+        .unwrap();
+        let mut compiler =
+            Compiler::new_address("unused".into(), "unused".into(), "unused".into(), 1, config);
         let mut pending = job(packet);
         pending.protocol = Protocol::Address(config);
         compiler.pending = Some(pending);
-        for other in [address::Config::new(3, 3, 2).unwrap(), address::Config::new(4, 4, 2).unwrap(), address::Config::new(4, 3, 3).unwrap()] {
-            let mut wrong = address::request(37, other, 1, 1, 2, false, 0,
-                other.fetch(1, false, 0).unwrap().gpa).unwrap();
+        for other in [
+            address::Config::new(3, 3, 2).unwrap(),
+            address::Config::new(4, 4, 2).unwrap(),
+            address::Config::new(4, 3, 3).unwrap(),
+        ] {
+            let mut wrong = address::request(
+                37,
+                other,
+                1,
+                1,
+                2,
+                false,
+                0,
+                other.fetch(1, false, 0).unwrap().gpa,
+            )
+            .unwrap();
             assert!(address::reply(&wrong).is_some());
             wrong[0] = TAKE_COMPILE;
             assert!(compiler.exchange(wrong).is_err());
             assert!(compiler.pending.is_some());
             assert!(compiler.requests.is_empty());
         }
+        let mut take = packet;
+        take[0] = TAKE_COMPILE;
+        assert_eq!(compiler.exchange(take).unwrap(), wire::command(wire::BUSY));
+        let mut wrong = packet;
+        wrong[0] = POLL_COMPILE;
+        wrong[2] += 1;
+        assert!(compiler.exchange(wrong).is_err());
+        assert_eq!(compiler.foreground.as_ref().unwrap().request, packet);
+    }
+    #[test]
+    fn ordering_worker_cannot_change_config_or_owner_before_launch() {
+        let config = ordering::Config::new(4, 9, 2, 37).unwrap();
+        let mut compiler =
+            Compiler::new_ordering("unused".into(), "unused".into(), "unused".into(), 1, config);
+        for other in [
+            ordering::Config::new(4, 8, 2, 37).unwrap(),
+            ordering::Config::new(4, 9, 3, 37).unwrap(),
+            ordering::Config::new(4, 9, 2, 38).unwrap(),
+            ordering::Config::new(3, 9, 2, 37).unwrap(),
+        ] {
+            assert!(
+                compiler
+                    .exchange(ordering::request(37, other, 1).unwrap())
+                    .is_err()
+            );
+            assert!(compiler.requests.is_empty());
+        }
+        assert!(
+            compiler
+                .exchange(ordering::request(37, config, 0).unwrap())
+                .is_err()
+        );
+        let packet = ordering::request(37, config, 1).unwrap();
+        let mut pending = job(packet);
+        pending.protocol = Protocol::Ordering(config);
+        compiler.pending = Some(pending);
         let mut take = packet;
         take[0] = TAKE_COMPILE;
         assert_eq!(compiler.exchange(take).unwrap(), wire::command(wire::BUSY));

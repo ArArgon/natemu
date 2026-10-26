@@ -62,7 +62,9 @@ impl Compiler {
         Ok(c)
     }
     pub fn is_controls(&self) -> bool {
-        self.controls.as_ref().is_some_and(|compiler| !compiler.is_address())
+        self.controls
+            .as_ref()
+            .is_some_and(|compiler| !compiler.is_address() && !compiler.is_ordering())
     }
     pub fn new_address(
         producer: PathBuf,
@@ -78,7 +80,27 @@ impl Compiler {
         Ok(compiler)
     }
     pub fn is_address(&self) -> bool {
-        self.controls.as_ref().is_some_and(|compiler| compiler.is_address())
+        self.controls
+            .as_ref()
+            .is_some_and(|compiler| compiler.is_address())
+    }
+    pub fn new_ordering(
+        producer: PathBuf,
+        worker: PathBuf,
+        output: PathBuf,
+        owner: u64,
+        config: natemu_abi::ordering::Config,
+    ) -> Result<Self> {
+        let mut compiler = Self::new(producer.clone(), output.clone())?;
+        compiler.controls = Some(crate::i4v_controls::producer::Compiler::new_ordering(
+            producer, worker, output, owner, config,
+        ));
+        Ok(compiler)
+    }
+    pub fn is_ordering(&self) -> bool {
+        self.controls
+            .as_ref()
+            .is_some_and(|compiler| compiler.is_ordering())
     }
     pub fn is_mixed(&self) -> bool {
         self.mixed.is_some()

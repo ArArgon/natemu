@@ -1,0 +1,100 @@
+{
+  "schema": "natemu-i4v-program-v1",
+  "case": "fex_order_sb_mfence",
+  "guest_rip": 1056768,
+  "bitness": 64,
+  "source_hex": "c703010000000faef08b02",
+  "source_sha256": "f2689cf98c68b58ad28aa80f460b03466eef859e2a445c2ccfc57e7733c57ac6",
+  "body_hex": "340080521f2003d5d4fc9f88bf3f03d5a4fcdf881f2003d5",
+  "body_sha256": "123d4b8937ba328edfca57925ab3efdc09e1c5e404b759ec859cb11fec9a807d",
+  "producer_sha256": "b614bac26ef89bb8b3d2812a2708a5541314e77e06b6c6771d135ab0424cdc33",
+  "object": {
+    "index": 1,
+    "bytes": 144,
+    "code_bytes": 92,
+    "code_offset": 4,
+    "guest_instructions": 3,
+    "relocation_bytes": 144,
+    "block_address": 281472265093248
+  },
+  "native_object_sha256": "78610ac7b913a73e8354b8c2a3bd4dc171b7f129611ecc799116354005b95669",
+  "relocations_sha256": "7da49e70beaa14eb407bda68d073a8a90760a11ebc4748c5894c8820cad177ed",
+  "extraction": [
+    12,
+    36
+  ],
+  "guest_pc": [
+    {
+      "guest_offset": 0,
+      "native_offset": 4
+    },
+    {
+      "guest_offset": 0,
+      "native_offset": 12
+    },
+    {
+      "guest_offset": 9,
+      "native_offset": 28
+    }
+  ],
+  "entry_gprs": {
+    "rax": 4,
+    "rbx": 6,
+    "rcx": 7,
+    "rdx": 5,
+    "rsi": 10,
+    "rdi": 11,
+    "rbp": 9,
+    "rsp": 8,
+    "r8": 12,
+    "r9": 13,
+    "r10": 14,
+    "r11": 15,
+    "r12": 16,
+    "r13": 17,
+    "r14": 19,
+    "r15": 29
+  },
+  "flags": "unchanged",
+  "sites": [
+    {
+      "native_offset": 8,
+      "guest_offset": 0,
+      "guest_rip": 1056768,
+      "width": 4,
+      "write": true,
+      "address_register": 6,
+      "address_displacement": 0,
+      "continuation": 12,
+      "phase": "precommit",
+      "guest_rsp_register": 8,
+      "kind": "store",
+      "committed_guest_bytes": 0
+    },
+    {
+      "native_offset": 16,
+      "guest_offset": 9,
+      "guest_rip": 1056777,
+      "width": 4,
+      "write": false,
+      "address_register": 5,
+      "address_displacement": 0,
+      "continuation": 20,
+      "phase": "precommit",
+      "guest_rsp_register": 8,
+      "kind": "load",
+      "committed_guest_bytes": 9
+    }
+  ],
+  "native_writes": [
+    4,
+    20
+  ],
+  "barriers": [
+    [
+      12,
+      6,
+      "dmb sy"
+    ]
+  ]
+}

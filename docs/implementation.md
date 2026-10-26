@@ -550,6 +550,11 @@ wrapping are accepted within their finite profiles. The new address cases use
 checked memory service; they do not qualify native ordering. Next implement the
 reviewed native litmus, atomic-recovery and local-fence slice, then continue the
 remaining translation, recovery/lifetime and adversarial progress coverage.
+The first ordering development campaign now passes154 new native cells plus44
+baseline cases: seven whole-block litmus profiles, aligned XCHG32 pre/post-commit
+fault recovery, and raw fence controls. Independent artifact inspection passes;
+full live-dependency LFENCE adaptation, all earlier regressions and a fresh
+independent rebuild remain required before accepting this ordering checkpoint.
 Declare execution bounds, adapt existing tests and add missing adversarial cases
 as each slice is built. Independent I5 preparation can proceed. Accepted finite
 checkpoints do not complete V1 or I4-V; unfinished cells remain explicit.

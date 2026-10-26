@@ -1,0 +1,127 @@
+{
+  "schema": "natemu-i4v-compile-v1",
+  "guest_rip": 1056768,
+  "bitness": 64,
+  "source_hex": "8b03c70201000000",
+  "instructions": 2,
+  "expected_host": 5,
+  "image": "sha256:27475cb39ecb4500d02b7c6e73c9d598e8d9f0736f0dc217d2d985e5cbe01aac",
+  "producer_sha256": "b614bac26ef89bb8b3d2812a2708a5541314e77e06b6c6771d135ab0424cdc33",
+  "commands": [
+    {
+      "argv": [
+        "docker",
+        "create",
+        "--name",
+        "natemu-i4v-4af51a46bf3647f79b9454d37736b2ab",
+        "--cpus=2",
+        "--memory=512m",
+        "--memory-swap=512m",
+        "--pids-limit=128",
+        "--network=none",
+        "--read-only",
+        "--tmpfs",
+        "/tmp:rw,size=64m",
+        "--tmpfs",
+        "/var/lib/postgresql/data:rw,size=1m",
+        "--mount",
+        "type=bind,src=/Users/liaozping/orca/natemu-raw/i4v-ordering-producer-20261026-01/wrc_middle-0,dst=/work",
+        "--mount",
+        "type=bind,src=/Users/liaozping/orca/natemu-raw/i4v-ordering-producer-20261026-01/CodeSizeValidation,dst=/producer,readonly",
+        "--entrypoint=/usr/bin/env",
+        "sha256:27475cb39ecb4500d02b7c6e73c9d598e8d9f0736f0dc217d2d985e5cbe01aac",
+        "-i",
+        "PATH=/usr/bin:/bin",
+        "HOME=/work/empty-home",
+        "NATEMU_EXPORT=/work/outputs",
+        "NATEMU_GUEST_RIP=1056768",
+        "timeout",
+        "30",
+        "/producer",
+        "/work/input.bin"
+      ],
+      "timeout_seconds": 30,
+      "returncode": 0,
+      "stdout": "7318bb143bef344e5ccdbb8aa3669993edeebd37ea6f91724aa4f65eb68ec11e\n",
+      "stderr": "",
+      "elapsed_seconds": 0.04045191699999995
+    },
+    {
+      "argv": [
+        "docker",
+        "start",
+        "--attach",
+        "natemu-i4v-4af51a46bf3647f79b9454d37736b2ab"
+      ],
+      "timeout_seconds": 40,
+      "returncode": 0,
+      "stdout": "RAW RIP: 0x10000\nRAW Guest Code instructions: 1\nRAW Host Code instructions: 17\nRAW Blow-up Amt: 17x\nRAW Disassemble Begin\nRAW adr x0, #-0x4 (addr 0xffff3c200000)\nRAW str x0, [x28]\nRAW udf #0x420f\nRAW b #+0x8 (addr 0xffff3c200018)\nRAW udf #0x0\nRAW b #+0x8 (addr 0xffff3c200020)\nRAW br x0\nRAW ldr x0, pc+32 (addr 0xffff3c200040)\nRAW blr x0\nRAW udf #0x0\nRAW udf #0x0\nRAW unallocated (Unallocated)\nRAW udf #0x0\nRAW unallocated (Unallocated)\nRAW unallocated (Unallocated)\nRAW unallocated (Unallocated)\nRAW udf #0xffff\nRAW Disassemble End\nNATEMU_MODE bitness=64\nNATEMU_FEATURES sve128=0 sve256=0 rcpc=0 imm9=0 atomics=1 preserve_all=1\nNATEMU_WINDOW index=0 guest_rip=65536 source_address=65536 bytes=1 instructions=1\nNATEMU_OBJECT {\"index\":0,\"bytes\":128,\"code_bytes\":68,\"code_offset\":4,\"guest_instructions\":1,\"relocation_bytes\":144,\"block_address\":281471690473472}\nNATEMU_ENTRY index=0 guest_rip=65536\nNATEMU_GUEST_PC index=0 guest_offset=0 native_offset=4\nRAW Compiling code\nI Compiling code\nRAW Compiling instruction 'natemu-i4v-request'\nI Compiling instruction 'natemu-i4v-request'\nRAW RIP: 0x102000\nRAW Guest Code instructions: 2\nRAW Host Code instructions: 21\nI Host Code instructions: 21\nRAW Blow-up Amt: 10.5x\nRAW Disassemble Begin\nRAW adr x0, #-0x4 (addr 0xffff3c200080)\nRAW str x0, [x28]\nRAW ldar w4, [x6]\nRAW nop\nRAW mov w20, #0x1\nRAW nop\nRAW stlr w20, [x5]\nRAW udf #0x420f\nRAW b #+0x4 (addr 0xffff3c2000a8)\nRAW b #+0x8 (addr 0xffff3c2000b0)\nRAW br x0\nRAW ldr x0, pc+32 (addr 0xffff3c2000d0)\nRAW blr x0\nRAW udf #0x0\nRAW udf #0x0\nRAW unallocated (Unallocated)\nRAW udf #0x0\nRAW unallocated (Unallocated)\nRAW unallocated (Unallocated)\nRAW unallocated (Unallocated)\nRAW udf #0xffff\nRAW Disassemble End\nNATEMU_COMPILE index=0 ns=586923 clock=monotonic scope=CompileRIP-or-CompileRIPCount diagnostics=included export_io=included policy=NOP-then-six-sequential-compiles cache=range-invalidated-before-each-compile\nNATEMU_WINDOW index=1 guest_rip=1056768 source_address=65536 bytes=8 instructions=2\nNATEMU_OBJECT {\"index\":1,\"bytes\":144,\"code_bytes\":84,\"code_offset\":4,\"guest_instructions\":2,\"relocation_bytes\":144,\"block_address\":281471690473600}\nNATEMU_ENTRY index=1 guest_rip=1056768\nNATEMU_GUEST_PC index=1 guest_offset=0 native_offset=4\nNATEMU_GUEST_PC index=1 guest_offset=0 native_offset=12\nNATEMU_GUEST_PC index=1 guest_offset=2 native_offset=20\nRAW Testing instruction 'natemu-i4v-request': 5 host instructions\nI Testing instruction 'natemu-i4v-request': 5 host instructions\nNATEMU_COMPILE index=1 ns=233794 clock=monotonic scope=CompileRIP-or-CompileRIPCount diagnostics=included export_io=included policy=NOP-then-six-sequential-compiles cache=range-invalidated-before-each-compile\nNATEMU_COMPLETED tests=1 result=0\n",
+      "stderr": "",
+      "elapsed_seconds": 0.09176620800000013
+    },
+    {
+      "argv": [
+        "docker",
+        "inspect",
+        "natemu-i4v-4af51a46bf3647f79b9454d37736b2ab"
+      ],
+      "timeout_seconds": 30,
+      "returncode": 0,
+      "stdout": "[\n    {\n        \"Id\": \"7318bb143bef344e5ccdbb8aa3669993edeebd37ea6f91724aa4f65eb68ec11e\",\n        \"Created\": \"2026-10-26T11:58:20.952209508Z\",\n        \"Path\": \"/usr/bin/env\",\n        \"Args\": [\n            \"-i\",\n            \"PATH=/usr/bin:/bin\",\n            \"HOME=/work/empty-home\",\n            \"NATEMU_EXPORT=/work/outputs\",\n            \"NATEMU_GUEST_RIP=1056768\",\n            \"timeout\",\n            \"30\",\n            \"/producer\",\n            \"/work/input.bin\"\n        ],\n        \"State\": {\n            \"Status\": \"exited\",\n            \"Running\": false,\n            \"Paused\": false,\n            \"Restarting\": false,\n            \"OOMKilled\": false,\n            \"Dead\": false,\n            \"Pid\": 0,\n            \"ExitCode\": 0,\n            \"Error\": \"\",\n            \"StartedAt\": \"2026-10-26T11:58:21.005891555Z\",\n            \"FinishedAt\": \"2026-10-26T11:58:21.04599712Z\"\n        },\n        \"Image\": \"sha256:27475cb39ecb4500d02b7c6e73c9d598e8d9f0736f0dc217d2d985e5cbe01aac\",\n        \"ResolvConfPath\": \"/var/lib/docker/containers/7318bb143bef344e5ccdbb8aa3669993edeebd37ea6f91724aa4f65eb68ec11e/resolv.conf\",\n        \"HostnamePath\": \"/var/lib/docker/containers/7318bb143bef344e5ccdbb8aa3669993edeebd37ea6f91724aa4f65eb68ec11e/hostname\",\n        \"HostsPath\": \"/var/lib/docker/containers/7318bb143bef344e5ccdbb8aa3669993edeebd37ea6f91724aa4f65eb68ec11e/hosts\",\n        \"LogPath\": \"/var/lib/docker/containers/7318bb143bef344e5ccdbb8aa3669993edeebd37ea6f91724aa4f65eb68ec11e/7318bb143bef344e5ccdbb8aa3669993edeebd37ea6f91724aa4f65eb68ec11e-json.log\",\n        \"Name\": \"/natemu-i4v-4af51a46bf3647f79b9454d37736b2ab\",\n        \"RestartCount\": 0,\n        \"Driver\": \"overlay2\",\n        \"Platform\": \"linux\",\n        \"MountLabel\": \"\",\n        \"ProcessLabel\": \"\",\n        \"AppArmorProfile\": \"\",\n        \"ExecIDs\": null,\n        \"HostConfig\": {\n            \"Binds\": null,\n            \"ContainerIDFile\": \"\",\n            \"LogConfig\": {\n                \"Type\": \"json-file\",\n                \"Config\": {\n                    \"max-file\": \"5\",\n                    \"max-size\": \"20m\"\n                }\n            },\n            \"NetworkMode\": \"none\",\n            \"PortBindings\": {},\n            \"RestartPolicy\": {\n                \"Name\": \"no\",\n                \"MaximumRetryCount\": 0\n            },\n            \"AutoRemove\": false,\n            \"VolumeDriver\": \"\",\n            \"VolumesFrom\": null,\n            \"ConsoleSize\": [\n                0,\n                0\n            ],\n            \"CapAdd\": null,\n            \"CapDrop\": null,\n            \"CgroupnsMode\": \"private\",\n            \"Dns\": null,\n            \"DnsOptions\": [],\n            \"DnsSearch\": [],\n            \"ExtraHosts\": null,\n            \"GroupAdd\": null,\n            \"IpcMode\": \"private\",\n            \"Cgroup\": \"\",\n            \"Links\": null,\n            \"OomScoreAdj\": 0,\n            \"PidMode\": \"\",\n            \"Privileged\": false,\n            \"PublishAllPorts\": false,\n            \"ReadonlyRootfs\": true,\n            \"SecurityOpt\": null,\n            \"Tmpfs\": {\n                \"/tmp\": \"rw,size=64m\",\n                \"/var/lib/postgresql/data\": \"rw,size=1m\"\n            },\n            \"UTSMode\": \"\",\n            \"UsernsMode\": \"\",\n            \"ShmSize\": 6299844608,\n            \"Runtime\": \"runc\",\n            \"Isolation\": \"\",\n            \"CpuShares\": 0,\n            \"Memory\": 536870912,\n            \"NanoCpus\": 2000000000,\n            \"CgroupParent\": \"\",\n            \"BlkioWeight\": 0,\n            \"BlkioWeightDevice\": [],\n            \"BlkioDeviceReadBps\": [],\n            \"BlkioDeviceWriteBps\": [],\n            \"BlkioDeviceReadIOps\": [],\n            \"BlkioDeviceWriteIOps\": [],\n            \"CpuPeriod\": 0,\n            \"CpuQuota\": 0,\n            \"CpuRealtimePeriod\": 0,\n            \"CpuRealtimeRuntime\": 0,\n            \"CpusetCpus\": \"\",\n            \"CpusetMems\": \"\",\n            \"Devices\": [],\n            \"DeviceCgroupRules\": null,\n            \"DeviceRequests\": null,\n            \"MemoryReservation\": 0,\n            \"MemorySwap\": 536870912,\n            \"MemorySwappiness\": null,\n            \"OomKillDisable\": null,\n            \"PidsLimit\": 128,\n            \"Ulimits\": [],\n            \"CpuCount\": 0,\n            \"CpuPercent\": 0,\n            \"IOMaximumIOps\": 0,\n            \"IOMaximumBandwidth\": 0,\n            \"Mounts\": [\n                {\n                    \"Type\": \"bind\",\n                    \"Source\": \"/Users/liaozping/orca/natemu-raw/i4v-ordering-producer-20261026-01/wrc_middle-0\",\n                    \"Target\": \"/work\"\n                },\n                {\n                    \"Type\": \"bind\",\n                    \"Source\": \"/Users/liaozping/orca/natemu-raw/i4v-ordering-producer-20261026-01/CodeSizeValidation\",\n                    \"Target\": \"/producer\",\n                    \"ReadOnly\": true\n                }\n            ],\n            \"MaskedPaths\": [\n                \"/proc/acpi\",\n                \"/proc/asound\",\n                \"/proc/interrupts\",\n                \"/proc/kcore\",\n                \"/proc/keys\",\n                \"/proc/latency_stats\",\n                \"/proc/sched_debug\",\n                \"/proc/scsi\",\n                \"/proc/timer_list\",\n                \"/proc/timer_stats\",\n                \"/sys/devices/virtual/powercap\",\n                \"/sys/firmware\"\n            ],\n            \"ReadonlyPaths\": [\n                \"/proc/bus\",\n                \"/proc/fs\",\n                \"/proc/irq\",\n                \"/proc/sys\",\n                \"/proc/sysrq-trigger\"\n            ]\n        },\n        \"GraphDriver\": {\n            \"Data\": {\n                \"ID\": \"7318bb143bef344e5ccdbb8aa3669993edeebd37ea6f91724aa4f65eb68ec11e\",\n                \"LowerDir\": \"/var/lib/docker/overlay2/186e39e6df017d2a202dcb132c6d68100b50ea5b32bac1715e6e8ce699228500-init/diff:/var/lib/docker/overlay2/fc9e6babadbe74f707ae548eb5a2cfae79d8aa731651b0ede5498877aef07eea/diff:/var/lib/docker/overlay2/853305853dd7ceaa02a7c42d444e7c1be8b4afe6a81d3fb963ff2827569dc9ef/diff:/var/lib/docker/overlay2/b91b0ad5e6c47cf225cd4322cfc6eec3ab2f982f0cfe10b7f331eb3e5a95cd27/diff:/var/lib/docker/overlay2/bf4ac83e82f997055973b61313e86997dc71cdaf3999a45c6ae69f76073de9f5/diff:/var/lib/docker/overlay2/7f8bcc979e0e2e1408d4484b63f20ae7907dfe5a25931295a794791412597431/diff:/var/lib/docker/overlay2/4f0d2e243285662e750cb831c6cd4da5b20dbb1a70b3032fb6d110cbb04fa372/diff:/var/lib/docker/overlay2/5db6fa79fac3892576e5a7f29e28cf1dfc487b68518c5f874b1a832a9bba8f8d/diff:/var/lib/docker/overlay2/e2d7c29f526e1ab906b2fd1986982cf0d7dde125428316c04f4d2796ac22795f/diff:/var/lib/docker/overlay2/e41757182903f1490f35ad1e03d55cb1d399c8b2789acea70d08c792d0047b77/diff:/var/lib/docker/overlay2/6880f5ed0ad2fda0b091533363d3aff9103d9f69d0b80da8828c32c3bccf2c55/diff:/var/lib/docker/overlay2/8d214dc2fb5314f17923f30f68d5dfe41873f64cfa7a61d3c1411fb3661132b2/diff:/var/lib/docker/overlay2/729c0e49543a438b39eac9bb543f2938adcffabf6b8473ca85f6a26907d61ca1/diff:/var/lib/docker/overlay2/02f939e56a38a77bda9ecc7bce509b5a3b2f9bdd1ba12b8bd2e4f0aa99c503d8/diff:/var/lib/docker/overlay2/2d73abb72d1f68667a3a8ce6686b7afacf30a60df0a8fc1e32c2e524664e3592/diff:/var/lib/docker/overlay2/93f4bc3619364f0ebedc1502978383fe45481c5853f2101085d551dbe592f4cb/diff\",\n                \"MergedDir\": \"/var/lib/docker/overlay2/186e39e6df017d2a202dcb132c6d68100b50ea5b32bac1715e6e8ce699228500/merged\",\n                \"UpperDir\": \"/var/lib/docker/overlay2/186e39e6df017d2a202dcb132c6d68100b50ea5b32bac1715e6e8ce699228500/diff\",\n                \"WorkDir\": \"/var/lib/docker/overlay2/186e39e6df017d2a202dcb132c6d68100b50ea5b32bac1715e6e8ce699228500/work\"\n            },\n            \"Name\": \"overlay2\"\n        },\n        \"Mounts\": [\n            {\n                \"Type\": \"bind\",\n                \"Source\": \"/Users/liaozping/orca/natemu-raw/i4v-ordering-producer-20261026-01/wrc_middle-0\",\n                \"Destination\": \"/work\",\n                \"Mode\": \"\",\n                \"RW\": true,\n                \"Propagation\": \"rprivate\"\n            },\n            {\n                \"Type\": \"bind\",\n                \"Source\": \"/Users/liaozping/orca/natemu-raw/i4v-ordering-producer-20261026-01/CodeSizeValidation\",\n                \"Destination\": \"/producer\",\n                \"Mode\": \"\",\n                \"RW\": false,\n                \"Propagation\": \"rprivate\"\n            }\n        ],\n        \"Config\": {\n            \"Hostname\": \"7318bb143bef\",\n            \"Domainname\": \"\",\n            \"User\": \"0\",\n            \"AttachStdin\": false,\n            \"AttachStdout\": true,\n            \"AttachStderr\": true,\n            \"ExposedPorts\": {\n                \"5432/tcp\": {}\n            },\n            \"Tty\": false,\n            \"OpenStdin\": false,\n            \"StdinOnce\": false,\n            \"Env\": [\n                \"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/16/bin\",\n                \"GOSU_VERSION=1.19\",\n                \"LANG=en_US.utf8\",\n                \"PG_MAJOR=16\",\n                \"PG_VERSION=16.14-1.pgdg13+1\",\n                \"PGDATA=/var/lib/postgresql/data\"\n            ],\n            \"Cmd\": [\n                \"-i\",\n                \"PATH=/usr/bin:/bin\",\n                \"HOME=/work/empty-home\",\n                \"NATEMU_EXPORT=/work/outputs\",\n                \"NATEMU_GUEST_RIP=1056768\",\n                \"timeout\",\n                \"30\",\n                \"/producer\",\n                \"/work/input.bin\"\n            ],\n            \"Image\": \"sha256:27475cb39ecb4500d02b7c6e73c9d598e8d9f0736f0dc217d2d985e5cbe01aac\",\n            \"Volumes\": {\n                \"/var/lib/postgresql/data\": {}\n            },\n            \"WorkingDir\": \"\",\n            \"Entrypoint\": [\n                \"/usr/bin/env\"\n            ],\n            \"Labels\": {},\n            \"StopSignal\": \"SIGINT\"\n        },\n        \"NetworkSettings\": {\n            \"SandboxID\": \"\",\n            \"SandboxKey\": \"\",\n            \"Ports\": {},\n            \"Networks\": {\n                \"none\": {\n                    \"IPAMConfig\": null,\n                    \"Links\": null,\n                    \"Aliases\": null,\n                    \"DriverOpts\": null,\n                    \"GwPriority\": 0,\n                    \"NetworkID\": \"345d004aeddd88cabe7ae96a7fb471c46243bc91b36836b8cb0785b452aa819c\",\n                    \"EndpointID\": \"\",\n                    \"Gateway\": \"\",\n                    \"IPAddress\": \"\",\n                    \"MacAddress\": \"\",\n                    \"IPPrefixLen\": 0,\n                    \"IPv6Gateway\": \"\",\n                    \"GlobalIPv6Address\": \"\",\n                    \"GlobalIPv6PrefixLen\": 0,\n                    \"DNSNames\": null\n                }\n            }\n        }\n    }\n]\n",
+      "stderr": "",
+      "elapsed_seconds": 0.0192429999999999
+    },
+    {
+      "argv": [
+        "docker",
+        "rm",
+        "--force",
+        "--volumes",
+        "natemu-i4v-4af51a46bf3647f79b9454d37736b2ab"
+      ],
+      "timeout_seconds": 30,
+      "returncode": 0,
+      "stdout": "natemu-i4v-4af51a46bf3647f79b9454d37736b2ab\n",
+      "stderr": "",
+      "elapsed_seconds": 0.02157137500000017
+    }
+  ],
+  "status": "exported_not_executed",
+  "container_state": {
+    "Status": "exited",
+    "Running": false,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 0,
+    "ExitCode": 0,
+    "Error": "",
+    "StartedAt": "2026-10-26T11:58:21.005891555Z",
+    "FinishedAt": "2026-10-26T11:58:21.04599712Z"
+  },
+  "instruction_count_check": 0,
+  "object": {
+    "index": 1,
+    "bytes": 144,
+    "code_bytes": 84,
+    "code_offset": 4,
+    "guest_instructions": 2,
+    "relocation_bytes": 144,
+    "block_address": 281471690473600
+  },
+  "guest_pc": [
+    {
+      "guest_offset": 0,
+      "native_offset": 4
+    },
+    {
+      "guest_offset": 0,
+      "native_offset": 12
+    },
+    {
+      "guest_offset": 2,
+      "native_offset": 20
+    }
+  ]
+}

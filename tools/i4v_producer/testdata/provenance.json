@@ -377,5 +377,15 @@
     "exports": "i4v-address-export-20261026-01",
     "rip": 8194,
     "mode": 32
+  },
+  "ordering_blocks": {
+    "probe": "i4v-ordering-producer-20261026-01",
+    "exports": "i4v-ordering-export-20261026-01",
+    "rips": [
+      1056768,
+      1057024
+    ],
+    "mode": 64,
+    "retained_fixture_rip": 1056768
   }
 }

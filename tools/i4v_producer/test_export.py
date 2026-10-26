@@ -21,6 +21,30 @@ class ExportChecks(unittest.TestCase):
         self.mutated('address-store_edx16','outputs/001.native',lambda b:b[:24]+bytes([b[24]^2])+b[25:])
         self.mutated('address-load16','outputs/001.native',lambda b:b[:16]+bytes([b[16]^1])+b[17:])
 
+    def test_ordering_blocks_preserve_atomic_commit_boundary_and_full_pointer_roots(self):
+        names=('sb','mp_writer','reader','wrc_middle','writer','sb_mfence','sb_xchg','xchg_result','lfence','sfence','mfence','xchg')
+        for name in names:
+            program=export.verify(DATA/f'order-{name}',dict(case=f'fex_order_{name}',bitness=64,guest_rip=0x102000))
+            body=bytes.fromhex(program['body_hex'])
+            self.assertEqual(program['flags'],'unchanged')
+            for site in program['sites']:
+                self.assertEqual(site['continuation'],site['native_offset']+4)
+                self.assertEqual(site['committed_guest_bytes'],site['guest_offset'])
+                if site['kind']=='atomic_exchange':
+                    word=int.from_bytes(body[site['native_offset']:site['native_offset']+4],'little')
+                    self.assertEqual(word&0xffe0fc00,0xb8e08000)
+                    self.assertEqual((word>>5)&31,site['address_register'])
+                    self.assertEqual(((word>>16)&31,word&31),(4,4))
+                    self.assertTrue(site['read'] and site['write'])
+            with self.assertRaises(ValueError):export.verify(DATA/f'order-{name}',dict(bitness=32))
+        result=export.verify(DATA/'order-xchg_result')
+        self.assertEqual([(s['native_offset'],s['kind'],s['committed_guest_bytes']) for s in result['sites']],[(0,'atomic_exchange',0),(8,'store',2)])
+        self.assertEqual(export.verify(DATA/'order-lfence')['barriers'],[[0,0,'dmb ld']])
+        self.assertEqual(export.verify(DATA/'order-sb_mfence')['barriers'],[[12,6,'dmb sy']])
+        self.mutated('order-xchg_result','outputs/001.native',lambda b:b[:15]+bytes([b[15]^0x40])+b[16:])
+        self.mutated('order-sb_mfence','source.x86',lambda b:b[:6]+b[9:])
+        self.mutated('order-xchg','producer.log',lambda b:b.replace(b'bitness=64',b'bitness=32'))
+
     def test_real_retained_outputs(self):
         for name,case,site_count in [('load-high','fex_memory_data64',1),('push-high','fex_push_immediates64',5)]:
             result=export.verify(DATA/name,dict(case=case,guest_rip=0xffff800000102000))

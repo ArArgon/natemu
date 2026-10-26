@@ -245,3 +245,19 @@ address is narrowed to16bits; the data operation remains32bit. Store/load sites
 are12/8 and their continuations16/12. Ordinary32 store/load sites are4/0 with
 continuations8/4. The finite exporter retains these exact sequences; it does not
 infer missing instruction boundaries from the old three-instruction block.
+
+`probe_ordering.py` retains whole ordering/atomic participants at RIP0x102000 and
+0x102100 using 64-bit decode with DWORD data and full-width pointers. The fresh
+compile-only `i4v-ordering-producer-20261026-01` and checked
+`i4v-ordering-export-20261026-01` retain all24 checked exports, original count
+discovery, independent LLVM disassembly and the relevant pinned FEX emitter
+sources. Small producing inputs live in `testdata/order-*`; adapted upstream
+provenance lives in `fixtures/i4v/ordering`.
+
+The new exports label memory sites as load/store/atomic_exchange and state the
+already committed guest-byte prefix. In XCHG followed by a result store, SWPAL is
+at body0 and the later STLR at body8: a fault at8 must never restart the exchange.
+Observed barriers and native register writes are explicit metadata, separate
+from FEX's sparse PC map. These exact-byte admissions neither qualify LSE as the
+complete x86 locked-operation implementation nor turn DMB LD into the selected
+LFENCE completion construction. Those are resident-contract/review obligations.
