@@ -479,8 +479,10 @@ step) on the rare path whose dividend needs 128 bits.
 - `python3 tools/fexc/scan_skips.py`: the native-control-flow scan above.
 - `python3 tools/fexc/verify_precision.py [--before FEXC0] [CORPUS.json ...]`: the slice1 precision guarantee (above) and the
   guards (P8-P10: guard on exactly the access address, split check on every store wider than 1 byte, stubs reached only by their checks,
-  indirect targets checked before any state write; series2 fails them, series4 passes) and P11 (every div/idiv has its #DE
-  check before its divide; every `blr` is the 128/64 helper call followed by its #DE branch).
+  indirect targets checked before any state write; series2 fails them, series4 passes) and P11 (every div/idiv has exactly
+  its per-width #DE checks in their exact form, on its divide's own operands, before its divide; every `blr` is the 128/64
+  helper call followed by its #DE branch). Admission (`crates/host/src/admission/structure.rs`) re-checks P8-P11 on the
+  native words of every block it admits.
 - `python3 tools/fexc/check_sites.py [--known-ok] [--slice1]`: the 64 reference programs; expected accesses from the fixture `asm`
   against the sites, sites against the `xcrun objdump` disassembly of the code (every load/store with a base other than
   x28/sp must be a site and the reverse), dense versus sparse code bytes, binary object versus JSON.

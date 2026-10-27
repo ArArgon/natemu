@@ -177,6 +177,9 @@ invalidation on read-only → writable upgrade; plus §6 step 2's single guest-m
    byte. A branch to a non-canonical target is #GP(0) at the branch (Intel); falling through into non-canonical code is
    #GP(0) at the first instruction with a non-canonical byte (the saved RIP may itself be non-canonical). #GP/#SS
    records carry CR2 = 0. The U bit comes from the committed CPL, with WP/SMEP/SMAP applied by the walker. Admission
-   does not yet check guard structure: isolation rests on the producer and its verifier (hardening item).
+   checks the guard, split, #DE, exit and frame structure on every block's words (`crates/host/src/admission/structure.rs`,
+   H1): isolation no longer rests on the producer and its offline verifier alone. Open policy: an access wrapping past
+   2^64 (e.g. 8 bytes at `0xffff_ffff_ffff_fffc`) passes the guard (its first byte is canonical) and reaches guest page
+   0, never private memory; x86 semantics for the wrap (#GP versus wrap) are not yet decided.
 5. **TSO evidence before two vCPUs** (§2); upkeep of patches to upstream RA, flag elimination and dispatcher. Slice 1
    drops block linking, L1 lookup, call-ret stack and push/pop fusion (code-cache step restores them). No scope change.

@@ -33,11 +33,16 @@ For every compile, from the disassembly, the sites, the dense PC table and the s
   P8-P10 (S1b2, see guards()): every non-RIP-relative access has the address guard on exactly its address, every pure
       store wider than one byte the split check, every stub is reached only by its check, and every indirect exit checks
       its target before any state write; the guard/split/branch-target stubs are sites, so P1/P2 hold at their branches.
-  P11 (S1f, see divides()): every div/idiv has a #DE check branch to a divide stub (`brk #3`) before FEX's own divide (or
-      its helper call); every divide stub is reached from inside a div/idiv instruction; every `blr` is FEX's call of the
-      resident 128/64 helper (`ldr x3, [x28, #LUDIVHandler|LDIVHandler]` for div|idiv; `str x30, [sp, #-16]!; blr x3;
-      ldr x30, [sp], #16`) followed by `cbnz x2` to a divide stub. P1/P2 at each divide branch then give the state before
-      the instruction, relying on the helper's contract (only x0-x3 change; NZCV kept; the runtime's natemu_ludiv).
+  P11 (S1f, see divides()): every div/idiv (width and signedness from its x86 bytes) has exactly its #DE checks in
+      their exact per-width form (DIV_FORMS: opcodes, extends, bitfield positions and scratch registers pinned; the far
+      form `inverse test; b stub` accepted), the zero check directly before the overflow check, all before FEX's own
+      divide (or its helper call), reading that divide's divisor (directly or through FEX's x1 copy), at 8 bits its
+      dividend, and passing the same divisor to the helper in x2, unchanged in between; every divide stub is one of
+      these checks; every `blr` is FEX's call of the resident 128/64 helper (`ldr x3, [x28, #LUDIVHandler|LDIVHandler]`
+      for div|idiv; `str x30, [sp, #-16]!; blr x3; ldr x30, [sp], #16`) followed by `cbnz x2` to a divide stub. P1/P2 at
+      each divide branch then give the state before the instruction, relying on the helper's contract (only x0-x3
+      change; NZCV kept; the runtime's natemu_ludiv). Admission (crates/host/src/admission/structure.rs) checks the
+      same forms on every block it admits.
 Assumption by construction, NOT checked: every static-register write of guest instruction k-1 is emitted before the PC-table
 entry of instruction k. P1 sees only the window from an instruction's start to its site, so a write of an earlier
 instruction that was sunk past the next instruction's start would be flagged only if it lands before that site, and one
@@ -400,11 +405,50 @@ def guards(d, dis, order):
     return out, check_at, cost
 
 
+def x86_divide(code):
+    """(signed, operand width) of an x86 div/idiv (F6/F7 /6, /7) from its bytes, else None."""
+    i, size16, rex_w = 0, False, False
+    while i < len(code) and code[i] in (0x66, 0x67, 0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0xf0, 0xf2, 0xf3):
+        size16 |= code[i] == 0x66
+        i += 1
+    if i < len(code) and code[i] & 0xf0 == 0x40:
+        rex_w = bool(code[i] & 8)
+        i += 1
+    if i + 1 >= len(code) or code[i] not in (0xf6, 0xf7) or (code[i + 1] >> 3 & 7) < 6:
+        return None
+    return (code[i + 1] >> 3 & 7) == 7, 8 if code[i] == 0xf6 else 64 if rex_w else 16 if size16 else 32
+
+
+R = r'(?P<{}>\d+)'   # a register number parameter
+# The exact #DE checks per (signed, width): kind -> (words before the check branch, the branch, normalized: taken on #DE).
+# Registers: d = divisor, h = dividend (8-bit forms; 16-64 read RDX:RAX in x5:x4 directly). Pinned: opcodes, extends,
+# bitfield positions, scratch registers x0/x1.
+DIV_FORMS = {
+    (False, 8): {'high': ([rf'ubfx x0, x{R.format("h")}, #8, #8', rf'sub x0, x0, w{R.format("d")}, uxtb'], r'tbz x0, #0x3f')},
+    (False, 16): {'high': ([r'uxth w0, w5', rf'sub x0, x0, w{R.format("d")}, uxth'], r'tbz x0, #0x3f')},
+    (False, 32): {'high': ([r'mov w0, w5', rf'sub x0, x0, w{R.format("d")}, uxtw'], r'tbz x0, #0x3f')},
+    (False, 64): {'zero': ([], rf'cbz x{R.format("d")}')},
+    (True, 8): {'zero': ([rf'sxtb w1, w{R.format("d")}'], r'cbz w1'),
+                'overflow': ([rf'sxth w0, w{R.format("h")}', r'sdiv w0, w0, w1', r'sub w0, w0, w0, sxtb'], r'cbnz w0')},
+    (True, 16): {'zero': ([rf'sxth w1, w{R.format("d")}'], r'cbz w1'),
+                 'overflow': ([r'uxth w0, w4', r'bfi w0, w5, #16, #16', r'sdiv w0, w0, w1', r'sub w0, w0, w0, sxth'], r'cbnz w0')},
+    (True, 32): {'zero': ([rf'sxtw x1, w{R.format("d")}'], r'cbz x1'),
+                 'overflow': ([r'mov w0, w4', r'bfi x0, x5, #32, #32', r'sdiv x0, x0, x1', r'sub x0, x0, w0, sxtw'], r'cbnz x0')},
+    (True, 64): {'zero': ([], rf'cbz x{R.format("d")}'),
+                 'overflow': ([r'eor x0, x4, #0x8000000000000000', r'add x1, x5, #0x1', r'orr x0, x0, x1',
+                               rf'add x1, x{R.format("d")}, #0x1', r'orr x0, x0, x1'], r'cbz x0')},
+}
+DIV_WANT = {(False, 64): ['verdict', 'zero'], (True, 64): ['overflow', 'verdict', 'zero']}   # else: high | overflow+zero
+SCRATCH = {0, 1, 2, 3, 28, 31}
+INVERSE = {'cbz': 'cbnz', 'cbnz': 'cbz', 'tbz': 'tbnz', 'tbnz': 'tbz'}
+
+
 def divides(d, dis, order, stubs, check_at):
     """P11 on one compile: (violations, the divide check branches)."""
     out, ok = [], set()
     ptr = {p['state_offset']: p['pointer'] for p in d['state_abi']['state_pointer_loads']}
-    names = {i['offset']: i['name'] for i in d['guest']['instructions'] if i['translated']}
+    gi = {i['offset']: i for i in d['guest']['instructions'] if i['translated']}
+    names = {g: i['name'] for g, i in gi.items()}
     starts = sorted((e['native_offset'], e['guest_offset']) for e in d['pc_table']['entries'])
     body_end = min([o for o in order if dis[o].startswith('brk')] + [d['code']['layout']['code_region_end']])
 
@@ -414,28 +458,49 @@ def divides(d, dis, order, stubs, check_at):
         hi = min([n for n, og in starts if og > g] + [body_end])
         return g, lo, hi
 
-    def branch_to(t, stub):
-        """The check's own conditional test reaching `stub` from t (FEX's far form: inverse test to t+4; b stub)."""
-        text = dis.get(t, '')
-        if re.fullmatch(rf'(cbz|cbnz) [wx]\d+, {stub:#x}|tbz x0, #0x3f, {stub:#x}', text):
-            return t
-        if text == f'b {stub:#x}' and re.fullmatch(rf'(cbz|cbnz) [wx]\d+, {t + 4:#x}|tbnz x0, #0x3f, {t + 4:#x}', dis.get(t - 4, '')):
-            return t - 4
+    def cond_to(t, stub):
+        """(offset, normalized text) of the check's conditional test reaching `stub` from the branch at t: the test
+        itself, or FEX's far form `inverse test to t+4; b stub` normalized to the test taken on #DE."""
+        m = re.fullmatch(rf'(cbz|cbnz|tbz|tbnz) (.*), {stub:#x}', dis.get(t, ''))
+        if m:
+            return t, f'{m[1]} {m[2]}'
+        m = re.fullmatch(rf'(cbz|cbnz|tbz|tbnz) (.*), {t + 4:#x}', dis.get(t - 4, ''))
+        if dis.get(t) == f'b {stub:#x}' and m:
+            return t - 4, f'{INVERSE[m[1]]} {m[2]}'
+        return None
+
+    def form(sw, c, cond):
+        """(kind, first word, registers) of the exact #DE check whose conditional test is at c, else None."""
+        if cond == 'cbnz x2' and dis.get(c - 8) == 'blr x3':
+            return 'verdict', c - 20, {}
+        for kind, (words, test) in DIV_FORMS.get(sw, {}).items():
+            regs = {}
+            seq = [(c - 4 * (len(words) - k), w) for k, w in enumerate(words)] + [(c, test)]
+            for o, pattern in seq:
+                m = re.fullmatch(pattern, cond if o == c else dis.get(o, ''))
+                if not m or any(regs.get(k, v) != v for k, v in m.groupdict().items()):
+                    break
+                regs |= m.groupdict()
+            else:
+                if all(int(v) not in SCRATCH for v in regs.values()):
+                    return kind, seq[0][0], {k: int(v) for k, v in regs.items()}
         return None
 
     divs = {at: s for at, s in stubs.items() if s['kind'] == 'divide'}
-    branches = {}   # guest offset -> divide check branches
+    checks = {}   # guest offset -> [(kind, first word, branch, registers)]
     for at, s in divs.items():
         t = check_at.get(at)
         if t is None:
             continue   # reported by guards()
-        c = branch_to(t, at)
-        g, lo, hi = insn_at(c if c is not None else t)
-        if c is None or names.get(g) not in ('DIV', 'IDIV') or g != s['guest_offset'] or not lo <= c < hi:
-            out.append(f'divide stub +{at}: branch +{t} "{dis.get(t)}" is not a #DE check inside its div/idiv (guest +{s["guest_offset"]})')
+        cc = cond_to(t, at)
+        g, lo, hi = insn_at(cc[0] if cc else t)
+        sw = x86_divide(bytes.fromhex(gi[g]['bytes_hex'])) if g in gi else None
+        f = cc and sw and form(sw, *cc)
+        if not f or g != s['guest_offset'] or not lo <= f[1] or names.get(g) != ('IDIV' if sw[0] else 'DIV'):
+            out.append(f'divide stub +{at}: branch +{t} "{dis.get(t)}" is not an exact #DE check of its div/idiv (guest +{s["guest_offset"]})')
             continue
         ok.add(t)
-        branches.setdefault(g, []).append(c)
+        checks.setdefault(g, []).append((f[0], f[1], t, f[2]))
     for o in (o for o in order if dis[o].startswith(('blr', 'bl '))):
         g, lo, hi = insn_at(o)
         want = {'DIV': 'LUDIVHandler', 'IDIV': 'LDIVHandler'}.get(names.get(g))
@@ -449,12 +514,62 @@ def divides(d, dis, order, stubs, check_at):
     for g, name in names.items():
         if name not in ('DIV', 'IDIV'):
             continue
+        sw = x86_divide(bytes.fromhex(gi[g]['bytes_hex']))
         lo = min(n for n, og in starts if og == g)
         hi = min([n for n, og in starts if og > g] + [body_end])
-        fex = [o for o in order if lo <= o < hi and (dis[o] == 'blr x3' or (dis[o].partition(' ')[0] in ('udiv', 'sdiv') and
-                                                                          reg(dis[o].split()[1].rstrip(',')) not in (('x', 0), ('x', 1))))]
-        if not fex or not any(c < fex[0] for c in branches.get(g, [])):
+        mine = sorted(checks.get(g, []), key=lambda x: x[1])
+        kinds = sorted(k for k, *_ in mine)
+        want = DIV_WANT.get(sw, ['overflow', 'zero'] if sw and sw[0] else ['high'])
+        if not sw or kinds != want:
+            out.append(f'{name} at guest +{g}: #DE checks {kinds}, expected {want}')
+            continue
+        by = {k: (s, t, r) for k, s, t, r in mine}
+        if 'overflow' in by and (by['overflow'][0] != by['zero'][1] + 4 or by['overflow'][2].get('d', by['zero'][2]['d']) != by['zero'][2]['d']):
+            out.append(f'{name} at guest +{g}: the overflow check does not directly follow its zero check')
+        # FEX's divide: the helper call or a udiv/sdiv into another register than the checks' x0; all checks but the
+        # helper's verdict come first, and they read its operands.
+        def fex_div(o):
+            mn, _, ops = dis[o].partition(' ')
+            return mn in ('udiv', 'sdiv') and not ops.startswith(('w0,', 'x0,'))
+        fex = [o for o in order if lo <= o < hi and (dis[o] == 'blr x3' or fex_div(o))]
+        inline = [o for o in fex if dis[o] != 'blr x3']
+        if not fex or not inline or any(t >= fex[0] for k, s, t, r in mine if k != 'verdict'):
             out.append(f'{name} at guest +{g}: no #DE check before its divide (+{fex[0] if fex else None})')
+            continue
+        dreg = (by.get('high') or by['zero'])[2]['d']
+        hreg = (by.get('high') or by.get('overflow') or (0, 0, {}))[2].get('h')
+        mn, ops = dis[inline[0]].split(' ', 1)
+        rd, rn, rm = [reg(x)[1] for x in ops.split(', ')]
+        x1 = [o for o in order if lo <= o < inline[0] and ('x', 1) in writes(dis[o])]
+        copy = rm == 1 and x1 and dis[x1[-1]] in (f'mov w1, w{dreg}', f'sxth w1, w{dreg}', f'sxtw x1, w{dreg}')
+        x2 = [o for o in order if lo <= o < fex[0] and ('x', 2) in writes(dis[o])]
+        helper = sw[1] != 64 or (x2 and dis[x2[-1]] == f'mov x2, x{dreg}')
+        first = min(s for k, s, t, r in mine)
+        if not (rm == dreg or copy) or mn != ('sdiv' if sw[0] else 'udiv') or (sw[1] == 8 and rn != hreg) or not helper \
+                or any(first <= o < fex[0] and ('x', dreg) in writes(dis[o]) for o in order):
+            out.append(f'{name} at guest +{g}: its #DE checks do not read the operands of its divide "{dis[inline[0]]}"')
+        # The dividend is RDX:RAX (x5:x4), unchanged from the instruction start to FEX's divide; the 8-bit forms read
+        # FEX's copy of AX (`uxth wH, w4` / `sxth xH, w4`), unchanged up to the divide.
+        last = max(fex[0], inline[0])
+        if sw[1] == 8:
+            hw = [o for o in order if lo <= o < first and ('x', hreg) in writes(dis[o])]
+            ax = f'sxth x{hreg}, w4' if sw[0] else f'uxth w{hreg}, w4'
+            if not hw or dis[hw[-1]] != ax or any(first <= o < inline[0] and ('x', hreg) in writes(dis[o]) for o in order):
+                out.append(f'{name} at guest +{g}: its 8-bit #DE checks do not read FEX\'s copy of AX ({ax})')
+        if any(lo <= o < last and writes(dis[o]) & {('x', 4), ('x', 5)} for o in order):
+            out.append(f'{name} at guest +{g}: RDX:RAX written before its divide')
+        # 64 bits: FEX's selector of its inline divide is exactly `cbz x5` (div) or `asr x0, x4, #63; eor x0, x0, x5;
+        # cbz x0` (idiv), right after the checks, to that divide.
+        if sw[1] == 64:
+            after = by['overflow' if sw[0] else 'zero'][1] + 4
+            sel, test = (['asr x0, x4, #63', 'eor x0, x0, x5'], 'cbz x0') if sw[0] else ([], 'cbz x5')
+            c = after + 4 * len(sel)
+            near = re.fullmatch(rf'{test}, 0x([0-9a-f]+)', dis.get(c, ''))
+            inv = INVERSE[test.split()[0]] + ' ' + test.split()[1]
+            far = dis.get(c) == f'{inv}, {c + 8:#x}' and re.fullmatch(r'b 0x([0-9a-f]+)', dis.get(c + 4, ''))
+            target = int((near or far)[1], 16) if (near or far) else None
+            if [dis.get(after + 4 * k) for k in range(len(sel))] != sel or target != inline[0]:
+                out.append(f'{name} at guest +{g}: FEX\'s 64-bit fast-path selector is not exact')
     return out, ok
 
 

@@ -360,5 +360,32 @@ class Slice1Exits(unittest.TestCase):
         self.assertEqual((full, cut), (64, 0))
 
 
+
+@unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
+class Slice1DivisionChecks(unittest.TestCase):
+    def test_p11_pins_the_exact_check(self):
+        # A real compile of every div/idiv form verifies; one-word mutations of its #DE checks (the extend of the
+        # 32-bit high check, the bitfield of the 8-bit one, the divisor register, the 8-bit dividend copy, FEX's
+        # 64-bit fast-path selector) must each be reported by P11.
+        import verify_precision as vp
+        p = next(p for p in vp.adversarial() if p['name'] == 'division-forms')
+        d, _ = run(p['code'], int(p['rip'], 16))
+        code = bytes.fromhex(d['code']['hex'])
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(vp.verify(d, Path(t))[0], [])
+            dis = check_sites.disassemble(code, d['code']['layout']['code_region_end'], Path(t))
+            for text, change, why in (('sub x0, x0, w7, uxtw', lambda w: w & ~(7 << 13) | 1 << 13, 'exact #DE check'),   # uxth
+                                      ('ubfx x0, x23, #8, #8', lambda w: w + (1 << 16) + (1 << 10), 'exact #DE check'),   # #9, #8
+                                      ('sub x0, x0, w20, uxtb', lambda w: w + (1 << 16), 'operands'),                     # w21
+                                      ('uxth w23, w4', lambda w: w + (2 << 5), 'copy of AX'),                             # w6
+                                      ('cbz x5, ', lambda w: w + 1, 'selector'),                                          # cbz x6
+                                      ('eor x0, x0, x5', lambda w: w & ~(31 << 16), 'selector')):                         # x0
+                o = min(o for o, x in dis.items() if x.startswith(text))   # first occurrence
+                w = change(int.from_bytes(code[o:o + 4], 'little'))
+                bad = dict(d, code=dict(d['code'], hex=(code[:o] + w.to_bytes(4, 'little') + code[o + 4:]).hex()))
+                problems = vp.verify(bad, Path(t))[0]
+                self.assertTrue(any(why in m for m in problems), (text, problems))
+
+
 if __name__ == '__main__':
     unittest.main()

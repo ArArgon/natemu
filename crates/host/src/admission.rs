@@ -1,11 +1,14 @@
 //! Admission of fexc code objects (`natemu_abi::code_object`) for the execution
 //! mode, before anything reaches the VM: header, profile, sizes and offsets,
 //! feature profile against the vCPU's ID registers, sorted in-body access sites
-//! of supported kinds, guest-RIP relocations of the requested RIP, and every
-//! x28 (FEX frame) access within the admitted fields (native pointers load-only). Literal slots are
-//! resolved here; the resident fills the frame's native pointers itself.
+//! of supported kinds and guest-RIP relocations of the requested RIP; then the
+//! code itself ([`structure`]): every instruction decoded, frame accesses, address
+//! guards, split and #DE checks, exits and indirect branches verified on the words.
+//! Literal slots are resolved here; the resident fills the frame's native pointers itself.
 use natemu_abi::code_object::{self as object, Header, PcEntry, Reloc, Site};
-use natemu_abi::execution::{BLOCK_STACK_BYTES, ENTRY_OFFSET, SLOT_BYTES, STAGING_BYTES, frame};
+use natemu_abi::execution::{ENTRY_OFFSET, SLOT_BYTES, STAGING_BYTES, frame};
+
+mod structure;
 
 /// The vCPU ID registers features are checked against, in [`Field::register`] order.
 pub(crate) const ID_REGISTERS: [(&str, u16); 5] = [
@@ -130,6 +133,38 @@ fn branch_target(insn: &[u8], end: u64) -> Option<u64> {
 /// Admits `bytes`, an fexc `--object` compiled at `rip` from `source` (the guest
 /// bytes given to fexc), for a vCPU executing `supported` feature bits.
 pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Result<Admitted, String> {
+    let (admitted, parts) = admit_records(bytes, rip, source, supported)?;
+    let h = &parts.header;
+    let code = &admitted.object[h.code_offset as usize..][..h.code_region_end as usize];
+    let split = parts.sites.iter().position(is_stub).unwrap_or(parts.sites.len());
+    let (accesses, stubs) = parts.sites.split_at(split);
+    let c = structure::Code {
+        code,
+        literals: &parts.literals,
+        accesses,
+        stubs,
+        pcs: &parts.pcs,
+        relocs: &parts.relocs,
+        source,
+        rip,
+        guest_bytes: h.guest_bytes,
+    };
+    structure::check(&c).map_err(|e| format!("object refused: {e}"))?;
+    Ok(admitted)
+}
+
+/// The records of an object [`admit_records`] accepted.
+struct Parts {
+    header: Header,
+    sites: Vec<Site>,
+    pcs: Vec<PcEntry>,
+    relocs: Vec<Reloc>,
+    /// Literal slots in the code (offsets from the code start).
+    literals: Vec<std::ops::Range<usize>>,
+}
+
+/// Everything but the code: header, tables, site records, relocations.
+fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Result<(Admitted, Parts), String> {
     let fail = |what: &str| Err(format!("object refused: {what}"));
     if bytes.len() < size_of::<Header>() || bytes.len() > STAGING_BYTES {
         return fail("size");
@@ -163,8 +198,9 @@ pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Re
         || h.body_offset < ENTRY_OFFSET
         || h.body_offset > region
         || h.end_marker_offset != object::NONE32
-        || h.spill_bytes > BLOCK_STACK_BYTES
-        || h.spill_bytes % 16 != 0
+        // ponytail: no spill area (fexc never spilled on the slice-1 corpora); admitting one needs the sp
+        // prologue/epilogue and spill-slot accesses verified on every path.
+        || h.spill_bytes != 0
         || h.guest_bytes == 0
         || h.guest_bytes as usize > source.len()
         || h.pre_nzcv_offset != frame::PRE_NZCV
@@ -216,7 +252,7 @@ pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Re
     let target = (h.end_reason == object::end_reason::BLOCK_ENDING_INSTRUCTION)
         .then(|| branch_target(&source[last..h.guest_bytes as usize], end))
         .flatten();
-    let plausible = |v: u64| v == rip || v == end || Some(v) == target;
+    let plausible = |v: u64| (v == rip || v == end || Some(v) == target) && (structure::canonical(v) || v == end);
     let mut out = bytes.to_vec();
     let mut literals = Vec::new();
     for r in &relocs {
@@ -237,8 +273,8 @@ pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Re
             _ => return fail(&format!("relocation at {at:#x}")),
         }
     }
-    check_frame_accesses(&out[code..code + region as usize], ENTRY_OFFSET as usize, &literals)?;
-    Ok(Admitted { object: out, guest_bytes: h.guest_bytes })
+    let admitted = Admitted { object: out, guest_bytes: h.guest_bytes };
+    Ok((admitted, Parts { header: h, sites, pcs, relocs, literals }))
 }
 
 /// The intent a site's kind implies: stores write; a load writes only as the
@@ -322,39 +358,14 @@ fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
     }
 }
 
-/// Every load/store with base x28 in `code[from..]` (literal slots skipped) must be
-/// an unsigned-offset integer access inside one admitted FEX frame field, and only
-/// a load of a native pointer the resident fills.
-fn check_frame_accesses(code: &[u8], from: usize, literals: &[std::ops::Range<usize>]) -> Result<(), String> {
-    for at in (from..code.len()).step_by(4) {
-        if literals.iter().any(|l| l.contains(&at)) {
-            continue;
-        }
-        let w = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
-        let load_store = (w >> 25) & 5 == 4;
-        let literal = (w >> 27) & 7 == 3 && (w >> 24) & 1 == 0;
-        if !load_store || literal || (w >> 5) & 31 != 28 {
-            continue;
-        }
-        // LDR/STR (unsigned immediate), general registers: size:111:0:01:opc.
-        let size = w >> 30;
-        let offset = ((w >> 10) & 0xfff) << size;
-        let bytes = 1 << size;
-        let load = (w >> 22) & 3 == 1;
-        let admitted = (w >> 24) & 0x3f == 0x39
-            && (w >> 22) & 3 <= 1
-            && frame::FIELDS.iter().any(|&(field, len)| offset >= field && offset + bytes <= field + len)
-            && (load || !frame::POINTERS.iter().any(|&p| offset < p + 8 && p < offset + bytes));
-        if !admitted {
-            return Err(format!("object refused: frame access {w:#010x} at native offset {at:#x}"));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The record checks only: the synthetic object's code is no real block (`structure` tests use fexc output).
+    fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Result<Admitted, String> {
+        admit_records(bytes, rip, source, supported).map(|(a, _)| a)
+    }
 
     const RIP: u64 = 0x10_0000;
     /// `str x0,[x28]`, `ldr x0,[x20]`, `str x0,[x28,#24]`, `ldr x1,[x28,#2920]`, `br x1`, literal.
@@ -478,7 +489,7 @@ mod tests {
             header(|h| h.relocs_offset = 128), // inside the code
             header(|h| h.code_region_end = 64),
             header(|h| h.body_offset = 0),
-            header(|h| h.spill_bytes = BLOCK_STACK_BYTES + 16),
+            header(|h| h.spill_bytes = 16),
             header(|h| h.sra_gpr[3] = 4),
             header(|h| h.sra_gpr[0] = 28),
             header(|h| h.version += 1),
@@ -550,6 +561,11 @@ mod tests {
         assert!(admit(&literal(RIP + 4, object::end_reason::END_OF_INPUT), RIP, &SOURCE, ALL).is_err());
         assert!(admit(&literal(RIP + 5, ending), RIP, &SOURCE, ALL).is_err());
         assert!(admit(&literal(0xdead_0000, ending), RIP, &SOURCE, ALL).is_err());
+        // A non-canonical branch target is refused; the fall-through RIP may leave canonical space.
+        let top = 0x7fff_ffff_fffd;
+        let at_top = |value: u64| with(literal(value, ending), 0, |h: &mut Header| h.guest_rip = top);
+        assert!(admit(&at_top(top + 3), top, &SOURCE, ALL).is_ok());
+        assert!(admit(&at_top(top + 4), top, &SOURCE, ALL).is_err());
         assert_eq!(branch_target(&[0x48, 0xe9, 0xfb, 0xff, 0xff, 0xff], 0x10), Some(0x0b));
         assert_eq!(branch_target(&[0x0f, 0x84, 1, 0, 0, 0], 0x10), Some(0x11));
         assert_eq!(branch_target(&[0x90], 0x10), None);
@@ -619,28 +635,31 @@ mod tests {
         assert!(admit(&with_stub(Site { base_reg: object::NO_REG, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
     }
 
+    /// Every object in `$NATEMU_ADMIT_CORPUS` (`NAME.obj` compiled at its header RIP from `NAME.src`) is admitted;
+    /// prints the admission time per block. `cargo test --release -p natemu-host corpus -- --ignored --nocapture`.
     #[test]
-    fn division_helper_pointers_are_load_only() {
-        // ldr x3,[x28,#3024] (LUDIVHandler) and ldr x3,[x28,#3032] (LDIVHandler) are admitted.
-        for word in [0xf945_eb83u32, 0xf945_ef83] {
-            assert!(admit(&with(object(), 128 + 16, |w: &mut u32| *w = word), RIP, &SOURCE, ALL).is_ok(), "{word:#x}");
+    #[ignore]
+    fn corpus() {
+        let dir = std::env::var("NATEMU_ADMIT_CORPUS").expect("NATEMU_ADMIT_CORPUS");
+        let (mut n, mut bad, mut words, mut time) = (0, 0, 0, std::time::Duration::ZERO);
+        let mut entries: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        entries.sort();
+        for obj in entries.iter().filter(|p| p.extension().is_some_and(|e| e == "obj")) {
+            let (bytes, source) = (std::fs::read(obj).unwrap(), std::fs::read(obj.with_extension("src")).unwrap());
+            let h: Header = record(&bytes, 0);
+            let t = std::time::Instant::now();
+            let r = super::admit(&bytes, h.guest_rip, &source, ALL);
+            time += t.elapsed();
+            n += 1;
+            words += h.code_region_end as u64 / 4;
+            if let Err(e) = r {
+                bad += 1;
+                if bad <= 40 {
+                    println!("{}: {e}", obj.file_name().unwrap().to_string_lossy());
+                }
+            }
         }
-        // str x3,[x28,#3024], str x1,[x28,#2920]: a native pointer is never written by code.
-        for word in [0xf905_eb83u32, 0xf905_b781] {
-            assert!(admit(&with(object(), 128 + 16, |w: &mut u32| *w = word), RIP, &SOURCE, ALL).is_err(), "{word:#x}");
-        }
-    }
-
-    #[test]
-    fn frame_accesses_outside_admitted_fields_are_refused() {
-        // ldr x1,[x28,#8]: the slot between the block header and RIP.
-        let bad = with(object(), 128 + 16, |w: &mut u32| *w = 0xf9400781);
-        assert!(admit(&bad, RIP, &SOURCE, ALL).is_err());
-        // ldp x0,x1,[x28]
-        let bad = with(object(), 128 + 16, |w: &mut u32| *w = 0xa9400780);
-        assert!(admit(&bad, RIP, &SOURCE, ALL).is_err());
-        // A nonzero literal slot (would be patched over) is refused.
-        let bad = with(object(), 128 + 24, |w: &mut u32| *w = 1);
-        assert!(admit(&bad, RIP, &SOURCE, ALL).is_err());
+        println!("{n} objects, {bad} refused; {:.1} us per block, {:.1} ns per code word", time.as_secs_f64() * 1e6 / n as f64, time.as_secs_f64() * 1e9 / words as f64);
+        assert_eq!(bad, 0);
     }
 }
