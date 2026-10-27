@@ -7,33 +7,19 @@ use core::{
     ptr,
 };
 use natemu_abi::*;
-use natemu_abi::guest_memory::{GuestRam, GuestTables, Observer};
+use natemu_abi::guest_memory::{GuestRam, GuestTables};
 use record::*;
-mod atomic_progress;
-mod coherence;
-mod concurrent;
-mod controls;
+// Kept general for the multi-owner path; only the families use it so far.
+#[cfg_attr(not(feature = "families"), allow(dead_code))]
 mod coordinator;
 mod execution;
-mod fence;
-mod helper;
-mod ordering;
-mod paging_off32;
-mod paging_off_steps;
-mod partial;
-mod partial_progress;
-mod pressure;
+#[cfg(feature = "families")]
+mod families;
 mod record;
-mod recovery;
-mod schedule;
-mod containment;
-mod stack;
-mod table_log;
 mod tables;
-mod translation;
-mod validation;
 
-global_asm!(include_str!("gates.S"),
+// The general gates; the `families` feature appends the regression families' gates.
+macro_rules! gates { ($source:expr) => { global_asm!($source,
     frame_size=const size_of::<NativeFrame>(),
     sp_offset=const offset_of!(NativeFrame,sp),
     q_offset=const offset_of!(NativeFrame,q),
@@ -46,12 +32,11 @@ global_asm!(include_str!("gates.S"),
     exception_stack_top=const EXCEPTION_STACK_TOP,
     identity_entry=const PRIVATE+0x11008,
     upper_root_pages=const (shadow::UPPER_ROOT-shadow::LOWER_ROOT)/4096,
-);
-
-unsafe extern "C" {
-    fn enter(frame: *const NativeFrame) -> !;
-    fn returned();
-}
+); } }
+#[cfg(not(feature = "families"))]
+gates!(include_str!("gates.S"));
+#[cfg(feature = "families")]
+gates!(concat!(include_str!("gates.S"), include_str!("families/gates.S")));
 
 fn shared() -> *mut Shared {
     (PRIVATE + SHARED_OFFSET as u64) as *mut Shared
@@ -86,43 +71,10 @@ unsafe extern "C" fn runtime_main() -> ! {
         if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::execution::MODE {
             execution::start();
         }
-        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::partial_progress::MODE {
-            partial_progress::initialize();
-        }
-        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::coherence::MODE {
-            coherence::initialize();
-        }
-        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::fence::MODE {
-            fence::initialize();
-        }
-        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::ordering::MODE {
-            ordering::initialize();
-        }
-        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::concurrency::MODE {
-            concurrent::initialize();
-        }
-        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::validation::MODE {
-            validation::initialize();
-        }
-        if ptr::read_volatile(&raw const (*s).mode) >= natemu_abi::translation::MODE {
-            translation::initialize();
-        }
-        let object = ptr::read_volatile(&raw const (*s).object);
-        let mut initial = read_record(&raw const (*s).initial);
-        if object.code_length > 48 {
-            stop(REJECTED, 3);
-        }
-        let code = core::slice::from_raw_parts(CODE_VA as *const u8, object.code_length as usize);
-        if let Err(reason) = object.validate(&initial, code) {
-            stop(REJECTED, reason);
-        }
-        let capture_pc = returned as *const () as u64;
-        initial.x[16] = CODE_VA;
-        initial.x[30] = capture_pc;
-        write_record(&raw mut (*s).initial, initial);
-        ptr::write_volatile(&raw mut (*s).capture_pc, capture_pc);
-        asm!("dsb ish", "ic iallu", "dsb ish", "isb");
-        enter(&raw const (*s).initial);
+        #[cfg(feature = "families")]
+        families::start();
+        #[cfg(not(feature = "families"))]
+        stop(REJECTED, 11);
     }
 }
 
@@ -134,57 +86,10 @@ unsafe extern "C" fn finish(frame: *const NativeFrame, fault: u64) -> ! {
         if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::execution::MODE {
             execution::returned(&*frame, fault);
         }
-        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::partial_progress::MODE {
-            partial_progress::finish(fault);
-        }
-        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::coherence::MODE {
-            coherence::finish(fault);
-        }
-        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::fence::MODE {
-            fence::finish(fault);
-        }
-        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::ordering::MODE {
-            ordering::finish(fault);
-        }
-        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::concurrency::MODE {
-            concurrent::completed(fault);
-        }
-        if fault != 0 {
-            let esr: u64;
-            let far: u64;
-            let elr: u64;
-            let spsr: u64;
-            asm!("mrs {0}, ESR_EL1", "mrs {1}, FAR_EL1", "mrs {2}, ELR_EL1", "mrs {3}, SPSR_EL1",
-                 out(reg) esr,out(reg) far,out(reg) elr,out(reg) spsr);
-            ptr::write_volatile(&raw mut (*s).esr, esr);
-            ptr::write_volatile(&raw mut (*s).far, far);
-            ptr::write_volatile(&raw mut (*s).elr, elr);
-            ptr::write_volatile(&raw mut (*s).spsr, spsr);
-            if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::validation::MODE {
-                validation::finish(fault);
-            }
-            if ptr::read_volatile(&raw const (*s).mode) >= natemu_abi::recovery::MODE {
-                if partial::owns(elr) {
-                    partial::fault();
-                }
-                recovery::fault();
-            }
-            stop(NATIVE_FAULT, 0);
-        }
-        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::validation::MODE {
-            validation::finish(fault);
-        }
-        if ptr::read_volatile(&raw const (*s).mode) >= natemu_abi::translation::MODE {
-            if ptr::read_volatile(&raw const (*s).mode) >= natemu_abi::recovery::MODE {
-                if pressure::enabled() {
-                    pressure::completed()
-                } else {
-                    recovery::completed()
-                };
-            }
-            translation::completed();
-        }
-        stop(SUCCESS, 0);
+        #[cfg(feature = "families")]
+        families::finish(fault);
+        #[cfg(not(feature = "families"))]
+        stop(PANIC, 11);
     }
 }
 

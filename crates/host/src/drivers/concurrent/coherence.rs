@@ -1,6 +1,6 @@
 //! Retained native observations for shared x86 table mutation and shootdown.
 use super::*;
-use natemu_abi::coherence as c;
+use natemu_abi::families::coherence as c;
 
 macro_rules! fields {
     ($s:ident; $($field:ident),* $(,)?) => {{

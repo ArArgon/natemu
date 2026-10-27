@@ -292,7 +292,7 @@ def main():
         for name in ('i4v_ordering_worker', 'i4v_ordering_model', 'check_i4v_ordering', 'i4v_fence_worker', 'check_i4v_fence', 'check_i4v_fence_gate', 'i4v_coherence_worker', 'i4v_coherence_model', 'check_i4v_coherence', 'check_i4v_schedule', 'check_i4v_partial_progress'):
             job(name+'-tests', [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_'+name+'.py'])
         job('build-host', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-host'], wall=600, rss=8*1024**3)
-        job('build-runtime', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], wall=600, rss=8*1024**3)
+        job('build-runtime', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none', '--features', 'families'], wall=600, rss=8*1024**3)
         host = source / 'target/release/natemu-host'
         runtime = source / 'target/aarch64-unknown-none/release/natemu-runtime'
         gate_job=job('fence-gate-audit', [sys.executable, '-B', 'tools/check_i4v_fence_gate.py', runtime]+(['--partial'] if args.progress or args.containment else []))

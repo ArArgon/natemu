@@ -1,6 +1,6 @@
 //! Mixed32 fixture setup and per-owner observations; common coordination stays shared.
 use super::*;
-use natemu_abi::{mixed32, recovery as recover};
+use natemu_abi::{families::mixed32, recovery as recover};
 
 pub fn seed_owner(frame: &mut NativeFrame, data: &mut [u8; 256], id: usize) {
     frame.x[4] = 0x10203000 + id as u64;

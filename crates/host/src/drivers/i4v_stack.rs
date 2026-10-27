@@ -1,6 +1,6 @@
 //! Live stack-fragment validation with one compile and three bounded replies.
 use super::*;
-use natemu_abi::{recovery as recover, shadow, stack, validation};
+use natemu_abi::{recovery as recover, shadow, families::stack, families::validation};
 use crate::translation::{read_packet, run_worker, write_packet};
 use std::path::Path;
 

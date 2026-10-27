@@ -1,7 +1,7 @@
 //! Live protected32 paging-off execution of the complete retained FEX body.
 use crate::translation::{read_packet, run_worker, write_packet};
 use super::*;
-use natemu_abi::{paging_off32 as off, recovery as recover, shadow, validation};
+use natemu_abi::{families::paging_off32 as off, recovery as recover, shadow, families::validation};
 use std::path::Path;
 
 pub fn run(args: &[String]) -> Result<()> {

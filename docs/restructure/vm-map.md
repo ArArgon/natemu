@@ -93,8 +93,8 @@ or fixed workload shape.
 Ordered for the critical path to the first connected slice (one vCPU, 64-bit,
 paging on), which needs guest memory and tables before multi-owner services.
 
-Status (Oct 27): steps 1–4 done (`host/src/{vm,memory,owners}.rs`, abi
-`guest_memory.rs`/`shadow.rs`, runtime `tables.rs`/`record.rs`); step 5 remains.
+Status (Oct 27): steps 1–4 done; step 5 host side (`host/src/drivers/`) and runtime/abi side (`families/` behind the `families` cargo feature; the default resident is the general path only, ~18.6 KB text) done; drivers dissolve as the general path covers them (`host/src/{vm,memory,owners}.rs`, abi
+`guest_memory.rs`/`shadow.rs`, runtime `tables.rs`/`record.rs`).
 Sections 1–5 describe the code before these steps.
 
 1. **Host lifecycle, CPU state, memory.** See §7.

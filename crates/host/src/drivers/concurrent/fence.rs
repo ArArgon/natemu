@@ -1,6 +1,6 @@
 //! Generated live dependencies cross one local fence completion boundary.
 use super::*;
-use natemu_abi::fence as f;
+use natemu_abi::families::fence as f;
 macro_rules! fields {
     ($s:ident; $($field:ident),* $(,)?) => {{
         let mut out = Vec::<String>::new();

@@ -3,7 +3,7 @@ use super::*;
 use crate::owners::{Owners, Service};
 use natemu_abi::concurrency::*;
 use natemu_abi::translation as wire;
-use natemu_abi::{alias, shadow, stack, stack_concurrent};
+use natemu_abi::{families::alias, shadow, families::stack, families::stack_concurrent};
 mod address;
 mod coherence;
 pub(crate) mod containment;
@@ -32,7 +32,7 @@ use std::{
 fn stack_roles(n: usize) -> stack_concurrent::Roles {
     stack_concurrent::Roles::for_fixture(
         n as u64,
-        progress::configuration().filter(|c| c.family == natemu_abi::schedule::STACK),
+        progress::configuration().filter(|c| c.family == natemu_abi::families::schedule::STACK),
     )
     .expect("validated concurrent stack roles")
 }
@@ -183,7 +183,7 @@ pub fn run(args: &[String]) -> Result<()> {
         memory.copy(
             natemu_abi::recovery::SOURCE_OFFSET,
             if mixed_profile != 0 {
-                &natemu_abi::mixed32::SOURCE[..]
+                &natemu_abi::families::mixed32::SOURCE[..]
             } else if stack_profile {
                 &stack::SOURCE[..]
             } else {
@@ -196,8 +196,8 @@ pub fn run(args: &[String]) -> Result<()> {
     let pressure = scenario_id == 5;
     if pressure {
         memory.write_record(
-            natemu_abi::maintenance::OFFSET,
-            natemu_abi::maintenance::State::new(n).unwrap(),
+            natemu_abi::families::maintenance::OFFSET,
+            natemu_abi::families::maintenance::State::new(n).unwrap(),
         );
     }
     let mut seeds = Vec::new();
@@ -279,14 +279,14 @@ pub fn run(args: &[String]) -> Result<()> {
         };
         memory.write_record(base + SHARED_OFFSET, shared);
         if mixed_profile != 0 {
-            let mode = natemu_abi::mixed32::owner_mode(mixed_profile, id as u64).unwrap();
-            let mut m = natemu_abi::mixed32::State::ZERO;
+            let mode = natemu_abi::families::mixed32::owner_mode(mixed_profile, id as u64).unwrap();
+            let mut m = natemu_abi::families::mixed32::State::ZERO;
             m.mode = mode;
             m.incarnation = 1;
             m.context = mode + 1;
             m.a20 = 1;
             m.initial = frame;
-            memory.write_record(base + natemu_abi::mixed32::OFFSET, m);
+            memory.write_record(base + natemu_abi::families::mixed32::OFFSET, m);
         }
         if stack_profile {
             memory.write_record(
@@ -379,13 +379,13 @@ pub fn run(args: &[String]) -> Result<()> {
         let base = ram + id * RAM_SIZE;
         let binary = PathBuf::from(&args[5]);
         Ok(if mixed_profile != 0 {
-            let mode = natemu_abi::mixed32::owner_mode(mixed_profile, id as u64).unwrap();
+            let mode = natemu_abi::families::mixed32::owner_mode(mixed_profile, id as u64).unwrap();
             let output = owner_output(&args[6], id)?;
             checked(
                 mixed_producer::Compiler::new(binary, output, id as u64, mode),
                 move |_| unsafe {
                     ptr::read_volatile(
-                        (base + natemu_abi::mixed32::OFFSET) as *const natemu_abi::mixed32::State,
+                        (base + natemu_abi::families::mixed32::OFFSET) as *const natemu_abi::families::mixed32::State,
                     )
                     .expected
                 },
@@ -548,8 +548,8 @@ pub fn run(args: &[String]) -> Result<()> {
                 r.faults,r.old_gpa,frame_json(&r.fault_frame),r.fault_esr,r.fault_far,r.fault_pc,r.fault_spsr));
         }
         let baseline = if pressure {
-            Some(memory.read_record::<natemu_abi::maintenance::Baseline>(
-                base + natemu_abi::maintenance::BASELINE_OFFSET,
+            Some(memory.read_record::<natemu_abi::families::maintenance::Baseline>(
+                base + natemu_abi::families::maintenance::BASELINE_OFFSET,
             ))
         } else {
             None
@@ -665,7 +665,7 @@ pub fn run(args: &[String]) -> Result<()> {
         }
     );
     let maintenance = if pressure {
-        Some(memory.read_record::<natemu_abi::maintenance::State>(natemu_abi::maintenance::OFFSET))
+        Some(memory.read_record::<natemu_abi::families::maintenance::State>(natemu_abi::families::maintenance::OFFSET))
     } else {
         None
     };
@@ -681,13 +681,13 @@ pub fn run(args: &[String]) -> Result<()> {
     let maintenance_json = if let Some(m) = maintenance {
         let mut intervals = Vec::new();
         for id in 0..n {
-            if m.intervals[id] > natemu_abi::maintenance::MAX_INTERVALS as u64 {
+            if m.intervals[id] > natemu_abi::families::maintenance::MAX_INTERVALS as u64 {
                 return Err("interval reserve exceeded".into());
             }
             let state = memory.read_record::<Shared>(id * RAM_SIZE + SHARED_OFFSET);
             for index in 0..m.intervals[id] as usize {
-                let r = memory.read_record::<natemu_abi::maintenance::Interval>(
-                    id * RAM_SIZE + natemu_abi::maintenance::RECORD_OFFSET + index * 4096,
+                let r = memory.read_record::<natemu_abi::families::maintenance::Interval>(
+                    id * RAM_SIZE + natemu_abi::families::maintenance::RECORD_OFFSET + index * 4096,
                 );
                 let case = if mixed_profile != 0 {
                     "fex_mixed32_changed"
@@ -772,7 +772,7 @@ pub fn run(args: &[String]) -> Result<()> {
         Vec::new()
     };
     let role_report =
-        if progress::configuration().is_some_and(|c| c.family == natemu_abi::schedule::STACK) {
+        if progress::configuration().is_some_and(|c| c.family == natemu_abi::families::schedule::STACK) {
             format!(
                 "\"actor\":{},\"delayed_owner\":{},",
                 stack_roles.actor, stack_roles.delayed

@@ -1,6 +1,6 @@
 //! Protected32 owners share physical RAM while retaining distinct address formation.
 use super::*;
-use natemu_abi::{address_concurrent as a, maintenance as m, recovery as r};
+use natemu_abi::{families::address_concurrent as a, families::maintenance as m, recovery as r};
 
 macro_rules! fields {
     ($s:ident; $($field:ident),* $(,)?) => {{

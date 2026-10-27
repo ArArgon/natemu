@@ -227,7 +227,7 @@ def main():
         if args.i4_entry:
             job('i4-oracle-self-test', [sys.executable, '-B', 'tools/check_i4.py', '--self-test'])
         job('build-host', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-host'])
-        job('build-runtime', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'])
+        job('build-runtime', ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none', '--features', 'families'])
         host = source / 'target/release/natemu-host'
         runtime = source / 'target/aarch64-unknown-none/release/natemu-runtime'
         job('sign', ['codesign', '--force', '--sign', '-', '--entitlements', 'crates/host/entitlements.plist', host])

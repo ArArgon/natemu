@@ -316,10 +316,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "families")]
     fn deferred_dirty_commits_two_leaves() {
         let mut b = tables();
         b.0[1536 + 257] = 0x10_1007;
-        let mut t = crate::stack_boundary::DeferredDirty::new(GuestTables::new(b.ram()));
+        let mut t = crate::families::stack_boundary::DeferredDirty::new(GuestTables::new(b.ram()));
         for va in [0x10_0000, 0x10_1000] {
             assert!(paging::walk(&mut t, CONTROL, va, Access::Write).is_ok());
         }

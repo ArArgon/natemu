@@ -1,7 +1,7 @@
 //! Native semantic helper composition; containment adds compile-only work.
 //! The helper itself is not FEX-generated REP.
 use super::*;
-use natemu_abi::{partial_progress as p, schedule as sc};
+use natemu_abi::{families::partial_progress as p, families::schedule as sc};
 macro_rules! fields {
     ($s:ident;$($name:ident),* $(,)?)=>{{let mut out=Vec::<String>::new();
         $(out.push(format!("\"{}\":{:?}",stringify!($name),$s.$name));)*out}};
@@ -9,7 +9,7 @@ macro_rules! fields {
 fn record<T>(m: &Memory, offset: usize) -> &T {
     unsafe { &*m.0.add(offset).cast::<T>() }
 }
-fn walk_json(w: &natemu_abi::coherence::Walk) -> String {
+fn walk_json(w: &natemu_abi::families::coherence::Walk) -> String {
     format!(
         "{{{}}}",
         fields!(w;address,intent,gpa,leaf_bytes,writable,dirty,user,executable,wb,
@@ -121,7 +121,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let tables_before = p::tables();
     if let Some(c) = containment::configuration() {
         let at = c.actor as usize * 256 + 16;
-        source_before[at..at + 3].copy_from_slice(&natemu_abi::containment::PARTIAL_SOURCE);
+        source_before[at..at + 3].copy_from_slice(&natemu_abi::families::containment::PARTIAL_SOURCE);
     }
     let mut data_before = [0xa5; 8192];
     data_before[4096..].fill(0x5a);

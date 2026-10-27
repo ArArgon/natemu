@@ -1,6 +1,6 @@
 //! Actual guest control instructions around freshly generated ordinary instructions.
 use super::*;
-use natemu_abi::{controls as control, modes, pae, recovery as recover, shadow, validation};
+use natemu_abi::{families::controls as control, families::modes, families::pae, recovery as recover, shadow, families::validation};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},

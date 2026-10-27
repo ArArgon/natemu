@@ -50,6 +50,7 @@ pub fn install(va: u64, ram: &GuestRam, gpa: u64, writable: bool) -> Result<(), 
     let ipa = native(page as u64).ok_or(Error::OutsideRam)?;
     space().map(va & !4095, ipa, writable)
 }
+#[cfg_attr(not(feature = "families"), allow(dead_code))]
 pub fn unmap(va: u64) -> Result<(), Error> {
     space().unmap(va)
 }
@@ -57,6 +58,7 @@ pub fn unmap(va: u64) -> Result<(), Error> {
 pub fn descriptor(va: u64) -> u64 {
     space().descriptor(va)
 }
+#[cfg_attr(not(feature = "families"), allow(dead_code))]
 pub fn clear() -> Result<(), Error> {
     space().clear()
 }

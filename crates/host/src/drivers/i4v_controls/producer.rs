@@ -4,7 +4,7 @@ use crate::translation::process_owner::OwnedChild;
 use crate::*;
 use natemu_abi::concurrency::{DEFER_COMPILE, POLL_COMPILE, TAKE_COMPILE};
 use natemu_abi::translation as wire;
-use natemu_abi::{address_concurrent as address, coherence, controls, ordering};
+use natemu_abi::{families::address_concurrent as address, families::coherence, families::controls, families::ordering};
 use std::path::PathBuf;
 
 struct Job {
@@ -137,12 +137,12 @@ impl Compiler {
         let hold = deferred
             && crate::drivers::concurrent::containment::deferred_request(self.owner, &request)
             && crate::drivers::concurrent::containment::configuration().is_some_and(|c| {
-                c.actor == self.owner && c.failure == natemu_abi::containment::WORKER_EXIT
+                c.actor == self.owner && c.failure == natemu_abi::families::containment::WORKER_EXIT
             });
         let hold_container = deferred
             && crate::drivers::concurrent::containment::deferred_request(self.owner, &request)
             && crate::drivers::concurrent::containment::configuration()
-                .is_some_and(|c| c.failure == natemu_abi::containment::CANCEL);
+                .is_some_and(|c| c.failure == natemu_abi::families::containment::CANCEL);
         let mut child = OwnedChild::spawn_injected(
             &self.worker,
             &self.producer,
@@ -179,9 +179,9 @@ impl Compiler {
             return Err("control request changes configured owner/mode/profile".into());
         }
         match operation {
-            natemu_abi::containment::PEEK_CONTAINER => {
+            natemu_abi::families::containment::PEEK_CONTAINER => {
                 if !crate::drivers::concurrent::containment::configuration()
-                    .is_some_and(|c| c.failure == natemu_abi::containment::CANCEL)
+                    .is_some_and(|c| c.failure == natemu_abi::families::containment::CANCEL)
                     || !crate::drivers::concurrent::containment::service_request(
                         self.owner, &packet, operation,
                     )
@@ -193,14 +193,14 @@ impl Compiler {
                     return Err("container observation changed identity".into());
                 }
                 Ok(wire::command(if job.child.container_ready()? {
-                    natemu_abi::containment::PRODUCER_READY
+                    natemu_abi::families::containment::PRODUCER_READY
                 } else {
                     wire::BUSY
                 }))
             }
-            natemu_abi::containment::PEEK_DEFERRED => {
+            natemu_abi::families::containment::PEEK_DEFERRED => {
                 if !crate::drivers::concurrent::containment::configuration()
-                    .is_some_and(|c| c.failure == natemu_abi::containment::MALFORMED)
+                    .is_some_and(|c| c.failure == natemu_abi::families::containment::MALFORMED)
                     || !crate::drivers::concurrent::containment::service_request(
                         self.owner, &packet, operation,
                     )
@@ -216,7 +216,7 @@ impl Compiler {
                 }
                 match job.child.try_wait().map_err(|e| e.to_string())? {
                     Some(status) if status.success() => {
-                        Ok(wire::command(natemu_abi::containment::PRODUCER_READY))
+                        Ok(wire::command(natemu_abi::families::containment::PRODUCER_READY))
                     }
                     Some(_) => Err("deferred control worker failed before observation".into()),
                     None => Ok(wire::command(wire::BUSY)),
@@ -252,9 +252,9 @@ impl Compiler {
                     crate::drivers::concurrent::containment::injection_request(self.owner, &packet)
                 {
                     let job = self.pending.as_mut().unwrap();
-                    if config.failure == natemu_abi::containment::WORKER_EXIT {
+                    if config.failure == natemu_abi::families::containment::WORKER_EXIT {
                         job.child.inject_exit()?;
-                    } else if config.failure == natemu_abi::containment::MALFORMED {
+                    } else if config.failure == natemu_abi::families::containment::MALFORMED {
                         let path = job.directory.join("reply.bin");
                         let original = fs::read(&path).map_err(|e| e.to_string())?;
                         if original.len() != 128 {
@@ -360,7 +360,7 @@ mod tests {
         let mut compiler = compiler();
         compiler.pending = Some(job(request));
         let mut observed = request;
-        observed[0] = natemu_abi::containment::PEEK_DEFERRED;
+        observed[0] = natemu_abi::families::containment::PEEK_DEFERRED;
         assert_eq!(
             compiler.exchange(observed).unwrap_err(),
             "deferred observation outside containment request"

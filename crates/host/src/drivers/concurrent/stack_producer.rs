@@ -1,7 +1,7 @@
 //! One asynchronous compilation per source snapshot, followed by three chunks.
 use super::*;
 use crate::translation::process_owner::OwnedChild;
-use natemu_abi::stack;
+use natemu_abi::families::stack;
 use std::{fs::OpenOptions, io::Write, path::PathBuf};
 
 struct Job {

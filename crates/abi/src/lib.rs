@@ -1,7 +1,5 @@
 #![no_std]
 
-pub mod atomic_progress;
-
 // Same-build I1/I2 records. Pointers are owned native addresses, never guest GPAs.
 pub const VERSION: u32 = 3;
 pub const PROFILE: u32 = 1;
@@ -35,33 +33,20 @@ pub const FEX_OR_BODY: [u8; 44] = {
     body[3] = 0x4e;
     body
 };
-pub mod alias;
 pub mod concurrency;
-pub mod controls;
 pub mod guest_memory;
-pub mod control_concurrent;
-pub mod maintenance;
-pub mod mixed32;
 pub mod paging;
 pub mod paging32;
-pub mod pae;
-pub mod modes;
-pub mod paging_off32;
-pub mod paging_off_steps;
 pub mod pressure;
 pub mod recovery;
 pub mod resident;
 pub mod shadow;
-pub mod schedule;
-pub mod partial_progress;
-pub mod containment;
-pub mod stack;
-pub mod stack_concurrent;
-pub mod stack_boundary;
 pub mod translation;
-pub mod validation;
 pub mod code_object;
 pub mod execution;
+/// Regression-family records (`families` feature): the I1–I4/I4-V scenario layouts.
+#[cfg(feature = "families")]
+pub mod families;
 pub const SUCCESS: u64 = 1;
 pub const REJECTED: u64 = 2;
 pub const NATIVE_FAULT: u64 = 3;
@@ -248,9 +233,3 @@ mod tests {
         assert!(o.validate(&f, &changed).is_err());
     }
 }
-
-pub mod address_concurrent;
-pub mod ordering;
-
-pub mod fence;
-pub mod coherence;

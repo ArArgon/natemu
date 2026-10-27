@@ -1,7 +1,7 @@
 //! Live protected32 paging-off execution of the separately compiled FEX instructions.
 use crate::translation::{read_packet, run_worker, write_packet};
 use super::*;
-use natemu_abi::{paging_off_steps as off, recovery as recover, shadow, validation};
+use natemu_abi::{families::paging_off_steps as off, recovery as recover, shadow, families::validation};
 use std::path::Path;
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -49,7 +49,7 @@ pub fn run(args: &[String]) -> Result<()> {
     } else {
         &mut source_a
     };
-    active_source[..37].copy_from_slice(&natemu_abi::paging_off32::SOURCE);
+    active_source[..37].copy_from_slice(&natemu_abi::families::paging_off32::SOURCE);
     memory.copy(0x72000, &source_a);
     memory.copy(0x73000, &source_b);
     let data_pages_before = [[0xa5; 4096], [0x5a; 4096], [0x3c; 4096]];

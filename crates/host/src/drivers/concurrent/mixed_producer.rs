@@ -2,7 +2,7 @@
 use super::*;
 use crate::translation::{read_packet, write_packet};
 use crate::translation::process_owner::OwnedChild;
-use natemu_abi::mixed32;
+use natemu_abi::families::mixed32;
 use std::path::PathBuf;
 
 struct Job {

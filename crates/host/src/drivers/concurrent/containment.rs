@@ -1,6 +1,6 @@
 //! Host observation starts the failure deadline only after native publication.
 use super::*;
-use natemu_abi::{containment as c, schedule as sc};
+use natemu_abi::{families::containment as c, families::schedule as sc};
 use std::sync::{Mutex, OnceLock};
 
 static CONFIG: OnceLock<c::Config> = OnceLock::new();

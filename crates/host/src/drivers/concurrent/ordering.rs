@@ -1,6 +1,6 @@
 //! Whole generated participant blocks with synchronization outside guest accesses.
 use super::*;
-use natemu_abi::{atomic_progress as a, ordering as o};
+use natemu_abi::{families::atomic_progress as a, families::ordering as o};
 
 macro_rules! fields {
     ($s:ident; $($field:ident),* $(,)?) => {{
@@ -9,8 +9,8 @@ macro_rules! fields {
         out
     }};
 }
-fn atomic_config() -> Option<natemu_abi::schedule::Config> {
-    progress::configuration().filter(|c| c.family == natemu_abi::schedule::ATOMIC)
+fn atomic_config() -> Option<natemu_abi::families::schedule::Config> {
+    progress::configuration().filter(|c| c.family == natemu_abi::families::schedule::ATOMIC)
 }
 fn image_bytes() -> usize {
     if atomic_config().is_some() {

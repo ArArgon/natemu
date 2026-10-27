@@ -1,6 +1,6 @@
 //! First I4-V harness: eager controls and resident-requested high/low guest loads.
 use super::*;
-use natemu_abi::{recovery as recover, shadow, validation};
+use natemu_abi::{recovery as recover, shadow, families::validation};
 use crate::translation::{read_packet, run_worker};
 use std::path::Path;
 

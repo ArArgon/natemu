@@ -1,6 +1,6 @@
 //! Host setup and post-join evidence for the terminal stack wave.
 use super::*;
-use natemu_abi::{recovery as recover, stack_boundary as b};
+use natemu_abi::{recovery as recover, families::stack_boundary as b};
 
 pub(super) struct Config {
     pub profile: u64,

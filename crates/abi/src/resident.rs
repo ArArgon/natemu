@@ -18,8 +18,9 @@ pub fn contains(address: u64, bytes: u64) -> bool {
     (offset < BOOT_END as u64 && end <= BOOT_END as u64)
         || (offset >= TEXT_OFFSET as u64 && offset < TEXT_END as u64 && end <= TEXT_END as u64)
 }
+#[cfg(feature = "families")]
 const _: () = assert!(
-    TEXT_OFFSET >= crate::maintenance::OFFSET + core::mem::size_of::<crate::maintenance::State>()
+    TEXT_OFFSET >= crate::families::maintenance::OFFSET + core::mem::size_of::<crate::families::maintenance::State>()
 );
 const _: () = assert!(TEXT_END <= crate::RAM_SIZE);
 #[cfg(test)]

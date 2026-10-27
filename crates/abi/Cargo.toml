@@ -3,3 +3,7 @@ name = "natemu-abi"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+
+[features]
+# Regression-family records (runtime `families` image and host test drivers).
+families = []

@@ -2,7 +2,7 @@
 use super::*;
 use crate::translation::{read_packet, write_packet};
 use crate::translation::process_owner::OwnedChild;
-use natemu_abi::fence as f;
+use natemu_abi::families::fence as f;
 use std::path::PathBuf;
 
 pub struct Compiler {

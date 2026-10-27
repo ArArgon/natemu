@@ -1,7 +1,7 @@
 //! Concurrent control programs share RAM while retaining owner-private execution state.
 use super::*;
 use crate::drivers::i4v_controls as single;
-use natemu_abi::{controls as control, modes, pae, recovery as recover, validation};
+use natemu_abi::{families::controls as control, families::modes, families::pae, recovery as recover, families::validation};
 
 fn owner_mappings(memory: &Memory, id: usize) {
     let base = id * RAM_SIZE;
@@ -125,7 +125,7 @@ mod tests {
     }
 }
 
-use natemu_abi::{control_concurrent as cc, maintenance as maintenance_abi};
+use natemu_abi::{families::control_concurrent as cc, families::maintenance as maintenance_abi};
 const CODE_BYTES: usize = control::MAX_VISITS * control::SLOT_BYTES;
 macro_rules! fields {
     ($record:ident; $($field:ident),* $(,)?) => {{
@@ -528,7 +528,7 @@ pub fn run(args: &[String]) -> Result<()> {
             ),
             move |_| unsafe {
                 ptr::read_volatile(
-                    (base + natemu_abi::controls::OFFSET) as *const natemu_abi::controls::State,
+                    (base + natemu_abi::families::controls::OFFSET) as *const natemu_abi::families::controls::State,
                 )
                 .expected
             },

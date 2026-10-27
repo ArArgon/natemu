@@ -1,6 +1,6 @@
 //! Opt-in scheduler setup shared by the existing native fixture families.
 use super::*;
-use natemu_abi::schedule as s;
+use natemu_abi::families::schedule as s;
 use std::sync::OnceLock;
 
 static CONFIG: OnceLock<s::Config> = OnceLock::new();
