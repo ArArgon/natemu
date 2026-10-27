@@ -179,7 +179,7 @@ edit('FEXCore/Source/Interface/Core/JIT/JITClass.h', '  void ResetStack();',
   // natemu (fexc): access-site recording, defined in shim/fexc_sites.inc (included from MemoryOps.cpp).
   void FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32_t Begin);
   uint32_t FexcGuest {}, FexcInsnNative {};
-  bool FexcCf {true}, FexcNzcvWritten {};
+  bool FexcCf {true}, FexcNzcvWritten {}, FexcNzcvSaved {}, FexcStoreSeen {};
   int FexcLoadSite {-1};
   fextl::vector<size_t> FexcPendingFused;''')
 edit('FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp', 'DEF_OP(LoadContext) {',
@@ -194,7 +194,7 @@ edit(jit, '  JumpTargets.clear();\n  CallReturnTargets.clear();',
      '''  fexc_sites.clear();
   fexc_insns.clear();
   DebugData->FexcEntryPrologues.clear();
-  FexcGuest = FexcInsnNative = 0; FexcCf = true; FexcNzcvWritten = false; FexcLoadSite = -1; FexcPendingFused.clear();
+  FexcGuest = FexcInsnNative = 0; FexcCf = true; FexcNzcvWritten = FexcNzcvSaved = FexcStoreSeen = false; FexcLoadSite = -1; FexcPendingFused.clear();
   JumpTargets.clear();
   CallReturnTargets.clear();''')
 edit(jit, '    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {\n      switch (IROp->Op) {',
@@ -265,3 +265,113 @@ p.write_text('#include <fexc_hook.h>\n' + p.read_text())
 # No exit linker literal (nothing is linked) when every exit goes through the gate.
 edit(jit, '  BindOrRestart(&l_ExitLink);\n  PlaceNamedSymbolLiteral(InsertNamedSymbolLiteral(RelocNamedSymbolLiteral::NamedSymbol::SYMBOL_LITERAL_EXITFUNCTION_LINKER));',
      '  BindOrRestart(&l_ExitLink);\n  if (!fexc_slice1) PlaceNamedSymbolLiteral(InsertNamedSymbolLiteral(RelocNamedSymbolLiteral::NamedSymbol::SYMBOL_LITERAL_EXITFUNCTION_LINKER));')
+
+# ---------------------------------------------------------------------------
+# S1b1: precision patches (slice-1 contract §1, patches 2-5), every one guarded by the runtime flag fexc_slice1, so the
+# default profile compiles exactly as before. Goal: at every site the guest state is the state before the site's guest
+# instruction and none of its effects is committed. Shared predicates: shim/fexc_precision.h.
+# ---------------------------------------------------------------------------
+flagpass = 'FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp'
+edit(flagpass, '#include <FEXCore/fextl/vector.h>\n\n// Flag bit flags', '#include <FEXCore/fextl/vector.h>\n#include <fexc_precision.h>\n\n// Flag bit flags')
+# (2) Every guest-memory op reads all six flags, so no flag write that precedes it (in this or an earlier instruction) is
+#     deleted or narrowed. InvalidateFlags emits no code; as a "write of undefined values" just before an access it would
+#     make the previous instruction's flag writes look dead, so under slice1 it is neither a read nor a write.
+edit(flagpass, '''FlagInfo DeadFlagCalculationEliminination::Classify(IROp_Header* IROp) {
+  FlagInfo Info = FlagInfos[IROp->Op];
+''', '''FlagInfo DeadFlagCalculationEliminination::Classify(IROp_Header* IROp) {
+  if (fexc_slice1 && FexcPrecision::GuestMemOp(IROp->Op)) {
+    return FlagInfo::Pack({.Read = FLAG_ALL});
+  }
+  if (fexc_slice1 && IROp->Op == OP_INVALIDATEFLAGS) {
+    return FlagInfo::Pack({});
+  }
+  FlagInfo Info = FlagInfos[IROp->Op];
+''')
+# (2b) A guest load whose value is dead (cmp/test/bt [m] after flag elimination) is still an access that can fault: keep it.
+edit(flagpass, '  if (CodeNode->GetUses() > 0 || IR::HasSideEffects(IROp->Op)) {',
+     '  if (CodeNode->GetUses() > 0 || IR::HasSideEffects(IROp->Op) || (fexc_slice1 && FexcPrecision::GuestMemOp(IROp->Op))) {')
+# (5) Pre-NZCV: an instruction that writes NZCV before one of its accesses saves its incoming NZCV at its start
+#     (`mrs xT, nzcv; str wT, [x28, #PreNzcvOffset]`, existing IR ops LoadNZCV + StoreContext inserted right after its
+#     GuestOpcode); its sites then say nzcv=frame. Done before the elimination proper, which then sees the save as an NZCV
+#     read and keeps the previous instruction's flags alive. NZCV writers: FEX's own flag table plus ImplicitFlagClobber.
+edit(flagpass, '  // Initialize CFG\n  ControlFlowGraph CFG {.IR = CurrentIR};',
+     '''  if (fexc_slice1) {
+    Ref Guest = nullptr;
+    bool Writer = false, Saved = false;
+    for (auto [BlockNode, BlockHeader] : CurrentIR.GetBlocks()) {
+      for (auto [CodeNode, IROp] : CurrentIR.GetCode(BlockNode)) {
+        if (IROp->Op == OP_GUESTOPCODE) {
+          Guest = CodeNode;
+          Writer = Saved = false;
+        } else if (FexcPrecision::GuestMemOp(IROp->Op)) {
+          if (Writer && !Saved && Guest) {
+            auto Cursor = IREmit->GetWriteCursor();
+            IREmit->SetWriteCursor(Guest);
+            IREmit->_StoreContext(OpSize::i32Bit, RegClass::GPR, IREmit->_LoadNZCV(), FexcPrecision::PreNzcvOffset);
+            IREmit->SetWriteCursor(Cursor);
+            Saved = true;
+          }
+        } else if ((Classify(IROp).Write() & FLAG_NZCV) || IR::ImplicitFlagClobber(IROp->Op)) {
+          Writer = true;
+        }
+      }
+    }
+  }
+
+  // Initialize CFG
+  ControlFlowGraph CFG {.IR = CurrentIR};''')
+
+ra = 'FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp'
+edit(ra, '#include <FEXCore/fextl/vector.h>\n#include <bit>', '#include <FEXCore/fextl/vector.h>\n#include <fexc_precision.h>\n#include <bit>')
+# (3) No guest-memory op between a value's definition and its store to a static register. The backwards pass coalesces a
+#     value into its SRA register when the first SRA load/store after the definition is that store; a guest-memory op now
+#     counts as an access of every static register (GPRs, PF/AF, FPRs), so a value defined before it is computed in a
+#     temporary and moved after it. This covers constants pooled across instructions (IREmitter::Constant). A load's own
+#     result is never allocated to a static register (DDI0487 D1.4.1.4: the destination is UNKNOWN after an abort).
+#     Exception: the stack pointer a Pop updates by writeback stays in RSP's register, because the access itself is the
+#     only write (it does not happen if the access faults).
+#     Stricter than the contract: a guest instruction boundary (GuestOpcode) is a barrier too, so a constant pooled from
+#     an earlier instruction is never coalesced there; every static-register write stays in its own instruction's range
+#     (each PC-table entry then holds the exact state, and verify_precision.py can check flag writes per instruction).
+edit(ra, '''          if (CodeNode != DecodeSRANode(Header, Node)) {
+            PreferredReg[IR->GetID(CodeNode).Value] = PhysicalRegister::Invalid();
+          }
+        }
+''', '''          if (CodeNode != DecodeSRANode(Header, Node)) {
+            PreferredReg[IR->GetID(CodeNode).Value] = PhysicalRegister::Invalid();
+          }
+        }
+
+        if (fexc_slice1 && (FexcPrecision::GuestMemOp(IROp->Op) || IROp->Op == OP_GUESTOPCODE)) {
+          if (IROp->Op == OP_LOADMEM || IROp->Op == OP_LOADMEMTSO) {
+            PreferredReg[IR->GetID(CodeNode).Value] = PhysicalRegister::Invalid();
+          }
+          PhysicalRegister Keep = PhysicalRegister::Invalid();
+          if (IROp->Op == OP_POP) {
+            Keep = PreferredReg[IROp->C<IR::IROp_Pop>()->InoutAddr.ID().Value];
+          }
+          for (auto C : {RegClass::GPRFixed, RegClass::FPRFixed}) {
+            for (uint8_t r = 0; r < Classes[FEXCore::ToUnderlying(C)].Count; ++r) {
+              if (!(Keep == PhysicalRegister(C, r))) {
+                Classes[FEXCore::ToUnderlying(C)].RegToSSA[r] = CodeNode;
+              }
+            }
+          }
+        }
+''')
+# (4) No merge across a guest instruction boundary (TryPostRAMerge fused adjacent guest push/pop into stp/ldp).
+edit(ra, '''      if (IROp->Op == OP_GUESTOPCODE || IROp->Op == OP_INLINECONSTANT) {
+        continue;''', '''      if (IROp->Op == OP_GUESTOPCODE || IROp->Op == OP_INLINECONSTANT) {
+        if (fexc_slice1 && IROp->Op == OP_GUESTOPCODE) {
+          LastNode = nullptr;
+        }
+        continue;''')
+# (2b, RA side) A kept guest load with no uses still needs a destination; free it at once instead of holding it to block end.
+edit(ra, '''      if (GetHasDest(IROp->Op) && PhysicalRegister(CodeNode).IsInvalid()) {
+        AssignReg(IROp, BlockIROp, CodeNode, IROp);
+      }''', '''      if (GetHasDest(IROp->Op) && PhysicalRegister(CodeNode).IsInvalid()) {
+        AssignReg(IROp, BlockIROp, CodeNode, IROp);
+        if (fexc_slice1 && (IROp->Op == OP_LOADMEM || IROp->Op == OP_LOADMEMTSO) && CodeNode->GetUses() == 0) {
+          FreeReg(PhysicalRegister(CodeNode));
+        }
+      }''')

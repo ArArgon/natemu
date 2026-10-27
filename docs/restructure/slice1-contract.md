@@ -53,7 +53,7 @@ names, and none of that instruction's effects is committed. FEX patches that pro
    base/index registers are relied on to be unchanged after an abort.
 4. `TryPostRAMerge` resets its merge candidate at `OP_GUESTOPCODE`, so no fusion crosses guest instructions.
 5. Pre-NZCV: when an instruction writes NZCV and then emits any access site, `GenerateIR` inserts
-   `mrs x0,nzcv; str x0,[x28,#natemu_pre_nzcv]` at the instruction's start (IR cursor saved at its `GuestOpcode`), and
+   `mrs x0,nzcv; str w0,[x28,#natemu_pre_nzcv]` at the instruction's start (IR cursor saved at its `GuestOpcode`), and
    those sites say `nzcv=frame`. This is not deferred: with one vCPU an RMW load can still hit a read-only shadow, so
    its store can fault into a guest #PF. CF inversion is recorded at each instruction start.
 6. Intent from the dispatcher: the load of a memory-destination RMW operand is marked `write` intent.

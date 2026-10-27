@@ -502,6 +502,7 @@ int main(int argc, char** argv) {
   OFF("rip", State.rip); OFF("gregs", State.gregs); OFF("xmm", State.xmm); OFF("flags", State.flags); OFF("pf_raw", State.pf_raw);
   OFF("af_raw", State.af_raw); OFF("mxcsr", State.mxcsr); OFF("fs_cached", State.fs_cached); OFF("gs_cached", State.gs_cached);
   OFF("pointers", Pointers); OFF("exit_function_linker", Pointers.ExitFunctionLinker); OFF("dispatcher_loop_top", Pointers.DispatcherLoopTop);
+  if (slice1) j.kv("natemu_pre_nzcv", uint64_t(offsetof(Core::CpuStateFrame, State.flags) + X86State::RFLAG_NZCV_LOC)); // State.flags[RFLAG_NZCV_LOC]: incoming NZCV for nzcv=frame sites
   j.end_obj();
   // External references that are not relocations: helper/dispatch pointers loaded from the state frame.
   j.arr("state_pointer_loads");
@@ -609,7 +610,7 @@ int main(int argc, char** argv) {
     j.kv("data_class", s.data_class ? "fpr" : "gpr").kv("writeback", WritebackName[s.writeback]).kv("writeback_delta", int(s.writeback_delta))
      .kv("ordering", OrderingName[s.ordering]).kv("nzcv", s.nzcv ? "frame" : "pstate").kv("cf_inverted", bool(s.cf_inverted))
      .kv("flags_written_before_site", bool(s.flags_written_before))
-     .kv("completed_effects", "unverified").kv("located", bool(s.located));
+     .kv("completed_effects", s.completed_effects ? "unverified" : "none").kv("located", bool(s.located));
     const Capture::X86Mem* m = nullptr;
     for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) { if (i.mem.present) m = &i.mem; break; }
     if (m && (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE)) {
@@ -621,9 +622,15 @@ int main(int argc, char** argv) {
 
   j.obj("recovery");
   j.kv("per_access", "present: sites[] (native offset, guest instruction, kind, width, intent, address registers and offset form, segment, writeback, data registers)");
-  j.kv("flag_location_at_site", "nzcv=pstate with cf_inverted at the guest instruction start, plus flags_written_before_site; the frame copy (nzcv=frame) is absent until the precision patches");
-  j.kv("guest_state_at_fault", "absent: not guaranteed (no precision patches yet: flag elimination, static-register hoisting, push/pop fusion and the address guard are unmodified)");
-  j.kv("committed_effects", "unverified: completed_effects=unverified on every site");
+  if (slice1) {
+    j.kv("flag_location_at_site", "nzcv=pstate (PSTATE) or nzcv=frame (32 bits at state_abi.state_offsets.natemu_pre_nzcv, saved at the instruction start), with cf_inverted at the guest instruction start");
+    j.kv("guest_state_at_fault", "present (precision patches 2-5): at each site with completed_effects=none, static registers, PF/AF and NZCV (per nzcv) hold the state before the site's guest instruction; checked on the code by verify_precision.py. Address guard and split-store check are absent (S1b2)");
+    j.kv("committed_effects", "completed_effects=none per site (unverified if the recorder saw an earlier store site or an unsaved NZCV write in the instruction)");
+  } else {
+    j.kv("flag_location_at_site", "nzcv=pstate with cf_inverted at the guest instruction start, plus flags_written_before_site; the frame copy (nzcv=frame) is absent until the precision patches");
+    j.kv("guest_state_at_fault", "absent: not guaranteed (no precision patches yet: flag elimination, static-register hoisting, push/pop fusion and the address guard are unmodified)");
+    j.kv("committed_effects", "unverified: completed_effects=unverified on every site");
+  }
   j.kv("pc_table", st.dense_pc ? "present_dense" : "present_sparse");
   j.kv("static_register_map", "present").kv("flag_representation", "NZCV in PSTATE with carry inverted per cf_inverted; PF/AF in x26/x27 (see state_abi)");
   j.kv("spill_bytes", "present: code.layout.spill_bytes");
@@ -657,7 +664,7 @@ int main(int argc, char** argv) {
       push(s.native_offset, 4); push(s.guest_offset, 4); push(s.guest_offset2, 4); push(s.insn_native_offset, 4); push(uint32_t(s.imm), 4);
       for (uint8_t b : {s.kind, s.width, s.intent, s.rmw, s.segment, s.base_reg, s.index_reg, s.extend, s.shift, s.writeback,
                         uint8_t(s.writeback_delta), s.data_reg[0], s.data_reg[1], s.data_class, s.nzcv, s.cf_inverted,
-                        s.flags_written_before, s.ordering, uint8_t(1) /* completed_effects: unverified */, s.located}) f.push_back(b);
+                        s.flags_written_before, s.ordering, s.completed_effects, s.located}) f.push_back(b);
     }
     pad(8);
     put(72, f.size(), 4); put(76, Cap.pcs.size(), 4);

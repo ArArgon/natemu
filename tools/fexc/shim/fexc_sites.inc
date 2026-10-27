@@ -8,6 +8,7 @@
 // GuestOpcode" is the owning guest instruction. The one exception is a fused push/pop pair (TryPostRAMerge
 // skips GuestOpcode), which is recorded as such and carries both guest offsets.
 // (fexc_hook.h and <cstring> are included at the top of MemoryOps.cpp by patch.py.)
+#include <fexc_precision.h>
 
 namespace {
 // Load/store class of the A64 encoding, excluding PC-relative literal loads (patch-free: one fixed rule).
@@ -72,7 +73,7 @@ void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32
     const auto Op = IROp->C<IR::IROp_GuestOpcode>();
     FexcGuest = uint32_t(Op->GuestEntryOffset);
     FexcInsnNative = Begin;
-    FexcNzcvWritten = false;
+    FexcNzcvWritten = FexcNzcvSaved = FexcStoreSeen = false;
     FexcLoadSite = -1;
     const auto it = fexc_cf_inverted.find(Op->GuestEntryOffset);
     FexcCf = it == fexc_cf_inverted.end() ? true : it->second;
@@ -89,6 +90,11 @@ void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32
   S.index_reg = 0xff;
   S.cf_inverted = FexcCf;
   S.flags_written_before = FexcNzcvWritten;
+  // Profile slice1 (precision patches): the incoming NZCV is in the frame if the instruction saved it (patch 5), and the
+  // site is precise unless the recorder sees an earlier store site or an unsaved NZCV write in the same instruction
+  // (verify_precision.py checks the emitted code itself).
+  S.nzcv = fexc_slice1 && FexcNzcvSaved;
+  S.completed_effects = fexc_slice1 && !FexcStoreSeen && (!FexcNzcvWritten || FexcNzcvSaved) ? 0 : 1;
   S.ir_op = IR::GetName(IROp->Op).data();
 
   // Index/offset form of LoadMem/StoreMem(TSO): none, constant, or register with extend and shift.
@@ -175,7 +181,9 @@ void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32
   }
   default:
     Record = false;
-    if (FexcIsNzcvWriter(Name)) FexcNzcvWritten = true;
+    if (FexcIsNzcvWriter(Name) || (fexc_slice1 && IR::ImplicitFlagClobber(IROp->Op))) FexcNzcvWritten = true;
+    if (fexc_slice1 && IROp->Op == IROps::OP_STORECONTEXT && IROp->C<IR::IROp_StoreContext>()->Offset == FexcPrecision::PreNzcvOffset &&
+        !FexcNzcvWritten) FexcNzcvSaved = true;
     if (FexcIsOtherMemoryOp(Name)) { S.kind = FEXC_SITE_OTHER; Record = true; }
     break;
   }
@@ -196,7 +204,7 @@ void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32
     if (A.imm_form) { S.imm = A.imm; S.index_reg = 0xff; S.extend = 0; S.shift = 0; S.writeback = A.wb; S.writeback_delta = A.delta; }
     break;
   }
-  if (S.kind == FEXC_SITE_OTHER) { S.native_offset = Begin; }
+  if (S.kind == FEXC_SITE_OTHER) { S.native_offset = Begin; S.completed_effects = 1; }
 
   // A memory-destination read-modify-write loads then stores the one explicit memory operand, so the load of
   // an instruction that also has a plain store site is the RMW load and must be walked with write intent
@@ -208,5 +216,7 @@ void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32
     fexc_sites[FexcLoadSite].rmw = 1; fexc_sites[FexcLoadSite].intent = 1; S.rmw = 2;
   }
   if (S.kind == FEXC_SITE_PUSH_PAIR || S.kind == FEXC_SITE_POP_PAIR) FexcPendingFused.push_back(size_t(Index));
+  if (S.kind == FEXC_SITE_STORE || S.kind == FEXC_SITE_STORE_PAIR || S.kind == FEXC_SITE_PUSH || S.kind == FEXC_SITE_PUSH_PAIR ||
+      S.kind == FEXC_SITE_OTHER) FexcStoreSeen = true;
   fexc_sites.push_back(S);
 }

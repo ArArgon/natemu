@@ -1,6 +1,6 @@
 """S1c checks: profile slice1 of fexc (block cutting at an allowlist, single-gate exits, profile record).
 
-Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the s1c build)
+Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the s1b1 build)
 
 The x86 bytes below are assembled by hand and only drive the compiler; every expectation (where the block ends, why)
 comes from the instruction's architectural class, never from fexc's output. The cut position is also compared with a
@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402  (disassemble, object reader)
 import scan_skips  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/s1c/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/s1b1/obj/fexc')
 REPO = HERE.parents[1]
 RIP = 0x102000
 PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx

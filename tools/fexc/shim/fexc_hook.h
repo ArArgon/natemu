@@ -63,6 +63,7 @@ struct FexcSiteInfo {
   uint8_t flags_written_before;  // an NZCV-writing IR op of this guest instruction precedes the site
   uint8_t ordering;              // 0 plain, 1 acquire (ldar/ldapr family), 2 release (stlr family)
   uint8_t located;               // 1 if the faulting word was found in the op's emitted range
+  uint8_t completed_effects;     // 0 none (slice1: state at the site = state before the instruction), 1 unverified
   const char* ir_op;             // IR op name (diagnostic, not exported to the binary record)
 };
 struct FexcInsnInfo { uint32_t guest_offset; uint32_t native_offset; bool cf_inverted; };

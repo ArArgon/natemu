@@ -8,7 +8,8 @@ bitness (`tools/i4v_producer/export.py` CASES) are byte-identical to the native 
 sites, `spill_bytes`, `cf_inverted` per PC entry, and `--object` (binary record in
 `crates/abi/src/code_object.rs`); `check_sites.py` checks the sites against the 64 reference
 programs and the emitted code. **S1c done**: profile `slice1` (allowlist block cutting, single-gate exits, see
-"Profile slice1"). Not done: the precision patches, address guard and split check (S1b).
+"Profile slice1"). **S1b1 done**: the precision patches under `--profile slice1` and `verify_precision.py` (see
+"Precision (S1b1)"). Not done: address guard, split-store check, canonical branch targets (S1b2).
 
 ## Build
 
@@ -22,9 +23,9 @@ tools/fexc/build.sh /Users/liaozping/orca/natemu-raw/i4v-producer-20261026-02/so
 (every edit asserts its anchor, so it only applies to a fresh tree), configures
 `CMakeLists.txt` against that tree, builds with 4 jobs and runs
 `fexc_linktest --init` and `smoke.py`. Cold build about 25 s. Current tree:
-`/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/s1c` (~490 MB:
-472 MB source, ~19 MB objects; the older `c1b` tree is the v1 build without sites and is kept only for
-comparison). No Docker, no Linux VM; needs Homebrew `cmake`, `ninja`, Apple clang.
+`/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/s1b1` (~490 MB:
+472 MB source, ~19 MB objects). Kept for comparison only: `s1c` (slice1 without the precision patches, the "before" of
+the cost numbers) and `c1b` (the v1 build without sites). No Docker, no Linux VM; needs Homebrew `cmake`, `ninja`, Apple clang.
 
 ## What builds
 
@@ -284,10 +285,10 @@ Example (`mov eax, [rsi]`, TSO on):
  "x86":{"rip_relative":false,"base":6,"index":-1,"scale":1,"disp":0}}
 ```
 
-Known deviation of FEX from x86 that `check_sites.py` reports (belongs to the precision work, S1b): `cmp`/`test`/`bt`
-with a memory operand whose flags are overwritten later lose the access entirely (flag elimination, then dead-code
-elimination). `push`/`pop` of adjacent guest instructions are fused. Pop destinations can be static registers (S1b keeps
-them out of the SRA registers).
+Known deviations of FEX from x86 in the default profile, fixed under `--profile slice1` by the precision patches (S1b1):
+`cmp`/`test`/`bt` with a memory operand whose flags are overwritten later lose the access entirely (flag elimination,
+then dead-code elimination; `check_sites.py` reports ELIMINATED without `--slice1`). `push`/`pop` of adjacent guest
+instructions are fused. Load and pop destinations can be static registers.
 
 Accepted natemu policy: `bt`/`bts`/`btr`/`btc` with a memory operand access ONE byte (the byte holding the bit), for an
 immediate and for a register bit index alike, not the x86 operand width. The fault, CR2 and A/D bits are those of that byte.
@@ -304,6 +305,38 @@ marker), the end reason code (the `guest.end.reason` string), the feature profil
 of `features.host_features`, plus count and DCacheLineLog2). `check_sites.py` and `test_fexc.py` assert object and JSON agree.
 Numeric codes are shared with `shim/fexc_hook.h`.
 
+## Precision (S1b1)
+
+Under `--profile slice1` only (the default profile's output is unchanged: identical JSON on the 64 fixtures, a 264-program
+generated corpus and the 613-form matrix, except the host address of FEX's exit-linker literal), `patch.py` applies the
+[contract](../../docs/restructure/slice1-contract.md) §1 patches 2-5, with predicates in `shim/fexc_precision.h`:
+
+| patch | FEX file::function | change |
+|---|---|---|
+| 2 | `RedundantFlagCalculationElimination.cpp::Classify` | every guest-memory op (LoadMem, StoreMem, their TSO and pair forms, Push, Pop) reads all six flags, so no flag write before it is deleted or narrowed; `InvalidateFlags` (no code) is neither read nor write, else it would make the previous instruction's flags look dead just before an access |
+| 2b | `...::EliminateDeadCode`, `RegisterAllocationPass.cpp::Run` (forward) | a guest load with a dead value (`cmp`/`test`/`bt [m]`) is kept; its destination register is freed at once |
+| 3 | `RegisterAllocationPass.cpp::Run` (backwards) | a guest-memory op and a guest instruction boundary (`GuestOpcode`) count as an access of every static register, so a value is coalesced into its SRA register only if no access (and no instruction boundary) lies between its definition and its store; this covers constants pooled across instructions. A load's own value never gets an SRA register (DDI0487 D1.4.1.4); a pop's writeback stack pointer stays in RSP's register (the access is its only write) |
+| 4 | `RegisterAllocationPass.cpp::Run` (forward) | `TryPostRAMerge`'s candidate is reset at `GuestOpcode`: no push/pop pair, no merge across instructions |
+| 5 | `RedundantFlagCalculationElimination.cpp::Run` | an instruction with an NZCV writer (FEX's flag table or `ImplicitFlagClobber`) before one of its accesses gets `LoadNZCV; StoreContext` (`mrs xT, nzcv; str wT, [x28, #1032]`) right after its `GuestOpcode`; its sites say `nzcv=frame`. The slot is `CPUState.flags[RFLAG_NZCV_LOC]`, FEX's own NZCV home outside the JIT, reported as `state_abi.state_offsets.natemu_pre_nzcv` (JSON only; the binary object has no field for it) |
+
+The patch-3 boundary barrier is stricter than the contract (which only names accesses): it keeps every static-register
+write inside its own instruction, so each PC-table entry has the exact state and flag writes can be checked per instruction.
+
+Per site (slice1): `nzcv` is `frame` when the instruction saved it, `cf_inverted` is the CF inversion at the instruction
+start (valid for PSTATE and the frame copy, since nothing writes NZCV before the site otherwise), and `completed_effects`
+is `none`, or `unverified` if the recorder sees an earlier store site or an unsaved NZCV write in the same instruction
+(never seen). `flags_written_before_site` also counts `ImplicitFlagClobber` ops under slice1.
+
+`verify_precision.py [--before FEXC0] [CORPUS.json ...]` checks the guarantee on the emitted code (docstring: P1-P7):
+between a site's instruction start and the site no static-register (GPR, x26, x27, xmm) write, no store, no frame write
+but the pre-NZCV save, no NZCV write unless `nzcv=frame` with the save first; load destinations not static registers; at
+most one store site per instruction and last; no fused pair; `completed_effects=none`; no skippable site; for annotated
+programs every flag a later site observes has a native write in its defining instruction (flags.py rules); plus
+`check_sites` for programs with `asm` (no eliminated access). Corpora: fixtures, the scan_skips matrix, adversarial
+programs per patch, and any `gen_slice1.py` corpus given. Against `s1c` it reports every defect class (SRA writes from
+pooled constants and RMW flag results, unsaved NZCV writes, load destinations in SRA registers, fused pairs, eliminated
+loads and flag writes); against `s1b1` it passes.
+
 ## Checks
 
 - `python3 -m unittest tools/fexc/test_fexc.py`: structure, exact sites for hand-checked instructions, object file,
@@ -314,6 +347,7 @@ Numeric codes are shared with `shim/fexc_hook.h`.
   and the 64 programs is the single gate (disassembled), with no named-symbol literal, no pointer load but
   `DispatcherLoopTop`, no x25; the 64 programs translate completely except those with div/idiv.
 - `python3 tools/fexc/scan_skips.py`: the native-control-flow scan above.
+- `python3 tools/fexc/verify_precision.py [--before FEXC0] [CORPUS.json ...]`: the slice1 precision guarantee (above).
 - `python3 tools/fexc/check_sites.py [--known-ok] [--slice1]`: the 64 reference programs; expected accesses from the fixture `asm`
   against the sites, sites against the `xcrun objdump` disassembly of the code (every load/store with a base other than
   x28/sp must be a site and the reverse), dense versus sparse code bytes, binary object versus JSON.
