@@ -1,5 +1,26 @@
 # INV-03-01 — source findings review
 
+## Restructure plan review — October 26, 2026 owner direction
+
+**Independent reviewers:** `/root/plan_owner_review` and
+`/root/plan_engineering_review`, in separate read-only agent contexts; `/root`
+authored the revision. Both inspected `docs/vm-restructure.md`, the current
+implementation/investigation handoffs and the contract-inventory introduction.
+
+**Evidence validity: ACCEPT the plan within its stated scope.** It distinguishes
+native compilation, executable ABI integration and general system semantics;
+it makes no new runtime or performance claim and does not certify old tests.
+
+**Decision relevance: ACCEPT.** Both reviews found the parallel workstreams,
+early joint ABI integration, substantial selective refactor, orchestrator quality
+responsibility, justified incompleteness and evidence-backed pivots consistent
+with owner direction. Neither found an upfront audit/ABI/refactor gate or a
+substantive blocker. No changes were requested.
+
+**Disposition:** two focused document reviews completed; no implementation,
+experiment or reproduction was performed. This accepts the execution direction,
+not existing-code correctness or a total implementation-time estimate.
+
 ## Final acceptance — complete finite I4-V integrated pass, October 26, 2026 UTC
 
 **ACCEPT I4-V within the original implementation plan's admitted finite scope.**

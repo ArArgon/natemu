@@ -9,9 +9,6 @@ macro_rules! fields {
         out
     }};
 }
-fn record<T: Copy>(memory: &Memory, offset: usize) -> T {
-    unsafe { ptr::read_volatile(memory.0.add(offset).cast()) }
-}
 fn address_json(s: &a::Address) -> String {
     format!("{{{}}}", fields!(s; offset,linear,raw,gpa).join(","))
 }
@@ -132,19 +129,18 @@ fn owner_report(
     lower_before: &[u64; 512],
 ) -> String {
     let base = id * RAM_SIZE;
-    let shared: Shared = record(memory, base + SHARED_OFFSET);
+    let shared: Shared = memory.read_record(base + SHARED_OFFSET);
     let owner = unsafe { &*memory.0.add(base + a::OWNER_OFFSET).cast::<a::Owner>() };
-    let event: EventRecord = record(memory, base + EVENT_OFFSET);
-    let guest: r::GuestState = record(memory, base + r::GUEST_OFFSET);
+    let event: EventRecord = memory.read_record(base + EVENT_OFFSET);
+    let guest: r::GuestState = memory.read_record(base + r::GUEST_OFFSET);
     let mut f = fields!(shared; status,detail,current_el,sctlr,actlr,tcr,capture_pc,service_pc,esr,far,elr,spsr);
     f.push(format!("\"id\":{id},\"vm_nonce\":{},\"compiler_requests\":{:?},\"bank_before\":{:?},\"bank_after\":{:?},\"old_code\":{:?},\"new_code\":{:?}", shared.lifecycle.vm, requests.iter().filter(|p|p[3] == id as u64).collect::<Vec<_>>(),seed.1,memory.read::<512>(base+BANK_OFFSET),memory.read::<{a::CODE_BYTES}>(base+CODE_OFFSET),memory.read::<{a::CODE_BYTES}>(base+CODE_OFFSET+4096)));
     f.push(format!("\"initial\":{},\"entered\":{},\"final_frame\":{},\"guest_before\":{},\"guest_after\":{},\"owner\":{}",frame_json(&seed.0),frame_json(&shared.initial),frame_json(&shared.captured),crate::recovery::guest_json(&seed.2),crate::recovery::guest_json(&guest),owner_json(owner)));
     let visits = (0..a::MAX_VISITS)
         .map(|i| {
-            visit_json(&record(
-                memory,
-                base + a::RECORD_OFFSET + i * core::mem::size_of::<a::Visit>(),
-            ))
+            visit_json(
+                &memory.read_record(base + a::RECORD_OFFSET + i * core::mem::size_of::<a::Visit>()),
+            )
         })
         .collect::<Vec<_>>()
         .join(",");
@@ -177,22 +173,10 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut coordinator = Coordinator::new(n).unwrap();
     coordinator.scenario = 5;
     let common = a::Shared::new(n as u64, profile, actor).unwrap();
-    let mut host_limit = 0;
-    unsafe {
-        hv(
-            hv_vm_get_max_vcpu_count(&mut host_limit),
-            "read address vCPU limit",
-        )?;
-    }
-    if n > host_limit as usize {
-        return Err("address count exceeds host vCPU limit".into());
-    }
+    require_vcpus(n)?;
     let memory = Memory::with_size(n * RAM_SIZE)?;
-    load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
-    let mut vm_nonce = 0u64;
-    if unsafe { getentropy((&mut vm_nonce as *mut u64).cast(), 8) } != 0 || vm_nonce == 0 {
-        return Err("unable to generate address VM identity".into());
-    }
+    load_resident(&memory, &args[1])?;
+    let vm_nonce = new_vm_nonce()?;
     let mut data_before = [0xa5; 8192];
     data_before[4096..].fill(0x5a);
     if profile != 3 {
@@ -215,11 +199,7 @@ pub fn run(args: &[String]) -> Result<()> {
     for id in 0..n {
         let base = id * RAM_SIZE;
         if id != 0 {
-            for offset in (0..RAM_SIZE).step_by(4096) {
-                if resident::executable_offset(offset) {
-                    memory.copy(base + offset, &memory.read::<4096>(offset));
-                }
-            }
+            memory.replicate_resident_text(base);
         }
         owner_mappings(&memory, id);
         lower_before.push(i4v::words(&memory, base + shadow::LOWER_LEAF));
@@ -261,36 +241,22 @@ pub fn run(args: &[String]) -> Result<()> {
         recovery.native_fpsr = frame.fpsr;
         let mut event = EventRecord::new(&frame, id);
         event.packet = guest;
-        unsafe {
-            ptr::write(memory.0.add(base + SHARED_OFFSET).cast(), shared);
-            ptr::write(memory.0.add(base + a::OWNER_OFFSET).cast(), owner);
-            ptr::write(memory.0.add(base + r::GUEST_OFFSET).cast(), guest);
-            ptr::write(memory.0.add(base + r::STATE_OFFSET).cast(), recovery);
-            ptr::write(memory.0.add(base + ROUND_OFFSET).cast(), Round::ZERO);
-            ptr::write(memory.0.add(base + EVENT_OFFSET).cast(), event);
-        }
+        memory.write_record(base + SHARED_OFFSET, shared);
+        memory.write_record(base + a::OWNER_OFFSET, owner);
+        memory.write_record(base + r::GUEST_OFFSET, guest);
+        memory.write_record(base + r::STATE_OFFSET, recovery);
+        memory.write_record(base + ROUND_OFFSET, Round::ZERO);
+        memory.write_record(base + EVENT_OFFSET, event);
         seeds.push(seeded);
     }
     memory.copy(DATA_OFFSET, &data_before);
     memory.copy(r::SOURCE_OFFSET, &source_before);
     memory.copy(r::TABLE_OFFSET, &tables_before);
-    unsafe {
-        ptr::write(memory.0.add(COORD_OFFSET).cast(), coordinator);
-        ptr::write(memory.0.add(a::SHARED_OFFSET).cast(), common);
-        ptr::write(memory.0.add(m::OFFSET).cast(), m::State::new(n).unwrap());
-    }
+    memory.write_record(COORD_OFFSET, coordinator);
+    memory.write_record(a::SHARED_OFFSET, common);
+    memory.write_record(m::OFFSET, m::State::new(n).unwrap());
     fs::create_dir(&args[8]).map_err(|e| e.to_string())?;
-    unsafe {
-        sys_icache_invalidate(memory.0.cast(), memory.1);
-        hv(hv_vm_create(ptr::null()), "create address VM")?;
-    }
-    let _machine = Machine;
-    unsafe {
-        hv(
-            hv_vm_map(memory.0.cast(), IPA, memory.1, 7),
-            "map address backing",
-        )?;
-    }
+    let _machine = Machine::create(&memory)?;
     let execution = run_owners(
         n,
         shadow::TCR_BOTH,
@@ -310,7 +276,7 @@ pub fn run(args: &[String]) -> Result<()> {
     // All owners have joined before snapshots are read, including on failure.
     let common = unsafe { &*memory.0.add(a::SHARED_OFFSET).cast::<a::Shared>() };
     let coordinator = unsafe { &*memory.0.add(COORD_OFFSET).cast::<Coordinator>() };
-    let maintenance: m::State = record(&memory, m::OFFSET);
+    let maintenance: m::State = memory.read_record(m::OFFSET);
     let requests = execution.as_ref().map(Vec::as_slice).unwrap_or(&[]);
     let owners = (0..n)
         .map(|id| owner_report(&memory, id, &seeds[id], requests, &lower_before[id]))
@@ -327,7 +293,7 @@ pub fn run(args: &[String]) -> Result<()> {
     );
     execution?;
     for id in 0..n {
-        let s: Shared = record(&memory, id * RAM_SIZE + SHARED_OFFSET);
+        let s: Shared = memory.read_record(id * RAM_SIZE + SHARED_OFFSET);
         if s.current_el != 4
             || s.sctlr & 0x1005 != 0x1005
             || s.actlr & 2 != 2

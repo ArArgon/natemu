@@ -137,9 +137,6 @@ macro_rules! fields {
         out
     }};
 }
-fn record<T: Copy>(memory: &Memory, offset: usize) -> T {
-    unsafe { ptr::read_volatile(memory.0.add(offset).cast()) }
-}
 fn snapshot_json(s: &cc::Snapshot) -> String {
     format!("{{{}}}",fields!(s; control,cs,tr,hidden,hidden_generation,context,source_generation,rip,completed,gpr,route).join(","))
 }
@@ -326,15 +323,15 @@ fn owner_report(
     requests: &[wire::Packet],
 ) -> String {
     let base = id * RAM_SIZE;
-    let shared: Shared = record(memory, base + SHARED_OFFSET);
-    let state: control::State = record(memory, base + control::OFFSET);
-    let validation: validation::State = record(memory, base + validation::STATE_OFFSET);
-    let owner: cc::Owner = record(memory, base + cc::OWNER_OFFSET);
-    let pae: pae::State = record(memory, base + pae::OFFSET);
-    let modes: modes::State = record(memory, base + modes::OFFSET);
-    let guest: recover::GuestState = record(memory, base + recover::GUEST_OFFSET);
-    let recovery: recover::Recovery = record(memory, base + recover::STATE_OFFSET);
-    let event: EventRecord = record(memory, base + EVENT_OFFSET);
+    let shared: Shared = memory.read_record(base + SHARED_OFFSET);
+    let state: control::State = memory.read_record(base + control::OFFSET);
+    let validation: validation::State = memory.read_record(base + validation::STATE_OFFSET);
+    let owner: cc::Owner = memory.read_record(base + cc::OWNER_OFFSET);
+    let pae: pae::State = memory.read_record(base + pae::OFFSET);
+    let modes: modes::State = memory.read_record(base + modes::OFFSET);
+    let guest: recover::GuestState = memory.read_record(base + recover::GUEST_OFFSET);
+    let recovery: recover::Recovery = memory.read_record(base + recover::STATE_OFFSET);
+    let event: EventRecord = memory.read_record(base + EVENT_OFFSET);
     let mut f = fields!(shared; status,detail,current_el,sctlr,actlr,tcr,service_pc,capture_pc,esr,far,elr,spsr);
     f.extend(fields!(validation; live,requests,request,reply,completed,operand,width,stage));
     macro_rules! add {
@@ -374,8 +371,7 @@ fn owner_report(
     f.push(format!("\"initial\":{},\"entered\":{},\"final_frame\":{},\"guest_before\":{},\"guest_after\":{},\"controls\":{},\"pae\":{},\"modes\":{},\"owner\":{}",frame_json(&seed.0),frame_json(&shared.initial),frame_json(&shared.captured),crate::recovery::guest_json(&seed.2),crate::recovery::guest_json(&guest),single::state_json(&state),single::pae_json(&pae),single::modes_json(&modes),owner_json(&owner)));
     let visits = (0..control::MAX_VISITS)
         .map(|i| {
-            single::visit_json(&record(
-                memory,
+            single::visit_json(&memory.read_record(
                 base + control::RECORD_OFFSET + i * core::mem::size_of::<control::Visit>(),
             ))
         })
@@ -404,10 +400,7 @@ fn owner_report(
     f.push(format!("\"event\":{{{}}}", e.join(",")));
     let intervals = (0..maintenance_abi::MAX_INTERVALS)
         .map(|i| {
-            interval_json(&record(
-                memory,
-                base + maintenance_abi::RECORD_OFFSET + i * 4096,
-            ))
+            interval_json(&memory.read_record(base + maintenance_abi::RECORD_OFFSET + i * 4096))
         })
         .collect::<Vec<_>>()
         .join(",");
@@ -424,22 +417,10 @@ pub fn run(args: &[String]) -> Result<()> {
         .ok_or("unsupported concurrent controls/profile/count/actor")?;
     let mut coordinator = Coordinator::new(n).unwrap();
     coordinator.scenario = 5;
-    let mut host_limit = 0;
-    unsafe {
-        hv(
-            hv_vm_get_max_vcpu_count(&mut host_limit),
-            "read control vCPU limit",
-        )?;
-    }
-    if n > host_limit as usize {
-        return Err("control count exceeds host vCPU limit".into());
-    }
+    require_vcpus(n)?;
     let memory = Memory::with_size(super::progress::backing_size(n))?;
-    load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
-    let mut vm_nonce = 0u64;
-    if unsafe { getentropy((&mut vm_nonce as *mut u64).cast(), 8) } != 0 || vm_nonce == 0 {
-        return Err("unable to generate concurrent control VM identity".into());
-    }
+    load_resident(&memory, &args[1])?;
+    let vm_nonce = new_vm_nonce()?;
     let mut data_before = [0xa5; 8192];
     data_before[4096..].fill(0x5a);
     let mut source_before = [0xcc; 4096];
@@ -447,11 +428,7 @@ pub fn run(args: &[String]) -> Result<()> {
     for id in 0..n {
         let base = id * RAM_SIZE;
         if id != 0 {
-            for offset in (0..RAM_SIZE).step_by(4096) {
-                if resident::executable_offset(offset) {
-                    memory.copy(base + offset, &memory.read::<4096>(offset));
-                }
-            }
+            memory.replicate_resident_text(base);
         }
         owner_mappings(&memory, id);
         let (source, len) = cc::source_bytes(profile, id as u64, 1).unwrap();
@@ -512,21 +489,16 @@ pub fn run(args: &[String]) -> Result<()> {
         recovery.control.nxe = 0;
         let mut event = EventRecord::new(&frame, id);
         event.packet = guest;
-        unsafe {
-            ptr::write(memory.0.add(base + SHARED_OFFSET).cast(), shared);
-            ptr::write(memory.0.add(base + control::OFFSET).cast(), state);
-            ptr::write(memory.0.add(base + validation::STATE_OFFSET).cast(), v);
-            ptr::write(memory.0.add(base + recover::GUEST_OFFSET).cast(), guest);
-            ptr::write(memory.0.add(base + recover::STATE_OFFSET).cast(), recovery);
-            ptr::write(memory.0.add(base + pae::OFFSET).cast(), pae::State::ZERO);
-            ptr::write(memory.0.add(base + modes::OFFSET).cast(), modes);
-            ptr::write(
-                memory.0.add(base + cc::OWNER_OFFSET).cast(),
-                cc::Owner::new(),
-            );
-            ptr::write(memory.0.add(base + ROUND_OFFSET).cast(), Round::ZERO);
-            ptr::write(memory.0.add(base + EVENT_OFFSET).cast(), event);
-        }
+        memory.write_record(base + SHARED_OFFSET, shared);
+        memory.write_record(base + control::OFFSET, state);
+        memory.write_record(base + validation::STATE_OFFSET, v);
+        memory.write_record(base + recover::GUEST_OFFSET, guest);
+        memory.write_record(base + recover::STATE_OFFSET, recovery);
+        memory.write_record(base + pae::OFFSET, pae::State::ZERO);
+        memory.write_record(base + modes::OFFSET, modes);
+        memory.write_record(base + cc::OWNER_OFFSET, cc::Owner::new());
+        memory.write_record(base + ROUND_OFFSET, Round::ZERO);
+        memory.write_record(base + EVENT_OFFSET, event);
         seeds.push(seeded);
     }
     let tables_before = legacy_tables();
@@ -537,26 +509,14 @@ pub fn run(args: &[String]) -> Result<()> {
     memory.copy(recover::TABLE_OFFSET, &tables_before);
     memory.copy(pae::TABLE_OFFSET, &pae_tables_before);
     memory.copy(modes::TABLE_OFFSET, &mode_tables_before);
-    unsafe {
-        ptr::write(memory.0.add(COORD_OFFSET).cast(), coordinator);
-        ptr::write(memory.0.add(cc::SHARED_OFFSET).cast(), concurrent);
-        ptr::write(
-            memory.0.add(maintenance_abi::OFFSET).cast(),
-            maintenance_abi::State::new(n).unwrap(),
-        );
-    }
+    memory.write_record(COORD_OFFSET, coordinator);
+    memory.write_record(cc::SHARED_OFFSET, concurrent);
+    memory.write_record(
+        maintenance_abi::OFFSET,
+        maintenance_abi::State::new(n).unwrap(),
+    );
     fs::create_dir(&args[8]).map_err(|e| e.to_string())?;
-    unsafe {
-        sys_icache_invalidate(memory.0.cast(), memory.1);
-        hv(hv_vm_create(ptr::null()), "create concurrent control VM")?;
-    }
-    let _machine = Machine;
-    unsafe {
-        hv(
-            hv_vm_map(memory.0.cast(), IPA, memory.1, 7),
-            "map concurrent control backing",
-        )?;
-    }
+    let _machine = Machine::create(&memory)?;
     let execution = run_owners(
         n,
         shadow::TCR_BOTH,
@@ -577,8 +537,8 @@ pub fn run(args: &[String]) -> Result<()> {
         Err(error) if containment::configuration().is_some() => (Vec::new(), Some(error)),
         Err(error) => {
             // run_owners has joined every owner; failure snapshots cannot race native writes.
-            let concurrent: cc::Shared = record(&memory, cc::SHARED_OFFSET);
-            let pressure: maintenance_abi::State = record(&memory, maintenance_abi::OFFSET);
+            let concurrent: cc::Shared = memory.read_record(cc::SHARED_OFFSET);
+            let pressure: maintenance_abi::State = memory.read_record(maintenance_abi::OFFSET);
             let coordinator = unsafe { &*memory.0.add(COORD_OFFSET).cast::<Coordinator>() };
             eprintln!("concurrent failure state: {}", concurrent_json(&concurrent));
             eprintln!(
@@ -587,9 +547,9 @@ pub fn run(args: &[String]) -> Result<()> {
             );
             eprintln!("maintenance failure state: {}", maintenance_json(&pressure));
             for id in 0..n {
-                let shared: Shared = record(&memory, id * RAM_SIZE + SHARED_OFFSET);
-                let state: control::State = record(&memory, id * RAM_SIZE + control::OFFSET);
-                let owner: cc::Owner = record(&memory, id * RAM_SIZE + cc::OWNER_OFFSET);
+                let shared: Shared = memory.read_record(id * RAM_SIZE + SHARED_OFFSET);
+                let state: control::State = memory.read_record(id * RAM_SIZE + control::OFFSET);
+                let owner: cc::Owner = memory.read_record(id * RAM_SIZE + cc::OWNER_OFFSET);
                 eprintln!(
                     "owner {id} status={} detail={} visits={} completed={} local_cut={} peer_reply_cut={} peer_reply_executed={} admitted={} detached={}",
                     shared.status,
@@ -610,8 +570,8 @@ pub fn run(args: &[String]) -> Result<()> {
         .map(|id| owner_report(&memory, id, &seeds[id], &requests))
         .collect::<Vec<_>>()
         .join(",");
-    let concurrent: cc::Shared = record(&memory, cc::SHARED_OFFSET);
-    let maintenance: maintenance_abi::State = record(&memory, maintenance_abi::OFFSET);
+    let concurrent: cc::Shared = memory.read_record(cc::SHARED_OFFSET);
+    let maintenance: maintenance_abi::State = memory.read_record(maintenance_abi::OFFSET);
     let coordinator = unsafe { &*memory.0.add(COORD_OFFSET).cast::<Coordinator>() };
     let program_revision = cc::PROGRAM_REVISION;
     println!(
@@ -634,7 +594,7 @@ pub fn run(args: &[String]) -> Result<()> {
         );
     }
     for id in 0..n {
-        let s: Shared = record(&memory, id * RAM_SIZE + SHARED_OFFSET);
+        let s: Shared = memory.read_record(id * RAM_SIZE + SHARED_OFFSET);
         if s.current_el != 4
             || s.sctlr & 0x1005 != 0x1005
             || s.actlr & 2 != 2

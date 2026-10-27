@@ -77,10 +77,8 @@ pub fn prepare(
             *segment = [0x23, 0, 0xffff_ffff, 0xc0f3];
         }
     }
-    unsafe {
-        ptr::write(memory.0.add(STATE_OFFSET).cast::<Recovery>(), state);
-        ptr::write(memory.0.add(GUEST_OFFSET).cast::<GuestState>(), guest);
-    }
+    memory.write_record(STATE_OFFSET, state);
+    memory.write_record(GUEST_OFFSET, guest);
     Ok(guest)
 }
 pub(super) fn guest_json(g: &GuestState) -> String {
@@ -104,8 +102,8 @@ pub(super) fn guest_json(g: &GuestState) -> String {
     )
 }
 pub fn report(vm: &Vm, before: &GuestState, tables_before: &[u8; 16384]) -> String {
-    let r = unsafe { ptr::read_volatile(vm.memory.0.add(STATE_OFFSET).cast::<Recovery>()) };
-    let g = unsafe { ptr::read_volatile(vm.memory.0.add(GUEST_OFFSET).cast::<GuestState>()) };
+    let r = vm.memory.read_record::<Recovery>(STATE_OFFSET);
+    let g = vm.memory.read_record::<GuestState>(GUEST_OFFSET);
     let mut traces = Vec::new();
     for t in &r.trace[..(r.faults as usize).min(MAX_FAULTS)] {
         traces.push(format!("{{\"frame\":{},\"esr\":{},\"far\":{},\"elr\":{},\"spsr\":{},\"outcome\":{},\"error\":{}}}",frame_json(&t.frame),t.esr,t.far,t.elr,t.spsr,t.outcome,t.error));
@@ -142,13 +140,13 @@ pub fn allocated_report(vm: &Vm, initial: &NativeFrame, final_frame: &NativeFram
         frame_json(final_frame),
         vm.memory.read::<3072>(0x24000),
         vm.memory.read::<1168>(0x23000),
-        vm.read_reg(32).unwrap_or(u64::MAX),
-        vm.read_reg(33).unwrap_or(u64::MAX)
+        vm.cpu.reg(32).unwrap_or(u64::MAX),
+        vm.cpu.reg(33).unwrap_or(u64::MAX)
     )
 }
 
 pub fn helper_report(vm: &Vm) -> String {
-    let h = unsafe { ptr::read(vm.memory.0.add(0x25000).cast::<HelperState>()) };
+    let h = vm.memory.read_record::<HelperState>(0x25000);
     format!(
         "{{\"calls\":{},\"outputs\":{},\"before\":{},\"staged\":{},\"poisoned\":{}}}",
         h.calls,
@@ -160,7 +158,7 @@ pub fn helper_report(vm: &Vm) -> String {
 }
 
 pub fn partial_report(vm: &Vm) -> String {
-    let p = unsafe { ptr::read(vm.memory.0.add(0x26000).cast::<PartialState>()) };
+    let p = vm.memory.read_record::<PartialState>(0x26000);
     let t = &p.trace;
     format!(
         "{{\"reads\":{},\"writes\":{},\"faults\":{},\"retries\":{},\"phase\":{},\"value\":{},\"read_values\":{:?},\"store_pc\":{},\"at_fault_counts\":{:?},\"at_fault\":{},\"prefix\":{},\"before\":{},\"trace\":{{\"frame\":{},\"esr\":{},\"far\":{},\"elr\":{},\"spsr\":{},\"outcome\":{},\"error\":{}}},\"written\":{:?}}}",
@@ -173,7 +171,7 @@ pub fn partial_report(vm: &Vm) -> String {
         p.read_values,
         p.store_pc,
         p.at_fault_counts,
-        guest_json(&unsafe { ptr::read(vm.memory.0.add(0x27000).cast::<GuestState>()) }),
+        guest_json(&vm.memory.read_record::<GuestState>(0x27000)),
         guest_json(&p.prefix),
         guest_json(&p.before),
         frame_json(&t.frame),

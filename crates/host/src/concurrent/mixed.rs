@@ -42,28 +42,14 @@ pub fn private_code(memory: &Memory, base: usize) {
     }
 }
 pub fn state(memory: &Memory, base: usize) -> mixed32::State {
-    unsafe { ptr::read(memory.0.add(base + mixed32::OFFSET).cast()) }
+    memory.read_record(base + mixed32::OFFSET)
 }
 pub fn report(memory: &Memory, id: usize, profile: u64, frame: &NativeFrame) -> String {
     let base = id * RAM_SIZE;
     let m = state(memory, base);
-    let g = unsafe {
-        ptr::read(
-            memory
-                .0
-                .add(base + recover::GUEST_OFFSET)
-                .cast::<recover::GuestState>(),
-        )
-    };
-    let r = unsafe {
-        ptr::read(
-            memory
-                .0
-                .add(base + recover::STATE_OFFSET)
-                .cast::<recover::Recovery>(),
-        )
-    };
-    let s = unsafe { ptr::read(memory.0.add(base + SHARED_OFFSET).cast::<Shared>()) };
+    let g = memory.read_record::<recover::GuestState>(base + recover::GUEST_OFFSET);
+    let r = memory.read_record::<recover::Recovery>(base + recover::STATE_OFFSET);
+    let s = memory.read_record::<Shared>(base + SHARED_OFFSET);
     let traces=r.trace[..(r.faults as usize).min(recover::MAX_FAULTS)].iter().map(|t|format!("{{\"frame\":{},\"esr\":{},\"far\":{},\"elr\":{},\"spsr\":{},\"outcome\":{},\"error\":{}}}",frame_json(&t.frame),t.esr,t.far,t.elr,t.spsr,t.outcome,t.error)).collect::<Vec<_>>().join(",");
     format!(
         "{{\"id\":{id},\"mode\":{},\"incarnation\":{},\"context\":{},\"a20\":{},\"expected\":{:?},\"requests\":{:?},\"replies\":{:?},\"stale_replies\":{},\"wrong_owner\":{},\"wrong_mode\":{},\"blank_before_publish\":{},\"fetch_gpa\":{:?},\"routes\":{:?},\"source_before\":{:?},\"source_after\":{:?},\"initial\":{},\"old_memory_after\":{:?},\"new_memory_before\":{:?},\"new_memory_after\":{:?},\"guest_before\":{},\"guest_after\":{},\"current_el\":{},\"sctlr\":{},\"actlr\":{},\"tcr\":{},\"service_pc\":{},\"old_code\":{:?},\"new_code\":{:?},\"lower_leaf\":{:?},\"walks\":{},\"retries\":{},\"faults\":{},\"vector\":{},\"error\":{},\"linear\":{},\"rip\":{},\"traces\":[{traces}]}}",

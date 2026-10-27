@@ -36,48 +36,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-struct Machine;
-impl Drop for Machine {
-    fn drop(&mut self) {
-        unsafe {
-            hv_vm_destroy();
-        }
-    }
-}
-struct Cpu {
-    id: u64,
-    exit: *const HvExit,
-    alive: bool,
-}
+/// An owner vCPU and its resident service loop.
+struct Cpu(Vcpu);
 impl Cpu {
-    fn new() -> Result<Self> {
-        let mut c = Self {
-            id: 0,
-            exit: ptr::null(),
-            alive: false,
-        };
-        unsafe {
-            hv(
-                hv_vcpu_create(&mut c.id, &mut c.exit, ptr::null()),
-                "create owner vCPU",
-            )?;
-        }
-        c.alive = true;
-        Ok(c)
-    }
-    fn destroy(&mut self) -> i32 {
-        let result = unsafe { hv_vcpu_destroy(self.id) };
-        if result == 0 {
-            self.alive = false;
-        }
-        result
-    }
-    fn reg(&self, r: u32, value: u64) -> Result<()> {
-        unsafe { hv(hv_vcpu_set_reg(self.id, r, value), "set owner register") }
-    }
-    fn sys(&self, r: u16, value: u64) -> Result<()> {
-        unsafe { hv(hv_vcpu_set_sys_reg(self.id, r, value), "set owner control") }
-    }
     fn run(
         &self,
         shared_address: usize,
@@ -88,18 +49,10 @@ impl Cpu {
             if cancelled.load(Ordering::Acquire) {
                 return Err("owner cancelled after peer failure".into());
             }
+            let event = self.0.run_to_hvc()?;
+            let pc = self.0.reg(PC)?;
             unsafe {
-                hv(hv_vcpu_run(self.id), "run owner vCPU")?;
-                let e = &*self.exit;
-                let mut pc = 0;
-                hv(hv_vcpu_get_reg(self.id, 31, &mut pc), "read owner PC")?;
-                if e.reason != 1 || e.exception.syndrome >> 26 != 0x16 {
-                    return Err(format!(
-                        "owner exit reason={} ESR={:#x} PC={pc:#x} VA={:#x}",
-                        e.reason, e.exception.syndrome, e.exception.virtual_address
-                    ));
-                }
-                match e.exception.syndrome & 0xffff {
+                match event {
                     0x49 => {
                         let s = ptr::read_volatile(shared_address as *const Shared);
                         return terminal_outcome(s.status, s.detail);
@@ -113,7 +66,7 @@ impl Cpu {
                         }
                         let mut packet = [0; 16];
                         for (r, v) in packet.iter_mut().enumerate() {
-                            hv(hv_vcpu_get_reg(self.id, r as u32, v), "read service packet")?;
+                            *v = self.0.reg(r as u32)?;
                         }
                         let expected = if s.mode == natemu_abi::partial_progress::MODE
                             && containment::configuration().is_some()
@@ -172,7 +125,7 @@ impl Cpu {
                             .ok_or("compiler service on non-owner")?
                             .exchange(packet)?;
                         for (r, v) in reply.iter().enumerate() {
-                            self.reg(r as u32, *v)?;
+                            self.0.set_reg(r as u32, *v)?;
                         }
                     }
                     _ => return Err("unexpected owner HVC".into()),
@@ -199,13 +152,6 @@ fn terminal_outcome(status: u64, detail: u64) -> Result<()> {
 fn cancel_owners(cancelled: &AtomicBool) {
     if !cancelled.swap(true, Ordering::AcqRel) {
         crate::translation::process_owner::begin_cancellation();
-    }
-}
-impl Drop for Cpu {
-    fn drop(&mut self) {
-        if self.alive {
-            self.destroy();
-        }
     }
 }
 
@@ -263,27 +209,9 @@ fn tables(memory: &Memory, base: usize, aliases: bool) {
 }
 
 fn prepare_cpu(id: usize, tcr: u64) -> Result<Cpu> {
-    let cpu = Cpu::new()?;
-    let mut isar0 = 0;
-    unsafe {
-        hv(
-            hv_vcpu_get_sys_reg(cpu.id, 0xc030, &mut isar0),
-            "read FlagM",
-        )?;
-    }
-    if (isar0 >> 52) & 15 == 0 {
-        return Err("FlagM required".into());
-    }
-    cpu.reg(31, IPA + (id * RAM_SIZE) as u64)?;
-    cpu.reg(34, 0x3c5)?;
-    cpu.reg(0, IPA + (id * RAM_SIZE + 0x10000) as u64)?;
-    cpu.reg(1, tcr)?;
-    cpu.reg(2, 0xff)?;
-    cpu.sys(0xc080, 0x30d00980)?;
-    cpu.sys(0xc081, 2)?;
-    cpu.sys(0xc082, 3 << 20)?;
-    cpu.sys(0xdf19, 0)?;
-    Ok(cpu)
+    let cpu = Vcpu::create()?;
+    cpu.enter_resident(id * RAM_SIZE, tcr)?;
+    Ok(Cpu(cpu))
 }
 
 fn run_owners(
@@ -346,7 +274,7 @@ fn run_owners(
                     let cpu = std::panic::catch_unwind(|| prepare_cpu(id, tcr))
                         .unwrap_or_else(|_| Err("owner panicked during setup".into()));
                     prepared
-                        .send(cpu.as_ref().map(|c| c.id).map_err(Clone::clone))
+                        .send(cpu.as_ref().map(|c| c.0.id()).map_err(Clone::clone))
                         .map_err(|_| "setup receiver closed")?;
                     let mut cpu = cpu?;
                     // No native entry until *all* owners successfully prepare.
@@ -435,7 +363,7 @@ fn run_owners(
                     let _ = done.send(result.clone());
                     // Keep IDs alive while the supervisor may cancel peers.
                     let _ = release_rx.recv();
-                    let destroy_result = cpu.destroy();
+                    let destroy_result = cpu.0.destroy();
                     let _ = destroyed.send((id, destroy_result));
                     result?;
                     hv(destroy_result, "destroy owner vCPU")?;
@@ -518,9 +446,7 @@ fn run_owners(
                 cancel_owners(&cancelled);
                 // Repeat cancellation: an owner may still be in its declared
                 // pre-entry delay when an earlier cancellation is issued.
-                unsafe {
-                    cancellations.push(hv_vcpus_exit(ids.as_mut_ptr(), ids.len() as u32));
-                }
+                cancellations.push(exit_vcpus(&mut ids));
             }
         }
         drop(releases);
@@ -587,16 +513,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let n: usize = args[4].parse().map_err(|_| "invalid I4 vCPU count")?;
     let boundary_config = boundary::Config::parse(args, n)?;
     let mut coord = Coordinator::new(n).ok_or("I4 admits 1..=4 vCPUs")?;
-    let mut host_limit = 0;
-    unsafe {
-        hv(
-            hv_vm_get_max_vcpu_count(&mut host_limit),
-            "read host vCPU limit",
-        )?;
-    }
-    if n > host_limit as usize {
-        return Err("I4 count exceeds host vCPU limit".into());
-    }
+    require_vcpus(n)?;
     let mixed_profile = if args[2] == "i4v-mixed" {
         match args[3].as_str() {
             "off-first" => 1,
@@ -643,7 +560,7 @@ pub fn run(args: &[String]) -> Result<()> {
         return Err("I4 requires pinned FEX fragment".into());
     }
     let memory = Memory::with_size(progress::backing_size(n))?;
-    load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
+    load_resident(&memory, &args[1])?;
     if !stack_profile && mixed_profile == 0 {
         memory.copy(CODE_OFFSET, &body);
         memory.copy(CODE_OFFSET + 44, &RET);
@@ -665,35 +582,21 @@ pub fn run(args: &[String]) -> Result<()> {
             },
         );
     }
-    unsafe {
-        ptr::write(memory.0.add(COORD_OFFSET).cast::<Coordinator>(), coord);
-    }
-    let mut vm_id = 0u64;
-    if unsafe { getentropy((&raw mut vm_id).cast(), 8) } != 0 || vm_id == 0 {
-        return Err("VM identity entropy unavailable".into());
-    }
+    memory.write_record(COORD_OFFSET, coord);
+    let vm_id = new_vm_nonce()?;
     let pressure = scenario_id == 5;
     if pressure {
-        unsafe {
-            ptr::write(
-                memory
-                    .0
-                    .add(natemu_abi::maintenance::OFFSET)
-                    .cast::<natemu_abi::maintenance::State>(),
-                natemu_abi::maintenance::State::new(n).unwrap(),
-            );
-        }
+        memory.write_record(
+            natemu_abi::maintenance::OFFSET,
+            natemu_abi::maintenance::State::new(n).unwrap(),
+        );
     }
     let mut seeds = Vec::new();
     let mut new_data = Vec::new();
     for id in 0..n {
         let base = id * RAM_SIZE;
         if id != 0 {
-            for offset in (0..RAM_SIZE).step_by(4096) {
-                if resident::executable_offset(offset) {
-                    memory.copy(base + offset, &memory.read::<4096>(offset));
-                }
-            }
+            memory.replicate_resident_text(base);
         }
         tables(&memory, base, alias_profile != 0);
         if boundary_config.is_some() {
@@ -765,39 +668,25 @@ pub fn run(args: &[String]) -> Result<()> {
                 natemu_abi::translation::Lifecycle::new(vm_id)
             },
         };
-        unsafe {
-            ptr::write(memory.0.add(base + SHARED_OFFSET).cast::<Shared>(), shared);
-            if mixed_profile != 0 {
-                let mode = natemu_abi::mixed32::owner_mode(mixed_profile, id as u64).unwrap();
-                let mut m = natemu_abi::mixed32::State::ZERO;
-                m.mode = mode;
-                m.incarnation = 1;
-                m.context = mode + 1;
-                m.a20 = 1;
-                m.initial = frame;
-                ptr::write(
-                    memory
-                        .0
-                        .add(base + natemu_abi::mixed32::OFFSET)
-                        .cast::<natemu_abi::mixed32::State>(),
-                    m,
-                );
-            }
-            if stack_profile {
-                ptr::write(
-                    memory
-                        .0
-                        .add(base + stack_concurrent::OFFSET)
-                        .cast::<stack_concurrent::State>(),
-                    stack_concurrent::State::ZERO,
-                );
-            }
-            if alias_profile != 0 {
-                ptr::write(
-                    memory.0.add(base + alias::OFFSET).cast::<alias::Record>(),
-                    alias::Record::ZERO,
-                );
-            }
+        memory.write_record(base + SHARED_OFFSET, shared);
+        if mixed_profile != 0 {
+            let mode = natemu_abi::mixed32::owner_mode(mixed_profile, id as u64).unwrap();
+            let mut m = natemu_abi::mixed32::State::ZERO;
+            m.mode = mode;
+            m.incarnation = 1;
+            m.context = mode + 1;
+            m.a20 = 1;
+            m.initial = frame;
+            memory.write_record(base + natemu_abi::mixed32::OFFSET, m);
+        }
+        if stack_profile {
+            memory.write_record(
+                base + stack_concurrent::OFFSET,
+                stack_concurrent::State::ZERO,
+            );
+        }
+        if alias_profile != 0 {
+            memory.write_record(base + alias::OFFSET, alias::Record::ZERO);
         }
         seeds.push((frame, bank, data));
     }
@@ -817,55 +706,35 @@ pub fn run(args: &[String]) -> Result<()> {
             }
         }
         for id in 0..n {
-            unsafe {
-                ptr::write(
-                    memory.0.add(id * RAM_SIZE + ROUND_OFFSET).cast::<Round>(),
-                    Round::ZERO,
-                );
-                ptr::write(
-                    memory
-                        .0
-                        .add(id * RAM_SIZE + natemu_abi::recovery::STATE_OFFSET)
-                        .cast::<natemu_abi::recovery::Recovery>(),
-                    natemu_abi::recovery::Recovery::new(0),
-                );
-                if scenario_id >= 4 {
-                    let mut guest = if mixed_profile != 0 {
-                        mixed::guest(&seeds[id].0, id, mixed_profile)
-                    } else {
-                        natemu_abi::recovery::GuestState::seed(&seeds[id].0)
-                    };
-                    guest.rip = source_rip;
-                    if stack_profile {
-                        guest.gpr[4] = seeds[id].0.x[8];
-                    }
-                    if id as u64 == stack_roles.actor {
-                        guest.rflags &= !0x200;
-                    }
-                    ptr::write(
-                        memory
-                            .0
-                            .add(id * RAM_SIZE + natemu_abi::recovery::GUEST_OFFSET)
-                            .cast::<natemu_abi::recovery::GuestState>(),
-                        guest,
-                    );
-                    let mut event =
-                        EventRecord::new(&seeds[id].0, stack_roles.event_role(id as u64) as usize);
-                    event.packet.rip = source_rip;
-                    if mixed_profile != 0 {
-                        event.packet = guest;
-                    }
-                    if stack_profile {
-                        event.packet.gpr[4] = seeds[id].0.x[8];
-                    }
-                    ptr::write(
-                        memory
-                            .0
-                            .add(id * RAM_SIZE + EVENT_OFFSET)
-                            .cast::<EventRecord>(),
-                        event,
-                    );
+            memory.write_record(id * RAM_SIZE + ROUND_OFFSET, Round::ZERO);
+            memory.write_record(
+                id * RAM_SIZE + natemu_abi::recovery::STATE_OFFSET,
+                natemu_abi::recovery::Recovery::new(0),
+            );
+            if scenario_id >= 4 {
+                let mut guest = if mixed_profile != 0 {
+                    mixed::guest(&seeds[id].0, id, mixed_profile)
+                } else {
+                    natemu_abi::recovery::GuestState::seed(&seeds[id].0)
+                };
+                guest.rip = source_rip;
+                if stack_profile {
+                    guest.gpr[4] = seeds[id].0.x[8];
                 }
+                if id as u64 == stack_roles.actor {
+                    guest.rflags &= !0x200;
+                }
+                memory.write_record(id * RAM_SIZE + natemu_abi::recovery::GUEST_OFFSET, guest);
+                let mut event =
+                    EventRecord::new(&seeds[id].0, stack_roles.event_role(id as u64) as usize);
+                event.packet.rip = source_rip;
+                if mixed_profile != 0 {
+                    event.packet = guest;
+                }
+                if stack_profile {
+                    event.packet.gpr[4] = seeds[id].0.x[8];
+                }
+                memory.write_record(id * RAM_SIZE + EVENT_OFFSET, event);
             }
         }
     }
@@ -887,21 +756,11 @@ pub fn run(args: &[String]) -> Result<()> {
     if mixed_profile != 0 {
         fs::create_dir(&args[6]).map_err(|e| e.to_string())?;
     }
-    unsafe {
-        sys_icache_invalidate(memory.0.cast(), memory.1);
-        hv(hv_vm_create(ptr::null()), "create concurrent VM")?;
-    }
-    let _machine = Machine;
-    unsafe {
-        hv(
-            hv_vm_map(memory.0.cast(), IPA, memory.1, 7),
-            "map concurrent backing",
-        )?;
-    }
+    let _machine = Machine::create(&memory)?;
     let tcr = if alias_profile != 0 {
         shadow::TCR_BOTH
     } else {
-        16 | 1 << 8 | 1 << 10 | 3 << 12 | 1 << 23 | 2 << 32
+        SINGLE_ROOT_TCR
     };
     let execution = run_owners(
         n,
@@ -951,7 +810,7 @@ pub fn run(args: &[String]) -> Result<()> {
         let boundary_owner = boundary_config
             .as_ref()
             .map(|_| boundary::owner(&memory, id));
-        let s = unsafe { ptr::read(memory.0.add(base + SHARED_OFFSET).cast::<Shared>()) };
+        let s = memory.read_record::<Shared>(base + SHARED_OFFSET);
         if s.status != SUCCESS || s.current_el != 4 || s.actlr & 2 != 2 || s.tcr != tcr {
             return Err(format!("CPU{id}: status={} detail={}", s.status, s.detail));
         }
@@ -961,20 +820,19 @@ pub fn run(args: &[String]) -> Result<()> {
         if scenario_id < 2 && s.initial != entry {
             return Err(format!("CPU{id}: entry state changed"));
         }
-        let r = unsafe { ptr::read(memory.0.add(base + ROUND_OFFSET).cast::<Round>()) };
+        let r = memory.read_record::<Round>(base + ROUND_OFFSET);
         if mixed_profile != 0 {
             mixed_records.push(mixed::report(&memory, id, mixed_profile, frame));
         }
         if scenario_id >= 4 {
-            let e = unsafe { ptr::read(memory.0.add(base + EVENT_OFFSET).cast::<EventRecord>()) };
+            let e = memory.read_record::<EventRecord>(base + EVENT_OFFSET);
             event_records.push(format!("{{\"id\":{id},\"pending\":{},\"token_state\":{},\"notifications\":{},\"consumed\":{},\"deliveries\":{},\"boundary\":{},\"blocked\":{},\"wait_checks\":{},\"shadow\":{},\"priority\":{},\"vector\":{},\"packet\":{}}}",
                 u64::from(c.event_pending[id].load(Ordering::Acquire)==1),c.event_pending[id].load(Ordering::Acquire),c.event_notifications[id].load(Ordering::Acquire),
                 e.consumed,e.deliveries,e.boundary,e.blocked,e.wait_checks,e.shadow,e.priority,0x40+id,
                 recovery::guest_json(&e.packet)));
         }
         if alias_profile != 0 {
-            let a =
-                unsafe { ptr::read(memory.0.add(base + alias::OFFSET).cast::<alias::Record>()) };
+            let a = memory.read_record::<alias::Record>(base + alias::OFFSET);
             alias_records.push(format!("{{\"id\":{id},\"current_el\":{},\"sctlr\":{},\"actlr\":{},\"tcr\":{},\"ttbr1\":{},\"warm\":{:?},\"ack_count\":{},\"acks\":{:?},\"wrong_rip_rejections\":{},\"blank_before_publish\":{},\"source_address\":{},\"source_gpa\":{},\"source_leaf_before\":{},\"source_leaf_after\":{},\"source_before\":{:?},\"source_after\":{:?},\"upper_root\":{:?},\"upper_l1\":{:?},\"upper_l2\":{:?},\"upper_leaf\":{:?},\"lower_leaf\":{:?}}}",
                 s.current_el,s.sctlr,s.actlr,s.tcr,a.ttbr1,a.warm,a.ack_count,a.acks,
                 a.wrong_rip_rejections,a.blank_before_publish,a.source_address,a.source_gpa,a.source_leaf_before,a.source_leaf_after,a.source_before,a.source_after,
@@ -984,14 +842,8 @@ pub fn run(args: &[String]) -> Result<()> {
                 boundary_owner.as_ref().map_or_else(|| i4v::words(&memory,base+shadow::LOWER_LEAF), |o| o.lower_before)));
         }
         if stack_profile {
-            let state = unsafe {
-                ptr::read(
-                    memory
-                        .0
-                        .add(base + stack_concurrent::OFFSET)
-                        .cast::<stack_concurrent::State>(),
-                )
-            };
+            let state =
+                memory.read_record::<stack_concurrent::State>(base + stack_concurrent::OFFSET);
             let mut before = natemu_abi::recovery::GuestState::seed(frame);
             before.rip = source_rip;
             before.gpr[4] = frame.x[8];
@@ -999,12 +851,9 @@ pub fn run(args: &[String]) -> Result<()> {
                 before.rflags &= !0x200;
             }
             let after = boundary_owner.as_ref().map_or_else(
-                || unsafe {
-                    ptr::read(
-                        memory
-                            .0
-                            .add(base + natemu_abi::recovery::GUEST_OFFSET)
-                            .cast::<natemu_abi::recovery::GuestState>(),
+                || {
+                    memory.read_record::<natemu_abi::recovery::GuestState>(
+                        base + natemu_abi::recovery::GUEST_OFFSET,
                     )
                 },
                 |o| o.before_guest,
@@ -1049,14 +898,9 @@ pub fn run(args: &[String]) -> Result<()> {
                 r.faults,r.old_gpa,frame_json(&r.fault_frame),r.fault_esr,r.fault_far,r.fault_pc,r.fault_spsr));
         }
         let baseline = if pressure {
-            Some(unsafe {
-                ptr::read(
-                    memory
-                        .0
-                        .add(base + natemu_abi::maintenance::BASELINE_OFFSET)
-                        .cast::<natemu_abi::maintenance::Baseline>(),
-                )
-            })
+            Some(memory.read_record::<natemu_abi::maintenance::Baseline>(
+                base + natemu_abi::maintenance::BASELINE_OFFSET,
+            ))
         } else {
             None
         };
@@ -1171,14 +1015,7 @@ pub fn run(args: &[String]) -> Result<()> {
         }
     );
     let maintenance = if pressure {
-        Some(unsafe {
-            ptr::read(
-                memory
-                    .0
-                    .add(natemu_abi::maintenance::OFFSET)
-                    .cast::<natemu_abi::maintenance::State>(),
-            )
-        })
+        Some(memory.read_record::<natemu_abi::maintenance::State>(natemu_abi::maintenance::OFFSET))
     } else {
         None
     };
@@ -1197,21 +1034,11 @@ pub fn run(args: &[String]) -> Result<()> {
             if m.intervals[id] > natemu_abi::maintenance::MAX_INTERVALS as u64 {
                 return Err("interval reserve exceeded".into());
             }
-            let state =
-                unsafe { ptr::read(memory.0.add(id * RAM_SIZE + SHARED_OFFSET).cast::<Shared>()) };
+            let state = memory.read_record::<Shared>(id * RAM_SIZE + SHARED_OFFSET);
             for index in 0..m.intervals[id] as usize {
-                let r = unsafe {
-                    ptr::read(
-                        memory
-                            .0
-                            .add(
-                                id * RAM_SIZE
-                                    + natemu_abi::maintenance::RECORD_OFFSET
-                                    + index * 4096,
-                            )
-                            .cast::<natemu_abi::maintenance::Interval>(),
-                    )
-                };
+                let r = memory.read_record::<natemu_abi::maintenance::Interval>(
+                    id * RAM_SIZE + natemu_abi::maintenance::RECORD_OFFSET + index * 4096,
+                );
                 let case = if mixed_profile != 0 {
                     "fex_mixed32_changed"
                 } else if stack_profile {

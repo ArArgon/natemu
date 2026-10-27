@@ -213,8 +213,7 @@ impl Observation {
     }
 }
 pub(super) fn destroy(machine: Machine) -> Result<()> {
-    std::mem::forget(machine);
-    let status = unsafe { hv_vm_destroy() };
+    let status = machine.destroy();
     println!("{{\"case\":\"vm-destroy\",\"status\":{status}}}");
     hv(status, "destroy contained VM")
 }

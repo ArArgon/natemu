@@ -71,35 +71,18 @@ pub fn run(args: &[String]) -> Result<()> {
     if containment::configuration().is_some() {
         // The partial fixture normally has no compiler. Containment adds one
         // whose per-owner output needs this parent before any owner starts.
-        fs::create_dir(&args[8])
-            .map_err(|e| format!("create partial compiler output: {e}"))?;
+        fs::create_dir(&args[8]).map_err(|e| format!("create partial compiler output: {e}"))?;
     }
-    let mut limit = 0;
-    unsafe {
-        hv(
-            hv_vm_get_max_vcpu_count(&mut limit),
-            "read partial owner limit",
-        )?;
-    }
-    if n > limit as usize {
-        return Err("partial count exceeds host limit".into());
-    }
+    require_vcpus(n)?;
     let memory = Memory::with_size((n + 1) * RAM_SIZE)?;
-    load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
-    let mut vm = 0u64;
-    if unsafe { getentropy((&mut vm as *mut u64).cast(), 8) } != 0 || vm == 0 {
-        return Err("partial VM identity".into());
-    }
+    load_resident(&memory, &args[1])?;
+    let vm = new_vm_nonce()?;
     let mut banks = Vec::new();
     let mut source_before = [0xcc; 4096];
     for id in 0..n {
         let base = id * RAM_SIZE;
         if id != 0 {
-            for offset in (0..RAM_SIZE).step_by(4096) {
-                if resident::executable_offset(offset) {
-                    memory.copy(base + offset, &memory.read::<4096>(offset));
-                }
-            }
+            memory.replicate_resident_text(base);
         }
         ordering::owner_mappings(&memory, id, n);
         let (frame, mut bank, _) = seed(id);
@@ -130,13 +113,8 @@ pub fn run(args: &[String]) -> Result<()> {
             mode: p::MODE,
             lifecycle: wire::Lifecycle::new(vm),
         };
-        unsafe {
-            ptr::write(memory.0.add(base + SHARED_OFFSET).cast(), shared);
-            ptr::write(
-                memory.0.add(base + p::OWNER_OFFSET).cast(),
-                p::Owner::new(id as u64, frame),
-            );
-        }
+        memory.write_record(base + SHARED_OFFSET, shared);
+        memory.write_record(base + p::OWNER_OFFSET, p::Owner::new(id as u64, frame));
         source_before[id * 256..id * 256 + 2].copy_from_slice(&p::SOURCE);
         banks.push(bank);
     }
@@ -150,27 +128,9 @@ pub fn run(args: &[String]) -> Result<()> {
     memory.copy(p::RAM_OFFSET, &data_before);
     memory.copy(p::SOURCE_OFFSET, &source_before);
     memory.copy(p::TABLE_OFFSET, &tables_before);
-    unsafe {
-        ptr::write(
-            memory.0.add(COORD_OFFSET).cast(),
-            Coordinator::new(n).unwrap(),
-        );
-        ptr::write(
-            memory.0.add(p::COMMON_OFFSET).cast(),
-            p::Common::new(config).unwrap(),
-        );
-    }
-    unsafe {
-        sys_icache_invalidate(memory.0.cast(), memory.1);
-        hv(hv_vm_create(ptr::null()), "create partial VM")?;
-    }
-    let _machine = Machine;
-    unsafe {
-        hv(
-            hv_vm_map(memory.0.cast(), IPA, memory.1, 7),
-            "map partial backing",
-        )?;
-    }
+    memory.write_record(COORD_OFFSET, Coordinator::new(n).unwrap());
+    memory.write_record(p::COMMON_OFFSET, p::Common::new(config).unwrap());
+    let _machine = Machine::create(&memory)?;
     let execution = run_owners(
         n,
         shadow::TCR_BOTH,

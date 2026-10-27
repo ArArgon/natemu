@@ -132,7 +132,7 @@ pub(super) fn modes_json(state: &modes::State) -> String {
     format!("{{{}}}", fields.join(","))
 }
 fn read_state(memory: &Memory) -> control::State {
-    unsafe { ptr::read_volatile(memory.0.add(control::OFFSET).cast()) }
+    memory.read_record(control::OFFSET)
 }
 pub fn run(args: &[String]) -> Result<()> {
     if args[5] != "1" {
@@ -141,12 +141,9 @@ pub fn run(args: &[String]) -> Result<()> {
     let profile: u64 = args[4].parse().map_err(|_| "invalid control profile")?;
     let (program, program_len) = control::source(profile).ok_or("unsupported control profile")?;
     let cpl = if profile == 6 { 3 } else { 0 };
-    let mut vm_nonce = 0u64;
-    if unsafe { getentropy((&mut vm_nonce as *mut u64).cast(), 8) } != 0 || vm_nonce == 0 {
-        return Err("unable to generate control VM identity".into());
-    }
+    let vm_nonce = new_vm_nonce()?;
     let memory = Memory::new()?;
-    load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
+    load_resident(&memory, &args[1])?;
     i4v::prepare_shadow(&memory);
     for offset in (control::RECORD_OFFSET..0x90000).step_by(4096) {
         memory.word(
@@ -237,7 +234,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut object = Object::new(LIVE_LOAD);
     object.code_length = CODE_BYTES as u64;
     let shared = Shared {
-            schedule: 0,
+        schedule: 0,
         object,
         initial: frame,
         captured: NativeFrame::ZERO,
@@ -258,29 +255,15 @@ pub fn run(args: &[String]) -> Result<()> {
     };
     let code_before = memory.read::<CODE_BYTES>(CODE_OFFSET);
     let lower_leaf_before = i4v::words(&memory, shadow::LOWER_LEAF);
-    unsafe {
-        ptr::write(memory.0.add(recover::GUEST_OFFSET).cast(), guest);
-        ptr::write(memory.0.add(recover::STATE_OFFSET).cast(), recovery_state);
-        ptr::write(
-            memory.0.add(validation::STATE_OFFSET).cast(),
-            validation_state,
-        );
-        ptr::write(memory.0.add(control::OFFSET).cast(), state);
-        ptr::write(memory.0.add(pae::OFFSET).cast(), pae::State::ZERO);
-        ptr::write(memory.0.add(modes::OFFSET).cast(), mode_state);
-        ptr::write(memory.0.add(SHARED_OFFSET).cast(), shared);
-        sys_icache_invalidate(memory.0.cast(), RAM_SIZE);
-    }
+    memory.write_record(recover::GUEST_OFFSET, guest);
+    memory.write_record(recover::STATE_OFFSET, recovery_state);
+    memory.write_record(validation::STATE_OFFSET, validation_state);
+    memory.write_record(control::OFFSET, state);
+    memory.write_record(pae::OFFSET, pae::State::ZERO);
+    memory.write_record(modes::OFFSET, mode_state);
+    memory.write_record(SHARED_OFFSET, shared);
     let vm = Vm::new(memory)?;
-    vm.reg(31, IPA)?;
-    vm.reg(34, 0x3c5)?;
-    vm.reg(0, IPA + shadow::LOWER_ROOT as u64)?;
-    vm.reg(1, shadow::TCR_BOTH)?;
-    vm.reg(2, 0xff)?;
-    vm.sys(0xc080, 0x30d00980)?;
-    vm.sys(0xc081, 2)?;
-    vm.sys(0xc082, 3 << 20)?;
-    vm.sys(0xdf19, 0)?;
+    vm.cpu.enter_resident(0, shadow::TCR_BOTH)?;
     let output = PathBuf::from(&args[7]);
     fs::create_dir(&output).map_err(|e| e.to_string())?;
     let mut compiler =
@@ -290,7 +273,7 @@ pub fn run(args: &[String]) -> Result<()> {
         if started.elapsed() > Duration::from_secs(110) {
             return Err("control compiler service deadline exceeded".into());
         }
-        let event = vm.run_any()?;
+        let event = vm.cpu.run_to_hvc()?;
         if event == 0x49 {
             break;
         }
@@ -299,59 +282,42 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         let shared = vm.shared();
         if !natemu_abi::resident::contains(shared.service_pc, 4)
-            || vm.read_reg(31)? != shared.service_pc
+            || vm.cpu.reg(PC)? != shared.service_pc
         {
             return Err("control service outside resident boundary".into());
         }
         let mut packet = [0; 16];
         for (i, word) in packet.iter_mut().enumerate() {
-            *word = vm.read_reg(i as u32)?;
+            *word = vm.cpu.reg(i as u32)?;
         }
         if packet != read_state(&vm.memory).expected {
             return Err("control service request differs from stored identity".into());
         }
         let reply = compiler.exchange(packet)?;
         for (i, word) in reply.into_iter().enumerate() {
-            vm.reg(i as u32, word)?;
+            vm.cpu.set_reg(i as u32, word)?;
         }
     }
-    let pae_state =
-        unsafe { ptr::read_volatile(vm.memory.0.add(pae::OFFSET).cast::<pae::State>()) };
-    let mode_state =
-        unsafe { ptr::read_volatile(vm.memory.0.add(modes::OFFSET).cast::<modes::State>()) };
+    let pae_state = vm.memory.read_record::<pae::State>(pae::OFFSET);
+    let mode_state = vm.memory.read_record::<modes::State>(modes::OFFSET);
     let result = vm.shared();
     let state = read_state(&vm.memory);
-    let v = unsafe {
-        ptr::read_volatile(
-            vm.memory
-                .0
-                .add(validation::STATE_OFFSET)
-                .cast::<validation::State>(),
-        )
-    };
-    let guest_after = unsafe {
-        ptr::read_volatile(
-            vm.memory
-                .0
-                .add(recover::GUEST_OFFSET)
-                .cast::<recover::GuestState>(),
-        )
-    };
+    let v = vm
+        .memory
+        .read_record::<validation::State>(validation::STATE_OFFSET);
+    let guest_after = vm
+        .memory
+        .read_record::<recover::GuestState>(recover::GUEST_OFFSET);
     let visits = (0..control::MAX_VISITS)
         .map(|i| {
-            let visit = unsafe {
-                ptr::read_volatile(
-                    vm.memory
-                        .0
-                        .add(control::RECORD_OFFSET + i * core::mem::size_of::<control::Visit>())
-                        .cast::<control::Visit>(),
-                )
-            };
+            let visit = vm.memory.read_record::<control::Visit>(
+                control::RECORD_OFFSET + i * core::mem::size_of::<control::Visit>(),
+            );
             visit_json(&visit)
         })
         .collect::<Vec<_>>()
         .join(",");
-    let ttbr1 = vm.read_sys(0xc101)?;
+    let ttbr1 = vm.cpu.sys(0xc101)?;
     let mut report = fields!(result; status,detail,current_el,sctlr,actlr,tcr,service_pc,capture_pc,esr,far,elr,spsr);
     report.extend(fields!(v; live,requests,request,reply,completed,operand,width,stage));
     macro_rules! add {

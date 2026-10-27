@@ -79,14 +79,9 @@ pub fn run(args: &[String]) -> Result<()> {
         native[..BODY.len()].copy_from_slice(&body);
         native[BODY.len()..].copy_from_slice(&RET);
     }
-    let mut vm_nonce = 0u64;
-    if live {
-        if unsafe { getentropy((&mut vm_nonce as *mut u64).cast(), 8) } != 0 || vm_nonce == 0 {
-            return Err("unable to generate live VM identity".into());
-        }
-    }
+    let vm_nonce = if live { new_vm_nonce()? } else { 0 };
     let memory = Memory::new()?;
-    load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
+    load_resident(&memory, &args[1])?;
     prepare_shadow(&memory);
     memory.copy(CODE_OFFSET, &native);
     memory.copy(recover::SOURCE_OFFSET, &[0x48, 0x8b, 0x03]);
@@ -147,45 +142,22 @@ pub fn run(args: &[String]) -> Result<()> {
     let upper_links_before = upper_links(&memory);
     let lower_data_leaf_before = word(&memory, shadow::LOWER_LEAF + 256 * 8);
     let code_before = memory.read::<12>(CODE_OFFSET);
-    unsafe {
-        ptr::write(
-            memory
-                .0
-                .add(recover::GUEST_OFFSET)
-                .cast::<recover::GuestState>(),
-            guest,
-        );
-        ptr::write(
-            memory
-                .0
-                .add(validation::STATE_OFFSET)
-                .cast::<validation::State>(),
-            state,
-        );
-        ptr::write(memory.0.add(SHARED_OFFSET).cast::<Shared>(), shared);
-        sys_icache_invalidate(memory.0.cast(), RAM_SIZE);
-    }
+    memory.write_record(recover::GUEST_OFFSET, guest);
+    memory.write_record(validation::STATE_OFFSET, state);
+    memory.write_record(SHARED_OFFSET, shared);
     let vm = Vm::new(memory)?;
-    vm.reg(31, IPA)?;
-    vm.reg(34, 0x3c5)?;
-    vm.reg(0, IPA + shadow::LOWER_ROOT as u64)?;
-    vm.reg(1, shadow::TCR_BOTH)?;
-    vm.reg(2, 0xff)?;
-    vm.sys(0xc080, 0x30d00980)?;
-    vm.sys(0xc081, 2)?;
-    vm.sys(0xc082, 3 << 20)?;
-    vm.sys(0xdf19, 0)?;
-    let event = vm.run_any()?;
+    vm.cpu.enter_resident(0, shadow::TCR_BOTH)?;
+    let event = vm.cpu.run_to_hvc()?;
     if live && event == 0x4a {
         let resident = vm.shared();
         if !natemu_abi::resident::contains(resident.service_pc, 4)
-            || vm.read_reg(31)? != resident.service_pc
+            || vm.cpu.reg(PC)? != resident.service_pc
         {
             return Err("I4-V request did not exit at the resident service PC".into());
         }
         let mut request = [0; 16];
         for (index, value) in request.iter_mut().enumerate() {
-            *value = vm.read_reg(index as u32)?;
+            *value = vm.cpu.reg(index as u32)?;
         }
         if request != validation::request(vm_nonce, rip) {
             return Err("I4-V resident request differs from the expected identity/source".into());
@@ -199,22 +171,17 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         // At the explicit service boundary only registers transfer ownership.
         for (index, value) in reply.into_iter().enumerate() {
-            vm.reg(index as u32, value)?;
+            vm.cpu.set_reg(index as u32, value)?;
         }
         vm.run(0x49)?;
     } else if event != 0x49 {
         return Err(format!("unexpected I4-V HVC immediate {event:#x}"));
     }
     let result = vm.shared();
-    let final_state = unsafe {
-        ptr::read_volatile(
-            vm.memory
-                .0
-                .add(validation::STATE_OFFSET)
-                .cast::<validation::State>(),
-        )
-    };
-    let ttbr1 = vm.read_sys(0xc101)?;
+    let final_state = vm
+        .memory
+        .read_record::<validation::State>(validation::STATE_OFFSET);
+    let ttbr1 = vm.cpu.sys(0xc101)?;
     let live = u64::from(live);
     let requests = final_state.requests;
     let request = final_state.request;

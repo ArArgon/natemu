@@ -134,7 +134,7 @@ impl Session {
     fn event(&mut self, expected: u64) -> Result<wire::Packet> {
         self.vm.run(0x4a)?;
         let s = self.vm.shared();
-        let pc = self.vm.read_reg(31)?;
+        let pc = self.vm.cpu.reg(PC)?;
         if !resident::contains(s.service_pc, 4) || pc != s.service_pc {
             return Err(format!(
                 "not at transfer service: PC={pc:#x} expected={:#x}",
@@ -143,7 +143,7 @@ impl Session {
         }
         let mut p = [0; 16];
         for (i, v) in p.iter_mut().enumerate() {
-            *v = self.vm.read_reg(i as u32)?;
+            *v = self.vm.cpu.reg(i as u32)?;
         }
         if p != s.lifecycle.packet() || p[0] != expected {
             return Err(format!(
@@ -164,7 +164,7 @@ impl Session {
     fn send(&mut self, packet: wire::Packet, expected: u64) -> Result<wire::Packet> {
         // Only event() reaches this explicit service PC; never write mapped RAM.
         for (i, &v) in packet.iter().enumerate() {
-            self.vm.reg(i as u32, v)?;
+            self.vm.cpu.set_reg(i as u32, v)?;
         }
         self.event(expected)
     }
@@ -299,7 +299,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let output = Path::new(&args[6]).to_path_buf();
     fs::create_dir(&output).map_err(|e| e.to_string())?;
     let memory = Memory::new()?;
-    load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
+    load_resident(&memory, &args[1])?;
     page_tables(&memory);
     let (mut initial, bank, data) = seed(match scenario {
         "carry" => 1,
@@ -317,10 +317,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     memory.copy(BANK_OFFSET, &bank);
     memory.copy(DATA_OFFSET, &data);
-    let mut cookie = 0u64;
-    if unsafe { getentropy((&mut cookie as *mut u64).cast(), 8) } != 0 || cookie == 0 {
-        return Err("VM incarnation entropy unavailable".into());
-    }
+    let cookie = new_vm_nonce()?;
     let paging_before = if i3 {
         Some(super::recovery::prepare(
             &memory, &initial, scenario, allocated,
@@ -366,24 +363,10 @@ pub fn run(args: &[String]) -> Result<()> {
         },
         lifecycle: wire::Lifecycle::new(cookie),
     };
-    unsafe {
-        ptr::write(memory.0.add(SHARED_OFFSET).cast::<Shared>(), shared);
-        sys_icache_invalidate(memory.0.cast(), RAM_SIZE);
-    }
+    memory.write_record(SHARED_OFFSET, shared);
     let vm = Vm::new(memory)?;
-    if (vm.read_sys(0xc030)? >> 52) & 15 == 0 {
-        return Err("FlagM required".into());
-    }
-    let tcr = 16 | 1 << 8 | 1 << 10 | 3 << 12 | 1 << 23 | 2 << 32;
-    vm.reg(31, IPA)?;
-    vm.reg(34, 0x3c5)?;
-    vm.reg(0, IPA + 0x10000)?;
-    vm.reg(1, tcr)?;
-    vm.reg(2, 0xff)?;
-    vm.sys(0xc080, 0x30d00980)?;
-    vm.sys(0xc081, 2)?;
-    vm.sys(0xc082, 3 << 20)?;
-    vm.sys(0xdf19, 0)?;
+    let tcr = SINGLE_ROOT_TCR;
+    vm.cpu.enter_resident(0, tcr)?;
     let mut session = Session {
         vm,
         initial,
@@ -485,7 +468,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     let p = wire::command(wire::SHUTDOWN);
     for (i, &v) in p.iter().enumerate() {
-        session.vm.reg(i as u32, v)?;
+        session.vm.cpu.set_reg(i as u32, v)?;
     }
     session.vm.run(0x49)?;
     let s = session.vm.shared();

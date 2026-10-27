@@ -61,25 +61,21 @@ pub(super) fn prepare_owner(memory: &Memory, id: usize) {
             (IPA + offset as u64) | attrs,
         );
     }
-    unsafe {
-        ptr::write(memory.0.add(base + b::OWNER_OFFSET).cast(), b::Owner::ZERO);
-    }
+    memory.write_record(base + b::OWNER_OFFSET, b::Owner::ZERO);
     memory.word(base + b::ENABLE_OFFSET, 1);
 }
 pub(super) fn prepare_shared(memory: &Memory, config: &Config, n: usize) {
-    unsafe {
-        ptr::write(
-            memory.0.add(b::SHARED_OFFSET).cast(),
-            b::Shared::new(n, config.profile, config.actor).unwrap(),
-        );
-    }
+    memory.write_record(
+        b::SHARED_OFFSET,
+        b::Shared::new(n, config.profile, config.actor).unwrap(),
+    );
 }
 pub(super) fn shared(memory: &Memory) -> &b::Shared {
     // Called only after every owner has joined.
     unsafe { &*memory.0.add(b::SHARED_OFFSET).cast() }
 }
 pub(super) fn owner(memory: &Memory, id: usize) -> b::Owner {
-    unsafe { ptr::read(memory.0.add(id * RAM_SIZE + b::OWNER_OFFSET).cast()) }
+    memory.read_record(id * RAM_SIZE + b::OWNER_OFFSET)
 }
 macro_rules! fields {
     ($record:ident; $($field:ident),* $(,)?) => {{
@@ -99,9 +95,8 @@ fn shared_json(s: &b::Shared) -> String {
 fn owner_json(memory: &Memory, id: usize) -> String {
     let o = owner(memory, id);
     let base = id * RAM_SIZE;
-    let final_state: Shared = unsafe { ptr::read(memory.0.add(base + SHARED_OFFSET).cast()) };
-    let final_guest: recover::GuestState =
-        unsafe { ptr::read(memory.0.add(base + recover::GUEST_OFFSET).cast()) };
+    let final_state: Shared = memory.read_record(base + SHARED_OFFSET);
+    let final_guest: recover::GuestState = memory.read_record(base + recover::GUEST_OFFSET);
     let mut f = fields!(o; lower_before,upper_before,entries,completed,step,esr,far,pc,spsr,
         faults,vector,error,address,rip,saved_page,saved_writable,native_pair_before,
         native_pair_after,service_attempts,service_completed,service_pc,service_resume_pc,

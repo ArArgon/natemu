@@ -108,12 +108,9 @@ pub fn run(args: &[String]) -> Result<()> {
         args[5].parse()
     }
     .map_err(|_| "invalid stack RIP")?;
-    let mut vm_nonce = 0u64;
-    if unsafe { getentropy((&mut vm_nonce as *mut u64).cast(), 8) } != 0 || vm_nonce == 0 {
-        return Err("unable to generate stack VM identity".into());
-    }
+    let vm_nonce = new_vm_nonce()?;
     let memory = Memory::new()?;
-    load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
+    load_resident(&memory, &args[1])?;
     i4v::prepare_shadow(&memory);
     memory.word(shadow::LOWER_LEAF + 257 * 8, 0);
     memory.copy(recover::SOURCE_OFFSET, &stack::SOURCE);
@@ -137,14 +134,7 @@ pub fn run(args: &[String]) -> Result<()> {
     guest.rip = rip;
     guest.gpr[4] = frame.x[8];
     memory.word(recover::TABLE_OFFSET + 256 * 8, 0x2007);
-    let mut recovery_state = unsafe {
-        ptr::read(
-            memory
-                .0
-                .add(recover::STATE_OFFSET)
-                .cast::<recover::Recovery>(),
-        )
-    };
+    let mut recovery_state = memory.read_record::<recover::Recovery>(recover::STATE_OFFSET);
     let leaf = |index: usize| recover::TABLE_OFFSET + 0x3000 + index * 8;
     match scenario {
         "ro_first" => memory.word(leaf(257), (DATA_VA + 4096) | 5),
@@ -211,46 +201,14 @@ pub fn run(args: &[String]) -> Result<()> {
     let lower_leaf_before = i4v::words(&memory, shadow::LOWER_LEAF);
     let upper_links_before = i4v::upper_links(&memory);
     let code_before = memory.read::<{ stack::CODE_BYTES }>(CODE_OFFSET);
-    unsafe {
-        ptr::write(
-            memory
-                .0
-                .add(recover::GUEST_OFFSET)
-                .cast::<recover::GuestState>(),
-            guest,
-        );
-        ptr::write(
-            memory
-                .0
-                .add(recover::STATE_OFFSET)
-                .cast::<recover::Recovery>(),
-            recovery_state,
-        );
-        ptr::write(
-            memory
-                .0
-                .add(validation::STATE_OFFSET)
-                .cast::<validation::State>(),
-            state,
-        );
-        ptr::write(
-            memory.0.add(stack::STATE_OFFSET).cast::<stack::State>(),
-            stack::State::ZERO,
-        );
-        ptr::write(memory.0.add(SHARED_OFFSET).cast::<Shared>(), shared);
-        sys_icache_invalidate(memory.0.cast(), RAM_SIZE);
-    }
+    memory.write_record(recover::GUEST_OFFSET, guest);
+    memory.write_record(recover::STATE_OFFSET, recovery_state);
+    memory.write_record(validation::STATE_OFFSET, state);
+    memory.write_record(stack::STATE_OFFSET, stack::State::ZERO);
+    memory.write_record(SHARED_OFFSET, shared);
     let vm = Vm::new(memory)?;
-    vm.reg(31, IPA)?;
-    vm.reg(34, 0x3c5)?;
-    vm.reg(0, IPA + shadow::LOWER_ROOT as u64)?;
-    vm.reg(1, shadow::TCR_BOTH)?;
-    vm.reg(2, 0xff)?;
-    vm.sys(0xc080, 0x30d00980)?;
-    vm.sys(0xc081, 2)?;
-    vm.sys(0xc082, 3 << 20)?;
-    vm.sys(0xdf19, 0)?;
-    let mut event = vm.run_any()?;
+    vm.cpu.enter_resident(0, shadow::TCR_BOTH)?;
+    let mut event = vm.cpu.run_to_hvc()?;
     let mut directory = None;
     for chunk in 0..3 {
         if event == 0x49 && chunk == 0 {
@@ -261,13 +219,13 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         let resident = vm.shared();
         if !natemu_abi::resident::contains(resident.service_pc, 4)
-            || vm.read_reg(31)? != resident.service_pc
+            || vm.cpu.reg(PC)? != resident.service_pc
         {
             return Err("stack request outside service boundary".into());
         }
         let mut request = [0; 16];
         for (i, word) in request.iter_mut().enumerate() {
-            *word = vm.read_reg(i as u32)?;
+            *word = vm.cpu.reg(i as u32)?;
         }
         if request != stack::request(vm_nonce, rip, chunk) {
             return Err("stack request changes compile identity/chunk order".into());
@@ -294,9 +252,9 @@ pub fn run(args: &[String]) -> Result<()> {
             &reply,
         )?;
         for (i, word) in reply.into_iter().enumerate() {
-            vm.reg(i as u32, word)?;
+            vm.cpu.set_reg(i as u32, word)?;
         }
-        event = vm.run_any()?;
+        event = vm.cpu.run_to_hvc()?;
         if mutation >= 0 && mutation as u64 / 16 == chunk {
             if event != 0x49 {
                 return Err("mutated stack reply did not terminate".into());
@@ -308,23 +266,17 @@ pub fn run(args: &[String]) -> Result<()> {
         return Err("stack execution did not reach terminal HVC".into());
     }
     let result = vm.shared();
-    let final_state = unsafe {
-        ptr::read_volatile(
-            vm.memory
-                .0
-                .add(validation::STATE_OFFSET)
-                .cast::<validation::State>(),
-        )
-    };
-    let stack_state =
-        unsafe { ptr::read_volatile(vm.memory.0.add(stack::STATE_OFFSET).cast::<stack::State>()) };
+    let final_state = vm
+        .memory
+        .read_record::<validation::State>(validation::STATE_OFFSET);
+    let stack_state = vm.memory.read_record::<stack::State>(stack::STATE_OFFSET);
     let prefixes = stack_state
         .prefixes
         .iter()
         .map(frame_json)
         .collect::<Vec<_>>()
         .join(",");
-    let ttbr1 = vm.read_sys(0xc101)?;
+    let ttbr1 = vm.cpu.sys(0xc101)?;
     let code_after = vm.memory.read::<{ stack::CODE_BYTES }>(CODE_OFFSET);
     let memory_after = vm.memory.read::<8192>(DATA_OFFSET);
     let body_hex = stack::BODY

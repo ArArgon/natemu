@@ -36,12 +36,9 @@ pub fn run(args: &[String]) -> Result<()> {
     .position(|name| *name == scenario)
     .ok_or("unknown instruction scenario")? as u64;
     let rip = 0x2000;
-    let mut vm_nonce = 0u64;
-    if unsafe { getentropy((&mut vm_nonce as *mut u64).cast(), 8) } != 0 || vm_nonce == 0 {
-        return Err("unable to generate paging-off VM identity".into());
-    }
+    let vm_nonce = new_vm_nonce()?;
     let memory = Memory::new()?;
-    load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
+    load_resident(&memory, &args[1])?;
     i4v::prepare_shadow(&memory);
     let mut source_a = [0xcc; 4096];
     let mut source_b = [0x33; 4096];
@@ -117,7 +114,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut object = Object::new(LIVE_LOAD);
     object.code_length = off::CODE_BYTES as u64;
     let shared = Shared {
-            schedule: 0,
+        schedule: 0,
         object,
         initial: frame,
         captured: NativeFrame::ZERO,
@@ -146,46 +143,14 @@ pub fn run(args: &[String]) -> Result<()> {
     step_state.profile = scenario_id;
     step_state.a20 = u64::from(scenario_id != 1);
     step_state.device_value = 0x12345678;
-    unsafe {
-        ptr::write(
-            memory
-                .0
-                .add(recover::GUEST_OFFSET)
-                .cast::<recover::GuestState>(),
-            guest,
-        );
-        ptr::write(
-            memory
-                .0
-                .add(recover::STATE_OFFSET)
-                .cast::<recover::Recovery>(),
-            recovery_state,
-        );
-        ptr::write(
-            memory
-                .0
-                .add(validation::STATE_OFFSET)
-                .cast::<validation::State>(),
-            state,
-        );
-        ptr::write(
-            memory.0.add(off::STATE_OFFSET).cast::<off::State>(),
-            step_state,
-        );
-        ptr::write(memory.0.add(SHARED_OFFSET).cast::<Shared>(), shared);
-        sys_icache_invalidate(memory.0.cast(), RAM_SIZE);
-    }
+    memory.write_record(recover::GUEST_OFFSET, guest);
+    memory.write_record(recover::STATE_OFFSET, recovery_state);
+    memory.write_record(validation::STATE_OFFSET, state);
+    memory.write_record(off::STATE_OFFSET, step_state);
+    memory.write_record(SHARED_OFFSET, shared);
     let vm = Vm::new(memory)?;
-    vm.reg(31, IPA)?;
-    vm.reg(34, 0x3c5)?;
-    vm.reg(0, IPA + shadow::LOWER_ROOT as u64)?;
-    vm.reg(1, shadow::TCR_BOTH)?;
-    vm.reg(2, 0xff)?;
-    vm.sys(0xc080, 0x30d00980)?;
-    vm.sys(0xc081, 2)?;
-    vm.sys(0xc082, 3 << 20)?;
-    vm.sys(0xdf19, 0)?;
-    let mut event = vm.run_any()?;
+    vm.cpu.enter_resident(0, shadow::TCR_BOTH)?;
+    let mut event = vm.cpu.run_to_hvc()?;
     for step in 0..9 {
         if event == 0x49 {
             break;
@@ -195,13 +160,13 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         let resident = vm.shared();
         if !natemu_abi::resident::contains(resident.service_pc, 4)
-            || vm.read_reg(31)? != resident.service_pc
+            || vm.cpu.reg(PC)? != resident.service_pc
         {
             return Err("instruction request outside service boundary".into());
         }
         let mut request = [0; 16];
         for (i, word) in request.iter_mut().enumerate() {
-            *word = vm.read_reg(i as u32)?;
+            *word = vm.cpu.reg(i as u32)?;
         }
         if Some(request) != off::request(vm_nonce, scenario_id, step) {
             return Err("instruction request changes stored profile/source/addresses/order".into());
@@ -224,9 +189,9 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         write_packet(&directory.join("reply-delivered.bin"), &reply)?;
         for (i, word) in reply.into_iter().enumerate() {
-            vm.reg(i as u32, word)?;
+            vm.cpu.set_reg(i as u32, word)?;
         }
-        event = vm.run_any()?;
+        event = vm.cpu.run_to_hvc()?;
         if flip.is_some() {
             if event != 0x49 {
                 return Err("mutated instruction reply did not terminate".into());
@@ -238,17 +203,11 @@ pub fn run(args: &[String]) -> Result<()> {
         return Err("instruction execution did not reach terminal HVC".into());
     }
     let result = vm.shared();
-    let final_state = unsafe {
-        ptr::read_volatile(
-            vm.memory
-                .0
-                .add(validation::STATE_OFFSET)
-                .cast::<validation::State>(),
-        )
-    };
-    let steps =
-        unsafe { ptr::read_volatile(vm.memory.0.add(off::STATE_OFFSET).cast::<off::State>()) };
-    let ttbr1 = vm.read_sys(0xc101)?;
+    let final_state = vm
+        .memory
+        .read_record::<validation::State>(validation::STATE_OFFSET);
+    let steps = vm.memory.read_record::<off::State>(off::STATE_OFFSET);
+    let ttbr1 = vm.cpu.sys(0xc101)?;
     let code_after = vm.memory.read::<{ off::CODE_BYTES }>(CODE_OFFSET);
     let data_pages_after = [
         vm.memory.read::<4096>(0x70000),

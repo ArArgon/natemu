@@ -169,22 +169,10 @@ pub fn run(args: &[String]) -> Result<()> {
     let actor = args[6].parse().map_err(|_| "invalid coherence actor")?;
     let config =
         c::Config::new(n as u64, profile, actor).ok_or("unsupported coherence configuration")?;
-    let mut limit = 0;
-    unsafe {
-        hv(
-            hv_vm_get_max_vcpu_count(&mut limit),
-            "read coherence vCPU limit",
-        )?;
-    }
-    if n > limit as usize {
-        return Err("coherence count exceeds host limit".into());
-    }
+    require_vcpus(n)?;
     let memory = Memory::with_size((n + 1) * RAM_SIZE)?;
-    load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
-    let mut vm = 0u64;
-    if unsafe { getentropy((&mut vm as *mut u64).cast(), 8) } != 0 || vm == 0 {
-        return Err("unable to generate coherence VM identity".into());
-    }
+    load_resident(&memory, &args[1])?;
+    let vm = new_vm_nonce()?;
     let mut banks = Vec::new();
     let mut code_before = Vec::new();
     let mut native_before = Vec::new();
@@ -192,11 +180,7 @@ pub fn run(args: &[String]) -> Result<()> {
     for id in 0..n {
         let base = id * RAM_SIZE;
         if id != 0 {
-            for offset in (0..RAM_SIZE).step_by(4096) {
-                if resident::executable_offset(offset) {
-                    memory.copy(base + offset, &memory.read::<4096>(offset));
-                }
-            }
+            memory.replicate_resident_text(base);
         }
         owner_mappings(&memory, id, n);
         let (frame, mut bank, _) = seed(id);
@@ -235,10 +219,8 @@ pub fn run(args: &[String]) -> Result<()> {
         owner.guest_before = config.guest(&frame);
         owner.guest_before.rip = c::RIP + id as u64 * 256;
         owner.guest_after = owner.guest_before;
-        unsafe {
-            ptr::write(memory.0.add(base + SHARED_OFFSET).cast(), shared);
-            ptr::write(memory.0.add(base + c::OWNER_OFFSET).cast(), owner);
-        }
+        memory.write_record(base + SHARED_OFFSET, shared);
+        memory.write_record(base + c::OWNER_OFFSET, owner);
         for kind in 0..2 {
             let offset = id * 256 + kind * 16;
             source_before[offset..offset + 2].copy_from_slice(&c::source(kind).unwrap());
@@ -253,28 +235,10 @@ pub fn run(args: &[String]) -> Result<()> {
     memory.copy(c::RAM_OFFSET, &data_before);
     memory.copy(c::RAM_OFFSET + c::DATA_BYTES, &source_before);
     memory.copy(c::TABLE_OFFSET, &tables_before);
-    unsafe {
-        ptr::write(
-            memory.0.add(COORD_OFFSET).cast(),
-            Coordinator::new(n).unwrap(),
-        );
-        ptr::write(
-            memory.0.add(c::COMMON_OFFSET).cast(),
-            c::Common::new(config),
-        );
-    }
+    memory.write_record(COORD_OFFSET, Coordinator::new(n).unwrap());
+    memory.write_record(c::COMMON_OFFSET, c::Common::new(config));
     fs::create_dir(&args[8]).map_err(|e| e.to_string())?;
-    unsafe {
-        sys_icache_invalidate(memory.0.cast(), memory.1);
-        hv(hv_vm_create(ptr::null()), "create coherence VM")?;
-    }
-    let _machine = Machine;
-    unsafe {
-        hv(
-            hv_vm_map(memory.0.cast(), IPA, memory.1, 7),
-            "map coherence backing",
-        )?;
-    }
+    let _machine = Machine::create(&memory)?;
     let execution = run_owners(
         n,
         shadow::TCR_BOTH,

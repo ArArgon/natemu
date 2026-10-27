@@ -19,9 +19,6 @@ fn image_bytes() -> usize {
         o::IMAGE_BYTES
     }
 }
-fn record<T: Copy>(memory: &Memory, offset: usize) -> T {
-    unsafe { ptr::read_volatile(memory.0.add(offset).cast()) }
-}
 pub(super) fn owner_mappings(memory: &Memory, id: usize, n: usize) {
     let base = id * RAM_SIZE;
     tables(memory, base, false);
@@ -81,7 +78,7 @@ fn trial_json(s: &o::Trial) -> String {
 }
 fn owner_json(memory: &Memory, id: usize, bank: &[u8; 512], requests: &[wire::Packet]) -> String {
     let base = id * RAM_SIZE;
-    let s: Shared = record(memory, base + SHARED_OFFSET);
+    let s: Shared = memory.read_record(base + SHARED_OFFSET);
     let owner = unsafe { &*memory.0.add(base + o::OWNER_OFFSET).cast::<o::Owner>() };
     let mut f = fields!(owner; id,variant,trial,completed,expected,request,reply,walks,table_reads,table_writes,routes,code,code_length,isar0);
     f.extend(fields!(s; status,detail,current_el,sctlr,actlr,tcr,capture_pc,service_pc));
@@ -94,10 +91,9 @@ fn owner_json(memory: &Memory, id: usize, bank: &[u8; 512], requests: &[wire::Pa
     f.push(format!("\"bank_before\":{bank:?},\"bank_after\":{:?},\"published_code\":{:?},\"final_native_leaf\":{:?},\"compiler_requests\":{:?}",memory.read::<512>(base+BANK_OFFSET),memory.read::<{o::CODE_BYTES}>(base+CODE_OFFSET),i4v::words(memory,base+shadow::LOWER_LEAF),requests.iter().filter(|p|p[3]==id as u64).collect::<Vec<_>>()));
     let trials = (0..o::TRIALS)
         .map(|i| {
-            trial_json(&record(
-                memory,
-                base + o::RECORD_OFFSET + i * core::mem::size_of::<o::Trial>(),
-            ))
+            trial_json(
+                &memory.read_record(base + o::RECORD_OFFSET + i * core::mem::size_of::<o::Trial>()),
+            )
         })
         .collect::<Vec<_>>()
         .join(",");
@@ -150,32 +146,16 @@ pub fn run(args: &[String]) -> Result<()> {
     let trial_seed = args[7].parse().map_err(|_| "invalid ordering seed")?;
     let config = o::Config::new(n as u64, profile, rotation, trial_seed)
         .ok_or("unsupported ordering configuration")?;
-    let mut host_limit = 0;
-    unsafe {
-        hv(
-            hv_vm_get_max_vcpu_count(&mut host_limit),
-            "read ordering vCPU limit",
-        )?;
-    }
-    if n > host_limit as usize {
-        return Err("ordering count exceeds host vCPU limit".into());
-    }
+    require_vcpus(n)?;
     let memory = Memory::with_size((n + 1) * RAM_SIZE)?;
-    load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
-    let mut vm_nonce = 0u64;
-    if unsafe { getentropy((&mut vm_nonce as *mut u64).cast(), 8) } != 0 || vm_nonce == 0 {
-        return Err("unable to generate ordering VM identity".into());
-    }
+    load_resident(&memory, &args[1])?;
+    let vm_nonce = new_vm_nonce()?;
     let mut banks = Vec::new();
     let mut source_before = [0xcc; 4096];
     for id in 0..n {
         let base = id * RAM_SIZE;
         if id != 0 {
-            for offset in (0..RAM_SIZE).step_by(4096) {
-                if resident::executable_offset(offset) {
-                    memory.copy(base + offset, &memory.read::<4096>(offset));
-                }
-            }
+            memory.replicate_resident_text(base);
         }
         owner_mappings(&memory, id, n);
         let (mut frame, mut bank, _) = seed(id);
@@ -216,10 +196,8 @@ pub fn run(args: &[String]) -> Result<()> {
         owner.id = id as u64;
         owner.variant = config.variant(id as u64) as u64;
         owner.initial = frame;
-        unsafe {
-            ptr::write(memory.0.add(base + SHARED_OFFSET).cast(), shared);
-            ptr::write(memory.0.add(base + o::OWNER_OFFSET).cast(), owner);
-        }
+        memory.write_record(base + SHARED_OFFSET, shared);
+        memory.write_record(base + o::OWNER_OFFSET, owner);
         let bytes = o::source(config.variant(id as u64)).unwrap();
         source_before[id * 256..id * 256 + bytes.len()].copy_from_slice(bytes);
         banks.push(bank);
@@ -227,12 +205,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let tables_before = guest_tables();
     memory.copy(o::RAM_OFFSET + 8192, &source_before);
     memory.copy(o::TABLE_OFFSET, &tables_before);
-    unsafe {
-        ptr::write(
-            memory.0.add(o::COMMON_OFFSET).cast(),
-            o::Common::new(config),
-        );
-    }
+    memory.write_record(o::COMMON_OFFSET, o::Common::new(config));
     if let Some(scheduled) = atomic_config() {
         if profile != 9 || rotation != scheduled.actor || scheduled.n != n as u64 {
             return Err("atomic progress fixture mismatch".into());
@@ -260,25 +233,13 @@ pub fn run(args: &[String]) -> Result<()> {
                 );
             }
         }
-        unsafe {
-            ptr::write(
-                memory.0.add(supplemental).cast(),
-                a::State::new(scheduled, &frames).ok_or("atomic state admission")?,
-            );
-        }
+        memory.write_record(
+            supplemental,
+            a::State::new(scheduled, &frames).ok_or("atomic state admission")?,
+        );
     }
     fs::create_dir(&args[9]).map_err(|e| e.to_string())?;
-    unsafe {
-        sys_icache_invalidate(memory.0.cast(), memory.1);
-        hv(hv_vm_create(ptr::null()), "create ordering VM")?;
-    }
-    let _machine = Machine;
-    unsafe {
-        hv(
-            hv_vm_map(memory.0.cast(), IPA, memory.1, 7),
-            "map ordering backing",
-        )?;
-    }
+    let _machine = Machine::create(&memory)?;
     let execution = run_owners(
         n,
         shadow::TCR_BOTH,
@@ -346,7 +307,7 @@ pub fn run(args: &[String]) -> Result<()> {
     );
     execution?;
     for id in 0..n {
-        let s: Shared = record(&memory, id * RAM_SIZE + SHARED_OFFSET);
+        let s: Shared = memory.read_record(id * RAM_SIZE + SHARED_OFFSET);
         if s.status != SUCCESS
             || s.current_el != 4
             || s.sctlr & 0x1005 != 0x1005

@@ -7,9 +7,6 @@ macro_rules! fields {
         $(out.push(format!("\"{}\":{:?}", stringify!($field), $s.$field));)* out
     }};
 }
-fn record<T: Copy>(memory: &Memory, offset: usize) -> T {
-    unsafe { ptr::read_volatile(memory.0.add(offset).cast()) }
-}
 fn trial_json(t: &f::Trial) -> String {
     let mut out = fields!(t;epoch,case,completed,fence_completed,sink_count,sink_output,mxcsr_before,mxcsr,actlr,continuation);
     for (name, frame) in [
@@ -23,7 +20,7 @@ fn trial_json(t: &f::Trial) -> String {
 }
 fn owner_json(memory: &Memory, id: usize, bank: &[u8; 512], requests: &[wire::Packet]) -> String {
     let base = id * RAM_SIZE;
-    let s: Shared = record(memory, base + SHARED_OFFSET);
+    let s: Shared = memory.read_record(base + SHARED_OFFSET);
     let owner = unsafe { &*memory.0.add(base + f::OWNER_OFFSET).cast::<f::Owner>() };
     let mut out = fields!(owner;id,trial,completed,expected,requests,replies,transfers,walks,table_reads,table_writes,routes,code,code_length,sink_pc,return_pc);
     out.extend(fields!(s;status,detail,current_el,sctlr,actlr,tcr,capture_pc,service_pc));
@@ -53,32 +50,16 @@ pub fn run(args: &[String]) -> Result<()> {
     let case = args[4].parse().map_err(|_| "invalid fence case")?;
     let n: usize = args[5].parse().map_err(|_| "invalid fence vCPU count")?;
     let config = f::Config::new(n as u64, case).ok_or("unsupported fence configuration")?;
-    let mut limit = 0;
-    unsafe {
-        hv(
-            hv_vm_get_max_vcpu_count(&mut limit),
-            "read fence vCPU limit",
-        )?;
-    }
-    if n > limit as usize {
-        return Err("fence count exceeds host limit".into());
-    }
+    require_vcpus(n)?;
     let memory = Memory::with_size((n + 1) * RAM_SIZE)?;
-    load_elf(&memory, &read_input(&args[1], 2 * 1024 * 1024)?)?;
-    let mut vm = 0u64;
-    if unsafe { getentropy((&mut vm as *mut u64).cast(), 8) } != 0 || vm == 0 {
-        return Err("unable to generate fence VM identity".into());
-    }
+    load_resident(&memory, &args[1])?;
+    let vm = new_vm_nonce()?;
     let mut banks = Vec::new();
     let mut source_before = [0xcc; 4096];
     for id in 0..n {
         let base = id * RAM_SIZE;
         if id != 0 {
-            for offset in (0..RAM_SIZE).step_by(4096) {
-                if resident::executable_offset(offset) {
-                    memory.copy(base + offset, &memory.read::<4096>(offset));
-                }
-            }
+            memory.replicate_resident_text(base);
         }
         ordering::owner_mappings(&memory, id, n);
         let (mut frame, mut bank, _) = seed(id);
@@ -116,34 +97,17 @@ pub fn run(args: &[String]) -> Result<()> {
         let mut owner = f::Owner::ZERO;
         owner.id = id as u64;
         owner.initial = frame;
-        unsafe {
-            ptr::write(memory.0.add(base + SHARED_OFFSET).cast(), shared);
-            ptr::write(memory.0.add(base + f::OWNER_OFFSET).cast(), owner);
-        }
+        memory.write_record(base + SHARED_OFFSET, shared);
+        memory.write_record(base + f::OWNER_OFFSET, owner);
         source_before[id * 256..id * 256 + 29].copy_from_slice(&f::source());
         banks.push(bank);
     }
     let tables_before = ordering::guest_tables();
     memory.copy(f::RAM_OFFSET + 8192, &source_before);
     memory.copy(f::TABLE_OFFSET, &tables_before);
-    unsafe {
-        ptr::write(
-            memory.0.add(f::COMMON_OFFSET).cast(),
-            f::Common::new(config),
-        );
-    }
+    memory.write_record(f::COMMON_OFFSET, f::Common::new(config));
     fs::create_dir(&args[7]).map_err(|e| e.to_string())?;
-    unsafe {
-        sys_icache_invalidate(memory.0.cast(), memory.1);
-        hv(hv_vm_create(ptr::null()), "create fence VM")?;
-    }
-    let _machine = Machine;
-    unsafe {
-        hv(
-            hv_vm_map(memory.0.cast(), IPA, memory.1, 7),
-            "map fence backing",
-        )?;
-    }
+    let _machine = Machine::create(&memory)?;
     let execution = run_owners(
         n,
         shadow::TCR_BOTH,
@@ -198,7 +162,7 @@ pub fn run(args: &[String]) -> Result<()> {
     );
     execution?;
     for id in 0..n {
-        let s: Shared = record(&memory, id * RAM_SIZE + SHARED_OFFSET);
+        let s: Shared = memory.read_record(id * RAM_SIZE + SHARED_OFFSET);
         if s.status != SUCCESS
             || s.current_el != 4
             || s.sctlr & 0x1005 != 0x1005

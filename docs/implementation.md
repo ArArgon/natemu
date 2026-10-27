@@ -584,12 +584,21 @@ full-flags checks. The
 [contract-to-test matrix](research/reviews/INV-03-01-i4v-coverage.md) records
 configurations, explicit exclusions and retained evidence.
 
-**Next increment: I5, boot and small workloads.** Select an exact stock kernel
+**Next: native macOS code generation and VM refactoring in parallel.** The
+[restructure plan](vm-restructure.md) owns this pass and the orchestrator's
+responsibility for overall quality, coherence and engineering judgment. Build
+FEX's compiler subset without a Linux VM/container while separating reusable VM
+mechanisms from scenario drivers. Connect runnable slices early and develop the
+ABI with both consumers; neither a finished refactor nor a complete ABI is a gate.
+Existing tests require applicability checks as their mechanisms change, not blind
+preservation. I5 starts when its required general execution path is usable.
+
+**I5 (as its execution dependencies become ready), boot and small workloads.** Select an exact stock kernel
 and external initramfs containing `/init` and small test programs. Define the
 first bounded direct-boot slice using the accepted startup and machine contracts;
 implement required semantics, exception delivery/return, startup32, timer/APIC
 and serial as the boot path reaches them. Bring up uniprocessor boot and userspace
-outputs, then SMP, retaining I1–I4-V regressions throughout. Kernel boot alone
+outputs, then SMP, retaining applicable I1–I4-V regressions throughout. Kernel boot alone
 is not application coverage or a code-generator performance verdict.
 [INV-03-01](research/investigations/INV-03-01.md#current-direction--build-first-october-25-2026)
 owns current results and assignments. No whole-project research phase is a
