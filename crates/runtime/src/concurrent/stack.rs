@@ -229,19 +229,11 @@ pub unsafe fn probe_start() -> ! {
             guest.cast(),
             size_of::<GuestState>(),
         );
-        copy_record(
-            (&raw mut (*s).initial).cast(),
-            (&raw const (*s).captured).cast(),
-            size_of::<NativeFrame>(),
-        );
+        copy_frame(&raw mut (*s).initial, &raw const (*s).captured);
         (*s).initial.x[8] = aliases::other((*s).initial.x[8]);
         (*s).initial.x[16] = CODE_NEXT;
         (*s).initial.x[30] = returned as *const () as u64;
-        copy_record(
-            (&raw mut (*p).initial).cast(),
-            (&raw const (*s).initial).cast(),
-            size_of::<NativeFrame>(),
-        );
+        copy_frame(&raw mut (*p).initial, &raw const (*s).initial);
         materialize(&*(&raw const (*s).initial), 0);
         (*round()).stage = 4;
         enter(&raw const (*s).initial)
@@ -288,11 +280,7 @@ pub unsafe fn probe_finish(fault: u64) -> ! {
         }
         let rip = natemu_abi::alias::source_rip(c.alias_profile);
         recovery::guest_fault(far, 3, rip);
-        copy_record(
-            (&raw mut (*p).captured).cast(),
-            (&raw const (*s).captured).cast(),
-            size_of::<NativeFrame>(),
-        );
+        copy_frame(&raw mut (*p).captured, &raw const (*s).captured);
         copy_record(
             (&raw mut (*p).guest_after).cast(),
             natemu_abi::recovery::GUEST_VA as *const u8,

@@ -3,8 +3,8 @@ use super::*;
 use core::sync::atomic::Ordering::Relaxed;
 use natemu_abi::{
     atomic_progress as a, concurrency as c, ordering as o,
-    paging::{self, Access, Control, Tables},
-    schedule as sched, shadow,
+    paging::{self, Access, Control},
+    schedule as sched,
 };
 unsafe extern "C" {
     fn resume_exception(frame: *const NativeFrame, pc: u64, spsr: u64) -> !;
@@ -27,8 +27,8 @@ fn record() -> *mut a::Owner {
 fn ordered() -> *mut o::Owner {
     (PRIVATE + o::OWNER_OFFSET as u64) as *mut o::Owner
 }
-fn leaf() -> *mut u64 {
-    (PRIVATE + shadow::leaf_offset(o::RESULTS).unwrap() as u64) as *mut u64
+fn leaf() -> u64 {
+    tables::descriptor(o::RESULTS)
 }
 fn checked(result: Result<(), u64>) {
     if let Err(e) = result {
@@ -107,17 +107,15 @@ pub unsafe fn reset_spare() {
 }
 #[inline(never)]
 pub unsafe fn admit(index: u64) {
-    unsafe {
-        loop {
-            let g = coordinator::lock(coord());
-            if schedule::permit(&g, sched::ADMIT | index, all(), all(), c::OPEN, index + 1) {
-                checked(g.admit(id()));
-                checked(g.trace(a::ADMIT_BASE + index, id()));
-                return;
-            }
-            drop(g);
-            core::hint::spin_loop();
+    loop {
+        let g = coordinator::lock(coord());
+        if schedule::permit(&g, sched::ADMIT | index, all(), all(), c::OPEN, index + 1) {
+            checked(g.admit(id()));
+            checked(g.trace(a::ADMIT_BASE + index, id()));
+            return;
         }
+        drop(g);
+        core::hint::spin_loop();
     }
 }
 unsafe fn post(g: &coordinator::Guard<'_>) {
@@ -153,18 +151,14 @@ pub unsafe fn park(pc: u64, spsr: u64) -> ! {
         let bit = 1 << id();
         if pc != CODE_VA + 16
             || (*r).queued != 0
-            || ptr::read_volatile(leaf()) != 0
+            || leaf() != 0
             || (*o).routes[1] != o::RESULTS
         {
             stop(PANIC, 833);
         }
         (*r).saved_gpa = (*o).routes[1] + id() * 128;
         (*r).fault_pc = pc;
-        copy_record(
-            (&raw mut (*r).fault_frame).cast(),
-            (&raw const (*o).current).cast(),
-            size_of::<NativeFrame>(),
-        );
+        copy_frame(&raw mut (*r).fault_frame, &raw const (*o).current);
         loop {
             let g = coordinator::lock(coord());
             if (*r).queued == 0 {
@@ -198,7 +192,7 @@ pub unsafe fn park(pc: u64, spsr: u64) -> ! {
                         stop(PANIC, 834);
                     }
                     ordering::mapping_gpa(o::RESULTS, (*r).saved_gpa & !4095, true, true);
-                    (*r).saved_leaf = ptr::read_volatile(leaf());
+                    (*r).saved_leaf = leaf();
                     (*r).resumed = 1;
                     (*r).resume_pc = pc;
                     checked(g.trace(a::RETRY_STORE, id()));
@@ -211,27 +205,23 @@ pub unsafe fn park(pc: u64, spsr: u64) -> ! {
         }
     }
 }
-struct WalkTables;
-impl Tables for WalkTables {
-    fn read(&mut self, gpa: u64) -> Option<u64> {
-        if !(0x1000..0x5000).contains(&gpa) || gpa & 7 != 0 {
-            return None;
-        }
+/// Logs this owner's walk reads and refuses A/D writes (warm tables).
+struct RouteLog;
+impl Observer for RouteLog {
+    fn read(&mut self, gpa: u64, value: u64) -> bool {
         unsafe {
             let w = &raw mut (*record()).walk;
             let index = (*w).read_count as usize;
             if index >= 4 {
-                return None;
+                return false;
             }
-            let value =
-                ptr::read_volatile((PRIVATE + o::TABLE_OFFSET as u64 + gpa - 0x1000) as *const u64);
             (*w).reads[index] = [gpa, value];
             (*w).read_count += 1;
             (*ordered()).table_reads += 1;
-            Some(value)
         }
+        true
     }
-    fn write(&mut self, _: u64, _: u64) -> bool {
+    fn write(&mut self, _: u64, _: u64, _: u64) -> bool {
         unsafe {
             (*record()).walk.writes += 1;
             (*ordered()).table_writes += 1;
@@ -245,7 +235,7 @@ unsafe fn new_route() {
         (*record()).walk.address = address;
         (*ordered()).walks += 1;
         let t = paging::walk(
-            &mut WalkTables,
+            &mut GuestTables::observed(ordering::TABLES, RouteLog),
             Control {
                 cr3: 0x1000,
                 cpl: 0,
@@ -383,10 +373,10 @@ pub unsafe fn returned(index: u64) {
                         checked(g.trace(a::ENTRY_BLOCKED, id()));
                     }
                     ordering::mapping_gpa(o::RESULTS, o::RESULTS, false, true);
-                    (*record()).ack_leaf = ptr::read_volatile(leaf());
+                    (*record()).ack_leaf = leaf();
                     new_route();
                     ordering::mapping_gpa(o::RESULTS, (*ordered()).routes[1], true, true);
-                    (*record()).new_leaf = ptr::read_volatile(leaf());
+                    (*record()).new_leaf = leaf();
                     (*s).acknowledged |= bit;
                     coord().acknowledgements.fetch_or(bit, Relaxed);
                     checked(g.trace(a::ACK, id()));

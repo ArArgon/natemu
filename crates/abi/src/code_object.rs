@@ -14,9 +14,15 @@ pub const VERSION: u32 = 3;
 pub const NONE32: u32 = u32::MAX;
 pub const NO_REG: u8 = 0xff;
 
-/// [`Site::kind`]. Guard and split are produced only by the precision patches (slice chunk S1b); push/pop pairs
-/// exist while FEX fuses two guest push/pop into one `stp`/`ldp`; `OTHER` is a guest-memory operation the
-/// record cannot describe, which a consumer must refuse.
+/// [`Site::kind`]. Guard and split sites (profile slice1) are check stubs: `brk #1` / `brk #2` words after the block
+/// body, each reached only by its check. `GUARD` is a non-canonical address of the access site whose native offset is
+/// in [`Site::guest_offset2`] (#GP(0), or #SS(0) for [`SEG_SS`]), or, with `guest_offset2` = [`NONE32`], a
+/// non-canonical indirect branch target in `base_reg` (#GP(0)). `SPLIT` is a store wider than one byte (read-modify-write
+/// stores included) crossing a 4 KiB page (access site in `guest_offset2`): the runtime writes the access site's data
+/// register(s) to both pages or neither, applies the access site's writeback and resumes after that store.
+/// At a stub, `base_reg + imm` is the access's address (no index) and the guest state is that of the access site.
+/// Push/pop pairs exist while FEX fuses two guest push/pop into one `stp`/`ldp`; `OTHER` is a guest-memory operation
+/// the record cannot describe, which a consumer must refuse.
 pub mod kind {
     pub const LOAD: u8 = 0;
     pub const STORE: u8 = 1;
@@ -162,7 +168,8 @@ pub struct Site {
     pub native_offset: u32,
     /// Guest instruction, as an offset from the block RIP. For push/pop pairs, the first of two.
     pub guest_offset: u32,
-    /// Push/pop pairs: the second guest instruction; else [`NONE32`].
+    /// Push/pop pairs: the second guest instruction. Guard/split stubs: the native offset of the access site they
+    /// cover ([`NONE32`] for a branch-target guard). Else [`NONE32`].
     pub guest_offset2: u32,
     /// Where that guest instruction's translation starts (its PC-table entry).
     pub insn_native_offset: u32,

@@ -227,16 +227,16 @@ mod tests {
                 .get((gpa.checked_sub(0x1000)? / 8) as usize)
                 .copied()
         }
-        fn write(&mut self, gpa: u64, value: u64) -> bool {
+        fn write(&mut self, gpa: u64, _: u64, value: u64) -> crate::paging::Update {
             self.writes += 1;
             if let Some(at) = gpa
                 .checked_sub(0x1000)
                 .and_then(|p| self.words.get_mut((p / 8) as usize))
             {
                 *at = value;
-                true
+                crate::paging::Update::Written
             } else {
-                false
+                crate::paging::Update::Refused
             }
         }
     }

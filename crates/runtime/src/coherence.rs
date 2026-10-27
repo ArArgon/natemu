@@ -47,90 +47,27 @@ fn pause() {
 fn checked<T>(r: Result<T, u64>) -> T {
     r.unwrap_or_else(|e| stop(PANIC, e))
 }
-unsafe fn copy_frame(to: *mut NativeFrame, from: *const NativeFrame) {
-    unsafe {
-        copy_record(to.cast(), from.cast(), size_of::<NativeFrame>());
+const TABLES: GuestRam =
+    unsafe { GuestRam::new(0x1000, c::TABLE_BYTES as u64, PRIVATE + c::TABLE_OFFSET as u64) };
+const RAM: GuestRam =
+    unsafe { GuestRam::new(c::DATA, c::RIP + 4096 - c::DATA, PRIVATE + c::RAM_OFFSET as u64) };
+/// One entry at the configured legacy (4-byte) or PAE/long-mode (8-byte) width.
+fn table_read(gpa: u64) -> u64 {
+    if config().entry_bytes() == 4 {
+        TABLES.read::<u32>(gpa).map(u64::from)
+    } else {
+        TABLES.read::<u64>(gpa)
     }
+    .unwrap_or_else(|| stop(PANIC, 701))
 }
-fn table_pointer(gpa: u64) -> Option<*mut u8> {
-    (0x1000..0x7000)
-        .contains(&gpa)
-        .then_some((PRIVATE + c::TABLE_OFFSET as u64 + gpa - 0x1000) as *mut u8)
-}
-unsafe fn table_read(gpa: u64) -> u64 {
-    unsafe {
-        let p = table_pointer(gpa).unwrap_or_else(|| stop(PANIC, 701));
-        if config().entry_bytes() == 4 {
-            ptr::read_volatile(p.cast::<u32>()) as u64
-        } else {
-            ptr::read_volatile(p.cast::<u64>())
-        }
-    }
-}
-unsafe fn table_write(gpa: u64, value: u64) {
-    unsafe {
-        let p = table_pointer(gpa).unwrap_or_else(|| stop(PANIC, 702));
-        if config().entry_bytes() == 4 {
-            ptr::write_volatile(p.cast::<u32>(), value as u32);
-        } else {
-            ptr::write_volatile(p.cast::<u64>(), value);
-        }
-        asm!("dsb ish");
-    }
-}
-struct Tables(*mut c::Walk);
-impl paging::Tables for Tables {
-    fn read(&mut self, gpa: u64) -> Option<u64> {
-        unsafe {
-            if gpa & 7 != 0 || table_pointer(gpa).is_none() || (*self.0).read_count >= 4 {
-                return None;
-            }
-            let value = table_read(gpa);
-            let i = (*self.0).read_count as usize;
-            (*self.0).reads[i] = [gpa, value];
-            (*self.0).read_count += 1;
-            Some(value)
-        }
-    }
-    fn write(&mut self, gpa: u64, value: u64) -> bool {
-        unsafe {
-            if gpa & 7 != 0 || table_pointer(gpa).is_none() || (*self.0).write_count >= 4 {
-                return false;
-            }
-            let old = table_read(gpa);
-            let i = (*self.0).write_count as usize;
-            (*self.0).writes[i] = [gpa, old, value];
-            (*self.0).write_count += 1;
-            table_write(gpa, value);
-            true
-        }
-    }
-}
-impl paging32::Tables for Tables {
-    fn read32(&mut self, gpa: u64) -> Option<u32> {
-        unsafe {
-            if gpa & 3 != 0 || table_pointer(gpa).is_none() || (*self.0).read_count >= 4 {
-                return None;
-            }
-            let value = table_read(gpa);
-            let i = (*self.0).read_count as usize;
-            (*self.0).reads[i] = [gpa, value];
-            (*self.0).read_count += 1;
-            Some(value as u32)
-        }
-    }
-    fn write32(&mut self, gpa: u64, value: u32) -> bool {
-        unsafe {
-            if gpa & 3 != 0 || table_pointer(gpa).is_none() || (*self.0).write_count >= 4 {
-                return false;
-            }
-            let old = table_read(gpa);
-            let i = (*self.0).write_count as usize;
-            (*self.0).writes[i] = [gpa, old, value as u64];
-            (*self.0).write_count += 1;
-            table_write(gpa, value as u64);
-            true
-        }
+fn table_write(gpa: u64, value: u64) {
+    let written = if config().entry_bytes() == 4 {
+        TABLES.write(gpa, value as u32)
+    } else {
+        TABLES.write(gpa, value)
+    };
+    if !written {
+        stop(PANIC, 702)
     }
 }
 unsafe fn walk_record(
@@ -154,18 +91,19 @@ unsafe fn walk_record(
             nxe: u64::from(cfg.four()),
             smep: 0,
         };
+        let mut tables = GuestTables::observed(TABLES, table_log::WalkLog(out));
         let result = if cfg.four() {
-            paging::walk(&mut Tables(out), control, address, access)
+            paging::walk(&mut tables, control, address, access)
         } else if cfg.pae() {
             pae::walk(
-                &mut Tables(out),
+                &mut tables,
                 &(*owner()).hidden_after,
                 control,
                 address,
                 access,
             )
         } else {
-            paging32::walk(&mut Tables(out), control, address, access)
+            paging32::walk(&mut tables, control, address, access)
         };
         match result {
             Ok(t) => {
@@ -203,61 +141,31 @@ unsafe fn walk(
         result
     }
 }
-unsafe fn physical(gpa: u64) -> *mut u8 {
-    if !(c::DATA..c::RIP + 4096).contains(&gpa) {
-        stop(REJECTED, 705)
-    }
-    (PRIVATE + c::RAM_OFFSET as u64 + gpa - c::DATA) as *mut u8
+fn memory4(gpa: u64) -> [u8; 4] {
+    RAM.read_bytes(gpa).unwrap_or_else(|| stop(REJECTED, 705))
 }
-unsafe fn memory4(gpa: u64) -> [u8; 4] {
-    unsafe {
-        let mut out = [0; 4];
-        copy_record(out.as_mut_ptr(), physical(gpa), 4);
-        out
-    }
-}
-unsafe fn leaves() -> [u64; 4] {
-    unsafe {
-        core::array::from_fn(|i| {
-            let address =
-                c::DATA + (i % 2) as u64 * 4096 + if i >= 2 { shadow::HIGH_BASE } else { 0 };
-            ptr::read_volatile(
-                (PRIVATE + shadow::leaf_offset(address).unwrap() as u64) as *const u64,
-            )
-        })
-    }
+fn leaves() -> [u64; 4] {
+    core::array::from_fn(|i| {
+        let address = c::DATA + (i % 2) as u64 * 4096 + if i >= 2 { shadow::HIGH_BASE } else { 0 };
+        tables::descriptor(address)
+    })
 }
 unsafe fn invalidate() {
     unsafe {
-        // Guest large leaves still use native4KiB shadows. Clear the whole admitted
-        // two-MiB window under both roots, rather than only the faulting subpage.
-        for offset in [shadow::LOWER_LEAF, shadow::UPPER_LEAF] {
-            for i in 0..512 {
-                ptr::write_volatile((PRIVATE + offset as u64 + i * 8) as *mut u64, 0);
-            }
-        }
-        asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
+        // Guest large leaves still use native 4KiB shadows. Drop every shadow
+        // under both roots, rather than only the faulting subpage.
+        tables::clear().unwrap_or_else(|_| stop(PANIC, 707));
         (*owner()).mapping_gpa = [0; 2];
         (*owner()).mapping_writable = [0; 2];
         (*owner()).mapping_leaf_bytes = [0; 2];
     }
 }
 unsafe fn install(address: u64, t: paging::Translation) {
-    unsafe {
-        if !t.wb || !(c::DATA..c::DATA + 8192).contains(&t.gpa) {
-            stop(REJECTED, 706)
-        }
-        let slot = shadow::leaf_offset(address & !4095).unwrap_or_else(|| stop(REJECTED, 707));
-        let p = (PRIVATE + slot as u64) as *mut u64;
-        ptr::write_volatile(p, 0);
-        asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
-        let pa = (IPA + c::RAM_OFFSET as u64 + t.gpa - c::DATA) & !4095;
-        ptr::write_volatile(
-            p,
-            pa | 3 | 1 << 10 | 3 << 8 | 3 << 53 | if t.writable && t.dirty { 0 } else { 1 << 7 },
-        );
-        asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
+    if !t.wb || !(c::DATA..c::DATA + 8192).contains(&t.gpa) {
+        stop(REJECTED, 706)
     }
+    tables::install(address, &RAM, t.gpa, t.writable && t.dirty)
+        .unwrap_or_else(|_| stop(REJECTED, 707));
 }
 unsafe fn install_pair(g: &coordinator::Guard<'_>, address: u64, t: paging::Translation) {
     unsafe {
@@ -276,12 +184,8 @@ unsafe fn install_pair(g: &coordinator::Guard<'_>, address: u64, t: paging::Tran
         (*owner()).mapping_leaf_bytes[page] = t.leaf_bytes;
     }
 }
-unsafe fn clear_active(address: u64) {
-    unsafe {
-        let p = (PRIVATE + shadow::leaf_offset(address & !4095).unwrap() as u64) as *mut u64;
-        ptr::write_volatile(p, 0);
-        asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
-    }
+fn clear_active(address: u64) {
+    tables::unmap(address).unwrap_or_else(|_| stop(PANIC, 707));
 }
 unsafe fn publish(bytes: *const u8) {
     unsafe {
@@ -307,8 +211,8 @@ unsafe fn publish(bytes: *const u8) {
         asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
     }
 }
-unsafe fn source_matches(kind: usize, address: u64) -> bool {
-    unsafe { core::slice::from_raw_parts(physical(address), 2) == c::source(kind).unwrap() }
+fn source_matches(kind: usize, address: u64) -> bool {
+    RAM.matches(address, &c::source(kind).unwrap())
 }
 unsafe fn code_matches() -> bool {
     unsafe { core::slice::from_raw_parts(CODE_VA as *const u8, c::CODE_BYTES) == (*owner()).code }

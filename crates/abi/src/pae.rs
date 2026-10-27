@@ -1,7 +1,7 @@
 //! Hidden legacy-PAE roots are semantic state, independent of native shadows.
 use crate::{
     controls::Error,
-    paging::{Access, Control, Fault, PA_MASK, Tables, Translation},
+    paging::{Access, Control, Fault, PA_MASK, Stop, Tables, Translation, applied, retrying},
 };
 
 pub const OFFSET: usize = 0x24000;
@@ -88,6 +88,16 @@ pub fn walk<T: Tables>(
     address: u64,
     access: Access,
 ) -> Result<Translation, Fault> {
+    retrying(|| walk_once(tables, hidden, c, address, access))
+}
+
+fn walk_once<T: Tables>(
+    tables: &mut T,
+    hidden: &Hidden,
+    c: Control,
+    address: u64,
+    access: Access,
+) -> Result<Translation, Stop> {
     if hidden.generation == 0
         || address > u32::MAX as u64
         || !matches!(c.cpl, 0 | 3)
@@ -95,7 +105,7 @@ pub fn walk<T: Tables>(
         || c.nxe > 1
         || c.smep > 1
     {
-        return Err(Fault::Unsupported);
+        return Err(Fault::Unsupported.into());
     }
     let error = u64::from(access == Access::Write) * 2
         | u64::from(c.cpl == 3) * 4
@@ -106,7 +116,7 @@ pub fn walk<T: Tables>(
     };
     let root = hidden.entries[(address >> 30) as usize];
     if root & 1 == 0 {
-        return Err(pf(0));
+        return Err(pf(0).into());
     }
     let (mut base, mut rw, mut user, mut executable, mut wb) =
         (root & PA_MASK, true, true, true, root & 0x18 == 0);
@@ -114,14 +124,14 @@ pub fn walk<T: Tables>(
         let at = base + ((address >> (12 + 9 * (level - 1))) & 511) * 8;
         let entry = tables.read(at).ok_or(Fault::Unsupported)?;
         if entry & 1 == 0 {
-            return Err(pf(0));
+            return Err(pf(0).into());
         }
         let large = level == 2 && entry & 128 != 0;
         if entry & 0x7fff_ff00_0000_0000 != 0
             || (c.nxe == 0 && entry >> 63 != 0)
             || (large && entry & 0x1fe000 != 0)
         {
-            return Err(pf(9));
+            return Err(pf(9).into());
         }
         rw &= entry & 2 != 0;
         user &= entry & 4 != 0;
@@ -133,11 +143,11 @@ pub fn walk<T: Tables>(
                 || (access == Access::Write && !rw && (c.cpl == 3 || c.wp != 0))
                 || (access == Access::Fetch && (!executable || (c.cpl == 0 && c.smep != 0 && user)))
             {
-                return Err(pf(1));
+                return Err(pf(1).into());
             }
             let next = entry | 32 | if access == Access::Write { 64 } else { 0 };
-            if next != entry && !tables.write(at, next) {
-                return Err(Fault::Unsupported);
+            if next != entry {
+                applied(tables.write(at, entry, next))?;
             }
             let bytes = if large { 1 << 21 } else { 4096 };
             return Ok(Translation {
@@ -150,12 +160,12 @@ pub fn walk<T: Tables>(
                 wb,
             });
         }
-        if entry & 32 == 0 && !tables.write(at, entry | 32) {
-            return Err(Fault::Unsupported);
+        if entry & 32 == 0 {
+            applied(tables.write(at, entry, entry | 32))?;
         }
         base = entry & PA_MASK;
     }
-    Err(Fault::Unsupported)
+    Err(Fault::Unsupported.into())
 }
 
 #[cfg(test)]
@@ -170,12 +180,12 @@ mod tests {
             self.reads += 1;
             self.words.get(at as usize / 8).copied()
         }
-        fn write(&mut self, at: u64, value: u64) -> bool {
+        fn write(&mut self, at: u64, _: u64, value: u64) -> crate::paging::Update {
             if let Some(word) = self.words.get_mut(at as usize / 8) {
                 *word = value;
-                true
+                crate::paging::Update::Written
             } else {
-                false
+                crate::paging::Update::Refused
             }
         }
     }

@@ -1,5 +1,5 @@
 //! Terminal and split-stack wave after the unchanged concurrent stack pressure run.
-use crate::{NativeFrame, concurrency::Coordinator, recovery::GuestState};
+use crate::{NativeFrame, concurrency::Coordinator, paging::Update, recovery::GuestState};
 pub const OWNER_OFFSET: usize = 0x84000;
 pub const SHARED_OFFSET: usize = 0x93000;
 pub const STAGE: u64 = 5;
@@ -164,43 +164,38 @@ impl<T: crate::paging::Tables> DeferredDirty<T> {
             count: 0,
         }
     }
+    /// Set each deferred D by compare-exchange from the A-only value this walk
+    /// wrote; an entry that already holds the final value counts. All entries
+    /// are checked first, so a route changed before commit sets no D at all.
     pub fn commit(&mut self) -> bool {
-        for p in &self.pending[..self.count] {
-            if self.tables.read(p[0]) != Some(p[1]) {
-                return false;
-            }
-        }
-        for p in &self.pending[..self.count] {
-            if !self.tables.write(p[0], p[2]) {
-                return false;
-            }
-        }
-        true
+        let pending = &self.pending[..self.count];
+        pending
+            .iter()
+            .all(|p| matches!(self.tables.read(p[0]), Some(v) if v == p[1] || v == p[2]))
+            && pending
+                .iter()
+                .all(|p| self.tables.write(p[0], p[1], p[2]) == Update::Written)
     }
 }
 impl<T: crate::paging::Tables> crate::paging::Tables for DeferredDirty<T> {
     fn read(&mut self, gpa: u64) -> Option<u64> {
         self.tables.read(gpa)
     }
-    fn write(&mut self, gpa: u64, value: u64) -> bool {
-        let Some(old) = self.tables.read(gpa) else {
-            return false;
-        };
+    fn write(&mut self, gpa: u64, old: u64, new: u64) -> Update {
         let dirty = crate::paging::DIRTY;
-        if value & dirty != 0 && old & dirty == 0 {
-            if self.count == 2 {
-                return false;
-            }
-            let masked = value & !dirty;
-            if !self.tables.write(gpa, masked) {
-                return false;
-            }
-            self.pending[self.count] = [gpa, masked, value];
-            self.count += 1;
-            true
-        } else {
-            self.tables.write(gpa, value)
+        if new & dirty == 0 || old & dirty != 0 {
+            return self.tables.write(gpa, old, new);
         }
+        if self.count == 2 {
+            return Update::Refused;
+        }
+        let masked = new & !dirty;
+        let update = self.tables.write(gpa, old, masked);
+        if update == Update::Written {
+            self.pending[self.count] = [gpa, masked, new];
+            self.count += 1;
+        }
+        update
     }
 }
 #[cfg(test)]
@@ -226,12 +221,14 @@ mod tests {
         fn read(&mut self, p: u64) -> Option<u64> {
             self.0.get((p / 8) as usize).copied()
         }
-        fn write(&mut self, p: u64, v: u64) -> bool {
-            if let Some(a) = self.0.get_mut((p / 8) as usize) {
-                *a = v;
-                true
-            } else {
-                false
+        fn write(&mut self, p: u64, old: u64, v: u64) -> Update {
+            match self.0.get_mut((p / 8) as usize) {
+                Some(a) if *a == old || *a == v => {
+                    *a = v;
+                    Update::Written
+                }
+                Some(_) => Update::Changed,
+                None => Update::Refused,
             }
         }
     }
@@ -298,6 +295,20 @@ mod tests {
         assert_eq!((rsp - 8) & 4095, 4092);
         assert_eq!((rdx - 8) & 7, 0);
         assert_eq!((rdx - 12) & 3, 0);
+    }
+    #[test]
+    fn deferred_write_passes_the_walked_value_and_commit_accepts_identical_d() {
+        let mut d = fixture(0x101007);
+        // A stale `old` is not replaced by a value built from it.
+        assert_eq!(d.write(1793 * 8, 0x101005, 0x101067), Update::Changed);
+        assert_eq!(d.tables.0[1793], 0x101007);
+        for at in [0x100ffc, 0x101000] {
+            assert!(paging::walk(&mut d, C, at, Access::Write).is_ok());
+        }
+        // Another agent already set the same D on one leaf.
+        d.tables.0[1792] |= paging::DIRTY;
+        assert!(d.commit());
+        assert_ne!(d.tables.0[1793] & paging::DIRTY, 0);
     }
     #[test]
     fn successful_readiness_defers_only_new_dirty_until_both_routes_valid() {

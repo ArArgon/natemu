@@ -48,19 +48,22 @@ impl Config {
 
 pub(super) fn prepare_owner(memory: &Memory, id: usize) {
     let base = id * RAM_SIZE;
-    let attrs = 3 | 1 << 10 | 3 << 8 | 3 << 53;
-    for offset in (b::OWNER_OFFSET..0x90000).step_by(4096) {
-        memory.word(
-            base + 0x14000 + offset / 4096 * 8,
-            (IPA + (base + offset) as u64) | attrs,
-        );
-    }
-    for offset in (b::SHARED_OFFSET..0xa0000).step_by(4096) {
-        memory.word(
-            base + 0x14000 + offset / 4096 * 8,
-            (IPA + offset as u64) | attrs,
-        );
-    }
+    map_private(
+        memory,
+        base,
+        &[
+            Span::data(
+                b::OWNER_OFFSET,
+                0x90000 - b::OWNER_OFFSET,
+                base + b::OWNER_OFFSET,
+            ),
+            Span::data(
+                b::SHARED_OFFSET,
+                0xa0000 - b::SHARED_OFFSET,
+                b::SHARED_OFFSET,
+            ),
+        ],
+    );
     memory.write_record(base + b::OWNER_OFFSET, b::Owner::ZERO);
     memory.word(base + b::ENABLE_OFFSET, 1);
 }

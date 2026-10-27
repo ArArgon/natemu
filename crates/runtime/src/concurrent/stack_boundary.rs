@@ -1,7 +1,7 @@
 //! Boundary accesses keep peer grants until saved-route completion.
 use super::*;
 use natemu_abi::{
-    paging::{self, Fault, Tables},
+    paging::{self, Fault},
     recovery as r, shadow, stack as p, stack_boundary as b,
 };
 fn common() -> *mut b::Shared {
@@ -40,11 +40,6 @@ fn physical(gpa: u64) -> *mut u8 {
 pub fn enabled() -> bool {
     unsafe { ptr::read_volatile((PRIVATE + b::ENABLE_OFFSET as u64) as *const u64) == 1 }
 }
-unsafe fn copy_frame(to: *mut NativeFrame, from: *const NativeFrame) {
-    unsafe {
-        copy_record(to.cast(), from.cast(), size_of::<NativeFrame>());
-    }
-}
 unsafe fn materialize(offset: u64) {
     unsafe {
         let f = &(*owner()).current;
@@ -65,12 +60,8 @@ unsafe fn eligible() -> bool {
                 == (*common()).code_before
     }
 }
-unsafe fn native_pair(address: u64) -> [u64; 2] {
-    unsafe {
-        [address & !4095, (address & !4095) + 4096].map(|page| {
-            ptr::read_volatile((PRIVATE + shadow::leaf_offset(page).unwrap() as u64) as *const u64)
-        })
-    }
+fn native_pair(address: u64) -> [u64; 2] {
+    [address & !4095, (address & !4095) + 4096].map(tables::descriptor)
 }
 #[inline(never)]
 unsafe fn snapshot() {
@@ -298,30 +289,6 @@ unsafe fn enter_step() -> ! {
         enter(&raw const (*shared()).initial)
     }
 }
-struct Memory;
-impl Tables for Memory {
-    fn read(&mut self, gpa: u64) -> Option<u64> {
-        if !(0x1000..0x5000).contains(&gpa) || gpa & 7 != 0 {
-            return None;
-        }
-        Some(unsafe {
-            ptr::read_volatile((PRIVATE + r::TABLE_OFFSET as u64 + gpa - 0x1000) as *const u64)
-        })
-    }
-    fn write(&mut self, gpa: u64, value: u64) -> bool {
-        if !(0x1000..0x5000).contains(&gpa) || gpa & 7 != 0 {
-            return false;
-        }
-        unsafe {
-            ptr::write_volatile(
-                (PRIVATE + r::TABLE_OFFSET as u64 + gpa - 0x1000) as *mut u64,
-                value,
-            );
-            asm!("dsb ish");
-        }
-        true
-    }
-}
 unsafe fn service_bytes(out: *mut u8) {
     unsafe {
         copy_record(out, physical((*common()).other_page + 4092), 4);
@@ -342,7 +309,7 @@ unsafe fn split_service() -> ! {
         (*o).service_pc = (*o).pc;
         (*o).dirty_before = [ptr::read_volatile(leaf(260)), ptr::read_volatile(leaf(261))];
         service_bytes((&raw mut (*o).data_before_service).cast());
-        let mut memory = b::DeferredDirty::new(Memory);
+        let mut memory = b::DeferredDirty::new(GuestTables::new(recovery::RAM));
         let control = ptr::read_volatile(&raw const (*(r::STATE_VA as *const r::Recovery)).control);
         for i in 0..2 {
             let address = if i == 0 { b::BOUNDARY - 4 } else { b::BOUNDARY };
@@ -580,9 +547,7 @@ unsafe fn retire() -> ! {
                             stop(PANIC, 367);
                         }
                         recovery::install_ram(address, t.gpa, false);
-                        (*o).ack_pair[i] = ptr::read_volatile(
-                            (PRIVATE + shadow::leaf_offset(address).unwrap() as u64) as *const u64,
-                        );
+                        (*o).ack_pair[i] = tables::descriptor(address);
                     }
                     (*s).acknowledgements |= 1 << id();
                     checked(g.trace(49, id()));

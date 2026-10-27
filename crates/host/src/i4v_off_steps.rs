@@ -39,7 +39,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let vm_nonce = new_vm_nonce()?;
     let memory = Memory::new()?;
     load_resident(&memory, &args[1])?;
-    i4v::prepare_shadow(&memory);
+    single_owner_space(&memory, true);
     let mut source_a = [0xcc; 4096];
     let mut source_b = [0x33; 4096];
     // Only the A20-selected physical page contains the admitted program.

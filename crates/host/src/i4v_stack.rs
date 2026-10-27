@@ -111,7 +111,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let vm_nonce = new_vm_nonce()?;
     let memory = Memory::new()?;
     load_resident(&memory, &args[1])?;
-    i4v::prepare_shadow(&memory);
+    single_owner_space(&memory, true);
     memory.word(shadow::LOWER_LEAF + 257 * 8, 0);
     memory.copy(recover::SOURCE_OFFSET, &stack::SOURCE);
     let (mut frame, bank, _) = seed(3);

@@ -300,7 +300,7 @@ pub fn run(args: &[String]) -> Result<()> {
     fs::create_dir(&output).map_err(|e| e.to_string())?;
     let memory = Memory::new()?;
     load_resident(&memory, &args[1])?;
-    page_tables(&memory);
+    single_owner_space(&memory, false);
     let (mut initial, bank, data) = seed(match scenario {
         "carry" => 1,
         "overflow" => 2,

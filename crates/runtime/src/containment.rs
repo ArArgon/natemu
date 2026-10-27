@@ -115,11 +115,7 @@ unsafe fn witness(g: &coordinator::Guard<'_>, site: u64, packet: wire::Packet) {
                 (recovery::GUEST_VA as *const recovery::GuestState).cast(),
                 size_of::<recovery::GuestState>(),
             );
-            copy_record(
-                (&raw mut (*w).frame).cast(),
-                (&raw const (*r).current).cast(),
-                size_of::<NativeFrame>(),
-            );
+            copy_frame(&raw mut (*w).frame, &raw const (*r).current);
             copy_record((*w).code.as_mut_ptr(), CODE_VA as *const u8, 640);
         } else {
             let o = (PRIVATE + p::OWNER_OFFSET as u64) as *const p::Owner;
@@ -146,11 +142,7 @@ unsafe fn witness(g: &coordinator::Guard<'_>, site: u64, packet: wire::Packet) {
                 (&raw const (*o).after).cast(),
                 size_of::<recovery::GuestState>(),
             );
-            copy_record(
-                (&raw mut (*w).frame).cast(),
-                (&raw const (*o).fault[0].frame).cast(),
-                size_of::<NativeFrame>(),
-            );
+            copy_frame(&raw mut (*w).frame, &raw const (*o).fault[0].frame);
         }
         (*w).deferred_started = (*s).deferred_started;
         (*w).producer_ready = (*s).producer_ready;

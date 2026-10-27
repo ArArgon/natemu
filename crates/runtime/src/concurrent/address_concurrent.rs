@@ -42,49 +42,24 @@ fn visit() -> *mut a::Visit {
 pub fn enabled() -> bool {
     unsafe { ptr::read_volatile(&raw const (*owner()).enabled) == 1 }
 }
-unsafe fn frame(to: *mut NativeFrame, from: *const NativeFrame) {
-    unsafe {
-        copy_record(to.cast(), from.cast(), size_of::<NativeFrame>());
-    }
-}
 unsafe fn canonical(to: *mut r::GuestState, from: *const r::GuestState) {
     unsafe {
         copy_record(to.cast(), from.cast(), size_of::<r::GuestState>());
     }
 }
-fn phys(gpa: u64, bytes: u64) -> *mut u8 {
-    (PRIVATE + a::ram(config(), gpa, bytes).unwrap_or_else(|| stop(REJECTED, 401)) as u64)
-        as *mut u8
+/// One access's window of the owner's sparse, A20-aliased physical map.
+fn ram(gpa: u64, bytes: u64) -> GuestRam {
+    let backing = a::ram(config(), gpa, bytes).unwrap_or_else(|| stop(REJECTED, 401));
+    unsafe { GuestRam::new(gpa, bytes, PRIVATE + backing as u64) }
 }
-fn leaf(index: u64) -> *mut u32 {
-    (PRIVATE + r::TABLE_OFFSET as u64 + 4096 + index * 4) as *mut u32
+/// Legacy leaf entries of the fixture's single page table at guest-physical 0x2000.
+fn leaf(index: u64) -> u64 {
+    let entry = recovery::RAM.read::<u32>(0x2000 + index * 4);
+    u64::from(entry.unwrap_or_else(|| stop(PANIC, 401)))
 }
-struct Tables;
-impl paging32::Tables for Tables {
-    fn read32(&mut self, gpa: u64) -> Option<u32> {
-        if !(0x1000..0x5000).contains(&gpa) || gpa & 3 != 0 {
-            return None;
-        }
-        unsafe {
-            (*owner()).reads += 1;
-            Some(ptr::read_volatile(
-                (PRIVATE + r::TABLE_OFFSET as u64 + gpa - 0x1000) as *const u32,
-            ))
-        }
-    }
-    fn write32(&mut self, gpa: u64, value: u32) -> bool {
-        if !(0x1000..0x5000).contains(&gpa) || gpa & 3 != 0 {
-            return false;
-        }
-        unsafe {
-            (*owner()).writes += 1;
-            ptr::write_volatile(
-                (PRIVATE + r::TABLE_OFFSET as u64 + gpa - 0x1000) as *mut u32,
-                value,
-            );
-            asm!("dsb ish");
-        }
-        true
+fn set_leaf(index: u64, value: u64) {
+    if !recovery::RAM.write(0x2000 + index * 4, value as u32) {
+        stop(PANIC, 401)
     }
 }
 // Caller holds shared coordinator authority; A20 follows the final guest walk.
@@ -101,7 +76,14 @@ unsafe fn resolve(
         } else {
             (*owner()).walks += 1;
             match paging32::walk(
-                &mut Tables,
+                &mut GuestTables::observed(
+                    recovery::RAM,
+                    table_log::Counts {
+                        reads: &raw mut (*owner()).reads,
+                        writes: &raw mut (*owner()).writes,
+                        require_warm: false,
+                    },
+                ),
                 Control {
                     cr3: (*guest()).control[2],
                     cpl: 0,
@@ -258,7 +240,7 @@ unsafe fn packet(step: usize, fetch: a::Address) -> wire::Packet {
 unsafe fn source_matches(address: a::Address, step: usize) -> bool {
     unsafe {
         let bytes = a::source(config().profile, (*owner()).generation, step).unwrap();
-        core::slice::from_raw_parts(phys(address.gpa, bytes.len() as u64), bytes.len()) == bytes
+        ram(address.gpa, bytes.len() as u64).matches(address.gpa, bytes)
     }
 }
 #[inline(never)]
@@ -331,8 +313,8 @@ pub unsafe fn initialize() -> ! {
         {
             stop(REJECTED, 408)
         }
-        frame(&raw mut (*o).initial, &raw const (*shared()).initial);
-        frame(&raw mut (*o).current, &raw const (*o).initial);
+        copy_frame(&raw mut (*o).initial, &raw const (*shared()).initial);
+        copy_frame(&raw mut (*o).current, &raw const (*o).initial);
         canonical(&raw mut (*o).guest_before, guest());
         {
             let g = coordinator::lock(c);
@@ -415,7 +397,7 @@ unsafe fn begin_step() -> ! {
         (*o).current.x[16] = code() + step as u64 * a::SLOT_BYTES as u64;
         (*o).current.x[30] = returned as *const () as u64;
         (*o).current.sp = STACK_TOP;
-        frame(&raw mut (*shared()).initial, &raw const (*o).current);
+        copy_frame(&raw mut (*shared()).initial, &raw const (*o).current);
         (*shared()).capture_pc = returned as *const () as u64;
         (*v).entered = 1;
         enter(&raw const (*shared()).initial)
@@ -454,19 +436,21 @@ unsafe fn service_access() -> ! {
             .unwrap_or_else(|_| stop(REJECTED, 414))
         };
         (*v).access = address;
-        let ptr = phys(address.gpa, 4);
-        copy_record((&raw mut (*v).memory_before).cast(), ptr, 4);
+        let data = ram(address.gpa, 4);
+        (*v).memory_before = data.read_bytes(address.gpa).unwrap_or_else(|| stop(PANIC, 401));
         let value = if step == 1 {
             (*o).current.x[if (*o).generation == 1 { 7 } else { 5 }] as u32
         } else {
             u32::from_le_bytes((*v).memory_before)
         };
         if step == 1 {
-            copy_record(ptr, value.to_le_bytes().as_ptr(), 4);
+            if !data.copy_in(address.gpa, &value.to_le_bytes()) {
+                stop(PANIC, 401)
+            }
         } else {
             (*o).current.x[4] = value as u64;
         }
-        copy_record((&raw mut (*v).memory_after).cast(), ptr, 4);
+        (*v).memory_after = data.read_bytes(address.gpa).unwrap_or_else(|| stop(PANIC, 401));
         (*v).value = value as u64;
         (*v).service = 1;
         (*v).continuation = (*v).pc + 4;
@@ -484,7 +468,7 @@ pub unsafe fn finish(fault: u64) -> ! {
         if (*v).entered != 1 || (*v).completed != 0 {
             stop(PANIC, 415)
         }
-        frame(&raw mut (*o).current, &raw const (*shared()).captured);
+        copy_frame(&raw mut (*o).current, &raw const (*shared()).captured);
         if fault != 0 {
             let (esr, far, pc, spsr): (u64, u64, u64, u64);
             asm!("mrs {0},ESR_EL1","mrs {1},FAR_EL1","mrs {2},ELR_EL1","mrs {3},SPSR_EL1",out(reg)esr,out(reg)far,out(reg)pc,out(reg)spsr);
@@ -506,7 +490,7 @@ pub unsafe fn finish(fault: u64) -> ! {
             (*v).far = far;
             (*v).pc = pc;
             (*v).spsr = spsr;
-            frame(&raw mut (*v).fault, &raw const (*o).current);
+            copy_frame(&raw mut (*v).fault, &raw const (*o).current);
             if step == 1 && ((*o).program == 0 || ((*o).program == 6 && id() != config().actor)) {
                 let c = coordinator();
                 if (*o).program == 0 && id() == config().actor {
@@ -561,7 +545,7 @@ pub unsafe fn finish(fault: u64) -> ! {
             }
             service_access()
         }
-        frame(&raw mut (*v).prefix, &raw const (*o).current);
+        copy_frame(&raw mut (*v).prefix, &raw const (*o).current);
         (*v).completed = 1;
         materialize(a::offset(config().profile, step + 1).unwrap());
         {
@@ -582,9 +566,7 @@ unsafe fn acknowledge() -> [u64; 6] {
         let load = a::operand(config().profile, &(*owner()).current, 2).unwrap();
         recovery::clear_mapping(load);
         let route = resolve(1, offset, 4, Access::Read).unwrap_or_else(|_| stop(REJECTED, 420));
-        let native = ptr::read_volatile(
-            (PRIVATE + shadow::leaf_offset(offset & !4095).unwrap() as u64) as *const u64,
-        );
+        let native = tables::descriptor(offset);
         if native != 0 {
             stop(PANIC, 421)
         }
@@ -616,7 +598,7 @@ unsafe fn source_cut() -> ! {
                     let cfg = config();
                     let source = cfg.fetch(id(), false, 0).unwrap();
                     let at = if cfg.profile == 3 { 4 } else { 3 };
-                    (*s).source_leaf_before = ptr::read_volatile(leaf(2)) as u64;
+                    (*s).source_leaf_before = leaf(2);
                     let offset = ((source.linear + at) as u32)
                         .wrapping_sub((*guest()).segments[1][1] as u32)
                         as u64;
@@ -626,17 +608,17 @@ unsafe fn source_cut() -> ! {
                         stop(PANIC, 424)
                     }
                     (*s).source_write = route;
-                    copy_record((&raw mut (*s).source_before).cast(), phys(source.gpa, 8), 8);
-                    ptr::write_volatile(
-                        phys(route.gpa, 1),
-                        if cfg.profile == 3 { 0x10 } else { 0x13 },
-                    );
-                    copy_record((&raw mut (*s).source_after).cast(), phys(source.gpa, 8), 8);
-                    (*s).source_leaf_after = ptr::read_volatile(leaf(2)) as u64;
-                    (*s).data_leaf_before = ptr::read_volatile(leaf(cfg.data_leaf())) as u64;
-                    ptr::write_volatile(leaf(cfg.data_leaf()), (cfg.data_raw(true) | 7) as u32);
-                    asm!("dsb ish");
-                    (*s).data_leaf_after = ptr::read_volatile(leaf(cfg.data_leaf())) as u64;
+                    let code = ram(source.gpa, 8);
+                    (*s).source_before = code.read_bytes(source.gpa).unwrap_or_else(|| stop(PANIC, 401));
+                    let byte: u8 = if cfg.profile == 3 { 0x10 } else { 0x13 };
+                    if !ram(route.gpa, 1).write(route.gpa, byte) {
+                        stop(PANIC, 424)
+                    }
+                    (*s).source_after = code.read_bytes(source.gpa).unwrap_or_else(|| stop(PANIC, 401));
+                    (*s).source_leaf_after = leaf(2);
+                    (*s).data_leaf_before = leaf(cfg.data_leaf());
+                    set_leaf(cfg.data_leaf(), cfg.data_raw(true) | 7);
+                    (*s).data_leaf_after = leaf(cfg.data_leaf());
                     c.generation.store(2, Ordering::Relaxed);
                     c.old_eligible.store(0, Ordering::Relaxed);
                     (*s).source_changed = 1;
@@ -784,7 +766,7 @@ unsafe fn pressure_loop() -> ! {
             if (*s).new_done == all() && (*p).ready == all() {
                 if (*s).maintenance_started == 0 {
                     (*s).maintenance_started = 1;
-                    (*p).compose_leaf = ptr::read_volatile(leaf(config().data_leaf())) as u64;
+                    (*p).compose_leaf = leaf(config().data_leaf());
                 }
                 if (*p).finished != 0 {
                     drop(g);
@@ -824,10 +806,9 @@ unsafe fn pressure_loop() -> ! {
                     } else if let Some(request) = checked((*p).start_head()) {
                         c.phase.store(EXCLUSIVE, Ordering::Relaxed);
                         let old =
-                            ptr::read_volatile(leaf(config().data_leaf())) as u64 & 0xfffff000;
+                            leaf(config().data_leaf()) & 0xfffff000;
                         let next = config().data_raw(old == config().data_raw(false));
-                        ptr::write_volatile(leaf(config().data_leaf()), (next | 7) as u32);
-                        asm!("dsb ish");
+                        set_leaf(config().data_leaf(), next | 7);
                         checked(g.trace(25, request.cpu));
                     }
                 }
@@ -843,7 +824,7 @@ unsafe fn pressure_loop() -> ! {
                     checked(g.trace(26, id()));
                     if (*p).acknowledgements == all() {
                         (*p).leaf_history[(*p).total as usize] =
-                            ptr::read_volatile(leaf(config().data_leaf())) as u64;
+                            leaf(config().data_leaf());
                         checked((*p).complete_head());
                         checked(g.trace(27, id()));
                         c.phase.store(CLOSING, Ordering::Relaxed);
@@ -903,7 +884,7 @@ unsafe fn terminal_start() -> ! {
                 publish(CODE_NEXT, &[0; a::CODE_BYTES]);
             }
             materialize(0);
-            frame(&raw mut (*o).terminal_initial, &raw const (*o).current);
+            copy_frame(&raw mut (*o).terminal_initial, &raw const (*o).current);
             (*s).terminal_ready |= 1 << id();
             c.active.fetch_or(1 << id(), Ordering::Relaxed);
             c.phase.store(OPEN, Ordering::Relaxed);

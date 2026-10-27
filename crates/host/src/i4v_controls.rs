@@ -144,13 +144,9 @@ pub fn run(args: &[String]) -> Result<()> {
     let vm_nonce = new_vm_nonce()?;
     let memory = Memory::new()?;
     load_resident(&memory, &args[1])?;
-    i4v::prepare_shadow(&memory);
-    for offset in (control::RECORD_OFFSET..0x90000).step_by(4096) {
-        memory.word(
-            0x14000 + offset / 4096 * 8,
-            (IPA + offset as u64) | 3 | 1 << 10 | 3 << 8 | 3 << 53,
-        );
-    }
+    single_owner_space(&memory, true);
+    let records = control::RECORD_OFFSET;
+    map_private(&memory, 0, &[Span::data(records, 0x90000 - records, records)]);
     let mut source_before = [0xcc; 4096];
     source_before[..program_len].copy_from_slice(&program[..program_len]);
     memory.copy(recover::SOURCE_OFFSET, &source_before);

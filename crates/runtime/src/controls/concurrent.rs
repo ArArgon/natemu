@@ -719,11 +719,10 @@ pub(super) unsafe fn after_native() {
                     stop(PANIC, 317);
                 }
                 coordinator().phase.store(n::EXCLUSIVE, Relaxed);
-                ptr::write_volatile(
-                    (PRIVATE + pae::TABLE_OFFSET as u64 + pae::ROOT - 0x1000) as *mut u64,
-                    if index == 0 { 0x4001 } else { 0x2001 },
-                );
-                asm!("dsb ish");
+                let root: u64 = if index == 0 { 0x4001 } else { 0x2001 };
+                if !PAE_TABLES.write(pae::ROOT, root) {
+                    stop(PANIC, 317);
+                }
                 (*pae_state()).mutations += 1;
                 (*common()).pae_published |= 1 << index;
                 checked(g.trace(110 + index as u64, id()));

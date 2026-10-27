@@ -3,8 +3,7 @@ use super::*;
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
 use natemu_abi::{
     ordering as o,
-    paging::{self, Access, Control, Tables},
-    shadow, translation as wire,
+    paging::{self, Access, Control}, translation as wire,
 };
 unsafe extern "C" {
     fn service(packet: *mut wire::Packet);
@@ -33,40 +32,25 @@ fn trial() -> *mut o::Trial {
             as *mut o::Trial
     }
 }
-unsafe fn copy_frame(to: *mut NativeFrame, from: *const NativeFrame) {
-    unsafe {
-        copy_record(to.cast(), from.cast(), size_of::<NativeFrame>());
-    }
-}
 fn pause() {
     core::hint::spin_loop();
 }
-struct GuestTables;
-impl Tables for GuestTables {
-    fn read(&mut self, gpa: u64) -> Option<u64> {
-        if !(0x1000..0x5000).contains(&gpa) || gpa & 7 != 0 {
-            return None;
-        }
-        unsafe {
-            (*owner()).table_reads += 1;
-            Some(ptr::read_volatile(
-                (PRIVATE + o::TABLE_OFFSET as u64 + gpa - 0x1000) as *const u64,
-            ))
-        }
-    }
-    fn write(&mut self, _gpa: u64, _value: u64) -> bool {
-        // Host supplies a genuinely warm A/D-satisfied guest-table fixture.
-        unsafe {
-            (*owner()).table_writes += 1;
-        }
-        false
-    }
-}
+/// Guest data/results/source pages and guest table pages, as private windows.
+pub(super) const RAM: GuestRam = unsafe { GuestRam::new(o::DATA, 0x4000, PRIVATE + o::RAM_OFFSET as u64) };
+pub(super) const TABLES: GuestRam =
+    unsafe { GuestRam::new(0x1000, 0x4000, PRIVATE + o::TABLE_OFFSET as u64) };
 unsafe fn walk(address: u64, access: Access) -> u64 {
     unsafe {
         (*owner()).walks += 1;
         match paging::walk(
-            &mut GuestTables,
+            &mut GuestTables::observed(
+                TABLES,
+                table_log::Counts {
+                    reads: &raw mut (*owner()).table_reads,
+                    writes: &raw mut (*owner()).table_writes,
+                    require_warm: true,
+                },
+            ),
             Control {
                 cr3: 0x1000,
                 cpl: 0,
@@ -91,10 +75,7 @@ unsafe fn walk(address: u64, access: Access) -> u64 {
 unsafe fn source_matches() -> bool {
     unsafe {
         let bytes = o::source((*owner()).variant as usize).unwrap_or_else(|| stop(REJECTED, 502));
-        core::slice::from_raw_parts(
-            (PRIVATE + o::RAM_OFFSET as u64 + o::RIP - o::DATA + id() * 256) as *const u8,
-            bytes.len(),
-        ) == bytes
+        RAM.matches(o::RIP + id() * 256, bytes)
     }
 }
 unsafe fn mapping(address: u64, present: bool, writable: bool) {
@@ -108,26 +89,20 @@ unsafe fn mapping(address: u64, present: bool, writable: bool) {
     }
 }
 pub(super) unsafe fn mapping_gpa(address: u64, gpa: u64, present: bool, writable: bool) {
-    unsafe {
-        if !matches!(address, o::DATA | o::RESULTS)
-            || (gpa != address
-                && !(atomic_progress::enabled()
-                    && address == o::RESULTS
-                    && gpa == natemu_abi::atomic_progress::NEW_RESULTS))
-        {
-            stop(PANIC, 503)
-        }
-        let slot = shadow::leaf_offset(address).unwrap_or_else(|| stop(PANIC, 503));
-        let pte = (PRIVATE + slot as u64) as *mut u64;
-        ptr::write_volatile(pte, 0);
-        asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
-        if present {
-            let pa = IPA + o::RAM_OFFSET as u64 + gpa - o::DATA;
-            let entry = pa | 3 | 1 << 10 | 3 << 8 | 3 << 53 | if writable { 0 } else { 1 << 7 };
-            ptr::write_volatile(pte, entry);
-        }
-        asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
+    if !matches!(address, o::DATA | o::RESULTS)
+        || (gpa != address
+            && !(atomic_progress::enabled()
+                && address == o::RESULTS
+                && gpa == natemu_abi::atomic_progress::NEW_RESULTS))
+    {
+        stop(PANIC, 503)
     }
+    let result = if present {
+        tables::install(address, &RAM, gpa, writable)
+    } else {
+        tables::unmap(address)
+    };
+    result.unwrap_or_else(|_| stop(PANIC, 503));
 }
 unsafe fn publish() {
     unsafe {

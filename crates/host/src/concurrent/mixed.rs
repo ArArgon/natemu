@@ -33,13 +33,13 @@ pub fn guest(frame: &NativeFrame, id: usize, profile: u64) -> recover::GuestStat
     }
     g
 }
+/// This owner's own code pages, instead of the shared ones.
 pub fn private_code(memory: &Memory, base: usize) {
-    for offset in [CODE_OFFSET, CODE_OFFSET + 4096] {
-        memory.word(
-            base + 0x14000 + offset / 4096 * 8,
-            (IPA + (base + offset) as u64) | 3 | 1 << 10 | 3 << 8 | 1 << 7,
-        );
-    }
+    map_private(
+        memory,
+        base,
+        &[Span::text(CODE_OFFSET, 8192, base + CODE_OFFSET)],
+    );
 }
 pub fn state(memory: &Memory, base: usize) -> mixed32::State {
     memory.read_record(base + mixed32::OFFSET)

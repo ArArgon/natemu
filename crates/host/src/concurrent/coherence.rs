@@ -23,13 +23,15 @@ fn leaves(memory: &Memory, base: usize) -> [u64; 4] {
 fn owner_mappings(memory: &Memory, id: usize, n: usize) {
     ordering::owner_mappings(memory, id, n);
     let base = id * RAM_SIZE;
-    let attrs = 3 | 1 << 10 | 3 << 8 | 3 << 53;
-    for offset in (shadow::UPPER_ROOT..shadow::UPPER_LEAF + 4096).step_by(4096) {
-        memory.word(
-            base + 0x14000 + offset / 4096 * 8,
-            (IPA + (base + offset) as u64) | attrs,
-        );
-    }
+    map_private(
+        memory,
+        base,
+        &[Span::data(
+            shadow::UPPER_ROOT,
+            shadow::UPPER_LEAF + 4096 - shadow::UPPER_ROOT,
+            base + shadow::UPPER_ROOT,
+        )],
+    );
     for (at, target) in [
         (shadow::UPPER_ROOT + 256 * 8, shadow::UPPER_L1),
         (shadow::UPPER_L1, shadow::UPPER_L2),
@@ -37,18 +39,22 @@ fn owner_mappings(memory: &Memory, id: usize, n: usize) {
     ] {
         memory.word(base + at, (IPA + (base + target) as u64) | 3);
     }
-    for offset in (COORD_OFFSET..c::TABLE_OFFSET + c::TABLE_BYTES).step_by(4096) {
-        memory.word(
-            base + 0x14000 + offset / 4096 * 8,
-            (IPA + offset as u64) | attrs,
-        );
-    }
-    for offset in (0..c::MAX_SNAPSHOTS * c::SNAPSHOT_BYTES).step_by(4096) {
-        memory.word(
-            base + 0x14000 + (c::IMAGE_VA_OFFSET + offset) / 4096 * 8,
-            (IPA + (n * RAM_SIZE + offset) as u64) | attrs,
-        );
-    }
+    map_private(
+        memory,
+        base,
+        &[
+            Span::data(
+                COORD_OFFSET,
+                c::TABLE_OFFSET + c::TABLE_BYTES - COORD_OFFSET,
+                COORD_OFFSET,
+            ),
+            Span::data(
+                c::IMAGE_VA_OFFSET,
+                c::MAX_SNAPSHOTS * c::SNAPSHOT_BYTES,
+                n * RAM_SIZE,
+            ),
+        ],
+    );
     for leaf in [shadow::LOWER_LEAF, shadow::UPPER_LEAF] {
         for index in 256..=258 {
             memory.word(base + leaf + index * 8, 0);

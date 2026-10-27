@@ -160,40 +160,155 @@ pub(crate) fn load_elf(memory: &Memory, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Single-owner private tables rooted at `shadow::LOWER_ROOT` in window 0.
-pub(crate) fn page_tables(memory: &Memory) {
-    let table = |offset| IPA + offset + 3;
-    let attrs = 3 | 1 << 10 | 3 << 8;
-    memory.word(0x10000, table(0x11000));
-    memory.word(0x10000 + 256 * 8, table(0x12000));
+/// Protection of a private alias: resident text is read-only and executable,
+/// everything else read-write and never executable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Rights {
+    Text,
+    Data,
+}
+/// `bytes` of the resident's private address space at `PRIVATE + offset`,
+/// backed by the backing bytes at `target`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Span {
+    pub offset: usize,
+    pub bytes: usize,
+    pub target: usize,
+    pub rights: Rights,
+}
+impl Span {
+    pub(crate) const fn text(offset: usize, bytes: usize, target: usize) -> Self {
+        Self {
+            offset,
+            bytes,
+            target,
+            rights: Rights::Text,
+        }
+    }
+    pub(crate) const fn data(offset: usize, bytes: usize, target: usize) -> Self {
+        Self {
+            offset,
+            bytes,
+            target,
+            rights: Rights::Data,
+        }
+    }
+}
+const PAGE: u64 = 3 | 1 << 10 | 3 << 8;
+const PRIVATE_LEAF: usize = 0x14000;
+
+/// Private tables of the owner whose window starts at backing offset `window`:
+/// TTBR0 (`shadow::LOWER_ROOT`) holds the boot identity alias, the private
+/// region `PRIVATE..PRIVATE + 2 MiB` with exactly `spans`, and the lower guest
+/// shadow window; with `upper`, TTBR1 (`shadow::UPPER_ROOT`) pre-links the
+/// upper window. `shadows` pre-populates lower-window guest pages (guest VA,
+/// backing offset), writable. The runtime's table pages, shadow state and
+/// shadow pool are always mapped.
+pub(crate) fn private_space(
+    memory: &Memory,
+    window: usize,
+    spans: &[Span],
+    shadows: &[(u64, usize)],
+    upper: bool,
+) {
+    let word = |at: usize, value| memory.word(window + at, value);
+    let table = |offset: usize| IPA + (window + offset) as u64 + 3;
+    word(shadow::LOWER_ROOT, table(0x11000));
+    word(shadow::LOWER_ROOT + 256 * 8, table(0x12000));
     // Low alias exists only for MMU enable and is removed by startup.
-    memory.word(0x11000 + 8, IPA | 1 | 1 << 10 | 3 << 8);
-    memory.word(0x11000, table(0x15000));
-    memory.word(0x15000, table(0x16000));
-    memory.word(
-        0x16000 + 256 * 8,
-        (IPA + DATA_OFFSET as u64) | attrs | (3 << 53),
+    word(0x11000 + 8, IPA | 1 | 1 << 10 | 3 << 8);
+    word(0x11000, table(0x15000));
+    word(0x15000, table(shadow::LOWER_LEAF));
+    for &(va, target) in shadows {
+        assert!(va < shadow::WINDOW_BYTES && va % 4096 == 0);
+        word(
+            shadow::LOWER_LEAF + (va as usize >> 12) * 8,
+            (IPA + target as u64) | PAGE | 3 << 53,
+        );
+    }
+    word(0x12000 + 8, table(0x13000));
+    word(0x13000, table(PRIVATE_LEAF));
+    if upper {
+        word(shadow::UPPER_ROOT + 256 * 8, table(shadow::UPPER_L1));
+        word(shadow::UPPER_L1, table(shadow::UPPER_L2));
+        word(shadow::UPPER_L2, table(shadow::UPPER_LEAF));
+    }
+    let own = |offset, bytes| Span::data(offset, bytes, window + offset);
+    let tables_end = if upper {
+        shadow::UPPER_LEAF
+    } else {
+        shadow::LOWER_LEAF
+    } + 4096;
+    map_private(
+        memory,
+        window,
+        &[own(shadow::LOWER_ROOT, tables_end - shadow::LOWER_ROOT)],
     );
-    memory.word(0x16000 + 258 * 8, (IPA + 0x72000) | attrs | (3 << 53));
-    memory.word(0x12000 + 8, table(0x13000));
-    memory.word(0x13000, table(0x14000));
-    // Private aliases cover only declared text, tables, state and stacks.
-    for offset in (0..RAM_SIZE).step_by(4096) {
-        let text = resident::executable_offset(offset) || offset == CODE_OFFSET;
-        let writable = (0x10000..0x17000).contains(&offset)
-            || (SHARED_OFFSET..SHARED_OFFSET + 0x8000).contains(&offset)
-            || (BANK_OFFSET..BANK_OFFSET + 0x2000).contains(&offset)
-            || (0x70000..0x84000).contains(&offset)
-            || (0x50000..0x54000).contains(&offset)
-            || (0x60000..0x64000).contains(&offset);
-        if text || writable {
-            let protection = if text { 1 << 7 } else { 3 << 53 };
+    map_private(memory, window, spans);
+    map_private(
+        memory,
+        window,
+        &[
+            own(shadow::STATE_OFFSET, 4096),
+            own(shadow::POOL_OFFSET, shadow::POOL_PAGES * 4096),
+        ],
+    );
+}
+
+/// Maps `spans` into window `window`'s private region (replacing earlier entries).
+pub(crate) fn map_private(memory: &Memory, window: usize, spans: &[Span]) {
+    for span in spans {
+        assert!(span.offset % 4096 == 0 && span.target % 4096 == 0);
+        assert!(span.offset + span.bytes <= 2 * RAM_SIZE);
+        let protection = match span.rights {
+            Rights::Text => 1 << 7,
+            Rights::Data => 3 << 53,
+        };
+        for page in (0..span.bytes).step_by(4096) {
             memory.word(
-                0x14000 + offset / 4096 * 8,
-                (IPA + offset as u64) | attrs | protection,
+                window + PRIVATE_LEAF + (span.offset + page) / 4096 * 8,
+                (IPA + (span.target + page) as u64) | PAGE | protection,
             );
         }
     }
+}
+
+/// Single-owner resident tables in window 0: guest data and source pages are
+/// shadowed at start; `upper` pre-links the upper shadow window.
+pub(crate) fn single_owner_space(memory: &Memory, upper: bool) {
+    let source = (
+        natemu_abi::translation::SOURCE_VA,
+        natemu_abi::recovery::SOURCE_OFFSET,
+    );
+    let shadows: &[_] = if upper {
+        &[source]
+    } else {
+        &[(DATA_VA, DATA_OFFSET), source]
+    };
+    private_space(memory, 0, &single_owner_spans(), shadows, upper);
+}
+/// Private spans of a single-owner resident in window 0.
+pub(crate) fn single_owner_spans() -> Vec<Span> {
+    let mut spans = resident_text(0);
+    spans.push(Span::text(CODE_OFFSET, 4096, CODE_OFFSET));
+    for (offset, bytes) in [
+        (SHARED_OFFSET, 0x8000),
+        (BANK_OFFSET, 0x2000),
+        (0x50000, 0x4000),
+        (0x60000, 0x4000),
+        (DATA_OFFSET, 0x14000),
+    ] {
+        spans.push(Span::data(offset, bytes, offset));
+    }
+    spans
+}
+/// The resident's boot and extended text in window `window`.
+pub(crate) fn resident_text(window: usize) -> Vec<Span> {
+    let text = |offset, end| Span::text(offset, end - offset, window + offset);
+    vec![
+        text(0, resident::BOOT_END),
+        text(resident::TEXT_OFFSET, resident::TEXT_END),
+    ]
 }
 
 #[cfg(test)]
@@ -284,7 +399,7 @@ mod tests {
     #[test]
     fn private_resident_mapping_has_no_executable_gap() {
         let memory = Memory::new().unwrap();
-        page_tables(&memory);
+        private_space(&memory, 0, &single_owner_spans(), &[], false);
         let leaf = |offset| u64::from_le_bytes(memory.read::<8>(0x14000 + offset / 4096 * 8));
         for offset in (0..RAM_SIZE).step_by(4096) {
             let pte = leaf(offset);
@@ -296,5 +411,63 @@ mod tests {
                 assert_eq!(pte & (3 << 53), 3 << 53);
             }
         }
+    }
+
+    #[test]
+    fn runtime_shadows_use_prelinked_windows_then_the_mapped_pool() {
+        struct Quiet;
+        impl shadow::Maintenance for Quiet {
+            fn publish(&mut self) {}
+            fn invalidate(&mut self, _: u64) {}
+            fn invalidate_all(&mut self) {}
+        }
+        let memory = Memory::with_size(2 * RAM_SIZE).unwrap();
+        let window = RAM_SIZE;
+        private_space(&memory, window, &resident_text(window), &[], true);
+        let leaf = |offset: usize| {
+            u64::from_le_bytes(memory.read::<8>(window + 0x14000 + offset / 4096 * 8))
+        };
+        // The runtime reaches its tables, state and pool through own-window RW aliases.
+        for offset in [shadow::LOWER_ROOT, shadow::UPPER_LEAF, shadow::STATE_OFFSET]
+            .into_iter()
+            .chain((0..shadow::POOL_PAGES).map(|i| shadow::POOL_OFFSET + i * 4096))
+        {
+            assert_eq!(leaf(offset), (IPA + (window + offset) as u64) | PAGE | 3 << 53);
+        }
+        let mut space = shadow::Space {
+            window: unsafe { memory.0.add(window) },
+            ipa: IPA + window as u64,
+            pool_pages: shadow::POOL_PAGES,
+            upper: true,
+            tlb: Quiet,
+        };
+        for va in [DATA_VA, shadow::HIGH_BASE + DATA_VA] {
+            space.map(va, IPA, true).unwrap();
+        }
+        assert_eq!(space.used(), 0);
+        let word = |offset: usize| u64::from_le_bytes(memory.read::<8>(window + offset));
+        assert_eq!(word(shadow::LOWER_LEAF + 256 * 8), IPA | shadow::PAGE);
+        assert_eq!(word(shadow::UPPER_LEAF + 256 * 8), IPA | shadow::PAGE);
+        space.map(0x7fff_0000_0000, IPA, false).unwrap();
+        assert_eq!(space.used(), 3);
+        // Without `upper` (TCR.EPD1 set) the upper half is refused; the lower
+        // half grows from the pool.
+        let memory = Memory::new().unwrap();
+        private_space(&memory, 0, &resident_text(0), &[], false);
+        let mut space = shadow::Space {
+            window: memory.0,
+            ipa: IPA,
+            pool_pages: 2,
+            upper: false,
+            tlb: Quiet,
+        };
+        assert_eq!(
+            space.map(shadow::HIGH_BASE, IPA, true),
+            Err(shadow::Error::Noncanonical)
+        );
+        assert_eq!(
+            space.map(0x7f80_0000_0000, IPA, true),
+            Err(shadow::Error::Capacity)
+        );
     }
 }

@@ -61,10 +61,11 @@ names, and none of that instruction's effects is committed. FEX patches that pro
    (xA = base, or x0 after `add x0, base, disp|index`). It catches bit 63 ≠ bit 47, covering the private region; other
    non-canonical values take level-0 translation faults and canonical-end overruns land in the unmapped 1 GiB below
    `PRIVATE`, both classified at the site. RIP-relative addresses are checked at compile time. Stubs (`brk`) are sites.
-8. Split check for pure stores wider than 1 byte: `add x0, a, #w-1; eor x0, x0, a; tbnz x0, #12, split`. The split stub
-   is a service site: the runtime walks both pages with write intent, writes both parts through owned RAM or neither (#PF),
-   applies any recorded writeback, and resumes after the store (`ACCESS_COMPLETED`). An RMW store needs no split check,
-   because its load already walked both pages with write intent.
+8. Split check for every guest store wider than 1 byte, including RMW, push/call and pair stores:
+   `add x0, a, #w-1; eor x0, x0, a; tbnz x0, #12, split`. The split stub is a service site: the runtime walks both pages
+   with write intent, writes both parts through owned RAM or neither (#PF), applies any recorded writeback, and resumes
+   after the store (`ACCESS_COMPLETED`). (Corrected Oct 27 after S1d1 review: an RMW load can hit existing readable
+   shadows without faulting, so only its store faults and Arm permits a partial commit, DDI0487 B2.8.2.1.)
 
 Site record (natemu-fexc-v2 JSON `sites` and binary object): `native_offset u32, guest_offset u32, kind
 (load|store|load_pair|store_pair|push|pop|guard|split), width, intent (read|write), segment (ds|ss), base_reg,

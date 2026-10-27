@@ -1,8 +1,9 @@
 //! Legacy two-level, 4-KiB translation for the PSE-off profile.
-use crate::paging::{Access, Control, Fault, Translation};
+use crate::paging::{Access, Control, Fault, Stop, Translation, Update, applied, retrying};
 pub trait Tables {
     fn read32(&mut self, gpa: u64) -> Option<u32>;
-    fn write32(&mut self, gpa: u64, value: u32) -> bool;
+    /// Replace `old`, the value just read at `gpa`, with `new`.
+    fn write32(&mut self, gpa: u64, old: u32, new: u32) -> Update;
 }
 pub fn walk<T: Tables>(
     tables: &mut T,
@@ -10,6 +11,14 @@ pub fn walk<T: Tables>(
     address: u64,
     access: Access,
 ) -> Result<Translation, Fault> {
+    retrying(|| walk_once(tables, c, address, access))
+}
+fn walk_once<T: Tables>(
+    tables: &mut T,
+    c: Control,
+    address: u64,
+    access: Access,
+) -> Result<Translation, Stop> {
     if !matches!(c.cpl, 0 | 3)
         || c.wp > 1
         || c.nxe != 0
@@ -18,7 +27,7 @@ pub fn walk<T: Tables>(
         || c.cr3 > u32::MAX as u64
         || c.cr3 & 0x18 != 0
     {
-        return Err(Fault::Unsupported);
+        return Err(Fault::Unsupported.into());
     }
     let error = u64::from(access == Access::Write) * 2 | u64::from(c.cpl == 3) * 4;
     let pf = |present| Fault::Page {
@@ -28,26 +37,26 @@ pub fn walk<T: Tables>(
     let pd = (c.cr3 & 0xffff_f000) + ((address >> 22) & 1023) * 4;
     let pde = tables.read32(pd).ok_or(Fault::Unsupported)?;
     if pde & 1 == 0 {
-        return Err(pf(0));
+        return Err(pf(0).into());
     }
     // PDE.PS is ignored with CR4.PSE=0; it is not a large-page selector here.
-    if pde & 32 == 0 && !tables.write32(pd, pde | 32) {
-        return Err(Fault::Unsupported);
+    if pde & 32 == 0 {
+        applied(tables.write32(pd, pde, pde | 32))?;
     }
     let pt = (pde as u64 & 0xffff_f000) + ((address >> 12) & 1023) * 4;
     let pte = tables.read32(pt).ok_or(Fault::Unsupported)?;
     if pte & 1 == 0 {
-        return Err(pf(0));
+        return Err(pf(0).into());
     }
     let writable = pde & pte & 2 != 0;
     let user = pde & pte & 4 != 0;
     if (c.cpl == 3 && !user) || (access == Access::Write && !writable && (c.cpl == 3 || c.wp != 0))
     {
-        return Err(pf(1));
+        return Err(pf(1).into());
     }
     let next = pte | 32 | if access == Access::Write { 64 } else { 0 };
-    if next != pte && !tables.write32(pt, next) {
-        return Err(Fault::Unsupported);
+    if next != pte {
+        applied(tables.write32(pt, pte, next))?;
     }
     Ok(Translation {
         gpa: (pte as u64 & 0xffff_f000) | (address & 4095),
@@ -67,12 +76,12 @@ mod tests {
         fn read32(&mut self, p: u64) -> Option<u32> {
             self.0.get((p / 4) as usize).copied()
         }
-        fn write32(&mut self, p: u64, v: u32) -> bool {
+        fn write32(&mut self, p: u64, _: u32, v: u32) -> Update {
             if let Some(x) = self.0.get_mut((p / 4) as usize) {
                 *x = v;
-                true
+                Update::Written
             } else {
-                false
+                Update::Refused
             }
         }
     }

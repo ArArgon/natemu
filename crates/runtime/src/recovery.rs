@@ -1,6 +1,6 @@
 use super::*;
 use natemu_abi::{
-    paging::{self, Access, Fault, Tables},
+    paging::{self, Access, Fault},
     recovery::*,
 };
 
@@ -14,47 +14,24 @@ fn state() -> *mut Recovery {
 fn guest() -> *mut GuestState {
     GUEST_VA as *mut GuestState
 }
-pub(super) struct OwnedTables;
-impl Tables for OwnedTables {
-    fn read(&mut self, gpa: u64) -> Option<u64> {
-        if !(0x1000..0x5000).contains(&gpa) || gpa & 7 != 0 {
-            return None;
-        }
-        Some(unsafe {
-            ptr::read_volatile((PRIVATE + TABLE_OFFSET as u64 + gpa - 0x1000) as *const u64)
-        })
-    }
-    fn write(&mut self, gpa: u64, value: u64) -> bool {
-        if !(0x1000..0x5000).contains(&gpa) || gpa & 7 != 0 {
-            return false;
-        }
-        unsafe {
-            ptr::write_volatile(
-                (PRIVATE + TABLE_OFFSET as u64 + gpa - 0x1000) as *mut u64,
-                value,
-            );
-            asm!("dsb ish");
-        }
-        true
-    }
-}
-unsafe fn mapping(page: u64, entry: u64) {
-    unsafe {
-        let slot = natemu_abi::shadow::leaf_offset(page).unwrap_or_else(|| stop(REJECTED, 46));
-        let pte = (PRIVATE + slot as u64) as *mut u64;
-        ptr::write_volatile(pte, 0);
-        asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
-        ptr::write_volatile(pte, entry);
-        asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
-    }
-}
+/// The owner's guest data pages; ordinary native accesses reach them through
+/// shadows. Guest table pages are never shadowed: their writes must stay visible
+/// to the runtime.
+pub(super) const GUEST_DATA: GuestRam =
+    unsafe { GuestRam::new(DATA_VA, 0x3000, PRIVATE + DATA_OFFSET as u64) };
+/// The owner's whole guest RAM (table pages and data pages), for the walker.
+pub(super) const RAM: GuestRam = unsafe {
+    GuestRam::new(0x1000, 0x4000, PRIVATE + TABLE_OFFSET as u64).and(
+        DATA_VA,
+        0x3000,
+        PRIVATE + DATA_OFFSET as u64,
+    )
+};
 pub unsafe fn initialize() {
-    unsafe {
-        mapping(DATA_VA, 0);
-    }
+    unsafe { clear_mapping(DATA_VA) }
 }
 pub unsafe fn clear_mapping(address: u64) {
-    unsafe { mapping(address & !4095, 0) }
+    tables::unmap(address).unwrap_or_else(|_| stop(REJECTED, 46))
 }
 pub unsafe fn walk(address: u64, access: Access) -> Result<paging::Translation, Fault> {
     unsafe {
@@ -62,7 +39,7 @@ pub unsafe fn walk(address: u64, access: Access) -> Result<paging::Translation, 
         let n = ptr::read_volatile(&raw const (*r).walks);
         ptr::write_volatile(&raw mut (*r).walks, n + 1);
         paging::walk(
-            &mut OwnedTables,
+            &mut GuestTables::new(RAM),
             ptr::read_volatile(&raw const (*r).control),
             address,
             access,
@@ -209,15 +186,9 @@ pub unsafe fn install(address: u64, t: paging::Translation) {
 
 // Physical ownership and native permissions do not require a guest PTE or D bit.
 pub unsafe fn install_ram(address: u64, gpa: u64, writable: bool) {
-    unsafe {
-        if !(DATA_VA..DATA_VA + 0x3000).contains(&gpa) {
-            stop(REJECTED, 44)
-        }
-        let native = IPA + DATA_OFFSET as u64 + (gpa - DATA_VA);
-        let rights = if writable { 0 } else { 1 << 7 };
-        mapping(
-            address & !4095,
-            (native & !4095) | 3 | (1 << 10) | (3 << 8) | (3 << 53) | rights,
-        );
+    match tables::install(address, &GUEST_DATA, gpa, writable) {
+        Ok(()) => {}
+        Err(natemu_abi::shadow::Error::OutsideRam) => stop(REJECTED, 44),
+        Err(_) => stop(REJECTED, 46),
     }
 }

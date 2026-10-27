@@ -5,17 +5,8 @@ use natemu_abi::{alias as profile, paging::Translation, recovery as r, shadow};
 fn record() -> *mut profile::Record {
     (PRIVATE + profile::OFFSET as u64) as *mut profile::Record
 }
-pub unsafe fn leaves() -> [u64; 2] {
-    unsafe {
-        [
-            ptr::read_volatile(
-                (PRIVATE + shadow::leaf_offset(DATA_VA).unwrap() as u64) as *const u64,
-            ),
-            ptr::read_volatile(
-                (PRIVATE + shadow::leaf_offset(other(DATA_VA)).unwrap() as u64) as *const u64,
-            ),
-        ]
-    }
+pub fn leaves() -> [u64; 2] {
+    [DATA_VA, other(DATA_VA)].map(tables::descriptor)
 }
 pub fn data_address(id: u64, pass: u64) -> u64 {
     if coordinator().stack_profile >= 2 {

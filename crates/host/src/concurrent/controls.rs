@@ -7,19 +7,18 @@ fn owner_mappings(memory: &Memory, id: usize) {
     let base = id * RAM_SIZE;
     tables(memory, base, true);
     mixed::private_code(memory, base);
-    let attrs = 3 | 1 << 10 | 3 << 8 | 3 << 53;
-    for offset in (control::RECORD_OFFSET..0x90000).step_by(4096) {
-        memory.word(
-            base + 0x14000 + offset / 4096 * 8,
-            (IPA + (base + offset) as u64) | attrs,
-        );
-    }
-    for offset in (0x93000..0xa0000).step_by(4096) {
-        memory.word(
-            base + 0x14000 + offset / 4096 * 8,
-            (IPA + offset as u64) | attrs,
-        );
-    }
+    map_private(
+        memory,
+        base,
+        &[
+            Span::data(
+                control::RECORD_OFFSET,
+                0x90000 - control::RECORD_OFFSET,
+                base + control::RECORD_OFFSET,
+            ),
+            Span::data(0x93000, 0xa0000 - 0x93000, 0x93000),
+        ],
+    );
     memory.word(base + shadow::LOWER_LEAF + 256 * 8, 0);
 }
 
@@ -119,11 +118,9 @@ mod tests {
                 [0; 8]
             );
             let operand = cc::data(id as u64);
-            assert_eq!(
-                shadow::leaf_offset(operand & !4095),
-                Some(shadow::LOWER_LEAF + 256 * 8)
-            );
-            assert_eq!(shadow::leaf_offset(operand).is_some(), id == 0);
+            // Every owner's operand is in the guest data page that leaf 256 shadows.
+            assert_eq!(operand & !4095, DATA_VA);
+            assert_eq!(operand & 4095 == 0, id == 0);
         }
     }
 }

@@ -34,7 +34,7 @@ pub unsafe fn resolve(address: u64, bytes: u64, access: Access) -> m::Route {
             (*r).walks += 1;
         }
         m::resolve(
-            &mut recovery::OwnedTables,
+            &mut GuestTables::new(recovery::RAM),
             g,
             (*state()).a20,
             address,
@@ -283,11 +283,7 @@ unsafe fn record_fault(first: bool) {
                 stop(PANIC, 222);
             }
             (*round()).faults = 1;
-            copy_record(
-                (&raw mut (*round()).fault_frame).cast(),
-                (&raw const (*shared()).captured).cast(),
-                size_of::<NativeFrame>(),
-            );
+            copy_frame(&raw mut (*round()).fault_frame, &raw const (*shared()).captured);
             (*round()).fault_esr = esr;
             (*round()).fault_far = far;
             (*round()).fault_pc = pc;
@@ -297,11 +293,7 @@ unsafe fn record_fault(first: bool) {
                 stop(PANIC, 222);
             }
             (*round()).dirty_faults = 1;
-            copy_record(
-                (&raw mut (*round()).dirty_frame).cast(),
-                (&raw const (*shared()).captured).cast(),
-                size_of::<NativeFrame>(),
-            );
+            copy_frame(&raw mut (*round()).dirty_frame, &raw const (*shared()).captured);
             (*round()).dirty_esr = esr;
             (*round()).dirty_far = far;
             (*round()).dirty_pc = pc;
@@ -369,11 +361,7 @@ pub unsafe fn completed(fault: u64) -> ! {
         }
         materialize(&(*shared()).captured, 6);
         if first {
-            copy_record(
-                (&raw mut (*round()).first_frame).cast(),
-                (&raw const (*shared()).captured).cast(),
-                size_of::<NativeFrame>(),
-            );
+            copy_frame(&raw mut (*round()).first_frame, &raw const (*shared()).captured);
             copy_record(
                 (&raw mut (*state()).old_memory_after).cast(),
                 (PRIVATE + DATA_OFFSET as u64 + id() * 256) as *const u8,

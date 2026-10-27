@@ -38,6 +38,7 @@ pub const FEX_OR_BODY: [u8; 44] = {
 pub mod alias;
 pub mod concurrency;
 pub mod controls;
+pub mod guest_memory;
 pub mod control_concurrent;
 pub mod maintenance;
 pub mod mixed32;
@@ -60,6 +61,7 @@ pub mod stack_boundary;
 pub mod translation;
 pub mod validation;
 pub mod code_object;
+pub mod execution;
 pub const SUCCESS: u64 = 1;
 pub const REJECTED: u64 = 2;
 pub const NATIVE_FAULT: u64 = 3;

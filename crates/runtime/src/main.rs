@@ -7,11 +7,14 @@ use core::{
     ptr,
 };
 use natemu_abi::*;
+use natemu_abi::guest_memory::{GuestRam, GuestTables, Observer};
+use record::*;
 mod atomic_progress;
 mod coherence;
 mod concurrent;
 mod controls;
 mod coordinator;
+mod execution;
 mod fence;
 mod helper;
 mod ordering;
@@ -20,10 +23,13 @@ mod paging_off_steps;
 mod partial;
 mod partial_progress;
 mod pressure;
+mod record;
 mod recovery;
 mod schedule;
 mod containment;
 mod stack;
+mod table_log;
+mod tables;
 mod translation;
 mod validation;
 
@@ -47,27 +53,6 @@ unsafe extern "C" {
     fn returned();
 }
 
-// Copy quiescent owner records without LLVM expanding aggregate volatile loads
-// into thousands of byte instructions. MaybeUninit preserves structure padding.
-#[inline(never)]
-unsafe fn copy_record(dst: *mut u8, src: *const u8, count: usize) {
-    for i in 0..count {
-        unsafe {
-            let b = ptr::read_volatile(src.add(i).cast::<core::mem::MaybeUninit<u8>>());
-            ptr::write_volatile(dst.add(i).cast::<core::mem::MaybeUninit<u8>>(), b);
-        }
-    }
-}
-unsafe fn read_record<T: Copy>(src: *const T) -> T {
-    let mut result = core::mem::MaybeUninit::<T>::uninit();
-    unsafe {
-        copy_record(result.as_mut_ptr().cast(), src.cast(), size_of::<T>());
-        result.assume_init()
-    }
-}
-unsafe fn write_record<T: Copy>(dst: *mut T, value: T) {
-    unsafe { copy_record(dst.cast(), (&raw const value).cast(), size_of::<T>()) }
-}
 fn shared() -> *mut Shared {
     (PRIVATE + SHARED_OFFSET as u64) as *mut Shared
 }
@@ -97,6 +82,9 @@ unsafe extern "C" fn runtime_main() -> ! {
         ptr::write_volatile(&raw mut (*s).tcr, tcr);
         if current_el != 4 || sctlr & 0x1005 != 0x1005 || actlr & 2 != 2 {
             stop(PANIC, 10);
+        }
+        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::execution::MODE {
+            execution::start();
         }
         if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::partial_progress::MODE {
             partial_progress::initialize();
@@ -142,11 +130,10 @@ unsafe extern "C" fn runtime_main() -> ! {
 unsafe extern "C" fn finish(frame: *const NativeFrame, fault: u64) -> ! {
     unsafe {
         let s = shared();
-        copy_record(
-            (&raw mut (*s).captured).cast(),
-            frame.cast(),
-            size_of::<NativeFrame>(),
-        );
+        copy_frame(&raw mut (*s).captured, frame);
+        if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::execution::MODE {
+            execution::returned(&*frame, fault);
+        }
         if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::partial_progress::MODE {
             partial_progress::finish(fault);
         }

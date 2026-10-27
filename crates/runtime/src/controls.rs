@@ -48,19 +48,19 @@ unsafe fn pae_visit() -> *mut pae::Visit {
             .add((*state()).visits as usize - 1)
     }
 }
-struct PaeTables {
+const SOURCE: GuestRam = unsafe { GuestRam::new(c::RIP, 4096, PRIVATE + r::SOURCE_OFFSET as u64) };
+const PAE_TABLES: GuestRam = unsafe { GuestRam::new(0x1000, 0x5000, PRIVATE + pae::TABLE_OFFSET as u64) };
+/// Hidden-root loads record their entry addresses and never set A/D; walks count.
+struct PaeAccess {
     loading: bool,
     index: usize,
 }
-impl natemu_abi::paging::Tables for PaeTables {
-    fn read(&mut self, gpa: u64) -> Option<u64> {
-        if !(0x1000..0x6000).contains(&gpa) || gpa & 7 != 0 {
-            return None;
-        }
+impl Observer for PaeAccess {
+    fn read(&mut self, gpa: u64, _: u64) -> bool {
         unsafe {
             if self.loading {
                 if self.index >= 4 {
-                    return None;
+                    return false;
                 }
                 (&mut (*pae_visit()).load_addresses)[self.index] = gpa;
                 self.index += 1;
@@ -68,48 +68,14 @@ impl natemu_abi::paging::Tables for PaeTables {
             } else {
                 (*pae_state()).walk_reads += 1;
             }
-            Some(ptr::read_volatile(
-                (PRIVATE + pae::TABLE_OFFSET as u64 + gpa - 0x1000) as *const u64,
-            ))
-        }
-    }
-    fn write(&mut self, gpa: u64, value: u64) -> bool {
-        if self.loading || !(0x1000..0x6000).contains(&gpa) || gpa & 7 != 0 {
-            return false;
-        }
-        unsafe {
-            ptr::write_volatile(
-                (PRIVATE + pae::TABLE_OFFSET as u64 + gpa - 0x1000) as *mut u64,
-                value,
-            );
-            (*pae_state()).walk_writes += 1;
-            asm!("dsb ish");
         }
         true
     }
-}
-struct Tables;
-impl paging32::Tables for Tables {
-    fn read32(&mut self, gpa: u64) -> Option<u32> {
-        if !(0x1000..0x5000).contains(&gpa) || gpa & 3 != 0 {
-            return None;
+    fn write(&mut self, _: u64, _: u64, _: u64) -> bool {
+        if !self.loading {
+            unsafe { (*pae_state()).walk_writes += 1 };
         }
-        Some(unsafe {
-            ptr::read_volatile((PRIVATE + r::TABLE_OFFSET as u64 + gpa - 0x1000) as *const u32)
-        })
-    }
-    fn write32(&mut self, gpa: u64, value: u32) -> bool {
-        if !(0x1000..0x5000).contains(&gpa) || gpa & 3 != 0 {
-            return false;
-        }
-        unsafe {
-            ptr::write_volatile(
-                (PRIVATE + r::TABLE_OFFSET as u64 + gpa - 0x1000) as *mut u32,
-                value,
-            );
-            asm!("dsb ish");
-        }
-        true
+        !self.loading
     }
 }
 unsafe fn route(address: u64, bytes: u64, access: Access) -> Result<(u64, bool), Fault> {
@@ -148,10 +114,13 @@ unsafe fn route_under_authority(
             };
             let t = if mode == 2 {
                 pae::walk(
-                    &mut PaeTables {
-                        loading: false,
-                        index: 0,
-                    },
+                    &mut GuestTables::observed(
+                        PAE_TABLES,
+                        PaeAccess {
+                            loading: false,
+                            index: 0,
+                        },
+                    ),
                     &(*pae_state()).hidden,
                     control,
                     address,
@@ -162,7 +131,7 @@ unsafe fn route_under_authority(
                 control.cr3 &= natemu_abi::paging::PA_MASK;
                 long_mode::walk(control, address, access)?
             } else {
-                paging32::walk(&mut Tables, control, address, access)?
+                paging32::walk(&mut GuestTables::new(recovery::RAM), control, address, access)?
             };
             if !t.wb {
                 return Err(Fault::Unsupported);
@@ -195,11 +164,7 @@ unsafe fn summarize() {
             (*pae_visit()).attempts_after = (*pae_state()).attempts;
             (*pae_visit()).reads_after = (*pae_state()).reads;
         }
-        copy_record(
-            (&raw mut (*v).frame).cast(),
-            (&raw const (*state()).current).cast(),
-            size_of::<NativeFrame>(),
-        );
+        copy_frame(&raw mut (*v).frame, &raw const (*state()).current);
     }
 }
 unsafe fn exception(vector: u64, address: u64, error: u64) -> ! {
@@ -384,12 +349,9 @@ unsafe fn compile(source: &[u8]) -> [u8; 8] {
                 let (gpa, _) =
                     route_under_authority((*guest()).rip, replacement.len as u64, Access::Fetch)
                         .unwrap_or_else(|_| stop(PANIC, 322));
-                copy_record(
-                    actual.as_mut_ptr(),
-                    (PRIVATE + r::SOURCE_OFFSET as u64 + gpa - c::RIP) as *const u8,
-                    replacement.len,
-                );
-                if actual != replacement.bytes {
+                if !SOURCE.copy_out(gpa, &mut actual[..replacement.len])
+                    || actual != replacement.bytes
+                {
                     stop(PANIC, 323);
                 }
                 (*v).fetch_gpa = gpa;
@@ -502,10 +464,13 @@ unsafe fn control(source: &[u8]) {
                         .ok_or(c::Error::Unsupported)?;
                     (*pae_state()).attempts += 1;
                     let entries = pae::load(
-                        &mut PaeTables {
-                            loading: true,
-                            index: 0,
-                        },
+                        &mut GuestTables::observed(
+                            PAE_TABLES,
+                            PaeAccess {
+                                loading: true,
+                                index: 0,
+                            },
+                        ),
                         after[2],
                     )?;
                     hidden = pae::Hidden {
@@ -653,12 +618,10 @@ unsafe fn dispatch() -> ! {
             let fetched = {
                 let guard = concurrent::lock();
                 let result = route_under_authority((*g).rip, instruction.len as u64, Access::Fetch);
-                if let Ok((gpa, _)) = result {
-                    copy_record(
-                        actual.as_mut_ptr(),
-                        (PRIVATE + r::SOURCE_OFFSET as u64 + gpa - c::RIP) as *const u8,
-                        instruction.len,
-                    );
+                if let Ok((gpa, _)) = result
+                    && !SOURCE.copy_out(gpa, &mut actual[..instruction.len])
+                {
+                    stop(REJECTED, 283);
                 }
                 if let Some(guard) = guard {
                     guard
@@ -735,14 +698,15 @@ unsafe fn dispatch() -> ! {
         }
     }
 }
+fn guest_bytes<const N: usize>(gpa: u64) -> [u8; N] {
+    recovery::GUEST_DATA
+        .read_bytes(gpa)
+        .unwrap_or_else(|| stop(PANIC, 288))
+}
 unsafe fn memory_before(gpa: u64) {
     unsafe {
         (*visit()).gpa = gpa;
-        copy_record(
-            (&raw mut (*visit()).memory_before).cast(),
-            (PRIVATE + DATA_OFFSET as u64 + gpa - DATA_VA) as *const u8,
-            16,
-        );
+        (*visit()).memory_before = guest_bytes(gpa);
     }
 }
 #[inline(never)]
@@ -755,11 +719,7 @@ pub unsafe fn finish(fault: u64) -> ! {
         if (*validation()).stage != 1 || (*v).entries != 1 {
             stop(PANIC, 286);
         }
-        copy_record(
-            (&raw mut (*r).current).cast(),
-            (&raw const (*s).captured).cast(),
-            size_of::<NativeFrame>(),
-        );
+        copy_frame(&raw mut (*r).current, &raw const (*s).captured);
         for (guest, native) in [(0, 4), (1, 7), (2, 5), (3, 6)] {
             (*g).gpr[guest] = (*r).current.x[native]
                 & if c::mode(&*g) == Some(4) {
@@ -787,11 +747,7 @@ pub unsafe fn finish(fault: u64) -> ! {
             }
             (*v).faults = 1;
             (*v).exception = [esr, far, pc, spsr];
-            copy_record(
-                (&raw mut (*v).fault_frame).cast(),
-                (&raw const (*s).captured).cast(),
-                size_of::<NativeFrame>(),
-            );
+            copy_frame(&raw mut (*v).fault_frame, &raw const (*s).captured);
             let (gpa, writable) = if concurrent::enabled() {
                 concurrent::fault()
             } else {
@@ -810,11 +766,7 @@ pub unsafe fn finish(fault: u64) -> ! {
             if (*v).gpa == 0 || (*v).gpa != (*r).mapping {
                 stop(PANIC, 288);
             }
-            copy_record(
-                (&raw mut (*v).memory_after).cast(),
-                (PRIVATE + DATA_OFFSET as u64 + (*v).gpa - DATA_VA) as *const u8,
-                16,
-            );
+            (*v).memory_after = guest_bytes((*v).gpa);
         }
         (*g).rip += (*v).bytes;
         complete_visit();
@@ -823,17 +775,14 @@ pub unsafe fn finish(fault: u64) -> ! {
         concurrent::after_native();
         long_mode::after_native(opcode);
         if (*r).profile == 1 && (*r).completed == 3 {
-            let at = (PRIVATE + shadow::leaf_offset(DATA_VA).unwrap() as u64) as *const u64;
-            (*r).warm_before_reload = ptr::read_volatile(at);
+            (*r).warm_before_reload = tables::descriptor(DATA_VA);
             if (*r).mapping != DATA_VA || (*r).warm_before_reload & 3 != 3 {
                 stop(PANIC, 289);
             }
             // Protected fixture writer changes the guest PTE while the old native mapping remains.
-            ptr::write_volatile(
-                (PRIVATE + r::TABLE_OFFSET as u64 + 0x1000 + 256 * 4) as *mut u32,
-                (DATA_VA + 4096) as u32 | 7,
-            );
-            asm!("dsb ish");
+            if !recovery::RAM.write(0x2000 + 256 * 4, (DATA_VA + 4096) as u32 | 7) {
+                stop(PANIC, 289);
+            }
             (*r).fixture_mutated = 1;
         }
         let profile = (*r).profile;
@@ -843,12 +792,12 @@ pub unsafe fn finish(fault: u64) -> ! {
         let second = profile == 21 && completed == 8;
         if (first || second) && !concurrent::enabled() {
             // Fixture changes memory roots without changing the loaded hidden set.
-            let at = (PRIVATE + pae::TABLE_OFFSET as u64 + pae::ROOT - 0x1000) as *mut u64;
-            ptr::write_volatile(at, if second { 0x2001 } else { 0x4001 });
-            if matches!(profile, 18 | 19) {
-                ptr::write_volatile(at.add(3), 0x21);
+            let root: u64 = if second { 0x2001 } else { 0x4001 };
+            if !PAE_TABLES.write(pae::ROOT, root)
+                || (matches!(profile, 18 | 19) && !PAE_TABLES.write(pae::ROOT + 24, 0x21u64))
+            {
+                stop(PANIC, 289);
             }
-            asm!("dsb ish");
             (*pae_state()).mutations += 1;
             if profile == 15 {
                 evict();

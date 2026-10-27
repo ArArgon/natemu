@@ -22,22 +22,6 @@ pub(super) fn upper_links(memory: &Memory) -> [u64; 3] {
     ]
 }
 
-pub(super) fn prepare_shadow(memory: &Memory) {
-    page_tables(memory);
-    let descriptor = |offset: usize| IPA + offset as u64 + 3;
-    memory.word(shadow::UPPER_ROOT + 256 * 8, descriptor(shadow::UPPER_L1));
-    memory.word(shadow::UPPER_L1, descriptor(shadow::UPPER_L2));
-    memory.word(shadow::UPPER_L2, descriptor(shadow::UPPER_LEAF));
-    // The runtime can update its own page tables through private, non-executable aliases.
-    for offset in (shadow::UPPER_ROOT..shadow::UPPER_LEAF + 4096).step_by(4096) {
-        memory.word(
-            0x14000 + offset / 4096 * 8,
-            (IPA + offset as u64) | 3 | 1 << 10 | 3 << 8 | 3 << 53,
-        );
-    }
-    memory.word(shadow::LOWER_LEAF + 256 * 8, 0);
-}
-
 pub fn run(args: &[String]) -> Result<()> {
     let live = args[2] == "i4v-live";
     let reply_mutation: i64 = if args.len() == 10 {
@@ -82,7 +66,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let vm_nonce = if live { new_vm_nonce()? } else { 0 };
     let memory = Memory::new()?;
     load_resident(&memory, &args[1])?;
-    prepare_shadow(&memory);
+    single_owner_space(&memory, true);
     memory.copy(CODE_OFFSET, &native);
     memory.copy(recover::SOURCE_OFFSET, &[0x48, 0x8b, 0x03]);
 

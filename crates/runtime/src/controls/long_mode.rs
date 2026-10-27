@@ -1,9 +1,6 @@
 //! IA-32e fixture transactions reuse the control dispatcher and memory authority.
 use super::*;
-use natemu_abi::{
-    modes as m,
-    paging::{Tables as TableAccess, Translation},
-};
+use natemu_abi::{modes as m, paging::Translation};
 
 pub(super) fn state() -> *mut m::State {
     (PRIVATE + m::OFFSET as u64) as *mut m::State
@@ -15,32 +12,9 @@ unsafe fn visit() -> *mut m::Visit {
             .add((*super::state()).visits as usize - 1)
     }
 }
-struct Tables;
-impl TableAccess for Tables {
-    fn read(&mut self, gpa: u64) -> Option<u64> {
-        if !(0x6000..0xa000).contains(&gpa) || gpa & 7 != 0 {
-            return None;
-        }
-        Some(unsafe {
-            ptr::read_volatile((PRIVATE + m::TABLE_OFFSET as u64 + gpa - 0x6000) as *const u64)
-        })
-    }
-    fn write(&mut self, gpa: u64, value: u64) -> bool {
-        if !(0x6000..0xa000).contains(&gpa) || gpa & 7 != 0 {
-            return false;
-        }
-        unsafe {
-            ptr::write_volatile(
-                (PRIVATE + m::TABLE_OFFSET as u64 + gpa - 0x6000) as *mut u64,
-                value,
-            );
-            asm!("dsb ish");
-        }
-        true
-    }
-}
+pub(super) const TABLES: GuestRam = unsafe { GuestRam::new(0x6000, 0x4000, PRIVATE + m::TABLE_OFFSET as u64) };
 pub(super) fn walk(control: Control, address: u64, access: Access) -> Result<Translation, Fault> {
-    natemu_abi::paging::walk(&mut Tables, control, address, access)
+    natemu_abi::paging::walk(&mut GuestTables::new(TABLES), control, address, access)
 }
 pub(super) unsafe fn initial_valid(profile: u64) -> bool {
     unsafe {
@@ -104,11 +78,9 @@ unsafe fn read_guest(address: u64, bytes: usize) -> [u8; 16] {
             }
         };
         let mut value = [0; 16];
-        copy_record(
-            value.as_mut_ptr(),
-            (PRIVATE + DATA_OFFSET as u64 + gpa - DATA_VA) as *const u8,
-            bytes,
-        );
+        if !recovery::GUEST_DATA.copy_out(gpa, &mut value[..bytes]) {
+            stop(REJECTED, 270);
+        }
         (*state()).reads += 1;
         if let Some(guard) = guard {
             (*concurrent::owner()).metadata_gpas[(*super::state()).visits as usize - 1]
@@ -199,11 +171,9 @@ pub(super) unsafe fn instruction(source: &[u8]) -> bool {
         (*super::state()).generation = generation;
         invalidate();
         if (*super::state()).profile == 35 {
-            ptr::write_volatile(
-                (PRIVATE + m::TABLE_OFFSET as u64 + 0x3000 + 258 * 8) as *mut u64,
-                0,
-            );
-            asm!("dsb ish");
+            if !TABLES.write(0x9000 + 258 * 8, 0u64) {
+                stop(PANIC, 302);
+            }
             (*state()).mutations += 1;
         }
         complete_visit();
@@ -214,11 +184,9 @@ pub(super) unsafe fn instruction(source: &[u8]) -> bool {
 pub(super) unsafe fn after_native(opcode: u8) {
     unsafe {
         if (*super::state()).profile == 34 && opcode == 0x48 {
-            ptr::write_volatile(
-                (PRIVATE + m::TABLE_OFFSET as u64 + 0x3000 + 256 * 8) as *mut u64,
-                0,
-            );
-            asm!("dsb ish");
+            if !TABLES.write(0x9000 + 256 * 8, 0u64) {
+                stop(PANIC, 302);
+            }
             (*state()).mutations += 1;
         }
     }

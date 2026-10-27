@@ -188,11 +188,7 @@ pub unsafe fn finish(fault: u64) -> ! {
             stop(REJECTED, 226);
         }
         if fault == 0 {
-            copy_record(
-                (&raw mut (*r).prefixes[step]).cast(),
-                (&raw const (*s).captured).cast(),
-                size_of::<NativeFrame>(),
-            );
+            copy_frame(&raw mut (*r).prefixes[step], &raw const (*s).captured);
             materialize(&raw const (*s).captured, step + 1);
             (*r).guest_prefixes[step] = [(*g).gpr[0], (*g).gpr[1], (*g).gpr[2], (*g).rip];
             (*v).completed += 1;
@@ -200,11 +196,7 @@ pub unsafe fn finish(fault: u64) -> ! {
                 (*v).stage = 2;
                 stop(SUCCESS, 0);
             }
-            copy_record(
-                (&raw mut (*s).initial).cast(),
-                (&raw const (*s).captured).cast(),
-                size_of::<NativeFrame>(),
-            );
+            copy_frame(&raw mut (*s).initial, &raw const (*s).captured);
             begin_step()
         }
         let (esr, far, pc, spsr) = ((*s).esr, (*s).far, (*s).elr, (*s).spsr);
@@ -243,11 +235,7 @@ pub unsafe fn finish(fault: u64) -> ! {
             stop(PANIC, 228);
         }
         let trace = &raw mut (*recovery).trace[count];
-        copy_record(
-            (&raw mut (*trace).frame).cast(),
-            (&raw const (*s).captured).cast(),
-            size_of::<NativeFrame>(),
-        );
+        copy_frame(&raw mut (*trace).frame, &raw const (*s).captured);
         (*trace).esr = esr;
         (*trace).far = far;
         (*trace).elr = pc;
@@ -263,14 +251,10 @@ pub unsafe fn finish(fault: u64) -> ! {
                     16,
                 );
                 (*trace).outcome = 1;
-                let slot = shadow::leaf_offset(far & !4095).unwrap_or_else(|| stop(REJECTED, 222));
-                let pte = (PRIVATE + slot as u64) as *mut u64;
                 // begin_step invalidated this leaf; ownership and low-bit alignment were checked above.
-                ptr::write_volatile(
-                    pte,
-                    (IPA + (offset & !4095) as u64) | 3 | (1 << 10) | (3 << 8) | (3 << 53),
-                );
-                asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
+                tables::space()
+                    .map(far & !4095, IPA + (offset & !4095) as u64, true)
+                    .unwrap_or_else(|_| stop(REJECTED, 222));
                 (*recovery).retries += 1;
                 resume_exception(&raw const (*s).captured, pc, spsr)
             }

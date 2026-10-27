@@ -165,47 +165,22 @@ fn stack_roles(n: usize) -> stack_concurrent::Roles {
 
 // Each root has its own boot alias and private state/stacks. The immutable
 // native object, guest data and coordinator deliberately share physical pages.
+/// Owner `base / RAM_SIZE`'s private tables. Code pages, the coordinator and
+/// common pages, and guest data map the shared window 0; the rest is the owner's.
 fn tables(memory: &Memory, base: usize, aliases: bool) {
-    let word = |at, value| memory.word(base + at, value);
-    let table = |offset| IPA + base as u64 + offset + 3;
-    let attrs = 3 | 1 << 10 | 3 << 8;
-    word(0x10000, table(0x11000));
-    word(0x10000 + 256 * 8, table(0x12000));
-    word(0x11008, IPA | 1 | 1 << 10 | 3 << 8);
-    word(0x11000, table(0x15000));
-    word(0x15000, table(0x16000));
-    word(
-        0x16000 + 256 * 8,
-        (IPA + DATA_OFFSET as u64) | attrs | (3 << 53),
-    );
-    word(0x12008, table(0x13000));
-    word(0x13000, table(0x14000));
-    if aliases {
-        word(shadow::UPPER_ROOT + 256 * 8, table(shadow::UPPER_L1 as u64));
-        word(shadow::UPPER_L1, table(shadow::UPPER_L2 as u64));
-        word(shadow::UPPER_L2, table(shadow::UPPER_LEAF as u64));
-    }
-    for offset in (0..RAM_SIZE).step_by(4096) {
-        let text = resident::executable_offset(offset)
-            || (CODE_OFFSET..CODE_OFFSET + 8192).contains(&offset);
-        let writable = (0x10000..if aliases { 0x1b000 } else { 0x17000 }).contains(&offset)
-            || (SHARED_OFFSET..SHARED_OFFSET + 0x10000).contains(&offset)
-            || (BANK_OFFSET..BANK_OFFSET + 0x2000).contains(&offset)
-            || (0x70000..0x84000).contains(&offset)
-            || (0x50000..0x54000).contains(&offset)
-            || (0x60000..0x64000).contains(&offset)
-            || (COORD_OFFSET..0x93000).contains(&offset);
-        if text || writable {
-            let common = (CODE_OFFSET..CODE_OFFSET + 8192).contains(&offset)
-                || (COORD_OFFSET..0x93000).contains(&offset)
-                || (DATA_OFFSET..0x84000).contains(&offset);
-            let pa = IPA + offset as u64 + if common { 0 } else { base as u64 };
-            word(
-                0x14000 + offset / 4096 * 8,
-                pa | attrs | if text { 1 << 7 } else { 3 << 53 },
-            );
-        }
-    }
+    let own = |offset, bytes| Span::data(offset, bytes, base + offset);
+    let common = |offset, bytes| Span::data(offset, bytes, offset);
+    let mut spans = resident_text(base);
+    spans.extend([
+        Span::text(CODE_OFFSET, 8192, CODE_OFFSET),
+        own(SHARED_OFFSET, 0x10000),
+        own(BANK_OFFSET, 0x2000),
+        own(0x50000, 0x4000),
+        own(0x60000, 0x4000),
+        common(DATA_OFFSET, 0x84000 - DATA_OFFSET),
+        common(COORD_OFFSET, 0x93000 - COORD_OFFSET),
+    ]);
+    private_space(memory, base, &spans, &[(DATA_VA, DATA_OFFSET)], aliases);
 }
 
 fn prepare_cpu(id: usize, tcr: u64) -> Result<Cpu> {

@@ -36,7 +36,7 @@ unsafe fn guard(step: usize, frame: &NativeFrame) {
         }
         // Single-page aligned accesses in this slice. Noncanonical spans above
         // still fault architecturally; other unsupported spans never execute.
-        if operand & (width - 1) != 0 || shadow::leaf_offset(operand & !4095).is_none() {
+        if operand & (width - 1) != 0 {
             stop(REJECTED, 114)
         }
     }

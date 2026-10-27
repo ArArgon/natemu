@@ -104,7 +104,7 @@ pub unsafe fn initialize() -> ! {
         }
         // This first profile admits aligned ordinary RAM within a single page.
         // Wider spans require per-subaccess effects and are still unsupported.
-        if operand & 7 != 0 || shadow::leaf_offset(operand & !4095).is_none() {
+        if operand & 7 != 0 {
             stop(REJECTED, 94)
         }
         if (*v).live == 1 {

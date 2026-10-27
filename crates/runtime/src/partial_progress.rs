@@ -6,7 +6,7 @@ use natemu_abi::{
     coherence::Walk,
     concurrency as n,
     paging::{self, Access, Control},
-    partial_progress as p, schedule as sc, shadow,
+    partial_progress as p, schedule as sc,
 };
 unsafe extern "C" {
     fn partial_store(address: u64, value: u64);
@@ -33,46 +33,8 @@ fn checked<T>(r: Result<T, u64>) -> T {
 fn pause() {
     core::hint::spin_loop();
 }
-fn leaf() -> *mut u64 {
-    (PRIVATE + shadow::LOWER_LEAF as u64 + 256 * 8) as *mut u64
-}
-fn guest_leaf() -> *mut u64 {
-    (PRIVATE + p::TABLE_OFFSET as u64 + 12288 + 256 * 8) as *mut u64
-}
-fn table(gpa: u64) -> Option<*mut u64> {
-    (gpa & 7 == 0 && (0x1000..0x5000).contains(&gpa))
-        .then_some((PRIVATE + p::TABLE_OFFSET as u64 + gpa - 0x1000) as *mut u64)
-}
-struct Tables(*mut Walk);
-impl paging::Tables for Tables {
-    fn read(&mut self, gpa: u64) -> Option<u64> {
-        unsafe {
-            let at = table(gpa)?;
-            let w = &mut *self.0;
-            if w.read_count >= 4 {
-                return None;
-            }
-            let value = ptr::read_volatile(at);
-            w.reads[w.read_count as usize] = [gpa, value];
-            w.read_count += 1;
-            Some(value)
-        }
-    }
-    fn write(&mut self, gpa: u64, value: u64) -> bool {
-        unsafe {
-            let Some(at) = table(gpa) else { return false };
-            let w = &mut *self.0;
-            if w.write_count >= 4 {
-                return false;
-            }
-            w.writes[w.write_count as usize] = [gpa, ptr::read_volatile(at), value];
-            w.write_count += 1;
-            ptr::write_volatile(at, value);
-            asm!("dsb ish");
-            true
-        }
-    }
-}
+const RAM: GuestRam = unsafe { GuestRam::new(p::DATA, 0x4000, PRIVATE + p::RAM_OFFSET as u64) };
+const TABLES: GuestRam = unsafe { GuestRam::new(0x1000, 0x4000, PRIVATE + p::TABLE_OFFSET as u64) };
 unsafe fn walk(g: &coordinator::Guard<'_>, address: u64, access: Access) -> paging::Translation {
     unsafe {
         let o = owner();
@@ -89,7 +51,7 @@ unsafe fn walk(g: &coordinator::Guard<'_>, address: u64, access: Access) -> pagi
             Access::Fetch => 2,
         };
         let t = paging::walk(
-            &mut Tables(w),
+            &mut GuestTables::observed(TABLES, table_log::WalkLog(w)),
             Control {
                 cr3: 0x1000,
                 cpl: 0,
@@ -113,25 +75,16 @@ unsafe fn walk(g: &coordinator::Guard<'_>, address: u64, access: Access) -> pagi
         t
     }
 }
-unsafe fn clear() {
-    unsafe {
-        ptr::write_volatile(leaf(), 0);
-        asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
-    }
+/// The one shadowed guest page of this profile.
+fn clear() {
+    tables::unmap(p::DATA).unwrap_or_else(|_| stop(REJECTED, 842));
 }
 unsafe fn install(t: paging::Translation) {
-    unsafe {
-        if !t.wb || !(p::DATA..p::DATA + 8192).contains(&t.gpa) {
-            stop(REJECTED, 842);
-        }
-        clear();
-        let pa = (IPA + p::RAM_OFFSET as u64 + t.gpa - p::DATA) & !4095;
-        ptr::write_volatile(
-            leaf(),
-            pa | 3 | 1 << 10 | 3 << 8 | 3 << 53 | if t.writable && t.dirty { 0 } else { 1 << 7 },
-        );
-        asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
+    if !t.wb || !(p::DATA..p::DATA + 8192).contains(&t.gpa) {
+        stop(REJECTED, 842);
     }
+    tables::install(p::DATA, &RAM, t.gpa, t.writable && t.dirty)
+        .unwrap_or_else(|_| stop(REJECTED, 842));
 }
 unsafe fn snapshot(index: usize) {
     unsafe {
@@ -198,8 +151,9 @@ unsafe fn try_mutate(g: &coordinator::Guard<'_>) -> bool {
             return false;
         }
         snapshot(1);
-        ptr::write_volatile(guest_leaf(), (p::DATA + 4096) | 7);
-        asm!("dsb ish");
+        if !TABLES.write(0x4000 + 256 * 8, (p::DATA + 4096) | 7) {
+            stop(PANIC, 843);
+        }
         (*common()).mutated = 1;
         (*common()).destination_generation = 2;
         checked(g.trace(p::MUTATED, id()));
@@ -235,8 +189,7 @@ pub unsafe fn initialize() -> ! {
             if t.gpa != (*o).before.rip || !t.wb {
                 stop(REJECTED, 846);
             }
-            let source = (PRIVATE + p::SOURCE_OFFSET as u64 + id() * 256) as *const u8;
-            if core::slice::from_raw_parts(source, 2) != p::SOURCE {
+            if !RAM.matches(p::RIP + id() * 256, &p::SOURCE) {
                 stop(REJECTED, 847);
             }
             let t = walk(&g, p::destination(id()), Access::Write);
@@ -506,12 +459,12 @@ pub unsafe fn finish(fault: u64) -> ! {
                     if id() == (*common()).actor {
                         let rip = (*o).before.rip + 16;
                         let route = walk(&g, rip, Access::Fetch);
-                        let source =
-                            (PRIVATE + p::SOURCE_OFFSET as u64 + id() * 256 + 16) as *const u8;
                         if route.gpa != rip
                             || !route.wb
-                            || core::slice::from_raw_parts(source, 3)
-                                != natemu_abi::containment::PARTIAL_SOURCE
+                            || !RAM.matches(
+                                p::RIP + id() * 256 + 16,
+                                &natemu_abi::containment::PARTIAL_SOURCE,
+                            )
                         {
                             stop(REJECTED, 854);
                         }

@@ -23,25 +23,23 @@ pub(super) fn owner_mappings(memory: &Memory, id: usize, n: usize) {
     let base = id * RAM_SIZE;
     tables(memory, base, false);
     mixed::private_code(memory, base);
-    let attrs = 3 | 1 << 10 | 3 << 8 | 3 << 53;
-    for offset in (o::RECORD_OFFSET..o::COMMON_OFFSET).step_by(4096) {
-        memory.word(
-            base + 0x14000 + offset / 4096 * 8,
-            (IPA + (base + offset) as u64) | attrs,
-        );
-    }
-    for offset in (o::COMMON_OFFSET..o::TABLE_OFFSET + 16384).step_by(4096) {
-        memory.word(
-            base + 0x14000 + offset / 4096 * 8,
-            (IPA + offset as u64) | attrs,
-        );
-    }
-    for offset in (0..o::TRIALS * image_bytes()).step_by(4096) {
-        memory.word(
-            base + 0x14000 + (o::IMAGE_VA_OFFSET + offset) / 4096 * 8,
-            (IPA + (n * RAM_SIZE + offset) as u64) | attrs,
-        );
-    }
+    map_private(
+        memory,
+        base,
+        &[
+            Span::data(
+                o::RECORD_OFFSET,
+                o::COMMON_OFFSET - o::RECORD_OFFSET,
+                base + o::RECORD_OFFSET,
+            ),
+            Span::data(
+                o::COMMON_OFFSET,
+                o::TABLE_OFFSET + 16384 - o::COMMON_OFFSET,
+                o::COMMON_OFFSET,
+            ),
+            Span::data(o::IMAGE_VA_OFFSET, o::TRIALS * image_bytes(), n * RAM_SIZE),
+        ],
+    );
     for entry in 256..=258 {
         memory.word(base + shadow::LOWER_LEAF + entry * 8, 0);
     }
@@ -224,14 +222,12 @@ pub fn run(args: &[String]) -> Result<()> {
             }
         });
         let supplemental = n * RAM_SIZE + a::BACKING_OFFSET;
-        let attrs = 3 | 1 << 10 | 3 << 8 | 3 << 53;
         for id in 0..n {
-            for page in (0..a::BYTES).step_by(4096) {
-                memory.word(
-                    id * RAM_SIZE + 0x14000 + (a::OFFSET + page) / 4096 * 8,
-                    (IPA + (supplemental + page) as u64) | attrs,
-                );
-            }
+            map_private(
+                &memory,
+                id * RAM_SIZE,
+                &[Span::data(a::OFFSET, a::BYTES, supplemental)],
+            );
         }
         memory.write_record(
             supplemental,

@@ -4,7 +4,13 @@ use std::mem::{align_of, size_of};
 use std::{env, ffi::c_void, fs, ptr};
 use vm::*;
 
+mod admission;
 mod concurrent;
+mod drivers {
+    pub(crate) mod program;
+}
+mod execution;
+mod json;
 #[cfg(test)]
 #[path = "../../runtime/src/coordinator.rs"]
 mod coordinator_tests;
@@ -64,6 +70,9 @@ fn seed(index: usize) -> (NativeFrame, [u8; 512], [u8; 256]) {
 }
 fn run() -> Result<()> {
     let a: Vec<_> = env::args().collect();
+    if (a.len() == 6 || a.len() == 7) && a[2] == "run-program" {
+        return drivers::program::run(&a);
+    }
     if a.len() == 9 && a[2] == "i4v-containment" {
         return concurrent::containment::run(&a);
     }
@@ -141,7 +150,7 @@ fn run() -> Result<()> {
     }
     let memory = Memory::new()?;
     load_resident(&memory, &a[1])?;
-    page_tables(&memory);
+    single_owner_space(&memory, false);
     let mut code = match kind {
         CONTROL => NOP.to_vec(),
         LIVE_LOAD => fex,

@@ -120,67 +120,51 @@ unsafe fn ready() -> bool {
         }
     }
 }
+// Fixture leaves: the legacy pair, the PAE pair and the long-mode data leaf.
+fn leaf_gpa(i: usize) -> u64 {
+    [0x2000 + 256 * 4, 0x4000 + 256 * 4, 0x3000 + 256 * 8, 0x5000 + 256 * 8, 0x9000 + 256 * 8][i]
+}
 unsafe fn leaves() -> [u64; 5] {
     unsafe {
-        let mut out = [0; 5];
         let profile = (*state()).profile;
-        if profile < 13 {
-            out[0] = ptr::read_volatile(
-                (PRIVATE + r::TABLE_OFFSET as u64 + 0x1000 + 256 * 4) as *const u32,
-            ) as u64;
-            out[1] = ptr::read_volatile(
-                (PRIVATE + r::TABLE_OFFSET as u64 + 0x3000 + 256 * 4) as *const u32,
-            ) as u64;
-        } else {
-            out[2] = ptr::read_volatile(
-                (PRIVATE + pae::TABLE_OFFSET as u64 + 0x2000 + 256 * 8) as *const u64,
-            );
-            out[3] = ptr::read_volatile(
-                (PRIVATE + pae::TABLE_OFFSET as u64 + 0x4000 + 256 * 8) as *const u64,
-            );
-            if profile >= 22 {
-                out[4] = ptr::read_volatile(
-                    (PRIVATE + natemu_abi::modes::TABLE_OFFSET as u64 + 0x3000 + 256 * 8)
-                        as *const u64,
-                );
+        let read = |i: usize| {
+            if i < 2 {
+                recovery::RAM.read::<u32>(leaf_gpa(i)).map(u64::from)
+            } else if i < 4 {
+                PAE_TABLES.read::<u64>(leaf_gpa(i))
+            } else {
+                long_mode::TABLES.read::<u64>(leaf_gpa(i))
             }
-        }
-        out
+            .unwrap_or_else(|| stop(PANIC, 339))
+        };
+        core::array::from_fn(|i| match i {
+            0 | 1 if profile < 13 => read(i),
+            2 | 3 if profile >= 13 => read(i),
+            4 if profile >= 22 => read(i),
+            _ => 0,
+        })
     }
 }
 unsafe fn mutate() {
     unsafe {
         let values = leaves();
-        let next = |value: u64| {
-            if value & natemu_abi::paging::PA_MASK == DATA_VA {
+        let profile = (*state()).profile;
+        for (i, value) in values.into_iter().enumerate() {
+            let next = if value & natemu_abi::paging::PA_MASK == DATA_VA {
                 DATA_VA + 4096 | 7
             } else {
                 DATA_VA | 7
-            }
-        };
-        if (*state()).profile < 13 {
-            for (i, offset) in [0x1000, 0x3000].into_iter().enumerate() {
-                ptr::write_volatile(
-                    (PRIVATE + r::TABLE_OFFSET as u64 + offset + 256 * 4) as *mut u32,
-                    next(values[i]) as u32,
-                );
-            }
-        } else {
-            for (i, offset) in [0x2000, 0x4000].into_iter().enumerate() {
-                ptr::write_volatile(
-                    (PRIVATE + pae::TABLE_OFFSET as u64 + offset + 256 * 8) as *mut u64,
-                    next(values[i + 2]),
-                );
-            }
-            if (*state()).profile >= 22 {
-                ptr::write_volatile(
-                    (PRIVATE + natemu_abi::modes::TABLE_OFFSET as u64 + 0x3000 + 256 * 8)
-                        as *mut u64,
-                    next(values[4]),
-                );
+            };
+            let written = match i {
+                0 | 1 if profile < 13 => recovery::RAM.write(leaf_gpa(i), next as u32),
+                2 | 3 if profile >= 13 => PAE_TABLES.write(leaf_gpa(i), next),
+                4 if profile >= 22 => long_mode::TABLES.write(leaf_gpa(i), next),
+                _ => true,
+            };
+            if !written {
+                stop(PANIC, 339);
             }
         }
-        asm!("dsb ish");
     }
 }
 // Called between instructions. An ordinary grant may include the immediately
@@ -283,10 +267,7 @@ pub(super) unsafe fn boundary() {
                 (*state()).mapping = gpa;
                 (*owner()).route = gpa;
                 (*owner()).writable = 0;
-                let pte = ptr::read_volatile(
-                    (PRIVATE + shadow::leaf_offset(operand() & !4095).unwrap() as u64)
-                        as *const u64,
-                );
+                let pte = tables::descriptor(operand());
                 (*owner()).maintenance_acks[(*p).total as usize] = [
                     (*p).epoch,
                     gpa,
@@ -343,16 +324,8 @@ pub(super) unsafe fn before_native(source: &[u8]) {
         (*out).heads = (*p).total;
         (*out).epoch = (*p).epoch;
         (*out).gpa = gpa;
-        copy_record(
-            (&raw mut (*out).initial).cast(),
-            (&raw const (*shared()).initial).cast(),
-            size_of::<NativeFrame>(),
-        );
-        copy_record(
-            (&raw mut (*out).before).cast(),
-            (PRIVATE + DATA_OFFSET as u64 + gpa - DATA_VA) as *const u8,
-            256,
-        );
+        copy_frame(&raw mut (*out).initial, &raw const (*shared()).initial);
+        (*out).before = guest_bytes(gpa);
         (*owner()).interval_visits[index] = (*state()).visits;
         attempt(&g);
     }
@@ -372,22 +345,10 @@ pub(super) unsafe fn native_done() {
         if (*out).ordinal == 0 || (*out).epoch != (*p).epoch {
             stop(PANIC, 339);
         }
-        copy_record(
-            (&raw mut (*out).captured).cast(),
-            (&raw const (*shared()).captured).cast(),
-            size_of::<NativeFrame>(),
-        );
-        copy_record(
-            (&raw mut (*out).after).cast(),
-            (PRIVATE + DATA_OFFSET as u64 + (*out).gpa - DATA_VA) as *const u8,
-            256,
-        );
+        copy_frame(&raw mut (*out).captured, &raw const (*shared()).captured);
+        (*out).after = guest_bytes((*out).gpa);
         if (*v).faults != 0 {
-            copy_record(
-                (&raw mut (*out).dirty_frame).cast(),
-                (&raw const (*v).fault_frame).cast(),
-                size_of::<NativeFrame>(),
-            );
+            copy_frame(&raw mut (*out).dirty_frame, &raw const (*v).fault_frame);
             (*out).faults = (*v).faults;
             [(*out).esr, (*out).far, (*out).pc, (*out).spsr] = (*v).exception;
         }

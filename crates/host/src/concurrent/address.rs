@@ -58,19 +58,22 @@ fn owner_mappings(memory: &Memory, id: usize) {
     let base = id * RAM_SIZE;
     tables(memory, base, false);
     mixed::private_code(memory, base);
-    let attrs = 3 | 1 << 10 | 3 << 8 | 3 << 53;
-    for offset in (a::RECORD_OFFSET..0x90000).step_by(4096) {
-        memory.word(
-            base + 0x14000 + offset / 4096 * 8,
-            (IPA + (base + offset) as u64) | attrs,
-        );
-    }
-    for offset in (a::SHARED_OFFSET..0xa0000).step_by(4096) {
-        memory.word(
-            base + 0x14000 + offset / 4096 * 8,
-            (IPA + offset as u64) | attrs,
-        );
-    }
+    map_private(
+        memory,
+        base,
+        &[
+            Span::data(
+                a::RECORD_OFFSET,
+                0x90000 - a::RECORD_OFFSET,
+                base + a::RECORD_OFFSET,
+            ),
+            Span::data(
+                a::SHARED_OFFSET,
+                0xa0000 - a::SHARED_OFFSET,
+                a::SHARED_OFFSET,
+            ),
+        ],
+    );
     // Offset addresses must fault; their physical pages have different byte offsets.
     memory.word(base + shadow::LOWER_LEAF + 256 * 8, 0);
 }

@@ -48,9 +48,53 @@ pub struct Translation {
     pub dirty: bool,
     pub wb: bool,
 }
+/// Outcome of replacing a table entry the walker has just read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Update {
+    /// The entry now holds the new value (possibly written by another agent).
+    Written,
+    /// Another agent changed the entry since it was read; the walk restarts.
+    Changed,
+    /// The memory refused the update (bounds or instrumentation).
+    Refused,
+}
 pub trait Tables {
     fn read(&mut self, gpa: u64) -> Option<u64>;
-    fn write(&mut self, gpa: u64, value: u64) -> bool;
+    /// Replace `old`, the value just read at `gpa`, with `new`.
+    fn write(&mut self, gpa: u64, old: u64, new: u64) -> Update;
+}
+
+/// x86 re-walks after losing an A/D race; the bound contains a livelock as
+/// `Fault::Unsupported` instead of spinning in the resident.
+pub const WALK_ATTEMPTS: usize = 8;
+
+/// Why one walk attempt stopped.
+pub(crate) enum Stop {
+    Fault(Fault),
+    Restart,
+}
+impl From<Fault> for Stop {
+    fn from(f: Fault) -> Self {
+        Self::Fault(f)
+    }
+}
+pub(crate) fn applied(update: Update) -> Result<(), Stop> {
+    match update {
+        Update::Written => Ok(()),
+        Update::Changed => Err(Stop::Restart),
+        Update::Refused => Err(Fault::Unsupported.into()),
+    }
+}
+/// Repeat `attempt` while it restarts, at most `WALK_ATTEMPTS` times.
+pub(crate) fn retrying<R>(mut attempt: impl FnMut() -> Result<R, Stop>) -> Result<R, Fault> {
+    for _ in 0..WALK_ATTEMPTS {
+        match attempt() {
+            Ok(r) => return Ok(r),
+            Err(Stop::Fault(f)) => return Err(f),
+            Err(Stop::Restart) => {}
+        }
+    }
+    Err(Fault::Unsupported)
 }
 
 pub fn walk<T: Tables>(
@@ -59,11 +103,20 @@ pub fn walk<T: Tables>(
     va: u64,
     access: Access,
 ) -> Result<Translation, Fault> {
+    retrying(|| walk_once(memory, c, va, access))
+}
+
+fn walk_once<T: Tables>(
+    memory: &mut T,
+    c: Control,
+    va: u64,
+    access: Access,
+) -> Result<Translation, Stop> {
     if !matches!(c.cpl, 0 | 3) || c.wp > 1 || c.nxe > 1 || c.smep > 1 || c.cr3 & !PA_MASK != 0 {
-        return Err(Fault::Unsupported);
+        return Err(Fault::Unsupported.into());
     }
     if !canonical(va) {
-        return Err(Fault::Noncanonical);
+        return Err(Fault::Noncanonical.into());
     }
     let base_error: u64 = if access == Access::Write { 2 } else { 0 }
         | if c.cpl == 3 { 4 } else { 0 }
@@ -82,7 +135,7 @@ pub fn walk<T: Tables>(
         let at = table + ((va >> (12 + 9 * (level - 1))) & 511) * 8;
         let value = memory.read(at).ok_or(Fault::Unsupported)?;
         if value & 1 == 0 {
-            return Err(pf(0));
+            return Err(pf(0).into());
         }
         let large = level == 2 && value & 128 != 0;
         if value & 0x000f_ff00_0000_0000 != 0
@@ -90,7 +143,7 @@ pub fn walk<T: Tables>(
             || (level >= 3 && value & 128 != 0)
             || (large && value & 0x1fe000 != 0)
         {
-            return Err(pf(9));
+            return Err(pf(9).into());
         }
         rw &= value & 2 != 0;
         user &= value & 4 != 0;
@@ -103,11 +156,11 @@ pub fn walk<T: Tables>(
                 || (access == Access::Write && !rw && (c.cpl == 3 || c.wp != 0))
                 || (access == Access::Fetch && (!executable || (c.cpl == 0 && c.smep != 0 && user)))
             {
-                return Err(pf(1));
+                return Err(pf(1).into());
             }
             let next = value | ACCESSED | if access == Access::Write { DIRTY } else { 0 };
-            if next != value && !memory.write(at, next) {
-                return Err(Fault::Unsupported);
+            if next != value {
+                applied(memory.write(at, value, next))?;
             }
             let size = if large { 0x20_0000 } else { 4096 };
             return Ok(Translation {
@@ -120,12 +173,12 @@ pub fn walk<T: Tables>(
                 wb,
             });
         }
-        if value & ACCESSED == 0 && !memory.write(at, value | ACCESSED) {
-            return Err(Fault::Unsupported);
+        if value & ACCESSED == 0 {
+            applied(memory.write(at, value, value | ACCESSED))?;
         }
         table = value & PA_MASK;
     }
-    Err(Fault::Unsupported)
+    Err(Fault::Unsupported.into())
 }
 
 #[cfg(test)]
@@ -149,12 +202,12 @@ mod tests {
         fn read(&mut self, p: u64) -> Option<u64> {
             self.0.get((p / 8) as usize).copied()
         }
-        fn write(&mut self, p: u64, v: u64) -> bool {
+        fn write(&mut self, p: u64, _: u64, v: u64) -> Update {
             if let Some(x) = self.0.get_mut((p / 8) as usize) {
                 *x = v;
-                true
+                Update::Written
             } else {
-                false
+                Update::Refused
             }
         }
     }
