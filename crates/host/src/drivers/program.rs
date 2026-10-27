@@ -8,10 +8,12 @@
 //!
 //! Description (text, one item per line):
 //!   rip ADDR | rflags VALUE | gpr V0 .. V15 | code HEX | memory ADDR HEX
+//!   | unmap ADDR | readonly ADDR   (mutations: clear P or R/W in the leaf entry of ADDR's page after setup)
 use super::super::*;
 use crate::execution::{self, Compiler, Stop};
 use natemu_abi::execution::{self as exec, Cpu, State};
 use natemu_abi::guest_memory::GuestRam;
+use natemu_abi::paging::Fault;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -22,6 +24,8 @@ struct Program {
     gpr: [u64; 16],
     code: Vec<u8>,
     memory: Vec<(u64, Vec<u8>)>,
+    /// Leaf-entry bits cleared after setup, per page.
+    clear: Vec<(u64, u64)>,
 }
 
 fn number(text: &str) -> Result<u64> {
@@ -35,7 +39,7 @@ fn hex(text: &str) -> Result<Vec<u8>> {
         .collect()
 }
 fn parse(text: &str) -> Result<Program> {
-    let mut p = Program { rip: 0, rflags: 0, gpr: [0; 16], code: vec![], memory: vec![] };
+    let mut p = Program { rip: 0, rflags: 0, gpr: [0; 16], code: vec![], memory: vec![], clear: vec![] };
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let words: Vec<_> = line.split_whitespace().collect();
         match (words[0], &words[1..]) {
@@ -48,6 +52,8 @@ fn parse(text: &str) -> Result<Program> {
             }
             ("code", [h]) => p.code = hex(h)?,
             ("memory", [a, h]) => p.memory.push((number(a)?, hex(h)?)),
+            ("unmap", [a]) => p.clear.push((number(a)? & !4095, PRESENT)),
+            ("readonly", [a]) => p.clear.push((number(a)? & !4095, WRITABLE)),
             _ => return Err(format!("bad description line: {line}")),
         }
     }
@@ -151,6 +157,11 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     for (address, data) in &p.memory {
         guest.copy_in(*address, data);
     }
+    for &(page, bits) in &p.clear {
+        let &(_, leaf) = guest.pages.get(&page).ok_or(format!("{page:#x} is not mapped"))?;
+        let entry = guest.ram.read::<u64>(leaf).unwrap();
+        assert!(guest.ram.write(leaf, entry & !bits));
+    }
     // User mode (as the QEMU reference), 4-level paging, NX and WP on.
     execution::set_cpu(
         &memory,
@@ -172,11 +183,15 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let stop = execution::run(&vm, &mut compiler, Some(p.rip + p.code.len() as u64))?;
     let s: State = vm.memory.read_record(exec::STATE_OFFSET);
 
-    let (kind, reason) = match &stop {
-        Stop::Reached => ("reached", String::new()),
-        Stop::FetchFault(f) => ("fetch_fault", format!("{f:?}")),
-        Stop::NoCode(reason) => ("no_code", reason.clone()),
-        Stop::Resident { stop, status, detail } => ("resident", format!("{} status={status} detail={detail}", exec::stop::name(*stop))),
+    // A guest exception (resident: at an access site or stub; host: instruction fetch) with its record.
+    let (kind, reason, fault) = match &stop {
+        Stop::Reached => ("reached", String::new(), [0; 4]),
+        Stop::FetchFault(Fault::Page { address, error }) => ("guest_fault", "fetch".into(), [14, *address, *error, s.cpu.rip]),
+        Stop::FetchFault(Fault::Noncanonical) => ("guest_fault", "fetch".into(), [13, 0, 0, s.cpu.rip]),
+        Stop::FetchFault(f) => ("fetch_fault", format!("{f:?}"), [0; 4]),
+        Stop::NoCode(reason) => ("no_code", reason.clone(), [0; 4]),
+        Stop::Resident { stop: exec::stop::GUEST_FAULT, .. } => ("guest_fault", "resident".into(), s.fault),
+        Stop::Resident { stop, status, detail } => ("resident", format!("{} status={status} detail={detail}", exec::stop::name(*stop)), [0; 4]),
     };
     let list = |v: &[u64]| v.iter().map(|x| format!("\"{x:#x}\"")).collect::<Vec<_>>().join(",");
     let mut out = format!(
@@ -202,17 +217,30 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"compiles\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{}}},\"fault\":[{}],\"native\":[{}]}}",
+        "],\"stats\":{{\"blocks\":{},\"compiles\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{}}}",
         s.blocks,
         compiler.compiles,
         s.retries,
         s.upgrades,
         s.evictions,
-        list(&s.fault),
-        list(&s.native)
+        s.splits,
+        list(&fault),
+        list(&s.native),
+        frame_intact(&vm.memory)
     );
     println!("{out}");
     Ok(())
+}
+
+/// The FEX frame holds nothing but its admitted fields (guest code cannot have written
+/// private memory there), and the exit gate pointer still points into the resident.
+fn frame_intact(memory: &Memory) -> bool {
+    let frame: [u8; exec::frame::BYTES] = memory.read_record(exec::FRAME_OFFSET);
+    let admitted = |i: usize| exec::frame::FIELDS.iter().any(|&(at, len)| (at as usize..(at + len) as usize).contains(&i));
+    let gate = u64::from_le_bytes(frame[exec::frame::DISPATCHER_LOOP_TOP as usize..][..8].try_into().unwrap());
+    let text = |offset: usize| PRIVATE + offset as u64;
+    let gate_in_text = (text(natemu_abi::resident::TEXT_OFFSET)..text(natemu_abi::resident::TEXT_END)).contains(&gate);
+    frame.iter().enumerate().all(|(i, &b)| b == 0 || admitted(i)) && gate_in_text
 }
 
 #[cfg(test)]
@@ -220,8 +248,9 @@ mod tests {
     use super::*;
     #[test]
     fn description_parses_and_rejects_malformed_lines() {
-        let p = parse("rip 0x100000\nrflags 0x1\ngpr 0 1 2 3 4 5 6 7 8 9 a b c d e f\ncode 90c3\nmemory 0x200000 0102\n").unwrap();
+        let p = parse("rip 0x100000\nrflags 0x1\ngpr 0 1 2 3 4 5 6 7 8 9 a b c d e f\ncode 90c3\nmemory 0x200000 0102\nunmap 0x200010\nreadonly 0x201000\n").unwrap();
         assert_eq!((p.rip, p.rflags, p.gpr[15], p.code, p.memory), (0x100000, 1, 15, vec![0x90, 0xc3], vec![(0x200000, vec![1, 2])]));
+        assert_eq!(p.clear, vec![(0x200000, PRESENT), (0x201000, WRITABLE)]);
         for bad in ["rip\ncode 90", "code 9", "gpr 1 2\ncode 90", "", "frob 1\ncode 90"] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }

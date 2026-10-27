@@ -72,6 +72,9 @@ class EndToEnd(unittest.TestCase):
             prog('4801d8', {0: a, 3: b}, insns=[{'op': 'add', 'width': 64}]),                                  # add rax, rbx
             prog('89c8' '31d2', {0: 1, 1: 0xffffffffffffffff, 2: 7}, insns=[{'op': 'mov', 'width': 32}, {'op': 'xor', 'width': 32}]),   # mov eax, ecx ; xor edx, edx
             prog('488907', {0: 0x1122334455667788, 7: 0x200008}, [(0x200000, bytes(range(16)))], [{'op': 'mov', 'width': 64}]),          # mov [rdi], rax
+            # prefix 3 of: add rax, rbx ; mov [rdi], rax ; xor edx, edx -> the state before the store; prefix 0: the input
+            prog('4801d8' '488907' '31d2', {0: a, 3: b, 7: 0x200008}, [(0x200000, bytes(range(16)))], [{'op': 'add', 'width': 64}, {'op': 'mov', 'width': 64}, {'op': 'xor', 'width': 32}]) | {'prefix': 3},
+            prog('4801d8', {0: a, 3: b}, insns=[{'op': 'add', 'width': 64}]) | {'prefix': 0},
         ]
         work = RAW / 'selfcheck'; shutil.rmtree(work, ignore_errors=True)
         try: results, _ = ref.run_programs(progs, work, QEMU)
@@ -87,6 +90,11 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(q[2]['memory'][0]['data'], bytes(want).hex())
         self.assertEqual(int(q[2]['rip'], 16), 0x100003)
         self.assertEqual(ref.compare(results[2], [int(x, 16) for x in q[2]['gpr']], int(q[2]['rflags'], 16), int(q[2]['rip'], 16), q[2]['memory']), [])
+        self.assertEqual((int(q[3]['gpr'][0], 16), int(q[3]['gpr'][2], 16), int(q[3]['rip'], 16)), (r, 0x1002, 0x100003))  # add ran, xor did not
+        self.assertEqual(q[3]['memory'][0]['data'], bytes(range(16)).hex())                                    # the store did not run
+        self.assertEqual((int(q[3]['rflags'], 16), results[3]['prefix'], results[3]['undefined_flags']), (f | flags.FIXED, 3, ref.hx(0)))
+        self.assertEqual((int(q[4]['gpr'][0], 16), int(q[4]['rip'], 16), int(q[4]['rflags'], 16)), (a, 0x100000, flags.FIXED))
+        with self.assertRaises(ValueError): ref.run_programs([progs[3] | {'prefix': 4}], work, QEMU)           # not an instruction boundary
 
 class Slice1Fixtures(unittest.TestCase):
     def test_fixtures_build_and_pins_hold(self):    # builds missing/stale fixtures; skips only if clang/Docker/QEMU are unavailable

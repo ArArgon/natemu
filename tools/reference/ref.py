@@ -5,7 +5,9 @@
 
 PROGRAMS.json: {"programs": [program, ...]} where a program is
   {"name": label only, "code": hex, "rip": addr, "gpr": [16 values], "rflags": value,
-   "memory": [{"addr": a, "data": hex}, ...], "insns": [annotation, ...] (required)}
+   "memory": [{"addr": a, "data": hex}, ...], "insns": [annotation, ...] (required), "prefix": k (optional)}
+With "prefix": k only bytes [0, k) run (k on an instruction boundary, 0 allowed): the result is the state at that
+boundary, e.g. before an instruction that faults; "insns" annotates the whole program and is cut to what ran.
 GPR order: rax rcx rdx rbx rsp rbp rsi rdi r8..r15.  All integers may be JSON numbers or
 "0x.." strings; this tool writes hex strings.  Every memory region is captured at the end.
 Execution is the code bytes followed by fallthrough into a capture sequence.  See README.md.
@@ -82,11 +84,14 @@ def norm(p):
     """Validate a program description; return it with integers/bytes decoded."""
     code = bytes.fromhex(p['code']); rip = num(p['rip']); gpr = [num(x) & (2**64 - 1) for x in p['gpr']]
     rflags = num(p['rflags']); regions = [(num(m['addr']), bytes.fromhex(m['data'])) for m in p.get('memory', [])]
-    require(code and len(gpr) == 16, 'code and 16 GPRs required')
+    prefix = p.get('prefix')
+    if prefix is not None:
+        require(0 <= prefix <= len(code), f'prefix {prefix} outside the code'); code = code[:prefix]
+    require((code or prefix is not None) and len(gpr) == 16, 'code and 16 GPRs required')
     require(p.get('insns'), 'insns annotations are required (flag masks and the disassembly cross-check depend on them)')
     require(rflags & ~(flags.ARITH | 2) == 0, 'initial RFLAGS may only set the arithmetic flags')
     require(len(regions) <= MAX_REGIONS and all(d for _, d in regions), 'regions: 1..%d non-empty' % MAX_REGIONS)
-    return dict(name=p.get('name', ''), code=code, rip=rip, gpr=gpr, rflags=rflags, regions=regions, insns=p.get('insns'))
+    return dict(name=p.get('name', ''), code=code, rip=rip, gpr=gpr, rflags=rflags, regions=regions, insns=p.get('insns'), prefix=prefix)
 
 
 def build_elf(p):
@@ -177,6 +182,7 @@ def check_annotations(p, log):
     """Cross-check the annotations (mnemonic, operand width, shift count) against QEMU's disassembly of the executed bytes."""
     insns, raw = disasm(log, p['rip'], len(p['code']))
     require(raw == p['code'], 'QEMU did not translate exactly the supplied code bytes')
+    if p['prefix'] is not None: p['insns'] = p['insns'][:len(insns)]     # the annotations of what ran
     require(len(insns) == len(p['insns']), f'{len(insns)} instructions executed, {len(p["insns"])} annotated')
     prev = ''
     for (a, m, t), ann in zip(insns, p['insns']):
@@ -226,7 +232,8 @@ def run_programs(programs, workdir, qemu):
         final = parse_output(p, (d / 'qemu.stdout').read_bytes())
         text = check_annotations(p, (d / 'qemu.log').read_text())
         und = flags.analyze(p['insns'])
-        results.append({'name': p['name'], 'qemu': final, 'disasm': text, 'undefined_flags': hx(und), 'rflags_compare_mask': hx(flags.ARITH & ~und)})
+        results.append({'name': p['name'], 'qemu': final, 'disasm': text, 'undefined_flags': hx(und), 'rflags_compare_mask': hx(flags.ARITH & ~und)}
+                       | ({'prefix': p['prefix']} if p['prefix'] is not None else {}))
     prov = {'format': FORMAT, 'image': IMAGE, 'qemu_sha256': digest, 'qemu_package': 'qemu-user-static 1:7.2+dfsg-7+deb12u18+b3 arm64',
             'qemu_argv': ['/qemu', '-cpu', 'qemu64', '-d', 'in_asm', '-D', 'qemu.log', 'prog.elf'], 'rflags_fixed_bits': hx(flags.FIXED)}
     return results, prov

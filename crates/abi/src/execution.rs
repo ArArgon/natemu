@@ -143,7 +143,8 @@ pub mod stop {
     pub const UNKNOWN_ABORT: u64 = 3;
     /// A site's abort does not match its record (ESR class/direction, FAR).
     pub const SITE_MISMATCH: u64 = 4;
-    /// The guest walk faulted: an x86 exception is due (`State::fault`); delivery is S1e.
+    /// An x86 exception is due at a guest instruction boundary (`State::fault`; the bank holds the
+    /// exact state at that instruction's start). Delivery through the IDT is later system work.
     pub const GUEST_FAULT: u64 = 5;
     /// A write to a page the current block was translated from.
     pub const UNSUPPORTED_SMC: u64 = 6;
@@ -179,18 +180,19 @@ pub struct State {
     pub source_va: [u64; 2],
     pub source_gpa: [u64; 2],
     pub stop: u64,
-    /// Guest exception due at a stop: vector, address (CR2), error code, RIP.
+    /// Guest exception due at a stop: vector, CR2 (#PF; else 0), error code, RIP.
     pub fault: [u64; 4],
     /// Native abort at a stop: ESR, FAR, ELR (slot offset).
     pub native: [u64; 3],
     /// The last retry: native PC, FAR and the shadow descriptor then installed at FAR.
     pub last_retry: [u64; 3],
     /// Blocks entered, shadow-miss retries, of which read-only → writable upgrades,
-    /// shadow evictions on capacity.
+    /// shadow evictions on capacity, page-crossing stores completed by the split service.
     pub blocks: u64,
     pub retries: u64,
     pub upgrades: u64,
     pub evictions: u64,
+    pub splits: u64,
 }
 impl State {
     pub const fn new(cpu: Cpu) -> Self {
@@ -208,6 +210,7 @@ impl State {
             retries: 0,
             upgrades: 0,
             evictions: 0,
+            splits: 0,
         }
     }
 }

@@ -52,7 +52,7 @@ pub(crate) fn set_cpu(memory: &Memory, cpu: Cpu) {
 pub(crate) enum Stop {
     /// RIP reached the caller's stop address at a block boundary.
     Reached,
-    /// The instruction fetch at RIP faults (delivery is S1e).
+    /// The instruction fetch at RIP faults; the bank holds the state at RIP (no IDT delivery yet).
     FetchFault(Fault),
     /// fexc translated nothing at RIP; its end reason (e.g. `system_instruction`).
     NoCode(String),
@@ -119,13 +119,20 @@ fn end_reason(json: &crate::json::Value) -> Option<&str> {
     json.get("guest")?.get("end")?.get("reason")?.as_str()
 }
 
+/// Guest bytes fetched at a RIP, the (linear, physical) pages they came from, and the
+/// fetch fault of the next page when that ended them.
+struct Fetched {
+    bytes: Vec<u8>,
+    pages: Vec<[u64; 2]>,
+    next_fault: Option<Fault>,
+}
+
 /// Guest bytes at `rip` up to the end of its page, continuing into the next
-/// page when that is fetchable, and never past `limit`; with the
-/// (linear, physical) pages they came from.
-fn fetch(ram: GuestRam, cpu: &Cpu, rip: u64, limit: Option<u64>) -> Result<std::result::Result<(Vec<u8>, Vec<[u64; 2]>), Fault>> {
+/// page when that is fetchable, and never past `limit`.
+fn fetch(ram: GuestRam, cpu: &Cpu, rip: u64, limit: Option<u64>) -> Result<std::result::Result<Fetched, Fault>> {
     let control = cpu.control().ok_or("bank is not in 4-level long mode")?;
     let mut tables = GuestTables::new(ram);
-    let (mut bytes, mut pages, mut va) = (Vec::new(), Vec::new(), rip);
+    let (mut bytes, mut pages, mut va, mut next_fault) = (Vec::new(), Vec::new(), rip, None);
     for _ in 0..2 {
         let page_end = (va | 4095).checked_add(1);
         let end = match (limit, page_end) {
@@ -139,7 +146,10 @@ fn fetch(ram: GuestRam, cpu: &Cpu, rip: u64, limit: Option<u64>) -> Result<std::
             Ok(_) if pages.is_empty() => return Err(format!("code at {va:#x} is not write-back memory")),
             Ok(_) => break,
             Err(f) if pages.is_empty() => return Ok(Err(f)),
-            Err(_) => break,
+            Err(f) => {
+                next_fault = Some(f);
+                break;
+            }
         };
         let mut chunk = vec![0; end.wrapping_sub(va) as usize];
         if !ram.copy_out(t.gpa, &mut chunk) {
@@ -152,7 +162,7 @@ fn fetch(ram: GuestRam, cpu: &Cpu, rip: u64, limit: Option<u64>) -> Result<std::
         }
         va = end;
     }
-    Ok(Ok((bytes, pages)))
+    Ok(Ok(Fetched { bytes, pages, next_fault }))
 }
 
 /// Runs the vCPU (entered at the resident) until it stops; `stop_at` is a RIP at
@@ -177,13 +187,19 @@ pub(crate) fn run(vm: &Vm, compiler: &mut Compiler, stop_at: Option<u64>) -> Res
         if Some(rip) == stop_at {
             return Ok(Stop::Reached);
         }
-        let (bytes, pages) = match fetch(ram, &state.cpu, rip, stop_at)? {
+        let Fetched { bytes, pages, next_fault } = match fetch(ram, &state.cpu, rip, stop_at)? {
             Ok(fetched) => fetched,
             Err(fault) => return Ok(Stop::FetchFault(fault)),
         };
         let block = match compiler.compile(&bytes, rip)? {
             Ok(block) => block,
-            Err(reason) => return Ok(Stop::NoCode(reason)),
+            Err(reason) => {
+                return Ok(match next_fault {
+                    // The instruction at RIP continues into a page whose fetch faults.
+                    Some(fault) if reason == "partial_decode" => Stop::FetchFault(fault),
+                    _ => Stop::NoCode(reason),
+                });
+            }
         };
         vm.memory.copy(exec::STAGING_OFFSET, &block.object);
         state.source_va = [u64::MAX; 2];

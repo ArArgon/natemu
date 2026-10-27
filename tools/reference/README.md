@@ -23,6 +23,12 @@ generator also assembles programs) and Docker.
               "undefined_flags": hex|null, "rflags_compare_mask": hex}
     file   : {"format": "natemu-reference-v2", "image", "qemu_sha256", "qemu_package", "qemu_argv", "results": [...]}
 
+Prefix mode: a program with `"prefix": k` runs only bytes [0, k) of its code (k must be an instruction boundary; 0 is
+allowed) and its result, which carries `prefix`, is the state at that boundary: the reference for an exception raised by
+the instruction at k (nothing of it or after it ran). `insns` annotates the whole program; it is cut to the instructions
+QEMU executed before the disassembly cross-check and the flag analysis, so the compare mask is the one at the boundary.
+A k inside an instruction is refused (QEMU's disassembly then covers bytes beyond k). Used by `tools/run_slice1_faults.py`.
+
 GPR order rax rcx rdx rbx rsp rbp rsi rdi r8..r15. Integers are JSON numbers or `0x` strings; output is
 `0x%016x`. Result memory regions are in input order, same addresses and lengths; all are captured.
 `ref.compare(result, gpr, rflags, rip, memory)` returns the differences against another implementation's final

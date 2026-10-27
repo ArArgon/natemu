@@ -190,30 +190,23 @@ pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Re
     if !sorted(&sites.iter().map(|s| s.native_offset).collect::<Vec<_>>()) {
         return fail("access sites not sorted");
     }
-    for s in &sites {
-        use object::kind::*;
-        let register = |r: u8| r < 31 && r != 28;
-        if s.native_offset % 4 != 0
-            || s.native_offset < h.body_offset
-            || s.native_offset >= region
-            || s.insn_native_offset > s.native_offset
-            || s.guest_offset >= h.guest_bytes
+    // Access sites, then the check stubs placed after the body.
+    let (accesses, stubs) = sites.split_at(sites.iter().position(is_stub).unwrap_or(sites.len()));
+    for s in accesses {
+        if !site_fields_valid(s, &h, region)
             || s.guest_offset2 != object::NONE32
-            || !matches!(s.kind, LOAD | STORE | LOAD_PAIR | STORE_PAIR | PUSH | POP)
+            || !matches!(s.kind, object::kind::LOAD | object::kind::STORE | object::kind::LOAD_PAIR | object::kind::STORE_PAIR | object::kind::PUSH | object::kind::POP)
             || !matches!(s.width, 1 | 2 | 4 | 8 | 16)
             || s.intent != intent(s)
-            || s.segment > object::SEG_SS
-            || !(register(s.base_reg) || s.base_reg == 31)
-            || !(register(s.index_reg) || s.index_reg == object::NO_REG)
-            || s.extend > object::EXT_SXTX
-            || s.shift > 4
-            || s.writeback > object::WB_POST
-            || s.data_class != object::CLASS_GPR
-            || s.nzcv > object::NZCV_FRAME
-            || s.completed_effects != object::EFFECTS_NONE
-            || s.located != 1
         {
             return fail(&format!("access site at native offset {:#x}", s.native_offset));
+        }
+    }
+    let word = |at: u32| u32::from_le_bytes(bytes[code + at as usize..code + at as usize + 4].try_into().unwrap());
+    for s in stubs {
+        let access = accesses.binary_search_by_key(&s.guest_offset2, |a| a.native_offset).ok().map(|i| &accesses[i]);
+        if !is_stub(s) || !site_fields_valid(s, &h, region) || word(s.native_offset) != stub_word(s.kind) || !stub_matches(s, access) {
+            return fail(&format!("check stub at native offset {:#x}", s.native_offset));
         }
     }
     // Literal values: the block's own RIP (FEX's tail), its end, or the direct target
@@ -257,6 +250,65 @@ fn intent(s: &Site) -> u8 {
         (LOAD | LOAD_PAIR, object::RMW_LOAD) => object::INTENT_WRITE,
         (LOAD | LOAD_PAIR | POP, object::RMW_NONE) => object::INTENT_READ,
         _ => u8::MAX,
+    }
+}
+
+/// Fields every site (access or stub) must satisfy.
+fn site_fields_valid(s: &Site, h: &Header, region: u32) -> bool {
+    let register = |r: u8| r < 31 && r != 28;
+    s.native_offset % 4 == 0
+        && s.native_offset >= h.body_offset
+        && s.native_offset < region
+        && s.insn_native_offset <= s.native_offset
+        && s.guest_offset < h.guest_bytes
+        && s.segment <= object::SEG_SS
+        && (register(s.base_reg) || s.base_reg == 31)
+        && (register(s.index_reg) || s.index_reg == object::NO_REG)
+        && s.extend <= object::EXT_SXTX
+        && s.shift <= 4
+        && s.writeback <= object::WB_POST
+        && s.data_class == object::CLASS_GPR
+        && s.nzcv <= object::NZCV_FRAME
+        && s.completed_effects == object::EFFECTS_NONE
+        && s.located == 1
+}
+
+fn is_stub(s: &Site) -> bool {
+    matches!(s.kind, object::kind::GUARD | object::kind::SPLIT)
+}
+/// `brk #1` (guard) or `brk #2` (split).
+fn stub_word(kind: u8) -> u32 {
+    let imm = if kind == object::kind::GUARD { 1 } else { 2 };
+    0xd420_0000 | imm << 5
+}
+/// A stub's record against the access site it covers (`None`: no site at `guest_offset2`). At a stub the guest
+/// state is that of its access, so instruction, flags location, width, intent and data registers are the access's;
+/// its address is `base_reg + imm` without index or writeback. A split covers a store wider than one byte whose data
+/// registers survive the check (x0/x1 are the check's scratch). A guard without an access is a branch-target guard:
+/// the target is in `base_reg`. The address register at a stub is neither x0 (the check's scratch, overwritten by it)
+/// nor sp (the checks cannot name it).
+fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
+    use object::kind::*;
+    let address_only = s.index_reg == object::NO_REG && s.writeback == object::WB_NONE && !matches!(s.base_reg, 0 | 31);
+    match access {
+        None => {
+            s.kind == GUARD
+                && s.guest_offset2 == object::NONE32
+                && address_only
+                && s.imm == 0
+                && (s.width, s.intent, s.rmw, s.segment) == (0, object::INTENT_READ, object::RMW_NONE, object::SEG_DS)
+        }
+        Some(a) => {
+            let same = (s.guest_offset, s.insn_native_offset, s.width, s.intent, s.rmw, s.segment)
+                == (a.guest_offset, a.insn_native_offset, a.width, a.intent, a.rmw, a.segment)
+                && (s.data_reg, s.data_class, s.nzcv, s.cf_inverted) == (a.data_reg, a.data_class, a.nzcv, a.cf_inverted);
+            let store = matches!(a.kind, STORE | STORE_PAIR | PUSH);
+            let pair = a.kind == STORE_PAIR;
+            let survives = |r: u8| r > 1;
+            let split_ok = s.kind != SPLIT
+                || (store && a.width > 1 && survives(a.data_reg[0]) && (!pair || survives(a.data_reg[1])));
+            address_only && same && split_ok
+        }
     }
 }
 
@@ -488,6 +540,54 @@ mod tests {
         assert_eq!(branch_target(&[0x48, 0xe9, 0xfb, 0xff, 0xff, 0xff], 0x10), Some(0x0b));
         assert_eq!(branch_target(&[0x0f, 0x84, 1, 0, 0, 0], 0x10), Some(0x11));
         assert_eq!(branch_target(&[0x90], 0x10), None);
+    }
+
+    /// The load at 8 and a stub at 20 (the `br`'s word replaced by `brk`).
+    fn with_stub(stub: Site, word: u32) -> Vec<u8> {
+        with(object_with(&[load_site(8), stub]), 128 + 20, |w: &mut u32| *w = word)
+    }
+    fn stub(kind: u8, access: u32) -> Site {
+        Site { native_offset: 20, kind, guest_offset2: access, ..load_site(8) }
+    }
+    const BRK1: u32 = 0xd420_0020;
+    const BRK2: u32 = 0xd420_0040;
+
+    #[test]
+    fn check_stubs_must_be_brk_words_covering_a_matching_access() {
+        use object::kind::*;
+        assert!(admit(&with_stub(stub(GUARD, 8), BRK1), RIP, &SOURCE, ALL).is_ok());
+        assert!(admit(&with_stub(stub(GUARD, 8), BRK2), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&with_stub(stub(GUARD, 8), 0xd61f_0020), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&with_stub(stub(GUARD, 12), BRK1), RIP, &SOURCE, ALL).is_err()); // no access there
+        assert!(admit(&with_stub(Site { width: 4, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&with_stub(Site { segment: object::SEG_SS, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&with_stub(Site { nzcv: object::NZCV_FRAME, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&with_stub(Site { index_reg: 3, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
+        // The address register at the stub may differ from the access's (x1 after an add).
+        assert!(admit(&with_stub(Site { base_reg: 1, imm: 0, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_ok());
+        // A split covers only a store wider than a byte whose data register survives the check.
+        assert!(admit(&with_stub(stub(SPLIT, 8), BRK2), RIP, &SOURCE, ALL).is_err());
+        let store = Site { kind: STORE, intent: object::INTENT_WRITE, data_reg: [4, 0], ..load_site(8) };
+        let split = Site { native_offset: 20, kind: SPLIT, guest_offset2: 8, ..store };
+        let both = |a: Site, s: Site| with(object_with(&[a, s]), 128 + 20, |w: &mut u32| *w = BRK2);
+        assert!(admit(&both(store, split), RIP, &SOURCE, ALL).is_ok());
+        assert!(admit(&both(store, Site { kind: GUARD, ..split }), RIP, &SOURCE, ALL).is_err()); // brk #2 for a guard
+        assert!(admit(&both(Site { data_reg: [0, 0], ..store }, Site { data_reg: [0, 0], ..split }), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&both(Site { width: 1, ..store }, Site { width: 1, ..split }), RIP, &SOURCE, ALL).is_err());
+        // The stub's address register survives the check: not x0 (its scratch), not sp.
+        assert!(admit(&both(store, Site { base_reg: 1, ..split }), RIP, &SOURCE, ALL).is_ok());
+        assert!(admit(&both(store, Site { base_reg: 0, ..split }), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&both(store, Site { base_reg: 31, ..split }), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&with_stub(Site { base_reg: 0, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&with_stub(Site { base_reg: 31, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
+        // Branch-target guard: no access, width 0, target register.
+        let target = Site { width: 0, base_reg: 4, ..stub(GUARD, object::NONE32) };
+        assert!(admit(&with_stub(target, BRK1), RIP, &SOURCE, ALL).is_ok());
+        assert!(admit(&with_stub(Site { width: 8, ..target }, BRK1), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&with_stub(Site { base_reg: 31, ..target }, BRK1), RIP, &SOURCE, ALL).is_err());
+        // Stubs follow every access site.
+        let early = with(object_with(&[Site { native_offset: 8, kind: GUARD, guest_offset2: 12, ..load_site(8) }, load_site(12)]), 128 + 8, |w: &mut u32| *w = BRK1);
+        assert!(admit(&early, RIP, &SOURCE, ALL).is_err());
     }
 
     #[test]

@@ -165,8 +165,13 @@ invalidation on read-only → writable upgrade; plus §6 step 2's single guest-m
    cost is one extra `mov` per memory-to-register load. Base/index/writeback restoration is relied on.
 3. **Split-store path.** It is the only `ACCESS_COMPLETED` path in slice 1 and needs its own writeback record. Its
    frequency and cost are unmeasured.
-4. **natemu policies, not SDM-defined.** A read fault in a non-locked RMW instruction reports W=1. CR2 for a split
-   access is the first byte of the faulting page. The U bit comes from the committed CPL, with WP/SMEP/SMAP applied by
-   the walker. QEMU Linux-user mode cannot check any of these.
+4. **natemu policies, not SDM-defined** (implemented in S1e; QEMU Linux-user mode cannot check them). A read fault in
+   a non-locked RMW instruction reports W=1. CR2 for a split access is the first byte of the faulting page; when both
+   pages fault, the first (address order) is reported. After a failed crossing store or RMW second-page fault, the first
+   page's A/D are already set (no byte written; beyond SDM 4.8, QEMU softmmu order). bt-family memory forms access one
+   byte. A branch to a non-canonical target is #GP(0) at the branch (Intel); falling through into non-canonical code is
+   #GP(0) at the first instruction with a non-canonical byte (the saved RIP may itself be non-canonical). #GP/#SS
+   records carry CR2 = 0. The U bit comes from the committed CPL, with WP/SMEP/SMAP applied by the walker. Admission
+   does not yet check guard structure: isolation rests on the producer and its verifier (hardening item).
 5. **TSO evidence before two vCPUs** (§2); upkeep of patches to upstream RA, flag elimination and dispatcher. Slice 1
    drops block linking, L1 lookup, call-ret stack and push/pop fusion (code-cache step restores them). No scope change.
