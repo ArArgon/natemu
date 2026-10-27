@@ -1,4 +1,4 @@
-//! Binary code object written by `tools/fexc --object` (format `natemu-fexc-v2`).
+//! Binary code object written by `tools/fexc --object` (JSON format `natemu-fexc-v2`, object version 3).
 //!
 //! Little-endian, fixed-width, no pointers. One file: [`Header`], the FEX block's code bytes (relocation
 //! literal slots zeroed), then the [`Site`], [`PcEntry`] and [`Reloc`] tables at the offsets the header names.
@@ -9,7 +9,7 @@
 //! Numeric codes are shared with `tools/fexc/shim/fexc_hook.h`; keep them in sync.
 
 pub const MAGIC: [u8; 8] = *b"NFXOBJ\0\x01";
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 /// "No value" for a u32 offset field.
 pub const NONE32: u32 = u32::MAX;
 pub const NO_REG: u8 = 0xff;
@@ -148,7 +148,10 @@ pub struct Header {
     /// Entries in that table.
     pub feature_count: u8,
     pub dcache_line_log2: u8,
-    pub reserved: [u8; 6],
+    pub reserved: [u8; 2],
+    /// Offset in the guest-state frame (x28) of the 32-bit slot where a [`NZCV_FRAME`] site finds the instruction's
+    /// incoming NZCV (PSTATE layout); [`NONE32`] if the compile has no such sites (default profile).
+    pub pre_nzcv_offset: u32,
 }
 
 /// One native instruction that performs a guest memory access, sorted by `native_offset` in the table.
@@ -262,6 +265,7 @@ mod tests {
         assert_eq!(offset_of!(Header, feature_count), 120);
         assert_eq!(offset_of!(Header, dcache_line_log2), 121);
         assert_eq!(offset_of!(Header, reserved), 122);
+        assert_eq!(offset_of!(Header, pre_nzcv_offset), 124);
     }
 
     #[test]
@@ -307,6 +311,6 @@ mod tests {
     #[test]
     fn magic_and_version() {
         assert_eq!(&MAGIC[..6], b"NFXOBJ");
-        assert_eq!(VERSION, 2);
+        assert_eq!(VERSION, 3);
     }
 }

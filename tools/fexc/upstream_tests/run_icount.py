@@ -15,7 +15,7 @@ Variants (what the unspecified feature bits are):
   upstream     the x86-CI view FEX's HostFeatures.cpp gives under the VIXL simulator (CPUFeaturesAll minus AFP/RPRES), +
                multiblock on (FEX's config default, CodeSizeValidation never changes it)
   fexc-default fexc's own default feature table (Apple M4 view) and fexc's default multiblock off
-The file's Enabled/Disabled lists, TSO and Bitness are applied on top in both.  --pad N appends N zero bytes after the
+The file's Enabled/Disabled lists, TSO, Bitness and Env (every FEX_* option, through fexc --config) are applied on top in both.  --pad N appends N zero bytes after the
 code (upstream's code window is 512 MiB of zero-filled anonymous memory; fexc gets exactly the bytes).
 Writes DIR/<variant>-pad<N>.jsonl (one record per test) and prints per-file totals.
 """
@@ -39,11 +39,10 @@ UPSTREAM_BASE = dict(
     crc32=1, aes=1, sha=1, pmull128=1, rng=1, cssc=1, afp=0, frintts=1, mops=1, i8mm=1, dotprod=1, ecv=1, clzero=1,
     svebitperm=1, float_exceptions=0, cache_maintenance_ops=1, prefer_zva_for_vzero=0, x86_avx=1, x86_aes256=1,
     x86_3dnow=1, x86_sse4a=0)
-KNOWN_ENV = {}          # FEX_* environment options fexc can express (none: it only has multiblock/tso)
 
 
 def settings_of(feat, variant):
-    """feat = the file's Features dict -> (bitness, feature overrides list [(name,0/1)], tso, missing-knob list)"""
+    """feat = the file's Features dict -> (bitness, feature overrides list [(name,0/1)], tso, FEX config options from Env)"""
     bits = int(feat.get('Bitness', 64))
     en = [x.upper() for x in feat.get('EnabledHostFeatures', [])]
     dis = [x.upper() for x in feat.get('DisabledHostFeatures', [])]
@@ -60,8 +59,8 @@ def settings_of(feat, variant):
         if 'SVE256' not in en:
             f.pop('sve256')          # keep fexc's default (off) -> same thing
     tso = 'TSO' in en and 'TSO' not in dis
-    missing = [f'{k}={v}' for k, v in feat.get('Env', {}).items() if k not in KNOWN_ENV]
-    return bits, sorted(f.items()), tso, missing
+    env = [f'{k}={v}' for k, v in feat.get('Env', {}).items()]   # FEX_* options: fexc --config NAME=VALUE accepts them as they are
+    return bits, sorted(f.items()), tso, env
 
 
 def load_tests(src, only=None):
@@ -94,8 +93,8 @@ def nop_header(a, bits):
 
 def run_one(t, a):
     r = dict(file=t['file'], name=t['name'], exp_count=t['exp_count'], exp_asm=t['exp_asm'], x86=t['insts'])
-    bits, feats, tso, missing = settings_of(t['feat'], a.variant)
-    r['missing_knobs'] = missing
+    bits, feats, tso, env = settings_of(t['feat'], a.variant)
+    r['env'] = env
     r['bitness'] = bits
     tag = base64.urlsafe_b64encode(f"{t['file']}|{t['name']}".encode()).decode()[:60] + str(abs(hash((t['file'], t['name']))))
     asm = os.path.join(a.tmp, tag + '.asm'); binf = os.path.join(a.tmp, tag + '.bin')
@@ -115,6 +114,8 @@ def run_one(t, a):
         cmd.append('--no-tso')
     for n, v in feats:
         cmd += ['--feature', f'{n}={v}']
+    for e in env:
+        cmd += ['--config', e]
     p = subprocess.run(cmd, capture_output=True, text=True)
     r['rc'] = p.returncode
     try:

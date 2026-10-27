@@ -2,7 +2,7 @@
 // resulting ARM64 block as one JSON document. Nothing is executed.
 //
 //   fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N]
-//        [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--feature NAME=0|1]... [--out FILE] [--object FILE]
+//        [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--feature NAME=0|1]... [--config NAME=VALUE]... [--out FILE] [--object FILE]
 //
 // General by construction: input bytes + RIP + mode + feature profile in, code +
 // FEX metadata out. Nothing here is keyed by program name.
@@ -269,6 +269,18 @@ static void CutJson(Json& j) {
   j.end_obj();
 }
 
+// FEX config option by name (the enum name without CONFIG_, e.g. X87REDUCEDPRECISION; a leading FEX_ is accepted, case ignored).
+static bool ConfigOptionByName(std::string n, Config::ConfigOption& out) {
+  static const std::pair<const char*, Config::ConfigOption> opts[] = {
+#define OPT_BASE(type, group, enum, json, default) {#enum, Config::CONFIG_##enum},
+#include <FEXCore/Config/ConfigValues.inl>
+  };
+  for (auto& c : n) c = char(toupper(c));
+  if (n.rfind("FEX_", 0) == 0) n = n.substr(4);
+  for (auto& o : opts) if (n == o.first) { out = o.second; return true; }
+  return false;
+}
+
 int main(int argc, char** argv) {
   std::string hex, file, out, object;
   bool have_rip = false;
@@ -276,6 +288,7 @@ int main(int argc, char** argv) {
   Settings st;
   bool sparse_flag = false;
   std::vector<std::pair<std::string, bool>> overrides;
+  std::vector<std::pair<std::string, std::string>> configs;   // --config NAME=VALUE, applied after fexc's own Config::Set calls
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> const char* { if (i + 1 >= argc) { fprintf(stderr, "fexc: %s needs a value\n", a.c_str()); exit(2); } return argv[++i]; };
@@ -295,11 +308,12 @@ int main(int argc, char** argv) {
     else if (a == "--no-end-marker") st.end_marker = false;
     else if (a == "--no-tso") st.tso = false;
     else if (a == "--feature") { std::string v = next(); auto eq = v.find('='); if (eq == std::string::npos) return Fail("--feature NAME=0|1"); overrides.push_back({v.substr(0, eq), v.substr(eq + 1) != "0"}); }
+    else if (a == "--config") { std::string v = next(); auto eq = v.find('='); Config::ConfigOption o; if (eq == std::string::npos || !ConfigOptionByName(v.substr(0, eq), o)) return Fail("--config NAME=VALUE (NAME: a FEX config option, e.g. X87REDUCEDPRECISION)"); configs.push_back({v.substr(0, eq), v.substr(eq + 1)}); }
     else if (a == "--out") out = next();
     else if (a == "--object") object = next();
     else return Fail("unknown argument " + a);
   }
-  if (!have_rip || (hex.empty() == file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--feature NAME=0|1] [--out FILE] [--object FILE]");
+  if (!have_rip || (hex.empty() == file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
   if (bitness != 32 && bitness != 64) return Fail("--bitness must be 32 or 64");
   const bool slice1 = st.profile == "slice1";
   if (slice1 && bitness != 64) return Fail("profile slice1 is 64-bit only");
@@ -338,6 +352,7 @@ int main(int argc, char** argv) {
   Config::Set(Config::CONFIG_TSOENABLED, st.tso ? "1" : "0");
   Config::Set(Config::CONFIG_VECTORTSOENABLED, st.tso ? "1" : "0");
   Config::Set(Config::CONFIG_MEMCPYSETTSOENABLED, st.tso ? "1" : "0");
+  for (auto& c : configs) { Config::ConfigOption o; ConfigOptionByName(c.first, o); Config::Set(o, c.second); }
 
   HostFeatures hf {};
   auto table = FeatureTable();
@@ -388,6 +403,11 @@ int main(int argc, char** argv) {
   j.obj("settings").kv("profile", st.profile).kv("block_cutting", slice1 ? "allowlist" : "none")
    .kv("exits", slice1 ? "dispatcher_gate" : "linked").kv("tso", st.tso).kv("multiblock", st.multiblock).kv("dense_pc_table", st.dense_pc).kv("end_marker", st.end_marker)
    .kv("fresh_context_per_request", true);
+  if (!configs.empty()) {   // only when given: output without --config is unchanged
+    j.obj("config");
+    for (auto& c : configs) j.kv(c.first.c_str(), c.second);
+    j.end_obj();
+  }
   j.end_obj();
   j.obj("features").kv("profile", "old-producer-compat+m4").kv("required_by_settings_profile", slice1 ? "flagm" : "none").kv("dcache_line_log2", uint64_t(st.dcache_line_log2));
   j.obj("host_features");
@@ -652,7 +672,7 @@ int main(int argc, char** argv) {
     auto pad = [&](size_t a) { while (f.size() % a) f.push_back(0); };
     auto push = [&](uint64_t v, int n) { for (int i = 0; i < n; ++i) f.push_back(uint8_t(v >> (8 * i))); };
     memcpy(f.data(), "NFXOBJ\0\x01", 8);
-    put(8, 2, 4); put(12, 128, 4); put(20, bitness, 4); put(24, rip, 8);
+    put(8, 3, 4); put(12, 128, 4); put(20, bitness, 4); put(24, rip, 8);
     put(32, Cap.info.TotalLength, 4); put(36, Cap.info.TotalInstructions, 4);
     put(40, f.size(), 4); put(44, code.size(), 4);
     put(48, Cap.prologues[0].second, 4); put(52, marker == UINT64_MAX ? 0xFFFFFFFFull : marker, 4);
@@ -694,6 +714,7 @@ int main(int argc, char** argv) {
     uint64_t fbits = 0;   // bit i = FeatureTable() entry i = the i-th member of JSON features.host_features
     for (size_t i = 0; i < table.size() && i < 64; ++i) if (table[i].get(hf)) fbits |= 1ull << i;
     put(112, fbits, 8); f[120] = uint8_t(table.size()); f[121] = uint8_t(st.dcache_line_log2);
+    put(124, slice1 ? uint32_t(offsetof(Core::CpuStateFrame, State.flags) + X86State::RFLAG_NZCV_LOC) : 0xFFFFFFFFu, 4);   // = JSON natemu_pre_nzcv
     put(16, f.size(), 4);
     std::ofstream(object, std::ios::binary).write(reinterpret_cast<const char*>(f.data()), std::streamsize(f.size()));
   }

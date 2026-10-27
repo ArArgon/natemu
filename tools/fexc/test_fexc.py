@@ -13,7 +13,7 @@ import sys
 import unittest
 from pathlib import Path
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series1/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series2/obj/fexc')
 HERE = Path(__file__).resolve().parent
 
 # (name, x86 hex, rip, bitness, decoded instructions, expected end reason)
@@ -190,6 +190,17 @@ class FexcStructure(unittest.TestCase):
                 for e in d['pc_table']['entries']:
                     self.assertIn(e['cf_inverted'], (True, False, None))
 
+    def test_config_option(self):
+        # --config sets any FEX config option: X87ReducedPrecision changes the x87 code (fld/fadd), is echoed, and bad names are refused
+        base, _ = run('d9c0d8c1', 0x102000, 64)
+        red, rc = run('d9c0d8c1', 0x102000, 64, '--config', 'FEX_X87REDUCEDPRECISION=1')
+        self.assertEqual(rc, 0)
+        self.assertNotEqual(base['code']['hex'], red['code']['hex'])
+        self.assertEqual(red['settings']['config'], {'FEX_X87REDUCEDPRECISION': '1'})
+        self.assertNotIn('config', base['settings'])
+        r = subprocess.run([FEXC, '--hex', '90', '--rip', '0x1000', '--config', 'NOSUCHOPTION=1'], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+
     def test_object_file(self):
         import struct, tempfile
         with tempfile.TemporaryDirectory() as tmp:
@@ -198,12 +209,13 @@ class FexcStructure(unittest.TestCase):
             self.assertEqual(rc, 0)
             f = o.read_bytes()
             magic, version, hsize, total, bitness, rip = struct.unpack_from('<8sIIIIQ', f, 0)
-            self.assertEqual((magic, version, hsize, total, bitness, rip), (b'NFXOBJ\0\x01', 2, 128, len(f), 64, 0x102000))
+            self.assertEqual((magic, version, hsize, total, bitness, rip), (b'NFXOBJ\0\x01', 3, 128, len(f), 64, 0x102000))
             sys.path.insert(0, str(HERE))
             import check_sites
             obj = check_sites.read_object(o)
             self.assertEqual(check_sites.object_vs_json(obj, d), [])   # profile, settings, end reason, feature profile, counts
             self.assertEqual((obj['profile'], obj['settings']), (0, 1 | 4 | 8))   # default profile: TSO, dense PC, end marker
+            self.assertEqual(obj['pre_nzcv'], 0xFFFFFFFF)   # default profile: no frame-NZCV sites
             self.assertTrue(all(s[24] == 1 for s in obj['sites']))
             code_off, code_size, body, marker, region, spill = struct.unpack_from('<6I', f, 40)
             soff, scount = struct.unpack_from('<II', f, 64)

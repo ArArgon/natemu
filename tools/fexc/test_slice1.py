@@ -1,6 +1,6 @@
 """S1c checks: profile slice1 of fexc (block cutting at an allowlist, single-gate exits, profile record).
 
-Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series1 build)
+Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series2 build)
 
 The x86 bytes below are assembled by hand and only drive the compiler; every expectation (where the block ends, why)
 comes from the instruction's architectural class, never from fexc's output. The cut position is also compared with a
@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402  (disassemble, object reader)
 import scan_skips  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series1/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series2/obj/fexc')
 REPO = HERE.parents[1]
 RIP = 0x102000
 PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
@@ -210,6 +210,7 @@ class Slice1Cutting(unittest.TestCase):
                 self.assertEqual(check_sites.object_vs_json(o, d), [])
                 self.assertEqual((o['profile'], o['settings']), (1, 4))   # slice1; only the dense PC table is on
                 self.assertTrue(all(s[24] == 1 for s in o['sites']))      # located
+                self.assertEqual(o['pre_nzcv'], d['state_abi']['state_offsets']['natemu_pre_nzcv'])   # 1032: the frame NZCV slot
             d, _ = run(PRE + SYSTEM['cli'], RIP, '--object', str(obj))
             self.assertEqual(check_sites.END_REASONS[check_sites.read_object(obj)['end_reason']], 'system_instruction')
 
@@ -311,7 +312,7 @@ class Slice1Exits(unittest.TestCase):
         print('\nexit sequences of "add; xor; jne +5" under slice1:\n' + text)
 
     def test_fixture_programs(self):
-        programs = json.loads((REPO / 'fixtures/slice1/programs.json').read_text())['programs']
+        programs = check_sites.fixture_programs()
         full = cut = 0
         with tempfile.TemporaryDirectory() as t:
             tmp = Path(t)

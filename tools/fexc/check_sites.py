@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1a check: fexc's access sites against the fixture programs and against the emitted code.
 
-usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series1 build)
+usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series2 build)
 
 --slice1 compiles with `--profile slice1` (S1c): hardware TSO (plain ldr/str), exits through the dispatcher gate, block
 cutting. A program then ends at its first div/idiv or memory xchg with end reason `unsupported_form` at that
@@ -37,7 +37,15 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series1/obj/fexc')
+
+
+def fixture_programs():
+    """The programs of fixtures/slice1/programs.json (git-ignored, built on demand: tools/reference/build_slice1.py)."""
+    path = REPO / 'fixtures/slice1/programs.json'
+    if not path.exists():
+        subprocess.run([sys.executable, '-B', str(REPO / 'tools/reference/build_slice1.py'), '--programs-only'], check=True)
+    return json.loads(path.read_text())['programs']
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series2/obj/fexc')
 KNOWN_OK = False
 PROFILE = []   # extra fexc arguments for every compile: ['--profile', 'slice1'] under --slice1
 
@@ -137,13 +145,13 @@ def run(hexs, rip, tmp, *extra):
 
 def read_object(path):
     f = Path(path).read_bytes()
-    h = struct.unpack_from('<8sIIIIQ14I20sBBBBQBB6s', f, 0)
-    assert h[0] == b'NFXOBJ\0\x01' and h[1] == 2 and h[2] == 128 and h[3] == len(f)
+    h = struct.unpack_from('<8sIIIIQ14I20sBBBBQBB2sI', f, 0)
+    assert h[0] == b'NFXOBJ\0\x01' and h[1] in (2, 3) and h[2] == 128   # 2: builds before the pre-NZCV header field and h[3] == len(f)
     (_, _, _, _, bitness, rip, gbytes, ginsns, coff, csize, body, marker, region_end, spill, soff, scount, poff, pcount, roff, rcount,
-     sra, nsra, profile, end_reason, settings, fbits, fcount, dcache, _) = h
+     sra, nsra, profile, end_reason, settings, fbits, fcount, dcache, _, pre_nzcv) = h
     sites = [struct.unpack_from('<IIIIi20B', f, soff + 40 * i) for i in range(scount)]
     return dict(code=f[coff:coff + csize], sites=sites, body=body, spill=spill, rip=rip, bitness=bitness, nsra=nsra, pcs=pcount, relocs=rcount,
-                gbytes=gbytes, ginsns=ginsns, profile=profile, end_reason=end_reason, settings=settings, fbits=fbits, fcount=fcount, dcache=dcache)
+                gbytes=gbytes, ginsns=ginsns, profile=profile, end_reason=end_reason, settings=settings, fbits=fbits, fcount=fcount, dcache=dcache, pre_nzcv=pre_nzcv, version=h[1])
 
 
 END_REASONS = ['', 'end_of_input', 'block_ending_instruction', 'max_instructions', 'fex_instruction_limit', 'system_instruction',
@@ -160,8 +168,11 @@ def object_vs_json(o, d):
             ('ginsns', g['instructions_translated']), ('gbytes', g['bytes_translated']),
             ('fbits', sum(1 << i for i, v in enumerate(d['features']['host_features'].values()) if v)),
             ('fcount', len(d['features']['host_features'])), ('dcache', d['features']['dcache_line_log2']),
+            ('pre_nzcv', d['state_abi']['state_offsets'].get('natemu_pre_nzcv', 0xFFFFFFFF)),
             ('pcs', len(d['pc_table']['entries'])), ('relocs', len(d['code']['relocations']))]
     for k, v in want:
+        if k == 'pre_nzcv' and o['version'] < 3:
+            continue
         if o[k] != v:
             out.append(f'object {k}={o[k]} but JSON says {v}')
     return out
@@ -175,6 +186,34 @@ def first_cut(asm):
 
 def asm0_cut(p):
     return first_cut(p['asm']) == 0
+
+
+def code_vs_sites(sites, dis):
+    """Messages for every disagreement between the sites and the disassembly `dis` ({offset: text}): a native load/store with a
+    base other than x28/sp that is no site, a site not on a load/store, and a site whose width, base, operand form or writeback
+    differs from the instruction. Independent of the guest program (needs no `asm`)."""
+    out = []
+    by_off = {s['native_offset']: s for s in sites}
+    native = {}
+    for off, text in dis.items():
+        a = native_access(text)
+        if a and a[2] not in ('x28', 'sp'):
+            native[off] = a
+    for off in sorted(set(native) | set(by_off)):
+        a, s = native.get(off), by_off.get(off)
+        if a and not s:
+            out.append(f'native +{off} "{dis[off]}" is a load/store with a non-frame base but no site')
+        elif s and not a:
+            out.append(f'site at +{off} ({s["ir_op"]}) is not on a load/store: "{dis.get(off)}"')
+        else:
+            dirn = 'load' if s['kind'] in ('load', 'pop', 'load_pair', 'pop_pair') else 'store'
+            if (a[0], a[1], a[2]) != (dirn, s['width'], f'x{s["base_reg"]}'):
+                out.append(f'site +{off} ({s["kind"]} w{s["width"]} base x{s["base_reg"]}) vs "{dis[off]}"')
+            if a[3] != s['index_reg'] or a[5] != s['writeback'] or (a[5] == 'none' and a[3] is None and a[4] != s['imm']):
+                out.append(f'site +{off} operand form (index {s["index_reg"]} imm {s["imm"]} wb {s["writeback"]}) vs "{dis[off]}"')
+            elif a[5] == 'pre' and not (a[4] == s['imm'] == s['writeback_delta']) or a[5] == 'post' and not (a[4] == s['writeback_delta'] and s['imm'] == 0):
+                out.append(f'site +{off} writeback (imm {s["imm"]} delta {s["writeback_delta"]}) vs "{dis[off]}"')
+    return out
 
 
 def check_program(p, tmp):
@@ -245,26 +284,7 @@ def check_program(p, tmp):
     end = d['code']['layout']['code_region_end']
     lits = [(r['offset'], r['size']) for r in d['code']['relocations'] if r['size']]
     dis = disassemble(code, end, tmp, lits)
-    by_off = {s['native_offset']: s for s in sites}
-    native = {}
-    for off, text in dis.items():
-        a = native_access(text)
-        if a and a[2] not in ('x28', 'sp'):
-            native[off] = a
-    for off in sorted(set(native) | set(by_off)):
-        a, s = native.get(off), by_off.get(off)
-        if a and not s:
-            problems.append(('ERROR', f'native +{off} "{dis[off]}" is a load/store with a non-frame base but no site'))
-        elif s and not a:
-            problems.append(('ERROR', f'site at +{off} ({s["ir_op"]}) is not on a load/store: "{dis.get(off)}"'))
-        else:
-            dirn = 'load' if s['kind'] in ('load', 'pop', 'load_pair', 'pop_pair') else 'store'
-            if (a[0], a[1], a[2]) != (dirn, s['width'], f'x{s["base_reg"]}'):
-                problems.append(('ERROR', f'site +{off} ({s["kind"]} w{s["width"]} base x{s["base_reg"]}) vs "{dis[off]}"'))
-            if a[3] != s['index_reg'] or a[5] != s['writeback'] or (a[5] == 'none' and a[3] is None and a[4] != s['imm']):
-                problems.append(('ERROR', f'site +{off} operand form (index {s["index_reg"]} imm {s["imm"]} wb {s["writeback"]}) vs "{dis[off]}"'))
-            elif a[5] == 'pre' and not (a[4] == s['imm'] == s['writeback_delta']) or a[5] == 'post' and not (a[4] == s['writeback_delta'] and s['imm'] == 0):
-                problems.append(('ERROR', f'site +{off} writeback (imm {s["imm"]} delta {s["writeback_delta"]}) vs "{dis[off]}"'))
+    problems += [('ERROR', m) for m in code_vs_sites(sites, dis)]
 
     # 3. dense vs sparse, and the binary object vs JSON
     if not PROFILE:   # slice1 refuses --sparse-pc
@@ -291,7 +311,7 @@ def main():
     PROFILE = ['--profile', 'slice1'] if '--slice1' in sys.argv else []
     if args:
         FEXC = args[0]
-    programs = json.loads((REPO / 'fixtures/slice1/programs.json').read_text())['programs']
+    programs = fixture_programs()
     bad = 0
     count = {'ERROR': 0, 'ELIMINATED': 0, 'NARROWED': 0}
     total = 0

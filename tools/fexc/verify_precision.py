@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1b1 check: the slice-1 precision guarantee, verified statically on the code fexc emits (profile slice1).
 
-usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series1 build)
+usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series2 build)
 
 Corpora: fixtures/slice1/programs.json, the single-instruction matrix of scan_skips.py, the adversarial programs below
 (one per precision patch), and every CORPUS.json given (gen_slice1.py format, e.g. a fresh `--seed` corpus).
@@ -12,17 +12,28 @@ For every compile, from the disassembly, the sites, the dense PC table and the s
       stores to the x28 frame other than the pre-NZCV save; the window holds no other guest instruction's entry;
   P2  no NZCV write in that window unless the site says nzcv=frame, and then `mrs xT, nzcv; str wT, [x28, #natemu_pre_nzcv]`
       comes first in the window, before any NZCV write;
-  P3  a load site's destination is not a static register (DDI0487 D1.4.1.4: UNKNOWN after an abort); a writeback base
-      (push/pop on RSP) is allowed, the access itself is its only write;
+  P3  a load site's destination is not a static register (DDI0487 D1.4.1.4: UNKNOWN after an abort). The destinations are
+      read from the disassembled instruction at the site (every transfer register of an ld*, GPR or FP), not from fexc's
+      data_regs; a writeback base (push/pop on RSP) is allowed, the access itself is its only write;
   P4  at most one store-class site (store, store_pair, push) per guest instruction, and it is the instruction's last site;
       no fused pair sites; every site says completed_effects=none;
   P5  no site can be skipped by a forward branch inside its instruction (scan_skips.skips);
   P6  for annotated programs (`insns`, the generator's flag annotations): for each site and each arithmetic flag, the last
-      earlier instruction of the block that writes the flag, if it defines it (tools/reference/flags.py rules), has a
-      native write of its location in its own range (NZCV for CF/ZF/SF/OF, x26 for PF, x27 for AF): no flag write that a
-      later site observes was eliminated;
-  P7  for programs with `asm` (fixtures, generated, adversarial): check_sites' comparison of expected accesses, sites,
-      emitted code and the binary object, with no eliminated access.
+      earlier instruction of the block that writes the flag, if it defines it (tools/reference/flags.py rules; an
+      instruction that leaves the flag undefined defines nothing, which matches the compiler's InvalidateFlags-as-write
+      rule), has a native write of its location in its own range (NZCV for CF/ZF/SF/OF, x26 for PF, x27 for AF): no flag
+      write that a later site observes was eliminated. COARSE: any NZCV-writing instruction in that range satisfies each of
+      CF, ZF, SF and OF (and any x26 / x27 writer PF / AF); it does not check that the right bit holds the right value.
+      Values are covered by the QEMU comparison (S1e), not here;
+  P7  (a) every compile: every native load/store with a base other than x28/sp is a site, every site is on such an
+      instruction, and width, base, index, immediate and writeback match the instruction (check_sites.code_vs_sites);
+      (b) for programs with `asm` (fixtures, generated, adversarial): check_sites' comparison of expected accesses, sites,
+      object and JSON, with no eliminated access.
+Assumption by construction, NOT checked: every static-register write of guest instruction k-1 is emitted before the PC-table
+entry of instruction k. P1 sees only the window from an instruction's start to its site, so a write of an earlier
+instruction that was sunk past the next instruction's start would be flagged only if it lands before that site, and one
+landing after the site would go unnoticed. It holds because the compiler flushes registers per instruction and the
+register-allocation barrier at GuestOpcode (patch 0006) stops a value from being coalesced across the boundary.
 Every mnemonic in a P1/P2 window must be classified below; an unknown one is reported, never assumed harmless.
 Also prints the cost (native instructions and code bytes per translated guest instruction), and with --before the same
 for an earlier build (e.g. s1c, without the patches) on the same inputs.
@@ -36,9 +47,10 @@ REPO = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(REPO / 'tools/reference'))
 import check_sites, scan_skips  # noqa: E402
+from check_sites import code_vs_sites  # noqa: E402
 import flags as F  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series1/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series2/obj/fexc')
 
 NZCV_WRITERS = {'adds', 'adcs', 'subs', 'sbcs', 'ands', 'bics', 'negs', 'ngcs', 'cmp', 'cmn', 'tst', 'ccmp', 'ccmn', 'fcmp',
                 'fcmpe', 'fccmp', 'fccmpe', 'setf8', 'setf16', 'rmif', 'cfinv', 'axflag', 'xaflag'}
@@ -83,6 +95,11 @@ def effects(text):
     nzcv = mn in NZCV_WRITERS or (mn == 'msr' and 'nzcv' in ops.lower())
     known = mn in DATA or mn in NO_DEST or mn.startswith('b.') or bool(acc)
     return mn, {d for d in dests if d}, nzcv, acc, known
+
+
+def loaded_regs(text):
+    """Registers a disassembled load transfers into (all transfer registers before the address; the base is not one)."""
+    return {r for r in map(reg, text.partition(' ')[2].split('[')[0].split(',')) if r}
 
 
 def flag_writes(a):
@@ -179,16 +196,18 @@ def verify(d, tmp, insns=None):
             out.append(f'{tag}: NZCV written at +{first_nzcv} "{dis[first_nzcv]}" before the site, nzcv={s["nzcv"]}')
         if s['nzcv'] == 'frame' and saved is None:
             out.append(f'{tag}: nzcv=frame but no pre-NZCV save before the first NZCV write')
-        if s['kind'] in ('load', 'pop', 'load_pair', 'pop_pair') and s['data_class'] == 'gpr':
-            bad = {('x', r) for r in s['data_regs']} & sra
+        acc = check_sites.native_access(dis.get(at, ''))   # P3 from the disassembly at the site, not from fexc's data_regs
+        if acc and acc[0] == 'load':
+            bad = loaded_regs(dis[at]) & sra
             if bad:
-                out.append(f'{tag}: load destination {",".join(sorted(map(name, bad)))} is a static register')
+                out.append(f'{tag}: load destination {",".join(sorted(map(name, bad)))} of "{dis[at]}" is a static register')
     for g, ss in by_insn.items():
         stores = [s for s in ss if s['kind'] in ('store', 'store_pair', 'push', 'push_pair')]
         if len(stores) > 1:
             out.append(f'guest +{g}: {len(stores)} store sites')
         if stores and stores[-1]['native_offset'] != max(s['native_offset'] for s in ss):
             out.append(f'guest +{g}: the store site +{stores[-1]["native_offset"]} is not the last access of the instruction')
+    out += code_vs_sites(d['sites'], dis)   # P7, code half, on every compile: no unrecorded or misdescribed access
     out += [f'skippable site: {s}' for s in scan_skips.skips(d, tmp)]
     if insns:
         out += stale_flags(d, insns, dis, order)
@@ -220,6 +239,8 @@ ADVERSARIAL = {   # one or more per precision patch; registers point into the ge
     'load-destinations': ['mov rax, qword ptr [rbx]', 'mov ecx, dword ptr [rsi]', 'movzx edx, byte ptr [rdi]', 'pop r8',
                           'cmovb r9, qword ptr [rbx]', 'imul r10, qword ptr [rsi]'],
     'memory-stack-forms': ['pop qword ptr [rbx]', 'push qword ptr [rsi]', 'setb byte ptr [rbx]', 'xchg rax, rcx', 'mov qword ptr [rdi], rax'],
+    'killed-by-undefined-then-access': ['add rdx, 5', 'or rsi, rdi', 'mov rax, qword ptr [rbx]', 'sub rax, rcx', 'imul rdx, rcx',
+                                        'mov qword ptr [rsi], rax', 'add rax, 1', 'mul qword ptr [rdi]'],
     'undefined-flags-before-access': ['add rax, rcx', 'shl qword ptr [rbx], 3', 'mul qword ptr [rsi]', 'imul rax, qword ptr [rbx]'],
 }
 
@@ -248,7 +269,7 @@ def run_corpus(label, progs, tmp, before=None):
         if 'asm' in p:
             check_sites.FEXC, check_sites.PROFILE = FEXC, ['--profile', 'slice1']
             cp, _ = check_sites.check_program(p, tmp)
-            problems += [f'{k}: {m}' for k, m in cp if k != 'NARROWED']
+            problems += [f'{k}: {m}' for k, m in cp if k != 'NARROWED' and m not in problems]   # code_vs_sites already ran in verify()
         for m in problems:
             print(f'  {label} {p["name"]}: {m}')
         bad += bool(problems)
@@ -276,7 +297,7 @@ def main():
     if '--before' in args:
         k = args.index('--before'); before = args[k + 1]; del args[k:k + 2]
     scan_skips.FEXC = FEXC
-    fixtures = json.loads((REPO / 'fixtures/slice1/programs.json').read_text())['programs']
+    fixtures = check_sites.fixture_programs()
     matrix = [{'name': n, 'code': h, 'rip': '0x102000'} for n, h in scan_skips.matrix().items()]
     corpora = [('fixtures', fixtures), ('matrix', matrix), ('adversarial', adversarial())]
     for a in args:

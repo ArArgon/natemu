@@ -10,10 +10,13 @@ state is the state before its instruction and none of its effects is
 committed.
 
 RedundantFlagCalculationElimination: every guest memory op reads all six
-flags (no flag write before it is deleted or narrowed), InvalidateFlags is
-neither read nor write, a guest load with a dead value is kept, and an
-instruction with an NZCV write before one of its accesses saves its
-incoming NZCV to the frame (LoadNZCV + StoreContext after its GuestOpcode).
+flags (no flag write before it is deleted or narrowed), and so does the
+GuestOpcode of an instruction that has an access (the incoming flags are live
+at the instruction start even if the instruction itself invalidates some);
+InvalidateFlags stays a write (an undefined value, so an earlier write may
+die), a guest load with a dead value is kept, and an instruction with an NZCV
+write before one of its accesses saves its incoming NZCV to the frame
+(LoadNZCV + StoreContext after its GuestOpcode).
 
 RegisterAllocationPass: a guest memory op and an instruction boundary count
 as an access of every static register, so a value is coalesced into its
@@ -23,12 +26,12 @@ writeback stack pointer in RSP's register); TryPostRAMerge's candidate is
 reset at GuestOpcode (no push/pop pair across instructions); a kept load
 with no uses frees its register at once.
 ---
- .../RedundantFlagCalculationElimination.cpp   | 32 ++++++++++++++++++-
- .../IR/Passes/RegisterAllocationPass.cpp      | 24 ++++++++++++++
- 2 files changed, 55 insertions(+), 1 deletion(-)
+ .../RedundantFlagCalculationElimination.cpp   | 43 ++++++++++++++++++-
+ .../IR/Passes/RegisterAllocationPass.cpp      | 24 +++++++++++
+ 2 files changed, 66 insertions(+), 1 deletion(-)
 
 diff --git a/FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp b/FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp
-index dc44f16..0f94350 100644
+index dc44f16..bacb9cc 100644
 --- a/FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp
 +++ b/FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp
 @@ -17,6 +17,7 @@ $end_info$
@@ -39,20 +42,17 @@ index dc44f16..0f94350 100644
  
  // Flag bit flags
  #define FLAG_V (1U << 0)
-@@ -344,6 +345,12 @@ constexpr auto FlagInfos = [] {
+@@ -344,6 +345,9 @@ constexpr auto FlagInfos = [] {
  }();
  
  FlagInfo DeadFlagCalculationEliminination::Classify(IROp_Header* IROp) {
 +  if (fexc_slice1 && FexcPrecision::GuestMemOp(IROp->Op)) {
 +    return FlagInfo::Pack({.Read = FLAG_ALL});
 +  }
-+  if (fexc_slice1 && IROp->Op == OP_INVALIDATEFLAGS) {
-+    return FlagInfo::Pack({});
-+  }
    FlagInfo Info = FlagInfos[IROp->Op];
    if (!Info.Special()) {
      return Info;
-@@ -447,7 +454,7 @@ FlagInfo DeadFlagCalculationEliminination::Classify(IROp_Header* IROp) {
+@@ -447,7 +451,7 @@ FlagInfo DeadFlagCalculationEliminination::Classify(IROp_Header* IROp) {
  // be skipped (because it was removed or could not possibly affect flags).
  bool DeadFlagCalculationEliminination::EliminateDeadCode(IREmitter* IREmit, Ref CodeNode, IROp_Header* IROp) {
    // Can't remove anything used or with side effects.
@@ -61,7 +61,32 @@ index dc44f16..0f94350 100644
      return false;
    }
  
-@@ -686,6 +693,29 @@ void DeadFlagCalculationEliminination::Run(IREmitter* IREmit) {
+@@ -543,10 +547,24 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
+     FlagsRead = CFG.Get(ExitOp->Args[0])->Flags;
+   }
+ 
++  bool HasAccess = false;
+   // Iterate the block in reverse
+   while (true) {
+     auto [CodeNode, IROp] = CodeLast();
+ 
++    // slice1: the incoming flags are live at the start of every instruction that has a guest memory access (the access
++    // reads them; an InvalidateFlags of the same instruction must not hide them from the instruction start).
++    if (fexc_slice1) {
++      if (FexcPrecision::GuestMemOp(IROp->Op)) {
++        HasAccess = true;
++      } else if (IROp->Op == OP_GUESTOPCODE) {
++        if (HasAccess) {
++          FlagsRead |= FLAG_ALL;
++        }
++        HasAccess = false;
++      }
++    }
++
+     // Optimizing flags can cause earlier flag reads to become dead but dead
+     // flag reads should not impede optimiation of earlier dead flag writes.
+     // We must DCE as we go to ensure we converge in a single iteration.
+@@ -686,6 +704,29 @@ void DeadFlagCalculationEliminination::Run(IREmitter* IREmit) {
    auto CurrentIR = IREmit->ViewIR();
    fextl::deque<uint32_t> Worklist;
  
@@ -81,7 +106,7 @@ index dc44f16..0f94350 100644
 +            IREmit->SetWriteCursor(Cursor);
 +            Saved = true;
 +          }
-+        } else if ((Classify(IROp).Write() & FLAG_NZCV) || IR::ImplicitFlagClobber(IROp->Op)) {
++        } else if (IROp->Op != OP_INVALIDATEFLAGS && ((Classify(IROp).Write() & FLAG_NZCV) || IR::ImplicitFlagClobber(IROp->Op))) {
 +          Writer = true;
 +        }
 +      }

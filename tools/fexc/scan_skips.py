@@ -12,7 +12,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series1/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series2/obj/fexc')
 BR = [re.compile(r'b\.\w+\s+0x([0-9a-f]+)$'), re.compile(r'(?:cbz|cbnz)\s+\w+,\s+0x([0-9a-f]+)$'),
       re.compile(r'(?:tbz|tbnz)\s+\w+,\s+#\d+,\s+0x([0-9a-f]+)$'), re.compile(r'b\s+0x([0-9a-f]+)$')]
 
@@ -113,7 +113,7 @@ def scan():
                 bad[name] = s[0]
             elif '[' in name and 'lea' not in name and not d['sites']:
                 bad[name] = ('no site at all', 'the memory access is not emitted')
-        programs = json.loads((HERE.parents[1] / 'fixtures/slice1/programs.json').read_text())['programs']
+        programs = check_sites.fixture_programs()
         fixtures = 0
         for p in programs:
             d = run(p['code'], int(p['rip'], 16))

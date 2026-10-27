@@ -40,7 +40,7 @@ static inline void* mremap(void*, size_t, size_t, int, ...) { abort(); }
 // PROT_EXEC (macOS arm64 refuses writable+executable anonymous mappings).
 #define FEXC_EXEC_PROT(execute) 0
 #define SYS_futex 1001
-#define SYS_getcpu 1002
+#define SYS_getcpu 168   // the arm64 Linux number: rdpid/rdtscp code embeds it (`mov x8, #168; svc`), InstructionCountCI checks it
 #define SYS_tgkill 1003
 #define SYS_statx 1004
 #define SYS_renameat2 1005

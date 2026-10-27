@@ -27,15 +27,18 @@ jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never 
 (series applied as six commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series1` (identical `fexc` binary, byte for byte, to
-the earlier `s1b1` build that came from the archives and `patch.py`). Kept for comparison only: `s1b1`, `s1c` (slice1
-without the precision patches, the "before" of the cost numbers) and `c1b` (the v1 build without sites).
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series2` (a fresh `build.sh` run gives a
+byte-identical `fexc`). Kept for comparison only: `s1c` (slice1 without the precision patches, the "before" of the cost
+numbers) and `c1b` (the v1 build without sites). The earlier `series1` (flag rule before the cheaper one below) and `s1b1` are gone.
 
 The dependency archives of the old I4-V producer (`upstream.tar.gz`, `dependency-overlay.tar`) are no longer used; the
 submodule tree and the three externals are identical to them (the other overlay members, `vixl`, `jemalloc_glibc`,
 `range-v3`, `rpmalloc`, `cpp-optparse`, are not used by this build and not initialised). Running
 `upstream_tests/run_icount.py` additionally needs `git -C third_party/FEX submodule update --init --depth 1 External/vixl`
-(it builds a VIXL disassembler from it).
+(it builds a VIXL disassembler from it into `--work`, and reuses one that is already there; `git -C third_party/FEX
+submodule deinit -f External/vixl` afterwards frees the disk). It passes the JSON's `Env` options through `fexc --config`.
+Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--variant upstream` (6,905 before `--config`;
+`--config` alone accounts for 802 of the 804 more, the 2 `rdpid` tests need `SYS_getcpu = 168` in `shim/fexc_compat.h`).
 
 ### The patch series
 
@@ -120,7 +123,7 @@ Warnings are suppressed (`-w`) for the vendored sources.
 ```
 BUILD_DIR/obj/fexc (--hex HEX | --file RAW) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1]
                    [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso]
-                   [--feature NAME=0|1]... [--out FILE] [--object FILE]
+                   [--feature NAME=0|1]... [--config NAME=VALUE]... [--out FILE] [--object FILE]
 ```
 
 Input: raw x86 bytes (1..65536), full 64-bit guest RIP (canonical, including
@@ -129,7 +132,9 @@ window at that RIP; FEX reads them through `ResolveGuestCodePointer` by logical
 address, so nothing is mapped at the guest address. Anything past the window is
 "not executable" and ends the block (`end.reason = end_of_input`).
 `--max-insts N` stops after N guest instructions (default: FEX's own limit, 5000).
-One fresh FEX context per run (FEX fixes the mode per context). Exit code: 0 ok,
+`--config NAME=VALUE` sets any FEX config option after fexc's own settings (NAME: the option's enum name without `CONFIG_`,
+e.g. `X87REDUCEDPRECISION`, case-insensitive, a leading `FEX_` is accepted; an unknown name is refused); the options given are
+echoed in `settings.config` (absent when none). One fresh FEX context per run (FEX fixes the mode per context). Exit code: 0 ok,
 1 no instruction translated (JSON still written), 2 bad arguments, 3 FEX init failed.
 
 ### Settings (one place: `FeatureTable()` / `Settings` in `fexc.cpp`)
@@ -211,6 +216,10 @@ CASES (64-bit high RIP, 32-bit) and three from `fixtures/slice1/programs.json`, 
 and disassembles each block with `xcrun objdump` (llvm-based; it wraps the words in a
 Mach-O object first). The full comparison with the old pinned bodies and the structural
 self-check are in `test_fexc.py`.
+
+The scripts that read `fixtures/slice1/programs.json` (git-ignored; `smoke.py`, `check_sites.py`, `scan_skips.py`,
+`verify_precision.py`, `test_slice1.py`) get it through `check_sites.fixture_programs()`, which runs
+`tools/reference/build_slice1.py --programs-only` (needs host clang) when the file is missing.
 
 ## Profile slice1 (S1c)
 
@@ -325,7 +334,7 @@ The site's `imm`, `writeback` and `writeback_delta` (address = base register val
 equals `writeback_delta`, post-index: `imm` is 0) are read from the emitted instruction word (FEX's `Push` with
 `NeedsMoveAfterwards` emits `stur [base,#-n]` and updates the base with a later `sub`, which is no writeback of the access).
 
-`--object FILE` (only when the status is `ok`) writes the binary form, version 2: a 128-byte header, the code (relocation
+`--object FILE` (only when the status is `ok`) writes the binary form, version 3 (v2 plus `pre_nzcv_offset` at byte 124, the frame offset of the pre-NZCV save slot, 1032 under slice1 and `NONE32` otherwise): a 128-byte header, the code (relocation
 slots zeroed), then site, PC-entry and relocation tables, layout in `crates/abi/src/code_object.rs`. Besides what the JSON
 carries per site (including `located`), the header records the profile, the `settings` bits (TSO, multiblock, dense PC, end
 marker), the end reason code (the `guest.end.reason` string), the feature profile (`feature_bits`: bit i is the i-th member
@@ -340,7 +349,7 @@ generated corpus and the 613-form matrix, except the host address of FEX's exit-
 
 | patch | FEX file::function | change |
 |---|---|---|
-| 2 | `RedundantFlagCalculationElimination.cpp::Classify` | every guest-memory op (LoadMem, StoreMem, their TSO and pair forms, Push, Pop) reads all six flags, so no flag write before it is deleted or narrowed; `InvalidateFlags` (no code) is neither read nor write, else it would make the previous instruction's flags look dead just before an access |
+| 2 | `RedundantFlagCalculationElimination.cpp::Classify` | every guest-memory op (LoadMem, StoreMem, their TSO and pair forms, Push, Pop) reads all six flags, so no flag write before it is deleted or narrowed; `InvalidateFlags` stays a write (its value is undefined, so an earlier write of that flag may die, e.g. add's AF across a later `or`), and the `GuestOpcode` of an instruction with an access reads all six flags, so the incoming flags stay live at the instruction start even if the instruction itself invalidates some; the guarantee is unchanged, the cost drops |
 | 2b | `...::EliminateDeadCode`, `RegisterAllocationPass.cpp::Run` (forward) | a guest load with a dead value (`cmp`/`test`/`bt [m]`) is kept; its destination register is freed at once |
 | 3 | `RegisterAllocationPass.cpp::Run` (backwards) | a guest-memory op and a guest instruction boundary (`GuestOpcode`) count as an access of every static register, so a value is coalesced into its SRA register only if no access (and no instruction boundary) lies between its definition and its store; this covers constants pooled across instructions. A load's own value never gets an SRA register (DDI0487 D1.4.1.4); a pop's writeback stack pointer stays in RSP's register (the access is its only write) |
 | 4 | `RegisterAllocationPass.cpp::Run` (forward) | `TryPostRAMerge`'s candidate is reset at `GuestOpcode`: no push/pop pair, no merge across instructions |
@@ -358,11 +367,14 @@ is `none`, or `unverified` if the recorder sees an earlier store site or an unsa
 between a site's instruction start and the site no static-register (GPR, x26, x27, xmm) write, no store, no frame write
 but the pre-NZCV save, no NZCV write unless `nzcv=frame` with the save first; load destinations not static registers; at
 most one store site per instruction and last; no fused pair; `completed_effects=none`; no skippable site; for annotated
-programs every flag a later site observes has a native write in its defining instruction (flags.py rules); plus
-`check_sites` for programs with `asm` (no eliminated access). Corpora: fixtures, the scan_skips matrix, adversarial
+programs every flag a later site observes has a native write in its defining instruction (flags.py rules; coarse: any NZCV
+writer satisfies CF/ZF/SF/OF, any x26/x27 writer PF/AF); load destinations are read from the disassembly at the site; on
+every compile (matrix too) each native non-frame load/store is a site and the reverse; plus the rest of `check_sites` for
+programs with `asm` (no eliminated access). By construction and unchecked: an instruction's static-register writes land
+before the next instruction's start. Corpora: fixtures, the scan_skips matrix, adversarial
 programs per patch, and any `gen_slice1.py` corpus given. Against `s1c` it reports every defect class (SRA writes from
 pooled constants and RMW flag results, unsaved NZCV writes, load destinations in SRA registers, fused pairs, eliminated
-loads and flag writes); against `s1b1` it passes.
+loads and flag writes); against `series2` (and the earlier `series1`) it passes.
 
 ## Checks
 

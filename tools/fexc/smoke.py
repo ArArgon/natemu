@@ -7,11 +7,13 @@ from pathlib import Path
 here = Path(__file__).resolve().parent
 repo = here.parent.parent
 sys.path.insert(0, str(repo / 'tools/i4v_producer'))
+sys.path.insert(0, str(here))
+import check_sites
 from export import CASES  # existing pinned bodies, used only as sample inputs
 
 fexc, out = sys.argv[1], Path(sys.argv[2])
 out.mkdir(parents=True, exist_ok=True)
-programs = {p['name']: p for p in json.loads((repo / 'fixtures/slice1/programs.json').read_text())['programs']}
+programs = {p['name']: p for p in check_sites.fixture_programs()}
 inputs = [  # (tag, hex, rip, bitness, max_insts)
     ('case-memory_data64', CASES['fex_memory_data64']['source'], 0xffff800000102000, 64, 1),
     ('case-address_store_ecx', CASES['fex_address_store_ecx']['source'], 0x1000, 32, 1),
