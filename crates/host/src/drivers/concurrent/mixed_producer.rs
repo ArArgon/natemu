@@ -1,6 +1,6 @@
 //! Bounded per-owner compilation, including an independently retained stale job.
 use super::*;
-use crate::i4v_stack::{read_packet, write_packet};
+use crate::translation::{read_packet, write_packet};
 use crate::translation::process_owner::OwnedChild;
 use natemu_abi::mixed32;
 use std::path::PathBuf;

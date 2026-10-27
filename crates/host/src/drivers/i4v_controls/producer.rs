@@ -1,5 +1,5 @@
 //! Bounded per-owner instruction compilation for control and address profiles.
-use crate::i4v_stack::{read_packet, write_packet};
+use crate::translation::{read_packet, write_packet};
 use crate::translation::process_owner::OwnedChild;
 use crate::*;
 use natemu_abi::concurrency::{DEFER_COMPILE, POLL_COMPILE, TAKE_COMPILE};
@@ -34,7 +34,7 @@ impl Job {
     fn finish(mut self) -> Result<wire::Packet> {
         let result = self.validate_reply();
         if let Err(error) = &result {
-            crate::concurrent::containment::latch(error);
+            crate::drivers::concurrent::containment::latch(error);
         }
         let reply = result?;
         write_packet(&self.directory.join("reply-delivered.bin"), &reply)?;
@@ -135,13 +135,13 @@ impl Compiler {
         fs::create_dir(&directory).map_err(|e| e.to_string())?;
         write_packet(&directory.join("request.bin"), &request)?;
         let hold = deferred
-            && crate::concurrent::containment::deferred_request(self.owner, &request)
-            && crate::concurrent::containment::configuration().is_some_and(|c| {
+            && crate::drivers::concurrent::containment::deferred_request(self.owner, &request)
+            && crate::drivers::concurrent::containment::configuration().is_some_and(|c| {
                 c.actor == self.owner && c.failure == natemu_abi::containment::WORKER_EXIT
             });
         let hold_container = deferred
-            && crate::concurrent::containment::deferred_request(self.owner, &request)
-            && crate::concurrent::containment::configuration()
+            && crate::drivers::concurrent::containment::deferred_request(self.owner, &request)
+            && crate::drivers::concurrent::containment::configuration()
                 .is_some_and(|c| c.failure == natemu_abi::containment::CANCEL);
         let mut child = OwnedChild::spawn_injected(
             &self.worker,
@@ -180,9 +180,9 @@ impl Compiler {
         }
         match operation {
             natemu_abi::containment::PEEK_CONTAINER => {
-                if !crate::concurrent::containment::configuration()
+                if !crate::drivers::concurrent::containment::configuration()
                     .is_some_and(|c| c.failure == natemu_abi::containment::CANCEL)
-                    || !crate::concurrent::containment::service_request(
+                    || !crate::drivers::concurrent::containment::service_request(
                         self.owner, &packet, operation,
                     )
                 {
@@ -199,9 +199,9 @@ impl Compiler {
                 }))
             }
             natemu_abi::containment::PEEK_DEFERRED => {
-                if !crate::concurrent::containment::configuration()
+                if !crate::drivers::concurrent::containment::configuration()
                     .is_some_and(|c| c.failure == natemu_abi::containment::MALFORMED)
-                    || !crate::concurrent::containment::service_request(
+                    || !crate::drivers::concurrent::containment::service_request(
                         self.owner, &packet, operation,
                     )
                 {
@@ -249,7 +249,7 @@ impl Compiler {
                     return Err("control take changed identity".into());
                 }
                 if let Some(config) =
-                    crate::concurrent::containment::injection_request(self.owner, &packet)
+                    crate::drivers::concurrent::containment::injection_request(self.owner, &packet)
                 {
                     let job = self.pending.as_mut().unwrap();
                     if config.failure == natemu_abi::containment::WORKER_EXIT {

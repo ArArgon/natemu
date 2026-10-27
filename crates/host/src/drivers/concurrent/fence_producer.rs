@@ -1,6 +1,6 @@
 //! One actual compilation, followed by four identity-bound resident deliveries.
 use super::*;
-use crate::i4v_stack::{read_packet, write_packet};
+use crate::translation::{read_packet, write_packet};
 use crate::translation::process_owner::OwnedChild;
 use natemu_abi::fence as f;
 use std::path::PathBuf;

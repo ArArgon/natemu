@@ -1,14 +1,10 @@
 //! First I4-V harness: eager controls and resident-requested high/low guest loads.
 use super::*;
 use natemu_abi::{recovery as recover, shadow, validation};
-use std::{fs::OpenOptions, io::Write, path::Path};
+use crate::translation::{read_packet, run_worker};
+use std::path::Path;
 
 const BODY: [u8; 8] = [0xc4, 0xfc, 0xdf, 0xc8, 0x1f, 0x20, 0x03, 0xd5];
-
-pub(super) fn words(memory: &Memory, offset: usize) -> [u64; 512] {
-    let bytes = memory.read::<4096>(offset);
-    core::array::from_fn(|i| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap()))
-}
 
 fn word(memory: &Memory, offset: usize) -> u64 {
     u64::from_le_bytes(memory.read::<8>(offset))
@@ -121,8 +117,8 @@ pub fn run(args: &[String]) -> Result<()> {
         lifecycle: natemu_abi::translation::Lifecycle::new(vm_nonce),
     };
     let tables_before = memory.read::<16384>(recover::TABLE_OFFSET);
-    let upper_root_before = words(&memory, shadow::UPPER_ROOT);
-    let upper_leaf_before = words(&memory, shadow::UPPER_LEAF);
+    let upper_root_before = table_words(&memory, shadow::UPPER_ROOT);
+    let upper_leaf_before = table_words(&memory, shadow::UPPER_LEAF);
     let upper_links_before = upper_links(&memory);
     let lower_data_leaf_before = word(&memory, shadow::LOWER_LEAF + 256 * 8);
     let code_before = memory.read::<12>(CODE_OFFSET);
@@ -146,7 +142,9 @@ pub fn run(args: &[String]) -> Result<()> {
         if request != validation::request(vm_nonce, rip) {
             return Err("I4-V resident request differs from the expected identity/source".into());
         }
-        let mut reply = compile_request(&args[7], &args[3], Path::new(&args[8]), request)?;
+        let mut reply = read_packet(
+            &run_worker(&args[7], &args[3], Path::new(&args[8]), &request, 1)?.join("reply.bin"),
+        )?;
         if Some(reply) != validation::reply(&request) {
             return Err("I4-V compiler reply differs from its original request/body".into());
         }
@@ -188,8 +186,8 @@ pub fn run(args: &[String]) -> Result<()> {
         final_state.width,
         final_state.stage,
         recovery::report(&vm, &guest, &tables_before),
-        words(&vm.memory, shadow::UPPER_ROOT),
-        words(&vm.memory, shadow::UPPER_LEAF),
+        table_words(&vm.memory, shadow::UPPER_ROOT),
+        table_words(&vm.memory, shadow::UPPER_LEAF),
         upper_links(&vm.memory),
         word(&vm.memory, shadow::LOWER_LEAF + 256 * 8),
     );
@@ -208,48 +206,4 @@ pub fn run(args: &[String]) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn compile_request(
-    worker: &str,
-    producer: &str,
-    output: &Path,
-    request: [u64; 16],
-) -> Result<[u64; 16]> {
-    fs::create_dir_all(output).map_err(|e| e.to_string())?;
-    let directory = output.join("request-001");
-    fs::create_dir(&directory).map_err(|e| e.to_string())?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(directory.join("request.bin"))
-        .map_err(|e| e.to_string())?;
-    for value in request {
-        file.write_all(&value.to_le_bytes())
-            .map_err(|e| e.to_string())?;
-    }
-    drop(file);
-    let mut child = translation::process_owner::OwnedChild::spawn(
-        Path::new(worker),
-        Path::new(producer),
-        &directory,
-    )?;
-    let result = child.wait().map_err(|e| e.to_string())?;
-    if !result.success() {
-        return Err(format!("I4-V worker failed: {}", directory.display()));
-    }
-    let raw = read_input(
-        directory
-            .join("reply.bin")
-            .to_str()
-            .ok_or("non-UTF8 worker path")?,
-        128,
-    )?;
-    if raw.len() != 128 {
-        return Err("I4-V worker reply length differs from packet".into());
-    }
-    child.cleanup()?;
-    Ok(core::array::from_fn(|i| {
-        u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap())
-    }))
 }

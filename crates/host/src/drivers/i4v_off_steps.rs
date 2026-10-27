@@ -1,5 +1,5 @@
 //! Live protected32 paging-off execution of the separately compiled FEX instructions.
-use super::i4v_stack::{read_packet, start_worker_numbered, write_packet};
+use crate::translation::{read_packet, run_worker, write_packet};
 use super::*;
 use natemu_abi::{paging_off_steps as off, recovery as recover, shadow, validation};
 use std::path::Path;
@@ -134,9 +134,9 @@ pub fn run(args: &[String]) -> Result<()> {
         lifecycle: natemu_abi::translation::Lifecycle::new(vm_nonce),
     };
     let tables_before = memory.read::<16384>(recover::TABLE_OFFSET);
-    let upper_root_before = i4v::words(&memory, shadow::UPPER_ROOT);
-    let upper_leaf_before = i4v::words(&memory, shadow::UPPER_LEAF);
-    let lower_leaf_before = i4v::words(&memory, shadow::LOWER_LEAF);
+    let upper_root_before = table_words(&memory, shadow::UPPER_ROOT);
+    let upper_leaf_before = table_words(&memory, shadow::UPPER_LEAF);
+    let lower_leaf_before = table_words(&memory, shadow::LOWER_LEAF);
     let upper_links_before = i4v::upper_links(&memory);
     let code_before = memory.read::<{ off::CODE_BYTES }>(CODE_OFFSET);
     let mut step_state: off::State = unsafe { core::mem::zeroed() };
@@ -172,7 +172,7 @@ pub fn run(args: &[String]) -> Result<()> {
             return Err("instruction request changes stored profile/source/addresses/order".into());
         }
         let directory =
-            start_worker_numbered(&args[6], &args[3], Path::new(&args[7]), &request, step)?;
+            run_worker(&args[6], &args[3], Path::new(&args[7]), &request, step)?;
         let mut reply = read_packet(&directory.join("reply.bin"))?;
         if Some(reply) != off::reply(&request) {
             return Err("instruction reply differs from actual compile/request".into());
@@ -265,9 +265,9 @@ pub fn run(args: &[String]) -> Result<()> {
         final_state.width,
         final_state.stage,
         recovery::report(&vm, &guest, &tables_before),
-        i4v::words(&vm.memory, shadow::UPPER_ROOT),
-        i4v::words(&vm.memory, shadow::UPPER_LEAF),
-        i4v::words(&vm.memory, shadow::LOWER_LEAF),
+        table_words(&vm.memory, shadow::UPPER_ROOT),
+        table_words(&vm.memory, shadow::UPPER_LEAF),
+        table_words(&vm.memory, shadow::LOWER_LEAF),
         i4v::upper_links(&vm.memory)
     );
     if result.current_el != 4

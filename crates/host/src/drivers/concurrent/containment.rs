@@ -179,7 +179,7 @@ impl Observation {
         );
         fields.push(format!(
             "\"guest\":{},\"frame\":{}",
-            crate::recovery::guest_json(&w.guest),
+            guest_json(&w.guest),
             frame_json(&w.frame)
         ));
         let timestamp = |time: Option<Instant>| {

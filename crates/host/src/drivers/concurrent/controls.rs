@@ -1,6 +1,6 @@
 //! Concurrent control programs share RAM while retaining owner-private execution state.
 use super::*;
-use crate::i4v_controls as single;
+use crate::drivers::i4v_controls as single;
 use natemu_abi::{controls as control, modes, pae, recovery as recover, validation};
 
 fn owner_mappings(memory: &Memory, id: usize) {
@@ -355,17 +355,17 @@ fn owner_report(
     add!("code_after", memory.read::<CODE_BYTES>(base + CODE_OFFSET));
     add!(
         "lower_leaf_after",
-        i4v::words(memory, base + shadow::LOWER_LEAF)
+        table_words(memory, base + shadow::LOWER_LEAF)
     );
     add!(
         "upper_root_after",
-        i4v::words(memory, base + shadow::UPPER_ROOT)
+        table_words(memory, base + shadow::UPPER_ROOT)
     );
     add!(
         "upper_leaf_after",
-        i4v::words(memory, base + shadow::UPPER_LEAF)
+        table_words(memory, base + shadow::UPPER_LEAF)
     );
-    f.push(format!("\"initial\":{},\"entered\":{},\"final_frame\":{},\"guest_before\":{},\"guest_after\":{},\"controls\":{},\"pae\":{},\"modes\":{},\"owner\":{}",frame_json(&seed.0),frame_json(&shared.initial),frame_json(&shared.captured),crate::recovery::guest_json(&seed.2),crate::recovery::guest_json(&guest),single::state_json(&state),single::pae_json(&pae),single::modes_json(&modes),owner_json(&owner)));
+    f.push(format!("\"initial\":{},\"entered\":{},\"final_frame\":{},\"guest_before\":{},\"guest_after\":{},\"controls\":{},\"pae\":{},\"modes\":{},\"owner\":{}",frame_json(&seed.0),frame_json(&shared.initial),frame_json(&shared.captured),guest_json(&seed.2),guest_json(&guest),single::state_json(&state),single::pae_json(&pae),single::modes_json(&modes),owner_json(&owner)));
     let visits = (0..control::MAX_VISITS)
         .map(|i| {
             single::visit_json(&memory.read_record(
@@ -392,7 +392,7 @@ fn owner_report(
     let mut e = fields!(event; consumed,deliveries,boundary,blocked,wait_checks,shadow,priority);
     e.push(format!(
         "\"packet\":{}",
-        crate::recovery::guest_json(&event.packet)
+        guest_json(&event.packet)
     ));
     f.push(format!("\"event\":{{{}}}", e.join(",")));
     let intervals = (0..maintenance_abi::MAX_INTERVALS)
@@ -519,7 +519,7 @@ pub fn run(args: &[String]) -> Result<()> {
         let base = ram + id * RAM_SIZE;
         let output = owner_output(&args[8], id)?;
         Ok(checked(
-            crate::i4v_controls::producer::Compiler::new_owner(
+            crate::drivers::i4v_controls::producer::Compiler::new_owner(
                 args[3].clone().into(),
                 args[7].clone().into(),
                 output,

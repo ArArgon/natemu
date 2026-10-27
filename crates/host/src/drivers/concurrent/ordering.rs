@@ -86,7 +86,7 @@ fn owner_json(memory: &Memory, id: usize, bank: &[u8; 512], requests: &[wire::Pa
         frame_json(&owner.current),
         frame_json(&s.captured)
     ));
-    f.push(format!("\"bank_before\":{bank:?},\"bank_after\":{:?},\"published_code\":{:?},\"final_native_leaf\":{:?},\"compiler_requests\":{:?}",memory.read::<512>(base+BANK_OFFSET),memory.read::<{o::CODE_BYTES}>(base+CODE_OFFSET),i4v::words(memory,base+shadow::LOWER_LEAF),requests.iter().filter(|p|p[3]==id as u64).collect::<Vec<_>>()));
+    f.push(format!("\"bank_before\":{bank:?},\"bank_after\":{:?},\"published_code\":{:?},\"final_native_leaf\":{:?},\"compiler_requests\":{:?}",memory.read::<512>(base+BANK_OFFSET),memory.read::<{o::CODE_BYTES}>(base+CODE_OFFSET),table_words(memory,base+shadow::LOWER_LEAF),requests.iter().filter(|p|p[3]==id as u64).collect::<Vec<_>>()));
     let trials = (0..o::TRIALS)
         .map(|i| {
             trial_json(
@@ -109,10 +109,10 @@ fn atomic_json(memory: &Memory, n: usize) -> String {
     let owners=state.owners.iter().map(|v| {
         let mut f=fields!(v; saved_gpa,saved_leaf,fault_pc,resume_pc,queued,resumed,completed,ack_leaf,new_leaf);
         f.push(format!("\"fault_frame\":{}",frame_json(&v.fault_frame)));
-        f.push(format!("\"before_guest\":{},\"completed_guest\":{}",crate::recovery::guest_json(&v.before_guest),crate::recovery::guest_json(&v.completed_guest)));
+        f.push(format!("\"before_guest\":{},\"completed_guest\":{}",guest_json(&v.before_guest),guest_json(&v.completed_guest)));
         let e=&v.event;
         let mut event=fields!(e; consumed,deliveries,boundary,blocked,wait_checks,shadow,priority);
-        event.push(format!("\"packet\":{}",crate::recovery::guest_json(&e.packet)));
+        event.push(format!("\"packet\":{}",guest_json(&e.packet)));
         let w=&v.walk;
         f.push(format!("\"event\":{{{}}},\"walk\":{{{}}}",event.join(","),fields!(w; address,gpa,leaf_bytes,writable,dirty,read_count,writes,reads).join(",")));
         format!("{{{}}}",f.join(","))
@@ -241,7 +241,7 @@ pub fn run(args: &[String]) -> Result<()> {
         let base = ram + id * RAM_SIZE;
         let output = owner_output(&args[9], id)?;
         Ok(checked(
-            crate::i4v_controls::producer::Compiler::new_ordering(
+            crate::drivers::i4v_controls::producer::Compiler::new_ordering(
                 args[3].clone().into(),
                 args[8].clone().into(),
                 output,

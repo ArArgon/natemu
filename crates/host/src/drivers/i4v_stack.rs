@@ -1,67 +1,8 @@
 //! Live stack-fragment validation with one compile and three bounded replies.
 use super::*;
 use natemu_abi::{recovery as recover, shadow, stack, validation};
-use std::{
-    fs::OpenOptions,
-    io::Write,
-    path::{Path, PathBuf},
-};
-
-pub(super) fn write_packet(path: &Path, packet: &[u64; 16]) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    for word in packet {
-        file.write_all(&word.to_le_bytes())
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-pub(super) fn start_worker(
-    worker: &str,
-    producer: &str,
-    output: &Path,
-    request: &[u64; 16],
-) -> Result<PathBuf> {
-    start_worker_numbered(worker, producer, output, request, 1)
-}
-
-pub(super) fn start_worker_numbered(
-    worker: &str,
-    producer: &str,
-    output: &Path,
-    request: &[u64; 16],
-    number: usize,
-) -> Result<PathBuf> {
-    fs::create_dir_all(output).map_err(|e| e.to_string())?;
-    let directory = output.join(format!("request-{number:03}"));
-    fs::create_dir(&directory).map_err(|e| e.to_string())?;
-    write_packet(&directory.join("request.bin"), request)?;
-    let mut child = translation::process_owner::OwnedChild::spawn(
-        Path::new(worker),
-        Path::new(producer),
-        &directory,
-    )?;
-    let status = child.wait().map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err(format!("I4-V stack worker failed: {}", directory.display()));
-    }
-    child.cleanup()?;
-    Ok(directory)
-}
-
-pub(super) fn read_packet(path: &Path) -> Result<[u64; 16]> {
-    let raw = read_input(path.to_str().ok_or("non-UTF8 packet path")?, 128)?;
-    if raw.len() != 128 {
-        return Err("stack reply packet length differs".into());
-    }
-    Ok(core::array::from_fn(|i| {
-        u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap())
-    }))
-}
+use crate::translation::{read_packet, run_worker, write_packet};
+use std::path::Path;
 
 pub fn run(args: &[String]) -> Result<()> {
     if args[6] != "1" {
@@ -196,9 +137,9 @@ pub fn run(args: &[String]) -> Result<()> {
         lifecycle: natemu_abi::translation::Lifecycle::new(vm_nonce),
     };
     let tables_before = memory.read::<16384>(recover::TABLE_OFFSET);
-    let upper_root_before = i4v::words(&memory, shadow::UPPER_ROOT);
-    let upper_leaf_before = i4v::words(&memory, shadow::UPPER_LEAF);
-    let lower_leaf_before = i4v::words(&memory, shadow::LOWER_LEAF);
+    let upper_root_before = table_words(&memory, shadow::UPPER_ROOT);
+    let upper_leaf_before = table_words(&memory, shadow::UPPER_LEAF);
+    let lower_leaf_before = table_words(&memory, shadow::LOWER_LEAF);
     let upper_links_before = i4v::upper_links(&memory);
     let code_before = memory.read::<{ stack::CODE_BYTES }>(CODE_OFFSET);
     memory.write_record(recover::GUEST_OFFSET, guest);
@@ -231,11 +172,12 @@ pub fn run(args: &[String]) -> Result<()> {
             return Err("stack request changes compile identity/chunk order".into());
         }
         if chunk == 0 {
-            directory = Some(start_worker(
+            directory = Some(run_worker(
                 &args[7],
                 &args[3],
                 Path::new(&args[8]),
                 &request,
+                1,
             )?);
         }
         let directory = directory.as_ref().ok_or("stack worker was not started")?;
@@ -303,9 +245,9 @@ pub fn run(args: &[String]) -> Result<()> {
         final_state.width,
         final_state.stage,
         recovery::report(&vm, &guest, &tables_before),
-        i4v::words(&vm.memory, shadow::UPPER_ROOT),
-        i4v::words(&vm.memory, shadow::UPPER_LEAF),
-        i4v::words(&vm.memory, shadow::LOWER_LEAF),
+        table_words(&vm.memory, shadow::UPPER_ROOT),
+        table_words(&vm.memory, shadow::UPPER_LEAF),
+        table_words(&vm.memory, shadow::LOWER_LEAF),
         i4v::upper_links(&vm.memory),
         stack_state.transfers,
         stack_state.entries,

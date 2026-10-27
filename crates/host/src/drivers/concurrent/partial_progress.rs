@@ -36,7 +36,7 @@ fn owner_json(m: &Memory, id: usize, bank: &[u8; 512]) -> String {
         ("resumed", &o.resumed),
         ("after", &o.after),
     ] {
-        out.push(format!("\"{name}\":{}", crate::recovery::guest_json(g)));
+        out.push(format!("\"{name}\":{}", guest_json(g)));
     }
     out.push(format!(
         "\"walks\":[{}]",
@@ -57,7 +57,7 @@ fn owner_json(m: &Memory, id: usize, bank: &[u8; 512]) -> String {
     out.push(format!(
         "\"bank_before\":{bank:?},\"bank_after\":{:?},\"native_leaf\":{:?}",
         m.read::<512>(base + BANK_OFFSET),
-        i4v::words(m, base + shadow::LOWER_LEAF)
+        table_words(m, base + shadow::LOWER_LEAF)
     ));
     format!("{{{}}}", out.join(","))
 }
@@ -139,7 +139,7 @@ pub fn run(args: &[String]) -> Result<()> {
         };
         let output = owner_output(&args[8], id)?;
         Ok(checked(
-            crate::i4v_controls::producer::Compiler::new_owner(
+            crate::drivers::i4v_controls::producer::Compiler::new_owner(
                 args[3].clone().into(),
                 args[7].clone().into(),
                 output,

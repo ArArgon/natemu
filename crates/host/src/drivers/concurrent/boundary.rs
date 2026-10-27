@@ -121,7 +121,7 @@ fn owner_json(memory: &Memory, id: usize) -> String {
         ("guest_after", &o.guest_after),
         ("final_guest", &final_guest),
     ] {
-        f.push(format!("\"{name}\":{}", recovery::guest_json(guest)));
+        f.push(format!("\"{name}\":{}", guest_json(guest)));
     }
     f.push(format!(
         "\"prefixes\":[{}]",
@@ -145,7 +145,7 @@ fn owner_json(memory: &Memory, id: usize) -> String {
     f.push(format!("\"fragments\":[{fragments}]"));
     f.extend(fields!(final_state; status,detail,capture_pc,current_el,sctlr,actlr,tcr));
     f.push(format!("\"id\":{id},\"final_lower_leaf\":{:?},\"final_upper_leaf\":{:?},\"final_code\":{:?},\"bank_after\":{:?}",
-        i4v::words(memory,base+shadow::LOWER_LEAF),i4v::words(memory,base+shadow::UPPER_LEAF),
+        table_words(memory,base+shadow::LOWER_LEAF),table_words(memory,base+shadow::UPPER_LEAF),
         memory.read::<{stack::CODE_BYTES}>(CODE_OFFSET+4096),memory.read::<512>(base+BANK_OFFSET)));
     format!("{{{}}}", f.join(","))
 }

@@ -113,7 +113,7 @@ fn owner_json(
         ("guest_before", &o.guest_before),
         ("guest_after", &o.guest_after),
     ] {
-        out.push(format!("\"{name}\":{}", crate::recovery::guest_json(guest)));
+        out.push(format!("\"{name}\":{}", guest_json(guest)));
     }
     for (name, hidden) in [
         ("hidden_before", &o.hidden_before),
@@ -250,7 +250,7 @@ pub fn run(args: &[String]) -> Result<()> {
         let base = ram + id * RAM_SIZE;
         let output = owner_output(&args[8], id)?;
         Ok(checked(
-            crate::i4v_controls::producer::Compiler::new_coherence(
+            crate::drivers::i4v_controls::producer::Compiler::new_coherence(
                 args[3].clone().into(),
                 args[7].clone().into(),
                 output,

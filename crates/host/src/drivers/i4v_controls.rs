@@ -250,7 +250,7 @@ pub fn run(args: &[String]) -> Result<()> {
         lifecycle: natemu_abi::translation::Lifecycle::new(vm_nonce),
     };
     let code_before = memory.read::<CODE_BYTES>(CODE_OFFSET);
-    let lower_leaf_before = i4v::words(&memory, shadow::LOWER_LEAF);
+    let lower_leaf_before = table_words(&memory, shadow::LOWER_LEAF);
     memory.write_record(recover::GUEST_OFFSET, guest);
     memory.write_record(recover::STATE_OFFSET, recovery_state);
     memory.write_record(validation::STATE_OFFSET, validation_state);
@@ -355,10 +355,10 @@ pub fn run(args: &[String]) -> Result<()> {
     add!("lower_leaf_before", lower_leaf_before);
     add!(
         "lower_leaf_after",
-        i4v::words(&vm.memory, shadow::LOWER_LEAF)
+        table_words(&vm.memory, shadow::LOWER_LEAF)
     );
     add!("bank_before", bank);
-    report.push(format!("\"controls\":{},\"visits\":[{}],\"initial\":{},\"entered\":{},\"final_frame\":{},\"guest_before\":{},\"guest_after\":{},\"recovery\":{}",state_json(&state),visits,frame_json(&frame),frame_json(&result.initial),frame_json(&result.captured),recovery::guest_json(&guest),recovery::guest_json(&guest_after),recovery::report(&vm,&guest,&tables_before)));
+    report.push(format!("\"controls\":{},\"visits\":[{}],\"initial\":{},\"entered\":{},\"final_frame\":{},\"guest_before\":{},\"guest_after\":{},\"recovery\":{}",state_json(&state),visits,frame_json(&frame),frame_json(&result.initial),frame_json(&result.captured),guest_json(&guest),guest_json(&guest_after),recovery::report(&vm,&guest,&tables_before)));
     report.push(format!("\"pae\":{}", pae_json(&pae_state)));
     report.push(format!("\"modes\":{}", modes_json(&mode_state)));
     println!("{{{}}}", report.join(","));

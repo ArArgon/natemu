@@ -479,17 +479,17 @@ pub fn run(args: &[String]) -> Result<()> {
             event_records.push(format!("{{\"id\":{id},\"pending\":{},\"token_state\":{},\"notifications\":{},\"consumed\":{},\"deliveries\":{},\"boundary\":{},\"blocked\":{},\"wait_checks\":{},\"shadow\":{},\"priority\":{},\"vector\":{},\"packet\":{}}}",
                 u64::from(c.event_pending[id].load(Ordering::Acquire)==1),c.event_pending[id].load(Ordering::Acquire),c.event_notifications[id].load(Ordering::Acquire),
                 e.consumed,e.deliveries,e.boundary,e.blocked,e.wait_checks,e.shadow,e.priority,0x40+id,
-                recovery::guest_json(&e.packet)));
+                guest_json(&e.packet)));
         }
         if alias_profile != 0 {
             let a = memory.read_record::<alias::Record>(base + alias::OFFSET);
             alias_records.push(format!("{{\"id\":{id},\"current_el\":{},\"sctlr\":{},\"actlr\":{},\"tcr\":{},\"ttbr1\":{},\"warm\":{:?},\"ack_count\":{},\"acks\":{:?},\"wrong_rip_rejections\":{},\"blank_before_publish\":{},\"source_address\":{},\"source_gpa\":{},\"source_leaf_before\":{},\"source_leaf_after\":{},\"source_before\":{:?},\"source_after\":{:?},\"upper_root\":{:?},\"upper_l1\":{:?},\"upper_l2\":{:?},\"upper_leaf\":{:?},\"lower_leaf\":{:?}}}",
                 s.current_el,s.sctlr,s.actlr,s.tcr,a.ttbr1,a.warm,a.ack_count,a.acks,
                 a.wrong_rip_rejections,a.blank_before_publish,a.source_address,a.source_gpa,a.source_leaf_before,a.source_leaf_after,a.source_before,a.source_after,
-                i4v::words(&memory,base+shadow::UPPER_ROOT),i4v::words(&memory,base+shadow::UPPER_L1),
-                i4v::words(&memory,base+shadow::UPPER_L2),
-                boundary_owner.as_ref().map_or_else(|| i4v::words(&memory,base+shadow::UPPER_LEAF), |o| o.upper_before),
-                boundary_owner.as_ref().map_or_else(|| i4v::words(&memory,base+shadow::LOWER_LEAF), |o| o.lower_before)));
+                table_words(&memory,base+shadow::UPPER_ROOT),table_words(&memory,base+shadow::UPPER_L1),
+                table_words(&memory,base+shadow::UPPER_L2),
+                boundary_owner.as_ref().map_or_else(|| table_words(&memory,base+shadow::UPPER_LEAF), |o| o.upper_before),
+                boundary_owner.as_ref().map_or_else(|| table_words(&memory,base+shadow::LOWER_LEAF), |o| o.lower_before)));
         }
         if stack_profile {
             let state =
@@ -524,8 +524,8 @@ pub fn run(args: &[String]) -> Result<()> {
                 "{{\"initial\":{},\"captured\":{},\"guest_before\":{},\"guest_after\":{},\"pair\":{:?},\"tables_before\":{:?},\"tables_after\":{:?},\"vector\":{},\"error\":{},\"address\":{},\"rip\":{},\"esr\":{},\"far\":{},\"pc\":{},\"spsr\":{},\"done\":{}}}",
                 frame_json(&p.initial),
                 frame_json(&p.captured),
-                recovery::guest_json(&p.guest_before),
-                recovery::guest_json(&p.guest_after),
+                guest_json(&p.guest_before),
+                guest_json(&p.guest_after),
                 p.pair,
                 p.tables_before,
                 p.tables_after,
@@ -541,7 +541,7 @@ pub fn run(args: &[String]) -> Result<()> {
             );
             stack_records.push(format!("{{\"id\":{id},\"step\":{},\"pass\":{},\"code\":{},\"expected\":{:?},\"compile_requests\":{:?},\"replies\":{:?},\"programs\":[{programs}],\"probe\":{probe},\"stale_chunks\":{},\"wrong_owner_rejections\":{},\"blank_before_publish\":{},\"source_before\":{:?},\"source_after\":{:?},\"guest_before\":{},\"guest_after\":{}}}",
                 state.step,state.pass,state.code,state.expected,state.compile_requests,state.replies,state.stale_chunks,state.wrong_owner_rejections,state.blank_before_publish,
-                state.source_before,state.source_after,recovery::guest_json(&before),recovery::guest_json(&after)));
+                state.source_before,state.source_after,guest_json(&before),guest_json(&after)));
         }
         if args[3] != "entry" {
             faults.push(format!("{{\"id\":{id},\"faults\":{},\"old_gpa\":{},\"frame\":{},\"esr\":{},\"far\":{},\"pc\":{},\"spsr\":{}}}",

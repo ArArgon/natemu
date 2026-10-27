@@ -31,7 +31,7 @@ fn owner_json(memory: &Memory, id: usize, bank: &[u8; 512], requests: &[wire::Pa
     ] {
         out.push(format!("\"{name}\":{}", frame_json(frame)));
     }
-    out.push(format!("\"bank_before\":{bank:?},\"bank_after\":{:?},\"published_code\":{:?},\"final_native_leaf\":{:?},\"compiler_requests\":{:?}",memory.read::<512>(base+BANK_OFFSET),memory.read::<{f::CODE_BYTES}>(base+CODE_OFFSET),i4v::words(memory,base+shadow::LOWER_LEAF),requests.iter().filter(|p|p[3]==id as u64).collect::<Vec<_>>()));
+    out.push(format!("\"bank_before\":{bank:?},\"bank_after\":{:?},\"published_code\":{:?},\"final_native_leaf\":{:?},\"compiler_requests\":{:?}",memory.read::<512>(base+BANK_OFFSET),memory.read::<{f::CODE_BYTES}>(base+CODE_OFFSET),table_words(memory,base+shadow::LOWER_LEAF),requests.iter().filter(|p|p[3]==id as u64).collect::<Vec<_>>()));
     let trials = (0..f::TRIALS)
         .map(|i| {
             trial_json(unsafe {

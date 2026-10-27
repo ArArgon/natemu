@@ -25,7 +25,7 @@ fn owner_json(s: &a::Owner) -> String {
         ("guest_before", &s.guest_before),
         ("guest_after", &s.guest_after),
     ] {
-        f.push(format!("\"{name}\":{}", crate::recovery::guest_json(guest)));
+        f.push(format!("\"{name}\":{}", guest_json(guest)));
     }
     for (name, address) in [
         ("saved_store", &s.saved_store),
@@ -138,7 +138,7 @@ fn owner_report(
     let guest: r::GuestState = memory.read_record(base + r::GUEST_OFFSET);
     let mut f = fields!(shared; status,detail,current_el,sctlr,actlr,tcr,capture_pc,service_pc,esr,far,elr,spsr);
     f.push(format!("\"id\":{id},\"vm_nonce\":{},\"compiler_requests\":{:?},\"bank_before\":{:?},\"bank_after\":{:?},\"old_code\":{:?},\"new_code\":{:?}", shared.lifecycle.vm, requests.iter().filter(|p|p[3] == id as u64).collect::<Vec<_>>(),seed.1,memory.read::<512>(base+BANK_OFFSET),memory.read::<{a::CODE_BYTES}>(base+CODE_OFFSET),memory.read::<{a::CODE_BYTES}>(base+CODE_OFFSET+4096)));
-    f.push(format!("\"initial\":{},\"entered\":{},\"final_frame\":{},\"guest_before\":{},\"guest_after\":{},\"owner\":{}",frame_json(&seed.0),frame_json(&shared.initial),frame_json(&shared.captured),crate::recovery::guest_json(&seed.2),crate::recovery::guest_json(&guest),owner_json(owner)));
+    f.push(format!("\"initial\":{},\"entered\":{},\"final_frame\":{},\"guest_before\":{},\"guest_after\":{},\"owner\":{}",frame_json(&seed.0),frame_json(&shared.initial),frame_json(&shared.captured),guest_json(&seed.2),guest_json(&guest),owner_json(owner)));
     let visits = (0..a::MAX_VISITS)
         .map(|i| {
             visit_json(
@@ -151,7 +151,7 @@ fn owner_report(
     let mut e = fields!(event; consumed,deliveries,boundary,blocked,wait_checks,shadow,priority);
     e.push(format!(
         "\"packet\":{}",
-        crate::recovery::guest_json(&event.packet)
+        guest_json(&event.packet)
     ));
     f.push(format!("\"event\":{{{}}}", e.join(",")));
     f.push(format!("\"lower_leaf_before\":{lower_before:?}"));
@@ -162,7 +162,7 @@ fn owner_report(
     ] {
         f.push(format!(
             "\"{name}\":{:?}",
-            i4v::words(memory, base + offset)
+            table_words(memory, base + offset)
         ));
     }
     format!("{{{}}}", f.join(","))
@@ -205,7 +205,7 @@ pub fn run(args: &[String]) -> Result<()> {
             memory.replicate_resident_text(base);
         }
         owner_mappings(&memory, id);
-        lower_before.push(i4v::words(&memory, base + shadow::LOWER_LEAF));
+        lower_before.push(table_words(&memory, base + shadow::LOWER_LEAF));
         let seeded = seed_owner(config, id);
         let (frame, bank, guest) = seeded;
         memory.copy(base + BANK_OFFSET, &bank);
@@ -265,7 +265,7 @@ pub fn run(args: &[String]) -> Result<()> {
         let base = ram + id * RAM_SIZE;
         let output = owner_output(&args[8], id)?;
         Ok(checked(
-            crate::i4v_controls::producer::Compiler::new_address(
+            crate::drivers::i4v_controls::producer::Compiler::new_address(
                 args[3].clone().into(),
                 args[7].clone().into(),
                 output,

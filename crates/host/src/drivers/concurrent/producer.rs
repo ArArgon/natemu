@@ -41,7 +41,7 @@ owner_services!(
     stack_producer::Compiler,
     mixed_producer::Compiler,
     fence_producer::Compiler,
-    crate::i4v_controls::producer::Compiler
+    crate::drivers::i4v_controls::producer::Compiler
 );
 
 /// Creates owner `id`'s producer directory under `output`.

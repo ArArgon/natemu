@@ -81,26 +81,6 @@ pub fn prepare(
     memory.write_record(GUEST_OFFSET, guest);
     Ok(guest)
 }
-pub(super) fn guest_json(g: &GuestState) -> String {
-    format!(
-        "{{\"gpr\":{:?},\"rip\":{},\"rflags\":{},\"ymm\":{:?},\"mxcsr\":{},\"x87\":[{},{},{},{},{},{}],\"x87_regs\":{:?},\"control\":{:?},\"segments\":{:?},\"reserved\":{}}}",
-        g.gpr,
-        g.rip,
-        g.rflags,
-        g.ymm,
-        g.mxcsr,
-        g.x87_control,
-        g.x87_status,
-        g.x87_tag,
-        g.x87_opcode,
-        g.x87_ip,
-        g.x87_dp,
-        g.x87_regs,
-        g.control,
-        g.segments,
-        g.reserved
-    )
-}
 pub fn report(vm: &Vm, before: &GuestState, tables_before: &[u8; 16384]) -> String {
     let r = vm.memory.read_record::<Recovery>(STATE_OFFSET);
     let g = vm.memory.read_record::<GuestState>(GUEST_OFFSET);
