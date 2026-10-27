@@ -60,7 +60,8 @@ names, and none of that instruction's effects is committed. FEX patches that pro
 7. Address guard (ABI §2) before each non-RIP-relative access, flag-free: `eor x0, xA, xA, lsl #16; tbnz x0, #63, stub`
    (xA = base, or x0 after `add x0, base, disp|index`). It catches bit 63 ≠ bit 47, covering the private region; other
    non-canonical values take level-0 translation faults and canonical-end overruns land in the unmapped 1 GiB below
-   `PRIVATE`, both classified at the site. RIP-relative addresses are checked at compile time. Stubs (`brk`) are sites.
+   `PRIVATE`, both classified at the site. RIP-relative addresses are checked at compile time; this relies on admission requiring every guest-RIP
+   relocation to equal the compile RIP's value (a future relocating code cache must re-check). Stubs (`brk`) are sites.
 8. Split check for every guest store wider than 1 byte, including RMW, push/call and pair stores:
    `add x0, a, #w-1; eor x0, x0, a; tbnz x0, #12, split`. The split stub is a service site: the runtime walks both pages
    with write intent, writes both parts through owned RAM or neither (#PF), applies any recorded writeback, and resumes

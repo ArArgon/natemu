@@ -65,6 +65,11 @@ bool FexcIsOtherMemoryOp(std::string_view n) {
 } // namespace
 
 void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32_t Begin) {
+  FexcRecordOp(IROp, Node, Begin);
+  if (fexc_slice1) FexcCheckTarget(Node);
+}
+
+void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32_t Begin) {
   const uint32_t End = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
   const std::string_view Name = IR::GetName(IROp->Op);
   using IR::IROps;
@@ -96,6 +101,7 @@ void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32
   S.nzcv = fexc_slice1 && FexcNzcvSaved;
   S.completed_effects = fexc_slice1 && !FexcStoreSeen && (!FexcNzcvWritten || FexcNzcvSaved) ? 0 : 1;
   S.ir_op = IR::GetName(IROp->Op).data();
+  S.access_native_offset = FEXC_NONE32;
 
   // Index/offset form of LoadMem/StoreMem(TSO): none, constant, or register with extend and shift.
   auto Form = [&](IR::OrderedNodeWrapper Offset, IR::MemOffsetType Type, uint8_t Scale) {
@@ -200,11 +206,16 @@ void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32
     const uint32_t rn = (w >> 5) & 31;
     if (!FexcIsMemWord(w) || rn == 28 || rn == 31) continue;
     S.native_offset = off - 4; S.base_reg = uint8_t(rn); S.located = 1;
+    // The transfer register(s) actually encoded (e.g. a push of the base register stores a TMP copy in the default profile).
+    S.data_reg[0] = uint8_t(w & 31);
+    if (((w >> 27) & 7) == 5) S.data_reg[1] = uint8_t((w >> 10) & 31);
     const FexcAddr A = FexcDecodeAddr(w);
     if (A.imm_form) { S.imm = A.imm; S.index_reg = 0xff; S.extend = 0; S.shift = 0; S.writeback = A.wb; S.writeback_delta = A.delta; }
     break;
   }
   if (S.kind == FEXC_SITE_OTHER) { S.native_offset = Begin; S.completed_effects = 1; }
+  for (auto i : FexcPendingLink) fexc_sites[i].access_native_offset = S.native_offset;   // this op's guard/split stubs
+  FexcPendingLink.clear();
 
   // A memory-destination read-modify-write loads then stores the one explicit memory operand, so the load of
   // an instruction that also has a plain store site is the RMW load and must be walked with write intent
@@ -219,4 +230,163 @@ void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32
   if (S.kind == FEXC_SITE_STORE || S.kind == FEXC_SITE_STORE_PAIR || S.kind == FEXC_SITE_PUSH || S.kind == FEXC_SITE_PUSH_PAIR ||
       S.kind == FEXC_SITE_OTHER) FexcStoreSeen = true;
   fexc_sites.push_back(S);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Profile slice1: address guard (contract §1 patch 7), split-store check (patch 8) and branch-target check.
+//
+// Each check branches with tbnz to an out-of-line `brk` stub emitted after the block body (FexcEmitStubs). The stub's
+// PC is a guard or split site: the runtime finds it by ELR like any site. The checks use only TMP1/TMP2 (x0/x1, never
+// allocated by the RA and dead between IR ops), do not write NZCV, and sit right before the access op (or right after
+// the branch target is defined), so at a stub the guest state is exactly that of the access site: the state before the
+// guest instruction, with no effect of it committed. No helper call, no new IR op.
+//   guard   eor x0, A, A, lsl #16; tbnz x0, #63, stub       A[63] != A[47]: the private half, the TTBR1 gap and the
+//           (A = base, or x1 = base + index|imm first)       non-canonical lower addresses; the rest is in neither
+//                                                            TTBR range (level-0 translation fault at the site)
+//   split   add x0, A, #w-1; eor x0, x0, A; tbnz x0, #12, stub   store wider than 1 byte crossing a 4 KiB page
+//   target  eor x0, T, T, lsl #16; tbnz x0, #63, stub       indirect jmp/call/ret: T = the exit's computed RIP
+// A RIP-relative address (base = EntrypointOffset, no index) is a compile-time constant: a non-canonical one or a
+// page-crossing store gets an unconditional `b` to its stub instead. Direct branches to non-canonical targets are
+// cut at decode (FexcSlice1::Cut).
+// ---------------------------------------------------------------------------------------------
+namespace {
+constexpr bool FexcCanonical(uint64_t A) { return uint64_t(int64_t(A << 16) >> 16) == A; }
+constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2;   // brk immediates (diagnostic; the runtime keys on the PC)
+} // namespace
+
+// A new guard/split site for the current guest instruction, recorded like an access site at this point (width, intent,
+// segment and data registers are copied from the linked access by fexc; the caller sets the address). Returns its label.
+ARMEmitter::ForwardLabel* Arm64JITCore::FexcStub(uint8_t Kind, bool Link) {
+  FexcSiteInfo S {};
+  S.kind = Kind;
+  S.guest_offset = FexcGuest;
+  S.guest_offset2 = FEXC_NONE32;
+  S.insn_native_offset = FexcInsnNative;
+  S.base_reg = S.index_reg = 0xff;
+  S.cf_inverted = FexcCf;
+  S.flags_written_before = FexcNzcvWritten;
+  S.nzcv = FexcNzcvSaved;
+  S.completed_effects = !FexcStoreSeen && (!FexcNzcvWritten || FexcNzcvSaved) ? 0 : 1;
+  S.located = 1;
+  S.access_native_offset = FEXC_NONE32;
+  S.ir_op = Kind == FEXC_SITE_SPLIT ? "split" : "guard";
+  const size_t Index = fexc_sites.size();
+  fexc_sites.push_back(S);
+  if (Link) FexcPendingLink.push_back(Index);
+  return &FexcStubs[Index];
+}
+
+// After the node FexcPrecision::Prescan chose (the target's definition, or the instruction's GuestOpcode), check the indirect exit's
+// target: in its register (a static register for jmp/call reg), or at compile time for a materialised constant.
+void Arm64JITCore::FexcCheckTarget(IR::Ref Node) {
+  const auto it = fexc_target_check.find(IR->GetID(Node).Value);
+  if (it == fexc_target_check.end()) return;
+  ++FexcTargetsDone;
+  const auto Def = IR->GetNode(IR::OrderedNodeWrapper::WrapOffset(it->second.def * sizeof(IR::OrderedNode)));
+  const auto DefOp = IR->GetOp<IR::IROp_Header>(Def);
+  if (it->second.sra < 0 && DefOp->Op == IR::IROps::OP_CONSTANT) {
+    if (!FexcCanonical(DefOp->C<IR::IROp_Constant>()->Constant)) b_OrRestart(FexcStub(FEXC_SITE_GUARD, false));
+    return;
+  }
+  const auto T = it->second.sra >= 0 ? ARMEmitter::Register(StaticRegisters[it->second.sra]) : GetReg(Def);
+  auto* L = FexcStub(FEXC_SITE_GUARD, false);
+  fexc_sites.back().base_reg = uint8_t(T.Idx());
+  eor(ARMEmitter::Size::i64Bit, TMP1, T.X(), T.X(), ARMEmitter::ShiftType::LSL, 16);
+  tbnz_OrRestart(TMP1, 63, L);
+}
+
+void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
+  using IR::IROps;
+  const IR::OrderedNodeWrapper* Addr = nullptr;
+  const IR::OrderedNodeWrapper* Offset = nullptr;
+  IR::MemOffsetType Type = IR::MemOffsetType::SXTX;
+  uint8_t Scale = 1;
+  int64_t Imm = 0;
+  uint32_t W = IR::OpSizeToSize(IROp->Size);
+  bool Store = false;
+  switch (IROp->Op) {
+#define FEXC_MEM(OP, T, ST) \
+  case IROps::OP: { const auto Op = IROp->C<IR::T>(); Addr = &Op->Addr; Offset = &Op->Offset; Type = Op->OffsetType; \
+                    Scale = Op->OffsetScale; Store = ST; break; }
+  FEXC_MEM(OP_LOADMEM, IROp_LoadMem, false)
+  FEXC_MEM(OP_LOADMEMTSO, IROp_LoadMemTSO, false)
+  FEXC_MEM(OP_STOREMEM, IROp_StoreMem, true)
+  FEXC_MEM(OP_STOREMEMTSO, IROp_StoreMemTSO, true)
+#undef FEXC_MEM
+  case IROps::OP_LOADMEMPAIR: { const auto Op = IROp->C<IR::IROp_LoadMemPair>(); Addr = &Op->Addr; Imm = Op->Offset; W *= 2; break; }
+  case IROps::OP_STOREMEMPAIR: {
+    const auto Op = IROp->C<IR::IROp_StoreMemPair>(); Addr = &Op->Addr; Imm = Op->Offset; W *= 2; Store = true; break;
+  }
+  case IROps::OP_PUSH: {
+    const auto Op = IROp->C<IR::IROp_Push>(); Addr = &Op->Addr; W = IR::OpSizeToSize(Op->ValueSize); Imm = -int64_t(W); Store = true;
+    break;
+  }
+  case IROps::OP_POP: { const auto Op = IROp->C<IR::IROp_Pop>(); Addr = &Op->InoutAddr; W = IR::OpSizeToSize(Op->Size); break; }
+  default: return;
+  }
+  bool Index = false;
+  uint64_t C;
+  if (Offset && !Offset->IsInvalid()) {
+    if (IsInlineConstant(*Offset, &C)) Imm += int64_t(C);
+    else Index = true;
+  }
+  // Every store wider than one byte gets the split check, read-modify-write stores included: with both pages already
+  // shadowed readable the load does not fault, only the store faults on the second page, and Arm may commit the first
+  // part (DDI0487 B2.8.2.1). The store of a read-modify-write (same rule as the recorder) whose address is the very
+  // value its load guarded skips only the guard.
+  const bool Rmw = (IROp->Op == IROps::OP_STOREMEM || IROp->Op == IROps::OP_STOREMEMTSO) && FexcLoadSite >= 0 &&
+                   fexc_sites[FexcLoadSite].width == W;
+  const bool Split = Store && W > 1;
+
+  const auto Base = GetReg(*Addr).X();
+  // A stub site records the address as it is at the stub: register + imm (the checked register, or the RIP-relative base).
+  auto Stub = [&](uint8_t Kind, ARMEmitter::Register R, int64_t Off) {
+    auto* L = FexcStub(Kind, true);
+    fexc_sites.back().base_reg = uint8_t(R.Idx());
+    fexc_sites.back().imm = int32_t(Off);
+    return L;
+  };
+  const auto Rip = fexc_rip_relative.find(IR->GetID(Node).Value);
+  if (Rip != fexc_rip_relative.end() && !Index) {   // RIP-relative: a compile-time address
+    const uint64_t A = Entry + Rip->second + Imm;
+    if (!FexcCanonical(A)) b_OrRestart(Stub(FEXC_SITE_GUARD, Base, Imm));
+    else if (Split && ((A ^ (A + W - 1)) & 0x1000)) b_OrRestart(Stub(FEXC_SITE_SPLIT, Base, Imm));
+    return;
+  }
+  const bool Shared = Rmw && fexc_rmw_same_address.count(IR->GetID(Node).Value);
+  if (Shared && !Split) return;
+  ARMEmitter::Register A = Base;
+  if (Index) {
+    const auto Ext = Type == IR::MemOffsetType::UXTW ? ARMEmitter::ExtendedType::UXTW :
+                     Type == IR::MemOffsetType::SXTW ? ARMEmitter::ExtendedType::SXTW : ARMEmitter::ExtendedType::SXTX;
+    add(ARMEmitter::Size::i64Bit, TMP2, Base, GetReg(*Offset).X(), Ext, FEXCore::ilog2(Scale));
+    A = TMP2;
+  } else if (Imm) {
+    if (Imm > 0 && Imm < 4096) add(ARMEmitter::Size::i64Bit, TMP2, Base, uint32_t(Imm));
+    else if (Imm < 0 && Imm > -4096) sub(ARMEmitter::Size::i64Bit, TMP2, Base, uint32_t(-Imm));
+    else { LoadConstant(ARMEmitter::Size::i64Bit, TMP2, uint64_t(Imm)); add(ARMEmitter::Size::i64Bit, TMP2, Base, TMP2); }
+    A = TMP2;
+  }
+  if (!Shared) {
+    eor(ARMEmitter::Size::i64Bit, TMP1, A, A, ARMEmitter::ShiftType::LSL, 16);
+    tbnz_OrRestart(TMP1, 63, Stub(FEXC_SITE_GUARD, A, 0));
+  }
+  if (Split) {
+    add(ARMEmitter::Size::i64Bit, TMP1, A, W - 1);
+    eor(ARMEmitter::Size::i64Bit, TMP1, TMP1, A);
+    tbnz_OrRestart(TMP1, 12, Stub(FEXC_SITE_SPLIT, A, 0));
+  }
+}
+
+// The stubs, after the block body (reached only by their checks; the body before them ends in an exit `br`).
+void Arm64JITCore::FexcEmitStubs() {
+  if (FexcTargetsDone != fexc_target_check.size()) {
+    ERROR_AND_DIE_FMT("fexc slice1: {} of {} indirect branch targets were not checked", fexc_target_check.size() - FexcTargetsDone,
+                      fexc_target_check.size());
+  }
+  for (auto& [Index, Label] : FexcStubs) {
+    BindOrRestart(&Label);
+    fexc_sites[Index].native_offset = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
+    brk(fexc_sites[Index].kind == FEXC_SITE_SPLIT ? FexcBrkSplit : FexcBrkGuard);
+  }
 }

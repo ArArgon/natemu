@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string_view>
 #include <vector>
 
@@ -34,7 +35,7 @@ inline bool fexc_dense_pc_table = false;
 enum FexcSiteKind : uint8_t {
   FEXC_SITE_LOAD = 0, FEXC_SITE_STORE = 1, FEXC_SITE_LOAD_PAIR = 2, FEXC_SITE_STORE_PAIR = 3,
   FEXC_SITE_PUSH = 4, FEXC_SITE_POP = 5,
-  FEXC_SITE_GUARD = 6, FEXC_SITE_SPLIT = 7, // reserved for the precision patches (S1b); never produced here
+  FEXC_SITE_GUARD = 6, FEXC_SITE_SPLIT = 7, // slice1 stubs (address guard / branch-target check, split-store check)
   FEXC_SITE_PUSH_PAIR = 8, FEXC_SITE_POP_PAIR = 9, // FEX fused two guest push/pop into one stp/ldp
   FEXC_SITE_OTHER = 10,                     // guest-memory IR op the site record cannot describe
 };
@@ -64,6 +65,9 @@ struct FexcSiteInfo {
   uint8_t ordering;              // 0 plain, 1 acquire (ldar/ldapr family), 2 release (stlr family)
   uint8_t located;               // 1 if the faulting word was found in the op's emitted range
   uint8_t completed_effects;     // 0 none (slice1: state at the site = state before the instruction), 1 unverified
+  uint32_t access_native_offset; // guard/split: native offset of the access site the stub covers (FEXC_NONE32 for a
+                                 // branch-target guard, whose base_reg is the target register); FEXC_NONE32 otherwise.
+                                 // The binary record carries it in guest_offset2 (pairs never occur with stubs)
   const char* ir_op;             // IR op name (diagnostic, not exported to the binary record)
 };
 struct FexcInsnInfo { uint32_t guest_offset; uint32_t native_offset; bool cf_inverted; };
@@ -94,3 +98,9 @@ struct FexcCut {
   uint8_t status = 0;
 };
 inline FexcCut fexc_cut {};
+// Profile slice1, filled by FexcPrecision::Prescan before register allocation (post-RA the JIT sees physical registers,
+// not the SSA nodes behind them); keys are IR node IDs, which RA does not change.
+inline std::map<uint32_t, int64_t> fexc_rip_relative;   // guest-memory op -> its base EntrypointOffset (offset from the block RIP)
+inline std::set<uint32_t> fexc_rmw_same_address;        // store whose address is its instruction's load's (same SSA values)
+struct FexcTarget { uint32_t def; int sra; };            // the target's node, or (sra >= 0) the static register it reads
+inline std::map<uint32_t, FexcTarget> fexc_target_check; // node after which to check an indirect exit's target

@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: natemu <natemu@example.invalid>
+Date: Tue, 27 Oct 2026 00:00:00 +0000
+Subject: [PATCH 7/7] FEXCore: slice1 address guard, split-store check and
+ branch-target check
+
+Every change is guarded by fexc_slice1; the code is in
+tools/fexc/shim/fexc_sites.inc and fexc_precision.h.
+
+JIT: Arm64JITCore::FexcBeforeOp emits, before each guest memory op, the
+flag-free address guard (eor x0, A, A, lsl #16; tbnz x0, #63) and, for a
+store wider than one byte, the 4 KiB split check (add x0, A, #w-1;
+eor x0, x0, A; tbnz x0, #12). FexcAfterOp also checks the target of an
+indirect exit after its definition (or at the instruction start for a
+static-register target). The branches go to out-of-line brk stubs that
+FexcEmitStubs places after the block body; each stub is a guard or split
+site. A far-branch restart discards the attempt's GuestOpcodes and
+Subblocks.
+
+Push stores from its unchanged base (stur, then sub for the new stack
+pointer) whenever the new pointer is another register or the value is
+the base, so nothing is written between the checks and the store.
+
+Register allocation: FexcPrecision::Prescan records, while operands are
+still SSA nodes, the RIP-relative accesses (checked at compile time), the
+read-modify-write stores that reuse their load's address and the
+indirect exit targets.
+
+Dispatcher: ret loads its return address without writeback, so the
+target check runs before RSP is committed.
+---
+ FEXCore/Source/Interface/Core/JIT/JIT.cpp        |  4 ++++
+ FEXCore/Source/Interface/Core/JIT/JITClass.h     | 11 +++++++++++
+ FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp  | 10 ++++++++--
+ .../Source/Interface/Core/OpcodeDispatcher.cpp   | 16 ++++++++++++++++
+ .../IR/Passes/RegisterAllocationPass.cpp         |  3 +++
+ 5 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index 6d9c25c..6fdf72d 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -910,6 +910,8 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+   fexc_insns.clear();
+   DebugData->FexcEntryPrologues.clear();
+   FexcGuest = FexcInsnNative = 0; FexcCf = true; FexcNzcvWritten = FexcNzcvSaved = FexcStoreSeen = false; FexcLoadSite = -1; FexcPendingFused.clear();
++  FexcStubs.clear(); FexcPendingLink.clear(); FexcTargetsDone = 0;
++  DebugData->GuestOpcodes.clear(); DebugData->Subblocks.clear();   // natemu: per attempt (a far-branch restart re-emits them)
+   JumpTargets.clear();
+   CallReturnTargets.clear();
+   PendingJumpThunks.clear();
+@@ -1021,6 +1023,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+     }
+ 
+     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
++      if (fexc_slice1) FexcBeforeOp(IROp, CodeNode);
+       const uint32_t FexcBegin = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
+       switch (IROp->Op) {
+ #define REGISTER_OP(op, x) \
+@@ -1047,6 +1050,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+     b_OrRestart(PendingTargetLabel);
+   }
+   PendingTargetLabel = nullptr;
++  if (fexc_slice1) FexcEmitStubs();
+ 
+   ARMEmitter::ForwardLabel l_ExitLink;
+   for (auto& PendingJumpThunk : PendingJumpThunks) {
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index 354d6b1..4c2ed3b 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -538,6 +538,17 @@ private:
+ 
+   // natemu (fexc): access-site recording, defined in shim/fexc_sites.inc (included from MemoryOps.cpp).
+   void FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32_t Begin);
++  void FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32_t Begin);
++  // natemu (fexc), profile slice1: address guard, split-store check and branch-target check, with out-of-line brk stubs
++  // whose PCs are guard/split sites (same file).
++  void FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node);
++  void FexcCheckTarget(IR::Ref Node);
++  void FexcEmitStubs();
++  ARMEmitter::ForwardLabel* FexcStub(uint8_t Kind, bool Link);
++  // (targets and RIP-relative accesses come from FexcPrecision::Prescan, run before register allocation)
++  fextl::map<size_t, ARMEmitter::ForwardLabel> FexcStubs;   // guard/split site index -> its stub
++  fextl::vector<size_t> FexcPendingLink;                    // guard/split sites waiting for their access's native offset
++  uint32_t FexcTargetsDone {};                              // branch-target checks emitted (all of Prescan's, or the compile dies)
+   uint32_t FexcGuest {}, FexcInsnNative {};
+   bool FexcCf {true}, FexcNzcvWritten {}, FexcNzcvSaved {}, FexcStoreSeen {};
+   int FexcLoadSite {-1};
+diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+index c77c137..9681f4b 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+@@ -1478,7 +1478,9 @@ DEF_OP(Push) {
+ 
+   bool NeedsMoveAfterwards = false;
+   if (Dst != AddrSrc) {
+-    if (Dst == Src) {
++    if (Dst == Src || fexc_slice1) {
++      // natemu slice1: also here, store from the unchanged base and set Dst afterwards, so nothing is written between
++      // the address/split checks and the store (a split stub completes the store with the base it was checked on).
+       NeedsMoveAfterwards = true;
+       // Need to be careful here, incoming source might be reused afterwards.
+     } else {
+@@ -1487,7 +1489,11 @@ DEF_OP(Push) {
+     }
+   }
+ 
+-  if (Src == AddrSrc) {
++  if (Src == AddrSrc && fexc_slice1) {
++    // natemu slice1: `stur Src, [Src, #-n]` then `sub` has no writeback, so the value can be stored from its own register
++    // (the access records the register it actually stores) instead of a TMP1 copy.
++    NeedsMoveAfterwards = true;
++  } else if (Src == AddrSrc) {
+     // If the data source is the address source then we need to do some additional work.
+     // This is because it is undefined behaviour to do a writeback on store operation where dest == src.
+     // In the case of writeback where the source is the address there are multiple behaviours.
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 5ee6189..8e74e82 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -7,6 +7,7 @@ $end_info$
+ */
+ 
+ #include "FEXCore/Core/HostFeatures.h"
++#include <fexc_hook.h>
+ #include "FEXCore/Utils/Telemetry.h"
+ #include "Interface/Context/Context.h"
+ #include "Interface/Core/OpcodeDispatcher.h"
+@@ -109,6 +110,21 @@ void OpDispatchBuilder::NOPOp(OpcodeArgs) {}
+ void OpDispatchBuilder::RETOp(OpcodeArgs) {
+   const auto GPRSize = GetGPROpSize();
+ 
++  if (fexc_slice1) {
++    // natemu slice1: load the return address without writeback, so the JIT's branch-target check (a non-canonical
++    // target raises #GP(0) at the ret) runs before RSP is committed; then commit RSP and exit.
++    Ref SP = LoadGPRRegister(X86State::REG_RSP);
++    Ref NewRIP = _LoadMem(RegClass::GPR, GPRSize, SP, Invalid(), OpSize::i8Bit, MemOffsetType::SXTX, 1);
++    SP = Add(GPRSize, SP, IR::OpSizeToSize(GPRSize));
++    if (Op->OP == 0xC2) {
++      SP = Add(GPRSize, SP, LoadSourceGPR(Op, Op->Src[0], Op->Flags));
++    }
++    StoreGPRRegister(X86State::REG_RSP, SP);
++    ExitFunction(NewRIP, BranchHint::Return);
++    BlockSetRIP = true;
++    return;
++  }
++
+   Ref SP = _RMWHandle(LoadGPRRegister(X86State::REG_RSP));
+   Ref NewRIP = Pop(GPRSize, SP);
+ 
+diff --git a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+index 561c1a9..525cc62 100644
+--- a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+@@ -579,6 +579,9 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+   IREmit = IREmit_;
+   auto IR_ = IREmit->ViewIR();
+   IR = &IR_;
++  if (fexc_slice1) {
++    FexcPrecision::Prescan(IR_);
++  }
+ 
+   PreferredReg.resize(IR->GetSSACount(), PhysicalRegister::Invalid());
+   SSAToReg.resize(IR->GetSSACount(), PhysicalRegister::Invalid());

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1a check: fexc's access sites against the fixture programs and against the emitted code.
 
-usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series2 build)
+usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series4 build)
 
 --slice1 compiles with `--profile slice1` (S1c): hardware TSO (plain ldr/str), exits through the dispatcher gate, block
 cutting. A program then ends at its first div/idiv or memory xchg with end reason `unsupported_form` at that
@@ -45,7 +45,7 @@ def fixture_programs():
     if not path.exists():
         subprocess.run([sys.executable, '-B', str(REPO / 'tools/reference/build_slice1.py'), '--programs-only'], check=True)
     return json.loads(path.read_text())['programs']
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series2/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series4/obj/fexc')
 KNOWN_OK = False
 PROFILE = []   # extra fexc arguments for every compile: ['--profile', 'slice1'] under --slice1
 
@@ -55,6 +55,7 @@ RMW_DST = {'add', 'adc', 'sub', 'sbb', 'and', 'or', 'xor', 'inc', 'dec', 'neg', 
 LOAD_DST = {'cmp', 'test', 'bt'}
 LOAD_ONLY_1OP = {'mul', 'imul', 'div', 'idiv'}
 WORD_REGS = {'ax', 'cx', 'dx', 'bx', 'sp', 'bp', 'si', 'di'} | {f'r{i}w' for i in range(8, 16)}
+STUBS = ('guard', 'split')   # slice1 check stubs (brk words after the body), not accesses: verify_precision.py checks them
 
 
 def expected(asm):
@@ -91,6 +92,8 @@ def site_classes(sites):
     out = {}
     for s in sites:
         k, w = s['kind'], s['width']
+        if k in STUBS:
+            continue
         if k in ('push_pair', 'pop_pair'):
             for g in (s['guest_offset'], s['guest_offset2']):
                 out.setdefault(g, []).append((k[:-5], w // 2))
@@ -146,7 +149,7 @@ def run(hexs, rip, tmp, *extra):
 def read_object(path):
     f = Path(path).read_bytes()
     h = struct.unpack_from('<8sIIIIQ14I20sBBBBQBB2sI', f, 0)
-    assert h[0] == b'NFXOBJ\0\x01' and h[1] in (2, 3) and h[2] == 128   # 2: builds before the pre-NZCV header field and h[3] == len(f)
+    assert h[0] == b'NFXOBJ\0\x01' and h[1] in (2, 3) and h[2] == 128 and h[3] == len(f)   # 2: builds before the pre-NZCV header field
     (_, _, _, _, bitness, rip, gbytes, ginsns, coff, csize, body, marker, region_end, spill, soff, scount, poff, pcount, roff, rcount,
      sra, nsra, profile, end_reason, settings, fbits, fcount, dcache, _, pre_nzcv) = h
     sites = [struct.unpack_from('<IIIIi20B', f, soff + 40 * i) for i in range(scount)]
@@ -190,10 +193,10 @@ def asm0_cut(p):
 
 def code_vs_sites(sites, dis):
     """Messages for every disagreement between the sites and the disassembly `dis` ({offset: text}): a native load/store with a
-    base other than x28/sp that is no site, a site not on a load/store, and a site whose width, base, operand form or writeback
-    differs from the instruction. Independent of the guest program (needs no `asm`)."""
+    base other than x28/sp that is no site, a site not on a load/store, and a site whose width, base, operand form, writeback or
+    transfer registers differ from the instruction. Independent of the guest program (needs no `asm`)."""
     out = []
-    by_off = {s['native_offset']: s for s in sites}
+    by_off = {s['native_offset']: s for s in sites if s['kind'] not in STUBS}
     native = {}
     for off, text in dis.items():
         a = native_access(text)
@@ -213,6 +216,9 @@ def code_vs_sites(sites, dis):
                 out.append(f'site +{off} operand form (index {s["index_reg"]} imm {s["imm"]} wb {s["writeback"]}) vs "{dis[off]}"')
             elif a[5] == 'pre' and not (a[4] == s['imm'] == s['writeback_delta']) or a[5] == 'post' and not (a[4] == s['writeback_delta'] and s['imm'] == 0):
                 out.append(f'site +{off} writeback (imm {s["imm"]} delta {s["writeback_delta"]}) vs "{dis[off]}"')
+            regs = [31 if r.endswith('zr') else int(r[1:]) for r in re.findall(r'\b([wxbhsdq](?:\d+|zr))\b', dis[off].split(' ', 1)[1].split('[')[0])]
+            if regs != s['data_regs']:
+                out.append(f'site +{off} data registers {s["data_regs"]} vs "{dis[off]}"')
     return out
 
 
@@ -264,6 +270,8 @@ def check_program(p, tmp):
     for s in sites:
         a = asm_at.get(s['guest_offset'], '?')
         mn = a.split()[0]
+        if s['kind'] in STUBS:
+            continue
         if s['kind'] == 'load' and s['rmw'] == 'load' and s['intent'] != 'write':
             problems.append(('ERROR', f'rmw load without write intent at {s["native_offset"]}'))
         is_rmw = mn in RMW_DST and '[' in a.partition(',')[0]
@@ -300,6 +308,9 @@ def check_program(p, tmp):
             problems.append(('ERROR', f'object site {rec[:4]} disagrees with JSON {s["native_offset"]}'))
         if rec[24] != int(s['located']) or rec[4] != s['imm']:
             problems.append(('ERROR', f'object site at {s["native_offset"]}: located/imm disagree with JSON'))
+        link = s.get('access_native_offset') if s['kind'] in STUBS else s['guest_offset2']   # a stub's guest_offset2 is its access
+        if rec[2] != (0xFFFFFFFF if link is None else link):
+            problems.append(('ERROR', f'object site at {s["native_offset"]}: guest_offset2/access_native_offset disagree with JSON'))
     problems += [('ERROR', m) for m in object_vs_json(o, d)]
     return problems, len(sites)
 

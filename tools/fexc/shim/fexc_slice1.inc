@@ -152,8 +152,17 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
     fexc_cut = {FEXC_CUT_DECODER, rip, d.FexcMap, d.OPRaw, d.ModRM, false, "?", "", uint8_t(status)};
     return true;
   }
-  const Verdict v = Classify(d, !failed && d.TableInfo != nullptr);
-  if (v.kind == ALLOW) return false;
+  Verdict v = Classify(d, !failed && d.TableInfo != nullptr);
+  if (v.kind == ALLOW) {
+    // A direct branch to a non-canonical target raises #GP(0) at the branch (Intel), before a call pushes. Its target is
+    // known here, so it is cut instead of compiled; slice 1 does not deliver that #GP.
+    const uint8_t op = d.OPRaw;
+    const bool rel = (d.FexcMap == FEXC_MAP_PRIMARY && ((op >= 0x70 && op <= 0x7F) || op == 0xE8 || op == 0xE9 || op == 0xEB)) ||
+                     (d.FexcMap == FEXC_MAP_TWO && op >= 0x80 && op <= 0x8F);
+    const uint64_t target = rip + d.InstSize + d.Src[0].Literal();
+    if (!rel || uint64_t(int64_t(target << 16) >> 16) == target) return false;
+    v = Uns("direct branch to a non-canonical target");
+  }
   fexc_cut = {v.kind == SYSTEM ? FEXC_CUT_SYSTEM : FEXC_CUT_UNSUPPORTED, rip, d.FexcMap, d.OPRaw, d.ModRM,
               bool(d.Flags & DecodeFlags::FLAG_DECODED_MODRM), d.TableInfo && d.TableInfo->Name ? d.TableInfo->Name : "?", v.why};
   return true;

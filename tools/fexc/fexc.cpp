@@ -190,11 +190,24 @@ int CfInverted(uint64_t guest, uint64_t native) {
 
 // Join each site with FEX's own decode of its guest instruction: segment (stack ops and RSP/RBP-based operands use SS,
 // which decides #SS(0) vs #GP(0) for a non-canonical address) and the x86 addressing form.
+// A load of a RIP-setting instruction without an explicit memory operand is the implicit stack access of slice1's ret.
+// Guard/split stubs (slice1) take the width, intent, segment and data registers of the access they cover (their own
+// base_reg + imm is the address as it is at the stub); a branch-target guard (no access) has its target register in
+// base_reg and is DS (#GP(0)).
 void JoinSites(uint64_t rip) {
   for (auto& s : Cap.sites) {
     s.segment = (s.kind == FEXC_SITE_PUSH || s.kind == FEXC_SITE_POP || s.kind == FEXC_SITE_PUSH_PAIR || s.kind == FEXC_SITE_POP_PAIR) ? 1 : 0;
     if (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE)
-      for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) { if (i.mem.present && (i.mem.base == 4 || i.mem.base == 5)) s.segment = 1; break; }
+      for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) { if ((!i.mem.present && i.sets_rip) || i.mem.base == 4 || i.mem.base == 5) s.segment = 1; break; }
+  }
+  for (auto& s : Cap.sites) {
+    if ((s.kind != FEXC_SITE_GUARD && s.kind != FEXC_SITE_SPLIT) || s.access_native_offset == FEXC_NONE32) continue;
+    for (auto& a : Cap.sites) {
+      if (a.native_offset != s.access_native_offset || a.kind == FEXC_SITE_GUARD || a.kind == FEXC_SITE_SPLIT) continue;
+      s.width = a.width; s.intent = a.intent; s.rmw = a.rmw; s.segment = a.segment; s.data_reg[0] = a.data_reg[0];
+      s.data_reg[1] = a.data_reg[1]; s.data_class = a.data_class; s.ordering = a.ordering;
+      break;
+    }
   }
 }
 const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other"};
@@ -631,6 +644,9 @@ int main(int argc, char** argv) {
      .kv("ordering", OrderingName[s.ordering]).kv("nzcv", s.nzcv ? "frame" : "pstate").kv("cf_inverted", bool(s.cf_inverted))
      .kv("flags_written_before_site", bool(s.flags_written_before))
      .kv("completed_effects", s.completed_effects ? "unverified" : "none").kv("located", bool(s.located));
+    if (slice1) {
+      if (s.access_native_offset != FEXC_NONE32) j.kv("access_native_offset", s.access_native_offset); else j.null("access_native_offset");
+    }
     const Capture::X86Mem* m = nullptr;
     for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) { if (i.mem.present) m = &i.mem; break; }
     if (m && (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE)) {
@@ -644,7 +660,7 @@ int main(int argc, char** argv) {
   j.kv("per_access", "present: sites[] (native offset, guest instruction, kind, width, intent, address registers and offset form, segment, writeback, data registers)");
   if (slice1) {
     j.kv("flag_location_at_site", "nzcv=pstate (PSTATE) or nzcv=frame (32 bits at state_abi.state_offsets.natemu_pre_nzcv, saved at the instruction start), with cf_inverted at the guest instruction start");
-    j.kv("guest_state_at_fault", "present (precision patches 2-5): at each site with completed_effects=none, static registers, PF/AF and NZCV (per nzcv) hold the state before the site's guest instruction; checked on the code by verify_precision.py. Address guard and split-store check are absent (S1b2)");
+    j.kv("guest_state_at_fault", "present (precision patches 2-5): at each site with completed_effects=none, static registers, PF/AF and NZCV (per nzcv) hold the state before the site's guest instruction; checked on the code by verify_precision.py. Guard sites (brk stubs): the address guard before every non-RIP-relative access (#GP(0), #SS(0) for segment=ss) and the check of every indirect branch target (base_reg = target register, #GP(0)); split sites: a store wider than 1 byte (read-modify-write included) crossing a 4 KiB page (the runtime completes it all-or-nothing and resumes after access_native_offset). Same state at a stub as at its access; checked by verify_precision.py");
     j.kv("committed_effects", "completed_effects=none per site (unverified if the recorder saw an earlier store site or an unsaved NZCV write in the instruction)");
   } else {
     j.kv("flag_location_at_site", "nzcv=pstate with cf_inverted at the guest instruction start, plus flags_written_before_site; the frame copy (nzcv=frame) is absent until the precision patches");
@@ -654,7 +670,8 @@ int main(int argc, char** argv) {
   j.kv("pc_table", st.dense_pc ? "present_dense" : "present_sparse");
   j.kv("static_register_map", "present").kv("flag_representation", "NZCV in PSTATE with carry inverted per cf_inverted; PF/AF in x26/x27 (see state_abi)");
   j.kv("spill_bytes", "present: code.layout.spill_bytes");
-  j.kv("note", "Sites are recorded from the final IR after register allocation, so each is exact for the emitted code. What is still absent is the guarantee that guest state at a site equals the state before its guest instruction (slice-1 chunk S1b), the address guard and split-store check, and block cutting/exits (S1c).");
+  j.kv("note", slice1 ? "Sites are recorded from the final IR after register allocation, so each is exact for the emitted code. Profile slice1 adds the precision patches, block cutting, single-gate exits, guard and split stubs."
+                       : "Sites are recorded from the final IR after register allocation, so each is exact for the emitted code. What is still absent is the guarantee that guest state at a site equals the state before its guest instruction (slice-1 chunk S1b), the address guard and split-store check, and block cutting/exits (S1c).");
   j.end_obj();
   j.arr("diagnostics");
   for (auto& d : Diagnostics) { j.sep(); j.s += '"' + Json::esc(d) + '"'; }
@@ -681,7 +698,8 @@ int main(int argc, char** argv) {
     pad(8);
     put(64, f.size(), 4); put(68, Cap.sites.size(), 4);
     for (auto& s : Cap.sites) {
-      push(s.native_offset, 4); push(s.guest_offset, 4); push(s.guest_offset2, 4); push(s.insn_native_offset, 4); push(uint32_t(s.imm), 4);
+      const bool stub = s.kind == FEXC_SITE_GUARD || s.kind == FEXC_SITE_SPLIT;   // a stub's guest_offset2 is its access site
+      push(s.native_offset, 4); push(s.guest_offset, 4); push(stub ? s.access_native_offset : s.guest_offset2, 4); push(s.insn_native_offset, 4); push(uint32_t(s.imm), 4);
       for (uint8_t b : {s.kind, s.width, s.intent, s.rmw, s.segment, s.base_reg, s.index_reg, s.extend, s.shift, s.writeback,
                         uint8_t(s.writeback_delta), s.data_reg[0], s.data_reg[1], s.data_class, s.nzcv, s.cf_inverted,
                         s.flags_written_before, s.ordering, s.completed_effects, s.located}) f.push_back(b);

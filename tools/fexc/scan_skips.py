@@ -12,7 +12,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series2/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series4/obj/fexc')
 BR = [re.compile(r'b\.\w+\s+0x([0-9a-f]+)$'), re.compile(r'(?:cbz|cbnz)\s+\w+,\s+0x([0-9a-f]+)$'),
       re.compile(r'(?:tbz|tbnz)\s+\w+,\s+#\d+,\s+0x([0-9a-f]+)$'), re.compile(r'b\s+0x([0-9a-f]+)$')]
 
@@ -26,7 +26,10 @@ def skips(d, tmp):
     starts = sorted({(e['native_offset'], e['guest_offset']) for e in d['pc_table']['entries']})
     bounds = [s[0] for s in starts] + [end]
     found = []
+    stubs = {s['native_offset'] for s in d['sites'] if s['kind'] in check_sites.STUBS}   # leave to the runtime, not skips
     for s in d['sites']:
+        if s['kind'] in check_sites.STUBS:
+            continue
         i = max(k for k, (n, _) in enumerate(starts) if n <= s['insn_native_offset'])
         lo = starts[i][0]
         for off, text in dis.items():
@@ -34,7 +37,7 @@ def skips(d, tmp):
                 continue
             for pat in BR:
                 m = pat.match(text)
-                if m and int(m.group(1), 16) > s['native_offset']:
+                if m and int(m.group(1), 16) > s['native_offset'] and int(m.group(1), 16) not in stubs:
                     found.append((starts[i][1], off, int(m.group(1), 16), s['native_offset'], text))
     return found
 

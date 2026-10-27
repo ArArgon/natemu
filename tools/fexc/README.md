@@ -9,7 +9,8 @@ sites, `spill_bytes`, `cf_inverted` per PC entry, and `--object` (binary record 
 `crates/abi/src/code_object.rs`); `check_sites.py` checks the sites against the 64 reference
 programs and the emitted code. **S1c done**: profile `slice1` (allowlist block cutting, single-gate exits, see
 "Profile slice1"). **S1b1 done**: the precision patches under `--profile slice1` and `verify_precision.py` (see
-"Precision (S1b1)"). Not done: address guard, split-store check, canonical branch targets (S1b2).
+"Precision (S1b1)"). **S1b2 done**: address guard, split-store check and canonical branch targets under `--profile slice1`
+(patch 0007, see "Guards (S1b2)").
 
 ## Build
 
@@ -24,12 +25,12 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as six commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as seven commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series2` (a fresh `build.sh` run gives a
-byte-identical `fexc`). Kept for comparison only: `s1c` (slice1 without the precision patches, the "before" of the cost
-numbers) and `c1b` (the v1 build without sites). The earlier `series1` (flag rule before the cheaper one below) and `s1b1` are gone.
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series4` (a fresh `build.sh` run gives a
+byte-identical `fexc`). Kept for comparison only: `series2` (patches 0001-0006, the "before" of the guard cost), `s1c` (slice1
+without the precision patches, the "before" of the precision cost) and `c1b` (the v1 build without sites). The earlier `series1` (flag rule before the cheaper one below) and `s1b1` are gone.
 
 The dependency archives of the old I4-V producer (`upstream.tar.gz`, `dependency-overlay.tar`) are no longer used; the
 submodule tree and the three externals are identical to them (the other overlay members, `vixl`, `jemalloc_glibc`,
@@ -52,6 +53,7 @@ Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--v
 | 0004 | access-site recording: CF inversion capture, `FexcAfterOp` in the JIT, spill size |
 | 0005 | slice1 block cutting (`FexcMap` in the decoder, `FexcSlice1::Cut`) and single-gate exits |
 | 0006 | slice1 precision (flag elimination, register allocation, pre-NZCV save) |
+| 0007 | slice1 address guard, split-store check, branch-target check (JIT hooks, pre-RA scan, `ret` without writeback) |
 
 Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in `shim/` and `fexc.cpp`; the patches only
 include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then
@@ -298,7 +300,7 @@ the x86 addressing form come from FEX's own decode of the instruction.
 | `guest_offset`, `guest_offset2` | guest instruction(s), offset from the block RIP; `guest_offset2` only for fused pairs |
 | `insn_native_offset` | native offset where that guest instruction's translation starts (its PC-table entry) |
 | `ir_op` | FEX IR op (diagnostic) |
-| `kind` | `load`, `store`, `load_pair`, `store_pair`, `push`, `pop`, `push_pair`, `pop_pair`, `other` (a guest-memory IR op the record cannot describe: a consumer must refuse it); `guard`, `split` reserved for S1b |
+| `kind` | `load`, `store`, `load_pair`, `store_pair`, `push`, `pop`, `push_pair`, `pop_pair`, `other` (a guest-memory IR op the record cannot describe: a consumer must refuse it); `guard`, `split`: slice1 check stubs (see "Guards (S1b2)") |
 | `width` | bytes the native instruction accesses (pairs: both registers) |
 | `intent`, `rmw` | `read`/`write`; for a memory-destination read-modify-write the load has `rmw: load`, `intent: write`, the store `rmw: store` (derived at emission: a load followed by a plain store in one guest instruction; valid because admitted instructions have at most one explicit memory operand) |
 | `segment` | `ss` for stack ops and RSP/RBP-based operands, else `ds` (decides #SS(0) vs #GP(0)) |
@@ -374,7 +376,62 @@ programs with `asm` (no eliminated access). By construction and unchecked: an in
 before the next instruction's start. Corpora: fixtures, the scan_skips matrix, adversarial
 programs per patch, and any `gen_slice1.py` corpus given. Against `s1c` it reports every defect class (SRA writes from
 pooled constants and RMW flag results, unsaved NZCV writes, load destinations in SRA registers, fused pairs, eliminated
-loads and flag writes); against `series2` (and the earlier `series1`) it passes.
+loads and flag writes); `series2` passed P1-P7 and fails only the guard checks P8-P10 added with S1b2 (missing guards,
+split checks and branch-target checks; 666 of the 911 compiled programs including the seed-77 corpus); `series4` passes all.
+
+## Guards (S1b2)
+
+Under `--profile slice1` only (default-profile JSON unchanged on the 64 fixtures, the 613-form matrix and a 264-program
+`--seed 77` corpus, except the exit-linker host address), patch 0007 adds three flag-free checks ([contract](../../docs/restructure/slice1-contract.md)
+§1 patches 7 and 8; code in `shim/fexc_sites.inc`, the pre-RA scan in `shim/fexc_precision.h`). Each branches with `tbnz` to
+an out-of-line `brk` stub placed after the block body (after the last exit `br`); the stub's PC is a site of kind `guard`
+(`brk #1`) or `split` (`brk #2`), found by the runtime through ELR like any site. The checks use only x0/x1 (FEX's TMP1/TMP2,
+never allocated) and sit right before the access (or right after the branch target is defined), so the state at a stub is
+the state of its access site: before the guest instruction, nothing committed. No helper call, no new IR op.
+
+| check | code | when |
+|---|---|---|
+| address guard | `[add/sub x1, base, index\|imm;] eor x0, A, A, lsl #16; tbnz x0, #63, G` | every non-RIP-relative access (A = base or x1); the store of a read-modify-write whose address is its load's SSA value shares the load's guard (it keeps its split check) |
+| split check | `add x0, A, #w-1; eor x0, x0, A; tbnz x0, #12, S` | every store wider than 1 byte (`store`, `store_pair`, `push`, read-modify-write stores too: with both pages already shadowed readable only the store faults, on the second page, and Arm may commit the first part) |
+| branch target | `eor x0, T, T, lsl #16; tbnz x0, #63, G` | indirect `jmp`/`call` (register or memory) and `ret`/`ret imm16`, before any state write |
+| RIP-relative | `b G` / `b S` or nothing | the address is a compile-time constant: guard only if non-canonical, split only if a store crosses a page |
+
+The RIP-relative elision is sound only because admission requires every guest-RIP relocation to equal the value for the
+compile RIP; any future relocation of code to another guest RIP (a code cache reusing objects) must re-check those addresses.
+| direct branch | cut at decode | `jmp`/`call`/`jcc` rel with a non-canonical target ends the block before it, `unsupported_form` |
+
+The guard catches A[63] != A[47]: the private half (`PRIVATE` = `0x0000_8000_4000_0000`), the rest of TTBR0's upper half and
+TTBR1's lower half. Any other non-canonical A is in neither TTBR range (T0SZ = T1SZ = 16, TBI off) and takes a level-0
+translation fault at the access itself. The last byte is not guarded: an access with a canonical A whose end crosses
+`0x0000_8000_0000_0000` lands in the unmapped 1 GiB below `PRIVATE` (L1 entry 0 under TTBR0 L0 entry 256 is invalid in the
+host's tables) and faults there; a store crossing it is a page-crossing store, caught by the split check. An access
+wrapping past `2^64` (A within 15 bytes of the top) reaches guest page 0, never private memory (open: the ABI predicate asks
+for checked handling; x86 wraps there too).
+
+`push` (slice1 only) never writes a register between its checks and its store: when the new stack pointer goes to another
+register, or the pushed value is the base itself (`push rsp`, `call rsp`), it stores with `stur value, [base, #-n]` and sets
+the new stack pointer with a `sub` afterwards (FEX's own path for the value-is-destination case), instead of `mov` before a
+pre-indexed store or a TMP copy. A far-branch restart (blocks over 32 KiB) now discards the attempt's PC-table and sub-block
+entries; the checks then take FEX's far form `tbz x0, #bit, +8; b stub`, which the verifier accepts. A branch-target check
+that Prescan planned but the JIT did not emit kills the compile. Site `data_regs` are the registers the access word encodes
+(check_sites compares them with the disassembly).
+
+`ret` (slice1 only) loads its return address with a plain load (site kind `load`, segment `ss`) instead of FEX's
+post-index pop, checks it, then adds 8 (+ imm16) to RSP; `call` checks before its push. A target read from a static register
+(`jmp`/`call reg`) is checked in that register at the instruction start.
+
+Stub sites (JSON): `access_native_offset` (slice1 only) names the access site a guard or split covers (null for a branch-target
+guard, whose `base_reg` is the target register); `base_reg` + `imm` is the address as it is at the stub (x1, the base, or the
+RIP-relative base register), no index; width, intent, segment and data registers are the access's. In the binary object
+(version 3, unchanged layout) a stub carries that access offset in `guest_offset2`. A split stub's completion: write both
+parts (or neither, #PF), apply the access site's writeback to the access site's `base_reg`, resume after the access site;
+the words between the split check and the store only build the address or copy the base, which the completion subsumes
+(checked).
+
+Cost (`verify_precision.py --before series2`, native words per translated guest instruction, stubs included): fixtures
+3.84 -> 5.67, `gen_slice1.py --seed 77 --random 240` 4.06 -> 6.02 (code bytes 17.3 -> 25.1). Of the 1.96 added words on the
+seed-77 corpus: guards 0.92, split checks 0.50, branch targets 0.00 (2 per indirect branch; the corpus has none), stubs 0.53
+(never executed). Run time is not measured (fexc cannot execute its output; S1d's runtime can).
 
 ## Checks
 
@@ -386,7 +443,9 @@ loads and flag writes); against `series2` (and the earlier `series1`) it passes.
   and the 64 programs is the single gate (disassembled), with no named-symbol literal, no pointer load but
   `DispatcherLoopTop`, no x25; the 64 programs translate completely except those with div/idiv.
 - `python3 tools/fexc/scan_skips.py`: the native-control-flow scan above.
-- `python3 tools/fexc/verify_precision.py [--before FEXC0] [CORPUS.json ...]`: the slice1 precision guarantee (above).
+- `python3 tools/fexc/verify_precision.py [--before FEXC0] [CORPUS.json ...]`: the slice1 precision guarantee (above) and the
+  guards (P8-P10: guard on exactly the access address, split check on every store wider than 1 byte, stubs reached only by their checks,
+  indirect targets checked before any state write; series2 fails them, series4 passes).
 - `python3 tools/fexc/check_sites.py [--known-ok] [--slice1]`: the 64 reference programs; expected accesses from the fixture `asm`
   against the sites, sites against the `xcrun objdump` disassembly of the code (every load/store with a base other than
   x28/sp must be a site and the reverse), dense versus sparse code bytes, binary object versus JSON.
