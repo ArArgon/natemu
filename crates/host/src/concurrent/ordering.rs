@@ -236,21 +236,32 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     fs::create_dir(&args[9]).map_err(|e| e.to_string())?;
     let _machine = Machine::create(&memory)?;
+    let ram = memory.0 as usize;
+    let service = |id: usize| -> Result<Option<Service>> {
+        let base = ram + id * RAM_SIZE;
+        let output = owner_output(&args[9], id)?;
+        Ok(checked(
+            crate::i4v_controls::producer::Compiler::new_ordering(
+                args[3].clone().into(),
+                args[8].clone().into(),
+                output,
+                id as u64,
+                config,
+            ),
+            move |_| unsafe {
+                ptr::read_volatile((base + o::OWNER_OFFSET) as *const o::Owner).expected
+            },
+        ))
+    };
     let execution = run_owners(
-        n,
-        shadow::TCR_BOTH,
-        0,
-        memory.0 as usize,
-        None,
-        0,
-        None,
-        None,
-        Some((
-            args[3].clone().into(),
-            args[8].clone().into(),
-            args[9].clone().into(),
-            NativeProfile::Ordering(config),
-        )),
+        Owners {
+            n,
+            tcr: shadow::TCR_BOTH,
+            memory: ram,
+            delayed: None,
+            deadline: Duration::from_secs(100),
+        },
+        &service,
     );
     let requests = execution.as_ref().map(Vec::as_slice).unwrap_or(&[]);
     let owners = (0..n)

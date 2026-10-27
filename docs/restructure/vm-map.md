@@ -93,6 +93,10 @@ or fixed workload shape.
 Ordered for the critical path to the first connected slice (one vCPU, 64-bit,
 paging on), which needs guest memory and tables before multi-owner services.
 
+Status (Oct 27): steps 1–4 done (`host/src/{vm,memory,owners}.rs`, abi
+`guest_memory.rs`/`shadow.rs`, runtime `tables.rs`/`record.rs`); step 5 remains.
+Sections 1–5 describe the code before these steps.
+
 1. **Host lifecycle, CPU state, memory.** See §7.
 2. **Runtime guest memory.** One guest-physical accessor and one `Tables`
    implementation over explicit bounds; one `copy_frame`/record module; families

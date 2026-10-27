@@ -1,5 +1,6 @@
 //! VM lifetime belongs to this caller; every vCPU belongs to one scoped thread.
 use super::*;
+use crate::owners::{Owners, Service};
 use natemu_abi::concurrency::*;
 use natemu_abi::translation as wire;
 use natemu_abi::{alias, shadow, stack, stack_concurrent};
@@ -13,12 +14,6 @@ mod progress;
 pub use coherence::run as run_coherence;
 pub use fence::run as run_fence;
 pub use progress::run as run_progress;
-#[derive(Clone, Copy)]
-enum NativeProfile {
-    Ordering(natemu_abi::ordering::Config),
-    Fence(natemu_abi::fence::Config),
-    Coherence(natemu_abi::coherence::Config),
-}
 mod ordering;
 pub use ordering::run as run_ordering;
 mod boundary;
@@ -27,133 +22,12 @@ mod mixed;
 mod mixed_producer;
 mod producer;
 mod stack_producer;
+use producer::{checked, owner_output};
 use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
-    thread,
+    path::PathBuf,
+    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
-
-/// An owner vCPU and its resident service loop.
-struct Cpu(Vcpu);
-impl Cpu {
-    fn run(
-        &self,
-        shared_address: usize,
-        compiler: &mut Option<producer::Compiler>,
-        cancelled: &AtomicBool,
-    ) -> Result<()> {
-        loop {
-            if cancelled.load(Ordering::Acquire) {
-                return Err("owner cancelled after peer failure".into());
-            }
-            let event = self.0.run_to_hvc()?;
-            let pc = self.0.reg(PC)?;
-            unsafe {
-                match event {
-                    0x49 => {
-                        let s = ptr::read_volatile(shared_address as *const Shared);
-                        return terminal_outcome(s.status, s.detail);
-                    }
-                    0x4a => {
-                        // Only this owner writes its private record, and is
-                        // stopped at the explicit register-transfer gateway.
-                        let s = ptr::read_volatile(shared_address as *const Shared);
-                        if !resident::contains(s.service_pc, 4) || pc != s.service_pc {
-                            return Err("compiler service outside explicit gateway".into());
-                        }
-                        let mut packet = [0; 16];
-                        for (r, v) in packet.iter_mut().enumerate() {
-                            *v = self.0.reg(r as u32)?;
-                        }
-                        let expected = if s.mode == natemu_abi::partial_progress::MODE
-                            && containment::configuration().is_some()
-                        {
-                            let config = containment::configuration().unwrap();
-                            let memory = shared_address
-                                - SHARED_OFFSET
-                                - s.object.vcpu_id as usize * RAM_SIZE;
-                            (*containment::state(memory, config.n as usize)).expected
-                        } else if compiler.as_ref().is_some_and(|c| c.is_coherence()) {
-                            (*((shared_address - SHARED_OFFSET
-                                + natemu_abi::coherence::OWNER_OFFSET)
-                                as *const natemu_abi::coherence::Owner))
-                                .expected
-                        } else if compiler.as_ref().is_some_and(|c| c.is_fence()) {
-                            (*((shared_address - SHARED_OFFSET + natemu_abi::fence::OWNER_OFFSET)
-                                as *const natemu_abi::fence::Owner))
-                                .expected
-                        } else if compiler.as_ref().is_some_and(|c| c.is_ordering()) {
-                            (*((shared_address - SHARED_OFFSET + natemu_abi::ordering::OWNER_OFFSET)
-                                as *const natemu_abi::ordering::Owner))
-                                .expected
-                        } else if compiler.as_ref().is_some_and(|c| c.is_address()) {
-                            (*((shared_address - SHARED_OFFSET
-                                + natemu_abi::address_concurrent::OWNER_OFFSET)
-                                as *const natemu_abi::address_concurrent::Owner))
-                                .expected
-                        } else if compiler.as_ref().is_some_and(|c| c.is_controls()) {
-                            ptr::read_volatile(
-                                (shared_address - SHARED_OFFSET + natemu_abi::controls::OFFSET)
-                                    as *const natemu_abi::controls::State,
-                            )
-                            .expected
-                        } else if compiler.as_ref().is_some_and(|c| c.is_mixed()) {
-                            ptr::read_volatile(
-                                (shared_address - SHARED_OFFSET + natemu_abi::mixed32::OFFSET)
-                                    as *const natemu_abi::mixed32::State,
-                            )
-                            .expected
-                        } else if compiler.as_ref().is_some_and(|c| c.is_stack()) {
-                            ptr::read_volatile(
-                                (shared_address - SHARED_OFFSET + stack_concurrent::OFFSET)
-                                    as *const stack_concurrent::State,
-                            )
-                            .expected
-                        } else {
-                            let mut expected = s.lifecycle.packet();
-                            expected[0] = packet[0];
-                            expected
-                        };
-                        if packet != expected {
-                            return Err("compiler request differs from resident identity".into());
-                        }
-                        let reply = compiler
-                            .as_mut()
-                            .ok_or("compiler service on non-owner")?
-                            .exchange(packet)?;
-                        for (r, v) in reply.iter().enumerate() {
-                            self.0.set_reg(r as u32, *v)?;
-                        }
-                    }
-                    _ => return Err("unexpected owner HVC".into()),
-                }
-            }
-        }
-    }
-}
-
-// Every concurrent fixture reports expected guest exceptions in its own record
-// and terminates with SUCCESS. Resident rejection/fault is never a guest outcome.
-fn terminal_outcome(status: u64, detail: u64) -> Result<()> {
-    match status {
-        SUCCESS => Ok(()),
-        REJECTED => Err(format!("resident owner rejected detail={detail}")),
-        NATIVE_FAULT => Err(format!("resident owner native fault detail={detail}")),
-        PANIC => Err(format!("resident owner panic detail={detail}")),
-        _ => Err(format!(
-            "resident owner invalid terminal status={status} detail={detail}"
-        )),
-    }
-}
-
-fn cancel_owners(cancelled: &AtomicBool) {
-    if !cancelled.swap(true, Ordering::AcqRel) {
-        crate::translation::process_owner::begin_cancellation();
-    }
-}
 
 fn stack_roles(n: usize) -> stack_concurrent::Roles {
     stack_concurrent::Roles::for_fixture(
@@ -183,276 +57,36 @@ fn tables(memory: &Memory, base: usize, aliases: bool) {
     private_space(memory, base, &spans, &[(DATA_VA, DATA_OFFSET)], aliases);
 }
 
-fn prepare_cpu(id: usize, tcr: u64) -> Result<Cpu> {
-    let cpu = Vcpu::create()?;
-    cpu.enter_resident(id * RAM_SIZE, tcr)?;
-    Ok(Cpu(cpu))
-}
-
+/// Runs `owners` with the opt-in scheduling and containment overlays attached:
+/// their records are installed before any owner starts and reported after join.
 fn run_owners(
-    n: usize,
-    tcr: u64,
-    delay: u64,
-    memory: usize,
-    compiler_config: Option<(std::path::PathBuf, std::path::PathBuf, u64, bool)>,
-    mixed_profile: u64,
-    controls_config: Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>,
-    address_config: Option<(
-        std::path::PathBuf,
-        std::path::PathBuf,
-        std::path::PathBuf,
-        natemu_abi::address_concurrent::Config,
-    )>,
-    ordering_config: Option<(
-        std::path::PathBuf,
-        std::path::PathBuf,
-        std::path::PathBuf,
-        NativeProfile,
-    )>,
+    owners: Owners,
+    service: &(dyn Fn(usize) -> Result<Option<Service>> + Sync),
 ) -> Result<Vec<wire::Packet>> {
+    let (memory, n) = (owners.memory, owners.n);
     unsafe {
         progress::prepare(memory, n)?;
         containment::prepare(memory, n)?;
     }
-    let cancelled = AtomicBool::new(false);
-    thread::scope(|scope| {
-        let (prepared_tx, prepared_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let (destroyed_tx, destroyed_rx) = mpsc::channel();
-        let mut starts = Vec::new();
-        let mut releases = Vec::new();
-        let mut owners = Vec::new();
-        for id in 0..n {
-            let cancelled = &cancelled;
-            let (start_tx, start_rx) = mpsc::channel::<()>();
-            let (release_tx, release_rx) = mpsc::channel::<()>();
-            let prepared = prepared_tx.clone();
-            let done = done_tx.clone();
-            let destroyed = destroyed_tx.clone();
-            let controls_config = if containment::configuration()
-                .is_some_and(|c| c.family == natemu_abi::schedule::PARTIAL && c.actor != id as u64)
-            {
-                None
-            } else {
-                controls_config.clone()
-            };
-            let address_config = address_config.clone();
-            let ordering_config = ordering_config.clone();
-            let compiler_config = if id as u64 == stack_roles(n).actor || mixed_profile != 0 {
-                compiler_config.clone()
-            } else {
-                None
-            };
-            let owner = thread::Builder::new()
-                .name(format!("vcpu-{id}"))
-                .spawn_scoped(scope, move || -> Result<Vec<wire::Packet>> {
-                    let cpu = std::panic::catch_unwind(|| prepare_cpu(id, tcr))
-                        .unwrap_or_else(|_| Err("owner panicked during setup".into()));
-                    prepared
-                        .send(cpu.as_ref().map(|c| c.0.id()).map_err(Clone::clone))
-                        .map_err(|_| "setup receiver closed")?;
-                    let mut cpu = cpu?;
-                    // No native entry until *all* owners successfully prepare.
-                    let mut compiler = None;
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        start_rx.recv().map_err(|_| "owner startup cancelled")?;
-                        if id as u64 == stack_roles(n).delayed {
-                            thread::sleep(Duration::from_millis(delay));
-                        }
-                        if let Some((binary, worker, output, config)) = ordering_config {
-                            compiler = Some(match config {
-                                NativeProfile::Ordering(config) => {
-                                    producer::Compiler::new_ordering(
-                                        binary,
-                                        worker,
-                                        output.join(format!("cpu-{id}")),
-                                        id as u64,
-                                        config,
-                                    )?
-                                }
-                                NativeProfile::Fence(config) => producer::Compiler::new_fence(
-                                    binary,
-                                    worker,
-                                    output.join(format!("cpu-{id}")),
-                                    id as u64,
-                                    config,
-                                )?,
-                                NativeProfile::Coherence(config) => {
-                                    producer::Compiler::new_coherence(
-                                        binary,
-                                        worker,
-                                        output.join(format!("cpu-{id}")),
-                                        id as u64,
-                                        config,
-                                    )?
-                                }
-                            });
-                        } else if let Some((binary, worker, output, config)) = address_config {
-                            compiler = Some(producer::Compiler::new_address(
-                                binary,
-                                worker,
-                                output.join(format!("cpu-{id}")),
-                                id as u64,
-                                config,
-                            )?);
-                        } else if let Some((binary, worker, output)) = controls_config {
-                            compiler = Some(producer::Compiler::new_controls(
-                                binary,
-                                worker,
-                                output.join(format!("cpu-{id}")),
-                                id as u64,
-                            )?);
-                        } else if let Some((binary, output, profile, is_stack)) = compiler_config {
-                            compiler = Some(if mixed_profile != 0 {
-                                producer::Compiler::new_mixed(
-                                    binary,
-                                    output.join(format!("cpu-{id}")),
-                                    id as u64,
-                                    natemu_abi::mixed32::owner_mode(mixed_profile, id as u64)
-                                        .unwrap(),
-                                )?
-                            } else if is_stack {
-                                producer::Compiler::new_stack(
-                                    binary,
-                                    output,
-                                    alias::source_rip(profile),
-                                    id as u64,
-                                )?
-                            } else if profile == 0 {
-                                producer::Compiler::new(binary, output)?
-                            } else {
-                                producer::Compiler::new_alias(
-                                    binary,
-                                    output,
-                                    alias::source_rip(profile),
-                                )?
-                            });
-                        }
-                        cpu.run(
-                            memory + id * RAM_SIZE + SHARED_OFFSET,
-                            &mut compiler,
-                            cancelled,
-                        )
-                    }))
-                    .unwrap_or_else(|_| Err("owner panicked during execution".into()));
-                    let _ = done.send(result.clone());
-                    // Keep IDs alive while the supervisor may cancel peers.
-                    let _ = release_rx.recv();
-                    let destroy_result = cpu.0.destroy();
-                    let _ = destroyed.send((id, destroy_result));
-                    result?;
-                    hv(destroy_result, "destroy owner vCPU")?;
-                    Ok(compiler.map_or_else(Vec::new, |mut c| std::mem::take(&mut c.requests)))
-                })
-                .map_err(|e| e.to_string());
-            match owner {
-                Ok(h) => {
-                    owners.push(h);
-                    starts.push(start_tx);
-                    releases.push(release_tx);
-                }
-                Err(e) => {
-                    drop(starts);
-                    drop(releases);
-                    return Err(e);
-                }
-            }
-        }
-        drop(prepared_tx);
-        drop(done_tx);
-        drop(destroyed_tx);
-        let mut ids = Vec::new();
-        for _ in 0..n {
-            match prepared_rx.recv().map_err(|_| "owner setup disconnected")? {
-                Ok(id) => ids.push(id),
-                Err(e) => {
-                    drop(starts);
-                    drop(releases);
-                    return Err(e);
-                }
-            }
-        }
-        let mut error = None;
-        for start in starts {
-            if start.send(()).is_err() {
-                error.get_or_insert("owner disappeared before entry".into());
-            }
-        }
-        let began = Instant::now();
-        let mut completed = 0;
-        let mut cancellations = Vec::new();
-        let mut observation = containment::Observation::default();
-        while completed < n {
-            let completion = done_rx.recv_timeout(Duration::from_millis(20));
-            if let Some(cause) = unsafe { observation.poll(memory, n) } {
-                error.get_or_insert(cause);
-            }
-            match completion {
-                Ok(result) => {
-                    completed += 1;
-                    if let Err(e) = result {
-                        containment::latch(&e);
-                        error.get_or_insert(e);
-                        cancel_owners(&cancelled);
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    error.get_or_insert("owner completion disconnected".into());
-                    break;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-            }
-            if began.elapsed()
-                > Duration::from_secs(
-                    if compiler_config.is_some()
-                        || controls_config.is_some()
-                        || address_config.is_some()
-                        || ordering_config.is_some()
-                    {
-                        100
-                    } else {
-                        10
-                    },
-                )
-            {
-                error.get_or_insert("concurrent execution exceeded its deadline".into());
-            }
-            if error.is_some() && completed < n {
-                cancel_owners(&cancelled);
-                // Repeat cancellation: an owner may still be in its declared
-                // pre-entry delay when an earlier cancellation is issued.
-                cancellations.push(exit_vcpus(&mut ids));
-            }
-        }
-        drop(releases);
-        let mut requests = Vec::new();
-        for (id, h) in owners.into_iter().enumerate() {
-            match h.join() {
-                Ok(Ok(mut r)) => requests.append(&mut r),
-                Ok(Err(e)) => {
-                    eprintln!("owner {id}: {e}");
-                    error.get_or_insert(e);
-                }
-                Err(_) => {
-                    error.get_or_insert("owner panicked".into());
-                }
-            }
-        }
-        let destroyed = destroyed_rx.into_iter().collect::<Vec<_>>();
-        unsafe {
-            progress::report(
-                memory,
-                n,
-                completed,
-                &destroyed,
-                &cancellations,
-                error.as_deref(),
-                began.elapsed(),
-            );
-            observation.report(memory, n, began);
-        }
-        error.map_or(Ok(requests), Err)
-    })
+    let mut observation = containment::Observation::default();
+    let s = owners.run(
+        service,
+        &mut || unsafe { observation.poll(memory, n) },
+        &containment::latch,
+    )?;
+    unsafe {
+        progress::report(
+            memory,
+            n,
+            s.completed,
+            &s.destroyed,
+            &s.cancellations,
+            s.error.as_deref(),
+            s.began.elapsed(),
+        );
+        observation.report(memory, n, s.began);
+    }
+    s.error.map_or(Ok(s.requests), Err)
 }
 
 // Keep profile admission explicit: source address selection and permission setup
@@ -737,25 +371,66 @@ pub fn run(args: &[String]) -> Result<()> {
     } else {
         SINGLE_ROOT_TCR
     };
-    let execution = run_owners(
-        n,
-        tcr,
-        delay,
-        memory.0 as usize,
-        if compose {
-            Some((
-                args[5].clone().into(),
-                args[6].clone().into(),
-                alias_profile,
-                stack_profile,
-            ))
+    let ram = memory.0 as usize;
+    let service = |id: usize| -> Result<Option<Service>> {
+        if !compose || (id as u64 != stack_roles.actor && mixed_profile == 0) {
+            return Ok(None);
+        }
+        let base = ram + id * RAM_SIZE;
+        let binary = PathBuf::from(&args[5]);
+        Ok(if mixed_profile != 0 {
+            let mode = natemu_abi::mixed32::owner_mode(mixed_profile, id as u64).unwrap();
+            let output = owner_output(&args[6], id)?;
+            checked(
+                mixed_producer::Compiler::new(binary, output, id as u64, mode),
+                move |_| unsafe {
+                    ptr::read_volatile(
+                        (base + natemu_abi::mixed32::OFFSET) as *const natemu_abi::mixed32::State,
+                    )
+                    .expected
+                },
+            )
+        } else if stack_profile {
+            fs::create_dir(&args[6]).map_err(|e| e.to_string())?;
+            checked(
+                stack_producer::Compiler::new(
+                    binary,
+                    args[6].clone().into(),
+                    source_rip,
+                    id as u64,
+                ),
+                move |_| unsafe {
+                    ptr::read_volatile(
+                        (base + stack_concurrent::OFFSET) as *const stack_concurrent::State,
+                    )
+                    .expected
+                },
+            )
         } else {
-            None
+            let output = args[6].clone().into();
+            let compiler = if alias_profile == 0 {
+                producer::Compiler::new(binary, output)?
+            } else {
+                producer::Compiler::new_alias(binary, output, source_rip)?
+            };
+            // The request names the identity the resident published for this VM.
+            checked(compiler, move |packet| {
+                let s = unsafe { ptr::read_volatile((base + SHARED_OFFSET) as *const Shared) };
+                let mut expected = s.lifecycle.packet();
+                expected[0] = packet[0];
+                expected
+            })
+        })
+    };
+    let execution = run_owners(
+        Owners {
+            n,
+            tcr,
+            memory: ram,
+            delayed: Some((stack_roles.delayed as usize, Duration::from_millis(delay))),
+            deadline: Duration::from_secs(if compose { 100 } else { 10 }),
         },
-        mixed_profile,
-        None,
-        None,
-        None,
+        &service,
     );
     let requests = match execution {
         Ok(requests) => requests,
@@ -1128,24 +803,6 @@ pub fn run(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn concurrent_guest_exceptions_do_not_authorize_runtime_failures() {
-        assert!(terminal_outcome(SUCCESS, 0).is_ok());
-        for status in [0, REJECTED, NATIVE_FAULT, PANIC, u64::MAX] {
-            assert!(terminal_outcome(status, 321).unwrap_err().contains("321"));
-        }
-        assert!(
-            terminal_outcome(REJECTED, 7)
-                .unwrap_err()
-                .contains("rejected")
-        );
-        assert!(
-            terminal_outcome(NATIVE_FAULT, 7)
-                .unwrap_err()
-                .contains("native fault")
-        );
-    }
 
     #[test]
     fn each_owner_maps_its_extended_resident_text_read_only() {

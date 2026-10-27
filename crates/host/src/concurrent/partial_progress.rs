@@ -131,22 +131,37 @@ pub fn run(args: &[String]) -> Result<()> {
     memory.write_record(COORD_OFFSET, Coordinator::new(n).unwrap());
     memory.write_record(p::COMMON_OFFSET, p::Common::new(config).unwrap());
     let _machine = Machine::create(&memory)?;
-    let execution = run_owners(
-        n,
-        shadow::TCR_BOTH,
-        0,
-        memory.0 as usize,
-        None,
-        0,
-        containment::configuration().map(|_| {
-            (
+    let ram = memory.0 as usize;
+    // Only a contained cell's actor compiles; it must request the containment witness.
+    let service = |id: usize| -> Result<Option<Service>> {
+        let Some(config) = containment::configuration().filter(|c| c.actor == id as u64) else {
+            return Ok(None);
+        };
+        let output = owner_output(&args[8], id)?;
+        Ok(checked(
+            crate::i4v_controls::producer::Compiler::new_owner(
                 args[3].clone().into(),
                 args[7].clone().into(),
-                args[8].clone().into(),
-            )
-        }),
-        None,
-        None,
+                output,
+                id as u64,
+                1,
+            ),
+            move |_| unsafe { (*containment::state(ram, config.n as usize)).expected },
+        ))
+    };
+    let execution = run_owners(
+        Owners {
+            n,
+            tcr: shadow::TCR_BOTH,
+            memory: ram,
+            delayed: None,
+            deadline: Duration::from_secs(if containment::configuration().is_some() {
+                100
+            } else {
+                10
+            }),
+        },
+        &service,
     );
     let owners = (0..n)
         .map(|id| owner_json(&memory, id, &banks[id]))

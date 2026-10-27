@@ -108,21 +108,32 @@ pub fn run(args: &[String]) -> Result<()> {
     memory.write_record(f::COMMON_OFFSET, f::Common::new(config));
     fs::create_dir(&args[7]).map_err(|e| e.to_string())?;
     let _machine = Machine::create(&memory)?;
+    let ram = memory.0 as usize;
+    let service = |id: usize| -> Result<Option<Service>> {
+        let base = ram + id * RAM_SIZE;
+        let output = owner_output(&args[7], id)?;
+        Ok(checked(
+            fence_producer::Compiler::new(
+                args[3].clone().into(),
+                args[6].clone().into(),
+                output,
+                id as u64,
+                config,
+            ),
+            move |_| unsafe {
+                ptr::read_volatile((base + f::OWNER_OFFSET) as *const f::Owner).expected
+            },
+        ))
+    };
     let execution = run_owners(
-        n,
-        shadow::TCR_BOTH,
-        0,
-        memory.0 as usize,
-        None,
-        0,
-        None,
-        None,
-        Some((
-            args[3].clone().into(),
-            args[6].clone().into(),
-            args[7].clone().into(),
-            NativeProfile::Fence(config),
-        )),
+        Owners {
+            n,
+            tcr: shadow::TCR_BOTH,
+            memory: ram,
+            delayed: None,
+            deadline: Duration::from_secs(100),
+        },
+        &service,
     );
     let requests = execution.as_ref().map(Vec::as_slice).unwrap_or(&[]);
     let owners = (0..n)

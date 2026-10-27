@@ -103,9 +103,6 @@ impl Compiler {
         compiler.protocol = Protocol::Address(config);
         compiler
     }
-    pub fn is_address(&self) -> bool {
-        matches!(self.protocol, Protocol::Address(_))
-    }
     pub fn new_ordering(
         producer: PathBuf,
         worker: PathBuf,
@@ -117,9 +114,6 @@ impl Compiler {
         compiler.protocol = Protocol::Ordering(config);
         compiler
     }
-    pub fn is_ordering(&self) -> bool {
-        matches!(self.protocol, Protocol::Ordering(_))
-    }
     pub fn new_coherence(
         producer: PathBuf,
         worker: PathBuf,
@@ -130,9 +124,6 @@ impl Compiler {
         let mut compiler = Self::new_owner(producer, worker, output, owner, 1);
         compiler.protocol = Protocol::Coherence(config);
         compiler
-    }
-    pub fn is_coherence(&self) -> bool {
-        matches!(self.protocol, Protocol::Coherence(_))
     }
     fn start(&mut self, request: wire::Packet) -> Result<Job> {
         self.start_inner(request, false)

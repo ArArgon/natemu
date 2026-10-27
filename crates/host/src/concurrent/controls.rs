@@ -514,20 +514,35 @@ pub fn run(args: &[String]) -> Result<()> {
     );
     fs::create_dir(&args[8]).map_err(|e| e.to_string())?;
     let _machine = Machine::create(&memory)?;
+    let ram = memory.0 as usize;
+    let service = |id: usize| -> Result<Option<Service>> {
+        let base = ram + id * RAM_SIZE;
+        let output = owner_output(&args[8], id)?;
+        Ok(checked(
+            crate::i4v_controls::producer::Compiler::new_owner(
+                args[3].clone().into(),
+                args[7].clone().into(),
+                output,
+                id as u64,
+                1,
+            ),
+            move |_| unsafe {
+                ptr::read_volatile(
+                    (base + natemu_abi::controls::OFFSET) as *const natemu_abi::controls::State,
+                )
+                .expected
+            },
+        ))
+    };
     let execution = run_owners(
-        n,
-        shadow::TCR_BOTH,
-        0,
-        memory.0 as usize,
-        None,
-        0,
-        Some((
-            args[3].clone().into(),
-            args[7].clone().into(),
-            args[8].clone().into(),
-        )),
-        None,
-        None,
+        Owners {
+            n,
+            tcr: shadow::TCR_BOTH,
+            memory: ram,
+            delayed: None,
+            deadline: Duration::from_secs(100),
+        },
+        &service,
     );
     let (requests, containment_error) = match execution {
         Ok(requests) => (requests, None),

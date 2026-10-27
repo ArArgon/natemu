@@ -1,6 +1,55 @@
+//! Per-owner gateway services for the concurrent fixtures.
 use super::*;
+use crate::owners::{OwnerService, Service};
 use natemu_abi::translation as wire;
 use std::path::PathBuf;
+
+/// Rejects a request that differs from the packet the resident published for
+/// this owner before `service` sees it.
+pub(super) fn checked(
+    service: impl OwnerService + 'static,
+    expected: impl Fn(&wire::Packet) -> wire::Packet + 'static,
+) -> Option<Service> {
+    Some(Box::new(Checked(service, expected)))
+}
+struct Checked<S, F>(S, F);
+impl<S: OwnerService, F: Fn(&wire::Packet) -> wire::Packet> OwnerService for Checked<S, F> {
+    fn exchange(&mut self, packet: wire::Packet) -> Result<wire::Packet> {
+        if packet != (self.1)(&packet) {
+            return Err("compiler request differs from resident identity".into());
+        }
+        self.0.exchange(packet)
+    }
+    fn requests(&mut self) -> Vec<wire::Packet> {
+        self.0.requests()
+    }
+}
+macro_rules! owner_services {
+    ($($compiler:ty),*) => {$(
+        impl OwnerService for $compiler {
+            fn exchange(&mut self, packet: wire::Packet) -> Result<wire::Packet> {
+                <$compiler>::exchange(self, packet)
+            }
+            fn requests(&mut self) -> Vec<wire::Packet> {
+                std::mem::take(&mut self.requests)
+            }
+        }
+    )*};
+}
+owner_services!(
+    Compiler,
+    stack_producer::Compiler,
+    mixed_producer::Compiler,
+    fence_producer::Compiler,
+    crate::i4v_controls::producer::Compiler
+);
+
+/// Creates owner `id`'s producer directory under `output`.
+pub(super) fn owner_output(output: &str, id: usize) -> Result<PathBuf> {
+    let directory = PathBuf::from(output).join(format!("cpu-{id}"));
+    fs::create_dir(&directory).map_err(|e| e.to_string())?;
+    Ok(directory)
+}
 
 pub struct Compiler {
     worker: PathBuf,
@@ -11,10 +60,6 @@ pub struct Compiler {
     pub requests: Vec<wire::Packet>,
     guest_rip: u64,
     address_profile: bool,
-    stack: Option<stack_producer::Compiler>,
-    fence: Option<fence_producer::Compiler>,
-    mixed: Option<mixed_producer::Compiler>,
-    controls: Option<crate::i4v_controls::producer::Compiler>,
 }
 impl Compiler {
     pub fn new(producer: PathBuf, output: PathBuf) -> Result<Self> {
@@ -28,10 +73,6 @@ impl Compiler {
             requests: Vec::new(),
             guest_rip: wire::SOURCE_VA,
             address_profile: false,
-            stack: None,
-            fence: None,
-            mixed: None,
-            controls: None,
         })
     }
     pub fn new_alias(producer: PathBuf, output: PathBuf, guest_rip: u64) -> Result<Self> {
@@ -41,137 +82,7 @@ impl Compiler {
         compiler.address_profile = true;
         Ok(compiler)
     }
-    pub fn new_stack(
-        producer: PathBuf,
-        output: PathBuf,
-        guest_rip: u64,
-        owner: u64,
-    ) -> Result<Self> {
-        let mut compiler = Self::new(producer.clone(), output.clone())?;
-        compiler.stack = Some(stack_producer::Compiler::new(
-            producer, output, guest_rip, owner,
-        ));
-        Ok(compiler)
-    }
-    pub fn new_mixed(producer: PathBuf, output: PathBuf, owner: u64, mode: u64) -> Result<Self> {
-        let mut c = Self::new(producer.clone(), output.clone())?;
-        c.mixed = Some(mixed_producer::Compiler::new(producer, output, owner, mode));
-        Ok(c)
-    }
-    pub fn new_controls(
-        producer: PathBuf,
-        worker: PathBuf,
-        output: PathBuf,
-        owner: u64,
-    ) -> Result<Self> {
-        let mut c = Self::new(producer.clone(), output.clone())?;
-        c.controls = Some(crate::i4v_controls::producer::Compiler::new_owner(
-            producer, worker, output, owner, 1,
-        ));
-        Ok(c)
-    }
-    pub fn is_controls(&self) -> bool {
-        self.controls.as_ref().is_some_and(|compiler| {
-            !compiler.is_address() && !compiler.is_ordering() && !compiler.is_coherence()
-        })
-    }
-    pub fn new_address(
-        producer: PathBuf,
-        worker: PathBuf,
-        output: PathBuf,
-        owner: u64,
-        config: natemu_abi::address_concurrent::Config,
-    ) -> Result<Self> {
-        let mut compiler = Self::new(producer.clone(), output.clone())?;
-        compiler.controls = Some(crate::i4v_controls::producer::Compiler::new_address(
-            producer, worker, output, owner, config,
-        ));
-        Ok(compiler)
-    }
-    pub fn is_address(&self) -> bool {
-        self.controls
-            .as_ref()
-            .is_some_and(|compiler| compiler.is_address())
-    }
-    pub fn new_ordering(
-        producer: PathBuf,
-        worker: PathBuf,
-        output: PathBuf,
-        owner: u64,
-        config: natemu_abi::ordering::Config,
-    ) -> Result<Self> {
-        let mut compiler = Self::new(producer.clone(), output.clone())?;
-        compiler.controls = Some(crate::i4v_controls::producer::Compiler::new_ordering(
-            producer, worker, output, owner, config,
-        ));
-        Ok(compiler)
-    }
-    pub fn is_ordering(&self) -> bool {
-        self.controls
-            .as_ref()
-            .is_some_and(|compiler| compiler.is_ordering())
-    }
-    pub fn new_coherence(
-        producer: PathBuf,
-        worker: PathBuf,
-        output: PathBuf,
-        owner: u64,
-        config: natemu_abi::coherence::Config,
-    ) -> Result<Self> {
-        let mut compiler = Self::new(producer.clone(), output.clone())?;
-        compiler.controls = Some(crate::i4v_controls::producer::Compiler::new_coherence(
-            producer, worker, output, owner, config,
-        ));
-        Ok(compiler)
-    }
-    pub fn is_coherence(&self) -> bool {
-        self.controls
-            .as_ref()
-            .is_some_and(|compiler| compiler.is_coherence())
-    }
-    pub fn new_fence(
-        producer: PathBuf,
-        worker: PathBuf,
-        output: PathBuf,
-        owner: u64,
-        config: natemu_abi::fence::Config,
-    ) -> Result<Self> {
-        let mut compiler = Self::new(producer.clone(), output.clone())?;
-        compiler.fence = Some(fence_producer::Compiler::new(
-            producer, worker, output, owner, config,
-        ));
-        Ok(compiler)
-    }
-    pub fn is_fence(&self) -> bool {
-        self.fence.is_some()
-    }
-    pub fn is_mixed(&self) -> bool {
-        self.mixed.is_some()
-    }
-    pub fn is_stack(&self) -> bool {
-        self.stack.is_some()
-    }
     pub fn exchange(&mut self, mut packet: wire::Packet) -> Result<wire::Packet> {
-        if let Some(fence) = self.fence.as_mut() {
-            let reply = fence.exchange(packet)?;
-            self.requests.clone_from(&fence.requests);
-            return Ok(reply);
-        }
-        if let Some(controls) = self.controls.as_mut() {
-            let reply = controls.exchange(packet)?;
-            self.requests.clone_from(&controls.requests);
-            return Ok(reply);
-        }
-        if let Some(mixed) = self.mixed.as_mut() {
-            let reply = mixed.exchange(packet)?;
-            self.requests.clone_from(&mixed.requests);
-            return Ok(reply);
-        }
-        if let Some(stack) = self.stack.as_mut() {
-            let reply = stack.exchange(packet)?;
-            self.requests.clone_from(&stack.requests);
-            return Ok(reply);
-        }
         let operation = packet[0];
         if operation == POLL_COMPILE {
             if self
