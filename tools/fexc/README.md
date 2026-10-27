@@ -29,7 +29,7 @@ jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never 
 (series applied as eight commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series5`. Kept for comparison only: `series4`
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series6` (series5 plus `--serve`, no patch change). Kept for comparison only: `series5`, `series4`
 (patches 0001-0007, before division), `series2` (patches 0001-0006, the "before" of the guard cost), `s1c` (slice1
 without the precision patches, the "before" of the precision cost) and `c1b` (the v1 build without sites). The earlier `series1` (flag rule before the cheaper one below) and `s1b1` are gone.
 
@@ -60,6 +60,21 @@ Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--v
 Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in `shim/` and `fexc.cpp`; the patches only
 include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then
 `git -C BUILD_DIR/src format-patch --no-signature --zero-commit -o tools/fexc/patches 48d7175..HEAD`.
+
+### Compile server (`fexc --serve`, S2a)
+
+One persistent process answers compile requests, length-prefixed (u32 little-endian) on stdin/stdout; EOF on stdin ends it.
+Request: `len`, `args_len`, the CLI arguments as NUL-terminated strings (without `--hex/--file/--out/--object`), then the
+guest bytes. Reply: `len`, `code` (i32: the CLI's exit code), `json_len`, `object_len`, JSON report (error text for
+`code >= 2`), binary object (always produced for `code 0`). Object and JSON equal the one-shot CLI's (the one JSON value that
+differs between two CLI runs, the dispatcher's host address `emitted_value`, aside).
+
+**Each request runs in a forked child of the server** (`--serve-mode fork`, the default), which does exactly what the CLI
+does. The parent never touches FEX, so no state of any kind crosses requests, and a crash costs one request. In-process
+alternatives were measured and rejected (`--serve-mode fresh|reuse`, `test_serve.py --mode`): one reused context answers a
+repeated RIP from FEX's block cache without compiling (wrong or missing code, even for other bytes), and a context per request
+in the same process still leaks `Config::Set` values (e.g. `--config`), the process-global recorders, and about 150 KiB of
+unreleasable memory per request (FEX contexts cannot be destroyed). `test_serve.py FEXC --corpus C.json` checks identity.
 
 ## What builds
 

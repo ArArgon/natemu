@@ -128,7 +128,7 @@ fn page_span(start: u64, length: usize) -> impl Iterator<Item = u64> {
 }
 
 pub(crate) fn run(args: &[String]) -> Result<()> {
-    let (resident, fexc, description, work) = match args {
+    let (resident, fexc, description, _work) = match args {
         [_, r, _, f, d, w] | [_, r, _, f, d, w, _] => (r, f, d, w),
         _ => return Err("usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS]".into()),
     };
@@ -178,7 +178,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     );
 
     let vm = Vm::new(memory)?;
-    let mut compiler = Compiler::new(Path::new(fexc), Path::new(work), &vm.cpu, max_instructions)?;
+    let mut compiler = Compiler::new(Path::new(fexc), &vm.cpu, max_instructions)?;
     vm.cpu.enter_resident(0, natemu_abi::shadow::TCR_BOTH)?;
     let stop = execution::run(&vm, &mut compiler, Some(p.rip + p.code.len() as u64))?;
     let s: State = vm.memory.read_record(exec::STATE_OFFSET);

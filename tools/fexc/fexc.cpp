@@ -21,7 +21,12 @@
 #include <FEXCore/fextl/memory.h>
 #include <fexc_hook.h>
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <map>
+#include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -255,8 +260,12 @@ static const char* StatusName(int s) {
   return "unknown";
 }
 
+// A served request's result (--serve): exit code as the CLI would return it, the JSON report and the binary object.
+struct Reply { int code = 0; std::string json; std::vector<uint8_t> object; };
+static Reply* Served = nullptr;   // set while a --serve request is compiled
+
 static int Fail(const std::string& msg, int code = 2) {
-  fprintf(stderr, "fexc: %s\n", msg.c_str());
+  if (Served) Served->json = msg; else fprintf(stderr, "fexc: %s\n", msg.c_str());
   return code;
 }
 
@@ -294,7 +303,24 @@ static bool ConfigOptionByName(std::string n, Config::ConfigOption& out) {
   return false;
 }
 
-int main(int argc, char** argv) {
+// Everything the compile reads from process-wide state is reset here, so a request never sees an earlier one's.
+static void ResetGlobals() {
+  Cap = {};
+  Diagnostics.clear();
+  W = {};
+  fexc_sites.clear(); fexc_insns.clear(); fexc_cf_inverted.clear(); fexc_spill_bytes = 0; fexc_cut = {};
+  fexc_rip_relative.clear(); fexc_rmw_same_address.clear(); fexc_target_check.clear(); fexc_div_width.clear();
+}
+
+// The CLI's body. `args` are the command-line arguments (args[0] is the program name); `given` replaces --hex/--file with the
+// bytes themselves and `rep` collects the outputs instead of stdout/--out/--object (both set only by --serve).
+// `reuse` (--serve-mode reuse, diagnostic): contexts are kept per configuration instead of created per request.
+static bool ReuseContexts = false;
+struct Ctx { fextl::unique_ptr<Context::Context> ctx; Core::InternalThreadState* thread = nullptr; Handler handler; Signals signals; Core::CPUState::gdt_segment gdt[32] {}; };
+static int CompileRequest(const std::vector<std::string>& args, const std::vector<uint8_t>* given, Reply* rep) {
+  Served = rep;
+  ResetGlobals();
+  const int argc = int(args.size());
   std::string hex, file, out, object;
   bool have_rip = false;
   uint64_t rip = 0, bitness = 64;
@@ -302,9 +328,10 @@ int main(int argc, char** argv) {
   bool sparse_flag = false;
   std::vector<std::pair<std::string, bool>> overrides;
   std::vector<std::pair<std::string, std::string>> configs;   // --config NAME=VALUE, applied after fexc's own Config::Set calls
-  for (int i = 1; i < argc; ++i) {
-    std::string a = argv[i];
-    auto next = [&]() -> const char* { if (i + 1 >= argc) { fprintf(stderr, "fexc: %s needs a value\n", a.c_str()); exit(2); } return argv[++i]; };
+  std::string missing;
+  for (int i = 1; i < argc && missing.empty(); ++i) {
+    std::string a = args[i];
+    auto next = [&]() -> const char* { if (i + 1 >= argc) { missing = a; return ""; } return args[++i].c_str(); };
     if (a == "--hex") hex = next();
     else if (a == "--file") file = next();
     else if (a == "--rip") { rip = strtoull(next(), nullptr, 0); have_rip = true; }
@@ -326,7 +353,8 @@ int main(int argc, char** argv) {
     else if (a == "--object") object = next();
     else return Fail("unknown argument " + a);
   }
-  if (!have_rip || (hex.empty() == file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
+  if (!missing.empty()) return Fail(missing + " needs a value");
+  if (!have_rip || (!given && hex.empty() == file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
   if (bitness != 32 && bitness != 64) return Fail("--bitness must be 32 or 64");
   const bool slice1 = st.profile == "slice1";
   if (slice1 && bitness != 64) return Fail("profile slice1 is 64-bit only");
@@ -334,7 +362,8 @@ int main(int argc, char** argv) {
   if (slice1 && (st.tso || st.multiblock || st.end_marker)) return Fail("profile slice1 fixes TSO emulation off, multiblock off and no end marker");
 
   std::vector<uint8_t> bytes;
-  if (!file.empty()) {
+  if (given) bytes = *given;
+  else if (!file.empty()) {
     std::ifstream f(file, std::ios::binary);
     if (!f) return Fail("cannot read " + file);
     bytes.assign(std::istreambuf_iterator<char>(f), {});
@@ -384,15 +413,27 @@ int main(int argc, char** argv) {
   fexc_dense_pc_table = st.dense_pc;
   fexc_slice1 = slice1;
 
-  auto ctx = Context::Context::CreateNewContext(hf);
-  Handler handler; Signals signals;
-  ctx->SetSignalDelegator(&signals);
-  ctx->SetSyscallHandler(&handler);
-  if (!ctx->InitCore()) return Fail("InitCore failed", 3);
-  auto* thread = ctx->CreateThread();
+  // One context per request (a Ctx is never torn down: FEX's destructors assume a running emulator thread). Diagnostic
+  // --serve-mode reuse keeps one per configuration instead; its LookupCache then answers a repeated RIP with the old block.
+  static std::map<std::string, Ctx*> kept;
+  std::string key = std::to_string(bitness) + (st.tso ? "t" : "n") + (st.multiblock ? "m" : "s") + "|";
+  for (auto& f : table) key += f.get(hf) ? '1' : '0';
+  for (auto& c : configs) key += "|" + c.first + "=" + c.second;
+  Ctx* kc = ReuseContexts && kept.count(key) ? kept[key] : nullptr;
+  if (!kc) {
+    kc = new Ctx;
+    kc->ctx = Context::Context::CreateNewContext(hf);
+    kc->ctx->SetSignalDelegator(&kc->signals);
+    kc->ctx->SetSyscallHandler(&kc->handler);
+    if (!kc->ctx->InitCore()) return Fail("InitCore failed", 3);
+    kc->thread = kc->ctx->CreateThread();
+    if (ReuseContexts) kept[key] = kc;
+  }
+  auto& ctx = kc->ctx;
+  auto* thread = kc->thread;
   {
     // Code segment as a flat user CS (same setup FEX's CodeSizeValidation uses).
-    static Core::CPUState::gdt_segment gdt[32] {};
+    auto* gdt = kc->gdt;
     auto& state = thread->CurrentFrame->State;
     state.segment_arrays[Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] = &gdt[0];
     state.segment_arrays[Core::CPUState::SEGMENT_ARRAY_INDEX_LDT] = &gdt[0];
@@ -438,7 +479,7 @@ int main(int argc, char** argv) {
     j.arr("diagnostics"); for (auto& d : Diagnostics) { j.sep(); j.s += '"' + Json::esc(d) + '"'; } j.end_arr();
     j.end_obj();
     std::string o = j.s + "\n";
-    if (out.empty()) fwrite(o.data(), 1, o.size(), stdout); else std::ofstream(out) << o;
+    if (rep) rep->json = o; else if (out.empty()) fwrite(o.data(), 1, o.size(), stdout); else std::ofstream(out) << o;
     return 1;
   }
 
@@ -679,11 +720,11 @@ int main(int argc, char** argv) {
   j.end_obj();
 
   std::string o = j.s + "\n";
-  if (out.empty()) fwrite(o.data(), 1, o.size(), stdout); else std::ofstream(out) << o;
+  if (rep) rep->json = o; else if (out.empty()) fwrite(o.data(), 1, o.size(), stdout); else std::ofstream(out) << o;
 
   // Binary object (crates/abi/src/code_object.rs): header, code with zeroed relocation slots, then the tables.
   // Only for a successful compile (status ok): nothing is written for a block without translated instructions.
-  if (!object.empty() && layout_ok && !Cap.prologues.empty() && Cap.info.TotalInstructions) {
+  if ((rep || !object.empty()) && layout_ok && !Cap.prologues.empty() && Cap.info.TotalInstructions) {
     std::vector<uint8_t> f(128, 0);
     auto put = [&](size_t at, uint64_t v, int n) { for (int i = 0; i < n; ++i) f[at + i] = uint8_t(v >> (8 * i)); };
     auto pad = [&](size_t a) { while (f.size() % a) f.push_back(0); };
@@ -734,10 +775,68 @@ int main(int argc, char** argv) {
     put(112, fbits, 8); f[120] = uint8_t(table.size()); f[121] = uint8_t(st.dcache_line_log2);
     put(124, slice1 ? uint32_t(offsetof(Core::CpuStateFrame, State.flags) + X86State::RFLAG_NZCV_LOC) : 0xFFFFFFFFu, 4);   // = JSON natemu_pre_nzcv
     put(16, f.size(), 4);
-    std::ofstream(object, std::ios::binary).write(reinterpret_cast<const char*>(f.data()), std::streamsize(f.size()));
+    if (rep) rep->object = f; else std::ofstream(object, std::ios::binary).write(reinterpret_cast<const char*>(f.data()), std::streamsize(f.size()));
   }
-  if (!Cap.info.TotalInstructions) { fflush(nullptr); _exit(1); }
+  return Cap.info.TotalInstructions ? 0 : 1;
+}
+
+// ---------------------------------------------------------------- --serve
+// Framing, all integers little-endian u32. Request: len, then payload = args_len, args (NUL-terminated strings, the CLI's
+// arguments without --hex/--file/--out/--object), then the guest bytes. Reply: len, then payload = code (i32, the CLI's exit
+// code: 0 object, 1 no code (json = report), >=2 error (json = message)), json_len, object_len, json, object.
+// EOF on stdin ends the server. One request at a time, in order.
+static bool ReadAll(int fd, void* p, size_t n) {
+  for (auto* c = static_cast<char*>(p); n;) { ssize_t r = read(fd, c, n); if (r <= 0) return false; c += r; n -= size_t(r); }
+  return true;
+}
+static void WriteAll(int fd, const void* p, size_t n) {
+  for (auto* c = static_cast<const char*>(p); n;) { ssize_t r = write(fd, c, n); if (r <= 0) _exit(3); c += r; n -= size_t(r); }
+}
+static void SendReply(const Reply& r) {
+  std::vector<uint8_t> f(16);
+  auto put = [&](size_t at, uint32_t v) { for (int i = 0; i < 4; ++i) f[at + i] = uint8_t(v >> (8 * i)); };
+  put(4, uint32_t(r.code)); put(8, uint32_t(r.json.size())); put(12, uint32_t(r.object.size()));
+  f.insert(f.end(), r.json.begin(), r.json.end());
+  f.insert(f.end(), r.object.begin(), r.object.end());
+  put(0, uint32_t(f.size() - 4));
+  WriteAll(1, f.data(), f.size());
+}
+static void Compile(const std::vector<std::string>& args, const std::vector<uint8_t>& bytes, Reply& r) {
+  r.code = CompileRequest(args, &bytes, &r);
+}
+// mode "fork": a child process per request (fresh state, no leak, a crash costs one request); "fresh": a new FEX context per
+// request in this process; "reuse": diagnostic, see CompileRequest.
+static int Serve(const std::string& mode) {
+  ReuseContexts = mode == "reuse";
+  for (;;) {
+    uint32_t len;
+    if (!ReadAll(0, &len, 4)) return 0;
+    std::vector<uint8_t> req(len);
+    if (!ReadAll(0, req.data(), len) || len < 4) return 3;
+    uint32_t alen = req[0] | req[1] << 8 | req[2] << 16 | uint32_t(req[3]) << 24;
+    if (alen > len - 4 || (alen && req[3 + alen]) ) return 3;   // the arguments end with a NUL
+    std::vector<std::string> args {"fexc"};
+    for (size_t i = 4; i < 4 + alen; i += args.back().size() + 1) args.push_back(reinterpret_cast<const char*>(&req[i]));
+    std::vector<uint8_t> bytes(req.begin() + 4 + alen, req.end());
+    Reply r;
+    if (mode == "fork") {
+      pid_t pid = fork();
+      if (pid == 0) { Compile(args, bytes, r); SendReply(r); _exit(0); }
+      int status = 0;
+      waitpid(pid, &status, 0);
+      if (!WIFEXITED(status) || WEXITSTATUS(status)) { r = {}; r.code = 4; r.json = "fexc child died, status " + std::to_string(status); SendReply(r); }
+    } else { Compile(args, bytes, r); SendReply(r); }
+  }
+}
+
+int main(int argc, char** argv) {
+  if (argc >= 2 && std::string(argv[1]) == "--serve") {
+    std::string mode = argc >= 4 && std::string(argv[2]) == "--serve-mode" ? argv[3] : "fork";
+    if (mode != "fork" && mode != "fresh" && mode != "reuse") return Fail("--serve-mode fork|fresh|reuse");
+    return Serve(mode);   // stdin EOF; contexts are never torn down (see Ctx), so leave without destructors
+  }
+  int code = CompileRequest(std::vector<std::string>(argv, argv + argc), nullptr, nullptr);
   // Do not tear the context down: FEX's destructors assume a running emulator thread.
   fflush(nullptr);
-  _exit(0);
+  _exit(code);
 }
