@@ -18,6 +18,11 @@ inline bool GuestMemOp(FEXCore::IR::IROps Op) {
   default: return false;
   }
 }
+// Ops at which a slice1 guest fault is raised with the state before the instruction: guest memory accesses, and (S1f) the
+// divide ops, right before which the #DE check branches to its stub. The incoming flags must be live there.
+inline bool FaultPoint(FEXCore::IR::IROps Op) {
+  return GuestMemOp(Op) || Op == FEXCore::IR::OP_DIV || Op == FEXCore::IR::OP_UDIV;
+}
 // Frame slot of the instruction's incoming NZCV (patch 5): FEX's own home for guest NZCV outside the JIT,
 // CPUState.flags[RFLAG_NZCV_LOC] (32 bits, the PSTATE bit layout; see Core.cpp::ReconstructCompactedEFLAGS).
 inline constexpr uint32_t PreNzcvOffset =

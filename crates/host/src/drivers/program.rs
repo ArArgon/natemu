@@ -233,14 +233,16 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
 }
 
 /// The FEX frame holds nothing but its admitted fields (guest code cannot have written
-/// private memory there), and the exit gate pointer still points into the resident.
+/// private memory there), and its native pointers (exit gate, division helpers) still point into the resident.
 fn frame_intact(memory: &Memory) -> bool {
     let frame: [u8; exec::frame::BYTES] = memory.read_record(exec::FRAME_OFFSET);
     let admitted = |i: usize| exec::frame::FIELDS.iter().any(|&(at, len)| (at as usize..(at + len) as usize).contains(&i));
-    let gate = u64::from_le_bytes(frame[exec::frame::DISPATCHER_LOOP_TOP as usize..][..8].try_into().unwrap());
     let text = |offset: usize| PRIVATE + offset as u64;
-    let gate_in_text = (text(natemu_abi::resident::TEXT_OFFSET)..text(natemu_abi::resident::TEXT_END)).contains(&gate);
-    frame.iter().enumerate().all(|(i, &b)| b == 0 || admitted(i)) && gate_in_text
+    let in_text = |at: u32| {
+        let pointer = u64::from_le_bytes(frame[at as usize..][..8].try_into().unwrap());
+        (text(natemu_abi::resident::TEXT_OFFSET)..text(natemu_abi::resident::TEXT_END)).contains(&pointer)
+    };
+    frame.iter().enumerate().all(|(i, &b)| b == 0 || admitted(i)) && exec::frame::POINTERS.into_iter().all(in_text)
 }
 
 #[cfg(test)]

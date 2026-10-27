@@ -210,7 +210,7 @@ void JoinSites(uint64_t rip) {
     }
   }
 }
-const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other"};
+const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other", "divide"};
 const char* const ExtendName[] = {"none", "uxtw", "sxtw", "sxtx"};
 const char* const RmwName[] = {"none", "load", "store"};
 const char* const OrderingName[] = {"plain", "acquire", "release"};

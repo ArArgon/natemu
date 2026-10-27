@@ -2,6 +2,7 @@
 //! host-admitted block, enter it from the state bank, take its exit through the
 //! dispatcher gate back into the bank, and serve shadow misses at its recorded
 //! access sites by walking the guest tables and retrying the same instruction.
+//! Also the 128/64 division helpers admitted code calls through the frame.
 use super::*;
 use natemu_abi::{
     code_object::{self as object, Header, Site},
@@ -15,7 +16,91 @@ unsafe extern "C" {
     fn enter_allocated(frame: *const NativeFrame, pc: u64, spsr: u64) -> !;
     fn resume_exception(frame: *const NativeFrame, pc: u64, spsr: u64) -> !;
     fn returned_allocated();
+    fn natemu_ludiv();
+    fn natemu_ldiv();
 }
+
+// FEX's LUDIV/LDIV handler ABI (JIT/ALUOps.cpp: a 64-bit div/idiv whose dividend needs 128 bits calls
+// `Pointers.LUDIVHandler/LDIVHandler` with `str lr, [sp, #-16]!; blr x3`): x0 = dividend high, x1 = low, x2 = divisor;
+// returns x0 = quotient, x1 = remainder. natemu adds x2 = 0, or 1 for #DE (zero divisor, or a quotient that does
+// not fit 64 bits; x0/x1 are then meaningless), which the code tests before writing any guest register. Only x0-x3
+// change: NZCV and every other register are preserved, and nothing but the native stack below sp is touched
+// (`HELPER_STACK_BYTES` with FEX's lr push). Unsigned division of |high:low| by |divisor| after the
+// `high < divisor` check (which also rejects a zero divisor), one quotient bit per step; the signed helper divides
+// magnitudes, checks the quotient against 2^63 - 1 (2^63 when negative) and applies the signs (remainder: the
+// dividend's).
+// ponytail: 64 iterations (about 600 instructions) on this rare path; a normalised udiv-based 128/64 (Knuth D) if it matters.
+global_asm!(
+    ".pushsection .text.natemu_div, \"ax\"",
+    ".balign 4",
+    ".global natemu_ludiv",
+    ".global natemu_ldiv",
+    "natemu_ludiv:",
+    "stp x4, x5, [sp, #-48]!",
+    "stp x6, x7, [sp, #16]",
+    "mrs x4, nzcv",
+    "str x4, [sp, #32]",
+    "mov x5, #0", // quotient sign mask
+    "mov x6, #0", // remainder sign mask
+    "mov x7, #0", // signed
+    "b 2f",
+    "natemu_ldiv:",
+    "stp x4, x5, [sp, #-48]!",
+    "stp x6, x7, [sp, #16]",
+    "mrs x4, nzcv",
+    "str x4, [sp, #32]",
+    "mov x7, #1",
+    "asr x6, x0, #63",
+    "asr x5, x2, #63",
+    "eor x5, x5, x6",
+    // |high:low| = (v ^ m) - m over 128 bits, m = the dividend's sign mask
+    "eor x0, x0, x6",
+    "eor x1, x1, x6",
+    "subs x1, x1, x6",
+    "sbc x0, x0, x6",
+    "asr x4, x2, #63",
+    "eor x2, x2, x4",
+    "sub x2, x2, x4",
+    "2:",
+    "cmp x0, x2",
+    "b.hs 8f",
+    "mov x3, #64",
+    "3:",
+    "lsr x4, x0, #63",       // the bit shifted out of the partial remainder
+    "extr x0, x0, x1, #63",  // remainder:dividend <<= 1
+    "lsl x1, x1, #1",
+    "cmp x0, x2",
+    "ccmp x4, #1, #2, lo",   // C: remainder (65 bits) >= divisor
+    "csel x4, x2, xzr, hs",
+    "sub x0, x0, x4",
+    "cinc x1, x1, hs",       // the quotient bit
+    "subs x3, x3, #1",
+    "b.ne 3b",
+    "cbz x7, 6f",
+    "mov x4, #0x7fffffffffffffff",
+    "sub x4, x4, x5",
+    "cmp x1, x4",
+    "b.hi 8f",
+    "6:",
+    "eor x1, x1, x5",
+    "sub x1, x1, x5",
+    "eor x0, x0, x6",
+    "sub x0, x0, x6",
+    "mov x2, x0",
+    "mov x0, x1",
+    "mov x1, x2",
+    "mov x2, #0",
+    "b 9f",
+    "8:",
+    "mov x2, #1",
+    "9:",
+    "ldr x4, [sp, #32]",
+    "msr nzcv, x4",
+    "ldp x6, x7, [sp, #16]",
+    "ldp x4, x5, [sp], #48",
+    "ret",
+    ".popsection",
+);
 
 /// Guest-physical RAM through the resident's alias.
 const RAM: GuestRam = unsafe { GuestRam::new(0, GUEST_RAM_BYTES as u64, GUEST_RAM_VA) };
@@ -86,6 +171,8 @@ unsafe fn next(mut s: State) -> ! {
         copy_record(SLOT_WRITE_VA as *mut u8, (STAGING_VA + h.code_offset as u64) as *const u8, code);
         synchronize_code(code);
         frame_word(frame::DISPATCHER_LOOP_TOP).write_volatile(returned_allocated as *const () as u64);
+        frame_word(frame::LUDIV_HANDLER).write_volatile(natemu_ludiv as *const () as u64);
+        frame_word(frame::LDIV_HANDLER).write_volatile(natemu_ldiv as *const () as u64);
         frame_word(frame::RIP).write_volatile(0);
 
         let reg = |i: usize| h.sra_gpr[i] as usize;
@@ -236,16 +323,22 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             halt(s, stop::SITE_MISMATCH)
         }
         match site.kind {
-            object::kind::GUARD | object::kind::SPLIT => {
-                // BRK from AArch64 with the stub's immediate (1 guard, 2 split).
-                let imm = if site.kind == object::kind::GUARD { 1 } else { 2 };
+            object::kind::GUARD | object::kind::SPLIT | object::kind::DIVIDE => {
+                // BRK from AArch64 with the stub's immediate (1 guard, 2 split, 3 divide).
+                let imm = match site.kind {
+                    object::kind::GUARD => 1,
+                    object::kind::SPLIT => 2,
+                    _ => 3,
+                };
                 if esr >> 26 != 0x3c || esr & 0xffff != imm {
                     halt(s, stop::SITE_MISMATCH)
                 }
-                if site.kind == object::kind::GUARD {
-                    guest_fault(s, f, &h, &site, noncanonical(&site))
+                match site.kind {
+                    object::kind::GUARD => guest_fault(s, f, &h, &site, noncanonical(&site)),
+                    // #DE: no error code.
+                    object::kind::DIVIDE => guest_fault(s, f, &h, &site, [0, 0, 0]),
+                    _ => split(s, f, &h, all, &site, spsr),
                 }
-                split(s, f, &h, all, &site, spsr)
             }
             _ => access_aborted(s, f, &h, &site, [esr, far, elr, spsr]),
         }

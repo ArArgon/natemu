@@ -251,7 +251,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
 // ---------------------------------------------------------------------------------------------
 namespace {
 constexpr bool FexcCanonical(uint64_t A) { return uint64_t(int64_t(A << 16) >> 16) == A; }
-constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2;   // brk immediates (diagnostic; the runtime keys on the PC)
+constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3;   // brk immediates (the runtime keys on the PC)
 } // namespace
 
 // A new guard/split site for the current guest instruction, recorded like an access site at this point (width, intent,
@@ -269,7 +269,7 @@ ARMEmitter::ForwardLabel* Arm64JITCore::FexcStub(uint8_t Kind, bool Link) {
   S.completed_effects = !FexcStoreSeen && (!FexcNzcvWritten || FexcNzcvSaved) ? 0 : 1;
   S.located = 1;
   S.access_native_offset = FEXC_NONE32;
-  S.ir_op = Kind == FEXC_SITE_SPLIT ? "split" : "guard";
+  S.ir_op = Kind == FEXC_SITE_SPLIT ? "split" : Kind == FEXC_SITE_DIVIDE ? "divide" : "guard";
   const size_t Index = fexc_sites.size();
   fexc_sites.push_back(S);
   if (Link) FexcPendingLink.push_back(Index);
@@ -322,6 +322,7 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
     break;
   }
   case IROps::OP_POP: { const auto Op = IROp->C<IR::IROp_Pop>(); Addr = &Op->InoutAddr; W = IR::OpSizeToSize(Op->Size); break; }
+  case IROps::OP_UDIV: case IROps::OP_DIV: FexcDivCheck(IROp); return;
   default: return;
   }
   bool Index = false;
@@ -387,6 +388,76 @@ void Arm64JITCore::FexcEmitStubs() {
   for (auto& [Index, Label] : FexcStubs) {
     BindOrRestart(&Label);
     fexc_sites[Index].native_offset = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
-    brk(fexc_sites[Index].kind == FEXC_SITE_SPLIT ? FexcBrkSplit : FexcBrkGuard);
+    const uint8_t K = fexc_sites[Index].kind;
+    brk(K == FEXC_SITE_SPLIT ? FexcBrkSplit : K == FEXC_SITE_DIVIDE ? FexcBrkDivide : FexcBrkGuard);
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Profile slice1: #DE for div/idiv (contract S1f). FEX raises none (Arm udiv/sdiv return 0 for a zero divisor and wrap on
+// overflow). Right before the divide op, which is the first op of the instruction to write anything but temporaries, a
+// flag-free check on FEX's own operand registers of the op branches to a `brk #3` divide stub (one stub per branch), so
+// the state at the stub is the state before the instruction, its memory divisor already loaded (a #PF there comes first,
+// as on x86). Only x0/x1 are written. W is the x86 width the dispatcher recorded (FEX widens the 8-bit forms).
+//   DIV  W<64  #DE iff high >= divisor (a zero divisor included), high = AH | DX | EDX:
+//              {ubfx x0, lo, #8, #8 | uxth w0, wHi | mov w0, wHi}; sub x0, x0, wD, uxt{b,h,w}; tbz x0, #63, stub
+//   DIV  64    cbz xD, stub; a nonzero RDX takes FEX's LUDIV helper, which reports high >= divisor (FexcDivAfterCall)
+//   IDIV W<64  sxt{b,h,w} x1, wD; cbz x1, stub; x0 = dividend (sign-correct in 32 or 64 bits); sdiv x0, x0, x1;
+//              sub x0, x0, w0, sxt{b,h,w}; cbnz x0, stub     (the quotient does not fit W bits; -2^63 / -1 included)
+//   IDIV 64    cbz xD, stub; RDX:RAX = -2^63 with divisor -1 (FEX's inline path, whose sdiv would wrap):
+//              eor x0, xLo, #1<<63; add x1, xHi, #1; orr x0, x0, x1; add x1, xD, #1; orr x0, x0, x1; cbz x0, stub;
+//              a dividend that needs 128 bits takes FEX's LDIV helper, which reports any other overflow.
+// ---------------------------------------------------------------------------------------------
+void Arm64JITCore::FexcDivCheck(const IR::IROp_Header* IROp) {
+  using ARMEmitter::ExtendedType;
+  using Sz = ARMEmitter::Size;
+  const auto it = fexc_div_width.find(Entry + FexcGuest);
+  if (it == fexc_div_width.end()) ERROR_AND_DIE_FMT("fexc slice1: a divide op outside a guest div/idiv");
+  const bool Signed = IROp->Op == IR::IROps::OP_DIV;
+  IR::OrderedNodeWrapper Lower, Upper, Divisor;
+  if (Signed) { const auto Op = IROp->C<IR::IROp_Div>(); Lower = Op->Lower; Upper = Op->Upper; Divisor = Op->Divisor; }
+  else { const auto Op = IROp->C<IR::IROp_UDiv>(); Lower = Op->Lower; Upper = Op->Upper; Divisor = Op->Divisor; }
+  const unsigned W = 8 * it->second;
+  if ((W == 8) != Upper.IsInvalid()) ERROR_AND_DIE_FMT("fexc slice1: unexpected divide form for a {}-bit div/idiv", W);
+  const auto L = GetReg(Lower), D = GetReg(Divisor);
+  const auto H = W == 8 ? L : GetReg(Upper);
+  auto Stub = [&] { return FexcStub(FEXC_SITE_DIVIDE, false); };
+  const ExtendedType Uxt = W == 8 ? ExtendedType::UXTB : W == 16 ? ExtendedType::UXTH : ExtendedType::UXTW;
+  const ExtendedType Sxt = W == 8 ? ExtendedType::SXTB : W == 16 ? ExtendedType::SXTH : ExtendedType::SXTW;
+  if (W == 64) {
+    cbz_OrRestart(Sz::i64Bit, D.X(), Stub());
+    if (!Signed) return;
+    eor(Sz::i64Bit, TMP1, L.X(), uint64_t(1) << 63);
+    add(Sz::i64Bit, TMP2, H.X(), 1);
+    orr(Sz::i64Bit, TMP1, TMP1, TMP2);
+    add(Sz::i64Bit, TMP2, D.X(), 1);
+    orr(Sz::i64Bit, TMP1, TMP1, TMP2);
+    cbz_OrRestart(Sz::i64Bit, TMP1, Stub());
+  } else if (!Signed) {
+    if (W == 8) ubfx(Sz::i64Bit, TMP1, L.X(), 8, 8);
+    else if (W == 16) uxth(Sz::i32Bit, TMP1, H);
+    else mov(Sz::i32Bit, TMP1, H);
+    sub(Sz::i64Bit, TMP1, TMP1, D, Uxt);
+    tbz_OrRestart(TMP1, 63, Stub());
+  } else {
+    const Sz S = W == 32 ? Sz::i64Bit : Sz::i32Bit;   // the dividend: 16 bits (W = 8), 32 (16) or 64 (32)
+    if (W == 8) sxtb(Sz::i32Bit, TMP2, D);
+    else if (W == 16) sxth(Sz::i32Bit, TMP2, D);
+    else sxtw(TMP2, D.W());
+    cbz_OrRestart(S, TMP2, Stub());
+    if (W == 8) sxth(Sz::i32Bit, TMP1, L);
+    else if (W == 16) { uxth(Sz::i32Bit, TMP1, L); bfi(Sz::i32Bit, TMP1, H, 16, 16); }
+    else { mov(Sz::i32Bit, TMP1, L); bfi(Sz::i64Bit, TMP1, H, 32, 32); }
+    sdiv(S, TMP1, TMP1, TMP2);
+    sub(S, TMP1, TMP1, TMP1, Sxt);
+    cbnz_OrRestart(S, TMP1, Stub());
+  }
+}
+
+// After FEX's call to its LUDIV/LDIV helper (64-bit div/idiv with a dividend that needs 128 bits): the resident helper
+// returns x2 != 0 for #DE (quotient does not fit 64 bits, or a zero divisor). It changes only x0-x3 and leaves NZCV
+// and every other register as they were, and FEX's call sequence restores lr and sp, so the state at the stub is still
+// the state before the instruction (no write to the destination registers has happened yet).
+void Arm64JITCore::FexcDivAfterCall() {
+  cbnz_OrRestart(ARMEmitter::Size::i64Bit, TMP3, FexcStub(FEXC_SITE_DIVIDE, false));
 }

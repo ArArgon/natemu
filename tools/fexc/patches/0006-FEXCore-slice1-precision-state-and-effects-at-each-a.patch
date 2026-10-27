@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: natemu <natemu@example.invalid>
 Date: Tue, 27 Oct 2026 00:00:00 +0000
-Subject: [PATCH 6/7] FEXCore: slice1 precision (state and effects at each
+Subject: [PATCH 6/8] FEXCore: slice1 precision (state and effects at each
  access site)
 
 Every change is guarded by fexc_slice1; predicates live in

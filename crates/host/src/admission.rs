@@ -2,7 +2,7 @@
 //! mode, before anything reaches the VM: header, profile, sizes and offsets,
 //! feature profile against the vCPU's ID registers, sorted in-body access sites
 //! of supported kinds, guest-RIP relocations of the requested RIP, and every
-//! x28 (FEX frame) access within the admitted fields. Literal slots are
+//! x28 (FEX frame) access within the admitted fields (native pointers load-only). Literal slots are
 //! resolved here; the resident fills the frame's native pointers itself.
 use natemu_abi::code_object::{self as object, Header, PcEntry, Reloc, Site};
 use natemu_abi::execution::{BLOCK_STACK_BYTES, ENTRY_OFFSET, SLOT_BYTES, STAGING_BYTES, frame};
@@ -262,7 +262,7 @@ fn site_fields_valid(s: &Site, h: &Header, region: u32) -> bool {
         && s.insn_native_offset <= s.native_offset
         && s.guest_offset < h.guest_bytes
         && s.segment <= object::SEG_SS
-        && (register(s.base_reg) || s.base_reg == 31)
+        && (register(s.base_reg) || s.base_reg == 31 || (s.kind == object::kind::DIVIDE && s.base_reg == object::NO_REG))
         && (register(s.index_reg) || s.index_reg == object::NO_REG)
         && s.extend <= object::EXT_SXTX
         && s.shift <= 4
@@ -274,11 +274,15 @@ fn site_fields_valid(s: &Site, h: &Header, region: u32) -> bool {
 }
 
 fn is_stub(s: &Site) -> bool {
-    matches!(s.kind, object::kind::GUARD | object::kind::SPLIT)
+    matches!(s.kind, object::kind::GUARD | object::kind::SPLIT | object::kind::DIVIDE)
 }
-/// `brk #1` (guard) or `brk #2` (split).
-fn stub_word(kind: u8) -> u32 {
-    let imm = if kind == object::kind::GUARD { 1 } else { 2 };
+/// `brk #1` (guard), `brk #2` (split) or `brk #3` (divide).
+pub(crate) fn stub_word(kind: u8) -> u32 {
+    let imm = match kind {
+        object::kind::GUARD => 1,
+        object::kind::SPLIT => 2,
+        _ => 3,
+    };
     0xd420_0000 | imm << 5
 }
 /// A stub's record against the access site it covers (`None`: no site at `guest_offset2`). At a stub the guest
@@ -286,9 +290,15 @@ fn stub_word(kind: u8) -> u32 {
 /// its address is `base_reg + imm` without index or writeback. A split covers a store wider than one byte whose data
 /// registers survive the check (x0/x1 are the check's scratch). A guard without an access is a branch-target guard:
 /// the target is in `base_reg`. The address register at a stub is neither x0 (the check's scratch, overwritten by it)
-/// nor sp (the checks cannot name it).
+/// nor sp (the checks cannot name it). A divide stub (#DE) has no access and no address.
 fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
     use object::kind::*;
+    if s.kind == DIVIDE {
+        return access.is_none()
+            && s.guest_offset2 == object::NONE32
+            && (s.base_reg, s.index_reg, s.imm, s.writeback) == (object::NO_REG, object::NO_REG, 0, object::WB_NONE)
+            && (s.width, s.intent, s.rmw, s.segment) == (0, object::INTENT_READ, object::RMW_NONE, object::SEG_DS);
+    }
     let address_only = s.index_reg == object::NO_REG && s.writeback == object::WB_NONE && !matches!(s.base_reg, 0 | 31);
     match access {
         None => {
@@ -313,7 +323,8 @@ fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
 }
 
 /// Every load/store with base x28 in `code[from..]` (literal slots skipped) must be
-/// an unsigned-offset integer access inside one admitted FEX frame field.
+/// an unsigned-offset integer access inside one admitted FEX frame field, and only
+/// a load of a native pointer the resident fills.
 fn check_frame_accesses(code: &[u8], from: usize, literals: &[std::ops::Range<usize>]) -> Result<(), String> {
     for at in (from..code.len()).step_by(4) {
         if literals.iter().any(|l| l.contains(&at)) {
@@ -329,9 +340,11 @@ fn check_frame_accesses(code: &[u8], from: usize, literals: &[std::ops::Range<us
         let size = w >> 30;
         let offset = ((w >> 10) & 0xfff) << size;
         let bytes = 1 << size;
+        let load = (w >> 22) & 3 == 1;
         let admitted = (w >> 24) & 0x3f == 0x39
             && (w >> 22) & 3 <= 1
-            && frame::FIELDS.iter().any(|&(field, len)| offset >= field && offset + bytes <= field + len);
+            && frame::FIELDS.iter().any(|&(field, len)| offset >= field && offset + bytes <= field + len)
+            && (load || !frame::POINTERS.iter().any(|&p| offset < p + 8 && p < offset + bytes));
         if !admitted {
             return Err(format!("object refused: frame access {w:#010x} at native offset {at:#x}"));
         }
@@ -588,6 +601,34 @@ mod tests {
         // Stubs follow every access site.
         let early = with(object_with(&[Site { native_offset: 8, kind: GUARD, guest_offset2: 12, ..load_site(8) }, load_site(12)]), 128 + 8, |w: &mut u32| *w = BRK1);
         assert!(admit(&early, RIP, &SOURCE, ALL).is_err());
+    }
+
+    #[test]
+    fn divide_stubs_have_no_access_or_address() {
+        use object::kind::*;
+        let divide = Site { kind: DIVIDE, guest_offset2: object::NONE32, base_reg: object::NO_REG, width: 0, ..stub(DIVIDE, 0) };
+        let brk3 = stub_word(DIVIDE);
+        assert_eq!(brk3, 0xd420_0060);
+        assert!(admit(&with_stub(divide, brk3), RIP, &SOURCE, ALL).is_ok());
+        assert!(admit(&with_stub(divide, BRK1), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&with_stub(Site { guest_offset2: 8, ..divide }, brk3), RIP, &SOURCE, ALL).is_err()); // names an access
+        assert!(admit(&with_stub(Site { base_reg: 4, ..divide }, brk3), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&with_stub(Site { width: 8, ..divide }, brk3), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&with_stub(Site { segment: object::SEG_SS, ..divide }, brk3), RIP, &SOURCE, ALL).is_err());
+        // The base register may be NO_REG only for a divide stub.
+        assert!(admit(&with_stub(Site { base_reg: object::NO_REG, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
+    }
+
+    #[test]
+    fn division_helper_pointers_are_load_only() {
+        // ldr x3,[x28,#3024] (LUDIVHandler) and ldr x3,[x28,#3032] (LDIVHandler) are admitted.
+        for word in [0xf945_eb83u32, 0xf945_ef83] {
+            assert!(admit(&with(object(), 128 + 16, |w: &mut u32| *w = word), RIP, &SOURCE, ALL).is_ok(), "{word:#x}");
+        }
+        // str x3,[x28,#3024], str x1,[x28,#2920]: a native pointer is never written by code.
+        for word in [0xf905_eb83u32, 0xf905_b781] {
+            assert!(admit(&with(object(), 128 + 16, |w: &mut u32| *w = word), RIP, &SOURCE, ALL).is_err(), "{word:#x}");
+        }
     }
 
     #[test]

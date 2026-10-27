@@ -1,6 +1,6 @@
 """S1c checks: profile slice1 of fexc (block cutting at an allowlist, single-gate exits, profile record).
 
-Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series4 build)
+Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series5 build)
 
 The x86 bytes below are assembled by hand and only drive the compiler; every expectation (where the block ends, why)
 comes from the instruction's architectural class, never from fexc's output. The cut position is also compared with a
@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402  (disassemble, object reader)
 import scan_skips  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series4/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series5/obj/fexc')
 REPO = HERE.parents[1]
 RIP = 0x102000
 PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
@@ -46,7 +46,6 @@ SYSTEM = {
 
 # name -> hex. Decodable instructions that are not slice-1 forms, and admitted opcodes with an excluded prefix or operand.
 UNSUPPORTED = {
-    'div r8': 'f6f1', 'div rcx': '48f7f1', 'idiv [rcx]': '48f739', 'idiv r15d': '41f7ff', 'div byte [rax]': 'f630',
     'xchg [rax],ecx': '8708', 'xchg [rax],rcx': '488708', 'xchg [rax],cl': '8608',
     'lock add [rax],rcx': 'f0480108', 'lock inc [rax]': 'f0ff00', 'cmpxchg [rax],ecx': '0fb108', 'xadd [rax],ecx': '0fc108',
     'rep movsb': 'f3a4', 'movsb': 'a4', 'stosq': '48ab', 'scasb': 'ae', 'cmpsb': 'a6', 'lodsb': 'ac',
@@ -79,6 +78,7 @@ ALLOWED = {
     'lea rax,[rax+rcx*2+5]': '488d440805', 'lea rax,[rip+0]': '488d0500000000', 'sete al': '0f94c0', 'setl [rax]': '0f9c00',
     'cmove rax,rcx': '480f44c1', 'cmovg eax,[rax]': '0f4f00', 'bswap rax': '480fc8', 'bswap r9d': '410fc9', 'bsf rax,rcx': '480fbcc1',
     'bsr eax,[rax]': '0fbd00', 'bt rax,rcx': '480fa3c8', 'bts [rax],rcx': '480fab08', 'btr rax,5': '480fbaf005', 'btc [rax],5': '480fba3805',
+    'div cl': 'f6f1', 'div rcx': '48f7f1', 'idiv [rcx]': '48f739', 'idiv r15d': '41f7ff', 'div byte [rax]': 'f630', 'idiv bx': '66f7fb',
     'cbw': '6698', 'cwde': '98', 'cdqe': '4898', 'cwd': '6699', 'cdq': '99', 'cqo': '4899', 'push rax': '50', 'push r9': '4151',
     'endbr64': 'f30f1efa', 'rcl rax,cl': '48d3d0', 'rcr eax,1': 'd1d8', 'rcl al,5': 'c0d005', 'pop rbx': '5b', 'push imm8': '6a01', 'push imm32': '6800010000', 'push [rax]': 'ff30', 'pop [rax]': '8f00', 'push ax': '6650',
 }
@@ -259,20 +259,23 @@ class Slice1Cutting(unittest.TestCase):
 
     def test_default_profile_does_not_cut(self):
         # the same system instructions translate (or fail) as before in the default profile: no cut is ever reported
-        for x in (SYSTEM['mov cr3,rax'], SYSTEM['cli'], UNSUPPORTED['div rcx'], UNSUPPORTED['xchg [rax],rcx']):
+        for x in (SYSTEM['mov cr3,rax'], SYSTEM['cli'], UNSUPPORTED['xchg [rax],rcx']):
             d, rc = run(PRE + x + PRE, profile=None)
             self.assertNotIn(d['guest']['end']['reason'], ('system_instruction', 'unsupported_form'))
             self.assertNotIn('cut_opcode', d['guest']['end'])
 
 
-# `ldr xA, [x28, #dlt]; br xA` must be the only way out, fed by `str xR, [x28, #rip]`.
+# `ldr xA, [x28, #dlt]; br xA` must be the only way out, fed by `str xR, [x28, #rip]`. The only call is FEX's call of the
+# resident 128/64 division helper of a 64-bit div/idiv (verify_precision.py P11 checks its #DE branch).
+HELPERS = {'LUDIVHandler', 'LDIVHandler'}
 def check_exits(test, d, tmp, what):
     off = d['state_abi']['state_offsets']
     rip_off, dlt_off = off['rip'], off['dispatcher_loop_top']
     # exit RIP literals, plus guest-RIP constants materialised for RIP-relative addresses; nothing host-specific
     test.assertEqual({r['kind'] for r in d['code']['relocations']} - {'guest_rip_literal', 'guest_rip_move'}, set(), what)
     test.assertFalse([r for r in d['code']['relocations'] if r['kind'] == 'named_symbol_literal'], what)
-    test.assertEqual({p['pointer'] for p in d['state_abi']['state_pointer_loads']} - {'DispatcherLoopTop'}, set(), what)
+    test.assertEqual({p['pointer'] for p in d['state_abi']['state_pointer_loads']} - {'DispatcherLoopTop'} - HELPERS, set(), what)
+    helpers = {p['state_offset'] for p in d['state_abi']['state_pointer_loads'] if p['pointer'] in HELPERS}
     test.assertIsNone(d['code']['layout']['end_marker_offset'], what)
     code = bytes.fromhex(d['code']['hex'])
     end = d['code']['layout']['code_region_end']
@@ -288,14 +291,19 @@ def check_exits(test, d, tmp, what):
         test.assertEqual(lines[i - 1][1], f'ldr {reg.group(1)}, [x28, #{hex(dlt_off)}]', (what, o))
         test.assertRegex(lines[i - 2][1], rf'^str x\d+, \[x28, #{hex(rip_off)}\]$', (what, o))
     # no other control transfer through registers or calls, and no use of the call-return stack register
-    for o, t in lines:
+    for i, (o, t) in enumerate(lines):
+        if t == 'blr x3':
+            test.assertRegex(lines[i - 2][1], r'^ldr x3, \[x28, #0x[0-9a-f]+\]$', (what, o))
+            test.assertEqual(lines[i - 1][1], 'str x30, [sp, #-0x10]!', (what, o))
+            test.assertEqual(lines[i + 1][1], 'ldr x30, [sp], #0x10', (what, o))
+            continue
         test.assertIsNone(re.match(r'(blr|ret|bl)\s', t), (what, o, t))
         test.assertIsNone(re.search(r'\bx25\b', t), (what, o, t))
-    # every ldr from the frame in the code reads DispatcherLoopTop (a literal pool load has no x28 base)
+    # every ldr from the frame in the code reads DispatcherLoopTop or a division helper (a literal pool load has no x28 base)
     for o, t in lines:
         m = re.match(r'ldr\s+x\d+, \[x28, #(0x[0-9a-f]+)\]', t)
         if m:
-            test.assertEqual(int(m.group(1), 16), dlt_off, (what, o, t))
+            test.assertIn(int(m.group(1), 16), {dlt_off} | helpers, (what, o, t))
     return len(brs), '\n'.join(f'{o:4x}: {t}' for o, t in lines)
 
 
@@ -348,8 +356,8 @@ class Slice1Exits(unittest.TestCase):
                     check_exits(self, d, tmp, p['name'])
                     for s in d['sites']:
                         self.assertEqual(s['ordering'], 'plain', p['name'])   # hardware TSO: no ldar/stlr
-        print(f'\nfixtures: {full} translate completely, {cut} end at div/idiv or memory xchg (unsupported_form)')
-        self.assertEqual(full + cut, 64)
+        print(f'\nfixtures: {full} translate completely, {cut} end at a memory xchg (unsupported_form)')
+        self.assertEqual((full, cut), (64, 0))
 
 
 if __name__ == '__main__':

@@ -12,7 +12,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series4/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series5/obj/fexc')
 BR = [re.compile(r'b\.\w+\s+0x([0-9a-f]+)$'), re.compile(r'(?:cbz|cbnz)\s+\w+,\s+0x([0-9a-f]+)$'),
       re.compile(r'(?:tbz|tbnz)\s+\w+,\s+#\d+,\s+0x([0-9a-f]+)$'), re.compile(r'b\s+0x([0-9a-f]+)$')]
 
@@ -85,8 +85,10 @@ def matrix():
             out[f'{mn}{size} rcx,[rax]'] = pre[size] + '%02x' % (op * 8 + (2 if b else 3)) + modrm(1)
             out[f'{mn}{size} [rax],imm'] = pre[size] + ('80' if b else '83') + modrm(op) + '05'
         b = size == 8
-        for mn, reg in (('test', 0), ('not', 2), ('neg', 3), ('mul', 4), ('imul', 5)):
+        for mn, reg in (('test', 0), ('not', 2), ('neg', 3), ('mul', 4), ('imul', 5), ('div', 6), ('idiv', 7)):
             out[f'{mn}{size} [rax]'] = pre[size] + ('f6' if b else 'f7') + modrm(reg) + ('01' if reg == 0 and b else '01000000' if reg == 0 and size == 32 else '0100' if reg == 0 and size == 16 else '01000000' if reg == 0 else '')
+        for mn, reg in (('div', 6), ('idiv', 7)):
+            out[f'{mn}{size} rcx'] = pre[size] + ('f6' if b else 'f7') + modrm(reg, 1, 3)
         out[f'inc{size} [rax]'] = pre[size] + ('fe' if b else 'ff') + modrm(0)
         out[f'dec{size} [rax]'] = pre[size] + ('fe' if b else 'ff') + modrm(1)
         out[f'mov{size} [rax],rcx'] = pre[size] + ('88' if b else '89') + modrm(1)

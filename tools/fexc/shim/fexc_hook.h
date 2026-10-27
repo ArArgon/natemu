@@ -38,6 +38,7 @@ enum FexcSiteKind : uint8_t {
   FEXC_SITE_GUARD = 6, FEXC_SITE_SPLIT = 7, // slice1 stubs (address guard / branch-target check, split-store check)
   FEXC_SITE_PUSH_PAIR = 8, FEXC_SITE_POP_PAIR = 9, // FEX fused two guest push/pop into one stp/ldp
   FEXC_SITE_OTHER = 10,                     // guest-memory IR op the site record cannot describe
+  FEXC_SITE_DIVIDE = 11,                    // slice1 stub: div/idiv #DE (zero divisor or quotient overflow)
 };
 inline constexpr uint32_t FEXC_NONE32 = 0xFFFFFFFFu;
 struct FexcSiteInfo {
@@ -104,3 +105,6 @@ inline std::map<uint32_t, int64_t> fexc_rip_relative;   // guest-memory op -> it
 inline std::set<uint32_t> fexc_rmw_same_address;        // store whose address is its instruction's load's (same SSA values)
 struct FexcTarget { uint32_t def; int sra; };            // the target's node, or (sra >= 0) the static register it reads
 inline std::map<uint32_t, FexcTarget> fexc_target_check; // node after which to check an indirect exit's target
+// Profile slice1, recorded by the dispatcher's DIVOp/IDIVOp: guest RIP of each div/idiv -> its x86 operand width in bytes
+// (the #DE check needs it; FEX's IR widens the 8-bit forms).
+inline std::map<uint64_t, uint8_t> fexc_div_width;

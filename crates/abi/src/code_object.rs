@@ -21,6 +21,8 @@ pub const NO_REG: u8 = 0xff;
 /// stores included) crossing a 4 KiB page (access site in `guest_offset2`): the runtime writes the access site's data
 /// register(s) to both pages or neither, applies the access site's writeback and resumes after that store.
 /// At a stub, `base_reg + imm` is the access's address (no index) and the guest state is that of the access site.
+/// `DIVIDE` (`brk #3`) is a div/idiv whose divisor is zero or whose quotient does not fit its destination (#DE): no
+/// access (`guest_offset2` = [`NONE32`], no address registers, width 0); the guest state is that before the instruction.
 /// Push/pop pairs exist while FEX fuses two guest push/pop into one `stp`/`ldp`; `OTHER` is a guest-memory operation
 /// the record cannot describe, which a consumer must refuse.
 pub mod kind {
@@ -35,6 +37,7 @@ pub mod kind {
     pub const PUSH_PAIR: u8 = 8;
     pub const POP_PAIR: u8 = 9;
     pub const OTHER: u8 = 10;
+    pub const DIVIDE: u8 = 11;
 }
 /// [`Site::intent`].
 pub const INTENT_READ: u8 = 0;

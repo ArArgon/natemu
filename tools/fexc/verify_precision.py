@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1b1 check: the slice-1 precision guarantee, verified statically on the code fexc emits (profile slice1).
 
-usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series4 build)
+usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series5 build)
 
 Corpora: fixtures/slice1/programs.json, the single-instruction matrix of scan_skips.py, the adversarial programs below
 (one per precision patch), and every CORPUS.json given (gen_slice1.py format, e.g. a fresh `--seed` corpus).
@@ -22,7 +22,8 @@ For every compile, from the disassembly, the sites, the dense PC table and the s
       earlier instruction of the block that writes the flag, if it defines it (tools/reference/flags.py rules; an
       instruction that leaves the flag undefined defines nothing, which matches the compiler's InvalidateFlags-as-write
       rule), has a native write of its location in its own range (NZCV for CF/ZF/SF/OF, x26 for PF, x27 for AF): no flag
-      write that a later site observes was eliminated. COARSE: any NZCV-writing instruction in that range satisfies each of
+      write that a later site observes was eliminated (div/idiv leave all six flags undefined, so they define none; FEX
+      keeps the incoming flags, which a later site may observe like any other undefined value). COARSE: any NZCV-writing instruction in that range satisfies each of
       CF, ZF, SF and OF (and any x26 / x27 writer PF / AF); it does not check that the right bit holds the right value.
       Values are covered by the QEMU comparison (S1e), not here;
   P7  (a) every compile: every native load/store with a base other than x28/sp is a site, every site is on such an
@@ -32,6 +33,11 @@ For every compile, from the disassembly, the sites, the dense PC table and the s
   P8-P10 (S1b2, see guards()): every non-RIP-relative access has the address guard on exactly its address, every pure
       store wider than one byte the split check, every stub is reached only by its check, and every indirect exit checks
       its target before any state write; the guard/split/branch-target stubs are sites, so P1/P2 hold at their branches.
+  P11 (S1f, see divides()): every div/idiv has a #DE check branch to a divide stub (`brk #3`) before FEX's own divide (or
+      its helper call); every divide stub is reached from inside a div/idiv instruction; every `blr` is FEX's call of the
+      resident 128/64 helper (`ldr x3, [x28, #LUDIVHandler|LDIVHandler]` for div|idiv; `str x30, [sp, #-16]!; blr x3;
+      ldr x30, [sp], #16`) followed by `cbnz x2` to a divide stub. P1/P2 at each divide branch then give the state before
+      the instruction, relying on the helper's contract (only x0-x3 change; NZCV kept; the runtime's natemu_ludiv).
 Assumption by construction, NOT checked: every static-register write of guest instruction k-1 is emitted before the PC-table
 entry of instruction k. P1 sees only the window from an instruction's start to its site, so a write of an earlier
 instruction that was sunk past the next instruction's start would be flagged only if it lands before that site, and one
@@ -54,7 +60,7 @@ import check_sites, scan_skips  # noqa: E402
 from check_sites import code_vs_sites  # noqa: E402
 import flags as F  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series4/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series5/obj/fexc')
 
 NZCV_WRITERS = {'adds', 'adcs', 'subs', 'sbcs', 'ands', 'bics', 'negs', 'ngcs', 'cmp', 'cmn', 'tst', 'ccmp', 'ccmn', 'fcmp',
                 'fcmpe', 'fccmp', 'fccmpe', 'setf8', 'setf16', 'rmif', 'cfinv', 'axflag', 'xaflag'}
@@ -150,7 +156,7 @@ def stale_flags(d, insns, dis, order):
 
 STUBS = check_sites.STUBS
 BRANCH = re.compile(r'(b|b\.\w+|cbz|cbnz|tbz|tbnz)\s+(?:([wx]\d+),\s+)?(?:#(0x[0-9a-f]+|\d+),\s+)?0x([0-9a-f]+)$')
-STUB_WORD = {'guard': 'brk #0x1', 'split': 'brk #0x2'}
+STUB_WORD = {'guard': 'brk #0x1', 'split': 'brk #0x2', 'divide': 'brk #0x3'}
 M64 = (1 << 64) - 1
 
 
@@ -385,10 +391,71 @@ def guards(d, dis, order):
                 ok.add(t); cost['branch'] += 2
         if not good:
             out.append(f'exit +{o} (guest +{g}): computed RIP x{R} is not checked by a branch-target guard before any state write')
+    dout, dok = divides(d, dis, order, stubs, check_at)
+    out += dout
+    ok |= dok
     for at, t in check_at.items():
         if t not in ok:
             out.append(f'branch +{t} to stub +{at} is not one of the checks')
     return out, check_at, cost
+
+
+def divides(d, dis, order, stubs, check_at):
+    """P11 on one compile: (violations, the divide check branches)."""
+    out, ok = [], set()
+    ptr = {p['state_offset']: p['pointer'] for p in d['state_abi']['state_pointer_loads']}
+    names = {i['offset']: i['name'] for i in d['guest']['instructions'] if i['translated']}
+    starts = sorted((e['native_offset'], e['guest_offset']) for e in d['pc_table']['entries'])
+    body_end = min([o for o in order if dis[o].startswith('brk')] + [d['code']['layout']['code_region_end']])
+
+    def insn_at(o):
+        """(guest offset, native start, native end) of the instruction whose range holds native offset o."""
+        lo, g = max(e for e in starts if e[0] <= o)
+        hi = min([n for n, og in starts if og > g] + [body_end])
+        return g, lo, hi
+
+    def branch_to(t, stub):
+        """The check's own conditional test reaching `stub` from t (FEX's far form: inverse test to t+4; b stub)."""
+        text = dis.get(t, '')
+        if re.fullmatch(rf'(cbz|cbnz) [wx]\d+, {stub:#x}|tbz x0, #0x3f, {stub:#x}', text):
+            return t
+        if text == f'b {stub:#x}' and re.fullmatch(rf'(cbz|cbnz) [wx]\d+, {t + 4:#x}|tbnz x0, #0x3f, {t + 4:#x}', dis.get(t - 4, '')):
+            return t - 4
+        return None
+
+    divs = {at: s for at, s in stubs.items() if s['kind'] == 'divide'}
+    branches = {}   # guest offset -> divide check branches
+    for at, s in divs.items():
+        t = check_at.get(at)
+        if t is None:
+            continue   # reported by guards()
+        c = branch_to(t, at)
+        g, lo, hi = insn_at(c if c is not None else t)
+        if c is None or names.get(g) not in ('DIV', 'IDIV') or g != s['guest_offset'] or not lo <= c < hi:
+            out.append(f'divide stub +{at}: branch +{t} "{dis.get(t)}" is not a #DE check inside its div/idiv (guest +{s["guest_offset"]})')
+            continue
+        ok.add(t)
+        branches.setdefault(g, []).append(c)
+    for o in (o for o in order if dis[o].startswith(('blr', 'bl '))):
+        g, lo, hi = insn_at(o)
+        want = {'DIV': 'LUDIVHandler', 'IDIV': 'LDIVHandler'}.get(names.get(g))
+        m = re.fullmatch(r'ldr x3, \[x28, #(0x[0-9a-f]+)\]', dis.get(o - 8, ''))
+        nxt = dis.get(o + 8, '')
+        cb = re.fullmatch(r'cbnz x2, 0x([0-9a-f]+)', nxt) or re.fullmatch(r'cbz x2, 0x([0-9a-f]+)', nxt)
+        stub = int(dis.get(o + 12, 'b 0x0').split()[-1], 16) if cb and nxt.startswith('cbz') else int(cb[1], 16) if cb else None
+        if not (want and dis[o] == 'blr x3' and m and ptr.get(int(m[1], 16)) == want and dis.get(o - 4) == 'str x30, [sp, #-0x10]!'
+                and dis.get(o + 4) == 'ldr x30, [sp], #0x10' and stub in divs and check_at.get(stub) in (o + 8, o + 12) and lo <= o < hi):
+            out.append(f'call +{o} "{dis[o]}" (guest +{g}) is not the 128/64 helper call of a div/idiv followed by its #DE check')
+    for g, name in names.items():
+        if name not in ('DIV', 'IDIV'):
+            continue
+        lo = min(n for n, og in starts if og == g)
+        hi = min([n for n, og in starts if og > g] + [body_end])
+        fex = [o for o in order if lo <= o < hi and (dis[o] == 'blr x3' or (dis[o].partition(' ')[0] in ('udiv', 'sdiv') and
+                                                                          reg(dis[o].split()[1].rstrip(',')) not in (('x', 0), ('x', 1))))]
+        if not fex or not any(c < fex[0] for c in branches.get(g, [])):
+            out.append(f'{name} at guest +{g}: no #DE check before its divide (+{fex[0] if fex else None})')
+    return out, ok
 
 
 def verify(d, tmp, insns=None):
@@ -496,6 +563,8 @@ ADVERSARIAL = {   # one or more per precision patch; registers point into the ge
     'killed-by-undefined-then-access': ['add rdx, 5', 'or rsi, rdi', 'mov rax, qword ptr [rbx]', 'sub rax, rcx', 'imul rdx, rcx',
                                         'mov qword ptr [rsi], rax', 'add rax, 1', 'mul qword ptr [rdi]'],
     'undefined-flags-before-access': ['add rax, rcx', 'shl qword ptr [rbx], 3', 'mul qword ptr [rsi]', 'imul rax, qword ptr [rbx]'],
+    'division-flags': ['sub rax, rcx', 'div qword ptr [rbx]', 'mov qword ptr [rsi], rdx', 'add r8, 1', 'idiv ecx', 'mov rax, qword ptr [rdi]',
+                       'cmp r9, r10', 'div r11b', 'adc qword ptr [rsi], 1'],
 }
 
 
@@ -512,6 +581,9 @@ GUARDED = {   # P8-P10: name -> (rip, asm, compare with the fixture rules); the 
     'large-displacements': ('0x100000', ['mov rax, qword ptr [rbx+0x1000]', 'neg qword ptr [rsp+rbp*8+0x2000]',
                                          'mov qword ptr [rsi-0x1001], rcx', 'add dword ptr [rdi+0x7ffff000], eax'], True),
     'stack-forms': ('0x100000', ['push rax', 'push rsp', 'pop qword ptr [rbx]', 'push qword ptr [rsp+8]', 'pop rsp', 'push 7'], True),
+    'division-forms': ('0x100000', ['div cl', 'div byte ptr [rbx]', 'idiv bh', 'div word ptr [rsi+rcx*2]', 'idiv r9w', 'div ecx',
+                                    'idiv dword ptr [rsp+8]', 'div rcx', 'idiv qword ptr [rbx+0x10]', 'div qword ptr [rip+0x100]', 'idiv r15',
+                                    'idiv qword ptr [rbp-8]'], True),
     'ret': ('0x100000', ['add rax, rcx', 'ret'], False),
     'ret-imm': ('0x100000', ['ret 8'], False),
     'call-reg': ('0x100000', ['call rax'], False),

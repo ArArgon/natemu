@@ -30,7 +30,7 @@ pub(crate) fn prepare(resident: &str) -> Result<Memory> {
         own(exec::FRAME_OFFSET, exec::frame::BYTES),
         Span::text(exec::SLOT_OFFSET, exec::SLOT_BYTES, exec::SLOT_OFFSET),
         Span::data((exec::SLOT_WRITE_VA - PRIVATE) as usize, exec::SLOT_BYTES, exec::SLOT_OFFSET),
-        own((STACK_TOP - PRIVATE) as usize - 0x4000, 0x4000),
+        own((STACK_TOP - PRIVATE) as usize - exec::STACK_BYTES, exec::STACK_BYTES),
         own((EXCEPTION_STACK_TOP - PRIVATE) as usize - 0x4000, 0x4000),
         own(exec::STAGING_OFFSET, exec::STAGING_BYTES),
         own(exec::GUEST_RAM_OFFSET, exec::GUEST_RAM_BYTES),

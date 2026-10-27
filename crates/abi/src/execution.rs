@@ -31,8 +31,12 @@ pub const SLOT_WRITE_VA: u64 = PRIVATE + 0x40000;
 pub const STAGING_OFFSET: usize = 0x70000;
 pub const STAGING_BYTES: usize = 0x20000;
 pub const STAGING_VA: u64 = PRIVATE + STAGING_OFFSET as u64;
+/// Native stack mapped below `crate::STACK_TOP` while code runs.
+pub const STACK_BYTES: usize = 0x4000;
 /// Generated code's native stack (spill area below `crate::STACK_TOP`).
 pub const BLOCK_STACK_BYTES: u32 = 0x2000;
+/// Stack below the spill area a 128/64 division uses: FEX's `lr` push and the helper's saved registers.
+pub const HELPER_STACK_BYTES: u32 = 64;
 /// Guest-physical RAM `[0, GUEST_RAM_BYTES)`: backing offset and resident alias.
 pub const GUEST_RAM_OFFSET: usize = RAM_SIZE;
 pub const GUEST_RAM_BYTES: usize = 0x10_0000;
@@ -50,8 +54,15 @@ pub mod frame {
     pub const PRE_NZCV: u32 = 1032;
     /// `Pointers.DispatcherLoopTop`: the resident exit gate.
     pub const DISPATCHER_LOOP_TOP: u32 = 2920;
+    /// `Pointers.LUDIVHandler` / `LDIVHandler`: the resident 128/64 unsigned / signed division helpers a 64-bit
+    /// div / idiv calls when its dividend needs 128 bits (FEX's helper ABI, see the runtime's `natemu_ludiv`).
+    pub const LUDIV_HANDLER: u32 = 3024;
+    pub const LDIV_HANDLER: u32 = 3032;
+    /// Native pointers the resident fills; code may only load them.
+    pub const POINTERS: [u32; 3] = [DISPATCHER_LOOP_TOP, LUDIV_HANDLER, LDIV_HANDLER];
     /// `(offset, bytes)` of every admitted access.
-    pub const FIELDS: [(u32, u32); 4] = [(BLOCK_HEADER, 8), (RIP, 8), (PRE_NZCV, 4), (DISPATCHER_LOOP_TOP, 8)];
+    pub const FIELDS: [(u32, u32); 6] =
+        [(BLOCK_HEADER, 8), (RIP, 8), (PRE_NZCV, 4), (DISPATCHER_LOOP_TOP, 8), (LUDIV_HANDLER, 8), (LDIV_HANDLER, 8)];
     pub const BYTES: usize = 4096;
 }
 /// Native offset of a FEX block's entry: after its 4-byte `JITCodeHeader`.
@@ -219,6 +230,7 @@ const _: () = assert!(STATE_OFFSET + 4096 <= FRAME_OFFSET);
 const _: () = assert!(SLOT_OFFSET + SLOT_BYTES <= 0x40000);
 const _: () = assert!(STAGING_OFFSET + STAGING_BYTES <= crate::resident::TEXT_OFFSET);
 const _: () = assert!(crate::STACK_TOP - PRIVATE >= 0x50000 + BLOCK_STACK_BYTES as u64);
+const _: () = assert!((BLOCK_STACK_BYTES + HELPER_STACK_BYTES) as usize <= STACK_BYTES);
 
 #[cfg(test)]
 mod tests {

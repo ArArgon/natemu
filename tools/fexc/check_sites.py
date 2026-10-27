@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """S1a check: fexc's access sites against the fixture programs and against the emitted code.
 
-usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series4 build)
+usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series5 build)
 
 --slice1 compiles with `--profile slice1` (S1c): hardware TSO (plain ldr/str), exits through the dispatcher gate, block
-cutting. A program then ends at its first div/idiv or memory xchg with end reason `unsupported_form` at that
+cutting. A program then ends at its first memory xchg with end reason `unsupported_form` at that
 instruction's RIP (the expectation is cut at the same place in the fixture `asm`, never taken from fexc); the exit
 literals (8-byte guest RIPs inside the code region) are not instructions and are masked from the disassembly.
 
@@ -45,7 +45,7 @@ def fixture_programs():
     if not path.exists():
         subprocess.run([sys.executable, '-B', str(REPO / 'tools/reference/build_slice1.py'), '--programs-only'], check=True)
     return json.loads(path.read_text())['programs']
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series4/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series5/obj/fexc')
 KNOWN_OK = False
 PROFILE = []   # extra fexc arguments for every compile: ['--profile', 'slice1'] under --slice1
 
@@ -55,7 +55,7 @@ RMW_DST = {'add', 'adc', 'sub', 'sbb', 'and', 'or', 'xor', 'inc', 'dec', 'neg', 
 LOAD_DST = {'cmp', 'test', 'bt'}
 LOAD_ONLY_1OP = {'mul', 'imul', 'div', 'idiv'}
 WORD_REGS = {'ax', 'cx', 'dx', 'bx', 'sp', 'bp', 'si', 'di'} | {f'r{i}w' for i in range(8, 16)}
-STUBS = ('guard', 'split')   # slice1 check stubs (brk words after the body), not accesses: verify_precision.py checks them
+STUBS = ('guard', 'split', 'divide')   # slice1 check stubs (brk words after the body), not accesses: verify_precision.py checks them
 
 
 def expected(asm):
@@ -182,9 +182,9 @@ def object_vs_json(o, d):
 
 
 def first_cut(asm):
-    """Index of the first fixture instruction slice1 must cut (division, memory xchg), else None. Taken from the
-    generator's `asm`, never from fexc."""
-    return next((k for k, a in enumerate(asm) if a.split()[0] in ('div', 'idiv') or (a.startswith('xchg') and '[' in a)), None)
+    """Index of the first fixture instruction slice1 must cut (memory xchg), else None. Taken from the generator's `asm`,
+    never from fexc."""
+    return next((k for k, a in enumerate(asm) if a.startswith('xchg') and '[' in a), None)
 
 
 def asm0_cut(p):
@@ -302,7 +302,7 @@ def check_program(p, tmp):
     o = read_object(tmp / 'o.bin')
     if o['code'] != code or o['spill'] != d['code']['layout']['spill_bytes'] or len(o['sites']) != len(sites) or o['rip'] != int(p['rip'], 16):
         problems.append(('ERROR', 'object header/code disagrees with the JSON'))
-    kinds = ['load', 'store', 'load_pair', 'store_pair', 'push', 'pop', 'guard', 'split', 'push_pair', 'pop_pair', 'other']
+    kinds = ['load', 'store', 'load_pair', 'store_pair', 'push', 'pop', 'guard', 'split', 'push_pair', 'pop_pair', 'other', 'divide']
     for rec, s in zip(o['sites'], sites):
         if (rec[0], rec[1], kinds[rec[5]], rec[6]) != (s['native_offset'], s['guest_offset'], s['kind'], s['width']):
             problems.append(('ERROR', f'object site {rec[:4]} disagrees with JSON {s["native_offset"]}'))

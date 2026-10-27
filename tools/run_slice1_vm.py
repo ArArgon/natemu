@@ -7,7 +7,7 @@ Builds and signs the release host and runtime, then for each program writes a de
 (`natemu-host RUNTIME run-program`), runs it and compares the final state with the expected
 QEMU result through `ref.compare`. Defaults: fixtures/slice1/{programs,expected}.json. Nothing is
 keyed by program name. A program is "unsupported" when execution stops at a declared limit of the
-slice before its end: an instruction it cannot compile (fexc `unsupported_form`, e.g. div/idiv), or a
+slice before its end: an instruction it cannot compile (fexc `unsupported_form`, e.g. memory xchg), or a
 store to a page the running block was translated from (`unsupported_smc`; this includes data stores to
 the code's own page, which the reference layout allows). Every other stop before the end, and every
 difference, is a failure. Independent page checks: a dirty page is

@@ -10,7 +10,8 @@ sites, `spill_bytes`, `cf_inverted` per PC entry, and `--object` (binary record 
 programs and the emitted code. **S1c done**: profile `slice1` (allowlist block cutting, single-gate exits, see
 "Profile slice1"). **S1b1 done**: the precision patches under `--profile slice1` and `verify_precision.py` (see
 "Precision (S1b1)"). **S1b2 done**: address guard, split-store check and canonical branch targets under `--profile slice1`
-(patch 0007, see "Guards (S1b2)").
+(patch 0007, see "Guards (S1b2)"). **S1f done**: div/idiv admitted with #DE checks and the 128/64 helper call (patch 0008,
+see "Division (S1f)").
 
 ## Build
 
@@ -25,11 +26,11 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as seven commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as eight commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series4` (a fresh `build.sh` run gives a
-byte-identical `fexc`). Kept for comparison only: `series2` (patches 0001-0006, the "before" of the guard cost), `s1c` (slice1
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series5`. Kept for comparison only: `series4`
+(patches 0001-0007, before division), `series2` (patches 0001-0006, the "before" of the guard cost), `s1c` (slice1
 without the precision patches, the "before" of the precision cost) and `c1b` (the v1 build without sites). The earlier `series1` (flag rule before the cheaper one below) and `s1b1` are gone.
 
 The dependency archives of the old I4-V producer (`upstream.tar.gz`, `dependency-overlay.tar`) are no longer used; the
@@ -54,6 +55,7 @@ Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--v
 | 0005 | slice1 block cutting (`FexcMap` in the decoder, `FexcSlice1::Cut`) and single-gate exits |
 | 0006 | slice1 precision (flag elimination, register allocation, pre-NZCV save) |
 | 0007 | slice1 address guard, split-store check, branch-target check (JIT hooks, pre-RA scan, `ret` without writeback) |
+| 0008 | slice1 #DE for div/idiv (width record in the dispatcher, check after FEX's LUDIV/LDIV call, divide ops as flag fault points) |
 
 Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in `shim/` and `fexc.cpp`; the patches only
 include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then
@@ -258,7 +260,7 @@ The scripts that read `fixtures/slice1/programs.json` (git-ignored; `smoke.py`, 
 - **Allowlist.** Primary map: add/or/adc/sbb/and/sub/xor/cmp (all six forms), push/pop r, push imm, mov (88-8b, a0-a3,
   b0-bf, c6/c7 /0), lea, movsxd, imul (69/6b), test, group 1, shifts/rotates (c0/c1/d0-d3 except /6; rcl/rcr only with a register operand: FEX branches around the whole access for a
   static or dynamic zero count, which would lose a guest #PF), group 3 inc/dec-style
-  ops (test /0, not, neg, mul, imul; div/idiv are `unsupported_form` until S1f), fe/ff inc/dec/push, nop, endbr64 (f3 0f 1e fa, a no-op) and register xchg
+  ops (test /0, not, neg, mul, imul, div, idiv), fe/ff inc/dec/push, nop, endbr64 (f3 0f 1e fa, a no-op) and register xchg
   (86/87 only with mod=3, 90-97), cbw/cwde/cdqe and cwd/cdq/cqo. Two-byte map (no mandatory-prefix overlay): nop (0f 1f), cmovcc,
   setcc, bt/bts/btr/btc (a3/ab/b3/bb, ba /4-7), imul, movzx, movsx, bsf/bsr, bswap. Branches (end the block): jcc rel8/rel32,
   jmp rel8/rel32 and near indirect, call rel32/indirect, ret, rep ret (f3 c3), ret imm16. All with no LOCK, REP/REPNE (except
@@ -274,9 +276,10 @@ The scripts that read `fixtures/slice1/programs.json` (git-ignored; `smoke.py`, 
 ### Native control flow inside one guest instruction
 `scan_skips.py` (and a test in `test_slice1.py`) looks, in the emitted code, for a forward branch inside one guest
 instruction's native range that jumps over one of its recorded sites, and for admitted memory forms with no site at all. It scans
-613 single-instruction forms (shifts and rotates by 1, CL and immediates 0/5/31/32/255 at 8/16/32/64 bits, memory and
-register; bt family; cmov, bsf/bsr, imul, movzx/movsx, ALU forms, setcc, push/pop, call/jmp [m], ...) and the 63 fixture
-programs that compile. Only rcl/rcr with a memory operand were found (a `cbz` on the count around the load/store, and no
+629 single-instruction forms (shifts and rotates by 1, CL and immediates 0/5/31/32/255 at 8/16/32/64 bits, memory and
+register; bt family; cmov, bsf/bsr, imul, movzx/movsx, ALU forms, setcc, push/pop, call/jmp [m], div/idiv, ...) and the 64 fixture
+programs. Divide stubs are not accesses: the branch around a 64-bit division's helper call (and its #DE test) is FEX's
+inline path and skips no access. Only rcl/rcr with a memory operand were found (a `cbz` on the count around the load/store, and no
 access at all for a masked-to-zero static count: rcl/rcr by 0 or 32 at 8/16/64 bits); they are cut. All other forms access
 memory unconditionally, including shifts and rotates by CL and by an immediate that masks to zero.
 
@@ -351,7 +354,7 @@ generated corpus and the 613-form matrix, except the host address of FEX's exit-
 
 | patch | FEX file::function | change |
 |---|---|---|
-| 2 | `RedundantFlagCalculationElimination.cpp::Classify` | every guest-memory op (LoadMem, StoreMem, their TSO and pair forms, Push, Pop) reads all six flags, so no flag write before it is deleted or narrowed; `InvalidateFlags` stays a write (its value is undefined, so an earlier write of that flag may die, e.g. add's AF across a later `or`), and the `GuestOpcode` of an instruction with an access reads all six flags, so the incoming flags stay live at the instruction start even if the instruction itself invalidates some; the guarantee is unchanged, the cost drops |
+| 2 | `RedundantFlagCalculationElimination.cpp::Classify` | every guest-memory op (LoadMem, StoreMem, their TSO and pair forms, Push, Pop) and, since S1f, every divide op (UDiv, Div: `FexcPrecision::FaultPoint`) reads all six flags, so no flag write before it is deleted or narrowed; `InvalidateFlags` stays a write (its value is undefined, so an earlier write of that flag may die, e.g. add's AF across a later `or`), and the `GuestOpcode` of an instruction with an access reads all six flags, so the incoming flags stay live at the instruction start even if the instruction itself invalidates some; the guarantee is unchanged, the cost drops |
 | 2b | `...::EliminateDeadCode`, `RegisterAllocationPass.cpp::Run` (forward) | a guest load with a dead value (`cmp`/`test`/`bt [m]`) is kept; its destination register is freed at once |
 | 3 | `RegisterAllocationPass.cpp::Run` (backwards) | a guest-memory op and a guest instruction boundary (`GuestOpcode`) count as an access of every static register, so a value is coalesced into its SRA register only if no access (and no instruction boundary) lies between its definition and its store; this covers constants pooled across instructions. A load's own value never gets an SRA register (DDI0487 D1.4.1.4); a pop's writeback stack pointer stays in RSP's register (the access is its only write) |
 | 4 | `RegisterAllocationPass.cpp::Run` (forward) | `TryPostRAMerge`'s candidate is reset at `GuestOpcode`: no push/pop pair, no merge across instructions |
@@ -433,6 +436,37 @@ Cost (`verify_precision.py --before series2`, native words per translated guest 
 seed-77 corpus: guards 0.92, split checks 0.50, branch targets 0.00 (2 per indirect branch; the corpus has none), stubs 0.53
 (never executed). Run time is not measured (fexc cannot execute its output; S1d's runtime can).
 
+## Division (S1f)
+
+Under `--profile slice1` only (default-profile JSON unchanged on the 64 fixtures, the `--seed 77` corpus and the 629-form
+matrix, 957 compiles), div/idiv at all widths, register and memory divisors, are admitted. FEX raises no #DE (Arm `udiv`/`sdiv`
+return 0 for a zero divisor and wrap on overflow), so `FexcBeforeOp` emits a check right before each `UDiv`/`Div` IR op, the
+first op of the instruction that writes anything but temporaries (a memory divisor is already loaded, so its #PF comes
+first, as on x86). The check is flag-free, uses x0/x1 only, reads FEX's own operand registers of the op at the x86 width the
+dispatcher recorded (`fexc_div_width`; FEX widens the 8-bit forms), and branches to an out-of-line `brk #3` stub, a site of
+kind `divide` (no access, `base_reg` 255, width 0; one stub per branch). The state at the stub is the state before the
+instruction; `verify_precision.py` P1/P2/P11 check it on the code.
+
+| form | check (native words) |
+|---|---|
+| div 8/16/32 | high >= divisor, unsigned (a zero divisor included): `{ubfx x0, AX, #8, #8 \| uxth w0, wDX \| mov w0, wEDX}; sub x0, x0, wD, uxt{b,h,w}; tbz x0, #63` (3) |
+| div 64 | `cbz xD` (1); a nonzero RDX takes FEX's LUDIV helper call, after which `cbnz x2` (1) takes the helper's #DE verdict |
+| idiv 8/16/32 | `sxt x1, wD; cbz x1`; dividend in 32 (8, 16) or 64 bits (32); `sdiv x0, x0, x1; sub x0, x0, w0, sxt{b,h,w}; cbnz x0` (6, 7, 7: the quotient does not fit W bits, -2^63 / -1 included) |
+| idiv 64 | `cbz xD` + RDX:RAX = -2^63 with divisor -1 (FEX's inline path) in 6 words; a 128-bit dividend takes LDIV, then `cbnz x2` (1) |
+
+FEX's 128/64 call is unchanged: `mov x0..x2 <- RDX, RAX, divisor; ldr x3, [x28, #Pointers.LUDIVHandler|LDIVHandler]; str x30, [sp,
+#-16]!; blr x3; ldr x30, [sp], #16`. The resident provides both handlers (runtime `natemu_ludiv`/`natemu_ldiv`; admission allows
+loads, never stores, of those two frame words): FEX's convention (x0 = high, x1 = low, x2 = divisor in; x0 = quotient, x1 =
+remainder out; x0-x3 clobbered), plus x2 = 1 for #DE; NZCV and all other registers preserved, no guest memory, 48 bytes of
+native stack. A divide op is a fault point for flag elimination (`FexcPrecision::FaultPoint`): the flags an earlier
+instruction defines stay computed before a div even when a later instruction overwrites them (found by P6 on fixture
+random-38: an `add`'s flags were eliminated before an `idiv`).
+
+Cost per guest instruction (native words on the executed path, plus never-executed stubs): FEX's own divide is 6-7 words at
+8/16/32 bits; the check adds 3 (div) or 6-7 (idiv, including a second `sdiv`), and 1 or 2 stub words. 64-bit: +1 (div) or +7
+(idiv) on FEX's inline path, +1 after the helper call; the helper itself is about 600 instructions (one quotient bit per
+step) on the rare path whose dividend needs 128 bits.
+
 ## Checks
 
 - `python3 -m unittest tools/fexc/test_fexc.py`: structure, exact sites for hand-checked instructions, object file,
@@ -441,11 +475,12 @@ seed-77 corpus: guards 0.92, split checks 0.50, branch targets 0.00 (2 per indir
   allowed instructions ends the block exactly at its RIP with the right reason and the same code as the two instructions alone;
   as the first instruction it gives no code; ~100 allowed forms and 11 branch forms translate; every exit in the branch cases
   and the 64 programs is the single gate (disassembled), with no named-symbol literal, no pointer load but
-  `DispatcherLoopTop`, no x25; the 64 programs translate completely except those with div/idiv.
+  `DispatcherLoopTop` and the division helpers (used only by FEX's helper call), no x25; the 64 programs translate completely.
 - `python3 tools/fexc/scan_skips.py`: the native-control-flow scan above.
 - `python3 tools/fexc/verify_precision.py [--before FEXC0] [CORPUS.json ...]`: the slice1 precision guarantee (above) and the
   guards (P8-P10: guard on exactly the access address, split check on every store wider than 1 byte, stubs reached only by their checks,
-  indirect targets checked before any state write; series2 fails them, series4 passes).
+  indirect targets checked before any state write; series2 fails them, series4 passes) and P11 (every div/idiv has its #DE
+  check before its divide; every `blr` is the 128/64 helper call followed by its #DE branch).
 - `python3 tools/fexc/check_sites.py [--known-ok] [--slice1]`: the 64 reference programs; expected accesses from the fixture `asm`
   against the sites, sites against the `xcrun objdump` disassembly of the code (every load/store with a base other than
   x28/sp must be a site and the reverse), dense versus sparse code bytes, binary object versus JSON.

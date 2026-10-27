@@ -96,7 +96,8 @@ This removes block linking, the L1 lookup and the x25 call-ret stack. One reside
 
 **Admission.** The host fetches source bytes through the guest walk, runs fexc and checks version, sizes, offsets,
 sorted in-body sites, guest-RIP relocations equal to the requested RIP's values, and x28 offsets within
-{`InlineJITBlockHeader`, `State.rip`, `natemu_pre_nzcv`, `Pointers.DispatcherLoopTop`, after S1f `LUDIVHandler/LDIVHandler`}.
+{`InlineJITBlockHeader`, `State.rip`, `natemu_pre_nzcv`, `Pointers.DispatcherLoopTop`, after S1f `LUDIVHandler/LDIVHandler`};
+the native pointers (gate, helpers) are load-only.
 It writes the object to resident staging at the service stop; the resident copies it into a private slot (RW alias, RX
 mapping, I-cache maintenance) and fills every native pointer itself.
 
@@ -116,8 +117,9 @@ one stops `unsupported_smc`) and ERET to the same PC. `GUEST_FAULT`: canonical s
 PSTATE or frame slot with `cf_inverted`; PF/AF formulas), RIP = block RIP + guest_offset, CR2/error code per risk 4,
 exception packet to the host (no IDT delivery yet). `COMPLETE` cannot arise (at most one store per instruction, last).
 
-**Helpers and limits.** None before S1f's pure LUDIV/LDIV 128/64 routines (x0-x3 only; other registers and NZCV kept;
-no guest memory or faults). One vCPU, no chaining, one host round trip per block, no event delivery; FS/GS, LOCK (incl.
+**Helpers and limits.** Only S1f's resident LUDIV/LDIV 128/64 routines (runtime `natemu_ludiv`/`natemu_ldiv`, FEX's handler
+ABI: x0 high, x1 low, x2 divisor in; x0 quotient, x1 remainder out; plus x2 = 1 for #DE; x0-x3 only, other registers and
+NZCV kept, no guest memory or faults, 48 bytes of native stack below FEX's lr push). One vCPU, no chaining, one host round trip per block, no event delivery; FS/GS, LOCK (incl.
 memory xchg), string, x87/SSE, CPUID/RDTSC and system instructions are cut.
 
 **Prerequisite (gates S1d).** vm-map §6 step 3: a general resident/shadow table builder replacing `shadow.rs` (one 2 MiB
@@ -152,9 +154,12 @@ invalidation on read-only → writable upgrade; plus §6 step 2's single guest-m
   rip + offset(k); CR2/error code per policy; nothing later ran. Also: fetch #PF at a not-present code page (I bit);
   page-crossing pure stores (both parts or neither); non-canonical probes incl. `0x0000_8000_4000_0000` give #GP(0) (#SS(0)
   for RSP/RBP bases) with private memory and frame byte-identical.
-- **S1f, division.** Resident LUDIV/LDIV; a DIV/IDIV guard (zero divisor; DIV high >= divisor; IDIV overflow reported
-  by the helper) exits through a natemu `Break` site with the guest offset. *Check:* division fixtures pass; zero and
-  overflow cases give a #DE packet whose state equals the QEMU prefix run.
+- **S1f, division (implemented, patch 0008).** Resident LUDIV/LDIV; a flag-free DIV/IDIV check right before FEX's divide op
+  (zero divisor; DIV high >= divisor; IDIV quotient outside W bits by a scratch `sdiv` at 8/16/32 bits and -2^63/-1 at 64;
+  a 128-bit dividend's overflow reported by the helper in x2 and tested after FEX's call) branches to a `brk #3` stub, a
+  site of kind `divide` (no access); the runtime stops with #DE (vector 0, no error code, RIP at the div). The divide op is a
+  flag fault point (incoming flags kept live). *Check:* division fixtures pass; zero and overflow cases give a #DE packet
+  whose state equals the QEMU prefix run.
 
 ## 4. Open risks and owner decisions
 

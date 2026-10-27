@@ -11,14 +11,19 @@ Cases are derived from program descriptions, never written per program:
   Effective addresses come from the generator's `asm` text evaluated in QEMU's prefix state at that instruction
   (tools/reference/ref.py `prefix`), never from fexc.
 * Built-in probes (PROBES below): non-canonical data and stack addresses (#GP(0)/#SS(0)), branches to
-  non-canonical targets (#GP(0) at the branch), and instruction fetch from a not-present code page.
+  non-canonical targets (#GP(0) at the branch), instruction fetch from a not-present code page, and divide errors
+  (#DE: zero divisor and quotient overflow per width and signedness, register and memory divisors, a not-present
+  divisor page before #DE, 64-bit divisions whose dividend needs 128 bits after a run of such divisions that do not
+  fault).
 
 The expected exception, from the instruction text and the prefix state alone, follows x86 and the contract's natemu
 policies: per access in order, a non-canonical access (any byte) is #SS(0) for an RSP/RBP base or stack operation,
 else #GP(0); then each page it touches in address order, #PF with CR2 = the first byte of the access in that page,
 error code U | W (write intent; a read-modify-write's load is write intent) | P (protection). A branch target is
-checked after the accesses that produce it and before a call's push. Fetch #PF: CR2 = the first instruction byte in
-the not-present page, error U | I. bt-family memory forms access one byte (natemu policy, tools/fexc/README.md).
+checked after the accesses that produce it and before a call's push. div/idiv: after its memory divisor is read, #DE
+(no error code) when the divisor is zero or the quotient does not fit the destination (SDM DIV/IDIV), computed from the
+prefix state. Fetch #PF: CR2 = the first instruction byte in the not-present page, error U | I. bt-family memory forms
+access one byte (natemu policy, tools/fexc/README.md).
 
 The VM must stop with exactly that exception record (vector, CR2, error code, RIP = start of the faulting
 instruction), its GPRs, masked RFLAGS and memory equal to the QEMU prefix run (nothing later ran, no partial store),
@@ -60,9 +65,28 @@ def address(expr, regs, next_rip):
 
 class Unsupported(Exception): pass
 
+def reg_value(name, regs):
+    """Value of a 64/32/16/8-bit register name (incl. ah..bh) from the 64-bit registers."""
+    if name in ref.HI: return (regs[ref.R64[ref.HI.index(name)]] >> 8) & 0xff
+    for names in (ref.R64, ref.R32, ref.R16, ref.R8):
+        if name in names: return regs[ref.R64[names.index(name)]] & ((1 << ref.WIDTH[name]) - 1)
+    raise Unsupported(name)
+
+def divide_error(signed, w, divisor, rax, rdx):
+    """x86 #DE of a w-byte div (unsigned) / idiv (signed): zero divisor or a quotient outside the destination."""
+    bits = 8 * w; mask = (1 << bits) - 1
+    n = rax & 0xffff if w == 1 else (rdx & mask) << bits | rax & mask
+    d = divisor & mask
+    if d == 0: return True
+    if not signed: return n // d > mask
+    n -= (n >> (2 * bits - 1)) << (2 * bits); d -= (d >> (bits - 1)) << bits
+    q = abs(n) // abs(d) * (1 if (n < 0) == (d < 0) else -1)
+    return not -(1 << (bits - 1)) <= q < 1 << (bits - 1)
+
 def events(text, regs, next_rip):
     """One instruction's guest data accesses and branch-target check, in architectural order:
-    ('access', address, bytes, write intent, stack segment) and ('target', register value | ('mem', address))."""
+    ('access', address, bytes, write intent, stack segment), ('target', register value | ('mem', address)) and
+    ('divide', signed, bytes, divisor value | ('mem', address), rax, rdx)."""
     m, ops = text.split()[0], split_operands(text)
     def mem(op):
         x = MEM.fullmatch(op)
@@ -95,6 +119,12 @@ def events(text, regs, next_rip):
     # Anything else that transfers control (jcc, direct jmp/call, loop, ...) is not straight-line: never guessed.
     if m in ('jmp', 'call', 'ret', 'push', 'pop') or m.startswith('j') or m.startswith('loop') or m in ('iret', 'iretq', 'int', 'syscall'):
         raise Unsupported(text)
+    if m in ('div', 'idiv') and len(ops) == 1:      # the divisor is read, then checked
+        x = mem(ops[0])
+        if x and not x[1]: raise Unsupported(text)
+        w = x[1] if x else reg_width(ops[0])
+        return ([('access', x[0], w, False, x[2])] if x else []) + \
+            [('divide', m == 'idiv', w, ('mem', x[0]) if x else reg_value(ops[0], regs), regs['rax'], regs['rdx'])]
     mems = [i for i, o in enumerate(ops) if MEM.fullmatch(o)]
     if m in ('lea', 'nop') or not mems: return []
     i = mems[0]; a, w, ss = mem(ops[i])
@@ -111,6 +141,11 @@ def events(text, regs, next_rip):
 def first_fault(evs, layout, read):
     """The x86 exception of one instruction's events in the page layout (page -> writable; absent: not present), or None."""
     for e in evs:
+        if e[0] == 'divide':
+            _, signed, w, src, rax, rdx = e
+            d = int.from_bytes(read(src[1], w), 'little') if isinstance(src, tuple) else src
+            if divide_error(signed, w, d, rax, rdx): return (0, 0, 0)
+            continue
         if e[0] == 'target':
             value = int.from_bytes(read(e[1][1], 8), 'little') if isinstance(e[1], tuple) else e[1]
             if not canonical(value): return (13, 0, 0)
@@ -144,12 +179,13 @@ def layout(p, mutations):
 def describe(line, evs, f, fetched=False):
     m = line.split()[0]
     acc = [e for e in evs if e[0] == 'access']
+    if f[0] == 0: return f'#DE {m}{8 * next(e[2] for e in evs if e[0] == "divide")}' + (' mem' if acc else '')
     crossing = ' crossing' if any((a ^ (a + w - 1)) >> 12 for _, a, w, _, _ in acc) else ''
     if fetched: what = 'fetch'
     elif m in ('push', 'pop', 'ret', 'call', 'jmp'): what = m
     elif not any(e[3] for e in acc): what = 'load'
     else: what = 'store' if m in ('mov', 'movabs') or m.startswith('set') else 'rmw'
-    return {14: '#PF', 13: '#GP', 12: '#SS'}[f[0]] + ' ' + what + crossing
+    return {14: '#PF', 13: '#GP', 12: '#SS'}[f[0]] + ' ' + what + crossing + (' (div)' if m in ('div', 'idiv') else '')
 
 def offsets(lines):
     """(code, instruction start offsets and the end) from assembling the lines."""
@@ -206,6 +242,64 @@ def probes():
         out.append((f'fetch-{name}', REGS, lines, None, {'unmap': [0x101000], 'rip': 0x101000 - 11 - pad}))
         # Falling through (or straddling) the end of the lower canonical half: #GP at the next fetch.
         out.append((f'fetch-noncanonical-{name}', REGS, lines, None, {'rip': 0x8000_0000_0000 - 11 - pad}))
+    return out + division_probes()
+
+DIVISOR = {1: 'r9b', 2: 'r9w', 4: 'r9d', 8: 'r9'}
+SIZE = {1: 'byte', 2: 'word', 4: 'dword', 8: 'qword'}
+def division_probes():
+    """#DE cases: (rax, rdx, divisor) per width and signedness, register and memory divisors. Values outside an operand's
+    width are garbage the division must ignore. A `cmp` right before the division defines all six flags (CF set, so FEX
+    holds it inverted), which the #DE state must keep."""
+    out = []
+    def probe(name, setup, line, mut=None):
+        lines = PRELUDE + setup + ['cmp r13, r14', line] + AFTER
+        out.append((name, REGS, lines, len(lines) - len(AFTER) - 1, mut or {}))
+    M = 2**64 - 1
+    cases = {   # name -> {width: (rax, rdx, divisor) for div, idiv}
+        'zero': {w: ((0x1234_5678_9abc_def0, 0x77, 0x5500_0000_0000_0000 if w < 8 else 0),) * 2 for w in (1, 2, 4, 8)},
+        'overflow': {1: ((0x0505, 0, 5), (0xff80, 0, M)), 2: ((0x1111, 5, 5), (0x8000, 0xffff, M)),
+                     4: ((0, 0xffff_ffff_0000_0007, 7), (0x8000_0000, 0xffff_ffff, M)), 8: ((0, 5, 5), (2**63, M, M))},
+        'overflow-positive': {1: ((0x0100, 0, 0x3301), (0x0100, 0, 1)), 2: ((0, 0xffff, 0xffff), (0, 1, 1)),
+                              4: ((1, 0xffff_ffff, 0xffff_ffff), (0, 1, 1)), 8: ((0, M, 7), (0, 1, 1))},
+        'overflow-negative': {1: ((0xfe7f, 0, 0x7f), (0xfe7f, 0, 2)), 2: ((0x7fff, 0xffff, 0x7fff), (0, 0xfffe, 2)),
+                              4: ((0x7fff_ffff, 0x8000_0000, 0x7fff_ffff), (0, 0xffff_fffe, 2)), 8: ((1, 2**63, 2**63), (0, M - 1, 2))},
+    }
+    for case, by_width in cases.items():
+        for w, pair in by_width.items():
+            for m, (rax, rdx, d) in zip(('div', 'idiv'), pair):
+                assert divide_error(m == 'idiv', w, d, rax, rdx), (case, m, w)
+                setup = [f'movabs rax, {rax:#x}', f'movabs rdx, {rdx:#x}', f'movabs r9, {d:#x}']
+                probe(f'divide-{case}-{m}{8 * w}', setup, f'{m} {DIVISOR[w]}')
+                probe(f'divide-{case}-{m}{8 * w}-mem', setup + ['mov qword ptr [rsi + 8], r9'], f'{m} {SIZE[w]} ptr [rsi + 8]')
+    # A not-present divisor page faults before #DE (the byte at D + 0x1000 is zero); mapped, it is a zero divisor.
+    for m in ('div', 'idiv'):
+        setup = [f'movabs rbx, {D + 0x1000:#x}', 'movabs rax, 0x1234']
+        probe(f'divide-{m}-unmapped-zero-divisor', setup, f'{m} byte ptr [rbx]', {'unmap': [D + 0x1000]})
+        probe(f'divide-{m}-mapped-zero-divisor', setup, f'{m} byte ptr [rbx]')
+        probe(f'divide-{m}-crossing-unmapped', [f'movabs rbx, {D + 0xffe:#x}'], f'{m} dword ptr [rbx]', {'unmap': [D + 0x1000]})
+        probe(f'divide-{m}-rsp-unmapped', [f'movabs rsp, {S + 0x1000:#x}'], f'{m} qword ptr [rsp]', {'unmap': [S + 0x1000]})
+    # 64-bit divisions whose dividend needs 128 bits (FEX's helper call), each stored, then one that faults through the
+    # helper: inputs from a fixed seed (no expected values here: QEMU's prefix run is the reference).
+    import random
+    rng = random.Random(1027)
+    for m, signed in (('div', False), ('idiv', True)):
+        edges = [(0, 1, 2), (M, 2**63 - 1, 2**63), (0, M - 1, M)] if not signed else \
+                [(0, M, 2), (2**63, 0, M), (0, 2**62, 2**63), (5, M, 3), (1, M, 3)]
+        assert not any(divide_error(signed, 8, d, rax, rdx) for rax, rdx, d in edges)
+        while len(edges) < 24:
+            rax, d = rng.getrandbits(64), rng.getrandbits(rng.choice([8, 33, 63, 64])) | 1
+            rdx = rng.getrandbits(64) if signed else rng.randrange(1, max(2, d))
+            if signed and rng.random() < 0.5: rdx = M if rax >> 63 else 0     # FEX's inline path, mixed in
+            if (rdx != 0 or signed) and not divide_error(signed, 8, d, rax, rdx): edges.append((rax, rdx, d))
+        last = (3, 7, 7) if not signed else (0, 1, 1)     # high >= divisor; 2^64 / 1
+        assert divide_error(signed, 8, last[2], last[0], last[1])
+        for n in range(0, len(edges), 8):    # short programs: QEMU's in_asm log of a long translation block is unreliable
+            setup = []
+            for k, (rax, rdx, d) in enumerate(edges[n:n + 8]):
+                setup += [f'movabs rax, {rax:#x}', f'movabs rdx, {rdx:#x}', f'movabs rcx, {d:#x}', f'{m} rcx',
+                          f'mov qword ptr [rdi + {0x10 + 16 * k:#x}], rax', f'mov qword ptr [rdi + {0x18 + 16 * k:#x}], rdx']
+            setup += [f'movabs rax, {last[0]:#x}', f'movabs rdx, {last[1]:#x}', f'movabs rcx, {last[2]:#x}']
+            probe(f'divide-128-{m}-{n // 8}', setup, f'{m} rcx')
     return out
 
 def probe_program(name, regs, lines, rip):

@@ -47,7 +47,6 @@ inline Verdict Primary(uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
   case 0xC6: case 0xC7: return has_modrm && reg == 0 ? Allow() : Uns("group 11 other than mov");
   case 0xF6: case 0xF7:
     if (!has_modrm) return Uns("group 3 without ModRM");
-    if (reg == 6 || reg == 7) return Uns("div/idiv (admitted with S1f)");
     return reg == 1 ? Uns("test /1 alias") : Allow();
   case 0xFE: return has_modrm && reg <= 1 ? Allow() : Uns("group 4 other than inc/dec");
   case 0xFF:
