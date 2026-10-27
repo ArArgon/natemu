@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: natemu <natemu@example.invalid>
+Date: Tue, 27 Oct 2026 00:00:00 +0000
+Subject: [PATCH 5/6] FEXCore: slice1 block cutting and single-gate exits
+
+Both are guarded by the runtime flag fexc_slice1, so the default profile
+compiles as before.
+
+Decoder: record which opcode map produced each instruction
+(DecodedInst::FexcMap) so tools/fexc/shim/fexc_slice1.inc can classify
+instructions whose table identity is lost.
+
+Core.cpp::GenerateIR asks FexcSlice1::Cut before each instruction; on a
+cut the block ends with an ExitFunction to the instruction's RIP, or
+produces no code when it is the first instruction.
+
+Exits: ExitFunction takes FEX's BLOCK_DEBUGGING branch (no block linking)
+under the flag, registers the 8-byte RIP literal as a guest-RIP
+relocation, and the exit-linker literal is not emitted.
+---
+ FEXCore/Source/Interface/Core/Core.cpp         | 12 ++++++++++++
+ FEXCore/Source/Interface/Core/Frontend.cpp     | 18 ++++++++++--------
+ .../Source/Interface/Core/JIT/BranchOps.cpp    |  5 +++--
+ FEXCore/Source/Interface/Core/JIT/JIT.cpp      |  2 +-
+ .../Interface/Core/X86Tables/X86Tables.h       |  1 +
+ 5 files changed, 27 insertions(+), 11 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index b0c645f..95d9442 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -519,11 +519,14 @@ bool ContextImpl::CheckIfBlockIsCacheable(FEXCore::Core::InternalThreadState& Th
+   return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(GuestRIP), GuestRIP, MaxInst);
+ }
+ 
++#include <fexc_slice1.inc>
++
+ ContextImpl::GenerateIRResult
+ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, bool ExtendedDebugInfo, uint64_t MaxInst) {
+   FEXCORE_PROFILE_SCOPED("GenerateIR");
+ 
+   Thread->OpDispatcher->ResetWorkingList();
++  fexc_cut = {};
+ 
+   uint64_t TotalInstructions {0};
+   uint64_t TotalInstructionsLength {0};
+@@ -610,6 +613,15 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+         TableInfo = Block.DecodedInstructions[i].TableInfo;
+         DecodedInfo = &Block.DecodedInstructions[i];
+ 
++        if (fexc_slice1 && FexcSlice1::Cut(Block.BlockStatus, i + 1 == InstsInBlock, BlockInstructionsLength == 0, *DecodedInfo, InstAddress)) {
++          if (!BlockInstructionsLength) {
++            Thread->OpDispatcher->DelayedDisownBuffer();
++            return {std::nullopt, 0, 0, 0, 0};
++          }
++          Thread->OpDispatcher->ExitFunction(Thread->OpDispatcher->_InlineEntrypointOffset(GPRSize, InstAddress - GuestRIP));
++          break;
++        }
++
+ #ifdef ZYDIS_DISASSEMBLER
+         if (FEXCore::Config::Get_X86DISASSEMBLE()) {
+           const uint8_t* InstBytes = SyscallHandler->ResolveGuestCodePointer(InstAddress, DecodedInfo->InstSize, reinterpret_cast<const uint8_t*>(InstAddress));
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index f03da3d..184e12b 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -1,3 +1,4 @@
++#include <fexc_hook.h>
+ // SPDX-License-Identifier: MIT
+ /*
+ $info$
+@@ -885,7 +886,7 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstructionImpl(uint64_t PC) {
+ 
+           // Take a peek at the op just past the displacement
+           uint8_t LocalOp = ReadByte();
+-          return NormalOpHeader(&FEXCore::X86Tables::DDDNowOps[LocalOp], LocalOp);
++          { DecodeInst->FexcMap = 7; return NormalOpHeader(&FEXCore::X86Tables::DDDNowOps[LocalOp], LocalOp); }
+           break;
+         }
+       case 0x38: { // F38 Table!
+@@ -915,7 +916,7 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstructionImpl(uint64_t PC) {
+           DecodeInst->Flags &= ~DecodeFlags::FLAG_OPERAND_SIZE;
+           DecodeFlags::PopOpAddrIf(&DecodeInst->Flags, DecodeFlags::FLAG_OPERAND_SIZE_LAST);
+         }
+-        return NormalOpHeader(&FEXCore::X86Tables::H0F38TableOps[LocalOp], LocalOp);
++        { DecodeInst->FexcMap = 5; return NormalOpHeader(&FEXCore::X86Tables::H0F38TableOps[LocalOp], LocalOp); }
+         break;
+       }
+       case 0x3A: { // F3A Table!
+@@ -934,7 +935,7 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstructionImpl(uint64_t PC) {
+         }
+ 
+         uint16_t LocalOp = (Prefix << 8) | ReadByte();
+-        return NormalOpHeader(&FEXCore::X86Tables::H0F3ATableOps[LocalOp], LocalOp);
++        { DecodeInst->FexcMap = 6; return NormalOpHeader(&FEXCore::X86Tables::H0F3ATableOps[LocalOp], LocalOp); }
+         break;
+       }
+       default:
+@@ -951,25 +952,25 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstructionImpl(uint64_t PC) {
+ 
+           DecodeREXIfValid(-2);
+           if (NoOverlay) { // This section of the table ignores prefix extention
+-            return NormalOpHeader(&FEXCore::X86Tables::SecondBaseOps[EscapeOp], EscapeOp);
++            { DecodeInst->FexcMap = 1; return NormalOpHeader(&FEXCore::X86Tables::SecondBaseOps[EscapeOp], EscapeOp); }
+           } else if (LastEscapePrefix == 0xF3) { // REP
+             // Remove prefix so it doesn't effect calculations.
+             // This is only an escape prefix rather tan modifier now
+             DecodeInst->Flags &= ~DecodeFlags::FLAG_REP_PREFIX;
+-            return NormalOpHeader(&FEXCore::X86Tables::RepModOps[EscapeOp], EscapeOp);
++            { DecodeInst->FexcMap = 2; return NormalOpHeader(&FEXCore::X86Tables::RepModOps[EscapeOp], EscapeOp); }
+           } else if (LastEscapePrefix == 0xF2) { // REPNE
+             // Remove prefix so it doesn't effect calculations.
+             // This is only an escape prefix rather tan modifier now
+             DecodeInst->Flags &= ~DecodeFlags::FLAG_REPNE_PREFIX;
+-            return NormalOpHeader(&FEXCore::X86Tables::RepNEModOps[EscapeOp], EscapeOp);
++            { DecodeInst->FexcMap = 3; return NormalOpHeader(&FEXCore::X86Tables::RepNEModOps[EscapeOp], EscapeOp); }
+           } else if (LastEscapePrefix == 0x66 && !NoOverlay66) { // Operand Size
+             // Remove prefix so it doesn't effect calculations.
+             // This is only an escape prefix rather tan modifier now
+             DecodeInst->Flags &= ~DecodeFlags::FLAG_OPERAND_SIZE;
+             DecodeFlags::PopOpAddrIf(&DecodeInst->Flags, DecodeFlags::FLAG_OPERAND_SIZE_LAST);
+-            return NormalOpHeader(&FEXCore::X86Tables::OpSizeModOps[EscapeOp], EscapeOp);
++            { DecodeInst->FexcMap = 4; return NormalOpHeader(&FEXCore::X86Tables::OpSizeModOps[EscapeOp], EscapeOp); }
+           } else {
+-            return NormalOpHeader(&FEXCore::X86Tables::SecondBaseOps[EscapeOp], EscapeOp);
++            { DecodeInst->FexcMap = 1; return NormalOpHeader(&FEXCore::X86Tables::SecondBaseOps[EscapeOp], EscapeOp); }
+           }
+           break;
+         }
+@@ -1032,6 +1033,7 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstructionImpl(uint64_t PC) {
+           DecodeInst->REXIndex = InstructionSize;
+         } else {
+           DecodeREXIfValid();
++          DecodeInst->FexcMap = 0;
+           return NormalOpHeader(Info, Op);
+         }
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+index 5852d1e..23c25a0 100644
+--- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+@@ -1,3 +1,4 @@
++#include <fexc_hook.h>
+ // SPDX-License-Identifier: MIT
+ /*
+ $info$
+@@ -55,7 +56,7 @@ DEF_OP(ExitFunction) {
+ 
+   uint64_t NewRIP;
+ 
+-  if constexpr (Context::BLOCK_DEBUGGING) {
++  if (fexc_slice1 || Context::BLOCK_DEBUGGING) {
+     // Skip block linking when BLOCK_DEBUGGING as it adds overhead and is unncessary.
+     // This is a debug only feature and doesn't need caching help.
+     bool IsInlineRIP = IsInlineConstant(Op->NewRIP, &NewRIP) || IsInlineEntrypointOffset(Op->NewRIP, &NewRIP);
+@@ -72,7 +73,7 @@ DEF_OP(ExitFunction) {
+ 
+     if (IsInlineRIP) {
+       BindOrRestart(&l_ExitLink);
+-      dc64(NewRIP);
++      PlaceNamedSymbolLiteral(InsertGuestRIPLiteral(NewRIP));
+     }
+ 
+     return;
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index a9082e0..6d9c25c 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -1076,7 +1076,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+   }
+ 
+   BindOrRestart(&l_ExitLink);
+-  PlaceNamedSymbolLiteral(InsertNamedSymbolLiteral(RelocNamedSymbolLiteral::NamedSymbol::SYMBOL_LITERAL_EXITFUNCTION_LINKER));
++  if (!fexc_slice1) PlaceNamedSymbolLiteral(InsertNamedSymbolLiteral(RelocNamedSymbolLiteral::NamedSymbol::SYMBOL_LITERAL_EXITFUNCTION_LINKER));
+ 
+   // CodeSize not including the header or tail data.
+   const uint64_t CodeOnlySize = GetCursorAddress<uint8_t*>() - CodeBegin;
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h b/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
+index 3010516..2871fd2 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
++++ b/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
+@@ -241,6 +241,7 @@ struct DecodedInst {
+   uint8_t SIB;
+   uint8_t InstSize;
+   int8_t REXIndex;
++  uint8_t FexcMap; // natemu: FexcMap (shim/fexc_hook.h) that produced this instruction
+ };
+ 
+ union ModRMDecoded {

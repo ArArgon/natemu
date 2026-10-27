@@ -1,0 +1,4 @@
+[submodule "third_party/FEX"]
+	path = third_party/FEX
+	url = https://github.com/FEX-Emu/FEX
+	shallow = true

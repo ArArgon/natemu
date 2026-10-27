@@ -1,5 +1,5 @@
 // natemu (fexc) profile slice1: the allowlist of slice-1 instruction forms, applied to FEX's own decode.
-// Included from Core.cpp (patch.py) just before GenerateIR; FEXCore::X86Tables is in scope there.
+// Included from Core.cpp (patches/0005) just before GenerateIR; FEXCore::X86Tables is in scope there.
 //
 // The key is (opcode map, opcode byte, ModRM.reg where the opcode is a group) taken from the decoder's result
 // (DecodedInst::FexcMap/OPRaw/ModRM, which survive a decode failure) plus the decoder's prefix flags. This is

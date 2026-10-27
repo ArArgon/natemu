@@ -1,21 +1,28 @@
 #!/bin/sh
 # Build the native macOS FEXCore compiler subset (static library, fexc CLI, smoke check).
-#   build.sh ARCHIVE_DIR BUILD_DIR
-# ARCHIVE_DIR holds the pinned upstream.tar.gz + dependency-overlay.tar (the I4-V
-# producer's source/ directory). BUILD_DIR is created fresh: BUILD_DIR/src is the
-# extracted+patched FEX tree (never committed), BUILD_DIR/obj the CMake/Ninja build.
+#   build.sh BUILD_DIR
+# Source: the FEX submodule third_party/FEX (pinned commit) plus the externals the build uses (fmt, xxhash,
+# unordered_dense), patched with the series patches/*.patch in a scratch git worktree of the submodule. BUILD_DIR is
+# created fresh: BUILD_DIR/src is that worktree (patched, a git checkout so the series can be regenerated with
+# `git format-patch`; never committed), BUILD_DIR/obj the CMake/Ninja build. third_party/FEX itself is never modified.
 set -eu
-archives=$1
-build=$2
+build=$1
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-pin_up=97df6a9ccd3b870b7616a294afc8e637aeab8cb1d85bb70fb4ca0538942b6079
-pin_ov=17434ad9b7e62abaea61613ce35fda968e12b55c8d7314e9fba7a8c47d6cc701   # == tools/i4v_producer/producer.json source_inputs
-[ "$(shasum -a 256 "$archives/upstream.tar.gz" | cut -d' ' -f1)" = "$pin_up" ] || { echo "upstream.tar.gz differs from pin" >&2; exit 1; }
-[ "$(shasum -a 256 "$archives/dependency-overlay.tar" | cut -d' ' -f1)" = "$pin_ov" ] || { echo "overlay differs from pin" >&2; exit 1; }
-mkdir "$build" "$build/src"
-tar xzf "$archives/upstream.tar.gz" -C "$build/src" --strip-components=1   # FEX 48d71752e2a363d5535181f803b0b0e9666c1825
-tar xf "$archives/dependency-overlay.tar" -C "$build/src"
-python3 "$here/patch.py" "$build/src"
+root=$(CDPATH= cd -- "$here/../.." && pwd)
+fex=$root/third_party/FEX
+pin=48d71752e2a363d5535181f803b0b0e9666c1825   # == the third_party/FEX gitlink, tools/i4v_producer/producer.json upstream_commit
+externals="fmt xxhash unordered_dense"
+git -C "$root" submodule update --init --depth 1 third_party/FEX
+for e in $externals; do git -C "$fex" submodule update --init --depth 1 External/$e; done
+[ "$(git -C "$fex" rev-parse HEAD)" = "$pin" ] || { echo "third_party/FEX is not at the pinned commit $pin" >&2; exit 1; }
+git -C "$fex" worktree prune
+mkdir "$build"
+git -C "$fex" worktree add -q --detach "$build/src" "$pin"
+for e in $externals; do
+  mkdir -p "$build/src/External/$e"
+  git -C "$fex/External/$e" archive HEAD | tar x -C "$build/src/External/$e"
+done
+git -C "$build/src" -c user.name=natemu -c user.email=natemu@example.invalid am -q --whitespace=nowarn "$here"/patches/*.patch
 cmake -S "$here" -B "$build/obj" -G Ninja -DFEXC_SRC="$build/src" -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 cmake --build "$build/obj" --parallel 4

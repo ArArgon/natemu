@@ -14,18 +14,45 @@ programs and the emitted code. **S1c done**: profile `slice1` (allowlist block c
 ## Build
 
 ```sh
-tools/fexc/build.sh /Users/liaozping/orca/natemu-raw/i4v-producer-20261026-02/source BUILD_DIR
+git submodule update --init --depth 1 third_party/FEX      # build.sh also does this
+tools/fexc/build.sh BUILD_DIR
 ```
 
-`BUILD_DIR` must not exist. The script checks the SHA-256 of the pinned
-`upstream.tar.gz` (FEX `48d71752e2a363d5535181f803b0b0e9666c1825`) and
-`dependency-overlay.tar`, extracts them to `BUILD_DIR/src`, applies `patch.py`
-(every edit asserts its anchor, so it only applies to a fresh tree), configures
-`CMakeLists.txt` against that tree, builds with 4 jobs and runs
-`fexc_linktest --init` and `smoke.py`. Cold build about 25 s. Current tree:
-`/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/s1b1` (~490 MB:
-472 MB source, ~19 MB objects). Kept for comparison only: `s1c` (slice1 without the precision patches, the "before" of
-the cost numbers) and `c1b` (the v1 build without sites). No Docker, no Linux VM; needs Homebrew `cmake`, `ninja`, Apple clang.
+`BUILD_DIR` must not exist. FEX comes from the submodule `third_party/FEX`, pinned to upstream commit
+`48d71752e2a363d5535181f803b0b0e9666c1825` (`.gitmodules`: `shallow = true`). The script initialises the submodule and the
+three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`, each shallow at the revision FEX pins),
+checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
+into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
+jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
+(series applied as six commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+`git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
+
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series1` (identical `fexc` binary, byte for byte, to
+the earlier `s1b1` build that came from the archives and `patch.py`). Kept for comparison only: `s1b1`, `s1c` (slice1
+without the precision patches, the "before" of the cost numbers) and `c1b` (the v1 build without sites).
+
+The dependency archives of the old I4-V producer (`upstream.tar.gz`, `dependency-overlay.tar`) are no longer used; the
+submodule tree and the three externals are identical to them (the other overlay members, `vixl`, `jemalloc_glibc`,
+`range-v3`, `rpmalloc`, `cpp-optparse`, are not used by this build and not initialised). Running
+`upstream_tests/run_icount.py` additionally needs `git -C third_party/FEX submodule update --init --depth 1 External/vixl`
+(it builds a VIXL disassembler from it).
+
+### The patch series
+
+`patches/` is `git format-patch` output on top of the pinned commit (author `natemu`, fixed date), in order:
+
+| patch | purpose |
+|---|---|
+| 0001 | macOS arm64 portability: SpinWaitLock overloads, no PROT_EXEC for JIT buffers, `posix_memalign`, `memset` for `VirtualDontNeed`, 16 KiB host-page guard pages |
+| 0002 | guest-code window seam: `ResolveGuestCodePointer`, integer arithmetic on guest PCs in Frontend/Core |
+| 0003 | compile-only export hook (`fexc_compile_hook`, dense PC table) and extra `DebugData` (entry prologues, static register map) |
+| 0004 | access-site recording: CF inversion capture, `FexcAfterOp` in the JIT, spill size |
+| 0005 | slice1 block cutting (`FexcMap` in the decoder, `FexcSlice1::Cut`) and single-gate exits |
+| 0006 | slice1 precision (flag elimination, register allocation, pre-NZCV save) |
+
+Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in `shim/` and `fexc.cpp`; the patches only
+include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then
+`git -C BUILD_DIR/src format-patch --no-signature --zero-commit -o tools/fexc/patches 48d7175..HEAD`.
 
 ## What builds
 
@@ -65,7 +92,7 @@ Linux and drags in the application layer).
 - Generated files use FEX's own generators (`json_ir_generator.py`,
   `config_generator.py`); `git_version.h` is a fixed stub.
 
-`patch.py` (applied to the extracted tree):
+Patch 0001 (`patches/`):
 - `SpinWaitLock.h`: `size_t` is `unsigned long` on macOS but `uint64_t` is
   `unsigned long long`; add the missing overloads.
 - `AllocatorHooks.h`: JIT/dispatcher buffers are mapped without PROT_EXEC (macOS
@@ -74,7 +101,7 @@ Linux and drags in the application layer).
 - `AllocatorHooks.cpp`: macOS `aligned_alloc` rejects small alignments (returned
   NULL and crashed `CreateNewContext`); use `posix_memalign`.
 
-C1b patches in `patch.py`: the guest-code window seam from `i4v_producer/adapt.py`
+Patches 0002 and 0003 (C1b): the guest-code window seam from `i4v_producer/adapt.py`
 (`ResolveGuestCodePointer`, integer arithmetic on logical PCs in `Frontend.cpp/.h`,
 `Core.cpp`); the export hook (`shim/fexc_hook.h`, called from `ContextImpl::CompileCode`);
 extra `DebugData` fields (entry prologue end offsets, static register map, filled in
@@ -82,7 +109,7 @@ extra `DebugData` fields (entry prologue end offsets, static register map, fille
 `FEXC_HOST_PAGE_SIZE`, `VirtualDontNeed` zeroes with `memset` because macOS
 `MADV_DONTNEED` does not).
 
-S1a patches in `patch.py` (see "Access sites" below): `OpcodeDispatcher.h`/`Core.cpp` capture the dispatcher's CF
+Patch 0004 (S1a; see "Access sites" below): `OpcodeDispatcher.h`/`Core.cpp` capture the dispatcher's CF
 inversion at each `GuestOpcode`; `JIT.cpp` calls `FexcAfterOp` after every emitted IR op and keeps the spill size;
 `JITClass.h` declares it; `MemoryOps.cpp` includes `shim/fexc_sites.inc`, which defines it.
 
@@ -308,7 +335,7 @@ Numeric codes are shared with `shim/fexc_hook.h`.
 ## Precision (S1b1)
 
 Under `--profile slice1` only (the default profile's output is unchanged: identical JSON on the 64 fixtures, a 264-program
-generated corpus and the 613-form matrix, except the host address of FEX's exit-linker literal), `patch.py` applies the
+generated corpus and the 613-form matrix, except the host address of FEX's exit-linker literal), patch 0006 applies the
 [contract](../../docs/restructure/slice1-contract.md) §1 patches 2-5, with predicates in `shim/fexc_precision.h`:
 
 | patch | FEX file::function | change |

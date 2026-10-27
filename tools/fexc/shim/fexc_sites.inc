@@ -1,4 +1,4 @@
-// natemu fexc: guest-memory access-site recording. Included by patch.py into FEXCore's JIT/MemoryOps.cpp,
+// natemu fexc: guest-memory access-site recording. Included by patches/0004 into FEXCore's JIT/MemoryOps.cpp,
 // i.e. inside namespace FEXCore::CPU, so it can use the Arm64JITCore members that emit the ops.
 //
 // Why here: after RA every IR op has its final physical registers and its emitted native range
@@ -7,7 +7,7 @@
 // FEX emits IR ops in order and no later pass moves an access across a GuestOpcode, so the "current
 // GuestOpcode" is the owning guest instruction. The one exception is a fused push/pop pair (TryPostRAMerge
 // skips GuestOpcode), which is recorded as such and carries both guest offsets.
-// (fexc_hook.h and <cstring> are included at the top of MemoryOps.cpp by patch.py.)
+// (fexc_hook.h and <cstring> are included at the top of MemoryOps.cpp by patches/0004.)
 #include <fexc_precision.h>
 
 namespace {

@@ -1,5 +1,5 @@
 // natemu fexc, profile slice1: shared predicates of the precision patches (slice-1 contract §1, patches 2-5).
-// Included by patch.py into FEX's flag-elimination and register-allocation passes and by shim/fexc_sites.inc, after the
+// Included by patches/0006 into FEX's flag-elimination and register-allocation passes and by shim/fexc_sites.inc, after the
 // FEX IR headers. Every use is guarded by fexc_slice1; the default profile never reaches this code.
 #pragma once
 #include <fexc_hook.h>
