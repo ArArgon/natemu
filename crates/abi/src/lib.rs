@@ -59,6 +59,7 @@ pub mod stack_concurrent;
 pub mod stack_boundary;
 pub mod translation;
 pub mod validation;
+pub mod code_object;
 pub const SUCCESS: u64 = 1;
 pub const REJECTED: u64 = 2;
 pub const NATIVE_FAULT: u64 = 3;
