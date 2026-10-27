@@ -5,7 +5,7 @@ The end-to-end programs are compared with a tiny independent Python model of ADD
 import json, os, pathlib, shutil, subprocess, sys, unittest
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-import flags, ref
+import flags, ref, build_slice1
 
 RAW = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', HERE.parent.parent.parent / 'natemu-raw')) / 'reference-slice1-20261026-01'
 QEMU = RAW / 'pin' / 'qemu-x86_64-static'
@@ -87,5 +87,12 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(q[2]['memory'][0]['data'], bytes(want).hex())
         self.assertEqual(int(q[2]['rip'], 16), 0x100003)
         self.assertEqual(ref.compare(results[2], [int(x, 16) for x in q[2]['gpr']], int(q[2]['rflags'], 16), int(q[2]['rip'], 16), q[2]['memory']), [])
+
+class Slice1Fixtures(unittest.TestCase):
+    def test_fixtures_build_and_pins_hold(self):    # builds missing/stale fixtures; skips only if clang/Docker/QEMU are unavailable
+        try: build_slice1.build()
+        except build_slice1.Unavailable as e: self.skipTest(f'slice1 fixtures not buildable: {e}')
+        except subprocess.CalledProcessError as e: self.skipTest(f'slice1 fixture build failed to run: {e}')
+        self.assertEqual(sorted(json.loads(build_slice1.RECORD.read_text())['sha256']), ['expected.json', 'programs.json'])
 
 if __name__ == '__main__': unittest.main()

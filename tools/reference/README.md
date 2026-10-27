@@ -4,8 +4,9 @@ Runs any straight-line x86-64 program under the pinned QEMU Linux-user (same ima
 `tools/run_i4v_qemu.py`; container flags copied from it; no new image) and returns final GPRs,
 RFLAGS, RIP and memory. Nothing is keyed by program name. Independent of the compiler and the VM.
 
-    tools/with-env python3 tools/reference/gen_slice1.py -o fixtures/slice1/programs.json     # inputs (seeded, host clang)
-    tools/with-env python3 tools/reference/ref.py fixtures/slice1/programs.json -o fixtures/slice1/expected.json
+    tools/with-env python3 tools/reference/build_slice1.py                                   # build fixtures/slice1/{programs,expected}.json
+    tools/with-env python3 tools/reference/gen_slice1.py -o OUT.json                         # (what the build runs) inputs, seeded, host clang
+    tools/with-env python3 tools/reference/ref.py PROGRAMS.json -o RESULTS.json              # (what the build runs) QEMU results
     python3 -m unittest discover -s tools/reference                                        # self-check (needs Docker)
 
 Defaults: QEMU at `$NATEMU_RAW_ROOT/reference-slice1-20261026-01/pin/qemu-x86_64-static` (copy of the pinned
@@ -86,3 +87,18 @@ operands based on rsp/rbp/r12/r13 (special encodings), index forms, absolute and
 resolved by a second assembly pass). Non-faulting division: divisor is a freshly moved nonzero immediate (and not -1
 for idiv), the dividend high half is zeroed (div) or sign-extended with cbw/cwd/cdq/cqo (idiv), so the quotient fits.
 bsf/bsr: the source is a freshly moved nonzero immediate, so no zero-source behaviour is exercised.
+
+### Building the fixtures (not committed)
+
+`fixtures/slice1/programs.json` and `expected.json` are derived and git-ignored; run `build_slice1.py` (also called by
+`test_ref.py`) to create them at those same paths. It regenerates a file when it or `build.json` is missing, or its
+inputs changed (seed, `gen_slice1.py`/`ref.py`/`flags.py`/`container_entry.py` contents, programs, QEMU pins);
+otherwise it does nothing. Without Docker or the pinned QEMU it still builds `programs.json` and exits nonzero for `expected.json`
+(`--programs-only` skips that step; the test skips with the reason).
+
+- `fixtures/slice1/manifest.json` (committed) is the input pin: generator script + seed, and the QEMU identity
+  (`format`, image id, QEMU sha256, package, argv). Gate: `ref.py`'s image/QEMU pins and `expected.json`'s header must
+  equal it, else the build fails ("PIN MISMATCH"). Change it only when deliberately moving the pinned QEMU/image or seed.
+- Outputs are not hash-gated: host clang is not pinned, and correctness rests on QEMU plus `ref.py`'s per-run checks.
+- `fixtures/slice1/build.json` (git-ignored) records what was actually built: inputs, host clang version and sha256 of both
+  outputs. Cite it when reporting a verification run's corpus.
