@@ -118,6 +118,23 @@ requiring every obsolete path or internal layout to survive. Start dependent
 stock-kernel boot work when the needed general path is usable; complete cleanup
 and full ISA coverage are not prerequisites.
 
+## Phase boundary (owner, October 27)
+
+This restructuring pass stops before stock-kernel boot (I5), which is the next phase.
+It ends when: slice 2 (VM-resident code cache, in-VM dispatch and block linking,
+control flow, first speed numbers against QEMU TCG) works; up to four vCPUs run on the
+general execution path; the general path covers the behaviour the old specialized
+paths established (paging modes, mode/control transitions, ordering and coherence), so
+those paths are retired or kept as thin regression drivers over it; and the handoff to
+the boot phase is documented. Broad ISA, devices and exception delivery belong to the
+next phase except where these items need them.
+
+Performance (owner, October 27): no performance tuning in this phase. Build the
+architectural pieces (code cache, dispatch, linking) and report measurements against
+the agreed yardstick (qemu-system-x86_64 TCG natively on the host; first targets
+integer loop ≤ 1.0×, memory loop ≤ 0.7× QEMU time), but optimisations are deferred and
+the targets do not gate this phase.
+
 ## Correctness and execution discipline
 
 Use short implementation assignments with a concrete runnable result, an explicit
