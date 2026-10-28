@@ -333,8 +333,10 @@ pub(crate) enum Stop {
     NoCode(String),
     /// The resident stopped the VM: `State::stop` (0 for a non-execution stop) and the shared status/detail.
     Resident { stop: u64, status: u64, detail: u64 },
-    /// The watchdog forced the vCPU out (imprecise: the bank is not current).
-    Watchdog,
+    /// The watchdog forced the vCPU out (imprecise: the bank is not current) at native `pc`: in guest code (a guest
+    /// loop ran past the budget) or in the resident (a resident wait, e.g. for a peer's shadow reset, never ended);
+    /// `asked` = the peers whose `SHADOWS` request was still pending then (bit p: vCPU p).
+    Watchdog { pc: u64, asked: u8 },
     /// A peer's failure cancelled the run (imprecise when the vCPU was forced out).
     Cancelled,
 }
@@ -356,14 +358,16 @@ impl Server {
         let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
         Ok(Self { child, stdin, stdout })
     }
-    /// The server's reply to one request body: (fexc's exit code for it, JSON report or error text, object).
-    fn request(&mut self, body: &[u8]) -> std::io::Result<(i32, Vec<u8>, Vec<u8>)> {
+    /// The server's reply to one request body: (fexc's exit code for it, JSON report or error text, object); a
+    /// `TimedOut` error when the whole reply has not arrived by `deadline`. (The request itself is written without a
+    /// deadline: a body is at most a few KiB, which the pipe takes whether or not the server reads.)
+    fn request(&mut self, body: &[u8], deadline: Instant) -> std::io::Result<(i32, Vec<u8>, Vec<u8>)> {
         self.stdin.write_all(&(body.len() as u32).to_le_bytes())?;
         self.stdin.write_all(body)?;
         let mut word = [0; 4];
-        self.stdout.read_exact(&mut word)?;
+        self.read_by(&mut word, deadline)?;
         let mut reply = vec![0; u32::from_le_bytes(word) as usize];
-        self.stdout.read_exact(&mut reply)?;
+        self.read_by(&mut reply, deadline)?;
         let field = |at: usize| u32::from_le_bytes(reply[at..at + 4].try_into().unwrap()) as usize;
         if reply.len() < 12 || reply.len() != 12 + field(4) + field(8) {
             return Err(std::io::Error::other("malformed fexc reply"));
@@ -372,6 +376,51 @@ impl Server {
         let object = reply.split_off(12 + json_len);
         let json = reply.split_off(12);
         Ok((code, json, object))
+    }
+    /// Fills `buf` from the server's stdout, waiting (poll) at most until `deadline`.
+    fn read_by(&mut self, buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
+        #[repr(C)]
+        struct PollFd {
+            fd: i32,
+            events: i16,
+            revents: i16,
+        }
+        unsafe extern "C" {
+            fn poll(fds: *mut PollFd, count: u32, timeout_ms: i32) -> i32;
+        }
+        const POLLIN: i16 = 1;
+        let mut done = 0;
+        while done < buf.len() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let mut fd = PollFd { fd: std::os::fd::AsRawFd::as_raw_fd(&self.stdout), events: POLLIN, revents: 0 };
+            match unsafe { poll(&mut fd, 1, left.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32) } {
+                0 => return Err(std::io::ErrorKind::TimedOut.into()),
+                n if n < 0 => {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(e);
+                    }
+                }
+                _ => match self.stdout.read(&mut buf[done..])? {
+                    0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                    n => done += n,
+                },
+            }
+        }
+        Ok(())
+    }
+    /// A failed request's error, naming the server and, if it has exited, how (its pipes close as it exits, so a dead
+    /// server is normally reaped here at once; wait briefly for the exit status).
+    fn failed(&mut self, e: std::io::Error) -> String {
+        let pid = self.child.id();
+        for _ in 0..100 {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return format!("fexc --serve (pid {pid}) exited ({status}): {e}"),
+                Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+                Err(_) => break,
+            }
+        }
+        format!("fexc --serve (pid {pid}) failed, still running: {e}")
     }
 }
 impl Drop for Server {
@@ -412,7 +461,18 @@ pub(crate) struct Compiler {
     /// Test drivers only: rewrites each admitted object before it is staged, to check the resident's run-time defences
     /// against code admission refuses.
     pub(crate) tamper: Option<fn(&mut [u8])>,
+    /// How long one request may wait for the server's whole reply (the first one includes the server's start); then the
+    /// server is killed and the run fails with a host error ([`COMPILE_DEADLINE`] by default).
+    pub(crate) deadline: Duration,
+    /// The longest request so far (reply received), for the deadline's margin.
+    pub(crate) slowest: Duration,
+    /// Test drivers only: once `.0` requests have reached the server, it gets signal `.1` before the next (SIGKILL: the
+    /// server dies mid-run; SIGSTOP: it stays alive and never answers). The run must fail with the cause.
+    pub(crate) signal_at: Option<(u64, i32)>,
 }
+/// The default [`Compiler::deadline`]: a large multiple of the slowest compile measured on the regression sets
+/// (S3h: at most 13.4 ms, server start included, over 6,080 vCPU runs of the corpora at N = 4 and N = 2 with block size 1).
+pub(crate) const COMPILE_DEADLINE: Duration = Duration::from_secs(30);
 impl Compiler {
     pub(crate) fn new(fexc: &Path, cpu: &Vcpu, max_instructions: Option<u32>) -> Result<Self> {
         let mut id = [0; admission::ID_REGISTERS.len()];
@@ -422,7 +482,7 @@ impl Compiler {
         Ok(Self::with_features(fexc, admission::supported_features(&id), max_instructions))
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
-        Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), compiles: 0, hits: 0, tamper: None }
+        Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), compiles: 0, hits: 0, tamper: None, deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, signal_at: None }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
     /// `rip` the resident executes, or fexc's end reason when it produced no code.
@@ -442,7 +502,23 @@ impl Compiler {
             if self.server.is_none() {
                 self.server = Some(Server::start(&self.fexc)?);
             }
-            let (code, json, object) = self.server.as_mut().unwrap().request(&body).map_err(|e| format!("fexc: {e}"))?;
+            let server = self.server.as_mut().unwrap();
+            if let Some((_, signal)) = self.signal_at.filter(|s| s.0 == self.compiles) {
+                unsafe extern "C" {
+                    fn kill(pid: i32, signal: i32) -> i32;
+                }
+                unsafe { kill(server.child.id() as i32, signal) };
+            }
+            let began = Instant::now();
+            let (code, json, object) = match server.request(&body, began + self.deadline) {
+                Ok(reply) => reply,
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    let _ = server.child.kill();
+                    return Err(format!("{}: no reply within {:?}, killed", server.failed(e), self.deadline));
+                }
+                Err(e) => return Err(server.failed(e)),
+            };
+            self.slowest = self.slowest.max(began.elapsed());
             self.compiles += 1;
             let compiled = match code {
                 0 => Compiled::Object(object),
@@ -544,13 +620,17 @@ pub(crate) struct Requests {
     /// Translation requests answered with a block, and the distinct RIPs among them (single-step requests not included).
     pub(crate) blocks: u64,
     pub(crate) rips: std::collections::HashSet<u64>,
-    /// Test drivers only: called with the vCPU stopped, the block staged and the reply not yet written, until it returns
-    /// true (it corrupted something); then `tampered` is set. Checks the resident's run-time defences.
+    /// Test drivers only: called at each reply but a park, with the vCPU stopped, the reply (`State::reply`) and its block
+    /// or decode in place but not yet seen by the resident, until it returns true (it corrupted something, possibly the
+    /// reply kind); then `tampered` is set. Checks the resident's run-time defences.
     pub(crate) tamper: Option<fn(Area, &mut State) -> bool>,
     pub(crate) tampered: bool,
     /// Test drivers only: the first stop enters the stop gate with a forged ELR (the word after the stop store); the
     /// resident must halt (`bad_stop`). Sets `tampered`.
     pub(crate) forge_stop: bool,
+    /// Test drivers only: every stop resumes at its stop store without entering the gate, so the vCPU never drains while
+    /// it runs linked code (a peer that never answers `SHADOWS`); the waiter must be contained by its watchdog.
+    pub(crate) ignore_stops: bool,
 }
 
 /// Runs the vCPU (entered at the resident, see [`enter`]) until it stops; `stop_at` is a RIP at
@@ -619,11 +699,21 @@ fn serve(
         let _ = running.send(false);
         let exit = match exit? {
             vm::Exit::Hvc(immediate) => immediate,
-            vm::Exit::Cancelled => return Ok(if cancelled.load(SeqCst) { Stop::Cancelled } else { Stop::Watchdog }),
+            vm::Exit::Cancelled if cancelled.load(SeqCst) => return Ok(Stop::Cancelled),
+            vm::Exit::Cancelled => {
+                let asked = (0..cache::MAX_VCPUS)
+                    .filter(|&p| p != v && record_word(area.memory, p, None).load(SeqCst) & cache::SHADOWS != 0)
+                    .fold(0, |m, p| m | 1 << p);
+                return Ok(Stop::Watchdog { pc: cpu.reg(PC)?, asked });
+            }
             vm::Exit::Stage2 { syndrome, ipa } => {
                 // Only a kick's stop restores the granule: a kick that found the vCPU in the host stays in force.
                 let pc = cpu.reg(PC)?;
                 stops.stopped(v, syndrome, ipa, pc, exited)?;
+                if requests.ignore_stops {
+                    requests.tampered = true;
+                    continue; // resumes at the stop store, never entering the gate: nothing is drained
+                }
                 let state: State = area.read_record(exec::STATE_OFFSET);
                 if !resident::contains(state.stop_gate, 4) {
                     return Err(format!("stop gate {:#x} outside the resident", state.stop_gate));
@@ -668,6 +758,11 @@ fn serve(
                 exec::REPLY_PARK
             }
         };
+        if let Some(tamper) = requests.tamper.filter(|_| parked.is_none()) {
+            if tamper(area, &mut state) {
+                (requests.tamper, requests.tampered) = (None, true);
+            }
+        }
         area.write_record(exec::STATE_OFFSET, state);
     }
 }
@@ -704,11 +799,6 @@ fn translation(
         // A step request is for a block's access site, never a system instruction.
         Code::System(s) if !step => {
             state.system = s;
-            if let Some(tamper) = requests.tamper {
-                if tamper(area, state) {
-                    (requests.tamper, requests.tampered) = (None, true);
-                }
-            }
             return Ok(Ok(exec::REPLY_SYSTEM));
         }
         Code::System(_) => return Err(format!("step at {rip:#x}: a system instruction")),
@@ -732,11 +822,6 @@ fn translation(
     }
     state.link_points = [exec::LinkPoint::NONE; exec::MAX_LINK_POINTS];
     state.link_points[..block.links.len()].copy_from_slice(&block.links);
-    if let Some(tamper) = requests.tamper {
-        if tamper(area, state) {
-            (requests.tamper, requests.tampered) = (None, true);
-        }
-    }
     Ok(Ok(exec::REPLY_ADMITTED))
 }
 

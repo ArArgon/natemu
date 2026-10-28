@@ -126,12 +126,12 @@ LOCK ADD/CMPXCHG/XADD/BT* and CMPXCHG16B wait for the boot phase.
 | --- | --- | --- |
 | I1 entry, I2 live translation, I3 paging/allocated, address, stack | Nothing new: slices 1–2 cover them (fault sets, guard, split, precision verifier, admission). Port I3 cells the slice-1 fault matrix lacks (CR0.WP=0, 2 MiB leaves, reserved bits, SMEP, carry/overflow) as generated cases. REP and FP cells wait for that ISA. Retained-route completion (42) and the resident stack bound (62): a general-path check or an explicit retirement reason. | Deleted at S3a2 (below). |
 | Six-program QEMU check, gate-binary audit | `run_i4v_qemu.py` binds native reports of six programs. Two of them (`live-low-low_operand`, `stack-low-low_stack`) were cells S3a2 deleted, so the check now reproduces only from bundles retained before S3a2; the general-path corpora against QEMU (fixtures, seed corpora, faults) cover those programs' behaviour. The four ordering programs (xchg, lfence, sfence, mfence) live until the ordering family goes. `tools/reference/ref.py` takes its QEMU pins from `run_i4v_qemu.py`. | Delete at S3i (move the pins). |
-| I4 entry/faults/remap/compose/pressure; seeded progress, schedule, partial progress | N vCPUs (S3a), coherence (S3d, S3f). Contracts 45–48 and 53 describe the old global service lock and FIFO; the new design has no global lock, so they retire; progress is checked by S3h. REP partial progress (44): boot-phase handoff. | Delete at S3h. |
+| I4 entry/faults/remap/compose/pressure; seeded progress, schedule, partial progress | N vCPUs (S3a), coherence (S3d, S3f). Contracts 45–48 and 53 describe the old global service lock and FIFO; the new design has no global lock, so they retire; progress is checked by S3h. REP partial progress (44): boot-phase handoff. | Mapped at S3h (table there); delete at S3i. |
 | I4 events (49) | Interrupt delivery: boot phase (handoff item). | Delete; rebuilt with delivery. |
 | Aliases, concurrent stack, stack boundary | Per-vCPU INVLPG (S3c), shared tables (S3f); #SS and split pushes are slice 1. | Re-express in S3f, delete. |
 | Coherence (four-level parent, A/D, size) | S3c + S3f. Legacy and PAE variants need S3g. | Re-express in S3f/S3g, delete. |
 | Ordering, fence, atomic progress | Fences and memory XCHG (§2), litmus programs (S3e). LFENCE register capture (51) needs SSE: handoff item. | Re-express in S3e, delete. |
-| Containment | Tamper hooks per vCPU, cancellation, fresh-process control (S3h). | Re-express in S3h, delete. |
+| Containment | Tamper hooks per vCPU, cancellation, fresh-process control (S3h). | Re-expressed in S3h (table there); delete at S3i. |
 | Controls (39), concurrent controls (33) | Long mode: resident system transactions and a multi-vCPU cell (S3c). Legacy/PAE, PDPTEs, IA-32e activation, far transfers: S3g. | S3c + S3g, delete. |
 | Paging-off, mixed modes | 32-bit flat profile + paging-off identity resolver (S3g). | S3g, delete. |
 | Paging-off steps, address forms (segment bases/limits, CS limit, A20, 16-bit address size, linear wrap, device, hole) | Nothing this phase (owner decision 1): refused by admission or the resolver. | Boot phase if needed; delete at S3i. |
@@ -176,7 +176,7 @@ boot-phase CPUID must report Page1GB=0. The A bit of a non-leaf entry is set by 
 | Old check | General-path check, or reason |
 | --- | --- |
 | I1 control, live_load ×4 (exact effects, ADD flags incl. carry/overflow, preserved state: 1, 2) | Fixtures and seed corpora vs QEMU (registers, flags, memory), ASM suite, `frame_intact` every run. |
-| I1 fault (unknown native exception traps, no guessed guest fault: 56) | Resident `aborted`: an abort at an unknown PC or with a syndrome not its site's kind halts (`unknown_abort`/`site_mismatch`) before any effect. No run-time test forces one yet (gap: an S3h tamper). |
+| I1 fault (unknown native exception traps, no guessed guest fault: 56) | Resident `aborted`: an abort at an unknown PC or with a syndrome not its site's kind halts (`unknown_abort`/`site_mismatch`) before any effect. S3h: `--tamper site` (sites off the instruction grid → `unknown_abort`) and `site-kind` (load/store sites claiming to be guard stubs → `site_mismatch`) on every vCPU at N = 1..4 (`contain`). |
 | I1 eight submission mutations, N=2 refusal (55, 54) | Admission refuses malformed objects (host unit tests); resident `request` refuses bad replies (`--tamper offset` → `bad_reply`); link defences (`--forge-header`, `--tamper*`); N=0/5 refused (`limits`, unit test). |
 | I2 live, capacity (38) | Host requests = distinct blocks per vCPU (`run_slice3_vm.py`), exact-request compile cache (unit test), small-cache flush probes. |
 | I2 source_stale (34) | S2e SMC probes, FEX SelfModifyingCode in the ASM suite, seed corpora own-page stores. |
@@ -368,6 +368,69 @@ their campaigns retire:** runtime/abi family code (modes are layered: `translati
   process healthy; a peer that never acks a shootdown, compile-server death and a malformed reply on vCPUs 1–3; all vCPUs
   finish under sustained cross-vCPU code writes; one vCPU finishes while a peer misses on its page; watchdog contains a
   stuck wait.
+  *Built (Oct 28):* `tools/run_slice3_vm.py contain`; no resident change, no containment defect found: every failure ended
+  as §1 designs it (a halt or host error cancels the peers, which stop at their next host exit or are forced out; a
+  resident wait on a peer that never drains is bounded only by the waiter's watchdog). Driver hooks (opt-in, on
+  `--tamper-vcpu V`; nothing changes without them): the reply tamper now runs in the service loop at every reply but a
+  park, after the reply kind is set, so it may change the kind (`--tamper next-page`: a block request answered with
+  `REPLY_NEXT_PAGE`, then again after the next page was walked → `bad_reply`; S3d review carry-over); `--tamper site`
+  and `site-kind` (above, contract 56); `--ignore-kicks` (every stop resumes at its stop store without the gate, so the
+  vCPU never drains while in linked code); `--kill-compiler N` (SIGKILL of its `fexc --serve` before request N + 1); `--stall-compiler N` (SIGSTOP there: alive,
+  never answering).
+  General mechanisms added: (a) a watchdog stop reports where the vCPU was (`guest` code or `resident`, native PC) and
+  which peers' `SHADOWS` request was still pending; (b) a failed compile-server request names the server, its PID and its
+  exit (`owner 2: fexc --serve (pid P) exited (signal: 9 (SIGKILL)): …`, exit status 1); (c) every `run-program` writes a
+  `teardown:` line after destroying the VM, on success and on failure (before, a kicker or setup error returned before
+  the explicit destroy and left it to `Drop`): vCPUs joined, vCPUs destroyed with status 0, the VM's destroy status and
+  the child processes left (`waitpid(-1, WNOHANG)`: ECHILD = no compile server alive or unreaped); (d) every
+  compile-server request has a deadline for its whole reply (`--compile-deadline-ms`, default 30 s: the slowest compile
+  measured on the corpora, 6,080 vCPU runs at N = 4 and at N = 2 with block size 1, took 13.4 ms with the server's start);
+  on expiry the server is killed and the run fails as when it dies (`owner k: fexc --serve (pid P) exited (signal: 9
+  (SIGKILL)): timed out: no reply within 30s, killed`). The request body is written without a deadline (a few KiB,
+  which the pipe takes whether or not the server reads).
+  *Checks (each failing run is one process, must end within 10 s, or the watchdog + 5 s, and print a clean teardown
+  line; a fresh process follows each at once with N fixture programs on N vCPUs, which must match QEMU):* (1, 4) ten
+  tampers (forged header, link-point offset, next-page twice, system decode, linked word, literal and record before a
+  flush, forged stop PC, sites off the grid, wrong site kind) on each vCPU v at N = 1..4, the others in linked loops:
+  v halts with its defence's stop, the others are `cancelled`, exit 0: 100 runs (10 tampers × 10 vCPU positions), all as stated, each run ≤ 0.16 s. (2) A peer that never answers a
+  shootdown (`unacked`, vCPU k = 1..3 of 4; k keeps exiting on host kicks every millisecond, so only the waiter's own
+  watchdog can fire): vCPU 0 stops `watchdog`, `resident`, with k's `SHADOWS` pending, k `cancelled`, the others ended;
+  the untampered control matches QEMU with one shootdown: 3 of 3 (each 1.04 s at a 1 s watchdog), control ok. (3) vCPU k's compile server killed before its
+  51st request (k = 1..3 of 4): exit 1, the vCPU, server and signal named: 3 of 3 (≤ 0.05 s); the same server stopped instead
+  (`--stall-compiler`, deadline 2 s): exit 1, the vCPU, server and "no reply within 2s" named: 3 of 3 (2.06 s). (5) A guest `jmp $` on vCPU v
+  of 4 (watchdog 1 s) stops `watchdog`, `guest`, while the others reach their ends and match: 4 of 4 (1.04 s at a 1 s watchdog). A guest that
+  legitimately spins (vCPU 0 waits in a linked loop for a flag vCPU 1 raises after 1.5·10^9 delay rounds, ~0.7 s): a
+  `guest` watchdog stop at a 300 ms budget, both vCPUs at their ends at the default 10 s. Progress (as `coherence`, QEMU
+  reference, block sizes default and 1): `mutual`, `data`, `rewrite` at 2 and 4 vCPUs and `stale` at 3 and 4 (sustained
+  cross-vCPU code writes), `finish` and `finish-late` at 2 and 4 (vCPUs ending before or while a peer translates their
+  page): 12 programs × 2 block sizes, 24 of 24 match. Fresh-process controls: 113 of 113 healthy, each with a clean teardown line.
+  **Watchdog: legitimate spin or containment failure.** The watchdog bounds each span inside `hv_vcpu_run` without a host
+  exit (host work between exits is not counted), guest code and resident waits alike. A guest that legitimately spins
+  past the budget gets the same stop as a loop that never ends: the budget (10 s, `--watchdog-ms`) is policy, and the
+  report is the diagnosis: `guest pc=…` (the guest's own loop; a containment failure only if the guest was waiting for
+  something the emulator owed it) or `resident pc=… shadows_asked=[k]` (the emulator itself waited, on vCPU k). A
+  resident wait for a peer also counts the peer's host service time (a compile) into the waiter's span: milliseconds in
+  practice, not bounded by design (the compile deadline bounds each such compile).
+
+  **Old containment and progress checks → S3h check or retirement reason** (S3i deletes the families: drivers
+  `i4v-containment`, `i4v-progress`; `check_i4v_containment.py` and its test and testdata, `test_containment_supervisor.py`,
+  `check_i4v_schedule.py`, `check_i4v_progress_protocols.py`, `check_i4v_atomic_progress.py`,
+  `check_i4v_partial_progress.py` and their tests, `check_i4_pressure.py`, `run_i4v.py --progress/--containment`,
+  `run_i1.py --i4-pressure`).
+
+  | Old contract or check | General-path check, or reason |
+  | --- | --- |
+  | 45 fault service serialized (exclusive service, FIFO, one operation per vCPU; `check_i4`, `check_i4v_progress_protocols`, concurrent controls and coherence traces) | Retired: there is no global service lock or queue. Each vCPU serves its own faults in its own resident; cross-vCPU state is atomic RMWs on masks, records and counters (§1). Guest-visible consequences: `coherence`, `sharedpt`, `litmus`. |
+  | 46 acknowledgement after covered effects; admission reopens after the owner set | Replaced by the one synchronous shootdown (§1): the waiter goes on only after the peer's reset counter moved (its `tlbi` + `dsb ish` done). `coherence` `fresh-reused` (negative control: shootdown off fails); `contain` `unacked` (served when untampered; never served: the waiter waits until its watchdog). Remap acknowledgements: retired at S3a2 (42). |
+  | 47 progress under sustained maintenance (≤ 8 queued heads, round robin; `check_i4_pressure`, concurrent families) | Progress without a fairness bound: `contain` progress (every vCPU reaches its end under sustained cross-vCPU code writes and while a peer translates a finishing vCPU's page), `litmus` (every vCPU completes its K iterations), `sharedpt` contended walks (6,000 per walker). A block killed as it is placed steps one instruction, so a miss always progresses; known limits, both measured: `data@4` steps every instruction (S3d cliff) and a no-pause PTE store loop starves walks (S3f, watchdog-contained). The heads bound retires with the queue. |
+  | 48 capacity exhaustion is a state-preserving refusal (queue full; I2 capacity) | Retired: no queue; invalidation records are bitmaps (no capacity, no overflow, no lost entry), and a full code cache flushes (probes with a small `--code-cache`). |
+  | 53 seeded schedules replay exactly | Retired: a test mechanism of the old coordinator's schedule points. The general path runs real concurrency; outcomes are judged by models (`litmus`, `sharedpt`) or by programs deterministic by construction against QEMU (`smp`, `coherence`). |
+  | 57 contained failure with the original cause, within bounds | `contain`: tamper halts (typed stop name), compile-server death (vCPU, PID, signal), a compile server that never answers (killed at its request deadline; vCPU, PID, deadline named), a peer that never acknowledges (waiter `watchdog`, `resident`, the peer named), every run within its bound (measured below). Old kinds: worker exit → compile-server death; a hung worker → the request deadline (`stall`); malformed reply → `offset`, `next-page`, `system`; resident panic holding the coordinator lock → any resident halt (there is no lock); withheld acknowledgement → `unacked`; cancellation with deferred work → retired (requests are synchronous: nothing is deferred; peers stop at their next host exit or are forced out). |
+  | 58 failure never fabricates completion | `contain`: the tampered vCPU stops `resident` with its reason and peers `cancelled`, never `reached`; a host error exits 1 without a state report. The frozen-trace replay retires with the trace; a halt banks the state, a `watchdog` or `cancelled` stop is reported imprecise. |
+  | 59 a fresh machine after a failure is healthy | `contain`: a fresh process right after every failing run, its N fixture programs matching QEMU. |
+  | 60 owned compiler processes always cleaned up | `contain`: `teardown: … children none` after every run, failing and fresh, also after a server killed at its request deadline. Container ownership (tokens, immutable ids) retires with Docker: fexc runs natively. |
+  | Containment campaign (25 cells + 25 fresh controls; detection ≤ 3 s, joined stop ≤ 10 s; N3 untested) | `contain` covers N = 1..4 for every tamper; measured below. The gate-relative outer watchdog (`experiments/track01/run_check.py`) is replaced by the per-vCPU watchdog (time in the VM), the compile-request deadline (time in the compiler) and the runner's bound. |
+  | Seeded progress families (stack, controls, coherence, atomic × N1–4 × seeds; partial) | Stack, controls and coherence: S3a2, S3c2, S3d/S3f checks; atomic progress: `litmus` XCHG chains and S3r `xchg-lock`; partial (REP, 44): boot-phase handoff. |
 - **S3i, retirement and handoff.** Delete the `families` feature (runtime/abi `families/`), drivers `i4v_*`,
   `concurrent*`, `recovery` (`i1`, `i2_i3`, `i4v` and `i4v_stack` went at S3a2), abi `translation`/`recovery`/`pressure`/
   `concurrency` and lib.rs bodies, runtime `coordinator`, `hvc #0x4a`/`OwnerService`, old runners/checkers/workers

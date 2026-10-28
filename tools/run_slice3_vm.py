@@ -15,6 +15,8 @@
         [--parallel P]
     tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR sharedpt [--programs SUBSTR,...] [--reps R]
         [--cpus 2 4] [--parallel P]
+    tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR contain [--cpus-contain 1 2 3 4] [--watchdog-ms MS] [--compile-deadline-ms MS]
+        [--spin-iterations I] [--no-progress] [--reps R]
 
 `corpora`: the single-vCPU corpora — the slice-1 fixtures, the control-flow corpus (default: the S2d run's
 programs and QEMU results under NATEMU_RAW_ROOT/s2d/corpus) and the slice-1 fault cases (QEMU prefix references, as
@@ -78,6 +80,26 @@ contended A/D walks (data, fetch, both) that must never halt; at 2 and 4 vCPUs (
 `limits`: 5 vCPUs are refused (0 cannot be written: a description without `cpu` lines is one vCPU; the host's
 `prepare` refuses 0 in its unit test); a forged block header on vCPU V of 4 (V = 0..3; the others spin in a linked
 loop) halts V with bad_link, cancels and joins the others, and the VM is destroyed (the driver reports only then).
+
+`contain` (S3h, containment and progress; runs one at a time, each a fresh process). Every failing run must exit as stated,
+end within its bound (10 s; watchdog runs: the watchdog + 5 s) and print the driver's teardown line with every vCPU joined
+and destroyed, the VM destroyed (status 0) and no child process left (no compile server alive or unreaped); each is
+followed at once by a fresh process running fixture programs on as many vCPUs, which must match QEMU. (1, 4) Every
+run-time tamper of the driver (forged header, link-point offset, next-page reply given twice, system decode, linked word,
+literal and record before a flush, forged stop PC, access sites off the instruction grid or of the wrong kind) on each vCPU v at N = 1..4, the others in linked loops: v halts with
+its defence's stop (bad_link, bad_reply, bad_stop, unknown_abort, site_mismatch), the others are cancelled, exit 0. (2) A peer that never answers a
+shootdown (`--ignore-kicks` on vCPU k = 1..3 of 4: its stops resume without the gate, so it never drains, while a host
+kicker keeps it exiting every millisecond): vCPU 0, waiting in the resident for k's shadow reset, is stopped by its
+watchdog, reported `resident` with k's `SHADOWS` request still pending; k is cancelled; an untampered control matches QEMU
+with a shootdown. (3) vCPU k's compile server (k = 1..3 of 4) killed before its 51st request: exit 1, stderr names the
+vCPU, the server and its signal; the same server stopped instead (SIGSTOP: alive, never answering): the request deadline
+(`--compile-deadline-ms`, 2 s here, driver default 30 s) kills it, exit 1, stderr names the vCPU, the server and
+"no reply within". (5) A guest loop that never ends on vCPU v of 4 is stopped by the watchdog (`guest`)
+while the others reach their ends and match; a guest that legitimately spins past a tight budget is a `guest` watchdog
+stop, and reaches its end under the default budget: the watchdog bounds every span inside the VM without a host exit, so
+budget and location (guest code or resident) are what separate the two, not the stop kind. Progress: the coherence
+programs with sustained cross-vCPU code writes (`mutual`, `data`, `rewrite`, `stale`) and CPUs ending while a peer
+translates their page (`finish`, `finish-late`), as `coherence` (QEMU reference, block sizes default and 1).
 
 Writes DIR/<mode>.json; exit status 1 on any failure."""
 import argparse, collections, concurrent.futures as cf, json, os, pathlib, random, subprocess, sys
@@ -593,7 +615,15 @@ def cmd_system(a, host, runtime):
 
 
 def cmd_coherence(a, host, runtime):
-    programs = [p for p in json.loads((ROOT / 'tools/bench/smp/coherence.json').read_text()) if not a.programs or any(n in p['name'] for n in a.programs)]
+    failures, report = coherence_runs(a, host, runtime, a.programs)
+    for f in failures: print(f)
+    (a.out / 'coherence.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
+    return len(failures)
+
+
+def coherence_runs(a, host, runtime, names):
+    """The coherence.json programs whose names contain one of `names` (all if None), as cmd_coherence: (failures, report)."""
+    programs = [p for p in json.loads((ROOT / 'tools/bench/smp/coherence.json').read_text()) if not names or any(n in p['name'] for n in names)]
     failures, report = [], []
     stub = smp.build_stub(a.out / 'qemu-build')
     for prog in programs:
@@ -623,9 +653,7 @@ def cmd_coherence(a, host, runtime):
             failures += [f"{label} rep{e['rep']}: {'; '.join(e['diffs'])[:400]}" for e in bad]
             report.append({'name': prog['name'], 'max_block': limit[0] if limit else None, 'runs': len(entries), 'match': len(entries) - len(bad),
                            'totals': dict(totals), 'entries': entries})
-    for f in failures: print(f)
-    (a.out / 'coherence.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
-    return len(failures)
+    return failures, report
 
 
 def cmd_sharedpt(a, host, runtime):
@@ -680,9 +708,209 @@ def cmd_sharedpt(a, host, runtime):
     return len(failures)
 
 
+# ---- contain (S3h): containment and progress --------------------------------------------------------------------------
+LOOP = 'rip 0x100000\nbody 0x100000 ebfe\n'          # jmp $: a linked loop with no exit, in its own space
+TEARDOWN = 'teardown: vcpus {n} joined {n} destroyed {n} vm_destroy 0 children none'
+
+
+def chain_section(count=600, trips=3):
+    """`count` distinct ADDs in a counted loop: at block size 1 with a small code cache it fills the cache (flushes, with
+    links) and makes many compile requests."""
+    code = ref.assemble('\n'.join([f'mov ecx, {trips}', '1:'] + [f'add rax, {0x10000 + 977 * i:#x}' for i in range(count)] + ['dec ecx', 'jnz 1b']))
+    return f'rip 0x100000\ncode {code.hex()}\n'
+
+
+def tamper_kinds(fixture):
+    """Every run-time tamper of the driver: (name, driver options for the tampered vCPU, its section, its expected halt).
+    `--tamper-after` is not here: it corrupts after every vCPU stopped (the host self-check, run_slice2_probes.py)."""
+    flush = ['1', '--code-cache', 32768]
+    system = 'rip 0x100000\ncpl 0\ncode ' + ref.assemble('mov rax, cr0\nnop').hex() + '\n'
+    load = 'rip 0x100000\ncode ' + ref.assemble('mov rax, qword ptr [0x200000]\nnop').hex() + '\nmemory 0x200000 0102030405060708\n'
+    return [('forge-header', ['--forge-header'], fixture, 'bad_link'),
+            ('offset', ['--tamper', 'offset'], fixture, 'bad_reply'),
+            ('next-page', ['--tamper', 'next-page'], fixture, 'bad_reply'),
+            ('system', ['--tamper', 'system'], system, 'bad_reply'),
+            ('site', ['--tamper', 'site'], load, 'unknown_abort'),
+            ('site-kind', ['--tamper', 'site-kind'], load, 'site_mismatch'),
+            *[(k, flush + ['--tamper', k], chain_section(), 'bad_link') for k in ('word', 'literal', 'record')],
+            ('forge-stop', ['--kicks', 1, '--forge-stop'], LOOP, 'bad_stop')]
+
+
+def unacked_program(n, k):
+    """vCPU k stores to a data word on page 12 (a writable shadow of it), raises GEN and waits for DONE in a linked loop;
+    vCPU 0 waits for GEN, delays (vCPU k is then in its linked loop), calls the function on page 12 (its miss marks the
+    page and must wait for vCPU k's shadow reset) and raises DONE; the others end at once."""
+    P, done = programs.CC_PAGE(12), programs.CC_DONE
+    t0 = programs.cc_wait(programs.CC_GEN, 1, 'g') + '    mov ecx, 5000000\n.x: dec ecx\n    jnz .x\n'
+    t0 += programs.cc_call(P + programs.CC_FN, 'b') + f'    mov qword [0x{done:x}], 1\n'
+    texts = [t0] + [f'    mov [0x{P + 0x800:x}], rbx\n    mov qword [0x{programs.CC_GEN:x}], 1\n' + programs.cc_wait(done, 1, 'd')
+                    if i == k else '' for i in range(1, n)]
+    return programs.cc_program(f'unacked{k}', n, texts, [(12, bytes(programs.CC_FN - 0x10) + programs.cc_function(1))],
+                               regs=lambda i: {'rbx': 0x3333 * (i + 1)})
+
+
+def spin_program(iterations):
+    """vCPU 0 waits in a linked loop for a flag vCPU 1 raises after `iterations` rounds of a delay loop (no exits in
+    either): a guest that legitimately spins for as long as the delay takes."""
+    t0 = programs.cc_wait(programs.CC_GEN, 1, 'w')
+    t1 = f'    mov rcx, {iterations}\n.x: dec rcx\n    jnz .x\n    mov qword [0x{programs.CC_GEN:x}], 1\n'
+    return programs.cc_program('spin', 2, [t0, t1], [])
+
+
+def cmd_contain(a, host, runtime):
+    """See the module docstring (`contain`)."""
+    import time
+    fixtures = json.loads((ROOT / 'fixtures/slice1/programs.json').read_text())['programs']
+    expected = {r['name']: r for r in json.loads((ROOT / 'fixtures/slice1/expected.json').read_text())['results']}
+    fixture = vm.description(fixtures[0])
+    report, failures, fresh_runs = {k: [] for k in ('tamper', 'unacked', 'compiler', 'stall', 'spin', 'legit', 'fresh')}, [], [0]
+    wd = a.watchdog_ms
+
+    def run(label, text, extra):
+        t = time.monotonic()
+        rc, out, err = driver(host, runtime, a.fexc, text, a.out / 'work' / label, extra)
+        return rc, out, err, time.monotonic() - t
+
+    def teardown(n, err):
+        return [] if TEARDOWN.format(n=n) in err else [f'no clean teardown line: {err.strip()[-300:]}']
+
+    def fresh(n, after):
+        """A fresh process right after a failure: n fixture programs (rotated) on n vCPUs, each must match QEMU."""
+        i = fresh_runs[0]; fresh_runs[0] += 1
+        ps = [fixtures[(i * 4 + v) % len(fixtures)] for v in range(n)]
+        rc, out, err, secs = run(f'fresh-{after}', ''.join('cpu\n' + vm.description(p) for p in ps), [])
+        diffs = [f'driver exit {rc}: {err.strip()[-300:]}'] if rc else []
+        for v, p in enumerate(ps if not rc else []):
+            outcome, d = vm.evaluate(p, expected[p['name']], out['cpus'][v])
+            if outcome != 'match' or per_vcpu_checks(out['cpus'][v]): diffs.append(f"cpu{v} {p['name']}: {outcome} {d} {per_vcpu_checks(out['cpus'][v])}")
+        diffs += teardown(n, err)
+        report['fresh'].append({'after': after, 'n': n, 'programs': [p['name'] for p in ps], 'diffs': diffs, 'seconds': round(secs, 2)})
+        return [f'fresh after {after}: {d}' for d in diffs]
+
+    def judge(n, rc, out, err, secs, want, bound):
+        """want[v] = (stop, reason prefix); the run must exit 0, tear down cleanly and end within `bound` seconds."""
+        diffs = [f'driver exit {rc}: {err.strip()[-300:]}'] if rc else []
+        stops = [(c['stop'], c['reason']) for c in out['cpus']] if out else None
+        if out and not all(s == w[0] and r.startswith(w[1]) for (s, r), w in zip(stops, want)): diffs.append(f'stops {stops}, want {want}')
+        diffs += teardown(n, err)
+        if secs > bound: diffs.append(f'took {secs:.1f} s (bound {bound} s)')
+        return stops, diffs
+
+    # 1 and 4: every tamper on every vCPU at N = 1..4 (the others in linked loops); the tampered vCPU halts, the others are
+    # cancelled, all joined, the VM destroyed; then a fresh process.
+    for name, extra, section, reason in tamper_kinds(fixture):
+        for n in a.cpus_contain:
+            for v in range(n):
+                text = ''.join('cpu\n' + (section if w == v else LOOP) for w in range(n))
+                kick = ['--kick-vcpu', v] if name == 'forge-stop' else []
+                label = f'{name}-n{n}-v{v}'
+                rc, out, err, secs = run(label, text, extra + kick + ['--tamper-vcpu', v])
+                want = [('resident', reason) if w == v else ('cancelled', '') for w in range(n)]
+                stops, diffs = judge(n, rc, out, err, secs, want, 10)
+                if out and name != 'forge-header' and not out['cpus'][v]['tampered']: diffs.append('not tampered')
+                diffs += fresh(n, label)
+                report['tamper'].append({'label': label, 'stops': stops, 'seconds': round(secs, 2), 'diffs': diffs})
+                print(f"{label}: {'ok' if not diffs else 'FAIL ' + '; '.join(diffs)[:300]} ({secs:.2f} s)", flush=True)
+                failures += [f'{label}: {d}' for d in diffs]
+
+    # 2: a peer that never answers a shootdown: its stops resume without entering the gate, so it never drains, but it is
+    # kicked every millisecond (each stop is a host exit: its own watchdog does not fire). Control: the same untampered.
+    for k in (1, 2, 3):
+        prog = unacked_program(4, k)
+        kicks = ['--kick-vcpu', k, '--kicks', 100_000, '--kick-every-us', 1000, '--watchdog-ms', wd]
+        if k == 1:
+            want = qemu_reference(prog, a.out / 'qemu' / prog['name'])
+            rc, out, err, secs = run('unacked-control', smp_description(prog), kicks)
+            diffs = [f'driver exit {rc}: {err.strip()[-300:]}'] if rc else judge_smp(prog, want, out, [None] * 4)
+            if out and out['cpus'][0]['stats']['shootdowns'] < 1: diffs.append('vCPU 0 shot nothing down')
+            diffs += teardown(4, err)
+            report['unacked'].append({'label': 'control', 'diffs': diffs, 'shootdowns': out and out['cpus'][0]['stats']['shootdowns']})
+            print(f"unacked control: {'ok' if not diffs else 'FAIL ' + '; '.join(diffs)[:300]}", flush=True)
+            failures += [f'unacked control: {d}' for d in diffs]
+        label = f'unacked-v{k}'
+        rc, out, err, secs = run(label, smp_description(prog), kicks + ['--ignore-kicks', '--tamper-vcpu', k])
+        want = [('watchdog', 'resident pc=') if w == 0 else ('cancelled', '') if w == k else ('reached', '') for w in range(4)]
+        stops, diffs = judge(4, rc, out, err, secs, want, wd / 1000 + 5)
+        if stops and f'shadows_asked=[{k}]' not in stops[0][1]: diffs.append(f'vCPU {k} not named as the peer asked')
+        if out and not out['cpus'][k]['tampered']: diffs.append(f'vCPU {k} took no stop')
+        diffs += fresh(4, label)
+        report['unacked'].append({'label': label, 'stops': stops, 'seconds': round(secs, 2), 'diffs': diffs})
+        print(f"{label}: {'ok' if not diffs else 'FAIL ' + '; '.join(diffs)[:300]} {stops and stops[0]} ({secs:.2f} s)", flush=True)
+        failures += [f'{label}: {d}' for d in diffs]
+
+    # 3: vCPU k's compile server dies mid-run (killed before its 51st request): the run fails naming the cause.
+    for k in (1, 2, 3):
+        label = f'compiler-v{k}'
+        text = ''.join('cpu\n' + (chain_section() if w == k else LOOP) for w in range(4))
+        rc, out, err, secs = run(label, text, ['1', '--kill-compiler', 50, '--tamper-vcpu', k])
+        diffs = [] if rc == 1 and out is None else [f'driver exit {rc}, want 1']
+        if f'owner {k}: fexc --serve (pid' not in err or 'signal: 9' not in err: diffs.append(f'cause not named: {err.strip()[-300:]}')
+        diffs += teardown(4, err) + ([f'took {secs:.1f} s'] if secs > 10 else [])
+        diffs += fresh(4, label)
+        report['compiler'].append({'label': label, 'stderr': err.strip()[-600:], 'seconds': round(secs, 2), 'diffs': diffs})
+        print(f"{label}: {'ok' if not diffs else 'FAIL ' + '; '.join(diffs)[:300]} ({secs:.2f} s)", flush=True)
+        failures += [f'{label}: {d}' for d in diffs]
+
+    # 3: vCPU k's compile server stops answering (SIGSTOP before its 51st request): the request's deadline kills it and the
+    # run fails the same way, naming the vCPU, the server and the deadline.
+    cd = a.compile_deadline_ms
+    for k in (1, 2, 3):
+        label = f'stall-v{k}'
+        text = ''.join('cpu\n' + (chain_section() if w == k else LOOP) for w in range(4))
+        rc, out, err, secs = run(label, text, ['1', '--stall-compiler', 50, '--tamper-vcpu', k, '--compile-deadline-ms', cd])
+        diffs = [] if rc == 1 and out is None else [f'driver exit {rc}, want 1']
+        if f'owner {k}: fexc --serve (pid' not in err or f'no reply within {cd / 1000:g}s' not in err or 'signal: 9' not in err:
+            diffs.append(f'cause not named: {err.strip()[-300:]}')
+        diffs += teardown(4, err) + ([f'took {secs:.1f} s'] if secs > cd / 1000 + 5 else [])
+        diffs += fresh(4, label)
+        report['stall'].append({'label': label, 'stderr': err.strip()[-600:], 'seconds': round(secs, 2), 'diffs': diffs})
+        print(f"{label}: {'ok' if not diffs else 'FAIL ' + '; '.join(diffs)[:300]} ({secs:.2f} s)", flush=True)
+        failures += [f'{label}: {d}' for d in diffs]
+
+    # 5: the watchdog contains a guest loop that never ends (vCPU v; the others run fixtures to their ends).
+    for v in range(4):
+        label = f'spin-v{v}'
+        ps = [fixtures[(v + w) % len(fixtures)] for w in range(4)]
+        text = ''.join('cpu\n' + (LOOP if w == v else vm.description(ps[w])) for w in range(4))
+        rc, out, err, secs = run(label, text, ['--watchdog-ms', wd])
+        want = [('watchdog', 'guest pc=') if w == v else ('reached', '') for w in range(4)]
+        stops, diffs = judge(4, rc, out, err, secs, want, wd / 1000 + 5)
+        for w in range(4 if out else 0):
+            if w != v and vm.evaluate(ps[w], expected[ps[w]['name']], out['cpus'][w])[0] != 'match': diffs.append(f'cpu{w} does not match')
+        diffs += fresh(4, label)
+        report['spin'].append({'label': label, 'stops': stops, 'seconds': round(secs, 2), 'diffs': diffs})
+        print(f"{label}: {'ok' if not diffs else 'FAIL ' + '; '.join(diffs)[:300]} ({secs:.2f} s)", flush=True)
+        failures += [f'{label}: {d}' for d in diffs]
+
+    # A guest that legitimately spins (and computes) longer than a tight budget: the watchdog reports a guest stop; with
+    # the default budget the same program reaches its end on both vCPUs.
+    prog = spin_program(a.spin_iterations)
+    for budget, ok_stop in ((300, 'watchdog'), (10_000, 'reached')):
+        rc, out, err, secs = run(f'legit-{budget}', smp_description(prog), ['--watchdog-ms', budget])
+        stops = [(c['stop'], c['reason']) for c in out['cpus']] if out else None
+        diffs = [f'driver exit {rc}: {err.strip()[-300:]}'] if rc else []
+        if ok_stop == 'reached' and stops != [('reached', '')] * 2: diffs.append(f'stops {stops}')
+        if ok_stop == 'watchdog' and not (stops and any(s == 'watchdog' and r.startswith('guest pc=') for s, r in stops)
+                                          and all(s in ('watchdog', 'cancelled') for s, _ in stops)):
+            diffs.append(f'stops {stops}')
+        diffs += teardown(2, err)
+        report['legit'].append({'budget_ms': budget, 'stops': stops, 'seconds': round(secs, 2), 'diffs': diffs})
+        print(f"legit spin, watchdog {budget} ms: {'ok' if not diffs else 'FAIL ' + '; '.join(diffs)[:300]} {stops} ({secs:.2f} s)", flush=True)
+        failures += [f'legit spin {budget} ms: {d}' for d in diffs]
+
+    # 5: progress under sustained cross-vCPU code writes and while a peer misses on a finishing vCPU's page (coherence).
+    if not a.no_progress:
+        bad, report['progress'] = coherence_runs(a, host, runtime, ['mutual', 'data', 'rewrite', 'stale', 'finish'])
+        failures += bad
+    for f in failures: print(f)
+    print(f"fresh-process controls: {len(report['fresh'])}, failing {sum(bool(r['diffs']) for r in report['fresh'])}")
+    (a.out / 'contain.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
+    return len(failures)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=['corpora', 'smp', 'litmus', 'limits', 'kicks', 'system', 'coherence', 'sharedpt'])
+    ap.add_argument('mode', choices=['corpora', 'smp', 'litmus', 'limits', 'kicks', 'system', 'coherence', 'sharedpt', 'contain'])
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--cpus', type=int, nargs='+', default=[2, 3, 4])
@@ -703,12 +931,17 @@ def main():
     ap.add_argument('--reps', type=int, default=1)
     ap.add_argument('--kicks', type=int, help='kicks per vCPU (kicks: default 10000; corpora: off unless given)')
     ap.add_argument('--iterations', type=int, default=400_000_000, help='hot-loop iterations per vCPU (kicks)')
+    ap.add_argument('--cpus-contain', type=int, nargs='+', default=[1, 2, 3, 4], help='contain: N for the tamper matrix')
+    ap.add_argument('--watchdog-ms', type=int, default=1000, help='contain: the watchdog of the runs that must hit it')
+    ap.add_argument('--compile-deadline-ms', type=int, default=2000, help='contain: the compile deadline of the stalled-server runs')
+    ap.add_argument('--spin-iterations', type=int, default=1_500_000_000, help='contain: the legitimate spin delay loop')
+    ap.add_argument('--no-progress', action='store_true', help='contain: skip the coherence progress programs')
     a = ap.parse_args()
     if a.mode == 'sharedpt' and '--cpus' not in sys.argv: a.cpus = [2, 4]
     a.out.mkdir(parents=True, exist_ok=True)
     host, runtime = vm.build()
     if a.mode == 'kicks' and a.kicks is None: a.kicks = 10_000
-    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'litmus': cmd_litmus, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'coherence': cmd_coherence, 'sharedpt': cmd_sharedpt}[a.mode](a, host, runtime)
+    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'litmus': cmd_litmus, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'coherence': cmd_coherence, 'sharedpt': cmd_sharedpt, 'contain': cmd_contain}[a.mode](a, host, runtime)
     print('failures:', failed)
     sys.exit(1 if failed else 0)
 

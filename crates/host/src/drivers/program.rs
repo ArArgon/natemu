@@ -15,7 +15,16 @@
 //! and the unlink must halt (`bad_link`); `--tamper-after KIND` (not `offset`) corrupts after the run, and the host's
 //! self-check must refuse (`links_check`); `--forge-stop` enters the stop gate of its first stop with a forged ELR
 //! (the resident must halt: `bad_stop`); `--tamper system` makes the first system reply's decode malformed (the resident
-//! must refuse it: `bad_reply`).
+//! must refuse it: `bad_reply`); `--tamper next-page` answers a block request with [`exec::REPLY_NEXT_PAGE`] twice (the
+//! second after the next page was walked: `bad_reply`); `--tamper site` moves the native offsets of the first block with
+//! a load or store site off the instruction grid (its first abort is at no site: `unknown_abort`), `--tamper site-kind`
+//! makes its load and store sites claim to be guard stubs (a data abort there: `site_mismatch`). Containment:
+//! `--ignore-kicks` resumes every stop of the vCPU without entering the stop gate (it never drains while in linked code,
+//! so a peer waiting for its shadow reset is contained by that peer's watchdog); `--kill-compiler N` kills its `fexc --serve` before the request after its first N
+//! (the run fails with the server's exit), `--stall-compiler N` stops it there (SIGSTOP: alive, never answering; the
+//! request's deadline, `--compile-deadline-ms`, default 30 s, kills it and fails the run). Each run ends with a `teardown:` line on stderr, written after the VM is
+//! destroyed, success or failure: vCPUs joined and destroyed, the VM's destroy status, and whether any child process
+//! (compile server) is left, alive or unreaped.
 //!
 //! Precise stops: `--kick-vcpu V` (repeatable) runs a host kicker thread per listed vCPU that kicks it `--kicks M`
 //! times (default 10,000), each after the previous kick's stop was taken (or the vCPU ended) and `--kick-every-us P`
@@ -368,7 +377,7 @@ fn page_span(start: u64, length: usize) -> impl Iterator<Item = u64> {
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] \
                      [--code-cache BYTES] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-header] [--tamper offset|word|literal|record|system] [--tamper-after word|literal|record] \
-                     [--forge-stop] [--kick-vcpu V]... [--kicks M] [--kick-every-us P]";
+                     [--forge-stop] [--kick-vcpu V]... [--kicks M] [--kick-every-us P] [--tamper next-page|site|site-kind] [--ignore-kicks] [--kill-compiler N] [--stall-compiler N] [--compile-deadline-ms MS]";
 
 /// `adr x0, #-4` (the block's header) at the entry becomes `adr x0, #0` (the entry itself).
 fn forge_header(object: &mut [u8]) {
@@ -417,6 +426,9 @@ fn corrupt(area: Area, kind: Corrupt) -> bool {
     true
 }
 fn tamper_offset(area: Area, state: &mut State) -> bool {
+    if !admitted(state) {
+        return false;
+    }
     let h: natemu_abi::code_object::Header = area.read_record(exec::STAGING_OFFSET);
     let Some(p) = state.link_points.iter_mut().find(|p| p.offset != 0) else { return false };
     p.offset = h.code_size; // a whole exit no longer fits
@@ -424,26 +436,68 @@ fn tamper_offset(area: Area, state: &mut State) -> bool {
 }
 /// A system reply whose decode the resident must refuse (`bad_reply`): an instruction length of 16.
 fn tamper_system(_: Area, state: &mut State) -> bool {
-    let reply = state.system.kind != 0;
+    let reply = state.reply == exec::REPLY_SYSTEM;
     if reply {
         state.system.length = 16;
     }
     reply
 }
-fn tamper_word(area: Area, _: &mut State) -> bool {
-    flushing_next(area) && corrupt(area, Corrupt::Word)
+/// A block reply turned into a next-page reply, and the request that follows (its next page walked or its walk failed)
+/// answered with one again: a second next-page reply, which the resident must refuse (`bad_reply`).
+fn tamper_next_page(_: Area, state: &mut State) -> bool {
+    if state.reply != exec::REPLY_ADMITTED {
+        return false;
+    }
+    state.reply = exec::REPLY_NEXT_PAGE;
+    state.fetch[1] != u64::MAX || state.fetch_fault[0] != exec::fetch::NONE
 }
-fn tamper_literal(area: Area, _: &mut State) -> bool {
-    flushing_next(area) && corrupt(area, Corrupt::Literal)
+fn admitted(state: &State) -> bool {
+    state.reply == exec::REPLY_ADMITTED
 }
-fn tamper_record(area: Area, _: &mut State) -> bool {
-    flushing_next(area) && corrupt(area, Corrupt::Record)
+/// Rewrites every site of the staged block with `f`, once it has a load or store site (the block's first access to a
+/// page it has no shadow of aborts there).
+fn tamper_sites(area: Area, state: &State, f: fn(&mut natemu_abi::code_object::Site)) -> bool {
+    use natemu_abi::code_object::{Header, Site, kind};
+    let h: Header = area.read_record(exec::STAGING_OFFSET);
+    let at = |i: usize| exec::STAGING_OFFSET + h.sites_offset as usize + i * size_of::<Site>();
+    let sites: Vec<Site> = (0..h.sites_count as usize).map(|i| area.read_record(at(i))).collect();
+    if !admitted(state) || !sites.iter().any(|s| matches!(s.kind, kind::LOAD | kind::STORE)) {
+        return false;
+    }
+    for (i, mut site) in sites.into_iter().enumerate() {
+        f(&mut site);
+        area.write_record(at(i), site);
+    }
+    true
+}
+/// No site at any native PC of the block (offsets moved off the instruction grid): its first abort is `unknown_abort`.
+fn tamper_site(area: Area, state: &mut State) -> bool {
+    tamper_sites(area, state, |s| s.native_offset += 2)
+}
+/// Every load and store site claims to be a guard stub (a BRK): its first data abort is `site_mismatch`.
+fn tamper_site_kind(area: Area, state: &mut State) -> bool {
+    use natemu_abi::code_object::kind;
+    tamper_sites(area, state, |s| {
+        if matches!(s.kind, kind::LOAD | kind::STORE) {
+            s.kind = kind::GUARD;
+        }
+    })
+}
+fn tamper_word(area: Area, state: &mut State) -> bool {
+    admitted(state) && flushing_next(area) && corrupt(area, Corrupt::Word)
+}
+fn tamper_literal(area: Area, state: &mut State) -> bool {
+    admitted(state) && flushing_next(area) && corrupt(area, Corrupt::Literal)
+}
+fn tamper_record(area: Area, state: &mut State) -> bool {
+    admitted(state) && flushing_next(area) && corrupt(area, Corrupt::Record)
 }
 
 /// What one vCPU's thread returns.
 struct Ran {
     stop: Stop,
     compiles: u64,
+    slowest: std::time::Duration,
     blocks: u64,
     distinct: usize,
     tampered: bool,
@@ -463,6 +517,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let (mut max_instructions, mut code_bytes, mut watchdog_ms, mut forge, mut target) = (None, exec::cache::CODE_BYTES, 10_000, false, 0);
     let (mut tamper, mut tamper_after): (Option<fn(Area, &mut State) -> bool>, Option<Corrupt>) = (None, None);
     let (mut forge_stop, mut kicked, mut kicks, mut every_us) = (false, Vec::new(), 10_000, 0);
+    let (mut ignore_kicks, mut signal_at, mut deadline_ms) = (false, None, execution::COMPILE_DEADLINE.as_millis() as u64);
     let mut options = options.iter();
     while let Some(option) = options.next() {
         let mut value = || -> Result<usize> { options.next().and_then(|v| v.parse().ok()).ok_or(USAGE.into()) };
@@ -472,6 +527,10 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             "--tamper-vcpu" => target = value()?,
             "--forge-header" => forge = true,
             "--forge-stop" => forge_stop = true,
+            "--ignore-kicks" => ignore_kicks = true,
+            "--compile-deadline-ms" => deadline_ms = value()? as u64,
+            "--kill-compiler" => signal_at = Some((value()? as u64, 9)),   // SIGKILL
+            "--stall-compiler" => signal_at = Some((value()? as u64, 17)), // SIGSTOP (macOS)
             "--kick-vcpu" => kicked.push(value()?),
             "--kicks" => kicks = value()?,
             "--kick-every-us" => every_us = value()? as u64,
@@ -482,6 +541,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                     Some("literal") => tamper_literal,
                     Some("record") => tamper_record,
                     Some("system") => tamper_system,
+                    Some("next-page") => tamper_next_page,
+                    Some("site") => tamper_site,
+                    Some("site-kind") => tamper_site_kind,
                     _ => return Err(USAGE.into()),
                 })
             }
@@ -549,11 +611,14 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let watchdog = std::time::Duration::from_millis(watchdog_ms);
     let body = |v: usize, cpu: &Vcpu, cancelled: &AtomicBool| -> Result<Ran> {
         let mut compiler = Compiler::new(Path::new(fexc), cpu, max_instructions)?;
+        compiler.deadline = std::time::Duration::from_millis(deadline_ms);
         let mut requests = execution::Requests::default();
         if v == target {
             compiler.tamper = forge.then_some(forge_header as fn(&mut [u8]));
+            compiler.signal_at = signal_at;
             requests.tamper = tamper;
             requests.forge_stop = forge_stop;
+            requests.ignore_stops = ignore_kicks;
         }
         let stop = execution::run(cpu, backing.vcpu(v), &mut compiler, Some(stop_at[v]), watchdog, &mut requests, &stops, cancelled);
         ended[v].store(true, SeqCst);
@@ -561,7 +626,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         if !finished(&stop) {
             owners::cancel_owners(cancelled);
         }
-        Ok(Ran { stop, compiles: compiler.compiles, blocks: requests.blocks, distinct: requests.rips.len(), tampered: requests.tampered })
+        Ok(Ran { stop, compiles: compiler.compiles, slowest: compiler.slowest, blocks: requests.blocks, distinct: requests.rips.len(), tampered: requests.tampered })
     };
     let prepare = |v: usize| -> Result<Vcpu> {
         let cpu = Vcpu::create()?;
@@ -604,9 +669,12 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         }
         let kicked: Result<()> = kickers.into_iter().map(|k| k.join().unwrap_or(Err("kicker panicked".into()))).collect();
         kicked.and(supervision)
-    })?;
-    // Every vCPU is destroyed: the VM goes next, then the host reads the backing.
-    hv(machine.destroy(), "destroy VM")?;
+    });
+    // Every vCPU is destroyed (or never created): the VM goes next, then the host reads the backing.
+    let destroyed = machine.destroy();
+    eprintln!("{}", teardown(n, supervision.as_ref().ok(), destroyed));
+    let supervision = supervision?;
+    hv(destroyed, "destroy VM")?;
     if let Some(e) = supervision.error {
         return Err(e);
     }
@@ -626,6 +694,25 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         println!("{}", out[0]);
     }
     Ok(())
+}
+
+/// The `teardown:` line: of `n` vCPUs, how many ran and joined and how many were destroyed with status 0 (`None`: setup
+/// failed before any ran), the VM's destroy status, and the child processes left (`waitpid(-1, WNOHANG)` failing with
+/// ECHILD: none, alive or unreaped).
+fn teardown(n: usize, s: Option<&owners::Supervision<Ran>>, vm: i32) -> String {
+    unsafe extern "C" {
+        fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    }
+    const WNOHANG: i32 = 1;
+    let mut status = 0;
+    let children = match unsafe { waitpid(-1, &mut status, WNOHANG) } {
+        -1 if std::io::Error::last_os_error().raw_os_error() == Some(10) => "none".to_string(), // ECHILD
+        -1 => format!("unknown ({})", std::io::Error::last_os_error()),
+        0 => "alive".into(),
+        pid => format!("unreaped (pid {pid})"),
+    };
+    let (joined, destroyed) = s.map_or((0, 0), |s| (s.outputs.len(), s.destroyed.iter().filter(|d| d.1 == 0).count()));
+    format!("teardown: vcpus {n} joined {joined} destroyed {destroyed} vm_destroy {vm} children {children}")
 }
 
 /// One vCPU's final state, its space's memory and A/D bits, and its counters, as JSON. With `tamper_after`, corrupts
@@ -652,7 +739,11 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
         Stop::NoCode(reason) => ("no_code", reason.clone(), [0; 4]),
         Stop::Resident { stop: exec::stop::GUEST_FAULT, .. } => ("guest_fault", "resident".into(), s.fault),
         Stop::Resident { stop, status, detail } => ("resident", format!("{} status={status} detail={detail}", exec::stop::name(*stop)), [0; 4]),
-        Stop::Watchdog => ("watchdog", String::new(), [0; 4]),
+        Stop::Watchdog { pc, asked } => {
+            let place = if natemu_abi::resident::contains(*pc, 4) { "resident" } else { "guest" };
+            let asked: Vec<u32> = (0..8).filter(|p| asked & 1 << p != 0).collect();
+            ("watchdog", format!("{place} pc={pc:#x} shadows_asked={asked:?}"), [0; 4])
+        }
         Stop::Cancelled => ("cancelled", String::new(), [0; 4]),
     };
     let list = |v: &[u64]| v.iter().map(|x| format!("\"{x:#x}\"")).collect::<Vec<_>>().join(",");
@@ -681,7 +772,7 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\"}}",
+        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\"}}",
         s.blocks,
         s.fast,
         s.l2_hits,
@@ -690,6 +781,7 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
         ran.blocks,
         s.generation,
         ran.compiles,
+        ran.slowest.as_micros(),
         s.steps,
         s.shootdowns,
         s.stops,
@@ -780,6 +872,19 @@ mod tests {
                     "entry 0x1000 5 set 1\ncode 90", "entry 0x1000 1 flip 1\ncode 90", "body 0x1000 90\nsmep 1\ncpu\nrip 0x1000"] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
+    }
+    #[test]
+    fn next_page_tamper_answers_a_block_request_twice() {
+        let memory = Memory::with_size(4096).unwrap();
+        let area = Area { memory: &memory, vcpu: 0, base: 0 };
+        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1000, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3 });
+        s.fetch = [0x5000, u64::MAX];
+        s.reply = exec::REPLY_SYSTEM;
+        assert!(!tamper_next_page(area, &mut s) && s.reply == exec::REPLY_SYSTEM);
+        s.reply = exec::REPLY_ADMITTED;
+        assert!(!tamper_next_page(area, &mut s) && s.reply == exec::REPLY_NEXT_PAGE); // first: not yet refused
+        (s.reply, s.fetch[1]) = (exec::REPLY_ADMITTED, 0x6000);
+        assert!(tamper_next_page(area, &mut s) && s.reply == exec::REPLY_NEXT_PAGE); // second, after the walk
     }
     #[test]
     fn cpu_sections_share_the_preamble_space_or_own_one() {
