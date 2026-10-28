@@ -93,6 +93,22 @@ QEMU references run in the pinned container image (`tools/reference/ref.py` hold
 | Faults | Precise guest faults reported as a stop (vector, error, CR2, banked state) | Delivery to the guest (no IDT); the run ends at the fault |
 | Atomicity | Aligned 1–8 bytes and unaligned within 16 bytes single-copy atomic | Non-LOCKed access crossing 16 bytes inside a line may tear for peers (owner decision 2) |
 
+### ISA coverage measured (October 28, after the phase)
+
+Admission takes about 151 of 256 primary-map slots and about 70 two-byte slots, all integer: roughly 85–90% of the
+legacy integer ISA, under 10% of all x86-64 forms. Refused entirely: SSE/MMX, AVX, x87, BMI/ABM, string and REP, every
+LOCK form but memory XCHG, flag moves (`cld`/`std`/`stc`/`clc`/`lahf`/`sahf`), `shld`/`shrd`, `popcnt`/`lzcnt`/`tzcnt`,
+`cmpxchg`/`xadd`, `enter`/`leave`, `pushf`/`popf`, CPUID, RDTSC.
+
+| Measure | Result |
+| --- | --- |
+| FEX ASM suite | 235 / 2,270 pass (10.4%), 0 fail. First refused instruction of the 2,035 unsupported tests: AVX 726, SSE/MMX/AES/SHA 480, x87 401, flag moves 205 (mostly test set-up), LOCK/cmpxchg/xadd 90, system 41, BMI 38, shld/shrd 17, other 37 |
+| Static share of admitted instructions in macOS x86-64 binaries | bash 97.5%, ls 97.7%, ld 92.3%: the rest is almost all SSE (`movaps`/`movups`/`xorps` from compiler copies and zeroing, scalar SSE float), present in nearly every function, so most real functions fail |
+
+Suggested order for the ISA track: flag moves and small integer forms (cheap), REP strings with partial progress (44),
+LOCK forms, CPUID/RDTSC and system registers, SSE (state in the frame, vector sites in admission/recovery, ordering
+cells, OSFXSR/XSAVE), then x87 (FEX's soft-float helpers must run in the resident) and AVX (only if CPUID advertises it).
+
 ## 3. Boot-phase prerequisites and handoff items
 
 | Item | State now | Origin |
