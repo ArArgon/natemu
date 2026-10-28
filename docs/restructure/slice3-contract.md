@@ -111,7 +111,11 @@ MFENCE/SFENCE, which FEX emits as `dmb ld`/`dmb sy`/`dmb st`; admission accepts 
 orders). (b) Memory XCHG (implicit LOCK): FEX emits `swpal` only with SupportsAtomics, else an `ldaxr`/`stlxr` loop;
 natemu pins LSE in fexc's features and admits `swpal` only at a site of kind `swap` (write intent, nothing committed at an
 abort: retry or #PF; WnR not checked strictly). An XCHG operand that crosses a 16-byte boundary takes an alignment fault
-(FSC 0x21) at the swap site → stop `unsupported_atomic` (admission refuses it when the address is known). Split locks,
+(FSC 0x21) at the swap site → stop `unsupported_atomic` (admission refuses it when the address is known). The stop is
+precise for data (nothing was written) but not for page-table bits: the write-intent walk before the access has already
+set A/D of the pages it walked, as an x86 walk does before a faulting access; and if a crossed page is absent or
+read-only that walk faults first, so the guest sees #PF, not `unsupported_atomic`. `swpal` is admitted only with Rt ≠ XZR
+(with the result discarded the architecture drops its acquire semantics; FEX never emits that form). Split locks,
 LOCK ADD/CMPXCHG/XADD/BT* and CMPXCHG16B wait for the boot phase.
 
 ## 3. Covering the old specialized paths
@@ -297,13 +301,18 @@ their campaigns retire:** runtime/abi family code (modes are layered: `translati
   Rt, Rs, no offset), and a guest-RIP-addressed swap crossing 16 bytes is refused. The resident accepts either WnR at a swap
   site (translation/permission fault: walk with write intent, retry or #PF, nothing written), and an alignment fault (FSC
   0x21) at a swap whose operand crosses 16 bytes banks the state at the instruction and stops `unsupported_atomic`, which (like
-  a guest fault) ends only that vCPU. Deviation: the guest-RIP crossing case surfaces as an admission refusal (host error), not
-  as that stop. Checks: `tools/run_slice3_vm.py litmus` (generated families sb, sb-mfence, sb-xchg, mp, lb, 2+2W, XCHG chain at
+  a guest fault) ends only that vCPU: nothing was written to data, but A/D of the walked pages may already be set, and an
+  absent crossed page gives #PF instead (§2); the faults runner compares registers and memory for these four probes, not leaf
+  A/D. Admission also refuses `swpal` with Rt = XZR (fixture case). Deviation: the guest-RIP crossing case surfaces as an
+  admission refusal (host error), not as that stop. Checks: `tools/run_slice3_vm.py litmus` (generated families sb, sb-mfence, sb-xchg, mp, lb, 2+2W, XCHG chain at
   N = 2..4, wrc at 3..4, iriw at 4; locations aligned, unaligned inside 16 bytes, and page-crossing (`split`; exchanged words
-  stay aligned): 69 cells × 100,000 trials, zero outcomes outside `i4v_ordering_model`'s enumerated sets (the model gained
+  stay aligned; S3f added `split-hi`, the same placement with the changing byte on the second page — in `split` it sits on
+  the first, so the second half of a split store was never observed): 69 cells × 100,000 trials, zero outcomes outside `i4v_ordering_model`'s enumerated sets (the model gained
   final-memory outputs for 2+2W and chains), every chain outcome linearizable (all n! orders seen); control (sb-mfence without
   MFENCE, aligned/unaligned) shows the forbidden outcome in all 6 cells; a split store completes with `dsb ish`, so SB cannot
-  relax there and the split cells skew to one outcome). Faults: XCHG access forms join the paging matrix and four split-lock
+  relax there, and the split service is slow (an exception round trip against a race window of nanoseconds), so the split
+  cells skew to one outcome: the other CPU nearly always finds the store complete. The control refuses a split variant, and
+  (from S3f) judges run diffs and trial counts like the normal run). Faults: XCHG access forms join the paging matrix and four split-lock
   probes (`unsupported_atomic`, QEMU prefix state): 3,443 cases match at block sizes default and 1; an XCHG stride program
   joins the loop faults (signal reference, 846 cases × 3 sizes); two XCHG SMC probes. S3r `handshake`, `token-ring`,
   `xchg-lock` at 2–4 vCPUs match the model and live QEMU. ASM suite 235 pass (227 + Pause, Primary_86/87/87_2/87_3,
@@ -312,7 +321,46 @@ their campaigns retire:** runtime/abi family code (modes are layered: `translati
 - **S3f, shared-table coherence.** Tests only: A/D races on one PTE from N vCPUs while one clears A/D with plain stores
   and its own INVLPG; remap with per-vCPU INVLPG; 2 MiB ↔ 4 KiB changes; aliases across vCPUs; contended walks never halt.
   *Check:* each vCPU's observations and final PTE bytes against `i4v_coherence_model.py`.
-- **S3g, 32-bit flat protected mode and transitions.** As §3, disassembly first. *Check:* S3r programs running a
+  *Built (Oct 28; no resident change was needed):* `tools/bench/smp/sharedpt.py` generates the programs (one shared body,
+  one shared table set loaded by every CPU at CPL0, plain-store handshakes, a private log per CPU) and judges the logs through
+  the model (`walk`, `Cache`, `access_outcomes`, `check_observation`; the observation passed is what a CPU can see: the frame
+  and the leaf bytes; a fresh walk replaces the CPU's single cache entry); `tools/run_slice3_vm.py sharedpt` also compares
+  the schedule-independent memory (final PTE bytes, data pages, flags) with pinned QEMU and requires every CPU to reach its end.
+  Programs, each at 2 and 4 vCPUs, block sizes default and 1, 10 runs each (32 configurations, 320 runs, all pass):
+  `ad-race` (450 synchronized rounds per run, the PTE sampled by every CPU after its access and exactly by CPU 0 after all
+  acknowledged: A, or A+D when anyone wrote; a free race of 10,000 accesses per CPU against CPU 0 clearing with plain stores +
+  its own INVLPG, where every sample must be a state the model reaches), `remap` (41 rounds: before its own INVLPG a CPU reads
+  and stores through V, after it only the new frame is permitted), `large` (a PDE flipping between a 2 MiB leaf and a table in a
+  random sequence, with large→large and table→table rewrites; exact PDE/PTE A/D after every round), `alias` (two linear
+  pages onto one frame, 200 rounds, roles drawn so one or both PTEs get A, A+D or stay clean; exact A/D of both PTEs per
+  round; every word verified through a third alias), `contended-{data,fetch,both}` (a clearer cycling a PTE through four
+  values with 64 spins between stores while the others INVLPG and access: 6,000 walks per walker) and `contended-max` (no
+  pause: 150 walks). Histories seen over all 320 runs: A/D races: round samples after a read: A 19,829, A+D 7,071; after a
+  write A+D 27,100 (never less); rounds' final PTE A 5,800, A+D 12,200; free race (all three states, no D without A): reads
+  saw clean 33,436, A 114,219, A+D 270,661 and writes clean 21,322, A 885, A+D 401,317 (the 'write → A' samples are a write
+  whose D a later clear removed and a reader's walk then set A). Remap: after the CPU's own INVLPG always the new frame
+  (4,920); before it, 10,800 reads and stores through a stale translation (old frame) and 4,720 each of the new frame (CPUs
+  that had no cached translation); natemu never replaces a cached translation by itself, so "new before INVLPG" occurs only
+  without a cached entry. Large: 4,680 pre-INVLPG reads of T saw the new state, 3,200 the old; every post-INVLPG access hit
+  the new state (2,680 from a 2 MiB leaf, 2,240 from a table). Contended: the Contended path is exercised: with
+  `Fault::Contended` turned back into a `unsupported_mode` halt (control below) every contended run halts within about 20–200
+  walks; unmodified, 160 of 160 runs finish and the final PTE bytes match the model. **Finding (not a defect of the
+  contract):** a CPU that stores to the PTE with no pause at all (`contended-max`) starves the walker's compare-exchange: about
+  200 walks/s (a plain 64-spin pause gives tens of thousands), so 6,000 such walks exceed the 10 s watchdog; x86's locked
+  A/D update cannot be starved this way. The watchdog contains it, as §1 says; no kernel stores this fast to a PTE.
+  Negative controls (each applied once, then reverted completely; `git diff crates/` showed only the XZR admission change
+  afterwards): (1) the walker's A/D update as a plain store instead of a compare-exchange: `ad-race` fails in 11 of 20 runs at
+  4 vCPUs (a write's D lost to a reader's stale store: PTE sample A without D after its own write), none at 2, none unmodified (20
+  of 20); (2) INVLPG keeping the shadows: `remap`, `large` and `alias` fail in all 24 runs (after INVLPG the old frame,
+  A/D not set); (3) `Contended` as a halt: all 80 `contended-*` runs fail. Model limits: the model's INVLPG of a 2 MiB leaf drops one
+  4 KiB entry; natemu drops the whole 2 MiB range (stricter, so every permitted history still holds).
+  *S3e review carry-overs, done with S3f:* admission refuses `swpal` with Rt = XZR (fixture case); the XCHG text above and the
+  S3e note state that the alignment stop leaves A/D possibly set and that an absent crossed page is a #PF, and the faults
+  runner says it does not compare leaf A/D for those probes; the `split-hi` litmus variant (a rerun at 20,000 trials per
+  cell: 90 cells = 24 aligned + 24 unaligned + 21 `split` + 21 `split-hi`, zero outcomes outside the model, the control
+  still showing the forbidden SB outcome in all 6 cells); `litmus --control` judges run diffs and trial counts and refuses
+  split variants; `tools/test_i4v_ordering_model.py` runs by path from the repo root.
+- **S3g — dropped from this phase (owner decision 3); kept for the boot phase.** *Was:* 32-bit flat protected mode and transitions. As §3, disassembly first. *Check:* S3r programs running a
   `startup_32`-like path (paging off → PAE tables → LME → PG → far jump to 64-bit → compatibility mode → paging off),
   legacy two-level with 4 MiB pages; fault matrices against `i4v_pae_model.py` and `i4v_modes_model.py` (contracts 28–31);
   mixed modes on N vCPUs sharing a code page; explicit segment prefixes refused.
@@ -339,3 +387,11 @@ their campaigns retire:** runtime/abi family code (modes are layered: `translati
    16-byte block: atomic, pending S3t; line- or page-crossing: not guaranteed by x86 either; LOCKed and crossing 16 bytes:
    stops. Only racing multi-vCPU code is affected; tearing is silent (a boot-phase diagnostic may count such stores).
    Replaces a resident atomic service (a load-side check on every unaligned access).
+3. **All 32-bit support goes to the boot phase (owner, October 28).** The S3g survey ([s3g-plan.md](s3g-plan.md)) found
+   that, on the planned 64-bit boot protocol with ACPI-mailbox AP start-up and no LA57, Debian 6.12 runs no 32-bit or
+   paging-off instruction and no x86-64 Linux path uses legacy two-level, 4 MiB or legacy-PAE paging; only Ubuntu 6.8's
+   AP trampoline briefly goes 64 → compatibility → paging off → PAE/LME/PG → 64. S3g is dropped from this phase: the
+   32-bit profile, paging-off resolver, mode transitions, descriptor loads and legacy/PAE walking are built in the boot
+   phase only if its chosen kernel needs them (the plan's S3g1–S3g3 are the starting point). The 32-bit families
+   (paging-off, paging-off steps, address forms, mixed modes, legacy/PAE controls and coherence variants) retire at S3i
+   with this reason; their models stay in `tools/models/` for the boot phase.

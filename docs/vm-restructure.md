@@ -128,6 +128,9 @@ paths established (paging modes, mode/control transitions, ordering and coherenc
 those paths are retired or kept as thin regression drivers over it; and the handoff to
 the boot phase is documented. Broad ISA, devices and exception delivery belong to the
 next phase except where these items need them.
+Owner, October 28: 32-bit and paging-off modes are out of this phase too (64-bit Linux on the planned boot path does
+not use them); the old 32-bit paths retire with that reason and the [S3g survey](restructure/s3g-plan.md) seeds the
+boot phase if its kernel needs them.
 
 Performance (owner, October 27): no performance tuning in this phase. Build the
 architectural pieces (code cache, dispatch, linking) and report measurements against
