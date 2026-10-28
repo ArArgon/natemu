@@ -342,13 +342,24 @@ fn unlink(r: LinkRecord) -> Option<()> {
 
 /// This vCPU is about to write `gpa`'s page, which holds translations: clears every vCPU's code bit of the page at
 /// once, posts the page to each other vCPU that had one (page bit, then `PAGES`, then a kick: it drops its blocks at
-/// its next block entry) and invalidates this vCPU's own blocks from it ([`invalidate`]).
-// ponytail: no re-check after the write; that is S3d's.
+/// its next block entry) and invalidates this vCPU's own blocks from it ([`invalidate`]). A write through the RAM
+/// alias is followed by [`rechecked`].
 pub fn written(gpa: u64) -> Option<u64> {
     if let Some(m) = code_page(gpa) {
         post(m.swap(0, SeqCst) & !own(), gpa);
     }
     invalidate(gpa)
+}
+/// This vCPU wrote `gpa`'s page through the RAM alias (a split store's part, a walker's A/D update): a peer that
+/// marked the page after [`written`] cleared it, or after a check found it unmarked, may have been given the old
+/// bytes. Posts the page to every such peer and clears their bits (this vCPU marks no page while it writes one).
+pub fn rechecked(gpa: u64) {
+    if let Some(m) = code_page(gpa) {
+        unsafe { asm!("dmb ish") };
+        if m.load(SeqCst) & !own() != 0 {
+            post(m.fetch_and(own(), SeqCst) & !own(), gpa);
+        }
+    }
 }
 /// Posts `gpa`'s page to the vCPUs whose bits are set in `peers` and kicks them.
 fn post(peers: u8, gpa: u64) {
@@ -375,6 +386,12 @@ pub fn invalidate(gpa: u64) -> Option<u64> {
         mask.fetch_and(!own(), SeqCst);
     }
     Some(unlinked)
+}
+/// Invalidates the live block `b` alone (as [`invalidate`], its pages' marks untouched): a block placed from a page
+/// whose mark this vCPU lost while it was fetched.
+pub fn discard(b: &Block) -> Option<u64> {
+    let number = b.number;
+    kill(|x| x.number == number)
 }
 /// Invalidates (as [`invalidate`]) every live block of this vCPU with guest bytes in the linear range
 /// `[start, start + bytes)` (a guest INVLPG). Its code-page bits stay: they only say it may hold translations.
@@ -441,13 +458,32 @@ pub fn block_at(pc: u64) -> Option<&'static Block> {
     (offset < u64::from(b.code) + u64::from(b.code_size)).then_some(b)
 }
 
-/// Marks `gpa`'s page as holding this vCPU's translations. True if this vCPU may hold a writable shadow of it (the
-/// caller resets its shadows, so the page is read-only in its tables).
-// ponytail: peers' writable shadows of the page are not reset (the synchronous shootdown is slice 3's S3d).
-pub fn protect(gpa: u64) -> bool {
-    let Some(m) = code_page(gpa) else { return false };
+/// Marks `gpa`'s page as holding this vCPU's translations, before its bytes are copied for a block: from here on a
+/// write to the page posts it to this vCPU. Returns the vCPUs that may hold a writable shadow of it, read after the
+/// mark (a writable install sets its bit before it reads the marks, so it either sees this mark or is returned here).
+pub fn mark(gpa: u64) -> u8 {
+    let Some(m) = code_page(gpa) else { return 0 };
     m.fetch_or(own(), SeqCst);
-    mask(area::WRITABLE_PAGES, (gpa >> 12) as usize).load(SeqCst) & own() != 0
+    writable(gpa)
+}
+/// This vCPU's mark of `gpa`'s page is still set (no write cleared it since [`mark`]); pages outside guest RAM count as
+/// marked (no code is fetched from them).
+pub fn marked(gpa: u64) -> bool {
+    code_page(gpa).is_none_or(|m| m.load(SeqCst) & own() != 0)
+}
+/// The vCPUs that may hold a writable shadow of `gpa`'s page.
+pub fn writable(gpa: u64) -> u8 {
+    let page = (gpa >> 12) as usize;
+    if page < GUEST_PAGES { mask(area::WRITABLE_PAGES, page).load(SeqCst) } else { 0 }
+}
+/// vCPU `v`'s shadow-reset count (it moves each time `v` drops all its shadows, see [`shadows_reset`]).
+pub fn resets_of(v: usize) -> u64 {
+    resets(v).load(SeqCst)
+}
+/// Asks vCPU `v` to drop all its shadows ([`SHADOWS`], then a kick).
+pub fn ask_shadows(v: usize) {
+    record_word(v, None).fetch_or(SHADOWS, SeqCst);
+    kick(v);
 }
 /// Some vCPU holds translations from `gpa`'s page: shadows of it stay read-only.
 pub fn translated(gpa: u64) -> bool {

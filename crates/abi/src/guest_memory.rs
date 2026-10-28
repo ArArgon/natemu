@@ -172,8 +172,36 @@ pub trait Observer {
     fn write(&mut self, _gpa: u64, _old: u64, _new: u64) -> bool {
         true
     }
+    /// The entry at `gpa` was written (or already held the value the walker wanted).
+    fn wrote(&mut self, _gpa: u64) {}
 }
 impl Observer for () {}
+
+/// The global code-page mask as the walker's A/D writes must respect it (natemu's cross-vCPU code coherence).
+pub trait CodePages {
+    /// Some vCPU holds translations from `gpa`'s page.
+    fn translated(&mut self, gpa: u64) -> bool;
+    /// `gpa`'s page, which holds translations, is about to be written: clears its code bits for every vCPU and posts
+    /// the page to the others, or does not return (the resident single-steps the instruction instead).
+    fn code_write(&mut self, gpa: u64);
+    /// `gpa`'s page was written: posts it to any vCPU that marked it since the code bits were last cleared.
+    fn rechecked(&mut self, gpa: u64);
+}
+/// A walk observer applying [`CodePages`]: an A/D write into a page holding translations takes `code_write` first and
+/// is then made, never refused, so no walk repeats because of a code page, whoever marks the page again meanwhile;
+/// every write is re-checked after it is made.
+pub struct CodeWrites<C>(pub C);
+impl<C: CodePages> Observer for CodeWrites<C> {
+    fn write(&mut self, gpa: u64, _: u64, _: u64) -> bool {
+        if self.0.translated(gpa) {
+            self.0.code_write(gpa);
+        }
+        true
+    }
+    fn wrote(&mut self, gpa: u64) {
+        self.0.rechecked(gpa);
+    }
+}
 
 /// Guest page tables in `ram` for the paging, PAE and legacy 32-bit walkers.
 /// A walker writes an entry only from the value it read (to set A/D), by
@@ -207,11 +235,13 @@ impl<O: Observer> GuestTables<O> {
                 .map(|r| r.map(u64::from).map_err(u64::from))
         };
         match actual {
-            Some(Ok(_)) => Update::Written,
-            Some(Err(v)) if v == new => Update::Written,
-            Some(Err(_)) => Update::Changed,
-            None => Update::Refused,
+            Some(Ok(_)) => {}
+            Some(Err(v)) if v == new => {}
+            Some(Err(_)) => return Update::Changed,
+            None => return Update::Refused,
         }
+        self.observer.wrote(gpa);
+        Update::Written
     }
 }
 impl<O: Observer> paging::Tables for GuestTables<O> {
@@ -431,6 +461,40 @@ mod tests {
         let mut t = GuestTables::observed(b.ram(), Log::default());
         assert!(paging::walk(&mut t, CONTROL, 0x10_0000, Access::Write).is_err());
         assert_eq!((t.observer.0, t.observer.1), (4, 1));
+    }
+
+    /// A walk whose A writes land in pages holding a peer's translations, the peer marking each page again right after
+    /// every clear (`translated` stays true): each write into such a page takes `code_write` once and is then made, the
+    /// walk is never repeated (no livelock, and no refusal: S2e's refuse-and-rewalk could repeat for as long as a peer
+    /// re-marked), and every write is re-checked after it is made.
+    #[test]
+    fn writes_into_code_pages_never_repeat_the_walk() {
+        struct Peer {
+            code: [u64; 2],
+            events: [(u8, u64); 8],
+            n: usize,
+        }
+        impl CodePages for Peer {
+            fn translated(&mut self, gpa: u64) -> bool {
+                self.code.contains(&(gpa & !4095))
+            }
+            fn code_write(&mut self, gpa: u64) {
+                self.events[self.n] = (b'c', gpa);
+                self.n += 1;
+            }
+            fn rechecked(&mut self, gpa: u64) {
+                self.events[self.n] = (b'r', gpa);
+                self.n += 1;
+            }
+        }
+        let mut b = tables();
+        let peer = Peer { code: [0x1000, 0x4000], events: [(0, 0); 8], n: 0 };
+        let mut t = GuestTables::observed(b.ram(), CodeWrites(peer));
+        assert_eq!(paging::walk(&mut t, CONTROL, 0x10_0000, Access::Read).map(|r| r.gpa), Ok(0x10_0000));
+        let p = &t.observer.0;
+        let want = [(b'c', 0x1000), (b'r', 0x1000), (b'r', 0x2000), (b'r', 0x3000), (b'c', 0x4800), (b'r', 0x4800)];
+        assert_eq!(&p.events[..p.n], &want);
+        assert_eq!((b.0[0], b.0[512], b.0[1024], b.0[1536 + 256]), (0x2027, 0x3027, 0x4027, 0x10_0027));
     }
 
     #[test]

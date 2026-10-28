@@ -677,7 +677,7 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"steps\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\"}}",
+        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\"}}",
         s.blocks,
         s.fast,
         s.l2_hits,
@@ -687,6 +687,7 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
         s.generation,
         ran.compiles,
         s.steps,
+        s.shootdowns,
         s.stops,
         s.systems,
         s.invalidations,
@@ -719,6 +720,7 @@ fn kick_report(area: Area, stops: &execution::Stops) -> String {
         .chain([exec::SLOT_VA + u64::from(exec::STOP_STORE)])
         .collect();
     let at_entry = k.pcs.keys().all(|pc| entries.contains(pc));
+    let at_step = k.pcs.get(&(exec::SLOT_VA + u64::from(exec::STOP_STORE))).copied().unwrap_or(0);
     let pcs: Vec<String> = k.pcs.iter().map(|(pc, n)| format!("[\"{pc:#x}\",{n}]")).collect();
     let quantiles = |host: bool| {
         let mut ns: Vec<u64> = k.latency.iter().filter(|l| l.1 == host).map(|l| l.0).collect();
@@ -727,7 +729,7 @@ fn kick_report(area: Area, stops: &execution::Stops) -> String {
         format!("{{\"n\":{},\"min\":{},\"p50\":{},\"p90\":{},\"p99\":{},\"p999\":{},\"max\":{}}}", ns.len(), q(0.0), q(0.5), q(0.9), q(0.99), q(0.999), q(1.0))
     };
     format!(
-        ",\"kicks\":{{\"issued\":{},\"in_host\":{},\"merged\":{},\"stops\":{},\"pending\":{pending},\"stop_pcs\":[{}],\"stops_at_entry\":{at_entry},\"latency_ns\":{},\"latency_in_host_ns\":{}}}",
+        ",\"kicks\":{{\"issued\":{},\"in_host\":{},\"merged\":{},\"stops\":{},\"pending\":{pending},\"stop_pcs\":[{}],\"stops_at_entry\":{at_entry},\"stops_at_step\":{at_step},\"latency_ns\":{},\"latency_in_host_ns\":{}}}",
         k.issued,
         k.in_host,
         k.merged,

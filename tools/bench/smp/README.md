@@ -96,6 +96,21 @@ another frame and has no U), CR0.WP and EFER.NXE 6 times per round for 10 rounds
 #PF 0x11 with NXE=1; X read: #PF 9 with NXE=0) while CPU 0 holds the opposite controls; CPU 0 ends by faulting on its own. Scenarios: `cr3`, `wp-clear`
 (peers clear WP), `wp-set`, `wp-mixed` (4 CPUs: peer 2 clears), `nxe-keep`, `nxe-clear`, `nxe-mixed`, `all`. Compared with QEMU like the other system programs.
 
+## (e) Code coherence programs (`coherence.json`, from `programs.coherence_all`; S3d)
+
+Code written at run time by one CPU and run by others, at 2 and 4 CPUs, judged against QEMU's run of the same bytes (QEMU keeps translated code
+coherent with stores). A run-time code page has a one-byte body at +0 (natemu's driver then maps it writable and executable) and a captured
+region from +0x10, so its final bytes are compared; run-time code is entered with `jmp` and returns through `jmp r13`; handshakes are plain
+stores and loads (no PAUSE, no XCHG). `fresh-new`: CPU 0 writes 6 variants of a function in turn into a page, each published by a flag and run by
+every other CPU before the next; `fresh-reused`: the same on a page the others first stored to and loaded from; `fresh-cr3` (CPL0): the same, each
+CPU loading CR3 with its own value before running the function; `rounds`: every CPU in turn patches one shared function, all run it each round;
+`data`: CPUs 1.. store to their own word on the page CPU 0's hot loop runs from until it ends; `rewrite`: CPUs 1.. store CPU 0's loop bytes back
+over it (same values) until it ends; `mutual`: CPU i loops on its page and stores to CPU i+1's; `finish` / `finish-late`: CPUs 1.. store to a
+page, set a flag and end (immediately / after a delay loop) while CPU 0 waits for the flags and runs a function on that page. `stale` (3 and 4 CPUs):
+CPU 0 calls a one-block function in a loop until its result changes, CPUs 1.. store data on its page until CPU 0 is done, and the last
+one patches a single instruction of the function after CPU 0 went round 2,000 times (an uncaptured counter). Pinned QEMU (MTTCG) now and
+then never finishes `stale` (2 of 8 runs at 3 CPUs, 1 of 10 at 4); the runner repeats a QEMU run that times out.
+
 ## (a) Deterministic programs (`programs.json`, 5 programs x 2/3/4 CPUs)
 
 Every one ends in `cmp r11, r11` (all six flags defined) and has a schedule-independent final state; spin waits only on flags written by a

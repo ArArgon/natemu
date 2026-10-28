@@ -117,6 +117,8 @@ pub(crate) struct Admitted {
     pub guest_bytes: u32,
     /// Guest instructions in it.
     pub guest_insns: u32,
+    /// Why translation ended ([`object::end_reason`]).
+    pub end_reason: u8,
     /// Its literal exits, the only words the resident's linker may rewrite.
     pub links: Vec<LinkPoint>,
 }
@@ -283,7 +285,7 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
             _ => return fail(&format!("relocation at {at:#x}")),
         }
     }
-    let admitted = Admitted { object: out, guest_bytes: h.guest_bytes, guest_insns: h.guest_insns, links: Vec::new() };
+    let admitted = Admitted { object: out, guest_bytes: h.guest_bytes, guest_insns: h.guest_insns, end_reason: h.end_reason, links: Vec::new() };
     let targets = [Some(end), target].into_iter().flatten().collect();
     Ok((admitted, Parts { header: h, sites, pcs, relocs, literals, targets }))
 }

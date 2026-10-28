@@ -9,6 +9,8 @@
     tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR kicks [--cpus 1 2 4] [--kicks M] [--iterations I]
         [--parallel P] [--reps R]
     tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR system [--programs SUBSTR,...]
+    tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR coherence [--programs SUBSTR,...] [--reps R]
+        [--parallel P]
 
 `corpora`: the single-vCPU corpora — the slice-1 fixtures, the control-flow corpus (default: the S2d run's
 programs and QEMU results under NATEMU_RAW_ROOT/s2d/corpus) and the slice-1 fault cases (QEMU prefix references, as
@@ -44,6 +46,16 @@ change without INVLPG (i4v_coherence_model) and the fault cases (tools/system_fa
 the instruction; i4v_modes_model where it covers them; QEMU's own outcome is reported and must agree where it raises an
 exception); refused forms stop `unsupported_system`; a tampered system reply stops `bad_reply`.
 
+`coherence` (S3d, cross-vCPU code coherence): the programs of tools/bench/smp/coherence.json (`programs.coherence_all`:
+code written at run time by one CPU and run by others — fresh code on a new page and on a page used for data before, a
+function patched in rounds and run after a CR3 load, every CPU patching in turn, data stored on a peer's running code
+page, a page rewritten (with its own bytes) on every fetch, CPUs translating pages the others write, CPUs ending while a
+peer translates a page they held writable; at 3 and 4 vCPUs a function called in a loop until a patch shows while peers
+store data on its page) at 2 and 4 vCPUs, each run R times at block sizes default and 1 and compared
+with pinned QEMU system mode (`-accel tcg,thread=multi`; QEMU keeps translated code coherent with stores), plus the
+per-vCPU and kick accounting checks. Every vCPU must reach its end (a `bad_link` or any other halt fails). The runs'
+steps, stale links, invalidations, stops and shootdowns are reported.
+
 `limits`: 5 vCPUs are refused (0 cannot be written: a description without `cpu` lines is one vCPU; the host's
 `prepare` refuses 0 in its unit test); a forged block header on vCPU V of 4 (V = 0..3; the others spin in a linked
 loop) halts V with bad_link, cancels and joins the others, and the VM is destroyed (the driver reports only then).
@@ -78,7 +90,9 @@ def kick_checks(out, kicks=None):
     # kick may legitimately land while another is pending.
     if k['merged'] and kicks is not None: problems.append(f"{k['merged']} kicks merged")
     if out['stats']['stops'] != k['stops']: problems.append(f"resident stops {out['stats']['stops']} != host {k['stops']}")
-    if not k['stops_at_entry']: problems.append(f"stop PCs not at stop stores: {k['stop_pcs']}")
+    # Judged against the blocks placed at the end, so only without a flush after the driver's initial one (a flush, such
+    # as a CR3 load's, reuses code addresses; the resident's stop gate checks every stop PC when it is taken).
+    if not k['stops_at_entry'] and out['stats']['flushes'] <= 1: problems.append(f"stop PCs not at stop stores: {k['stop_pcs']}")
     if kicks is not None and k['issued'] != kicks: problems.append(f"{k['issued']} of {kicks} kicks issued before the end")
     return problems
 
@@ -508,9 +522,45 @@ def cmd_system(a, host, runtime):
     return len(failures)
 
 
+def cmd_coherence(a, host, runtime):
+    programs = [p for p in json.loads((ROOT / 'tools/bench/smp/coherence.json').read_text()) if not a.programs or any(n in p['name'] for n in a.programs)]
+    failures, report = [], []
+    stub = smp.build_stub(a.out / 'qemu-build')
+    for prog in programs:
+        # Pinned QEMU (MTTCG) now and then never finishes a program whose code another CPU rewrites while it runs (seen with
+        # `stale`): a run that times out is repeated; its final state, when it finishes, is deterministic by construction.
+        for attempt in range(5):
+            rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), a.out / 'qemu' / prog['name'], 'multi', timeout=30)
+            if rc != 'timeout': break
+            print(f"{prog['name']}: QEMU run {attempt + 1} timed out", flush=True)
+        if rc != 1: raise RuntimeError(f"QEMU {prog['name']}: {rc} {err}")
+        want = smp.parse_dump(prog, dump)
+        n = prog['ncpu']
+        for limit in ([], [1]):
+            groups = [(f"{prog['name']}{'-1' if limit else ''}-{r}", smp_description(prog), limit) for r in range(a.reps)]
+
+            def judge(i, rc, out, err, prog=prog, want=want, n=n):
+                if rc: return [{'rep': i, 'diffs': [f'driver exit {rc}: {err.strip()[-300:]}']}]
+                stats = {k: sum(c['stats'][k] for c in out['cpus']) for k in ('steps', 'stale_links', 'invalidations', 'stops', 'shootdowns', 'requests')}
+                stats['stops_at_step'] = sum(c['kicks']['stops_at_step'] for c in out['cpus'])
+                return [{'rep': i, 'diffs': judge_smp(prog, want, out, [None] * n), 'stats': stats}]
+            entries = run_groups(a, host, runtime, groups, judge)
+            totals = collections.Counter()
+            for e in entries: totals.update(e.get('stats', {}))
+            bad = [e for e in entries if e['diffs']]
+            label = f"{prog['name']}{' (max-block 1)' if limit else ''}"
+            print(f"{label}: {len(entries) - len(bad)}/{len(entries)} match; {dict(totals)}", flush=True)
+            failures += [f"{label} rep{e['rep']}: {'; '.join(e['diffs'])[:400]}" for e in bad]
+            report.append({'name': prog['name'], 'max_block': limit[0] if limit else None, 'runs': len(entries), 'match': len(entries) - len(bad),
+                           'totals': dict(totals), 'entries': entries})
+    for f in failures: print(f)
+    (a.out / 'coherence.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
+    return len(failures)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=['corpora', 'smp', 'limits', 'kicks', 'system'])
+    ap.add_argument('mode', choices=['corpora', 'smp', 'limits', 'kicks', 'system', 'coherence'])
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--cpus', type=int, nargs='+', default=[2, 3, 4])
@@ -529,7 +579,7 @@ def main():
     a.out.mkdir(parents=True, exist_ok=True)
     host, runtime = vm.build()
     if a.mode == 'kicks' and a.kicks is None: a.kicks = 10_000
-    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system}[a.mode](a, host, runtime)
+    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'coherence': cmd_coherence}[a.mode](a, host, runtime)
     print('failures:', failed)
     sys.exit(1 if failed else 0)
 

@@ -602,3 +602,174 @@ def system_all():
     out = [sys_program(name, n) for name in SYS for n in ((1, 2, 4) if name not in ('pte-no-invlpg',) else (1,))]
     out += [sys_fault(name) for name in list(SYS_FAULTS) + list(SYS_CPL3)]
     return out + [ctl_program(scn, n) for scn in CTL_SCENARIOS for n in CTL_SCENARIOS[scn][2]]
+
+
+# ---- (e) cross-vCPU code coherence (S3d): code written at run time by one CPU and executed by others -----------------------
+# No expected results here: the reference is QEMU's run of the same bytes (QEMU keeps translated code coherent with stores).
+# A page that holds run-time code (CC_PAGE(k)) has a one-byte body at +0 (natemu's driver then maps it writable and
+# executable: a memory region covering a code page leaves it executable) and a captured memory region from +0x10, so its
+# final bytes are compared. Run-time code is entered with `jmp` and leaves with `jmp r13` (no stack). Handshakes are plain
+# stores and loads on flag words (CC_SYNC: +0x80*i per CPU and per purpose); every CPU ends with `cmp r11, r11`, and every
+# register a CPU ends with is independent of how often its spin loops went round.
+CC_PAGE = lambda k: 0x130000 + 0x1000 * k
+CC_SYNC = 0x140000
+CC_GEN, CC_ACK, CC_DONE = CC_SYNC, CC_SYNC + 0x400, CC_SYNC + 0x800      # +0x80*i each
+CC_FN = 0x40                                                             # offset of the function in its page
+
+def cc_function(r):
+    """Variant r of the run-time function: rax = rbx * (7r + 3) + r, then back through r13 (3 qwords)."""
+    code = asm(f'imul rax, rbx, {7 * r + 3}\nadd rax, {r}\njmp r13')
+    return code + b'\x90' * (24 - len(code))
+
+def cc_write(at, code):
+    """Stores of `code` (a multiple of 8 bytes) at `at`, a qword at a time through rax."""
+    return ''.join(f'    mov rax, 0x{int.from_bytes(code[k:k + 8], "little"):x}\n    mov [0x{at + k:x}], rax\n' for k in range(0, len(code), 8))
+
+def cc_wait(flag, value, label):
+    return f'.{label}:\n    cmp qword [0x{flag:x}], {value}\n    jb .{label}\n'
+
+def cc_call(fn, label, serialize=False):
+    """rax = fn(rbx) (rbx set by the caller), folded into r12; `serialize` loads CR3 with its own value first."""
+    s = '    mov rax, cr3\n    mov cr3, rax\n' if serialize else ''
+    return s + f'    lea r13, [rel .{label}]\n    mov rax, 0x{fn:x}\n    jmp rax\n.{label}:\n    rol r12, 7\n    xor r12, rax\n'
+
+def cc_page(k, data=b''):
+    """Body and captured region of run-time code page k (`data`: the region's first bytes, the rest zero)."""
+    return [body(CC_PAGE(k), 'ret')], [{'addr': f'0x{CC_PAGE(k) + 0x10:x}', 'data': (data + bytes(0xff0 - len(data))).hex()}]
+
+def cc_program(name, n, texts, pages, regs=None, cpl=3, memory=()):
+    bodies, mem = [], [zero(CC_SYNC, 0x1000)] + list(memory)
+    for k, data in pages:
+        b, m = cc_page(k, data); bodies += b; mem += m
+    cpus = []
+    for i, t in enumerate(texts):
+        bodies.append(body(BODY0 + 0x1000 * i, t + '\n    cmp r11, r11'))
+        cpus.append(dict(cpu(i, BODY0 + 0x1000 * i, **(regs(i) if regs else {})), cpl=cpl))
+    return {'format': 'natemu-smp-v1', 'name': f'cc-{name}@{n}', 'ncpu': n, 'bodies': bodies, 'cpus': cpus, 'memory': mem, 'params': {'coherence': name}}
+
+CC_ROUNDS = 6
+def cc_fresh(n, kind):
+    """CPU 0 writes variant r of a function into a page, then publishes GEN = r; CPUs 1.. wait for it, run the function,
+    acknowledge; CPU 0 waits for every acknowledgement before the next variant. `new`: the page held nothing the others
+    touched; `reused`: the others first stored to and loaded from a data word on that page (their writable shadows of it
+    must go when they translate code from it); `cr3`: as `new`, each CPU loading CR3 with its own value (a serialising
+    instruction) before running the function (CPL0)."""
+    k = {'new': 0, 'reused': 1, 'cr3': 2}[kind]
+    fn = CC_PAGE(k) + CC_FN
+    w = ''
+    for r in range(1, CC_ROUNDS + 1):
+        w += ''.join(cc_wait(CC_ACK + 0x80 * j, r - 1, f'a{r}_{j}') for j in range(1, n))
+        w += cc_write(fn, cc_function(r)) + f'    mov qword [0x{CC_GEN:x}], {r}\n'
+    w += ''.join(cc_wait(CC_ACK + 0x80 * j, CC_ROUNDS, f'af_{j}') for j in range(1, n))
+    def jumper(i):
+        t = f'    mov [0x{CC_PAGE(k) + 0x800 + 8 * i:x}], rbx\n    mov r8, [0x{CC_PAGE(k) + 0x800 + 8 * i:x}]\n' if kind == 'reused' else ''
+        for r in range(1, CC_ROUNDS + 1):
+            t += cc_wait(CC_GEN, r, f'w{r}') + cc_call(fn, f'b{r}', kind == 'cr3') + f'    mov qword [0x{CC_ACK + 0x80 * i:x}], {r}\n'
+        return t
+    return cc_program(f'fresh-{kind}', n, [w] + [jumper(i) for i in range(1, n)], [(k, b'')], regs=lambda i: {'rbx': 0x1234567 * (i + 1)},
+                      cpl=0 if kind == 'cr3' else 3)
+
+def cc_rounds(n):
+    """Every CPU in turn patches one shared function (round r: CPU (r - 1) % n writes variant r, after every CPU acknowledged
+    round r - 1), then all CPUs run it and acknowledge."""
+    fn = CC_PAGE(3) + CC_FN
+    def text(i):
+        t = ''
+        for r in range(1, 3 * n + 1):
+            if (r - 1) % n == i:
+                t += ''.join(cc_wait(CC_ACK + 0x80 * j, r - 1, f'a{r}_{j}') for j in range(n))
+                t += cc_write(fn, cc_function(r)) + f'    mov qword [0x{CC_GEN:x}], {r}\n'
+            t += cc_wait(CC_GEN, r, f'w{r}') + cc_call(fn, f'b{r}') + f'    mov qword [0x{CC_ACK + 0x80 * i:x}], {r}\n'
+        return t
+    return cc_program('rounds', n, [text(i) for i in range(n)], [(3, b'')], regs=lambda i: {'rbx': 0x9e3779b9 * (i + 1)})
+
+def cc_loop(k, i, iters, extra=''):
+    """Run-time loop code for page k (at +CC_FN): `iters` rounds of an ALU mix on r8/r9 (plus `extra` per round), then back
+    through r13."""
+    return asm(f"""    mov ecx, {iters}
+.l: add r8, rcx
+    imul r9, r8, 13
+    xor r8, r9
+    rol r8, 3
+{extra}    dec ecx
+    jnz .l
+    jmp r13""")
+
+def cc_data(n, iters=20000):
+    """CPU 0 runs a hot loop from page 4 (`iters` rounds); once it announced its start, CPUs 1.. store to their own word on
+    that same page until CPU 0 announces its end (data on a peer's code page: every such store that faults posts the page of
+    CPU 0's running block), then acknowledge; CPU 0 waits for every acknowledgement and reads the words."""
+    loop = cc_loop(4, 0, iters)
+    t0 = f'    mov qword [0x{CC_GEN:x}], 1\n    lea r13, [rel .back]\n    mov rax, 0x{CC_PAGE(4) + CC_FN:x}\n    jmp rax\n.back:\n'
+    t0 += f'    mov qword [0x{CC_DONE:x}], 1\n'
+    t0 += ''.join(cc_wait(CC_ACK + 0x80 * j, 1, f'd{j}') + f'    add r10, [0x{CC_PAGE(4) + 0x800 + 8 * j:x}]\n' for j in range(1, n))
+    def writer(i):
+        return cc_wait(CC_GEN, 1, 'w') + f""".s: mov [0x{CC_PAGE(4) + 0x800 + 8 * i:x}], rbx
+    cmp qword [0x{CC_DONE:x}], 0
+    je .s
+    mov qword [0x{CC_ACK + 0x80 * i:x}], 1
+"""
+    return cc_program('data', n, [t0] + [writer(i) for i in range(1, n)], [(4, bytes(CC_FN - 0x10) + loop)], regs=lambda i: {'rbx': 0x1111 * (i + 1)})
+
+def cc_rewrite(n, iters=3000):
+    """CPU 0 runs a loop from page 5; CPUs 1.. store the loop's own bytes back over it (the same values) until CPU 0
+    announces its end: a page rewritten on every fetch."""
+    loop = cc_loop(5, 0, iters)
+    code = loop + bytes(-len(loop) % 8)
+    t0 = f'    lea r13, [rel .back]\n    mov rax, 0x{CC_PAGE(5) + CC_FN:x}\n    jmp rax\n.back:\n    mov qword [0x{CC_DONE:x}], 1\n'
+    at = CC_PAGE(5) + CC_FN
+    def writer(i):
+        body_ = ''.join(f'    mov rax, [0x{at + k:x}]\n    mov [0x{at + k:x}], rax\n' for k in range(0, len(code), 8))
+        return f'.r:\n{body_}    cmp qword [0x{CC_DONE:x}], 0\n    je .r\n'
+    return cc_program('rewrite', n, [t0] + [writer(i) for i in range(1, n)], [(5, bytes(CC_FN - 0x10) + code)])
+
+def cc_mutual(n, iters=300000):
+    """CPU i runs a loop from page 6 + i that stores its counter into page 6 + (i + 1) % n each round: every CPU translates
+    a page another CPU writes (with a writable shadow of it), so they shoot each other's shadows down."""
+    def page(i):
+        return bytes(CC_FN - 0x10) + cc_loop(6 + i, i, iters, f'    mov [0x{CC_PAGE(6 + (i + 1) % n) + 0x800 + 8 * i:x}], rcx\n')
+    t = lambda i: f'    lea r13, [rel .back]\n    mov rax, 0x{CC_PAGE(6 + i) + CC_FN:x}\n    jmp rax\n.back:\n'
+    return cc_program('mutual', n, [t(i) for i in range(n)], [(6 + i, page(i)) for i in range(n)])
+
+def cc_finish(n, late):
+    """CPUs 1.. store to a data word on page 10 (holding a writable shadow of it), publish their flag and end (`late`: after a
+    delay loop); CPU 0 waits for the flags and runs the function on page 10, translating it after the writers ended (their
+    writable shadows went with their end) or, `late`, while they still run (they are shot down)."""
+    fn = cc_function(1)
+    t0 = ''.join(cc_wait(CC_DONE + 0x80 * j, 1, f'd{j}') for j in range(1, n)) + '    mov rbx, 77\n' + cc_call(CC_PAGE(10) + CC_FN, 'b')
+    delay = '    mov ecx, 3000000\n.x: dec ecx\n    jnz .x\n' if late else ''
+    writer = lambda i: f'    mov [0x{CC_PAGE(10) + 0x800 + 8 * i:x}], rbx\n    mov qword [0x{CC_DONE + 0x80 * i:x}], 1\n' + delay
+    return cc_program('finish-late' if late else 'finish', n, [t0] + [writer(i) for i in range(1, n)], [(10, bytes(CC_FN - 0x10) + fn)],
+                      regs=lambda i: {'rbx': i + 5})
+
+CC_COUNT = 0x141000          # CPU 0's iteration count in `stale` (not captured: how often it went round is schedule-dependent)
+def cc_stale(n, patch_after=2000):
+    """CPU 0 calls a one-block function on page 11 in a loop until its result changes (counting rounds in an uncaptured
+    word); CPUs 1.. store to their own data word on that page until CPU 0 is done, so CPU 0's misses there wait on their
+    writable shadows while their stores keep clearing its mark; the last CPU patches the function once CPU 0 went round
+    `patch_after` times. A block CPU 0 placed from a page whose mark it lost, and kept live, would never see the patch."""
+    # The patch changes one instruction (an 8-byte-aligned store holds it), so a fetch racing it sees the old or the new one.
+    fn, old = CC_PAGE(11) + CC_FN, 5 * 10 + 1
+    variant = lambda r: (lambda c: c + b'\x90' * (24 - len(c)))(asm(f'imul rax, rbx, 10\nadd rax, {r}\njmp r13'))
+    t0 = f""".l: inc qword [0x{CC_COUNT:x}]
+    mov rbx, 5
+""" + cc_call(fn, 'b').replace('    rol r12, 7\n    xor r12, rax\n', '') + f"""    cmp rax, {old}
+    je .l
+    mov qword [0x{CC_DONE:x}], 1
+""" + ''.join(cc_wait(CC_ACK + 0x80 * j, 1, f'a{j}') for j in range(1, n))
+    def writer(i):
+        slot = CC_PAGE(11) + 0x800 + 8 * i
+        store = lambda lab, until: f'.{lab}: mov [0x{slot:x}], rbx\n{until}'
+        done = f'    cmp qword [0x{CC_DONE:x}], 0\n    je .t\n'
+        t = ''
+        if i == n - 1:
+            t += store('s', f'    cmp qword [0x{CC_COUNT:x}], {patch_after}\n    jb .s\n') + cc_write(fn, variant(2)[:8])
+        return t + store('t', done) + f'    mov qword [0x{CC_ACK + 0x80 * i:x}], 1\n'
+    return cc_program('stale', n, [t0] + [writer(i) for i in range(1, n)], [(11, bytes(CC_FN - 0x10) + variant(1))],
+                      regs=lambda i: {'rbx': 0x2222 * (i + 1)}, memory=[dict(zero(CC_COUNT, 8), capture=False)])
+
+def coherence_all():
+    out = []
+    for n in (2, 4):
+        out += [cc_fresh(n, k) for k in ('new', 'reused', 'cr3')] + [cc_rounds(n), cc_data(n), cc_rewrite(n), cc_mutual(n), cc_finish(n, False), cc_finish(n, True)]
+    return out + [cc_stale(n) for n in (3, 4)]

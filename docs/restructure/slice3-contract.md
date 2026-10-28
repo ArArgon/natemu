@@ -50,7 +50,9 @@ host copies from the guest-physical page it is given; host fetch walks and their
 path, not a writable install), so no later writable install misses the code bit. For each peer p with a writable bit: read
 p's reset counter, set SHADOWS, kick p, wait until the counter changes (not until the bit clears: p may re-set it),
 draining its own record meanwhile (mutual waiters both progress); if its own code bit is cleared meanwhile (a write hit
-the page), stop waiting and redo the miss. Serving SHADOWS: reset own shadows (`tlbi` own ASID, `dsb ish`), clear own
+the page), stop waiting: the block placed from the page is then killed and its instruction stepped (as after any failed
+post-place check: a dead block, a flush during the miss or a source page without its owner's mark), so every live block's
+source pages carry its owner's mark unless a write since cleared it and posted the page. Serving SHADOWS: reset own shadows (`tlbi` own ASID, `dsb ish`), clear own
 writable bits, increment the counter (release). A block using the next page: the request carries that page's
 guest-physical address, marked the same way first; a fetch fault there cuts the block before it. **Peers that stop
 draining.** Before any exit to the host that may block indefinitely (finished at `stop_at` or halt, parked, stopped for
@@ -256,6 +258,31 @@ their campaigns retire:** runtime/abi family code (modes are layered: `translati
   posting the page of a vCPU's running block (never `bad_link`; steps, stale links counted) at block sizes default/1; a
   page rewritten on every fetch (the runner finishes); two vCPUs translating pages the other writes (no deadlock); a vCPU
   finishing while a peer misses on a page it held writable.
+  *Built (Oct 28):* the resident walks each miss's fetch itself (abi `execution::fetch`, `State::fetch`/`fetch_fault`; contended
+  walks re-walk), marks the page (`cache::mark`) and shoots down peers' writable shadows (`execution::mark`: counter read, bit
+  re-checked, `SHADOWS` + kick, wait while draining its own record; own bit cleared → stop waiting) before the host copies the
+  bytes from the given guest-physical page; host fetch walks, their A-bit writes and kicks are gone. The next page is walked
+  only when the host's bytes ran out at the page end (reply `REPLY_NEXT_PAGE`: the compiled block ended `end_of_input` there, or
+  its first instruction did not decode) and marked the same way; its fault cuts the block (or is the stop for a straddling
+  instruction). The host's stop RIP is in `State::stop_at` (nothing is fetched there). After placing, the resident drains again;
+  a dead block, a flush during the miss or a source page whose mark was cleared (a peer's write, possibly drained before the
+  block existed, or its own fetch walk's A write) kills the block, if live, and steps the instruction instead (`stale_links`
+  in the linker). (The first build stepped without killing a block whose only fault was a lost mark: it stayed in L2,
+  unmarked, and no later write reached it; found by review. `stale@3/4` targets it; 20 runs did not provoke it before the
+  fix, since a peer clears the mark before it posts, so the wait usually ends before the post is drained.) A stop at the step block drains and enters the step block again (it
+  holds one already-fetched instruction), so kicks faster than a block entry cannot discard the step: without this, the data
+  stress below at block size 1 did not finish in 6.5 min. Walker A/D writes into a code page no longer refuse and re-walk:
+  `guest_memory::CodeWrites` clears and posts first, then writes (no livelock, whoever re-marks the page; unit test), and every
+  A/D or split-store write through the RAM alias is re-checked after `dmb ish` (`cache::rechecked`). A writable install sets its
+  bit before it reads the marks (an install after an eviction reads them again, else installs read-only). Halts already served
+  `SHADOWS` unasked (S3a). INVLPG's spurious code bits stay (conservative). Check: `tools/run_slice3_vm.py coherence`
+  (`programs.coherence_all`, QEMU reference): fresh code on a new page and on a reused data page, 6 patch rounds (also after
+  `mov cr3, cr3`), every CPU patching in turn, data on a peer's running code page (stress), a page rewritten with its own
+  bytes on every fetch, CPUs translating each other's written pages, writers ending before or while a peer translates their
+  page, and (`stale`, 3 and 4 vCPUs) a function called in a loop until a patch shows while peers store data on its page — 20
+  programs × 2 block sizes, all match; negative control (shootdown disabled): `fresh-new` and `fresh-reused` fail
+  at 2 and 4 vCPUs. **Cliff:** a peer storing continuously to data on the page a vCPU runs from makes that vCPU step every
+  instruction (each shootdown is answered by the next faulting store); `data@4` takes ~120,000 steps for 20,000 loop rounds.
 - **S3e, ordering on the general path.** Fences, memory XCHG (`swap` sites, alignment stop), generated litmus programs
   (sb, mp, lb, wrc, iriw, 2+2W, sb-mfence, sb-xchg, XCHG chains) at N = 2..4, with unaligned and split-store variants.
   *Check:* outcomes within `i4v_ordering_model.py`'s allowed sets in ≥10^5 trials per cell; chains linearizable; XCHG

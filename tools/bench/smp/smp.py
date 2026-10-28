@@ -155,6 +155,7 @@ def cmd_build(a):
     (HERE / 'programs.json').write_text(json.dumps(programs.det_all(), indent=1) + '\n')
     (HERE / 'litmus.json').write_text(json.dumps(programs.litmus_all(a.k), indent=1) + '\n')
     (HERE / 'system.json').write_text(json.dumps(programs.system_all(), indent=1) + '\n')
+    (HERE / 'coherence.json').write_text(json.dumps(programs.coherence_all(), indent=1) + '\n')
 
 
 def det_one(prog, stub, work, mode, reps, log, model):

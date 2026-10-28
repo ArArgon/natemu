@@ -1,7 +1,7 @@
 //! Host side of block execution (`natemu_abi::execution`): the execution mode's
 //! private address space (code cache areas included), and the service loop that
 //! answers the resident's translation requests, which arrive only on a cache miss:
-//! fetch the guest bytes at RIP through the guest walk, compile one block with fexc
+//! copy the guest bytes at RIP from the guest-physical pages the resident walked, compile one block with fexc
 //! (`--profile slice1`, a persistent server), admit it and stage it. A step request
 //! (self-modifying code) is the same with a one-instruction block. A watchdog
 //! stops a vCPU that runs too long without a host exit. A kick ([`Stops`]) stops a
@@ -9,13 +9,13 @@
 use super::*;
 use crate::admission;
 use natemu_abi::execution::{self as exec, Cpu, State, cache};
-use natemu_abi::guest_memory::{GuestRam, GuestTables};
-use natemu_abi::paging::{self, Access, Fault};
+use natemu_abi::guest_memory::GuestRam;
+use natemu_abi::paging::Fault;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -148,30 +148,14 @@ pub(crate) fn guest_ram_written(memory: &Memory) {
         record_word(memory, v, None).fetch_or(cache::FLUSH, SeqCst);
     }
 }
-/// The host wrote guest-physical `gpa` (a fetch walk's A bit) while vCPUs may run: clears every vCPU's code bit of
-/// the page and posts the page to each that had one (as the resident does for its own writes). Returns their mask
-/// (the caller kicks them).
-fn page_written(memory: &Memory, gpa: u64) -> u8 {
-    let page = (gpa >> 12) as usize;
-    if page >= exec::GUEST_PAGES {
-        return 0;
-    }
-    let mask = unsafe { AtomicU8::from_ptr(memory.0.add(cache::GLOBAL_OFFSET + cache::CODE_PAGES + page)) };
-    let holders = mask.swap(0, SeqCst);
-    for v in (0..cache::MAX_VCPUS).filter(|v| holders & 1 << v != 0) {
-        record_word(memory, v, Some(page / 64)).fetch_or(1 << (page % 64), SeqCst);
-        record_word(memory, v, None).fetch_or(cache::PAGES, SeqCst);
-    }
-    holders
-}
-
 /// Precise stops. vCPU v's stop granule is the IPA granule holding its stop page (`exec::STOP_OFFSET` of its window;
 /// nothing else is in it). A kick sets v's kick flag and write-protects the granule (under v's mutex), so v's next
 /// block entry, at its stop store, takes a stage-2 permission fault to v's own thread ([`serve`]), which restores the
 /// granule, clears the flag and enters the resident's stop gate; the gate drains v's invalidation record and
 /// re-dispatches. A kick that finds v in the host or the resident faults at v's next block entry, after its next
-/// drain (an empty stop); a kick while one is pending merges into it. Kicks come from the host (drivers; fetch walks
-/// writing a code page) and from peers' residents (`hvc #KICK_HVC`).
+/// drain (an empty stop); a kick while one is pending merges into it. Kicks come from the host (drivers) and from
+/// peers' residents (`hvc #KICK_HVC`: a write to a page the vCPU holds translations from, a shootdown of its writable
+/// shadows).
 ///
 /// Concurrency: the granule's rights change only under v's mutex, read-only by a kick that finds no kick pending and
 /// read-write only by v's own thread on the stop exit itself (never on other exits, so a kick that lands while v is
@@ -508,92 +492,50 @@ fn system_cut(json: &crate::json::Value, rip: u64) -> Option<(u8, u8)> {
     (at == rip).then_some((number("cut_opcode_map")?, number("cut_opcode")?))
 }
 
-/// Guest bytes fetched at a RIP, the (linear, physical) pages they came from, and the
-/// fetch fault of the next page when that ended them.
+/// The guest bytes at a RIP, copied from the guest-physical pages the resident walked for the request.
 struct Fetched {
     bytes: Vec<u8>,
-    pages: Vec<[u64; 2]>,
+    /// They end at the end of RIP's page and the next page was not walked yet: more may follow.
+    more: bool,
+    /// The fetch fault of the next page, when its walk failed (the block is cut before it).
     next_fault: Option<Fault>,
 }
-
-/// The fetch walk's A-bit writes: guest-physical addresses written (a write to a page holding translations is a
-/// write to code, which no vCPU may keep running, see [`page_written`]).
-struct Writes(Vec<u64>);
-impl natemu_abi::guest_memory::Observer for Writes {
-    fn write(&mut self, gpa: u64, _: u64, _: u64) -> bool {
-        self.0.push(gpa);
-        true
-    }
-}
-
-/// Fetches lost to peers' A/D races in a row before the host gives up on a request (a livelock the guest causes: x86
-/// re-walks without bound, but a host thread must not spin forever; each fetch already re-walks `WALK_ATTEMPTS` times).
-const FETCH_ATTEMPTS: usize = 100_000;
-
-/// Guest bytes at `rip` up to the end of its page, continuing into the next
-/// page when that is fetchable, and never past `limit`. A fetch whose walk (of either page) loses its A/D
-/// races to peers is repeated whole (x86 re-walks), until `cancelled` or [`FETCH_ATTEMPTS`] (then an error).
-/// Peers holding translations from a page the walk wrote are kicked (`area` is the fetching vCPU's).
-fn fetch(area: Area, stops: &Stops, cpu: &Cpu, rip: u64, limit: Option<u64>, cancelled: &AtomicBool) -> Result<std::result::Result<Fetched, Fault>> {
+/// The bytes at `state.cpu.rip` up to the end of its page, continuing through the next page when the resident walked
+/// it, never past `limit` (when it lies ahead); or the vCPU's stop, when the walk of RIP's page failed.
+fn fetched(area: Area, state: &State, limit: Option<u64>) -> Result<std::result::Result<Fetched, Stop>> {
     let ram = guest_ram(area.memory);
-    let control = cpu.control().ok_or("bank is not in 4-level long mode")?;
-    for _ in 0..FETCH_ATTEMPTS {
-        let mut tables = GuestTables::observed(ram, Writes(Vec::new()));
-        let fetched = fetch_with(&mut tables, ram, control, rip, limit);
-        for gpa in tables.observer.0 {
-            let peers = page_written(area.memory, gpa) & !(1 << area.vcpu);
-            for v in (0..cache::MAX_VCPUS).filter(|v| peers & 1 << v != 0) {
-                stops.kick(v)?;
-            }
-        }
-        match fetched {
-            Ok(Err(Fault::Contended)) if !cancelled.load(SeqCst) => {}
-            _ => return fetched,
-        }
-    }
-    Err(format!("fetch at {rip:#x}: page walks lost {FETCH_ATTEMPTS} A/D races in a row (livelock)"))
-}
-fn fetch_with<O: natemu_abi::guest_memory::Observer>(
-    tables: &mut GuestTables<O>,
-    ram: GuestRam,
-    control: paging::Control,
-    rip: u64,
-    limit: Option<u64>,
-) -> Result<std::result::Result<Fetched, Fault>> {
-    let (mut bytes, mut pages, mut va, mut next_fault) = (Vec::new(), Vec::new(), rip, None);
-    for _ in 0..2 {
-        let page_end = (va | 4095).checked_add(1);
-        let end = match (limit, page_end) {
-            (Some(l), Some(e)) if l > va && l < e => l,
-            (Some(l), None) if l > va => l,
-            (_, Some(e)) => e,
-            (_, None) => 0, // the last page: up to 2^64, wrapping is the guest's problem
+    let rip = state.cpu.rip;
+    let fault = exec::fetch::decode(state.fetch_fault);
+    if state.fetch[0] == u64::MAX {
+        return match fault {
+            Some(fault) => Ok(Err(Stop::FetchFault(fault))),
+            None => Err(format!("code at {rip:#x} is not write-back guest RAM")),
         };
-        let t = match paging::walk(tables, control, va, Access::Fetch) {
-            Ok(t) if t.wb => t,
-            Ok(_) if pages.is_empty() => return Err(format!("code at {va:#x} is not write-back memory")),
-            Ok(_) => break,
-            // Either page's walk lost its races: the whole fetch is repeated (an instruction may straddle into the
-            // next page, which must not look undecodable).
-            Err(f @ Fault::Contended) => return Ok(Err(f)),
-            Err(f) if pages.is_empty() => return Ok(Err(f)),
-            Err(f) => {
-                next_fault = Some(f);
-                break;
-            }
-        };
-        let mut chunk = vec![0; end.wrapping_sub(va) as usize];
-        if !ram.copy_out(t.gpa, &mut chunk) {
-            return Err(format!("code at {va:#x} is outside guest RAM"));
-        }
-        bytes.extend(chunk);
-        pages.push([va & !4095, t.gpa & !4095]);
-        if Some(end) != page_end {
-            break;
-        }
-        va = end;
     }
-    Ok(Ok(Fetched { bytes, pages, next_fault }))
+    // Bytes of [va, the end of its page), cut at the limit when it lies inside; and whether it did.
+    let span = |va: u64| {
+        let rest = 4096 - (va & 4095);
+        match limit {
+            Some(l) if l > va && l - va < rest => (l - va, true),
+            _ => (rest, false),
+        }
+    };
+    let copy = |gpa: u64, length: u64| -> Result<Vec<u8>> {
+        let mut chunk = vec![0; length as usize];
+        if !ram.copy_out(gpa, &mut chunk) {
+            return Err(format!("code at {rip:#x} is outside guest RAM"));
+        }
+        Ok(chunk)
+    };
+    let (length, cut) = span(rip);
+    let mut bytes = copy(state.fetch[0] | rip & 4095, length)?;
+    // The last page of the address space has no next page.
+    let next = rip.checked_add(length).filter(|_| !cut);
+    if let (Some(va), true) = (next, state.fetch[1] != u64::MAX) {
+        bytes.extend(copy(state.fetch[1], span(va).0)?);
+    }
+    let walked = state.fetch[1] != u64::MAX || state.fetch_fault[0] != exec::fetch::NONE;
+    Ok(Ok(Fetched { bytes, more: next.is_some() && !walked, next_fault: fault }))
 }
 
 /// Host exits of one [`run`].
@@ -627,6 +569,10 @@ pub(crate) fn run(
     stops: &Stops,
     cancelled: &AtomicBool,
 ) -> Result<Stop> {
+    // The resident fetches nothing at the stop RIP (the run ends there).
+    let mut state: State = area.read_record(exec::STATE_OFFSET);
+    state.stop_at = stop_at.unwrap_or(u64::MAX);
+    area.write_record(exec::STATE_OFFSET, state);
     // `true`: the vCPU enters the guest; `false`: it is back in the host. Dropping the sender ends the watchdog.
     let (running, events) = std::sync::mpsc::channel::<bool>();
     let id = cpu.id();
@@ -715,7 +661,7 @@ fn serve(
             exec::REQUEST_STEP => true,
             _ => return Err("translation exit without a request".into()),
         };
-        state.reply = match translation(area, compiler, &mut state, step, stop_at, requests, stops, cancelled)? {
+        state.reply = match translation(area, compiler, &mut state, step, stop_at, requests)? {
             Ok(reply) => reply,
             Err(stop) => {
                 parked = Some(stop);
@@ -726,7 +672,8 @@ fn serve(
     }
 }
 /// Serves one request: stages the admitted block, or decodes the system instruction at RIP, and fills `state`'s
-/// reply fields (returns the reply); or returns the vCPU's stop.
+/// reply fields (returns the reply); or asks for the next page ([`exec::REPLY_NEXT_PAGE`]) when the bytes of RIP's
+/// page ran out before the block or its first instruction ended; or returns the vCPU's stop.
 fn translation(
     area: Area,
     compiler: &mut Compiler,
@@ -734,19 +681,25 @@ fn translation(
     step: bool,
     stop_at: Option<u64>,
     requests: &mut Requests,
-    stops: &Stops,
-    cancelled: &AtomicBool,
 ) -> Result<std::result::Result<u64, Stop>> {
     let rip = state.cpu.rip;
     if Some(rip) == stop_at {
         return Ok(Err(Stop::Reached));
     }
-    let Fetched { bytes, pages, next_fault } = match fetch(area, stops, &state.cpu, rip, stop_at, cancelled)? {
+    let Fetched { bytes, more, next_fault } = match fetched(area, state, stop_at)? {
         Ok(fetched) => fetched,
-        Err(Fault::Contended) => return Ok(Err(Stop::Cancelled)),
-        Err(fault) => return Ok(Err(Stop::FetchFault(fault))),
+        Err(stop) => return Ok(Err(stop)),
     };
-    let block = match compiler.compile(&bytes, rip, step)? {
+    let code = compiler.compile(&bytes, rip, step)?;
+    let ran_out = match &code {
+        Code::Block(b) => b.end_reason == natemu_abi::code_object::end_reason::END_OF_INPUT,
+        Code::None(reason) => reason == "partial_decode" || reason == "end_of_input",
+        Code::System(_) => false,
+    };
+    if more && ran_out {
+        return Ok(Ok(exec::REPLY_NEXT_PAGE));
+    }
+    let block = match code {
         Code::Block(block) => block,
         // A step request is for a block's access site, never a system instruction.
         Code::System(s) if !step => {
@@ -777,15 +730,8 @@ fn translation(
         requests.blocks += 1;
         requests.rips.insert(rip);
     }
-    state.source_gpa = [u64::MAX; 2];
     state.link_points = [exec::LinkPoint::NONE; exec::MAX_LINK_POINTS];
     state.link_points[..block.links.len()].copy_from_slice(&block.links);
-    // Source pages are those the translated bytes reach.
-    let end = rip.wrapping_add(u64::from(block.guest_bytes) - 1);
-    let used = pages.into_iter().filter(|&[va, _]| va == rip & !4095 || va == end & !4095);
-    for (i, [_, gpa]) in used.enumerate() {
-        state.source_gpa[i] = gpa;
-    }
     if let Some(tamper) = requests.tamper {
         if tamper(area, state) {
             (requests.tamper, requests.tampered) = (None, true);
@@ -839,48 +785,36 @@ mod tests {
         assert_eq!(cache::MAX_VCPUS, 4);
     }
 
+    /// The bytes come only from the pages the resident walked: RIP's page to its end (more may follow until the next
+    /// page is walked or its walk failed), on through the next page, never past the limit; a failed walk of RIP's page
+    /// is the fetch fault stop.
     #[test]
-    fn a_write_to_a_code_page_is_posted_to_its_holders() {
+    fn fetched_bytes_follow_the_resident_walk() {
         let memory = Memory::with_size(exec::BACKING_BYTES).unwrap();
-        memory.copy(cache::GLOBAL_OFFSET + cache::CODE_PAGES + 5, &[0b101]);
-        page_written(&memory, 0x5123);
-        assert_eq!(memory.read::<1>(cache::GLOBAL_OFFSET + cache::CODE_PAGES + 5), [0]);
-        for v in 0..cache::MAX_VCPUS {
-            let held = v == 0 || v == 2;
-            assert_eq!(record_word(&memory, v, None).load(SeqCst), if held { cache::PAGES } else { 0 });
-            assert_eq!(record_word(&memory, v, Some(0)).load(SeqCst), if held { 1 << 5 } else { 0 });
-        }
-        page_written(&memory, 0x6000); // no holder: nothing posted
-        assert_eq!(record_word(&memory, 1, None).load(SeqCst), 0);
-        guest_ram_written(&memory);
-        assert!((0..cache::MAX_VCPUS).all(|v| record_word(&memory, v, None).load(SeqCst) & cache::FLUSH != 0));
+        let ram = guest_ram(&memory);
+        assert!(ram.copy_in(0x5ff0, &[0xaa; 16]) && ram.copy_in(0x9000, &[0xbb; 16]));
+        let area = Area { memory: &memory, vcpu: 0, base: 0 };
+        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1ff0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3 });
+        s.fetch = [0x5000, u64::MAX];
+        let f = fetched(area, &s, None).unwrap().unwrap();
+        assert_eq!((f.bytes, f.more, f.next_fault), (vec![0xaa; 16], true, None));
+        let f = fetched(area, &s, Some(0x1ff8)).unwrap().unwrap();
+        assert_eq!((f.bytes.len(), f.more), (8, false));
+        s.fetch_fault = exec::fetch::encode(Fault::Page { address: 0x2000, error: 0x15 });
+        let f = fetched(area, &s, None).unwrap().unwrap();
+        assert_eq!((f.more, f.next_fault), (false, Some(Fault::Page { address: 0x2000, error: 0x15 })));
+        (s.fetch, s.fetch_fault) = ([0x5000, 0x9000], [exec::fetch::NONE; 3]);
+        let f = fetched(area, &s, Some(0x2004)).unwrap().unwrap();
+        assert_eq!((&f.bytes[14..], f.more), (&[0xaa, 0xaa, 0xbb, 0xbb, 0xbb, 0xbb][..], false));
+        (s.fetch, s.fetch_fault) = ([u64::MAX; 2], exec::fetch::encode(Fault::Noncanonical));
+        assert!(matches!(fetched(area, &s, None), Ok(Err(Stop::FetchFault(Fault::Noncanonical)))));
     }
 
-    /// A second page whose walk loses its A/D races is a contended fetch of the whole range, not a fetch that ends at the
-    /// first page with a fault of the next: [`fetch`] repeats it, and the repeat sees both pages.
     #[test]
-    fn a_contended_second_page_makes_the_whole_fetch_contended() {
-        // Guest-physical 0x1000.. is this array: PML4, PDPT, PD, PT, then the code pages at 0x5000 and 0x6000.
-        let mut backing = [0u64; 0x6000 / 8];
-        for (i, v) in [(0, 0x2007), (512, 0x3007), (1024, 0x4007), (1537, 0x5007), (1538, 0x6007)] {
-            backing[i] = v;
-        }
-        let ram = unsafe { GuestRam::new(0x1000, 0x6000, backing.as_mut_ptr() as u64) };
-        let control = paging::Control { cr3: 0x1000, cpl: 3, wp: 1, nxe: 1, smep: 0 };
-        // Every A-bit write to the second page's PTE (0x4010) finds an unrelated bit (AVL) changed.
-        struct Race(GuestRam);
-        impl natemu_abi::guest_memory::Observer for Race {
-            fn write(&mut self, gpa: u64, old: u64, _: u64) -> bool {
-                if gpa == 0x4010 {
-                    assert!(self.0.write::<u64>(gpa, old ^ 0x200));
-                }
-                true
-            }
-        }
-        let lost = fetch_with(&mut GuestTables::observed(ram, Race(ram)), ram, control, 0x1ff0, None);
-        assert!(matches!(lost, Ok(Err(Fault::Contended))));
-        let f = fetch_with(&mut GuestTables::observed(ram, Writes(Vec::new())), ram, control, 0x1ff0, None).unwrap().unwrap();
-        assert_eq!((f.bytes.len(), f.pages, f.next_fault), (0x10 + 0x1000, vec![[0x1000, 0x5000], [0x2000, 0x6000]], None));
+    fn host_writes_to_guest_ram_flush_every_vcpu() {
+        let memory = Memory::with_size(exec::BACKING_BYTES).unwrap();
+        guest_ram_written(&memory);
+        assert!((0..cache::MAX_VCPUS).all(|v| record_word(&memory, v, None).load(SeqCst) & cache::FLUSH != 0));
     }
 
     #[test]

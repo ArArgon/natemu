@@ -1,6 +1,7 @@
 //! Block execution in the resident (`natemu_abi::execution`): find the block
-//! for the banked RIP in the code cache ([`cache`]) or ask the host for it and
-//! place it, enter it from the state bank, take exits the fast dispatcher
+//! for the banked RIP in the code cache ([`cache`]) or walk its fetch, mark its
+//! pages as code (shooting down peers' writable shadows of them), ask the host for
+//! it and place it, enter it from the state bank, take exits the fast dispatcher
 //! (`gates.S` `dispatch_fast`) cannot resolve back into the bank, and serve
 //! shadow misses at the recorded access sites of the block holding the faulting
 //! PC by walking the guest tables and retrying the same instruction. A write to a
@@ -16,7 +17,7 @@ use crate::cache::{self, Block};
 use natemu_abi::{
     code_object::{self as object, Header, Site},
     execution::*,
-    guest_memory::{self, Observer},
+    guest_memory::{self, CodePages, CodeWrites},
     paging::{self, Access, Fault},
     shadow::{self, READ_ONLY},
 };
@@ -161,16 +162,25 @@ pub unsafe fn start() -> ! {
     }
 }
 
-/// Enters the block for `s.cpu.rip`.
+/// Enters the block for `s.cpu.rip`, or steps its first instruction when a write killed it as it was placed.
 unsafe fn dispatch(mut s: State) -> ! {
-    let block = unsafe { find(&mut s) };
-    unsafe { enter(s, block) }
+    match unsafe { find(&mut s) } {
+        Some(block) => unsafe { enter(s, block) },
+        None => step(s),
+    }
 }
 /// The block for `s.cpu.rip`: from the cache (L2; L1 was probed by the fast dispatcher), else asks the host for it and
-/// places it. Pending invalidations are taken first. Either may flush the cache (`s.generation`). A system instruction
-/// at the RIP is executed ([`system`]) and the search goes on at the next RIP (so the block found may be for a later
-/// RIP than the one asked for).
-unsafe fn find(s: &mut State) -> &'static Block {
+/// places it. Pending invalidations are taken first, and again after placing. A write that raced the block's fetch (a
+/// peer's, or this vCPU's own fetch walk writing an A bit into it) killed it, cleared this vCPU's mark of a source page
+/// (its post may have been drained before the block existed, in [`mark`]'s wait) or flushed the cache during the miss:
+/// the block, if still live, is then killed, and `None` says to step the instruction instead (re-dispatching could
+/// starve under a peer rewriting the page on every fetch; the step always runs one instruction). This keeps the
+/// invariant that every live block's source pages carry this vCPU's mark, unless a write since cleared it, which then
+/// either posted the page to this vCPU (a peer's) or invalidates its blocks at once (its own, [`code_written`]). A
+/// system instruction at the RIP is executed ([`system`]) and the search goes on at the next RIP (so the block found
+/// may be for a later RIP than the one asked for).
+unsafe fn find(s: &mut State) -> Option<&'static Block> {
+    let mut flushed = false;
     loop {
         take_invalidations(s);
         let context = s.cpu.code_context();
@@ -180,16 +190,40 @@ unsafe fn find(s: &mut State) -> &'static Block {
                 s.l2_hits += 1;
                 b
             }
-            None => match unsafe { request(s, REQUEST_TRANSLATE) } {
-                Reply::Block(h) => translate_block(s, h, context),
-                Reply::System(instruction) => {
+            None => match (s.generation, unsafe { request(s, REQUEST_TRANSLATE) }) {
+                (missed, Reply::Block(h)) => {
+                    s.requests += 1;
+                    let Some(block) = cache::place(&h, STAGING_VA as *const u8, context, s.source_gpa, s.link_points) else {
+                        // Full: flush (which also drops this vCPU's marks) and miss again; an empty cache holds any block.
+                        if flushed {
+                            halt(*s, stop::BAD_REPLY)
+                        }
+                        flush(s);
+                        flushed = true;
+                        continue;
+                    };
+                    let placed = s.generation;
+                    take_invalidations(s);
+                    if s.generation != placed {
+                        return None; // flushed: the block is gone
+                    }
+                    let unmarked = |g: u64| g != u64::MAX && !cache::marked(g);
+                    if placed != missed || block.flags & cache::DEAD != 0 || block.source_gpa.iter().any(|&g| unmarked(g)) {
+                        if block.flags & cache::DEAD == 0 && cache::discard(block).is_none() {
+                            halt(*s, stop::BAD_LINK)
+                        }
+                        return None;
+                    }
+                    block
+                }
+                (_, Reply::System(instruction)) => {
                     system(s, instruction);
                     continue;
                 }
             },
         };
         cache::fill_l1(s.cpu.rip, block);
-        return block;
+        return Some(block);
     }
 }
 
@@ -198,7 +232,7 @@ unsafe fn find(s: &mut State) -> &'static Block {
 /// (admission), so it must be a live cache block with a link point to `State.rip`; anything else halts. The target is
 /// found as by the dispatcher; the exit is linked to it unless the cache was flushed meanwhile (the source may be
 /// gone: FEX re-checks the same way) or the link records are full, then the target is entered. A block run from the
-/// single-step slot is never linked.
+/// single-step slot is never linked. A target killed as it was placed ([`find`]) is stepped, not linked (`stale_links`).
 unsafe fn linker(frame: &NativeFrame) -> ! {
     unsafe {
         let mut s = load();
@@ -211,7 +245,13 @@ unsafe fn linker(frame: &NativeFrame) -> ! {
             _ => Some(cache::block_with_header(header).unwrap_or_else(|| halt(s, stop::BAD_LINK))),
         };
         let (generation, rip) = (s.generation, s.cpu.rip);
-        let target = find(&mut s);
+        // A target killed as it was placed is neither linked to nor entered: its instruction is stepped.
+        let Some(target) = find(&mut s) else {
+            if source.is_some() {
+                s.stale_links += 1;
+            }
+            step(s)
+        };
         match source {
             // Flushed, or its page invalidated (queued), while the target was found.
             Some(source) if s.generation != generation || source.flags & cache::DEAD != 0 => s.stale_links += 1,
@@ -228,27 +268,6 @@ unsafe fn linker(frame: &NativeFrame) -> ! {
     }
 }
 
-/// A miss: the host compiled and admitted the block at `s.cpu.rip` (header `h`) into staging; place it (flushing a
-/// full cache first) and keep its source pages read-only.
-fn translate_block(s: &mut State, h: Header, context: [u64; 2]) -> &'static Block {
-    s.requests += 1;
-    let staging = STAGING_VA as *const u8;
-    let block = match cache::place(&h, staging, context, s.source_gpa, s.link_points) {
-        Some(b) => b,
-        None => {
-            flush(s);
-            cache::place(&h, staging, context, s.source_gpa, s.link_points).unwrap_or_else(|| halt(*s, stop::BAD_REPLY))
-        }
-    };
-    // A write to a translated page must fault: no writable shadow of a source page may survive.
-    for gpa in block.source_gpa {
-        if gpa != u64::MAX && cache::protect(gpa) {
-            reset_shadows(s);
-        }
-    }
-    block
-}
-
 /// What the host answered a request with.
 enum Reply {
     /// A block staged (its header).
@@ -257,21 +276,40 @@ enum Reply {
     System(System),
 }
 /// Asks the host for code at `s.cpu.rip` (`kind`: a block, or one instruction for the slot) and checks the reply: the
-/// staged block, or a system instruction's decode.
+/// staged block, or a system instruction's decode. The resident walks the instruction fetch itself (RIP's page, and the
+/// next page when the host's bytes ran out at the page end, [`REPLY_NEXT_PAGE`]) and, for a block, marks each page
+/// before the host copies its bytes ([`mark`]), so a write to it from then on posts it to this vCPU; the step block
+/// marks nothing (see [`code_written`]). A walk's fault goes to the host with the request (the host ends the run with
+/// it, or cuts the block before the next page). The block's source pages are those its bytes reach.
 unsafe fn request(s: &mut State, kind: u64) -> Reply {
-    unsafe {
-        s.request = kind;
-        s.reply = NONE;
-        write_record(record(), *s);
-        asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
-        *s = load();
+    let block = kind == REQUEST_TRANSLATE;
+    let page = s.cpu.rip & !4095;
+    (s.fetch, s.fetch_fault) = ([u64::MAX; 2], [fetch::NONE; 3]);
+    // The host stops the run at its stop RIP: nothing there is fetched.
+    if s.cpu.rip != s.stop_at {
+        fetch_page(s, page, 0, block);
     }
-    // The host may have written guest RAM while serving the request (A bits of the fetch walk).
-    take_invalidations(s);
+    loop {
+        unsafe {
+            s.request = kind;
+            s.reply = NONE;
+            write_record(record(), *s);
+            asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
+            *s = load();
+        }
+        if s.reply != REPLY_NEXT_PAGE {
+            break;
+        }
+        // Once, after RIP's page was fetched.
+        if s.fetch[0] == u64::MAX || s.fetch[1] != u64::MAX || s.fetch_fault[0] != fetch::NONE {
+            halt(*s, stop::BAD_REPLY)
+        }
+        fetch_page(s, page.wrapping_add(4096), 1, block);
+    }
     if s.reply == REPLY_PARK {
         halt(*s, stop::PARKED)
     }
-    if s.reply == REPLY_SYSTEM && kind == REQUEST_TRANSLATE {
+    if s.reply == REPLY_SYSTEM && block {
         if !s.system.well_formed() {
             halt(*s, stop::BAD_REPLY)
         }
@@ -280,8 +318,13 @@ unsafe fn request(s: &mut State, kind: u64) -> Reply {
     }
     let h = staged();
     let table_end = (h.sites_offset as usize).checked_add(h.sites_count as usize * size_of::<Site>());
+    let crosses = (s.cpu.rip & 4095) + u64::from(h.guest_bytes) > 4096;
+    s.source_gpa = [s.fetch[0], if crosses { s.fetch[1] } else { u64::MAX }];
     if s.reply != REPLY_ADMITTED
         || h.guest_rip != s.cpu.rip
+        || h.guest_bytes == 0
+        || s.source_gpa[0] == u64::MAX
+        || (crosses && s.source_gpa[1] == u64::MAX)
         || h.code_size as usize > natemu_abi::execution::cache::MAX_BLOCK_BYTES
         || h.code_offset as usize + h.code_size as usize > STAGING_BYTES
         || table_end.is_none_or(|end| end > STAGING_BYTES)
@@ -292,6 +335,82 @@ unsafe fn request(s: &mut State, kind: u64) -> Reply {
     }
     s.request = NONE;
     Reply::Block(h)
+}
+/// Walks the fetch of page `va` for a request into `s.fetch[i]` (or its failure into `s.fetch_fault`); for a block,
+/// marks it ([`mark`]).
+fn fetch_page(s: &mut State, va: u64, i: usize, block: bool) {
+    match fetch_walk(s, va) {
+        Ok(gpa) => {
+            s.fetch[i] = gpa;
+            if block {
+                mark(s, gpa);
+            }
+        }
+        Err(fault) => s.fetch_fault = fault,
+    }
+}
+/// The guest-physical page `va` is fetched from (the walk sets A bits like the CPU's), or why not ([`fetch`]). A walk
+/// losing its A/D races to peers walks again, as x86 does (the watchdog contains a livelock). No block of this vCPU runs
+/// now (a step's source block is abandoned, and the linker checks that its source is not dead after finding the
+/// target), so an A write into a page holding translations just invalidates it ([`cache::written`]).
+fn fetch_walk(s: &mut State, va: u64) -> Result<u64, [u64; 3]> {
+    let Some(control) = s.cpu.control() else {
+        halt(*s, stop::UNSUPPORTED_MODE)
+    };
+    loop {
+        let mut tables = GuestTables::observed(RAM, CodeWrites(FetchWrites(s)));
+        match paging::walk(&mut tables, control, va, Access::Fetch) {
+            Ok(t) if t.wb && RAM.range(t.gpa & !4095, 4096).is_some() => return Ok(t.gpa & !4095),
+            Ok(_) => return Err([fetch::NOT_RAM, 0, 0]),
+            Err(Fault::Contended) => {}
+            Err(f) => return Err(fetch::encode(f)),
+        }
+    }
+}
+/// The fetch walk's code-page writes (see [`fetch_walk`]).
+struct FetchWrites<'a>(&'a mut State);
+impl CodePages for FetchWrites<'_> {
+    fn translated(&mut self, gpa: u64) -> bool {
+        cache::translated(gpa)
+    }
+    fn code_write(&mut self, gpa: u64) {
+        let s = &mut *self.0;
+        match cache::written(gpa) {
+            Some(n) => (s.invalidations, s.unlinks) = (s.invalidations + 1, s.unlinks + n),
+            None => halt(*s, stop::BAD_LINK),
+        }
+    }
+    fn rechecked(&mut self, gpa: u64) {
+        cache::rechecked(gpa)
+    }
+}
+
+/// Marks `gpa`'s page as holding this vCPU's translations before the host copies its bytes, then makes sure no vCPU
+/// keeps a writable shadow of it (the one synchronous shootdown): this vCPU's own shadows are reset; each peer with a
+/// writable bit is asked to reset its shadows (`SHADOWS`, a kick) and waited for until its reset counter moves (not
+/// until its bit clears: it may set it again, but then it sees this mark and takes the code-write path). The counter is
+/// read before the bit is checked again, so a reset in between is never waited for twice (a vCPU that has stopped for
+/// good reset its shadows first). While waiting, this vCPU drains its own record, so two vCPUs waiting for each other
+/// both progress; a write to the page that clears this vCPU's mark ends the wait (the block placed from it is stepped,
+/// see [`find`]).
+fn mark(s: &mut State, gpa: u64) {
+    let writers = cache::mark(gpa);
+    let own = 1u8 << s.vcpu;
+    if writers & own != 0 {
+        reset_shadows(s);
+    }
+    for p in (0..cache::MAX_VCPUS).filter(|&p| writers & !own & 1 << p != 0) {
+        let count = cache::resets_of(p);
+        if cache::writable(gpa) & 1 << p == 0 {
+            continue;
+        }
+        s.shootdowns += 1;
+        cache::ask_shadows(p);
+        while cache::resets_of(p) == count && cache::marked(gpa) {
+            take_invalidations(s);
+            core::hint::spin_loop();
+        }
+    }
 }
 
 /// Applies this vCPU's pending invalidations (listed pages drop their blocks; host writes to guest RAM while it was
@@ -368,7 +487,9 @@ pub unsafe fn returned(frame: &NativeFrame, fault: u64) -> ! {
 /// entry's stop store faulted to the host, which entered the gate with ELR/SPSR as the fault left them. ELR must be
 /// the stop store of a live cache block or of the step block, entered from EL1t; anything else halts. Nothing of the
 /// block ran but its prologue's header store, so the state is its entry state (static registers, NZCV with CF
-/// inverted) at its RIP (`State.rip` is stale after a linked edge). Drains (the kick's reason) and re-dispatches.
+/// inverted) at its RIP (`State.rip` is stale after a linked edge). Drains (the kick's reason) and re-dispatches; the
+/// step block is entered again instead: it is uncached and holds one instruction already fetched, so no drain drops
+/// it, and re-entering it means kicks arriving faster than a block entry cannot keep discarding the step.
 unsafe fn stopped(frame: &NativeFrame) -> ! {
     let (elr, spsr): (u64, u64);
     unsafe { asm!("mrs {0}, elr_el1", "mrs {1}, spsr_el1", out(reg) elr, out(reg) spsr) };
@@ -381,6 +502,10 @@ unsafe fn stopped(frame: &NativeFrame) -> ! {
     bank(&mut s.cpu, frame, frame.nzcv, true);
     s.cpu.rip = b.rip;
     s.stops += 1;
+    if b.flags & cache::STEP != 0 {
+        take_invalidations(&mut s);
+        unsafe { enter(s, b) }
+    }
     unsafe { dispatch(s) }
 }
 
@@ -561,24 +686,29 @@ fn bank_at(s: &mut State, f: &NativeFrame, b: &Block, site: &Site) {
 
 /// Self-modifying code: the instruction at `site` of `b` writes `gpa`'s page (a store, a split store or its walk's
 /// A/D update), which holds translations. If `b` was translated from that page it must not run past the instruction
-/// (whose store may change bytes after it in `b`): the instruction is stepped ([`step`]) instead. Otherwise the
+/// (whose store may change bytes after it in `b`): the instruction is stepped ([`step_from`]) instead. Otherwise the
 /// page's blocks are invalidated (none of them is running) and the write proceeds. The step block itself never
 /// steps: it holds one instruction, already fetched, so its own writes simply invalidate (this ends the step: no loop).
 fn code_written(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, gpa: u64) {
     if b.flags & cache::STEP == 0 && b.source_gpa.iter().any(|&g| g != u64::MAX && g >> 12 == gpa >> 12) {
-        step(*s, f, b, site)
+        step_from(*s, f, b, site)
     }
     match cache::written(gpa) {
         Some(n) => (s.invalidations, s.unlinks) = (s.invalidations + 1, s.unlinks + n),
         None => halt(*s, stop::BAD_LINK),
     }
 }
-/// Runs the instruction at `site` of `b` alone: banks the exact state at its start (a split store in progress is
-/// dropped: it wrote nothing yet) and enters it as an uncached one-instruction block in the slot, which marks no
-/// source page. Its write then takes [`code_written`]'s invalidation path and completes; its exit goes to the next
-/// instruction, which the next miss compiles from the new bytes (SDM vol. 3, "Handling Self- and Cross-Modifying Code").
-fn step(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
+/// Steps the instruction at `site` of `b` ([`step`]) from the exact state at its start (a split store in progress is
+/// dropped: it wrote nothing yet).
+fn step_from(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
     bank_at(&mut s, f, b, site);
+    step(s)
+}
+/// Runs the instruction at `s.cpu.rip` (the bank holds the state at its start) alone, as an uncached one-instruction
+/// block in the slot, which marks no source page. A write it makes to a page holding translations takes
+/// [`code_written`]'s invalidation path and completes; its exit goes to the next instruction, which the next miss
+/// compiles from the new bytes (SDM vol. 3, "Handling Self- and Cross-Modifying Code").
+fn step(mut s: State) -> ! {
     s.steps += 1;
     let Reply::Block(h) = (unsafe { request(&mut s, REQUEST_STEP) }) else { halt(s, stop::BAD_REPLY) };
     let context = s.cpu.code_context();
@@ -615,14 +745,23 @@ fn pages(address: u64, width: u64) -> Option<[Option<u64>; 2]> {
         .then(|| [Some(address), ((last ^ address) >> 12 != 0).then_some(last & !4095)])
 }
 
-/// The walker's A/D writes: the first to a translated page is refused (and recorded), as the guest's own stores are.
-struct CodePageWrites(Option<u64>);
-impl Observer for CodePageWrites {
-    fn write(&mut self, gpa: u64, _: u64, _: u64) -> bool {
-        if self.0.is_none() && cache::translated(gpa) {
-            self.0 = Some(gpa);
-        }
-        self.0.is_none()
+/// A data walk's code-page writes: an A/D write into a page holding translations is a write by the guest instruction
+/// at `site` of `b` ([`code_written`], which may step it instead of returning).
+struct DataWrites<'a> {
+    s: &'a mut State,
+    f: &'a NativeFrame,
+    b: &'a Block,
+    site: &'a Site,
+}
+impl CodePages for DataWrites<'_> {
+    fn translated(&mut self, gpa: u64) -> bool {
+        cache::translated(gpa)
+    }
+    fn code_write(&mut self, gpa: u64) {
+        code_written(self.s, self.f, self.b, self.site, gpa)
+    }
+    fn rechecked(&mut self, gpa: u64) {
+        cache::rechecked(gpa)
     }
 }
 
@@ -631,25 +770,23 @@ impl Observer for CodePageWrites {
 /// walk kept losing A/D races to peers (nothing installed: the caller resumes the instruction, which
 /// faults and walks again, as x86 re-walks). Translated pages are shadowed read-only whatever the
 /// walk grants; a write to one, or an A/D update in one, takes [`code_written`] first (which may step
-/// the instruction instead of returning).
+/// the instruction instead of returning), and each A/D update is re-checked after it is made.
 fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, access: Access) -> Option<u64> {
     let Some(control) = s.cpu.control() else {
         halt(*s, stop::UNSUPPORTED_MODE)
     };
-    // Each refused A/D write clears every vCPU's code bit of its page, so the walk is repeated at most once per page.
-    let walk = loop {
-        let mut tables = GuestTables::observed(RAM, CodePageWrites(None));
-        let walk = paging::walk(&mut tables, control, va, access);
-        match tables.observer.0 {
-            None => break walk,
-            Some(gpa) => code_written(s, f, b, site, gpa),
-        }
-    };
+    let walk = paging::walk(&mut GuestTables::observed(RAM, CodeWrites(DataWrites { s: &mut *s, f, b, site })), control, va, access);
     match walk {
         Ok(t) if t.wb => {
             let writable = access == Access::Write && t.writable && t.dirty;
-            if writable && cache::translated(t.gpa) {
-                code_written(s, f, b, site, t.gpa);
+            // As a mark is set before the writable bits are read ([`mark`]), the writable bit is set before the marks
+            // are read: a vCPU marking the page then either shoots this shadow down or is seen here, and the write
+            // takes the code-write path.
+            if writable {
+                cache::shadowed_writable(t.gpa);
+                if cache::translated(t.gpa) {
+                    code_written(s, f, b, site, t.gpa);
+                }
             }
             let old = tables::descriptor(va);
             if writable && old & 1 != 0 && old & READ_ONLY != 0 {
@@ -703,7 +840,7 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
         let generation = s.generation;
         take_invalidations(&mut s);
         if b.flags & cache::STEP == 0 && (s.generation != generation || b.flags & cache::DEAD != 0) {
-            step(s, f, b, &site)
+            step_from(s, f, b, &site)
         }
         match site.kind {
             object::kind::GUARD | object::kind::SPLIT | object::kind::DIVIDE => {
@@ -810,6 +947,9 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
         guest_memory::copy_volatile(to0, bytes.as_ptr(), head);
         guest_memory::copy_volatile(to1, bytes[head..].as_ptr(), width - head);
         asm!("dsb ish");
+        // A peer may have marked either page since its code bits were cleared (or found clear) in `translate`.
+        cache::rechecked(gpa[0]);
+        cache::rechecked(gpa[1]);
         // Writeback: the access's base becomes what the store would have left in it, derived from the
         // address checked at the stub (base + imm), never from the base register's value at the stub, which
         // need not hold the access's base yet. Pre-index (imm = delta): the address; post-index (imm = 0):
@@ -828,19 +968,19 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
     }
 }
 
-/// Shadows linear page `va` with guest-physical `gpa`; on table capacity
-/// exhaustion evicts every shadow once and retries.
+/// Shadows linear page `va` with guest-physical `gpa` (a writable shadow's bit is already set, see [`translate`]); on
+/// table capacity exhaustion evicts every shadow once and retries. The eviction clears the writable bits: the bit is
+/// set again and the marks read again, and a page marked meanwhile is shadowed read-only (the access faults again and
+/// takes the code-write path).
 fn install(s: &mut State, va: u64, gpa: u64, writable: bool) {
-    if writable {
-        cache::shadowed_writable(gpa);
-    }
     match tables::install(va, &RAM, gpa, writable) {
         Ok(()) => {}
         Err(shadow::Error::Capacity) => {
             reset_shadows(s);
-            if writable {
+            let writable = writable && {
                 cache::shadowed_writable(gpa);
-            }
+                !cache::translated(gpa)
+            };
             s.evictions += 1;
             if tables::install(va, &RAM, gpa, writable).is_err() {
                 halt(*s, stop::SHADOW)

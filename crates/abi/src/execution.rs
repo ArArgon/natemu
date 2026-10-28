@@ -4,8 +4,9 @@
 //!
 //! Flow: blocks stay in the vCPU's resident code cache ([`cache`]). At a block
 //! exit the resident's dispatcher looks up the next RIP (L1, then L2); only a
-//! miss asks the host for code (`hvc #TRANSLATE_HVC`): the host fetches the bytes
-//! through the guest walk, compiles and admits one block into the staging area
+//! miss asks the host for code (`hvc #TRANSLATE_HVC`): the resident walks the fetch
+//! and marks the pages as code, the host copies the bytes from those guest-physical
+//! pages, compiles and admits one block into the staging area
 //! and replies; the resident places it in the cache and enters it. A literal exit
 //! (a [`LinkPoint`]) goes through the resident's linker instead, which finds the
 //! target the same way and then patches the exit into a direct branch to it, so a
@@ -397,6 +398,38 @@ pub const REPLY_PARK: u64 = 2;
 /// (Translate requests only.) The instruction at `cpu.rip` is a system instruction, decoded by the host into
 /// `State::system`; nothing is staged. The resident executes it as a transaction ([`system`]).
 pub const REPLY_SYSTEM: u64 = 3;
+/// The bytes of `cpu.rip`'s page ran out before the block (or the instruction) ended: the resident walks the next page
+/// for an instruction fetch (marking it, for a translate request) and asks again with its result in `State::fetch` /
+/// `State::fetch_fault`.
+pub const REPLY_NEXT_PAGE: u64 = 4;
+
+/// A request's instruction fetch, walked by the resident (`State::fetch_fault`): why the walk of the last page it walked
+/// failed — kind, then the #PF address and error code for [`fetch::PAGE`].
+pub mod fetch {
+    use crate::paging::Fault;
+    pub const NONE: u64 = 0;
+    pub const PAGE: u64 = 1;
+    pub const NONCANONICAL: u64 = 2;
+    pub const UNSUPPORTED: u64 = 3;
+    /// The page is not write-back memory or lies outside guest RAM (code is fetched only from guest RAM).
+    pub const NOT_RAM: u64 = 4;
+    pub fn encode(f: Fault) -> [u64; 3] {
+        match f {
+            Fault::Page { address, error } => [PAGE, address, error],
+            Fault::Noncanonical => [NONCANONICAL, 0, 0],
+            Fault::Unsupported | Fault::Contended => [UNSUPPORTED, 0, 0],
+        }
+    }
+    /// The walk's fault ([`NOT_RAM`] and [`NONE`] have none).
+    pub fn decode([kind, address, error]: [u64; 3]) -> Option<Fault> {
+        match kind {
+            PAGE => Some(Fault::Page { address, error }),
+            NONCANONICAL => Some(Fault::Noncanonical),
+            UNSUPPORTED => Some(Fault::Unsupported),
+            _ => None,
+        }
+    }
+}
 
 /// A system instruction (FEX cuts every block before one) as the host decoded it, for the resident to execute with
 /// x86 semantics: privilege, prefix and operand checks, the architectural effect, RIP past the instruction (`length`
@@ -510,9 +543,17 @@ pub struct State {
     /// The cache's flush generation (flushes so far), sent with each request: the host never needs to resend an
     /// object the resident holds.
     pub generation: u64,
-    /// With a reply: guest-physical pages the staged block was fetched from (`u64::MAX` = unused), and its link points.
+    /// With a reply: the guest-physical pages the staged block's bytes came from (`u64::MAX` = unused; the resident
+    /// derives them from `fetch` and the block's length), and its link points (the host's).
     pub source_gpa: [u64; 2],
     pub link_points: [LinkPoint; MAX_LINK_POINTS],
+    /// With a request: the guest-physical pages of the instruction fetch at `cpu.rip`, walked by the resident (its page,
+    /// then the next one if the host asked, [`REPLY_NEXT_PAGE`]; `u64::MAX` = not walked or the walk failed), and the
+    /// failure of the last walk ([`fetch`]). The host copies the bytes from these pages only.
+    pub fetch: [u64; 2],
+    pub fetch_fault: [u64; 3],
+    /// The host's stop RIP (`u64::MAX`: none): a miss there is not fetched (the host ends the run at it).
+    pub stop_at: u64,
     pub stop: u64,
     /// Guest exception due at a stop: vector, CR2 (#PF; else 0), error code, RIP.
     pub fault: [u64; 4],
@@ -548,6 +589,8 @@ pub struct State {
     /// instructions single-stepped because they wrote a page their own block came from.
     pub invalidations: u64,
     pub steps: u64,
+    /// Peers asked to drop their writable shadows of a page this vCPU marked for a block (and waited for).
+    pub shootdowns: u64,
     /// The resident's stop gate (written at start): where the host enters a vCPU stopped at a block entry by a kick.
     pub stop_gate: u64,
     /// Stops taken at the stop gate.
@@ -568,6 +611,9 @@ impl State {
             generation: 0,
             source_gpa: [u64::MAX; 2],
             link_points: [LinkPoint::NONE; MAX_LINK_POINTS],
+            fetch: [u64::MAX; 2],
+            fetch_fault: [0; 3],
+            stop_at: u64::MAX,
             stop: 0,
             fault: [0; 4],
             native: [0; 3],
@@ -588,6 +634,7 @@ impl State {
             full_links: 0,
             invalidations: 0,
             steps: 0,
+            shootdowns: 0,
             stop_gate: 0,
             stops: 0,
             system: System::NONE,
