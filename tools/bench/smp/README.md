@@ -111,6 +111,23 @@ CPU 0 calls a one-block function in a loop until its result changes, CPUs 1.. st
 one patches a single instruction of the function after CPU 0 went round 2,000 times (an uncaptured counter). Pinned QEMU (MTTCG) now and
 then never finishes `stale` (2 of 8 runs at 3 CPUs, 1 of 10 at 4); the runner repeats a QEMU run that times out.
 
+## (f) Shared guest page-table programs (`sharedpt.py`; S3f)
+
+Generated at run time (no json), judged by `tools/run_slice3_vm.py sharedpt` against `tools/i4v_coherence_model.py` (walks, `Cache`,
+`access_outcomes`, `check_observation`) and, for what is schedule-independent, QEMU. Every program is a system program (CPL0) with ONE shared body
+and ONE shared table set (identity map of 0..4 MiB, 4 KiB pages, A/D preset except on the test pages) loaded by every CPU; CPU `rbx` logs what it saw in
+a private log area (not captured) and the judge replays the logs through the model. Handshakes are plain stores and loads.
+`ad-race`: all CPUs access one PTE (A/D clear); synchronized rounds (CPU 0 clears with a plain store + INVLPG, each CPU INVLPGs and reads or
+writes per a role table, samples the PTE; CPU 0 samples after every acknowledgement: exactly the model's A/D), then a free race (CPU 0 clears + INVLPGs
+in a loop while the others do random reads, writes and INVLPGs; every PTE sample must be a state the model reaches), then more rounds ending with all writers.
+`remap`: CPU 0 flips a PTE between two frames each round; each CPU reads and stores through V before its own INVLPG (a mode table: stale reads, INVLPG before the
+remap is seen, none), after a staggered delay INVLPGs, then reads and stores (new frame only). `large`: a PDE switches between a 2 MiB leaf and a
+table (T's frame differs, S's does not), each CPU INVLPGs at its own time; the PDE's and T's PTE's A/D after each round are exact. `alias`: two linear pages map one
+frame; each round every CPU writes its word through one alias (or reads through another) and, after all wrote, verifies every word through a third alias (the
+identity page or either alias); both PTEs' A/D after each round are exact. `contended-{data,fetch,both,max}`: a clearer cycles a PTE through four values (bits 9, 10)
+while the others INVLPG and access it (store/load, or run code from its page); `-max` pauses nowhere (walkers are starved but finish). The final PTE bytes come from
+a last synchronized round. Memory the schedule decides (pre-INVLPG store words, phase-2 words, logs) is not captured; registers are not compared.
+
 ## (a) Deterministic programs (`programs.json`, 5 programs x 2/3/4 CPUs)
 
 Every one ends in `cmp r11, r11` (all six flags defined) and has a schedule-independent final state; spin waits only on flags written by a

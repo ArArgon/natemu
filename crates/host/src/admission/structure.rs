@@ -590,6 +590,10 @@ impl<'a> Verifier<'a> {
     /// A swap word must be a swap site recording exactly it: base (a guest register or a computed address, never x28
     /// or sp), width, Rt and Rs; no offset, index or writeback.
     fn swap_word(&self, size: u8, rs: u8, rt: u8, rn: u8, at: u32) -> Result<(), String> {
+        // With Rt = XZR, SWPAL is not an acquire (the architecture drops the load-acquire when the result is discarded).
+        if rt == 31 {
+            return Err(format!("swap at {at:#x} discards its result (Rt is XZR): no acquire semantics"));
+        }
         let s = self.c.accesses.binary_search_by_key(&at, |s| s.native_offset).ok().map(|i| &self.c.accesses[i]);
         match s {
             Some(s)
@@ -1288,6 +1292,7 @@ mod tests {
         for other in [0xb824_80c4, 0xb8a4_80c4, 0xb864_80c4, 0xd503_39bf, 0xd503_3bbf, 0xd503_3fdf, 0xd503_205f, 0xd503_3f9f] {
             refused(XCHG, 0x20, 0xd503_3dbf, other, "unrecognised"); // swp swpa swpl; dmb ishld ish; isb; wfe; dsb sy
         }
+        refused(XCHG, 0x1c, SWPAL_W4_X6, SWPAL_W4_X6 | 31, "XZR"); // swpal w4, wzr, [x6]: Rt = XZR loses the acquire
         refused(XCHG, 0x1c, SWPAL_W4_X6, SWPAL_W4_X6 + 1, "swap site"); // Rt w5: the record says w4
         refused(XCHG, 0x1c, SWPAL_W4_X6, SWPAL_W4_X6 + (1 << 16), "swap site"); // Rs w5
         refused(XCHG, 0x1c, SWPAL_W4_X6, SWPAL_W4_X6 & !(31 << 5) | 28 << 5, "swap site"); // [x28]: the frame

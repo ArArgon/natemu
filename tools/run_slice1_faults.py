@@ -634,6 +634,8 @@ def evaluate(case, out):
     want = [*f, rip] if f else [0, 0, 0, 0]
     entry = {'expected_fault': [hex(x) for x in want], 'vm': {k: out[k] for k in ('stop', 'reason', 'rip', 'fault', 'native', 'stats', 'frame_intact')}}
     if case[6] == ATOMIC:
+        # Data and registers are those of the QEMU prefix. The leaf A/D bits are NOT checked here: the swap's write-intent
+        # walk may already have set A (and D) before the alignment fault stopped it.
         diffs = [] if (out['stop'], out['reason'].split(' ')[0]) == ('resident', ATOMIC) else [f"stopped {out['stop']} {out['reason']} at {out['rip']}, not {ATOMIC}"]
         diffs += ref.compare(prefix, [ref.num(v) for v in out['gpr']], ref.num(out['rflags']), ref.num(out['rip']), out['memory'])
         if not out['frame_intact']: diffs.append('FEX frame changed')

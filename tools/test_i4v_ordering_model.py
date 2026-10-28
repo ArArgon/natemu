@@ -1,7 +1,10 @@
 import itertools
+import pathlib
+import sys
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))   # runnable by path from the repo root
 import i4v_ordering_model as model
 
 
