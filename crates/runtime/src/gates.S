@@ -215,34 +215,6 @@ stop_gate:
     bl finish
     b .
 
-// Called only with all guest roots saved. Host may transfer x0..x15 here.
-.global service
-.global service_resume
-service:
-    mov x16, x0
-    ldp x0, x1, [x16, #0]
-    ldp x2, x3, [x16, #16]
-    ldp x4, x5, [x16, #32]
-    ldp x6, x7, [x16, #48]
-    ldp x8, x9, [x16, #64]
-    ldp x10, x11, [x16, #80]
-    ldp x12, x13, [x16, #96]
-    ldp x14, x15, [x16, #112]
-    dsb sy
-    hvc #0x4a
-service_resume:
-    stp x0, x1, [x16, #0]
-    stp x2, x3, [x16, #16]
-    stp x4, x5, [x16, #32]
-    stp x6, x7, [x16, #48]
-    stp x8, x9, [x16, #64]
-    stp x10, x11, [x16, #80]
-    stp x12, x13, [x16, #96]
-    stp x14, x15, [x16, #112]
-    ret
-
-
-
 .global resume_exception
 resume_exception:
     msr elr_el1, x1

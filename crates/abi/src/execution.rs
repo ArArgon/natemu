@@ -36,8 +36,7 @@ pub const FRAME_POINTER: u64 = FRAME_VA + FRAME_BIAS;
 /// The stop page (precise stop, slice 3): the only page of the vCPU's stop region, `STOP_BYTES` of the window that
 /// hold nothing else, so one IPA granule (4 or 16 KiB, as HVF reports it) covers the stop page alone. To stop a running
 /// vCPU the host write-protects that granule (a kick): its next block entry takes a stage-2 fault at the stop store
-/// with the entry state intact, and the host enters the resident's stop gate. (The regression families map their own
-/// pages at these private addresses, e.g. `pressure::SPILLS`; they never run in this mode.)
+/// with the entry state intact, and the host enters the resident's stop gate.
 pub const STOP_OFFSET: usize = FRAME_OFFSET + 0x1000;
 pub const STOP_BYTES: usize = 0x4000;
 /// Native offset of a block's stop store (its third prologue word, after `adr x0, header; str x0, [x28]`).

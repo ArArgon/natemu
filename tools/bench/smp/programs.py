@@ -150,7 +150,7 @@ def det_all():
     return out
 
 
-# ---- (b) litmus programs. One DSL for both the QEMU program and the independent model (tools/i4v_ordering_model.py) ---------
+# ---- (b) litmus programs. One DSL for both the QEMU program and the independent model (tools/models/ordering_model.py) ---------
 SYNC = 0x200000
 SEQ = lambda i: 0x000 + 0x80 * i
 DONE = lambda i: 0x200 + 0x80 * i
@@ -159,7 +159,7 @@ RES = lambda i: 0x210000 + 0x10000 * i           # per CPU: 2 bytes per iteratio
 LITMUS_NAMES = ('sb', 'mp', 'lb', 'wrc', 'iriw', 'sb-mfence', 'sb-xchg', 'iriw-mfence')
 
 def litmus_decl(name):
-    import i4v_ordering_model as m
+    from models import ordering_model as m
     if name in m.PROFILES: return m.PROFILES[name]
     assert name == 'iriw-mfence'
     return m.Litmus(name, ((('store', 'x', 1),), (('store', 'y', 1),), (('load', 'r0', 'x'), ('fence',), ('load', 'r1', 'y')),
@@ -238,7 +238,7 @@ VARIANTS = ('aligned', 'unaligned', 'split', 'split-hi')
 
 def litmus_family(name, n):
     """The model Litmus of family `name` on n participants, or None when it has no n-participant shape."""
-    import i4v_ordering_model as m
+    from models import ordering_model as m
     X = [f'x{i}' for i in range(n)]
     nxt = lambda i: X[(i + 1) % n]
     zero = lambda names: tuple((a, 0) for a in names)
@@ -473,7 +473,7 @@ SYS = {
     # NXE: a fetch from the XD page C faults (#PF 0x11).
     'xd-fetch': """    mov rax, {C:#x}
     jmp rax""",
-    # A PTE change without INVLPG: the second read of V may see either frame (checked against i4v_coherence_model, not QEMU).
+    # A PTE change without INVLPG: the second read of V may see either frame (checked against coherence_model, not QEMU).
     'pte-no-invlpg': """    mov rbx, [{V:#x}]
     mov qword [{la:#x}], {F2:#x}|7
     mov r8, [{V:#x}]""",

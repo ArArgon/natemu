@@ -11,10 +11,7 @@ use core::{
     },
 };
 
-use crate::{
-    paging::{self, Update},
-    paging32,
-};
+use crate::paging::{self, Update};
 
 /// Copy bytes without LLVM expanding aggregate volatile loads into thousands of
 /// byte instructions. MaybeUninit preserves structure padding.
@@ -224,17 +221,11 @@ impl<O: Observer> GuestTables<O> {
     fn observe(&mut self, gpa: u64, value: Option<u64>) -> Option<u64> {
         value.filter(|&v| self.observer.read(gpa, v))
     }
-    fn update(&mut self, gpa: u64, old: u64, new: u64, wide: bool) -> Update {
+    fn update(&mut self, gpa: u64, old: u64, new: u64) -> Update {
         if !self.observer.write(gpa, old, new) {
             return Update::Refused;
         }
-        let actual = if wide {
-            self.ram.compare_exchange64(gpa, old, new)
-        } else {
-            (self.ram.compare_exchange32(gpa, old as u32, new as u32))
-                .map(|r| r.map(u64::from).map_err(u64::from))
-        };
-        match actual {
+        match self.ram.compare_exchange64(gpa, old, new) {
             Some(Ok(_)) => {}
             Some(Err(v)) if v == new => {}
             Some(Err(_)) => return Update::Changed,
@@ -250,16 +241,7 @@ impl<O: Observer> paging::Tables for GuestTables<O> {
         self.observe(gpa, value)
     }
     fn write(&mut self, gpa: u64, old: u64, new: u64) -> Update {
-        self.update(gpa, old, new, true)
-    }
-}
-impl<O: Observer> paging32::Tables for GuestTables<O> {
-    fn read32(&mut self, gpa: u64) -> Option<u32> {
-        let value = self.ram.load32(gpa).map(u64::from);
-        self.observe(gpa, value).map(|v| v as u32)
-    }
-    fn write32(&mut self, gpa: u64, old: u32, new: u32) -> Update {
-        self.update(gpa, old.into(), new.into(), false)
+        self.update(gpa, old, new)
     }
 }
 
@@ -345,19 +327,6 @@ mod tests {
         assert_eq!(b.0[1536 + 256], 0x10_0067);
     }
 
-    #[test]
-    #[cfg(feature = "families")]
-    fn deferred_dirty_commits_two_leaves() {
-        let mut b = tables();
-        b.0[1536 + 257] = 0x10_1007;
-        let mut t = crate::families::stack_boundary::DeferredDirty::new(GuestTables::new(b.ram()));
-        for va in [0x10_0000, 0x10_1000] {
-            assert!(paging::walk(&mut t, CONTROL, va, Access::Write).is_ok());
-        }
-        assert_eq!((b.0[1536 + 256], b.0[1536 + 257]), (0x10_0027, 0x10_1027));
-        assert!(t.commit());
-        assert_eq!((b.0[1536 + 256], b.0[1536 + 257]), (0x10_0067, 0x10_1067));
-    }
 
     #[test]
     fn concurrent_entry_change_restarts_the_walk() {
@@ -496,22 +465,4 @@ mod tests {
         assert_eq!(&p.events[..p.n], &want);
         assert_eq!((b.0[0], b.0[512], b.0[1024], b.0[1536 + 256]), (0x2027, 0x3027, 0x4027, 0x10_0027));
     }
-
-    #[test]
-    fn legacy_walk_uses_32_bit_entries() {
-        let mut b = Backing([0; 2048]);
-        let ram = b.ram();
-        assert!(ram.write::<u32>(0x1000, 0x2007));
-        assert!(ram.write::<u32>(0x2000 + 256 * 4, 0x10_0007));
-        let r = paging32::walk(
-            &mut GuestTables::new(ram),
-            CONTROL_32,
-            0x10_0000,
-            Access::Write,
-        );
-        assert_eq!(r.unwrap().gpa, 0x10_0000);
-        assert_eq!(ram.read::<u32>(0x1000), Some(0x2027));
-        assert_eq!(ram.read::<u32>(0x2000 + 256 * 4), Some(0x10_0067));
-    }
-    const CONTROL_32: Control = Control { nxe: 0, ..CONTROL };
 }

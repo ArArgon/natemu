@@ -10,7 +10,7 @@ build=$1
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH= cd -- "$here/../.." && pwd)
 fex=$root/third_party/FEX
-pin=48d71752e2a363d5535181f803b0b0e9666c1825   # == the third_party/FEX gitlink, tools/i4v_producer/producer.json upstream_commit
+pin=48d71752e2a363d5535181f803b0b0e9666c1825   # == the third_party/FEX gitlink (the old I4-V producer's upstream_commit)
 externals="fmt xxhash unordered_dense"
 git -C "$root" submodule update --init --depth 1 third_party/FEX
 for e in $externals; do git -C "$fex" submodule update --init --depth 1 External/$e; done

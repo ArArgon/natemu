@@ -34,8 +34,8 @@ impl Maintenance for Tlb {
 
 /// The owner's tables; the window's IPA and the ASID come from its TTBR0, and the
 /// upper half is in use unless TCR_EL1.EPD1 (bit 23) disables TTBR1 walks. ASID 0 is
-/// the untagged world of the regression families (global shadows, one tag for all
-/// owners); an owner with an ASID of its own tags its shadows with it.
+/// untagged (global shadows, one tag for all owners: the S3a control); an owner with
+/// an ASID of its own tags its shadows with it.
 pub fn space() -> Space<Tlb> {
     let (root, tcr): (u64, u64);
     unsafe { asm!("mrs {0}, ttbr0_el1", "mrs {1}, tcr_el1", out(reg) root, out(reg) tcr) };
@@ -69,8 +69,4 @@ pub fn unmap(va: u64) -> Result<(), Error> {
 /// The native leaf descriptor shadowing `va` (0 when none).
 pub fn descriptor(va: u64) -> u64 {
     space().descriptor(va)
-}
-#[cfg_attr(not(feature = "families"), allow(dead_code))]
-pub fn clear() -> Result<(), Error> {
-    space().clear()
 }

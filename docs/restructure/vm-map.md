@@ -1,6 +1,12 @@
 # VM code map by responsibility (restructure step 2)
 
-Status: October 26, 2026; §7 implemented (V1b), §1–5 describe the code before it. Maps code to the
+Status: October 26, 2026; §7 implemented (V1b), §1–5 describe the code before it. **October 28 (S3i):** the regression
+families are deleted (the `families` feature, runtime/abi `families/`, abi `translation`/`recovery`/`pressure`/
+`concurrency`, runtime `coordinator`, the `hvc #0x4a` owner service, host drivers `concurrent*`/`i4v_*`/`recovery`,
+host `translation`/`process_owner` and `diagnostics`, `Vm`, `enter_resident`/`run_to_hvc`, `new_vm_nonce`); the crates
+hold the general path only (host: `vm`, `memory`, `owners`, `execution`, `admission`, `system`, `json`, the
+`run-program` driver; abi: layouts, `execution`, `code_object`, `guest_memory`, `paging`, `shadow`,
+`resident`; runtime: `execution`, `cache`, `tables`, `record`, `gates.S`). The family names below are history. Maps code to the
 [restructure plan](../vm-restructure.md)'s responsibilities and proposes the migration
 order. "Scenario-bound": code that knows a test program, expected result, case name
 or fixed workload shape.
@@ -93,7 +99,7 @@ or fixed workload shape.
 Ordered for the critical path to the first connected slice (one vCPU, 64-bit,
 paging on), which needs guest memory and tables before multi-owner services.
 
-Status (Oct 27): steps 1–4 done; step 5 host side (`host/src/drivers/`) and runtime/abi side (`families/` behind the `families` cargo feature; the default resident is the general path only, ~18.6 KB text) done; drivers dissolve as the general path covers them (`host/src/{vm,memory,owners}.rs`, abi
+Status (Oct 28, S3i): all steps done; the families and their drivers are deleted (see the top). Earlier status (Oct 27): steps 1–4 done; step 5 host side (`host/src/drivers/`) and runtime/abi side (`families/` behind the `families` cargo feature; the default resident is the general path only, ~18.6 KB text) done; drivers dissolve as the general path covers them (`host/src/{vm,memory,owners}.rs`, abi
 `guest_memory.rs`/`shadow.rs`, runtime `tables.rs`/`record.rs`).
 Sections 1–5 describe the code before these steps.
 

@@ -1,0 +1,328 @@
+{
+ "note": "Bodies pinned by the I4-V Docker FEX producer (tools/i4v_producer/export.py CASES, i4v-producer-20261026-02; same FEX commit) and kept as fexc identity references when that producer was deleted at S3i: source (x86 hex), bitness, instruction count, native body (hex).",
+ "cases": {
+  "fex_lfence_dependencies": {
+   "source": "0f58c14801d10faee89f0f90c048890f66894708f30f7f4710",
+   "bitness": 64,
+   "instructions": 8,
+   "body": "10d6314efb0005cafa0005abe7031aaabf3d03d5f4379f9a75031acab5120453941215aa40135a4a0008404a1504404ab5fa7fb294faf5aa15423bd5b5066292946255aa94027fb2841e78b3f4779f9a841e40b31f2003d567fd9fc8742100911f2003d584fe9f4814028052bf3b03d570e9b43c1f4000d5"
+  },
+  "fex_order_sb": {
+   "source": "c703010000008b02",
+   "bitness": 64,
+   "instructions": 2,
+   "body": "340080521f2003d5d4fc9f88a4fcdf881f2003d5"
+  },
+  "fex_order_mp_writer": {
+   "source": "c70301000000c70201000000",
+   "bitness": 64,
+   "instructions": 2,
+   "body": "340080521f2003d5d4fc9f881f2003d5b4fc9f88"
+  },
+  "fex_order_reader": {
+   "source": "8b038b0a",
+   "bitness": 64,
+   "instructions": 2,
+   "body": "c4fcdf881f2003d5a7fcdf881f2003d5"
+  },
+  "fex_order_wrc_middle": {
+   "source": "8b03c70201000000",
+   "bitness": 64,
+   "instructions": 2,
+   "body": "c4fcdf881f2003d5340080521f2003d5b4fc9f88"
+  },
+  "fex_order_writer": {
+   "source": "c70301000000",
+   "bitness": 64,
+   "instructions": 1,
+   "body": "340080521f2003d5d4fc9f88"
+  },
+  "fex_order_sb_mfence": {
+   "source": "c703010000000faef08b02",
+   "bitness": 64,
+   "instructions": 3,
+   "body": "340080521f2003d5d4fc9f88bf3f03d5a4fcdf881f2003d5"
+  },
+  "fex_order_sb_xchg": {
+   "source": "c7030100000087068b02",
+   "bitness": 64,
+   "instructions": 3,
+   "body": "340080521f2003d5d4fc9f884481e4b8a4fcdf881f2003d5"
+  },
+  "fex_order_xchg_result": {
+   "source": "87038902",
+   "bitness": 64,
+   "instructions": 2,
+   "body": "c480e4b81f2003d5a4fc9f88"
+  },
+  "fex_order_lfence": {
+   "source": "0faee8",
+   "bitness": 64,
+   "instructions": 1,
+   "body": "bf3d03d5"
+  },
+  "fex_order_sfence": {
+   "source": "0faef8",
+   "bitness": 64,
+   "instructions": 1,
+   "body": "bf3e03d5"
+  },
+  "fex_order_mfence": {
+   "source": "0faef0",
+   "bitness": 64,
+   "instructions": 1,
+   "body": "bf3f03d5"
+  },
+  "fex_order_xchg": {
+   "source": "8703",
+   "bitness": 64,
+   "instructions": 1,
+   "body": "c480e4b8"
+  },
+  "fex_address_store_ecx": {
+   "source": "890b",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "1f2003d5c7fc9f88"
+  },
+  "fex_address_store_edx": {
+   "source": "8913",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "1f2003d5c5fc9f88"
+  },
+  "fex_address_load_edx": {
+   "source": "8b02",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "a4fcdf881f2003d5"
+  },
+  "fex_address_store_ecx16": {
+   "source": "678908",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "d4000a0b943e00531f2003d587fe9f88"
+  },
+  "fex_address_store_edx16": {
+   "source": "678910",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "d4000a0b943e00531f2003d585fe9f88"
+  },
+  "fex_address_load16": {
+   "source": "678b00",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "d4000a0b943e005384fedf881f2003d5"
+  },
+  "fex_mov_eax_00000100": {
+   "source": "b800010000",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "04208052"
+  },
+  "fex_mov_eax_00006000": {
+   "source": "b800600000",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "04008c52"
+  },
+  "fex_mov_eax_00010011_mode64": {
+   "source": "b811000100",
+   "bitness": 64,
+   "instructions": 1,
+   "body": "240280522400a072"
+  },
+  "fex_mov_eax_00000620": {
+   "source": "b820060000",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "04c48052"
+  },
+  "fex_mov_eax_000006a0": {
+   "source": "b8a0060000",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "04d48052"
+  },
+  "fex_mov_eax_00001020": {
+   "source": "b820100000",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "04048252"
+  },
+  "fex_mov_eax_00001003": {
+   "source": "b803100000",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "64008252"
+  },
+  "fex_mov_eax_00000011": {
+   "source": "b811000000",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "24028052"
+  },
+  "fex_mov_eax_80000011": {
+   "source": "b811000080",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "240280520400b072"
+  },
+  "fex_mov_eax_00000680": {
+   "source": "b880060000",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "04d08052"
+  },
+  "fex_mov_eax_00010011": {
+   "source": "b811000100",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "240280522400a072"
+  },
+  "fex_mov_eax_80010011": {
+   "source": "b811000180",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "240280522400b072"
+  },
+  "fex_mov_eax_00001000": {
+   "source": "b800100000",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "04008252"
+  },
+  "fex_mov_eax_00003000": {
+   "source": "b800300000",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "04008652"
+  },
+  "fex_mov_eax_00000000": {
+   "source": "b800000000",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "04008052"
+  },
+  "fex_mov_eax_80010010": {
+   "source": "b810000180",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "040280522400b072"
+  },
+  "fex_mov_eax_20010011": {
+   "source": "b811000120",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "240280522400a472"
+  },
+  "fex_mov_eax_ffffffff": {
+   "source": "b8ffffffff",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "04008012"
+  },
+  "fex_mov_eax_00000600": {
+   "source": "b800060000",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "04c08052"
+  },
+  "fex_store_eax_rbx64": {
+   "source": "8903",
+   "bitness": 64,
+   "instructions": 1,
+   "body": "1f2003d5c4fc9f88"
+  },
+  "fex_load_eax_rbx64": {
+   "source": "8b03",
+   "bitness": 64,
+   "instructions": 1,
+   "body": "c4fcdf881f2003d5"
+  },
+  "fex_store_eax_ebx32": {
+   "source": "8903",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "1f2003d5c4fc9f88"
+  },
+  "fex_load_eax_ebx32": {
+   "source": "8b03",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "c4fcdf881f2003d5"
+  },
+  "fex_mixed32_old": {
+   "source": "89c1890b8b02",
+   "bitness": 32,
+   "instructions": 3,
+   "body": "e70304aa1f2003d5c7fc9f88a4fcdf881f2003d5"
+  },
+  "fex_mixed32_changed": {
+   "source": "89c189138b02",
+   "bitness": 32,
+   "instructions": 3,
+   "body": "e70304aa1f2003d5c5fc9f88a4fcdf881f2003d5"
+  },
+  "fex_moffs_load32_step0": {
+   "source": "ba00001000",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "0502a052"
+  },
+  "fex_moffs_load32_step1": {
+   "source": "b842000000",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "44088052"
+  },
+  "fex_moffs_load32_step2": {
+   "source": "8902",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "1f2003d5a4fc9f88"
+  },
+  "fex_moffs_load32_step3": {
+   "source": "b8ffffffff",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "04008012"
+  },
+  "fex_moffs_load32_step4": {
+   "source": "a100001000",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "1402a05284fedf881f2003d5"
+  },
+  "fex_moffs_load32_step5": {
+   "source": "89c2",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "e50304aa"
+  },
+  "fex_moffs_load32_step7": {
+   "source": "66a100001000",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "1402a05294fedf481f2003d5843e40b3"
+  },
+  "fex_moffs_load32_step8": {
+   "source": "89c1",
+   "bitness": 32,
+   "instructions": 1,
+   "body": "e70304aa"
+  },
+  "fex_moffs_load32": {
+   "source": "ba00001000b8420000008902b8ffffffffa10000100089c2b8ffffffff66a10000100089c1",
+   "bitness": 32,
+   "instructions": 9,
+   "body": "0502a05244088052f40305aa1f2003d5a4fc9f880400801295fedf881f2003d5f60304aae40315aae50304aae40316aa94fedf481f2003d5843e40b3e70304aa"
+  },
+  "fex_memory_data64": {
+   "source": "488b03",
+   "instructions": 1,
+   "body": "c4fcdfc81f2003d5"
+  }
+ }
+}

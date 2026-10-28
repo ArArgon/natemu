@@ -458,10 +458,14 @@ fn admitted(state: &State) -> bool {
 /// page it has no shadow of aborts there).
 fn tamper_sites(area: Area, state: &State, f: fn(&mut natemu_abi::code_object::Site)) -> bool {
     use natemu_abi::code_object::{Header, Site, kind};
+    // Staging holds a block only with a block reply.
+    if !admitted(state) {
+        return false;
+    }
     let h: Header = area.read_record(exec::STAGING_OFFSET);
     let at = |i: usize| exec::STAGING_OFFSET + h.sites_offset as usize + i * size_of::<Site>();
     let sites: Vec<Site> = (0..h.sites_count as usize).map(|i| area.read_record(at(i))).collect();
-    if !admitted(state) || !sites.iter().any(|s| matches!(s.kind, kind::LOAD | kind::STORE)) {
+    if !sites.iter().any(|s| matches!(s.kind, kind::LOAD | kind::STORE)) {
         return false;
     }
     for (i, mut site) in sites.into_iter().enumerate() {
@@ -493,13 +497,18 @@ fn tamper_record(area: Area, state: &mut State) -> bool {
     admitted(state) && flushing_next(area) && corrupt(area, Corrupt::Record)
 }
 
+/// Signals sent to a vCPU's compile server (`--kill-compiler`, `--stall-compiler`); macOS numbers.
+const SIGKILL: i32 = 9;
+const SIGSTOP: i32 = 17;
+
 /// What one vCPU's thread returns.
 struct Ran {
     stop: Stop,
     compiles: u64,
     slowest: std::time::Duration,
     blocks: u64,
-    distinct: usize,
+    /// The distinct RIPs of the blocks the host translated for it.
+    rips: std::collections::HashSet<u64>,
     tampered: bool,
 }
 /// A vCPU's own end (it parks; peers run on). Any other stop cancels the peers.
@@ -529,8 +538,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             "--forge-stop" => forge_stop = true,
             "--ignore-kicks" => ignore_kicks = true,
             "--compile-deadline-ms" => deadline_ms = value()? as u64,
-            "--kill-compiler" => signal_at = Some((value()? as u64, 9)),   // SIGKILL
-            "--stall-compiler" => signal_at = Some((value()? as u64, 17)), // SIGSTOP (macOS)
+            "--kill-compiler" => signal_at = Some((value()? as u64, SIGKILL)),
+            "--stall-compiler" => signal_at = Some((value()? as u64, SIGSTOP)),
             "--kick-vcpu" => kicked.push(value()?),
             "--kicks" => kicks = value()?,
             "--kick-every-us" => every_us = value()? as u64,
@@ -626,7 +635,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         if !finished(&stop) {
             owners::cancel_owners(cancelled);
         }
-        Ok(Ran { stop, compiles: compiler.compiles, slowest: compiler.slowest, blocks: requests.blocks, distinct: requests.rips.len(), tampered: requests.tampered })
+        Ok(Ran { stop, compiles: compiler.compiles, slowest: compiler.slowest, blocks: requests.blocks, rips: requests.rips, tampered: requests.tampered })
     };
     let prepare = |v: usize| -> Result<Vcpu> {
         let cpu = Vcpu::create()?;
@@ -634,7 +643,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         Ok(cpu)
     };
     // One kicker per kicked vCPU, joined before the VM goes (a protect needs the VM).
-    let supervision = std::thread::scope(|scope| {
+    let (kicked, supervision) = std::thread::scope(|scope| {
         let kickers: Vec<_> = kicked
             .iter()
             .map(|&v| {
@@ -668,7 +677,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             e.store(true, SeqCst); // a vCPU that never started
         }
         let kicked: Result<()> = kickers.into_iter().map(|k| k.join().unwrap_or(Err("kicker panicked".into()))).collect();
-        kicked.and(supervision)
+        (kicked, supervision)
     });
     // Every vCPU is destroyed (or never created): the VM goes next, then the host reads the backing.
     let destroyed = machine.destroy();
@@ -678,6 +687,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     if let Some(e) = supervision.error {
         return Err(e);
     }
+    kicked?;
     let mut out = Vec::new();
     for (v, ran) in supervision.outputs.into_iter().enumerate() {
         let ran = ran.ok_or("vCPU without a result")?;
@@ -696,9 +706,11 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// The `teardown:` line: of `n` vCPUs, how many ran and joined and how many were destroyed with status 0 (`None`: setup
-/// failed before any ran), the VM's destroy status, and the child processes left (`waitpid(-1, WNOHANG)` failing with
-/// ECHILD: none, alive or unreaped).
+/// The `teardown:` line, written after the joins (every vCPU thread has returned) and the VM's destroy: of `n` vCPUs,
+/// how many joined with a result and how many were destroyed with status 0 (`None`: [`owners::supervise`] failed in
+/// setup, before the start barrier, so no vCPU entered and none reports), the VM's destroy status, and the child
+/// processes left (`waitpid(-1, WNOHANG)` failing with ECHILD: none, alive or unreaped). A kicker's failure does not
+/// change it (it is returned after the line).
 fn teardown(n: usize, s: Option<&owners::Supervision<Ran>>, vm: i32) -> String {
     unsafe extern "C" {
         fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
@@ -747,6 +759,8 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
         Stop::Cancelled => ("cancelled", String::new(), [0; 4]),
     };
     let list = |v: &[u64]| v.iter().map(|x| format!("\"{x:#x}\"")).collect::<Vec<_>>().join(",");
+    let mut rips: Vec<u64> = ran.rips.iter().copied().collect();
+    rips.sort_unstable();
     let mut out = format!(
         "{{\"vcpu\":{},\"tso\":{},\"stop\":\"{kind}\",\"reason\":\"{reason}\",\"gpr\":[{}],\"rip\":\"{:#x}\",\"rflags\":\"{:#x}\",\"memory\":[",
         area.vcpu,
@@ -772,12 +786,12 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\"}}",
+        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]}}",
         s.blocks,
         s.fast,
         s.l2_hits,
         s.requests,
-        ran.distinct,
+        ran.rips.len(),
         ran.blocks,
         s.generation,
         ran.compiles,
@@ -802,7 +816,8 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
         list(&s.native),
         frame_intact(area),
         tampered,
-        links_check.replace('"', "'")
+        links_check.replace('"', "'"),
+        list(&rips)
     );
     Ok(out)
 }

@@ -16,9 +16,16 @@ import argparse, hashlib, json, os, pathlib, re, struct, subprocess, sys, tempfi
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
 import flags
-import run_i4v_qemu as old          # reuse the pinned image id and QEMU hashes
 
-IMAGE, PINS = old.IMAGE, old.PINS
+# The pinned QEMU container image (Debian bookworm, qemu-user-static 7.2) and the SHA-256 of its QEMU binaries and
+# sources (the pins of the earlier I4-V QEMU check, run_i4v_qemu.py, deleted at S3i).
+IMAGE = 'sha256:27475cb39ecb4500d02b7c6e73c9d598e8d9f0736f0dc217d2d985e5cbe01aac'
+PINS = {
+'qemu-arm64.deb':'e420c417c12b42ca774795b62888d5388da0e08c1ef263dea1490e5ce4e32a0b',
+'qemu-x86_64-static':'16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594',
+'qemu.dsc':'6b6bd27b947ec89e40a1d6b26d9c9f3c698ca691da13163e0483f6061bbb20b3',
+'debian.tar.xz':'28a1c86310ee53b6bf1854cffe6f6be6ed29a08db7d05759f8ac57b8d6a6cb2f',
+'qemu-source.tar.xz':'91aca71520040edc40b8d437aa3004dae614f58e286cf653ee8996c07af2962f'}
 REGS = ('rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi', 'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15')
 R64 = list(REGS)
 R32 = ['eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi'] + [f'r{i}d' for i in range(8, 16)]

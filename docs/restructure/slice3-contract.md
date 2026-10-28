@@ -373,7 +373,9 @@ their campaigns retire:** runtime/abi family code (modes are layered: `translati
   resident wait on a peer that never drains is bounded only by the waiter's watchdog). Driver hooks (opt-in, on
   `--tamper-vcpu V`; nothing changes without them): the reply tamper now runs in the service loop at every reply but a
   park, after the reply kind is set, so it may change the kind (`--tamper next-page`: a block request answered with
-  `REPLY_NEXT_PAGE`, then again after the next page was walked → `bad_reply`; S3d review carry-over); `--tamper site`
+  `REPLY_NEXT_PAGE`, then again after the next page was walked → `bad_reply`; S3d review carry-over); the older tampers
+  (`offset`, `word`, `literal`, `record`, and `site`/`site-kind` below) act only on a block reply, so they no longer fire
+  at system replies; `--tamper site`
   and `site-kind` (above, contract 56); `--ignore-kicks` (every stop resumes at its stop store without the gate, so the
   vCPU never drains while in linked code); `--kill-compiler N` (SIGKILL of its `fexc --serve` before request N + 1); `--stall-compiler N` (SIGSTOP there: alive,
   never answering).
@@ -381,7 +383,8 @@ their campaigns retire:** runtime/abi family code (modes are layered: `translati
   which peers' `SHADOWS` request was still pending; (b) a failed compile-server request names the server, its PID and its
   exit (`owner 2: fexc --serve (pid P) exited (signal: 9 (SIGKILL)): …`, exit status 1); (c) every `run-program` writes a
   `teardown:` line after destroying the VM, on success and on failure (before, a kicker or setup error returned before
-  the explicit destroy and left it to `Drop`): vCPUs joined, vCPUs destroyed with status 0, the VM's destroy status and
+  the explicit destroy and left it to `Drop`): vCPUs joined (the line is written after the joins: the vCPU threads that
+  returned a result), vCPUs destroyed with status 0, the VM's destroy status and
   the child processes left (`waitpid(-1, WNOHANG)`: ECHILD = no compile server alive or unreaped); (d) every
   compile-server request has a deadline for its whole reply (`--compile-deadline-ms`, default 30 s: the slowest compile
   measured on the corpora, 6,080 vCPU runs at N = 4 and at N = 2 with block size 1, took 13.4 ms with the server's start);
@@ -420,7 +423,7 @@ their campaigns retire:** runtime/abi family code (modes are layered: `translati
 
   | Old contract or check | General-path check, or reason |
   | --- | --- |
-  | 45 fault service serialized (exclusive service, FIFO, one operation per vCPU; `check_i4`, `check_i4v_progress_protocols`, concurrent controls and coherence traces) | Retired: there is no global service lock or queue. Each vCPU serves its own faults in its own resident; cross-vCPU state is atomic RMWs on masks, records and counters (§1). Guest-visible consequences: `coherence`, `sharedpt`, `litmus`. |
+  | 45 fault service serialized (exclusive service, FIFO, one operation per vCPU; `check_i4`, `check_i4v_progress_protocols`, concurrent controls and coherence traces) | Retired: there is no global service lock or queue. Each vCPU serves its own faults in its own resident; cross-vCPU state is atomic RMWs on masks, records and counters (§1). Successor property: a waiter drains its own record while it waits, so mutual waits progress; checked by `mutual` (`coherence`, `contain` progress). Guest-visible consequences: `coherence`, `sharedpt`, `litmus`. |
   | 46 acknowledgement after covered effects; admission reopens after the owner set | Replaced by the one synchronous shootdown (§1): the waiter goes on only after the peer's reset counter moved (its `tlbi` + `dsb ish` done). `coherence` `fresh-reused` (negative control: shootdown off fails); `contain` `unacked` (served when untampered; never served: the waiter waits until its watchdog). Remap acknowledgements: retired at S3a2 (42). |
   | 47 progress under sustained maintenance (≤ 8 queued heads, round robin; `check_i4_pressure`, concurrent families) | Progress without a fairness bound: `contain` progress (every vCPU reaches its end under sustained cross-vCPU code writes and while a peer translates a finishing vCPU's page), `litmus` (every vCPU completes its K iterations), `sharedpt` contended walks (6,000 per walker). A block killed as it is placed steps one instruction, so a miss always progresses; known limits, both measured: `data@4` steps every instruction (S3d cliff) and a no-pause PTE store loop starves walks (S3f, watchdog-contained). The heads bound retires with the queue. |
   | 48 capacity exhaustion is a state-preserving refusal (queue full; I2 capacity) | Retired: no queue; invalidation records are bitmaps (no capacity, no overflow, no lost entry), and a full code cache flushes (probes with a small `--code-cache`). |
@@ -438,6 +441,32 @@ their campaigns retire:** runtime/abi family code (modes are layered: `translati
   "general-path check" column; boot-phase handoff written (44, 51, 49, 64-bit FS/GS bases, the CPUID/SERIALIZE/IRET drain
   rule). *Check:* suites green; no campaign-named module; every contract maps to a check, a retirement reason or a
   boot-phase item; the resident stack audit (62) redone on the phase's final binary.
+  *Built S3i1 (Oct 28, the deletion; S3i2 is the inventory column, the handoff and the stack audit):* S3h review
+  carry-overs first: `contain` checks each tampered vCPU's banked state (FEX frame intact; the `system`, `site` and
+  `site-kind` tampers at the unchanged start state, rip 0x100000 and every GPR 0; the others at a block boundary the run
+  reached: a translated block's entry, reported by the driver as `block_rips`, or the section's end, where a forged
+  header halts the linker at the exit of the block before it), so 56 and 58 are enforced; every `contain` process is
+  killed 5 s past its bound (a hang is a diff); the driver keeps the vCPUs' supervision when a kicker fails (the
+  teardown line comes from it alone; the kicker's error is returned after it) and reads staging only for a block reply.
+  Deleted: the `families` feature with runtime/abi `families/` (17,955 lines), abi `translation`/`recovery`/`pressure`/
+  `concurrency` (+ the pressure binaries) and lib.rs's I1 object and record fields, runtime `coordinator`, the
+  `service` gate (`hvc #0x4a`), host drivers `concurrent*`/`i4v_*`/`recovery` (6,118), host `translation` and
+  `process_owner` (798; the families' worker transport), `diagnostics`, the owner service (`OwnerService`, `Owners`),
+  `Vm`, `enter_resident`/`run_to_hvc`, `new_vm_nonce`; the old runners, checkers, workers, producers (`i4v_producer`,
+  `i3_producer`), `i4v_qemu`, their tests and testdata, the outer-supervisor tests (`test_containment_supervisor.py`,
+  `test_supervisor_ownership.py`: the outer supervisor and its container ownership retired, S3h table, 57 and 60) and `fixtures/i1`, `fixtures/i4v`, `fixtures/i4v-qemu`. The
+  32-bit families go under decision 3, and with them the legacy two-level walker `paging32.rs` (no general-path caller;
+  recover it from commit 4902ee5 if the boot phase needs legacy paging). Moved:
+  the four models to `tools/models/` (`ordering_model`, `coherence_model`, `pae_model`, `modes_model`, a package; their
+  tests with them); the QEMU pins to `tools/reference/ref.py` (`IMAGE`, `PINS`); the old producer's pinned bodies, which
+  `tools/fexc/test_fexc.py` compares fexc against, to `tools/fexc/producer_bodies.json`. Contracts §3's model fixes
+  (items 3, 15 in `modes_model`; 4, 12 as declared policy) are left to S3i2: the moved models are unchanged.
+  Checks: cargo tests 70 pass (1 ignored; 183 `#[test]` before), no build warnings (one before: `spawn_held`); Python
+  tests 51 (318 before); fixtures 64 and seed 4242 44 match at block sizes default and 1; faults 3,443 at both; control
+  flow 64 × 3 sizes, loop faults 846 × 3; probes 85; ASM 235 pass; `run_slice3_vm.py` corpora (3,040 programs at N = 2,
+  3, 4), smp 15, limits, kicks (1,000 per vCPU), system, coherence 40, sharedpt 32 (1 run each), litmus 90 cells × 5,000
+  trials (none outside the model), contain (100 tampers with the banked-state checks, 113 fresh controls, progress 24):
+  all pass.
 
 ## 5. Owner decisions (recorded October 27, 2026)
 1. **32-bit and paging-off segmentation forms go to the boot phase** (segment bases and limits, CS limit, A20, 16-bit

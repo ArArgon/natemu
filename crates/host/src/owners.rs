@@ -3,11 +3,8 @@
 //! The caller owns the VM and its memory. This module owns the start barrier
 //! (no native entry until every owner prepared), supervision, cancellation,
 //! join-before-read and vCPU-destroy-before-return ordering ([`supervise`]). What
-//! an owner runs is the caller's: the execution service (`execution::run`), or the
-//! regression families' resident compiler-service gateway ([`Owners`], with a
-//! caller-supplied [`OwnerService`]).
+//! an owner runs is the caller's: the execution service (`execution::run`).
 use super::*;
-use natemu_abi::translation as wire;
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -17,136 +14,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// One owner's handler for the resident compiler-service gateway (HVC #0x4a).
-pub(crate) trait OwnerService {
-    /// `packet` is x0..x15 at the gateway; the reply is written back to x0..x15.
-    fn exchange(&mut self, packet: wire::Packet) -> Result<wire::Packet>;
-    /// Requests this owner submitted, collected after a successful run.
-    fn requests(&mut self) -> Vec<wire::Packet>;
-}
-pub(crate) type Service = Box<dyn OwnerService>;
-
-/// Configured owners: owner `id` enters at window `memory + id * RAM_SIZE`.
-pub(crate) struct Owners {
-    pub n: usize,
-    pub tcr: u64,
-    /// Host address of guest RAM window 0.
-    pub memory: usize,
-    /// One owner's declared pre-entry delay after the start barrier.
-    pub delayed: Option<(usize, Duration)>,
-    pub deadline: Duration,
-}
-
 /// Returned after every owner has joined and destroyed its vCPU. A setup
 /// failure before the start barrier is an `Err` from [`supervise`] instead.
 pub(crate) struct Supervision<T> {
     /// Each owner's result, by id (`None` when it failed; `error` holds the first failure).
     pub outputs: Vec<Option<T>>,
     pub error: Option<String>,
-    pub completed: usize,
     pub destroyed: Vec<(usize, i32)>,
-    pub cancellations: Vec<i32>,
-    pub began: Instant,
-}
-
-/// An owner vCPU and its resident service loop.
-struct Cpu<'a>(&'a Vcpu);
-impl Cpu<'_> {
-    fn run(
-        &self,
-        shared_address: usize,
-        service: &mut Option<Service>,
-        cancelled: &AtomicBool,
-    ) -> Result<()> {
-        loop {
-            if cancelled.load(Ordering::Acquire) {
-                return Err("owner cancelled after peer failure".into());
-            }
-            let event = self.0.run_to_hvc()?;
-            let pc = self.0.reg(PC)?;
-            match event {
-                0x49 => {
-                    let s = unsafe { ptr::read_volatile(shared_address as *const Shared) };
-                    return terminal_outcome(s.status, s.detail);
-                }
-                0x4a => {
-                    // Only this owner writes its private record, and is
-                    // stopped at the explicit register-transfer gateway.
-                    let s = unsafe { ptr::read_volatile(shared_address as *const Shared) };
-                    if !resident::contains(s.service_pc, 4) || pc != s.service_pc {
-                        return Err("compiler service outside explicit gateway".into());
-                    }
-                    let mut packet = [0; 16];
-                    for (r, v) in packet.iter_mut().enumerate() {
-                        *v = self.0.reg(r as u32)?;
-                    }
-                    let reply = service
-                        .as_mut()
-                        .ok_or("compiler service on non-owner")?
-                        .exchange(packet)?;
-                    for (r, v) in reply.iter().enumerate() {
-                        self.0.set_reg(r as u32, *v)?;
-                    }
-                }
-                _ => return Err("unexpected owner HVC".into()),
-            }
-        }
-    }
-}
-
-// Every concurrent fixture reports expected guest exceptions in its own record
-// and terminates with SUCCESS. Resident rejection/fault is never a guest outcome.
-fn terminal_outcome(status: u64, detail: u64) -> Result<()> {
-    match status {
-        SUCCESS => Ok(()),
-        REJECTED => Err(format!("resident owner rejected detail={detail}")),
-        NATIVE_FAULT => Err(format!("resident owner native fault detail={detail}")),
-        PANIC => Err(format!("resident owner panic detail={detail}")),
-        _ => Err(format!(
-            "resident owner invalid terminal status={status} detail={detail}"
-        )),
-    }
 }
 
 /// Cancels every owner: each stops at its next host exit, and the supervisor forces running vCPUs out.
 pub(crate) fn cancel_owners(cancelled: &AtomicBool) {
-    if !cancelled.swap(true, Ordering::AcqRel) {
-        crate::translation::process_owner::begin_cancellation();
-    }
-}
-
-impl Owners {
-    /// The regression families' owners: each enters at its window and serves the
-    /// resident compiler-service gateway. `service(id)` runs on owner `id`'s thread
-    /// after the start barrier (and its delay); `None` means the owner has no gateway
-    /// service. Returns every owner's submitted requests (see [`supervise`]).
-    pub(crate) fn run(
-        &self,
-        service: &(dyn Fn(usize) -> Result<Option<Service>> + Sync),
-        poll: &mut dyn FnMut() -> Option<String>,
-        owner_failed: &dyn Fn(&str),
-    ) -> Result<Supervision<Vec<wire::Packet>>> {
-        let Self { n, tcr, memory, delayed, deadline } = *self;
-        supervise(
-            n,
-            deadline,
-            &|id| {
-                let cpu = Vcpu::create()?;
-                cpu.enter_resident(id * RAM_SIZE, tcr)?;
-                Ok(cpu)
-            },
-            &|id, cpu, cancelled| {
-                if let Some((_, delay)) = delayed.filter(|d| d.0 == id) {
-                    thread::sleep(delay);
-                }
-                let mut owned = service(id)?;
-                Cpu(cpu).run(memory + id * RAM_SIZE + SHARED_OFFSET, &mut owned, cancelled)?;
-                Ok(owned.map_or_else(Vec::new, |mut s| s.requests()))
-            },
-            poll,
-            owner_failed,
-        )
-    }
+    cancelled.store(true, Ordering::Release);
 }
 
 /// Runs `n` owners in one VM (the caller owns it and its memory), each on its own
@@ -231,7 +110,6 @@ pub(crate) fn supervise<T: Send>(
         }
         let began = Instant::now();
         let mut completed = 0;
-        let mut cancellations = Vec::new();
         while completed < n {
             let completion = done_rx.recv_timeout(Duration::from_millis(20));
             if let Some(cause) = poll() {
@@ -259,7 +137,7 @@ pub(crate) fn supervise<T: Send>(
                 cancel_owners(&cancelled);
                 // Repeat cancellation: an owner may still be in its declared
                 // pre-entry delay when an earlier cancellation is issued.
-                cancellations.push(exit_vcpus(&mut ids));
+                exit_vcpus(&mut ids);
             }
         }
         drop(releases);
@@ -278,36 +156,6 @@ pub(crate) fn supervise<T: Send>(
                 }
             });
         }
-        Ok(Supervision {
-            outputs,
-            error,
-            completed,
-            destroyed: destroyed_rx.into_iter().collect(),
-            cancellations,
-            began,
-        })
+        Ok(Supervision { outputs, error, destroyed: destroyed_rx.into_iter().collect() })
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn concurrent_guest_exceptions_do_not_authorize_runtime_failures() {
-        assert!(terminal_outcome(SUCCESS, 0).is_ok());
-        for status in [0, REJECTED, NATIVE_FAULT, PANIC, u64::MAX] {
-            assert!(terminal_outcome(status, 321).unwrap_err().contains("321"));
-        }
-        assert!(
-            terminal_outcome(REJECTED, 7)
-                .unwrap_err()
-                .contains("rejected")
-        );
-        assert!(
-            terminal_outcome(NATIVE_FAULT, 7)
-                .unwrap_err()
-                .contains("native fault")
-        );
-    }
 }

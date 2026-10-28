@@ -296,8 +296,20 @@ Ordinary local checks/builds, from the repository root:
 ./tools/with-env cargo test --offline --locked
 ./tools/with-env cargo build --offline --locked --release -p natemu-runtime --target aarch64-unknown-none
 python3 -B -m unittest discover -s tools -p 'test_*.py'
-python3 -B tools/check_i1.py --self-test
 ```
+
+The general execution path's suites (each runner's docstring gives its options; the slice contracts give what they
+check): `tools/run_slice1_vm.py` (fixtures and seeded corpora vs QEMU), `tools/run_slice1_faults.py` (precise faults and
+paging cells), `tools/run_slice2_vm.py` (control flow), `tools/run_slice2_faults.py` (loop faults),
+`tools/run_slice2_probes.py` (code cache, linking, self-modifying code), `tools/fexc/upstream_tests/run_asm.py` (FEX's
+ASM suite) and `tools/run_slice3_vm.py` (N vCPUs: corpora, smp, limits, kicks, system, coherence, sharedpt, litmus,
+contain). Each takes `--fexc FEXC --out DIR` and runs under `./tools/with-env`.
+
+**Retired (S3i, October 28, 2026):** every specialized I1–I4/I4-V path. The runtime/abi regression families, their host
+drivers and the resident compiler-service gateway are deleted, as are `run_i1.py`, `run_i4v.py`, `run_i4v_qemu.py`, their
+checkers, workers, producers, tests and fixtures; the independent models moved to `tools/models/`. The sections
+below record what those runs established; their commands no longer run. Coverage of each old check by the general
+path, or its retirement reason: [slice-3 contract](restructure/slice3-contract.md) §3, S3a2 and S3h tables.
 
 **Retired (S3a2, October 27, 2026):** the general execution path covers the I1 entry cells, the I2 live-translation
 scenarios and the I3 paging/allocated cells, and their host drivers, runner options and I3 worker are deleted
@@ -310,7 +322,7 @@ oracle. Use a fresh name; existing output directories are refused.
 
 The `--fragment` path in the I4 command below is this machine's durable reproduced input; supply its
 actual location when using a different raw root. Its exact producer, extraction,
-bytes and manual site maps are in `fixtures/i1/live_load.json`. A missing fragment
+bytes and manual site maps were in `fixtures/i1/live_load.json` (deleted at S3i). A missing fragment
 is an acquisition requirement, not permission to substitute handwritten code.
 Use `--snapshot PATH_TO_RETAINED_SOURCE` to rebuild the same checked sources;
 invoke that snapshot's runner if its runner/helper versions differ from the
@@ -338,7 +350,7 @@ This is development coverage of I1, not the full ABI coverage matrix.
 ### I2 live producer checks
 
 Retired with I1 (above). The runner's I2 scenarios required the retained ARM64 Linux toolchain image identified in
-`tools/fex_worker.py` and the exact pinned producer binary. The runner verifies
+`tools/fex_worker.py` (deleted at S3i) and the exact pinned producer binary. The runner verifies
 and copies that binary into each fresh run; the earlier producer run retains its
 producing sources/build. Each runtime request supplies fresh x86 bytes to a new
 compile-only invocation. New `input.bin`, raw objects, logs and replies remain
@@ -388,7 +400,7 @@ The runner snapshots and rebuilds sources, binds both producer binaries, retains
 fresh per-request inputs/outputs and supervises the combined execution bundle
 for at most20 minutes. Both compiler container families use run-specific cleanup.
 Its producer package (now deleted; only the shared
-[FEX export patch](../tools/i3_producer/README.md) remains) recorded exact inputs, adaptation and allocation maps.
+FEX export patch remained, until S3i) recorded exact inputs, adaptation and allocation maps.
 
 **Implemented finite behavior:** the runtime distinguishes missing ARM shadows
 from x86 #PF using a four-level, 48-bit virtual/40-bit physical walker, 4KiB/2MiB
@@ -428,7 +440,7 @@ open. These finite I3 checks do not complete the full ABI milestone or Track03.
 
 ### I4 concurrent composition
 
-Run the complete finite I4 matrix with:
+Retired at S3i (above); the complete finite I4 matrix ran with:
 
 ```sh
 ./tools/with-env python3 -B tools/run_i1.py \
@@ -472,8 +484,8 @@ and acceptance remain recorded in INV-03-01.
 
 ### I4-V validation runs
 
-Use the [pinned I4-V producer](../tools/i4v_producer/README.md), rather than the
-earlier I1/I3 executables, for the new profiles. For a focused development check:
+Retired at S3i (above). The runs used the pinned I4-V producer (`tools/i4v_producer`, deleted), rather than the
+earlier I1/I3 executables, for the new profiles. A focused development check was:
 
 ```sh
 ./tools/with-env python3 -B tools/run_i4v.py \
@@ -501,7 +513,7 @@ all flags into one bundle that exceeds the declared limit. Count repeated baseli
 separately from distinct coverage. A bundle's `full_i4v_complete: false` does not
 claim aggregate milestone acceptance; that judgment belongs to the
 [contract matrix and independent review](research/reviews/INV-03-01-i4v-coverage.md).
-The separate [QEMU comparison](../fixtures/i4v-qemu/README.md) binds passed native
+The separate QEMU comparison (`fixtures/i4v-qemu`, deleted at S3i) bound passed native
 reports and has its own producing snapshot, checksums and bounded execution.
 
 Use `./tools/with-env COMMAND ...` for project builds, checks and runs. It supplies

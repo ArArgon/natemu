@@ -124,8 +124,8 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize) -> Result<Bac
 pub(crate) fn set_cpu(area: Area, cpu: Cpu) {
     area.write_record(exec::STATE_OFFSET, State::new(area.vcpu as u64, cpu));
 }
-/// Enters the vCPU at the resident in its window, its tables tagged with its own ASID (its number + 1; ASID 0 is the
-/// untagged world of the regression families).
+/// Enters the vCPU at the resident in its window, its tables tagged with its own ASID (its number + 1; ASID 0 would be
+/// untagged, with global shadows).
 pub(crate) fn enter(cpu: &Vcpu, area: Area) -> Result<()> {
     cpu.enter_resident_with_asid(area.base, natemu_abi::shadow::TCR_BOTH, area.vcpu as u8 + 1)
 }

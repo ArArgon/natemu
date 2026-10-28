@@ -2,7 +2,7 @@
 
 Status: **C1a done** (library + link smoke test). **C1b done** (`fexc` CLI and JSON
 output, 5-input smoke check). **C1c done in effect**: the 53 pinned old-producer bodies with a recorded
-bitness (`tools/i4v_producer/export.py` CASES) are byte-identical to the native output, which
+bitness (then `tools/i4v_producer/export.py` CASES; since S3i `tools/fexc/producer_bodies.json`) are byte-identical to the native output, which
 `test_fexc.py` asserts; the structural self-check is `test_fexc.py` too. **S1a done**
 ([slice 1 contract](../../docs/restructure/slice1-contract.md) §3): `natemu-fexc-v2` with access
 sites, `spill_bytes`, `cf_inverted` per PC entry, and `--object` (binary record in
@@ -128,7 +128,7 @@ Patch 0001 (`patches/`):
 - `AllocatorHooks.cpp`: macOS `aligned_alloc` rejects small alignments (returned
   NULL and crashed `CreateNewContext`); use `posix_memalign`.
 
-Patches 0002 and 0003 (C1b): the guest-code window seam from `i4v_producer/adapt.py`
+Patches 0002 and 0003 (C1b): the guest-code window seam from `i4v_producer/adapt.py` (deleted at S3i; in git history)
 (`ResolveGuestCodePointer`, integer arithmetic on logical PCs in `Frontend.cpp/.h`,
 `Core.cpp`); the export hook (`shim/fexc_hook.h`, called from `ContextImpl::CompileCode`);
 extra `DebugData` fields (entry prologue end offsets, static register map, filled in
@@ -235,8 +235,8 @@ NAME=0|1` overrides one bit. Later this table is to be derived from the VM's vCP
   running emulator thread).
 
 ## Smoke check
-`smoke.py FEXC OUT_DIR` compiles two sample inputs from `tools/i4v_producer/export.py`
-CASES (64-bit high RIP, 32-bit) and three from `fixtures/slice1/programs.json`, writes JSON
+`smoke.py FEXC OUT_DIR` compiles two sample inputs from `tools/fexc/producer_bodies.json`
+(the old producer's pinned cases) (64-bit high RIP, 32-bit) and three from `fixtures/slice1/programs.json`, writes JSON
 and disassembles each block with `xcrun objdump` (llvm-based; it wraps the words in a
 Mach-O object first). The full comparison with the old pinned bodies and the structural
 self-check are in `test_fexc.py`.

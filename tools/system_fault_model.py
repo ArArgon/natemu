@@ -6,7 +6,7 @@ Processor profile (natemu's CPU model, declared): Intel, MAXPHYADDR 40, 64-bit m
 no SMAP; the only MSR is IA32_EFER (others raise #GP(0)). CR4 bits of features the profile does not have are reserved.
 
 `fault(code, gpr, cpl, cr0, cr4, efer)` -> (vector, error code) the instruction at the start of `code` raises, or None.
-Used where neither QEMU nor i4v_modes_model gives the answer: pinned QEMU 11.1.2 accepts several of these writes
+Used where neither QEMU nor modes_model gives the answer: pinned QEMU 11.1.2 accepts several of these writes
 (reserved CR0 bits 63:32, PE=0 with PG=1, NW without CD, PCIDE without PCID, clearing CR4.PAE, reserved EFER bits,
 LME changes with paging on, unknown MSRs) and hangs on others (reserved CR4 bits, SMAP without SMAP, CR3 bits above
 MAXPHYADDR, clearing CR0.PG).

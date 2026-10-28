@@ -11,7 +11,7 @@ emulator or its crates.
     python3 tools/bench/smp/smp.py build    [--k 32768]    # rewrite programs.json / litmus.json from programs.py
 
 Needs `nasm`, QEMU, python3. `det` fails (exit 1) if any run differs from the model or if repeated runs give different dumps. `litmus` fails
-only on tool errors; allowed/forbidden labelling comes from `tools/i4v_ordering_model.py` (`enumerate_outcomes`), reported in the results.
+only on tool errors; allowed/forbidden labelling comes from `tools/models/ordering_model.py` (`enumerate_outcomes`), reported in the results.
 
 ## Files
 
@@ -113,7 +113,7 @@ then never finishes `stale` (2 of 8 runs at 3 CPUs, 1 of 10 at 4); the runner re
 
 ## (f) Shared guest page-table programs (`sharedpt.py`; S3f)
 
-Generated at run time (no json), judged by `tools/run_slice3_vm.py sharedpt` against `tools/i4v_coherence_model.py` (walks, `Cache`,
+Generated at run time (no json), judged by `tools/run_slice3_vm.py sharedpt` against `tools/models/coherence_model.py` (walks, `Cache`,
 `access_outcomes`, `check_observation`) and, for what is schedule-independent, QEMU. Every program is a system program (CPL0) with ONE shared body
 and ONE shared table set (identity map of 0..4 MiB, 4 KiB pages, A/D preset except on the test pages) loaded by every CPU; CPU `rbx` logs what it saw in
 a private log area (not captured) and the judge replays the logs through the model. Handshakes are plain stores and loads.
@@ -143,7 +143,7 @@ specific peer (handshake), never on an unordered race. `model_smp.py` computes e
 
 ## (b) Litmus programs (`litmus.json`: sb mp lb wrc iriw sb-mfence sb-xchg iriw-mfence, each at `thread=multi` k=32768 and a `-pause` form)
 
-Declarations come from `tools/i4v_ordering_model.py` (`PROFILES`; `iriw-mfence` is declared locally with a fence between the two loads). Each
+Declarations come from `tools/models/ordering_model.py` (`PROFILES`; `iriw-mfence` is declared locally with a fence between the two loads). Each
 CPU runs k iterations of: CPU 0 waits for all CPUs to finish the previous iteration and resets the locations; every CPU announces iteration `it`
 in its own sequence word and waits for the others' (symmetric arrival); a per-CPU xorshift picks a 0..63-spin random start offset (without it the CPU
 that arrives last at the barrier always wins the race and the interesting outcomes never appear); the test's plain `mov dword` stores,

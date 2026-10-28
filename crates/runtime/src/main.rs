@@ -9,18 +9,12 @@ use core::{
 use natemu_abi::*;
 use natemu_abi::guest_memory::{GuestRam, GuestTables};
 use record::*;
-// Kept general for the multi-owner path; only the families use it so far.
-#[cfg_attr(not(feature = "families"), allow(dead_code))]
-mod coordinator;
 mod cache;
 mod execution;
-#[cfg(feature = "families")]
-mod families;
 mod record;
 mod tables;
 
-// The general gates; the `families` feature appends the regression families' gates.
-macro_rules! gates { ($source:expr) => { global_asm!($source,
+global_asm!(include_str!("gates.S"),
     frame_size=const size_of::<NativeFrame>(),
     sp_offset=const offset_of!(NativeFrame,sp),
     q_offset=const offset_of!(NativeFrame,q),
@@ -37,11 +31,7 @@ macro_rules! gates { ($source:expr) => { global_asm!($source,
     l1_address=const natemu_abi::execution::cache::LOOKUP_VA+natemu_abi::execution::cache::L1 as u64,
     l1_mask=const natemu_abi::execution::cache::L1_MASK,
     fast_counter=const natemu_abi::execution::STATE_VA+offset_of!(natemu_abi::execution::State,fast) as u64,
-); } }
-#[cfg(not(feature = "families"))]
-gates!(include_str!("gates.S"));
-#[cfg(feature = "families")]
-gates!(concat!(include_str!("gates.S"), include_str!("families/gates.S")));
+);
 
 fn shared() -> *mut Shared {
     (PRIVATE + SHARED_OFFSET as u64) as *mut Shared
@@ -76,9 +66,6 @@ unsafe extern "C" fn runtime_main() -> ! {
         if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::execution::MODE {
             execution::start();
         }
-        #[cfg(feature = "families")]
-        families::start();
-        #[cfg(not(feature = "families"))]
         stop(REJECTED, 11);
     }
 }
@@ -91,9 +78,6 @@ unsafe extern "C" fn finish(frame: *const NativeFrame, fault: u64) -> ! {
         if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::execution::MODE {
             execution::returned(&*frame, fault);
         }
-        #[cfg(feature = "families")]
-        families::finish(fault);
-        #[cfg(not(feature = "families"))]
         stop(PANIC, 11);
     }
 }

@@ -134,11 +134,7 @@ class FexcStructure(unittest.TestCase):
 
     def test_old_producer_identity(self):
         """One pinned I4-V body (same FEX commit, TSO, no SVE/LRCPC, LSE on) must be reproduced exactly."""
-        sys.path.insert(0, str(HERE.parent / 'i4v_producer'))
-        try:
-            from export import CASES
-        finally:
-            sys.path.pop(0)
+        CASES = json.loads((HERE / 'producer_bodies.json').read_text())['cases']
         self.assertEqual(CASES['fex_order_sb']['bitness'], 64)
         # Site recording, the dense PC table and the feature profile must not change emitted code: every pinned body
         # with a recorded bitness, at two RIPs for the 64-bit ones.

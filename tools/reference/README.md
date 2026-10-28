@@ -1,7 +1,7 @@
 # General QEMU reference tool
 
-Runs any straight-line x86-64 program under the pinned QEMU Linux-user (same image and QEMU hash as
-`tools/run_i4v_qemu.py`; container flags copied from it; no new image) and returns final GPRs,
+Runs any straight-line x86-64 program under the pinned QEMU Linux-user (the image and QEMU hashes
+first pinned by the I4-V QEMU check, now `ref.IMAGE`/`ref.PINS`; container flags copied from that check; no new image) and returns final GPRs,
 RFLAGS, RIP and memory. Nothing is keyed by program name. Independent of the compiler and the VM.
 
     tools/with-env python3 tools/reference/build_slice1.py                                   # build fixtures/slice1/{programs,expected}.json
@@ -10,7 +10,7 @@ RFLAGS, RIP and memory. Nothing is keyed by program name. Independent of the com
     python3 -m unittest discover -s tools/reference                                        # self-check (needs Docker)
 
 Defaults: QEMU at `$NATEMU_RAW_ROOT/reference-slice1-20261026-01/pin/qemu-x86_64-static` (copy of the pinned
-binary, SHA-256 checked against `run_i4v_qemu.PINS`), run files in `.../run/` (ELFs, QEMU stdout/stderr/log
+binary, SHA-256 checked against `ref.PINS`), run files in `.../run/` (ELFs, QEMU stdout/stderr/log
 per program). Override with `--qemu`, `--workdir`. Requires host `clang` (assembles the harness stubs; the
 generator also assembles programs) and Docker.
 

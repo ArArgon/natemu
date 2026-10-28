@@ -46,15 +46,6 @@ pub(crate) fn hv(code: i32, operation: &str) -> Result<()> {
     }
 }
 
-/// A fresh nonzero identity for one VM incarnation.
-pub(crate) fn new_vm_nonce() -> Result<u64> {
-    let mut nonce = 0u64;
-    if unsafe { getentropy((&raw mut nonce).cast(), 8) } != 0 || nonce == 0 {
-        return Err("VM identity entropy unavailable".into());
-    }
-    Ok(nonce)
-}
-
 /// Fails unless the host can run `n` vCPUs in one VM.
 pub(crate) fn require_vcpus(n: usize) -> Result<()> {
     let mut limit = 0;
@@ -126,8 +117,6 @@ const SCTLR_EL1: u16 = 0xc080;
 const ACTLR_EL1: u16 = 0xc081;
 const CPACR_EL1: u16 = 0xc082;
 const CNTV_CTL_EL0: u16 = 0xdf19;
-/// TCR_EL1 for the single lower private root (TTBR1 walks disabled).
-pub(crate) const SINGLE_ROOT_TCR: u64 = 16 | 1 << 8 | 1 << 10 | 3 << 12 | 1 << 23 | 2 << 32;
 
 /// Why `hv_vcpu_run` returned.
 pub(crate) enum Exit {
@@ -196,12 +185,8 @@ impl Vcpu {
     }
     /// Sets the architectural EL1 state the resident `_start` consumes for the
     /// owner window at `window`: PC at the window, EL1h with DAIF masked, x0 = the
-    /// window's lower private root, x1 = TCR_EL1, x2 = MAIR_EL1; MMU off, TSO on
-    /// (ACTLR_EL1 bit 1), FP/SIMD untrapped, virtual timer off. ASID 0.
-    pub(crate) fn enter_resident(&self, window: usize, tcr: u64) -> Result<()> {
-        self.enter_resident_with_asid(window, tcr, 0)
-    }
-    /// [`Self::enter_resident`] with the owner's tables tagged `asid` (TTBR0_EL1[63:48]; 8-bit ASIDs).
+    /// window's lower private root tagged `asid` (TTBR0_EL1[63:48]; 8-bit ASIDs), x1 = TCR_EL1, x2 = MAIR_EL1; MMU
+    /// off, TSO on (ACTLR_EL1 bit 1), FP/SIMD untrapped, virtual timer off.
     pub(crate) fn enter_resident_with_asid(&self, window: usize, tcr: u64, asid: u8) -> Result<()> {
         let base = IPA + window as u64;
         self.set_reg(PC, base)?;
@@ -213,15 +198,6 @@ impl Vcpu {
         self.set_sys(ACTLR_EL1, 2)?;
         self.set_sys(CPACR_EL1, 3 << 20)?;
         self.set_sys(CNTV_CTL_EL0, 0)
-    }
-    /// Runs until the next exit and returns its HVC immediate; any other exit is
-    /// an error reporting the exit and PC.
-    pub(crate) fn run_to_hvc(&self) -> Result<u64> {
-        match self.run_until_exit()? {
-            Exit::Hvc(immediate) => Ok(immediate),
-            Exit::Cancelled => Err("vCPU exit requested by the host".into()),
-            Exit::Stage2 { syndrome, ipa } => Err(self.unexpected(1, syndrome, ipa)),
-        }
     }
     /// Runs until the next exit: an HVC, a forced exit ([`exit_vcpus`]) or a stage-2 data abort (EC 0x24); any
     /// other exit is an error reporting the exit and PC.
@@ -257,27 +233,6 @@ impl Drop for Vcpu {
         if self.alive {
             self.destroy();
         }
-    }
-}
-
-/// A one-vCPU machine over window 0. Fields drop in teardown order: the vCPU,
-/// then the VM, then the backing.
-pub(crate) struct Vm {
-    pub(crate) cpu: Vcpu,
-    _machine: Machine,
-    pub(crate) memory: Memory,
-}
-impl Vm {
-    pub(crate) fn new(memory: Memory) -> Result<Self> {
-        let machine = Machine::create(&memory)?;
-        Ok(Self {
-            cpu: Vcpu::create()?,
-            _machine: machine,
-            memory,
-        })
-    }
-    pub(crate) fn shared(&self) -> Shared {
-        self.memory.read_record(SHARED_OFFSET)
     }
 }
 

@@ -22,6 +22,7 @@ pub(crate) struct Memory(pub(crate) *mut u8, pub(crate) usize);
 // touch their own vCPU's records, and areas shared between vCPUs only through atomics.
 unsafe impl Sync for Memory {}
 impl Memory {
+    #[cfg(test)]
     pub(crate) fn new() -> Result<Self> {
         Self::with_size(RAM_SIZE)
     }
@@ -294,35 +295,6 @@ pub(crate) fn map_private(memory: &Memory, window: usize, spans: &[Span]) {
     }
 }
 
-/// Single-owner resident tables in window 0: guest data and source pages are
-/// shadowed at start; `upper` pre-links the upper shadow window.
-pub(crate) fn single_owner_space(memory: &Memory, upper: bool) {
-    let source = (
-        natemu_abi::translation::SOURCE_VA,
-        natemu_abi::recovery::SOURCE_OFFSET,
-    );
-    let shadows: &[_] = if upper {
-        &[source]
-    } else {
-        &[(DATA_VA, DATA_OFFSET), source]
-    };
-    private_space(memory, 0, &single_owner_spans(), shadows, upper);
-}
-/// Private spans of a single-owner resident in window 0.
-pub(crate) fn single_owner_spans() -> Vec<Span> {
-    let mut spans = resident_text(0);
-    spans.push(Span::text(CODE_OFFSET, 4096, CODE_OFFSET));
-    for (offset, bytes) in [
-        (SHARED_OFFSET, 0x8000),
-        (BANK_OFFSET, 0x2000),
-        (0x50000, 0x4000),
-        (0x60000, 0x4000),
-        (DATA_OFFSET, 0x14000),
-    ] {
-        spans.push(Span::data(offset, bytes, offset));
-    }
-    spans
-}
 /// The resident's boot and extended text in window `window`.
 pub(crate) fn resident_text(window: usize) -> Vec<Span> {
     let text = |offset, end| Span::text(offset, end - offset, window + offset);
@@ -420,7 +392,9 @@ mod tests {
     #[test]
     fn private_resident_mapping_has_no_executable_gap() {
         let memory = Memory::new().unwrap();
-        private_space(&memory, 0, &single_owner_spans(), &[], false);
+        let mut spans = resident_text(0);
+        spans.push(Span::data(SHARED_OFFSET, 0x8000, SHARED_OFFSET));
+        private_space(&memory, 0, &spans, &[], false);
         let leaf = |offset| u64::from_le_bytes(memory.read::<8>(0x14000 + offset / 4096 * 8));
         for offset in (0..RAM_SIZE).step_by(4096) {
             let pte = leaf(offset);
@@ -428,7 +402,7 @@ mod tests {
                 assert_eq!(pte, (IPA + offset as u64) | PAGE | 1 << 7);
             } else if (resident::BOOT_END..0x10000).contains(&offset) {
                 assert_eq!(pte, 0);
-            } else if pte != 0 && offset != CODE_OFFSET {
+            } else if pte != 0 {
                 assert_eq!(pte & (3 << 53), 3 << 53);
             }
         }

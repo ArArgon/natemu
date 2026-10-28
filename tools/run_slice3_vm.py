@@ -38,7 +38,7 @@ sb, sb-mfence, sb-xchg, mp, lb, wrc, iriw, 2+2W and XCHG chains, each generalise
 their locations aligned, unaligned inside a 16-byte block, or (`split`, `split-hi`) each crossing a page (every store to it
 takes the split-store service; exchanged locations stay aligned; the changing byte is on the first page for `split`, on the
 second for `split-hi`, so both halves of a split store are observed), R runs of K iterations per cell. Every iteration's outcome
-must be in tools/i4v_ordering_model.py's allowed set for that program (the model enumerates it; nothing is written per
+must be in tools/models/ordering_model.py's allowed set for that program (the model enumerates it; nothing is written per
 test), and an XCHG chain's outcome must also be one linear order of the exchanges (`check_xchg_chain`). Every vCPU
 reaches its end having done all K iterations. `--control drop-fence` runs sb-mfence without its MFENCEs, judged
 against sb-mfence's allowed set: it must show the forbidden SB outcome (the harness can see a violation); its run diffs and
@@ -59,8 +59,8 @@ every vCPU M times (mostly while it is in the host or the resident) and adds the
 
 `system` (S3c1, long-mode system instructions as resident transactions): see cmd_system. Each system program of
 tools/bench/smp/system.json runs at block sizes default and 1 against QEMU system mode (smp.SYSTEM_CPU), except the PTE
-change without INVLPG (i4v_coherence_model) and the fault cases (tools/system_fault_model.py at QEMU's state just before
-the instruction; i4v_modes_model where it covers them; QEMU's own outcome is reported and must agree where it raises an
+change without INVLPG (coherence_model) and the fault cases (tools/system_fault_model.py at QEMU's state just before
+the instruction; modes_model where it covers them; QEMU's own outcome is reported and must agree where it raises an
 exception); refused forms stop `unsupported_system`; a tampered system reply stops `bad_reply`.
 
 `coherence` (S3d, cross-vCPU code coherence): the programs of tools/bench/smp/coherence.json (`programs.coherence_all`:
@@ -87,7 +87,10 @@ and destroyed, the VM destroyed (status 0) and no child process left (no compile
 followed at once by a fresh process running fixture programs on as many vCPUs, which must match QEMU. (1, 4) Every
 run-time tamper of the driver (forged header, link-point offset, next-page reply given twice, system decode, linked word,
 literal and record before a flush, forged stop PC, access sites off the instruction grid or of the wrong kind) on each vCPU v at N = 1..4, the others in linked loops: v halts with
-its defence's stop (bad_link, bad_reply, bad_stop, unknown_abort, site_mismatch), the others are cancelled, exit 0. (2) A peer that never answers a
+its defence's stop (bad_link, bad_reply, bad_stop, unknown_abort, site_mismatch) with its FEX frame intact and its banked
+state at a block boundary the run reached (the system, site and site-kind tampers: the unchanged start state, rip
+0x100000 and every GPR 0), the others are cancelled, exit 0. A run that outlives its bound by 5 s is killed and fails.
+(2) A peer that never answers a
 shootdown (`--ignore-kicks` on vCPU k = 1..3 of 4: its stops resume without the gate, so it never drains, while a host
 kicker keeps it exiting every millisecond): vCPU 0, waiting in the resident for k's shadow reset, is stopped by its
 watchdog, reported `resident` with k's `SHADOWS` request still pending; k is cancelled; an untampered control matches QEMU
@@ -102,7 +105,7 @@ programs with sustained cross-vCPU code writes (`mutual`, `data`, `rewrite`, `st
 translates their page (`finish`, `finish-late`), as `coherence` (QEMU reference, block sizes default and 1).
 
 Writes DIR/<mode>.json; exit status 1 on any failure."""
-import argparse, collections, concurrent.futures as cf, json, os, pathlib, random, subprocess, sys
+import argparse, collections, concurrent.futures as cf, json, os, pathlib, random, re, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
@@ -110,11 +113,17 @@ sys.path.insert(0, str(ROOT / 'tools' / 'bench' / 'smp'))
 import ref, run_slice1_vm as vm, run_slice1_faults as faults, smp, model_smp, programs  # noqa: E402
 
 
-def driver(host, runtime, fexc, text, work, extra=()):
-    """Runs one description; (returncode, stdout JSON or None, stderr)."""
+def driver(host, runtime, fexc, text, work, extra=(), timeout=None):
+    """Runs one description; (returncode, stdout JSON or None, stderr). A run still going after `timeout` seconds is
+    killed: returncode 'timeout'."""
     work.mkdir(parents=True, exist_ok=True)
     (work / 'program.txt').write_text(text)
-    run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work, *map(str, extra)], capture_output=True, text=True)
+    try:
+        run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work, *map(str, extra)],
+                             capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        err = e.stderr.decode(errors='replace') if isinstance(e.stderr, bytes) else e.stderr or ''
+        return 'timeout', None, f'killed after {timeout} s; stderr: {err[-1800:]}'
     out = json.loads(run.stdout) if run.returncode == 0 else None
     return run.returncode, out, run.stderr[-2000:]
 
@@ -279,7 +288,7 @@ def cmd_smp(a, host, runtime):
 
 
 def cmd_litmus(a, host, runtime):
-    import i4v_ordering_model as model
+    from models import ordering_model as model
     control = a.control == 'drop-fence'
     families = ['sb-mfence'] if control else a.families or list(programs.FAMILIES)
     # The control refuses the split variants: a split store completes in the resident with `dsb ish`, so SB cannot relax there.
@@ -475,7 +484,7 @@ def vm_fault(cpu):
 
 def qemu_fault(f):
     """QEMU's fault record, with one declared correction: pinned QEMU reports a reserved-bit #PF (RSVD) with P = 0; the
-    SDM (vol. 3 §4.7: the entry is present) and i4v_coherence_model.walk (`fault(9)`) have P = 1."""
+    SDM (vol. 3 §4.7: the entry is present) and coherence_model.walk (`fault(9)`) have P = 1."""
     return f and (f[0], f[1] | 1 if f[0] == 14 and f[1] & 8 else f[1], *f[2:])
 
 
@@ -488,8 +497,9 @@ def vm_state(prog, out):
 
 def either_check(prog, out):
     """The PTE change without INVLPG (`sys-pte-no-invlpg`): each CPU's second read of V (r8) and V's final PTE in table A
-    must be one of i4v_coherence_model's permitted histories (cached translation, or a fresh walk) after its first read."""
-    import programs, i4v_coherence_model as cm
+    must be one of coherence_model's permitted histories (cached translation, or a fresh walk) after its first read."""
+    import programs
+    from models import coherence_model as cm
     problems = []
     memory = {smp.num(r['addr']): smp.region_bytes(r) for r in prog['memory']}
     for i, cpu in enumerate(out['cpus']):
@@ -526,9 +536,10 @@ def unsupported_cases():
 
 def cmd_system(a, host, runtime):
     """S3c1: system programs (tools/bench/smp/system.json) against QEMU system mode; fault cases against
-    tools/system_fault_model.py at the state QEMU reaches just before the instruction (and i4v_modes_model where it covers
-    them); the PTE change without INVLPG against i4v_coherence_model; refusals of unimplemented forms."""
-    import system_fault_model as sfm, i4v_modes_model as modes
+    tools/system_fault_model.py at the state QEMU reaches just before the instruction (and modes_model where it covers
+    them); the PTE change without INVLPG against coherence_model; refusals of unimplemented forms."""
+    import system_fault_model as sfm
+    from models import modes_model as modes
     programs = [p for p in json.loads((ROOT / 'tools/bench/smp/system.json').read_text()) if not a.programs or any(n in p['name'] for n in a.programs)]
     stub = smp.build_stub(a.out / 'qemu-build')
     report, failures = [], []
@@ -568,7 +579,7 @@ def cmd_system(a, host, runtime):
             last = modes.model(model_profile, 0, modes.data(model_profile, [0] * 0x400))['records'][-1]
             entry['modes_model'] = (model_profile, last['vector'])
             if last['vector'] != want['cpus'][0]['fault'][0]:
-                failures.append(f"{name}: i4v_modes_model profile {model_profile} gives vector {last['vector']}")
+                failures.append(f"{name}: modes_model profile {model_profile} gives vector {last['vector']}")
         for limit in ([], [1]):
             rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f"{name}{'-1' if limit else ''}", limit)
             if rc:
@@ -661,7 +672,7 @@ def cmd_sharedpt(a, host, runtime):
     sizes default and 1. Every CPU must reach its end (no halt, no watchdog); the final memory (captured regions: the PTE
     bytes, the data pages, the flags) equals pinned QEMU system mode's (registers hold schedule-dependent counters and are
     not compared); the CPUs' logged observations and the PTE bytes are judged by sharedpt.judge against
-    tools/i4v_coherence_model.py. Reports how often each history was seen."""
+    tools/models/coherence_model.py. Reports how often each history was seen."""
     import sharedpt
     failures, report = [], []
     stub = smp.build_stub(a.out / 'qemu-build')
@@ -711,6 +722,7 @@ def cmd_sharedpt(a, host, runtime):
 # ---- contain (S3h): containment and progress --------------------------------------------------------------------------
 LOOP = 'rip 0x100000\nbody 0x100000 ebfe\n'          # jmp $: a linked loop with no exit, in its own space
 TEARDOWN = 'teardown: vcpus {n} joined {n} destroyed {n} vm_destroy 0 children none'
+SLACK = 5                                             # seconds a contain run may outlive its bound before it is killed
 
 
 def chain_section(count=600, trips=3):
@@ -734,6 +746,26 @@ def tamper_kinds(fixture):
             ('site-kind', ['--tamper', 'site-kind'], load, 'site_mismatch'),
             *[(k, flush + ['--tamper', k], chain_section(), 'bad_link') for k in ('word', 'literal', 'record')],
             ('forge-stop', ['--kicks', 1, '--forge-stop'], LOOP, 'bad_stop')]
+
+
+# Tampers whose section is a single instruction at 0x100000 with all GPRs 0, halted before anything of it ran.
+AT_START = ('site', 'site-kind', 'system')
+
+
+def halted_state(name, section, cpu):
+    """The tampered vCPU's banked state (contracts 56, 58: a defence halts before any effect, nothing fabricated): the
+    FEX frame intact; for AT_START tampers the start state (rip 0x100000, every GPR 0), for the others a block boundary
+    the run reached: the entry of a block it translated, or the section's end (a forged header halts the linker at the
+    exit of the block before it)."""
+    problems = [] if cpu['frame_intact'] else ['FEX frame changed']
+    rip = smp.num(cpu['rip'])
+    end = 0x100000 + len(re.search(r'(?:code|body 0x100000) ([0-9a-f]+)', section).group(1)) // 2
+    if name in AT_START:
+        if rip != 0x100000 or any(smp.num(g) for g in cpu['gpr']):
+            problems.append(f"banked rip {cpu['rip']} gpr {cpu['gpr']}, want rip 0x100000 and every GPR 0")
+    elif rip not in {smp.num(r) for r in cpu['block_rips']} | {end}:
+        problems.append(f"banked rip {cpu['rip']} is no block boundary of the run ({len(cpu['block_rips'])} blocks, end {end:#x})")
+    return problems
 
 
 def unacked_program(n, k):
@@ -766,9 +798,10 @@ def cmd_contain(a, host, runtime):
     report, failures, fresh_runs = {k: [] for k in ('tamper', 'unacked', 'compiler', 'stall', 'spin', 'legit', 'fresh')}, [], [0]
     wd = a.watchdog_ms
 
-    def run(label, text, extra):
+    def run(label, text, extra, bound):
+        """One process, killed if it outlives its bound by SLACK seconds (a hang is then a diff, not a stuck harness)."""
         t = time.monotonic()
-        rc, out, err = driver(host, runtime, a.fexc, text, a.out / 'work' / label, extra)
+        rc, out, err = driver(host, runtime, a.fexc, text, a.out / 'work' / label, extra, timeout=bound + SLACK)
         return rc, out, err, time.monotonic() - t
 
     def teardown(n, err):
@@ -778,7 +811,7 @@ def cmd_contain(a, host, runtime):
         """A fresh process right after a failure: n fixture programs (rotated) on n vCPUs, each must match QEMU."""
         i = fresh_runs[0]; fresh_runs[0] += 1
         ps = [fixtures[(i * 4 + v) % len(fixtures)] for v in range(n)]
-        rc, out, err, secs = run(f'fresh-{after}', ''.join('cpu\n' + vm.description(p) for p in ps), [])
+        rc, out, err, secs = run(f'fresh-{after}', ''.join('cpu\n' + vm.description(p) for p in ps), [], 10)
         diffs = [f'driver exit {rc}: {err.strip()[-300:]}'] if rc else []
         for v, p in enumerate(ps if not rc else []):
             outcome, d = vm.evaluate(p, expected[p['name']], out['cpus'][v])
@@ -804,10 +837,11 @@ def cmd_contain(a, host, runtime):
                 text = ''.join('cpu\n' + (section if w == v else LOOP) for w in range(n))
                 kick = ['--kick-vcpu', v] if name == 'forge-stop' else []
                 label = f'{name}-n{n}-v{v}'
-                rc, out, err, secs = run(label, text, extra + kick + ['--tamper-vcpu', v])
+                rc, out, err, secs = run(label, text, extra + kick + ['--tamper-vcpu', v], 10)
                 want = [('resident', reason) if w == v else ('cancelled', '') for w in range(n)]
                 stops, diffs = judge(n, rc, out, err, secs, want, 10)
                 if out and name != 'forge-header' and not out['cpus'][v]['tampered']: diffs.append('not tampered')
+                if out: diffs += halted_state(name, section, out['cpus'][v])
                 diffs += fresh(n, label)
                 report['tamper'].append({'label': label, 'stops': stops, 'seconds': round(secs, 2), 'diffs': diffs})
                 print(f"{label}: {'ok' if not diffs else 'FAIL ' + '; '.join(diffs)[:300]} ({secs:.2f} s)", flush=True)
@@ -820,7 +854,7 @@ def cmd_contain(a, host, runtime):
         kicks = ['--kick-vcpu', k, '--kicks', 100_000, '--kick-every-us', 1000, '--watchdog-ms', wd]
         if k == 1:
             want = qemu_reference(prog, a.out / 'qemu' / prog['name'])
-            rc, out, err, secs = run('unacked-control', smp_description(prog), kicks)
+            rc, out, err, secs = run('unacked-control', smp_description(prog), kicks, wd / 1000 + 5)
             diffs = [f'driver exit {rc}: {err.strip()[-300:]}'] if rc else judge_smp(prog, want, out, [None] * 4)
             if out and out['cpus'][0]['stats']['shootdowns'] < 1: diffs.append('vCPU 0 shot nothing down')
             diffs += teardown(4, err)
@@ -828,7 +862,7 @@ def cmd_contain(a, host, runtime):
             print(f"unacked control: {'ok' if not diffs else 'FAIL ' + '; '.join(diffs)[:300]}", flush=True)
             failures += [f'unacked control: {d}' for d in diffs]
         label = f'unacked-v{k}'
-        rc, out, err, secs = run(label, smp_description(prog), kicks + ['--ignore-kicks', '--tamper-vcpu', k])
+        rc, out, err, secs = run(label, smp_description(prog), kicks + ['--ignore-kicks', '--tamper-vcpu', k], wd / 1000 + 5)
         want = [('watchdog', 'resident pc=') if w == 0 else ('cancelled', '') if w == k else ('reached', '') for w in range(4)]
         stops, diffs = judge(4, rc, out, err, secs, want, wd / 1000 + 5)
         if stops and f'shadows_asked=[{k}]' not in stops[0][1]: diffs.append(f'vCPU {k} not named as the peer asked')
@@ -842,7 +876,7 @@ def cmd_contain(a, host, runtime):
     for k in (1, 2, 3):
         label = f'compiler-v{k}'
         text = ''.join('cpu\n' + (chain_section() if w == k else LOOP) for w in range(4))
-        rc, out, err, secs = run(label, text, ['1', '--kill-compiler', 50, '--tamper-vcpu', k])
+        rc, out, err, secs = run(label, text, ['1', '--kill-compiler', 50, '--tamper-vcpu', k], 10)
         diffs = [] if rc == 1 and out is None else [f'driver exit {rc}, want 1']
         if f'owner {k}: fexc --serve (pid' not in err or 'signal: 9' not in err: diffs.append(f'cause not named: {err.strip()[-300:]}')
         diffs += teardown(4, err) + ([f'took {secs:.1f} s'] if secs > 10 else [])
@@ -857,7 +891,7 @@ def cmd_contain(a, host, runtime):
     for k in (1, 2, 3):
         label = f'stall-v{k}'
         text = ''.join('cpu\n' + (chain_section() if w == k else LOOP) for w in range(4))
-        rc, out, err, secs = run(label, text, ['1', '--stall-compiler', 50, '--tamper-vcpu', k, '--compile-deadline-ms', cd])
+        rc, out, err, secs = run(label, text, ['1', '--stall-compiler', 50, '--tamper-vcpu', k, '--compile-deadline-ms', cd], cd / 1000 + 5)
         diffs = [] if rc == 1 and out is None else [f'driver exit {rc}, want 1']
         if f'owner {k}: fexc --serve (pid' not in err or f'no reply within {cd / 1000:g}s' not in err or 'signal: 9' not in err:
             diffs.append(f'cause not named: {err.strip()[-300:]}')
@@ -872,7 +906,7 @@ def cmd_contain(a, host, runtime):
         label = f'spin-v{v}'
         ps = [fixtures[(v + w) % len(fixtures)] for w in range(4)]
         text = ''.join('cpu\n' + (LOOP if w == v else vm.description(ps[w])) for w in range(4))
-        rc, out, err, secs = run(label, text, ['--watchdog-ms', wd])
+        rc, out, err, secs = run(label, text, ['--watchdog-ms', wd], wd / 1000 + 5)
         want = [('watchdog', 'guest pc=') if w == v else ('reached', '') for w in range(4)]
         stops, diffs = judge(4, rc, out, err, secs, want, wd / 1000 + 5)
         for w in range(4 if out else 0):
@@ -886,7 +920,7 @@ def cmd_contain(a, host, runtime):
     # the default budget the same program reaches its end on both vCPUs.
     prog = spin_program(a.spin_iterations)
     for budget, ok_stop in ((300, 'watchdog'), (10_000, 'reached')):
-        rc, out, err, secs = run(f'legit-{budget}', smp_description(prog), ['--watchdog-ms', budget])
+        rc, out, err, secs = run(f'legit-{budget}', smp_description(prog), ['--watchdog-ms', budget], budget / 1000 + 5)
         stops = [(c['stop'], c['reason']) for c in out['cpus']] if out else None
         diffs = [f'driver exit {rc}: {err.strip()[-300:]}'] if rc else []
         if ok_stop == 'reached' and stops != [('reached', '')] * 2: diffs.append(f'stops {stops}')

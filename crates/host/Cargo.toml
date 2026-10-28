@@ -5,4 +5,4 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-natemu-abi = { path = "../abi", features = ["families"] }
+natemu-abi = { path = "../abi" }

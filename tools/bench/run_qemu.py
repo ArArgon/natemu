@@ -143,9 +143,9 @@ def run_user(out, benches, mults, ns, reps, models, log):
     return res, insn_check
 
 def bb_pins():
-    import run_i4v_qemu as old; return old.PINS
+    import ref; return ref.PINS
 def bb_image():
-    import run_i4v_qemu as old; return old.IMAGE
+    import ref; return ref.IMAGE
 
 
 def stats(vals):

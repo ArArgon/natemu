@@ -6,10 +6,9 @@ from pathlib import Path
 
 here = Path(__file__).resolve().parent
 repo = here.parent.parent
-sys.path.insert(0, str(repo / 'tools/i4v_producer'))
 sys.path.insert(0, str(here))
 import check_sites
-from export import CASES  # existing pinned bodies, used only as sample inputs
+CASES = json.loads((here / 'producer_bodies.json').read_text())['cases']  # pinned bodies, used only as sample inputs
 
 fexc, out = sys.argv[1], Path(sys.argv[2])
 out.mkdir(parents=True, exist_ok=True)

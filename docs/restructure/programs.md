@@ -6,6 +6,14 @@ Later change (S3a2, October 27, 2026): the I1–I3, address and stack cells, the
 are deleted; [slice3-contract.md](slice3-contract.md#s3a2-covering-and-deleting-the-i1i3-address-and-stack-paths) maps
 each of their checks to a general-path check or a retirement reason. References below stay as of `577a7f2`.
 
+Later change (S3i, October 28, 2026): every runner, checker, worker, producer and fixture named below
+(`run_i1.py`, `run_i4v.py`, `run_i4v_qemu.py`, `check_i*.py`, `i4v_*.py`, the workers, `tools/i4v_producer`,
+`tools/i4v_qemu`, `fixtures/i1`, `fixtures/i4v`) and the runtime/abi regression families are deleted; none of them can
+be run. The four independent models moved to `tools/models/` (`ordering_model.py`, `coherence_model.py`,
+`pae_model.py`, `modes_model.py`). [slice3-contract.md](slice3-contract.md) §3, its S3a2 and S3h tables and §5 map
+each old check to a general-path check, a retirement reason (32-bit and paging-off families: owner decision 3,
+deferred to the boot phase) or a boot-phase item. References below stay as of `577a7f2`.
+
 ## 0. Scope, counting rules and mode glossary
 
 Scope: every x86 byte sequence that any runner, worker, oracle, fixture or QEMU comparison in `crates/`, `tools/` and `fixtures/` places in guest memory, hands to the FEX producer as source, or executes under QEMU. Excluded and listed in section 4: archived research under `experiments/`, decoder-only unit-test byte strings, and QEMU/NASM harness glue. Native AArch64 bodies (FEX output, `pressure_body.arm64`, runtime assembly) are not guest programs and are not inventoried. I1 `control` and `fault` cases run native NOP/UDF and contain no x86.

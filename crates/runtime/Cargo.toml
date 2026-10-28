@@ -12,7 +12,3 @@ name = "natemu-runtime"
 path = "src/main.rs"
 test = false
 bench = false
-
-[features]
-# Regression families for the I1–I4/I4-V runners; the default image is the general resident.
-families = ["natemu-abi/families"]

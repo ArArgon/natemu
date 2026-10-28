@@ -12,6 +12,14 @@ Later change (S3a2, October 27, 2026): the I1–I3, address and stack cells, the
 are deleted; [slice3-contract.md](slice3-contract.md#s3a2-covering-and-deleting-the-i1i3-address-and-stack-paths) maps
 each of their checks to a general-path check or a retirement reason. References below stay as of `577a7f2`.
 
+Later change (S3i, October 28, 2026): every runner, checker, worker, producer and fixture named below
+(`run_i1.py`, `run_i4v.py`, `run_i4v_qemu.py`, `check_i*.py`, `i4v_*.py`, the workers, `tools/i4v_producer`,
+`tools/i4v_qemu`, `fixtures/i1`, `fixtures/i4v`) and the runtime/abi regression families are deleted; none of them can
+be run. The four independent models moved to `tools/models/` (`ordering_model.py`, `coherence_model.py`,
+`pae_model.py`, `modes_model.py`). [slice3-contract.md](slice3-contract.md) §3, its S3a2 and S3h tables and §5 map
+each old check to a general-path check, a retirement reason (32-bit and paging-off families: owner decision 3,
+deferred to the boot phase) or a boot-phase item. References below stay as of `577a7f2`.
+
 Source state: working tree at commit `577a7f2`. The starting point is the accepted
 [I4-V contract-to-test matrix](../research/reviews/INV-03-01-i4v-coverage.md).
 Every runner, checker and model under `tools/` was read, plus

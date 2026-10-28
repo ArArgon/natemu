@@ -215,7 +215,7 @@ def cmd_selftest(a):
 
 def cmd_litmus(a):
     import programs
-    from i4v_ordering_model import enumerate_outcomes
+    from models.ordering_model import enumerate_outcomes
     out = pathlib.Path(a.out); out.mkdir(parents=True, exist_ok=True); manifest(out); stub = build_stub(out / 'build'); logf = open(out / 'litmus.log', 'a')
     def log(s): print(s, flush=True); logf.write(s + '\n'); logf.flush()
     allowed_cache, res = {}, {}

@@ -1,5 +1,5 @@
 """Shared guest page tables (S3f): generated system programs in which several CPUs run on ONE set of page tables, and the
-judges that hold their observations against tools/i4v_coherence_model.py (the independent translation/coherence model).
+judges that hold their observations against tools/models/coherence_model.py (the independent translation/coherence model).
 
 Every program loads the one table set TA on every CPU (CPL0, `system`), shares one code page, and ends by restoring the
 start-up controls. No expected result is written by hand: the programs log what each CPU saw (plain stores, a log area per
@@ -28,7 +28,7 @@ import collections, itertools, pathlib, random, sys
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent)); sys.path.insert(0, str(HERE.parent.parent))
 import programs as P, smp
-import i4v_coherence_model as cm
+from models import coherence_model as cm
 
 TA = P.SYS_T(0, 0)                  # the one table set (identity map of 0..4 MiB, 4 KiB pages; PML4 TA, PDPT +0x1000, PD +0x2000, PT0 +0x3000, PT1 +0x4000)
 D0 = P.SYS_D(0)                     # data area 0x280000..0x2c0000 (inside the leaf slice sys_tables provides)
