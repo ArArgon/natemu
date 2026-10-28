@@ -225,6 +225,16 @@ guest RAM such as disk DMA, which today stop all vCPUs and flush everything) inv
 programs switching between address spaces keep their translations (counted), while remapped or rewritten code is
 always re-translated, at 1–4 vCPUs. Privilege level: a follow-up study (EL0 without the address guard) is running;
 EL1 stays until the owner decides on its evidence.
+**Owner decision (October 28): adopt hardware-only checking first.** Translated code runs at EL0 and touches no
+emulator data; every non-canonical access faults in hardware and becomes an exact #GP/#SS; the address guard goes and
+admission's code-shape rules become a debug option (object validation stays). Evidence: `experiments/track03/el0-study/`
+(follow-up and independent review). Order: (E1) frame-free code at EL1t with the guard on — exits via `svc`, division
+via `svc`, no header store, pre-NZCV in a dead temporary (not x28), stop as `bl` to a per-vCPU execute-only pad stopped
+by removing X at stage 2, lookup table as code (measure fill/clear cost); (E2) switch to EL0 (page roles, lower-EL
+vectors, EC 0x24/0x20 stop exits); (E3) remove the guard, negative #GP/#SS tests for every former window address and
+both straddles, split admission; (E4) full suites and independent review. x28 stays FEX's state base. Guest state FEX
+keeps in memory (DF, FS/GS bases, MXCSR, x87, AVX upper halves): owner asked for a survey of existing solutions before
+choosing (registers, traps/specialised snippets, a guest-state page, hardware permission features).
 
 **Decided from evidence (recorded, not questions):** guest RAM default 2 GiB, tests choose their own size (M69);
 INIT/SIPI deferred, unused with the mailbox (`K kernel/smpboot.c:877-928`; M64 keeps the definition); legacy devices
