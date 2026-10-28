@@ -445,6 +445,10 @@ fn serve(vm: &Vm, compiler: &mut Compiler, stop_at: Option<u64>, requests: &mut 
                 });
             }
         };
+        // A step reply is exactly one instruction (the resident refuses anything else too).
+        if step && (block.guest_insns != 1 || block.guest_bytes > 15) {
+            return Err(format!("step at {rip:#x}: {} instructions, {} bytes", block.guest_insns, block.guest_bytes));
+        }
         vm.memory.copy(exec::STAGING_OFFSET, &block.object);
         if !step {
             requests.blocks += 1;

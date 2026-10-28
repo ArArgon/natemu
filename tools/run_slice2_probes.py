@@ -179,13 +179,20 @@ SMC = [
     # Data on the loop's own code page, written every iteration (the known cliff: a step and a recompile each time).
     ('smc-data-loop', f'mov esi, {CODE + 0x800:#x}\nmov ecx, 50\n1: add qword ptr [rsi], rcx\nadd rax, rcx\ndec ecx\njnz 1b',
      [{'addr': CODE + 0x800, 'data': '00' * 8}]),
+    # A byte of the running loop body incremented by itself four times, then read back as data (movzx).
+    ('smc-self-inc', 'mov ecx, 4\n1: add byte ptr [rip + 1b + 6], 1\ndec ecx\njnz 1b\nmovzx eax, byte ptr [rip + 1b + 6]', []),
+    # A function straddling CODE + 0x1000 (its `add rax, 1` on the second page), patched from a third page on each call.
+    ('smc-span-other-p2', 'mov ecx, 3\n1: call g\njmp far\nback: dec ecx\njnz 1b\njmp 2f\n.org 0xff8, 0xcc\n'
+                          'g: nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nadd rax, 1\nret\n.org 0x2100, 0xcc\n'
+                          'far: mov byte ptr [rip + g + 11], cl\njmp back\n2:', [{'addr': STACK, 'data': '00' * 0x1000}]),
 ]
+# Every SMC probe ends by copying its own final bytes (the code as it stands then) into this region, which is compared.
+CODE_COPY = 0x180000
 
 
 def writable_code(program):
     """Memory regions holding the program's own code bytes on each code page no region of the program touches: they make
-    those pages writable in the VM (the driver maps a page with a region writable, executable if code is on it; a second
-    region on a code page would make it non-executable)."""
+    those pages writable in the VM (the driver maps a page with a region writable, and executable if code is on it)."""
     rip, code = ref.num(program['rip']), bytes.fromhex(program['code'])
     touched = {a >> 12 for m in program['memory'] for a in range(ref.num(m['addr']), ref.num(m['addr']) + len(m['data']) // 2)}
     pages = sorted({a >> 12 for a in range(rip, rip + len(code))} - touched)
@@ -202,7 +209,12 @@ def smc_programs():
         program = {'name': name, 'code': code.hex(), 'rip': rip, 'gpr': gpr, 'rflags': 0, 'memory': memory}
         out.append((program, {**program, 'insns': [{'op': 'mov', 'width': 64}]}, expected))
     for name, text, memory in SMC:
-        add(name, ref.assemble(text), CODE, memory, gprs(rsp=STACK + 0x800), {})
+        # r8..r12 are scratch (equal in both runs); `loop` and `lea` leave the flags alone.
+        size = (len(ref.assemble(text)) + 7) // 8 * 8
+        tail = (f'\nmov r12, rcx\nlea r8, [rip + Lcode]\nmov r9, {CODE_COPY:#x}\nmov ecx, {size // 8}\n'
+                'Lcopy: mov r10, qword ptr [r8]\nmov qword ptr [r9], r10\nlea r8, [r8 + 8]\nlea r9, [r9 + 8]\nloop Lcopy\nmov rcx, r12')
+        add(name, ref.assemble('Lcode:\n' + text + tail), CODE, memory + [{'addr': CODE_COPY, 'data': '00' * size}],
+            gprs(rsp=STACK + 0x800), {})
     for test in sorted(FEX_SMC.glob('*.asm')):
         source = test.read_text()
         config = json.loads(source.split('%ifdef CONFIG', 1)[1].split('%endif', 1)[0])

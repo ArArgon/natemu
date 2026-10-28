@@ -475,6 +475,18 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
         if spsr & 15 != 4 {
             halt(s, stop::SITE_MISMATCH)
         }
+        // The syndrome must be the class this site's kind produces, before anything is taken or stepped (a malformed
+        // abort stops here): BRK from AArch64 with the stub's immediate (1 guard, 2 split, 3 divide), else a data
+        // abort from EL1 (access_aborted checks the rest).
+        let expected = match site.kind {
+            object::kind::GUARD => (0x3c, 1),
+            object::kind::SPLIT => (0x3c, 2),
+            object::kind::DIVIDE => (0x3c, 3),
+            _ => (0x25, esr & 0xffff),
+        };
+        if (esr >> 26, esr & 0xffff) != expected {
+            halt(s, stop::SITE_MISMATCH)
+        }
         // Invalidations queued while `b` ran (a resident entry takes them): if they dropped `b`, it must not run on.
         let generation = s.generation;
         take_invalidations(&mut s);
@@ -483,15 +495,6 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
         }
         match site.kind {
             object::kind::GUARD | object::kind::SPLIT | object::kind::DIVIDE => {
-                // BRK from AArch64 with the stub's immediate (1 guard, 2 split, 3 divide).
-                let imm = match site.kind {
-                    object::kind::GUARD => 1,
-                    object::kind::SPLIT => 2,
-                    _ => 3,
-                };
-                if esr >> 26 != 0x3c || esr & 0xffff != imm {
-                    halt(s, stop::SITE_MISMATCH)
-                }
                 match site.kind {
                     object::kind::GUARD => guest_fault(s, f, b, &site, noncanonical(&site)),
                     // #DE: no error code.

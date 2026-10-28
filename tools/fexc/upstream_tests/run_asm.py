@@ -11,8 +11,8 @@ Source/Tools/TestHarnessRunner, CommonTools/HarnessHelpers.h) and checked agains
   * Initial state: every GPR 0 (RSP too; tests set their own stack), RFLAGS 0x202 (reserved + IF, as FEX's thread init).
   * Memory: FEX maps 0xe0000000 (10 pages) and 0xe7fff000 (2 pages) for every test, plus the JSON `MemoryRegions`
     (base: size), plus the code pages, all RWX; page size 4 KiB. natemu: `region` lines (eager, zero-filled, writable, NX)
-    for the data ranges, and a `region` over the code pages so they are writable too (RWX as FEX; a store to a page a
-    running block came from stops with unsupported_smc). `MemoryData` bytes are decoded like parse_hexstring (each blank-
+    for the data ranges, and a `region` over the code pages so they are writable too (RWX as FEX; stores to translated
+    pages invalidate or single-step). `MemoryData` bytes are decoded like parse_hexstring (each blank-
     separated token is a little-endian number) and loaded as `memory` lines.
   * End: the first executed hlt (FEX's SIGSEGV handler accepts a fault only when the byte at RIP is hlt). natemu: fexc cuts
     the block at hlt (system_instruction), the driver stops there with the state banked, RIP = the hlt.
@@ -23,7 +23,7 @@ Source/Tools/TestHarnessRunner, CommonTools/HarnessHelpers.h) and checked agains
 Outcome per test:
   pass         ran to the hlt and every GPR/RIP expectation matches (vector expectations, if any, are separate: see below)
   unsupported  with a reason: an instruction outside the slice's allowlist (fexc unsupported_form / system_instruction at a
-               RIP before the hlt, with the instruction's mnemonic), self-modifying code (unsupported_smc), 32-bit mode,
+               RIP before the hlt, with the instruction's mnemonic), 32-bit mode,
                region beyond guest RAM, expectations on vector/x87/segment state natemu does not model (the GPR part had
                matched), ...
   fail         anything else: registers differ, a guest fault, the driver or nasm erred. Each is diagnosed by hand (see the
@@ -124,8 +124,6 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
             if s['stop'] == 'no_code':
                 # fexc's end reason; the instruction is the one at RIP
                 return {**rec, 'outcome': 'unsupported', 'reason': f"{s['reason']}: {rec.get('at', '?')}"}
-            if s['stop'] == 'resident' and s['reason'].startswith('unsupported_smc'):
-                return {**rec, 'outcome': 'unsupported', 'reason': 'self-modifying code (store to a translated page)'}
             return {**rec, 'outcome': 'fail', 'reason': 'did not reach hlt', 'detail': rec['stop'] + ' fault=' + json.dumps(s['fault'])}
         gpr = [int(v, 0) for v in s['gpr']]
         diffs = []

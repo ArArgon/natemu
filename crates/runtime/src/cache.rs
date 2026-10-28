@@ -180,7 +180,11 @@ pub fn place_step(
     links: [LinkPoint; MAX_LINK_POINTS],
 ) -> Option<&'static Block> {
     let sites = size_of::<Site>() * h.sites_count as usize;
-    if size_of::<Block>() + sites > area::STEP_RECORD_BYTES || h.code_size as usize > SLOT_BYTES {
+    if size_of::<Block>() + sites > area::STEP_RECORD_BYTES
+        || h.code_size as usize > SLOT_BYTES
+        || h.guest_insns != 1
+        || h.guest_bytes > 15
+    {
         return None;
     }
     let record = Block {

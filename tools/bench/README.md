@@ -13,6 +13,7 @@ column; image and QEMU hash are the ones `tools/reference/ref.py` pins). Results
 
 - `bodies/*.asm`, `benchmarks.json`: the benchmarks (bytes are authoritative; position independent; fall through at the end).
 - `stub.asm`: bare-metal boot stub. `model.c`: independent native model (final GPRs + exact dynamic instruction count).
+- `attribution/` (S2g): word classes per benchmark, native class-removed variants and array-size sweeps (see the last section).
 - `run_qemu.py` (harness), `lu_entry.py` (timing loop inside the container), `build_bench.py` (assemble, json, helpers).
 
 ## Benchmarks
@@ -101,9 +102,117 @@ October 27, 2026 (S2c, series8, default block size, 5 rounds, M4, not idle; `nat
 | branchy | 0.410 | 0.5 | 0.597 | 0.69 | six blocks, all edges linked |
 | mixed | 0.080 | 0.9 | 0.283 | 0.28 | one linked block |
 
-Guest RAM grew from 1 to 4 MiB for this (the 1 MiB array of mem64/mem4096 did not fit). Not attributed yet (S2g).
+Guest RAM grew from 1 to 4 MiB for this (the 1 MiB array of mem64/mem4096 did not fit). S2g re-measured and attributed these
+numbers (next section); its mem4096 findings supersede the explanation that stood here: the TLB-reach reading is not supported.
 
-Reading mem4096 (unproven without PMU access): about half of its cost is the access pattern itself, which is slow even
-natively (every access touches a new 4 KiB stride). The rest grows with the page count and is consistent with the VM's
-stage-1 TLB reach of 4 KiB guest pages against 16 KiB host pages, but no counter has confirmed this. Slope estimators
-differ between the two columns: QEMU's is a least-squares fit over N, 2N and 4N (the Method section), natemu's the N/2N pair.
+## Measurements and attribution (S2g, October 27, 2026)
+
+Measurement and attribution only; nothing was tuned, and the §5 optimisation list of the slice-2 contract stays deferred.
+
+**Setup.** M4 (4 P + 6 E cores), macOS 26.x, AC power, no thermal/performance warning recorded, series9 `fexc`, default block size.
+The commands were started from the agent's shell, so they ran at the default QoS (no command-line way to raise it to user-interactive;
+`taskpolicy` only clamps downwards) and macOS does not pin cores. The machine was not idle: other agents ran short jobs, load
+averages 1.5-2.7, CPU 83-96% idle at the start/end snapshots (a `top` sample at the start of the first natemu run read 83% idle;
+all others 94-96%; `host_start/host_end` in each `results.json`). Order, back to back, 7 rounds plus a discarded warm-up each:
+natemu (19:52), QEMU system TCG (19:55), natemu (19:56), QEMU (19:58). The linux-user column was not run (`--no-linux-user`).
+`results.json`, logs and the sweeps below are in `natemu-raw/s2g/`.
+
+**Steady state against QEMU system TCG** (mean of the two back-to-back pairs; each pair's own ratio was within 0.01 of it;
+spread = (max-min)/median of the 7 rounds, pair 1 / pair 2):
+
+| bench | natemu ns/insn | spread % | QEMU ns/insn | spread % | ratio | natemu ns/iter | natemu MIPS | target |
+|---|---|---|---|---|---|---|---|---|
+| int | 0.191 | 1.6 / 2.0 | 0.196 | 3.3 / 1.3 | 0.97 | 1.91 | 5,240 | <= 1.0: met |
+| mem64 | 0.0995 | 18.1 / 6.3 | 0.342 | 3.6 / 1.2 | 0.29 | 0.80 | 10,050 | <= 0.7: met |
+| mem4096 | 1.013 | 16.8 / 14.7 | 0.391 | 3.0 / 2.4 | 2.59 | 8.10 | 990 | none |
+| call | 0.157 | 3.3 / 2.2 | 0.759 | 14.8 / 6.0 | 0.21 | 1.72 | 6,380 | none |
+| branchy | 0.411 | 1.6 / 7.7 | 0.585 | 1.7 / 2.0 | 0.70 | 4.82 | 2,440 | none |
+| mixed | 0.080 | 2.7 / 1.9 | 0.280 | 3.4 / 1.3 | 0.29 | 1.04 | 12,460 | none |
+
+The mem64, mem4096 and one branchy spread exceed the 5% asked for in the QEMU baseline chunk (single slow rounds on a shared host);
+the medians of the two pairs agree within 2% for every benchmark. Counters at N
+and 2N were identical in every run (blocks, links, linked, compiles; only `fast` grows with N for `call`: one dispatcher hit per iteration).
+
+**Executed native words per iteration in the linked steady state** (counted from the series9 objects as the VM links them; the
+path of `branchy` is weighted by the model's branch outcomes; `call` includes the callee and the block after the call):
+
+| bench | guest insns/iter | native words/iter | per guest insn | FEX body (default profile) | slice-1 body extras | address guards | split checks | divide checks | link exits | prologue (header 2 + stop check 1) | dispatcher |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| int | 10 | 22 | 2.2 | 16 | 2 | 0 | 0 | 0 | 1 | 3 | 0 |
+| mem64, mem4096 | 8 | 28 | 3.5 | 12 | 3 | 6 | 3 | 0 | 1 | 3 | 0 |
+| mixed | 13 | 40 | 3.1 | 18 | 6 | 9 | 3 | 0 | 1 | 3 | 0 |
+| call | 11 | 54 + 12 = 66 | 6.0 | n/a | n/a | 12 | 6 | 0 | 2 | 9 | 15 (ret: 3 in the block, 12 in `dispatch_fast`) |
+| branchy | 11.75 | 33.2 | 2.8 | 18.2 | 1.0 | 0 | 0 | 0 | 3.5 | 10.5 | 0 |
+
+"FEX body" is the word count of the same block compiled by the default profile (`--no-tso --no-end-marker`, no checks), counted up
+to its first branch; "slice-1 extras" is the executed body minus that (for `int`, the two `mov x5, x4` before the shifts; the causes of
+the others were not analysed word by word). For `call` the default profile
+cuts blocks differently, so no split is given. None of the six benchmarks contains a divide, so divide checks are 0 words
+(they are exercised by the fault corpus, not measured here). QEMU's words (`-d out_asm`) were not counted in this pass.
+
+**Class-removed variants run natively outside the VM** (`attribution/build_native.py`): the linked blocks, patched exactly as the resident
+links them (the branch to the entry plus 4), are executed by a small harness with the frame (x28) and the dispatcher replicated; a
+class is removed by turning its words into `nop` (`noguard`, `nosplit`, `nochecks` = both, `nostop`, `noprologue` = header and stop
+words, `skip3` = links jump past the three prologue words, `nodisp` = the `ret` jumps straight to its one return site), or `fexonly`
+(the default-profile block with its in-block loop). Median over 8 pooled passes (two sweeps of 3 and 5 passes of 7 rounds,
+N and 2N slope; the second ran under more host load, so the base moved by up to 5%), delta against `base` in ns per iteration
+(negative = faster without the class). Deltas are not additive and below about 0.05 ns (5% of an `int` iteration) are noise:
+
+| bench | native base | VM (natemu) | noguard | nosplit | nochecks | nostop | noprologue | skip3 | nodisp | fexonly |
+|---|---|---|---|---|---|---|---|---|---|---|
+| int | 1.99 | 1.91 | +0.04 | +0.03 | +0.03 | -0.02 | -0.06 | -0.02 | - | -0.10 |
+| mem64 | 0.79 | 0.80 | -0.05 | -0.05 | -0.05 | +0.00 | +0.02 | +0.01 | - | -0.13 |
+| mixed | 1.02 | 1.04 | -0.01 | -0.01 | -0.01 | +0.01 | -0.01 | +0.01 | - | -0.03 |
+| call | 1.87 | 1.72 | -0.11 | -0.12 | -0.14 | -0.15 | -0.14 | -0.10 | -0.38 | - |
+| branchy | 5.07 | 4.82 | - | - | - | +0.15 | +0.09 | +0.09 | - | - |
+| mem4096 | 4.55 | 8.10 | -0.04 | +0.15 | +0.02 | 0.00 | -0.85 | -0.32 | - | -0.91 |
+
+Reading (what the data supports, no more):
+
+- **int** (0.97x): the same hot block runs in the same 1.9 ns natively and in the VM, and removing any class changes it by at most 5%, within noise.
+  The iteration is a serial chain (add, shift, xor, shift, xor, multiply: about 8 cycles at 4 GHz = 1.9 ns), so 22 words cost nothing
+  on a wide core (inferred from the dependency chain; no PMU); neither natemu nor QEMU can go much below the chain, which is why the ratio sits near 1.
+- **mem64 / mixed** (0.29x): the VM equals native. Guards and split checks cost about 0.05 ns of 0.8 ns on mem64 (6% each, 6% together)
+  and nothing measurable on mixed; the whole slice-1 code against the default FEX block is 16% (mem64) and 3% (mixed).
+- **call** (0.21x): the dispatcher for `ret` (L1 hit, 15 words) costs 0.38 ns of 1.87 ns per iteration (20%), the largest single class;
+  the checks (6%-8% each) and the prologue are the rest of the removable cost. One L1 hit per iteration, never a miss. (The harness's base
+  read 1.73 ns in the quiet sweep, equal to the VM's 1.72; 1.87 is the pooled median including the loaded sweep.)
+- **branchy** (0.70x): 4.8 ns per iteration natively and in the VM, unchanged by removing the prologue; consistent with the two
+  data-dependent branches mispredicting about once per iteration (inferred from the model's branch outcomes; no PMU), not with
+  anything natemu adds.
+- **Everything but mem4096 equals the same blocks run natively**: once the loop is linked, nothing measurable of the VM (tables, EL1,
+  watchdog, host) is on the hot path.
+
+**mem4096.** Natively (no VM) the same blocks take 4.4-5.0 ns/iter and QEMU 3.1 ns, but natemu 8.1 ns. A sweep of the array size
+(power of two, pages of 4 KiB, wrap mask patched into the benchmark) at two strides isolates the cause (`attribution/vmvar.py` in
+the VM, `build_native.py` with `PAGES`/`STRIDE` natively; ns per iteration, median):
+
+| 4 KiB pages touched | 4 | 16 | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|---|
+| native, stride 4096 | 0.77 | 0.76 | 2.11 | 3.87 | 4.68 | 5.03 |
+| native, stride 4160 | 0.76 | 0.76 | 0.77 | 0.89 | 0.89 | 0.91 |
+| natemu, stride 4096 | 0.75 | 0.75 | 0.92 | 5.33 | 7.06 | 8.75 (7.3 in two earlier runs) |
+| natemu, stride 4160 | 0.77 | 0.77 | 0.73 | 0.89 | 0.86 | 1.07 |
+
+Stride 4160 (4096 + one cache line) touches the same number of distinct pages, so the same stage-1 TLB footprint, but is fast at every size.
+The slowdown follows the power-of-two stride (all accesses share the low 12 address bits: with an M4 P-core L1D of 128 KiB, 8-way,
+64-byte lines, assumed and not verified here, they use only 4 sets = 32 lines, and in-flight loads and stores alias on their low address bits),
+appears natively at the same size (the step at 32-64 pages = 32-64 lines), and is independent of the VM. Natively the stride is the whole of the 4.4-5.0 ns.
+The TLB-reach hypothesis (4 KiB guest pages against 16 KiB host pages) is therefore **not supported as the cause**: with a cache-friendly stride
+the 256-page footprint costs only +0.15 to +0.3 ns/iter in the VM (1.07 against 0.73-0.77), about 2-4% of the 8.1 ns. What is not explained is the
+extra 2.3-3.7 ns/iter the VM adds on top of native at stride 4096 (7.3-8.8 against 5.0 at 256 pages), and why QEMU, which has the
+same host-address aliasing, pays only 0.4 ns/iter more than for mem64. A TLB miss that compounds the already serialised L1 misses is a
+candidate for the first; a PMU (needs root: `kpc`) would settle it; unproven. The 3 prologue words (header and stop-check stores to the
+frame) cost 0.3-0.9 ns/iter of the native 4.4-5.0 only in this one benchmark (the stores contend with the miss-bound data stream; mechanism
+unproven).
+
+**Targets.** int 0.97x (<= 1.0) and the memory loop mem64 0.29x (<= 0.7): both reported as met on these numbers; the less
+favourable loop for natemu, mem4096, is 2.59x. Reproduce: `tools/bench/attribution/` (`words.py` classes, `sweep.py` class-removed variants,
+`vmvar.py` array-size sweeps; need `NATEMU_RAW_ROOT`, `cc`, `clang`).
+
+**Caveats.** Native deltas come from patched images that are checked only for their iteration count, not their results; the
+dispatcher in the harness is `dispatch_fast` with its two literal loads replaced by frame loads. The two native sweeps ran under
+different host load and CPU frequency (the harness's calibration read 2.9-3.9 GHz), so deltas under 0.05 ns/iter (about 5% of `int`,
+1% of `mem64`) are not resolved. Word counts are per iteration at the linked steady state, not per guest instruction retired. The spread
+targets (5%) were missed for mem64, mem4096 and one branchy pair. Compile cost, QEMU word counts, the linux-user column and PMU cycles were
+not measured.

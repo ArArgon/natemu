@@ -241,7 +241,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let p = parse(&fs::read_to_string(description).map_err(|e| e.to_string())?)?;
     // Code pages are read-only and executable; region pages writable and not executable.
     let mut flags = BTreeMap::new();
-    for page in page_span(p.rip, p.code.len()) {
+    let code_pages: Vec<u64> = page_span(p.rip, p.code.len()).collect();
+    for &page in &code_pages {
         flags.insert(page, 0);
     }
     let ranges = p.memory.iter().map(|(a, d)| (*a, d.len() as u64)).chain(p.regions.iter().copied());
@@ -250,8 +251,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             return Err("guest RAM exhausted".into());
         }
         for page in page_span(address, length as usize) {
-            let code = flags.get(&page) == Some(&0);
-            flags.insert(page, WRITABLE | if code { 0 } else { NO_EXECUTE });
+            // Any region covering a code page leaves it executable.
+            flags.insert(page, WRITABLE | if code_pages.contains(&page) { 0 } else { NO_EXECUTE });
         }
     }
     let memory = execution::prepare(resident, code_bytes)?;
@@ -340,7 +341,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\"}}",
+        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"steps\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\"}}",
         s.blocks,
         s.fast,
         s.l2_hits,
@@ -349,6 +350,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         requests.blocks,
         s.generation,
         compiler.compiles,
+        s.steps,
+        s.invalidations,
         s.retries,
         s.upgrades,
         s.evictions,

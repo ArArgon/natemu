@@ -15,6 +15,7 @@ import argparse, json, pathlib, statistics, subprocess, sys, time
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent)); sys.path.insert(0, str(HERE.parent / 'reference'))
 import build_bench as bench, run_slice1_vm as vm, ref  # noqa: E402
+from run_qemu import host_state  # noqa: E402
 
 # qemu-system-x86_64 TCG on the same host, steady-state ns/insn (S2p, bench-qemu-20261027-01).
 QEMU = {'int': 0.200, 'mem64': 0.346, 'mem4096': 0.398, 'call': 0.744, 'branchy': 0.597, 'mixed': 0.283}
@@ -59,6 +60,8 @@ def main():
             sys.exit(f"{name} N={k}: stopped {s['stop']} {s['reason']}; GPRs {'match' if got == gpr else 'differ from the model'}")
         return dt, {x: s['stats'][x] for x in STATS}
 
+    h0 = host_state()
+    print('host start:', json.dumps(h0))
     times = {key: [] for key in cases}
     stats = {}
     for rep in range(a.reps + 1):
@@ -84,8 +87,10 @@ def main():
         q = QEMU.get(b['name'])
         print(f"{b['name']:9} {n:11} {(i2 - i1) / n:8.3f} {med:8.4f} {r['ns_per_insn']['range_pct']:7.2f} {q or 0:6.3f} "
               f"{med / q if q else 0:6.2f}  {'' if steady else 'NOT STEADY '}{stats[(b['name'], n)]}")
-    (a.out / 'results.json').write_text(json.dumps({'reps': a.reps, 'scale': a.scale, 'max_block': a.max_block,
-                                                     'results': results}, indent=1) + '\n')
+    h1 = host_state()
+    print('host end:', json.dumps(h1))
+    (a.out / 'results.json').write_text(json.dumps({'reps': a.reps, 'scale': a.scale, 'max_block': a.max_block, 'host_start': h0,
+                                                     'host_end': h1, 'results': results}, indent=1) + '\n')
     sys.exit(0 if all(r['steady'] for r in results) else 1)
 
 
