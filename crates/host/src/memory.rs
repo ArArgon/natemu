@@ -195,7 +195,11 @@ impl Span {
     }
 }
 const PAGE: u64 = 3 | 1 << 10 | 3 << 8;
+/// A 2 MiB block descriptor at level 2.
+const BLOCK: u64 = 1 | 1 << 10 | 3 << 8;
 const PRIVATE_LEAF: usize = 0x14000;
+/// Level-2 table of `PRIVATE..PRIVATE + 1 GiB`; its first entry links `PRIVATE_LEAF`.
+const PRIVATE_L2: usize = 0x13000;
 
 /// Private tables of the owner whose window starts at backing offset `window`:
 /// TTBR0 (`shadow::LOWER_ROOT`) holds the boot identity alias, the private
@@ -226,8 +230,8 @@ pub(crate) fn private_space(
             (IPA + target as u64) | PAGE | 3 << 53,
         );
     }
-    word(0x12000 + 8, table(0x13000));
-    word(0x13000, table(PRIVATE_LEAF));
+    word(0x12000 + 8, table(PRIVATE_L2));
+    word(PRIVATE_L2, table(PRIVATE_LEAF));
     if upper {
         word(shadow::UPPER_ROOT + 256 * 8, table(shadow::UPPER_L1));
         word(shadow::UPPER_L1, table(shadow::UPPER_L2));
@@ -255,15 +259,27 @@ pub(crate) fn private_space(
     );
 }
 
-/// Maps `spans` into window `window`'s private region (replacing earlier entries).
+/// Maps `spans` into window `window`'s private region (replacing earlier entries): 4 KiB pages in its first 2 MiB,
+/// 2 MiB blocks (offset, size and target 2 MiB aligned) above, up to 1 GiB.
 pub(crate) fn map_private(memory: &Memory, window: usize, spans: &[Span]) {
+    const BLOCK_BYTES: usize = 2 * RAM_SIZE;
     for span in spans {
-        assert!(span.offset % 4096 == 0 && span.target % 4096 == 0);
-        assert!(span.offset + span.bytes <= 2 * RAM_SIZE);
         let protection = match span.rights {
             Rights::Text => 1 << 7,
             Rights::Data => 3 << 53,
         };
+        if span.offset >= BLOCK_BYTES {
+            assert!((span.offset | span.bytes | span.target) % BLOCK_BYTES == 0 && span.offset + span.bytes <= 1 << 30);
+            for block in (0..span.bytes).step_by(BLOCK_BYTES) {
+                memory.word(
+                    window + PRIVATE_L2 + (span.offset + block) / BLOCK_BYTES * 8,
+                    (IPA + (span.target + block) as u64) | BLOCK | protection,
+                );
+            }
+            continue;
+        }
+        assert!(span.offset % 4096 == 0 && span.target % 4096 == 0);
+        assert!(span.offset + span.bytes <= BLOCK_BYTES);
         for page in (0..span.bytes).step_by(4096) {
             memory.word(
                 window + PRIVATE_LEAF + (span.offset + page) / 4096 * 8,
@@ -411,6 +427,18 @@ mod tests {
                 assert_eq!(pte & (3 << 53), 3 << 53);
             }
         }
+    }
+
+    #[test]
+    fn spans_above_two_mib_map_as_level_two_blocks() {
+        let memory = Memory::new().unwrap();
+        let mib = RAM_SIZE;
+        map_private(&memory, 0, &[Span::text(0x1000_0000, 4 * mib, 6 * mib), Span::data(0x2000_0000, 2 * mib, 6 * mib)]);
+        let l2 = |offset: usize| u64::from_le_bytes(memory.read::<8>(PRIVATE_L2 + offset / (2 * mib) * 8));
+        assert_eq!(l2(0x1000_0000), (IPA + 6 * mib as u64) | BLOCK | 1 << 7);
+        assert_eq!(l2(0x1020_0000), (IPA + 8 * mib as u64) | BLOCK | 1 << 7);
+        assert_eq!(l2(0x2000_0000), (IPA + 6 * mib as u64) | BLOCK | 3 << 53);
+        assert_eq!(l2(0x1040_0000), 0);
     }
 
     #[test]

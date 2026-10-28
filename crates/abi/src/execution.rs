@@ -1,12 +1,13 @@
-//! General block execution (slice 1): the vCPU's x86 architectural state bank,
-//! the record the resident and the host exchange per block, the private layout
-//! of the execution mode, and the FEX frame offsets admitted code may touch.
+//! General block execution (slices 1 and 2): the vCPU's x86 architectural state bank,
+//! the record the resident and the host exchange per translation, the private layout
+//! of the execution mode (code cache included), and the FEX frame offsets admitted code may touch.
 //!
-//! Flow: the resident asks the host for code at `Cpu::rip` (`hvc #TRANSLATE_HVC`);
-//! the host fetches the bytes through the guest walk, compiles and admits one
-//! block into the staging area and replies; the resident places it in the code
-//! slot, enters it and, at its exit through the dispatcher gate, writes the
-//! state back to the bank. Shadow misses are served in the resident.
+//! Flow: blocks stay in the vCPU's resident code cache ([`cache`]). At a block
+//! exit the resident's dispatcher looks up the next RIP (L1, then L2); only a
+//! miss asks the host for code (`hvc #TRANSLATE_HVC`): the host fetches the bytes
+//! through the guest walk, compiles and admits one block into the staging area
+//! and replies; the resident places it in the cache and enters it. Shadow misses
+//! are served in the resident.
 use crate::{
     PRIVATE, RAM_SIZE,
     paging::{self, Control},
@@ -41,8 +42,109 @@ pub const HELPER_STACK_BYTES: u32 = 64;
 pub const GUEST_RAM_OFFSET: usize = RAM_SIZE;
 pub const GUEST_RAM_BYTES: usize = 0x10_0000;
 pub const GUEST_RAM_VA: u64 = PRIVATE + GUEST_RAM_OFFSET as u64;
-/// Backing bytes the execution mode needs: window 0 plus guest RAM.
-pub const BACKING_BYTES: usize = GUEST_RAM_OFFSET + GUEST_RAM_BYTES;
+/// Guest-physical pages of guest RAM.
+pub const GUEST_PAGES: usize = GUEST_RAM_BYTES / 4096;
+
+/// The code cache (slice 2). Per vCPU: an executable code area with a writable
+/// alias, a metadata arena (block records and their access sites) and the lookup
+/// structures. Shared between owners ([`cache::GLOBAL_VA`]): the code-page masks
+/// over guest-physical pages and one invalidation queue per vCPU. Areas are
+/// mapped in 2 MiB blocks; the backing places them after guest RAM, the code
+/// area last because its size is set at `prepare`.
+pub mod cache {
+    use crate::PRIVATE;
+    const MIB: usize = 1 << 20;
+    /// Code area: executable alias (blocks run here) and writable alias (the resident places them there).
+    pub const CODE_VA: u64 = PRIVATE + 0x1000_0000;
+    pub const CODE_WRITE_VA: u64 = PRIVATE + 0x2000_0000;
+    pub const CODE_BYTES: usize = 16 * MIB;
+    /// Every block-to-block branch of a later linking step stays one `b` (±128 MiB).
+    pub const CODE_BYTES_MAX: usize = 128 * MIB;
+    /// The largest block admitted; the code area holds at least one.
+    pub const MAX_BLOCK_BYTES: usize = 32 * 1024;
+    pub const META_VA: u64 = PRIVATE + 0x3000_0000;
+    pub const META_BYTES: usize = 8 * MIB;
+    pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
+    pub const LOOKUP_BYTES: usize = 2 * MIB;
+    pub const GLOBAL_VA: u64 = PRIVATE + 0x3c00_0000;
+    pub const GLOBAL_BYTES: usize = 2 * MIB;
+    /// Mapping granule of the areas.
+    pub const BLOCK: usize = 2 * MIB;
+
+    /// Backing offsets (2 MiB aligned).
+    pub const LOOKUP_OFFSET: usize = 2 * MIB;
+    pub const GLOBAL_OFFSET: usize = LOOKUP_OFFSET + LOOKUP_BYTES;
+    pub const META_OFFSET: usize = GLOBAL_OFFSET + GLOBAL_BYTES;
+    pub const CODE_OFFSET: usize = META_OFFSET + META_BYTES;
+
+    /// Lookup area layout: [`Control`], the vCPU's writable-shadow bits over guest-physical pages, L1, L2, block index.
+    pub const CONTROL: usize = 0;
+    pub const WRITABLE: usize = 0x1000;
+    /// L1: direct-mapped {guest RIP, host entry} pairs indexed by `rip & L1_MASK` (FEX `L1Pointer/L1Mask`).
+    /// An empty entry holds a RIP whose low bits differ from its index, so it never matches.
+    pub const L1: usize = 0x1_0000;
+    pub const L1_ENTRIES: usize = 4096;
+    pub const L1_MASK: u64 = L1_ENTRIES as u64 - 1;
+    /// L2: open-addressed {guest RIP, block number + 1} table keyed by (RIP, context).
+    pub const L2: usize = 0x2_0000;
+    pub const L2_ENTRIES: usize = 1 << 16;
+    /// Block index: metadata offsets of the blocks in placement (= code address) order.
+    pub const INDEX: usize = 0x12_0000;
+    /// At most half of L2, so probes stay short.
+    pub const MAX_BLOCKS: usize = L2_ENTRIES / 2;
+
+    /// Global area layout: one code-page mask byte per guest-physical page (bit v: vCPU v holds translations from
+    /// the page), then one [`Queue`] per vCPU.
+    pub const CODE_PAGES: usize = 0;
+    pub const QUEUES: usize = 0x4000;
+    pub const MAX_VCPUS: usize = 8;
+
+    /// Per-vCPU cache bookkeeping at [`CONTROL`]. The host sets `code_bytes` (the code area's capacity) at prepare;
+    /// the resident owns the rest.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Control {
+        pub code_bytes: u64,
+        /// Bump pointers of the code area and the metadata arena, and blocks placed since the last flush.
+        pub code_used: u64,
+        pub meta_used: u64,
+        pub blocks: u64,
+        /// The lookup context (CR3, context word) L1 was filled under.
+        pub l1_context: [u64; 2],
+    }
+    /// Invalidation requests to one vCPU, drained at each resident entry. `pages` lists guest-physical pages whose
+    /// translations are stale; `flush` (or a full list) drops the whole cache.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Queue {
+        pub flush: u64,
+        pub count: u64,
+        pub pages: [u64; 30],
+    }
+    pub const FLUSH: u64 = 1;
+
+    const _: () = assert!(crate::execution::GUEST_RAM_OFFSET + crate::execution::GUEST_RAM_BYTES <= LOOKUP_OFFSET);
+    // The guest RAM alias ends below the code area; every area lies in PRIVATE..PRIVATE + 1 GiB, 2 MiB aligned.
+    const _: () = assert!(crate::execution::GUEST_RAM_VA + crate::execution::GUEST_RAM_BYTES as u64 <= CODE_VA);
+    const _: () = assert!(CODE_VA + CODE_BYTES_MAX as u64 <= CODE_WRITE_VA);
+    const _: () = assert!(CODE_WRITE_VA + CODE_BYTES_MAX as u64 <= META_VA);
+    const _: () = assert!(META_VA + META_BYTES as u64 <= LOOKUP_VA);
+    const _: () = assert!(LOOKUP_VA + LOOKUP_BYTES as u64 <= GLOBAL_VA);
+    const _: () = assert!(GLOBAL_VA + GLOBAL_BYTES as u64 <= PRIVATE + (1 << 30));
+    const _: () = assert!(CODE_BYTES <= CODE_BYTES_MAX && CODE_BYTES % BLOCK == 0);
+    const _: () = assert!(MAX_BLOCK_BYTES <= crate::execution::SLOT_BYTES);
+    const _: () = assert!((CODE_VA | CODE_WRITE_VA | META_VA | LOOKUP_VA | GLOBAL_VA) % BLOCK as u64 == 0);
+    const _: () = assert!(CODE_OFFSET % BLOCK == 0 && META_BYTES % BLOCK == 0);
+    const _: () = assert!(core::mem::size_of::<Control>() <= WRITABLE);
+    const _: () = assert!(WRITABLE + crate::execution::GUEST_PAGES / 8 <= L1);
+    const _: () = assert!(L1 + L1_ENTRIES * 16 <= L2 && L2 + L2_ENTRIES * 16 <= INDEX);
+    const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= LOOKUP_BYTES);
+    const _: () = assert!(CODE_PAGES + crate::execution::GUEST_PAGES <= QUEUES);
+    const _: () = assert!(QUEUES + MAX_VCPUS * core::mem::size_of::<Queue>() <= GLOBAL_BYTES);
+}
+
+/// Backing bytes the execution mode needs before the code area: window 0, guest RAM and the cache's fixed areas.
+pub const BACKING_BYTES: usize = cache::CODE_OFFSET;
 
 /// FEX `CpuStateFrame` fields admitted code may access (pinned FEX build).
 pub mod frame {
@@ -67,6 +169,9 @@ pub mod frame {
 }
 /// Native offset of a FEX block's entry: after its 4-byte `JITCodeHeader`.
 pub const ENTRY_OFFSET: u32 = 4;
+/// The static-register map (FEX `x64::SRA`) admission pins for every block: native registers of RAX..R15, then PF
+/// and AF. Guest state is in these registers at every block entry and exit.
+pub const SRA: [u8; 18] = [4, 7, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 29, 26, 27];
 
 /// Guest RFLAGS bits slice-1 code computes (CF PF AF ZF SF OF).
 pub const ARITHMETIC_FLAGS: u64 = 0x8d5;
@@ -94,6 +199,8 @@ pub const CR4_PAE: u64 = 1 << 5;
 pub const CR4_SMEP: u64 = 1 << 20;
 pub const CR4_SMAP: u64 = 1 << 21;
 pub const CR4_LA57: u64 = 1 << 12;
+pub const CR4_PGE: u64 = 1 << 7;
+pub const CR4_PCIDE: u64 = 1 << 17;
 pub const EFER_LME: u64 = 1 << 8;
 pub const EFER_LMA: u64 = 1 << 10;
 pub const EFER_NXE: u64 = 1 << 11;
@@ -115,6 +222,21 @@ impl Cpu {
             nxe: u64::from(self.efer & EFER_NXE != 0),
             smep: u64::from(self.cr4 & CR4_SMEP != 0),
         })
+    }
+    /// What code at a RIP is compiled and cached under besides the RIP: CR3, and a word of the CPL, the code mode
+    /// (bit 2: 64-bit, the only mode yet) and the paging controls a translation depends on (CR0.PG/WP,
+    /// CR4.PGE/PCIDE/SMEP, EFER.NXE).
+    pub fn code_context(&self) -> [u64; 2] {
+        let bit = |on: bool, n: u32| u64::from(on) << n;
+        let word = self.cpl & 3
+            | bit(true, 2)
+            | bit(self.cr0 & CR0_PG != 0, 3)
+            | bit(self.cr0 & CR0_WP != 0, 4)
+            | bit(self.cr4 & CR4_PGE != 0, 5)
+            | bit(self.cr4 & CR4_PCIDE != 0, 6)
+            | bit(self.cr4 & CR4_SMEP != 0, 7)
+            | bit(self.efer & EFER_NXE != 0, 8);
+        [self.cr3, word]
     }
 }
 
@@ -157,7 +279,7 @@ pub mod stop {
     /// An x86 exception is due at a guest instruction boundary (`State::fault`; the bank holds the
     /// exact state at that instruction's start). Delivery through the IDT is later system work.
     pub const GUEST_FAULT: u64 = 5;
-    /// A write to a page the current block was translated from.
+    /// A write to a guest-physical page code was translated from (until per-page invalidation exists).
     pub const UNSUPPORTED_SMC: u64 = 6;
     /// Shadow installation failed (capacity after eviction, memory outside guest RAM).
     pub const SHADOW: u64 = 7;
@@ -186,20 +308,29 @@ pub struct State {
     pub cpu: Cpu,
     pub request: u64,
     pub reply: u64,
-    /// Guest linear and physical pages the admitted block was fetched from
-    /// (`u64::MAX` = unused): kept read-only while it runs.
-    pub source_va: [u64; 2],
+    /// The cache's flush generation (flushes so far), sent with each request: the host never needs to resend an
+    /// object the resident holds.
+    pub generation: u64,
+    /// With a reply: guest-physical pages the staged block was fetched from (`u64::MAX` = unused).
     pub source_gpa: [u64; 2],
     pub stop: u64,
     /// Guest exception due at a stop: vector, CR2 (#PF; else 0), error code, RIP.
     pub fault: [u64; 4],
-    /// Native abort at a stop: ESR, FAR, ELR (slot offset).
+    /// Native abort at a stop: ESR, FAR, ELR (offset in its block; the address itself when no block holds it).
     pub native: [u64; 3],
-    /// The last retry: native PC, FAR and the shadow descriptor then installed at FAR.
-    pub last_retry: [u64; 3],
-    /// Blocks entered, shadow-miss retries, of which read-only → writable upgrades,
-    /// shadow evictions on capacity, page-crossing stores completed by the split service.
+    /// The last retry: native PC, FAR, the shadow descriptor then installed at FAR and the shadow generation.
+    pub last_retry: [u64; 4],
+    /// Bumped by every shadow reset (eviction, protection reset) and cache flush: an abort that repeats the last
+    /// retry across one is progress, not a loop.
+    pub shadow_generation: u64,
+    /// Block entries through the resident (slow path) and through the fast dispatcher (L1 hits); slow-path L2 hits;
+    /// host translation requests answered.
     pub blocks: u64,
+    pub fast: u64,
+    pub l2_hits: u64,
+    pub requests: u64,
+    /// Shadow-miss retries, of which read-only → writable upgrades,
+    /// shadow evictions on capacity, page-crossing stores completed by the split service.
     pub retries: u64,
     pub upgrades: u64,
     pub evictions: u64,
@@ -211,13 +342,17 @@ impl State {
             cpu,
             request: NONE,
             reply: NONE,
-            source_va: [u64::MAX; 2],
+            generation: 0,
             source_gpa: [u64::MAX; 2],
             stop: 0,
             fault: [0; 4],
             native: [0; 3],
-            last_retry: [0; 3],
+            last_retry: [0; 4],
+            shadow_generation: 0,
             blocks: 0,
+            fast: 0,
+            l2_hits: 0,
+            requests: 0,
             retries: 0,
             upgrades: 0,
             evictions: 0,

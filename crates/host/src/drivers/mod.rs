@@ -17,7 +17,7 @@ mod recovery;
 
 /// Dispatches the host CLI (`natemu-host RUNTIME.elf CASE ...`) to its driver.
 pub(crate) fn run(a: &[String]) -> Result<()> {
-    if (a.len() == 6 || a.len() == 7) && a[2] == "run-program" {
+    if a.len() >= 6 && a[2] == "run-program" {
         return program::run(a);
     }
     if a.len() == 9 && a[2] == "i4v-containment" {

@@ -1,13 +1,16 @@
-//! Block execution in the resident (`natemu_abi::execution`): place each
-//! host-admitted block, enter it from the state bank, take its exit through the
-//! dispatcher gate back into the bank, and serve shadow misses at its recorded
-//! access sites by walking the guest tables and retrying the same instruction.
-//! Also the 128/64 division helpers admitted code calls through the frame.
+//! Block execution in the resident (`natemu_abi::execution`): find the block
+//! for the banked RIP in the code cache ([`cache`]) or ask the host for it and
+//! place it, enter it from the state bank, take exits the fast dispatcher
+//! (`gates.S` `dispatch_fast`) cannot resolve back into the bank, and serve
+//! shadow misses at the recorded access sites of the block holding the faulting
+//! PC by walking the guest tables and retrying the same instruction. Also the
+//! 128/64 division helpers admitted code calls through the frame.
 use super::*;
+use crate::cache::{self, Block};
 use natemu_abi::{
     code_object::{self as object, Header, Site},
     execution::*,
-    guest_memory,
+    guest_memory::{self, Observer},
     paging::{self, Access, Fault},
     shadow::{self, READ_ONLY},
 };
@@ -15,7 +18,7 @@ use natemu_abi::{
 unsafe extern "C" {
     fn enter_allocated(frame: *const NativeFrame, pc: u64, spsr: u64) -> !;
     fn resume_exception(frame: *const NativeFrame, pc: u64, spsr: u64) -> !;
-    fn returned_allocated();
+    fn dispatch_fast();
     fn natemu_ludiv();
     fn natemu_ldiv();
 }
@@ -113,13 +116,9 @@ fn record() -> *mut State {
 unsafe fn load() -> State {
     unsafe { read_record(record()) }
 }
-fn header() -> Header {
+/// The staged object's header (host-written at a translation reply).
+fn staged() -> Header {
     unsafe { read_record(STAGING_VA as *const Header) }
-}
-/// The admitted block's sites, sorted by native offset (checked by the host).
-fn sites(h: &Header) -> &'static [Site] {
-    let at = (STAGING_VA + h.sites_offset as u64) as *const Site;
-    unsafe { core::slice::from_raw_parts(at, h.sites_count as usize) }
 }
 fn frame_word(offset: u32) -> *mut u64 {
     (FRAME_VA + offset as u64) as *mut u64
@@ -137,81 +136,111 @@ pub unsafe fn start() -> ! {
     if s.cpu.control().is_none() || s.request != NONE {
         halt(s, stop::UNSUPPORTED_MODE)
     }
-    unsafe { next(s) }
+    cache::reset();
+    unsafe {
+        frame_word(frame::DISPATCHER_LOOP_TOP).write_volatile(dispatch_fast as *const () as u64);
+        frame_word(frame::LUDIV_HANDLER).write_volatile(natemu_ludiv as *const () as u64);
+        frame_word(frame::LDIV_HANDLER).write_volatile(natemu_ldiv as *const () as u64);
+        dispatch(s)
+    }
 }
 
-/// Asks the host for the block at `s.cpu.rip`, places it and enters it.
-unsafe fn next(mut s: State) -> ! {
+/// Enters the block for `s.cpu.rip`: from the cache (L2; L1 was probed by the fast dispatcher), else asks the host
+/// for it and places it. Pending invalidations are taken first.
+unsafe fn dispatch(mut s: State) -> ! {
+    if cache::drain() {
+        flush(&mut s);
+    }
+    let context = s.cpu.code_context();
+    cache::select_l1(context);
+    let block = match cache::lookup(s.cpu.rip, context) {
+        Some(b) => {
+            s.l2_hits += 1;
+            b
+        }
+        None => unsafe { translate_block(&mut s, context) },
+    };
+    cache::fill_l1(s.cpu.rip, block);
+    unsafe { enter(s, block) }
+}
+
+/// A miss: the host compiles and admits the block at `s.cpu.rip` into staging; place it (flushing a full cache
+/// first) and keep its source pages read-only.
+unsafe fn translate_block(s: &mut State, context: [u64; 2]) -> &'static Block {
     unsafe {
         s.request = REQUEST_TRANSLATE;
         s.reply = NONE;
-        write_record(record(), s);
+        write_record(record(), *s);
         asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
-        let mut s = load();
-        let h = header();
-        if s.reply != REPLY_ADMITTED
-            || h.code_size as usize > SLOT_BYTES
-            || h.code_offset as usize + h.code_size as usize > STAGING_BYTES
-            || h.guest_rip != s.cpu.rip
-        {
-            halt(s, stop::BAD_REPLY)
+        *s = load();
+    }
+    // The host may have written guest RAM while serving the request (A bits of the fetch walk).
+    if cache::drain() {
+        flush(s);
+    }
+    let h = staged();
+    let table_end = (h.sites_offset as usize).checked_add(h.sites_count as usize * size_of::<Site>());
+    if s.reply != REPLY_ADMITTED
+        || h.guest_rip != s.cpu.rip
+        || h.code_size as usize > natemu_abi::execution::cache::MAX_BLOCK_BYTES
+        || h.code_offset as usize + h.code_size as usize > STAGING_BYTES
+        || table_end.is_none_or(|end| end > STAGING_BYTES)
+    {
+        halt(*s, stop::BAD_REPLY)
+    }
+    s.request = NONE;
+    s.requests += 1;
+    let staging = STAGING_VA as *const u8;
+    let block = match cache::place(&h, staging, context, s.source_gpa) {
+        Some(b) => b,
+        None => {
+            flush(s);
+            cache::place(&h, staging, context, s.source_gpa).unwrap_or_else(|| halt(*s, stop::BAD_REPLY))
         }
-        s.request = NONE;
-        // A write to the block's own source must fault into the SMC check.
-        for (va, gpa) in s.source_va.into_iter().zip(s.source_gpa) {
-            if va == u64::MAX {
-                continue;
-            }
-            let d = tables::descriptor(va);
-            if d & 1 != 0 && d & READ_ONLY == 0 {
-                install(&mut s, va, gpa, false);
-            }
+    };
+    // A write to a translated page must fault: no writable shadow of a source page may survive.
+    for gpa in block.source_gpa {
+        if gpa != u64::MAX && cache::protect(gpa) {
+            reset_shadows(s);
         }
-        let code = h.code_size as usize;
-        copy_record(SLOT_WRITE_VA as *mut u8, (STAGING_VA + h.code_offset as u64) as *const u8, code);
-        synchronize_code(code);
-        frame_word(frame::DISPATCHER_LOOP_TOP).write_volatile(returned_allocated as *const () as u64);
-        frame_word(frame::LUDIV_HANDLER).write_volatile(natemu_ludiv as *const () as u64);
-        frame_word(frame::LDIV_HANDLER).write_volatile(natemu_ldiv as *const () as u64);
-        frame_word(frame::RIP).write_volatile(0);
+    }
+    block
+}
 
-        let reg = |i: usize| h.sra_gpr[i] as usize;
-        let mut f = NativeFrame::ZERO;
-        for (i, &value) in s.cpu.gpr.iter().enumerate() {
-            f.x[reg(i)] = value;
-        }
-        let (nzcv, pf, af) = native_flags(s.cpu.rflags);
-        f.x[reg(16)] = pf;
-        f.x[reg(17)] = af;
-        f.x[28] = FRAME_VA;
-        f.sp = STACK_TOP;
-        s.blocks += 1;
-        // Blocks are straight-line: a native PC repeats only after a retry.
-        s.last_retry = [0; 3];
+/// Drops every block (capacity, or an invalidation request), with nothing generated live and the state banked.
+fn flush(s: &mut State) {
+    cache::reset();
+    s.generation += 1;
+    s.shadow_generation += 1;
+}
+/// Removes every shadow of this vCPU.
+fn reset_shadows(s: &mut State) {
+    tables::space().reset();
+    cache::shadows_reset();
+    s.shadow_generation += 1;
+}
+
+/// Enters `block` from the bank: GPRs and PF/AF in their static registers, NZCV with C = !CF, the frame in x28.
+unsafe fn enter(mut s: State, block: &Block) -> ! {
+    let mut f = NativeFrame::ZERO;
+    for (&reg, &value) in SRA.iter().zip(&s.cpu.gpr) {
+        f.x[reg as usize] = value;
+    }
+    let (nzcv, pf, af) = native_flags(s.cpu.rflags);
+    f.x[SRA[16] as usize] = pf;
+    f.x[SRA[17] as usize] = af;
+    f.x[28] = FRAME_VA;
+    f.sp = STACK_TOP;
+    s.blocks += 1;
+    unsafe {
         write_record(record(), s);
         let entry = &raw mut (*shared()).initial;
         write_record(entry, f);
-        enter_allocated(entry, SLOT_VA + ENTRY_OFFSET as u64, BLOCK_SPSR | nzcv)
+        enter_allocated(entry, block.entry(), BLOCK_SPSR | nzcv)
     }
 }
 
-/// Written through the data alias, executed through the code alias.
-unsafe fn synchronize_code(bytes: usize) {
-    unsafe {
-        let ctr: u64;
-        asm!("mrs {0}, ctr_el0", out(reg) ctr);
-        for offset in (0..bytes).step_by(4 << ((ctr >> 16) & 15)) {
-            asm!("dc cvau, {0}", in(reg) SLOT_WRITE_VA + offset as u64);
-        }
-        asm!("dsb ish");
-        for offset in (0..bytes).step_by(4 << (ctr & 15)) {
-            asm!("ic ivau, {0}", in(reg) SLOT_VA + offset as u64);
-        }
-        asm!("dsb ish", "isb");
-    }
-}
-
-/// Exception capture and the dispatcher gate both end here.
+/// Exception capture and the dispatcher's slow path both end here.
 pub unsafe fn returned(frame: &NativeFrame, fault: u64) -> ! {
     unsafe {
         if fault != 0 {
@@ -219,34 +248,34 @@ pub unsafe fn returned(frame: &NativeFrame, fault: u64) -> ! {
         }
         // Block exit: guest state is in the static registers, NZCV (CF inverted) and PF/AF registers.
         let mut s = load();
-        bank(&mut s.cpu, frame, &header(), frame.nzcv, true);
+        bank(&mut s.cpu, frame, frame.nzcv, true);
         s.cpu.rip = frame_word(frame::RIP).read_volatile();
-        next(s)
+        dispatch(s)
     }
 }
 
 /// Guest GPRs and arithmetic flags from the native state: the static-register map,
 /// PF/AF registers and `nzcv` (PSTATE layout) with the given CF inversion.
-fn bank(cpu: &mut Cpu, f: &NativeFrame, h: &Header, nzcv: u64, cf_inverted: bool) {
-    let reg = |i: usize| f.x[h.sra_gpr[i] as usize];
+fn bank(cpu: &mut Cpu, f: &NativeFrame, nzcv: u64, cf_inverted: bool) {
+    let reg = |i: usize| f.x[SRA[i] as usize];
     for (i, value) in cpu.gpr.iter_mut().enumerate() {
         *value = reg(i);
     }
     cpu.rflags = guest_flags(cpu.rflags, nzcv, reg(16), reg(17), cf_inverted);
 }
 
-/// Stops with an x86 exception due at `site`'s guest instruction (`vector`,
+/// Stops with an x86 exception due at `site`'s guest instruction in `b` (`vector`,
 /// CR2, error code): the bank holds the exact state at that instruction's
 /// start, which the precision guarantee places at the site (or its stub):
 /// GPRs and PF/AF in their static registers, NZCV in PSTATE or, for
 /// `nzcv=frame` sites, in the frame's pre-NZCV slot. No IDT delivery yet.
-fn guest_fault(mut s: State, f: &NativeFrame, h: &Header, site: &Site, [vector, cr2, error]: [u64; 3]) -> ! {
+fn guest_fault(mut s: State, f: &NativeFrame, b: &Block, site: &Site, [vector, cr2, error]: [u64; 3]) -> ! {
     let nzcv = match site.nzcv {
         object::NZCV_FRAME => unsafe { ((FRAME_VA + frame::PRE_NZCV as u64) as *const u32).read_volatile() as u64 },
         _ => f.nzcv,
     };
-    bank(&mut s.cpu, f, h, nzcv, site.cf_inverted != 0);
-    s.cpu.rip = h.guest_rip.wrapping_add(site.guest_offset as u64);
+    bank(&mut s.cpu, f, nzcv, site.cf_inverted != 0);
+    s.cpu.rip = b.rip.wrapping_add(site.guest_offset as u64);
     s.fault = [vector, cr2, error, s.cpu.rip];
     halt(s, stop::GUEST_FAULT)
 }
@@ -278,16 +307,32 @@ fn pages(address: u64, width: u64) -> Option<[Option<u64>; 2]> {
         .then(|| [Some(address), ((last ^ address) >> 12 != 0).then_some(last & !4095)])
 }
 
-/// Walks `va` with `access` for the guest instruction at `site` and shadows the page; a guest
-/// fault stops with the precise state. Returns the guest-physical address of `va`.
-fn translate(s: &mut State, f: &NativeFrame, h: &Header, site: &Site, va: u64, access: Access) -> u64 {
+/// The walker's A/D writes: refused on a translated page (as the guest's own stores are).
+struct CodePageWrites(bool);
+impl Observer for CodePageWrites {
+    fn write(&mut self, gpa: u64, _: u64, _: u64) -> bool {
+        self.0 |= cache::translated(gpa);
+        !self.0
+    }
+}
+
+/// Walks `va` with `access` for the guest instruction at `site` of `b` and shadows the page; a guest
+/// fault stops with the precise state. Returns the guest-physical address of `va`. Translated pages
+/// are shadowed read-only whatever the walk grants; a write to one stops `unsupported_smc` (until SMC
+/// invalidation exists).
+fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, access: Access) -> u64 {
     let Some(control) = s.cpu.control() else {
         halt(*s, stop::UNSUPPORTED_MODE)
     };
-    match paging::walk(&mut GuestTables::new(RAM), control, va, access) {
+    let mut tables = GuestTables::observed(RAM, CodePageWrites(false));
+    let walk = paging::walk(&mut tables, control, va, access);
+    if tables.observer.0 {
+        halt(*s, stop::UNSUPPORTED_SMC)
+    }
+    match walk {
         Ok(t) if t.wb => {
             let writable = access == Access::Write && t.writable && t.dirty;
-            if writable && s.source_gpa.contains(&(t.gpa & !4095)) {
+            if writable && cache::translated(t.gpa) {
                 halt(*s, stop::UNSUPPORTED_SMC)
             }
             let old = tables::descriptor(va);
@@ -299,8 +344,8 @@ fn translate(s: &mut State, f: &NativeFrame, h: &Header, site: &Site, va: u64, a
         }
         // Only write-back guest memory is shadowed.
         Ok(_) => halt(*s, stop::SHADOW),
-        Err(Fault::Page { address, error }) => guest_fault(*s, f, h, site, [14, address, error]),
-        Err(Fault::Noncanonical) => guest_fault(*s, f, h, site, noncanonical(site)),
+        Err(Fault::Page { address, error }) => guest_fault(*s, f, b, site, [14, address, error]),
+        Err(Fault::Noncanonical) => guest_fault(*s, f, b, site, noncanonical(site)),
         Err(Fault::Unsupported) => halt(*s, stop::UNSUPPORTED_MODE),
     }
 }
@@ -311,10 +356,13 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
         asm!("mrs {0}, esr_el1", "mrs {1}, far_el1", "mrs {2}, elr_el1", "mrs {3}, spsr_el1",
              out(reg) esr, out(reg) far, out(reg) elr, out(reg) spsr);
         let mut s = load();
-        let at = elr.wrapping_sub(SLOT_VA);
-        s.native = [esr, far, at];
-        let h = header();
-        let all = sites(&h);
+        s.native = [esr, far, elr];
+        let Some(b) = cache::block_at(elr) else {
+            halt(s, stop::UNKNOWN_ABORT)
+        };
+        let at = elr - b.code_va();
+        s.native[2] = at;
+        let all = b.sites();
         let Ok(i) = all.binary_search_by_key(&at, |site| site.native_offset as u64) else {
             halt(s, stop::UNKNOWN_ABORT)
         };
@@ -334,19 +382,19 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
                     halt(s, stop::SITE_MISMATCH)
                 }
                 match site.kind {
-                    object::kind::GUARD => guest_fault(s, f, &h, &site, noncanonical(&site)),
+                    object::kind::GUARD => guest_fault(s, f, b, &site, noncanonical(&site)),
                     // #DE: no error code.
-                    object::kind::DIVIDE => guest_fault(s, f, &h, &site, [0, 0, 0]),
-                    _ => split(s, f, &h, all, &site, spsr),
+                    object::kind::DIVIDE => guest_fault(s, f, b, &site, [0, 0, 0]),
+                    _ => split(s, f, b, all, &site, spsr),
                 }
             }
-            _ => access_aborted(s, f, &h, &site, [esr, far, elr, spsr]),
+            _ => access_aborted(s, f, b, &site, [esr, far, elr, spsr]),
         }
     }
 }
 
 /// A data abort at an access site: a shadow miss to retry, or a guest fault.
-unsafe fn access_aborted(mut s: State, f: &NativeFrame, h: &Header, site: &Site, [esr, far, elr, spsr]: [u64; 4]) -> ! {
+unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, [esr, far, elr, spsr]: [u64; 4]) -> ! {
     let store = matches!(site.kind, object::kind::STORE | object::kind::STORE_PAIR | object::kind::PUSH);
     let write_abort = (esr >> 6) & 1 != 0;
     let write = site.intent == object::INTENT_WRITE;
@@ -363,18 +411,19 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, h: &Header, site: &Site,
     }
     // A non-canonical access that passed the guard (other than A[63] != A[47]: level-0 or gap faults).
     let Some(touched) = pages(address, width) else {
-        guest_fault(s, f, h, site, noncanonical(site))
+        guest_fault(s, f, b, site, noncanonical(site))
     };
-    // A repeat of the last retry with its shadow untouched would loop.
-    if s.last_retry == [elr, far, tables::descriptor(far)] {
+    // A repeat of the last retry with its shadow untouched, and no shadow reset or flush since, would loop.
+    // (Native PCs repeat legitimately: cached blocks run again.)
+    if s.last_retry == [elr, far, tables::descriptor(far), s.shadow_generation] {
         halt(s, stop::NO_PROGRESS)
     }
     let access = if write { Access::Write } else { Access::Read };
     // Every page the access touches, in address order, before the retry.
     for va in touched.into_iter().flatten() {
-        translate(&mut s, f, h, site, va, access);
+        translate(&mut s, f, b, site, va, access);
     }
-    s.last_retry = [elr, far, tables::descriptor(far)];
+    s.last_retry = [elr, far, tables::descriptor(far), s.shadow_generation];
     s.retries += 1;
     unsafe {
         write_record(record(), s);
@@ -386,7 +435,7 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, h: &Header, site: &Site,
 /// with write intent, then write the access's data register(s) through owned RAM in
 /// guest byte order, apply its writeback and resume after it. A fault on either page
 /// stops before any byte is written.
-unsafe fn split(mut s: State, f: &NativeFrame, h: &Header, all: &[Site], stub: &Site, spsr: u64) -> ! {
+unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &Site, spsr: u64) -> ! {
     let Ok(i) = all.binary_search_by_key(&stub.guest_offset2, |site| site.native_offset) else {
         halt(s, stop::SITE_MISMATCH)
     };
@@ -399,11 +448,11 @@ unsafe fn split(mut s: State, f: &NativeFrame, h: &Header, all: &[Site], stub: &
     let address = site_address(stub, f);
     let Some([Some(first), Some(second)]) = pages(address, width as u64) else {
         match pages(address, width as u64) {
-            None => guest_fault(s, f, h, stub, noncanonical(stub)),
+            None => guest_fault(s, f, b, stub, noncanonical(stub)),
             Some(_) => halt(s, stop::SITE_MISMATCH), // the check fired for an access within one page
         }
     };
-    let gpa = [first, second].map(|va| translate(&mut s, f, h, stub, va, Access::Write));
+    let gpa = [first, second].map(|va| translate(&mut s, f, b, stub, va, Access::Write));
     let reg = |r: u8| if r == 31 { 0 } else { f.x[r as usize] };
     let mut bytes = [0u8; 16];
     if pair {
@@ -435,17 +484,23 @@ unsafe fn split(mut s: State, f: &NativeFrame, h: &Header, all: &[Site], stub: &
         }
         s.splits += 1;
         write_record(record(), s);
-        resume_exception(resume, SLOT_VA + access.native_offset as u64 + 4, spsr)
+        resume_exception(resume, b.code_va() + access.native_offset as u64 + 4, spsr)
     }
 }
 
 /// Shadows linear page `va` with guest-physical `gpa`; on table capacity
 /// exhaustion evicts every shadow once and retries.
 fn install(s: &mut State, va: u64, gpa: u64, writable: bool) {
+    if writable {
+        cache::shadowed_writable(gpa);
+    }
     match tables::install(va, &RAM, gpa, writable) {
         Ok(()) => {}
         Err(shadow::Error::Capacity) => {
-            tables::space().reset();
+            reset_shadows(s);
+            if writable {
+                cache::shadowed_writable(gpa);
+            }
             s.evictions += 1;
             if tables::install(va, &RAM, gpa, writable).is_err() {
                 halt(*s, stop::SHADOW)

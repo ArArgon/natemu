@@ -6,7 +6,7 @@
 //! guards, split and #DE checks, exits and indirect branches verified on the words.
 //! Literal slots are resolved here; the resident fills the frame's native pointers itself.
 use natemu_abi::code_object::{self as object, Header, PcEntry, Reloc, Site};
-use natemu_abi::execution::{ENTRY_OFFSET, SLOT_BYTES, STAGING_BYTES, frame};
+use natemu_abi::execution::{ENTRY_OFFSET, SRA, STAGING_BYTES, cache::MAX_BLOCK_BYTES, frame};
 
 mod structure;
 
@@ -106,8 +106,6 @@ fn table<T: Copy>(bytes: &[u8], offset: u32, count: u32, from: usize, to: usize)
     Ok((0..count).map(|i| record(bytes, offset + i * size_of::<T>())).collect())
 }
 
-/// The contract's static-register map (FEX `x64::SRA`): RAX..R15, then PF and AF.
-pub(crate) const SRA: [u8; 18] = [4, 7, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 29, 26, 27];
 /// Feature bit of FlagM (the contract requires it: FEX emits CFINV/RMIF).
 const FLAGM: u64 = 1 << 8;
 
@@ -192,7 +190,7 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
     if code < size_of::<Header>()
         || code % 16 != 0
         || code_end.is_none()
-        || h.code_size as usize > SLOT_BYTES
+        || h.code_size as usize > MAX_BLOCK_BYTES
         || h.code_size % 4 != 0
         || region > h.code_size
         || h.body_offset < ENTRY_OFFSET

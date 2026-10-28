@@ -1,10 +1,12 @@
-//! Test driver: run one straight-line x86-64 program description in the VM.
+//! Test driver: run one x86-64 program description in the VM.
 //!
 //! Fixture setup (owned here, not by the emulator): user-mode 4-level page
 //! tables mapping exactly the pages of the code and the memory regions, the
 //! bytes, and the initial architectural state. The program ends where its
 //! bytes end: that RIP is the stop address. Prints the final state as JSON.
-//! An optional block size limit makes every program run as several blocks.
+//! An optional block size limit makes every program run as several blocks;
+//! `--code-cache BYTES` sets the code cache's capacity and `--watchdog-ms MS`
+//! the watchdog (default 10 s).
 //!
 //! Description (text, one item per line):
 //!   rip ADDR | rflags VALUE | gpr V0 .. V15 | code HEX | memory ADDR HEX
@@ -127,15 +129,24 @@ fn page_span(start: u64, length: usize) -> impl Iterator<Item = u64> {
     (start & !4095..start + length as u64).step_by(4096)
 }
 
+const USAGE: &str =
+    "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] [--code-cache BYTES] [--watchdog-ms MS]";
+
 pub(crate) fn run(args: &[String]) -> Result<()> {
-    let (resident, fexc, description, _work) = match args {
-        [_, r, _, f, d, w] | [_, r, _, f, d, w, _] => (r, f, d, w),
-        _ => return Err("usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS]".into()),
+    let [_, resident, _, fexc, description, _work, options @ ..] = args else {
+        return Err(USAGE.into());
     };
-    let max_instructions = match args.get(6) {
-        Some(n) => Some(n.parse().map_err(|_| "bad block size limit")?),
-        None => None,
-    };
+    let (mut max_instructions, mut code_bytes, mut watchdog_ms) = (None, exec::cache::CODE_BYTES, 10_000);
+    let mut options = options.iter();
+    while let Some(option) = options.next() {
+        let mut value = || -> Result<usize> { options.next().and_then(|v| v.parse().ok()).ok_or(USAGE.into()) };
+        match option.as_str() {
+            "--code-cache" => code_bytes = value()?,
+            "--watchdog-ms" => watchdog_ms = value()? as u64,
+            n if max_instructions.is_none() => max_instructions = Some(n.parse().map_err(|_| "bad block size limit")?),
+            _ => return Err(USAGE.into()),
+        }
+    }
     let p = parse(&fs::read_to_string(description).map_err(|e| e.to_string())?)?;
     // Code pages are read-only and executable; region pages writable and not executable.
     let mut flags = BTreeMap::new();
@@ -148,7 +159,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             flags.insert(page, WRITABLE | if code { 0 } else { NO_EXECUTE });
         }
     }
-    let memory = execution::prepare(resident)?;
+    let memory = execution::prepare(resident, code_bytes)?;
     let mut guest = Builder::new(execution::guest_ram(&memory))?;
     for (&page, &f) in &flags {
         guest.map(page, f)?;
@@ -162,6 +173,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let entry = guest.ram.read::<u64>(leaf).unwrap();
         assert!(guest.ram.write(leaf, entry & !bits));
     }
+    execution::guest_ram_written(&memory);
     // User mode (as the QEMU reference), 4-level paging, NX and WP on.
     execution::set_cpu(
         &memory,
@@ -180,7 +192,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let vm = Vm::new(memory)?;
     let mut compiler = Compiler::new(Path::new(fexc), &vm.cpu, max_instructions)?;
     vm.cpu.enter_resident(0, natemu_abi::shadow::TCR_BOTH)?;
-    let stop = execution::run(&vm, &mut compiler, Some(p.rip + p.code.len() as u64))?;
+    let mut requests = execution::Requests::default();
+    let watchdog = std::time::Duration::from_millis(watchdog_ms);
+    let stop = execution::run(&vm, &mut compiler, Some(p.rip + p.code.len() as u64), watchdog, &mut requests)?;
     let s: State = vm.memory.read_record(exec::STATE_OFFSET);
 
     // A guest exception (resident: at an access site or stub; host: instruction fetch) with its record.
@@ -192,6 +206,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         Stop::NoCode(reason) => ("no_code", reason.clone(), [0; 4]),
         Stop::Resident { stop: exec::stop::GUEST_FAULT, .. } => ("guest_fault", "resident".into(), s.fault),
         Stop::Resident { stop, status, detail } => ("resident", format!("{} status={status} detail={detail}", exec::stop::name(*stop)), [0; 4]),
+        Stop::Watchdog => ("watchdog", String::new(), [0; 4]),
     };
     let list = |v: &[u64]| v.iter().map(|x| format!("\"{x:#x}\"")).collect::<Vec<_>>().join(",");
     let mut out = format!(
@@ -217,8 +232,14 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"compiles\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{}}}",
+        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{}}}",
         s.blocks,
+        s.fast,
+        s.l2_hits,
+        s.requests,
+        requests.rips.len(),
+        requests.blocks,
+        s.generation,
         compiler.compiles,
         s.retries,
         s.upgrades,

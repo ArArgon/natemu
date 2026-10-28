@@ -12,6 +12,7 @@ use record::*;
 // Kept general for the multi-owner path; only the families use it so far.
 #[cfg_attr(not(feature = "families"), allow(dead_code))]
 mod coordinator;
+mod cache;
 mod execution;
 #[cfg(feature = "families")]
 mod families;
@@ -32,6 +33,10 @@ macro_rules! gates { ($source:expr) => { global_asm!($source,
     exception_stack_top=const EXCEPTION_STACK_TOP,
     identity_entry=const PRIVATE+0x11008,
     upper_root_pages=const (shadow::UPPER_ROOT-shadow::LOWER_ROOT)/4096,
+    frame_rip=const natemu_abi::execution::frame::RIP,
+    l1_address=const natemu_abi::execution::cache::LOOKUP_VA+natemu_abi::execution::cache::L1 as u64,
+    l1_mask=const natemu_abi::execution::cache::L1_MASK,
+    fast_counter=const natemu_abi::execution::STATE_VA+offset_of!(natemu_abi::execution::State,fast) as u64,
 ); } }
 #[cfg(not(feature = "families"))]
 gates!(include_str!("gates.S"));

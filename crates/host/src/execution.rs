@@ -1,16 +1,19 @@
 //! Host side of block execution (`natemu_abi::execution`): the execution mode's
-//! private address space, and the service loop that answers the resident's
-//! translation requests: fetch the guest bytes at RIP through the guest walk,
-//! compile one block with fexc (`--profile slice1`, a persistent server), admit it and stage it.
+//! private address space (code cache areas included), and the service loop that
+//! answers the resident's translation requests, which arrive only on a cache miss:
+//! fetch the guest bytes at RIP through the guest walk, compile one block with fexc
+//! (`--profile slice1`, a persistent server), admit it and stage it. A watchdog
+//! stops a vCPU that runs too long without a host exit.
 use super::*;
 use crate::admission;
-use natemu_abi::execution::{self as exec, Cpu, State};
+use natemu_abi::execution::{self as exec, Cpu, State, cache};
 use natemu_abi::guest_memory::{GuestRam, GuestTables};
 use natemu_abi::paging::{self, Access, Fault};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::Duration;
 
 /// Guest-physical RAM of the execution mode, through the host's alias.
 pub(crate) fn guest_ram(memory: &Memory) -> GuestRam {
@@ -20,9 +23,18 @@ pub(crate) fn guest_ram(memory: &Memory) -> GuestRam {
 }
 
 /// Backing for the execution mode with the resident loaded and its private
-/// address space and shared record in place; guest RAM is zero.
-pub(crate) fn prepare(resident: &str) -> Result<Memory> {
-    let memory = Memory::with_size(exec::BACKING_BYTES)?;
+/// address space and shared record in place; guest RAM is zero. The code cache
+/// holds `code_bytes` of generated code (at most `cache::CODE_BYTES_MAX`).
+pub(crate) fn prepare(resident: &str, code_bytes: usize) -> Result<Memory> {
+    if !(cache::MAX_BLOCK_BYTES..=cache::CODE_BYTES_MAX).contains(&code_bytes) {
+        return Err(format!(
+            "code cache of {code_bytes} bytes: it must hold the largest block ({} bytes) and at most {} bytes",
+            cache::MAX_BLOCK_BYTES,
+            cache::CODE_BYTES_MAX
+        ));
+    }
+    let code_mapped = code_bytes.next_multiple_of(cache::BLOCK);
+    let memory = Memory::with_size(exec::BACKING_BYTES + code_mapped)?;
     load_resident(&memory, resident)?;
     let mut spans = resident_text(0);
     let own = |offset, bytes| Span::data(offset, bytes, offset);
@@ -36,8 +48,17 @@ pub(crate) fn prepare(resident: &str) -> Result<Memory> {
         own((EXCEPTION_STACK_TOP - PRIVATE) as usize - 0x4000, 0x4000),
         own(exec::STAGING_OFFSET, exec::STAGING_BYTES),
         own(exec::GUEST_RAM_OFFSET, exec::GUEST_RAM_BYTES),
+        Span::text((cache::CODE_VA - PRIVATE) as usize, code_mapped, cache::CODE_OFFSET),
+        Span::data((cache::CODE_WRITE_VA - PRIVATE) as usize, code_mapped, cache::CODE_OFFSET),
+        Span::data((cache::META_VA - PRIVATE) as usize, cache::META_BYTES, cache::META_OFFSET),
+        Span::data((cache::LOOKUP_VA - PRIVATE) as usize, cache::LOOKUP_BYTES, cache::LOOKUP_OFFSET),
+        Span::data((cache::GLOBAL_VA - PRIVATE) as usize, cache::GLOBAL_BYTES, cache::GLOBAL_OFFSET),
     ]);
     private_space(&memory, 0, &spans, &[], true);
+    // SAFETY: Control is plain integers; the resident owns everything but the capacity.
+    let mut control: cache::Control = unsafe { std::mem::zeroed() };
+    control.code_bytes = code_bytes as u64;
+    memory.write_record(cache::LOOKUP_OFFSET + cache::CONTROL, control);
     // SAFETY: Shared is plain integers; all-zero is its empty value.
     let mut shared: Shared = unsafe { std::mem::zeroed() };
     shared.mode = exec::MODE;
@@ -47,6 +68,14 @@ pub(crate) fn prepare(resident: &str) -> Result<Memory> {
 /// Sets the vCPU's initial architectural state (before it first runs).
 pub(crate) fn set_cpu(memory: &Memory, cpu: Cpu) {
     memory.write_record(exec::STATE_OFFSET, State::new(cpu));
+}
+/// Guest RAM was written by the host (only while the vCPU is stopped): the vCPU drops its cached code before it
+/// next runs guest code.
+pub(crate) fn guest_ram_written(memory: &Memory) {
+    let at = cache::GLOBAL_OFFSET + cache::QUEUES;
+    let mut queue: cache::Queue = memory.read_record(at);
+    queue.flush = cache::FLUSH;
+    memory.write_record(at, queue);
 }
 
 /// Why execution stopped.
@@ -60,6 +89,8 @@ pub(crate) enum Stop {
     NoCode(String),
     /// The resident stopped the VM: `State::stop` (0 for a non-execution stop) and the shared status/detail.
     Resident { stop: u64, status: u64, detail: u64 },
+    /// The watchdog forced the vCPU out (imprecise: the bank is not current).
+    Watchdog,
 }
 
 /// One `fexc --serve` process (protocol in tools/fexc/fexc.cpp): length-prefixed requests and replies on its stdin/stdout.
@@ -190,11 +221,38 @@ struct Fetched {
     next_fault: Option<Fault>,
 }
 
+/// The fetch walk's A-bit writes: one to a page the vCPU holds translations from is a host write to code, which
+/// the vCPU must not keep running (see [`guest_ram_written`]).
+struct CodePageWrites<'a>(&'a Memory, bool);
+impl natemu_abi::guest_memory::Observer for CodePageWrites<'_> {
+    fn write(&mut self, gpa: u64, _: u64, _: u64) -> bool {
+        let page = (gpa >> 12) as usize;
+        if page < exec::GUEST_PAGES {
+            self.1 |= self.0.read::<1>(cache::GLOBAL_OFFSET + cache::CODE_PAGES + page)[0] != 0;
+        }
+        true
+    }
+}
+
 /// Guest bytes at `rip` up to the end of its page, continuing into the next
 /// page when that is fetchable, and never past `limit`.
-fn fetch(ram: GuestRam, cpu: &Cpu, rip: u64, limit: Option<u64>) -> Result<std::result::Result<Fetched, Fault>> {
+fn fetch(memory: &Memory, cpu: &Cpu, rip: u64, limit: Option<u64>) -> Result<std::result::Result<Fetched, Fault>> {
+    let ram = guest_ram(memory);
     let control = cpu.control().ok_or("bank is not in 4-level long mode")?;
-    let mut tables = GuestTables::new(ram);
+    let mut tables = GuestTables::observed(ram, CodePageWrites(memory, false));
+    let fetched = fetch_with(&mut tables, ram, control, rip, limit);
+    if tables.observer.1 {
+        guest_ram_written(memory);
+    }
+    fetched
+}
+fn fetch_with(
+    tables: &mut GuestTables<CodePageWrites>,
+    ram: GuestRam,
+    control: paging::Control,
+    rip: u64,
+    limit: Option<u64>,
+) -> Result<std::result::Result<Fetched, Fault>> {
     let (mut bytes, mut pages, mut va, mut next_fault) = (Vec::new(), Vec::new(), rip, None);
     for _ in 0..2 {
         let page_end = (va | 4095).checked_add(1);
@@ -204,7 +262,7 @@ fn fetch(ram: GuestRam, cpu: &Cpu, rip: u64, limit: Option<u64>) -> Result<std::
             (_, Some(e)) => e,
             (_, None) => 0, // the last page: up to 2^64, wrapping is the guest's problem
         };
-        let t = match paging::walk(&mut tables, control, va, Access::Fetch) {
+        let t = match paging::walk(tables, control, va, Access::Fetch) {
             Ok(t) if t.wb => t,
             Ok(_) if pages.is_empty() => return Err(format!("code at {va:#x} is not write-back memory")),
             Ok(_) => break,
@@ -228,12 +286,50 @@ fn fetch(ram: GuestRam, cpu: &Cpu, rip: u64, limit: Option<u64>) -> Result<std::
     Ok(Ok(Fetched { bytes, pages, next_fault }))
 }
 
+/// Host exits of one [`run`].
+#[derive(Default)]
+pub(crate) struct Requests {
+    /// Translation requests answered with a block, and the distinct RIPs among them.
+    pub(crate) blocks: u64,
+    pub(crate) rips: std::collections::HashSet<u64>,
+}
+
 /// Runs the vCPU (entered at the resident) until it stops; `stop_at` is a RIP at
-/// which execution stops at a block boundary (blocks are fetched up to it).
-pub(crate) fn run(vm: &Vm, compiler: &mut Compiler, stop_at: Option<u64>) -> Result<Stop> {
-    let ram = guest_ram(&vm.memory);
+/// which execution stops at a block boundary (blocks are fetched up to it, and
+/// never cached at it, so reaching it is a miss). A vCPU that stays in the guest
+/// for `watchdog` without a host exit is forced out ([`Stop::Watchdog`]); host
+/// work between exits (compiles) is not counted.
+pub(crate) fn run(vm: &Vm, compiler: &mut Compiler, stop_at: Option<u64>, watchdog: Duration, requests: &mut Requests) -> Result<Stop> {
+    // `true`: the vCPU enters the guest; `false`: it is back in the host. Dropping the sender ends the watchdog.
+    let (running, events) = std::sync::mpsc::channel::<bool>();
+    let id = vm.cpu.id();
+    let dog = std::thread::spawn(move || {
+        use std::sync::mpsc::RecvTimeoutError::Timeout;
+        while let Ok(true) = events.recv() {
+            let mut limit = watchdog;
+            // Repeated while the vCPU stays in: a request racing its entry into `hv_vcpu_run` might not stop it.
+            while events.recv_timeout(limit) == Err(Timeout) {
+                exit_vcpus(&mut [id]);
+                limit = Duration::from_millis(100);
+            }
+        }
+    });
+    let stop = serve(vm, compiler, stop_at, requests, &running);
+    // ponytail: a cancel the watchdog sent just as the guest exited stays pending on the vCPU and would end its next
+    // `hv_vcpu_run` at once; harmless while a vCPU serves one run. Drain it (a zero-length run) if vCPUs get reused.
+    drop(running);
+    let _ = dog.join();
+    stop
+}
+fn serve(vm: &Vm, compiler: &mut Compiler, stop_at: Option<u64>, requests: &mut Requests, running: &std::sync::mpsc::Sender<bool>) -> Result<Stop> {
     loop {
-        match vm.cpu.run_to_hvc()? {
+        let _ = running.send(true);
+        let exit = vm.cpu.run_until_exit();
+        let _ = running.send(false);
+        let Some(exit) = exit? else {
+            return Ok(Stop::Watchdog);
+        };
+        match exit {
             0x49 => {
                 let s = vm.shared();
                 let state: State = vm.memory.read_record(exec::STATE_OFFSET);
@@ -250,7 +346,7 @@ pub(crate) fn run(vm: &Vm, compiler: &mut Compiler, stop_at: Option<u64>) -> Res
         if Some(rip) == stop_at {
             return Ok(Stop::Reached);
         }
-        let Fetched { bytes, pages, next_fault } = match fetch(ram, &state.cpu, rip, stop_at)? {
+        let Fetched { bytes, pages, next_fault } = match fetch(&vm.memory, &state.cpu, rip, stop_at)? {
             Ok(fetched) => fetched,
             Err(fault) => return Ok(Stop::FetchFault(fault)),
         };
@@ -265,13 +361,13 @@ pub(crate) fn run(vm: &Vm, compiler: &mut Compiler, stop_at: Option<u64>) -> Res
             }
         };
         vm.memory.copy(exec::STAGING_OFFSET, &block.object);
-        state.source_va = [u64::MAX; 2];
+        requests.blocks += 1;
+        requests.rips.insert(rip);
         state.source_gpa = [u64::MAX; 2];
         // Source pages are those the translated bytes reach.
         let end = rip.wrapping_add(u64::from(block.guest_bytes) - 1);
         let used = pages.into_iter().filter(|&[va, _]| va == rip & !4095 || va == end & !4095);
-        for (i, [va, gpa]) in used.enumerate() {
-            state.source_va[i] = va;
+        for (i, [_, gpa]) in used.enumerate() {
             state.source_gpa[i] = gpa;
         }
         state.reply = exec::REPLY_ADMITTED;

@@ -174,9 +174,18 @@ impl Vcpu {
     /// Runs until the next exit and returns its HVC immediate; any other exit is
     /// an error reporting the exit and PC.
     pub(crate) fn run_to_hvc(&self) -> Result<u64> {
+        self.run_until_exit()?.ok_or_else(|| "vCPU exit requested by the host".into())
+    }
+    /// Runs until the next exit: its HVC immediate, or `None` when the host forced the exit
+    /// ([`exit_vcpus`]); any other exit is an error reporting the exit and PC.
+    pub(crate) fn run_until_exit(&self) -> Result<Option<u64>> {
+        const CANCELED: u32 = 0;
         unsafe {
             hv(hv_vcpu_run(self.id), "hv_vcpu_run")?;
             let exit = &*self.exit;
+            if exit.reason == CANCELED {
+                return Ok(None);
+            }
             if exit.reason != 1 || exit.exception.syndrome >> 26 != 0x16 {
                 return Err(format!(
                     "unexpected exit: reason={} syndrome={:#x} PC={:#x} VA={:#x} IPA={:#x}",
@@ -187,7 +196,7 @@ impl Vcpu {
                     exit.exception.physical_address
                 ));
             }
-            Ok(exit.exception.syndrome & 0xffff)
+            Ok(Some(exit.exception.syndrome & 0xffff))
         }
     }
     /// Destroys the vCPU now and returns the framework status.
