@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: natemu <natemu@example.invalid>
+Date: Tue, 27 Oct 2026 00:00:00 +0000
+Subject: [PATCH 10/10] FEXCore: slice1 literal exits through the block linker
+ pointer
+
+Under fexc_slice1 only: BranchOps.cpp ExitFunction loads Pointers.ExitFunctionLinker for an exit to a literal
+(inline-constant) RIP and Pointers.DispatcherLoopTop for a computed one, FEX's own linker/dispatcher split. The literal
+exit is then exactly `ldr x0, L; str x0, [x28, #State.rip]; ldr x1, [x28, #ExitFunctionLinker]; br x1`; the resident's
+linker replaces its first word with a direct branch to the target block's entry.
+---
+ FEXCore/Source/Interface/Core/JIT/BranchOps.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+index 23c25a0..91ad3e7 100644
+--- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+@@ -68,7 +68,13 @@ DEF_OP(ExitFunction) {
+       auto RipReg = GetReg(Op->NewRIP);
+       str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+     }
+-    ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
++    // natemu slice1: a literal exit goes through FEX's block linker pointer (the resident links it, patching the
++    // `ldr` into a direct branch), a computed one through the dispatcher.
++    if (fexc_slice1 && IsInlineRIP) {
++      ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.ExitFunctionLinker));
++    } else {
++      ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
++    }
+     br(TMP2);
+ 
+     if (IsInlineRIP) {

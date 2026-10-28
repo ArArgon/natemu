@@ -78,6 +78,57 @@ pub(crate) fn guest_ram_written(memory: &Memory) {
     memory.write_record(at, queue);
 }
 
+/// Self-check of the vCPU's cache after a run (the contract's rule (d), independent of the resident): every link point of
+/// every placed block holds its admitted word (`ldr x0, L`, L holding its target) or `b` to the entry of a placed block
+/// keyed (target, the block's context), and the resident's link records describe exactly the linked ones. Returns
+/// (link points, linked).
+pub(crate) fn check_links(memory: &Memory) -> Result<(u64, u64)> {
+    let lookup = |offset: usize| cache::LOOKUP_OFFSET + offset;
+    let control: cache::Control = memory.read_record(lookup(cache::CONTROL));
+    let word = |offset: u64| u32::from_le_bytes(memory.read::<4>(cache::CODE_OFFSET + offset as usize));
+    let blocks: Vec<cache::Block> = (0..control.blocks as usize)
+        .map(|n| {
+            let meta = u32::from_le_bytes(memory.read::<4>(lookup(cache::INDEX) + 4 * n));
+            memory.read_record(cache::META_OFFSET + meta as usize)
+        })
+        .collect();
+    let mut linked = HashMap::new();
+    let mut points = 0;
+    for b in &blocks {
+        for p in b.links.iter().filter(|p| p.offset != 0) {
+            points += 1;
+            let at = u64::from(b.code) + u64::from(p.offset);
+            let w = word(at);
+            let bad = || format!("link point {:#x} of the block at {:#x}: word {w:#010x}", p.offset, b.rip);
+            if w & 0xff00_001f == 0x5800_0000 {
+                let literal = at.wrapping_add((((w << 8) as i32 >> 13) as i64 * 4) as u64);
+                let value = u64::from(word(literal)) | u64::from(word(literal + 4)) << 32;
+                if value != p.target || literal < u64::from(b.code) || literal + 8 > u64::from(b.code + b.code_size) {
+                    return Err(bad());
+                }
+            } else if w & 0xfc00_0000 == 0x1400_0000 {
+                let to = at.wrapping_add((((w << 6) as i32 >> 6) as i64 * 4) as u64);
+                match blocks.iter().position(|t| u64::from(t.code) + u64::from(exec::ENTRY_OFFSET) == to) {
+                    Some(t) if blocks[t].rip == p.target && blocks[t].context == b.context => linked.insert((b.number, p.offset), t),
+                    _ => return Err(bad()),
+                };
+            } else {
+                return Err(bad());
+            }
+        }
+    }
+    let records: Vec<cache::LinkRecord> = (0..control.links as usize)
+        .map(|i| memory.read_record(lookup(cache::LINKS) + i * size_of::<cache::LinkRecord>()))
+        .collect();
+    let described = records.iter().all(|r| {
+        linked.get(&(r.source, r.offset)) == Some(&(r.target as usize)) && r.original & 0xff00_001f == 0x5800_0000
+    });
+    if !described || records.len() != linked.len() {
+        return Err(format!("{} link records for {} linked points", records.len(), linked.len()));
+    }
+    Ok((points, linked.len() as u64))
+}
+
 /// Why execution stopped.
 #[derive(Debug)]
 pub(crate) enum Stop {
@@ -155,6 +206,9 @@ pub(crate) struct Compiler {
     pub(crate) compiles: u64,
     /// Requests answered from the cache.
     pub(crate) hits: u64,
+    /// Test drivers only: rewrites each admitted object before it is staged, to check the resident's run-time defences
+    /// against code admission refuses.
+    pub(crate) tamper: Option<fn(&mut [u8])>,
 }
 impl Compiler {
     pub(crate) fn new(fexc: &Path, cpu: &Vcpu, max_instructions: Option<u32>) -> Result<Self> {
@@ -165,7 +219,7 @@ impl Compiler {
         Ok(Self::with_features(fexc, admission::supported_features(&id), max_instructions))
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
-        Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), compiles: 0, hits: 0 }
+        Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), compiles: 0, hits: 0, tamper: None }
     }
     /// The admitted block for `bytes` at `rip`, or fexc's end reason when it produced no code.
     fn compile(&mut self, bytes: &[u8], rip: u64) -> Result<std::result::Result<admission::Admitted, String>> {
@@ -203,7 +257,13 @@ impl Compiler {
             self.hits += 1;
         }
         match &self.cache[&body] {
-            Compiled::Object(object) => Ok(Ok(admission::admit(object, rip, bytes, self.supported)?)),
+            Compiled::Object(object) => {
+                let mut admitted = admission::admit(object, rip, bytes, self.supported)?;
+                if let Some(tamper) = self.tamper {
+                    tamper(&mut admitted.object);
+                }
+                Ok(Ok(admitted))
+            }
             Compiled::NoCode(reason) => Ok(Err(reason.clone())),
         }
     }
@@ -364,6 +424,8 @@ fn serve(vm: &Vm, compiler: &mut Compiler, stop_at: Option<u64>, requests: &mut 
         requests.blocks += 1;
         requests.rips.insert(rip);
         state.source_gpa = [u64::MAX; 2];
+        state.link_points = [exec::LinkPoint::NONE; exec::MAX_LINK_POINTS];
+        state.link_points[..block.links.len()].copy_from_slice(&block.links);
         // Source pages are those the translated bytes reach.
         let end = rip.wrapping_add(u64::from(block.guest_bytes) - 1);
         let used = pages.into_iter().filter(|&[va, _]| va == rip & !4095 || va == end & !4095);

@@ -26,10 +26,10 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as nine commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as ten commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series7` (series6 plus patch 0009). Kept for comparison only: `series6` (patches 0001-0008, before self-loop exits and the stop check), `series5`, `series4`
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series8` (series7 plus patch 0010). Kept for comparison only: `series7` (patches 0001-0009, literal exits through DispatcherLoopTop), `series6` (patches 0001-0008, before self-loop exits and the stop check), `series5`, `series4`
 (patches 0001-0007, before division), `series2` (patches 0001-0006, the "before" of the guard cost), `s1c` (slice1
 without the precision patches, the "before" of the precision cost) and `c1b` (the v1 build without sites). The earlier `series1` (flag rule before the cheaper one below) and `s1b1` are gone.
 
@@ -57,6 +57,7 @@ Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--v
 | 0007 | slice1 address guard, split-store check, branch-target check (JIT hooks, pre-RA scan, `ret` without writeback) |
 | 0008 | slice1 #DE for div/idiv (width record in the dispatcher, check after FEX's LUDIV/LDIV call, divide ops as flag fault points) |
 | 0009 | slice1 self-loop exits (no `JumpTargets` lookup for the taken edge of jcc/jrcxz/loop) and FEX's pending-interrupt fault check at every block entry |
+| 0010 | slice1 literal exits through `Pointers.ExitFunctionLinker` (computed exits keep `DispatcherLoopTop`): FEX's linker/dispatcher split, so the resident can link them |
 
 Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in `shim/` and `fexc.cpp`; the patches only
 include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then
@@ -253,11 +254,12 @@ The scripts that read `fixtures/slice1/programs.json` (git-ignored; `smoke.py`, 
   (`features.required_by_settings_profile`; `--feature flagm=0` is refused).
 - **Exits.** `BranchOps.cpp::ExitFunction` takes FEX's existing `BLOCK_DEBUGGING` branch when the runtime flag
   `fexc_slice1` is set (the compile-time constant stays off: `Core.cpp::CompileBlock` would force one instruction per
-  block). Every exit is `ldr x0,<rip literal>; str x0,[x28,#State.rip]; ldr x1,[x28,#Pointers.DispatcherLoopTop]; br x1`
-  (computed targets store their register). The 8-byte RIP literal is placed in the code and registered as a
+  block). Every exit to a literal RIP is `ldr x0,<rip literal>; str x0,[x28,#State.rip]; ldr x1,[x28,#Pointers.ExitFunctionLinker];
+  br x1` (a link point: since patch 0010 the resident's linker rewrites its first word into `b <target entry>`); a computed
+  exit stores its register and loads `Pointers.DispatcherLoopTop` instead. The 8-byte RIP literal is placed in the code and registered as a
   `guest_rip_literal` relocation (FEX's debugging branch leaves it unregistered). No exit-linker literal is emitted, so there
-  is no `named_symbol_literal`, L1 lookup, block link or x25 call-return stack; the only state pointer loaded is
-  `DispatcherLoopTop`. Guest RIP constants for RIP-relative addresses and pushed return addresses stay `guest_rip_move`.
+  is no `named_symbol_literal`, in-code L1 lookup, FEX jump thunk or x25 call-return stack; the only state pointers loaded
+  are `ExitFunctionLinker`, `DispatcherLoopTop` and the division helpers. Guest RIP constants for RIP-relative addresses and pushed return addresses stay `guest_rip_move`.
   The literals are data inside the code region (check_sites masks them from its disassembly).
 - **Block cutting.** Before each instruction `GenerateIR` asks `shim/fexc_slice1.inc` (`FexcSlice1::Cut`). If the instruction
   is outside the allowlist, the block ends before it: `ExitFunction` to its RIP (or, when it is the first instruction, no
@@ -515,8 +517,9 @@ six self-loop programs, `emitted_value` aside), patch 0009:
   would then overlap the region's first 320 bytes, which no admitted field uses (highest is the division helper at 3032). (2) Armed,
   the host `hv_vm_protect`s the region read-only; the next block entry's store takes a stage-2 permission data abort to the host
   (EC 0x24, WnR = 1, HPFAR in the region, PC = the store at native offset 12 of a block) with the vCPU exactly at the block-entry
-  state: guest registers in the static map and NZCV in PSTATE, State.rip = the block's guest RIP (every entry follows an exit
-  that stored it), `InlineJITBlockHeader` already naming the block (word 8 ran, word 12 did not). Nothing of the block's body ran.
+  state: guest registers in the static map and NZCV in PSTATE, `InlineJITBlockHeader` already naming the block (word 8 ran,
+  word 12 did not), whose record gives the guest RIP. (State.rip is stale after a linked edge, which skips the exit's store,
+  as in FEX: the header, not State.rip, names the block.) Nothing of the block's body ran.
   (3) The host banks that state itself (or resumes the resident at a banking routine), and to continue restores RW and
   re-enters, which retries the store. `hv_vcpus_exit` stays an imprecise watchdog. (4) Until the host stop path exists the
   region may be ordinary writable memory (as today: the store hits a harmless word of the frame page).
@@ -527,6 +530,17 @@ six self-loop programs, `emitted_value` aside), patch 0009:
   rel8 and rel32, the stop word in every form, mutations of P12/P13); the admission unit tests mutate the stop store (removed,
   next/previous field, wrong register, 32-bit, moved, repeated, loaded).
 
+## Literal exits through the linker (S2c)
+
+Under `--profile slice1` only (default-profile JSON and objects identical to series7 on the 64 fixtures, `emitted_value`
+aside), patch 0010 makes `BranchOps.cpp::ExitFunction` load `Pointers.ExitFunctionLinker` (offset 2952, JSON
+`state_abi.state_offsets.exit_function_linker`) for an exit to an inline-constant RIP and `Pointers.DispatcherLoopTop` (2920)
+for a computed one, as FEX's own linking path does. A literal exit is then exactly `ldr x0, L; str x0, [x28, #0x18]; ldr x1,
+[x28, #0xb88]; br x1`. Admission (`structure.rs`, "Exits") accepts it only in that form, with L the block end or the decoded
+target of the block's branch and no branch into its words 2-4, and returns it as a link point; the resident's linker
+(`crates/runtime/src/execution.rs` `linker`) rewrites the first word into `b` to the target block's entry. Same code size and
+layout as series7: only that one load word per literal exit differs.
+
 ## Checks
 
 - `python3 -m unittest tools/fexc/test_fexc.py`: structure, exact sites for hand-checked instructions, object file,
@@ -534,8 +548,9 @@ six self-loop programs, `emitted_value` aside), patch 0009:
 - `python3 -m unittest tools/fexc/test_slice1.py`: profile slice1. Every system class and unsupported form placed after two
   allowed instructions ends the block exactly at its RIP with the right reason and the same code as the two instructions alone;
   as the first instruction it gives no code; ~100 allowed forms and 11 branch forms translate; every exit in the branch cases
-  and the 64 programs is the single gate (disassembled), with no named-symbol literal, no pointer load but
-  `DispatcherLoopTop` and the division helpers (used only by FEX's helper call), no x25; the 64 programs translate completely.
+  and the 64 programs is one of the two gates (disassembled: a literal exit loads `ExitFunctionLinker`, a computed one
+  `DispatcherLoopTop`), with no named-symbol literal, no other pointer load but the division helpers (used only by FEX's
+  helper call), no x25; the 64 programs translate completely.
 - `python3 tools/fexc/scan_skips.py`: the native-control-flow scan above.
 - `python3 tools/fexc/verify_precision.py [--before FEXC0] [CORPUS.json ...]`: the slice1 precision guarantee (above) and the
   guards (P8-P10: guard on exactly the access address, split check on every store wider than 1 byte, stubs reached only by their checks,

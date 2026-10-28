@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: natemu <natemu@example.invalid>
 Date: Tue, 27 Oct 2026 00:00:00 +0000
-Subject: [PATCH 4/9] FEXCore: record guest memory access sites
+Subject: [PATCH 04/10] FEXCore: record guest memory access sites
 
 The hooks behind the natemu-fexc-v2 `sites` array. The dispatcher's
 carry-inversion state is captured where each GuestOpcode op is created

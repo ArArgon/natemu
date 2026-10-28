@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: natemu <natemu@example.invalid>
 Date: Tue, 27 Oct 2026 00:00:00 +0000
-Subject: [PATCH 9/9] FEXCore: slice1 self-loop exits and the block-entry stop
- check
+Subject: [PATCH 09/10] FEXCore: slice1 self-loop exits and the block-entry
+ stop check
 
 Under fexc_slice1 only (guarded at both points; the default profile is unchanged):
 - OpcodeDispatcher.cpp CondJUMPOp / CondJUMPRCXOp / LoopOp: no JumpTargets lookup for the taken edge, so a jump back to

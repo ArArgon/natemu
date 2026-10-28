@@ -6,8 +6,10 @@
 //! exit the resident's dispatcher looks up the next RIP (L1, then L2); only a
 //! miss asks the host for code (`hvc #TRANSLATE_HVC`): the host fetches the bytes
 //! through the guest walk, compiles and admits one block into the staging area
-//! and replies; the resident places it in the cache and enters it. Shadow misses
-//! are served in the resident.
+//! and replies; the resident places it in the cache and enters it. A literal exit
+//! (a [`LinkPoint`]) goes through the resident's linker instead, which finds the
+//! target the same way and then patches the exit into a direct branch to it, so a
+//! linked edge never leaves generated code. Shadow misses are served in the resident.
 use crate::{
     PRIVATE, RAM_SIZE,
     paging::{self, Control},
@@ -38,9 +40,9 @@ pub const STACK_BYTES: usize = 0x4000;
 pub const BLOCK_STACK_BYTES: u32 = 0x2000;
 /// Stack below the spill area a 128/64 division uses: FEX's `lr` push and the helper's saved registers.
 pub const HELPER_STACK_BYTES: u32 = 64;
-/// Guest-physical RAM `[0, GUEST_RAM_BYTES)`: backing offset and resident alias.
-pub const GUEST_RAM_OFFSET: usize = RAM_SIZE;
-pub const GUEST_RAM_BYTES: usize = 0x10_0000;
+/// Guest-physical RAM `[0, GUEST_RAM_BYTES)`: backing offset and resident alias, mapped in 2 MiB blocks.
+pub const GUEST_RAM_OFFSET: usize = 2 * RAM_SIZE;
+pub const GUEST_RAM_BYTES: usize = 0x40_0000;
 pub const GUEST_RAM_VA: u64 = PRIVATE + GUEST_RAM_OFFSET as u64;
 /// Guest-physical pages of guest RAM.
 pub const GUEST_PAGES: usize = GUEST_RAM_BYTES / 4096;
@@ -72,7 +74,7 @@ pub mod cache {
     pub const BLOCK: usize = 2 * MIB;
 
     /// Backing offsets (2 MiB aligned).
-    pub const LOOKUP_OFFSET: usize = 2 * MIB;
+    pub const LOOKUP_OFFSET: usize = crate::execution::GUEST_RAM_OFFSET + crate::execution::GUEST_RAM_BYTES;
     pub const GLOBAL_OFFSET: usize = LOOKUP_OFFSET + LOOKUP_BYTES;
     pub const META_OFFSET: usize = GLOBAL_OFFSET + GLOBAL_BYTES;
     pub const CODE_OFFSET: usize = META_OFFSET + META_BYTES;
@@ -92,6 +94,9 @@ pub mod cache {
     pub const INDEX: usize = 0x12_0000;
     /// At most half of L2, so probes stay short.
     pub const MAX_BLOCKS: usize = L2_ENTRIES / 2;
+    /// Link records ([`LinkRecord`]), one per patched link point, in patch order; a full area means no new links.
+    pub const LINKS: usize = 0x14_0000;
+    pub const MAX_LINKS: usize = 32 * 1024;
 
     /// Global area layout: one code-page mask byte per guest-physical page (bit v: vCPU v holds translations from
     /// the page), then one [`Queue`] per vCPU.
@@ -111,6 +116,47 @@ pub mod cache {
         pub blocks: u64,
         /// The lookup context (CR3, context word) L1 was filled under.
         pub l1_context: [u64; 2],
+        /// Link records in use.
+        pub links: u64,
+    }
+    /// A block placed in the cache: its record in the metadata arena (at the offset `INDEX` lists), its access sites
+    /// ([`crate::code_object::Site`]) right after it.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Block {
+        pub rip: u64,
+        pub context: [u64; 2],
+        /// Guest-physical source pages (`u64::MAX` = unused).
+        pub source_gpa: [u64; 2],
+        /// Offset of the FEX block (its 4-byte `JITCodeHeader` first) in the code area, and its size.
+        pub code: u32,
+        pub code_size: u32,
+        pub sites_count: u32,
+        pub guest_bytes: u32,
+        /// Its position in `INDEX`.
+        pub number: u32,
+        pub reserved: u32,
+        /// Its literal exits as admitted (`offset` 0 = unused).
+        pub links: [super::LinkPoint; super::MAX_LINK_POINTS],
+    }
+    impl Block {
+        /// Its `JITCodeHeader` in the executable alias (what its entry prologue stores in `InlineJITBlockHeader`).
+        pub fn code_va(&self) -> u64 {
+            CODE_VA + u64::from(self.code)
+        }
+        pub fn entry(&self) -> u64 {
+            self.code_va() + u64::from(super::ENTRY_OFFSET)
+        }
+    }
+    /// A patched link point: the first word of link point `offset` of block `source` (block numbers) was `original`
+    /// (`ldr x0, L`) and is now `b` to the entry of block `target`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct LinkRecord {
+        pub source: u32,
+        pub offset: u32,
+        pub original: u32,
+        pub target: u32,
     }
     /// Invalidation requests to one vCPU, drained at each resident entry. `pages` lists guest-physical pages whose
     /// translations are stale; `flush` (or a full list) drops the whole cache.
@@ -124,6 +170,7 @@ pub mod cache {
     pub const FLUSH: u64 = 1;
 
     const _: () = assert!(crate::execution::GUEST_RAM_OFFSET + crate::execution::GUEST_RAM_BYTES <= LOOKUP_OFFSET);
+    const _: () = assert!((crate::execution::GUEST_RAM_OFFSET | crate::execution::GUEST_RAM_BYTES | LOOKUP_OFFSET) % BLOCK == 0);
     // The guest RAM alias ends below the code area; every area lies in PRIVATE..PRIVATE + 1 GiB, 2 MiB aligned.
     const _: () = assert!(crate::execution::GUEST_RAM_VA + crate::execution::GUEST_RAM_BYTES as u64 <= CODE_VA);
     const _: () = assert!(CODE_VA + CODE_BYTES_MAX as u64 <= CODE_WRITE_VA);
@@ -138,7 +185,8 @@ pub mod cache {
     const _: () = assert!(core::mem::size_of::<Control>() <= WRITABLE);
     const _: () = assert!(WRITABLE + crate::execution::GUEST_PAGES / 8 <= L1);
     const _: () = assert!(L1 + L1_ENTRIES * 16 <= L2 && L2 + L2_ENTRIES * 16 <= INDEX);
-    const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= LOOKUP_BYTES);
+    const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= LINKS);
+    const _: () = assert!(LINKS + MAX_LINKS * core::mem::size_of::<LinkRecord>() <= LOOKUP_BYTES);
     const _: () = assert!(CODE_PAGES + crate::execution::GUEST_PAGES <= QUEUES);
     const _: () = assert!(QUEUES + MAX_VCPUS * core::mem::size_of::<Queue>() <= GLOBAL_BYTES);
 }
@@ -148,27 +196,59 @@ pub const BACKING_BYTES: usize = cache::CODE_OFFSET;
 
 /// FEX `CpuStateFrame` fields admitted code may access (pinned FEX build).
 pub mod frame {
-    /// `InlineJITBlockHeader`: the entry prologue stores the block's address.
+    /// `InlineJITBlockHeader`: the entry prologue `adr x0, header; str x0, [x28]` stores the running block's address
+    /// (its only admitted access); the linker reads it to find the block whose literal exit it was called from.
     pub const BLOCK_HEADER: u32 = 0;
     /// `State.rip`: every exit stores the next guest RIP here.
     pub const RIP: u32 = 24;
     /// `CPUState.flags[RFLAG_NZCV_LOC]`: an instruction's incoming NZCV (`nzcv=frame` sites).
     pub const PRE_NZCV: u32 = 1032;
-    /// `Pointers.DispatcherLoopTop`: the resident exit gate.
+    /// `Pointers.DispatcherLoopTop`: the resident exit gate of computed exits (the fast dispatcher).
     pub const DISPATCHER_LOOP_TOP: u32 = 2920;
+    /// `Pointers.ExitFunctionLinker`: the resident block linker, the gate of every literal exit (a link point).
+    pub const EXIT_FUNCTION_LINKER: u32 = 2952;
     /// `Pointers.LUDIVHandler` / `LDIVHandler`: the resident 128/64 unsigned / signed division helpers a 64-bit
     /// div / idiv calls when its dividend needs 128 bits (FEX's helper ABI, see the runtime's `natemu_ludiv`).
     pub const LUDIV_HANDLER: u32 = 3024;
     pub const LDIV_HANDLER: u32 = 3032;
     /// Native pointers the resident fills; code may only load them.
-    pub const POINTERS: [u32; 3] = [DISPATCHER_LOOP_TOP, LUDIV_HANDLER, LDIV_HANDLER];
+    pub const POINTERS: [u32; 4] = [DISPATCHER_LOOP_TOP, EXIT_FUNCTION_LINKER, LUDIV_HANDLER, LDIV_HANDLER];
     /// `(offset, bytes)` of every admitted access.
-    pub const FIELDS: [(u32, u32); 6] =
-        [(BLOCK_HEADER, 8), (RIP, 8), (PRE_NZCV, 4), (DISPATCHER_LOOP_TOP, 8), (LUDIV_HANDLER, 8), (LDIV_HANDLER, 8)];
+    pub const FIELDS: [(u32, u32); 7] = [
+        (BLOCK_HEADER, 8),
+        (RIP, 8),
+        (PRE_NZCV, 4),
+        (DISPATCHER_LOOP_TOP, 8),
+        (EXIT_FUNCTION_LINKER, 8),
+        (LUDIV_HANDLER, 8),
+        (LDIV_HANDLER, 8),
+    ];
+    /// FEX's `InterruptFaultPage` (`offsetof(InternalThreadState, InterruptFaultPage) - offsetof(.., BaseFrameState)`,
+    /// fexc's `state_abi.state_offsets.natemu_interrupt_fault_page`): the block entry's stop store `str xzr, [x28, #this]`.
+    /// The runtime stops a vCPU by write-protecting the region holding these 8 bytes. Not a member of [`FIELDS`]:
+    /// admission allows that one store and no other access.
+    pub const INTERRUPT_FAULT_PAGE: u32 = 3776;
     pub const BYTES: usize = 4096;
 }
 /// Native offset of a FEX block's entry: after its 4-byte `JITCodeHeader`.
 pub const ENTRY_OFFSET: u32 = 4;
+
+/// A literal exit of an admitted block, exactly `ldr x0, L; str x0, [x28, #RIP]; ldr x1, [x28, #EXIT_FUNCTION_LINKER];
+/// br x1` with L holding a proven guest RIP (the block end or its branch's decoded target): the native offset of its
+/// first word, the only word the resident's linker rewrites (to `b` the entry of the block cached for `target`), and
+/// `target`. Offset 0 (the code header) marks an unused entry.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkPoint {
+    pub offset: u32,
+    pub reserved: u32,
+    pub target: u64,
+}
+impl LinkPoint {
+    pub const NONE: Self = Self { offset: 0, reserved: 0, target: 0 };
+}
+/// Link points per block: a slice-1 block ends at one branch (a jcc has two literal exits); admission refuses more.
+pub const MAX_LINK_POINTS: usize = 4;
 /// The static-register map (FEX `x64::SRA`) admission pins for every block: native registers of RAX..R15, then PF
 /// and AF. Guest state is in these registers at every block entry and exit.
 pub const SRA: [u8; 18] = [4, 7, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 29, 26, 27];
@@ -285,6 +365,9 @@ pub mod stop {
     pub const SHADOW: u64 = 7;
     /// The same abort recurred after its shadow was installed and left unchanged.
     pub const NO_PROGRESS: u64 = 8;
+    /// A linker exit whose `InlineJITBlockHeader` names no live cache block (or a block without a link point to the
+    /// exit's RIP), or a link point holding neither its original word nor a branch to a live block it may link to.
+    pub const BAD_LINK: u64 = 9;
 
     pub fn name(code: u64) -> &'static str {
         match code {
@@ -296,6 +379,7 @@ pub mod stop {
             UNSUPPORTED_SMC => "unsupported_smc",
             SHADOW => "shadow",
             NO_PROGRESS => "no_progress",
+            BAD_LINK => "bad_link",
             _ => "none",
         }
     }
@@ -311,8 +395,9 @@ pub struct State {
     /// The cache's flush generation (flushes so far), sent with each request: the host never needs to resend an
     /// object the resident holds.
     pub generation: u64,
-    /// With a reply: guest-physical pages the staged block was fetched from (`u64::MAX` = unused).
+    /// With a reply: guest-physical pages the staged block was fetched from (`u64::MAX` = unused), and its link points.
     pub source_gpa: [u64; 2],
+    pub link_points: [LinkPoint; MAX_LINK_POINTS],
     pub stop: u64,
     /// Guest exception due at a stop: vector, CR2 (#PF; else 0), error code, RIP.
     pub fault: [u64; 4],
@@ -335,6 +420,14 @@ pub struct State {
     pub upgrades: u64,
     pub evictions: u64,
     pub splits: u64,
+    /// Linker entries (literal exits not yet linked); link points patched and restored; linker entries that did not
+    /// link because the cache was flushed while the target was found or requested, or because the link records were
+    /// full.
+    pub linker: u64,
+    pub links: u64,
+    pub unlinks: u64,
+    pub stale_links: u64,
+    pub full_links: u64,
 }
 impl State {
     pub const fn new(cpu: Cpu) -> Self {
@@ -344,6 +437,7 @@ impl State {
             reply: NONE,
             generation: 0,
             source_gpa: [u64::MAX; 2],
+            link_points: [LinkPoint::NONE; MAX_LINK_POINTS],
             stop: 0,
             fault: [0; 4],
             native: [0; 3],
@@ -357,6 +451,11 @@ impl State {
             upgrades: 0,
             evictions: 0,
             splits: 0,
+            linker: 0,
+            links: 0,
+            unlinks: 0,
+            stale_links: 0,
+            full_links: 0,
         }
     }
 }

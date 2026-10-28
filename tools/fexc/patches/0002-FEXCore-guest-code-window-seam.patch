@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: natemu <natemu@example.invalid>
 Date: Tue, 27 Oct 2026 00:00:00 +0000
-Subject: [PATCH 2/9] FEXCore: guest-code window seam
+Subject: [PATCH 02/10] FEXCore: guest-code window seam
 
 Guest instruction bytes live in a bounded host buffer that the driver
 resolves by logical guest address, so nothing is mapped at the guest

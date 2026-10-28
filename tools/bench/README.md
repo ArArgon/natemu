@@ -79,3 +79,26 @@ thermal) is recorded at start and end.
   pays for its own shadow paging; the comparison is system TCG vs natemu, which is why system TCG is the yardstick.
 - **Steady-state only.** QEMU's translation and boot cost (startup intercept is about 40-45 ms system, 5-7 ms linux-user) is excluded; compile cost
   belongs in a separate natemu-side measurement (contract section 4).
+
+## natemu (`run_natemu.py`, S2c measurement)
+
+    tools/with-env python3 tools/bench/run_natemu.py --fexc FEXC --out DIR [--reps 5] [--scale 1.0] [--bench int,mem64] [--max-block N]
+
+The same `benchmarks.json` programs through natemu's program driver (`natemu-host RUNTIME run-program`, the general execution
+path: resident code cache, linking, dispatcher), at N and 2N (`n_default` x `--scale`), interleaved, `--reps` rounds after a
+discarded warm-up. ns/insn = (t(2N) - t(N)) / (insns(2N) - insns(N)) per round, process wall time; median and range. Every run's
+final GPRs must equal `model()` and stop at the program end; N and 2N must compile the same blocks and make the same resident
+entries and links (only the dispatcher's L1 hits of computed exits, `ret`, may grow with N). No tuning: measurement only.
+
+October 27, 2026 (S2c, series8, default block size, 5 rounds, M4, not idle; `natemu-raw/s2c/bench/results.json`):
+
+| bench | natemu ns/insn | range % | QEMU system TCG | ratio | per iteration in the steady state |
+|---|---|---|---|---|---|
+| int | 0.189 | 0.2 | 0.200 | 0.94 | one linked self-loop block |
+| mem64 | 0.102 | 12.3 | 0.346 | 0.30 | one linked block; 512 shadow retries at start |
+| mem4096 | 0.993 | 9.7 | 0.398 | 2.50 | one linked block; 256 pages per sweep (TLB misses in the VM) |
+| call | 0.156 | 1.6 | 0.744 | 0.21 | linked call edge; `ret` through the fast dispatcher (one L1 hit per iteration) |
+| branchy | 0.410 | 0.5 | 0.597 | 0.69 | six blocks, all edges linked |
+| mixed | 0.080 | 0.9 | 0.283 | 0.28 | one linked block |
+
+Guest RAM grew from 1 to 4 MiB for this (the 1 MiB array of mem64/mem4096 did not fit). Not attributed yet (S2g).

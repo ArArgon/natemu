@@ -9,9 +9,10 @@
 //!   decoded word of the code region; no word falls through into a literal slot or past the region; a literal load
 //!   names a guest-RIP literal slot.
 //! - Memory: base x28 is an unsigned-offset access inside an admitted frame field; the native pointers are loaded
-//!   only by the exit gate (`str xR, [x28, #rip]; ldr x1, [x28, #gate]; br x1`) and the division helper call
-//!   (`ldr x3, [x28, #helper]; str x30, [sp, #-16]!; blr x3; ldr x30, [sp], #16`), the only indirect branches and sp
-//!   accesses; State.rip is written only whole. Every other access is an access site whose record matches the word.
+//!   only by the exits (a computed one `str xR, [x28, #rip]; ldr x1, [x28, #DispatcherLoopTop]; br x1`, a literal one
+//!   below) and the division helper call (`ldr x3, [x28, #helper]; str x30, [sp, #-16]!; blr x3; ldr x30, [sp], #16`),
+//!   the only indirect branches and sp accesses; State.rip is written only whole; `InlineJITBlockHeader` only by the
+//!   entry prologue. Every other access is an access site whose record matches the word.
 //! - Address guard: every access not addressed by a guest-RIP move is preceded in its instruction by `eor x0, xA, xA,
 //!   lsl #16; tbnz x0, #63, G` (or `tbz x0, #63, +8; b G`), G a guard stub linked to it, xA its base or x1 computed as
 //!   exactly its address (`add|sub x1, base, #imm`, `add x1, base, index{, ext #s}`, or a mov/movk constant into x1 and
@@ -21,12 +22,15 @@
 //!   before the access.
 //! - Split: every store wider than one byte has `add x0, xA, #w-1; eor x0, x0, xA; tbnz w0, #12, S` on exactly its
 //!   address, only x0/x1 written between it and the store (guest-RIP-addressed: `b S` iff it crosses a page).
-//! - Entry: the block's third prologue word is exactly `str xzr, [x28, #INTERRUPT_FAULT_PAGE]` after `str x0, [x28]`
-//!   (FEX's suspend/interrupt fault check): the runtime stops a vCPU by write-protecting the page that store targets,
-//!   so the stop is precise (the next block entry faults with the entry state intact). That word is the only access
-//!   to those 8 bytes, and every block has it.
+//! - Entry: the prologue is exactly `adr x0, header; str x0, [x28]; str xzr, [x28, #INTERRUPT_FAULT_PAGE]`: the only
+//!   store to `InlineJITBlockHeader` (the linker trusts it to name the running block) and FEX's suspend/interrupt
+//!   fault check (the runtime stops a vCPU by write-protecting the page that store targets, so the stop is precise:
+//!   the next block entry faults with the entry state intact). That word is the only access to those 8 bytes.
 //! - Exits: every computed State.rip store has `eor x0, xR, xR, lsl #16; tbnz x0, #63, G` on its register in its
-//!   instruction (G a branch-target guard), a literal one follows `ldr xR, literal`.
+//!   instruction (G a branch-target guard) and loads DispatcherLoopTop. A literal one is a link point, exactly `ldr x0,
+//!   L; str x0, [x28, #rip]; ldr x1, [x28, #ExitFunctionLinker]; br x1`, L holding the block end or the decoded target
+//!   of its branch, and no branch enters its words 2-4 (the linker rewrites word 1 to `b` the target's entry);
+//!   ExitFunctionLinker is loaded nowhere else. Admission returns the link points.
 //! - Division: each div/idiv (from its x86 opcode: width, signedness) has exactly its per-width #DE checks, in their
 //!   exact form, before FEX's divide, reading that divide's own divisor (and, at 8 bits, dividend) registers; the
 //!   128/64 helper gets the same divisor and its call is followed by `cbnz x2, D`.
@@ -38,7 +42,7 @@
 use std::ops::Range;
 
 use natemu_abi::code_object::{self as object, PcEntry, Reloc, Site};
-use natemu_abi::execution::{ENTRY_OFFSET, frame};
+use natemu_abi::execution::{ENTRY_OFFSET, LinkPoint, frame, frame::INTERRUPT_FAULT_PAGE};
 
 /// The 64-bit index forms (LSL, UXTX, SXTX) compute the same address: one extend value.
 const EXT_X: u8 = object::EXT_SXTX;
@@ -216,13 +220,10 @@ fn memory(w: u32, at: u32) -> Option<Insn> {
 
 // Exact words of the fixed sequences.
 const LDR_GATE: u32 = 0xf940_0381 | (frame::DISPATCHER_LOOP_TOP / 8) << 10; // ldr x1, [x28, #DispatcherLoopTop]
+const LDR_LINKER: u32 = 0xf940_0381 | (frame::EXIT_FUNCTION_LINKER / 8) << 10; // ldr x1, [x28, #ExitFunctionLinker]
+const STR_X0_RIP: u32 = 0xf900_0380 | (frame::RIP / 8) << 10; // str x0, [x28, #State.rip]
 const BR_X1: u32 = 0xd61f_0020;
-/// `CpuStateFrame` offset of FEX's `InterruptFaultPage` (`offsetof(InternalThreadState, InterruptFaultPage) -
-/// offsetof(.., BaseFrameState)`, fexc's `state_abi.state_offsets.natemu_interrupt_fault_page`): the 8 bytes the runtime
-/// write-protects (inside a region of their own) to stop the vCPU at the next block entry.
-// TODO(S2c integration): move to `natemu_abi::execution::frame` (a const, NOT a member of `frame::FIELDS`: this rule is
-// the only access).
-const INTERRUPT_FAULT_PAGE: u32 = 3776;
+const ADR_X0_HEADER: u32 = 0x10ff_ffe0; // adr x0, #-4 (the block's JITCodeHeader, from the entry)
 const STR_X0_HEADER: u32 = 0xf900_0380; // str x0, [x28, #BLOCK_HEADER]
 const STR_XZR_STOP: u32 = 0xf900_039f | (INTERRUPT_FAULT_PAGE / 8) << 10; // str xzr, [x28, #INTERRUPT_FAULT_PAGE]
 /// Native offset of the stop store: `adr x0, header; str x0, [x28]; str xzr, [x28, #stop]` after the 4-byte header.
@@ -276,6 +277,8 @@ pub(super) struct Code<'a> {
     pub source: &'a [u8],
     pub rip: u64,
     pub guest_bytes: u32,
+    /// The guest RIPs a literal exit may go to: the block end, and the direct target of the branch ending it.
+    pub targets: &'a [u64],
 }
 
 pub(super) fn canonical(a: u64) -> bool {
@@ -292,9 +295,12 @@ struct Verifier<'a> {
     /// Per stub (same order as `c.stubs`): how it is reached, and whether a rule accepted that check.
     checks: Vec<Check>,
     claimed: Vec<bool>,
+    /// The literal exits found by `exits`.
+    links: Vec<LinkPoint>,
 }
 
-pub(super) fn check(c: &Code) -> Result<(), String> {
+/// Verifies the code; returns its link points.
+pub(super) fn check(c: &Code) -> Result<Vec<LinkPoint>, String> {
     let mut v = Verifier::new(c)?;
     v.entry()?;
     v.words()?;
@@ -303,7 +309,7 @@ pub(super) fn check(c: &Code) -> Result<(), String> {
     v.divisions()?;
     match v.claimed.iter().position(|&ok| !ok) {
         Some(i) => Err(format!("stub at {:#x} is reached by no check of its kind", c.stubs[i].native_offset)),
-        None => Ok(()),
+        None => Ok(v.links),
     }
 }
 
@@ -329,7 +335,7 @@ impl<'a> Verifier<'a> {
             })
             .collect::<Result<_, _>>()?;
         branches.sort_by_key(|&(_, t)| t);
-        let mut v = Verifier { c, insns, branches, moves: Vec::new(), checks: Vec::new(), claimed: vec![false; c.stubs.len()] };
+        let mut v = Verifier { c, insns, branches, moves: Vec::new(), checks: Vec::new(), claimed: vec![false; c.stubs.len()], links: Vec::new() };
         for r in c.relocs.iter().filter(|r| r.kind == object::RELOC_GUEST_RIP_MOVE) {
             let (words, value) = v.move_sequence(r.offset, r.register).ok_or(format!("guest-RIP move at {:#x}", r.offset))?;
             if value != r.value || !v.displacement_ok(r.offset, value) {
@@ -401,6 +407,13 @@ impl<'a> Verifier<'a> {
     fn rip_store(&self, at: u32) -> bool {
         matches!(self.insn(at), Some(Insn::Mem(m)) if !m.load && m.addr.base == 28 && m.addr.imm == frame::RIP as i64)
     }
+    /// The four words at `at` are a link point (`ldr x0, L; str x0, [x28, #rip]; ldr x1, [x28, #linker]; br x1`) that
+    /// no branch enters after its first word; `L`'s offset.
+    fn link_point(&self, at: u32) -> Option<i64> {
+        let Some(Insn::Literal { rt: 0, target }) = self.insn(at) else { return None };
+        let tail = at as usize + 16 <= self.c.code.len() && [self.word(at + 4), self.word(at + 8), self.word(at + 12)] == [STR_X0_RIP, LDR_LINKER, BR_X1];
+        (tail && self.sealed(at, at, at + 12)).then_some(target)
+    }
     fn helper_at(&self, at: u32) -> bool {
         at as usize + 16 <= self.c.code.len()
             && [LDR_LUDIV, LDR_LDIV].contains(&self.word(at))
@@ -438,14 +451,14 @@ impl<'a> Verifier<'a> {
         disp == 0 || i32::try_from(disp).is_ok_and(|d| insn.windows(4).any(|b| b == d.to_le_bytes()))
     }
 
-    /// Every block begins with the stop store after the header store (no branch can enter the prologue: branches go
+    /// Every block begins with the header store and the stop store (no branch can enter the prologue: branches go
     /// forward, and `new` requires each target to be a decoded word after its source).
     fn entry(&self) -> Result<(), String> {
         let word = |at: u32| (at as usize + 4 <= self.c.code.len()).then(|| self.word(at));
-        if word(STOP_AT) == Some(STR_XZR_STOP) && word(STOP_AT - 4) == Some(STR_X0_HEADER) {
+        if [word(ENTRY_OFFSET), word(STOP_AT - 4), word(STOP_AT)] == [Some(ADR_X0_HEADER), Some(STR_X0_HEADER), Some(STR_XZR_STOP)] {
             Ok(())
         } else {
-            Err(format!("entry prologue at {:#x}: not `str x0, [x28]; str xzr, [x28, #{INTERRUPT_FAULT_PAGE}]`", STOP_AT - 4))
+            Err(format!("entry prologue at {ENTRY_OFFSET:#x}: not `adr x0, header; str x0, [x28]; str xzr, [x28, #{INTERRUPT_FAULT_PAGE}]`"))
         }
     }
 
@@ -473,8 +486,12 @@ impl<'a> Verifier<'a> {
                 Insn::Literal { target, .. } if !self.c.literals.iter().any(|l| l.start as i64 == target && l.len() == 8) => {
                     return fail(at, "literal load of a non-literal");
                 }
-                // The exit gate, right after the exit's State.rip store.
-                Insn::Br if !(w == BR_X1 && self.word(at - 4) == LDR_GATE && self.rip_store(at.wrapping_sub(8)) && self.sealed(at - 8, at - 8, at)) => {
+                // The exits' gates: a computed exit's, right after its State.rip store, or a link point's last word.
+                Insn::Br
+                    if !(w == BR_X1
+                        && ((self.word(at - 4) == LDR_GATE && self.rip_store(at.wrapping_sub(8)) && self.sealed(at - 8, at - 8, at))
+                            || (at >= 12 && self.link_point(at - 12).is_some()))) =>
+                {
                     return fail(at, "indirect branch");
                 }
                 Insn::Blr if !(at >= 8 && self.helper_at(at - 8)) => return fail(at, "indirect branch"),
@@ -505,6 +522,21 @@ impl<'a> Verifier<'a> {
                 Ok(())
             } else {
                 Err(format!("frame access {w:#010x} at {at:#x}: the interrupt-fault word is accessed only by the block entry's stop store"))
+            };
+        }
+        if overlaps(frame::BLOCK_HEADER, 8) {
+            // The header store, only as the block's second prologue word (`entry` checks the prologue).
+            return if at == STOP_AT - 4 && w == STR_X0_HEADER {
+                Ok(())
+            } else {
+                Err(format!("frame access {w:#010x} at {at:#x}: the block header is accessed only by the entry prologue's store"))
+            };
+        }
+        if overlaps(frame::EXIT_FUNCTION_LINKER, 8) {
+            return if w == LDR_LINKER && at >= 8 && self.link_point(at - 8).is_some() {
+                Ok(())
+            } else {
+                Err(format!("frame access {w:#010x} at {at:#x}: ExitFunctionLinker is loaded only as the third word of a link point"))
             };
         }
         let ok = m.form == Form::Unsigned
@@ -708,7 +740,7 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    /// Every State.rip store: a literal RIP, or a register checked canonical by a branch-target guard.
+    /// Every State.rip store: a link point to a proven RIP, or a register checked canonical by a branch-target guard.
     fn exits(&mut self) -> Result<(), String> {
         for at in (ENTRY_OFFSET..self.c.code.len() as u32).step_by(4) {
             let Some(Insn::Mem(m)) = self.insn(at) else { continue };
@@ -716,7 +748,15 @@ impl<'a> Verifier<'a> {
                 continue;
             }
             let r = m.rt;
-            if matches!(self.insn(at - 4), Some(Insn::Literal { rt, .. }) if rt == r) && self.sealed(at - 4, at - 4, at) {
+            if matches!(self.insn(at - 4), Some(Insn::Literal { rt, .. }) if rt == r) {
+                let Some(literal) = self.link_point(at - 4) else {
+                    return Err(format!("exit at {at:#x}: a literal exit is not exactly a link point"));
+                };
+                let target = u64::from_le_bytes(self.c.code[literal as usize..][..8].try_into().unwrap());
+                if !self.c.targets.contains(&target) {
+                    return Err(format!("exit at {at:#x}: literal {target:#x} is neither the block end nor its branch target"));
+                }
+                self.links.push(LinkPoint { offset: at - 4, reserved: 0, target });
                 continue;
             }
             let Some((g, lo)) = self.instruction(at) else { return Err(format!("exit at {at:#x} outside the PC table")) };
@@ -950,7 +990,7 @@ mod tests {
     use super::*;
     use natemu_abi::code_object::Header;
 
-    /// Real fexc (series7, profile slice1) objects and the guest bytes they were compiled from.
+    /// Real fexc (series8, profile slice1) objects and the guest bytes they were compiled from.
     macro_rules! fixture {
         ($name:literal) => {
             (
@@ -1096,9 +1136,82 @@ mod tests {
         let (call, jcc) = (FIXTURES[2], FIXTURES[6]);
         refused(call, 0x10, 0xca08_4100, 0xca09_4120, "branch-target guard"); // checks x9, exits through rsp's copy
         refused(call, 0x40, 0xaa08_03f6, 0xaa09_03f6, "branch-target guard"); // mov x22, x9: an unchecked RIP
-        refused(jcc, 0x18, 0x5400_00e1, 0x5400_0041, "branch-target guard"); // b.ne to the str, skipping its literal
-        refused(jcc, 0x20, 0xf900_0f80, 0xf940_0f80, "indirect branch"); // exit without storing State.rip
-        refused(jcc, 0x18, 0x5400_00e1, 0x5400_0061, "indirect branch"); // b.ne to the gate load, skipping the exit's store
+        refused(jcc, 0x18, 0x5400_00e1, 0x5400_0041, "link point"); // b.ne to the str, skipping its literal
+        refused(jcc, 0x20, 0xf900_0f80, 0xf940_0f80, "link point"); // exit without storing State.rip
+        refused(jcc, 0x18, 0x5400_00e1, 0x5400_0061, "link point"); // b.ne to the gate load, skipping the exit's store
+    }
+
+    /// `jcc` (`cmp rax, rcx; jne +0x40`): fall-through exit at 0x1c (literal 0x2c), taken exit at 0x34 (literal 0x44).
+    const JCC: (&[u8], &[u8]) = FIXTURES[6];
+    const LINK_FT: u32 = 0x1c;
+    const LDR_X0_FT: u32 = 0x5800_0080; // ldr x0, 0x2c
+
+    #[test]
+    fn link_points_are_returned() {
+        let h: Header = super::super::record(JCC.0, 0);
+        let a = super::super::admit(JCC.0, h.guest_rip, JCC.1, u64::MAX).unwrap();
+        let point = |offset, target| LinkPoint { offset, reserved: 0, target };
+        assert_eq!(a.links, [point(LINK_FT, h.guest_rip + 5), point(0x34, h.guest_rip + 0x45)]);
+        // A computed exit (`call rsp`) is no link point.
+        let (call, _) = FIXTURES[2];
+        let h: Header = super::super::record(call, 0);
+        assert!(super::super::admit(call, h.guest_rip, FIXTURES[2].1, u64::MAX).unwrap().links.is_empty());
+    }
+
+    #[test]
+    fn link_point_form_is_pinned() {
+        let at = LINK_FT;
+        // Form altered: the dispatcher instead of the linker; another register; the tail's words rewritten.
+        refused(JCC, at + 8, LDR_LINKER, LDR_GATE, "not exactly a link point");
+        refused(JCC, at, LDR_X0_FT, LDR_X0_FT | 2, "link point"); // ldr x2, L; str x0
+        refused(JCC, at + 4, STR_X0_RIP, STR_X0_RIP | 2, "link point"); // ldr x0, L; str x2
+        refused(JCC, at + 12, BR_X1, 0xd61f_0040, "link point"); // br x2
+        // An extra write in the tail: x1 (the branch register) from a guest register, or x0 changed before its store.
+        refused(JCC, at + 8, LDR_LINKER, 0xaa05_03e1, "indirect branch"); // mov x1, x5
+        refused(JCC, at + 4, STR_X0_RIP, 0x9100_0400, "link point"); // add x0, x0, #1
+        // A branch into words 2-4 (the b.ne at 0x18 targets the taken exit's first word, 0x34).
+        refused(JCC, 0x18, 0x5400_00e1, 0x5400_0001 | (at + 4 - 0x18) / 4 << 5, "link point");
+        refused(JCC, 0x18, 0x5400_00e1, 0x5400_0001 | (at + 8 - 0x18) / 4 << 5, "link point");
+        refused(JCC, 0x18, 0x5400_00e1, 0x5400_0001 | (at + 12 - 0x18) / 4 << 5, "link point");
+        // The linker pointer loaded anywhere else: in a straight-line block, or as a computed exit's gate.
+        refused(ADDRESS, 0x24, 0xaa14_03e4, LDR_LINKER, "only as the third word of a link point");
+        let (call, src) = FIXTURES[2];
+        let h: Header = super::super::record(call, 0);
+        let words: Vec<u32> = call[h.code_offset as usize..][..h.code_region_end as usize].chunks(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+        let gate = words.iter().position(|&w| w == LDR_GATE).unwrap() as u32 * 4;
+        refused((call, src), gate, LDR_GATE, LDR_LINKER, "only as the third word of a link point");
+    }
+
+    #[test]
+    fn link_targets_must_be_proven() {
+        // The fall-through literal set to the block's own RIP (a plausible literal value, not this exit's target).
+        let h: Header = super::super::record(JCC.0, 0);
+        let mut object = JCC.0.to_vec();
+        let reloc = (0..h.relocs_count as usize)
+            .map(|i| h.relocs_offset as usize + i * size_of::<Reloc>())
+            .find(|&r| u32::from_le_bytes(object[r..r + 4].try_into().unwrap()) == 0x2c)
+            .unwrap();
+        object[reloc + 8..reloc + 16].copy_from_slice(&h.guest_rip.to_le_bytes());
+        let e = admit((&object, JCC.1)).expect_err("unproven link target admitted");
+        assert!(e.contains("neither the block end nor its branch target"), "{e}");
+        // Without a branch ending the block (fall-through only), its target is not proven either (refused already as
+        // a relocation value).
+        object[reloc + 8..reloc + 16].copy_from_slice(&(h.guest_rip + 0x45).to_le_bytes());
+        admit((&object, JCC.1)).unwrap(); // both exits to the taken target
+        let mut source = JCC.1.to_vec();
+        source[3] = 0x90; // nop instead of jne: the block's branch has no decoded target
+        let e = admit((&object, &source)).expect_err("link target without a branch admitted");
+        assert!(e.contains("relocation at 0x2c"), "{e}");
+    }
+
+    #[test]
+    fn only_the_entry_prologue_writes_the_block_header() {
+        refused(ADDRESS, 0x24, 0xaa14_03e4, STR_X0_HEADER, "block header"); // a second header store
+        refused(ADDRESS, 0x24, 0xaa14_03e4, 0xf900_0384, "block header"); // str x4, [x28]: a guest value as header
+        refused(ADDRESS, 0x24, 0xaa14_03e4, 0xb900_0784, "block header"); // str w4, [x28, #4]: its upper half
+        refused(ADDRESS, 0x24, 0xaa14_03e4, 0xf940_0381, "block header"); // ldr x1, [x28]
+        refused(ADDRESS, ENTRY_OFFSET, ADR_X0_HEADER, 0x1000_0000, "entry prologue"); // adr x0, #0: the entry, not the header
+        refused(ADDRESS, ENTRY_OFFSET, ADR_X0_HEADER, 0x10ff_ffc0, "entry prologue"); // adr x0, #-8
     }
 
     #[test]

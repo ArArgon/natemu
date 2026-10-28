@@ -330,3 +330,18 @@ returned_allocated:
     mov x1, #0
     bl finish
     b .
+
+// The block linker (`Pointers.ExitFunctionLinker`, FEX's `ExitFunctionLinker`): every literal exit, with its
+// target RIP in the frame, until the resident links it. Always the slow path, once per edge.
+.global link_exit
+link_exit:
+    msr spsel, #1
+    save_native
+    mrs x9, sp_el0
+    str x9, [sp, #{sp_offset}]
+    mrs x9, nzcv
+    str x9, [sp, #{nzcv_offset}]
+    mov x0, sp
+    mov x1, #2
+    bl finish
+    b .

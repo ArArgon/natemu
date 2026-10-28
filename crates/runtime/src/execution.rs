@@ -3,8 +3,10 @@
 //! place it, enter it from the state bank, take exits the fast dispatcher
 //! (`gates.S` `dispatch_fast`) cannot resolve back into the bank, and serve
 //! shadow misses at the recorded access sites of the block holding the faulting
-//! PC by walking the guest tables and retrying the same instruction. Also the
-//! 128/64 division helpers admitted code calls through the frame.
+//! PC by walking the guest tables and retrying the same instruction. Literal exits
+//! enter the linker (`gates.S` `link_exit`), which finds their target the same way
+//! and links the exit to it. Also the 128/64 division helpers admitted code calls
+//! through the frame.
 use super::*;
 use crate::cache::{self, Block};
 use natemu_abi::{
@@ -19,6 +21,7 @@ unsafe extern "C" {
     fn enter_allocated(frame: *const NativeFrame, pc: u64, spsr: u64) -> !;
     fn resume_exception(frame: *const NativeFrame, pc: u64, spsr: u64) -> !;
     fn dispatch_fast();
+    fn link_exit();
     fn natemu_ludiv();
     fn natemu_ldiv();
 }
@@ -139,17 +142,23 @@ pub unsafe fn start() -> ! {
     cache::reset();
     unsafe {
         frame_word(frame::DISPATCHER_LOOP_TOP).write_volatile(dispatch_fast as *const () as u64);
+        frame_word(frame::EXIT_FUNCTION_LINKER).write_volatile(link_exit as *const () as u64);
         frame_word(frame::LUDIV_HANDLER).write_volatile(natemu_ludiv as *const () as u64);
         frame_word(frame::LDIV_HANDLER).write_volatile(natemu_ldiv as *const () as u64);
         dispatch(s)
     }
 }
 
-/// Enters the block for `s.cpu.rip`: from the cache (L2; L1 was probed by the fast dispatcher), else asks the host
-/// for it and places it. Pending invalidations are taken first.
+/// Enters the block for `s.cpu.rip`.
 unsafe fn dispatch(mut s: State) -> ! {
+    let block = unsafe { find(&mut s) };
+    unsafe { enter(s, block) }
+}
+/// The block for `s.cpu.rip`: from the cache (L2; L1 was probed by the fast dispatcher), else asks the host for it and
+/// places it. Pending invalidations are taken first. Either may flush the cache (`s.generation`).
+unsafe fn find(s: &mut State) -> &'static Block {
     if cache::drain() {
-        flush(&mut s);
+        flush(s);
     }
     let context = s.cpu.code_context();
     cache::select_l1(context);
@@ -158,10 +167,42 @@ unsafe fn dispatch(mut s: State) -> ! {
             s.l2_hits += 1;
             b
         }
-        None => unsafe { translate_block(&mut s, context) },
+        None => unsafe { translate_block(s, context) },
     };
     cache::fill_l1(s.cpu.rip, block);
-    unsafe { enter(s, block) }
+    block
+}
+
+/// A literal exit (`Pointers.ExitFunctionLinker`, FEX's `ExitFunctionLink`), entered with the exit's state as at a
+/// dispatcher exit. `InlineJITBlockHeader` names the block that ran it: only its entry prologue stores there
+/// (admission), so it must be a live cache block with a link point to `State.rip`; anything else halts. The target is
+/// found as by the dispatcher; the exit is linked to it unless the cache was flushed meanwhile (the source may be
+/// gone: FEX re-checks the same way) or the link records are full, then the target is entered. A block run from the
+/// single-step slot is never linked.
+unsafe fn linker(frame: &NativeFrame) -> ! {
+    unsafe {
+        let mut s = load();
+        bank(&mut s.cpu, frame, frame.nzcv, true);
+        s.cpu.rip = frame_word(frame::RIP).read_volatile();
+        s.linker += 1;
+        let header = frame_word(frame::BLOCK_HEADER).read_volatile();
+        let source = match header {
+            SLOT_VA => None,
+            _ => Some(cache::block_with_header(header).unwrap_or_else(|| halt(s, stop::BAD_LINK))),
+        };
+        let generation = s.generation;
+        let target = find(&mut s);
+        match source {
+            Some(_) if s.generation != generation => s.stale_links += 1,
+            Some(source) => match cache::link(source, target) {
+                cache::Link::Linked(n) => s.links += n,
+                cache::Link::Full => s.full_links += 1,
+                cache::Link::Bad => halt(s, stop::BAD_LINK),
+            },
+            None => {}
+        }
+        enter(s, target)
+    }
 }
 
 /// A miss: the host compiles and admits the block at `s.cpu.rip` into staging; place it (flushing a full cache
@@ -191,11 +232,11 @@ unsafe fn translate_block(s: &mut State, context: [u64; 2]) -> &'static Block {
     s.request = NONE;
     s.requests += 1;
     let staging = STAGING_VA as *const u8;
-    let block = match cache::place(&h, staging, context, s.source_gpa) {
+    let block = match cache::place(&h, staging, context, s.source_gpa, s.link_points) {
         Some(b) => b,
         None => {
             flush(s);
-            cache::place(&h, staging, context, s.source_gpa).unwrap_or_else(|| halt(*s, stop::BAD_REPLY))
+            cache::place(&h, staging, context, s.source_gpa, s.link_points).unwrap_or_else(|| halt(*s, stop::BAD_REPLY))
         }
     };
     // A write to a translated page must fault: no writable shadow of a source page may survive.
@@ -207,8 +248,13 @@ unsafe fn translate_block(s: &mut State, context: [u64; 2]) -> &'static Block {
     block
 }
 
-/// Drops every block (capacity, or an invalidation request), with nothing generated live and the state banked.
+/// Drops every block (capacity, or an invalidation request), with nothing generated live and the state banked: first
+/// undoes every link and checks that every link point holds its admitted word again.
 fn flush(s: &mut State) {
+    match cache::unlink_all() {
+        Some(n) if cache::links_restored() => s.unlinks += n,
+        _ => halt(*s, stop::BAD_LINK),
+    }
     cache::reset();
     s.generation += 1;
     s.shadow_generation += 1;
@@ -240,11 +286,13 @@ unsafe fn enter(mut s: State, block: &Block) -> ! {
     }
 }
 
-/// Exception capture and the dispatcher's slow path both end here.
+/// Exception capture (`fault` 1), the linker (2) and the dispatcher's slow path (0) end here.
 pub unsafe fn returned(frame: &NativeFrame, fault: u64) -> ! {
     unsafe {
-        if fault != 0 {
-            aborted(frame)
+        match fault {
+            0 => {}
+            2 => linker(frame),
+            _ => aborted(frame),
         }
         // Block exit: guest state is in the static registers, NZCV (CF inverted) and PF/AF registers.
         let mut s = load();
@@ -362,7 +410,7 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
         };
         let at = elr - b.code_va();
         s.native[2] = at;
-        let all = b.sites();
+        let all = cache::sites(b);
         let Ok(i) = all.binary_search_by_key(&at, |site| site.native_offset as u64) else {
             halt(s, stop::UNKNOWN_ABORT)
         };

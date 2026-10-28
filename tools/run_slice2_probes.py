@@ -14,7 +14,9 @@ leaf calls (`call F` ... `F: body; ret`). Two forms are generated mechanically f
 The VM's final GPRs, masked RFLAGS and memory must equal QEMU's, and it must stop at the looping form's end. Counters:
 without a flush (only the one requested when the driver writes guest RAM), host translation requests must equal the
 distinct block RIPs (every block is compiled once and then found in the VM); a forced small code cache (`--code-cache`,
-at least the largest block) must flush repeatedly and still match; a cache smaller than that is refused. A non-terminating loop must be stopped by the watchdog. A block refused for a
+at least the largest block) must flush repeatedly and still match; a cache smaller than that is refused. Linking (S2c): a
+hot loop at N and 2N iterations makes the same resident entries and dispatcher hits, and a forged block header halts the
+linker; every run self-checks its link points (the driver). A non-terminating loop must be stopped by the watchdog. A block refused for a
 native backward branch (see SELF_LOOP) is reported as unsupported. Nothing is keyed by probe
 name; expected values come only from QEMU. Writes DIR/probes.json; exit status 1 on any failure."""
 import argparse, json, pathlib, random, subprocess, sys
@@ -229,10 +231,39 @@ def main():
     out.append({'name': 'tiny-cache', 'stderr': err})
     print(f"tiny-cache --code-cache 1: {'match' if ok else 'fail'} {err}")
 
-    # The watchdog stops a loop that never ends (no host exit after its first block).
+    # Linking (S2c): once a hot loop's edges are linked it runs without entering the resident or the dispatcher, so N
+    # and 2N iterations (N = 10^6) make the same number of resident entries (`blocks`) and dispatcher hits (`fast`).
+    for args in ([], ['1'], ['2']):
+        counts = []
+        for trips in (10**6, 2 * 10**6):
+            program, result, end = add_chain(3, trips)
+            state, err = run(f'hot-{trips}', program, args)
+            diffs = [f'host error: {err}'] if state is None else ref.compare(result, [ref.num(v) for v in state['gpr']],
+                     ref.num(state['rflags']), ref.num(state['rip']), state['memory'])
+            if state is not None:
+                if state['stop'] != 'reached': diffs.insert(0, f"stopped {state['stop']} at {state['rip']}")
+                counts.append((state['stats']['blocks'], state['stats']['fast'], state['stats']['linked']))
+            failures += bool(diffs)
+            out.append({'name': program['name'], 'args': args, 'stats': state and state['stats'], 'diffs': diffs, 'stderr': err})
+            print(f"{program['name']} {' '.join(args)}: {'fail' if diffs else 'match'} {state and state['stats']} {'; '.join(diffs)[:300]}")
+        ok = len(counts) == 2 and counts[0] == counts[1] and counts[0][2] > 0
+        failures += not ok
+        out.append({'name': 'hot-loop-entries', 'args': args, 'counts': counts})
+        print(f"hot loop {' '.join(args)}: {'match' if ok else 'fail'} (resident entries, dispatcher hits, linked) at N, 2N: {counts}")
+
+    # A block whose entry prologue stores anything but its own header (admission refuses this; the driver forges it
+    # after admission) makes the linker halt instead of patching code it cannot name.
+    program, _, _ = built['split-body']
+    state, err = run('forged-header', program, ['--forge-header'])
+    ok = state is not None and state['stop'] == 'resident' and state['reason'].startswith('bad_link') and state['stats']['links'] == 0
+    failures += not ok
+    out.append({'name': 'forged-header', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
+    print(f"forged-header: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']}")
+
+    # The watchdog stops a loop that never ends (no host exit after its first block; linked, it never leaves the code).
     spin = {'name': 'spin', 'code': ref.assemble('1: inc rax\njmp 1b').hex(), 'rip': CODE, 'gpr': gprs(), 'rflags': 0, 'memory': []}
     state, err = run('spin', spin, ['--watchdog-ms', '300'])
-    ok = state is not None and state['stop'] == 'watchdog' and state['stats']['fast'] > 1000
+    ok = state is not None and state['stop'] == 'watchdog' and state['stats']['linked'] == 1
     failures += not ok
     out.append({'name': 'spin', 'stop': state and state['stop'], 'stats': state and state['stats'], 'stderr': err})
     print(f"spin --watchdog-ms 300: {'match' if ok else 'fail'} {state and state['stop']} {state and state['stats']}")

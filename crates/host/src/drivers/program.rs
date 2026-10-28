@@ -6,7 +6,10 @@
 //! bytes end: that RIP is the stop address. Prints the final state as JSON.
 //! An optional block size limit makes every program run as several blocks;
 //! `--code-cache BYTES` sets the code cache's capacity and `--watchdog-ms MS`
-//! the watchdog (default 10 s).
+//! the watchdog (default 10 s). After the run the cache's link points are
+//! self-checked ([`execution::check_links`]). `--forge-header` (a run-time
+//! defence check) makes every block's entry prologue store its entry instead of its
+//! header, which admission refuses: the resident's linker must halt.
 //!
 //! Description (text, one item per line):
 //!   rip ADDR | rflags VALUE | gpr V0 .. V15 | code HEX | memory ADDR HEX
@@ -129,20 +132,29 @@ fn page_span(start: u64, length: usize) -> impl Iterator<Item = u64> {
     (start & !4095..start + length as u64).step_by(4096)
 }
 
-const USAGE: &str =
-    "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] [--code-cache BYTES] [--watchdog-ms MS]";
+const USAGE: &str = "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] \
+                     [--code-cache BYTES] [--watchdog-ms MS] [--forge-header]";
+
+/// `adr x0, #-4` (the block's header) at the entry becomes `adr x0, #0` (the entry itself).
+fn forge_header(object: &mut [u8]) {
+    let h: natemu_abi::code_object::Header = unsafe { std::ptr::read_unaligned(object.as_ptr().cast()) };
+    let at = (h.code_offset + exec::ENTRY_OFFSET) as usize;
+    assert_eq!(object[at..at + 4], 0x10ff_ffe0u32.to_le_bytes());
+    object[at..at + 4].copy_from_slice(&0x1000_0000u32.to_le_bytes());
+}
 
 pub(crate) fn run(args: &[String]) -> Result<()> {
     let [_, resident, _, fexc, description, _work, options @ ..] = args else {
         return Err(USAGE.into());
     };
-    let (mut max_instructions, mut code_bytes, mut watchdog_ms) = (None, exec::cache::CODE_BYTES, 10_000);
+    let (mut max_instructions, mut code_bytes, mut watchdog_ms, mut forge) = (None, exec::cache::CODE_BYTES, 10_000, false);
     let mut options = options.iter();
     while let Some(option) = options.next() {
         let mut value = || -> Result<usize> { options.next().and_then(|v| v.parse().ok()).ok_or(USAGE.into()) };
         match option.as_str() {
             "--code-cache" => code_bytes = value()?,
             "--watchdog-ms" => watchdog_ms = value()? as u64,
+            "--forge-header" => forge = true,
             n if max_instructions.is_none() => max_instructions = Some(n.parse().map_err(|_| "bad block size limit")?),
             _ => return Err(USAGE.into()),
         }
@@ -191,11 +203,15 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
 
     let vm = Vm::new(memory)?;
     let mut compiler = Compiler::new(Path::new(fexc), &vm.cpu, max_instructions)?;
+    if forge {
+        compiler.tamper = Some(forge_header);
+    }
     vm.cpu.enter_resident(0, natemu_abi::shadow::TCR_BOTH)?;
     let mut requests = execution::Requests::default();
     let watchdog = std::time::Duration::from_millis(watchdog_ms);
     let stop = execution::run(&vm, &mut compiler, Some(p.rip + p.code.len() as u64), watchdog, &mut requests)?;
     let s: State = vm.memory.read_record(exec::STATE_OFFSET);
+    let (link_points, linked) = execution::check_links(&vm.memory)?;
 
     // A guest exception (resident: at an access site or stub; host: instruction fetch) with its record.
     let (kind, reason, fault) = match &stop {
@@ -232,7 +248,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{}}}",
+        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{}}}",
         s.blocks,
         s.fast,
         s.l2_hits,
@@ -245,6 +261,13 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         s.upgrades,
         s.evictions,
         s.splits,
+        s.linker,
+        s.links,
+        s.unlinks,
+        s.stale_links,
+        s.full_links,
+        link_points,
+        linked,
         list(&fault),
         list(&s.native),
         frame_intact(&vm.memory)

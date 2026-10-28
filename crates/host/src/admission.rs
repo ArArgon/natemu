@@ -4,9 +4,10 @@
 //! of supported kinds and guest-RIP relocations of the requested RIP; then the
 //! code itself ([`structure`]): every instruction decoded, frame accesses, address
 //! guards, split and #DE checks, exits and indirect branches verified on the words.
-//! Literal slots are resolved here; the resident fills the frame's native pointers itself.
+//! Literal slots are resolved here, and the literal exits returned as link points;
+//! the resident fills the frame's native pointers itself.
 use natemu_abi::code_object::{self as object, Header, PcEntry, Reloc, Site};
-use natemu_abi::execution::{ENTRY_OFFSET, SRA, STAGING_BYTES, cache::MAX_BLOCK_BYTES, frame};
+use natemu_abi::execution::{ENTRY_OFFSET, LinkPoint, MAX_LINK_POINTS, SRA, STAGING_BYTES, cache::MAX_BLOCK_BYTES, frame};
 
 mod structure;
 
@@ -114,6 +115,8 @@ pub(crate) struct Admitted {
     pub object: Vec<u8>,
     /// Guest bytes the block translated from `rip`.
     pub guest_bytes: u32,
+    /// Its literal exits, the only words the resident's linker may rewrite.
+    pub links: Vec<LinkPoint>,
 }
 
 /// Direct branch target of the x86 instruction `insn` ending at `end`
@@ -131,7 +134,7 @@ fn branch_target(insn: &[u8], end: u64) -> Option<u64> {
 /// Admits `bytes`, an fexc `--object` compiled at `rip` from `source` (the guest
 /// bytes given to fexc), for a vCPU executing `supported` feature bits.
 pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Result<Admitted, String> {
-    let (admitted, parts) = admit_records(bytes, rip, source, supported)?;
+    let (mut admitted, parts) = admit_records(bytes, rip, source, supported)?;
     let h = &parts.header;
     let code = &admitted.object[h.code_offset as usize..][..h.code_region_end as usize];
     let split = parts.sites.iter().position(is_stub).unwrap_or(parts.sites.len());
@@ -146,8 +149,13 @@ pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Re
         source,
         rip,
         guest_bytes: h.guest_bytes,
+        targets: &parts.targets,
     };
-    structure::check(&c).map_err(|e| format!("object refused: {e}"))?;
+    let links = structure::check(&c).map_err(|e| format!("object refused: {e}"))?;
+    if links.len() > MAX_LINK_POINTS {
+        return Err(format!("object refused: {} literal exits, at most {MAX_LINK_POINTS}", links.len()));
+    }
+    admitted.links = links;
     Ok(admitted)
 }
 
@@ -159,6 +167,8 @@ struct Parts {
     relocs: Vec<Reloc>,
     /// Literal slots in the code (offsets from the code start).
     literals: Vec<std::ops::Range<usize>>,
+    /// The block end and the direct target of the branch ending it (when it is one).
+    targets: Vec<u64>,
 }
 
 /// Everything but the code: header, tables, site records, relocations.
@@ -271,8 +281,9 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
             _ => return fail(&format!("relocation at {at:#x}")),
         }
     }
-    let admitted = Admitted { object: out, guest_bytes: h.guest_bytes };
-    Ok((admitted, Parts { header: h, sites, pcs, relocs, literals }))
+    let admitted = Admitted { object: out, guest_bytes: h.guest_bytes, links: Vec::new() };
+    let targets = [Some(end), target].into_iter().flatten().collect();
+    Ok((admitted, Parts { header: h, sites, pcs, relocs, literals, targets }))
 }
 
 /// The intent a site's kind implies: stores write; a load writes only as the

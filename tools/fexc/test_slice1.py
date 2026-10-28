@@ -1,6 +1,6 @@
 """S1c checks: profile slice1 of fexc (block cutting at an allowlist, single-gate exits, profile record).
 
-Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series7 build)
+Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series8 build)
 
 The x86 bytes below are assembled by hand and only drive the compiler; every expectation (where the block ends, why)
 comes from the instruction's architectural class, never from fexc's output. The cut position is also compared with a
@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402  (disassemble, object reader)
 import scan_skips  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series7/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series8/obj/fexc')
 REPO = HERE.parents[1]
 RIP = 0x102000
 PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
@@ -265,16 +265,18 @@ class Slice1Cutting(unittest.TestCase):
             self.assertNotIn('cut_opcode', d['guest']['end'])
 
 
-# `ldr xA, [x28, #dlt]; br xA` must be the only way out, fed by `str xR, [x28, #rip]`. The only call is FEX's call of the
-# resident 128/64 division helper of a 64-bit div/idiv (verify_precision.py P11 checks its #DE branch).
+# `ldr x1, [x28, #pointer]; br x1` must be the only way out, fed by `str xR, [x28, #rip]`: a literal exit is exactly
+# `ldr x0, L; str x0, [x28, #rip]; ldr x1, [x28, #ExitFunctionLinker]; br x1` (the resident links it), a computed one loads
+# DispatcherLoopTop. The only call is FEX's call of the resident 128/64 division helper of a 64-bit div/idiv
+# (verify_precision.py P11 checks its #DE branch).
 HELPERS = {'LUDIVHandler', 'LDIVHandler'}
 def check_exits(test, d, tmp, what):
     off = d['state_abi']['state_offsets']
-    rip_off, dlt_off = off['rip'], off['dispatcher_loop_top']
+    rip_off, dlt_off, efl_off = off['rip'], off['dispatcher_loop_top'], off['exit_function_linker']
     # exit RIP literals, plus guest-RIP constants materialised for RIP-relative addresses; nothing host-specific
     test.assertEqual({r['kind'] for r in d['code']['relocations']} - {'guest_rip_literal', 'guest_rip_move'}, set(), what)
     test.assertFalse([r for r in d['code']['relocations'] if r['kind'] == 'named_symbol_literal'], what)
-    test.assertEqual({p['pointer'] for p in d['state_abi']['state_pointer_loads']} - {'DispatcherLoopTop'} - HELPERS, set(), what)
+    test.assertEqual({p['pointer'] for p in d['state_abi']['state_pointer_loads']} - {'DispatcherLoopTop', 'ExitFunctionLinker'} - HELPERS, set(), what)
     helpers = {p['state_offset'] for p in d['state_abi']['state_pointer_loads'] if p['pointer'] in HELPERS}
     test.assertIsNone(d['code']['layout']['end_marker_offset'], what)
     code = bytes.fromhex(d['code']['hex'])
@@ -287,9 +289,10 @@ def check_exits(test, d, tmp, what):
     for i in brs:
         o, t = lines[i]
         reg = re.match(r'br\s+(x\d+)$', t)
-        test.assertTrue(reg, (what, o, t))
-        test.assertEqual(lines[i - 1][1], f'ldr {reg.group(1)}, [x28, #{hex(dlt_off)}]', (what, o))
+        test.assertTrue(reg and reg.group(1) == 'x1', (what, o, t))
         test.assertRegex(lines[i - 2][1], rf'^str x\d+, \[x28, #{hex(rip_off)}\]$', (what, o))
+        literal = re.fullmatch(r'ldr x0, 0x[0-9a-f]+', lines[i - 3][1]) and lines[i - 2][1].startswith('str x0,')
+        test.assertEqual(lines[i - 1][1], f'ldr x1, [x28, #{hex(efl_off if literal else dlt_off)}]', (what, o))
     # no other control transfer through registers or calls, and no use of the call-return stack register
     for i, (o, t) in enumerate(lines):
         if t == 'blr x3':
@@ -299,11 +302,11 @@ def check_exits(test, d, tmp, what):
             continue
         test.assertIsNone(re.match(r'(blr|ret|bl)\s', t), (what, o, t))
         test.assertIsNone(re.search(r'\bx25\b', t), (what, o, t))
-    # every ldr from the frame in the code reads DispatcherLoopTop or a division helper (a literal pool load has no x28 base)
+    # every ldr from the frame in the code reads DispatcherLoopTop, ExitFunctionLinker or a division helper (a literal pool load has no x28 base)
     for o, t in lines:
         m = re.match(r'ldr\s+x\d+, \[x28, #(0x[0-9a-f]+)\]', t)
         if m:
-            test.assertIn(int(m.group(1), 16), {dlt_off} | helpers, (what, o, t))
+            test.assertIn(int(m.group(1), 16), {dlt_off, efl_off} | helpers, (what, o, t))
     return len(brs), '\n'.join(f'{o:4x}: {t}' for o, t in lines)
 
 

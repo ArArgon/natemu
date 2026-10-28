@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: natemu <natemu@example.invalid>
 Date: Tue, 27 Oct 2026 00:00:00 +0000
-Subject: [PATCH 5/9] FEXCore: slice1 block cutting and single-gate exits
+Subject: [PATCH 05/10] FEXCore: slice1 block cutting and single-gate exits
 
 Both are guarded by the runtime flag fexc_slice1, so the default profile
 compiles as before.
