@@ -176,3 +176,11 @@ only reported passes. They supply new programs within the claimed subset and
 challenge special-case fixes. Keep authors and reviewers separate. Review and
 testing accompany implementation; a complete test audit, finished refactor or
 final ABI is not a prerequisite to making progress.
+
+## Next phase scope (owner, October 28)
+
+Build every feature a stock-kernel boot needs — interrupt and exception delivery (IDT, IRET, local APIC, timer,
+IPIs), the instruction coverage Linux uses (LOCK forms, string/REP, SSE, x87 at reduced precision, CPUID, RDTSC),
+the system registers (FS/GS bases, syscall MSRs, PAT, CR2, Linux's CR0/CR4 bits), larger guest memory, a loader and
+a serial console — each checked on the general path as in this phase. Booting a kernel end to end (integration) is
+not part of it. x87 may trade accuracy for speed (FEX reduced-precision mode).
