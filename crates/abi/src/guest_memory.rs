@@ -398,7 +398,7 @@ mod tests {
         let mut t = GuestTables::observed(ram, Always(ram));
         assert_eq!(
             paging::walk(&mut t, CONTROL, 0x10_0000, Access::Read),
-            Err(Fault::Unsupported)
+            Err(Fault::Contended)
         );
     }
 

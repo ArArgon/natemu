@@ -130,17 +130,22 @@ fn frame_word(offset: u32) -> *mut u64 {
     (FRAME_VA + offset as u64) as *mut u64
 }
 
-/// Stops the VM; the host reads `reason` and the record.
+/// Stops this vCPU; the host reads `reason` and the record. The host may never resume it, so it first drops every
+/// shadow and writable bit unasked (as if serving `SHADOWS`): no peer ever waits on a vCPU that has stopped.
 fn halt(mut s: State, reason: u64) -> ! {
+    reset_shadows(&mut s);
     s.stop = reason;
     unsafe { write_record(record(), s) };
     stop(SUCCESS, reason)
 }
 
 pub unsafe fn start() -> ! {
-    let s = unsafe { load() };
-    if s.cpu.control().is_none() || s.request != NONE {
-        halt(s, stop::UNSUPPORTED_MODE)
+    let mut s = unsafe { load() };
+    if s.cpu.control().is_none() || s.request != NONE || s.vcpu as usize >= cache::MAX_VCPUS {
+        // Before anything is shadowed or marked (and before the vCPU number is known to be valid).
+        s.stop = stop::UNSUPPORTED_MODE;
+        unsafe { write_record(record(), s) };
+        stop(SUCCESS, s.stop)
     }
     cache::reset();
     unsafe {
@@ -240,6 +245,9 @@ unsafe fn request(s: &mut State, kind: u64) -> Header {
     }
     // The host may have written guest RAM while serving the request (A bits of the fetch walk).
     take_invalidations(s);
+    if s.reply == REPLY_PARK {
+        halt(*s, stop::PARKED)
+    }
     let h = staged();
     let table_end = (h.sites_offset as usize).checked_add(h.sites_count as usize * size_of::<Site>());
     if s.reply != REPLY_ADMITTED
@@ -256,13 +264,15 @@ unsafe fn request(s: &mut State, kind: u64) -> Header {
     h
 }
 
-/// Applies this vCPU's queued invalidations (host writes to guest RAM while it was stopped flush; listed pages drop
-/// their blocks).
+/// Applies this vCPU's pending invalidations (listed pages drop their blocks; host writes to guest RAM while it was
+/// stopped flush) and resets its shadows when a peer asks.
 fn take_invalidations(s: &mut State) {
-    match cache::drain() {
-        Some(true) => flush(s),
-        Some(false) => {}
-        None => halt(*s, stop::BAD_LINK),
+    let Some(pending) = cache::drain() else { halt(*s, stop::BAD_LINK) };
+    if pending & cache::FLUSH != 0 {
+        flush(s);
+    }
+    if pending & cache::SHADOWS != 0 {
+        reset_shadows(s);
     }
 }
 
@@ -277,7 +287,7 @@ fn flush(s: &mut State) {
     s.generation += 1;
     s.shadow_generation += 1;
 }
-/// Removes every shadow of this vCPU.
+/// Removes every shadow of this vCPU and its writable bits, and counts the reset.
 fn reset_shadows(s: &mut State) {
     tables::space().reset();
     cache::shadows_reset();
@@ -359,7 +369,7 @@ fn code_written(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, gpa: u64
     if b.flags & cache::STEP == 0 && b.source_gpa.iter().any(|&g| g != u64::MAX && g >> 12 == gpa >> 12) {
         step(*s, f, b, site)
     }
-    match cache::invalidate(gpa) {
+    match cache::written(gpa) {
         Some(n) => (s.invalidations, s.unlinks) = (s.invalidations + 1, s.unlinks + n),
         None => halt(*s, stop::BAD_LINK),
     }
@@ -418,14 +428,16 @@ impl Observer for CodePageWrites {
 }
 
 /// Walks `va` with `access` for the guest instruction at `site` of `b` and shadows the page; a guest
-/// fault stops with the precise state. Returns the guest-physical address of `va`. Translated pages
-/// are shadowed read-only whatever the walk grants; a write to one, or an A/D update in one, takes
-/// [`code_written`] first (which may step the instruction instead of returning).
-fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, access: Access) -> u64 {
+/// fault stops with the precise state. Returns the guest-physical address of `va`, or `None` when the
+/// walk kept losing A/D races to peers (nothing installed: the caller resumes the instruction, which
+/// faults and walks again, as x86 re-walks). Translated pages are shadowed read-only whatever the
+/// walk grants; a write to one, or an A/D update in one, takes [`code_written`] first (which may step
+/// the instruction instead of returning).
+fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, access: Access) -> Option<u64> {
     let Some(control) = s.cpu.control() else {
         halt(*s, stop::UNSUPPORTED_MODE)
     };
-    // Each refused A/D write invalidates its page (one vCPU: its bit clears), so the walk is repeated at most once per page.
+    // Each refused A/D write clears every vCPU's code bit of its page, so the walk is repeated at most once per page.
     let walk = loop {
         let mut tables = GuestTables::observed(RAM, CodePageWrites(None));
         let walk = paging::walk(&mut tables, control, va, access);
@@ -445,12 +457,13 @@ fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, ac
                 s.upgrades += 1;
             }
             install(s, va, t.gpa, writable);
-            t.gpa
+            Some(t.gpa)
         }
         // Only write-back guest memory is shadowed.
         Ok(_) => halt(*s, stop::SHADOW),
         Err(Fault::Page { address, error }) => guest_fault(*s, f, b, site, [14, address, error]),
         Err(Fault::Noncanonical) => guest_fault(*s, f, b, site, noncanonical(site)),
+        Err(Fault::Contended) => None,
         Err(Fault::Unsupported) => halt(*s, stop::UNSUPPORTED_MODE),
     }
 }
@@ -533,9 +546,15 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
         halt(s, stop::NO_PROGRESS)
     }
     let access = if write { Access::Write } else { Access::Read };
-    // Every page the access touches, in address order, before the retry.
+    // Every page the access touches, in address order, before the retry. A contended walk resumes at once, outside
+    // the no-progress test (the abort repeats until the walk wins; the watchdog contains a livelock).
     for va in touched.into_iter().flatten() {
-        translate(&mut s, f, b, site, va, access);
+        if translate(&mut s, f, b, site, va, access).is_none() {
+            unsafe {
+                write_record(record(), s);
+                resume_exception(&raw const (*shared()).captured, elr, spsr)
+            }
+        }
     }
     s.last_retry = [elr, far, tables::descriptor(far), s.shadow_generation];
     s.retries += 1;
@@ -566,7 +585,15 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
             Some(_) => halt(s, stop::SITE_MISMATCH), // the check fired for an access within one page
         }
     };
+    // A contended walk resumes at the stub, which takes this path again.
     let gpa = [first, second].map(|va| translate(&mut s, f, b, stub, va, Access::Write));
+    let [Some(gpa0), Some(gpa1)] = gpa else {
+        unsafe {
+            write_record(record(), s);
+            resume_exception(&raw const (*shared()).captured, b.code_va() + stub.native_offset as u64, spsr)
+        }
+    };
+    let gpa = [gpa0, gpa1];
     let reg = |r: u8| if r == 31 { 0 } else { f.x[r as usize] };
     let mut bytes = [0u8; 16];
     if pair {

@@ -37,6 +37,8 @@ pub enum Fault {
     Page { address: u64, error: u64 },
     Noncanonical,
     Unsupported,
+    /// The walk lost `WALK_ATTEMPTS` A/D races in a row: no translation this time; the access re-walks later.
+    Contended,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Translation {
@@ -64,8 +66,8 @@ pub trait Tables {
     fn write(&mut self, gpa: u64, old: u64, new: u64) -> Update;
 }
 
-/// x86 re-walks after losing an A/D race; the bound contains a livelock as
-/// `Fault::Unsupported` instead of spinning in the resident.
+/// x86 re-walks after losing an A/D race without bound; one walk gives up after this
+/// many with `Fault::Contended` (the caller retries later) instead of spinning.
 pub const WALK_ATTEMPTS: usize = 8;
 
 /// Why one walk attempt stopped.
@@ -94,7 +96,7 @@ pub(crate) fn retrying<R>(mut attempt: impl FnMut() -> Result<R, Stop>) -> Resul
             Err(Stop::Restart) => {}
         }
     }
-    Err(Fault::Unsupported)
+    Err(Fault::Contended)
 }
 
 pub fn walk<T: Tables>(

@@ -49,10 +49,12 @@ pub const GUEST_PAGES: usize = GUEST_RAM_BYTES / 4096;
 
 /// The code cache (slice 2). Per vCPU: an executable code area with a writable
 /// alias, a metadata arena (block records and their access sites) and the lookup
-/// structures. Shared between owners ([`cache::GLOBAL_VA`]): the code-page masks
-/// over guest-physical pages and one invalidation queue per vCPU. Areas are
-/// mapped in 2 MiB blocks; the backing places them after guest RAM, the code
-/// area last because its size is set at `prepare`.
+/// structures. Shared between vCPUs ([`cache::GLOBAL_VA`]): the code-page and
+/// writable-shadow masks over guest-physical pages, one invalidation record and one
+/// shadow-reset counter per vCPU. Areas are mapped in 2 MiB blocks; the backing
+/// places them after guest RAM, the code area last because its size is set at
+/// `prepare`. vCPU v's own areas (window, lookup, metadata, code) sit at the same
+/// private addresses as every other vCPU's, backed by its own block of the backing.
 pub mod cache {
     use crate::PRIVATE;
     const MIB: usize = 1 << 20;
@@ -79,9 +81,8 @@ pub mod cache {
     pub const META_OFFSET: usize = GLOBAL_OFFSET + GLOBAL_BYTES;
     pub const CODE_OFFSET: usize = META_OFFSET + META_BYTES;
 
-    /// Lookup area layout: [`Control`], the vCPU's writable-shadow bits over guest-physical pages, L1, L2, block index.
+    /// Lookup area layout: [`Control`], L1, L2, block index.
     pub const CONTROL: usize = 0;
-    pub const WRITABLE: usize = 0x1000;
     /// L1: direct-mapped {guest RIP, host entry} pairs indexed by `rip & L1_MASK` (FEX `L1Pointer/L1Mask`).
     /// An empty entry holds a RIP whose low bits differ from its index, so it never matches.
     pub const L1: usize = 0x1_0000;
@@ -101,11 +102,16 @@ pub mod cache {
     pub const STEP_RECORD: usize = 0x1c_0000;
     pub const STEP_RECORD_BYTES: usize = 0x4_0000;
 
-    /// Global area layout: one code-page mask byte per guest-physical page (bit v: vCPU v holds translations from
-    /// the page), then one [`Queue`] per vCPU.
+    /// Global area layout, shared by all vCPUs and updated only by atomic read-modify-writes (host and resident):
+    /// a code-page mask byte per guest-physical page (bit v: vCPU v holds translations from the page), a writable
+    /// mask byte per page (bit v: vCPU v may hold a writable shadow of it), one invalidation [`Record`] per vCPU and
+    /// one shadow-reset counter (u64) per vCPU.
     pub const CODE_PAGES: usize = 0;
-    pub const QUEUES: usize = 0x4000;
-    pub const MAX_VCPUS: usize = 8;
+    pub const WRITABLE_PAGES: usize = 0x1000;
+    pub const RECORDS: usize = 0x2000;
+    pub const RESETS: usize = 0x3000;
+    /// vCPUs of one VM (bits of the mask bytes).
+    pub const MAX_VCPUS: usize = 4;
 
     /// Per-vCPU cache bookkeeping at [`CONTROL`]. The host sets `code_bytes` (the code area's capacity) at prepare;
     /// the resident owns the rest.
@@ -167,16 +173,21 @@ pub mod cache {
         pub original: u32,
         pub target: u32,
     }
-    /// Invalidation requests to one vCPU, drained at each resident entry. `pages` lists guest-physical pages whose
-    /// translations are stale; `flush` (or a full list) drops the whole cache.
+    /// Invalidation requests to one vCPU, drained at each of its resident entries. Producers only set bits (atomic
+    /// OR), the page's `stale` bit before `pending`; the consumer swaps `pending` to 0, then each `stale` word, so no
+    /// entry is lost and nothing overflows.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct Queue {
-        pub flush: u64,
-        pub count: u64,
-        pub pages: [u64; 30],
+    pub struct Record {
+        /// [`PAGES`], [`FLUSH`], [`SHADOWS`].
+        pub pending: u64,
+        /// Guest-physical pages whose translations are stale (bit p % 64 of word p / 64).
+        pub stale: [u64; crate::execution::GUEST_PAGES / 64],
     }
-    pub const FLUSH: u64 = 1;
+    /// `Record::pending`: `stale` lists pages; drop the whole cache; reset all shadows (and writable bits).
+    pub const PAGES: u64 = 1;
+    pub const FLUSH: u64 = 2;
+    pub const SHADOWS: u64 = 4;
 
     const _: () = assert!(crate::execution::GUEST_RAM_OFFSET + crate::execution::GUEST_RAM_BYTES <= LOOKUP_OFFSET);
     const _: () = assert!((crate::execution::GUEST_RAM_OFFSET | crate::execution::GUEST_RAM_BYTES | LOOKUP_OFFSET) % BLOCK == 0);
@@ -191,14 +202,16 @@ pub mod cache {
     const _: () = assert!(MAX_BLOCK_BYTES <= crate::execution::SLOT_BYTES);
     const _: () = assert!((CODE_VA | CODE_WRITE_VA | META_VA | LOOKUP_VA | GLOBAL_VA) % BLOCK as u64 == 0);
     const _: () = assert!(CODE_OFFSET % BLOCK == 0 && META_BYTES % BLOCK == 0);
-    const _: () = assert!(core::mem::size_of::<Control>() <= WRITABLE);
-    const _: () = assert!(WRITABLE + crate::execution::GUEST_PAGES / 8 <= L1);
+    const _: () = assert!(core::mem::size_of::<Control>() <= L1);
     const _: () = assert!(L1 + L1_ENTRIES * 16 <= L2 && L2 + L2_ENTRIES * 16 <= INDEX);
     const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= LINKS);
     const _: () = assert!(LINKS + MAX_LINKS * core::mem::size_of::<LinkRecord>() <= STEP_RECORD);
     const _: () = assert!(STEP_RECORD + STEP_RECORD_BYTES <= LOOKUP_BYTES && STEP_RECORD % core::mem::align_of::<Block>() == 0);
-    const _: () = assert!(CODE_PAGES + crate::execution::GUEST_PAGES <= QUEUES);
-    const _: () = assert!(QUEUES + MAX_VCPUS * core::mem::size_of::<Queue>() <= GLOBAL_BYTES);
+    const _: () = assert!(CODE_PAGES + crate::execution::GUEST_PAGES <= WRITABLE_PAGES);
+    const _: () = assert!(WRITABLE_PAGES + crate::execution::GUEST_PAGES <= RECORDS);
+    const _: () = assert!(RECORDS + MAX_VCPUS * core::mem::size_of::<Record>() <= RESETS && RECORDS % 8 == 0);
+    const _: () = assert!(RESETS + MAX_VCPUS * 8 <= GLOBAL_BYTES);
+    const _: () = assert!(crate::execution::GUEST_PAGES % 64 == 0);
 }
 
 /// Backing bytes the execution mode needs before the code area: window 0, guest RAM and the cache's fixed areas.
@@ -357,6 +370,9 @@ pub const REQUEST_TRANSLATE: u64 = 1;
 /// Translate only the instruction at `cpu.rip` (`max_instructions = 1`) for the single-step slot.
 pub const REQUEST_STEP: u64 = 2;
 pub const REPLY_ADMITTED: u64 = 1;
+/// The host ends the vCPU's run at this request (its stop is the host's: `stop_at` reached, a fetch fault, no code):
+/// the resident halts with [`stop::PARKED`].
+pub const REPLY_PARK: u64 = 2;
 
 /// `State::stop`: why the resident stopped the VM (`hvc #0x49`).
 pub mod stop {
@@ -378,6 +394,8 @@ pub mod stop {
     /// A linker exit whose `InlineJITBlockHeader` names no live cache block (or a block without a link point to the
     /// exit's RIP), or a link point holding neither its original word nor a branch to a live block it may link to.
     pub const BAD_LINK: u64 = 9;
+    /// The host parked the vCPU ([`super::REPLY_PARK`]).
+    pub const PARKED: u64 = 10;
 
     pub fn name(code: u64) -> &'static str {
         match code {
@@ -389,6 +407,7 @@ pub mod stop {
             SHADOW => "shadow",
             NO_PROGRESS => "no_progress",
             BAD_LINK => "bad_link",
+            PARKED => "parked",
             _ => "none",
         }
     }
@@ -399,6 +418,8 @@ pub mod stop {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct State {
     pub cpu: Cpu,
+    /// This vCPU's number (0..`cache::MAX_VCPUS`): its bit in the global masks, its record and counter.
+    pub vcpu: u64,
     pub request: u64,
     pub reply: u64,
     /// The cache's flush generation (flushes so far), sent with each request: the host never needs to resend an
@@ -443,9 +464,10 @@ pub struct State {
     pub steps: u64,
 }
 impl State {
-    pub const fn new(cpu: Cpu) -> Self {
+    pub const fn new(vcpu: u64, cpu: Cpu) -> Self {
         Self {
             cpu,
+            vcpu,
             request: NONE,
             reply: NONE,
             generation: 0,

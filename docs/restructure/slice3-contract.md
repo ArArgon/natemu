@@ -137,6 +137,15 @@ code: at least CR0.PE/PG, CR4.PAE/PSE, EFER.LME, LGDT, far JMP/RET, likely MOV S
   refused), each vCPU runs a different corpus program on disjoint pages concurrently and matches its reference, also
   oversubscribed (more busy threads than cores) so threads migrate; host requests equal distinct blocks per vCPU; EnTSO
   read back on every vCPU; a tamper-forced halt on any vCPU stops and joins all, then the VM is destroyed.
+  *Built (Oct 27):* backing block v at `v * (BACKING_BYTES + code area)` holds vCPU v's window, lookup, metadata and code
+  areas at vCPU 0's offsets (guest RAM and the global area only in block 0); private and shadow descriptors are nG, ASID
+  = vCPU number + 1 (TLBI by ASID; ASID 0 stays the families' untagged world with global shadows). `State::vcpu`; global area: code and writable masks, `Record {pending, stale}` per vCPU,
+  reset counters (abi `cache`), host and resident producers (`page_written`, runtime `cache::written`: swap the mask to 0,
+  post page then `PAGES`), drain (swap `pending`, then words). A halt (also on the host's new `REPLY_PARK`, which ends
+  a vCPU at `stop_at`, a fetch fault or no code) resets shadows and writable bits first. `Fault::Contended` replaces the
+  walk-exhaustion halt (resident resumes; host fetch re-walks). `owners::supervise` is generic; the program driver runs
+  every vCPU through it (description `cpu` sections, `body ADDR HEX`, `--tamper-vcpu`); `tools/run_slice3_vm.py`
+  (`corpora`, `smp`, `limits`). Not yet: kicks, post-write re-check, peers' writable-shadow shootdown (S3b/S3d).
 - **S3b, precise stop.** Premise first: a vCPU in a hot linked loop (zero exits), kicked by `hv_vm_protect` alone (no
   `hv_vcpus_exit`), must stop within 1 ms per kick, else the fallback; a no-kick control never exits; per-kick latency
   reported. Then frame bias (moving `SPILLS` or the stop page), granules, kick, stage-2 exit, gate. *Check:* a hot linked

@@ -158,12 +158,16 @@ impl Vcpu {
     /// Sets the architectural EL1 state the resident `_start` consumes for the
     /// owner window at `window`: PC at the window, EL1h with DAIF masked, x0 = the
     /// window's lower private root, x1 = TCR_EL1, x2 = MAIR_EL1; MMU off, TSO on
-    /// (ACTLR_EL1 bit 1), FP/SIMD untrapped, virtual timer off.
+    /// (ACTLR_EL1 bit 1), FP/SIMD untrapped, virtual timer off. ASID 0.
     pub(crate) fn enter_resident(&self, window: usize, tcr: u64) -> Result<()> {
+        self.enter_resident_with_asid(window, tcr, 0)
+    }
+    /// [`Self::enter_resident`] with the owner's tables tagged `asid` (TTBR0_EL1[63:48]; 8-bit ASIDs).
+    pub(crate) fn enter_resident_with_asid(&self, window: usize, tcr: u64, asid: u8) -> Result<()> {
         let base = IPA + window as u64;
         self.set_reg(PC, base)?;
         self.set_reg(CPSR, 0x3c5)?;
-        self.set_reg(0, base + shadow::LOWER_ROOT as u64)?;
+        self.set_reg(0, base + shadow::LOWER_ROOT as u64 | u64::from(asid) << 48)?;
         self.set_reg(1, tcr)?;
         self.set_reg(2, 0xff)?;
         self.set_sys(SCTLR_EL1, 0x30d00980)?;

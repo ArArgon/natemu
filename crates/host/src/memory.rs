@@ -18,6 +18,9 @@ unsafe extern "C" {
 
 /// Anonymous host backing for guest RAM. It must outlive the VM that maps it.
 pub(crate) struct Memory(pub(crate) *mut u8, pub(crate) usize);
+// SAFETY: the backing is shared with running vCPUs anyway; every accessor copies through raw pointers. Owner threads
+// touch their own vCPU's records, and areas shared between vCPUs only through atomics.
+unsafe impl Sync for Memory {}
 impl Memory {
     pub(crate) fn new() -> Result<Self> {
         Self::with_size(RAM_SIZE)
@@ -194,9 +197,11 @@ impl Span {
         }
     }
 }
-const PAGE: u64 = 3 | 1 << 10 | 3 << 8;
+/// Private descriptors are not global: every owner maps the same private addresses to its own backing, so its
+/// entries carry its ASID.
+const PAGE: u64 = 3 | 1 << 10 | 1 << 11 | 3 << 8;
 /// A 2 MiB block descriptor at level 2.
-const BLOCK: u64 = 1 | 1 << 10 | 3 << 8;
+const BLOCK: u64 = 1 | 1 << 10 | 1 << 11 | 3 << 8;
 const PRIVATE_LEAF: usize = 0x14000;
 /// Level-2 table of `PRIVATE..PRIVATE + 1 GiB`; its first entry links `PRIVATE_LEAF`.
 const PRIVATE_L2: usize = 0x13000;
@@ -220,7 +225,7 @@ pub(crate) fn private_space(
     word(shadow::LOWER_ROOT, table(0x11000));
     word(shadow::LOWER_ROOT + 256 * 8, table(0x12000));
     // Low alias exists only for MMU enable and is removed by startup.
-    word(0x11000 + 8, IPA | 1 | 1 << 10 | 3 << 8);
+    word(0x11000 + 8, IPA | 1 | 1 << 10 | 1 << 11 | 3 << 8);
     word(0x11000, table(0x15000));
     word(0x15000, table(shadow::LOWER_LEAF));
     for &(va, target) in shadows {
@@ -420,7 +425,7 @@ mod tests {
         for offset in (0..RAM_SIZE).step_by(4096) {
             let pte = leaf(offset);
             if resident::executable_offset(offset) {
-                assert_eq!(pte, (IPA + offset as u64) | 3 | 1 << 10 | 3 << 8 | 1 << 7);
+                assert_eq!(pte, (IPA + offset as u64) | PAGE | 1 << 7);
             } else if (resident::BOOT_END..0x10000).contains(&offset) {
                 assert_eq!(pte, 0);
             } else if pte != 0 && offset != CODE_OFFSET {
@@ -467,6 +472,7 @@ mod tests {
             ipa: IPA + window as u64,
             pool_pages: shadow::POOL_PAGES,
             upper: true,
+            tagged: false,
             tlb: Quiet,
         };
         for va in [DATA_VA, shadow::HIGH_BASE + DATA_VA] {
@@ -487,6 +493,7 @@ mod tests {
             ipa: IPA,
             pool_pages: 2,
             upper: false,
+            tagged: false,
             tlb: Quiet,
         };
         assert_eq!(

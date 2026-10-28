@@ -23,6 +23,9 @@ pub const TCR_BOTH: u64 =
 /// Valid page, AF, inner shareable, normal memory (MAIR index 0), UXN and PXN:
 /// generated code never executes from guest pages.
 pub const PAGE: u64 = 3 | 1 << 10 | 3 << 8 | 3 << 53;
+/// nG: the entry is tagged with the owner's ASID (owners with ASIDs map the same
+/// addresses differently, so their entries must not match another owner's).
+pub const NOT_GLOBAL: u64 = 1 << 11;
 pub const READ_ONLY: u64 = 1 << 7;
 const TABLE: u64 = 3;
 const OUTPUT: u64 = 0x0000_ffff_ffff_f000;
@@ -66,6 +69,8 @@ pub struct Space<M> {
     pub ipa: u64,
     pub pool_pages: usize,
     pub upper: bool,
+    /// Shadows carry [`NOT_GLOBAL`] (the owner has its own ASID).
+    pub tagged: bool,
     pub tlb: M,
 }
 /// The pre-linked lower and upper shadow tables below the roots.
@@ -171,7 +176,7 @@ impl<M: Maintenance> Space<M> {
             return Err(Error::Private);
         }
         let (table, index) = self.leaf(va, true)?.ok_or(Error::Corrupt)?;
-        let new = target | PAGE | if writable { 0 } else { READ_ONLY };
+        let new = target | PAGE | if writable { 0 } else { READ_ONLY } | if self.tagged { NOT_GLOBAL } else { 0 };
         let old = self.get(table, index);
         if old == new {
             return Ok(());
@@ -271,6 +276,7 @@ mod tests {
             ipa: IPA,
             pool_pages,
             upper: true,
+            tagged: false,
             tlb: Log::default(),
         }
     }
@@ -392,6 +398,10 @@ mod tests {
         s.unmap(0x7000_0000_0000).unwrap();
         assert!(s.tlb.0.is_empty());
         assert_eq!(s.unmap(0x8000_0000_0000), Err(Error::Noncanonical));
+        // An owner with its own ASID tags its shadows.
+        s.tagged = true;
+        s.map(va, 0x4007_0000, false).unwrap();
+        assert_eq!(s.descriptor(va), 0x4007_0000 | PAGE | READ_ONLY | NOT_GLOBAL);
     }
 
     #[test]

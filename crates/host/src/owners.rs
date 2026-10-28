@@ -2,8 +2,10 @@
 //!
 //! The caller owns the VM and its memory. This module owns the start barrier
 //! (no native entry until every owner prepared), supervision, cancellation,
-//! join-before-read and vCPU-destroy-before-return ordering. What an owner does
-//! at the resident compiler-service gateway is a caller-supplied [`OwnerService`].
+//! join-before-read and vCPU-destroy-before-return ordering ([`supervise`]). What
+//! an owner runs is the caller's: the execution service (`execution::run`), or the
+//! regression families' resident compiler-service gateway ([`Owners`], with a
+//! caller-supplied [`OwnerService`]).
 use super::*;
 use natemu_abi::translation as wire;
 use std::{
@@ -36,9 +38,10 @@ pub(crate) struct Owners {
 }
 
 /// Returned after every owner has joined and destroyed its vCPU. A setup
-/// failure before the start barrier is an `Err` from [`Owners::run`] instead.
-pub(crate) struct Supervision {
-    pub requests: Vec<wire::Packet>,
+/// failure before the start barrier is an `Err` from [`supervise`] instead.
+pub(crate) struct Supervision<T> {
+    /// Each owner's result, by id (`None` when it failed; `error` holds the first failure).
+    pub outputs: Vec<Option<T>>,
     pub error: Option<String>,
     pub completed: usize,
     pub destroyed: Vec<(usize, i32)>,
@@ -47,8 +50,8 @@ pub(crate) struct Supervision {
 }
 
 /// An owner vCPU and its resident service loop.
-struct Cpu(Vcpu);
-impl Cpu {
+struct Cpu<'a>(&'a Vcpu);
+impl Cpu<'_> {
     fn run(
         &self,
         shared_address: usize,
@@ -105,163 +108,185 @@ fn terminal_outcome(status: u64, detail: u64) -> Result<()> {
     }
 }
 
-fn cancel_owners(cancelled: &AtomicBool) {
+/// Cancels every owner: each stops at its next host exit, and the supervisor forces running vCPUs out.
+pub(crate) fn cancel_owners(cancelled: &AtomicBool) {
     if !cancelled.swap(true, Ordering::AcqRel) {
         crate::translation::process_owner::begin_cancellation();
     }
 }
 
 impl Owners {
-    /// `service(id)` runs on owner `id`'s thread after the start barrier (and
-    /// its delay); `None` means the owner has no gateway service. `poll` runs
-    /// about every 20 ms and returns an external failure cause; `owner_failed`
-    /// sees each owner error before cancellation.
+    /// The regression families' owners: each enters at its window and serves the
+    /// resident compiler-service gateway. `service(id)` runs on owner `id`'s thread
+    /// after the start barrier (and its delay); `None` means the owner has no gateway
+    /// service. Returns every owner's submitted requests (see [`supervise`]).
     pub(crate) fn run(
         &self,
         service: &(dyn Fn(usize) -> Result<Option<Service>> + Sync),
         poll: &mut dyn FnMut() -> Option<String>,
         owner_failed: &dyn Fn(&str),
-    ) -> Result<Supervision> {
-        let Self {
+    ) -> Result<Supervision<Vec<wire::Packet>>> {
+        let Self { n, tcr, memory, delayed, deadline } = *self;
+        supervise(
             n,
-            tcr,
-            memory,
-            delayed,
             deadline,
-        } = *self;
-        let cancelled = AtomicBool::new(false);
-        thread::scope(|scope| {
-            let (prepared_tx, prepared_rx) = mpsc::channel();
-            let (done_tx, done_rx) = mpsc::channel();
-            let (destroyed_tx, destroyed_rx) = mpsc::channel();
-            let mut starts = Vec::new();
-            let mut releases = Vec::new();
-            let mut owners = Vec::new();
-            for id in 0..n {
-                let cancelled = &cancelled;
-                let (start_tx, start_rx) = mpsc::channel::<()>();
-                let (release_tx, release_rx) = mpsc::channel::<()>();
-                let prepared = prepared_tx.clone();
-                let done = done_tx.clone();
-                let destroyed = destroyed_tx.clone();
-                let owner = thread::Builder::new()
-                    .name(format!("vcpu-{id}"))
-                    .spawn_scoped(scope, move || -> Result<Vec<wire::Packet>> {
-                        let cpu = std::panic::catch_unwind(|| -> Result<Cpu> {
-                            let cpu = Vcpu::create()?;
-                            cpu.enter_resident(id * RAM_SIZE, tcr)?;
-                            Ok(Cpu(cpu))
-                        })
-                        .unwrap_or_else(|_| Err("owner panicked during setup".into()));
-                        prepared
-                            .send(cpu.as_ref().map(|c| c.0.id()).map_err(Clone::clone))
-                            .map_err(|_| "setup receiver closed")?;
-                        let mut cpu = cpu?;
-                        // No native entry until *all* owners successfully prepare.
-                        let mut owned = None;
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            start_rx.recv().map_err(|_| "owner startup cancelled")?;
-                            if let Some((_, delay)) = delayed.filter(|d| d.0 == id) {
-                                thread::sleep(delay);
-                            }
-                            owned = service(id)?;
-                            cpu.run(
-                                memory + id * RAM_SIZE + SHARED_OFFSET,
-                                &mut owned,
-                                cancelled,
-                            )
-                        }))
-                        .unwrap_or_else(|_| Err("owner panicked during execution".into()));
-                        let _ = done.send(result.clone());
-                        // Keep IDs alive while the supervisor may cancel peers.
-                        let _ = release_rx.recv();
-                        let destroy_result = cpu.0.destroy();
-                        let _ = destroyed.send((id, destroy_result));
-                        result?;
-                        hv(destroy_result, "destroy owner vCPU")?;
-                        Ok(owned.map_or_else(Vec::new, |mut s| s.requests()))
-                    })
-                    .map_err(|e| e.to_string());
-                // A setup failure drops `starts`: unstarted owners exit and the
-                // scope joins them before this returns.
-                owners.push(owner?);
-                starts.push(start_tx);
-                releases.push(release_tx);
-            }
-            drop(prepared_tx);
-            drop(done_tx);
-            drop(destroyed_tx);
-            let mut ids = Vec::new();
-            for _ in 0..n {
-                ids.push(
-                    prepared_rx
-                        .recv()
-                        .map_err(|_| "owner setup disconnected")??,
-                );
-            }
-            let mut error = None;
-            for start in starts {
-                if start.send(()).is_err() {
-                    error.get_or_insert("owner disappeared before entry".into());
+            &|id| {
+                let cpu = Vcpu::create()?;
+                cpu.enter_resident(id * RAM_SIZE, tcr)?;
+                Ok(cpu)
+            },
+            &|id, cpu, cancelled| {
+                if let Some((_, delay)) = delayed.filter(|d| d.0 == id) {
+                    thread::sleep(delay);
                 }
-            }
-            let began = Instant::now();
-            let mut completed = 0;
-            let mut cancellations = Vec::new();
-            while completed < n {
-                let completion = done_rx.recv_timeout(Duration::from_millis(20));
-                if let Some(cause) = poll() {
-                    error.get_or_insert(cause);
-                }
-                match completion {
-                    Ok(result) => {
-                        completed += 1;
-                        if let Err(e) = result {
-                            owner_failed(&e);
-                            error.get_or_insert(e);
-                            cancel_owners(&cancelled);
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        error.get_or_insert("owner completion disconnected".into());
-                        break;
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                }
-                if began.elapsed() > deadline {
-                    error.get_or_insert("concurrent execution exceeded its deadline".into());
-                }
-                if error.is_some() && completed < n {
-                    cancel_owners(&cancelled);
-                    // Repeat cancellation: an owner may still be in its declared
-                    // pre-entry delay when an earlier cancellation is issued.
-                    cancellations.push(exit_vcpus(&mut ids));
-                }
-            }
-            drop(releases);
-            let mut requests = Vec::new();
-            for (id, h) in owners.into_iter().enumerate() {
-                match h.join() {
-                    Ok(Ok(mut r)) => requests.append(&mut r),
-                    Ok(Err(e)) => {
-                        eprintln!("owner {id}: {e}");
-                        error.get_or_insert(e);
-                    }
-                    Err(_) => {
-                        error.get_or_insert("owner panicked".into());
-                    }
-                }
-            }
-            Ok(Supervision {
-                requests,
-                error,
-                completed,
-                destroyed: destroyed_rx.into_iter().collect(),
-                cancellations,
-                began,
-            })
-        })
+                let mut owned = service(id)?;
+                Cpu(cpu).run(memory + id * RAM_SIZE + SHARED_OFFSET, &mut owned, cancelled)?;
+                Ok(owned.map_or_else(Vec::new, |mut s| s.requests()))
+            },
+            poll,
+            owner_failed,
+        )
     }
+}
+
+/// Runs `n` owners in one VM (the caller owns it and its memory), each on its own
+/// scoped thread: `prepare(id)` creates and readies the owner's vCPU; once every
+/// owner has prepared (start barrier: no native entry before), `body(id, vcpu,
+/// cancelled)` runs it. A body error cancels every owner (as [`cancel_owners`],
+/// which a body may also call itself); running vCPUs are then forced out
+/// repeatedly until every body returned. `poll` runs about every 20 ms and returns
+/// an external failure cause; `owner_failed` sees each owner error before
+/// cancellation. Every vCPU is destroyed on its own thread before this returns, so
+/// the caller may destroy the VM next.
+pub(crate) fn supervise<T: Send>(
+    n: usize,
+    deadline: Duration,
+    prepare: &(dyn Fn(usize) -> Result<Vcpu> + Sync),
+    body: &(dyn Fn(usize, &Vcpu, &AtomicBool) -> Result<T> + Sync),
+    poll: &mut dyn FnMut() -> Option<String>,
+    owner_failed: &dyn Fn(&str),
+) -> Result<Supervision<T>> {
+    let cancelled = AtomicBool::new(false);
+    thread::scope(|scope| {
+        let (prepared_tx, prepared_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let (destroyed_tx, destroyed_rx) = mpsc::channel();
+        let mut starts = Vec::new();
+        let mut releases = Vec::new();
+        let mut owners = Vec::new();
+        for id in 0..n {
+            let cancelled = &cancelled;
+            let (start_tx, start_rx) = mpsc::channel::<()>();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let prepared = prepared_tx.clone();
+            let done = done_tx.clone();
+            let destroyed = destroyed_tx.clone();
+            let owner = thread::Builder::new()
+                .name(format!("vcpu-{id}"))
+                .spawn_scoped(scope, move || -> Result<T> {
+                    let cpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare(id)))
+                        .unwrap_or_else(|_| Err("owner panicked during setup".into()));
+                    prepared
+                        .send(cpu.as_ref().map(Vcpu::id).map_err(Clone::clone))
+                        .map_err(|_| "setup receiver closed")?;
+                    let mut cpu = cpu?;
+                    // No native entry until *all* owners successfully prepare.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        start_rx.recv().map_err(|_| "owner startup cancelled")?;
+                        body(id, &cpu, cancelled)
+                    }))
+                    .unwrap_or_else(|_| Err("owner panicked during execution".into()));
+                    let _ = done.send(result.as_ref().map(|_| ()).map_err(Clone::clone));
+                    // Keep IDs alive while the supervisor may cancel peers.
+                    let _ = release_rx.recv();
+                    let destroy_result = cpu.destroy();
+                    let _ = destroyed.send((id, destroy_result));
+                    let output = result?;
+                    hv(destroy_result, "destroy owner vCPU")?;
+                    Ok(output)
+                })
+                .map_err(|e| e.to_string());
+            // A setup failure drops `starts`: unstarted owners exit and the
+            // scope joins them before this returns.
+            owners.push(owner?);
+            starts.push(start_tx);
+            releases.push(release_tx);
+        }
+        drop(prepared_tx);
+        drop(done_tx);
+        drop(destroyed_tx);
+        let mut ids = Vec::new();
+        for _ in 0..n {
+            ids.push(
+                prepared_rx
+                    .recv()
+                    .map_err(|_| "owner setup disconnected")??,
+            );
+        }
+        let mut error = None;
+        for start in starts {
+            if start.send(()).is_err() {
+                error.get_or_insert("owner disappeared before entry".into());
+            }
+        }
+        let began = Instant::now();
+        let mut completed = 0;
+        let mut cancellations = Vec::new();
+        while completed < n {
+            let completion = done_rx.recv_timeout(Duration::from_millis(20));
+            if let Some(cause) = poll() {
+                error.get_or_insert(cause);
+            }
+            match completion {
+                Ok(result) => {
+                    completed += 1;
+                    if let Err(e) = result {
+                        owner_failed(&e);
+                        error.get_or_insert(e);
+                        cancel_owners(&cancelled);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    error.get_or_insert("owner completion disconnected".into());
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if began.elapsed() > deadline {
+                error.get_or_insert("concurrent execution exceeded its deadline".into());
+            }
+            if (error.is_some() || cancelled.load(Ordering::Acquire)) && completed < n {
+                cancel_owners(&cancelled);
+                // Repeat cancellation: an owner may still be in its declared
+                // pre-entry delay when an earlier cancellation is issued.
+                cancellations.push(exit_vcpus(&mut ids));
+            }
+        }
+        drop(releases);
+        let mut outputs = Vec::new();
+        for (id, h) in owners.into_iter().enumerate() {
+            outputs.push(match h.join() {
+                Ok(Ok(output)) => Some(output),
+                Ok(Err(e)) => {
+                    eprintln!("owner {id}: {e}");
+                    error.get_or_insert(e);
+                    None
+                }
+                Err(_) => {
+                    error.get_or_insert("owner panicked".into());
+                    None
+                }
+            });
+        }
+        Ok(Supervision {
+            outputs,
+            error,
+            completed,
+            destroyed: destroyed_rx.into_iter().collect(),
+            cancellations,
+            began,
+        })
+    })
 }
 
 #[cfg(test)]

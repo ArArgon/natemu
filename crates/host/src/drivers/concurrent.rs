@@ -86,7 +86,7 @@ fn run_owners(
         );
         observation.report(memory, n, s.began);
     }
-    s.error.map_or(Ok(s.requests), Err)
+    s.error.map_or_else(|| Ok(s.outputs.into_iter().flatten().flatten().collect()), Err)
 }
 
 // Keep profile admission explicit: source address selection and permission setup
@@ -815,7 +815,7 @@ mod tests {
                 if resident::executable_offset(offset) {
                     assert_eq!(
                         pte,
-                        (IPA + (base + offset) as u64) | 3 | 1 << 10 | 3 << 8 | 1 << 7
+                        (IPA + (base + offset) as u64) | 3 | 1 << 10 | 1 << 11 | 3 << 8 | 1 << 7
                     );
                 } else if (resident::BOOT_END..0x10000).contains(&offset) {
                     assert_eq!(pte, 0);

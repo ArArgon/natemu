@@ -5,25 +5,37 @@ use natemu_abi::shadow::{Error, LOWER_ROOT, Maintenance, POOL_PAGES, Space};
 
 const OUTPUT: u64 = 0x0000_ffff_ffff_f000;
 
-/// Local (non-broadcast) maintenance: each owner's tables are walked only by
-/// its own vCPU. Shared tables would need the inner-shareable TLBI forms.
-pub struct Tlb;
+/// Local (non-broadcast) maintenance of this owner's ASID: each owner's tables are
+/// walked only by its own vCPU, and its entries are not global (they carry its ASID,
+/// TTBR0_EL1[63:48]), so no other vCPU's entries are hit or invalidated. Shared tables
+/// would need the inner-shareable TLBI forms.
+pub struct Tlb {
+    /// The ASID in TLBI operand position (bits 63:48).
+    asid: u64,
+}
 impl Maintenance for Tlb {
     fn publish(&mut self) {
         unsafe { asm!("dsb ishst", "isb") }
     }
     fn invalidate(&mut self, va: u64) {
-        // TLBI VAE1 takes VA[55:12]; ASID 0, and shadow entries are global.
-        let operand = (va >> 12) & ((1 << 44) - 1);
+        // TLBI VAE1 takes VA[55:12] and the ASID.
+        let operand = (va >> 12) & ((1 << 44) - 1) | self.asid;
         unsafe { asm!("dsb ishst", "tlbi vae1, {0}", "dsb ish", "isb", in(reg) operand) }
     }
     fn invalidate_all(&mut self) {
-        unsafe { asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb") }
+        // ASIDE1 leaves global entries: ASID 0 (untagged, global shadows) drops everything.
+        if self.asid == 0 {
+            unsafe { asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb") }
+        } else {
+            unsafe { asm!("dsb ishst", "tlbi aside1, {0}", "dsb ish", "isb", in(reg) self.asid) }
+        }
     }
 }
 
-/// The owner's tables; the window's IPA comes from its TTBR0 root, and the
-/// upper half is in use unless TCR_EL1.EPD1 (bit 23) disables TTBR1 walks.
+/// The owner's tables; the window's IPA and the ASID come from its TTBR0, and the
+/// upper half is in use unless TCR_EL1.EPD1 (bit 23) disables TTBR1 walks. ASID 0 is
+/// the untagged world of the regression families (global shadows, one tag for all
+/// owners); an owner with an ASID of its own tags its shadows with it.
 pub fn space() -> Space<Tlb> {
     let (root, tcr): (u64, u64);
     unsafe { asm!("mrs {0}, ttbr0_el1", "mrs {1}, tcr_el1", out(reg) root, out(reg) tcr) };
@@ -32,7 +44,8 @@ pub fn space() -> Space<Tlb> {
         ipa: (root & OUTPUT) - LOWER_ROOT as u64,
         pool_pages: POOL_PAGES,
         upper: tcr & 1 << 23 == 0,
-        tlb: Tlb,
+        tagged: root >> 48 != 0,
+        tlb: Tlb { asid: root & 0xffff << 48 },
     }
 }
 

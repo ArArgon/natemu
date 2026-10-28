@@ -4,21 +4,29 @@
 //! by (guest RIP, context) through L1 and L2, native PC → block, whole-cache
 //! flush, block linking (patching a link point into a branch to its target's entry
 //! and restoring it), per-page invalidation of the blocks translated from a written
-//! page, the uncached single-step block in the slot, the code-page masks shared
-//! between owners and this vCPU's invalidation queue. The fast dispatcher
+//! page, the uncached single-step block in the slot, and this vCPU's side of the
+//! global area shared by all vCPUs: its bits in the code-page and writable masks,
+//! the invalidation records it posts to and drains, and its shadow-reset counter.
+//! Every global update is an atomic read-modify-write (SeqCst). The fast dispatcher
 //! (`gates.S` `dispatch_fast`) probes L1 directly.
 use super::*;
 use natemu_abi::code_object::{Header, Site};
 use core::mem::align_of;
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering::SeqCst};
 use natemu_abi::execution::{
-    GUEST_PAGES, LinkPoint, MAX_LINK_POINTS, SLOT_BYTES, SLOT_VA, SLOT_WRITE_VA,
-    cache::{self as area, Control, LinkRecord, Queue},
+    GUEST_PAGES, LinkPoint, MAX_LINK_POINTS, SLOT_BYTES, SLOT_VA, SLOT_WRITE_VA, STATE_VA, State,
+    cache::{self as area, Control, LinkRecord, Record},
 };
-pub use natemu_abi::execution::cache::{Block, DEAD, STEP};
+pub use natemu_abi::execution::cache::{Block, DEAD, FLUSH, MAX_VCPUS, PAGES, SHADOWS, STEP};
 
-/// This owner's vCPU: its bit in the code-page masks and its queue.
-// ponytail: one vCPU; slice 3 reads it from the owner's record.
-const VCPU: usize = 0;
+/// This vCPU's number (its state record's; checked below `MAX_VCPUS` at start).
+fn vcpu() -> usize {
+    unsafe { (&raw const (*(STATE_VA as *const State)).vcpu).read_volatile() as usize }
+}
+/// This vCPU's bit in the mask bytes.
+fn own() -> u8 {
+    1 << vcpu()
+}
 /// Code placement alignment (a cache line).
 const CODE_ALIGN: u64 = 64;
 
@@ -58,13 +66,31 @@ fn step_block() -> &'static Block {
 fn record(i: usize) -> *mut LinkRecord {
     lookup_area::<LinkRecord>(area::LINKS).wrapping_add(i)
 }
-/// The code-page mask of guest-physical `gpa` (shared between owners); `None` outside guest RAM.
-fn code_page(gpa: u64) -> Option<*mut u8> {
-    let page = (gpa >> 12) as usize;
-    (page < GUEST_PAGES).then(|| (area::GLOBAL_VA as *mut u8).wrapping_add(area::CODE_PAGES + page))
+fn global<T>(offset: usize) -> *mut T {
+    (area::GLOBAL_VA + offset as u64) as *mut T
 }
-fn queue() -> *mut Queue {
-    ((area::GLOBAL_VA + area::QUEUES as u64) as *mut Queue).wrapping_add(VCPU)
+/// Mask byte of `page` in the mask at `mask` (code or writable pages).
+fn mask(mask: usize, page: usize) -> &'static AtomicU8 {
+    unsafe { AtomicU8::from_ptr(global::<u8>(mask).wrapping_add(page)) }
+}
+/// The code-page mask of guest-physical `gpa`; `None` outside guest RAM.
+fn code_page(gpa: u64) -> Option<&'static AtomicU8> {
+    let page = (gpa >> 12) as usize;
+    (page < GUEST_PAGES).then(|| mask(area::CODE_PAGES, page))
+}
+/// vCPU `v`'s invalidation record: its `pending` word and `stale` word `i`.
+fn record_word(v: usize, i: Option<usize>) -> &'static AtomicU64 {
+    let r = global::<Record>(area::RECORDS).wrapping_add(v);
+    unsafe {
+        AtomicU64::from_ptr(match i {
+            None => &raw mut (*r).pending,
+            Some(i) => (&raw mut (*r).stale).cast::<u64>().wrapping_add(i),
+        })
+    }
+}
+/// vCPU `v`'s shadow-reset counter.
+fn resets(v: usize) -> &'static AtomicU64 {
+    unsafe { AtomicU64::from_ptr(global::<u64>(area::RESETS).wrapping_add(v)) }
 }
 
 fn hash(rip: u64, context: [u64; 2]) -> usize {
@@ -80,9 +106,7 @@ pub fn reset() {
     clear_l1();
     unsafe { ptr::write_bytes(lookup_area::<u8>(area::L2), 0, area::L2_ENTRIES * 16) };
     for page in 0..GUEST_PAGES {
-        let mask = (area::GLOBAL_VA as *mut u8).wrapping_add(area::CODE_PAGES + page);
-        // ponytail: plain read-modify-write while one vCPU exists; an atomic bit clear (ldclrb) with several.
-        unsafe { mask.write_volatile(mask.read_volatile() & !(1 << VCPU)) };
+        mask(area::CODE_PAGES, page).fetch_and(!own(), SeqCst);
     }
 }
 fn clear_l1() {
@@ -316,12 +340,30 @@ fn unlink(r: LinkRecord) -> Option<()> {
     (word(at) == branch(at, entry)).then(|| rewrite(at, r.original))
 }
 
-/// Invalidates every live block translated from `gpa`'s page (the page is about to be written): each leaves L1 and
-/// L2, every link into or out of it is undone and its record dropped, and it is marked dead. Then this vCPU's bit
-/// for the page is cleared. Returns the links undone; `None` if a record does not describe its word (as
-/// [`unlink_all`]).
+/// This vCPU is about to write `gpa`'s page, which holds translations: clears every vCPU's code bit of the page at
+/// once, posts the page to each other vCPU that had one (page bit, then `PAGES`; it drops its blocks at its next
+/// resident entry) and invalidates this vCPU's own blocks from it ([`invalidate`]).
+// ponytail: no kick and no re-check after the write; prompt cross-vCPU invalidation is slice 3's S3b/S3d.
+pub fn written(gpa: u64) -> Option<u64> {
+    if let Some(m) = code_page(gpa) {
+        post(m.swap(0, SeqCst) & !own(), gpa);
+    }
+    invalidate(gpa)
+}
+/// Posts `gpa`'s page to the vCPUs whose bits are set in `peers`.
+fn post(peers: u8, gpa: u64) {
+    let page = (gpa >> 12) as usize;
+    for v in (0..MAX_VCPUS).filter(|v| peers & 1 << v != 0) {
+        record_word(v, Some(page / 64)).fetch_or(1 << (page % 64), SeqCst);
+        record_word(v, None).fetch_or(PAGES, SeqCst);
+    }
+}
+
+/// Invalidates every live block of this vCPU translated from `gpa`'s page (the page is about to be written, or was):
+/// each leaves L1 and L2, every link into or out of it is undone and its record dropped, and it is marked dead. Then
+/// this vCPU's bit for the page is cleared. Returns the links undone; `None` if a record does not describe its word
+/// (as [`unlink_all`]).
 // ponytail: scans every block and record; a reverse map (page → blocks, block → records) if profiles show it.
-// Other vCPUs' bits need a shootdown (slice 3).
 pub fn invalidate(gpa: u64) -> Option<u64> {
     let c = control();
     let mut unlinked = 0;
@@ -349,7 +391,7 @@ pub fn invalidate(gpa: u64) -> Option<u64> {
         }
     }
     if let Some(mask) = code_page(gpa) {
-        unsafe { mask.write_volatile(mask.read_volatile() & !(1 << VCPU)) };
+        mask.fetch_and(!own(), SeqCst);
     }
     Some(unlinked)
 }
@@ -383,48 +425,47 @@ pub fn block_at(pc: u64) -> Option<&'static Block> {
     (offset < u64::from(b.code) + u64::from(b.code_size)).then_some(b)
 }
 
-/// Marks `gpa`'s page as holding this vCPU's translations. True if this vCPU had shadowed it writable since the
-/// last shadow reset (the caller resets its shadows, so the page is read-only everywhere).
+/// Marks `gpa`'s page as holding this vCPU's translations. True if this vCPU may hold a writable shadow of it (the
+/// caller resets its shadows, so the page is read-only in its tables).
+// ponytail: peers' writable shadows of the page are not reset (the synchronous shootdown is slice 3's S3d).
 pub fn protect(gpa: u64) -> bool {
-    let Some(mask) = code_page(gpa) else { return false };
-    unsafe { mask.write_volatile(mask.read_volatile() | 1 << VCPU) };
-    let page = (gpa >> 12) as usize;
-    let bits = lookup_area::<u8>(area::WRITABLE).wrapping_add(page / 8);
-    unsafe { bits.read() & 1 << (page % 8) != 0 }
+    let Some(m) = code_page(gpa) else { return false };
+    m.fetch_or(own(), SeqCst);
+    mask(area::WRITABLE_PAGES, (gpa >> 12) as usize).load(SeqCst) & own() != 0
 }
 /// Some vCPU holds translations from `gpa`'s page: shadows of it stay read-only.
 pub fn translated(gpa: u64) -> bool {
-    code_page(gpa).is_some_and(|mask| unsafe { mask.read_volatile() } != 0)
+    code_page(gpa).is_some_and(|m| m.load(SeqCst) != 0)
 }
 /// Records that this vCPU shadows `gpa`'s page writable.
 pub fn shadowed_writable(gpa: u64) {
     let page = (gpa >> 12) as usize;
     if page < GUEST_PAGES {
-        let bits = lookup_area::<u8>(area::WRITABLE).wrapping_add(page / 8);
-        unsafe { bits.write(bits.read() | 1 << (page % 8)) };
+        mask(area::WRITABLE_PAGES, page).fetch_or(own(), SeqCst);
     }
 }
-/// This vCPU's shadows were all removed.
+/// This vCPU's shadows were all removed (and the TLB invalidated): clears its writable bits, then counts the reset
+/// (a peer waiting for this vCPU to drop its writable shadows waits for the counter to change).
 pub fn shadows_reset() {
-    unsafe { ptr::write_bytes(lookup_area::<u8>(area::WRITABLE), 0, GUEST_PAGES.div_ceil(8)) };
+    for page in 0..GUEST_PAGES {
+        mask(area::WRITABLE_PAGES, page).fetch_and(!own(), SeqCst);
+    }
+    resets(vcpu()).fetch_add(1, SeqCst);
 }
 
-/// Takes this vCPU's pending invalidations: `Some(true)` if the whole cache must go (a flush request, or more pages
-/// than the list holds; the caller flushes), else invalidates each listed page ([`invalidate`], whose `None` this
-/// returns) and returns `Some(false)`.
-pub fn drain() -> Option<bool> {
-    let (flush, count, pages) = unsafe {
-        let q = queue();
-        let taken = ((&raw const (*q).flush).read_volatile(), (&raw const (*q).count).read_volatile(), (&raw const (*q).pages).read_volatile());
-        (&raw mut (*q).flush).write_volatile(0);
-        (&raw mut (*q).count).write_volatile(0);
-        taken
-    };
-    if flush != 0 || count > pages.len() as u64 {
-        return Some(true);
+/// Takes this vCPU's pending invalidations: swaps `pending` to 0, then each stale word, and invalidates each listed
+/// page ([`invalidate`], whose `None` this returns) unless the whole cache goes anyway. Returns the pending bits;
+/// the caller flushes on [`FLUSH`] and resets its shadows on [`SHADOWS`].
+pub fn drain() -> Option<u64> {
+    let pending = record_word(vcpu(), None).swap(0, SeqCst);
+    if pending & PAGES != 0 {
+        for i in 0..GUEST_PAGES / 64 {
+            let mut bits = record_word(vcpu(), Some(i)).swap(0, SeqCst);
+            while bits != 0 && pending & FLUSH == 0 {
+                invalidate(((i * 64 + bits.trailing_zeros() as usize) as u64) << 12)?;
+                bits &= bits - 1;
+            }
+        }
     }
-    for &gpa in &pages[..count as usize] {
-        invalidate(gpa)?;
-    }
-    Some(false)
+    Some(pending)
 }

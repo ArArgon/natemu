@@ -364,6 +364,27 @@ def ref_qemu():
     raw = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', ROOT.parent / 'natemu-raw'))
     return raw / 'reference-slice1-20261026-01' / 'pin' / 'qemu-x86_64-static'
 
+def case_description(case):
+    """The driver description of a fault case (`expectations`): its program and page mutations."""
+    _, p, mut = case[:3]
+    return vm.description(p) + ''.join(f'{m} {page:#x}\n' for m, pages in mut.items() for page in pages)
+
+def evaluate(case, out):
+    """{'expected_fault', 'vm', 'outcome', 'diffs'} of the VM's final state `out` (driver JSON) for a fault case."""
+    _, p, _, (vector, cr2, error), off, prefix, _ = case
+    rip = ref.num(p['rip']) + off
+    want = [vector, cr2, error, rip]
+    entry = {'expected_fault': [hex(x) for x in want], 'vm': {k: out[k] for k in ('stop', 'reason', 'rip', 'fault', 'native', 'stats', 'frame_intact')}}
+    limit_hit = vm.declared_limit(out)
+    if limit_hit and ref.num(out['rip']) < rip:
+        return {**entry, 'outcome': 'unsupported', 'diffs': [f"stopped at {out['rip']}: {limit_hit}"]}
+    diffs = [] if out['stop'] == 'guest_fault' else [f"stopped {out['stop']} {out['reason']} at {out['rip']}"]
+    got = [ref.num(x) for x in out['fault']]
+    if got != want: diffs.append(f'fault {[hex(x) for x in got]} != expected {[hex(x) for x in want]}')
+    diffs += ref.compare(prefix, [ref.num(v) for v in out['gpr']], ref.num(out['rflags']), ref.num(out['rip']), out['memory'])
+    if not out['frame_intact']: diffs.append('FEX frame changed')
+    return {**entry, 'outcome': 'fail' if diffs else 'match', 'diffs': diffs}
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('programs', type=pathlib.Path, nargs='*', default=[ROOT / 'fixtures/slice1/programs.json'])
@@ -377,29 +398,18 @@ def main():
     a.out.mkdir(parents=True, exist_ok=True)
     cases = expectations(programs, [] if a.no_probes else probes(), a.out / 'ref')
     counts, results = {'match': 0, 'unsupported': 0, 'fail': 0}, []
-    for n, (name, p, mut, (vector, cr2, error), off, prefix, kind) in enumerate(cases):
+    for n, case in enumerate(cases):
+        name, kind = case[0], case[6]
         work = a.out / 'work' / f'c{n:04d}'; work.mkdir(parents=True, exist_ok=True)
-        text = vm.description(p) + ''.join(f'{m} {page:#x}\n' for m, pages in mut.items() for page in pages)
-        (work / 'program.txt').write_text(text)
+        (work / 'program.txt').write_text(case_description(case))
         limit = [str(a.max_block)] if a.max_block else []
         run = subprocess.run([host, runtime, 'run-program', a.fexc, work / 'program.txt', work] + limit, capture_output=True, text=True)
-        rip = ref.num(p['rip']) + off
-        want = [vector, cr2, error, rip]
-        entry = {'case': name, 'kind': kind, 'expected_fault': [hex(x) for x in want], 'returncode': run.returncode, 'stderr': run.stderr[-1000:]}
+        entry = {'case': name, 'kind': kind, 'returncode': run.returncode, 'stderr': run.stderr[-1000:]}
         if run.returncode:
             entry['outcome'], diffs = 'fail', ['host error']
         else:
-            out = json.loads(run.stdout); entry['vm'] = {k: out[k] for k in ('stop', 'reason', 'rip', 'fault', 'native', 'stats', 'frame_intact')}
-            limit_hit = vm.declared_limit(out)
-            if limit_hit and ref.num(out['rip']) < rip:
-                entry['outcome'], diffs = 'unsupported', [f"stopped at {out['rip']}: {limit_hit}"]
-            else:
-                diffs = [] if out['stop'] == 'guest_fault' else [f"stopped {out['stop']} {out['reason']} at {out['rip']}"]
-                got = [ref.num(x) for x in out['fault']]
-                if got != want: diffs.append(f'fault {[hex(x) for x in got]} != expected {[hex(x) for x in want]}')
-                diffs += ref.compare(prefix, [ref.num(v) for v in out['gpr']], ref.num(out['rflags']), ref.num(out['rip']), out['memory'])
-                if not out['frame_intact']: diffs.append('FEX frame changed')
-                entry['outcome'] = 'fail' if diffs else 'match'
+            entry.update(evaluate(case, json.loads(run.stdout)))
+            diffs = entry['diffs']
         entry['diffs'] = diffs
         counts[entry['outcome']] += 1; results.append(entry)
         print(f"{name} [{kind}]: {entry['outcome']} {'; '.join(diffs)[:300]} {run.stderr.strip()[-200:]}")

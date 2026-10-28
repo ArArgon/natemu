@@ -50,6 +50,17 @@ def page_checks(p, vm):
                 problems.append(f'{(a + i) & ~4095:#x} written but not dirty'); break
     return problems
 
+def evaluate(p, expected, vm):
+    """The outcome (match | unsupported | fail) and differences of the VM's final state `vm` for program `p` against its
+    QEMU result `expected`."""
+    diffs = ref.compare(expected, [ref.num(v) for v in vm['gpr']], ref.num(vm['rflags']), ref.num(vm['rip']), vm['memory'])
+    limit = declared_limit(vm)
+    if limit:
+        return 'unsupported', [f"stopped at {vm['rip']}: {limit}"]
+    if vm['stop'] != 'reached': diffs.insert(0, f"stopped {vm['stop']} {vm['reason']} at {vm['rip']}")
+    diffs += page_checks(p, vm)
+    return ('fail' if diffs else 'match'), diffs
+
 def run_program(host, runtime, fexc, p, expected, work, max_block=None):
     """Runs one program description in the VM (`natemu-host run-program`) and compares with its QEMU result `expected`:
     {'name', 'returncode', 'stderr', 'outcome': match | unsupported | fail, 'diffs', 'vm'}."""
@@ -61,16 +72,7 @@ def run_program(host, runtime, fexc, p, expected, work, max_block=None):
     if run.returncode == 0:
         vm = json.loads(run.stdout)
         entry['vm'] = vm
-        diffs = ref.compare(expected, [ref.num(v) for v in vm['gpr']], ref.num(vm['rflags']), ref.num(vm['rip']), vm['memory'])
-        limit = declared_limit(vm)
-        if limit:
-            entry['outcome'] = 'unsupported'
-            diffs = [f"stopped at {vm['rip']}: {limit}"]
-        else:
-            if vm['stop'] != 'reached': diffs.insert(0, f"stopped {vm['stop']} {vm['reason']} at {vm['rip']}")
-            diffs += page_checks(p, vm)
-            entry['outcome'] = 'fail' if diffs else 'match'
-        entry['diffs'] = diffs
+        entry['outcome'], entry['diffs'] = evaluate(p, expected, vm)
     else:
         entry['outcome'] = 'fail'
     return entry
