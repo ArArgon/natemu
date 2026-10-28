@@ -441,6 +441,9 @@ def cmd_system(a, host, runtime):
             if want is None: failures.append(f'{name}: QEMU prefix run failed ({rc})'); continue
             code = bytes.fromhex(prog['bodies'][0]['code'])[at - smp.num(prog['bodies'][0]['addr']):]
             c = prog['cpus'][0]
+            # The model is given the start-up controls: the prefix must not have written any (MOV to CR 0f 22, WRMSR 0f 30).
+            prefix = bytes.fromhex(prog['bodies'][0]['code'])[:at - smp.num(prog['bodies'][0]['addr'])]
+            assert b'\x0f\x22' not in prefix and b'\x0f\x30' not in prefix, f'{name}: the prefix changes controls'
             vector = sfm.fault(code, want['cpus'][0]['gpr'], c.get('cpl', 3), 0x80010011, 0x20, 0xd00)
             if vector is None: failures.append(f'{name}: the model expects no fault'); continue
             want['cpus'][0]['fault'] = (*vector, at, 0)

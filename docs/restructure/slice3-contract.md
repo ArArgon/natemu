@@ -241,6 +241,9 @@ their campaigns retire:** runtime/abi family code (modes are layered: `translati
   Refused (`unsupported_system`): MOV CR2/CR8, CR0 bits but WP, CR4 feature bits (OSFXSR ...), CR3 PWT/PCD. Driver
   `identity` spaces; `tools/run_slice3_vm.py system` (QEMU `system.json` programs; fault cases by `tools/system_fault_model.py`
   at QEMU's prefix state, five cases also by four `i4v_modes_model` profiles; the PTE change without INVLPG by `i4v_coherence_model`).
+  *Built S3c2 (Oct 28, concurrent controls, contract 33):* generated QEMU programs `sys-ctl-*` (`programs.ctl_program`) at 2 and 4 CPUs
+  (CPU 0 toggles CR3/WP/NXE while peers run the same tables and code; finals depend on each CPU's own controls) run by
+  `tools/run_slice3_vm.py system` at block sizes default and 1; no resident change was needed (controls, cache and shadows are per vCPU).
   *Boot-phase items from S3c1 review:* MOV from CR2 (the page-fault handler reads it); the CR4 bits Linux sets (OSFXSR,
   OSXMMEXCPT, OSXSAVE, FSGSBASE, UMIP) and CR0 TS/MP/NE/AM changes are refused today; MSRs other than EFER #GP (FS/GS base,
   KERNEL_GS_BASE, STAR/LSTAR, PAT … needed); CR4 profile bits (VMXE, SMXE, PKE, UMIP) become reserved from the CPUID

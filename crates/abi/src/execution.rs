@@ -554,7 +554,8 @@ pub struct State {
     pub stops: u64,
     /// With a [`REPLY_SYSTEM`] reply: the decoded instruction.
     pub system: System,
-    /// System instructions executed (committed or faulted) as transactions.
+    /// System instructions the resident began executing as transactions: counted on entry, so those refused
+    /// (`unsupported_system`) are included along with the committed and faulted.
     pub systems: u64,
 }
 impl State {

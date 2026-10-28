@@ -89,6 +89,13 @@ per CPU); and a PTE change without INVLPG (either history is legal: not compared
 LOCK, CR1/CR5, CPL3 forms, reserved EFER bits, LME cleared with paging on, unknown MSRs. QEMU 11.1.2 is not a reference for most of these
 (it accepts some writes the SDM faults and hangs on others); `tools/run_slice3_vm.py system` judges them with `tools/system_fault_model.py`.
 
+Concurrent controls (`sys-ctl-<scenario>@N`, N = 2, 4; `programs.ctl_program`, contract 33): CPU 0 toggles CR3 (roots A, B, a copy A2 of A; B maps V to
+another frame and has no U), CR0.WP and EFER.NXE 6 times per round for 10 rounds, settling each round in a state from a fixed generator, while its peers
+(one shared body, shared tables and code) loop on loads, stores and fetches, log their own CR0/CR3/EFER and what V resolves to, and ACK through flags
+(plain loads and stores). Peers walk V afresh (INVLPG) before each read when CPU 0 toggles CR3, and R before the final store in the WP scenarios, so a leaked root or WP shows at once. A final stage has each peer make one access whose outcome depends only on its own controls (R store: #PF 3 with WP=1; XD fetch:
+#PF 0x11 with NXE=1; X read: #PF 9 with NXE=0) while CPU 0 holds the opposite controls; CPU 0 ends by faulting on its own. Scenarios: `cr3`, `wp-clear`
+(peers clear WP), `wp-set`, `wp-mixed` (4 CPUs: peer 2 clears), `nxe-keep`, `nxe-clear`, `nxe-mixed`, `all`. Compared with QEMU like the other system programs.
+
 ## (a) Deterministic programs (`programs.json`, 5 programs x 2/3/4 CPUs)
 
 Every one ends in `cmp r11, r11` (all six flags defined) and has a schedule-independent final state; spin waits only on flags written by a

@@ -1,5 +1,5 @@
 """Program generators for the SMP reference: deterministic programs (a) and litmus programs (b). Output: natemu-smp-v1 programs."""
-import pathlib, subprocess, sys, tempfile
+import pathlib, random, subprocess, sys, tempfile
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent.parent))
 M64 = (1 << 64) - 1
@@ -448,6 +448,157 @@ def sys_fault(name):
             'params': {'fault_at': f"0x{SYS_CODE(0) + len(asm(chr(10).join(lines[:-1]))):x}"}}
     return prog
 
+# ---- (d) concurrent controls (contract 33): CPU 0 rewrites CR3 / CR0.WP / EFER.NXE while its peers run on the same tables ----
+# Shared tables: roots A and B (built at CPU 0's addresses) and A2 (a copy of A at CPU 1's); one data area (SYS_D(0)'s test
+# pages, A/D preset); two bodies: CPU 0's, and the peers' (SYS_CODE(1), id in rbx). B differs from A: V maps to F2 and U is
+# not present. Each round CPU 0 toggles its controls CTL_K times, settles in a state drawn from a fixed generator, logs its
+# controls, then publishes GEN = round and waits for every peer's ACK. Peers loop on loads, stores and a fetch through the
+# tables (per scenario also reads of the XD page X after an INVLPG, and stores to the read-only page R) until GEN arrives, log
+# their own CR0/CR3/EFER and the frame V resolves to, and ACK. A peer that sees CPU 0's controls would log or fault early. Final
+# stage: every peer ACKs and makes one access whose outcome depends only on its own controls (R store: #PF 3 with WP=1; fetch
+# from the XD page C: #PF 0x11 with NXE=1; read of X: #PF 9 with NXE=0); CPU 0 holds the opposite controls, waits, delays and
+# ends by faulting on its own (R store with WP=1, X read with NXE=0, U read under root B). Plain loads and stores only.
+CTL_ROUNDS, CTL_K, CTL_SYNC = 10, 6, 0x8000        # SYNC page: GEN +0, ACK[i] +0x40*i, peer cell +0x100+8*i, LOG[i] +0x400+0x200*i (cr0, cr3, efer, V)
+CTL_SCENARIOS = {            # name: (CPU 0 toggles, which peers clear their own WP/NXE: None/'all'/'even', CPU counts, CPU 0's last fault)
+    'cr3': (('cr3',), None, (2, 4), 'u'),
+    'wp-clear': (('wp',), 'all', (2, 4), 'r'),        # peers clear WP: their R stores succeed whatever CPU 0's WP is; CPU 0 faults
+    'wp-set': (('wp',), None, (2, 4), 'r'),           # peers keep WP: the final R store faults on each of them
+    'wp-mixed': (('wp',), 'even', (4,), 'r'),         # peer 2 clears WP (succeeds), peers 1 and 3 fault
+    'nxe-keep': (('nxe',), None, (2, 4), 'x'),
+    'nxe-clear': (('nxe',), 'all', (2, 4), 'x'),
+    'nxe-mixed': (('nxe',), 'even', (4,), 'x'),
+    'all': (('cr3', 'wp', 'nxe'), None, (2, 4), 'r'),
+}
+CTL_PAGE = 'mov eax, 0x5a5a\nadd rax, rax\nret'
+
+def ctl_clears(scn, j):
+    own = CTL_SCENARIOS[scn][1]
+    return own == 'all' or (own == 'even' and j % 2 == 0)
+
+def ctl_fields():
+    d = SYS_D(0)
+    return dict(ta=SYS_T(0, 0), tb=SYS_T(0, 1), a2=SYS_T(1, 0), V=d + V, F1=d + F1, R=d + R, X=d + X, U=d + U, C=d + C, sync=d + CTL_SYNC, cell=d + CTL_SYNC + 0x100, save=d + SAVE)
+
+def ctl_cpu0(scn, n):
+    toggles, last = CTL_SCENARIOS[scn][0], CTL_SCENARIOS[scn][3]
+    rng, t = random.Random(33), ['bits 64', 'mov rax, cr3', 'mov [{save:#x}], rax', 'mov rax, {ta:#x}', 'mov cr3, rax', 'mov r15, {sync:#x}', 'lea r9, [r15+0x400]']
+    peers = lambda which: [j for j in range(1, n) if which(j)]
+    ack = lambda lab, r, which=(lambda j: True): ''.join(f'.{lab}{j}:\n    cmp qword [r15+{0x40 * j:#x}], {r}\n    jb .{lab}{j}\n' for j in peers(which))
+    delay = lambda lab: f'    mov ecx, 300000\n.{lab}:\n    dec ecx\n    jnz .{lab}\n'
+    wp = lambda w: f"    mov rax, cr0\n    {'bts' if w else 'btr'} rax, 16\n    mov cr0, rax\n"
+    nxe = lambda x: f"    mov ecx, 0xC0000080\n    rdmsr\n    {'bts' if x else 'btr'} eax, 11\n    wrmsr\n"
+    tog = ('    mov rax, {tb:#x}\n    mov cr3, rax\n    mov rax, {a2:#x}\n    mov cr3, rax\n    mov rax, {ta:#x}\n    mov cr3, rax\n    mov cr3, rax\n' if 'cr3' in toggles else '') \
+        + ('    mov rax, cr0\n    btc rax, 16\n    mov cr0, rax\n' if 'wp' in toggles else '') \
+        + ('    mov ecx, 0xC0000080\n    rdmsr\n    btc eax, 11\n    wrmsr\n' if 'nxe' in toggles else '')
+    roots = ['{ta:#x}', '{tb:#x}', '{a2:#x}']
+    for r in range(1, CTL_ROUNDS + 1):
+        t.append(f'    mov r12d, {CTL_K}\n.t{r}:\n{tog}    dec r12d\n    jnz .t{r}')
+        # the round's state (round 1: every toggled control away from its start-up value)
+        rt, w, x = rng.randrange(3), rng.randrange(2), rng.randrange(2)
+        if r == 1: rt, w, x = 1, 0, 0
+        if 'cr3' in toggles: t.append(f'    mov rax, {roots[rt]}\n    mov cr3, rax')
+        if 'wp' in toggles: t.append(wp(w).rstrip())
+        if 'nxe' in toggles: t.append(nxe(x).rstrip())
+        if 'wp' in toggles and not w: t.append(f'    mov qword [{{R:#x}}], {r}')            # a supervisor write to a read-only page: only with WP=0
+        if 'nxe' in toggles and x: t.append('    invlpg [{X:#x}]\n    mov rsi, [{X:#x}]')   # a walk of the XD page: only with NXE=1
+        t.append(f'    mov qword [{{V:#x}}+8], {r}')
+        t.append('    mov rax, cr0\n    mov [r9], rax\n    mov rax, cr3\n    mov [r9+8], rax\n    mov ecx, 0xC0000080\n    rdmsr\n    mov [r9+16], rax\n'
+                 '    mov rax, [{V:#x}]\n    mov [r9+24], rax\n    add r9, 32')
+        t.append(f'    mov qword [r15], {r}\n' + ack(f'a{r}_', r).rstrip())
+    fin = CTL_ROUNDS + 1
+    if 'cr3' in toggles: t.append('    mov rax, {tb:#x}\n    mov cr3, rax')              # root B for the end (U not present)
+    if 'wp' in toggles: t.append(wp(scn == 'wp-clear').rstrip())    # opposite of the peers' WP (wp-clear: peers 0, CPU 0 1; else CPU 0 0)
+    if 'nxe' in toggles: t.append(nxe(0).rstrip())
+    t.append(f'    mov qword [r15], {fin}\n' + ack('af', fin).rstrip() + '\n' + delay('df').rstrip())
+    f2 = peers(lambda j: 'nxe' in toggles and ctl_clears(scn, j))
+    if f2: t.append(nxe(1).rstrip() + f'\n    mov qword [r15], {fin + 1}\n' + ack('ag', fin + 1, lambda j: j in f2).rstrip() + '\n' + delay('dg').rstrip())
+    t.append({'u': '    mov rax, [{U:#x}]', 'r': wp(1).rstrip() + '\n    mov [{R:#x}], rbp', 'x': nxe(0).rstrip() + '\n    invlpg [{X:#x}]\n    mov rax, [{X:#x}]'}[last])
+    return '\n'.join(t).format(**ctl_fields()), bool(f2)
+
+def ctl_peer(scn, n, has_f2):
+    toggles = CTL_SCENARIOS[scn][0]; fin = CTL_ROUNDS + 1
+    clear = {'wp': '    mov rax, cr0\n    btr rax, 16\n    mov cr0, rax\n', 'nxe': '    mov ecx, 0xC0000080\n    rdmsr\n    btr eax, 11\n    wrmsr\n'}.get(toggles[0] if len(toggles) == 1 else '', '')
+    own = CTL_SCENARIOS[scn][1]
+    init = '' if not own else (clear + '    xor r10d, r10d\n' if own == 'all' else '    test bl, 1\n    jnz .keep\n' + clear + '    xor r10d, r10d\n.keep:\n')
+    reads_x = '    invlpg [{X:#x}]\n    mov rax, [{X:#x}]\n'
+    extra = {'wp': '    test r10, r10\n    jz .w0\n    mov rax, [{R:#x}+rbx*8]\n    jmp .we\n.w0:\n    mov [{R:#x}+rbx*8], rbp\n.we:\n',
+             'nxe': '    test r10, r10\n    jz .nx\n' + reads_x + '.nx:\n',
+             'all': '    mov rax, [{R:#x}+rbx*8]\n' + reads_x, 'cr3': ''}[scn.split('-')[0]]
+    ack = '    mov rax, rbx\n    shl rax, 6\n    mov [r15+rax], r13\n'
+    walk_v = '    invlpg [{V:#x}]\n' if 'cr3' in toggles else ''       # a fresh walk of V each time: CPU 0's root would show
+    walk_r = '    invlpg [{R:#x}]\n'                                       # and of R before the final store: CPU 0's WP would show
+    final = {'wp': walk_r + '    mov [{R:#x}+rbx*8], rbp\n', 'all': walk_r + '    mov [{R:#x}+rbx*8], rbp\n', 'cr3': '',
+             'nxe': '    test r10, r10\n    jz .s1\n    mov rax, {C:#x}\n    jmp rax\n.s1:\n'}[scn.split('-')[0]]
+    f2 = (f'    inc r13\n.w2:\n    cmp qword [r15], r13\n    jb .w2\n{ack}    test r10, r10\n    jnz .s2\n    invlpg [{{X:#x}}]\n    mov rax, [{{X:#x}}]\n.s2:\n' if has_f2 else '')
+    text = f"""bits 64
+    mov rax, cr3
+    mov [{{save:#x}}+rbx*8], rax
+    mov rax, {{ta:#x}}
+    mov cr3, rax
+    mov r15, {{sync:#x}}
+    mov r9, rbx
+    shl r9, 9
+    lea r9, [r9+r15+0x400]
+    xor r14d, r14d
+    mov r13d, 1
+    mov r10d, 1
+{init}.work:
+{walk_v}    mov rax, [{{V:#x}}]
+    cmp rax, [{{F1:#x}}]
+    je .vok
+    inc r14
+.vok:
+    mov [{{cell:#x}}+rbx*8], r13
+{extra}    mov rax, {{U:#x}}
+    call rax
+    cmp qword [r15], r13
+    jb .work
+    cmp r13, {fin}
+    jae .final
+    mov rax, cr0
+    mov [r9], rax
+    mov rax, cr3
+    mov [r9+8], rax
+    mov ecx, 0xC0000080
+    rdmsr
+    mov [r9+16], rax
+{walk_v}    mov rax, [{{V:#x}}]
+    mov [r9+24], rax
+    add r9, 32
+{ack}    inc r13
+    jmp .work
+.final:
+{ack}{final}{f2}"""
+    return (text + """    mov eax, 0x20
+    mov cr4, rax
+    mov eax, 0x80010011
+    mov cr0, rax
+    mov ecx, 0xC0000080
+    mov eax, 0xd00
+    xor edx, edx
+    wrmsr
+    mov rax, [{save:#x}+rbx*8]
+    mov cr3, rax
+    xor eax, eax
+    cmp r11, r11""").format(**ctl_fields())
+
+def ctl_program(scn, n):
+    d = SYS_D(0)
+    a = {d + V: (d + F1) | P | RW | US | A | D, d + R: (d + R) | P | US | A | D, d + X: (d + X) | P | RW | US | A | D | XD,
+         d + C: (d + C) | P | RW | A | D | XD, d + U: (d + U) | P | RW | US | A | D}
+    b = dict(a); b[d + V] = (d + F2) | P | RW | US | A | D; b[d + U] = 0
+    lcg = lambda o, seed: {'addr': f'0x{d + o:x}', 'size': 0x1000, 'fill': 'lcg', 'seed': seed}
+    code = asm(CTL_PAGE).hex()
+    memory = sys_tables(0, 0, n, a) + sys_tables(0, 1, n, b) + sys_tables(1, 0, n, a) + [
+        zero(d + V, 0x1000), lcg(F1, 1), lcg(F2, 2), lcg(R, 3), lcg(X, 4), {'addr': f'0x{d + U:x}', 'data': code}, {'addr': f'0x{d + C:x}', 'data': code},
+        dict(zero(d + SAVE, 0x20), capture=False), zero(d + CTL_SYNC, 0x1000)]
+    text0, has_f2 = ctl_cpu0(scn, n); text1 = ctl_peer(scn, n, has_f2)
+    for t in (text0, text1): assert len(asm(t)) < 0x1000 - 8, (scn, len(asm(t)))
+    cpus = [dict(cpu(0, SYS_CODE(0), rbp=0xabc0), cpl=0)] + [dict(cpu(j, SYS_CODE(1), rbx=j, rbp=0xabc0 + j), cpl=0) for j in range(1, n)]
+    return {'format': 'natemu-smp-v1', 'name': f'sys-ctl-{scn}@{n}', 'ncpu': n, 'system': True, 'bodies': [body(SYS_CODE(0), text0), body(SYS_CODE(1), text1)],
+            'cpus': cpus, 'memory': memory, 'params': {'controls': scn, 'rounds': CTL_ROUNDS, 'toggles': CTL_K}}
+
 def system_all():
     out = [sys_program(name, n) for name in SYS for n in ((1, 2, 4) if name not in ('pte-no-invlpg',) else (1,))]
-    return out + [sys_fault(name) for name in list(SYS_FAULTS) + list(SYS_CPL3)]
+    out += [sys_fault(name) for name in list(SYS_FAULTS) + list(SYS_CPL3)]
+    return out + [ctl_program(scn, n) for scn in CTL_SCENARIOS for n in CTL_SCENARIOS[scn][2]]

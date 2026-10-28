@@ -227,7 +227,7 @@ gdt:    dq 0
         dq 0x00CF9A000000FFFF               ; 0x28 code32 DPL0
 %assign i 0
 %rep 4                                      ; 0x30 + 16*i: TSS i (64-bit available TSS, 0x68 bytes at TSS + 0x80*i)
-        dq 0x67 | (((TSSADDR + 0x80*i) & 0xffff) << 16) | (((TSSADDR + 0x80*i) >> 16) << 32) | (0x89 << 40)
+        dq 0x67 | (((TSSADDR + 0x80*i) & 0xffff) << 16) | ((((TSSADDR + 0x80*i) >> 16) & 0xff) << 32) | (0x89 << 40) | ((((TSSADDR + 0x80*i) >> 24) & 0xff) << 56)
         dq 0
 %assign i i+1
 %endrep

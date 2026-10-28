@@ -424,7 +424,9 @@ fn tamper_offset(area: Area, state: &mut State) -> bool {
 /// A system reply whose decode the resident must refuse (`bad_reply`): an instruction length of 16.
 fn tamper_system(_: Area, state: &mut State) -> bool {
     let reply = state.system.kind != 0;
-    state.system.length = if reply { 16 } else { state.system.length };
+    if reply {
+        state.system.length = 16;
+    }
     reply
 }
 fn tamper_word(area: Area, _: &mut State) -> bool {

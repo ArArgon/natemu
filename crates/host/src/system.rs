@@ -7,9 +7,9 @@
 //! INVLPG) is `None`: the vCPU stops with fexc's reason, as for code it cannot compile.
 use natemu_abi::execution::{System, system};
 
-/// fexc's opcode map of the two-byte table (`FEXC_MAP_TWO`) and its 66 overlay (`FEXC_MAP_TWO_66`).
+/// fexc's opcode map of the two-byte table (`FEXC_MAP_TWO`). It reports map 1 even with a 66 prefix (the 66 overlay,
+/// map 4, is not reported for these opcodes).
 const MAP_TWO: u8 = 1;
-const MAP_TWO_66: u8 = 4;
 
 /// Decodes the instruction at the start of `bytes`, which fexc cut as a system instruction with opcode map `map` and
 /// opcode `opcode`.
@@ -33,7 +33,7 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         _ => 0,
     };
     let (r, x, b) = (u32::from(rex >> 2 & 1) << 3, u32::from(rex >> 1 & 1) << 3, u32::from(rex & 1) << 3);
-    if *bytes.get(at)? != 0x0f || *bytes.get(at + 1)? != opcode || !matches!(map, MAP_TWO | MAP_TWO_66) {
+    if *bytes.get(at)? != 0x0f || *bytes.get(at + 1)? != opcode || map != MAP_TWO {
         return None;
     }
     at += 2;
