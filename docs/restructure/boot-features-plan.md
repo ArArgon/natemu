@@ -215,6 +215,8 @@ config and initramfs into natemu-raw is allowed (nothing committed); mitigations
 (`mitigations=off`), while VERW and CR3 switches are still implemented correctly; the accepted CPU 16 profile is kept
 (AVX/AVX2/FMA via FEX AVX128, RDRAND, MTRR in this phase). The owner asked why a CR3 load discards the code cache:
 it is an S3c1 simplification, not an x86 requirement — see the code-cache-across-CR3 item added to the plan.
+Also: single-step (TF/RF) and hardware breakpoints are built in this phase as CPU 16 requires (no deferral); the
+loader may run Debian's real decompressor up to its jump into the decompressed kernel as a smoke test.
 
 **Decided from evidence (recorded, not questions):** guest RAM default 2 GiB, tests choose their own size (M69);
 INIT/SIPI deferred, unused with the mailbox (`K kernel/smpboot.c:877-928`; M64 keeps the definition); legacy devices
