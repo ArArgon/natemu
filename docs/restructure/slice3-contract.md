@@ -76,7 +76,17 @@ stage-2 fault to v's thread, which restores the granule and injects a stop (ELR/
 gate, EL1h masked). The gate requires ELR = a placed or step block's stop-store PC (else halt), banks the entry state (RIP
 = block RIP, CF inverted), drains and re-dispatches. Latency: one block (no in-block loops; helpers bounded). A kick
 finding v in the host or resident is served by its next drain (the later fault is an empty stop). **Premise:** `hv_vm.h`
-does not document `hv_vm_protect` taking effect on a running vCPU; S3b tests it first. Fallback: protect, then
+does not document `hv_vm_protect` taking effect on a running vCPU; S3b tests it first. *Result (S3b1, Oct 28,
+`experiments/track03/stop-premise/`):* holds — 150,000 kicks at 1/2/4 vCPUs, unloaded and oversubscribed, none lost;
+one stage-2 exit per kick (EC 0x24, WnR, DFSC 0x0f, FAR = the stop granule, 16 KiB); no-kick controls zero exits; the
+exit usually precedes the call's return. The ms-scale tail (up to 1.6% > 1 ms at 4 vCPUs oversubscribed, fallback
+alike) is host scheduling, partly in the protect call and partly the vCPU thread waking late (independent replication:
+up to ~10 ms after the call returned), so the bound is **the stop takes effect at the next stop-store after
+`hv_vm_protect` returns**; wall-clock latency carries a host-scheduling tail. Replication also showed: a protect issued
+while v is in the host stays in force and fires at the first stop-store after re-entry (8,000/8,000) — so the granule
+is restored only on the stop exit itself, never on other exits; concurrent protect calls contend (p99 ~200 µs with 8
+callers vs ~30 µs with one), so redundant protects are skipped; unkicked peers neither exit nor stall (throughput −5–10%,
+unattributed). Fallback: protect, then
 `hv_vcpus_exit(v)`; still precise at the next block entry after re-entry. `hv_vcpus_exit` alone stays watchdog only.
 Rejected: a virtual IRQ (owner-thread only, lands at any native PC).
 

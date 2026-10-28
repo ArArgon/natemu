@@ -548,9 +548,9 @@ def expectations(programs, probe_specs, work, paging=True):
                 if not f: r = rs[full]
                 elif i in at: r = rs[at[i]]
                 elif i == 0: r = initial_result(q)
-                else: skipped.append(f"{q['name']}/{name}"); return     # no QEMU prefix there (a fetch fault mid-program)
+                else: skipped.append(f"{q['name']}@{where}/{name}"); return     # no QEMU prefix there (a fetch fault mid-program)
                 kind = describe(q['asm'][i], [] if fetched else evs.get(i, []), f, fetched) if f else 'runs to its end'
-                cases.append((f"{q['name']}/{name}", q, mut, f, offs[i], r, kind, ad))
+                cases.append((f"{q['name']}@{where}/{name}", q, mut, f, offs[i], r, kind, ad))
             code_pages = set(pages(rip, offs[-1]))
             touched = sorted({pg for es in evs.values() for e in es if e[0] == 'access'
                               for pg in (e[1] & ~(PAGE - 1), (e[1] + e[2] - 1) & ~(PAGE - 1))} - code_pages - {q.get('scratch')})
@@ -559,7 +559,7 @@ def expectations(programs, probe_specs, work, paging=True):
                     for mode in ('unmap', 'readonly'):
                         mut = {mode: [page]}
                         f, i, fetched, ad = run_case(q, offs, evs, lambda k: reader(rs[at[k]]), mut)
-                        if f: cases.append((f"{q['name']}/{mode}-{page:#x}", q, mut, f, offs[i], rs[at[i]], describe(q['asm'][i], evs[i], f), ad))
+                        if f: cases.append((f"{q['name']}@{where}/{mode}-{page:#x}", q, mut, f, offs[i], rs[at[i]], describe(q['asm'][i], evs[i], f), ad))
             if not paging: continue
             n = 2 if corpus else 6
             for page in touched:
