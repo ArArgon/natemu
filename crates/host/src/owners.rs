@@ -11,7 +11,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 /// Returned after every owner has joined and destroyed its vCPU. A setup
@@ -33,17 +33,12 @@ pub(crate) fn cancel_owners(cancelled: &AtomicBool) {
 /// owner has prepared (start barrier: no native entry before), `body(id, vcpu,
 /// cancelled)` runs it. A body error cancels every owner (as [`cancel_owners`],
 /// which a body may also call itself); running vCPUs are then forced out
-/// repeatedly until every body returned. `poll` runs about every 20 ms and returns
-/// an external failure cause; `owner_failed` sees each owner error before
-/// cancellation. Every vCPU is destroyed on its own thread before this returns, so
-/// the caller may destroy the VM next.
+/// repeatedly until every body returned. Every vCPU is destroyed on its own thread
+/// before this returns, so the caller may destroy the VM next.
 pub(crate) fn supervise<T: Send>(
     n: usize,
-    deadline: Duration,
     prepare: &(dyn Fn(usize) -> Result<Vcpu> + Sync),
     body: &(dyn Fn(usize, &Vcpu, &AtomicBool) -> Result<T> + Sync),
-    poll: &mut dyn FnMut() -> Option<String>,
-    owner_failed: &dyn Fn(&str),
 ) -> Result<Supervision<T>> {
     let cancelled = AtomicBool::new(false);
     thread::scope(|scope| {
@@ -108,18 +103,12 @@ pub(crate) fn supervise<T: Send>(
                 error.get_or_insert("owner disappeared before entry".into());
             }
         }
-        let began = Instant::now();
         let mut completed = 0;
         while completed < n {
-            let completion = done_rx.recv_timeout(Duration::from_millis(20));
-            if let Some(cause) = poll() {
-                error.get_or_insert(cause);
-            }
-            match completion {
+            match done_rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(result) => {
                     completed += 1;
                     if let Err(e) = result {
-                        owner_failed(&e);
                         error.get_or_insert(e);
                         cancel_owners(&cancelled);
                     }
@@ -129,9 +118,6 @@ pub(crate) fn supervise<T: Send>(
                     break;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-            }
-            if began.elapsed() > deadline {
-                error.get_or_insert("concurrent execution exceeded its deadline".into());
             }
             if (error.is_some() || cancelled.load(Ordering::Acquire)) && completed < n {
                 cancel_owners(&cancelled);

@@ -23,8 +23,8 @@ pub const TCR_BOTH: u64 =
 /// Valid page, AF, inner shareable, normal memory (MAIR index 0), UXN and PXN:
 /// generated code never executes from guest pages.
 pub const PAGE: u64 = 3 | 1 << 10 | 3 << 8 | 3 << 53;
-/// nG: the entry is tagged with the owner's ASID (owners with ASIDs map the same
-/// addresses differently, so their entries must not match another owner's).
+/// nG: the entry is tagged with the owner's ASID (every owner maps the same
+/// addresses differently, so its entries must not match another owner's).
 pub const NOT_GLOBAL: u64 = 1 << 11;
 pub const READ_ONLY: u64 = 1 << 7;
 const TABLE: u64 = 3;
@@ -48,7 +48,7 @@ pub enum Error {
 }
 
 /// Translation-table maintenance on the owning CPU. Non-broadcast TLBI
-/// (VAE1/VMALLE1) suffices only while the table pages are walked by this CPU
+/// (VAE1/ASIDE1) suffices only while the table pages are walked by this CPU
 /// alone (owner-private tables); tables shared between CPUs need the
 /// inner-shareable variants (VAE1IS/VMALLE1IS).
 pub trait Maintenance {
@@ -69,8 +69,6 @@ pub struct Space<M> {
     pub ipa: u64,
     pub pool_pages: usize,
     pub upper: bool,
-    /// Shadows carry [`NOT_GLOBAL`] (the owner has its own ASID).
-    pub tagged: bool,
     pub tlb: M,
 }
 /// The pre-linked lower and upper shadow tables below the roots.
@@ -176,7 +174,7 @@ impl<M: Maintenance> Space<M> {
             return Err(Error::Private);
         }
         let (table, index) = self.leaf(va, true)?.ok_or(Error::Corrupt)?;
-        let new = target | PAGE | if writable { 0 } else { READ_ONLY } | if self.tagged { NOT_GLOBAL } else { 0 };
+        let new = target | PAGE | NOT_GLOBAL | if writable { 0 } else { READ_ONLY };
         let old = self.get(table, index);
         if old == new {
             return Ok(());
@@ -205,30 +203,6 @@ impl<M: Maintenance> Space<M> {
             Ok(Some((table, index))) => self.get(table, index),
             _ => 0,
         }
-    }
-    /// Remove every shadow under the enabled roots; tables stay linked for
-    /// reuse. Leaves cleared before a corrupt link are still invalidated.
-    pub fn clear(&mut self) -> Result<(), Error> {
-        let result = self.halves().try_for_each(|(root, indices)| {
-            indices
-                .into_iter()
-                .try_for_each(|index| self.clear_table(self.get(root, index), 1))
-        });
-        self.tlb.invalidate_all();
-        result
-    }
-    fn clear_table(&mut self, descriptor: u64, level: usize) -> Result<(), Error> {
-        let Some(table) = self.next(descriptor)? else {
-            return Ok(());
-        };
-        for index in 0..512 {
-            if level == 3 {
-                self.set(table, index, 0);
-            } else {
-                self.clear_table(self.get(table, index), level + 1)?;
-            }
-        }
-        Ok(())
     }
     /// Evict everything: unlink both guest halves and return the pool. Tables
     /// the host pre-linked are dropped too; later maps allocate from the pool.
@@ -270,13 +244,14 @@ mod tests {
         }
     }
     const IPA: u64 = 0x4010_0000;
+    /// Every shadow leaf: valid page, tagged with the owner's ASID.
+    const LEAF: u64 = PAGE | NOT_GLOBAL;
     fn space(memory: &mut Vec<u64>, pool_pages: usize) -> Space<Log> {
         Space {
             window: memory.as_mut_ptr().cast(),
             ipa: IPA,
             pool_pages,
             upper: true,
-            tagged: false,
             tlb: Log::default(),
         }
     }
@@ -310,8 +285,8 @@ mod tests {
         }
         assert_eq!(s.map(0x10_0800, 0x4007_0000, true), Err(Error::Misaligned));
         assert_eq!(s.map(0x10_0000, 0x4007_0800, true), Err(Error::Misaligned));
-        assert_eq!(s.descriptor(0x10_0000), 0x4007_0000 | PAGE | READ_ONLY);
-        assert_eq!(s.descriptor(HIGH_BASE + 0x10_0abc), 0x4007_0000 | PAGE);
+        assert_eq!(s.descriptor(0x10_0000), 0x4007_0000 | LEAF | READ_ONLY);
+        assert_eq!(s.descriptor(HIGH_BASE + 0x10_0abc), 0x4007_0000 | LEAF);
         assert_eq!(s.descriptor(0x10_2000), 0);
         drop(s);
         // Lower: root[0] -> pool 0 -> pool 1 -> pool 2; upper: root[256] -> pool 3..5.
@@ -321,7 +296,7 @@ mod tests {
         assert_eq!(word(&m, POOL_OFFSET + 4096), table(2));
         assert_eq!(
             word(&m, POOL_OFFSET + 2 * 4096 + 256 * 8),
-            0x4007_0000 | PAGE | READ_ONLY
+            0x4007_0000 | LEAF | READ_ONLY
         );
         assert_eq!(word(&m, UPPER_ROOT + 256 * 8), table(3));
         // Nothing reaches the private half or the gap.
@@ -340,15 +315,15 @@ mod tests {
         link(&mut m, UPPER_L1, UPPER_L2);
         link(&mut m, UPPER_L2, UPPER_LEAF);
         let mut s = space(&mut m, 0);
-        s.map(crate::DATA_VA, 0x4007_0000, true).unwrap();
-        s.map(HIGH_BASE + crate::DATA_VA, 0x4007_0000, false)
+        s.map(0x10_0000, 0x4007_0000, true).unwrap();
+        s.map(HIGH_BASE + 0x10_0000, 0x4007_0000, false)
             .unwrap();
         assert_eq!(s.map(0x20_0000, 0x4007_0000, false), Err(Error::Capacity));
         drop(s);
-        assert_eq!(word(&m, LOWER_LEAF + 256 * 8), 0x4007_0000 | PAGE);
+        assert_eq!(word(&m, LOWER_LEAF + 256 * 8), 0x4007_0000 | LEAF);
         assert_eq!(
             word(&m, UPPER_LEAF + 256 * 8),
-            0x4007_0000 | PAGE | READ_ONLY
+            0x4007_0000 | LEAF | READ_ONLY
         );
     }
 
@@ -362,7 +337,7 @@ mod tests {
         assert_eq!(s.used(), 4);
         // The partially linked path stays valid and needs no new page later.
         assert_eq!(s.map(0x4000_0000, 0x4000_0000, true), Err(Error::Capacity));
-        assert_eq!(s.descriptor(0), 0x4000_0000 | PAGE);
+        assert_eq!(s.descriptor(0), 0x4000_0000 | LEAF);
         s.reset();
         assert_eq!((s.used(), s.descriptor(0)), (0, 0));
         assert_eq!(s.tlb.0.last(), Some(&ALL));
@@ -387,7 +362,7 @@ mod tests {
         s.tlb.1 = Some(s.slot(table, index));
         s.map(va, 0x4007_0000, true).unwrap();
         assert_eq!(s.tlb.0, [va, 0, PUBLISH]);
-        assert_eq!(s.descriptor(va), 0x4007_0000 | PAGE);
+        assert_eq!(s.descriptor(va), 0x4007_0000 | LEAF);
         s.tlb.0.clear();
         s.unmap(va + 0x123).unwrap();
         assert_eq!(s.descriptor(va), 0);
@@ -398,27 +373,9 @@ mod tests {
         s.unmap(0x7000_0000_0000).unwrap();
         assert!(s.tlb.0.is_empty());
         assert_eq!(s.unmap(0x8000_0000_0000), Err(Error::Noncanonical));
-        // An owner with its own ASID tags its shadows.
-        s.tagged = true;
+        // Every shadow is tagged with the owner's ASID.
         s.map(va, 0x4007_0000, false).unwrap();
-        assert_eq!(s.descriptor(va), 0x4007_0000 | PAGE | READ_ONLY | NOT_GLOBAL);
-    }
-
-    #[test]
-    fn clear_drops_every_leaf_but_keeps_tables() {
-        let mut m = window();
-        let mut s = space(&mut m, POOL_PAGES);
-        for va in [0, 0x10_0000, 0x40_0000_0000, HIGH_BASE, u64::MAX & !4095] {
-            s.map(va, 0x4000_0000, true).unwrap();
-        }
-        let used = s.used();
-        s.clear().unwrap();
-        assert_eq!(s.tlb.0.last(), Some(&ALL));
-        for va in [0, 0x10_0000, 0x40_0000_0000, HIGH_BASE, u64::MAX & !4095] {
-            assert_eq!(s.descriptor(va), 0);
-            s.map(va, 0x4000_0000, true).unwrap();
-        }
-        assert_eq!(s.used(), used);
+        assert_eq!(s.descriptor(va), 0x4007_0000 | LEAF | READ_ONLY);
     }
 
     #[test]
@@ -447,7 +404,6 @@ mod tests {
             assert_eq!(s.descriptor(va), 0);
         }
         s.map(0x10_0000, 0x4000_0000, true).unwrap();
-        s.clear().unwrap();
         s.reset();
         drop(s);
         assert!(
@@ -473,16 +429,13 @@ mod tests {
             m[(POOL_OFFSET + 4096) / 8] = (IPA + to as u64) | 3;
             let mut s = space(&mut m, POOL_PAGES);
             assert_eq!(s.map(0, 0x4000_0000, true), Err(Error::Corrupt));
-            // clear() stops at the corrupt link but still invalidates.
-            assert_eq!(s.clear(), Err(Error::Corrupt));
-            assert_eq!(s.tlb.0.last(), Some(&ALL));
         }
         let mut s = space(&mut m, POOL_PAGES);
         for own in [LOWER_ROOT, 0x14000, STATE_OFFSET, POOL_OFFSET + 31 * 4096] {
             let target = IPA + own as u64;
             assert_eq!(s.map(0x20_0000, target, false), Err(Error::Private));
         }
-        s.map(0x20_0000, IPA + crate::DATA_OFFSET as u64, true)
+        s.map(0x20_0000, IPA + 0x7_0000, true)
             .unwrap_or_else(|e| panic!("{e:?}"));
     }
 }

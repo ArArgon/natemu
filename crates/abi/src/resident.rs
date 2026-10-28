@@ -34,7 +34,7 @@ mod tests {
             (crate::PRIVATE, 0),
             (crate::PRIVATE + BOOT_END as u64 - 1, 2),
             (crate::PRIVATE + 0x10000, 8),
-            (crate::CODE_VA, 48),
+            (crate::PRIVATE + 0x3_0000, 48),
             (crate::PRIVATE + TEXT_OFFSET as u64 - 1, 2),
             (crate::PRIVATE + TEXT_END as u64 - 1, 2),
             (u64::MAX, 2),

@@ -6,6 +6,16 @@ permitted eager-parent/permission-before-leaf policy, not a universal CPU trace.
 Without invalidation both a legitimate cached hit and a fresh/internal walk are
 permitted. Explicit invalidation requires a fresh walk. This model is preparation
 for native tests, not evidence that any native execution or shootdown occurred.
+
+Declared policy and CPU profile (contracts §3 items 4 and 12), not SDM requirements; natemu's walker
+(`crates/abi/src/paging.rs`) makes the same choices:
+- LEAF_A_ON_FAULT (False): a permission-, NX- or SMEP-faulting access sets A on the parents it walked but not on the leaf
+  (SDM §4.8 does not say whether a faulting access sets the leaf's A; True models the other permitted choice).
+- MAXPHYADDR (40): four-level entry bits 51:MAXPHYADDR are reserved (RSVD fault).
+- No 1 GiB pages: PS in a PDPTE (or PML4E) is reserved; the CPUID profile must report Page1GB = 0.
+- Memory types: any PWT, PCD or PAT bit makes the route non-write-back (`Route.wb` false; conservative: under the
+  default PAT some of these combinations are write-back); natemu refuses to shadow such a page.
+The legacy32 and PAE modes serve the boot phase only (owner decision 3).
 """
 from dataclasses import dataclass, field
 from typing import Optional
@@ -14,6 +24,8 @@ PAGE = 4096
 PA_MASK = 0x000000fffffff000
 A, D, P, RW, US, PS, NX = 32, 64, 1, 2, 4, 128, 1 << 63
 MODES = ('legacy32', 'pae', 'four')
+LEAF_A_ON_FAULT = False
+MAXPHYADDR = 40
 
 
 def require(condition, message):
@@ -140,7 +152,7 @@ def walk(tables, context, address, access):
             return fault()
         large = bits == 64 and shift == 21 and bool(entry & PS)
         if bits == 64:
-            reserved = 0x000fff0000000000 if context.mode == 'four' else 0x7fffff0000000000
+            reserved = ((1 << 52) - (1 << MAXPHYADDR)) if context.mode == 'four' else 0x7fffff0000000000
             if (entry & reserved or (not context.nxe and entry & NX)
                     or (shift >= 30 and entry & PS) or (large and entry & 0x1fe000)):
                 return fault(9)
@@ -154,6 +166,8 @@ def walk(tables, context, address, access):
             if ((context.cpl == 3 and not user)
                     or (access == 'write' and not writable and (context.wp or context.cpl == 3))
                     or (access == 'fetch' and (not executable or (context.cpl == 0 and context.smep and user)))):
+                if LEAF_A_ON_FAULT:
+                    update(at, entry | A)
                 return fault(1)
             update(at, entry | A | (D if access == 'write' else 0))
             size = 1 << 21 if large else PAGE

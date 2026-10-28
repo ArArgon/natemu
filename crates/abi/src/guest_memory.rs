@@ -6,7 +6,7 @@ use core::{
     mem::MaybeUninit,
     ptr,
     sync::atomic::{
-        AtomicU32, AtomicU64,
+        AtomicU64,
         Ordering::{Relaxed, SeqCst},
     },
 };
@@ -91,10 +91,6 @@ impl GuestRam {
         // SAFETY: the owner maps [base, base + size) at va for this RAM's lifetime.
         self.word(gpa).map(|p| unsafe { ptr::read_volatile(p) })
     }
-    pub fn read_bytes<const N: usize>(&self, gpa: u64) -> Option<[u8; N]> {
-        let mut out = [0; N];
-        self.copy_out(gpa, &mut out).then_some(out)
-    }
     /// Store and complete the write before later accesses or maintenance.
     #[must_use]
     pub fn write<T: Word>(&self, gpa: u64, value: T) -> bool {
@@ -107,24 +103,13 @@ impl GuestRam {
         }
         true
     }
-    /// `Some(Ok(current))` when swapped, `Some(Err(actual))` when RAM held
-    /// another value, `None` when out of bounds or misaligned.
-    /// Single-copy-atomic loads for entries other agents may update concurrently.
-    pub fn load32(&self, gpa: u64) -> Option<u32> {
-        let p = self.word::<u32>(gpa)?;
-        Some(unsafe { AtomicU32::from_ptr(p) }.load(Relaxed))
-    }
+    /// Single-copy-atomic load for entries other agents may update concurrently.
     pub fn load64(&self, gpa: u64) -> Option<u64> {
         let p = self.word::<u64>(gpa)?;
         Some(unsafe { AtomicU64::from_ptr(p) }.load(Relaxed))
     }
-    pub fn compare_exchange32(&self, gpa: u64, current: u32, new: u32) -> Option<Result<u32, u32>> {
-        let p = self.word::<u32>(gpa)?;
-        let result =
-            unsafe { AtomicU32::from_ptr(p) }.compare_exchange(current, new, SeqCst, SeqCst);
-        unsafe { asm!("dsb ish") };
-        Some(result)
-    }
+    /// `Some(Ok(current))` when swapped, `Some(Err(actual))` when RAM held
+    /// another value, `None` when out of bounds or misaligned.
     pub fn compare_exchange64(&self, gpa: u64, current: u64, new: u64) -> Option<Result<u64, u64>> {
         let p = self.word::<u64>(gpa)?;
         let result =
@@ -285,9 +270,9 @@ mod tests {
         assert_eq!(ram.read::<u64>(0xff8), None);
         assert!(ram.write::<u16>(0x1002, 0xbeef));
         assert_eq!(ram.read::<u64>(0x1000), Some(0xbeef_2007));
-        assert_eq!(ram.compare_exchange32(0x1000, 1, 2), Some(Err(0xbeef_2007)));
+        assert_eq!(ram.compare_exchange64(0x1000, 1, 2), Some(Err(0xbeef_2007)));
         assert_eq!(
-            ram.compare_exchange32(0x1000, 0xbeef_2007, 3),
+            ram.compare_exchange64(0x1000, 0xbeef_2007, 3),
             Some(Ok(0xbeef_2007))
         );
         assert_eq!(ram.compare_exchange64(0x1004, 0, 1), None);
@@ -296,10 +281,9 @@ mod tests {
         assert_eq!(out, [3, 0, 0, 0]);
         assert!(!ram.copy_out(0x4ffe, &mut out));
         assert!(ram.copy_in(0x1001, &[7, 8]) && !ram.copy_in(0x4fff, &[0, 0]));
-        assert_eq!(ram.read_bytes::<4>(0x1000), Some([3, 7, 8, 0]));
+        assert!(ram.matches(0x1000, &[3, 7, 8, 0]));
         assert!(ram.copy_in(0x1001, &[0, 0]));
-        assert_eq!(ram.read_bytes::<2>(0x1000), Some([3, 0]));
-        assert_eq!(ram.read_bytes::<2>(0x4fff), None);
+        assert!(!ram.copy_out(0x4fff, &mut [0; 2]));
         assert!(ram.matches(0x1000, &[3, 0]) && !ram.matches(0x1000, &[3, 1]));
         assert!(!ram.matches(0x4fff, &[0, 0]));
     }
@@ -313,7 +297,7 @@ mod tests {
         assert_eq!(b.0[1024], 9);
         assert_eq!(ram.read::<u64>(0x1000), Some(0x2007));
         assert_eq!(ram.read::<u64>(0x2000), None);
-        assert_eq!(ram.read_bytes::<2>(0x1fff), None);
+        assert!(!ram.copy_out(0x1fff, &mut [0; 2]));
         assert_eq!(ram.read::<u64>(0x10_1000), None);
     }
 

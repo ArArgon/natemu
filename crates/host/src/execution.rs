@@ -99,7 +99,7 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize) -> Result<Bac
             Span::text(exec::SLOT_OFFSET, exec::SLOT_BYTES, base + exec::SLOT_OFFSET),
             Span::data((exec::SLOT_WRITE_VA - PRIVATE) as usize, exec::SLOT_BYTES, base + exec::SLOT_OFFSET),
             own((STACK_TOP - PRIVATE) as usize - exec::STACK_BYTES, exec::STACK_BYTES),
-            own((EXCEPTION_STACK_TOP - PRIVATE) as usize - 0x4000, 0x4000),
+            own((EXCEPTION_STACK_TOP - PRIVATE) as usize - 0x8000, 0x8000),
             own(exec::STAGING_OFFSET, exec::STAGING_BYTES),
             shared(exec::GUEST_RAM_OFFSET, exec::GUEST_RAM_BYTES),
             Span::text((cache::CODE_VA - PRIVATE) as usize, code_mapped, base + cache::CODE_OFFSET),
@@ -124,8 +124,7 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize) -> Result<Bac
 pub(crate) fn set_cpu(area: Area, cpu: Cpu) {
     area.write_record(exec::STATE_OFFSET, State::new(area.vcpu as u64, cpu));
 }
-/// Enters the vCPU at the resident in its window, its tables tagged with its own ASID (its number + 1; ASID 0 would be
-/// untagged, with global shadows).
+/// Enters the vCPU at the resident in its window, its tables tagged with its own ASID (its number + 1).
 pub(crate) fn enter(cpu: &Vcpu, area: Area) -> Result<()> {
     cpu.enter_resident_with_asid(area.base, natemu_abi::shadow::TCR_BOTH, area.vcpu as u8 + 1)
 }

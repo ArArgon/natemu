@@ -573,10 +573,12 @@ def cmd_system(a, host, runtime):
             want, rc = qemu(prog, name)
             if want is None: failures.append(f'{name}: QEMU run failed ({rc})'); continue
             for c in want['cpus']: c['fault'] = qemu_fault(c['fault'])
-        model_profile = {'sysfault-efer-lme-clear@1': 25, 'sysfault-cr4-pae-clear@1': 27, 'sysfault-cr0-pg-clear@1': 28,
-                         'sysfault-efer-reserved-1@1': 29, 'sysfault-efer-reserved-edx@1': 29}.get(name)
+        # (profile, EDX): profile 22's first WRMSR writes a legal EAX, so with EDX = 1 only EDX is reserved.
+        model_profile, edx = {'sysfault-efer-lme-clear@1': (25, 0), 'sysfault-cr4-pae-clear@1': (27, 0),
+                              'sysfault-cr0-pg-clear@1': (28, 0), 'sysfault-efer-reserved-1@1': (29, 0),
+                              'sysfault-efer-reserved-edx@1': (22, 1)}.get(name, (None, 0))
         if model_profile:
-            last = modes.model(model_profile, 0, modes.data(model_profile, [0] * 0x400))['records'][-1]
+            last = modes.model(model_profile, 0, modes.data(model_profile, [0] * 0x400), edx)['records'][-1]
             entry['modes_model'] = (model_profile, last['vector'])
             if last['vector'] != want['cpus'][0]['fault'][0]:
                 failures.append(f"{name}: modes_model profile {model_profile} gives vector {last['vector']}")
@@ -748,7 +750,8 @@ def tamper_kinds(fixture):
             ('forge-stop', ['--kicks', 1, '--forge-stop'], LOOP, 'bad_stop')]
 
 
-# Tampers whose section is a single instruction at 0x100000 with all GPRs 0, halted before anything of it ran.
+# Tampers whose section is a single instruction at 0x100000 with all GPRs 0: the vCPU halted before its first
+# instruction ran.
 AT_START = ('site', 'site-kind', 'system')
 
 

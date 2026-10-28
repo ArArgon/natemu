@@ -232,5 +232,42 @@ class CoherenceReferenceTests(unittest.TestCase):
             m.walk(tables, context, 0x100000, 'read')
 
 
+
+class DeclaredPolicyTests(unittest.TestCase):
+    """Contracts §3 items 4 and 12: choices the model declares as natemu policy and CPU profile."""
+    def four(self, leaf=None, level=None, bits=0):
+        tables, context, layout = m.fixture('four')
+        at = {1: layout['first'] + 256 * 8, 2: layout['parent'], 3: 0x2000}[level] if level else None
+        if at is not None:
+            tables[at] = (tables[at] | bits) if leaf is None else leaf
+        return tables, replace(context, cpl=3), layout
+
+    def test_faulting_access_sets_parent_a_not_leaf_a(self):
+        tables, context, layout = self.four(level=1, leaf=0x100005)          # leaf read-only at CPL3
+        leaf = layout['first'] + 256 * 8
+        r = m.walk(tables, context, 0x100000, 'write')
+        self.assertEqual((r.vector, r.error), (14, 7))
+        self.assertEqual(r.tables[leaf] & m.A, 0)
+        self.assertTrue(all(r.tables[p] & m.A for p in (0x1000, 0x2000, layout['parent'])))
+        saved, m.LEAF_A_ON_FAULT = m.LEAF_A_ON_FAULT, True
+        try:
+            self.assertEqual(m.walk(tables, context, 0x100000, 'write').tables[leaf] & m.A, m.A)
+        finally:
+            m.LEAF_A_ON_FAULT = saved
+
+    def test_maxphyaddr_40_and_no_1gib_pages(self):
+        self.assertEqual(m.MAXPHYADDR, 40)
+        r = m.walk(*self.four(level=1, bits=1 << 40)[:2], 0x100000, 'read')
+        self.assertEqual((r.vector, r.error), (14, 13))                      # RSVD | P | U
+        r = m.walk(*self.four(level=1, bits=1 << 39)[:2], 0x100000, 'read')
+        self.assertEqual((r.vector, r.route.gpa), (0, 0x8000100000))
+        r = m.walk(*self.four(level=3, bits=m.PS)[:2], 0x100000, 'read')     # PS in the PDPTE
+        self.assertEqual((r.vector, r.error), (14, 13))
+
+    def test_pwt_pcd_or_pat_make_the_route_non_write_back(self):
+        self.assertTrue(m.walk(*self.four()[:2], 0x100000, 'read').route.wb)
+        for level, bit in ((1, 8), (1, 16), (1, m.PS), (2, 8), (3, 16)):
+            self.assertFalse(m.walk(*self.four(level=level, bits=bit)[:2], 0x100000, 'read').route.wb, (level, bit))
+
 if __name__ == '__main__':
     unittest.main()

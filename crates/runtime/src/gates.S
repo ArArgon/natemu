@@ -40,66 +40,6 @@ private_start:
 .ltorg
 
 .section .text,"ax"
-.global enter
-enter:
-    mov x16, x0
-    ldr x9, [x16, #{sp_offset}]
-    mov sp, x9
-    ldr x9, [x16, #{fpcr_offset}]
-    msr fpcr, x9
-    ldr x9, [x16, #{fpsr_offset}]
-    msr fpsr, x9
-    ldr x9, [x16, #{nzcv_offset}]
-    msr nzcv, x9
-    ldp q0, q1, [x16, #({q_offset}+0)]
-    ldp q2, q3, [x16, #({q_offset}+32)]
-    ldp q4, q5, [x16, #({q_offset}+64)]
-    ldp q6, q7, [x16, #({q_offset}+96)]
-    ldp q8, q9, [x16, #({q_offset}+128)]
-    ldp q10, q11, [x16, #({q_offset}+160)]
-    ldp q12, q13, [x16, #({q_offset}+192)]
-    ldp q14, q15, [x16, #({q_offset}+224)]
-    ldp q16, q17, [x16, #({q_offset}+256)]
-    ldp q18, q19, [x16, #({q_offset}+288)]
-    ldp q20, q21, [x16, #({q_offset}+320)]
-    ldp q22, q23, [x16, #({q_offset}+352)]
-    ldp q24, q25, [x16, #({q_offset}+384)]
-    ldp q26, q27, [x16, #({q_offset}+416)]
-    ldp q28, q29, [x16, #({q_offset}+448)]
-    ldp q30, q31, [x16, #({q_offset}+480)]
-    ldr x0, [x16, #0]
-    ldr x1, [x16, #8]
-    ldr x2, [x16, #16]
-    ldr x3, [x16, #24]
-    ldr x4, [x16, #32]
-    ldr x5, [x16, #40]
-    ldr x6, [x16, #48]
-    ldr x7, [x16, #56]
-    ldr x8, [x16, #64]
-    ldr x9, [x16, #72]
-    ldr x10, [x16, #80]
-    ldr x11, [x16, #88]
-    ldr x12, [x16, #96]
-    ldr x13, [x16, #104]
-    ldr x14, [x16, #112]
-    ldr x15, [x16, #120]
-    ldr x17, [x16, #136]
-    ldr x18, [x16, #144]
-    ldr x19, [x16, #152]
-    ldr x20, [x16, #160]
-    ldr x21, [x16, #168]
-    ldr x22, [x16, #176]
-    ldr x23, [x16, #184]
-    ldr x24, [x16, #192]
-    ldr x25, [x16, #200]
-    ldr x26, [x16, #208]
-    ldr x27, [x16, #216]
-    ldr x28, [x16, #224]
-    ldr x29, [x16, #232]
-    ldr x30, [x16, #240]
-    ldr x16, [x16, #128]
-    br x16
-
 .macro save_native
     sub sp, sp, #{frame_size}
     stp x0, x1, [sp, #0]
@@ -140,18 +80,6 @@ enter:
     str x9, [sp, #{fpsr_offset}]
     str xzr, [sp, #{reserved_offset}]
 .endm
-
-.global returned
-returned:
-    save_native
-    add x9, sp, #{frame_size}
-    str x9, [sp, #{sp_offset}]
-    mrs x9, nzcv
-    str x9, [sp, #{nzcv_offset}]
-    mov x0, sp
-    mov x1, #0
-    bl finish
-    b .
 
 exception_capture:
     save_native

@@ -1,4 +1,15 @@
-"""Independent bounded compatibility/long-mode transition expectations."""
+"""Independent bounded compatibility/long-mode transition expectations.
+
+Vendor profile: Intel. WRMSR EFER raises #GP(0) for a nonzero EDX (EFER bits 63:32 are reserved) and for any EAX bit
+outside EFER_DEFINED (SCE, LME, LMA, NXE; AMD would add SVME, LMSLE, FFXSR and TCE); a write to LMA is ignored. These
+match the resident's WRMSR (`crates/runtime/src/execution.rs` `system`) and `tools/system_fault_model.py`.
+
+The programs start in 32-bit protected mode (contracts 28-31), which the general path does not run: owner decision 3
+moved 32-bit support to the boot phase, so the rest of contracts §3's fixes wait for it there. Open for that reuse:
+profiles 34 and 35 require a fresh walk after a PTE write without INVLPG (§3 item 3), where a TLB may keep the old
+entry, so a checker must accept either history (`coherence_model.access_outcomes`/`check_observation`); the 16-bit-TSS
+rule on IA-32e activation is an Intel-profile choice (§3 item 15).
+"""
 import copy
 
 from models import pae_model as pae
@@ -7,6 +18,7 @@ DATA=0x100000
 SOURCE=0x102000
 CS32=[8,0,0xffffffff,0xc09b]
 CS64=[0x18,0,0xffffffff,0xa09b]
+EFER_DEFINED=0xd01
 
 
 def programs(profile):
@@ -104,7 +116,8 @@ def walk(memory,linear,write=False,wp=True):
         base=entry&0xfffffff000
 
 
-def model(profile,initial_eax,memory):
+def model(profile,initial_eax,memory,edx=0):
+    """`edx`: EDX throughout the program (WRMSR's high half)."""
     source=programs(profile);offsets=[0]
     for instruction in source:offsets.append(offsets[-1]+len(instruction))
     table=tables();pt=pae.tables(13);ps=pae.empty_state();ms=empty_state()
@@ -145,7 +158,7 @@ def model(profile,initial_eax,memory):
                 eax=int.from_bytes(bytes(memory[at:at+width]),'little')
                 rec['memory_after']=memory[at:at+16]
         elif instruction==b'\x0f\x30':
-            if eax&~0xd01 or (cr0&0x80000000 and (eax^efer)&0x100):rec['vector']=13
+            if edx or eax&~EFER_DEFINED or (cr0&0x80000000 and (eax^efer)&0x100):rec['vector']=13
             else:
                 efer=(eax&~0x400)|(efer&0x400);generation+=1;mapping=None
         elif instruction[:2]==b'\x0f\x22':

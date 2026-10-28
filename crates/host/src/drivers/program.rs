@@ -672,7 +672,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 })
             })
             .collect();
-        let supervision = owners::supervise(n, std::time::Duration::MAX, &prepare, &body, &mut || None, &|_| {});
+        let supervision = owners::supervise(n, &prepare, &body);
         for e in &ended {
             e.store(true, SeqCst); // a vCPU that never started
         }

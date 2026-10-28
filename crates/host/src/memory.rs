@@ -446,16 +446,15 @@ mod tests {
             ipa: IPA + window as u64,
             pool_pages: shadow::POOL_PAGES,
             upper: true,
-            tagged: false,
             tlb: Quiet,
         };
-        for va in [DATA_VA, shadow::HIGH_BASE + DATA_VA] {
+        for va in [0x10_0000, shadow::HIGH_BASE + 0x10_0000] {
             space.map(va, IPA, true).unwrap();
         }
         assert_eq!(space.used(), 0);
         let word = |offset: usize| u64::from_le_bytes(memory.read::<8>(window + offset));
-        assert_eq!(word(shadow::LOWER_LEAF + 256 * 8), IPA | shadow::PAGE);
-        assert_eq!(word(shadow::UPPER_LEAF + 256 * 8), IPA | shadow::PAGE);
+        assert_eq!(word(shadow::LOWER_LEAF + 256 * 8), IPA | shadow::PAGE | shadow::NOT_GLOBAL);
+        assert_eq!(word(shadow::UPPER_LEAF + 256 * 8), IPA | shadow::PAGE | shadow::NOT_GLOBAL);
         space.map(0x7fff_0000_0000, IPA, false).unwrap();
         assert_eq!(space.used(), 3);
         // Without `upper` (TCR.EPD1 set) the upper half is refused; the lower
@@ -467,7 +466,6 @@ mod tests {
             ipa: IPA,
             pool_pages: 2,
             upper: false,
-            tagged: false,
             tlb: Quiet,
         };
         assert_eq!(

@@ -13,7 +13,8 @@ Shared: guest RAM (one alias, same VA everywhere) and the global area; all guest
 Shareable (pinned). Each vCPU's tables carry its own ASID, so its shadow entries could not hit for another vCPU even in
 a shared TLB. That is a precaution, not shown necessary: an S3a control with every vCPU on ASID 0 and global shadows
 also passed every S3a check, because HVF keeps vCPUs' TLBs apart (across host-thread migration too). The ASIDs are
-harmless, but the migration stress cannot detect a regression in them. `State` gains the vCPU id (replacing cache.rs's `VCPU = 0`); each vCPU reads back `ACTLR_EL1.EnTSO` at start.
+harmless, but the migration stress cannot detect a regression in them. (History: that ASID-0 untagged mode was removed
+at S3i2; every vCPU's shadows are tagged with its own ASID.) `State` gains the vCPU id (replacing cache.rs's `VCPU = 0`); each vCPU reads back `ACTLR_EL1.EnTSO` at start.
 `owners.rs` (barrier, cancellation, join, vCPU-before-VM teardown) runs the execution service per thread; the `hvc #0x4a`
 owner service stays until the family drivers retire (S3i). Any resident halt or host error cancels all vCPUs.
 
@@ -125,7 +126,7 @@ LOCK ADD/CMPXCHG/XADD/BT* and CMPXCHG16B wait for the boot phase.
 | Old campaign | What the general path needs | Recommendation |
 | --- | --- | --- |
 | I1 entry, I2 live translation, I3 paging/allocated, address, stack | Nothing new: slices 1–2 cover them (fault sets, guard, split, precision verifier, admission). Port I3 cells the slice-1 fault matrix lacks (CR0.WP=0, 2 MiB leaves, reserved bits, SMEP, carry/overflow) as generated cases. REP and FP cells wait for that ISA. Retained-route completion (42) and the resident stack bound (62): a general-path check or an explicit retirement reason. | Deleted at S3a2 (below). |
-| Six-program QEMU check, gate-binary audit | `run_i4v_qemu.py` binds native reports of six programs. Two of them (`live-low-low_operand`, `stack-low-low_stack`) were cells S3a2 deleted, so the check now reproduces only from bundles retained before S3a2; the general-path corpora against QEMU (fixtures, seed corpora, faults) cover those programs' behaviour. The four ordering programs (xchg, lfence, sfence, mfence) live until the ordering family goes. `tools/reference/ref.py` takes its QEMU pins from `run_i4v_qemu.py`. | Delete at S3i (move the pins). |
+| Six-program QEMU check, gate-binary audit | `run_i4v_qemu.py` binds native reports of six programs. Two of them (`live-low-low_operand`, `stack-low-low_stack`) were cells S3a2 deleted, so the check now reproduces only from bundles retained before S3a2; the general-path corpora against QEMU (fixtures, seed corpora, faults) cover those programs' behaviour. The four ordering programs (xchg, lfence, sfence, mfence) live until the ordering family goes. `tools/reference/ref.py` takes its QEMU pins from `run_i4v_qemu.py`. The gate-binary audit (contract 61, `check_i4v_fence_gate.py`) audited the LFENCE completion sink and the families' gates; it retires with the LFENCE sink (contract 51, a boot-phase handoff item). What still exists of 61, the resident gates' save sequences, the vectors and the general gates' ERET restore path, is checked instruction by instruction by `tools/check_resident_stack.py` (S3i2) on the built runtime. | Deleted at S3i (pins moved to `ref.py`); the gate audit's remainder replaced at S3i2. |
 | I4 entry/faults/remap/compose/pressure; seeded progress, schedule, partial progress | N vCPUs (S3a), coherence (S3d, S3f). Contracts 45–48 and 53 describe the old global service lock and FIFO; the new design has no global lock, so they retire; progress is checked by S3h. REP partial progress (44): boot-phase handoff. | Mapped at S3h (table there); delete at S3i. |
 | I4 events (49) | Interrupt delivery: boot phase (handoff item). | Delete; rebuilt with delivery. |
 | Aliases, concurrent stack, stack boundary | Per-vCPU INVLPG (S3c), shared tables (S3f); #SS and split pushes are slice 1. | Re-express in S3f, delete. |
@@ -193,7 +194,7 @@ boot-phase CPUID must report Page1GB=0. The A bit of a non-leaf entry is set by 
 | Stack fetch_nx, smep; ss_first, ss_after_first, ss_span, gp_after_pushes, read_np_after_pushes (8, 37) | Code-page cells (no compile before a first-instruction fetch fault); non-canonical stack/data probes (#SS/#GP), non-canonical-end probes; slice-1 unmap of pop pages. |
 | Address 16 and stack 48 reply-word flips (35) | Producer transport (packets) gone; the design core (no false success, failure is never #PF) as I2 bad_reply. |
 | 42 retained-route completion before a remap acknowledgement | Retired: there is no acknowledgement protocol; each vCPU's shadows are its TLB, which may keep a translation until its own INVLPG/CR3 (SDM §4.10.4). Remaps with per-vCPU INVLPG: S3f. |
-| 62 resident stack bound | No check yet: the audit is per binary (inventory §4) and S3b–S3h still add resident paths; redone on the phase's final binary at S3i. |
+| 62 resident stack bound | `tools/check_resident_stack.py` (S3i2): a runnable audit of the built runtime's call graph (no recursion, no unaccounted indirect branch, declared stack switches only); on the phase's final binary 11,568 bytes, 16,000 with one nested entry to its halt, of an exception stack grown to 32 KiB at S3i2. |
 
 **Deleted.** Host drivers `i1.rs`, `i2_i3.rs`, `i4v.rs` (address), `i4v_stack.rs` (1,042 lines) and the I3 scenario
 branches of `recovery::prepare` plus three report helpers and `Vm::run` only they used; `run_i1.py` keeps only the I4
@@ -219,7 +220,7 @@ their campaigns retire:** runtime/abi family code (modes are layered: `translati
   read back on every vCPU; a tamper-forced halt on any vCPU stops and joins all, then the VM is destroyed.
   *Built (Oct 27):* backing block v at `v * (BACKING_BYTES + code area)` holds vCPU v's window, lookup, metadata and code
   areas at vCPU 0's offsets (guest RAM and the global area only in block 0); private and shadow descriptors are nG, ASID
-  = vCPU number + 1 (TLBI by ASID; ASID 0 stays the families' untagged world with global shadows; a precaution, see §1). `State::vcpu`; global area: code and writable masks, `Record {pending, stale}` per vCPU,
+  = vCPU number + 1 (TLBI by ASID; ASID 0 stayed the families' untagged world with global shadows until S3i2 removed it; a precaution, see §1). `State::vcpu`; global area: code and writable masks, `Record {pending, stale}` per vCPU,
   reset counters (abi `cache`), host and resident producers (`page_written`, runtime `cache::written`: swap the mask to 0,
   post page then `PAGES`), drain (swap `pending`, then words). A halt (also on the host's new `REPLY_PARK`, which ends
   a vCPU at `stop_at`, a fetch fault or no code) resets shadows and writable bits first. `Fault::Contended` replaces the
@@ -467,6 +468,38 @@ their campaigns retire:** runtime/abi family code (modes are layered: `translati
   3, 4), smp 15, limits, kicks (1,000 per vCPU), system, coherence 40, sharedpt 32 (1 run each), litmus 90 cells × 5,000
   trials (none outside the model), contain (100 tampers with the banked-state checks, 113 fresh controls, progress 24):
   all pass.
+  *Built S3i2 (Oct 28, the last chunk):* dead code and wording left by S3i1: every vCPU's shadows are tagged with its ASID
+  (the ASID-0 untagged mode, its `tlbi vmalle1` branch and `Space::tagged` are gone), abi items with no non-test caller
+  deleted (`GuestRam::load32`/`compare_exchange32`/`read_bytes`, `paging::canonical_span`, `Space::clear`, the I1 layout
+  constants), `owners::supervise` without its no-op deadline/poll/failure parameters, the unreferenced asm gates
+  `enter`/`returned`; contracts §3 model fixes (`tools/models/`): item 15, `modes_model` WRMSR raises #GP for a nonzero
+  EDX and declares its Intel EFER profile (the `system` runner now cross-checks `sysfault-efer-reserved-edx` with
+  EDX = 1 on profile 22, not the EAX case); items 4 and 12 declared as policy and CPU profile in `coherence_model`
+  (fault-path leaf A as a switchable `LEAF_A_ON_FAULT`, `MAXPHYADDR` 40, no 1 GiB pages, PWT/PCD/PAT non-write-back),
+  unit-tested; item 3 (`modes_model` profiles 34/35 require a fresh walk after a PTE write without INVLPG) retired with
+  32-bit (owner decision 3): the profiles start in 32-bit code and the 64-bit property is checked through
+  `coherence_model.check_observation` (`system`, `sharedpt`); `pae_model`'s profile items likewise. The resident stack
+  audit (62) and the remainder of the gate audit (61) as a runnable check, `tools/check_resident_stack.py` (+ test):
+  11,568 bytes at the deepest gate path (… `aborted` → `access_aborted` → walker A/D write into a code page → `step` →
+  `request` → … → `halt`), 16,000 with one nested entry to its halt (that path declared from the source, not derived);
+  the 16 KiB exception stack left 384 bytes, so it grew to 32 KiB (`host/src/execution.rs`; 16,768 bytes margin); boot
+  6,976 of 16,384; division helpers 48 + 16 of 64; `dispatch_fast` touches no stack (budget 0); no recursion; the only
+  indirect branches are the boot jump and `dispatch_fast`'s entry into a cached block. Below the exception stack 32 KiB
+  stay unmapped. An overflow is contained to the vCPU but not harmless: the fault on SP_EL1 re-faults on every frame
+  push down through the guard until a push lands in the vCPU's own boot/block stack (`STACK_TOP` region), which it
+  overwrites, and the vCPU then halts `unknown_abort`.
+  Contract inventory: "General-path check per contract" (all 64 mapped, none unmapped). Handoff: [boot-handoff.md](boot-handoff.md).
+
+### Phase end (S3i2, October 28)
+
+| Criterion ([vm-restructure.md](../vm-restructure.md) phase boundary, step 2 end state) | Evidence on the final tree |
+| --- | --- |
+| Slice 2 works: VM-resident code cache, in-VM dispatch and block linking, control flow, first speed numbers against QEMU TCG | [Slice-2 contract](slice2-contract.md) built (S2a–S2g); flow 64 × 3 block sizes, probes 85, loop faults 846 × 3, ASM 235; S2g numbers in [boot-handoff.md](boot-handoff.md) §4 (int 0.97×, mem64 0.29× of QEMU time). |
+| Up to four vCPUs on the general execution path | corpora N = 2, 3, 4 (3,040 + 3,042 + 3,040 program runs), smp 15, kicks, contain at N = 1..4. N = 0 cannot be described; `execution::prepare` refuses it (unit test `one_to_four_vcpus`); 5 is refused (limits). |
+| The general path covers the old specialized paths' behaviour (paging modes, mode/control transitions, ordering, coherence); those paths retired | Every contract has a general-path check, retirement reason or boot-phase item ([contracts.md](contracts.md), 64 of 64); old paths deleted at S3a2 and S3i1; 32-bit and paging-off modes out of the phase (owner, October 28; decision 3). |
+| Handoff to the boot phase documented | [boot-handoff.md](boot-handoff.md). |
+| Step 2: crates organised by responsibility, no module named after a test campaign; test programs, expectations and mutations in drivers outside the emulator crates | Met: crates by responsibility (host `vm`, `memory`, `owners`, `execution`, `admission`, `system`, `json`; abi `execution`, `code_object`, `guest_memory`, `paging`, `shadow`, `resident`; runtime `execution`, `cache`, `tables`, `record`, `gates.S`); no file in `crates/` or `tools/` carries a campaign name; programs, QEMU expectations and models live in `tools/` and `fixtures/`. **Deviation for the owner:** the test driver is still inside the host crate: `run-program` (`host/src/drivers/`) and its tamper hooks, some of which act in the service loop (`forge_stop`, `ignore_stops`, the reply tampers in `host/src/execution.rs`). Minimal move, proposed for when the boot phase adds a loader entry point (not done now): split the host into a library and a driver crate, and turn `forge_stop` into a generic stop-ELR hook the driver supplies. |
+| Suites green on the final tree | `cargo build` 0 warnings; `cargo test` 68 pass (1 ignored); Python tool tests 62; fixtures 64 and seed 4242 44 match at block sizes default and 1; faults 3,443 at both; flow 64 × 3; loop faults 846 × 3; probes 85; ASM 235 pass; `run_slice3_vm.py` corpora 9,122, smp 15, limits, kicks (1,000 per vCPU at N = 1, 2, 4), system 69, coherence 40, sharedpt 32 (1 run each), litmus 90 cells × 5,000 trials (none outside the model), contain (100 tampers, 4 unacked, 3 compiler deaths, 3 stalls, 4 spins, 2 legitimate spins, 24 progress, 113 fresh controls); `check_resident_stack.py` ok. After the S3i2 review fixes (32 KiB exception stack, `dispatch_fast` stack check, a doc-comment edit to `shadow.rs` that left the runtime binary unchanged) the whole suite was re-run from the command block in [boot-handoff.md](boot-handoff.md) §1 under zsh: the same counts, all pass. Nothing staged (`git diff --cached` empty). |
 
 ## 5. Owner decisions (recorded October 27, 2026)
 1. **32-bit and paging-off segmentation forms go to the boot phase** (segment bases and limits, CS limit, A20, 16-bit

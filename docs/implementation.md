@@ -286,9 +286,11 @@ builds must record/admit their actual SDK/toolchain; the frozen Track01 checker
 retains its exact original SDK requirement. The workspace now contains `crates/host`, `crates/runtime` and `crates/abi`.
 Rust 1.97.0 and the bare-metal target are pinned in `rust-toolchain.toml`; Cargo
 has no registry dependencies. Assembly offsets come from the shared Rust layout.
-I2 uses a versioned 128-byte little-endian register/worker packet, with Rust and
-Python validation. FEX consumes its pinned compile-only input format; no direct
-Rust/C++ ABI bridge or C header is required by this worker topology.
+I2 used a versioned 128-byte little-endian register/worker packet, with Rust and
+Python validation, and FEX consumed its pinned compile-only input format through
+an out-of-process worker; that transport retired at S3i. The general path runs one
+native `fexc --serve` child per vCPU and admits its code objects
+(`crates/abi/src/code_object.rs`, `crates/host/src/admission.rs`).
 
 Ordinary local checks/builds, from the repository root:
 
@@ -314,21 +316,18 @@ path, or its retirement reason: [slice-3 contract](restructure/slice3-contract.m
 **Retired (S3a2, October 27, 2026):** the general execution path covers the I1 entry cells, the I2 live-translation
 scenarios and the I3 paging/allocated cells, and their host drivers, runner options and I3 worker are deleted
 ([slice-3 contract](restructure/slice3-contract.md#s3a2-covering-and-deleting-the-i1i3-address-and-stack-paths) maps
-every check). `run_i1.py` now runs only the I4 cells below; this section records what those runs established.
+every check). `run_i1.py` then ran only the I4 cells below, until S3i; this section records what those runs established.
 
-The retained development runner snapshots sources, builds and signs the host,
-checks the emitted image, then supervises each native cell and runs the independent
-oracle. Use a fresh name; existing output directories are refused.
+The development runner snapshotted sources, built and signed the host, checked the
+emitted image, then supervised each native cell and ran the independent oracle;
+it refused existing output directories.
 
-The `--fragment` path in the I4 command below is this machine's durable reproduced input; supply its
-actual location when using a different raw root. Its exact producer, extraction,
-bytes and manual site maps were in `fixtures/i1/live_load.json` (deleted at S3i). A missing fragment
-is an acquisition requirement, not permission to substitute handwritten code.
-Use `--snapshot PATH_TO_RETAINED_SOURCE` to rebuild the same checked sources;
-invoke that snapshot's runner if its runner/helper versions differ from the
-working tree. Runs retain manifests, source/build outputs, disassembly, per-cell
-JSON, supervision records and checksums. Build overrides are controlled and
-Cargo state/output isolated under the retained run.
+The `--fragment` path in the I4 command below was this machine's durable reproduced input. Its exact producer,
+extraction, bytes and manual site maps were in `fixtures/i1/live_load.json` (deleted at S3i); a missing fragment
+was an acquisition requirement, not permission to substitute handwritten code.
+`--snapshot PATH_TO_RETAINED_SOURCE` rebuilt the same checked sources with that snapshot's runner. Runs retained
+manifests, source/build outputs, disassembly, per-cell JSON, supervision records and checksums, with controlled
+build overrides and Cargo state/output isolated under the retained run.
 
 **I1 scope:** one immutable object per fresh VM, configured/admitted/tested N=1,
 1MiB guest backing and fixed private native mappings. Runtime text/generated code
@@ -494,10 +493,10 @@ earlier I1/I3 executables, for the new profiles. A focused development check was
   --progress --focus progress-stack-n4-seed3
 ```
 
-The focus selects one native case while retaining the runner's build and unit
-checks. It cannot establish full I4-V coverage. Omit `--focus` and use the following
-flag groups in separate, sequential runs with unique names for the full native
-campaign; each group stays within the existing20-minute bundle bound.
+The focus selected one native case while retaining the runner's build and unit
+checks. The full native campaign omitted `--focus` and ran the following flag
+groups in separate, sequential runs with unique names, each within the
+20-minute bundle bound.
 
 | Flag group | Manifest cells (the 44 address baseline cells each group once repeated, and the `--stack` slice, are retired: S3a2) |
 | --- | --- |
@@ -507,9 +506,9 @@ campaign; each group stays within the existing20-minute bundle bound.
 | `--aliases --concurrent-stack --mixed-aliases --paging-off --paging-off-steps --mixed-modes --controls --concurrent-controls --stack-boundaries` | 268 alias, stack-composition and mode/control cases. |
 | `--address-forms` | 60 protected32 address cases. |
 
-Also run the legacy `run_i1.py --i4-pressure` matrix above
-with its original producer pins. Do not run the groups concurrently or combine
-all flags into one bundle that exceeds the declared limit. Count repeated baselines and fresh controls
+The legacy `run_i1.py --i4-pressure` matrix above also ran with its original
+producer pins. Groups were never run concurrently or combined into one bundle
+beyond the declared limit; repeated baselines and fresh controls were counted
 separately from distinct coverage. A bundle's `full_i4v_complete: false` does not
 claim aggregate milestone acceptance; that judgment belongs to the
 [contract matrix and independent review](research/reviews/INV-03-01-i4v-coverage.md).
@@ -586,7 +585,8 @@ and external initramfs containing `/init` and small test programs. Define the
 first bounded direct-boot slice using the accepted startup and machine contracts;
 implement required semantics, exception delivery/return, startup32, timer/APIC
 and serial as the boot path reaches them. Bring up uniprocessor boot and userspace
-outputs, then SMP, retaining applicable I1–I4-V regressions throughout. Kernel boot alone
+outputs, then SMP, keeping the general-path suites green throughout (the I1–I4-V
+regressions retired at S3i; [boot handoff](restructure/boot-handoff.md) lists the suites). Kernel boot alone
 is not application coverage or a code-generator performance verdict.
 [INV-03-01](research/investigations/INV-03-01.md#current-direction--build-first-october-25-2026)
 owns current results and assignments. No whole-project research phase is a

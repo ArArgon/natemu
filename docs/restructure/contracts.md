@@ -20,6 +20,86 @@ be run. The four independent models moved to `tools/models/` (`ordering_model.py
 each old check to a general-path check, a retirement reason (32-bit and paging-off families: owner decision 3,
 deferred to the boot phase) or a boot-phase item. References below stay as of `577a7f2`.
 
+### General-path check per contract (S3i2, October 28, 2026)
+
+Every contract below has a general-path check, a retirement reason or a boot-phase handoff item
+([boot handoff](boot-handoff.md) lists the items). Sources: [slice-3 contract](slice3-contract.md) §3 table, its S3a2
+and S3h tables and §5 owner decisions 1–3 (D1 segmentation/A20/resolver, D2 tearing across 16 bytes, D3 all 32-bit and
+paging-off support), and the slice-1/2 contracts. Runners (all under `tools/`, each `--fexc FEXC --out DIR`):
+**fixtures/seed** `run_slice1_vm.py` (64 fixtures and 44 seed-4242 programs vs QEMU, block sizes default and 1);
+**faults** `run_slice1_faults.py` (3,443 precise-fault cases incl. 2,724 paging cells, default and 1); **flow**
+`run_slice2_vm.py` (64 control-flow programs × 3 sizes); **loop faults** `run_slice2_faults.py` (846 × 3); **probes**
+`run_slice2_probes.py` (85 code-cache/SMC probes); **ASM** `fexc/upstream_tests/run_asm.py` (235 FEX ASM tests);
+`run_slice3_vm.py` modes **corpora, smp, limits, kicks, system, coherence, sharedpt, litmus, contain**; **stack**
+`check_resident_stack.py`. "Unit" = `cargo test` or the named Python test.
+
+| # | General-path check, retirement reason or boot-phase item |
+| --- | --- |
+| 1 | fixtures/seed, flow, ASM, corpora and smp: final GPRs, RFLAGS and memory against QEMU. SSE parts (PXOR/POR, ADDPS, MXCSR): boot phase (SSE). |
+| 2 | Same runs (whole register file and memory regions compared), `frame_intact` on every run, private state unreachable (21). Vector, x87, segment and XCR0 state: boot phase (not admitted). |
+| 3 | MOV CR keeps RFLAGS: `system` (QEMU programs, RFLAGS compared). EFER.LMA writes ignored: resident code reading only (`runtime/src/execution.rs` `system`, WRMSR keeps LMA); no program writes EFER with LMA clear and reads it back. Upper halves outside 64-bit mode: retired, D3. |
+| 4 | Retired, D3: only 64-bit code is decoded; the code-cache key already holds the mode (S3a2 table, I2 context_stale). |
+| 5 | Division helper probes (#DE through the 128/64 helper) in faults; ASM; helper stack within `HELPER_STACK_BYTES` (stack). Vector width and FP controls: boot phase (SSE). LFENCE sink: retired with 51. |
+| 6 | faults and loop faults at every block size (exact state at the fault); `fexc/verify_precision.py` and admission. |
+| 7 | faults (error codes 0/2/3/5/7/9/17 and CR2 per paging cell), loop faults. Delivery through the IDT: boot phase (49). |
+| 8 | faults: non-canonical stack/data probes (#SS/#GP), non-canonical ends (S3a2 table). Far-transfer targets: retired, D3. |
+| 9 | faults: paging cells, 6 controls (CPL3, CPL0, WP=0, SMEP, SMEP with supervisor code, NXE=0) × mutations × levels × leaf sizes. |
+| 10 | faults: reserved per level, non-present garbage. MAXPHYADDR 40 and no 1 GiB pages are declared profile (`models/coherence_model.py`; CPUID Page1GB=0 is a boot-phase item). |
+| 11 | faults: 2 MiB leaf cells (A/D on the PDE); sharedpt `large`. |
+| 12 | faults (leaf A/D per page compared; fault-path leaf-A policy declared in `models/coherence_model.py`, §3 item 4), sharedpt (`ad-race`, `alias`, `large`). Non-leaf A not compared (§3 item 7). PAE and paging-off rules: retired, D3. |
+| 13 | Guest consequence (D set exactly when written): faults (leaf D compared), sharedpt `ad-race` (after its own write a CPU always sees D). The install rule itself (a shadow is writable only for a write whose walk returned D, per vCPU): resident code reading only (`runtime/src/execution.rs`, `writable = write && t.writable && t.dirty`). Upgrade counts are internal (S3a2 table). |
+| 14 | faults: page-crossing access forms and split stores (all-or-nothing, CR2 policy §3 item 8); litmus `split`/`split-hi`. Atomicity across 16 bytes: D2. |
+| 15 | system (CR3 switch, INVLPG after a PTE change, WP and NXE toggles; same-value CR3 flushes), sharedpt `remap`/`large`/`alias` (after its own INVLPG a CPU sees only the new state). CR0.PG/CD/NW, CR4.PSE/PAE changes: refused or retired, D3. |
+| 16 | Retired: not required (slice-3 §1; §3 items 3, 5, 6); each vCPU's shadows are its TLB until its own INVLPG/CR3. |
+| 17 | Retired as a requirement (§3 item 2): either history is accepted, `system` (PTE change without INVLPG through `coherence_model.check_observation`) and sharedpt (`ad-race` free race). |
+| 18 | system (CR3 switches; every CR3 load flushes the vCPU's cache and shadows), coherence (patch after `mov cr3, cr3`). PAE ABA: retired, D3. |
+| 19 | sharedpt `large` (2 MiB leaf ↔ table, both ways). |
+| 20 | sharedpt `alias` (two linear pages, one frame, per-alias A/D); faults access forms at low, high and high-code placements. |
+| 21 | faults: high-code placement and non-canonical probes at the resident's private range (#GP, nothing written) (S3a2 table); `frame_intact`. |
+| 22 | Retired, D3 (paging off). |
+| 23 | Retired, D1 (boot phase if needed). |
+| 24 | Retired, D1. |
+| 25 | Retired, D1. |
+| 26 | Retired, D1 (resolver); devices: boot phase. |
+| 27 | Retired, D3. |
+| 28 | system: QEMU programs and fault cases (`system_fault_model.py` at QEMU's prefix state; five also by `models/modes_model.py`). PG-without-PE and legacy cases: retired, D3. |
+| 29 | Retired, D3 (PAE hidden PDPTEs). |
+| 30 | WRMSR EFER (reserved EAX and EDX bits, LME change under PG): system. IA-32e activation and LMA transitions: retired, D3. |
+| 31 | Retired, D3 (far transfers); boot phase if its kernel needs them (`s3g-plan.md`). |
+| 32 | Code-cache key holds CR3/CPL/mode/controls and every control change flushes: system, coherence (S3a2 table, I2 context_stale). Stale compiler replies: retired, requests are synchronous (S3a2 table, I2 cancel). |
+| 33 | system `sys-ctl-*` at 2 and 4 CPUs, block sizes default and 1 (S3c2). Hidden PDPTEs: retired, D3. |
+| 34 | coherence (20 programs × 2 sizes), contain progress, probes (SMC), ASM (SelfModifyingCode). Writes from another mode: retired, D3. |
+| 35 | contain (`offset`, `next-page`, `system`, `word`, `literal`, `record`, forged header), admission unit tests. Reply-word flips: retired with the producer transport (S3a2 table). |
+| 36 | Whole-cache flush only at the owner's resident entries; a dead or unknown header is `bad_link`: contain (`word`/`literal`/`record` before a flush, forged header), probes with small `--code-cache`, coherence `stale`. Reference counting and reclaim order: retired (per-vCPU caches, no shared code; slice-2 contract). |
+| 37 | faults: code-page cells (no compile before a first-instruction fetch fault); the resident walks the fetch before the host copies (S3d). |
+| 38 | corpora (host requests = distinct blocks per vCPU), exact-request compile cache (unit), probes (small-cache flushes). Busy slot and cancellation: retired (synchronous, S3a2 table). |
+| 39 | Placement (write alias, code synchronization, then lookup insert) under every suite; contain (forged header, linked word/literal/record tampers → `bad_link`). |
+| 40 | Every suite (each first access is a shadow miss); faults compare CR2 and vector on all 3,443 cases (522 run to their end). |
+| 41 | faults and loop faults at block sizes default and 1, precision verifier, admission. |
+| 42 | Retired (S3a2 table): no acknowledgement protocol; shadows are each vCPU's TLB. |
+| 43 | litmus XCHG chains (linearizable), faults (XCHG access forms, split-lock probes → `unsupported_atomic`), loop faults (XCHG stride). Under remap: retired with 42. LOCK ADD/CMPXCHG/XADD/BT*, CMPXCHG8B/16B, split locks: boot phase. |
+| 44 | Boot phase (REP partial progress). |
+| 45 | Retired (S3h table): no global service lock or queue; successor property checked by coherence `mutual`. |
+| 46 | Replaced by the synchronous shootdown (S3h table): coherence `fresh-reused` (control: shootdown off fails), contain `unacked`. |
+| 47 | contain progress, litmus, sharedpt contended walks (S3h table); the heads bound retired with the queue. |
+| 48 | Retired (S3h table): no queue; a full code cache flushes (probes). |
+| 49 | Boot phase (interrupt and exception delivery). |
+| 50 | litmus (90 cells, `models/ordering_model.py`), S3t probe. |
+| 51 | Raw LFENCE/SFENCE/MFENCE: litmus (`sb-mfence`), ASM. LFENCE register capture: boot phase (SSE). |
+| 52 | Every run: the resident halts unless EL1, SCTLR M/C/I and EnTSO hold (`runtime_main`); `run_slice3_vm.py` checks EnTSO read back on every vCPU. |
+| 53 | Retired (S3h table): a test mechanism of the old coordinator. |
+| 54 | N = 0 cannot be described (a description has at least one vCPU); `execution::prepare` refuses 0 and 5 (unit test `execution::tests::one_to_four_vcpus`); 5 is refused end to end by limits. Isolation: corpora and smp (a different program per vCPU on disjoint pages). |
+| 55 | Admission unit tests, limits (S3a2 table). |
+| 56 | contain `site` and `site-kind` on every vCPU at N = 1..4, banked state checked (S3a2 and S3h tables). |
+| 57 | contain (S3h table). |
+| 58 | contain (S3h table; banked state checked since S3i1). |
+| 59 | contain: a fresh process after every failing run. |
+| 60 | contain: `teardown: … children none` after every run. Containers: retired with Docker. |
+| 61 | stack: gates' save sequences, vectors and the ERET restore path, instruction by instruction. LFENCE sink and partial-store gates: retired with 51 and 44. |
+| 62 | stack: 11,568 bytes (16,000 with one nested entry to its halt) of the 32,768-byte exception stack (grown from 16 KiB at S3i2); boot 6,976 of 16,384; helpers 48 + 16 of 64; `dispatch_fast` 0 of 0. |
+| 63 | fexc unit tests (`fexc/test_slice1.py`: unsupported forms and window ends cut, never compiled), admission; the host copies only the walked guest-physical page and the resident walks the next one (S3d). |
+| 64 | `fexc/check_sites.py`, precision verifier, admission (every memory word must be a described site), contain `site`/`site-kind`. |
+
 Source state: working tree at commit `577a7f2`. The starting point is the accepted
 [I4-V contract-to-test matrix](../research/reviews/INV-03-01-i4v-coverage.md).
 Every runner, checker and model under `tools/` was read, plus
