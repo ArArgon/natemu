@@ -235,6 +235,15 @@ vectors, EC 0x24/0x20 stop exits); (E3) remove the guard, negative #GP/#SS tests
 both straddles, split admission; (E4) full suites and independent review. x28 stays FEX's state base. Guest state FEX
 keeps in memory (DF, FS/GS bases, MXCSR, x87, AVX upper halves): owner asked for a survey of existing solutions before
 choosing (registers, traps/specialised snippets, a guest-state page, hardware permission features).
+**Owner decision (October 28): one EL0 guest-state page per vCPU (FEX's layout at x28).** It holds only that vCPU's
+guest state that FEX's generated code keeps in memory (DF, FS/GS bases, MXCSR, x87 registers and status, AVX upper
+halves); no emulator-trusted value lives there (FEX's frame pointers are unused after E1 and stay zero; the resident
+treats the page as untrusted guest data). Documented deviation, like owner decision 2: a guest data access to exactly
+that page — one fixed 4 KiB page per vCPU in the non-canonical hole, placed away from Linux's poison patterns — reaches
+that vCPU's own state instead of raising #GP/#SS; every other non-canonical address faults exactly. Enforced by a test
+that fails if anything but listed guest-state fields is placed on the page. To verify: which kernel paths may be handed
+arbitrary addresses (tracing/debugger reads with fault fix-ups) and could land there. Survey:
+`docs/research/guest-state-protection-survey.md`.
 
 **Decided from evidence (recorded, not questions):** guest RAM default 2 GiB, tests choose their own size (M69);
 INIT/SIPI deferred, unused with the mailbox (`K kernel/smpboot.c:877-928`; M64 keeps the definition); legacy devices
