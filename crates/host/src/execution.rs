@@ -4,7 +4,8 @@
 //! fetch the guest bytes at RIP through the guest walk, compile one block with fexc
 //! (`--profile slice1`, a persistent server), admit it and stage it. A step request
 //! (self-modifying code) is the same with a one-instruction block. A watchdog
-//! stops a vCPU that runs too long without a host exit.
+//! stops a vCPU that runs too long without a host exit. A kick ([`Stops`]) stops a
+//! running vCPU precisely at its next block entry.
 use super::*;
 use crate::admission;
 use natemu_abi::execution::{self as exec, Cpu, State, cache};
@@ -15,7 +16,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::SeqCst};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Guest-physical RAM of the execution mode, through the host's alias.
 pub(crate) fn guest_ram(memory: &Memory) -> GuestRam {
@@ -93,6 +95,7 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize) -> Result<Bac
             own(SHARED_OFFSET, 4096),
             own(exec::STATE_OFFSET, 4096),
             own(exec::FRAME_OFFSET, exec::frame::BYTES),
+            own(exec::STOP_OFFSET, 4096),
             Span::text(exec::SLOT_OFFSET, exec::SLOT_BYTES, base + exec::SLOT_OFFSET),
             Span::data((exec::SLOT_WRITE_VA - PRIVATE) as usize, exec::SLOT_BYTES, base + exec::SLOT_OFFSET),
             own((STACK_TOP - PRIVATE) as usize - exec::STACK_BYTES, exec::STACK_BYTES),
@@ -146,17 +149,118 @@ pub(crate) fn guest_ram_written(memory: &Memory) {
     }
 }
 /// The host wrote guest-physical `gpa` (a fetch walk's A bit) while vCPUs may run: clears every vCPU's code bit of
-/// the page and posts the page to each that had one (as the resident does for its own writes).
-fn page_written(memory: &Memory, gpa: u64) {
+/// the page and posts the page to each that had one (as the resident does for its own writes). Returns their mask
+/// (the caller kicks them).
+fn page_written(memory: &Memory, gpa: u64) -> u8 {
     let page = (gpa >> 12) as usize;
     if page >= exec::GUEST_PAGES {
-        return;
+        return 0;
     }
     let mask = unsafe { AtomicU8::from_ptr(memory.0.add(cache::GLOBAL_OFFSET + cache::CODE_PAGES + page)) };
     let holders = mask.swap(0, SeqCst);
     for v in (0..cache::MAX_VCPUS).filter(|v| holders & 1 << v != 0) {
         record_word(memory, v, Some(page / 64)).fetch_or(1 << (page % 64), SeqCst);
         record_word(memory, v, None).fetch_or(cache::PAGES, SeqCst);
+    }
+    holders
+}
+
+/// Precise stops. vCPU v's stop granule is the IPA granule holding its stop page (`exec::STOP_OFFSET` of its window;
+/// nothing else is in it). A kick sets v's kick flag and write-protects the granule (under v's mutex), so v's next
+/// block entry, at its stop store, takes a stage-2 permission fault to v's own thread ([`serve`]), which restores the
+/// granule, clears the flag and enters the resident's stop gate; the gate drains v's invalidation record and
+/// re-dispatches. A kick that finds v in the host or the resident faults at v's next block entry, after its next
+/// drain (an empty stop); a kick while one is pending merges into it. Kicks come from the host (drivers; fetch walks
+/// writing a code page) and from peers' residents (`hvc #KICK_HVC`).
+///
+/// Concurrency: the granule's rights change only under v's mutex, read-only by a kick that finds no kick pending and
+/// read-write only by v's own thread on the stop exit itself (never on other exits, so a kick that lands while v is
+/// in the host stays in force across its re-entry); hence at most one protect per stop each way, and a merged kick
+/// costs none. Concurrent `hv_vm_protect` calls contend inside HVF (S3b replication: p99 ~30 µs for one kicked vCPU,
+/// ~200 µs with four kickers and four restoring vCPUs). A kick that finds v in the host still protects: not every
+/// host exit is followed by a drain before generated code runs again (a resident kick request resumes inside a
+/// fault handler), so skipping it could lose the kick.
+pub(crate) struct Stops {
+    granule: usize,
+    /// vCPU v's stop granule (IPA).
+    ipa: Vec<u64>,
+    kicks: Vec<Mutex<Kick>>,
+    /// vCPU v is in the host (not in `hv_vcpu_run`): a kick then waits for its next entry.
+    in_host: Vec<AtomicBool>,
+}
+/// One vCPU's kick flag and its stop accounting.
+#[derive(Default, Clone)]
+pub(crate) struct Kick {
+    /// The flag: its granule is write-protected and no stop has taken it yet; with when the protect returned and
+    /// whether the kick found the vCPU in the host.
+    pending: Option<(Instant, bool)>,
+    /// Kicks that protected the granule, of which while the vCPU was in the host; kicks merged into a pending one.
+    pub(crate) issued: u64,
+    pub(crate) in_host: u64,
+    pub(crate) merged: u64,
+    /// Stops taken (stage-2 faults on the granule served).
+    pub(crate) stops: u64,
+    /// Per stop: nanoseconds from the protect's return to the fault's exit (0 if the exit came first), and whether
+    /// the kick found the vCPU in the host.
+    pub(crate) latency: Vec<(u64, bool)>,
+    /// Native PCs of the stops (the faulting stop stores), with their counts.
+    pub(crate) pcs: std::collections::BTreeMap<u64, u64>,
+}
+impl Stops {
+    /// Stop granules of `backing`'s vCPUs in `machine` (which maps the backing).
+    pub(crate) fn new(backing: &Backing, machine: &Machine) -> Result<Self> {
+        let granule = machine.granule;
+        if exec::STOP_BYTES % granule != 0 || exec::STOP_OFFSET % granule != 0 {
+            return Err(format!("IPA granule {granule} does not fit the stop region"));
+        }
+        Ok(Self {
+            granule,
+            ipa: (0..backing.n).map(|v| IPA + (backing.vcpu(v).base + exec::STOP_OFFSET) as u64).collect(),
+            kicks: (0..backing.n).map(|_| Mutex::default()).collect(),
+            in_host: (0..backing.n).map(|_| AtomicBool::new(true)).collect(),
+        })
+    }
+    /// Stops vCPU `v` at its next block entry. False: a kick was pending (merged into it).
+    pub(crate) fn kick(&self, v: usize) -> Result<bool> {
+        let mut k = self.kicks.get(v).ok_or(format!("kick of vCPU {v}: no such vCPU"))?.lock().unwrap();
+        if k.pending.is_some() {
+            k.merged += 1;
+            return Ok(false);
+        }
+        let in_host = self.in_host[v].load(SeqCst);
+        protect(self.ipa[v], self.granule, vm::READ_ONLY)?;
+        k.pending = Some((Instant::now(), in_host));
+        k.issued += 1;
+        k.in_host += u64::from(in_host);
+        Ok(true)
+    }
+    /// The stage-2 abort `syndrome` at `ipa` that took vCPU `v` out at `exited` (PC `pc`) is a kick's stop: a write
+    /// abort in its own granule while a kick is pending. Restores the granule.
+    fn stopped(&self, v: usize, syndrome: u64, ipa: u64, pc: u64, exited: Instant) -> Result<()> {
+        let mut k = self.kicks[v].lock().unwrap();
+        let own = ipa.wrapping_sub(self.ipa[v]) < self.granule as u64;
+        // A write (WnR) with a translation or permission fault: a page not yet populated at stage 2 is a translation
+        // fault (HVF populates writable pages itself, so only a protected one exits).
+        let write = syndrome & 1 << 6 != 0 && matches!(syndrome & 0x3f, 0x04..=0x07 | 0x0c..=0x0f);
+        let Some((protected, in_host)) = k.pending.filter(|_| own && write) else {
+            return Err(format!("stage-2 abort: syndrome={syndrome:#x} IPA={ipa:#x} PC={pc:#x}"));
+        };
+        protect(self.ipa[v], self.granule, vm::MAPPED)?;
+        k.pending = None;
+        k.stops += 1;
+        let ns = exited.saturating_duration_since(protected).as_nanos() as u64;
+        k.latency.push((ns, in_host));
+        *k.pcs.entry(pc).or_default() += 1;
+        Ok(())
+    }
+    /// vCPU `v`'s accounting, and whether a kick is still pending (its vCPU ended first).
+    pub(crate) fn report(&self, v: usize) -> (Kick, bool) {
+        let k = self.kicks[v].lock().unwrap();
+        (k.clone(), k.pending.is_some())
+    }
+    /// Stops vCPU `v` has taken.
+    pub(crate) fn taken(&self, v: usize) -> u64 {
+        self.kicks[v].lock().unwrap().stops
     }
 }
 
@@ -400,14 +504,18 @@ const FETCH_ATTEMPTS: usize = 100_000;
 /// Guest bytes at `rip` up to the end of its page, continuing into the next
 /// page when that is fetchable, and never past `limit`. A fetch whose walk (of either page) loses its A/D
 /// races to peers is repeated whole (x86 re-walks), until `cancelled` or [`FETCH_ATTEMPTS`] (then an error).
-fn fetch(memory: &Memory, cpu: &Cpu, rip: u64, limit: Option<u64>, cancelled: &AtomicBool) -> Result<std::result::Result<Fetched, Fault>> {
-    let ram = guest_ram(memory);
+/// Peers holding translations from a page the walk wrote are kicked (`area` is the fetching vCPU's).
+fn fetch(area: Area, stops: &Stops, cpu: &Cpu, rip: u64, limit: Option<u64>, cancelled: &AtomicBool) -> Result<std::result::Result<Fetched, Fault>> {
+    let ram = guest_ram(area.memory);
     let control = cpu.control().ok_or("bank is not in 4-level long mode")?;
     for _ in 0..FETCH_ATTEMPTS {
         let mut tables = GuestTables::observed(ram, Writes(Vec::new()));
         let fetched = fetch_with(&mut tables, ram, control, rip, limit);
         for gpa in tables.observer.0 {
-            page_written(memory, gpa);
+            let peers = page_written(area.memory, gpa) & !(1 << area.vcpu);
+            for v in (0..cache::MAX_VCPUS).filter(|v| peers & 1 << v != 0) {
+                stops.kick(v)?;
+            }
         }
         match fetched {
             Ok(Err(Fault::Contended)) if !cancelled.load(SeqCst) => {}
@@ -469,6 +577,9 @@ pub(crate) struct Requests {
     /// true (it corrupted something); then `tampered` is set. Checks the resident's run-time defences.
     pub(crate) tamper: Option<fn(Area, &mut State) -> bool>,
     pub(crate) tampered: bool,
+    /// Test drivers only: the first stop enters the stop gate with a forged ELR (the word after the stop store); the
+    /// resident must halt (`bad_stop`). Sets `tampered`.
+    pub(crate) forge_stop: bool,
 }
 
 /// Runs the vCPU (entered at the resident, see [`enter`]) until it stops; `stop_at` is a RIP at
@@ -484,6 +595,7 @@ pub(crate) fn run(
     stop_at: Option<u64>,
     watchdog: Duration,
     requests: &mut Requests,
+    stops: &Stops,
     cancelled: &AtomicBool,
 ) -> Result<Stop> {
     // `true`: the vCPU enters the guest; `false`: it is back in the host. Dropping the sender ends the watchdog.
@@ -500,7 +612,7 @@ pub(crate) fn run(
             }
         }
     });
-    let stop = serve(cpu, area, compiler, stop_at, requests, &running, cancelled);
+    let stop = serve(cpu, area, compiler, stop_at, requests, stops, &running, cancelled);
     // ponytail: a cancel the watchdog sent just as the guest exited stays pending on the vCPU and would end its next
     // `hv_vcpu_run` at once; harmless while a vCPU serves one run. Drain it (a zero-length run) if vCPUs get reused.
     drop(running);
@@ -513,22 +625,49 @@ fn serve(
     compiler: &mut Compiler,
     stop_at: Option<u64>,
     requests: &mut Requests,
+    stops: &Stops,
     running: &std::sync::mpsc::Sender<bool>,
     cancelled: &AtomicBool,
 ) -> Result<Stop> {
     // The host's own stop, once decided: the vCPU was told to park (it drops its shadows first).
     let mut parked = None;
+    let v = area.vcpu;
     loop {
         if cancelled.load(SeqCst) {
             return Ok(Stop::Cancelled);
         }
         let _ = running.send(true);
+        stops.in_host[v].store(false, SeqCst);
         let exit = cpu.run_until_exit();
+        let exited = Instant::now();
+        stops.in_host[v].store(true, SeqCst);
         let _ = running.send(false);
-        let Some(exit) = exit? else {
-            return Ok(if cancelled.load(SeqCst) { Stop::Cancelled } else { Stop::Watchdog });
+        let exit = match exit? {
+            vm::Exit::Hvc(immediate) => immediate,
+            vm::Exit::Cancelled => return Ok(if cancelled.load(SeqCst) { Stop::Cancelled } else { Stop::Watchdog }),
+            vm::Exit::Stage2 { syndrome, ipa } => {
+                // Only a kick's stop restores the granule: a kick that found the vCPU in the host stays in force.
+                let pc = cpu.reg(PC)?;
+                stops.stopped(v, syndrome, ipa, pc, exited)?;
+                let state: State = area.read_record(exec::STATE_OFFSET);
+                if !resident::contains(state.stop_gate, 4) {
+                    return Err(format!("stop gate {:#x} outside the resident", state.stop_gate));
+                }
+                let elr = if requests.forge_stop { pc + 4 } else { pc };
+                (requests.forge_stop, requests.tampered) = (false, requests.tampered || requests.forge_stop);
+                // As an exception from EL1t taken to EL1h with DAIF masked would leave it.
+                cpu.set_sys(vm::ELR_EL1, elr)?;
+                cpu.set_sys(vm::SPSR_EL1, cpu.reg(vm::CPSR)?)?;
+                cpu.set_reg(PC, state.stop_gate)?;
+                cpu.set_reg(vm::CPSR, 0x3c5)?;
+                continue;
+            }
         };
         match exit {
+            exec::KICK_HVC => {
+                stops.kick(cpu.reg(0)? as usize)?;
+                continue;
+            }
             0x49 => {
                 let s: Shared = area.read_record(SHARED_OFFSET);
                 let state: State = area.read_record(exec::STATE_OFFSET);
@@ -547,7 +686,7 @@ fn serve(
             exec::REQUEST_STEP => true,
             _ => return Err("translation exit without a request".into()),
         };
-        match translation(area, compiler, &mut state, step, stop_at, requests, cancelled)? {
+        match translation(area, compiler, &mut state, step, stop_at, requests, stops, cancelled)? {
             Some(stop) => {
                 parked = Some(stop);
                 state.reply = exec::REPLY_PARK;
@@ -565,13 +704,14 @@ fn translation(
     step: bool,
     stop_at: Option<u64>,
     requests: &mut Requests,
+    stops: &Stops,
     cancelled: &AtomicBool,
 ) -> Result<Option<Stop>> {
     let rip = state.cpu.rip;
     if Some(rip) == stop_at {
         return Ok(Some(Stop::Reached));
     }
-    let Fetched { bytes, pages, next_fault } = match fetch(area.memory, &state.cpu, rip, stop_at, cancelled)? {
+    let Fetched { bytes, pages, next_fault } = match fetch(area, stops, &state.cpu, rip, stop_at, cancelled)? {
         Ok(fetched) => fetched,
         Err(Fault::Contended) => return Ok(Some(Stop::Cancelled)),
         Err(fault) => return Ok(Some(Stop::FetchFault(fault))),

@@ -200,6 +200,21 @@ vectors:
     b exception_capture
     .balign 128
 
+// The precise stop gate: the host enters here (EL1h, DAIF masked) when a block entry's stop store took the stage-2
+// fault of a kick, with ELR_EL1/SPSR_EL1 = the faulting PC/PSTATE, as an exception entry from EL1t would leave them.
+.global stop_gate
+stop_gate:
+    save_native
+    mrs x9, sp_el0
+    str x9, [sp, #{sp_offset}]
+    mrs x9, spsr_el1
+    and x9, x9, #0xf0000000
+    str x9, [sp, #{nzcv_offset}]
+    mov x0, sp
+    mov x1, #3
+    bl finish
+    b .
+
 // Called only with all guest roots saved. Host may transfer x0..x15 here.
 .global service
 .global service_resume

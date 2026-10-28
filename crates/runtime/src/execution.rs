@@ -25,6 +25,7 @@ unsafe extern "C" {
     fn resume_exception(frame: *const NativeFrame, pc: u64, spsr: u64) -> !;
     fn dispatch_fast();
     fn link_exit();
+    fn stop_gate();
     fn natemu_ludiv();
     fn natemu_ldiv();
 }
@@ -126,8 +127,9 @@ unsafe fn load() -> State {
 fn staged() -> Header {
     unsafe { read_record(STAGING_VA as *const Header) }
 }
+/// A field of FEX's frame (x28 = [`FRAME_POINTER`]).
 fn frame_word(offset: u32) -> *mut u64 {
-    (FRAME_VA + offset as u64) as *mut u64
+    (FRAME_POINTER + offset as u64) as *mut u64
 }
 
 /// Stops this vCPU; the host reads `reason` and the record. The host may never resume it, so it first drops every
@@ -148,6 +150,7 @@ pub unsafe fn start() -> ! {
         stop(SUCCESS, s.stop)
     }
     cache::reset();
+    s.stop_gate = stop_gate as *const () as u64;
     unsafe {
         frame_word(frame::DISPATCHER_LOOP_TOP).write_volatile(dispatch_fast as *const () as u64);
         frame_word(frame::EXIT_FUNCTION_LINKER).write_volatile(link_exit as *const () as u64);
@@ -268,6 +271,9 @@ unsafe fn request(s: &mut State, kind: u64) -> Header {
 /// stopped flush) and resets its shadows when a peer asks.
 fn take_invalidations(s: &mut State) {
     let Some(pending) = cache::drain() else { halt(*s, stop::BAD_LINK) };
+    if pending & cache::PAGES != 0 {
+        s.invalidations += 1;
+    }
     if pending & cache::FLUSH != 0 {
         flush(s);
     }
@@ -303,7 +309,7 @@ unsafe fn enter(mut s: State, block: &Block) -> ! {
     let (nzcv, pf, af) = native_flags(s.cpu.rflags);
     f.x[SRA[16] as usize] = pf;
     f.x[SRA[17] as usize] = af;
-    f.x[28] = FRAME_VA;
+    f.x[28] = FRAME_POINTER;
     f.sp = STACK_TOP;
     s.blocks += 1;
     unsafe {
@@ -314,12 +320,13 @@ unsafe fn enter(mut s: State, block: &Block) -> ! {
     }
 }
 
-/// Exception capture (`fault` 1), the linker (2) and the dispatcher's slow path (0) end here.
+/// Exception capture (`fault` 1), the linker (2), the stop gate (3) and the dispatcher's slow path (0) end here.
 pub unsafe fn returned(frame: &NativeFrame, fault: u64) -> ! {
     unsafe {
         match fault {
             0 => {}
             2 => linker(frame),
+            3 => stopped(frame),
             _ => aborted(frame),
         }
         // Block exit: guest state is in the static registers, NZCV (CF inverted) and PF/AF registers.
@@ -328,6 +335,26 @@ pub unsafe fn returned(frame: &NativeFrame, fault: u64) -> ! {
         s.cpu.rip = frame_word(frame::RIP).read_volatile();
         dispatch(s)
     }
+}
+
+/// A precise stop (the stop gate, `gates.S` `stop_gate`): a kick write-protected this vCPU's stop page, so a block
+/// entry's stop store faulted to the host, which entered the gate with ELR/SPSR as the fault left them. ELR must be
+/// the stop store of a live cache block or of the step block, entered from EL1t; anything else halts. Nothing of the
+/// block ran but its prologue's header store, so the state is its entry state (static registers, NZCV with CF
+/// inverted) at its RIP (`State.rip` is stale after a linked edge). Drains (the kick's reason) and re-dispatches.
+unsafe fn stopped(frame: &NativeFrame) -> ! {
+    let (elr, spsr): (u64, u64);
+    unsafe { asm!("mrs {0}, elr_el1", "mrs {1}, spsr_el1", out(reg) elr, out(reg) spsr) };
+    let mut s = unsafe { load() };
+    let block = cache::block_at(elr).filter(|b| elr == b.code_va() + u64::from(STOP_STORE) && b.flags & cache::DEAD == 0);
+    let Some(b) = block.filter(|_| spsr & 15 == 4) else {
+        s.native = [0, 0, elr];
+        halt(s, stop::BAD_STOP)
+    };
+    bank(&mut s.cpu, frame, frame.nzcv, true);
+    s.cpu.rip = b.rip;
+    s.stops += 1;
+    unsafe { dispatch(s) }
 }
 
 /// Guest GPRs and arithmetic flags from the native state: the static-register map,
@@ -353,7 +380,7 @@ fn guest_fault(mut s: State, f: &NativeFrame, b: &Block, site: &Site, [vector, c
 /// Banks the exact state at the start of `site`'s guest instruction in `b` (see [`guest_fault`]).
 fn bank_at(s: &mut State, f: &NativeFrame, b: &Block, site: &Site) {
     let nzcv = match site.nzcv {
-        object::NZCV_FRAME => unsafe { ((FRAME_VA + frame::PRE_NZCV as u64) as *const u32).read_volatile() as u64 },
+        object::NZCV_FRAME => unsafe { ((FRAME_POINTER + frame::PRE_NZCV as u64) as *const u32).read_volatile() as u64 },
         _ => f.nzcv,
     };
     bank(&mut s.cpu, f, nzcv, site.cf_inverted != 0);

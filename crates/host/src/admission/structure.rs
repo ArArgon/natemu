@@ -227,7 +227,7 @@ const ADR_X0_HEADER: u32 = 0x10ff_ffe0; // adr x0, #-4 (the block's JITCodeHeade
 const STR_X0_HEADER: u32 = 0xf900_0380; // str x0, [x28, #BLOCK_HEADER]
 const STR_XZR_STOP: u32 = 0xf900_039f | (INTERRUPT_FAULT_PAGE / 8) << 10; // str xzr, [x28, #INTERRUPT_FAULT_PAGE]
 /// Native offset of the stop store: `adr x0, header; str x0, [x28]; str xzr, [x28, #stop]` after the 4-byte header.
-const STOP_AT: u32 = ENTRY_OFFSET + 8;
+const STOP_AT: u32 = natemu_abi::execution::STOP_STORE;
 const LDR_LUDIV: u32 = 0xf940_0383 | (frame::LUDIV_HANDLER / 8) << 10; // ldr x3, [x28, #LUDIVHandler]
 const LDR_LDIV: u32 = 0xf940_0383 | (frame::LDIV_HANDLER / 8) << 10;
 const STR_X30_PRE: u32 = 0xf81f_0ffe; // str x30, [sp, #-16]!

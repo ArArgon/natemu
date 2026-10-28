@@ -19,12 +19,28 @@ use crate::{
 pub const MODE: u64 = 32;
 /// Resident → host: translate at `cpu.rip` (state record holds the request).
 pub const TRANSLATE_HVC: u64 = 0x4b;
+/// Resident → host: kick vCPU `x0` (see [`STOP_OFFSET`]); returns at once.
+pub const KICK_HVC: u64 = 0x4c;
 
 pub const STATE_OFFSET: usize = 0x22000;
 pub const STATE_VA: u64 = PRIVATE + STATE_OFFSET as u64;
 /// FEX `CpuStateFrame` (x28): private plumbing, never guest state.
 pub const FRAME_OFFSET: usize = 0x23000;
 pub const FRAME_VA: u64 = PRIVATE + FRAME_OFFSET as u64;
+/// x28 = the frame page + `FRAME_BIAS`: every admitted field ([`frame::FIELDS`], offsets up to 3040) stays in the frame
+/// page, and the block entry's stop store (`str xzr, [x28, #frame::INTERRUPT_FAULT_PAGE]`) lands alone in the next page,
+/// the stop page.
+pub const FRAME_BIAS: u64 = 0x400;
+pub const FRAME_POINTER: u64 = FRAME_VA + FRAME_BIAS;
+/// The stop page (precise stop, slice 3): the only page of the vCPU's stop region, `STOP_BYTES` of the window that
+/// hold nothing else, so one IPA granule (4 or 16 KiB, as HVF reports it) covers the stop page alone. To stop a running
+/// vCPU the host write-protects that granule (a kick): its next block entry takes a stage-2 fault at the stop store
+/// with the entry state intact, and the host enters the resident's stop gate. (The regression families map their own
+/// pages at these private addresses, e.g. `pressure::SPILLS`; they never run in this mode.)
+pub const STOP_OFFSET: usize = FRAME_OFFSET + 0x1000;
+pub const STOP_BYTES: usize = 0x4000;
+/// Native offset of a block's stop store (its third prologue word, after `adr x0, header; str x0, [x28]`).
+pub const STOP_STORE: u32 = ENTRY_OFFSET + 8;
 /// Code slot: executable alias at `SLOT_VA`, writable alias at `SLOT_WRITE_VA`.
 pub const SLOT_OFFSET: usize = 0x30000;
 pub const SLOT_BYTES: usize = 0x10000;
@@ -396,6 +412,8 @@ pub mod stop {
     pub const BAD_LINK: u64 = 9;
     /// The host parked the vCPU ([`super::REPLY_PARK`]).
     pub const PARKED: u64 = 10;
+    /// The stop gate was entered at a PC that is no live block's stop store (`super::STOP_STORE`), or not from EL1t.
+    pub const BAD_STOP: u64 = 11;
 
     pub fn name(code: u64) -> &'static str {
         match code {
@@ -408,6 +426,7 @@ pub mod stop {
             NO_PROGRESS => "no_progress",
             BAD_LINK => "bad_link",
             PARKED => "parked",
+            BAD_STOP => "bad_stop",
             _ => "none",
         }
     }
@@ -462,6 +481,10 @@ pub struct State {
     /// updates, queued requests); instructions single-stepped because they wrote a page their own block came from.
     pub invalidations: u64,
     pub steps: u64,
+    /// The resident's stop gate (written at start): where the host enters a vCPU stopped at a block entry by a kick.
+    pub stop_gate: u64,
+    /// Stops taken at the stop gate.
+    pub stops: u64,
 }
 impl State {
     pub const fn new(vcpu: u64, cpu: Cpu) -> Self {
@@ -493,11 +516,26 @@ impl State {
             full_links: 0,
             invalidations: 0,
             steps: 0,
+            stop_gate: 0,
+            stops: 0,
         }
     }
 }
 const _: () = assert!(core::mem::size_of::<State>() <= 4096);
 const _: () = assert!(STATE_OFFSET + 4096 <= FRAME_OFFSET);
+// Admitted fields stay in the frame page; the stop store's 8 bytes are in the stop page; the stop region is aligned
+// for the largest IPA granule it may be (16 KiB) and holds nothing else.
+const _: () = {
+    let mut i = 0;
+    while i < frame::FIELDS.len() {
+        assert!(FRAME_BIAS as usize + (frame::FIELDS[i].0 + frame::FIELDS[i].1) as usize <= frame::BYTES);
+        i += 1;
+    }
+};
+const _: () = assert!(FRAME_OFFSET + FRAME_BIAS as usize + frame::INTERRUPT_FAULT_PAGE as usize >= STOP_OFFSET);
+const _: () = assert!(FRAME_OFFSET + FRAME_BIAS as usize + frame::INTERRUPT_FAULT_PAGE as usize + 8 <= STOP_OFFSET + 4096);
+const _: () = assert!(FRAME_OFFSET + frame::BYTES == STOP_OFFSET && STOP_OFFSET % STOP_BYTES == 0);
+const _: () = assert!(STOP_OFFSET + STOP_BYTES <= SLOT_OFFSET);
 const _: () = assert!(SLOT_OFFSET + SLOT_BYTES <= 0x40000);
 const _: () = assert!(STAGING_OFFSET + STAGING_BYTES <= crate::resident::TEXT_OFFSET);
 const _: () = assert!(crate::STACK_TOP - PRIVATE >= 0x50000 + BLOCK_STACK_BYTES as u64);

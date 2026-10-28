@@ -13,7 +13,15 @@
 //! block will not fit and the resident is about to flush (KIND `offset`: a link point outside the code, so the reply is
 //! refused; `word`: a linked point's branch; `literal`: the target literal of a linked point; `record`: a link record),
 //! and the unlink must halt (`bad_link`); `--tamper-after KIND` (not `offset`) corrupts after the run, and the host's
-//! self-check must refuse (`links_check`).
+//! self-check must refuse (`links_check`); `--forge-stop` enters the stop gate of its first stop with a forged ELR
+//! (the resident must halt: `bad_stop`).
+//!
+//! Precise stops: `--kick-vcpu V` (repeatable) runs a host kicker thread per listed vCPU that kicks it `--kicks M`
+//! times (default 10,000), each after the previous kick's stop was taken (or the vCPU ended) and `--kick-every-us P`
+//! (default 0) more; kicks while the vCPU is in the host or the resident are part of the stream. Each vCPU's output
+//! has its `kicks` accounting (issued, of which found it in the host, merged, stops taken, still pending at its end),
+//! the native PCs of its stops with counts (`stops_at_entry`: every one is a stop store of a block it placed) and the
+//! latencies from each protect's return to the stop's exit.
 //!
 //! vCPUs run concurrently over shared guest RAM, each until its own stop. A vCPU that stops for any other reason than
 //! reaching its end, a guest fault or code it cannot compile (a resident halt, the watchdog) cancels the others.
@@ -46,7 +54,7 @@ use natemu_abi::paging::Fault;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 
 /// One address space's contents.
 #[derive(Default, Debug, PartialEq)]
@@ -335,7 +343,8 @@ fn page_span(start: u64, length: usize) -> impl Iterator<Item = u64> {
 }
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] \
-                     [--code-cache BYTES] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-header] [--tamper offset|word|literal|record] [--tamper-after word|literal|record]";
+                     [--code-cache BYTES] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-header] [--tamper offset|word|literal|record] [--tamper-after word|literal|record] \
+                     [--forge-stop] [--kick-vcpu V]... [--kicks M] [--kick-every-us P]";
 
 /// `adr x0, #-4` (the block's header) at the entry becomes `adr x0, #0` (the entry itself).
 fn forge_header(object: &mut [u8]) {
@@ -418,6 +427,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     };
     let (mut max_instructions, mut code_bytes, mut watchdog_ms, mut forge, mut target) = (None, exec::cache::CODE_BYTES, 10_000, false, 0);
     let (mut tamper, mut tamper_after): (Option<fn(Area, &mut State) -> bool>, Option<Corrupt>) = (None, None);
+    let (mut forge_stop, mut kicked, mut kicks, mut every_us) = (false, Vec::new(), 10_000, 0);
     let mut options = options.iter();
     while let Some(option) = options.next() {
         let mut value = || -> Result<usize> { options.next().and_then(|v| v.parse().ok()).ok_or(USAGE.into()) };
@@ -426,6 +436,10 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             "--watchdog-ms" => watchdog_ms = value()? as u64,
             "--tamper-vcpu" => target = value()?,
             "--forge-header" => forge = true,
+            "--forge-stop" => forge_stop = true,
+            "--kick-vcpu" => kicked.push(value()?),
+            "--kicks" => kicks = value()?,
+            "--kick-every-us" => every_us = value()? as u64,
             "--tamper" => {
                 tamper = Some(match options.next().map(String::as_str) {
                     Some("offset") => tamper_offset,
@@ -449,18 +463,22 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
     let d = parse(&fs::read_to_string(description).map_err(|e| e.to_string())?)?;
     let n = d.cpus.len();
+    if kicked.iter().any(|&v| v >= n) {
+        return Err(format!("--kick-vcpu: {n} vCPUs"));
+    }
     let backing = execution::prepare(resident, code_bytes, n)?;
     require_vcpus(n)?;
     let mut builder = Builder { ram: execution::guest_ram(&backing.memory), next: 0x1000, top: exec::GUEST_RAM_BYTES as u64 };
     // A space is built for the first vCPU using it (its rip places `code` bodies).
     let mut spaces: Vec<Option<Tables>> = d.spaces.iter().map(|_| None).collect();
-    let mut stops = Vec::new();
+    let mut ends = Vec::new();
     for c in &d.cpus {
         if spaces[c.space].is_none() {
             spaces[c.space] = Some(build(&mut builder, &d.spaces[c.space], c.rip, c.nxe)?);
         }
-        stops.push(stop_at(&d.spaces[c.space], c.rip)?);
+        ends.push(stop_at(&d.spaces[c.space], c.rip)?);
     }
+    let stop_at = ends;
     execution::guest_ram_written(&backing.memory);
     for (v, c) in d.cpus.iter().enumerate() {
         // 4-level paging; user mode, NX and WP on unless the section says otherwise.
@@ -481,6 +499,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
 
     let machine = Machine::create(&backing.memory)?;
+    let stops = execution::Stops::new(&backing, &machine)?;
+    let ended: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
     let watchdog = std::time::Duration::from_millis(watchdog_ms);
     let body = |v: usize, cpu: &Vcpu, cancelled: &AtomicBool| -> Result<Ran> {
         let mut compiler = Compiler::new(Path::new(fexc), cpu, max_instructions)?;
@@ -488,8 +508,11 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         if v == target {
             compiler.tamper = forge.then_some(forge_header as fn(&mut [u8]));
             requests.tamper = tamper;
+            requests.forge_stop = forge_stop;
         }
-        let stop = execution::run(cpu, backing.vcpu(v), &mut compiler, Some(stops[v]), watchdog, &mut requests, cancelled)?;
+        let stop = execution::run(cpu, backing.vcpu(v), &mut compiler, Some(stop_at[v]), watchdog, &mut requests, &stops, cancelled);
+        ended[v].store(true, SeqCst);
+        let stop = stop?;
         if !finished(&stop) {
             owners::cancel_owners(cancelled);
         }
@@ -500,7 +523,43 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         execution::enter(&cpu, backing.vcpu(v))?;
         Ok(cpu)
     };
-    let supervision = owners::supervise(n, std::time::Duration::MAX, &prepare, &body, &mut || None, &|_| {})?;
+    // One kicker per kicked vCPU, joined before the VM goes (a protect needs the VM).
+    let supervision = std::thread::scope(|scope| {
+        let kickers: Vec<_> = kicked
+            .iter()
+            .map(|&v| {
+                let (stops, ended) = (&stops, &ended);
+                scope.spawn(move || -> Result<()> {
+                    for _ in 0..kicks {
+                        if ended[v].load(SeqCst) {
+                            break;
+                        }
+                        let taken = stops.taken(v);
+                        stops.kick(v)?;
+                        // Spin briefly, then sleep: a spinning kicker would take a core from the vCPUs.
+                        for spins in 0.. {
+                            if stops.taken(v) != taken || ended[v].load(SeqCst) {
+                                break;
+                            }
+                            if spins < 1000 {
+                                std::hint::spin_loop();
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_micros(20));
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(every_us));
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        let supervision = owners::supervise(n, std::time::Duration::MAX, &prepare, &body, &mut || None, &|_| {});
+        for e in &ended {
+            e.store(true, SeqCst); // a vCPU that never started
+        }
+        let kicked: Result<()> = kickers.into_iter().map(|k| k.join().unwrap_or(Err("kicker panicked".into()))).collect();
+        kicked.and(supervision)
+    })?;
     // Every vCPU is destroyed: the VM goes next, then the host reads the backing.
     hv(machine.destroy(), "destroy VM")?;
     if let Some(e) = supervision.error {
@@ -511,7 +570,10 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let ran = ran.ok_or("vCPU without a result")?;
         let tables = spaces[d.cpus[v].space].as_ref().unwrap();
         let tampering = v == target && (tamper.is_some() || tamper_after.is_some());
-        out.push(report(backing.vcpu(v), &d.spaces[d.cpus[v].space], tables, ran, tampering, tamper_after.filter(|_| v == target))?);
+        let tampering = tampering || (v == target && forge_stop);
+        let mut json = report(backing.vcpu(v), &d.spaces[d.cpus[v].space], tables, ran, tampering, tamper_after.filter(|_| v == target))?;
+        json.pop();
+        out.push(json + &kick_report(backing.vcpu(v), &stops) + "}");
     }
     if d.sections {
         println!("{{\"cpus\":[{}]}}", out.join(","));
@@ -574,7 +636,7 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"steps\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\"}}",
+        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"steps\":{},\"stops\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\"}}",
         s.blocks,
         s.fast,
         s.l2_hits,
@@ -584,6 +646,7 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
         s.generation,
         ran.compiles,
         s.steps,
+        s.stops,
         s.invalidations,
         s.retries,
         s.upgrades,
@@ -605,14 +668,44 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
     Ok(out)
 }
 
+/// `,"kicks":{..}` for vCPU `area.vcpu`: its kick accounting, its stops' PCs and their latency distribution.
+fn kick_report(area: Area, stops: &execution::Stops) -> String {
+    let (k, pending) = stops.report(area.vcpu);
+    let entries: std::collections::HashSet<u64> = execution::placed_blocks(area)
+        .iter()
+        .map(|b| b.code_va() + u64::from(exec::STOP_STORE))
+        .chain([exec::SLOT_VA + u64::from(exec::STOP_STORE)])
+        .collect();
+    let at_entry = k.pcs.keys().all(|pc| entries.contains(pc));
+    let pcs: Vec<String> = k.pcs.iter().map(|(pc, n)| format!("[\"{pc:#x}\",{n}]")).collect();
+    let quantiles = |host: bool| {
+        let mut ns: Vec<u64> = k.latency.iter().filter(|l| l.1 == host).map(|l| l.0).collect();
+        ns.sort_unstable();
+        let q = |f: f64| ns.get(((ns.len() as f64 - 1.0) * f).round() as usize).copied().unwrap_or(0);
+        format!("{{\"n\":{},\"min\":{},\"p50\":{},\"p90\":{},\"p99\":{},\"p999\":{},\"max\":{}}}", ns.len(), q(0.0), q(0.5), q(0.9), q(0.99), q(0.999), q(1.0))
+    };
+    format!(
+        ",\"kicks\":{{\"issued\":{},\"in_host\":{},\"merged\":{},\"stops\":{},\"pending\":{pending},\"stop_pcs\":[{}],\"stops_at_entry\":{at_entry},\"latency_ns\":{},\"latency_in_host_ns\":{}}}",
+        k.issued,
+        k.in_host,
+        k.merged,
+        k.stops,
+        pcs.join(","),
+        quantiles(false),
+        quantiles(true)
+    )
+}
+
 /// The FEX frame holds nothing but its admitted fields (guest code cannot have written
 /// private memory there), and its native pointers (exit gate, division helpers) still point into the resident.
 fn frame_intact(area: Area) -> bool {
     let frame: [u8; exec::frame::BYTES] = area.read_record(exec::FRAME_OFFSET);
-    let admitted = |i: usize| exec::frame::FIELDS.iter().any(|&(at, len)| (at as usize..(at + len) as usize).contains(&i));
+    // x28 is the page + FRAME_BIAS.
+    let bias = exec::FRAME_BIAS as usize;
+    let admitted = |i: usize| exec::frame::FIELDS.iter().any(|&(at, len)| (bias + at as usize..bias + (at + len) as usize).contains(&i));
     let text = |offset: usize| PRIVATE + offset as u64;
     let in_text = |at: u32| {
-        let pointer = u64::from_le_bytes(frame[at as usize..][..8].try_into().unwrap());
+        let pointer = u64::from_le_bytes(frame[bias + at as usize..][..8].try_into().unwrap());
         (text(natemu_abi::resident::TEXT_OFFSET)..text(natemu_abi::resident::TEXT_END)).contains(&pointer)
     };
     frame.iter().enumerate().all(|(i, &b)| b == 0 || admitted(i)) && exec::frame::POINTERS.into_iter().all(in_text)

@@ -523,8 +523,11 @@ six self-loop programs, `emitted_value` aside), patch 0009:
   word 12 did not), whose record gives the guest RIP. (State.rip is stale after a linked edge, which skips the exit's store,
   as in FEX: the header, not State.rip, names the block.) Nothing of the block's body ran.
   (3) The host banks that state itself (or resumes the resident at a banking routine), and to continue restores RW and
-  re-enters, which retries the store. `hv_vcpus_exit` stays an imprecise watchdog. (4) Until the host stop path exists the
-  region may be ordinary writable memory (as today: the store hits a harmless word of the frame page).
+  re-enters, which retries the store. `hv_vcpus_exit` stays an imprecise watchdog. (4) Built (slice 3, S3b2): x28 = the
+  frame page + 0x400 (abi `execution::FRAME_POINTER`), so every admitted field stays in the frame page and the stop store
+  lands alone in the next page, mapped to the vCPU's own stop granule (abi `STOP_OFFSET`, 16 KiB of the window holding
+  nothing else); the host enters the resident's stop gate, which banks the entry state and drains (host `execution::Stops`,
+  runtime `stopped`). No FEX change: every frame offset is x28-relative.
 - **Admission** (`structure.rs`, rule "Entry"): the word at offset 12 is exactly `0xf907639f` (`str xzr, [x28, #3776]`) preceded
   by `str x0, [x28]`; any access (load, store, narrower, other register) overlapping those 8 bytes anywhere else is refused. The
   rule has its own constant (3776) and is not a member of `frame::FIELDS`; see the S2c integration note in the file.

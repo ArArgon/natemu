@@ -21,6 +21,10 @@ struct HvExit {
 #[link(name = "Hypervisor", kind = "framework")]
 unsafe extern "C" {
     fn hv_vm_create(config: *const c_void) -> i32;
+    fn hv_vm_config_create() -> *mut c_void;
+    fn hv_vm_config_get_ipa_granule(config: *const c_void, granule: *mut u32) -> i32;
+    fn hv_vm_protect(ipa: u64, size: usize, flags: u64) -> i32;
+    fn os_release(object: *mut c_void);
     fn hv_vm_destroy() -> i32;
     fn hv_vm_map(address: *const c_void, ipa: u64, size: usize, flags: u64) -> i32;
     fn hv_vcpu_create(vcpu: *mut u64, exit: *mut *const HvExit, config: *const c_void) -> i32;
@@ -66,14 +70,37 @@ pub(crate) fn exit_vcpus(ids: &mut [u64]) -> i32 {
     unsafe { hv_vcpus_exit(ids.as_mut_ptr(), ids.len() as u32) }
 }
 
+/// Guest memory rights of [`protect`]: as mapped (read/write/execute), or read-only.
+pub(crate) const MAPPED: u64 = 7;
+pub(crate) const READ_ONLY: u64 = 1;
+/// Sets the stage-2 rights of `[ipa, ipa + size)` (granule-aligned) for every vCPU, running ones included.
+pub(crate) fn protect(ipa: u64, size: usize, rights: u64) -> Result<()> {
+    unsafe { hv(hv_vm_protect(ipa, size, rights), "hv_vm_protect") }
+}
+
 /// The process VM with all of `memory` mapped read/write/execute at `IPA`.
-pub(crate) struct Machine(());
+pub(crate) struct Machine {
+    /// Bytes of the stage-2 (IPA) granule: the unit of [`protect`].
+    pub(crate) granule: usize,
+}
 impl Machine {
     pub(crate) fn create(memory: &Memory) -> Result<Self> {
         memory.flush_instruction_cache();
-        unsafe { hv(hv_vm_create(ptr::null()), "hv_vm_create")? };
-        let machine = Self(());
-        unsafe { hv(hv_vm_map(memory.0.cast(), IPA, memory.1, 7), "hv_vm_map")? };
+        let mut granule = u32::MAX;
+        unsafe {
+            // The default configuration; its IPA granule is the VM's.
+            let config = hv_vm_config_create();
+            let read = hv(hv_vm_config_get_ipa_granule(config, &mut granule), "hv_vm_config_get_ipa_granule");
+            let created = read.and_then(|()| hv(hv_vm_create(config), "hv_vm_create"));
+            os_release(config);
+            created?;
+        }
+        // HV_IPA_GRANULE_4KB, HV_IPA_GRANULE_16KB.
+        let machine = Self { granule: if granule == 0 { 4096 } else { 16384 } };
+        if granule > 1 {
+            return Err(format!("unknown IPA granule {granule}"));
+        }
+        unsafe { hv(hv_vm_map(memory.0.cast(), IPA, memory.1, MAPPED), "hv_vm_map")? };
         Ok(machine)
     }
     /// Destroys the VM now and returns the framework status.
@@ -91,7 +118,9 @@ impl Drop for Machine {
 }
 
 pub(crate) const PC: u32 = 31;
-const CPSR: u32 = 34;
+pub(crate) const CPSR: u32 = 34;
+pub(crate) const SPSR_EL1: u16 = 0xc200;
+pub(crate) const ELR_EL1: u16 = 0xc201;
 pub(crate) const ID_AA64ISAR0_EL1: u16 = 0xc030;
 const SCTLR_EL1: u16 = 0xc080;
 const ACTLR_EL1: u16 = 0xc081;
@@ -99,6 +128,16 @@ const CPACR_EL1: u16 = 0xc082;
 const CNTV_CTL_EL0: u16 = 0xdf19;
 /// TCR_EL1 for the single lower private root (TTBR1 walks disabled).
 pub(crate) const SINGLE_ROOT_TCR: u64 = 16 | 1 << 8 | 1 << 10 | 3 << 12 | 1 << 23 | 2 << 32;
+
+/// Why `hv_vcpu_run` returned.
+pub(crate) enum Exit {
+    /// An HVC with this immediate (PC is after it).
+    Hvc(u64),
+    /// The host forced the exit ([`exit_vcpus`]).
+    Cancelled,
+    /// A stage-2 data abort (EC 0x24) with its syndrome and IPA; PC is the faulting instruction.
+    Stage2 { syndrome: u64, ipa: u64 },
+}
 
 pub(crate) struct Vcpu {
     id: u64,
@@ -178,30 +217,31 @@ impl Vcpu {
     /// Runs until the next exit and returns its HVC immediate; any other exit is
     /// an error reporting the exit and PC.
     pub(crate) fn run_to_hvc(&self) -> Result<u64> {
-        self.run_until_exit()?.ok_or_else(|| "vCPU exit requested by the host".into())
+        match self.run_until_exit()? {
+            Exit::Hvc(immediate) => Ok(immediate),
+            Exit::Cancelled => Err("vCPU exit requested by the host".into()),
+            Exit::Stage2 { syndrome, ipa } => Err(self.unexpected(1, syndrome, ipa)),
+        }
     }
-    /// Runs until the next exit: its HVC immediate, or `None` when the host forced the exit
-    /// ([`exit_vcpus`]); any other exit is an error reporting the exit and PC.
-    pub(crate) fn run_until_exit(&self) -> Result<Option<u64>> {
+    /// Runs until the next exit: an HVC, a forced exit ([`exit_vcpus`]) or a stage-2 data abort (EC 0x24); any
+    /// other exit is an error reporting the exit and PC.
+    pub(crate) fn run_until_exit(&self) -> Result<Exit> {
         const CANCELED: u32 = 0;
         unsafe {
             hv(hv_vcpu_run(self.id), "hv_vcpu_run")?;
             let exit = &*self.exit;
-            if exit.reason == CANCELED {
-                return Ok(None);
+            let (syndrome, ipa) = (exit.exception.syndrome, exit.exception.physical_address);
+            match (exit.reason, syndrome >> 26) {
+                (CANCELED, _) => Ok(Exit::Cancelled),
+                (1, 0x16) => Ok(Exit::Hvc(syndrome & 0xffff)),
+                (1, 0x24) => Ok(Exit::Stage2 { syndrome, ipa }),
+                (reason, _) => Err(self.unexpected(reason, syndrome, ipa)),
             }
-            if exit.reason != 1 || exit.exception.syndrome >> 26 != 0x16 {
-                return Err(format!(
-                    "unexpected exit: reason={} syndrome={:#x} PC={:#x} VA={:#x} IPA={:#x}",
-                    exit.reason,
-                    exit.exception.syndrome,
-                    self.reg(PC)?,
-                    exit.exception.virtual_address,
-                    exit.exception.physical_address
-                ));
-            }
-            Ok(Some(exit.exception.syndrome & 0xffff))
         }
+    }
+    fn unexpected(&self, reason: u32, syndrome: u64, ipa: u64) -> String {
+        let va = unsafe { (*self.exit).exception.virtual_address };
+        format!("unexpected exit: reason={reason} syndrome={syndrome:#x} PC={:#x} VA={va:#x} IPA={ipa:#x}", self.reg(PC).unwrap_or(0))
     }
     /// Destroys the vCPU now and returns the framework status.
     pub(crate) fn destroy(&mut self) -> i32 {

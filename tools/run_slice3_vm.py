@@ -6,6 +6,8 @@
     tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR smp [--cpus 2 3 4] [--programs a,b] [--reps R]
         [--parallel P] [--max-block N]
     tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR limits
+    tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR kicks [--cpus 1 2 4] [--kicks M] [--iterations I]
+        [--parallel P] [--reps R]
 
 `corpora`: the single-vCPU corpora — the slice-1 fixtures, the control-flow corpus (default: the S2d run's
 programs and QEMU results under NATEMU_RAW_ROOT/s2d/corpus) and the slice-1 fault cases (QEMU prefix references, as
@@ -22,6 +24,18 @@ oversubscribed and migrate between cores.
 shared address space, judged against tools/bench/smp/model_smp.py with smp.compare. Programs using an instruction the
 general path does not admit yet are reported `unsupported` when a vCPU stops on it (`unsupported_form`): handshake
 and token-ring spin with PAUSE, xchg-lock needs memory XCHG (S3e). Run to the end, they are judged like the others.
+
+`kicks` (S3b, precise stop): (1) a hot linked loop (no exit once linked) on each of N vCPUs (own registers, shared
+code page), every vCPU kicked M times (default 10,000) by its own host kicker thread, R runs of it, P at once (P * N
+above the core count: oversubscribed); (2) a peer's resident kick: vCPU 1 writes data on vCPU 0's code page while vCPU
+0 spins in its hot loop, so vCPU 1's resident posts the page to vCPU 0 and kicks it (`hvc #KICK_HVC`); (3) forged stop
+PCs: vCPU V's first stop enters the stop gate with ELR = the word after the stop store, which must halt V (bad_stop)
+and cancel the others. Programs are natemu-smp-v1; the reference is a pinned QEMU system-mode run of the same program
+(tools/bench/smp, `-accel tcg,thread=multi`), compared with smp.compare. Per vCPU: reached its end, the per-vCPU checks,
+stops taken = kicks issued - a kick still pending at its end (none lost or doubled; kicks finding it in the host
+included), the resident's stop count = the host's, every stop PC a stop store of a placed block, and (hot loop) all M
+kicks issued while it ran. Latency (protect return -> stop exit, per vCPU) is reported. `corpora --kicks M` also kicks
+every vCPU M times (mostly while it is in the host or the resident) and adds the same accounting checks.
 
 `limits`: 5 vCPUs are refused (0 cannot be written: a description without `cpu` lines is one vCPU; the host's
 `prepare` refuses 0 in its unit test); a forged block header on vCPU V of 4 (V = 0..3; the others spin in a linked
@@ -46,6 +60,18 @@ def driver(host, runtime, fexc, text, work, extra=()):
     run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work, *map(str, extra)], capture_output=True, text=True)
     out = json.loads(run.stdout) if run.returncode == 0 else None
     return run.returncode, out, run.stderr[-2000:]
+
+
+def kick_checks(out, kicks=None):
+    """Kick accounting of one vCPU's output (`kicks`: every kick must have been issued)."""
+    k, problems = out.get('kicks'), []
+    if k is None: return ['no kick report']
+    if k['stops'] + k['pending'] != k['issued']: problems.append(f"stops {k['stops']} + pending {k['pending']} != issued {k['issued']}")
+    if k['merged']: problems.append(f"{k['merged']} kicks merged")
+    if out['stats']['stops'] != k['stops']: problems.append(f"resident stops {out['stats']['stops']} != host {k['stops']}")
+    if not k['stops_at_entry']: problems.append(f"stop PCs not at stop stores: {k['stop_pcs']}")
+    if kicks is not None and k['issued'] != kicks: problems.append(f"{k['issued']} of {kicks} kicks issued before the end")
+    return problems
 
 
 def per_vcpu_checks(out):
@@ -104,6 +130,7 @@ def cmd_corpora(a, host, runtime):
         order += order[:(-len(order)) % n]          # the last group is filled from the start
         groups = [order[i:i + n] for i in range(0, len(order), n)]
         limit = [a.max_block] if a.max_block else []
+        if a.kicks: limit += [x for v in range(n) for x in ('--kick-vcpu', v)] + ['--kicks', a.kicks]
         texts = [(f'n{n}g{i}', ''.join('cpu\n' + text for _, text, _ in g), limit) for i, g in enumerate(groups)]
 
         def judge(i, rc, out, err, groups=groups, n=n):
@@ -115,9 +142,9 @@ def cmd_corpora(a, host, runtime):
                 else:
                     cpu = out['cpus'][v]
                     outcome, diffs = evaluate(cpu)
-                    diffs = list(diffs) + per_vcpu_checks(cpu)
+                    diffs = list(diffs) + per_vcpu_checks(cpu) + (kick_checks(cpu) if a.kicks else [])
                     if outcome == 'match' and diffs: outcome = 'fail'
-                    e.update(outcome=outcome, diffs=diffs, stop=cpu['stop'], stats=cpu['stats'])
+                    e.update(outcome=outcome, diffs=diffs, stop=cpu['stop'], stats=cpu['stats'], kicks=cpu.get('kicks'))
                 entries.append(e)
             return entries
         entries = run_groups(a, host, runtime, texts, judge)
@@ -125,6 +152,10 @@ def cmd_corpora(a, host, runtime):
         for e in entries:
             if e['outcome'] == 'fail': print(f"N={n} g{e['group']} vcpu{e['vcpu']} {e['name']}: {'; '.join(e['diffs'])[:300]}", flush=True)
         print(f'N={n}: {len(groups)} runs, {dict(counts)}', flush=True)
+        if a.kicks:
+            ks = [e['kicks'] for e in entries if e.get('kicks')]
+            print(f"N={n} kicks: issued {sum(k['issued'] for k in ks)}, in host {sum(k['in_host'] for k in ks)}, "
+                  f"stops {sum(k['stops'] for k in ks)}, pending at end {sum(k['pending'] for k in ks)}", flush=True)
         failed += counts['fail']
         results += entries
     (a.out / 'corpora.json').write_text(json.dumps({'results': results}, indent=1, default=str) + '\n')
@@ -208,9 +239,119 @@ def cmd_limits(a, host, runtime):
     return len(failures)
 
 
+HOT = ref.assemble('1: add rax, rcx\nxor rdx, rax\nrol rdx, 7\ndec rcx\njnz 1b').hex()
+
+
+def stack(v):
+    """vCPU v's RSP: the reference's capture sequence uses the stack (as tools/bench/smp's programs)."""
+    return f'{0x3e1800 + 0x2000 * v:#x}'
+
+
+def hot_program(n, iterations):
+    """N vCPUs, each in the hot loop on its own registers (shared code page, no memory)."""
+    cpus = [{'rip': '0x110000', 'rflags': 0,
+             'gpr': [f'{0x9e3779b97f4a7c15 * (v + 1) & (2**64 - 1):#x}', f'{iterations + 7 * v:#x}', '0x0', '0x0', stack(v)] + ['0x0'] * 11}
+            for v in range(n)]
+    return {'name': f'hot@{n}', 'ncpu': n, 'bodies': [{'addr': '0x110000', 'code': HOT}], 'cpus': cpus,
+            'memory': [{'addr': '0x120000', 'size': 64, 'fill': 'zero'}], 'params': {}, 'format': 'natemu-smp-v1'}
+
+
+def peer_program(iterations):
+    """vCPU 0: set the flag at 0x120000, then the hot loop (its first block, flag store to jnz, is placed before the
+    store runs, so the code page is marked before the flag is seen). vCPU 1 (own code page): wait for the flag, then
+    spin 2 * 10^6 iterations (vCPU 0 is then in its hot loop) and store rcx to 0x110800 (data on vCPU 0's code page) 64
+    times: the first store posts the page to vCPU 0 and kicks it, which drops its running loop block and translates it
+    again."""
+    cpu0 = ref.assemble('mov byte ptr [0x120000], 1').hex() + HOT
+    cpu1 = ref.assemble('1: cmp byte ptr [0x120000], 0\nje 1b\nmov ecx, 2000000\n3: dec ecx\njnz 3b\n'
+                        'mov ecx, 64\n2: mov [0x110800], rcx\ndec rcx\njnz 2b').hex()
+    gpr = lambda *v: [f'{x:#x}' for x in v] + ['0x0'] * (16 - len(v))
+    return {'name': 'peer-kick@2', 'ncpu': 2, 'params': {}, 'format': 'natemu-smp-v1',
+            'bodies': [{'addr': '0x110000', 'code': cpu0}, {'addr': '0x111000', 'code': cpu1}],
+            'cpus': [{'rip': '0x110000', 'rflags': 0, 'gpr': gpr(0x1234567, iterations, 0, 0, 0x3e1800)},
+                     {'rip': '0x111000', 'rflags': 0, 'gpr': gpr(0, 0, 0, 0, 0x3e3800)}],
+            'memory': [{'addr': '0x120000', 'size': 64, 'fill': 'zero'}, {'addr': '0x110800', 'size': 8, 'fill': 'zero'}]}
+
+
+def qemu_reference(prog, work):
+    """The program's final state under pinned QEMU system mode (smp.parse_dump form)."""
+    rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, smp.build_stub(work)), work, 'multi', timeout=600)
+    if rc != 1: raise RuntimeError(f'QEMU {prog["name"]}: {rc} {err}')
+    return smp.parse_dump(prog, dump)
+
+
+def judge_smp(prog, want, out, kicks):
+    """Differences of a natemu run of `prog` from QEMU's `want`; `kicks[v]`: kicks vCPU v must have been issued (None:
+    no count required)."""
+    diffs = []
+    cpus = out['cpus']
+    for v, (c, cpu) in enumerate(zip(prog['cpus'], cpus)):
+        end = body_end(prog, smp.num(c['rip']))
+        if cpu['stop'] != 'reached' or smp.num(cpu['rip']) != end:
+            diffs.append(f"cpu{v} stopped {cpu['stop']} {cpu['reason']} at {cpu['rip']} (end {end:#x})")
+        diffs += [f'cpu{v} ' + d for d in per_vcpu_checks(cpu) + kick_checks(cpu, kicks[v])]
+    memory = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in cpus[0]['memory']}
+    got = {'cpus': [{'gpr': [smp.num(x) for x in cpu['gpr']], 'rflags': smp.num(cpu['rflags'])} for cpu in cpus],
+           'memory': [{'addr': smp.num(r['addr']), 'data': memory[smp.num(r['addr'])]} for r in prog['memory'] if r.get('capture', True)]}
+    return diffs + smp.compare(prog, got, want)
+
+
+def cmd_kicks(a, host, runtime):
+    failures, report = [], {'hot': [], 'peer': [], 'forge': []}
+    for n in a.cpus:
+        prog = hot_program(n, a.iterations)
+        want = qemu_reference(prog, a.out / 'qemu' / prog['name'])
+        extra = [x for v in range(n) for x in ('--kick-vcpu', v)] + ['--kicks', a.kicks]
+        groups = [(f"{prog['name']}-{r}", smp_description(prog), extra) for r in range(a.reps)]
+
+        def judge(i, rc, out, err, prog=prog, want=want, n=n):
+            e = {'name': prog['name'], 'rep': i}
+            if rc: return [{**e, 'diffs': [f'driver exit {rc}: {err.strip()[-300:]}']}]
+            return [{**e, 'diffs': judge_smp(prog, want, out, [a.kicks] * n), 'kicks': [c['kicks'] for c in out['cpus']],
+                     'stats': [{k: c['stats'][k] for k in ('blocks', 'fast', 'requests', 'stops', 'linker')} for c in out['cpus']]}]
+        entries = run_groups(a, host, runtime, groups, judge)
+        for e in entries:
+            ks = e.get('kicks', [])
+            lat = [k['latency_ns'] for k in ks]
+            print(f"{e['name']} rep{e['rep']}: {'ok' if not e['diffs'] else 'FAIL ' + '; '.join(e['diffs'])[:400]}; "
+                  f"issued {[k['issued'] for k in ks]} in_host {[k['in_host'] for k in ks]} stops {[k['stops'] for k in ks]}; "
+                  f"latency p50/p99/p999/max us {[(l['p50'] / 1e3, l['p99'] / 1e3, l['p999'] / 1e3, l['max'] / 1e3) for l in lat]}", flush=True)
+            failures += [f"{e['name']} rep{e['rep']}: {d}" for d in e['diffs']]
+        report['hot'] += entries
+    # A peer's resident kick: no host kicker; vCPU 0 must take at least one stop and drop its blocks from the page.
+    prog = peer_program(a.iterations)
+    want = qemu_reference(prog, a.out / 'qemu' / prog['name'])
+    for r in range(a.reps):
+        rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f'peer-{r}')
+        diffs = [f'driver exit {rc}: {err.strip()[-300:]}'] if rc else judge_smp(prog, want, out, [None, None])
+        if not rc:
+            k0, st0 = out['cpus'][0]['kicks'], out['cpus'][0]['stats']
+            if k0['issued'] < 1 or k0['stops'] < 1 or st0['requests'] < 3:
+                diffs.append(f'vCPU 0 not stopped by the peer, or its loop not translated again: {k0} {st0}')
+        report['peer'].append({'rep': r, 'diffs': diffs, 'kicks': out and [c['kicks'] for c in out['cpus']],
+                               'stats': out and [c['stats'] for c in out['cpus']]})
+        print(f"peer-kick rep{r}: {'ok' if not diffs else 'FAIL ' + '; '.join(diffs)[:400]}; "
+              f"vCPU 0 kicks {out and {k: out['cpus'][0]['kicks'][k] for k in ('issued', 'in_host', 'stops', 'pending')}}, "
+              f"requests {out and out['cpus'][0]['stats']['requests']}", flush=True)
+        failures += [f'peer rep{r}: {d}' for d in diffs]
+    # Forged stop PC on each vCPU of 4: it halts with bad_stop, the others are cancelled.
+    prog = hot_program(4, a.iterations)
+    for v in range(4):
+        rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f'forge{v}',
+                              ['--kick-vcpu', v, '--kicks', 1, '--forge-stop', '--tamper-vcpu', v])
+        stops = [(c['stop'], c['reason']) for c in out['cpus']] if out else None
+        want_stops = [('resident', 'bad_stop status=1 detail=11') if w == v else ('cancelled', '') for w in range(4)]
+        ok = rc == 0 and stops == want_stops and out['cpus'][v]['tampered']
+        report['forge'].append({'vcpu': v, 'returncode': rc, 'stops': stops, 'native': out and out['cpus'][v]['native']})
+        print(f'forged stop on vCPU {v}: {"ok" if ok else "FAIL"} {stops}', flush=True)
+        if not ok: failures.append(f'forged stop on vCPU {v}: {rc} {stops} {err.strip()[-200:]}')
+    (a.out / 'kicks.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
+    return len(failures)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=['corpora', 'smp', 'limits'])
+    ap.add_argument('mode', choices=['corpora', 'smp', 'limits', 'kicks'])
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--cpus', type=int, nargs='+', default=[2, 3, 4])
@@ -223,10 +364,13 @@ def main():
     ap.add_argument('--no-faults', action='store_true')
     ap.add_argument('--programs', type=lambda s: s.split(','))
     ap.add_argument('--reps', type=int, default=1)
+    ap.add_argument('--kicks', type=int, help='kicks per vCPU (kicks: default 10000; corpora: off unless given)')
+    ap.add_argument('--iterations', type=int, default=400_000_000, help='hot-loop iterations per vCPU (kicks)')
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     host, runtime = vm.build()
-    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'limits': cmd_limits}[a.mode](a, host, runtime)
+    if a.mode == 'kicks' and a.kicks is None: a.kicks = 10_000
+    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'limits': cmd_limits, 'kicks': cmd_kicks}[a.mode](a, host, runtime)
     print('failures:', failed)
     sys.exit(1 if failed else 0)
 

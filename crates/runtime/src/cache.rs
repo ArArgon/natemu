@@ -341,22 +341,27 @@ fn unlink(r: LinkRecord) -> Option<()> {
 }
 
 /// This vCPU is about to write `gpa`'s page, which holds translations: clears every vCPU's code bit of the page at
-/// once, posts the page to each other vCPU that had one (page bit, then `PAGES`; it drops its blocks at its next
-/// resident entry) and invalidates this vCPU's own blocks from it ([`invalidate`]).
-// ponytail: no kick and no re-check after the write; prompt cross-vCPU invalidation is slice 3's S3b/S3d.
+/// once, posts the page to each other vCPU that had one (page bit, then `PAGES`, then a kick: it drops its blocks at
+/// its next block entry) and invalidates this vCPU's own blocks from it ([`invalidate`]).
+// ponytail: no re-check after the write; that is S3d's.
 pub fn written(gpa: u64) -> Option<u64> {
     if let Some(m) = code_page(gpa) {
         post(m.swap(0, SeqCst) & !own(), gpa);
     }
     invalidate(gpa)
 }
-/// Posts `gpa`'s page to the vCPUs whose bits are set in `peers`.
+/// Posts `gpa`'s page to the vCPUs whose bits are set in `peers` and kicks them.
 fn post(peers: u8, gpa: u64) {
     let page = (gpa >> 12) as usize;
     for v in (0..MAX_VCPUS).filter(|v| peers & 1 << v != 0) {
         record_word(v, Some(page / 64)).fetch_or(1 << (page % 64), SeqCst);
         record_word(v, None).fetch_or(PAGES, SeqCst);
+        kick(v);
     }
+}
+/// Asks the host to stop vCPU `v` at its next block entry (it then drains its record); returns at once.
+pub fn kick(v: usize) {
+    unsafe { asm!("dsb sy", "hvc #{imm}", imm = const natemu_abi::execution::KICK_HVC, in("x0") v) };
 }
 
 /// Invalidates every live block of this vCPU translated from `gpa`'s page (the page is about to be written, or was):
