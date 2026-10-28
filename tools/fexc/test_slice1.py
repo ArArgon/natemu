@@ -1,6 +1,6 @@
 """S1c checks: profile slice1 of fexc (block cutting at an allowlist, single-gate exits, profile record).
 
-Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series5 build)
+Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series7 build)
 
 The x86 bytes below are assembled by hand and only drive the compiler; every expectation (where the block ends, why)
 comes from the instruction's architectural class, never from fexc's output. The cut position is also compared with a
@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402  (disassemble, object reader)
 import scan_skips  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series5/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series7/obj/fexc')
 REPO = HERE.parents[1]
 RIP = 0x102000
 PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
@@ -385,6 +385,69 @@ class Slice1DivisionChecks(unittest.TestCase):
                 bad = dict(d, code=dict(d['code'], hex=(code[:o] + w.to_bytes(4, 'little') + code[o + 4:]).hex()))
                 problems = vp.verify(bad, Path(t))[0]
                 self.assertTrue(any(why in m for m in problems), (text, problems))
+
+
+@unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
+class Slice1SelfLoopsAndStop(unittest.TestCase):
+    """S2c0: a jcc back to its own block's entry exits like any taken edge; every block starts with the pinned stop store."""
+    STOP = 0xf907639f   # str xzr, [x28, #3776]
+
+    def test_self_loop_exits(self):
+        body = '4883c001' + '48ffc9'   # add rax,1 ; dec rcx  (7 bytes)
+        import verify_precision as vp
+        with tempfile.TemporaryDirectory() as t:
+            for cc in range(16):
+                for name, jcc, size in (('rel8', f'{0x70 + cc:02x}f7', 2), ('rel32', f'0f{0x80 + cc:02x}f3ffffff', 6)):
+                    with self.subTest(f'j{cc:x} {name}'):
+                        d, rc = run(body + jcc)
+                        self.assertEqual((rc, d['guest']['instructions_translated']), (0, 3))
+                        n, _ = check_exits(self, d, Path(t), name)
+                        self.assertEqual(n, 2)                                # taken and fall-through gates
+                        lits = sorted(r['guest_rip'] for r in d['code']['relocations'] if r['kind'] == 'guest_rip_literal')
+                        self.assertIn(hex(RIP), lits)                         # the taken edge exits to the block's own entry
+                        self.assertIn(hex(RIP + 7 + size), lits)
+                        code = bytes.fromhex(d['code']['hex'])
+                        end = d['code']['layout']['code_region_end']
+                        lit = [(r['offset'], r['size']) for r in d['code']['relocations'] if r['size']]
+                        dis = check_sites.disassemble(code, end, Path(t), lit)
+                        self.assertEqual(vp.entry_and_branches(d, dis, sorted(dis)), [])   # P12, P13
+
+    def test_stop_store_is_the_third_prologue_word_of_every_block(self):
+        for name, x in list(BRANCHES.items()) + [('add', '4801d8'), ('push', '50'), ('mov [rax],rcx', '488908'), ('div', '48f7f1')]:
+            with self.subTest(name):
+                d, rc = run(x)
+                self.assertEqual(rc, 0)
+                code = bytes.fromhex(d['code']['hex'])
+                self.assertEqual(d['state_abi']['state_offsets']['natemu_interrupt_fault_page'], 3776)
+                self.assertEqual(int.from_bytes(code[12:16], 'little'), self.STOP)
+                self.assertEqual(d['code']['layout']['entries'][0]['body_native_offset'], 16)
+                self.assertEqual(int.from_bytes(code[8:12], 'little'), 0xf900_0380)   # str x0, [x28]
+                words = [int.from_bytes(code[o:o + 4], 'little') for o in range(16, d['code']['layout']['code_region_end'], 4)]
+                self.assertNotIn(self.STOP, words)                                      # only at the entry
+
+    def test_p12_p13_mutations(self):
+        import verify_precision as vp
+        d, _ = run('4883c001' + '48ffc9' + '75f7')
+        with tempfile.TemporaryDirectory() as t:
+            code = bytes.fromhex(d['code']['hex'])
+            end = d['code']['layout']['code_region_end']
+            lit = [(r['offset'], r['size']) for r in d['code']['relocations'] if r['size']]
+            dis = check_sites.disassemble(code, end, Path(t), lit)
+            order = sorted(dis)
+            self.assertEqual(vp.entry_and_branches(d, dis, order), [])
+            nop = 'mov x0, x0'
+            for what, mutate, why in (
+                    ('stop store removed', lambda m: m.update({12: nop}), 'pinned entry sequence'),
+                    ('wrong field', lambda m: m.update({12: 'str xzr, [x28, #0xec8]'}), 'pinned entry sequence'),
+                    ('wrong register', lambda m: m.update({12: 'str x0, [x28, #0xec0]'}), 'pinned entry sequence'),
+                    ('moved to the second word', lambda m: m.update({8: m[12], 12: m[8]}), 'pinned entry sequence'),
+                    ('a second store later', lambda m: m.update({0x14: 'str xzr, [x28, #0xec0]'}), 'interrupt-fault word'),
+                    ('a load of it', lambda m: m.update({0x14: 'ldr x1, [x28, #0xec0]'}), 'interrupt-fault word'),
+                    ('backward branch to the entry body', lambda m: m.update({0x28: 'b.ne 0x10'}), 'not a forward branch')):
+                bad = dict(dis)
+                mutate(bad)
+                problems = vp.entry_and_branches(d, bad, sorted(bad))
+                self.assertTrue(any(why in m for m in problems), (what, problems))
 
 
 if __name__ == '__main__':

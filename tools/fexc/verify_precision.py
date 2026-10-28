@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1b1 check: the slice-1 precision guarantee, verified statically on the code fexc emits (profile slice1).
 
-usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series5 build)
+usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series7 build)
 
 Corpora: fixtures/slice1/programs.json, the single-instruction matrix of scan_skips.py, the adversarial programs below
 (one per precision patch), and every CORPUS.json given (gen_slice1.py format, e.g. a fresh `--seed` corpus).
@@ -43,6 +43,12 @@ For every compile, from the disassembly, the sites, the dense PC table and the s
       each divide branch then give the state before the instruction, relying on the helper's contract (only x0-x3
       change; NZCV kept; the runtime's natemu_ludiv). Admission (crates/host/src/admission/structure.rs) checks the
       same forms on every block it admits.
+  P12 (S2c0, see entry_and_branches()): the entry prologue is exactly `adr x0, header; str x0, [x28]; str xzr, [x28,
+      #natemu_interrupt_fault_page]` followed by the first guest instruction (no spill, no TF check): the runtime stops a vCPU at
+      the next block entry by protecting the page that store targets, and the state there is the entry state. No other
+      access to those 8 bytes anywhere in the block;
+  P13 (S2c0): every branch in the block goes forward to an instruction of the code region, so a block never loops
+      internally: a jcc back to its own entry exits through the gate like any taken edge (no multiblock, no self-loop).
 Assumption by construction, NOT checked: every static-register write of guest instruction k-1 is emitted before the PC-table
 entry of instruction k. P1 sees only the window from an instruction's start to its site, so a write of an earlier
 instruction that was sunk past the next instruction's start would be flagged only if it lands before that site, and one
@@ -65,7 +71,7 @@ import check_sites, scan_skips  # noqa: E402
 from check_sites import code_vs_sites  # noqa: E402
 import flags as F  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series5/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series7/obj/fexc')
 
 NZCV_WRITERS = {'adds', 'adcs', 'subs', 'sbcs', 'ands', 'bics', 'negs', 'ngcs', 'cmp', 'cmn', 'tst', 'ccmp', 'ccmn', 'fcmp',
                 'fcmpe', 'fccmp', 'fccmpe', 'setf8', 'setf16', 'rmif', 'cfinv', 'axflag', 'xaflag'}
@@ -573,6 +579,32 @@ def divides(d, dis, order, stubs, check_at):
     return out, ok
 
 
+def entry_and_branches(d, dis, order):
+    """P12 and P13 on one compile."""
+    out = []
+    stop = d['state_abi']['state_offsets'].get('natemu_interrupt_fault_page')
+    if stop is None:
+        return ['state_abi has no natemu_interrupt_fault_page']
+    want = {4: lambda t: re.fullmatch(r'adr x0, 0x[0-9a-f]+', t) is not None, 8: lambda t: t == 'str x0, [x28]',
+            12: lambda t: t == f'str xzr, [x28, #{stop:#x}]'}
+    for off, ok in want.items():
+        if not ok(dis.get(off, '')):
+            out.append(f'prologue +{off}: "{dis.get(off)}" is not the pinned entry sequence (stop store at {stop})')
+    le = d['code']['layout']['entries'][0]
+    if (le['entry_native_offset'], le['body_native_offset']) != (4, 16) or d['code']['layout']['spill_bytes']:
+        out.append(f'entry prologue is [{le["entry_native_offset"]}, {le["body_native_offset"]}) with {d["code"]["layout"]["spill_bytes"]} spill bytes, not [4, 16) (spill or TF check in the prologue)')
+    for off in order:
+        acc = check_sites.native_access(dis[off])
+        if acc and acc[2] == 'x28' and acc[4] < stop + 8 and stop < acc[4] + acc[1] and off != 12:
+            out.append(f'+{off} "{dis[off]}" touches the interrupt-fault word')
+        mn = dis[off].split(' ')[0]
+        if mn in ('b', 'cbz', 'cbnz', 'tbz', 'tbnz') or mn.startswith('b.'):
+            t = int(re.findall(r'0x([0-9a-f]+)$', dis[off])[0], 16)
+            if t <= off or t not in dis:
+                out.append(f'+{off} "{dis[off]}" is not a forward branch to an instruction of the block')
+    return out
+
+
 def verify(d, tmp, insns=None):
     """Violations of P1-P10 for one compile result (P6 needs the generator's annotations `insns`), and the check cost."""
     out = []
@@ -589,6 +621,7 @@ def verify(d, tmp, insns=None):
     name = lambda r: ('x%d' if r[0] == 'x' else 'v%d') % r[1]
     gout, check_at, cost_ = guards(d, dis, order)   # P8-P10; check_at: stub -> the branch that reaches it
     out += gout
+    out += entry_and_branches(d, dis, order)   # P12, P13
     by_insn = {}
     for s in d['sites']:
         g, at, start = s['guest_offset'], s['native_offset'], s['insn_native_offset']

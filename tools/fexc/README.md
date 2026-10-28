@@ -26,10 +26,10 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as eight commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as nine commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series6` (series5 plus `--serve`, no patch change). Kept for comparison only: `series5`, `series4`
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series7` (series6 plus patch 0009). Kept for comparison only: `series6` (patches 0001-0008, before self-loop exits and the stop check), `series5`, `series4`
 (patches 0001-0007, before division), `series2` (patches 0001-0006, the "before" of the guard cost), `s1c` (slice1
 without the precision patches, the "before" of the precision cost) and `c1b` (the v1 build without sites). The earlier `series1` (flag rule before the cheaper one below) and `s1b1` are gone.
 
@@ -56,6 +56,7 @@ Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--v
 | 0006 | slice1 precision (flag elimination, register allocation, pre-NZCV save) |
 | 0007 | slice1 address guard, split-store check, branch-target check (JIT hooks, pre-RA scan, `ret` without writeback) |
 | 0008 | slice1 #DE for div/idiv (width record in the dispatcher, check after FEX's LUDIV/LDIV call, divide ops as flag fault points) |
+| 0009 | slice1 self-loop exits (no `JumpTargets` lookup for the taken edge of jcc/jrcxz/loop) and FEX's pending-interrupt fault check at every block entry |
 
 Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in `shim/` and `fexc.cpp`; the patches only
 include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then
@@ -482,6 +483,50 @@ Cost per guest instruction (native words on the executed path, plus never-execut
 (idiv) on FEX's inline path, +1 after the helper call; the helper itself is about 600 instructions (one quotient bit per
 step) on the rare path whose dividend needs 128 bits.
 
+## Self-loops and the stop check (S2c0)
+
+Under `--profile slice1` only (default-profile JSON and objects identical to series6 on the 64 fixtures, the 629-form matrix and
+six self-loop programs, `emitted_value` aside), patch 0009:
+
+- **Self-loop exits.** `OpcodeDispatcher.cpp::CondJUMPOp`, `CondJUMPRCXOp` and `LoopOp` look the taken target up in `JumpTargets`
+  even with multiblock off; the one entry there is the block's own entry, so `1: add rax,1; dec rcx; jnz 1b` became a native
+  backward `b.ne` into the block (past the header store, skipping the prologue) with no exit for the taken edge. Under slice1 the
+  lookup is skipped (`fexc_slice1 ? JumpTargets.end() : find`), so the taken edge is an ordinary exit: `State.rip` literal and the
+  gate, to the block's own RIP. Every branch in a block is now forward (P13), and a conditional block has two exits. jrcxz/loop are
+  still cut (`unsupported_form`) until S2d allowlists them; with them allowlisted in a scratch build they compile to
+  `cbz/cbnz` forward to a taken exit plus a fall-through exit (`loop`: `sub x7,x7,#1; cbnz x7,T; b F`).
+- **Stop check.** `JIT.cpp::EmitSuspendInterruptCheck` emits FEX's `str xzr, [x28, #InterruptFaultPage]` only when
+  `Config.NeedsPendingInterruptFaultCheck` (gdbserver). Under slice1 it is always emitted, once, as the last word of
+  `EmitEntryPoint` (after `adr x0, header; str x0, [x28]`, no TF check and no spill slots here); the second use, before a backward
+  branch, never arises. Prologue before/after for `add rax,1; dec rcx; jnz 1b`:
+
+  ```
+  before: 4 adr x0,hdr  8 str x0,[x28]                              c adds x4,x4,#1 ... 24 b.ne 0xc  (backward)  28 exit gate
+  after:  4 adr x0,hdr  8 str x0,[x28]  c str xzr,[x28,#0xec0]     10 adds x4,x4,#1 ... 28 b.ne 0x44 (forward)  2c exit gate  44 exit gate
+  ```
+
+  The field is `offsetof(InternalThreadState, InterruptFaultPage) - offsetof(.., BaseFrameState)` = 3776 = `0xec0`, JSON
+  `state_abi.state_offsets.natemu_interrupt_fault_page` (slice1 only). FEX places that page directly after `CpuStateFrame`
+  (4 KiB aligned); we only need the 8 bytes at `x28 + 3776` to lie in a region of their own.
+- **What the runtime must provide.** (1) `x28 + 3776` (8 bytes) is mapped writable in the resident's stage-1 tables and its IPA
+  lies in a region that holds nothing else the vCPU or host writes, whose bounds are a multiple of the stage-2 granule (HVF
+  protects at host-page granularity, 16 KiB on Apple silicon; `hv_vm_protect` rejects anything else). Simplest layout: the
+  frame ends at a 16 KiB boundary S and the stop region is [S, S + 16 KiB), so x28 = S - 3776. The abi's 4096-byte frame
+  would then overlap the region's first 320 bytes, which no admitted field uses (highest is the division helper at 3032). (2) Armed,
+  the host `hv_vm_protect`s the region read-only; the next block entry's store takes a stage-2 permission data abort to the host
+  (EC 0x24, WnR = 1, HPFAR in the region, PC = the store at native offset 12 of a block) with the vCPU exactly at the block-entry
+  state: guest registers in the static map and NZCV in PSTATE, State.rip = the block's guest RIP (every entry follows an exit
+  that stored it), `InlineJITBlockHeader` already naming the block (word 8 ran, word 12 did not). Nothing of the block's body ran.
+  (3) The host banks that state itself (or resumes the resident at a banking routine), and to continue restores RW and
+  re-enters, which retries the store. `hv_vcpus_exit` stays an imprecise watchdog. (4) Until the host stop path exists the
+  region may be ordinary writable memory (as today: the store hits a harmless word of the frame page).
+- **Admission** (`structure.rs`, rule "Entry"): the word at offset 12 is exactly `0xf907639f` (`str xzr, [x28, #3776]`) preceded
+  by `str x0, [x28]`; any access (load, store, narrower, other register) overlapping those 8 bytes anywhere else is refused. The
+  rule has its own constant (3776) and is not a member of `frame::FIELDS`; see the S2c integration note in the file.
+- **Checks.** `verify_precision.py` P12/P13 on every compile; `test_slice1.py::Slice1SelfLoopsAndStop` (all 16 condition codes,
+  rel8 and rel32, the stop word in every form, mutations of P12/P13); the admission unit tests mutate the stop store (removed,
+  next/previous field, wrong register, 32-bit, moved, repeated, loaded).
+
 ## Checks
 
 - `python3 -m unittest tools/fexc/test_fexc.py`: structure, exact sites for hand-checked instructions, object file,
@@ -496,7 +541,7 @@ step) on the rare path whose dividend needs 128 bits.
   guards (P8-P10: guard on exactly the access address, split check on every store wider than 1 byte, stubs reached only by their checks,
   indirect targets checked before any state write; series2 fails them, series4 passes) and P11 (every div/idiv has exactly
   its per-width #DE checks in their exact form, on its divide's own operands, before its divide; every `blr` is the 128/64
-  helper call followed by its #DE branch). Admission (`crates/host/src/admission/structure.rs`) re-checks P8-P11 on the
+  helper call followed by its #DE branch), P12 (entry prologue and the stop store pinned, no other access to it) and P13 (every branch forward). Admission (`crates/host/src/admission/structure.rs`) re-checks P8-P11 on the
   native words of every block it admits.
 - `python3 tools/fexc/check_sites.py [--known-ok] [--slice1]`: the 64 reference programs; expected accesses from the fixture `asm`
   against the sites, sites against the `xcrun objdump` disassembly of the code (every load/store with a base other than

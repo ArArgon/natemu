@@ -21,6 +21,10 @@
 //!   before the access.
 //! - Split: every store wider than one byte has `add x0, xA, #w-1; eor x0, x0, xA; tbnz w0, #12, S` on exactly its
 //!   address, only x0/x1 written between it and the store (guest-RIP-addressed: `b S` iff it crosses a page).
+//! - Entry: the block's third prologue word is exactly `str xzr, [x28, #INTERRUPT_FAULT_PAGE]` after `str x0, [x28]`
+//!   (FEX's suspend/interrupt fault check): the runtime stops a vCPU by write-protecting the page that store targets,
+//!   so the stop is precise (the next block entry faults with the entry state intact). That word is the only access
+//!   to those 8 bytes, and every block has it.
 //! - Exits: every computed State.rip store has `eor x0, xR, xR, lsl #16; tbnz x0, #63, G` on its register in its
 //!   instruction (G a branch-target guard), a literal one follows `ldr xR, literal`.
 //! - Division: each div/idiv (from its x86 opcode: width, signedness) has exactly its per-width #DE checks, in their
@@ -213,6 +217,16 @@ fn memory(w: u32, at: u32) -> Option<Insn> {
 // Exact words of the fixed sequences.
 const LDR_GATE: u32 = 0xf940_0381 | (frame::DISPATCHER_LOOP_TOP / 8) << 10; // ldr x1, [x28, #DispatcherLoopTop]
 const BR_X1: u32 = 0xd61f_0020;
+/// `CpuStateFrame` offset of FEX's `InterruptFaultPage` (`offsetof(InternalThreadState, InterruptFaultPage) -
+/// offsetof(.., BaseFrameState)`, fexc's `state_abi.state_offsets.natemu_interrupt_fault_page`): the 8 bytes the runtime
+/// write-protects (inside a region of their own) to stop the vCPU at the next block entry.
+// TODO(S2c integration): move to `natemu_abi::execution::frame` (a const, NOT a member of `frame::FIELDS`: this rule is
+// the only access).
+const INTERRUPT_FAULT_PAGE: u32 = 3776;
+const STR_X0_HEADER: u32 = 0xf900_0380; // str x0, [x28, #BLOCK_HEADER]
+const STR_XZR_STOP: u32 = 0xf900_039f | (INTERRUPT_FAULT_PAGE / 8) << 10; // str xzr, [x28, #INTERRUPT_FAULT_PAGE]
+/// Native offset of the stop store: `adr x0, header; str x0, [x28]; str xzr, [x28, #stop]` after the 4-byte header.
+const STOP_AT: u32 = ENTRY_OFFSET + 8;
 const LDR_LUDIV: u32 = 0xf940_0383 | (frame::LUDIV_HANDLER / 8) << 10; // ldr x3, [x28, #LUDIVHandler]
 const LDR_LDIV: u32 = 0xf940_0383 | (frame::LDIV_HANDLER / 8) << 10;
 const STR_X30_PRE: u32 = 0xf81f_0ffe; // str x30, [sp, #-16]!
@@ -282,6 +296,7 @@ struct Verifier<'a> {
 
 pub(super) fn check(c: &Code) -> Result<(), String> {
     let mut v = Verifier::new(c)?;
+    v.entry()?;
     v.words()?;
     v.sites()?;
     v.exits()?;
@@ -423,6 +438,17 @@ impl<'a> Verifier<'a> {
         disp == 0 || i32::try_from(disp).is_ok_and(|d| insn.windows(4).any(|b| b == d.to_le_bytes()))
     }
 
+    /// Every block begins with the stop store after the header store (no branch can enter the prologue: branches go
+    /// forward, and `new` requires each target to be a decoded word after its source).
+    fn entry(&self) -> Result<(), String> {
+        let word = |at: u32| (at as usize + 4 <= self.c.code.len()).then(|| self.word(at));
+        if word(STOP_AT) == Some(STR_XZR_STOP) && word(STOP_AT - 4) == Some(STR_X0_HEADER) {
+            Ok(())
+        } else {
+            Err(format!("entry prologue at {:#x}: not `str x0, [x28]; str xzr, [x28, #{INTERRUPT_FAULT_PAGE}]`", STOP_AT - 4))
+        }
+    }
+
     /// The per-word rules of the linear pass.
     fn words(&self) -> Result<(), String> {
         let fail = |at: u32, what: &str| Err(format!("{what} at {at:#x}"));
@@ -473,6 +499,14 @@ impl<'a> Verifier<'a> {
         let (offset, end) = (m.addr.imm as u32, m.addr.imm as u32 + m.size as u32);
         let overlaps = |field: u32, len: u32| offset < field + len && field < end;
         let w = self.word(at);
+        if overlaps(INTERRUPT_FAULT_PAGE, 8) {
+            // The stop store, only as the block's third prologue word (`entry` checks it is there).
+            return if at == STOP_AT && w == STR_XZR_STOP {
+                Ok(())
+            } else {
+                Err(format!("frame access {w:#010x} at {at:#x}: the interrupt-fault word is accessed only by the block entry's stop store"))
+            };
+        }
         let ok = m.form == Form::Unsigned
             && frame::FIELDS.iter().any(|&(field, len)| offset >= field && end <= field + len)
             && (!frame::POINTERS.iter().any(|&p| overlaps(p, 8))
@@ -916,7 +950,7 @@ mod tests {
     use super::*;
     use natemu_abi::code_object::Header;
 
-    /// Real fexc (series5, profile slice1) objects and the guest bytes they were compiled from.
+    /// Real fexc (series7, profile slice1) objects and the guest bytes they were compiled from.
     macro_rules! fixture {
         ($name:literal) => {
             (
@@ -982,86 +1016,119 @@ mod tests {
     }
 
     #[test]
+    fn the_stop_store_is_pinned_at_the_block_entry() {
+        // Every block has `str x0, [x28]; str xzr, [x28, #stop]` as its prologue words after `adr`.
+        assert_eq!((STOP_AT, STR_XZR_STOP), (12, 0xf907_639f));
+        for (i, &f) in FIXTURES.iter().enumerate() {
+            let h: Header = super::super::record(f.0, 0);
+            let w = |at: u32| u32::from_le_bytes(f.0[(h.code_offset + at) as usize..][..4].try_into().unwrap());
+            assert_eq!((w(8), w(12)), (STR_X0_HEADER, STR_XZR_STOP), "fixture {i}");
+        }
+        let at = STOP_AT;
+        refused(ADDRESS, at, STR_XZR_STOP, NOP, "entry prologue"); // stop store removed
+        refused(ADDRESS, at, STR_XZR_STOP, STR_XZR_STOP + (1 << 10), "entry prologue"); // the next 8 bytes
+        refused(ADDRESS, at, STR_XZR_STOP, STR_XZR_STOP - (1 << 10), "entry prologue"); // the previous 8 bytes
+        refused(ADDRESS, at, STR_XZR_STOP, STR_XZR_STOP & !31, "entry prologue"); // str x0, not xzr
+        refused(ADDRESS, at, STR_XZR_STOP, 0xb900_039f | INTERRUPT_FAULT_PAGE / 4 << 10, "entry prologue"); // str wzr
+        refused(ADDRESS, at, STR_XZR_STOP, 0xf900_039f | (INTERRUPT_FAULT_PAGE + 8) / 8 << 10, "entry prologue");
+        refused(ADDRESS, at - 4, STR_X0_HEADER, NOP, "entry prologue"); // header store removed
+        // Moved: the stop store as the second word, the header store third.
+        let h: Header = super::super::record(ADDRESS.0, 0);
+        let mut object = ADDRESS.0.to_vec();
+        for (o, w) in [(8, STR_XZR_STOP), (12, STR_X0_HEADER)] {
+            object[(h.code_offset + o) as usize..][..4].copy_from_slice(&w.to_le_bytes());
+        }
+        let e = admit((&object, ADDRESS.1)).expect_err("moved stop store admitted");
+        assert!(e.contains("entry prologue"), "{e}");
+        // Stored again, or loaded, anywhere else in the block (the word after the first load: mov x4, x20).
+        let ldr_stop = STR_XZR_STOP & !31 | 1 | 1 << 22; // ldr x1, [x28, #stop]
+        refused(ADDRESS, 0x24, 0xaa14_03e4, STR_XZR_STOP, "interrupt-fault word");
+        refused(ADDRESS, 0x24, 0xaa14_03e4, STR_XZR_STOP & !31, "interrupt-fault word"); // str x0, [x28, #stop]
+        refused(ADDRESS, 0x24, 0xaa14_03e4, ldr_stop, "interrupt-fault word");
+        refused(ADDRESS, 0x24, 0xaa14_03e4, 0xb900_039f | (INTERRUPT_FAULT_PAGE + 4) / 4 << 10, "interrupt-fault word"); // str wzr, the field's upper half
+    }
+
+    #[test]
     fn address_guards_are_verified() {
-        refused(ADDRESS, 0x14, 0xca01_4020, NOP, "address guard"); // eor x0, x1, x1, lsl #16 removed
-        refused(ADDRESS, 0x14, 0xca01_4020, 0xca02_4040, "address guard"); // guard on x2
-        refused(ADDRESS, 0x10, 0x9100_4281, 0x9100_6281, "address guard"); // add x1, x20, #0x18: not the access's address
-        refused(ADDRESS, 0x0c, 0x8b07_0cd4, 0x1400_0004, "address guard"); // b 0x1c: enters the guarded window
-        refused(ADDRESS, 0x18, 0xb7f8_09a0, NOP, "reached by 0 branches"); // tbnz removed
+        refused(ADDRESS, 0x18, 0xca01_4020, NOP, "address guard"); // eor x0, x1, x1, lsl #16 removed
+        refused(ADDRESS, 0x18, 0xca01_4020, 0xca02_4040, "address guard"); // guard on x2
+        refused(ADDRESS, 0x14, 0x9100_4281, 0x9100_6281, "address guard"); // add x1, x20, #0x18: not the access's address
+        refused(ADDRESS, 0x10, 0x8b07_0cd4, 0x1400_0004, "address guard"); // b 0x1c: enters the guarded window
+        refused(ADDRESS, 0x1c, 0xb7f8_09a0, NOP, "reached by 0 branches"); // tbnz removed
         // add x6, x6, #1 between a read-modify-write's (shared) guard and its store
-        refused(ADDRESS, 0x9c, 0xca04_0295, 0x9100_04c6, "read-modify-write store");
+        refused(ADDRESS, 0xa0, 0xca04_0295, 0x9100_04c6, "read-modify-write store");
         let large = FIXTURES[5];
-        refused(large, 0x0c, 0x5282_0001, 0x5284_0001, "address guard"); // mov w1, #0x2000 for an access at +0x1000
+        refused(large, 0x10, 0x5282_0001, 0x5284_0001, "address guard"); // mov w1, #0x2000 for an access at +0x1000
     }
 
     #[test]
     fn split_checks_are_verified() {
-        refused(ADDRESS, 0x38, 0x9100_1c20, 0x9100_0c20, "split check"); // add x0, x1, #3 for an 8-byte store
-        refused(ADDRESS, 0x38, 0x9100_1c20, NOP, "split check");
+        refused(ADDRESS, 0x3c, 0x9100_1c20, 0x9100_0c20, "split check"); // add x0, x1, #3 for an 8-byte store
+        refused(ADDRESS, 0x3c, 0x9100_1c20, NOP, "split check");
     }
 
     #[test]
     fn guest_rip_addresses_are_verified() {
         let (rip, noncanonical) = (FIXTURES[3], FIXTURES[4]);
-        refused(rip, 0x10, 0x72a0_0214, 0x72a0_0234, "guest-RIP move"); // movk w20, #0x11, lsl #16
-        refused(rip, 0x24, 0x1400_0024, NOP, "reached by 0 branches"); // the crossing store's `b split`
-        refused(noncanonical, 0x18, 0x1400_000e, NOP, "reached by 0 branches"); // the non-canonical load's `b guard`
-        refused(noncanonical, 0x14, 0xf2d0_0014, 0xf2c0_0014, "guest-RIP move"); // canonical, but not the relocation
+        refused(rip, 0x14, 0x72a0_0214, 0x72a0_0234, "guest-RIP move"); // movk w20, #0x11, lsl #16
+        refused(rip, 0x28, 0x1400_0024, NOP, "reached by 0 branches"); // the crossing store's `b split`
+        refused(noncanonical, 0x1c, 0x1400_000e, NOP, "reached by 0 branches"); // the non-canonical load's `b guard`
+        refused(noncanonical, 0x18, 0xf2d0_0014, 0xf2c0_0014, "guest-RIP move"); // canonical, but not the relocation
         // Review H1: `mov rax, [rip + 0x40000ff9]` = PRIVATE (0x8000_4000_0000), `b G` jumped over by a branch between
         // the move and the `b`: the window is sealed from the move, the `b` included.
         let h: Header = super::super::record(noncanonical.0, 0);
         let (mut object, mut source) = (noncanonical.0.to_vec(), noncanonical.1.to_vec());
         source[3..7].copy_from_slice(&[0xf9, 0x0f, 0x00, 0x40]);
         let reloc = h.relocs_offset as usize;
-        assert_eq!(object[reloc..reloc + 6], [0x0c, 0, 0, 0, object::RELOC_GUEST_RIP_MOVE, 20]);
+        assert_eq!(object[reloc..reloc + 6], [0x10, 0, 0, 0, object::RELOC_GUEST_RIP_MOVE, 20]);
         object[reloc + 8..reloc + 16].copy_from_slice(&0x8000_4000_0000u64.to_le_bytes());
-        for (at, w) in [(0x0c, 0xd2a8_0014u32), (0x10, 0xf2d0_0014), (0x14, 0x1400_0002)] {
+        for (at, w) in [(0x10, 0xd2a8_0014u32), (0x14, 0xf2d0_0014), (0x18, 0x1400_0002)] {
             object[(h.code_offset + at) as usize..][..4].copy_from_slice(&w.to_le_bytes());
         }
         let e = admit((&object, &source)).expect_err("branch over `b guard` admitted");
         assert!(e.contains("a branch enters between its guest-RIP move and the access"), "{e}");
-        object[(h.code_offset + 0x14) as usize..][..4].copy_from_slice(&NOP.to_le_bytes());
+        object[(h.code_offset + 0x18) as usize..][..4].copy_from_slice(&NOP.to_le_bytes());
         admit((&object, &source)).unwrap(); // the same block without the branch is admitted
     }
 
     #[test]
     fn exits_and_branch_targets_are_verified() {
         let (call, jcc) = (FIXTURES[2], FIXTURES[6]);
-        refused(call, 0x0c, 0xca08_4100, 0xca09_4120, "branch-target guard"); // checks x9, exits through rsp's copy
-        refused(call, 0x3c, 0xaa08_03f6, 0xaa09_03f6, "branch-target guard"); // mov x22, x9: an unchecked RIP
-        refused(jcc, 0x14, 0x5400_00e1, 0x5400_0041, "branch-target guard"); // b.ne to the str, skipping its literal
-        refused(jcc, 0x1c, 0xf900_0f80, 0xf940_0f80, "indirect branch"); // exit without storing State.rip
-        refused(jcc, 0x14, 0x5400_00e1, 0x5400_0061, "indirect branch"); // b.ne to the gate load, skipping the exit's store
+        refused(call, 0x10, 0xca08_4100, 0xca09_4120, "branch-target guard"); // checks x9, exits through rsp's copy
+        refused(call, 0x40, 0xaa08_03f6, 0xaa09_03f6, "branch-target guard"); // mov x22, x9: an unchecked RIP
+        refused(jcc, 0x18, 0x5400_00e1, 0x5400_0041, "branch-target guard"); // b.ne to the str, skipping its literal
+        refused(jcc, 0x20, 0xf900_0f80, 0xf940_0f80, "indirect branch"); // exit without storing State.rip
+        refused(jcc, 0x18, 0x5400_00e1, 0x5400_0061, "indirect branch"); // b.ne to the gate load, skipping the exit's store
     }
 
     #[test]
     fn division_checks_are_pinned() {
-        refused(DIVISION, 0x104, 0xcb27_4000, 0xcb27_2000, "divide stub"); // div ecx: uxtw -> uxth
-        refused(DIVISION, 0x14, 0xd348_3ee0, 0xd349_42e0, "divide stub"); // div cl: ubfx x0, x23, #9, #8
-        refused(DIVISION, 0x184, LDR_LUDIV, LDR_LDIV, "divide stub"); // div rcx calling the signed helper
-        refused(DIVISION, 0x1c4, 0xb400_0f34, 0xb400_0f35, "zero check"); // idiv: cbz x21, overflow tests x20
-        refused(DIVISION, 0x1c, 0xb6f8_0000 | DIVISION_STUB_IMM, NOP, "reached by 0 branches"); // check removed
+        refused(DIVISION, 0x108, 0xcb27_4000, 0xcb27_2000, "divide stub"); // div ecx: uxtw -> uxth
+        refused(DIVISION, 0x18, 0xd348_3ee0, 0xd349_42e0, "divide stub"); // div cl: ubfx x0, x23, #9, #8
+        refused(DIVISION, 0x188, LDR_LUDIV, LDR_LDIV, "divide stub"); // div rcx calling the signed helper
+        refused(DIVISION, 0x1c8, 0xb400_0f34, 0xb400_0f35, "zero check"); // idiv: cbz x21, overflow tests x20
+        refused(DIVISION, 0x20, 0xb6f8_0000 | DIVISION_STUB_IMM, NOP, "reached by 0 branches"); // check removed
         // The checks read FEX's own operands.
-        refused(DIVISION, 0x18, 0xcb34_0000, 0xcb35_0000, "operands"); // div cl: sub x0, x0, w21, uxtb (divisor is w20)
-        refused(DIVISION, 0x14, 0xd348_3ee0, 0xd348_3ec0, "operands"); // div cl: ubfx x0, x22 (dividend is x23)
-        refused(DIVISION, 0x68, 0x1300_1e81, 0x1300_1ea1, "operands"); // idiv bh: sxtb w1, w21
-        refused(DIVISION, 0xc8, 0x1300_3e81, 0x1300_3ea1, "operands"); // idiv r9w: sxth w1, w21 (FEX divides by sxth w1, w20)
-        refused(DIVISION, 0x170, 0xb400_1167, 0xb400_1166, "operands"); // div rcx: cbz x6
-        refused(DIVISION, 0x180, 0xaa07_03e2, 0xaa06_03e2, "operands"); // div rcx: the helper gets x6 as divisor
+        refused(DIVISION, 0x1c, 0xcb34_0000, 0xcb35_0000, "operands"); // div cl: sub x0, x0, w21, uxtb (divisor is w20)
+        refused(DIVISION, 0x18, 0xd348_3ee0, 0xd348_3ec0, "operands"); // div cl: ubfx x0, x22 (dividend is x23)
+        refused(DIVISION, 0x6c, 0x1300_1e81, 0x1300_1ea1, "operands"); // idiv bh: sxtb w1, w21
+        refused(DIVISION, 0xcc, 0x1300_3e81, 0x1300_3ea1, "operands"); // idiv r9w: sxth w1, w21 (FEX divides by sxth w1, w20)
+        refused(DIVISION, 0x174, 0xb400_1167, 0xb400_1166, "operands"); // div rcx: cbz x6
+        refused(DIVISION, 0x184, 0xaa07_03e2, 0xaa06_03e2, "operands"); // div rcx: the helper gets x6 as divisor
         // Review H1: FEX's 64-bit fast-path selector and the 8-bit dividend copy are pinned.
-        refused(DIVISION, 0x174, 0xb400_0185, 0xb400_0186, "selector"); // div rcx: cbz x6, inline
-        refused(DIVISION, 0x174, 0xb400_0185, 0xb400_019f, "selector"); // cbz xzr: always the inline divide
-        refused(DIVISION, 0x174, 0xb400_0185, 0x1400_000c, "selector"); // b inline
-        refused(DIVISION, 0x1e4, 0xca05_0000, 0xca00_0000, "selector"); // idiv: eor x0, x0, x0
-        refused(DIVISION, 0x10, 0x5300_3c97, 0x5300_3cd7, "dividend"); // div cl: uxth w23, w6 (AX is w4)
-        refused(DIVISION, 0x0c, 0x5300_1cf4, 0x5300_1ce4, "dividend"); // div cl: uxtb w4, w7 writes RAX first
+        refused(DIVISION, 0x178, 0xb400_0185, 0xb400_0186, "selector"); // div rcx: cbz x6, inline
+        refused(DIVISION, 0x178, 0xb400_0185, 0xb400_019f, "selector"); // cbz xzr: always the inline divide
+        refused(DIVISION, 0x178, 0xb400_0185, 0x1400_000c, "selector"); // b inline
+        refused(DIVISION, 0x1e8, 0xca05_0000, 0xca00_0000, "selector"); // idiv: eor x0, x0, x0
+        refused(DIVISION, 0x14, 0x5300_3c97, 0x5300_3cd7, "dividend"); // div cl: uxth w23, w6 (AX is w4)
+        refused(DIVISION, 0x10, 0x5300_1cf4, 0x5300_1ce4, "dividend"); // div cl: uxtb w4, w7 writes RAX first
     }
     /// The div-cl check's tbz offset field (stub at 0x368 from 0x1c).
     const DIVISION_STUB_IMM: u32 = ((0x368 - 0x1c) / 4) << 5;
 
     #[test]
     fn forbidden_instructions_are_refused() {
-        let at = 0x20; // mov x4, x20 after the first load
+        let at = 0x24; // mov x4, x20 after the first load
         let old = 0xaa14_03e4;
         refused(ADDRESS, at, old, 0xd63f_00a0, "indirect branch"); // blr x5
         refused(ADDRESS, at, old, 0xd61f_0020, "indirect branch"); // br x1 without the gate load

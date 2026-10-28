@@ -577,6 +577,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
   OFF("af_raw", State.af_raw); OFF("mxcsr", State.mxcsr); OFF("fs_cached", State.fs_cached); OFF("gs_cached", State.gs_cached);
   OFF("pointers", Pointers); OFF("exit_function_linker", Pointers.ExitFunctionLinker); OFF("dispatcher_loop_top", Pointers.DispatcherLoopTop);
   if (slice1) j.kv("natemu_pre_nzcv", uint64_t(offsetof(Core::CpuStateFrame, State.flags) + X86State::RFLAG_NZCV_LOC)); // State.flags[RFLAG_NZCV_LOC]: incoming NZCV for nzcv=frame sites
+  if (slice1) j.kv("natemu_interrupt_fault_page", uint64_t(offsetof(Core::InternalThreadState, InterruptFaultPage) - offsetof(Core::InternalThreadState, BaseFrameState))); // the block prologue's `str xzr,[x28,#this]` (the runtime's stop page)
   j.end_obj();
   // External references that are not relocations: helper/dispatch pointers loaded from the state frame.
   j.arr("state_pointer_loads");

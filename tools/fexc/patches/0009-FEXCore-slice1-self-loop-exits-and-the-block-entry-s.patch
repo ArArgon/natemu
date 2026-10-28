@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: natemu <natemu@example.invalid>
+Date: Tue, 27 Oct 2026 00:00:00 +0000
+Subject: [PATCH 9/9] FEXCore: slice1 self-loop exits and the block-entry stop
+ check
+
+Under fexc_slice1 only (guarded at both points; the default profile is unchanged):
+- OpcodeDispatcher.cpp CondJUMPOp / CondJUMPRCXOp / LoopOp: no JumpTargets lookup for the taken edge, so a jump back to
+  the block's own entry exits through the gate like any other taken edge instead of becoming a native backward branch.
+- JIT.cpp EmitSuspendInterruptCheck: always emit FEX's pending-interrupt fault check, `str xzr, [x28, #InterruptFaultPage]`,
+  as the last word of the entry prologue. The runtime stops a vCPU precisely by write-protecting that page.
+
+The offset is reported by fexc as state_abi.state_offsets.natemu_interrupt_fault_page (tools/fexc/fexc.cpp).
+---
+ FEXCore/Source/Interface/Core/JIT/JIT.cpp          | 2 +-
+ FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp | 9 ++++++---
+ 2 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index 6fdf72d..99cf371 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -802,7 +802,7 @@ void Arm64JITCore::EmitTFCheck() {
+ }
+ 
+ void Arm64JITCore::EmitSuspendInterruptCheck() {
+-  if (CTX->Config.NeedsPendingInterruptFaultCheck) {
++  if (CTX->Config.NeedsPendingInterruptFaultCheck || fexc_slice1) { // natemu slice1: the runtime stops a vCPU by protecting this page
+     // Trigger a fault if there are any pending interrupts
+     // Used only for gdbserver at the moment
+     constexpr size_t InterruptPageOffset =
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 93a770f..0f88c99 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -683,7 +683,8 @@ void OpDispatchBuilder::CondJUMPOp(OpcodeArgs) {
+   }
+ 
+   FlushRegisterCache();
+-  auto TrueBlock = JumpTargets.find(Target);
++  // natemu slice1: a jump back to the block's own entry exits like any other taken edge (no native backward branch).
++  auto TrueBlock = fexc_slice1 ? JumpTargets.end() : JumpTargets.find(Target);
+   auto FalseBlock = JumpTargets.find(Op->PC + Op->InstSize);
+ 
+   auto CurrentBlock = GetCurrentBlock();
+@@ -742,7 +743,8 @@ void OpDispatchBuilder::CondJUMPRCXOp(OpcodeArgs) {
+ 
+   Ref CondReg = LoadGPRRegister(X86State::REG_RCX, JcxGPRSize);
+ 
+-  auto TrueBlock = JumpTargets.find(Target);
++  // natemu slice1: a jump back to the block's own entry exits like any other taken edge (no native backward branch).
++  auto TrueBlock = fexc_slice1 ? JumpTargets.end() : JumpTargets.find(Target);
+   auto FalseBlock = JumpTargets.find(Op->PC + Op->InstSize);
+ 
+   auto CurrentBlock = GetCurrentBlock();
+@@ -814,7 +816,8 @@ void OpDispatchBuilder::LoopOp(OpcodeArgs) {
+   }
+ 
+   CalculateDeferredFlags();
+-  auto TrueBlock = JumpTargets.find(Target);
++  // natemu slice1: a jump back to the block's own entry exits like any other taken edge (no native backward branch).
++  auto TrueBlock = fexc_slice1 ? JumpTargets.end() : JumpTargets.find(Target);
+   auto FalseBlock = JumpTargets.find(Op->PC + Op->InstSize);
+ 
+   {
