@@ -301,3 +301,206 @@ Another idea was not evaluated (no evidence): relocating the plumbing into canon
   - At EL0 (option A), a decoder gap is a correctness risk, not an isolation break.
   - x87 soft-float helpers would need EL0-executable copies, or `svc` at +15.9 ns per call.
   - RDTSC could read `cntvct_el0` at either level (EL0 measured with CNTKCTL EL0VCTEN).
+
+## Follow-up: EL0 without the address guard
+
+Status: design study, October 28, 2026 (same day, one pass). Evidence only; nothing in `crates/` or `tools/fexc` changed.
+Question: what would translated code at EL0 need so that the address guard and the isolation half of admission go,
+and the hardware alone raises x86 #GP/#SS for non-canonical addresses? What deviation, if any, would remain?
+
+Files:
+- `probe_noguard.c`: a standalone HVF probe. Build like `probe.c` (the `xcrun clang ... -framework Hypervisor` line of
+  `build.sh`, then `codesign` with `entitlements.plist`); run `probe_noguard [reps] [scale]`. It uses natemu's TCR with
+  TTBR0 **and** TTBR1 enabled (T0SZ = T1SZ = 16, TBI0 = TBI1 = 0) and natemu's SCTLR.
+- `literals.py`: a static census of fexc slice-1 code (same block walk as `census.py`): literal loads, x28 frame
+  accesses by offset, `sp` accesses, helper calls, spills.
+- Raw output in `/private/tmp/claude-501/-Users-liaozping-orca-natemu/025ed521-9978-4fb2-aaf7-b90da95d37f3/scratchpad/el0b/`:
+  `final.txt` (`probe_noguard 9 1`), `try2.txt` (replicate), `try1.txt` (first run, `3 0.2`), `literals.txt`/`.json`,
+  `arm-B2-2-1.txt` and `arm-align.txt` (Arm DDI0487 M.c §B2.2.1 and §B2.8.2, fetched from documentation-service.arm.com).
+- Machine: M4, macOS 26.6.2, 15:13-15:16 PDT, load average 1.6-1.8. All `check` lines were identical in the three
+  runs. In `final.txt` the empty loop was disturbed (0.387 ns, range 0.27-0.50), so the stop-check rows below come
+  from `try2.txt`; every other timing agreed within 0.01 ns.
+
+### How often translated code touches emulator memory today (static, measured)
+
+`literals.py` over the four corpora of §2 (556 blocks, all compiled `ok`):
+
+| Access | Words | When it runs |
+|---|---|---|
+| `str x0, [x28, #0]` block-header store | 556 (1 per block) | every block entry, linked edges included |
+| `str xzr, [x28, #3776]` stop store | 556 (1 per block) | every block entry |
+| `str w0, [x28, #1032]` pre-NZCV save | 230 | each instruction that writes NZCV before an access site |
+| `str x, [x28, #24]` `State.rip` store | 828 | each unlinked exit (783 link points + 45 computed exits) |
+| `ldr x1, [x28, #2952]` linker pointer | 783 | each unlinked literal exit; a linked exit skips it (word 1 becomes `b`) |
+| `ldr x1, [x28, #2920]` dispatcher pointer | 45 | each computed exit |
+| `ldr x3, [x28, #3024/3032]` division helpers | 21 | each 64-bit div/idiv whose dividend needs 128 bits |
+| `ldr x0, L` literal load from the code area | 783 | each unlinked literal exit; **all 783 read a guest-RIP slot; no other literal load exists** |
+| `sp` accesses | 42 | all are the `lr` push/pop around the 21 helper `blr`s (patch 0008) |
+| RA spills | 0 | `spill_bytes` is 0 in all 556 blocks, and admission refuses any other value (`admission.rs` l.213-215) |
+
+So in steady state (linked edges, no division helper, no computed exit) the only emulator accesses are the two prologue
+stores per block entry, plus the pre-NZCV save for flag-writing read-modify-write instructions. Dynamic counts on the
+bench loops were not taken (not verified); per block entry they follow from the table.
+126 blocks already carry RIP values as `movz/movk` immediates (relocation kind `guest_rip_move`).
+
+### Can each access be eliminated, not moved?
+
+| Access | Elimination | Evidence |
+|---|---|---|
+| Header store | **Drop it.** Only the linker reads it (`runtime/src/execution.rs` l.242; the pointers and the header are the only frame fields the resident reads besides `State.rip` and pre-NZCV, l.240-242, 481, 680). At EL0 the linker is entered by `svc`, so ELR_EL1 names the source block (`cache::block_at`, as `aborted` and `stopped` already do). | code; `svc` from EL0 measured in §3 (31 ns round trip) |
+| `State.rip` store + linker pointer load | Link point becomes `movz/movk x0, rip` + `svc #LINK` (RIP in x0, exit kind in the immediate). The linker still patches word 1 into `b`. | code; movz/movk form exists in fexc output |
+| `State.rip` store + dispatcher pointer load | Computed exit becomes `mov x0, xR; b dispatch` with `b` relocated by the resident at placement, as link points are patched today. `dispatch` lives in an EL0 execute-only page; its miss path is `svc`. | measured: frame-free exit through dispatch with L1 as read-only data 0.964 ns, with L1 encoded as code (execute-only; per entry `movz/movk x2 = rip; sub; cbnz miss; b block`) 1.221 ns |
+| Division pointer loads, `lr` push/pop, helper stack | `svc #DIV` (or `brk`): the resident divides at EL1. No EL0 stack remains, so SP_EL0 can point at nothing. | +31 ns per helper division (§3 `svc` cost); 21 sites in 556 blocks |
+| Literal loads | Replaced by `movz/movk` (above). Then the code area reads no data: the JITCodeTail RIP slot is read only by the resident. | `literals.py`: 783/783 literal loads are link points |
+| Pre-NZCV save | Into a register instead of memory: x28 is free once the frame is gone, so `mrs x28, nzcv`; the resident reads x28 from the captured frame. | not verified (a FEX patch-0006 change) |
+| Stop store | See next section. | measured |
+| RA spills | None today. If FEX ever needs one it would go to `sp` memory, i.e. an EL0 data page. Options: cut the block instead (fexc), or admit spills to a page that is part of the guest-state window. | not verified; no spill seen |
+
+### Can the EL0 window be empty?
+
+The stop check must be an access the host can make fault at a block entry. Measured options (`try2.txt`, EL0, per
+block entry, loop minus empty loop):
+
+| Stop check | Extra cost | Host fault when armed | EL0 data page needed |
+|---|---|---|---|
+| `str xzr` to the stop word (today) | 0.000 ns | stage-2 read-only: exit `0x93c2804f` (§3) | stop page EL0 read-write |
+| `ldr xzr` from the stop word | 0.000 ns | `hv_vm_protect(granule, 0)` accepted (rc 0); load exit `0x93c28007`, store exit `0x93c28047` (EC 0x24, translation L3) | stop page EL0 **read-only**, holding zeros |
+| `bl pad` to a `ret` on an EL0 execute-only page alone in its 16 KiB granule | **+0.456 ns** | stage-2 R/W without X: exit `0x8200000f` (EC 0x20, instruction abort, permission L3); restored, it runs again | **none** |
+
+The `bl` pad clobbers x30, which FEX uses only as a register-allocator temporary (slice-1 contract §1), dead at a block
+entry. The stop gate would map x30 (the return address) to the block instead of ELR. A stage-2 change on something every
+entry already touches, its own code, does not work: removing X from the code area stops the vCPU at an arbitrary
+instruction, not at an entry (code reasoning; not measured).
+
+Other primitives (`final.txt`):
+- **Execute-only code** (AP 00, UXN 0, PXN 1): EL0 `br` into it completes. EL0 `ldr` from it → EC 0x24 permission L3;
+  `str` → permission L3, WnR; an `ldr x, literal` executed inside it faults the same way (FAR = the literal). EL1 still
+  reads it.
+- **Read-only page** (lookup-table role): EL0 load completes; EL0 store → permission L3, WnR.
+- EL1t loads from an EL0 read-write page complete (PAN is not in the way).
+
+**Answer: yes, for the slice-1 instruction set.** With the header dropped, exits through `svc`/relocated `b`, division
+by `svc`, no literals, pre-NZCV in a register, L1 encoded as code and the stop as an instruction fetch, translated code
+makes **no data access** to emulator memory. Every x86-non-canonical address is then unmapped, EL1-only or EL0
+execute-only, and a data access to it faults. The price, measured on loops: +0.46 ns per block entry, +0.26 ns per
+computed exit (code-encoded versus data L1), about +31 ns per helper division (an `svc` round trip instead of a `blr`), and +15.9 ns per linker or miss entry (`svc`
+instead of today's `br`, §3). Not measured end to end.
+
+**Limit.** FEX keeps more guest state in its frame than slice 1 uses (`third_party/FEX/FEXCore/include/FEXCore/Core/CoreState.h`:
+`flags[48]` (DF and others), `mxcsr`, `fs_cached`/`gs_cached`, segment indices, `mm[8]` and `FCW`/`AbridgedFTW` (x87),
+`avx_high`, `xmm`). Once those instructions are admitted, that state needs an EL0 read-write page or registers. As a page
+it holds only this vCPU's own guest state, never a pointer the resident trusts. Which fields FEX would touch was not
+verified.
+
+### Hardware #GP coverage outside the window (measured, EL0 loads)
+
+| Address | Result |
+|---|---|
+| canonical: `0x0000_7fff_ffff_f000`, `0xffff_8000_0000_0000`, `0xffff_ffff_ffff_f000` (mapped) | complete |
+| `0x0000_8000_0000_0000` (TTBR0-side hole; L0 entry 256 exists, as natemu's `PRIVATE` table) | translation fault L1 |
+| `0x0000_8000_4000_0000` (an EL1-only page, natemu's `PRIVATE`) | permission fault L3 |
+| `0x0000_ffff_ffff_fff8`, `0x0000_8880_1234_5678` (a kernel pointer truncated to 48 bits) | translation fault L0 |
+| `0xffff_0000_0000_0000`, `0xffff_7fff_ffff_fff8` (TTBR1-side hole) | translation fault L0 |
+| outside both ranges: `2^48`, `2^63`, `LIST_POISON1` `0xdead000000000100`, `LIST_POISON2` `0xdead000000000122`, KASAN offset `0xdffffc0000000000`, slab poison `0x6b6b6b6b6b6b6b6b` | translation fault L0 |
+| `0xffff_4000_0000_0000`: an EL0 read-write page mapped in the TTBR1-side hole | **complete** (a window page would be reachable) |
+
+Every fault had EC 0x24 and FAR = the address. Straddling and wrapping accesses:
+- An 8-byte load or store at `0x0000_7fff_ffff_fffc` (canonical into hole) faults: translation L1, FAR = `0x0000_8000_0000_0000`
+  (the first byte of the faulting page). The store committed nothing to the canonical page.
+- A load at `0xffff_7fff_ffff_fffc` (hole into canonical) faults with FAR = the start.
+- A load at `0xffff_ffff_ffff_fffc` wraps: FAR = 0. x86's rule for a wrapping access was not checked (not verified).
+  This is unchanged by the privilege level.
+
+The resident already gives exact #GP/#SS for all of these (code): `access_aborted` accepts translation and permission
+faults at any level (DFSC 4-7, 12-15), requires `FAR - address < width`, and `pages()` raises #GP, or #SS for an
+SS-segment site, unless both the first and the last byte are canonical (`runtime/src/execution.rs` l.721-746, 873-885). At EL0 only
+the EC changes (0x25 → 0x24) and the SPSR mode check changes.
+
+### Size and placement of a residual window (if the owner keeps any)
+
+- **Minimal, measured option set above:** 0 bytes.
+- **If the stop stays a data access** (0 ns instead of +0.46 ns): one 4 KiB page per vCPU, EL0 **read-only**, all zeros,
+  armed by `hv_vm_protect(granule, 0)` and alone in its 16 KiB IPA granule. A guest store to it raises an exact #GP
+  (permission fault). A guest load returns 0 instead of #GP.
+- **If L1 stays data** (0.26 ns cheaper per computed exit): +64 KiB EL0 read-only, holding (guest RIP, native entry)
+  pairs. Loads observe them; stores fault.
+- **Today's frame** cannot be split into read-write and read-only parts without changing FEX's offsets. The written
+  fields end at 1036, the pointers sit at 2920-3040 and the stop word at 3776. That leaves 2,740 bytes for two 4 KiB
+  page boundaries (`abi/src/execution.rs` `frame`). So keeping any pointer load means guest-writable native branch targets.
+- **Placement:** put any page in the TTBR1-side hole, away from both canonical edges (for example `0xffff_4000_0000_0000`).
+  Linux poison values and the KASAN offset lie outside both ranges and fault anyway (measured above). A kernel pointer
+  truncated to 48 bits lands in the TTBR0-side hole, not there. Which pointer patterns guests produce in general was not
+  measured.
+
+### Which remaining checks are x86 semantics at any privilege level
+
+| Check | Verdict | Reason |
+|---|---|---|
+| Split check (page-crossing stores) | **Kept** | Arm DDI0487 M.c §B2.8.2.1.1: an access not within one aligned 16-byte quantity "is not guaranteed to be single-copy atomic except at the byte access level". §D1.4.1 (pinned in `artifacts/research/track01/source-snapshots/2026-10-27/arm-ddi0487Mc-D1-4-1.json`): for a Data Abort on an instruction that performs more than one single-copy atomic access, memory it affects "can be UNKNOWN". x86 commits neither part. Measured on the M4: eight page-crossing store forms (`str x`, `str w`, two `stp`, `str q`, into read-only and unmapped pages, at EL0 and EL1t) committed **nothing**. That is one implementation; relying on it would be a deviation from the architecture. |
+| #DE checks | **Kept** | A64 `udiv`/`sdiv` return 0 on a zero divisor and do not trap (DDI0487C.a, cited in INV-03-02). x86 raises #DE. |
+| Branch-target check | **Kept** | x86 raises #GP at the branch with no push, pop or RIP change. A lazy check at dispatch (fetch walk → `NONCANONICAL`) comes after `call`'s push or `ret`'s pop, and RIP already holds the target. 90 words in 556 blocks. |
+| Precision (flag elimination, RA hoisting, no fusion, pre-NZCV, CF inversion) | **Kept** | exact state at a fault, at any privilege level (slice-1 contract §1). Pre-NZCV moves to a register (not verified). |
+| Site map and recovery records | **Kept** | `aborted` maps every fault PC to a site or halts `unknown_abort` (`execution.rs` l.807-826) |
+
+### Admission at EL0 without the window
+
+With isolation enforced by hardware (system instructions trap, measured in §3; EL1-only pages fault; branches into EL1
+text abort; no EL0 data page holds a trusted pointer), admission splits as follows:
+- **Object validation stays mandatory**, because the resident parses the object: magic, version, sizes, sorted and
+  in-range sites, SRA map and profile pin, feature bits, link-point offsets and targets, relocation values.
+  This is about 2 µs of host time per block.
+- **The code-shape rules can become an optional debug check:** the decode allowlist, x28/`sp` rules, frame-field rules,
+  guard and stub structure, and "no branch into a check window". A violation is then a FEX correctness bug confined to
+  that vCPU's guest, and the hardware still contains it.
+- Two rules stay mandatory as correctness, because the resident patches or maps by them: "every exit has the exact
+  link-point or computed form", and "the entry prologue is exact".
+
+Not changed by this decision: x86 U/S, WP and SMEP stay in the software walker. Every shadow is EL0-accessible, so a
+CPL change must reset or split shadows, at EL1t and at EL0 alike. CPL changes are boot-phase work (code: no CPL
+transition exists yet).
+
+### Today versus EL0 without the guard
+
+| Mechanism | Today (EL1t) | EL0, empty window | Reason |
+|---|---|---|---|
+| Address guard (`eor`+`tbnz`, 1.48 words/access, plus 0.35 address words) | in code | **removed** | every non-canonical address faults (measured); `pages()` gives #GP/#SS (code) |
+| Admission code-shape rules | isolation | **optional debug** | hardware isolation (measured traps and permission faults) |
+| Admission object validation | yes | **kept** | the resident parses the object |
+| x28 frame (header, RIP, pre-NZCV, 4 pointers) | EL1 data | **removed** | header unused at EL0; RIP in x0; pointers replaced by `svc` or relocated `b`; pre-NZCV in a register (not verified) |
+| Literal loads (783) | code area readable | **changed** to `movz/movk` | code area becomes execute-only (measured) |
+| Stop store (1 per entry) | `str` to the stop page | **changed** to `bl` to a pad on an execute-only page | stage-2 no-X exit measured; +0.46 ns per entry |
+| `dispatch_fast` + L1 | EL1 text, data L1 | **changed**: execute-only copy, L1 as code | +0.26 ns per computed exit, measured |
+| Linker, miss | `br` into resident text | **changed** to `svc` | +15.9 ns per entry (§3) |
+| Division helper + EL0 stack | `blr` + `lr` push | **changed** to `svc` | +31 ns per helper division; no EL0 stack left |
+| Split check | in code | **kept** | Arm permits partial commit (cited); the M4 showed none |
+| #DE, branch-target check, precision, sites | in code | **kept** | x86 semantics (cited above) |
+
+### Residual deviation (for the owner to accept or reject)
+
+With the full design above there is **none** for the slice-1 instruction set:
+- Every data access by translated code to an x86-non-canonical address takes a hardware fault, and the resident turns
+  it into an exact #GP or #SS (measured for every region of the 64-bit space; existing resident logic).
+- No EL0-reachable page holds data.
+
+If the owner prefers the 0-ns data stop to the +0.46 ns instruction-fetch stop, the deviation is exactly this:
+- A guest **load** from one 4 KiB non-canonical page per vCPU, at a fixed address in the `0xffff_0000_0000_0000`-
+  `0xffff_7fff_ffff_ffff` hole, returns zeros instead of raising #GP. Stores there still raise #GP.
+- Nothing in that page is ever read by the emulator.
+
+Future instructions whose guest state FEX keeps in its frame (MXCSR, FS/GS base, DF, x87, AVX upper halves) would add
+one EL0 read-write page holding only this vCPU's own guest state, unless that state is kept in registers.
+
+### Work, in agent-sized chunks
+
+1. FEX patches: exits with `movz/movk` RIP in x0 and `svc #LINK`; computed exits `b dispatch` with a relocation record;
+   division by `svc`; no header store; pre-NZCV into x28; stop as `bl pad` with a relocation record. Plus
+   fexc/`check_sites.py`/verifier updates.
+2. Resident: EL0 entry (SPSR 0); `svc` gates (miss, linker, division) using x0 and ELR; lower-EL vectors and
+   EC 0x24/0x20 in `aborted`; stop gate keyed on x30; division at EL1; execute-only `dispatch` page and code-encoded L1
+   writer; relocation of the `b dispatch` and `bl pad` words at placement.
+3. Host: page roles (code area, slot and pad execute-only; shadows AP 01/11; no EL0 frame, stop page or stack); kicks
+   by stage-2 no-X on the vCPU's pad granule; stop injection from EL0 (not tested yet). Update
+   `check_resident_stack.py`.
+4. Admission: split it into mandatory object validation and an optional debug code-shape check. Add negative tests:
+   a non-canonical access at each former window address, and both straddles, give #GP/#SS.
+5. Full suites (fixtures, seed 4242, flow, faults, slice-3 sets, bench) plus an independent review (1-2 chunks).
