@@ -217,6 +217,14 @@ config and initramfs into natemu-raw is allowed (nothing committed); mitigations
 it is an S3c1 simplification, not an x86 requirement — see the code-cache-across-CR3 item added to the plan.
 Also: single-step (TF/RF) and hardware breakpoints are built in this phase as CPU 16 requires (no deferral); the
 loader may run Debian's real decompressor up to its jump into the decompressed kernel as a smoke test.
+**Code cache across address-space changes (owner, October 28; to be chunked).** Translations stay valid across CR3
+loads and INVLPG: blocks are filed by the guest-physical pages their bytes came from (already tracked for cross-vCPU
+coherence); a CR3 load or INVLPG drops only the vCPU's shadows (x86 TLB semantics), and a lookup by linear RIP
+re-validates linear → physical before entering a block. Code bytes changing (guest stores, and host/device writes into
+guest RAM such as disk DMA, which today stop all vCPUs and flush everything) invalidate per physical page. Check:
+programs switching between address spaces keep their translations (counted), while remapped or rewritten code is
+always re-translated, at 1–4 vCPUs. Privilege level: a follow-up study (EL0 without the address guard) is running;
+EL1 stays until the owner decides on its evidence.
 
 **Decided from evidence (recorded, not questions):** guest RAM default 2 GiB, tests choose their own size (M69);
 INIT/SIPI deferred, unused with the mailbox (`K kernel/smpboot.c:877-928`; M64 keeps the definition); legacy devices
