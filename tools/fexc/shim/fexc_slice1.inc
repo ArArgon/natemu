@@ -55,6 +55,7 @@ inline Verdict Primary(uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
     if (reg == 2 || reg == 4) return Allow(true);
     return reg <= 1 || reg == 6 ? Allow() : Uns("group 5 /7");
   case 0xC2: case 0xC3: case 0xE8: case 0xE9: case 0xEB: return Allow(true);
+  case 0xE0: case 0xE1: case 0xE2: case 0xE3: return Allow(true);  // loopne/loope/loop/jrcxz rel8 (two exits, both forward; 67 prefix refused below)
   default: break;
   }
   if (op >= 0x50 && op <= 0x5F) return Allow();                     // push/pop r

@@ -120,11 +120,11 @@ pub(crate) struct Admitted {
 }
 
 /// Direct branch target of the x86 instruction `insn` ending at `end`
-/// (jmp/jcc rel8/rel32, call rel32, REX prefixes allowed), if it is one.
+/// (jmp/jcc rel8/rel32, loopne/loope/loop/jrcxz rel8, call rel32, REX prefixes allowed), if it is one.
 fn branch_target(insn: &[u8], end: u64) -> Option<u64> {
     let start = insn.iter().position(|b| b & 0xf0 != 0x40)?;
     let rel = match &insn[start..] {
-        [0xeb | 0x70..=0x7f, r] => *r as i8 as i64,
+        [0xeb | 0x70..=0x7f | 0xe0..=0xe3, r] => *r as i8 as i64,
         [0xe9 | 0xe8, r @ ..] | [0x0f, 0x80..=0x8f, r @ ..] if r.len() == 4 => i32::from_le_bytes(r.try_into().unwrap()) as i64,
         _ => return None,
     };
@@ -577,6 +577,10 @@ mod tests {
         assert!(admit(&at_top(top + 4), top, &SOURCE, ALL).is_err());
         assert_eq!(branch_target(&[0x48, 0xe9, 0xfb, 0xff, 0xff, 0xff], 0x10), Some(0x0b));
         assert_eq!(branch_target(&[0x0f, 0x84, 1, 0, 0, 0], 0x10), Some(0x11));
+        for op in 0xe0..=0xe3 {
+            assert_eq!(branch_target(&[op, 0xfe], 0x10), Some(0x0e)); // loopne/loope/loop/jrcxz rel8
+        }
+        assert_eq!(branch_target(&[0xe4, 0xfe], 0x10), None); // in al, imm8
         assert_eq!(branch_target(&[0x90], 0x10), None);
     }
 

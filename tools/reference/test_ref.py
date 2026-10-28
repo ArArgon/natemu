@@ -96,6 +96,54 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual((int(q[4]['gpr'][0], 16), int(q[4]['rip'], 16), int(q[4]['rflags'], 16)), (a, 0x100000, flags.FIXED))
         with self.assertRaises(ValueError): ref.run_programs([progs[3] | {'prefix': 4}], work, QEMU)           # not an instruction boundary
 
+@unittest.skipUnless(QEMU.exists(), f'pinned QEMU not at {QEMU}')
+class ControlFlow(unittest.TestCase):
+    """Flow programs: the executed path (from QEMU's TB trace) decides the instruction count and the undefined flags."""
+    def flow(self, name, lines):
+        text = []
+        for i, (t, _) in enumerate(lines): text += [f'I{i}:', t]
+        code, labels = ref.assemble('\n'.join(text) + '\nend:', labels=True)
+        return {'name': name, 'flow': True, 'code': code.hex(), 'rip': '0x100000', 'gpr': [0x1000 + i for i in range(16)], 'rflags': '0x0',
+                'memory': [], 'insns': [a for _, a in lines], 'offsets': [labels[f'I{i}'] for i in range(len(lines))]}
+
+    def test_loops_and_executed_path_flags(self):
+        mov = lambda n: (f'mov ecx, {n}', {'op': 'mov', 'width': 32})
+        loop = self.flow('loop', [('xor eax, eax', {'op': 'xor', 'width': 32}), mov(3), ('L1: add eax, 5', {'op': 'add', 'width': 32}),
+                                  ('loop L1', {'op': 'loop'})])
+        def cond(op, compare):
+            return self.flow(op, [('xor eax, eax', {'op': 'xor', 'width': 32}), mov(4), ('L1: inc eax', {'op': 'inc', 'width': 32}),
+                                  (f'cmp eax, {compare}', {'op': 'cmp', 'width': 32}), (f'{op} L1', {'op': op})])
+        skipped = self.flow('skipped', [('mul rdx', {'op': 'mul', 'width': 64}), ('jmp L1', {'op': 'jmp'}), ('add rax, rbx', {'op': 'add', 'width': 64}),
+                                        ('L1: mov rdx, rdx', {'op': 'mov', 'width': 64})])
+        work = RAW / 'selfcheck-flow'; shutil.rmtree(work, ignore_errors=True)
+        try: results, _ = ref.run_programs([loop, cond('loope', 'eax'), cond('loope', 2), cond('loopne', 3), skipped], work, QEMU)
+        except subprocess.CalledProcessError as e: self.skipTest(f'docker/image unavailable: {e}')
+        got = [(int(r['qemu']['gpr'][0], 16), int(r['qemu']['gpr'][1], 16), r['executed_insns']) for r in results]
+        self.assertEqual(got[0], (15, 0, 2 + 3 * 2))
+        self.assertEqual(got[1], (4, 0, 2 + 4 * 3))      # loope while equal: all four trips
+        self.assertEqual(got[2], (1, 3, 2 + 3))          # eax = 1 != 2: leaves after one trip, rcx = 3
+        self.assertEqual(got[3], (3, 1, 2 + 3 * 3))      # loopne while different: leaves when eax = 3
+        # the jump skipped the `add`: mul's undefined SF ZF AF PF stay undefined at the end (a static analysis would say none)
+        self.assertEqual((results[4]['executed_insns'], int(results[4]['undefined_flags'], 16)), (3, flags.SF | flags.ZF | flags.AF | flags.PF))
+
+    def test_leaving_the_code_and_returning_is_refused(self):
+        # jmp to a stub in a data page that jumps back: instructions after re-entry would be dropped from the path
+        p = self.flow('leave-code', [('lea rbx, [rip + back]', {'op': 'lea', 'width': 64}), ('imul rdx, rdx', {'op': 'imul', 'width': 64}),
+                                     ('mov eax, 0x200000', {'op': 'mov', 'width': 32}), ('jmp rax', {'op': 'jmp'}),
+                                     ('back: cmp ecx, 1', {'op': 'cmp', 'width': 32})])
+        p['memory'] = [{'addr': '0x200000', 'data': 'ffe3' + '00' * 0xffe}]
+        work = RAW / 'selfcheck-leave'; shutil.rmtree(work, ignore_errors=True)
+        try: ref.run_programs([p], work, QEMU)
+        except subprocess.CalledProcessError as e: self.skipTest(f'docker/image unavailable: {e}')
+        except ValueError as e: self.assertIn('left its code', str(e))
+        else: self.fail('a program that leaves its code and returns must be refused')
+
+    def test_branch_on_undefined_flag_is_rejected(self):
+        with self.assertRaises(ValueError): flags.analyze([{'op': 'mul'}, {'op': 'jcc', 'cc': 'e'}])
+        with self.assertRaises(ValueError): flags.analyze([{'op': 'mul'}, {'op': 'loope'}])
+        self.assertEqual(flags.analyze([{'op': 'mul'}, {'op': 'cmp'}, {'op': 'jcc', 'cc': 'e'}, {'op': 'loope'}]), 0)
+        self.assertEqual(flags.analyze([{'op': 'and'}, {'op': 'loopne'}]), flags.AF)       # `and` leaves ZF defined
+
 class Slice1Fixtures(unittest.TestCase):
     def test_fixtures_build_and_pins_hold(self):    # builds missing/stale fixtures; skips only if clang/Docker/QEMU are unavailable
         try: build_slice1.build()

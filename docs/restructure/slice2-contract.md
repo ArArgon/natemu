@@ -85,7 +85,7 @@ with a proven guest-RIP literal (block end or decoded direct target). Admission 
 2–4 of a literal exit (the check-window rule, widened). (c) The only store to `BLOCK_HEADER` is the entry prologue `adr
 x0,header; str x0,[x28]`. (d) The resident writes placed code only at link-point first words, and only `ldr x0,L` or `b E`,
 where E is the entry of a live block keyed (L, context). A debug self-check re-decodes every link point. Isolation is
-unchanged: a link only removes the hop between two admitted entries.
+unchanged: a link only removes the hop between two admitted entries. Known limit: admission proves a link target is one of {block end, decoded branch target}, not which exit it belongs to.
 
 **Stops and interrupts.** Stopping a running vCPU is the host's job. For a precise stop, the host `hv_vm_protect`s the IPA
 of a dedicated stop page (stage 2). FEX's `EmitSuspendInterruptCheck` store at block entry, `str
@@ -167,6 +167,11 @@ with K > 1.
   entries per 10^6 iterations; corpora pass at block sizes default/1/2.
 - **S2d, control-flow corpus, signal fault reference, loop/jrcxz.** *Check:* seeded and reviewer programs, and a fault sweep
   inside loops, match QEMU.
+  *Built (Oct 27):* `tools/reference/gen_slice2.py` (64 seeded programs from the template list above), `ref.py` `flow` and fault modes, `tools/run_slice2_vm.py` and `tools/run_slice2_faults.py` (see their headers and
+  `tools/reference/README.md`). The fault reference is a single-stepped SIGSEGV run; error code and CR2 follow natemu's
+  policy from the instruction QEMU faulted on, because QEMU reports read-modify-write loads as reads and never-mapped pages as
+  protection faults, and the flags come from QEMU's exact straight-line run of the executed path, because its signal context
+  can hold stale AF/CF after a `cmp` and a faulting `setcc`. `loop/loope/loopne/jrcxz` are allowlisted (fexc series9).
 - **S2e, SMC invalidation and single-step.** *Check:* a write to another block's page retranslates; a store or a split store
   into the running block's next instruction runs the new bytes; the mixed code/data loop terminates correctly; FEX
   `SelfModifyingCode/` passes.

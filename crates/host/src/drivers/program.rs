@@ -7,16 +7,19 @@
 //! An optional block size limit makes every program run as several blocks;
 //! `--code-cache BYTES` sets the code cache's capacity and `--watchdog-ms MS`
 //! the watchdog (default 10 s). After the run the cache's link points are
-//! self-checked ([`execution::check_links`]). `--forge-header` (a run-time
-//! defence check) makes every block's entry prologue store its entry instead of its
-//! header, which admission refuses: the resident's linker must halt.
+//! self-checked ([`execution::check_links`]). Run-time defence checks, which corrupt what admission or the resident
+//! would never produce: `--forge-header` makes every block's entry prologue store its entry instead of its header (the
+//! resident's linker must halt); `--tamper KIND` corrupts the cache when the next block will not fit and the resident is
+//! about to flush (KIND `offset`: a link point outside the code, so the reply is refused; `word`: a linked point's branch;
+//! `literal`: the target literal of a linked point; `record`: a link record), and the unlink must halt (`bad_link`);
+//! `--tamper-after KIND` (not `offset`) corrupts after the run, and the host's self-check must refuse (`links_check`).
 //!
 //! Description (text, one item per line):
 //!   rip ADDR | rflags VALUE | gpr V0 .. V15 | code HEX | memory ADDR HEX
 //!   | unmap ADDR | readonly ADDR   (mutations: clear P or R/W in the leaf entry of ADDR's page after setup)
 use super::super::*;
 use crate::execution::{self, Compiler, Stop};
-use natemu_abi::execution::{self as exec, Cpu, State};
+use natemu_abi::execution::{self as exec, Cpu, State, cache};
 use natemu_abi::guest_memory::GuestRam;
 use natemu_abi::paging::Fault;
 use std::collections::BTreeMap;
@@ -133,7 +136,7 @@ fn page_span(start: u64, length: usize) -> impl Iterator<Item = u64> {
 }
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] \
-                     [--code-cache BYTES] [--watchdog-ms MS] [--forge-header]";
+                     [--code-cache BYTES] [--watchdog-ms MS] [--forge-header] [--tamper offset|word|literal|record] [--tamper-after word|literal|record]";
 
 /// `adr x0, #-4` (the block's header) at the entry becomes `adr x0, #0` (the entry itself).
 fn forge_header(object: &mut [u8]) {
@@ -143,11 +146,66 @@ fn forge_header(object: &mut [u8]) {
     object[at..at + 4].copy_from_slice(&0x1000_0000u32.to_le_bytes());
 }
 
+/// The first link record and its source block, if the vCPU has linked anything.
+fn first_link(memory: &Memory) -> Option<(cache::Block, cache::LinkRecord)> {
+    let control: cache::Control = memory.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+    (control.links > 0).then(|| {
+        let r = execution::link_record(memory, 0);
+        (execution::placed_blocks(memory)[r.source as usize], r)
+    })
+}
+/// The resident is about to flush: the staged block does not fit (as `cache::place` computes) and links exist.
+fn flushing_next(memory: &Memory) -> bool {
+    let control: cache::Control = memory.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+    let h: natemu_abi::code_object::Header = memory.read_record(exec::STAGING_OFFSET);
+    control.links > 0 && control.code_used.next_multiple_of(64) + u64::from(h.code_size) > control.code_bytes
+}
+#[derive(Clone, Copy)]
+enum Corrupt {
+    Word,
+    Literal,
+    Record,
+}
+/// Corrupts the first linked point, its literal or its record; false when nothing is linked yet.
+fn corrupt(memory: &Memory, kind: Corrupt) -> bool {
+    let Some((b, r)) = first_link(memory) else { return false };
+    let at = cache::CODE_OFFSET + b.code as usize + r.offset as usize;
+    match kind {
+        Corrupt::Word => memory.copy(at, &0x1400_0001u32.to_le_bytes()), // b .+4
+        Corrupt::Literal => {
+            let literal = at.wrapping_add((((r.original << 8) as i32 >> 13) as i64 * 4) as usize);
+            let value = u64::from_le_bytes(memory.read::<8>(literal)) ^ 1 << 20;
+            memory.copy(literal, &value.to_le_bytes());
+        }
+        Corrupt::Record => {
+            let record = cache::LinkRecord { original: r.original.wrapping_add(1 << 5), ..r };
+            memory.write_record(cache::LOOKUP_OFFSET + cache::LINKS, record); // the literal one word further
+        }
+    }
+    true
+}
+fn tamper_offset(memory: &Memory, state: &mut State) -> bool {
+    let h: natemu_abi::code_object::Header = memory.read_record(exec::STAGING_OFFSET);
+    let Some(p) = state.link_points.iter_mut().find(|p| p.offset != 0) else { return false };
+    p.offset = h.code_size; // a whole exit no longer fits
+    true
+}
+fn tamper_word(memory: &Memory, _: &mut State) -> bool {
+    flushing_next(memory) && corrupt(memory, Corrupt::Word)
+}
+fn tamper_literal(memory: &Memory, _: &mut State) -> bool {
+    flushing_next(memory) && corrupt(memory, Corrupt::Literal)
+}
+fn tamper_record(memory: &Memory, _: &mut State) -> bool {
+    flushing_next(memory) && corrupt(memory, Corrupt::Record)
+}
+
 pub(crate) fn run(args: &[String]) -> Result<()> {
     let [_, resident, _, fexc, description, _work, options @ ..] = args else {
         return Err(USAGE.into());
     };
     let (mut max_instructions, mut code_bytes, mut watchdog_ms, mut forge) = (None, exec::cache::CODE_BYTES, 10_000, false);
+    let (mut tamper, mut tamper_after): (Option<fn(&Memory, &mut State) -> bool>, Option<Corrupt>) = (None, None);
     let mut options = options.iter();
     while let Some(option) = options.next() {
         let mut value = || -> Result<usize> { options.next().and_then(|v| v.parse().ok()).ok_or(USAGE.into()) };
@@ -155,6 +213,23 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             "--code-cache" => code_bytes = value()?,
             "--watchdog-ms" => watchdog_ms = value()? as u64,
             "--forge-header" => forge = true,
+            "--tamper" => {
+                tamper = Some(match options.next().map(String::as_str) {
+                    Some("offset") => tamper_offset,
+                    Some("word") => tamper_word,
+                    Some("literal") => tamper_literal,
+                    Some("record") => tamper_record,
+                    _ => return Err(USAGE.into()),
+                })
+            }
+            "--tamper-after" => {
+                tamper_after = Some(match options.next().map(String::as_str) {
+                    Some("word") => Corrupt::Word,
+                    Some("literal") => Corrupt::Literal,
+                    Some("record") => Corrupt::Record,
+                    _ => return Err(USAGE.into()),
+                })
+            }
             n if max_instructions.is_none() => max_instructions = Some(n.parse().map_err(|_| "bad block size limit")?),
             _ => return Err(USAGE.into()),
         }
@@ -207,11 +282,20 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         compiler.tamper = Some(forge_header);
     }
     vm.cpu.enter_resident(0, natemu_abi::shadow::TCR_BOTH)?;
-    let mut requests = execution::Requests::default();
+    let mut requests = execution::Requests { tamper, ..Default::default() };
     let watchdog = std::time::Duration::from_millis(watchdog_ms);
     let stop = execution::run(&vm, &mut compiler, Some(p.rip + p.code.len() as u64), watchdog, &mut requests)?;
     let s: State = vm.memory.read_record(exec::STATE_OFFSET);
-    let (link_points, linked) = execution::check_links(&vm.memory)?;
+    let mut tampered = requests.tampered;
+    if let Some(kind) = tamper_after {
+        tampered = corrupt(&vm.memory, kind);
+    }
+    // Under a tamper option the self-check's verdict is reported, not fatal.
+    let (link_points, linked, links_check) = match execution::check_links(&vm.memory) {
+        Ok((points, linked)) => (points, linked, "ok".to_string()),
+        Err(e) if tamper.is_some() || tamper_after.is_some() => (0, 0, e),
+        Err(e) => return Err(e),
+    };
 
     // A guest exception (resident: at an access site or stub; host: instruction fetch) with its record.
     let (kind, reason, fault) = match &stop {
@@ -248,7 +332,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{}}}",
+        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\"}}",
         s.blocks,
         s.fast,
         s.l2_hits,
@@ -270,7 +354,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         linked,
         list(&fault),
         list(&s.native),
-        frame_intact(&vm.memory)
+        frame_intact(&vm.memory),
+        tampered,
+        links_check.replace('"', "'")
     );
     println!("{out}");
     Ok(())

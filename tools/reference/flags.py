@@ -19,7 +19,8 @@ CC_READS = {'o': OF, 'no': OF, 'b': CF, 'ae': CF, 'e': ZF, 'ne': ZF, 'be': CF | 
             'le': ZF | SF | OF, 'g': ZF | SF | OF}
 
 NO_FLAGS = {'mov', 'movzx', 'movsx', 'lea', 'push', 'pop', 'not', 'setcc', 'cmovcc', 'xchg', 'bswap',
-            'cbw', 'cwde', 'cdqe', 'cwd', 'cdq', 'cqo'}
+            'cbw', 'cwde', 'cdqe', 'cwd', 'cdq', 'cqo',
+            'jcc', 'jmp', 'call', 'ret', 'loop', 'loope', 'loopne', 'jrcxz'}      # control flow: reads flags (below), writes none
 ADD_LIKE = {'add', 'adc', 'sub', 'sbb', 'cmp', 'neg'}          # all six defined
 LOGIC = {'and', 'or', 'xor', 'test'}                           # CF=OF=0; AF undefined
 SHIFTS = {'shl', 'shr', 'sar'}
@@ -40,7 +41,8 @@ def step(insn, undefined):
     op, width = insn['op'], insn.get('width', 64)
     reads = 0
     if op in ('adc', 'sbb'): reads = CF
-    elif op in ('setcc', 'cmovcc'): reads = CC_READS[insn['cc']]
+    elif op in ('setcc', 'cmovcc', 'jcc'): reads = CC_READS[insn['cc']]
+    elif op in ('loope', 'loopne'): reads = ZF
     if reads & undefined:
         raise ValueError(f"{op} {insn.get('cc', '')} reads undefined flag(s) {reads & undefined:#x}")
     if op in NO_FLAGS: return undefined

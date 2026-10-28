@@ -69,10 +69,38 @@ The tool checks final RIP = `rip+len(code)`, and QEMU's `-d in_asm` log must sho
   CL shifts the preceding `mov $N, %cl`.
 - Shifts/rotates by CL: annotate the count actually in CL (the generator emits `mov cl, imm` immediately before).
 
+## Control-flow programs (`flow`, S2d)
+
+A program with `"flow": true` may contain branches, loops, calls and returns; it must still end by reaching the capture
+sequence at `rip+len(code)` (a jump or fall-through to the end of the code). `"offsets"` lists the start offset of every
+annotated instruction (parallel to `insns`; the annotations describe the static instructions, once each). QEMU also logs the
+translation blocks it executes (`-d in_asm,exec,nochain`); the tool rebuilds the executed instruction sequence from them,
+cross-checks every executed instruction against its annotation and the supplied bytes, and runs the flags rule along that
+path, so `rflags_compare_mask` and `undefined_flags` are those of what ran (the result adds `executed_insns`). Control flow has
+annotations `jcc` (with `cc`), `jmp`, `call`, `ret`, `loop`, `loope`, `loopne`, `jrcxz`; a conditional branch or `loope/loopne`
+reading an undefined flag is rejected like `adc`. The generator is `gen_slice2.py` (structured, seeded; see its header);
+`tools/run_slice2_vm.py` runs the corpus in the VM.
+
+**Fault mode** (`"faults": {"protect": [{"addr": page, "mode": "unmap"|"readonly"}, ...]}`, flow programs, at most two
+pages, each inside a memory region; `{}` or an empty list protects nothing): QEMU runs `-singlestep` with a SIGSEGV
+handler on an alternate stack. The setup stub saves and `munmap`s (or `mprotect`s read-only) the pages before the program
+runs; the handler stores the context the signal delivers (all GPRs, RIP, EFLAGS, the sigcontext error code, trap number and CR2,
+and `si_addr`), restores the pages (an unmapped page comes back with its saved bytes, so memory can be written out) and
+writes the state and every region out like the capture sequence. The result's `qemu` is that state, `fault` the delivered
+error code and addresses, `executed_insns` the instructions completed before the fault and `path_ix` their static indices.
+A program whose page is never touched (or never written) runs to the end and has no `fault`. Known QEMU limits, handled by
+`tools/run_slice2_faults.py`: the sigcontext trap number is -1 (every fault here is a page fault), its error code is the
+access QEMU made (a read-modify-write's load is a read; a never-mapped address reports P=1), and the flags a `cmp` left lazily
+computed can be stale at a faulting `setcc` store (AF/CF) even single-stepped; the runner takes the exact state from the
+unrolled executed path instead (`gen_slice2.unrolled`).
+
 ## Limits
 
-- Straight-line, 64-bit, unprivileged code only; control flow out of the code (branches, calls) is not handled and
-  would not reach the capture sequence (rejected by the RIP check). The program must fall through.
+- QEMU's disassembly (`in_asm`) goes wrong inside translation blocks longer than 1 KiB; the annotation cross-check catches it
+  (the run fails loudly, it is never silently wrong).
+- A flow program that leaves its code region (other than into the capture sequence or the fault handler) is refused.
+- Straight-line programs (or `flow` programs, above), 64-bit, unprivileged code only. A straight-line program must fall
+  through to the capture sequence (rejected by the RIP check otherwise).
 - Linux-user cannot represent: privileged state (CRs, MSRs, segments/descriptors, IDT), guest paging/page-table
   faults, exceptions as architectural events (a fault kills the process: nonzero exit is an error), IF/IOPL/TF changes,
   other CPUs/ordering. Use the existing independent models for those.

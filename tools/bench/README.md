@@ -96,9 +96,14 @@ October 27, 2026 (S2c, series8, default block size, 5 rounds, M4, not idle; `nat
 |---|---|---|---|---|---|
 | int | 0.189 | 0.2 | 0.200 | 0.94 | one linked self-loop block |
 | mem64 | 0.102 | 12.3 | 0.346 | 0.30 | one linked block; 512 shadow retries at start |
-| mem4096 | 0.993 | 9.7 | 0.398 | 2.50 | one linked block; 256 pages per sweep (TLB misses in the VM) |
+| mem4096 | 0.993 | 9.7 | 0.398 | 2.50 | one linked block; 256 pages per sweep (see below) |
 | call | 0.156 | 1.6 | 0.744 | 0.21 | linked call edge; `ret` through the fast dispatcher (one L1 hit per iteration) |
 | branchy | 0.410 | 0.5 | 0.597 | 0.69 | six blocks, all edges linked |
 | mixed | 0.080 | 0.9 | 0.283 | 0.28 | one linked block |
 
 Guest RAM grew from 1 to 4 MiB for this (the 1 MiB array of mem64/mem4096 did not fit). Not attributed yet (S2g).
+
+Reading mem4096 (unproven without PMU access): about half of its cost is the access pattern itself, which is slow even
+natively (every access touches a new 4 KiB stride). The rest grows with the page count and is consistent with the VM's
+stage-1 TLB reach of 4 KiB guest pages against 16 KiB host pages, but no counter has confirmed this. Slope estimators
+differ between the two columns: QEMU's is a least-squares fit over N, 2N and 4N (the Method section), natemu's the N/2N pair.

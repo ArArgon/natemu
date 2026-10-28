@@ -53,6 +53,31 @@ def page_checks(p, vm):
                 problems.append(f'{(a + i) & ~4095:#x} written but not dirty'); break
     return problems
 
+def run_program(host, runtime, fexc, p, expected, work, max_block=None):
+    """Runs one program description in the VM (`natemu-host run-program`) and compares with its QEMU result `expected`:
+    {'name', 'returncode', 'stderr', 'outcome': match | unsupported | fail, 'diffs', 'vm'}."""
+    work.mkdir(parents=True, exist_ok=True)
+    (work / 'program.txt').write_text(description(p))
+    limit = [str(max_block)] if max_block else []
+    run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work] + limit, capture_output=True, text=True)
+    entry = {'name': p['name'], 'returncode': run.returncode, 'stderr': run.stderr[-2000:]}
+    if run.returncode == 0:
+        vm = json.loads(run.stdout)
+        entry['vm'] = vm
+        diffs = ref.compare(expected, [ref.num(v) for v in vm['gpr']], ref.num(vm['rflags']), ref.num(vm['rip']), vm['memory'])
+        limit = declared_limit(vm)
+        if limit:
+            entry['outcome'] = 'unsupported'
+            diffs = [f"stopped at {vm['rip']}: {limit}"]
+        else:
+            if vm['stop'] != 'reached': diffs.insert(0, f"stopped {vm['stop']} {vm['reason']} at {vm['rip']}")
+            diffs += page_checks(p, vm)
+            entry['outcome'] = 'fail' if diffs else 'match'
+        entry['diffs'] = diffs
+    else:
+        entry['outcome'] = 'fail'
+    return entry
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('programs', type=pathlib.Path, nargs='?', default=ROOT / 'fixtures/slice1/programs.json')
@@ -66,32 +91,11 @@ def main():
     a.out.mkdir(parents=True, exist_ok=True)
     results, counts = [], {'match': 0, 'unsupported': 0, 'fail': 0}
     for p in json.loads(a.programs.read_text())['programs']:
-        work = a.out / 'work' / p['name']
-        work.mkdir(parents=True, exist_ok=True)
-        (work / 'program.txt').write_text(description(p))
-        limit = [str(a.max_block)] if a.max_block else []
-        run = subprocess.run([host, runtime, 'run-program', a.fexc, work / 'program.txt', work] + limit, capture_output=True, text=True)
-        entry = {'name': p['name'], 'returncode': run.returncode, 'stderr': run.stderr[-2000:]}
-        if run.returncode == 0:
-            vm = json.loads(run.stdout)
-            entry['vm'] = vm
-            diffs = ref.compare(expected[p['name']], [ref.num(v) for v in vm['gpr']], ref.num(vm['rflags']),
-                                ref.num(vm['rip']), vm['memory'])
-            limit = declared_limit(vm)
-            if limit:
-                entry['outcome'] = 'unsupported'
-                diffs = [f"stopped at {vm['rip']}: {limit}"]
-            else:
-                if vm['stop'] != 'reached': diffs.insert(0, f"stopped {vm['stop']} {vm['reason']} at {vm['rip']}")
-                diffs += page_checks(p, vm)
-                entry['outcome'] = 'fail' if diffs else 'match'
-            entry['diffs'] = diffs
-        else:
-            entry['outcome'] = 'fail'
+        entry = run_program(host, runtime, a.fexc, p, expected[p['name']], a.out / 'work' / p['name'], a.max_block)
         counts[entry['outcome']] += 1
         results.append(entry)
         stats = entry.get('vm', {}).get('stats', {})
-        print(f"{p['name']}: {entry['outcome']} {stats} {'; '.join(entry.get('diffs', []))[:300]} {run.stderr.strip()[-300:]}")
+        print(f"{p['name']}: {entry['outcome']} {stats} {'; '.join(entry.get('diffs', []))[:300]} {entry['stderr'].strip()[-300:]}")
     (a.out / 'results.json').write_text(json.dumps({'counts': counts, 'results': results}, indent=1) + '\n')
     print(counts)
     sys.exit(1 if counts['fail'] else 0)

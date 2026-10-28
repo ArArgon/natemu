@@ -1,6 +1,6 @@
 """S1c checks: profile slice1 of fexc (block cutting at an allowlist, single-gate exits, profile record).
 
-Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series8 build)
+Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series9 build)
 
 The x86 bytes below are assembled by hand and only drive the compiler; every expectation (where the block ends, why)
 comes from the instruction's architectural class, never from fexc's output. The cut position is also compared with a
@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402  (disassemble, object reader)
 import scan_skips  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series8/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series9/obj/fexc')
 REPO = HERE.parents[1]
 RIP = 0x102000
 PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
@@ -52,7 +52,7 @@ UNSUPPORTED = {
     'mov rax,fs:[rax]': '64488b00', 'mov rax,gs:[rax]': '65488b00', 'mov eax,[eax] (addr32)': '678b00',
     'pause': 'f390', 'addps': '0f58c1', 'movaps': '0f28c1', 'fld st0': 'd9c0', 'vzeroupper': 'c5f877', 'cld': 'fc', 'std': 'fd',
     'clc': 'f8', 'stc': 'f9', 'lahf': '9f', 'sahf': '9e', 'lfence': '0faee8', 'mfence': '0faef0', 'sfence': '0faef8',
-    'fxsave': '0fae00', 'loop': 'e2fe', 'jrcxz': 'e3fe', 'shld': '0fa4c101', 'shrd': '0facc101', 'popcnt': 'f3480fb8c1',
+    'fxsave': '0fae00', 'loop 67-prefix': '67e2fe', 'jecxz': '67e3fe', 'loop o16': '66e2fe', 'shld': '0fa4c101', 'shrd': '0facc101', 'popcnt': 'f3480fb8c1',
     'tzcnt': 'f30fbcc1', 'lzcnt': 'f30fbdc1', 'rdrand': '0fc7f0', 'rdseed': '0fc7f8', 'cmpxchg16b': '480fc708', 'cmpxchg8b': '0fc708',
     'leave': 'c9', 'enter': 'c8080000', 'xlat': 'd7', 'movbe': '0f38f000', 'prefetch': '0f1808', 'sal /6 alias': 'd1f0',
     'bnd ret': 'f2c3', 'o16 ret': '66c3', 'o16 jmp': '66e9fbffffff', 'bswap r9w (undefined)': '66410fc9', 'bswap ax': '660fc8',
@@ -86,6 +86,7 @@ ALLOWED = {
 # (name, hex, translated-instruction count): control transfers end the block with their normal exit.
 BRANCHES = {
     'jmp rel8': 'eb05', 'jmp rel32': 'e905000000', 'jne rel8': '7505', 'je rel32': '0f8405000000', 'call rel32': 'e805000000',
+    'loop rel8': 'e205', 'loope rel8': 'e105', 'loopne rel8': 'e005', 'jrcxz rel8': 'e305',
     'ret': 'c3', 'rep ret': 'f3c3', 'ret 8': 'c20800', 'jmp rax': 'ffe0', 'call rax': 'ffd0', 'jmp [rax]': 'ff20', 'call [rax]': 'ff10',
 }
 
@@ -320,7 +321,7 @@ class Slice1Exits(unittest.TestCase):
                     d, rc = run(PRE + x)
                     self.assertEqual(rc, 0)
                     n, _ = check_exits(self, d, tmp, name)
-                    self.assertEqual(n, 2 if name in ('jne rel8', 'je rel32') else 1, name)   # jcc: taken and fall-through gates
+                    self.assertEqual(n, 2 if name in ('jne rel8', 'je rel32', 'loop rel8', 'loope rel8', 'loopne rel8', 'jrcxz rel8') else 1, name)   # taken and fall-through gates
             for name, x in (('fall off the window', PRE), ('cut before cr3 write', PRE + SYSTEM['mov cr3,rax'])):
                 with self.subTest(name):
                     d, rc = run(x)
@@ -414,6 +415,25 @@ class Slice1SelfLoopsAndStop(unittest.TestCase):
                         lit = [(r['offset'], r['size']) for r in d['code']['relocations'] if r['size']]
                         dis = check_sites.disassemble(code, end, Path(t), lit)
                         self.assertEqual(vp.entry_and_branches(d, dis, sorted(dis)), [])   # P12, P13
+
+    def test_self_loop_exits_of_loop_and_jrcxz(self):
+        body = '4883c001' + '48ffc9'
+        import verify_precision as vp
+        with tempfile.TemporaryDirectory() as t:
+            for name, op in (('loopne', 0xe0), ('loope', 0xe1), ('loop', 0xe2), ('jrcxz', 0xe3)):
+                with self.subTest(name):
+                    d, rc = run(body + f'{op:02x}f7')
+                    self.assertEqual((rc, d['guest']['instructions_translated']), (0, 3))
+                    n, _ = check_exits(self, d, Path(t), name)
+                    self.assertEqual(n, 2)
+                    lits = sorted(r['guest_rip'] for r in d['code']['relocations'] if r['kind'] == 'guest_rip_literal')
+                    self.assertIn(hex(RIP), lits)
+                    self.assertIn(hex(RIP + 9), lits)
+                    code = bytes.fromhex(d['code']['hex'])
+                    end = d['code']['layout']['code_region_end']
+                    lit = [(r['offset'], r['size']) for r in d['code']['relocations'] if r['size']]
+                    dis = check_sites.disassemble(code, end, Path(t), lit)
+                    self.assertEqual(vp.entry_and_branches(d, dis, sorted(dis)), [])   # P12, P13
 
     def test_stop_store_is_the_third_prologue_word_of_every_block(self):
         for name, x in list(BRANCHES.items()) + [('add', '4801d8'), ('push', '50'), ('mov [rax],rcx', '488908'), ('div', '48f7f1')]:

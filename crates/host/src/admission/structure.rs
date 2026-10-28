@@ -513,8 +513,9 @@ impl<'a> Verifier<'a> {
     /// x28 accesses: unsigned offset inside one admitted field; native pointers only loaded by the exit gate and the
     /// helper call; State.rip only written whole (checked by `exits`).
     fn frame_access(&self, m: Mem, at: u32) -> Result<(), String> {
-        let (offset, end) = (m.addr.imm as u32, m.addr.imm as u32 + m.size as u32);
-        let overlaps = |field: u32, len: u32| offset < field + len && field < end;
+        // i64: an unscaled access can be at a negative offset (`stur x0, [x28, #-4]`), outside every field.
+        let (offset, end) = (m.addr.imm, m.addr.imm + m.size as i64);
+        let overlaps = |field: u32, len: u32| offset < (field + len) as i64 && (field as i64) < end;
         let w = self.word(at);
         if overlaps(INTERRUPT_FAULT_PAGE, 8) {
             // The stop store, only as the block's third prologue word (`entry` checks it is there).
@@ -540,11 +541,11 @@ impl<'a> Verifier<'a> {
             };
         }
         let ok = m.form == Form::Unsigned
-            && frame::FIELDS.iter().any(|&(field, len)| offset >= field && end <= field + len)
+            && frame::FIELDS.iter().any(|&(field, len)| offset >= field as i64 && end <= (field + len) as i64)
             && (!frame::POINTERS.iter().any(|&p| overlaps(p, 8))
                 || (w == LDR_GATE && self.word(at + 4) == BR_X1)
                 || ((w == LDR_LUDIV || w == LDR_LDIV) && self.helper_at(at)))
-            && (m.load || !overlaps(frame::RIP, 8) || (offset == frame::RIP && m.size == 8));
+            && (m.load || !overlaps(frame::RIP, 8) || (offset == frame::RIP as i64 && m.size == 8));
         if ok { Ok(()) } else { Err(format!("frame access {w:#010x} at {at:#x}")) }
     }
 
@@ -1252,6 +1253,8 @@ mod tests {
         refused(ADDRESS, at, old, 0xb900_1b94, "frame access"); // str w20, [x28, #24]: half of State.rip
         refused(ADDRESS, at, old, 0xf905_b781, "frame access"); // str x1, [x28, #DispatcherLoopTop]
         refused(ADDRESS, at, old, 0xf945_b781, "frame access"); // ldr x1, [x28, #DispatcherLoopTop] without its br
+        refused(ADDRESS, at, old, 0xf81f_c380, "frame access"); // stur x0, [x28, #-4]: before the frame (once overflowed u32)
+        refused(ADDRESS, at, old, 0xf85f_c380, "frame access"); // ldur x0, [x28, #-4]
         refused(ADDRESS, at, old, 0xa940_0780, "unrecognised"); // ldp x0, x1, [x28]
         refused(ADDRESS, at, old, 0xaa14_03fc, "write to x28"); // mov x28, x20
         refused(ADDRESS, at, old, 0x9100_029f, "write to sp"); // mov sp, x20

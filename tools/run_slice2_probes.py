@@ -16,9 +16,10 @@ without a flush (only the one requested when the driver writes guest RAM), host 
 distinct block RIPs (every block is compiled once and then found in the VM); a forced small code cache (`--code-cache`,
 at least the largest block) must flush repeatedly and still match; a cache smaller than that is refused. Linking (S2c): a
 hot loop at N and 2N iterations makes the same resident entries and dispatcher hits, and a forged block header halts the
-linker; every run self-checks its link points (the driver). A non-terminating loop must be stopped by the watchdog. A block refused for a
-native backward branch (see SELF_LOOP) is reported as unsupported. Nothing is keyed by probe
-name; expected values come only from QEMU. Writes DIR/probes.json; exit status 1 on any failure."""
+linker; every run self-checks its link points (the driver). A non-terminating loop must be stopped by the watchdog. Run-time tamper checks
+(driver `--tamper`, `--tamper-after`): a link point reported outside its block is refused (`bad_reply`); a corrupted linked
+branch, target literal or link record makes the next flush halt (`bad_link`) and is refused by the host's self-check
+(`links_check`). Nothing is keyed by probe name; expected values come only from QEMU. Writes DIR/probes.json; exit status 1 on any failure."""
 import argparse, json, pathlib, random, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -152,12 +153,6 @@ PROBES = [
 ]
 # (probe, extra run-program arguments, expect repeated flushes: True, none: False, either: None)
 RUNS = [(p['name'], args, False) for p in PROBES for args in ([], ['1'], ['2'])]
-# A declared limit, not a failure: FEX compiles a jcc back to its own block's entry as a native backward branch (the
-# taken edge of `CondJump` uses the compile's own entry as a jump target even without multiblock), which admission
-# refuses. A loop whose body is one block therefore runs only with a block limit until the producer exits there.
-SELF_LOOP = 'not forward to an instruction of the code region'
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
@@ -171,7 +166,7 @@ def main():
     qemu = a.qemu or raw / 'reference-slice1-20261026-01' / 'pin' / 'qemu-x86_64-static'
     results, _ = ref.run_programs([r for _, r, _ in built.values()], a.out / 'ref', qemu)
     expected = {r['name']: r for r in results}
-    out, failures, unsupported = [], 0, 0
+    out, failures = [], 0
 
     def run(name, program, args):
         work = a.out / 'work' / name
@@ -184,11 +179,6 @@ def main():
         program, _, end = built[name]
         state, err = run(name, program, args)
         entry = {'name': name, 'args': args, 'stderr': err}
-        if state is None and SELF_LOOP in err:
-            unsupported += 1
-            out.append(entry | {'outcome': 'unsupported'})
-            print(f"{name} {' '.join(args)}: unsupported (self-loop branch refused by admission)")
-            continue
         if state is None:
             diffs = [f'host error: {err}']
         else:
@@ -219,6 +209,7 @@ def main():
         if state is not None:
             if state['stop'] != 'reached' or ref.num(state['rip']) != end: diffs.insert(0, f"stopped {state['stop']} at {state['rip']}")
             if flushes and state['stats']['flushes'] < 3: diffs.append(f"expected repeated flushes, got {state['stats']['flushes']}")
+            if flushes and not state['stats']['stale_links']: diffs.append('expected a flush during a link target request (stale_links)')
         failures += bool(diffs)
         out.append({'name': program['name'], 'args': args, 'stats': state and state['stats'], 'diffs': diffs, 'stderr': err})
         print(f"{program['name']} {' '.join(args)}: {'fail' if diffs else 'match'} {state and state['stats']} {'; '.join(diffs)[:300]}")
@@ -260,6 +251,33 @@ def main():
     out.append({'name': 'forged-header', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
     print(f"forged-header: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']}")
 
+    # Run-time tampering (driver options): what admission and the resident never produce must be caught. A host-supplied
+    # link point outside its block is refused at placement; a corrupted linked branch, target literal or link record
+    # (corrupted just before a flush) halts the unlink, and the host's self-check refuses the same corruption after a run.
+    flush_args = ['1', '--code-cache', '32768']
+    program = add_chain(600, 3)[0]
+    state, err = run('tamper-offset', program, flush_args + ['--tamper', 'offset'])
+    ok = state is not None and state['tampered'] and state['stop'] == 'resident' and state['reason'].startswith('bad_reply')
+    failures += not ok
+    out.append({'name': 'tamper-offset', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
+    print(f"tamper offset: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']} {err}")
+    for kind in ('word', 'literal', 'record'):
+        state, err = run(f'tamper-{kind}', program, flush_args + ['--tamper', kind])
+        ok = state is not None and state['tampered'] and state['stop'] == 'resident' and state['reason'].startswith('bad_link')
+        failures += not ok
+        out.append({'name': f'tamper-{kind}', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
+        print(f"tamper {kind} before a flush: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']} {err}")
+        small, _, _ = add_chain(3, 40)
+        state, err = run(f'tamper-after-{kind}', small, ['--tamper-after', kind])
+        ok = state is not None and state['tampered'] and state['stop'] == 'reached' and state['links_check'] != 'ok'
+        failures += not ok
+        out.append({'name': f'tamper-after-{kind}', 'links_check': state and state['links_check'], 'stderr': err})
+        print(f"tamper {kind} after the run: {'match' if ok else 'fail'} host self-check: {state and state['links_check']} {err}")
+    state, err = run('untampered', add_chain(3, 40)[0], [])
+    ok = state is not None and state['links_check'] == 'ok' and not state['tampered']
+    failures += not ok
+    print(f"untampered: {'match' if ok else 'fail'} {state and state['links_check']}")
+
     # The watchdog stops a loop that never ends (no host exit after its first block; linked, it never leaves the code).
     spin = {'name': 'spin', 'code': ref.assemble('1: inc rax\njmp 1b').hex(), 'rip': CODE, 'gpr': gprs(), 'rflags': 0, 'memory': []}
     state, err = run('spin', spin, ['--watchdog-ms', '300'])
@@ -282,7 +300,7 @@ def main():
         out.append({'name': name, 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
         print(f"{name}: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']}")
     (a.out / 'probes.json').write_text(json.dumps(out, indent=1) + '\n')
-    print(f'{len(out) - failures - unsupported} match, {unsupported} unsupported, {failures} fail')
+    print(f'{len(out) - failures} match, {failures} fail')
     sys.exit(1 if failures else 0)
 
 

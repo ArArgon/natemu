@@ -32,6 +32,10 @@ HARNESS = 0x40000                     # setup code; +0x1000 input block; +0x2000
 IN, OUT, TABLE, STACK_TOP = HARNESS + 0x1000, HARNESS + 0x2000, HARNESS + 0x2800, HARNESS + 0x4000
 ADDR_MIN, ADDR_MAX = 0x10000, 0x300000000   # program bytes must lie here (tested to 0x2_0000_1000; 0x7fff_0000_0000 failed)
 MAX_REGIONS = 100
+# Fault mode (signal reference): a SIGSEGV handler on an alternate stack, the saved pages of unmapped regions
+ALT, ALT_BYTES, SAVE, SAVE_PAGES = HARNESS + 0x4000, 0x2000, HARNESS + 0x6000, 2
+HANDLER, ACT, SS, RESTORER = HARNESS + 0x400, HARNESS + 0x300, HARNESS + 0x340, HARNESS + 0x3c0
+FAULT_BYTES = 32                      # appended to the 144-byte output: error code, trap number, CR2, si_addr
 
 
 def require(ok, why):
@@ -78,6 +82,57 @@ def _stubs():
             'add r12d, 16', 'dec r13d', 'jnz again', 'done:', 'mov eax, 231', 'xor edi, edi', 'syscall']
     return assemble('\n'.join(setup)), assemble('\n'.join(cap))
 _STUBS = None
+_FAULT_STUBS = {}
+
+
+def _fault_stubs(protect):
+    """(setup, handler, restorer) machine code of fault mode for the page protections `protect` [(page, 'unmap'|'readonly')]:
+    the setup installs the handler (rt_sigaction on SIGSEGV, sigaltstack) and applies the protections before the program
+    starts; the handler stores the faulting context (ucontext: GPRs, RIP, EFLAGS, err, trapno, CR2; siginfo: si_addr),
+    undoes the protections (unmapped pages come back with their saved bytes, so the regions can be written out) and
+    writes the state and the regions out like the capture sequence."""
+    key = tuple(protect)
+    if key in _FAULT_STUBS: return _FAULT_STUBS[key]
+    setup = [f'mov eax, 131', f'mov edi, {SS}', 'xor esi, esi', 'syscall',                        # sigaltstack(&ss, 0)
+             f'mov eax, 13', 'mov edi, 11', f'mov esi, {ACT}', 'xor edx, edx', 'mov r10d, 8', 'syscall']   # rt_sigaction(SIGSEGV, &act, 0, 8)
+    restore = []
+    for i, (page, mode) in enumerate(protect):
+        if mode == 'unmap':
+            setup += [f'mov esi, {page}', f'mov edi, {SAVE + PAGE * i}', 'mov ecx, 4096', 'cld', 'rep movsb',
+                      'mov eax, 11', f'mov edi, {page}', 'mov esi, 4096', 'syscall']             # copy the page away, munmap it
+            restore += ['mov eax, 9', f'mov edi, {page}', 'mov esi, 4096', 'mov edx, 3', 'mov r10d, 0x32', 'mov r8, -1', 'xor r9d, r9d', 'syscall',
+                        f'mov esi, {SAVE + PAGE * i}', f'mov edi, {page}', 'mov ecx, 4096', 'cld', 'rep movsb']   # mmap it back, refill it
+        else:
+            setup += ['mov eax, 10', f'mov edi, {page}', 'mov esi, 4096', 'mov edx, 1', 'syscall']        # mprotect(PROT_READ)
+            restore += ['mov eax, 10', f'mov edi, {page}', 'mov esi, 4096', 'mov edx, 3', 'syscall']
+    # ucontext.uc_mcontext (offset 0x28): r8..r15, rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp, rip, eflags, cs/gs/fs, err, trapno, oldmask, cr2
+    at = {'r8': 0, 'r9': 8, 'r10': 16, 'r11': 24, 'r12': 32, 'r13': 40, 'r14': 48, 'r15': 56, 'rdi': 64, 'rsi': 72, 'rbp': 80, 'rbx': 88,
+          'rdx': 96, 'rax': 104, 'rcx': 112, 'rsp': 120}
+    handler = ['mov r9, rsi', 'mov r8, rdx']                                                         # siginfo, ucontext
+    for i, r in enumerate(REGS): handler += [f'mov rax, qword ptr [r8 + {0x28 + at[r]}]', f'mov qword ptr [{OUT + 8 * i}], rax']
+    for k, off in enumerate((136, 128, 152, 160, 176)):      # eflags, rip, err, trapno, cr2
+        handler += [f'mov rax, qword ptr [r8 + {0x28 + off}]', f'mov qword ptr [{OUT + 128 + 8 * k}], rax']
+    handler += ['mov rax, qword ptr [r9 + 16]', f'mov qword ptr [{OUT + 168}], rax']                 # si_addr
+    handler += restore
+    handler += ['mov eax, 1', 'mov edi, 1', f'mov esi, {OUT}', f'mov edx, {144 + FAULT_BYTES}', 'syscall',
+                f'mov r12d, {TABLE + 8}', f'mov r13d, dword ptr [{TABLE}]', 'test r13d, r13d', 'jz done', 'again:',
+                'mov rsi, qword ptr [r12]', 'mov rdx, qword ptr [r12 + 8]', 'mov eax, 1', 'mov edi, 1', 'syscall',
+                'add r12d, 16', 'dec r13d', 'jnz again', 'done:', 'mov eax, 231', 'xor edi, edi', 'syscall']
+    if _STUBS is None: globals()['_STUBS'] = _stubs()
+    base_setup = [f'mov esp, {IN + 8}', 'popfq'] + [f'mov {r}, qword ptr [{IN + 16 + 8 * i}]' for i, r in enumerate(REGS) if r != 'rsp']
+    base_setup += [f'mov rsp, qword ptr [{IN + 16 + 8 * 4}]', f'jmp qword ptr [{IN}]']
+    code = assemble('\n'.join(setup + base_setup))
+    require(len(code) < ACT - HARNESS, 'fault-mode setup code too long')
+    cap = ['cap:'] + [f'mov qword ptr [{OUT + 8 * i}], {r}' for i, r in enumerate(REGS)]
+    cap += [f'mov esp, {STACK_TOP}', 'pushfq', f'pop qword ptr [{OUT + 128}]', 'lea rax, [rip + cap]', f'mov qword ptr [{OUT + 136}], rax'] + restore
+    cap += ['mov eax, 1', 'mov edi, 1', f'mov esi, {OUT}', 'mov edx, 144', 'syscall',      # then written out as the plain capture
+            f'mov r12d, {TABLE + 8}', f'mov r13d, dword ptr [{TABLE}]', 'test r13d, r13d', 'jz done', 'again:',
+            'mov rsi, qword ptr [r12]', 'mov rdx, qword ptr [r12 + 8]', 'mov eax, 1', 'mov edi, 1', 'syscall',
+            'add r12d, 16', 'dec r13d', 'jnz again', 'done:', 'mov eax, 231', 'xor edi, edi', 'syscall']
+    out = (code, assemble('\n'.join(handler)), assemble('mov eax, 15\nsyscall'), assemble('\n'.join(cap)))
+    _FAULT_STUBS[key] = out
+    return out
+
 
 
 def norm(p):
@@ -91,7 +146,22 @@ def norm(p):
     require(p.get('insns'), 'insns annotations are required (flag masks and the disassembly cross-check depend on them)')
     require(rflags & ~(flags.ARITH | 2) == 0, 'initial RFLAGS may only set the arithmetic flags')
     require(len(regions) <= MAX_REGIONS and all(d for _, d in regions), 'regions: 1..%d non-empty' % MAX_REGIONS)
-    return dict(name=p.get('name', ''), code=code, rip=rip, gpr=gpr, rflags=rflags, regions=regions, insns=p.get('insns'), prefix=prefix)
+    flow, offsets = bool(p.get('flow')), p.get('offsets')
+    if flow:
+        require(prefix is None, 'a flow program cannot also be a prefix program')
+        require(offsets and len(offsets) == len(p['insns']) and offsets == sorted(set(offsets)) and offsets[-1] < len(code),
+                'flow: "offsets" must list the start offset of each annotated instruction (increasing, inside the code)')
+    faults = p.get('faults')
+    if faults is not None:
+        protect = [(num(x['addr']), x['mode']) for x in faults.get('protect', [])]
+        require(flow, 'fault mode needs a flow program (the executed path ends where the fault is)')
+        require(len(protect) <= SAVE_PAGES and len({a for a, _ in protect}) == len(protect), f'at most {SAVE_PAGES} distinct protected pages')
+        for page, mode in protect:
+            require(mode in ('unmap', 'readonly') and page % PAGE == 0 and any(a <= page and page + PAGE <= a + len(d) for a, d in regions),
+                    f'protection {mode} {page:#x}: a whole page of a memory region')
+        faults = protect
+    return dict(name=p.get('name', ''), code=code, rip=rip, gpr=gpr, rflags=rflags, regions=regions, insns=p.get('insns'), prefix=prefix,
+                flow=flow, offsets=offsets, faults=faults)
 
 
 def build_elf(p):
@@ -99,6 +169,7 @@ def build_elf(p):
     global _STUBS
     if _STUBS is None: _STUBS = _stubs()
     setup, cap = _STUBS
+    if p['faults'] is not None: setup, handler, restorer, cap = _fault_stubs(p['faults'])
     pages, claimed = {}, {}
     def put(addr, data, what):
         require(ADDR_MIN <= addr and addr + len(data) <= ADDR_MAX, f'{what} at {addr:#x} outside [{ADDR_MIN:#x},{ADDR_MAX:#x})')
@@ -108,9 +179,16 @@ def build_elf(p):
             claimed[a] = what; pages.setdefault(a // PAGE, bytearray(PAGE))[a % PAGE] = b
     for i in range(HARNESS // PAGE, STACK_TOP // PAGE): pages[i] = bytearray(PAGE)
     for i in range(HARNESS, STACK_TOP): claimed[i] = 'harness'
+    if p['faults'] is not None:
+        for i in range(ALT // PAGE, (SAVE + SAVE_PAGES * PAGE) // PAGE): pages[i] = bytearray(PAGE)
+        for i in range(ALT, SAVE + SAVE_PAGES * PAGE): claimed[i] = 'harness'
     def poke(addr, data):
         for i, b in enumerate(data): pages[(addr + i) // PAGE][(addr + i) % PAGE] = b
     poke(HARNESS, setup)
+    if p['faults'] is not None:
+        poke(HANDLER, handler); poke(RESTORER, restorer)
+        poke(ACT, struct.pack('<4Q', HANDLER, 4 | 0x04000000 | 0x08000000 | 0x40000000, RESTORER, 0))     # SA_SIGINFO|RESTORER|ONSTACK|NODEFER
+        poke(SS, struct.pack('<QiiQ', ALT, 0, 0, ALT_BYTES))
     poke(IN, struct.pack('<2Q', p['rip'], p['rflags'] | 0x202) + b''.join(struct.pack('<Q', g) for g in p['gpr']))
     poke(TABLE, struct.pack('<Q', len(p['regions'])) + b''.join(struct.pack('<2Q', a, len(d)) for a, d in p['regions']))
     for a, d in p['regions']: put(a, d, f'memory {a:#x}')
@@ -129,12 +207,17 @@ def build_elf(p):
 
 def parse_output(p, out):
     sizes = [len(d) for _, d in p['regions']]
-    require(len(out) == 144 + sum(sizes), f'QEMU output length {len(out)}, expected {144 + sum(sizes)}')
-    v = struct.unpack('<18Q', out[:144]); at = 144; mem = []
+    extra = len(out) - 144 - sum(sizes)
+    require(extra == 0 or (p['faults'] is not None and extra == FAULT_BYTES), f'QEMU output length {len(out)}, expected {144 + sum(sizes)}')
+    v = struct.unpack('<18Q', out[:144]); at = 144 + extra; mem = []
     for (a, d) in p['regions']: mem.append({'addr': hx(a), 'data': out[at:at + len(d)].hex()}); at += len(d)
-    require(v[17] == p['rip'] + len(p['code']), f'final RIP {v[17]:#x}: capture sequence not reached by fallthrough')
     require(v[16] & ~flags.ARITH == flags.FIXED, f'RFLAGS {v[16]:#x}: unexpected non-arithmetic bits')
-    return {'gpr': [hx(x) for x in v[:16]], 'rflags': hx(v[16]), 'rip': hx(v[17]), 'memory': mem}
+    final = {'gpr': [hx(x) for x in v[:16]], 'rflags': hx(v[16]), 'rip': hx(v[17]), 'memory': mem}
+    if extra:      # the signal handler ran: the context at the fault
+        err, trapno, cr2, si_addr = struct.unpack('<4Q', out[144:144 + FAULT_BYTES])
+        return final, {'err': err, 'trapno': hx(trapno), 'cr2': hx(cr2), 'si_addr': hx(si_addr)}
+    require(v[17] == p['rip'] + len(p['code']), f'final RIP {v[17]:#x}: capture sequence not reached by fallthrough')
+    return final, None
 
 
 LINE = re.compile(r'^0x([0-9a-f]+):\s+((?:[0-9a-f]{2}(?=\s|$)\s?)+)\s*(\S.*)?$')
@@ -151,8 +234,12 @@ def disasm(log, rip, length):
 IMPLICIT = {'cbw': ('cbtw', 16), 'cwde': ('cwtl', 32), 'cdqe': ('cltq', 64), 'cwd': ('cwtd', 16), 'cdq': ('cltd', 32), 'cqo': ('cqto', 64)}
 SUFFIX = {'b': 8, 'w': 16, 'l': 32, 'q': 64}
 
+BRANCH_OPS = {'jcc', 'jmp', 'call', 'ret', 'loop', 'loope', 'loopne', 'jrcxz'}      # control flow: no operand width to check
+
 def mnemonic_ok(insn, m):
     op = insn['op']
+    if op == 'jcc': return m == 'j' + insn['cc']
+    if op in BRANCH_OPS: return m in (op, op + 'q')            # QEMU prints jmpq/callq/retq; loop, loope, loopne, jrcxz as is
     if op in IMPLICIT: return m == IMPLICIT[op][0]
     if op == 'setcc': return m == 'set' + insn['cc']
     if op == 'cmovcc': return m in ['cmov' + insn['cc']] + ['cmov' + insn['cc'] + s for s in 'wlq']
@@ -178,6 +265,21 @@ def att_width(ann, m, ops):
     if ops and ops[-1].startswith('%'): return WIDTH[ops[-1][1:]]
     return SUFFIX.get(m[-1]) if m[-1] in SUFFIX else None
 
+def check_one(ann, a, m, t, prev):
+    """One annotation against QEMU's disassembly (`m` mnemonic, `t` text) of the instruction at `a`; `prev` is the text of the
+    instruction executed before it."""
+    require(mnemonic_ok(ann, m), f'annotation {ann} does not match disassembly "{t}" at {a:#x}')
+    ops = att_operands(t)
+    w = att_width(ann, m, ops)
+    require(ann['op'] in BRANCH_OPS or w == ann.get('width', 64),
+            f'annotated width {ann.get("width")} but disassembly "{t}" implies {w} at {a:#x}')
+    if ann['op'] in flags.SHIFTS | flags.ROTATES:
+        if ops[0] == '%cl':          # count came from CL: the previous instruction must be mov $N, %cl
+            pm = re.fullmatch(r'movb\s+\$(\S+), %cl', prev)
+            require(pm and int(pm[1], 0) & 0xff == ann['count'] & 0xff, f'CL count {ann["count"]} not set by preceding "mov $N, %cl" at {a:#x}')
+        else:
+            require(ops[0].startswith('$') and int(ops[0][1:], 0) & 0xff == ann['count'] & 0xff, f'shift count {ann["count"]} vs "{t}"')
+
 def check_annotations(p, log):
     """Cross-check the annotations (mnemonic, operand width, shift count) against QEMU's disassembly of the executed bytes."""
     insns, raw = disasm(log, p['rip'], len(p['code']))
@@ -186,19 +288,64 @@ def check_annotations(p, log):
     require(len(insns) == len(p['insns']), f'{len(insns)} instructions executed, {len(p["insns"])} annotated')
     prev = ''
     for (a, m, t), ann in zip(insns, p['insns']):
-        require(mnemonic_ok(ann, m), f'annotation {ann} does not match disassembly "{t}" at {a:#x}')
-        ops = att_operands(t)
-        w = att_width(ann, m, ops)
-        require(w == ann.get('width', 64),
-                f'annotated width {ann.get("width")} but disassembly "{t}" implies {w} at {a:#x}')
-        if ann['op'] in flags.SHIFTS | flags.ROTATES:
-            if ops[0] == '%cl':          # count came from CL: the previous instruction must be mov $N, %cl
-                pm = re.fullmatch(r'movb\s+\$(\S+), %cl', prev)
-                require(pm and int(pm[1], 0) & 0xff == ann['count'] & 0xff, f'CL count {ann["count"]} not set by preceding "mov $N, %cl" at {a:#x}')
-            else:
-                require(ops[0].startswith('$') and int(ops[0][1:], 0) & 0xff == ann['count'] & 0xff, f'shift count {ann["count"]} vs "{t}"')
+        check_one(ann, a, m, t, prev)
         prev = t
     return [t for _, _, t in insns]
+
+
+TRACE = re.compile(r'^Trace \d+: 0x[0-9a-f]+ \[[0-9a-f]+/([0-9a-f]+)/')
+def executed_path(p, log, stop=None):
+    """The dynamic instruction sequence of a flow program from QEMU's `-d in_asm,exec,nochain` log: the translation blocks it
+    entered, in order, from the program's first instruction until it reaches the capture sequence at the end of the code.
+    Returns [(address, mnemonic, text)]. Every translated instruction inside the code must be the supplied bytes. With `stop`
+    (the RIP of a fault) the last block ends before the instruction at that address, which did not complete."""
+    rip, end = p['rip'], p['rip'] + len(p['code'])
+    blocks, cur, trace, fresh = {}, None, [], False
+    for line in log.splitlines():
+        if line.startswith('IN:'): cur = None; fresh = True; continue
+        m = TRACE.match(line)
+        if m: trace.append(int(m[1], 16)); continue
+        m = LINE.match(line)
+        if not m: continue
+        addr, raw = int(m[1], 16), bytes.fromhex(m[2].replace(' ', ''))
+        if fresh: cur = blocks[addr] = []; fresh = False       # the block's start; a retranslation replaces it
+        if cur is None: continue
+        if m[3]: cur.append([addr, m[3].split()[0], m[3], raw])
+        elif cur: cur[-1][3] += raw
+    for tb in blocks.values():
+        for addr, _, t, raw in tb:
+            if rip <= addr < end: require(p['code'][addr - rip:addr - rip + len(raw)] == raw, f'QEMU translated other bytes than supplied at {addr:#x}')
+    if _STUBS is None: globals()['_STUBS'] = _stubs()
+    cap = _fault_stubs(p['faults'])[3] if p['faults'] is not None else _STUBS[1]
+    path, started = [], False
+    for pc in trace:
+        if rip <= pc < end: started = True
+        elif started:      # left the code: only the capture sequence (or, in fault mode, the signal handler) may follow
+            require(end <= pc < end + len(cap) or (p['faults'] is not None and pc == HANDLER),
+                    f'the program left its code for {pc:#x} (jumps outside the code are not supported)')
+            break
+        else: continue
+        require(pc in blocks, f'executed block {pc:#x} was not translated in the log')
+        path += [(a, m, t) for a, m, t, _ in blocks[pc]]
+    require(started, 'the trace never entered the code')      # reaching the end is checked by parse_output (final RIP)
+    path = [x for x in path if rip <= x[0] < end]
+    if stop is not None:
+        hits = [i for i, x in enumerate(path) if x[0] == stop]
+        require(hits and hits[-1] == len(path) - 1, f'the faulting instruction at {stop:#x} is not the last executed one')
+        path = path[:hits[-1]]
+    return path
+
+def check_flow(p, log, stop=None):
+    """Annotations along the executed path: returns (distinct executed disassembly, executed annotations)."""
+    path = executed_path(p, log, stop)
+    index = {off: i for i, off in enumerate(p['offsets'])}
+    prev, anns, ixs = '', [], []
+    for a, m, t in path:
+        require(a - p['rip'] in index, f'executed instruction {a:#x} "{t}" is not an annotated instruction start')
+        ann = p['insns'][index[a - p['rip']]]
+        check_one(ann, a, m, t, prev)
+        anns.append(ann); ixs.append(index[a - p['rip']]); prev = t
+    return sorted({t for _, _, t in path}), anns, ixs
 
 
 def run_programs(programs, workdir, qemu):
@@ -211,6 +358,9 @@ def run_programs(programs, workdir, qemu):
     (workdir / 'container_entry.py').write_bytes((HERE / 'container_entry.py').read_bytes())
     for i, p in enumerate(progs):
         d = workdir / 'jobs' / f'p{i:04d}'; d.mkdir(exist_ok=True); (d / 'prog.elf').write_bytes(build_elf(p)[0]); (d / 'prog.elf').chmod(0o755)
+        for marker, on in (('flow', p['flow']), ('faults', p['faults'] is not None)):
+            if on: (d / marker).write_text('1')
+            elif (d / marker).exists(): (d / marker).unlink()
     token = uuid.uuid4().hex; name = 'natemu-ref-' + token; cidfile = workdir / 'container-id'
     if cidfile.exists(): cidfile.unlink()
     args = ['docker', 'create', '--name', name, '--label', 'natemu.qemu.token=' + token, '--cidfile', str(cidfile), '--network', 'none', '--read-only',
@@ -229,11 +379,17 @@ def run_programs(programs, workdir, qemu):
     for i, (src, p) in enumerate(zip(programs, progs)):
         d = workdir / 'jobs' / f'p{i:04d}'
         require((d / 'rc').read_text().strip() == '0', f'QEMU exit status {(d / "rc").read_text().strip()} for program {i}')
-        final = parse_output(p, (d / 'qemu.stdout').read_bytes())
-        text = check_annotations(p, (d / 'qemu.log').read_text())
-        und = flags.analyze(p['insns'])
+        final, fault = parse_output(p, (d / 'qemu.stdout').read_bytes())
+        if p['flow']:      # the flags rule runs along the executed path (the same instructions as QEMU executed, in order)
+            text, executed, path_ix = check_flow(p, (d / 'qemu.log').read_text(), num(final['rip']) if fault else None)
+            und = flags.analyze(executed)
+        else:
+            text = check_annotations(p, (d / 'qemu.log').read_text())
+            und = flags.analyze(p['insns'])
         results.append({'name': p['name'], 'qemu': final, 'disasm': text, 'undefined_flags': hx(und), 'rflags_compare_mask': hx(flags.ARITH & ~und)}
-                       | ({'prefix': p['prefix']} if p['prefix'] is not None else {}))
+                       | ({'prefix': p['prefix']} if p['prefix'] is not None else {})
+                       | ({'executed_insns': len(executed)} if p['flow'] else {})
+                       | ({'fault': fault, 'path_ix': path_ix} if fault else {}))
     prov = {'format': FORMAT, 'image': IMAGE, 'qemu_sha256': digest, 'qemu_package': 'qemu-user-static 1:7.2+dfsg-7+deb12u18+b3 arm64',
             'qemu_argv': ['/qemu', '-cpu', 'qemu64', '-d', 'in_asm', '-D', 'qemu.log', 'prog.elf'], 'rflags_fixed_bits': hx(flags.FIXED)}
     return results, prov

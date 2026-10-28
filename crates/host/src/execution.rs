@@ -78,6 +78,21 @@ pub(crate) fn guest_ram_written(memory: &Memory) {
     memory.write_record(at, queue);
 }
 
+/// The vCPU's placed blocks, in placement order (read from its metadata arena).
+pub(crate) fn placed_blocks(memory: &Memory) -> Vec<cache::Block> {
+    let control: cache::Control = memory.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+    (0..control.blocks as usize)
+        .map(|n| {
+            let meta = u32::from_le_bytes(memory.read::<4>(cache::LOOKUP_OFFSET + cache::INDEX + 4 * n));
+            memory.read_record(cache::META_OFFSET + meta as usize)
+        })
+        .collect()
+}
+/// The link record `i` (written by the resident's linker).
+pub(crate) fn link_record(memory: &Memory, i: usize) -> cache::LinkRecord {
+    memory.read_record(cache::LOOKUP_OFFSET + cache::LINKS + i * size_of::<cache::LinkRecord>())
+}
+
 /// Self-check of the vCPU's cache after a run (the contract's rule (d), independent of the resident): every link point of
 /// every placed block holds its admitted word (`ldr x0, L`, L holding its target) or `b` to the entry of a placed block
 /// keyed (target, the block's context), and the resident's link records describe exactly the linked ones. Returns
@@ -86,12 +101,7 @@ pub(crate) fn check_links(memory: &Memory) -> Result<(u64, u64)> {
     let lookup = |offset: usize| cache::LOOKUP_OFFSET + offset;
     let control: cache::Control = memory.read_record(lookup(cache::CONTROL));
     let word = |offset: u64| u32::from_le_bytes(memory.read::<4>(cache::CODE_OFFSET + offset as usize));
-    let blocks: Vec<cache::Block> = (0..control.blocks as usize)
-        .map(|n| {
-            let meta = u32::from_le_bytes(memory.read::<4>(lookup(cache::INDEX) + 4 * n));
-            memory.read_record(cache::META_OFFSET + meta as usize)
-        })
-        .collect();
+    let blocks = placed_blocks(memory);
     let mut linked = HashMap::new();
     let mut points = 0;
     for b in &blocks {
@@ -117,11 +127,18 @@ pub(crate) fn check_links(memory: &Memory) -> Result<(u64, u64)> {
             }
         }
     }
-    let records: Vec<cache::LinkRecord> = (0..control.links as usize)
-        .map(|i| memory.read_record(lookup(cache::LINKS) + i * size_of::<cache::LinkRecord>()))
-        .collect();
+    let records: Vec<cache::LinkRecord> = (0..control.links as usize).map(|i| link_record(memory, i)).collect();
+    // Each record also holds the point's original `ldr x0, L`, whose literal L (inside the block) holds the target.
     let described = records.iter().all(|r| {
-        linked.get(&(r.source, r.offset)) == Some(&(r.target as usize)) && r.original & 0xff00_001f == 0x5800_0000
+        let Some(b) = blocks.get(r.source as usize) else { return false };
+        let at = u64::from(b.code) + u64::from(r.offset);
+        let literal = at.wrapping_add((((r.original << 8) as i32 >> 13) as i64 * 4) as u64);
+        let target = u64::from(word(literal)) | u64::from(word(literal + 4)) << 32;
+        linked.get(&(r.source, r.offset)) == Some(&(r.target as usize))
+            && r.original & 0xff00_001f == 0x5800_0000
+            && literal >= u64::from(b.code)
+            && literal + 8 <= u64::from(b.code + b.code_size)
+            && blocks.get(r.target as usize).is_some_and(|t| t.rip == target)
     });
     if !described || records.len() != linked.len() {
         return Err(format!("{} link records for {} linked points", records.len(), linked.len()));
@@ -352,6 +369,10 @@ pub(crate) struct Requests {
     /// Translation requests answered with a block, and the distinct RIPs among them.
     pub(crate) blocks: u64,
     pub(crate) rips: std::collections::HashSet<u64>,
+    /// Test drivers only: called with the vCPU stopped, the block staged and the reply not yet written, until it returns
+    /// true (it corrupted something); then `tampered` is set. Checks the resident's run-time defences.
+    pub(crate) tamper: Option<fn(&Memory, &mut State) -> bool>,
+    pub(crate) tampered: bool,
 }
 
 /// Runs the vCPU (entered at the resident) until it stops; `stop_at` is a RIP at
@@ -431,6 +452,11 @@ fn serve(vm: &Vm, compiler: &mut Compiler, stop_at: Option<u64>, requests: &mut 
         let used = pages.into_iter().filter(|&[va, _]| va == rip & !4095 || va == end & !4095);
         for (i, [_, gpa]) in used.enumerate() {
             state.source_gpa[i] = gpa;
+        }
+        if let Some(tamper) = requests.tamper {
+            if tamper(&vm.memory, &mut state) {
+                (requests.tamper, requests.tampered) = (None, true);
+            }
         }
         state.reply = exec::REPLY_ADMITTED;
         vm.memory.write_record(exec::STATE_OFFSET, state);

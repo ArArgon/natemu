@@ -226,6 +226,8 @@ unsafe fn translate_block(s: &mut State, context: [u64; 2]) -> &'static Block {
         || h.code_size as usize > natemu_abi::execution::cache::MAX_BLOCK_BYTES
         || h.code_offset as usize + h.code_size as usize > STAGING_BYTES
         || table_end.is_none_or(|end| end > STAGING_BYTES)
+        // Host-supplied link points name words the linker may rewrite: each whole exit (4 words) inside the code.
+        || s.link_points.iter().any(|p| p.offset != 0 && (p.offset % 4 != 0 || u64::from(p.offset) + 16 > u64::from(h.code_size)))
     {
         halt(*s, stop::BAD_REPLY)
     }

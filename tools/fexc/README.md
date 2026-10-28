@@ -29,7 +29,7 @@ jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never 
 (series applied as ten commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series8` (series7 plus patch 0010). Kept for comparison only: `series7` (patches 0001-0009, literal exits through DispatcherLoopTop), `series6` (patches 0001-0008, before self-loop exits and the stop check), `series5`, `series4`
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series9` (series8 with `loop/loope/loopne/jrcxz` allowlisted, S2d: the same ten patches, only `shim/fexc_slice1.inc` differs; objects identical to series8 on the 64 fixtures). Kept for comparison only: `series8` (patches 0001-0010, loop/jrcxz cut), `series7` (patches 0001-0009, literal exits through DispatcherLoopTop), `series6` (patches 0001-0008, before self-loop exits and the stop check), `series5`, `series4`
 (patches 0001-0007, before division), `series2` (patches 0001-0006, the "before" of the guard cost), `s1c` (slice1
 without the precision patches, the "before" of the precision cost) and `c1b` (the v1 build without sites). The earlier `series1` (flag rule before the cheaper one below) and `s1b1` are gone.
 
@@ -288,7 +288,7 @@ The scripts that read `fixtures/slice1/programs.json` (git-ignored; `smoke.py`, 
   int/int3/into/icebp, ud2/ud1/ud0, pushf/popf/cli/sti, hlt, port I/O, all of 0f 00 and 0f 01 (descriptor tables, invlpg,
   swapgs, rdtscp, xgetbv, ...), lar/lsl, syscall/sysret/sysenter/sysexit, clts, invd/wbinvd, clflush, mov cr/dr, wrmsr/rdmsr/rdpmc,
   rdtsc, cpuid, rd/wr fs/gs base, vmread/vmwrite, invept/invvpid/invpcid. Everything else outside the allowlist (string ops,
-  LOCK forms, memory xchg, cmpxchg/xadd, x87/SSE/AVX, fences, cld/std, clc/stc, lahf/sahf, loop/jrcxz, shld/shrd,
+  LOCK forms, memory xchg, cmpxchg/xadd, x87/SSE/AVX, fences, cld/std, clc/stc, lahf/sahf, loop/jrcxz with a 67 prefix, shld/shrd,
   tzcnt/popcnt, prefetch, leave/enter, ...) is `unsupported_form`.
 
 ### Native control flow inside one guest instruction
@@ -494,9 +494,11 @@ six self-loop programs, `emitted_value` aside), patch 0009:
   even with multiblock off; the one entry there is the block's own entry, so `1: add rax,1; dec rcx; jnz 1b` became a native
   backward `b.ne` into the block (past the header store, skipping the prologue) with no exit for the taken edge. Under slice1 the
   lookup is skipped (`fexc_slice1 ? JumpTargets.end() : find`), so the taken edge is an ordinary exit: `State.rip` literal and the
-  gate, to the block's own RIP. Every branch in a block is now forward (P13), and a conditional block has two exits. jrcxz/loop are
-  still cut (`unsupported_form`) until S2d allowlists them; with them allowlisted in a scratch build they compile to
-  `cbz/cbnz` forward to a taken exit plus a fall-through exit (`loop`: `sub x7,x7,#1; cbnz x7,T; b F`).
+  gate, to the block's own RIP. Every branch in a block is now forward (P13), and a conditional block has two exits. `loopne/loope/loop/
+  jrcxz` rel8 (no 67 prefix; with it they are `unsupported_form`) are allowlisted since S2d (series9; `Allow(true)` in
+  `shim/fexc_slice1.inc`, admission's `branch_target` decodes them): they compile to `cbz/cbnz` forward to a taken exit plus a
+  fall-through exit (`loop`: `sub x7,x7,#1; cbnz x7,T; b F`; loope/loopne select rcx = 0 on the wrong ZF first), two exits like a
+  jcc, checked by `test_slice1.py` (exit forms, all four as self-loops, P12/P13) and `verify_precision.py`.
 - **Stop check.** `JIT.cpp::EmitSuspendInterruptCheck` emits FEX's `str xzr, [x28, #InterruptFaultPage]` only when
   `Config.NeedsPendingInterruptFaultCheck` (gdbserver). Under slice1 it is always emitted, once, as the last word of
   `EmitEntryPoint` (after `adr x0, header; str x0, [x28]`, no TF check and no spill slots here); the second use, before a backward
