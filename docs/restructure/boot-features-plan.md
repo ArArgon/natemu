@@ -22,6 +22,18 @@ manifest, loader and map); `B n` = [INV-01-34](../research/investigations/INV-01
 [privilege study](../../experiments/track03/el0-study/README.md). `SDM` = Intel SDM by volume and chapter title.
 Ubuntu 6.8 is surveyed only for its AP trampoline (s3g-plan §1).
 
+## 0. Principles (owner, October 28)
+
+- **Architecture, not a kernel.** Implement x86 and the platform as specified (SDM, ACPI, device datasheets). The Linux
+  source is used only to find which architectural features a boot exercises and to build test sequences; nothing in the
+  emulator recognises, special-cases or patches a kernel. Other kernels and OSes come later. Any exception must be
+  shown necessary and approved by the owner. (Boot configuration such as the command line is the user's choice, not
+  emulator behaviour.)
+- **Native exceptions and interrupts where possible.** Use Arm/HVF hardware mechanisms (synchronous exceptions taken
+  in the VM, virtual interrupt injection, the in-VM GIC and timers, inter-processor signalling) in preference to host
+  round trips and software polling, subject to precise x86 delivery at instruction boundaries. A study of what HVF
+  on the M4 provides comes before the exception and interrupt chunks.
+
 ## 1. Requirements inventory
 
 Boot path (M69, s3g-plan §1): bzImage loaded by our host, BSP entered at `K+0x200` (decompressor `startup_64`) in long
