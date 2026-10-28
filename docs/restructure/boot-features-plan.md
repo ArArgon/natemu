@@ -210,6 +210,12 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 
 ## 5. Owner questions and recorded decisions
 
+**Owner decisions (October 28):** kernel = Debian 6.12 (32-bit stays deferred); fetching the Debian kernel,
+config and initramfs into natemu-raw is allowed (nothing committed); mitigations are booted off on the command line
+(`mitigations=off`), while VERW and CR3 switches are still implemented correctly; the accepted CPU 16 profile is kept
+(AVX/AVX2/FMA via FEX AVX128, RDRAND, MTRR in this phase). The owner asked why a CR3 load discards the code cache:
+it is an S3c1 simplification, not an x86 requirement — see the code-cache-across-CR3 item added to the plan.
+
 **Decided from evidence (recorded, not questions):** guest RAM default 2 GiB, tests choose their own size (M69);
 INIT/SIPI deferred, unused with the mailbox (`K kernel/smpboot.c:877-928`; M64 keeps the definition); legacy devices
 and ACPI tables reuse QEMU's (M20, M24, M69); privilege level stays EL1 (P2; the owner confirms it once).
