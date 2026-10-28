@@ -8,8 +8,9 @@
 //! block came from that page, runs the writing instruction alone in the slot
 //! (self-modifying code, [`code_written`]). Literal exits
 //! enter the linker (`gates.S` `link_exit`), which finds their target the same way
-//! and links the exit to it. Also the 128/64 division helpers admitted code calls
-//! through the frame.
+//! and links the exit to it. A miss at a system instruction (every block ends before one) gets the host's decode of
+//! it instead of a block, and the resident executes it as a transaction ([`system`]). Also the 128/64 division
+//! helpers admitted code calls through the frame.
 use super::*;
 use crate::cache::{self, Block};
 use natemu_abi::{
@@ -166,20 +167,30 @@ unsafe fn dispatch(mut s: State) -> ! {
     unsafe { enter(s, block) }
 }
 /// The block for `s.cpu.rip`: from the cache (L2; L1 was probed by the fast dispatcher), else asks the host for it and
-/// places it. Pending invalidations are taken first. Either may flush the cache (`s.generation`).
+/// places it. Pending invalidations are taken first. Either may flush the cache (`s.generation`). A system instruction
+/// at the RIP is executed ([`system`]) and the search goes on at the next RIP (so the block found may be for a later
+/// RIP than the one asked for).
 unsafe fn find(s: &mut State) -> &'static Block {
-    take_invalidations(s);
-    let context = s.cpu.code_context();
-    cache::select_l1(context);
-    let block = match cache::lookup(s.cpu.rip, context) {
-        Some(b) => {
-            s.l2_hits += 1;
-            b
-        }
-        None => unsafe { translate_block(s, context) },
-    };
-    cache::fill_l1(s.cpu.rip, block);
-    block
+    loop {
+        take_invalidations(s);
+        let context = s.cpu.code_context();
+        cache::select_l1(context);
+        let block = match cache::lookup(s.cpu.rip, context) {
+            Some(b) => {
+                s.l2_hits += 1;
+                b
+            }
+            None => match unsafe { request(s, REQUEST_TRANSLATE) } {
+                Reply::Block(h) => translate_block(s, h, context),
+                Reply::System(instruction) => {
+                    system(s, instruction);
+                    continue;
+                }
+            },
+        };
+        cache::fill_l1(s.cpu.rip, block);
+        return block;
+    }
 }
 
 /// A literal exit (`Pointers.ExitFunctionLinker`, FEX's `ExitFunctionLink`), entered with the exit's state as at a
@@ -199,11 +210,13 @@ unsafe fn linker(frame: &NativeFrame) -> ! {
             SLOT_VA => None,
             _ => Some(cache::block_with_header(header).unwrap_or_else(|| halt(s, stop::BAD_LINK))),
         };
-        let generation = s.generation;
+        let (generation, rip) = (s.generation, s.cpu.rip);
         let target = find(&mut s);
         match source {
             // Flushed, or its page invalidated (queued), while the target was found.
             Some(source) if s.generation != generation || source.flags & cache::DEAD != 0 => s.stale_links += 1,
+            // The exit's target was a system instruction: the block found follows it, nothing to link.
+            Some(_) if target.rip != rip => {}
             Some(source) => match cache::link(source, target) {
                 cache::Link::Linked(n) => s.links += n,
                 cache::Link::Full => s.full_links += 1,
@@ -215,10 +228,9 @@ unsafe fn linker(frame: &NativeFrame) -> ! {
     }
 }
 
-/// A miss: the host compiles and admits the block at `s.cpu.rip` into staging; place it (flushing a full cache
-/// first) and keep its source pages read-only.
-unsafe fn translate_block(s: &mut State, context: [u64; 2]) -> &'static Block {
-    let h = unsafe { request(s, REQUEST_TRANSLATE) };
+/// A miss: the host compiled and admitted the block at `s.cpu.rip` (header `h`) into staging; place it (flushing a
+/// full cache first) and keep its source pages read-only.
+fn translate_block(s: &mut State, h: Header, context: [u64; 2]) -> &'static Block {
     s.requests += 1;
     let staging = STAGING_VA as *const u8;
     let block = match cache::place(&h, staging, context, s.source_gpa, s.link_points) {
@@ -237,8 +249,16 @@ unsafe fn translate_block(s: &mut State, context: [u64; 2]) -> &'static Block {
     block
 }
 
-/// Asks the host for code at `s.cpu.rip` (`kind`: a block, or one instruction for the slot) and checks the reply staged.
-unsafe fn request(s: &mut State, kind: u64) -> Header {
+/// What the host answered a request with.
+enum Reply {
+    /// A block staged (its header).
+    Block(Header),
+    /// The system instruction at `s.cpu.rip`, decoded (translate requests only).
+    System(System),
+}
+/// Asks the host for code at `s.cpu.rip` (`kind`: a block, or one instruction for the slot) and checks the reply: the
+/// staged block, or a system instruction's decode.
+unsafe fn request(s: &mut State, kind: u64) -> Reply {
     unsafe {
         s.request = kind;
         s.reply = NONE;
@@ -250,6 +270,13 @@ unsafe fn request(s: &mut State, kind: u64) -> Header {
     take_invalidations(s);
     if s.reply == REPLY_PARK {
         halt(*s, stop::PARKED)
+    }
+    if s.reply == REPLY_SYSTEM && kind == REQUEST_TRANSLATE {
+        if !s.system.well_formed() {
+            halt(*s, stop::BAD_REPLY)
+        }
+        s.request = NONE;
+        return Reply::System(s.system);
     }
     let h = staged();
     let table_end = (h.sites_offset as usize).checked_add(h.sites_count as usize * size_of::<Site>());
@@ -264,7 +291,7 @@ unsafe fn request(s: &mut State, kind: u64) -> Header {
         halt(*s, stop::BAD_REPLY)
     }
     s.request = NONE;
-    h
+    Reply::Block(h)
 }
 
 /// Applies this vCPU's pending invalidations (listed pages drop their blocks; host writes to guest RAM while it was
@@ -347,7 +374,7 @@ unsafe fn stopped(frame: &NativeFrame) -> ! {
     unsafe { asm!("mrs {0}, elr_el1", "mrs {1}, spsr_el1", out(reg) elr, out(reg) spsr) };
     let mut s = unsafe { load() };
     let block = cache::block_at(elr).filter(|b| elr == b.code_va() + u64::from(STOP_STORE) && b.flags & cache::DEAD == 0);
-    let Some(b) = block.filter(|_| spsr & 15 == 4) else {
+    let Some(b) = block.filter(|_| spsr & 0x1f == 4) else {
         s.native = [0, 0, elr];
         halt(s, stop::BAD_STOP)
     };
@@ -356,6 +383,151 @@ unsafe fn stopped(frame: &NativeFrame) -> ! {
     s.stops += 1;
     unsafe { dispatch(s) }
 }
+
+/// CR0 bits (SDM vol. 3 §2.5): those defined; the others in 31:0 are reserved and ignored on a load (they stay clear),
+/// those in 63:32 raise #GP. Of the defined bits the resident implements changes of WP only (PG, PE are fixed in
+/// 64-bit code: clearing either raises #GP; ET is hard-wired).
+const CR0_DEFINED: u64 = 0xe005_003f;
+const CR0_CD: u64 = 1 << 30;
+const CR0_NW: u64 = 1 << 29;
+/// CR4 bits the resident implements (PAE is fixed in long mode), and the defined bits whose change it refuses as
+/// unsupported (VME, PVI, TSD, DE, PSE, MCE, PCE, OSFXSR, OSXMMEXCPT, UMIP, LA57, VMXE, SMXE, FSGSBASE, OSXSAVE, PKE).
+/// Every other bit is reserved for natemu's CPU model (#GP): the architecturally reserved ones and the features it
+/// does not have, PCIDE and SMAP among them (KL, CET, PKS, UINTR, LAM, FRED).
+const CR4_SUPPORTED: u64 = CR4_PAE | CR4_PGE | CR4_SMEP;
+const CR4_UNSUPPORTED: u64 = 0x0045_7f5f;
+/// EFER bits of natemu's model (Intel: SCE, LME, LMA, NXE); others reserved (#GP).
+const EFER_DEFINED: u64 = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE;
+const UD: [u64; 2] = [6, 0];
+const GP: [u64; 2] = [13, 0];
+
+/// Executes the system instruction at `s.cpu.rip` (`i`, the host's decode, checked by [`request`]) as a transaction
+/// with x86 semantics in 64-bit mode: its checks raise their exception (#UD, then #GP) with the state unchanged;
+/// otherwise its effect commits, RIP moves past it and RFLAGS stay. Every control change (and every CR3 load) drops
+/// this vCPU's cached code and shadows: they are its instruction and data TLBs, which may always lose entries, and are
+/// keyed by values a change makes stale (a block's context, a shadow's rights). INVLPG drops the shadows and blocks of
+/// the 2 MiB-aligned range holding the address (a superset of its page in either page size). Only this vCPU's
+/// state, cache and shadows change. Forms and operand values the resident does not implement stop it
+/// (`unsupported_system`) before any effect.
+fn system(s: &mut State, i: System) {
+    s.systems += 1;
+    let c = s.cpu;
+    let fault = |s: &mut State, [vector, error]: [u64; 2]| -> ! {
+        s.fault = [vector, 0, error, s.cpu.rip];
+        halt(*s, stop::GUEST_FAULT)
+    };
+    let unsupported = |s: &State| -> ! { halt(*s, stop::UNSUPPORTED_SYSTEM) };
+    let moves = matches!(i.kind, system::MOV_TO_CR | system::MOV_FROM_CR);
+    if i.lock != 0 || (moves && !matches!(i.cr, 0 | 2 | 3 | 4 | 8)) {
+        fault(s, UD)
+    }
+    if c.cpl != 0 {
+        fault(s, GP)
+    }
+    let gpr = |r: u32| c.gpr[r as usize];
+    // Whether the vCPU's translations must go.
+    let changed = match i.kind {
+        system::MOV_FROM_CR => {
+            s.cpu.gpr[i.reg as usize] = match i.cr {
+                0 => c.cr0,
+                3 => c.cr3,
+                4 => c.cr4,
+                _ => unsupported(s), // CR2 (no exception delivery yet), CR8 (no APIC)
+            };
+            false
+        }
+        system::MOV_TO_CR => {
+            let v = gpr(i.reg);
+            match i.cr {
+                0 => {
+                    let new = v & CR0_DEFINED | CR0_ET;
+                    if v >> 32 != 0 || new & CR0_PG == 0 || new & CR0_PE == 0 || new & (CR0_NW | CR0_CD) == CR0_NW {
+                        fault(s, GP)
+                    }
+                    if (new ^ c.cr0) & !CR0_WP != 0 {
+                        unsupported(s)
+                    }
+                    s.cpu.cr0 = new;
+                }
+                3 => {
+                    // Without PCIDE, bits 63:MAXPHYADDR are reserved (bit 63 included); PWT/PCD are not modelled.
+                    if v & !(paging::PA_MASK | 0xfff) != 0 {
+                        fault(s, GP)
+                    }
+                    if v & !(paging::PA_MASK | CR3_IGNORED) != 0 {
+                        unsupported(s)
+                    }
+                    s.cpu.cr3 = v;
+                    return commit(s, i, true); // a load of the same value too
+                }
+                4 => {
+                    if v & !(CR4_SUPPORTED | CR4_UNSUPPORTED) != 0 || (v ^ c.cr4) & (CR4_PAE | CR4_LA57) != 0 {
+                        fault(s, GP)
+                    }
+                    if (v ^ c.cr4) & CR4_UNSUPPORTED != 0 {
+                        unsupported(s)
+                    }
+                    s.cpu.cr4 = v;
+                }
+                _ => unsupported(s),
+            }
+            s.cpu != c
+        }
+        system::INVLPG => {
+            let base = match i.base {
+                system::RIP => c.rip.wrapping_add(u64::from(i.length)),
+                system::NO_REG => 0,
+                r => gpr(r),
+            };
+            let index = if i.index == system::NO_REG { 0 } else { gpr(i.index) << i.scale };
+            let address = base.wrapping_add(index).wrapping_add(i.disp as u64);
+            // A non-canonical address invalidates nothing.
+            if paging::canonical(address) {
+                let start = address & !(LARGE_PAGE - 1);
+                for page in (0..LARGE_PAGE / 4096).map(|k| start + k * 4096) {
+                    if tables::descriptor(page) & 1 != 0 && tables::unmap(page).is_err() {
+                        halt(*s, stop::SHADOW)
+                    }
+                }
+                match cache::invalidate_linear(start, LARGE_PAGE) {
+                    Some(n) => s.unlinks += n,
+                    None => halt(*s, stop::BAD_LINK),
+                }
+            }
+            false
+        }
+        system::RDMSR | system::WRMSR => {
+            if gpr(1) as u32 != system::MSR_EFER {
+                fault(s, GP) // natemu's model implements no other MSR
+            }
+            if i.kind == system::RDMSR {
+                (s.cpu.gpr[0], s.cpu.gpr[2]) = (c.efer & 0xffff_ffff, c.efer >> 32);
+                false
+            } else {
+                let v = gpr(2) << 32 | gpr(0) & 0xffff_ffff;
+                if v & !EFER_DEFINED != 0 || (v ^ c.efer) & EFER_LME != 0 && c.cr0 & CR0_PG != 0 {
+                    fault(s, GP)
+                }
+                s.cpu.efer = v & !EFER_LMA | c.efer & EFER_LMA; // LMA writes are ignored
+                s.cpu.efer != c.efer
+            }
+        }
+        _ => halt(*s, stop::BAD_REPLY),
+    };
+    commit(s, i, changed)
+}
+/// Ends a system transaction: RIP past the instruction; with `flush`, this vCPU's cached code and shadows go.
+fn commit(s: &mut State, i: System, flush_all: bool) {
+    if s.cpu.control().is_none() {
+        halt(*s, stop::UNSUPPORTED_MODE)
+    }
+    if flush_all {
+        flush(s);
+        reset_shadows(s);
+    }
+    s.cpu.rip = s.cpu.rip.wrapping_add(u64::from(i.length));
+}
+const LARGE_PAGE: u64 = 0x20_0000;
 
 /// Guest GPRs and arithmetic flags from the native state: the static-register map,
 /// PF/AF registers and `nzcv` (PSTATE layout) with the given CF inversion.
@@ -408,7 +580,7 @@ fn code_written(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, gpa: u64
 fn step(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
     bank_at(&mut s, f, b, site);
     s.steps += 1;
-    let h = unsafe { request(&mut s, REQUEST_STEP) };
+    let Reply::Block(h) = (unsafe { request(&mut s, REQUEST_STEP) }) else { halt(s, stop::BAD_REPLY) };
     let context = s.cpu.code_context();
     match cache::place_step(&h, STAGING_VA as *const u8, context, s.source_gpa, s.link_points) {
         Some(block) => unsafe { enter(s, block) },

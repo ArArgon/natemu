@@ -370,11 +370,25 @@ pub fn kick(v: usize) {
 /// (as [`unlink_all`]).
 // ponytail: scans every block and record; a reverse map (page → blocks, block → records) if profiles show it.
 pub fn invalidate(gpa: u64) -> Option<u64> {
+    let unlinked = kill(|b| b.source_gpa.iter().any(|&g| g != u64::MAX && g >> 12 == gpa >> 12))?;
+    if let Some(mask) = code_page(gpa) {
+        mask.fetch_and(!own(), SeqCst);
+    }
+    Some(unlinked)
+}
+/// Invalidates (as [`invalidate`]) every live block of this vCPU with guest bytes in the linear range
+/// `[start, start + bytes)` (a guest INVLPG). Its code-page bits stay: they only say it may hold translations.
+pub fn invalidate_linear(start: u64, bytes: u64) -> Option<u64> {
+    kill(|b| b.rip.wrapping_sub(start) < bytes || start.wrapping_sub(b.rip) < u64::from(b.guest_bytes))
+}
+/// Marks every live block `doomed` selects dead: out of L1 and L2, every link into or out of it undone and its record
+/// dropped. Returns the links undone; `None` if a record does not describe its word.
+fn kill(doomed: impl Fn(&Block) -> bool) -> Option<u64> {
     let c = control();
     let mut unlinked = 0;
     for n in 0..c.blocks as usize {
         let b = block(n);
-        if b.flags & DEAD != 0 || !b.source_gpa.iter().any(|&g| g != u64::MAX && g >> 12 == gpa >> 12) {
+        if b.flags & DEAD != 0 || !doomed(b) {
             continue;
         }
         unsafe { (*block_ptr(n)).flags |= DEAD };
@@ -394,9 +408,6 @@ pub fn invalidate(gpa: u64) -> Option<u64> {
                 i += 1;
             }
         }
-    }
-    if let Some(mask) = code_page(gpa) {
-        mask.fetch_and(!own(), SeqCst);
     }
     Some(unlinked)
 }

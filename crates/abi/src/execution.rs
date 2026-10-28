@@ -312,6 +312,8 @@ pub struct Cpu {
 }
 
 pub const CR0_PE: u64 = 1;
+/// Hard-wired to 1 (SDM vol. 3 §2.5); writes are ignored.
+pub const CR0_ET: u64 = 1 << 4;
 pub const CR0_WP: u64 = 1 << 16;
 pub const CR0_PG: u64 = 1 << 31;
 pub const CR4_PAE: u64 = 1 << 5;
@@ -320,6 +322,9 @@ pub const CR4_SMAP: u64 = 1 << 21;
 pub const CR4_LA57: u64 = 1 << 12;
 pub const CR4_PGE: u64 = 1 << 7;
 pub const CR4_PCIDE: u64 = 1 << 17;
+/// CR3 bits a 4-level walk ignores without PCIDE (kept in CR3): 2:0 and 11:5. PWT/PCD (4:3) are not ignored.
+pub const CR3_IGNORED: u64 = 0xfe7;
+pub const EFER_SCE: u64 = 1;
 pub const EFER_LME: u64 = 1 << 8;
 pub const EFER_LMA: u64 = 1 << 10;
 pub const EFER_NXE: u64 = 1 << 11;
@@ -327,15 +332,15 @@ pub const EFER_NXE: u64 = 1 << 11;
 impl Cpu {
     /// Walk controls for 4-level long-mode paging; `None` for any other mode
     /// (paging off, legacy/PAE, LA57, SMAP: not supported by this slice), and
-    /// for a CR3 with PWT/PCD or other non-address bits set (memory types of the
-    /// root table are not modelled; refused rather than ignored).
+    /// for a CR3 with PWT/PCD or bits above the physical-address width set (memory types of the
+    /// root table are not modelled; refused rather than ignored). [`CR3_IGNORED`] bits are ignored.
     pub fn control(&self) -> Option<Control> {
         let long = self.cr0 & (CR0_PE | CR0_PG) == CR0_PE | CR0_PG
             && self.cr4 & CR4_PAE != 0
             && self.cr4 & (CR4_LA57 | CR4_SMAP) == 0
             && self.efer & (EFER_LME | EFER_LMA) == EFER_LME | EFER_LMA;
-        (long && matches!(self.cpl, 0 | 3) && self.cr3 & !paging::PA_MASK == 0).then_some(Control {
-            cr3: self.cr3,
+        (long && matches!(self.cpl, 0 | 3) && self.cr3 & !(paging::PA_MASK | CR3_IGNORED) == 0).then_some(Control {
+            cr3: self.cr3 & paging::PA_MASK,
             cpl: self.cpl,
             wp: u64::from(self.cr0 & CR0_WP != 0),
             nxe: u64::from(self.efer & EFER_NXE != 0),
@@ -389,6 +394,63 @@ pub const REPLY_ADMITTED: u64 = 1;
 /// The host ends the vCPU's run at this request (its stop is the host's: `stop_at` reached, a fetch fault, no code):
 /// the resident halts with [`stop::PARKED`].
 pub const REPLY_PARK: u64 = 2;
+/// (Translate requests only.) The instruction at `cpu.rip` is a system instruction, decoded by the host into
+/// `State::system`; nothing is staged. The resident executes it as a transaction ([`system`]).
+pub const REPLY_SYSTEM: u64 = 3;
+
+/// A system instruction (FEX cuts every block before one) as the host decoded it, for the resident to execute with
+/// x86 semantics: privilege, prefix and operand checks, the architectural effect, RIP past the instruction (`length`
+/// bytes) and the invalidation its semantics require. RFLAGS are unchanged. Register numbers are x86 (RAX = 0 .. R15).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct System {
+    /// [`system::MOV_TO_CR`] ..
+    pub kind: u32,
+    pub length: u32,
+    /// The instruction has a LOCK prefix (#UD).
+    pub lock: u32,
+    /// MOV CR: the control register number (0..15, REX.R included) and the general register.
+    pub cr: u32,
+    pub reg: u32,
+    /// INVLPG's memory operand: base register ([`system::RIP`] for RIP-relative, [`system::NO_REG`] for none), index
+    /// register ([`system::NO_REG`]: none), scale (a shift, 0..3) and displacement; 64-bit address size.
+    pub base: u32,
+    pub index: u32,
+    pub scale: u32,
+    pub disp: i64,
+}
+pub mod system {
+    /// CR `cr` := GPR `reg`; GPR `reg` := CR `cr`.
+    pub const MOV_TO_CR: u32 = 1;
+    pub const MOV_FROM_CR: u32 = 2;
+    pub const INVLPG: u32 = 3;
+    /// EDX:EAX := MSR ECX; MSR ECX := EDX:EAX.
+    pub const RDMSR: u32 = 4;
+    pub const WRMSR: u32 = 5;
+    /// `System::base` of a RIP-relative operand (relative to the next instruction).
+    pub const RIP: u32 = 16;
+    pub const NO_REG: u32 = 0xff;
+    /// The one MSR the resident implements; any other RDMSR/WRMSR raises #GP(0).
+    pub const MSR_EFER: u32 = 0xc000_0080;
+    impl super::System {
+        pub const NONE: Self = Self { kind: 0, length: 0, lock: 0, cr: 0, reg: 0, base: NO_REG, index: NO_REG, scale: 0, disp: 0 };
+        /// Field ranges the resident relies on (it checks every reply).
+        pub fn well_formed(&self) -> bool {
+            let reg = |r: u32| r < 16;
+            (1..=15).contains(&self.length)
+                && self.lock <= 1
+                && match self.kind {
+                    MOV_TO_CR | MOV_FROM_CR => reg(self.cr) && reg(self.reg),
+                    INVLPG => (reg(self.base) || self.base == RIP || self.base == NO_REG)
+                        && (reg(self.index) || self.index == NO_REG)
+                        && self.scale <= 3
+                        && (self.base != RIP || self.index == NO_REG),
+                    RDMSR | WRMSR => true,
+                    _ => false,
+                }
+        }
+    }
+}
 
 /// `State::stop`: why the resident stopped the VM (`hvc #0x49`).
 pub mod stop {
@@ -414,6 +476,9 @@ pub mod stop {
     pub const PARKED: u64 = 10;
     /// The stop gate was entered at a PC that is no live block's stop store (`super::STOP_STORE`), or not from EL1t.
     pub const BAD_STOP: u64 = 11;
+    /// A system instruction whose form or operand value the resident does not implement (e.g. MOV from CR2, a CR0 or
+    /// CR4 feature bit change, CR3 with PWT/PCD); nothing of it was executed.
+    pub const UNSUPPORTED_SYSTEM: u64 = 12;
 
     pub fn name(code: u64) -> &'static str {
         match code {
@@ -427,6 +492,7 @@ pub mod stop {
             BAD_LINK => "bad_link",
             PARKED => "parked",
             BAD_STOP => "bad_stop",
+            UNSUPPORTED_SYSTEM => "unsupported_system",
             _ => "none",
         }
     }
@@ -478,13 +544,18 @@ pub struct State {
     pub stale_links: u64,
     pub full_links: u64,
     /// Writes to pages holding translations that invalidated the page's blocks (stores, split stores, walker A/D
-    /// updates, queued requests); instructions single-stepped because they wrote a page their own block came from.
+    /// updates), plus one per drain of this vCPU's record that carried `PAGES` (however many pages it listed);
+    /// instructions single-stepped because they wrote a page their own block came from.
     pub invalidations: u64,
     pub steps: u64,
     /// The resident's stop gate (written at start): where the host enters a vCPU stopped at a block entry by a kick.
     pub stop_gate: u64,
     /// Stops taken at the stop gate.
     pub stops: u64,
+    /// With a [`REPLY_SYSTEM`] reply: the decoded instruction.
+    pub system: System,
+    /// System instructions executed (committed or faulted) as transactions.
+    pub systems: u64,
 }
 impl State {
     pub const fn new(vcpu: u64, cpu: Cpu) -> Self {
@@ -518,6 +589,8 @@ impl State {
             steps: 0,
             stop_gate: 0,
             stops: 0,
+            system: System::NONE,
+            systems: 0,
         }
     }
 }
@@ -562,6 +635,26 @@ mod tests {
     }
 
     #[test]
+    fn system_replies_are_range_checked() {
+        let mov = System { kind: system::MOV_TO_CR, length: 3, cr: 3, ..System::NONE };
+        let invlpg = System { kind: system::INVLPG, length: 7, base: system::RIP, ..System::NONE };
+        assert!(mov.well_formed() && invlpg.well_formed());
+        for bad in [
+            System { kind: 9, ..mov },
+            System { length: 0, ..mov },
+            System { length: 16, ..mov },
+            System { reg: 16, ..mov },
+            System { cr: 16, ..mov },
+            System { lock: 2, ..mov },
+            System { index: 3, ..invlpg }, // RIP-relative has no index
+            System { base: 17, ..invlpg },
+            System { scale: 4, base: 0, ..invlpg },
+        ] {
+            assert!(!bad.well_formed(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn only_four_level_long_mode_has_walk_controls() {
         let cpu = Cpu {
             gpr: [0; 16],
@@ -581,9 +674,12 @@ mod tests {
             Cpu { cr4: CR4_PAE | CR4_LA57, ..cpu },
             Cpu { efer: EFER_LME, ..cpu },
             Cpu { cpl: 1, ..cpu },
-            Cpu { cr3: 0x1001, ..cpu },
+            Cpu { cr3: 0x1008, ..cpu },
+            Cpu { cr3: 0x1000 | 1 << 40, ..cpu },
         ] {
             assert_eq!(bad.control(), None);
         }
+        // Ignored CR3 bits stay in CR3 (and in the code context) but not in the walk's root.
+        assert_eq!(Cpu { cr3: 0x1fe7, ..cpu }.control().unwrap().cr3, 0x1000);
     }
 }

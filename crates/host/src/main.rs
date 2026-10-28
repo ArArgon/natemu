@@ -15,6 +15,7 @@ mod json;
 mod coordinator_tests;
 mod memory;
 mod owners;
+mod system;
 mod translation;
 mod vm;
 

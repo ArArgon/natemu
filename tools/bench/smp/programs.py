@@ -215,3 +215,239 @@ def litmus_outcomes(prog, test, got, k):
     for c, reg in test.outputs: idx[(c, reg)] = sum(1 for cc, rr in test.outputs[:test.outputs.index((c, reg))] if cc == c)
     res = {c: reg_mem[RES(c)] for c, _ in test.outputs}
     return [tuple(res[c][2 * it + idx[(c, reg)]] for c, reg in test.outputs) for it in range(k)]
+
+
+# ---- (c) system programs (CPL0, `system`: QEMU runs them on natemu's CPU model, smp.SYSTEM_CPU) ------------------------------
+# Long-mode system instructions: MOV to/from CR0/CR3/CR4, INVLPG, RDMSR/WRMSR EFER. No expected results here: the reference
+# is QEMU's run of the same bytes. Each CPU i has its own code page, its own page tables and data pages (disjoint), so the
+# programs run at any N. Start-up controls (both QEMU's stub and natemu's driver): CR0 0x80010011, CR4 0x20, EFER 0xd00.
+# A CPU's tables T(i, k) (k = 0 A, 1 B) identity-map 0..4 MiB in 4 KiB pages (PML4, PDPT, PD, PT0, PT1: 5 pages): every
+# non-leaf entry P|RW|US|A and every leaf P|RW|US|A|D (no walk writes them), except: the stub's pages and every CPU's code
+# page are supervisor (bodies may set SMEP; QEMU's fault handler runs there), and the test pages below have A/D clear (so
+# a walk's A/D writes are compared) with their own rights and frames. Bodies start with a CR3 load of their table A and
+# end by restoring the start-up controls; the restore makes a fall-through end legal for QEMU's capture code.
+SYS_CODE = lambda i: BODY0 + 0x1000 * i
+SYS_T = lambda i, k: 0x200000 + 0x10000 * i + 0x8000 * k
+SYS_D = lambda i: 0x280000 + 0x10000 * i
+# Test pages of CPU i (offsets from SYS_D(i)): V (the remapped linear page), its frames F1/F2, R (read-only), X (XD data),
+# U (user code), C (XD code).
+# SAVE: the start-up CR3 (QEMU's and natemu's differ, so it is kept out of registers and compared memory).
+V, F1, F2, R, X, U, C, SAVE = 0x0, 0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000
+P, RW, US, A, D, XD = 1, 2, 4, 0x20, 0x40, 1 << 63
+LEAF = P | RW | US | A | D
+
+def sys_leaf(i, k, va):
+    """Address of the PTE of `va` (below 4 MiB) in CPU i's table k."""
+    return SYS_T(i, k) + 0x3000 + (va >> 12) * 8
+
+def sys_tables(i, k, n, overrides):
+    """CPU i's table k as memory regions: only the entries any program here walks (the rest of each table page is never
+    read; QEMU leaves it undefined). Only the slice holding the data pages' PTEs is captured (compared)."""
+    base = SYS_T(i, k)
+    supervisor = set(range(0x100000, 0x110000, 0x1000)) | {SYS_CODE(j) for j in range(n)}
+    entry = lambda page: overrides.get(page, page | (LEAF & ~US if page in supervisor else LEAF))
+    parent = lambda table: table | P | RW | US | A
+    slices = [(base, [parent(base + 0x1000)]), (base + 0x1000, [parent(base + 0x2000)]),
+              (base + 0x2000, [parent(base + 0x3000), parent(base + 0x4000)])]
+    for lo, hi in ((0x100000, 0x120000), (0x200000, 0x240000), (0x280000, 0x2c0000), (0x3e0000, 0x3f0000)):
+        slices.append((base + 0x3000 + (lo >> 12) * 8, [entry(page) for page in range(lo, hi, 0x1000)]))
+    return [{'addr': f'0x{a:x}', 'data': b''.join(e.to_bytes(8, 'little') for e in es).hex(), 'capture': a == base + 0x3000 + (0x280000 >> 12) * 8}
+            for a, es in slices]
+
+def sys_memory(i, n):
+    d = SYS_D(i)
+    a = {d + V: (d + F1) | P | RW | US, d + R: (d + R) | P | US | A, d + X: (d + X) | P | RW | US | A | XD,
+         d + C: (d + C) | P | RW | A | XD, d + U: (d + U) | P | RW | US | A}
+    b = dict(a); b[d + V] = (d + F2) | P | RW | US
+    code = asm('mov eax, 0x5a5a\nadd rax, rax\njmp r13').hex()            # U and C: user / XD code (the smep program returns via r13)
+    lcg = lambda o, seed: {'addr': f'0x{d + o:x}', 'size': 0x1000, 'fill': 'lcg', 'seed': seed + 16 * i}
+    return sys_tables(i, 0, n, a) + sys_tables(i, 1, n, b) + [
+        zero(d + V, 0x1000), lcg(F1, 1), lcg(F2, 2), lcg(R, 3), lcg(X, 4),
+        {'addr': f'0x{d + U:x}', 'data': code}, {'addr': f'0x{d + C:x}', 'data': code}, dict(zero(d + SAVE, 8), capture=False)]
+
+RESTORE = """    mov eax, 0x20
+    mov cr4, rax
+    mov eax, 0x80010011
+    mov cr0, rax
+    mov ecx, 0xC0000080
+    mov eax, 0xd00
+    xor edx, edx
+    wrmsr
+    mov rax, [{save:#x}]
+    mov cr3, rax
+    xor eax, eax"""
+
+def sys_text(i, body):
+    """Saves CR3 at SAVE, loads table A, runs `body` (Python format fields: the addresses below) and restores the start-up
+    controls (clobbering rax, rcx, rdx: bodies keep their results elsewhere)."""
+    f = dict(d=SYS_D(i), ta=SYS_T(i, 0), tb=SYS_T(i, 1), la=sys_leaf(i, 0, SYS_D(i) + V), lb=sys_leaf(i, 1, SYS_D(i) + V),
+             V=SYS_D(i) + V, Vrel=SYS_D(i) + V + 0x234 - SYS_CODE(i), F2=SYS_D(i) + F2, R=SYS_D(i) + R, X=SYS_D(i) + X, U=SYS_D(i) + U, C=SYS_D(i) + C, lx=sys_leaf(i, 0, SYS_D(i) + X))
+    f['save'] = SYS_D(i) + SAVE
+    head = 'bits 64\n    mov rax, cr3\n    mov [{save:#x}], rax\n    mov rax, {ta:#x}\n    mov cr3, rax\n'
+    return (head + body + '\n' + RESTORE + '\n    cmp r11, r11').format(**f)
+
+SYS = {
+    # Two address spaces mapping V to different frames: loads and stores through each, back to A, CR3 read back.
+    'cr3-switch': """    mov rbx, [{V:#x}]
+    mov [{V:#x}+8], rbx
+    mov rax, {tb:#x}
+    mov cr3, rax
+    mov r8, [{V:#x}]
+    mov [{V:#x}+16], r8
+    mov rax, {ta:#x}|0x7e7
+    mov cr3, rax
+    mov r9, [{V:#x}+8]
+    mov rsi, cr3
+    mov rax, {ta:#x}
+    mov cr3, rax
+    mov cr3, rax
+    mov rdi, [{V:#x}+16]""",
+    # V's PTE rewritten to F2, INVLPG through four operand forms (and a non-canonical one, a no-op), V read after each.
+    'invlpg': """    mov rbx, [{V:#x}]
+    mov qword [{la:#x}], {F2:#x}|7
+    mov rax, {V:#x}
+    invlpg [rax]
+    mov r13, [{V:#x}+8]
+    mov qword [{la:#x}], {d:#x}+0x1000|7
+    mov r8, {V:#x}-0x40
+    invlpg [r8+0x40]
+    mov r14, [{V:#x}+16]
+    mov qword [{la:#x}], {F2:#x}|7
+    mov rsi, {V:#x}/8
+    invlpg [rsi*8]
+    mov rdi, [{V:#x}+24]
+    mov qword [{la:#x}], {d:#x}+0x1000|7
+    invlpg [rel $$+{Vrel:#x}]
+    mov r9, [{V:#x}+32]
+    mov qword [{la:#x}], {F2:#x}|7
+    mov r10, 0x8000000000000000
+    invlpg [r10]
+    invlpg [{V:#x}]
+    mov r12, [{V:#x}+40]
+    mov [{V:#x}+48], r12""",
+    # CR0.WP: a supervisor write to the read-only page R succeeds with WP=0 (and sets D), faults (#PF 3) with WP=1.
+    'wp': """    mov r13, cr0
+    mov rax, r13
+    btr rax, 16
+    mov cr0, rax
+    mov qword [{R:#x}], 0x1234
+    mov rbx, cr0
+    mov cr0, r13
+    mov r8, [{R:#x}]
+    mov r9, cr0
+    mov qword [{R:#x}+8], 0x5678""",
+    # EFER.NXE read back and toggled; the XD page X is readable; then with NXE=0 its XD bit is reserved (#PF 9 after a CR3 load).
+    'nxe': """    mov ecx, 0xC0000080
+    rdmsr
+    mov r8, rax
+    mov r9, rdx
+    mov rbx, [{X:#x}]
+    and eax, ~0x800
+    wrmsr
+    rdmsr
+    mov r10, rax
+    or eax, 0x800
+    wrmsr
+    mov rsi, [{X:#x}+8]
+    rdmsr
+    mov r12, rax
+    and eax, ~0x800
+    wrmsr
+    mov rax, {ta:#x}
+    mov cr3, rax
+    mov rdi, [{X:#x}+16]""",
+    # MOV from CR0/CR3/CR4 and RDMSR EFER; CR4.PGE and SMEP set and cleared with read-backs; supervisor code runs under SMEP.
+    'readback': """    mov rbx, cr0
+    mov r14, cr3
+    mov rbp, cr4
+    mov ecx, 0xC0000080
+    rdmsr
+    mov rsi, rax
+    mov rdi, rdx
+    mov rax, cr4
+    bts rax, 7
+    mov cr4, rax
+    mov r8, cr4
+    bts rax, 20
+    mov cr4, rax
+    mov r9, cr4
+    mov r10, [{V:#x}]
+    btr rax, 7
+    mov cr4, rax
+    mov r12, cr4
+    mov r13, 0x1122334455667788
+    add r13, r12""",
+    # SMEP: a CPL0 fetch from the user page U faults (#PF 0x11); without SMEP it ran first.
+    'smep': """    mov rax, {U:#x}
+    lea r13, [rel .back]
+    jmp rax
+.back:
+    mov rax, cr4
+    bts rax, 20
+    mov cr4, rax
+    mov rax, {U:#x}
+    jmp rax""",
+    # NXE: a fetch from the XD page C faults (#PF 0x11).
+    'xd-fetch': """    mov rax, {C:#x}
+    jmp rax""",
+    # A PTE change without INVLPG: the second read of V may see either frame (checked against i4v_coherence_model, not QEMU).
+    'pte-no-invlpg': """    mov rbx, [{V:#x}]
+    mov qword [{la:#x}], {F2:#x}|7
+    mov r8, [{V:#x}]""",
+}
+def sys_program(name, n=1):
+    bodies, cpus, memory = [], [], []
+    for i in range(n):
+        text = sys_text(i, SYS[name])
+        bodies.append(body(SYS_CODE(i), text)); cpus.append(dict(cpu(i, SYS_CODE(i)), cpl=0)); memory += sys_memory(i, n)
+    return {'format': 'natemu-smp-v1', 'name': f'sys-{name}@{n}', 'ncpu': n, 'system': True, 'bodies': bodies, 'cpus': cpus,
+            'memory': memory, 'params': {'either': name == 'pte-no-invlpg'}}
+
+# Fault cases: one faulting system instruction at CPL0 or CPL3, under the start-up tables and controls (values that would
+# differ between QEMU and natemu, such as the start-up CR3, never reach a register before the fault).
+SYS_FAULTS = {
+    'cr4-reserved-15': 'mov rax, cr4\n    bts rax, 15\n    mov cr4, rax',
+    'cr4-reserved-32': 'mov rax, cr4\n    bts rax, 32\n    mov cr4, rax',
+    'cr4-pcide': 'mov rax, cr4\n    bts rax, 17\n    mov cr4, rax',
+    'cr4-smap': 'mov rax, cr4\n    bts rax, 21\n    mov cr4, rax',
+    'cr4-pae-clear': 'mov rax, cr4\n    btr rax, 5\n    mov cr4, rax',
+    'cr0-pg-clear': 'mov rax, cr0\n    btr rax, 31\n    mov cr0, rax',
+    'cr0-pe-clear': 'mov rax, cr0\n    btr rax, 0\n    mov cr0, rax',
+    'cr0-nw-without-cd': 'mov rax, cr0\n    bts rax, 29\n    mov cr0, rax',
+    'cr0-high': 'mov rax, cr0\n    bts rax, 32\n    mov cr0, rax',
+    'cr3-reserved-63': 'mov rax, 0x8000000000201000\n    mov cr3, rax',
+    'cr3-reserved-40': 'mov rax, 0x10000201000\n    mov cr3, rax',
+    'lock-mov-cr4': 'mov rax, cr4\n    db 0xf0, 0x0f, 0x22, 0xe0',
+    'lock-mov-from-cr3': 'db 0xf0, 0x0f, 0x20, 0xd8',
+    'lock-invlpg': 'db 0xf0, 0x0f, 0x01, 0x38',
+    'lock-rdmsr': 'mov ecx, 0xC0000080\n    db 0xf0, 0x0f, 0x32',
+    'mov-cr1': 'db 0x0f, 0x22, 0xc8',
+    'mov-from-cr5': 'db 0x0f, 0x20, 0xe8',
+    'efer-reserved-1': 'mov ecx, 0xC0000080\n    rdmsr\n    bts eax, 1\n    wrmsr',
+    'efer-reserved-edx': 'mov ecx, 0xC0000080\n    rdmsr\n    mov edx, 1\n    wrmsr',
+    'efer-lme-clear': 'mov ecx, 0xC0000080\n    rdmsr\n    btr eax, 8\n    wrmsr',
+    'rdmsr-invalid': 'mov ecx, 0x12345678\n    rdmsr',
+    'wrmsr-invalid': 'mov ecx, 0x12345678\n    xor eax, eax\n    xor edx, edx\n    wrmsr',
+}
+SYS_CPL3 = {
+    'cpl3-mov-to-cr0': 'mov rax, 0x80010011\n    mov cr0, rax',
+    'cpl3-mov-from-cr3': 'mov rax, cr3',
+    'cpl3-invlpg': 'invlpg [rsp]',
+    'cpl3-rdmsr': 'mov ecx, 0xC0000080\n    rdmsr',
+    'cpl3-wrmsr': 'mov ecx, 0xC0000080\n    mov eax, 0xd00\n    xor edx, edx\n    wrmsr',
+}
+
+def sys_fault(name):
+    cpl3 = name in SYS_CPL3
+    case = (SYS_CPL3 if cpl3 else SYS_FAULTS)[name].split('\n')
+    # The flags are defined (cmp) right before the instruction under test (bts/btr/xor leave some undefined).
+    lines = ['bits 64', 'mov rbx, 0x1234', 'mov rsi, 0x5678'] + case[:-1] + ['cmp rbx, rsi', case[-1]]
+    # params.fault_at: the last instruction, the one under test (its prefix runs on QEMU as the fault's state reference).
+    prog = {'format': 'natemu-smp-v1', 'name': f'sysfault-{name}@1', 'ncpu': 1, 'system': True,
+            'bodies': [body(SYS_CODE(0), '\n'.join(lines))], 'cpus': [dict(cpu(0, SYS_CODE(0)), cpl=3 if cpl3 else 0)], 'memory': [],
+            'params': {'fault_at': f"0x{SYS_CODE(0) + len(asm(chr(10).join(lines[:-1]))):x}"}}
+    return prog
+
+def system_all():
+    out = [sys_program(name, n) for name in SYS for n in ((1, 2, 4) if name not in ('pte-no-invlpg',) else (1,))]
+    return out + [sys_fault(name) for name in list(SYS_FAULTS) + list(SYS_CPL3)]

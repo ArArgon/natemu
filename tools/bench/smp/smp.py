@@ -13,6 +13,10 @@ sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent)); sys.path.in
 QEMU = shutil.which('qemu-system-x86_64') or '/opt/homebrew/bin/qemu-system-x86_64'
 CFG, RESULT, CAPTURE, LOW, HIGH = 0x106000, 0x107000, 0x100800, 0x110000, 0x400000
 FLAG_MASK = 0x8d5
+# `system` programs (CPL0 bodies with system instructions) run on natemu's CPU model: QEMU's max CPU without PCID and
+# SMAP (CR4.PCIDE and CR4.SMAP are reserved then), and dump a fault record per CPU (40 bytes at slot + 0xa0).
+SYSTEM_CPU = 'max,-pcid,-smap'
+FAULT = 0xa0
 M64 = (1 << 64) - 1
 REGS = ('rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi', 'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15')
 
@@ -65,15 +69,18 @@ def build_image(prog, stub):
         g = [num(x) for x in c['gpr']]; assert len(g) == 16
         rip = num(c['rip']); assert any(a <= rip < e for a, e in ends), f'cpu {i} rip {rip:#x} not inside a body'
         assert num(c.get('rflags', 0)) & ~FLAG_MASK == 0
-        cfg(0x800 + 0x100 * i, b''.join(x.to_bytes(8, 'little') for x in g) + rip.to_bytes(8, 'little') + num(c.get('rflags', 0)).to_bytes(8, 'little'))
-    segs = [(CFG, 16)] + [(RESULT + 0x100 * i, 136) for i in range(n)] + [(a, s) for a, s, cap, _ in regions(prog) if cap] + [(CFG + 0x10, 8)]
+        assert c.get('cpl', 3) in (0, 3)
+        cfg(0x800 + 0x100 * i, b''.join(x.to_bytes(8, 'little') for x in g) + rip.to_bytes(8, 'little') + num(c.get('rflags', 0)).to_bytes(8, 'little')
+            + c.get('cpl', 3).to_bytes(8, 'little'))
+    faults = [(RESULT + 0x100 * i + FAULT, 40) for i in range(n)] if prog.get('system') else []
+    segs = [(CFG, 16)] + [(RESULT + 0x100 * i, 136) for i in range(n)] + faults + [(a, s) for a, s, cap, _ in regions(prog) if cap] + [(CFG + 0x10, 8)]
     assert len(segs) < 64
     cfg(0x100, b''.join(a.to_bytes(8, 'little') + s.to_bytes(8, 'little') for a, s in segs))
     return bytes(img)
 
 
-def qemu_args(n, mode, dbg, img):
-    return [QEMU, '-accel', f'tcg,thread={mode}', '-cpu', 'max', '-smp', str(n), '-m', '64', '-machine', 'pc', '-nographic', '-nodefaults',
+def qemu_args(n, mode, dbg, img, cpu='max'):
+    return [QEMU, '-accel', f'tcg,thread={mode}', '-cpu', cpu, '-smp', str(n), '-m', '64', '-machine', 'pc', '-nographic', '-nodefaults',
             '-monitor', 'none', '-serial', 'none', '-device', 'isa-debug-exit,iobase=0xf4,iosize=0x04', '-no-reboot',
             '-debugcon', f'file:{dbg}', '-kernel', str(img)]
 
@@ -82,7 +89,8 @@ def run_image(prog, img, work, mode='multi', timeout=120):
     work.mkdir(parents=True, exist_ok=True); p, dbg = work / 'image.bin', work / 'dbg.out'
     p.write_bytes(img); dbg.unlink(missing_ok=True); t0 = time.perf_counter()
     try:
-        r = subprocess.run(qemu_args(prog['ncpu'], mode, dbg, p), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=timeout)
+        cpu = SYSTEM_CPU if prog.get('system') else 'max'
+        r = subprocess.run(qemu_args(prog['ncpu'], mode, dbg, p, cpu), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=timeout)
         rc, err = r.returncode, r.stderr.decode(errors='replace')[-300:]
     except subprocess.TimeoutExpired:
         rc, err = 'timeout', ''
@@ -90,15 +98,20 @@ def run_image(prog, img, work, mode='multi', timeout=120):
 
 
 def parse_dump(prog, data):
-    """-> {'cpus': [{'gpr': [16 ints], 'rflags': int}], 'memory': [{'addr','data'}...captured regions in program order]}. Raises ValueError."""
+    """-> {'cpus': [{'gpr': [16 ints], 'rflags': int}], 'memory': [{'addr','data'}...captured regions in program order]}; a
+    `system` program's CPUs also have 'fault': None or (vector, error code, RIP, CR2 (#PF only, else 0)). Raises ValueError."""
     n = prog['ncpu']; caps = [(a, s) for a, s, c, _ in regions(prog) if c]
-    want = 16 + 136 * n + sum(s for _, s in caps) + 8
+    system = bool(prog.get('system'))
+    want = 16 + 136 * n + 40 * n * system + sum(s for _, s in caps) + 8
     if len(data) != want: raise ValueError(f'dump is {len(data)} bytes, expected {want}')
     if data[:8] != b'SMPCFG01' or int.from_bytes(data[8:16], 'little') != n or data[-8:] != b'ENDDUMP!': raise ValueError('bad dump header/footer')
     cpus, o = [], 16
     for i in range(n):
         q = [int.from_bytes(data[o + 8 * j:o + 8 * j + 8], 'little') for j in range(17)]
         cpus.append({'gpr': q[:16], 'rflags': q[16]}); o += 136
+    for c in cpus if system else []:
+        faulted, vector, error, rip, cr2 = (int.from_bytes(data[o + 8 * j:o + 8 * j + 8], 'little') for j in range(5)); o += 40
+        c['fault'] = (vector, error, rip, cr2 if vector == 14 else 0) if faulted else None
     mem = []
     for a, s in caps: mem.append({'addr': a, 'data': data[o:o + s]}); o += s
     return {'cpus': cpus, 'memory': mem}
@@ -111,6 +124,9 @@ def compare(prog, got, want):
         for k, (x, y) in enumerate(zip(g['gpr'], w['gpr'])):
             if x != y: d.append(f'cpu{i} {REGS[k]}: {x:#x} != {y:#x}')
         if (g['rflags'] ^ w['rflags']) & FLAG_MASK: d.append(f"cpu{i} rflags: {g['rflags'] & FLAG_MASK:#x} != {w['rflags'] & FLAG_MASK:#x}")
+        if g.get('fault') != w.get('fault'):
+            f = lambda x: x and '(vector %d, error %#x, rip %#x, cr2 %#x)' % x
+            d.append(f"cpu{i} fault: {f(g.get('fault'))} != {f(w.get('fault'))}")
     if len(got['memory']) != len(want['memory']): d.append('memory region count')
     for g, w in zip(got['memory'], want['memory']):
         if g['addr'] != w['addr'] or len(g['data']) != len(w['data']): d.append(f"region {g['addr']:#x} shape")
@@ -138,6 +154,7 @@ def cmd_build(a):
     import programs
     (HERE / 'programs.json').write_text(json.dumps(programs.det_all(), indent=1) + '\n')
     (HERE / 'litmus.json').write_text(json.dumps(programs.litmus_all(a.k), indent=1) + '\n')
+    (HERE / 'system.json').write_text(json.dumps(programs.system_all(), indent=1) + '\n')
 
 
 def det_one(prog, stub, work, mode, reps, log, model):

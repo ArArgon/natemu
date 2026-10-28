@@ -185,8 +185,11 @@ pub(crate) struct Stops {
     /// vCPU v's stop granule (IPA).
     ipa: Vec<u64>,
     kicks: Vec<Mutex<Kick>>,
-    /// vCPU v is in the host (not in `hv_vcpu_run`): a kick then waits for its next entry.
+    /// vCPU v is in the host (not in `hv_vcpu_run`). Accounting only (`Kick::in_host`, latency classes): a kick
+    /// protects whether or not it is set.
     in_host: Vec<AtomicBool>,
+    /// Per-stop latencies are kept (`Kick::latency`) only when the driver asks.
+    latencies: bool,
 }
 /// One vCPU's kick flag and its stop accounting.
 #[derive(Default, Clone)]
@@ -200,15 +203,15 @@ pub(crate) struct Kick {
     pub(crate) merged: u64,
     /// Stops taken (stage-2 faults on the granule served).
     pub(crate) stops: u64,
-    /// Per stop: nanoseconds from the protect's return to the fault's exit (0 if the exit came first), and whether
-    /// the kick found the vCPU in the host.
+    /// Per stop, if the driver asked ([`Stops::new`]): nanoseconds from the protect's return to the fault's exit (0 if
+    /// the exit came first), and whether the kick found the vCPU in the host.
     pub(crate) latency: Vec<(u64, bool)>,
     /// Native PCs of the stops (the faulting stop stores), with their counts.
     pub(crate) pcs: std::collections::BTreeMap<u64, u64>,
 }
 impl Stops {
-    /// Stop granules of `backing`'s vCPUs in `machine` (which maps the backing).
-    pub(crate) fn new(backing: &Backing, machine: &Machine) -> Result<Self> {
+    /// Stop granules of `backing`'s vCPUs in `machine` (which maps the backing); `latencies`: keep every stop's latency.
+    pub(crate) fn new(backing: &Backing, machine: &Machine, latencies: bool) -> Result<Self> {
         let granule = machine.granule;
         if exec::STOP_BYTES % granule != 0 || exec::STOP_OFFSET % granule != 0 {
             return Err(format!("IPA granule {granule} does not fit the stop region"));
@@ -218,6 +221,7 @@ impl Stops {
             ipa: (0..backing.n).map(|v| IPA + (backing.vcpu(v).base + exec::STOP_OFFSET) as u64).collect(),
             kicks: (0..backing.n).map(|_| Mutex::default()).collect(),
             in_host: (0..backing.n).map(|_| AtomicBool::new(true)).collect(),
+            latencies,
         })
     }
     /// Stops vCPU `v` at its next block entry. False: a kick was pending (merged into it).
@@ -248,8 +252,10 @@ impl Stops {
         protect(self.ipa[v], self.granule, vm::MAPPED)?;
         k.pending = None;
         k.stops += 1;
-        let ns = exited.saturating_duration_since(protected).as_nanos() as u64;
-        k.latency.push((ns, in_host));
+        if self.latencies {
+            let ns = exited.saturating_duration_since(protected).as_nanos() as u64;
+            k.latency.push((ns, in_host));
+        }
         *k.pcs.entry(pc).or_default() += 1;
         Ok(())
     }
@@ -391,10 +397,18 @@ impl Drop for Server {
     }
 }
 
-/// What fexc answered for one request (errors are not kept).
+/// What fexc answered for one request (errors are not kept): an object, a system instruction at the RIP (decoded,
+/// [`crate::system`]), or no code with fexc's end reason.
 enum Compiled {
     Object(Vec<u8>),
+    System(exec::System),
     NoCode(String),
+}
+/// What [`Compiler::compile`] gives the service loop.
+pub(crate) enum Code {
+    Block(admission::Admitted),
+    System(exec::System),
+    None(String),
 }
 
 /// fexc for one vCPU's feature set: one persistent `fexc --serve` process (started at the first compile) and a cache of its
@@ -426,9 +440,9 @@ impl Compiler {
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
         Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), compiles: 0, hits: 0, tamper: None }
     }
-    /// The admitted block for `bytes` at `rip` (only its first instruction if `step`), or fexc's end reason when it
-    /// produced no code.
-    fn compile(&mut self, bytes: &[u8], rip: u64, step: bool) -> Result<std::result::Result<admission::Admitted, String>> {
+    /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
+    /// `rip` the resident executes, or fexc's end reason when it produced no code.
+    fn compile(&mut self, bytes: &[u8], rip: u64, step: bool) -> Result<Code> {
         let mut args = vec!["--profile".to_string(), "slice1".into(), "--rip".into(), format!("{rip:#x}")];
         if let Some(n) = if step { Some(1) } else { self.max_instructions } {
             args.extend(["--max-insts".into(), n.to_string()]);
@@ -450,7 +464,11 @@ impl Compiler {
                 0 => Compiled::Object(object),
                 1 => {
                     let json = crate::json::parse(&String::from_utf8_lossy(&json))?;
-                    Compiled::NoCode(end_reason(&json).ok_or("fexc report without guest.end.reason")?.into())
+                    let reason = end_reason(&json).ok_or("fexc report without guest.end.reason")?;
+                    match system_cut(&json, rip).and_then(|(map, opcode)| crate::system::decode(bytes, map, opcode)) {
+                        Some(s) if reason == "system_instruction" => Compiled::System(s),
+                        _ => Compiled::NoCode(reason.into()),
+                    }
                 }
                 _ => return Err(format!("fexc failed at {rip:#x}: {}", String::from_utf8_lossy(&json))),
             };
@@ -468,15 +486,26 @@ impl Compiler {
                 if let Some(tamper) = self.tamper {
                     tamper(&mut admitted.object);
                 }
-                Ok(Ok(admitted))
+                Ok(Code::Block(admitted))
             }
-            Compiled::NoCode(reason) => Ok(Err(reason.clone())),
+            Compiled::System(s) => Ok(Code::System(*s)),
+            Compiled::NoCode(reason) => Ok(Code::None(reason.clone())),
         }
     }
 }
 /// `guest.end.reason` of fexc's report.
 fn end_reason(json: &crate::json::Value) -> Option<&str> {
     json.get("guest")?.get("end")?.get("reason")?.as_str()
+}
+/// The opcode map and opcode of the instruction fexc cut the block before, if that is the first one (at `rip`).
+fn system_cut(json: &crate::json::Value, rip: u64) -> Option<(u8, u8)> {
+    let end = json.get("guest")?.get("end")?;
+    let number = |key: &str| match end.get(key)? {
+        crate::json::Value::Number(n) => n.parse().ok(),
+        _ => None,
+    };
+    let at = u64::from_str_radix(end.get("rip")?.as_str()?.strip_prefix("0x")?, 16).ok()?;
+    (at == rip).then_some((number("cut_opcode_map")?, number("cut_opcode")?))
 }
 
 /// Guest bytes fetched at a RIP, the (linear, physical) pages they came from, and the
@@ -686,17 +715,18 @@ fn serve(
             exec::REQUEST_STEP => true,
             _ => return Err("translation exit without a request".into()),
         };
-        match translation(area, compiler, &mut state, step, stop_at, requests, stops, cancelled)? {
-            Some(stop) => {
+        state.reply = match translation(area, compiler, &mut state, step, stop_at, requests, stops, cancelled)? {
+            Ok(reply) => reply,
+            Err(stop) => {
                 parked = Some(stop);
-                state.reply = exec::REPLY_PARK;
+                exec::REPLY_PARK
             }
-            None => state.reply = exec::REPLY_ADMITTED,
-        }
+        };
         area.write_record(exec::STATE_OFFSET, state);
     }
 }
-/// Serves one request: stages the admitted block and fills `state`'s reply fields, or returns the vCPU's stop.
+/// Serves one request: stages the admitted block, or decodes the system instruction at RIP, and fills `state`'s
+/// reply fields (returns the reply); or returns the vCPU's stop.
 fn translation(
     area: Area,
     compiler: &mut Compiler,
@@ -706,20 +736,31 @@ fn translation(
     requests: &mut Requests,
     stops: &Stops,
     cancelled: &AtomicBool,
-) -> Result<Option<Stop>> {
+) -> Result<std::result::Result<u64, Stop>> {
     let rip = state.cpu.rip;
     if Some(rip) == stop_at {
-        return Ok(Some(Stop::Reached));
+        return Ok(Err(Stop::Reached));
     }
     let Fetched { bytes, pages, next_fault } = match fetch(area, stops, &state.cpu, rip, stop_at, cancelled)? {
         Ok(fetched) => fetched,
-        Err(Fault::Contended) => return Ok(Some(Stop::Cancelled)),
-        Err(fault) => return Ok(Some(Stop::FetchFault(fault))),
+        Err(Fault::Contended) => return Ok(Err(Stop::Cancelled)),
+        Err(fault) => return Ok(Err(Stop::FetchFault(fault))),
     };
     let block = match compiler.compile(&bytes, rip, step)? {
-        Ok(block) => block,
-        Err(reason) => {
-            return Ok(Some(match next_fault {
+        Code::Block(block) => block,
+        // A step request is for a block's access site, never a system instruction.
+        Code::System(s) if !step => {
+            state.system = s;
+            if let Some(tamper) = requests.tamper {
+                if tamper(area, state) {
+                    (requests.tamper, requests.tampered) = (None, true);
+                }
+            }
+            return Ok(Ok(exec::REPLY_SYSTEM));
+        }
+        Code::System(_) => return Err(format!("step at {rip:#x}: a system instruction")),
+        Code::None(reason) => {
+            return Ok(Err(match next_fault {
                 // The instruction at RIP continues into a page whose fetch faults.
                 Some(fault) if reason == "partial_decode" => Stop::FetchFault(fault),
                 _ => Stop::NoCode(reason),
@@ -731,6 +772,7 @@ fn translation(
         return Err(format!("step at {rip:#x}: {} instructions, {} bytes", block.guest_insns, block.guest_bytes));
     }
     area.copy(exec::STAGING_OFFSET, &block.object);
+    state.system = exec::System::NONE;
     if !step {
         requests.blocks += 1;
         requests.rips.insert(rip);
@@ -749,7 +791,7 @@ fn translation(
             (requests.tamper, requests.tampered) = (None, true);
         }
     }
-    Ok(None)
+    Ok(Ok(exec::REPLY_ADMITTED))
 }
 
 #[cfg(test)]
@@ -761,15 +803,31 @@ mod tests {
         let Some(fexc) = std::env::var_os("FEXC") else { return };
         let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
         let code = [0x48, 0x01, 0xd8, 0xc3];
-        let first = c.compile(&code, 0x1000, false).unwrap().unwrap().object;
+        let object = |c: &mut super::Compiler, code: &[u8], rip| match c.compile(code, rip, false).unwrap() {
+            Code::Block(b) => b.object,
+            _ => panic!("no block"),
+        };
+        let first = object(&mut c, &code, 0x1000);
         assert_eq!((c.compiles, c.hits), (1, 0));
-        assert_eq!(c.compile(&code, 0x1000, false).unwrap().unwrap().object, first);
+        assert_eq!(object(&mut c, &code, 0x1000), first);
         assert_eq!((c.compiles, c.hits), (1, 1));
-        c.compile(&code, 0x2000, false).unwrap().unwrap();
-        c.compile(&[0x48, 0x29, 0xd8, 0xc3], 0x1000, false).unwrap().unwrap();
+        object(&mut c, &code, 0x2000);
+        object(&mut c, &[0x48, 0x29, 0xd8, 0xc3], 0x1000);
         c.max_instructions = Some(1);
-        c.compile(&code, 0x1000, false).unwrap().unwrap();
+        object(&mut c, &code, 0x1000);
         assert_eq!((c.compiles, c.hits), (4, 1));
+        // A system instruction at the RIP is decoded (and cached with fexc's answer); one later in the block cuts it.
+        let mov_cr3 = [0x0f, 0x22, 0xd8, 0x90];
+        let decoded = |c: &mut super::Compiler, rip| match c.compile(&mov_cr3, rip, false).unwrap() {
+            Code::System(s) => Some(s),
+            _ => None,
+        };
+        let s = decoded(&mut c, 0x3000).unwrap();
+        assert_eq!((s.kind, s.cr, s.reg, s.length), (exec::system::MOV_TO_CR, 3, 0, 3));
+        assert_eq!(decoded(&mut c, 0x3000), Some(s));
+        assert_eq!((c.compiles, c.hits), (5, 2));
+        assert!(matches!(c.compile(&[0xf4], 0x3000, false).unwrap(), Code::None(r) if r == "system_instruction")); // hlt
+        assert!(matches!(c.compile(&[0x90, 0x0f, 0x22, 0xd8], 0x3000, false).unwrap(), Code::Block(_)));
     }
 
     #[test]
@@ -831,5 +889,8 @@ mod tests {
         let json = crate::json::parse(json).unwrap();
         assert_eq!(super::end_reason(&json), Some("system_instruction"));
         assert_eq!(super::end_reason(&crate::json::parse("{}").unwrap()), None);
+        let cut = r#"{"guest":{"end":{"rip":"0x10","reason":"system_instruction","detail":"x","cut_opcode_map":1,"cut_opcode":34}}}"#;
+        let cut = crate::json::parse(cut).unwrap();
+        assert_eq!((super::system_cut(&cut, 0x10), super::system_cut(&cut, 0x11)), (Some((1, 0x22)), None));
     }
 }

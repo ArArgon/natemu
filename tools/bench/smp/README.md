@@ -24,7 +24,8 @@ only on tool errors; allowed/forbidden labelling comes from `tools/i4v_ordering_
 ## Stub: how CPUs start (extends `tools/bench/stub.asm`)
 
 Map: identity-mapped 4 KiB pages 0..4 MiB, present/rw/user with A/D preset (no walk ever writes); stub, GDT and tables at 0x100000..0x106000,
-config at 0x106000, result slots 0x107000, boot stacks 0x108000..0x10c000, bodies and data from 0x110000 (python-patched into the image).
+config at 0x106000, result slots 0x107000, boot stacks 0x108000..0x10c000, IDT, fault stubs and handler 0x10c000, TSSs 0x10e000, bodies and
+data from 0x110000 (python-patched into the image).
 
 1. **BSP** (SeaBIOS enters the Multiboot image on CPU 0): copies a 33-byte real-mode trampoline to 0x7000, loads the GDT, enables PAE, EFER.LME,
    paging, far-jumps to 64-bit CPL0. CPU index = initial APIC id (`cpuid` leaf 1 EBX[31:24]); per-CPU boot stack 0x109000 + 0x1000 * id.
@@ -33,10 +34,14 @@ config at 0x106000, result slots 0x107000, boot stacks 0x108000..0x10c000, bodie
    each followed by a busy delay. No MP table or ACPI parsing: QEMU's `-smp N` gives APIC ids 0..N-1.
 3. **AP**: real mode at 0x7000 -> `lgdt`, CR0.PE -> far jump to the flat 32-bit segment -> the same PAE/LME/paging sequence as the BSP -> 64-bit
    CPL0 (the BSP's and APs' code from `common32` on is one path). Each CPU masks its PICs, points its GS base at its own 0x100-byte result slot
-   (`IA32_GS_BASE`, set at CPL0 and kept across `iretq`), and increments the `ARRIVE` counter.
+   (`IA32_GS_BASE`, set at CPL0 and kept across `iretq`), loads its own TSS (RSP0 = its boot stack) and the shared IDT, and increments the
+   `ARRIVE` counter. Controls from here on: CR0 = PE|ET|WP|PG (0x80010011, CD/NW clear), CR4 = PAE (0x20), EFER = LME|LMA|NXE (0xd00); the
+   same values natemu's program driver starts a vCPU with.
 4. **Start barrier**: the BSP waits until `ARRIVE == ncpu`, then stores `GO`; every CPU spins on `GO`. Then each CPU loads its own 16 GPRs
-   from its entry of the CPU table and does `iretq` to **CPL3** at its own `rip` (user CS/SS, IOPL = 3 so the program may `out`, IF = 0, RFLAGS
-   per CPU masked to the six arithmetic flags). No IDT, no interrupts after start-up.
+   from its entry of the CPU table and does `iretq` to **CPL3** (CPL0 when the CPU's `cpl` is 0) at its own `rip` (user CS/SS, IOPL = 3 so
+   the program may `out`, IF = 0, RFLAGS per CPU masked to the six arithmetic flags). No interrupts after start-up. An exception (vectors
+   0..31, interrupt gates) stores the GPRs and RFLAGS as the faulting instruction found them and a fault record (vector, error code, RIP, CR2)
+   in the CPU's slot, restores the start-up CR4, CR3, CR0 and EFER and joins the capture at `done` (a CPL3 fault switches to RSP0).
 5. **Body**: runs unmodified; the end is a fall-through. python appends `jmp capture` (5 bytes) after each body.
 6. **Capture** (CPL3, GS-relative): store 16 GPRs and `pushfq` to the own slot, set the slot's `done` (TSO: after the register stores), CPUs > 0
    park in a `pause` loop; CPU 0 waits for every `done`, then writes the dump to debugcon (port 0xe9) with `rep outsb`, then `out 0xf4`
@@ -67,6 +72,22 @@ a plain reference program):
   compared; bodies never use them. Bodies are position-dependent (absolute addresses in the regions); code is not stored to.
 - `lcg` fill: `x = x * 6364136223846793005 + 1442695040888963407 (mod 2^64)`, byte = `x >> 56`, from `seed` (as `tools/bench`).
 - Result of a run: `{"cpus": [{"gpr": [16], "rflags"}], "memory": [{"addr","data"}]}` (`smp.parse_dump`); `smp.compare(prog, got, want)` lists differences.
+- `system: true` (system programs): CPUs may have `"cpl": 0` (default 3); QEMU runs with `-cpu max,-pcid,-smap` (natemu's CPU model has
+  neither, so CR4.PCIDE/SMAP are reserved); the dump has a 40-byte fault record per CPU after the CPU slots and each CPU's result a
+  `fault`: None or (vector, error code, RIP, CR2 for #PF), compared by `smp.compare`. natemu runs such a program in an identity-mapped
+  space (driver `identity`), so bodies may build page tables from physical addresses.
+
+## (c) System programs (`system.json`, from `programs.system_all`)
+
+CPL0 bodies with MOV to/from CR0/CR3/CR4, INVLPG (four operand forms and a non-canonical no-op), RDMSR/WRMSR EFER: a CR3 switch between
+two address spaces (also a same-value load and ignored low CR3 bits), INVLPG after PTE rewrites, CR0.WP toggled around supervisor writes to
+a read-only page (the last one faults), EFER.NXE toggled with read-backs (an XD bit becomes reserved: the last read faults), control
+read-backs with CR4.PGE/SMEP set and cleared, a SMEP fetch fault, an XD fetch fault, each at 1, 2 and 4 CPUs (own code page, tables and data
+per CPU); and a PTE change without INVLPG (either history is legal: not compared with QEMU). Each CPU's two table sets identity-map
+0..4 MiB with A/D preset except on its test pages (their A/D are compared). Bodies end by restoring the start-up controls. Fault cases
+(`sysfault-*`, `params.fault_at` = the instruction under test): reserved CR0/CR3/CR4 bits, PCIDE, SMAP, clearing PE/PG/PAE, NW without CD,
+LOCK, CR1/CR5, CPL3 forms, reserved EFER bits, LME cleared with paging on, unknown MSRs. QEMU 11.1.2 is not a reference for most of these
+(it accepts some writes the SDM faults and hangs on others); `tools/run_slice3_vm.py system` judges them with `tools/system_fault_model.py`.
 
 ## (a) Deterministic programs (`programs.json`, 5 programs x 2/3/4 CPUs)
 
@@ -124,7 +145,12 @@ Host Apple M4, macOS 26.6.2, QEMU 11.1.2 (binary SHA-256 in `*/manifest.json`), 
 - Outcome frequencies are skewed by barrier latency and run-to-run host load; they are not comparable between machines or runs. Only containment in
   the allowed set is a result.
 - Not covered: LOCK-prefixed read-modify-write (only `xchg`), unaligned and line/page-crossing accesses, SMC across CPUs, interrupts/IPIs after
-  start-up (no IDT), TLB shootdown, CR3 switches, more than 4 CPUs.
+  start-up, TLB shootdown, concurrent controls over shared tables, more than 4 CPUs.
+- QEMU 11.1.2 deviations seen by the system programs: a reserved-bit #PF has P = 0 in its error code (SDM: 1; `run_slice3_vm.py` corrects
+  it, declared); MOV to CR0 with bits 63:32, PE=0/PG=1 or NW without CD, MOV to CR4 setting PCIDE (with `-pcid`) or clearing PAE, WRMSR
+  EFER with reserved bits or an LME change under paging, and RDMSR/WRMSR of an unknown MSR complete without #GP; MOV to CR4 setting a
+  reserved bit or SMAP (with `-smap`), MOV to CR0 clearing PG and MOV to CR3 with bits above MAXPHYADDR hang (the vCPU stays at the
+  instruction, no exception logged).
 - Each CPU's boot path touches shared stub memory (ARRIVE/GO, result slots) before the body; programs must not use 0x100000-0x10c000 or
   0x3E0000-0x3F0000 other than the stacks above. Bodies at 0x110000.. and regions below 0x400000.
 - `thread=single` litmus runs use the `-pause` variants (PAUSE in the spin loops, untested without); `thread=multi` uses the plain ones.

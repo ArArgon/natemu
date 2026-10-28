@@ -14,7 +14,8 @@
 //! refused; `word`: a linked point's branch; `literal`: the target literal of a linked point; `record`: a link record),
 //! and the unlink must halt (`bad_link`); `--tamper-after KIND` (not `offset`) corrupts after the run, and the host's
 //! self-check must refuse (`links_check`); `--forge-stop` enters the stop gate of its first stop with a forged ELR
-//! (the resident must halt: `bad_stop`).
+//! (the resident must halt: `bad_stop`); `--tamper system` makes the first system reply's decode malformed (the resident
+//! must refuse it: `bad_reply`).
 //!
 //! Precise stops: `--kick-vcpu V` (repeatable) runs a host kicker thread per listed vCPU that kicks it `--kicks M`
 //! times (default 10,000), each after the previous kick's stop was taken (or the vCPU ended) and `--kick-every-us P`
@@ -28,7 +29,10 @@
 //!
 //! Description (text, one item per line). State items: rip ADDR | rflags VALUE | gpr V0 .. V15
 //!   | cpl 0|3 (default 3) | wp 0|1 (CR0.WP, default 1) | smep 0|1 (CR4.SMEP, default 0) | nxe 0|1 (EFER.NXE, default 1).
+//! CR0 is PE, ET, PG and WP as set, CR4 PAE and SMEP as set, EFER LME, LMA and NXE as set; CPL0 code may change them
+//! with system instructions (the resident's transactions).
 //! Address-space items: code HEX (a body at the section's rip) | body ADDR HEX | memory ADDR HEX
+//!   | identity   (every page maps to the guest-physical page of its own address, below 4 MiB; no `large`)
 //!   | region ADDR SIZE   (zero-filled writable pages covering the byte range; eager: guest RAM bounds the total)
 //!   | large ADDR   (the 2 MiB-aligned range holding ADDR is one present 2 MiB leaf (PDE with PS), writable if any page
 //!     of the space in it is, not executable unless one is code; at most one per run: guest RAM holds one such frame)
@@ -68,6 +72,8 @@ struct Space {
     large: Vec<u64>,
     /// Entry mutations after setup, in order.
     edits: Vec<Edit>,
+    /// Pages map to the guest-physical page of the same address.
+    identity: bool,
 }
 /// Set, then clear, bits of the entry at `level` (`None`: the leaf) of `va`'s walk.
 #[derive(Debug, PartialEq)]
@@ -174,6 +180,7 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
             ("memory", [a, h]) => space.memory.push((number(a)?, hex(h)?)),
             ("region", [a, n]) if number(n)? > 0 => space.regions.push((number(a)?, number(n)?)),
             ("large", [a]) => space.large.push(number(a)? & !(LARGE - 1)),
+            ("identity", []) => space.identity = true,
             ("unmap", [a]) => space.edits.push(Edit { va: number(a)?, level: None, set: 0, clear: PRESENT }),
             ("readonly", [a]) => space.edits.push(Edit { va: number(a)?, level: None, set: 0, clear: WRITABLE }),
             ("entry", [a, l @ ("1" | "2" | "3" | "4"), op @ ("set" | "clear"), bits]) => {
@@ -207,14 +214,18 @@ const LARGE: u64 = 0x20_0000;
 const ADDRESS: u64 = natemu_abi::paging::PA_MASK;
 
 /// Guest-physical page allocation (shared by every address space): 4 KiB pages upwards from `next`, 2 MiB frames
-/// downwards from `top`.
+/// downwards from `top`, never one of the `reserved` pages (identity-mapped pages).
 struct Builder {
     ram: GuestRam,
     next: u64,
     top: u64,
+    reserved: std::collections::BTreeSet<u64>,
 }
 impl Builder {
     fn page(&mut self) -> Result<u64> {
+        while self.reserved.contains(&self.next) {
+            self.next += 4096;
+        }
         let gpa = self.next;
         if gpa + 4096 > self.top {
             return Err("guest RAM exhausted".into());
@@ -261,9 +272,10 @@ impl Tables {
         }
         Ok(table + ((va >> (12 + 9 * (level - 1))) & 511) * 8)
     }
-    fn map(&mut self, b: &mut Builder, va: u64, flags: u64) -> Result<()> {
+    /// Maps `va` to a new page, or (`identity`) to its own address.
+    fn map(&mut self, b: &mut Builder, va: u64, flags: u64, identity: bool) -> Result<()> {
         let leaf = self.entry(Some(b), va, 1)?;
-        let gpa = b.page()?;
+        let gpa = if identity { va } else { b.page()? };
         assert!(self.ram.write(leaf, gpa | PRESENT | USER | flags));
         self.pages.insert(va, (gpa, leaf));
         Ok(())
@@ -294,8 +306,13 @@ impl Tables {
 /// Builds `space` (for a vCPU starting at `rip` when its bodies sit at the rip): code pages are read-only and
 /// executable, region pages writable and not executable (any region covering a code page leaves it executable;
 /// without `nxe` nothing is marked not executable).
+/// With `identity`, every page maps to the guest-physical page of its own address (the space's guest code can then
+/// build page tables of its own: its physical addresses are its linear ones); no `large` pages.
 fn build(b: &mut Builder, space: &Space, rip: u64, nxe: bool) -> Result<Tables> {
     let no_execute = if nxe { NO_EXECUTE } else { 0 };
+    if space.identity && !space.large.is_empty() {
+        return Err("identity space with a large page".into());
+    }
     let mut flags = BTreeMap::new();
     let code_pages: Vec<u64> = bodies(space, rip).flat_map(|(at, code)| page_span(at, code.len())).collect();
     for &page in &code_pages {
@@ -319,7 +336,7 @@ fn build(b: &mut Builder, space: &Space, rip: u64, nxe: bool) -> Result<Tables> 
     }
     for (&page, &f) in &flags {
         if !space.large.contains(&(page & !(LARGE - 1))) {
-            t.map(b, page, f)?;
+            t.map(b, page, f, space.identity)?;
         }
     }
     for (at, code) in bodies(space, rip) {
@@ -338,12 +355,18 @@ fn build(b: &mut Builder, space: &Space, rip: u64, nxe: bool) -> Result<Tables> 
     }
     Ok(t)
 }
+/// The pages an identity space maps (as [`build`]: its code, memory and regions).
+fn identity_pages(space: &Space, rip: u64) -> Vec<u64> {
+    let code = bodies(space, rip).map(|(at, code)| (at, code.len()));
+    let data = space.memory.iter().map(|(a, d)| (*a, d.len())).chain(space.regions.iter().map(|&(a, n)| (a, n as usize)));
+    code.chain(data).flat_map(|(at, n)| page_span(at, n)).collect()
+}
 fn page_span(start: u64, length: usize) -> impl Iterator<Item = u64> {
     (start & !4095..start + length as u64).step_by(4096)
 }
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] \
-                     [--code-cache BYTES] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-header] [--tamper offset|word|literal|record] [--tamper-after word|literal|record] \
+                     [--code-cache BYTES] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-header] [--tamper offset|word|literal|record|system] [--tamper-after word|literal|record] \
                      [--forge-stop] [--kick-vcpu V]... [--kicks M] [--kick-every-us P]";
 
 /// `adr x0, #-4` (the block's header) at the entry becomes `adr x0, #0` (the entry itself).
@@ -398,6 +421,12 @@ fn tamper_offset(area: Area, state: &mut State) -> bool {
     p.offset = h.code_size; // a whole exit no longer fits
     true
 }
+/// A system reply whose decode the resident must refuse (`bad_reply`): an instruction length of 16.
+fn tamper_system(_: Area, state: &mut State) -> bool {
+    let reply = state.system.kind != 0;
+    state.system.length = if reply { 16 } else { state.system.length };
+    reply
+}
 fn tamper_word(area: Area, _: &mut State) -> bool {
     flushing_next(area) && corrupt(area, Corrupt::Word)
 }
@@ -446,6 +475,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                     Some("word") => tamper_word,
                     Some("literal") => tamper_literal,
                     Some("record") => tamper_record,
+                    Some("system") => tamper_system,
                     _ => return Err(USAGE.into()),
                 })
             }
@@ -468,7 +498,16 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
     let backing = execution::prepare(resident, code_bytes, n)?;
     require_vcpus(n)?;
-    let mut builder = Builder { ram: execution::guest_ram(&backing.memory), next: 0x1000, top: exec::GUEST_RAM_BYTES as u64 };
+    let mut builder = Builder { ram: execution::guest_ram(&backing.memory), next: 0x1000, top: exec::GUEST_RAM_BYTES as u64, reserved: Default::default() };
+    // Identity-mapped pages first: the allocator never hands them out.
+    for c in d.cpus.iter().filter(|c| d.spaces[c.space].identity) {
+        for page in identity_pages(&d.spaces[c.space], c.rip) {
+            if page >= exec::GUEST_RAM_BYTES as u64 || page == 0 {
+                return Err(format!("identity page {page:#x} outside guest RAM (or page 0)"));
+            }
+            builder.reserved.insert(page);
+        }
+    }
     // A space is built for the first vCPU using it (its rip places `code` bodies).
     let mut spaces: Vec<Option<Tables>> = d.spaces.iter().map(|_| None).collect();
     let mut ends = Vec::new();
@@ -489,7 +528,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 gpr: c.gpr,
                 rip: c.rip,
                 rflags: c.rflags | 0x202,
-                cr0: exec::CR0_PE | exec::CR0_PG | bit(c.wp, exec::CR0_WP),
+                cr0: exec::CR0_PE | exec::CR0_ET | exec::CR0_PG | bit(c.wp, exec::CR0_WP),
                 cr3: spaces[c.space].as_ref().unwrap().cr3,
                 cr4: exec::CR4_PAE | bit(c.smep, exec::CR4_SMEP),
                 efer: exec::EFER_LME | exec::EFER_LMA | bit(c.nxe, exec::EFER_NXE),
@@ -499,7 +538,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
 
     let machine = Machine::create(&backing.memory)?;
-    let stops = execution::Stops::new(&backing, &machine)?;
+    let stops = execution::Stops::new(&backing, &machine, !kicked.is_empty())?;
     let ended: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
     let watchdog = std::time::Duration::from_millis(watchdog_ms);
     let body = |v: usize, cpu: &Vcpu, cancelled: &AtomicBool| -> Result<Ran> {
@@ -636,7 +675,7 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"steps\":{},\"stops\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\"}}",
+        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"steps\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\"}}",
         s.blocks,
         s.fast,
         s.l2_hits,
@@ -647,6 +686,7 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
         ran.compiles,
         s.steps,
         s.stops,
+        s.systems,
         s.invalidations,
         s.retries,
         s.upgrades,
@@ -727,6 +767,7 @@ mod tests {
         let edits = [edit(0x200010, None, 0, PRESENT), edit(0x201000, None, 0, WRITABLE), edit(0x200000, Some(2), 1 << 40, 0), edit(0x200000, Some(4), 0, 4)];
         assert_eq!(p.edits, edits);
         assert_eq!((parse("code 90").unwrap().cpus[0].cpl, parse("code 90").unwrap().cpus[0].nxe), (3, true));
+        assert!(parse("identity\ncode 90").unwrap().spaces[0].identity && !parse("code 90").unwrap().spaces[0].identity);
         for bad in ["rip\ncode 90", "code 9", "gpr 1 2\ncode 90", "", "frob 1\ncode 90", "region 1 0\ncode 90", "cpl 1\ncode 90", "wp 2\ncode 90",
                     "entry 0x1000 5 set 1\ncode 90", "entry 0x1000 1 flip 1\ncode 90", "body 0x1000 90\nsmep 1\ncpu\nrip 0x1000"] {
             assert!(parse(bad).is_err(), "{bad:?}");

@@ -8,6 +8,7 @@
     tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR limits
     tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR kicks [--cpus 1 2 4] [--kicks M] [--iterations I]
         [--parallel P] [--reps R]
+    tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR system [--programs SUBSTR,...]
 
 `corpora`: the single-vCPU corpora — the slice-1 fixtures, the control-flow corpus (default: the S2d run's
 programs and QEMU results under NATEMU_RAW_ROOT/s2d/corpus) and the slice-1 fault cases (QEMU prefix references, as
@@ -36,6 +37,12 @@ stops taken = kicks issued - a kick still pending at its end (none lost or doubl
 included), the resident's stop count = the host's, every stop PC a stop store of a placed block, and (hot loop) all M
 kicks issued while it ran. Latency (protect return -> stop exit, per vCPU) is reported. `corpora --kicks M` also kicks
 every vCPU M times (mostly while it is in the host or the resident) and adds the same accounting checks.
+
+`system` (S3c1, long-mode system instructions as resident transactions): see cmd_system. Each system program of
+tools/bench/smp/system.json runs at block sizes default and 1 against QEMU system mode (smp.SYSTEM_CPU), except the PTE
+change without INVLPG (i4v_coherence_model) and the fault cases (tools/system_fault_model.py at QEMU's state just before
+the instruction; i4v_modes_model where it covers them; QEMU's own outcome is reported and must agree where it raises an
+exception); refused forms stop `unsupported_system`; a tampered system reply stops `bad_reply`.
 
 `limits`: 5 vCPUs are refused (0 cannot be written: a description without `cpu` lines is one vCPU; the host's
 `prepare` refuses 0 in its unit test); a forged block header on vCPU V of 4 (V = 0..3; the others spin in a linked
@@ -67,7 +74,9 @@ def kick_checks(out, kicks=None):
     k, problems = out.get('kicks'), []
     if k is None: return ['no kick report']
     if k['stops'] + k['pending'] != k['issued']: problems.append(f"stops {k['stops']} + pending {k['pending']} != issued {k['issued']}")
-    if k['merged']: problems.append(f"{k['merged']} kicks merged")
+    # A merge is a failure only when the host kicker is the vCPU's only kick source (`kicks` given): a peer's resident
+    # kick may legitimately land while another is pending.
+    if k['merged'] and kicks is not None: problems.append(f"{k['merged']} kicks merged")
     if out['stats']['stops'] != k['stops']: problems.append(f"resident stops {out['stats']['stops']} != host {k['stops']}")
     if not k['stops_at_entry']: problems.append(f"stop PCs not at stop stores: {k['stop_pcs']}")
     if kicks is not None and k['issued'] != kicks: problems.append(f"{k['issued']} of {kicks} kicks issued before the end")
@@ -163,11 +172,13 @@ def cmd_corpora(a, host, runtime):
 
 
 def smp_description(prog):
-    """natemu-smp-v1 -> driver description: the bodies and memory form the shared space, one `cpu` section per CPU."""
-    lines = [f"body {smp.num(b['addr']):#x} {b['code']}" for b in prog['bodies']]
+    """natemu-smp-v1 -> driver description: the bodies and memory form the shared space, one `cpu` section per CPU. A
+    `system` program's space is identity-mapped (its bodies build page tables from physical addresses)."""
+    lines = ['identity'] if prog.get('system') else []
+    lines += [f"body {smp.num(b['addr']):#x} {b['code']}" for b in prog['bodies']]
     lines += [f"memory {smp.num(r['addr']):#x} {smp.region_bytes(r).hex()}" for r in prog['memory']]
     for c in prog['cpus']:
-        lines += ['cpu', f"rip {smp.num(c['rip']):#x}", f"rflags {smp.num(c['rflags']):#x}",
+        lines += ['cpu', f"rip {smp.num(c['rip']):#x}", f"rflags {smp.num(c['rflags']):#x}", f"cpl {c.get('cpl', 3)}",
                   'gpr ' + ' '.join(f'{smp.num(v):#x}' for v in c['gpr'])]
     return '\n'.join(lines) + '\n'
 
@@ -349,9 +360,154 @@ def cmd_kicks(a, host, runtime):
     return len(failures)
 
 
+def vm_fault(cpu):
+    """natemu's guest exception as smp.parse_dump reports QEMU's: (vector, error, RIP, CR2), or None."""
+    if cpu['stop'] != 'guest_fault': return None
+    vector, cr2, error, rip = (smp.num(x) for x in cpu['fault'])
+    return vector, error, rip, cr2 if vector == 14 else 0
+
+
+def qemu_fault(f):
+    """QEMU's fault record, with one declared correction: pinned QEMU reports a reserved-bit #PF (RSVD) with P = 0; the
+    SDM (vol. 3 §4.7: the entry is present) and i4v_coherence_model.walk (`fault(9)`) have P = 1."""
+    return f and (f[0], f[1] | 1 if f[0] == 14 and f[1] & 8 else f[1], *f[2:])
+
+
+def vm_state(prog, out):
+    """natemu's run in smp.parse_dump's shape."""
+    memory = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in out['cpus'][0]['memory']}
+    return {'cpus': [{'gpr': [smp.num(x) for x in c['gpr']], 'rflags': smp.num(c['rflags']), 'fault': vm_fault(c)} for c in out['cpus']],
+            'memory': [{'addr': smp.num(r['addr']), 'data': memory[smp.num(r['addr'])]} for r in prog['memory'] if r.get('capture', True)]}
+
+
+def either_check(prog, out):
+    """The PTE change without INVLPG (`sys-pte-no-invlpg`): each CPU's second read of V (r8) and V's final PTE in table A
+    must be one of i4v_coherence_model's permitted histories (cached translation, or a fresh walk) after its first read."""
+    import programs, i4v_coherence_model as cm
+    problems = []
+    memory = {smp.num(r['addr']): smp.region_bytes(r) for r in prog['memory']}
+    for i, cpu in enumerate(out['cpus']):
+        ta, d = programs.SYS_T(i, 0), programs.SYS_D(i)
+        tables = {}
+        for a, data in memory.items():
+            if ta <= a < ta + 0x5000: tables.update({a + k: int.from_bytes(data[k:k + 8], 'little') for k in range(0, len(data), 8)})
+        ctx = cm.Context('four', ta, cpl=0, wp=True, nxe=True)
+        first = cm.walk(tables, ctx, d + programs.V, 'read')
+        cache = cm.Cache(); cache.remember(ctx, first)
+        leaf = programs.sys_leaf(i, 0, d + programs.V)
+        changed = dict(first.tables); changed[leaf] = (d + programs.F2) | 7
+        permitted = cm.access_outcomes(changed, ctx, d + programs.V, 'read', cache)
+        got = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in cpu['memory']}
+        frames = {memory[d + f][:8]: d + f for f in (programs.F1, programs.F2)}
+        frame = frames.get(smp.num(cpu['gpr'][8]).to_bytes(8, 'little'))
+        start = max(a for a in got if a <= leaf)
+        pte = int.from_bytes(got[start][leaf - start:leaf - start + 8], 'little')
+        observed = [r for r in permitted if r.route and r.route.gpa & ~4095 == frame and r.tables[leaf] == pte]
+        try:
+            cm.check_observation(observed[0] if observed else None, permitted)
+            cpu['either'] = observed[0].policy
+        except ValueError as e:
+            problems.append(f'cpu{i}: read {cpu["gpr"][8]} (frame {frame and hex(frame)}), PTE {pte:#x}: {e}')
+    return problems
+
+
+def unsupported_cases():
+    """Instructions the resident refuses (`unsupported_system`), each alone at CPL0 after a flag-setting prefix."""
+    cases = {'cr0-cd': 'mov rax, cr0\nbts rax, 30\nmov cr0, rax', 'cr4-osfxsr': 'mov rax, cr4\nbts rax, 9\nmov cr4, rax',
+             'mov-from-cr2': 'mov rax, cr2', 'mov-to-cr8': 'xor eax, eax\nmov cr8, rax', 'cr3-pwt': 'mov rax, cr3\nbts rax, 3\nmov cr3, rax'}
+    return {k: ref.assemble('mov rbx, 1\n' + v).hex() for k, v in cases.items()}
+
+
+def cmd_system(a, host, runtime):
+    """S3c1: system programs (tools/bench/smp/system.json) against QEMU system mode; fault cases against
+    tools/system_fault_model.py at the state QEMU reaches just before the instruction (and i4v_modes_model where it covers
+    them); the PTE change without INVLPG against i4v_coherence_model; refusals of unimplemented forms."""
+    import system_fault_model as sfm, i4v_modes_model as modes
+    programs = [p for p in json.loads((ROOT / 'tools/bench/smp/system.json').read_text()) if not a.programs or any(n in p['name'] for n in a.programs)]
+    stub = smp.build_stub(a.out / 'qemu-build')
+    report, failures = [], []
+
+    def qemu(prog, label, timeout=120):
+        rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), a.out / 'qemu' / label, 'multi', timeout=timeout)
+        return (smp.parse_dump(prog, dump) if rc == 1 else None), rc
+    for prog in programs:
+        name, fault_at = prog['name'], prog['params'].get('fault_at')
+        entry = {'name': name, 'runs': []}
+        if fault_at:
+            # QEMU's state just before the instruction under test: the body cut there.
+            pre = json.loads(json.dumps(prog)); at = smp.num(fault_at); b = pre['bodies'][0]
+            b['code'] = b['code'][:2 * (at - smp.num(b['addr']))]
+            want, rc = qemu(pre, name + '-prefix')
+            if want is None: failures.append(f'{name}: QEMU prefix run failed ({rc})'); continue
+            code = bytes.fromhex(prog['bodies'][0]['code'])[at - smp.num(prog['bodies'][0]['addr']):]
+            c = prog['cpus'][0]
+            vector = sfm.fault(code, want['cpus'][0]['gpr'], c.get('cpl', 3), 0x80010011, 0x20, 0xd00)
+            if vector is None: failures.append(f'{name}: the model expects no fault'); continue
+            want['cpus'][0]['fault'] = (*vector, at, 0)
+            full, rc = qemu(prog, name, timeout=10)
+            entry['qemu'] = 'hang' if rc == 'timeout' else (full and full['cpus'][0]['fault'] and list(full['cpus'][0]['fault'])) or 'no fault'
+            # Where QEMU does raise an exception, it is the model's.
+            if isinstance(entry['qemu'], list) and tuple(entry['qemu']) != want['cpus'][0]['fault']:
+                failures.append(f"{name}: QEMU raises {entry['qemu']}, the model {want['cpus'][0]['fault']}")
+        else:
+            want, rc = qemu(prog, name)
+            if want is None: failures.append(f'{name}: QEMU run failed ({rc})'); continue
+            for c in want['cpus']: c['fault'] = qemu_fault(c['fault'])
+        model_profile = {'sysfault-efer-lme-clear@1': 25, 'sysfault-cr4-pae-clear@1': 27, 'sysfault-cr0-pg-clear@1': 28,
+                         'sysfault-efer-reserved-1@1': 29, 'sysfault-efer-reserved-edx@1': 29}.get(name)
+        if model_profile:
+            last = modes.model(model_profile, 0, modes.data(model_profile, [0] * 0x400))['records'][-1]
+            entry['modes_model'] = (model_profile, last['vector'])
+            if last['vector'] != want['cpus'][0]['fault'][0]:
+                failures.append(f"{name}: i4v_modes_model profile {model_profile} gives vector {last['vector']}")
+        for limit in ([], [1]):
+            rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f"{name}{'-1' if limit else ''}", limit)
+            if rc:
+                diffs = [f'driver exit {rc}: {err.strip()[-300:]}']
+            else:
+                diffs = []
+                for v, (c, cpu) in enumerate(zip(prog['cpus'], out['cpus'])):
+                    end = body_end(prog, smp.num(c['rip']))
+                    if want['cpus'][v]['fault'] is None and (cpu['stop'] != 'reached' or smp.num(cpu['rip']) != end):
+                        diffs.append(f"cpu{v} stopped {cpu['stop']} {cpu['reason']} at {cpu['rip']} (end {end:#x})")
+                    diffs += [f'cpu{v} ' + d for d in per_vcpu_checks(cpu)]
+                if prog['params'].get('either'):
+                    diffs += either_check(prog, out)
+                    entry['either'] = [c.get('either') for c in out['cpus']]
+                else:
+                    diffs += smp.compare(prog, vm_state(prog, out), want)
+            entry['runs'].append({'max_block': limit[0] if limit else None, 'diffs': diffs,
+                                  'systems': out and [c['stats']['systems'] for c in out['cpus']]})
+            failures += [f"{name}{' (max-block 1)' if limit else ''}: {d}" for d in diffs]
+        print(f"{name}: {'ok' if not any(r['diffs'] for r in entry['runs']) else 'FAIL'}"
+              + (f"; QEMU full run: {entry['qemu']}" if 'qemu' in entry else '') + (f"; modes model {entry['modes_model']}" if 'modes_model' in entry else '')
+              + (f"; history {entry['either']}" if 'either' in entry else ''), flush=True)
+        report.append(entry)
+    # Refusals: the vCPU stops `unsupported_system` at the instruction, after the prefix.
+    for name, code in ([] if a.programs else unsupported_cases().items()):
+        text = f'cpl 0\nrip 0x110000\ncode {code}\n'
+        rc, out, err = driver(host, runtime, a.fexc, text, a.out / 'work' / f'unsupported-{name}')
+        ok = rc == 0 and out['stop'] == 'resident' and out['reason'].startswith('unsupported_system') and smp.num(out['gpr'][3]) == 1
+        print(f'unsupported {name}: {"ok" if ok else "FAIL"} {out and (out["stop"], out["reason"], out["rip"])}', flush=True)
+        report.append({'name': f'unsupported-{name}', 'ok': ok})
+        if not ok: failures.append(f'unsupported {name}: {rc} {out and out["reason"]} {err.strip()[-200:]}')
+    # A malformed system reply (driver `--tamper system`: length 16) is refused before anything of it runs.
+    if not a.programs:
+        prog = next(p for p in programs if p['name'] == 'sys-cr3-switch@1')
+        rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / 'tamper-system', ['--tamper', 'system'])
+        stops = out and [(c['stop'], c['reason'], c['tampered'], c['stats']['systems']) for c in out['cpus']]
+        ok = rc == 0 and stops == [('resident', 'bad_reply status=1 detail=2', True, 0)]
+        print(f'tampered system reply: {"ok" if ok else "FAIL"} {stops}', flush=True)
+        report.append({'name': 'tamper-system', 'ok': ok, 'stops': stops})
+        if not ok: failures.append(f'tampered system reply: {rc} {stops} {err.strip()[-200:]}')
+    for f in failures: print(f)
+    (a.out / 'system.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
+    return len(failures)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=['corpora', 'smp', 'limits', 'kicks'])
+    ap.add_argument('mode', choices=['corpora', 'smp', 'limits', 'kicks', 'system'])
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--cpus', type=int, nargs='+', default=[2, 3, 4])
@@ -370,7 +526,7 @@ def main():
     a.out.mkdir(parents=True, exist_ok=True)
     host, runtime = vm.build()
     if a.mode == 'kicks' and a.kicks is None: a.kicks = 10_000
-    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'limits': cmd_limits, 'kicks': cmd_kicks}[a.mode](a, host, runtime)
+    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system}[a.mode](a, host, runtime)
     print('failures:', failed)
     sys.exit(1 if failed else 0)
 

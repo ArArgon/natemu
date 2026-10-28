@@ -231,6 +231,21 @@ their campaigns retire:** runtime/abi family code (modes are layered: `translati
   *Check:* QEMU system-mode programs (CR3 switch, INVLPG after a PTE change, WP toggling, NXE); fault cases against
   `i4v_modes_model.py`; a PTE change without INVLPG accepted as either history by `i4v_coherence_model.check_observation`;
   concurrent controls (33): one vCPU writes CR3/WP/NXE while peers run the same tables and code unaffected.
+  *Built S3c1 (Oct 28, single and multi vCPU; concurrent controls are S3c2):* a miss at a system instruction gets reply
+  `REPLY_SYSTEM` with the host's decode (`State::system`; FEX's cut gives map/opcode, host `system.rs` decodes the operands
+  of `0f 20/22`, `0f 01 /7` m, `0f 30/32`; cached with fexc's answer); the resident checks it (`System::well_formed`) and
+  executes it (`execution.rs` `system`): #UD (LOCK, CR1/5-7/9-15), #GP (CPL > 0; CR0 bits 63:32, PG or PE cleared, NW
+  without CD; CR3 bits 63:40; CR4 reserved for the model incl. PCIDE, SMAP, PAE/LA57 changes; EFER reserved bits, LME change
+  under PG; any MSR but EFER), else commits; CR0[31:0] reserved bits are ignored, ET hard-wired. Any CR0/CR4/EFER change and
+  every CR3 load flush the vCPU's cache and reset its shadows; INVLPG drops shadows and blocks of the address's 2 MiB range.
+  Refused (`unsupported_system`): MOV CR2/CR8, CR0 bits but WP, CR4 feature bits (OSFXSR ...), CR3 PWT/PCD. Driver
+  `identity` spaces; `tools/run_slice3_vm.py system` (QEMU `system.json` programs; fault cases by `tools/system_fault_model.py`
+  at QEMU's prefix state, five cases also by four `i4v_modes_model` profiles; the PTE change without INVLPG by `i4v_coherence_model`).
+  *Boot-phase items from S3c1 review:* MOV from CR2 (the page-fault handler reads it); the CR4 bits Linux sets (OSFXSR,
+  OSXMMEXCPT, OSXSAVE, FSGSBASE, UMIP) and CR0 TS/MP/NE/AM changes are refused today; MSRs other than EFER #GP (FS/GS base,
+  KERNEL_GS_BASE, STAR/LSTAR, PAT … needed); CR4 profile bits (VMXE, SMXE, PKE, UMIP) become reserved from the CPUID
+  profile; every system instruction is a host round trip and every CR3 load flushes the whole cache (correct without
+  PCID, costly on context switches).
 - **S3d, cross-vCPU code coherence.** §1's marking, writable mask, shootdown, self-reset, resident fetch walk, page posts,
   post-write check, post-place drain and step. *Check:* a unit test that an A/D refusal with a peer's code bit ends;
   against S3r: a peer writes fresh code then a flag and the other vCPU jumps to it (new page, reused data page), patch a
