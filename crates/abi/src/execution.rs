@@ -512,6 +512,9 @@ pub mod stop {
     /// A system instruction whose form or operand value the resident does not implement (e.g. MOV from CR2, a CR0 or
     /// CR4 feature bit change, CR3 with PWT/PCD); nothing of it was executed.
     pub const UNSUPPORTED_SYSTEM: u64 = 12;
+    /// A locked access the resident does not complete: a memory XCHG whose operand crosses a 16-byte boundary (an
+    /// alignment fault at its `swpal`, before any effect; contract: split locks wait for the boot phase).
+    pub const UNSUPPORTED_ATOMIC: u64 = 13;
 
     pub fn name(code: u64) -> &'static str {
         match code {
@@ -526,6 +529,7 @@ pub mod stop {
             PARKED => "parked",
             BAD_STOP => "bad_stop",
             UNSUPPORTED_SYSTEM => "unsupported_system",
+            UNSUPPORTED_ATOMIC => "unsupported_atomic",
             _ => "none",
         }
     }

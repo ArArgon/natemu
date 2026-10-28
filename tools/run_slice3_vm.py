@@ -4,7 +4,9 @@
     tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR corpora [--cpus 2 3 4] [--max-block N]
         [--parallel P] [--seed S] [--flow PROGRAMS.json EXPECTED.json] [--no-faults]
     tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR smp [--cpus 2 3 4] [--programs a,b] [--reps R]
-        [--parallel P] [--max-block N]
+        [--parallel P] [--max-block N] [--qemu]
+    tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR litmus [--cpus 2 3 4] [--families sb,mp]
+        [--variants aligned,unaligned,split] [--k K] [--runs R] [--parallel P] [--control drop-fence]
     tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR limits
     tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR kicks [--cpus 1 2 4] [--kicks M] [--iterations I]
         [--parallel P] [--reps R]
@@ -24,9 +26,18 @@ the cache neither flushed (beyond the driver's initial one) nor invalidated, hos
 oversubscribed and migrate between cores.
 
 `smp`: the deterministic programs of tools/bench/smp (natemu-smp-v1: the bytes QEMU system mode ran) at N vCPUs over one
-shared address space, judged against tools/bench/smp/model_smp.py with smp.compare. Programs using an instruction the
-general path does not admit yet are reported `unsupported` when a vCPU stops on it (`unsupported_form`): handshake
-and token-ring spin with PAUSE, xchg-lock needs memory XCHG (S3e). Run to the end, they are judged like the others.
+shared address space, judged against tools/bench/smp/model_smp.py with smp.compare, and with `--qemu` also against a
+pinned QEMU system-mode run of the same program (`-accel tcg,thread=multi`). Every vCPU must reach its end.
+
+`litmus` (S3e, ordering on the general path): generated litmus programs (tools/bench/smp/programs.py `litmus_family`:
+sb, sb-mfence, sb-xchg, mp, lb, wrc, iriw, 2+2W and XCHG chains, each generalised to N participants) at N vCPUs with
+their locations aligned, unaligned inside a 16-byte block, or (`split`) each crossing a page (every store to it takes
+the split-store service; exchanged locations stay aligned), R runs of K iterations per cell. Every iteration's outcome
+must be in tools/i4v_ordering_model.py's allowed set for that program (the model enumerates it; nothing is written per
+test), and an XCHG chain's outcome must also be one linear order of the exchanges (`check_xchg_chain`). Every vCPU
+reaches its end having done all K iterations. `--control drop-fence` runs sb-mfence without its MFENCEs, judged
+against sb-mfence's allowed set: it must show the forbidden SB outcome (the harness can see a violation); aligned and
+unaligned only (a split store completes in the resident with `dsb ish`: SB cannot relax there).
 
 `kicks` (S3b, precise stop): (1) a hot linked loop (no exit once linked) on each of N vCPUs (own registers, shared
 code page), every vCPU kicked M times (default 10,000) by its own host kicker thread, R runs of it, P at once (P * N
@@ -66,10 +77,7 @@ import argparse, collections, concurrent.futures as cf, json, os, pathlib, rando
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
 sys.path.insert(0, str(ROOT / 'tools' / 'bench' / 'smp'))
-import ref, run_slice1_vm as vm, run_slice1_faults as faults, smp, model_smp  # noqa: E402
-
-# Programs needing an instruction not admitted yet (fexc refuses it: `unsupported_form`).
-REFUSED = {'handshake': 'PAUSE', 'token-ring': 'PAUSE', 'xchg-lock': 'memory XCHG'}
+import ref, run_slice1_vm as vm, run_slice1_faults as faults, smp, model_smp, programs  # noqa: E402
 
 
 def driver(host, runtime, fexc, text, work, extra=()):
@@ -207,14 +215,13 @@ def cmd_smp(a, host, runtime):
                 if p['ncpu'] in a.cpus and (not a.programs or p['name'].split('@')[0] in a.programs)]
     groups = [(f"{p['name']}-{r}", smp_description(p), [a.max_block] if a.max_block else []) for p in programs for r in range(a.reps)]
     order = [p for p in programs for _ in range(a.reps)]
+    qemu = {p['name']: qemu_reference(p, a.out / 'qemu' / p['name']) for p in programs} if a.qemu else {}
 
     def judge(i, rc, out, err):
         prog = order[i]
-        base = prog['name'].split('@')[0]
         e = {'name': prog['name'], 'rep': i}
         if rc:
-            outcome = 'unsupported' if base in REFUSED and 'unsupported_form' in err else 'fail'
-            return [{**e, 'outcome': outcome, 'diffs': [f'driver exit {rc}: {err.strip()[-300:]}']}]
+            return [{**e, 'outcome': 'fail', 'diffs': [f'driver exit {rc}: {err.strip()[-300:]}']}]
         cpus = out['cpus']
         diffs = []
         for v, (c, cpu) in enumerate(zip(prog['cpus'], cpus)):
@@ -227,10 +234,8 @@ def cmd_smp(a, host, runtime):
         got = {'cpus': [{'gpr': [smp.num(x) for x in cpu['gpr']], 'rflags': smp.num(cpu['rflags'])} for cpu in cpus],
                'memory': [{'addr': smp.num(r['addr']), 'data': memory[smp.num(r['addr'])]} for r in captured]}
         diffs += smp.compare(prog, got, model_smp.expected(prog))
-        if base in REFUSED and any('unsupported_form' in d for d in diffs):
-            outcome = 'unsupported'
-            diffs = [f'{REFUSED[base]} not admitted'] + diffs
-        else: outcome = 'fail' if diffs else 'match'
+        if prog['name'] in qemu: diffs += ['qemu: ' + d for d in smp.compare(prog, got, qemu[prog['name']])]
+        outcome = 'fail' if diffs else 'match'
         stats = [{k: cpu['stats'][k] for k in ('blocks', 'fast', 'requests', 'links', 'retries')} for cpu in cpus]
         return [{**e, 'outcome': outcome, 'diffs': diffs, 'stats': stats}]
     entries = run_groups(a, host, runtime, groups, judge)
@@ -241,6 +246,59 @@ def cmd_smp(a, host, runtime):
         if e['outcome'] != 'match': print(f"{e['name']} rep{e['rep']} {e['outcome']}: {'; '.join(e['diffs'])[:400]}")
     (a.out / 'smp.json').write_text(json.dumps({'results': entries}, indent=1) + '\n')
     return sum(c['fail'] for c in by.values())
+
+
+def cmd_litmus(a, host, runtime):
+    import i4v_ordering_model as model
+    control = a.control == 'drop-fence'
+    families = ['sb-mfence'] if control else a.families or list(programs.FAMILIES)
+    # The control leaves out `split`: a split store completes in the resident with `dsb ish`, so SB cannot relax there.
+    variants = a.variants or [v for v in programs.VARIANTS if not (control and v == 'split')]
+    cells = [(f, n, v) for f in families for n in a.cpus for v in variants
+             if programs.litmus_family(f, n) and not (f == 'xchg' and v == 'split')]
+    failures, report = [], []
+    for f, n, v in cells:
+        test = programs.litmus_family(f, n)
+        prog = programs.family_program(test, v, a.k, fences=not control)
+        allowed = model.enumerate_outcomes(test).outcomes
+        groups = [(f"{prog['name']}-{r}", smp_description(prog), []) for r in range(a.runs)]
+
+        def judge(i, rc, out, err, prog=prog, test=test):
+            if rc: return [{'diffs': [f'driver exit {rc}: {err.strip()[-300:]}']}]
+            diffs = [f"cpu{v} stopped {c['stop']} {c['reason']} at {c['rip']}" for v, c in enumerate(out['cpus'])
+                     if c['stop'] != 'reached' or smp.num(c['rip']) != body_end(prog, smp.num(prog['cpus'][v]['rip']))]
+            diffs += [f'cpu{v} ' + d for v, c in enumerate(out['cpus']) for d in per_vcpu_checks(c)]
+            got = {'memory': [{'addr': smp.num(m['addr']), 'data': bytes.fromhex(m['data'])} for m in out['cpus'][0]['memory']]}
+            try: outcomes = programs.litmus_outcomes(prog, test, got, a.k, prog['params']['stride'], programs.FAMILY_RES)
+            except AssertionError as e: return [{'diffs': diffs + [str(e)]}]
+            return [{'diffs': diffs, 'hist': collections.Counter(outcomes)}]
+        entries = run_groups(a, host, runtime, groups, judge)
+        hist = collections.Counter()
+        for e in entries: hist.update(e.get('hist', {}))
+        forbidden = {o: c for o, c in hist.items() if o not in allowed}
+        unchained = []
+        if f == 'xchg':       # each outcome: returned tokens and the final word form one exchange order
+            for o in hist:
+                try: model.check_xchg_chain({i: i + 1 for i in range(n)}, dict(enumerate(o[:n])), o[n])
+                except ValueError as e: unchained.append((o, str(e)))
+        label = f'{f}@{n} {v}' + (' without MFENCE' if control else '')
+        trials = sum(hist.values())
+        print(f"{label}: {trials} trials, {len(hist)} distinct outcomes ({len(allowed)} allowed), forbidden {sum(forbidden.values())} "
+              f"{dict(sorted(forbidden.items()))}; histogram {dict(sorted(hist.items()))}", flush=True)
+        bad = [e['diffs'] for e in entries if e['diffs']]
+        if control:
+            if not forbidden: failures.append(f'{label}: control shows no forbidden outcome')
+        else:
+            if bad: failures.append(f'{label}: {bad[0][:3]}')
+            if forbidden: failures.append(f'{label}: forbidden {forbidden}')
+            if unchained: failures.append(f'{label}: not linearizable {unchained[:3]}')
+            if trials != a.k * a.runs: failures.append(f'{label}: {trials} of {a.k * a.runs} trials')
+        report.append({'family': f, 'n': n, 'variant': v, 'control': control, 'trials': trials,
+                       'histogram': {str(o): c for o, c in sorted(hist.items())}, 'allowed': len(allowed),
+                       'forbidden': {str(o): c for o, c in forbidden.items()}, 'run_diffs': bad})
+    for x in failures: print(x)
+    (a.out / ('litmus-control.json' if control else 'litmus.json')).write_text(json.dumps({'report': report, 'failures': failures}, indent=1) + '\n')
+    return len(failures)
 
 
 def cmd_limits(a, host, runtime):
@@ -560,7 +618,7 @@ def cmd_coherence(a, host, runtime):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=['corpora', 'smp', 'limits', 'kicks', 'system', 'coherence'])
+    ap.add_argument('mode', choices=['corpora', 'smp', 'litmus', 'limits', 'kicks', 'system', 'coherence'])
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--cpus', type=int, nargs='+', default=[2, 3, 4])
@@ -571,6 +629,12 @@ def main():
     flow = [raw / 's2d/corpus/programs.json', raw / 's2d/corpus/expected.json']
     ap.add_argument('--flow', type=pathlib.Path, nargs=2, default=flow if all(f.exists() for f in flow) else None)
     ap.add_argument('--no-faults', action='store_true')
+    ap.add_argument('--qemu', action='store_true', help='smp: also compare with a pinned QEMU system-mode run')
+    ap.add_argument('--families', type=lambda s: s.split(','))
+    ap.add_argument('--variants', type=lambda s: s.split(','))
+    ap.add_argument('--k', type=int, default=25_000, help='litmus: iterations per run')
+    ap.add_argument('--runs', type=int, default=4, help='litmus: runs per cell')
+    ap.add_argument('--control', choices=['drop-fence'])
     ap.add_argument('--programs', type=lambda s: s.split(','))
     ap.add_argument('--reps', type=int, default=1)
     ap.add_argument('--kicks', type=int, help='kicks per vCPU (kicks: default 10000; corpora: off unless given)')
@@ -579,7 +643,7 @@ def main():
     a.out.mkdir(parents=True, exist_ok=True)
     host, runtime = vm.build()
     if a.mode == 'kicks' and a.kicks is None: a.kicks = 10_000
-    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'coherence': cmd_coherence}[a.mode](a, host, runtime)
+    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'litmus': cmd_litmus, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'coherence': cmd_coherence}[a.mode](a, host, runtime)
     print('failures:', failed)
     sys.exit(1 if failed else 0)
 

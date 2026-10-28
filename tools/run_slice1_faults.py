@@ -153,8 +153,8 @@ def events(text, regs, next_rip):
         if not re.fullmatch(r'-?\d+|0x[0-9a-f]+', ops[1]): raise Unsupported(text)
         return [('access', (a + (int(ops[1], 0) % (8 * w)) // 8) & M64, 1, m != 'bt', ss)]
     # A memory destination is written (mov/setcc) or read-modify-written (write intent); cmp/test only read, and
-    # so does the implicit-destination one-operand group (mul/imul/div/idiv).
-    write = i == 0 and m not in ('cmp', 'test', 'mul', 'imul', 'div', 'idiv')
+    # so does the implicit-destination one-operand group (mul/imul/div/idiv). xchg writes its memory operand either way.
+    write = (i == 0 or m == 'xchg') and m not in ('cmp', 'test', 'mul', 'imul', 'div', 'idiv')
     return [('access', a, w, write, ss)]
 
 # The driver's guest tables (natemu-host run-program), entry bits.
@@ -301,7 +301,8 @@ DATA_FORMS = [('load', 'rbx', 'mov rax, qword ptr [rbx + 8]'), ('store', 'rbx', 
               ('rmw', 'rbx', 'add qword ptr [rbx], 1'), ('read-index', 'rsi', 'cmp word ptr [rsi + r8*2], 5'),
               ('push-mem', 'rbx', 'push qword ptr [rbx]'), ('rbp-load', 'rbp', 'mov rax, qword ptr [rbp + 16]'),
               ('rsp-store', 'rsp', 'mov qword ptr [rsp + 8], rax'), ('push', 'rsp', 'push rax'), ('pop', 'rsp', 'pop rcx'),
-              ('rmw-byte', 'rbp', 'not byte ptr [rbp]'), ('ret', 'rsp', 'ret')]
+              ('rmw-byte', 'rbp', 'not byte ptr [rbp]'), ('ret', 'rsp', 'ret'),
+              ('xchg', 'rbx', 'xchg qword ptr [rbx], rax'), ('xchg-byte', 'rbp', 'xchg cl, byte ptr [rbp + 3]')]
 REGS = {'rax': 0x1122334455667788, 'rcx': 0x7fffffffffffffff, 'rdx': 5, 'rbx': D + 0x100, 'rsi': D + 0x200, 'rdi': D + 0x300,
         'rbp': D + 0x400, 'rsp': S + 0x1000, 'r8': 3}
 SS_SPAN = [(0x8000_0000_0004, 'push', 'push rax'), (0xffff_8000_0000_0004, 'push', 'push rax'), (0x8000_0000_0004, 'pop', 'pop rcx'),
@@ -318,6 +319,11 @@ def probes():
     # half and above the start of the upper half, a pop starting in the gap or at the last bytes before it.
     for a, name, line in SS_SPAN:
         out.append((f'noncanonical-ss-span-{name}-{a:#x}', REGS, PRELUDE + [f'movabs rsp, {a}', line] + AFTER, len(PRELUDE) + 1, {}))
+    # A memory XCHG whose operand crosses 16 bytes (inside a line, across a line, across a page) is a split lock: the
+    # VM stops `unsupported_atomic` at it with nothing written (the QEMU prefix state); expected by `atomic`, not a fault.
+    for name, line in [('16', 'xchg qword ptr [rbx + 0xc], rax'), ('line', 'xchg dword ptr [rbx + 0x3e], ecx'),
+                       ('page', 'xchg qword ptr [rbx + 0xefc], rax'), ('16-word', 'xchg word ptr [rbp + 0xf], dx')]:
+        out.append((f'xchg-crossing-{name}', REGS, PRELUDE + [line] + AFTER, len(PRELUDE), {'atomic': True}))
     # Page order of a crossing access (first page tested first, also when its first byte is near the page end).
     out.append(('crossing-first-page-readonly', dict(REGS, rbx=D, rdi=S + 0x300), PRELUDE + ['mov qword ptr [rbx + 0xffc], rax'] + AFTER, len(PRELUDE),
                 {'readonly': [D], 'unmap': [D + 0x1000]}))
@@ -573,6 +579,8 @@ def expectations(programs, probe_specs, work, paging=True):
         evs = events(p['asm'][k], state(r), rip + offs[k + 1])
         m = layout(p, mut)
         fetched = m.fetch(rip + offs[k], offs[k + 1] - offs[k])
+        if mut.get('atomic'):
+            cases.append((p['name'], p, mut, None, offs[k], r, ATOMIC, None)); continue
         f = fetched or first_fault(evs, m, reader(r))
         if not f: raise ValueError(f"{p['name']}: the probe does not fault")
         cases.append((p['name'], p, mut, f, offs[k], r, describe(p['asm'][k], [] if fetched else evs, f, bool(fetched)), None))
@@ -616,6 +624,8 @@ def case_description(case):
         out += (f'entry {va:#x} {level} set {set_:#x}\n' if set_ else '') + (f'entry {va:#x} {level} clear {clear:#x}\n' if clear else '')
     return out
 
+ATOMIC = 'unsupported_atomic'      # a probe's kind: the VM stops so at the instruction, before any effect
+
 def evaluate(case, out):
     """{'expected_fault', 'vm', 'outcome', 'diffs'} of the VM's final state `out` (driver JSON) for a fault case (or
     one expected to run to its end), with its leaf A/D bits."""
@@ -623,6 +633,11 @@ def evaluate(case, out):
     rip = ref.num(p['rip']) + off
     want = [*f, rip] if f else [0, 0, 0, 0]
     entry = {'expected_fault': [hex(x) for x in want], 'vm': {k: out[k] for k in ('stop', 'reason', 'rip', 'fault', 'native', 'stats', 'frame_intact')}}
+    if case[6] == ATOMIC:
+        diffs = [] if (out['stop'], out['reason'].split(' ')[0]) == ('resident', ATOMIC) else [f"stopped {out['stop']} {out['reason']} at {out['rip']}, not {ATOMIC}"]
+        diffs += ref.compare(prefix, [ref.num(v) for v in out['gpr']], ref.num(out['rflags']), ref.num(out['rip']), out['memory'])
+        if not out['frame_intact']: diffs.append('FEX frame changed')
+        return {**entry, 'outcome': 'fail' if diffs else 'match', 'diffs': diffs}
     limit_hit = vm.declared_limit(out)
     if limit_hit and ref.num(out['rip']) < rip:
         return {**entry, 'outcome': 'unsupported', 'diffs': [f"stopped at {out['rip']}: {limit_hit}"]}

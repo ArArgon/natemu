@@ -859,13 +859,20 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
 /// A data abort at an access site: a shadow miss to retry, or a guest fault.
 unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, [esr, far, elr, spsr]: [u64; 4]) -> ! {
     let store = matches!(site.kind, object::kind::STORE | object::kind::STORE_PAIR | object::kind::PUSH);
+    // A swap (memory XCHG) may report either direction (WnR is not defined strictly for atomics); it writes nothing.
+    let swap = site.kind == object::kind::SWAP;
     let write_abort = (esr >> 6) & 1 != 0;
     let write = site.intent == object::INTENT_WRITE;
     let address = site_address(site, f);
     let width = u64::from(site.width);
+    // A swap whose operand crosses 16 bytes takes an alignment fault (LSE2) before any effect: a split lock, not completed.
+    if swap && esr & 63 == 0x21 && esr >> 26 == 0x25 && (address & 15) + width > 16 {
+        bank_at(&mut s, f, b, site);
+        halt(s, stop::UNSUPPORTED_ATOMIC)
+    }
     // Data abort from EL1, translation or permission fault, direction, intent and FAR as recorded.
     if esr >> 26 != 0x25
-        || write_abort != store
+        || (write_abort != store && !swap)
         || (write_abort && !write)
         || !matches!(esr & 63, 4..=7 | 12..=15)
         || far.wrapping_sub(address) >= width

@@ -40,6 +40,10 @@ class MachineTests(unittest.TestCase):
         self.assertEqual(machine(large=[DATA], entry=[(DATA, 2, 1 << 13, 0)]).walk(DATA, 'r'), (None, 13))
         self.assertRaises(ValueError, machine, large=[DATA], entry=[(DATA, 1, 0, F.P)])
 
+    def test_xchg_writes_its_memory_operand_in_either_position(self):
+        for line in ('xchg qword ptr [rbx], rax', 'xchg rax, qword ptr [rbx]'):
+            self.assertEqual(F.events(line, F.REGS, 0), [('access', F.REGS['rbx'], 8, True, False)])
+
     def test_stack_accesses_across_the_canonical_gap(self):
         for a, name, line in F.SS_SPAN:
             evs = F.events(line, dict(F.REGS, rsp=a), 0)

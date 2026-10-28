@@ -202,7 +202,7 @@ int CfInverted(uint64_t guest, uint64_t native) {
 void JoinSites(uint64_t rip) {
   for (auto& s : Cap.sites) {
     s.segment = (s.kind == FEXC_SITE_PUSH || s.kind == FEXC_SITE_POP || s.kind == FEXC_SITE_PUSH_PAIR || s.kind == FEXC_SITE_POP_PAIR) ? 1 : 0;
-    if (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE)
+    if (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP)
       for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) { if ((!i.mem.present && i.sets_rip) || i.mem.base == 4 || i.mem.base == 5) s.segment = 1; break; }
   }
   for (auto& s : Cap.sites) {
@@ -215,7 +215,7 @@ void JoinSites(uint64_t rip) {
     }
   }
 }
-const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other", "divide"};
+const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other", "divide", "swap"};
 const char* const ExtendName[] = {"none", "uxtw", "sxtw", "sxtx"};
 const char* const RmwName[] = {"none", "load", "store"};
 const char* const OrderingName[] = {"plain", "acquire", "release"};
@@ -680,7 +680,8 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     if (s.index_reg != 0xff) j.kv("index_reg", int(s.index_reg)); else j.null("index_reg");
     j.kv("extend", ExtendName[s.extend]).kv("shift", int(s.shift)).kv("imm", s.imm);
     j.arr("data_regs"); j.sep(); j.s += std::to_string(s.data_reg[0]);
-    if (s.kind == FEXC_SITE_LOAD_PAIR || s.kind == FEXC_SITE_STORE_PAIR || s.kind == FEXC_SITE_PUSH_PAIR || s.kind == FEXC_SITE_POP_PAIR) { j.sep(); j.s += std::to_string(s.data_reg[1]); }
+    if (s.kind == FEXC_SITE_LOAD_PAIR || s.kind == FEXC_SITE_STORE_PAIR || s.kind == FEXC_SITE_PUSH_PAIR || s.kind == FEXC_SITE_POP_PAIR ||
+        s.kind == FEXC_SITE_SWAP) { j.sep(); j.s += std::to_string(s.data_reg[1]); }
     j.end_arr();
     j.kv("data_class", s.data_class ? "fpr" : "gpr").kv("writeback", WritebackName[s.writeback]).kv("writeback_delta", int(s.writeback_delta))
      .kv("ordering", OrderingName[s.ordering]).kv("nzcv", s.nzcv ? "frame" : "pstate").kv("cf_inverted", bool(s.cf_inverted))
@@ -691,7 +692,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     }
     const Capture::X86Mem* m = nullptr;
     for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) { if (i.mem.present) m = &i.mem; break; }
-    if (m && (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE)) {
+    if (m && (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP)) {
       j.obj("x86").kv("rip_relative", m->rip_relative).kv("base", m->base).kv("index", m->index).kv("scale", m->scale).kv("disp", m->disp).end_obj();
     } else j.null("x86");
     j.end_obj();

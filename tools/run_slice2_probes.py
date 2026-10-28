@@ -185,6 +185,11 @@ SMC = [
     ('smc-span-other-p2', 'mov ecx, 3\n1: call g\njmp far\nback: dec ecx\njnz 1b\njmp 2f\n.org 0xff8, 0xcc\n'
                           'g: nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nadd rax, 1\nret\n.org 0x2100, 0xcc\n'
                           'far: mov byte ptr [rip + g + 11], cl\njmp back\n2:', [{'addr': STACK, 'data': '00' * 0x1000}]),
+    # A memory XCHG (S3e, `swpal`) into the next instruction (its immediate becomes 5, al gets the old 1), and one rewriting
+    # the loop's next instruction every iteration, as smc-patch-loop.
+    ('smc-xchg-next', 'mov eax, 5\nxchg byte ptr [rip + 1f + 3], al\n1: add rax, 1\nadd rbx, rax', []),
+    ('smc-xchg-loop', 'mov ecx, 5\n1: mov edx, ecx\nxchg byte ptr [rip + 2f + 3], dl\n2: add rax, 0x7f\nimul rax, rax, 3\n'
+                      'add rbx, rdx\ndec ecx\njnz 1b', []),
 ]
 # Every SMC probe ends by copying its own final bytes (the code as it stands then) into this region, which is compared.
 CODE_COPY = 0x180000

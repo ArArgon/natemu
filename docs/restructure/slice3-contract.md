@@ -287,6 +287,28 @@ their campaigns retire:** runtime/abi family code (modes are layered: `translati
   (sb, mp, lb, wrc, iriw, 2+2W, sb-mfence, sb-xchg, XCHG chains) at N = 2..4, with unaligned and split-store variants.
   *Check:* outcomes within `i4v_ordering_model.py`'s allowed sets in ≥10^5 trials per cell; chains linearizable; XCHG
   faults before commit leave memory unchanged (single-vCPU cases against the QEMU prefix and signal references).
+  *Built (Oct 28):* fexc series10 (`natemu-raw/fexc-native-20261026-01/series10`; shims only, no new patch: LSE was already on
+  through the `atomics_lse` feature default, so FEX emits `swpal`): the allowlist admits memory XCHG (86/87, LOCK allowed only
+  there), LFENCE/MFENCE/SFENCE (exactly `0f ae e8/f0/f8`, no 66/F2/F3) and PAUSE (`f3 90` without REX.B: FEX's `yield`; not in
+  the list above, admitted because the S3r spin loops use it); FEX's `AtomicSwap` is site kind 12 `swap` (`data_reg` = Rt, Rs;
+  write intent; an address guard, no split check; a fault point for the precision patches). Objects on the 64 fixtures and the
+  44 seed-4242 programs are identical to series9. Admission decodes exactly `dmb ld`/`dmb sy`/`dmb st`, `yield` and
+  `swpal{b,h,,x}` (no other swap, barrier or hint); a swap word must be a `swap` site describing it (base not x28/sp, width,
+  Rt, Rs, no offset), and a guest-RIP-addressed swap crossing 16 bytes is refused. The resident accepts either WnR at a swap
+  site (translation/permission fault: walk with write intent, retry or #PF, nothing written), and an alignment fault (FSC
+  0x21) at a swap whose operand crosses 16 bytes banks the state at the instruction and stops `unsupported_atomic`, which (like
+  a guest fault) ends only that vCPU. Deviation: the guest-RIP crossing case surfaces as an admission refusal (host error), not
+  as that stop. Checks: `tools/run_slice3_vm.py litmus` (generated families sb, sb-mfence, sb-xchg, mp, lb, 2+2W, XCHG chain at
+  N = 2..4, wrc at 3..4, iriw at 4; locations aligned, unaligned inside 16 bytes, and page-crossing (`split`; exchanged words
+  stay aligned): 69 cells × 100,000 trials, zero outcomes outside `i4v_ordering_model`'s enumerated sets (the model gained
+  final-memory outputs for 2+2W and chains), every chain outcome linearizable (all n! orders seen); control (sb-mfence without
+  MFENCE, aligned/unaligned) shows the forbidden outcome in all 6 cells; a split store completes with `dsb ish`, so SB cannot
+  relax there and the split cells skew to one outcome). Faults: XCHG access forms join the paging matrix and four split-lock
+  probes (`unsupported_atomic`, QEMU prefix state): 3,443 cases match at block sizes default and 1; an XCHG stride program
+  joins the loop faults (signal reference, 846 cases × 3 sizes); two XCHG SMC probes. S3r `handshake`, `token-ring`,
+  `xchg-lock` at 2–4 vCPUs match the model and live QEMU. ASM suite 235 pass (227 + Pause, Primary_86/87/87_2/87_3,
+  15_XX_5/6/7); Primary_87_Atomic16/32/64 are split locks (unsupported). Not built: LOCK ADD/CMPXCHG/XADD/BT*, CMPXCHG8B/16B,
+  split locks (boot phase); LFENCE register capture (51).
 - **S3f, shared-table coherence.** Tests only: A/D races on one PTE from N vCPUs while one clears A/D with plain stores
   and its own INVLPG; remap with per-vCPU INVLPG; 2 MiB ↔ 4 KiB changes; aliases across vCPUs; contended walks never halt.
   *Check:* each vCPU's observations and final PTE bytes against `i4v_coherence_model.py`.

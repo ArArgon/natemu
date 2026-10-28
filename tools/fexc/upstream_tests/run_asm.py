@@ -124,6 +124,9 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
             if s['stop'] == 'no_code':
                 # fexc's end reason; the instruction is the one at RIP
                 return {**rec, 'outcome': 'unsupported', 'reason': f"{s['reason']}: {rec.get('at', '?')}"}
+            if s['stop'] == 'resident' and s['reason'].startswith('unsupported_atomic'):
+                # A memory xchg whose operand crosses 16 bytes (a split lock): stopped before any effect (S3e, boot phase)
+                return {**rec, 'outcome': 'unsupported', 'reason': f"split lock: {rec.get('at', '?')}"}
             return {**rec, 'outcome': 'fail', 'reason': 'did not reach hlt', 'detail': rec['stop'] + ' fault=' + json.dumps(s['fault'])}
         gpr = [int(v, 0) for v in s['gpr']]
         diffs = []

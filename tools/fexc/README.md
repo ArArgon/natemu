@@ -29,7 +29,10 @@ jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never 
 (series applied as ten commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series9` (series8 with `loop/loope/loopne/jrcxz` allowlisted, S2d: the same ten patches, only `shim/fexc_slice1.inc` differs; objects identical to series8 on the 64 fixtures). Kept for comparison only: `series8` (patches 0001-0010, loop/jrcxz cut), `series7` (patches 0001-0009, literal exits through DispatcherLoopTop), `series6` (patches 0001-0008, before self-loop exits and the stop check), `series5`, `series4`
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series10` (S3e: the same ten patches; the shims admit
+memory xchg as a `swap` site (kind 12: one `swpal`, LSE on as before through the `atomics_lse` feature default; an address
+guard, no split check), lfence/mfence/sfence and pause; objects identical to series9 on the 64 fixtures and the 44 seed-4242 programs, which have none of
+these forms). Kept for comparison only: `series9` (series8 with `loop/loope/loopne/jrcxz` allowlisted, S2d), `series8` (patches 0001-0010, loop/jrcxz cut), `series7` (patches 0001-0009, literal exits through DispatcherLoopTop), `series6` (patches 0001-0008, before self-loop exits and the stop check), `series5`, `series4`
 (patches 0001-0007, before division), `series2` (patches 0001-0006, the "before" of the guard cost), `s1c` (slice1
 without the precision patches, the "before" of the precision cost) and `c1b` (the v1 build without sites). The earlier `series1` (flag rule before the cheaper one below) and `s1b1` are gone.
 
@@ -278,17 +281,19 @@ The scripts that read `fixtures/slice1/programs.json` (git-ignored; `smoke.py`, 
 - **Allowlist.** Primary map: add/or/adc/sbb/and/sub/xor/cmp (all six forms), push/pop r, push imm, mov (88-8b, a0-a3,
   b0-bf, c6/c7 /0), lea, movsxd, imul (69/6b), test, group 1, shifts/rotates (c0/c1/d0-d3 except /6; rcl/rcr only with a register operand: FEX branches around the whole access for a
   static or dynamic zero count, which would lose a guest #PF), group 3 inc/dec-style
-  ops (test /0, not, neg, mul, imul, div, idiv), fe/ff inc/dec/push, nop, endbr64 (f3 0f 1e fa, a no-op) and register xchg
-  (86/87 only with mod=3, 90-97), cbw/cwde/cdqe and cwd/cdq/cqo. Two-byte map (no mandatory-prefix overlay): nop (0f 1f), cmovcc,
-  setcc, bt/bts/btr/btc (a3/ab/b3/bb, ba /4-7), imul, movzx, movsx, bsf/bsr, bswap. Branches (end the block): jcc rel8/rel32,
+  ops (test /0, not, neg, mul, imul, div, idiv), fe/ff inc/dec/push, nop, endbr64 (f3 0f 1e fa, a no-op), pause (f3 90 without
+  REX.B, FEX's `yield`), xchg (86/87, 90-97; with a memory operand, LOCK prefix allowed, it is FEX's `swpal` at a `swap` site, S3e),
+  cbw/cwde/cdqe and cwd/cdq/cqo. Two-byte map (no mandatory-prefix overlay): nop (0f 1f), cmovcc,
+  setcc, bt/bts/btr/btc (a3/ab/b3/bb, ba /4-7), imul, movzx, movsx, bsf/bsr, bswap; lfence/mfence/sfence (exactly 0f ae e8/f0/f8,
+  no 66/F2/F3: FEX's `dmb ld`/`dmb sy`/`dmb st`). Branches (end the block): jcc rel8/rel32,
   jmp rel8/rel32 and near indirect, call rel32/indirect, ret, rep ret (f3 c3), ret imm16. All with no LOCK, REP/REPNE (except
-  rep ret and endbr64), FS/GS override, address-size override, and (branches) no operand-size prefix; 66-prefixed bswap
+  rep ret, endbr64 and pause; LOCK only on memory xchg), FS/GS override, address-size override, and (branches) no operand-size prefix; 66-prefixed bswap
   (undefined result) is cut.
 - **System class** (reason `system_instruction`): segment push/pop and moves, lss/lfs/lgs, far call/jmp/ret, iret,
   int/int3/into/icebp, ud2/ud1/ud0, pushf/popf/cli/sti, hlt, port I/O, all of 0f 00 and 0f 01 (descriptor tables, invlpg,
   swapgs, rdtscp, xgetbv, ...), lar/lsl, syscall/sysret/sysenter/sysexit, clts, invd/wbinvd, clflush, mov cr/dr, wrmsr/rdmsr/rdpmc,
   rdtsc, cpuid, rd/wr fs/gs base, vmread/vmwrite, invept/invvpid/invpcid. Everything else outside the allowlist (string ops,
-  LOCK forms, memory xchg, cmpxchg/xadd, x87/SSE/AVX, fences, cld/std, clc/stc, lahf/sahf, loop/jrcxz with a 67 prefix, shld/shrd,
+  LOCK forms but memory xchg, cmpxchg/xadd, x87/SSE/AVX, cld/std, clc/stc, lahf/sahf, loop/jrcxz with a 67 prefix, shld/shrd,
   tzcnt/popcnt, prefetch, leave/enter, ...) is `unsupported_form`.
 
 ### Native control flow inside one guest instruction

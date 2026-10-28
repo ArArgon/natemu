@@ -39,6 +39,7 @@ enum FexcSiteKind : uint8_t {
   FEXC_SITE_PUSH_PAIR = 8, FEXC_SITE_POP_PAIR = 9, // FEX fused two guest push/pop into one stp/ldp
   FEXC_SITE_OTHER = 10,                     // guest-memory IR op the site record cannot describe
   FEXC_SITE_DIVIDE = 11,                    // slice1 stub: div/idiv #DE (zero divisor or quotient overflow)
+  FEXC_SITE_SWAP = 12,                      // memory xchg: swpal (data_reg[0] = Rt, the old value; data_reg[1] = Rs, the new)
 };
 inline constexpr uint32_t FEXC_NONE32 = 0xFFFFFFFFu;
 struct FexcSiteInfo {

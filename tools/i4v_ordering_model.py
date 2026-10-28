@@ -37,6 +37,8 @@ class Litmus:
     # Operations: ('load', destination, address), ('store', address, value),
     # ('fence',), ('xchg', destination, address, input_value). Values are u32
     # constants or names of registers written earlier by the same participant.
+    # Outputs: (participant, register), or ('final', address): the word's value once everything finished and
+    # every buffered store reached memory (2+2W, exchange chains).
     programs: tuple
     initial: tuple
     outputs: tuple
@@ -120,8 +122,15 @@ def validate(test):
     require(type(test.outputs) is tuple and bool(test.outputs), 'explicit outcome register order')
     require(len(set(test.outputs)) == len(test.outputs), 'unique outcome registers')
     for cpu, reg in test.outputs:
-        require(type(cpu) is int and 0 <= cpu < len(registers) and reg in registers[cpu], 'valid outcome register')
+        require((cpu == 'final' and reg in memory) or
+                (type(cpu) is int and 0 <= cpu < len(registers) and reg in registers[cpu]), 'valid outcome register')
     return tuple(sorted(memory)), tuple(registers)
+
+
+def outcome_of(test, state, addresses, registers):
+    """The outputs of a finished state (all stores in memory)."""
+    return tuple(state.memory[addresses.index(reg)] if cpu == 'final' else state.registers[cpu][registers[cpu].index(reg)]
+                 for cpu, reg in test.outputs)
 
 
 @dataclass(frozen=True)
@@ -205,7 +214,7 @@ def enumerate_outcomes(test, max_states=250000):
         current = pending.popleft()
         if all(pc == len(program) for pc, program in zip(current.pcs, test.programs)) and not any(current.buffers):
             terminals += 1
-            outcome = tuple(current.registers[cpu][registers[cpu].index(reg)] for cpu, reg in test.outputs)
+            outcome = outcome_of(test, current, addresses, registers)
             if outcome not in witnesses:
                 path, at = [], current
                 while parents[at] is not None:
@@ -234,7 +243,7 @@ def replay_witness(test, actions):
         state = matching[0]
     require(all(pc == len(program) for pc, program in zip(state.pcs, test.programs)) and not any(state.buffers),
             'witness must finish guest instructions and outstanding stores')
-    return tuple(state.registers[cpu][registers[cpu].index(reg)] for cpu, reg in test.outputs), state
+    return outcome_of(test, state, addresses, registers), state
 
 
 @lru_cache(maxsize=7)

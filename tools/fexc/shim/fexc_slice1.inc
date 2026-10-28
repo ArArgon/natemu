@@ -37,7 +37,7 @@ inline Verdict Primary(uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
   case 0x63: case 0x68: case 0x6A: case 0x69: case 0x6B: case 0x84: case 0x85: case 0x88: case 0x89: case 0x8A: case 0x8B:
   case 0x8D: case 0x98: case 0x99: case 0xA0: case 0xA1: case 0xA2: case 0xA3: case 0xA8: case 0xA9: return Allow();
   case 0x80: case 0x81: case 0x83: return Allow();                  // group 1 (82 is invalid in 64-bit mode)
-  case 0x86: case 0x87: return mod == 3 ? Allow() : Uns("memory xchg (implicit LOCK)");
+  case 0x86: case 0x87: return Allow();                             // xchg; with memory: implicit LOCK, FEX's swpal (S3e)
   case 0x8F: return has_modrm && reg == 0 ? Allow() : Uns("pop r/m with reg != 0");
   case 0xC0: case 0xC1: case 0xD0: case 0xD1: case 0xD2: case 0xD3:
     if (!has_modrm || reg == 6) return Uns("shift group /6 alias");
@@ -84,7 +84,7 @@ inline Verdict Two(uint8_t op, bool plain, bool has_modrm, uint8_t mod, uint8_t 
   case 0xAE:
     if (has_modrm && mod != 3 && reg == 7) return Sys("clflush/clflushopt (cache maintenance)");
     if (has_modrm && mod == 3 && reg < 4) return Sys("rd/wr fs/gs base");
-    return Uns("fence, fxsave/xsave, ldmxcsr/stmxcsr");
+    return Uns("fxsave/xsave, ldmxcsr/stmxcsr, a fence with another ModRM");
   default: break;
   }
   if (!plain) return Uns("mandatory-prefix (F3/F2/66) overlay opcode");
@@ -106,6 +106,7 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   const bool has_modrm = d.Flags & DecodeFlags::FLAG_DECODED_MODRM;
   const uint8_t mod = d.ModRM >> 6, reg = (d.ModRM >> 3) & 7;
   const uint8_t op = d.OPRaw;
+  const uint32_t f = d.Flags;
   Verdict v;
   switch (d.FexcMap) {
   case FEXC_MAP_PRIMARY: v = Primary(op, has_modrm, mod, reg); break;
@@ -115,6 +116,10 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
     v = (op >= 0x80 && op <= 0x82) ? Sys("invept/invvpid/invpcid") : Uns("0f38 map"); break;
   default: v = Uns("0f3a/3dnow map"); break;
   }
+  // LFENCE/MFENCE/SFENCE (0f ae e8/f0/f8, no 66/F2/F3: those are other instructions): FEX emits dmb ld/sy/st (S3e).
+  if (d.FexcMap == FEXC_MAP_TWO && op == 0xAE && has_modrm && (d.ModRM == 0xE8 || d.ModRM == 0xF0 || d.ModRM == 0xF8) &&
+      !(f & (DecodeFlags::FLAG_OPERAND_SIZE | DecodeFlags::FLAG_REP_PREFIX | DecodeFlags::FLAG_REPNE_PREFIX)))
+    v = Allow();
   if (v.kind != ALLOW) {
     // endbr64 (f3 0f 1e fa) is a no-op. 0f 1e is a NO_OVERLAY opcode, so FEX decodes it from the base two-byte table
     // with the REP flag still set; nothing else may be set.
@@ -126,10 +131,13 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
     return v;
   }
   if (!decoded) return Uns("did not decode");
-  const uint32_t f = d.Flags;
-  if (f & DecodeFlags::FLAG_LOCK) return Uns("LOCK prefix");
+  const bool primary = d.FexcMap == FEXC_MAP_PRIMARY;
+  // LOCK only on memory xchg (implicitly locked anyway; on a register form LOCK is #UD).
+  if ((f & DecodeFlags::FLAG_LOCK) && !(primary && (op == 0x86 || op == 0x87) && mod != 3)) return Uns("LOCK prefix");
   if (f & DecodeFlags::FLAG_REPNE_PREFIX) return Uns("REPNE prefix");
-  if ((f & DecodeFlags::FLAG_REP_PREFIX) && !(d.FexcMap == FEXC_MAP_PRIMARY && op == 0xC3)) return Uns("REP prefix");   // rep ret is a ret
+  // rep ret is a ret; F3 90 (no REX.B: that would be xchg r8, rax) is PAUSE, FEX's `yield`.
+  if ((f & DecodeFlags::FLAG_REP_PREFIX) && !(primary && (op == 0xC3 || (op == 0x90 && !(f & DecodeFlags::FLAG_REX_XGPR_B)))))
+    return Uns("REP prefix");
   const uint32_t seg = f & DecodeFlags::FLAG_SEGMENTS;
   if (seg == DecodeFlags::FLAG_FS_PREFIX || seg == DecodeFlags::FLAG_GS_PREFIX) return Uns("FS/GS override");
   if (f & DecodeFlags::FLAG_ADDRESS_SIZE) return Uns("address-size override");

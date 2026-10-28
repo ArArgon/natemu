@@ -1,6 +1,6 @@
 """S1c checks: profile slice1 of fexc (block cutting at an allowlist, single-gate exits, profile record).
 
-Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series9 build)
+Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series10 build)
 
 The x86 bytes below are assembled by hand and only drive the compiler; every expectation (where the block ends, why)
 comes from the instruction's architectural class, never from fexc's output. The cut position is also compared with a
@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402  (disassemble, object reader)
 import scan_skips  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series9/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series10/obj/fexc')
 REPO = HERE.parents[1]
 RIP = 0x102000
 PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
@@ -46,12 +46,13 @@ SYSTEM = {
 
 # name -> hex. Decodable instructions that are not slice-1 forms, and admitted opcodes with an excluded prefix or operand.
 UNSUPPORTED = {
-    'xchg [rax],ecx': '8708', 'xchg [rax],rcx': '488708', 'xchg [rax],cl': '8608',
+    'lock xchg rax,rcx (#UD)': 'f04887c1', 'rep xchg r8,rax (not pause)': 'f34190', 'o16 mfence': '660faef0',
+    'lfence modrm e9': '0faee9', 'rep mfence': 'f30faef0',
     'lock add [rax],rcx': 'f0480108', 'lock inc [rax]': 'f0ff00', 'cmpxchg [rax],ecx': '0fb108', 'xadd [rax],ecx': '0fc108',
     'rep movsb': 'f3a4', 'movsb': 'a4', 'stosq': '48ab', 'scasb': 'ae', 'cmpsb': 'a6', 'lodsb': 'ac',
     'mov rax,fs:[rax]': '64488b00', 'mov rax,gs:[rax]': '65488b00', 'mov eax,[eax] (addr32)': '678b00',
-    'pause': 'f390', 'addps': '0f58c1', 'movaps': '0f28c1', 'fld st0': 'd9c0', 'vzeroupper': 'c5f877', 'cld': 'fc', 'std': 'fd',
-    'clc': 'f8', 'stc': 'f9', 'lahf': '9f', 'sahf': '9e', 'lfence': '0faee8', 'mfence': '0faef0', 'sfence': '0faef8',
+    'addps': '0f58c1', 'movaps': '0f28c1', 'fld st0': 'd9c0', 'vzeroupper': 'c5f877', 'cld': 'fc', 'std': 'fd',
+    'clc': 'f8', 'stc': 'f9', 'lahf': '9f', 'sahf': '9e',
     'fxsave': '0fae00', 'loop 67-prefix': '67e2fe', 'jecxz': '67e3fe', 'loop o16': '66e2fe', 'shld': '0fa4c101', 'shrd': '0facc101', 'popcnt': 'f3480fb8c1',
     'tzcnt': 'f30fbcc1', 'lzcnt': 'f30fbdc1', 'rdrand': '0fc7f0', 'rdseed': '0fc7f8', 'cmpxchg16b': '480fc708', 'cmpxchg8b': '0fc708',
     'leave': 'c9', 'enter': 'c8080000', 'xlat': 'd7', 'movbe': '0f38f000', 'prefetch': '0f1808', 'sal /6 alias': 'd1f0',
@@ -80,7 +81,8 @@ ALLOWED = {
     'bsr eax,[rax]': '0fbd00', 'bt rax,rcx': '480fa3c8', 'bts [rax],rcx': '480fab08', 'btr rax,5': '480fbaf005', 'btc [rax],5': '480fba3805',
     'div cl': 'f6f1', 'div rcx': '48f7f1', 'idiv [rcx]': '48f739', 'idiv r15d': '41f7ff', 'div byte [rax]': 'f630', 'idiv bx': '66f7fb',
     'cbw': '6698', 'cwde': '98', 'cdqe': '4898', 'cwd': '6699', 'cdq': '99', 'cqo': '4899', 'push rax': '50', 'push r9': '4151',
-    'endbr64': 'f30f1efa', 'rcl rax,cl': '48d3d0', 'rcr eax,1': 'd1d8', 'rcl al,5': 'c0d005', 'pop rbx': '5b', 'push imm8': '6a01', 'push imm32': '6800010000', 'push [rax]': 'ff30', 'pop [rax]': '8f00', 'push ax': '6650',
+    'endbr64': 'f30f1efa', 'xchg [rax],ecx': '8708', 'xchg [rax],rcx': '488708', 'xchg [rax],cl': '8608', 'xchg cx,[rax]': '668708',
+    'lock xchg [rax],rcx': 'f0488708', 'pause': 'f390', 'lfence': '0faee8', 'mfence': '0faef0', 'sfence': '0faef8', 'rcl rax,cl': '48d3d0', 'rcr eax,1': 'd1d8', 'rcl al,5': 'c0d005', 'pop rbx': '5b', 'push imm8': '6a01', 'push imm32': '6800010000', 'push [rax]': 'ff30', 'pop [rax]': '8f00', 'push ax': '6650',
 }
 
 # (name, hex, translated-instruction count): control transfers end the block with their normal exit.
@@ -260,7 +262,7 @@ class Slice1Cutting(unittest.TestCase):
 
     def test_default_profile_does_not_cut(self):
         # the same system instructions translate (or fail) as before in the default profile: no cut is ever reported
-        for x in (SYSTEM['mov cr3,rax'], SYSTEM['cli'], UNSUPPORTED['xchg [rax],rcx']):
+        for x in (SYSTEM['mov cr3,rax'], SYSTEM['cli'], UNSUPPORTED['lock add [rax],rcx']):
             d, rc = run(PRE + x + PRE, profile=None)
             self.assertNotIn(d['guest']['end']['reason'], ('system_instruction', 'unsupported_form'))
             self.assertNotIn('cut_opcode', d['guest']['end'])
@@ -360,7 +362,7 @@ class Slice1Exits(unittest.TestCase):
                     check_exits(self, d, tmp, p['name'])
                     for s in d['sites']:
                         self.assertEqual(s['ordering'], 'plain', p['name'])   # hardware TSO: no ldar/stlr
-        print(f'\nfixtures: {full} translate completely, {cut} end at a memory xchg (unsupported_form)')
+        print(f'\nfixtures: {full} translate completely, {cut} are cut (unsupported_form)')
         self.assertEqual((full, cut), (64, 0))
 
 

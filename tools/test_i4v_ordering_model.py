@@ -181,6 +181,21 @@ class ExchangeChainTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             model.check_xchg_chain({0: 1}, {0: False}, 1)
 
+    def test_final_memory_outputs(self):
+        # 2+2W: both final values 1 would need each first store after the other's second (a cycle): forbidden.
+        two = model.Litmus('2+2w', ((('store', 'x', 1), ('store', 'y', 2)), (('store', 'y', 1), ('store', 'x', 2))),
+                           (('x', 0), ('y', 0)), (('final', 'x'), ('final', 'y')))
+        self.assertEqual(model.enumerate_outcomes(two).outcomes, {(1, 2), (2, 1), (2, 2)})
+        # One exchange chain: every allowed outcome (returned values, final word) is one linear order.
+        chain = model.Litmus('xchg', ((('xchg', 'o0', 't', 1),), (('xchg', 'o1', 't', 2),), (('xchg', 'o2', 't', 3),)),
+                             (('t', 0),), ((0, 'o0'), (1, 'o1'), (2, 'o2'), ('final', 't')))
+        outcomes = model.enumerate_outcomes(chain).outcomes
+        self.assertEqual(len(outcomes), 6)
+        for o in outcomes:
+            model.check_xchg_chain({0: 1, 1: 2, 2: 3}, dict(enumerate(o[:3])), o[3])
+        with self.assertRaises(ValueError):
+            model.validate(model.Litmus('bad', ((('store', 'x', 1),),), (('x', 0),), (('final', 'y'),)))
+
 
 if __name__ == '__main__':
     unittest.main()

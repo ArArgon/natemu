@@ -165,7 +165,9 @@ def litmus_decl(name):
     return m.Litmus(name, ((('store', 'x', 1),), (('store', 'y', 1),), (('load', 'r0', 'x'), ('fence',), ('load', 'r1', 'y')),
                            (('load', 'r2', 'y'), ('fence',), ('load', 'r3', 'x'))), (('x', 0), ('y', 0)), ((2, 'r0'), (2, 'r1'), (3, 'r2'), (3, 'r3')))
 
-def litmus_cpu_text(test, i, pause):
+def litmus_cpu_text(test, i, pause, locs=LOC, stride=2, fences=True, delay=63):
+    """CPU i's body: `locs` = location -> offset from SYNC, `stride` = result bytes per iteration, `fences` = False drops
+    every fence (a positive control), `delay` = mask of the random start delay (spins). CPU 0 also records the ('final', location) outputs once every CPU is done."""
     n = len(test.programs); mem = dict(test.initial); pz = '        pause\n' if pause else ''
     regs, lines = {}, []
     def r(name):
@@ -175,21 +177,25 @@ def litmus_cpu_text(test, i, pause):
     if i == 0:                                    # CPU 0 resets the locations once everybody finished the previous iteration
         L.append('    lea rax, [rbx-1]')
         for j in range(n): L += [f'.wd{j}: cmp [rdi+{DONE(j)}], rax', f'    jae .od{j}', pz.rstrip(), f'    jmp .wd{j}', f'.od{j}:']
-        L += [f'    mov dword [rdi+{LOC[a]}], {v}' for a, v in mem.items()]
+        L += [f'    mov dword [rdi+{locs[a]}], {v}' for a, v in mem.items()]
     L.append(f'    mov [rdi+{SEQ(i)}], rbx')
     for j in range(n):
         if j != i: L += [f'.ws{j}: cmp [rdi+{SEQ(j)}], rbx', f'    jae .os{j}', pz.rstrip(), f'    jmp .ws{j}', f'.os{j}:']
     # random start offset 0..63 spins (xorshift64 in r14): without it the CPU that arrives last at the barrier always wins the race
     L += ['    mov r13, r14', '    shl r13, 13', '    xor r14, r13', '    mov r13, r14', '    shr r13, 7', '    xor r14, r13', '    mov r13, r14', '    shl r13, 17',
-          '    xor r14, r13', '    mov r13d, r14d', '    and r13d, 63', '.dl: dec r13d', '    jns .dl']
+          '    xor r14, r13', '    mov r13d, r14d', f'    and r13d, {delay}', '.dl: dec r13d', '    jns .dl']
     for op in test.programs[i]:
-        if op[0] == 'store': assert type(op[2]) is int; L.append(f'    mov dword [rdi+{LOC[op[1]]}], {op[2]}')
-        elif op[0] == 'load': L.append(f'    mov {r(op[1])}d, [rdi+{LOC[op[2]]}]')
-        elif op[0] == 'fence': L.append('    mfence')
-        else: assert op[0] == 'xchg' and type(op[3]) is int; L += [f'    mov {r(op[1])}d, {op[3]}', f'    xchg [rdi+{LOC[op[2]]}], {r(op[1])}d']
+        if op[0] == 'store': assert type(op[2]) is int; L.append(f'    mov dword [rdi+{locs[op[1]]}], {op[2]}')
+        elif op[0] == 'load': L.append(f'    mov {r(op[1])}d, [rdi+{locs[op[2]]}]')
+        elif op[0] == 'fence': L.append('    mfence' if fences else '')
+        else: assert op[0] == 'xchg' and type(op[3]) is int; L += [f'    mov {r(op[1])}d, {op[3]}', f'    xchg [rdi+{locs[op[2]]}], {r(op[1])}d']
     outs = [reg for c, reg in test.outputs if c == i]
     for k, reg in enumerate(outs): L.append(f'    mov [rsi+{k}], {regs[reg]}b')
-    L += [f'    mov [rdi+{DONE(i)}], rbx', '    add rsi, 2', '    inc rbx', '    cmp rbx, rdx', '    jbe .top', '    cmp r15, r15']
+    finals = [a for c, a in test.outputs if c == 'final'] if i == 0 else []
+    if finals:                                    # every other CPU is done (its stores precede its DONE): the final values
+        for j in range(1, n): L += [f'.wf{j}: cmp [rdi+{DONE(j)}], rbx', f'    jae .of{j}', pz.rstrip(), f'    jmp .wf{j}', f'.of{j}:']
+        for k, a in enumerate(finals, len(outs)): L += [f'    mov eax, [rdi+{locs[a]}]', f'    mov [rsi+{k}], al']
+    L += [f'    mov [rdi+{DONE(i)}], rbx', f'    add rsi, {stride}', '    inc rbx', '    cmp rbx, rdx', '    jbe .top', '    cmp r15, r15']
     return '\n'.join(x for x in L if x != '')
 
 def litmus(name, k, pause=False):
@@ -205,16 +211,81 @@ def litmus(name, k, pause=False):
 def litmus_all(k):
     return [litmus(t, k, pause)[0] for t in LITMUS_NAMES for pause in (False, True)]
 
-def litmus_outcomes(prog, test, got, k):
+def litmus_outcomes(prog, test, got, k, stride=2, res=RES):
     """Per-iteration outcomes (tuples in the model's `outputs` order) from a parsed dump; checks every CPU finished all k iterations."""
     reg_mem = {m['addr']: m['data'] for m in got['memory']}
     sync = reg_mem[SYNC]
     for i in range(len(test.programs)):
         done = int.from_bytes(sync[DONE(i):DONE(i) + 8], 'little'); assert done == k, f'cpu {i} finished {done} of {k} iterations'
-    idx = {}
-    for c, reg in test.outputs: idx[(c, reg)] = sum(1 for cc, rr in test.outputs[:test.outputs.index((c, reg))] if cc == c)
-    res = {c: reg_mem[RES(c)] for c, _ in test.outputs}
-    return [tuple(res[c][2 * it + idx[(c, reg)]] for c, reg in test.outputs) for it in range(k)]
+    idx = {}     # byte of each output in its CPU's record: CPU 0 records the ('final', location) outputs after its own
+    who = lambda c: 0 if c == 'final' else c
+    order = sorted(test.outputs, key=lambda o: (who(o[0]), o[0] == 'final'))
+    for o in test.outputs: idx[o] = sum(1 for oo in order[:order.index(o)] if who(oo[0]) == who(o[0]))
+    data = {who(c): reg_mem[res(who(c))] for c, _ in test.outputs}
+    return [tuple(data[who(c)][stride * it + idx[(c, reg)]] for c, reg in test.outputs) for it in range(k)]
+
+
+# ---- (b2) generated litmus families on the general path (S3e; natemu only, judged by the model) ----------------------------
+# Each family is the classic shape generalised to n participants (rings for sb/lb/2+2W, a propagation chain for wrc, n-1
+# readers for mp, n exchangers for xchg); the model enumerates the allowed outcomes, nothing is written per test.
+FAMILIES = ('sb', 'sb-mfence', 'sb-xchg', 'mp', 'lb', 'wrc', 'iriw', '2+2w', 'xchg')
+VARIANTS = ('aligned', 'unaligned', 'split')
+
+def litmus_family(name, n):
+    """The model Litmus of family `name` on n participants, or None when it has no n-participant shape."""
+    import i4v_ordering_model as m
+    X = [f'x{i}' for i in range(n)]
+    nxt = lambda i: X[(i + 1) % n]
+    zero = lambda names: tuple((a, 0) for a in names)
+    if name in ('sb', 'sb-mfence', 'sb-xchg'):
+        mid = {'sb': lambda i: (), 'sb-mfence': lambda i: (('fence',),), 'sb-xchg': lambda i: (('xchg', f'o{i}', f'd{i}', i + 1),)}[name]
+        progs = tuple((('store', X[i], 1),) + mid(i) + (('load', f'r{i}', nxt(i)),) for i in range(n))
+        extra = [f'd{i}' for i in range(n)] if name == 'sb-xchg' else []
+        return m.Litmus(f'{name}@{n}', progs, zero(X + extra), tuple((i, f'r{i}') for i in range(n)))
+    if name == 'mp':
+        progs = ((('store', 'x0', 1), ('store', 'x1', 1)),) + tuple((('load', 'f', 'x1'), ('load', 'd', 'x0')) for _ in range(1, n))
+        return m.Litmus(f'mp@{n}', progs, zero(['x0', 'x1']), tuple(o for j in range(1, n) for o in ((j, 'f'), (j, 'd'))))
+    if name == 'lb':
+        return m.Litmus(f'lb@{n}', tuple((('load', f'r{i}', X[i]), ('store', nxt(i), 1)) for i in range(n)), zero(X),
+                        tuple((i, f'r{i}') for i in range(n)))
+    if name == 'wrc' and n >= 3:     # x0 propagates through a chain of n-2 forwarders to the last reader
+        progs = ((('store', 'x0', 1),),) + tuple((('load', 'r', X[j - 1]), ('store', X[j], 1)) for j in range(1, n - 1))
+        progs += ((('load', 'r', X[n - 2]), ('load', 's', 'x0')),)
+        return m.Litmus(f'wrc@{n}', progs, zero(X[:n - 1]), tuple((j, 'r') for j in range(1, n)) + ((n - 1, 's'),))
+    if name == 'iriw' and n == 4:
+        progs = ((('store', 'x0', 1),), (('store', 'x1', 1),), (('load', 'a', 'x0'), ('load', 'b', 'x1')), (('load', 'a', 'x1'), ('load', 'b', 'x0')))
+        return m.Litmus('iriw@4', progs, zero(X[:2]), ((2, 'a'), (2, 'b'), (3, 'a'), (3, 'b')))
+    if name == '2+2w':
+        return m.Litmus(f'2+2w@{n}', tuple((('store', X[i], 1), ('store', nxt(i), 2)) for i in range(n)), zero(X),
+                        tuple(('final', a) for a in X))
+    if name == 'xchg':                # one exchange chain: CPU i swaps in token i+1
+        return m.Litmus(f'xchg@{n}', tuple((('xchg', f'o{i}', 't', i + 1),) for i in range(n)), zero(['t']),
+                        tuple((i, f'o{i}') for i in range(n)) + (('final', 't'),))
+    return None
+
+def family_locations(test, variant):
+    """Location -> offset from SYNC: `aligned` 32-bit words on lines of their own; `unaligned` 5 bytes in (inside one
+    16-byte block); `split` each plain location crossing a page boundary of its own (exchanged locations stay aligned: a
+    split XCHG is not supported)."""
+    xchg = {op[2] for prog in test.programs for op in prog if op[0] == 'xchg'}
+    out = {}
+    for j, (a, _) in enumerate(test.initial):
+        if variant == 'split' and a not in xchg: out[a] = 0x1000 * (j + 1) - 2
+        else: out[a] = 0x400 + 0x80 * j + (5 if variant == 'unaligned' else 0)
+    return out
+
+FAMILY_RES = lambda i: 0x220000 + 0x20000 * i
+def family_program(test, variant, k, fences=True, delay=255):
+    """natemu-smp-v1 program of `test` with locations by `variant`, k iterations (<= 32768 / outputs per CPU)."""
+    n, locs = len(test.programs), family_locations(test, variant)
+    stride = max(sum(1 for c, _ in test.outputs if (0 if c == 'final' else c) == i) for i in range(n))
+    assert 1 <= k and stride * k <= 0x20000
+    bodies = [body(BODY0 + 0x1000 * i, litmus_cpu_text(test, i, False, locs, stride, fences, delay)) for i in range(n)]
+    cpus = [cpu(i, BODY0 + 0x1000 * i, rdi=SYNC, rsi=FAMILY_RES(i), rdx=k, r14=0x9e3779b97f4a7c15 * (i + 1)) for i in range(n)]
+    mem = [zero(SYNC, 0x6000)] + [zero(FAMILY_RES(i), stride * k) for i in range(n)
+                                  if any((0 if c == 'final' else c) == i for c, _ in test.outputs)]
+    return {'format': 'natemu-smp-v1', 'name': f'{test.name}-{variant}' + ('' if fences else '-nofence'), 'ncpu': n,
+            'bodies': bodies, 'cpus': cpus, 'memory': mem, 'params': {'k': k, 'stride': stride}}
 
 
 # ---- (c) system programs (CPL0, `system`: QEMU runs them on natemu's CPU model, smp.SYSTEM_CPU) ------------------------------

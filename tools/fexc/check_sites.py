@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """S1a check: fexc's access sites against the fixture programs and against the emitted code.
 
-usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series9 build)
+usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series10 build)
 
 --slice1 compiles with `--profile slice1` (S1c): hardware TSO (plain ldr/str), exits through the dispatcher gate, block
-cutting. A program then ends at its first memory xchg with end reason `unsupported_form` at that
-instruction's RIP (the expectation is cut at the same place in the fixture `asm`, never taken from fexc); the exit
+cutting (no fixture instruction is cut since S3e admitted memory xchg, a `swap` site); the exit
 literals (8-byte guest RIPs inside the code region) are not instructions and are masked from the disassembly.
 
 For each program in fixtures/slice1/programs.json (compiled at its rip, 64-bit):
@@ -45,7 +44,7 @@ def fixture_programs():
     if not path.exists():
         subprocess.run([sys.executable, '-B', str(REPO / 'tools/reference/build_slice1.py'), '--programs-only'], check=True)
     return json.loads(path.read_text())['programs']
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series9/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series10/obj/fexc')
 KNOWN_OK = False
 PROFILE = []   # extra fexc arguments for every compile: ['--profile', 'slice1'] under --slice1
 
@@ -76,6 +75,8 @@ def expected(asm):
         return []
     assert len(mem) == 1, asm
     i, w = mem[0], ptr(ops[mem[0]])
+    if mn == 'xchg':
+        return [('swap', w)]
     if i > 0:
         return [('load', w)]
     if mn in ('mov', 'movabs') or mn.startswith('set'):
@@ -107,10 +108,12 @@ def site_classes(sites):
 def native_access(w):
     """Width of a load/store mnemonic line, (direction, width, base, index, imm, writeback) or None."""
     m = re.match(r'(\w+)\s+(.*)$', w)
-    if not m or not m.group(1).startswith(('ld', 'st')) or '[' not in m.group(2):
+    if not m or not m.group(1).startswith(('ld', 'st', 'swp')) or '[' not in m.group(2):
         return None
     mn, ops = m.group(1), m.group(2)
     base = re.search(r'\[(x\d+|sp)', ops).group(1)
+    if mn.startswith('swp'):        # swpal{b,h} Rs, Rt, [Rn]: a memory xchg
+        return ('swap', 1 if mn.endswith('b') else 2 if mn.endswith('h') else 4 if ops.startswith('w') else 8, base, None, 0, 'none')
     regs = re.findall(r'\b([wxbhsdq])(?:\d+|zr)\b', ops.split('[')[0])
     if mn.endswith('b') and mn != 'ldaddb':
         width = 1
@@ -182,9 +185,9 @@ def object_vs_json(o, d):
 
 
 def first_cut(asm):
-    """Index of the first fixture instruction slice1 must cut (memory xchg), else None. Taken from the generator's `asm`,
-    never from fexc."""
-    return next((k for k, a in enumerate(asm) if a.startswith('xchg') and '[' in a), None)
+    """Index of the first fixture instruction slice1 must cut, else None. Taken from the generator's `asm`, never from
+    fexc. None since S3e: memory xchg, the only fixture form slice1 cut, is admitted."""
+    return None
 
 
 def asm0_cut(p):
@@ -209,7 +212,7 @@ def code_vs_sites(sites, dis):
         elif s and not a:
             out.append(f'site at +{off} ({s["ir_op"]}) is not on a load/store: "{dis.get(off)}"')
         else:
-            dirn = 'load' if s['kind'] in ('load', 'pop', 'load_pair', 'pop_pair') else 'store'
+            dirn = 'load' if s['kind'] in ('load', 'pop', 'load_pair', 'pop_pair') else 'swap' if s['kind'] == 'swap' else 'store'
             if (a[0], a[1], a[2]) != (dirn, s['width'], f'x{s["base_reg"]}'):
                 out.append(f'site +{off} ({s["kind"]} w{s["width"]} base x{s["base_reg"]}) vs "{dis[off]}"')
             if a[3] != s['index_reg'] or a[5] != s['writeback'] or (a[5] == 'none' and a[3] is None and a[4] != s['imm']):
@@ -217,6 +220,7 @@ def code_vs_sites(sites, dis):
             elif a[5] == 'pre' and not (a[4] == s['imm'] == s['writeback_delta']) or a[5] == 'post' and not (a[4] == s['writeback_delta'] and s['imm'] == 0):
                 out.append(f'site +{off} writeback (imm {s["imm"]} delta {s["writeback_delta"]}) vs "{dis[off]}"')
             regs = [31 if r.endswith('zr') else int(r[1:]) for r in re.findall(r'\b([wxbhsdq](?:\d+|zr))\b', dis[off].split(' ', 1)[1].split('[')[0])]
+            if s['kind'] == 'swap': regs = regs[::-1]        # swpal Rs, Rt; the record is [Rt, Rs]
             if regs != s['data_regs']:
                 out.append(f'site +{off} data registers {s["data_regs"]} vs "{dis[off]}"')
     return out
@@ -302,7 +306,7 @@ def check_program(p, tmp):
     o = read_object(tmp / 'o.bin')
     if o['code'] != code or o['spill'] != d['code']['layout']['spill_bytes'] or len(o['sites']) != len(sites) or o['rip'] != int(p['rip'], 16):
         problems.append(('ERROR', 'object header/code disagrees with the JSON'))
-    kinds = ['load', 'store', 'load_pair', 'store_pair', 'push', 'pop', 'guard', 'split', 'push_pair', 'pop_pair', 'other', 'divide']
+    kinds = ['load', 'store', 'load_pair', 'store_pair', 'push', 'pop', 'guard', 'split', 'push_pair', 'pop_pair', 'other', 'divide', 'swap']
     for rec, s in zip(o['sites'], sites):
         if (rec[0], rec[1], kinds[rec[5]], rec[6]) != (s['native_offset'], s['guest_offset'], s['kind'], s['width']):
             problems.append(('ERROR', f'object site {rec[:4]} disagrees with JSON {s["native_offset"]}'))

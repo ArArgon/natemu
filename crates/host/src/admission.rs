@@ -243,7 +243,10 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
     for s in accesses {
         if !site_fields_valid(s, &h, region)
             || s.guest_offset2 != object::NONE32
-            || !matches!(s.kind, object::kind::LOAD | object::kind::STORE | object::kind::LOAD_PAIR | object::kind::STORE_PAIR | object::kind::PUSH | object::kind::POP)
+            || !matches!(
+                s.kind,
+                object::kind::LOAD | object::kind::STORE | object::kind::LOAD_PAIR | object::kind::STORE_PAIR | object::kind::PUSH | object::kind::POP | object::kind::SWAP
+            )
             || !matches!(s.width, 1 | 2 | 4 | 8 | 16)
             || s.intent != intent(s)
         {
@@ -295,7 +298,7 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
 fn intent(s: &Site) -> u8 {
     use object::kind::*;
     match (s.kind, s.rmw) {
-        (STORE | STORE_PAIR | PUSH, object::RMW_NONE | object::RMW_STORE) => object::INTENT_WRITE,
+        (STORE | STORE_PAIR | PUSH, object::RMW_NONE | object::RMW_STORE) | (SWAP, object::RMW_NONE) => object::INTENT_WRITE,
         (LOAD | LOAD_PAIR, object::RMW_LOAD) => object::INTENT_WRITE,
         (LOAD | LOAD_PAIR | POP, object::RMW_NONE) => object::INTENT_READ,
         _ => u8::MAX,
@@ -554,6 +557,10 @@ mod tests {
         assert!(admit(&site(|s| (s.kind, s.intent) = (object::kind::STORE, object::INTENT_WRITE)), RIP, &SOURCE, ALL).is_ok());
         assert!(admit(&site(|s| (s.rmw, s.intent) = (object::RMW_LOAD, object::INTENT_WRITE)), RIP, &SOURCE, ALL).is_ok());
         assert!(admit(&site(|s| (s.rmw, s.intent) = (object::RMW_LOAD, object::INTENT_READ)), RIP, &SOURCE, ALL).is_err());
+        // A swap (memory XCHG) writes; it is never half of a read-modify-write pair.
+        assert!(admit(&site(|s| (s.kind, s.intent) = (object::kind::SWAP, object::INTENT_WRITE)), RIP, &SOURCE, ALL).is_ok());
+        assert!(admit(&site(|s| (s.kind, s.intent) = (object::kind::SWAP, object::INTENT_READ)), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&site(|s| (s.kind, s.intent, s.rmw) = (object::kind::SWAP, object::INTENT_WRITE, object::RMW_LOAD)), RIP, &SOURCE, ALL).is_err());
     }
 
     #[test]

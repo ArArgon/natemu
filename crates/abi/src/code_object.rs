@@ -24,7 +24,9 @@ pub const NO_REG: u8 = 0xff;
 /// `DIVIDE` (`brk #3`) is a div/idiv whose divisor is zero or whose quotient does not fit its destination (#DE): no
 /// access (`guest_offset2` = [`NONE32`], no address registers, width 0); the guest state is that before the instruction.
 /// Push/pop pairs exist while FEX fuses two guest push/pop into one `stp`/`ldp`; `OTHER` is a guest-memory operation
-/// the record cannot describe, which a consumer must refuse.
+/// the record cannot describe, which a consumer must refuse. `SWAP` is a memory XCHG (implicitly locked): one `swpal`
+/// (`data_reg` = [Rt, Rs]), write intent, nothing written if it aborts; an operand crossing 16 bytes takes an alignment
+/// fault there (LSE2), which the runtime does not complete.
 pub mod kind {
     pub const LOAD: u8 = 0;
     pub const STORE: u8 = 1;
@@ -38,6 +40,7 @@ pub mod kind {
     pub const POP_PAIR: u8 = 9;
     pub const OTHER: u8 = 10;
     pub const DIVIDE: u8 = 11;
+    pub const SWAP: u8 = 12;
 }
 /// [`Site::intent`].
 pub const INTENT_READ: u8 = 0;

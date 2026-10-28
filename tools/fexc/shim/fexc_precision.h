@@ -14,7 +14,7 @@ inline bool GuestMemOp(FEXCore::IR::IROps Op) {
   using namespace FEXCore::IR;
   switch (Op) {
   case OP_LOADMEM: case OP_LOADMEMTSO: case OP_STOREMEM: case OP_STOREMEMTSO: case OP_LOADMEMPAIR: case OP_STOREMEMPAIR:
-  case OP_PUSH: case OP_PUSHTWO: case OP_POP: case OP_POPTWO: return true;
+  case OP_PUSH: case OP_PUSHTWO: case OP_POP: case OP_POPTWO: case OP_ATOMICSWAP: return true;
   default: return false;
   }
 }
@@ -72,6 +72,7 @@ inline void Prescan(const FEXCore::IR::IRListView& IR) {
       case OP_STOREMEMTSO: Addr = IROp->C<IROp_StoreMemTSO>()->Addr; break;
       case OP_LOADMEMPAIR: Addr = IROp->C<IROp_LoadMemPair>()->Addr; break;
       case OP_STOREMEMPAIR: Addr = IROp->C<IROp_StoreMemPair>()->Addr; break;
+      case OP_ATOMICSWAP: Addr = IROp->C<IROp_AtomicSwap>()->Addr; break;
       default: break;
       }
       if (!Addr.IsInvalid()) {

@@ -79,6 +79,8 @@ enum Insn {
     /// Register-only instruction writing at most this register (31: sp; a zero-register destination writes nothing).
     Data(Option<u8>),
     Mem(Mem),
+    /// `swpal{b,h} Rs, Rt, [Rn]` (a memory XCHG): `size` bytes at Rn (no offset), Rt receives the old value.
+    Swap { size: u8, rs: u8, rt: u8, rn: u8 },
     /// `ldr xT, label`, the label's code offset.
     Literal { rt: u8, target: i64 },
     B(i64),
@@ -99,7 +101,7 @@ impl Insn {
                 let wb = if matches!(m.form, Form::Pre | Form::Post) { 1 << m.addr.base } else { 0 };
                 wb | if m.load { bit(m.rt) } else { 0 }
             }
-            Insn::Literal { rt, .. } => bit(rt),
+            Insn::Literal { rt, .. } | Insn::Swap { rt, .. } => bit(rt),
             Insn::Blr => 1 << 30 | 0b1111, // the helper's contract: x0-x3 change
             _ => 0,
         }
@@ -144,6 +146,13 @@ fn decode(w: u32, at: u32) -> Option<Insn> {
         _ if w & 0xfc00_0000 == 0x1400_0000 => B(rel(sext(w & 0x3ff_ffff, 26))),
         _ if w & 0xff00_0010 == 0x5400_0000 || w & 0x7e00_0000 == 0x3400_0000 => Cond(rel(sext(w >> 5 & 0x7_ffff, 19))),
         _ if w & 0x7e00_0000 == 0x3600_0000 => Cond(rel(sext(w >> 5 & 0x3fff, 14))),
+        // The ordering words and hints FEX emits for x86 instructions (S3e): exactly these.
+        0xd503_3dbf | 0xd503_3fbf | 0xd503_3ebf => Data(None), // dmb ld (LFENCE), dmb sy (MFENCE), dmb st (SFENCE)
+        0xd503_203f => Data(None),                             // yield (PAUSE)
+        _ if w & 0x3fe0_fc00 == 0x38e0_8000 => {
+            let reg = |shift: u32| (w >> shift & 31) as u8;
+            Swap { size: 1 << (w >> 30), rs: reg(16), rt: reg(0), rn: reg(5) } // swpal{b,h,,x}
+        }
         _ if w & 0xffff_ffe0 == 0xd53b_4200 => Data(zr(rd)), // mrs xT, nzcv
         _ if w & 0xffff_ffe0 == 0xd51b_4200 => Data(None),   // msr nzcv, xT
         0xd500_401f => Data(None),                           // cfinv
@@ -483,6 +492,7 @@ impl<'a> Verifier<'a> {
                     SP => {}
                     _ => self.site_word(m, at)?,
                 },
+                Insn::Swap { size, rs, rt, rn } => self.swap_word(size, rs, rt, rn, at)?,
                 Insn::Literal { target, .. } if !self.c.literals.iter().any(|l| l.start as i64 == target && l.len() == 8) => {
                     return fail(at, "literal load of a non-literal");
                 }
@@ -565,7 +575,8 @@ impl<'a> Verifier<'a> {
             Some((r, ext, shift)) => (s.index_reg, s.shift) == (r, shift) && (s.extend == ext || (ext == EXT_X && s.extend == object::EXT_NONE)),
         };
         let load = matches!(s.kind, object::kind::LOAD | object::kind::POP);
-        if !(index
+        if !(s.kind != object::kind::SWAP
+            && index
             && load == m.load
             && (s.base_reg, s.width, s.data_reg[0]) == (m.addr.base, m.size, m.rt)
             && s.imm as i64 == m.addr.imm
@@ -574,6 +585,23 @@ impl<'a> Verifier<'a> {
             return Err(format!("access site at {at:#x} does not describe its instruction"));
         }
         Ok(())
+    }
+
+    /// A swap word must be a swap site recording exactly it: base (a guest register or a computed address, never x28
+    /// or sp), width, Rt and Rs; no offset, index or writeback.
+    fn swap_word(&self, size: u8, rs: u8, rt: u8, rn: u8, at: u32) -> Result<(), String> {
+        let s = self.c.accesses.binary_search_by_key(&at, |s| s.native_offset).ok().map(|i| &self.c.accesses[i]);
+        match s {
+            Some(s)
+                if s.kind == object::kind::SWAP
+                    && !matches!(rn, 28 | SP)
+                    && (s.base_reg, s.width, s.data_reg) == (rn, size, [rt, rs])
+                    && (s.imm, s.index_reg, s.writeback, s.rmw) == (0, object::NO_REG, object::WB_NONE, object::RMW_NONE) =>
+            {
+                Ok(())
+            }
+            _ => Err(format!("swap at {at:#x} is not a swap site describing it")),
+        }
     }
 
     fn claim(&mut self, stub: u32) {
@@ -644,9 +672,12 @@ impl<'a> Verifier<'a> {
             if !entry || self.c.pcs.iter().any(|p| lo < p.native_offset && p.native_offset <= at && p.guest_offset != s.guest_offset) {
                 return fail("not inside its guest instruction");
             }
-            let Some(Insn::Mem(m)) = self.insn(at) else { return fail("no memory access there") };
-            let addr = m.addr;
-            let store = !m.load;
+            // A swap is a guarded access without split check (an operand crossing 16 bytes faults at the swap).
+            let (addr, size, store, swap) = match self.insn(at) {
+                Some(Insn::Mem(m)) if s.kind != object::kind::SWAP => (m.addr, m.size, !m.load, false),
+                Some(Insn::Swap { size, rn, .. }) if s.kind == object::kind::SWAP => (Addr { base: rn, index: None, imm: 0 }, size, false, true),
+                _ => return fail("no memory access of its kind there"),
+            };
             let (guards, splits) = (self.linked(at, object::kind::GUARD), self.linked(at, object::kind::SPLIT));
             // Guest-RIP-addressed: the base was last written by a guest-RIP move.
             let mv = (addr.index.is_none())
@@ -655,7 +686,10 @@ impl<'a> Verifier<'a> {
                 .and_then(|w| self.moves.iter().find(|(words, r, _)| *r == addr.base && words.contains(&w)).cloned());
             if let Some((words, _, value)) = mv {
                 let a = value.wrapping_add(addr.imm as u64);
-                let crosses = store && m.size > 1 && (a ^ a.wrapping_add(m.size as u64 - 1)) & 0x1000 != 0;
+                if swap && (a & 15) + size as u64 > 16 {
+                    return fail(&format!("swap at {a:#x} crosses a 16-byte boundary (unsupported_atomic)"));
+                }
+                let crosses = store && size > 1 && (a ^ a.wrapping_add(size as u64 - 1)) & 0x1000 != 0;
                 let need = if !canonical(a) { Some((object::kind::GUARD, &guards)) } else if crosses { Some((object::kind::SPLIT, &splits)) } else { None };
                 let stubs = guards.len() + splits.len();
                 // With a `b stub`, nothing may enter between the move and the access, not even from before the `b`.
@@ -714,7 +748,7 @@ impl<'a> Verifier<'a> {
                 _ => return fail(&format!("{} guard stubs", guards.len())),
             }
             // Split check on every store wider than a byte.
-            match (store && m.size > 1, &splits[..]) {
+            match (store && size > 1, &splits[..]) {
                 (false, []) => {}
                 (true, &[x]) => {
                     let (st, c) = (self.c.stubs[x], self.checks[x]);
@@ -724,7 +758,7 @@ impl<'a> Verifier<'a> {
                         && st.imm == 0
                         && add >= lo
                         && c.end < at
-                        && self.word(add) == 0x9100_0000 | (m.size as u32 - 1) << 10 | a << 5
+                        && self.word(add) == 0x9100_0000 | (size as u32 - 1) << 10 | a << 5
                         && self.word(add + 4) == 0xca00_0000 | a << 16
                         && self.address_in(st.base_reg, lo, add).is_some_and(|(x, from)| {
                             x == addr && self.kept(addr, from, at) && self.sealed(from.min(add), c.end, at)
@@ -735,7 +769,7 @@ impl<'a> Verifier<'a> {
                     }
                     self.claim(st.native_offset);
                 }
-                _ => return fail(&format!("{} split stubs for a {}-byte {}", splits.len(), m.size, if store { "store" } else { "load" })),
+                _ => return fail(&format!("{} split stubs for a {size}-byte {}", splits.len(), if store { "store" } else { "load" })),
             }
         }
         Ok(())
@@ -991,7 +1025,7 @@ mod tests {
     use super::*;
     use natemu_abi::code_object::Header;
 
-    /// Real fexc (series8, profile slice1) objects and the guest bytes they were compiled from.
+    /// Real fexc (series8, profile slice1; `xchg-*`: series10) objects and the guest bytes they were compiled from.
     macro_rules! fixture {
         ($name:literal) => {
             (
@@ -1000,7 +1034,7 @@ mod tests {
             )
         };
     }
-    const FIXTURES: [(&[u8], &[u8]); 8] = [
+    const FIXTURES: [(&[u8], &[u8]); 9] = [
         fixture!("address-forms"),
         fixture!("division-forms"),
         fixture!("call-rsp"),
@@ -1009,6 +1043,7 @@ mod tests {
         fixture!("large-displacements"),
         fixture!("jcc"),
         fixture!("fix-edge-rip-relative"),
+        fixture!("xchg-fences"),
     ];
     fn admit((object, source): (&[u8], &[u8])) -> Result<(), String> {
         let h: Header = super::super::record(object, 0);
@@ -1239,6 +1274,32 @@ mod tests {
     }
     /// The div-cl check's tbz offset field (stub at 0x368 from 0x1c).
     const DIVISION_STUB_IMM: u32 = ((0x368 - 0x1c) / 4) << 5;
+
+    /// `mov eax, 5; xchg [rbx], eax; lfence; mfence; sfence; pause; lock xchg [rbx+8], rcx; xchg [rip+0x10], al;
+    /// xchg dx, [rsp]; mov [rbx], eax`: swaps at 0x1c (guard at 0x14), 0x3c, 0x48 (guest-RIP), 0x58; fences at 0x20-0x28.
+    const XCHG: (&[u8], &[u8]) = FIXTURES[8];
+    const SWPAL_W4_X6: u32 = 0xb8e4_80c4; // swpal w4, w4, [x6]
+
+    #[test]
+    fn swaps_fences_and_pause_are_verified() {
+        assert!(matches!(decode(SWPAL_W4_X6, 0), Some(Insn::Swap { size: 4, rs: 4, rt: 4, rn: 6 })));
+        assert!(matches!(decode(0x38e4_8294, 0), Some(Insn::Swap { size: 1, rs: 4, rt: 20, rn: 20 }))); // swpalb
+        // Only the acquire-release swap: swp, swpa, swpl are refused (not FEX's xchg), as are other barriers and hints.
+        for other in [0xb824_80c4, 0xb8a4_80c4, 0xb864_80c4, 0xd503_39bf, 0xd503_3bbf, 0xd503_3fdf, 0xd503_205f, 0xd503_3f9f] {
+            refused(XCHG, 0x20, 0xd503_3dbf, other, "unrecognised"); // swp swpa swpl; dmb ishld ish; isb; wfe; dsb sy
+        }
+        refused(XCHG, 0x1c, SWPAL_W4_X6, SWPAL_W4_X6 + 1, "swap site"); // Rt w5: the record says w4
+        refused(XCHG, 0x1c, SWPAL_W4_X6, SWPAL_W4_X6 + (1 << 16), "swap site"); // Rs w5
+        refused(XCHG, 0x1c, SWPAL_W4_X6, SWPAL_W4_X6 & !(31 << 5) | 28 << 5, "swap site"); // [x28]: the frame
+        refused(XCHG, 0x1c, SWPAL_W4_X6, SWPAL_W4_X6 | 1 << 30, "swap site"); // 8 bytes, recorded 4
+        refused(XCHG, 0x10, 0x5280_00a4, SWPAL_W4_X6, "swap at 0x10 is not a swap site"); // a swap where no site is
+        refused(XCHG, 0x1c, SWPAL_W4_X6, 0xb900_00c4, "does not describe its instruction"); // str w4, [x6] at the swap site
+        refused(XCHG, 0x18, 0xb7f8_03c0, NOP, "reached by 0 branches"); // the swap's guard branch removed
+        refused(XCHG, 0x14, 0xca06_40c0, NOP, "address guard"); // its eor removed
+        // A guest-RIP swap whose operand crosses 16 bytes (`xchg [rip+0x18], eax` at 0x100000: 0x10001e) is refused.
+        let e = admit(fixture!("xchg-rip-crossing")).expect_err("split lock admitted");
+        assert!(e.contains("crosses a 16-byte boundary"), "{e}");
+    }
 
     #[test]
     fn forbidden_instructions_are_refused() {

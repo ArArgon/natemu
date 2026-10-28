@@ -25,7 +25,8 @@
 //! latencies from each protect's return to the stop's exit.
 //!
 //! vCPUs run concurrently over shared guest RAM, each until its own stop. A vCPU that stops for any other reason than
-//! reaching its end, a guest fault or code it cannot compile (a resident halt, the watchdog) cancels the others.
+//! reaching its end, a guest fault, code it cannot compile or a split lock (`unsupported_atomic`: a precise stop before the
+//! instruction, like a guest fault) cancels the others (another resident halt, the watchdog).
 //!
 //! Description (text, one item per line). State items: rip ADDR | rflags VALUE | gpr V0 .. V15
 //!   | cpl 0|3 (default 3) | wp 0|1 (CR0.WP, default 1) | smep 0|1 (CR4.SMEP, default 0) | nxe 0|1 (EFER.NXE, default 1).
@@ -449,7 +450,10 @@ struct Ran {
 }
 /// A vCPU's own end (it parks; peers run on). Any other stop cancels the peers.
 fn finished(stop: &Stop) -> bool {
-    matches!(stop, Stop::Reached | Stop::FetchFault(_) | Stop::NoCode(_) | Stop::Resident { stop: exec::stop::GUEST_FAULT, .. })
+    matches!(
+        stop,
+        Stop::Reached | Stop::FetchFault(_) | Stop::NoCode(_) | Stop::Resident { stop: exec::stop::GUEST_FAULT | exec::stop::UNSUPPORTED_ATOMIC, .. }
+    )
 }
 
 pub(crate) fn run(args: &[String]) -> Result<()> {

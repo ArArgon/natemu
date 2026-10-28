@@ -57,7 +57,7 @@ bool FexcIsOtherMemoryOp(std::string_view n) {
   static constexpr std::string_view names[] = {"VLoadVectorMasked", "VStoreVectorMasked", "VLoadVectorGatherMasked",
     "VLoadVectorGatherMaskedQPS", "VLoadVectorElement", "VStoreVectorElement", "VBroadcastFromMem", "StoreMemX87SVEOptPredicate",
     "LoadMemX87SVEOptPredicate", "MemSet", "MemCpy", "VStoreNonTemporal", "VStoreNonTemporalPair", "VLoadNonTemporal", "CAS",
-    "CASPair", "AtomicSwap", "AtomicFetchAdd", "AtomicFetchSub", "AtomicFetchAnd", "AtomicFetchCLR", "AtomicFetchOr",
+    "CASPair", "AtomicFetchAdd", "AtomicFetchSub", "AtomicFetchAnd", "AtomicFetchCLR", "AtomicFetchOr",
     "AtomicFetchXor", "AtomicFetchNeg", "CacheLineClear", "CacheLineClean", "CacheLineZero"};
   for (auto s : names) if (s == n) return true;
   return false;
@@ -185,6 +185,10 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
     S.data_reg[0] = D1 == D2 ? 31 : D1.Idx(); S.data_reg[1] = D2.Idx(); // the handler encodes a duplicate as xzr
     break;
   }
+  case IROps::OP_ATOMICSWAP: {   // memory xchg: `swpal Rs, Rt, [Rn]` (SupportsAtomics), nothing written if it faults
+    S.kind = FEXC_SITE_SWAP; S.width = Size; S.intent = 1;
+    break;
+  }
   default:
     Record = false;
     if (FexcIsNzcvWriter(Name) || (fexc_slice1 && IR::ImplicitFlagClobber(IROp->Op))) FexcNzcvWritten = true;
@@ -209,6 +213,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
     // The transfer register(s) actually encoded (e.g. a push of the base register stores a TMP copy in the default profile).
     S.data_reg[0] = uint8_t(w & 31);
     if (((w >> 27) & 7) == 5) S.data_reg[1] = uint8_t((w >> 10) & 31);
+    if (S.kind == FEXC_SITE_SWAP) S.data_reg[1] = uint8_t((w >> 16) & 31);   // Rs
     const FexcAddr A = FexcDecodeAddr(w);
     if (A.imm_form) { S.imm = A.imm; S.index_reg = 0xff; S.extend = 0; S.shift = 0; S.writeback = A.wb; S.writeback_delta = A.delta; }
     break;
@@ -228,7 +233,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
   }
   if (S.kind == FEXC_SITE_PUSH_PAIR || S.kind == FEXC_SITE_POP_PAIR) FexcPendingFused.push_back(size_t(Index));
   if (S.kind == FEXC_SITE_STORE || S.kind == FEXC_SITE_STORE_PAIR || S.kind == FEXC_SITE_PUSH || S.kind == FEXC_SITE_PUSH_PAIR ||
-      S.kind == FEXC_SITE_OTHER) FexcStoreSeen = true;
+      S.kind == FEXC_SITE_OTHER || S.kind == FEXC_SITE_SWAP) FexcStoreSeen = true;
   fexc_sites.push_back(S);
 }
 
@@ -322,6 +327,9 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
     break;
   }
   case IROps::OP_POP: { const auto Op = IROp->C<IR::IROp_Pop>(); Addr = &Op->InoutAddr; W = IR::OpSizeToSize(Op->Size); break; }
+  // Memory xchg: the guard only. No split check: an operand crossing 16 bytes (a page included) takes an alignment fault
+  // at the swap itself, before any effect (LSE2), which the runtime stops as unsupported.
+  case IROps::OP_ATOMICSWAP: Addr = &IROp->C<IR::IROp_AtomicSwap>()->Addr; break;
   case IROps::OP_UDIV: case IROps::OP_DIV: FexcDivCheck(IROp); return;
   default: return;
   }
