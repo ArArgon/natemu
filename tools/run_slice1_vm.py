@@ -7,9 +7,8 @@ Builds and signs the release host and runtime, then for each program writes a de
 (`natemu-host RUNTIME run-program`), runs it and compares the final state with the expected
 QEMU result through `ref.compare`. Defaults: fixtures/slice1/{programs,expected}.json. Nothing is
 keyed by program name. A program is "unsupported" when execution stops at a declared limit of the
-slice before its end: an instruction it cannot compile (fexc `unsupported_form`, e.g. memory xchg), or a
-store to a page the running block was translated from (`unsupported_smc`; this includes data stores to
-the code's own page, which the reference layout allows). Every other stop before the end, and every
+slice before its end: an instruction it cannot compile (fexc `unsupported_form`, e.g. memory xchg; stores
+to the code's own page stopped `unsupported_smc` until S2e and now run). Every other stop before the end, and every
 difference, is a failure. Independent page checks: a dirty page is
 accessed, every page whose bytes changed is dirty, the code pages are accessed.
 Writes DIR/results.json; exit status 1 on any failure."""
@@ -34,10 +33,8 @@ def description(p):
     return '\n'.join(lines) + '\n'
 
 def declared_limit(vm):
-    """The slice's declared limits: an instruction it cannot compile, and a store to a page a running block
-    was translated from (translated pages stay read-only; any data store to the code's own page stops)."""
+    """The slice's declared limit: an instruction it cannot compile."""
     if vm['stop'] == 'no_code' and vm['reason'] == 'unsupported_form': return 'unsupported_form'
-    if vm['stop'] == 'resident' and vm['reason'].startswith('unsupported_smc'): return 'unsupported_smc'
     return None
 
 def page_checks(p, vm):

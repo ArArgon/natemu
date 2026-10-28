@@ -3,7 +3,10 @@
 //! place it, enter it from the state bank, take exits the fast dispatcher
 //! (`gates.S` `dispatch_fast`) cannot resolve back into the bank, and serve
 //! shadow misses at the recorded access sites of the block holding the faulting
-//! PC by walking the guest tables and retrying the same instruction. Literal exits
+//! PC by walking the guest tables and retrying the same instruction. A write to a
+//! page holding translations drops that page's blocks first, or, when the running
+//! block came from that page, runs the writing instruction alone in the slot
+//! (self-modifying code, [`code_written`]). Literal exits
 //! enter the linker (`gates.S` `link_exit`), which finds their target the same way
 //! and links the exit to it. Also the 128/64 division helpers admitted code calls
 //! through the frame.
@@ -157,9 +160,7 @@ unsafe fn dispatch(mut s: State) -> ! {
 /// The block for `s.cpu.rip`: from the cache (L2; L1 was probed by the fast dispatcher), else asks the host for it and
 /// places it. Pending invalidations are taken first. Either may flush the cache (`s.generation`).
 unsafe fn find(s: &mut State) -> &'static Block {
-    if cache::drain() {
-        flush(s);
-    }
+    take_invalidations(s);
     let context = s.cpu.code_context();
     cache::select_l1(context);
     let block = match cache::lookup(s.cpu.rip, context) {
@@ -193,7 +194,8 @@ unsafe fn linker(frame: &NativeFrame) -> ! {
         let generation = s.generation;
         let target = find(&mut s);
         match source {
-            Some(_) if s.generation != generation => s.stale_links += 1,
+            // Flushed, or its page invalidated (queued), while the target was found.
+            Some(source) if s.generation != generation || source.flags & cache::DEAD != 0 => s.stale_links += 1,
             Some(source) => match cache::link(source, target) {
                 cache::Link::Linked(n) => s.links += n,
                 cache::Link::Full => s.full_links += 1,
@@ -208,30 +210,7 @@ unsafe fn linker(frame: &NativeFrame) -> ! {
 /// A miss: the host compiles and admits the block at `s.cpu.rip` into staging; place it (flushing a full cache
 /// first) and keep its source pages read-only.
 unsafe fn translate_block(s: &mut State, context: [u64; 2]) -> &'static Block {
-    unsafe {
-        s.request = REQUEST_TRANSLATE;
-        s.reply = NONE;
-        write_record(record(), *s);
-        asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
-        *s = load();
-    }
-    // The host may have written guest RAM while serving the request (A bits of the fetch walk).
-    if cache::drain() {
-        flush(s);
-    }
-    let h = staged();
-    let table_end = (h.sites_offset as usize).checked_add(h.sites_count as usize * size_of::<Site>());
-    if s.reply != REPLY_ADMITTED
-        || h.guest_rip != s.cpu.rip
-        || h.code_size as usize > natemu_abi::execution::cache::MAX_BLOCK_BYTES
-        || h.code_offset as usize + h.code_size as usize > STAGING_BYTES
-        || table_end.is_none_or(|end| end > STAGING_BYTES)
-        // Host-supplied link points name words the linker may rewrite: each whole exit (4 words) inside the code.
-        || s.link_points.iter().any(|p| p.offset != 0 && (p.offset % 4 != 0 || u64::from(p.offset) + 16 > u64::from(h.code_size)))
-    {
-        halt(*s, stop::BAD_REPLY)
-    }
-    s.request = NONE;
+    let h = unsafe { request(s, REQUEST_TRANSLATE) };
     s.requests += 1;
     let staging = STAGING_VA as *const u8;
     let block = match cache::place(&h, staging, context, s.source_gpa, s.link_points) {
@@ -248,6 +227,43 @@ unsafe fn translate_block(s: &mut State, context: [u64; 2]) -> &'static Block {
         }
     }
     block
+}
+
+/// Asks the host for code at `s.cpu.rip` (`kind`: a block, or one instruction for the slot) and checks the reply staged.
+unsafe fn request(s: &mut State, kind: u64) -> Header {
+    unsafe {
+        s.request = kind;
+        s.reply = NONE;
+        write_record(record(), *s);
+        asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
+        *s = load();
+    }
+    // The host may have written guest RAM while serving the request (A bits of the fetch walk).
+    take_invalidations(s);
+    let h = staged();
+    let table_end = (h.sites_offset as usize).checked_add(h.sites_count as usize * size_of::<Site>());
+    if s.reply != REPLY_ADMITTED
+        || h.guest_rip != s.cpu.rip
+        || h.code_size as usize > natemu_abi::execution::cache::MAX_BLOCK_BYTES
+        || h.code_offset as usize + h.code_size as usize > STAGING_BYTES
+        || table_end.is_none_or(|end| end > STAGING_BYTES)
+        // Host-supplied link points name words the linker may rewrite: each whole exit (4 words) inside the code.
+        || s.link_points.iter().any(|p| p.offset != 0 && (p.offset % 4 != 0 || u64::from(p.offset) + 16 > u64::from(h.code_size)))
+    {
+        halt(*s, stop::BAD_REPLY)
+    }
+    s.request = NONE;
+    h
+}
+
+/// Applies this vCPU's queued invalidations (host writes to guest RAM while it was stopped flush; listed pages drop
+/// their blocks).
+fn take_invalidations(s: &mut State) {
+    match cache::drain() {
+        Some(true) => flush(s),
+        Some(false) => {}
+        None => halt(*s, stop::BAD_LINK),
+    }
 }
 
 /// Drops every block (capacity, or an invalidation request), with nothing generated live and the state banked: first
@@ -320,14 +336,47 @@ fn bank(cpu: &mut Cpu, f: &NativeFrame, nzcv: u64, cf_inverted: bool) {
 /// GPRs and PF/AF in their static registers, NZCV in PSTATE or, for
 /// `nzcv=frame` sites, in the frame's pre-NZCV slot. No IDT delivery yet.
 fn guest_fault(mut s: State, f: &NativeFrame, b: &Block, site: &Site, [vector, cr2, error]: [u64; 3]) -> ! {
+    bank_at(&mut s, f, b, site);
+    s.fault = [vector, cr2, error, s.cpu.rip];
+    halt(s, stop::GUEST_FAULT)
+}
+/// Banks the exact state at the start of `site`'s guest instruction in `b` (see [`guest_fault`]).
+fn bank_at(s: &mut State, f: &NativeFrame, b: &Block, site: &Site) {
     let nzcv = match site.nzcv {
         object::NZCV_FRAME => unsafe { ((FRAME_VA + frame::PRE_NZCV as u64) as *const u32).read_volatile() as u64 },
         _ => f.nzcv,
     };
     bank(&mut s.cpu, f, nzcv, site.cf_inverted != 0);
     s.cpu.rip = b.rip.wrapping_add(site.guest_offset as u64);
-    s.fault = [vector, cr2, error, s.cpu.rip];
-    halt(s, stop::GUEST_FAULT)
+}
+
+/// Self-modifying code: the instruction at `site` of `b` writes `gpa`'s page (a store, a split store or its walk's
+/// A/D update), which holds translations. If `b` was translated from that page it must not run past the instruction
+/// (whose store may change bytes after it in `b`): the instruction is stepped ([`step`]) instead. Otherwise the
+/// page's blocks are invalidated (none of them is running) and the write proceeds. The step block itself never
+/// steps: it holds one instruction, already fetched, so its own writes simply invalidate (this ends the step: no loop).
+fn code_written(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, gpa: u64) {
+    if b.flags & cache::STEP == 0 && b.source_gpa.iter().any(|&g| g != u64::MAX && g >> 12 == gpa >> 12) {
+        step(*s, f, b, site)
+    }
+    match cache::invalidate(gpa) {
+        Some(n) => (s.invalidations, s.unlinks) = (s.invalidations + 1, s.unlinks + n),
+        None => halt(*s, stop::BAD_LINK),
+    }
+}
+/// Runs the instruction at `site` of `b` alone: banks the exact state at its start (a split store in progress is
+/// dropped: it wrote nothing yet) and enters it as an uncached one-instruction block in the slot, which marks no
+/// source page. Its write then takes [`code_written`]'s invalidation path and completes; its exit goes to the next
+/// instruction, which the next miss compiles from the new bytes (SDM vol. 3, "Handling Self- and Cross-Modifying Code").
+fn step(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
+    bank_at(&mut s, f, b, site);
+    s.steps += 1;
+    let h = unsafe { request(&mut s, REQUEST_STEP) };
+    let context = s.cpu.code_context();
+    match cache::place_step(&h, STAGING_VA as *const u8, context, s.source_gpa, s.link_points) {
+        Some(block) => unsafe { enter(s, block) },
+        None => halt(s, stop::BAD_REPLY),
+    }
 }
 /// #GP(0), or #SS(0) for a stack-segment access: a non-canonical address.
 fn noncanonical(site: &Site) -> [u64; 3] {
@@ -357,33 +406,39 @@ fn pages(address: u64, width: u64) -> Option<[Option<u64>; 2]> {
         .then(|| [Some(address), ((last ^ address) >> 12 != 0).then_some(last & !4095)])
 }
 
-/// The walker's A/D writes: refused on a translated page (as the guest's own stores are).
-struct CodePageWrites(bool);
+/// The walker's A/D writes: the first to a translated page is refused (and recorded), as the guest's own stores are.
+struct CodePageWrites(Option<u64>);
 impl Observer for CodePageWrites {
     fn write(&mut self, gpa: u64, _: u64, _: u64) -> bool {
-        self.0 |= cache::translated(gpa);
-        !self.0
+        if self.0.is_none() && cache::translated(gpa) {
+            self.0 = Some(gpa);
+        }
+        self.0.is_none()
     }
 }
 
 /// Walks `va` with `access` for the guest instruction at `site` of `b` and shadows the page; a guest
 /// fault stops with the precise state. Returns the guest-physical address of `va`. Translated pages
-/// are shadowed read-only whatever the walk grants; a write to one stops `unsupported_smc` (until SMC
-/// invalidation exists).
+/// are shadowed read-only whatever the walk grants; a write to one, or an A/D update in one, takes
+/// [`code_written`] first (which may step the instruction instead of returning).
 fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, access: Access) -> u64 {
     let Some(control) = s.cpu.control() else {
         halt(*s, stop::UNSUPPORTED_MODE)
     };
-    let mut tables = GuestTables::observed(RAM, CodePageWrites(false));
-    let walk = paging::walk(&mut tables, control, va, access);
-    if tables.observer.0 {
-        halt(*s, stop::UNSUPPORTED_SMC)
-    }
+    // Each refused A/D write invalidates its page (one vCPU: its bit clears), so the walk is repeated at most once per page.
+    let walk = loop {
+        let mut tables = GuestTables::observed(RAM, CodePageWrites(None));
+        let walk = paging::walk(&mut tables, control, va, access);
+        match tables.observer.0 {
+            None => break walk,
+            Some(gpa) => code_written(s, f, b, site, gpa),
+        }
+    };
     match walk {
         Ok(t) if t.wb => {
             let writable = access == Access::Write && t.writable && t.dirty;
             if writable && cache::translated(t.gpa) {
-                halt(*s, stop::UNSUPPORTED_SMC)
+                code_written(s, f, b, site, t.gpa);
             }
             let old = tables::descriptor(va);
             if writable && old & 1 != 0 && old & READ_ONLY != 0 {
@@ -419,6 +474,12 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
         let site = all[i];
         if spsr & 15 != 4 {
             halt(s, stop::SITE_MISMATCH)
+        }
+        // Invalidations queued while `b` ran (a resident entry takes them): if they dropped `b`, it must not run on.
+        let generation = s.generation;
+        take_invalidations(&mut s);
+        if b.flags & cache::STEP == 0 && (s.generation != generation || b.flags & cache::DEAD != 0) {
+            step(s, f, b, &site)
         }
         match site.kind {
             object::kind::GUARD | object::kind::SPLIT | object::kind::DIVIDE => {

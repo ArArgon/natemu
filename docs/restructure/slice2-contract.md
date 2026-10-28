@@ -43,7 +43,7 @@ it. On a hit, the block (found by ELR) must not run past the instruction. The re
 the precise state at the start of that instruction. It then runs that one instruction as an uncached `max_instructions = 1`
 block in the slot. The step block does not mark its source pages (else the store faults forever). The next miss recompiles.
 The same single-step rule applies when an invalidation drained at a resident entry hits the running block. This replaces the
-`unsupported_smc` stop. Until S2e, however, S2b's bitmap protection still stops with `unsupported_smc`. (ponytail: resets
+`unsupported_smc` stop (S2e). (ponytail: resets
 and scans; a reverse map if profiles show it.) Known cliff: data written on a loop's own code page costs a fault, a step and
 a recompile on every iteration. **Fault retries.** In linked loops native PCs repeat legitimately, so the slice-1
 no-progress test (same PC, FAR and descriptor as the last retry) gains the shadow-reset generation. An eviction, a
@@ -175,6 +175,14 @@ with K > 1.
 - **S2e, SMC invalidation and single-step.** *Check:* a write to another block's page retranslates; a store or a split store
   into the running block's next instruction runs the new bytes; the mixed code/data loop terminates correctly; FEX
   `SelfModifyingCode/` passes.
+  *Built (Oct 27):* runtime `code_written` (the hit test, shared by stores, split stores and walker A/D writes), `step`
+  (request `REQUEST_STEP`, host compiles with `max_instructions = 1`; record at lookup `STEP_RECORD`, code in the slot),
+  `cache::invalidate` (marks blocks `DEAD`: L2 tombstone, L1 entry cleared, links into and out of them undone and their
+  records dropped, page bit cleared) and per-page queue entries. The step block's own writes always invalidate and
+  complete (one already-fetched instruction), which ends the step. Checks in `tools/run_slice2_probes.py`: SMC programs and
+  FEX's three tests run as is under pinned QEMU (the bytes cross-check is skipped for them). Not exercised: walker A/D
+  writes into a code page (the driver cannot put tables on code pages) and invalidations queued while a block runs (no
+  producer until slice 3).
 - **S2f, FEX ASM tests through the program driver.** *Check:* counts with reasons; none unexplained.
 - **S2g, measurement and attribution.** *Check:* the §4 table and attribution reported against the targets; the phase ends
   here.

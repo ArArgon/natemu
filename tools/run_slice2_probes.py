@@ -19,7 +19,10 @@ hot loop at N and 2N iterations makes the same resident entries and dispatcher h
 linker; every run self-checks its link points (the driver). A non-terminating loop must be stopped by the watchdog. Run-time tamper checks
 (driver `--tamper`, `--tamper-after`): a link point reported outside its block is refused (`bad_reply`); a corrupted linked
 branch, target literal or link record makes the next flush halt (`bad_link`) and is refused by the host's self-check
-(`links_check`). Nothing is keyed by probe name; expected values come only from QEMU. Writes DIR/probes.json; exit status 1 on any failure."""
+(`links_check`). Self-modifying code (S2e): stores into the running block (next instruction, an already executed one in a
+loop, page-crossing), into another block's page, data on a loop's own code page, and FEX's upstream SelfModifyingCode tests
+must reach their end with QEMU's state (QEMU runs the self-modifying program itself). Nothing is keyed by probe name;
+expected values come only from QEMU. Writes DIR/probes.json; exit status 1 on any failure."""
 import argparse, json, pathlib, random, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -151,6 +154,69 @@ PROBES = [
     # which ref.py's disassembly cross-check refuses.)
     {'name': 'long-body', 'gpr': gprs(), 'memory': [], 'main': [('loop', 'ecx', 3, alu_body(7, 70))]},
 ]
+FEX_SMC = ROOT / 'third_party' / 'FEX' / 'unittests' / 'ASM' / 'SelfModifyingCode'
+# Self-modifying programs (assembly, extra memory regions). Expected values come only from QEMU; the comments say what
+# the SDM rule ("Handling Self- and Cross-Modifying Code") makes them compute.
+SMC = [
+    # A data store to the running block's own page (no translated byte changes).
+    ('smc-own-page', 'mov dword ptr [rip + 0x7fa], eax', [{'addr': CODE + 0x800, 'data': '00' * 0x10}]),
+    # A store into the next instruction of the running block: its new immediate (5) is executed.
+    ('smc-next-insn', 'mov byte ptr [rip + 1f + 3], 5\n1: add rax, 1\nadd rbx, rax', []),
+    # A page-crossing store (8 bytes over CODE + 0x1000) into the running block's next two instructions.
+    ('smc-split-next', 'movabs rdx, 0x20c0834810c08348\njmp 1f\n.org 0xff5, 0xcc\n1: mov qword ptr [rip + 2f], rdx\n'
+                       '2: add rax, 1\nadd rax, 2\nadd rbx, rax', []),
+    # A store into another block (a function on the next page), which then runs retranslated: adds 0x11, 3, 2.
+    ('smc-other-page', 'mov ecx, 3\n1: call f\nmov byte ptr [rip + f + 3], cl\ndec ecx\njnz 1b\njmp 2f\n'
+                       '.org 0x1000, 0xcc\nf: add rax, 0x11\nret\n2:', [{'addr': STACK, 'data': '00' * 0x1000}]),
+    # A page-crossing store from a block on a third page into a function spanning CODE + 0x1000: adds 3, then 0x30.
+    ('smc-split-other', 'mov ecx, 2\nmovabs rdx, 0x20c0834810c08348\n1: call f\njmp far\nback: dec ecx\njnz 1b\njmp 2f\n'
+                        '.org 0xffc, 0xcc\nf: add rax, 1\nadd rax, 2\nret\n.org 0x2100, 0xcc\nfar: mov qword ptr [rip + f], rdx\n'
+                        'jmp back\n2:', [{'addr': STACK, 'data': '00' * 0x1000}]),
+    # A store into an already executed instruction of the running loop body: the next iteration adds 4, 3, 2 (after 1).
+    ('smc-earlier-loop', 'mov ecx, 4\n1: add rax, 1\nmov byte ptr [rip + 1b + 3], cl\ndec ecx\njnz 1b', []),
+    # Code rewritten every iteration, each time just before it runs: rax = (rax + ecx) * 3 for ecx = 5..1.
+    ('smc-patch-loop', 'mov ecx, 5\n1: mov byte ptr [rip + 2f + 3], cl\n2: add rax, 0x7f\nimul rax, rax, 3\ndec ecx\njnz 1b', []),
+    # Data on the loop's own code page, written every iteration (the known cliff: a step and a recompile each time).
+    ('smc-data-loop', f'mov esi, {CODE + 0x800:#x}\nmov ecx, 50\n1: add qword ptr [rsi], rcx\nadd rax, rcx\ndec ecx\njnz 1b',
+     [{'addr': CODE + 0x800, 'data': '00' * 8}]),
+]
+
+
+def writable_code(program):
+    """Memory regions holding the program's own code bytes on each code page no region of the program touches: they make
+    those pages writable in the VM (the driver maps a page with a region writable, executable if code is on it; a second
+    region on a code page would make it non-executable)."""
+    rip, code = ref.num(program['rip']), bytes.fromhex(program['code'])
+    touched = {a >> 12 for m in program['memory'] for a in range(ref.num(m['addr']), ref.num(m['addr']) + len(m['data']) // 2)}
+    pages = sorted({a >> 12 for a in range(rip, rip + len(code))} - touched)
+    spans = [(max(rip, p << 12), min(rip + len(code), (p + 1) << 12)) for p in pages]
+    return [{'addr': s, 'data': code[s - rip:e - rip].hex()} for s, e in spans]
+
+
+def smc_programs():
+    """[(VM program, QEMU reference program, FEX's expected GPRs)]: the SMC probes above and FEX's upstream
+    SelfModifyingCode tests (assembled with nasm at 0x10000; their final `hlt` dropped, so they end where their bytes do;
+    stack at 0xe0001000 as FEX's DifferentBlock sets it)."""
+    out = []
+    def add(name, code, rip, memory, gpr, expected):
+        program = {'name': name, 'code': code.hex(), 'rip': rip, 'gpr': gpr, 'rflags': 0, 'memory': memory}
+        out.append((program, {**program, 'insns': [{'op': 'mov', 'width': 64}]}, expected))
+    for name, text, memory in SMC:
+        add(name, ref.assemble(text), CODE, memory, gprs(rsp=STACK + 0x800), {})
+    for test in sorted(FEX_SMC.glob('*.asm')):
+        source = test.read_text()
+        config = json.loads(source.split('%ifdef CONFIG', 1)[1].split('%endif', 1)[0])
+        with __import__('tempfile').TemporaryDirectory() as d:
+            src, binary = pathlib.Path(d, 'a.asm'), pathlib.Path(d, 'a.bin')
+            src.write_text('BITS 64\norg 0x10000\n' + source)
+            subprocess.run(['nasm', '-f', 'bin', '-o', binary, src], check=True)
+            code = binary.read_bytes()
+        assert code[-1] == 0xf4, f'{test.name} does not end with hlt'
+        expected = {r.lower(): int(v, 0) for r, v in config['RegData'].items()}
+        add('fex-smc-' + test.stem, code[:-1], 0x10000, [{'addr': 0xe0000f00, 'data': '00' * 0x100}], [0] * 16, expected)
+    return out
+
+
 # (probe, extra run-program arguments, expect repeated flushes: True, none: False, either: None)
 RUNS = [(p['name'], args, False) for p in PROBES for args in ([], ['1'], ['2'])]
 def main():
@@ -286,19 +352,32 @@ def main():
     out.append({'name': 'spin', 'stop': state and state['stop'], 'stats': state and state['stats'], 'stderr': err})
     print(f"spin --watchdog-ms 300: {'match' if ok else 'fail'} {state and state['stop']} {state and state['stats']}")
 
-    # Stores to a page code was translated from stop (`unsupported_smc`) until SMC invalidation exists, whether the
-    # page holds the running block or only an earlier one. A memory region at CODE + 0x800 (past the first block's
-    # code) makes the first code page writable; the store writes there.
-    for name, text in [('smc-own-page', 'mov dword ptr [rip + 0x7fa], eax'),
-                       ('smc-earlier-page', 'add rax, 1\njmp 1f\n.fill 4096, 1, 0xcc\n1: mov dword ptr [rip - 0x80f], eax')]:
-        code = ref.assemble(text)
-        program = {'name': name, 'code': code.hex(), 'rip': CODE, 'gpr': gprs(), 'rflags': 0,
-                   'memory': [{'addr': CODE + 0x800, 'data': '00' * 0x10}]}
-        state, err = run(name, program, [])
-        ok = state is not None and state['stop'] == 'resident' and state['reason'].startswith('unsupported_smc')
-        failures += not ok
-        out.append({'name': name, 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
-        print(f"{name}: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']}")
+    # Self-modifying code (S2e). Each program runs in the VM with its code pages writable (regions over the code holding
+    # the same bytes, not compared: `writable_code`) and under pinned QEMU as is (its code is writable there): QEMU translates the
+    # rewritten bytes, so ref.py's check that it translated exactly the supplied bytes cannot hold and is skipped for
+    # these programs. Their last flag writers define all six arithmetic flags (or none is written), so all are compared.
+    smc = smc_programs()
+    saved = ref.check_annotations
+    ref.check_annotations = lambda p, log: []
+    try:
+        smc_results, _ = ref.run_programs([r for _, r, _ in smc], a.out / 'ref-smc', qemu)
+    finally:
+        ref.check_annotations = saved
+    for (program, reference, expected_gpr), result in zip(smc, smc_results):
+        end = ref.num(program['rip']) + len(program['code']) // 2
+        for args in ([], ['1'], ['2']):
+            cover = writable_code(program)
+            state, err = run(program['name'], {**program, 'memory': cover + program['memory']}, args)
+            diffs = [f'host error: {err}'] if state is None else ref.compare(result, [ref.num(v) for v in state['gpr']],
+                     ref.num(state['rflags']), ref.num(state['rip']), state['memory'][len(cover):])
+            if state is not None and (state['stop'] != 'reached' or ref.num(state['rip']) != end):
+                diffs.insert(0, f"stopped {state['stop']} {state['reason']} at {state['rip']}, end {end:#x}")
+            # FEX's expected registers (RegData): a second reference.
+            diffs += [f'{r}: FEX expects {v:#x}, qemu {result["qemu"]["gpr"][ref.REGS.index(r)]}'
+                      for r, v in expected_gpr.items() if ref.num(result['qemu']['gpr'][ref.REGS.index(r)]) != v]
+            failures += bool(diffs)
+            out.append({'name': program['name'], 'args': args, 'stats': state and state['stats'], 'diffs': diffs, 'stderr': err})
+            print(f"{program['name']} {' '.join(args)}: {'fail' if diffs else 'match'} {state and state['stats']} {'; '.join(diffs)[:300]}")
     (a.out / 'probes.json').write_text(json.dumps(out, indent=1) + '\n')
     print(f'{len(out) - failures} match, {failures} fail')
     sys.exit(1 if failures else 0)

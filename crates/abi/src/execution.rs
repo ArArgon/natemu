@@ -94,9 +94,12 @@ pub mod cache {
     pub const INDEX: usize = 0x12_0000;
     /// At most half of L2, so probes stay short.
     pub const MAX_BLOCKS: usize = L2_ENTRIES / 2;
-    /// Link records ([`LinkRecord`]), one per patched link point, in patch order; a full area means no new links.
+    /// Link records ([`LinkRecord`]), one per patched link point; a full area means no new links.
     pub const LINKS: usize = 0x14_0000;
     pub const MAX_LINKS: usize = 32 * 1024;
+    /// The single-step block's record (its code is in the slot, `SLOT_VA`) and its access sites after it.
+    pub const STEP_RECORD: usize = 0x1c_0000;
+    pub const STEP_RECORD_BYTES: usize = 0x4_0000;
 
     /// Global area layout: one code-page mask byte per guest-physical page (bit v: vCPU v holds translations from
     /// the page), then one [`Queue`] per vCPU.
@@ -135,14 +138,20 @@ pub mod cache {
         pub guest_bytes: u32,
         /// Its position in `INDEX`.
         pub number: u32,
-        pub reserved: u32,
+        /// [`DEAD`], [`STEP`].
+        pub flags: u32,
         /// Its literal exits as admitted (`offset` 0 = unused).
         pub links: [super::LinkPoint; super::MAX_LINK_POINTS],
     }
+    /// `Block::flags`: invalidated (a source page was written): out of L1 and L2, no link into or out of it, never run
+    /// again; its space is reclaimed at the next flush.
+    pub const DEAD: u32 = 1;
+    /// The uncached single-step block, in the slot (not in `INDEX`, L1 or L2; never linked; no source page marked).
+    pub const STEP: u32 = 2;
     impl Block {
         /// Its `JITCodeHeader` in the executable alias (what its entry prologue stores in `InlineJITBlockHeader`).
         pub fn code_va(&self) -> u64 {
-            CODE_VA + u64::from(self.code)
+            if self.flags & STEP != 0 { super::SLOT_VA } else { CODE_VA + u64::from(self.code) }
         }
         pub fn entry(&self) -> u64 {
             self.code_va() + u64::from(super::ENTRY_OFFSET)
@@ -186,7 +195,8 @@ pub mod cache {
     const _: () = assert!(WRITABLE + crate::execution::GUEST_PAGES / 8 <= L1);
     const _: () = assert!(L1 + L1_ENTRIES * 16 <= L2 && L2 + L2_ENTRIES * 16 <= INDEX);
     const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= LINKS);
-    const _: () = assert!(LINKS + MAX_LINKS * core::mem::size_of::<LinkRecord>() <= LOOKUP_BYTES);
+    const _: () = assert!(LINKS + MAX_LINKS * core::mem::size_of::<LinkRecord>() <= STEP_RECORD);
+    const _: () = assert!(STEP_RECORD + STEP_RECORD_BYTES <= LOOKUP_BYTES && STEP_RECORD % core::mem::align_of::<Block>() == 0);
     const _: () = assert!(CODE_PAGES + crate::execution::GUEST_PAGES <= QUEUES);
     const _: () = assert!(QUEUES + MAX_VCPUS * core::mem::size_of::<Queue>() <= GLOBAL_BYTES);
 }
@@ -344,6 +354,8 @@ pub fn guest_flags(rflags: u64, nzcv: u64, pf: u64, af: u64, cf_inverted: bool) 
 /// `State::request` / `State::reply`.
 pub const NONE: u64 = 0;
 pub const REQUEST_TRANSLATE: u64 = 1;
+/// Translate only the instruction at `cpu.rip` (`max_instructions = 1`) for the single-step slot.
+pub const REQUEST_STEP: u64 = 2;
 pub const REPLY_ADMITTED: u64 = 1;
 
 /// `State::stop`: why the resident stopped the VM (`hvc #0x49`).
@@ -359,8 +371,6 @@ pub mod stop {
     /// An x86 exception is due at a guest instruction boundary (`State::fault`; the bank holds the
     /// exact state at that instruction's start). Delivery through the IDT is later system work.
     pub const GUEST_FAULT: u64 = 5;
-    /// A write to a guest-physical page code was translated from (until per-page invalidation exists).
-    pub const UNSUPPORTED_SMC: u64 = 6;
     /// Shadow installation failed (capacity after eviction, memory outside guest RAM).
     pub const SHADOW: u64 = 7;
     /// The same abort recurred after its shadow was installed and left unchanged.
@@ -376,7 +386,6 @@ pub mod stop {
             UNKNOWN_ABORT => "unknown_abort",
             SITE_MISMATCH => "site_mismatch",
             GUEST_FAULT => "guest_fault",
-            UNSUPPORTED_SMC => "unsupported_smc",
             SHADOW => "shadow",
             NO_PROGRESS => "no_progress",
             BAD_LINK => "bad_link",
@@ -428,6 +437,10 @@ pub struct State {
     pub unlinks: u64,
     pub stale_links: u64,
     pub full_links: u64,
+    /// Writes to pages holding translations that invalidated the page's blocks (stores, split stores, walker A/D
+    /// updates, queued requests); instructions single-stepped because they wrote a page their own block came from.
+    pub invalidations: u64,
+    pub steps: u64,
 }
 impl State {
     pub const fn new(cpu: Cpu) -> Self {
@@ -456,6 +469,8 @@ impl State {
             unlinks: 0,
             stale_links: 0,
             full_links: 0,
+            invalidations: 0,
+            steps: 0,
         }
     }
 }

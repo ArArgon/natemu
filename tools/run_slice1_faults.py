@@ -27,8 +27,8 @@ access one byte (natemu policy, tools/fexc/README.md).
 
 The VM must stop with exactly that exception record (vector, CR2, error code, RIP = start of the faulting
 instruction), its GPRs, masked RFLAGS and memory equal to the QEMU prefix run (nothing later ran, no partial store),
-and the FEX frame intact. A stop at a declared slice limit before the expected fault (unsupported_form,
-unsupported_smc) is "unsupported". Writes DIR/faults.json; exit status 1 on any failure."""
+and the FEX frame intact. A stop at a declared slice limit before the expected fault (unsupported_form)
+is "unsupported". Writes DIR/faults.json; exit status 1 on any failure."""
 import argparse, json, pathlib, re, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent

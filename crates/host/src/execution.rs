@@ -2,7 +2,8 @@
 //! private address space (code cache areas included), and the service loop that
 //! answers the resident's translation requests, which arrive only on a cache miss:
 //! fetch the guest bytes at RIP through the guest walk, compile one block with fexc
-//! (`--profile slice1`, a persistent server), admit it and stage it. A watchdog
+//! (`--profile slice1`, a persistent server), admit it and stage it. A step request
+//! (self-modifying code) is the same with a one-instruction block. A watchdog
 //! stops a vCPU that runs too long without a host exit.
 use super::*;
 use crate::admission;
@@ -238,10 +239,11 @@ impl Compiler {
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
         Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), compiles: 0, hits: 0, tamper: None }
     }
-    /// The admitted block for `bytes` at `rip`, or fexc's end reason when it produced no code.
-    fn compile(&mut self, bytes: &[u8], rip: u64) -> Result<std::result::Result<admission::Admitted, String>> {
+    /// The admitted block for `bytes` at `rip` (only its first instruction if `step`), or fexc's end reason when it
+    /// produced no code.
+    fn compile(&mut self, bytes: &[u8], rip: u64, step: bool) -> Result<std::result::Result<admission::Admitted, String>> {
         let mut args = vec!["--profile".to_string(), "slice1".into(), "--rip".into(), format!("{rip:#x}")];
-        if let Some(n) = self.max_instructions {
+        if let Some(n) = if step { Some(1) } else { self.max_instructions } {
             args.extend(["--max-insts".into(), n.to_string()]);
         }
         for feature in admission::feature_overrides(self.supported) {
@@ -366,7 +368,7 @@ fn fetch_with(
 /// Host exits of one [`run`].
 #[derive(Default)]
 pub(crate) struct Requests {
-    /// Translation requests answered with a block, and the distinct RIPs among them.
+    /// Translation requests answered with a block, and the distinct RIPs among them (single-step requests not included).
     pub(crate) blocks: u64,
     pub(crate) rips: std::collections::HashSet<u64>,
     /// Test drivers only: called with the vCPU stopped, the block staged and the reply not yet written, until it returns
@@ -420,9 +422,11 @@ fn serve(vm: &Vm, compiler: &mut Compiler, stop_at: Option<u64>, requests: &mut 
             other => return Err(format!("unexpected HVC immediate {other:#x}")),
         }
         let mut state: State = vm.memory.read_record(exec::STATE_OFFSET);
-        if state.request != exec::REQUEST_TRANSLATE {
-            return Err("translation exit without a request".into());
-        }
+        let step = match state.request {
+            exec::REQUEST_TRANSLATE => false,
+            exec::REQUEST_STEP => true,
+            _ => return Err("translation exit without a request".into()),
+        };
         let rip = state.cpu.rip;
         if Some(rip) == stop_at {
             return Ok(Stop::Reached);
@@ -431,7 +435,7 @@ fn serve(vm: &Vm, compiler: &mut Compiler, stop_at: Option<u64>, requests: &mut 
             Ok(fetched) => fetched,
             Err(fault) => return Ok(Stop::FetchFault(fault)),
         };
-        let block = match compiler.compile(&bytes, rip)? {
+        let block = match compiler.compile(&bytes, rip, step)? {
             Ok(block) => block,
             Err(reason) => {
                 return Ok(match next_fault {
@@ -442,8 +446,10 @@ fn serve(vm: &Vm, compiler: &mut Compiler, stop_at: Option<u64>, requests: &mut 
             }
         };
         vm.memory.copy(exec::STAGING_OFFSET, &block.object);
-        requests.blocks += 1;
-        requests.rips.insert(rip);
+        if !step {
+            requests.blocks += 1;
+            requests.rips.insert(rip);
+        }
         state.source_gpa = [u64::MAX; 2];
         state.link_points = [exec::LinkPoint::NONE; exec::MAX_LINK_POINTS];
         state.link_points[..block.links.len()].copy_from_slice(&block.links);
@@ -471,14 +477,14 @@ mod tests {
         let Some(fexc) = std::env::var_os("FEXC") else { return };
         let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
         let code = [0x48, 0x01, 0xd8, 0xc3];
-        let first = c.compile(&code, 0x1000).unwrap().unwrap().object;
+        let first = c.compile(&code, 0x1000, false).unwrap().unwrap().object;
         assert_eq!((c.compiles, c.hits), (1, 0));
-        assert_eq!(c.compile(&code, 0x1000).unwrap().unwrap().object, first);
+        assert_eq!(c.compile(&code, 0x1000, false).unwrap().unwrap().object, first);
         assert_eq!((c.compiles, c.hits), (1, 1));
-        c.compile(&code, 0x2000).unwrap().unwrap();
-        c.compile(&[0x48, 0x29, 0xd8, 0xc3], 0x1000).unwrap().unwrap();
+        c.compile(&code, 0x2000, false).unwrap().unwrap();
+        c.compile(&[0x48, 0x29, 0xd8, 0xc3], 0x1000, false).unwrap().unwrap();
         c.max_instructions = Some(1);
-        c.compile(&code, 0x1000).unwrap().unwrap();
+        c.compile(&code, 0x1000, false).unwrap().unwrap();
         assert_eq!((c.compiles, c.hits), (4, 1));
     }
 

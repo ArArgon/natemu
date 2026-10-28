@@ -3,16 +3,18 @@
 //! range, access sites, guest-physical source pages) in the metadata arena, lookup
 //! by (guest RIP, context) through L1 and L2, native PC → block, whole-cache
 //! flush, block linking (patching a link point into a branch to its target's entry
-//! and restoring it), the code-page masks shared between owners and this vCPU's
-//! invalidation queue. The fast dispatcher (`gates.S` `dispatch_fast`) probes L1 directly.
+//! and restoring it), per-page invalidation of the blocks translated from a written
+//! page, the uncached single-step block in the slot, the code-page masks shared
+//! between owners and this vCPU's invalidation queue. The fast dispatcher
+//! (`gates.S` `dispatch_fast`) probes L1 directly.
 use super::*;
 use natemu_abi::code_object::{Header, Site};
 use core::mem::align_of;
 use natemu_abi::execution::{
-    GUEST_PAGES, LinkPoint, MAX_LINK_POINTS,
+    GUEST_PAGES, LinkPoint, MAX_LINK_POINTS, SLOT_BYTES, SLOT_VA, SLOT_WRITE_VA,
     cache::{self as area, Control, LinkRecord, Queue},
 };
-pub use natemu_abi::execution::cache::Block;
+pub use natemu_abi::execution::cache::{Block, DEAD, STEP};
 
 /// This owner's vCPU: its bit in the code-page masks and its queue.
 // ponytail: one vCPU; slice 3 reads it from the owner's record.
@@ -43,8 +45,15 @@ fn l2(i: usize) -> *mut [u64; 2] {
 fn index(n: usize) -> *mut u32 {
     lookup_area::<u32>(area::INDEX).wrapping_add(n)
 }
+fn block_ptr(n: usize) -> *mut Block {
+    unsafe { (area::META_VA + u64::from(*index(n))) as *mut Block }
+}
 fn block(n: usize) -> &'static Block {
-    unsafe { &*((area::META_VA + u64::from(*index(n))) as *const Block) }
+    unsafe { &*block_ptr(n) }
+}
+/// The single-step block's record (zero, so holding no code, until the first step).
+fn step_block() -> &'static Block {
+    unsafe { &*lookup_area::<Block>(area::STEP_RECORD) }
 }
 fn record(i: usize) -> *mut LinkRecord {
     lookup_area::<LinkRecord>(area::LINKS).wrapping_add(i)
@@ -104,7 +113,7 @@ pub fn lookup(rip: u64, context: [u64; 2]) -> Option<&'static Block> {
             return None;
         }
         let b = block(number as usize - 1);
-        if key == rip && b.rip == rip && b.context == context {
+        if key == rip && b.rip == rip && b.context == context && b.flags & DEAD == 0 {
             return Some(b);
         }
         i = (i + 1) & (area::L2_ENTRIES - 1);
@@ -139,7 +148,7 @@ pub fn place(
         sites_count: h.sites_count,
         guest_bytes: h.guest_bytes,
         number: c.blocks as u32,
-        reserved: 0,
+        flags: 0,
         links,
     };
     unsafe {
@@ -147,7 +156,7 @@ pub fn place(
         at.write(record);
         copy_record(at.add(1).cast(), object.add(h.sites_offset as usize), sites);
         copy_record((area::CODE_WRITE_VA + code) as *mut u8, object.add(h.code_offset as usize), h.code_size as usize);
-        synchronize_code(code, h.code_size as usize);
+        synchronize_code(area::CODE_WRITE_VA + code, area::CODE_VA + code, h.code_size as usize);
         let n = c.blocks as usize;
         index(n).write(meta as u32);
         let mut i = hash(record.rip, context);
@@ -160,22 +169,57 @@ pub fn place(
     }
 }
 
-/// Code written at `offset` through the writable alias becomes visible to instruction fetch through the executable one.
-fn synchronize_code(offset: u64, bytes: usize) {
+/// Places the admitted object at `object` as the single-step block in the slot: uncached (not in the index, L1 or L2,
+/// never linked) and marking no source page, so the write it steps through completes (it drops the page's blocks
+/// itself, see the runtime's `code_written`). `None` if it does not fit the slot or the record area.
+pub fn place_step(
+    h: &Header,
+    object: *const u8,
+    context: [u64; 2],
+    source_gpa: [u64; 2],
+    links: [LinkPoint; MAX_LINK_POINTS],
+) -> Option<&'static Block> {
+    let sites = size_of::<Site>() * h.sites_count as usize;
+    if size_of::<Block>() + sites > area::STEP_RECORD_BYTES || h.code_size as usize > SLOT_BYTES {
+        return None;
+    }
+    let record = Block {
+        rip: h.guest_rip,
+        context,
+        source_gpa,
+        code: 0,
+        code_size: h.code_size,
+        sites_count: h.sites_count,
+        guest_bytes: h.guest_bytes,
+        number: u32::MAX,
+        flags: STEP,
+        links,
+    };
+    unsafe {
+        let at = lookup_area::<Block>(area::STEP_RECORD);
+        at.write(record);
+        copy_record(at.add(1).cast(), object.add(h.sites_offset as usize), sites);
+        copy_record(SLOT_WRITE_VA as *mut u8, object.add(h.code_offset as usize), h.code_size as usize);
+        synchronize_code(SLOT_WRITE_VA, SLOT_VA, h.code_size as usize);
+        Some(&*at)
+    }
+}
+
+/// `bytes` of code written at `write` (a writable alias) become visible to instruction fetch at `exec` (its executable alias).
+fn synchronize_code(write: u64, exec: u64, bytes: usize) {
     unsafe {
         let ctr: u64;
         asm!("mrs {0}, ctr_el0", out(reg) ctr);
         let (dline, iline) = (4u64 << ((ctr >> 16) & 15), 4u64 << (ctr & 15));
-        let (start, end) = (offset, offset + bytes as u64);
-        let mut at = start & !(dline - 1);
-        while at < end {
-            asm!("dc cvau, {0}", in(reg) area::CODE_WRITE_VA + at);
+        let mut at = 0;
+        while at < bytes as u64 + (write & (dline - 1)) {
+            asm!("dc cvau, {0}", in(reg) (write & !(dline - 1)) + at);
             at += dline;
         }
         asm!("dsb ish");
-        at = start & !(iline - 1);
-        while at < end {
-            asm!("ic ivau, {0}", in(reg) area::CODE_VA + at);
+        at = 0;
+        while at < bytes as u64 + (exec & (iline - 1)) {
+            asm!("ic ivau, {0}", in(reg) (exec & !(iline - 1)) + at);
             at += iline;
         }
         asm!("dsb ish", "isb");
@@ -189,7 +233,7 @@ fn word(offset: u64) -> u32 {
 /// Rewrites one placed word and makes it visible to instruction fetch.
 fn rewrite(offset: u64, w: u32) {
     unsafe { ((area::CODE_WRITE_VA + offset) as *mut u32).write_volatile(w) };
-    synchronize_code(offset, 4);
+    synchronize_code(area::CODE_WRITE_VA + offset, area::CODE_VA + offset, 4);
 }
 /// `b` from code-area offset `from` to `to` (the area is at most 128 MiB, so every target is in range).
 fn branch(from: u64, to: u64) -> u32 {
@@ -208,7 +252,7 @@ fn unlinked(b: &Block, p: &LinkPoint) -> bool {
 
 /// The block whose `JITCodeHeader` is at `header`, the value its entry prologue stores in `InlineJITBlockHeader`.
 pub fn block_with_header(header: u64) -> Option<&'static Block> {
-    block_at(header).filter(|b| b.code_va() == header)
+    block_at(header).filter(|b| b.code_va() == header && b.flags & (DEAD | STEP) == 0)
 }
 
 pub enum Link {
@@ -249,23 +293,61 @@ pub fn link(source: &Block, target: &Block) -> Link {
     }
     Link::Linked(todo as u64)
 }
-/// Restores every linked point's original word and drops every record (the invalidation of all blocks at a flush;
-/// per-page invalidation arrives with S2e). `None` if a record does not describe its word (it is not left as is).
+/// Restores every linked point's original word and drops every record (the invalidation of all blocks at a flush).
+/// `None` if a record does not describe its word (it is not left as is).
 pub fn unlink_all() -> Option<u64> {
     let c = control();
     for i in 0..c.links as usize {
-        let r = unsafe { record(i).read() };
-        let (source, target) = (block(r.source as usize), block(r.target as usize));
-        let at = u64::from(source.code) + u64::from(r.offset);
-        let entry = u64::from(target.code) + u64::from(natemu_abi::execution::ENTRY_OFFSET);
-        if word(at) != branch(at, entry) {
-            return None;
-        }
-        rewrite(at, r.original);
+        unlink(unsafe { record(i).read() })?;
     }
     let n = c.links;
     c.links = 0;
     Some(n)
+}
+/// Restores the original word of the link point `r` describes, if it holds the branch `r` says.
+fn unlink(r: LinkRecord) -> Option<()> {
+    let (source, target) = (block(r.source as usize), block(r.target as usize));
+    let at = u64::from(source.code) + u64::from(r.offset);
+    let entry = u64::from(target.code) + u64::from(natemu_abi::execution::ENTRY_OFFSET);
+    (word(at) == branch(at, entry)).then(|| rewrite(at, r.original))
+}
+
+/// Invalidates every live block translated from `gpa`'s page (the page is about to be written): each leaves L1 and
+/// L2, every link into or out of it is undone and its record dropped, and it is marked dead. Then this vCPU's bit
+/// for the page is cleared. Returns the links undone; `None` if a record does not describe its word (as
+/// [`unlink_all`]).
+// ponytail: scans every block and record; a reverse map (page → blocks, block → records) if profiles show it.
+// Other vCPUs' bits need a shootdown (slice 3).
+pub fn invalidate(gpa: u64) -> Option<u64> {
+    let c = control();
+    let mut unlinked = 0;
+    for n in 0..c.blocks as usize {
+        let b = block(n);
+        if b.flags & DEAD != 0 || !b.source_gpa.iter().any(|&g| g != u64::MAX && g >> 12 == gpa >> 12) {
+            continue;
+        }
+        unsafe { (*block_ptr(n)).flags |= DEAD };
+        let slot = l1((b.rip & area::L1_MASK) as usize);
+        if unsafe { slot.read() } == [b.rip, b.entry()] {
+            unsafe { slot.write([(b.rip & area::L1_MASK) ^ 1, 0]) };
+        }
+        let mut i = 0;
+        while i < c.links {
+            let r = unsafe { record(i as usize).read() };
+            if r.source as usize == n || r.target as usize == n {
+                unlink(r)?;
+                unlinked += 1;
+                c.links -= 1;
+                unsafe { record(i as usize).write(record(c.links as usize).read()) };
+            } else {
+                i += 1;
+            }
+        }
+    }
+    if let Some(mask) = code_page(gpa) {
+        unsafe { mask.write_volatile(mask.read_volatile() & !(1 << VCPU)) };
+    }
+    Some(unlinked)
 }
 /// Self-check: every link point of every placed block holds its admitted word (after [`unlink_all`]).
 pub fn links_restored() -> bool {
@@ -275,8 +357,12 @@ pub fn links_restored() -> bool {
     })
 }
 
-/// The block whose code holds native address `pc`.
+/// The block whose code holds native address `pc` (the single-step block in the slot, or a cache block, dead ones too).
 pub fn block_at(pc: u64) -> Option<&'static Block> {
+    if let Some(offset) = pc.checked_sub(SLOT_VA).filter(|&o| o < SLOT_BYTES as u64) {
+        let b = step_block();
+        return (offset < u64::from(b.code_size)).then_some(b);
+    }
     let offset = pc.checked_sub(area::CODE_VA)?;
     let count = control().blocks as usize;
     // The last block starting at or below `offset` (placement order is address order).
@@ -319,14 +405,22 @@ pub fn shadows_reset() {
     unsafe { ptr::write_bytes(lookup_area::<u8>(area::WRITABLE), 0, GUEST_PAGES.div_ceil(8)) };
 }
 
-/// Takes this vCPU's pending invalidations; true if any (the caller flushes).
-// ponytail: every request drops the whole cache; per-page block invalidation arrives with SMC handling (S2e).
-pub fn drain() -> bool {
-    unsafe {
+/// Takes this vCPU's pending invalidations: `Some(true)` if the whole cache must go (a flush request, or more pages
+/// than the list holds; the caller flushes), else invalidates each listed page ([`invalidate`], whose `None` this
+/// returns) and returns `Some(false)`.
+pub fn drain() -> Option<bool> {
+    let (flush, count, pages) = unsafe {
         let q = queue();
-        let pending = (&raw const (*q).flush).read_volatile() != 0 || (&raw const (*q).count).read_volatile() != 0;
+        let taken = ((&raw const (*q).flush).read_volatile(), (&raw const (*q).count).read_volatile(), (&raw const (*q).pages).read_volatile());
         (&raw mut (*q).flush).write_volatile(0);
         (&raw mut (*q).count).write_volatile(0);
-        pending
+        taken
+    };
+    if flush != 0 || count > pages.len() as u64 {
+        return Some(true);
     }
+    for &gpa in &pages[..count as usize] {
+        invalidate(gpa)?;
+    }
+    Some(false)
 }
