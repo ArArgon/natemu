@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Retain the first I4-V native address slice; not full I4-V acceptance."""
+"""Retain the I4-V native family campaigns; not full I4-V acceptance. The address (eager and live high/low cells,
+reply-word flips) and stack (17 scenarios, flips) slices it began with are retired: the general execution path
+covers them (docs/restructure/slice3-contract.md, S3a2)."""
 import argparse
 import hashlib
 import importlib.util
@@ -37,7 +39,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--name', required=True)
     parser.add_argument('--producer', type=Path, required=True)
-    parser.add_argument('--stack', action='store_true', help='also execute the stack/prefix and staged-reply slice')
     parser.add_argument('--aliases', action='store_true', help='also execute N=1..4 alias/remap/source composition')
     parser.add_argument('--concurrent-stack', action='store_true', help='also execute N=1..4 stack recovery/source/maintenance composition')
     parser.add_argument('--mixed-aliases', action='store_true', help='also execute N=1..4 parent/leaf permission aliases and terminal fault probes')
@@ -114,7 +115,6 @@ def main():
                   started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                   source_origin=str(REPO), jobs=[], commands=[], compilations=[], cells=[],
                   standalone_compilers={},
-                  stack_enabled=args.stack,
                   aliases_enabled=args.aliases,
                   concurrent_stack_enabled=args.concurrent_stack,
                   mixed_aliases_enabled=args.mixed_aliases,
@@ -141,7 +141,6 @@ def main():
         source.mkdir()
         for name in ('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo', 'crates',
                      'fixtures/i4v', 'tools/i4v_producer', 'tools/run_i4v.py',
-                     'tools/i4v_worker.py', 'tools/test_i4v_worker.py',
                      'tools/i4v_stack_worker.py', 'tools/test_i4v_stack_worker.py',
                      'tools/i4v_off_worker.py', 'tools/test_i4v_off_worker.py',
                      'tools/i4v_off_check.py', 'tools/test_i4v_off_check.py',
@@ -239,7 +238,6 @@ def main():
                     else 'tools/check_i4v_mixed.py' if oracle == 'mixed'
                     else 'tools/i4v_off_steps_check.py' if oracle == 'off-steps'
                     else 'tools/i4v_off_check.py' if oracle == 'off32'
-                    else 'tools/i4v_stack_check.py' if oracle == 'stack'
                     else 'tools/check_i4v_alias.py' if oracle == 'aliases'
                     else 'tools/check_i4v_stack_concurrent.py' if oracle == 'concurrent-stack' else 'tools/i4v_check.py'))
             path = directory / 'job.json'
@@ -270,7 +268,6 @@ def main():
         for label, folder, pattern in (('producer-tests', 'tools/i4v_producer', 'test_*.py'),
                                        ('expectation-tests', 'fixtures/i4v', 'test_*.py'),
                                        ('oracle-tests', 'tools', 'test_i4v_check.py'),
-                                       ('worker-tests', 'tools', 'test_i4v_worker.py'),
                                        ('stack-oracle-tests', 'tools', 'test_i4v_stack_check.py'),
                                        ('stack-worker-tests', 'tools', 'test_i4v_stack_worker.py'),
                                        ('alias-oracle-tests', 'tools', 'test_check_i4v_alias.py'),
@@ -299,7 +296,6 @@ def main():
         fence_gates=json.loads((gate_job/'command.stdout').read_text())
         job('sign', ['codesign', '--force', '--sign', '-', '--entitlements', 'crates/host/entitlements.plist', host])
         job('verify-signature', ['codesign', '--verify', '--verbose=2', host])
-        exporter = module(source / 'tools/i4v_producer/export.py', 'exporter')
         if args.containment:
             sys.path.insert(0,str(source/'tools'))
             containment=module(source/'tools/check_i4v_containment.py','containment_checker')
@@ -499,94 +495,6 @@ def main():
                                 exported=controls_worker.verify_request(item,request)
                                 record['compilations'].append(dict(directory=str(item.relative_to(run)),export=exported))
                         record['cells'].append(dict(name=label,producer=str(output.relative_to(run)),vcpus=n,actor=actor,profile=profile))
-        for region, rip in (() if args.focus else (('high', 0xffff800000102000), ('low', 0x102000))):
-            directory = run / ('compile-' + region)
-            record['standalone_compilers'][str(directory.relative_to(run))]='producer-'+region
-            job('producer-' + region, [sys.executable, '-B', source / 'tools/i4v_producer/compile.py',
-                                       '--directory', directory, '--producer', producer,
-                                       '--case', 'fex_memory_data64', '--rip', hex(rip)])
-            exported = exporter.verify(directory, expected={'case': 'fex_memory_data64', 'guest_rip': rip})
-            record['compilations'].append(dict(directory=directory.name, export=exported))
-            for scenario in ('cold', 'load_np', 'user_denied', 'fetch_nx', 'smep', 'low_operand', 'private_operand'):
-                label = region + '-' + scenario
-                result = job(label, [host, runtime, 'i4v', directory / 'body.bin', scenario, hex(rip), '1'], oracle=True)
-                report = json.loads((result / 'command.stdout').read_text())
-                if report['scenario'] != scenario or report['live'] != 0 or report['reply_mutation'] != -1 or report['rip'] != rip or report['body_hex'] != exported['body_hex']:
-                    raise ValueError('runtime does not match actual compiled request')
-                record['cells'].append(dict(name=label, compilation=directory.name))
-        live_cells = [(region, rip, scenario, None)
-                      for region, rip in (('high', 0xffff800000102000), ('low', 0x102000))
-                      for scenario in ('cold', 'load_np', 'user_denied', 'fetch_nx', 'smep', 'low_operand', 'private_operand')]
-        live_cells += [('high', 0xffff800000102000, 'cold', i) for i in range(16)]
-        if args.focus:
-            live_cells = []
-        for region, rip, scenario, mutation in live_cells:
-            label = f'live-{region}-{scenario}' + (f'-reply-{mutation}' if mutation is not None else '')
-            output = run / (label + '-producer')
-            argv = [host, runtime, 'i4v-live', producer, scenario, hex(rip), '1',
-                    source / 'tools/i4v_worker.py', output]
-            if mutation is not None:
-                argv.append(str(mutation))
-            result = job(label, argv, oracle=True)
-            report = json.loads((result / 'command.stdout').read_text())
-            expected_requests = int(scenario not in ('fetch_nx', 'smep', 'private_operand'))
-            if (report['live'] != 1 or report['requests'] != expected_requests or report['rip'] != rip
-                    or report['scenario'] != scenario or report['reply_mutation'] != (-1 if mutation is None else mutation)):
-                raise ValueError('live runtime request mode/count/identity mismatch')
-            directories = list(output.glob('request-*'))
-            if len(directories) != expected_requests:
-                raise ValueError('runtime requests and actual compilations differ')
-            for directory in directories:
-                exported = exporter.verify(directory / 'compile', expected={'case': 'fex_memory_data64', 'guest_rip': rip})
-                request = list(struct.unpack('<16Q', (directory / 'request.bin').read_bytes()))
-                if request != report['request'] or exported['body_hex'] != report['body_hex']:
-                    raise ValueError('resident request/actual compile association mismatch')
-                reply = list(struct.unpack('<16Q', (directory / 'reply.bin').read_bytes()))
-                if mutation is not None:
-                    reply[mutation] ^= 1
-                if reply != report['reply']:
-                    raise ValueError('runtime reply differs from producer delivery/control mutation')
-                record['compilations'].append(dict(directory=str(directory.relative_to(run)), export=exported))
-            record['cells'].append(dict(name=label, producer=str(output.relative_to(run)), reply_mutation=mutation))
-        if args.stack and not args.focus:
-            # The verifier's imports must come from the retained snapshot too.
-            sys.path.insert(0, str(source / 'tools'))
-            stack_worker = module(source / 'tools/i4v_stack_worker.py', 'stack_worker')
-            sys.path.pop(0)
-            scenarios = ('cold', 'low_stack', 'ro_first', 'ro_after_first', 'np_after_first',
-                         'wp_off', 'user_ro', 'user_denied', 'user_ok', 'parent_ro',
-                         'fetch_nx', 'smep', 'ss_first', 'ss_after_first', 'ss_span',
-                         'gp_after_pushes', 'read_np_after_pushes')
-            stack_cells = [(region, rip, scenario, -1)
-                           for region, rip in (('high', 0xffff800000102000), ('low', 0x102000))
-                           for scenario in scenarios]
-            stack_cells += [('high', 0xffff800000102000, 'cold', i) for i in range(48)]
-            for region, rip, scenario, mutation in stack_cells:
-                label = f'stack-{region}-{scenario}' + (f'-reply-{mutation}' if mutation >= 0 else '')
-                output = run / (label + '-producer')
-                argv = [host, runtime, 'i4v-stack-live', producer, scenario, hex(rip), '1',
-                        source / 'tools/i4v_stack_worker.py', output]
-                if mutation >= 0:
-                    argv.append(str(mutation))
-                result = job(label, argv, oracle='stack')
-                report = json.loads((result / 'command.stdout').read_text())
-                expected_requests = int(scenario not in ('fetch_nx', 'smep', 'ss_first', 'ss_span'))
-                transfers = 0 if not expected_requests else mutation//16+1 if mutation >= 0 else 3
-                if (report['case'] != 'fex_push_immediates64' or report['live'] != 1
-                        or report['scenario'] != scenario or report['rip'] != rip
-                        or report['reply_mutation'] != mutation or report['requests'] != expected_requests
-                        or report['stack']['transfers'] != transfers):
-                    raise ValueError('stack runtime does not match requested cell/transfer count')
-                directories = list(output.glob('request-*'))
-                if len(directories) != expected_requests:
-                    raise ValueError('stack requests and compilations differ')
-                for directory in directories:
-                    exported = stack_worker.verify_transfers(directory,
-                        report['stack']['requests'][:transfers], report['stack']['replies'][:transfers])
-                    if exported['guest_rip'] != rip or exported['body_hex'] != report['body_hex']:
-                        raise ValueError('stack compilation differs from actual requested RIP/body')
-                    record['compilations'].append(dict(directory=str(directory.relative_to(run)), export=exported))
-                record['cells'].append(dict(name=label, producer=str(output.relative_to(run)), reply_mutation=mutation))
         if args.paging_off:
             sys.path.insert(0, str(source / 'tools'))
             off_worker = module(source / 'tools/i4v_off_worker.py', 'off_worker')

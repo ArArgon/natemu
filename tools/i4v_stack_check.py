@@ -199,7 +199,7 @@ def native_leaves(scenario, completed):
     """Only successful first writes may install writable owned-RAM routes."""
     attrs = 3 | (1 << 10) | (3 << 8) | (3 << 53)
     lower = [0] * 512
-    lower[258] = (IPA + 0x72000) | attrs
+    lower[258] = (IPA + 0x72000) | attrs | (1 << 11)     # the host-made source alias is nG since S3a
     upper = [0] * 512
     before = list(lower)
     target = lower if scenario == "low_stack" else upper

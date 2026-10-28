@@ -107,7 +107,7 @@ def zeros(value):
 def native_tables(scenario, completed):
     attrs = 3 | (1 << 10) | (3 << 8) | (3 << 53)
     lower = [0] * 512
-    lower[258] = (IPA + 0x72000) | attrs
+    lower[258] = (IPA + 0x72000) | attrs | (1 << 11)     # the host-made source alias is nG since S3a
     if scenario != "cold":
         lower[256] = (IPA + 0x70000) | attrs | (128 if scenario == "readonly" else 0)
     before = list(lower)

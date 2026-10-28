@@ -2,6 +2,10 @@
 
 Generated 2026-10-26 from the working tree at commit `577a7f2` (no git history read, VM not run). Decoded with GNU objdump (`/opt/homebrew/opt/binutils/bin/objdump -D -b binary -m i386[:x86-64] -M intel`); each program was decoded in the mode(s) the suite actually executes it in. Where independent Python oracles exist (`tools/i4v_controls_check.py`, `tools/i4v_modes_model.py`) they were run, unmodified, only to learn which instructions of the control programs execute, in what mode, and where they fault.
 
+Later change (S3a2, October 27, 2026): the I1–I3, address and stack cells, their host drivers and their I3-only tools
+are deleted; [slice3-contract.md](slice3-contract.md#s3a2-covering-and-deleting-the-i1i3-address-and-stack-paths) maps
+each of their checks to a general-path check or a retirement reason. References below stay as of `577a7f2`.
+
 ## 0. Scope, counting rules and mode glossary
 
 Scope: every x86 byte sequence that any runner, worker, oracle, fixture or QEMU comparison in `crates/`, `tools/` and `fixtures/` places in guest memory, hands to the FEX producer as source, or executes under QEMU. Excluded and listed in section 4: archived research under `experiments/`, decoder-only unit-test byte strings, and QEMU/NASM harness glue. Native AArch64 bodies (FEX output, `pressure_body.arm64`, runtime assembly) are not guest programs and are not inventoried. I1 `control` and `fault` cases run native NOP/UDF and contain no x86.

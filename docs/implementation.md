@@ -299,17 +299,16 @@ python3 -B -m unittest discover -s tools -p 'test_*.py'
 python3 -B tools/check_i1.py --self-test
 ```
 
+**Retired (S3a2, October 27, 2026):** the general execution path covers the I1 entry cells, the I2 live-translation
+scenarios and the I3 paging/allocated cells, and their host drivers, runner options and I3 worker are deleted
+([slice-3 contract](restructure/slice3-contract.md#s3a2-covering-and-deleting-the-i1i3-address-and-stack-paths) maps
+every check). `run_i1.py` now runs only the I4 cells below; this section records what those runs established.
+
 The retained development runner snapshots sources, builds and signs the host,
 checks the emitted image, then supervises each native cell and runs the independent
-oracle. Use a fresh name; existing output directories are refused:
+oracle. Use a fresh name; existing output directories are refused.
 
-```sh
-./tools/with-env python3 -B tools/run_i1.py \
-  --name "i1-local-$(date +%Y%m%d-%H%M%S)" \
-  --fragment ../natemu-raw/i1-fex-fragment-20261025-02/live_load.arm64
-```
-
-The fragment path above is this machine's durable reproduced input; supply its
+The `--fragment` path in the I4 command below is this machine's durable reproduced input; supply its
 actual location when using a different raw root. Its exact producer, extraction,
 bytes and manual site maps are in `fixtures/i1/live_load.json`. A missing fragment
 is an acquisition requirement, not permission to substitute handwritten code.
@@ -338,17 +337,7 @@ This is development coverage of I1, not the full ABI coverage matrix.
 
 ### I2 live producer checks
 
-The same runner retains I1 and adds the I2 scenarios:
-
-```sh
-./tools/with-env python3 -B tools/run_i1.py \
-  --name "i2-local-$(date +%Y%m%d-%H%M%S)" \
-  --fragment ../natemu-raw/i1-fex-fragment-20261025-02/live_load.arm64 \
-  --i2 \
-  --producer ../natemu-raw/i1-fex-export-20261025-01/build/Bin/CodeSizeValidation
-```
-
-This requires the retained ARM64 Linux toolchain image identified in
+Retired with I1 (above). The runner's I2 scenarios required the retained ARM64 Linux toolchain image identified in
 `tools/fex_worker.py` and the exact pinned producer binary. The runner verifies
 and copies that binary into each fresh run; the earlier producer run retains its
 producing sources/build. Each runtime request supplies fresh x86 bytes to a new
@@ -394,24 +383,12 @@ I3/I4 work.
 
 ### I3 recovery, paging and allocated maps
 
-Run all earlier checks plus the finite I3 matrix with:
-
-```sh
-./tools/with-env python3 -B tools/run_i1.py \
-  --name "i3-local-$(date +%Y%m%d-%H%M%S)" \
-  --fragment ../natemu-raw/i1-fex-fragment-20261025-02/live_load.arm64 \
-  --i3-allocated \
-  --producer ../natemu-raw/i1-fex-export-20261025-01/build/Bin/CodeSizeValidation \
-  --allocated-producer ../natemu-raw/i3-producer-probe-20261025-04/build/Bin/CodeSizeValidation
-```
-
-`--i3-paging` runs only the paging subset; it does not satisfy I3. The full command
-adds 12 paging scenarios and 10 allocated-map/FP/helper/partial-effect scenarios.
+Retired with I1 (above). The finite I3 matrix added 12 paging scenarios and 10 allocated-map/FP/helper/partial-effect scenarios.
 The runner snapshots and rebuilds sources, binds both producer binaries, retains
 fresh per-request inputs/outputs and supervises the combined execution bundle
 for at most20 minutes. Both compiler container families use run-specific cleanup.
-The new [producer package](../tools/i3_producer/README.md) records exact inputs,
-adaptation, actual allocation maps and reproduction instructions.
+Its producer package (now deleted; only the shared
+[FEX export patch](../tools/i3_producer/README.md) remains) recorded exact inputs, adaptation and allocation maps.
 
 **Implemented finite behavior:** the runtime distinguishes missing ARM shadows
 from x86 #PF using a four-level, 48-bit virtual/40-bit physical walker, 4KiB/2MiB
@@ -451,21 +428,20 @@ open. These finite I3 checks do not complete the full ABI milestone or Track03.
 
 ### I4 concurrent composition
 
-Run the complete finite I4 matrix with all I1–I3 regressions:
+Run the complete finite I4 matrix with:
 
 ```sh
 ./tools/with-env python3 -B tools/run_i1.py \
   --name "i4-local-$(date +%Y%m%d-%H%M%S)" \
   --fragment ../natemu-raw/i1-fex-fragment-20261025-02/live_load.arm64 \
   --producer ../natemu-raw/i3-independent-20261025-01/CodeSizeValidation \
-  --allocated-producer ../natemu-raw/i3-independent-20261025-01/AllocatedCodeSizeValidation \
-  --i4-pressure --i3-allocated
+  --i4-pressure
 ```
 
 `--i4-pressure` includes entry, queued faults, remap, live source publication and
 pending-event profiles at N=1/2/3/4. Smaller `--i4-entry`, `--i4-faults`,
 `--i4-remap`, `--i4-compose` and `--i4-events` options retain earlier applicable
-profiles. The legacy I1–I3 profiles still admit only N=1; I4 rejects N=0/5 before
+profiles. I4 rejects N=0/5 before
 creating the VM. Host/API admission and per-owner backing precede execution.
 
 The pressure profile performs nine protected page-table changes per CPU. Every
@@ -511,15 +487,15 @@ checks. It cannot establish full I4-V coverage. Omit `--focus` and use the follo
 flag groups in separate, sequential runs with unique names for the full native
 campaign; each group stays within the existing20-minute bundle bound.
 
-| Flag group | Manifest cells, including44 repeated baseline cells per group |
+| Flag group | Manifest cells (the 44 address baseline cells each group once repeated, and the `--stack` slice, are retired: S3a2) |
 | --- | --- |
-| `--progress` | 116:72 seeded stack/control/coherence/atomic/partial-helper cases plus baseline. |
-| `--containment` | 69:25 declared failures plus baseline; each failure also requires a separate fresh-control execution. |
-| `--coherence --fence --ordering` | 278 translation, ordering and fence cases. |
-| `--stack --aliases --concurrent-stack --mixed-aliases --paging-off --paging-off-steps --mixed-modes --controls --concurrent-controls --stack-boundaries` | 394 address, stack and mode/control cases. |
-| `--address-forms` | 104 protected32 address cases. |
+| `--progress` | 72 seeded stack/control/coherence/atomic/partial-helper cases. |
+| `--containment` | 25 declared failures; each failure also requires a separate fresh-control execution. |
+| `--coherence --fence --ordering` | 234 translation, ordering and fence cases. |
+| `--aliases --concurrent-stack --mixed-aliases --paging-off --paging-off-steps --mixed-modes --controls --concurrent-controls --stack-boundaries` | 268 alias, stack-composition and mode/control cases. |
+| `--address-forms` | 60 protected32 address cases. |
 
-Also run the87-job legacy `run_i1.py --i4-pressure --i3-allocated` matrix above
+Also run the legacy `run_i1.py --i4-pressure` matrix above
 with its original producer pins. Do not run the groups concurrently or combine
 all flags into one bundle that exceeds the declared limit. Count repeated baselines and fresh controls
 separately from distinct coverage. A bundle's `full_i4v_complete: false` does not

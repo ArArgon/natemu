@@ -8,6 +8,10 @@ Numbered plan references below refer to an earlier draft, not current execution
 requirements. The current plan governs verification and migration without an
 upfront whole-suite audit.
 
+Later change (S3a2, October 27, 2026): the I1–I3, address and stack cells, their host drivers and their I3-only tools
+are deleted; [slice3-contract.md](slice3-contract.md#s3a2-covering-and-deleting-the-i1i3-address-and-stack-paths) maps
+each of their checks to a general-path check or a retirement reason. References below stay as of `577a7f2`.
+
 Source state: working tree at commit `577a7f2`. The starting point is the accepted
 [I4-V contract-to-test matrix](../research/reviews/INV-03-01-i4v-coverage.md).
 Every runner, checker and model under `tools/` was read, plus

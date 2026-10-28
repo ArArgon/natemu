@@ -341,7 +341,7 @@ def expectations(profile,vm,capture):
     # Common host setup retains a native RW/NX source-page alias. Controls
     # invalidate the operand leaf only; this source alias is not a guest PTE.
     lower_before=[0]*512
-    lower_before[258]=descriptor(2,False)
+    lower_before[258]=descriptor(2,False)|1<<11     # host-made private descriptors are not global (nG) since S3a
     leaves=list(lower_before)
     if answer['mapping']:
         gpa,writable=answer['mapping'];leaves[256]=descriptor((gpa-DATA)//4096,not writable)

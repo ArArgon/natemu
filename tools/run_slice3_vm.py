@@ -9,7 +9,8 @@
 
 `corpora`: the single-vCPU corpora — the slice-1 fixtures, the control-flow corpus (default: the S2d run's
 programs and QEMU results under NATEMU_RAW_ROOT/s2d/corpus) and the slice-1 fault cases (QEMU prefix references, as
-tools/run_slice1_faults.py) — are shuffled (seed) and grouped N at a time; each group runs as one multi-vCPU
+tools/run_slice1_faults.py, its paging cells included except those with a 2 MiB page: guest RAM holds one 2 MiB
+frame per run) — are shuffled (seed) and grouped N at a time; each group runs as one multi-vCPU
 description (driver `cpu` sections), every program in its own address space (own tables, disjoint guest-physical
 pages) and the same linear addresses, all vCPUs concurrently. Each vCPU's final state is judged by its corpus's own
 evaluator against its own single-program reference. Also per vCPU: EnTSO read back, the FEX frame intact, and, when
@@ -18,9 +19,9 @@ the cache neither flushed (beyond the driver's initial one) nor invalidated, hos
 oversubscribed and migrate between cores.
 
 `smp`: the deterministic programs of tools/bench/smp (natemu-smp-v1: the bytes QEMU system mode ran) at N vCPUs over one
-shared address space, judged against tools/bench/smp/model_smp.py with smp.compare. Programs whose result depends on
-cross-vCPU ordering (handshake, token-ring: flags passed by plain stores under TSO) are run and reported as
-`unjudged` until the TSO evidence (S3t) exists; xchg-lock needs memory XCHG (refused by fexc this slice).
+shared address space, judged against tools/bench/smp/model_smp.py with smp.compare. Programs using an instruction the
+general path does not admit yet are reported `unsupported` when a vCPU stops on it (`unsupported_form`): handshake
+and token-ring spin with PAUSE, xchg-lock needs memory XCHG (S3e). Run to the end, they are judged like the others.
 
 `limits`: 5 vCPUs are refused (0 cannot be written: a description without `cpu` lines is one vCPU; the host's
 `prepare` refuses 0 in its unit test); a forged block header on vCPU V of 4 (V = 0..3; the others spin in a linked
@@ -34,8 +35,8 @@ sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' /
 sys.path.insert(0, str(ROOT / 'tools' / 'bench' / 'smp'))
 import ref, run_slice1_vm as vm, run_slice1_faults as faults, smp, model_smp  # noqa: E402
 
-ORDERED = {'handshake', 'token-ring'}     # results depend on cross-vCPU ordering (judged after S3t)
-REFUSED = {'xchg-lock'}                   # memory XCHG: not admitted this slice
+# Programs needing an instruction not admitted yet (fexc refuses it: `unsupported_form`).
+REFUSED = {'handshake': 'PAUSE', 'token-ring': 'PAUSE', 'xchg-lock': 'memory XCHG'}
 
 
 def driver(host, runtime, fexc, text, work, extra=()):
@@ -72,6 +73,7 @@ def corpus_items(a):
             items.append(('flow/' + p['name'], vm.description(p), lambda out, p=p: vm.evaluate(p, results[p['name']], out)))
     if not a.no_faults:
         for case in faults.expectations(fixtures, faults.probes(), a.out / 'ref'):
+            if case[2].get('large'): continue       # guest RAM holds one 2 MiB frame per run, not one per vCPU
             def judge(out, case=case):
                 e = faults.evaluate(case, out)
                 return e['outcome'], e['diffs']
@@ -169,8 +171,9 @@ def cmd_smp(a, host, runtime):
         got = {'cpus': [{'gpr': [smp.num(x) for x in cpu['gpr']], 'rflags': smp.num(cpu['rflags'])} for cpu in cpus],
                'memory': [{'addr': smp.num(r['addr']), 'data': memory[smp.num(r['addr'])]} for r in captured]}
         diffs += smp.compare(prog, got, model_smp.expected(prog))
-        if base in REFUSED and any('unsupported_form' in d for d in diffs): outcome = 'unsupported'
-        elif base in ORDERED: outcome = 'unjudged-match' if not diffs else 'unjudged-differ'
+        if base in REFUSED and any('unsupported_form' in d for d in diffs):
+            outcome = 'unsupported'
+            diffs = [f'{REFUSED[base]} not admitted'] + diffs
         else: outcome = 'fail' if diffs else 'match'
         stats = [{k: cpu['stats'][k] for k in ('blocks', 'fast', 'requests', 'links', 'retries')} for cpu in cpus]
         return [{**e, 'outcome': outcome, 'diffs': diffs, 'stats': stats}]
@@ -179,7 +182,7 @@ def cmd_smp(a, host, runtime):
     for e in entries: by[e['name']][e['outcome']] += 1
     for name, c in by.items(): print(f'{name}: {dict(c)}', flush=True)
     for e in entries:
-        if e['outcome'] not in ('match', 'unjudged-match'): print(f"{e['name']} rep{e['rep']} {e['outcome']}: {'; '.join(e['diffs'])[:400]}")
+        if e['outcome'] != 'match': print(f"{e['name']} rep{e['rep']} {e['outcome']}: {'; '.join(e['diffs'])[:400]}")
     (a.out / 'smp.json').write_text(json.dumps({'results': entries}, indent=1) + '\n')
     return sum(c['fail'] for c in by.values())
 

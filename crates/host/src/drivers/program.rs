@@ -18,10 +18,21 @@
 //! vCPUs run concurrently over shared guest RAM, each until its own stop. A vCPU that stops for any other reason than
 //! reaching its end, a guest fault or code it cannot compile (a resident halt, the watchdog) cancels the others.
 //!
-//! Description (text, one item per line). State items: rip ADDR | rflags VALUE | gpr V0 .. V15.
+//! Description (text, one item per line). State items: rip ADDR | rflags VALUE | gpr V0 .. V15
+//!   | cpl 0|3 (default 3) | wp 0|1 (CR0.WP, default 1) | smep 0|1 (CR4.SMEP, default 0) | nxe 0|1 (EFER.NXE, default 1).
 //! Address-space items: code HEX (a body at the section's rip) | body ADDR HEX | memory ADDR HEX
 //!   | region ADDR SIZE   (zero-filled writable pages covering the byte range; eager: guest RAM bounds the total)
-//!   | unmap ADDR | readonly ADDR   (mutations: clear P or R/W in the leaf entry of ADDR's page after setup).
+//!   | large ADDR   (the 2 MiB-aligned range holding ADDR is one present 2 MiB leaf (PDE with PS), writable if any page
+//!     of the space in it is, not executable unless one is code; at most one per run: guest RAM holds one such frame)
+//!   | unmap ADDR | readonly ADDR   (mutations: clear P or R/W in the leaf entry of ADDR's page after setup)
+//!   | entry ADDR LEVEL set|clear BITS   (mutation: set or clear BITS in the paging-structure entry of ADDR's walk at
+//!     LEVEL, 4 = PML4E .. 1 = PTE, after setup; mutations apply in order, and the levels above must be present).
+//! Every entry is present and user; leaves of code pages are read-only and executable, the others writable and
+//! (with NXE) not executable; the space's tables follow the NXE of the first vCPU using it.
+//! The resident's walker refuses what it does not model (a refusal is a halt, never a wrong result): any PWT, PCD or PAT
+//! bit (entry bits 3, 4; bit 7 of a PTE; bit 12 of a 2 MiB leaf) makes the page non-write-back (`shadow status=1
+//! detail=7`), although under the default PAT some such pages are write-back on x86; PS in a PML4E/PDPTE is reserved
+//! (no 1 GiB pages); the A bit of a non-leaf entry is set but never compared.
 //! Without `cpu` lines the description is one program on one vCPU (output: one state object). Each `cpu` line starts
 //! the next vCPU's section (vCPUs 0.., output `{"cpus": [...]}`); address-space items before the first `cpu` line
 //! form the shared address space, which a section uses unless it has address-space items of its own (then it gets
@@ -45,8 +56,18 @@ struct Space {
     memory: Vec<(u64, Vec<u8>)>,
     /// Zero-filled writable ranges (address, length).
     regions: Vec<(u64, u64)>,
-    /// Leaf-entry bits cleared after setup, per page.
-    clear: Vec<(u64, u64)>,
+    /// 2 MiB-aligned linear ranges mapped by one PDE leaf.
+    large: Vec<u64>,
+    /// Entry mutations after setup, in order.
+    edits: Vec<Edit>,
+}
+/// Set, then clear, bits of the entry at `level` (`None`: the leaf) of `va`'s walk.
+#[derive(Debug, PartialEq)]
+struct Edit {
+    va: u64,
+    level: Option<u32>,
+    set: u64,
+    clear: u64,
 }
 /// One vCPU's initial state and the address space it runs in (an index into `Description::spaces`).
 #[derive(Debug, PartialEq)]
@@ -54,6 +75,10 @@ struct Section {
     rip: u64,
     rflags: u64,
     gpr: [u64; 16],
+    cpl: u64,
+    wp: bool,
+    smep: bool,
+    nxe: bool,
     space: usize,
 }
 #[derive(Debug, PartialEq)]
@@ -83,7 +108,7 @@ fn parse(text: &str) -> Result<Description> {
             _ => chunks.last_mut().unwrap().push(line),
         }
     }
-    let new = |space| Section { rip: 0, rflags: 0, gpr: [0; 16], space };
+    let new = |space| Section { rip: 0, rflags: 0, gpr: [0; 16], cpl: 3, wp: true, smep: false, nxe: true, space };
     let mut d = Description { spaces: vec![Space::default()], cpus: vec![], sections: chunks.len() > 1 };
     if d.sections {
         items(&chunks[0], &mut d.spaces[0], None)?;
@@ -126,12 +151,28 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
                     *r = number(v)?;
                 }
             }
+            ("cpl", ["0"]) => state(&mut cpu, line)?.cpl = 0,
+            ("cpl", ["3"]) => state(&mut cpu, line)?.cpl = 3,
+            ("wp" | "smep" | "nxe", [v @ ("0" | "1")]) => {
+                let c = state(&mut cpu, line)?;
+                *match words[0] {
+                    "wp" => &mut c.wp,
+                    "smep" => &mut c.smep,
+                    _ => &mut c.nxe,
+                } = *v == "1";
+            }
             ("code", [h]) => space.bodies.push((None, hex(h)?)),
             ("body", [a, h]) => space.bodies.push((Some(number(a)?), hex(h)?)),
             ("memory", [a, h]) => space.memory.push((number(a)?, hex(h)?)),
             ("region", [a, n]) if number(n)? > 0 => space.regions.push((number(a)?, number(n)?)),
-            ("unmap", [a]) => space.clear.push((number(a)? & !4095, PRESENT)),
-            ("readonly", [a]) => space.clear.push((number(a)? & !4095, WRITABLE)),
+            ("large", [a]) => space.large.push(number(a)? & !(LARGE - 1)),
+            ("unmap", [a]) => space.edits.push(Edit { va: number(a)?, level: None, set: 0, clear: PRESENT }),
+            ("readonly", [a]) => space.edits.push(Edit { va: number(a)?, level: None, set: 0, clear: WRITABLE }),
+            ("entry", [a, l @ ("1" | "2" | "3" | "4"), op @ ("set" | "clear"), bits]) => {
+                let (va, bits, level) = (number(a)?, number(bits)?, Some(l.parse().unwrap()));
+                let set = if *op == "set" { bits } else { 0 };
+                space.edits.push(Edit { va, level, set, clear: if *op == "clear" { bits } else { 0 } });
+            }
             _ => return Err(format!("bad description line: {line}")),
         }
     }
@@ -152,21 +193,33 @@ fn stop_at(space: &Space, rip: u64) -> Result<u64> {
 const PRESENT: u64 = 1;
 const WRITABLE: u64 = 2;
 const USER: u64 = 4;
+const LARGE_PAGE: u64 = 1 << 7;
 const NO_EXECUTE: u64 = 1 << 63;
+const LARGE: u64 = 0x20_0000;
 const ADDRESS: u64 = natemu_abi::paging::PA_MASK;
 
-/// Guest-physical page allocation (shared by every address space).
+/// Guest-physical page allocation (shared by every address space): 4 KiB pages upwards from `next`, 2 MiB frames
+/// downwards from `top`.
 struct Builder {
     ram: GuestRam,
     next: u64,
+    top: u64,
 }
 impl Builder {
     fn page(&mut self) -> Result<u64> {
         let gpa = self.next;
-        if gpa + 4096 > exec::GUEST_RAM_BYTES as u64 {
+        if gpa + 4096 > self.top {
             return Err("guest RAM exhausted".into());
         }
         self.next += 4096;
+        Ok(gpa)
+    }
+    fn large(&mut self) -> Result<u64> {
+        let gpa = self.top.saturating_sub(LARGE) & !(LARGE - 1);
+        if gpa == 0 || gpa < self.next {
+            return Err("guest RAM exhausted (2 MiB frame)".into());
+        }
+        self.top = gpa;
         Ok(gpa)
     }
 }
@@ -181,23 +234,40 @@ impl Tables {
     fn new(b: &mut Builder) -> Result<Self> {
         Ok(Self { ram: b.ram, cr3: b.page()?, pages: BTreeMap::new() })
     }
-    fn map(&mut self, b: &mut Builder, va: u64, flags: u64) -> Result<()> {
+    /// The address of the entry at `level` of `va`'s walk, creating missing tables above it with a builder (without
+    /// one, a non-present entry above it is an error: mutations never create tables).
+    fn entry(&mut self, mut b: Option<&mut Builder>, va: u64, level: u32) -> Result<u64> {
         let mut table = self.cr3;
-        for level in (2..=4).rev() {
-            let at = table + ((va >> (12 + 9 * (level - 1))) & 511) * 8;
+        for l in (level + 1..=4).rev() {
+            let at = table + ((va >> (12 + 9 * (l - 1))) & 511) * 8;
             let entry = self.ram.read::<u64>(at).unwrap();
-            table = if entry & PRESENT != 0 {
-                entry & ADDRESS
-            } else {
-                let next = b.page()?;
+            table = if entry & PRESENT == 0 {
+                let next = b.as_deref_mut().ok_or(format!("{va:#x}: no level-{level} entry (level {l} is not present)"))?.page()?;
                 assert!(self.ram.write(at, next | PRESENT | WRITABLE | USER));
                 next
+            } else if l == 2 && entry & LARGE_PAGE != 0 {
+                return Err(format!("{va:#x} is in a 2 MiB page: no level-{level} entry"));
+            } else {
+                entry & ADDRESS
             };
         }
-        let leaf = table + ((va >> 12) & 511) * 8;
+        Ok(table + ((va >> (12 + 9 * (level - 1))) & 511) * 8)
+    }
+    fn map(&mut self, b: &mut Builder, va: u64, flags: u64) -> Result<()> {
+        let leaf = self.entry(Some(b), va, 1)?;
         let gpa = b.page()?;
         assert!(self.ram.write(leaf, gpa | PRESENT | USER | flags));
         self.pages.insert(va, (gpa, leaf));
+        Ok(())
+    }
+    /// Maps the 2 MiB range at `va` with one PDE leaf; its `pages` (those the space uses) are listed.
+    fn map_large(&mut self, b: &mut Builder, va: u64, flags: u64, pages: impl Iterator<Item = u64>) -> Result<()> {
+        let pde = self.entry(Some(b), va, 2)?;
+        let gpa = b.large()?;
+        assert!(self.ram.write(pde, gpa | PRESENT | USER | LARGE_PAGE | flags));
+        for page in pages {
+            self.pages.insert(page, (gpa + (page - va), pde));
+        }
         Ok(())
     }
     /// Physical address of mapped linear `va`.
@@ -214,8 +284,10 @@ impl Tables {
     }
 }
 /// Builds `space` (for a vCPU starting at `rip` when its bodies sit at the rip): code pages are read-only and
-/// executable, region pages writable and not executable (any region covering a code page leaves it executable).
-fn build(b: &mut Builder, space: &Space, rip: u64) -> Result<Tables> {
+/// executable, region pages writable and not executable (any region covering a code page leaves it executable;
+/// without `nxe` nothing is marked not executable).
+fn build(b: &mut Builder, space: &Space, rip: u64, nxe: bool) -> Result<Tables> {
+    let no_execute = if nxe { NO_EXECUTE } else { 0 };
     let mut flags = BTreeMap::new();
     let code_pages: Vec<u64> = bodies(space, rip).flat_map(|(at, code)| page_span(at, code.len())).collect();
     for &page in &code_pages {
@@ -227,12 +299,20 @@ fn build(b: &mut Builder, space: &Space, rip: u64) -> Result<Tables> {
             return Err("guest RAM exhausted".into());
         }
         for page in page_span(address, length as usize) {
-            flags.insert(page, WRITABLE | if code_pages.contains(&page) { 0 } else { NO_EXECUTE });
+            flags.insert(page, WRITABLE | if code_pages.contains(&page) { 0 } else { no_execute });
         }
     }
     let mut t = Tables::new(b)?;
+    for &region in &space.large {
+        let inside: Vec<(u64, u64)> = flags.range(region..region + LARGE).map(|(&p, &f)| (p, f)).collect();
+        let writable = inside.iter().fold(0, |w, &(_, f)| w | f & WRITABLE);
+        let code = inside.iter().any(|(p, _)| code_pages.contains(p));
+        t.map_large(b, region, writable | if code { 0 } else { no_execute }, inside.iter().map(|&(p, _)| p))?;
+    }
     for (&page, &f) in &flags {
-        t.map(b, page, f)?;
+        if !space.large.contains(&(page & !(LARGE - 1))) {
+            t.map(b, page, f)?;
+        }
     }
     for (at, code) in bodies(space, rip) {
         t.copy_in(at, code);
@@ -240,10 +320,13 @@ fn build(b: &mut Builder, space: &Space, rip: u64) -> Result<Tables> {
     for (address, data) in &space.memory {
         t.copy_in(*address, data);
     }
-    for &(page, bits) in &space.clear {
-        let &(_, leaf) = t.pages.get(&page).ok_or(format!("{page:#x} is not mapped"))?;
-        let entry = t.ram.read::<u64>(leaf).unwrap();
-        assert!(t.ram.write(leaf, entry & !bits));
+    for e in &space.edits {
+        let at = match e.level {
+            None => t.pages.get(&(e.va & !4095)).ok_or(format!("{:#x} is not mapped", e.va))?.1,
+            Some(level) => t.entry(None, e.va, level)?,
+        };
+        let entry = t.ram.read::<u64>(at).unwrap();
+        assert!(t.ram.write(at, (entry | e.set) & !e.clear));
     }
     Ok(t)
 }
@@ -368,30 +451,31 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let n = d.cpus.len();
     let backing = execution::prepare(resident, code_bytes, n)?;
     require_vcpus(n)?;
-    let mut builder = Builder { ram: execution::guest_ram(&backing.memory), next: 0x1000 };
+    let mut builder = Builder { ram: execution::guest_ram(&backing.memory), next: 0x1000, top: exec::GUEST_RAM_BYTES as u64 };
     // A space is built for the first vCPU using it (its rip places `code` bodies).
     let mut spaces: Vec<Option<Tables>> = d.spaces.iter().map(|_| None).collect();
     let mut stops = Vec::new();
     for c in &d.cpus {
         if spaces[c.space].is_none() {
-            spaces[c.space] = Some(build(&mut builder, &d.spaces[c.space], c.rip)?);
+            spaces[c.space] = Some(build(&mut builder, &d.spaces[c.space], c.rip, c.nxe)?);
         }
         stops.push(stop_at(&d.spaces[c.space], c.rip)?);
     }
     execution::guest_ram_written(&backing.memory);
     for (v, c) in d.cpus.iter().enumerate() {
-        // User mode (as the QEMU reference), 4-level paging, NX and WP on.
+        // 4-level paging; user mode, NX and WP on unless the section says otherwise.
+        let bit = |on: bool, value: u64| if on { value } else { 0 };
         execution::set_cpu(
             backing.vcpu(v),
             Cpu {
                 gpr: c.gpr,
                 rip: c.rip,
                 rflags: c.rflags | 0x202,
-                cr0: exec::CR0_PE | exec::CR0_PG | exec::CR0_WP,
+                cr0: exec::CR0_PE | exec::CR0_PG | bit(c.wp, exec::CR0_WP),
                 cr3: spaces[c.space].as_ref().unwrap().cr3,
-                cr4: exec::CR4_PAE,
-                efer: exec::EFER_LME | exec::EFER_LMA | exec::EFER_NXE,
-                cpl: 3,
+                cr4: exec::CR4_PAE | bit(c.smep, exec::CR4_SMEP),
+                efer: exec::EFER_LME | exec::EFER_LMA | bit(c.nxe, exec::EFER_NXE),
+                cpl: c.cpl,
             },
         );
     }
@@ -539,14 +623,19 @@ mod tests {
     use super::*;
     #[test]
     fn description_parses_and_rejects_malformed_lines() {
-        let d = parse("rip 0x100000\nrflags 0x1\ngpr 0 1 2 3 4 5 6 7 8 9 a b c d e f\ncode 90c3\nmemory 0x200000 0102\nunmap 0x200010\nreadonly 0x201000\n").unwrap();
+        let d = parse("rip 0x100000\nrflags 0x1\ngpr 0 1 2 3 4 5 6 7 8 9 a b c d e f\ncode 90c3\nmemory 0x200000 0102\nunmap 0x200010\nreadonly 0x201000\ncpl 0\nwp 0\nsmep 1\nnxe 0\nlarge 0x3fffff\nentry 0x200000 2 set 0x10000000000\nentry 0x200000 4 clear 4\n").unwrap();
         let (c, p) = (&d.cpus[0], &d.spaces[0]);
         assert_eq!((d.cpus.len(), d.sections, c.rip, c.rflags, c.gpr[15]), (1, false, 0x100000, 1, 15));
         assert_eq!((&p.bodies, &p.memory), (&vec![(None, vec![0x90, 0xc3])], &vec![(0x200000, vec![1, 2])]));
         assert_eq!(stop_at(p, c.rip), Ok(0x100002));
         assert_eq!(parse("region 1000 2000\ncode 90").unwrap().spaces[0].regions, vec![(0x1000, 0x2000)]);
-        assert_eq!(p.clear, vec![(0x200000, PRESENT), (0x201000, WRITABLE)]);
-        for bad in ["rip\ncode 90", "code 9", "gpr 1 2\ncode 90", "", "frob 1\ncode 90", "region 1 0\ncode 90"] {
+        assert_eq!((c.cpl, c.wp, c.smep, c.nxe, &p.large), (0, false, true, false, &vec![0x200000]));
+        let edit = |va, level, set, clear| Edit { va, level, set, clear };
+        let edits = [edit(0x200010, None, 0, PRESENT), edit(0x201000, None, 0, WRITABLE), edit(0x200000, Some(2), 1 << 40, 0), edit(0x200000, Some(4), 0, 4)];
+        assert_eq!(p.edits, edits);
+        assert_eq!((parse("code 90").unwrap().cpus[0].cpl, parse("code 90").unwrap().cpus[0].nxe), (3, true));
+        for bad in ["rip\ncode 90", "code 9", "gpr 1 2\ncode 90", "", "frob 1\ncode 90", "region 1 0\ncode 90", "cpl 1\ncode 90", "wp 2\ncode 90",
+                    "entry 0x1000 5 set 1\ncode 90", "entry 0x1000 1 flip 1\ncode 90", "body 0x1000 90\nsmep 1\ncpu\nrip 0x1000"] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
     }

@@ -34,7 +34,7 @@ class WorkerTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location('runner', RUNNER)
         runner = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(runner)
-        args = argparse.Namespace(i2=False, i3_paging=False, i3_allocated=False, i4_entry=True)
+        args = argparse.Namespace(i4_compose=False)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for name in runner.snapshot_inputs(args):

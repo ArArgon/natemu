@@ -19,7 +19,7 @@ def synthetic(scenario="segments", mutation=-1):
     attrs = 3 | (1 << 10) | (3 << 8) | (3 << 53)
     root, lower = [0] * 512, [0] * 512
     root[256] = oracle.IPA + 0x18000 + 3
-    lower[258] = oracle.IPA + 0x72000 | attrs
+    lower[258] = oracle.IPA + 0x72000 | attrs | (1 << 11)
     links = [oracle.IPA + offset + 3 for offset in (0x18000, 0x19000, 0x1A000)]
     final_lower = list(lower)
     latest_memory = max((step for step in oracle.MEMORY_STEPS if step < requested), default=-1)

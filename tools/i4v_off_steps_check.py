@@ -288,7 +288,7 @@ def check(cell, expected_scenario=None):
         exact(cell["upper_leaf_" + suffix], [0] * 512, "no upper operand mapping " + suffix)
     attrs = 3 | (1 << 10) | (3 << 8) | (3 << 53)
     lower = [0] * 512
-    lower[258] = (IPA + 0x72000) | attrs
+    lower[258] = (IPA + 0x72000) | attrs | (1 << 11)     # the host-made source alias is nG since S3a
     exact(cell["lower_leaf_before"], lower, "initial cold data leaf and fixed source alias")
     latest_memory = max((step for step in MEMORY_STEPS if step < requested), default=-1)
     if latest_memory >= 0 and latest_memory < completed and scenario not in ("device", "hole"):

@@ -10,8 +10,10 @@ No performance tuning.
 staging, stacks; shadow tables and pool; lookup area; metadata arena; code area) at the same private VAs, backed by its
 own backing block (fixed stride); host side: thread, `Vcpu`, watchdog, `Compiler` (own `fexc --serve` and object cache).
 Shared: guest RAM (one alias, same VA everywhere) and the global area; all guest-RAM mappings are Normal WB Inner
-Shareable (pinned). Each vCPU's tables use its own ASID, so no TLB entry of another vCPU's tables can hit after a thread
-migrates. `State` gains the vCPU id (replacing cache.rs's `VCPU = 0`); each vCPU reads back `ACTLR_EL1.EnTSO` at start.
+Shareable (pinned). Each vCPU's tables carry its own ASID, so its shadow entries could not hit for another vCPU even in
+a shared TLB. That is a precaution, not shown necessary: an S3a control with every vCPU on ASID 0 and global shadows
+also passed every S3a check, because HVF keeps vCPUs' TLBs apart (across host-thread migration too). The ASIDs are
+harmless, but the migration stress cannot detect a regression in them. `State` gains the vCPU id (replacing cache.rs's `VCPU = 0`); each vCPU reads back `ACTLR_EL1.EnTSO` at start.
 `owners.rs` (barrier, cancellation, join, vCPU-before-VM teardown) runs the execution service per thread; the `hvc #0x4a`
 owner service stays until the family drivers retire (S3i). Any resident halt or host error cancels all vCPUs.
 
@@ -106,7 +108,8 @@ LOCK ADD/CMPXCHG/XADD/BT* and CMPXCHG16B wait for the boot phase.
 
 | Old campaign | What the general path needs | Recommendation |
 | --- | --- | --- |
-| I1 entry, I2 live translation, I3 paging/allocated, address, stack, six-program QEMU check, gate-binary audit | Nothing new: slices 1–2 cover them (fault sets, guard, split, precision verifier, admission). Port I3 cells the slice-1 fault matrix lacks (CR0.WP=0, 2 MiB leaves, reserved bits, SMEP, carry/overflow) as generated cases. REP and FP cells wait for that ISA. Retained-route completion (42) and the resident stack bound (62) get a general-path check or an explicit retirement reason at S3i. | Delete in S3a. ~0.5 run. |
+| I1 entry, I2 live translation, I3 paging/allocated, address, stack | Nothing new: slices 1–2 cover them (fault sets, guard, split, precision verifier, admission). Port I3 cells the slice-1 fault matrix lacks (CR0.WP=0, 2 MiB leaves, reserved bits, SMEP, carry/overflow) as generated cases. REP and FP cells wait for that ISA. Retained-route completion (42) and the resident stack bound (62): a general-path check or an explicit retirement reason. | Deleted at S3a2 (below). |
+| Six-program QEMU check, gate-binary audit | `run_i4v_qemu.py` binds native reports of six programs. Two of them (`live-low-low_operand`, `stack-low-low_stack`) were cells S3a2 deleted, so the check now reproduces only from bundles retained before S3a2; the general-path corpora against QEMU (fixtures, seed corpora, faults) cover those programs' behaviour. The four ordering programs (xchg, lfence, sfence, mfence) live until the ordering family goes. `tools/reference/ref.py` takes its QEMU pins from `run_i4v_qemu.py`. | Delete at S3i (move the pins). |
 | I4 entry/faults/remap/compose/pressure; seeded progress, schedule, partial progress | N vCPUs (S3a), coherence (S3d, S3f). Contracts 45–48 and 53 describe the old global service lock and FIFO; the new design has no global lock, so they retire; progress is checked by S3h. REP partial progress (44): boot-phase handoff. | Delete at S3h. |
 | I4 events (49) | Interrupt delivery: boot phase (handoff item). | Delete; rebuilt with delivery. |
 | Aliases, concurrent stack, stack boundary | Per-vCPU INVLPG (S3c), shared tables (S3f); #SS and split pushes are slice 1. | Re-express in S3f, delete. |
@@ -122,6 +125,67 @@ admission (flat segments; FEX loads segment bases from the frame for explicit DS
 admission refuses those prefixes), code mode in the key, `control()` over the existing legacy/PAE walkers, hidden PDPTEs
 in the bank, and resident transactions with descriptor checks, listed from a disassembly of the pinned kernel's startup
 code: at least CR0.PE/PG, CR4.PAE/PSE, EFER.LME, LGDT, far JMP/RET, likely MOV Sreg after LGDT, LTR, CPUID and PUSHF/POPF.
+
+### S3a2: covering and deleting the I1–I3, address and stack paths
+**Built (Oct 27).** Program-driver description lines (general, no per-case code): per vCPU `cpl 0|3`, `wp 0|1`,
+`smep 0|1`, `nxe 0|1`; per space `large ADDR` (the 2 MiB range one PDE leaf; guest RAM holds one such frame per run) and
+`entry ADDR LEVEL set|clear BITS` (any entry of a walk, PML4E..PTE); code may sit anywhere canonical. The resident needed
+nothing new: its walker already implemented CPL0/3 rights with WP, SMEP and NXE, reserved bits (51:40, XD without NXE, PS
+in a PML4E/PDPTE, 20:13 in a 2 MiB leaf), 2 MiB leaves shadowed as 4 KiB pieces with A/D on the PDE, and upper-half
+shadows (TTBR1). Not supported: CR4.SMAP (refused, `unsupported_mode`; S3c). `tools/run_slice1_faults.py` gained an SDM
+model of the driver's tables (`Machine`, unit-tested in `tools/test_run_slice1_faults.py`), fetch checks before each
+instruction's accesses, per-page leaf A/D comparison (data exact, code A where fetched), cases that run to their end
+(QEMU full run) and generated paging cells: 6 controls (CPL3; CPL0; CPL0 WP=0; CPL0 SMEP; CPL0 SMEP with supervisor
+code; NXE=0) × mutation (unmap, read-only, supervisor, reserved, non-present garbage on a data page; XD, supervisor, unmap,
+reserved on the code page) × level 1–4 × 4 KiB/2 MiB leaf, rotated over the corpus; the 14 position-independent
+access-form programs (data forms, push/pop/ret, page-crossing accesses) take every control × mutation of the leaf of
+each page they touch plus a rotation of the upper levels, at three placements in which the code, the data/stack pages
+and the store base `rdi` (its own page) sit under different PML4 entries (all lower half; all upper half; code alone in
+the upper half), so a mutation hits the access under test rather than the prelude's store or the fetch; the runner
+refuses a run in which an access-form program never faults at its own access (1,236 of the paging cells do; every
+program, including pop and ret stack reads and upper-half loads and read-modify-writes). Results: the fault set grows
+from 434 to 3,169 cases (2,724 paging cases covering all 252 control × mutation × level × leaf-size cells; 522 run to
+their end, 846 fault on fetch), all match at block sizes default and 1; the multi-vCPU corpora (N=4) take the paging cases without a
+2 MiB page. No resident change was needed and none is claimed.
+
+**Walker refusals the boot phase must respect (prerequisites).** The walker (`crates/abi/src/paging.rs`) treats any
+PWT, PCD or PAT bit (entry bits 3 and 4 at any level, bit 7 of a PTE, bit 12 of a 2 MiB leaf) as non-write-back and the
+resident halts (`shadow status=1 detail=7`) when such a page would be shadowed; under the default PAT some of these
+combinations are write-back on x86. This is a refusal, not a wrong result, and the model and corpora never set them; a
+guest that maps owned RAM that way needs the walker to evaluate the PAT first. PS in a PDPTE is reserved: there are no 1 GiB pages, so the
+boot-phase CPUID must report Page1GB=0. The A bit of a non-leaf entry is set by the walk but not compared (leaf A/D are).
+
+**Old checks → covering check or retirement reason.** "Faults" = `run_slice1_faults.py`; "cells" = its paging cells.
+
+| Old check | General-path check, or reason |
+| --- | --- |
+| I1 control, live_load ×4 (exact effects, ADD flags incl. carry/overflow, preserved state: 1, 2) | Fixtures and seed corpora vs QEMU (registers, flags, memory), ASM suite, `frame_intact` every run. |
+| I1 fault (unknown native exception traps, no guessed guest fault: 56) | Resident `aborted`: an abort at an unknown PC or with a syndrome not its site's kind halts (`unknown_abort`/`site_mismatch`) before any effect. No run-time test forces one yet (gap: an S3h tamper). |
+| I1 eight submission mutations, N=2 refusal (55, 54) | Admission refuses malformed objects (host unit tests); resident `request` refuses bad replies (`--tamper offset` → `bad_reply`); link defences (`--forge-header`, `--tamper*`); N=0/5 refused (`limits`, unit test). |
+| I2 live, capacity (38) | Host requests = distinct blocks per vCPU (`run_slice3_vm.py`), exact-request compile cache (unit test), small-cache flush probes. |
+| I2 source_stale (34) | S2e SMC probes, FEX SelfModifyingCode in the ASM suite, seed corpora own-page stores. |
+| I2 context_stale | Code-cache key holds CR3/CPL/mode/controls; no context changes without system instructions: S3c (CR3, WP, NXE programs). |
+| I2 cancel, bad_reply (35) | No cancellable request in the synchronous design; peer cancellation: `limits` forged header; bad replies as above. |
+| I3 cold, carry, overflow | Fixtures (edge-carry-chain), fault probes' prelude (`add` with OF) and division probes (`cmp` with CF, held inverted) at faults. |
+| I3 load_np, store_ro, parent_ro, wp_off, user_denied, reserved, fetch_nx, smep, large (7, 9, 10, 11, 12) | Cells: np-garbage, read-only at CPL0 (leaf, parent levels), CPL0 WP=0 (runs to its end, D set), CPL3 supervisor, reserved per level, XD/SMEP on the code page, 2 MiB leaf variants with A/D on the PDE. Non-leaf A is not compared (policy, §3 item 7 of the inventory). |
+| I3 read-only fill until D, one upgrade (13) | Leaf D compared on every case (D only when written); the upgrade count is internal (resident `upgrades`), not compared. |
+| I3 pressure, helper (5, 41) | Exact state at every fault across the corpora at block sizes default and 1 (precision verifier, admission); division-helper probes (#DE through the 128/64 helper). |
+| I3 fp (ADDPS, MXCSR), partial (REP, 44) | Wait for SSE / REP admission (boot-phase handoff; contract 44 already listed). |
+| Address {high, low} × cold, load_np, user_denied, fetch_nx, smep | Cells on the access-form programs at low, high and high-code placements. |
+| Address low_operand, private_operand (21) | High-code placement (upper-half code, lower-half operands); non-canonical probes at the resident's private range (#GP, nothing written). |
+| Stack {high, low} × cold, low_stack, ro/np first and after first, wp_off, user_ro/denied/ok, parent_ro | Push/pop access forms × cells at three placements; slice-1 page mutations of stack pages in programs with several pushes. |
+| Stack fetch_nx, smep; ss_first, ss_after_first, ss_span, gp_after_pushes, read_np_after_pushes (8, 37) | Code-page cells (no compile before a first-instruction fetch fault); non-canonical stack/data probes (#SS/#GP), non-canonical-end probes; slice-1 unmap of pop pages. |
+| Address 16 and stack 48 reply-word flips (35) | Producer transport (packets) gone; the design core (no false success, failure is never #PF) as I2 bad_reply. |
+| 42 retained-route completion before a remap acknowledgement | Retired: there is no acknowledgement protocol; each vCPU's shadows are its TLB, which may keep a translation until its own INVLPG/CR3 (SDM §4.10.4). Remaps with per-vCPU INVLPG: S3f. |
+| 62 resident stack bound | No check yet: the audit is per binary (inventory §4) and S3b–S3h still add resident paths; redone on the phase's final binary at S3i. |
+
+**Deleted.** Host drivers `i1.rs`, `i2_i3.rs`, `i4v.rs` (address), `i4v_stack.rs` (1,042 lines) and the I3 scenario
+branches of `recovery::prepare` plus three report helpers and `Vm::run` only they used; `run_i1.py` keeps only the I4
+cells, `run_i4v.py` loses the address baseline and stack cells; `check_i3_pressure.py`, `i3_worker.py`, `i4v_worker.py`
+(+ test) and the I3 allocated producer package except `fex_export.py` (the I4-V producer build applies it). **Kept until
+their campaigns retire:** runtime/abi family code (modes are layered: `translation`, `recovery`, `pressure`, `partial`,
+`stack` and `validation` serve every family), `check_i1`/`check_i2`/`check_i3_paging`/`i4v_check`/`i4v_stack_check`
+(imported as helpers by the I4 and I4-V oracles), `fixtures/i1` (the I4 cells' body).
 
 ## 4. Chunks, in order (each keeps slice-1/2 sets green: fixtures, seed 4242, control flow, faults, ASM tests, probes)
 - **S3r, SMP reference (parallel, independent author).** The S2p multiboot stub gains AP start-up (INIT/SIPI), per-vCPU
@@ -139,7 +203,7 @@ code: at least CR0.PE/PG, CR4.PAE/PSE, EFER.LME, LGDT, far JMP/RET, likely MOV S
   read back on every vCPU; a tamper-forced halt on any vCPU stops and joins all, then the VM is destroyed.
   *Built (Oct 27):* backing block v at `v * (BACKING_BYTES + code area)` holds vCPU v's window, lookup, metadata and code
   areas at vCPU 0's offsets (guest RAM and the global area only in block 0); private and shadow descriptors are nG, ASID
-  = vCPU number + 1 (TLBI by ASID; ASID 0 stays the families' untagged world with global shadows). `State::vcpu`; global area: code and writable masks, `Record {pending, stale}` per vCPU,
+  = vCPU number + 1 (TLBI by ASID; ASID 0 stays the families' untagged world with global shadows; a precaution, see §1). `State::vcpu`; global area: code and writable masks, `Record {pending, stale}` per vCPU,
   reset counters (abi `cache`), host and resident producers (`page_written`, runtime `cache::written`: swap the mask to 0,
   post page then `PAGES`), drain (swap `pending`, then words). A halt (also on the host's new `REPLY_PARK`, which ends
   a vCPU at `stop_at`, a fetch fault or no code) resets shadows and writable bits first. `Fault::Contended` replaces the
@@ -179,11 +243,13 @@ code: at least CR0.PE/PG, CR4.PAE/PSE, EFER.LME, LGDT, far JMP/RET, likely MOV S
   process healthy; a peer that never acks a shootdown, compile-server death and a malformed reply on vCPUs 1–3; all vCPUs
   finish under sustained cross-vCPU code writes; one vCPU finishes while a peer misses on its page; watchdog contains a
   stuck wait.
-- **S3i, retirement and handoff.** Delete the `families` feature (runtime/abi `families/`), drivers `i1`, `i2_i3`, `i4v*`,
-  `concurrent*`, `recovery`, abi `translation`/`recovery`/`pressure`/`concurrency` and lib.rs bodies, runtime
-  `coordinator`, `hvc #0x4a`/`OwnerService`, old runners/checkers/workers; inventory gains a "general-path check" column;
-  boot-phase handoff written (44, 51, 49, 64-bit FS/GS bases, the CPUID/SERIALIZE/IRET drain rule). *Check:* suites green;
-  no campaign-named module; every contract maps to a check, a retirement reason or a boot-phase item (42, 62 too).
+- **S3i, retirement and handoff.** Delete the `families` feature (runtime/abi `families/`), drivers `i4v_*`,
+  `concurrent*`, `recovery` (`i1`, `i2_i3`, `i4v` and `i4v_stack` went at S3a2), abi `translation`/`recovery`/`pressure`/
+  `concurrency` and lib.rs bodies, runtime `coordinator`, `hvc #0x4a`/`OwnerService`, old runners/checkers/workers
+  (including the I1–I3/address/stack checkers S3a2 kept as other families' oracle helpers); inventory gains a
+  "general-path check" column; boot-phase handoff written (44, 51, 49, 64-bit FS/GS bases, the CPUID/SERIALIZE/IRET drain
+  rule). *Check:* suites green; no campaign-named module; every contract maps to a check, a retirement reason or a
+  boot-phase item; the resident stack audit (62) redone on the phase's final binary.
 
 ## 5. Owner decisions (recorded October 27, 2026)
 1. **32-bit and paging-off segmentation forms go to the boot phase** (segment bases and limits, CS limit, A20, 16-bit

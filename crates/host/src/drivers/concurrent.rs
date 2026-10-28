@@ -300,7 +300,7 @@ pub fn run(args: &[String]) -> Result<()> {
         seeds.push((frame, bank, data));
     }
     if args[3] != "entry" {
-        recovery::prepare(&memory, &seeds[0].0, "cold", false)?;
+        recovery::prepare(&memory, &seeds[0].0);
         if alias_profile != 0 {
             memory.word(
                 natemu_abi::recovery::TABLE_OFFSET + 256 * 8,

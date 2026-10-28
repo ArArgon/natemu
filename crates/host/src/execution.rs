@@ -393,13 +393,17 @@ impl natemu_abi::guest_memory::Observer for Writes {
     }
 }
 
+/// Fetches lost to peers' A/D races in a row before the host gives up on a request (a livelock the guest causes: x86
+/// re-walks without bound, but a host thread must not spin forever; each fetch already re-walks `WALK_ATTEMPTS` times).
+const FETCH_ATTEMPTS: usize = 100_000;
+
 /// Guest bytes at `rip` up to the end of its page, continuing into the next
-/// page when that is fetchable, and never past `limit`. A walk that loses its A/D
-/// races to peers is repeated (x86 re-walks), until `cancelled`.
+/// page when that is fetchable, and never past `limit`. A fetch whose walk (of either page) loses its A/D
+/// races to peers is repeated whole (x86 re-walks), until `cancelled` or [`FETCH_ATTEMPTS`] (then an error).
 fn fetch(memory: &Memory, cpu: &Cpu, rip: u64, limit: Option<u64>, cancelled: &AtomicBool) -> Result<std::result::Result<Fetched, Fault>> {
     let ram = guest_ram(memory);
     let control = cpu.control().ok_or("bank is not in 4-level long mode")?;
-    loop {
+    for _ in 0..FETCH_ATTEMPTS {
         let mut tables = GuestTables::observed(ram, Writes(Vec::new()));
         let fetched = fetch_with(&mut tables, ram, control, rip, limit);
         for gpa in tables.observer.0 {
@@ -410,9 +414,10 @@ fn fetch(memory: &Memory, cpu: &Cpu, rip: u64, limit: Option<u64>, cancelled: &A
             _ => return fetched,
         }
     }
+    Err(format!("fetch at {rip:#x}: page walks lost {FETCH_ATTEMPTS} A/D races in a row (livelock)"))
 }
-fn fetch_with(
-    tables: &mut GuestTables<Writes>,
+fn fetch_with<O: natemu_abi::guest_memory::Observer>(
+    tables: &mut GuestTables<O>,
     ram: GuestRam,
     control: paging::Control,
     rip: u64,
@@ -431,9 +436,10 @@ fn fetch_with(
             Ok(t) if t.wb => t,
             Ok(_) if pages.is_empty() => return Err(format!("code at {va:#x} is not write-back memory")),
             Ok(_) => break,
+            // Either page's walk lost its races: the whole fetch is repeated (an instruction may straddle into the
+            // next page, which must not look undecodable).
+            Err(f @ Fault::Contended) => return Ok(Err(f)),
             Err(f) if pages.is_empty() => return Ok(Err(f)),
-            // The next page's walk lost its races: end the bytes at this page (the block ends there, or re-asks).
-            Err(Fault::Contended) => break,
             Err(f) => {
                 next_fault = Some(f);
                 break;
@@ -650,6 +656,33 @@ mod tests {
         assert_eq!(record_word(&memory, 1, None).load(SeqCst), 0);
         guest_ram_written(&memory);
         assert!((0..cache::MAX_VCPUS).all(|v| record_word(&memory, v, None).load(SeqCst) & cache::FLUSH != 0));
+    }
+
+    /// A second page whose walk loses its A/D races is a contended fetch of the whole range, not a fetch that ends at the
+    /// first page with a fault of the next: [`fetch`] repeats it, and the repeat sees both pages.
+    #[test]
+    fn a_contended_second_page_makes_the_whole_fetch_contended() {
+        // Guest-physical 0x1000.. is this array: PML4, PDPT, PD, PT, then the code pages at 0x5000 and 0x6000.
+        let mut backing = [0u64; 0x6000 / 8];
+        for (i, v) in [(0, 0x2007), (512, 0x3007), (1024, 0x4007), (1537, 0x5007), (1538, 0x6007)] {
+            backing[i] = v;
+        }
+        let ram = unsafe { GuestRam::new(0x1000, 0x6000, backing.as_mut_ptr() as u64) };
+        let control = paging::Control { cr3: 0x1000, cpl: 3, wp: 1, nxe: 1, smep: 0 };
+        // Every A-bit write to the second page's PTE (0x4010) finds an unrelated bit (AVL) changed.
+        struct Race(GuestRam);
+        impl natemu_abi::guest_memory::Observer for Race {
+            fn write(&mut self, gpa: u64, old: u64, _: u64) -> bool {
+                if gpa == 0x4010 {
+                    assert!(self.0.write::<u64>(gpa, old ^ 0x200));
+                }
+                true
+            }
+        }
+        let lost = fetch_with(&mut GuestTables::observed(ram, Race(ram)), ram, control, 0x1ff0, None);
+        assert!(matches!(lost, Ok(Err(Fault::Contended))));
+        let f = fetch_with(&mut GuestTables::observed(ram, Writes(Vec::new())), ram, control, 0x1ff0, None).unwrap().unwrap();
+        assert_eq!((f.bytes.len(), f.pages, f.next_fault), (0x10 + 0x1000, vec![[0x1000, 0x5000], [0x2000, 0x6000]], None));
     }
 
     #[test]

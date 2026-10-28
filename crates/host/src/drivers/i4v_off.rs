@@ -112,7 +112,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let upper_root_before = table_words(&memory, shadow::UPPER_ROOT);
     let upper_leaf_before = table_words(&memory, shadow::UPPER_LEAF);
     let lower_leaf_before = table_words(&memory, shadow::LOWER_LEAF);
-    let upper_links_before = i4v::upper_links(&memory);
+    let upper_links_before = upper_links(&memory);
     let code_before = memory.read::<{ off::CODE_BYTES }>(CODE_OFFSET);
     memory.write_record(recover::GUEST_OFFSET, guest);
     memory.write_record(recover::STATE_OFFSET, recovery_state);
@@ -230,7 +230,7 @@ pub fn run(args: &[String]) -> Result<()> {
         table_words(&vm.memory, shadow::UPPER_ROOT),
         table_words(&vm.memory, shadow::UPPER_LEAF),
         table_words(&vm.memory, shadow::LOWER_LEAF),
-        i4v::upper_links(&vm.memory),
+        upper_links(&vm.memory),
         off_state.a20,
         off_state.scenario,
         off_state.transfers,

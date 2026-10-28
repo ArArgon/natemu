@@ -5,13 +5,9 @@
 use crate::*;
 
 mod concurrent;
-mod i1;
-mod i2_i3;
-mod i4v;
 mod i4v_controls;
 mod i4v_off;
 mod i4v_off_steps;
-mod i4v_stack;
 mod program;
 mod recovery;
 
@@ -53,31 +49,10 @@ pub(crate) fn run(a: &[String]) -> Result<()> {
     if (a.len() == 9 || a.len() == 10) && a[2] == "i4v-off-live" {
         return i4v_off::run(a);
     }
-    if (a.len() == 9 || a.len() == 10) && a[2] == "i4v-stack-live" {
-        return i4v_stack::run(a);
-    }
-    if (a.len() == 9 || a.len() == 10) && a[2] == "i4v-live" {
-        return i4v::run(a);
-    }
-    if a.len() != 7 {
-        return Err("usage: natemu-host RUNTIME.elf FEX.arm64 control|live_load|fault VECTOR none|version|profile|size|target|entry|code|address|vcpu N".into());
-    }
-    if a[2] == "i4" || a[2] == "i4v-mixed" {
+    if a.len() == 7 && (a[2] == "i4" || a[2] == "i4v-mixed") {
         return concurrent::run(a);
     }
-    if a[2] == "i4v" {
-        return i4v::run(a);
-    }
-    if a[2] == "i2"
-        || a[2] == "i3"
-        || a[2] == "i3-pressure"
-        || a[2] == "i3-fp"
-        || a[2] == "i3-helper"
-        || a[2] == "i3-partial"
-    {
-        return i2_i3::run(a);
-    }
-    i1::run(a)
+    Err("usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [OPTIONS] | i4 ... | i4v-* ...".into())
 }
 
 /// Seed input vector `index` (0..4): native entry frame, register bank and data page.
@@ -112,4 +87,10 @@ fn seed(index: usize) -> (NativeFrame, [u8; 512], [u8; 256]) {
     initial.fpcr = 0x01000000;
     initial.fpsr = 0x08000001;
     (frame, bank, data)
+}
+
+/// The upper shadow half's pre-linked root, L1 and L2 table words.
+pub(super) fn upper_links(memory: &Memory) -> [u64; 3] {
+    let word = |offset: usize| u64::from_le_bytes(memory.read::<8>(offset));
+    [word(natemu_abi::shadow::UPPER_ROOT + 256 * 8), word(natemu_abi::shadow::UPPER_L1), word(natemu_abi::shadow::UPPER_L2)]
 }

@@ -239,15 +239,6 @@ impl Vm {
     pub(crate) fn shared(&self) -> Shared {
         self.memory.read_record(SHARED_OFFSET)
     }
-    pub(crate) fn run(&self, expected: u64) -> Result<()> {
-        let event = self.cpu.run_to_hvc()?;
-        if event != expected {
-            return Err(format!(
-                "unexpected HVC immediate {event:#x}, expected {expected:#x}"
-            ));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
