@@ -16,6 +16,7 @@
 //!
 //! Description (text, one item per line):
 //!   rip ADDR | rflags VALUE | gpr V0 .. V15 | code HEX | memory ADDR HEX
+//!   | region ADDR SIZE   (zero-filled writable pages covering the byte range; eager: guest RAM bounds the total)
 //!   | unmap ADDR | readonly ADDR   (mutations: clear P or R/W in the leaf entry of ADDR's page after setup)
 use super::super::*;
 use crate::execution::{self, Compiler, Stop};
@@ -32,6 +33,8 @@ struct Program {
     gpr: [u64; 16],
     code: Vec<u8>,
     memory: Vec<(u64, Vec<u8>)>,
+    /// Zero-filled writable ranges (address, length).
+    regions: Vec<(u64, u64)>,
     /// Leaf-entry bits cleared after setup, per page.
     clear: Vec<(u64, u64)>,
 }
@@ -47,7 +50,7 @@ fn hex(text: &str) -> Result<Vec<u8>> {
         .collect()
 }
 fn parse(text: &str) -> Result<Program> {
-    let mut p = Program { rip: 0, rflags: 0, gpr: [0; 16], code: vec![], memory: vec![], clear: vec![] };
+    let mut p = Program { rip: 0, rflags: 0, gpr: [0; 16], code: vec![], memory: vec![], regions: vec![], clear: vec![] };
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let words: Vec<_> = line.split_whitespace().collect();
         match (words[0], &words[1..]) {
@@ -60,6 +63,7 @@ fn parse(text: &str) -> Result<Program> {
             }
             ("code", [h]) => p.code = hex(h)?,
             ("memory", [a, h]) => p.memory.push((number(a)?, hex(h)?)),
+            ("region", [a, n]) if number(n)? > 0 => p.regions.push((number(a)?, number(n)?)),
             ("unmap", [a]) => p.clear.push((number(a)? & !4095, PRESENT)),
             ("readonly", [a]) => p.clear.push((number(a)? & !4095, WRITABLE)),
             _ => return Err(format!("bad description line: {line}")),
@@ -240,8 +244,12 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     for page in page_span(p.rip, p.code.len()) {
         flags.insert(page, 0);
     }
-    for (address, data) in &p.memory {
-        for page in page_span(*address, data.len()) {
+    let ranges = p.memory.iter().map(|(a, d)| (*a, d.len() as u64)).chain(p.regions.iter().copied());
+    for (address, length) in ranges {
+        if length > exec::GUEST_RAM_BYTES as u64 {
+            return Err("guest RAM exhausted".into());
+        }
+        for page in page_span(address, length as usize) {
             let code = flags.get(&page) == Some(&0);
             flags.insert(page, WRITABLE | if code { 0 } else { NO_EXECUTE });
         }
@@ -382,8 +390,9 @@ mod tests {
     fn description_parses_and_rejects_malformed_lines() {
         let p = parse("rip 0x100000\nrflags 0x1\ngpr 0 1 2 3 4 5 6 7 8 9 a b c d e f\ncode 90c3\nmemory 0x200000 0102\nunmap 0x200010\nreadonly 0x201000\n").unwrap();
         assert_eq!((p.rip, p.rflags, p.gpr[15], p.code, p.memory), (0x100000, 1, 15, vec![0x90, 0xc3], vec![(0x200000, vec![1, 2])]));
+        assert_eq!(parse("region 1000 2000\ncode 90").unwrap().regions, vec![(0x1000, 0x2000)]);
         assert_eq!(p.clear, vec![(0x200000, PRESENT), (0x201000, WRITABLE)]);
-        for bad in ["rip\ncode 90", "code 9", "gpr 1 2\ncode 90", "", "frob 1\ncode 90"] {
+        for bad in ["rip\ncode 90", "code 9", "gpr 1 2\ncode 90", "", "frob 1\ncode 90", "region 1 0\ncode 90"] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
     }
