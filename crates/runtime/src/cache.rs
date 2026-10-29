@@ -323,9 +323,13 @@ fn relocate(code: u64, dispatch_exit: u64) {
 /// Arms a precise stop in `b` (the block the doorbell interrupted; live, or the step block): every exit's word (each
 /// link point's first word, linked or not, and the computed exit's `b`) becomes [`STOP_WORD`], recorded with its word
 /// for [`disarm`]. Every path out of a block passes one of them or enters the resident (`svc`, a stub, an abort):
-/// branches inside a block go forward and none enters a link point after its first word (admission).
-pub fn arm(b: &Block) {
+/// branches inside a block go forward and none enters a link point after its first word (admission). False (nothing
+/// patched) when a stop is armed already: every resident entry disarms first, so a second arm is a resident bug.
+pub fn arm(b: &Block) -> bool {
     let c = control();
+    if c.armed != 0 {
+        return false;
+    }
     let points = b.links.iter().filter(|p| p.offset != 0).map(|p| p.offset);
     let exits = points.chain((b.dispatch_exit != 0).then_some(b.dispatch_exit));
     for offset in exits {
@@ -335,6 +339,7 @@ pub fn arm(b: &Block) {
         unsafe { ((area::CODE_WRITE_VA + at) as *mut u32).write_volatile(STOP_WORD) };
     }
     synchronize_words(c);
+    true
 }
 /// Restores the words [`arm`] patched (each must still hold [`STOP_WORD`]) and empties the record: at every resident
 /// entry from generated code, before anything reads or rewrites code. Returns the restored code-area offsets (the

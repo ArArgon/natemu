@@ -39,7 +39,7 @@
 use std::ops::Range;
 
 use natemu_abi::code_object::{self as object, PcEntry, Reloc, Site};
-use natemu_abi::execution::{DISPATCH_PLACEHOLDER, ENTRY_OFFSET, LinkPoint, PRE_NZCV_REG, frame, svc};
+use natemu_abi::execution::{DISPATCH_PLACEHOLDER, ENTRY_OFFSET, LinkPoint, PRE_NZCV_REG, bitmask, frame, svc};
 
 /// The 64-bit index forms (LSL, UXTX, SXTX) compute the same address: one extend value.
 const EXT_X: u8 = object::EXT_SXTX;
@@ -108,21 +108,6 @@ impl Insn {
     fn falls_through(&self) -> bool {
         !matches!(self, Insn::B(_) | Insn::Dispatch | Insn::Svc(svc::LINK) | Insn::Brk | Insn::Udf)
     }
-}
-
-/// The value of a logical-immediate word's bitmask (DecodeBitMasks), `None` if reserved.
-fn bitmask(w: u32) -> Option<u64> {
-    let (n, immr, imms) = (w >> 22 & 1, w >> 16 & 63, w >> 10 & 63);
-    let len = 31 - (n << 6 | (!imms & 63)).leading_zeros();
-    let esize = 1u32.checked_shl(len).filter(|&e| e >= 2 && (w >> 31 == 1 || e <= 32))?;
-    let (s, r) = (imms & (esize - 1), immr & (esize - 1));
-    if s == esize - 1 {
-        return None;
-    }
-    let ones = (1u64 << (s + 1)) - 1;
-    let emask = if esize == 64 { u64::MAX } else { (1 << esize) - 1 };
-    let elem = (ones >> r | ones << (esize - r) % esize) & emask;
-    Some((0..64 / esize).fold(0, |v, i| v | elem << (i * esize)))
 }
 
 fn sext(v: u32, bits: u32) -> i64 {

@@ -172,6 +172,7 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 | **E2** EL0 switch | Page roles (code execute-only, L1 code, EL1-only resident), lower-EL vectors, EC 0x24/0x20 at EL0, stop and fault paths from EL0 | Standing suite; trap checks for system instructions at EL0 | standing suite | all green at EL0 |
 | **E3** guard off, admission split | Remove patch-0007 guard words and checks; admission = mandatory object validation + optional code-shape debug; negative tests: every former window address and both canonical straddles give #GP/#SS | Faults suite + new negative cells; census | standing suite | 0 guard words; all #GP/#SS exact |
 | **E4** review | Independent review of E1b–E3 as one design | — | standing suite | ACCEPT |
+| **P1** x86 privilege in shadows | E2 shadows carry no x86 U/S (the walker checks at the current CPL; CPL is fixed per run today). Before any CPL transition (X1b delivery from CPL3, S3 SYSCALL/SYSRET, IRETQ to CPL3): keep one shadow space per x86 CPL class (separate ASIDs/roots for CPL0 and CPL3) so a CPL change switches spaces instead of resetting, and a CPL0 shadow can never serve a CPL3 access | Fault matrix at both CPLs across transitions; syscall/IRET round trips that touch supervisor pages before and after | standing suite | no CPL3 access through a CPL0 shadow; no shadow flush per transition |
 | **G1** guest-state page | One EL0 page per vCPU at a fixed non-canonical address holding only FEX guest-state fields (DF, FS/GS, MXCSR, x87, AVX-high); documented deviation; invariant test | Layout test; non-#GP limited to that page | standing suite | invariant test fails on any non-guest field |
 | **K1** code cache across CR3/INVLPG | Blocks filed by guest-physical source pages; CR3/INVLPG drop only shadows; linear→physical revalidation on lookup; per-page invalidation for host/device writes | Address-space switch programs keep translations (counted); remap/rewrite always retranslated; QEMU at 1–4 vCPUs | `system`, `coherence`, `sharedpt` | no full flush on CR3 |
 | **S4** debug: TF and breakpoints | TF/RF single-step, DR0–3/DR7 execute and data breakpoints, #DB delivery, interaction with linking/dispatch (CPU 16 requires it) | QEMU programs; SDM model | standing suite | #DB exact per SDM |
@@ -275,6 +276,21 @@ running block's exits (including computed exits) to stop, restores them after; n
 *Built (E1b):* with the pad gone, `hv_vm_protect` has nothing precise to protect and is removed; the host fallback is
 `hv_vcpus_exit` under the watchdog (a failed or lost doorbell is contained — the run stops — not recovered). A precise
 host fallback remains possible if wanted (exit, then enter the resident's IRQ path with the exited PC). Owner informed.
+*Built (E2):* translated code runs at EL0 (blocks entered with SPSR EL0t, IRQs unmasked); its `svc`, `brk`, aborts and
+traps arrive at the lower-EL vectors, every other vector is a resident fault that halts. Page roles: the code area
+(blocks, slot, dispatcher, L1) is EL1 read-only and EL0 execute-only (never EL1-executable); resident text is
+EL1-executable only; every other private page (State, tables, records, frame page, stacks, guest-RAM alias) is
+EL1-only; shadows are EL0 read/write or read-only. x86 CPL stays in the software walker: a shadow exists only for an
+access granted at the vCPU's CPL, so CPL0 shadows of supervisor pages and CPL3 shadows of user pages map alike (a CPL
+change would have to reset shadows; none exists yet). Isolation is the hardware's: forged system instructions halt
+`trapped` (ESR 0x00/0x01/0x18) and loads, stores and branches into the private window `private_access`
+(`contain` EL0_FORGED). The guard stays; a guest access cannot reach the window through it. Steady-state benchmarks
+unchanged. Also: the resident decodes each link point's move at the reply (it must build the point's target). EL0
+access to the debug channel, counters/timers and PMU traps to EL1, not the host (MDSCR_EL1.TDCC, CNTKCTL_EL1 = 0).
+**E3 input:** `aborted` classifies `trapped`/`private_access` before the site lookup. Once the guard goes, an abort at a
+recorded access site must become #GP/#SS from the walker by `site_address`, even with FAR in the window or a permission
+fault on the code area; `private_access` stays only for an ELR that is no access site. G1's page must lie outside the
+window or be exempted explicitly.
 **Owner decision (October 28): MTRRs enabled by the virtual firmware, RAM write-back, device ranges uncached** (plan Q3).
 **Deferred (owner, October 28):** replacing the host's minimal JSON reader (`crates/host/src/json.rs`, used only for
 fexc's per-compile report: end reason and cut opcode) by carrying those fields in the code-object header; no registry

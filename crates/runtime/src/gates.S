@@ -93,9 +93,27 @@ exception_capture:
     bl finish
     b .
 
-// Current EL with SP0 (generated code runs at EL1t): synchronous, then IRQ (the doorbell, `irq_gate`).
+// Generated code runs at EL0: its exceptions arrive in the lower-EL AArch64 group, synchronous (`svc`, `brk`, aborts,
+// traps) at +0x400 and IRQ (the doorbell, `irq_gate`) at +0x480. Every other vector is the resident's own fault (it runs
+// at EL1 with IRQs masked): it reaches the capture gate too, and `returned` halts on its SPSR (not EL0t).
 .balign 2048
 vectors:
+    b exception_capture
+    .balign 128
+    b exception_capture
+    .balign 128
+    b exception_capture
+    .balign 128
+    b exception_capture
+    .balign 128
+    b exception_capture
+    .balign 128
+    b exception_capture
+    .balign 128
+    b exception_capture
+    .balign 128
+    b exception_capture
+    .balign 128
     b exception_capture
     .balign 128
     b irq_gate
@@ -112,24 +130,8 @@ vectors:
     .balign 128
     b exception_capture
     .balign 128
-    b exception_capture
-    .balign 128
-    b exception_capture
-    .balign 128
-    b exception_capture
-    .balign 128
-    b exception_capture
-    .balign 128
-    b exception_capture
-    .balign 128
-    b exception_capture
-    .balign 128
-    b exception_capture
-    .balign 128
-    b exception_capture
-    .balign 128
 
-// The IRQ gate: a doorbell interrupted generated code at EL1t (the resident runs with interrupts masked); ELR_EL1 is
+// The IRQ gate: a doorbell interrupted generated code at EL0 (the resident runs with interrupts masked); ELR_EL1 is
 // the next instruction, SPSR_EL1 its PSTATE.
 .global irq_gate
 irq_gate:

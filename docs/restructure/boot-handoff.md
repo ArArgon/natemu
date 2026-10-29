@@ -6,8 +6,9 @@ This page is enough to start the next phase (stock-kernel boot, I5); the slice c
 
 ## 1. What exists
 
-x86-64 guest code runs as FEX-compiled ARM64 blocks inside one Hypervisor.framework VM, at EL1, under a small resident
-runtime that owns translation, faults, the code cache and system instructions. The host compiles and supervises; it
+x86-64 guest code runs as FEX-compiled ARM64 blocks inside one Hypervisor.framework VM, at EL0 since E2, under a small
+resident runtime at EL1 that owns translation, faults, the code cache and system instructions. Every private page is
+EL1-only except the code area, which EL0 may only execute; shadows of guest pages are EL0 read/write or read-only. The host compiles and supervises; it
 never runs guest code.
 
 | Piece | What it does | Where |
@@ -164,15 +165,16 @@ iteration is unexplained. Known costs and limits:
   costly on context switches.
 - **INVLPG leaves spurious code bits:** it drops the vCPU's blocks of the 2 MiB range but keeps their pages' code-mask
   bits, so later writes there still take the code-write path until the next flush (conservative).
-- **Stop latency tail:** a stop takes effect at the next block entry after `hv_vm_protect` returns, but wall-clock
-  latency has a host-scheduling tail (up to 1.6% of kicks > 1 ms at 4 oversubscribed vCPUs; up to ~10 ms observed).
-- **Protect-call contention:** concurrent `hv_vm_protect` calls contend (p99 about 200 µs with 8 callers vs 30 µs with
-  one); redundant protects are skipped.
+- **Stop latency tail:** since E1b a stop is a GIC doorbell (no `hv_vm_protect`); it takes effect at the interrupted
+  block's next boundary. Ring to stop, hot loop (E2, `kicks --kicks 1000`): p50 5–8 µs, p99 9–59 µs, with a
+  host-scheduling tail to about 5–8 ms (max per vCPU, 1 and 4 vCPUs).
+- **Doorbell ring cost:** `hv_gic_set_spi` takes 0.4 µs with one kicker and 5.5–6.9 µs on average with four kicking at
+  once (same run); acknowledging an IRQ in the resident (IAR to EOI) about 2.2–4 µs.
 - **Cancellation during a compile stall:** cancellation does not interrupt a pending compile request; a vCPU whose
   compile server is alive but silent is released only at the request deadline (30 s default, `--compile-deadline-ms`).
   A resident wait on a peer also counts that peer's compile time into the waiter's watchdog span.
-- **Resident stack:** 11,568 bytes at the deepest gate path, 16,000 with one nested entry to its halt, of a 32 KiB
-  exception stack (16,768 bytes margin; `tools/check_resident_stack.py`). New resident paths (delivery, devices) must be
+- **Resident stack:** 14,176 bytes at the deepest gate path, 19,616 with one nested entry to its halt, of a 32 KiB
+  exception stack (13,152 bytes margin; boot path 7,728 of 16 KiB; `tools/check_resident_stack.py`, E2). New resident paths (delivery, devices) must be
   re-checked. An overflow is contained to the vCPU but overwrites its boot/block stack before it halts.
 - **Compile latency:** every distinct block is a host round trip on first use (about 0.4 ms per block with the compile
   server, S2a; 13.4 ms the slowest measured, including the server's start).

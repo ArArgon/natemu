@@ -99,13 +99,14 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize) -> Result<Bac
             own((EXCEPTION_STACK_TOP - PRIVATE) as usize - 0x8000, 0x8000),
             own(exec::STAGING_OFFSET, exec::STAGING_BYTES),
             shared(exec::GUEST_RAM_OFFSET, exec::GUEST_RAM_BYTES),
-            Span::text((cache::CODE_VA - PRIVATE) as usize, code_mapped, base + cache::CODE_OFFSET),
+            // Generated code runs at EL0 from the code area (EL0 execute-only); the resident writes it through its alias.
+            Span::code((cache::CODE_VA - PRIVATE) as usize, code_mapped, base + cache::CODE_OFFSET),
             Span::data((cache::CODE_WRITE_VA - PRIVATE) as usize, code_mapped, base + cache::CODE_OFFSET),
             Span::data((cache::META_VA - PRIVATE) as usize, cache::META_BYTES, base + cache::META_OFFSET),
             Span::data((cache::LOOKUP_VA - PRIVATE) as usize, cache::LOOKUP_BYTES, base + cache::LOOKUP_OFFSET),
             Span::data((cache::GLOBAL_VA - PRIVATE) as usize, cache::GLOBAL_BYTES, cache::GLOBAL_OFFSET),
         ]);
-        private_space(&memory, base, &spans, &[], true);
+        private_space(&memory, base, &spans, true);
         // SAFETY: Control is plain integers; the resident owns everything but the capacity.
         let mut control: cache::Control = unsafe { std::mem::zeroed() };
         control.code_bytes = (cache::HEAD_BYTES + code_bytes) as u64;
@@ -173,6 +174,8 @@ pub(crate) struct Kick {
     pub(crate) latency: Vec<(u64, bool)>,
     /// The last ring: `mach_absolute_time`, in the host.
     rung: Option<(u64, bool)>,
+    /// The vCPU's run ended (or it never ran): no kick rings it any more ([`Stops::end`]).
+    ended: bool,
 }
 unsafe extern "C" {
     fn mach_absolute_time() -> u64;
@@ -200,9 +203,12 @@ impl Stops {
             latencies,
         }
     }
-    /// Stops vCPU `v` of `machine` at its next block boundary.
-    pub(crate) fn kick(&self, machine: &Machine, v: usize) -> Result<()> {
+    /// Stops vCPU `v` of `machine` at its next block boundary; false (nothing rung) once its run [ended](Self::end).
+    pub(crate) fn kick(&self, machine: &Machine, v: usize) -> Result<bool> {
         let mut k = self.kicks.get(v).ok_or(format!("kick of vCPU {v}: no such vCPU"))?.lock().unwrap();
+        if k.ended {
+            return Ok(false);
+        }
         let in_host = self.in_host[v].load(SeqCst);
         let at = unsafe { mach_absolute_time() };
         machine.ring(v)?;
@@ -210,7 +216,24 @@ impl Stops {
         k.rung = Some((at, in_host));
         k.issued += 1;
         k.in_host += u64::from(in_host);
-        Ok(())
+        Ok(true)
+    }
+    /// vCPU `v`'s run ended (or it never started): from now on no kick rings it, and a kick in progress has completed
+    /// (the mutex). That every GIC call is serialized with vCPU create and destroy is `vm.rs`'s (its GIC lock).
+    pub(crate) fn end(&self, v: usize) {
+        self.kicks[v].lock().unwrap().ended = true;
+    }
+    pub(crate) fn ended(&self, v: usize) -> bool {
+        self.kicks[v].lock().unwrap().ended
+    }
+    /// Whether vCPU `v`'s doorbell is still pending (rung, not acknowledged), asked under its kick mutex: `None` once
+    /// its run [ended](Self::end).
+    pub(crate) fn ringing(&self, machine: &Machine, v: usize) -> Result<Option<bool>> {
+        let k = self.kicks[v].lock().unwrap();
+        if k.ended {
+            return Ok(None);
+        }
+        machine.ringing(v).map(Some)
     }
     /// Stops vCPU `v` (`area`) has taken (the resident's count).
     pub(crate) fn taken(&self, area: Area) -> u64 {
@@ -227,7 +250,7 @@ impl Stops {
         }
     }
     /// Records whether vCPU `v`'s doorbell is still pending (after it and its kicker ended, before the VM goes).
-    pub(crate) fn ended(&self, machine: &Machine, v: usize) -> Result<()> {
+    pub(crate) fn pending_at_end(&self, machine: &Machine, v: usize) -> Result<()> {
         let pending = machine.ringing(v)?;
         self.kicks[v].lock().unwrap().pending = pending;
         Ok(())
@@ -313,10 +336,10 @@ pub(crate) enum Stop {
     NoCode(String),
     /// The resident stopped the VM: `State::stop` (0 for a non-execution stop) and the shared status/detail.
     Resident { stop: u64, status: u64, detail: u64 },
-    /// The watchdog forced the vCPU out (imprecise: the bank is not current) at native `pc`: in guest code (a guest
-    /// loop ran past the budget) or in the resident (a resident wait, e.g. for a peer's shadow reset, never ended);
-    /// `asked` = the peers whose `SHADOWS` request was still pending then (bit p: vCPU p).
-    Watchdog { pc: u64, asked: u8 },
+    /// The watchdog forced the vCPU out (imprecise: the bank is not current) at native `pc`: in generated code (`el0`: a
+    /// guest loop ran past the budget) or in the resident (EL1: a resident wait, e.g. for a peer's shadow reset, never
+    /// ended); `asked` = the peers whose `SHADOWS` request was still pending then (bit p: vCPU p).
+    Watchdog { pc: u64, el0: bool, asked: u8 },
     /// A peer's failure cancelled the run (imprecise when the vCPU was forced out).
     Cancelled,
 }
@@ -677,7 +700,7 @@ fn serve(
                 let asked = (0..cache::MAX_VCPUS)
                     .filter(|&p| p != v && record_word(area.memory, p, None).load(SeqCst) & cache::SHADOWS != 0)
                     .fold(0, |m, p| m | 1 << p);
-                return Ok(Stop::Watchdog { pc: cpu.reg(PC)?, asked });
+                return Ok(Stop::Watchdog { pc: cpu.reg(PC)?, el0: cpu.reg(CPSR)? & 0x1f == 0, asked });
             }
         };
         match exit {

@@ -9,12 +9,15 @@
 //! the watchdog (default 10 s). After the run each vCPU's cache link points are
 //! self-checked ([`execution::check_links`]). Run-time defence checks, which corrupt what admission or the resident
 //! would never produce, on vCPU `--tamper-vcpu V` (default 0): `--forge-exit` makes every literal exit move another RIP than its link
-//! point's target into x0, the last word of its move altered (the resident's linker must halt); `--tamper KIND` corrupts the cache when the
+//! point's target into x0, the last word of its move altered (the resident refuses the reply: `bad_reply`); `--tamper KIND` corrupts the cache when the
 //! next block will not fit and the resident is about to flush (KIND `offset`: a link point outside the code, so the reply
 //! is refused; `word`: a linked point's branch; `record`: a link record),
 //! and the unlink must halt (`bad_link`); `--tamper-after KIND` (not `offset`) corrupts after the run, and the host's
 //! self-check must refuse (`links_check`); `--forge-stop` writes the stop word (`exec::STOP_WORD`) over the first
-//! block's entry, a stop nobody armed (the resident must halt: `bad_stop`); `--tamper armed` records an armed stop at a
+//! block's entry, a stop nobody armed (the resident must halt: `bad_stop`); `--forge-entry W[,W..]` writes those A64
+//! words there instead (generated code runs at EL0, so a system instruction must halt `trapped` and an access to the
+//! private window `private_access`); `--tamper target` changes a link point's target alone (its move unchanged: the reply
+//! is refused, `bad_reply`); `--tamper armed` records an armed stop at a
 //! word that does not hold the stop word (the next resident entry must halt: `bad_stop`); `--tamper dispatch` names the
 //! first block's entry as its computed exit (the reply is refused: `bad_reply`); `--tamper system` makes the first system reply's decode malformed (the resident
 //! must refuse it: `bad_reply`); `--tamper next-page` answers a block request with [`exec::REPLY_NEXT_PAGE`] twice (the
@@ -381,7 +384,7 @@ fn page_span(start: u64, length: usize) -> impl Iterator<Item = u64> {
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] \
                      [--code-cache BYTES] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-exit] [--tamper offset|word|record|system] [--tamper-after word|record] \
-                     [--forge-stop] [--kick-vcpu V]... [--kicks M] [--kick-every-us P] [--kick-jitter-us J] [--tamper next-page|site|site-kind|armed|dispatch] [--ignore-kicks] [--kill-compiler N] [--stall-compiler N] [--compile-deadline-ms MS]";
+                     [--forge-stop] [--forge-entry HEX[,HEX]...] [--kick-vcpu V]... [--kicks M] [--kick-every-us P] [--kick-jitter-us J] [--tamper next-page|site|site-kind|armed|dispatch|target] [--ignore-kicks] [--kill-compiler N] [--stall-compiler N] [--compile-deadline-ms MS]";
 
 /// Every literal exit's RIP move puts another RIP in x0: bit 0 of the immediate of its last word (the one before its
 /// `svc #LINK`) flips. A one-word move would change the link point's first word itself, which the host's self-check
@@ -491,13 +494,28 @@ fn tamper_site_kind(area: Area, state: &mut State) -> bool {
         }
     })
 }
-/// The stop word over the staged block's entry: its first run traps with no stop armed (`bad_stop`).
-fn tamper_forge_stop(area: Area, state: &mut State) -> bool {
+/// The words `--forge-entry` (or `--forge-stop`) puts over the first staged block's entry.
+static FORGED_ENTRY: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+/// [`FORGED_ENTRY`] over the staged block's entry (admission never saw them; the block keeps its length). The stop word
+/// traps with no stop armed (`bad_stop`); words the hardware refuses at EL0, or that touch the private window, show
+/// that EL0 isolation is the hardware's (`trapped`, `private_access`).
+fn tamper_forge_entry(area: Area, state: &mut State) -> bool {
+    let words = FORGED_ENTRY.get().map_or(&[][..], Vec::as_slice);
+    let h: natemu_abi::code_object::Header = area.read_record(exec::STAGING_OFFSET);
+    if !admitted(state) || exec::ENTRY_OFFSET as usize + 4 * words.len() > h.code_size as usize {
+        return false;
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    area.copy(exec::STAGING_OFFSET + (h.code_offset + exec::ENTRY_OFFSET) as usize, &bytes);
+    true
+}
+/// A link point's target changed alone (its move still builds the old RIP): the reply is refused (`bad_reply`).
+fn tamper_target(_: Area, state: &mut State) -> bool {
     if !admitted(state) {
         return false;
     }
-    let h: natemu_abi::code_object::Header = area.read_record(exec::STAGING_OFFSET);
-    area.copy(exec::STAGING_OFFSET + (h.code_offset + exec::ENTRY_OFFSET) as usize, &exec::STOP_WORD.to_le_bytes());
+    let Some(p) = state.link_points.iter_mut().find(|p| p.offset != 0) else { return false };
+    p.target ^= 1 << 4;
     true
 }
 /// An armed stop recorded at the code area's first block word (the first block placed, the staged one at the latest),
@@ -555,7 +573,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     };
     let (mut max_instructions, mut code_bytes, mut watchdog_ms, mut forge, mut target) = (None, exec::cache::CODE_BYTES, 10_000, false, 0);
     let (mut tamper, mut tamper_after): (Option<fn(Area, &mut State) -> bool>, Option<Corrupt>) = (None, None);
-    let (mut forge_stop, mut kicked, mut kicks, mut every_us, mut jitter_us) = (false, Vec::new(), 10_000, 0, 0);
+    let (mut forge_stop, mut forged, mut kicked, mut kicks, mut every_us, mut jitter_us) = (false, None, Vec::new(), 10_000, 0, 0);
     let (mut ignore_kicks, mut signal_at, mut deadline_ms) = (false, None, execution::COMPILE_DEADLINE.as_millis() as u64);
     let mut options = options.iter();
     while let Some(option) = options.next() {
@@ -566,6 +584,10 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             "--tamper-vcpu" => target = value()?,
             "--forge-exit" => forge = true,
             "--forge-stop" => forge_stop = true,
+            "--forge-entry" => {
+                let words = options.next().ok_or(USAGE)?.split(',').map(|w| u32::from_str_radix(w.trim_start_matches("0x"), 16));
+                forged = Some(words.collect::<std::result::Result<Vec<u32>, _>>().map_err(|_| "--forge-entry: hex words")?);
+            }
             "--ignore-kicks" => ignore_kicks = true,
             "--compile-deadline-ms" => deadline_ms = value()? as u64,
             "--kill-compiler" => signal_at = Some((value()? as u64, SIGKILL)),
@@ -585,6 +607,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                     Some("site-kind") => tamper_site_kind,
                     Some("armed") => tamper_armed,
                     Some("dispatch") => tamper_dispatch,
+                    Some("target") => tamper_target,
                     _ => return Err(USAGE.into()),
                 })
             }
@@ -598,6 +621,10 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             n if max_instructions.is_none() => max_instructions = Some(n.parse().map_err(|_| "bad block size limit")?),
             _ => return Err(USAGE.into()),
         }
+    }
+    let forged_entry = if forge_stop { Some(vec![exec::STOP_WORD]) } else { forged };
+    if let Some(words) = &forged_entry {
+        FORGED_ENTRY.set(words.clone()).map_err(|_| "forged entry set twice")?;
     }
     let d = parse(&fs::read_to_string(description).map_err(|e| e.to_string())?)?;
     let n = d.cpus.len();
@@ -647,32 +674,35 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
 
     let machine = Machine::create(&backing.memory)?;
     let stops = execution::Stops::new(&backing, !kicked.is_empty());
-    let ended: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
     // vCPU v passed the start barrier: every vCPU exists. A kicker waits for it: an SPI rung while vCPUs are being
-    // created can deadlock HVF (`hv_gic_set_spi` and `hv_vcpu_create` wait for each other; seen at 4 vCPUs).
+    // created would also find no vCPU to take it. Its end (`Stops::end`, under its kick mutex) stops its kicker.
     let started: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
     let watchdog = std::time::Duration::from_millis(watchdog_ms);
-    let body = |v: usize, cpu: &Vcpu, cancelled: &AtomicBool| -> Result<Ran> {
-        started[v].store(true, SeqCst);
+    let run_vcpu = |v: usize, cpu: &Vcpu, cancelled: &AtomicBool| -> Result<(Stop, Compiler, execution::Requests)> {
         let mut compiler = Compiler::new(Path::new(fexc), cpu, max_instructions)?;
         compiler.deadline = std::time::Duration::from_millis(deadline_ms);
         let mut requests = execution::Requests::default();
         if v == target {
             compiler.tamper = forge.then_some(forge_exit as fn(&mut [u8]));
             compiler.signal_at = signal_at;
-            requests.tamper = if forge_stop { Some(tamper_forge_stop) } else { tamper };
-            // A peer that never answers: alive (no watchdog of its own), never stopping.
-            requests.tampered = ignore_kicks;
+            requests.tamper = if forged_entry.is_some() { Some(tamper_forge_entry) } else { tamper };
         }
+        // A peer that never answers: alive (no watchdog of its own), never stopping.
         let watchdog = if v == target && ignore_kicks { std::time::Duration::from_secs(86_400) } else { watchdog };
-        let stop = execution::run(cpu, backing.vcpu(v), &mut compiler, Some(stop_at[v]), watchdog, &mut requests, &stops, cancelled);
-        ended[v].store(true, SeqCst);
-        let stop = stop?;
+        let stop = execution::run(cpu, backing.vcpu(v), &mut compiler, Some(stop_at[v]), watchdog, &mut requests, &stops, cancelled)?;
+        Ok((stop, compiler, requests))
+    };
+    let body = |v: usize, cpu: &Vcpu, cancelled: &AtomicBool| -> Result<Ran> {
+        started[v].store(true, SeqCst);
+        let ran = run_vcpu(v, cpu, cancelled);
+        stops.end(v);
+        let (stop, compiler, requests) = ran?;
         if !finished(&stop) {
             owners::cancel_owners(cancelled);
         }
         Ok(Ran { stop, compiles: compiler.compiles, slowest: compiler.slowest, blocks: requests.blocks, rips: requests.rips, tampered: requests.tampered })
     };
+    // HVF's GIC calls never race vCPU create/destroy (`vm.rs`, one lock).
     let prepare = |v: usize| -> Result<Vcpu> {
         let cpu = Vcpu::create()?;
         let answers = !(ignore_kicks && v == target);
@@ -688,28 +718,26 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let kickers: Vec<_> = kicked
             .iter()
             .map(|&v| {
-                let (stops, ended, started, machine, backing) = (&stops, &ended, &started, &machine, &backing);
+                let (stops, started, machine, backing) = (&stops, &started, &machine, &backing);
                 scope.spawn(move || -> Result<()> {
                     let mut rng = 0x2545_f491_4f6c_dd1d_u64 ^ (v as u64 + 1) << 32;
-                    while !started[v].load(SeqCst) && !ended[v].load(SeqCst) {
+                    while !started[v].load(SeqCst) && !stops.ended(v) {
                         std::thread::sleep(std::time::Duration::from_micros(20));
                     }
                     for _ in 0..kicks {
-                        if ended[v].load(SeqCst) {
-                            break;
-                        }
                         let area = backing.vcpu(v);
                         let taken = stops.taken(area);
-                        stops.kick(machine, v)?;
+                        if !stops.kick(machine, v)? {
+                            break;
+                        }
                         // Spin briefly, then sleep: a spinning kicker would take a core from the vCPUs.
                         for spins in 0.. {
                             // Acknowledged (a doorbell rung again before that would merge into this one in the GIC) and a
-                            // stop taken since (peers' doorbells stop the vCPU too).
-                            if stops.taken(area) != taken && !machine.ringing(v)? {
+                            // stop taken since (peers' doorbells stop the vCPU too); or the vCPU ended.
+                            let moved = stops.taken(area) != taken;
+                            let Some(ringing) = stops.ringing(machine, v)? else { break };
+                            if moved && !ringing {
                                 stops.followed(area);
-                                break;
-                            }
-                            if ended[v].load(SeqCst) {
                                 break;
                             }
                             if spins < 1000 {
@@ -729,12 +757,12 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             })
             .collect();
         let supervision = owners::supervise(n, &prepare, &body);
-        for e in &ended {
-            e.store(true, SeqCst); // a vCPU that never started
+        for v in 0..n {
+            stops.end(v); // a vCPU that never started
         }
         let kicked: Result<()> = kickers.into_iter().map(|k| k.join().unwrap_or(Err("kicker panicked".into()))).collect();
         // Every vCPU and kicker has ended: a doorbell still pending is a kick no stop followed.
-        let kicked = kicked.and_then(|()| (0..n).try_for_each(|v| stops.ended(&machine, v)));
+        let kicked = kicked.and_then(|()| (0..n).try_for_each(|v| stops.pending_at_end(&machine, v)));
         (kicked, supervision)
     });
     // Every vCPU is destroyed (or never created): the VM goes next, then the host reads the backing.
@@ -751,7 +779,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let ran = ran.ok_or("vCPU without a result")?;
         let tables = spaces[d.cpus[v].space].as_ref().unwrap();
         let tampering = v == target && (tamper.is_some() || tamper_after.is_some());
-        let tampering = tampering || (v == target && forge_stop);
+        let tampering = tampering || (v == target && forged_entry.is_some());
         let mut json = report(backing.vcpu(v), &d.spaces[d.cpus[v].space], tables, ran, tampering, tamper_after.filter(|_| v == target))?;
         json.pop();
         out.push(json + &kick_report(backing.vcpu(v), &stops) + "}");
@@ -809,8 +837,8 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
         Stop::NoCode(reason) => ("no_code", reason.clone(), [0; 4]),
         Stop::Resident { stop: exec::stop::GUEST_FAULT, .. } => ("guest_fault", "resident".into(), s.fault),
         Stop::Resident { stop, status, detail } => ("resident", format!("{} status={status} detail={detail}", exec::stop::name(*stop)), [0; 4]),
-        Stop::Watchdog { pc, asked } => {
-            let place = if natemu_abi::resident::contains(*pc, 4) { "resident" } else { "guest" };
+        Stop::Watchdog { pc, el0, asked } => {
+            let place = if *el0 { "guest" } else { "resident" };
             let asked: Vec<u32> = (0..8).filter(|p| asked & 1 << p != 0).collect();
             ("watchdog", format!("{place} pc={pc:#x} shadows_asked={asked:?}"), [0; 4])
         }

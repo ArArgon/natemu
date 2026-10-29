@@ -312,6 +312,42 @@ pub struct LinkPoint {
 impl LinkPoint {
     pub const NONE: Self = Self { offset: 0, word: 0, target: 0 };
 }
+/// The value of a logical-immediate word's bitmask (DecodeBitMasks), `None` if reserved.
+pub fn bitmask(w: u32) -> Option<u64> {
+    let (n, immr, imms) = (w >> 22 & 1, w >> 16 & 63, w >> 10 & 63);
+    let len = 31 - (n << 6 | (!imms & 63)).leading_zeros();
+    let esize = 1u32.checked_shl(len).filter(|&e| e >= 2 && (w >> 31 == 1 || e <= 32))?;
+    let (s, r) = (imms & (esize - 1), immr & (esize - 1));
+    if s == esize - 1 {
+        return None;
+    }
+    let ones = (1u64 << (s + 1)) - 1;
+    let emask = if esize == 64 { u64::MAX } else { (1 << esize) - 1 };
+    let elem = (ones >> r | ones << (esize - r) % esize) & emask;
+    Some((0..64 / esize).fold(0, |v, i| v | elem << (i * esize)))
+}
+/// The constant the move at the start of `words` builds in register `reg` (`movz`, `movn` or `orr #bitmask` from the
+/// zero register, then `movk`s of the same width), and its length in words; `None` if the first word is none of those.
+pub fn move_value(words: &[u32], reg: u32) -> Option<(usize, u64)> {
+    let w = *words.first()?;
+    let sf = w >> 31;
+    let mask = if sf == 1 { u64::MAX } else { 0xffff_ffff };
+    let part = |w: u32| (u64::from(w >> 5 & 0xffff), 16 * (w >> 21 & 3));
+    let (imm, sh) = part(w);
+    let mut value = match w & 0x7f80_0000 {
+        _ if w & 31 != reg => return None,
+        0x1280_0000 => !(imm << sh) & mask, // movn
+        0x5280_0000 => (imm << sh) & mask,  // movz
+        0x3200_0000 if w >> 5 & 31 == 31 => bitmask(w)? & mask, // orr xD, xzr, #bitmask
+        _ => return None,
+    };
+    let n = 1 + words[1..].iter().take_while(|&&k| k & 0xff80_001f == (0x7280_0000 | sf << 31 | reg)).count();
+    for &k in &words[1..n] {
+        let (imm, sh) = part(k);
+        value = (value & !(0xffff << sh) | imm << sh) & mask;
+    }
+    Some((n, value))
+}
 /// The placeholder fexc emits for the resident to relocate when it places a block: a computed exit's branch (`b .`,
 /// becomes `b` to [`cache::DISPATCH`]).
 pub const DISPATCH_PLACEHOLDER: u32 = 0x1400_0000;
@@ -544,6 +580,14 @@ pub mod stop {
     /// A locked access the resident does not complete: a memory XCHG whose operand crosses a 16-byte boundary (an
     /// alignment fault at its `swpal`, before any effect; contract: split locks wait for the boot phase).
     pub const UNSUPPORTED_ATOMIC: u64 = 13;
+    /// Generated code (EL0) touched the resident's private window (`PRIVATE..PRIVATE + 1 GiB`): a data or instruction
+    /// abort there (its pages are EL1-only, or EL0 execute-only code). With the address guard on (until E3) only a guard
+    /// bypass or a bug reaches it; `State::native` holds the abort.
+    pub const PRIVATE_ACCESS: u64 = 14;
+    /// Generated code ran an instruction the hardware refuses at EL0 (a system register, cache or TLB maintenance,
+    /// `eret`, `hvc`, `wfi`, `udf`, the debug channel, counters and timers: ESR classes 0x00, 0x01, 0x18; also an illegal
+    /// execution state, SME, and PC or SP misalignment: 0x0e, 0x1d, 0x22, 0x26); admission never admits one.
+    pub const TRAPPED: u64 = 15;
 
     pub fn name(code: u64) -> &'static str {
         match code {
@@ -559,6 +603,8 @@ pub mod stop {
             BAD_STOP => "bad_stop",
             UNSUPPORTED_SYSTEM => "unsupported_system",
             UNSUPPORTED_ATOMIC => "unsupported_atomic",
+            PRIVATE_ACCESS => "private_access",
+            TRAPPED => "trapped",
             _ => "none",
         }
     }

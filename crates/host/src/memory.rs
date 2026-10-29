@@ -164,13 +164,19 @@ pub(crate) fn load_elf(memory: &Memory, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Protection of a private alias: resident text is read-only and executable,
-/// everything else read-write and never executable.
+/// Protection of a private alias, none of it EL0 data: resident text is EL1 read-only and EL1-executable; generated
+/// code (the code area: blocks, the step slot, the dispatcher and L1) is EL1 read-only and EL0 execute-only, so EL1
+/// never executes it and EL0 can neither read nor write it; everything else is EL1 read/write and never executable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Rights {
     Text,
+    Code,
     Data,
 }
+/// AP 10 (EL1 read-only, no EL0 access), PXN and UXN.
+const READ_ONLY: u64 = 1 << 7;
+const PXN: u64 = 1 << 53;
+const UXN: u64 = 1 << 54;
 /// `bytes` of the resident's private address space at `PRIVATE + offset`,
 /// backed by the backing bytes at `target`.
 #[derive(Clone, Copy, Debug)]
@@ -187,6 +193,14 @@ impl Span {
             bytes,
             target,
             rights: Rights::Text,
+        }
+    }
+    pub(crate) const fn code(offset: usize, bytes: usize, target: usize) -> Self {
+        Self {
+            offset,
+            bytes,
+            target,
+            rights: Rights::Code,
         }
     }
     pub(crate) const fn data(offset: usize, bytes: usize, target: usize) -> Self {
@@ -211,16 +225,9 @@ const PRIVATE_L2: usize = 0x13000;
 /// TTBR0 (`shadow::LOWER_ROOT`) holds the boot identity alias, the private
 /// region `PRIVATE..PRIVATE + 2 MiB` with exactly `spans`, and the lower guest
 /// shadow window; with `upper`, TTBR1 (`shadow::UPPER_ROOT`) pre-links the
-/// upper window. `shadows` pre-populates lower-window guest pages (guest VA,
-/// backing offset), writable. The runtime's table pages, shadow state and
-/// shadow pool are always mapped.
-pub(crate) fn private_space(
-    memory: &Memory,
-    window: usize,
-    spans: &[Span],
-    shadows: &[(u64, usize)],
-    upper: bool,
-) {
+/// upper window. The runtime's table pages, shadow state and shadow pool are
+/// always mapped.
+pub(crate) fn private_space(memory: &Memory, window: usize, spans: &[Span], upper: bool) {
     let word = |at: usize, value| memory.word(window + at, value);
     let table = |offset: usize| IPA + (window + offset) as u64 + 3;
     word(shadow::LOWER_ROOT, table(0x11000));
@@ -229,13 +236,6 @@ pub(crate) fn private_space(
     word(0x11000 + 8, IPA | 1 | 1 << 10 | 1 << 11 | 3 << 8);
     word(0x11000, table(0x15000));
     word(0x15000, table(shadow::LOWER_LEAF));
-    for &(va, target) in shadows {
-        assert!(va < shadow::WINDOW_BYTES && va % 4096 == 0);
-        word(
-            shadow::LOWER_LEAF + (va as usize >> 12) * 8,
-            (IPA + target as u64) | PAGE | 3 << 53,
-        );
-    }
     word(0x12000 + 8, table(PRIVATE_L2));
     word(PRIVATE_L2, table(PRIVATE_LEAF));
     if upper {
@@ -271,8 +271,9 @@ pub(crate) fn map_private(memory: &Memory, window: usize, spans: &[Span]) {
     const BLOCK_BYTES: usize = 2 * RAM_SIZE;
     for span in spans {
         let protection = match span.rights {
-            Rights::Text => 1 << 7,
-            Rights::Data => 3 << 53,
+            Rights::Text => READ_ONLY | UXN,
+            Rights::Code => READ_ONLY | PXN,
+            Rights::Data => PXN | UXN,
         };
         if span.offset >= BLOCK_BYTES {
             assert!((span.offset | span.bytes | span.target) % BLOCK_BYTES == 0 && span.offset + span.bytes <= 1 << 30);
@@ -394,16 +395,16 @@ mod tests {
         let memory = Memory::new().unwrap();
         let mut spans = resident_text(0);
         spans.push(Span::data(SHARED_OFFSET, 0x8000, SHARED_OFFSET));
-        private_space(&memory, 0, &spans, &[], false);
+        private_space(&memory, 0, &spans, false);
         let leaf = |offset| u64::from_le_bytes(memory.read::<8>(0x14000 + offset / 4096 * 8));
         for offset in (0..RAM_SIZE).step_by(4096) {
             let pte = leaf(offset);
             if resident::executable_offset(offset) {
-                assert_eq!(pte, (IPA + offset as u64) | PAGE | 1 << 7);
+                assert_eq!(pte, (IPA + offset as u64) | PAGE | READ_ONLY | UXN);
             } else if (resident::BOOT_END..0x10000).contains(&offset) {
                 assert_eq!(pte, 0);
             } else if pte != 0 {
-                assert_eq!(pte & (3 << 53), 3 << 53);
+                assert_eq!(pte & (PXN | UXN | 3 << 6), PXN | UXN);
             }
         }
     }
@@ -412,11 +413,13 @@ mod tests {
     fn spans_above_two_mib_map_as_level_two_blocks() {
         let memory = Memory::new().unwrap();
         let mib = RAM_SIZE;
-        map_private(&memory, 0, &[Span::text(0x1000_0000, 4 * mib, 6 * mib), Span::data(0x2000_0000, 2 * mib, 6 * mib)]);
+        map_private(&memory, 0, &[Span::text(0x1000_0000, 4 * mib, 6 * mib), Span::data(0x2000_0000, 2 * mib, 6 * mib), Span::code(0x3000_0000, 2 * mib, 6 * mib)]);
         let l2 = |offset: usize| u64::from_le_bytes(memory.read::<8>(PRIVATE_L2 + offset / (2 * mib) * 8));
-        assert_eq!(l2(0x1000_0000), (IPA + 6 * mib as u64) | BLOCK | 1 << 7);
-        assert_eq!(l2(0x1020_0000), (IPA + 8 * mib as u64) | BLOCK | 1 << 7);
-        assert_eq!(l2(0x2000_0000), (IPA + 6 * mib as u64) | BLOCK | 3 << 53);
+        assert_eq!(l2(0x1000_0000), (IPA + 6 * mib as u64) | BLOCK | READ_ONLY | UXN);
+        assert_eq!(l2(0x1020_0000), (IPA + 8 * mib as u64) | BLOCK | READ_ONLY | UXN);
+        assert_eq!(l2(0x2000_0000), (IPA + 6 * mib as u64) | BLOCK | PXN | UXN);
+        // Generated code: EL1 read-only, EL0 execute-only (AP 10, UXN clear), never EL1-executable.
+        assert_eq!(l2(0x3000_0000), (IPA + 6 * mib as u64) | BLOCK | READ_ONLY | PXN);
         assert_eq!(l2(0x1040_0000), 0);
     }
 
@@ -430,7 +433,7 @@ mod tests {
         }
         let memory = Memory::with_size(2 * RAM_SIZE).unwrap();
         let window = RAM_SIZE;
-        private_space(&memory, window, &resident_text(window), &[], true);
+        private_space(&memory, window, &resident_text(window), true);
         let leaf = |offset: usize| {
             u64::from_le_bytes(memory.read::<8>(window + 0x14000 + offset / 4096 * 8))
         };
@@ -439,7 +442,7 @@ mod tests {
             .into_iter()
             .chain((0..shadow::POOL_PAGES).map(|i| shadow::POOL_OFFSET + i * 4096))
         {
-            assert_eq!(leaf(offset), (IPA + (window + offset) as u64) | PAGE | 3 << 53);
+            assert_eq!(leaf(offset), (IPA + (window + offset) as u64) | PAGE | PXN | UXN);
         }
         let mut space = shadow::Space {
             window: unsafe { memory.0.add(window) },
@@ -460,7 +463,7 @@ mod tests {
         // Without `upper` (TCR.EPD1 set) the upper half is refused; the lower
         // half grows from the pool.
         let memory = Memory::new().unwrap();
-        private_space(&memory, 0, &resident_text(0), &[], false);
+        private_space(&memory, 0, &resident_text(0), false);
         let mut space = shadow::Space {
             window: memory.0,
             ipa: IPA,

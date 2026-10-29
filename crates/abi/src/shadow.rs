@@ -20,12 +20,17 @@ pub const POOL_OFFSET: usize = 0xe0000;
 pub const POOL_PAGES: usize = 32;
 pub const TCR_BOTH: u64 =
     16 | 1 << 8 | 1 << 10 | 3 << 12 | 16 << 16 | 1 << 24 | 1 << 26 | 3 << 28 | 2 << 30 | 2 << 32;
-/// Valid page, AF, inner shareable, normal memory (MAIR index 0), UXN and PXN:
-/// generated code never executes from guest pages.
-pub const PAGE: u64 = 3 | 1 << 10 | 3 << 8 | 3 << 53;
+/// Valid page, AF, inner shareable, normal memory (MAIR index 0), EL0 read/write (AP 01: generated code runs at EL0),
+/// UXN and PXN: generated code never executes from guest pages. x86 privilege is not in the descriptor: a shadow exists
+/// only for a data access the software walker granted at the vCPU's CPL (U/S, WP; SMEP concerns fetches, which never use
+/// shadows), so a CPL0 vCPU's shadows of
+/// supervisor pages and a CPL3 vCPU's of user pages are alike; a CPL change would have to reset the shadows (there is
+/// none yet: the CPL is fixed for a run).
+pub const PAGE: u64 = 3 | 1 << 10 | 3 << 8 | 1 << 6 | 3 << 53;
 /// nG: the entry is tagged with the owner's ASID (every owner maps the same
 /// addresses differently, so its entries must not match another owner's).
 pub const NOT_GLOBAL: u64 = 1 << 11;
+/// AP[2]: read-only at both levels (AP 11).
 pub const READ_ONLY: u64 = 1 << 7;
 const TABLE: u64 = 3;
 const OUTPUT: u64 = 0x0000_ffff_ffff_f000;

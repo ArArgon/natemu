@@ -15,8 +15,8 @@ The VM's final GPRs, masked RFLAGS and memory must equal QEMU's, and it must sto
 without a flush (only the one requested when the driver writes guest RAM), host translation requests must equal the
 distinct block RIPs (every block is compiled once and then found in the VM); a forced small code cache (`--code-cache`,
 at least the largest block) must flush repeatedly and still match; a cache smaller than that is refused. Linking (S2c): a
-hot loop at N and 2N iterations makes the same resident entries, and a forged literal exit halts the
-linker; every run self-checks its link points (the driver). A non-terminating loop must be stopped by the watchdog. Run-time tamper checks
+hot loop at N and 2N iterations makes the same resident entries, and a forged literal exit (its RIP move no longer
+builds its link point's target) is refused at the reply (`bad_reply`, E2; the linker's own check stays behind it); every run self-checks its link points (the driver). A non-terminating loop must be stopped by the watchdog. Run-time tamper checks
 (driver `--tamper`, `--tamper-after`): a link point reported outside its block is refused (`bad_reply`); a corrupted linked
 branch or link record makes the next flush halt (`bad_link`) and is refused by the host's self-check
 (`links_check`). Self-modifying code (S2e): stores into the running block (next instruction, an already executed one in a
@@ -331,10 +331,10 @@ def main():
         print(f"hot loop {' '.join(args)}: {'match' if ok else 'fail'} (resident entries, linker entries, linked) at N, 2N: {counts}")
 
     # A literal exit whose RIP is none of its block's link targets (admission refuses this; the driver forges it after
-    # admission) makes the linker halt instead of patching code it cannot name.
+    # admission) is refused at the reply, before the block is placed: its move must build its link point's target.
     program, _, _ = built['split-body']
     state, err = run('forged-exit', program, ['--forge-exit'])
-    ok = state is not None and state['stop'] == 'resident' and state['reason'].startswith('bad_link') and state['stats']['links'] == 0
+    ok = state is not None and state['stop'] == 'resident' and state['reason'].startswith('bad_reply') and state['stats']['links'] == 0
     failures += not ok
     out.append({'name': 'forged-exit', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
     print(f"forged-exit: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']}")

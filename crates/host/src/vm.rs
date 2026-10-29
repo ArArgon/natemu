@@ -64,6 +64,14 @@ pub(crate) fn require_vcpus(n: usize) -> Result<()> {
     Ok(())
 }
 
+/// Serializes HVF's GIC calls with vCPU creation and destruction (from any thread): `hv_gic_set_spi` and
+/// `hv_vcpu_create` can deadlock each other when they run at once (seen at 4 vCPUs), and a ring must not race a destroy.
+// ponytail: one process lock around every GIC call and vCPU create/destroy; per-vCPU locks if kick rates make it contend.
+static GIC: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn gic() -> std::sync::MutexGuard<'static, ()> {
+    GIC.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Forces the listed vCPUs (owned by other threads) out of `hv_vcpu_run`.
 pub(crate) fn exit_vcpus(ids: &mut [u64]) -> i32 {
     unsafe { hv_vcpus_exit(ids.as_mut_ptr(), ids.len() as u32) }
@@ -142,10 +150,12 @@ impl Machine {
     }
     fn distributor(&self, reg: u16) -> Result<u64> {
         let mut value = 0;
+        let _gic = gic();
         unsafe { hv(hv_gic_get_distributor_reg(reg, &mut value), "read GIC distributor")? };
         Ok(value)
     }
     fn set_distributor(&self, reg: u16, value: u64) -> Result<()> {
+        let _gic = gic();
         unsafe { hv(hv_gic_set_distributor_reg(reg, value), "write GIC distributor") }
     }
     /// Disables vCPU `v`'s host doorbell (a test driver's peer that never answers).
@@ -160,6 +170,7 @@ impl Machine {
     }
     /// Rings vCPU `v`'s host doorbell (an edge on its SPI), from any thread.
     pub(crate) fn ring(&self, v: usize) -> Result<()> {
+        let _gic = gic();
         unsafe { hv(hv_gic_set_spi(self.spi + v as u32, true), "hv_gic_set_spi") }
     }
     /// vCPU `v`'s host doorbell is pending (rung, not yet acknowledged).
@@ -188,6 +199,11 @@ const SCTLR_EL1: u16 = 0xc080;
 const ACTLR_EL1: u16 = 0xc081;
 const CPACR_EL1: u16 = 0xc082;
 const CNTV_CTL_EL0: u16 = 0xdf19;
+const MDSCR_EL1: u16 = 0x8012;
+const CNTKCTL_EL1: u16 = 0xc708;
+/// MDSCR_EL1.TDCC: EL0 accesses to the debug communication channel (MDCCSR_EL0, DBGDTR*_EL0) trap to EL1. Clear, HVF
+/// traps them to the host instead, and the resident never sees them.
+const MDSCR_TDCC: u64 = 1 << 12;
 
 /// Why `hv_vcpu_run` returned.
 pub(crate) enum Exit {
@@ -212,6 +228,7 @@ impl Vcpu {
             alive: false,
         };
         unsafe {
+            let _gic = gic();
             hv(
                 hv_vcpu_create(&mut cpu.id, &mut cpu.exit, ptr::null()),
                 "hv_vcpu_create",
@@ -231,8 +248,12 @@ impl Vcpu {
     /// `mach_absolute_time`), so the resident's stop times compare with the host's kick times.
     /// `enabled` false leaves the SGI disabled (a test driver's peer that never answers).
     pub(crate) fn doorbell(&self, v: usize, enabled: bool) -> Result<()> {
+        // GICR_IGROUPR0 holds the group of every SGI and PPI: this write sets the kick SGI to group 1 and leaves the
+        // rest in group 0. X2 (the LAPIC timer on the virtual timer, PPI 27) must add bit 27 here, or the timer's IRQ is
+        // group 0 and never reaches the resident (only group 1 is enabled, ICC_IGRPEN1_EL1).
         let bit = 1 << natemu_abi::execution::KICK_SGI;
         self.set_sys(MPIDR_EL1, v as u64)?;
+        let _gic = gic();
         unsafe {
             hv(hv_vcpu_set_vtimer_offset(self.id, 0), "hv_vcpu_set_vtimer_offset")?;
             hv(hv_gic_set_redistributor_reg(self.id, GICR_IGROUPR0, bit), "GICR_IGROUPR0")?;
@@ -271,7 +292,9 @@ impl Vcpu {
     /// Sets the architectural EL1 state the resident `_start` consumes for the
     /// owner window at `window`: PC at the window, EL1h with DAIF masked, x0 = the
     /// window's lower private root tagged `asid` (TTBR0_EL1[63:48]; 8-bit ASIDs), x1 = TCR_EL1, x2 = MAIR_EL1; MMU
-    /// off, TSO on (ACTLR_EL1 bit 1), FP/SIMD untrapped, virtual timer off.
+    /// off, TSO on (ACTLR_EL1 bit 1), FP/SIMD untrapped, virtual timer off. Generated code runs at EL0: every EL0 access
+    /// the resident does not grant traps to EL1 (SCTLR_EL1 has UCI, UCT, DZE, UMA, nTWI, nTWE clear; MDSCR_EL1.TDCC set
+    /// for the debug channel; CNTKCTL_EL1 = 0 for the counters and timers), never to the host.
     pub(crate) fn enter_resident_with_asid(&self, window: usize, tcr: u64, asid: u8) -> Result<()> {
         let base = IPA + window as u64;
         self.set_reg(PC, base)?;
@@ -282,6 +305,8 @@ impl Vcpu {
         self.set_sys(SCTLR_EL1, 0x30d00980)?;
         self.set_sys(ACTLR_EL1, 2)?;
         self.set_sys(CPACR_EL1, 3 << 20)?;
+        self.set_sys(MDSCR_EL1, MDSCR_TDCC)?;
+        self.set_sys(CNTKCTL_EL1, 0)?;
         self.set_sys(CNTV_CTL_EL0, 0)
     }
     /// Runs until the next exit: an HVC or a forced exit ([`exit_vcpus`]); any other exit is an error reporting the
@@ -305,7 +330,10 @@ impl Vcpu {
     }
     /// Destroys the vCPU now and returns the framework status.
     pub(crate) fn destroy(&mut self) -> i32 {
-        let result = unsafe { hv_vcpu_destroy(self.id) };
+        let result = {
+            let _gic = gic();
+            unsafe { hv_vcpu_destroy(self.id) }
+        };
         if result == 0 {
             self.alive = false;
         }

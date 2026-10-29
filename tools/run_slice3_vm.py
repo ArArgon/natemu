@@ -51,7 +51,7 @@ it, P at once (P * N above the core count: oversubscribed); (1b) adversarial: th
 times (0..`--jitter-us` after each stop) into `adversarial_program` (computed jumps through the dispatcher and L1 every
 round, a division `svc` resumed mid-block, self-modifying stores single-stepped, peers rung by SGI), and over all its
 runs stops must have been taken at every place (block entry, dispatcher, L1, armed exit, resident entry, in the step
-block, re-armed after a mid-block resume); (2) a peer's resident kick: vCPU 1 writes data on vCPU 0's
+block, re-armed after a mid-block resume; at a resident entry only with N > 1: peers' SGIs); (2) a peer's resident kick: vCPU 1 writes data on vCPU 0's
 code page while vCPU 0 spins in its hot loop, so vCPU 1's resident posts the page to vCPU 0 and rings its SGI; (3)
 forged stops: the stop word over vCPU V's first block entry (a stop nobody armed) and an armed-stop record whose word
 does not hold the stop word must each halt V (bad_stop) and cancel the others. Programs are natemu-smp-v1; the reference
@@ -86,21 +86,24 @@ contended A/D walks (data, fetch, both) that must never halt; at 2 and 4 vCPUs (
 
 `limits`: 5 vCPUs are refused (0 cannot be written: a description without `cpu` lines is one vCPU; the host's
 `prepare` refuses 0 in its unit test); a forged literal exit (its RIP move altered after admission) on vCPU V of 4 (V = 0..3; the others spin in a linked
-loop) halts V with bad_link, cancels and joins the others, and the VM is destroyed (the driver reports only then).
+loop) halts V with bad_reply (the resident decodes each link point's move at the reply), cancels and joins the others, and the VM is destroyed (the driver reports only then).
 
 `contain` (S3h, containment and progress; runs one at a time, each a fresh process). Every failing run must exit as stated,
 end within its bound (10 s; watchdog runs: the watchdog + 5 s) and print the driver's teardown line with every vCPU joined
 and destroyed, the VM destroyed (status 0) and no child process left (no compile server alive or unreaped); each is
 followed at once by a fresh process running fixture programs on as many vCPUs, which must match QEMU. (1, 4) Every
 run-time tamper of the driver (forged literal exit, link-point offset, next-page reply given twice, system decode, linked
-word and link record before a flush, a computed exit naming the block entry, the stop word at a block entry, an armed
-record at a word without the stop word, access sites off the instruction grid or of the wrong kind) on each vCPU v at N = 1..4, the others in linked loops: v halts with
-its defence's stop (bad_link, bad_reply, bad_stop, unknown_abort, site_mismatch) with its FEX frame intact and its banked
+word and link record before a flush, a computed exit naming the block entry, a link point's target changed alone, the
+stop word at a block entry, an armed record at a word without the stop word, access sites off the instruction grid or of
+the wrong kind; and, generated code running at EL0, system instructions and accesses to the private window forged over a
+block's entry: EL0_FORGED) on each vCPU v at N = 1..4, the others in linked loops: v halts with
+its defence's stop (bad_link, bad_reply, bad_stop, unknown_abort, site_mismatch, trapped, private_access) with its FEX frame intact and its banked
 state at a block boundary the run reached (the system, site and site-kind tampers: the unchanged start state, rip
 0x100000 and every GPR 0), the others are cancelled, exit 0. A run that outlives its bound by 5 s is killed and fails.
 (2) A peer that never answers a
 shootdown (`--ignore-kicks` on vCPU k = 1..3 of 4: its doorbells are disabled and its own watchdog is off, so it never
-stops or drains, while a host kicker rings it every millisecond, unheard): vCPU 0, waiting in the resident for k's shadow reset, is stopped by its
+stops or drains, while a host kicker rings it every millisecond, unheard: its kicks issued, its doorbell pending, no IRQ
+taken): vCPU 0, waiting in the resident for k's shadow reset, is stopped by its
 watchdog, reported `resident` with k's `SHADOWS` request still pending; k is cancelled; an untampered control matches QEMU
 with a shootdown. (3) vCPU k's compile server (k = 1..3 of 4) killed before its 51st request: exit 1, stderr names the
 vCPU, the server and its signal; the same server stopped instead (SIGSTOP: alive, never answering): the request deadline
@@ -374,7 +377,7 @@ def cmd_limits(a, host, runtime):
         rc, out, err = driver(host, runtime, a.fexc, text, a.out / 'work' / f'forge{v}', ['--forge-exit', '--tamper-vcpu', v])
         stops = [(c['stop'], c['reason']) for c in out['cpus']] if out else None
         report[f'forge{v}'] = {'returncode': rc, 'stops': stops, 'stderr': err.strip()[-300:]}
-        want = [('resident', 'bad_link status=1 detail=9') if w == v else ('cancelled', '') for w in range(4)]
+        want = [('resident', 'bad_reply status=1 detail=2') if w == v else ('cancelled', '') for w in range(4)]
         if rc or stops != want: failures.append(f'forged exit on vCPU {v}: {rc} {stops} {err.strip()[-200:]}')
     for f in failures: print(f)
     print(json.dumps(report, indent=1))
@@ -507,7 +510,9 @@ def cmd_kicks(a, host, runtime):
                   f"steps {e.get('steps')}; ack ns {[k['ack_ns_mean'] for k in ks]}", flush=True)
             failures += [f"{e['name']} rep{e['rep']}: {d}" for d in e['diffs']]
             report['adversarial'].append(e)
-    missing = [p for p in ('entry', 'dispatch', 'l1', 'exit', 'resident', 'irqs_step', 'rearms') if not seen[p]]
+    # A resident-entry stop needs a doorbell pending when the vCPU enters the resident: peers' SGIs (N > 1).
+    wanted = ('entry', 'dispatch', 'l1', 'exit', 'irqs_step', 'rearms') + (('resident',) if max(a.cpus) > 1 else ())
+    missing = [p for p in wanted if not seen[p]]
     print(f'adversarial places: {dict(seen)}', flush=True)
     if missing: failures.append(f'adversarial: no stop at {missing}')
     # A peer's resident kick: no host kicker; vCPU 0 must take at least one stop and drop its blocks from the page.
@@ -830,7 +835,7 @@ def tamper_kinds(fixture):
     flush = ['1', '--code-cache', 32768]
     system = 'rip 0x100000\ncpl 0\ncode ' + ref.assemble('mov rax, cr0\nnop').hex() + '\n'
     load = 'rip 0x100000\ncode ' + ref.assemble('mov rax, qword ptr [0x200000]\nnop').hex() + '\nmemory 0x200000 0102030405060708\n'
-    return [('forge-exit', ['--forge-exit'], fixture, 'bad_link'),
+    return [('forge-exit', ['--forge-exit'], fixture, 'bad_reply'),
             ('offset', ['--tamper', 'offset'], fixture, 'bad_reply'),
             ('next-page', ['--tamper', 'next-page'], fixture, 'bad_reply'),
             ('system', ['--tamper', 'system'], system, 'bad_reply'),
@@ -838,9 +843,28 @@ def tamper_kinds(fixture):
             ('site-kind', ['--tamper', 'site-kind'], load, 'site_mismatch'),
             *[(k, flush + ['--tamper', k], chain_section(), 'bad_link') for k in ('word', 'record')],
             ('dispatch', ['--tamper', 'dispatch'], fixture, 'bad_reply'),
+            ('target', ['--tamper', 'target'], fixture, 'bad_reply'),
             # Not LOOP: its entry word is its exit's link point, which the reply check refuses (bad_reply) once forged.
             ('forge-stop', ['--kicks', 1, '--forge-stop'], fixture, 'bad_stop'),
-            ('armed', ['--kicks', 1, '--tamper', 'armed'], LOOP, 'bad_stop')]
+            ('armed', ['--kicks', 1, '--tamper', 'armed'], LOOP, 'bad_stop'),
+            # EL0 isolation by hardware (E2): words admission never admits, forged over the first block's entry.
+            *[(f'el0-{name}', ['--forge-entry', words], fixture, stop) for name, words, stop in EL0_FORGED]]
+
+
+# Forged block entries (name, A64 words, expected halt): system instructions trap at EL0 (ESR classes 0x00, 0x01,
+# 0x18); loads, stores and branches into the private window (x28 is the EL1-only frame page; `adr` names the
+# execute-only code area) abort there.
+EL0_FORGED = [('msr-daifset', 'd50342df', 'trapped'), ('msr-ttbr0', 'd5182000', 'trapped'),
+              ('mrs-sctlr', 'd5381000', 'trapped'), ('mrs-ctr', 'd53b0020', 'trapped'), ('tlbi', 'd508871f', 'trapped'),
+              ('dc-civac', 'd50b7e20', 'trapped'), ('ic-ivau', 'd50b7520', 'trapped'), ('eret', 'd69f03e0', 'trapped'),
+              ('wfi', 'd503207f', 'trapped'), ('hvc', 'd4000002', 'trapped'),
+              # The debug channel (MDSCR_EL1.TDCC), counters and timers (CNTKCTL_EL1 = 0), DC ZVA (SCTLR_EL1.DZE).
+              ('mrs-mdccsr', 'd5330100', 'trapped'), ('msr-dbgdtrtx', 'd5130500', 'trapped'), ('mrs-dbgdtrrx', 'd5330500', 'trapped'),
+              ('mrs-cntvct', 'd53be040', 'trapped'), ('msr-cntv-ctl', 'd51be320', 'trapped'), ('dc-zva', 'd50b743c', 'trapped'), ('mrs-pmccntr', 'd53b9d00', 'trapped'),
+              # A literal exit to a RIP none of the block's link points targets: the linker's own check.
+              ('link-forged', 'd2824680,d4000021', 'bad_link'),
+              ('load-frame', 'f940039f', 'private_access'), ('store-frame', 'f900039c', 'private_access'),
+              ('branch-frame', 'd61f0380', 'private_access'), ('read-code', '10000000,f9400000', 'private_access')]
 
 
 # Tampers whose section is a single instruction at 0x100000 with all GPRs 0: the vCPU halted before its first
@@ -851,11 +875,12 @@ AT_START = ('site', 'site-kind', 'system')
 def halted_state(name, section, cpu):
     """The tampered vCPU's banked state (contracts 56, 58: a defence halts before any effect, nothing fabricated): the
     FEX frame intact; for AT_START tampers the start state (rip 0x100000, every GPR 0), for the others a block boundary
-    the run reached: the entry of a block it translated, or the section's end (a forged exit halts the linker at the
-    exit of the block before it, with the RIP the forged move left in x0: the driver flips bit 0 of the move's last
-    immediate, `movk w0, #imm, lsl #16` for these RIPs, so the RIP the exit should have had differs in bit 16)."""
+    the run reached: the entry of a block it translated, or the section's end (a forged exit is refused at the reply of
+    the forged block, banked at its entry)."""
     problems = [] if cpu['frame_intact'] else ['FEX frame changed']
-    rip = smp.num(cpu['rip']) ^ (1 << 16 if name == 'forge-exit' else 0)
+    rip = smp.num(cpu['rip'])
+    if name == 'el0-link-forged':  # the linker banks the exit's state, the forged RIP (0x1234) included, and halts
+        return problems + ([] if rip == 0x1234 else [f"banked rip {cpu['rip']}, want the forged 0x1234"])
     end = 0x100000 + len(re.search(r'(?:code|body 0x100000) ([0-9a-f]+)', section).group(1)) // 2
     if name in AT_START:
         if rip != 0x100000 or any(smp.num(g) for g in cpu['gpr']):
@@ -963,7 +988,9 @@ def cmd_contain(a, host, runtime):
         want = [('watchdog', 'resident pc=') if w == 0 else ('cancelled', '') if w == k else ('reached', '') for w in range(4)]
         stops, diffs = judge(4, rc, out, err, secs, want, wd / 1000 + 5)
         if stops and f'shadows_asked=[{k}]' not in stops[0][1]: diffs.append(f'vCPU {k} not named as the peer asked')
-        if out and not out['cpus'][k]['tampered']: diffs.append(f'vCPU {k} took no stop')
+        # Its doorbell was rung, stayed pending (disabled) and never interrupted it.
+        kk = out and out['cpus'][k]['kicks']
+        if kk and not (kk['issued'] >= 1 and kk['pending'] and kk['irqs'] == 0): diffs.append(f'vCPU {k} kicks {kk}')
         diffs += fresh(4, label)
         report['unacked'].append({'label': label, 'stops': stops, 'seconds': round(secs, 2), 'diffs': diffs})
         print(f"{label}: {'ok' if not diffs else 'FAIL ' + '; '.join(diffs)[:300]} {stops and stops[0]} ({secs:.2f} s)", flush=True)
