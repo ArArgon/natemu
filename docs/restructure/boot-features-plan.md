@@ -336,6 +336,47 @@ entry and only `pushf` sees it. Admission lets x28 load the flag bytes and store
 `drivers/program.rs` (`frame_intact`: any nonzero byte outside `frame::GUEST_STATE` fails the run). Open (owner): check
 which kernel paths may be handed arbitrary addresses that could land in `PRIVATE + 0x24000..0x25000` (user-supplied
 pointers before access_ok, probing helpers), where x86 would raise #GP.
+*Built (S1, presented CPU):* `tools/models/gen_cpu_profile_rs.py` generates `crates/abi/src/cpu_profile.rs` from
+`cpu_profile.json` (CPUID leaves, MSR access/reset/writable mask/rules, CR0/CR4/EFER/XCR0 sets, the selected "enabled"
+MTRR state) plus `cpu_profile.py`'s answers as test vectors; `crates/abi/src/cpu.rs` (CPUID with its dynamic fields,
+the MSR checks, reset values) replays them in the abi tests, and `tools/models/test_cpu_profile_rs.py` fails while the
+file is stale. The host decodes CPUID, RDTSC and RDTSCP; the resident executes them and every profile MSR as
+transactions: CPUID at any CPL (a draining entry, as every system instruction), RDTSC/RDTSCP #GP at CPL > 0 with CR4.TSD;
+RDMSR/WRMSR with the profile's #GP rules before any effect; MISC_ENABLE bit 22 limits CPUID, CPUID.1 reloads the
+UCODE_REV latch with virtual revision 0, FS/GS_BASE are the bank's `Cpu::fs_base/gs_base` (I7), an MTRR write drops the vCPU's code and shadows (CPU 9),
+PAT and MTRRs are recorded for M2. The MSRs live in their own record after `State` (`execution::MSRS_OFFSET`), written by
+the host at reset (vCPU 0 is the BSP). CR4: bits outside the profile's 0x1507bc are #GP; PSE and TSD are implemented;
+DE, PCE, OSFXSR, OSXMMEXCPT, FSGSBASE, OSXSAVE stay refused. IA32_APIC_BASE: the BSP flag (bit 8) is R/W (SDM Vol.4
+Table 2-2; the profile's mask was corrected after review, so the BSP may write back what it reads); a write changing
+EN, EXTD or the base is refused (no LAPIC yet; the profile notes the x2APIC -> xAPIC and disabled -> x2APIC #GP rules
+for that chunk). After review also: the leaf 4 terminator is all zeros at any vCPU count; IA32_FMASK 63:32 are reserved
+(#GP; SDM Vol.4 Table 2-2), SYSENTER_CS keeps all 64 bits ("not used, can be read and written"). TSC is provisional
+(L5): CNTVCT scaled to 1 GHz plus a per-vCPU offset, which the host sets from one CNTVCT sample per VM, so every TSC
+starts near 0 and the vCPUs agree (`profile@N` checks a peer's RDTSC after it sees CPU 0's flag is not smaller).
+Performance (recorded, not built): every CPUID/RDTSC/RDTSCP is a host exit plus a decode; a resident-side system decode
+cache or fast path is planned with L5. Checks: `run_slice3_vm.py system` (0 GAPs; profile programs at 1/2/4 vCPUs judged
+by `cpu_profile.py`, MSR read-backs against QEMU, 11 new fault cases).
+*Built (I7, FS/GS overrides; fexc series15):* FS.base and GS.base are the bank's `Cpu::fs_base`/`gs_base`, the only copy
+the resident trusts; it writes them into FEX's `fs_cached`/`gs_cached` (`frame::FS_BASE` 1000, `frame::GS_BASE` 992, in
+`frame::GUEST_STATE`) at every block entry and never reads them back, so a guest store through the guest-state page
+(the documented deviation) changes at most that vCPU's own later prefixed accesses until its next resident entry, never
+the bank. Admission lets x28 load them, never store. Translated code cannot change them: WRFSBASE/WRGSBASE and SWAPGS
+stay system cuts (S3); WRMSR goes through the resident (S1). Until S3 the driver's `fsbase`/`gsbase` items set them.
+fexc admits an FS/GS prefix on every admitted form with an explicit memory operand: FEX folds the base into the native
+address, so a site's recorded address (`site_address`) is already base + EA mod 2^64, and #PF CR2, the canonical check
+(#GP(0); an FS/GS reference is never a stack one, so RSP/RBP bases give #GP, not #SS), the split-store check and the
+swap's 16-byte test all see the x86 linear address with no runtime change. Branch targets need nothing: FS/GS only
+changes where `jmp`/`call [mem]` load the target. CS/DS/ES/SS prefixes were already admitted silently (FEX's decoder
+drops them in 64-bit mode); now they are admitted only naming the operand's default segment. Refused (`unsupported_form`,
+vendors differ and the SDM gives no rule): FS/GS with a second segment prefix or with no memory operand; SS on a
+DS-default operand and CS/DS/ES on an RSP/RBP one (#SS versus #GP). Checks: `tools/reference/gen_i7.py` corpus (67
+programs, bases near, far, negative and 0; QEMU sets them with WRFSBASE/WRGSBASE) 67/67 at CPL 3 and 0, block sizes
+default and 1; faults: 252 `segment_probes` and 979 page-mutation cases on that corpus (#PF at base + EA), all match;
+`verify_precision.py` matrix and adversarial programs with FS/GS forms clean; on the corpus it finds one defect that is
+I1's, not I7's (also on series14 with the prefixes removed): after a 16-bit register `cmpxchg` following BMI/POPCNT forms,
+FEX leaves AF's x27 write out, so a fault at a later access in the block would bank a stale AF (P6, program
+`i7-random-45`). Census FS/GS class: kernel 36,958 → 0,
+initramfs 27,599 → 2. FEX ASM suite unchanged (its FS/GS tests need WRFSBASE/WRGSBASE or SSE).
 **Owner decision (October 28): MTRRs enabled by the virtual firmware, RAM write-back, device ranges uncached** (plan Q3).
 **Deferred (owner, October 28):** replacing the host's minimal JSON reader (`crates/host/src/json.rs`, used only for
 fexc's per-compile report: end reason and cut opcode) by carrying those fields in the code-object header; no registry

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3 -I
 """Static census of x86 instruction forms natemu admission refuses.
 Usage: census.py RAW_DIR OUT_MD   (needs RAW_DIR/x from extract.py), or census.py --selftest
-Classifier = a byte-level port of tools/fexc/shim/fexc_slice1.inc (Primary/Two/Vex/Classify), the S3e and the I1 additions."""
+Classifier = a byte-level port of tools/fexc/shim/fexc_slice1.inc (Primary/Two/Vex/Classify), the S3e, I1 and I7 additions."""
 import collections, json, os, re, struct, subprocess, sys
 from multiprocessing import Pool
 
@@ -80,14 +80,60 @@ def vex(b):
     if i + 4 >= len(b): return None
     return b[i + 1] & 0x1F, b[i + 2] & 3, b[i + 2] >> 2 & 1, b[i + 3], b[i + 4] >> 3 & 7, i > 0
 
-def vex_allowed(v):
-    """fexc_slice1.inc Vex(): the BMI1/BMI2 general-register forms but pdep/pext, VEX.L = 0, no prefix before VEX"""
+SEGS = {0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65}
+
+def vex_allowed(v, b=b''):
+    """fexc_slice1.inc Vex(): the BMI1/BMI2 general-register forms but pdep/pext, VEX.L = 0, no prefix before VEX but a
+    segment prefix (I7; its rules are segment()'s)"""
     m, pp, l, op, reg, prefixed = v
-    if l or prefixed: return False
+    if l or (prefixed and not set(leading(b)) <= SEGS): return False
     if m == 2:
         return (op == 0xF2 and pp == 0 or op == 0xF3 and pp == 0 and 1 <= reg <= 3 or op == 0xF5 and pp == 0
                 or op == 0xF6 and pp == 3 or op == 0xF7)
     return m == 3 and op == 0xF0 and pp == 3
+
+def leading(b):
+    """The legacy prefix and REX bytes before the opcode, in order (duplicates kept)."""
+    i = 0
+    while i < len(b) and (b[i] in LEGACY or 0x40 <= b[i] <= 0x4F): i += 1
+    return b[:i]
+
+NO_MODRM_P = {0x50 + i for i in range(16)} | {0x70 + i for i in range(16)} | {0x90 + i for i in range(10)} | {0xB0 + i for i in range(16)} | \
+    {0x68, 0x6A, 0x9C, 0x9E, 0x9F, 0xA0, 0xA1, 0xA2, 0xA3, 0xA8, 0xA9, 0xC2, 0xC3, 0xC8, 0xC9, 0xE0, 0xE1, 0xE2, 0xE3, 0xE8, 0xE9, 0xEB,
+     0xF5, 0xF8, 0xF9, 0xFC, 0xFD} | {o for o in range(0x40) if o & 7 in (4, 5)}
+
+def mem_base(b, k, op):
+    """(explicit memory operand?, its base register number or None) of an admitted form (ModRM/SIB from the bytes)."""
+    i = len(leading(b)); rex = b[i - 1] if i and 0x40 <= b[i - 1] <= 0x4F else 0
+    if k == 'p':
+        if op in (0xA0, 0xA1, 0xA2, 0xA3): return True, None
+        if op in NO_MODRM_P: return False, None
+        at, xb = i + 1, rex & 1
+    elif k == '0f':
+        if 0x80 <= op <= 0x8F or 0xC8 <= op <= 0xCF: return False, None
+        at, xb = i + 2, rex & 1
+    elif k == 'vex':
+        at, xb = (i + 3, 0) if b[i] == 0xC5 else (i + 4, (~b[i + 1] >> 5) & 1)
+    else:
+        at, xb = i + 3, rex & 1
+    if at >= len(b): return False, None
+    modrm = b[at]; mod, rm = modrm >> 6, modrm & 7
+    if mod == 3: return False, None
+    if rm == 4:
+        base = b[at + 1] & 7 if at + 1 < len(b) else 0
+        return True, None if base == 5 and mod == 0 else base | xb << 3
+    return True, None if rm == 5 and mod == 0 else rm | xb << 3
+
+def segment(b, k, op):
+    """fexc_slice1.inc's segment-prefix rules (I7) for an otherwise admitted form: (class, why) of a refusal, else None."""
+    pre = leading(b)
+    ss, data, high = pre.count(0x36), sum(pre.count(x) for x in (0x26, 0x2E, 0x3E)), pre.count(0x64) + pre.count(0x65)
+    memory, base = mem_base(b, k, op)
+    if high and not memory: return 'FS/GS', 'FS/GS override without a memory operand'
+    if high and ss + data + high != 1: return 'FS/GS', 'FS/GS override with another segment prefix'
+    if not high and memory and ss + data and (bool(ss) != (base in (4, 5))):
+        return 'FS/GS', 'CS/DS/ES/SS override naming another segment than the default'
+    return None
 
 def classify(b, mnem):
     """-> (class, why). Classes: admitted SSE AVX x87 LOCK string system BMI FS/GS small-int other bad"""
@@ -97,7 +143,7 @@ def classify(b, mnem):
     base = mnem.split()[-1] if mnem else ''
     if k == 'vex':
         v = vex(b)
-        if v and vex_allowed(v): return 'admitted', ''
+        if v and vex_allowed(v, b): return segment(b, k, p['op']) or ('admitted', '')
         return ('BMI' if base in BMI or base[:-1] in BMI else 'AVX'), 'vex/evex'
     if k == 'xop': return 'other', 'xop'
     if k == 'p': v, br = primary(op, modrm)
@@ -107,7 +153,8 @@ def classify(b, mnem):
     else: v, br = UNS, False
     plainmod = modrm
     # fences and endbr64 are admitted whatever the opcode table says
-    if k == '0f' and op == 0xAE and modrm in (0xE8, 0xF0, 0xF8) and not (pre & {0x66, 0xF2, 0xF3}): return 'admitted', ''
+    if k == '0f' and op == 0xAE and modrm in (0xE8, 0xF0, 0xF8) and not (pre & {0x66, 0xF2, 0xF3}):
+        return segment(b, k, op) or ('admitted', '')
     if v != ALLOW:
         if k == '0f' and op == 0x1E and modrm == 0xFA and 0xF3 in pre and not (pre & {0xF0, 0xF2, 0x66, 0x67, 0x64, 0x65}): return 'admitted', ''
     else:
@@ -115,7 +162,8 @@ def classify(b, mnem):
         if 0xF2 in pre: return 'other', 'REPNE/bnd prefix on an admitted opcode'
         if 0xF3 in pre and not (k == 'p' and (op == 0xC3 or (op == 0x90 and not (p['rex'] & 1)))) and not (k == '0f' and op in (0xB8, 0xBC, 0xBD)):
             return 'other', 'REP prefix on an admitted opcode'
-        if pre & {0x64, 0x65}: return 'FS/GS', 'override on an admitted opcode'
+        seg = segment(b, k, op)      # I7: FS/GS overrides admitted on memory operands
+        if seg: return seg
         if 0x67 in pre: return 'other', 'address-size prefix on an admitted opcode'
         if br and 0x66 in pre: return 'other', 'operand-size prefix on a branch'
         if k == '0f' and 0xC8 <= op <= 0xCF and 0x66 in pre and not p['rex'] & 8: return 'other', '16-bit bswap'
@@ -231,7 +279,11 @@ def job(a):
 def selftest():
     h = bytes.fromhex
     cases = [('f390', 'pause', 'admitted'), ('0faee8', 'lfence', 'admitted'), ('f0488708', 'lock xchg', 'admitted'), ('f04887c1', 'lock xchg reg', 'LOCK'),
-             ('f3a4', 'rep movsb', 'string'), ('f30f1efa', 'endbr64', 'admitted'), ('64488b042528000000', 'mov %gs:', 'FS/GS'),
+             ('f3a4', 'rep movsb', 'string'), ('f30f1efa', 'endbr64', 'admitted'), ('64488b042528000000', 'mov %fs:', 'admitted'),
+             ('6548ff0425f0ff0000', 'incq %gs:', 'admitted'), ('644889c8', 'fs mov reg', 'FS/GS'), ('642e488b00', 'fs cs mov', 'FS/GS'),
+             ('36488b03', 'ss mov (%rbx)', 'FS/GS'), ('36488b0424', 'ss mov (%rsp)', 'admitted'), ('3e488b4500', 'ds mov (%rbp)', 'FS/GS'),
+             ('3e48ff24c500000000', 'notrack jmp *tbl', 'admitted'), ('65c4e2f0f200', 'andn %gs:', 'admitted'), ('f065480fc108', 'lock xadd %gs:', 'LOCK'),
+             ('65c3', 'gs ret', 'FS/GS'), ('3e4c8b2424', 'ds mov (%rsp),%r12', 'FS/GS'), ('3e498b0424', 'ds mov (%r12)', 'admitted'),
              ('0f22d8', 'mov %cr3', 'system'), ('0f28c1', 'movaps', 'SSE'), ('c5f877', 'vzeroupper', 'AVX'), ('d9c0', 'fld', 'x87'),
              ('f3480fb8c1', 'popcnt', 'admitted'), ('f0480fb10a', 'lock cmpxchg', 'LOCK'), ('480fa4c10c', 'shld', 'admitted'), ('f2c3', 'bnd ret', 'other'),
              ('fc', 'cld', 'admitted'), ('9c', 'pushfq', 'admitted'), ('9d', 'popfq', 'system'), ('c8100001', 'enter', 'small-int'), ('c9', 'leave', 'admitted'),

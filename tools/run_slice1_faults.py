@@ -34,6 +34,11 @@ Cases are derived from program descriptions, never written per program:
   operation") but not the access; the pinned QEMU faults with error 7 for shld/shrd by 0, 64 (64-bit), 32 (32-bit) and
   CL = 0 alike (October 28), and fexc series14 writes the value back. The guest-state page (G1) is a documented
   deviation: `guest_state_probes`. Any corpus of `tools/reference/gen_i1.py` works as input too.
+* I7: an FS/GS-overridden operand's address is the program's `fsbase`/`gsbase` + EA (mod 2^64) and it is never a stack
+  reference (#GP(0), not #SS(0), when non-canonical, whatever its base register); `segment_probes` cover every memory form
+  at a far, a negative and a wrapping base with a not-present page (CR2 = base + EA), a page-crossing access, a
+  non-canonical address, a canonical straddle and the private window, and indirect branches through FS/GS operands to a
+  non-canonical target. Any corpus of `tools/reference/gen_i7.py` works as input (its page mutations fault at base + EA).
 * Built-in probes (PROBES below): non-canonical data and stack addresses (#GP(0)/#SS(0)), stack accesses across the
   canonical gap (#SS(0)), E3's negative cases (`window_probes`; `--no-window` leaves them out): every class of the
   former private window (frame, state, tables, stacks, staging, resident text, shadow pool, guest-RAM alias, code area,
@@ -82,7 +87,7 @@ def split_operands(text):
         else: cur += c
     return [o for o in ops + [cur.strip()] if o]
 
-MEM = re.compile(r'(?:(byte|word|dword|qword) ptr )?\[(.*)\]')
+MEM = re.compile(r'(?:(byte|word|dword|qword) ptr )?(?:([cdefgs]s):)?\[(.*)\]')
 
 def address(expr, regs, next_rip):
     """Intel address expression `base + index*scale + disp` (64-bit registers, rip) -> (address, base register)."""
@@ -121,9 +126,13 @@ def events(text, regs, next_rip):
     ('divide', signed, bytes, divisor value | ('mem', address), rax, rdx)."""
     m, ops = text.split()[0], split_operands(text)
     def mem(op):
+        # I7: an FS/GS override adds that segment's base (`regs['fs']`/`regs['gs']`, from the program) and makes the
+        # reference an FS/GS one (#GP(0) when non-canonical, whatever the base register); CS/DS/ES/SS add nothing (the
+        # corpus names only the operand's default segment with them: fexc refuses the others).
         x = MEM.fullmatch(op)
         if not x: return None
-        a, base = address(x[2], regs, next_rip)
+        a, base = address(x[3], regs, next_rip)
+        if x[2] in ('fs', 'gs'): return (a + regs.get(x[2], 0)) & M64, SIZES[x[1]] if x[1] else None, False
         return a, SIZES[x[1]] if x[1] else None, base in STACK_BASES
     def reg_width(op, default=8): return ref.WIDTH[op] // 8 if op in ref.WIDTH else default
     rsp = regs['rsp']
@@ -138,8 +147,9 @@ def events(text, regs, next_rip):
     if m == 'pop' and len(ops) == 1:
         w, out = operand_width(ops[0]), [('access', rsp, operand_width(ops[0]), False, True)]
         if MEM.fullmatch(ops[0]):     # the destination address uses RSP after the increment
-            a, base = address(MEM.fullmatch(ops[0])[2], dict(regs, rsp=(rsp + w) & M64), next_rip)
-            out.append(('access', a, w, True, base in STACK_BASES))
+            x = MEM.fullmatch(ops[0]); a, base = address(x[3], dict(regs, rsp=(rsp + w) & M64), next_rip)
+            seg = x[2] in ('fs', 'gs')
+            out.append(('access', (a + regs.get(x[2], 0)) & M64 if seg else a, w, True, base in STACK_BASES and not seg))
         return out
     # I1: pushf and enter (nesting level 0) push one qword; leave reads [RBP] (a stack access; RSP and RBP change after it);
     # a prefetch hint never faults (SDM PREFETCHh: no exceptions but #UD for LOCK), whatever its address.
@@ -307,6 +317,7 @@ def reader(result):
     return read
 
 def state(result): return dict(zip(ref.REGS, (ref.num(v) for v in result['qemu']['gpr'])))
+def bases(p): return {'fs': ref.num(p.get('fsbase', 0)) & M64, 'gs': ref.num(p.get('gsbase', 0)) & M64}    # I7
 
 # Built-in probes: (name, registers, lines, index of the faulting line, mutations).
 D, S = gen.DATA, gen.STACK
@@ -431,7 +442,42 @@ def probes(window=True):
         out.append((f'fetch-{name}', REGS, lines, None, {'unmap': [0x101000], 'rip': 0x101000 - 11 - pad}))
         # Falling through (or straddling) the end of the lower canonical half: #GP at the next fetch.
         out.append((f'fetch-noncanonical-{name}', REGS, lines, None, {'rip': 0x8000_0000_0000 - 11 - pad}))
-    return out + division_probes()
+    return out + division_probes() + segment_probes()
+
+# I7: FS/GS-overridden accesses. For each (segment, base) and form, the pointer register is set so that base + EA (mod 2^64)
+# is the target: a not-present page (#PF, CR2 = base + EA), the second page of a crossing access (#PF at that page), a
+# non-canonical address and a canonical straddle (#GP(0) even with an RSP/RBP base: the reference is FS/GS, not SS).
+SEGMENT_BASES = [('fs', 0x7ffe_0000_1000), ('gs', 0xffff_8000_dead_0000), ('fs', 0xffff_ffff_ffff_f000)]
+SEGMENT_FORMS = [   # (name, pointer register, displacement + index part of the EA, line with {s} for the segment), 8-byte unless noted
+    ('load', 'rbx', 8, 'mov rax, qword ptr {s}:[rbx + 8]'), ('store', 'rbx', 0, 'mov qword ptr {s}:[rbx], rcx'),
+    ('rmw', 'rbx', 0, 'add qword ptr {s}:[rbx], 1'), ('read-index', 'rsi', 6, 'cmp qword ptr {s}:[rsi + r8*2], 5'),
+    ('push-mem', 'rbx', 0, 'push qword ptr {s}:[rbx]'), ('pop-mem', 'rbx', 0, 'pop qword ptr {s}:[rbx]'),
+    ('rbp-load', 'rbp', 16, 'mov rax, qword ptr {s}:[rbp + 16]'), ('rsp-store', 'rsp', 8, 'mov qword ptr {s}:[rsp + 8], rax'),
+    ('rbp-rmw', 'rbp', 0, 'xor qword ptr {s}:[rbp], rax'), ('xchg', 'rbx', 0, 'xchg qword ptr {s}:[rbx], rax'),
+    ('cmpxchg', 'rbx', 0, 'cmpxchg qword ptr {s}:[rbx], rcx'), ('xadd', 'rbx', 0, 'xadd qword ptr {s}:[rbx], rcx'),
+    ('shld', 'rbx', 0, 'shld qword ptr {s}:[rbx], rcx, 5'), ('movnti', 'rbx', 0, 'movnti qword ptr {s}:[rbx], rcx'),
+    ('jmp-mem', 'rbx', 0, 'jmp qword ptr {s}:[rbx]'), ('call-mem', 'rbx', 0, 'call qword ptr {s}:[rbx]'),
+    ('moffs', None, 0, 'movabs rax, qword ptr {s}:[{off:#x}]')]
+SEGMENT_TARGETS = [('pf', D + 0x1010, {'unmap': [D + 0x1000]}), ('pf-crossing', D + 0xffc, {'unmap': [D + 0x1000]}),
+                   ('noncanonical', 0x0000_8000_0000_0010, {}), ('straddle', 0x7fff_ffff_fffc, {}), ('window', PRIVATE + 0x1_0800, {})]
+
+def segment_probes():
+    out = []
+    for seg, base in SEGMENT_BASES:
+        for name, reg, ea, line in SEGMENT_FORMS:
+            for tname, target, mut in SEGMENT_TARGETS:
+                if tname == 'pf-crossing' and name in ('xchg', 'jmp-mem', 'call-mem'): continue    # split lock / no data write
+                text = line.format(s=seg, off=(target - base) & M64)
+                regs = dict(REGS, **({reg: (target - base - ea) & M64} if reg else {}))
+                if name == 'cmpxchg': regs['rax'] = 0         # either outcome writes the destination
+                out.append((f'segment-{seg}-{base:#x}-{name}-{tname}', regs, PRELUDE + [text] + AFTER, len(PRELUDE),
+                            dict(mut, **{f'{seg}base': base})))
+        # An indirect branch through an FS/GS operand to a non-canonical target: #GP(0) at the branch (before a call's push).
+        for name in ('jmp', 'call'):
+            regs = dict(REGS, rbx=(D + 0x40 - base) & M64, rax=0x8000_0000_0000_0000)
+            lines = PRELUDE + [f'mov qword ptr {seg}:[rbx], rax', f'{name} qword ptr {seg}:[rbx]'] + AFTER
+            out.append((f'segment-{seg}-{base:#x}-{name}-target', regs, lines, len(PRELUDE) + 1, {f'{seg}base': base}))
+    return out
 
 DIVISOR = {1: 'r9b', 2: 'r9w', 4: 'r9d', 8: 'r9'}
 SIZE = {1: 'byte', 2: 'word', 4: 'dword', 8: 'qword'}
@@ -626,6 +672,8 @@ def expectations(programs, probe_specs, work, paging=True):
     for name, regs, lines, k, mut in probe_specs:
         rip = mut.get('rip', gen.CODE)
         p, (_, offs) = probe_program(name, regs, lines, rip), offsets(lines)
+        p.update({b: hex(mut[b]) for b in ('fsbase', 'gsbase') if b in mut})      # I7: the segment bases
+        mut = {m: v for m, v in mut.items() if m not in ('fsbase', 'gsbase')}
         if k is None:       # fetch probe: the first instruction with a byte in a not-present page
             k = next(i for i in range(len(lines)) if layout(p, mut).fetch(rip + offs[i], offs[i + 1] - offs[i]))
         probing.append((p, offs, k, {m: v for m, v in mut.items() if m != 'rip'}, len(jobs)))
@@ -643,7 +691,7 @@ def expectations(programs, probe_specs, work, paging=True):
         placements = [('low', (p, results))] if corpus else [(w, relocate(p, results, mine, *d)) for w, d in PLACEMENTS]
         for where, (q, rs) in placements:
             rip = ref.num(q['rip'])
-            try: evs = {i: events(q['asm'][i], state(rs[j]), rip + offs[i + 1]) for i, j in at.items()}
+            try: evs = {i: events(q['asm'][i], dict(state(rs[j]), **bases(q)), rip + offs[i + 1]) for i, j in at.items()}
             except Unsupported as e: print(f"skip {q['name']} ({where}): {e}"); continue
             def case(name, mut):
                 f, i, fetched, ad = run_case(q, offs, evs, lambda k: reader(rs[at[k]]), mut)
@@ -672,7 +720,7 @@ def expectations(programs, probe_specs, work, paging=True):
     for p, offs, k, mut, j in probing:
         rip, r = ref.num(p['rip']), results[j]
         r['qemu']['rip'] = ref.hx(rip + offs[k])
-        evs = events(p['asm'][k], state(r), rip + offs[k + 1])
+        evs = events(p['asm'][k], dict(state(r), **bases(p)), rip + offs[k + 1])
         m = layout(p, mut)
         fetched = m.fetch(rip + offs[k], offs[k + 1] - offs[k])
         if mut.get('atomic'):

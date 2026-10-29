@@ -1428,24 +1428,25 @@
    "scope": "per_vcpu",
    "access": "rw",
    "reset": "0xfee00800",
-   "writable_mask": "0xfffffffc00",
+   "writable_mask": "0xfffffffd00",
    "write_rules": [
     "reserved_gp",
     "apic_base_extd_needs_en"
    ],
    "side_effects": [
-    "EN/EXTD select LAPIC mode; EN clear clears CPUID.1.EDX.APIC; base moves the MMIO page; no direct xAPIC->x2APIC (must pass through disabled): transition rule needs current value (not modelled statelessly)"
+    "EN/EXTD select LAPIC mode; EN clear clears CPUID.1.EDX.APIC; base moves the MMIO page; BSP (bit 8) is stored. Mode transitions that need the current value (SDM Vol.3 13.12.5, Figure 13-37), for the LAPIC chunk: x2APIC -> xAPIC (EN=1, EXTD 1 -> 0) and disabled -> x2APIC (EN 0 -> 1 with EXTD=1) are #GP; xAPIC -> x2APIC and x2APIC -> disabled are allowed (not modelled statelessly here)"
    ],
    "source": [
     "CPU 16 (CLM-03-01-16)",
-    "SDM Vol.3 13.4 (IA32_APIC_BASE: BSP bit 8, EXTD bit 10, EN bit 11, base 35:12 up to MAXPHYADDR)"
+    "SDM Vol.3 13.4 (IA32_APIC_BASE: BSP bit 8, EXTD bit 10, EN bit 11, base 35:12 up to MAXPHYADDR)",
+    "SDM Vol.4 Table 2-2 IA32_APIC_BASE: 7:0 reserved, 8 BSP flag (R/W), 9 reserved, 10 EXTD, 11 EN, MAXPHYADDR-1:12 base, 63:MAXPHYADDR reserved"
    ],
    "reset_bsp": "0xfee00900",
    "kernel": [
     "K kernel/apic/apic.c:1713-1729 (disable then set EXTD)",
     "apic.c:1180-1182,1965-1993,2465-2468"
    ],
-   "note": "Reset 0xfee00900 for the BSP (BSP bit 8), 0xfee00800 for APs: SDM default base, not stated in a CPU record. Writes to bit 8 (read-only) : ignored vs #GP is OPEN."
+   "note": "Reset 0xfee00900 for the BSP (BSP bit 8), 0xfee00800 for APs: SDM default base, not stated in a CPU record. Bit 8 is R/W (SDM Vol.4 Table 2-2; KVM's reserved mask is 0x2ff and the bits above MAXPHYADDR): writable, so the BSP may write back the value it reads."
   },
   {
    "index": "0x79",
@@ -1518,13 +1519,14 @@
    "source": [
     "CPU 9 (CLM-03-01-09)",
     "CPU 16 (CLM-03-01-16)",
-    "SDM Vol.2D WRMSR (canonical check list includes IA32_SYSENTER_ESP/EIP)"
+    "SDM Vol.2D WRMSR (canonical check list includes IA32_SYSENTER_ESP/EIP)",
+    "SDM Vol.4 Table 2-2 IA32_SYSENTER_CS: 15:0 CS selector (R/W), 31:16 and 63:32 not used, can be read and written"
    ],
    "kernel": [
     "K kernel/cpu/common.c:2019-2021 (unsafe, gated on SEP)",
     "common.c:2131-2139 (_safe)"
    ],
-   "note": "SYSENTER_CS reserved-bit behaviour is not stated in the records: OPEN (all 64 bits stored here)"
+   "note": "All 64 bits are stored: bits 63:16 are 'not used, can be read and written' (SDM Vol.4 Table 2-2). QEMU keeps only 15:0 (a QEMU deviation)."
   },
   {
    "index": "0x175",
@@ -2279,19 +2281,22 @@
    "scope": "per_vcpu",
    "access": "rw",
    "reset": "0x0",
-   "writable_mask": "0xffffffffffffffff",
-   "write_rules": [],
+   "writable_mask": "0xffffffff",
+   "write_rules": [
+    "reserved_gp"
+   ],
    "side_effects": [
     "RFLAGS clear mask on SYSCALL"
    ],
    "source": [
     "CPU 9 (CLM-03-01-09)",
-    "CPU 16 (CLM-03-01-16)"
+    "CPU 16 (CLM-03-01-16)",
+    "SDM Vol.4 Table 2-2 IA32_FMASK: 31:0 system call flag mask (R/W), 63:32 reserved; SDM Vol.3 Figure 5-14 (IA32_FMASK 63:32 reserved); SDM Vol.2D WRMSR: setting a reserved bit is #GP(0)"
    ],
    "kernel": [
     "K kernel/cpu/common.c:2146"
    ],
-   "note": "upper-half reserved-bit behaviour is not stated in the records: OPEN (all 64 bits stored)"
+   "note": "bits 63:32 reserved (#GP on a set bit), per the SDM citations above"
   },
   {
    "index": "0xc0000100",

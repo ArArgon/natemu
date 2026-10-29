@@ -113,6 +113,9 @@ unrolled executed path instead (`gen_slice2.unrolled`).
   0x40000..0x44000 are reserved. CPU model `-cpu qemu64` (no AVX/BMI etc.), or a program's `cpu` (qemu64 plus `+feature`
   flags, e.g. the I1 corpus's `qemu64,+bmi1,+bmi2,+abm,+popcnt`, recorded in its result). Code bytes must not overlap memory regions
   (same page is fine). Max 100 regions.
+- Segment bases (I7): a program's optional `fsbase`/`gsbase` (canonical, default 0) are loaded by WRFSBASE/WRGSBASE in a
+  prelude at 0x40f00 (the ELF entry then; `+fsgsbase` is added to the CPU model), because Linux-user's `arch_prctl`
+  refuses bases at or above its task size. The VM runners pass them as the driver's `fsbase`/`gsbase` items.
 - QEMU is a software model of x86, not hardware: behavior of undefined bits and a few corners (e.g. 8/16-bit
   shift CF beyond width) is whatever QEMU 7.2 does; those bits are masked, not trusted.
 

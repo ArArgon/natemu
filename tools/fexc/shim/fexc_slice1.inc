@@ -175,8 +175,46 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   // rep ret is a ret; F3 90 (no REX.B: that would be xchg r8, rax) is PAUSE, FEX's `yield`.
   if ((f & DecodeFlags::FLAG_REP_PREFIX) && !(primary && (op == 0xC3 || (op == 0x90 && !(f & DecodeFlags::FLAG_REX_XGPR_B)))))
     return Uns("REP prefix");
-  const uint32_t seg = f & DecodeFlags::FLAG_SEGMENTS;
-  if (seg == DecodeFlags::FLAG_FS_PREFIX || seg == DecodeFlags::FLAG_GS_PREFIX) return Uns("FS/GS override");
+  // Segment prefixes in 64-bit mode (I7). FS/GS: FEX adds fs_cached/gs_cached (guest-state page loads) to the effective
+  // address of the explicit memory operand, as x86 adds FS.base/GS.base; never to the implicit stack accesses of push/
+  // pop/call/ret/enter/leave/pushf (SS, which no prefix overrides). CS/DS/ES/SS: base 0 in 64-bit mode, and FEX's decoder
+  // drops them (they never set FLAG_SEGMENTS there), so they are admitted as no-ops when they name the operand's default
+  // segment (SS for an RSP/RBP base, else DS; CS and ES behave as DS: #GP(0) for a non-canonical address) or the
+  // instruction has no explicit memory operand. Refused, where vendors differ and the SDM gives no rule:
+  //   - several segment prefixes with an FS/GS one (Vol. 2 §2.1.1 gives no rule for two prefixes of one group; FEX keeps
+  //     the last FS/GS prefix and drops CS/DS/ES/SS, QEMU lets the last segment prefix win, a null one included);
+  //   - SS naming an operand whose default is DS, or CS/DS/ES one whose default is SS (#SS(0) versus #GP(0) for a
+  //     non-canonical address: AMD ignores these overrides, so the default segment decides);
+  //   - FS/GS on an instruction with no explicit memory operand (nothing to override).
+  {
+    const uint32_t seg = f & DecodeFlags::FLAG_SEGMENTS;
+    const bool fsgs = seg == DecodeFlags::FLAG_FS_PREFIX || seg == DecodeFlags::FLAG_GS_PREFIX;
+    const bool memory = (has_modrm && mod != 3) || (primary && op >= 0xA0 && op <= 0xA3);
+    const uint8_t* b = fexc_guest_bytes ? fexc_guest_bytes(d.PC, d.InstSize) : nullptr;
+    if (!b) return Uns("segment prefixes: instruction bytes unavailable");
+    int ss = 0, data = 0, high = 0;   // 36; 26/2E/3E; 64/65
+    for (unsigned i = 0; i < d.InstSize; ++i) {
+      const uint8_t x = b[i];
+      if (x == 0x36) ++ss;
+      else if (x == 0x26 || x == 0x2E || x == 0x3E) ++data;
+      else if (x == 0x64 || x == 0x65) ++high;
+      else if (!(x == 0xF0 || x == 0xF2 || x == 0xF3 || x == 0x66 || x == 0x67 || (x >= 0x40 && x <= 0x4F))) break;
+    }
+    if (fsgs && !memory) return Uns("FS/GS override on an instruction without a memory operand");
+    if (fsgs && ss + data + high != 1) return Uns("FS/GS override with another segment prefix (no SDM rule for several)");
+    if (!fsgs && memory && ss + data) {
+      int base = -1;
+      for (const auto* o : {&d.Dest, &d.Src[0], &d.Src[1], &d.Src[2]}) {
+        if (o->IsGPRDirect()) base = o->Data.GPR.GPR;
+        else if (o->IsGPRIndirect()) base = o->Data.GPRIndirect.GPR;
+        else if (o->IsSIB()) base = o->Data.SIB.Base;
+        else if (!o->IsRIPRelative()) continue;
+        break;
+      }
+      const bool stack = base == FEXCore::X86State::REG_RSP || base == FEXCore::X86State::REG_RBP;
+      if ((ss && !stack) || (data && stack)) return Uns("CS/DS/ES/SS override naming another segment than the operand's default (#GP versus #SS)");
+    }
+  }
   if (f & DecodeFlags::FLAG_ADDRESS_SIZE) return Uns("address-size override");
   if (v.branch && (f & DecodeFlags::FLAG_OPERAND_SIZE)) return Uns("operand-size prefix on a branch");
   if (d.FexcMap == FEXC_MAP_TWO && op >= 0xC8 && op <= 0xCF && (f & DecodeFlags::FLAG_OPERAND_SIZE) && !(f & DecodeFlags::FLAG_REX_WIDENING))

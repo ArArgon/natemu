@@ -102,7 +102,7 @@ class Profile:
             ebx = ebx & 0xFFFF | (vcpu & 0xFF) << 24 | (n & 0xFF) << 16
             ecx |= (cr4 >> 18 & 1) << 27
             edx |= (apic_en << 9) | ((n > 1) << 28)
-        elif l == 4:
+        elif l == 4 and eax & 31:                             # a null cache type (the terminator) has EAX = 0 (SDM Vol.2A CPUID leaf 4)
             eax |= ((n - 1) << 26) | ((n - 1) << 14 if sub == 3 else 0)
         elif l == 0xB:
             edx = vcpu

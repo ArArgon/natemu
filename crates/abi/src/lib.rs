@@ -14,6 +14,8 @@ pub mod resident;
 pub mod shadow;
 pub mod code_object;
 pub mod execution;
+pub mod cpu;
+pub mod cpu_profile;
 pub const SUCCESS: u64 = 1;
 pub const REJECTED: u64 = 2;
 pub const PANIC: u64 = 4;

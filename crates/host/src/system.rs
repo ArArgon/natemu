@@ -2,8 +2,8 @@
 //! the instruction fexc cut a block before. FEX's decoder classifies the instruction (fexc's `system_instruction` cut
 //! with its opcode map and opcode); it does not decode the ModRM of `0f 20..23` (two bytes there), so the operands of
 //! the supported forms are decoded here and must agree with FEX's opcode: MOV to/from CR0..CR15 (`0f 22`/`0f 20`,
-//! ModRM always a register pair), INVLPG m (`0f 01 /7`, mod != 3), RDMSR (`0f 32`) and WRMSR (`0f 30`) in 64-bit
-//! mode. Anything else (other system instructions, F2/F3 prefixes, an address-size prefix or an FS/GS override on
+//! ModRM always a register pair), INVLPG m (`0f 01 /7`, mod != 3), RDMSR (`0f 32`), WRMSR (`0f 30`), CPUID (`0f a2`),
+//! RDTSC (`0f 31`) and RDTSCP (`0f 01 f9`) in 64-bit mode. Anything else (other system instructions, F2/F3 prefixes, an address-size prefix or an FS/GS override on
 //! INVLPG) is `None`: the vCPU stops with fexc's reason, as for code it cannot compile.
 use natemu_abi::execution::{System, system};
 
@@ -47,6 +47,12 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
             (s.cr, s.reg) = (u32::from(modrm >> 3 & 7) | r, u32::from(modrm & 7) | b);
         }
         0x30 | 0x32 => s.kind = if opcode == 0x30 { system::WRMSR } else { system::RDMSR },
+        0xa2 => s.kind = system::CPUID,
+        0x31 => s.kind = system::RDTSC,
+        0x01 if *bytes.get(at)? == 0xf9 => {
+            at += 1;
+            s.kind = system::RDTSCP;
+        }
         0x01 => {
             let modrm = *bytes.get(at)?;
             at += 1;
@@ -115,6 +121,10 @@ mod tests {
         assert_eq!(d("660f22c0", 0x22), Some(mov(MOV_TO_CR, 0, 0, 4, 0))); // 66 ignored
         assert_eq!(d("0f30", 0x30), Some(System { kind: WRMSR, length: 2, ..System::NONE }));
         assert_eq!(d("480f32", 0x32), Some(System { kind: RDMSR, length: 3, ..System::NONE }));
+        assert_eq!(d("0fa2", 0xa2), Some(System { kind: CPUID, length: 2, ..System::NONE }));
+        assert_eq!(d("f00fa2", 0xa2), Some(System { kind: CPUID, length: 3, lock: 1, ..System::NONE })); // #UD
+        assert_eq!(d("480f31", 0x31), Some(System { kind: RDTSC, length: 3, ..System::NONE }));
+        assert_eq!(d("670f01f9", 0x01), Some(System { kind: RDTSCP, length: 4, ..System::NONE })); // 67 ignored
     }
 
     #[test]
@@ -141,7 +151,8 @@ mod tests {
             ("0f22", MAP_TWO, 0x22),     // truncated ModRM
             ("0f013c", MAP_TWO, 0x01),   // truncated SIB
             ("0f017810", MAP_TWO, 0x01), // fine, but see below: complete
-            ("0fa2", MAP_TWO, 0xa2),     // cpuid
+            ("f30fa2", MAP_TWO, 0xa2),   // F3 cpuid
+            ("0f01f8", MAP_TWO, 0x31),   // FEX's opcode disagrees
             ("0f22d8", MAP_TWO, 0x20),   // FEX's opcode disagrees
             ("0f22d8", 6, 0x22),         // not the two-byte map
         ] {

@@ -96,6 +96,17 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual((int(q[4]['gpr'][0], 16), int(q[4]['rip'], 16), int(q[4]['rflags'], 16)), (a, 0x100000, flags.FIXED))
         with self.assertRaises(ValueError): ref.run_programs([progs[3] | {'prefix': 4}], work, QEMU)           # not an instruction boundary
 
+    def test_segment_bases(self):     # I7: fsbase/gsbase reach QEMU; linear = base + EA mod 2^64 (a negative GS base wraps)
+        fs, gs, d = 0x7ffe_0000_1000, 0xffff_8000_dead_0000, bytes(range(32))
+        p = prog('64488b03' '65488b0e', {3: (0x200000 - fs) & M64, 6: (0x200008 - gs) & M64}, [(0x200000, d)],
+                 [{'op': 'mov', 'width': 64}] * 2) | {'fsbase': hex(fs), 'gsbase': hex(gs)}     # mov rax, fs:[rbx]; mov rcx, gs:[rsi]
+        work = RAW / 'selfcheck-segments'; shutil.rmtree(work, ignore_errors=True)
+        try: results, _ = ref.run_programs([p], work, QEMU)
+        except subprocess.CalledProcessError as e: self.skipTest(f'docker/image unavailable: {e}')
+        g = [int(x, 16) for x in results[0]['qemu']['gpr']]
+        self.assertEqual((g[0], g[1]), (int.from_bytes(d[:8], 'little'), int.from_bytes(d[8:16], 'little')))
+        with self.assertRaises(ValueError): ref.norm(p | {'fsbase': hex(1 << 47)})                             # non-canonical base
+
 @unittest.skipUnless(QEMU.exists(), f'pinned QEMU not at {QEMU}')
 class ControlFlow(unittest.TestCase):
     """Flow programs: the executed path (from QEMU's TB trace) decides the instruction count and the undefined flags."""

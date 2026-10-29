@@ -17,6 +17,13 @@ kernel small-int 1,330 → 36 refused (cmpxchg16b 19, prefetchw 17; the 104 `cmp
 now counted as FS/GS, chunk I7), kernel BMI 1,939 → 0, `pushfq` 539 admitted (`popfq` stays system); initramfs small-int
 7,108 → 0, BMI 7,501 → 8 (`mulx` with an address-size or legacy prefix before VEX).
 
+**I7 re-check (October 28).** `census.py` ports the I7 segment rules (fexc series15: FS/GS on an explicit memory operand,
+alone; CS/DS/ES/SS naming the operand's default segment; a segment prefix before a BMI VEX form). Rerun into
+`natemu-raw/kernel-census-i7-20261028-01/` (`x` linked to the C0 data; report in its `report/`). FS/GS class: kernel
+(decompressor + vmlinux) 36,958 → 0; initramfs init chain 6,113 → 0, other executables 8,810 → 0, other libraries
+12,676 → 2 (two `jb` with an FS prefix and no memory operand, probably data in a code section). Every one of them moved
+to admitted; no instruction admitted before is refused now (no CS/DS/ES/SS prefix names a non-default segment).
+
 Files here: `extract.py`, `census.py`, `report.py`, `results.md` (every table, generated), `forms-kernel.tsv` (every refused
 form of the decompressor and vmlinux, one row per mnemonic + operand shape, first-use order). The same for the
 initramfs is `RAW/forms-initrd.tsv`; `RAW/census.json` holds every row.

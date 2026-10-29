@@ -302,9 +302,15 @@ pub mod frame {
     /// (FEX: 1 = clear, -1 = set).
     pub const FLAGS: u32 = 0x3f0;
     pub const DF: u32 = FLAGS + 10;
-    /// Guest-state fields `(offset, bytes)` admitted code may read through x28: the RFLAGS bytes above. FS/GS bases,
-    /// MXCSR, x87 and AVX state await their chunks. Every other x28 access is refused.
-    pub const GUEST_STATE: [(u32, u32); 4] = [(FLAGS + 8, 3), (FLAGS + 12, 1), (FLAGS + 14, 1), (FLAGS + 16, 6)];
+    /// FEX's `gs_cached` and `fs_cached` (`CPUState`, right before the flag bytes): the GS and FS bases FEX adds to every
+    /// GS-/FS-prefixed address in 64-bit mode (`OpDispatchBuilder::GetSegment`), 8 bytes each, written by the resident
+    /// from the bank at every block entry (I7).
+    pub const GS_BASE: u32 = FLAGS - 16;
+    pub const FS_BASE: u32 = FLAGS - 8;
+    /// Guest-state fields `(offset, bytes)` admitted code may read through x28: the segment bases and the RFLAGS bytes
+    /// above. MXCSR, x87 and AVX state await their chunks. Every other x28 access is refused.
+    pub const GUEST_STATE: [(u32, u32); 6] =
+        [(GS_BASE, 8), (FS_BASE, 8), (FLAGS + 8, 3), (FLAGS + 12, 1), (FLAGS + 14, 1), (FLAGS + 16, 6)];
     /// The fields admitted code may also write: DF only. TF, IF, IOPL, NT, AC, VIF, VIP and ID are the resident's.
     pub const GUEST_STATE_WRITABLE: [(u32, u32); 1] = [(DF, 1)];
     pub const BYTES: usize = 4096;
@@ -409,6 +415,11 @@ pub struct Cpu {
     pub efer: u64,
     /// Current privilege level (CS.RPL in a full segment model).
     pub cpl: u64,
+    /// FS.base and GS.base (64-bit mode: the only segment bases that apply, I7). Authoritative here: the resident writes
+    /// them into the guest-state page ([`frame::FS_BASE`], [`frame::GS_BASE`]) at every block entry and never reads
+    /// them back; only the resident changes them (WRFSBASE/WRGSBASE, the MSRs and SWAPGS are its transactions, S3).
+    pub fs_base: u64,
+    pub gs_base: u64,
 }
 
 pub const CR0_PE: u64 = 1;
@@ -556,17 +567,19 @@ pub mod system {
     pub const MOV_TO_CR: u32 = 1;
     pub const MOV_FROM_CR: u32 = 2;
     pub const INVLPG: u32 = 3;
-    /// EDX:EAX := MSR ECX; MSR ECX := EDX:EAX.
+    /// EDX:EAX := MSR ECX; MSR ECX := EDX:EAX (the profile's MSRs, [`crate::cpu`]).
     pub const RDMSR: u32 = 4;
     pub const WRMSR: u32 = 5;
     /// Test drivers only (no x86 instruction; the host's decoder never yields it): the `length`-byte instruction at RIP
     /// is replaced by a change of the CPL to `cr` (0 or 3) at any CPL, through the resident's general CPL change.
     pub const SET_CPL: u32 = 6;
+    /// CPUID (any CPL, serialising), RDTSC and RDTSCP (#GP at CPL > 0 with CR4.TSD).
+    pub const CPUID: u32 = 7;
+    pub const RDTSC: u32 = 8;
+    pub const RDTSCP: u32 = 9;
     /// `System::base` of a RIP-relative operand (relative to the next instruction).
     pub const RIP: u32 = 16;
     pub const NO_REG: u32 = 0xff;
-    /// The one MSR the resident implements; any other RDMSR/WRMSR raises #GP(0).
-    pub const MSR_EFER: u32 = 0xc000_0080;
     impl super::System {
         pub const NONE: Self = Self { kind: 0, length: 0, lock: 0, cr: 0, reg: 0, base: NO_REG, index: NO_REG, scale: 0, disp: 0 };
         /// Field ranges the resident relies on (it checks every reply).
@@ -580,7 +593,7 @@ pub mod system {
                         && (reg(self.index) || self.index == NO_REG)
                         && self.scale <= 3
                         && (self.base != RIP || self.index == NO_REG),
-                    RDMSR | WRMSR => true,
+                    RDMSR | WRMSR | CPUID | RDTSC | RDTSCP => true,
                     SET_CPL => matches!(self.cr, 0 | 3),
                     _ => false,
                 }
@@ -733,6 +746,8 @@ pub struct State {
     /// System instructions the resident began executing as transactions: counted on entry, so those refused
     /// (`unsupported_system`) are included along with the committed and faulted.
     pub systems: u64,
+    /// The VM's vCPU count (CPUID's topology fields; set by the host, 1 by default).
+    pub vcpus: u64,
 }
 impl State {
     pub const fn new(vcpu: u64, cpu: Cpu) -> Self {
@@ -781,10 +796,16 @@ impl State {
             stop_ticks: 0,
             system: System::NONE,
             systems: 0,
+            vcpus: 1,
         }
     }
 }
-const _: () = assert!(core::mem::size_of::<State>() <= 4096);
+/// The vCPU's MSRs ([`crate::cpu::Msrs`]): a record of their own after [`State`] in its page, so the resident never copies
+/// them with the state. The host writes [`crate::cpu::reset_msrs`] before the vCPU first runs; the resident owns them.
+pub const MSRS_OFFSET: usize = STATE_OFFSET + 0x800;
+pub const MSRS_VA: u64 = PRIVATE + MSRS_OFFSET as u64;
+const _: () = assert!(core::mem::size_of::<State>() <= MSRS_OFFSET - STATE_OFFSET);
+const _: () = assert!(MSRS_OFFSET + core::mem::size_of::<crate::cpu::Msrs>() <= STATE_OFFSET + 4096);
 const _: () = assert!(STATE_OFFSET + 4096 <= FRAME_OFFSET);
 const _: () = assert!(FRAME_OFFSET + frame::BYTES <= GUEST_STATE_OFFSET);
 const _: () = assert!(GUEST_STATE_OFFSET + frame::BYTES <= (crate::STACK_TOP - PRIVATE) as usize - STACK_BYTES);
@@ -816,6 +837,11 @@ mod tests {
             assert_eq!(frame::df(frame::flag_bytes(rflags)[2].1), rflags & 0x400 != 0);
         }
         assert!(!frame::df(0) && !frame::df(1) && frame::df(0xff));
+        // I7: FEX's gs_cached/fs_cached, 8 bytes each right below the flag bytes, readable, never writable.
+        assert_eq!((frame::GS_BASE, frame::FS_BASE), (992, 1000));
+        for at in [frame::GS_BASE, frame::FS_BASE] {
+            assert!((at..at + 8).all(|b| inside(&frame::GUEST_STATE, b)) && !inside(&frame::GUEST_STATE_WRITABLE, at));
+        }
     }
 
     #[test]
@@ -856,7 +882,7 @@ mod tests {
         let invlpg = System { kind: system::INVLPG, length: 7, base: system::RIP, ..System::NONE };
         assert!(mov.well_formed() && invlpg.well_formed());
         for bad in [
-            System { kind: 9, ..mov },
+            System { kind: 10, ..mov },
             System { length: 0, ..mov },
             System { length: 16, ..mov },
             System { reg: 16, ..mov },
@@ -881,6 +907,8 @@ mod tests {
             cr4: CR4_PAE,
             efer: EFER_LME | EFER_LMA | EFER_NXE,
             cpl: 3,
+            fs_base: 0,
+            gs_base: 0,
         };
         let c = cpu.control().unwrap();
         assert_eq!((c.cr3, c.cpl, c.wp, c.nxe, c.smep), (0x1000, 3, 1, 1, 0));

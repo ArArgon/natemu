@@ -34,12 +34,15 @@ pub(crate) struct Backing {
     pub(crate) memory: Memory,
     pub(crate) n: usize,
     stride: usize,
+    /// One CNTVCT sample (the host's `mach_absolute_time`: every vCPU's virtual counter has offset 0) taken when the VM
+    /// was prepared: each vCPU's TSC starts from it, so all start near 0 and agree.
+    epoch: u64,
 }
 impl Backing {
     /// vCPU `v`'s view.
     pub(crate) fn vcpu(&self, v: usize) -> Area<'_> {
         assert!(v < self.n);
-        Area { memory: &self.memory, vcpu: v, base: v * self.stride }
+        Area { memory: &self.memory, vcpu: v, vcpus: self.n, epoch: self.epoch, base: v * self.stride }
     }
 }
 /// One vCPU's own part of the backing: offsets are those of block 0 (`exec`/`cache`), relocated to its block.
@@ -47,6 +50,9 @@ impl Backing {
 pub(crate) struct Area<'a> {
     pub(crate) memory: &'a Memory,
     pub(crate) vcpu: usize,
+    /// The VM's vCPU count, and the CNTVCT its TSCs start from ([`Backing`]).
+    pub(crate) vcpus: usize,
+    pub(crate) epoch: u64,
     /// Backing offset of its block (its window).
     pub(crate) base: usize,
 }
@@ -118,11 +124,18 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize) -> Result<Bac
         shared.mode = exec::MODE;
         memory.write_record(base + SHARED_OFFSET, shared);
     }
-    Ok(Backing { memory, n, stride })
+    Ok(Backing { memory, n, stride, epoch: unsafe { mach_absolute_time() } })
 }
 /// Sets the vCPU's initial architectural state (before it first runs).
 pub(crate) fn set_cpu(area: Area, cpu: Cpu) {
-    area.write_record(exec::STATE_OFFSET, State::new(area.vcpu as u64, cpu));
+    let mut state = State::new(area.vcpu as u64, cpu);
+    state.vcpus = area.vcpus as u64;
+    area.write_record(exec::STATE_OFFSET, state);
+    // The TSC (provisional, plan L5) is the resident's CNTVCT scaled to TSC_HZ plus this offset: from the shared epoch.
+    const _: () = assert!(natemu_abi::cpu_profile::TSC_HZ == 1_000_000_000); // ticks_ns scales like the resident
+    let mut msrs = natemu_abi::cpu::reset_msrs(area.vcpu == 0);
+    msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_TSC).unwrap()] = ticks_ns(area.epoch).wrapping_neg();
+    area.write_record(exec::MSRS_OFFSET, msrs);
 }
 /// Enters the vCPU at the resident in its window, its tables tagged with its own ASIDs (2v + 2 for its supervisor
 /// shadow space, loaded at boot; the resident uses 2v + 3 for its user space), as GIC vCPU `area.vcpu` with its peer
@@ -882,8 +895,8 @@ mod tests {
         let memory = Memory::with_size(exec::BACKING_BYTES).unwrap();
         let ram = guest_ram(&memory);
         assert!(ram.copy_in(0x5ff0, &[0xaa; 16]) && ram.copy_in(0x9000, &[0xbb; 16]));
-        let area = Area { memory: &memory, vcpu: 0, base: 0 };
-        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1ff0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3 });
+        let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0 };
+        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1ff0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0 });
         s.fetch = [0x5000, u64::MAX];
         let f = fetched(area, &s, None).unwrap().unwrap();
         assert_eq!((f.bytes, f.more, f.next_fault), (vec![0xaa; 16], true, None));

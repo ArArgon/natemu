@@ -42,6 +42,10 @@ MAX_REGIONS = 100
 # Fault mode (signal reference): a SIGSEGV handler on an alternate stack, the saved pages of unmapped regions
 ALT, ALT_BYTES, SAVE, SAVE_PAGES = HARNESS + 0x4000, 0x2000, HARNESS + 0x6000, 2
 HANDLER, ACT, SS, RESTORER = HARNESS + 0x400, HARNESS + 0x300, HARNESS + 0x340, HARNESS + 0x3c0
+# I7: the FS/GS bases of a program with `fsbase`/`gsbase` (input block +144/+152) are loaded by WRFSBASE/WRGSBASE in a
+# prelude (the ELF entry then; it jumps to the setup), QEMU's CPU with +fsgsbase. Linux-user's arch_prctl refuses bases
+# at or above its task size, so negative (upper-half) bases need the instructions.
+SEGMENTS = HARNESS + 0xf00
 FAULT_BYTES = 32                      # appended to the 144-byte output: error code, trap number, CR2, si_addr
 
 
@@ -168,9 +172,12 @@ def norm(p):
                     f'protection {mode} {page:#x}: a whole page of a memory region')
         faults = protect
     cpu = p.get('cpu', 'qemu64')
+    bases = [num(p.get('fsbase', 0)) & (2**64 - 1), num(p.get('gsbase', 0)) & (2**64 - 1)]
+    require(all(b >> 47 in (0, 0x1ffff) for b in bases), 'fsbase/gsbase must be canonical (WRFSBASE/WRGSBASE #GP otherwise)')
+    if any(bases) and '+fsgsbase' not in cpu: cpu += ',+fsgsbase'
     require(re.fullmatch(r'qemu64(,\+[a-z0-9_]+)*', cpu) is not None, f'cpu {cpu!r}: qemu64 plus +feature flags only')
     return dict(name=p.get('name', ''), code=code, rip=rip, gpr=gpr, rflags=rflags, regions=regions, insns=p.get('insns'), prefix=prefix,
-                flow=flow, offsets=offsets, faults=faults, cpu=cpu)
+                flow=flow, offsets=offsets, faults=faults, cpu=cpu, bases=bases)
 
 
 def build_elf(p):
@@ -198,7 +205,12 @@ def build_elf(p):
         poke(HANDLER, handler); poke(RESTORER, restorer)
         poke(ACT, struct.pack('<4Q', HANDLER, 4 | 0x04000000 | 0x08000000 | 0x40000000, RESTORER, 0))     # SA_SIGINFO|RESTORER|ONSTACK|NODEFER
         poke(SS, struct.pack('<QiiQ', ALT, 0, 0, ALT_BYTES))
-    poke(IN, struct.pack('<2Q', p['rip'], p['rflags'] | 0x202) + b''.join(struct.pack('<Q', g) for g in p['gpr']))
+    poke(IN, struct.pack('<2Q', p['rip'], p['rflags'] | 0x202) + b''.join(struct.pack('<Q', g) for g in p['gpr']) + struct.pack('<2Q', *p['bases']))
+    entry = HARNESS
+    if any(p['bases']):
+        prelude = assemble(f'mov rax, qword ptr [{IN + 144}]\nwrfsbase rax\nmov rax, qword ptr [{IN + 152}]\nwrgsbase rax\nmov eax, {HARNESS}\njmp rax')
+        require(p['faults'] is None or HANDLER + len(handler) <= SEGMENTS, 'fault-mode handler overlaps the segment prelude')
+        poke(SEGMENTS, prelude); entry = SEGMENTS
     poke(TABLE, struct.pack('<Q', len(p['regions'])) + b''.join(struct.pack('<2Q', a, len(d)) for a, d in p['regions']))
     for a, d in p['regions']: put(a, d, f'memory {a:#x}')
     put(p['rip'], p['code'] + cap, 'code')
@@ -210,7 +222,7 @@ def build_elf(p):
     for run in runs:
         data = b''.join(bytes(pages[n]) for n in run)
         phs.append(struct.pack('<IIQQQQQQ', 1, 7, offset + len(body), run[0] * PAGE, run[0] * PAGE, len(data), len(data), PAGE)); body += data
-    header = struct.pack('<16sHHIQQQIHHHHHH', b'\x7fELF\x02\x01\x01' + bytes(9), 2, 62, 1, HARNESS, 64, 0, 0, 64, 56, len(runs), 0, 0, 0)
+    header = struct.pack('<16sHHIQQQIHHHHHH', b'\x7fELF\x02\x01\x01' + bytes(9), 2, 62, 1, entry, 64, 0, 0, 64, 56, len(runs), 0, 0, 0)
     return (header + b''.join(phs)).ljust(offset, b'\0') + body, len(cap)
 
 
@@ -274,9 +286,9 @@ def att_width(ann, m, ops):
     """Operand width QEMU's disassembly implies for the annotation's operand: destination register, else size suffix."""
     if ann['op'] in IMPLICIT: return IMPLICIT[ann['op']][1]
     if ann['op'] == 'setcc': return 8
-    if ops and ops[-1].startswith('%'): return WIDTH[ops[-1][1:]]
+    if ops and ops[-1][1:] in WIDTH: return WIDTH[ops[-1][1:]]      # a register (`%fs:...` is memory, I7)
     if m[-1] in SUFFIX: return SUFFIX[m[-1]]
-    regs = [o for o in ops if o.startswith('%')]                  # memory destination: the last register operand (I1:
+    regs = [o for o in ops if o[1:] in WIDTH]                  # memory destination: the last register operand (I1:
     return WIDTH.get(regs[-1][1:]) if regs and ann['op'] in REG_WIDTH_OPS else None   # shld/shrd, cmpxchg, xadd, movnti)
 REG_WIDTH_OPS = {'shld', 'shrd', 'cmpxchg', 'xadd', 'movnti'}
 

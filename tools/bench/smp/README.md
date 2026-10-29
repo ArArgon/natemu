@@ -88,6 +88,10 @@ per CPU); and a PTE change without INVLPG (either history is legal: not compared
 (`sysfault-*`, `params.fault_at` = the instruction under test): reserved CR0/CR3/CR4 bits, PCIDE, SMAP, clearing PE/PG/PAE, NW without CD,
 LOCK, CR1/CR5, CPL3 forms, reserved EFER bits, LME cleared with paging on, unknown MSRs. QEMU 11.1.2 is not a reference for most of these
 (it accepts some writes the SDM faults and hangs on others); `tools/run_slice3_vm.py system` judges them with `tools/system_fault_model.py`.
+S1 adds MSR read-backs compared with QEMU (`sys-msr-syscall`: STAR/LSTAR/CSTAR/FMASK, SYSENTER, FS/GS/KERNEL_GS_BASE, TSC_AUX, per-CPU
+values, the stub's GS base saved and restored; `sys-msr-mtrr`: PAT, MTRR_DEF_TYPE, variable and fixed MTRRs) and fault cases for more
+profile MSR rules and LOCK CPUID/RDTSC. CPUID values, MSR reset values and the like are natemu's CPU, not QEMU's: the runner judges them
+with `tools/models/cpu_profile.py` (`profile_program`).
 
 Concurrent controls (`sys-ctl-<scenario>@N`, N = 2, 4; `programs.ctl_program`, contract 33): CPU 0 toggles CR3 (roots A, B, a copy A2 of A; B maps V to
 another frame and has no U), CR0.WP and EFER.NXE 6 times per round for 10 rounds, settling each round in a state from a fixed generator, while its peers

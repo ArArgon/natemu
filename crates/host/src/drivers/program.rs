@@ -46,6 +46,7 @@
 //!
 //! Description (text, one item per line). State items: rip ADDR | rflags VALUE | gpr V0 .. V15
 //!   | cpl 0|3 (default 3) | wp 0|1 (CR0.WP, default 1) | smep 0|1 (CR4.SMEP, default 0) | nxe 0|1 (EFER.NXE, default 1)
+//!   | fsbase ADDR | gsbase ADDR (FS.base, GS.base, default 0, canonical; no x86 instruction changes them yet)
 //!   | switch ADDR 0|3 (repeatable: the one-byte instruction at ADDR, a `nop`, runs as a change of the CPL to the value,
 //!     the resident's general CPL change; no x86 instruction changes the CPL yet. Blocks end before it.)
 //! CR0 is PE, ET, PG and WP as set, CR4 PAE and SMEP as set, EFER LME, LMA and NXE as set; CPL0 code may change them
@@ -112,6 +113,8 @@ struct Section {
     wp: bool,
     smep: bool,
     nxe: bool,
+    fs_base: u64,
+    gs_base: u64,
     space: usize,
     /// `switch` items: (RIP, CPL).
     switches: Vec<(u64, u64)>,
@@ -143,7 +146,7 @@ fn parse(text: &str) -> Result<Description> {
             _ => chunks.last_mut().unwrap().push(line),
         }
     }
-    let new = |space| Section { rip: 0, rflags: 0, gpr: [0; 16], cpl: 3, wp: true, smep: false, nxe: true, space, switches: vec![] };
+    let new = |space| Section { rip: 0, rflags: 0, gpr: [0; 16], cpl: 3, wp: true, smep: false, nxe: true, fs_base: 0, gs_base: 0, space, switches: vec![] };
     let mut d = Description { spaces: vec![Space::default()], cpus: vec![], sections: chunks.len() > 1 };
     if d.sections {
         items(&chunks[0], &mut d.spaces[0], None)?;
@@ -185,6 +188,13 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
                 for (r, v) in state(&mut cpu, line)?.gpr.iter_mut().zip(values) {
                     *r = number(v)?;
                 }
+            }
+            ("fsbase" | "gsbase", [v]) => {
+                let (c, base) = (state(&mut cpu, line)?, number(v)?);
+                if !natemu_abi::paging::canonical(base) {
+                    return Err(format!("non-canonical segment base: {line}"));
+                }
+                *if words[0] == "fsbase" { &mut c.fs_base } else { &mut c.gs_base } = base;
             }
             ("cpl", ["0"]) => state(&mut cpu, line)?.cpl = 0,
             ("cpl", ["3"]) => state(&mut cpu, line)?.cpl = 3,
@@ -675,6 +685,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 cr4: exec::CR4_PAE | bit(c.smep, exec::CR4_SMEP),
                 efer: exec::EFER_LME | exec::EFER_LMA | bit(c.nxe, exec::EFER_NXE),
                 cpl: c.cpl,
+                fs_base: c.fs_base,
+                gs_base: c.gs_base,
             },
         );
     }
@@ -980,6 +992,9 @@ mod tests {
         let edits = [edit(0x200010, None, 0, PRESENT), edit(0x201000, None, 0, WRITABLE), edit(0x200000, Some(2), 1 << 40, 0), edit(0x200000, Some(4), 0, 4)];
         assert_eq!(p.edits, edits);
         assert_eq!((parse("code 90").unwrap().cpus[0].cpl, parse("code 90").unwrap().cpus[0].nxe), (3, true));
+        let c = &parse("code 90\nfsbase 0xffff800000001000\ngsbase 0x10").unwrap().cpus[0];
+        assert_eq!((c.fs_base, c.gs_base), (0xffff_8000_0000_1000, 0x10));
+        assert!(parse("code 90\ngsbase 0x800000000000").is_err());
         assert!(parse("identity\ncode 90").unwrap().spaces[0].identity && !parse("code 90").unwrap().spaces[0].identity);
         assert_eq!(parse("code 9090\nswitch 0x1001 3\nswitch 1000 0").unwrap().cpus[0].switches, vec![(0x1001, 3), (0x1000, 0)]);
         for bad in ["switch 0x1000 1\ncode 90", "body 0x1000 90\nswitch 0x1000 0\ncpu\nrip 0x1000", "rip\ncode 90", "code 9", "gpr 1 2\ncode 90", "", "frob 1\ncode 90", "region 1 0\ncode 90", "cpl 1\ncode 90", "wp 2\ncode 90",
@@ -990,8 +1005,8 @@ mod tests {
     #[test]
     fn next_page_tamper_answers_a_block_request_twice() {
         let memory = Memory::with_size(4096).unwrap();
-        let area = Area { memory: &memory, vcpu: 0, base: 0 };
-        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1000, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3 });
+        let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0 };
+        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1000, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0 });
         s.fetch = [0x5000, u64::MAX];
         s.reply = exec::REPLY_SYSTEM;
         assert!(!tamper_next_page(area, &mut s) && s.reply == exec::REPLY_SYSTEM);

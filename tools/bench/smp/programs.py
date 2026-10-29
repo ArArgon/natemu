@@ -478,6 +478,33 @@ SYS = {
     mov qword [{la:#x}], {F2:#x}|7
     mov r8, [{V:#x}]""",
 }
+
+def msr_write(index, value):
+    return f'    mov ecx, {index:#x}\n    mov rax, {value}\n    mov rdx, rax\n    shr rdx, 32\n    wrmsr\n'
+
+def msr_read(index, reg):
+    return f'    mov ecx, {index:#x}\n    rdmsr\n    shl rdx, 32\n    or rax, rdx\n    mov {reg}, rax\n'
+
+def msr_readback(cases, keep_gs=False):
+    """WRMSR of each (index, value) then RDMSR of each into rbx, rsi, ... (S1: values QEMU and the profile agree on). With
+    `keep_gs` the start-up GS base (QEMU's stub captures through it) is saved at SAVE+8 and restored."""
+    regs = ('rbx', 'rsi', 'rdi', 'rbp', 'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15')
+    save = '    mov ecx, 0xc0000101\n    rdmsr\n    mov [{save:#x}+8], eax\n    mov [{save:#x}+12], edx\n' if keep_gs else ''
+    text = save + ''.join(msr_write(i, v) for i, v in cases) + ''.join(msr_read(i, r) for (i, _), r in zip(cases, regs))
+    restore = '    mov ecx, 0xc0000101\n    mov eax, [{save:#x}+8]\n    mov edx, [{save:#x}+12]\n    wrmsr\n' if keep_gs else ''
+    return text + restore
+
+# Per-CPU values ({d} = the CPU's data base): SYSCALL/SYSENTER targets, segment bases, TSC_AUX (FMASK within its 32 defined
+# bits; SYSENTER_CS within 16: QEMU keeps only those, the profile all 64); memory types (PAT, MTRRs).
+SYS['msr-syscall'] = msr_readback([
+    (0xc0000081, '0x0023001000000000+{d:#x}'), (0xc0000082, '0xffffffff81000000+{d:#x}'), (0xc0000083, '0x00007fff00000000+{d:#x}'),
+    (0xc0000084, '0x47700+{d:#x}'), (0x174, '0x10+({d:#x}>>16)'), (0x175, '0xffff888000000000+{d:#x}'), (0x176, '0xffffffff81800000+{d:#x}'),
+    (0xc0000100, '0x00007f0000001000+{d:#x}'), (0xc0000101, '0xffff888000002000+{d:#x}'), (0xc0000102, '0x00007f0000003000+{d:#x}'),
+    (0xc0000103, '{d:#x}>>16')], keep_gs=True)
+SYS['msr-mtrr'] = msr_readback([
+    (0x277, '0x0007010600070106'), (0x2ff, '0x806'), (0x200, '0xc0000000'), (0x201, '0xffc0000800'), (0x20e, '0x100000006'),
+    (0x20f, '0xff00000800'), (0x250, '0x0606060606060606'), (0x258, '0x0606060606060000'), (0x259, '0x0101010100000000'),
+    (0x268, '0x0505050505050505'), (0x26f, '0x0404040404040404')])
 def sys_program(name, n=1):
     bodies, cpus, memory = [], [], []
     for i in range(n):
@@ -533,6 +560,18 @@ SYS_FAULTS = {
     'efer-reserved-edx': 'mov ecx, 0xC0000080\n    rdmsr\n    mov edx, 1\n    wrmsr',
     'efer-lme-clear': 'mov ecx, 0xC0000080\n    rdmsr\n    btr eax, 8\n    wrmsr',
     'rdmsr-invalid': 'mov ecx, 0x12345678\n    rdmsr',
+    # S1: more of the profile's MSR rules, and LOCK on the unprivileged system instructions.
+    'wrmsr-mtrrcap': 'mov ecx, 0xfe\n    mov eax, 0x508\n    xor edx, edx\n    wrmsr',
+    'wrmsr-platform-id': 'mov ecx, 0x17\n    xor eax, eax\n    xor edx, edx\n    wrmsr',
+    'wrmsr-mtrr-mask-reserved': 'mov ecx, 0x201\n    mov eax, 0x801\n    mov edx, 0xff\n    wrmsr',
+    'wrmsr-mtrr-fixed-bad-type': 'mov ecx, 0x250\n    mov eax, 0x06020606\n    mov edx, 0x06060606\n    wrmsr',
+    'wrmsr-pat-bad-high-byte': 'mov ecx, 0x277\n    mov eax, 0x00070406\n    mov edx, 0x08070406\n    wrmsr',
+    'wrmsr-kernel-gs-noncanonical': 'mov ecx, 0xC0000102\n    mov eax, 0\n    mov edx, 0xffff7fff\n    wrmsr',
+    'wrmsr-gs-base-noncanonical': 'mov ecx, 0xC0000101\n    mov eax, 0\n    mov edx, 0x00008000\n    wrmsr',
+    'wrmsr-sysenter-esp-noncanonical': 'mov ecx, 0x175\n    mov eax, 0\n    mov edx, 0x00010000\n    wrmsr',
+    'wrmsr-apic-base-reserved': 'mov ecx, 0x1b\n    mov eax, 0xfee00a00\n    xor edx, edx\n    wrmsr',
+    'lock-cpuid': 'xor eax, eax\n    db 0xf0, 0x0f, 0xa2',
+    'lock-rdtsc': 'db 0xf0, 0x0f, 0x31',
     'wrmsr-invalid': 'mov ecx, 0x12345678\n    xor eax, eax\n    xor edx, edx\n    wrmsr',
 }
 SYS_CPL3 = {

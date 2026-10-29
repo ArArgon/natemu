@@ -69,7 +69,10 @@ QEMU. Latency (ring -> the resident's stop, per vCPU, one clock) and the mean ac
 tools/bench/smp/system.json runs at block sizes default and 1 against QEMU system mode (smp.SYSTEM_CPU), except the PTE
 change without INVLPG (coherence_model) and the fault cases (tools/system_fault_model.py at QEMU's state just before
 the instruction; modes_model where it covers them; QEMU's own outcome is reported and must agree where it raises an
-exception); refused forms stop `unsupported_system`; a tampered system reply stops `bad_reply`.
+exception); refused forms stop `unsupported_system`; a tampered system reply stops `bad_reply`. The presented CPU (S1,
+tools/models/cpu_profile.py as the judge, QEMU's CPU being another): CPUID leaf by leaf, MSR reset values, MISC_ENABLE,
+the UCODE_REV latch, TSC/RDTSC/RDTSCP and CR4.PSE/TSD at 1, 2 and 4 vCPUs (`profile_program`), and CPUID/RDTSC at CPL3,
+RDTSC/RDTSCP #GP at CPL3 with CR4.TSD (SDM Vol.2 RDTSC).
 
 `coherence` (S3d, cross-vCPU code coherence): the programs of tools/bench/smp/coherence.json (`programs.coherence_all`:
 code written at run time by one CPU and run by others — fresh code on a new page and on a page used for data before, a
@@ -610,23 +613,148 @@ def unsupported_cases():
     """Instructions the resident refuses (`unsupported_system`), each alone at CPL0 after a flag-setting prefix."""
     cases = {'cr0-cd': 'mov rax, cr0\nbts rax, 30\nmov cr0, rax', 'cr4-osfxsr': 'mov rax, cr4\nbts rax, 9\nmov cr4, rax',
              'mov-from-cr2': 'mov rax, cr2', 'mov-to-cr8': 'xor eax, eax\nmov cr8, rax', 'cr3-pwt': 'mov rax, cr3\nbts rax, 3\nmov cr3, rax',
-             # Valid under the CPU 16/17 profile but not implemented yet (S1/S2): the resident must refuse, never #GP.
-             'cr4-pce': 'mov rax, cr4\nbts rax, 8\nmov cr4, rax', 'rdmsr-apic-base': 'mov ecx, 0x1b\nrdmsr',
-             'rdmsr-pat': 'mov ecx, 0x277\nrdmsr', 'wrmsr-pat': 'mov ecx, 0x277\nmov eax, 0x00070406\nmov edx, 0x00070406\nwrmsr',
-             'rdmsr-tsc-aux': 'mov ecx, 0xC0000103\nrdmsr', 'wrmsr-fs-base': 'mov ecx, 0xC0000100\nxor eax, eax\nxor edx, edx\nwrmsr',
-             'rdmsr-misc-enable': 'mov ecx, 0x1a0\nrdmsr', 'rdmsr-mtrrcap': 'mov ecx, 0xfe\nrdmsr'}
+             # Valid under the CPU 16/17 profile but not implemented yet: the resident must refuse, never #GP.
+             'cr4-pce': 'mov rax, cr4\nbts rax, 8\nmov cr4, rax', 'cr4-de': 'mov rax, cr4\nbts rax, 3\nmov cr4, rax',
+             'cr4-fsgsbase': 'mov rax, cr4\nbts rax, 16\nmov cr4, rax', 'cr4-osxsave': 'mov rax, cr4\nbts rax, 18\nmov cr4, rax',
+             # IA32_APIC_BASE moved (a valid value): the LAPIC's page and mode, no LAPIC yet.
+             'wrmsr-apic-base-move': 'mov ecx, 0x1b\nmov eax, 0xfed00800\nxor edx, edx\nwrmsr'}
     return {k: ref.assemble('mov rbx, 1\n' + v).hex() for k, v in cases.items()}
 
 
-# Resident behaviour that disagrees with the CPU 16/17 profile (tools/models/cpu_profile.json, via tools/system_fault_model.py)
-# and is waiting for chunk S1/S2: the case runs and its mismatch is printed as GAP, not counted as a failure. A listed case that
-# starts to pass is a failure, so the entry must be deleted when the resident is fixed.
-SYSTEM_GAPS = {
-    **{f'sysfault-cr4-{n}@1': 'crates/runtime/src/execution.rs CR4_UNSUPPORTED (0x457f5f) refuses the write as unsupported_system instead of #GP; '
-                              'CPUID bit clear in the profile makes the bit reserved (SDM Vol.3 2.5)' for n in ('vme', 'pvi', 'mce', 'umip', 'vmxe', 'smxe', 'pke')},
-    **{f'unsupported {n}': 'resident raises #GP for every MSR but EFER (execution.rs:724); the profile has this MSR (CPU 16/17, SDM Vol.4)'
-       for n in ('rdmsr-apic-base', 'rdmsr-pat', 'wrmsr-pat', 'rdmsr-tsc-aux', 'wrmsr-fs-base', 'rdmsr-misc-enable', 'rdmsr-mtrrcap')},
-}
+# Resident behaviour that disagrees with the CPU 16/17 profile (tools/models/cpu_profile.json, via tools/system_fault_model.py):
+# the case runs and its mismatch is printed as GAP, not counted as a failure. A listed case that starts to pass is a failure,
+# so the entry must be deleted when the resident is fixed. Empty since S1.
+SYSTEM_GAPS = {}
+
+
+# ---- S1: the presented CPU, judged by tools/models/cpu_profile.py (QEMU presents its own CPU) --------------------------------
+TSC_WRITE = 1 << 48
+
+
+def profile_program(n):
+    """natemu-smp-v1 program (identity, CPL0) whose CPU i stores, at RES(i): its MSRs after reset (but EFER, set by the
+    driver, and TSC), the CPUID matrix of gen_cpu_profile_rs.leaves, CPUID with MISC_ENABLE bit 22 set, MISC_ENABLE and
+    UCODE_REV after writes, CPUID.1 reloading the UCODE_REV latch, IA32_APIC_BASE after a same-value write and after
+    toggling its BSP flag (bit 8, R/W), TSC/RDTSC/RDTSCP and TSC_AUX, and CR4 after setting PSE and TSD. Cross-vCPU TSC
+    order: CPU 0 reads its TSC and then sets a flag; every other CPU waits for the flag and then reads its own, which must
+    not be smaller. Returns (program, judge): judge([bytes of RES(i)]) lists the differences from the model."""
+    from models import cpu_profile as cp, gen_cpu_profile_rs as gen
+    P = cp.load()
+    readable = [m for m in sorted(P._msr) if P.msr(m)['access'] in ('rw', 'ro') and m not in (0x10, 0xc0000080)]
+    matrix = gen.leaves(P)
+    limited = [0, 1, 2, 3, 4, 0x15, 0x16, 0x40000000, 0x80000000, 0x80000008, 0x80000009]
+    res = lambda i: programs.SYS_D(i) + 0x8000
+    bodies, cpus, memory, layouts, flag = [], [], [], [], [None]
+    for i in range(n):
+        out, lay, at = [], [], [0]
+        def slot(kind, info, size):
+            lay.append((kind, info, at[0])); at[0] += size; return res(i) + at[0] - size
+        def rd(index, kind, info=None):
+            o = slot(kind, index if info is None else info, 8)
+            out.append(f'mov ecx, {index:#x}\nrdmsr\nmov [{o:#x}], eax\nmov [{o + 4:#x}], edx')
+        def wr(index, value):
+            out.append(f'mov ecx, {index:#x}\nmov eax, {value & 0xffffffff:#x}\nmov edx, {value >> 32:#x}\nwrmsr')
+        def cpuid(leaf, sub, kind):
+            o = slot(kind, (leaf, sub), 16)
+            out.append(f'mov eax, {leaf:#x}\nmov ecx, {sub:#x}\ncpuid\n' + '\n'.join(f'mov [{o + 4 * k:#x}], {r}' for k, r in enumerate(('eax', 'ebx', 'ecx', 'edx'))))
+        for m in readable: rd(m, 'reset')
+        for leaf, sub in matrix: cpuid(leaf, sub, 'cpuid')
+        wr(0x1a0, 0x401801)
+        for leaf in limited: cpuid(leaf, 0, 'cpuid-limited')
+        rd(0x1a0, 'misc', 0x401801)
+        for v in (0x1801, 0x1, 0x80, 0x800, 0x401881, 0x1801):
+            wr(0x1a0, v); rd(0x1a0, 'misc', v)
+        wr(0x8b, 0x1234 << 32); rd(0x8b, 'value', 0x1234 << 32)
+        out.append('mov eax, 1\nxor ecx, ecx\ncpuid'); rd(0x8b, 'value', 0)
+        apic = 0xfee00900 if i == 0 else 0xfee00800
+        out.append('mov ecx, 0x1b\nrdmsr\nwrmsr'); rd(0x1b, 'value', apic)
+        wr(0x1b, apic ^ 0x100); rd(0x1b, 'value', apic ^ 0x100); wr(0x1b, apic)
+        # Cross-vCPU order (before any TSC write): CPU 0's RDTSC, then its flag; the others' RDTSC after seeing the flag.
+        x = slot('order', 0, 8)
+        if i == 0:
+            flag[0] = slot('flag', 0, 8)
+            out.append(f'rdtsc\nmov [{x:#x}], eax\nmov [{x + 4:#x}], edx\nmov dword [{flag[0]:#x}], 1')
+        else:
+            out.append(f'.wait:\npause\ncmp dword [{flag[0]:#x}], 1\njne .wait\nrdtsc\nmov [{x:#x}], eax\nmov [{x + 4:#x}], edx')
+        # TSC: RDTSC <= RDMSR TSC <= RDTSCP (ECX = TSC_AUX = 0, then 0x55 + i); after a TSC write W: W <= RDMSR <= RDTSC.
+        t = [slot('tsc', k, 8) for k in range(6)]
+        aux = [slot('aux', k, 4) for k in range(2)]
+        out.append(f'rdtsc\nmov [{t[0]:#x}], eax\nmov [{t[0] + 4:#x}], edx')
+        out.append(f'mov ecx, 0x10\nrdmsr\nmov [{t[1]:#x}], eax\nmov [{t[1] + 4:#x}], edx')
+        out.append(f'rdtscp\nmov [{t[2]:#x}], eax\nmov [{t[2] + 4:#x}], edx\nmov [{aux[0]:#x}], ecx')
+        wr(0xc0000103, 0x55 + i)
+        out.append(f'rdtscp\nmov [{t[3]:#x}], eax\nmov [{t[3] + 4:#x}], edx\nmov [{aux[1]:#x}], ecx')
+        wr(0x10, TSC_WRITE)
+        out.append(f'mov ecx, 0x10\nrdmsr\nmov [{t[4]:#x}], eax\nmov [{t[4] + 4:#x}], edx')
+        out.append(f'rdtsc\nmov [{t[5]:#x}], eax\nmov [{t[5] + 4:#x}], edx')
+        c4 = [slot('cr4', k, 8) for k in range(2)]
+        out.append(f'mov rax, cr4\nmov [{c4[0]:#x}], rax\nmov rbx, rax\nor rax, 0x14\nmov cr4, rax\nrdtsc\nmov rax, cr4\nmov [{c4[1]:#x}], rax\nmov cr4, rbx')
+        out.append('cmp r11, r11')
+        layouts.append(lay)
+        code = programs.BODY0 + 0x2000 * i
+        bodies.append(programs.body(code, '\n'.join(out)))
+        assert len(bodies[-1]['code']) // 2 < 0x2000
+        cpus.append(dict(programs.cpu(i, code), cpl=0))
+        memory.append(programs.zero(res(i), at[0]))
+    prog = {'format': 'natemu-smp-v1', 'name': f'profile@{n}', 'ncpu': n, 'system': True, 'bodies': bodies, 'cpus': cpus, 'memory': memory}
+    reset = {**{m: cp._i(P.msr(m)['reset']) for m in readable}, **P.mtrr_state()}
+
+    def judge(datas):
+        order = [int.from_bytes(d[o:o + 8], 'little') for d, lay in zip(datas, layouts) for kind, _, o in lay if kind == 'order']
+        diffs = [f'cpu{i} TSC {t:#x} read after CPU 0 read {order[0]:#x}' for i, t in enumerate(order) if t < order[0]]
+        if order[0] > 60 * cp.load().d['identity']['tsc_hz']: diffs.append(f'CPU 0 TSC {order[0]:#x}: not near 0 after VM creation')
+        return diffs + [d for i, data in enumerate(datas) for d in judge_one(i, data)]
+
+    def judge_one(i, data):
+        diffs, u64 = [], lambda o: int.from_bytes(data[o:o + 8], 'little')
+        tsc, aux, cr4 = {}, {}, {}
+        for kind, info, o in layouts[i]:
+            if kind == 'reset':
+                want = reset[info] if not (info == 0x1b and i == 0) else cp._i(P.msr(0x1b)['reset_bsp'])
+                got = u64(o)
+            elif kind in ('cpuid', 'cpuid-limited'):
+                want = P.cpuid(*info, n=n, vcpu=i, misc_enable=0x401801 if kind == 'cpuid-limited' else 0x1801)
+                got = tuple(int.from_bytes(data[o + 4 * k:o + 4 * k + 4], 'little') for k in range(4))
+            elif kind == 'misc':
+                want, got = P.misc_enable_after_write(info), u64(o)
+            elif kind == 'value':
+                want, got = info, u64(o)
+            elif kind in ('order', 'flag'):
+                continue
+            else:
+                {'tsc': tsc, 'aux': aux, 'cr4': cr4}[kind][info] = u64(o) if kind != 'aux' else int.from_bytes(data[o:o + 4], 'little')
+                continue
+            if got != want: diffs.append(f'cpu{i} {kind} {info if not isinstance(info, int) else hex(info)}: {got if isinstance(got, tuple) else hex(got)} != {want if isinstance(want, tuple) else hex(want)}')
+        if not tsc[0] <= tsc[1] <= tsc[2] <= tsc[3]: diffs.append(f'cpu{i} TSC not monotonic: {[hex(tsc[k]) for k in range(4)]}')
+        if not TSC_WRITE <= tsc[4] <= tsc[5] < TSC_WRITE + 100 * cp.load().d['identity']['tsc_hz']:
+            diffs.append(f'cpu{i} TSC after writing {TSC_WRITE:#x}: {tsc[4]:#x}, {tsc[5]:#x}')
+        if (aux[0], aux[1]) != (0, 0x55 + i): diffs.append(f'cpu{i} RDTSCP ECX {aux[0]:#x}, {aux[1]:#x} (want 0, {0x55 + i:#x})')
+        if cr4[1] != cr4[0] | 0x14: diffs.append(f'cpu{i} CR4 with PSE and TSD {cr4[1]:#x} (from {cr4[0]:#x})')
+        return diffs
+    return prog, judge
+
+
+def cpl3_cases():
+    """(name, description, check(out) -> problems): CPUID and RDTSC/RDTSCP run at CPL3; with CR4.TSD both are #GP(0) at
+    CPL3 (SDM Vol.2 RDTSC, RDTSCP). One vCPU, the driver's user space; the CPL drops through a `switch` nop."""
+    from models import cpu_profile as cp
+    want = cp.load().cpuid(1)
+    cpuid = 'mov eax, 1\nmov ecx, 7\ncpuid\nrdtsc\nmov r8, rax\nrdtscp\nmov r9, rcx\ncmp r11, r11'
+
+    def ran(out):
+        g = [smp.num(x) for x in out['gpr']]
+        return [] if out['stop'] == 'reached' and g[3] == want[1] and g[9] == 0 else [f"{out['stop']} {out['reason']} rbx {g[3]:#x} r9 {g[9]:#x}"]
+    cases = [('cpl3-cpuid-rdtsc', f"cpl 3\nrip 0x110000\ncode {ref.assemble(cpuid).hex()}\n", ran)]
+    for name, insn in (('rdtsc', 'rdtsc'), ('rdtscp', 'rdtscp')):
+        head = ref.assemble('mov rax, cr4\nbts rax, 2\nmov cr4, rax')
+        code = head + b'\x90' + ref.assemble(insn)
+        at = 0x110000 + len(head) + 1
+
+        def gp(out, at=at):
+            f = out.get('fault')
+            return [] if out['stop'] == 'guest_fault' and [smp.num(x) for x in f] == [13, 0, 0, at] else [f"{out['stop']} {out['reason']} {f}"]
+        cases.append((f'tsd-cpl3-{name}', f"cpl 0\nrip 0x110000\nswitch {0x110000 + len(head):#x} 3\ncode {code.hex()}\n", gp))
+    return cases
 
 
 def cmd_system(a, host, runtime):
@@ -712,6 +840,26 @@ def cmd_system(a, host, runtime):
         if f'unsupported {name}' in SYSTEM_GAPS:
             (gaps if not ok else failures).append(f'unsupported {name}: ' + (f'{rc} {out and out["stop"]} {out and out["reason"]}' if not ok else 'listed in SYSTEM_GAPS but passes'))
         elif not ok: failures.append(f'unsupported {name}: {rc} {out and out["reason"]} {err.strip()[-200:]}')
+    # S1: the presented CPU against cpu_profile.py.
+    for n in ([] if a.programs else (1, 2, 4)):
+        prog, judge = profile_program(n)
+        rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f'profile{n}')
+        if rc:
+            diffs = [f'driver exit {rc}: {err.strip()[-300:]}']
+        else:
+            memory = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in out['cpus'][0]['memory']}
+            diffs = [f"cpu{v} stopped {c['stop']} {c['reason']} at {c['rip']}" for v, c in enumerate(out['cpus'])
+                     if c['stop'] != 'reached' or smp.num(c['rip']) != body_end(prog, smp.num(prog['cpus'][v]['rip']))]
+            diffs += judge([memory[smp.num(prog['memory'][v]['addr'])] for v in range(n)])
+        print(f"profile@{n}: {'ok' if not diffs else 'FAIL'}", *diffs[:10], sep='\n  ', flush=True)
+        report.append({'name': f'profile@{n}', 'diffs': diffs})
+        failures += [f'profile@{n}: {d}' for d in diffs]
+    for name, text, check in ([] if a.programs else cpl3_cases()):
+        rc, out, err = driver(host, runtime, a.fexc, text, a.out / 'work' / name)
+        problems = check(out) if rc == 0 else [f'driver exit {rc}: {err.strip()[-300:]}']
+        print(f"{name}: {'ok' if not problems else 'FAIL'} {problems}", flush=True)
+        report.append({'name': name, 'problems': problems})
+        failures += [f'{name}: {p}' for p in problems]
     # A malformed system reply (driver `--tamper system`: length 16) is refused before anything of it runs.
     if not a.programs:
         prog = next(p for p in programs if p['name'] == 'sys-cr3-switch@1')

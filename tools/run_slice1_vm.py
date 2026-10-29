@@ -35,6 +35,8 @@ def description(p):
     lines = [f"rip {ref.num(p['rip']):#x}", f"rflags {ref.num(p['rflags']):#x}",
              'gpr ' + ' '.join(f'{ref.num(v):#x}' for v in p['gpr']), f"code {p['code']}"]
     lines += [f"memory {ref.num(m['addr']):#x} {m['data']}" for m in p['memory']]
+    lines += [f"{k} {ref.num(p[k]) & (2**64 - 1):#x}" for k in ('fsbase', 'gsbase') if k in p]     # I7: segment bases
+    lines += [f"cpl {p['cpl']}"] if 'cpl' in p else []
     return '\n'.join(lines) + '\n'
 
 def declared_limit(vm):
@@ -90,12 +92,15 @@ def main():
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--max-block', type=int, help='block size limit in guest instructions (runs each program as several blocks)')
+    ap.add_argument('--cpl', type=int, choices=(0, 3), help="run every program at this CPL (the QEMU reference is CPL 3; valid for "
+                    "programs without CPL-dependent instructions, e.g. the I7 segment corpus)")
     a = ap.parse_args()
     host, runtime = build()
     expected = {r['name']: r for r in json.loads(a.expected.read_text())['results']}
     a.out.mkdir(parents=True, exist_ok=True)
     results, counts = [], {'match': 0, 'unsupported': 0, 'fail': 0}
     for p in json.loads(a.programs.read_text())['programs']:
+        if a.cpl is not None: p = dict(p, cpl=a.cpl)
         entry = run_program(host, runtime, a.fexc, p, expected[p['name']], a.out / 'work' / p['name'], a.max_block)
         counts[entry['outcome']] += 1
         results.append(entry)

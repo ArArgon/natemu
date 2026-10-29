@@ -29,7 +29,18 @@ jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never 
 (series applied as thirteen commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series14` (I1, October 28: the small integer and
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series15` (I7, October 28: FS/GS segment overrides
+in 64-bit mode. The patches are series14's; the change is in `shim/` and `fexc.cpp`: the allowlist admits an FS or GS
+prefix on every admitted form with an explicit memory operand (FEX adds `fs_cached`/`gs_cached`, x28 + 1000/992, to the
+effective address; the site's native address is then the x86 linear address, so recovery, the split check and the
+canonical check see base + EA), and CS/DS/ES/SS prefixes, which 64-bit mode ignores and FEX's decoder drops, when they
+name the operand's default segment or there is no memory operand. Cut (`unsupported_form`): FS/GS with no memory
+operand or with a second segment prefix (no SDM rule for two of one group; FEX and QEMU differ), and SS naming a
+DS-default operand or CS/DS/ES an RSP/RBP-based one (#SS versus #GP for a non-canonical address differs between
+vendors). The allowlist reads the prefix bytes through `fexc_guest_bytes` (`shim/fexc_hook.h`). An FS/GS-overridden
+operand is recorded `segment: ds` (#GP(0)) whatever its base; the site JSON's `x86` object carries `segment_override`.
+Binary objects of the 64 fixtures and the seed-4242, flow and I1 corpora (383 programs) are byte-identical to series14.)
+Kept for comparison: `series14` (I1, October 28: the small integer and
 BMI forms. Patch 0013: the decoder records a VEX instruction's map, pp, L and opcode byte (`FEXC_MAP_VEX`, metadata only);
 under slice1, CMPXCHG/XADD with a memory operand and no LOCK are plain read-modify-writes (FEX emits CAS / atomic
 fetch-add otherwise) and LEAVE loads [RBP] before writing RSP and RBP (FEX's pop moved RBP into RSP's register first);
@@ -316,7 +327,8 @@ The scripts that read `fixtures/slice1/programs.json` (git-ignored; `smoke.py`, 
   VEX.L = 0 and no 66/REX/F2/F3/LOCK before the VEX prefix. Still cut: pdep/pext (FEX emits a native loop), prefetchw/0f 0d
   (PREFETCHW not advertised), cmpxchg8b/16b, 16-bit shld/shrd, enter with a nesting level, LOCK forms, popf. Branches (end the block): jcc rel8/rel32,
   jmp rel8/rel32 and near indirect, call rel32/indirect, ret, rep ret (f3 c3), ret imm16. All with no LOCK, REP/REPNE (except
-  rep ret, endbr64 and pause; LOCK only on memory xchg), FS/GS override, address-size override, and (branches) no operand-size prefix; 66-prefixed bswap
+  rep ret, endbr64 and pause; LOCK only on memory xchg), address-size override, and (branches) no operand-size prefix; FS/GS
+  overrides only on an explicit memory operand and alone, CS/DS/ES/SS only naming the default segment (I7); 66-prefixed bswap
   (undefined result) is cut.
 - **System class** (reason `system_instruction`): segment push/pop and moves, lss/lfs/lgs, far call/jmp/ret, iret,
   int/int3/into/icebp, ud2/ud1/ud0, popf/cli/sti, hlt, port I/O, all of 0f 00 and 0f 01 (descriptor tables, invlpg,
@@ -357,7 +369,7 @@ the x86 addressing form come from FEX's own decode of the instruction.
 | `kind` | `load`, `store`, `load_pair`, `store_pair`, `push`, `pop`, `push_pair`, `pop_pair`, `other` (a guest-memory IR op the record cannot describe: a consumer must refuse it); `guard`, `split`: slice1 check stubs (see "Guards (S1b2)") |
 | `width` | bytes the native instruction accesses (pairs: both registers) |
 | `intent`, `rmw` | `read`/`write`; for a memory-destination read-modify-write the load has `rmw: load`, `intent: write`, the store `rmw: store` (derived at emission: a load followed by a plain store in one guest instruction; valid because admitted instructions have at most one explicit memory operand) |
-| `segment` | `ss` for stack ops and RSP/RBP-based operands, else `ds` (decides #SS(0) vs #GP(0)) |
+| `segment` | `ss` for stack ops and RSP/RBP-based operands without an FS/GS override, else `ds` (decides #SS(0) vs #GP(0)) |
 | `base_reg`, `index_reg`, `extend`, `shift`, `imm` | native address form: base register number (31 = sp), optional index register with `uxtw`/`sxtw`/`sxtx` and shift, constant offset |
 | `data_regs`, `data_class` | transfer register(s) (31 = xzr), `gpr`/`fpr` |
 | `writeback`, `writeback_delta` | `pre`/`post` base update performed by the access itself (push: pre, -size; pop: post, +size) |

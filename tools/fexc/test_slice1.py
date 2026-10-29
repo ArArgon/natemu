@@ -1,6 +1,6 @@
 """S1c checks: profile slice1 of fexc (block cutting at an allowlist, single-gate exits, profile record).
 
-Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series14 build)
+Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series15 build)
 
 The x86 bytes below are assembled by hand and only drive the compiler; every expectation (where the block ends, why)
 comes from the instruction's architectural class, never from fexc's output. The cut position is also compared with a
@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402  (disassemble, object reader)
 import scan_skips  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series14/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series15/obj/fexc')
 REPO = HERE.parents[1]
 RIP = 0x102000
 PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
@@ -50,7 +50,13 @@ UNSUPPORTED = {
     'lfence modrm e9': '0faee9', 'rep mfence': 'f30faef0',
     'lock add [rax],rcx': 'f0480108', 'lock inc [rax]': 'f0ff00', 'lock cmpxchg [rax],ecx': 'f00fb108', 'lock xadd [rax],ecx': 'f00fc108',
     'rep movsb': 'f3a4', 'movsb': 'a4', 'stosq': '48ab', 'scasb': 'ae', 'cmpsb': 'a6', 'lodsb': 'ac',
-    'mov rax,fs:[rax]': '64488b00', 'mov rax,gs:[rax]': '65488b00', 'mov eax,[eax] (addr32)': '678b00',
+    'mov eax,[eax] (addr32)': '678b00',
+    # I7: an FS/GS override with nothing to override, or with a second segment prefix (no SDM rule; FEX and QEMU differ)
+    'fs mov rax,rcx': '644889c8', 'gs push rax': '6550', 'gs ret': '65c3', 'fs leave': '64c9', 'gs pushf': '659c', 'fs jmp rel8': '64eb00',
+    'fs cs mov rax,[rax]': '642e488b00', 'ds gs mov rax,[rax]': '3e65488b00', 'fs gs mov rax,[rax]': '6465488b00', 'fs fs mov [rax],rcx': '6464894808',
+    'fs addr32 mov rax,[eax]': '6467488b00',
+    'ss mov rax,[rbx] (#SS or #GP)': '36488b03', 'ds mov rax,[rbp] (#GP or #SS)': '3e488b4500', 'cs mov [rsp+8],rcx': '2e48894c2408',
+    'ss mov rax,[rip]': '36488b0500000000', 'es push [rbp+8]': '26ff7508',
     'addps': '0f58c1', 'movaps': '0f28c1', 'fld st0': 'd9c0', 'vzeroupper': 'c5f877',
     'o16 pushf': '669c', 'o16 leave': '66c9', 'enter level 1': 'c8080001', 'o16 shld': '660fa4c101', 'o16 shrd cl': '660fadc1',
     'prefetchw': '0f0d08', 'prefetch /4 (reserved nop)': '0f1820', 'prefetch reg (reserved nop)': '0f18c0', 'movnti reg': '0fc3c1',
@@ -93,11 +99,21 @@ ALLOWED = {
     'prefetcht0': '0f1808', 'prefetchnta': '0f1800', 'prefetcht1': '0f1810', 'prefetcht2': '0f1818', 'movnti [rax],rcx': '480fc308',
     'andn': 'c4e278f2c1', 'andn [rax]': 'c4e2f8f200', 'bextr': 'c4e270f7c1', 'blsr': 'c4e278f3c9', 'blsmsk': 'c4e278f3d1', 'blsi': 'c4e2f8f3d8',
     'bzhi': 'c4e270f5c1', 'mulx': 'c4e2f3f6c2', 'rorx': 'c4e3fbf0c107', 'sarx': 'c4e2faf7c1', 'shlx': 'c4e2f9f7c1', 'shrx [rax]': 'c4e2fbf700',
+    # I7: FS/GS overrides on memory forms; CS/DS/ES/SS prefixes (ignored in 64-bit mode)
+    'mov rax,fs:[rax]': '64488b00', 'mov rax,gs:[rax]': '65488b00', 'add gs:[rax+8],rcx': '6548014808', 'mov gs:[0x28],rax': '654889042528000000',
+    'mov rax,fs:[rip+0x10]': '64488b0510000000', 'push fs:[rax]': '64ff30', 'pop gs:[rax]': '658f00', 'xchg gs:[rax],rcx': '65488708',
+    'movabs rax,gs:[moffs]': '6548a10102030405060708', 'cmpxchg fs:[rax],ecx': '640fb108', 'andn rax,rcx,gs:[rax]': '65c4e2f0f200',
+    'lea rax,fs:[rax+8]': '64488d4008', 'rex fs mov rax,[rax]': '4064488b00',
+    'cs mov rax,[rax]': '2e488b00', 'ds mov [rax],rcx': '3e488908', 'es add [rax],ecx': '260108', 'ss mov rax,[rsp]': '36488b0424',
+    'ss mov rax,[rbp+8]': '36488b4508', 'ds mov rax,[rax+rbp*2]': '3e488b0468', 'ds movabs rax,[moffs]': '3e48a10102030405060708',
+    'cs push rax': '2e50', 'ds mov rax,rcx': '3e4889c8', 'cs ds mov rax,[rbx]': '2e3e488b03', 'ss ss mov rax,[rsp+8]': '3636488b442408',
+    'cs nop word [rax+rax]': '662e0f1f840000000000',
 }
 
 # (name, hex, translated-instruction count): control transfers end the block with their normal exit.
 BRANCHES = {
     'jmp rel8': 'eb05', 'jmp rel32': 'e905000000', 'jne rel8': '7505', 'je rel32': '0f8405000000', 'call rel32': 'e805000000',
+    'ds jne rel8 (hint, ignored)': '3e7505', 'gs jmp [rax+8]': '65ff6008', 'fs call [rip+0x10]': '64ff1510000000',
     'loop rel8': 'e205', 'loope rel8': 'e105', 'loopne rel8': 'e005', 'jrcxz rel8': 'e305',
     'ret': 'c3', 'rep ret': 'f3c3', 'ret 8': 'c20800', 'jmp rax': 'ffe0', 'call rax': 'ffd0', 'jmp [rax]': 'ff20', 'call [rax]': 'ff10',
 }
@@ -326,7 +342,9 @@ def check_exits(test, d, tmp, what):
         else:
             test.assertIsNone(re.match(r'(blr|br|ret|bl)\s', t), (what, o, t))
             test.assertIsNone(re.match(r'svc\s', t) if t not in ('svc #0x3', 'svc #0x4') else None, (what, o, t))
-            test.assertIsNone(re.search(r'\[(x28|sp)\b', t), (what, o, t))       # no frame or stack access
+            # no frame or stack access but a guest-state load of the FS/GS base (I7: ldr xN, [x28, #0x3e0|#0x3e8])
+            if not re.fullmatch(r'ldr x\d+, \[x28, #0x3e[08]\]', t):
+                test.assertIsNone(re.search(r'\[(x28|sp)\b', t), (what, o, t))
             test.assertIsNone(re.match(r'ldr\w* \w+, 0x', t), (what, o, t))         # no literal load
             if t.lower() != 'mrs x25, nzcv':
                 test.assertIsNone(re.match(r'\w+ [wx]25\b', t), (what, o, t))       # x25: only the pre-NZCV save
@@ -344,7 +362,7 @@ class Slice1Exits(unittest.TestCase):
                     d, rc = run(PRE + x)
                     self.assertEqual(rc, 0)
                     n, _ = check_exits(self, d, tmp, name)
-                    self.assertEqual(n, 2 if name in ('jne rel8', 'je rel32', 'loop rel8', 'loope rel8', 'loopne rel8', 'jrcxz rel8') else 1, name)   # taken and fall-through gates
+                    self.assertEqual(n, 2 if name in ('jne rel8', 'ds jne rel8 (hint, ignored)', 'je rel32', 'loop rel8', 'loope rel8', 'loopne rel8', 'jrcxz rel8') else 1, name)   # taken and fall-through gates
             for name, x in (('fall off the window', PRE), ('cut before cr3 write', PRE + SYSTEM['mov cr3,rax'])):
                 with self.subTest(name):
                     d, rc = run(x)

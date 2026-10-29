@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1b1 check: the slice-1 precision guarantee, verified statically on the code fexc emits (profile slice1).
 
-usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series14 build)
+usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series15 build)
 
 Corpora: fixtures/slice1/programs.json, the single-instruction matrix of scan_skips.py, the adversarial programs below
 (one per precision patch), and every CORPUS.json given (gen_slice1.py format, e.g. a fresh `--seed` corpus).
@@ -48,7 +48,8 @@ For every compile, from the disassembly, the sites, the dense PC table and the s
       instruction (no stop check, spill or TF check; the resident stops a vCPU by unlinking the interrupted block's
       exits). No `bl`, `blr`, `br` or `ret` in the block, no sp access and no literal load, and x28 only for a byte of
       the guest-state page's RFLAGS fields (G1, I1: loads of TF/IF/DF/IOPL/NT/RF/VM/AC/VIF/VIP/ID by `pushf`, stores
-      only to DF by `cld`/`std`; crates/abi/src/execution.rs `frame`), so the code touches no emulator data;
+      only to DF by `cld`/`std`; crates/abi/src/execution.rs `frame`) and loads inside the FS/GS bases (I7: FEX's
+      fs_cached/gs_cached, read by every FS-/GS-prefixed access), so the code touches no emulator data;
   P13 (S2c0): every branch in the block goes forward to an instruction of the code region, so a block never loops
       internally: a jcc back to its own entry exits through the gate like any taken edge (no multiblock, no self-loop).
 Assumption by construction, NOT checked: every static-register write of guest instruction k-1 is emitted before the PC-table
@@ -73,7 +74,7 @@ import check_sites, scan_skips  # noqa: E402
 from check_sites import code_vs_sites  # noqa: E402
 import flags as F  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series14/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series15/obj/fexc')
 
 NZCV_WRITERS = {'adds', 'adcs', 'subs', 'sbcs', 'ands', 'bics', 'negs', 'ngcs', 'cmp', 'cmn', 'tst', 'ccmp', 'ccmn', 'fcmp',
                 'fcmpe', 'fccmp', 'fccmpe', 'setf8', 'setf16', 'rmif', 'cfinv', 'axflag', 'xaflag'}
@@ -578,6 +579,8 @@ def divides(d, dis, order, stubs, check_at):
 # DF, IOPL, NT, RF, VM, AC, VIF, VIP, ID; writable DF only.
 GUEST_STATE_FLAGS = {0x3f0 + b for b in (8, 9, 10, 12, 14, 16, 17, 18, 19, 20, 21)}
 GUEST_STATE_DF = {0x3f0 + 10}
+# I7: FEX's gs_cached (0x3e0) and fs_cached (0x3e8), 8 bytes each: loads only (an FS-/GS-prefixed access adds the base).
+GUEST_STATE_BASES = ((0x3e0, 8), (0x3e8, 8))
 
 
 def entry_and_branches(d, dis, order):
@@ -591,6 +594,8 @@ def entry_and_branches(d, dis, order):
         mn = dis[off].split(' ')[0]
         guest_state = acc and acc[2] == 'x28' and acc[1] == 1 and acc[3] is None and acc[5] == 'none' and \
             acc[4] in (GUEST_STATE_DF if acc[0] == 'store' else GUEST_STATE_FLAGS)
+        guest_state = guest_state or (acc and acc[2] == 'x28' and acc[0] == 'load' and acc[3] is None and acc[5] == 'none' and
+                                      any(f <= acc[4] and acc[4] + acc[1] <= f + n for f, n in GUEST_STATE_BASES))
         if acc and acc[2] in ('x28', 'sp') and not guest_state:
             out.append(f'+{off} "{dis[off]}" accesses emulator data ({acc[2]})')
         if re.fullmatch(r'ldr\w* \w+, 0x[0-9a-f]+', dis[off]):
@@ -740,6 +745,17 @@ GUARDED = {   # P8-P10: name -> (rip, asm, compare with the fixture rules); the 
     'jmp-mem': ('0x100000', ['jmp qword ptr [rip+0x100]'], False),
     'jmp-mem-index': ('0x100000', ['jmp qword ptr [rbx+rcx*8]'], False),
     'jcc': ('0x100000', ['cmp rax, rcx', '.byte 0x75, 0x40'], False),   # jne +0x40
+    # I7: FS/GS overrides; the base is a register load from the guest-state page added into the address, so the split
+    # check and the site see the linear address; an RSP/RBP base under FS/GS is FS/GS (#GP), not SS.
+    'segment-forms': ('0x100000', ['mov rax, qword ptr gs:[rbx+8]', 'mov qword ptr fs:[rsi+rcx*4+0xffc], rax',
+                                   'add dword ptr gs:[rsp+16], 1', 'mov rcx, qword ptr fs:[rbp-8]', 'mov rax, qword ptr gs:[0x28]',
+                                   'mov qword ptr fs:[rip+0xff5], rax', 'add qword ptr gs:[rip+0x100], rcx', 'push qword ptr fs:[rbx]',
+                                   'pop qword ptr gs:[rsp+8]', 'xchg qword ptr fs:[rdi], rdx', 'cmpxchg qword ptr gs:[rbx], rcx',
+                                   'xadd dword ptr fs:[rsi], eax', 'btc qword ptr gs:[rdi], rax', 'shld qword ptr fs:[rbx], rcx, 5',
+                                   'movnti qword ptr gs:[rsi], rcx', 'div qword ptr fs:[rbx+0x10]', 'andn rax, rcx, qword ptr gs:[rbx]',
+                                   'lea rax, fs:[rbx+8]', 'movabs rax, qword ptr gs:[0x1122334455667788]'], True),
+    'segment-call-mem': ('0x100000', ['call qword ptr gs:[rax+8]'], False),
+    'segment-jmp-mem-rip': ('0x100000', ['jmp qword ptr fs:[rip+0x100]'], False),
 }
 
 
@@ -803,6 +819,9 @@ def main():
     scan_skips.FEXC = FEXC
     fixtures = check_sites.fixture_programs()
     matrix = [{'name': n, 'code': h, 'rip': '0x102000'} for n, h in scan_skips.matrix().items()]
+    # I7: every memory form of the matrix again with an FS and a GS override (implicit-stack forms are cut: no operand).
+    matrix += [{'name': f'{seg} {n}', 'code': pre + h, 'rip': '0x102000'} for n, h in scan_skips.matrix().items() if '[' in n
+               for seg, pre in (('fs', '64'), ('gs', '65'))]
     corpora = [('fixtures', fixtures), ('matrix', matrix), ('adversarial', adversarial())]
     for a in args:
         corpora.append((Path(a).name, json.loads(Path(a).read_text())['programs']))

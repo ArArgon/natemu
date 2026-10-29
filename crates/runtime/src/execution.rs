@@ -19,6 +19,7 @@ use super::*;
 use crate::cache::{self, Block};
 use natemu_abi::{
     code_object::{self as object, Header, Site},
+    cpu, cpu_profile,
     execution::*,
     guest_memory::{self, CodePages, CodeWrites},
     paging::{self, Access, Fault},
@@ -71,7 +72,7 @@ fn halt(mut s: State, reason: u64) -> ! {
 
 pub unsafe fn start() -> ! {
     let mut s = unsafe { load() };
-    if s.cpu.control().is_none() || s.request != NONE || s.vcpu as usize >= cache::MAX_VCPUS {
+    if s.cpu.control().is_none() || s.request != NONE || s.vcpu >= s.vcpus || s.vcpus as usize > cache::MAX_VCPUS {
         // Before anything is shadowed or marked (and before the vCPU number is known to be valid).
         s.stop = stop::UNSUPPORTED_MODE;
         unsafe { write_record(record(), s) };
@@ -410,12 +411,19 @@ fn reset_shadows(s: &mut State) {
 }
 
 /// Enters `block` from the bank: GPRs and PF/AF in their static registers, NZCV with C = !CF, the guest-state page in
-/// x28 with its flag bytes (TF, IF, DF, IOPL, NT, AC, VIF, VIP, ID; RF and VM as 0) written from the bank.
+/// x28 with its flag bytes (TF, IF, DF, IOPL, NT, AC, VIF, VIP, ID; RF and VM as 0) and the FS/GS bases (FEX's
+/// `fs_cached`/`gs_cached`, which every FS-/GS-prefixed access adds) written from the bank. The bases are rewritten at
+/// every entry and never read back, so the bank stays authoritative: a guest store into the page (the documented
+/// deviation) changes only what that vCPU's own prefixed accesses use until its next resident entry.
 unsafe fn enter(mut s: State, block: &Block) -> ! {
     served(&mut s);
     for (at, value) in frame::flag_bytes(s.cpu.rflags) {
         // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA; `at` lies inside it.
         unsafe { (FRAME_VA as *mut u8).add(at as usize).write_volatile(value) };
+    }
+    for (at, base) in [(frame::FS_BASE, s.cpu.fs_base), (frame::GS_BASE, s.cpu.gs_base)] {
+        // SAFETY: as above; the fields are 8-byte aligned (abi `guest_state_page_layout`).
+        unsafe { (FRAME_VA as *mut u64).byte_add(at as usize).write_volatile(base) };
     }
     let mut f = NativeFrame::ZERO;
     for (&reg, &value) in SRA.iter().zip(&s.cpu.gpr) {
@@ -640,17 +648,17 @@ unsafe fn stopped(frame: &NativeFrame, elr: u64, spsr: u64, (armed, n): ([u32; M
 /// CR0 bits (SDM vol. 3 §2.5): those defined; the others in 31:0 are reserved and ignored on a load (they stay clear),
 /// those in 63:32 raise #GP. Of the defined bits the resident implements changes of WP only (PG, PE are fixed in
 /// 64-bit code: clearing either raises #GP; ET is hard-wired).
-const CR0_DEFINED: u64 = 0xe005_003f;
+const CR0_DEFINED: u64 = cpu_profile::CR0_VALID;
 const CR0_CD: u64 = 1 << 30;
 const CR0_NW: u64 = 1 << 29;
-/// CR4 bits the resident implements (PAE is fixed in long mode), and the defined bits whose change it refuses as
-/// unsupported (VME, PVI, TSD, DE, PSE, MCE, PCE, OSFXSR, OSXMMEXCPT, UMIP, LA57, VMXE, SMXE, FSGSBASE, OSXSAVE, PKE).
-/// Every other bit is reserved for natemu's CPU model (#GP): the architecturally reserved ones and the features it
-/// does not have, PCIDE and SMAP among them (KL, CET, PKS, UINTR, LAM, FRED).
-const CR4_SUPPORTED: u64 = CR4_PAE | CR4_PGE | CR4_SMEP;
-const CR4_UNSUPPORTED: u64 = 0x0045_7f5f;
-/// EFER bits of natemu's model (Intel: SCE, LME, LMA, NXE); others reserved (#GP).
-const EFER_DEFINED: u64 = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE;
+/// CR4: a bit outside the presented CPU's valid set (`cpu_profile::CR4_VALID`: its CPUID feature is advertised, SDM
+/// Vol.3 2.5) is reserved (#GP). Of the valid bits the resident implements PAE (fixed in long mode), PGE, SMEP, PSE (no
+/// effect with 4-level paging, SDM Vol.3 4.1) and TSD (RDTSC/RDTSCP #GP at CPL > 0); a change of the others (DE, PCE,
+/// OSFXSR, OSXMMEXCPT, FSGSBASE, OSXSAVE) is refused as unsupported until their features exist.
+const CR4_TSD: u64 = 1 << 2;
+const CR4_PSE: u64 = 1 << 4;
+const CR4_SUPPORTED: u64 = CR4_PAE | CR4_PGE | CR4_SMEP | CR4_PSE | CR4_TSD;
+const CR4_UNSUPPORTED: u64 = cpu_profile::CR4_VALID & !CR4_SUPPORTED;
 const UD: [u64; 2] = [6, 0];
 const GP: [u64; 2] = [13, 0];
 
@@ -662,7 +670,9 @@ const GP: [u64; 2] = [13, 0];
 /// shadows (both spaces) and blocks of the 2 MiB-aligned range holding the address (a superset of its page in either
 /// page size). Only this vCPU's state, cache and shadows change. Forms and operand values the resident does not
 /// implement stop it (`unsupported_system`) before any effect. A test driver's [`system::SET_CPL`] changes the CPL
-/// ([`set_cpl`]) at any CPL.
+/// ([`set_cpl`]) at any CPL. CPUID, RDMSR/WRMSR, RDTSC and RDTSCP answer from the presented CPU ([`natemu_abi::cpu`]).
+/// CPUID is serialising: like every system instruction it is a draining entry, since [`find`] drains this vCPU's
+/// invalidations before the request and again before the next instruction is looked up.
 fn system(s: &mut State, i: System) {
     s.systems += 1;
     if i.kind == system::SET_CPL {
@@ -679,10 +689,17 @@ fn system(s: &mut State, i: System) {
     if i.lock != 0 || (moves && !matches!(i.cr, 0 | 2 | 3 | 4 | 8)) {
         fault(s, UD)
     }
-    if c.cpl != 0 {
+    // CPUID runs at any CPL; RDTSC/RDTSCP at CPL > 0 unless CR4.TSD; the rest at CPL 0 only.
+    let unprivileged = match i.kind {
+        system::CPUID => true,
+        system::RDTSC | system::RDTSCP => c.cr4 & CR4_TSD == 0,
+        _ => false,
+    };
+    if c.cpl != 0 && !unprivileged {
         fault(s, GP)
     }
     let gpr = |r: u32| c.gpr[r as usize];
+    let slot = |index: u32| cpu::msr(index).unwrap();
     // Whether the vCPU's translations must go.
     let changed = match i.kind {
         system::MOV_FROM_CR => {
@@ -754,20 +771,70 @@ fn system(s: &mut State, i: System) {
             }
             false
         }
-        system::RDMSR | system::WRMSR => {
-            if gpr(1) as u32 != system::MSR_EFER {
-                fault(s, GP) // natemu's model implements no other MSR
+        system::CPUID => {
+            let d = cpu::Dynamic {
+                vcpus: s.vcpus,
+                vcpu: s.vcpu,
+                cr4: c.cr4,
+                apic_base: msr_get(slot(cpu::MSR_APIC_BASE)),
+                misc_enable: msr_get(slot(cpu::MSR_MISC_ENABLE)),
+                xcr0: cpu_profile::XCR0_RESET, // no XSETBV yet (I5b)
+            };
+            let [eax, ebx, ecx, edx] = cpu::cpuid(gpr(0) as u32, gpr(1) as u32, &d);
+            [0, 3, 1, 2].into_iter().zip([eax, ebx, ecx, edx]).for_each(|(r, v)| s.cpu.gpr[r] = u64::from(v));
+            if gpr(0) as u32 == 1 {
+                msr_set(slot(cpu::MSR_UCODE_REV), 0); // CPUID.1 reloads the latch with virtual revision 0 (CPU 17)
             }
+            false
+        }
+        system::RDTSC | system::RDTSCP => {
+            let t = tsc();
+            (s.cpu.gpr[0], s.cpu.gpr[2]) = (t & 0xffff_ffff, t >> 32);
+            if i.kind == system::RDTSCP {
+                s.cpu.gpr[1] = msr_get(slot(cpu::MSR_TSC_AUX)) & 0xffff_ffff;
+            }
+            false
+        }
+        system::RDMSR | system::WRMSR => {
+            // ECX selects; the profile's checks (cpu::read_ok/write_ok) decide #GP(0) before any effect.
+            let index = gpr(1) as u32;
+            let Some(at) = cpu::msr(index) else { fault(s, GP) };
+            let m = cpu_profile::MSRS[at];
             if i.kind == system::RDMSR {
-                (s.cpu.gpr[0], s.cpu.gpr[2]) = (c.efer & 0xffff_ffff, c.efer >> 32);
+                if !cpu::read_ok(&m) {
+                    fault(s, GP)
+                }
+                let v = match index {
+                    cpu::MSR_EFER => c.efer,
+                    cpu::MSR_FS_BASE => c.fs_base,
+                    cpu::MSR_GS_BASE => c.gs_base,
+                    cpu::MSR_TSC => tsc(),
+                    _ => msr_get(at),
+                };
+                (s.cpu.gpr[0], s.cpu.gpr[2]) = (v & 0xffff_ffff, v >> 32);
                 false
             } else {
                 let v = gpr(2) << 32 | gpr(0) & 0xffff_ffff;
-                if v & !EFER_DEFINED != 0 || (v ^ c.efer) & EFER_LME != 0 && c.cr0 & CR0_PG != 0 {
+                if !cpu::write_ok(&m, v, c.cr0, c.efer) {
                     fault(s, GP)
                 }
-                s.cpu.efer = v & !EFER_LMA | c.efer & EFER_LMA; // LMA writes are ignored
-                s.cpu.efer != c.efer
+                match index {
+                    cpu::MSR_EFER => s.cpu.efer = v & !EFER_LMA | c.efer & EFER_LMA, // LMA writes are ignored
+                    // The bank's bases, which every block entry writes into the guest-state page (I7): no flush.
+                    cpu::MSR_FS_BASE => s.cpu.fs_base = v,
+                    cpu::MSR_GS_BASE => s.cpu.gs_base = v,
+                    cpu::MSR_TSC => msr_set(at, v.wrapping_sub(tsc().wrapping_sub(msr_get(at)))),
+                    cpu::MSR_MISC_ENABLE => msr_set(at, cpu::misc_enable_after_write(v)),
+                    // EN/EXTD and the base select the LAPIC's mode and page: no LAPIC yet (its chunk), so a write that
+                    // changes them is refused; the BSP flag (bit 8, R/W) alone is stored.
+                    cpu::MSR_APIC_BASE if (v ^ msr_get(at)) & !APIC_BASE_BSP != 0 => unsupported(s),
+                    // UCODE_REV keeps the high half (the low is 0 by the mask); KERNEL_GS_BASE waits for SWAPGS (S3);
+                    // PAT and the MTRRs are recorded: memory types are the walker's (M2), RAM runs as write-back.
+                    _ => msr_set(at, v),
+                }
+                // A changed EFER ends the paging and code assumptions; an MTRR write invalidates TLBs including global
+                // entries (CPU 9).
+                s.cpu.efer != c.efer || cpu::is_mtrr(index)
             }
         }
         _ => halt(*s, stop::BAD_REPLY),
@@ -786,6 +853,28 @@ fn commit(s: &mut State, i: System, flush_all: bool) {
     s.cpu.rip = s.cpu.rip.wrapping_add(u64::from(i.length));
 }
 const LARGE_PAGE: u64 = 0x20_0000;
+const APIC_BASE_BSP: u64 = 1 << 8;
+
+/// MSR slot `at` of the vCPU's MSR record (`MSRS_VA`, its own; the host wrote the reset values), read and written.
+fn msr_get(at: usize) -> u64 {
+    assert!(at < cpu_profile::MSRS.len());
+    // SAFETY: the record is mapped EL1 read/write in this vCPU's window and only this vCPU's resident uses it.
+    unsafe { (MSRS_VA as *const u64).add(at).read_volatile() }
+}
+fn msr_set(at: usize, value: u64) {
+    assert!(at < cpu_profile::MSRS.len());
+    // SAFETY: as in msr_get.
+    unsafe { (MSRS_VA as *mut u64).add(at).write_volatile(value) }
+}
+/// The vCPU's TSC. Provisional until the clock service (plan L5): CNTVCT_EL0 scaled to the profile's rate
+/// (`cpu_profile::TSC_HZ`, 1 GHz) plus the vCPU's offset (the TSC MSR's slot: the host sets it from one CNTVCT sample
+/// shared by all vCPUs, so every TSC starts near 0 at VM creation and the vCPUs agree; a WRMSR of the TSC moves it).
+fn tsc() -> u64 {
+    let (count, hz): (u64, u64);
+    unsafe { asm!("isb", "mrs {c}, cntvct_el0", "mrs {f}, cntfrq_el0", c = out(reg) count, f = out(reg) hz) };
+    let scaled = u128::from(count) * u128::from(cpu_profile::TSC_HZ) / u128::from(hz.max(1));
+    (scaled as u64).wrapping_add(msr_get(cpu::msr(cpu::MSR_TSC).unwrap()))
+}
 
 /// Changes the vCPU's CPL (0..=3), at a block boundary with the state banked: the one place a CPL changes (exception
 /// delivery, SYSCALL/SYSRET and IRET call it; today only the test drivers' [`system::SET_CPL`]). Nothing is flushed

@@ -84,6 +84,9 @@ inline uint32_t fexc_spill_bytes = 0;             // bytes the entry prologue su
 // global constant, which would also force one instruction per block).
 // ---------------------------------------------------------------------------------------------
 inline bool fexc_slice1 = false;
+// Profile slice1: the guest bytes [Address, Address + Size) the compile was given, or nullptr (set by fexc). The allowlist
+// reads an instruction's prefix bytes with it (FEX's decode keeps only the last segment prefix).
+inline const uint8_t* (*fexc_guest_bytes)(uint64_t Address, uint64_t Size) = nullptr;
 // Profile slice1: `svc` immediates of the resident entries generated code makes (crates/abi/src/execution.rs `svc`):
 // a literal exit (RIP in x0), the dispatcher's L1 miss (resident code, listed for completeness) and the 128/64
 // unsigned / signed division (FEX's helper registers: x0 high, x1 low, x2 divisor in; quotient, remainder, #DE out).

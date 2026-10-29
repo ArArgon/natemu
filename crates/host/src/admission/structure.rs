@@ -1336,6 +1336,12 @@ mod tests {
         refused(ADDRESS, at, old, 0x390f_f394, "frame access"); // strb w20, [x28, #0x3fc]: IOPL
         refused(ADDRESS, at, old, 0x394f_ef95, "frame access"); // ldrb w21, [x28, #0x3fb]: no field
         refused(ADDRESS, at, old, 0x3950_1b95, "frame access"); // ldrb w21, [x28, #0x406]: past the flags
+        // I7: the segment bases (gs_cached 992, fs_cached 1000) are loads only.
+        admitted(0xf941_f794); // ldr x20, [x28, #1000]: an FS-prefixed access reads FS.base
+        admitted(0xf941_f394); // ldr x20, [x28, #992]: GS.base
+        refused(ADDRESS, at, old, 0xf901_f794, "frame access"); // str x20, [x28, #1000]: the resident's
+        refused(ADDRESS, at, old, 0xf901_f394, "frame access"); // str x20, [x28, #992]
+        refused(ADDRESS, at, old, 0xf941_ef94, "frame access"); // ldr x20, [x28, #984]: below gs_cached (ds_cached)
         // POPCNT without FEAT_CSSC, and prefetch hints.
         for word in [0x9e67_00c0, 0x1e27_00e0, 0x0e20_5800, 0x0e31_b800, 0x0e20_bc00, 0x0e01_3c04, 0xf980_00c0] {
             admitted(word); // fmov d0, x6; fmov s0, w7; cnt v0.8b; addv b0, v0.8b; umov w4, v0.b[0]; prfm pldl1keep, [x6]

@@ -160,7 +160,8 @@ struct Capture {
   std::vector<uint8_t> sra_gpr, sra_fpr;
   // The explicit x86 memory operand FEX decoded (base/index are x86 register numbers, -1 = none).
   struct X86Mem { bool present = false, rip_relative = false; int base = -1, index = -1; unsigned scale = 1; int64_t disp = 0; };
-  struct Inst { uint64_t pc; unsigned size; std::string name; bool block_end; bool sets_rip; X86Mem mem; };
+  // seg: the FS/GS override FEX applies (4 fs, 5 gs, 0 none; CS/DS/ES/SS are ignored in 64-bit mode).
+  struct Inst { uint64_t pc; unsigned size; std::string name; bool block_end; bool sets_rip; X86Mem mem; int seg; };
   struct Block { uint64_t entry, size, count; int status; bool entry_point; };
   std::vector<Inst> insts;
   std::vector<Block> blocks;
@@ -194,8 +195,14 @@ int CfInverted(uint64_t guest, uint64_t native) {
   return -1;
 }
 
+int SegmentOverride(uint32_t flags) {
+  const uint32_t s = flags & X86Tables::DecodeFlags::FLAG_SEGMENTS;
+  return s == X86Tables::DecodeFlags::FLAG_FS_PREFIX ? 4 : s == X86Tables::DecodeFlags::FLAG_GS_PREFIX ? 5 : 0;
+}
+
 // Join each site with FEX's own decode of its guest instruction: segment (stack ops and RSP/RBP-based operands use SS,
-// which decides #SS(0) vs #GP(0) for a non-canonical address) and the x86 addressing form.
+// which decides #SS(0) vs #GP(0) for a non-canonical address; an FS/GS-overridden operand is FS/GS, #GP(0), whatever its
+// base) and the x86 addressing form.
 // A load of a RIP-setting instruction without an explicit memory operand is the implicit stack access of slice1's ret;
 // leave's load of [RBP] (slice1: a plain load, then RSP and RBP) is a stack access too.
 // Guard/split stubs (slice1) take the width, intent, segment and data registers of the access they cover (their own
@@ -205,7 +212,10 @@ void JoinSites(uint64_t rip) {
   for (auto& s : Cap.sites) {
     s.segment = (s.kind == FEXC_SITE_PUSH || s.kind == FEXC_SITE_POP || s.kind == FEXC_SITE_PUSH_PAIR || s.kind == FEXC_SITE_POP_PAIR) ? 1 : 0;
     if (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP)
-      for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) { if ((!i.mem.present && (i.sets_rip || i.name == "LEAVE")) || i.mem.base == 4 || i.mem.base == 5) s.segment = 1; break; }
+      for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) {
+        if ((!i.mem.present && (i.sets_rip || i.name == "LEAVE")) || (!i.seg && (i.mem.base == 4 || i.mem.base == 5))) s.segment = 1;
+        break;
+      }
   }
   for (auto& s : Cap.sites) {
     if ((s.kind != FEXC_SITE_GUARD && s.kind != FEXC_SITE_SPLIT) || s.access_native_offset == FEXC_NONE32) continue;
@@ -244,7 +254,8 @@ void Hook(Core::InternalThreadState* t, const FexcCompileInfo& info, const uint8
       auto& d = b.DecodedInstructions[i];
       Cap.insts.push_back({d.PC, d.InstSize, d.TableInfo && d.TableInfo->Name ? d.TableInfo->Name : "?",
                            d.TableInfo && (d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_BLOCK_END),
-                           d.TableInfo && (d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_SETS_RIP), MemOperand(d)});
+                           d.TableInfo && (d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_SETS_RIP), MemOperand(d),
+                           SegmentOverride(d.Flags)});
     }
   }
 }
@@ -413,6 +424,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
   hf.HostType = HostFeatures::HostTypeEnum::Linux;
 
   fexc_compile_hook = Hook;
+  fexc_guest_bytes = [](uint64_t a, uint64_t n) -> const uint8_t* { return InWindow(a, n) ? W.bytes + (a - W.base) : nullptr; };
   fexc_dense_pc_table = st.dense_pc;
   fexc_slice1 = slice1;
 
@@ -695,10 +707,13 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     if (slice1) {
       if (s.access_native_offset != FEXC_NONE32) j.kv("access_native_offset", s.access_native_offset); else j.null("access_native_offset");
     }
-    const Capture::X86Mem* m = nullptr;
-    for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) { if (i.mem.present) m = &i.mem; break; }
-    if (m && (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP)) {
-      j.obj("x86").kv("rip_relative", m->rip_relative).kv("base", m->base).kv("index", m->index).kv("scale", m->scale).kv("disp", m->disp).end_obj();
+    const Capture::Inst* in = nullptr;
+    for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) { if (i.mem.present) in = &i; break; }
+    if (in && (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP)) {
+      const auto* m = &in->mem;
+      j.obj("x86").kv("rip_relative", m->rip_relative).kv("base", m->base).kv("index", m->index).kv("scale", m->scale).kv("disp", m->disp);
+      if (in->seg) j.kv("segment_override", in->seg == 4 ? "fs" : "gs"); else j.null("segment_override");
+      j.end_obj();
     } else j.null("x86");
     j.end_obj();
   }
