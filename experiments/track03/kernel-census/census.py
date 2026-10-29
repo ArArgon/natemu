@@ -1,0 +1,231 @@
+#!/usr/bin/env python3 -I
+"""Static census of x86 instruction forms natemu admission refuses.
+Usage: census.py RAW_DIR OUT_MD   (needs RAW_DIR/x from extract.py), or census.py --selftest
+Classifier = a byte-level port of tools/fexc/shim/fexc_slice1.inc (Primary/Two/Classify) and the S3e additions."""
+import collections, json, os, re, struct, subprocess, sys
+from multiprocessing import Pool
+
+LEGACY = {0xF0, 0xF2, 0xF3, 0x66, 0x67, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65}
+BMI = {'andn', 'bextr', 'blsi', 'blsmsk', 'blsr', 'bzhi', 'mulx', 'pdep', 'pext', 'rorx', 'sarx', 'shlx', 'shrx'}
+ALLOW, SYS, UNS = 'ALLOW', 'SYS', 'UNS'
+
+def primary(op, modrm):
+    mod, reg = modrm >> 6, (modrm >> 3) & 7
+    if op < 0x40 and (op & 7) < 6: return ALLOW, False
+    if op in (0x06, 0x07, 0x0E, 0x16, 0x17, 0x1E, 0x1F, 0x8C, 0x8E, 0x9A, 0xEA, 0xCA, 0xCB, 0xCF, 0xCC, 0xCD, 0xCE, 0xF1,
+              0x9C, 0x9D, 0xFA, 0xFB, 0xF4, 0xE4, 0xE5, 0xE6, 0xE7, 0xEC, 0xED, 0xEE, 0xEF, 0x6C, 0x6D, 0x6E, 0x6F): return SYS, False
+    if op in (0x63, 0x68, 0x6A, 0x69, 0x6B, 0x84, 0x85, 0x88, 0x89, 0x8A, 0x8B, 0x8D, 0x98, 0x99, 0xA0, 0xA1, 0xA2, 0xA3, 0xA8, 0xA9,
+              0x80, 0x81, 0x83, 0x86, 0x87): return ALLOW, False
+    if op == 0x8F: return (ALLOW if reg == 0 else UNS), False
+    if op in (0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3):
+        return (UNS if reg == 6 or (reg in (2, 3) and mod != 3) else ALLOW), False
+    if op in (0xC6, 0xC7): return (ALLOW if reg == 0 else UNS), False
+    if op in (0xF6, 0xF7): return (UNS if reg == 1 else ALLOW), False
+    if op == 0xFE: return (ALLOW if reg <= 1 else UNS), False
+    if op == 0xFF:
+        if reg in (3, 5): return SYS, False
+        if reg in (2, 4): return ALLOW, True
+        return (ALLOW if reg <= 1 or reg == 6 else UNS), False
+    if op in (0xC2, 0xC3, 0xE8, 0xE9, 0xEB, 0xE0, 0xE1, 0xE2, 0xE3): return ALLOW, True
+    if 0x50 <= op <= 0x5F or 0x90 <= op <= 0x97 or 0xB0 <= op <= 0xBF: return ALLOW, False
+    if 0x70 <= op <= 0x7F: return ALLOW, True
+    return UNS, False
+
+def two(op, plain, modrm):
+    mod, reg = modrm >> 6, (modrm >> 3) & 7
+    if op in (0x00, 0x01, 0x02, 0x03, 0x05, 0x07, 0x34, 0x35, 0x06, 0x08, 0x09, 0x0B, 0xB9, 0xFF, 0x20, 0x21, 0x22, 0x23, 0x30, 0x32,
+              0x33, 0x31, 0x78, 0x79, 0xA0, 0xA1, 0xA8, 0xA9, 0xA2, 0xB2, 0xB4, 0xB5): return SYS, False
+    if op == 0xAE:
+        if mod != 3 and reg == 7: return SYS, False
+        if mod == 3 and reg < 4: return SYS, False
+        return UNS, False
+    if not plain: return UNS, False
+    if op in (0x1F, 0xA3, 0xAB, 0xB3, 0xBB, 0xAF, 0xB6, 0xB7, 0xBE, 0xBF, 0xBC, 0xBD): return ALLOW, False
+    if op == 0xBA: return (ALLOW if reg >= 4 else UNS), False
+    if 0x40 <= op <= 0x4F or 0x90 <= op <= 0x9F or 0xC8 <= op <= 0xCF: return ALLOW, False
+    if 0x80 <= op <= 0x8F: return ALLOW, True
+    return UNS, False
+
+def parse(b):
+    """-> dict(prefixes, rex, kind('vex'|'xop'|'p'|'0f'|'0f38'|'0f3a'), op, modrm) or None"""
+    i, pre = 0, set()
+    while i < len(b) and b[i] in LEGACY: pre.add(b[i]); i += 1
+    rex = 0
+    if i < len(b) and 0x40 <= b[i] <= 0x4F: rex = b[i]; i += 1
+    if i >= len(b): return None
+    o = b[i]
+    g = lambda k: b[i + k] if i + k < len(b) else 0
+    if o in (0xC4, 0xC5, 0x62): return dict(pre=pre, rex=rex, kind='vex', op=o, modrm=0)
+    if o == 0x8F and (g(1) >> 3) & 7 != 0: return dict(pre=pre, rex=rex, kind='xop', op=o, modrm=0)
+    if o == 0x0F:
+        if g(1) == 0x38: return dict(pre=pre, rex=rex, kind='0f38', op=g(2), modrm=g(3))
+        if g(1) == 0x3A: return dict(pre=pre, rex=rex, kind='0f3a', op=g(2), modrm=g(3))
+        return dict(pre=pre, rex=rex, kind='0f', op=g(1), modrm=g(2))
+    return dict(pre=pre, rex=rex, kind='p', op=o, modrm=g(1))
+
+SSE2 = set(range(0x10, 0x18)) | set(range(0x28, 0x30)) | set(range(0x50, 0x78)) | {0x77, 0x7C, 0x7D, 0x7E, 0x7F, 0xC2, 0xC4, 0xC5, 0xC6} | set(range(0xD0, 0xFF))
+SMALL2 = {0xA4, 0xA5, 0xAC, 0xAD, 0xB0, 0xB1, 0xC0, 0xC1, 0xC3, 0x0D, 0x18, 0xC7}
+SMALL1 = {0xFC, 0xFD, 0xF8, 0xF9, 0xF5, 0x9E, 0x9F, 0xC8, 0xC9}
+
+def classify(b, mnem):
+    """-> (class, why). Classes: admitted SSE AVX x87 LOCK string system BMI FS/GS small-int other bad"""
+    p = parse(b)
+    if p is None or mnem.startswith('(bad)') or mnem.startswith('.byte'): return 'bad', ''
+    pre, k, op, modrm = p['pre'], p['kind'], p['op'], p['modrm']
+    base = mnem.split()[-1] if mnem else ''
+    if k == 'vex': return ('BMI' if base in BMI or base[:-1] in BMI else 'AVX'), 'vex/evex'
+    if k == 'xop': return 'other', 'xop'
+    if k == 'p': v, br = primary(op, modrm)
+    elif k == '0f': v, br = two(op, not (0xF2 in pre or 0xF3 in pre), modrm)
+    elif k == '0f38': v, br = (SYS if 0x80 <= op <= 0x82 else UNS), False
+    else: v, br = UNS, False
+    plainmod = modrm
+    # fences and endbr64 are admitted whatever the opcode table says
+    if k == '0f' and op == 0xAE and modrm in (0xE8, 0xF0, 0xF8) and not (pre & {0x66, 0xF2, 0xF3}): return 'admitted', ''
+    if v != ALLOW:
+        if k == '0f' and op == 0x1E and modrm == 0xFA and 0xF3 in pre and not (pre & {0xF0, 0xF2, 0x66, 0x67, 0x64, 0x65}): return 'admitted', ''
+    else:
+        if 0xF0 in pre and not (k == 'p' and op in (0x86, 0x87) and modrm >> 6 != 3): return 'LOCK', 'LOCK on an admitted opcode'
+        if 0xF2 in pre: return 'other', 'REPNE/bnd prefix on an admitted opcode'
+        if 0xF3 in pre and not (k == 'p' and (op == 0xC3 or (op == 0x90 and not (p['rex'] & 1)))): return 'other', 'REP prefix on an admitted opcode'
+        if pre & {0x64, 0x65}: return 'FS/GS', 'override on an admitted opcode'
+        if 0x67 in pre: return 'other', 'address-size prefix on an admitted opcode'
+        if br and 0x66 in pre: return 'other', 'operand-size prefix on a branch'
+        if k == '0f' and 0xC8 <= op <= 0xCF and 0x66 in pre and not p['rex'] & 8: return 'other', '16-bit bswap'
+        return 'admitted', ''
+    if k == 'p' and op == 0xCC: return 'int3', 'alignment padding / breakpoint'
+    if v == SYS: return 'system', ''
+    # refused: say what it is
+    if k == 'p' and (0xD8 <= op <= 0xDF or op == 0x9B): return 'x87', ''
+    if k == '0f' and op == 0xAE:
+        r = (modrm >> 3) & 7
+        return ('x87' if r <= 1 else 'SSE' if r in (2, 3) else 'other'), 'fxsave/ldmxcsr/xsave group'
+    if k == '0f' and op in (0xB8, 0xBC, 0xBD) and 0xF3 in pre: return 'BMI', 'popcnt/tzcnt/lzcnt'
+    if k in ('0f38', '0f3a') and not (k == '0f38' and op in (0xF0, 0xF1, 0xF5, 0xF6, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC)): return 'SSE', 'incl. AES/SHA/PCLMUL'
+    if k == '0f' and op in SSE2 and not (op == 0x7E and 0 and False): return 'SSE', ''
+    if 0xF0 in pre: return 'LOCK', ''
+    if k == 'p' and (0xA4 <= op <= 0xA7 or 0xAA <= op <= 0xAF): return 'string', ''
+    if k == 'p' and op in SMALL1 or k == '0f' and op in SMALL2 and op != 0xC7: return 'small-int', ''
+    if k == '0f' and op == 0xC7 and (modrm >> 3) & 7 == 1: return 'small-int', 'cmpxchg8b/16b'
+    return 'other', ''
+
+PFX = {'lock', 'rep', 'repe', 'repne', 'repz', 'repnz', 'notrack', 'bnd', 'data16', 'cs', 'ds', 'es', 'ss', 'fs', 'gs', 'addr32', 'xacquire', 'xrelease', 'rex', 'rex.W', 'rex.R', 'rex.X', 'rex.B', 'rex.WR', 'rex.WB', 'rex.WX'}
+REG = re.compile(r'%([a-z]+)\d*')
+def form(text):
+    """'movq\\t%rax, 8(%rbx)' -> ('movq', 'r,m'); prefixes folded into the mnemonic."""
+    text = text.split('#')[0].strip()
+    parts = text.split('\t'); parts = [x for x in parts if x != '']
+    words = []
+    while parts and parts[0].split()[0] in PFX and len(parts) > 1:
+        words.append(parts.pop(0))
+    if not parts: return text, ''
+    mn = ' '.join(words + [parts[0]]); ops = parts[1] if len(parts) > 1 else ''
+    out, depth, cur = [], 0, ''
+    for ch in ops:
+        if ch == '(': depth += 1
+        if ch == ')': depth -= 1
+        if ch == ',' and depth == 0: out.append(cur.strip()); cur = ''
+        else: cur += ch
+    if cur.strip(): out.append(cur.strip())
+    def shape(o):
+        o = o.split(' <')[0].strip(); star = '*' if o.startswith('*') else ''; o = o.lstrip('*')
+        if o.startswith('$'): return star + 'i'
+        if '(' in o or ':' in o or re.match(r'^-?0x[0-9a-f]+$', o) and not star and mn.split()[-1][0] not in 'jc' : return star + ('m' if '(' in o or ':' in o else 'a')
+        m = REG.match(o)
+        if m:
+            n = m.group(1); return star + ('x' if n == 'xmm' else 'y' if n == 'ymm' else 'z' if n == 'zmm' else n if n in ('mm', 'st', 'k', 'cr', 'dr') else 'sr' if n in ('cs', 'ds', 'es', 'ss', 'fs', 'gs') else 'r')
+        return star + 'rel'
+    return mn, ','.join(shape(o) for o in out)
+
+def wrap(code, path, is64, base=0):
+    """minimal ELF with one executable .text, for objdump on raw bytes"""
+    shstr = b'\0.text\0.shstrtab\0'
+    shoff = (64 + len(code) + len(shstr) + 7) & ~7
+    if is64:
+        eh = b'\x7fELF' + bytes([2, 1, 1, 0]) + bytes(8) + struct.pack('<HHIQQQIHHHHHH', 1, 62, 1, 0, 0, shoff, 0, 64, 0, 0, 64, 3, 2)
+        sh = lambda n, t, f, a, o, s: struct.pack('<IIQQQQIIQQ', n, t, f, a, o, s, 0, 0, 1, 0)
+    else:
+        eh = b'\x7fELF' + bytes([1, 1, 1, 0]) + bytes(8) + struct.pack('<HHIIIIIHHHHHH', 1, 3, 1, 0, 0, shoff, 0, 52, 0, 0, 40, 3, 2)
+        eh += bytes(64 - len(eh))
+        sh = lambda n, t, f, a, o, s: struct.pack('<IIIIIIIIII', n, t, f, a, o, s, 0, 0, 1, 0)
+    secs = sh(0, 0, 0, 0, 0, 0) + sh(1, 1, 6, base, 64, len(code)) + sh(7, 3, 0, 0, 64 + len(code), len(shstr))
+    open(path, 'wb').write(eh + code + shstr + bytes(shoff - 64 - len(code) - len(shstr)) + secs)
+
+def sweep(path):
+    """objdump -d one ELF -> {(section, class, mnemonic, form): [count, first_addr, why]}, per-section insn totals"""
+    agg, tot = {}, collections.Counter()
+    pr = subprocess.Popen(['objdump', '-d', path], stdout=subprocess.PIPE, text=True, errors='replace')
+    sec, pend = '?', None
+    for ln in pr.stdout:
+        if ln.startswith('Disassembly of section '): sec = ln.split()[3].rstrip(':'); continue
+        if '\t' not in ln or ':' not in ln: continue
+        pre, txt = ln.split('\t', 1)
+        addr, hx = pre.split(':', 1)
+        hx = hx.strip()
+        if not txt.strip() or not re.fullmatch(r'(?:[0-9a-f]{2} ?)+', hx): continue  # raw-bytes-only continuation
+        b = bytes.fromhex(hx.replace(' ', ''))
+        addr = addr.strip()
+        # llvm-objdump prints some prefixes (lock, data16, cs, ...) as an instruction of their own: glue to the next
+        if txt.strip() in PFX:
+            if pend is None: pend = [addr, b'', '']
+            pend[1] += b; pend[2] += txt.strip() + '\t'
+            continue
+        if pend is not None: addr, b, txt, pend = pend[0], pend[1] + b, pend[2] + txt, None
+        mn, fm = form(txt)
+        cls, why = classify(b, mn)
+        k = (sec, cls, mn, fm)
+        e = agg.get(k)
+        if e is None: agg[k] = [1, addr, why]
+        else: e[0] += 1
+        tot[sec] += 1
+    pr.wait()
+    return [[*k, *v] for k, v in agg.items()]
+
+def job(a):
+    name, path, group = a
+    return name, group, sweep(path)
+
+def selftest():
+    h = bytes.fromhex
+    cases = [('f390', 'pause', 'admitted'), ('0faee8', 'lfence', 'admitted'), ('f0488708', 'lock xchg', 'admitted'), ('f04887c1', 'lock xchg reg', 'LOCK'),
+             ('f3a4', 'rep movsb', 'string'), ('fc', 'cld', 'small-int'), ('f30f1efa', 'endbr64', 'admitted'), ('64488b042528000000', 'mov %gs:', 'FS/GS'),
+             ('0f22d8', 'mov %cr3', 'system'), ('0f28c1', 'movaps', 'SSE'), ('c5f877', 'vzeroupper', 'AVX'), ('d9c0', 'fld', 'x87'),
+             ('f3480fb8c1', 'popcnt', 'BMI'), ('f0480fb10a', 'lock cmpxchg', 'LOCK'), ('480fa4c10c', 'shld', 'small-int'), ('f2c3', 'bnd ret', 'other'),
+             ('f3c3', 'rep ret', 'admitted'), ('c3', 'ret', 'admitted'), ('cc', 'int3', 'int3'), ('3effe0', 'notrack jmp', 'admitted'), ('0f05', 'syscall', 'system'),
+             ('c5f8f7', 'bmi?', 'AVX'), ('c4e260f7c1', 'shlx', 'BMI'), ('c4e2f8f7c1', 'shlxq', 'BMI')]
+    for hx, mn, want in cases:
+        got = classify(h(hx), mn if mn != 'shlx' else 'shlxq')[0]
+        if mn == 'popcnt': got = classify(h(hx), 'popcnt')[0]
+        assert got == want, (mn, got, want)
+    assert form('movq\t%rax, 8(%rbx,%rcx,4)') == ('movq', 'r,m') and form('callq\t0x1fba2 <.text+0x1fba2>') == ('callq', 'rel')
+    assert form('lock\t\tcmpxchgl\t%ecx, (%rdi)') == ('lock cmpxchgl', 'r,m') and form('movl\t$0x0, %eax') == ('movl', 'i,r')
+    print('selftest ok')
+
+def main(raw, out_md):
+    x = os.path.join(raw, 'x'); w = os.path.join(raw, 'wrap'); os.makedirs(w, exist_ok=True)
+    head = open(f'{x}/head.bin', 'rb').read(); tail = open(f'{x}/tail.bin', 'rb').read()
+    # decompressor tail: cut where the first long printable run (rodata strings) starts
+    m = re.search(rb'[\x20-\x7e]{24,}', tail[0x400:])
+    cut = 0x400 + m.start() if m else len(tail)
+    jobs = []
+    for n, code, is64, base, grp in (('dec head 32-bit [0,0x200)', head[:0x200], False, 0, 'decompressor'),
+                                     ('dec head 64-bit [0x200,end)', head[0x200:], True, 0x200, 'decompressor'),
+                                     (f'dec tail 64-bit, code part [0,{cut:#x})', tail[:cut], True, 0, 'decompressor')):
+        p = f'{w}/{abs(hash(n))}.elf'; wrap(code, p, is64, base); jobs.append((n, p, grp))
+    jobs.append(('vmlinux', f'{x}/vmlinux.elf', 'vmlinux'))
+    chain = ('busybox', 'ld-linux', 'libc.so', 'libm.so')
+    for f in sorted(os.listdir(f'{x}/initrd')):
+        if f == 'init': continue
+        g = 'initrd:init chain (busybox, ld.so, libc, libm)' if any(c in f for c in chain) else 'initrd:other executables' if '.so' not in f else 'initrd:other libraries'
+        jobs.append((f.replace('__', '/'), f'{x}/initrd/{f}', g))
+    res = collections.defaultdict(list)
+    with Pool(6) as pool:
+        for name, grp, rows in pool.imap_unordered(job, jobs, chunksize=1):
+            res[(grp, name)] = rows
+            print('done', name, sum(r[4] for r in rows), flush=True)
+    json.dump([[g, n, rows] for (g, n), rows in res.items()], open(os.path.join(raw, 'census.json'), 'w'))
+    open(os.path.join(raw, 'tail_cut.txt'), 'w').write(f'{cut:#x} of {len(tail):#x}\n')
+
+if __name__ == '__main__':
+    if sys.argv[1] == '--selftest': selftest()
+    else: main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
