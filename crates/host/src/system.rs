@@ -194,6 +194,31 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         // I5a: LDMXCSR/STMXCSR m32 (`0f ae /2`, `/3`); with a 66 prefix or a register operand another instruction. S3:
         // CLFLUSH m8 (`/7`; with 66 CLFLUSHOPT, not advertised: #UD); f3 with a register operand RDFSBASE, RDGSBASE,
         // WRFSBASE, WRGSBASE (`/0../3`), whose register forms without f3 are #UD.
+        // I6: the x87 forms the resident executes: FNINIT, FNCLEX (`db e3`, `db e2`), FLDCW m16 (`d9 /5`), FLDENV/FNSTENV m
+        // (`d9 /4`, `/6`) and FRSTOR/FNSAVE m (`dd /4`, `/6`), whose image is the 16-bit one with a 66 prefix (`size` 2, else 4),
+        // FLD/FSTP m80 (`db /5`, `/7`).
+        (MAP_PRIMARY, 0xdb) if matches!(*bytes.get(at)?, 0xe2 | 0xe3) => {
+            s.kind = if bytes[at] == 0xe3 { system::FNINIT } else { system::FNCLEX };
+            at += 1;
+        }
+        (MAP_PRIMARY, 0xd9 | 0xdb | 0xdd) => {
+            let reg = rm(bytes, &mut at, rex, &mut s)?;
+            s.kind = match (opcode, reg) {
+                (0xd9, 4) => system::FLDENV,
+                (0xd9, 5) => system::FLDCW,
+                (0xd9, 6) => system::FNSTENV,
+                (0xdd, 4) => system::FRSTOR,
+                (0xdd, 6) => system::FNSAVE,
+                (0xdb, 5) => system::FLD80,
+                (0xdb, 7) => system::FSTP80,
+                _ => return None,
+            };
+            // REX.W wins over 66 (the 64-bit operand size): the 28/108-byte image.
+            s.size = if operand16 && !w { 2 } else { 4 };
+            if s.memory == 0 {
+                return None;
+            }
+        }
         (MAP_TWO, 0xae) => {
             let reg = rm(bytes, &mut at, rex, &mut s)?;
             s.kind = match (s.memory, reg) {
@@ -426,6 +451,22 @@ mod tests {
     #[test]
     fn mxcsr_forms() {
         assert_eq!(d("0fae10", 0xae), Some(mem(LDMXCSR, 0, 0, 3))); // ldmxcsr [rax]
+        // I6: the resident's x87 forms.
+        let x87 = p;
+        assert_eq!(x87("dbe3", 0xdb), Some(System { kind: FNINIT, length: 2, ..System::NONE }));
+        assert_eq!(x87("dbe2", 0xdb), Some(System { kind: FNCLEX, length: 2, ..System::NONE }));
+        assert_eq!(x87("d92b", 0xd9), Some(System { size: 4, ..mem(FLDCW, 3, 0, 2) })); // fldcw [rbx]
+        assert_eq!(x87("66d92648", 0xd9).map(|s| (s.kind, s.size, s.base, s.length)), Some((FLDENV, 2, 6, 3))); // fldenv [rsi] (16-bit image)
+        assert_eq!(x87("d93424", 0xd9).map(|s| (s.kind, s.size, s.base, s.length)), Some((FNSTENV, 4, 4, 3))); // fnstenv [rsp]
+        assert_eq!(x87("6648d97740", 0xd9).map(|s| (s.kind, s.size, s.disp, s.length)), Some((FNSTENV, 4, 0x40, 5))); // 66 REX.W: 28 bytes
+        assert_eq!(x87("66dd6008", 0xdd).map(|s| (s.kind, s.size)), Some((FRSTOR, 2))); // 66 alone: the 94-byte image
+        assert_eq!(x87("dd6008", 0xdd).map(|s| (s.kind, s.disp, s.length)), Some((FRSTOR, 8, 3))); // frstor [rax+8]
+        assert_eq!(x87("64dd30", 0xdd).map(|s| (s.kind, s.fs_gs)), Some((FNSAVE, SREG_FS as u32))); // fnsave fs:[rax]
+        assert_eq!(x87("db2b", 0xdb).map(|s| s.kind), Some(FLD80));
+        assert_eq!(x87("db3b", 0xdb).map(|s| s.kind), Some(FSTP80));
+        for (hex, op) in [("d9e8", 0xd9), ("dbc0", 0xdb), ("dd00", 0xdd), ("d900", 0xd9), ("f3d92b", 0xd9), ("67d92b", 0xd9)] {
+            assert_eq!(x87(hex, op), None, "{hex}"); // admitted forms, register operands, F3, a 32-bit address
+        }
         assert_eq!(d("410fae5c2408", 0xae), Some(mem(STMXCSR, 12, 8, 6))); // stmxcsr [r12+8]
         assert_eq!(d("640fae18", 0xae), Some(System { fs_gs: 4, ..mem(STMXCSR, 0, 0, 4) })); // stmxcsr fs:[rax]
         for hex in ["660fae10", "0fae20", "f30fae10", "670fae10"] {

@@ -150,3 +150,19 @@ inline std::set<uint64_t> fexc_align16;
 // RSQRTPS/RSQRTSS raise none (FEX divides exactly: FPSR is saved and restored around the op); ROUNDPS/PD/SS/SD with imm8
 // bit 3 clear raise PE when inexact (`frintx`, under the instruction's rounding mode when imm8 bit 2 is clear).
 inline std::set<uint64_t> fexc_fp_signal, fexc_fp_quiet, fexc_round_inexact;
+// Profile slice1 (M3), recorded by the allowlist: guest RIP of each MOV-family instruction -> its completion record for a
+// device access (shim/fexc_mmio.inc); fexc.cpp attaches it to the instruction's one load or store site.
+inline std::map<uint64_t, uint32_t> fexc_mmio;
+// Profile slice1 (I6): x87 in FEX's reduced-precision mode (X87REDUCEDPRECISION, set by fexc for slice1): ST(i) as doubles in
+// the guest-state page (`mm[i]`, low 8 bytes), TOP/C0..C3 in FEX's flag bytes, FCW and the abridged tag word in their FEX
+// fields. From the host: `--x87-gated` (CR0.EM or CR0.TS) cuts every x87 form d8..df as a system instruction (#NM),
+// `--wait-gated` (CR0.TS and CR0.MP) cuts WAIT/FWAIT (9b) likewise; `--x87-fpcr V` (V nonzero) is the FPCR x87 arithmetic
+// runs under (FCW.RC, no flush to zero) when it differs from MXCSR's (the resident enters blocks with MXCSR's FPCR).
+inline bool fexc_x87_gated = false, fexc_wait_gated = false;
+inline uint64_t fexc_x87_fpcr = 0;
+// Profile slice1 (I6), recorded by the allowlist: guest RIP of each admitted x87 instruction. Its floating-point ops run
+// with FPSR cleared (MXCSR's flags saved around them) and, with `fexc_x87_fpcr`, under that FPCR; the cumulative FPSR flags
+// they raise are or-ed into the x87 exception word at FEXC_X87_EXCEPTIONS (a guest-state field in FEX's CPUState padding
+// after AbridgedFTW: FPSR bit order, IOC IE, DZC ZE, OFC OE, UFC UE, IXC PE, IDC DE; bit 6 is the resident's stack fault SF).
+inline std::set<uint64_t> fexc_x87;
+constexpr uint32_t FEXC_X87_EXCEPTIONS = 0x4b4;

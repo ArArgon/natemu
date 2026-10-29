@@ -19,9 +19,11 @@ use super::*;
 use crate::cache::{self, Block};
 mod delivery;
 mod events;
+mod mmio;
 mod segments;
 mod sse;
 mod syscalls;
+mod x87;
 use delivery::{Event, deliver};
 use natemu_abi::{
     code_object::{self as object, Header, Site},
@@ -500,6 +502,8 @@ unsafe fn enter(mut s: State, block: &Block) -> ! {
         // SAFETY: as above; the fields are 8-byte aligned (abi `guest_state_page_layout`).
         unsafe { (FRAME_VA as *mut u64).byte_add(at as usize).write_volatile(base) };
     }
+    // I6: FCW, which FNSTCW reads there; like the bases, never read back.
+    unsafe { (FRAME_VA as *mut u16).byte_add(frame::X87_FCW as usize).write_volatile(s.cpu.fcw as u16) };
     let mut f = NativeFrame::ZERO;
     for (&reg, &value) in SRA.iter().zip(&s.cpu.gpr) {
         f.x[reg as usize] = value;
@@ -842,6 +846,11 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         }
         system::LDMXCSR | system::STMXCSR | system::SSE_GATED => {
             sse::transaction(s, i)?;
+            return Ok(commit(s, i, false));
+        }
+        // I6: the resident's x87 forms and a gated x87 form or WAIT (#NM).
+        system::X87_GATED..=system::FSTP80 => {
+            x87::transaction(s, i)?;
             return Ok(commit(s, i, false));
         }
         // S3: each checks its own privilege ([`syscalls`]); SYSCALL/SYSRET commit to their target RIP.
@@ -1208,14 +1217,29 @@ fn step_from(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
 fn step(mut s: State) -> ! {
     loop {
         s.steps += 1;
-        let h = match unsafe { request(&mut s, REQUEST_STEP) } {
+        let reply = unsafe { request(&mut s, REQUEST_STEP) };
+        s.plain_step = 0;
+        let h = match reply {
             Reply::Block(h) => h,
             // Its fetch faults (a peer changed the tables): delivered, and the handler's first instruction is stepped.
             Reply::Fault(fault) => {
                 deliver(&mut s, Event::Exception(fault));
                 continue;
             }
-            Reply::System(_) => halt(&s, stop::BAD_REPLY),
+            // A system instruction (a peer replaced the instruction, e.g. by an INT3 as Linux's text_poke_bp does): executed
+            // as `find` executes it, then the next boundary is `find`'s (events a POPF, IRET or STI made eligible, invalidations),
+            // unless a BT* form found aligned must run itself, compiled plain.
+            Reply::System(instruction) => {
+                system(&mut s, instruction);
+                if s.plain_step != 0 {
+                    continue;
+                }
+                // (In this loop, not through `dispatch`, which would recurse into `step`: `None` steps the next instruction.)
+                match unsafe { find(&mut s) } {
+                    Some(block) => unsafe { enter(s, block) },
+                    None => continue,
+                }
+            }
         };
         let context = s.cpu.code_context();
         match cache::place_step(&h, STAGING_VA as *const u8, context, s.source_gpa, s.link_points, s.dispatch_exit, s.rep_exits) {
@@ -1275,7 +1299,8 @@ impl CodePages for DataWrites<'_> {
 /// Walks `va` with `access` for the guest instruction at `site` of `b` and shadows the page; a guest
 /// fault stops with the precise state. Returns the guest-physical address of `va`, or `None` when the
 /// walk kept losing A/D races to peers (nothing installed: the caller resumes the instruction, which
-/// faults and walks again, as x86 re-walks). Translated pages are shadowed read-only whatever the
+/// faults and walks again, as x86 re-walks). A device page (not guest RAM) is walked but not shadowed: its address is
+/// returned for the device path. Translated pages are shadowed read-only whatever the
 /// walk grants; a write to one, or an A/D update in one, takes [`code_written`] first (which may step
 /// the instruction instead of returning), and each A/D update is re-checked after it is made.
 fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, access: Access) -> Option<u64> {
@@ -1284,6 +1309,9 @@ fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, ac
     };
     let walk = paging::walk(&mut GuestTables::observed(RAM, CodeWrites(DataWrites { s: &mut *s, f, b, site })), control, va, access);
     match walk {
+        // M3: a page that is not guest RAM is a device page whatever its memory type (device ranges are uncached): never
+        // shadowed; the caller completes the access through the device path ([`mmio::device`]).
+        Ok(t) if !mmio::ram(t.gpa) => Some(t.gpa),
         Ok(t) if t.wb => {
             let writable = access == Access::Write && t.writable && t.dirty;
             // As a mark is set before the writable bits are read ([`mark`]), the writable bit is set before the marks
@@ -1437,14 +1465,21 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
     }
     let access = if write { Access::Write } else { Access::Read };
     // Every page the access touches, in address order, before the retry. A contended walk resumes at once, outside
-    // the no-progress test (the abort repeats until the walk wins; the watchdog contains a livelock).
-    for va in touched.into_iter().flatten() {
-        if translate(&mut s, f, b, site, va, access).is_none() {
-            unsafe {
+    // the no-progress test (the abort repeats until the walk wins; the watchdog contains a livelock). M3: a device page
+    // among them (walked, so every fault it owes came first) takes the device path instead of a retry.
+    let mut device = [None; 2];
+    for (k, va) in touched.into_iter().flatten().enumerate() {
+        match translate(&mut s, f, b, site, va, access) {
+            None => unsafe {
                 write_record(record(), s);
                 resume(&s, &raw const (*shared()).captured, elr, spsr)
-            }
+            },
+            Some(gpa) if !mmio::ram(gpa) => device[k] = Some(gpa),
+            Some(_) => {}
         }
+    }
+    if device != [None; 2] {
+        mmio::device(s, f, b, site, device[0].filter(|_| touched[1].is_none()))
     }
     s.last_retry = [elr, far, tables::descriptor(s.cpu.cpl, far), s.shadow_generation];
     s.retries += 1;
@@ -1487,6 +1522,10 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
             resume(&s, &raw const (*shared()).captured, b.code_va() + stub.native_offset as u64, spsr)
         }
     };
+    // M3: a page-crossing store with a device page on either side is refused (both pages walked first).
+    if !mmio::ram(gpa0) || !mmio::ram(gpa1) {
+        mmio::refuse(s, f, b, stub, natemu_abi::execution::mmio::CROSSING)
+    }
     let gpa = [gpa0, gpa1];
     // One data register: a general one, or the low `width` bytes of a vector one (I5a); or MOVAPS m128's X-register pair
     // (I5a, `STORE_PAIR`: aligned, so it never crosses a page, but completed alike).

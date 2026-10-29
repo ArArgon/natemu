@@ -559,6 +559,25 @@ pub(crate) struct Compiler {
     /// The vCPU runs under alignment checking (X2: CR0.AM, RFLAGS.AC, CPL 3): fexc cuts every BT* memory form as a system
     /// instruction, which the resident checks for #AC and then steps compiled without it (`State::plain_step`).
     pub(crate) alignment_gated: bool,
+    /// The vCPU's x87 gating and rounding (I6, [`x87_args`]): fexc's `--x87-gated`, `--wait-gated` and `--x87-fpcr` arguments.
+    pub(crate) x87: Vec<String>,
+}
+/// fexc's x87 arguments for `cpu` (I6; SDM Vol.3 Table 2-2): every x87 form #NM under CR0.EM or CR0.TS, WAIT/FWAIT under CR0.TS
+/// with CR0.MP; x87 arithmetic under its own FPCR when FCW.RC or MXCSR's flush-to-zero/DAZ differ ([`exec::x87_fpcr`]). The
+/// same state is part of `Cpu::code_context`.
+pub(crate) fn x87_args(cpu: &exec::Cpu) -> Vec<String> {
+    let mut args = vec![];
+    if cpu.cr0 & (exec::CR0_EM | exec::CR0_TS) != 0 {
+        args.push("--x87-gated".into());
+    }
+    if cpu.cr0 & (exec::CR0_TS | exec::CR0_MP) == exec::CR0_TS | exec::CR0_MP {
+        args.push("--wait-gated".into());
+    }
+    match exec::x87_fpcr(cpu.fcw, cpu.mxcsr) {
+        0 => {}
+        fpcr => args.extend(["--x87-fpcr".into(), format!("{fpcr:#x}")]),
+    }
+    args
 }
 /// Whether `cpu`'s controls gate SSE instructions (SDM Vol.3 Table 2-2, Vol.2 2.5: #UD with CR0.EM or without CR4.OSFXSR,
 /// #NM with CR0.TS). Blocks are made under one gating state: every CR0/CR4 change drops the vCPU's code.
@@ -578,7 +597,7 @@ impl Compiler {
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
         Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), compiles: 0, hits: 0, tamper: None, deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, signal_at: None,
-               shape: false, sse_gated: false, alignment_gated: false }
+               shape: false, sse_gated: false, alignment_gated: false, x87: vec![] }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
     /// `rip` the resident executes, or fexc's end reason when it produced no code.
@@ -596,6 +615,7 @@ impl Compiler {
         if self.alignment_gated {
             args.push("--alignment-gated".into());
         }
+        args.extend(self.x87.iter().cloned());
         let args: Vec<u8> = args.iter().flat_map(|a| a.bytes().chain([0])).collect();
         let mut body = (args.len() as u32).to_le_bytes().to_vec();
         body.extend(args);
@@ -629,9 +649,13 @@ impl Compiler {
                     let reason = end_reason(&json).ok_or("fexc report without guest.end.reason")?;
                     let decoded = |(map, opcode)| crate::system::decode(bytes, map, opcode).or_else(|| crate::system::lock_ud(bytes));
                     // An SSE form cut by its gating (I5a): no operand matters, the resident raises #UD or #NM.
-                    let gated = || Some(exec::System { kind: exec::system::SSE_GATED, length: 1, ..exec::System::NONE });
+                    // I6: an x87 form or WAIT (primary d8..df, 9b) cut by its gating: #NM.
+                    let gated = |(map, op): (u8, u8)| {
+                        let x87 = map == 0 && matches!(op, 0xd8..=0xdf | 0x9b);
+                        Some(exec::System { kind: if x87 { exec::system::X87_GATED } else { exec::system::SSE_GATED }, length: 1, ..exec::System::NONE })
+                    };
                     let gated_cut = json.get("guest").and_then(|g| g.get("end")).and_then(|e| e.get("cut_gated")).is_some();
-                    match system_cut(&json, rip).and_then(|cut| if gated_cut { gated() } else { decoded(cut) }) {
+                    match system_cut(&json, rip).and_then(|cut| if gated_cut { gated(cut) } else { decoded(cut) }) {
                         Some(s) if reason == "system_instruction" => Compiled::System(s),
                         _ => Compiled::NoCode(reason.into()),
                     }
@@ -730,6 +754,8 @@ pub(crate) struct Requests {
     /// or decode in place but not yet seen by the resident, until it returns true (it corrupted something, possibly the
     /// reply kind); then `tampered` is set. Checks the resident's run-time defences.
     pub(crate) tamper: Option<fn(Area, &mut State) -> bool>,
+    /// The same for device replies (M3), only.
+    pub(crate) tamper_device: Option<fn(Area, &mut State) -> bool>,
     pub(crate) tampered: bool,
     /// Test drivers only: RIPs whose one-byte instruction is executed as a CPL change to the value
     /// ([`exec::system::SET_CPL`]); blocks are fetched up to each, so it is reached at a block boundary.
@@ -742,6 +768,8 @@ pub(crate) struct Requests {
     /// [`exec::system::EVENT_HOOK`]; blocks are fetched up to each, as for `switches`.
     pub(crate) posts: std::collections::BTreeMap<u64, u64>,
     pub(crate) doorbell: Option<crate::vm::Doorbell>,
+    /// M3: the VM's device ranges (shared by every vCPU thread; see [`crate::devices`]).
+    pub(crate) devices: Option<std::sync::Arc<crate::devices::Devices>>,
 }
 
 /// Runs the vCPU (entered at the resident, see [`enter`]) until it stops; `stop_at` is a RIP at
@@ -843,6 +871,21 @@ fn serve(
         let step = match state.request {
             exec::REQUEST_TRANSLATE => false,
             exec::REQUEST_STEP => true,
+            // M3: a device access, completed (or refused) once; never parked (test drivers may tamper with the reply).
+            exec::REQUEST_DEVICE => {
+                // A peer failed after this exit: the device is not accessed (the vCPU ends with the access undone).
+                if cancelled.load(SeqCst) {
+                    return Ok(Stop::Cancelled);
+                }
+                crate::devices::serve(area, &mut state, requests.devices.as_deref());
+                if let Some(tamper) = requests.tamper_device {
+                    if tamper(area, &mut state) {
+                        (requests.tamper_device, requests.tampered) = (None, true);
+                    }
+                }
+                area.write_record(exec::STATE_OFFSET, state);
+                continue;
+            }
             _ => return Err("translation exit without a request".into()),
         };
         state.reply = match translation(area, compiler, &mut state, step, stop_at, requests)? {
@@ -899,6 +942,7 @@ fn translation(
         Err(stop) => return Ok(Err(stop)),
     };
     compiler.sse_gated = sse_gated(&state.cpu);
+    compiler.x87 = x87_args(&state.cpu);
     compiler.alignment_gated = state.cpu.alignment_check() && !(step && state.plain_step != 0);
     let code = compiler.compile(&bytes, rip, step)?;
     let ran_out = match &code {
@@ -996,7 +1040,7 @@ mod tests {
         let ram = guest_ram(&memory);
         assert!(ram.copy_in(0x5ff0, &[0xaa; 16]) && ram.copy_in(0x9000, &[0xbb; 16]));
         let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0 };
-        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1ff0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET });
+        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1ff0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, fcw: exec::FCW_INIT });
         s.fetch = [0x5000, u64::MAX];
         let f = fetched(area, &s, None).unwrap().unwrap();
         assert_eq!((f.bytes, f.more, f.next_fault), (vec![0xaa; 16], true, None));

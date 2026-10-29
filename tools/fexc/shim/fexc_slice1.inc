@@ -17,7 +17,9 @@ using namespace FEXCore::X86Tables;
 
 enum Kind : uint8_t { ALLOW, SYSTEM, UNSUPPORTED };
 // `simd`: an SSE form, gated by CR0.EM/TS and CR4.OSFXSR (I5a); `align`: its 16-byte memory operand must be 16-byte aligned.
-struct Verdict { Kind kind; bool branch; const char* why; bool simd = false; bool align = false; };
+// `x87` (I6): 1 = a documented x87 form (d8..df: #NM under CR0.EM or CR0.TS whatever else it is), 2 = WAIT/FWAIT (9b: #NM
+// under CR0.TS with CR0.MP). `gated`: cut because of that gating (the host's `cut_gated`).
+struct Verdict { Kind kind; bool branch; const char* why; bool simd = false; bool align = false; uint8_t x87 = 0; bool gated = false; };
 
 inline Verdict Allow(bool branch = false) { return {ALLOW, branch, ""}; }
 inline Verdict Sys(const char* why) { return {SYSTEM, false, why}; }
@@ -205,6 +207,50 @@ inline Verdict Sse(uint8_t map, uint8_t pfx, uint8_t op, bool has_modrm, uint8_t
   return v;
 }
 
+// x87 (I6), FEX's reduced-precision mode (doubles). `modrm` is the byte after d8..df. Admitted: loads, stores and integer
+// conversions at every width but m80, the arithmetic and compares (FCOM forms compare signalling, as COMISS), FXCH, FCMOV,
+// constants, FCHS/FABS/FSQRT/FRNDINT, FXAM (patch 0019: x86's classes of a double), FINCSTP/FDECSTP/FFREE/FNOP, FNSTSW and FNSTCW. The resident's (system cuts): FNINIT,
+// FNCLEX, FLDCW, FLDENV/FNSTENV, FRSTOR/FNSAVE and FLD/FSTP m80 (FCW, the environment, 80-bit images). Refused: the
+// transcendental, remainder and scale forms (FEX calls a host libm helper there), FBLD/FBSTP (a host helper), FXTRACT (FEX's split is wrong for a denormal double), the 287 no-ops FENI/FDISI/
+// FSETPM, and the undocumented aliases (DC D0/D8, DD C8, DE D0, DF C0..DF) and reserved encodings.
+inline Verdict X87(uint8_t op, uint8_t modrm) {
+  const uint8_t mod = modrm >> 6, reg = (modrm >> 3) & 7;
+  const Verdict ok = Allow(), res = Sys("x87 control or state instruction (the resident's: FCW, environment, 80-bit image)");
+  const Verdict helper = Uns("x87 transcendental, remainder or scale (FEX's reduced-precision mode calls a host libm helper)");
+  const Verdict alias = Uns("undocumented or reserved x87 encoding");
+  if (mod != 3) {
+    switch (op) {
+    case 0xD8: case 0xDA: case 0xDC: case 0xDE: return ok;                       // arithmetic/compare with m32fp, m32int, m64fp, m16int
+    case 0xD9: return reg == 1 ? alias : (reg >= 4 && reg <= 6) ? res : ok;      // fld/fst/fstp m32, fnstcw; fldenv, fldcw, fnstenv
+    case 0xDB: return (reg == 4 || reg == 6) ? alias : (reg == 5 || reg == 7) ? res : ok;   // fild/fisttp/fist/fistp m32; fld/fstp m80
+    case 0xDD: return reg == 5 ? alias : (reg == 4 || reg == 6) ? res : ok;      // fld/fisttp/fst/fstp m64, fnstsw m16; frstor, fnsave
+    default: return (reg == 4 || reg == 6) ? Uns("fbld/fbstp (FEX calls a host helper for BCD)") : ok;   // df: fild/fisttp/fist/fistp m16, fild/fistp m64
+    }
+  }
+  switch (op) {
+  case 0xD8: return ok;                                                        // fadd..fdivr st0, st(i); fcom/fcomp st(i)
+  case 0xD9:
+    if (reg <= 1 || modrm == 0xD0) return ok;                                    // fld st(i), fxch st(i), fnop
+    switch (modrm) {
+    case 0xE0: case 0xE1: case 0xE4: case 0xE5: case 0xF6: case 0xF7: case 0xFA: case 0xFC: return ok;   // fchs fabs ftst fxam fdecstp fincstp fsqrt frndint
+    case 0xE8: case 0xE9: case 0xEA: case 0xEB: case 0xEC: case 0xED: case 0xEE: return ok;   // fld1 fldl2t fldl2e fldpi fldlg2 fldln2 fldz
+    case 0xF4: return Uns("fxtract (FEX's reduced-precision split is wrong for a denormal double)");
+    case 0xF0: case 0xF1: case 0xF2: case 0xF3: case 0xF5: case 0xF8: case 0xF9: case 0xFB: case 0xFD: case 0xFE: case 0xFF: return helper;
+    default: return alias;
+    }
+  case 0xDA: return reg <= 3 || modrm == 0xE9 ? ok : alias;                    // fcmovb/e/be/u, fucompp
+  case 0xDB:
+    if (reg <= 3 || reg == 5 || reg == 6) return ok;                             // fcmovnb/ne/nbe/nu, fucomi, fcomi
+    if (modrm == 0xE2 || modrm == 0xE3) return res;                              // fnclex, fninit
+    if (modrm == 0xE0 || modrm == 0xE1 || modrm == 0xE4) return Uns("feni/fdisi/fsetpm (8087/287 no-ops)");
+    return alias;
+  case 0xDC: return reg == 2 || reg == 3 ? alias : ok;                         // fadd..fdiv st(i), st0
+  case 0xDD: return reg == 1 || reg >= 6 ? alias : ok;                         // ffree, fst/fstp st(i), fucom/fucomp
+  case 0xDE: return reg == 2 || (reg == 3 && modrm != 0xD9) ? alias : ok;      // faddp fmulp fcompp fsubrp fsubp fdivrp fdivp
+  default: return modrm == 0xE0 || reg == 5 || reg == 6 ? ok : alias;          // df: fnstsw ax, fucomip, fcomip
+  }
+}
+
 // LOCK (SDM Vol.2 "LOCK"): allowed only on the memory-destination forms of ADD, ADC, AND, BTC, BTR, BTS, CMPXCHG,
 // CMPXCHG8B/16B, DEC, INC, NEG, NOT, OR, SBB, SUB, XOR, XADD and XCHG; on any other instruction, or one of these with a
 // register destination, it raises #UD.
@@ -269,6 +315,19 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
       v = Uns("insertps m32 whose zero mask clears the inserted element (FEX drops the load and its #PF)");
     // LDMXCSR/STMXCSR m32 (0f ae /2, /3): MXCSR is the resident's (its gating, #GP for reserved bits, the exception flags).
     if (d.FexcMap == FEXC_MAP_TWO && op == 0xAE && has_modrm && mod != 3 && (reg == 2 || reg == 3)) return Sys("ldmxcsr/stmxcsr");
+  }
+  // x87 (I6): d8..df with their ModRM, WAIT/FWAIT. A documented form is cut as gated under CR0.EM/TS (#NM comes first,
+  // whatever else the form is), WAIT under CR0.TS with CR0.MP; the prefixes are checked below as for any admitted form.
+  if (d.FexcMap == FEXC_MAP_PRIMARY && ((op >= 0xD8 && op <= 0xDF && has_modrm) || op == 0x9B)) {
+    v = op == 0x9B ? Allow() : X87(op, d.ModRM);
+    v.x87 = op == 0x9B ? 2 : v.why && std::string_view(v.why).starts_with("undocumented") ? 0 : 1;
+    if ((v.x87 == 1 && fexc_x87_gated) || (v.x87 == 2 && fexc_wait_gated)) {
+      v = Sys(v.x87 == 1 ? "x87 instruction under CR0.EM or CR0.TS (#NM)" : "wait under CR0.TS and CR0.MP (#NM)");
+      v.gated = true;
+      return v;
+    }
+    if (v.kind == ALLOW && (f & (DecodeFlags::FLAG_OPERAND_SIZE | DecodeFlags::FLAG_REP_PREFIX | DecodeFlags::FLAG_REPNE_PREFIX)))
+      v = Uns("66/F2/F3 prefix on an x87 form");
   }
   if (v.why == nullptr) switch (d.FexcMap) {
   case FEXC_MAP_PRIMARY: v = Primary(op, has_modrm, mod, reg); break;
@@ -382,6 +441,8 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
 // The one place the cut is decided. `last` = this is the last decoded instruction of its block, whose decode
 // status is `status`; `first` = no instruction of the block was translated yet. Returns false to translate the
 // instruction (and, mid-block, to let FEX end the block at a decoder end-of-input status with its own reason).
+#include <fexc_mmio.inc>
+
 inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, bool first, const DecodedInst& d, uint64_t rip) {
   using S = Frontend::Decoder::DecodedBlockStatus;
   // A REP string instruction (I2) or a LOCK NEG (I3) ends its block: the next instruction starts the next block.
@@ -413,6 +474,19 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
                           (d.Flags & DecodeFlags::FLAG_LOCK);
     if (lock_neg) fexc_after_rep = rip + d.InstSize;
     if (v.align) fexc_align16.insert(rip);   // I5a: its first access gets the alignment check (#GP(0))
+    FexcMmioRecord(d, rip);                  // M3: completion record of a MOV-family device access
+    if (v.x87 == 1) {   // I6: FSW exception flags from FPSR, the x87 FPCR; FCOM forms and FTST signal, FIST/FRNDINT raise PE
+      const uint8_t m = d.ModRM, r = (m >> 3) & 7;
+      fexc_x87.insert(rip);
+      const bool memory = (m >> 6) != 3;
+      const bool fcom_m = memory && (op == 0xD8 || op == 0xDA || op == 0xDC || op == 0xDE) && (r == 2 || r == 3);   // fcom(p)/ficom(p) m
+      const bool fcom_r = !memory && ((op == 0xD8 && (r == 2 || r == 3)) || (op == 0xDE && m == 0xD9) || ((op == 0xDB || op == 0xDF) && r == 6));
+      if (fcom_m || fcom_r || (op == 0xD9 && m == 0xE4))   // + fcompp, fcomi(p), ftst
+        fexc_fp_signal.insert(rip);
+      // fistp m64 and frndint: frintx (PE); m16/m32 FIST computes PE itself (patch 0019: none beside an out-of-range IE)
+      if ((memory && op == 0xDF && r == 7) || (op == 0xD9 && m == 0xFC))
+        fexc_round_inexact.insert(rip);
+    }
     if (v.simd) {   // I5a: the MXCSR flags FEX's lowering would get wrong (fexc_hook.h)
       const uint8_t* b = fexc_guest_bytes(d.PC, d.InstSize);
       if (d.FexcMap == FEXC_MAP_TWO || d.FexcMap == FEXC_MAP_TWO_66) { if (op == 0x2F) fexc_fp_signal.insert(rip); }
@@ -424,7 +498,7 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
   }
   fexc_cut = {v.kind == SYSTEM ? FEXC_CUT_SYSTEM : FEXC_CUT_UNSUPPORTED, rip, d.FexcMap, d.FexcMap == FEXC_MAP_VEX ? d.FexcVexOp : d.OPRaw, d.ModRM,
               bool(d.Flags & DecodeFlags::FLAG_DECODED_MODRM), d.TableInfo && d.TableInfo->Name ? d.TableInfo->Name : "?", v.why};
-  fexc_cut.gated = v.kind == SYSTEM && v.simd;
+  fexc_cut.gated = v.kind == SYSTEM && (v.simd || v.gated);
   return true;
 }
 } // namespace FexcSlice1

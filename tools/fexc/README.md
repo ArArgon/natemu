@@ -26,10 +26,25 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as eighteen commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as nineteen commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series22` (X2, October 29: series21-s3 plus a shim
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series25` (I6 after review and M3, October 29: patches
+0001-0019 and the tree's shim, which holds I6's hunks and M3's `fexc_mmio.inc` completion records. Previous:
+`series24-i6` (I6 before review: series23-i6's sources plus
+x87 stack faults with their masked response in patch 0019; built from an I6-only copy of the shim in `series24-i6/fexc-tools`,
+without M3's in-progress hunks. Previous: `series23-i6` (I6, October 29: series22 plus patch
+0019 and shim changes: x87 in FEX's reduced-precision mode, which `--profile slice1` now sets (`X87REDUCEDPRECISION`). The
+allowlist's `X87` table admits the x87 forms whose reduced-precision lowering is native code and cuts the resident's
+(FNINIT, FNCLEX, FLDCW, FLDENV/FNSTENV, FRSTOR/FNSAVE, FLD/FSTP m80) as system instructions; transcendental, remainder and
+scale forms (host libm helpers), FBLD/FBSTP, FXAM, FXTRACT, the 287 no-ops and undocumented aliases are `unsupported_form`.
+`--x87-gated` (CR0.EM or TS) and `--wait-gated` (TS with MP) cut x87 forms and WAIT as gated (`cut_gated`, #NM); `--x87-fpcr V`
+runs x87 arithmetic under FPCR V when FCW.RC or MXCSR's FTZ/DAZ differ. The JIT wraps every floating-point op of an x87
+instruction (`FexcX87Op`): FPSR cleared before it (MXCSR's flags kept in x3), its flags OR-ed into the x87 exception word at
+x28 + 0x4b4 after it. Patch 0019: the x87 stack pass on its slow path, stack faults (underflow/overflow: the indefinite, IE, SF, C1) with a flush after every op (the state is in the
+guest-state page at every boundary), TOP masked, ST(i) as context-indexed accesses; FIST/FISTP/FISTTP with x86's integer
+indefinite; FNSTSW's exception flags from the exception word. Boot-features plan, Built (I6).) Previous tree:
+`series22` (X2, October 29: series21-s3 plus a shim
 change, no new patch: `--alignment-gated`, the host's when the vCPU runs under x86 alignment checking (CR0.AM, RFLAGS.AC, CPL
 3), cuts BT/BTS/BTR/BTC with a memory operand (`0f a3/ab/b3/bb`, `0f ba /4../7`) as system instructions: FEX touches only the
 byte holding the bit, so the resident checks the operand's alignment (#AC) and steps it compiled without the flag). Previous
@@ -150,6 +165,9 @@ Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--v
 | 0014 | slice1 no coalescing of a value stored twice to one static register (the later store was a self-move without a native write) |
 | 0015 | slice1 string instructions one element per pass (`FexcStringOp`; REP exits to its own RIP), `fexc_movs` for the site recorder |
 | 0016 | slice1 LOCK forms: LOCK NEG as one compare-and-swap attempt (`FexcLockNeg`, an exit to its own RIP on a lost race), `dmb ish` before LOCK CMPXCHG*'s CAS, swap/fetch-and-op results never preferred into a static register, no pooled constant across a LOCK instruction |
+| 0017 | slice1 I5a SSE: sites, vector constants in their register, MXCSR flags as x86 raises them |
+| 0018 | slice1 I5a after review: MOVAPS/MOVAPD/MOVDQA m128 as one aligned LDP/STP, DPPS/DPPD flags, a dead FCmp kept |
+| 0019 | slice1 I6 x87 reduced precision: the x87 stack pass on its slow path, flushed after every op, TOP masked, ST(i) as context-indexed accesses; stack faults with their masked response (the indefinite, IE, SF, C1); C1 on pushes, FCHS/FABS and FCOMI; FCHS/FABS as sign-bit operations; FLD m64 and FST m64 quieting an SNaN (IE; FLD m64's DE); FIST/FISTP/FISTTP with the integer indefinite (flag-free); FXAM's classes; FNSTSW's exception flags from the x87 exception word and FEX's IE, PE and SF bytes |
 
 Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in `shim/` and `fexc.cpp`; the patches only
 include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then
@@ -428,7 +446,7 @@ the x86 addressing form come from FEX's own decode of the instruction.
 | field | meaning |
 |---|---|
 | `native_offset` | the faulting native instruction (last load/store-class word of the op's range with a base other than x28/sp) |
-| `guest_offset`, `guest_offset2` | guest instruction(s), offset from the block RIP; `guest_offset2` only for fused pairs |
+| `guest_offset`, `guest_offset2` | guest instruction(s), offset from the block RIP; `guest_offset2` only for fused pairs (binary object, since series23-m3: a load/store site's M3 completion record, JSON `mmio`; `shim/fexc_mmio.inc`) |
 | `insn_native_offset` | native offset where that guest instruction's translation starts (its PC-table entry) |
 | `ir_op` | FEX IR op (diagnostic) |
 | `kind` | `load`, `store`, `load_pair`, `store_pair`, `push`, `pop`, `push_pair`, `pop_pair`, `other` (a guest-memory IR op the record cannot describe: a consumer must refuse it); `guard`, `split`: slice1 check stubs (see "Guards (S1b2)") |

@@ -38,6 +38,8 @@ and runtime; contract-by-contract mapping: [contracts.md](contracts.md), "Genera
 | `tools/run_slice2_vm.py`, `run_slice2_faults.py`, `run_slice2_probes.py` | control flow (64 × 3 block sizes), faults inside loops (846 × 3), code-cache/SMC probes (85) |
 | `tools/fexc/upstream_tests/run_asm.py` | FEX's ASM suite (235 admitted tests; 372 since I1, 376 after I7, 443 since I2, 480 since I3, 781 since I5a) |
 | `tools/run_slice3_vm.py MODE` | `corpora`, `smp`, `limits`, `kicks`, `system`, `coherence`, `sharedpt`, `litmus`, `contain`, `privilege` (U1), `delivery` (X1a), `events` (X2: interrupt eligibility, shadows, POPF, HLT, NMI, #AC; QEMU x2APIC programs, natemu-only cases, random-time stress) |
+| `tools/run_i6_faults.py` | I6 x87: gating (#NM), precise faults with the x87 state unchanged, refusals, FXAM classes, FIST indefinite, MXCSR isolation, Linux's FPU probes (SDM rules; `--max-block 1` too); the x87 QEMU corpus is `tools/reference/gen_i6.py` + `ref.py` + `run_slice1_vm.py` |
+| `tools/run_m3.py` | M3 device pages: MOV-family corpus vs QEMU (on RAM) and `tools/models/mmio_model.py`, fault priority, refused forms, exactly-once under kicks at 1-4 vCPUs, a tampered reply, cross-modifying code at a device access (needs series23-m3) |
 | `tools/check_resident_stack.py` | resident stack bound and gate/ERET binary shape of the built runtime |
 | `tools/models/` | independent ordering, coherence, PAE and modes models (used by the runners) |
 
@@ -47,7 +49,7 @@ the phase-end ones):
 ```sh
 # From the repository root; works in zsh and bash (no word-splitting of variables; run in full under zsh and
 # argument-checked under bash at the phase end).
-F=../natemu-raw/fexc-native-20261026-01/series22/obj/fexc   # tools/fexc/build.sh rebuilds it; S3's `system` programs (RDRAND/RDSEED/RDPID) need series21-s3 or later, X2's BT* #AC cases series22
+F=../natemu-raw/fexc-native-20261026-01/series25/obj/fexc   # tools/fexc/build.sh rebuilds it; S3's `system` programs (RDRAND/RDSEED/RDPID) need series21-s3 or later, X2's BT* #AC cases series22; since I6 the host passes x87 arguments; series25 is the combined I6 + M3 build
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 O=../natemu-raw/suite-$(date +%Y%m%d-%H%M%S)                  # a fresh output directory
@@ -79,6 +81,9 @@ s3 --out "$O/contain" contain
 s3 --out "$O/privilege" privilege
 s3 --out "$O/delivery" delivery                               # X1a: nested faults, #DF, shutdown, gates (delivery_model)
 s3 --out "$O/events" events --kicks 2000                       # X2: eligibility, shadows, POPF, HLT, NMI, #AC, stress (delivery_model)
+tools/with-env python3 tools/run_i6_faults.py --fexc "$F" --out "$O/i6-faults"                  # I6: x87 gating, faults, refusals
+tools/with-env python3 tools/run_i6_faults.py --fexc "$F" --out "$O/i6-faults-1" --max-block 1
+tools/with-env python3 tools/run_m3.py --fexc "$F" --out "$O/m3"   # M3: device pages (QEMU via Docker, mmio_model, kicks)
 ```
 
 QEMU references run in the pinned container image (`tools/reference/ref.py` holds the pins) or Homebrew
@@ -93,7 +98,7 @@ QEMU references run in the pinned container image (`tools/reference/ref.py` hold
 | System | MOV CR0 (WP), CR3, CR4 (PGE, SMEP), MOV from CR0/CR3/CR4, INVLPG, RDMSR/WRMSR EFER | Everything else: §3 (`unsupported_system`, #GP or #UD per the model) |
 | Paging | Four-level, 4 KiB and 2 MiB pages, WP, NXE, SMEP, A/D per SDM with a declared fault-path policy (leaf A only after the permission check) | 1 GiB pages, PCID, SMAP, LA57, PWT/PCD/PAT memory types (halt), MAXPHYADDR above 40 |
 | vCPUs | 1–4 (`MAX_VCPUS`). N = 0 cannot be described; `execution::prepare` refuses it (unit test); 5 is refused (`limits`) | APIC, IPIs, INIT/SIPI |
-| Memory | Guest RAM 4 MiB (`GUEST_RAM_BYTES`), guest-physical from 0; 32 shadow-table pool pages per vCPU (reset on exhaustion) | Devices, MMIO, holes; host writes only with every vCPU stopped |
+| Memory | Guest RAM 4 MiB (`GUEST_RAM_BYTES`), guest-physical from 0; 32 shadow-table pool pages per vCPU (reset on exhaustion); since M3 device pages above RAM: MOV-family loads and stores of 1-8 bytes completed once from their sites' completion records through the host's device registry (fexc series23-m3; boot-features plan, Built (M3)) | Other forms on device pages (`unsupported_mmio`), holes; host writes only with every vCPU stopped |
 | Faults | Precise guest faults reported as a stop (vector, error, CR2, banked state) | Delivery to the guest (no IDT); the run ends at the fault |
 | Atomicity | Aligned 1–8 bytes and unaligned within 16 bytes single-copy atomic | Non-LOCKed access crossing 16 bytes inside a line may tear for peers (owner decision 2) |
 

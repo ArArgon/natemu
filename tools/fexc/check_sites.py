@@ -136,6 +136,9 @@ def expected(asm):
         if i == 0 and mn not in ('ptest', 'comiss', 'ucomiss', 'comisd', 'ucomisd', 'crc32'):
             return [('store', w)]
         return [('load', w)]
+    # I6: an x87 memory form loads its operand, but the stores (FST/FSTP/FIST/FISTP/FISTTP, FNSTSW/FNSTCW m16).
+    if mn.startswith('f'):
+        return [('store' if mn in ('fst', 'fstp', 'fist', 'fistp', 'fisttp', 'fnstsw', 'fnstcw') else 'load', w)]
     if i > 0:
         return [('load', w)]
     if mn in ('mov', 'movabs', 'movnti') or mn.startswith('set'):
@@ -145,6 +148,11 @@ def expected(asm):
     if mn in LOAD_DST or mn in LOAD_ONLY_1OP:
         return [('load', w)]
     return None
+
+
+def x87_slot(dis, off):
+    """I6: the access at `off` is an x87 stack slot in the guest-state page: `add x0, x28, xI, lsl #4` right before it."""
+    return re.fullmatch(r'add x0, x28, x\d+, lsl #4', dis.get(off - 4, '')) is not None and '[x0, #0x420]' in dis[off]
 
 
 def site_classes(sites):
@@ -267,7 +275,7 @@ def code_vs_sites(sites, dis):
     native = {}
     for off, text in dis.items():
         a = native_access(text)
-        if a and a[2] not in ('x28', 'sp'):
+        if a and a[2] not in ('x28', 'sp') and not x87_slot(dis, off):
             native[off] = a
     for off in sorted(set(native) | set(by_off)):
         a, s = native.get(off), by_off.get(off)
@@ -381,7 +389,8 @@ def check_program(p, tmp):
             problems.append(('ERROR', f'object site {rec[:4]} disagrees with JSON {s["native_offset"]}'))
         if rec[24] != int(s['located']) or rec[4] != s['imm']:
             problems.append(('ERROR', f'object site at {s["native_offset"]}: located/imm disagree with JSON'))
-        link = s.get('access_native_offset') if s['kind'] in STUBS else s['guest_offset2']   # a stub's guest_offset2 is its access
+        link = s.get('access_native_offset') if s['kind'] in STUBS else s.get('mmio', s['guest_offset2'])   # a stub's guest_offset2 is
+        # its access; a load/store site's is its M3 completion record when it has one
         if rec[2] != (0xFFFFFFFF if link is None else link):
             problems.append(('ERROR', f'object site at {s["native_offset"]}: guest_offset2/access_native_offset disagree with JSON'))
     problems += [('ERROR', m) for m in object_vs_json(o, d)]

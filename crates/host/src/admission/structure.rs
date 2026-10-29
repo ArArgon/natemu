@@ -593,6 +593,7 @@ impl<'a> Verifier<'a> {
             match i {
                 Insn::Mem(m) => match m.addr.base {
                     28 => self.frame_access(m, at)?,
+                    0 if shape && self.x87_slot(m, at) => {}
                     SP if shape => return fail(at, "stack access"),
                     _ if shape && !site(at) => return fail(at, "unrecorded memory access"),
                     _ => {}
@@ -664,6 +665,27 @@ impl<'a> Verifier<'a> {
         } else {
             Err(format!("frame access {:#010x} at {at:#x}: not a guest-state field", self.word(at)))
         }
+    }
+
+    /// I6 (code shape): an x87 stack slot, FEX's `mm[I]` in the guest-state page: `add x0, x28, xI, lsl #4` right before an
+    /// 8-byte access `[x0, #mm]` (I = (TOP + i) & 7, which fexc masks; the hardware keeps any address inside EL0's mappings).
+    /// The index register's last write before the `add` must be `and wI, wN, #7` (fexc masks every index: TOP is guest data).
+    fn x87_slot(&self, m: Mem, at: u32) -> bool {
+        if at < ENTRY_OFFSET + 4
+            || self.word(at - 4) & 0xffe0_ffff != 0x8b00_1380
+            || (m.form, m.addr.index, m.size, m.addr.imm) != (Form::Unsigned, None, 8, i64::from(frame::X87_MM))
+        {
+            return false;
+        }
+        let index = self.word(at - 4) >> 16 & 31;
+        let mut k = at - 4;
+        while k > ENTRY_OFFSET {
+            k -= 4;
+            if self.insn(k).is_some_and(|i| i.writes() & 1 << index != 0) {
+                return self.word(k) & 0xffff_fc1f == 0x1200_0800 | index;   // and wI, wN, #0x7
+            }
+        }
+        false
     }
 
     /// A guest access word must be an access site recording exactly this access.

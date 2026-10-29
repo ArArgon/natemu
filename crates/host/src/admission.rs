@@ -283,7 +283,14 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
     let (accesses, stubs) = sites.split_at(sites.iter().position(is_stub).unwrap_or(sites.len()));
     for s in accesses {
         if !site_fields_valid(s, &h, region)
-            || s.guest_offset2 != object::NONE32
+            // M3: a load or store site may carry its instruction's completion record (fexc series23-m3): its length must end
+            // at the next instruction boundary of the PC table, or at the block's end.
+            || (s.guest_offset2 != object::NONE32
+                && object::completion(s).is_none_or(|c| {
+                    let end = s.guest_offset + u32::from(c.length);
+                    let next = pcs.iter().map(|p| p.guest_offset).filter(|&g| g > s.guest_offset).min().unwrap_or(h.guest_bytes);
+                    end != next.min(h.guest_bytes)
+                }))
             || !matches!(
                 s.kind,
                 object::kind::LOAD | object::kind::STORE | object::kind::PUSH | object::kind::POP | object::kind::SWAP | object::kind::ATOMIC

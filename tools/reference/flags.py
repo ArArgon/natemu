@@ -62,6 +62,16 @@ def step(insn, undefined):
         raise ValueError(f"{op} {insn.get('cc', '')} reads undefined flag(s) {reads & undefined:#x}")
     # I5a: SSE forms (annotation `sse`) write no arithmetic flag but COMISS/UCOMISS/COMISD/UCOMISD and PTEST, which define
     # all six (ZF PF CF, or ZF CF, by the operands; the rest cleared).
+    # I6: x87 forms ride on the same annotation: FCOMI/FCOMIP/FUCOMI/FUCOMIP define all six (ZF PF CF by the operands, OF SF AF
+    # cleared); FCMOVcc reads CF, ZF or PF (fcmov{n}{b,e,be,u}).
+    if insn.get('sse') and op.startswith('fcmov'):
+        cc = op[6:] if op[5] == 'n' else op[5:]
+        need = {'b': CF, 'e': ZF, 'be': CF | ZF, 'u': PF}[cc]
+        if need & undefined: raise ValueError(f'{op} reads undefined flag(s) {need & undefined:#x}')
+        return undefined
+    # FCOMI & co.: the SDM clears OF, SF and AF ("set the OF, SF, and AF flags to zero", natemu/FEX do); the pinned QEMU 7.2
+    # keeps them (helper_fcomi), so they are not compared after one.
+    if insn.get('sse') and op in ('fcomi', 'fcomip', 'fucomi', 'fucomip'): return (undefined & ~ALL6) | OF | SF | AF
     if insn.get('sse'): return undefined & ~ALL6 if op in ('comiss', 'ucomiss', 'comisd', 'ucomisd', 'ptest') else undefined
     if op in NO_FLAGS | NO_FLAGS_I1 | STRING_MOVES | {'lahf', 'pushf'}: return undefined
     if op in STRING_COMPARES: return undefined if insn.get('count') == 0 else undefined & ~ALL6

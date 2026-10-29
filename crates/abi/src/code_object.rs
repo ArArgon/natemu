@@ -247,6 +247,47 @@ pub struct Reloc {
     pub value: u64,
 }
 
+/// M3 (fexc series23-m3, `tools/fexc/shim/fexc_mmio.inc`): how the resident completes a load or store site's guest
+/// instruction when the access hits a device page, recorded from FEX's own decode of the instruction it translated, in the
+/// site's `guest_offset2` slot (otherwise [`NONE32`] for load and store sites). Only MOV-family instructions whose one access
+/// is that site get one: MOV loads and stores, MOV of an immediate, moffs, MOVZX, MOVSX, MOVSXD. A store's data is the site's
+/// native transfer register (`data_reg[0]`, a general one: what the translated instruction stores, its immediate or AH..BH
+/// included); a load's value goes to x86 register `reg` (AH..BH: bits 15:8 of `reg` 0..3 when `high`), zero- or
+/// sign-extended from `width` to `dest` bytes, with x86's merge (8- and 16-bit destinations keep the other bits, 32-bit
+/// zero-extends). RIP then moves `length` bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Completion {
+    pub length: u8,
+    pub store: bool,
+    pub reg: u8,
+    pub high: bool,
+    pub dest: u8,
+    pub width: u8,
+    pub signed: bool,
+}
+/// The site's [`Completion`], when it carries a well-formed one consistent with it (`None` for every other site).
+pub fn completion(site: &Site) -> Option<Completion> {
+    let r = site.guest_offset2;
+    let store = r >> 4 & 1 != 0;
+    let c = Completion {
+        length: (r & 15) as u8,
+        store,
+        reg: (r >> 5 & 15) as u8,
+        high: r >> 9 & 1 != 0,
+        dest: if store { 0 } else { 1 << (r >> 10 & 3) },
+        width: 1 << (r >> 12 & 3),
+        signed: r >> 14 & 1 != 0,
+    };
+    let kind = if store { kind::STORE } else { kind::LOAD };
+    let shape = r >> 30 == 2 && r & 0x3fff_8000 == 0 && c.length != 0 && site.kind == kind && site.width == c.width;
+    let operands = if store {
+        r & 0x4fe0 == 0 && site.data_class == CLASS_GPR
+    } else {
+        c.dest >= c.width && (!c.high || (c.dest == 1 && c.reg < 4)) && (!c.signed || c.dest > c.width)
+    };
+    (shape && site.rmw == RMW_NONE && operands).then_some(c)
+}
+
 const _: () = assert!(core::mem::size_of::<Header>() == 128);
 const _: () = assert!(core::mem::size_of::<Site>() == 40);
 const _: () = assert!(core::mem::size_of::<PcEntry>() == 12);
@@ -292,6 +333,34 @@ mod tests {
         assert_eq!(offset_of!(Header, dcache_line_log2), 121);
         assert_eq!(offset_of!(Header, reserved), 122);
         assert_eq!(offset_of!(Header, pre_nzcv_register), 124);
+    }
+
+    #[test]
+    fn completion_records() {
+        let site = |kind, width, g2| Site { kind, width, guest_offset2: g2, ..unsafe { core::mem::zeroed() } };
+        // fexc series23-m3's records: mov eax, [m]; mov ah, [m]; movsx rax, word [m]; mov [m], ch; mov qword [m], imm32.
+        let c = |length, store, reg, high, dest, width, signed| Completion { length, store, reg, high, dest, width, signed };
+        assert_eq!(completion(&site(kind::LOAD, 4, 0x8000_2803)), Some(c(3, false, 0, false, 4, 4, false)));
+        assert_eq!(completion(&site(kind::LOAD, 1, 0x8000_0202)), Some(c(2, false, 0, true, 1, 1, false)));
+        assert_eq!(completion(&site(kind::LOAD, 2, 0x8000_5c04)), Some(c(4, false, 0, false, 8, 2, true)));
+        assert_eq!(completion(&site(kind::STORE, 1, 0x8000_0012)), Some(c(2, true, 0, false, 0, 1, false)));
+        assert_eq!(completion(&site(kind::STORE, 8, 0x8000_3018)), Some(c(8, true, 0, false, 0, 8, false)));
+        for bad in [
+            site(kind::LOAD, 4, NONE32),
+            site(kind::LOAD, 2, 0x8000_2803),  // width disagrees with the site
+            site(kind::STORE, 4, 0x8000_2803), // direction disagrees
+            site(kind::LOAD, 4, 0x8000_2800),  // length 0
+            site(kind::LOAD, 4, 0x0000_2803),  // no marker
+            site(kind::LOAD, 4, 0x8001_2803),  // stray bits
+            site(kind::LOAD, 1, 0x8000_02e2),  // AH..BH of register 7
+            site(kind::LOAD, 4, 0x8000_6803),  // sign-extend to its own width
+            site(kind::LOAD, 2, 0x8000_1002),  // a 1-byte destination for a 2-byte access
+            site(kind::STORE, 4, 0x8000_2833), // a store naming a register
+            site(kind::ATOMIC, 4, 0x8000_2803),
+            Site { rmw: RMW_LOAD, ..site(kind::LOAD, 4, 0x8000_2803) },
+        ] {
+            assert_eq!(completion(&bad), None, "{bad:?}");
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::{env, ffi::c_void, fs, ptr};
 use vm::*;
 
 mod admission;
+mod devices;
 mod drivers;
 mod execution;
 mod json;

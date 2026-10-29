@@ -1,0 +1,493 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: natemu <natemu@example.invalid>
+Date: Thu, 29 Oct 2026 00:00:00 +0000
+Subject: [PATCH 19/19] FEXCore: slice1 I6 x87 reduced precision: state, FIST, FSW
+
+Under fexc_slice1 only (x87 in FEX's reduced-precision mode, which fexc sets
+for slice1).
+
+- x87StackOptimizationPass: always the slow path, and every lowered op flushes
+  and drops its caches, so the x87 state (mm[], TOP, the abridged tag word) is
+  in the guest-state page at every instruction boundary (a fault or stop
+  anywhere sees it exact) and no register pressure builds up (slice1 admits no
+  spill area); TOP is masked to 0..7 on load (a guest-state byte the guest can
+  reach); ST(i) is accessed as LoadContextIndexed/StoreContextIndexed
+  (`add x0, x28, xI, lsl #4; ldr|str dN, [x0, #mm]`), not as a guest memory op.
+- X87F64.cpp FISTF64: x86's FIST/FISTP/FISTTP. Round by the FPCR (frintx: PE
+  when inexact) or truncate (fcvtzs), convert at 64 bits, and store the
+  integer indefinite for a NaN or a value outside the operand size's range
+  (Arm saturates; FEX stored the low half of a 64-bit conversion for m16);
+  flag-free. IE from FPSR.IOC or, for m16/m32 range, FEX's IE byte; m16/m32
+  round without a flag and set PE in FEX's PE byte only for a stored inexact
+  result (x86 raises IE alone out of range); both bytes after the store.
+- x87StackOptimizationPass: x87 stack faults with their masked response (SDM
+  Vol.1 8.5.1.1; every exception stays masked): a read of an empty register
+  gives the QNaN indefinite (underflow), a push onto a non-empty one loads it
+  (overflow); IE and SF set and C1 = 1 / 0 before the next instruction (after
+  this one's store); a register written is always marked valid (an underflow
+  fills its destination). FXAM reads ST(0) from the page directly (no fault).
+- x87StackOptimizationPass: C1 = overflow on every push and 0 for FCHS/FABS;
+  an arithmetic result after a stack underflow is the indefinite even beside
+  a NaN operand; FST/FSTP m64 quiets an SNaN with IE (integer code).
+- X87F64.cpp FLDF64: FLD m64 is a multiply by 1.0 (SNaN quieted with IE,
+  denormal DE, exact otherwise under the x87 FPCR); FCOMIF64: C1 = 0 for
+  FCOMI/FUCOMI(P).
+- x87StackOptimizationPass: FCHS and FABS as sign-bit operations (Arm FNEG and
+  FABS leave a NaN unchanged under FPCR.AH = 1; x87's flip or clear its sign).
+- X87.cpp X87FXAM: x86's classes of a double (empty, NaN, infinity, zero,
+  normal; a denormal double is a normal 80-bit value), C1 the sign; flag-free.
+- X87.cpp ReconstructFSW_Helper: FSW's exception flags from the x87 exception
+  word, FEX's IE, PE and SF bytes (FPSR order, filled by the JIT's x87 wrapper in shim/fexc_sites.inc).
+- JITClass.h: the wrapper's declarations.
+---
+ FEXCore/Source/Interface/Core/JIT/JITClass.h       |   4 +
+ .../Source/Interface/Core/OpcodeDispatcher/X87.cpp |  33 +++++
+ .../Interface/Core/OpcodeDispatcher/X87F64.cpp     |  54 +++++++-
+ .../IR/Passes/x87StackOptimizationPass.cpp         | 138 +++++++++++++++++++--
+ 4 files changed, 220 insertions(+), 9 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index 4c29aa6..59ff10d 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -556,6 +556,10 @@ private:
+   void FexcVectorConstant(ARMEmitter::VRegister Dst, IR::OpSize OpSize, const uint8_t* Bytes);
+   // natemu (fexc), profile slice1 (I5a): the MXCSR flags x86 raises (shim/fexc_sites.inc).
+   bool FexcQuietOp(const IR::IROp_Header* IROp);
++  // natemu (fexc), profile slice1 (I6): x87 floating-point ops: FPSR into the x87 exception word, the x87 FPCR (shim/fexc_sites.inc).
++  bool FexcX87Op(const IR::IROp_Header* IROp);
++  void FexcX87Begin();
++  void FexcX87End();
+   bool FexcRoundBegin(IR::RoundMode Mode);
+   void FexcRoundEnd(IR::RoundMode Mode);
+   uint32_t FexcNegLoad {};
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+index d8820ab..127967c 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+@@ -17,6 +17,8 @@ $end_info$
+ #include <FEXCore/Utils/LogManager.h>
+ #include <FEXCore/Utils/FPState.h>
+ 
++#include <fexc_hook.h>
++
+ #include <stddef.h>
+ #include <stdint.h>
+ 
+@@ -762,6 +764,18 @@ Ref OpDispatchBuilder::ReconstructFSW_Helper(Ref T) {
+   auto IE = GetRFLAG(FEXCore::X86State::X87FLAG_IE_LOC);
+   FSW = _Or(OpSize::i64Bit, FSW, IE);
+ 
++  if (fexc_slice1) {
++    // natemu slice1 (I6): the exception flags from the x87 exception word (FPSR order: IOC IE, DZC ZE, OFC OE, UFC UE, IXC PE,
++    // IDC DE; bit 6 SF): FSW bits 0 IE, 1 DE, 2..5 ZE OE UE PE, 6 SF. ES and B stay 0: every exception is masked (an FCW that
++    // unmasks one is refused by the resident).
++    Ref Ex = _LoadContextGPR(OpSize::i32Bit, FEXC_X87_EXCEPTIONS);
++    FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_PE_LOC), 5);   // FIST m16/m32's PE byte
++    FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_SF_LOC), 6);   // the x87 pass's stack fault
++    FSW = _Or(OpSize::i64Bit, FSW, _And(OpSize::i32Bit, Ex, Constant(0x41)));
++    FSW = _Or(OpSize::i64Bit, FSW, _And(OpSize::i32Bit, _Lshr(OpSize::i32Bit, Ex, Constant(6)), Constant(2)));
++    FSW = _Or(OpSize::i64Bit, FSW, _And(OpSize::i32Bit, _Lshl(OpSize::i32Bit, Ex, Constant(1)), Constant(0x3c)));
++  }
++
+   return FSW;
+ }
+ 
+@@ -859,6 +873,25 @@ void OpDispatchBuilder::X87FCMOV(OpcodeArgs) {
+ }
+ 
+ void OpDispatchBuilder::X87FXAM(OpcodeArgs) {
++  if (fexc_slice1 && ReducedPrecisionMode) {
++    // natemu slice1 (I6): x86's classes for a double (SDM Vol.2 FXAM; C3 C2 C0): empty 101, NaN 001, infinity 011, zero 100,
++    // normal 010; a denormal double is a normal 80-bit value (010). C1 the sign. Flag-free; no exception.
++    // ST(0) read from the page directly: FXAM of an empty register is no stack fault (the x87 pass checks every other read).
++    _SyncStackToSlow();
++    Ref St0 = _LoadContextFPRIndexed(_And(OpSize::i32Bit, GetX87Top(), Constant(7)), OpSize::i64Bit, MMBaseOffset(), 16);
++    Ref Bits = _VExtractToGPR(OpSize::i64Bit, OpSize::i64Bit, St0, 0);
++    Ref One = Constant(1);
++    Ref Abs = _And(OpSize::i64Bit, Bits, Constant(0x7fff'ffff'ffff'ffffULL));
++    Ref IsZero = _Xor(OpSize::i64Bit, _Lshr(OpSize::i64Bit, _Or(OpSize::i64Bit, Abs, _Neg(OpSize::i64Bit, Abs)), Constant(63)), One);
++    Ref IsSpecial = _Lshr(OpSize::i64Bit, Add(OpSize::i64Bit, _Lshr(OpSize::i64Bit, Abs, Constant(52)), 1), Constant(11));   // NaN or infinity
++    Ref IsNaN = _Lshr(OpSize::i64Bit, Add(OpSize::i64Bit, Abs, 0x000f'ffff'ffff'ffffULL), Constant(63));
++    Ref Empty = _Xor(OpSize::i64Bit, _StackValidTag(0), One);
++    SetRFLAG<FEXCore::X86State::X87FLAG_C1_LOC>(_Lshr(OpSize::i64Bit, Bits, Constant(63)));
++    SetRFLAG<FEXCore::X86State::X87FLAG_C0_LOC>(_Or(OpSize::i64Bit, IsSpecial, Empty));
++    SetRFLAG<FEXCore::X86State::X87FLAG_C2_LOC>(_Andn(OpSize::i64Bit, _Xor(OpSize::i64Bit, _Or(OpSize::i64Bit, IsZero, IsNaN), One), Empty));
++    SetRFLAG<FEXCore::X86State::X87FLAG_C3_LOC>(_Or(OpSize::i64Bit, IsZero, Empty));
++    return;
++  }
+   auto a = _ReadStackValue(0);
+   Ref Result =
+     ReducedPrecisionMode ? _VExtractToGPR(OpSize::i64Bit, OpSize::i64Bit, a, 0) : _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, a, 1);
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87F64.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87F64.cpp
+index 33fba69..cfa27e4 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87F64.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87F64.cpp
+@@ -15,6 +15,8 @@ $end_info$
+ #include <FEXCore/Utils/EnumUtils.h>
+ #include <FEXCore/Utils/LogManager.h>
+ 
++#include <fexc_hook.h>
++
+ #include <stddef.h>
+ #include <stdint.h>
+ 
+@@ -66,8 +68,12 @@ void OpDispatchBuilder::FLDF64(OpcodeArgs, IR::OpSize Width) {
+     ConvertedData = _Float_FToF(OpSize::i64Bit, OpSize::i32Bit, Data);
+   } else if (Width == OpSize::f80Bit) {
+     ConvertedData = _F80CVT(OpSize::i64Bit, Data);
++  } else if (fexc_slice1 && Width == OpSize::i64Bit) {
++    // natemu slice1 (I6): FLD m64 quiets an SNaN with IE and raises DE for a denormal (SDM FLD #IA, #D): a multiply by 1.0,
++    // exact for every other value under the x87 FPCR (FZ = 0), inside the x87 FPSR wrapper.
++    ConvertedData = _VFMul(OpSize::i64Bit, OpSize::i64Bit, Data, _VCastFromGPR(OpSize::i64Bit, OpSize::i64Bit, Constant(0x3ff0'0000'0000'0000ULL)));
+   }
+-  _PushStack(ConvertedData, Data, Width);
++  _PushStack(ConvertedData, fexc_slice1 ? ConvertedData : Data, Width);
+ }
+ 
+ void OpDispatchBuilder::FBLDF64(OpcodeArgs) {
+@@ -105,6 +111,49 @@ void OpDispatchBuilder::FILDF64(OpcodeArgs) {
+ void OpDispatchBuilder::FISTF64(OpcodeArgs, bool Truncate) {
+   const auto Size = OpSizeFromSrc(Op);
+ 
++  if (fexc_slice1) {
++    // natemu slice1 (I6): x86's FIST/FISTP/FISTTP (SDM Vol.2): round by FCW.RC (`frintx`: PE when inexact; the x87 FPCR) or
++    // truncate (`fcvtzs`: PE when inexact), then store the integer, or the integer indefinite (the operand size's smallest
++    // value) with IE for a NaN or a value outside the operand size's range. Arm saturates instead, and FEX converts the 16-bit
++    // form at 64 bits and stores its low half. IE comes from FPSR.IOC (NaN, 64-bit overflow) or, for 16/32 bits, the range check.
++    // Flag-free (no NZCV to save, few live registers: slice1 admits no spill area): NaN from the double's bits, the range
++    // check by comparing the 64-bit result with its sign-extended low part (64 bits: the saturated INT64_MAX), a mask select.
++    Ref Data = _ReadStackValue(0);
++    // m64: frintx (FIST) or fcvtzs (FISTTP) raise PE; m16/m32 round without a flag (frinti/frintz) and compute PE below.
++    Ref Integral = Truncate && Size == OpSize::i64Bit ? Data :
++                   _Vector_FToI(OpSize::i64Bit, OpSize::i64Bit, Data, Truncate ? RoundMode::TowardsZero : RoundMode::Host);
++    Ref Value = _Float_ToGPR_ZS(OpSize::i64Bit, OpSize::i64Bit, Integral);
++    Ref Bits = _VExtractToGPR(OpSize::i64Bit, OpSize::i64Bit, Data, 0);
++    Ref IsNaN = _Lshr(OpSize::i64Bit, Add(OpSize::i64Bit, _And(OpSize::i64Bit, Bits, Constant(0x7fff'ffff'ffff'ffffULL)), 0x000f'ffff'ffff'ffffULL),
++                      Constant(63));
++    Ref Diff = Size == OpSize::i64Bit ? _Xor(OpSize::i64Bit, Value, Constant(0x7fff'ffff'ffff'ffffULL))
++                                      : _Xor(OpSize::i64Bit, Value, _Sbfe(OpSize::i64Bit, IR::OpSizeAsBits(Size), 0, Value));
++    Ref NonZero = _Lshr(OpSize::i64Bit, _Or(OpSize::i64Bit, Diff, _Neg(OpSize::i64Bit, Diff)), Constant(63));
++    Ref OutOfRange = Size == OpSize::i64Bit ? _Xor(OpSize::i64Bit, NonZero, Constant(1)) : NonZero;
++    Ref Mask = _Neg(OpSize::i64Bit, _Or(OpSize::i64Bit, IsNaN, OutOfRange));
++    const uint64_t Indefinite = Size == OpSize::i16Bit ? 0x8000 : Size == OpSize::i32Bit ? 0x8000'0000ULL : 0x8000'0000'0000'0000ULL;
++    // m16/m32: PE when the rounding was inexact and the integer is stored (an out-of-range value raises IE alone). m64:
++    // out of range is integral, and Arm raises no IXC beside IOC.
++    Ref Inexact {};
++    if (Size != OpSize::i64Bit) {
++      Ref Diff2 = _Xor(OpSize::i64Bit, Bits, _VExtractToGPR(OpSize::i64Bit, OpSize::i64Bit, Integral, 0));
++      Inexact = _Andn(OpSize::i64Bit, _Lshr(OpSize::i64Bit, _Or(OpSize::i64Bit, Diff2, _Neg(OpSize::i64Bit, Diff2)), Constant(63)), _Neg(OpSize::i64Bit, Mask));
++    }
++    Value = _Or(OpSize::i64Bit, _Andn(OpSize::i64Bit, Value, Mask), _And(OpSize::i64Bit, Mask, Constant(Indefinite)));
++    StoreResultGPR_WithOpSize(Op, Op->Dest, Value, Size, OpSize::i8Bit, MemoryAccessType::NONTSO);
++    if (Size != OpSize::i64Bit) {
++      // After the store (a #PF there leaves FSW as it was, except the FPSR flags already accumulated; plan I6 deviations).
++      SetRFLAG<FEXCore::X86State::X87FLAG_IE_LOC>(_Or(OpSize::i32Bit, GetRFLAG(FEXCore::X86State::X87FLAG_IE_LOC), OutOfRange));
++    }
++    if (Inexact) {
++      SetRFLAG<FEXCore::X86State::X87FLAG_PE_LOC>(_Or(OpSize::i32Bit, GetRFLAG(FEXCore::X86State::X87FLAG_PE_LOC), Inexact));
++    }
++    if ((Op->TableInfo->Flags & X86Tables::InstFlags::FLAGS_POP) != 0) {
++      _PopStackDestroy();
++    }
++    return;
++  }
++
+   Ref data = _ReadStackValue(0);
+   bool CanUseFloatReg = Size == OpSize::i64Bit;
+   if (CanUseFloatReg) {
+@@ -368,6 +417,9 @@ void OpDispatchBuilder::FCOMIF64(OpcodeArgs, IR::OpSize Width, bool Integer, OpD
+     HandleNZCVWrite();
+     _F80CmpValue(b);
+     ComissFlags();
++    if (fexc_slice1) {
++      SetRFLAG<FEXCore::X86State::X87FLAG_C1_LOC>(Constant(0));   // natemu slice1 (I6): FCOMI/FUCOMI(P): C1 = 0 (SDM)
++    }
+   }
+ 
+   if (PopTwice) {
+diff --git a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+index f205097..82ed9bc 100644
+--- a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+@@ -4,6 +4,7 @@
+ #include "Interface/IR/IR.h"
+ #include "Interface/IR/IREmitter.h"
+ #include "Interface/IR/Passes.h"
++#include <fexc_hook.h>
+ #include "Interface/IR/PassManager.h"
+ #include "FEXCore/IR/IR.h"
+ #include "FEXCore/Utils/Profiler.h"
+@@ -242,6 +243,7 @@ private:
+       [[fallthrough]];
+     }
+     case OpSize::i64Bit: {
++      if (fexc_slice1 && Op->StoreSize == OpSize::i64Bit) StackNode = QuietSNaN(StackNode);   // natemu slice1 (I6)
+       IREmit->_StoreMemFPR(Op->StoreSize, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
+       break;
+     }
+@@ -270,6 +272,21 @@ private:
+   void SetX87ValidTag(uint8_t Offset, bool Valid);
+   // Generates slow code to load/store a value from an offset from the top of the stack
+   Ref LoadStackValueAtOffset_Slow(uint8_t Offset = 0);
++  // natemu slice1 (I6): x87 stack faults with their masked response (SDM Vol.1 8.5.1.1; every exception is masked): a read of
++  // an empty register gives the QNaN floating-point indefinite (stack underflow), a push onto a non-empty one loads it (stack
++  // overflow); the instruction's IE and SF are set and C1 = 1 for an overflow, 0 for an underflow, at the next instruction's
++  // start (after any store of this one: a fault there leaves FSW as it was). Fault/Overflow accumulate over one instruction.
++  Ref StackChecked(Ref Value, uint8_t Offset, bool Push);
++  void FlushStackFault();
++  Ref Fault {}, Overflow {};
++  bool CheckReads = true;
++  // natemu slice1 (I6): the current op's own stack fault (its arithmetic result is then the indefinite, whatever the other
++  // operand), an SNaN an FST m64 quieted (IE), and whether the instruction defines C1 itself: a push (C1 = overflow) or
++  // FCHS/FABS (C1 = 0).
++  Ref OpFault {}, SNaN {};
++  bool Pushed = false, C1Zero = false;
++  Ref FaultResult(Ref Value);
++  Ref QuietSNaN(Ref Value);
+   void StoreStackValueAtOffset_Slow(Ref Value, uint8_t Offset = 0, bool SetValid = true);
+   // Update Top value in slow path for a pop
+   void UpdateTopForPop_Slow(bool InvalidateTag = true);
+@@ -376,8 +393,74 @@ inline void X87StackOptimization::InvalidateCachedRegs() {
+   TopValidCache.fill(StackSlot::UNUSED);
+ }
+ 
++inline Ref X87StackOptimization::StackChecked(Ref Value, uint8_t Offset, bool Push) {
++  // Push: register TOP - 1 (offset 7) must be empty; read: register TOP + Offset must not be.
++  Ref Valid = GetX87ValidTag_Slow(Offset);
++  Ref Bad = Push ? Valid : IREmit->_Xor(OpSize::i32Bit, Valid, GetConstant(1));
++  Fault = Fault ? IREmit->_Or(OpSize::i32Bit, Fault, Bad) : Bad;
++  OpFault = OpFault ? IREmit->_Or(OpSize::i32Bit, OpFault, Bad) : Bad;
++  if (Push) {
++    Pushed = true;
++    Overflow = Overflow ? IREmit->_Or(OpSize::i32Bit, Overflow, Bad) : Bad;
++  }
++  Ref Keep = IREmit->_VCastFromGPR(OpSize::i64Bit, OpSize::i64Bit, IREmit->_Sub(OpSize::i64Bit, Bad, GetConstant(1)));   // all ones: no fault
++  Ref Indefinite = IREmit->_VCastFromGPR(OpSize::i64Bit, OpSize::i64Bit, IREmit->_Constant(0xfff8'0000'0000'0000ULL));
++  return IREmit->_VBSL(OpSize::i64Bit, Keep, Value, Indefinite);
++}
++
++inline Ref X87StackOptimization::FaultResult(Ref Value) {
++  // An arithmetic result after a stack underflow of this op is the indefinite (the masked response), even when the other
++  // operand is a NaN that the operation would propagate.
++  if (!fexc_slice1 || !OpFault) {
++    return Value;
++  }
++  Ref Keep = IREmit->_VCastFromGPR(OpSize::i64Bit, OpSize::i64Bit, IREmit->_Sub(OpSize::i64Bit, OpFault, GetConstant(1)));
++  Ref Indefinite = IREmit->_VCastFromGPR(OpSize::i64Bit, OpSize::i64Bit, IREmit->_Constant(0xfff8'0000'0000'0000ULL));
++  return IREmit->_VBSL(OpSize::i64Bit, Keep, Value, Indefinite);
++}
++
++inline Ref X87StackOptimization::QuietSNaN(Ref Value) {
++  // FST/FSTP m64 of an SNaN stores it quieted, with IE (SDM FST #IA); flag-free, every other value unchanged.
++  Ref Bits = IREmit->_VExtractToGPR(OpSize::i64Bit, OpSize::i64Bit, Value, 0);
++  Ref Abs = IREmit->_And(OpSize::i64Bit, Bits, IREmit->_Constant(0x7fff'ffff'ffff'ffffULL));
++  Ref IsNaN = IREmit->_Lshr(OpSize::i64Bit, IREmit->Add(OpSize::i64Bit, Abs, 0x000f'ffff'ffff'ffffULL), IREmit->_Constant(63));
++  Ref Quiet = IREmit->_And(OpSize::i64Bit, IREmit->_Lshr(OpSize::i64Bit, Bits, IREmit->_Constant(51)), IREmit->_Constant(1));
++  Ref IsSNaN = IREmit->_Andn(OpSize::i64Bit, IsNaN, Quiet);
++  SNaN = SNaN ? IREmit->_Or(OpSize::i32Bit, SNaN, IsSNaN) : IsSNaN;
++  return IREmit->_VCastFromGPR(OpSize::i64Bit, OpSize::i64Bit, IREmit->_Orlshl(OpSize::i64Bit, Bits, IsSNaN, 51));
++}
++
++inline void X87StackOptimization::FlushStackFault() {
++  const auto Flag = [&](uint32_t Loc) { return offsetof(FEXCore::Core::CPUState, flags) + Loc; };
++  const auto OrFlag = [&](uint32_t Loc, Ref V) {
++    IREmit->_StoreContextGPR(OpSize::i8Bit, IREmit->_Or(OpSize::i32Bit, IREmit->_LoadContextGPR(OpSize::i8Bit, Flag(Loc)), V), Flag(Loc));
++  };
++  if (Fault) {
++    OrFlag(FEXCore::X86State::X87FLAG_IE_LOC, Fault);
++    OrFlag(FEXCore::X86State::X87FLAG_SF_LOC, Fault);
++  }
++  if (SNaN) {
++    OrFlag(FEXCore::X86State::X87FLAG_IE_LOC, SNaN);
++  }
++  if (Pushed || C1Zero) {
++    // FLD/FILD/the constants: C1 = 1 for a stack overflow, else 0; FCHS/FABS: 0 (SDM "FPU Flags Affected").
++    IREmit->_StoreContextGPR(OpSize::i8Bit, Overflow ? Overflow : GetConstant(0), Flag(FEXCore::X86State::X87FLAG_C1_LOC));
++  } else if (Fault) {
++    // Any instruction that read a stack register (Fault is then an emitted value, whether it is 0 or 1): C1 = 0. Exact for
++    // an underflow and for the forms that define C1 = 0; where x87 would report a round-up in C1 (arithmetic, FSQRT, FRNDINT,
++    // FST/FSTP, FIST/FISTTP, FCMOVcc), C1 reads 0 (deviation 5).
++    IREmit->_StoreContextGPR(OpSize::i8Bit, GetConstant(0), Flag(FEXCore::X86State::X87FLAG_C1_LOC));
++  }
++  Fault = Overflow = SNaN = {};
++  Pushed = C1Zero = false;
++}
++
+ inline void X87StackOptimization::Reset() {
+-  SlowPath = false;
++  Fault = Overflow = OpFault = SNaN = {};
++  Pushed = C1Zero = false;
++  // natemu slice1 (I6): always the slow path, so the x87 state is in the guest-state page at every instruction boundary
++  // (each lowered op flushes below): a fault or stop anywhere in the block sees it exact.
++  SlowPath = fexc_slice1;
+   StackData.clear();
+   InvalidateCaches();
+ }
+@@ -405,6 +488,8 @@ inline void X87StackOptimization::MigrateToSlowPathIf(bool ShouldMigrate) {
+ inline Ref X87StackOptimization::GetTopWithCache_Slow() {
+   if (!TopOffsetCache[0]) {
+     TopOffsetCache[0] = IREmit->_LoadContextGPR(OpSize::i8Bit, offsetof(FEXCore::Core::CPUState, flags) + FEXCore::X86State::X87FLAG_TOP_LOC);
++    // natemu slice1 (I6): TOP is a guest-state byte the guest can reach (the page deviation): keep every index inside mm[].
++    if (fexc_slice1) TopOffsetCache[0] = IREmit->_And(OpSize::i32Bit, TopOffsetCache[0], GetConstant(7));
+   }
+   return TopOffsetCache[0];
+ }
+@@ -469,8 +554,13 @@ inline Ref X87StackOptimization::GetX87ValidTag_Slow(uint8_t Offset) {
+ }
+ 
+ inline Ref X87StackOptimization::LoadStackValueAtOffset_Slow(uint8_t Offset) {
+-  OrderedNode* TopOffsetAddress = GetOffsetTopAddressWithCache_Slow(Offset);
++  OrderedNode* TopOffsetAddress = fexc_slice1 ? nullptr : GetOffsetTopAddressWithCache_Slow(Offset);
+   auto Size = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
++  if (!TopValueCache[Offset] && fexc_slice1) {
++    // natemu slice1 (I6): `add x0, x28, xI, lsl #4; ldr dN, [x0, #mm]`, a guest-state access (not a guest memory op: no site).
++    Ref Raw = IREmit->_LoadContextFPRIndexed(GetOffsetTopWithCache_Slow(Offset), Size, MMBaseOffset(), 16);
++    TopValueCache[Offset] = CheckReads ? StackChecked(Raw, Offset, false) : Raw;
++  }
+   if (!TopValueCache[Offset]) {
+     TopValueCache[Offset] = IREmit->_LoadMemFPR(Size, TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size, MemOffsetType::SXTX, 1);
+   }
+@@ -482,7 +572,8 @@ inline void X87StackOptimization::StoreStackValueAtOffset_Slow(Ref Value, uint8_
+   FlushValuesPending[Offset] = true;
+   // mark it valid
+   // In some cases we might already know it has been previously set as valid so we don't need to do it again
+-  if (SetValid) {
++  // natemu slice1 (I6): always: the register written may have been empty (a stack underflow's masked response fills it).
++  if (SetValid || fexc_slice1) {
+     SetX87ValidTag(Offset, true);
+   }
+ }
+@@ -536,7 +627,7 @@ void X87StackOptimization::HandleUnop(IROps Op64, bool VFOp64, IROps Op80) {
+     DeriveOp(Value, Op80, IREmit->_F80SQRT(St0));
+   }
+ 
+-  StoreStackValue(Value);
++  StoreStackValue(FaultResult(Value));
+ }
+ 
+ 
+@@ -564,7 +655,7 @@ void X87StackOptimization::HandleBinopValue(IROps Op64, bool VFOp64, IROps Op80,
+     }
+   }
+ 
+-  StoreStackValue(Node, DestStackOffset, MarkDestValid && StackOffset != DestStackOffset);
++  StoreStackValue(FaultResult(Node), DestStackOffset, MarkDestValid && StackOffset != DestStackOffset);
+ }
+ 
+ void X87StackOptimization::HandleBinopStack(IROps Op64, bool VFOp64, IROps Op80, uint8_t DestStackOffset, uint8_t StackOffset1,
+@@ -617,6 +708,10 @@ void X87StackOptimization::FlushCachedRegs() {
+ 
+   auto Size = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
+   for (size_t i = 0; i < FlushValuesPending.size(); i++) {
++    if (FlushValuesPending[i] && fexc_slice1) {
++      IREmit->_StoreContextFPRIndexed(TopValueCache[i], GetOffsetTopWithCache_Slow(i), Size, MMBaseOffset(), 16);   // natemu slice1 (I6)
++      FlushValuesPending[i] = false;
++    }
+     if (FlushValuesPending[i]) {
+       OrderedNode* TopOffsetAddress = GetOffsetTopAddressWithCache_Slow(i);
+       IREmit->_StoreMemFPR(Size, TopValueCache[i], TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size, MemOffsetType::SXTX, 1);
+@@ -746,10 +841,16 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+ 
+     IREmit->SetCurrentCodeBlock(BlockNode);
+     for (auto [CodeNode, IROp] : CurrentIR.GetCode(BlockNode)) {
++      if (fexc_slice1 && IROp->Op == OP_GUESTOPCODE && (Fault || SNaN || Pushed || C1Zero)) {
++        IREmit->SetWriteCursorBefore(CodeNode);   // natemu slice1 (I6): the previous instruction's stack fault flags
++        FlushStackFault();
++        continue;
++      }
+       if (!LoweredX87(IROp->Op)) {
+         continue;
+       }
+       IREmit->SetWriteCursor(CodeNode);
++      OpFault = {};
+       switch (IROp->Op) {
+       case OP_F80ADDSTACK: {
+         const auto* Op = IROp->C<IROp_F80AddStack>();
+@@ -941,6 +1042,7 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+         auto* SourceNode = CurrentIR.GetNode(Op->X80Src);
+ 
+         if (SlowPath) {
++          if (fexc_slice1) SourceNode = StackChecked(SourceNode, 7, true);   // natemu slice1 (I6): stack overflow
+           UpdateTopForPush_Slow();
+           StoreStackValueAtOffset_Slow(SourceNode);
+         } else {
+@@ -962,6 +1064,7 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+ 
+         if (SlowPath) {
+           Ref St0 = LoadStackValueAtOffset_Slow(Offset);
++          if (fexc_slice1) St0 = StackChecked(St0, 7, true);   // natemu slice1 (I6): stack overflow
+           UpdateTopForPush_Slow();
+           StoreStackValueAtOffset_Slow(St0);
+         } else {
+@@ -1083,12 +1186,20 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+       }
+ 
+       case OP_F80STACKCHANGESIGN: {
++        // natemu slice1 (I6): an empty ST(0) gives the indefinite itself, not its negation (checked after the operation).
++        CheckReads = !fexc_slice1;
+         Ref Value = LoadStackValue();
++        CheckReads = true;
+ 
+         // We need a couple of intermediate instructions to change the sign
+         // of a value
+         Ref ResultNode {};
+-        if (ReducedPrecisionMode) {
++        if (ReducedPrecisionMode && fexc_slice1) {
++          // natemu slice1 (I6): FCHS flips the sign bit of any value, a NaN too (Arm FNEG leaves a NaN under FPCR.AH = 1).
++          ResultNode = IREmit->_VXor(OpSize::i64Bit, Value, IREmit->_VCastFromGPR(OpSize::i64Bit, OpSize::i64Bit, IREmit->_Constant(0x8000'0000'0000'0000ULL)));
++          ResultNode = StackChecked(ResultNode, 0, false);
++          C1Zero = true;
++        } else if (ReducedPrecisionMode) {
+           ResultNode = IREmit->_VFNeg(OpSize::i64Bit, OpSize::i64Bit, Value);
+         } else {
+           Ref HelperNode = IREmit->_LoadNamedVectorConstant(OpSize::i128Bit, IR::NamedVectorConstant::NAMED_VECTOR_F80_SIGN_MASK);
+@@ -1099,10 +1210,17 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+       }
+ 
+       case OP_F80STACKABS: {
++        CheckReads = !fexc_slice1;   // natemu slice1 (I6): as FCHS
+         Ref Value = LoadStackValue();
++        CheckReads = true;
+ 
+         Ref ResultNode {};
+-        if (ReducedPrecisionMode) {
++        if (ReducedPrecisionMode && fexc_slice1) {
++          // natemu slice1 (I6): FABS clears the sign bit of any value, a NaN too (Arm FABS leaves a NaN under FPCR.AH = 1).
++          ResultNode = IREmit->_VAndn(OpSize::i64Bit, Value, IREmit->_VCastFromGPR(OpSize::i64Bit, OpSize::i64Bit, IREmit->_Constant(0x8000'0000'0000'0000ULL)));
++          ResultNode = StackChecked(ResultNode, 0, false);
++          C1Zero = true;
++        } else if (ReducedPrecisionMode) {
+           ResultNode = IREmit->_VFAbs(OpSize::i64Bit, OpSize::i64Bit, Value);
+         } else {
+           // Intermediate insts
+@@ -1202,7 +1320,7 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+         } else {
+           Value = IREmit->_F80Round(St0);
+         }
+-        StoreStackValue(Value);
++        StoreStackValue(FaultResult(Value));
+         break;
+       }
+ 
+@@ -1221,6 +1339,9 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+ 
+       default: LOGMAN_THROW_A_FMT(false, "IROp was expected to be lowered");
+       }
++      // natemu slice1 (I6): the page holds the x87 state after every op; nothing stays cached in registers across ops
++      // (no register pressure builds up over a block: slice1 admits no spill area).
++      if (fexc_slice1) InvalidateCaches();
+       IREmit->Remove(CodeNode);
+     }
+ 
+@@ -1231,6 +1352,7 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+     IREmit->SetWriteCursorBefore(LastCodeNode);
+     SynchronizeStackValues();
+     FlushCachedRegs();
++    if (fexc_slice1) FlushStackFault();
+   }
+ }
+ 
+-- 
+2.39.5
+

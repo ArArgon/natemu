@@ -102,7 +102,7 @@ The census C0 (§3) lists the forms the real binaries contain; rows below are th
 | --- | --- | --- | --- | --- |
 | Guest RAM and layout | **Decided:** M69 map, default L = 2 GiB (configurable 1–3 GiB), H = 0; tests choose their own size | `GUEST_RAM_BYTES` (4 MiB, `crates/abi/src/execution.rs:61`) and all per-page structures from the manifest; holes are non-RAM; shadow pool (`POOL_PAGES` = 32, `crates/abi/src/shadow.rs:20`) sized for a kernel working set, resets counted | Standing suite at 4 MiB and 2 GiB; programs above 16 MiB and at holes | M1 |
 | Memory types: PAT, PWT/PCD, MTRR | Linux PAT = WB, WC, UC-, UC, WB, WP, UC-, WT (`K mm/pat/memtype.c:344`, written `:234`); LAPIC/IOAPIC mapped UC | Walker evaluates PAT/PWT/PCD (and MTRR if advertised) instead of halting (`shadow status=1 detail=7`, slice-3 S3a2); RAM of any type runs as coherent WB (declared deviation); device pages take M3 | Paging cells with PAT bits (`coherence_model.py` profile updated); QEMU | M2 |
-| MMIO from translated code | xAPIC, IOAPIC | Device ranges never shadowed; an abort at a described load/store site completes once through the device owner with the site's width, direction and register, then resumes after that native access; string/vector/atomic MMIO → typed stop | QEMU programs on device pages; #PF-before-device priority | M3 |
+| MMIO from translated code | xAPIC, IOAPIC | Device ranges never shadowed; an abort at a load/store site completes once through the device owner from the site's completion record (fexc's decode of the translated instruction: width, direction, register and merge, length), then resumes after the instruction; every other form (string, vector, RMW, atomic) → typed stop | QEMU programs on device pages; #PF-before-device priority | M3 |
 | 1 GiB pages | Only with GBPAGES | Not advertised (CPU 16); PS in a PDPTE → #PF(RSVD) (contract 10) | Existing cells | — |
 
 ### 1e. Devices, firmware interface, loader
@@ -175,6 +175,7 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 | **U1** x86 privilege in shadows | E2 shadows carry no x86 U/S (the walker checks at the current CPL; CPL is fixed per run today). Before any CPL transition (X1b delivery from CPL3, S3 SYSCALL/SYSRET, IRETQ to CPL3): keep one shadow space per x86 CPL class (separate ASIDs/roots for CPL0 and CPL3) so a CPL change switches spaces instead of resetting, and a CPL0 shadow can never serve a CPL3 access | Fault matrix at both CPLs across transitions; syscall/IRET round trips that touch supervisor pages before and after | standing suite | no CPL3 access through a CPL0 shadow; no shadow flush per transition |
 | **G1** guest-state page (minimum built in I1; remainder (MXCSR, x87, AVX-high fields) with I5/I6/I8) | One EL0 page per vCPU at a fixed non-canonical address holding only FEX guest-state fields (DF, FS/GS, MXCSR, x87, AVX-high); documented deviation (a guest access to that page reaches its own state instead of #GP); the page lies outside the private window `[PRIVATE, PRIVATE+1 GiB)` or is exempted explicitly in `aborted`; invariant test | Layout test; non-#GP limited to that page | standing suite | invariant test fails on any non-guest field |
 | **K1** code cache across CR3/INVLPG | Blocks filed by guest-physical source pages; CR3/INVLPG drop only shadows; linear→physical revalidation on lookup; per-page invalidation for host/device writes | Address-space switch programs keep translations (counted); remap/rewrite always retranslated; QEMU at 1–4 vCPUs | `system`, `coherence`, `sharedpt` | no full flush on CR3 |
+| **K2** resident system-instruction path | Every system instruction is a host exit for its decode today (measured: FLD+FSTP m80 11.4 us per pair against <0.1 us for m64; CPUID/RDTSC, CLI/STI/POPF, SWAPGS, MSR and CR accesses, Linux's irq save/restore and syscall paths all pay it). Decode once when the block is translated, from the bytes fexc translated (so cross-modifying code sees old-or-new, as M3's site records), store the decoded system record in the block, and run the transaction in the resident with no host exit; keep host exits only for work that needs the host (devices, entropy refill, CPUID/MSR state the host owns, if any) | Exit counts per system kind before/after; the standing suite unchanged; XMC toggle cases (old-or-new); cost per CLI/STI/POPF/SWAPGS/RDTSC/FLD m80 measured | standing suite | no decode exit for an admitted system instruction |
 | **S4** debug: TF and breakpoints | TF/RF single-step, DR0–3/DR7 execute and data breakpoints, #DB delivery, interaction with linking/dispatch (CPU 16 requires it); once breakpoints are armed, writes to DR0–3 and DR7 must flush this vCPU's code or key it by them | QEMU programs; SDM model | standing suite | #DB exact per SDM |
 | **C0** census (after Q2) | Static census of instruction forms admission refuses, over the Debian decompressor, the decompressed vmlinux and the initramfs `/init` binaries, by H §2's static-share method with fexc's classifier | Counts per form and per binary; spot-check against `llvm-objdump` | — | every refused form is listed with its I-chunk or a proposed typed refusal |
 | **L0** host split | Host library + driver crate; generic stop-ELR hook for `forge_stop` (slice-3 phase-end deviation); manifest-taking boot entry stub | Standing suite; `contain` tampers fire | all | green; no tamper code in the library |
@@ -204,6 +205,7 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 | **I5a** SSE state and arithmetic (~1–2 runs) | XMM/MXCSR in the frame, vector sites, recovery, ordering cells | FEX ASM SSE; QEMU corpora; vector fault matrix; litmus vector cells | ASM, `litmus`, faults | SSE ASM tests pass or refused with reason, 0 fail |
 | **I5b** FXSAVE/XSAVE family and gating (~1 run) | FXSAVE/FXRSTOR, XSAVE/XRSTOR/XSETBV/XGETBV, CR0.TS/CR4 gating; XRSTOR #GP on a bad header, #PF on user buffers via the exception table; XCR0 bit 2 and YMM state while AVX is advertised | FEX ASM tests; SDM table for the faults | ASM, faults | images match CPU 16 layout |
 | **I6** x87 reduced precision | FEX reduced mode; 80-bit images; helper inventory | `X87_F64`; QEMU exact-by-construction | ASM | 0 fail; deviation recorded |
+| **I6b** x87 helper forms without a helper library | Research (Oct 29, read-only): no general in-VM helper library (needs an EL0 stack page and an EL0 rodata page, helper code outside admission, IRQ/stop handling inside helpers; pays off only for full 80-bit mode, which the owner did not choose). Instead: FSIN/FCOS/FSINCOS/FPTAN/FPATAN/F2XM1/FYL2X/FYL2XP1/FSCALE/FPREM/FPREM1 by `svc` to the resident (division precedent), computed with the toolchain's compiler_builtins libm, with x87's C2 out-of-range rule and FPREM's quotient bits and partial remainder (FEX has neither); PCMPISTRI/PCMPESTRI (I5c) the same way, porting FEX's pure C++; FLD/FSTP m80 cost goes with K2, then inline conversion in fexc only if still hot (one 10-byte crossing check before the first store) | x87 corpus extended with these forms; SDM C2/quotient-bit cases; census | ASM, faults | refused forms executed or refused with reason |
 | **I8** AVX/AVX2 (if Q3 keeps them) | YMM ops | FEX ASM VEX tests | ASM | as I5a |
 | **R1a** single-vCPU composites (~1 run) | Decompressor entry; kernel head (`head_64.S:37-405`); early #PF table building; `int3_selftest`; alternatives/static-call patching through a second mapping under another CR3; syscall round trip with PTI CR3 switch and VERW; timer tick into `sti; hlt`; serial write with IRQ4 | QEMU system mode with the same programs | all | each matches at block sizes default/1 |
 | **R1b** SMP composites (~1 run) | Mailbox AP start into the head; `text_poke_bp` + IPI `sync_core`; paranoid NMI with `lsl`; IPIs under load | QEMU at N = 2..4 | all | each matches at N = 2..4 |
@@ -881,6 +883,77 @@ self-exit is a block exit, so `completed` clears RF there, while x86 keeps RF se
 uses it before S4). **Not built / choices:** the 8-byte-aligned 16-byte vector access above (refused at an access site;
 completing it needs the access emulated); the SDM orders neither way #AC against #PF on a page not present, and natemu gives
 #AC (Arm takes the alignment fault before translation).
+*Built (M3, MMIO completion; fexc series23-m3 = series22 + a shim change, `shim/fexc_mmio.inc`):* **Device pages.** A
+guest-physical page that is not guest RAM is a device page; the host owns a registry of page-aligned device ranges above RAM
+(`crates/host/src/devices.rs` `Devices`; `Device::read(vcpu, offset, size) -> Option<u64>`, `write(.., value) -> bool`, sizes
+1/2/4/8, `None`/`false` = the device refuses the access, unchanged). Choice: no shadow plus the walker's result, not a stage-2
+hole: the resident already walks at every shadow miss, so `translate` returning a non-RAM gpa unshadowed makes every access
+abort at its recorded site in the resident, where the site gives the precise state; a stage-2 hole would exit to the host
+from inside the block with no site, banked state or walk (the walk's #PF must come first). Memory type does not matter for a
+device page (device ranges are UC; RAM with a non-WB type still stops, M2's). **Fault priority:** at the abort the walk of
+every page touched has run, so canonical #GP/#SS, #AC (SCTLR.A, X2) and every #PF the tables owe (not present, U/S, R/W with
+WP, reserved bits, upper levels, the second page of a crossing access) come before any device effect; the walk's A/D updates
+stay when the access is then refused (as on x86). **Completion from the site** (`execution/mmio.rs`): fexc records, from
+FEX's own decode of the instruction it translated (`shim/fexc_mmio.inc`, called from the slice-1 allowlist), a completion
+record for the one load or store site of each MOV-family instruction (88/89/8A/8B with a memory operand, C6/C7 /0, A0-A3
+moffs64, MOVZX, MOVSX, MOVSXD as FEX lowers it; no LOCK/REP/67): x86 register (AH..BH), destination size, zero- or
+sign-extension from the access width, store or load, length; it rides in the site's `guest_offset2` slot
+(`code_object::completion` checks it against the site's width and direction; admission requires its length to end at
+the next instruction boundary of the PC table or at the block's end). A
+store's data is the site's native transfer register (what the translated instruction stores: an immediate or AH..BH
+included). The resident banks the state at the instruction, makes the one device access (`mmio::local` first, the hook for a
+resident device such as X3's LAPIC, then the host: `REQUEST_DEVICE` after `dsb sy`, the `Mmio` record at state page +0xe00
+holding gpa, width, direction and data; the host performs exactly that read or write under the device's mutex, never decoding
+x86), merges a load as x86 does (8/16-bit keep the rest, 32 zero-extends), moves RIP past the instruction and never runs it
+again: exactly once. Nothing at run time reads guest bytes, so cross-modifying code gives x86's old-or-new outcome: a block a
+peer's rewrite killed is stepped from the new bytes before any site is served (`aborted`), and a block still running ran
+the old instruction its records describe. **Older defect fixed here (P1):** the single-instruction step treated a system
+instruction in its reply as `bad_reply`, so a peer replacing an instruction by INT3 (Linux's `text_poke_bp`) halted the vCPU;
+`step` now executes it as `find` does (both entries, `find` → step and `aborted` → `step_from`) and continues through
+`find`, so the next boundary's checks run (an interrupt a POPF, IRET or STI made eligible is taken there, not one instruction
+late); only a BT* form found aligned is stepped again, compiled plain. Linux's
+accessors emit exactly the completed forms (`arch/x86/include/asm/io.h` `build_mmio_read/write`: `mov` with a register;
+`apic.h` `native_apic_mem_write` `movl` (XCHG only for X86_BUG_11AP); the APIC-ID read in `head_64.S:268-270`). **Refused**
+(`unsupported_mmio`, 48, before any device effect, state at the instruction, reason in `Mmio::status`): `atomic` (LOCK forms,
+XCHG), `site` (pair/push/pop sites), `crossing` (a load or a split store crossing a page with a device page on either side,
+after both walks), `form` (a site without a completion record: RMW, CMP/TEST, BT*, CMPXCHG, SETcc, PUSH/POP/CALL m, MOVNTI,
+strings, SSE), `unassigned` (no device claims the page; an MMIO rule for unassigned pages is the owner's), `device` (the device
+refused the access), `system` (a system instruction's or a delivery's own access to a device page, `segments::linear`; nothing
+written). CLFLUSH of a device page completes with only the walk's faults. **For X3, L3, L4:** register a `Device`
+(`Arc<Mutex<dyn Device>>`) on page ranges; a handler runs on the accessing vCPU's thread with that vCPU stopped, gets its
+number, is serialised with every other access to that device by its mutex (one total order, each vCPU's in program order),
+must return promptly (never wait for another vCPU or for input: peers' shootdowns spin meanwhile) and may refuse an access it
+does not implement (e.g. a non-32-bit LAPIC access). A resident device answers in `mmio::local` (it sees the access's gpa,
+width and data, with the vCPU's state; the merge and RIP are the completion record's), with no host exit. Limits: the
+registry is fixed before the vCPUs run and lies above RAM (a relocatable APIC base or holes below the top of RAM need M1 and a
+mutable registry). **Cost:** each device access ends its block (the resident dispatches at the next RIP, an L1/L2 lookup)
+and makes one host exit unless `mmio::local` answers it. A peer's failure cancels the run: a device request the host has not yet
+served is never performed (it checks before serving); one it has served may be left performed and uncommitted (the vCPU
+ends at the instruction). The stop is terminal, so nothing replays the access. **Checks** (`tools/run_m3.py`, series23-m3, block sizes default and 1; driver item
+`mmio VA GPA [unassigned]` maps a page to a test device with a counting counter register, an order-checking sequence
+register, a refusing last 8 bytes and memory, and reports per-vCPU access counts and log): `corpus` 60 seeded MOV-family
+programs and 6 fixed encodings (REX before 66, 66 before REX.W, BPL and CH stores, imm16, a 16-bit moffs; 715 device
+accesses) at CPL 3 and 0: registers, RFLAGS, RIP and the page's bytes equal pinned QEMU running them on RAM (except `48 66
+8b 03`, judged by the SDM: REX not before the opcode is ignored, a 16-bit MOV; QEMU keeps REX.W), and the device's ordered
+access log and registers equal `tools/models/mmio_model.py` (independent author; it refuses a prefix after REX, so the fixed
+REX-before-66 program is QEMU/SDM only): 264 runs, 0 failures; `faults` 22 cases (#PF not present at CPL 3/0, load and
+store; supervisor page at CPL 3, completes at CPL 0; read-only store at CPL 3 and CPL 0 with WP, read-only load completes;
+reserved bit; PDE not present; crossing into a page not present; #GP and #SS non-canonical; #AC misaligned, aligned completes;
+CLFLUSH completes untouched and faults not present; ADD, LOCK ADD and XCHG on a read-only device page give #PF(7) before
+their refusal; identical loads and stores back to back in one block each reach the device); `refusals` 28 cases (crossings
+both ways, a device refusal) with their reasons and the device untouched; `kicks` 1-4 vCPUs looping counter reads (each
+vCPU checks the values increase) and sequence writes under random host kicks (20,000 iterations and 1,000 kicks per vCPU):
+device reads and writes per vCPU equal the iterations, no order error, kick accounting exact; `contain` a device reply with
+an unknown status halts `bad_reply` with nothing committed; `xmc` (the review's repro): vCPU 0 loops a device load while
+vCPU 1 rewrites it with no synchronisation (the same byte, load <-> store, another register, INT3 <-> the load; and INT3 over
+a plain RAM load), 300,000 rounds against 20,000,000 rewrites: vCPU 0 reaches its end or takes #BP after the INT3, never
+stops otherwise, device accesses = rounds done (hundreds of steps from rewritten bytes per run); `boundary`: with IF = 0 and
+an interrupt pending, a peer rewrites POP RAX into POPF (sets IF, no shadow) or NOP into STI (shadow): the interrupt is
+delivered exactly at the boundary `delivery_model.recognise` first allows. Independent reviews:
+first pass ACCEPT (its non-blocking findings taken); the second found the host's run-time decode wrong under cross-modifying
+code and the step's system reply (P1), both fixed as above. **Not built:** RMW, string, vector and LOCK forms on device pages
+and crossing accesses (typed stops; Linux's device paths use none), an MMIO rule for unassigned pages, a resident device
+(`mmio::local` is X3's), a relocatable or mutable registry (M1/X3).
 **I5c (recorded, not built; the I5a review's design): unmasked SIMD exceptions.** Hardware FP traps are not used although
 the M4 has them (the review's probe: FPCR's trap enables stick and a trapped divide by zero is a synchronous exception, EC
 0x2C): a trap reports one Arm operation's exceptions, while x86 delivers #XM (#UD without CR4.OSXMMEXCPT) for the whole
@@ -893,6 +966,144 @@ mask-changing LDMXCSR/FXRSTOR/XRSTOR flushing the vCPU's code) give each SSE flo
 FPSR, compute into a temporary, test the FPSR bits of the unmasked exceptions, branch to a #XM stub (the state before the
 instruction, the flags it raised for the resident to merge) or commit the temporary to the destination. Until then an LDMXCSR
 that clears a mask stops `unsupported_system`.
+*Built (I6, x87 at reduced precision; fexc series25 (the combined I6 + M3 build), patch 0019 and shim changes; after review):* x87 runs in FEX's reduced-precision
+mode (`X87REDUCEDPRECISION`, set by `--profile slice1`; owner direction "x87 performance over accuracy"): every ST(i) is a
+double. **State:** the guest-state page holds FEX's x87 fields (`frame::X87_*`): `mm[8]` (ST(i) = `mm[(TOP + i) & 7]`, low
+8 bytes), the TOP, C0..C3 and IE flag bytes, the abridged tag byte (bit i: register i not empty), and the x87 exception word
+(x28 + 0x4b4, in FEX's padding after the tag byte: FPSR's bit order, IE ZE OE UE PE in bits 0..4, DE in 7, SF in 6). The page
+is authoritative for these (guest data: the resident reads and writes them only in x87 transactions, never trusts them; TOP is
+masked to 0..7 wherever generated code indexes `mm`). FCW is the bank's (`Cpu::fcw`, FNINIT state 037FH at driver start,
+not RESET's 0040H), written into the page at every `enter` and never read back (FNSTCW reads it there). GUEST_STATE and
+GUEST_STATE_WRITABLE list the fields (FCW readable only); the layout test pins every offset. **Translation:** patch 0019 keeps
+FEX's x87 stack pass on its slow path and flushes (and drops its caches) after every lowered op, so the x87 state is exact in
+the page at every instruction boundary (a fault or stop anywhere sees it; no register pressure across a block: slice1 admits
+no spill area); ST(i) is `add x0, x28, xI, lsl #4; ldr|str dN, [x0, #0x420]` (context-indexed, no site; admission's
+code-shape check accepts exactly that pair). The JIT wraps each floating-point op of an admitted x87 instruction
+(`FexcX87Op`: VFADD/SUB/MUL/DIV/SQRT, FCMP, the conversions): FPSR cleared before it (MXCSR's flags saved in x3 and put back
+after), its FPSR flags OR-ed into the exception word after it; when FCW.RC differs from MXCSR.RC, or MXCSR has FTZ/DAZ, the
+host passes `--x87-fpcr` and the op runs under FPCR AH|NEP|RMode(FCW.RC) (x2 keeps MXCSR's). So x87 flags never reach
+MXCSR, and x87 rounding is FCW's. Code is keyed by the x87 rounding (`Cpu::code_context` bits 14..16: set only when it
+differs) and CR0.MP (bit 13). **Forms admitted (generated code):** FLD/FST/FSTP m32/m64/ST(i), FILD m16/m32/m64,
+FIST/FISTP/FISTTP m16/m32/m64 (patch 0019: x86's integer indefinite with IE for a NaN or an out-of-range value, PE only for
+a stored inexact integer; FEX saturated, and stored a 64-bit conversion's low half for m16), FADD/FSUB/FSUBR/FMUL/FDIV/FDIVR in all
+register and memory forms, the P and FI forms, FCOM/FCOMP/FCOMPP/FICOM/FICOMP/FTST (signalling compares, `fcmpe`: IE for a
+QNaN), FUCOM/FUCOMP/FUCOMPP, FCOMI/FCOMIP/FUCOMI/FUCOMIP (OF, SF, AF cleared as the SDM says), FCMOVcc, FXCH, FLD1/FLDZ and
+the other constants, FSQRT, FRNDINT (frintx: PE), FXAM (patch 0019: x86's classes of a double), FINCSTP,
+FDECSTP, FFREE, FNOP, FCHS/FABS (patch 0019: sign-bit operations: Arm FNEG/FABS leave a NaN unchanged under FPCR.AH), FNSTSW AX/m16 (exception flags from the exception word; ES and B 0), FNSTCW, WAIT. **Resident
+transactions** (`execution/x87.rs`; 80-bit conversions in `natemu_abi::x87`): FNINIT, FNCLEX, FLDCW, FLDENV/FNSTENV,
+FRSTOR/FNSAVE (14/28 and 94/108-byte images; FNSAVE then initialises), FLD/FSTP m80 (with x86's stack overflow/underflow:
+IE and SF, C1, the indefinite), each after its gating, with #PF/#GP/#SS (the whole image walked before any byte moves) and
+#AC by SDM Table 7-7 (2, 4 or 2 by image size, 8 for m80). **Helper inventory (FEX's reduced-precision mode):** host libm
+helpers through the frame's pointers for F2XM1, FYL2X, FYL2XP1, FPTAN, FPATAN, FPREM, FPREM1, FSCALE, FSIN, FCOS, FSINCOS:
+refused (`unsupported_form`); SoftFloat fallbacks F80CVT/F80CVTTO for FLD/FSTP m80, FNSAVE/FRSTOR (and FXSAVE/FXRSTOR, I5b):
+replaced by the resident's conversions; F80BCDLOAD/F80BCDSTORE (FBLD/FBSTP): refused; FXTRACT is native but splits a
+denormal double wrongly: refused; everything else is native code. Also refused: FENI/FDISI/FSETPM, the undocumented aliases
+(DC D0/D8, DD C8, DE D0, DF C0..DF, including FFREEP) and reserved encodings, 66/F2/F3 on x87 forms, MMX-register forms.
+**Exceptions (decision):** every x87 exception stays masked: FLDCW, FLDENV and FRSTOR (FXRSTOR in I5b must do the same)
+whose FCW clears a mask stop `unsupported_system` before any effect, so #MF is never due and CR0.NE (FERR#) cannot matter:
+no refusal of NE = 0 is needed. Masked responses are the double operation's (indefinite, infinities, zeros) and the flags its
+FPSR flags. **Stack faults** (SDM Vol.1 8.5.1.1, masked): FEX models none, so patch 0019 adds them in the x87 stack pass, for
+every form at once: each read of a register checks its tag (an empty one reads as the QNaN indefinite: stack underflow) and
+each push checks that register TOP - 1 is empty (else the indefinite is pushed: overflow); the instruction's IE and SF bytes are
+set, and C1 = 1 for an overflow, 0 for an underflow, at the next instruction's start (so after its own store: a #PF there
+leaves FSW as it was, and the #PF wins). The indefinite then gives each form its masked response by itself: arithmetic and
+FSQRT write it to the destination (now marked valid), FST/FSTP store it (FFF8..0H, FFC00000H for m32), FIST/FISTP/FISTTP the
+integer indefinite, compares are unordered (FCOMI: ZF PF CF = 1), FXCH loads it into the empty register before the exchange,
+FLD ST(i) pushes it, and an arithmetic result after an underflow is the indefinite even beside a NaN operand (after review);
+FCHS/FABS of an empty register give the indefinite itself; FXAM reads its register unchecked (no fault for
+an empty one, SDM FXAM). FCMOVcc checks both operands (an empty one reads as the indefinite whatever the condition: the SDM
+names #IS there without a per-instruction response). The resident's FLD/FSTP m80 do the same. Cost: an x87 loop of
+FLD m64/FADD/FMUL/FSTP takes 33.5 ns per iteration on series25 against 23.6 with only the stack checks (series24-i6) and 24.2
+without them (series23-i6): most of it is FLD m64's quieting multiply inside the FPSR wrapper (two `mrs`/`msr` pairs); the
+same loop's integer form takes 1.6 ns. **Gating
+(translation time):** `--x87-gated` (CR0.EM or TS) cuts every documented x87 form, the refused ones included, as gated, and
+`--wait-gated` (TS with MP) cuts WAIT; the host answers `X87_GATED` and the resident raises #NM; the resident's own x87
+transactions check EM/TS first; WAIT under EM alone runs (SDM Vol.3 Table 2-2). **Deviations (recorded; the reduced-precision
+class the owner accepted, every other one listed):**
+1. Values are doubles: 53-bit significands whatever FCW.PC, the double's exponent range for every intermediate (overflow,
+   underflow and denormals at double thresholds: `1e300 * 1e300` is infinity, with OE, where x87 holds 1e600), so every
+   inexact result and every comparison or integer conversion of one may differ from an 80-bit x87 (integer-visible:
+   FIST/FISTP of such a result, FNSTSW condition codes of a comparison of one, OE/UE/PE flags).
+2. FLD m80 and FRSTOR round an 80-bit value to a double by FCW.RC (x87 holds it exactly); pseudo-NaN, pseudo-infinity and
+   unnormal encodings load as the indefinite; an SNaN keeps as much payload as fits (bit 0 if none). FILD m64 of more than
+   53 significant bits rounds at the load (PE). FSTP m80, FNSAVE and the FXSAVE image widen exactly.
+3. FLDPI, FLDL2T, FLDL2E, FLDLG2, FLDLN2 load the nearest double whatever FCW.RC.
+4. FSW exception flags are the double operation's FPSR flags: equal to x87's when the double operation is exact or rounds
+   as the 80-bit one would (the QEMU corpus), else they may differ (PE, OE, UE); DE: FLD m32/m64 of a denormal raises DE
+   as x86 does (after review: FLD m64 is a multiply by 1.0 inside the x87 FPSR wrapper, which also quiets an SNaN with IE;
+   FST/FSTP m64 quiets an SNaN with IE in integer code), but arithmetic on a double denormal (an 80-bit normal) raises DE
+   where x87 would not.
+5. C1 is never the round-up indicator: every instruction that reads a stack register stores C1 = 0 (the stack check's
+   flush), so after arithmetic, FSQRT, FRNDINT, FST/FSTP, FIST/FISTTP and FCMOVcc C1 reads 0 where x87 would report a
+   round-up (1). Every other C1, C0, C2, C3 the SDM defines is exact: C1 = 0 or 1 for overflow on every push, 0 for
+   FCHS/FABS, FCOMI/FUCOMI(P) and any stack underflow; compares, FTST, FXAM, FXCH, FINCSTP/FDECSTP and the resident's forms.
+6. Two NaN operands: FPCR.AH's rule (the first operand's NaN), not x87's larger significand.
+7. (Built before review: stack faults are detected; see above.)
+8. FIP, FCS, FOP, FDP, FDS are not modelled: 0 in FNSTENV/FNSAVE images (and FXSAVE's); the 28-byte image's upper words are 0.
+9. An x87 store whose memory access faults has already OR-ed its FPSR flags into the exception word (FSW may show the
+   faulting FST m32/FIST's PE/OE/UE/IE at the fault); `verify_precision` reports these sites (569 in the corpus) instead
+   of failing P1.
+10. FSW.ES and B read 0 (every exception masked); FLDENV/FRSTOR take FSW's other bits as given; FCW is stored as loaded.
+11. The tag word in FNSTENV/FNSAVE images is computed from the doubles (zero 01, NaN/infinity 10, else 00: a denormal
+    double is an 80-bit normal); FLDENV/FRSTOR keep only empty/non-empty.
+12. G1's page deviation now covers the x87 fields: a guest data access to the page reaches its own x87 state.
+**Not built (remaining; census counts from `kernel-census-i6-20261029-01`):** the transcendental, remainder and scale forms
+(FPATAN 22, FSCALE 9, FYL2XP1 8, F2XM1 5, FPREM 4, FYL2X 4, FPREM1 1: 53 initramfs sites, none in the kernel; FEX's helpers
+need resident or native implementations); FXTRACT (3, a denormal-aware split); FBLD/FBSTP (0 in the census); FFREEP (DF C0+i,
+an undocumented alias: 3); MMX (the x87 registers as MM0..7: 1,381 initramfs sites and 1 kernel site, filed under SSE by the census); unmasked x87 exceptions
+(#MF: the I5c-style design applies, blocks keyed by FCW's masks with per-instruction FPSR checks; FLDCW/FLDENV/FRSTOR refuse
+them today, 160 + 44 + 0 initramfs sites take the transaction); FIP/FDP (0 in images); FLD/FSTP m80 as resident round
+trips (2,411 FLD m80 and 1,098 FSTP m80 initramfs sites): a loop of FLD m80 + FSTP m80 takes 11.4 us per iteration against
+under 0.1 us for FLD/FSTP m64, because every system instruction is a host request for its decode today (a resident decode
+cache, L5, or native 80-bit conversions would remove it).
+**For I5b:** FXSAVE/FXRSTOR's and XSAVE's x87 image is built from `Cpu::fcw`, `x87::fsw()`, the abridged tag byte as it is in
+the page (`frame::X87_FTW`, FXSAVE's own format), ST(i) = `natemu_abi::x87::to_f80(x87::mm(x87::top() + i))` at 32 + 16i (bytes
+10..15 zero), FOP/FIP/FDP 0; restoring takes FCW (refuse a cleared mask: `x87::masked`), `x87::set_fsw`, the tag byte and
+`x87::set_mm(top + i, from_f80(.., FCW.RC))`; then (MXCSR aside) a FCW change needs no flush: the x87 rounding is in
+`code_context`. fexc must cut FXSAVE/FXRSTOR (it does: `0f ae /0 /1` are `unsupported_form` today). **Host/fexc pairing:** the
+host passes `--x87-gated`, `--wait-gated` and `--x87-fpcr` whenever the vCPU's CR0 or FCW/MXCSR call for them, so it needs a
+fexc of series25 or later (series22 refuses the arguments: runs with CR0.TS/EM set, or MXCSR.RC not nearest, fail there;
+fexc refuses `--config X87REDUCEDPRECISION=0` under slice1).
+**Checks** (series25, block sizes default and 1 where VM programs): `tools/reference/gen_i6.py` corpus (120 programs, x87
+forms on `double` groups, FCW.PC = 53 bits, and `exact` groups, PC = 64 bits; FNSTSW after compares and FXAM, SETcc after
+FCOMI, FNSTENV/FNSAVE/FRSTOR/FLD/FSTP m80 round trips, the stack stored at the end) against QEMU 7.2: 120 match at both block
+sizes. Recorded QEMU differences the corpus steps around: FCOMI keeps OF/SF/AF (SDM: cleared; not compared after one), FCOM
+and FTST keep C1 (SDM: cleared; masked after compares, FXAM's C1 cleared through FLDENV), FSQRT of a negative sets C2
+(undefined: FTST follows), no stack faults at all, and its in_asm log garbles an instruction crossing 1 KiB of a translation
+block (the generator ends blocks every ten operations). `tools/run_i6_faults.py` (276 cases, judged by the SDM rules in its
+docstring; QEMU is no oracle for stack faults): #PF not present/read-only/crossing, #GP/#SS non-canonical and straddles for 24
+memory forms with the x87 state and memory unchanged at each fault; #NM under TS, EM, TS+EM, TS+MP for 13 forms (refused ones
+included), WAIT only with TS+MP; FCW unmasking refused (FLDCW/FLDENV/FRSTOR); helper forms and FBSTP `unsupported_form`; LOCK
+#UD; FLD m80 overflow and FSTP m80 underflow; FXAM's six classes; FIST/FISTTP indefinite with IE and no PE, PE alone when
+inexact; x87 flags never in MXCSR and FCW.RC against MXCSR.RC/FTZ in one block; 29 stack-fault cases (overflow on FLD
+m32/m64, FILD, FLDZ, FLD ST(i); underflow on FADD register and memory forms, FSUBP, FSQRT, FCHS, FABS, FST/FSTP
+m32/m64/ST(i), FIST/FISTP/FISTTP, FCOM, FUCOM, FCOMP, FTST, FCOMI, FUCOMIP, FXCH, FLD ST(i); FXAM after FFREE without a fault;
+FNCLEX after one; FSTP's #PF ahead of its underflow), each checking FSW, the tag byte, the registers and the stored value; the
+review's cases (C1 after FLD m64, FLD1, FLDPI, FILD, FLD ST(i), FCHS, FABS and FCOMI following an FXAM of a negative value; SNaN
+through FLD m32/m64 and FST m64; FLD m64 of a denormal (DE); an underflow beside a QNaN; FCOMI clearing OF/SF/AF; 66 + REX.W
+FNSTENV writing the 28-byte image; re-keying across FLDCW, FLDENV and LDMXCSR; #AC at CPL 3 on 15 x87 operand forms by Table
+7-7); Linux's probes (the decompressor's FNINIT/FNSTSW/FNSTCW: status 0, control & 103FH = 3FH; the FDIV-bug sequence stores
+0): 276 as expected at both block sizes; the reviewer's own 33 reproducers pass. `verify_precision` on the corpus bodies
+(`gen_i6.py --vp`: the resident forms and block-ending jumps removed, so every body compiles as one block): 120 compiled,
+12,579 sites, 0 violations, 568 x87 store sites reported under deviation 9 (28.8 native instructions per guest instruction).
+Non-x87 objects (fixtures, seed 4242, the I5a corpus: 222 programs) are byte-identical to series22. FEX ASM suite: 794 -> 1,052
+pass, 0 fail, 22 `precision deviation` (`run_asm.py` `x87_value_ok`: every difference is an x87 register MMn widened from its
+double, or an XMM register holding an 80-bit image, that is exactly the 80-bit expectation rounded to 53 bits under one of the
+four rounding modes; a NaN must agree in sign, quiet bit and the top 51 significand bits; an 80-bit denormal expectation never
+matches; only the 15 named FEX precision tests (FCW.PC single/double/extended, deviations 1-2) may also have the expectation
+equal to our double rounded to 24 bits, or one 53-bit ulp from it (FLD m80 rounded the operand under the group's RC: FSUBR's
+0 - x then rounds the other way); any GPR, RIP or other difference fails, and the review's hole tests are must-fail selftests:
+D9_E9..ED (FLDL2T..FLDLN2, deviation 3), DD_04, DD_04_2 and the 15 precision_test_*), x87
+unsupported: 79 transcendental/remainder/scale, 10 FXTRACT, 7 undocumented aliases, 6 FFREEP, 5 BCD, 4 FXRSTOR (I5b), 2 FCW
+unmasking (D9_05, refused), 1 expecting FEX's FXAM bug (FXAM_Simple); X87: 134 of 217 pass, X87_F64: 110 of 150. Census
+(`experiments/track03/kernel-census`, rerun into `natemu-raw/kernel-census-i6-20261029-01/`): x87 class kernel 31 -> 10
+(FXSAVE/FXRSTOR only: I5b), initramfs 14,440 -> 65; x87 forms filed `system` (resident transactions): kernel FNINIT 7, FNCLEX
+1; initramfs FLD m80 2,411, FSTP m80 1,098, FLDCW 160, FNSTENV 44, FLDENV 44, FNCLEX 16. Full standing suite on series25 (the
+combined I6 + M3 build): unit (cargo 0 failures, python), stack check, fix/fix-1 64, seed/seed-1 44, faults and faults-1 7,581
+each (faults rerun once after `hv_vm_create` contention from another agent's VMs), flow 64, loopfaults 846, probes 83, i5a
+faults 454, i5a DE 351, corpora, smp, limits, kicks, system, coherence, sharedpt, litmus, contain, privilege, delivery, events,
+i6 faults 276 at both block sizes, `run_m3.py` (corpus 66 programs / 715 accesses, faults, refusals, kicks, contain, xmc,
+boundary), all with 0 failures.
 **Owner decision (October 28): MTRRs enabled by the virtual firmware, RAM write-back, device ranges uncached** (plan Q3).
 **Deferred (owner, October 28):** replacing the host's minimal JSON reader (`crates/host/src/json.rs`, used only for
 fexc's per-compile report: end reason and cut opcode) by carrying those fields in the code-object header; no registry

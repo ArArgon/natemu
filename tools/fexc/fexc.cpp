@@ -229,6 +229,18 @@ void JoinSites(uint64_t rip) {
     }
   }
 }
+// M3: the completion record of a load or store site (shim/fexc_mmio.inc), or 0: its instruction's record when the site is
+// that instruction's only access, a plain one (not half of a read-modify-write, a general register) of the recorded width
+// and direction. The binary object carries it in the site's guest_offset2 slot, the JSON as "mmio".
+uint32_t MmioRecord(const FexcSiteInfo& s, uint64_t rip) {
+  if ((s.kind != FEXC_SITE_LOAD && s.kind != FEXC_SITE_STORE) || s.rmw != 0 || s.data_class != 0) return 0;
+  const auto it = fexc_mmio.find(rip + s.guest_offset);
+  if (it == fexc_mmio.end()) return 0;
+  int accesses = 0;
+  for (auto& a : Cap.sites) accesses += a.guest_offset == s.guest_offset && a.kind != FEXC_SITE_GUARD && a.kind != FEXC_SITE_SPLIT && a.kind != FEXC_SITE_ALIGN && a.kind != FEXC_SITE_DIVIDE;
+  const uint32_t r = it->second;
+  return accesses == 1 && (1u << ((r >> 12) & 3)) == s.width && ((r >> 4) & 1) == uint32_t(s.kind == FEXC_SITE_STORE) ? r : 0;
+}
 const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other", "divide", "swap", "atomic", "align"};
 const char* const ExtendName[] = {"none", "uxtw", "sxtw", "sxtx"};
 const char* const RmwName[] = {"none", "load", "store"};
@@ -329,7 +341,8 @@ static void ResetGlobals() {
   W = {};
   fexc_sites.clear(); fexc_insns.clear(); fexc_cf_inverted.clear(); fexc_spill_bytes = 0; fexc_cut = {}; fexc_after_rep = 0;
   fexc_rip_relative.clear(); fexc_target_check.clear(); fexc_div_width.clear(); fexc_movs.clear(); fexc_lock_cas.clear();
-  fexc_align16.clear(); fexc_sse_gated = false; fexc_alignment_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear();
+  fexc_align16.clear(); fexc_sse_gated = false; fexc_alignment_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear(); fexc_mmio.clear();
+  fexc_x87_gated = fexc_wait_gated = false; fexc_x87_fpcr = 0; fexc_x87.clear();
 }
 
 // The CLI's body. `args` are the command-line arguments (args[0] is the program name); `given` replaces --hex/--file with the
@@ -369,6 +382,9 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     else if (a == "--no-tso") st.tso = false;
     else if (a == "--sse-gated") fexc_sse_gated = true;   // slice1 (I5a): CR0.EM/TS or no CR4.OSFXSR: SSE forms are system cuts
     else if (a == "--alignment-gated") fexc_alignment_gated = true;   // slice1 (X2): alignment checking on: BT* memory forms are system cuts
+    else if (a == "--x87-gated") fexc_x87_gated = true;   // slice1 (I6): CR0.EM or CR0.TS: x87 forms are system cuts (#NM)
+    else if (a == "--wait-gated") fexc_wait_gated = true; // slice1 (I6): CR0.TS and CR0.MP: WAIT/FWAIT is a system cut (#NM)
+    else if (a == "--x87-fpcr") fexc_x87_fpcr = strtoull(next(), nullptr, 0);   // slice1 (I6): FPCR of x87 arithmetic when MXCSR's differs
     else if (a == "--feature") { std::string v = next(); auto eq = v.find('='); if (eq == std::string::npos) return Fail("--feature NAME=0|1"); overrides.push_back({v.substr(0, eq), v.substr(eq + 1) != "0"}); }
     else if (a == "--config") { std::string v = next(); auto eq = v.find('='); Config::ConfigOption o; if (eq == std::string::npos || !ConfigOptionByName(v.substr(0, eq), o)) return Fail("--config NAME=VALUE (NAME: a FEX config option, e.g. X87REDUCEDPRECISION)"); configs.push_back({v.substr(0, eq), v.substr(eq + 1)}); }
     else if (a == "--out") out = next();
@@ -376,12 +392,17 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     else return Fail("unknown argument " + a);
   }
   if (!missing.empty()) return Fail(missing + " needs a value");
-  if (!have_rip || (!given && hex.empty() == file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--alignment-gated] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
+  if (!have_rip || (!given && hex.empty() == file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--alignment-gated] [--x87-gated] [--wait-gated] [--x87-fpcr V] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
   if (bitness != 32 && bitness != 64) return Fail("--bitness must be 32 or 64");
   const bool slice1 = st.profile == "slice1";
   if (slice1 && bitness != 64) return Fail("profile slice1 is 64-bit only");
   if (slice1 && sparse_flag) return Fail("profile slice1 needs the dense PC table (sites would be attributed to the previous instruction)");
   if (slice1 && (st.tso || st.multiblock || st.end_marker)) return Fail("profile slice1 fixes TSO emulation off, multiblock off and no end marker");
+  for (auto& c : configs) {   // slice1 (I6): x87 runs in reduced precision only (the resident's state model is doubles)
+    Config::ConfigOption o;
+    if (slice1 && ConfigOptionByName(c.first, o) && o == Config::CONFIG_X87REDUCEDPRECISION && c.second != "1")
+      return Fail("profile slice1 fixes X87REDUCEDPRECISION=1");
+  }
 
   std::vector<uint8_t> bytes;
   if (given) bytes = *given;
@@ -416,6 +437,8 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
   Config::Set(Config::CONFIG_TSOENABLED, st.tso ? "1" : "0");
   Config::Set(Config::CONFIG_VECTORTSOENABLED, st.tso ? "1" : "0");
   Config::Set(Config::CONFIG_MEMCPYSETTSOENABLED, st.tso ? "1" : "0");
+  // slice1 (I6): x87 in FEX's reduced-precision mode (doubles; owner direction, boot-features plan I6).
+  if (slice1) Config::Set(Config::CONFIG_X87REDUCEDPRECISION, "1");
   for (auto& c : configs) { Config::ConfigOption o; ConfigOptionByName(c.first, o); Config::Set(o, c.second); }
 
   HostFeatures hf {};
@@ -699,6 +722,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
   for (auto& s : Cap.sites) {
     j.elem_obj().kv("native_offset", s.native_offset).kv("guest_offset", s.guest_offset);
     if (s.guest_offset2 != FEXC_NONE32) j.kv("guest_offset2", s.guest_offset2); else j.null("guest_offset2");
+    if (const uint32_t m = MmioRecord(s, rip)) j.kv("mmio", m);   // M3
     j.kv("insn_native_offset", s.insn_native_offset).kv("ir_op", s.ir_op).kv("kind", KindName[s.kind]).kv("width", int(s.width))
      .kv("intent", s.intent ? "write" : "read").kv("rmw", RmwName[s.rmw]).kv("segment", s.segment ? "ss" : "ds")
      .kv("base_reg", int(s.base_reg));
@@ -770,7 +794,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     put(64, f.size(), 4); put(68, Cap.sites.size(), 4);
     for (auto& s : Cap.sites) {
       const bool stub = s.kind == FEXC_SITE_GUARD || s.kind == FEXC_SITE_SPLIT || s.kind == FEXC_SITE_ALIGN;   // a stub's guest_offset2 is its access site
-      push(s.native_offset, 4); push(s.guest_offset, 4); push(stub ? s.access_native_offset : s.guest_offset2, 4); push(s.insn_native_offset, 4); push(uint32_t(s.imm), 4);
+      push(s.native_offset, 4); push(s.guest_offset, 4); push(stub ? s.access_native_offset : MmioRecord(s, rip) ? MmioRecord(s, rip) : s.guest_offset2, 4); push(s.insn_native_offset, 4); push(uint32_t(s.imm), 4);
       for (uint8_t b : {s.kind, s.width, s.intent, s.rmw, s.segment, s.base_reg, s.index_reg, s.extend, s.shift, s.writeback,
                         uint8_t(s.writeback_delta), s.data_reg[0], s.data_reg[1], s.data_class, s.nzcv, s.cf_inverted,
                         s.flags_written_before, s.ordering, s.completed_effects, s.located}) f.push_back(b);

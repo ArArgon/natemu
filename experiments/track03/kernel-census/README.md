@@ -47,6 +47,13 @@ SSE4.2 string functions), ADCX 736 and MOVBE 68 (filed as SSE: other features), 
 LDMXCSR/STMXCSR (kernel 1, initramfs 383: `system`, the resident's transactions); `other` fell too (kernel 23 → 19, initramfs
 3,086 → 2,302: SSE forms with an F2/F3 prefix the earlier classifier filed as a REP/REPNE prefix on an admitted opcode).
 
+**I6 re-check (October 29).** `census.py` ports the I6 x87 table (`x87_form`, fexc series23-i6: admitted forms, the resident's
+FNINIT/FNCLEX/FLDCW/FLDENV/FNSTENV/FRSTOR/FNSAVE/FLD/FSTP m80 filed `system`, the helper, BCD, FXTRACT, 287 and alias forms
+refused as `x87` with the reason; 66/F2/F3 on an x87 form refused). Rerun into `natemu-raw/kernel-census-i6-20261029-01/` (`x`
+linked to the C0 data; report in its `report/`). x87 class: kernel 31 -> 10 (FXSAVE/FXRSTOR: I5b), initramfs 14,440 -> 65
+(FPATAN 22, FSCALE 9, FYL2XP1 8, F2XM1 5, FPREM 4, FYL2X 4, FXTRACT 3, FFREEP 3, FPREM1 1, FXSAVE/FXRSTOR 6); x87 forms now
+`system`: kernel FNINIT 7, FNCLEX 1; initramfs FLD m80 2,411, FSTP m80 1,098, FLDCW 160, FNSTENV 44, FLDENV 44, FNCLEX 16.
+
 **S3 re-check (October 29).** `census.py` ports the S3 shim change (fexc series21-s3: group 9's register forms /6 /7, RDRAND,
 RDSEED and RDPID, are system cuts). Rerun into `natemu-raw/kernel-census-s3-20261029-01/` (`x` linked to the C0 data; report
 in its `report/`). Kernel `system` 16,745 -> 16,754 (`rdrandq` 7 and `rdseedq` 2 moved from `other`); nothing else moved. Of

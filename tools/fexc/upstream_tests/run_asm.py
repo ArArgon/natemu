@@ -28,6 +28,12 @@ Outcome per test:
                matched), ...
   fail         anything else: registers differ, a guest fault, the driver or nasm erred. Each is diagnosed by hand (see the
                report); none is silently ignored.
+x87 (I6): natemu runs x87 in FEX's reduced-precision mode (doubles; owner direction). A test whose `Env` does not set
+FEX_X87REDUCEDPRECISION expects FEX's 80-bit mode; when such a test runs to the hlt and every differing value is an x87
+value that is exactly the 80-bit expectation rounded to 53 bits under some rounding mode (see `x87_value_ok`: MMn, or an
+XMM register holding an 80-bit image), it is `precision deviation` (recorded in the plan's I6 deviations), never a pass; any
+GPR, RIP or other difference fails. An FLDCW/FLDENV/FRSTOR that clears
+an x87 exception mask stops `unsupported_system` (unmasked x87 exceptions, #MF, are not built): unsupported with that reason.
 Known_Failures / Disabled_Tests (the jit lists and the ARMv8.4 class file, the M4's class) are reported as `listed`, separately;
 the test is still run."""
 import argparse, collections, concurrent.futures as cf, json, pathlib, re, shutil, subprocess, sys, tempfile
@@ -46,11 +52,60 @@ GPR = {'RAX': 0, 'RCX': 1, 'RDX': 2, 'RBX': 3, 'RSP': 4, 'RBP': 5, 'RSI': 6, 'RD
 # instructions architecturally (plan S2b) against the driver's start-up descriptor tables (GDTR base 0, limit FFFFH), so the
 # selectors fault or SGDT reads other values: counted unsupported with this reason.
 NOT_ADVERTISED = {'rdpid', 'rdseed', 'clflushopt', 'clzero', 'clwb', 'serialize', 'rdpkru', 'wrpkru', 'monitorx', 'mwaitx', 'rdpru'}
+# Tests whose expectation is FEX's own x87 behaviour where it is not x86's (the test says so): natemu gives the SDM's.
+FEX_EXPECTS_ITS_BUG = {'X87/FXAM_Simple.asm': "expects FEX's FXAM of +0 (its comment: 'should be 0x4000 for zero, but there's no "
+                                              "support'); natemu gives the SDM's 4000H (patch 0019)"}
 NEEDS_OS = {'syscall'}   # #UD with EFER.SCE = 0: no OS has set up SYSCALL here
 OS_SEGMENTS = {'Primary/Primary_8C.asm', 'Primary/Primary_8C_2.asm', 'Primary/Primary_CF.asm', 'PrimaryGroup/5_FF_05.asm',
                'PrimaryGroup/5_FF_05_03_o64.asm', 'PrimaryGroup/5_FF_05_03_o64_imm.asm', 'Secondary/07_XX_00.asm'}
 
 
+# I6: x87 values against 80-bit expectations, as tight as the recorded deviations. A test's differences are a precision
+# deviation only when every one is an 80-bit x87 value (MMn: the x87 register widened from its double; an XMM register whose
+# high quadword holds only a sign and exponent: an 80-bit image FEX's tests load with MOVUPS) that is exactly the expectation
+# rounded to a double's 53 bits under one of the four rounding modes (deviations 1-3: doubles for every value, FLD m80 and
+# the constants); a NaN must agree in sign, quiet bit and the top 51 significand bits; an 80-bit denormal or pseudo-denormal
+# expectation (exponent 0, a nonzero significand) never matches. The FEX precision tests run at FCW.PC = single, double or
+# extended (PRECISION_PC_TESTS, deviations 1 and 2): there the expectation may also be the double rounded to 24 bits, or lie
+# one 53-bit ulp from it (FLD m80 rounded the operand under the group's own RC). Any GPR, RIP or
+# other difference fails, and so does every other XMM value (no doubles-in-XMM path).
+X87_TEXT = re.compile(r'^\s*f(?!emms)[a-z0-9]+\b', re.M)
+PRECISION_PC_TESTS = {f'X87/precision_test_{n}.asm' for n in ('fabs', 'fadd', 'fdiv', 'fdivr', 'fmul', 'fsqrt', 'fsub', 'fsubr',
+                      'neg_fabs', 'neg_fadd', 'neg_fdiv', 'neg_fdivr', 'neg_fmul', 'neg_fsub', 'neg_fsubr')}
+def f80(d):
+    """A double widened to the 80-bit format: [significand, sign and exponent] (natemu_abi::x87::to_f80)."""
+    sign, exp, frac = d >> 63, d >> 52 & 0x7ff, d & ((1 << 52) - 1)
+    if exp == 0:
+        if frac == 0: return 0, sign << 15
+        lz = 64 - frac.bit_length()
+        return frac << lz, sign << 15 | (15372 - lz)
+    return (1 << 63 | frac << 11), sign << 15 | (0x7fff if exp == 0x7ff else exp + 15360)
+def rounded80(m, se, bits, rc):
+    """An 80-bit normal value rounded to `bits` significand bits under x87 rounding control `rc` (0 nearest, 1 down, 2 up,
+    3 toward zero), in the 80-bit format; None for anything but a normal value."""
+    e, sign = se & 0x7fff, se >> 15 & 1
+    if e in (0, 0x7fff) or not m >> 63: return None
+    drop = 64 - bits
+    kept, rest, half = m >> drop, m & ((1 << drop) - 1), 1 << (drop - 1)
+    up = {0: rest > half or (rest == half and kept & 1), 1: sign and rest, 2: not sign and rest, 3: False}[rc]
+    kept += bool(up)
+    if kept >> bits: kept, e = kept >> 1, e + 1
+    return kept << drop, sign << 15 | e
+def x87_value_ok(got, want, name):
+    """`got` (an 80-bit image our double widens to) against the 80-bit expectation `want` (both [significand, sign|exponent])."""
+    gm, gse, wm, wse = got[0], got[1] & 0xffff, want[0], want[1] & 0xffff
+    if wse & 0x7fff == 0 and wm: return False                         # an 80-bit denormal expectation: never
+    if wse & 0x7fff == 0x7fff and wm << 1 & (2**64 - 1):              # a NaN: sign, quiet bit, top 51 significand bits
+        return gse == wse and gm >> 11 == wm >> 11
+    if any(rounded80(wm, wse, 53, rc) == (gm, gse) for rc in range(4)): return True
+    if name not in PRECISION_PC_TESTS: return False
+    # FCW.PC = single: the expectation is our double rounded to 24 bits. PC = double or extended: the operand was rounded by FLD m80
+    # under the group's RC before the operation (deviation 2), so the result may be one 53-bit ulp off the x87 result.
+    if any(rounded80(gm, gse, 24, rc) == (wm, wse) for rc in range(4)): return True
+    return gse == wse and gm >> 63 and wm >> 63 and abs(gm - wm) <= 1 << 11
+def image80(x):
+    """An XMM pair [low, high] holding an 80-bit image (high: sign and exponent only, a nonzero exponent), or None."""
+    return x if x[1] <= 0xffff and x[1] & 0x7fff else None
 def header(text):
     parts = text.split('%ifdef CONFIG')
     if len(parts) < 2: return {}
@@ -118,7 +173,8 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
         binary = (work / 't.bin').read_bytes()
         want = {k.upper(): [int(v, 0) for v in (vals if isinstance(vals, list) else [vals])] for k, vals in h.get('REGDATA', {}).items()}
         # Expectations natemu cannot check: MMn (x87/MMX, I6), XMM16+ and nonzero YMM upper halves (AVX, I8).
-        vector = sorted(k for k in want if k not in GPR and k != 'RIP' and not (re.fullmatch(r'XMM\d+', k) and int(k[3:]) < 16 and not any(want[k][2:])))
+        vector = sorted(k for k in want if k not in GPR and k != 'RIP' and not (re.fullmatch(r'XMM\d+', k) and int(k[3:]) < 16 and not any(want[k][2:]))
+                        and not re.fullmatch(r'MM[0-7]', k))
         (work / 'program.txt').write_text(description(h, binary))
         run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work] + ([str(max_block)] if max_block else []) + vm1.CODE_SHAPE, capture_output=True, text=True, timeout=120)
         if run.returncode:
@@ -154,21 +210,39 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
                 return {**rec, 'outcome': 'unsupported', 'reason': f"#UD: {rec['at']} not advertised by the CPU profile"}
             if vector == 6 and rec.get('at') in NEEDS_OS:
                 return {**rec, 'outcome': 'unsupported', 'reason': f"#UD: {rec['at']} with EFER.SCE = 0 (needs an OS)"}
+            if s['stop'] == 'resident' and s['reason'].startswith('unsupported_system') and rec.get('at') in ('fldcw', 'fldenv', 'frstor'):
+                return {**rec, 'outcome': 'unsupported', 'reason': f"x87 FCW unmasking an exception (refused: #MF not built): {rec['at']}"}
             return {**rec, 'outcome': 'fail', 'reason': 'did not reach hlt', 'detail': rec['stop'] + ' fault=' + json.dumps(s['fault'])}
         gpr = [int(v, 0) for v in s['gpr']]
         xmm = [int(v, 0) for v in s['xmm']]
-        diffs = []
+        reduced = 'FEX_X87REDUCEDPRECISION' in (h.get('ENV') or {})
+        x87 = X87_TEXT.search(text) is not None
+        mm = [int(v, 0) for v in s['x87']['mm']]
+        diffs, soft = [], []   # soft: an x87 floating-point value within the reduced-precision bound of an 80-bit expectation
         for k, vals in want.items():
             if k == 'RIP': got = rip
             elif k in GPR: got = gpr[GPR[k]]
             elif re.fullmatch(r'XMM\d+', k) and int(k[3:]) < 16 and not any(vals[2:]):   # I5a: XMM (low, high); YMM upper must be 0
                 n = int(k[3:])
                 if xmm[2 * n:2 * n + 2] != vals[:2]:
-                    diffs.append(f'{k}: got {xmm[2 * n]:#x} {xmm[2 * n + 1]:#x}, want {vals[0]:#x} {vals[1]:#x}')
+                    d = f'{k}: got {xmm[2 * n]:#x} {xmm[2 * n + 1]:#x}, want {vals[0]:#x} {vals[1]:#x}'
+                    g80, w80 = image80(xmm[2 * n:2 * n + 2]), image80(vals[:2])
+                    (soft if x87 and not reduced and g80 and w80 and x87_value_ok(g80, w80, name) else diffs).append(d)
+                continue
+            elif re.fullmatch(r'MM[0-7]', k):   # I6: x87 register n (physical), 80-bit, or a double under reduced precision
+                g = mm[int(k[2])]
+                got2 = [g, 0] if reduced else list(f80(g))
+                if got2 != vals[:2]:
+                    d = f'{k}: got {got2[0]:#x} {got2[1]:#x}, want {vals[0]:#x} {vals[1]:#x}'
+                    (soft if not reduced and x87_value_ok(got2, vals[:2], name) else diffs).append(d)
                 continue
             else: continue
             if got != vals[0]: diffs.append(f'{k}: got {got:#x}, want {vals[0]:#x}')
-        if diffs: return {**rec, 'outcome': 'fail', 'reason': 'registers differ', 'detail': '; '.join(diffs), 'stats': s['stats']}
+        if (diffs or soft) and name in FEX_EXPECTS_ITS_BUG:
+            return {**rec, 'outcome': 'unsupported', 'reason': FEX_EXPECTS_ITS_BUG[name], 'detail': '; '.join(diffs + soft)}
+        if diffs: return {**rec, 'outcome': 'fail', 'reason': 'registers differ', 'detail': '; '.join(diffs + soft), 'stats': s['stats']}
+        if soft:
+            return {**rec, 'outcome': 'precision deviation', 'reason': '80-bit expectation, our double is it rounded to 53 bits (plan I6)', 'detail': '; '.join(soft)}
         if 'FS' in want or 'GS' in want:
             return {**rec, 'outcome': 'unsupported', 'reason': 'needs segment base state (GPR part matched)'}
         if vector:
@@ -190,7 +264,11 @@ def category(reason):
     pre = w[0] if w[0] in PREFIXES else None
     base = w[1] if pre and len(w) > 1 else w[0]
     if base.startswith('v'): return 'AVX (VEX-encoded)'
-    if base.startswith('f') and base != 'femms': return 'x87'
+    if base == 'db': return 'x87: undocumented alias or reserved encoding'
+    if base in ('f2xm1', 'fyl2x', 'fyl2xp1', 'fptan', 'fpatan', 'fsin', 'fcos', 'fsincos', 'fprem', 'fprem1', 'fscale'):
+        return 'x87: transcendental, remainder or scale (FEX host libm helper)'
+    if base in ('fbld', 'fbstp'): return 'x87: BCD (FEX host helper)'
+    if base.startswith('f') and base != 'femms': return 'x87: ' + base
     if re.match(r'^(movap[sd]|movup[sd]|movdq[au]|movntdqa|movss|movsd|movq|movd|p[a-z0-9]+|cvt.*|round.*|aes.*|sha.*|lddqu|[ls]dmxcsr|emms|femms|pf.*|pi2f.*)$', base):
         return 'MMX/SSE/3DNow/AES/SHA vector'
     if pre == 'lock' or base in ('xchg', 'cmpxchg', 'xadd', 'cmpxchg8b', 'cmpxchg16b'): return 'atomics: lock prefix, xchg/cmpxchg/xadd on memory'
@@ -205,7 +283,19 @@ SELFTEST = {   # synthetic tests: (source, expected outcome, reason prefix)
     'wrong.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0x2"}}\n%endif\nmov eax, 1\nhlt\n', 'fail', 'registers differ'),
     'memory.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0x0807060504030201","RBX":"0x1234"},"MemoryRegions":{"0x100000000":"4096"},"MemoryData":{"0x100000000":"0102030405060708"}}\n%endif\n'
                    'mov rcx, 0x100000000\nmov rax, [rcx]\nbswap rax\nmov word [rcx+8], 0x1234\nmovzx ebx, word [rcx+8]\nhlt\n', 'pass', ''),
-    'vector.asm': ('%ifdef CONFIG\n{"RegData":{"MM0":["0","0"],"RAX":"0"}}\n%endif\nxor eax,eax\nhlt\n', 'unsupported', 'needs vector state'),
+    'vector.asm': ('%ifdef CONFIG\n{"RegData":{"XMM16":["0","0"],"RAX":"0"}}\n%endif\nxor eax,eax\nhlt\n', 'unsupported', 'needs vector state'),
+    'mm.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0x8000000000000000","0x3fff"]}}\n%endif\nfld1\nhlt\n', 'pass', ''),
+    'mm_close.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0x8000000000000001","0x3fff"]}}\n%endif\nfld1\nhlt\n', 'precision deviation', '80-bit'),
+    # Must-fail holes (I6 re-review): an integer in XMM read as an 80-bit denormal, a 64-bit integer off by one, a double 2^28
+    # ulps wrong, MM7 = 1 + 2^-24 against 1.0, a NaN with another payload, an 80-bit denormal expectation.
+    'hole_int_xmm.asm': ('%ifdef CONFIG\n{"RegData":{"XMM0":["0x2","0x0"]}}\n%endif\nfld1\nmov eax, 1\nmovd xmm0, eax\nhlt\n', 'fail', 'registers differ'),
+    'hole_i64_xmm.asm': ('%ifdef CONFIG\n{"RegData":{"XMM0":["0x100000000","0x0"]}}\n%endif\nfld1\nmov rax, 0xffffffff\nmovq xmm0, rax\nhlt\n', 'fail', 'registers differ'),
+    'hole_dbl_far.asm': ('%ifdef CONFIG\n{"RegData":{"XMM0":["0x3ff0000010000000","0x0"]}}\n%endif\nfld1\nfstp qword [rel v]\nmovq xmm0, [rel v]\nhlt\nv: dq 0\n', 'fail', 'registers differ'),
+    'hole_mm_far.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0x8000008000000000","0x3fff"]}}\n%endif\nfld1\nhlt\n', 'fail', 'registers differ'),
+    'hole_nan_payload.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0xc000000000100000","0x7fff"]}}\n%endif\nfld qword [rel v]\nhlt\nv: dq 0x7ff8000000000001\n', 'fail', 'registers differ'),
+    'hole_denormal_want.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0x1","0x0"]}}\n%endif\nfldz\nhlt\n', 'fail', 'registers differ'),
+    'nan_ok.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0xc000000000000a00","0x7fff"]}}\n%endif\nfld qword [rel v]\nhlt\nv: dq 0x7ff8000000000001\n', 'precision deviation', '80-bit'),
+    'mm_far.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0x8000000000000000","0x4000"]}}\n%endif\nfld1\nhlt\n', 'fail', 'registers differ'),
     'vector_insn.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0"}}\n%endif\nxor eax,eax\npaddd mm0, mm1\nhlt\n', 'unsupported', 'unsupported_form'),
     'xmm.asm': ('%ifdef CONFIG\n{"RegData":{"XMM0":["0x1","0x0"],"XMM1":["0x0","0x0","0x0","0x0"]}}\n%endif\nmov eax, 1\nmovd xmm0, eax\nhlt\n', 'pass', ''),
     'xmm_wrong.asm': ('%ifdef CONFIG\n{"RegData":{"XMM0":["0x2","0x0"]}}\n%endif\nmov eax, 1\nmovd xmm0, eax\nhlt\n', 'fail', 'registers differ'),

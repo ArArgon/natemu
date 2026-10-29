@@ -74,6 +74,9 @@ bool Arm64JITCore::FexcQuietOp(const IR::IROp_Header* IROp) {
 // (FPCR.RMode switched around it: x2 keeps FPCR, x3 the temporary value). Returns whether to emit frintx.
 bool Arm64JITCore::FexcRoundBegin(IR::RoundMode Mode) {
   if (!fexc_slice1 || !fexc_round_inexact.count(Entry + FexcGuest)) return false;
+  // x2/x3 hold the x87 wrapper's saved FPCR/FPSR around an x87 instruction's op (FexcX87Begin): x87 rounding ops (FRNDINT,
+  // FISTP m64) use the host mode only, which switches nothing here.
+  if (Mode != IR::RoundMode::Host && fexc_x87.count(Entry + FexcGuest)) std::abort();   // a hard check (LOGMAN asserts compile out)
   if (Mode != IR::RoundMode::Host) {
     const uint64_t RMode = Mode == IR::RoundMode::Nearest ? 0 : Mode == IR::RoundMode::PosInfinity ? 1 : Mode == IR::RoundMode::NegInfinity ? 2 : 3;
     mrs(TMP3, ARMEmitter::SystemRegister::FPCR);
@@ -87,8 +90,40 @@ void Arm64JITCore::FexcRoundEnd(IR::RoundMode Mode) {
   if (Mode != IR::RoundMode::Host) msr(ARMEmitter::SystemRegister::FPCR, TMP3);
 }
 
+// I6: the floating-point ops of an admitted x87 instruction (reduced precision: scalar doubles). Each runs with FPSR cleared
+// (x3 keeps MXCSR's flags) and, when the host gave one, under the x87 FPCR (x2 keeps MXCSR's); after it, its FPSR flags go into
+// the x87 exception word (x0, x1 are free between ops). None of these ops uses x0..x3 itself (FEX's TMP1..TMP4).
+bool Arm64JITCore::FexcX87Op(const IR::IROp_Header* IROp) {
+  using IR::IROps;
+  if (!fexc_slice1 || !fexc_x87.count(Entry + FexcGuest)) return false;
+  switch (IROp->Op) {
+  case IROps::OP_VFADD: case IROps::OP_VFSUB: case IROps::OP_VFMUL: case IROps::OP_VFDIV: case IROps::OP_VFSQRT:
+  case IROps::OP_FLOAT_FTOF: case IROps::OP_FLOAT_FROMGPR_S: case IROps::OP_FLOAT_TOGPR_S: case IROps::OP_FLOAT_TOGPR_ZS:
+  case IROps::OP_VECTOR_FTOZS: case IROps::OP_VECTOR_FTOS: case IROps::OP_VECTOR_FTOI: case IROps::OP_FCMP: return true;
+  default: return false;
+  }
+}
+void Arm64JITCore::FexcX87Begin() {
+  mrs(TMP4, ARMEmitter::SystemRegister::FPSR);
+  msr(ARMEmitter::SystemRegister::FPSR, ARMEmitter::XReg::zr);
+  if (fexc_x87_fpcr) {
+    mrs(TMP3, ARMEmitter::SystemRegister::FPCR);
+    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, fexc_x87_fpcr);
+    msr(ARMEmitter::SystemRegister::FPCR, TMP1);
+  }
+}
+void Arm64JITCore::FexcX87End() {
+  if (fexc_x87_fpcr) msr(ARMEmitter::SystemRegister::FPCR, TMP3);
+  mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
+  msr(ARMEmitter::SystemRegister::FPSR, TMP4);
+  ldr(TMP2.W(), STATE, FEXC_X87_EXCEPTIONS);
+  orr(ARMEmitter::Size::i32Bit, TMP2, TMP2, TMP1);
+  str(TMP2.W(), STATE, FEXC_X87_EXCEPTIONS);
+}
+
 void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32_t Begin) {
   if (FexcQuietOp(IROp)) msr(ARMEmitter::SystemRegister::FPSR, TMP4);
+  if (FexcX87Op(IROp)) FexcX87End();
   FexcRecordOp(IROp, Node, Begin);
   if (fexc_slice1) FexcCheckTarget(Node);
 }
@@ -355,6 +390,7 @@ void Arm64JITCore::FexcCheckTarget(IR::Ref Node) {
 void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   using IR::IROps;
   if (FexcQuietOp(IROp)) mrs(TMP4, ARMEmitter::SystemRegister::FPSR);
+  if (FexcX87Op(IROp)) FexcX87Begin();
   const IR::OrderedNodeWrapper* Addr = nullptr;
   const IR::OrderedNodeWrapper* Offset = nullptr;
   IR::MemOffsetType Type = IR::MemOffsetType::SXTX;

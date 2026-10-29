@@ -339,12 +339,36 @@ pub mod frame {
     /// from the bank at every block entry (I7).
     pub const GS_BASE: u32 = FLAGS - 16;
     pub const FS_BASE: u32 = FLAGS - 8;
-    /// Guest-state fields `(offset, bytes)` admitted code may read through x28: the segment bases and the RFLAGS bytes
-    /// above. MXCSR, x87 and AVX state await their chunks. Every other x28 access is refused.
-    pub const GUEST_STATE: [(u32, u32); 6] =
-        [(GS_BASE, 8), (FS_BASE, 8), (FLAGS + 8, 3), (FLAGS + 12, 1), (FLAGS + 14, 1), (FLAGS + 16, 6)];
-    /// The fields admitted code may also write: DF only. TF, IF, IOPL, NT, AC, VIF, VIP and ID are the resident's.
-    pub const GUEST_STATE_WRITABLE: [(u32, u32); 1] = [(DF, 1)];
+    /// x87 (I6, FEX's reduced-precision mode): FEX's flag bytes for FSW.IE (only FEX's own IE: its other exception flags
+    /// are in [`X87_EXCEPTIONS`]), C0, C1, C2, C3 (each 0/1) and TOP (0..7); ST(i) as a double in the low 8 bytes of the
+    /// 16-byte `mm[(TOP + i) & 7]` (the high 8 are unused); FCW (written from the bank at every block entry, never read back);
+    /// the abridged tag word (bit i set: physical register i is not empty); and the x87 exception word, a 4-byte field in
+    /// FEX's padding after the tag word, which generated code ORs FPSR into after each x87 floating-point op: bit 0 IE,
+    /// 1 ZE, 2 OE, 3 UE, 4 PE, 7 DE (FPSR's IOC DZC OFC UFC IXC IDC), and 6 SF (the resident's stack fault).
+    pub const X87_IE: u32 = FLAGS + 32;
+    /// FEX's PE flag byte, which FIST/FISTP m16/m32 set (patch 0019: their PE is computed, not FPSR's).
+    pub const X87_PE: u32 = FLAGS + 37;
+    /// FEX's SF flag byte: generated code's stack faults (patch 0019: IE and SF with the masked response).
+    pub const X87_SF: u32 = FLAGS + 38;
+    pub const X87_C0: u32 = FLAGS + 40;
+    pub const X87_C1: u32 = FLAGS + 41;
+    pub const X87_C2: u32 = FLAGS + 42;
+    pub const X87_TOP: u32 = FLAGS + 43;
+    pub const X87_C3: u32 = FLAGS + 46;
+    pub const X87_MM: u32 = FLAGS + 48;
+    pub const X87_FCW: u32 = 0x4b0;
+    pub const X87_FTW: u32 = 0x4b2;
+    pub const X87_EXCEPTIONS: u32 = 0x4b4;
+    /// Guest-state fields `(offset, bytes)` admitted code may read through x28: the segment bases, the RFLAGS bytes
+    /// above and the x87 state (I6). MXCSR is the bank's; AVX state awaits its chunk. Every other x28 access is refused.
+    pub const GUEST_STATE: [(u32, u32); 12] = [
+        (GS_BASE, 8), (FS_BASE, 8), (FLAGS + 8, 3), (FLAGS + 12, 1), (FLAGS + 14, 1), (FLAGS + 16, 6),
+        (X87_IE, 1), (X87_PE, 2), (X87_C0, 4), (X87_C3, 1), (X87_MM, 128), (X87_FCW, 8),
+    ];
+    /// The fields admitted code may also write: DF and the x87 state but FCW. TF, IF, IOPL, NT, AC, VIF, VIP and ID are the
+    /// resident's, and so is FCW (FLDCW, FNINIT, FLDENV, FRSTOR are transactions).
+    pub const GUEST_STATE_WRITABLE: [(u32, u32); 7] =
+        [(DF, 1), (X87_IE, 1), (X87_PE, 2), (X87_C0, 4), (X87_C3, 1), (X87_MM, 128), (X87_FTW, 6)];
     pub const BYTES: usize = 4096;
     /// RFLAGS bits held in the flag bytes.
     const BITS: [u32; 10] = [8, 9, 10, 12, 14, 16, 17, 18, 19, 20];
@@ -478,6 +502,10 @@ pub struct Cpu {
     /// ([`fpcr`]); the exception flags FEX's code raises accumulate in FPSR and are or-ed in at the next resident entry
     /// ([`mxcsr_flags`]). LDMXCSR/STMXCSR are the resident's transactions.
     pub mxcsr: u64,
+    /// The x87 FPU control word (I6; SDM Vol.1 8.1.5): authoritative here, written into the guest-state page
+    /// ([`frame::X87_FCW`]) at every block entry; FLDCW, FNINIT, FLDENV and FRSTOR are the resident's transactions. Every
+    /// exception mask stays set (an FCW that clears one is refused). The rest of the x87 state lives in the page.
+    pub fcw: u64,
 }
 /// The first native vector register of XMM0 (FEX's x64 `SRAFPR`: XMM0..XMM15 in v16..v31).
 pub const XMM_VREG: usize = 16;
@@ -505,6 +533,17 @@ pub const fn mxcsr_flags(fpsr: u64, mxcsr: u64) -> u64 {
 }
 /// MXCSR.DAZ (denormal source operands are zeros: no DE).
 pub const MXCSR_DAZ: u64 = 1 << 6;
+/// FCW after FNINIT (SDM Vol.1 8.1.5): every exception masked, 64-bit precision, round to nearest. A driver-started vCPU
+/// has the FNINIT state (FCW 037FH, FSW 0, every tag empty), as QEMU's and FEX's start; RESET's 0040H/5555H is not built.
+pub const FCW_INIT: u64 = 0x37f;
+/// FCW's exception masks (IM DM ZM OM UM PM, bits 5:0).
+pub const FCW_MASKS: u64 = 0x3f;
+/// The FPCR x87 arithmetic runs under for `fcw` (I6): AH and NEP as for SSE, RMode from FCW.RC (bits 11:10, the same
+/// encoding as MXCSR.RC), no flush to zero; 0 when it equals MXCSR's ([`fpcr`]), which blocks are entered with.
+pub const fn x87_fpcr(fcw: u64, mxcsr: u64) -> u64 {
+    let x87 = 1 << 1 | 1 << 2 | [0, 2, 1, 3][(fcw >> 10 & 3) as usize] << 22;
+    if x87 == fpcr(mxcsr) { 0 } else { x87 }
+}
 
 /// A segment register's visible selector and hidden part. `attributes` are descriptor bits 47:40 (type, S, DPL, P) in
 /// 7:0 and bits 55:52 (AVL, L, D/B, G) in 15:12; a null load leaves 0 (P = 0: unusable). `limit` is byte-granular.
@@ -641,7 +680,9 @@ impl Cpu {
     /// (bit 2: 64-bit, the only mode yet) and the paging controls a translation depends on (CR0.PG/WP,
     /// CR4.PGE/PCIDE/SMEP, EFER.NXE), and the SSE gating bits (I5a: CR0.EM, CR0.TS, CR4.OSFXSR; a translation cuts every
     /// SSE form when they gate it, so a block is never entered under other gating than it was made for, even should a
-    /// control change ever keep the code), and alignment checking (X2: a translation under it cuts every BT* memory form,
+    /// control change ever keep the code), CR0.MP (I6: WAIT's gating with TS), the x87 rounding when it differs from MXCSR's
+    /// (bit 14 and FCW.RC in 16:15: a translation runs x87 arithmetic under that FPCR), and alignment checking (X2: a
+    /// translation under it cuts every BT* memory form,
     /// and RFLAGS.AC changes without dropping code).
     pub fn code_context(&self) -> [u64; 2] {
         let bit = |on: bool, n: u32| u64::from(on) << n;
@@ -656,7 +697,9 @@ impl Cpu {
             | bit(self.cr0 & CR0_EM != 0, 9)
             | bit(self.cr0 & CR0_TS != 0, 10)
             | bit(self.cr4 & CR4_OSFXSR != 0, 11)
-            | bit(self.alignment_check(), 12);
+            | bit(self.alignment_check(), 12)
+            | bit(self.cr0 & CR0_MP != 0, 13)
+            | (x87_fpcr(self.fcw, self.mxcsr) != 0) as u64 * (1 | (self.fcw >> 10 & 3) << 1) << 14;
         [self.cr3, word]
     }
 }
@@ -701,6 +744,10 @@ pub const REPLY_NEXT_PAGE: u64 = 4;
 /// The instruction fetch at `cpu.rip` faults (`State::fetch_fault`: RIP's page, or the next one an instruction crossing
 /// into it needs): nothing is staged; the resident delivers the exception (X1a).
 pub const REPLY_FETCH_FAULT: u64 = 5;
+/// M3 (numbered apart from the other chunks' kinds): complete the device access described by the [`Mmio`] record; the
+/// host answers [`REPLY_DEVICE`] with the record's reply half.
+pub const REQUEST_DEVICE: u64 = 0x30;
+pub const REPLY_DEVICE: u64 = 0x30;
 
 /// A request's instruction fetch, walked by the resident (`State::fetch_fault`): why the walk of the last page it walked
 /// failed — kind, then the #PF address and error code for [`fetch::PAGE`].
@@ -854,6 +901,20 @@ pub mod system {
     /// it, `--alignment-gated`): `cr` 0..3 = BT, BTS, BTR, BTC; `reg` the bit-offset register, or [`NO_REG`] for the imm8
     /// form; `size` the operand size (2, 4, 8). The resident checks the operand's alignment (#AC(0)), then steps it.
     pub const BT_ALIGNED: u32 = 0x45;
+    /// x87 (I6, numbered apart): an x87 instruction under CR0.EM or CR0.TS, or WAIT under CR0.TS and CR0.MP (fexc cut it,
+    /// `--x87-gated`/`--wait-gated`): #NM (`length` is not used). FNINIT (`db e3`), FNCLEX (`db e2`), FLDCW m16 (`d9 /5`),
+    /// FLDENV/FNSTENV m (`d9 /4`, `/6`; `size` 2 with a 66 prefix: the 14-byte image, else 4: 28 bytes), FRSTOR/FNSAVE m
+    /// (`dd /4`, `/6`; 94 or 108 bytes), FLD/FSTP m80 (`db /5`, `/7`).
+    pub const X87_GATED: u32 = 0x48;
+    pub const FNINIT: u32 = 0x49;
+    pub const FNCLEX: u32 = 0x4a;
+    pub const FLDCW: u32 = 0x4b;
+    pub const FLDENV: u32 = 0x4c;
+    pub const FNSTENV: u32 = 0x4d;
+    pub const FRSTOR: u32 = 0x4e;
+    pub const FNSAVE: u32 = 0x4f;
+    pub const FLD80: u32 = 0x50;
+    pub const FSTP80: u32 = 0x51;
     impl super::System {
         pub const NONE: Self = Self {
             kind: 0, length: 0, lock: 0, cr: 0, reg: 0, base: NO_REG, index: NO_REG, scale: 0, disp: 0, memory: 0, size: 0, fs_gs: 0,
@@ -895,6 +956,9 @@ pub mod system {
                     POPF => matches!(self.size, 2 | 8),
                     EVENT_HOOK => self.length == 1,
                     BT_ALIGNED => self.memory == 1 && address && self.cr < 4 && (reg(self.reg) || self.reg == NO_REG) && matches!(self.size, 2 | 4 | 8),
+                    X87_GATED | FNINIT | FNCLEX => true,
+                    FLDCW | FLD80 | FSTP80 => self.memory == 1 && address,
+                    FLDENV..=FNSAVE => self.memory == 1 && address && matches!(self.size, 2 | 4),
                     _ => false,
                 }
         }
@@ -952,6 +1016,9 @@ pub mod stop {
     /// host ended its run ([`super::cache::Events::end`]: no source could wake it). The bank holds the state after the
     /// HLT.
     pub const HALTED: u64 = 32;
+    /// (M3, numbered apart.) A device access the resident does not complete ([`super::Mmio`]: its `status` says why):
+    /// a precise stop with the state at the instruction, nothing of it done (the device untouched).
+    pub const UNSUPPORTED_MMIO: u64 = 48;
 
     pub fn name(code: u64) -> &'static str {
         match code {
@@ -970,6 +1037,7 @@ pub mod stop {
             TRAPPED => "trapped",
             SHUTDOWN => "shutdown",
             HALTED => "halted",
+            UNSUPPORTED_MMIO => "unsupported_mmio",
             _ => "none",
         }
     }
@@ -1177,6 +1245,60 @@ pub const ENTROPY_WORDS: usize = 32;
 pub const ENTROPY_OFFSET: usize = STATE_OFFSET + 0xc00;
 pub const ENTROPY_VA: u64 = PRIVATE + ENTROPY_OFFSET as u64;
 const _: () = assert!(ENTROPY_OFFSET + core::mem::size_of::<Entropy>() <= STATE_OFFSET + 4096);
+/// M3: a guest access by translated code to a guest-physical page that is not RAM (a device page: shadows never map
+/// one, so the access aborts at its site). The resident walks it first (every #GP/#SS/#AC/#PF the access owes comes
+/// before; the walk's A/D updates stay, as on x86, also when the access is then refused), and completes the instruction
+/// from its site's completion record (`code_object::completion`: fexc's decode of the instruction it translated): one
+/// device access through the host ([`REQUEST_DEVICE`]: the host performs exactly that read or write and replies
+/// [`REPLY_DEVICE`]), then the load's register and RIP committed; the instruction never runs again. A record of its own
+/// in the state page, written by the resident before the request and by the host before the reply.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Mmio {
+    /// Request: the device byte (guest-physical), the width (1, 2, 4, 8), the direction (1: a store) and a store's data.
+    pub gpa: u64,
+    pub width: u64,
+    pub write: u64,
+    /// A store's data (request); a load's value, in its low `width` bytes (reply).
+    pub value: u64,
+    /// Reply: [`mmio::DONE`], or why the access is refused ([`mmio`]; also the resident's own refusals).
+    pub status: u64,
+    /// Device accesses this vCPU completed (resident).
+    pub completed: u64,
+}
+pub mod mmio {
+    /// [`super::Mmio::status`]: completed.
+    pub const DONE: u64 = 1;
+    /// Refusals (the vCPU stops [`super::stop::UNSUPPORTED_MMIO`] at the instruction, nothing of it done, the device untouched):
+    /// a LOCK read-modify-write, memory XCHG or other atomic site; a pair, push or pop site; an access crossing a page with a
+    /// device page on either side; a site without a completion record (every x86 form but MOV loads and stores of 1, 2, 4,
+    /// 8 bytes, MOV of an immediate, moffs, MOVZX, MOVSX, MOVSXD); a page no device claims; a device refusing the access
+    /// (e.g. a width it does not implement); a system instruction's or a delivery's own access to a device page.
+    pub const ATOMIC: u64 = 2;
+    pub const SITE: u64 = 3;
+    pub const CROSSING: u64 = 4;
+    pub const FORM: u64 = 5;
+    pub const UNASSIGNED: u64 = 6;
+    pub const DEVICE: u64 = 7;
+    pub const SYSTEM: u64 = 8;
+    pub fn name(status: u64) -> &'static str {
+        match status {
+            DONE => "done",
+            ATOMIC => "atomic",
+            SITE => "site",
+            CROSSING => "crossing",
+            FORM => "form",
+            UNASSIGNED => "unassigned",
+            DEVICE => "device",
+            SYSTEM => "system",
+            _ => "none",
+        }
+    }
+}
+pub const MMIO_OFFSET: usize = STATE_OFFSET + 0xe00;
+pub const MMIO_VA: u64 = PRIVATE + MMIO_OFFSET as u64;
+const _: () = assert!(ENTROPY_OFFSET + core::mem::size_of::<Entropy>() <= MMIO_OFFSET);
+const _: () = assert!(MMIO_OFFSET + core::mem::size_of::<Mmio>() <= STATE_OFFSET + 4096);
 const _: () = assert!(STATE_OFFSET + 4096 <= FRAME_OFFSET);
 const _: () = assert!(FRAME_OFFSET + frame::BYTES <= GUEST_STATE_OFFSET);
 const _: () = assert!(GUEST_STATE_OFFSET + frame::BYTES <= (crate::STACK_TOP - PRIVATE) as usize - STACK_BYTES);
@@ -1213,6 +1335,30 @@ mod tests {
         for at in [frame::GS_BASE, frame::FS_BASE] {
             assert!((at..at + 8).all(|b| inside(&frame::GUEST_STATE, b)) && !inside(&frame::GUEST_STATE_WRITABLE, at));
         }
+        // I6: FEX's x87 fields in the pinned CPUState (TOP and C0..C3 are flag bytes 43, 40..42, 46; mm[8][2] after the 48
+        // flag bytes; FCW and AbridgedFTW after the segment arrays), the x87 exception word in the padding after the tag word.
+        assert_eq!(frame::X87_SF, frame::X87_PE + 1);
+        let x87 = [frame::X87_IE, frame::X87_PE, frame::X87_C0, frame::X87_C1, frame::X87_C2, frame::X87_TOP, frame::X87_C3, frame::X87_MM];
+        assert_eq!(x87, [0x410, 0x415, 0x418, 0x419, 0x41a, 0x41b, 0x41e, 0x420]);
+        assert_eq!((frame::X87_FCW, frame::X87_FTW, frame::X87_EXCEPTIONS), (0x4b0, 0x4b2, 0x4b4));
+        for at in x87.into_iter().chain([frame::X87_MM + 127, frame::X87_FTW, frame::X87_EXCEPTIONS, frame::X87_EXCEPTIONS + 3]) {
+            assert!(inside(&frame::GUEST_STATE_WRITABLE, at), "{at:#x}");
+        }
+        assert!(inside(&frame::GUEST_STATE, frame::X87_FCW + 1) && !inside(&frame::GUEST_STATE_WRITABLE, frame::X87_FCW));
+        assert!(!inside(&frame::GUEST_STATE, frame::X87_MM + 128) && !inside(&frame::GUEST_STATE, frame::X87_IE + 1));
+    }
+
+    /// I6: x87 arithmetic runs under MXCSR's FPCR when FCW.RC equals MXCSR.RC and neither FTZ nor DAZ is set, else under its own.
+    #[test]
+    fn x87_fpcr_differs_only_when_it_must() {
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET), 0);
+        for rc in 0..4u64 {
+            assert_eq!(x87_fpcr(FCW_INIT | rc << 10, MXCSR_RESET | rc << 13), 0);
+            assert_eq!(x87_fpcr(FCW_INIT | rc << 10, MXCSR_RESET | (rc ^ 1) << 13), fpcr(MXCSR_RESET | rc << 13));
+        }
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15), fpcr(MXCSR_RESET)); // FTZ
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | MXCSR_DAZ), fpcr(MXCSR_RESET));
+        assert_eq!(x87_fpcr(FCW_INIT & !0x300, MXCSR_RESET), 0); // precision control has no FPCR effect (doubles throughout)
     }
 
     #[test]
@@ -1302,6 +1448,7 @@ mod tests {
             mov_ss: 0,
             xmm: [[0; 2]; 16],
             mxcsr: MXCSR_RESET,
+            fcw: FCW_INIT,
         };
         let c = cpu.control().unwrap();
         assert_eq!((c.cr3, c.cpl, c.wp, c.nxe, c.smep), (0x1000, 3, 1, 1, 0));

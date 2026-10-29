@@ -618,6 +618,11 @@ GUEST_STATE_FLAGS = {0x3f0 + b for b in (8, 9, 10, 12, 14, 16, 17, 18, 19, 20, 2
 GUEST_STATE_DF = {0x3f0 + 10}
 # I7: FEX's gs_cached (0x3e0) and fs_cached (0x3e8), 8 bytes each: loads only (an FS-/GS-prefixed access adds the base).
 GUEST_STATE_BASES = ((0x3e0, 8), (0x3e8, 8))
+# I6: the x87 state (abi `frame::X87_*`): FEX's IE, C0..C2, TOP and C3 bytes, the abridged tag word and the x87 exception word,
+# read and written; FCW read only; ST(i) through `add x0, x28, xI, lsl #4; ldr|str dN, [x0, #0x420]` (check_sites.x87_slot).
+X87_STATE = ((0x410, 1), (0x415, 2), (0x418, 4), (0x41e, 1), (0x4b2, 1), (0x4b4, 4))
+X87_FCW = (0x4b0, 2)
+X87_EXCEPTIONS = 0x4b4
 
 
 def entry_and_branches(d, dis, order):
@@ -633,6 +638,8 @@ def entry_and_branches(d, dis, order):
             acc[4] in (GUEST_STATE_DF if acc[0] == 'store' else GUEST_STATE_FLAGS)
         guest_state = guest_state or (acc and acc[2] == 'x28' and acc[0] == 'load' and acc[3] is None and acc[5] == 'none' and
                                       any(f <= acc[4] and acc[4] + acc[1] <= f + n for f, n in GUEST_STATE_BASES))
+        inside = lambda fields: acc and acc[3] is None and acc[5] == 'none' and any(f <= acc[4] and acc[4] + acc[1] <= f + n for f, n in fields)
+        guest_state = guest_state or (acc and acc[2] == 'x28' and (inside(X87_STATE) or (acc[0] == 'load' and inside((X87_FCW,)))))
         if acc and acc[2] in ('x28', 'sp') and not guest_state:
             out.append(f'+{off} "{dis[off]}" accesses emulator data ({acc[2]})')
         if re.fullmatch(r'ldr\w* \w+, 0x[0-9a-f]+', dis[off]):
@@ -645,6 +652,9 @@ def entry_and_branches(d, dis, order):
             if (t <= off or t not in dis) and not dispatch:
                 out.append(f'+{off} "{dis[off]}" is not a forward branch to an instruction of the block')
     return out
+
+
+X87_EARLY = set()   # I6: sites after which the x87 exception word was already updated (reported, not a violation)
 
 
 def verify(d, tmp, insns=None):
@@ -694,7 +704,9 @@ def verify(d, tmp, insns=None):
                 out.append(f'{tag}: +{off} "{text}" writes x{pre}, the pre-NZCV register, before the site')
             if nzcv and first_nzcv is None:
                 first_nzcv = off
-            if acc and acc[0] == 'store':
+            if acc and acc[0] == 'store' and acc[2] == 'x28' and acc[4] == X87_EXCEPTIONS:
+                X87_EARLY.add(tag)   # I6: the recorded deviation (an x87 store's FPSR flags already in the exception word)
+            elif acc and acc[0] == 'store':
                 out.append(f'{tag}: store +{off} "{text}" before the site')
             bad = dests & sra
             if bad:
@@ -891,6 +903,7 @@ def main():
     with tempfile.TemporaryDirectory() as t:
         for label, progs in corpora:
             bad += run_corpus(label, progs, Path(t), before if label != 'matrix' else None)
+    if X87_EARLY: print(f'I6 deviation (recorded): {len(X87_EARLY)} x87 store sites after their FPSR flags reached the x87 exception word')
     print('PASS' if not bad else f'FAIL: {bad} programs with violations')
     return 1 if bad else 0
 

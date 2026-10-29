@@ -23,7 +23,8 @@
 //! must refuse it: `bad_reply`); `--tamper next-page` answers a block request with [`exec::REPLY_NEXT_PAGE`] twice (the
 //! second after the next page was walked: `bad_reply`); `--tamper site` moves the native offsets of the first block with
 //! a load or store site off the instruction grid (its first abort is at no site: `unknown_abort`), `--tamper site-kind`
-//! makes its load and store sites claim to be guard stubs (a data abort there: `site_mismatch`). Containment:
+//! makes its load and store sites claim to be guard stubs (a data abort there: `site_mismatch`); `--tamper mmio` makes the first
+//! completed device access's reply status unknown (`bad_reply`, nothing committed). Containment:
 //! `--ignore-kicks` leaves the vCPU's doorbells disabled and its watchdog off (it never stops or drains while in linked
 //! code, a peer that never answers, so a peer waiting for its shadow reset is contained by that peer's watchdog);
 //! `--kill-compiler N` kills its `fexc --serve` before the request after its first N
@@ -45,8 +46,8 @@
 //! the mean acknowledge (IAR to EOI) and SGI send costs, and the latencies from each ring to the resident's stop.
 //!
 //! vCPUs run concurrently over shared guest RAM, each until its own stop. A vCPU that stops for any other reason than
-//! reaching its end, a guest fault, code it cannot compile or a split lock (`unsupported_atomic`: a precise stop before the
-//! instruction, like a guest fault) cancels the others (another resident halt, the watchdog).
+//! reaching its end, a guest fault, code it cannot compile, a split lock or a refused device access (`unsupported_atomic`,
+//! `unsupported_mmio`: precise stops before the instruction, like a guest fault) cancels the others (another resident halt, the watchdog).
 //!
 //! Description (text, one item per line). State items: rip ADDR | rflags VALUE | gpr V0 .. V15
 //!   | cpl 0|3 (default 3) | wp 0|1 (CR0.WP, default 1) | smep 0|1 (CR4.SMEP, default 0) | nxe 0|1 (EFER.NXE, default 1)
@@ -67,6 +68,12 @@
 //!   | large ADDR   (the 2 MiB-aligned range holding ADDR is one present 2 MiB leaf (PDE with PS), writable if any page
 //!     of the space in it is, not executable unless one is code; at most one per run: guest RAM holds one such frame)
 //!   | unmap ADDR | readonly ADDR   (mutations: clear P or R/W in the leaf entry of ADDR's page after setup)
+//!   | mmio ADDR GPA [unassigned]   (M3: ADDR's page maps the guest-physical page GPA, above guest RAM, writable, not
+//!     executable, where the driver registers a test device (`devices::TestDevice`, one per distinct GPA; none with
+//!     `unassigned`); `memory` items on that page preload
+//!     its bytes and are reported from it; the mutations below apply to it. The output gains `devices` (each test
+//!     device's per-vCPU reads and writes, order errors and access log) and per vCPU `mmio` (device accesses completed,
+//!     the last status: `done` or the refusal). Not in identity spaces.)
 //!   | entry ADDR LEVEL set|clear BITS   (mutation: set or clear BITS in the paging-structure entry of ADDR's walk at
 //!     LEVEL, 4 = PML4E .. 1 = PTE, after setup; mutations apply in order, and the levels above must be present).
 //! Every entry is present and user; leaves of code pages are read-only and executable, the others writable and
@@ -89,6 +96,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::{Arc, Mutex};
+use crate::devices::{Devices, TestDevice};
 
 /// One address space's contents.
 #[derive(Default, Debug, PartialEq)]
@@ -104,6 +113,8 @@ struct Space {
     edits: Vec<Edit>,
     /// Pages map to the guest-physical page of the same address.
     identity: bool,
+    /// M3: (linear page, device page, a test device there) of `mmio` items.
+    mmio: Vec<(u64, u64, bool)>,
 }
 /// Set, then clear, bits of the entry at `level` (`None`: the leaf) of `va`'s walk.
 #[derive(Debug, PartialEq)]
@@ -242,6 +253,9 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
             ("region", [a, n]) if number(n)? > 0 => space.regions.push((number(a)?, number(n)?)),
             ("large", [a]) => space.large.push(number(a)? & !(LARGE - 1)),
             ("identity", []) => space.identity = true,
+            ("mmio", [a, g, rest @ ..]) if number(g)? % 4096 == 0 && number(g)? >= exec::GUEST_RAM_BYTES as u64 && matches!(rest, [] | ["unassigned"]) => {
+                space.mmio.push((number(a)? & !4095, number(g)?, rest.is_empty()))
+            }
             ("unmap", [a]) => space.edits.push(Edit { va: number(a)?, level: None, set: 0, clear: PRESENT }),
             ("readonly", [a]) => space.edits.push(Edit { va: number(a)?, level: None, set: 0, clear: WRITABLE }),
             ("entry", [a, l @ ("1" | "2" | "3" | "4"), op @ ("set" | "clear"), bits]) => {
@@ -307,12 +321,14 @@ impl Builder {
 struct Tables {
     ram: GuestRam,
     cr3: u64,
+    /// M3: test devices by guest-physical page (`mmio` items): `copy_in`/`copy_out` reach their bytes.
+    devices: BTreeMap<u64, Arc<Mutex<TestDevice>>>,
     /// Linear page -> (physical page, leaf entry address).
     pages: BTreeMap<u64, (u64, u64)>,
 }
 impl Tables {
     fn new(b: &mut Builder) -> Result<Self> {
-        Ok(Self { ram: b.ram, cr3: b.page()?, pages: BTreeMap::new() })
+        Ok(Self { ram: b.ram, cr3: b.page()?, pages: BTreeMap::new(), devices: BTreeMap::new() })
     }
     /// The address of the entry at `level` of `va`'s walk, creating missing tables above it with a builder (without
     /// one, a non-present entry above it is an error: mutations never create tables).
@@ -361,11 +377,19 @@ impl Tables {
     }
     fn copy_in(&self, va: u64, bytes: &[u8]) {
         for (i, &b) in bytes.iter().enumerate() {
-            assert!(self.ram.write(self.physical(va + i as u64), b));
+            let gpa = self.physical(va + i as u64);
+            match self.devices.get(&(gpa & !4095)) {
+                Some(d) => d.lock().unwrap().bytes[(gpa & 4095) as usize] = b,
+                None => assert!(self.ram.write(gpa, b)),
+            }
         }
     }
     fn copy_out(&self, va: u64, length: usize) -> Vec<u8> {
-        (0..length as u64).map(|i| self.ram.read::<u8>(self.physical(va + i)).unwrap()).collect()
+        let byte = |gpa: u64| match self.devices.get(&(gpa & !4095)) {
+            Some(d) => d.lock().unwrap().bytes[(gpa & 4095) as usize],
+            None => self.ram.read::<u8>(gpa).unwrap(),
+        };
+        (0..length as u64).map(|i| byte(self.physical(va + i))).collect()
     }
 }
 /// Builds `space` (for a vCPU starting at `rip` when its bodies sit at the rip): code pages are read-only and
@@ -373,10 +397,13 @@ impl Tables {
 /// without `nxe` nothing is marked not executable).
 /// With `identity`, every page maps to the guest-physical page of its own address (the space's guest code can then
 /// build page tables of its own: its physical addresses are its linear ones); no `large` pages.
-fn build(b: &mut Builder, space: &Space, rip: u64, nxe: bool) -> Result<Tables> {
+fn build(b: &mut Builder, space: &Space, rip: u64, nxe: bool, devices: &BTreeMap<u64, Arc<Mutex<TestDevice>>>) -> Result<Tables> {
     let no_execute = if nxe { NO_EXECUTE } else { 0 };
     if space.identity && !space.large.is_empty() {
         return Err("identity space with a large page".into());
+    }
+    if space.identity && !space.mmio.is_empty() {
+        return Err("identity space with an mmio page".into());
     }
     let mut flags = BTreeMap::new();
     let code_pages: Vec<u64> = bodies(space, rip).flat_map(|(at, code)| page_span(at, code.len())).collect();
@@ -393,6 +420,11 @@ fn build(b: &mut Builder, space: &Space, rip: u64, nxe: bool) -> Result<Tables> 
         }
     }
     let mut t = Tables::new(b)?;
+    t.devices = devices.clone();
+    for &(va, gpa, _) in &space.mmio {
+        flags.remove(&va);
+        t.map_at(b, va, gpa, USER | WRITABLE | no_execute)?;
+    }
     for &region in &space.large {
         let inside: Vec<(u64, u64)> = flags.range(region..region + LARGE).map(|(&p, &f)| (p, f)).collect();
         let writable = inside.iter().fold(0, |w, &(_, f)| w | f & WRITABLE);
@@ -534,6 +566,17 @@ fn tamper_offset(area: Area, state: &mut State) -> bool {
     p.offset = h.code_size; // a whole exit no longer fits
     true
 }
+/// M3: a completed device access's reply with a status the resident does not know: it must refuse it (`bad_reply`) and
+/// commit nothing.
+fn tamper_mmio(area: Area, state: &mut State) -> bool {
+    let mut m: exec::Mmio = area.read_record(exec::MMIO_OFFSET);
+    let done = state.reply == exec::REPLY_DEVICE && m.status == exec::mmio::DONE;
+    if done {
+        m.status = 0x7f;
+        area.write_record(exec::MMIO_OFFSET, m);
+    }
+    done
+}
 /// A system reply whose decode the resident must refuse (`bad_reply`): an instruction length of 16.
 fn tamper_system(_: Area, state: &mut State) -> bool {
     let reply = state.reply == exec::REPLY_SYSTEM;
@@ -660,7 +703,7 @@ fn finished(stop: &Stop) -> bool {
             | Stop::Logged
             | Stop::FetchFault(_)
             | Stop::NoCode(_)
-            | Stop::Resident { stop: exec::stop::SHUTDOWN | exec::stop::UNSUPPORTED_ATOMIC | exec::stop::HALTED, .. }
+            | Stop::Resident { stop: exec::stop::SHUTDOWN | exec::stop::UNSUPPORTED_ATOMIC | exec::stop::HALTED | exec::stop::UNSUPPORTED_MMIO, .. }
     )
 }
 
@@ -673,7 +716,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let (mut forge_stop, mut forged, mut kicked, mut kicks, mut every_us, mut jitter_us) = (false, None, Vec::new(), 10_000, 0, 0);
     let mut kick_events: Vec<u64> = Vec::new();
     let (mut ignore_kicks, mut signal_at, mut deadline_ms) = (false, None, execution::COMPILE_DEADLINE.as_millis() as u64);
-    let mut code_shape = false;
+    let (mut code_shape, mut device_tamper) = (false, false);
     let mut options = options.iter();
     while let Some(option) = options.next() {
         let mut value = || -> Result<usize> { options.next().and_then(|v| v.parse().ok()).ok_or(USAGE.into()) };
@@ -710,6 +753,10 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                     Some("word") => tamper_word,
                     Some("record") => tamper_record,
                     Some("system") => tamper_system,
+                    Some("mmio") => {
+                        device_tamper = true;
+                        tamper_mmio
+                    }
                     Some("next-page") => tamper_next_page,
                     Some("site") => tamper_site,
                     Some("site-kind") => tamper_site_kind,
@@ -755,12 +802,23 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         }
         builder.reserved.extend(LOG_PAGES.map(|o| LOG_IDENTITY + o));
     }
+    // M3: one test device per distinct `mmio` page, registered for every vCPU.
+    let mut test_devices: BTreeMap<u64, Arc<Mutex<TestDevice>>> = BTreeMap::new();
+    let mut registry = Devices::default();
+    for &(_, gpa, _) in d.spaces.iter().flat_map(|s| s.mmio.iter().filter(|m| m.2)) {
+        if !test_devices.contains_key(&gpa) {
+            let device = Arc::new(Mutex::new(TestDevice::new()));
+            registry.register(gpa, 4096, device.clone())?;
+            test_devices.insert(gpa, device);
+        }
+    }
+    let registry = Arc::new(registry);
     // A space is built for the first vCPU using it (its rip places `code` bodies).
     let mut spaces: Vec<Option<Tables>> = d.spaces.iter().map(|_| None).collect();
     let mut ends = Vec::new();
     for c in &d.cpus {
         if spaces[c.space].is_none() {
-            spaces[c.space] = Some(build(&mut builder, &d.spaces[c.space], c.rip, c.nxe)?);
+            spaces[c.space] = Some(build(&mut builder, &d.spaces[c.space], c.rip, c.nxe, &test_devices)?);
         }
         ends.push(stop_at(&d.spaces[c.space], c.rip)?);
     }
@@ -804,6 +862,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 gs_base: c.gs_base,
                 xmm: c.xmm,
                 mxcsr: c.mxcsr,
+                fcw: exec::FCW_INIT,
                 cr2: 0,
                 cr8: 0,
                 dr: exec::DR_RESET,
@@ -833,12 +892,17 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             handlers: Some(handlers..handlers + 0x1000),
             posts: d.cpus[v].posts.iter().copied().collect(),
             doorbell: Some(machine.doorbell()),
+            devices: Some(registry.clone()),
             ..Default::default()
         };
         if v == target {
             compiler.tamper = forge.then_some(forge_exit as fn(&mut [u8]));
             compiler.signal_at = signal_at;
             requests.tamper = if forged_entry.is_some() { Some(tamper_forge_entry) } else { tamper };
+            // M3: the device reply tamper runs on device replies only.
+            if device_tamper {
+                (requests.tamper, requests.tamper_device) = (None, tamper);
+            }
         }
         // A peer that never answers: alive (no watchdog of its own), never stopping.
         let watchdog = if v == target && ignore_kicks { std::time::Duration::from_secs(86_400) } else { watchdog };
@@ -970,12 +1034,26 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let log = log_base(d.spaces[d.cpus[v].space].identity);
         let mut json = report(backing.vcpu(v), &d.spaces[d.cpus[v].space], tables, log, ran, tampering, tamper_after.filter(|_| v == target))?;
         json.pop();
-        out.push(json + &kick_report(backing.vcpu(v), &stops) + "}");
+        let m: exec::Mmio = backing.vcpu(v).read_record(exec::MMIO_OFFSET);
+        let mmio = if test_devices.is_empty() {
+            String::new()
+        } else {
+            format!(",\"mmio\":{{\"completed\":{},\"status\":\"{}\"}}", m.completed, exec::mmio::name(m.status))
+        };
+        out.push(json + &kick_report(backing.vcpu(v), &stops) + &mmio + "}");
     }
+    let devices = test_devices.iter().map(|(gpa, d)| {
+        let d = d.lock().unwrap();
+        let log: Vec<String> = d.log.iter().map(|e| format!("[{},{},{},{},\"{:#x}\"]", e[0], e[1], e[2], e[3], e[4])).collect();
+        format!("{{\"gpa\":\"{gpa:#x}\",\"reads\":{:?},\"writes\":{:?},\"order_errors\":{},\"log\":[{}]}}", &d.reads[..n], &d.writes[..n], d.order_errors, log.join(","))
+    });
+    let devices = if test_devices.is_empty() { String::new() } else { format!(",\"devices\":[{}]", devices.collect::<Vec<_>>().join(",")) };
     if d.sections {
-        println!("{{\"cpus\":[{}]}}", out.join(","));
+        println!("{{\"cpus\":[{}]{devices}}}", out.join(","));
     } else {
-        println!("{}", out[0]);
+        let mut one = out.swap_remove(0);
+        one.pop();
+        println!("{one}{devices}}}");
     }
     Ok(())
 }
@@ -1094,7 +1172,29 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
         let bytes: String = guest.copy_out(*address, data.len()).iter().map(|b| format!("{b:02x}")).collect();
         let _ = write!(out, "{}{{\"addr\":\"{address:#x}\",\"data\":\"{bytes}\"}}", if i > 0 { "," } else { "" });
     }
-    out += "],\"pages\":[";
+    // I6: the x87 state (FCW from the bank; the rest from the guest-state page: TOP, C0..C3, FEX's IE byte, the exception
+    // word, the abridged tag byte, ST's physical registers mm[0..8] as doubles).
+    let frame: [u8; exec::frame::BYTES] = area.read_record(exec::FRAME_OFFSET);
+    let byte = |at: u32| u64::from(frame[at as usize]);
+    let word = |at: u32| u64::from(u32::from_le_bytes(frame[at as usize..at as usize + 4].try_into().unwrap()));
+    let mm: Vec<u64> = (0..8).map(|r| u64::from_le_bytes(frame[(exec::frame::X87_MM + 16 * r) as usize..][..8].try_into().unwrap())).collect();
+    let _ = write!(
+        out,
+        "],\"x87\":{{\"fcw\":\"{:#x}\",\"top\":{},\"c\":[{},{},{},{}],\"ie\":{},\"pe\":{},\"sf\":{},\"exceptions\":\"{:#x}\",\"ftw\":\"{:#x}\",\"mm\":[{}]}}",
+        s.cpu.fcw,
+        byte(exec::frame::X87_TOP),
+        byte(exec::frame::X87_C0),
+        byte(exec::frame::X87_C1),
+        byte(exec::frame::X87_C2),
+        byte(exec::frame::X87_C3),
+        byte(exec::frame::X87_IE),
+        byte(exec::frame::X87_PE),
+        byte(exec::frame::X87_SF),
+        word(exec::frame::X87_EXCEPTIONS),
+        byte(exec::frame::X87_FTW),
+        list(&mm)
+    );
+    out += ",\"pages\":[";
     for (i, (va, &(_, leaf))) in guest.pages.iter().filter(|(va, _)| !(log..log + 0x7000).contains(*va)).enumerate() {
         let entry = guest.ram.read::<u64>(leaf).unwrap();
         let _ = write!(
@@ -1226,7 +1326,7 @@ mod tests {
     fn next_page_tamper_answers_a_block_request_twice() {
         let memory = Memory::with_size(4096).unwrap();
         let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0 };
-        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1000, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET });
+        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1000, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, fcw: exec::FCW_INIT });
         s.fetch = [0x5000, u64::MAX];
         s.reply = exec::REPLY_SYSTEM;
         assert!(!tamper_next_page(area, &mut s) && s.reply == exec::REPLY_SYSTEM);

@@ -133,8 +133,8 @@ pub(super) fn noncanonical(i: &System) -> Exception {
 /// supervisor one (`supervisor`: descriptor tables, TSS). Both pages of a crossing range are walked (A/D set as the CPU
 /// does) before any byte moves, so a #PF (CR2 the first faulting byte's page start, or `va`) leaves memory unchanged;
 /// a non-canonical range raises `noncanonical`. A write into a page holding translations invalidates them first
-/// ([`FetchWrites`]: no block of this vCPU runs during a transaction). Only write-back guest RAM is accessed; anything
-/// else (device pages: M3) stops `unsupported_system`.
+/// ([`FetchWrites`]: no block of this vCPU runs during a transaction). Only write-back guest RAM is accessed: other memory
+/// types stop `unsupported_system` (M2's), device pages `unsupported_mmio` (status `system`, M3).
 pub(super) fn linear(s: &mut State, va: u64, buf: &mut [u8], write: bool, supervisor: bool, noncanonical: Exception) -> Result<(), Exception> {
     let n = buf.len() as u64;
     // X2: an explicit access at CPL 3 under alignment checking (SDM Vol.3 7.15, Table 7-7): #AC(0) after the canonical
@@ -157,6 +157,10 @@ pub(super) fn linear(s: &mut State, va: u64, buf: &mut [u8], write: bool, superv
     }
     let gpa = pages(s, va, n, write, supervisor, noncanonical)?;
     let first = (4096 - (va & 4095)).min(n) as usize;
+    // Only guest RAM is accessed, and nothing is written unless every byte is RAM (M3: a device page stops first).
+    if !super::mmio::ram(gpa[0]) || (first < n as usize && !super::mmio::ram(gpa[1])) {
+        super::mmio::system_access(s)
+    }
     let (low, high) = buf.split_at_mut(first);
     for (gpa, chunk) in [(gpa[0], low), (gpa[1], high)] {
         if chunk.is_empty() {
@@ -178,8 +182,10 @@ pub(super) fn linear(s: &mut State, va: u64, buf: &mut [u8], write: bool, superv
     }
     Ok(())
 }
-/// The guest-physical addresses of `[va, va + n)` (its page, and the next one when it crosses), walked for [`linear`].
-fn pages(s: &mut State, va: u64, n: u64, write: bool, supervisor: bool, noncanonical: Exception) -> Result<[u64; 2], Exception> {
+/// The guest-physical addresses of `[va, va + n)` (its page, and the next one when it crosses), walked for [`linear`]
+/// (which accesses only guest RAM) and for CLFLUSH (M3: a device page is uncached, nothing to flush; the walk's faults
+/// are all it has).
+pub(super) fn pages(s: &mut State, va: u64, n: u64, write: bool, supervisor: bool, noncanonical: Exception) -> Result<[u64; 2], Exception> {
     let last = va.wrapping_add(n - 1);
     if !paging::canonical(va) || !paging::canonical(last) || last < va {
         return Err(noncanonical);
@@ -194,7 +200,7 @@ fn pages(s: &mut State, va: u64, n: u64, write: bool, supervisor: bool, noncanon
     for (k, at) in [va, last & !4095].into_iter().enumerate().take(1 + usize::from(crosses)) {
         gpa[k] = loop {
             match paging::walk(&mut GuestTables::observed(RAM, CodeWrites(FetchWrites(s))), control, at, access) {
-                Ok(t) if t.wb => break t.gpa,
+                Ok(t) if t.wb || !super::mmio::ram(t.gpa) => break t.gpa,
                 Ok(_) => halt(s, stop::UNSUPPORTED_SYSTEM),
                 Err(Fault::Page { address, error }) => return Err([14, error, address]),
                 Err(Fault::Contended) => {}
@@ -210,7 +216,7 @@ fn pages(s: &mut State, va: u64, n: u64, write: bool, supervisor: bool, noncanon
 /// hardware sets by a locked read-modify-write.
 fn atomic_byte(s: &mut State, va: u64, update: impl FnMut(u8) -> Option<u8>) -> Result<Result<u8, u8>, Exception> {
     let gpa = pages(s, va, 1, true, true, GP0)?[0];
-    let Some(p) = RAM.range(gpa, 1) else { halt(s, stop::UNSUPPORTED_SYSTEM) };
+    let Some(p) = RAM.range(gpa, 1) else { super::mmio::system_access(s) };
     if cache::translated(gpa) {
         FetchWrites(s).code_write(gpa);
     }

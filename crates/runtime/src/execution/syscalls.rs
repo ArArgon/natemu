@@ -143,7 +143,8 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             }
         }
         system::CLFLUSH => {
-            segments::linear(s, segments::address(&c, &i), &mut [0u8; 1], false, false, segments::noncanonical(&i))?;
+            // The walk of a byte load (its faults; M3: a device page passes, uncached, nothing to flush).
+            segments::pages(s, segments::address(&c, &i), 1, false, false, segments::noncanonical(&i))?;
         }
         _ => halt(s, stop::BAD_REPLY),
     }
