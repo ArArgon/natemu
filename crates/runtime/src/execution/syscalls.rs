@@ -15,8 +15,9 @@
 //! - RDFSBASE..WRGSBASE (#UD without CR4.FSGSBASE, any CPL): 32-bit forms read the low half zero-extended and write the
 //!   zero-extended low half; a 64-bit write of a non-canonical value is #GP(0).
 //! - RDRAND: the next word of the vCPU's entropy pool ([`Entropy`], filled by the host): CF = 1, OF SF ZF AF PF = 0, the
-//!   destination written at its size (16 bits merge, 32 zero-extend); an empty pool is RDRAND's architectural failure,
-//!   CF = 0 and a zero destination.
+//!   destination written at its size (16 bits merge, 32 zero-extend); an empty pool is refilled by one host exit
+//!   ([`REQUEST_ENTROPY`], K2), and a pool still empty after it (the host's source failed) is RDRAND's architectural
+//!   failure, CF = 0 and a zero destination.
 //! - WBINVD, INVD, WBNOINVD (CPL 0, else #GP(0)) have no architectural effect on memory here: guest RAM is coherent
 //!   write-back with no cache model, so there is nothing to write back or to discard. INVD's discard without write-back
 //!   is therefore WBINVD (the SDM lets INVD lose data, never invent it; no data is lost here). Like every system
@@ -122,6 +123,9 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             // SAFETY: the pool is this vCPU's own record in its state page (EL1 read/write); the host writes it only while
             // the vCPU is in the host.
             let value = unsafe {
+                if (&raw const (*pool).taken).read_volatile() >= ENTROPY_WORDS as u64 {
+                    refill(s);
+                }
                 let taken = (&raw const (*pool).taken).read_volatile();
                 (taken < ENTROPY_WORDS as u64).then(|| {
                     (&raw mut (*pool).taken).write_volatile(taken + 1);
@@ -149,4 +153,20 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
         _ => halt(s, stop::BAD_REPLY),
     }
     Ok(None)
+}
+/// K2: an empty entropy pool is refilled by one host exit (the host tops it up at every exit). The state goes to the
+/// record and back in place (no copy on this frame: it is on the gate's deepest path).
+#[inline(never)]
+fn refill(s: &mut State) {
+    (s.request, s.reply) = (REQUEST_ENTROPY, NONE);
+    let bytes = size_of::<State>();
+    unsafe {
+        copy_record(record().cast(), (&raw const *s).cast(), bytes);
+        asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
+        copy_record((&raw mut *s).cast(), record().cast(), bytes);
+    }
+    s.request = NONE;
+    if s.reply != REPLY_ENTROPY {
+        halt(s, stop::BAD_REPLY)
+    }
 }

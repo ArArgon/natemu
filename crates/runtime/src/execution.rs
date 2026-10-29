@@ -10,7 +10,8 @@
 //! (self-modifying code, [`code_written`]). Literal exits
 //! enter the linker (`svc #LINK`), which finds their target the same way
 //! and links the exit to it. A miss at a system instruction (every block ends before one) gets the host's decode of
-//! it instead of a block, and the resident executes it as a transaction ([`system`]). Also the 128/64 division
+//! it instead of a block, which the resident keeps in the code cache like a block of those bytes (K2: decoded once per
+//! translation, later runs make no host exit) and executes as a transaction ([`system`]). Also the 128/64 division
 //! generated code asks for with `svc #DIV_U/DIV_S`. Generated code runs at EL0 and reaches the resident only by
 //! exceptions (`svc`, check stubs, aborts, traps, interrupts); it reads and writes no emulator data, and the hardware
 //! enforces it: every private page is EL1-only except the code area, which EL0 may only execute. Interrupts are doorbells (a host SPI, a
@@ -136,6 +137,14 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
         let context = s.cpu.code_context();
         cache::select_l1(context);
         let block = match cache::lookup(s.cpu.rip, context) {
+            // K2: a system instruction's decode, kept when it was translated: executed with no host exit.
+            Some(b) if b.flags & cache::SYSTEM != 0 => {
+                s.l2_hits += 1;
+                match unsafe { executed(s, cache::system_of(b)) } {
+                    Some(block) => return Some(block),
+                    None => continue,
+                }
+            }
             Some(b) => {
                 s.l2_hits += 1;
                 b
@@ -152,29 +161,34 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
                         flushed = true;
                         continue;
                     };
-                    let placed = s.generation;
-                    take_invalidations(s);
-                    if s.generation != placed {
-                        return None; // flushed: the block is gone
-                    }
-                    let unmarked = |g: u64| g != u64::MAX && !cache::marked(g);
-                    if placed != missed || block.flags & cache::DEAD != 0 || block.source_gpa.iter().any(|&g| unmarked(g)) {
-                        if block.flags & cache::DEAD == 0 && cache::discard(block).is_none() {
-                            halt(s, stop::BAD_LINK)
-                        }
+                    if !kept(s, block, missed) {
                         return None;
                     }
                     block
                 }
-                (_, Reply::System(instruction)) => {
-                    system(s, instruction);
-                    // A BT* form found aligned under alignment checking (X2): run it alone, compiled without the cut.
-                    if s.plain_step != 0 {
-                        if let Some(block) = unsafe { step_here(s) } {
-                            return Some(block);
+                // K2: the decode is kept as the translation of its bytes (a test driver's hooks are not instructions:
+                // they are answered at every request), under the rule a block's placement keeps ([`cache::place_system`]).
+                (missed, Reply::System(instruction)) => {
+                    if !matches!(instruction.kind, system::SET_CPL | system::EVENT_HOOK) {
+                        // Crossing into a second page: at least up to its first byte, so INVLPG of either page covers it
+                        // (some kinds, e.g. #UD forms, do not use `length`).
+                        let bytes = if s.source_gpa[1] == u64::MAX { instruction.length } else { instruction.length.max(4097 - (s.cpu.rip & 4095) as u32) };
+                        let Some(record) = cache::place_system(s.cpu.rip, context, s.source_gpa, bytes, &instruction) else {
+                            if flushed {
+                                halt(s, stop::BAD_REPLY)
+                            }
+                            flush(s);
+                            flushed = true;
+                            continue;
+                        };
+                        if !kept(s, record, missed) {
+                            return None;
                         }
                     }
-                    continue;
+                    match unsafe { executed(s, instruction) } {
+                        Some(block) => return Some(block),
+                        None => continue,
+                    }
                 }
                 (_, Reply::Fault(fault)) => {
                     deliver(s, Event::Exception(fault));
@@ -187,10 +201,46 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
     }
 }
 
+/// Whether `b`, just placed for a request made at cache generation `missed`, may stay: invalidations are taken; a
+/// flush meanwhile (`false`: it is gone), a write that raced its fetch (dead), or a source page whose mark this vCPU lost
+/// while it was fetched discards it (`false`: the caller steps the instruction from fresh bytes; see [`find`]).
+fn kept(s: &mut State, b: &Block, missed: u64) -> bool {
+    let placed = s.generation;
+    take_invalidations(s);
+    if s.generation != placed {
+        return false; // flushed: the block is gone
+    }
+    let unmarked = |g: u64| g != u64::MAX && !cache::marked(g);
+    if placed != missed || b.flags & cache::DEAD != 0 || b.source_gpa.iter().any(|&g| unmarked(g)) {
+        if b.flags & cache::DEAD == 0 && cache::discard(b).is_none() {
+            halt(s, stop::BAD_LINK)
+        }
+        return false;
+    }
+    true
+}
+/// Executes the decoded system instruction `i` at `s.cpu.rip` ([`system`]); a BT* form found aligned under alignment
+/// checking (X2) then runs alone, compiled without the cut: its step block.
+unsafe fn executed(s: &mut State, i: System) -> Option<&'static Block> {
+    system(s, i);
+    if s.plain_step != 0 { unsafe { step_here(s) } } else { None }
+}
+/// K2: the decode kept for the system instruction at `s.cpu.rip` in this context, unless the instruction must be compiled
+/// plain (`State::plain_step`).
+fn kept_system(s: &State) -> Option<System> {
+    let b = cache::lookup(s.cpu.rip, s.cpu.code_context()).filter(|b| b.flags & cache::SYSTEM != 0 && s.plain_step == 0)?;
+    Some(cache::system_of(b))
+}
+
 /// The instruction at `s.cpu.rip` alone, placed in the step slot (X2: after a shadow-setting instruction with an event
 /// pending, or a BT* form under alignment checking, `State::plain_step`, which this request consumes); `None` when it was
 /// a system instruction (executed) or its fetch faulted (delivered): the caller looks at the next boundary.
 unsafe fn step_here(s: &mut State) -> Option<&'static Block> {
+    // A system instruction whose decode is kept runs from it (K2): nothing to compile.
+    if let Some(i) = kept_system(s) {
+        system(s, i);
+        return None;
+    }
     let reply = unsafe { request(s, REQUEST_STEP) };
     s.plain_step = 0;
     match reply {
@@ -321,6 +371,8 @@ unsafe fn request(s: &mut State, kind: u64) -> Reply {
         if !s.system.well_formed() {
             halt(s, stop::BAD_REPLY)
         }
+        // The pages its bytes came from (the next one only when the decode needed it, [`REPLY_NEXT_PAGE`]).
+        s.source_gpa = s.fetch;
         s.request = NONE;
         return Reply::System(s.system);
     }
@@ -1217,7 +1269,11 @@ fn step_from(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
 fn step(mut s: State) -> ! {
     loop {
         s.steps += 1;
-        let reply = unsafe { request(&mut s, REQUEST_STEP) };
+        // A system instruction whose decode is kept runs from it (K2), as a decoded reply below does.
+        let reply = match kept_system(&s) {
+            Some(i) => Reply::System(i),
+            None => unsafe { request(&mut s, REQUEST_STEP) },
+        };
         s.plain_step = 0;
         let h = match reply {
             Reply::Block(h) => h,

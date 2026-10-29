@@ -176,6 +176,7 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 | **G1** guest-state page (minimum built in I1; remainder (MXCSR, x87, AVX-high fields) with I5/I6/I8) | One EL0 page per vCPU at a fixed non-canonical address holding only FEX guest-state fields (DF, FS/GS, MXCSR, x87, AVX-high); documented deviation (a guest access to that page reaches its own state instead of #GP); the page lies outside the private window `[PRIVATE, PRIVATE+1 GiB)` or is exempted explicitly in `aborted`; invariant test | Layout test; non-#GP limited to that page | standing suite | invariant test fails on any non-guest field |
 | **K1** code cache across CR3/INVLPG | Blocks filed by guest-physical source pages; CR3/INVLPG drop only shadows; linear→physical revalidation on lookup; per-page invalidation for host/device writes | Address-space switch programs keep translations (counted); remap/rewrite always retranslated; QEMU at 1–4 vCPUs | `system`, `coherence`, `sharedpt` | no full flush on CR3 |
 | **K2** resident system-instruction path | Every system instruction is a host exit for its decode today (measured: FLD+FSTP m80 11.4 us per pair against <0.1 us for m64; CPUID/RDTSC, CLI/STI/POPF, SWAPGS, MSR and CR accesses, Linux's irq save/restore and syscall paths all pay it). Decode once when the block is translated, from the bytes fexc translated (so cross-modifying code sees old-or-new, as M3's site records), store the decoded system record in the block, and run the transaction in the resident with no host exit; keep host exits only for work that needs the host (devices, entropy refill, CPUID/MSR state the host owns, if any) | Exit counts per system kind before/after; the standing suite unchanged; XMC toggle cases (old-or-new); cost per CLI/STI/POPF/SWAPGS/RDTSC/FLD m80 measured | standing suite | no decode exit for an admitted system instruction |
+| **P2** resident entry cost | Measured after K2: about 0.36 us fixed per resident entry on the linker path and 0.167 us for the cheapest round trip (`svc #DIV`), against ~55 ns per extra transaction inside one entry; every block exit into a system instruction pays it (never linked). Instrument `bank`/`sse::bank`, `block_at`, `enter` (frame build, `sse::fill`, full State `write_record`, NativeFrame) and `tables::select` with counters; then cut what the evidence shows (e.g. bank/copy only what changed, link a block exit straight into a kept system record, skip `tables::select` when the CPL/root did not change) | Per-step cycle breakdown before/after; K2 cost loops; the standing suite | standing suite | each removed cost measured; no correctness change |
 | **S4** debug: TF and breakpoints | TF/RF single-step, DR0–3/DR7 execute and data breakpoints, #DB delivery, interaction with linking/dispatch (CPU 16 requires it); once breakpoints are armed, writes to DR0–3 and DR7 must flush this vCPU's code or key it by them | QEMU programs; SDM model | standing suite | #DB exact per SDM |
 | **C0** census (after Q2) | Static census of instruction forms admission refuses, over the Debian decompressor, the decompressed vmlinux and the initramfs `/init` binaries, by H §2's static-share method with fexc's classifier | Counts per form and per binary; spot-check against `llvm-objdump` | — | every refused form is listed with its I-chunk or a proposed typed refusal |
 | **L0** host split | Host library + driver crate; generic stop-ELR hook for `forge_stop` (slice-3 phase-end deviation); manifest-taking boot entry stub | Standing suite; `contain` tampers fire | all | green; no tamper code in the library |
@@ -1055,7 +1056,7 @@ an undocumented alias: 3); MMX (the x87 registers as MM0..7: 1,381 initramfs sit
 them today, 160 + 44 + 0 initramfs sites take the transaction); FIP/FDP (0 in images); FLD/FSTP m80 as resident round
 trips (2,411 FLD m80 and 1,098 FSTP m80 initramfs sites): a loop of FLD m80 + FSTP m80 takes 11.4 us per iteration against
 under 0.1 us for FLD/FSTP m64, because every system instruction is a host request for its decode today (a resident decode
-cache, L5, or native 80-bit conversions would remove it).
+cache, L5, or native 80-bit conversions would remove it) (K2: 0.5 us per pair, no host exit; Built (K2)).
 **For I5b:** FXSAVE/FXRSTOR's and XSAVE's x87 image is built from `Cpu::fcw`, `x87::fsw()`, the abridged tag byte as it is in
 the page (`frame::X87_FTW`, FXSAVE's own format), ST(i) = `natemu_abi::x87::to_f80(x87::mm(x87::top() + i))` at 32 + 16i (bytes
 10..15 zero), FOP/FIP/FDP 0; restoring takes FCW (refuse a cleared mask: `x87::masked`), `x87::set_fsw`, the tag byte and
@@ -1104,6 +1105,111 @@ each (faults rerun once after `hv_vm_create` contention from another agent's VMs
 faults 454, i5a DE 351, corpora, smp, limits, kicks, system, coherence, sharedpt, litmus, contain, privilege, delivery, events,
 i6 faults 276 at both block sizes, `run_m3.py` (corpus 66 programs / 715 accesses, faults, refusals, kicks, contain, xmc,
 boundary), all with 0 failures.
+*Built (K2, the resident system-instruction path; no fexc change, series25):* **Where the decode happens.** Host-side,
+at translation time, as before: `system.rs` stays the only x86 system decoder and decodes the instruction fexc cut,
+from exactly the bytes the resident walked and marked for that translate request. What changed is that the resident
+keeps the decode: on a `REPLY_SYSTEM` to a translate request it files the `System` record in its code cache as a block
+without code (`cache::SYSTEM`, the record right after the `Block` where a block's sites are; `cache::place_system`;
+`code_size` 0, never in L1, never entered or linked), keyed by (RIP, context) in L2 and filed by its source pages and
+guest bytes, so it is invalidated exactly as a block of those bytes would be (a peer's or its own write to the page,
+INVLPG over its range, every flush), and placed under the same rule as a block (a write racing the fetch, a lost mark or
+a flush while it was asked for: discarded, and the instruction stepped from fresh bytes). Later visits to the RIP find
+it in `find`'s L2 lookup and run the transaction with no host exit; the single-instruction step (X2's shadow step, the
+killed-block and code-write `step`) uses a kept record too (`kept_system`), except a BT* form under alignment checking,
+which is compiled plain by design. Rejected: a record from fexc like M3's (a second decoder of the operand forms in the
+shim, which FEX's decoder does not decode for `0f 20..23`), and a record attached to the preceding block (a system
+instruction is reached from many predecessors, a delivery, an IRET or a step; keyed by its own RIP it covers all). The
+test drivers' hooks (`SET_CPL`, `EVENT_HOOK`) are not instructions and are answered at every request. **Cross-modifying
+code** gives old or new: a record describes the bytes of one translation; a rewrite posts the page and the next drain
+kills it (`run_k2.py xmc`). **Host-owned state:** none; CPUID (generated profile), the MSRs (their record) and the TSC
+(CNTVCT) were already in the resident (S1), so nothing moved. **RDRAND:** the pool is no longer refilled at every
+RDRAND's exit, so an RDRAND that finds it empty asks the host once (`REQUEST_ENTROPY`, the host tops it up as at every
+exit) and takes the next word; CF = 0 remains only for a failed host source. **Exits that remain:** compile requests
+(the first visit of a block or system instruction per cache generation, and step-slot compiles of ordinary
+instructions), fetch faults (with the request), device accesses (M3), one entropy refill per 32 RDRANDs without another
+exit between, the test drivers' hooks, stop RIP and logging handlers, and the end. Every flush still drops every kept
+decode: each CR0/CR4 change, CR3 load and MTRR write, so the next visit of each system instruction after one is a
+decode exit again (K1's). Also: a vCPU running system instructions no longer leaves the guest for them, so the host
+watchdog (10 s without a host exit) now applies to such loops as to any guest loop: a loop made only of system
+instructions spins in the resident until the watchdog ends it. **Resident cost:** the state record
+and frames are copied 8 bytes at a time (`record::copy_record`; the byte-by-byte volatile copy made every resident entry
+cost about 1 us), and `fill_l1` skips a rewrite of an L1 entry that already holds the block. **Accounting:** the program
+driver reports `decode_exits`, `decodes` (by kind) and `entropy_exits` per vCPU, and with `NATEMU_EXIT_LOG=FILE`
+appends one line per vCPU (systems, entropy, decodes by kind) for a suite's totals. **Checks** (series25; decode exits from `NATEMU_EXIT_LOG`, before = the HEAD runtime with the new host's counter):
+`system` 112,024 decode exits for 112,027 transactions before, 16,931 for 176,337 after (more transactions: the time-bound
+loops run faster), of which MOV to CR 4,963, MOV from CR 2,984, RDMSR 2,629, WRMSR 2,068, CPUID 773 (each the first visit after
+a flush: the CR, EFER and MTRR writes in these programs flush), INVLPG 92,651 -> 288; `events` 61,186 for 61,514 -> 1,282 for
+53,500 (IRET 23,574 -> 182, HLT 14,022 -> 50, CLI 6,076 -> 406, STI 5,828 -> 158, MOV Sreg 11,312 -> 112); `run_i6_faults.py`
+616 -> 616 (every case runs each instruction once: first translations only); `run_m3.py` 20 -> 23 (a few more steps meet
+the INT3 in its xmc). Cost per loop iteration at CPL 0, 1 vCPU (`run_k2.py cost`, slope over N = 100,000 and 200,000,
+median of 3): CLI 6.39 -> 0.46 us, STI 6.35 -> 0.47, PUSHFQ+POPFQ 6.40 -> 0.51, SWAPGS 6.24 -> 0.51, RDTSC 6.36 -> 0.48,
+CPUID 6.34 -> 0.47, WRMSR KERNEL_GS_BASE 6.33 -> 0.47, FLD+FSTP m80 10.92 -> 0.56 (two transactions, one resident entry); a
+loop's decode exits stay 1 (2 for the m80 pair) at both N (a failure if they grow). What remains is one resident round
+trip per block exit into a system instruction (a literal exit to it is never linked: the linker, the transaction, the next
+lookup); without the record-copy change it was 1.32 us. Breakdown (the review's measurement, `cost` variants): each
+further transaction in the same resident entry costs about 55 ns (CLI x2, x4 per iteration), so about 0.36 us is the fixed
+cost of one resident entry on the linker path; the cheapest resident round trip, a 128/64 division by `svc #DIV`
+(`run_k2.py` `div`: RDX = 1, divisor 2), takes 0.167 us (0.152 in the rerun after review), so an `svc` alone (about 31 ns) describes no current resident
+entry. The rest is in `bank`/`sse::bank`, `block_at`, `enter` (the frame build, `sse::fill`, the whole `State`
+`write_record`) and `tables::select`, not yet instrumented. `run_k2.py rdrand` (4,000 RDRANDs: all CF = 1, 124 entropy exits,
+values differ); `run_k2.py xmc` (300,000 rounds against 20,000,000 one-byte rewrites, block sizes default and 1: CLI <-> NOP,
+CLI <-> STI, SWAPGS <-> RDTSCP, FLD m80 <-> FILD m32 reach their end with 435-1,574 decode exits and 723-2,357 steps from
+rewritten bytes; INT3 <-> CLI reaches the INT3 and takes #BP, RIP after it), never another stop; each run must translate X again (decode
+exits > 1) and an INT3 run must take #BP. `run_k2.py coherence` (the review's cases, block sizes default and 1; each with
+the old instruction decoded once over two visits, then the new one observed): A the vCPU's own write from another page, B
+its own write on X's page in a loop, C remap + INVLPG and remap + CR3 reload, D a write through an alias of X's frame, E a
+SWAPGS crossing 0x200000 with only the second page remapped (to RDTSCP) and INVLPGed, F a peer's rewrite, a flag, then
+CPUID (three runs); and a kept BTS record under alignment checking (aligned five times, each stepped plain, then #AC(0)
+at the BTS; all aligned: completes). Shown red with record invalidation disabled (`cache::kill` skipping SYSTEM records):
+every xmc run (decode exits 1, no #BP) and A, B, C-INVLPG, D, E, F fail; C-CR3 passes (the CR3 load flushes) and the BTS
+cases pass (no invalidation involved); green with it restored. Full standing suite green:
+cargo build/test, stack audit (gate 18,464 bytes, 22,528 with a nested entry to its halt, of 32,768; HEAD 18,368/22,368),
+python unit 259, fix/fix-1 64, seed/seed-1 44, faults/faults-1 7,581, flow 64 x 2, loopfaults 846 x 2, probes 83, FEX ASM
+1,052 pass 0 fail (22 precision deviations), corpora, smp, limits, kicks, system, coherence, sharedpt, litmus, contain,
+privilege, delivery, events, i6 faults 276 at both block sizes, i5a faults 454, i5a DE 351, `run_m3.py`, `run_k2.py`.
+**Not built:** linking a block's exit straight into a kept system record (the remaining ~0.45 us), keeping records across
+flushes (K1), inline translation of the simple flag forms (CLI/STI/POPF without TF).
+*Built (L1, the boot-protocol loader; no fexc change, series25):* `crates/host/src/boot.rs` loads a bzImage by the 64-bit
+protocol of `Documentation/arch/x86/boot.rst` v6.12.107 and nothing else (no kernel is recognised). **Header:** boot flag,
+`HdrS`, protocol >= 2.12, the jump byte, header end 0x268..0x290, LOADED_HIGH, XLF_KERNEL_64, a power-of-two alignment
+(relocatable), init_size != 0, a pref_address (fixed), setup_sects 0 = 4, the file holds `syssize * 16` bytes (checked
+arithmetic), the payload inside it; codes and order are `tools/models/bootproto.py`'s. **Map** (`Layout { low_end, high }`,
+CLM-03-03-69): reserved 0..4 KiB, RAM to 0xa0000, reserved legacy hole, loader page tables 1..2 MiB, the SMRAM hole to
+6 MiB, ACPI NVS 6..8 MiB (L2: RSDP, tables, mailbox), NVS boot scratch 8..16 MiB (X4), RAM 16 MiB..L (default 2 GiB,
+any 2 MiB multiple to 3 GiB), reserved L..4 GiB, RAM 4 GiB..+H. **Placement:** the boot.rst runtime start (relocatable:
+align_up(max(16 MiB, pref_address), kernel_alignment); else pref_address), window max(init_size, loaded size) inside
+[16 MiB, L); the initrd page-aligned downward, last byte <= initrd_addr_max, end <= L, above the window. **Zero page**
+(0x10000): zeroed, the header 0x1f1..end copied, then every field boot.rst types "write" is the loader's (type_of_loader
+0xFF, ext_loader_*, heap_end_ptr 0, loadflags' QUIET/KEEP_SEGMENTS/CAN_USE_HEAP clear, ramdisk_image/size and their high
+halves (0 without an initrd), cmd_line_ptr and its high half, hardware_subarch and its data 0, setup_data 0), code32_start,
+acpi_rsdp_addr (L2's hook `Inputs::rsdp`, inside the ACPI NVS range; kernels of protocol 2.12/2.13 predate the field and
+ignore it), the e820 table. Command line 0x11000 (<= cmdline_size), GDT 0x18000 (`__BOOT_CS` 64-bit, `__BOOT_DS`, flat),
+identity map of [0, L) in 2 MiB pages at 0x100000. **BSP:** RIP = K + 0x200, RSI = 0x10000, RSP = 0x18000, CR0 =
+PE|ET|NE|PG, CR4 = PAE, EFER = LME|LMA, RFLAGS = 2, CS 0x10, DS/ES/SS 0x18, FS/GS null, IDTR limit 0 (an exception before
+the kernel's own IDT is a shutdown). Typed refusals (`LoadError`), each tested. For L2: table writes must be added to
+`Loaded::writes` (the dump and the QEMU image use it). For M1: `load` takes one RAM range from 0; high RAM needs a
+multi-range description first. Driver `natemu-host RUNTIME boot-linux FEXC BZIMAGE [--initrd] [--cmdline] [--ram]
+[--rsdp] [--load-only] [--dump] [--stop-at] [--save]` (`drivers/linux.rs`, no tamper). **RAM limit:** in-tree guest RAM is
+`GUEST_RAM_BYTES` = 4 MiB, below the map's 16 MiB RAM start, so a VM run refuses `BAD_LAYOUT` until M1. Causes: the
+constant itself; the global area's code-page and writable-page masks (one byte per page in 0x1000-byte slots, so 16 MiB
+before RECORDS/RESETS/EVENTS move); the guest-RAM alias must end below `cache::CODE_VA` (PRIVATE + 256 MiB, alias from
+PRIVATE + 2 MiB: about 254 MiB in this layout); 2 GiB also needs a larger private window. **Smoke test** (owner Q8,
+`tools/run_l1_smoke.py`) on a scratch build with 128 MiB guest RAM (diff:
+`/private/tmp/claude-501/-Users-liaozping-orca-natemu/025ed521-9978-4fb2-aaf7-b90da95d37f3/scratchpad/l1/ram128.diff`,
+not committed; M1's): the Debian 6.12.107 bzImage with `mitigations=off nokaslr` runs its decompressor from the loader's
+entry to its jump into vmlinux (`e_entry` 0x1000c43) in about 1 s with no other stop (2,112 blocks, 66 system
+instructions: CPUID, string copies, its own GDT/IDT/CR3 loads, #PF delivered to its on-demand identity-map handler, CR2
+0x3800020 at the end; no port I/O, MSR, RDRAND or RDTSC). QEMU 11.1.2 (TCG, `-cpu Haswell`, no BIOS: a firmware from the
+reset vector into the identical state, the loader's writes as `-device loader` blobs, a gdbstub breakpoint at 0x1000c43):
+every GPR, RIP, RFLAGS, CR0/2/3/4, EFER, selectors, GDTR and IDTR equal; the zero page after the decompressor equal; the
+four vmlinux PT_LOAD segments equal in natemu, QEMU and the ELF; of the 0x37ef000-byte window one byte differs, the A bit
+of the decompressor's code descriptor (natemu 0x9b, QEMU 0x9a: QEMU's far-transfer CS load sets no A bit, S2b). `nokaslr`:
+with KASLR the decompressor draws RDRAND/RDTSC entropy and moves the kernel, so neither the stop address nor the bytes
+would be comparable. Checks: `boot::` unit tests (5: every header and loader refusal, the map, the write fields, a load);
+`tools/run_l1.py` check 12/12 (Debian with and without its initrd at 2 GiB, 3 GiB, 128 MiB; synthetic 2.12/2.15,
+aligned-up, fixed-address and stale-write-field images; three corrupted-dump controls), rejections 41/41 (16 header
+mutations on two images with the model's codes, 9 loader refusals); `bootproto.py` gained the setup_data rule
+(independent author). Not done: a KASLR run (needs a stop rule other than a fixed RIP); the VM path in-tree (M1).
 **Owner decision (October 28): MTRRs enabled by the virtual firmware, RAM write-back, device ranges uncached** (plan Q3).
 **Deferred (owner, October 28):** replacing the host's minimal JSON reader (`crates/host/src/json.rs`, used only for
 fexc's per-compile report: end reason and cut opcode) by carrying those fields in the code-object header; no registry

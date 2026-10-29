@@ -694,6 +694,9 @@ struct Ran {
     /// The distinct RIPs of the blocks the host translated for it.
     rips: std::collections::HashSet<u64>,
     tampered: bool,
+    /// K2: the host's system decodes by kind, and entropy refills.
+    decodes: std::collections::BTreeMap<u32, u64>,
+    entropy: u64,
 }
 /// A vCPU's own end (it parks; peers run on). Any other stop cancels the peers.
 fn finished(stop: &Stop) -> bool {
@@ -917,7 +920,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         if !finished(&stop) {
             owners::cancel_owners(cancelled);
         }
-        Ok(Ran { stop, compiles: compiler.compiles, slowest: compiler.slowest, blocks: requests.blocks, rips: requests.rips, tampered: requests.tampered })
+        Ok(Ran { stop, compiles: compiler.compiles, slowest: compiler.slowest, blocks: requests.blocks, rips: requests.rips, tampered: requests.tampered, decodes: requests.decodes, entropy: requests.entropy })
     };
     // HVF's GIC calls never race vCPU create/destroy (`vm.rs`, one lock).
     let prepare = |v: usize| -> Result<Vcpu> {
@@ -1158,6 +1161,13 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
     };
     let mut rips: Vec<u64> = ran.rips.iter().copied().collect();
     rips.sort_unstable();
+    // K2: decodes by kind ("0x7": n). A suite can collect them: with NATEMU_EXIT_LOG set, one line per vCPU is appended.
+    let decodes = ran.decodes.iter().map(|(k, n)| format!(r#""{k:#x}":{n}"#)).collect::<Vec<_>>().join(",");
+    if let Some(path) = std::env::var_os("NATEMU_EXIT_LOG") {
+        use std::io::Write as _;
+        let line = format!(r#"{{"systems":{},"entropy":{},"decodes":{{{decodes}}}}}"#, s.systems, ran.entropy) + "\n";
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| f.write_all(line.as_bytes()));
+    }
     let mut out = format!(
         "{{\"vcpu\":{},\"tso\":{},\"stop\":\"{kind}\",\"reason\":\"{reason}\",\"gpr\":[{}],\"rip\":\"{:#x}\",\"rflags\":\"{:#x}\",\"xmm\":[{}],\"mxcsr\":\"{:#x}\",\"memory\":[",
         area.vcpu,
@@ -1207,7 +1217,7 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"shadow_resets\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{},\"dispatch_exits\":{},\"interrupts\":{},\"nmis\":{},\"halts\":{},\"shadow_steps\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]{}}}",
+        "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"shadow_resets\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{},\"dispatch_exits\":{},\"interrupts\":{},\"nmis\":{},\"halts\":{},\"shadow_steps\":{},\"decode_exits\":{},\"decodes\":{{{}}},\"entropy_exits\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]{}}}",
         s.blocks,
         s.l2_hits,
         s.requests,
@@ -1238,6 +1248,9 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
         s.nmis,
         s.halts,
         s.shadow_steps,
+        ran.decodes.values().sum::<u64>(),
+        decodes,
+        ran.entropy,
         list(&fault),
         list(&s.native),
         frame_intact(area),

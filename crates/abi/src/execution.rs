@@ -236,6 +236,10 @@ pub mod cache {
     pub const DEAD: u32 = 1;
     /// The uncached single-step block, in the slot [`SLOT`] (not in `INDEX`, L1 or L2; never linked; no source page marked).
     pub const STEP: u32 = 2;
+    /// K2: a system instruction's decode ([`super::System`], the host's, kept right after the record where a block's sites
+    /// are): no code (`code_size` 0, `code` the code area's fill point when placed), never in L1, never entered or linked;
+    /// in L2 and invalidated exactly as a block of the same source pages and guest bytes.
+    pub const SYSTEM: u32 = 4;
     impl Block {
         /// Its `JITCodeHeader` in the executable alias.
         pub fn code_va(&self) -> u64 {
@@ -734,8 +738,10 @@ pub const REPLY_ADMITTED: u64 = 1;
 /// The host ends the vCPU's run at this request (its stop is the host's: `stop_at` reached, a fetch fault, no code):
 /// the resident halts with [`stop::PARKED`].
 pub const REPLY_PARK: u64 = 2;
-/// (Translate requests only.) The instruction at `cpu.rip` is a system instruction, decoded by the host into
-/// `State::system`; nothing is staged. The resident executes it as a transaction ([`system`]).
+/// The instruction at `cpu.rip` is a system instruction, decoded by the host into `State::system` from the bytes it
+/// was asked to translate; nothing is staged. The resident executes it as a transaction ([`system`]); for a translate
+/// request it first keeps the decode in its code cache as a block without code ([`cache::SYSTEM`], K2), so the
+/// instruction is decoded once per translation, like a block, and later runs need no host exit.
 pub const REPLY_SYSTEM: u64 = 3;
 /// The bytes of `cpu.rip`'s page ran out before the block (or the instruction) ended: the resident walks the next page
 /// for an instruction fetch (marking it, for a translate request) and asks again with its result in `State::fetch` /
@@ -748,6 +754,10 @@ pub const REPLY_FETCH_FAULT: u64 = 5;
 /// host answers [`REPLY_DEVICE`] with the record's reply half.
 pub const REQUEST_DEVICE: u64 = 0x30;
 pub const REPLY_DEVICE: u64 = 0x30;
+/// K2: the vCPU's entropy pool ([`Entropy`]) is empty at an RDRAND: the host tops it up (as at every exit) and answers
+/// [`REPLY_ENTROPY`].
+pub const REQUEST_ENTROPY: u64 = 0x31;
+pub const REPLY_ENTROPY: u64 = 0x31;
 
 /// A request's instruction fetch, walked by the resident (`State::fetch_fault`): why the walk of the last page it walked
 /// failed — kind, then the #PF address and error code for [`fetch::PAGE`].
@@ -1231,10 +1241,10 @@ const _: () = assert!(MSRS_OFFSET + core::mem::size_of::<crate::cpu::Msrs>() <= 
 /// The vCPU's entropy service (S3, RDRAND): a pool of random words the host fills and the resident consumes, a record of
 /// its own in the state page. The host writes the record only while the vCPU is in the host (at reset and at each of its
 /// exits it tops the pool up: [`Entropy::taken`] words are replaced, `taken` returns to 0); the resident only while the
-/// vCPU runs (each RDRAND takes `words[taken]` and counts it). An empty pool (`taken` = [`ENTROPY_WORDS`]: more RDRANDs
-/// than that between two host exits, or a host whose entropy source failed and left the pool empty) is RDRAND's
-/// architectural failure, CF = 0 (SDM Vol.2 RDRAND: "a value of zero ... and CF = 0 indicates the random number was not
-/// available"), which software retries. Today every RDRAND is itself a host exit (its decode), so the pool never runs dry.
+/// vCPU runs (each RDRAND takes `words[taken]` and counts it). An RDRAND that finds the pool empty (`taken` = [`ENTROPY_WORDS`])
+/// asks the host for a refill once ([`REQUEST_ENTROPY`], K2: RDRAND itself makes no host exit) and takes the next word;
+/// a pool still empty after it (the host's entropy source failed) is RDRAND's architectural failure, CF = 0 (SDM Vol.2
+/// RDRAND: "a value of zero ... and CF = 0 indicates the random number was not available"), which software retries.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Entropy {

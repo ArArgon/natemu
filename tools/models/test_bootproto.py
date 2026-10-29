@@ -386,6 +386,30 @@ class CheckTests(unittest.TestCase):
         e.mem.write(0x300000, e.mem.read(e.ACPI, 20))
         self.only(e, "RSDP")
 
+    # --- setup_data ---
+    def test_setup_data_stale_from_image(self):
+        e = Env(); e.zp(0x250, struct.pack("<Q", 0xDEAD000))
+        self.only(e, "ZP-SETUP-DATA")
+
+    def test_setup_data_good_list(self):
+        e = Env(); n = 0x300000
+        e.mem.write(n, struct.pack("<QII", 0, 1, 8) + bytes(8))
+        e.zp(0x250, struct.pack("<Q", n)); e.layout.setup_data = n
+        self.assertEqual(e.check(), [])
+
+    def test_setup_data_loop(self):
+        e = Env(); n = 0x300000
+        e.mem.write(n, struct.pack("<QII", n, 1, 0))
+        e.zp(0x250, struct.pack("<Q", n)); e.layout.setup_data = n
+        self.only(e, "ZP-SETUP-DATA")
+
+    def test_setup_data_unreadable_node(self):
+        e = Env(); n = 1 << 40
+        e.zp(0x250, struct.pack("<Q", n)); e.layout.setup_data = n
+        read = e.mem.read
+        e.mem.read = lambda a, k: read(a, k) if a < n else (_ for _ in ()).throw(OSError("unmapped"))
+        self.only(e, "ZP-SETUP-DATA")
+
     # --- CPU state ---
     def test_cpu_not_long_mode(self):
         for k, val in (("efer", 0x100), ("cr0", 0x1), ("cr4", 0), ("cr0", 0x80000000)):

@@ -25,6 +25,7 @@ LOADED_HIGH = 0x01
 XLF_KERNEL_64, XLF_ABOVE_4G = 0x01, 0x02
 E820_RAM, E820_RESERVED, E820_ACPI, E820_NVS = 1, 2, 3, 4
 E820_TYPES = {1, 2, 3, 4, 5, 7, 12, 128, 0xEFFFFFFF}  # E8 enum e820_type
+SETUP_DATA_MAX_NODES = 64  # bound for the list walk (checker's own limit, not the spec's)
 E820_MAX = 128  # BP E820_MAX_ENTRIES_ZEROPAGE
 MIN_VERSION = 0x020C  # B "Protocol 2.12 ... xloadflags ... above 4G in 64bit"
 KERNEL_NAMES = ("kernel", "zero page", "cmdline", "initrd")
@@ -74,6 +75,9 @@ C_E820N = 'Z 1E8/001 e820_entries: "Number of entries in e820_table"; BP E820_MA
 C_E820 = 'Z 2D0/A00 e820_table: "E820 memory map table (array of struct e820_entry)"; E8 struct e820_entry'
 C_E820T = 'E8 enum e820_type'
 C_RSDP = 'Z 070/008 acpi_rsdp_addr: "Physical address of ACPI RSDP table"; BP boot_params.acpi_rsdp_addr @0x070'
+C_SETUP = ('B field setup_data (write (special), 2.09+): "The 64-bit physical pointer to NULL terminated single '
+           'linked list of struct setup_data." "the next field of the last node is 0"; struct setup_data = '
+           '{u64 next; u32 type; u32 len; u8 data[]}')
 C_RSDPSIG = 'ACPI 6.5 s5.2.5.3 RSDP: signature "RSD PTR ", bytes 0..19 sum to 0 (not in boot.rst)'
 
 
@@ -190,6 +194,7 @@ class Layout:
     memory_map: list
     initrd: tuple | None = None  # (addr, size)
     rsdp_addr: int | None = None
+    setup_data: int = 0  # head of the setup_data list the loader says it passed; 0 = no list
 
 
 # Header fields typed "read" in boot.rst: the copy in boot_params must equal the image's.
@@ -404,6 +409,24 @@ def check_loaded(memory, rip, rsi, regs, layout: Layout) -> list:
             bad("RSDP", f"unreadable: {e}", C_RSDP)
         if not _covered(norm, rsdp, rsdp + 20, {E820_ACPI, E820_NVS, E820_RESERVED}):
             bad("RSDP", f"RSDP {rsdp:#x} not in an ACPI/NVS/reserved e820 extent", C_RSDPSIG)
+
+    # -- setup_data list (loader-written; never passed through from the image) -----------------
+    sd = _u(z, 0x250, "Q")
+    if sd != layout.setup_data:
+        bad("ZP-SETUP-DATA", f"setup_data {sd:#x} != layout {layout.setup_data:#x} (field is the loader's to write)", C_SETUP)
+    seen, node = set(), sd
+    while node:
+        if node in seen or len(seen) >= SETUP_DATA_MAX_NODES:
+            bad("ZP-SETUP-DATA", f"list does not terminate within {SETUP_DATA_MAX_NODES} nodes (node {node:#x})", C_SETUP)
+            break
+        seen.add(node)
+        try:
+            nxt, _typ, ln = struct.unpack("<QII", _read(memory, node, 16))
+            _read(memory, node + 16, ln)
+        except _Unreadable as e:
+            bad("ZP-SETUP-DATA", f"node {node:#x} unreadable: {e}", C_SETUP)
+            break
+        node = nxt
 
     # -- CPU state -----------------------------------------------------------------------------
     cr0, cr4, efer = regs["cr0"], regs["cr4"], regs["efer"]

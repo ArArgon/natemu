@@ -3,7 +3,8 @@
 //! range, access sites, guest-physical source pages) in the metadata arena, lookup
 //! by (guest RIP, context) through L1 and L2, native PC → block, whole-cache
 //! flush, block linking (patching a link point into a branch to its target's entry
-//! and restoring it), per-page invalidation of the blocks translated from a written
+//! and restoring it), system instructions' decodes kept as records without code
+//! ([`place_system`], K2), per-page invalidation of the blocks translated from a written
 //! page, the uncached single-step block in the slot, and this vCPU's side of the
 //! global area shared by all vCPUs: its bits in the code-page and writable masks,
 //! the invalidation records it posts to and drains, and its shadow-reset counter.
@@ -16,10 +17,10 @@ use natemu_abi::code_object::{Header, Site};
 use core::mem::align_of;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering::SeqCst};
 use natemu_abi::execution::{
-    ENTRY_OFFSET, GUEST_PAGES, KICK_SGI, LinkPoint, MAX_LINK_POINTS, STATE_VA, STOP_WORD, State,
+    ENTRY_OFFSET, GUEST_PAGES, KICK_SGI, LinkPoint, MAX_LINK_POINTS, STATE_VA, STOP_WORD, State, System,
     cache::{self as area, Control, LinkRecord, Record, SLOT, SLOT_BYTES, SLOT_VA, SLOT_WRITE_VA},
 };
-pub use natemu_abi::execution::cache::{Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, HEAD_BYTES, MAX_VCPUS, PAGES, SHADOWS, STEP};
+pub use natemu_abi::execution::cache::{Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, HEAD_BYTES, MAX_VCPUS, PAGES, SHADOWS, STEP, SYSTEM};
 /// L1's code (the dispatcher's head ends there).
 pub const L1_VA: u64 = CODE_VA + area::L1_CODE as u64;
 
@@ -160,6 +161,10 @@ pub fn select_l1(context: [u64; 2]) {
 pub fn fill_l1(rip: u64, block: &Block) {
     let at = l1_entry((rip & area::L1_MASK) as usize);
     let words = l1_words(at, rip, block.entry() - area::CODE_VA);
+    // Already there (a resident entry that ends at the same block again, e.g. after a system instruction): no code change.
+    if (0..words.len()).all(|k| unsafe { ((area::CODE_WRITE_VA + at) as *const u32).add(k).read_volatile() } == words[k]) {
+        return;
+    }
     unsafe { copy_record((area::CODE_WRITE_VA + at) as *mut u8, words.as_ptr().cast(), size_of_val(&words)) };
     synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, area::L1_ENTRY_BYTES);
 }
@@ -196,10 +201,7 @@ pub fn place(
     let c = control();
     let code = c.code_used.next_multiple_of(CODE_ALIGN);
     let code_end = code + u64::from(h.code_size);
-    let meta = c.meta_used.next_multiple_of(align_of::<Block>() as u64);
-    let sites = size_of::<Site>() * h.sites_count as usize;
-    let meta_end = meta + (size_of::<Block>() + sites) as u64;
-    if code_end > c.code_bytes || meta_end > area::META_BYTES as u64 || c.blocks as usize >= area::MAX_BLOCKS {
+    if code_end > c.code_bytes {
         return None;
     }
     let record = Block {
@@ -210,27 +212,57 @@ pub fn place(
         code_size: h.code_size,
         sites_count: h.sites_count,
         guest_bytes: h.guest_bytes,
-        number: c.blocks as u32,
+        number: 0,
         flags: 0,
         dispatch_exit: dispatch_exit as u32,
         rep_exits: rep_exits as u32,
         links,
     };
     unsafe {
-        let at = (area::META_VA + meta) as *mut Block;
-        at.write(record);
-        copy_record(at.add(1).cast(), object.add(h.sites_offset as usize), sites);
+        // Copied above the fill point first: nothing refers to it until the record is filed.
         copy_record((area::CODE_WRITE_VA + code) as *mut u8, object.add(h.code_offset as usize), h.code_size as usize);
         relocate(code, dispatch_exit, area::DISPATCH);
         synchronize_code(area::CODE_WRITE_VA + code, area::CODE_VA + code, h.code_size as usize);
-        let n = c.blocks as usize;
+        let placed = file(record, object.add(h.sites_offset as usize), size_of::<Site>() * h.sites_count as usize)?;
+        c.code_used = code_end;
+        Some(placed)
+    }
+}
+/// K2: enters the host's decode `i` of the system instruction at `rip` (`guest_bytes` long, from `source_gpa`) in the
+/// cache for `context` as a [`SYSTEM`] record (no code); `None` when the metadata arena or the block index is full.
+pub fn place_system(rip: u64, context: [u64; 2], source_gpa: [u64; 2], guest_bytes: u32, i: &System) -> Option<&'static Block> {
+    // `code` at the fill point keeps the records in address order ([`block_at`]); a size of 0 holds no PC.
+    let code = control().code_used as u32;
+    let links = [LinkPoint::NONE; MAX_LINK_POINTS];
+    let record = Block { rip, context, source_gpa, code, code_size: 0, sites_count: 0, guest_bytes, number: 0, flags: SYSTEM, dispatch_exit: 0, rep_exits: 0, links };
+    unsafe { file(record, (i as *const System).cast(), size_of::<System>()) }
+}
+/// The decode a [`SYSTEM`] record holds.
+pub fn system_of(b: &Block) -> System {
+    unsafe { (b as *const Block).add(1).cast::<System>().read() }
+}
+const _: () = assert!(size_of::<Block>() % align_of::<System>() == 0);
+/// Files `record` (its number assigned here) with `tail_bytes` from `tail` after it (sites, or a decode) in the metadata
+/// arena, the block index and L2; `None` when either is full.
+unsafe fn file(record: Block, tail: *const u8, tail_bytes: usize) -> Option<&'static Block> {
+    let c = control();
+    let meta = c.meta_used.next_multiple_of(align_of::<Block>() as u64);
+    let meta_end = meta + (size_of::<Block>() + tail_bytes) as u64;
+    if meta_end > area::META_BYTES as u64 || c.blocks as usize >= area::MAX_BLOCKS {
+        return None;
+    }
+    let n = c.blocks as usize;
+    unsafe {
+        let at = (area::META_VA + meta) as *mut Block;
+        at.write(Block { number: n as u32, ..record });
+        copy_record(at.add(1).cast(), tail, tail_bytes);
         index(n).write(meta as u32);
-        let mut i = hash(record.rip, context);
+        let mut i = hash(record.rip, record.context);
         while l2(i).read()[1] != 0 {
             i = (i + 1) & (area::L2_ENTRIES - 1);
         }
         l2(i).write([record.rip, n as u64 + 1]);
-        (c.code_used, c.meta_used, c.blocks) = (code_end, meta_end, n as u64 + 1);
+        (c.meta_used, c.blocks) = (meta_end, n as u64 + 1);
         Some(&*at)
     }
 }
@@ -525,7 +557,7 @@ fn kill(doomed: impl Fn(&Block) -> bool) -> Option<u64> {
         let i = (b.rip & area::L1_MASK) as usize;
         let at = l1_entry(i);
         let held = |k: usize| unsafe { ((area::CODE_WRITE_VA + at) as *const u32).add(k).read_volatile() };
-        if l1_words(at, b.rip, u64::from(b.code) + u64::from(ENTRY_OFFSET)).iter().enumerate().all(|(k, &w)| held(k) == w) {
+        if b.flags & SYSTEM == 0 && l1_words(at, b.rip, u64::from(b.code) + u64::from(ENTRY_OFFSET)).iter().enumerate().all(|(k, &w)| held(k) == w) {
             empty_l1(i);
             synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, 4);
         }

@@ -374,7 +374,7 @@ pub(crate) fn check_links(area: Area) -> Result<(u64, u64)> {
                 return Err(bad());
             }
             let to = at.wrapping_add((((w << 6) as i32 >> 6) as i64 * 4) as u64);
-            match blocks.iter().position(|t| u64::from(t.code) + u64::from(exec::ENTRY_OFFSET) == to) {
+            match blocks.iter().position(|t| t.flags & cache::SYSTEM == 0 && u64::from(t.code) + u64::from(exec::ENTRY_OFFSET) == to) {
                 Some(t) if blocks[t].rip == p.target && blocks[t].context == b.context => linked.insert((b.number, p.offset), t),
                 _ => return Err(bad()),
             };
@@ -770,6 +770,10 @@ pub(crate) struct Requests {
     pub(crate) doorbell: Option<crate::vm::Doorbell>,
     /// M3: the VM's device ranges (shared by every vCPU thread; see [`crate::devices`]).
     pub(crate) devices: Option<std::sync::Arc<crate::devices::Devices>>,
+    /// K2: system-instruction decodes answered ([`exec::REPLY_SYSTEM`], by kind; the test hooks not included), and
+    /// entropy refills asked for ([`exec::REQUEST_ENTROPY`]).
+    pub(crate) decodes: std::collections::BTreeMap<u32, u64>,
+    pub(crate) entropy: u64,
 }
 
 /// Runs the vCPU (entered at the resident, see [`enter`]) until it stops; `stop_at` is a RIP at
@@ -886,6 +890,13 @@ fn serve(
                 area.write_record(exec::STATE_OFFSET, state);
                 continue;
             }
+            // K2: an RDRAND found the pool empty; it was topped up above.
+            exec::REQUEST_ENTROPY => {
+                requests.entropy += 1;
+                state.reply = exec::REPLY_ENTROPY;
+                area.write_record(exec::STATE_OFFSET, state);
+                continue;
+            }
             _ => return Err("translation exit without a request".into()),
         };
         state.reply = match translation(area, compiler, &mut state, step, stop_at, requests)? {
@@ -957,6 +968,7 @@ fn translation(
         Code::Block(block) => block,
         // A step request at a system instruction (X2: after a shadow-setting instruction) gets its decode too.
         Code::System(s) => {
+            *requests.decodes.entry(s.kind).or_default() += 1;
             state.system = s;
             return Ok(Ok(exec::REPLY_SYSTEM));
         }
