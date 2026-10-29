@@ -211,17 +211,20 @@ def eret_problems(funcs, words, tops):
     if len(erets) != 1 or not body or erets[0] != ('resume_exception', body[-1][0]):
         problems.append(f'ERET sites {[(short(n), hex(a)) for n, a in erets]}: want only resume_exception\'s last')
     o = lambda n: f'#{n:#x}'
-    want = (['msr elr_el1, x1', 'msr spsr_el1, x2', 'mov x16, x0', 'ldr x9, [x16, #0xf8]', 'msr sp_el0, x9',
+    # X2: first, x3 != 0 sets SCTLR_EL1.A (x86 alignment checking for the code entered).
+    want = (['cbz x3, SKIP', 'mrs x9, sctlr_el1', 'orr x9, x9, #0x2', 'msr sctlr_el1, x9', 'isb',
+             'msr elr_el1, x1', 'msr spsr_el1, x2', 'mov x16, x0', 'ldr x9, [x16, #0xf8]', 'msr sp_el0, x9',
              'ldr x9, LIT', 'mov sp, x9', 'ldr x9, [x16, #0x308]', 'msr fpcr, x9', 'ldr x9, [x16, #0x310]',
              'msr fpsr, x9'] + [f'ldp q{2 * i}, q{2 * i + 1}, [x16, {o(256 + 32 * i)}]' for i in range(16)] +
             [f'ldr x{r}, [x16{", " + o(8 * r) if r else ""}]' for r in range(31) if r != 16] +
             ['ldr x16, [x16, #0x80]', 'eret'])
-    got = [re.sub(r'^ldr x9, 0x[0-9a-f]+ <.*', 'ldr x9, LIT', i) for _, i in body]
+    skip = lambda n, i: re.sub(rf' 0x[0-9a-f]+ <{n}\+0x[0-9a-f]+>$', ' SKIP', i) if re.match(r'(cbz|tbz) ', i) else i
+    got = [skip('resume_exception', re.sub(r'^ldr x9, 0x[0-9a-f]+ <.*', 'ldr x9, LIT', i)) for _, i in body]
     if got != want:
         diff = next((f'#{k}: `{g}`, want `{w}`' for k, (g, w) in enumerate(zip(got, want)) if g != w),
                     f'{len(got)} instructions, want {len(want)}')
         problems.append(f'resume_exception restore sequence differs: {diff}')
-    elif literal(words, body, 6) != tops['EXCEPTION_STACK_TOP']:
+    elif literal(words, body, 11) != tops['EXCEPTION_STACK_TOP']:
         problems.append('resume_exception does not reset SP_EL1 to EXCEPTION_STACK_TOP')
     callers = {n for n, insns in funcs.items() for _, i in insns
                if re.match(r'bl? 0x[0-9a-f]+ <(resume_exception|enter_allocated)>$', i)} - {'resume_exception'}
@@ -230,14 +233,15 @@ def eret_problems(funcs, words, tops):
                         f'want {sorted(map(short, ERET_CALLERS))}')
     saves = ([f'stp x{2 * i}, x{2 * i + 1}, [sp{", " + o(16 * i) if i else ""}]' for i in range(15)] +
              ['str x30, [sp, #0xf0]'] + [f'stp q{2 * i}, q{2 * i + 1}, [sp, {o(256 + 32 * i)}]' for i in range(16)] +
-             ['mrs x9, fpcr', 'str x9, [sp, #0x308]', 'msr fpcr, xzr', 'mrs x9, fpsr', 'str x9, [sp, #0x310]', 'str xzr, [sp, #0x318]'])   # (I5a: FPCR cleared)
+             ['mrs x9, fpcr', 'str x9, [sp, #0x308]', 'msr fpcr, xzr', 'mrs x9, fpsr', 'str x9, [sp, #0x310]', 'str xzr, [sp, #0x318]'] +  # (I5a: FPCR cleared)
+             ['mrs x9, sctlr_el1', 'tbz w9, #0x1, SKIP', 'and x9, x9, #0xfffffffffffffffd', 'msr sctlr_el1, x9', 'isb'])  # (X2: SCTLR_EL1.A off)
     for gate, kind in SAVES.items():
         # Both gates are exception entries (on SP_EL1): NZCV from SPSR.
         flags = ['mrs x9, spsr_el1', 'and x9, x9, #0xf0000000']
         want = (['sub sp, sp, #0x320'] + saves + ['mrs x9, sp_el0', 'str x9, [sp, #0xf8]'] + flags +
                 ['str x9, [sp, #0x300]', 'mov x0, sp', f'mov x1, #{kind:#x}', 'bl FINISH', 'b SELF'])
         got = [re.sub(r'^bl 0x[0-9a-f]+ <finish>$', 'bl FINISH',
-                      re.sub(rf'^b 0x[0-9a-f]+ <{gate}\+0x[0-9a-f]+>$', 'b SELF', i)) for _, i in funcs.get(gate, [])]
+                      re.sub(rf'^b 0x[0-9a-f]+ <{gate}\+0x[0-9a-f]+>$', 'b SELF', skip(gate, i))) for _, i in funcs.get(gate, [])]
         if got[:len(want)] != want or any(i != 'nop' for i in got[len(want):]):
             problems.append(f'{gate} save sequence differs from the declared gate shape')
     vec = funcs.get('vectors', [])

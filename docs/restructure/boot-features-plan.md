@@ -748,6 +748,139 @@ FEX ASM suite 480 → 781 pass, 0 fail (left: MMX, PCMPxSTRx, AES/SHA, x87, AVX)
 CET `wrussq` the classifier files as SSE; LDMXCSR now `system`), initramfs 198,200 → 7,236 (AES/SHA/PCLMULQDQ 6,015,
 PCMPISTRI 401, ADX/MOVBE and MMX the rest); LDMXCSR/STMXCSR are `system` (kernel 1, initramfs 383)
 (`experiments/track03/kernel-census/README.md`).
+*Built (S3, system calls and misc system instructions; fexc series21-s3: the shim cuts group 9's register forms /6 /7):*
+transactions in `execution/syscalls.rs` and `segments::inspect`, decoded by `system.rs` (F2/F3 now parsed; only the forms
+that name them take them). **SWAPGS** (#GP(0) at CPL > 0) swaps the bank's GS.base with IA32_KERNEL_GS_BASE's slot; the
+page takes it at the next `enter` (I7). **SYSCALL** (#UD without EFER.SCE; under TF it stops `unsupported_system` before any change, as SYSRET does): RCX, R11 := RFLAGS as is (RF included,
+syscall_model C1), RFLAGS &= ~FMASK, CS = STAR[47:32] & FFFCH and SS = STAR[47:32] + 8 (unmasked) with the fixed flat
+attributes, `set_cpl(0)`, RIP := LSTAR, no stack switch. **SYSRET** (#UD, then #GP(0) at CPL > 0, then #GP(0) for a
+non-canonical RCX, Intel's order at CPL 0): RFLAGS := R11 & 3C7FD7H | 2, CS/SS from STAR[63:48] with RPL 3, `set_cpl(3)`
+(since X2 an AC from R11 with CR0.AM turns alignment checking on: the next misaligned access at CPL 3 is #AC(0)); a TF from R11 stops `unsupported_system`; SYSRETL
+(compatibility mode) stops `unsupported_mode`. **RD/WR FS/GS BASE** (#UD without CR4.FSGSBASE, any CPL; 32-bit forms
+zero-extend; #GP(0) for a non-canonical 64-bit write) read and write `Cpu::fs_base/gs_base`. **LAR/LSL/VERR/VERW** (register
+or m16): no fault for a bad selector (ZF = 0, destination kept); IA-32e types (LAR: code/data, 2, 9, B, C; LSL: code/data, 2,
+9, B), DPL >= max(CPL, RPL) unless conforming code, descriptor read as 8 bytes, LAR mask 00F0FF00H, LSL G-scaled; only ZF
+changes; a #PF on the table read is delivered. Undecided and untested: whether IA-32e LAR/LSL check the upper half of a
+16-byte system descriptor (its type field, limit or page); the SDM text at hand does not settle it (syscall_model C8), and
+the tables assert nothing for such a descriptor (selector 0xa0 is left out). **VERW** is the architectural instruction only: its MDS buffer clearing has
+no architectural effect and natemu models no such buffers, so nothing is left out (not a deviation). **RDRAND** takes the next
+word of a per-vCPU entropy pool (`execution::Entropy`, 32 words in the state page at `ENTROPY_OFFSET`): the host fills it
+from `getentropy` at reset and tops it up at each exit; CF = 1 with OF/SF/ZF/AF/PF cleared, 16-bit merge, 32-bit zero-extend.
+CF = 0 (value 0) when the pool is empty: today unreachable, since every RDRAND is itself a host exit (its decode) that
+refills the pool first; it becomes reachable with a resident decode cache (L5) or a failing host source, and software's
+retry loop handles it. **WBINVD/INVD/WBNOINVD** (#GP(0) at CPL > 0; WBNOINVD is not advertised and runs as WBINVD, as on
+processors that ignore its F3) change nothing: RAM is coherent write-back with no cache model, so INVD's discard is WBINVD
+(no worse: no data is lost). **CLFLUSH** has a byte load's faults at the CPL (#GP(0)/#SS(0) non-canonical, #PF with a read
+error code; the walk sets A) and no other effect; on a page that is not write-back RAM (e.g. a UC device mapping) it stops
+`unsupported_system` today, as every resident operand access does (M2/M3 own memory types and device pages). **#UD** for forms the profile does not advertise or that need VMX/SVM/
+SGX/TDX operation: RDSEED, RDPID, CLFLUSHOPT, CLAC/STAC, MONITOR/MWAIT(X), SERIALIZE, RDPKRU/WRPKRU, ENCLS/ENCLU, VMCALL and
+the VMX group, VMMCALL and the SVM group, TDCALL, the RMP group, CLZERO, RDPRU, XTEST, LKGS, VMREAD/VMWRITE, INVEPT/INVVPID/
+INVPCID, ENCLV, PCONFIG, WRMSRNS, XSUSLDTRK/XRESLDTRK, and 0f ae register forms without F3. IRET-to-self and CPUID were already draining entries (every system
+instruction is). Oracle: `tools/models/syscall_model.py` (independent author; ambiguities C1-C12, `alternatives` for C1, C6,
+C9). Checks (`run_slice3_vm.py system`, `tools/bench/smp/syscalls.py`, block sizes default and 1): `sc-roundtrip@1..4`
+(EFER.SCE, STAR/LSTAR/FMASK, KERNEL_GS_BASE per CPU, SYSRETQ into CPL 3, RD/WR FS/GS BASE at 32 and 64 bits, three
+SYSCALL -> SWAPGS, per-CPU `%gs` stores, RDGSBASE -> SWAPGS -> SYSRETQ round trips) against QEMU, which loses CF in the
+handler after SYSCALL (`sdm_bytes`); `sc-verify-cpl0/3` (LAR at 64/16 bits, LSL at 32/64/16, VERR, VERW over 29 selectors of
+the S2b GDT and LDT, memory forms) against QEMU and every result byte against syscall_model; `sc-rdrand@1/2` (CF, cleared
+flags from three presets, widths, eight samples differ); `sc-cache@1/4`; 23 fault and refusal cases judged by syscall_model (SYSCALL #UD with SCE = 0 at
+CPL 0/3, SYSRET #UD/#GP at CPL 3/non-canonical RCX, SWAPGS at CPL 3, FSGSBASE disabled, non-canonical WRFSBASE/WRGSBASE,
+RDSEED, RDPID, CLFLUSHOPT, ENCLV, XRESLDTRK at CPL 3, WBINVD/INVD at CPL 3, CLFLUSH non-canonical (#GP, and #SS through RBP) and on a supervisor page
+at CPL 3; refusals SYSCALL and SYSRET with TF and SYSRETL, natemu only), QEMU within the model on 9 of the 20 faults,
+listed in `QEMU_DIFFERS` on 11 (its CPU and
+helpers: no canonical check in SYSRET, WRFSBASE/WRGSBASE, no access in CLFLUSH, no CPL check in WBINVD/INVD,
+RDSEED/RDPID/CLFLUSHOPT implemented). Also pinned QEMU's SYSRET loads VM and not VIF/VIP from R11 (SDM mask 3C7FD7H), so the
+round trip's R11 sets every other bit (reserved ones included); VM/VIF/VIP are covered by syscall_model's unit tests only.
+FEX ASM suite (driver `fsgsbase 1`, as Linux sets CR4.FSGSBASE): 781 -> 794 pass, 0 fail; tests needing an unadvertised
+instruction count unsupported (`run_asm.py` `NOT_ADVERTISED`), as do SYSCALL tests (`NEEDS_OS`: #UD with EFER.SCE = 0).
+Not built: SYSENTER/SYSEXIT (no census use), CLWB and TPAUSE (fexc refuses them as unsupported forms; not advertised).
+*Built (X2, events: interrupt eligibility, shadows, POPF, IRETQ, HLT, NMI, #AC, the REP RF signal; fexc series22 after
+review: a shim change, no new patch):* `execution/events.rs`. **Pending events** are a per-vCPU record in the global area
+(`cache::Events` at `cache::EVENTS`): a 256-bit set of pending vectors (IRR-like until X3's LAPIC; the highest is taken first),
+one NMI bit (posts while pending merge), `end` (the host asks a halted vCPU to stop) and `halted` (set while parked).
+Producers set bits by atomic OR, then ring the vCPU's doorbell; the resident clears the bit it accepts. The STI shadow is
+`State::sti_shadow`, the MOV SS shadow `Cpu::mov_ss`, NMI blocking `State::nmi_blocked`. **Driver sources (the real
+path):** the host posts and rings the vCPU's SPI (`hv_gic_set_spi`), then answers the hook `nop` as `system::EVENT_HOOK`
+(description items `post ADDR VECTOR`, `nmi ADDR`; `if 0|1` sets IF at the start; `--kick-events E,..` posts a random event
+before each kick). **Eligibility** at the top of `find`'s loop (every precise stop, every resident entry that dispatches,
+every boundary after a system instruction or a delivery): Table 7-2, NMI before INTR; INTR needs IF and no shadow, NMI needs
+blocking clear and no shadow. Choices inside delivery_model's set-valued cases: both shadows block NMIs (A9 `maybe`); a
+shadow-setting instruction inside a shadow sets its own (`sti?`/`mov_ss?`). Delivery is `delivery::deliver` with
+`Event::External` (EXT = 1, no error code, RF = 1 between REP iterations, else the current RF); NMI blocking is set before
+delivery and kept if it faults (A8). **Shadows, exact:** a shadow is honoured only at the boundary right after its
+instruction. A system instruction or a delivery ends it, and so does entering generated code (`enter`), since every later
+resident entry follows a completed instruction except a doorbell at that block's first word, which then arms a stop instead
+of stopping there (`State::shadow_entry`), so the event is taken after at least one instruction (permitted for an event that
+arrives then). An event pending at the shadow's boundary makes `find` run exactly one instruction (`REQUEST_STEP`: a
+single-instruction block in the step slot, never cached or linked, whose computed exit branches to the dispatcher's
+`svc #MISS` and literal exits to the linker, so every exit returns to the resident; a system instruction is answered with
+its decode and runs as a transaction), and the boundary after it is evaluated again: `sti; X` takes the interrupt after X,
+`sti; ret` at the RET's target, `sti; hlt` wakes with RIP after the HLT. **REP RF signal:** admission reports the REP's RIP
+(`Admitted::rep_self`), the host the mask of link points that are its self-exit (`State::rep_exits`), kept in
+`Block::rep_exits` (size unchanged; `Block::rep_exit(offset)`, `Block::starts_with_rep()`); the linker finds the exit's link
+point from its `svc` address, an armed stop from the trapped word, never from RIP. That exit sets `State::mid_string`; after
+the last element (RCX = 0: I2's pass exits to its own RIP) RIP moves past the REP instead (x86 has no boundary at the REP with
+RCX = 0 after it ran). A doorbell at the first word of a block that starts with a REP arms the stop (that entry may be its
+own self-link). **Transactions** (kinds 0x40-0x45): CLI/STI #GP(0) at CPL > IOPL (no VME/PVI); STI's shadow only when IF was 0.
+POPF/POPFQ (8 bytes, 2 with 66; #SS(0), #PF, #AC at CPL 3): CF PF AF ZF SF TF IF DF OF IOPL NT AC ID written, IOPL only at
+CPL 0, IF only at CPL <= IOPL; RF, VM, VIF, VIP unaffected; setting TF stops `unsupported_system` before any effect (S4's
+single-step hook). IRETQ and S3's SYSCALL/SYSRET need nothing more: every transaction returns into `find`, which re-evaluates.
+**HLT** (#GP(0) at CPL > 0) commits RIP past it and parks in `wfi` at EL1 with IRQs masked; with the in-kernel GIC, HVF holds
+the vCPU without a host exit. A pending IRQ is a WFI wake-up event whatever PSTATE.I says (Arm ARM DDI 0487, "WFI wake-up
+events", D1.17.2 in recent issues; read here in secondary quotations, not in the repo's snapshot); how HVF implements a
+trapped guest WFI is not documented by Apple; every run here woke. Each wake acknowledges every pending doorbell, takes the
+vCPU's invalidations (a peer may wait for its shadow reset), serves a stop still wanted, and leaves only for an event it can
+take (A10: a blocked NMI or masked INTR does not wake it); `halts` counts the HLTs that waited. The host's watchdog skips a
+halted vCPU; the program driver ends halted vCPUs (stop `halted`, 32, RIP after the HLT) once every kicker has ended and every
+vCPU is halted or ended. **#AC:** native alignment checking, not per-site checks or blocks keyed by AC: `resume_exception`
+sets SCTLR_EL1.A before its `eret` when CR0.AM, RFLAGS.AC and CPL 3 hold (`Cpu::alignment_check`), and both gates clear it
+after their saves (`check_resident_stack.py` checks both shapes). At an access site an alignment fault under AC is, in order,
+the canonical check (#GP/#SS), then #AC(0), before any walk and before the split-lock stop (CMPXCHG16B's #GP(0) stays first).
+A 16-byte vector access (MOVUPS class) that is 8-byte but not 16-byte aligned, for which the SDM permits no #AC, is refused
+(`unsupported_mode`, state at the instruction) at an access site (`access_aborted`), but completed when it is a page-crossing
+store (the split stub, `split()`, writes it); any other page-crossing store under AC is #AC there. The resident's explicit
+CPL 3 accesses (`segments::linear`: POPF, IRET and far-transfer pops, LDMXCSR/STMXCSR, SGDT-class stores) check Table 7-7's
+alignment. **BT/BTS/BTR/BTC on memory** (FEX touches only the byte holding the bit): under alignment checking the host passes
+fexc `--alignment-gated` (series22's shim), which cuts them as system instructions (`system::BT_ALIGNED`); the resident gives
+#AC(0) when the operand is misaligned at its size (with a register bit offset, the operand-sized unit selected has EA's
+alignment; a non-canonical unit is left to the step's #GP/#SS, which comes first), and otherwise steps it compiled without
+the flag (`State::plain_step`); LOCK BT is #UD; a null CS/DS/ES/SS override is accepted as without it, FS/GS add their
+base. Older edge, from the slice-1 byte-access BT policy, not from X2: a misaligned BT unit whose bytes run past the top of
+the canonical range gets no #AC, and the one-byte plain step may then complete where x86 gives #GP. Alignment checking is bit 12 of `Cpu::code_context` (RFLAGS.AC changes
+without dropping code). `Cpu::control`'s AM/AC refusal is gone. **Checks** (`run_slice3_vm.py events`,
+`tools/bench/smp/events.py`, block sizes default and 1; every logged delivery judged by delivery_model
+`recognise`/`after_instruction`): QEMU system programs `ev-sti-shadow`, `ev-mov-ss`, `ev-mov-ss-sti`, `ev-popf`, `ev-iretq`,
+`ev-hlt-wake`, `ev-nmi`, and (after review) `ev-sti-ret`, `ev-sti-jmp`, `ev-movss-ret`, three rounds each so the target is
+cached and reached through L1 from the second (QEMU raises the events through its x2APIC: SELF_IPI, an ICR NMI to its own APIC
+ID; natemu's variant has two `nop`s per `wrmsr`, so every address is the same), at 1, 2, 4 vCPUs: QEMU agrees with the model on
+every vector and boundary (in the chained-shadow programs it picks another permitted boundary), pushes RF = 1 for every
+external interrupt and NMI (a QEMU deviation: its frames are judged without RF), final registers equal; 47 natemu-only cases
+(CLI/STI/HLT at CPL 3 with IOPL 0/3, POPF at CPL 3 and 0 incl. 16-bit, POPF TF refused, LOCK CLI #UD, HLT with a masked
+interrupt or idle ends `halted`, 32 #AC cases: loads, stores, RMW, LOCK, XCHG, REP MOVSQ, page-crossing load and store,
+MOVQ/MOVUPS, non-canonical #GP first, page not present, PUSH, POPF, the first misaligned access after a SYSRET (S3) to CPL 3
+with AC from R11, BT/BTS/BTR/BTC misaligned (word, dword, qword, register and imm8, LOCK, a DS override) and aligned (results checked, a DS override), and
+controls without #AC; QEMU does not implement #AC); stress with `--kick-events 0x40,0x41,0x50,nmi`, 2,000 kicks per vCPU at 1,
+2, 4 vCPUs: every delivery logged (each reserves its slot by XADD) and judged: at an allowed boundary (never in a shadow, IF = 1
+for INTR, RF exactly by the REP rule, no NMI in the NMI handler), never late after a shadow step (each step puts a delivery at
+the boundary after the shadowed instruction), the guest's count equal to the resident's, the stress loop's registers and data
+equal to QEMU's run without events (428-549 deliveries per vCPU, 257-976 shadow steps and 16-25 mid-REP deliveries per run), the
+HLT loop's 1,000 HLTs per vCPU all woken: 136 ok. The review's probes: `sti; ret`, `sti; jmp reg`, `mov ss; ret` take every
+round's interrupt at the target (before: rounds 2-3 waited for an unrelated resident entry); `stale2` shows no delivery at the
+spin loop's inner boundary at default block size (shadow steps remain where an event is pending at the boundary right after
+MOV SS, as x86 requires). Standing suite with series22 green: fix/fix-1 64, seed/seed-1 44, faults and faults-1 7,581 each, flow 64, loopfaults 846,
+probes 83, FEX ASM 794 pass and 0 fail (`run_asm.py`, `run_i5a_faults.py`, `run_i5a_de.py` accept #GP(0) at a CPL 3 `hlt`, or
+`halted` after one at CPL 0, as reaching it: `run_slice1_vm.at_hlt`), i5a faults 454, i5a DE 351, corpora, smp, limits, kicks
+(1, 2, 4 vCPUs), system, coherence, sharedpt, litmus, contain, privilege and delivery with 0 failures, `events` 136 ok (its one
+miss in the suite run was the judge's: an NMI at the program's end boundary, now allowed). **For X3, X4, S4:** X3 posts into
+`Events.vectors` (atomic OR) and rings the target (SGI between residents, SPI from the host), replaces "highest vector" in
+`events::next` with LAPIC priority (PPR/ISR/EOI; the bit becomes the IRR), and gets re-evaluation after EOI/TPR writes for
+free; the NMI bit and blocking serve ICR NMIs. In `park`, a post that lands between `next()` and the `end` check is lost once
+`end` is set (X2's driver sets `end` only when no source can post); X3, whose peers post at any time, must check `next()`
+again after seeing `end`. X4 adds host sources on the same post-and-ring path. S4: POPF's TF refusal is the single-step hook;
+shadows hold events until one instruction completes, and S4 adds the suppression of trap-class #DB after MOV SS; RF: a REP's
+self-exit is a block exit, so `completed` clears RF there, while x86 keeps RF set until the REP completes (no breakpoint
+uses it before S4). **Not built / choices:** the 8-byte-aligned 16-byte vector access above (refused at an access site;
+completing it needs the access emulated); the SDM orders neither way #AC against #PF on a page not present, and natemu gives
+#AC (Arm takes the alignment fault before translation).
 **I5c (recorded, not built; the I5a review's design): unmasked SIMD exceptions.** Hardware FP traps are not used although
 the M4 has them (the review's probe: FPCR's trap enables stick and a trapped divide by zero is a synchronous exception, EC
 0x2C): a trap reports one Arm operation's exceptions, while x86 delivers #XM (#UD without CR4.OSXMMEXCPT) for the whole

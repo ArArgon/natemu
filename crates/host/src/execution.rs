@@ -136,6 +136,28 @@ pub(crate) fn set_cpu(area: Area, cpu: Cpu) {
     let mut msrs = natemu_abi::cpu::reset_msrs(area.vcpu == 0);
     msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_TSC).unwrap()] = ticks_ns(area.epoch).wrapping_neg();
     area.write_record(exec::MSRS_OFFSET, msrs);
+    area.write_record(exec::ENTROPY_OFFSET, exec::Entropy { taken: exec::ENTROPY_WORDS as u64, words: [0; exec::ENTROPY_WORDS] });
+    refill_entropy(area);
+}
+/// Tops up the vCPU's entropy pool (RDRAND, [`exec::Entropy`]) while it is in the host: the words it took are replaced
+/// from the host's entropy source (`getentropy`, macOS's kernel CSPRNG). If the source fails, the pool stays as it is
+/// and an empty pool makes RDRAND return CF = 0 (its architectural failure), never a predictable value.
+fn refill_entropy(area: Area) {
+    unsafe extern "C" {
+        fn getentropy(buf: *mut u8, len: usize) -> i32;
+    }
+    let mut pool: exec::Entropy = area.read_record(exec::ENTROPY_OFFSET);
+    let taken = (pool.taken as usize).min(exec::ENTROPY_WORDS);
+    if taken == 0 {
+        return;
+    }
+    let mut fresh = [0u64; exec::ENTROPY_WORDS];
+    // SAFETY: `fresh` is 256 bytes, getentropy's maximum.
+    if unsafe { getentropy(fresh.as_mut_ptr().cast(), 8 * taken) } == 0 {
+        pool.words[..taken].copy_from_slice(&fresh[..taken]);
+        pool.taken = 0;
+        area.write_record(exec::ENTROPY_OFFSET, pool);
+    }
 }
 /// Enters the vCPU at the resident in its window, its tables tagged with its own ASIDs (2v + 2 for its supervisor
 /// shadow space, loaded at boot; the resident uses 2v + 3 for its user space), as GIC vCPU `area.vcpu` with its peer
@@ -157,6 +179,31 @@ fn global_u64(memory: &Memory, offset: usize) -> &AtomicU64 {
 fn record_word(memory: &Memory, v: usize, i: Option<usize>) -> &AtomicU64 {
     let record = cache::RECORDS + v * size_of::<cache::Record>();
     global_u64(memory, record + i.map_or(0, |i| std::mem::offset_of!(cache::Record, stale) + 8 * i))
+}
+/// vCPU `v`'s event record word at `field` (an offset in [`cache::Events`], X2).
+fn event_word(memory: &Memory, v: usize, field: usize) -> &AtomicU64 {
+    global_u64(memory, cache::EVENTS + v * size_of::<cache::Events>() + field)
+}
+/// `post` value of an NMI (else an interrupt vector, 0..=255).
+pub(crate) const NMI: u64 = 256;
+/// Posts `event` (a vector, or [`NMI`]) into vCPU `v`'s event record (X2); the caller then rings its doorbell, which makes
+/// it stop precisely and take the event when it is eligible.
+pub(crate) fn post(memory: &Memory, v: usize, event: u64) {
+    match event {
+        NMI => event_word(memory, v, std::mem::offset_of!(cache::Events, nmi)).store(1, SeqCst),
+        _ => {
+            let word = event_word(memory, v, std::mem::offset_of!(cache::Events, vectors) + 8 * (event as usize / 64 % 4));
+            word.fetch_or(1 << (event % 64), SeqCst);
+        }
+    }
+}
+/// vCPU `v` is halted (HLT, parked in the VM).
+pub(crate) fn halted(memory: &Memory, v: usize) -> bool {
+    event_word(memory, v, std::mem::offset_of!(cache::Events, halted)).load(SeqCst) != 0
+}
+/// Asks vCPU `v` to end its run when it is halted with no event it can take (`stop::HALTED`); the caller rings it.
+pub(crate) fn end_when_halted(memory: &Memory, v: usize) {
+    event_word(memory, v, std::mem::offset_of!(cache::Events, end)).store(1, SeqCst);
 }
 /// vCPU `area.vcpu`'s shadow resets so far (the resident's counter: evictions, shootdowns, control changes, halts).
 pub(crate) fn shadow_resets(area: Area) -> u64 {
@@ -509,6 +556,9 @@ pub(crate) struct Compiler {
     /// The vCPU's controls gate SSE (I5a: CR0.EM, CR0.TS or no CR4.OSFXSR, [`sse_gated`]): fexc cuts every SSE form as a
     /// system instruction, which the resident raises as #UD or #NM. Set per request (part of the request, so of the cache key).
     pub(crate) sse_gated: bool,
+    /// The vCPU runs under alignment checking (X2: CR0.AM, RFLAGS.AC, CPL 3): fexc cuts every BT* memory form as a system
+    /// instruction, which the resident checks for #AC and then steps compiled without it (`State::plain_step`).
+    pub(crate) alignment_gated: bool,
 }
 /// Whether `cpu`'s controls gate SSE instructions (SDM Vol.3 Table 2-2, Vol.2 2.5: #UD with CR0.EM or without CR4.OSFXSR,
 /// #NM with CR0.TS). Blocks are made under one gating state: every CR0/CR4 change drops the vCPU's code.
@@ -528,7 +578,7 @@ impl Compiler {
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
         Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), compiles: 0, hits: 0, tamper: None, deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, signal_at: None,
-               shape: false, sse_gated: false }
+               shape: false, sse_gated: false, alignment_gated: false }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
     /// `rip` the resident executes, or fexc's end reason when it produced no code.
@@ -542,6 +592,9 @@ impl Compiler {
         }
         if self.sse_gated {
             args.push("--sse-gated".into());
+        }
+        if self.alignment_gated {
+            args.push("--alignment-gated".into());
         }
         let args: Vec<u8> = args.iter().flat_map(|a| a.bytes().chain([0])).collect();
         let mut body = (args.len() as u32).to_le_bytes().to_vec();
@@ -684,6 +737,11 @@ pub(crate) struct Requests {
     /// Test drivers only: the handler range of the driver's logging IDT; reaching it ends the run ([`Stop::Logged`]) before
     /// anything there is fetched or compiled.
     pub(crate) handlers: Option<std::ops::Range<u64>>,
+    /// Test drivers only (X2 event sources): RIPs whose one-byte instruction (a `nop`) posts an event into the vCPU's
+    /// record ([`post`]: a vector, or [`NMI`]) and rings its doorbell (`doorbell`), then completes as
+    /// [`exec::system::EVENT_HOOK`]; blocks are fetched up to each, as for `switches`.
+    pub(crate) posts: std::collections::BTreeMap<u64, u64>,
+    pub(crate) doorbell: Option<crate::vm::Doorbell>,
 }
 
 /// Runs the vCPU (entered at the resident, see [`enter`]) until it stops; `stop_at` is a RIP at
@@ -709,12 +767,20 @@ pub(crate) fn run(
     // `true`: the vCPU enters the guest; `false`: it is back in the host. Dropping the sender ends the watchdog.
     let (running, events) = std::sync::mpsc::channel::<bool>();
     let id = cpu.id();
+    // A halted vCPU (X2: parked in the VM by HLT) is idle, not stuck: the watchdog waits on; the driver decides when a
+    // halted vCPU can never wake ([`end_when_halted`]). The word lives in the backing, which outlives this thread.
+    let halted = event_word(area.memory, area.vcpu, std::mem::offset_of!(cache::Events, halted)) as *const AtomicU64 as usize;
     let dog = std::thread::spawn(move || {
         use std::sync::mpsc::RecvTimeoutError::Timeout;
+        // SAFETY: see above (joined before `run` returns).
+        let halted = unsafe { &*(halted as *const AtomicU64) };
         while let Ok(true) = events.recv() {
             let mut limit = watchdog;
             // Repeated while the vCPU stays in: a request racing its entry into `hv_vcpu_run` might not stop it.
             while events.recv_timeout(limit) == Err(Timeout) {
+                if halted.load(SeqCst) != 0 {
+                    continue;
+                }
                 exit_vcpus(&mut [id]);
                 limit = Duration::from_millis(100);
             }
@@ -772,6 +838,7 @@ fn serve(
             exec::TRANSLATE_HVC if parked.is_none() => {}
             other => return Err(format!("unexpected HVC immediate {other:#x}")),
         }
+        refill_entropy(area);
         let mut state: State = area.read_record(exec::STATE_OFFSET);
         let step = match state.request {
             exec::REQUEST_TRANSLATE => false,
@@ -811,16 +878,20 @@ fn translation(
     if requests.handlers.as_ref().is_some_and(|h| h.contains(&rip)) {
         return Ok(Err(Stop::Logged));
     }
+    // (A step request may be at one: X2 steps the instruction after a shadow-setting one.)
     if let Some(&cpl) = requests.switches.get(&rip) {
-        // A step request is for a block's access site, never a switch (blocks end before one).
-        if step {
-            return Err(format!("step at {rip:#x}: a CPL switch"));
-        }
         state.system = exec::System { kind: exec::system::SET_CPL, length: 1, cr: cpl as u32, ..exec::System::NONE };
         return Ok(Ok(exec::REPLY_SYSTEM));
     }
-    // Blocks end at the stop RIP and at every switch after RIP.
-    let limit = requests.switches.range(rip..).map(|(&r, _)| r).chain(stop_at).filter(|&l| l > rip).min();
+    if let Some(&event) = requests.posts.get(&rip) {
+        post(area.memory, area.vcpu, event);
+        requests.doorbell.ok_or("an event source without a doorbell")?.ring(area.vcpu)?;
+        state.system = exec::System { kind: exec::system::EVENT_HOOK, length: 1, ..exec::System::NONE };
+        return Ok(Ok(exec::REPLY_SYSTEM));
+    }
+    // Blocks end at the stop RIP and at every switch and event source after RIP.
+    let hooks = requests.switches.range(rip..).map(|(&r, _)| r).chain(requests.posts.range(rip..).map(|(&r, _)| r));
+    let limit = hooks.chain(stop_at).filter(|&l| l > rip).min();
     let Fetched { bytes, more, next_fault } = match fetched(area, state, limit)? {
         Ok(fetched) => fetched,
         // RIP's page faults: the resident delivers it (`state.fetch_fault`); nothing is compiled.
@@ -828,6 +899,7 @@ fn translation(
         Err(stop) => return Ok(Err(stop)),
     };
     compiler.sse_gated = sse_gated(&state.cpu);
+    compiler.alignment_gated = state.cpu.alignment_check() && !(step && state.plain_step != 0);
     let code = compiler.compile(&bytes, rip, step)?;
     let ran_out = match &code {
         Code::Block(b) => b.end_reason == natemu_abi::code_object::end_reason::END_OF_INPUT,
@@ -839,12 +911,11 @@ fn translation(
     }
     let block = match code {
         Code::Block(block) => block,
-        // A step request is for a block's access site, never a system instruction.
-        Code::System(s) if !step => {
+        // A step request at a system instruction (X2: after a shadow-setting instruction) gets its decode too.
+        Code::System(s) => {
             state.system = s;
             return Ok(Ok(exec::REPLY_SYSTEM));
         }
-        Code::System(_) => return Err(format!("step at {rip:#x}: a system instruction")),
         Code::None(reason) => {
             return Ok(Err(match next_fault {
                 // The instruction at RIP continues into a page whose fetch faults: delivered by the resident.
@@ -867,6 +938,7 @@ fn translation(
     state.link_points = [exec::LinkPoint::NONE; exec::MAX_LINK_POINTS];
     state.link_points[..block.links.len()].copy_from_slice(&block.links);
     state.dispatch_exit = block.dispatch_exit.map_or(0, u64::from);
+    state.rep_exits = block.links.iter().enumerate().filter(|(_, p)| Some(p.target) == block.rep_self).fold(0, |m, (k, _)| m | 1 << k);
     Ok(Ok(exec::REPLY_ADMITTED))
 }
 

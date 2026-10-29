@@ -93,6 +93,8 @@ inline Verdict Two(uint8_t op, bool plain, bool has_modrm, uint8_t mod, uint8_t 
     if (has_modrm && mod != 3 && reg == 7) return Sys("clflush/clflushopt (cache maintenance)");
     if (has_modrm && mod == 3 && reg < 4) return Sys("rd/wr fs/gs base");
     return Uns("fxsave/xsave, ldmxcsr/stmxcsr, a fence with another ModRM");
+  // rdrand (/6), rdseed and rdpid (/7, F3): the entropy service and TSC_AUX are the resident's (S3).
+  case 0xC7: if (has_modrm && mod == 3 && reg >= 6) return Sys("rdrand/rdseed/rdpid"); break;
   default: break;
   }
   if (!plain) return Uns("mandatory-prefix (F3/F2/66) overlay opcode");
@@ -298,6 +300,11 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   if (!decoded) return Uns("did not decode");
   // CR0.EM, CR0.TS or no CR4.OSFXSR (the host's --sse-gated): the resident raises #UD or #NM before the instruction.
   if (v.simd && fexc_sse_gated) { v = Sys("SSE gated by CR0.EM/TS or CR4.OSFXSR (#UD/#NM)"); v.simd = true; return v; }
+  // X2: BT/BTS/BTR/BTC m, r and m, imm8 (0f a3/ab/b3/bb, 0f ba /4../7) under alignment checking (the host's --alignment-gated):
+  // the resident checks the operand-size alignment (#AC), then steps the instruction compiled without this flag.
+  if (fexc_alignment_gated && d.FexcMap >= FEXC_MAP_TWO && d.FexcMap <= FEXC_MAP_TWO_66 && has_modrm && mod != 3 &&
+      (op == 0xA3 || op == 0xAB || op == 0xB3 || op == 0xBB || (op == 0xBA && reg >= 4)))
+    return Sys("bt/bts/btr/btc with a memory operand under alignment checking (#AC: the resident's check)");
   const bool primary = d.FexcMap == FEXC_MAP_PRIMARY;
   // LOCK (I3): admitted on every lockable form (the others are cut above as #UD). FEX lowers each to one LSE atomic (LOCK NEG:
   // one compare-and-swap per pass, patch 0016). 66 on cmpxchg8b/16b is refused by policy (the SDM gives it no meaning).

@@ -23,6 +23,15 @@ import ref  # noqa: E402
 # tools/bench/run_natemu.py (the host's default admission).
 CODE_SHAPE = ['--code-shape']
 
+def at_hlt(out, rip):
+    """The driver's report `out` ended at the `hlt` at `rip` with the state there: HLT is the resident's transaction since
+    X2, #GP(0) at CPL 3 (delivered through the driver's logging IDT, the state banked at it), a park at CPL 0 that the
+    driver ends `halted` (RIP after it); before X2 the vCPU stopped `no_code` at it."""
+    r = int(out['rip'], 0)
+    return ((out['stop'] == 'no_code' and r == rip)
+            or (out['stop'] == 'guest_fault' and [int(x, 0) for x in out['fault']] == [13, 0, 0, rip] and r == rip)
+            or (out['stop'] == 'resident' and out['reason'].startswith('halted') and r == rip + 1))
+
 def build():
     cargo = ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release']
     subprocess.run(cargo + ['-p', 'natemu-host'], cwd=ROOT, check=True)

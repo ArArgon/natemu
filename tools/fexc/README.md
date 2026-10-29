@@ -29,7 +29,11 @@ jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never 
 (series applied as eighteen commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series20` (I5a after review, October 29: series19 plus
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series22` (X2, October 29: series21-s3 plus a shim
+change, no new patch: `--alignment-gated`, the host's when the vCPU runs under x86 alignment checking (CR0.AM, RFLAGS.AC, CPL
+3), cuts BT/BTS/BTR/BTC with a memory operand (`0f a3/ab/b3/bb`, `0f ba /4../7`) as system instructions: FEX touches only the
+byte holding the bit, so the resident checks the operand's alignment (#AC) and steps it compiled without the flag). Previous
+trees: `series21-s3` (S3: the shim cuts group 9's register forms /6 /7, RDRAND/RDSEED/RDPID); `series20` (I5a after review, October 29: series19 plus
 patch 0018: MOVAPS/MOVAPD/MOVDQA m128 as one 16-byte aligned LDP/STP of two X registers (sites of kinds 2/3 `load_pair`/
 `store_pair`, alignment-checked; SDM 9.1.1 atomicity with AVX enumerated, FEAT_LSE2), DPPS/DPPD masking their inputs before the
 multiply and computing the products under a zero destination mask (their MXCSR flags), a dead FCmp (COMISS/UCOMISS) kept for its

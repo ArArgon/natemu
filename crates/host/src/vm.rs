@@ -170,8 +170,11 @@ impl Machine {
     }
     /// Rings vCPU `v`'s host doorbell (an edge on its SPI), from any thread.
     pub(crate) fn ring(&self, v: usize) -> Result<()> {
-        let _gic = gic();
-        unsafe { hv(hv_gic_set_spi(self.spi + v as u32, true), "hv_gic_set_spi") }
+        self.doorbell().ring(v)
+    }
+    /// The doorbells alone (X2: what a vCPU's service loop rings for a test driver's event source).
+    pub(crate) fn doorbell(&self) -> Doorbell {
+        Doorbell { spi: self.spi }
     }
     /// vCPU `v`'s host doorbell is pending (rung, not yet acknowledged).
     pub(crate) fn ringing(&self, v: usize) -> Result<bool> {
@@ -182,6 +185,18 @@ impl Machine {
     pub(crate) fn destroy(self) -> i32 {
         std::mem::forget(self);
         unsafe { hv_vm_destroy() }
+    }
+}
+/// The VM's host doorbells ([`Machine::doorbell`]); valid while the machine exists.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Doorbell {
+    spi: u32,
+}
+impl Doorbell {
+    /// Rings vCPU `v`'s host doorbell (an edge on its SPI), from any thread.
+    pub(crate) fn ring(&self, v: usize) -> Result<()> {
+        let _gic = gic();
+        unsafe { hv(hv_gic_set_spi(self.spi + v as u32, true), "hv_gic_set_spi") }
     }
 }
 impl Drop for Machine {

@@ -81,6 +81,14 @@ private_start:
     mrs x9, fpsr
     str x9, [sp, #{fpsr_offset}]
     str xzr, [sp, #{reserved_offset}]
+    // X2: alignment checking (SCTLR_EL1.A, set only while generated code runs under x86 alignment checking: CR0.AM,
+    // RFLAGS.AC, CPL 3) is off before the resident runs any code of its own. The saves above are aligned.
+    mrs x9, sctlr_el1
+    tbz x9, #1, 1f
+    bic x9, x9, #2
+    msr sctlr_el1, x9
+    isb
+1:
 .endm
 
 exception_capture:
@@ -150,6 +158,14 @@ irq_gate:
 
 .global resume_exception
 resume_exception:
+    // x3 != 0: generated code runs under x86 alignment checking (X2, #AC): every misaligned data access at EL0 takes an
+    // alignment fault (SCTLR_EL1.A). Every load below is aligned.
+    cbz x3, 1f
+    mrs x9, sctlr_el1
+    orr x9, x9, #2
+    msr sctlr_el1, x9
+    isb
+1:
     msr elr_el1, x1
     msr spsr_el1, x2
     mov x16, x0

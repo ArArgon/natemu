@@ -125,7 +125,7 @@ pub(super) fn address(c: &Cpu, i: &System) -> u64 {
 }
 /// A non-canonical memory operand: #SS(0) through the stack segment (an RSP or RBP base, no FS/GS override; I7), else
 /// #GP(0).
-fn noncanonical(i: &System) -> Exception {
+pub(super) fn noncanonical(i: &System) -> Exception {
     if matches!(i.base, 4 | 5) && i.fs_gs == 0 { SS0 } else { GP0 }
 }
 
@@ -137,6 +137,24 @@ fn noncanonical(i: &System) -> Exception {
 /// else (device pages: M3) stops `unsupported_system`.
 pub(super) fn linear(s: &mut State, va: u64, buf: &mut [u8], write: bool, supervisor: bool, noncanonical: Exception) -> Result<(), Exception> {
     let n = buf.len() as u64;
+    // X2: an explicit access at CPL 3 under alignment checking (SDM Vol.3 7.15, Table 7-7): #AC(0) after the canonical
+    // check, before any walk, when misaligned for its data type: a word 2, a doubleword or a 48-bit far pointer or
+    // descriptor-table register image (6 or 10 bytes) 4, a quadword (and each quadword of a frame or pop: a multiple of 8
+    // bytes) 8; an 80-bit far pointer (m16:64) is taken as 4, as the table's far pointers. Implicit supervisor accesses
+    // are never checked.
+    if !supervisor && super::alignment_check(&s.cpu) != 0 {
+        let align = match n {
+            6 | 10 => 4,
+            n if n % 8 == 0 => 8,
+            4 => 4,
+            2 => 2,
+            _ => 1,
+        };
+        let last = va.wrapping_add(n - 1);
+        if va & (align - 1) != 0 && paging::canonical(va) && paging::canonical(last) && last >= va {
+            return Err([17, 0, 0]);
+        }
+    }
     let gpa = pages(s, va, n, write, supervisor, noncanonical)?;
     let first = (4096 - (va & 4095)).min(n) as usize;
     let (low, high) = buf.split_at_mut(first);
@@ -500,4 +518,56 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
         set_cpl(s, rpl);
     }
     Ok(rip)
+}
+
+/// LAR, LSL, VERR, VERW (S3; SDM Vol.2 LAR, LSL, VERR/VERW, IA-32e mode): the selector from a register or an m16 operand
+/// (an explicit access at the CPL), then the descriptor it names checked without faulting on it: ZF = 0, the destination
+/// unchanged, for a null selector, one outside the GDT/LDT limit (or TI = 1 with a null LDTR), a type the instruction does
+/// not accept, or (but for conforming code) DPL < CPL or DPL < RPL; else ZF = 1 and LAR/LSL write the destination. Only
+/// ZF changes among the flags. A #PF reading the descriptor (an implicit supervisor access) is raised. Accepted types
+/// (64-bit mode, SDM Vol.3 "System Descriptor Types"): every code and data segment; LAR also LDT (2), 64-bit TSS (9, B) and
+/// 64-bit call gate (C); LSL LDT and 64-bit TSS; VERR readable segments (data, code with R), VERW writable data. The
+/// descriptor is read as 8 bytes whatever its type (its limit, type and access rights are there). LAR gives the
+/// descriptor's dword 1 masked with 00F0FF00H (bits 19:16, the limit's, read as 0); LSL the limit scaled by G. A 16-bit
+/// destination keeps bits 63:16; 32- and 64-bit ones are written zero-extended.
+pub(super) fn inspect(s: &mut State, i: System) -> Result<(), Exception> {
+    let c = s.cpu;
+    let selector = if i.memory == 0 {
+        c.gpr[i.reg as usize] as u16
+    } else {
+        let mut b = [0u8; 2];
+        linear(s, address(&c, &i), &mut b, false, false, noncanonical(&i))?;
+        u16::from_le_bytes(b)
+    };
+    let found = if selector & 0xfffc == 0 {
+        None
+    } else {
+        match descriptor(s, selector, false) {
+            Ok((_, raw)) => Some(raw as u64),
+            Err([13, ..]) => None, // outside the table (or not canonical): no fault, ZF = 0
+            Err(e) => return Err(e),
+        }
+    };
+    let result = found.and_then(|raw| {
+        let (code_or_data, kind, dpl, _) = fields(raw);
+        let (code, conforming) = (code_or_data && kind & 8 != 0, code_or_data && kind & 0xc == 0xc);
+        let accepted = match i.kind {
+            system::LAR => code_or_data || matches!(kind, 2 | 9 | 0xb | 0xc),
+            system::LSL => code_or_data || matches!(kind, 2 | 9 | 0xb),
+            system::VERR => code_or_data && (!code || kind & 2 != 0),
+            _ => code_or_data && !code && kind & 2 != 0,
+        };
+        let privileged = !conforming && (c.cpl > dpl || u64::from(selector & 3) > dpl);
+        (accepted && !privileged).then(|| match i.kind {
+            system::LAR => raw >> 32 & 0x00f0_ff00,
+            _ => u64::from(Segment::loaded(selector, raw).limit),
+        })
+    });
+    const ZF: u64 = 1 << 6;
+    s.cpu.rflags = c.rflags & !ZF | if result.is_some() { ZF } else { 0 };
+    if let (Some(v), system::LAR | system::LSL) = (result, i.kind) {
+        let r = &mut s.cpu.gpr[i.cr as usize];
+        *r = if i.size == 2 { *r & !0xffff | v & 0xffff } else { v & if i.size == 4 { 0xffff_ffff } else { u64::MAX } };
+    }
+    Ok(())
 }

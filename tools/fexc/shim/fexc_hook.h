@@ -138,6 +138,10 @@ inline std::set<uint64_t> fexc_lock_cas;
 // Profile slice1 (I5a): the vCPU runs with CR0.EM or CR0.TS set or CR4.OSFXSR clear (`--sse-gated`, from the host): every SSE
 // form is cut as a system instruction (the resident raises #UD or #NM, SDM Vol.3 Table 2-2 and the SSE exception tables).
 inline bool fexc_sse_gated = false;
+// Profile slice1 (X2): the vCPU runs under x86 alignment checking (CR0.AM, RFLAGS.AC, CPL 3; `--alignment-gated`, from the
+// host): BT/BTS/BTR/BTC with a memory operand are cut as system instructions. FEX accesses the one byte holding the bit, so the
+// operand-size access x86 checks (#AC) never happens natively; the resident checks the operand's alignment, then steps it.
+inline bool fexc_alignment_gated = false;
 // Profile slice1 (I5a), recorded by the allowlist: guest RIP of each legacy SSE instruction whose 16-byte memory operand must be
 // 16-byte aligned (#GP(0) otherwise: SDM Vol.2 2.5, exception classes 1, 2 and 4); its first access gets an alignment check.
 inline std::set<uint64_t> fexc_align16;

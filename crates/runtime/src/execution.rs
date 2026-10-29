@@ -18,8 +18,10 @@
 use super::*;
 use crate::cache::{self, Block};
 mod delivery;
+mod events;
 mod segments;
 mod sse;
+mod syscalls;
 use delivery::{Event, deliver};
 use natemu_abi::{
     code_object::{self as object, Header, Site},
@@ -31,8 +33,8 @@ use natemu_abi::{
 };
 
 unsafe extern "C" {
-    fn enter_allocated(frame: *const NativeFrame, pc: u64, spsr: u64) -> !;
-    fn resume_exception(frame: *const NativeFrame, pc: u64, spsr: u64) -> !;
+    fn enter_allocated(frame: *const NativeFrame, pc: u64, spsr: u64, alignment: u64) -> !;
+    fn resume_exception(frame: *const NativeFrame, pc: u64, spsr: u64, alignment: u64) -> !;
     fn dispatch_template();
     fn dispatch_template_end();
 }
@@ -120,6 +122,15 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
     let mut flushed = false;
     loop {
         take_invalidations(s);
+        // X2: the events this boundary may take; an event a shadow alone blocks waits for exactly one more instruction,
+        // run alone (never cached or linked: the linker does not link to the step block).
+        if events::take(s) {
+            s.shadow_steps += 1;
+            match unsafe { step_here(s) } {
+                Some(block) => return Some(block),
+                None => continue,
+            }
+        }
         let context = s.cpu.code_context();
         cache::select_l1(context);
         let block = match cache::lookup(s.cpu.rip, context) {
@@ -130,7 +141,7 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
             None => match (s.generation, unsafe { request(s, REQUEST_TRANSLATE) }) {
                 (missed, Reply::Block(h)) => {
                     s.requests += 1;
-                    let Some(block) = cache::place(&h, STAGING_VA as *const u8, context, s.source_gpa, s.link_points, s.dispatch_exit) else {
+                    let Some(block) = cache::place(&h, STAGING_VA as *const u8, context, s.source_gpa, s.link_points, s.dispatch_exit, s.rep_exits) else {
                         // Full: flush (which also drops this vCPU's marks) and miss again; an empty cache holds any block.
                         if flushed {
                             halt(s, stop::BAD_REPLY)
@@ -155,6 +166,12 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
                 }
                 (_, Reply::System(instruction)) => {
                     system(s, instruction);
+                    // A BT* form found aligned under alignment checking (X2): run it alone, compiled without the cut.
+                    if s.plain_step != 0 {
+                        if let Some(block) = unsafe { step_here(s) } {
+                            return Some(block);
+                        }
+                    }
                     continue;
                 }
                 (_, Reply::Fault(fault)) => {
@@ -165,6 +182,29 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
         };
         cache::fill_l1(s.cpu.rip, block);
         return Some(block);
+    }
+}
+
+/// The instruction at `s.cpu.rip` alone, placed in the step slot (X2: after a shadow-setting instruction with an event
+/// pending, or a BT* form under alignment checking, `State::plain_step`, which this request consumes); `None` when it was
+/// a system instruction (executed) or its fetch faulted (delivered): the caller looks at the next boundary.
+unsafe fn step_here(s: &mut State) -> Option<&'static Block> {
+    let reply = unsafe { request(s, REQUEST_STEP) };
+    s.plain_step = 0;
+    match reply {
+        Reply::Block(h) => {
+            let context = s.cpu.code_context();
+            let placed = cache::place_step(&h, STAGING_VA as *const u8, context, s.source_gpa, s.link_points, s.dispatch_exit, s.rep_exits);
+            Some(placed.unwrap_or_else(|| halt(s, stop::BAD_REPLY)))
+        }
+        Reply::System(instruction) => {
+            system(s, instruction);
+            None
+        }
+        Reply::Fault(fault) => {
+            deliver(s, Event::Exception(fault));
+            None
+        }
     }
 }
 
@@ -182,6 +222,10 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
         completed(&mut s);
         s.cpu.rip = frame.x[0];
         s.linker += 1;
+        // A REP string's self-exit (X2): the boundary is between two of its iterations.
+        if let Some(b) = cache::block_at(elr.wrapping_sub(4)).filter(|b| link_point_of(b, elr.wrapping_sub(4)).is_some_and(|o| b.rep_exit(o))) {
+            rep_exited(&mut s, b);
+        }
         // The RIP must be one of the block's link targets (its `svc #LINK` follows that target's move).
         let target = |b: &Block| b.links.iter().any(|p| p.offset != 0 && p.target == s.cpu.rip);
         let source = match cache::block_at(elr.wrapping_sub(4)) {
@@ -205,6 +249,8 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             Some(source) if s.generation != generation || source.flags & cache::DEAD != 0 => s.stale_links += 1,
             // The exit's target was a system instruction: the block found follows it, nothing to link.
             Some(_) if target.rip != rip => {}
+            // An instruction run alone to end a shadow (X2): never linked to.
+            Some(_) if target.flags & cache::STEP != 0 => {}
             Some(source) => match cache::link(source, target) {
                 cache::Link::Linked(n) => s.links += n,
                 cache::Link::Full => s.full_links += 1,
@@ -268,7 +314,8 @@ unsafe fn request(s: &mut State, kind: u64) -> Reply {
             _ => halt(s, stop::BAD_REPLY),
         });
     }
-    if s.reply == REPLY_SYSTEM && block {
+    // (A step request may be answered with a decode too: X2's step after a shadow-setting instruction.)
+    if s.reply == REPLY_SYSTEM {
         if !s.system.well_formed() {
             halt(s, stop::BAD_REPLY)
         }
@@ -438,6 +485,13 @@ fn reset_shadows(s: &mut State) {
 /// deviation) changes only what that vCPU's own prefixed accesses use until the next `enter`.
 unsafe fn enter(mut s: State, block: &Block) -> ! {
     served(&mut s);
+    s.mid_string = 0; // the next resident entry is at another boundary
+    // X2: a shadow still set here covers the block's first instruction with no event pending (else `find` stepped it).
+    // Every later resident entry follows a completed instruction but a stop at this block's first word, which arms
+    // instead ([`interrupted`]): the shadow ends here, exactly.
+    let shadowed = s.cpu.mov_ss != 0 || s.sti_shadow != 0;
+    s.shadow_entry = if shadowed { block.entry() } else { 0 };
+    (s.cpu.mov_ss, s.sti_shadow) = (0, 0);
     for (at, value) in frame::flag_bytes(s.cpu.rflags) {
         // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA; `at` lies inside it.
         unsafe { (FRAME_VA as *mut u8).add(at as usize).write_volatile(value) };
@@ -462,7 +516,7 @@ unsafe fn enter(mut s: State, block: &Block) -> ! {
         let entry = &raw mut (*shared()).initial;
         write_record(entry, f);
         tables::select(s.cpu.cpl);
-        enter_allocated(entry, block.entry(), BLOCK_SPSR | nzcv)
+        enter_allocated(entry, block.entry(), BLOCK_SPSR | nzcv, alignment_check(&s.cpu))
     }
 }
 
@@ -556,7 +610,7 @@ unsafe fn resume(s: &State, frame: *const NativeFrame, pc: u64, spsr: u64) -> ! 
         cache::control().rearms += 1;
     }
     tables::select(s.cpu.cpl);
-    unsafe { resume_exception(frame, pc, spsr) }
+    unsafe { resume_exception(frame, pc, spsr, alignment_check(&s.cpu)) }
 }
 /// A wanted stop is served by a resident entry at a block boundary (the resident drained or will drain before the
 /// next block runs; [`enter`], [`halt`]).
@@ -622,7 +676,12 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
     }
     let Some(b) = cache::block_at(elr).filter(|b| b.flags & cache::DEAD == 0) else { bad(s) };
     s.irqs_step += u64::from(b.flags & cache::STEP != 0);
-    if elr == b.entry() {
+    // At a block's first word the vCPU stops at once, except in a block that starts with a REP string (X2): it may have
+    // been entered by its own self-link between iterations, so the stop is armed and taken at an exit, where the kind of
+    // boundary is known.
+    // Likewise at the first word of the block entered right after a shadow-setting instruction (`State::shadow_entry`):
+    // the shadow was cleared at that entry, so the event is taken after at least one more instruction.
+    if elr == b.entry() && (b.flags & cache::STEP != 0 || (!b.starts_with_rep() && s.shadow_entry != elr)) {
         let mut s = at_once(s, b.rip);
         s.stops_entry += 1;
         // The step block is entered again (see [`stopped`]).
@@ -644,8 +703,15 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
     tables::select(s.cpu.cpl);
     unsafe {
         write_record(record(), s);
-        resume_exception(&raw const (*shared()).captured, elr, spsr)
+        resume_exception(&raw const (*shared()).captured, elr, spsr, alignment_check(&s.cpu))
     }
+}
+/// x86 alignment checking is on (SDM Vol.3 7.15 #AC: CR0.AM, RFLAGS.AC and CPL 3), as a flag for the gates: generated
+/// code then runs with SCTLR_EL1.A, so a misaligned data access at any site takes an alignment fault before any
+/// translation ([`access_aborted`] makes it #AC(0)); the resident's own explicit accesses at CPL 3 check it in
+/// `segments::linear`.
+fn alignment_check(c: &Cpu) -> u64 {
+    u64::from(c.alignment_check())
 }
 
 /// A precise stop at an armed exit: a [`STOP_WORD`] trap at one of the words [`cache::arm`] patched (`armed`, already
@@ -671,6 +737,11 @@ unsafe fn stopped(frame: &NativeFrame, elr: u64, spsr: u64, (armed, n): ([u32; M
     bank(&mut s.cpu, frame, frame.nzcv, true);
     completed(&mut s);
     s.cpu.rip = rip;
+    // At a REP string's self-exit (X2): between two of its iterations.
+    let offset = at.wrapping_sub(block.map_or(0, |b| u64::from(b.code)));
+    if let Some(b) = block.filter(|b| b.rep_exit(offset)) {
+        rep_exited(&mut s, b);
+    }
     s.stop_wanted = 0;
     s.stops_exit += 1;
     taken(&mut s);
@@ -682,8 +753,9 @@ unsafe fn stopped(frame: &NativeFrame, elr: u64, spsr: u64, (armed, n): ([u32; M
 /// #GP; ET is hard-wired). WP is the walker's. MP, EM, TS, NE are recorded: they gate x87/MMX/SSE forms (#NM with TS
 /// or EM, #UD for SSE with EM; NE selects native x87 error reporting), none of which is admitted yet (I5, I6), and a
 /// change drops this vCPU's code like any control change, so a block never outlives the gating state it was made
-/// under. CD and NW are recorded: RAM is write-back whatever they say (memory types are M2's). AM is recorded;
-/// alignment checking (AM with RFLAGS.AC at CPL 3) is refused as a mode ([`Cpu::control`]).
+/// under. CD and NW are recorded: RAM is write-back whatever they say (memory types are M2's). AM with
+/// RFLAGS.AC at CPL 3 turns alignment checking on (X2, [`alignment_check`]); translations depend on it only through the
+/// BT* cut, and it is part of [`Cpu::code_context`].
 const CR0_DEFINED: u64 = cpu_profile::CR0_VALID;
 const CR0_CD: u64 = 1 << 30;
 const CR0_NW: u64 = 1 << 29;
@@ -691,7 +763,7 @@ const CR0_NW: u64 = 1 << 29;
 /// Vol.3 2.5) is reserved (#GP); every valid bit is accepted. PAE is fixed in long mode; PGE, SMEP are the walker's; PSE
 /// has no effect with 4-level paging (SDM Vol.3 4.1); TSD makes RDTSC/RDTSCP #GP at CPL > 0, PCE allows RDPMC there
 /// (which then #GPs for want of counters), DE makes DR4/DR5 #UD. OSFXSR, OSXMMEXCPT, OSXSAVE (CPUID.1:ECX.OSXSAVE
-/// follows it) gate SSE and XSAVE forms (I5); FSGSBASE gates RDFSBASE..WRGSBASE (S3): recorded state until then.
+/// follows it) gate SSE and XSAVE forms (I5); FSGSBASE gates RDFSBASE..WRGSBASE ([`syscalls`]).
 const CR4_TSD: u64 = 1 << 2;
 const UD: [u64; 3] = [6, 0, 0];
 const DB: [u64; 3] = [1, 0, 0];
@@ -713,7 +785,11 @@ const GP: [u64; 3] = [13, 0, 0];
 /// raise #UD. IRET releases NMI blocking once past the LOCK #UD check, even when it then faults (SDM Vol.3 7.7.2).
 fn system(s: &mut State, i: System) {
     s.systems += 1;
-    s.cpu.mov_ss = 0; // the shadow of a MOV SS ends after the next instruction (X2 ends it inside generated code)
+    // A shadow covers this instruction and ends with it (X2: MOV SS and STI set theirs again in the transaction); the
+    // boundary is not between REP iterations. A BT* form under alignment checking does not complete here (it is stepped).
+    if i.kind != system::BT_ALIGNED {
+        (s.cpu.mov_ss, s.sti_shadow, s.mid_string) = (0, 0, 0);
+    }
     if let Err(e) = transaction(s, i) {
         deliver(s, Event::Exception(e))
     }
@@ -734,7 +810,8 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
     // MOV to/from Sreg: ModRM.reg 6, 7 name no segment register; CS cannot be loaded.
     let sreg = matches!(i.kind, system::MOV_TO_SREG | system::MOV_FROM_SREG)
         && (i.cr as usize > SREG_GS || (i.kind == system::MOV_TO_SREG && i.cr as usize == SREG_CS));
-    if i.lock != 0 || (moves && !matches!(i.cr, 0 | 2 | 3 | 4 | 8)) || (debug && i.cr > 7) || sreg {
+    // (LOCK BTS/BTR/BTC are valid: BT_ALIGNED checks LOCK itself.)
+    if (i.lock != 0 && !(i.kind == system::BT_ALIGNED && i.cr != 0)) || (moves && !matches!(i.cr, 0 | 2 | 3 | 4 | 8)) || (debug && i.cr > 7) || sreg {
         return Err(UD);
     }
     // IRET (past its #UD checks) releases NMI blocking before anything else, even when it then faults.
@@ -748,9 +825,39 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             return Ok(());
         }
         system::INTO | system::UD => return Err(UD),
+        // X2: interrupt-flag control, HLT (it parks after its commit) and the test drivers' event hook.
+        // X2: a BT* memory form under alignment checking: #AC(0) when misaligned, else it is stepped (`find`), RIP kept.
+        system::BT_ALIGNED => {
+            events::bit_test(s, i)?;
+            s.plain_step = 1;
+            return Ok(());
+        }
+        system::CLI | system::STI | system::POPF | system::HLT | system::EVENT_HOOK => {
+            events::transaction(s, i)?;
+            commit(s, i, false);
+            if i.kind == system::HLT {
+                events::park(s);
+            }
+            return Ok(());
+        }
         system::LDMXCSR | system::STMXCSR | system::SSE_GATED => {
             sse::transaction(s, i)?;
             return Ok(commit(s, i, false));
+        }
+        // S3: each checks its own privilege ([`syscalls`]); SYSCALL/SYSRET commit to their target RIP.
+        system::SWAPGS..=system::CLFLUSH => {
+            let c = s.cpu;
+            return match syscalls::execute(s, i) {
+                Ok(None) => Ok(commit(s, i, false)),
+                Ok(Some(rip)) => {
+                    s.cpu.rip = rip;
+                    Ok(commit(s, System { length: 0, ..i }, false))
+                }
+                Err(e) => {
+                    s.cpu = c;
+                    Err(e)
+                }
+            };
         }
         _ => {}
     }
@@ -933,7 +1040,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                     // EN/EXTD and the base select the LAPIC's mode and page: no LAPIC yet (its chunk), so a write that
                     // changes them is refused; the BSP flag (bit 8, R/W) alone is stored.
                     cpu::MSR_APIC_BASE if (v ^ msr_get(at)) & !APIC_BASE_BSP != 0 => unsupported(s),
-                    // UCODE_REV keeps the high half (the low is 0 by the mask); KERNEL_GS_BASE waits for SWAPGS (S3);
+                    // UCODE_REV keeps the high half (the low is 0 by the mask); KERNEL_GS_BASE is SWAPGS's ([`syscalls`]);
                     // PAT and the MTRRs are recorded: memory types are the walker's (M2), RAM runs as write-back.
                     _ => msr_set(at, v),
                 }
@@ -1001,12 +1108,12 @@ fn tsc() -> u64 {
 }
 
 /// Changes the vCPU's CPL (0..=3), at a block boundary with the state banked: the one place a CPL changes (exception
-/// delivery, SYSCALL/SYSRET and IRET call it; today only the test drivers' [`system::SET_CPL`]). Nothing is flushed
+/// delivery, SYSCALL/SYSRET, IRET and RET far call it, and the test drivers' [`system::SET_CPL`]). Nothing is flushed
 /// or reset: blocks are keyed by CPL ([`Cpu::code_context`]: a fetch's U/S and SMEP checks were made at the CPL it was
 /// translated at), and shadows live in one space per privilege class, the CPL's loaded at every entry into generated
 /// code ([`tables::select`]), so a supervisor shadow never serves a CPL3 access. Implicit supervisor accesses
 /// (descriptor tables, the delivery frame) are the resident's, through the walker, never shadows. A CPL the bank
-/// cannot run at ([`Cpu::control`]: e.g. CPL 3 with CR0.AM and RFLAGS.AC, whose #AC is not built) stops
+/// cannot run at ([`Cpu::control`]: e.g. a compatibility-mode CS) stops
 /// `unsupported_mode` here, with the new CPL in the stop record and RIP still at the instruction.
 pub fn set_cpl(s: &mut State, cpl: u64) {
     s.cpu.cpl = cpl;
@@ -1035,6 +1142,22 @@ const RFLAGS_DF: u64 = 1 << 10;
 /// instruction keeps it.
 fn completed(s: &mut State) {
     s.cpu.rflags &= !(1 << 16);
+}
+/// The vCPU left `b` by its REP string's self-exit (X2), with RIP the REP's: between two iterations (`mid_string`), or,
+/// after its last element (RCX = 0: I2's pass exits to its own RIP whatever the count left), past the instruction, the
+/// boundary x86 has there (the REP ends `b`; a REP with RCX = 0 changes nothing).
+fn rep_exited(s: &mut State, b: &Block) {
+    if s.cpu.gpr[1] == 0 {
+        s.cpu.rip = b.rip.wrapping_add(u64::from(b.guest_bytes));
+    } else {
+        s.mid_string = 1;
+    }
+}
+/// The native offset of the link point whose `svc #LINK` is at native `svc` in `b`: the last one before the `svc` (each
+/// is a move of its target into x0 followed by its `svc`, admission).
+fn link_point_of(b: &Block, svc: u64) -> Option<u64> {
+    let at = svc.wrapping_sub(b.code_va());
+    b.links.iter().map(|p| u64::from(p.offset)).filter(|&o| o != 0 && o < at).max()
 }
 
 /// An x86 exception due at `site`'s guest instruction in `b` (`vector`,
@@ -1095,7 +1218,7 @@ fn step(mut s: State) -> ! {
             Reply::System(_) => halt(&s, stop::BAD_REPLY),
         };
         let context = s.cpu.code_context();
-        match cache::place_step(&h, STAGING_VA as *const u8, context, s.source_gpa, s.link_points, s.dispatch_exit) {
+        match cache::place_step(&h, STAGING_VA as *const u8, context, s.source_gpa, s.link_points, s.dispatch_exit, s.rep_exits) {
             Some(block) => unsafe { enter(s, block) },
             None => halt(&s, stop::BAD_REPLY),
         }
@@ -1270,6 +1393,20 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
     if site.kind == object::kind::ATOMIC && width == 16 && alignment && address & 15 != 0 {
         guest_fault(s, f, b, site, [13, 0, 0])
     }
+    // X2: under x86 alignment checking (SCTLR_EL1.A while it runs), a misaligned access is #AC(0) after the canonical
+    // check (made first, as for every access) and before any page walk, so before a split lock too. A 16-byte vector
+    // access that is 8-byte aligned is not one the SDM lets fault (MOVUPS and the like: "may or may not" only below 8-byte
+    // alignment, Vol.3 7.15); completing it is not built: refused with the state at the instruction.
+    if alignment && alignment_check(&s.cpu) != 0 {
+        if touched.is_none() {
+            guest_fault(s, f, b, site, noncanonical(site))
+        }
+        if width == 16 && site.data_class == object::CLASS_FPR && address & 7 == 0 {
+            bank_at(&mut s, f, b, site);
+            halt(&s, stop::UNSUPPORTED_MODE)
+        }
+        guest_fault(s, f, b, site, [17, 0, 0])
+    }
     // A swap or atomic whose operand crosses 16 bytes takes an alignment fault (LSE2) before any effect: a split lock, not
     // completed (owner decision: LOCKed accesses crossing 16 bytes stop), unless x86's canonical check (made first) fails.
     if swap && alignment && (address & 15) + width > 16 {
@@ -1337,6 +1474,11 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
             Some(_) => halt(&s, stop::SITE_MISMATCH), // the check fired for an access within one page
         }
     };
+    // X2: a store crossing a page is misaligned: #AC(0) under alignment checking (an 8-byte aligned 16-byte vector store
+    // excepted, as in [`access_aborted`]: completed here).
+    if alignment_check(&s.cpu) != 0 && !(width == 16 && access.data_class == object::CLASS_FPR && address & 7 == 0) {
+        guest_fault(s, f, b, stub, [17, 0, 0])
+    }
     // A contended walk resumes at the stub, which takes this path again.
     let gpa = [first, second].map(|va| translate(&mut s, f, b, stub, va, Access::Write));
     let [Some(gpa0), Some(gpa1)] = gpa else {

@@ -11,11 +11,14 @@ use super::segments::{self, Exception};
 use super::*;
 
 /// What is delivered: an exception raised at the banked state (vector, error code, CR2; the bank is the state at the
-/// faulting instruction for faults), or a software interrupt (INT n, INT3) of `length` bytes at the banked RIP.
+/// faulting instruction for faults), a software interrupt (INT n, INT3) of `length` bytes at the banked RIP, or an
+/// external event (X2: a maskable interrupt's vector, or 2 for an NMI) taken at the banked instruction boundary;
+/// `mid_string` when that boundary is between two iterations of a REP string instruction (its frame holds RF = 1).
 #[derive(Clone, Copy)]
 pub(super) enum Event {
     Exception(Exception),
     Software { vector: u64, length: u64 },
+    External { vector: u64, mid_string: bool },
 }
 
 const TF: u64 = 1 << 8;
@@ -41,7 +44,7 @@ enum Class {
 }
 fn class(e: Event) -> Class {
     match e {
-        Event::Software { .. } => Class::Benign,
+        Event::Software { .. } | Event::External { .. } => Class::Benign,
         Event::Exception([8, ..]) => Class::Double,
         Event::Exception([v, ..]) if CONTRIBUTORY >> v & 1 != 0 => Class::Contributory,
         Event::Exception([v, ..]) if PAGE >> v & 1 != 0 => Class::Page,
@@ -81,6 +84,7 @@ fn attempt(s: &mut State, event: Event) -> Result<(), Exception> {
     let (vector, software, length) = match event {
         Event::Exception([v, ..]) => (v, false, 0),
         Event::Software { vector, length } => (vector, true, length),
+        Event::External { vector, .. } => (vector, false, 0),
     };
     let ext = u64::from(!software); // §7.13 EXT
     let gate_error = vector << 3 | 2 | ext;
@@ -150,9 +154,15 @@ fn attempt(s: &mut State, event: Event) -> Result<(), Exception> {
         return Err(gp(ext)); // after the stack checks (A5)
     }
     // The frame (§7.14.2): 16-byte aligned; SS, RSP, RFLAGS, CS, RIP and the error code at decreasing addresses. RF image:
-    // 0 for INT n/INT3 (cleared at their start), 1 for faults, else the current RF (Vol.3 "RF", 20.3.1.1).
+    // 0 for INT n/INT3 (cleared at their start), 1 for faults and for an event between REP iterations (mid-string),
+    // else the current RF (Vol.3 "RF", 20.3.1.1).
     let top = rsp & !15;
-    let rf = if software { 0 } else if FAULTS >> vector & 1 != 0 { RF } else { c.rflags & RF };
+    let rf = match event {
+        Event::Software { .. } => 0,
+        Event::External { mid_string, .. } => if mid_string { RF } else { c.rflags & RF },
+        Event::Exception(_) if FAULTS >> vector & 1 != 0 => RF,
+        Event::Exception(_) => c.rflags & RF,
+    };
     let error = match event {
         Event::Exception([v, e, _]) if ERROR_CODE >> v & 1 != 0 => Some(e),
         _ => None,
@@ -177,7 +187,8 @@ fn attempt(s: &mut State, event: Event) -> Result<(), Exception> {
         s.cpu.seg[SREG_SS] = Segment { selector: new_cpl as u16, ..Segment::NULL }; // a null SS with RPL = new CPL
     }
     s.cpu.rflags &= !(TF | NT | RF | VM | if gtype == 0xe { IF } else { 0 }); // §7.12.1.3
-    s.cpu.mov_ss = 0;
+    // Both interrupt shadows end, and the boundary is no longer between REP iterations (X2).
+    (s.cpu.mov_ss, s.sti_shadow, s.mid_string) = (0, 0, 0);
     s.delivered = [vector, error.unwrap_or(u64::MAX)];
     if vector == 1 && !software {
         s.cpu.dr[5] &= !DR7_GD; // SDM Vol.3 17.2.4: the processor clears GD on entering the #DB handler

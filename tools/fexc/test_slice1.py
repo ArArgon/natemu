@@ -42,6 +42,8 @@ SYSTEM = {
     'cli': 'fa', 'sti': 'fb', 'popfq': '9d',
     'cpuid': '0fa2', 'rdtsc': '0f31', 'rdtscp': '0f01f9', 'xgetbv': '0f01d0', 'swapgs': '0f01f8', 'clac (FEX cannot decode)': '0f01ca',
     'rdfsbase': 'f3480faec0', 'wrfsbase': 'f3480faed0', 'ud2': '0f0b',
+    # S3: rdrand (/6), rdseed (/7), rdpid (f3 /7): register forms of group 9
+    'rdrand': '0fc7f0', 'rdrand ax': '660fc7f0', 'rdseed': '0fc7f8', 'rdpid': 'f30fc7f8',
 }
 
 # name -> hex. Decodable instructions that are not slice-1 forms, and admitted opcodes with an excluded prefix or operand.
@@ -66,7 +68,7 @@ UNSUPPORTED = {
     'prefetchw': '0f0d08', 'prefetch /4 (reserved nop)': '0f1820', 'prefetch reg (reserved nop)': '0f18c0', 'movnti reg': '0fc3c1',
     'pdep': 'c4e2fbf5c1', 'pext': 'c4e2faf5c1', 'andn L=1': 'c4e27cf2c1', 'blsr /0 (#UD)': 'c4e278f3c1', 'vpxor': 'c5f9efc0',
     'rex andn (#UD)': '48c4e278f2c1', 'o16 andn (#UD)': '66c4e278f2c1', 'rep popcnt-like f2 0f b8': 'f20fb8c1',
-    'fxsave': '0fae00', 'loop 67-prefix': '67e2fe', 'jecxz': '67e3fe', 'loop o16': '66e2fe', 'rdrand': '0fc7f0', 'rdseed': '0fc7f8',
+    'fxsave': '0fae00', 'loop 67-prefix': '67e2fe', 'jecxz': '67e3fe', 'loop o16': '66e2fe', 
     'xlat': 'd7', 'movbe': '0f38f000', 'sal /6 alias': 'd1f0',
     'bnd ret': 'f2c3', 'o16 ret': '66c3', 'o16 jmp': '66e9fbffffff', 'bswap r9w (undefined)': '66410fc9', 'bswap ax': '660fc8',
     # FEX branches around the whole access for a zero count (static or dynamic), losing a guest #PF

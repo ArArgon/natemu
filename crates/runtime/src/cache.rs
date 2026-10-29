@@ -191,6 +191,7 @@ pub fn place(
     source_gpa: [u64; 2],
     links: [LinkPoint; MAX_LINK_POINTS],
     dispatch_exit: u64,
+    rep_exits: u64,
 ) -> Option<&'static Block> {
     let c = control();
     let code = c.code_used.next_multiple_of(CODE_ALIGN);
@@ -212,6 +213,7 @@ pub fn place(
         number: c.blocks as u32,
         flags: 0,
         dispatch_exit: dispatch_exit as u32,
+        rep_exits: rep_exits as u32,
         links,
     };
     unsafe {
@@ -219,7 +221,7 @@ pub fn place(
         at.write(record);
         copy_record(at.add(1).cast(), object.add(h.sites_offset as usize), sites);
         copy_record((area::CODE_WRITE_VA + code) as *mut u8, object.add(h.code_offset as usize), h.code_size as usize);
-        relocate(code, dispatch_exit);
+        relocate(code, dispatch_exit, area::DISPATCH);
         synchronize_code(area::CODE_WRITE_VA + code, area::CODE_VA + code, h.code_size as usize);
         let n = c.blocks as usize;
         index(n).write(meta as u32);
@@ -235,7 +237,9 @@ pub fn place(
 
 /// Places the admitted object at `object` as the single-step block in the slot: uncached (not in the index, L1 or L2,
 /// never linked) and marking no source page, so the write it steps through completes (it drops the page's blocks
-/// itself, see the runtime's `code_written`). `None` if it does not fit the slot or the record area.
+/// itself, see the runtime's `code_written`). Every exit of it enters the resident: its literal exits are never linked,
+/// and its computed exit branches to the dispatcher's miss (`svc #MISS`), not through L1 (X2: the boundary after a
+/// stepped instruction is where a pending event is taken). `None` if it does not fit the slot or the record area.
 pub fn place_step(
     h: &Header,
     object: *const u8,
@@ -243,6 +247,7 @@ pub fn place_step(
     source_gpa: [u64; 2],
     links: [LinkPoint; MAX_LINK_POINTS],
     dispatch_exit: u64,
+    rep_exits: u64,
 ) -> Option<&'static Block> {
     let sites = size_of::<Site>() * h.sites_count as usize;
     if size_of::<Block>() + sites > area::STEP_RECORD_BYTES
@@ -263,6 +268,7 @@ pub fn place_step(
         number: u32::MAX,
         flags: STEP,
         dispatch_exit: dispatch_exit as u32,
+        rep_exits: rep_exits as u32,
         links,
     };
     unsafe {
@@ -270,7 +276,7 @@ pub fn place_step(
         at.write(record);
         copy_record(at.add(1).cast(), object.add(h.sites_offset as usize), sites);
         copy_record(SLOT_WRITE_VA as *mut u8, object.add(h.code_offset as usize), h.code_size as usize);
-        relocate(SLOT as u64, dispatch_exit);
+        relocate(SLOT as u64, dispatch_exit, DISPATCH_MISS);
         synchronize_code(SLOT_WRITE_VA, SLOT_VA, h.code_size as usize);
         Some(&*at)
     }
@@ -313,10 +319,10 @@ fn branch(from: u64, to: u64) -> u32 {
 /// Relocates the placeholder of the block just copied to code-area offset `code` (before its code is synchronized):
 /// its computed exit (at `dispatch_exit`, 0 for none) becomes `b` to the dispatcher. (The placeholder was checked at
 /// the reply.)
-fn relocate(code: u64, dispatch_exit: u64) {
+fn relocate(code: u64, dispatch_exit: u64, to: usize) {
     if dispatch_exit != 0 {
         let at = code + dispatch_exit;
-        unsafe { ((area::CODE_WRITE_VA + at) as *mut u32).write_volatile(branch(at, area::DISPATCH as u64)) };
+        unsafe { ((area::CODE_WRITE_VA + at) as *mut u32).write_volatile(branch(at, to as u64)) };
     }
 }
 

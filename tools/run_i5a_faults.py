@@ -162,7 +162,7 @@ def judge(c, code, vm, offsets):
         xmm = [int(v, 0) for v in vm['xmm']]
         if xmm != [v for p in XMM for v in p]: problems.append('xmm changed')
         if int(vm['mxcsr'], 0) != 0x1f80: problems.append(f"mxcsr {vm['mxcsr']}")
-    elif vm['stop'] != 'no_code' or int(vm['rip'], 0) != CODE + offsets[-1]:
+    elif not vm1.at_hlt(vm, CODE + offsets[-1]):
         problems.append(f"did not reach hlt: {vm['stop']} {vm['reason']} {vm['fault']} rip {vm['rip']}")
     if c['mem_check']:
         a, n = c['mem_check']

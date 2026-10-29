@@ -6,8 +6,11 @@
 //! (`0f 30`), RDPMC (`0f 33`), CPUID (`0f a2`), RDTSC (`0f 31`) and RDTSCP (`0f 01 f9`); the descriptor-table forms
 //! SGDT/SIDT/LGDT/LIDT m (`0f 01 /0../3`, mod != 3), SLDT/STR/LLDT/LTR r/m (`0f 00 /0../3`), MOV r/m, Sreg (`8c`) and
 //! MOV Sreg, r/m (`8e`), JMP/CALL far m16:32 or m16:64 (`ff /5`, `ff /3`, memory), RET far (`cb`, `ca iw`) and IRET (`cf`),
-//! with 32- or 64-bit operand size (REX.W) where it matters, in 64-bit mode. Anything else (other system instructions,
-//! F2/F3 prefixes, an address-size prefix on a memory operand, a 66 prefix on a far transfer, a CS/DS/ES/SS override on a
+//! with 32- or 64-bit operand size (REX.W) where it matters, in 64-bit mode; S3: SWAPGS (`0f 01 f8`), SYSCALL (`0f 05`),
+//! SYSRET (`0f 07`), RDFSBASE..WRGSBASE (`f3 0f ae /0../3`, register), LAR/LSL (`0f 02`/`0f 03`), VERR/VERW (`0f 00 /4`,
+//! `/5`), RDRAND (`0f c7 /6`, register), INVD/WBINVD/WBNOINVD (`0f 08`, `0f 09`, `f3 0f 09`), CLFLUSH m (`0f ae /7`), and
+//! forms the presented CPU raises #UD for whatever their operands (unadvertised or VMX/SVM-only instructions). Anything
+//! else (other system instructions, F2/F3 prefixes on other forms, an address-size prefix on a memory operand, a 66 prefix on a far transfer, a CS/DS/ES/SS override on a
 //! new memory form or an FS/GS override on INVLPG) is `None`: the vCPU stops with fexc's reason, as for code it cannot
 //! compile.
 use natemu_abi::execution::{SREG_FS, SREG_GS, System, system};
@@ -16,21 +19,25 @@ use natemu_abi::execution::{SREG_FS, SREG_GS, System, system};
 /// 66 overlay, map 4, is not reported for these opcodes).
 const MAP_PRIMARY: u8 = 0;
 const MAP_TWO: u8 = 1;
+const MAP_0F38: u8 = 5;
 
 /// Decodes the instruction at the start of `bytes`, which fexc cut as a system instruction with opcode map `map` and
 /// opcode `opcode`.
 pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
-    let (mut at, mut lock, mut segment, mut address_size, mut operand16) = (0, false, 0, false, false);
+    let (mut at, mut lock, mut segment, mut address_size, mut operand16, mut rep) = (0, false, 0, false, false, 0);
     loop {
         match *bytes.get(at)? {
             0xf0 => lock = true,
             0x66 => operand16 = true,
             0x67 => address_size = true,
             s @ (0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65) => segment = s,
-            _ => break, // F2/F3 (mandatory-prefix overlays) are not supported forms
+            // F2/F3 (mandatory-prefix overlays): only the forms that name them below (`rep_used`) take them.
+            p @ (0xf2 | 0xf3) => rep = p,
+            _ => break,
         }
         at += 1;
     }
+    let mut rep_used = false;
     let rex = match bytes[at] {
         r @ 0x40..=0x4f => {
             at += 1;
@@ -42,6 +49,7 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
     match map {
         MAP_TWO if *bytes.get(at)? == 0x0f && *bytes.get(at + 1)? == opcode => at += 2,
         MAP_PRIMARY if *bytes.get(at)? == opcode => at += 1,
+        MAP_0F38 if bytes.get(at..at + 3)? == [0x0f, 0x38, opcode] => at += 3,
         _ => return None,
     }
     let mut s = System { lock: u32::from(lock), ..System::NONE };
@@ -64,6 +72,17 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
             at += 1;
             s.kind = system::RDTSCP;
         }
+        (MAP_TWO, 0x01) if *bytes.get(at)? == 0xf8 => {
+            at += 1;
+            s.kind = system::SWAPGS;
+        }
+        // S3: register forms of group 7 whose CPUID feature the profile does not advertise, or that need VMX/SVM/SGX/TDX
+        // operation the presented CPU has none of: ENCLV, VMCALL/VMLAUNCH/VMRESUME/VMXOFF, PCONFIG, WRMSRNS, MONITOR/MWAIT, CLAC/STAC, TDCALL,
+        // ENCLS, VMFUNC/XEND/XTEST/ENCLU, the SVM group, SERIALIZE and XSUSLDTRK/XRESLDTRK (f2 e8/e9), RDPKRU/WRPKRU, MONITORX/MWAITX, CLZERO, RDPRU and the
+        // RMP/INVLPGB group: #UD whatever the prefixes (SDM Vol.2 each: "#UD If CPUID ... = 0" / "not in VMX operation").
+        (MAP_TWO, 0x01) if matches!(*bytes.get(at)?, 0xc0..=0xc6 | 0xc8..=0xcc | 0xcf | 0xd4..=0xdf | 0xe8 | 0xe9 | 0xee | 0xef | 0xfa..=0xff) => {
+            (at, rep_used, s.kind) = (at + 1, true, system::UD);
+        }
         (MAP_TWO, 0x01) => {
             let reg = rm(bytes, &mut at, rex, &mut s)?;
             s.kind = match reg {
@@ -80,9 +99,38 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         }
         (MAP_TWO, 0x00) => {
             let reg = rm(bytes, &mut at, rex, &mut s)?;
-            s.kind = *[system::SLDT, system::STR, system::LLDT, system::LTR].get(reg as usize)?;
+            s.kind = *[system::SLDT, system::STR, system::LLDT, system::LTR, system::VERR, system::VERW, system::UD].get(reg as usize)?;
+            // /6: LKGS (f2) is not advertised, and reserved without it.
+            rep_used = s.kind == system::UD;
             s.size = size;
         }
+        // S3: LAR/LSL r, r/m16 (destination ModRM.reg with REX.R).
+        (MAP_TWO, 0x02 | 0x03) => {
+            s.cr = rm(bytes, &mut at, rex, &mut s)? | r;
+            s.kind = if opcode == 0x02 { system::LAR } else { system::LSL };
+            s.size = size;
+        }
+        (MAP_TWO, 0x05) => s.kind = system::SYSCALL,
+        (MAP_TWO, 0x07) => {
+            s.kind = system::SYSRET;
+            s.size = far_size?;
+        }
+        // INVD, WBINVD and (f3) WBNOINVD.
+        (MAP_TWO, 0x08 | 0x09) => {
+            s.kind = system::WBINVD;
+            rep_used = opcode == 0x09 && rep == 0xf3;
+        }
+        // RDRAND (/6; F2/F3 #UD), RDSEED and RDPID (/7, f3), neither advertised: #UD.
+        (MAP_TWO, 0xc7) => {
+            let reg = rm(bytes, &mut at, rex, &mut s)?;
+            if s.memory != 0 || reg < 6 {
+                return None; // cmpxchg8b/16b (admitted) and other memory forms are never cut
+            }
+            (s.kind, rep_used) = if reg == 6 && rep == 0 { (system::RDRAND, false) } else { (system::UD, true) };
+            s.size = size;
+        }
+        // VMREAD/VMWRITE outside VMX operation; INVEPT/INVVPID (likewise) and INVPCID (not advertised): #UD.
+        (MAP_TWO, 0x78 | 0x79) | (MAP_0F38, 0x80..=0x82) => (s.kind, rep_used) = (system::UD, true),
         (MAP_PRIMARY, 0x8c | 0x8e) => {
             s.cr = rm(bytes, &mut at, rex, &mut s)?;
             s.kind = if opcode == 0x8c { system::MOV_FROM_SREG } else { system::MOV_TO_SREG };
@@ -115,30 +163,75 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
             at += 1;
         }
         (MAP_PRIMARY, 0xce) => s.kind = system::INTO,
-        // UD1/UD0's ModRM is not decoded: #UD leaves RIP at the instruction, its length is never used.
-        (MAP_TWO, 0x0b | 0xb9 | 0xff) => s.kind = system::UD,
-        // I5a: LDMXCSR/STMXCSR m32 (`0f ae /2`, `/3`); with a 66 prefix or a register operand another instruction.
-        (MAP_TWO, 0xae) if !operand16 => {
-            s.kind = match rm(bytes, &mut at, rex, &mut s)? {
-                2 => system::LDMXCSR,
-                3 => system::STMXCSR,
-                _ => return None,
-            };
+        // X2: CLI, STI, HLT; POPF pops 8 bytes in 64-bit mode (REX.W changes nothing), 2 with a 66 prefix.
+        (MAP_PRIMARY, 0xfa) => s.kind = system::CLI,
+        (MAP_PRIMARY, 0xfb) => s.kind = system::STI,
+        (MAP_PRIMARY, 0xf4) => s.kind = system::HLT,
+        (MAP_PRIMARY, 0x9d) => {
+            s.kind = system::POPF;
+            s.size = if operand16 && !w { 2 } else { 8 };
+        }
+        // X2: BT/BTS/BTR/BTC with a memory operand, cut only under alignment checking (fexc --alignment-gated): `cr` names
+        // the operation, `reg` the bit-offset register (NO_REG for the imm8 form, its immediate skipped), `size` the operand.
+        (MAP_TWO, 0xa3 | 0xab | 0xb3 | 0xbb) => {
+            let bit = rm(bytes, &mut at, rex, &mut s)? | r;
+            (s.kind, s.cr, s.reg, s.size) = (system::BT_ALIGNED, u32::from((opcode >> 3) & 3), bit, size);
             if s.memory == 0 {
                 return None;
             }
         }
+        (MAP_TWO, 0xba) => {
+            let op = rm(bytes, &mut at, rex, &mut s)?;
+            bytes.get(at)?;
+            at += 1;
+            if s.memory == 0 || op < 4 {
+                return None;
+            }
+            (s.kind, s.cr, s.reg, s.size) = (system::BT_ALIGNED, op - 4, system::NO_REG, size);
+        }
+        // UD1/UD0's ModRM is not decoded: #UD leaves RIP at the instruction, its length is never used.
+        (MAP_TWO, 0x0b | 0xb9 | 0xff) => s.kind = system::UD,
+        // I5a: LDMXCSR/STMXCSR m32 (`0f ae /2`, `/3`); with a 66 prefix or a register operand another instruction. S3:
+        // CLFLUSH m8 (`/7`; with 66 CLFLUSHOPT, not advertised: #UD); f3 with a register operand RDFSBASE, RDGSBASE,
+        // WRFSBASE, WRGSBASE (`/0../3`), whose register forms without f3 are #UD.
+        (MAP_TWO, 0xae) => {
+            let reg = rm(bytes, &mut at, rex, &mut s)?;
+            s.kind = match (s.memory, reg) {
+                (1, 2) if !operand16 => system::LDMXCSR,
+                (1, 3) if !operand16 => system::STMXCSR,
+                (1, 7) if operand16 => system::UD,
+                (1, 7) => system::CLFLUSH,
+                (0, 0..=3) if operand16 => return None, // 66 there: no SDM encoding (a stop, not a guess)
+                (0, 0..=3) if rep == 0xf3 => {
+                    rep_used = true;
+                    s.size = if w { 8 } else { 4 };
+                    [system::RDFSBASE, system::RDGSBASE, system::WRFSBASE, system::WRGSBASE][reg as usize]
+                }
+                (0, 0..=3) => system::UD,
+                _ => return None,
+            };
+            rep_used |= s.kind == system::UD;
+        }
         _ => return None,
+    }
+    // A UD form's operands are never used (the fault leaves RIP at the instruction).
+    if rep != 0 && !rep_used {
+        return None;
+    }
+    if s.kind == system::UD {
+        s = System { kind: system::UD, lock: s.lock, ..System::NONE };
     }
     if s.memory == 1 {
         if address_size {
             return None;
         }
-        // INVLPG keeps its null CS/DS/ES/SS overrides; the newer memory forms take only FS/GS (I7's rule for the others).
+        // INVLPG keeps its null CS/DS/ES/SS overrides, and so does a BT* form cut under alignment checking (X2: fexc compiles
+        // it with them otherwise, so they must not stop it here; base 0 in 64-bit mode); the newer memory forms take only
+        // FS/GS (I7's rule for the others).
         s.fs_gs = match segment {
             0x64 => SREG_FS as u32,
             0x65 => SREG_GS as u32,
-            _ if s.kind == system::INVLPG || segment == 0 => 0,
+            _ if matches!(s.kind, system::INVLPG | system::BT_ALIGNED) || segment == 0 => 0,
             _ => return None,
         };
     }
@@ -258,8 +351,8 @@ mod tests {
         for (hex, op) in [("66cb", 0xcb), ("66ff28", 0xff), ("ffe8", 0xff), ("ff20", 0xff), ("2e8e18", 0x8e), ("678e18", 0x8e), ("8ed8", 0x8c)] {
             assert_eq!(p(hex, op), None, "{hex}");
         }
-        for (hex, op) in [("0f01d0", 0x01), ("0f0120", 0x01), ("0f00e0", 0x00), ("0f00e8", 0x00)] {
-            assert_eq!(d(hex, op), None, "{hex}"); // xgetbv, smsw, verr, verw
+        for (hex, op) in [("0f01d0", 0x01), ("0f0120", 0x01), ("0f00f8", 0x00), ("f30f00e0", 0x00)] {
+            assert_eq!(d(hex, op), None, "{hex}"); // xgetbv, smsw, 0f 00 /7, f3 verr
         }
     }
 
@@ -297,12 +390,46 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_flag_forms() {
+        let s = |kind, size, length| Some(System { kind, size, length, ..System::NONE });
+        assert_eq!(super::decode(&[0xfa], MAP_PRIMARY, 0xfa), s(CLI, 0, 1));
+        assert_eq!(super::decode(&[0xfb], MAP_PRIMARY, 0xfb), s(STI, 0, 1));
+        assert_eq!(super::decode(&[0xf4], MAP_PRIMARY, 0xf4), s(HLT, 0, 1));
+        assert_eq!(super::decode(&[0x9d], MAP_PRIMARY, 0x9d), s(POPF, 8, 1));
+        assert_eq!(super::decode(&[0x48, 0x9d], MAP_PRIMARY, 0x9d), s(POPF, 8, 2));
+        assert_eq!(super::decode(&[0x66, 0x9d], MAP_PRIMARY, 0x9d), s(POPF, 2, 2));
+        assert_eq!(super::decode(&[0x66, 0x48, 0x9d], MAP_PRIMARY, 0x9d), s(POPF, 8, 3)); // REX.W wins
+        assert_eq!(super::decode(&[0xf0, 0xfa], MAP_PRIMARY, 0xfa).map(|s| (s.kind, s.lock)), Some((CLI, 1))); // #UD by LOCK
+        assert!(s(POPF, 2, 2).unwrap().well_formed() && !System { size: 4, ..s(POPF, 4, 1).unwrap() }.well_formed());
+    }
+
+    #[test]
+    fn bit_tests_under_alignment_checking() {
+        let bt = |hex: &str, opcode| d(hex, opcode).map(|s| (s.kind, s.cr, s.reg, s.size, s.memory, s.base, s.length));
+        assert_eq!(bt("0fa30b", 0xa3), Some((BT_ALIGNED, 0, 1, 4, 1, 3, 3))); // bt [rbx], ecx
+        assert_eq!(bt("0fab0b", 0xab), Some((BT_ALIGNED, 1, 1, 4, 1, 3, 3))); // bts
+        assert_eq!(bt("0fb30b", 0xb3), Some((BT_ALIGNED, 2, 1, 4, 1, 3, 3))); // btr
+        assert_eq!(bt("0fbb0b", 0xbb), Some((BT_ALIGNED, 3, 1, 4, 1, 3, 3))); // btc
+        assert_eq!(bt("0fba2b05", 0xba), Some((BT_ALIGNED, 1, NO_REG, 4, 1, 3, 4))); // bts dword [rbx], 5
+        assert_eq!(bt("0fa3cb", 0xa3), None); // register operand: never cut
+        let w = super::decode(&[0x48, 0x0f, 0xab, 0x0b], MAP_TWO, 0xab).unwrap();
+        let h = super::decode(&[0x66, 0x0f, 0xab, 0x0b], MAP_TWO, 0xab).unwrap();
+        assert_eq!((w.size, h.size, w.well_formed(), h.well_formed()), (8, 2, true, true));
+        // CS/DS/ES/SS overrides are null in 64-bit mode; FS/GS add their base.
+        for prefix in [0x26, 0x2e, 0x36, 0x3e] {
+            let p = super::decode(&[prefix, 0x0f, 0xa3, 0x4b, 0x01], MAP_TWO, 0xa3).unwrap();
+            assert_eq!((p.kind, p.fs_gs, p.disp, p.length), (BT_ALIGNED, 0, 1, 5));
+        }
+        assert_eq!(super::decode(&[0x64, 0x0f, 0xa3, 0x4b, 0x01], MAP_TWO, 0xa3).unwrap().fs_gs, SREG_FS as u32);
+    }
+
+    #[test]
     fn mxcsr_forms() {
         assert_eq!(d("0fae10", 0xae), Some(mem(LDMXCSR, 0, 0, 3))); // ldmxcsr [rax]
         assert_eq!(d("410fae5c2408", 0xae), Some(mem(STMXCSR, 12, 8, 6))); // stmxcsr [r12+8]
         assert_eq!(d("640fae18", 0xae), Some(System { fs_gs: 4, ..mem(STMXCSR, 0, 0, 4) })); // stmxcsr fs:[rax]
-        for hex in ["660fae10", "0faed0", "0fae38", "670fae10"] {
-            assert_eq!(d(hex, 0xae), None, "{hex}"); // 66, register form, clflush, 32-bit address
+        for hex in ["660fae10", "0fae20", "f30fae10", "670fae10"] {
+            assert_eq!(d(hex, 0xae), None, "{hex}"); // 66, xsave, f3, 32-bit address
         }
     }
 
@@ -321,7 +448,7 @@ mod tests {
     fn unsupported_forms_are_refused() {
         let bytes = |hex: &str| -> Vec<u8> { (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect() };
         for (hex, map, op) in [
-            ("0f01f8", MAP_TWO, 0x01),   // swapgs (mod 3)
+            ("0f01e0", MAP_TWO, 0x01),   // smsw eax (mod 3)
             ("0f0120", MAP_TWO, 0x01),   // smsw is /4
             ("670f0138", MAP_TWO, 0x01), // 32-bit address
             ("650f0138", MAP_TWO, 0x01), // GS override
@@ -339,5 +466,48 @@ mod tests {
             let got = decode(&bytes(hex), map, op);
             assert_eq!(got.is_some(), hex == "0f017810", "{hex}");
         }
+    }
+
+    #[test]
+    fn s3_forms() {
+        let k = |kind, length| Some(System { kind, length, ..System::NONE });
+        assert_eq!(d("0f01f8", 0x01), k(SWAPGS, 3));
+        assert_eq!(d("0f05", 0x05), k(SYSCALL, 2));
+        assert_eq!(d("480f07", 0x07), Some(System { kind: SYSRET, size: 8, length: 3, ..System::NONE }));
+        assert_eq!(d("0f07", 0x07), Some(System { kind: SYSRET, size: 4, length: 2, ..System::NONE })); // sysretl
+        assert_eq!(d("660f07", 0x07), None);
+        let base = |kind, reg, size, length| Some(System { kind, reg, size, length, ..System::NONE });
+        assert_eq!(d("f3480faec0", 0xae), base(RDFSBASE, 0, 8, 5));
+        assert_eq!(d("f30faecb", 0xae), base(RDGSBASE, 3, 4, 4));
+        assert_eq!(d("f3490faed1", 0xae), base(WRFSBASE, 9, 8, 5));
+        assert_eq!(d("f3480faedf", 0xae), base(WRGSBASE, 7, 8, 5));
+        assert_eq!(d("0faec0", 0xae), k(UD, 3)); // fxsave with a register operand
+        assert_eq!(d("66f30faec0", 0xae), None); // 66 on rdfsbase: no SDM encoding
+        assert_eq!(d("660f02c1", 0x02), Some(System { kind: LAR, cr: 0, reg: 1, size: 2, length: 4, ..System::NONE }));
+        assert_eq!(d("4c0f03c9", 0x03), Some(System { kind: LSL, cr: 9, reg: 1, size: 8, length: 4, ..System::NONE })); // lsl r9, rcx
+        assert_eq!(d("0f030d10000000", 0x03), Some(System { cr: 1, size: 4, ..mem(LSL, RIP, 0x10, 7) })); // lsl ecx, [rip+0x10]
+        assert_eq!(d("0f00e1", 0x00), Some(System { kind: VERR, reg: 1, size: 4, length: 3, ..System::NONE }));
+        assert_eq!(d("0f002d10000000", 0x00), Some(System { size: 4, ..mem(VERW, RIP, 0x10, 7) })); // verw [rip+0x10]
+        assert_eq!(d("f20f00f0", 0x00), k(UD, 4)); // lkgs
+        assert_eq!(d("0fc7f0", 0xc7), base(RDRAND, 0, 4, 3));
+        assert_eq!(d("660fc7f1", 0xc7), base(RDRAND, 1, 2, 4));
+        assert_eq!(d("490fc7f7", 0xc7), base(RDRAND, 15, 8, 4));
+        for hex in ["0fc7f8", "f30fc7f8", "f30fc7f0"] {
+            assert_eq!(d(hex, 0xc7), k(UD, hex.len() as u32 / 2), "{hex}"); // rdseed, rdpid, f3 rdrand
+        }
+        assert_eq!(d("0fc708", 0xc7), None); // cmpxchg8b: admitted, never cut
+        assert_eq!(d("0f09", 0x09), k(WBINVD, 2));
+        assert_eq!(d("f30f09", 0x09), k(WBINVD, 3)); // wbnoinvd
+        assert_eq!(d("0f08", 0x08), k(WBINVD, 2)); // invd
+        assert_eq!(d("f20f09", 0x09), None);
+        assert_eq!(d("0fae3b", 0xae), Some(mem(CLFLUSH, 3, 0, 3))); // clflush [rbx]
+        assert_eq!(d("650fae7808", 0xae), Some(System { fs_gs: 5, ..mem(CLFLUSH, 0, 8, 5) })); // clflush gs:[rax+8]
+        assert_eq!(d("660fae38", 0xae), k(UD, 4)); // clflushopt
+        for hex in ["0f01c0", "0f01c5", "0f01c6", "f20f01e9", "0f01ca", "0f01cb", "0f01c8", "0f01c9", "0f01e8", "0f01ee", "0f01ef", "0f01c1", "0f01d9", "660f01cc", "f30f01fe", "f20f01ff"] {
+            assert_eq!(d(hex, 0x01), k(UD, hex.len() as u32 / 2), "{hex}");
+        }
+        assert_eq!(d("0f78c0", 0x78), k(UD, 2));
+        assert_eq!(super::decode(&[0x66, 0x0f, 0x38, 0x82, 0x00, 0x90], MAP_0F38, 0x82), k(UD, 4)); // invpcid
+        assert_eq!(d("f00f01f8", 0x01).map(|s| (s.kind, s.lock)), Some((SWAPGS, 1))); // #UD by LOCK
     }
 }

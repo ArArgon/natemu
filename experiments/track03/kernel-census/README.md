@@ -47,6 +47,16 @@ SSE4.2 string functions), ADCX 736 and MOVBE 68 (filed as SSE: other features), 
 LDMXCSR/STMXCSR (kernel 1, initramfs 383: `system`, the resident's transactions); `other` fell too (kernel 23 → 19, initramfs
 3,086 → 2,302: SSE forms with an F2/F3 prefix the earlier classifier filed as a REP/REPNE prefix on an admitted opcode).
 
+**S3 re-check (October 29).** `census.py` ports the S3 shim change (fexc series21-s3: group 9's register forms /6 /7, RDRAND,
+RDSEED and RDPID, are system cuts). Rerun into `natemu-raw/kernel-census-s3-20261029-01/` (`x` linked to the C0 data; report
+in its `report/`). Kernel `system` 16,745 -> 16,754 (`rdrandq` 7 and `rdseedq` 2 moved from `other`); nothing else moved. Of
+the kernel's `system` instructions the host now decodes all but X2's (`cli`, `sti`, `popfq`, `hlt`: 1,078), L3's port I/O (747)
+and I5b's `xgetbv`/`xsetbv` (7): S3 executes 103 (`swapgs` 22, `wbinvd` 23, `verw` 17, `clflush` 14, `rdrandq` 7, the FS/GS
+base forms 12, `syscall` 2, `sysretq` 1, `sysretl` 2 (refused: compatibility mode), `lar` 2, `lsl` 1) and raises #UD for 457
+unadvertised or VMX/SVM/SGX/TDX-only forms (`clac` 190, `stac` 106, `vmmcall` 51, `encls` 23, `rdpkru`/`wrpkru` 25, `vmcall`
+12, `monitor`/`mwait`(`x`) 19, `serialize` 7, `rmpadjust`, `pvalidate`, `psmash`, `rmpupdate`, `tdcall`, `lkgs`, `invpcid`,
+`rdseedq`, `clflushopt`).
+
 Files here: `extract.py`, `census.py`, `report.py`, `results.md` (every table, generated), `forms-kernel.tsv` (every refused
 form of the decompressor and vmlinux, one row per mnemonic + operand shape, first-use order). The same for the
 initramfs is `RAW/forms-initrd.tsv`; `RAW/census.json` holds every row.

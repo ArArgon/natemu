@@ -32,6 +32,10 @@
 //! destroyed, success or failure: vCPUs joined and destroyed, the VM's destroy status, and whether any child process
 //! (compile server) is left, alive or unreaped.
 //!
+//! X2: with `--kick-events E[,E..]` (vectors 16..255 or `nmi`) each kick first posts one of them, chosen at random, so
+//! events arrive at random times. A halted vCPU (HLT) can be woken only by an event: once every kicker has ended and
+//! every vCPU is halted or ended, the driver asks each halted one to end (`stop` `resident`, reason `halted`).
+//!
 //! Precise stops: `--kick-vcpu V` (repeatable) runs a host kicker thread per listed vCPU that rings its doorbell
 //! `--kicks M` times (default 10,000), each after the previous kick was acknowledged and a stop taken (or the vCPU ended) and
 //! `--kick-every-us P` (default 0) more, plus a random 0..`--kick-jitter-us J` (default 0); kicks while the vCPU is in the host or the resident are part of the stream.
@@ -51,6 +55,10 @@
 //!     exception masked: unmasked SIMD exceptions are not built) (I5a; the report lists `xmm` as 32 quadwords and `mxcsr`)
 //!   | switch ADDR 0|3 (repeatable: the one-byte instruction at ADDR, a `nop`, runs as a change of the CPL to the value,
 //!     the resident's general CPL change; no x86 instruction changes the CPL yet. Blocks end before it.)
+//!   | if 0|1 (RFLAGS.IF at the start, default 1; RFLAGS is the `rflags` value with bit 1 and this)
+//!   | post ADDR VECTOR | nmi ADDR (X2 event sources, repeatable: the one-byte instruction at ADDR, a `nop`, makes the host
+//!     post the external interrupt VECTOR (16..255) or an NMI into the vCPU's event record and ring its doorbell; the
+//!     vCPU takes it when eligible. Blocks end before it.)
 //! CR0 is PE, ET, PG and WP as set, CR4 PAE and SMEP as set, EFER LME, LMA and NXE as set; CPL0 code may change them
 //! with system instructions (the resident's transactions).
 //! Address-space items: code HEX (a body at the section's rip) | body ADDR HEX | memory ADDR HEX
@@ -119,11 +127,17 @@ struct Section {
     gs_base: u64,
     /// I5a: CR4.OSFXSR and OSXMMEXCPT (SSE enabled, as Linux sets them), the XMM registers and MXCSR.
     sse: bool,
+    /// S3: CR4.FSGSBASE (RDFSBASE..WRGSBASE enabled, as Linux sets it).
+    fsgsbase: bool,
     xmm: [[u64; 2]; 16],
     mxcsr: u64,
     space: usize,
     /// `switch` items: (RIP, CPL).
     switches: Vec<(u64, u64)>,
+    /// `post`/`nmi` items (X2 event sources): (RIP, vector or `execution::NMI`).
+    posts: Vec<(u64, u64)>,
+    /// RFLAGS.IF at the start (`if 0|1`, default 1).
+    interrupts: bool,
 }
 #[derive(Debug, PartialEq)]
 struct Description {
@@ -152,7 +166,7 @@ fn parse(text: &str) -> Result<Description> {
             _ => chunks.last_mut().unwrap().push(line),
         }
     }
-    let new = |space| Section { rip: 0, rflags: 0, gpr: [0; 16], cpl: 3, wp: true, smep: false, nxe: true, fs_base: 0, gs_base: 0, sse: false, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, space, switches: vec![] };
+    let new = |space| Section { rip: 0, rflags: 0, gpr: [0; 16], cpl: 3, wp: true, smep: false, nxe: true, fs_base: 0, gs_base: 0, sse: false, fsgsbase: false, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, space, switches: vec![], posts: vec![], interrupts: true };
     let mut d = Description { spaces: vec![Space::default()], cpus: vec![], sections: chunks.len() > 1 };
     if d.sections {
         items(&chunks[0], &mut d.spaces[0], None)?;
@@ -209,12 +223,16 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
             ("cpl", ["0"]) => state(&mut cpu, line)?.cpl = 0,
             ("cpl", ["3"]) => state(&mut cpu, line)?.cpl = 3,
             ("switch", [a, c @ ("0" | "3")]) => state(&mut cpu, line)?.switches.push((number(a)?, c.parse().unwrap())),
-            ("wp" | "smep" | "nxe" | "sse", [v @ ("0" | "1")]) => {
+            ("post", [a, v]) if (16..256).contains(&number(v)?) => state(&mut cpu, line)?.posts.push((number(a)?, number(v)?)),
+            ("nmi", [a]) => state(&mut cpu, line)?.posts.push((number(a)?, execution::NMI)),
+            ("if", [v @ ("0" | "1")]) => state(&mut cpu, line)?.interrupts = *v == "1",
+            ("wp" | "smep" | "nxe" | "sse" | "fsgsbase", [v @ ("0" | "1")]) => {
                 let c = state(&mut cpu, line)?;
                 *match words[0] {
                     "wp" => &mut c.wp,
                     "smep" => &mut c.smep,
                     "sse" => &mut c.sse,
+                    "fsgsbase" => &mut c.fsgsbase,
                     _ => &mut c.nxe,
                 } = *v == "1";
             }
@@ -459,7 +477,7 @@ fn log_images(base: u64) -> [Vec<u8>; 2] {
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] \
                      [--code-shape] [--code-cache BYTES] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-exit] [--tamper offset|word|record|system] [--tamper-after word|record] \
-                     [--forge-stop] [--forge-entry HEX[,HEX]...] [--kick-vcpu V]... [--kicks M] [--kick-every-us P] [--kick-jitter-us J] [--tamper next-page|site|site-kind|armed|dispatch|target] [--ignore-kicks] [--kill-compiler N] [--stall-compiler N] [--compile-deadline-ms MS]";
+                     [--forge-stop] [--forge-entry HEX[,HEX]...] [--kick-vcpu V]... [--kicks M] [--kick-every-us P] [--kick-jitter-us J] [--kick-events E,..] [--tamper next-page|site|site-kind|armed|dispatch|target] [--ignore-kicks] [--kill-compiler N] [--stall-compiler N] [--compile-deadline-ms MS]";
 
 /// Every literal exit's RIP move puts another RIP in x0: bit 0 of the immediate of its last word (the one before its
 /// `svc #LINK`) flips. A one-word move would change the link point's first word itself, which the host's self-check
@@ -638,7 +656,11 @@ struct Ran {
 fn finished(stop: &Stop) -> bool {
     matches!(
         stop,
-        Stop::Reached | Stop::Logged | Stop::FetchFault(_) | Stop::NoCode(_) | Stop::Resident { stop: exec::stop::SHUTDOWN | exec::stop::UNSUPPORTED_ATOMIC, .. }
+        Stop::Reached
+            | Stop::Logged
+            | Stop::FetchFault(_)
+            | Stop::NoCode(_)
+            | Stop::Resident { stop: exec::stop::SHUTDOWN | exec::stop::UNSUPPORTED_ATOMIC | exec::stop::HALTED, .. }
     )
 }
 
@@ -649,6 +671,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let (mut max_instructions, mut code_bytes, mut watchdog_ms, mut forge, mut target) = (None, exec::cache::CODE_BYTES, 10_000, false, 0);
     let (mut tamper, mut tamper_after): (Option<fn(Area, &mut State) -> bool>, Option<Corrupt>) = (None, None);
     let (mut forge_stop, mut forged, mut kicked, mut kicks, mut every_us, mut jitter_us) = (false, None, Vec::new(), 10_000, 0, 0);
+    let mut kick_events: Vec<u64> = Vec::new();
     let (mut ignore_kicks, mut signal_at, mut deadline_ms) = (false, None, execution::COMPILE_DEADLINE.as_millis() as u64);
     let mut code_shape = false;
     let mut options = options.iter();
@@ -673,6 +696,14 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             "--kicks" => kicks = value()?,
             "--kick-every-us" => every_us = value()? as u64,
             "--kick-jitter-us" => jitter_us = value()? as u64,
+            "--kick-events" => {
+                for e in options.next().ok_or(USAGE)?.split(',') {
+                    kick_events.push(match e {
+                        "nmi" => execution::NMI,
+                        v => number(v).ok().filter(|v| (16..256).contains(v)).ok_or(USAGE)?,
+                    });
+                }
+            }
             "--tamper" => {
                 tamper = Some(match options.next().map(String::as_str) {
                     Some("offset") => tamper_offset,
@@ -763,10 +794,10 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             Cpu {
                 gpr: c.gpr,
                 rip: c.rip,
-                rflags: c.rflags | 0x202,
+                rflags: c.rflags | 2 | if c.interrupts { 0x200 } else { 0 },
                 cr0: exec::CR0_PE | exec::CR0_ET | exec::CR0_PG | bit(c.wp, exec::CR0_WP),
                 cr3: spaces[c.space].as_ref().unwrap().cr3,
-                cr4: exec::CR4_PAE | bit(c.smep, exec::CR4_SMEP) | bit(c.sse, exec::CR4_OSFXSR | exec::CR4_OSXMMEXCPT),
+                cr4: exec::CR4_PAE | bit(c.smep, exec::CR4_SMEP) | bit(c.sse, exec::CR4_OSFXSR | exec::CR4_OSXMMEXCPT) | bit(c.fsgsbase, 1 << 16),
                 efer: exec::EFER_LME | exec::EFER_LMA | bit(c.nxe, exec::EFER_NXE),
                 cpl: c.cpl,
                 fs_base: c.fs_base,
@@ -797,7 +828,13 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         compiler.deadline = std::time::Duration::from_millis(deadline_ms);
         compiler.shape = code_shape;
         let handlers = log_base(d.spaces[d.cpus[v].space].identity) + LOG_HANDLERS;
-        let mut requests = execution::Requests { switches: d.cpus[v].switches.iter().copied().collect(), handlers: Some(handlers..handlers + 0x1000), ..Default::default() };
+        let mut requests = execution::Requests {
+            switches: d.cpus[v].switches.iter().copied().collect(),
+            handlers: Some(handlers..handlers + 0x1000),
+            posts: d.cpus[v].posts.iter().copied().collect(),
+            doorbell: Some(machine.doorbell()),
+            ..Default::default()
+        };
         if v == target {
             compiler.tamper = forge.then_some(forge_exit as fn(&mut [u8]));
             compiler.signal_at = signal_at;
@@ -829,13 +866,23 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         }
         Ok(cpu)
     };
-    // One kicker per kicked vCPU, joined before the VM goes (a protect needs the VM).
+    // One kicker per kicked vCPU, joined before the VM goes (a protect needs the VM). With `--kick-events`, each kick
+    // first posts an event (X2), chosen at random from the list.
+    let kickers_left = std::sync::atomic::AtomicUsize::new(kicked.len());
+    let all_ended = AtomicBool::new(false);
     let (kicked, supervision) = std::thread::scope(|scope| {
         let kickers: Vec<_> = kicked
             .iter()
             .map(|&v| {
-                let (stops, started, machine, backing) = (&stops, &started, &machine, &backing);
+                let (stops, started, machine, backing, kick_events, kickers_left) = (&stops, &started, &machine, &backing, &kick_events, &kickers_left);
                 scope.spawn(move || -> Result<()> {
+                    struct Done<'a>(&'a std::sync::atomic::AtomicUsize);
+                    impl Drop for Done<'_> {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, SeqCst);
+                        }
+                    }
+                    let _done = Done(kickers_left);
                     let mut rng = 0x2545_f491_4f6c_dd1d_u64 ^ (v as u64 + 1) << 32;
                     while !started[v].load(SeqCst) && !stops.ended(v) {
                         std::thread::sleep(std::time::Duration::from_micros(20));
@@ -843,6 +890,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                     for _ in 0..kicks {
                         let area = backing.vcpu(v);
                         let taken = stops.taken(area);
+                        if !kick_events.is_empty() && !stops.ended(v) {
+                            execution::post(&backing.memory, v, kick_events[(rng >> 33) as usize % kick_events.len()]);
+                        }
                         if !stops.kick(machine, v)? {
                             break;
                         }
@@ -872,11 +922,32 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 })
             })
             .collect();
+        // X2: a halted vCPU can only be woken by an event; in this driver every source is a kicker (or a vCPU's own
+        // `post`/`nmi` items, which a halted vCPU cannot reach). Once every kicker has ended and every vCPU is halted or
+        // ended, no halted vCPU can wake: each is asked to end its run (`halted`).
+        let (stops, backing, machine, kickers_left, all_ended) = (&stops, &backing, &machine, &kickers_left, &all_ended);
+        let idle = scope.spawn(move || -> Result<()> {
+            let mut asked = vec![false; n];
+            while !all_ended.load(SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                let halted: Vec<usize> = (0..n).filter(|&v| !stops.ended(v) && execution::halted(&backing.memory, v)).collect();
+                if kickers_left.load(SeqCst) == 0 && !halted.is_empty() && (0..n).all(|v| stops.ended(v) || halted.contains(&v)) {
+                    for &v in halted.iter().filter(|&&v| !std::mem::replace(&mut asked[v], true)) {
+                        execution::end_when_halted(&backing.memory, v);
+                        stops.kick(machine, v)?;
+                    }
+                }
+            }
+            Ok(())
+        });
         let supervision = owners::supervise(n, &prepare, &body);
+        all_ended.store(true, SeqCst);
+        let idle = idle.join().unwrap_or(Err("idle watcher panicked".into()));
         for v in 0..n {
             stops.end(v); // a vCPU that never started
         }
         let kicked: Result<()> = kickers.into_iter().map(|k| k.join().unwrap_or(Err("kicker panicked".into()))).collect();
+        let kicked = kicked.and(idle);
         // Every vCPU and kicker has ended: a doorbell still pending is a kick no stop followed.
         let kicked = kicked.and_then(|()| (0..n).try_for_each(|v| stops.pending_at_end(&machine, v)));
         (kicked, supervision)
@@ -1036,7 +1107,7 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"shadow_resets\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{},\"dispatch_exits\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]{}}}",
+        "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"shadow_resets\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{},\"dispatch_exits\":{},\"interrupts\":{},\"nmis\":{},\"halts\":{},\"shadow_steps\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]{}}}",
         s.blocks,
         s.l2_hits,
         s.requests,
@@ -1063,6 +1134,10 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
         link_points,
         linked,
         execution::placed_blocks(area).iter().filter(|b| b.dispatch_exit != 0).count(),
+        s.interrupts,
+        s.nmis,
+        s.halts,
+        s.shadow_steps,
         list(&fault),
         list(&s.native),
         frame_intact(area),

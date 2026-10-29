@@ -97,7 +97,7 @@ def main():
                          vm1.CODE_SHAPE, capture_output=True, text=True)
     if run.returncode: sys.exit(f'driver: {run.stderr[-500:]}')
     d = json.loads(run.stdout); got = bytes.fromhex(d['memory'][0]['data'])
-    if d['stop'] != 'no_code': sys.exit(f"stopped {d['stop']} {d['reason']} at {d['rip']}")
+    if not vm1.at_hlt(d, 0x100000 + len(code) - 1): sys.exit(f"stopped {d['stop']} {d['reason']} at {d['rip']}")
     bad, results = 0, []
     for i, (name, text, x, y, mx, de) in enumerate(cs):
         out = struct.unpack_from('<I', got, 0x40 * i + 36)[0]

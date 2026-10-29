@@ -168,6 +168,8 @@ pub mod cache {
     pub const WRITABLE_PAGES: usize = 0x1000;
     pub const RECORDS: usize = 0x2000;
     pub const RESETS: usize = 0x3000;
+    /// Per-vCPU [`Events`] records (X2).
+    pub const EVENTS: usize = 0x3100;
     /// vCPUs of one VM (bits of the mask bytes).
     pub const MAX_VCPUS: usize = 4;
 
@@ -223,6 +225,9 @@ pub mod cache {
         pub flags: u32,
         /// Native offset of its computed exit's `b` to the dispatcher (0: none).
         pub dispatch_exit: u32,
+        /// Bit i: link point i is the self-exit of the REP string instruction that ends the block (X2, the host's
+        /// [`super::State::rep_exits`]): a stop there is between two iterations, with some elements done.
+        pub rep_exits: u32,
         /// Its literal exits as admitted (`offset` 0 = unused).
         pub links: [super::LinkPoint; super::MAX_LINK_POINTS],
     }
@@ -238,6 +243,15 @@ pub mod cache {
         }
         pub fn entry(&self) -> u64 {
             self.code_va() + u64::from(super::ENTRY_OFFSET)
+        }
+        /// Link point `offset` (a native offset in the block, 0 = none) is the self-exit of the REP string instruction
+        /// that ends the block (X2, [`Block::rep_exits`]).
+        pub fn rep_exit(&self, offset: u64) -> bool {
+            self.links.iter().enumerate().any(|(k, p)| self.rep_exits >> k & 1 != 0 && p.offset != 0 && u64::from(p.offset) == offset)
+        }
+        /// The block starts with a REP string instruction (X2): one of its self-exits goes to its own RIP.
+        pub fn starts_with_rep(&self) -> bool {
+            self.links.iter().enumerate().any(|(k, p)| self.rep_exits >> k & 1 != 0 && p.offset != 0 && p.target == self.rip)
         }
     }
     /// A patched link point: the first word of link point `offset` of block `source` (block numbers) was `original`
@@ -265,6 +279,23 @@ pub mod cache {
     pub const PAGES: u64 = 1;
     pub const FLUSH: u64 = 2;
     pub const SHADOWS: u64 = 4;
+    /// One vCPU's pending asynchronous x86 events (X2), shared: producers (the host's event sources today, the LAPIC of
+    /// peers in X3) set bits with an atomic OR and then ring the vCPU's doorbell; its resident takes them at precise
+    /// stops and resident entries (an atomic AND of the bit it accepts). Until the LAPIC exists, `vectors` is an IRR-like
+    /// set and the highest vector is taken first.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Events {
+        /// Pending external interrupt vectors (bit v % 64 of word v / 64).
+        pub vectors: [u64; 4],
+        /// 1: an NMI is pending (one pending bit: NMIs posted while one is pending merge, SDM Vol.3 7.7.2 / M64).
+        pub nmi: u64,
+        /// 1: the host ends the vCPU's run if it is halted with no event it can take ([`crate::execution::stop::HALTED`]).
+        pub end: u64,
+        /// 1 while the vCPU is halted (HLT, parked in `wfi` in the VM): the host's watchdog treats it as idle.
+        pub halted: u64,
+        pub reserved: u64,
+    }
 
     const _: () = assert!(crate::execution::GUEST_RAM_OFFSET + crate::execution::GUEST_RAM_BYTES <= LOOKUP_OFFSET);
     const _: () = assert!((crate::execution::GUEST_RAM_OFFSET | crate::execution::GUEST_RAM_BYTES | LOOKUP_OFFSET) % BLOCK == 0);
@@ -287,7 +318,8 @@ pub mod cache {
     const _: () = assert!(CODE_PAGES + crate::execution::GUEST_PAGES <= WRITABLE_PAGES);
     const _: () = assert!(WRITABLE_PAGES + crate::execution::GUEST_PAGES <= RECORDS);
     const _: () = assert!(RECORDS + MAX_VCPUS * core::mem::size_of::<Record>() <= RESETS && RECORDS % 8 == 0);
-    const _: () = assert!(RESETS + MAX_VCPUS * 8 <= GLOBAL_BYTES);
+    const _: () = assert!(RESETS + MAX_VCPUS * 8 <= EVENTS && EVENTS % 64 == 0);
+    const _: () = assert!(EVENTS + MAX_VCPUS * core::mem::size_of::<Events>() <= GLOBAL_BYTES);
     const _: () = assert!(crate::execution::GUEST_PAGES % 64 == 0);
 }
 
@@ -584,17 +616,16 @@ impl Cpu {
     /// (paging off, legacy/PAE, LA57, SMAP: not supported by this slice), and
     /// for a CR3 with PWT/PCD or bits above the physical-address width set (memory types of the
     /// root table are not modelled; refused rather than ignored). [`CR3_IGNORED`] bits are ignored.
-    /// Also `None` while alignment checking is on (CR0.AM, RFLAGS.AC, CPL 3; SDM Vol.3 6.15 #AC): no access site checks
-    /// alignment, so that state is refused, not run without #AC.
+    /// Alignment checking (CR0.AM, RFLAGS.AC, CPL 3; SDM Vol.3 7.15 #AC) runs since X2: generated code then runs with
+    /// SCTLR_EL1.A, and the resident's explicit CPL 3 accesses check it.
     pub fn control(&self) -> Option<Control> {
         let long = self.cr0 & (CR0_PE | CR0_PG) == CR0_PE | CR0_PG
             && self.cr4 & CR4_PAE != 0
             && self.cr4 & (CR4_LA57 | CR4_SMAP) == 0
             && self.efer & (EFER_LME | EFER_LMA) == EFER_LME | EFER_LMA;
-        let alignment_check = self.cr0 & CR0_AM != 0 && self.rflags & RFLAGS_AC != 0 && self.cpl == 3;
         // 64-bit mode: CS.L = 1, CS.D = 0 (compatibility mode is not built, owner decision 3).
         let bits64 = self.seg[SREG_CS].attributes & (ATTR_L | ATTR_D) == ATTR_L;
-        (long && bits64 && !alignment_check && matches!(self.cpl, 0 | 3) && self.cr3 & !(paging::PA_MASK | CR3_IGNORED) == 0).then_some(Control {
+        (long && bits64 && matches!(self.cpl, 0 | 3) && self.cr3 & !(paging::PA_MASK | CR3_IGNORED) == 0).then_some(Control {
             cr3: self.cr3 & paging::PA_MASK,
             cpl: self.cpl,
             wp: u64::from(self.cr0 & CR0_WP != 0),
@@ -602,11 +633,16 @@ impl Cpu {
             smep: u64::from(self.cr4 & CR4_SMEP != 0),
         })
     }
+    /// x86 alignment checking is on (SDM Vol.3 7.15 #AC: CR0.AM, RFLAGS.AC and CPL 3; X2).
+    pub fn alignment_check(&self) -> bool {
+        self.cr0 & CR0_AM != 0 && self.rflags & RFLAGS_AC != 0 && self.cpl == 3
+    }
     /// What code at a RIP is compiled and cached under besides the RIP: CR3, and a word of the CPL, the code mode
     /// (bit 2: 64-bit, the only mode yet) and the paging controls a translation depends on (CR0.PG/WP,
     /// CR4.PGE/PCIDE/SMEP, EFER.NXE), and the SSE gating bits (I5a: CR0.EM, CR0.TS, CR4.OSFXSR; a translation cuts every
     /// SSE form when they gate it, so a block is never entered under other gating than it was made for, even should a
-    /// control change ever keep the code).
+    /// control change ever keep the code), and alignment checking (X2: a translation under it cuts every BT* memory form,
+    /// and RFLAGS.AC changes without dropping code).
     pub fn code_context(&self) -> [u64; 2] {
         let bit = |on: bool, n: u32| u64::from(on) << n;
         let word = self.cpl & 3
@@ -619,7 +655,8 @@ impl Cpu {
             | bit(self.efer & EFER_NXE != 0, 8)
             | bit(self.cr0 & CR0_EM != 0, 9)
             | bit(self.cr0 & CR0_TS != 0, 10)
-            | bit(self.cr4 & CR4_OSFXSR != 0, 11);
+            | bit(self.cr4 & CR4_OSFXSR != 0, 11)
+            | bit(self.alignment_check(), 12);
         [self.cr3, word]
     }
 }
@@ -780,9 +817,43 @@ pub mod system {
     /// An SSE instruction under CR0.EM, CR0.TS or without CR4.OSFXSR (I5a; fexc cut it, `--sse-gated`): #UD or #NM from the
     /// bank's controls (`length` is not used: the fault leaves RIP at the instruction).
     pub const SSE_GATED: u32 = 33;
+    /// S3: SWAPGS (`0f 01 f8`), SYSCALL (`0f 05`), SYSRET (`0f 07`, `size` 8 with REX.W, else 4: compatibility mode).
+    pub const SWAPGS: u32 = 34;
+    pub const SYSCALL: u32 = 35;
+    pub const SYSRET: u32 = 36;
+    /// RDFSBASE/RDGSBASE/WRFSBASE/WRGSBASE `reg` (`f3 0f ae /0../3`, register; `size` 4 or 8).
+    pub const RDFSBASE: u32 = 37;
+    pub const RDGSBASE: u32 = 38;
+    pub const WRFSBASE: u32 = 39;
+    pub const WRGSBASE: u32 = 40;
+    /// LAR/LSL GPR `cr` := r/m16 (`0f 02`, `0f 03`; `size` of the destination); VERR/VERW r/m16 (`0f 00 /4`, `/5`).
+    pub const LAR: u32 = 41;
+    pub const LSL: u32 = 42;
+    pub const VERR: u32 = 43;
+    pub const VERW: u32 = 44;
+    /// RDRAND `reg` (`0f c7 /6`, register; `size` 2, 4 or 8): a value of the entropy service ([`super::Entropy`]).
+    pub const RDRAND: u32 = 45;
+    /// WBINVD, INVD and WBNOINVD (`0f 09`, `0f 08`, `f3 0f 09`): cache maintenance without an architectural memory effect.
+    pub const WBINVD: u32 = 46;
+    /// CLFLUSH m8 (`0f ae /7`, memory).
+    pub const CLFLUSH: u32 = 47;
     /// `System::base` of a RIP-relative operand (relative to the next instruction).
     pub const RIP: u32 = 16;
     pub const NO_REG: u32 = 0xff;
+    /// X2 (numbered apart from the other chunks' kinds): CLI (`fa`), STI (`fb`), POPF (`9d`; `size` 8, or 2 with a 66
+    /// prefix: 64-bit mode has no 32-bit form) and HLT (`f4`).
+    pub const CLI: u32 = 0x40;
+    pub const STI: u32 = 0x41;
+    pub const POPF: u32 = 0x42;
+    pub const HLT: u32 = 0x43;
+    /// A test driver's event source (never decoded from x86): the one-byte instruction at RIP, a `nop`, where the host
+    /// posted an event into the vCPU's [`super::cache::Events`] and rang its doorbell before answering; the transaction
+    /// only moves RIP past it.
+    pub const EVENT_HOOK: u32 = 0x44;
+    /// BT/BTS/BTR/BTC with a memory operand (`0f a3/ab/b3/bb /r`, `0f ba /4../7 ib`) under alignment checking (X2: fexc cut
+    /// it, `--alignment-gated`): `cr` 0..3 = BT, BTS, BTR, BTC; `reg` the bit-offset register, or [`NO_REG`] for the imm8
+    /// form; `size` the operand size (2, 4, 8). The resident checks the operand's alignment (#AC(0)), then steps it.
+    pub const BT_ALIGNED: u32 = 0x45;
     impl super::System {
         pub const NONE: Self = Self {
             kind: 0, length: 0, lock: 0, cr: 0, reg: 0, base: NO_REG, index: NO_REG, scale: 0, disp: 0, memory: 0, size: 0, fs_gs: 0,
@@ -813,6 +884,17 @@ pub mod system {
                     SSE_GATED => true,
                     INT => self.cr < 256,
                     INT3 | INTO | UD => true,
+                    SWAPGS | SYSCALL | WBINVD => true,
+                    SYSRET => matches!(self.size, 4 | 8),
+                    RDFSBASE..=WRGSBASE => self.memory == 0 && reg(self.reg) && self.fs_gs == 0 && matches!(self.size, 4 | 8),
+                    LAR | LSL => rm && reg(self.cr) && matches!(self.size, 2 | 4 | 8),
+                    VERR | VERW => rm,
+                    RDRAND => self.memory == 0 && reg(self.reg) && self.fs_gs == 0 && matches!(self.size, 2 | 4 | 8),
+                    CLFLUSH => self.memory == 1 && address,
+                    CLI | STI | HLT => true,
+                    POPF => matches!(self.size, 2 | 8),
+                    EVENT_HOOK => self.length == 1,
+                    BT_ALIGNED => self.memory == 1 && address && self.cr < 4 && (reg(self.reg) || self.reg == NO_REG) && matches!(self.size, 2 | 4 | 8),
                     _ => false,
                 }
         }
@@ -866,6 +948,10 @@ pub mod stop {
     /// `State::fault` holds the last exception detected (vector, CR2, error code, RIP of the original event); the bank
     /// holds the state at the original event (CR2 as written by any #PF detected on the way); nothing was delivered.
     pub const SHUTDOWN: u64 = 16;
+    /// (X2, numbered apart from the other chunks' reasons.) The vCPU was halted (HLT) with no event it could take, and the
+    /// host ended its run ([`super::cache::Events::end`]: no source could wake it). The bank holds the state after the
+    /// HLT.
+    pub const HALTED: u64 = 32;
 
     pub fn name(code: u64) -> &'static str {
         match code {
@@ -883,6 +969,7 @@ pub mod stop {
             PRIVATE_ACCESS => "private_access",
             TRAPPED => "trapped",
             SHUTDOWN => "shutdown",
+            HALTED => "halted",
             _ => "none",
         }
     }
@@ -981,6 +1068,28 @@ pub struct State {
     /// The last event delivered (X1a): its vector and the error code its frame holds, `u64::MAX` when it holds none (INT n
     /// and INT3 to any vector, and exceptions without one). The test driver's logging IDT reads its frame by it.
     pub delivered: [u64; 2],
+    /// With a reply (X2): bit i set when link point i is the self-exit of a REP string instruction that ends the block
+    /// (admission proves it from the guest bytes); the resident keeps it in the block ([`cache::Block::rep_exits`]).
+    pub rep_exits: u64,
+    /// 1 after an STI that set IF (SDM Vol.3 7.8.1, Vol.2 STI): maskable interrupts and NMIs are blocked until the next
+    /// instruction completes (`Cpu::mov_ss` is the MOV SS shadow). Both end where the resident sees an instruction complete.
+    pub sti_shadow: u64,
+    /// 1 at a resident entry made at a REP string's self-exit (between iterations, elements done): an interrupt or NMI
+    /// delivered there pushes RF = 1 (SDM Vol.3 "RF").
+    pub mid_string: u64,
+    /// The entry of the block entered right after a shadow-setting instruction with no event pending (X2), else 0: the
+    /// shadow is cleared at that entry (the next resident entry follows a completed instruction), and a doorbell at that
+    /// block's first word arms a stop instead of stopping there, so no boundary later than the shadow's sees it.
+    pub shadow_entry: u64,
+    /// With a step request (X2): 1 = compile the instruction without `--alignment-gated` (a BT* form the resident has just
+    /// found aligned under alignment checking, [`system::BT_ALIGNED`]).
+    pub plain_step: u64,
+    /// X2 counters: external interrupts and NMIs delivered, HLTs that parked the vCPU, single steps taken to end a shadow
+    /// with an event pending.
+    pub interrupts: u64,
+    pub nmis: u64,
+    pub halts: u64,
+    pub shadow_steps: u64,
 }
 impl State {
     pub const fn new(vcpu: u64, cpu: Cpu) -> Self {
@@ -1033,6 +1142,15 @@ impl State {
             nmi_blocked: 0,
             deliveries: 0,
             delivered: [0, u64::MAX],
+            rep_exits: 0,
+            sti_shadow: 0,
+            mid_string: 0,
+            shadow_entry: 0,
+            plain_step: 0,
+            interrupts: 0,
+            nmis: 0,
+            halts: 0,
+            shadow_steps: 0,
         }
     }
 }
@@ -1041,7 +1159,24 @@ impl State {
 pub const MSRS_OFFSET: usize = STATE_OFFSET + 0x800;
 pub const MSRS_VA: u64 = PRIVATE + MSRS_OFFSET as u64;
 const _: () = assert!(core::mem::size_of::<State>() <= MSRS_OFFSET - STATE_OFFSET);
-const _: () = assert!(MSRS_OFFSET + core::mem::size_of::<crate::cpu::Msrs>() <= STATE_OFFSET + 4096);
+const _: () = assert!(MSRS_OFFSET + core::mem::size_of::<crate::cpu::Msrs>() <= ENTROPY_OFFSET);
+/// The vCPU's entropy service (S3, RDRAND): a pool of random words the host fills and the resident consumes, a record of
+/// its own in the state page. The host writes the record only while the vCPU is in the host (at reset and at each of its
+/// exits it tops the pool up: [`Entropy::taken`] words are replaced, `taken` returns to 0); the resident only while the
+/// vCPU runs (each RDRAND takes `words[taken]` and counts it). An empty pool (`taken` = [`ENTROPY_WORDS`]: more RDRANDs
+/// than that between two host exits, or a host whose entropy source failed and left the pool empty) is RDRAND's
+/// architectural failure, CF = 0 (SDM Vol.2 RDRAND: "a value of zero ... and CF = 0 indicates the random number was not
+/// available"), which software retries. Today every RDRAND is itself a host exit (its decode), so the pool never runs dry.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Entropy {
+    pub taken: u64,
+    pub words: [u64; ENTROPY_WORDS],
+}
+pub const ENTROPY_WORDS: usize = 32;
+pub const ENTROPY_OFFSET: usize = STATE_OFFSET + 0xc00;
+pub const ENTROPY_VA: u64 = PRIVATE + ENTROPY_OFFSET as u64;
+const _: () = assert!(ENTROPY_OFFSET + core::mem::size_of::<Entropy>() <= STATE_OFFSET + 4096);
 const _: () = assert!(STATE_OFFSET + 4096 <= FRAME_OFFSET);
 const _: () = assert!(FRAME_OFFSET + frame::BYTES <= GUEST_STATE_OFFSET);
 const _: () = assert!(GUEST_STATE_OFFSET + frame::BYTES <= (crate::STACK_TOP - PRIVATE) as usize - STACK_BYTES);
@@ -1184,7 +1319,6 @@ mod tests {
             Cpu { cpl: 1, ..cpu },
             Cpu { cr3: 0x1008, ..cpu },
             Cpu { cr3: 0x1000 | 1 << 40, ..cpu },
-            Cpu { cr0: cpu.cr0 | CR0_AM, rflags: cpu.rflags | RFLAGS_AC, ..cpu }, // #AC would be due (not built)
             Cpu { seg: [Segment { attributes: 0xc0fb, ..cpu.seg[1] }; 6], ..cpu }, // compatibility mode (CS.L = 0)
             Cpu { seg: [Segment { attributes: 0xe0fb, ..cpu.seg[1] }; 6], ..cpu }, // CS.L = CS.D = 1
         ] {
@@ -1192,8 +1326,9 @@ mod tests {
         }
         // Ignored CR3 bits stay in CR3 (and in the code context) but not in the walk's root.
         assert_eq!(Cpu { cr3: 0x1fe7, ..cpu }.control().unwrap().cr3, 0x1000);
-        // AM or AC alone, or both at CPL 0, check nothing.
+        // AM or AC alone, or both at CPL 0, check nothing; both at CPL 3 run with alignment checking (X2).
         for fine in [
+            Cpu { cr0: cpu.cr0 | CR0_AM, rflags: cpu.rflags | RFLAGS_AC, ..cpu },
             Cpu { cr0: cpu.cr0 | CR0_AM, ..cpu },
             Cpu { rflags: cpu.rflags | RFLAGS_AC, ..cpu },
             Cpu { cr0: cpu.cr0 | CR0_AM, rflags: cpu.rflags | RFLAGS_AC, cpl: 0, ..cpu },

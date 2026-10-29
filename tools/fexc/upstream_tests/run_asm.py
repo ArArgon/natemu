@@ -14,8 +14,8 @@ Source/Tools/TestHarnessRunner, CommonTools/HarnessHelpers.h) and checked agains
     for the data ranges, and a `region` over the code pages so they are writable too (RWX as FEX; stores to translated
     pages invalidate or single-step). `MemoryData` bytes are decoded like parse_hexstring (each blank-
     separated token is a little-endian number) and loaded as `memory` lines.
-  * End: the first executed hlt (FEX's SIGSEGV handler accepts a fault only when the byte at RIP is hlt). natemu: fexc cuts
-    the block at hlt (system_instruction), the driver stops there with the state banked, RIP = the hlt.
+  * End: the first executed hlt (FEX's SIGSEGV handler accepts a fault only when the byte at RIP is hlt). natemu: HLT at
+    CPL 3 is #GP(0) (X2), delivered through the driver's logging IDT with the state banked at the hlt, RIP = the hlt.
   * Expected: only `RegData`. In FEX's JIT mode `Match`/`Ignore` have no effect (the second state is null), so they are
     ignored here too. A register value list compares the first value (GPR/RIP). FS/GS, XMMn and MMn need state natemu does
     not have (see below). `Mode` 32-bit is out of the slice. `HostFeatures` and `Env` are recorded, not applied (fexc runs
@@ -45,6 +45,8 @@ GPR = {'RAX': 0, 'RCX': 1, 'RDX': 2, 'RBX': 3, 'RSP': 4, 'RBP': 5, 'RSI': 6, 'RD
 # returns through IRETQ/far JMP without descriptor checks and answers SGDT with a fixed GDTR. natemu executes these
 # instructions architecturally (plan S2b) against the driver's start-up descriptor tables (GDTR base 0, limit FFFFH), so the
 # selectors fault or SGDT reads other values: counted unsupported with this reason.
+NOT_ADVERTISED = {'rdpid', 'rdseed', 'clflushopt', 'clzero', 'clwb', 'serialize', 'rdpkru', 'wrpkru', 'monitorx', 'mwaitx', 'rdpru'}
+NEEDS_OS = {'syscall'}   # #UD with EFER.SCE = 0: no OS has set up SYSCALL here
 OS_SEGMENTS = {'Primary/Primary_8C.asm', 'Primary/Primary_8C_2.asm', 'Primary/Primary_CF.asm', 'PrimaryGroup/5_FF_05.asm',
                'PrimaryGroup/5_FF_05_03_o64.asm', 'PrimaryGroup/5_FF_05_03_o64_imm.asm', 'Secondary/07_XX_00.asm'}
 
@@ -77,7 +79,7 @@ def lists(src):
 
 
 def description(h, binary):
-    lines = [f'rip {CODE:#x}', 'rflags 0x202', 'gpr ' + ' '.join(['0'] * 16), f'code {binary.hex()}', 'sse 1']   # I5a: CR4.OSFXSR as Linux
+    lines = [f'rip {CODE:#x}', 'rflags 0x202', 'gpr ' + ' '.join(['0'] * 16), f'code {binary.hex()}', 'sse 1', 'fsgsbase 1']   # I5a: CR4.OSFXSR, S3: CR4.FSGSBASE, as Linux
     regions = DEFAULT_REGIONS + [(int(a, 0), int(n, 0)) for a, n in h.get('MEMORYREGIONS', {}).items()]
     regions.append((CODE, -(-len(binary) // PAGE) * PAGE))   # FEX maps the code RWX
     lines += [f'region {a:#x} {n:#x}' for a, n in regions]
@@ -126,7 +128,10 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
             return {**rec, 'outcome': 'fail', 'reason': 'harness: driver error', 'detail': err}
         s = json.loads(run.stdout)
         rip = int(s['rip'], 0)
-        at_hlt = s['stop'] == 'no_code' and s['reason'] == 'system_instruction' and CODE <= rip < CODE + len(binary) and binary[rip - CODE] == 0xF4
+        # X2: HLT is the resident's transaction, and these tests run at CPL 3, where HLT is #GP(0) with RIP at it and the
+        # state banked there (delivered through the driver's logging IDT): that is reaching the hlt. (Before X2: no code.)
+        hlt_gp = s['stop'] == 'guest_fault' and [int(x, 0) for x in s['fault']] == [13, 0, 0, rip]
+        at_hlt = (hlt_gp or (s['stop'] == 'no_code' and s['reason'] == 'system_instruction')) and CODE <= rip < CODE + len(binary) and binary[rip - CODE] == 0xF4
         if not at_hlt:
             rec['stop'] = f"{s['stop']} {s['reason']} rip={rip:#x}"
             if CODE <= rip < CODE + len(binary): rec['at'] = mnemonic(binary, rip); rec['bytes'] = binary[rip - CODE:rip - CODE + 8].hex()
@@ -143,6 +148,12 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
                 # X1a: INT3/INT n/INTO/UD0-2 are delivered through the driver's logging IDT; these tests expect Linux's
                 # signal for them (before X1a: no code, `system_instruction`).
                 return {**rec, 'outcome': 'unsupported', 'reason': f"software interrupt or #UD instruction delivered (vector {int(s['fault'][0], 0)}): {rec.get('at', '?')}"}
+            if vector == 6 and rec.get('at') in NOT_ADVERTISED:
+                # S3: #UD for an instruction the presented CPU (tools/models/cpu_profile.json) does not advertise, as the SDM
+                # gives; FEX's tests assume its host's features.
+                return {**rec, 'outcome': 'unsupported', 'reason': f"#UD: {rec['at']} not advertised by the CPU profile"}
+            if vector == 6 and rec.get('at') in NEEDS_OS:
+                return {**rec, 'outcome': 'unsupported', 'reason': f"#UD: {rec['at']} with EFER.SCE = 0 (needs an OS)"}
             return {**rec, 'outcome': 'fail', 'reason': 'did not reach hlt', 'detail': rec['stop'] + ' fault=' + json.dumps(s['fault'])}
         gpr = [int(v, 0) for v in s['gpr']]
         xmm = [int(v, 0) for v in s['xmm']]

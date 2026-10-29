@@ -13,7 +13,7 @@ never runs guest code.
 
 | Piece | What it does | Where |
 | --- | --- | --- |
-| Compiler (fexc) | Native macOS build of FEX's decoder, IR, optimizer, allocator and emitter. Takes x86 bytes, RIP and CPU context; returns ARM64 code with every guest-memory access site, exits, link points and relocations (code object v4; since E1 the code touches no emulator data: exits by `svc`/a relocated `b`, division by `svc`; since E1b no stop check; since E3 no address guard: a non-canonical access faults in hardware at its site). Cuts a block before any system instruction or unsupported form. One `fexc --serve` child process per vCPU. | `tools/fexc/` (build, patch series, shims), `third_party/FEX` (pinned submodule); binary: `../natemu-raw/fexc-native-20261026-01/series20/obj/fexc` (I5a) |
+| Compiler (fexc) | Native macOS build of FEX's decoder, IR, optimizer, allocator and emitter. Takes x86 bytes, RIP and CPU context; returns ARM64 code with every guest-memory access site, exits, link points and relocations (code object v4; since E1 the code touches no emulator data: exits by `svc`/a relocated `b`, division by `svc`; since E1b no stop check; since E3 no address guard: a non-canonical access faults in hardware at its site). Cuts a block before any system instruction or unsupported form. One `fexc --serve` child process per vCPU. | `tools/fexc/` (build, patch series, shims), `third_party/FEX` (pinned submodule); binary: `../natemu-raw/fexc-native-20261026-01/series22/obj/fexc` (X2: series21-s3, which cut group 9's register forms, plus `--alignment-gated`) |
 | Admission | Object validation of each block before it reaches the VM: header, profile, features against the vCPU's ID registers, offsets, sites and their words, relocations, exits and link points, x25/x28 rules, control flow. Since E3 the code-shape check (instruction allowlist, sp, literals, every memory word a site, split/branch-target/#DE check forms) is a debug option (the program driver's `--code-shape`, passed by the test runners except `contain`). | `crates/host/src/admission.rs`, `admission/structure.rs`; format `crates/abi/src/code_object.rs` |
 | Host | VM, GIC and vCPU lifecycle (`vm.rs`), guest RAM and the resident image (`memory.rs`), one thread per vCPU with start barrier, cancellation and join-before-destroy (`owners.rs`), the per-vCPU service loop: compile requests, system-instruction decode, kicks (doorbells), watchdog (`execution.rs`, `system.rs`). | `crates/host/src/` |
 | Resident | Boots each vCPU's private address space, banks x86 state, walks guest page tables (four-level, A/D by compare-exchange), installs owner-private shadows (native stage-1 tables, one space per x86 privilege class: supervisor and user, each with its own roots and ASID, two ASIDs per vCPU; the CPL's space is loaded at every entry into generated code, U1), places and links blocks, recovers faults precisely, executes system instructions, drains invalidations. | `crates/runtime/src/` (`execution.rs`, `cache.rs`, `tables.rs`, `gates.S`); shared layouts `crates/abi/src/` (`execution.rs`, `paging.rs`, `shadow.rs`, `guest_memory.rs`) |
@@ -37,7 +37,7 @@ and runtime; contract-by-contract mapping: [contracts.md](contracts.md), "Genera
 | `tools/run_slice1_faults.py` | 3,443 precise-fault cases (paging cells, access forms, probes) against QEMU prefix runs |
 | `tools/run_slice2_vm.py`, `run_slice2_faults.py`, `run_slice2_probes.py` | control flow (64 × 3 block sizes), faults inside loops (846 × 3), code-cache/SMC probes (85) |
 | `tools/fexc/upstream_tests/run_asm.py` | FEX's ASM suite (235 admitted tests; 372 since I1, 376 after I7, 443 since I2, 480 since I3, 781 since I5a) |
-| `tools/run_slice3_vm.py MODE` | `corpora`, `smp`, `limits`, `kicks`, `system`, `coherence`, `sharedpt`, `litmus`, `contain`, `privilege` (U1), `delivery` (X1a) |
+| `tools/run_slice3_vm.py MODE` | `corpora`, `smp`, `limits`, `kicks`, `system`, `coherence`, `sharedpt`, `litmus`, `contain`, `privilege` (U1), `delivery` (X1a), `events` (X2: interrupt eligibility, shadows, POPF, HLT, NMI, #AC; QEMU x2APIC programs, natemu-only cases, random-time stress) |
 | `tools/check_resident_stack.py` | resident stack bound and gate/ERET binary shape of the built runtime |
 | `tools/models/` | independent ordering, coherence, PAE and modes models (used by the runners) |
 
@@ -47,7 +47,7 @@ the phase-end ones):
 ```sh
 # From the repository root; works in zsh and bash (no word-splitting of variables; run in full under zsh and
 # argument-checked under bash at the phase end).
-F=../natemu-raw/fexc-native-20261026-01/series20/obj/fexc   # tools/fexc/build.sh rebuilds it
+F=../natemu-raw/fexc-native-20261026-01/series22/obj/fexc   # tools/fexc/build.sh rebuilds it; S3's `system` programs (RDRAND/RDSEED/RDPID) need series21-s3 or later, X2's BT* #AC cases series22
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 O=../natemu-raw/suite-$(date +%Y%m%d-%H%M%S)                  # a fresh output directory
@@ -78,6 +78,7 @@ s3 --out "$O/litmus" litmus --k 5000 --runs 1 --parallel 2
 s3 --out "$O/contain" contain
 s3 --out "$O/privilege" privilege
 s3 --out "$O/delivery" delivery                               # X1a: nested faults, #DF, shutdown, gates (delivery_model)
+s3 --out "$O/events" events --kicks 2000                       # X2: eligibility, shadows, POPF, HLT, NMI, #AC, stress (delivery_model)
 ```
 
 QEMU references run in the pinned container image (`tools/reference/ref.py` holds the pins) or Homebrew

@@ -329,7 +329,7 @@ static void ResetGlobals() {
   W = {};
   fexc_sites.clear(); fexc_insns.clear(); fexc_cf_inverted.clear(); fexc_spill_bytes = 0; fexc_cut = {}; fexc_after_rep = 0;
   fexc_rip_relative.clear(); fexc_target_check.clear(); fexc_div_width.clear(); fexc_movs.clear(); fexc_lock_cas.clear();
-  fexc_align16.clear(); fexc_sse_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear();
+  fexc_align16.clear(); fexc_sse_gated = false; fexc_alignment_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear();
 }
 
 // The CLI's body. `args` are the command-line arguments (args[0] is the program name); `given` replaces --hex/--file with the
@@ -368,6 +368,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     else if (a == "--no-end-marker") st.end_marker = false;
     else if (a == "--no-tso") st.tso = false;
     else if (a == "--sse-gated") fexc_sse_gated = true;   // slice1 (I5a): CR0.EM/TS or no CR4.OSFXSR: SSE forms are system cuts
+    else if (a == "--alignment-gated") fexc_alignment_gated = true;   // slice1 (X2): alignment checking on: BT* memory forms are system cuts
     else if (a == "--feature") { std::string v = next(); auto eq = v.find('='); if (eq == std::string::npos) return Fail("--feature NAME=0|1"); overrides.push_back({v.substr(0, eq), v.substr(eq + 1) != "0"}); }
     else if (a == "--config") { std::string v = next(); auto eq = v.find('='); Config::ConfigOption o; if (eq == std::string::npos || !ConfigOptionByName(v.substr(0, eq), o)) return Fail("--config NAME=VALUE (NAME: a FEX config option, e.g. X87REDUCEDPRECISION)"); configs.push_back({v.substr(0, eq), v.substr(eq + 1)}); }
     else if (a == "--out") out = next();
@@ -375,7 +376,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     else return Fail("unknown argument " + a);
   }
   if (!missing.empty()) return Fail(missing + " needs a value");
-  if (!have_rip || (!given && hex.empty() == file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
+  if (!have_rip || (!given && hex.empty() == file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--alignment-gated] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
   if (bitness != 32 && bitness != 64) return Fail("--bitness must be 32 or 64");
   const bool slice1 = st.profile == "slice1";
   if (slice1 && bitness != 64) return Fail("profile slice1 is 64-bit only");

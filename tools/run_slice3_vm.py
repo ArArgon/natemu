@@ -692,7 +692,19 @@ QEMU_DIFFERS = {'sysfault-rdpmc@1': 'QEMU raises #UD for RDPMC at CPL 0 (unimple
                 'seg-ltr-null@1': 'QEMU loads a null TR; SDM LTR: #GP(0) for a null selector',
                 'seg-call-far-noncanonical@1': 'QEMU commits the call and faults at the fetch of the non-canonical RIP; SDM CALL: #GP(0) at the CALL',
                 'seg-lret-noncanonical@1': 'QEMU commits the return and faults at the fetch of the non-canonical RIP; SDM RET: #GP(0) at the RET',
-                'seg-iret-null-ss-rpl@1': 'QEMU accepts the null SS with RPL != the new CPL and does not reach the end (timeout); SDM IRET 64-bit mode exceptions: #GP(0) (segment_model B6)'}
+                'seg-iret-null-ss-rpl@1': 'QEMU accepts the null SS with RPL != the new CPL and does not reach the end (timeout); SDM IRET 64-bit mode exceptions: #GP(0) (segment_model B6)',
+                # S3 (syscall_model): the profile's CPU (Intel, CPU 16) where pinned QEMU's -cpu max or its helpers differ.
+                'sc-sysret-noncanonical@1': "QEMU commits SYSRET and faults at the fetch of the non-canonical RIP (AMD's behaviour); Intel SDM SYSRET: #GP(0) at CPL 0 before the switch (syscall_model C4)",
+                'sc-wrfsbase-noncanonical@1': 'QEMU loads a non-canonical FS base; SDM WRFSBASE: #GP(0)',
+                'sc-wrgsbase-noncanonical-cpl3@1': "QEMU loads a non-canonical GS base and its stub's fault handler, which uses GS, does not finish; SDM WRGSBASE: #GP(0)",
+                'sc-rdseed@1': 'QEMU -cpu max implements RDSEED; the profile does not advertise it (CPUID.7.0:EBX.RDSEED = 0): #UD',
+                'sc-rdpid-cpl3@1': 'QEMU -cpu max implements RDPID; the profile does not advertise it (CPUID.7.0:ECX.RDPID = 0): #UD',
+                'sc-clflushopt@1': 'QEMU -cpu max implements CLFLUSHOPT; the profile does not advertise it: #UD',
+                'sc-wbinvd-cpl3@1': 'QEMU executes WBINVD at CPL 3; SDM WBINVD: #GP(0) if CPL > 0',
+                'sc-invd-cpl3@1': 'QEMU executes INVD at CPL 3; SDM INVD: #GP(0) if CPL > 0',
+                'sc-clflush-noncanonical@1': 'QEMU makes no access for CLFLUSH; SDM CLFLUSH (faults of a byte load): #GP(0) for a non-canonical address',
+                'sc-clflush-noncanonical-rbp@1': 'QEMU makes no access for CLFLUSH; SDM CLFLUSH: #SS(0) for a non-canonical address through RBP',
+                'sc-clflush-supervisor-cpl3@1': 'QEMU makes no access for CLFLUSH; SDM CLFLUSH: #PF(5) for a CPL 3 byte load of a supervisor page'}
 
 
 # ---- S1: the presented CPU, judged by tools/models/cpu_profile.py (QEMU presents its own CPU) --------------------------------
@@ -966,7 +978,7 @@ def cmd_delivery(a, host, runtime):
 
 def cpl3_cases():
     """(name, description, check(out) -> problems): CPUID and RDTSC/RDTSCP run at CPL3; with CR4.TSD both are #GP(0) at
-    CPL3 (SDM Vol.2 RDTSC, RDTSCP); CR0.AM with RFLAGS.AC at CPL3 is refused. One vCPU, the driver's user space; the CPL
+    CPL3 (SDM Vol.2 RDTSC, RDTSCP); CR0.AM with RFLAGS.AC at CPL3 gives #AC(0) on a misaligned load (X2). One vCPU, the driver's user space; the CPL
     drops through a `switch` nop."""
     from models import cpu_profile as cp
     want = cp.load().cpuid(1)
@@ -985,15 +997,17 @@ def cpl3_cases():
             f = out.get('fault')
             return [] if out['stop'] == 'guest_fault' and [smp.num(x) for x in f] == [13, 0, 0, at] else [f"{out['stop']} {out['reason']} {f}"]
         cases.append((f'tsd-cpl3-{name}', f"cpl 0\nrip 0x110000\nswitch {0x110000 + len(head):#x} 3\ncode {code.hex()}\n", gp))
-    # Alignment checking (CR0.AM, RFLAGS.AC, CPL 3: #AC on a misaligned access) is not built: entering that state is
-    # refused (`unsupported_mode`) at the change; AM and AC at CPL 0, or AM without AC at CPL 3, run.
+    # Alignment checking (CR0.AM, RFLAGS.AC, CPL 3): a misaligned access is #AC(0) (X2; before it, entering the state was
+    # refused); AM and AC at CPL 0, or AM without AC at CPL 3, run.
     head = ref.assemble('mov rax, cr0\nbts rax, 18\nmov cr0, rax\nmov rbx, 1')
     tail = ref.assemble('mov rcx, [rip+1]\ncmp r11, r11')                # a misaligned load (no #AC without AC)
     code, at = head + b'\x90' + tail, 0x110000 + len(head)
 
+    # X2 builds #AC: the misaligned load at CPL 3 is #AC(0) (the state before it: RBX = 1).
     def refused(out):
-        return [] if out['stop'] == 'resident' and out['reason'].startswith('unsupported_mode') and smp.num(out['gpr'][3]) == 1 \
-            else [f"{out['stop']} {out['reason']} at {out['rip']}"]
+        f = out.get('fault')
+        return [] if out['stop'] == 'guest_fault' and [smp.num(x) for x in f] == [17, 0, 0, at + 1] and smp.num(out['gpr'][3]) == 1 \
+            else [f"{out['stop']} {out['reason']} at {out['rip']} {f}"]
 
     def runs(out):
         return [] if out['stop'] == 'reached' else [f"{out['stop']} {out['reason']} at {out['rip']}"]
@@ -1002,7 +1016,256 @@ def cpl3_cases():
     return cases
 
 
-def segment_runs(a, host, runtime, qemu, report, failures):
+# ---- X2: events (interrupt eligibility, shadows, POPF, IRETQ, HLT, NMI) ---------------------------------------------------
+QEMU_EVENTS_RF = ('QEMU pushes RF = 1 in the frame of every external interrupt and NMI; the SDM (and delivery_model) push '
+                  'the current RF (1 only between REP iterations): QEMU frames are judged without RF')
+
+
+def event_logs(prog, cpus_memory):
+    """Per CPU, its log entries (from each CPU's captured memory {addr: bytes})."""
+    import events
+    return [events.log(m[events.LOG(i)]) for i, m in enumerate(cpus_memory)]
+
+
+def x2_cases():
+    """natemu-only X2 cases (name, description, check(out) -> problems), judged by the SDM rules the delivery and system
+    models state: one vCPU on the driver's logging IDT (a delivered exception ends the run with its record)."""
+    def fault(vector, at):
+        def check(out):
+            f = out.get('fault')
+            return [] if out['stop'] == 'guest_fault' and [smp.num(x) for x in f] == [vector, 0, 0, at] else [f"{out['stop']} {out['reason']} {f}"]
+        return check
+
+    def reached(**want):
+        def check(out):
+            g = {r: smp.num(out['gpr'][smp.REGS.index(r)]) for r in want}
+            ok = out['stop'] == 'reached' and g == want
+            return [] if ok else [f"{out['stop']} {out['reason']} at {out['rip']} {({k: hex(v) for k, v in g.items()})}"]
+        return check
+
+    def halted(at):
+        def check(out):
+            ok = out['stop'] == 'resident' and out['reason'].startswith('halted') and smp.num(out['rip']) == at
+            return [] if ok else [f"{out['stop']} {out['reason']} at {out['rip']} (want halted at {at:#x})"]
+        return check
+
+    def refused(reason):
+        def check(out):
+            return [] if out['stop'] == 'resident' and out['reason'].startswith(reason) else [f"{out['stop']} {out['reason']} at {out['rip']}"]
+        return check
+    cases, base = [], 0x110000
+    stack = 'region 0x200000 0x1000\ngpr ' + ' '.join(['0'] * 4 + ['0x201000'] + ['0'] * 11) + '\n'
+    # CLI/STI at CPL 3 with IOPL < 3: #GP(0) (no VME/PVI); with IOPL = 3 they run; HLT at CPL 3: #GP(0).
+    for insn in ('cli', 'sti', 'hlt'):
+        for iopl in (0, 3):
+            code = ref.assemble(f'nop\n{insn}\nmov rbx, 1\ncmp r11, r11')
+            check = reached(rbx=1) if iopl == 3 and insn != 'hlt' else fault(13, base + 1)
+            cases.append((f'x2-{insn}-cpl3-iopl{iopl}', f'cpl 3\nrflags {iopl << 12:#x}\nrip {base:#x}\ncode {code.hex()}\n', check))
+    # POPF at CPL 3, IOPL 0: IF and IOPL unchanged, the other flags written (AC, ID, DF, arithmetic); at IOPL 3, IF written.
+    popf = 'push {v:#x}\npopfq\npushfq\npop rbx\ncmp r11, r11'
+    for iopl, v, want in ((0, 0x243cd5 & ~0x200, 0x240cd7 | 0x200), (0, 0x3000, 0x202), (3, 0x3000, 0x3002)):
+        code = ref.assemble(popf.format(v=v))
+        cases.append((f'x2-popf-cpl3-iopl{iopl}-{v:#x}', f'cpl 3\nrflags {iopl << 12:#x}\nrip {base:#x}\n{stack}code {code.hex()}\n', reached(rbx=want)))
+    # POPF at CPL 0 writes IOPL and IF; RF, VM, VIF, VIP stay; a 16-bit POPF writes only bits 15:0.
+    for v, size, want in ((0x1f3eff, 8, 0x43ed7), (0x1f3eff, 2, 0x3ed7)):
+        # push imm32 (sign-extended) + popfq, or push imm16 (66 68 iw) + popfw (66 9d)
+        pop = b'\x68' + v.to_bytes(4, 'little') + b'\x9d' if size == 8 else b'\x66\x68' + (v & 0xffff).to_bytes(2, 'little') + b'\x66\x9d'
+        code = pop + ref.assemble('pushfq\npop rbx\ncli\ncmp r11, r11')
+        cases.append((f'x2-popf{size * 8}-cpl0', f'cpl 0\nrip {base:#x}\n{stack}code {code.hex()}\n', reached(rbx=want)))
+    # POPF setting TF: single-step is S4's (refused before any effect). LOCK CLI: #UD.
+    popf_tf = ref.assemble('push 0x102\npopfq')
+    cases.append(('x2-popf-tf', f'cpl 0\nrip {base:#x}\n{stack}code {popf_tf.hex()}\n', refused('unsupported_system')))
+    lock_cli = bytes([0x90, 0xf0, 0xfa]) + ref.assemble('cmp r11, r11')
+    cases.append(('x2-lock-cli', f'cpl 0\nrip {base:#x}\ncode {lock_cli.hex()}\n', fault(6, base + 1)))
+    # HLT with no event that can wake it: IF = 0 and an interrupt pending (masked, model A10), or nothing pending. The
+    # driver ends the run (`halted`) with RIP after the HLT.
+    for name, text in (('masked', 'cli\nnop\nhlt\nnop'), ('idle', 'cli\nhlt\nnop')):
+        code = ref.assemble(text + '\ncmp r11, r11')
+        at = base + len(ref.assemble(text.rsplit('\n', 1)[0]))
+        post = f'post {base + 1:#x} 0x40\n' if name == 'masked' else ''
+        cases.append((f'x2-hlt-{name}', f'cpl 0\nrip {base:#x}\n{post}code {code.hex()}\n', halted(at)))
+    cases += ac_cases(fault, reached, refused)
+    return cases
+
+
+def ac_cases(fault, reached, refused):
+    """#AC (X2): CR0.AM set at CPL 0, RFLAGS.AC from the start, then a `switch` to CPL 3 and one access. Judged by the SDM
+    (Vol.3 7.15 #AC, Table 7-7: a fault, error code 0, nothing written; only CPL 3 data accesses; the canonical check
+    first). QEMU does not implement alignment checking, so it is no reference here. Where the SDM gives no order between #AC
+    and #PF (a misaligned access to a page not present), natemu gives #AC (the access is checked before any walk)."""
+    base, cases = 0x110000, []
+    head = ref.assemble('mov rax, cr0\nbts rax, 18\nmov cr0, rax\nxor eax, eax')
+    at = base + len(head) + 1
+    regs = lambda rsp: 'gpr ' + ' '.join(['0', '0', '0', '0x200000', f'{rsp:#x}'] + ['0'] * 11)
+    region = 'region 0x200000 0x2000\n'
+
+    def case(name, body, check, rflags=0x40000, rsp=0x201800, am=True, extra=''):
+        h = head if am else ref.assemble('xor eax, eax')
+        code = h + b'\x90' + body + ref.assemble('cmp r11, r11')
+        cases.append((f'x2-ac-{name}', f'cpl 0\nrflags {rflags:#x}\nrip {base:#x}\nswitch {base + len(h):#x} 3\n{region}{regs(rsp)}\n{extra}code {code.hex()}\n',
+                      check))
+    asm = ref.assemble
+    for name, text in (('load8', 'mov rcx, [rbx+1]'), ('load4', 'mov ecx, [rbx+2]'), ('load2', 'mov cx, [rbx+3]'),
+                       ('store8', 'mov [rbx+4], rbx'), ('store2', 'mov [rbx+1], bx'), ('rmw4', 'add [rbx+1], ecx'),
+                       ('lock-xadd8', 'lock xadd [rbx+0xc], rcx'), ('xchg4', 'xchg [rbx+0xe], ecx'),
+                       ('movsq', 'lea rsi, [rbx+0x100]\nlea rdi, [rbx+0x203]\nmov ecx, 4\nrep movsq'),
+                       ('cross-page-store8', 'mov [rbx+0xffd], rbx'), ('cross-page-load4', 'mov ecx, [rbx+0x1ffe]'),
+                       ('movsd8', 'movq xmm0, [rbx+4]'), ('movups4', 'movups xmm0, [rbx+4]')):
+        insn = asm(text)
+        last = len(asm(text.rsplit('\n', 1)[0])) if '\n' in text else 0
+        case(name, insn, fault(17, at + last), extra='sse 1\n' if 'xmm' in text else '')
+    # The canonical check first (#GP(0)); a page not present (natemu: #AC first); a push at a misaligned RSP; POPF (the
+    # resident's explicit CPL 3 access) at a misaligned RSP.
+    case('noncanonical', asm('mov rcx, 0x8000000000000001\nmov rdx, [rcx]'), fault(13, at + 10))
+    case('not-present', asm('mov rcx, [rbx+0x3001]'), fault(17, at))
+    case('push', asm('push rbx'), fault(17, at), rsp=0x201801)
+    case('popf', asm('popfq'), fault(17, at), rsp=0x201804)
+    # No #AC: aligned, bytes, AC cleared by POPF at CPL 3 (AC is writable there), AM clear, CPL 0 (no switch effect needed:
+    # the access before the switch), an 8-byte aligned 16-byte MOVUPS (the SDM permits no #AC there: refused, not built).
+    case('aligned', asm('mov rcx, [rbx+8]\nmov [rbx+16], ecx\nmov dx, [rbx+2]\nmov al, [rbx+1]\nmov ebx, 1'), reached(rbx=1))
+    case('popf-clears-ac', asm('push 0x202\npopfq\nmov rcx, [rbx+1]\nmov ebx, 1'), reached(rbx=1))
+    case('am-clear', asm('mov rcx, [rbx+1]\nmov ebx, 1'), reached(rbx=1), am=False)
+    case('movups8', asm('movups xmm0, [rbx+8]'), refused('unsupported_mode'), extra='sse 1\n')
+    # BT/BTS/BTR/BTC on memory (fexc cuts them under alignment checking: FEX touches one byte): #AC(0) when the operand is
+    # misaligned at its size (with a register bit offset, the unit it selects has EA's alignment), else they run (results
+    # checked), with LOCK too; AM clear: no #AC.
+    for name, text in (('bt4-odd', 'bt dword ptr [rbx+1], ecx'), ('bt2-odd', 'bt word ptr [rbx+1], cx'),
+                       ('bts8-imm-4', 'bts qword ptr [rbx+4], 5'), ('btc4-reg-far', 'mov ecx, 0x1000\nbtc dword ptr [rbx+2], ecx'),
+                       ('lock-btr4-odd', 'lock btr dword ptr [rbx+3], ecx')):
+        last = len(asm(text.rsplit('\n', 1)[0])) if '\n' in text else 0
+        case(name, asm(text), fault(17, at + last))
+    bts = 'mov dword ptr [rbx+8], 0\nmov ecx, 37\nbts dword ptr [rbx+4], ecx\nlock btc word ptr [rbx+8], 6\nbt qword ptr [rbx+8], 7\nsetnc dl\nmov eax, [rbx+8]'
+    case('bt-aligned', asm(bts + '\nmov ebx, 1'), reached(rax=0x60, rdx=1, rbx=1))
+    case('bt-odd-am-clear', asm('bt dword ptr [rbx+1], ecx\nmov ebx, 1'), reached(rbx=1), am=False)
+    # A null DS override (3e) on the BT form: decoded as without it (64-bit mode), misaligned #AC, aligned runs.
+    case('bt-ds-odd', bytes.fromhex('3e0fa34b01'), fault(17, at))
+    case('bt-ds-aligned', bytes.fromhex('3e0fa34b04') + asm('mov ebx, 1'), reached(rbx=1))
+    # SYSRET (S3) returning to CPL 3 with AC from R11 and CR0.AM: it completes, and the next misaligned access is #AC(0).
+    sysret, labels = asm('mov rax, cr0\nbts rax, 18\nmov cr0, rax\nmov ecx, 0xc0000080\nrdmsr\nor eax, 1\nwrmsr\n'
+                         'mov ecx, 0xc0000081\nxor eax, eax\nmov edx, 0x00100000\nwrmsr\nlea rcx, [rip + user]\n'
+                         'mov r11d, 0x40202\nsysretq\nuser:\nmov rdx, [rbx+1]\ncmp r11, r11', labels=True)
+    cases.append(('x2-ac-after-sysret', f'cpl 0\nrip {base:#x}\n{region}{regs(0x201800)}\ncode {sysret.hex()}\n',
+                  fault(17, base + labels['user'])))
+    cpl0 = head + asm('mov rcx, [rbx+1]\nmov ebx, 1\ncmp r11, r11')
+    cases.append(('x2-ac-cpl0', f'cpl 0\nrflags 0x40000\nrip {base:#x}\n{region}{regs(0x201800)}\ncode {cpl0.hex()}\n', reached(rbx=1)))
+    return cases
+
+
+def cmd_events(a, host, runtime):
+    """X2: the event programs (tools/bench/smp/events.py) on QEMU and natemu at 1, 2 and 4 vCPUs and block sizes default
+    and 1, every logged delivery judged by delivery_model; natemu-only cases (faults, refusals, HLT without a wake);
+    stress: events posted at random times into the stress loop and the HLT loop at 1-4 vCPUs."""
+    import events
+    stub = smp.build_stub(a.out / 'qemu-build')
+    failures, report = [], []
+    names = [k for k in events.PROGRAMS if not a.programs or any(p in k for p in a.programs)]
+    for name in names:
+        for n in (1, 2, 4):
+            prog = events.make(name, n)
+            label = f'{name}@{n}'
+            rc, err, dump, _ = smp.run_image(prog['qemu'], smp.build_image(prog['qemu'], stub), a.out / 'qemu' / label, 'multi', timeout=60)
+            want = smp.parse_dump(prog['qemu'], dump) if rc == 1 else None
+            entry = {'name': label, 'runs': []}
+            if want is None:
+                failures.append(f'{label}: QEMU run failed ({rc} {err})')
+            else:
+                qlogs = [[(e[0], e[1], e[2], e[3] & ~events.RF, *e[4:]) for e in events.log(m['data'])] for m in want['memory'][:n]]
+                entry['qemu'] = events.judge(prog, qlogs)
+                failures += [f'{label}: QEMU vs delivery_model: {d}' for d in entry['qemu']]
+            for limit in ([], [1]):
+                text = events.description(prog['natemu'], prog['hooks'])
+                rc, out, err = driver(host, runtime, a.fexc, text, a.out / 'work' / f"{label}{'-1' if limit else ''}", limit)
+                if rc:
+                    diffs = [f'driver exit {rc}: {err.strip()[-300:]}']
+                else:
+                    diffs = []
+                    for v, c in enumerate(out['cpus']):
+                        end = body_end(prog['natemu'], smp.num(prog['natemu']['cpus'][v]['rip']))
+                        if c['stop'] != 'reached' or smp.num(c['rip']) != end:
+                            diffs.append(f"cpu{v} stopped {c['stop']} {c['reason']} at {c['rip']} (end {end:#x})")
+                        diffs += [f'cpu{v} ' + d for d in per_vcpu_checks(c)]
+                    mems = [{smp.num(m['addr']): bytes.fromhex(m['data']) for m in c['memory']} for c in out['cpus']]
+                    diffs += events.judge(prog, event_logs(prog, [mems[0]] * n))
+                    if want is not None:
+                        got = {'cpus': [{'gpr': [smp.num(x) for x in c['gpr']], 'rflags': smp.num(c['rflags']), 'fault': None} for c in out['cpus']], 'memory': []}
+                        diffs += smp.compare(prog['qemu'], got, {'cpus': want['cpus'], 'memory': []})
+                entry['runs'].append({'max_block': limit[0] if limit else None, 'diffs': diffs})
+                failures += [f"{label}{' (max-block 1)' if limit else ''}: {d}" for d in diffs]
+            bad = any(r['diffs'] for r in entry['runs']) or entry.get('qemu')
+            print(f"{label}: {'FAIL' if bad else 'ok'}", *[d for r in entry['runs'] for d in r['diffs']][:6], sep='\n  ', flush=True)
+            report.append(entry)
+    for name, text, check in ([] if a.programs else x2_cases()):
+        for limit in ([], [1]):
+            rc, out, err = driver(host, runtime, a.fexc, text, a.out / 'work' / f"{name}{'-1' if limit else ''}", limit, timeout=60)
+            problems = check(out) if rc == 0 else [f'driver exit {rc}: {err.strip()[-300:]}']
+            print(f"{name}{' (max-block 1)' if limit else ''}: {'ok' if not problems else 'FAIL'} {problems}", flush=True)
+            report.append({'name': name, 'max_block': limit, 'problems': problems})
+            failures += [f'{name}: {p}' for p in problems]
+    if not a.programs or 'stress' in a.programs:
+        failures += events_stress(a, host, runtime, stub, report)
+    print(QEMU_EVENTS_RF)
+    for f in failures: print(f)
+    (a.out / 'events.json').write_text(json.dumps({'report': report, 'failures': failures, 'qemu_differs': QEMU_EVENTS_RF}, indent=1, default=str) + '\n')
+    return len(failures)
+
+
+def events_stress(a, host, runtime, stub, report):
+    """Random-time events (the driver's kickers post 0x40, 0x41, 0x50 or an NMI before each doorbell) into the stress loop
+    (REP strings, shadows) and the HLT loop, at 1, 2 and 4 vCPUs and block sizes default and 1: every logged delivery
+    judged (events.stress_check: all of them, and no event a shadow held taken late); the stress loop's registers and data equal QEMU's run without events; the HLT loop ends
+    (all its HLTs woken) or is ended halted by the driver after the kicks (RIP after a HLT)."""
+    import events
+    failures = []
+    kicks = a.kicks or 2000
+    for name, iterations in (('stress', 400), ('hlt', kicks // 2)):
+        for n in (1, 2, 4):
+            prog = events.stress(name, n, iterations)
+            label = f'ev-{name}@{n}'
+            want = None
+            if name == 'stress':
+                rc, err, dump, _ = smp.run_image(prog['qemu'], smp.build_image(prog['qemu'], stub), a.out / 'qemu' / label, 'multi', timeout=120)
+                want = smp.parse_dump(prog['qemu'], dump) if rc == 1 else None
+                if want is None: failures.append(f'{label}: QEMU run failed ({rc} {err})')
+            for limit in ([], [1]):
+                extra = limit + [x for v in range(n) for x in ('--kick-vcpu', v)] + ['--kicks', kicks, '--kick-jitter-us', 30,
+                                                                                     '--kick-events', '0x40,0x41,0x50,nmi']
+                text = events.description(prog['natemu'], prog['hooks'])
+                rc, out, err = driver(host, runtime, a.fexc, text, a.out / 'work' / f"{label}{'-1' if limit else ''}", extra, timeout=600)
+                diffs, delivered, coverage = [], [], collections.Counter()
+                if rc:
+                    diffs.append(f'driver exit {rc}: {err.strip()[-300:]}')
+                else:
+                    labels = prog['labels']
+                    for v, c in enumerate(out['cpus']):
+                        end = body_end(prog['natemu'], smp.num(prog['natemu']['cpus'][v]['rip']))
+                        stopped_ok = c['stop'] == 'reached' and smp.num(c['rip']) == end
+                        if name == 'hlt' and c['stop'] == 'resident' and c['reason'].startswith('halted'):
+                            stopped_ok = smp.num(c['rip']) == labels[v]['after_hlt']
+                        if not stopped_ok: diffs.append(f"cpu{v} stopped {c['stop']} {c['reason']} at {c['rip']}")
+                        diffs += [f'cpu{v} ' + d for d in per_vcpu_checks(c) + kick_checks(c)]
+                        mem = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in out['cpus'][0]['memory']}
+                        entries = events.log(mem[events.STRESS_LOG_AT(v)])
+                        count = int.from_bytes(mem[events.EV(v) + 0x1000][0x20:0x28], 'little')
+                        delivered.append(count)
+                        for k in ('interrupts', 'nmis', 'halts', 'shadow_steps'): coverage[k] += c['stats'][k]
+                        if c['stats']['interrupts'] + c['stats']['nmis'] != count:
+                            diffs.append(f"cpu{v}: the resident delivered {c['stats']['interrupts']} + {c['stats']['nmis']}, the handlers logged {count}")
+                        diffs += events.stress_check(prog, v, entries, count, coverage, c['stats']['shadow_steps'])
+                        if count > kicks: diffs.append(f'cpu{v}: {count} deliveries for {kicks} events posted')
+                    if want is not None:
+                        got = vm_state(prog['natemu'], out)
+                        keep = lambda st: {'cpus': st['cpus'], 'memory': [m for m in st['memory'] if any(m['addr'] == events.DATA(i) for i in range(n))]}
+                        for c in got['cpus']: c['fault'] = None
+                        diffs += smp.compare(prog['qemu'], keep(got), keep(want))
+                print(f"{label}{' (max-block 1)' if limit else ''}: {'ok' if not diffs else 'FAIL'} delivered {delivered}, "
+                      f"judged: {dict(coverage)}",
+                      *diffs[:8], sep='\n  ', flush=True)
+                report.append({'name': label, 'max_block': limit, 'delivered': delivered, 'coverage': coverage, 'diffs': diffs})
+                failures += [f'{label}: {d}' for d in diffs]
+    return failures
+
+
+def segment_runs(a, host, runtime, qemu, report, failures, progs=None):
     """S2b (tools/bench/smp/segments.py): descriptor tables, segment loads and far transfers at block sizes default and 1.
     Positive programs (1, 2 and 4 vCPUs) and fault cases against QEMU system mode (registers, captured memory, fault);
     every fault case's outcome (fault (vector, error, RIP, CR2) or completion) must be one segment_model permits, for
@@ -1011,7 +1274,7 @@ def segment_runs(a, host, runtime, qemu, report, failures):
     instruction; QEMU is not run for them. The LTR race (natemu only) runs 10 times per block size: exactly one vCPU
     loads TR, every other takes #GP(0x70) at its LTR."""
     import segments
-    for prog in segments.programs():
+    for prog in progs if progs is not None else segments.programs():
         name, model = prog['name'], prog['params'].get('model')
         if a.programs and not any(n in name for n in a.programs):
             continue
@@ -1030,7 +1293,7 @@ def segment_runs(a, host, runtime, qemu, report, failures):
             report.append(entry)
             continue
         if model and model['outcome'] == 'refused':
-            want_stop = 'unsupported_mode' if model['reason'].startswith('compatibility') else 'unsupported_system'
+            want_stop = prog['params'].get('stop') or ('unsupported_mode' if model['reason'].startswith('compatibility') else 'unsupported_system')
             for limit in ([], [1]):
                 rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f"{name}{'-1' if limit else ''}", limit)
                 cpu = out and out['cpus'][0]
@@ -1080,6 +1343,15 @@ def segment_runs(a, host, runtime, qemu, report, failures):
                     diffs.append(f"fault {g} not permitted by segment_model {sorted(permitted, key=str)}")
                 if permitted is None or g == want['cpus'][0]['fault']:
                     diffs += smp.compare(prog, got, want)
+                # S3: result bytes the model gives (syscalls.py's LAR/LSL/VERR/VERW tables): one of the permitted images.
+                if prog['params'].get('model_memory'):
+                    captured = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in out['cpus'][0]['memory']}
+                    for addr, images in prog['params']['model_memory'].items():
+                        at = smp.num(addr)
+                        start = max(x for x in captured if x <= at)
+                        image = captured[start][at - start:at - start + 16].hex()
+                        if image not in images:
+                            diffs.append(f'{addr}: {image} not permitted by syscall_model {images}')
             entry['runs'].append({'max_block': limit[0] if limit else None, 'diffs': diffs})
             failures.extend(f"{name}{' (max-block 1)' if limit else ''}: {d}" for d in diffs)
         bad = any(r['diffs'] for r in entry['runs'])
@@ -1173,6 +1445,8 @@ def cmd_system(a, host, runtime):
               + (f"; history {entry['either']}" if 'either' in entry else ''), flush=True)
         report.append(entry)
     segment_runs(a, host, runtime, qemu, report, failures)
+    import syscalls
+    segment_runs(a, host, runtime, qemu, report, failures, syscalls.programs())
     # Refusals: the vCPU stops `unsupported_system` at the instruction, after the prefix.
     for name, code in ([] if a.programs else unsupported_cases().items()):
         text = f'cpl 0\nrip 0x110000\ncode {code}\n'
@@ -1771,7 +2045,7 @@ def cmd_contain(a, host, runtime):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=['corpora', 'smp', 'litmus', 'limits', 'kicks', 'system', 'coherence', 'sharedpt', 'contain', 'privilege', 'delivery'])
+    ap.add_argument('mode', choices=['corpora', 'smp', 'litmus', 'limits', 'kicks', 'system', 'coherence', 'sharedpt', 'contain', 'privilege', 'delivery', 'events'])
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--cpus', type=int, nargs='+', default=[2, 3, 4])
@@ -1809,7 +2083,7 @@ def main():
         global CODE_SHAPE
         CODE_SHAPE = []   # containment holds with object validation alone (the host's default)
     if a.mode == 'kicks' and a.kicks is None: a.kicks = 10_000
-    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'litmus': cmd_litmus, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'coherence': cmd_coherence, 'sharedpt': cmd_sharedpt, 'contain': cmd_contain, 'privilege': cmd_privilege, 'delivery': cmd_delivery}[a.mode](a, host, runtime)
+    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'litmus': cmd_litmus, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'coherence': cmd_coherence, 'sharedpt': cmd_sharedpt, 'contain': cmd_contain, 'privilege': cmd_privilege, 'delivery': cmd_delivery, 'events': cmd_events}[a.mode](a, host, runtime)
     print('failures:', failed)
     sys.exit(1 if failed else 0)
 
