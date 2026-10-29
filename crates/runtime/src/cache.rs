@@ -8,16 +8,20 @@
 //! global area shared by all vCPUs: its bits in the code-page and writable masks,
 //! the invalidation records it posts to and drains, and its shadow-reset counter.
 //! Every global update is an atomic read-modify-write (SeqCst). The code area's head
-//! holds the stop pad, the slot and the dispatcher (`gates.S` `dispatch_template`), which probes L1 directly.
+//! holds the slot and the dispatcher (`gates.S` `dispatch_template`), which probes L1 directly. A precise stop arms
+//! the interrupted block by patching its exits to [`STOP_WORD`] ([`arm`], [`disarm`]). Blocks and L1 are this
+//! vCPU's own (its code area is backed by its own memory), so a patch stops no other vCPU.
 use super::*;
 use natemu_abi::code_object::{Header, Site};
 use core::mem::align_of;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering::SeqCst};
 use natemu_abi::execution::{
-    ENTRY_OFFSET, GUEST_PAGES, LinkPoint, MAX_LINK_POINTS, STATE_VA, STOP_BL, State,
+    ENTRY_OFFSET, GUEST_PAGES, KICK_SGI, LinkPoint, MAX_LINK_POINTS, STATE_VA, STOP_WORD, State,
     cache::{self as area, Control, LinkRecord, Record, SLOT, SLOT_BYTES, SLOT_VA, SLOT_WRITE_VA},
 };
-pub use natemu_abi::execution::cache::{Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, FLUSH, MAX_VCPUS, PAD_VA, PAGES, SHADOWS, STEP};
+pub use natemu_abi::execution::cache::{Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, HEAD_BYTES, MAX_VCPUS, PAGES, SHADOWS, STEP};
+/// L1's code (the dispatcher's head ends there).
+pub const L1_VA: u64 = CODE_VA + area::L1_CODE as u64;
 
 /// This vCPU's number (its state record's; checked below `MAX_VCPUS` at start).
 fn vcpu() -> usize {
@@ -40,7 +44,7 @@ const _: () = assert!(size_of::<Block>() % align_of::<Site>() == 0);
 fn lookup_area<T>(offset: usize) -> *mut T {
     (area::LOOKUP_VA + offset as u64) as *mut T
 }
-fn control() -> &'static mut Control {
+pub fn control() -> &'static mut Control {
     unsafe { &mut *lookup_area(area::CONTROL) }
 }
 /// {guest RIP, block number + 1}; 0 marks an empty slot.
@@ -139,14 +143,9 @@ fn clear_l1() {
     synchronize_code(area::CODE_WRITE_VA + l1_entry(0), area::CODE_VA + l1_entry(0), bytes);
 }
 
-/// Fills the code area's head once, before any block runs: the stop pad's `ret` (the rest of its granule stays zero,
-/// `udf`) and the dispatcher's code.
+/// Fills the code area's head once, before any block runs: the dispatcher's code.
 pub fn fill_head(dispatcher: &[u8]) {
-    unsafe {
-        ((area::CODE_WRITE_VA + area::PAD as u64) as *mut u32).write_volatile(0xd65f_03c0); // ret
-        copy_record((area::CODE_WRITE_VA + area::DISPATCH as u64) as *mut u8, dispatcher.as_ptr(), dispatcher.len());
-    }
-    synchronize_code(area::CODE_WRITE_VA + area::PAD as u64, PAD_VA, 4);
+    unsafe { copy_record((area::CODE_WRITE_VA + area::DISPATCH as u64) as *mut u8, dispatcher.as_ptr(), dispatcher.len()) };
     synchronize_code(area::CODE_WRITE_VA + area::DISPATCH as u64, area::DISPATCH_VA, dispatcher.len());
 }
 
@@ -182,7 +181,7 @@ pub fn lookup(rip: u64, context: [u64; 2]) -> Option<&'static Block> {
 }
 
 /// Places the admitted object at `object` (header `h`) for (`h.guest_rip`, `context`) with its guest-physical
-/// source pages and link points, relocates its stop `bl` and its computed exit's `b` (at `dispatch_exit`, 0 for none;
+/// source pages and link points, relocates its computed exit's `b` (at `dispatch_exit`, 0 for none;
 /// the reply was checked to hold the placeholders there), and enters it in L2. `None` when the code area, the metadata arena or the
 /// block index is full (the caller flushes and places again).
 pub fn place(
@@ -212,6 +211,7 @@ pub fn place(
         guest_bytes: h.guest_bytes,
         number: c.blocks as u32,
         flags: 0,
+        dispatch_exit: dispatch_exit as u32,
         links,
     };
     unsafe {
@@ -262,6 +262,7 @@ pub fn place_step(
         guest_bytes: h.guest_bytes,
         number: u32::MAX,
         flags: STEP,
+        dispatch_exit: dispatch_exit as u32,
         links,
     };
     unsafe {
@@ -309,16 +310,65 @@ fn rewrite(offset: u64, w: u32) {
 fn branch(from: u64, to: u64) -> u32 {
     0x1400_0000 | (to.wrapping_sub(from) >> 2) as u32 & 0x03ff_ffff
 }
-/// Relocates the placeholders of the block just copied to code-area offset `code` (before its code is synchronized):
-/// its stop check becomes `bl` to the stop pad, its computed exit (at `dispatch_exit`, 0 for none) `b` to the
-/// dispatcher. (The placeholders were checked at the reply.)
+/// Relocates the placeholder of the block just copied to code-area offset `code` (before its code is synchronized):
+/// its computed exit (at `dispatch_exit`, 0 for none) becomes `b` to the dispatcher. (The placeholder was checked at
+/// the reply.)
 fn relocate(code: u64, dispatch_exit: u64) {
-    let write = |at: u64, w: u32| unsafe { ((area::CODE_WRITE_VA + at) as *mut u32).write_volatile(w) };
-    let at = code + u64::from(STOP_BL);
-    write(at, 0x8000_0000 | branch(at, area::PAD as u64)); // bl
     if dispatch_exit != 0 {
         let at = code + dispatch_exit;
-        write(at, branch(at, area::DISPATCH as u64));
+        unsafe { ((area::CODE_WRITE_VA + at) as *mut u32).write_volatile(branch(at, area::DISPATCH as u64)) };
+    }
+}
+
+/// Arms a precise stop in `b` (the block the doorbell interrupted; live, or the step block): every exit's word (each
+/// link point's first word, linked or not, and the computed exit's `b`) becomes [`STOP_WORD`], recorded with its word
+/// for [`disarm`]. Every path out of a block passes one of them or enters the resident (`svc`, a stub, an abort):
+/// branches inside a block go forward and none enters a link point after its first word (admission).
+pub fn arm(b: &Block) {
+    let c = control();
+    let points = b.links.iter().filter(|p| p.offset != 0).map(|p| p.offset);
+    let exits = points.chain((b.dispatch_exit != 0).then_some(b.dispatch_exit));
+    for offset in exits {
+        let at = u64::from(b.code) + u64::from(offset);
+        c.armed_words[c.armed as usize] = [at as u32, word(at)];
+        c.armed += 1;
+        unsafe { ((area::CODE_WRITE_VA + at) as *mut u32).write_volatile(STOP_WORD) };
+    }
+    synchronize_words(c);
+}
+/// Restores the words [`arm`] patched (each must still hold [`STOP_WORD`]) and empties the record: at every resident
+/// entry from generated code, before anything reads or rewrites code. Returns the restored code-area offsets (the
+/// first `n`), or `None` (nothing restored) when the record is malformed.
+pub fn disarm() -> Option<([u32; MAX_LINK_POINTS + 1], usize)> {
+    let c = control();
+    let n = c.armed as usize;
+    let mut at = [0; MAX_LINK_POINTS + 1];
+    if n == 0 {
+        return Some((at, 0));
+    }
+    let words = c.armed_words.get(..n)?;
+    if words.iter().any(|&[o, _]| u64::from(o) >= c.code_bytes || o % 4 != 0 || word(u64::from(o)) != STOP_WORD) {
+        return None;
+    }
+    for (i, &[o, original]) in words.iter().enumerate() {
+        at[i] = o;
+        unsafe { ((area::CODE_WRITE_VA + u64::from(o)) as *mut u32).write_volatile(original) };
+    }
+    synchronize_words(c);
+    c.armed = 0;
+    Some((at, n))
+}
+/// The armed record's words become visible to instruction fetch (one barrier pair for all of them).
+fn synchronize_words(c: &Control) {
+    unsafe {
+        for &[o, _] in &c.armed_words[..c.armed as usize] {
+            asm!("dc cvau, {0}", in(reg) area::CODE_WRITE_VA + u64::from(o));
+        }
+        asm!("dsb ish");
+        for &[o, _] in &c.armed_words[..c.armed as usize] {
+            asm!("ic ivau, {0}", in(reg) area::CODE_VA + u64::from(o));
+        }
+        asm!("dsb ish", "isb");
     }
 }
 /// The link point's word is its admitted form (the first word of its RIP move).
@@ -413,9 +463,18 @@ fn post(peers: u8, gpa: u64) {
         kick(v);
     }
 }
-/// Asks the host to stop vCPU `v` at its next block entry (it then drains its record); returns at once.
+/// Rings vCPU `v`'s doorbell (SGI [`KICK_SGI`] to Aff0 = `v`, its MPIDR): it stops at its next block boundary and
+/// drains its record. The `dsb` makes this vCPU's record updates visible before the interrupt.
 pub fn kick(v: usize) {
-    unsafe { asm!("dsb sy", "hvc #{imm}", imm = const natemu_abi::execution::KICK_HVC, in("x0") v) };
+    let c = control();
+    let sgi = KICK_SGI << 24 | 1 << v;
+    let (t0, t1): (u64, u64);
+    unsafe {
+        asm!("dsb ish", "isb", "mrs {t0}, cntvct_el0", "msr S3_0_C12_C11_5, {sgi}", "isb", "mrs {t1}, cntvct_el0",
+             sgi = in(reg) sgi, t0 = out(reg) t0, t1 = out(reg) t1);
+    }
+    c.sgis += 1;
+    c.sgi_ticks += t1 - t0;
 }
 
 /// Invalidates every live block of this vCPU translated from `gpa`'s page (the page is about to be written, or was):
@@ -483,7 +542,7 @@ pub fn links_restored() -> bool {
 }
 
 /// The block whose code holds native address `pc` (the single-step block in the slot, or a cache block, dead ones too;
-/// never the head's pad or dispatcher).
+/// never the head's dispatcher or L1).
 pub fn block_at(pc: u64) -> Option<&'static Block> {
     if let Some(offset) = pc.checked_sub(SLOT_VA).filter(|&o| o < SLOT_BYTES as u64) {
         let b = step_block();

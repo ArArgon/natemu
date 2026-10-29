@@ -4,8 +4,8 @@
 //! copy the guest bytes at RIP from the guest-physical pages the resident walked, compile one block with fexc
 //! (`--profile slice1`, a persistent server), admit it and stage it. A step request
 //! (self-modifying code) is the same with a one-instruction block. A watchdog
-//! stops a vCPU that runs too long without a host exit. A kick ([`Stops`]) stops a
-//! running vCPU precisely at its next block entry.
+//! stops a vCPU that runs too long without a host exit. A kick ([`Stops`]) rings a
+//! vCPU's doorbell, which stops it precisely at its next block boundary in the VM.
 use super::*;
 use crate::admission;
 use natemu_abi::execution::{self as exec, Cpu, State, cache};
@@ -121,8 +121,10 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize) -> Result<Bac
 pub(crate) fn set_cpu(area: Area, cpu: Cpu) {
     area.write_record(exec::STATE_OFFSET, State::new(area.vcpu as u64, cpu));
 }
-/// Enters the vCPU at the resident in its window, its tables tagged with its own ASID (its number + 1).
-pub(crate) fn enter(cpu: &Vcpu, area: Area) -> Result<()> {
+/// Enters the vCPU at the resident in its window, its tables tagged with its own ASID (its number + 1), as GIC vCPU
+/// `area.vcpu` with its peer doorbell enabled (`doorbell`; disabled only by a test driver's never-answering peer).
+pub(crate) fn enter(cpu: &Vcpu, area: Area, doorbell: bool) -> Result<()> {
+    cpu.doorbell(area.vcpu, doorbell)?;
     cpu.enter_resident_with_asid(area.base, natemu_abi::shadow::TCR_BOTH, area.vcpu as u8 + 1)
 }
 
@@ -144,108 +146,95 @@ pub(crate) fn guest_ram_written(memory: &Memory) {
         record_word(memory, v, None).fetch_or(cache::FLUSH, SeqCst);
     }
 }
-/// Precise stops. vCPU v's stop granule is the IPA granule holding its stop pad (`cache::PAD` of its code area;
-/// nothing else is in it). A kick sets v's kick flag and removes execute permission from the granule (under v's
-/// mutex), so v's next block entry, at its stop `bl`, takes a stage-2 instruction abort at the pad to v's own thread
-/// ([`serve`]), which restores the granule, clears the flag and enters the resident's stop gate; the gate drains v's
-/// invalidation record and re-dispatches. A kick that finds v in the host or the resident faults at v's next block entry, after its next
-/// drain (an empty stop); a kick while one is pending merges into it. Kicks come from the host (drivers) and from
-/// peers' residents (`hvc #KICK_HVC`: a write to a page the vCPU holds translations from, a shootdown of its writable
-/// shadows).
-///
-/// Concurrency: the granule's rights change only under v's mutex, to read-write by a kick that finds no kick pending and
-/// back to read-write-execute only by v's own thread on the stop exit itself (never on other exits, so a kick that lands while v is
-/// in the host stays in force across its re-entry); hence at most one protect per stop each way, and a merged kick
-/// costs none. Concurrent `hv_vm_protect` calls contend inside HVF (S3b replication: p99 ~30 µs for one kicked vCPU,
-/// ~200 µs with four kickers and four restoring vCPUs). A kick that finds v in the host still protects: not every
-/// host exit is followed by a drain before generated code runs again (a resident kick request resumes inside a
-/// fault handler), so skipping it could lose the kick.
+/// Precise stops from the host. A kick rings vCPU v's doorbell (its GIC SPI, from any thread, no host exit); the
+/// resident's IRQ handler stops v at its next block boundary, drains its invalidation record and counts the stop
+/// (`State::stops`, with its CNTVCT, which is the host's `mach_absolute_time`). A kick that finds v in the host or the
+/// resident (interrupts masked) stays pending in the GIC and stops v as soon as it runs generated code again; a kick
+/// while one is pending merges into it in the GIC. Peers' residents ring v's SGI directly (`cache::kick`), never the host.
 pub(crate) struct Stops {
-    granule: usize,
-    /// vCPU v's stop granule (IPA).
-    ipa: Vec<u64>,
     kicks: Vec<Mutex<Kick>>,
-    /// vCPU v is in the host (not in `hv_vcpu_run`). Accounting only (`Kick::in_host`, latency classes): a kick
-    /// protects whether or not it is set.
+    /// vCPU v is in the host (not in `hv_vcpu_run`). Accounting only (`Kick::in_host`, latency classes).
     in_host: Vec<AtomicBool>,
     /// Per-stop latencies are kept (`Kick::latency`) only when the driver asks.
     latencies: bool,
 }
-/// One vCPU's kick flag and its stop accounting.
+/// One vCPU's host kicks.
 #[derive(Default, Clone)]
 pub(crate) struct Kick {
-    /// The flag: its granule is write-protected and no stop has taken it yet; with when the protect returned and
-    /// whether the kick found the vCPU in the host.
-    pending: Option<(Instant, bool)>,
-    /// Kicks that protected the granule, of which while the vCPU was in the host; kicks merged into a pending one.
+    /// Kicks (doorbells rung), of which while the vCPU was in the host.
     pub(crate) issued: u64,
     pub(crate) in_host: u64,
-    pub(crate) merged: u64,
-    /// Stops taken (stage-2 faults on the granule served).
-    pub(crate) stops: u64,
-    /// Per stop, if the driver asked ([`Stops::new`]): nanoseconds from the protect's return to the fault's exit (0 if
-    /// the exit came first), and whether the kick found the vCPU in the host.
+    /// Nanoseconds spent in the `hv_gic_set_spi` calls.
+    pub(crate) ring_ns: u64,
+    /// Its doorbell was still pending when it ended (read before the VM goes).
+    pub(crate) pending: bool,
+    /// Per kick a stop followed, if the driver asked ([`Stops::new`]): nanoseconds from the ring to the resident's stop,
+    /// and whether the kick found the vCPU in the host.
     pub(crate) latency: Vec<(u64, bool)>,
-    /// Native PCs of the stops (the stop `bl`s, from x30), with their counts.
-    pub(crate) pcs: std::collections::BTreeMap<u64, u64>,
+    /// The last ring: `mach_absolute_time`, in the host.
+    rung: Option<(u64, bool)>,
+}
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+}
+/// Nanoseconds of `ticks` of `mach_absolute_time` (and CNTVCT: 24 MHz on Apple silicon).
+pub(crate) fn ticks_ns(ticks: u64) -> u64 {
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+    unsafe extern "C" {
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+    let mut t = Timebase { numer: 0, denom: 0 };
+    unsafe { mach_timebase_info(&mut t) };
+    (ticks as u128 * u128::from(t.numer) / u128::from(t.denom.max(1))) as u64
 }
 impl Stops {
-    /// Stop granules of `backing`'s vCPUs in `machine` (which maps the backing); `latencies`: keep every stop's latency.
-    pub(crate) fn new(backing: &Backing, machine: &Machine, latencies: bool) -> Result<Self> {
-        let granule = machine.granule;
-        if cache::PAD_BYTES % granule != 0 || (cache::CODE_OFFSET + cache::PAD) % granule != 0 {
-            return Err(format!("IPA granule {granule} does not fit the stop pad"));
-        }
-        Ok(Self {
-            granule,
-            ipa: (0..backing.n).map(|v| IPA + (backing.vcpu(v).base + cache::CODE_OFFSET + cache::PAD) as u64).collect(),
+    /// Kicks of `backing`'s vCPUs; `latencies`: keep every stop's latency.
+    pub(crate) fn new(backing: &Backing, latencies: bool) -> Self {
+        Self {
             kicks: (0..backing.n).map(|_| Mutex::default()).collect(),
             in_host: (0..backing.n).map(|_| AtomicBool::new(true)).collect(),
             latencies,
-        })
-    }
-    /// Stops vCPU `v` at its next block entry. False: a kick was pending (merged into it).
-    pub(crate) fn kick(&self, v: usize) -> Result<bool> {
-        let mut k = self.kicks.get(v).ok_or(format!("kick of vCPU {v}: no such vCPU"))?.lock().unwrap();
-        if k.pending.is_some() {
-            k.merged += 1;
-            return Ok(false);
         }
+    }
+    /// Stops vCPU `v` of `machine` at its next block boundary.
+    pub(crate) fn kick(&self, machine: &Machine, v: usize) -> Result<()> {
+        let mut k = self.kicks.get(v).ok_or(format!("kick of vCPU {v}: no such vCPU"))?.lock().unwrap();
         let in_host = self.in_host[v].load(SeqCst);
-        protect(self.ipa[v], self.granule, vm::READ_WRITE)?;
-        k.pending = Some((Instant::now(), in_host));
+        let at = unsafe { mach_absolute_time() };
+        machine.ring(v)?;
+        k.ring_ns += ticks_ns(unsafe { mach_absolute_time() } - at);
+        k.rung = Some((at, in_host));
         k.issued += 1;
         k.in_host += u64::from(in_host);
-        Ok(true)
-    }
-    /// The stage-2 abort `syndrome` at `ipa` that took vCPU `v` out at `exited` (PC `pc`; its stop `bl` at `at`) is a
-    /// kick's stop: an instruction abort in its own granule while a kick is pending. Restores the granule.
-    fn stopped(&self, v: usize, syndrome: u64, ipa: u64, pc: u64, at: u64, exited: Instant) -> Result<()> {
-        let mut k = self.kicks[v].lock().unwrap();
-        let own = ipa.wrapping_sub(self.ipa[v]) < self.granule as u64;
-        // An instruction abort (from the guest's EL, which is lower than HVF's) with a permission or translation fault.
-        let fetch = syndrome >> 26 == 0x20 && matches!(syndrome & 0x3f, 0x04..=0x07 | 0x0c..=0x0f);
-        let Some((protected, in_host)) = k.pending.filter(|_| own && fetch) else {
-            return Err(format!("stage-2 abort: syndrome={syndrome:#x} IPA={ipa:#x} PC={pc:#x}"));
-        };
-        protect(self.ipa[v], self.granule, vm::MAPPED)?;
-        k.pending = None;
-        k.stops += 1;
-        if self.latencies {
-            let ns = exited.saturating_duration_since(protected).as_nanos() as u64;
-            k.latency.push((ns, in_host));
-        }
-        *k.pcs.entry(at).or_default() += 1;
         Ok(())
     }
-    /// vCPU `v`'s accounting, and whether a kick is still pending (its vCPU ended first).
-    pub(crate) fn report(&self, v: usize) -> (Kick, bool) {
-        let k = self.kicks[v].lock().unwrap();
-        (k.clone(), k.pending.is_some())
+    /// Stops vCPU `v` (`area`) has taken (the resident's count).
+    pub(crate) fn taken(&self, area: Area) -> u64 {
+        area.read_record(exec::STATE_OFFSET + std::mem::offset_of!(State, stops))
     }
-    /// Stops vCPU `v` has taken.
-    pub(crate) fn taken(&self, v: usize) -> u64 {
-        self.kicks[v].lock().unwrap().stops
+    /// A stop of `area`'s vCPU followed the last kick: its latency.
+    pub(crate) fn followed(&self, area: Area) {
+        let mut k = self.kicks[area.vcpu].lock().unwrap();
+        if let (true, Some((at, in_host))) = (self.latencies, k.rung.take()) {
+            // The resident writes its record field by field: the stop's time may land just after its count.
+            let ticks = || area.read_record::<u64>(exec::STATE_OFFSET + std::mem::offset_of!(State, stop_ticks));
+            let stop = (0..10_000).map(|_| ticks()).find(|&t| t >= at).unwrap_or(at);
+            k.latency.push((ticks_ns(stop - at), in_host));
+        }
+    }
+    /// Records whether vCPU `v`'s doorbell is still pending (after it and its kicker ended, before the VM goes).
+    pub(crate) fn ended(&self, machine: &Machine, v: usize) -> Result<()> {
+        let pending = machine.ringing(v)?;
+        self.kicks[v].lock().unwrap().pending = pending;
+        Ok(())
+    }
+    /// vCPU `v`'s accounting.
+    pub(crate) fn report(&self, v: usize) -> Kick {
+        self.kicks[v].lock().unwrap().clone()
     }
 }
 
@@ -266,12 +255,17 @@ pub(crate) fn link_record(area: Area, i: usize) -> cache::LinkRecord {
 
 /// Self-check of the vCPU's cache after a run (the contract's rule (d), independent of the resident): every link point of
 /// every placed block holds its admitted word (the first word of its RIP move) or `b` to the entry of a placed block
-/// keyed (target, the block's context), and the resident's link records describe exactly the linked ones. Returns
-/// (link points, linked).
+/// keyed (target, the block's context), and the resident's link records describe exactly the linked ones. A word an
+/// armed stop patched (a vCPU forced out with a stop armed) is judged by its word before the patch. Returns (link
+/// points, linked).
 pub(crate) fn check_links(area: Area) -> Result<(u64, u64)> {
     let lookup = |offset: usize| cache::LOOKUP_OFFSET + offset;
     let control: cache::Control = area.read_record(lookup(cache::CONTROL));
-    let word = |offset: u64| u32::from_le_bytes(area.read::<4>(cache::CODE_OFFSET + offset as usize));
+    let armed = &control.armed_words[..(control.armed as usize).min(control.armed_words.len())];
+    let word = |offset: u64| match armed.iter().find(|w| u64::from(w[0]) == offset) {
+        Some(&[_, original]) if u32::from_le_bytes(area.read::<4>(cache::CODE_OFFSET + offset as usize)) == exec::STOP_WORD => original,
+        _ => u32::from_le_bytes(area.read::<4>(cache::CODE_OFFSET + offset as usize)),
+    };
     let blocks = placed_blocks(area);
     let mut linked = HashMap::new();
     let mut points = 0;
@@ -611,12 +605,6 @@ pub(crate) struct Requests {
     /// reply kind); then `tampered` is set. Checks the resident's run-time defences.
     pub(crate) tamper: Option<fn(Area, &mut State) -> bool>,
     pub(crate) tampered: bool,
-    /// Test drivers only: the first stop enters the stop gate with a forged return address in x30 (the word after the
-    /// stop `bl`'s); the resident must halt (`bad_stop`). Sets `tampered`.
-    pub(crate) forge_stop: bool,
-    /// Test drivers only: every stop resumes at the pad without entering the gate, so the vCPU never drains while
-    /// it runs linked code (a peer that never answers `SHADOWS`); the waiter must be contained by its watchdog.
-    pub(crate) ignore_stops: bool,
 }
 
 /// Runs the vCPU (entered at the resident, see [`enter`]) until it stops; `stop_at` is a RIP at
@@ -680,7 +668,6 @@ fn serve(
         let _ = running.send(true);
         stops.in_host[v].store(false, SeqCst);
         let exit = cpu.run_until_exit();
-        let exited = Instant::now();
         stops.in_host[v].store(true, SeqCst);
         let _ = running.send(false);
         let exit = match exit? {
@@ -692,36 +679,8 @@ fn serve(
                     .fold(0, |m, p| m | 1 << p);
                 return Ok(Stop::Watchdog { pc: cpu.reg(PC)?, asked });
             }
-            vm::Exit::Stage2 { syndrome, ipa } => {
-                // Only a kick's stop restores the granule: a kick that found the vCPU in the host stays in force.
-                let (pc, ret) = (cpu.reg(PC)?, cpu.reg(vm::X30)?);
-                stops.stopped(v, syndrome, ipa, pc, ret.wrapping_sub(4), exited)?;
-                if requests.ignore_stops {
-                    requests.tampered = true;
-                    continue; // resumes at the pad, never entering the gate: nothing is drained
-                }
-                let state: State = area.read_record(exec::STATE_OFFSET);
-                if !resident::contains(state.stop_gate, 4) {
-                    return Err(format!("stop gate {:#x} outside the resident", state.stop_gate));
-                }
-                // A forged stop: the return address one word past the stop `bl`.
-                if requests.forge_stop {
-                    cpu.set_reg(vm::X30, ret + 4)?;
-                }
-                (requests.forge_stop, requests.tampered) = (false, requests.tampered || requests.forge_stop);
-                // As an exception from EL1t taken to EL1h with DAIF masked would leave it.
-                cpu.set_sys(vm::ELR_EL1, pc)?;
-                cpu.set_sys(vm::SPSR_EL1, cpu.reg(vm::CPSR)?)?;
-                cpu.set_reg(PC, state.stop_gate)?;
-                cpu.set_reg(vm::CPSR, 0x3c5)?;
-                continue;
-            }
         };
         match exit {
-            exec::KICK_HVC => {
-                stops.kick(cpu.reg(0)? as usize)?;
-                continue;
-            }
             0x49 => {
                 let s: Shared = area.read_record(SHARED_OFFSET);
                 let state: State = area.read_record(exec::STATE_OFFSET);

@@ -1,6 +1,6 @@
 //! Hypervisor.framework VM lifecycle and vCPU state.
 //!
-//! The VM is process-global: `Machine` creates it, maps guest RAM and destroys it.
+//! The VM is process-global: `Machine` creates it with its in-kernel GIC (macOS 15+), maps guest RAM and destroys it.
 //! A `Vcpu` belongs to the thread that created it; register access, runs and its
 //! destruction happen on that thread. Destroy every vCPU before the VM, and keep
 //! the mapped `Memory` alive until the VM is gone.
@@ -22,9 +22,16 @@ struct HvExit {
 unsafe extern "C" {
     fn hv_vm_create(config: *const c_void) -> i32;
     fn hv_vm_config_create() -> *mut c_void;
-    fn hv_vm_config_get_ipa_granule(config: *const c_void, granule: *mut u32) -> i32;
-    fn hv_vm_protect(ipa: u64, size: usize, flags: u64) -> i32;
     fn os_release(object: *mut c_void);
+    fn hv_gic_config_create() -> *mut c_void;
+    fn hv_gic_config_set_distributor_base(config: *mut c_void, ipa: u64) -> i32;
+    fn hv_gic_config_set_redistributor_base(config: *mut c_void, ipa: u64) -> i32;
+    fn hv_gic_create(config: *mut c_void) -> i32;
+    fn hv_gic_get_spi_interrupt_range(base: *mut u32, count: *mut u32) -> i32;
+    fn hv_gic_set_spi(intid: u32, level: bool) -> i32;
+    fn hv_gic_get_distributor_reg(reg: u16, value: *mut u64) -> i32;
+    fn hv_gic_set_distributor_reg(reg: u16, value: u64) -> i32;
+    fn hv_gic_set_redistributor_reg(vcpu: u64, reg: u32, value: u64) -> i32;
     fn hv_vm_destroy() -> i32;
     fn hv_vm_map(address: *const c_void, ipa: u64, size: usize, flags: u64) -> i32;
     fn hv_vcpu_create(vcpu: *mut u64, exit: *mut *const HvExit, config: *const c_void) -> i32;
@@ -34,6 +41,7 @@ unsafe extern "C" {
     fn hv_vcpu_set_sys_reg(vcpu: u64, reg: u16, value: u64) -> i32;
     fn hv_vcpu_get_sys_reg(vcpu: u64, reg: u16, value: *mut u64) -> i32;
     fn hv_vcpu_run(vcpu: u64) -> i32;
+    fn hv_vcpu_set_vtimer_offset(vcpu: u64, offset: u64) -> i32;
     fn hv_vcpus_exit(vcpus: *mut u64, count: u32) -> i32;
     fn hv_vm_get_max_vcpu_count(count: *mut u32) -> i32;
 }
@@ -61,38 +69,103 @@ pub(crate) fn exit_vcpus(ids: &mut [u64]) -> i32 {
     unsafe { hv_vcpus_exit(ids.as_mut_ptr(), ids.len() as u32) }
 }
 
-/// Guest memory rights of [`protect`]: as mapped (read/write/execute), or read-write (not executable).
-pub(crate) const MAPPED: u64 = 7;
-pub(crate) const READ_WRITE: u64 = 3;
-/// Sets the stage-2 rights of `[ipa, ipa + size)` (granule-aligned) for every vCPU, running ones included.
-pub(crate) fn protect(ipa: u64, size: usize, rights: u64) -> Result<()> {
-    unsafe { hv(hv_vm_protect(ipa, size, rights), "hv_vm_protect") }
+/// Guest memory rights: read/write/execute.
+const MAPPED: u64 = 7;
+/// IPAs of the GIC's distributor (64 KiB) and redistributor region (128 KiB per vCPU, 32 MiB), below guest memory.
+const GIC_DISTRIBUTOR: u64 = 0x0800_0000;
+const GIC_REDISTRIBUTORS: u64 = 0x0900_0000;
+const _: () = assert!(GIC_REDISTRIBUTORS + (32 << 20) <= IPA);
+/// Distributor registers (GICv3): control, then the per-INTID arrays (`n` = the register holding INTID `n`).
+const GICD_CTLR: u16 = 0;
+fn gicd(array: u16, n: u32, bits: u32) -> u16 {
+    array + (n / (32 / bits) * 4) as u16
 }
+const GICD_IGROUPR: u16 = 0x80;
+const GICD_ISENABLER: u16 = 0x100;
+const GICD_ICENABLER: u16 = 0x180;
+const GICD_ISPENDR: u16 = 0x200;
+const GICD_IPRIORITYR: u16 = 0x400;
+const GICD_ICFGR: u16 = 0xc00;
+const GICD_IROUTER: u16 = 0x6000;
+/// Redistributor SGI-frame registers of the SGIs and PPIs (`hv_gic_redistributor_reg_t`).
+const GICR_IGROUPR0: u32 = 0x1_0080;
+const GICR_ISENABLER0: u32 = 0x1_0100;
+const MPIDR_EL1: u16 = 0xc005;
 
-/// The process VM with all of `memory` mapped read/write/execute at `IPA`.
+/// The process VM with all of `memory` mapped read/write/execute at `IPA`, and its GIC: each vCPU's doorbells are the
+/// SGI `exec::KICK_SGI` (from peers' residents) and its own SPI `spi + v` (from the host), group 1, edge-triggered.
 pub(crate) struct Machine {
-    /// Bytes of the stage-2 (IPA) granule: the unit of [`protect`].
-    pub(crate) granule: usize,
+    /// The first SPI: vCPU v's host doorbell is `spi + v`.
+    spi: u32,
 }
 impl Machine {
     pub(crate) fn create(memory: &Memory) -> Result<Self> {
         memory.flush_instruction_cache();
-        let mut granule = u32::MAX;
         unsafe {
-            // The default configuration; its IPA granule is the VM's.
             let config = hv_vm_config_create();
-            let read = hv(hv_vm_config_get_ipa_granule(config, &mut granule), "hv_vm_config_get_ipa_granule");
-            let created = read.and_then(|()| hv(hv_vm_create(config), "hv_vm_create"));
+            let created = hv(hv_vm_create(config), "hv_vm_create");
             os_release(config);
             created?;
+            // After the VM, before any vCPU (hv_gic.h).
+            let gic = hv_gic_config_create();
+            let created = hv(hv_gic_config_set_distributor_base(gic, GIC_DISTRIBUTOR), "GIC distributor base")
+                .and_then(|()| hv(hv_gic_config_set_redistributor_base(gic, GIC_REDISTRIBUTORS), "GIC redistributor base"))
+                .and_then(|()| hv(hv_gic_create(gic), "hv_gic_create (macOS 15 or later)"));
+            os_release(gic);
+            created?;
         }
-        // HV_IPA_GRANULE_4KB, HV_IPA_GRANULE_16KB.
-        let machine = Self { granule: if granule == 0 { 4096 } else { 16384 } };
-        if granule > 1 {
-            return Err(format!("unknown IPA granule {granule}"));
+        let (mut spi, mut count) = (0, 0);
+        unsafe { hv(hv_gic_get_spi_interrupt_range(&mut spi, &mut count), "GIC SPI range")? };
+        if (count as usize) < natemu_abi::execution::cache::MAX_VCPUS {
+            return Err(format!("{count} GIC SPIs: one per vCPU needed"));
+        }
+        let machine = Self { spi };
+        // Affinity routing, both groups enabled.
+        let ctlr = machine.distributor(GICD_CTLR)?;
+        machine.set_distributor(GICD_CTLR, ctlr | 0x13)?;
+        // Every vCPU's SPI (one register write each: these registers hold several INTIDs, so all are set at once).
+        let spis = spi..spi + natemu_abi::execution::cache::MAX_VCPUS as u32;
+        let mut words: std::collections::BTreeMap<u16, u64> = Default::default();
+        for n in spis.clone() {
+            *words.entry(gicd(GICD_IGROUPR, n, 1)).or_default() |= 1 << (n % 32);
+            *words.entry(gicd(GICD_ICFGR, n, 2)).or_default() |= 2 << (2 * (n % 16)); // edge
+            *words.entry(gicd(GICD_IPRIORITYR, n, 8)).or_default() |= 0x80 << (8 * (n % 4));
+        }
+        for (reg, value) in words {
+            machine.set_distributor(reg, value)?;
+        }
+        for n in spis {
+            machine.set_distributor(gicd(GICD_ISENABLER, n, 1), 1 << (n % 32))?;
         }
         unsafe { hv(hv_vm_map(memory.0.cast(), IPA, memory.1, MAPPED), "hv_vm_map")? };
         Ok(machine)
+    }
+    fn distributor(&self, reg: u16) -> Result<u64> {
+        let mut value = 0;
+        unsafe { hv(hv_gic_get_distributor_reg(reg, &mut value), "read GIC distributor")? };
+        Ok(value)
+    }
+    fn set_distributor(&self, reg: u16, value: u64) -> Result<()> {
+        unsafe { hv(hv_gic_set_distributor_reg(reg, value), "write GIC distributor") }
+    }
+    /// Disables vCPU `v`'s host doorbell (a test driver's peer that never answers).
+    pub(crate) fn silence(&self, v: usize) -> Result<()> {
+        let n = self.spi + v as u32;
+        self.set_distributor(gicd(GICD_ICENABLER, n, 1), 1 << (n % 32))
+    }
+    /// Routes vCPU `v`'s SPI to it (Aff0 = `v`). Written after the vCPU exists: HVF delivers an SPI whose route was
+    /// written before then to no one (`experiments/track03/native-interrupts/`, the IROUTER quirk).
+    pub(crate) fn route(&self, v: usize) -> Result<()> {
+        self.set_distributor(GICD_IROUTER + 8 * (self.spi + v as u32) as u16, v as u64)
+    }
+    /// Rings vCPU `v`'s host doorbell (an edge on its SPI), from any thread.
+    pub(crate) fn ring(&self, v: usize) -> Result<()> {
+        unsafe { hv(hv_gic_set_spi(self.spi + v as u32, true), "hv_gic_set_spi") }
+    }
+    /// vCPU `v`'s host doorbell is pending (rung, not yet acknowledged).
+    pub(crate) fn ringing(&self, v: usize) -> Result<bool> {
+        let n = self.spi + v as u32;
+        Ok(self.distributor(gicd(GICD_ISPENDR, n, 1))? >> (n % 32) & 1 != 0)
     }
     /// Destroys the VM now and returns the framework status.
     pub(crate) fn destroy(self) -> i32 {
@@ -108,11 +181,8 @@ impl Drop for Machine {
     }
 }
 
-pub(crate) const X30: u32 = 30;
 pub(crate) const PC: u32 = 31;
 pub(crate) const CPSR: u32 = 34;
-pub(crate) const SPSR_EL1: u16 = 0xc200;
-pub(crate) const ELR_EL1: u16 = 0xc201;
 pub(crate) const ID_AA64ISAR0_EL1: u16 = 0xc030;
 const SCTLR_EL1: u16 = 0xc080;
 const ACTLR_EL1: u16 = 0xc081;
@@ -125,8 +195,6 @@ pub(crate) enum Exit {
     Hvc(u64),
     /// The host forced the exit ([`exit_vcpus`]).
     Cancelled,
-    /// A stage-2 data or instruction abort (EC 0x24, 0x20) with its syndrome and IPA; PC is the faulting instruction.
-    Stage2 { syndrome: u64, ipa: u64 },
 }
 
 pub(crate) struct Vcpu {
@@ -157,6 +225,22 @@ impl Vcpu {
     }
     pub(crate) fn id(&self) -> u64 {
         self.id
+    }
+    /// Makes this vCPU vCPU `v` of the GIC (MPIDR_EL1 Aff0 = `v`) and enables its peer doorbell, SGI `KICK_SGI`, in
+    /// group 1 (on the owning thread, before it first runs). Its virtual count is the host's (CNTVCT =
+    /// `mach_absolute_time`), so the resident's stop times compare with the host's kick times.
+    /// `enabled` false leaves the SGI disabled (a test driver's peer that never answers).
+    pub(crate) fn doorbell(&self, v: usize, enabled: bool) -> Result<()> {
+        let bit = 1 << natemu_abi::execution::KICK_SGI;
+        self.set_sys(MPIDR_EL1, v as u64)?;
+        unsafe {
+            hv(hv_vcpu_set_vtimer_offset(self.id, 0), "hv_vcpu_set_vtimer_offset")?;
+            hv(hv_gic_set_redistributor_reg(self.id, GICR_IGROUPR0, bit), "GICR_IGROUPR0")?;
+            if enabled {
+                hv(hv_gic_set_redistributor_reg(self.id, GICR_ISENABLER0, bit), "GICR_ISENABLER0")?;
+            }
+            Ok(())
+        }
     }
     pub(crate) fn set_reg(&self, reg: u32, value: u64) -> Result<()> {
         unsafe { hv(hv_vcpu_set_reg(self.id, reg, value), "set register") }
@@ -200,8 +284,8 @@ impl Vcpu {
         self.set_sys(CPACR_EL1, 3 << 20)?;
         self.set_sys(CNTV_CTL_EL0, 0)
     }
-    /// Runs until the next exit: an HVC, a forced exit ([`exit_vcpus`]) or a stage-2 abort (EC 0x24, 0x20); any
-    /// other exit is an error reporting the exit and PC.
+    /// Runs until the next exit: an HVC or a forced exit ([`exit_vcpus`]); any other exit is an error reporting the
+    /// exit and PC.
     pub(crate) fn run_until_exit(&self) -> Result<Exit> {
         const CANCELED: u32 = 0;
         unsafe {
@@ -211,7 +295,6 @@ impl Vcpu {
             match (exit.reason, syndrome >> 26) {
                 (CANCELED, _) => Ok(Exit::Cancelled),
                 (1, 0x16) => Ok(Exit::Hvc(syndrome & 0xffff)),
-                (1, 0x24 | 0x20) => Ok(Exit::Stage2 { syndrome, ipa }),
                 (reason, _) => Err(self.unexpected(reason, syndrome, ipa)),
             }
         }

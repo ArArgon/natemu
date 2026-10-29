@@ -12,7 +12,8 @@
 //! and links the exit to it. A miss at a system instruction (every block ends before one) gets the host's decode of
 //! it instead of a block, and the resident executes it as a transaction ([`system`]). Also the 128/64 division
 //! generated code asks for with `svc #DIV_U/DIV_S`. Generated code reaches the resident only by exceptions (`svc`,
-//! check stubs, aborts) and the stop pad; it reads and writes no emulator data.
+//! check stubs, aborts, interrupts); it reads and writes no emulator data. Interrupts are doorbells (a host SPI, a
+//! peer's SGI): each stops the vCPU precisely at a block boundary ([`interrupted`]) and the resident drains there.
 use super::*;
 use crate::cache::{self, Block};
 use natemu_abi::{
@@ -26,7 +27,6 @@ use natemu_abi::{
 unsafe extern "C" {
     fn enter_allocated(frame: *const NativeFrame, pc: u64, spsr: u64) -> !;
     fn resume_exception(frame: *const NativeFrame, pc: u64, spsr: u64) -> !;
-    fn stop_gate();
     fn dispatch_template();
     fn dispatch_template_end();
 }
@@ -38,8 +38,8 @@ fn dispatcher() -> &'static [u8] {
 
 /// Guest-physical RAM through the resident's alias.
 const RAM: GuestRam = unsafe { GuestRam::new(0, GUEST_RAM_BYTES as u64, GUEST_RAM_VA) };
-/// EL1t, DAIF masked; NZCV is or-ed in.
-const BLOCK_SPSR: u64 = 0x3c4;
+/// EL1t, IRQs unmasked (the doorbell), D, A and F masked; NZCV is or-ed in. The resident itself runs with DAIF masked.
+const BLOCK_SPSR: u64 = 0x344;
 
 fn record() -> *mut State {
     STATE_VA as *mut State
@@ -55,6 +55,7 @@ fn staged() -> Header {
 /// Stops this vCPU; the host reads `reason` and the record. The host may never resume it, so it first drops every
 /// shadow and writable bit unasked (as if serving `SHADOWS`): no peer ever waits on a vCPU that has stopped.
 fn halt(mut s: State, reason: u64) -> ! {
+    served(&mut s);
     reset_shadows(&mut s);
     s.stop = reason;
     unsafe { write_record(record(), s) };
@@ -75,7 +76,13 @@ pub unsafe fn start() -> ! {
     }
     cache::reset();
     cache::fill_head(dispatcher());
-    s.stop_gate = stop_gate as *const () as u64;
+    // The GIC CPU interface: system registers on, every priority unmasked, group 1 (the doorbells) enabled.
+    unsafe {
+        asm!("mrs {t}, S3_0_C12_C12_5", "orr {t}, {t}, #1", "msr S3_0_C12_C12_5, {t}", "isb", // ICC_SRE_EL1.SRE
+             "mov {t}, #0xff", "msr S3_0_C4_C6_0, {t}",                                     // ICC_PMR_EL1
+             "mov {t}, #1", "msr S3_0_C12_C12_7, {t}", "isb",                                // ICC_IGRPEN1_EL1
+             t = out(reg) _);
+    }
     unsafe { dispatch(s) }
 }
 
@@ -159,7 +166,7 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
         // The RIP must be one of the block's link targets (its `svc #LINK` follows that target's move).
         let target = |b: &Block| b.links.iter().any(|p| p.offset != 0 && p.target == s.cpu.rip);
         let source = match cache::block_at(elr.wrapping_sub(4)) {
-            Some(b) if b.flags & cache::STEP != 0 => None,
+            Some(b) if b.flags & cache::STEP != 0 && target(b) => None,
             Some(b) if b.flags & cache::DEAD == 0 && target(b) => Some(b),
             _ => {
                 s.native = [0, 0, elr];
@@ -250,10 +257,10 @@ unsafe fn request(s: &mut State, kind: u64) -> Reply {
         || h.code_size as usize > natemu_abi::execution::cache::MAX_BLOCK_BYTES
         || h.code_offset as usize + h.code_size as usize > STAGING_BYTES
         || table_end.is_none_or(|end| end > STAGING_BYTES)
-        // Host-supplied link points name words the linker may rewrite: each whole exit (a move and `svc`) inside the code.
-        || s.link_points.iter().any(|p| p.offset != 0 && (p.offset % 4 != 0 || u64::from(p.offset) + 8 > u64::from(h.code_size)))
-        // The placeholders the resident relocates ([`cache::place`]).
-        || staged_word(&h, u64::from(STOP_BL)) != STOP_PLACEHOLDER
+        // Host-supplied link points name words the linker may rewrite: each whole exit inside the code, as admitted (a
+        // move into x0 starting with the point's word, `svc #LINK` within its next four words).
+        || s.link_points.iter().any(|p| p.offset != 0 && !link_point(&h, p))
+        // The placeholder the resident relocates ([`cache::place`]).
         || (s.dispatch_exit != 0
             && (s.dispatch_exit % 4 != 0
                 || s.dispatch_exit + 4 > u64::from(h.code_size)
@@ -267,6 +274,21 @@ unsafe fn request(s: &mut State, kind: u64) -> Reply {
 /// The staged block's code word at `offset` (inside its code).
 fn staged_word(h: &Header, offset: u64) -> u32 {
     unsafe { ((STAGING_VA + u64::from(h.code_offset) + offset) as *const u32).read_unaligned() }
+}
+/// `p` names an exit of the staged block as admission returns it: its word is in the code and is `p.word`, a
+/// `movz|movn|orr xzr` into x0, and an `svc #LINK` follows within the next four words (inside the code).
+fn link_point(h: &Header, p: &LinkPoint) -> bool {
+    let at = u64::from(p.offset);
+    let w = p.word;
+    // Either width (sf).
+    let into_x0 = w & 31 == 0 && matches!(w & 0x7f80_0000, 0x5280_0000 | 0x1280_0000) || w & 0x7f80_03ff == 0x3200_03e0;
+    let svc_link = 0xd400_0001 | u32::from(svc::LINK) << 5;
+    at % 4 == 0
+        && at >= u64::from(ENTRY_OFFSET)
+        && at + 8 <= u64::from(h.code_size)
+        && staged_word(h, at) == w
+        && into_x0
+        && (1..=4).any(|k| at + 4 * k + 4 <= u64::from(h.code_size) && staged_word(h, at + 4 * k) == svc_link)
 }
 /// Walks the fetch of page `va` for a request into `s.fetch[i]` (or its failure into `s.fetch_fault`); for a block,
 /// marks it ([`mark`]).
@@ -380,6 +402,7 @@ fn reset_shadows(s: &mut State) {
 
 /// Enters `block` from the bank: GPRs and PF/AF in their static registers, NZCV with C = !CF, the frame in x28.
 unsafe fn enter(mut s: State, block: &Block) -> ! {
+    served(&mut s);
     let mut f = NativeFrame::ZERO;
     for (&reg, &value) in SRA.iter().zip(&s.cpu.gpr) {
         f.x[reg as usize] = value;
@@ -398,22 +421,31 @@ unsafe fn enter(mut s: State, block: &Block) -> ! {
     }
 }
 
-/// Exception capture (`kind` 1: an `svc` entry, a check stub or an abort from generated code) and the stop gate (3)
-/// end here. The `svc` entries come from EL1t: a literal exit (the linker), the dispatcher's miss (only from its own
-/// `svc`), and a division; any other `svc` is an unknown abort.
+/// Exception capture (`kind` 1: an `svc` entry, a check stub, a stop or an abort from generated code) and the IRQ gate
+/// (3) end here. Any stop armed is disarmed first ([`cache::disarm`]). The `svc` entries come from EL1t: a literal
+/// exit (the linker), the dispatcher's miss (only from its own `svc`), and a division; any other `svc` is an unknown
+/// abort.
 pub unsafe fn returned(frame: &NativeFrame, kind: u64) -> ! {
     unsafe {
+        let Some(armed) = cache::disarm() else {
+            let mut s = load();
+            s.native = [0, 0, frame.x[30]];
+            halt(s, stop::BAD_STOP)
+        };
         if kind == 3 {
-            stopped(frame)
+            interrupted(frame)
         }
         let (esr, elr, spsr): (u64, u64, u64);
         asm!("mrs {0}, esr_el1", "mrs {1}, elr_el1", "mrs {2}, spsr_el1", out(reg) esr, out(reg) elr, out(reg) spsr);
+        if esr >> 26 == 0x3c && esr & 0xffff == u64::from(STOP_IMM) {
+            stopped(frame, elr, spsr, armed)
+        }
         if esr >> 26 != 0x15 {
             aborted(frame)
         }
         let miss = cache::CODE_VA + cache::DISPATCH_MISS as u64 + 4;
         match (esr & 0xffff) as u16 {
-            _ if spsr & 15 != 4 => {}
+            _ if spsr & 0x1f != 4 => {}
             svc::LINK => linker(frame, elr),
             svc::MISS if elr == miss => {
                 // Block exit: guest state is in the static registers, NZCV (CF inverted) and PF/AF registers.
@@ -436,8 +468,9 @@ pub unsafe fn returned(frame: &NativeFrame, kind: u64) -> ! {
 /// changes; the block resumes after the `svc`.
 unsafe fn division(signed: bool, f: &NativeFrame, elr: u64, spsr: u64) -> ! {
     unsafe {
+        let s = load();
         if cache::block_at(elr.wrapping_sub(4)).is_none() {
-            let mut s = load();
+            let mut s = s;
             s.native = [0, 0, elr];
             halt(s, stop::UNKNOWN_ABORT)
         }
@@ -447,35 +480,131 @@ unsafe fn division(signed: bool, f: &NativeFrame, elr: u64, spsr: u64) -> ! {
             None => (f.x[0], f.x[1], 1),
         };
         ((*resume).x[0], (*resume).x[1], (*resume).x[2]) = (quotient, remainder, de);
-        resume_exception(resume, elr, spsr)
+        self::resume(&s, resume, elr, spsr)
     }
 }
 
-/// A precise stop (the stop gate, `gates.S` `stop_gate`): a kick took execute permission from this vCPU's stop pad, so
-/// a block entry's `bl` to the pad faulted to the host, which entered the gate with ELR/SPSR as the fault left them.
-/// ELR must be the pad and x30 the return address of the stop `bl` of a live cache block or of the step block, entered
-/// from EL1t; anything else halts. Nothing of the block ran but that `bl` (x30 is an allocator temporary, dead at a
-/// block entry), so the state is its entry state (static registers, NZCV with CF inverted) at its RIP. Drains (the
-/// kick's reason) and re-dispatches; the step block is entered again instead: it is uncached and holds one instruction
-/// already fetched, so no drain drops it, and re-entering it means kicks arriving faster than a block entry cannot keep
-/// discarding the step.
-unsafe fn stopped(frame: &NativeFrame) -> ! {
-    let (elr, spsr): (u64, u64);
-    unsafe { asm!("mrs {0}, elr_el1", "mrs {1}, spsr_el1", out(reg) elr, out(reg) spsr) };
+/// Resumes generated code mid-block at `pc` (a division, a retried access, a split store): a stop still wanted is
+/// armed again in the block holding `pc` (the entry disarmed it).
+unsafe fn resume(s: &State, frame: *const NativeFrame, pc: u64, spsr: u64) -> ! {
+    if s.stop_wanted != 0 {
+        match cache::block_at(pc) {
+            Some(b) => cache::arm(b),
+            None => halt(*s, stop::BAD_STOP),
+        }
+        cache::control().rearms += 1;
+    }
+    unsafe { resume_exception(frame, pc, spsr) }
+}
+/// A wanted stop is served by a resident entry at a block boundary (the resident drained or will drain before the
+/// next block runs; [`enter`], [`halt`]).
+fn served(s: &mut State) {
+    if s.stop_wanted != 0 {
+        s.stop_wanted = 0;
+        s.stops_resident += 1;
+        taken(s);
+    }
+}
+fn taken(s: &mut State) {
+    s.stops += 1;
+    unsafe { asm!("mrs {0}, cntvct_el0", out(reg) s.stop_ticks) };
+}
+
+/// A doorbell (the IRQ gate, `gates.S` `irq_gate`; the resident runs with interrupts masked, so only generated code is
+/// interrupted, at an instruction boundary with ELR = the next instruction): acknowledged and ended at once (one
+/// INTID per IRQ; more pending ones are taken in turn). Interrupted in the dispatcher or L1 code (the next RIP in x0,
+/// guest state in the static registers: they write only x1, x2) or at a block's first word (its entry state), the vCPU
+/// stops there at once. Inside a block, the stop is armed ([`cache::arm`]): the block runs to an exit, which traps
+/// ([`stopped`]), or into the resident, which serves the stop at its next block boundary. Anything else halts.
+unsafe fn interrupted(frame: &NativeFrame) -> ! {
+    let (intid, t0, elr, spsr): (u64, u64, u64, u64);
+    unsafe {
+        asm!("isb", "mrs {t0}, cntvct_el0", "mrs {i}, S3_0_C12_C12_0", "mrs {elr}, elr_el1", "mrs {spsr}, spsr_el1", // ICC_IAR1_EL1
+             i = out(reg) intid, t0 = out(reg) t0, elr = out(reg) elr, spsr = out(reg) spsr);
+    }
     let mut s = unsafe { load() };
-    let at = frame.x[30].wrapping_sub(4);
-    let block = cache::block_at(at).filter(|b| at == b.code_va() + u64::from(STOP_BL) && b.flags & cache::DEAD == 0);
-    let Some(b) = block.filter(|_| elr == cache::PAD_VA && spsr & 0x1f == 4) else {
-        s.native = [0, frame.x[30], elr];
+    // A spurious INTID (1020-1023) is neither ended nor counted: generated code resumes (a stop still wanted is armed again).
+    if intid >= 1020 {
+        unsafe { resume(&s, &raw const (*shared()).captured, elr, spsr) }
+    }
+    let t1: u64;
+    unsafe { asm!("msr S3_0_C12_C12_1, {i}", "isb", "mrs {t1}, cntvct_el0", i = in(reg) intid, t1 = out(reg) t1) }; // ICC_EOIR1_EL1
+    let c = cache::control();
+    c.irqs += 1;
+    c.irq_sgis += u64::from(intid < 16);
+    c.irq_ticks += t1 - t0;
+    let bad = |mut s: State| -> ! {
+        s.native = [intid, 0, elr];
+        halt(s, stop::BAD_STOP)
+    };
+    if spsr & 0x1f != 4 {
+        bad(s)
+    }
+    let at_once = |mut s: State, rip: u64| -> State {
+        bank(&mut s.cpu, frame, frame.nzcv, true);
+        s.cpu.rip = rip;
+        s.stop_wanted = 0;
+        taken(&mut s);
+        s
+    };
+    if (cache::DISPATCH_VA..cache::CODE_VA + cache::HEAD_BYTES as u64).contains(&elr) {
+        let mut s = at_once(s, frame.x[0]);
+        if elr < cache::L1_VA {
+            s.stops_dispatch += 1;
+        } else {
+            s.stops_l1 += 1;
+        }
+        unsafe { dispatch(s) }
+    }
+    let Some(b) = cache::block_at(elr).filter(|b| b.flags & cache::DEAD == 0) else { bad(s) };
+    s.irqs_step += u64::from(b.flags & cache::STEP != 0);
+    if elr == b.entry() {
+        let mut s = at_once(s, b.rip);
+        s.stops_entry += 1;
+        // The step block is entered again (see [`stopped`]).
+        if b.flags & cache::STEP != 0 {
+            take_invalidations(&mut s);
+            unsafe { enter(s, b) }
+        }
+        unsafe { dispatch(s) }
+    }
+    if s.stop_wanted != 0 {
+        s.merged += 1;
+    } else {
+        s.arms += 1;
+        s.stop_wanted = 1;
+    }
+    cache::arm(b);
+    unsafe {
+        write_record(record(), s);
+        resume_exception(&raw const (*shared()).captured, elr, spsr)
+    }
+}
+
+/// A precise stop at an armed exit: a [`STOP_WORD`] trap at one of the words [`cache::arm`] patched (`armed`, already
+/// restored), from EL1t, in a live block or the step block. The state is the exit's (static registers, NZCV with CF
+/// inverted); RIP is the link point's target, or x0 at the computed exit's `b`. Drains and re-dispatches. Anything else
+/// halts: a stop word nobody armed is not a stop.
+unsafe fn stopped(frame: &NativeFrame, elr: u64, spsr: u64, (armed, n): ([u32; MAX_LINK_POINTS + 1], usize)) -> ! {
+    let mut s = unsafe { load() };
+    let at = elr.wrapping_sub(cache::CODE_VA);
+    let block = cache::block_at(elr).filter(|b| b.flags & cache::DEAD == 0 && s.stop_wanted != 0 && spsr & 0x1f == 4);
+    let rip = block.filter(|_| armed[..n].iter().any(|&o| u64::from(o) == at)).and_then(|b| {
+        let offset = at - u64::from(b.code);
+        match b.links.iter().find(|p| p.offset != 0 && u64::from(p.offset) == offset) {
+            Some(p) => Some(p.target),
+            None => (b.dispatch_exit != 0 && offset == u64::from(b.dispatch_exit)).then_some(frame.x[0]),
+        }
+    });
+    let Some(rip) = rip else {
+        s.native = [0, 0, elr];
         halt(s, stop::BAD_STOP)
     };
     bank(&mut s.cpu, frame, frame.nzcv, true);
-    s.cpu.rip = b.rip;
-    s.stops += 1;
-    if b.flags & cache::STEP != 0 {
-        take_invalidations(&mut s);
-        unsafe { enter(s, b) }
-    }
+    s.cpu.rip = rip;
+    s.stop_wanted = 0;
+    s.stops_exit += 1;
+    taken(&mut s);
     unsafe { dispatch(s) }
 }
 
@@ -791,7 +920,7 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             halt(s, stop::UNKNOWN_ABORT)
         };
         let site = all[i];
-        if spsr & 15 != 4 {
+        if spsr & 0x1f != 4 {
             halt(s, stop::SITE_MISMATCH)
         }
         // The syndrome must be the class this site's kind produces, before anything is taken or stepped (a malformed
@@ -865,7 +994,7 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
         if translate(&mut s, f, b, site, va, access).is_none() {
             unsafe {
                 write_record(record(), s);
-                resume_exception(&raw const (*shared()).captured, elr, spsr)
+                resume(&s, &raw const (*shared()).captured, elr, spsr)
             }
         }
     }
@@ -873,7 +1002,7 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
     s.retries += 1;
     unsafe {
         write_record(record(), s);
-        resume_exception(&raw const (*shared()).captured, elr, spsr)
+        resume(&s, &raw const (*shared()).captured, elr, spsr)
     }
 }
 
@@ -903,7 +1032,7 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
     let [Some(gpa0), Some(gpa1)] = gpa else {
         unsafe {
             write_record(record(), s);
-            resume_exception(&raw const (*shared()).captured, b.code_va() + stub.native_offset as u64, spsr)
+            resume(&s, &raw const (*shared()).captured, b.code_va() + stub.native_offset as u64, spsr)
         }
     };
     let gpa = [gpa0, gpa1];
@@ -941,7 +1070,7 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
         }
         s.splits += 1;
         write_record(record(), s);
-        resume_exception(resume, b.code_va() + access.native_offset as u64 + 4, spsr)
+        self::resume(&s, resume, b.code_va() + access.native_offset as u64 + 4, spsr)
     }
 }
 

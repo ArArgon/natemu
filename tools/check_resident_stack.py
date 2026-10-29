@@ -7,7 +7,7 @@ RUNTIME defaults to target/aarch64-unknown-none/release/natemu-runtime (build it
 `objdump -d -C` and fails (exit 1) on any violation of:
 
 Stack. Every resident entry starts on a known stack. The gates (exception vectors, which take generated code's `svc`
-entries too, and the stop gate) start on SP_EL1 at EXCEPTION_STACK_TOP: the only way back to generated code,
+entries too, and the IRQ gate) start on SP_EL1 at EXCEPTION_STACK_TOP: the only way back to generated code,
 `resume_exception`, resets SP_EL1 to that top before its ERET (checked below), and generated code runs at EL1t on SP_EL0.
 The boot path (`_start`) runs on SP_EL0 from STACK_TOP until its first block entry. The dispatcher (`dispatch_template`,
 copied into the code area and run there by generated code at EL1t) has a budget of 0 bytes: it may not touch SP at all,
@@ -17,15 +17,16 @@ its deepest callee (`bl`, or a branch to another function's start: a tail call, 
 recursion, an indirect call or branch in reachable code not listed in INDIRECT, an SP write that is neither a constant
 adjustment nor a declared stack switch (STACK_SWITCHES, literal source checked), a branch into the middle of another
 function. The gate bound must fit the exception stack's reservation. One nested gate entry (a fault inside the
-resident, or a stop injected while it runs) ends in a halt before any other work: `aborted` finds no block at ELR →
-`unknown_abort`; `stopped` finds no block or SPSR not EL1t → `bad_stop`. That halting path is declared in NESTED from
+resident; the resident runs with interrupts masked, so no IRQ enters it) ends in a halt before any other work:
+`aborted` finds no block at ELR → `unknown_abort`; a stop trap finds no armed word (`stopped`) → `bad_stop`. That halting path is declared in NESTED from
 the source (which calls each function makes before it halts), not derived from the binary; the checker only confirms
 the declared calls exist and sums their depths. The gate bound plus that path must fit too.
 
 ERET path. The only ERET is resume_exception's last instruction, restoring every GPR, Q register, FPCR, FPSR and SP_EL0
 from the frame at the NativeFrame offsets (x16, the base, last) with ELR/SPSR from x1/x2 and SP_EL1 reset to its top;
 only ERET_CALLERS branch to it (or to enter_allocated). Each gate saves the full native state in that layout before any
-scratch use and calls `finish` with its kind; the vectors are 16 branches to the capture gate at 128-byte spacing.
+scratch use and calls `finish` with its kind; the vectors are 16 branches at 128-byte spacing, the second (current EL
+with SP0, IRQ: generated code runs at EL1t) to the IRQ gate, the others to the capture gate.
 
 Stack tops and reservations are read from the abi and host sources, so a layout change cannot pass silently."""
 import bisect, pathlib, re, subprocess, sys
@@ -33,8 +34,8 @@ import bisect, pathlib, re, subprocess, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT = ROOT / 'target/aarch64-unknown-none/release/natemu-runtime'
 
-GATES = ('vectors', 'stop_gate')
-SAVES = {'exception_capture': 1, 'stop_gate': 3}  # gate -> `finish` kind
+GATES = ('vectors',)
+SAVES = {'exception_capture': 1, 'irq_gate': 3}  # gate -> `finish` kind
 NO_STACK = ('dispatch_template',)                 # run by generated code (EL1t, SP_EL0) with a 0-byte budget
 BOOT = '_start'
 # Indirect branches allowed in reachable code: (function, instruction) -> functions it reaches.
@@ -45,13 +46,11 @@ STACK_SWITCHES = {'private_start': {('mov sp, x9', 'EXCEPTION_STACK_TOP'), ('msr
                   'resume_exception': {('mov sp, x9', 'EXCEPTION_STACK_TOP')},
                   'enter_allocated': {('msr spsel, #0x1', None)}}
 R = 'natemu_runtime::execution::'
-ERET_CALLERS = {'enter_allocated', R + 'enter', R + 'access_aborted', R + 'split', R + 'division'}
+ERET_CALLERS = {'enter_allocated', R + 'enter', R + 'resume', R + 'interrupted'}
 LOAD = 'natemu_abi::guest_memory::copy_volatile'                 # `load()`, inlined: the record copy
 # A nested gate entry's path to its halt: the gate's chain, then the calls its last function makes before halting.
 NESTED = {'exception_capture': (['finish', R + 'returned', R + 'aborted'],
-                                [LOAD, 'natemu_runtime::cache::block_at', R + 'halt']),
-          'stop_gate': (['finish', R + 'returned', R + 'stopped'],
-                        [LOAD, 'natemu_runtime::cache::block_at', R + 'halt'])}
+                                [LOAD, 'natemu_runtime::cache::block_at', R + 'halt'])}
 # Declared shared bodies: a branch from the function into the target's body past its prologue, after an identical
 # prologue of its own: counts the target's depth without its frame.
 SHARED_BODIES = set()
@@ -232,9 +231,10 @@ def eret_problems(funcs, words, tops):
             problems.append(f'{gate} save sequence differs from the declared gate shape')
     vec = funcs.get('vectors', [])
     branches = [(a - vec[0][0], i) for a, i in vec if i != 'nop'] if vec else []
+    target = lambda k: 'irq_gate' if k == 1 else 'exception_capture'
     if [a for a, _ in branches] != [128 * k for k in range(16)] or \
-            any(not re.fullmatch(r'b 0x[0-9a-f]+ <exception_capture>', i) for _, i in branches):
-        problems.append('vectors are not 16 branches to exception_capture at 128-byte spacing')
+            any(not re.fullmatch(rf'b 0x[0-9a-f]+ <{target(k)}>', i) for k, (_, i) in enumerate(branches)):
+        problems.append('vectors are not 16 branches at 128-byte spacing, the second to irq_gate, the others to exception_capture')
     return problems
 
 

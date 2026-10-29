@@ -1,6 +1,6 @@
 """S1c checks: profile slice1 of fexc (block cutting at an allowlist, single-gate exits, profile record).
 
-Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series11 build)
+Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series12 build)
 
 The x86 bytes below are assembled by hand and only drive the compiler; every expectation (where the block ends, why)
 comes from the instruction's architectural class, never from fexc's output. The cut position is also compared with a
@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402  (disassemble, object reader)
 import scan_skips  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series11/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series12/obj/fexc')
 REPO = HERE.parents[1]
 RIP = 0x102000
 PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
@@ -231,7 +231,11 @@ class Slice1Cutting(unittest.TestCase):
         self.assertGreater(d['code']['layout']['code_region_end'], 32768)
         entries = d['pc_table']['entries']
         self.assertEqual([e['guest_offset'] for e in entries], [0] + [4 * k for k in range(1500)])
-        self.assertEqual([e['native_offset'] for e in entries], sorted({e['native_offset'] for e in entries}))
+        # The block entry and its first instruction share native offset 4 (no stop check before it, E1b); then one
+        # strictly increasing offset per instruction.
+        native = [e['native_offset'] for e in entries]
+        self.assertEqual(native[:2], [4, 4])
+        self.assertEqual(native[1:], sorted(set(native[1:])))
         with tempfile.TemporaryDirectory() as t:
             self.assertEqual(verify_precision.verify(d, Path(t))[0], [])
 
@@ -271,7 +275,7 @@ class Slice1Cutting(unittest.TestCase):
 # The code touches no emulator data, and its only ways out are the resident's: a literal exit is exactly a guest-RIP move
 # into x0 then `svc #1` (the resident links it), a computed one `mov x0, xR` then the placeholder `b .` at a
 # dispatch_branch relocation (the resident relocates it to its dispatcher). The only other `svc`s are the 128/64
-# division's (verify_precision.py P11 checks its #DE branch); the only `bl` is the entry's stop check.
+# division's (verify_precision.py P11 checks its #DE branch); there is no `bl` (no stop check: E1b unlinks instead).
 def literal_exits(d):
     return sorted(r['guest_rip'] for r in d['code']['relocations'] if r['kind'] == 'guest_rip_move' and r['register'] == 0)
 
@@ -300,13 +304,12 @@ def check_exits(test, d, tmp, what):
             test.assertEqual(t, f'b {o:#x}', (what, o))
             test.assertRegex(lines[i - 1][1], r'^mov x0, x([1-9]|[12]\d|30)$', (what, o))
         else:
-            test.assertIsNone(re.match(r'(blr|br|ret|bl)\s', t) if o != 4 else None, (what, o, t))
+            test.assertIsNone(re.match(r'(blr|br|ret|bl)\s', t), (what, o, t))
             test.assertIsNone(re.match(r'svc\s', t) if t not in ('svc #0x3', 'svc #0x4') else None, (what, o, t))
             test.assertIsNone(re.search(r'\[(x28|sp)\b', t), (what, o, t))       # no frame or stack access
             test.assertIsNone(re.match(r'ldr\w* \w+, 0x', t), (what, o, t))         # no literal load
             if t.lower() != 'mrs x25, nzcv':
                 test.assertIsNone(re.match(r'\w+ [wx]25\b', t), (what, o, t))       # x25: only the pre-NZCV save
-    test.assertEqual(dis.get(4), 'bl 0x4', what)
     test.assertTrue(exits, what)
     return exits, '\n'.join(f'{o:4x}: {t}' for o, t in lines)
 
@@ -394,8 +397,8 @@ class Slice1DivisionChecks(unittest.TestCase):
 
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
 class Slice1SelfLoopsAndStop(unittest.TestCase):
-    """S2c0: a jcc back to its own block's entry exits like any taken edge; every block starts with the stop check."""
-    STOP = 0x94000000   # bl . (the resident relocates it to the stop pad)
+    """S2c0: a jcc back to its own block's entry exits like any taken edge; E1b: no block has a stop check."""
+    STOP = 0x94000000   # bl . (E1's stop check, gone)
 
     def test_self_loop_exits(self):
         body = '4883c001' + '48ffc9'   # add rax,1 ; dec rcx  (7 bytes)
@@ -436,16 +439,15 @@ class Slice1SelfLoopsAndStop(unittest.TestCase):
                     dis = check_sites.disassemble(code, end, Path(t), lit)
                     self.assertEqual(vp.entry_and_branches(d, dis, sorted(dis)), [])   # P12, P13
 
-    def test_stop_check_is_the_entry_of_every_block(self):
+    def test_no_block_has_a_stop_check(self):
         for name, x in list(BRANCHES.items()) + [('add', '4801d8'), ('push', '50'), ('mov [rax],rcx', '488908'), ('div', '48f7f1')]:
             with self.subTest(name):
                 d, rc = run(x)
                 self.assertEqual(rc, 0)
                 code = bytes.fromhex(d['code']['hex'])
-                self.assertEqual(int.from_bytes(code[4:8], 'little'), self.STOP)
-                self.assertEqual(d['code']['layout']['entries'][0]['body_native_offset'], 8)
-                words = [int.from_bytes(code[o:o + 4], 'little') for o in range(8, d['code']['layout']['code_region_end'], 4)]
-                self.assertNotIn(self.STOP, words)                                      # only at the entry
+                self.assertEqual(d['code']['layout']['entries'][0]['body_native_offset'], 4)   # the entry is the body
+                words = [int.from_bytes(code[o:o + 4], 'little') for o in range(4, d['code']['layout']['code_region_end'], 4)]
+                self.assertNotIn(self.STOP, words)
 
     def test_p12_p13_mutations(self):
         import verify_precision as vp
@@ -457,11 +459,9 @@ class Slice1SelfLoopsAndStop(unittest.TestCase):
             dis = check_sites.disassemble(code, end, Path(t), lit)
             order = sorted(dis)
             self.assertEqual(vp.entry_and_branches(d, dis, order), [])
-            nop = 'mov x0, x0'
             for what, mutate, why in (
-                    ('stop check removed', lambda m: m.update({4: nop}), 'pinned entry sequence'),
-                    ('moved to the second word', lambda m: m.update({4: m[8], 8: m[4]}), 'pinned entry sequence'),
-                    ('a second bl later', lambda m: m.update({0x14: 'bl 0x4'}), 'call, return or indirect branch'),
+                    ('a stop check at the entry', lambda m: m.update({4: 'bl 0x4'}), 'call, return or indirect branch'),
+                    ('a bl later', lambda m: m.update({0x14: 'bl 0x4'}), 'call, return or indirect branch'),
                     ('a return', lambda m: m.update({0x14: 'ret'}), 'call, return or indirect branch'),
                     ('the old stop store', lambda m: m.update({0x14: 'str xzr, [x28, #0xec0]'}), 'emulator data'),
                     ('a frame load', lambda m: m.update({0x14: 'ldr x1, [x28, #0xb68]'}), 'emulator data'),

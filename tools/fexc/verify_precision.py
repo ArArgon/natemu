@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1b1 check: the slice-1 precision guarantee, verified statically on the code fexc emits (profile slice1).
 
-usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series11 build)
+usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series12 build)
 
 Corpora: fixtures/slice1/programs.json, the single-instruction matrix of scan_skips.py, the adversarial programs below
 (one per precision patch), and every CORPUS.json given (gen_slice1.py format, e.g. a fresh `--seed` corpus).
@@ -42,10 +42,10 @@ For every compile, from the disassembly, the sites, the dense PC table and the s
       P1/P2 at each divide branch then give the state before the instruction, relying on the resident's contract (only
       x0-x2 change; NZCV kept; the runtime's `division`). Admission (crates/host/src/admission/structure.rs) checks the
       same forms on every block it admits.
-  P12 (E1, see entry_and_branches()): the entry prologue is exactly the stop check's placeholder `bl .` followed by the
-      first guest instruction (no spill, no TF check): the resident relocates it to the vCPU's stop pad, and a kick takes
-      execute permission from the pad, so the state at the stop is the entry state. No other `bl`, `blr`, `br` or `ret`
-      in the block, no x28 frame access, no sp access and no literal load (the code touches no emulator data);
+  P12 (E1, E1b, see entry_and_branches()): the entry prologue is empty: the block's first word is its first guest
+      instruction (no stop check, spill or TF check; the resident stops a vCPU by unlinking the interrupted block's
+      exits). No `bl`, `blr`, `br` or `ret` in the block, no x28 frame access, no sp access and no literal load (the code
+      touches no emulator data);
   P13 (S2c0): every branch in the block goes forward to an instruction of the code region, so a block never loops
       internally: a jcc back to its own entry exits through the gate like any taken edge (no multiblock, no self-loop).
 Assumption by construction, NOT checked: every static-register write of guest instruction k-1 is emitted before the PC-table
@@ -70,7 +70,7 @@ import check_sites, scan_skips  # noqa: E402
 from check_sites import code_vs_sites  # noqa: E402
 import flags as F  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series11/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series12/obj/fexc')
 
 NZCV_WRITERS = {'adds', 'adcs', 'subs', 'sbcs', 'ands', 'bics', 'negs', 'ngcs', 'cmp', 'cmn', 'tst', 'ccmp', 'ccmn', 'fcmp',
                 'fcmpe', 'fccmp', 'fccmpe', 'setf8', 'setf16', 'rmif', 'cfinv', 'axflag', 'xaflag'}
@@ -580,11 +580,9 @@ def divides(d, dis, order, stubs, check_at):
 def entry_and_branches(d, dis, order):
     """P12 and P13 on one compile."""
     out = []
-    if dis.get(4) != 'bl 0x4':
-        out.append(f'prologue +4: "{dis.get(4)}" is not the pinned entry sequence (the stop check `bl .`)')
     le = d['code']['layout']['entries'][0]
-    if (le['entry_native_offset'], le['body_native_offset']) != (4, 8) or d['code']['layout']['spill_bytes']:
-        out.append(f'entry prologue is [{le["entry_native_offset"]}, {le["body_native_offset"]}) with {d["code"]["layout"]["spill_bytes"]} spill bytes, not [4, 8) (spill or TF check in the prologue)')
+    if (le['entry_native_offset'], le['body_native_offset']) != (4, 4) or d['code']['layout']['spill_bytes']:
+        out.append(f'entry prologue is [{le["entry_native_offset"]}, {le["body_native_offset"]}) with {d["code"]["layout"]["spill_bytes"]} spill bytes, not empty at 4 (a stop check, spill or TF check in the prologue)')
     for off in order:
         acc = check_sites.native_access(dis[off])
         mn = dis[off].split(' ')[0]
@@ -592,7 +590,7 @@ def entry_and_branches(d, dis, order):
             out.append(f'+{off} "{dis[off]}" accesses emulator data ({acc[2]})')
         if re.fullmatch(r'ldr\w* \w+, 0x[0-9a-f]+', dis[off]):
             out.append(f'+{off} "{dis[off]}" is a literal load')
-        if mn in ('blr', 'br', 'ret') or (mn == 'bl' and off != 4):
+        if mn in ('bl', 'blr', 'br', 'ret'):
             out.append(f'+{off} "{dis[off]}" is a call, return or indirect branch')
         if mn in ('b', 'cbz', 'cbnz', 'tbz', 'tbnz') or mn.startswith('b.'):
             t = int(re.findall(r'0x([0-9a-f]+)$', dis[off])[0], 16)

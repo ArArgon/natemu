@@ -77,11 +77,11 @@ class Binary(unittest.TestCase):
             'an unsaved register in a gate': (r'^.*stp\tq30, q31, \[sp, #0x2e0\]\n', ''),
             'an indirect call in reachable code': (r'^(\s*[0-9a-f]+:\s+)mov\tx0, sp$', r'\1blr\tx8'),
             'a stack switch outside the gates': (r'^(\s*[0-9a-f]+:\s+)mov\tx8, sp$', r'\1mov\tsp, x8'),
-            'a frame beyond a reserve': (r'(sub\tsp, sp, #)0x5a0$', r'\g<1>0x5000'),
+            'a frame beyond a reserve': (r'(sub\tsp, sp, #)0xb50$', r'\g<1>0x5000'),
             'a stack use in the dispatcher': (r'^(\s*[0-9a-f]+:\s+)and\tx1, x0, #0xfff$', r'\1str\tx0, [sp, #-0x10]!'),
             'a literal load in the dispatcher': (r'^(\s*[0-9a-f]+:\s+)and\tx1, x0, #0xfff$', r'\1ldr\tx1, 0x1000 <_start>'),
             'a vector to the wrong place': (r'(<vectors>:\n\s*[0-9a-f]+:\s+b\t)0x[0-9a-f]+ <exception_capture>',
-                                            r'\g<1>0x8000400a5000 <stop_gate>'),
+                                            r'\g<1>0x8000400a5000 <irq_gate>'),
         }
         for name, (pattern, replacement) in cases.items():
             with self.subTest(name):

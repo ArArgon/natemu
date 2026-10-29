@@ -20,11 +20,18 @@ use crate::{
 pub const MODE: u64 = 32;
 /// Resident → host: translate at `cpu.rip` (state record holds the request).
 pub const TRANSLATE_HVC: u64 = 0x4b;
-/// Resident → host: kick vCPU `x0` (see [`cache::PAD`]); returns at once.
-pub const KICK_HVC: u64 = 0x4c;
+/// The GIC SGI a resident sends a peer to stop it ([`STOP_WORD`]; `ICC_SGI1R_EL1`). The host's doorbell for vCPU v is
+/// the SPI `spi_base + v` (`hv_gic_set_spi`), routed to it.
+pub const KICK_SGI: u64 = 1;
+/// A precise stop by IRQ-triggered unlinking: the resident's IRQ handler (a doorbell: a host SPI or a peer's SGI) stops a
+/// vCPU interrupted in the dispatcher, L1 or at a block's first word at once; interrupted inside a block, it patches
+/// every exit of that block (each link point's first word and the computed exit's `b`) to this `brk`, so the block
+/// stops at its exit with the exit's exact state, and restores the words at the next resident entry.
+pub const STOP_IMM: u16 = 6;
+pub const STOP_WORD: u32 = 0xd420_0000 | (STOP_IMM as u32) << 5;
 
 /// `svc` immediates of the resident entries made from generated code (fexc `FexcSvc`). Generated code touches no
-/// emulator data: these and the stop pad's `bl` are its only ways into the resident.
+/// emulator data: these, the check stubs, aborts and interrupts are its only ways into the resident.
 pub mod svc {
     /// A literal exit (a [`super::LinkPoint`]), its target RIP in x0: the linker.
     pub const LINK: u16 = 1;
@@ -60,8 +67,6 @@ pub const STATE_VA: u64 = PRIVATE + STATE_OFFSET as u64;
 pub const FRAME_OFFSET: usize = 0x23000;
 pub const FRAME_VA: u64 = PRIVATE + FRAME_OFFSET as u64;
 pub const FRAME_POINTER: u64 = FRAME_VA;
-/// Native offset of a block's stop check, `bl` to the stop pad ([`cache::PAD`]): its first word, the entry itself.
-pub const STOP_BL: u32 = ENTRY_OFFSET;
 /// Host-written admitted object (header, code, tables).
 pub const STAGING_OFFSET: usize = 0x70000;
 pub const STAGING_BYTES: usize = 0x20000;
@@ -87,24 +92,15 @@ pub mod cache {
     use crate::PRIVATE;
     const MIB: usize = 1 << 20;
     /// Code area: executable alias (blocks run here) and writable alias (the resident places them there). It starts
-    /// with a head the resident fills ([`PAD`], [`SLOT`], [`DISPATCH`], [`L1_CODE`]); blocks follow from [`HEAD_BYTES`].
+    /// with a head the resident fills ([`SLOT`], [`DISPATCH`], [`L1_CODE`]); blocks follow from [`HEAD_BYTES`].
     pub const CODE_VA: u64 = PRIVATE + 0x1000_0000;
     pub const CODE_WRITE_VA: u64 = PRIVATE + 0x2000_0000;
     /// Default capacity for blocks (after the head).
     pub const CODE_BYTES: usize = 16 * MIB;
-    /// The whole area, head included: every branch inside it (links, the stop `bl`, the dispatcher `b`) is one
-    /// `b`/`bl` (±128 MiB).
+    /// The whole area, head included: every branch inside it (links, the dispatcher `b`) is one `b` (±128 MiB).
     pub const CODE_BYTES_MAX: usize = 128 * MIB;
-    /// The stop pad: a `ret` alone in the area's first 16 KiB (the largest IPA granule), so one stage-2 granule per vCPU
-    /// holds it and nothing else. Every block entry is `bl` to it; to stop a running vCPU the host removes execute
-    /// permission from that granule (a kick), so its next block entry takes a stage-2 instruction abort at the pad with
-    /// the entry state intact (x30, an allocator temporary, holds the `bl`'s return address), and the host enters the
-    /// resident's stop gate.
-    pub const PAD: usize = 0;
-    pub const PAD_BYTES: usize = 0x4000;
-    pub const PAD_VA: u64 = CODE_VA + PAD as u64;
     /// The single-step slot: the uncached one-instruction block ([`STEP`]).
-    pub const SLOT: usize = 0x4000;
+    pub const SLOT: usize = 0;
     pub const SLOT_BYTES: usize = 0x10000;
     pub const SLOT_VA: u64 = CODE_VA + SLOT as u64;
     pub const SLOT_WRITE_VA: u64 = CODE_WRITE_VA + SLOT as u64;
@@ -183,6 +179,21 @@ pub mod cache {
         pub l1_context: [u64; 2],
         /// Link records in use.
         pub links: u64,
+        /// The armed stop ([`super::STOP_WORD`]): `armed` words of the interrupted block, each (code-area offset, its
+        /// word before the patch), restored at the next resident entry.
+        pub armed: u64,
+        pub armed_words: [[u32; 2]; super::MAX_LINK_POINTS + 1],
+        /// Doorbells: IRQs acknowledged (spurious ones excluded), of which SGIs, and the CNTVCT ticks spent in their
+        /// acknowledge and end (`ICC_IAR1_EL1` read to `ICC_EOIR1_EL1` write); SGIs sent to peers and the ticks of
+        /// their `ICC_SGI1R_EL1` writes.
+        pub irqs: u64,
+        pub irq_sgis: u64,
+        pub irq_ticks: u64,
+        pub sgis: u64,
+        pub sgi_ticks: u64,
+        /// Stops armed again in the interrupted block after a resident entry that resumed it mid-block (a division,
+        /// a retried access, a split store).
+        pub rearms: u64,
     }
     /// A block placed in the cache: its record in the metadata arena (at the offset `INDEX` lists), its access sites
     /// ([`crate::code_object::Site`]) right after it.
@@ -203,6 +214,8 @@ pub mod cache {
         pub number: u32,
         /// [`DEAD`], [`STEP`].
         pub flags: u32,
+        /// Native offset of its computed exit's `b` to the dispatcher (0: none).
+        pub dispatch_exit: u32,
         /// Its literal exits as admitted (`offset` 0 = unused).
         pub links: [super::LinkPoint; super::MAX_LINK_POINTS],
     }
@@ -256,7 +269,7 @@ pub mod cache {
     const _: () = assert!(LOOKUP_VA + LOOKUP_BYTES as u64 <= GLOBAL_VA);
     const _: () = assert!(GLOBAL_VA + GLOBAL_BYTES as u64 <= PRIVATE + (1 << 30));
     const _: () = assert!(HEAD_BYTES + CODE_BYTES <= CODE_BYTES_MAX && CODE_BYTES % BLOCK == 0);
-    const _: () = assert!(MAX_BLOCK_BYTES <= SLOT_BYTES && PAD + PAD_BYTES <= SLOT && HEAD_BYTES % 64 == 0);
+    const _: () = assert!(MAX_BLOCK_BYTES <= SLOT_BYTES && HEAD_BYTES % 64 == 0);
     const _: () = assert!((CODE_VA | CODE_WRITE_VA | META_VA | LOOKUP_VA | GLOBAL_VA) % BLOCK as u64 == 0);
     const _: () = assert!(CODE_OFFSET % BLOCK == 0 && META_BYTES % BLOCK == 0);
     const _: () = assert!(core::mem::size_of::<Control>() <= L2 && L2 + L2_ENTRIES * 16 <= INDEX);
@@ -299,9 +312,8 @@ pub struct LinkPoint {
 impl LinkPoint {
     pub const NONE: Self = Self { offset: 0, word: 0, target: 0 };
 }
-/// The placeholders fexc emits for the resident to relocate when it places a block: the stop check at [`STOP_BL`]
-/// (`bl .`, becomes `bl` to [`cache::PAD`]) and a computed exit's branch (`b .`, becomes `b` to [`cache::DISPATCH`]).
-pub const STOP_PLACEHOLDER: u32 = 0x9400_0000;
+/// The placeholder fexc emits for the resident to relocate when it places a block: a computed exit's branch (`b .`,
+/// becomes `b` to [`cache::DISPATCH`]).
 pub const DISPATCH_PLACEHOLDER: u32 = 0x1400_0000;
 /// Link points per block: a slice-1 block ends at one branch (a jcc has two literal exits); admission refuses more.
 pub const MAX_LINK_POINTS: usize = 4;
@@ -523,8 +535,8 @@ pub mod stop {
     pub const BAD_LINK: u64 = 9;
     /// The host parked the vCPU ([`super::REPLY_PARK`]).
     pub const PARKED: u64 = 10;
-    /// The stop gate was entered other than from a live block's stop `bl` (`super::STOP_BL`, by x30) at the pad, from
-    /// EL1t.
+    /// A stop that is not one: an IRQ outside generated code or in a dead block, a [`super::STOP_WORD`] trap at a word
+    /// the resident did not patch, or an armed patch record whose words do not hold the stop word.
     pub const BAD_STOP: u64 = 11;
     /// A system instruction whose form or operand value the resident does not implement (e.g. MOV from CR2, a CR0 or
     /// CR4 feature bit change, CR3 with PWT/PCD); nothing of it was executed.
@@ -613,10 +625,23 @@ pub struct State {
     pub steps: u64,
     /// Peers asked to drop their writable shadows of a page this vCPU marked for a block (and waited for).
     pub shootdowns: u64,
-    /// The resident's stop gate (written at start): where the host enters a vCPU stopped at a block entry by a kick.
-    pub stop_gate: u64,
-    /// Stops taken at the stop gate.
+    /// A doorbell asked for a stop that is not yet taken (its block's exits are patched; [`super::STOP_WORD`]).
+    pub stop_wanted: u64,
+    /// Stops taken, and where: at once (interrupted at a block's first word; in the dispatcher; in L1), at a patched
+    /// exit, or at a resident entry made at a block boundary while armed (linker, dispatcher miss, step, halt).
     pub stops: u64,
+    pub stops_entry: u64,
+    pub stops_dispatch: u64,
+    pub stops_l1: u64,
+    pub stops_exit: u64,
+    pub stops_resident: u64,
+    /// Blocks armed by a doorbell; doorbells that found the stop already armed (merged into it); doorbells that
+    /// interrupted the step block.
+    pub arms: u64,
+    pub merged: u64,
+    pub irqs_step: u64,
+    /// CNTVCT when the last stop was taken.
+    pub stop_ticks: u64,
     /// With a [`REPLY_SYSTEM`] reply: the decoded instruction.
     pub system: System,
     /// System instructions the resident began executing as transactions: counted on entry, so those refused
@@ -657,8 +682,17 @@ impl State {
             invalidations: 0,
             steps: 0,
             shootdowns: 0,
-            stop_gate: 0,
+            stop_wanted: 0,
             stops: 0,
+            stops_entry: 0,
+            stops_dispatch: 0,
+            stops_l1: 0,
+            stops_exit: 0,
+            stops_resident: 0,
+            arms: 0,
+            merged: 0,
+            irqs_step: 0,
+            stop_ticks: 0,
             system: System::NONE,
             systems: 0,
         }

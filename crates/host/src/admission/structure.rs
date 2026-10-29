@@ -3,9 +3,9 @@
 //! (`tools/fexc/verify_precision.py` P8-P11). One linear pass decodes every executable word with a small table of the
 //! A64 classes fexc emits (anything else is refused, never guessed) and applies the per-word rules; each access site,
 //! check stub and exit is then verified in a short backward window. Generated code touches no emulator data: its only
-//! ways into the resident are `svc`, the check stubs, aborts and the stop pad. Rules:
+//! ways into the resident are `svc`, the check stubs, aborts and interrupts. Rules:
 //!
-//! - Words: only the decoded classes; `mrs`/`msr` of NZCV only; no `ret`, `br`, `blr`, system or SIMD instruction; the
+//! - Words: only the decoded classes; `mrs`/`msr` of NZCV only; no `ret`, `bl`, `br`, `blr`, system or SIMD instruction; the
 //!   only exception-generating words are the stubs' `brk` and `svc #LINK` / `#DIV_U` / `#DIV_S` (below); x28 is never
 //!   written, x25 only by `mrs x25, nzcv` (the pre-NZCV save); sp is neither written nor accessed; direct branches go
 //!   forward to a decoded word of the code region; no word falls through into a literal slot or past the region; there
@@ -21,13 +21,10 @@
 //!   before the access.
 //! - Split: every store wider than one byte has `add x0, xA, #w-1; eor x0, x0, xA; tbnz w0, #12, S` on exactly its
 //!   address, only x0/x1 written between it and the store (guest-RIP-addressed: `b S` iff it crosses a page).
-//! - Entry: the first word is exactly the stop check's placeholder `bl .`, which the resident relocates to its stop pad
-//!   (a kick takes execute permission from the pad, so the stop is precise: the next block entry faults with the entry
-//!   state intact). It is the only `bl`.
 //! - Exits: a literal exit is a link point, exactly a guest-RIP move into x0 then `svc #LINK`, its value the block end
 //!   or the decoded target of its branch, and no branch enters it after its first word (the linker rewrites that word
-//!   to `b` the target's entry); `svc #LINK` occurs nowhere else. A computed exit (at most one) is exactly `mov x0, xR;
-//!   b .` at a dispatch relocation (the resident relocates the `b` to its dispatcher), with `eor x0, xG, xG, lsl #16;
+//!   to `b` the target's entry; a precise stop patches it to the resident's stop `brk`); `svc #LINK` occurs nowhere else. A computed exit (at most one) is exactly `mov x0, xR;
+//!   b .` at a dispatch relocation (the resident relocates the `b` to its dispatcher, and a stop patches it), with `eor x0, xG, xG, lsl #16;
 //!   tbnz x0, #63, G` in its instruction (G a branch-target guard, xG's value reaching xR through moves) and no branch
 //!   into it after the check. Admission returns the link points and the dispatch branch.
 //! - Division: each div/idiv (from its x86 opcode: width, signedness) has exactly its per-width #DE checks, in their
@@ -37,11 +34,12 @@
 //!   window (from the check's first word to the access, exit or divide) from before it.
 //!
 //! Premise: register values derived from x28 (a private address) may flow anywhere, because every guest access is
-//! guarded on its exact address and every private address has bit 47 != bit 63 (non-canonical).
+//! guarded on its exact address and every private address has bit 47 != bit 63 (non-canonical). x30 is an ordinary
+//! allocator temporary: no `bl` is admitted, so it never holds a return address the resident relies on.
 use std::ops::Range;
 
 use natemu_abi::code_object::{self as object, PcEntry, Reloc, Site};
-use natemu_abi::execution::{DISPATCH_PLACEHOLDER, ENTRY_OFFSET, LinkPoint, PRE_NZCV_REG, STOP_BL, STOP_PLACEHOLDER, frame, svc};
+use natemu_abi::execution::{DISPATCH_PLACEHOLDER, ENTRY_OFFSET, LinkPoint, PRE_NZCV_REG, frame, svc};
 
 /// The 64-bit index forms (LSL, UXTX, SXTX) compute the same address: one extend value.
 const EXT_X: u8 = object::EXT_SXTX;
@@ -87,8 +85,6 @@ enum Insn {
     Cond(i64),
     /// `svc #imm`: a literal exit's (no return) or a division's (x0-x2 change).
     Svc(u16),
-    /// The stop check's placeholder `bl .` (x30 changes).
-    Bl,
     /// A computed exit's placeholder `b .` at a dispatch relocation (never returns).
     Dispatch,
     Brk,
@@ -106,7 +102,6 @@ impl Insn {
             }
             Insn::Literal { rt, .. } | Insn::Swap { rt, .. } => bit(rt),
             Insn::Svc(svc::DIV_U | svc::DIV_S) => 0b111, // the division's contract: x0-x2 change
-            Insn::Bl => 1 << 30,
             _ => 0,
         }
     }
@@ -146,7 +141,6 @@ fn decode(w: u32, at: u32) -> Option<Insn> {
         _ if w >> 16 == 0 => Udf,
         _ if w & 0xffe0_001f == 0xd420_0000 => Brk,
         _ if w & 0xffe0_001f == 0xd400_0001 => Svc((w >> 5) as u16),
-        STOP_PLACEHOLDER => Bl,
         _ if w & 0xfc00_0000 == 0x1400_0000 => B(rel(sext(w & 0x3ff_ffff, 26))),
         _ if w & 0xff00_0010 == 0x5400_0000 || w & 0x7e00_0000 == 0x3400_0000 => Cond(rel(sext(w >> 5 & 0x7_ffff, 19))),
         _ if w & 0x7e00_0000 == 0x3600_0000 => Cond(rel(sext(w >> 5 & 0x3fff, 14))),
@@ -306,7 +300,6 @@ struct Verifier<'a> {
 /// Verifies the code; returns its link points and its computed exit's dispatch branch.
 pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>), String> {
     let mut v = Verifier::new(c)?;
-    v.entry()?;
     v.words()?;
     v.sites()?;
     v.exits()?;
@@ -470,15 +463,6 @@ impl<'a> Verifier<'a> {
         disp == 0 || i32::try_from(disp).is_ok_and(|d| insn.windows(4).any(|b| b == d.to_le_bytes()))
     }
 
-    /// Every block begins with the stop check's placeholder (no branch can enter it: branches go forward, and `new`
-    /// requires each target to be a decoded word after its source).
-    fn entry(&self) -> Result<(), String> {
-        match self.insn(STOP_BL) {
-            Some(Insn::Bl) => Ok(()),
-            _ => Err(format!("entry prologue at {ENTRY_OFFSET:#x}: not the stop check `bl .`")),
-        }
-    }
-
     /// The per-word rules of the linear pass.
     fn words(&self) -> Result<(), String> {
         let fail = |at: u32, what: &str| Err(format!("{what} at {at:#x}"));
@@ -502,7 +486,6 @@ impl<'a> Verifier<'a> {
                 },
                 Insn::Swap { size, rs, rt, rn } => self.swap_word(size, rs, rt, rn, at)?,
                 Insn::Literal { .. } => return fail(at, "literal load"),
-                Insn::Bl if at != STOP_BL => return fail(at, "bl"),
                 // Division `svc`s are checked by `divisions`, link points' by `exits`.
                 Insn::Svc(svc::LINK | svc::DIV_U | svc::DIV_S) => {}
                 Insn::Svc(_) => return fail(at, "svc"),
@@ -1002,7 +985,7 @@ mod tests {
     use super::*;
     use natemu_abi::code_object::Header;
 
-    /// Real fexc (series11, profile slice1) objects and the guest bytes they were compiled from.
+    /// Real fexc (series12, profile slice1) objects and the guest bytes they were compiled from.
     macro_rules! fixture {
         ($name:literal) => {
             (
@@ -1039,10 +1022,10 @@ mod tests {
     const NOP: u32 = 0xaa00_03e0; // mov x0, x0
     const ADDRESS: (&[u8], &[u8]) = FIXTURES[0];
     const DIVISION: (&[u8], &[u8]) = FIXTURES[1];
-    /// `call rsp`: branch-target guard at 0x8, `mov x0, x22` at 0x40, the dispatch branch at 0x44.
+    /// `call rsp`: branch-target guard at 0x4, `mov x0, x22` at 0x3c, the dispatch branch at 0x40.
     const CALL: (&[u8], &[u8]) = FIXTURES[2];
     /// A word in the middle of a straight-line block (`mov x4, x20` after the first load).
-    const MIDDLE: (u32, u32) = (0x1c, 0xaa14_03e4);
+    const MIDDLE: (u32, u32) = (0x18, 0xaa14_03e4);
 
     #[test]
     fn real_blocks_are_admitted() {
@@ -1058,9 +1041,8 @@ mod tests {
         assert!(matches!(decode(0xd100_03ff, 0), Some(Insn::Data(Some(31))))); // sub sp, sp, #0
         assert!(matches!(decode(0xeb00_001f, 0), Some(Insn::Data(None)))); // cmp x0, x0
         assert!(matches!(decode(SVC_LINK, 0), Some(Insn::Svc(svc::LINK))));
-        assert!(matches!(decode(STOP_PLACEHOLDER, 0), Some(Insn::Bl)));
-        // ret eret hvc nop tlbi ic ldp ldar bl (other than the placeholder) br blr
-        for refused in [0xd65f_03c0, 0xd69f_03e0, 0xd400_0002, 0xd503_201f, 0xd508_871f, 0xd50b_7520, 0xa940_0780, 0xc8df_fc00, 0x9400_0001, 0xd61f_0020, 0xd63f_0060] {
+        // ret eret hvc nop tlbi ic ldp ldar bl (E1's stop placeholder `bl .` too) br blr
+        for refused in [0xd65f_03c0, 0xd69f_03e0, 0xd400_0002, 0xd503_201f, 0xd508_871f, 0xd50b_7520, 0xa940_0780, 0xc8df_fc00, 0x9400_0001, 0x9400_0000, 0xd61f_0020, 0xd63f_0060] {
             assert!(decode(refused, 0).is_none(), "{refused:#x}");
         }
         // unallocated: add-ext option 01 / imm3 5, add-shifted ROR, sf=0 with N=1 or imm6=32, bitfield N != sf
@@ -1076,84 +1058,83 @@ mod tests {
     }
 
     #[test]
-    fn the_stop_check_is_pinned_at_the_block_entry() {
-        assert_eq!(STOP_BL, 4);
+    fn no_stop_check_and_no_bl() {
+        // No block carries E1's stop placeholder `bl .`; it, the old stop store and the stop `brk` are refused anywhere.
         for (i, &f) in FIXTURES.iter().enumerate() {
             let h: Header = super::super::record(f.0, 0);
-            let w = u32::from_le_bytes(f.0[(h.code_offset + STOP_BL) as usize..][..4].try_into().unwrap());
-            assert_eq!(w, STOP_PLACEHOLDER, "fixture {i}");
+            let code = &f.0[h.code_offset as usize..][..h.code_region_end as usize];
+            assert!(code.chunks(4).all(|w| w != 0x9400_0000u32.to_le_bytes()), "fixture {i}");
         }
-        refused(ADDRESS, STOP_BL, STOP_PLACEHOLDER, NOP, "entry prologue"); // stop check removed
-        refused(ADDRESS, STOP_BL, STOP_PLACEHOLDER, STOP_PLACEHOLDER + 1, "unrecognised"); // bl .+4
-        // The placeholder anywhere else; the old stop store.
         let (at, old) = MIDDLE;
-        refused(ADDRESS, at, old, STOP_PLACEHOLDER, "bl at");
+        refused(ADDRESS, ENTRY_OFFSET, 0x8b07_0cd4, 0x9400_0000, "unrecognised"); // at the entry
+        refused(ADDRESS, at, old, 0x9400_0000, "unrecognised");
         refused(ADDRESS, at, old, 0xf907_639f, "frame access"); // str xzr, [x28, #3776]
+        refused(ADDRESS, at, old, natemu_abi::execution::STOP_WORD, "brk");
     }
 
     #[test]
     fn address_guards_are_verified() {
-        refused(ADDRESS, 0x10, 0xca01_4020, NOP, "address guard"); // eor x0, x1, x1, lsl #16 removed
-        refused(ADDRESS, 0x10, 0xca01_4020, 0xca02_4040, "address guard"); // guard on x2
-        refused(ADDRESS, 0x0c, 0x9100_4281, 0x9100_6281, "address guard"); // add x1, x20, #0x18: not the access's address
-        refused(ADDRESS, 0x08, 0x8b07_0cd4, 0x1400_0004, "address guard"); // b 0x18: enters the guarded window
-        refused(ADDRESS, 0x14, 0xb7f8_0900, NOP, "reached by 0 branches"); // tbnz removed
+        refused(ADDRESS, 0xc, 0xca01_4020, NOP, "address guard"); // eor x0, x1, x1, lsl #16 removed
+        refused(ADDRESS, 0xc, 0xca01_4020, 0xca02_4040, "address guard"); // guard on x2
+        refused(ADDRESS, 0x8, 0x9100_4281, 0x9100_6281, "address guard"); // add x1, x20, #0x18: not the access's address
+        refused(ADDRESS, 0x4, 0x8b07_0cd4, 0x1400_0004, "address guard"); // b 0x18: enters the guarded window
+        refused(ADDRESS, 0x10, 0xb7f8_0900, NOP, "reached by 0 branches"); // tbnz removed
         // add x6, x6, #1 between a read-modify-write's (shared) guard and its store
-        refused(ADDRESS, 0x94, 0xca04_0295, 0x9100_04c6, "read-modify-write store");
+        refused(ADDRESS, 0x90, 0xca04_0295, 0x9100_04c6, "read-modify-write store");
         let large = FIXTURES[5];
-        refused(large, 0x08, 0x5282_0001, 0x5284_0001, "address guard"); // mov w1, #0x2000 for an access at +0x1000
+        refused(large, 0x4, 0x5282_0001, 0x5284_0001, "address guard"); // mov w1, #0x2000 for an access at +0x1000
     }
 
     #[test]
     fn split_checks_are_verified() {
-        refused(ADDRESS, 0x34, 0x9100_1c20, 0x9100_0c20, "split check"); // add x0, x1, #3 for an 8-byte store
-        refused(ADDRESS, 0x34, 0x9100_1c20, NOP, "split check");
+        refused(ADDRESS, 0x30, 0x9100_1c20, 0x9100_0c20, "split check"); // add x0, x1, #3 for an 8-byte store
+        refused(ADDRESS, 0x30, 0x9100_1c20, NOP, "split check");
     }
 
     #[test]
     fn guest_rip_addresses_are_verified() {
         let (rip, noncanonical) = (FIXTURES[3], FIXTURES[4]);
-        refused(rip, 0x0c, 0x72a0_0214, 0x72a0_0234, "guest-RIP move"); // movk w20, #0x11, lsl #16
-        refused(rip, 0x20, 0x1400_0020, NOP, "reached by 0 branches"); // the crossing store's `b split`
-        refused(noncanonical, 0x14, 0x1400_000c, NOP, "reached by 0 branches"); // the non-canonical load's `b guard`
-        refused(noncanonical, 0x10, 0xf2d0_0014, 0xf2c0_0014, "guest-RIP move"); // canonical, but not the relocation
+        refused(rip, 0x8, 0x72a0_0214, 0x72a0_0234, "guest-RIP move"); // movk w20, #0x11, lsl #16
+        refused(rip, 0x1c, 0x1400_0020, NOP, "reached by 0 branches"); // the crossing store's `b split`
+        refused(noncanonical, 0x10, 0x1400_000c, NOP, "reached by 0 branches"); // the non-canonical load's `b guard`
+        refused(noncanonical, 0xc, 0xf2d0_0014, 0xf2c0_0014, "guest-RIP move"); // canonical, but not the relocation
         // Review H1: `mov rax, [rip + 0x40000ff9]` = PRIVATE (0x8000_4000_0000), `b G` jumped over by a branch between
         // the move and the `b`: the window is sealed from the move, the `b` included.
         let h: Header = super::super::record(noncanonical.0, 0);
         let (mut object, mut source) = (noncanonical.0.to_vec(), noncanonical.1.to_vec());
         source[3..7].copy_from_slice(&[0xf9, 0x0f, 0x00, 0x40]);
         let reloc = h.relocs_offset as usize;
-        assert_eq!(object[reloc..reloc + 6], [0x08, 0, 0, 0, object::RELOC_GUEST_RIP_MOVE, 20]);
+        assert_eq!(object[reloc..reloc + 6], [0x04, 0, 0, 0, object::RELOC_GUEST_RIP_MOVE, 20]);
         object[reloc + 8..reloc + 16].copy_from_slice(&0x8000_4000_0000u64.to_le_bytes());
-        for (at, w) in [(0x08, 0xd2a8_0014u32), (0x0c, 0xf2d0_0014), (0x10, 0x1400_0002)] {
+        for (at, w) in [(0x04, 0xd2a8_0014u32), (0x08, 0xf2d0_0014), (0x0c, 0x1400_0002)] {
             object[(h.code_offset + at) as usize..][..4].copy_from_slice(&w.to_le_bytes());
         }
         let e = admit((&object, &source)).expect_err("branch over `b guard` admitted");
         assert!(e.contains("a branch enters between its guest-RIP move and the access"), "{e}");
-        object[(h.code_offset + 0x10) as usize..][..4].copy_from_slice(&NOP.to_le_bytes());
+        object[(h.code_offset + 0x0c) as usize..][..4].copy_from_slice(&NOP.to_le_bytes());
         admit((&object, &source)).unwrap(); // the same block without the branch is admitted
     }
 
     #[test]
     fn computed_exits_are_verified() {
-        refused(CALL, 0x08, 0xca08_4100, 0xca09_4120, "branch-target guard"); // checks x9, exits through rsp's copy
-        refused(CALL, 0x38, 0xaa08_03f6, 0xaa09_03f6, "branch-target guard"); // mov x22, x9: an unchecked RIP
-        refused(CALL, 0x40, 0xaa16_03e0, 0xaa16_03e1, "does not follow `mov x0, xR`"); // mov x1, x22
-        refused(CALL, 0x40, 0xaa16_03e0, NOP, "does not follow `mov x0, xR`");
-        refused(CALL, 0x44, DISPATCH_PLACEHOLDER, DISPATCH_PLACEHOLDER + 1, "placeholder"); // a real branch
-        refused(CALL, 0x44, DISPATCH_PLACEHOLDER, SVC_LINK, "placeholder"); // a literal exit's gate instead
+        refused(CALL, 0x4, 0xca08_4100, 0xca09_4120, "branch-target guard"); // checks x9, exits through rsp's copy
+        refused(CALL, 0x34, 0xaa08_03f6, 0xaa09_03f6, "branch-target guard"); // mov x22, x9: an unchecked RIP
+        refused(CALL, 0x3c, 0xaa16_03e0, 0xaa16_03e1, "does not follow `mov x0, xR`"); // mov x1, x22
+        refused(CALL, 0x3c, 0xaa16_03e0, NOP, "does not follow `mov x0, xR`");
+        refused(CALL, 0x40, DISPATCH_PLACEHOLDER, DISPATCH_PLACEHOLDER + 1, "placeholder"); // a real branch
+        refused(CALL, 0x40, DISPATCH_PLACEHOLDER, SVC_LINK, "placeholder"); // a literal exit's gate instead
         // The placeholder where no dispatch relocation names it.
         let (at, old) = MIDDLE;
         refused(ADDRESS, at, old, DISPATCH_PLACEHOLDER, "not forward");
         // Admission returns the dispatch branch.
         let h: Header = super::super::record(CALL.0, 0);
         let a = super::super::admit(CALL.0, h.guest_rip, CALL.1, u64::MAX).unwrap();
-        assert_eq!((a.dispatch_exit, a.links.len()), (Some(0x44), 0));
+        assert_eq!((a.dispatch_exit, a.links.len()), (Some(0x40), 0));
     }
 
-    /// `jcc` (`cmp rax, rcx; jne +0x40`): the taken exit's link point at 0x20, the fall-through's at 0x14.
+    /// `jcc` (`cmp rax, rcx; jne +0x40`): the taken exit's link point at 0x1c, the fall-through's at 0x10.
     const JCC: (&[u8], &[u8]) = FIXTURES[6];
-    const LINK_FT: u32 = 0x14;
+    const LINK_FT: u32 = 0x10;
     const MOV_W0_5: u32 = 0x5280_00a0; // mov w0, #5 (then movk w0, #0x10, lsl #16: 0x100005)
 
     #[test]
@@ -1161,7 +1142,7 @@ mod tests {
         let h: Header = super::super::record(JCC.0, 0);
         let a = super::super::admit(JCC.0, h.guest_rip, JCC.1, u64::MAX).unwrap();
         let point = |offset, word, target| LinkPoint { offset, word, target };
-        assert_eq!(a.links, [point(LINK_FT, MOV_W0_5, h.guest_rip + 5), point(0x20, 0x5280_08a0, h.guest_rip + 0x45)]);
+        assert_eq!(a.links, [point(LINK_FT, MOV_W0_5, h.guest_rip + 5), point(0x1c, 0x5280_08a0, h.guest_rip + 0x45)]);
         assert_eq!(a.dispatch_exit, None);
     }
 
@@ -1172,13 +1153,13 @@ mod tests {
         refused(JCC, at + 8, SVC_LINK, SVC_DIV_U, "not a literal exit"); // the move then a division
         refused(JCC, at + 8, SVC_LINK, NOP, "not a literal exit"); // no gate: falls through into the next exit
         refused(JCC, at + 4, 0x72a0_0200, 0x9100_0400, "guest-RIP move"); // add x0, x0, #1 instead of the movk
-        // A branch into its later words (the b.ne at 0x10 targets the taken exit's first word, 0x20).
-        refused(JCC, 0x10, 0x5400_0081, 0x5400_0001 | (at + 4 - 0x10) / 4 << 5, "link point");
-        refused(JCC, 0x10, 0x5400_0081, 0x5400_0001 | (at + 8 - 0x10) / 4 << 5, "link point");
+        // A branch into its later words (the b.ne at 0xc targets the taken exit's first word, 0x1c).
+        refused(JCC, 0xc, 0x5400_0081, 0x5400_0001 | (at + 4 - 0xc) / 4 << 5, "link point");
+        refused(JCC, 0xc, 0x5400_0081, 0x5400_0001 | (at + 8 - 0xc) / 4 << 5, "link point");
         // `svc #LINK` anywhere else: in a straight-line block, or as a computed exit's gate.
         let (mid, old) = MIDDLE;
         refused(ADDRESS, mid, old, SVC_LINK, "not exactly a link point");
-        refused(CALL, 0x44, DISPATCH_PLACEHOLDER, SVC_LINK, "dispatch branch");
+        refused(CALL, 0x40, DISPATCH_PLACEHOLDER, SVC_LINK, "dispatch branch");
     }
 
     #[test]
@@ -1223,27 +1204,27 @@ mod tests {
 
     #[test]
     fn division_checks_are_pinned() {
-        refused(DIVISION, 0x100, 0xcb27_4000, 0xcb27_2000, "divide stub"); // div ecx: uxtw -> uxth
-        refused(DIVISION, 0x10, 0xd348_3ee0, 0xd349_42e0, "divide stub"); // div cl: ubfx x0, x23, #9, #8
-        refused(DIVISION, 0x180, SVC_DIV_U, SVC_DIV_S, "divide stub"); // div rcx with the signed division
-        refused(DIVISION, 0x1b4, 0xb400_0d54, 0xb400_0d55, "zero check"); // idiv: cbz x21, overflow tests x20
-        refused(DIVISION, 0x18, 0xb6f8_0000 | DIVISION_STUB_IMM, NOP, "reached by 0 branches"); // check removed
+        refused(DIVISION, 0xfc, 0xcb27_4000, 0xcb27_2000, "divide stub"); // div ecx: uxtw -> uxth
+        refused(DIVISION, 0xc, 0xd348_3ee0, 0xd349_42e0, "divide stub"); // div cl: ubfx x0, x23, #9, #8
+        refused(DIVISION, 0x17c, SVC_DIV_U, SVC_DIV_S, "divide stub"); // div rcx with the signed division
+        refused(DIVISION, 0x1b0, 0xb400_0d54, 0xb400_0d55, "zero check"); // idiv: cbz x21, overflow tests x20
+        refused(DIVISION, 0x14, 0xb6f8_0000 | DIVISION_STUB_IMM, NOP, "reached by 0 branches"); // check removed
         // The checks read FEX's own operands.
-        refused(DIVISION, 0x14, 0xcb34_0000, 0xcb35_0000, "operands"); // div cl: sub x0, x0, w21, uxtb (divisor is w20)
-        refused(DIVISION, 0x10, 0xd348_3ee0, 0xd348_3ec0, "operands"); // div cl: ubfx x0, x22 (dividend is x23)
-        refused(DIVISION, 0x64, 0x1300_1e81, 0x1300_1ea1, "operands"); // idiv bh: sxtb w1, w21
-        refused(DIVISION, 0xc4, 0x1300_3e81, 0x1300_3ea1, "operands"); // idiv r9w: sxth w1, w21 (FEX divides by sxth w1, w20)
-        refused(DIVISION, 0x16c, 0xb400_0f27, 0xb400_0f26, "operands"); // div rcx: cbz x6
-        refused(DIVISION, 0x17c, 0xaa07_03e2, 0xaa06_03e2, "operands"); // div rcx: the division gets x6 as divisor
+        refused(DIVISION, 0x10, 0xcb34_0000, 0xcb35_0000, "operands"); // div cl: sub x0, x0, w21, uxtb (divisor is w20)
+        refused(DIVISION, 0xc, 0xd348_3ee0, 0xd348_3ec0, "operands"); // div cl: ubfx x0, x22 (dividend is x23)
+        refused(DIVISION, 0x60, 0x1300_1e81, 0x1300_1ea1, "operands"); // idiv bh: sxtb w1, w21
+        refused(DIVISION, 0xc0, 0x1300_3e81, 0x1300_3ea1, "operands"); // idiv r9w: sxth w1, w21 (FEX divides by sxth w1, w20)
+        refused(DIVISION, 0x168, 0xb400_0f27, 0xb400_0f26, "operands"); // div rcx: cbz x6
+        refused(DIVISION, 0x178, 0xaa07_03e2, 0xaa06_03e2, "operands"); // div rcx: the division gets x6 as divisor
         // Review H1: FEX's 64-bit fast-path selector and the 8-bit dividend copy are pinned.
-        refused(DIVISION, 0x170, 0xb400_0125, 0xb400_0126, "selector"); // div rcx: cbz x6, inline
-        refused(DIVISION, 0x170, 0xb400_0125, 0xb400_013f, "selector"); // cbz xzr: always the inline divide
-        refused(DIVISION, 0x170, 0xb400_0125, 0x1400_0009, "selector"); // b inline
-        refused(DIVISION, 0x1d4, 0xca05_0000, 0xca00_0000, "selector"); // idiv: eor x0, x0, x0
-        refused(DIVISION, 0x0c, 0x5300_3c97, 0x5300_3cd7, "dividend"); // div cl: uxth w23, w6 (AX is w4)
-        refused(DIVISION, 0x08, 0x5300_1cf4, 0x5300_1ce4, "dividend"); // div cl: uxtb w4, w7 writes RAX first
+        refused(DIVISION, 0x16c, 0xb400_0125, 0xb400_0126, "selector"); // div rcx: cbz x6, inline
+        refused(DIVISION, 0x16c, 0xb400_0125, 0xb400_013f, "selector"); // cbz xzr: always the inline divide
+        refused(DIVISION, 0x16c, 0xb400_0125, 0x1400_0009, "selector"); // b inline
+        refused(DIVISION, 0x1d0, 0xca05_0000, 0xca00_0000, "selector"); // idiv: eor x0, x0, x0
+        refused(DIVISION, 0x8, 0x5300_3c97, 0x5300_3cd7, "dividend"); // div cl: uxth w23, w6 (AX is w4)
+        refused(DIVISION, 0x4, 0x5300_1cf4, 0x5300_1ce4, "dividend"); // div cl: uxtb w4, w7 writes RAX first
         // A division `svc` without its verdict, or anywhere else.
-        refused(DIVISION, 0x184, 0xb500_0e82, NOP, "reached by 0 branches");
+        refused(DIVISION, 0x180, 0xb500_0e82, NOP, "reached by 0 branches");
         let (at, old) = MIDDLE;
         refused(ADDRESS, at, old, SVC_DIV_U, "without its division");
     }
@@ -1261,17 +1242,17 @@ mod tests {
         assert!(matches!(decode(0x38e4_8294, 0), Some(Insn::Swap { size: 1, rs: 4, rt: 20, rn: 20 }))); // swpalb
         // Only the acquire-release swap: swp, swpa, swpl are refused (not FEX's xchg), as are other barriers and hints.
         for other in [0xb824_80c4, 0xb8a4_80c4, 0xb864_80c4, 0xd503_39bf, 0xd503_3bbf, 0xd503_3fdf, 0xd503_205f, 0xd503_3f9f] {
-            refused(XCHG, 0x18, 0xd503_3dbf, other, "unrecognised"); // swp swpa swpl; dmb ishld ish; isb; wfe; dsb sy
+            refused(XCHG, 0x14, 0xd503_3dbf, other, "unrecognised"); // swp swpa swpl; dmb ishld ish; isb; wfe; dsb sy
         }
-        refused(XCHG, 0x14, SWPAL_W4_X6, SWPAL_W4_X6 | 31, "XZR"); // swpal w4, wzr, [x6]: Rt = XZR loses the acquire
-        refused(XCHG, 0x14, SWPAL_W4_X6, SWPAL_W4_X6 + 1, "swap site"); // Rt w5: the record says w4
-        refused(XCHG, 0x14, SWPAL_W4_X6, SWPAL_W4_X6 + (1 << 16), "swap site"); // Rs w5
-        refused(XCHG, 0x14, SWPAL_W4_X6, SWPAL_W4_X6 & !(31 << 5) | 28 << 5, "swap site"); // [x28]: the frame
-        refused(XCHG, 0x14, SWPAL_W4_X6, SWPAL_W4_X6 | 1 << 30, "swap site"); // 8 bytes, recorded 4
-        refused(XCHG, 0x08, 0x5280_00a4, SWPAL_W4_X6, "swap at 0x8 is not a swap site"); // a swap where no site is
-        refused(XCHG, 0x14, SWPAL_W4_X6, 0xb900_00c4, "does not describe its instruction"); // str w4, [x6] at the swap site
-        refused(XCHG, 0x10, 0xb7f8_0360, NOP, "reached by 0 branches"); // the swap's guard branch removed
-        refused(XCHG, 0x0c, 0xca06_40c0, NOP, "address guard"); // its eor removed
+        refused(XCHG, 0x10, SWPAL_W4_X6, SWPAL_W4_X6 | 31, "XZR"); // swpal w4, wzr, [x6]: Rt = XZR loses the acquire
+        refused(XCHG, 0x10, SWPAL_W4_X6, SWPAL_W4_X6 + 1, "swap site"); // Rt w5: the record says w4
+        refused(XCHG, 0x10, SWPAL_W4_X6, SWPAL_W4_X6 + (1 << 16), "swap site"); // Rs w5
+        refused(XCHG, 0x10, SWPAL_W4_X6, SWPAL_W4_X6 & !(31 << 5) | 28 << 5, "swap site"); // [x28]: the frame
+        refused(XCHG, 0x10, SWPAL_W4_X6, SWPAL_W4_X6 | 1 << 30, "swap site"); // 8 bytes, recorded 4
+        refused(XCHG, 0x4, 0x5280_00a4, SWPAL_W4_X6, "swap at 0x4 is not a swap site"); // a swap where no site is
+        refused(XCHG, 0x10, SWPAL_W4_X6, 0xb900_00c4, "does not describe its instruction"); // str w4, [x6] at the swap site
+        refused(XCHG, 0xc, 0xb7f8_0360, NOP, "reached by 0 branches"); // the swap's guard branch removed
+        refused(XCHG, 0x8, 0xca06_40c0, NOP, "address guard"); // its eor removed
         // A guest-RIP swap whose operand crosses 16 bytes (`xchg [rip+0x18], eax` at 0x100000: 0x10001e) is refused.
         let e = admit(fixture!("xchg-rip-crossing")).expect_err("split lock admitted");
         assert!(e.contains("crosses a 16-byte boundary"), "{e}");

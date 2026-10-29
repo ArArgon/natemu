@@ -45,17 +45,24 @@ against sb-mfence's allowed set: it must show the forbidden SB outcome (the harn
 trial counts are judged as in a normal run; aligned and unaligned only (`--variants` with a split variant is refused: a split
 store completes in the resident with `dsb ish`, so SB cannot relax there).
 
-`kicks` (S3b, precise stop): (1) a hot linked loop (no exit once linked) on each of N vCPUs (own registers, shared
-code page), every vCPU kicked M times (default 10,000) by its own host kicker thread, R runs of it, P at once (P * N
-above the core count: oversubscribed); (2) a peer's resident kick: vCPU 1 writes data on vCPU 0's code page while vCPU
-0 spins in its hot loop, so vCPU 1's resident posts the page to vCPU 0 and kicks it (`hvc #KICK_HVC`); (3) forged stop
-PCs: vCPU V's first stop enters the stop gate with ELR = the word after the stop store, which must halt V (bad_stop)
-and cancel the others. Programs are natemu-smp-v1; the reference is a pinned QEMU system-mode run of the same program
-(tools/bench/smp, `-accel tcg,thread=multi`), compared with smp.compare. Per vCPU: reached its end, the per-vCPU checks,
-stops taken = kicks issued - a kick still pending at its end (none lost or doubled; kicks finding it in the host
-included), the resident's stop count = the host's, every stop PC a stop store of a placed block, and (hot loop) all M
-kicks issued while it ran. Latency (protect return -> stop exit, per vCPU) is reported. `corpora --kicks M` also kicks
-every vCPU M times (mostly while it is in the host or the resident) and adds the same accounting checks.
+`kicks` (S3b, E1b, precise stop): (1) a hot linked loop (no exit once linked) on each of N vCPUs (own registers, shared
+code page), every vCPU kicked M times (default 10,000) by its own host kicker thread (its GIC SPI doorbell), R runs of
+it, P at once (P * N above the core count: oversubscribed); (1b) adversarial: the same at N vCPUs with kicks at random
+times (0..`--jitter-us` after each stop) into `adversarial_program` (computed jumps through the dispatcher and L1 every
+round, a division `svc` resumed mid-block, self-modifying stores single-stepped, peers rung by SGI), and over all its
+runs stops must have been taken at every place (block entry, dispatcher, L1, armed exit, resident entry, in the step
+block, re-armed after a mid-block resume); (2) a peer's resident kick: vCPU 1 writes data on vCPU 0's
+code page while vCPU 0 spins in its hot loop, so vCPU 1's resident posts the page to vCPU 0 and rings its SGI; (3)
+forged stops: the stop word over vCPU V's first block entry (a stop nobody armed) and an armed-stop record whose word
+does not hold the stop word must each halt V (bad_stop) and cancel the others. Programs are natemu-smp-v1; the reference
+is a pinned QEMU system-mode run of the same program (tools/bench/smp, `-accel tcg,thread=multi`), compared with
+smp.compare. Per vCPU: reached its end, the per-vCPU checks and the doorbell accounting (`kick_checks`: host kicks
+acknowledged + still pending = issued, none lost or doubled, kicks finding it in the host included; stops + doorbells
+merged into an armed stop = doorbells; stops = the sum by place; nothing armed at the end; (hot loop) all M kicks issued
+while it ran, none merged). The resident validates every stop's place (a block's first word, the dispatcher or L1, a
+word it armed, or a resident entry at a block boundary; anything else halts bad_stop); the final state is compared with
+QEMU. Latency (ring -> the resident's stop, per vCPU, one clock) and the mean acknowledge cost are reported. `corpora
+--kicks M` also kicks every vCPU M times (mostly while it is in the host or the resident) and adds the same checks.
 
 `system` (S3c1, long-mode system instructions as resident transactions): see cmd_system. Each system program of
 tools/bench/smp/system.json runs at block sizes default and 1 against QEMU system mode (smp.SYSTEM_CPU), except the PTE
@@ -86,13 +93,14 @@ end within its bound (10 s; watchdog runs: the watchdog + 5 s) and print the dri
 and destroyed, the VM destroyed (status 0) and no child process left (no compile server alive or unreaped); each is
 followed at once by a fresh process running fixture programs on as many vCPUs, which must match QEMU. (1, 4) Every
 run-time tamper of the driver (forged literal exit, link-point offset, next-page reply given twice, system decode, linked
-word and link record before a flush, forged stop return address, access sites off the instruction grid or of the wrong kind) on each vCPU v at N = 1..4, the others in linked loops: v halts with
+word and link record before a flush, a computed exit naming the block entry, the stop word at a block entry, an armed
+record at a word without the stop word, access sites off the instruction grid or of the wrong kind) on each vCPU v at N = 1..4, the others in linked loops: v halts with
 its defence's stop (bad_link, bad_reply, bad_stop, unknown_abort, site_mismatch) with its FEX frame intact and its banked
 state at a block boundary the run reached (the system, site and site-kind tampers: the unchanged start state, rip
 0x100000 and every GPR 0), the others are cancelled, exit 0. A run that outlives its bound by 5 s is killed and fails.
 (2) A peer that never answers a
-shootdown (`--ignore-kicks` on vCPU k = 1..3 of 4: its stops resume without the gate, so it never drains, while a host
-kicker keeps it exiting every millisecond): vCPU 0, waiting in the resident for k's shadow reset, is stopped by its
+shootdown (`--ignore-kicks` on vCPU k = 1..3 of 4: its doorbells are disabled and its own watchdog is off, so it never
+stops or drains, while a host kicker rings it every millisecond, unheard): vCPU 0, waiting in the resident for k's shadow reset, is stopped by its
 watchdog, reported `resident` with k's `SHADOWS` request still pending; k is cancelled; an untampered control matches QEMU
 with a shootdown. (3) vCPU k's compile server (k = 1..3 of 4) killed before its 51st request: exit 1, stderr names the
 vCPU, the server and its signal; the same server stopped instead (SIGSTOP: alive, never answering): the request deadline
@@ -129,19 +137,28 @@ def driver(host, runtime, fexc, text, work, extra=(), timeout=None):
 
 
 def kick_checks(out, kicks=None):
-    """Kick accounting of one vCPU's output (`kicks`: every kick must have been issued)."""
+    """Doorbell accounting of one vCPU's output (`kicks`: every kick must have been issued)."""
     k, problems = out.get('kicks'), []
     if k is None: return ['no kick report']
-    if k['stops'] + k['pending'] != k['issued']: problems.append(f"stops {k['stops']} + pending {k['pending']} != issued {k['issued']}")
-    # A merge is a failure only when the host kicker is the vCPU's only kick source (`kicks` given): a peer's resident
-    # kick may legitimately land while another is pending.
-    if k['merged'] and kicks is not None: problems.append(f"{k['merged']} kicks merged")
-    if out['stats']['stops'] != k['stops']: problems.append(f"resident stops {out['stats']['stops']} != host {k['stops']}")
-    # Judged against the blocks placed at the end, so only without a flush after the driver's initial one (a flush, such
-    # as a CR3 load's, reuses code addresses; the resident's stop gate checks every stop PC when it is taken).
-    if not k['stops_at_entry'] and out['stats']['flushes'] <= 1: problems.append(f"stop PCs not at stop stores: {k['stop_pcs']}")
+    spi = k['irqs'] - k['irq_sgis']
+    # Every host kick is acknowledged once or still pending at the end (none lost or doubled).
+    if spi + k['pending'] != k['issued']: problems.append(f"host doorbells {spi} + pending {k['pending']} != issued {k['issued']}")
+    # Every doorbell stopped the vCPU once, or merged into the stop it had armed.
+    if k['stops'] + k['merged'] != k['irqs']: problems.append(f"stops {k['stops']} + merged {k['merged']} != doorbells {k['irqs']}")
+    places = k['stops_entry'] + k['stops_dispatch'] + k['stops_l1'] + k['stops_exit'] + k['stops_resident']
+    if places != k['stops']: problems.append(f"stops by place {places} != stops {k['stops']}")
+    if k['armed_at_end']: problems.append(f"{k['armed_at_end']} words still armed at the end")
+    if out['stats']['stops'] != k['stops']: problems.append(f"resident stops {out['stats']['stops']} != {k['stops']}")
+    # A merge is a failure only when the host kicker is the vCPU's only kick source (`kicks` given): it waits for each
+    # stop before the next kick, while a peer's resident kick may legitimately land on an armed stop.
+    if kicks is not None and k['merged']: problems.append(f"{k['merged']} doorbells merged")
     if kicks is not None and k['issued'] != kicks: problems.append(f"{k['issued']} of {kicks} kicks issued before the end")
     return problems
+
+
+def places(ks):
+    """Stops by place, summed over kick reports."""
+    return {p: sum(k[f'stops_{p}'] for k in ks) for p in ('entry', 'dispatch', 'l1', 'exit', 'resident')}
 
 
 def per_vcpu_checks(out):
@@ -225,7 +242,7 @@ def cmd_corpora(a, host, runtime):
         if a.kicks:
             ks = [e['kicks'] for e in entries if e.get('kicks')]
             print(f"N={n} kicks: issued {sum(k['issued'] for k in ks)}, in host {sum(k['in_host'] for k in ks)}, "
-                  f"stops {sum(k['stops'] for k in ks)}, pending at end {sum(k['pending'] for k in ks)}", flush=True)
+                  f"stops {sum(k['stops'] for k in ks)} {places(ks)}, pending at end {sum(k['pending'] for k in ks)}", flush=True)
         failed += counts['fail']
         results += entries
     (a.out / 'corpora.json').write_text(json.dumps({'results': results}, indent=1, default=str) + '\n')
@@ -399,6 +416,24 @@ def peer_program(iterations):
             'memory': [{'addr': '0x120000', 'size': 64, 'fill': 'zero'}, {'addr': '0x110800', 'size': 8, 'fill': 'zero'}]}
 
 
+def adversarial_program(n, iterations):
+    """N vCPUs on one shared code page, own registers. Each round: a computed jump into a function and a computed jump
+    back (the dispatcher and L1 every time), a 128/64 division (`svc`, resumed mid-block), and every 1,024th round a
+    store of the same byte over the next instruction (self-modifying code: the store is single-stepped, the page's blocks
+    are invalidated, and the peers holding them are posted and rung). The rounds' results stay in r8-r10."""
+    code = ref.assemble(
+        '1: lea r13, [rip + 3f]\nlea rax, [rip + 5f]\njmp rax\n'
+        '3: mov rdx, 1\nmov rax, rcx\ndiv rbx\nadd r8, rax\nadd r9, rdx\n'
+        'test ecx, 0x3ff\njnz 4f\nmov byte ptr [rip + 2f], 0x90\n2: nop\n'
+        '4: dec rcx\njnz 1b\njmp 6f\n'
+        '5: add r10, rcx\nrol r10, 3\njmp r13\n6:').hex()
+    gpr = lambda v: [f'{x:#x}' for x in (0, iterations + 13 * v, 0, 3, int(stack(v), 16), 0, 0, 0, 7 * v, 0, v)] + ['0x0'] * 5
+    return {'name': f'adversarial@{n}', 'ncpu': n, 'params': {}, 'format': 'natemu-smp-v1',
+            'bodies': [{'addr': '0x110000', 'code': code}], 'cpus': [{'rip': '0x110000', 'rflags': 0, 'gpr': gpr(v)} for v in range(n)],
+            # Data on the code page makes it writable (the self-modifying store).
+            'memory': [{'addr': '0x110800', 'size': 8, 'fill': 'zero'}]}
+
+
 def qemu_reference(prog, work):
     """The program's final state under pinned QEMU system mode (smp.parse_dump form)."""
     rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, smp.build_stub(work)), work, 'multi', timeout=600)
@@ -423,7 +458,7 @@ def judge_smp(prog, want, out, kicks):
 
 
 def cmd_kicks(a, host, runtime):
-    failures, report = [], {'hot': [], 'peer': [], 'forge': []}
+    failures, report = [], {'hot': [], 'adversarial': [], 'peer': [], 'forge': []}
     for n in a.cpus:
         prog = hot_program(n, a.iterations)
         want = qemu_reference(prog, a.out / 'qemu' / prog['name'])
@@ -440,10 +475,41 @@ def cmd_kicks(a, host, runtime):
             ks = e.get('kicks', [])
             lat = [k['latency_ns'] for k in ks]
             print(f"{e['name']} rep{e['rep']}: {'ok' if not e['diffs'] else 'FAIL ' + '; '.join(e['diffs'])[:400]}; "
-                  f"issued {[k['issued'] for k in ks]} in_host {[k['in_host'] for k in ks]} stops {[k['stops'] for k in ks]}; "
+                  f"issued {[k['issued'] for k in ks]} in_host {[k['in_host'] for k in ks]} stops {[k['stops'] for k in ks]} {places(ks)}; "
+                  f"ack ns {[k['ack_ns_mean'] for k in ks]}; ring ns {[k['ring_ns_mean'] for k in ks]}; "
                   f"latency p50/p99/p999/max us {[(l['p50'] / 1e3, l['p99'] / 1e3, l['p999'] / 1e3, l['max'] / 1e3) for l in lat]}", flush=True)
             failures += [f"{e['name']} rep{e['rep']}: {d}" for d in e['diffs']]
         report['hot'] += entries
+    # Adversarial: kicks at random times (0..J us after each stop) into a program that keeps every vCPU moving through
+    # blocks, the dispatcher, L1, mid-block resident entries and the step block, with peers' SGIs from its code writes.
+    # Every run matches QEMU with the doorbell accounting; over all runs every place must have taken stops.
+    seen = collections.Counter()
+    for n in a.cpus:
+        prog = adversarial_program(n, a.adversarial_iterations)
+        want = qemu_reference(prog, a.out / 'qemu' / prog['name'])
+        extra = [x for v in range(n) for x in ('--kick-vcpu', v)] + ['--kicks', a.kicks, '--kick-jitter-us', a.jitter_us]
+        groups = [(f"{prog['name']}-{r}", smp_description(prog), extra) for r in range(a.reps)]
+
+        def judge(i, rc, out, err, prog=prog, want=want, n=n):
+            e = {'name': prog['name'], 'rep': i}
+            if rc: return [{**e, 'diffs': [f'driver exit {rc}: {err.strip()[-300:]}']}]
+            # Peers' SGIs may merge into a stop a host kick armed: no merge count is required.
+            diffs = judge_smp(prog, want, out, [None] * n)
+            diffs += [f'cpu{v} {c["kicks"]["issued"]} of {a.kicks} kicks issued' for v, c in enumerate(out['cpus']) if c['kicks']['issued'] != a.kicks]
+            return [{**e, 'diffs': diffs, 'kicks': [c['kicks'] for c in out['cpus']], 'steps': [c['stats']['steps'] for c in out['cpus']]}]
+        for e in run_groups(a, host, runtime, groups, judge):
+            ks = e.get('kicks', [])
+            seen.update(places(ks))
+            seen.update({k: sum(x[k] for x in ks) for k in ('irqs_step', 'rearms', 'irq_sgis', 'merged')})
+            print(f"{e['name']} rep{e['rep']}: {'ok' if not e['diffs'] else 'FAIL ' + '; '.join(e['diffs'])[:400]}; "
+                  f"stops {[k['stops'] for k in ks]} {places(ks)}; in step {[k['irqs_step'] for k in ks]}, "
+                  f"re-armed {[k['rearms'] for k in ks]}, SGIs {[k['irq_sgis'] for k in ks]}, merged {[k['merged'] for k in ks]}, "
+                  f"steps {e.get('steps')}; ack ns {[k['ack_ns_mean'] for k in ks]}", flush=True)
+            failures += [f"{e['name']} rep{e['rep']}: {d}" for d in e['diffs']]
+            report['adversarial'].append(e)
+    missing = [p for p in ('entry', 'dispatch', 'l1', 'exit', 'resident', 'irqs_step', 'rearms') if not seen[p]]
+    print(f'adversarial places: {dict(seen)}', flush=True)
+    if missing: failures.append(f'adversarial: no stop at {missing}')
     # A peer's resident kick: no host kicker; vCPU 0 must take at least one stop and drop its blocks from the page.
     prog = peer_program(a.iterations)
     want = qemu_reference(prog, a.out / 'qemu' / prog['name'])
@@ -452,25 +518,28 @@ def cmd_kicks(a, host, runtime):
         diffs = [f'driver exit {rc}: {err.strip()[-300:]}'] if rc else judge_smp(prog, want, out, [None, None])
         if not rc:
             k0, st0 = out['cpus'][0]['kicks'], out['cpus'][0]['stats']
-            if k0['issued'] < 1 or k0['stops'] < 1 or st0['requests'] < 3:
+            if k0['irq_sgis'] < 1 or k0['stops'] < 1 or st0['requests'] < 3:
                 diffs.append(f'vCPU 0 not stopped by the peer, or its loop not translated again: {k0} {st0}')
         report['peer'].append({'rep': r, 'diffs': diffs, 'kicks': out and [c['kicks'] for c in out['cpus']],
                                'stats': out and [c['stats'] for c in out['cpus']]})
         print(f"peer-kick rep{r}: {'ok' if not diffs else 'FAIL ' + '; '.join(diffs)[:400]}; "
-              f"vCPU 0 kicks {out and {k: out['cpus'][0]['kicks'][k] for k in ('issued', 'in_host', 'stops', 'pending')}}, "
+              f"vCPU 0 kicks {out and {k: out['cpus'][0]['kicks'][k] for k in ('irq_sgis', 'stops', 'merged', 'sgi_ns_mean')}}, "
+              f"vCPU 1 SGIs sent {out and out['cpus'][1]['kicks']['sgis_sent']}, "
               f"requests {out and out['cpus'][0]['stats']['requests']}", flush=True)
         failures += [f'peer rep{r}: {d}' for d in diffs]
-    # Forged stop PC on each vCPU of 4: it halts with bad_stop, the others are cancelled.
+    # Forged stops on each vCPU of 4 (the stop word at a block entry; an armed record at a word without it): it halts
+    # with bad_stop, the others are cancelled.
     prog = hot_program(4, a.iterations)
-    for v in range(4):
-        rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f'forge{v}',
-                              ['--kick-vcpu', v, '--kicks', 1, '--forge-stop', '--tamper-vcpu', v])
-        stops = [(c['stop'], c['reason']) for c in out['cpus']] if out else None
-        want_stops = [('resident', 'bad_stop status=1 detail=11') if w == v else ('cancelled', '') for w in range(4)]
-        ok = rc == 0 and stops == want_stops and out['cpus'][v]['tampered']
-        report['forge'].append({'vcpu': v, 'returncode': rc, 'stops': stops, 'native': out and out['cpus'][v]['native']})
-        print(f'forged stop on vCPU {v}: {"ok" if ok else "FAIL"} {stops}', flush=True)
-        if not ok: failures.append(f'forged stop on vCPU {v}: {rc} {stops} {err.strip()[-200:]}')
+    for kind, extra in (('stop', ['--forge-stop']), ('armed', ['--tamper', 'armed'])):
+        for v in range(4):
+            rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f'forge-{kind}{v}',
+                                  ['--kick-vcpu', v, '--kicks', 1, *extra, '--tamper-vcpu', v])
+            stops = [(c['stop'], c['reason']) for c in out['cpus']] if out else None
+            want_stops = [('resident', 'bad_stop status=1 detail=11') if w == v else ('cancelled', '') for w in range(4)]
+            ok = rc == 0 and stops == want_stops and out['cpus'][v]['tampered']
+            report['forge'].append({'kind': kind, 'vcpu': v, 'returncode': rc, 'stops': stops, 'native': out and out['cpus'][v]['native']})
+            print(f'forged {kind} on vCPU {v}: {"ok" if ok else "FAIL"} {stops}', flush=True)
+            if not ok: failures.append(f'forged {kind} on vCPU {v}: {rc} {stops} {err.strip()[-200:]}')
     (a.out / 'kicks.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
     return len(failures)
 
@@ -655,7 +724,7 @@ def coherence_runs(a, host, runtime, names):
             def judge(i, rc, out, err, prog=prog, want=want, n=n):
                 if rc: return [{'rep': i, 'diffs': [f'driver exit {rc}: {err.strip()[-300:]}']}]
                 stats = {k: sum(c['stats'][k] for c in out['cpus']) for k in ('steps', 'stale_links', 'invalidations', 'stops', 'shootdowns', 'requests')}
-                stats['stops_at_step'] = sum(c['kicks']['stops_at_step'] for c in out['cpus'])
+                stats['stops_by_place'] = places([c['kicks'] for c in out['cpus']])
                 return [{'rep': i, 'diffs': judge_smp(prog, want, out, [None] * n), 'stats': stats}]
             entries = run_groups(a, host, runtime, groups, judge)
             totals = collections.Counter()
@@ -747,7 +816,10 @@ def tamper_kinds(fixture):
             ('site', ['--tamper', 'site'], load, 'unknown_abort'),
             ('site-kind', ['--tamper', 'site-kind'], load, 'site_mismatch'),
             *[(k, flush + ['--tamper', k], chain_section(), 'bad_link') for k in ('word', 'record')],
-            ('forge-stop', ['--kicks', 1, '--forge-stop'], LOOP, 'bad_stop')]
+            ('dispatch', ['--tamper', 'dispatch'], fixture, 'bad_reply'),
+            # Not LOOP: its entry word is its exit's link point, which the reply check refuses (bad_reply) once forged.
+            ('forge-stop', ['--kicks', 1, '--forge-stop'], fixture, 'bad_stop'),
+            ('armed', ['--kicks', 1, '--tamper', 'armed'], LOOP, 'bad_stop')]
 
 
 # Tampers whose section is a single instruction at 0x100000 with all GPRs 0: the vCPU halted before its first
@@ -839,7 +911,7 @@ def cmd_contain(a, host, runtime):
         for n in a.cpus_contain:
             for v in range(n):
                 text = ''.join('cpu\n' + (section if w == v else LOOP) for w in range(n))
-                kick = ['--kick-vcpu', v] if name == 'forge-stop' else []
+                kick = ['--kick-vcpu', v] if name in ('forge-stop', 'armed') else []
                 label = f'{name}-n{n}-v{v}'
                 rc, out, err, secs = run(label, text, extra + kick + ['--tamper-vcpu', v], 10)
                 want = [('resident', reason) if w == v else ('cancelled', '') for w in range(n)]
@@ -851,8 +923,8 @@ def cmd_contain(a, host, runtime):
                 print(f"{label}: {'ok' if not diffs else 'FAIL ' + '; '.join(diffs)[:300]} ({secs:.2f} s)", flush=True)
                 failures += [f'{label}: {d}' for d in diffs]
 
-    # 2: a peer that never answers a shootdown: its stops resume without entering the gate, so it never drains, but it is
-    # kicked every millisecond (each stop is a host exit: its own watchdog does not fire). Control: the same untampered.
+    # 2: a peer that never answers a shootdown: its doorbells are disabled, so it never stops or drains, and its own
+    # watchdog is off (a live peer); a host kicker rings it every millisecond, unheard. Control: the same untampered.
     for k in (1, 2, 3):
         prog = unacked_program(4, k)
         kicks = ['--kick-vcpu', k, '--kicks', 100_000, '--kick-every-us', 1000, '--watchdog-ms', wd]
@@ -969,6 +1041,8 @@ def main():
     ap.add_argument('--reps', type=int, default=1)
     ap.add_argument('--kicks', type=int, help='kicks per vCPU (kicks: default 10000; corpora: off unless given)')
     ap.add_argument('--iterations', type=int, default=400_000_000, help='hot-loop iterations per vCPU (kicks)')
+    ap.add_argument('--adversarial-iterations', type=int, default=2_000_000, help='adversarial rounds per vCPU (kicks)')
+    ap.add_argument('--jitter-us', type=int, default=40, help='adversarial kicks: random extra delay 0..J us after each stop')
     ap.add_argument('--cpus-contain', type=int, nargs='+', default=[1, 2, 3, 4], help='contain: N for the tamper matrix')
     ap.add_argument('--watchdog-ms', type=int, default=1000, help='contain: the watchdog of the runs that must hit it')
     ap.add_argument('--compile-deadline-ms', type=int, default=2000, help='contain: the compile deadline of the stalled-server runs')

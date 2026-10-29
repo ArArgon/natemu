@@ -26,10 +26,12 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as eleven commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as twelve commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series11` (E1, October 28: patch 0011, code that
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series12` (E1b, October 28: patch 0012, no stop
+check at the block entry: the resident stops a vCPU by IRQ-triggered unlinking; otherwise series11; 556 blocks, 23,866
+words on the census corpora, none touching emulator data and no `bl`). Kept for comparison: `series11` (E1: patch 0011, code that
 touches no emulator data: literal exits `movz/movk x0, #rip; svc #1`, computed exits `mov x0, xR; b .` relocated by the
 resident to its dispatcher (a `dispatch_branch` relocation), the 128/64 division as `svc #3`/`#4`, no block-header store,
 the stop check a `bl .` relocated to the vCPU's stop pad, the pre-NZCV save `mrs x25, nzcv` instead of a frame store;
@@ -68,6 +70,7 @@ Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--v
 | 0009 | slice1 self-loop exits (no `JumpTargets` lookup for the taken edge of jcc/jrcxz/loop) and FEX's pending-interrupt fault check at every block entry |
 | 0010 | slice1 literal exits through `Pointers.ExitFunctionLinker` (computed exits keep `DispatcherLoopTop`): FEX's linker/dispatcher split, so the resident can link them |
 | 0011 | slice1 code that touches no emulator data (E1): literal exits `movz/movk x0; svc #1`, computed exits `mov x0, xR; b .` (relocated by the resident), the 128/64 division by `svc #3/#4`, no header store, the stop check `bl .` (relocated to the stop pad), the pre-NZCV save `mrs x25, nzcv` (the JIT emits it at the instruction start the flag pass chose, `fexc_pre_nzcv`); FEX's BLOCK_DEBUGGING exit branch back to its upstream form |
+| 0012 | slice1 no stop check at block entry (E1b): `EmitSuspendInterruptCheck` emits nothing; the resident's IRQ handler stops a vCPU by patching the interrupted block's exits |
 
 Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in `shim/` and `fexc.cpp`; the patches only
 include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then

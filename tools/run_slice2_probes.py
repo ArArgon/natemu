@@ -306,8 +306,9 @@ def main():
     print(f"tiny-cache --code-cache 1: {'match' if ok else 'fail'} {err}")
 
     # Linking (S2c): once a hot loop's edges are linked it runs without entering the resident, so N and 2N iterations
-    # (N = 10^6) make the same number of resident entries (`blocks`). (Dispatcher hits are no longer counted: generated
-    # code writes no emulator data. The loop has literal exits only, so it never reaches the dispatcher.)
+    # (N = 10^6) make the same number of resident entries (`blocks`) and linker entries. Dispatcher hits are not counted
+    # (generated code writes no emulator data), so the loop's blocks must have no computed exit (`dispatch_exits` 0): with
+    # equal resident and linker entries at N and 2N, every edge the loop repeats is then a direct branch.
     for args in ([], ['1'], ['2']):
         counts = []
         for trips in (10**6, 2 * 10**6):
@@ -317,14 +318,17 @@ def main():
                      ref.num(state['rflags']), ref.num(state['rip']), state['memory'])
             if state is not None:
                 if state['stop'] != 'reached': diffs.insert(0, f"stopped {state['stop']} at {state['rip']}")
-                counts.append((state['stats']['blocks'], state['stats']['linked']))
+                st = state['stats']
+                counts.append((st['blocks'], st['linker'], st['linked']))
+                if st['dispatch_exits']:
+                    diffs.append(f"{st['dispatch_exits']} computed exits: the loop could run through the dispatcher uncounted")
             failures += bool(diffs)
             out.append({'name': program['name'], 'args': args, 'stats': state and state['stats'], 'diffs': diffs, 'stderr': err})
             print(f"{program['name']} {' '.join(args)}: {'fail' if diffs else 'match'} {state and state['stats']} {'; '.join(diffs)[:300]}")
-        ok = len(counts) == 2 and counts[0] == counts[1] and counts[0][1] > 0
+        ok = len(counts) == 2 and counts[0] == counts[1] and counts[0][2] > 0
         failures += not ok
         out.append({'name': 'hot-loop-entries', 'args': args, 'counts': counts})
-        print(f"hot loop {' '.join(args)}: {'match' if ok else 'fail'} (resident entries, linked) at N, 2N: {counts}")
+        print(f"hot loop {' '.join(args)}: {'match' if ok else 'fail'} (resident entries, linker entries, linked) at N, 2N: {counts}")
 
     # A literal exit whose RIP is none of its block's link targets (admission refuses this; the driver forges it after
     # admission) makes the linker halt instead of patching code it cannot name.

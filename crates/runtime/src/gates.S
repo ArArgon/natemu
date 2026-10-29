@@ -93,11 +93,12 @@ exception_capture:
     bl finish
     b .
 
+// Current EL with SP0 (generated code runs at EL1t): synchronous, then IRQ (the doorbell, `irq_gate`).
 .balign 2048
 vectors:
     b exception_capture
     .balign 128
-    b exception_capture
+    b irq_gate
     .balign 128
     b exception_capture
     .balign 128
@@ -128,10 +129,10 @@ vectors:
     b exception_capture
     .balign 128
 
-// The precise stop gate: the host enters here (EL1h, DAIF masked) when a block entry's stop store took the stage-2
-// fault of a kick, with ELR_EL1/SPSR_EL1 = the faulting PC/PSTATE, as an exception entry from EL1t would leave them.
-.global stop_gate
-stop_gate:
+// The IRQ gate: a doorbell interrupted generated code at EL1t (the resident runs with interrupts masked); ELR_EL1 is
+// the next instruction, SPSR_EL1 its PSTATE.
+.global irq_gate
+irq_gate:
     save_native
     mrs x9, sp_el0
     str x9, [sp, #{sp_offset}]

@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: natemu <natemu@example.invalid>
+Date: Wed, 28 Oct 2026 00:00:00 +0000
+Subject: [PATCH 12/12] FEXCore: slice1 no stop check at block entry
+
+Under fexc_slice1 only: EmitSuspendInterruptCheck emits nothing (patch 0011
+emitted the placeholder `bl .` the resident relocated to its stop pad). The
+resident now stops a running vCPU by IRQ-triggered unlinking: its interrupt
+handler patches every exit of the block it interrupted, so nothing is left
+on the hot path. The default profile is unchanged.
+---
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -803,10 +803,8 @@ void Arm64JITCore::EmitTFCheck() {
+ 
+ void Arm64JITCore::EmitSuspendInterruptCheck() {
+   if (fexc_slice1) {
+-    // natemu slice1: `bl` to the vCPU's stop pad (a `ret` alone in its stage-2 granule), relocated by the resident when it
+-    // places the block. A kick removes execute permission from the pad, so the next block entry stops precisely there.
+-    // x30 is an RA temporary, dead at a block entry.
+-    dc32(0x94000000);
++    // natemu slice1: no stop check. The resident stops a running vCPU by unlinking: its interrupt handler patches the
++    // exits of the block it interrupted (nothing on the hot path).
+     return;
+   }
+   if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+-- 
+2.39.5
+

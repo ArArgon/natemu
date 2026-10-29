@@ -91,7 +91,12 @@ is restored only on the stop exit itself, never on other exits; concurrent prote
 callers vs ~30 µs with one), so redundant protects are skipped; unkicked peers neither exit nor stall (throughput −5–10%,
 unattributed). Fallback: protect, then
 `hv_vcpus_exit(v)`; still precise at the next block entry after re-entry. `hv_vcpus_exit` alone stays watchdog only.
-Rejected: a virtual IRQ (owner-thread only, lands at any native PC).
+Rejected: a virtual IRQ (owner-thread only, lands at any native PC). *Superseded (E1, then E1b, Oct 28):* E1 moved the
+stop to a `bl` per block entry to a stop pad stopped by removing X at stage 2; E1b replaced both with the HVF in-kernel
+GIC as doorbell (an SPI per vCPU from the host, SGIs between residents, no host exit) and IRQ-triggered unlinking in the
+resident: interrupted in the dispatcher, L1 or at a block's first word the vCPU stops at once; inside a block every exit
+of that block is patched to a stop `brk` (restored at the next resident entry), so the stop is at the block's exit with
+its exact state (boot-features plan §5, owner decision 2; `experiments/track03/native-interrupts/`).
 
 ## 2. Memory model
 **Hardware TSO for what is admitted.** Admission decodes only single general-register loads and stores (1–8 bytes, any

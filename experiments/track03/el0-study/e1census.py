@@ -9,8 +9,9 @@ guest-RIP literals). Every word of the code region is classified by exact encodi
   (`nonsite_*`: x28 frame fields, sp, anything else);
 - writes to sp and to x25 (`mrs x25, nzcv`, the pre-NZCV save, counted apart from any other write);
 - control transfers into or out of the resident: `svc #imm`, `brk #imm`, `bl`, `blr`, `br`, `ret`, and the placeholders
-  the resident relocates (`bl .` at the entry, `b .` at a dispatch relocation).
-Exit status 1 if any word touches emulator data: a non-site load/store, a literal load or an sp access or write."""
+  the resident relocates (series11's stop check `bl .` at the entry, `b .` at a dispatch relocation).
+Exit status 1 if any word touches emulator data (a non-site load/store, a literal load or an sp access or write) or, since
+E1b (series12, stops by unlinking), if any block still has a stop check or any other `bl`."""
 import json, sys, collections, tempfile, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from census import compile_block
@@ -98,12 +99,14 @@ def main():
                     scan(j, total, examples)
                     todo.extend(targets(j))
     touching = {k: v for k, v in total.items() if k.startswith(('nonsite_', 'literal_load', 'sp_write', 'site_sp'))}
-    result = {'total': dict(sorted(total.items())), 'emulator_data_words': touching, 'examples': examples}
+    calls = {k: v for k, v in total.items() if k == 'bl' or k.startswith('bl_')}
+    result = {'total': dict(sorted(total.items())), 'emulator_data_words': touching, 'stop_checks_and_calls': calls, 'examples': examples}
     json.dump(result, open(out, 'w'), indent=1)
     for k, v in sorted(total.items()):
         print(f'{k} {v}')
     print('words touching emulator data:', touching or 'none')
-    return 1 if touching else 0
+    print('stop checks and other bl:', calls or 'none')
+    return 1 if touching or calls else 0
 
 
 if __name__ == '__main__':
