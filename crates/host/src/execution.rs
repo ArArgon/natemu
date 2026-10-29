@@ -352,8 +352,11 @@ pub(crate) fn check_links(area: Area) -> Result<(u64, u64)> {
 pub(crate) enum Stop {
     /// RIP reached the caller's stop address at a block boundary.
     Reached,
-    /// The instruction fetch at RIP faults; the bank holds the state at RIP (no IDT delivery yet).
+    /// The instruction fetch at RIP faults in a way the resident cannot deliver (`Fault::Unsupported`); #PF and #GP from
+    /// a fetch are delivered (X1a, [`exec::REPLY_FETCH_FAULT`]).
     FetchFault(Fault),
+    /// RIP reached a handler of the test driver's logging IDT ([`Requests::handlers`]): an exception was delivered there.
+    Logged,
     /// fexc translated nothing at RIP; its end reason (e.g. `system_instruction`).
     NoCode(String),
     /// The resident stopped the VM: `State::stop` (0 for a non-execution stop) and the shared status/detail.
@@ -503,6 +506,14 @@ pub(crate) struct Compiler {
     /// Admission's code-shape debug check ([`admission`]); off unless the caller sets it (the program driver's
     /// `--code-shape`).
     pub(crate) shape: bool,
+    /// The vCPU's controls gate SSE (I5a: CR0.EM, CR0.TS or no CR4.OSFXSR, [`sse_gated`]): fexc cuts every SSE form as a
+    /// system instruction, which the resident raises as #UD or #NM. Set per request (part of the request, so of the cache key).
+    pub(crate) sse_gated: bool,
+}
+/// Whether `cpu`'s controls gate SSE instructions (SDM Vol.3 Table 2-2, Vol.2 2.5: #UD with CR0.EM or without CR4.OSFXSR,
+/// #NM with CR0.TS). Blocks are made under one gating state: every CR0/CR4 change drops the vCPU's code.
+pub(crate) fn sse_gated(cpu: &exec::Cpu) -> bool {
+    cpu.cr0 & (exec::CR0_EM | exec::CR0_TS) != 0 || cpu.cr4 & exec::CR4_OSFXSR == 0
 }
 /// The default [`Compiler::deadline`]: a large multiple of the slowest compile measured on the regression sets
 /// (S3h: at most 13.4 ms, server start included, over 6,080 vCPU runs of the corpora at N = 4 and N = 2 with block size 1).
@@ -517,7 +528,7 @@ impl Compiler {
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
         Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), compiles: 0, hits: 0, tamper: None, deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, signal_at: None,
-               shape: false }
+               shape: false, sse_gated: false }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
     /// `rip` the resident executes, or fexc's end reason when it produced no code.
@@ -528,6 +539,9 @@ impl Compiler {
         }
         for feature in admission::feature_overrides(self.supported) {
             args.extend(["--feature".into(), feature]);
+        }
+        if self.sse_gated {
+            args.push("--sse-gated".into());
         }
         let args: Vec<u8> = args.iter().flat_map(|a| a.bytes().chain([0])).collect();
         let mut body = (args.len() as u32).to_le_bytes().to_vec();
@@ -561,7 +575,10 @@ impl Compiler {
                     let json = crate::json::parse(&String::from_utf8_lossy(&json))?;
                     let reason = end_reason(&json).ok_or("fexc report without guest.end.reason")?;
                     let decoded = |(map, opcode)| crate::system::decode(bytes, map, opcode).or_else(|| crate::system::lock_ud(bytes));
-                    match system_cut(&json, rip).and_then(decoded) {
+                    // An SSE form cut by its gating (I5a): no operand matters, the resident raises #UD or #NM.
+                    let gated = || Some(exec::System { kind: exec::system::SSE_GATED, length: 1, ..exec::System::NONE });
+                    let gated_cut = json.get("guest").and_then(|g| g.get("end")).and_then(|e| e.get("cut_gated")).is_some();
+                    match system_cut(&json, rip).and_then(|cut| if gated_cut { gated() } else { decoded(cut) }) {
                         Some(s) if reason == "system_instruction" => Compiled::System(s),
                         _ => Compiled::NoCode(reason.into()),
                     }
@@ -664,6 +681,9 @@ pub(crate) struct Requests {
     /// Test drivers only: RIPs whose one-byte instruction is executed as a CPL change to the value
     /// ([`exec::system::SET_CPL`]); blocks are fetched up to each, so it is reached at a block boundary.
     pub(crate) switches: std::collections::BTreeMap<u64, u64>,
+    /// Test drivers only: the handler range of the driver's logging IDT; reaching it ends the run ([`Stop::Logged`]) before
+    /// anything there is fetched or compiled.
+    pub(crate) handlers: Option<std::ops::Range<u64>>,
 }
 
 /// Runs the vCPU (entered at the resident, see [`enter`]) until it stops; `stop_at` is a RIP at
@@ -788,6 +808,9 @@ fn translation(
     if Some(rip) == stop_at {
         return Ok(Err(Stop::Reached));
     }
+    if requests.handlers.as_ref().is_some_and(|h| h.contains(&rip)) {
+        return Ok(Err(Stop::Logged));
+    }
     if let Some(&cpl) = requests.switches.get(&rip) {
         // A step request is for a block's access site, never a switch (blocks end before one).
         if step {
@@ -800,8 +823,11 @@ fn translation(
     let limit = requests.switches.range(rip..).map(|(&r, _)| r).chain(stop_at).filter(|&l| l > rip).min();
     let Fetched { bytes, more, next_fault } = match fetched(area, state, limit)? {
         Ok(fetched) => fetched,
+        // RIP's page faults: the resident delivers it (`state.fetch_fault`); nothing is compiled.
+        Err(Stop::FetchFault(Fault::Page { .. } | Fault::Noncanonical)) => return Ok(Ok(exec::REPLY_FETCH_FAULT)),
         Err(stop) => return Ok(Err(stop)),
     };
+    compiler.sse_gated = sse_gated(&state.cpu);
     let code = compiler.compile(&bytes, rip, step)?;
     let ran_out = match &code {
         Code::Block(b) => b.end_reason == natemu_abi::code_object::end_reason::END_OF_INPUT,
@@ -821,7 +847,8 @@ fn translation(
         Code::System(_) => return Err(format!("step at {rip:#x}: a system instruction")),
         Code::None(reason) => {
             return Ok(Err(match next_fault {
-                // The instruction at RIP continues into a page whose fetch faults.
+                // The instruction at RIP continues into a page whose fetch faults: delivered by the resident.
+                Some(Fault::Page { .. } | Fault::Noncanonical) if reason == "partial_decode" => return Ok(Ok(exec::REPLY_FETCH_FAULT)),
                 Some(fault) if reason == "partial_decode" => Stop::FetchFault(fault),
                 _ => Stop::NoCode(reason),
             }));
@@ -897,7 +924,7 @@ mod tests {
         let ram = guest_ram(&memory);
         assert!(ram.copy_in(0x5ff0, &[0xaa; 16]) && ram.copy_in(0x9000, &[0xbb; 16]));
         let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0 };
-        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1ff0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0 });
+        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1ff0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET });
         s.fetch = [0x5000, u64::MAX];
         let f = fetched(area, &s, None).unwrap().unwrap();
         assert_eq!((f.bytes, f.more, f.next_fault), (vec![0xaa; 16], true, None));

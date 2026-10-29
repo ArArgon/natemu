@@ -37,6 +37,7 @@ def description(p):
     lines += [f"memory {ref.num(m['addr']):#x} {m['data']}" for m in p['memory']]
     lines += [f"{k} {ref.num(p[k]) & (2**64 - 1):#x}" for k in ('fsbase', 'gsbase') if k in p]     # I7: segment bases
     lines += [f"cpl {p['cpl']}"] if 'cpl' in p else []
+    lines += ['sse 1'] if p.get('sse') else []                                                        # I5a: CR4.OSFXSR
     return '\n'.join(lines) + '\n'
 
 def declared_limit(vm):

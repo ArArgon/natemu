@@ -79,12 +79,13 @@ def spec(name, n):
         for i in range(n):
             regs = dict(r15=0x260000, r8=(0x0123456789abcdef * (i + 1)) & M, r9=i, r10=1 << i)
             init.append(dict(regs, rsi=R)); fin.append(regs)
-    elif name in ('neg-race', 'neg-private'):    # (I3) n * 20000 LOCK NEGs of words starting at 1: each ends 1
-        R, c = 20000, bytearray(0x200)
+    elif name in ('neg-race', 'neg-private'):    # (I3) n * 200000 LOCK NEGs of words starting at 1: each ends 1
+        R, c = 200000, bytearray(0x200)
         for i in range(n if name == 'neg-private' else 1): q(c, 0x80 * i, 1)
+        c[0x1c0:0x1c4] = n.to_bytes(4, 'little')    # the start barrier: one LOCK INC per CPU
         mem[0x270000] = c
         for i in range(n):
-            regs = dict(r15=0x270000 + (0x80 * i if name == 'neg-private' else 0))
+            regs = dict(r15=0x270000 + (0x80 * i if name == 'neg-private' else 0), r14=0x2701c0)
             init.append(dict(regs, rsi=R)); fin.append(regs)
     else: raise KeyError(name)
     return init, fin, mem

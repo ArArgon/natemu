@@ -284,8 +284,14 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
             || !matches!(
                 s.kind,
                 object::kind::LOAD | object::kind::STORE | object::kind::PUSH | object::kind::POP | object::kind::SWAP | object::kind::ATOMIC
+                    | object::kind::LOAD_PAIR | object::kind::STORE_PAIR
             )
-            || !(matches!(s.width, 1 | 2 | 4 | 8) || (s.kind == object::kind::ATOMIC && s.width == 16))
+            || !(matches!(s.width, 1 | 2 | 4 | 8) || (matches!(s.kind, object::kind::ATOMIC | object::kind::LOAD | object::kind::STORE | object::kind::LOAD_PAIR | object::kind::STORE_PAIR) && s.width == 16))
+            // I5a: an X-register pair is MOVAPS/MOVAPD/MOVDQA m128's one 16-byte access, two general registers.
+            || (matches!(s.kind, object::kind::LOAD_PAIR | object::kind::STORE_PAIR) && (s.width != 16 || s.data_class != object::CLASS_GPR))
+            // Vector registers (I5a): only plain loads and stores transfer them; a 16-byte plain access is a vector one.
+            || (s.data_class == object::CLASS_FPR && !matches!(s.kind, object::kind::LOAD | object::kind::STORE))
+            || (s.width == 16 && matches!(s.kind, object::kind::LOAD | object::kind::STORE) && s.data_class != object::CLASS_FPR)
             || s.intent != intent(s)
         {
             return fail(&format!("access site at native offset {:#x}", s.native_offset));
@@ -343,7 +349,8 @@ fn intent(s: &Site) -> u8 {
     match (s.kind, s.rmw) {
         (STORE | PUSH | ATOMIC, object::RMW_NONE | object::RMW_STORE) | (SWAP, object::RMW_NONE) => object::INTENT_WRITE,
         (LOAD, object::RMW_LOAD) => object::INTENT_WRITE,
-        (LOAD | POP, object::RMW_NONE) => object::INTENT_READ,
+        (LOAD | POP | LOAD_PAIR, object::RMW_NONE) => object::INTENT_READ,
+        (STORE_PAIR, object::RMW_NONE) => object::INTENT_WRITE,
         _ => u8::MAX,
     }
 }
@@ -362,20 +369,21 @@ fn site_fields_valid(s: &Site, h: &Header, region: u32) -> bool {
         && s.extend <= object::EXT_SXTX
         && s.shift <= 4
         && s.writeback <= object::WB_POST
-        && s.data_class == object::CLASS_GPR
+        && s.data_class <= object::CLASS_FPR
         && s.nzcv <= object::NZCV_SAVED
         && s.completed_effects == object::EFFECTS_NONE
         && s.located == 1
 }
 
 fn is_stub(s: &Site) -> bool {
-    matches!(s.kind, object::kind::GUARD | object::kind::SPLIT | object::kind::DIVIDE)
+    matches!(s.kind, object::kind::GUARD | object::kind::SPLIT | object::kind::DIVIDE | object::kind::ALIGN)
 }
-/// `brk #1` (branch target), `brk #2` (split) or `brk #3` (divide).
+/// `brk #1` (branch target), `brk #2` (split), `brk #3` (divide) or `brk #4` (alignment, I5a).
 pub(crate) fn stub_word(kind: u8) -> u32 {
     let imm = match kind {
         object::kind::GUARD => 1,
         object::kind::SPLIT => 2,
+        object::kind::ALIGN => 4,
         _ => 3,
     };
     0xd420_0000 | imm << 5
@@ -383,7 +391,8 @@ pub(crate) fn stub_word(kind: u8) -> u32 {
 /// A stub's record against the access site it covers (`None`: no site at `guest_offset2`). A split stub covers a store
 /// wider than one byte whose data register survives the check (x0/x1 are the check's scratch); at it the guest state is
 /// that of its access, so instruction, flags location, width, intent and data registers are the access's, and its
-/// address is `base_reg + imm` without index or writeback (the resident completes the store from it). A guard stub is a
+/// address is `base_reg + imm` without index or writeback (the resident completes the store from it). An alignment stub
+/// (I5a) is the same record for the first (vector) access of an SSE instruction whose operand must be 16-byte aligned. A guard stub is a
 /// branch-target check with no access: the target is in `base_reg` (there is no address guard since E3). The address
 /// register at a stub is neither x0 (the check's scratch, overwritten by it) nor sp (the checks cannot name it). A
 /// divide stub (#DE) has no access and no address.
@@ -408,8 +417,14 @@ fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
             let same = (s.guest_offset, s.insn_native_offset, s.width, s.intent, s.rmw, s.segment)
                 == (a.guest_offset, a.insn_native_offset, a.width, a.intent, a.rmw, a.segment)
                 && (s.data_reg, s.data_class, s.nzcv, s.cf_inverted) == (a.data_reg, a.data_class, a.nzcv, a.cf_inverted);
-            let split_ok = s.kind == SPLIT && matches!(a.kind, STORE | PUSH) && a.width > 1 && a.data_reg[0] > 1;
-            address_only && same && split_ok
+            // x0/x1 are the checks' scratch: a general data register must survive them (vector registers do).
+            let data_ok = a.data_class == object::CLASS_FPR || (a.data_reg[0] > 1 && (a.kind != STORE_PAIR || a.data_reg[1] > 1));
+            let split_ok = s.kind == SPLIT && matches!(a.kind, STORE | PUSH | STORE_PAIR) && a.width > 1 && data_ok;
+            // An alignment stub (I5a) covers the first access of a legacy SSE instruction: a plain vector load or store, or
+            // MOVAPS/MOVAPD/MOVDQA's X-register pair.
+            let align_ok = s.kind == ALIGN
+                && ((matches!(a.kind, LOAD | STORE) && a.data_class == object::CLASS_FPR) || matches!(a.kind, LOAD_PAIR | STORE_PAIR));
+            address_only && same && (split_ok || align_ok)
         }
     }
 }
@@ -597,19 +612,21 @@ mod tests {
             with(object(), at, |s: &mut Site| s.native_offset = 4),
             with(object(), at, |s: &mut Site| s.base_reg = 28),
             with(object(), at, |s: &mut Site| s.guest_offset = 3),
-            // Pair kinds: fexc emits none under slice1 and the resident completes split stores of one register only.
+            // Pair kinds: only MOVAPS/MOVAPD/MOVDQA's 16-byte X-register pair (I5a); a narrower pair is refused.
             with(object(), at, |s: &mut Site| s.kind = object::kind::LOAD_PAIR),
-            with(object(), at, |s: &mut Site| (s.kind, s.width) = (object::kind::LOAD_PAIR, 16)),
             with(object(), at, |s: &mut Site| (s.kind, s.intent) = (object::kind::STORE_PAIR, object::INTENT_WRITE)),
             with(object(), at, |s: &mut Site| s.width = 16),
         ] {
             assert!(admit(&bad, RIP, &SOURCE, ALL).is_err());
         }
         // Review E4: a STORE_PAIR record over a single-register store with a split stub (the resident would have
-        // written two registers) is refused.
+        // written two registers) is refused; since I5a by the code check (a pair record needs an `ldp`/`stp` word), as a
+        // 16-byte LOAD_PAIR record over that `ldr` is.
+        let full = |bytes: &[u8]| super::admit(bytes, RIP, &SOURCE, ALL, false).map(|_| ());
         let pair = Site { kind: object::kind::STORE_PAIR, intent: object::INTENT_WRITE, data_reg: [4, 5], width: 16, ..load_site(8) };
         let split = Site { native_offset: 20, kind: object::kind::SPLIT, guest_offset2: 8, ..pair };
-        assert!(admit(&with(object_with(&[pair, split]), 128 + 20, |w: &mut u32| *w = 0xd420_0040), RIP, &SOURCE, ALL).is_err());
+        assert!(full(&with(object_with(&[pair, split]), 128 + 20, |w: &mut u32| *w = 0xd420_0040)).is_err());
+        assert!(full(&with(object(), at, |s: &mut Site| (s.kind, s.width) = (object::kind::LOAD_PAIR, 16))).is_err());
         let store = Site { kind: object::kind::STORE, width: 8, ..pair };
         assert!(admit(&with(object_with(&[store, Site { kind: object::kind::SPLIT, width: 8, ..split }]), 128 + 20, |w: &mut u32| *w = 0xd420_0040), RIP, &SOURCE, ALL).is_ok());
     }

@@ -16,7 +16,8 @@ namespace FexcSlice1 {
 using namespace FEXCore::X86Tables;
 
 enum Kind : uint8_t { ALLOW, SYSTEM, UNSUPPORTED };
-struct Verdict { Kind kind; bool branch; const char* why; };
+// `simd`: an SSE form, gated by CR0.EM/TS and CR4.OSFXSR (I5a); `align`: its 16-byte memory operand must be 16-byte aligned.
+struct Verdict { Kind kind; bool branch; const char* why; bool simd = false; bool align = false; };
 
 inline Verdict Allow(bool branch = false) { return {ALLOW, branch, ""}; }
 inline Verdict Sys(const char* why) { return {SYSTEM, false, why}; }
@@ -139,6 +140,69 @@ inline Verdict Vex(uint8_t vex, uint8_t op, bool has_modrm, uint8_t reg) {
   return Uns("VEX form other than BMI1/BMI2 (AVX: chunk I8)");
 }
 
+// SSE, SSE2, SSE3, SSSE3, SSE4.1, SSE4.2 (I5a; the profile advertises all six: CPUID.1 EDX 25/26, ECX 0/9/19/20) on XMM
+// registers. `map` 1 = 0f, 5 = 0f 38, 6 = 0f 3a; `pfx` the mandatory prefix (0, 0x66, 0xf3, 0xf2) read from the bytes.
+// Returns nullopt-like {UNSUPPORTED, .., why = nullptr} when the opcode is no SSE form here (the integer allowlist decides).
+// Refused: MMX-register forms (x87/MMX state is I6's: cvtpi2ps/pd, cvt(t)ps2pi/pd2pi, movq2dq, movdq2q, the no-prefix 0f 38/
+// 0f 3a and 0f 60..7f/c4/c5/d0..ff forms), maskmovdqu (a byte-masked store FEX lowers as a load, select and store of all
+// 16 bytes: it would fault and write where x86 does not), pcmpestri/m and pcmpistri/m (FEX calls a host helper), AES and
+// PCLMULQDQ (other features), SSE4a (not advertised). Memory-operand sizes and alignment: SDM Vol.2 per instruction and
+// 2.5 (exception classes 1, 2, 4: a 16-byte operand must be 16-byte aligned, except movups/movupd/movdqu/lddqu).
+inline Verdict Sse(uint8_t map, uint8_t pfx, uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
+  const Verdict none {UNSUPPORTED, false, nullptr};
+  enum : uint8_t { NO = 0, M128 = 1, SMALL = 2, UNALIGNED = 3 };   // NO: not an SSE form here
+  auto in = [](uint8_t v, std::initializer_list<int> l) { for (int x : l) if (x == v) return true; return false; };
+  uint8_t form = NO;
+  bool reg_only = false, mem_only = false;
+  if (map == 1 && pfx == 0) {
+    if (in(op, {0x10, 0x11})) form = UNALIGNED;
+    else if (in(op, {0x12, 0x13, 0x16, 0x17, 0x2e, 0x2f, 0x5a})) form = SMALL;
+    else if (in(op, {0x14, 0x15, 0x28, 0x29, 0x2b, 0x50, 0xc2, 0xc6}) || (op >= 0x51 && op <= 0x5f)) form = M128;
+    mem_only = in(op, {0x13, 0x17, 0x2b}); reg_only = op == 0x50;
+  } else if (map == 1 && pfx == 0x66) {
+    if (in(op, {0x10, 0x11})) form = UNALIGNED;
+    else if (in(op, {0x12, 0x13, 0x16, 0x17, 0x2e, 0x2f, 0x6e, 0x7e, 0xd6, 0xc4})) form = SMALL;
+    else if (in(op, {0x14, 0x15, 0x28, 0x29, 0x2b, 0x50, 0x51, 0x70, 0x74, 0x75, 0x76, 0x7c, 0x7d, 0x7f, 0xc2, 0xc5, 0xc6, 0xd7, 0xe7}) ||
+             (op >= 0x54 && op <= 0x6f) || (op >= 0xd0 && op <= 0xd5) || (op >= 0xd8 && op <= 0xe6) || (op >= 0xe8 && op <= 0xef) ||
+             (op >= 0xf1 && op <= 0xf6) || (op >= 0xf8 && op <= 0xfe))
+      form = M128;
+    else if (in(op, {0x71, 0x72, 0x73}) && has_modrm && mod == 3 && (reg == 2 || reg == 4 || reg == 6 || (op == 0x73 && (reg == 3 || reg == 7))) &&
+             !(op == 0x73 && reg == 4))
+      form = M128;
+    mem_only = in(op, {0x13, 0x17, 0x2b, 0xe7}); reg_only = in(op, {0x50, 0xc5, 0xd7});
+  } else if (map == 1 && pfx == 0xf3) {
+    if (in(op, {0x6f, 0x7f})) form = UNALIGNED;
+    else if (in(op, {0x12, 0x16, 0x5b, 0x70})) form = M128;
+    else if (in(op, {0x10, 0x11, 0x2a, 0x2c, 0x2d, 0x51, 0x52, 0x53, 0x58, 0x59, 0x5a, 0x5c, 0x5d, 0x5e, 0x5f, 0x7e, 0xc2, 0xe6})) form = SMALL;
+  } else if (map == 1 && pfx == 0xf2) {
+    if (op == 0xf0) form = UNALIGNED;
+    else if (in(op, {0x70, 0x7c, 0x7d, 0xd0, 0xe6})) form = M128;
+    else if (in(op, {0x10, 0x11, 0x12, 0x2a, 0x2c, 0x2d, 0x51, 0x58, 0x59, 0x5a, 0x5c, 0x5d, 0x5e, 0x5f, 0xc2})) form = SMALL;
+    mem_only = op == 0xf0;
+  } else if (map == 5 && pfx == 0x66) {
+    if ((op >= 0x20 && op <= 0x25) || (op >= 0x30 && op <= 0x35)) form = SMALL;
+    else if (op <= 0x0b || in(op, {0x10, 0x14, 0x15, 0x17, 0x1c, 0x1d, 0x1e, 0x28, 0x29, 0x2a, 0x2b}) || (op >= 0x37 && op <= 0x41)) form = M128;
+    mem_only = op == 0x2a;
+  } else if (map == 6 && pfx == 0x66) {
+    if (in(op, {0x0a, 0x0b, 0x14, 0x15, 0x16, 0x17, 0x20, 0x21, 0x22})) form = SMALL;
+    else if ((op >= 0x08 && op <= 0x0f && op != 0x0a && op != 0x0b) || (op >= 0x40 && op <= 0x42)) form = M128;
+  }
+  if (form == NO) {
+    if (map == 6 && pfx == 0x66 && op >= 0x60 && op <= 0x63) return Uns("pcmpestri/m, pcmpistri/m: FEX calls a host helper");
+    if (map == 1 && pfx == 0x66 && op == 0xf7) return Uns("maskmovdqu: FEX stores all 16 bytes (a masked store needs its own lowering)");
+    if ((map == 5 && pfx == 0x66 && op >= 0xdb) || (map == 6 && pfx == 0x66 && (op == 0x44 || op == 0xdf))) return Uns("AES/PCLMULQDQ (not in I5a)");
+    if ((map == 1 && (pfx == 0 || pfx == 0x66) && (in(op, {0x2a, 0x2c, 0x2d}) || (pfx == 0 && ((op >= 0x60 && op <= 0x7f) || in(op, {0xc4, 0xc5}) || op >= 0xd0)))) ||
+        (map == 1 && (pfx == 0xf3 || pfx == 0xf2) && op == 0xd6) || ((map == 5 || map == 6) && pfx == 0))
+      return Uns("MMX register form (x87/MMX state: chunk I6)");
+    return none;
+  }
+  if (!has_modrm || (reg_only && mod != 3) || (mem_only && mod == 3)) return Uns("SSE form with an operand x86 makes #UD");
+  Verdict v = Allow();
+  v.simd = true;
+  v.align = mod != 3 && form == M128;
+  return v;
+}
+
 // LOCK (SDM Vol.2 "LOCK"): allowed only on the memory-destination forms of ADD, ADC, AND, BTC, BTR, BTS, CMPXCHG,
 // CMPXCHG8B/16B, DEC, INC, NEG, NOT, OR, SBB, SUB, XOR, XADD and XCHG; on any other instruction, or one of these with a
 // register destination, it raises #UD.
@@ -174,8 +238,37 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   // its ModRM when that was decoded, else only from an opcode no lockable form has.
   if ((f & DecodeFlags::FLAG_LOCK) && (decoded || has_modrm ? !Lockable(d, has_modrm, mod, reg) : !Lockable(d, false, 0, 0, true)))
     return Sys("LOCK prefix on an instruction that is not lockable (#UD)");
-  Verdict v;
-  switch (d.FexcMap) {
+  Verdict v {UNSUPPORTED, false, nullptr};
+  // SSE (I5a): the mandatory prefix from the bytes (FEX takes the last of 66/F2/F3, x86 lets F2/F3 win over 66).
+  // (Only a decoded instruction: after a decoder failure its size, so its prefix bytes, are unknown.)
+  if (decoded && d.FexcMap >= FEXC_MAP_TWO && d.FexcMap <= FEXC_MAP_0F3A) {
+    const uint8_t* b = fexc_guest_bytes ? fexc_guest_bytes(d.PC, d.InstSize) : nullptr;
+    if (!b) return Uns("SSE prefixes: instruction bytes unavailable");
+    bool p66 = false, pf2 = false, pf3 = false;
+    for (unsigned i = 0; i < d.InstSize && b[i] != 0x0F; ++i) { p66 |= b[i] == 0x66; pf2 |= b[i] == 0xF2; pf3 |= b[i] == 0xF3; }
+    const uint8_t pfx = pf3 ? 0xF3 : pf2 ? 0xF2 : p66 ? 0x66 : 0;
+    const uint8_t map = d.FexcMap == FEXC_MAP_0F38 ? 5 : d.FexcMap == FEXC_MAP_0F3A ? 6 : 1;
+    const uint8_t fexpfx = d.FexcMap == FEXC_MAP_TWO_66 ? 0x66 : d.FexcMap == FEXC_MAP_TWO_F3 ? 0xF3 : d.FexcMap == FEXC_MAP_TWO_F2 ? 0xF2 : 0;
+    // CRC32 (SSE4.2, F2 0f 38 f0/f1; 66 for a 16-bit source): a general-register instruction, not gated by CR0/CR4.
+    if (map == 5 && pf2 && !pf3 && (op == 0xF0 || op == 0xF1) && has_modrm) {
+      if (!decoded) return Uns("did not decode");
+      if (f & DecodeFlags::FLAG_ADDRESS_SIZE) return Uns("address-size override");
+      return Allow();
+    }
+    v = Sse(map, pfx, op, has_modrm, mod, reg);
+    if (v.why == nullptr) v = {UNSUPPORTED, false, nullptr};
+    // (FEX decodes the 0f 71..73 shift groups through its group table, keyed by the prefix itself, and reports map 1.)
+    else if (v.kind == ALLOW && ((pf2 && pf3) || ((pf2 || pf3) && p66)))
+      v = Uns("SSE form with several mandatory prefixes (66 with F2/F3, or F2 with F3)");
+    else if (v.kind == ALLOW && map == 1 && fexpfx != pfx && !(op >= 0x71 && op <= 0x73))
+      v = Uns("SSE form FEX decoded under another mandatory prefix");
+    // INSERTPS m32 whose zero mask clears the inserted element: FEX drops the load, and with it the access's #PF.
+    else if (v.kind == ALLOW && map == 6 && op == 0x21 && mod != 3 && (b[d.InstSize - 1] & 0xF) & (1 << (b[d.InstSize - 1] >> 4 & 3)))
+      v = Uns("insertps m32 whose zero mask clears the inserted element (FEX drops the load and its #PF)");
+    // LDMXCSR/STMXCSR m32 (0f ae /2, /3): MXCSR is the resident's (its gating, #GP for reserved bits, the exception flags).
+    if (d.FexcMap == FEXC_MAP_TWO && op == 0xAE && has_modrm && mod != 3 && (reg == 2 || reg == 3)) return Sys("ldmxcsr/stmxcsr");
+  }
+  if (v.why == nullptr) switch (d.FexcMap) {
   case FEXC_MAP_PRIMARY: v = Primary(op, has_modrm, mod, reg); break;
   case FEXC_MAP_TWO: case FEXC_MAP_TWO_F2: case FEXC_MAP_TWO_66:
     v = Two(op, d.FexcMap == FEXC_MAP_TWO, has_modrm, mod, reg); break;
@@ -203,6 +296,8 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
     return v;
   }
   if (!decoded) return Uns("did not decode");
+  // CR0.EM, CR0.TS or no CR4.OSFXSR (the host's --sse-gated): the resident raises #UD or #NM before the instruction.
+  if (v.simd && fexc_sse_gated) { v = Sys("SSE gated by CR0.EM/TS or CR4.OSFXSR (#UD/#NM)"); v.simd = true; return v; }
   const bool primary = d.FexcMap == FEXC_MAP_PRIMARY;
   // LOCK (I3): admitted on every lockable form (the others are cut above as #UD). FEX lowers each to one LSE atomic (LOCK NEG:
   // one compare-and-swap per pass, patch 0016). 66 on cmpxchg8b/16b is refused by policy (the SDM gives it no meaning).
@@ -310,11 +405,19 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
     const bool lock_neg = d.FexcMap == FEXC_MAP_PRIMARY && (op == 0xF6 || op == 0xF7) && ((d.ModRM >> 3) & 7) == 3 &&
                           (d.Flags & DecodeFlags::FLAG_LOCK);
     if (lock_neg) fexc_after_rep = rip + d.InstSize;
+    if (v.align) fexc_align16.insert(rip);   // I5a: its first access gets the alignment check (#GP(0))
+    if (v.simd) {   // I5a: the MXCSR flags FEX's lowering would get wrong (fexc_hook.h)
+      const uint8_t* b = fexc_guest_bytes(d.PC, d.InstSize);
+      if (d.FexcMap == FEXC_MAP_TWO || d.FexcMap == FEXC_MAP_TWO_66) { if (op == 0x2F) fexc_fp_signal.insert(rip); }
+      if ((d.FexcMap == FEXC_MAP_TWO || d.FexcMap == FEXC_MAP_TWO_F3) && (op == 0x52 || op == 0x53)) fexc_fp_quiet.insert(rip);
+      if (d.FexcMap == FEXC_MAP_0F3A && op >= 0x08 && op <= 0x0B && !(b[d.InstSize - 1] & 8)) fexc_round_inexact.insert(rip);
+    }
     if (!rel || uint64_t(int64_t(target << 16) >> 16) == target) return false;
     v = Uns("direct branch to a non-canonical target");
   }
   fexc_cut = {v.kind == SYSTEM ? FEXC_CUT_SYSTEM : FEXC_CUT_UNSUPPORTED, rip, d.FexcMap, d.FexcMap == FEXC_MAP_VEX ? d.FexcVexOp : d.OPRaw, d.ModRM,
               bool(d.Flags & DecodeFlags::FLAG_DECODED_MODRM), d.TableInfo && d.TableInfo->Name ? d.TableInfo->Name : "?", v.why};
+  fexc_cut.gated = v.kind == SYSTEM && v.simd;
   return true;
 }
 } // namespace FexcSlice1

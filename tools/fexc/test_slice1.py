@@ -1,6 +1,6 @@
 """S1c checks: profile slice1 of fexc (block cutting at an allowlist, single-gate exits, profile record).
 
-Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series18 build)
+Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series20 build)
 
 The x86 bytes below are assembled by hand and only drive the compiler; every expectation (where the block ends, why)
 comes from the instruction's architectural class, never from fexc's output. The cut position is also compared with a
@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402  (disassemble, object reader)
 import scan_skips  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series18/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series20/obj/fexc')
 REPO = HERE.parents[1]
 RIP = 0x102000
 PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
@@ -60,7 +60,8 @@ UNSUPPORTED = {
     'fs addr32 mov rax,[eax]': '6467488b00',
     'ss mov rax,[rbx] (#SS or #GP)': '36488b03', 'ds mov rax,[rbp] (#GP or #SS)': '3e488b4500', 'cs mov [rsp+8],rcx': '2e48894c2408',
     'ss mov rax,[rip]': '36488b0500000000', 'es push [rbp+8]': '26ff7508',
-    'addps': '0f58c1', 'movaps': '0f28c1', 'fld st0': 'd9c0', 'vzeroupper': 'c5f877',
+    'paddd mm (MMX, I6)': '0ffec1', 'pcmpistri (host helper)': '660f3a63c100', 'maskmovdqu': '660ff7c1', 'f3 66 movss': 'f3660f10c1',
+    'insertps m32 zeroing its element': '660f3a21000f', 'aesenc': '660f38dcc1', 'fld st0': 'd9c0', 'vzeroupper': 'c5f877',
     'o16 pushf': '669c', 'o16 leave': '66c9', 'enter level 1': 'c8080001', 'o16 shld': '660fa4c101', 'o16 shrd cl': '660fadc1',
     'prefetchw': '0f0d08', 'prefetch /4 (reserved nop)': '0f1820', 'prefetch reg (reserved nop)': '0f18c0', 'movnti reg': '0fc3c1',
     'pdep': 'c4e2fbf5c1', 'pext': 'c4e2faf5c1', 'andn L=1': 'c4e27cf2c1', 'blsr /0 (#UD)': 'c4e278f3c1', 'vpxor': 'c5f9efc0',

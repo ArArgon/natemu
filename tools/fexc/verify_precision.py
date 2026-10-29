@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1b1 check: the slice-1 precision guarantee, verified statically on the code fexc emits (profile slice1).
 
-usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series18 build)
+usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series20 build)
 
 Corpora: fixtures/slice1/programs.json, the single-instruction matrix of scan_skips.py, the adversarial programs below
 (one per precision patch), and every CORPUS.json given (gen_slice1.py format, e.g. a fresh `--seed` corpus).
@@ -75,13 +75,14 @@ import check_sites, scan_skips  # noqa: E402
 from check_sites import code_vs_sites  # noqa: E402
 import flags as F  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series18/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series20/obj/fexc')
 
 NZCV_WRITERS = {'adds', 'adcs', 'subs', 'sbcs', 'ands', 'bics', 'negs', 'ngcs', 'cmp', 'cmn', 'tst', 'ccmp', 'ccmn', 'fcmp',
                 'fcmpe', 'fccmp', 'fccmpe', 'setf8', 'setf16', 'rmif', 'cfinv', 'axflag', 'xaflag'}
 NO_DEST = {'cmp', 'cmn', 'tst', 'ccmp', 'ccmn', 'fcmp', 'fcmpe', 'fccmp', 'fccmpe', 'setf8', 'setf16', 'rmif', 'cfinv', 'axflag',
            'xaflag', 'msr', 'b', 'br', 'ret', 'cbz', 'cbnz', 'tbz', 'tbnz', 'nop', 'dmb', 'dsb', 'isb', 'brk', 'udf', 'hint', 'prfm'}
 PAIR_LOADS = {'ldp', 'ldnp', 'ldpsw', 'ldxp', 'ldaxp'}
+SIMD_TO_GPR = {'umov', 'smov', 'fcvtzs', 'fcvtzu', 'fcvtns', 'fcvtnu', 'fcvtms', 'fcvtmu', 'fcvtps', 'fcvtpu', 'fcvtas', 'fcvtau', 'fjcvtzs'}   # I5a
 DATA = {'mov', 'movk', 'movz', 'movn', 'add', 'sub', 'and', 'orr', 'eor', 'bic', 'orn', 'eon', 'lsl', 'lsr', 'asr', 'ror', 'lslv',
         'lsrv', 'asrv', 'rorv', 'mul', 'madd', 'msub', 'mneg', 'smulh', 'umulh', 'smull', 'umull', 'smaddl', 'umaddl', 'sdiv', 'udiv',
         'csel', 'csinc', 'csinv', 'csneg', 'cset', 'csetm', 'cinc', 'cinv', 'cneg', 'sxtb', 'sxth', 'sxtw', 'uxtb', 'uxth', 'ubfx',
@@ -122,7 +123,11 @@ def effects(text):
     if acc and acc[5] != 'none':
         dests.add(reg(acc[2]))
     nzcv = mn in NZCV_WRITERS or (mn == 'msr' and 'nzcv' in ops.lower())
-    known = mn in DATA or mn in NO_DEST or mn.startswith('b.') or bool(acc)
+    # I5a: a SIMD&FP data-processing word (its destination a vector register; FP to integer conversions and moves to a
+    # general register write that one) is known: its first operand is its destination.
+    simd = bool(toks) and not acc and ((reg(toks[0]) or ('', 0))[0] == 'v' or mn.split('.')[0] in SIMD_TO_GPR or
+                                       mn.startswith('mov.'))   # (`mov.d xN, vM[i]`: UMOV's alias)
+    known = mn in DATA or mn in NO_DEST or mn.startswith('b.') or bool(acc) or simd
     return mn, {d for d in dests if d}, nzcv, acc, known
 
 
@@ -135,6 +140,9 @@ def flag_writes(a):
     """(written, defined) arithmetic-flag masks of one annotated instruction (flags.py rules); a shift or rotate by an
     unknown count may write nothing, so it defines nothing."""
     op = a['op']
+    if a.get('sse'):    # I5a: COMISS/UCOMISS/COMISD/UCOMISD and PTEST define all six; other SSE forms write none
+        w = F.ALL6 if op in ('comiss', 'ucomiss', 'comisd', 'ucomisd', 'ptest') else 0
+        return w, w
     if op in F.NO_FLAGS | F.NO_FLAGS_I1 | F.STRING_MOVES | {'lahf', 'pushf'} or op in F.STRING_COMPARES and a.get('count') == 0:
         return 0, 0
     if op == 'cmc':     # FEX flips its CF-inversion state at compile time (no native word; sites record cf_inverted), so
@@ -199,7 +207,7 @@ def df_stores(d, insns, dis, order):
 
 STUBS = check_sites.STUBS
 BRANCH = re.compile(r'(b|b\.\w+|cbz|cbnz|tbz|tbnz)\s+(?:([wx]\d+),\s+)?(?:#(0x[0-9a-f]+|\d+),\s+)?0x([0-9a-f]+)$')
-STUB_WORD = {'guard': 'brk #0x1', 'split': 'brk #0x2', 'divide': 'brk #0x3'}
+STUB_WORD = {'guard': 'brk #0x1', 'split': 'brk #0x2', 'divide': 'brk #0x3', 'align': 'brk #0x4'}
 M64 = (1 << 64) - 1
 
 
@@ -340,7 +348,31 @@ def guards(d, dis, order):
                         out.append(f'{tag}: RIP-relative {kind} stub +{x["native_offset"]} is not reached by an unconditional b in the instruction')
                     else:
                         ok.add(o); cost[kind] += 1
+            for x in (x for x in mine if x['kind'] == 'align'):   # I5a: a misaligned RIP-relative SSE operand: `b` to its stub
+                o = check_at.get(x['native_offset'])
+                if o is None or not (lo <= o < at) or dis[o] != f'b {x["native_offset"]:#x}' or not A & 15:
+                    out.append(f'{tag}: RIP-relative alignment stub +{x["native_offset"]} is not a `b` in the instruction for a misaligned address')
+                else:
+                    ok.add(o)
             continue
+        # I5a: the alignment check `and x0, xA, #0xf; cbnz x0, stub` on exactly the access's address (the first access of a
+        # legacy SSE instruction whose 16-byte operand must be aligned), then only scratch writes and the split check.
+        al = [x for x in mine if x['kind'] == 'align']
+        if len(al) > 1:
+            out.append(f'{tag}: {len(al)} alignment stubs')
+        for x in al[:1]:
+            A = x['base_reg']
+            t3 = check_at.get(x['native_offset'])
+            ce = checked_expr(A, lo, t3 - 4, dis, order) if t3 is not None else None
+            if t3 is None or not (lo <= t3 - 4 and t3 < at) or dis.get(t3) != f'cbnz x0, {x["native_offset"]:#x}' or \
+                    dis.get(t3 - 4) != f'and x0, x{A}, #0xf' or x['imm'] != 0 or ce != expr or written(ce[0], t3 - 4, at) or \
+                    (ix is not None and written(ix, t3 - 4, at)):
+                out.append(f'{tag}: alignment stub +{x["native_offset"]} is not `and x0, xA, #0xf; cbnz x0` on the access address ({ce} vs {expr})')
+            else:
+                ok.add(t3); cost['branch'] += 0
+                for o in (o for o in order if t3 < o < at):
+                    if writes(dis[o]) - {('x', 0), ('x', 1)} or check_sites.native_access(dis[o]):
+                        out.append(f'{tag}: "{dis[o]}" between the alignment check and the access')
         # P8: no address guard
         if gs:
             out.append(f'{tag}: {len(gs)} address guard stubs')

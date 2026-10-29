@@ -60,6 +60,9 @@ def step(insn, undefined):
     elif op == 'pushf': reads = ARITH                                # the pushed image holds every flag
     if reads & undefined:
         raise ValueError(f"{op} {insn.get('cc', '')} reads undefined flag(s) {reads & undefined:#x}")
+    # I5a: SSE forms (annotation `sse`) write no arithmetic flag but COMISS/UCOMISS/COMISD/UCOMISD and PTEST, which define
+    # all six (ZF PF CF, or ZF CF, by the operands; the rest cleared).
+    if insn.get('sse'): return undefined & ~ALL6 if op in ('comiss', 'ucomiss', 'comisd', 'ucomisd', 'ptest') else undefined
     if op in NO_FLAGS | NO_FLAGS_I1 | STRING_MOVES | {'lahf', 'pushf'}: return undefined
     if op in STRING_COMPARES: return undefined if insn.get('count') == 0 else undefined & ~ALL6
     if op in ('clc', 'stc', 'cmc'): return undefined & ~CF

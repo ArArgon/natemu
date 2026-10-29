@@ -79,7 +79,7 @@ pub const STAGING_OFFSET: usize = 0x70000;
 pub const STAGING_BYTES: usize = 0x20000;
 pub const STAGING_VA: u64 = PRIVATE + STAGING_OFFSET as u64;
 /// Native stack mapped below `crate::STACK_TOP` while code runs (SP_EL0; admitted code never uses it).
-pub const STACK_BYTES: usize = 0x4000;
+pub const STACK_BYTES: usize = 0x8000;
 /// Guest-physical RAM `[0, GUEST_RAM_BYTES)`: backing offset and resident alias, mapped in 2 MiB blocks.
 pub const GUEST_RAM_OFFSET: usize = 2 * RAM_SIZE;
 pub const GUEST_RAM_BYTES: usize = 0x40_0000;
@@ -439,7 +439,40 @@ pub struct Cpu {
     /// 1 after a MOV SS (its interrupt and debug shadow, SDM Vol.2 MOV); the next system transaction clears it. X2 owns
     /// its effect and its end at the next instruction boundary inside generated code.
     pub mov_ss: u64,
+    /// XMM0..XMM15 (I5a), each as two little-endian quadwords (low, high). In FEX's static vector registers v16..v31 while
+    /// generated code runs ([`XMM_VREG`]); banked here at every resident entry, so precise faults hold them too.
+    pub xmm: [[u64; 2]; 16],
+    /// MXCSR (I5a; SDM Vol.1 10.2.3): authoritative here. Its rounding control, FTZ and DAZ become FPCR at every block entry
+    /// ([`fpcr`]); the exception flags FEX's code raises accumulate in FPSR and are or-ed in at the next resident entry
+    /// ([`mxcsr_flags`]). LDMXCSR/STMXCSR are the resident's transactions.
+    pub mxcsr: u64,
 }
+/// The first native vector register of XMM0 (FEX's x64 `SRAFPR`: XMM0..XMM15 in v16..v31).
+pub const XMM_VREG: usize = 16;
+/// MXCSR at reset and as Linux sets it (SDM Vol.1 10.2.3.4: all exceptions masked, round to nearest).
+pub const MXCSR_RESET: u64 = 0x1f80;
+/// MXCSR bits LDMXCSR may set (MXCSR_MASK of a processor with DAZ, SDM Vol.1 11.6.6): a 1 above is #GP(0).
+pub const MXCSR_MASK: u64 = 0xffff;
+/// MXCSR exception masks (IM DM ZM OM UM PM, bits 12:7).
+pub const MXCSR_MASKS: u64 = 0x1f80;
+/// FPCR for generated code under `mxcsr` (FEX compiles with FEAT_AFP, DDI0487 FPCR): AH (x86 NaN and min/max rules) and NEP
+/// (scalar results keep the vector's upper lanes) always; FIZ = DAZ, FZ = FTZ (with AH, an output flush only), RMode from
+/// RC (x86 00 nearest, 01 down, 10 up, 11 toward zero; Arm RN 00, RP 01, RM 10, RZ 11).
+pub const fn fpcr(mxcsr: u64) -> u64 {
+    let rmode = [0, 2, 1, 3][(mxcsr >> 13 & 3) as usize];
+    1 << 1 | 1 << 2 | (mxcsr >> 6 & 1) | (mxcsr >> 15 & 1) << 24 | rmode << 22
+}
+/// MXCSR exception flags for the FPSR cumulative flags generated code raised under `mxcsr`: IOC -> IE, DZC -> ZE, OFC -> OE,
+/// UFC -> UE, IXC -> PE, and IDC -> DE unless DAZ. With FPCR.AH = 1 and FIZ = 0 the M4 sets IDC for a denormal input it
+/// does not flush, with x86's precedence (none beside an IE or ZE of the same operation or a NaN operand; not for FP to
+/// integer conversions, FRINT* or the reciprocal estimates; the I5a review's measurements, `tools/run_i5a_de.py`). Under DAZ
+/// (FIZ = 1) IDC marks a flushed input, where x86 sets no DE.
+pub const fn mxcsr_flags(fpsr: u64, mxcsr: u64) -> u64 {
+    let de = if mxcsr & MXCSR_DAZ == 0 { fpsr >> 7 & 1 } else { 0 };
+    (fpsr & 1) | de << 1 | (fpsr >> 1 & 1) << 2 | (fpsr >> 2 & 1) << 3 | (fpsr >> 3 & 1) << 4 | (fpsr >> 4 & 1) << 5
+}
+/// MXCSR.DAZ (denormal source operands are zeros: no DE).
+pub const MXCSR_DAZ: u64 = 1 << 6;
 
 /// A segment register's visible selector and hidden part. `attributes` are descriptor bits 47:40 (type, S, DPL, P) in
 /// 7:0 and bits 55:52 (AVL, L, D/B, G) in 15:12; a null load leaves 0 (P = 0: unusable). `limit` is byte-granular.
@@ -523,6 +556,9 @@ pub const CR4_PCIDE: u64 = 1 << 17;
 pub const CR4_DE: u64 = 1 << 3;
 /// RDPMC allowed at CPL > 0.
 pub const CR4_PCE: u64 = 1 << 8;
+/// SSE enabled (FXSAVE/FXRSTOR save XMM, SSE forms run; else #UD) and unmasked SIMD exceptions as #XM (else #UD).
+pub const CR4_OSFXSR: u64 = 1 << 9;
+pub const CR4_OSXMMEXCPT: u64 = 1 << 10;
 /// DR6 and DR7 in 64-bit mode (SDM Vol.3 17.2.3, 17.2.4; no RTM or bus-lock detection in the profile): bits 63:32
 /// reserved (#GP on a write of 1); DR6 writable B0..B3, BD, BS, BT, the rest fixed (1 in 31:16 and 11:4, 0 in 12); DR7
 /// writable L0..G3, LE, GE, GD and the R/W, LEN fields, bit 10 fixed 1, bits 11, 12, 14, 15 fixed 0.
@@ -568,7 +604,9 @@ impl Cpu {
     }
     /// What code at a RIP is compiled and cached under besides the RIP: CR3, and a word of the CPL, the code mode
     /// (bit 2: 64-bit, the only mode yet) and the paging controls a translation depends on (CR0.PG/WP,
-    /// CR4.PGE/PCIDE/SMEP, EFER.NXE).
+    /// CR4.PGE/PCIDE/SMEP, EFER.NXE), and the SSE gating bits (I5a: CR0.EM, CR0.TS, CR4.OSFXSR; a translation cuts every
+    /// SSE form when they gate it, so a block is never entered under other gating than it was made for, even should a
+    /// control change ever keep the code).
     pub fn code_context(&self) -> [u64; 2] {
         let bit = |on: bool, n: u32| u64::from(on) << n;
         let word = self.cpl & 3
@@ -578,7 +616,10 @@ impl Cpu {
             | bit(self.cr4 & CR4_PGE != 0, 5)
             | bit(self.cr4 & CR4_PCIDE != 0, 6)
             | bit(self.cr4 & CR4_SMEP != 0, 7)
-            | bit(self.efer & EFER_NXE != 0, 8);
+            | bit(self.efer & EFER_NXE != 0, 8)
+            | bit(self.cr0 & CR0_EM != 0, 9)
+            | bit(self.cr0 & CR0_TS != 0, 10)
+            | bit(self.cr4 & CR4_OSFXSR != 0, 11);
         [self.cr3, word]
     }
 }
@@ -620,6 +661,9 @@ pub const REPLY_SYSTEM: u64 = 3;
 /// for an instruction fetch (marking it, for a translate request) and asks again with its result in `State::fetch` /
 /// `State::fetch_fault`.
 pub const REPLY_NEXT_PAGE: u64 = 4;
+/// The instruction fetch at `cpu.rip` faults (`State::fetch_fault`: RIP's page, or the next one an instruction crossing
+/// into it needs): nothing is staged; the resident delivers the exception (X1a).
+pub const REPLY_FETCH_FAULT: u64 = 5;
 
 /// A request's instruction fetch, walked by the resident (`State::fetch_fault`): why the walk of the last page it walked
 /// failed — kind, then the #PF address and error code for [`fetch::PAGE`].
@@ -723,6 +767,19 @@ pub mod system {
     /// A LOCK prefix on an instruction that is not lockable (I3; SDM Vol.2 "LOCK"): #UD, whatever the instruction (fexc
     /// cuts it as a system instruction; `lock` is 1, `length` is not used: the fault leaves RIP at the instruction).
     pub const LOCK_UD: u32 = 0xf0;
+    /// Software interrupts and #UD instructions (X1a), delivered through the IDT by the resident: INT n (`cr` = n,
+    /// `length` past the immediate), INT3 (`cc`), INTO (`ce`: #UD in 64-bit mode) and UD0/UD1/UD2 (`0f ff`, `0f b9`,
+    /// `0f 0b`: #UD; their ModRM is not decoded, `length` is not used: the fault leaves RIP at the instruction).
+    pub const INT: u32 = 27;
+    pub const INT3: u32 = 28;
+    pub const INTO: u32 = 29;
+    pub const UD: u32 = 30;
+    /// LDMXCSR/STMXCSR m32 (I5a; `0f ae /2`, `/3`): MXCSR from or to the memory operand, gated like any SSE form.
+    pub const LDMXCSR: u32 = 31;
+    pub const STMXCSR: u32 = 32;
+    /// An SSE instruction under CR0.EM, CR0.TS or without CR4.OSFXSR (I5a; fexc cut it, `--sse-gated`): #UD or #NM from the
+    /// bank's controls (`length` is not used: the fault leaves RIP at the instruction).
+    pub const SSE_GATED: u32 = 33;
     /// `System::base` of a RIP-relative operand (relative to the next instruction).
     pub const RIP: u32 = 16;
     pub const NO_REG: u32 = 0xff;
@@ -752,6 +809,10 @@ pub mod system {
                     JMP_FAR..=CALL_FAR => self.memory == 1 && address && matches!(self.size, 4 | 8),
                     RET_FAR..=IRET => matches!(self.size, 4 | 8) && (self.kind == IRET || (0..=0xffff).contains(&self.disp)),
                     LOCK_UD => self.lock == 1,
+                    LDMXCSR | STMXCSR => self.memory == 1 && address,
+                    SSE_GATED => true,
+                    INT => self.cr < 256,
+                    INT3 | INTO | UD => true,
                     _ => false,
                 }
         }
@@ -770,8 +831,8 @@ pub mod stop {
     pub const UNKNOWN_ABORT: u64 = 3;
     /// A site's abort does not match its record (ESR class/direction, FAR).
     pub const SITE_MISMATCH: u64 = 4;
-    /// An x86 exception is due at a guest instruction boundary (`State::fault`; the bank holds the
-    /// exact state at that instruction's start). Delivery through the IDT is later system work.
+    /// (Retired by X1a: an x86 exception is delivered through the IDT, never a stop; a shutdown is [`SHUTDOWN`].)
+    /// The number stays reserved.
     pub const GUEST_FAULT: u64 = 5;
     /// Shadow installation failed (capacity after eviction, memory outside guest RAM).
     pub const SHADOW: u64 = 7;
@@ -801,6 +862,10 @@ pub mod stop {
     /// `eret`, `hvc`, `wfi`, `udf`, the debug channel, counters and timers: ESR classes 0x00, 0x01, 0x18; also an illegal
     /// execution state, SME, and PC or SP misalignment: 0x0e, 0x1d, 0x22, 0x26); admission never admits one.
     pub const TRAPPED: u64 = 15;
+    /// Shutdown (X1a; SDM Vol.3 7.15 interrupt 8): a contributory or page fault while delivering #DF, i.e. a triple fault.
+    /// `State::fault` holds the last exception detected (vector, CR2, error code, RIP of the original event); the bank
+    /// holds the state at the original event (CR2 as written by any #PF detected on the way); nothing was delivered.
+    pub const SHUTDOWN: u64 = 16;
 
     pub fn name(code: u64) -> &'static str {
         match code {
@@ -808,7 +873,6 @@ pub mod stop {
             BAD_REPLY => "bad_reply",
             UNKNOWN_ABORT => "unknown_abort",
             SITE_MISMATCH => "site_mismatch",
-            GUEST_FAULT => "guest_fault",
             SHADOW => "shadow",
             NO_PROGRESS => "no_progress",
             BAD_LINK => "bad_link",
@@ -818,6 +882,7 @@ pub mod stop {
             UNSUPPORTED_ATOMIC => "unsupported_atomic",
             PRIVATE_ACCESS => "private_access",
             TRAPPED => "trapped",
+            SHUTDOWN => "shutdown",
             _ => "none",
         }
     }
@@ -908,6 +973,14 @@ pub struct State {
     pub systems: u64,
     /// The VM's vCPU count (CPUID's topology fields; set by the host, 1 by default).
     pub vcpus: u64,
+    /// NMI blocking (SDM Vol.3 7.7.2): set by NMI delivery (X2), released by every IRET even when it faults (X1a).
+    pub nmi_blocked: u64,
+    /// Delivery attempts through the IDT (X1a): one per exception or software interrupt, plus one per fault detected while
+    /// delivering (the nested fault or #DF that follows); attempts that fault are counted too.
+    pub deliveries: u64,
+    /// The last event delivered (X1a): its vector and the error code its frame holds, `u64::MAX` when it holds none (INT n
+    /// and INT3 to any vector, and exceptions without one). The test driver's logging IDT reads its frame by it.
+    pub delivered: [u64; 2],
 }
 impl State {
     pub const fn new(vcpu: u64, cpu: Cpu) -> Self {
@@ -957,6 +1030,9 @@ impl State {
             system: System::NONE,
             systems: 0,
             vcpus: 1,
+            nmi_blocked: 0,
+            deliveries: 0,
+            delivered: [0, u64::MAX],
         }
     }
 }
@@ -1047,7 +1123,8 @@ mod tests {
         assert!(ltr.well_formed() && far.well_formed() && ret.well_formed());
         assert!(!System { disp: 0x1_0000, ..ret }.well_formed() && !System { memory: 1, base: 17, ..ltr }.well_formed());
         for bad in [
-            System { kind: 27, ..mov },
+            System { kind: 31, ..mov },
+            System { kind: system::INT, cr: 256, ..mov }, // no such vector
             System { kind: system::LGDT, ..mov }, // no memory operand
             System { kind: system::IRET, size: 2, ..mov },
             System { kind: system::MOV_FROM_SREG, size: 8, memory: 0, reg: 16, ..mov },
@@ -1088,6 +1165,8 @@ mod tests {
             gdtr: TABLE_RESET,
             idtr: TABLE_RESET,
             mov_ss: 0,
+            xmm: [[0; 2]; 16],
+            mxcsr: MXCSR_RESET,
         };
         let c = cpu.control().unwrap();
         assert_eq!((c.cr3, c.cpl, c.wp, c.nxe, c.smep), (0x1000, 3, 1, 1, 0));

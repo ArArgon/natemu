@@ -27,7 +27,6 @@ fn ss(selector: u16) -> Exception {
 }
 const RFLAGS_NT: u64 = 1 << 14;
 const RFLAGS_TF: u64 = 1 << 8;
-const RFLAGS_RF: u64 = 1 << 16;
 const RFLAGS_IF: u64 = 1 << 9;
 const RFLAGS_IOPL: u64 = 3 << 12;
 const RFLAGS_VM: u64 = 1 << 17;
@@ -104,7 +103,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
         }
         system::JMP_FAR..=system::CALL_FAR => return far_transfer(s, i).map(Some),
         system::RET_FAR..=system::IRET => return far_return(s, i).map(Some),
-        _ => halt(*s, stop::BAD_REPLY),
+        _ => halt(s, stop::BAD_REPLY),
     }
     Ok(None)
 }
@@ -136,7 +135,7 @@ fn noncanonical(i: &System) -> Exception {
 /// a non-canonical range raises `noncanonical`. A write into a page holding translations invalidates them first
 /// ([`FetchWrites`]: no block of this vCPU runs during a transaction). Only write-back guest RAM is accessed; anything
 /// else (device pages: M3) stops `unsupported_system`.
-fn linear(s: &mut State, va: u64, buf: &mut [u8], write: bool, supervisor: bool, noncanonical: Exception) -> Result<(), Exception> {
+pub(super) fn linear(s: &mut State, va: u64, buf: &mut [u8], write: bool, supervisor: bool, noncanonical: Exception) -> Result<(), Exception> {
     let n = buf.len() as u64;
     let gpa = pages(s, va, n, write, supervisor, noncanonical)?;
     let first = (4096 - (va & 4095)).min(n) as usize;
@@ -156,7 +155,7 @@ fn linear(s: &mut State, va: u64, buf: &mut [u8], write: bool, supervisor: bool,
             RAM.copy_out(gpa, chunk)
         };
         if !done {
-            halt(*s, stop::UNSUPPORTED_SYSTEM)
+            halt(s, stop::UNSUPPORTED_SYSTEM)
         }
     }
     Ok(())
@@ -167,7 +166,7 @@ fn pages(s: &mut State, va: u64, n: u64, write: bool, supervisor: bool, noncanon
     if !paging::canonical(va) || !paging::canonical(last) || last < va {
         return Err(noncanonical);
     }
-    let Some(mut control) = s.cpu.control() else { halt(*s, stop::UNSUPPORTED_MODE) };
+    let Some(mut control) = s.cpu.control() else { halt(s, stop::UNSUPPORTED_MODE) };
     if supervisor {
         control.cpl = 0;
     }
@@ -178,10 +177,10 @@ fn pages(s: &mut State, va: u64, n: u64, write: bool, supervisor: bool, noncanon
         gpa[k] = loop {
             match paging::walk(&mut GuestTables::observed(RAM, CodeWrites(FetchWrites(s))), control, at, access) {
                 Ok(t) if t.wb => break t.gpa,
-                Ok(_) => halt(*s, stop::UNSUPPORTED_SYSTEM),
+                Ok(_) => halt(s, stop::UNSUPPORTED_SYSTEM),
                 Err(Fault::Page { address, error }) => return Err([14, error, address]),
                 Err(Fault::Contended) => {}
-                Err(_) => halt(*s, stop::UNSUPPORTED_MODE),
+                Err(_) => halt(s, stop::UNSUPPORTED_MODE),
             }
         };
     }
@@ -193,7 +192,7 @@ fn pages(s: &mut State, va: u64, n: u64, write: bool, supervisor: bool, noncanon
 /// hardware sets by a locked read-modify-write.
 fn atomic_byte(s: &mut State, va: u64, update: impl FnMut(u8) -> Option<u8>) -> Result<Result<u8, u8>, Exception> {
     let gpa = pages(s, va, 1, true, true, GP0)?[0];
-    let Some(p) = RAM.range(gpa, 1) else { halt(*s, stop::UNSUPPORTED_SYSTEM) };
+    let Some(p) = RAM.range(gpa, 1) else { halt(s, stop::UNSUPPORTED_SYSTEM) };
     if cache::translated(gpa) {
         FetchWrites(s).code_write(gpa);
     }
@@ -208,7 +207,7 @@ fn atomic_byte(s: &mut State, va: u64, update: impl FnMut(u8) -> Option<u8>) -> 
 /// The descriptor `selector` names (8 bytes, or 16 for a `wide` system descriptor) in the GDT, or for TI = 1 the LDT,
 /// and its linear address: #GP(selector) when it does not lie within the table's limit, when TI = 1 with a null LDTR,
 /// or when its address is not canonical.
-fn descriptor(s: &mut State, selector: u16, wide: bool) -> Result<(u64, u128), Exception> {
+pub(super) fn descriptor(s: &mut State, selector: u16, wide: bool) -> Result<(u64, u128), Exception> {
     let (base, limit) = if selector & 4 != 0 {
         let l = s.cpu.ldtr;
         if l.attributes & ATTR_P == 0 {
@@ -228,14 +227,14 @@ fn descriptor(s: &mut State, selector: u16, wide: bool) -> Result<(u64, u128), E
     Ok((va, u128::from_le_bytes(raw)))
 }
 /// Sets the accessed bit of the descriptor at `va` when `raw` has it clear (SDM Vol.3 3.4.5).
-fn accessed(s: &mut State, va: u64, raw: u64) -> Result<(), Exception> {
+pub(super) fn accessed(s: &mut State, va: u64, raw: u64) -> Result<(), Exception> {
     if raw >> 40 & 1 == 0 {
         let _ = atomic_byte(s, va + 5, |b| Some(b | 1))?; // an atomic OR: a peer's change to the byte is kept
     }
     Ok(())
 }
 /// Descriptor fields: (S, type, DPL, P).
-fn fields(raw: u64) -> (bool, u64, u64, bool) {
+pub(super) fn fields(raw: u64) -> (bool, u64, u64, bool) {
     (raw >> 44 & 1 != 0, raw >> 40 & 15, raw >> 45 & 3, raw >> 47 & 1 != 0)
 }
 
@@ -320,7 +319,7 @@ fn far_target(s: &mut State, selector: u16) -> Result<(u64, u64), Exception> {
     let (code_or_data, kind, dpl, present) = fields(raw);
     let cpl = s.cpu.cpl;
     if !code_or_data && kind == 0xc {
-        halt(*s, stop::UNSUPPORTED_SYSTEM)
+        halt(s, stop::UNSUPPORTED_SYSTEM)
     }
     let conforming = kind & 4 != 0;
     if !code_or_data
@@ -340,7 +339,7 @@ fn far_target(s: &mut State, selector: u16) -> Result<(u64, u64), Exception> {
 fn load_cs(s: &mut State, selector: u16, raw: u64) {
     s.cpu.seg[SREG_CS] = Segment { base: 0, ..Segment::loaded(selector, raw | 1 << 40) };
     if s.cpu.control().is_none() {
-        halt(*s, stop::UNSUPPORTED_MODE)
+        halt(s, stop::UNSUPPORTED_MODE)
     }
 }
 /// Halts `unsupported_mode` before any effect when `raw` is not a 64-bit code segment (L = 1, D = 0).
@@ -348,7 +347,7 @@ fn refuse_compatibility(s: &State, selector: u16, raw: u64) {
     if raw >> 53 & 3 != 1 {
         let mut refused = *s;
         refused.cpu.seg[SREG_CS] = Segment { base: 0, ..Segment::loaded(selector, raw) };
-        halt(refused, stop::UNSUPPORTED_MODE)
+        halt(&refused, stop::UNSUPPORTED_MODE)
     }
 }
 
@@ -395,8 +394,8 @@ fn far_transfer(s: &mut State, i: System) -> Result<u64, Exception> {
 /// for IRET (delivery_model's order) and after it for RET (its pseudocode; segment_model B4). A return to CPL 1 or 2 is
 /// refused (`unsupported_mode`) before any effect. IRET's RFLAGS follow the CPL and IOPL masks. A return to an outer
 /// level nulls DS/ES/FS/GS that are null or hold data or nonconforming code with DPL below the new CPL (segment_model B5)
-/// and changes the CPL ([`set_cpl`]). IRET does not unblock NMIs yet (no NMI state: X2); a TF it would set stops
-/// `unsupported_system` (single-step is S4's); RF is dropped.
+/// and changes the CPL ([`set_cpl`]). IRET releases NMI blocking before this runs, even when it faults (`system`); a TF
+/// it would set stops `unsupported_system` (single-step is S4's); RF is loaded from the frame.
 fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     let c = s.cpu;
     let (w, iret, release) = (u64::from(i.size), i.kind == system::IRET, i.disp as u64);
@@ -462,18 +461,17 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     }
     // CPL 1 and 2 are not built ([`Cpu::control`]): refused with nothing changed.
     if matches!(rpl, 1 | 2) {
-        halt(*s, stop::UNSUPPORTED_MODE)
+        halt(s, stop::UNSUPPORTED_MODE)
     }
     let mut rflags = c.rflags;
     if iret {
         let mask = IRET_ALWAYS | if cpl <= (c.rflags & RFLAGS_IOPL) >> 12 { RFLAGS_IF } else { 0 } | if cpl == 0 { IRET_CPL0 } else { 0 };
         rflags = (c.rflags & !mask | words[2] & mask) & !RFLAGS_VM | 2;
         if rflags & RFLAGS_TF != 0 {
-            halt(*s, stop::UNSUPPORTED_SYSTEM)
+            halt(s, stop::UNSUPPORTED_SYSTEM)
         }
-        // ponytail: RF is dropped (it only suppresses instruction breakpoints, none armed before S4); S4/X1 keep it
-        // until the next instruction completes.
-        rflags &= !RFLAGS_RF;
+        // RF comes from the frame (X1a) and lasts until the next instruction completes (`execution::completed`); it
+        // suppresses instruction breakpoints, which S4 arms.
     }
     accessed(s, va, raw)?;
     if let Some((_, _, Some((ss_va, ss_raw)))) = stack {

@@ -44,6 +44,17 @@ and jumps to `rip`; the code runs and falls through into the capture sequence ap
 (MOV-saves all GPRs, PUSHFQ, records the capture label as final RIP, writes state and regions to stdout).
 The tool checks final RIP = `rip+len(code)`, and QEMU's `-d in_asm` log must show exactly the supplied bytes.
 
+## I5a (SSE) programs
+
+`gen_i5a.py` programs carry `sse: true` (the VM runner sets CR4.OSFXSR) and `cpu: qemu64,+ssse3,+sse4_1,+sse4_2` (qemu64 has
+SSE..SSE3 only). They load XMM0..15 from a pattern block at the data region's start, set MXCSR with LDMXCSR (every exception
+masked), and end by storing XMM0..15 and STMXCSR into the data region, which `compare` covers like any memory. SSE lines are
+annotated `{op, sse: true}`: the disassembly check compares the mnemonic's first three letters (QEMU's AT&T names add suffixes),
+and `flags.step` lets COMISS/UCOMISS/COMISD/UCOMISD and PTEST define all six flags, every other SSE form none. The pinned QEMU
+(7.2) differs from the SDM in places the corpus meets: two NaN operands follow its x87 rule (the larger significand) instead
+of the SSE rule (SDM Vol.1 Table 4-7: the first source), MIN/MAX under DAZ return the original denormal (the SDM's DAZ converts
+it to a signed zero before the operation; the generator keeps MIN/MAX out of DAZ groups), and DE is never set.
+
 ## RFLAGS
 
 - Settable and meaningful under Linux-user: CF PF AF ZF SF OF (mask 0x8d5). Initial RFLAGS may set only these.

@@ -194,13 +194,26 @@ def lock_counter(n):
 # races and their instruction exits to its own RIP and runs again (patch 0016); `neg-private` is the same loop on a word of
 # each CPU's own (no race). Final word 1 (n * NR negations, NR even). The runner (`smp`) requires the race's self-exit link
 # point to have been taken: some CPU links more exits than any CPU of `neg-private` at the same n.
-NR_C, NR_R = 0x270000, 20000
+# A start barrier first (each CPU LOCK INCs the dword at NR_C + 0x1c0, r14, then waits for it to reach n), so the loops
+# overlap and the race happens whatever the vCPUs' start skew. The wait is one loop of at least 1,000 rounds (ecx counts
+# down to 0 and stays; the loop goes on while ecx or the wait is not done): every CPU takes both of its exits, so the
+# barrier adds the same linked exits to every CPU and the lost-race comparison below is unaffected.
+NR_C, NR_R = 0x270000, 200000
 def neg_race(n, private=False):
-    text = """.l: lock neg qword [r15]
+    text = f"""    lock inc dword [r14]
+    mov ecx, 1000
+.b: sub ecx, 1
+    adc ecx, 0
+    mov eax, dword [r14]
+    sub eax, {n}
+    sar eax, 31
+    or eax, ecx
+    jnz .b
+.l: lock neg qword [r15]
     dec rsi
     jnz .l
     cmp r11, r11"""
-    cpus = [cpu(i, BODY0, r15=NR_C + (0x80 * i if private else 0), rsi=NR_R) for i in range(n)]
+    cpus = [cpu(i, BODY0, r15=NR_C + (0x80 * i if private else 0), rsi=NR_R, r14=NR_C + 0x1c0) for i in range(n)]
     init = bytearray(0x200)
     for i in range(n if private else 1): init[0x80 * i] = 1
     return dict(name=f"{'neg-private' if private else 'neg-race'}@{n}", ncpu=n, bodies=[body(BODY0, text)], cpus=cpus,
@@ -260,7 +273,7 @@ def rmw_text(form, op, loc, dest):
     return ['mov r12, rbx', 'mov r15, rdx', f'mov {a}, {exp}', f'xor {d}, {d}', f'mov {b}, {des}', f'xor {c}, {c}',
             f'lock {form} {"oword" if wide else "qword"} {m}'] + ([f'mov {dest}, eax'] if dest else []) + ['mov rbx, r12', 'mov rdx, r15']
 
-def litmus_cpu_text(test, i, pause, locs=LOC, stride=2, fences=True, delay=63, shifts={}, rmw_form=None):
+def litmus_cpu_text(test, i, pause, locs=LOC, stride=2, fences=True, delay=63, shifts={}, rmw_form=None, vector=False):
     """CPU i's body: `locs` = location -> offset from SYNC, `stride` = result bytes per iteration, `fences` = False drops
     every fence (a positive control), `delay` = mask of the random start delay (spins), `shifts` = location -> bit shift of its
     value (a plain store writes `value << shift`, a load or final read shifts it back, so the changing byte sits in the
@@ -283,9 +296,14 @@ def litmus_cpu_text(test, i, pause, locs=LOC, stride=2, fences=True, delay=63, s
     L += ['    mov r13, r14', '    shl r13, 13', '    xor r14, r13', '    mov r13, r14', '    shr r13, 7', '    xor r14, r13', '    mov r13, r14', '    shl r13, 17',
           '    xor r14, r13', '    mov r13d, r14d', f'    and r13d, {delay}', '.dl: dec r13d', '    jns .dl']
     for op in test.programs[i]:
-        if op[0] == 'store': assert type(op[2]) is int; L.append(f'    mov dword [rdi+{locs[op[1]]}], {op[2] << shifts.get(op[1], 0)}')
+        # I5a `vector`: every plain store and load is a 16-byte SSE access holding the value in its low dword: `vector` names
+        # the move, MOVDQA (16-byte aligned locations: one atomic X-register pair) or MOVDQU.
+        if op[0] == 'store' and vector:
+            L += [f'    mov eax, {op[2] << shifts.get(op[1], 0)}', '    movd xmm0, eax', f'    {vector} [rdi+{locs[op[1]]}], xmm0']
+        elif op[0] == 'store': assert type(op[2]) is int; L.append(f'    mov dword [rdi+{locs[op[1]]}], {op[2] << shifts.get(op[1], 0)}')
         elif op[0] == 'load':
-            L.append(f'    mov {r(op[1])}d, [rdi+{locs[op[2]]}]')
+            if vector: L += [f'    {vector} xmm1, [rdi+{locs[op[2]]}]', f'    movd {r(op[1])}d, xmm1']
+            else: L.append(f'    mov {r(op[1])}d, [rdi+{locs[op[2]]}]')
             if shifts.get(op[2]): L.append(f'    shr {r(op[1])}d, {shifts[op[2]]}')
         elif op[0] == 'fence': L.append('    mfence' if fences else '')
         elif op[0] == 'rmw':
@@ -341,11 +359,16 @@ def litmus_outcomes(prog, test, got, k, stride=2, res=RES):
 CAS_READ = {'cas-read': 'cmpxchg', 'cas8b-read': 'cmpxchg8b'}
 RMW_FAMILIES = tuple(f'sb-{f}' for f in RMW_FORMS) + ('xadd', 'cas') + tuple(CAS_READ)
 FAMILIES = ('sb', 'sb-mfence', 'sb-xchg', 'mp', 'lb', 'wrc', 'iriw', '2+2w', 'xchg') + RMW_FAMILIES
+VECTOR_FAMILIES = ('vec-sb', 'vec-sb-mfence', 'vec-mp', 'vec-lb', 'vec-wrc', 'vec-iriw', 'vec-2+2w')   # I5a (run with --families)
 VARIANTS = ('aligned', 'unaligned', 'split', 'split-hi')
 
 def litmus_family(name, n):
-    """The model Litmus of family `name` on n participants, or None when it has no n-participant shape."""
+    """The model Litmus of family `name` on n participants, or None when it has no n-participant shape. `vec-F` (I5a) is F
+    with every plain load and store a 16-byte SSE access (`family_program`), the same model."""
     from models import ordering_model as m
+    if name.startswith('vec-'):
+        t = litmus_family(name[4:], n)
+        return t and m.Litmus('vec-' + t.name, t.programs, t.initial, t.outputs)
     X = [f'x{i}' for i in range(n)]
     nxt = lambda i: X[(i + 1) % n]
     zero = lambda names: tuple((a, 0) for a in names)
@@ -414,12 +437,13 @@ def family_program(test, variant, k, fences=True, delay=255):
     stride = max(sum(1 for c, _ in test.outputs if (0 if c == 'final' else c) == i) for i in range(n))
     assert 1 <= k and stride * k <= 0x20000
     form = test.name.split('@')[0][3:] if test.name.startswith('sb-') else {'xadd': 'xadd', 'cas': 'cmpxchg', **CAS_READ}.get(test.name.split('@')[0])
-    bodies = [body(BODY0 + 0x1000 * i, litmus_cpu_text(test, i, False, locs, stride, fences, delay, shifts, form)) for i in range(n)]
+    vector = test.name.startswith('vec-') and ('movdqa' if variant == 'aligned' else 'movdqu')
+    bodies = [body(BODY0 + 0x1000 * i, litmus_cpu_text(test, i, False, locs, stride, fences, delay, shifts, form, vector)) for i in range(n)]
     cpus = [cpu(i, BODY0 + 0x1000 * i, rdi=SYNC, rsi=FAMILY_RES(i), rdx=k, r14=0x9e3779b97f4a7c15 * (i + 1)) for i in range(n)]
     mem = [zero(SYNC, 0x6000)] + [zero(FAMILY_RES(i), stride * k) for i in range(n)
                                   if any((0 if c == 'final' else c) == i for c, _ in test.outputs)]
     return {'format': 'natemu-smp-v1', 'name': f'{test.name}-{variant}' + ('' if fences else '-nofence'), 'ncpu': n,
-            'bodies': bodies, 'cpus': cpus, 'memory': mem, 'params': {'k': k, 'stride': stride}}
+            'bodies': bodies, 'cpus': cpus, 'memory': mem, 'params': {'k': k, 'stride': stride}} | ({'sse': True} if vector else {})
 
 
 # ---- (c) system programs (CPL0, `system`: QEMU runs them on natemu's CPU model, smp.SYSTEM_CPU) ------------------------------
@@ -767,6 +791,135 @@ def sys_program(name, n=1):
     return {'format': 'natemu-smp-v1', 'name': f'sys-{name}@{n}', 'ncpu': n, 'system': True, 'bodies': bodies, 'cpus': cpus,
             'memory': memory, 'params': {'either': name == 'pte-no-invlpg'}}
 
+# ---- X1a: exceptions delivered through the program's own IDT, handled and returned from with IRETQ -------------------------
+# CPU i (CPL 0, table A as in sys_text) loads an IDT at DLV(i) whose interrupt gates (CS 0x08, DPL 0, no IST: QEMU's stub and
+# natemu's driver both have a 64-bit DPL 0 code segment at 0x08) lead to stubs that push the vector (and 0 where the CPU
+# pushes no error code) and a common handler. The handler logs, at DLV(i) + 0x1000 + 0x50 * k for the k-th event, the
+# vector, the error code, the frame (RIP, CS, RFLAGS & 0x10cd5: the arithmetic flags, DF and RF; RSP, SS), the frame's
+# address and CR2 for #PF; then fixes up as Linux's early handlers do and IRETQs: INT3 and INT 0x21 return after the
+# instruction; UD2 (WARN/BUG) is skipped; a #PF on V maps V again in table A (on-demand paging, as the decompressor and the
+# kernel's early #PF handler); a WRMSR the profile and pinned QEMU refuse with #GP(0) (IA32_APIC_BASE with reserved bit 9 set,
+# as a wrmsr_safe probe; QEMU accepts unknown MSRs, so rdmsr_safe's PLATFORM_INFO probe is a `run_slice3_vm.py delivery`
+# case) is skipped with r13 = -1;
+# DIV by 0 (#DE) is skipped. INT3 runs once more with DF set. Registers and the log are compared with QEMU;
+# tools/run_slice3_vm.py checks the logged frames against delivery_model. (Pinned QEMU keeps RF after an IRETQ that loaded
+# it until a later event, so an INT3 after a fault's return logs RF = 1 there; the SDM clears RF when the next instruction
+# completes and INT n pushes RF = 0: no INT follows a fault's return here.)
+DLV = lambda i: SYS_D(i) + 0x8000
+DLV_VECTORS = (0, 3, 6, 13, 14, 0x21)
+DLV_BODY = """    sidt [{idt:#x}+0x810]
+    lidt [{idt:#x}+0x800]
+    xor r13d, r13d
+    mov r12, 0x1234
+    add r12, r12
+    int3
+    int 0x21
+    std
+    int3
+    cld
+    ud2
+    and qword [{la:#x}], -2
+    invlpg [{V:#x}]
+    mov rbx, [{V:#x}+8]
+    and qword [{la:#x}], -2
+    invlpg [{V:#x}]
+    mov [{V:#x}+16], rbx
+    mov ecx, 0x1b
+    mov eax, 0xfee00a00
+    xor edx, edx
+    wrmsr
+    xor ecx, ecx
+    mov eax, 7
+    xor edx, edx
+    div rcx
+    lidt [{idt:#x}+0x810]
+    jmp dlv_end
+dlv_common:
+    mov r15, [{idt:#x}+0x820]
+    mov r14, [rsp]
+    mov [r15], r14
+    mov r14, [rsp+8]
+    mov [r15+8], r14
+    mov r14, [rsp+16]
+    mov [r15+16], r14
+    mov r14, [rsp+24]
+    mov [r15+24], r14
+    mov r14, [rsp+32]
+    and r14, 0x10cd5
+    mov [r15+32], r14
+    mov r14, [rsp+40]
+    mov [r15+40], r14
+    mov r14, [rsp+48]
+    mov [r15+48], r14
+    lea r14, [rsp+16]
+    mov [r15+56], r14
+    lea r14, [r15+0x50]
+    mov [{idt:#x}+0x820], r14
+    mov r14, [rsp]
+    cmp r14, 14
+    jne dlv_n14
+    mov r14, cr2
+    mov [r15+64], r14
+    or qword [{la:#x}], 1
+dlv_n14:
+    cmp r14, 6
+    jne dlv_n6
+    add qword [rsp+16], 2
+dlv_n6:
+    cmp r14, 13
+    jne dlv_n13
+    add qword [rsp+16], 2
+    mov r13, -1
+dlv_n13:
+    test r14, r14
+    jnz dlv_n0
+    add qword [rsp+16], 3
+dlv_n0:
+    add rsp, 16
+    iretq
+""" + ''.join(f"""dlv_v{v}:
+{'' if v in (13, 14) else '    push 0' + chr(10)}    push {v}
+    jmp dlv_common
+""" for v in DLV_VECTORS) + "dlv_end:\n"
+
+def dlv_program(n):
+    """`dlv-handlers@n`: every CPU runs DLV_BODY with its own IDT, log and table A."""
+    bodies, cpus, memory = [], [], []
+    for i in range(n):
+        d, idt = SYS_D(i), DLV(i)
+        f = dict(idt=idt, la=sys_leaf(i, 0, d + V), V=d + V)
+        text = sys_text(i, DLV_BODY.replace('{idt:#x}', f'{idt:#x}').replace('{la:#x}', f"{f['la']:#x}").replace('{V:#x}', f"{f['V']:#x}"))
+        _, labels = ref_assemble(text)
+        gates = b''
+        for v in range(0x22):
+            off = SYS_CODE(i) + labels[f'dlv_v{v}'] if v in DLV_VECTORS else 0
+            lo = off & 0xffff | 0x08 << 16 | (0x8e if off else 0) << 40 | (off >> 16 & 0xffff) << 48
+            gates += lo.to_bytes(8, 'little') + (off >> 32).to_bytes(8, 'little')
+        idtr = (0x22 * 16 - 1).to_bytes(2, 'little') + idt.to_bytes(8, 'little')
+        bodies.append(body(SYS_CODE(i), text)); cpus.append(dict(cpu(i, SYS_CODE(i)), cpl=0)); memory += sys_memory(i, n)
+        memory += [{'addr': f'0x{idt:x}', 'data': gates.hex()},
+                   # The IDTR operand, the start-up IDTR saved by SIDT (QEMU's stub's, natemu's driver's: they differ) and the
+                   # log cursor (r15 holds its last value): not compared.
+                   {'addr': f'0x{idt + 0x800:x}', 'data': (idtr + bytes(6 + 16) + (idt + 0x1000).to_bytes(8, 'little')).hex(), 'capture': False},
+                   zero(idt + 0x1000, 0x400)]
+    return {'format': 'natemu-smp-v1', 'name': f'dlv-handlers@{n}', 'ncpu': n, 'system': True, 'bodies': bodies, 'cpus': cpus,
+            'memory': memory, 'params': {'delivery': [DLV(i) + 0x1000 for i in range(n)]}}
+
+def ref_assemble(text):
+    """nasm's bytes and its labels (from a listing): {label: offset}."""
+    import re
+    with tempfile.TemporaryDirectory() as d:
+        src, out, lst = pathlib.Path(d, 'b.asm'), pathlib.Path(d, 'b.bin'), pathlib.Path(d, 'b.lst')
+        src.write_text('bits 64\ndefault abs\n' + text + '\n')
+        subprocess.run(['nasm', '-f', 'bin', str(src), '-o', str(out), '-l', str(lst)], check=True)
+        labels, lines = {}, lst.read_text().splitlines()
+        for k, line in enumerate(lines):
+            m = re.match(r'\s*\d+\s+(?:([0-9A-F]{8})\s+\S+\s+)?([A-Za-z_]\w*):\s*$', line)
+            if m:
+                at = next(int(x.split()[1], 16) for x in lines[k + 1:] if re.match(r'\s*\d+\s+[0-9A-F]{8}\s', x))
+                labels[m.group(2)] = at
+        return out.read_bytes(), labels
+
 # Fault cases: one faulting system instruction at CPL0 or CPL3, under the start-up tables and controls (values that would
 # differ between QEMU and natemu, such as the start-up CR3, never reach a register before the fault).
 SYS_FAULTS = {
@@ -1021,6 +1174,7 @@ def ctl_program(scn, n):
 
 def system_all():
     out = [sys_program(name, n) for name in SYS for n in ((1, 2, 4) if name not in ('pte-no-invlpg',) else (1,))]
+    out += [dlv_program(n) for n in (1, 2, 4)]
     out += [sys_fault(name) for name in list(SYS_FAULTS) + list(SYS_CPL3)]
     return out + [ctl_program(scn, n) for scn in CTL_SCENARIOS for n in CTL_SCENARIOS[scn][2]]
 

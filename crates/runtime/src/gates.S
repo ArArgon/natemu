@@ -76,6 +76,8 @@ private_start:
     stp q30, q31, [sp, #({q_offset}+480)]
     mrs x9, fpcr
     str x9, [sp, #{fpcr_offset}]
+    // The resident never runs under the guest's FPCR (I5a: rounding, flush and any trap enables are generated code's).
+    msr fpcr, xzr
     mrs x9, fpsr
     str x9, [sp, #{fpsr_offset}]
     str xzr, [sp, #{reserved_offset}]

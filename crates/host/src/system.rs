@@ -107,6 +107,27 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
                 at += 2;
             }
         }
+        // X1a: software interrupts and #UD instructions, delivered by the resident.
+        (MAP_PRIMARY, 0xcc) => s.kind = system::INT3,
+        (MAP_PRIMARY, 0xcd) => {
+            s.kind = system::INT;
+            s.cr = u32::from(*bytes.get(at)?);
+            at += 1;
+        }
+        (MAP_PRIMARY, 0xce) => s.kind = system::INTO,
+        // UD1/UD0's ModRM is not decoded: #UD leaves RIP at the instruction, its length is never used.
+        (MAP_TWO, 0x0b | 0xb9 | 0xff) => s.kind = system::UD,
+        // I5a: LDMXCSR/STMXCSR m32 (`0f ae /2`, `/3`); with a 66 prefix or a register operand another instruction.
+        (MAP_TWO, 0xae) if !operand16 => {
+            s.kind = match rm(bytes, &mut at, rex, &mut s)? {
+                2 => system::LDMXCSR,
+                3 => system::STMXCSR,
+                _ => return None,
+            };
+            if s.memory == 0 {
+                return None;
+            }
+        }
         _ => return None,
     }
     if s.memory == 1 {
@@ -261,6 +282,28 @@ mod tests {
         assert_eq!(d("450f21e3", 0x21), Some(mov(MOV_FROM_DR, 12, 11, 4, 0))); // mov r11, dr12 (REX.R: #UD in the resident)
         assert_eq!(d("f00f2300", 0x23), Some(mov(MOV_TO_DR, 0, 0, 4, 1))); // lock mov dr0, rax (mod 0 ignored)
         assert_eq!(d("0f33", 0x33), Some(System { kind: RDPMC, length: 2, ..System::NONE }));
+    }
+
+    #[test]
+    fn software_interrupts_and_ud() {
+        let s = |kind, cr, length| Some(System { kind, cr, length, ..System::NONE });
+        assert_eq!(super::decode(&[0xcc], MAP_PRIMARY, 0xcc), s(INT3, 0, 1));
+        assert_eq!(super::decode(&[0xcd, 0x80], MAP_PRIMARY, 0xcd), s(INT, 0x80, 2));
+        assert_eq!(super::decode(&[0xcd], MAP_PRIMARY, 0xcd), None); // truncated immediate
+        assert_eq!(super::decode(&[0xce], MAP_PRIMARY, 0xce), s(INTO, 0, 1));
+        assert_eq!(super::decode(&[0x0f, 0x0b], MAP_TWO, 0x0b), s(UD, 0, 2));
+        assert_eq!(super::decode(&[0x0f, 0xb9, 0xc0], MAP_TWO, 0xb9), s(UD, 0, 2));
+        assert_eq!(super::decode(&[0xf0, 0xcc], MAP_PRIMARY, 0xcc).map(|s| (s.kind, s.lock)), Some((INT3, 1))); // #UD by LOCK
+    }
+
+    #[test]
+    fn mxcsr_forms() {
+        assert_eq!(d("0fae10", 0xae), Some(mem(LDMXCSR, 0, 0, 3))); // ldmxcsr [rax]
+        assert_eq!(d("410fae5c2408", 0xae), Some(mem(STMXCSR, 12, 8, 6))); // stmxcsr [r12+8]
+        assert_eq!(d("640fae18", 0xae), Some(System { fs_gs: 4, ..mem(STMXCSR, 0, 0, 4) })); // stmxcsr fs:[rax]
+        for hex in ["660fae10", "0faed0", "0fae38", "670fae10"] {
+            assert_eq!(d(hex, 0xae), None, "{hex}"); // 66, register form, clflush, 32-bit address
+        }
     }
 
     #[test]

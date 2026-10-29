@@ -593,6 +593,173 @@ prefixes). Census LOCK class: kernel 10,020 → 0, initramfs 1,385 → 0, kernel
 (`experiments/track03/kernel-census/README.md`). Standing suite (series17) green but two items outside I3: `system`
 `seg-iret-null-ss-rpl@1` (an S2b program, QEMU reference timeout) and VM-creation collisions with the concurrent S2b agent
 (rerun clean).
+*Built (X1a, exception delivery, IRETQ completion, the driver's logging IDT):* every x86 exception the resident raises is
+delivered through the guest IDT; no guest fault stops a run any more (`stop::GUEST_FAULT` is retired). The transaction
+(`execution/delivery.rs`) follows `delivery_model` step by step (A5 order): the 16-byte gate read through the walker as an
+implicit supervisor access (`segments::linear`); #GP(vector * 8 + 2 + EXT) beyond the IDT limit and for anything but a
+64-bit interrupt or trap gate (16-bit gates #GP(0), A11); gate DPL < CPL for INT n/INT3 only (#GP(vector * 8 + 2)); #NP for
+a gate not present; the target CS through `segments::descriptor` with EXT or-ed into its #GP (null #GP(EXT); not code or
+DPL > CPL #GP(sel + EXT); #NP(sel + EXT); not 64-bit #GP(vector * 8 + 2 + EXT), A11); the stack: IST n, or RSPn when a
+nonconforming DPL 0 CS takes CPL 3 to 0, read from TR's base (#TS(TR + EXT) beyond its limit, #SS(EXT) non-canonical), else
+RSP; #GP(EXT) for a non-canonical handler; RSP aligned to 16; SS, RSP, RFLAGS, CS, RIP and the error code (#DF #TS #NP #SS
+#GP #PF #AC #CP) written at the new CPL as one access (a fault writes nothing; A2); the CS accessed bit; then CS (RPL = new
+CPL), a null SS with RPL = new CPL on a CPL change, `set_cpl`, RIP, RFLAGS without TF, NT, RF, VM (and IF for an interrupt
+gate), the MOV SS shadow ended. RF image: 0 for INT n/INT3, 1 for the fault-class vectors (and #DB, whose only source,
+DR7.GD, is a fault until S4), else the current RF. CR2 is written before delivering a #PF; delivering #DB clears DR7.GD (S2a
+already set DR6.BD). A fault detected while delivering follows Table 7-5: benign then anything, or contributory then page,
+serial; contributory then contributory, page then contributory or page: #DF(0); a contributory or page fault while
+delivering #DF: `stop::SHUTDOWN` (typed: the record holds the last fault and the original RIP, the bank the state at the
+original event, CR2 as written by any #PF detected on the way). CPL 1 and 2 targets stop `unsupported_mode`. Sources: site
+faults (#PF, #GP/#SS non-canonical, #DE, CMPXCHG16B #GP), system-transaction checks (#UD, #GP, GD #DB, and S2b's #GP/#NP/#SS/#TS
+with the state restored), LOCK #UD, instruction-fetch faults (new reply `REPLY_FETCH_FAULT`: the host still compiles nothing
+at a faulting fetch), and the host's new decodes INT n (`cd ib`), INT3 (`cc`), INTO (`ce`: #UD in 64-bit mode), UD0/UD1/UD2.
+INT1 (`f1`, ICEBP) is not decoded yet (fexc cuts it; the run ends `no_code`); S4 adds it with the #DB sources.
+The handler is ordinary translated code. No recursion (`check_resident_stack.py`): a system instruction's exception is
+delivered and `find` goes on; a site fault delivers, then dispatches; a single step whose fetch faults steps the handler's
+first instruction. **Scope note:** the RSPn switch for CPL 3 -> 0 and IST were built here (the brief gave them to X1b)
+because the logging IDT needs a known stack for every old corpus, whose RSP may be anything; X1b keeps its QEMU frame
+checks at CPL 3, the paranoid-entry programs and IRETQ-to-CPL3 judgement. **IRETQ:** releases NMI blocking once past its LOCK #UD check, even when
+it then faults (`State::nmi_blocked`, set by X2's NMI delivery); RF is loaded from the frame (no longer dropped) and cleared when
+the next instruction completes (`completed`: a block's exit through the linker, the dispatcher or an armed stop, and every
+committed system instruction but IRET; a stop at a block's entry keeps it). `delivery_model` A7 now states S2b's B6 rule (a
+null SS needs RPL = the new CPL: Vol. 2A IRET 64-bit mode #GP(0)), single-valued, with a test. **Not built: the REP
+self-exit signal.** No X1a delivery reads it (a fault pushes RF = 1 anyway, INT n/INT3 are whole instructions); the resident
+cannot tell a REP's self-exit from a branch into the same block, and a linked self-exit never enters the resident. For X2:
+admission knows the self-exit (`admission.rs`, `own`); carried in the translation reply as the self-exit's link-point
+index (or exit index), the linker and `stopped` could record `rep_exit` by that index (a RIP does not identify it: a
+branch may target the same RIP), and an interrupt at the REP block's entry still needs X2's choice (take the window only
+at the self-exit, or unlink the self-link while a stop is armed). **Old corpora: the logging IDT.** The program driver gives
+every vCPU, at `0xffff_ff00_0000_0000` (its own PML4 entry) or, in identity spaces, at `0x3e8000` (inside what
+`programs.sys_tables` maps), a GDT in the QEMU stub's layout (0x08 code64 DPL 0 ... TSS v at 0x30 + 16v, accessed bits
+set), TSSs whose RSP0 and IST1 are the vCPU's own stack page, and 256 interrupt gates (CS 0x08, DPL 3, IST 1) whose handler
+for vector n is `+0x2000 + 16n`; GDTR, IDTR and TR start there. Its pages are supervisor-only (CPL 3 code cannot change them). Reaching a handler ends the run before anything there is
+fetched (`Stop::Logged`); the report reads the frame's length from the last event (`State::delivered`: INT n to an
+error-code vector pushes none) and gives the state the frame saved (GPRs with the frame's RSP, RIP, RFLAGS without
+RF), `stop` `guest_fault` with the old record (vector, CR2 for #PF, error code, RIP) and `delivered` (the raw frame, the
+handler's RSP and CPL, CR2). Every fault of the old corpora is therefore a CPL 3 -> 0 (or 0 -> 0) delivery on IST 1, judged as
+before plus `tools/delivery_check.py` (delivery_model rebuilds the driver's tables and must give the same frame, handler RSP
+and CPL) in `run_slice1_faults.py` and `run_slice2_faults.py`; `run_slice3_vm.py` reads the same record. A program that loads
+its own GDT, IDT, TSS or tables owns delivery from then on; `segments.py`'s TSS now carries IST1 = RSP0 for that reason.
+`run_asm.py` counts INT3/INT n/INTO/UD tests (they expect Linux's signal) as unsupported, as their former `no_code` was.
+**Checks** (fexc series19, the concurrent I5a build, whose host passes it `--sse-gated`; block sizes default and 1): every
+fault of `run_slice1_faults.py` (7,581 at default, twice; at 1, all 7,581 matched across two runs, each run losing 5 or 6
+different cases to `hv_vm_create: 0xfae94007` from the concurrent agent's VMs) and `run_slice2_faults.py` (846 at block
+sizes default, 1 and 2) is a logged delivery whose record matches as before and whose frame, handler RSP and CPL
+delivery_model rebuilds (`delivery_check`); `run_slice3_vm.py corpora` at N = 2..4 (6,783 and 6,784 matches per N, each
+vCPU on its own IST stack), `privilege` (the CPL 3/0 fault matrix at 1 and 4 vCPUs) and `system` (0 failures: the CPL 0 and
+CPL 3 fault cases, the segment programs that fault after loading their own GDT and TSS; the driver reads a frame through the
+vCPU's own CR3); new `system` programs `dlv-handlers@1/2/4` (each CPU loads its own IDT and takes INT3, INT 0x21, INT3 with
+DF set, UD2 skipped, two on-demand #PF (read, write) whose handler maps V again, a WRMSR the profile and QEMU refuse
+(#GP(0), skipped), #DE skipped, each returning by IRETQ) match QEMU system mode (registers, logs, tables) and every logged
+frame matches delivery_model, for natemu and for QEMU; new `delivery` mode, 18 cases at both block sizes judged by
+delivery_model alone (QEMU resets), CR2 included: #UD -> #PF -> #PF -> #DF on IST 1; the same into a shutdown; #GP -> #PF -> #PF -> #DF;
+#GP through a gate not present -> #NP(0x6b) -> #DF; INT n through a task gate (#GP(0x202)), a gate not present (#NP(0x20a)),
+a DPL 0 gate from CPL 3 (#GP(0x212)); a trap gate (IF kept); INT3 through a DPL 3 gate from CPL 3; INTO -> #UD; and
+rdmsr_safe's MSR_PLATFORM_INFO probe -> #GP(0) (QEMU reads 0 from unknown MSRs, so it is judged here); review additions:
+CPL 3 -> 0 on RSP0 through a gate without IST, a 16-bit gate (#GP(0)), a 32-bit target CS (#GP(0x33)), a target CS not
+present (#NP(0x41)), IST1 beyond the TSS limit (#TS(0x31)), a non-canonical IST1 (#SS(1)), a frame straddling into a page
+not present (#PF on IST 1, CR2 the faulting slot). Model, decode and
+abi unit tests; standing suite otherwise green (fix/fix-1 64, seed/seed-1 44, flow 64 x 3, probes 83, ASM 781 pass and 0
+fail with I5a's SSE (one INT3-expecting test moves from `no_code` to "delivered" unsupported), limits, kicks 1,000 at 1/2/4,
+coherence, sharedpt, litmus, contain, unit tests). `smp`: every program matches. The `neg-race` coverage check (some CPU took LOCK
+NEG's lost-race exit; two lost NEGs cancel, so it is that test's guard) missed at varying N with the state's growth;
+after review `neg_race` starts with a barrier (a LOCK INC, then a wait loop of at least 1,000 rounds whose exits every CPU
+takes, so linked-exit counts stay comparable) and runs 200,000 NEGs per CPU (`model_smp` updated): three runs of
+`smp --programs neg-race,neg-private --reps 3`, every CPU of every race run took the exit (7 linked exits against 6). Stack (after review): `halt` takes
+`&State` (its 38 callers each copied the ~1.26 KB state into their own frame), `returned` keeps no state copy (`missed`,
+`halt_native`, the exit handlers not inlined), the boot stack is 32 KiB (`STACK_BYTES` 0x8000, private 0x4c000-0x54000), and
+`check_resident_stack.py` reads `sub sp, sp, #N, lsl #12` and fails when either stack keeps less than 25% of its reserve
+or 4 KiB headroom: gate 14,688 bytes (18,528 with a nested entry to its halt) of 32,768, boot 9,216 of 32,768. QEMU deviation found: pinned QEMU keeps RF after an IRETQ that loaded it, so an INT3
+after a fault's return pushes RF = 1 (SDM and model: 0; `programs.DLV_BODY` avoids that order).
+**For X1b, X1c, X2:** `delivery::deliver(s, Event)` is the one entry (exceptions with [vector, error, CR2] from the state at
+the instruction, software interrupts with their length); `segments::{linear, descriptor, accessed, fields}` are shared;
+CPL changes go through `set_cpl`; `State::nmi_blocked` is the NMI state (X2 sets it at NMI delivery, IRET clears it);
+`stop::SHUTDOWN` is the triple fault; the logging IDT and `delivery_check` are the harness for CPL 3 frames. X1c owns the
+full Table 7-5 matrix as model cases (here: 18 delivery cases), the refused-but-defined cases (unknown MSR, reserved bits: already
+#GP via the transactions) and #DF's undefined CS:RIP; X2 owns interrupt events (EXT = 1, RF = current or mid-string),
+`recognise`, HLT and the REP signal above; S4 owns the trap-class and breakpoint #DB sources and RF's breakpoint effect.
+*Built (I5a, SSE state and arithmetic; fexc series19, patch 0017; series20, patch 0018, after review):* SSE, SSE2, SSE3, SSSE3, SSE4.1 and SSE4.2 (CPU 16
+advertises all six) on XMM0-15: integer and floating-point vector forms, scalar float, conversions, moves, shuffles, compares,
+PTEST, CRC32, admitted by `FexcSlice1::Sse` (map, mandatory prefix from the bytes, ModRM; 66 with F2/F3 or F2 with F3 refused:
+FEX takes the last prefix where x86 lets F2/F3 win). Refused with reasons: MMX-register forms (x87/MMX state, I6), PCMPESTRI/M
+and PCMPISTRI/M (FEX calls a host helper), MASKMOVDQU (FEX stores all 16 bytes), INSERTPS m32 whose zero mask clears the
+inserted element (FEX drops the load and its #PF), AES and PCLMULQDQ (other features). **State:** the bank (`Cpu`) gains
+`xmm` and `mxcsr` (reset 1F80H). `enter` puts XMM0-15 in v16-v31 (FEX's static vector registers) and sets FPCR from MXCSR
+(`execution::fpcr`: AH and NEP, which FEX's FEAT_AFP code relies on, FIZ = DAZ, FZ = FTZ, RMode from RC) and FPSR to 0;
+`bank` (every resident entry, so every precise fault) reads v16-v31 back and ORs FPSR's cumulative flags into MXCSR
+(`mxcsr_flags`: IOC IE, IDC DE unless DAZ, DZC ZE, OFC OE, UFC UE, IXC PE). The gates already saved q0-q31, FPCR and
+FPSR; since the review `save_native` also clears FPCR (`msr fpcr, xzr`), so the resident never runs under the guest's FPCR. LDMXCSR/STMXCSR are
+resident transactions (`execution/sse.rs`): gating, the m32 operand at the CPL through the walker (#SS(0) via RSP/RBP, #GP(0),
+#PF), then #GP(0) for a 1 in MXCSR 31:16 (MXCSR_MASK FFFFH). **MXCSR exactness:** FEX's own STMXCSR returns the stored value
+masked with FFC0H, so its exception flags always read 0, and FEX never reads FPSR; with FPCR.AH = 1 the Arm flags match x86
+(tininess after rounding, FTZ underflow, signalling compares, invalid conversions), except where FEX's lowering differs, fixed
+in patch 0017: COMISS/COMISD compare with `fcmpe` (IE for a QNaN), ROUND* with imm8 bit 3 clear use `frintx` under the
+instruction's rounding mode (PE), RCPPS/RCPSS/RSQRTPS/RSQRTSS keep FPSR across FEX's exact division (no flag); in patch
+0018: DPPS/DPPD mask their inputs before the multiply (x86 multiplies only the selected elements: the others raise nothing)
+and compute the products under a zero destination mask (their flags; the result is zero), and a COMISS/UCOMISS whose flags
+are dead keeps its `fcmp` (IE, DE). **DE is exact (review decision):** with FPCR.AH = 1 and FIZ = 0 the M4 sets FPSR.IDC for a
+denormal input it does not flush, with x86's precedence (none beside an IE or ZE of the same operation or a NaN operand; none
+for FP-to-integer conversions, FRINT* or the reciprocal estimates; measured by the review), so IDC is DE unless DAZ (under DAZ,
+FIZ = 1 and IDC marks a flushed input, where x86 sets no DE). QEMU 7.2 never sets DE, so `tools/run_i5a_de.py` judges it by
+the SDM's exception tables: 75 forms, 351 cases (a denormal source or destination element, under DAZ, beside a QNaN, divided
+by zero, DPPS/DPPD's unselected and zero-destination cases), all as the SDM says at block sizes default and 1; the review's
+40 hand cases all give the expected MXCSR (one changed from series19: `addss denormal, -0` now 1F82H). The corpus masks DE
+out of its MXCSR comparison. **Unmasked SIMD exceptions** (#XM, or #UD without OSXMMEXCPT) are not built: an LDMXCSR that
+clears any mask stops `unsupported_system` before any effect (FXRSTOR/XRSTOR in I5b must do the same); the driver accepts
+only masked `mxcsr` values. **Gating (translation time):** the host passes `--sse-gated` when the bank has CR0.EM, CR0.TS or no
+CR4.OSFXSR; fexc then cuts every SSE form as a system instruction (`cut_gated`), the host answers `system::SSE_GATED`, and the
+resident raises #UD (EM or no OSFXSR) or #NM (TS). Valid because every CR0/CR4 change drops the vCPU's code (S2a); a chunk that
+keeps blocks across control changes must key them by these bits; since the review they are in `Cpu::code_context` too.
+Obligation on every path that changes CR0.EM, CR0.TS or CR4.OSFXSR: flush the vCPU's code or key it, as MOV CR0/CR4 do
+(INIT/SIPI, CLTS, LMSW and task switches if ever added, host edits of the bank; XSETBV for XCR0 once AVX is gated, I8). PAUSE, PREFETCHh, the fences, MOVNTI,
+CLFLUSH and CRC32 are not gated. **Accesses:** vector loads and stores are recorded sites of class FPR (`ldr`/`str`/`ldur`/
+`stur` b h s d q, register offset too); patch 0017 lowers FEX's element ops (MOVHPS/MOVLPS/MOVHPD/MOVLPD, PINSR*, PEXTR*,
+EXTRACTPS m) to plain element loads and stores and MOVNTDQA/MOVNT* to plain `ldr`/`str q`, and builds FEX's named and indexed
+vector constants in their register (they were loads from the state frame). Every store wider than a byte keeps its split
+check; the resident completes a page-crossing vector store from the vector register (`split`, up to 16 bytes), so a fault on
+either page writes nothing. **Alignment:** the first access of a legacy SSE instruction whose 16-byte operand must be aligned
+(SDM Vol.2 2.5 classes 1, 2, 4; not MOVUPS/MOVUPD/MOVDQU/LDDQU, not narrower operands) gets `and x0, xA, #15; cbnz x0, A`
+to a stub of the new kind 14 `align` (`brk #4`): #GP(0) before any walk, QEMU's order, an RSP base included. Admission decodes
+the SIMD&FP data-processing class (its general-register destinations: FP-to-integer conversions, fixed-point FCVTZS/FCVTZU
+included since the review, UMOV/SMOV: x25/x28 never written), the vector loads and stores and MOVAPS's X-register pairs at
+matching sites, `axflag`/`xaflag`, `crc32*`, `mrs`/`msr` FPCR and FPSR, and the alignment check (code
+shape: on exactly the access's address; which instructions need one is the producer's table). **Ordering and atomicity:**
+vector accesses are plain `ldr`/`str q` under the M4's hardware TSO (FEX TSO emulation off): `litmus` vector families
+(`vec-sb`, `vec-sb-mfence`, `vec-mp`, `vec-lb`, `vec-wrc`, `vec-iriw`, `vec-2+2w`: every plain access a 16-byte MOVDQU, MOVDQA
+in the aligned variant) at N = 2..4, every variant, 20,000 trials each (series19) and 5,000 (series20): 0 forbidden.
+**16-byte atomicity (review decision):** the profile enumerates AVX, so SDM Vol.3 9.1.1 makes the 16-byte accesses of MOVAPS,
+MOVAPD and MOVDQA single-copy atomic; the Arm ARM (DDI0487 B2.2.1) treats an LDR/STR Q as two 64-bit single-copy atomic
+accesses and only, with FEAT_LSE2, a 16-byte aligned LDP/STP of two X registers as one. Patch 0018 lowers their memory forms
+to that pair (`ldp xA, xB` then `fmov dN, xA; fmov vN.d[1], xB`; `fmov`/`umov` out then `stp`), alignment-checked first,
+recorded as sites of kinds 2/3 (`load_pair`/`store_pair`, admitted at 16 bytes only, two general registers; a split stub
+cannot fire for an aligned pair but the resident completes one). VEX.128 VMOVAPS/VMOVAPD/VMOVDQA (and the EVEX.128 forms with
+k0) need the same when AVX lands (I8). Tear test (a writer alternating 16-byte values, readers comparing halves, 200,000 each):
+0 torn reads for MOVDQA, MOVAPS, MOVAPD and 16-byte aligned MOVDQU, and for MOVDQU inside 16 bytes; line- and page-crossing
+MOVDQU tear (x86 gives them no atomicity; the page-crossing store is the resident's two copies). **Checks:** `tools/reference/gen_i5a.py` corpus (114 programs, 266 forms, random data
+with float patterns, every rounding mode, FTZ/DAZ) against QEMU 7.2 (`qemu64,+ssse3,+sse4_1,+sse4_2`): 111 match at block sizes
+default and 1; 3 differ by QEMU's two-NaN rule (it keeps the x87 rule, larger significand, for SSE; the SDM's Table 4-7 SSE
+rule returns the first source, as natemu), each located by running its prefixes. QEMU also returns the original denormal
+from MIN/MAX under DAZ, where the SDM's DAZ converts it to a signed zero first (natemu): the generator keeps MIN/MAX out of
+DAZ groups. Faults (`tools/run_i5a_faults.py`, 454 cases judged by the SDM rules: #PF not-present/read-only/crossing for 25
+load and 16 store forms, #GP misalignment, alignment before #PF and before #SS, non-canonical #GP/#SS and straddles,
+LDMXCSR/STMXCSR, #NM/#UD gating, ungated forms, LOCK #UD, the unmasked-MXCSR refusal; XMM, MXCSR and memory unchanged at the
+fault) all as expected at block sizes default and 1. `verify_precision` (P1-P11, alignment checks added) clean on the corpus.
+FEX ASM suite 480 → 781 pass, 0 fail (left: MMX, PCMPxSTRx, AES/SHA, x87, AVX). Census SSE class: kernel 95 → 5 (EMMS and a
+CET `wrussq` the classifier files as SSE; LDMXCSR now `system`), initramfs 198,200 → 7,236 (AES/SHA/PCLMULQDQ 6,015,
+PCMPISTRI 401, ADX/MOVBE and MMX the rest); LDMXCSR/STMXCSR are `system` (kernel 1, initramfs 383)
+(`experiments/track03/kernel-census/README.md`).
+**I5c (recorded, not built; the I5a review's design): unmasked SIMD exceptions.** Hardware FP traps are not used although
+the M4 has them (the review's probe: FPCR's trap enables stick and a trapped divide by zero is a synchronous exception, EC
+0x2C): a trap reports one Arm operation's exceptions, while x86 delivers #XM (#UD without CR4.OSXMMEXCPT) for the whole
+instruction, before writing its destination, with the flags of every element and x86's precedence; FEX lowers one x86
+instruction to several Arm operations (DPPS/DPPD, HADD, the conversions) and to helper operations that must raise nothing
+(RCP/RSQRT), and earlier operations of the same instruction may already have written static registers, so a trap would not
+land on a precise x86 boundary. (The resident runs with FPCR cleared since the review, so guest trap enables never reach it.)
+Design: blocks compiled under an MXCSR with any exception unmasked (the masks in `Cpu::code_context`, or every
+mask-changing LDMXCSR/FXRSTOR/XRSTOR flushing the vCPU's code) give each SSE floating-point instruction a software check: clear
+FPSR, compute into a temporary, test the FPSR bits of the unmasked exceptions, branch to a #XM stub (the state before the
+instruction, the flags it raised for the resident to merge) or commit the temporary to the destination. Until then an LDMXCSR
+that clears a mask stops `unsupported_system`.
 **Owner decision (October 28): MTRRs enabled by the virtual firmware, RAM write-back, device ranges uncached** (plan Q3).
 **Deferred (owner, October 28):** replacing the host's minimal JSON reader (`crates/host/src/json.rs`, used only for
 fexc's per-compile report: end reason and cut opcode) by carrying those fields in the code-object header; no registry

@@ -312,6 +312,11 @@ def check_one(ann, a, m, t, prev):
         rep = {'rep': 'rep', 'repz': 'repe', 'repe': 'repe', 'repnz': 'repne', 'repne': 'repne'}.get(word)
         require(rep == ann.get('rep'), f'annotation {ann} does not match the repeat prefix of "{t}" at {a:#x}')
         return
+    # I5a: an SSE form (annotation `sse`) is checked by its mnemonic's first three letters (QEMU's AT&T names add size
+    # suffixes, e.g. cvtsi2sdq, and print movd/movq either way); its widths are XMM or memory, not a general operand's.
+    if ann.get('sse'):
+        require(m[:3] == ann['op'][:3], f'annotation {ann} does not match disassembly "{t}" at {a:#x}')
+        return
     # I3: a LOCK prefix must be what the annotation says (`lock`); the rest is checked as for the unlocked form.
     locked = t.split()[0] == 'lock'
     require(locked == bool(ann.get('lock')), f'annotation {ann} does not match the LOCK prefix of "{t}" at {a:#x}')

@@ -39,7 +39,10 @@ def ldt_image():
 
 
 def tss_image(i):
-    return (0).to_bytes(4, 'little') + (P.STACK(i) - 0x400).to_bytes(8, 'little') + bytes(0x68 - 12)
+    """RSP0, and IST1 the same (natemu's driver IDT delivers on IST 1, X1a; QEMU's stub gates use no IST)."""
+    image = bytearray((0).to_bytes(4, 'little') + (P.STACK(i) - 0x400).to_bytes(8, 'little') + bytes(0x68 - 12))
+    image[0x24:0x2c] = (P.STACK(i) - 0x400).to_bytes(8, 'little')
+    return bytes(image)
 
 
 def pointers(i, ro_gdt=False):

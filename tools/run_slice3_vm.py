@@ -278,7 +278,7 @@ def smp_description(prog):
     lines += [f"memory {smp.num(r['addr']):#x} {smp.region_bytes(r).hex()}" for r in prog['memory']]
     for c in prog['cpus']:
         lines += ['cpu', f"rip {smp.num(c['rip']):#x}", f"rflags {smp.num(c['rflags']):#x}", f"cpl {c.get('cpl', 3)}",
-                  'gpr ' + ' '.join(f'{smp.num(v):#x}' for v in c['gpr'])]
+                  'gpr ' + ' '.join(f'{smp.num(v):#x}' for v in c['gpr'])] + (['sse 1'] if prog.get('sse') else [])
     return '\n'.join(lines) + '\n'
 
 
@@ -802,6 +802,168 @@ def profile_program(n):
     return prog, judge
 
 
+DLV_EVENTS = [3, 0x21, 3, 6, 14, 14, 13, 0]      # programs.DLV_BODY's events, in order
+
+
+def delivery_log_problems(prog, state):
+    """X1a: each CPU's log of `dlv-handlers` (programs.DLV_BODY) in `state` (smp.parse_dump's shape) against
+    delivery_model: the vectors in order, and each frame (RIP, CS, RFLAGS under the logged mask, RSP, SS), error code and
+    frame address as the model delivers that event at the logged RIP (less the INT's length), RSP and RFLAGS."""
+    import delivery_check
+    memory = {r['addr']: bytes(r['data']) for r in state['memory']}
+    problems = []
+    for i, at in enumerate(prog['params']['delivery']):
+        log = next(data[at - a:] for a, data in memory.items() if a <= at < a + len(data))
+        entries = [[int.from_bytes(log[k + 8 * j:k + 8 * j + 8], 'little') for j in range(9)] for k in range(0, 0x50 * len(DLV_EVENTS), 0x50)]
+        if [e[0] for e in entries] != DLV_EVENTS:
+            problems.append(f'cpu{i} vectors {[hex(e[0]) for e in entries]} != {[hex(v) for v in DLV_EVENTS]}'); continue
+        for k, (vector, error, rip, cs, rflags, rsp, ss, base, cr2) in enumerate(entries):
+            length = {3: 1, 0x21: 2}.get(vector)
+            frame, slot = delivery_check.model_frame(vector, error, cr2, rip - (length or 0), rsp, rflags, length)
+            frame[2] &= 0x10cd5
+            if [rip, cs, rflags, rsp, ss, error if vector in (13, 14) else 0] != frame or base != slot:
+                problems.append(f'cpu{i} event {k} (vector {vector:#x}): logged {[hex(x) for x in (rip, cs, rflags, rsp, ss, error, base)]}, '
+                                f'model {[hex(x) for x in frame + [slot]]}')
+    return problems
+
+
+# ---- X1a: faults during delivery, #DF and shutdown, gate checks (delivery_model only: QEMU resets on a triple fault) --------
+DLV_CODE, DLV_IDT, DLV_PTR, DLV_BAD_STACK = 0x40_0000, 0x60_0000, 0x60_1000, 0x7f_0000
+DLV_GDT, DLV_TSS = 0x60_2000, 0x60_3000          # a case's own GDT and TSS (`own`), loaded at CPL 0 before its IDT
+
+
+def delivery_cases():
+    """[name, cpl, code text, {vector: (type, dpl, present, ist[, CS selector])}, rsp, own]: a CPL 0 or 3 program in the
+    driver's space that loads its own IDT (at CPL 0), whose gates lead to the driver's logging handlers (the last delivery
+    ends the run and is reported), then raises one event; with `own` = (TSS limit, IST1, extra GDT entries {selector:
+    descriptor}) it first loads its own GDT (0x08 code64 DPL 0, 0x10 data and 0x28 code32 as the driver's, the TSS at 0x30,
+    the extras from 0x40)
+    and TR. Gates not listed are zero (#GP for their type)."""
+    import models.delivery_model as dm
+    ok, ist1 = (0xE, 0, True, 0), (0xE, 0, True, 1)
+    return [
+        # #UD (benign) whose frame push faults: the #PF is delivered serially; its push faults: #DF on IST 1.
+        ('ud-pf-df', 0, 'ud2', {6: ok, 14: ok, 8: ist1}, DLV_BAD_STACK, None),
+        # The same with #DF on the bad stack too: a fault while delivering #DF, shutdown.
+        ('ud-pf-df-shutdown', 0, 'ud2', {6: ok, 14: ok, 8: ok}, DLV_BAD_STACK, None),
+        # #GP (contributory) whose push faults (#PF, page after contributory: serial), then #PF's push: #DF.
+        ('gp-pf-df', 0, 'mov rax, 0x8000000000000000\nmov rbx, [rax]', {13: ok, 14: ok, 8: ist1}, DLV_BAD_STACK, None),
+        # #GP's gate not present: #NP(13 * 8 + 2 + EXT), contributory after contributory: #DF.
+        ('gp-np-df', 0, 'mov rax, 0x8000000000000000\nmov rbx, [rax]', {13: (0xE, 0, False, 0), 8: ist1}, 0x50_0800, None),
+        # Gate checks of a software interrupt (EXT = 0): a task gate, a gate not present, a DPL 0 gate from CPL 3, a trap
+        # gate (IF kept), a 16-bit interrupt gate (#GP(0), A11), INT3 through a DPL 3 gate from CPL 3.
+        ('int-task-gate', 0, 'int 0x40', {0x40: (0x5, 0, True, 0), 13: ist1}, 0x50_0800, None),
+        ('int-not-present', 0, 'int 0x41', {0x41: (0xE, 0, False, 0), 11: ist1}, 0x50_0800, None),
+        ('int-dpl-cpl3', 3, 'int 0x42', {0x42: (0xE, 0, True, 0), 13: ist1}, 0x50_0800, None),
+        ('int-trap-gate', 0, 'int 0x43', {0x43: (0xF, 0, True, 0)}, 0x50_0808, None),
+        ('int-16bit-gate', 0, 'int 0x40', {0x40: (0x6, 0, True, 0), 13: ist1}, 0x50_0800, None),
+        ('int3-dpl3-cpl3', 3, 'int3', {3: (0xE, 3, True, 1)}, 0x50_0800, None),
+        ('into-ud', 0, '.byte 0xce', {6: ist1}, 0x50_0800, None),
+        # rdmsr_safe's probe (`K kernel/cpu/intel.c:528`): MSR_PLATFORM_INFO is not in the profile, #GP(0) (QEMU reads 0).
+        ('rdmsr-safe-platform-info', 0, 'mov ecx, 0xce\nrdmsr', {13: ist1}, 0x50_0800, None),
+        # CPL 3 -> 0 through a gate without IST: the stack is the TSS's RSP0.
+        ('ud-cpl3-rsp0', 3, 'ud2', {6: ok}, 0x50_0800, None),
+        # The target CS: a 32-bit code segment (#GP(vector * 8 + 2 + EXT), A11), not present (#NP(sel + EXT)).
+        ('ud-cs-32bit', 0, 'ud2', {6: (0xE, 0, True, 0, 0x28), 13: ist1}, 0x50_0800, None),
+        ('ud-cs-not-present', 0, 'ud2', {6: (0xE, 0, True, 0, 0x40), 11: (0xE, 0, True, 0)}, 0x50_0800,
+         (0x67, DLV_BAD_STACK, {0x40: dm.segment(0, present=False)})),
+        # The stack from the TSS: IST1 beyond the TSS limit (#TS(TR + EXT)), a non-canonical IST1 (#SS(EXT)).
+        ('ud-ist-ts', 0, 'ud2', {6: ist1, 10: ok}, 0x50_0800, (0x23, 0x50_0800, {})),
+        ('ud-ist-noncanonical', 0, 'ud2', {6: ist1, 12: ok}, 0x50_0800, (0x67, 0x8000_0000_0000_0000, {})),
+        # A frame straddling two pages, the lower (second written) not present: #PF there (CR2 judged), on IST 1.
+        ('ud-frame-straddle', 0, 'ud2', {6: ok, 14: ist1}, 0x50_0020, None),
+    ]
+
+
+def delivery_own(own):
+    """A case's own GDT image and TSS image (`delivery_cases`)."""
+    import models.delivery_model as dm
+    limit, ist1, extra = own
+    entries = {0x08: dm.segment(0), 0x10: dm.segment(0, code=False), 0x28: dm.segment(0, l=0, d=1), **extra}
+    gdt = bytearray(0x48)                         # the TSS's 16 bytes at 0x30, extras from 0x40
+    for sel, d in entries.items():
+        gdt[sel:sel + 8] = d.to_bytes(8, 'little')
+    tss = DLV_TSS
+    gdt[0x30:0x40] = (limit | (tss & 0xff_ffff) << 16 | 0x89 << 40 | (tss >> 24 & 0xff) << 56).to_bytes(8, 'little') + (tss >> 32).to_bytes(8, 'little')
+    return bytes(gdt), dm.tss(rsp=(0x50_0800, 0, 0), ist=(ist1,) + (0,) * 6)
+
+
+def delivery_description(cpl, text, gates, rsp, own):
+    import delivery_check as dc
+    idt = bytearray(16 * 0x44)
+    for v, g in gates.items():
+        gtype, dpl, present, ist = g[:4]
+        idt[16 * v:16 * v + 16] = dm_gate(dc.LOG_BASE + 0x2000 + 16 * v, gtype, dpl, present, ist, g[4] if len(g) > 4 else 0x08)
+    ptr = (len(idt) - 1).to_bytes(2, 'little') + DLV_IDT.to_bytes(8, 'little')
+    setup = f'lgdt [{DLV_PTR + 0x10:#x}]\nmov ax, 0x30\nltr ax\n' if own else ''
+    head = ref.assemble(setup + f'lidt [{DLV_PTR:#x}]') + (b'\x90' if cpl == 3 else b'')   # CPL 3: a switch (a nop) after it
+    code = head + ref.assemble(text)
+    gpr = ['0'] * 16
+    gpr[4] = f'{rsp:#x}'
+    lines = [f'rip {DLV_CODE:#x}', 'cpl 0', 'gpr ' + ' '.join(gpr), f'code {code.hex()}', f'memory {DLV_IDT:#x} {bytes(idt).hex()}',
+             f'memory {DLV_PTR:#x} {(ptr + bytes(6) + (0x47).to_bytes(2, "little") + DLV_GDT.to_bytes(8, "little")).hex()}',
+             'region 0x500000 0x1000']
+    if own:
+        gdt, tss = delivery_own(own)
+        lines += [f'memory {DLV_GDT:#x} {gdt.hex()}', f'memory {DLV_TSS:#x} {tss.hex()}']
+    if cpl == 3:
+        lines.append(f'switch {DLV_CODE + len(head) - 1:#x} 3')
+    return '\n'.join(lines) + '\n', DLV_CODE + len(code) - len(ref.assemble(text.split('\n')[-1])), idt
+
+
+def dm_gate(offset, gtype, dpl, present, ist, selector=0x08):
+    from models import delivery_model as dm
+    return dm.gate(offset, selector, dpl=dpl, gtype=gtype, ist=ist, present=present)
+
+
+def cmd_delivery(a, host, runtime):
+    """X1a: nested faults, #DF and shutdown, gate, CS and TSS-stack checks, natemu against delivery_model (events, the
+    delivered frame on the handler's stack, its RSP and CPL, CR2 (the model's, or any it permits), or the shutdown record),
+    at block sizes default and 1."""
+    import delivery_check as dc
+    from models import delivery_model as dm
+    failures, report = [], []
+    for name, cpl, text, gates, rsp, own in delivery_cases():
+        desc, at, idt = delivery_description(cpl, text, gates, rsp, own)
+        s = dc._state(dc.LOG_BASE, 0, cpl, at, rsp, 0x202)
+        s['idtr'] = (DLV_IDT, len(idt) - 1)
+        s['memory'][DLV_IDT >> 12] = dm.page(); dm.place(s['memory'], DLV_IDT, bytes(idt))
+        s['memory'][0x500] = dm.page(user=True)
+        if own:
+            gdt, tss = delivery_own(own)
+            for addr, data in ((DLV_GDT, gdt), (DLV_TSS, tss)):
+                s['memory'][addr >> 12] = dm.page(); dm.place(s['memory'], addr, data)
+            s['gdtr'], s['tr'] = (DLV_GDT, 0x47), (0x30, DLV_TSS, own[0])
+        insn = ref.assemble(text.split('\n')[-1])
+        event = {'int3': {'kind': 'int3', 'length': 1}, '.byte 0xce': {'kind': 'into', 'length': 1}, 'ud2': {'kind': 'exception', 'vector': 6}}.get(
+            text, {'kind': 'int', 'vector': insn[1], 'length': 2} if insn[0] == 0xcd else {'kind': 'exception', 'vector': 13, 'error': 0})
+        want = dm.deliver(s, event)
+        cr2s = want['undefined']['state'].get('cr2', {want['state']['cr2']})
+        for limit in ([], [1]):
+            rc, out, err = driver(host, runtime, a.fexc, desc, a.out / 'work' / f"{name}{'-1' if limit else ''}", limit)
+            diffs = [f'driver exit {rc}: {err.strip()[-300:]}'] if rc else []
+            if not rc and want['outcome'] == 'shutdown':
+                v, e = want['events'][-1]
+                f = [int(x, 16) for x in out['fault']]
+                if out['stop'] != 'shutdown' or [f[0], f[2], f[3]] != [v, e, at] or f[1] not in cr2s:
+                    diffs.append(f"want shutdown {want['events']} CR2 in {sorted(map(hex, cr2s))}, got {out['stop']} {out['fault']}")
+            elif not rc:
+                n, (v, e) = want['state'], want['events'][-1]
+                frame = [dm.qword(n['memory'], n['rsp'] + 8 * k) for k in range(6 if e is not None else 5)]
+                frame = frame[1:] + frame[:1] if e is not None else frame + [0]
+                d = out.get('delivered') or {}
+                got = [int(x, 16) for x in d.get('frame', [])]
+                if out['stop'] != 'guest_fault' or d.get('vector') != v or got != frame or int(d['handler_rsp'], 16) != n['rsp'] \
+                        or d['cpl'] != n['cpl'] or int(d['cr2'], 16) not in cr2s:
+                    diffs.append(f"want {want['events']} frame {[hex(x) for x in frame]} at {n['rsp']:#x} CR2 in {sorted(map(hex, cr2s))}, got {out['stop']} {d}")
+            failures += [f"{name}{' (max-block 1)' if limit else ''}: {x}" for x in diffs]
+        report.append({'name': name, 'model': want['outcome'], 'events': want['events']})
+        print(f"{name}: {'FAIL' if any(f.startswith(name + ':') or f.startswith(name + ' (') for f in failures) else 'ok'} {want['outcome']} {want['events']}", flush=True)
+    for f in failures: print(f)
+    (a.out / 'delivery.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
+    return len(failures)
+
+
 def cpl3_cases():
     """(name, description, check(out) -> problems): CPUID and RDTSC/RDTSCP run at CPL3; with CR4.TSD both are #GP(0) at
     CPL3 (SDM Vol.2 RDTSC, RDTSCP); CR0.AM with RFLAGS.AC at CPL3 is refused. One vCPU, the driver's user space; the CPL
@@ -971,6 +1133,9 @@ def cmd_system(a, host, runtime):
             want, rc = qemu(prog, name)
             if want is None: failures.append(f'{name}: QEMU run failed ({rc})'); continue
             for c in want['cpus']: c['fault'] = qemu_fault(c['fault'])
+            # X1a: QEMU's frames are a reference only where they agree with delivery_model (the plan's fault references).
+            if prog['params'].get('delivery'):
+                failures += [f'{name}: QEMU vs delivery_model: {d}' for d in delivery_log_problems(prog, want)]
         # (profile, EDX): profile 22's first WRMSR writes a legal EAX, so with EDX = 1 only EDX is reserved.
         model_profile, edx = {'sysfault-efer-lme-clear@1': (25, 0), 'sysfault-cr4-pae-clear@1': (27, 0),
                               'sysfault-cr0-pg-clear@1': (28, 0), 'sysfault-efer-reserved-1@1': (29, 0),
@@ -996,6 +1161,8 @@ def cmd_system(a, host, runtime):
                     entry['either'] = [c.get('either') for c in out['cpus']]
                 else:
                     diffs += smp.compare(prog, vm_state(prog, out), want)
+                if prog['params'].get('delivery'):
+                    diffs += delivery_log_problems(prog, vm_state(prog, out))
             entry['runs'].append({'max_block': limit[0] if limit else None, 'diffs': diffs,
                                   'systems': out and [c['stats']['systems'] for c in out['cpus']]})
             (gaps if name in SYSTEM_GAPS else failures).extend([f"{name}{' (max-block 1)' if limit else ''}: {d}" for d in diffs])
@@ -1604,7 +1771,7 @@ def cmd_contain(a, host, runtime):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=['corpora', 'smp', 'litmus', 'limits', 'kicks', 'system', 'coherence', 'sharedpt', 'contain', 'privilege'])
+    ap.add_argument('mode', choices=['corpora', 'smp', 'litmus', 'limits', 'kicks', 'system', 'coherence', 'sharedpt', 'contain', 'privilege', 'delivery'])
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--cpus', type=int, nargs='+', default=[2, 3, 4])
@@ -1642,7 +1809,7 @@ def main():
         global CODE_SHAPE
         CODE_SHAPE = []   # containment holds with object validation alone (the host's default)
     if a.mode == 'kicks' and a.kicks is None: a.kicks = 10_000
-    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'litmus': cmd_litmus, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'coherence': cmd_coherence, 'sharedpt': cmd_sharedpt, 'contain': cmd_contain, 'privilege': cmd_privilege}[a.mode](a, host, runtime)
+    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'litmus': cmd_litmus, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'coherence': cmd_coherence, 'sharedpt': cmd_sharedpt, 'contain': cmd_contain, 'privilege': cmd_privilege, 'delivery': cmd_delivery}[a.mode](a, host, runtime)
     print('failures:', failed)
     sys.exit(1 if failed else 0)
 

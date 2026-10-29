@@ -26,10 +26,22 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as sixteen commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as eighteen commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series18` (I3 after review, October 29: series17 plus
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series20` (I5a after review, October 29: series19 plus
+patch 0018: MOVAPS/MOVAPD/MOVDQA m128 as one 16-byte aligned LDP/STP of two X registers (sites of kinds 2/3 `load_pair`/
+`store_pair`, alignment-checked; SDM 9.1.1 atomicity with AVX enumerated, FEAT_LSE2), DPPS/DPPD masking their inputs before the
+multiply and computing the products under a zero destination mask (their MXCSR flags), a dead FCmp (COMISS/UCOMISS) kept for its
+flags. Previous tree: `series19` (I5a, October 29: SSE..SSE4.2. Patch 0017 and
+the shims: the allowlist's `Sse` table (mandatory prefix from the bytes; MMX forms, PCMPxSTRx, MASKMOVDQU, AES/PCLMULQDQ and a
+zero-masked INSERTPS m32 refused), CRC32; LDMXCSR/STMXCSR cut as system instructions; `--sse-gated` (the host's: CR0.EM/TS or no
+CR4.OSFXSR) cuts every SSE form (`cut_gated` in the report); vector loads and stores as FPR sites, FEX's element ops lowered to
+plain element accesses, MOVNT* to plain ones; named and indexed vector constants built in their register (no state-frame load);
+the alignment check `and x0, xA, #15; cbnz x0` to a stub of kind 14 `align` (`brk #4`) on the first access of a legacy SSE
+instruction whose 16-byte operand must be aligned; MXCSR flags as x86: COMISS/COMISD `fcmpe`, ROUND* `frintx` (FPCR.RMode
+switched for an explicit mode), RCP*/RSQRT* without flags (FPSR saved in x3 and restored). Boot-features plan, Built (I5a).)
+Previous tree: `series18` (I3 after review, October 29: series17 plus
 `dmb ish` immediately before the `casal`/`caspal` of LOCK CMPXCHG/CMPXCHG8B/CMPXCHG16B (`fexc_lock_cas`): a failing Arm CAS
 writes nothing and is only an acquire, while x86 orders a failing locked compare. Kept for comparison: `series17` (I3, October 29: LOCK forms. Patch 0016
 and the shims: every lockable memory form with LOCK (ADD ADC SUB SBB AND OR XOR INC DEC NOT NEG BTS BTR BTC XADD CMPXCHG

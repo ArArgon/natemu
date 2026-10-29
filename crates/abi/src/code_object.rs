@@ -32,6 +32,9 @@ pub const NO_REG: u8 = 0xff;
 /// both elements), write intent, nothing written if it aborts (CAS/CASP even when the comparison fails: the Arm ARM's
 /// MemAtomic translates the access as a write before the compare, so a read-only page faults whatever the outcome); an operand crossing 16 bytes takes an alignment fault there (LSE2), as does a 16-byte caspal that is
 /// not 16-byte aligned (CMPXCHG16B: #GP(0)). LOCK NEG's `casal` follows a load site of the same operand (`rmw`: the pair).
+/// `ALIGN` (I5a, `brk #4`) is a check stub like `SPLIT` before the first access of a legacy SSE instruction whose 16-byte
+/// operand must be 16-byte aligned: reached when `base_reg + imm` is not (#GP(0); access site in `guest_offset2`). A
+/// `LOAD`/`STORE` site of [`CLASS_FPR`] (I5a) transfers the low `width` bytes of vector register `data_reg[0]`.
 pub mod kind {
     pub const LOAD: u8 = 0;
     pub const STORE: u8 = 1;
@@ -47,6 +50,7 @@ pub mod kind {
     pub const DIVIDE: u8 = 11;
     pub const SWAP: u8 = 12;
     pub const ATOMIC: u8 = 13;
+    pub const ALIGN: u8 = 14;
 }
 /// [`Site::intent`].
 pub const INTENT_READ: u8 = 0;

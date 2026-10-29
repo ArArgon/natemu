@@ -40,7 +40,7 @@ B5 A return to an outer level nulls DS/ES/FS/GS that are null or hold data or no
    leaves an already null FS/GS selector as it is).
 B6 A null SS on IRET or an outer RET is allowed only for a 64-bit return to a new CPL < 3 with RPL = the new CPL (SDM
    IRET/RET 64-bit mode exceptions: #GP(0) for a null SS whose RPL != CPL going back to non-CPL3 64-bit mode), as MOV SS.
-   delivery_model A7 accepts any RPL there: it is the stricter Intel text that holds here.
+   delivery_model A7 now states the same rule (X1a).
 B7 Loading a null selector into FS or GS clears its base (Intel's behaviour, the one Linux's NULL_SEG bug test reads).
 B8 The accessed-bit and LTR busy-bit writes: the SDM gives no access width (a locked read-modify-write; QEMU writes the
    descriptor's high dword, KVM the whole descriptor). Model: byte 5 (CR2 = descriptor + 5 on a read-only GDT page);

@@ -77,7 +77,7 @@ def lists(src):
 
 
 def description(h, binary):
-    lines = [f'rip {CODE:#x}', 'rflags 0x202', 'gpr ' + ' '.join(['0'] * 16), f'code {binary.hex()}']
+    lines = [f'rip {CODE:#x}', 'rflags 0x202', 'gpr ' + ' '.join(['0'] * 16), f'code {binary.hex()}', 'sse 1']   # I5a: CR4.OSFXSR as Linux
     regions = DEFAULT_REGIONS + [(int(a, 0), int(n, 0)) for a, n in h.get('MEMORYREGIONS', {}).items()]
     regions.append((CODE, -(-len(binary) // PAGE) * PAGE))   # FEX maps the code RWX
     lines += [f'region {a:#x} {n:#x}' for a, n in regions]
@@ -115,7 +115,8 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
             return {**rec, 'outcome': 'fail', 'reason': 'harness: nasm failed', 'detail': n.stderr[-500:]}
         binary = (work / 't.bin').read_bytes()
         want = {k.upper(): [int(v, 0) for v in (vals if isinstance(vals, list) else [vals])] for k, vals in h.get('REGDATA', {}).items()}
-        vector = sorted(k for k in want if k not in GPR and k != 'RIP')
+        # Expectations natemu cannot check: MMn (x87/MMX, I6), XMM16+ and nonzero YMM upper halves (AVX, I8).
+        vector = sorted(k for k in want if k not in GPR and k != 'RIP' and not (re.fullmatch(r'XMM\d+', k) and int(k[3:]) < 16 and not any(want[k][2:])))
         (work / 'program.txt').write_text(description(h, binary))
         run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work] + ([str(max_block)] if max_block else []) + vm1.CODE_SHAPE, capture_output=True, text=True, timeout=120)
         if run.returncode:
@@ -135,19 +136,32 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
             if s['stop'] == 'resident' and s['reason'].startswith('unsupported_atomic'):
                 # A memory xchg whose operand crosses 16 bytes (a split lock): stopped before any effect (S3e, boot phase)
                 return {**rec, 'outcome': 'unsupported', 'reason': f"split lock: {rec.get('at', '?')}"}
+            at = lambda a, n: binary[a - CODE:a - CODE + n].hex() if CODE <= a and a + n <= CODE + len(binary) else ''
+            vector = int(s['fault'][0], 0) if s['stop'] == 'guest_fault' else None
+            if (vector == 3 and at(rip - 1, 1) == 'cc') or (vector is not None and at(rip - 2, 2) == f'cd{vector:02x}') \
+                    or (vector == 6 and (at(rip, 1) == 'ce' or at(rip, 2) in ('0f0b', '0fb9', '0fff'))):
+                # X1a: INT3/INT n/INTO/UD0-2 are delivered through the driver's logging IDT; these tests expect Linux's
+                # signal for them (before X1a: no code, `system_instruction`).
+                return {**rec, 'outcome': 'unsupported', 'reason': f"software interrupt or #UD instruction delivered (vector {int(s['fault'][0], 0)}): {rec.get('at', '?')}"}
             return {**rec, 'outcome': 'fail', 'reason': 'did not reach hlt', 'detail': rec['stop'] + ' fault=' + json.dumps(s['fault'])}
         gpr = [int(v, 0) for v in s['gpr']]
+        xmm = [int(v, 0) for v in s['xmm']]
         diffs = []
         for k, vals in want.items():
             if k == 'RIP': got = rip
             elif k in GPR: got = gpr[GPR[k]]
+            elif re.fullmatch(r'XMM\d+', k) and int(k[3:]) < 16 and not any(vals[2:]):   # I5a: XMM (low, high); YMM upper must be 0
+                n = int(k[3:])
+                if xmm[2 * n:2 * n + 2] != vals[:2]:
+                    diffs.append(f'{k}: got {xmm[2 * n]:#x} {xmm[2 * n + 1]:#x}, want {vals[0]:#x} {vals[1]:#x}')
+                continue
             else: continue
             if got != vals[0]: diffs.append(f'{k}: got {got:#x}, want {vals[0]:#x}')
         if diffs: return {**rec, 'outcome': 'fail', 'reason': 'registers differ', 'detail': '; '.join(diffs), 'stats': s['stats']}
         if 'FS' in want or 'GS' in want:
             return {**rec, 'outcome': 'unsupported', 'reason': 'needs segment base state (GPR part matched)'}
         if vector:
-            kinds = sorted({'x87/MMX' if k.startswith('MM') else 'XMM' for k in vector})
+            kinds = sorted({'x87/MMX' if k.startswith('MM') else 'YMM' if k.startswith('XMM') else k for k in vector})
             return {**rec, 'outcome': 'unsupported', 'reason': f"needs vector state: {'+'.join(kinds)} (GPR part matched)"}
         return {**rec, 'outcome': 'pass', 'expectations': len(want), 'stats': s['stats']}
     except Exception as e:
@@ -180,8 +194,10 @@ SELFTEST = {   # synthetic tests: (source, expected outcome, reason prefix)
     'wrong.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0x2"}}\n%endif\nmov eax, 1\nhlt\n', 'fail', 'registers differ'),
     'memory.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0x0807060504030201","RBX":"0x1234"},"MemoryRegions":{"0x100000000":"4096"},"MemoryData":{"0x100000000":"0102030405060708"}}\n%endif\n'
                    'mov rcx, 0x100000000\nmov rax, [rcx]\nbswap rax\nmov word [rcx+8], 0x1234\nmovzx ebx, word [rcx+8]\nhlt\n', 'pass', ''),
-    'vector.asm': ('%ifdef CONFIG\n{"RegData":{"XMM0":["0","0"],"RAX":"0"}}\n%endif\nxor eax,eax\nhlt\n', 'unsupported', 'needs vector state'),
-    'vector_insn.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0"}}\n%endif\nxor eax,eax\naddps xmm0, xmm1\nhlt\n', 'unsupported', 'unsupported_form'),
+    'vector.asm': ('%ifdef CONFIG\n{"RegData":{"MM0":["0","0"],"RAX":"0"}}\n%endif\nxor eax,eax\nhlt\n', 'unsupported', 'needs vector state'),
+    'vector_insn.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0"}}\n%endif\nxor eax,eax\npaddd mm0, mm1\nhlt\n', 'unsupported', 'unsupported_form'),
+    'xmm.asm': ('%ifdef CONFIG\n{"RegData":{"XMM0":["0x1","0x0"],"XMM1":["0x0","0x0","0x0","0x0"]}}\n%endif\nmov eax, 1\nmovd xmm0, eax\nhlt\n', 'pass', ''),
+    'xmm_wrong.asm': ('%ifdef CONFIG\n{"RegData":{"XMM0":["0x2","0x0"]}}\n%endif\nmov eax, 1\nmovd xmm0, eax\nhlt\n', 'fail', 'registers differ'),
     'bits32.asm': ('%ifdef CONFIG\n{"Mode":"32BIT","RegData":{"RAX":"0"}}\n%endif\nhlt\n', 'unsupported', '32-bit'),
     'fault.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0"}}\n%endif\nmov rax, [0x70000000]\nhlt\n', 'fail', 'did not reach hlt'),
     'huge.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0"},"MemoryRegions":{"0x500000000":"0x100000000"}}\n%endif\nhlt\n', 'unsupported', 'region beyond'),

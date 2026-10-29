@@ -69,6 +69,8 @@ instruction's data accesses. Page-walk outcomes and error codes follow SDM vol. 
 walker policy (`Machine`), leaf A/D bits compared per page (data exactly; code pages A where fetched, else either).
 
 The VM must stop with exactly that exception record (vector, CR2, error code, RIP = start of the faulting instruction),
+delivered through the driver's logging IDT since X1a (the state is the one its frame saved; the frame, handler RSP and
+CPL are judged by tools/models/delivery_model.py, `delivery_check`),
 or reach the program's end when nothing faults, its GPRs, masked RFLAGS and memory equal to the QEMU prefix (or full)
 run (nothing later ran, no partial store),
 and the FEX frame intact. A stop at a declared slice limit before the expected fault (unsupported_form)
@@ -77,7 +79,7 @@ import argparse, json, pathlib, re, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
-import ref, gen_slice1 as gen, gen_i1, run_slice1_vm as vm  # noqa: E402
+import ref, gen_slice1 as gen, gen_i1, run_slice1_vm as vm, delivery_check  # noqa: E402
 
 M64, PAGE = 2**64 - 1, 4096
 SIZES = {'byte': 1, 'word': 2, 'dword': 4, 'qword': 8, 'xmmword': 16}
@@ -879,6 +881,9 @@ def evaluate(case, out):
     diffs = [] if out['stop'] == stop else [f"stopped {out['stop']} {out['reason']} at {out['rip']}"]
     got = [ref.num(x) for x in out['fault']]
     if got != want: diffs.append(f'fault {[hex(x) for x in got]} != expected {[hex(x) for x in want]}')
+    # X1a: the fault is delivered through the driver's logging IDT; its frame, handler RSP and CPL are delivery_model's.
+    if f and out['stop'] == 'guest_fault':
+        diffs += delivery_check.problems(out, f[0], f[2], f[1], int(case[2].get('cpl', p.get('cpl', 3))))
     diffs += ref.compare(prefix, [ref.num(v) for v in out['gpr']], ref.num(out['rflags']), ref.num(out['rip']), out['memory'])
     for x in out['pages']:
         a, d = (ad or {}).get(ref.num(x['va']), (None, None))

@@ -205,29 +205,31 @@ int SegmentOverride(uint32_t flags) {
 // base) and the x86 addressing form.
 // A load of a RIP-setting instruction without an explicit memory operand is the implicit stack access of slice1's ret;
 // leave's load of [RBP] (slice1: a plain load, then RSP and RBP) is a stack access too.
-// Guard/split stubs (slice1) take the width, intent, segment and data registers of the access they cover (their own
+// Guard/split/alignment stubs (slice1) take the width, intent, segment and data registers of the access they cover (their own
 // base_reg + imm is the address as it is at the stub); a branch-target guard (no access) has its target register in
 // base_reg and is DS (#GP(0)).
 void JoinSites(uint64_t rip) {
   for (auto& s : Cap.sites) {
     s.segment = (s.kind == FEXC_SITE_PUSH || s.kind == FEXC_SITE_POP || s.kind == FEXC_SITE_PUSH_PAIR || s.kind == FEXC_SITE_POP_PAIR) ? 1 : 0;
-    if (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP || s.kind == FEXC_SITE_ATOMIC)
+    if (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP || s.kind == FEXC_SITE_ATOMIC ||
+        s.kind == FEXC_SITE_LOAD_PAIR || s.kind == FEXC_SITE_STORE_PAIR)   // (I5a: MOVAPS m128's X pair: its operand's segment)
       for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) {
         if ((!i.mem.present && (i.sets_rip || i.name == "LEAVE")) || (!i.seg && (i.mem.base == 4 || i.mem.base == 5))) s.segment = 1;
         break;
       }
   }
   for (auto& s : Cap.sites) {
-    if ((s.kind != FEXC_SITE_GUARD && s.kind != FEXC_SITE_SPLIT) || s.access_native_offset == FEXC_NONE32) continue;
+    const auto stub = [](uint8_t k) { return k == FEXC_SITE_GUARD || k == FEXC_SITE_SPLIT || k == FEXC_SITE_ALIGN; };
+    if (!stub(s.kind) || s.access_native_offset == FEXC_NONE32) continue;
     for (auto& a : Cap.sites) {
-      if (a.native_offset != s.access_native_offset || a.kind == FEXC_SITE_GUARD || a.kind == FEXC_SITE_SPLIT) continue;
+      if (a.native_offset != s.access_native_offset || stub(a.kind)) continue;
       s.width = a.width; s.intent = a.intent; s.rmw = a.rmw; s.segment = a.segment; s.data_reg[0] = a.data_reg[0];
       s.data_reg[1] = a.data_reg[1]; s.data_class = a.data_class; s.ordering = a.ordering;
       break;
     }
   }
 }
-const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other", "divide", "swap", "atomic"};
+const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other", "divide", "swap", "atomic", "align"};
 const char* const ExtendName[] = {"none", "uxtw", "sxtw", "sxtx"};
 const char* const RmwName[] = {"none", "load", "store"};
 const char* const OrderingName[] = {"plain", "acquire", "release"};
@@ -304,6 +306,7 @@ static std::string CutDetail() {
 static void CutJson(Json& j) {
   j.obj("end").kv("rip", Hex64(fexc_cut.rip)).kv("reason", CutReasonName()).kv("detail", CutDetail());
   if (fexc_cut.reason != FEXC_CUT_DECODER && fexc_cut.reason != FEXC_CUT_STRING) j.kv("cut_opcode_map", int(fexc_cut.map)).kv("cut_opcode", int(fexc_cut.opcode)).kv("cut_fex_name", fexc_cut.name);
+  if (fexc_cut.gated) j.kv("cut_gated", true);
   j.end_obj();
 }
 
@@ -326,6 +329,7 @@ static void ResetGlobals() {
   W = {};
   fexc_sites.clear(); fexc_insns.clear(); fexc_cf_inverted.clear(); fexc_spill_bytes = 0; fexc_cut = {}; fexc_after_rep = 0;
   fexc_rip_relative.clear(); fexc_target_check.clear(); fexc_div_width.clear(); fexc_movs.clear(); fexc_lock_cas.clear();
+  fexc_align16.clear(); fexc_sse_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear();
 }
 
 // The CLI's body. `args` are the command-line arguments (args[0] is the program name); `given` replaces --hex/--file with the
@@ -363,6 +367,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     else if (a == "--sparse-pc") { st.dense_pc = false; sparse_flag = true; } // diagnostic only: an instruction without a GuestOpcode (e.g. moffs movabs) is then attributed to the previous one
     else if (a == "--no-end-marker") st.end_marker = false;
     else if (a == "--no-tso") st.tso = false;
+    else if (a == "--sse-gated") fexc_sse_gated = true;   // slice1 (I5a): CR0.EM/TS or no CR4.OSFXSR: SSE forms are system cuts
     else if (a == "--feature") { std::string v = next(); auto eq = v.find('='); if (eq == std::string::npos) return Fail("--feature NAME=0|1"); overrides.push_back({v.substr(0, eq), v.substr(eq + 1) != "0"}); }
     else if (a == "--config") { std::string v = next(); auto eq = v.find('='); Config::ConfigOption o; if (eq == std::string::npos || !ConfigOptionByName(v.substr(0, eq), o)) return Fail("--config NAME=VALUE (NAME: a FEX config option, e.g. X87REDUCEDPRECISION)"); configs.push_back({v.substr(0, eq), v.substr(eq + 1)}); }
     else if (a == "--out") out = next();
@@ -370,7 +375,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     else return Fail("unknown argument " + a);
   }
   if (!missing.empty()) return Fail(missing + " needs a value");
-  if (!have_rip || (!given && hex.empty() == file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
+  if (!have_rip || (!given && hex.empty() == file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
   if (bitness != 32 && bitness != 64) return Fail("--bitness must be 32 or 64");
   const bool slice1 = st.profile == "slice1";
   if (slice1 && bitness != 64) return Fail("profile slice1 is 64-bit only");
@@ -763,7 +768,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     pad(8);
     put(64, f.size(), 4); put(68, Cap.sites.size(), 4);
     for (auto& s : Cap.sites) {
-      const bool stub = s.kind == FEXC_SITE_GUARD || s.kind == FEXC_SITE_SPLIT;   // a stub's guest_offset2 is its access site
+      const bool stub = s.kind == FEXC_SITE_GUARD || s.kind == FEXC_SITE_SPLIT || s.kind == FEXC_SITE_ALIGN;   // a stub's guest_offset2 is its access site
       push(s.native_offset, 4); push(s.guest_offset, 4); push(stub ? s.access_native_offset : s.guest_offset2, 4); push(s.insn_native_offset, 4); push(uint32_t(s.imm), 4);
       for (uint8_t b : {s.kind, s.width, s.intent, s.rmw, s.segment, s.base_reg, s.index_reg, s.extend, s.shift, s.writeback,
                         uint8_t(s.writeback_delta), s.data_reg[0], s.data_reg[1], s.data_class, s.nzcv, s.cf_inverted,

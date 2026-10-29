@@ -47,6 +47,8 @@
 //! Description (text, one item per line). State items: rip ADDR | rflags VALUE | gpr V0 .. V15
 //!   | cpl 0|3 (default 3) | wp 0|1 (CR0.WP, default 1) | smep 0|1 (CR4.SMEP, default 0) | nxe 0|1 (EFER.NXE, default 1)
 //!   | fsbase ADDR | gsbase ADDR (FS.base, GS.base, default 0, canonical; no x86 instruction changes them yet)
+//!   | sse 0|1 (CR4.OSFXSR and OSXMMEXCPT, default 0) | xmm N LO HI (XMMn's quadwords) | mxcsr VALUE (default 0x1f80; every
+//!     exception masked: unmasked SIMD exceptions are not built) (I5a; the report lists `xmm` as 32 quadwords and `mxcsr`)
 //!   | switch ADDR 0|3 (repeatable: the one-byte instruction at ADDR, a `nop`, runs as a change of the CPL to the value,
 //!     the resident's general CPL change; no x86 instruction changes the CPL yet. Blocks end before it.)
 //! CR0 is PE, ET, PG and WP as set, CR4 PAE and SMEP as set, EFER LME, LMA and NXE as set; CPL0 code may change them
@@ -115,6 +117,10 @@ struct Section {
     nxe: bool,
     fs_base: u64,
     gs_base: u64,
+    /// I5a: CR4.OSFXSR and OSXMMEXCPT (SSE enabled, as Linux sets them), the XMM registers and MXCSR.
+    sse: bool,
+    xmm: [[u64; 2]; 16],
+    mxcsr: u64,
     space: usize,
     /// `switch` items: (RIP, CPL).
     switches: Vec<(u64, u64)>,
@@ -146,7 +152,7 @@ fn parse(text: &str) -> Result<Description> {
             _ => chunks.last_mut().unwrap().push(line),
         }
     }
-    let new = |space| Section { rip: 0, rflags: 0, gpr: [0; 16], cpl: 3, wp: true, smep: false, nxe: true, fs_base: 0, gs_base: 0, space, switches: vec![] };
+    let new = |space| Section { rip: 0, rflags: 0, gpr: [0; 16], cpl: 3, wp: true, smep: false, nxe: true, fs_base: 0, gs_base: 0, sse: false, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, space, switches: vec![] };
     let mut d = Description { spaces: vec![Space::default()], cpus: vec![], sections: chunks.len() > 1 };
     if d.sections {
         items(&chunks[0], &mut d.spaces[0], None)?;
@@ -196,14 +202,19 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
                 }
                 *if words[0] == "fsbase" { &mut c.fs_base } else { &mut c.gs_base } = base;
             }
+            ("xmm", [n, lo, hi]) if number(n)? < 16 => state(&mut cpu, line)?.xmm[number(n)? as usize] = [number(lo)?, number(hi)?],
+            ("mxcsr", [v]) if number(v)? & !exec::MXCSR_MASK == 0 && number(v)? & exec::MXCSR_MASKS == exec::MXCSR_MASKS => {
+                state(&mut cpu, line)?.mxcsr = number(v)?
+            }
             ("cpl", ["0"]) => state(&mut cpu, line)?.cpl = 0,
             ("cpl", ["3"]) => state(&mut cpu, line)?.cpl = 3,
             ("switch", [a, c @ ("0" | "3")]) => state(&mut cpu, line)?.switches.push((number(a)?, c.parse().unwrap())),
-            ("wp" | "smep" | "nxe", [v @ ("0" | "1")]) => {
+            ("wp" | "smep" | "nxe" | "sse", [v @ ("0" | "1")]) => {
                 let c = state(&mut cpu, line)?;
                 *match words[0] {
                     "wp" => &mut c.wp,
                     "smep" => &mut c.smep,
+                    "sse" => &mut c.sse,
                     _ => &mut c.nxe,
                 } = *v == "1";
             }
@@ -306,9 +317,13 @@ impl Tables {
     }
     /// Maps `va` to a new page, or (`identity`) to its own address.
     fn map(&mut self, b: &mut Builder, va: u64, flags: u64, identity: bool) -> Result<()> {
-        let leaf = self.entry(Some(b), va, 1)?;
         let gpa = if identity { va } else { b.page()? };
-        assert!(self.ram.write(leaf, gpa | PRESENT | USER | flags));
+        self.map_at(b, va, gpa, USER | flags)
+    }
+    /// Maps `va` to guest-physical page `gpa` with the leaf's `flags` (USER among them or not).
+    fn map_at(&mut self, b: &mut Builder, va: u64, gpa: u64, flags: u64) -> Result<()> {
+        let leaf = self.entry(Some(b), va, 1)?;
+        assert!(self.ram.write(leaf, gpa | PRESENT | flags));
         self.pages.insert(va, (gpa, leaf));
         Ok(())
     }
@@ -395,6 +410,51 @@ fn identity_pages(space: &Space, rip: u64) -> Vec<u64> {
 }
 fn page_span(start: u64, length: usize) -> impl Iterator<Item = u64> {
     (start & !4095..start + length as u64).step_by(4096)
+}
+
+/// The driver's logging IDT (X1a; boot-features plan, X1a "Old corpora"). Every space gets, at `log_base`, a GDT
+/// (QEMU stub's layout: 0x08 code64 DPL 0, 0x10 data DPL 0, 0x18 data DPL 3, 0x20 code64 DPL 3, 0x28 code32 DPL 0, the
+/// TSS of vCPU v at 0x30 + 16v; accessed bits preset), the TSSs (RSP0 and IST1 = vCPU v's own stack page), and an IDT of
+/// 256 present 64-bit interrupt gates (CS 0x08, DPL 3 so INT n logs at any CPL, IST 1) whose handler for vector n is
+/// `log_base + 0x2000 + 16n`. Each vCPU starts with GDTR, IDTR and TR (hidden part, busy) naming them. The handler page is
+/// never mapped or fetched: reaching it ends the run (`Stop::Logged`, before any fetch) and the report reads the frame
+/// from the vCPU's stack, as a handler that logs and halts would. A program that loads its own GDT, IDT, TSS or tables
+/// owns delivery from then on. Pages: GDT and TSSs at +0, IDT at +0x1000, stacks at +0x3000 + 0x1000v (vCPUs 0..3), all
+/// writable, supervisor-only (CPL 3 code cannot change them), not executable; at `LOG_BASE` (its own PML4 entry) in driver-built spaces, identity-mapped at
+/// `LOG_IDENTITY` in identity spaces (inside the ranges `tools/bench/smp/programs.py` `sys_tables` maps, so programs
+/// that load those tables keep them).
+const LOG_BASE: u64 = 0xffff_ff00_0000_0000;
+const LOG_IDENTITY: u64 = 0x3e_8000;
+const LOG_PAGES: [u64; 6] = [0, 0x1000, 0x3000, 0x4000, 0x5000, 0x6000];
+const LOG_HANDLERS: u64 = 0x2000;
+const LOG_TSS: u64 = 0x800;
+fn log_base(identity: bool) -> u64 {
+    if identity { LOG_IDENTITY } else { LOG_BASE }
+}
+/// The GDT/TSS page and the IDT page at `base`.
+fn log_images(base: u64) -> [Vec<u8>; 2] {
+    let mut gdt: Vec<u64> = vec![0, 0x00af_9b00_0000_ffff, 0x00cf_9300_0000_ffff, 0x00cf_f300_0000_ffff, 0x00af_fb00_0000_ffff, 0x00cf_9b00_0000_ffff];
+    let mut page = vec![0u8; 4096];
+    for v in 0..cache::MAX_VCPUS as u64 {
+        let tss = base + LOG_TSS + 0x80 * v;
+        gdt.push(0x67 | (tss & 0xff_ffff) << 16 | 0x8b << 40 | (tss >> 24 & 0xff) << 56);
+        gdt.push(tss >> 32);
+        let stack = (base + 0x4000 + 0x1000 * v).to_le_bytes();
+        let at = (LOG_TSS + 0x80 * v) as usize;
+        page[at + 4..at + 12].copy_from_slice(&stack); // RSP0
+        page[at + 0x24..at + 0x2c].copy_from_slice(&stack); // IST1
+    }
+    for (k, d) in gdt.iter().enumerate() {
+        page[8 * k..8 * k + 8].copy_from_slice(&d.to_le_bytes());
+    }
+    let mut idt = vec![0u8; 4096];
+    for n in 0..256u64 {
+        let offset = base + LOG_HANDLERS + 16 * n;
+        let lo = offset & 0xffff | 0x08 << 16 | 1 << 32 | 0xe << 40 | 3 << 45 | 1 << 47 | (offset >> 16 & 0xffff) << 48;
+        idt[16 * n as usize..16 * n as usize + 8].copy_from_slice(&lo.to_le_bytes());
+        idt[16 * n as usize + 8..16 * n as usize + 16].copy_from_slice(&(offset >> 32).to_le_bytes());
+    }
+    [page, idt]
 }
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] \
@@ -578,7 +638,7 @@ struct Ran {
 fn finished(stop: &Stop) -> bool {
     matches!(
         stop,
-        Stop::Reached | Stop::FetchFault(_) | Stop::NoCode(_) | Stop::Resident { stop: exec::stop::GUEST_FAULT | exec::stop::UNSUPPORTED_ATOMIC, .. }
+        Stop::Reached | Stop::Logged | Stop::FetchFault(_) | Stop::NoCode(_) | Stop::Resident { stop: exec::stop::SHUTDOWN | exec::stop::UNSUPPORTED_ATOMIC, .. }
     )
 }
 
@@ -651,14 +711,18 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let backing = execution::prepare(resident, code_bytes, n)?;
     require_vcpus(n)?;
     let mut builder = Builder { ram: execution::guest_ram(&backing.memory), next: 0x1000, top: exec::GUEST_RAM_BYTES as u64, reserved: Default::default() };
-    // Identity-mapped pages first: the allocator never hands them out.
+    // Identity-mapped pages first: the allocator never hands them out (the logging pages of identity spaces too).
     for c in d.cpus.iter().filter(|c| d.spaces[c.space].identity) {
         for page in identity_pages(&d.spaces[c.space], c.rip) {
             if page >= exec::GUEST_RAM_BYTES as u64 || page == 0 {
                 return Err(format!("identity page {page:#x} outside guest RAM (or page 0)"));
             }
+            if (LOG_IDENTITY..LOG_IDENTITY + 0x7000).contains(&page) {
+                return Err(format!("identity page {page:#x} is the driver's logging IDT"));
+            }
             builder.reserved.insert(page);
         }
+        builder.reserved.extend(LOG_PAGES.map(|o| LOG_IDENTITY + o));
     }
     // A space is built for the first vCPU using it (its rip places `code` bodies).
     let mut spaces: Vec<Option<Tables>> = d.spaces.iter().map(|_| None).collect();
@@ -670,6 +734,26 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         ends.push(stop_at(&d.spaces[c.space], c.rip)?);
     }
     let stop_at = ends;
+    // The logging IDT's pages, after every space (the spaces' own pages keep their places): one set for the driver-built
+    // spaces, the identity set for identity spaces.
+    let mut log_gpa = None;
+    for (k, t) in spaces.iter_mut().enumerate() {
+        let Some(t) = t else { continue };
+        let identity = d.spaces[k].identity;
+        let base = log_base(identity);
+        let gpas = match (identity, log_gpa) {
+            (true, _) => LOG_PAGES.map(|o| base + o),
+            (false, Some(g)) => g,
+            (false, None) => *log_gpa.insert([(); 6].map(|_| builder.page()).into_iter().collect::<Result<Vec<_>>>()?.try_into().unwrap()),
+        };
+        let nx = if d.cpus.iter().find(|c| c.space == k).is_some_and(|c| c.nxe) { NO_EXECUTE } else { 0 };
+        for (o, gpa) in LOG_PAGES.iter().zip(gpas) {
+            t.map_at(&mut builder, base + o, gpa, WRITABLE | nx)?;
+        }
+        let [gdt, idt] = log_images(base);
+        t.copy_in(base, &gdt);
+        t.copy_in(base + 0x1000, &idt);
+    }
     execution::guest_ram_written(&backing.memory);
     for (v, c) in d.cpus.iter().enumerate() {
         // 4-level paging; user mode, NX and WP on unless the section says otherwise.
@@ -682,19 +766,21 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 rflags: c.rflags | 0x202,
                 cr0: exec::CR0_PE | exec::CR0_ET | exec::CR0_PG | bit(c.wp, exec::CR0_WP),
                 cr3: spaces[c.space].as_ref().unwrap().cr3,
-                cr4: exec::CR4_PAE | bit(c.smep, exec::CR4_SMEP),
+                cr4: exec::CR4_PAE | bit(c.smep, exec::CR4_SMEP) | bit(c.sse, exec::CR4_OSFXSR | exec::CR4_OSXMMEXCPT),
                 efer: exec::EFER_LME | exec::EFER_LMA | bit(c.nxe, exec::EFER_NXE),
                 cpl: c.cpl,
                 fs_base: c.fs_base,
                 gs_base: c.gs_base,
+                xmm: c.xmm,
+                mxcsr: c.mxcsr,
                 cr2: 0,
                 cr8: 0,
                 dr: exec::DR_RESET,
                 seg: exec::flat_segments(c.cpl),
                 ldtr: exec::LDTR_RESET,
-                tr: exec::TR_RESET,
-                gdtr: exec::TABLE_RESET,
-                idtr: exec::TABLE_RESET,
+                tr: exec::Segment { selector: 0x30 + 16 * v as u16, attributes: 0x8b, limit: 0x67, base: log_base(d.spaces[c.space].identity) + LOG_TSS + 0x80 * v as u64 },
+                gdtr: exec::Table { base: log_base(d.spaces[c.space].identity), limit: 0x6f },
+                idtr: exec::Table { base: log_base(d.spaces[c.space].identity) + 0x1000, limit: 0xfff },
                 mov_ss: 0,
             },
         );
@@ -710,7 +796,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let mut compiler = Compiler::new(Path::new(fexc), cpu, max_instructions)?;
         compiler.deadline = std::time::Duration::from_millis(deadline_ms);
         compiler.shape = code_shape;
-        let mut requests = execution::Requests { switches: d.cpus[v].switches.iter().copied().collect(), ..Default::default() };
+        let handlers = log_base(d.spaces[d.cpus[v].space].identity) + LOG_HANDLERS;
+        let mut requests = execution::Requests { switches: d.cpus[v].switches.iter().copied().collect(), handlers: Some(handlers..handlers + 0x1000), ..Default::default() };
         if v == target {
             compiler.tamper = forge.then_some(forge_exit as fn(&mut [u8]));
             compiler.signal_at = signal_at;
@@ -809,7 +896,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let tables = spaces[d.cpus[v].space].as_ref().unwrap();
         let tampering = v == target && (tamper.is_some() || tamper_after.is_some());
         let tampering = tampering || (v == target && forged_entry.is_some());
-        let mut json = report(backing.vcpu(v), &d.spaces[d.cpus[v].space], tables, ran, tampering, tamper_after.filter(|_| v == target))?;
+        let log = log_base(d.spaces[d.cpus[v].space].identity);
+        let mut json = report(backing.vcpu(v), &d.spaces[d.cpus[v].space], tables, log, ran, tampering, tamper_after.filter(|_| v == target))?;
         json.pop();
         out.push(json + &kick_report(backing.vcpu(v), &stops) + "}");
     }
@@ -844,8 +932,53 @@ fn teardown(n: usize, s: Option<&owners::Supervision<Ran>>, vm: i32) -> String {
 
 /// One vCPU's final state, its space's memory and A/D bits, and its counters, as JSON. With `tamper_after`, corrupts
 /// its cache first; with `tampering` the link self-check's verdict is reported, not fatal.
-fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, tamper_after: Option<Corrupt>) -> Result<String> {
-    let s: State = area.read_record(exec::STATE_OFFSET);
+/// `n` bytes at linear `va` through the 4-level tables at `cr3` (the vCPU's own, which a program may have loaded), read
+/// only: no A/D update; `None` when a byte is not mapped.
+fn linear_bytes(ram: GuestRam, cr3: u64, va: u64, n: usize) -> Option<Vec<u8>> {
+    (va..va + n as u64)
+        .map(|a| {
+            let mut table = cr3 & ADDRESS;
+            for level in (1..=4u32).rev() {
+                let entry = ram.read::<u64>(table + ((a >> (12 + 9 * (level - 1))) & 511) * 8)?;
+                if entry & PRESENT == 0 {
+                    return None;
+                }
+                if level == 2 && entry & LARGE_PAGE != 0 {
+                    return ram.read::<u8>(entry & ADDRESS & !(LARGE - 1) | a & (LARGE - 1));
+                }
+                table = entry & ADDRESS;
+            }
+            ram.read::<u8>(table | a & 4095)
+        })
+        .collect()
+}
+/// A run that reached the logging IDT (`log`: its base) reports the state its frame saved, as the faulting instruction
+/// found it (GPRs with RSP from the frame, RIP and RFLAGS from the frame, RF left out), `stop` `guest_fault` with the
+/// record (vector, CR2 for #PF, error code, RIP), and `delivered`: the vector, the raw frame (RIP, CS, RFLAGS, RSP, SS,
+/// error code or 0), whether it has an error code, the handler's RSP and CPL, and CR2.
+fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tampering: bool, tamper_after: Option<Corrupt>) -> Result<String> {
+    let mut s: State = area.read_record(exec::STATE_OFFSET);
+    let list = |v: &[u64]| v.iter().map(|x| format!("\"{x:#x}\"")).collect::<Vec<_>>().join(",");
+    let mut delivered = String::new();
+    if matches!(ran.stop, Stop::Logged) {
+        let vector = (s.cpu.rip - log - LOG_HANDLERS) / 16;
+        // From the event, not the vector: INT n to an error-code vector pushes none.
+        if s.delivered[0] != vector {
+            return Err(format!("logged vector {vector}, but the last delivery was vector {}", s.delivered[0]));
+        }
+        let error = s.delivered[1] != u64::MAX;
+        let n = if error { 6 } else { 5 };
+        let at = s.cpu.gpr[4];
+        let frame = linear_bytes(guest.ram, s.cpu.cr3, at, 8 * n).ok_or(format!("logged vector {vector}: its frame at {at:#x} is not mapped"))?;
+        let mut w: Vec<u64> = frame.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+        if !error {
+            w.insert(0, 0);
+        }
+        let [e, rip, cs, rflags, rsp, ss] = w[..] else { unreachable!() };
+        s.fault = [vector, if vector == 14 { s.cpu.cr2 } else { 0 }, e, rip];
+        delivered = format!(",\"delivered\":{{\"vector\":{vector},\"frame\":[{}],\"error_code\":{error},\"handler_rsp\":\"{at:#x}\",\"cpl\":{},\"cr2\":\"{:#x}\"}}", list(&[rip, cs, rflags, rsp, ss, e]), s.cpu.cpl, s.cpu.cr2);
+        (s.cpu.gpr[4], s.cpu.rip, s.cpu.rflags) = (rsp, rip, rflags & !(1 << 16));
+    }
     let shared: Shared = area.read_record(SHARED_OFFSET);
     let mut tampered = ran.tampered;
     if let Some(kind) = tamper_after {
@@ -864,7 +997,8 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
         Stop::FetchFault(Fault::Noncanonical) => ("guest_fault", "fetch".into(), [13, 0, 0, s.cpu.rip]),
         Stop::FetchFault(f) => ("fetch_fault", format!("{f:?}"), [0; 4]),
         Stop::NoCode(reason) => ("no_code", reason.clone(), [0; 4]),
-        Stop::Resident { stop: exec::stop::GUEST_FAULT, .. } => ("guest_fault", "resident".into(), s.fault),
+        Stop::Logged => ("guest_fault", "delivered".into(), s.fault),
+        Stop::Resident { stop: exec::stop::SHUTDOWN, .. } => ("shutdown", "triple fault".into(), s.fault),
         Stop::Resident { stop, status, detail } => ("resident", format!("{} status={status} detail={detail}", exec::stop::name(*stop)), [0; 4]),
         Stop::Watchdog { pc, el0, asked } => {
             let place = if *el0 { "guest" } else { "resident" };
@@ -873,23 +1007,24 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
         }
         Stop::Cancelled => ("cancelled", String::new(), [0; 4]),
     };
-    let list = |v: &[u64]| v.iter().map(|x| format!("\"{x:#x}\"")).collect::<Vec<_>>().join(",");
     let mut rips: Vec<u64> = ran.rips.iter().copied().collect();
     rips.sort_unstable();
     let mut out = format!(
-        "{{\"vcpu\":{},\"tso\":{},\"stop\":\"{kind}\",\"reason\":\"{reason}\",\"gpr\":[{}],\"rip\":\"{:#x}\",\"rflags\":\"{:#x}\",\"memory\":[",
+        "{{\"vcpu\":{},\"tso\":{},\"stop\":\"{kind}\",\"reason\":\"{reason}\",\"gpr\":[{}],\"rip\":\"{:#x}\",\"rflags\":\"{:#x}\",\"xmm\":[{}],\"mxcsr\":\"{:#x}\",\"memory\":[",
         area.vcpu,
         shared.actlr & 2 != 0,
         list(&s.cpu.gpr),
         s.cpu.rip,
-        s.cpu.rflags
+        s.cpu.rflags,
+        list(s.cpu.xmm.as_flattened()),
+        s.cpu.mxcsr
     );
     for (i, (address, data)) in space.memory.iter().enumerate() {
         let bytes: String = guest.copy_out(*address, data.len()).iter().map(|b| format!("{b:02x}")).collect();
         let _ = write!(out, "{}{{\"addr\":\"{address:#x}\",\"data\":\"{bytes}\"}}", if i > 0 { "," } else { "" });
     }
     out += "],\"pages\":[";
-    for (i, (va, &(_, leaf))) in guest.pages.iter().enumerate() {
+    for (i, (va, &(_, leaf))) in guest.pages.iter().filter(|(va, _)| !(log..log + 0x7000).contains(*va)).enumerate() {
         let entry = guest.ram.read::<u64>(leaf).unwrap();
         let _ = write!(
             out,
@@ -901,7 +1036,7 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"shadow_resets\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{},\"dispatch_exits\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]}}",
+        "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"shadow_resets\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{},\"dispatch_exits\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]{}}}",
         s.blocks,
         s.l2_hits,
         s.requests,
@@ -933,7 +1068,8 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
         frame_intact(area),
         tampered,
         links_check.replace('"', "'"),
-        list(&rips)
+        list(&rips),
+        delivered
     );
     Ok(out)
 }
@@ -1015,7 +1151,7 @@ mod tests {
     fn next_page_tamper_answers_a_block_request_twice() {
         let memory = Memory::with_size(4096).unwrap();
         let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0 };
-        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1000, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0 });
+        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1000, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET });
         s.fetch = [0x5000, u64::MAX];
         s.reply = exec::REPLY_SYSTEM;
         assert!(!tamper_next_page(area, &mut s) && s.reply == exec::REPLY_SYSTEM);

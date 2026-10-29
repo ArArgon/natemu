@@ -66,6 +66,8 @@ enum Form {
     Pre,
     Post,
     Register,
+    /// `ldp`/`stp` of two X registers, signed offset (I5a: MOVAPS/MOVAPD/MOVDQA m128, one 16-byte atomic access).
+    Pair,
 }
 #[derive(Clone, Copy, Debug)]
 struct Mem {
@@ -77,6 +79,10 @@ struct Mem {
     addr: Addr,
     /// Writeback amount (pre/post-index).
     delta: i64,
+    /// A SIMD&FP register transfer (I5a): `rt` is a vector register, no general register is written.
+    vector: bool,
+    /// [`Form::Pair`]: the second transfer register.
+    rt2: Option<u8>,
 }
 #[derive(Clone, Copy, Debug)]
 enum Insn {
@@ -114,7 +120,7 @@ impl Insn {
             Insn::Data(Some(r)) => 1 << r,
             Insn::Mem(m) => {
                 let wb = if matches!(m.form, Form::Pre | Form::Post) { 1 << m.addr.base } else { 0 };
-                wb | if m.load { bit(m.rt) } else { 0 }
+                wb | if m.load && !m.vector { bit(m.rt) | m.rt2.map_or(0, bit) } else { 0 }
             }
             Insn::Literal { rt, .. } | Insn::Swap { rt, .. } | Insn::Atomic { op: AtomicOp::Fetch, rt, .. } => bit(rt),
             Insn::Atomic { op: AtomicOp::Cas, rs, .. } => bit(rs),
@@ -198,6 +204,12 @@ fn decode(w: u32, at: u32) -> Option<Insn> {
         _ if w & 0x3fe0_0410 == 0x3a40_0000 => Data(None),                        // ccmp, ccmn
         _ if w & 0x3fe0_0800 == 0x1a80_0000 => Data(zr(rd)),                      // csel, csinc, csinv, csneg
         _ if w & 0x5fe0_0000 == 0x1ac0_0000 && matches!(w >> 10 & 63, 2 | 3 | 8..=11) => Data(zr(rd)), // div, shifts
+        // crc32{,c}{b,h,w,x} (I5a, x86 CRC32): X only with sf = 1, the others with sf = 0.
+        _ if w & 0x5fe0_0000 == 0x1ac0_0000 && matches!(w >> 10 & 63, 16..=23) && (w >> 10 & 3 == 3) == sf => Data(zr(rd)),
+        0xd500_405f | 0xd500_403f => Data(None), // axflag, xaflag (FlagM2: SSE compares' flags)
+        // I5a: FPSR around RCPPS/RSQRTPS (x86 raises no SIMD exception there), FPCR.RMode around ROUND*'s `frintx`.
+        _ if w & 0xffff_ffc0 == 0xd53b_4400 => Data(zr(rd)), // mrs xT, fpcr | fpsr (op2 0 | 1)
+        _ if w & 0xffff_ffc0 == 0xd51b_4400 => Data(None),   // msr fpcr | fpsr, xT
         _ if w & 0x5fff_0000 == 0x5ac0_0000 && w >> 10 & 63 <= 5 => Data(zr(rd)), // rbit, rev*, clz, cls
         _ if w & 0x7f00_0000 == 0x1b00_0000 && matches!(w >> 21 & 7, 0 | 1 | 2 | 5 | 6) => Data(zr(rd)), // madd..umulh
         // POPCNT without FEAT_CSSC (I1, FEX JIT/ALUOps.cpp Popcount): `fmov d0, xN | fmov s0, wN; cnt v0.8b, v0.8b;
@@ -208,24 +220,53 @@ fn decode(w: u32, at: u32) -> Option<Insn> {
         _ if w & 0xffff_ffe0 == 0x0e01_3c00 => Data(zr(rd)), // umov wD, v0.b[0]
         // Prefetch hints (I1, x86 prefetchh: never faults): `prfm <op>, [xN{, #imm}]`, no data transfer.
         _ if w & 0xffc0_0000 == 0xf980_0000 => Data(None),
+        // Scalar floating-point and Advanced SIMD data processing (op0 = x111; SSE, I5a): no branch, no memory access, writes
+        // vector registers and NZCV only, but for the forms with a general destination: FP to integer conversions and the
+        // moves to a general register (opcode 000, 001, 100, 101, 110 of the FP<->integer class) and UMOV/SMOV. An
+        // unallocated encoding of the class is UNDEFINED and traps at EL0 (`trapped`).
+        _ if w & 0x0e00_0000 == 0x0e00_0000 => {
+            // ... and the fixed-point FCVTZS/FCVTZU (bit 21 clear, rmode 11, opcode 00x), also to a general register.
+            let to_gpr = (w & 0x7f20_fc00 == 0x1e20_0000 && matches!(w >> 16 & 7, 0 | 1 | 4 | 5 | 6))
+                || w & 0x7f3e_0000 == 0x1e18_0000
+                || (w & 0xbfe0_8400 == 0x0e00_0400 && w >> 29 & 1 == 0 && matches!(w >> 11 & 15, 5 | 7));
+            Data(if to_gpr { zr(rd) } else { None })
+        }
         _ => return memory(w),
     })
 }
 
-/// General-register loads and stores: literal, unsigned offset, unscaled, pre/post-index, register offset.
+/// General-register and SIMD&FP (I5a: b, h, s, d, q) loads and stores: literal, unsigned offset, unscaled, pre/post-index,
+/// register offset. No sign-extending SIMD&FP forms exist; a 128-bit one is size 0 with opc 1x.
 fn memory(w: u32) -> Option<Insn> {
     let (rt, rn) = ((w & 31) as u8, (w >> 5 & 31) as u8);
     if w & 0x3b00_0000 == 0x1800_0000 {
         return (w >> 26 & 1 == 0 && w >> 30 == 1).then_some(Insn::Literal { rt });
     }
-    if w >> 26 & 1 != 0 {
-        return None;
+    // I5a: `ldp`/`stp xT, xT2, [xN, #imm7*8]` (signed offset, no writeback); a load naming one register twice is UNPREDICTABLE.
+    if matches!(w & 0xffc0_0000, 0xa900_0000 | 0xa940_0000) {
+        let (load, rt2) = (w >> 22 & 1 == 1, (w >> 10 & 31) as u8);
+        if load && rt == rt2 {
+            return None;
+        }
+        let addr = Addr { base: rn, index: None, imm: sext(w >> 15 & 0x7f, 7) * 8 };
+        return Some(Insn::Mem(Mem { load, size: 16, rt, form: Form::Pair, addr, delta: 0, vector: false, rt2: Some(rt2) }));
     }
-    let size = w >> 30;
-    let load = match (size, w >> 22 & 3) {
-        (_, 0) => false,
-        (_, 1) | (0 | 1, 2 | 3) | (2, 2) => true,
-        _ => return None,
+    let vector = w >> 26 & 1 != 0;
+    let opc = w >> 22 & 3;
+    let (size, load) = if vector {
+        match (w >> 30, opc) {
+            (s, 0 | 1) => (s, opc == 1),
+            (0, 2 | 3) => (4, opc == 3),
+            _ => return None,
+        }
+    } else {
+        let size = w >> 30;
+        let load = match (size, opc) {
+            (_, 0) => false,
+            (_, 1) | (0 | 1, 2 | 3) | (2, 2) => true,
+            _ => return None,
+        };
+        (size, load)
     };
     let base = |imm: i64| Addr { base: rn, index: None, imm };
     let simm9 = sext(w >> 12 & 0x1ff, 9);
@@ -250,11 +291,11 @@ fn memory(w: u32) -> Option<Insn> {
     } else {
         return None;
     };
-    // Writeback with the transfer register as base is CONSTRAINED UNPREDICTABLE.
-    if matches!(form, Form::Pre | Form::Post) && rn == rt && rn != SP {
+    // Writeback with the transfer register as base is CONSTRAINED UNPREDICTABLE (general registers only).
+    if matches!(form, Form::Pre | Form::Post) && rn == rt && rn != SP && !vector {
         return None;
     }
-    Some(Insn::Mem(Mem { load, size: 1 << size, rt, form, addr, delta }))
+    Some(Insn::Mem(Mem { load, size: 1 << size, rt, form, addr, delta, vector, rt2: None }))
 }
 
 /// Object validation of a word the decoder does not know (admitted only with the code-shape check off; the hardware
@@ -640,10 +681,15 @@ impl<'a> Verifier<'a> {
             None => s.index_reg == object::NO_REG,
             Some((r, ext, shift)) => (s.index_reg, s.shift) == (r, shift) && (s.extend == ext || (ext == EXT_X && s.extend == object::EXT_NONE)),
         };
-        let load = matches!(s.kind, object::kind::LOAD | object::kind::POP);
+        let load = matches!(s.kind, object::kind::LOAD | object::kind::POP | object::kind::LOAD_PAIR);
+        let class = if m.vector { object::CLASS_FPR } else { object::CLASS_GPR };
+        let pair = matches!(s.kind, object::kind::LOAD_PAIR | object::kind::STORE_PAIR);
         if !(!matches!(s.kind, object::kind::SWAP | object::kind::ATOMIC)
             && index
             && load == m.load
+            && s.data_class == class
+            && pair == (m.form == Form::Pair)
+            && (!pair || Some(s.data_reg[1]) == m.rt2)
             && (s.base_reg, s.width, s.data_reg[0]) == (m.addr.base, m.size, m.rt)
             && s.imm as i64 == m.addr.imm
             && (s.writeback, s.writeback_delta as i64) == (wb, delta))
@@ -760,6 +806,7 @@ impl<'a> Verifier<'a> {
                 _ => return fail("no memory access of its kind there"),
             };
             let splits = self.linked(at, object::kind::SPLIT);
+            let aligns = self.linked(at, object::kind::ALIGN);
             // Guest-RIP-addressed: the base was last written by a guest-RIP move.
             let mv = (addr.index.is_none())
                 .then(|| self.last_write(addr.base, lo, at))
@@ -774,6 +821,20 @@ impl<'a> Verifier<'a> {
                 let crosses = store && size > 1 && (a ^ a.wrapping_add(size as u64 - 1)) & 0x1000 != 0;
                 // With a `b stub`, nothing may enter between the move and the access, not even from before the `b`.
                 let mut sealed_to = words.start;
+                // A misaligned SSE operand (I5a): `b` to its alignment stub instead of any split check.
+                if let &[i] = &aligns[..] {
+                    let (st, c) = (&self.c.stubs[i], self.checks[i]);
+                    if !splits.is_empty() || a & 15 == 0 || c.cond.is_some() || c.start + 4 != at || (st.base_reg, st.imm as i64) != (addr.base, addr.imm) {
+                        return fail("guest-RIP address: an alignment stub needs a misaligned address and `b stub` right before the access");
+                    }
+                    self.claim(st.native_offset);
+                    if !self.sealed(words.start, c.start, at) {
+                        return fail("a branch enters between its guest-RIP move and the access");
+                    }
+                    continue;
+                } else if !aligns.is_empty() {
+                    return fail("several alignment stubs");
+                }
                 match (crosses, &splits[..]) {
                     (false, []) => {}
                     (true, &[i]) => {
@@ -790,6 +851,35 @@ impl<'a> Verifier<'a> {
                     return fail("a branch enters between its guest-RIP move and the access");
                 }
                 continue;
+            }
+            // The alignment check (I5a), before the split check: `and x0, xA, #15; cbnz x0, A` on exactly the access's address,
+            // then only x0/x1 written and at most the access's split check. (Which SSE instructions need one is the
+            // producer's table, FexcSlice1::Sse: not re-derived here.)
+            match &aligns[..] {
+                [] => {}
+                &[x] => {
+                    let (st, c) = (self.c.stubs[x], self.checks[x]);
+                    let a = st.base_reg as u32;
+                    let and = c.start.wrapping_sub(4);
+                    let split_branch = |o: u32| splits.iter().any(|&i| self.checks[i].end == o && self.checks[i].start == o);
+                    let ok = c.cond == Some(CBNZ_X)
+                        && c.start == c.end
+                        && st.imm == 0
+                        && and >= lo
+                        && c.end < at
+                        && self.word(and) == 0x9240_0c00 | a << 5
+                        && self.address_in(st.base_reg, lo, and).is_some_and(|(x, from)| {
+                            x == addr && self.kept(addr, from, at) && self.sealed(from.min(and), c.end, at)
+                        })
+                        && (c.end + 4..at).step_by(4).all(|o| {
+                            matches!(self.insn(o), Some(Insn::Data(d)) if d.is_none_or(|r| r < 2)) || split_branch(o)
+                        });
+                    if !ok {
+                        return fail("no alignment check `and x0, xA, #15; cbnz x0` on exactly its address, then only x0/x1 written");
+                    }
+                    self.claim(st.native_offset);
+                }
+                _ => return fail("several alignment stubs"),
             }
             // Split check on every store wider than a byte.
             match (store && size > 1, &splits[..]) {
@@ -1166,8 +1256,8 @@ mod tests {
         assert!(matches!(decode(0xd100_03ff, 0), Some(Insn::Data(Some(31))))); // sub sp, sp, #0
         assert!(matches!(decode(0xeb00_001f, 0), Some(Insn::Data(None)))); // cmp x0, x0
         assert!(matches!(decode(SVC_LINK, 0), Some(Insn::Svc(svc::LINK))));
-        // ret eret hvc nop tlbi ic ldp ldar bl (E1's stop placeholder `bl .` too) br blr
-        for refused in [0xd65f_03c0, 0xd69f_03e0, 0xd400_0002, 0xd503_201f, 0xd508_871f, 0xd50b_7520, 0xa940_0780, 0xc8df_fc00, 0x9400_0001, 0x9400_0000, 0xd61f_0020, 0xd63f_0060] {
+        // ret eret hvc nop tlbi ic ldp (pre-index; I5a decodes the offset form) ldar bl (E1's stop placeholder `bl .` too) br blr
+        for refused in [0xd65f_03c0, 0xd69f_03e0, 0xd400_0002, 0xd503_201f, 0xd508_871f, 0xd50b_7520, 0xa9c0_0780, 0xc8df_fc00, 0x9400_0001, 0x9400_0000, 0xd61f_0020, 0xd63f_0060] {
             assert!(decode(refused, 0).is_none(), "{refused:#x}");
         }
         // unallocated: add-ext option 01 / imm3 5, add-shifted ROR, sf=0 with N=1 or imm6=32, bitfield N != sf
@@ -1431,7 +1521,9 @@ mod tests {
         refused(ADDRESS, at, old, 0xd400_0002, "unrecognised"); // hvc #0
         refused(ADDRESS, at, old, 0xd400_0001, "svc at"); // svc #0
         refused(ADDRESS, at, old, 0xd400_0001 | 2 << 5, "svc at"); // svc #MISS: the dispatcher's own
-        refused(ADDRESS, at, old, 0xa940_0780, "unrecognised"); // ldp x0, x1, [x28]
+        refused(ADDRESS, at, old, 0xa940_0780, "frame access"); // ldp x0, x1, [x28] (I5a: a decoded pair, never at x28)
+        refused(ADDRESS, at, old, 0xa940_0a80, "unrecorded memory access"); // ldp x0, x2, [x20]: no site
+        assert!(decode(0xa940_0280, 0).is_none()); // ldp x0, x0, [x20]: UNPREDICTABLE
         refused(ADDRESS, at, old, 0xaa14_03fc, "write to x28"); // mov x28, x20
         refused(ADDRESS, at, old, 0x9100_029f, "write to sp"); // mov sp, x20
         refused(ADDRESS, at, old, 0xf940_00c5, "unrecorded memory access"); // ldr x5, [x6]
@@ -1461,7 +1553,7 @@ mod tests {
         // neither has `ldp x20, x21, [x28, #992]` (imm7 * 8 <= 504): the unscaled form is refused at any offset, and the
         // pair at 992 exists only for q registers.
         refused(ADDRESS, at, old, 0xf84f_c394, "frame access"); // ldur x20, [x28, #252]: unscaled
-        refused(ADDRESS, at, old, 0x3dc0_fb80, "unrecognised"); // ldr q0, [x28, #992]: both bases in one load
+        refused(ADDRESS, at, old, 0x3dc0_fb80, "frame access"); // ldr q0, [x28, #992]: both bases in one load (I5a: decoded)
         refused(ADDRESS, at, old, 0xad5f_0780, "unrecognised"); // ldp q0, q1, [x28, #992]
         refused(ADDRESS, at, old, 0xf941_fb94, "frame access"); // ldr x20, [x28, #1008]: past fs_cached
         for word in [0xf84f_c394, 0x3dc0_fb80, 0xad5f_0780, 0xf941_fb94] {
@@ -1472,6 +1564,12 @@ mod tests {
             admitted(word); // fmov d0, x6; fmov s0, w7; cnt v0.8b; addv b0, v0.8b; umov w4, v0.b[0]; prfm pldl1keep, [x6]
         }
         refused(ADDRESS, at, old, 0x0e01_3c19, "write to x25"); // umov w25, v0.b[0]
+        // I5a: a fixed-point FCVTZS/FCVTZU writes a general register too (fcvtzs x28/x25/x3, s0, #1).
+        refused(ADDRESS, at, old, 0x9e18_fc1c, "write to x28");
+        refused(ADDRESS, at, old, 0x9e18_fc19, "write to x25");
+        validated(ADDRESS, at, old, 0x9e18_fc1c, Some("write to x28"));
+        validated(ADDRESS, at, old, 0x9e19_fc19, Some("write to x25")); // fcvtzu x25, s0, #1
+        admitted(0x9e18_fc03);
     }
 
     #[test]
@@ -1489,8 +1587,8 @@ mod tests {
             (0x9400_0000, "unrecognised"),     // bl .
             (0xd400_0002, "unrecognised"),     // hvc #0
             (0xd51b_d059, "unrecognised"),     // msr tpidr_el0, x25
-            (0x3dc0_0380, "unrecognised"),     // ldr q0, [x28]
-            (0xa940_0780, "unrecognised"),     // ldp x0, x1, [x28]
+            (0x3dc0_0380, "frame access"),     // ldr q0, [x28] (I5a: a decoded vector load)
+            (0xa940_0780, "frame access"),     // ldp x0, x1, [x28] (I5a: decoded)
             (0x0820_7f18, "unrecognised"),     // casp w0, w1, w24, w25, [x24]: writes x25
             // The whole branch, exception and system group but its system class (0xd5), whatever the encoding:
             (0x7400_0020, "unrecognised"),     // Armv9.6 CMPBR (compare and branch, may go backward)

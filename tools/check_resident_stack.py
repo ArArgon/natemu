@@ -13,15 +13,15 @@ SP_EL0, pointing at an EL1-only page: it never uses SP). The boot path (`_start`
 until its first block entry. The dispatcher (`dispatch_template`, copied into the code area and run there by generated
 code at EL0) has a budget of 0 bytes: it may not touch SP at all,
 nor load a literal (its miss is an `svc`). A function's frame is the sum of every SP decrement
-in it (`sub sp, sp, #N`, pre-indexed `[sp, #-N]!`), whether or not one path takes them all; its depth is its frame plus
+in it (`sub sp, sp, #N` with or without `lsl #12`, pre-indexed `[sp, #-N]!`), whether or not one path takes them all; its depth is its frame plus
 its deepest callee (`bl`, or a branch to another function's start: a tail call, counted at the full frame). Refused:
 recursion, an indirect call or branch in reachable code not listed in INDIRECT, an SP write that is neither a constant
 adjustment nor a declared stack switch (STACK_SWITCHES, literal source checked), a branch into the middle of another
-function. The gate bound must fit the exception stack's reservation. One nested gate entry (a fault inside the
+function. The gate bound must fit the exception stack's reservation with a headroom of 25% or 4 KiB, whichever is larger (`headroom`). One nested gate entry (a fault inside the
 resident; the resident runs with interrupts masked, so no IRQ enters it) ends in a halt before any other work:
 `returned` sees an SPSR from EL1 and halts (`resident_fault` → `unknown_abort`). That halting path is declared in NESTED from
 the source (which calls each function makes before it halts), not derived from the binary; the checker only confirms
-the declared calls exist and sums their depths. The gate bound plus that path must fit too.
+the declared calls exist and sums their depths. The gate bound plus that path must fit too, and the boot path its reservation, with the same headroom.
 
 ERET path. The only ERET is resume_exception's last instruction, restoring every GPR, Q register, FPCR, FPSR and SP_EL0
 from the frame at the NativeFrame offsets (x16, the base, last) with ELR/SPSR from x1/x2 and SP_EL1 reset to its top;
@@ -55,6 +55,12 @@ NESTED = {'exception_capture': (['finish', R + 'returned', R + 'resident_fault']
 # prologue of its own: counts the target's depth without its frame.
 SHARED_BODIES = set()
 CALL_LIKE = re.compile(r'^(bl|b|b\.\w+|cbn?z|tbn?z)$')
+
+
+def headroom(reserve):
+    """The margin a stack bound must keep: 25% of its reserve or 4 KiB, whichever is larger (state records grow, and every
+    frame copying one grows with them)."""
+    return max(reserve // 4, 4096)
 
 
 def constants(root=ROOT):
@@ -114,9 +120,9 @@ def analyse(funcs, words, tops):
             at = f'{name}+{addr - insns[0][0]:#x}'
             if m := re.search(r'\[sp, #-(0x[0-9a-f]+)\]!', ins):
                 frame += int(m[1], 16)
-            elif m := re.fullmatch(r'sub sp, sp, #(0x[0-9a-f]+)', ins):
-                frame += int(m[1], 16)
-            elif re.fullmatch(r'add sp, (sp|x29), #0x[0-9a-f]+', ins):
+            elif m := re.fullmatch(r'sub sp, sp, #(0x[0-9a-f]+)(, lsl #12)?', ins):
+                frame += int(m[1], 16) << (12 if m[2] else 0)                # a frame of 4 KiB or more takes two (and a probe)
+            elif re.fullmatch(r'add sp, (sp|x29), #0x[0-9a-f]+(, lsl #12)?', ins):
                 pass                                                     # a release
             elif re.match(r'(sp|wsp)\b', rest) and not op.startswith(('st', 'ld', 'cmp', 'cmn')) \
                     or op == 'msr' and rest.startswith('spsel'):
@@ -224,7 +230,7 @@ def eret_problems(funcs, words, tops):
                         f'want {sorted(map(short, ERET_CALLERS))}')
     saves = ([f'stp x{2 * i}, x{2 * i + 1}, [sp{", " + o(16 * i) if i else ""}]' for i in range(15)] +
              ['str x30, [sp, #0xf0]'] + [f'stp q{2 * i}, q{2 * i + 1}, [sp, {o(256 + 32 * i)}]' for i in range(16)] +
-             ['mrs x9, fpcr', 'str x9, [sp, #0x308]', 'mrs x9, fpsr', 'str x9, [sp, #0x310]', 'str xzr, [sp, #0x318]'])
+             ['mrs x9, fpcr', 'str x9, [sp, #0x308]', 'msr fpcr, xzr', 'mrs x9, fpsr', 'str x9, [sp, #0x310]', 'str xzr, [sp, #0x318]'])   # (I5a: FPCR cleared)
     for gate, kind in SAVES.items():
         # Both gates are exception entries (on SP_EL1): NZCV from SPSR.
         flags = ['mrs x9, spsr_el1', 'and x9, x9, #0xf0000000']
@@ -258,13 +264,13 @@ def check(text, root=ROOT):
         d, p = nested(info, gate)
         problems, nest = problems + p, max(nest, d)
     lines.append(f'gate bound {worst} of {reserve} bytes (SP_EL1); with one nested entry to its halt {worst + nest}')
-    if worst + nest > reserve:
-        problems.append(f'exception stack: {worst} + nested {nest} exceeds the reserve {reserve}')
+    if worst + nest > reserve - headroom(reserve):
+        problems.append(f'exception stack: {worst} + nested {nest} leaves less than {headroom(reserve)} bytes of the reserve {reserve}')
     d, path, p = depth(info, BOOT)
     problems += p
     lines.append(f'boot: {d} of {boot_reserve} bytes (SP_EL0): {render(path)}')
-    if d > boot_reserve:
-        problems.append(f'boot stack: {d} exceeds the reserve {boot_reserve}')
+    if d > boot_reserve - headroom(boot_reserve):
+        problems.append(f'boot stack: {d} leaves less than {headroom(boot_reserve)} bytes of the reserve {boot_reserve}')
     for entry in NO_STACK:
         uses = [i for _, i in funcs.get(entry, []) if re.search(r'\bsp\b', i) or re.match(r'ldr\w* \w+, 0x', i)]
         lines.append(f'{entry}: {len(uses)} SP uses or literal loads, budget 0 (SP_EL0)')

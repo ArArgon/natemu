@@ -63,7 +63,32 @@ bool FexcIsOtherMemoryOp(std::string_view n) {
 }
 } // namespace
 
+// I5a: RCPPS/RCPSS/RSQRTPS/RSQRTSS raise no SIMD exception on x86; FEX's exact division would (ZE, PE, IE): FPSR around it.
+bool Arm64JITCore::FexcQuietOp(const IR::IROp_Header* IROp) {
+  using IR::IROps;
+  return fexc_slice1 && fexc_fp_quiet.count(Entry + FexcGuest) &&
+         (IROp->Op == IROps::OP_VFRECP || IROp->Op == IROps::OP_VFRSQRT || IROp->Op == IROps::OP_VFRECPSCALARINSERT ||
+          IROp->Op == IROps::OP_VFRSQRTSCALARINSERT);
+}
+// I5a: ROUND* with imm8 bit 3 clear (PE when inexact): `frintx`, under the instruction's own rounding mode when it names one
+// (FPCR.RMode switched around it: x2 keeps FPCR, x3 the temporary value). Returns whether to emit frintx.
+bool Arm64JITCore::FexcRoundBegin(IR::RoundMode Mode) {
+  if (!fexc_slice1 || !fexc_round_inexact.count(Entry + FexcGuest)) return false;
+  if (Mode != IR::RoundMode::Host) {
+    const uint64_t RMode = Mode == IR::RoundMode::Nearest ? 0 : Mode == IR::RoundMode::PosInfinity ? 1 : Mode == IR::RoundMode::NegInfinity ? 2 : 3;
+    mrs(TMP3, ARMEmitter::SystemRegister::FPCR);
+    and_(ARMEmitter::Size::i64Bit, TMP4, TMP3, ~(uint64_t(3) << 22));
+    if (RMode) orr(ARMEmitter::Size::i64Bit, TMP4, TMP4, RMode << 22);
+    msr(ARMEmitter::SystemRegister::FPCR, TMP4);
+  }
+  return true;
+}
+void Arm64JITCore::FexcRoundEnd(IR::RoundMode Mode) {
+  if (Mode != IR::RoundMode::Host) msr(ARMEmitter::SystemRegister::FPCR, TMP3);
+}
+
 void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32_t Begin) {
+  if (FexcQuietOp(IROp)) msr(ARMEmitter::SystemRegister::FPSR, TMP4);
   FexcRecordOp(IROp, Node, Begin);
   if (fexc_slice1) FexcCheckTarget(Node);
 }
@@ -283,7 +308,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
 // ---------------------------------------------------------------------------------------------
 namespace {
 constexpr bool FexcCanonical(uint64_t A) { return uint64_t(int64_t(A << 16) >> 16) == A; }
-constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3;   // brk immediates (the runtime keys on the PC); 1: branch target
+constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3, FexcBrkAlign = 4;   // brk immediates (the runtime keys on the PC); 1: branch target
 } // namespace
 
 // A new guard/split site for the current guest instruction, recorded like an access site at this point (width, intent,
@@ -301,7 +326,7 @@ ARMEmitter::ForwardLabel* Arm64JITCore::FexcStub(uint8_t Kind, bool Link) {
   S.completed_effects = !FexcStoreSeen && (!FexcNzcvWritten || FexcNzcvSaved) ? 0 : 1;
   S.located = 1;
   S.access_native_offset = FEXC_NONE32;
-  S.ir_op = Kind == FEXC_SITE_SPLIT ? "split" : Kind == FEXC_SITE_DIVIDE ? "divide" : "guard";
+  S.ir_op = Kind == FEXC_SITE_SPLIT ? "split" : Kind == FEXC_SITE_DIVIDE ? "divide" : Kind == FEXC_SITE_ALIGN ? "align" : "guard";
   const size_t Index = fexc_sites.size();
   fexc_sites.push_back(S);
   if (Link) FexcPendingLink.push_back(Index);
@@ -329,13 +354,14 @@ void Arm64JITCore::FexcCheckTarget(IR::Ref Node) {
 
 void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   using IR::IROps;
+  if (FexcQuietOp(IROp)) mrs(TMP4, ARMEmitter::SystemRegister::FPSR);
   const IR::OrderedNodeWrapper* Addr = nullptr;
   const IR::OrderedNodeWrapper* Offset = nullptr;
   IR::MemOffsetType Type = IR::MemOffsetType::SXTX;
   uint8_t Scale = 1;
   int64_t Imm = 0;
   uint32_t W = IR::OpSizeToSize(IROp->Size);
-  bool Store = false;
+  bool Store = false, Pair = false;
   switch (IROp->Op) {
 #define FEXC_MEM(OP, T, ST) \
   case IROps::OP: { const auto Op = IROp->C<IR::T>(); Addr = &Op->Addr; Offset = &Op->Offset; Type = Op->OffsetType; \
@@ -345,9 +371,10 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   FEXC_MEM(OP_STOREMEM, IROp_StoreMem, true)
   FEXC_MEM(OP_STOREMEMTSO, IROp_StoreMemTSO, true)
 #undef FEXC_MEM
-  case IROps::OP_LOADMEMPAIR: { const auto Op = IROp->C<IR::IROp_LoadMemPair>(); Addr = &Op->Addr; Imm = Op->Offset; W *= 2; break; }
+  // (I5a: MOVAPS/MOVAPD/MOVDQA m128 are an X-register pair, patch 0018: `Pair`, alignment-checked like a plain access.)
+  case IROps::OP_LOADMEMPAIR: { const auto Op = IROp->C<IR::IROp_LoadMemPair>(); Addr = &Op->Addr; Imm = Op->Offset; W *= 2; Pair = true; break; }
   case IROps::OP_STOREMEMPAIR: {
-    const auto Op = IROp->C<IR::IROp_StoreMemPair>(); Addr = &Op->Addr; Imm = Op->Offset; W *= 2; Store = true; break;
+    const auto Op = IROp->C<IR::IROp_StoreMemPair>(); Addr = &Op->Addr; Imm = Op->Offset; W *= 2; Store = true; Pair = true; break;
   }
   case IROps::OP_PUSH: {
     const auto Op = IROp->C<IR::IROp_Push>(); Addr = &Op->Addr; W = IR::OpSizeToSize(Op->ValueSize); Imm = -int64_t(W); Store = true;
@@ -363,7 +390,13 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   // Every store wider than one byte gets the split check, read-modify-write stores included: with both pages already
   // shadowed readable the load does not fault, only the store faults on the second page, and Arm may commit the first
   // part (DDI0487 B2.8.2.1). Loads, byte stores and swaps need no check: a fault anywhere commits nothing.
-  if (!Store || W < 2) return;
+  // I5a: the first access of a legacy SSE instruction whose 16-byte operand must be 16-byte aligned (FexcSlice1::Sse) gets
+  // the alignment check first: `and x0, A, #15; cbnz x0, stub` (#GP(0) at the stub, before any walk: QEMU's order; an
+  // aligned 16-byte operand never crosses a page). FEX may load fewer bytes than the x86 operand (e.g. punpcklbw's low
+  // half); the check is on the operand's address all the same.
+  const bool Align = fexc_slice1 && (Offset || Pair) && FexcLoadSite < 0 && !FexcStoreSeen && fexc_align16.count(Entry + FexcGuest);
+  const bool Split = Store && W >= 2;
+  if (!Align && !Split) return;
   bool Index = false;
   uint64_t C;
   if (Offset && !Offset->IsInvalid()) {
@@ -372,8 +405,8 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   }
   const auto Base = GetReg(*Addr).X();
   // A stub site records the address as it is at the stub: register + imm (the checked register, or the RIP-relative base).
-  auto Stub = [&](ARMEmitter::Register R, int64_t Off) {
-    auto* L = FexcStub(FEXC_SITE_SPLIT, true);
+  auto Stub = [&](ARMEmitter::Register R, int64_t Off, uint8_t Kind = FEXC_SITE_SPLIT) {
+    auto* L = FexcStub(Kind, true);
     fexc_sites.back().base_reg = uint8_t(R.Idx());
     fexc_sites.back().imm = int32_t(Off);
     return L;
@@ -381,7 +414,8 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   const auto Rip = fexc_rip_relative.find(IR->GetID(Node).Value);
   if (Rip != fexc_rip_relative.end() && !Index) {   // RIP-relative: a compile-time address
     const uint64_t A = Entry + Rip->second + Imm;
-    if ((A ^ (A + W - 1)) & 0x1000) b_OrRestart(Stub(Base, Imm));
+    if (Align && (A & 15)) { b_OrRestart(Stub(Base, Imm, FEXC_SITE_ALIGN)); return; }
+    if (Split && ((A ^ (A + W - 1)) & 0x1000)) b_OrRestart(Stub(Base, Imm));
     return;
   }
   ARMEmitter::Register A = Base;
@@ -396,6 +430,11 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
     else { LoadConstant(ARMEmitter::Size::i64Bit, TMP2, uint64_t(Imm)); add(ARMEmitter::Size::i64Bit, TMP2, Base, TMP2); }
     A = TMP2;
   }
+  if (Align) {
+    and_(ARMEmitter::Size::i64Bit, TMP1, A, 15);
+    cbnz_OrRestart(ARMEmitter::Size::i64Bit, TMP1, Stub(A, 0, FEXC_SITE_ALIGN));
+  }
+  if (!Split) return;
   add(ARMEmitter::Size::i64Bit, TMP1, A, W - 1);
   eor(ARMEmitter::Size::i64Bit, TMP1, TMP1, A);
   tbnz_OrRestart(TMP1, 12, Stub(A, 0));
@@ -412,7 +451,7 @@ void Arm64JITCore::FexcEmitStubs() {
     BindOrRestart(&Label);
     fexc_sites[Index].native_offset = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
     const uint8_t K = fexc_sites[Index].kind;
-    brk(K == FEXC_SITE_SPLIT ? FexcBrkSplit : K == FEXC_SITE_DIVIDE ? FexcBrkDivide : FexcBrkGuard);
+    brk(K == FEXC_SITE_SPLIT ? FexcBrkSplit : K == FEXC_SITE_DIVIDE ? FexcBrkDivide : K == FEXC_SITE_ALIGN ? FexcBrkAlign : FexcBrkGuard);
   }
 }
 

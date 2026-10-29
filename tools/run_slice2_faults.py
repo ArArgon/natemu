@@ -24,7 +24,7 @@ import argparse, json, os, pathlib, shutil, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
-import ref, gen_slice2 as gen, run_slice1_vm as vm, run_slice1_faults as F  # noqa: E402
+import ref, gen_slice2 as gen, run_slice1_vm as vm, run_slice1_faults as F, delivery_check  # noqa: E402
 
 PAGE = 4096
 PAGES = [gen.DATA, gen.DATA + PAGE, gen.STACK, gen.STACK + PAGE]
@@ -78,11 +78,14 @@ def expected_fault(p, muts, want):
     return got, problems
 
 
-def compare_fault(expected, out):
-    """Differences between the policy's (vector, CR2, error) and the VM's stop `out`."""
+def compare_fault(expected, out, cpl=3):
+    """Differences between the policy's (vector, CR2, error) and the VM's stop `out`: since X1a a delivery through the
+    driver's logging IDT, whose frame, handler RSP and CPL delivery_model judges (`delivery_check`)."""
     diffs = [] if out['stop'] == 'guest_fault' else [f"stopped {out['stop']} {out['reason']} at {out['rip']}"]
     vector, cr2, error, rip = (ref.num(x) for x in out['fault'])
     if (vector, cr2, error) != tuple(expected): diffs.append(f'fault {(vector, hex(cr2), hex(error))} vs expected {(expected[0], hex(expected[1]), hex(expected[2]))}')
+    if out['stop'] == 'guest_fault':
+        diffs += delivery_check.problems(out, expected[0], expected[2], expected[1], cpl)
     return diffs
 
 
@@ -179,7 +182,7 @@ def main():
                 else:
                     if want.get('fault'):
                         expected, diffs = expected_fault(p, muts, want)
-                        if expected: diffs += compare_fault(expected, out)
+                        if expected: diffs += compare_fault(expected, out, int(p.get('cpl', 3)))
                     else:
                         diffs = [] if out['stop'] == 'reached' else [f"QEMU ran to the end; VM stopped {out['stop']} {out['reason']} at {out['rip']}"]
                     diffs += ref.compare(want, [ref.num(v) for v in out['gpr']], ref.num(out['rflags']), ref.num(out['rip']), out['memory'])

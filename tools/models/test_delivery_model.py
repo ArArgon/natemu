@@ -281,6 +281,9 @@ class Iretq(unittest.TestCase):
     def test_same_cpl_null_ss_allowed_in_64bit_mode(self):
         n = m.iretq(build_iret_frame(machine(), KRIP, 0x08, 0x202, 0x8F00, 0))['state']
         self.assertEqual((n['ss'], n['rsp']), (0, 0x8F00))
+        # A7: a NULL SS whose RPL is not the new CPL is #GP(0) (Vol. 2A IRET 64-bit mode exceptions).
+        r = m.iretq(build_iret_frame(machine(), KRIP, 0x08, 0x202, 0x8F00, 1))
+        self.assertEqual(r['events'][0], (m.GP, 0))
 
     def test_cs_and_ss_checks(self):
         cases = [(machine(user=True), (URIP, 0x08, 0x202, 0x5000, 0x10), (m.GP, 0x08)),   # RPL < CPL

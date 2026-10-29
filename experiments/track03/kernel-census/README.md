@@ -38,6 +38,15 @@ LSE atomic each; LOCK elsewhere is #UD, still counted `LOCK`; CMPXCHG8B/16B lock
 `prefetchw` stay). Every one moved to admitted (kernel admitted +10,039, initramfs +1,385); no LOCK on a form that is not
 lockable occurs. Whether an operand crosses 16 bytes (the `unsupported_atomic` stop) is not decidable statically.
 
+**I5a re-check (October 29).** `census.py` ports the I5a SSE rules (fexc series19: `sse_form`, a port of
+`FexcSlice1::Sse`; CRC32 admitted; LDMXCSR/STMXCSR `system`; 66 with F2/F3 refused; INSERTPS m32 zeroing its inserted element
+refused). Rerun into `natemu-raw/kernel-census-i5a-20261029-01/` (`x` linked to the C0 data; report in its `report/`). SSE class:
+kernel 95 → 5 (EMMS 1, MMX; a CET `wrussq` filed as SSE 4), initramfs init chain 48,917 → 346, other executables 21,156 → 215,
+other libraries 128,127 → 6,675 (initramfs 198,200 → 7,236: AES 4,367, SHA 1,297, PCLMULQDQ 351, PCMPISTRI 401 (glibc's
+SSE4.2 string functions), ADCX 736 and MOVBE 68 (filed as SSE: other features), MMX 16). Every one moved to admitted but
+LDMXCSR/STMXCSR (kernel 1, initramfs 383: `system`, the resident's transactions); `other` fell too (kernel 23 → 19, initramfs
+3,086 → 2,302: SSE forms with an F2/F3 prefix the earlier classifier filed as a REP/REPNE prefix on an admitted opcode).
+
 Files here: `extract.py`, `census.py`, `report.py`, `results.md` (every table, generated), `forms-kernel.tsv` (every refused
 form of the decompressor and vmlinux, one row per mnemonic + operand shape, first-use order). The same for the
 initramfs is `RAW/forms-initrd.tsv`; `RAW/census.json` holds every row.

@@ -68,8 +68,11 @@ A5 Delivery check order: IDT limit, gate type, software DPL, gate P, CS null, CS
 A6 #DF: saved CS and RIP are undefined (§7.15 interrupt 8): model pushes the original context, undefined = any;
    RF image ∈ {current RF, 1} (abort; §20.3.1.1 does not list aborts).
 A7 IRETQ order: NT, pops, CS null/limit/type/RPL/DPL/P, RIP canonical (or CS limit), SS checks. IRETQ to the same CPL
-   reloads SS from the frame with the outer-return checks. A NULL SS is accepted for a 64-bit CS and new CPL < 3
-   whatever the NULL selector's RPL; the RPL rule for a NULL SS is not stated (N6): runners keep RPL = new CPL.
+   reloads SS from the frame with the outer-return checks. A NULL SS is accepted only for a 64-bit CS, a new CPL < 3
+   and RPL = the new CPL: Vol. 2A IRET, 64-Bit Mode Exceptions, #GP(0) "if the stack segment selector is NULL going
+   back to compatibility mode", "going back to CPL3 64-bit mode" and "if the stack segment selector RPL is not equal to
+   the RPL of the return code segment selector" (as MOV SS and RET; segment_model B6). Not set-valued: the SDM states
+   it.
 A8 IRETQ releases NMI blocking even when it faults (§7.7.2). NMI blocking starts before NMI delivery and stays even if
    that delivery faults (§7.7.2).
 A9 Shadows: STI (IF 0 -> 1) blocks INTR and may block NMI and SMI (§7.8.1 footnote 2); MOV/POP SS blocks INTR and NMI
@@ -389,7 +392,7 @@ def _iretq_once(s, bus):
         raise Fault(GP, 0)
     ss_addr = ss = None
     if ss_sel & 0xFFFC == 0:
-        if not to_64 or rpl == 3:                                  # NULL SS only for 64-bit CS and CPL < 3 (A7)
+        if not to_64 or rpl == 3 or ss_sel & 3 != rpl:             # NULL SS: 64-bit CS, CPL < 3, RPL = CPL (A7)
             raise Fault(GP, 0)
     else:
         ss_addr, ss = _descriptor(bus, ss_sel, 0)

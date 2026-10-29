@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1a check: fexc's access sites against the fixture programs and against the emitted code.
 
-usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series18 build)
+usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series20 build)
 
 --slice1 compiles with `--profile slice1` (S1c): hardware TSO (plain ldr/str), exits through the dispatcher gate, block
 cutting (no fixture instruction is cut since S3e admitted memory xchg, a `swap` site); the exit
@@ -44,7 +44,7 @@ def fixture_programs():
     if not path.exists():
         subprocess.run([sys.executable, '-B', str(REPO / 'tools/reference/build_slice1.py'), '--programs-only'], check=True)
     return json.loads(path.read_text())['programs']
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series18/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series20/obj/fexc')
 KNOWN_OK = False
 PROFILE = []   # extra fexc arguments for every compile: ['--profile', 'slice1'] under --slice1
 
@@ -54,7 +54,7 @@ RMW_DST = {'add', 'adc', 'sub', 'sbb', 'and', 'or', 'xor', 'inc', 'dec', 'neg', 
 LOAD_DST = {'cmp', 'test', 'bt'}
 LOAD_ONLY_1OP = {'mul', 'imul', 'div', 'idiv'}
 WORD_REGS = {'ax', 'cx', 'dx', 'bx', 'sp', 'bp', 'si', 'di'} | {f'r{i}w' for i in range(8, 16)}
-STUBS = ('guard', 'split', 'divide')   # slice1 check stubs (brk words after the body), not accesses: verify_precision.py checks them
+STUBS = ('guard', 'split', 'divide', 'align')   # slice1 check stubs (brk words after the body), not accesses: verify_precision.py checks them
 
 
 STRING = re.compile(r'(?:(?:rep|repe|repne)\s+)?(movs|stos|lods|scas|cmps)([bwdq]?)\b(.*)')
@@ -77,10 +77,14 @@ def blocks(p):
     import ref   # tools/reference (on the path of the callers that pass programs with `asm`)
     asm = p['asm']
     cuts = [i + 1 for i, a in enumerate(asm) if re.match(r'(rep|repe|repne)\s|lock neg\s', a)]   # (I3: LOCK NEG ends its block too)
-    if not cuts: return [p]
+    # I5a: LDMXCSR/STMXCSR are system instructions (a block ends before one; the resident executes it): skipped.
+    system = {i for i, a in enumerate(asm) if re.match(r'(ld|st)mxcsr\s', a)}
+    if not cuts and not system: return [p]
+    cuts = sorted(set(cuts) | system | {i + 1 for i in system})
     sizes = [len(ref.assemble(a)) for a in asm]
     out, start = [], 0
     for c in cuts + [len(asm)]:
+        if start in system: start += 1
         if c <= start: continue
         lo, hi = sum(sizes[:start]), sum(sizes[:c])
         q = dict(p, name=f"{p['name']}@{start}", code=p['code'][2 * lo:2 * hi], rip=hex(int(p['rip'], 16) + lo), asm=asm[start:c])
@@ -91,7 +95,7 @@ def blocks(p):
 
 def expected(asm):
     """[(class, width)] for one `asm` line, class in load/store/push/pop; None if the form is not understood."""
-    if x := STRING.fullmatch(asm.strip()):
+    if 'xmm' not in asm and (x := STRING.fullmatch(asm.strip())):   # (I5a: movsd/cmpsd with xmm operands are SSE)
         w = {'b': 1, 'w': 2, 'd': 4, 'q': 8}.get(x[2]) or WIDTH[re.search(r'(byte|word|dword|qword) ptr', x[3])[1]]
         return [(k, w) for k in STRING_ACCESSES[x[1]]]
     locked = asm.startswith('lock ')
@@ -126,6 +130,12 @@ def expected(asm):
     i, w = mem[0], ptr(ops[mem[0]])
     if mn == 'xchg':
         return [('swap', w)]
+    # I5a: an SSE form (an xmm operand, or crc32) loads its memory operand, or stores it when it is the destination; FEX
+    # reads only the low 8 bytes of the 16-byte source of the unpack-low forms and pmovsx/zx's narrower operand as given.
+    if 'xmm' in rest or mn == 'crc32':
+        if i == 0 and mn not in ('ptest', 'comiss', 'ucomiss', 'comisd', 'ucomisd', 'crc32'):
+            return [('store', w)]
+        return [('load', w)]
     if i > 0:
         return [('load', w)]
     if mn in ('mov', 'movabs', 'movnti') or mn.startswith('set'):
@@ -149,6 +159,8 @@ def site_classes(sites):
                 out.setdefault(g, []).append((k[:-5], w // 2))
         elif k in ('load', 'store', 'push', 'pop'):
             out.setdefault(s['guest_offset'], []).append((k, w))
+        elif k in ('load_pair', 'store_pair') and w == 16:   # I5a: MOVAPS/MOVAPD/MOVDQA m128, one 16-byte X-register pair
+            out.setdefault(s['guest_offset'], []).append((k[:-5], w))
         else:
             out.setdefault(s['guest_offset'], []).append((k, w))
     return {g: sorted(v) for g, v in out.items()}
@@ -341,7 +353,7 @@ def check_program(p, tmp):
             problems.append(('ERROR', f'store without write intent at {s["native_offset"]}'))
         # I7: an FS/GS-overridden operand is FS/GS (#GP), whatever its base; the implicit stack accesses stay SS.
         ss = s['kind'] in ('push', 'pop', 'push_pair', 'pop_pair') or \
-            bool(re.search(r'\[(rsp|rbp)\b', a) and not re.search(r'\b[fg]s:\[', a) and s['kind'] in ('load', 'store', 'swap', 'atomic')) or \
+            bool(re.search(r'\[(rsp|rbp)\b', a) and not re.search(r'\b[fg]s:\[', a) and s['kind'] in ('load', 'store', 'swap', 'atomic', 'load_pair', 'store_pair')) or \
             (mn == 'leave' and s['kind'] == 'load')
         if (s['segment'] == 'ss') != ss:
             problems.append(('ERROR', f'guest +{s["guest_offset"]} "{a}": segment {s["segment"]}'))
@@ -363,7 +375,7 @@ def check_program(p, tmp):
     o = read_object(tmp / 'o.bin')
     if o['code'] != code or o['spill'] != d['code']['layout']['spill_bytes'] or len(o['sites']) != len(sites) or o['rip'] != int(p['rip'], 16):
         problems.append(('ERROR', 'object header/code disagrees with the JSON'))
-    kinds = ['load', 'store', 'load_pair', 'store_pair', 'push', 'pop', 'guard', 'split', 'push_pair', 'pop_pair', 'other', 'divide', 'swap', 'atomic']
+    kinds = ['load', 'store', 'load_pair', 'store_pair', 'push', 'pop', 'guard', 'split', 'push_pair', 'pop_pair', 'other', 'divide', 'swap', 'atomic', 'align']
     for rec, s in zip(o['sites'], sites):
         if (rec[0], rec[1], kinds[rec[5]], rec[6]) != (s['native_offset'], s['guest_offset'], s['kind'], s['width']):
             problems.append(('ERROR', f'object site {rec[:4]} disagrees with JSON {s["native_offset"]}'))
