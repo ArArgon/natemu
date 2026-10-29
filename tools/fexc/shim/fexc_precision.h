@@ -23,10 +23,10 @@ inline bool GuestMemOp(FEXCore::IR::IROps Op) {
 inline bool FaultPoint(FEXCore::IR::IROps Op) {
   return GuestMemOp(Op) || Op == FEXCore::IR::OP_DIV || Op == FEXCore::IR::OP_UDIV;
 }
-// Frame slot of the instruction's incoming NZCV (patch 5): FEX's own home for guest NZCV outside the JIT,
-// CPUState.flags[RFLAG_NZCV_LOC] (32 bits, the PSTATE bit layout; see Core.cpp::ReconstructCompactedEFLAGS).
-inline constexpr uint32_t PreNzcvOffset =
-  uint32_t(offsetof(FEXCore::Core::CpuStateFrame, State) + offsetof(FEXCore::Core::CPUState, flags) + FEXCore::X86State::RFLAG_NZCV_LOC);
+// Register holding the instruction's incoming NZCV (patch 5): `mrs x25, nzcv` at the instruction start. x25 is FEX's
+// call-return stack pointer, which profile slice1 never uses (exits go through the resident), so the register
+// allocator never hands it out and no other word writes it (admission checks this).
+inline constexpr uint32_t PreNzcvReg = 25;
 
 // Profile slice1 (address guard, branch-target check): called at the start of register allocation, while operands are
 // still SSA nodes. Records each guest load/store whose base is an EntrypointOffset (a RIP-relative operand: its address

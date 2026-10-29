@@ -27,10 +27,8 @@ global_asm!(include_str!("gates.S"),
     exception_stack_top=const EXCEPTION_STACK_TOP,
     identity_entry=const PRIVATE+0x11008,
     upper_root_pages=const (shadow::UPPER_ROOT-shadow::LOWER_ROOT)/4096,
-    frame_rip=const natemu_abi::execution::frame::RIP,
-    l1_address=const natemu_abi::execution::cache::LOOKUP_VA+natemu_abi::execution::cache::L1 as u64,
-    l1_mask=const natemu_abi::execution::cache::L1_MASK,
-    fast_counter=const natemu_abi::execution::STATE_VA+offset_of!(natemu_abi::execution::State,fast) as u64,
+    l1_code_delta=const natemu_abi::execution::cache::L1_CODE-natemu_abi::execution::cache::DISPATCH-4,
+    svc_miss=const natemu_abi::execution::svc::MISS,
 );
 
 fn shared() -> *mut Shared {

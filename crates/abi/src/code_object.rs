@@ -9,7 +9,7 @@
 //! Numeric codes are shared with `tools/fexc/shim/fexc_hook.h`; keep them in sync.
 
 pub const MAGIC: [u8; 8] = *b"NFXOBJ\0\x01";
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 /// "No value" for a u32 offset field.
 pub const NONE32: u32 = u32::MAX;
 pub const NO_REG: u8 = 0xff;
@@ -66,7 +66,8 @@ pub const CLASS_GPR: u8 = 0;
 pub const CLASS_FPR: u8 = 1;
 /// [`Site::nzcv`]: where the guest NZCV is at the site.
 pub const NZCV_PSTATE: u8 = 0;
-pub const NZCV_FRAME: u8 = 1;
+/// In the header's `pre_nzcv_register` (saved at the instruction start).
+pub const NZCV_SAVED: u8 = 1;
 /// [`Site::ordering`].
 pub const ORD_PLAIN: u8 = 0;
 pub const ORD_ACQUIRE: u8 = 1;
@@ -113,6 +114,8 @@ pub const CF_UNKNOWN: u8 = 2;
 pub const RELOC_GUEST_RIP_LITERAL: u8 = 1;
 pub const RELOC_NAMED_SYMBOL_LITERAL: u8 = 2;
 pub const RELOC_GUEST_RIP_MOVE: u8 = 3;
+/// A computed exit's placeholder `b .` the resident relocates to its dispatcher (`execution::DISPATCH_PLACEHOLDER`).
+pub const RELOC_DISPATCH_BRANCH: u8 = 4;
 pub const RELOC_OTHER: u8 = 255;
 
 #[repr(C)]
@@ -161,9 +164,9 @@ pub struct Header {
     pub feature_count: u8,
     pub dcache_line_log2: u8,
     pub reserved: [u8; 2],
-    /// Offset in the guest-state frame (x28) of the 32-bit slot where a [`NZCV_FRAME`] site finds the instruction's
-    /// incoming NZCV (PSTATE layout); [`NONE32`] if the compile has no such sites (default profile).
-    pub pre_nzcv_offset: u32,
+    /// The register in which an [`NZCV_SAVED`] site finds its instruction's incoming NZCV (PSTATE layout);
+    /// [`NONE32`] if the compile has no such sites (default profile).
+    pub pre_nzcv_register: u32,
 }
 
 /// One native instruction that performs a guest memory access, sorted by `native_offset` in the table.
@@ -278,7 +281,7 @@ mod tests {
         assert_eq!(offset_of!(Header, feature_count), 120);
         assert_eq!(offset_of!(Header, dcache_line_log2), 121);
         assert_eq!(offset_of!(Header, reserved), 122);
-        assert_eq!(offset_of!(Header, pre_nzcv_offset), 124);
+        assert_eq!(offset_of!(Header, pre_nzcv_register), 124);
     }
 
     #[test]
@@ -324,6 +327,6 @@ mod tests {
     #[test]
     fn magic_and_version() {
         assert_eq!(&MAGIC[..6], b"NFXOBJ");
-        assert_eq!(VERSION, 3);
+        assert_eq!(VERSION, 4);
     }
 }

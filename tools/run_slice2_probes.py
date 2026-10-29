@@ -15,10 +15,10 @@ The VM's final GPRs, masked RFLAGS and memory must equal QEMU's, and it must sto
 without a flush (only the one requested when the driver writes guest RAM), host translation requests must equal the
 distinct block RIPs (every block is compiled once and then found in the VM); a forced small code cache (`--code-cache`,
 at least the largest block) must flush repeatedly and still match; a cache smaller than that is refused. Linking (S2c): a
-hot loop at N and 2N iterations makes the same resident entries and dispatcher hits, and a forged block header halts the
+hot loop at N and 2N iterations makes the same resident entries, and a forged literal exit halts the
 linker; every run self-checks its link points (the driver). A non-terminating loop must be stopped by the watchdog. Run-time tamper checks
 (driver `--tamper`, `--tamper-after`): a link point reported outside its block is refused (`bad_reply`); a corrupted linked
-branch, target literal or link record makes the next flush halt (`bad_link`) and is refused by the host's self-check
+branch or link record makes the next flush halt (`bad_link`) and is refused by the host's self-check
 (`links_check`). Self-modifying code (S2e): stores into the running block (next instruction, an already executed one in a
 loop, page-crossing), into another block's page, data on a loop's own code page, and FEX's upstream SelfModifyingCode tests
 must reach their end with QEMU's state (QEMU runs the self-modifying program itself). Nothing is keyed by probe name;
@@ -305,8 +305,9 @@ def main():
     out.append({'name': 'tiny-cache', 'stderr': err})
     print(f"tiny-cache --code-cache 1: {'match' if ok else 'fail'} {err}")
 
-    # Linking (S2c): once a hot loop's edges are linked it runs without entering the resident or the dispatcher, so N
-    # and 2N iterations (N = 10^6) make the same number of resident entries (`blocks`) and dispatcher hits (`fast`).
+    # Linking (S2c): once a hot loop's edges are linked it runs without entering the resident, so N and 2N iterations
+    # (N = 10^6) make the same number of resident entries (`blocks`). (Dispatcher hits are no longer counted: generated
+    # code writes no emulator data. The loop has literal exits only, so it never reaches the dispatcher.)
     for args in ([], ['1'], ['2']):
         counts = []
         for trips in (10**6, 2 * 10**6):
@@ -316,26 +317,26 @@ def main():
                      ref.num(state['rflags']), ref.num(state['rip']), state['memory'])
             if state is not None:
                 if state['stop'] != 'reached': diffs.insert(0, f"stopped {state['stop']} at {state['rip']}")
-                counts.append((state['stats']['blocks'], state['stats']['fast'], state['stats']['linked']))
+                counts.append((state['stats']['blocks'], state['stats']['linked']))
             failures += bool(diffs)
             out.append({'name': program['name'], 'args': args, 'stats': state and state['stats'], 'diffs': diffs, 'stderr': err})
             print(f"{program['name']} {' '.join(args)}: {'fail' if diffs else 'match'} {state and state['stats']} {'; '.join(diffs)[:300]}")
-        ok = len(counts) == 2 and counts[0] == counts[1] and counts[0][2] > 0
+        ok = len(counts) == 2 and counts[0] == counts[1] and counts[0][1] > 0
         failures += not ok
         out.append({'name': 'hot-loop-entries', 'args': args, 'counts': counts})
-        print(f"hot loop {' '.join(args)}: {'match' if ok else 'fail'} (resident entries, dispatcher hits, linked) at N, 2N: {counts}")
+        print(f"hot loop {' '.join(args)}: {'match' if ok else 'fail'} (resident entries, linked) at N, 2N: {counts}")
 
-    # A block whose entry prologue stores anything but its own header (admission refuses this; the driver forges it
-    # after admission) makes the linker halt instead of patching code it cannot name.
+    # A literal exit whose RIP is none of its block's link targets (admission refuses this; the driver forges it after
+    # admission) makes the linker halt instead of patching code it cannot name.
     program, _, _ = built['split-body']
-    state, err = run('forged-header', program, ['--forge-header'])
+    state, err = run('forged-exit', program, ['--forge-exit'])
     ok = state is not None and state['stop'] == 'resident' and state['reason'].startswith('bad_link') and state['stats']['links'] == 0
     failures += not ok
-    out.append({'name': 'forged-header', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
-    print(f"forged-header: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']}")
+    out.append({'name': 'forged-exit', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
+    print(f"forged-exit: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']}")
 
     # Run-time tampering (driver options): what admission and the resident never produce must be caught. A host-supplied
-    # link point outside its block is refused at placement; a corrupted linked branch, target literal or link record
+    # link point outside its block is refused at placement; a corrupted linked branch or link record
     # (corrupted just before a flush) halts the unlink, and the host's self-check refuses the same corruption after a run.
     flush_args = ['1', '--code-cache', '32768']
     program = add_chain(600, 3)[0]
@@ -344,7 +345,7 @@ def main():
     failures += not ok
     out.append({'name': 'tamper-offset', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
     print(f"tamper offset: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']} {err}")
-    for kind in ('word', 'literal', 'record'):
+    for kind in ('word', 'record'):
         state, err = run(f'tamper-{kind}', program, flush_args + ['--tamper', kind])
         ok = state is not None and state['tampered'] and state['stop'] == 'resident' and state['reason'].startswith('bad_link')
         failures += not ok

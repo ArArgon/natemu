@@ -12,6 +12,10 @@ Labels used below:
 Files:
 - `probe.c`: a standalone HVF probe, independent of natemu. Build it with `build.sh OUT`, run it with `OUT/probe [reps] [scale]`.
 - `census.py`: a static word census of fexc slice-1 output.
+- `e1census.py` (E1, added after the study): every word of fexc slice-1 output classified by what it touches (the
+  review's memwords approach); exit status 1 if any word loads or stores emulator data (a non-site access, a literal
+  load, an sp access). With series11 on the four corpora of §2 it finds none; series10 gives the 3,019 x28, 783 literal
+  and 42 sp words of the follow-up's table.
 - Raw output is in `/private/tmp/claude-501/-Users-liaozping-orca-natemu/025ed521-9978-4fb2-aaf7-b90da95d37f3/scratchpad/el0/`:
   - `final.txt`: the run reported here, `probe 9 2`;
   - `try2.txt`: a replicate;

@@ -156,6 +156,7 @@ struct Capture {
   std::vector<uint8_t> code;
   std::vector<std::pair<uint64_t, uint64_t>> pcs, subblocks, prologues;
   std::vector<CPU::Relocation> relocs;
+  std::vector<uint32_t> dispatch_exits;   // slice1: computed exits' `b` to the resident dispatcher (relocated at placement)
   std::vector<uint8_t> sra_gpr, sra_fpr;
   // The explicit x86 memory operand FEX decoded (base/index are x86 register numbers, -1 = none).
   struct X86Mem { bool present = false, rip_relative = false; int base = -1, index = -1; unsigned scale = 1; int64_t disp = 0; };
@@ -229,6 +230,7 @@ void Hook(Core::InternalThreadState* t, const FexcCompileInfo& info, const uint8
   for (auto& s : dd.Subblocks) Cap.subblocks.push_back({s.HostCodeOffset, s.HostCodeSize});
   Cap.prologues = {dd.FexcEntryPrologues.begin(), dd.FexcEntryPrologues.end()};
   if (dd.Relocations) Cap.relocs.assign(dd.Relocations->begin(), dd.Relocations->end());
+  Cap.dispatch_exits = fexc_dispatch_exits;
   Cap.sra_gpr.assign(dd.FexcSRAGPR, dd.FexcSRAGPR + dd.FexcSRAGPRCount);
   Cap.sra_fpr.assign(dd.FexcSRAFPR, dd.FexcSRAFPR + dd.FexcSRAFPRCount);
   Cap.sites = fexc_sites;
@@ -534,6 +536,9 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     }
     j.end_obj();
   }
+  for (auto o : Cap.dispatch_exits)
+    j.elem_obj().kv("offset", uint64_t(o)).kv("kind", "dispatch_branch").null("size")
+     .kv("meaning", "placeholder `b .`: the resident relocates it to its dispatcher when it places the block").end_obj();
   j.end_arr();
   // (relocations written inside "code" object after we know zeroed bytes; hex goes last)
   j.kv("size", code.size());
@@ -546,7 +551,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     uint64_t native = 0;
     for (auto& g : Cap.pcs) if (g.first == p.first) { native = g.second; break; }
     j.elem_obj().kv("guest_offset", p.first).kv("entry_native_offset", native).kv("body_native_offset", p.second)
-     .kv("note", "[entry, body) is FEX's entry prologue (stores block header pointer, interrupt check)").end_obj();
+     .kv("note", "[entry, body) is the entry prologue (slice1: the stop `bl` to the pad)").end_obj();
   }
   j.end_arr();
   j.kv("spill_bytes", Cap.spill_bytes); // the entry prologue subtracts this from sp; ResetStack restores it
@@ -576,8 +581,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
   OFF("rip", State.rip); OFF("gregs", State.gregs); OFF("xmm", State.xmm); OFF("flags", State.flags); OFF("pf_raw", State.pf_raw);
   OFF("af_raw", State.af_raw); OFF("mxcsr", State.mxcsr); OFF("fs_cached", State.fs_cached); OFF("gs_cached", State.gs_cached);
   OFF("pointers", Pointers); OFF("exit_function_linker", Pointers.ExitFunctionLinker); OFF("dispatcher_loop_top", Pointers.DispatcherLoopTop);
-  if (slice1) j.kv("natemu_pre_nzcv", uint64_t(offsetof(Core::CpuStateFrame, State.flags) + X86State::RFLAG_NZCV_LOC)); // State.flags[RFLAG_NZCV_LOC]: incoming NZCV for nzcv=frame sites
-  if (slice1) j.kv("natemu_interrupt_fault_page", uint64_t(offsetof(Core::InternalThreadState, InterruptFaultPage) - offsetof(Core::InternalThreadState, BaseFrameState))); // the block prologue's `str xzr,[x28,#this]` (the runtime's stop page)
+  if (slice1) j.kv("natemu_pre_nzcv_register", 25); // x25: incoming NZCV for nzcv=saved sites (`mrs x25, nzcv` at the instruction start)
   j.end_obj();
   // External references that are not relocations: helper/dispatch pointers loaded from the state frame.
   j.arr("state_pointer_loads");
@@ -684,7 +688,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
         s.kind == FEXC_SITE_SWAP) { j.sep(); j.s += std::to_string(s.data_reg[1]); }
     j.end_arr();
     j.kv("data_class", s.data_class ? "fpr" : "gpr").kv("writeback", WritebackName[s.writeback]).kv("writeback_delta", int(s.writeback_delta))
-     .kv("ordering", OrderingName[s.ordering]).kv("nzcv", s.nzcv ? "frame" : "pstate").kv("cf_inverted", bool(s.cf_inverted))
+     .kv("ordering", OrderingName[s.ordering]).kv("nzcv", s.nzcv ? "saved" : "pstate").kv("cf_inverted", bool(s.cf_inverted))
      .kv("flags_written_before_site", bool(s.flags_written_before))
      .kv("completed_effects", s.completed_effects ? "unverified" : "none").kv("located", bool(s.located));
     if (slice1) {
@@ -702,11 +706,11 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
   j.obj("recovery");
   j.kv("per_access", "present: sites[] (native offset, guest instruction, kind, width, intent, address registers and offset form, segment, writeback, data registers)");
   if (slice1) {
-    j.kv("flag_location_at_site", "nzcv=pstate (PSTATE) or nzcv=frame (32 bits at state_abi.state_offsets.natemu_pre_nzcv, saved at the instruction start), with cf_inverted at the guest instruction start");
+    j.kv("flag_location_at_site", "nzcv=pstate (PSTATE) or nzcv=saved (in register state_abi.state_offsets.natemu_pre_nzcv_register, saved at the instruction start), with cf_inverted at the guest instruction start");
     j.kv("guest_state_at_fault", "present (precision patches 2-5): at each site with completed_effects=none, static registers, PF/AF and NZCV (per nzcv) hold the state before the site's guest instruction; checked on the code by verify_precision.py. Guard sites (brk stubs): the address guard before every non-RIP-relative access (#GP(0), #SS(0) for segment=ss) and the check of every indirect branch target (base_reg = target register, #GP(0)); split sites: a store wider than 1 byte (read-modify-write included) crossing a 4 KiB page (the runtime completes it all-or-nothing and resumes after access_native_offset). Same state at a stub as at its access; checked by verify_precision.py");
     j.kv("committed_effects", "completed_effects=none per site (unverified if the recorder saw an earlier store site or an unsaved NZCV write in the instruction)");
   } else {
-    j.kv("flag_location_at_site", "nzcv=pstate with cf_inverted at the guest instruction start, plus flags_written_before_site; the frame copy (nzcv=frame) is absent until the precision patches");
+    j.kv("flag_location_at_site", "nzcv=pstate with cf_inverted at the guest instruction start, plus flags_written_before_site; the saved copy (nzcv=saved) is absent until the precision patches");
     j.kv("guest_state_at_fault", "absent: not guaranteed (no precision patches yet: flag elimination, static-register hoisting, push/pop fusion and the address guard are unmodified)");
     j.kv("committed_effects", "unverified: completed_effects=unverified on every site");
   }
@@ -732,7 +736,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     auto pad = [&](size_t a) { while (f.size() % a) f.push_back(0); };
     auto push = [&](uint64_t v, int n) { for (int i = 0; i < n; ++i) f.push_back(uint8_t(v >> (8 * i))); };
     memcpy(f.data(), "NFXOBJ\0\x01", 8);
-    put(8, 3, 4); put(12, 128, 4); put(20, bitness, 4); put(24, rip, 8);
+    put(8, 4, 4); put(12, 128, 4); put(20, bitness, 4); put(24, rip, 8);
     put(32, Cap.info.TotalLength, 4); put(36, Cap.info.TotalInstructions, 4);
     put(40, f.size(), 4); put(44, code.size(), 4);
     put(48, Cap.prologues[0].second, 4); put(52, marker == UINT64_MAX ? 0xFFFFFFFFull : marker, 4);
@@ -754,7 +758,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
       push(p.second, 4); push(p.first, 4); push(cf < 0 ? 2 : cf, 1); push(0, 3);
     }
     pad(8);
-    put(80, f.size(), 4); put(84, Cap.relocs.size(), 4);
+    put(80, f.size(), 4); put(84, Cap.relocs.size() + Cap.dispatch_exits.size(), 4);
     for (auto& r : Cap.relocs) {
       using T = CPU::RelocationTypes;
       uint8_t kind = 255, reg = 0, size = 0; uint64_t value = 0;
@@ -766,6 +770,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
       }
       push(r.Header.Offset, 4); push(kind, 1); push(reg, 1); push(size, 1); push(0, 1); push(value, 8);
     }
+    for (auto o : Cap.dispatch_exits) { push(o, 4); push(4, 1); push(0, 1); push(0, 1); push(0, 1); push(0, 8); }   // dispatch_branch
     for (size_t i = 0; i < Cap.sra_gpr.size() && i < 20; ++i) f[88 + i] = Cap.sra_gpr[i];
     f[108] = uint8_t(Cap.sra_gpr.size());
     // Profile, end reason, settings and the feature profile (same values as the JSON `settings`, `guest.end` and `features`).
@@ -775,7 +780,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     uint64_t fbits = 0;   // bit i = FeatureTable() entry i = the i-th member of JSON features.host_features
     for (size_t i = 0; i < table.size() && i < 64; ++i) if (table[i].get(hf)) fbits |= 1ull << i;
     put(112, fbits, 8); f[120] = uint8_t(table.size()); f[121] = uint8_t(st.dcache_line_log2);
-    put(124, slice1 ? uint32_t(offsetof(Core::CpuStateFrame, State.flags) + X86State::RFLAG_NZCV_LOC) : 0xFFFFFFFFu, 4);   // = JSON natemu_pre_nzcv
+    put(124, slice1 ? 25u : 0xFFFFFFFFu, 4);   // = JSON natemu_pre_nzcv_register
     put(16, f.size(), 4);
     if (rep) rep->object = f; else std::ofstream(object, std::ios::binary).write(reinterpret_cast<const char*>(f.data()), std::streamsize(f.size()));
   }

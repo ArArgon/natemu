@@ -6,13 +6,12 @@
 RUNTIME defaults to target/aarch64-unknown-none/release/natemu-runtime (build it first). Disassembles it with
 `objdump -d -C` and fails (exit 1) on any violation of:
 
-Stack. Every resident entry starts on a known stack. The gates (exception vectors, stop gate, dispatcher slow path,
-linker) start on SP_EL1 at EXCEPTION_STACK_TOP: the only way back to generated code, `resume_exception`, resets SP_EL1
-to that top before its ERET (checked below), and generated code runs at EL1t on SP_EL0. The boot path (`_start`) runs on
-SP_EL0 from STACK_TOP until its first block entry. The division helpers run on generated code's SP_EL0 within
-HELPER_STACK_BYTES, of which FEX's call takes 16 for its `lr` push. `dispatch_fast` runs on generated code's SP_EL0
-with a budget of 0 bytes: it may not touch SP at all (its miss branches to `returned_allocated`, which selects SP_EL1
-before its first store, checked below). A function's frame is the sum of every SP decrement
+Stack. Every resident entry starts on a known stack. The gates (exception vectors, which take generated code's `svc`
+entries too, and the stop gate) start on SP_EL1 at EXCEPTION_STACK_TOP: the only way back to generated code,
+`resume_exception`, resets SP_EL1 to that top before its ERET (checked below), and generated code runs at EL1t on SP_EL0.
+The boot path (`_start`) runs on SP_EL0 from STACK_TOP until its first block entry. The dispatcher (`dispatch_template`,
+copied into the code area and run there by generated code at EL1t) has a budget of 0 bytes: it may not touch SP at all,
+nor load a literal (its miss is an `svc`). A function's frame is the sum of every SP decrement
 in it (`sub sp, sp, #N`, pre-indexed `[sp, #-N]!`), whether or not one path takes them all; its depth is its frame plus
 its deepest callee (`bl`, or a branch to another function's start: a tail call, counted at the full frame). Refused:
 recursion, an indirect call or branch in reachable code not listed in INDIRECT, an SP write that is neither a constant
@@ -34,25 +33,19 @@ import bisect, pathlib, re, subprocess, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT = ROOT / 'target/aarch64-unknown-none/release/natemu-runtime'
 
-GATES = ('vectors', 'stop_gate', 'returned_allocated', 'link_exit')
-SAVES = {'exception_capture': 1, 'stop_gate': 3, 'returned_allocated': 0, 'link_exit': 2}  # gate -> `finish` kind
-HELPERS = ('natemu_ludiv', 'natemu_ldiv')
-NO_STACK = ('dispatch_fast',)                    # SP_EL0 entries with a 0-byte budget
-FEX_CALL_PUSH = 16
+GATES = ('vectors', 'stop_gate')
+SAVES = {'exception_capture': 1, 'stop_gate': 3}  # gate -> `finish` kind
+NO_STACK = ('dispatch_template',)                 # run by generated code (EL1t, SP_EL0) with a 0-byte budget
 BOOT = '_start'
-# Indirect branches allowed in reachable code: (function, instruction) -> functions it reaches (none: it leaves the
-# resident for generated code, which re-enters only through a gate).
-INDIRECT = {('_start', 'br x9'): ['private_start'],      # boot: to the linked address of the next label
-            ('dispatch_fast', 'br x3'): []}               # L1 hit: enters a cached block (EL1t, SP_EL0)
+# Indirect branches allowed in reachable code: (function, instruction) -> functions it reaches.
+INDIRECT = {('_start', 'br x9'): ['private_start']}      # boot: to the linked address of the next label
 # Stack switches: function -> {(instruction, literal source)}. `msr spsel, #1` selects SP_EL1, at its top whenever
 # generated code runs.
 STACK_SWITCHES = {'private_start': {('mov sp, x9', 'EXCEPTION_STACK_TOP'), ('msr spsel, #0x0', None)},
                   'resume_exception': {('mov sp, x9', 'EXCEPTION_STACK_TOP')},
-                  'enter_allocated': {('msr spsel, #0x1', None)},
-                  'returned_allocated': {('msr spsel, #0x1', None)},
-                  'link_exit': {('msr spsel, #0x1', None)}}
+                  'enter_allocated': {('msr spsel, #0x1', None)}}
 R = 'natemu_runtime::execution::'
-ERET_CALLERS = {'enter_allocated', R + 'enter', R + 'access_aborted', R + 'split'}
+ERET_CALLERS = {'enter_allocated', R + 'enter', R + 'access_aborted', R + 'split', R + 'division'}
 LOAD = 'natemu_abi::guest_memory::copy_volatile'                 # `load()`, inlined: the record copy
 # A nested gate entry's path to its halt: the gate's chain, then the calls its last function makes before halting.
 NESTED = {'exception_capture': (['finish', R + 'returned', R + 'aborted'],
@@ -60,15 +53,14 @@ NESTED = {'exception_capture': (['finish', R + 'returned', R + 'aborted'],
           'stop_gate': (['finish', R + 'returned', R + 'stopped'],
                         [LOAD, 'natemu_runtime::cache::block_at', R + 'halt'])}
 # Declared shared bodies: a branch from the function into the target's body past its prologue, after an identical
-# prologue of its own (the unsigned division helper joins the signed one's loop): counts the target's depth without
-# its frame.
-SHARED_BODIES = {('natemu_ludiv', 'natemu_ldiv')}
+# prologue of its own: counts the target's depth without its frame.
+SHARED_BODIES = set()
 CALL_LIKE = re.compile(r'^(bl|b|b\.\w+|cbn?z|tbn?z)$')
 
 
 def constants(root=ROOT):
-    """{STACK_TOP, EXCEPTION_STACK_TOP} addresses, and the exception, boot and helper stack reservations, from the
-    abi and host sources."""
+    """{STACK_TOP, EXCEPTION_STACK_TOP} addresses, and the exception and boot stack reservations, from the abi and host
+    sources."""
     num = lambda s: int(s.replace('_', ''), 0)
     lib = (root / 'crates/abi/src/lib.rs').read_text()
     private = num(re.search(r'pub const PRIVATE: u64 = (0x[0-9a-f_]+);', lib)[1])
@@ -79,10 +71,9 @@ def constants(root=ROOT):
     exc = re.search(r'own\(\(EXCEPTION_STACK_TOP - PRIVATE\) as usize - (0x[0-9a-f_]+), (0x[0-9a-f_]+)\)', host)
     boot = re.search(r'own\(\(STACK_TOP - PRIVATE\) as usize - exec::STACK_BYTES, exec::STACK_BYTES\)', host)
     stack = re.search(r'pub const STACK_BYTES: usize = (0x[0-9a-f_]+);', abi)
-    helper = re.search(r'pub const HELPER_STACK_BYTES: u32 = (\d+);', abi)
-    if not (exc and boot and stack and helper and exc[1] == exc[2]):
+    if not (exc and boot and stack and exc[1] == exc[2]):
         raise SystemExit('stack reservations not found in the host/abi sources: update check_resident_stack.py')
-    return tops, num(exc[1]), num(stack[1]), int(helper[1])
+    return tops, num(exc[1]), num(stack[1])
 
 
 def parse(text):
@@ -231,11 +222,9 @@ def eret_problems(funcs, words, tops):
              ['str x30, [sp, #0xf0]'] + [f'stp q{2 * i}, q{2 * i + 1}, [sp, {o(256 + 32 * i)}]' for i in range(16)] +
              ['mrs x9, fpcr', 'str x9, [sp, #0x308]', 'mrs x9, fpsr', 'str x9, [sp, #0x310]', 'str xzr, [sp, #0x318]'])
     for gate, kind in SAVES.items():
-        # The dispatcher's slow path and the linker are branched to from generated code (EL1t): they select SP_EL1 and
-        # read NZCV directly; the capture and stop gates are exception entries: NZCV from SPSR.
-        sel = ['msr spsel, #0x1'] if kind in (0, 2) else []
-        flags = ['mrs x9, nzcv'] if kind in (0, 2) else ['mrs x9, spsr_el1', 'and x9, x9, #0xf0000000']
-        want = (sel + ['sub sp, sp, #0x320'] + saves + ['mrs x9, sp_el0', 'str x9, [sp, #0xf8]'] + flags +
+        # Both gates are exception entries (on SP_EL1): NZCV from SPSR.
+        flags = ['mrs x9, spsr_el1', 'and x9, x9, #0xf0000000']
+        want = (['sub sp, sp, #0x320'] + saves + ['mrs x9, sp_el0', 'str x9, [sp, #0xf8]'] + flags +
                 ['str x9, [sp, #0x300]', 'mov x0, sp', f'mov x1, #{kind:#x}', 'bl FINISH', 'b SELF'])
         got = [re.sub(r'^bl 0x[0-9a-f]+ <finish>$', 'bl FINISH',
                       re.sub(rf'^b 0x[0-9a-f]+ <{gate}\+0x[0-9a-f]+>$', 'b SELF', i)) for _, i in funcs.get(gate, [])]
@@ -251,7 +240,7 @@ def eret_problems(funcs, words, tops):
 
 def check(text, root=ROOT):
     """(report lines, problems) for an `objdump -d -C --no-show-raw-insn` listing of the runtime."""
-    tops, reserve, boot_reserve, helper_reserve = constants(root)
+    tops, reserve, boot_reserve = constants(root)
     funcs, words = parse(text)
     info = analyse(funcs, words, tops)
     lines, problems, worst = [], [], 0
@@ -271,17 +260,11 @@ def check(text, root=ROOT):
     lines.append(f'boot: {d} of {boot_reserve} bytes (SP_EL0): {render(path)}')
     if d > boot_reserve:
         problems.append(f'boot stack: {d} exceeds the reserve {boot_reserve}')
-    for helper in HELPERS:
-        d, path, p = depth(info, helper)
-        problems += p
-        lines.append(f'{helper}: {d} + {FEX_CALL_PUSH} (FEX lr push) of {helper_reserve} bytes (SP_EL0)')
-        if d + FEX_CALL_PUSH > helper_reserve:
-            problems.append(f'{helper}: {d} + {FEX_CALL_PUSH} exceeds HELPER_STACK_BYTES {helper_reserve}')
     for entry in NO_STACK:
-        uses = [i for _, i in funcs.get(entry, []) if re.search(r'\bsp\b', i)]
-        lines.append(f'{entry}: {len(uses)} SP uses, budget 0 (SP_EL0)')
+        uses = [i for _, i in funcs.get(entry, []) if re.search(r'\bsp\b', i) or re.match(r'ldr\w* \w+, 0x', i)]
+        lines.append(f'{entry}: {len(uses)} SP uses or literal loads, budget 0 (SP_EL0)')
         if uses or entry not in funcs:
-            problems.append(f'{entry}: uses the stack ({uses}) or is missing; its budget is 0')
+            problems.append(f'{entry}: uses the stack or a literal ({uses}) or is missing; its budget is 0')
     problems += eret_problems(funcs, words, tops)
     return lines, list(dict.fromkeys(problems))
 

@@ -85,6 +85,11 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
     for (auto i : FexcPendingFused) fexc_sites[i].guest_offset2 = FexcGuest;
     FexcPendingFused.clear();
     fexc_insns.push_back({FexcGuest, Begin, FexcCf});
+    if (fexc_slice1 && fexc_pre_nzcv.count(Op->GuestEntryOffset)) {
+      static_assert(FexcPrecision::PreNzcvReg == 25);
+      mrs(ARMEmitter::XReg::x25, ARMEmitter::SystemRegister::NZCV);   // the incoming NZCV (patch 5)
+      FexcNzcvSaved = true;
+    }
     return;
   }
 
@@ -95,7 +100,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
   S.index_reg = 0xff;
   S.cf_inverted = FexcCf;
   S.flags_written_before = FexcNzcvWritten;
-  // Profile slice1 (precision patches): the incoming NZCV is in the frame if the instruction saved it (patch 5), and the
+  // Profile slice1 (precision patches): the incoming NZCV is in x25 if the instruction saved it (patch 5), and the
   // site is precise unless the recorder sees an earlier store site or an unsaved NZCV write in the same instruction
   // (verify_precision.py checks the emitted code itself).
   S.nzcv = fexc_slice1 && FexcNzcvSaved;
@@ -192,8 +197,6 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
   default:
     Record = false;
     if (FexcIsNzcvWriter(Name) || (fexc_slice1 && IR::ImplicitFlagClobber(IROp->Op))) FexcNzcvWritten = true;
-    if (fexc_slice1 && IROp->Op == IROps::OP_STORECONTEXT && IROp->C<IR::IROp_StoreContext>()->Offset == FexcPrecision::PreNzcvOffset &&
-        !FexcNzcvWritten) FexcNzcvSaved = true;
     if (FexcIsOtherMemoryOp(Name)) { S.kind = FEXC_SITE_OTHER; Record = true; }
     break;
   }
@@ -462,9 +465,16 @@ void Arm64JITCore::FexcDivCheck(const IR::IROp_Header* IROp) {
   }
 }
 
-// After FEX's call to its LUDIV/LDIV helper (64-bit div/idiv with a dividend that needs 128 bits): the resident helper
-// returns x2 != 0 for #DE (quotient does not fit 64 bits, or a zero divisor). It changes only x0-x3 and leaves NZCV
-// and every other register as they were, and FEX's call sequence restores lr and sp, so the state at the stub is still
+// A computed exit (its RIP already in x0) branches to the resident's dispatcher: a placeholder `b .` the resident
+// relocates when it places the block (its offset is exported as a `dispatch_branch` relocation).
+void Arm64JITCore::FexcDispatchExit() {
+  fexc_dispatch_exits.push_back(uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin));
+  dc32(0x14000000);
+}
+
+// After the resident's 128/64 division (`svc #FEXC_SVC_DIV_U/S`, which replaces FEX's LUDIV/LDIV helper call for a 64-bit
+// div/idiv whose dividend needs 128 bits): x2 != 0 reports #DE (quotient does not fit 64 bits, or a zero divisor). The
+// resident changes only x0-x2 and leaves NZCV and every other register as they were, so the state at the stub is still
 // the state before the instruction (no write to the destination registers has happened yet).
 void Arm64JITCore::FexcDivAfterCall() {
   cbnz_OrRestart(ARMEmitter::Size::i64Bit, TMP3, FexcStub(FEXC_SITE_DIVIDE, false));

@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """S1b1 check: the slice-1 precision guarantee, verified statically on the code fexc emits (profile slice1).
 
-usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series10 build)
+usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series11 build)
 
 Corpora: fixtures/slice1/programs.json, the single-instruction matrix of scan_skips.py, the adversarial programs below
 (one per precision patch), and every CORPUS.json given (gen_slice1.py format, e.g. a fresh `--seed` corpus).
 
 For every compile, from the disassembly, the sites, the dense PC table and the static register (SRA) map:
   P1  between the native start of a site's guest instruction (its PC-table entry) and the site, no instruction writes a
-      guest static register (the SRA map: 16 GPRs, PF x26, AF x27, the xmm registers), or stores to guest memory, or
-      stores to the x28 frame other than the pre-NZCV save; the window holds no other guest instruction's entry;
-  P2  no NZCV write in that window unless the site says nzcv=frame, and then `mrs xT, nzcv; str wT, [x28, #natemu_pre_nzcv]`
-      comes first in the window, before any NZCV write;
+      guest static register (the SRA map: 16 GPRs, PF x26, AF x27, the xmm registers), or stores to memory (the x28
+      frame included); the window holds no other guest instruction's entry;
+  P2  no NZCV write in that window unless the site says nzcv=saved, and then the pre-NZCV save `mrs x25, nzcv`
+      (state_offsets.natemu_pre_nzcv_register) is the window's first word, and nothing else in the window writes x25;
   P3  a load site's destination is not a static register (DDI0487 D1.4.1.4: UNKNOWN after an abort). The destinations are
       read from the disassembled instruction at the site (every transfer register of an ld*, GPR or FP), not from fexc's
       data_regs; a writeback base (push/pop on RSP) is allowed, the access itself is its only write;
@@ -36,17 +36,16 @@ For every compile, from the disassembly, the sites, the dense PC table and the s
   P11 (S1f, see divides()): every div/idiv (width and signedness from its x86 bytes) has exactly its #DE checks in
       their exact per-width form (DIV_FORMS: opcodes, extends, bitfield positions and scratch registers pinned; the far
       form `inverse test; b stub` accepted), the zero check directly before the overflow check, all before FEX's own
-      divide (or its helper call), reading that divide's divisor (directly or through FEX's x1 copy), at 8 bits its
-      dividend, and passing the same divisor to the helper in x2, unchanged in between; every divide stub is one of
-      these checks; every `blr` is FEX's call of the resident 128/64 helper (`ldr x3, [x28, #LUDIVHandler|LDIVHandler]`
-      for div|idiv; `str x30, [sp, #-16]!; blr x3; ldr x30, [sp], #16`) followed by `cbnz x2` to a divide stub. P1/P2 at
-      each divide branch then give the state before the instruction, relying on the helper's contract (only x0-x3
-      change; NZCV kept; the runtime's natemu_ludiv). Admission (crates/host/src/admission/structure.rs) checks the
+      divide (or its 128/64 division `svc`), reading that divide's divisor (directly or through FEX's x1 copy), at 8 bits
+      its dividend, and passing the same divisor to the resident in x2, unchanged in between; every divide stub is one of
+      these checks; every division `svc` (`svc #3` for div, `svc #4` for idiv) is followed by `cbnz x2` to a divide stub.
+      P1/P2 at each divide branch then give the state before the instruction, relying on the resident's contract (only
+      x0-x2 change; NZCV kept; the runtime's `division`). Admission (crates/host/src/admission/structure.rs) checks the
       same forms on every block it admits.
-  P12 (S2c0, see entry_and_branches()): the entry prologue is exactly `adr x0, header; str x0, [x28]; str xzr, [x28,
-      #natemu_interrupt_fault_page]` followed by the first guest instruction (no spill, no TF check): the runtime stops a vCPU at
-      the next block entry by protecting the page that store targets, and the state there is the entry state. No other
-      access to those 8 bytes anywhere in the block;
+  P12 (E1, see entry_and_branches()): the entry prologue is exactly the stop check's placeholder `bl .` followed by the
+      first guest instruction (no spill, no TF check): the resident relocates it to the vCPU's stop pad, and a kick takes
+      execute permission from the pad, so the state at the stop is the entry state. No other `bl`, `blr`, `br` or `ret`
+      in the block, no x28 frame access, no sp access and no literal load (the code touches no emulator data);
   P13 (S2c0): every branch in the block goes forward to an instruction of the code region, so a block never loops
       internally: a jcc back to its own entry exits through the gate like any taken edge (no multiblock, no self-loop).
 Assumption by construction, NOT checked: every static-register write of guest instruction k-1 is emitted before the PC-table
@@ -71,7 +70,7 @@ import check_sites, scan_skips  # noqa: E402
 from check_sites import code_vs_sites  # noqa: E402
 import flags as F  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series10/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series11/obj/fexc')
 
 NZCV_WRITERS = {'adds', 'adcs', 'subs', 'sbcs', 'ands', 'bics', 'negs', 'ngcs', 'cmp', 'cmn', 'tst', 'ccmp', 'ccmn', 'fcmp',
                 'fcmpe', 'fccmp', 'fccmpe', 'setf8', 'setf16', 'rmif', 'cfinv', 'axflag', 'xaflag'}
@@ -82,7 +81,7 @@ DATA = {'mov', 'movk', 'movz', 'movn', 'add', 'sub', 'and', 'orr', 'eor', 'bic',
         'lsrv', 'asrv', 'rorv', 'mul', 'madd', 'msub', 'mneg', 'smulh', 'umulh', 'smull', 'umull', 'smaddl', 'umaddl', 'sdiv', 'udiv',
         'csel', 'csinc', 'csinv', 'csneg', 'cset', 'csetm', 'cinc', 'cinv', 'cneg', 'sxtb', 'sxth', 'sxtw', 'uxtb', 'uxth', 'ubfx',
         'sbfx', 'ubfiz', 'sbfiz', 'bfi', 'bfxil', 'bfc', 'bfm', 'ubfm', 'sbfm', 'extr', 'rev', 'rev16', 'rev32', 'rbit', 'clz', 'cls',
-        'adc', 'sbc', 'neg', 'ngc', 'mvn', 'mrs', 'adr', 'adrp', 'bl', 'blr', 'cnt', 'fmov', 'uaddlv'} | NZCV_WRITERS | PAIR_LOADS
+        'adc', 'sbc', 'neg', 'ngc', 'mvn', 'mrs', 'adr', 'adrp', 'bl', 'blr', 'cnt', 'fmov', 'uaddlv', 'svc'} | NZCV_WRITERS | PAIR_LOADS
 
 
 def reg(tok):
@@ -109,6 +108,8 @@ def effects(text):
         dests |= {reg(toks[0]), reg(toks[1])}
     elif mn in ('bl', 'blr'):
         dests.add(('x', 30))
+    elif mn == 'svc':   # a division's (svc #3/#4): the resident changes x0-x2; a literal exit's never returns
+        dests |= {('x', 0), ('x', 1), ('x', 2)}
     elif mn not in NO_DEST and not mn.startswith('b.') and toks:
         dests.add(reg(toks[0]))
     if acc and acc[5] != 'none':
@@ -232,10 +233,11 @@ def guards(d, dis, order):
       P9  every guard/split site is a `brk #1`/`brk #2` word after the body, reached by exactly one branch, which is one of
           the checks above; the body falls into no stub; every brk is a stub site; a stub has its access's guest
           instruction and segment.
-      P10 every exit that stores a register to State.rip (indirect jmp/call/ret) is preceded in its guest instruction by
-          `eor x0, xT, xT, lsl #16; tbnz x0, #63, G`, G a guard with no access and base_reg T, and the stored register
-          holds T (mov copies followed); the P1/P2 window of that guard (instruction start to the tbnz) proves no state
-          write precedes it. Every exit with a literal RIP is canonical or the block's fall-through RIP."""
+      P10 every computed exit (indirect jmp/call/ret: `mov x0, xR` then the dispatch placeholder `b .` at a
+          dispatch_branch relocation) is preceded in its guest instruction by `eor x0, xT, xT, lsl #16; tbnz x0, #63, G`,
+          G a guard with no access and base_reg T, and R holds T (mov copies followed); the P1/P2 window of that guard
+          (instruction start to the tbnz) proves no state write precedes it. Every literal exit (a guest-RIP move into x0,
+          then `svc #1`) has a canonical RIP or the block's fall-through RIP."""
     out, check_at, ok = [], {}, set()
     cost = {'guard': 0, 'split': 0, 'branch': 0, 'stub': 0}
     sites = d['sites']
@@ -257,7 +259,7 @@ def guards(d, dis, order):
     if stubs:
         first = min(stubs)
         prev = max((o for o in order if o < first), default=None)
-        if prev is None or dis[prev].split()[0] not in ('br', 'b', 'udf'):
+        if prev is None or not (dis[prev].split()[0] in ('b', 'udf') or dis[prev] == 'svc #0x1'):   # an exit: dispatch or link
             out.append(f'the body falls into the first stub +{first}')
         if any(o > first and o not in stubs and not dis[o].startswith('udf') for o in order):
             out.append('code after the stubs')
@@ -366,32 +368,30 @@ def guards(d, dis, order):
         elif sp:
             out.append(f'{tag}: split stub on an access that is not a store wider than one byte')
 
-    # P10 indirect exits
-    rip_off = d['state_abi']['state_offsets']['rip']
+    # P10 exits
     starts = sorted((e['native_offset'], e['guest_offset']) for e in d['pc_table']['entries'])
     fall = (int(d['input']['rip'], 16) + d['guest']['bytes_translated']) & M64
-    lits = {r['offset']: int(r['guest_rip'], 16) for r in d['code']['relocations'] if r['kind'] == 'guest_rip_literal'}
-    for o in order:
-        m = re.fullmatch(rf'str x(\d+), \[x28, #{rip_off:#x}\]', dis[o])
-        if not m:
+    for r in d['code']['relocations']:
+        if r['kind'] == 'guest_rip_move' and r['register'] == 0:
+            v = int(r['guest_rip'], 16)
+            if not (canonical(v) or v == fall):
+                out.append(f'exit +{r["offset"]}: literal RIP {v:#x} is neither canonical nor the fall-through RIP')
+    for o in sorted(r['offset'] for r in d['code']['relocations'] if r['kind'] == 'dispatch_branch'):
+        m = re.fullmatch(r'mov x0, x(\d+)', dis.get(o - 4, ''))
+        if dis.get(o) != f'b {o:#x}' or not m:
+            out.append(f'exit +{o}: the dispatch branch is not `mov x0, xR; b .`')
             continue
         R = int(m[1])
-        if R == 0:
-            lm = re.fullmatch(r'ldr x0, 0x([0-9a-f]+)', dis.get(o - 4, ''))
-            v = lits.get(int(lm[1], 16)) if lm else None
-            if v is None or not (canonical(v) or v == fall):
-                out.append(f'exit +{o}: literal RIP {v} is neither canonical nor the fall-through RIP')
-            continue
         lo, g = max(e for e in starts if e[0] <= o)
         cand = [x for x in stubs.values() if x['kind'] == 'guard' and x['access_native_offset'] is None and x['guest_offset'] == g]
         good = False
         for x in cand:
             t, T = check_at.get(x['native_offset']), x['base_reg']
             c = cond(t, 63, x['native_offset'])
-            if c is None or not (lo <= c and t < o) or dis.get(c - 4) != f'eor x0, x{T}, x{T}, lsl #16':
+            if c is None or not (lo <= c and t < o - 4) or dis.get(c - 4) != f'eor x0, x{T}, x{T}, lsl #16':
                 continue
             alias = {T}   # registers holding the checked value
-            for q in (q for q in order if t < q < o):
+            for q in (q for q in order if t < q < o - 4):
                 mv = re.fullmatch(r'mov x(\d+), x(\d+)', dis[q])
                 copy = bool(mv) and int(mv[2]) in alias
                 alias -= {r_[1] for r_ in writes(dis[q]) if r_[0] == 'x'}
@@ -445,6 +445,7 @@ DIV_FORMS = {
                                rf'add x1, x{R.format("d")}, #0x1', r'orr x0, x0, x1'], r'cbz x0')},
 }
 DIV_WANT = {(False, 64): ['verdict', 'zero'], (True, 64): ['overflow', 'verdict', 'zero']}   # else: high | overflow+zero
+DIV_SVC = {'DIV': 'svc #0x3', 'IDIV': 'svc #0x4'}   # the resident's 128/64 division (execution::svc::DIV_U / DIV_S)
 SCRATCH = {0, 1, 2, 3, 28, 31}
 INVERSE = {'cbz': 'cbnz', 'cbnz': 'cbz', 'tbz': 'tbnz', 'tbnz': 'tbz'}
 
@@ -452,7 +453,6 @@ INVERSE = {'cbz': 'cbnz', 'cbnz': 'cbz', 'tbz': 'tbnz', 'tbnz': 'tbz'}
 def divides(d, dis, order, stubs, check_at):
     """P11 on one compile: (violations, the divide check branches)."""
     out, ok = [], set()
-    ptr = {p['state_offset']: p['pointer'] for p in d['state_abi']['state_pointer_loads']}
     gi = {i['offset']: i for i in d['guest']['instructions'] if i['translated']}
     names = {g: i['name'] for g, i in gi.items()}
     starts = sorted((e['native_offset'], e['guest_offset']) for e in d['pc_table']['entries'])
@@ -477,8 +477,8 @@ def divides(d, dis, order, stubs, check_at):
 
     def form(sw, c, cond):
         """(kind, first word, registers) of the exact #DE check whose conditional test is at c, else None."""
-        if cond == 'cbnz x2' and dis.get(c - 8) == 'blr x3':
-            return 'verdict', c - 20, {}
+        if cond == 'cbnz x2' and dis.get(c - 4) in DIV_SVC.values():
+            return 'verdict', c - 8, {}
         for kind, (words, test) in DIV_FORMS.get(sw, {}).items():
             regs = {}
             seq = [(c - 4 * (len(words) - k), w) for k, w in enumerate(words)] + [(c, test)]
@@ -507,16 +507,14 @@ def divides(d, dis, order, stubs, check_at):
             continue
         ok.add(t)
         checks.setdefault(g, []).append((f[0], f[1], t, f[2]))
-    for o in (o for o in order if dis[o].startswith(('blr', 'bl '))):
+    for o in (o for o in order if dis[o].startswith('svc') and dis[o] != 'svc #0x1'):
         g, lo, hi = insn_at(o)
-        want = {'DIV': 'LUDIVHandler', 'IDIV': 'LDIVHandler'}.get(names.get(g))
-        m = re.fullmatch(r'ldr x3, \[x28, #(0x[0-9a-f]+)\]', dis.get(o - 8, ''))
-        nxt = dis.get(o + 8, '')
+        want = DIV_SVC.get(names.get(g))
+        nxt = dis.get(o + 4, '')
         cb = re.fullmatch(r'cbnz x2, 0x([0-9a-f]+)', nxt) or re.fullmatch(r'cbz x2, 0x([0-9a-f]+)', nxt)
-        stub = int(dis.get(o + 12, 'b 0x0').split()[-1], 16) if cb and nxt.startswith('cbz') else int(cb[1], 16) if cb else None
-        if not (want and dis[o] == 'blr x3' and m and ptr.get(int(m[1], 16)) == want and dis.get(o - 4) == 'str x30, [sp, #-0x10]!'
-                and dis.get(o + 4) == 'ldr x30, [sp], #0x10' and stub in divs and check_at.get(stub) in (o + 8, o + 12) and lo <= o < hi):
-            out.append(f'call +{o} "{dis[o]}" (guest +{g}) is not the 128/64 helper call of a div/idiv followed by its #DE check')
+        stub = int(dis.get(o + 8, 'b 0x0').split()[-1], 16) if cb and nxt.startswith('cbz') else int(cb[1], 16) if cb else None
+        if not (want and dis[o] == want and stub in divs and check_at.get(stub) in (o + 4, o + 8) and lo <= o < hi):
+            out.append(f'svc +{o} "{dis[o]}" (guest +{g}) is not the 128/64 division of a div/idiv followed by its #DE check')
     for g, name in names.items():
         if name not in ('DIV', 'IDIV'):
             continue
@@ -532,13 +530,13 @@ def divides(d, dis, order, stubs, check_at):
         by = {k: (s, t, r) for k, s, t, r in mine}
         if 'overflow' in by and (by['overflow'][0] != by['zero'][1] + 4 or by['overflow'][2].get('d', by['zero'][2]['d']) != by['zero'][2]['d']):
             out.append(f'{name} at guest +{g}: the overflow check does not directly follow its zero check')
-        # FEX's divide: the helper call or a udiv/sdiv into another register than the checks' x0; all checks but the
-        # helper's verdict come first, and they read its operands.
+        # FEX's divide: the division svc or a udiv/sdiv into another register than the checks' x0; all checks but the
+        # svc's verdict come first, and they read its operands.
         def fex_div(o):
             mn, _, ops = dis[o].partition(' ')
             return mn in ('udiv', 'sdiv') and not ops.startswith(('w0,', 'x0,'))
-        fex = [o for o in order if lo <= o < hi and (dis[o] == 'blr x3' or fex_div(o))]
-        inline = [o for o in fex if dis[o] != 'blr x3']
+        fex = [o for o in order if lo <= o < hi and (dis[o] in DIV_SVC.values() or fex_div(o))]
+        inline = [o for o in fex if dis[o] not in DIV_SVC.values()]
         if not fex or not inline or any(t >= fex[0] for k, s, t, r in mine if k != 'verdict'):
             out.append(f'{name} at guest +{g}: no #DE check before its divide (+{fex[0] if fex else None})')
             continue
@@ -582,25 +580,24 @@ def divides(d, dis, order, stubs, check_at):
 def entry_and_branches(d, dis, order):
     """P12 and P13 on one compile."""
     out = []
-    stop = d['state_abi']['state_offsets'].get('natemu_interrupt_fault_page')
-    if stop is None:
-        return ['state_abi has no natemu_interrupt_fault_page']
-    want = {4: lambda t: re.fullmatch(r'adr x0, 0x[0-9a-f]+', t) is not None, 8: lambda t: t == 'str x0, [x28]',
-            12: lambda t: t == f'str xzr, [x28, #{stop:#x}]'}
-    for off, ok in want.items():
-        if not ok(dis.get(off, '')):
-            out.append(f'prologue +{off}: "{dis.get(off)}" is not the pinned entry sequence (stop store at {stop})')
+    if dis.get(4) != 'bl 0x4':
+        out.append(f'prologue +4: "{dis.get(4)}" is not the pinned entry sequence (the stop check `bl .`)')
     le = d['code']['layout']['entries'][0]
-    if (le['entry_native_offset'], le['body_native_offset']) != (4, 16) or d['code']['layout']['spill_bytes']:
-        out.append(f'entry prologue is [{le["entry_native_offset"]}, {le["body_native_offset"]}) with {d["code"]["layout"]["spill_bytes"]} spill bytes, not [4, 16) (spill or TF check in the prologue)')
+    if (le['entry_native_offset'], le['body_native_offset']) != (4, 8) or d['code']['layout']['spill_bytes']:
+        out.append(f'entry prologue is [{le["entry_native_offset"]}, {le["body_native_offset"]}) with {d["code"]["layout"]["spill_bytes"]} spill bytes, not [4, 8) (spill or TF check in the prologue)')
     for off in order:
         acc = check_sites.native_access(dis[off])
-        if acc and acc[2] == 'x28' and acc[4] < stop + 8 and stop < acc[4] + acc[1] and off != 12:
-            out.append(f'+{off} "{dis[off]}" touches the interrupt-fault word')
         mn = dis[off].split(' ')[0]
+        if acc and acc[2] in ('x28', 'sp'):
+            out.append(f'+{off} "{dis[off]}" accesses emulator data ({acc[2]})')
+        if re.fullmatch(r'ldr\w* \w+, 0x[0-9a-f]+', dis[off]):
+            out.append(f'+{off} "{dis[off]}" is a literal load')
+        if mn in ('blr', 'br', 'ret') or (mn == 'bl' and off != 4):
+            out.append(f'+{off} "{dis[off]}" is a call, return or indirect branch')
         if mn in ('b', 'cbz', 'cbnz', 'tbz', 'tbnz') or mn.startswith('b.'):
             t = int(re.findall(r'0x([0-9a-f]+)$', dis[off])[0], 16)
-            if t <= off or t not in dis:
+            dispatch = mn == 'b' and t == off and any(r['kind'] == 'dispatch_branch' and r['offset'] == off for r in d['code']['relocations'])
+            if (t <= off or t not in dis) and not dispatch:
                 out.append(f'+{off} "{dis[off]}" is not a forward branch to an instruction of the block')
     return out
 
@@ -616,7 +613,7 @@ def verify(d, tmp, insns=None):
     sabi = d['state_abi']
     sra = {('x', n) for n in sabi['static_registers_gpr_order_rax_rcx_rdx_rbx_rsp_rbp_rsi_rdi_r8_to_r15_then_pf_af']}
     sra |= {('v', n) for n in sabi['static_registers_xmm0_up']}
-    pre = sabi['state_offsets'].get('natemu_pre_nzcv')
+    pre = sabi['state_offsets'].get('natemu_pre_nzcv_register')
     entries = [(e['native_offset'], e['guest_offset']) for e in d['pc_table']['entries']]
     name = lambda r: ('x%d' if r[0] == 'x' else 'v%d') % r[1]
     gout, check_at, cost_ = guards(d, dis, order)   # P8-P10; check_at: stub -> the branch that reaches it
@@ -640,31 +637,27 @@ def verify(d, tmp, insns=None):
             out.append(f'{tag}: completed_effects={s["completed_effects"]}')
         if s['kind'] in ('push_pair', 'pop_pair', 'other'):
             out.append(f'{tag}: kind {s["kind"]} (fused or undescribed access)')
-        saved, first_nzcv, mrs = None, None, {}
+        saved, first_nzcv = None, None
         for off in (o for o in order if start <= o < at):
             text = dis[off]
             mn, dests, nzcv, acc, known = effects(text)
             if not known:
                 out.append(f'{tag}: unclassified instruction +{off} "{text}"')
-            for r in dests:   # mrs = registers currently holding the NZCV read at the instruction start
-                mrs.pop(r, None)
-            if mn == 'mrs' and 'nzcv' in text.lower() and first_nzcv is None:
-                mrs.update({r: off for r in dests})
+            if off == start and pre is not None and text.lower() == f'mrs x{pre}, nzcv':
+                saved = off   # the pre-NZCV save, the window's first word
+            elif pre is not None and ('x', pre) in dests:
+                out.append(f'{tag}: +{off} "{text}" writes x{pre}, the pre-NZCV register, before the site')
             if nzcv and first_nzcv is None:
                 first_nzcv = off
             if acc and acc[0] == 'store':
-                if acc[2] == 'x28' and acc[4] == pre and acc[5] == 'none' and text.split()[1].startswith('w') and \
-                        reg(text.split()[1].rstrip(',')) in mrs and first_nzcv is None and saved is None:
-                    saved = off
-                elif acc[2] != 'sp':
-                    out.append(f'{tag}: store +{off} "{text}" before the site')
+                out.append(f'{tag}: store +{off} "{text}" before the site')
             bad = dests & sra
             if bad:
                 out.append(f'{tag}: +{off} "{text}" writes static register {",".join(sorted(map(name, bad)))} before the site')
-        if first_nzcv is not None and s['nzcv'] != 'frame':
+        if first_nzcv is not None and s['nzcv'] != 'saved':
             out.append(f'{tag}: NZCV written at +{first_nzcv} "{dis[first_nzcv]}" before the site, nzcv={s["nzcv"]}')
-        if s['nzcv'] == 'frame' and saved is None:
-            out.append(f'{tag}: nzcv=frame but no pre-NZCV save before the first NZCV write')
+        if s['nzcv'] == 'saved' and saved is None:
+            out.append(f'{tag}: nzcv=saved but no pre-NZCV save at the instruction start')
         acc = check_sites.native_access(dis.get(at, ''))   # P3 from the disassembly at the site, not from fexc's data_regs
         if acc and acc[0] == 'load' and s['kind'] not in STUBS:
             bad = loaded_regs(dis[at]) & sra

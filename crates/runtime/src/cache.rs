@@ -7,17 +7,17 @@
 //! page, the uncached single-step block in the slot, and this vCPU's side of the
 //! global area shared by all vCPUs: its bits in the code-page and writable masks,
 //! the invalidation records it posts to and drains, and its shadow-reset counter.
-//! Every global update is an atomic read-modify-write (SeqCst). The fast dispatcher
-//! (`gates.S` `dispatch_fast`) probes L1 directly.
+//! Every global update is an atomic read-modify-write (SeqCst). The code area's head
+//! holds the stop pad, the slot and the dispatcher (`gates.S` `dispatch_template`), which probes L1 directly.
 use super::*;
 use natemu_abi::code_object::{Header, Site};
 use core::mem::align_of;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering::SeqCst};
 use natemu_abi::execution::{
-    GUEST_PAGES, LinkPoint, MAX_LINK_POINTS, SLOT_BYTES, SLOT_VA, SLOT_WRITE_VA, STATE_VA, State,
-    cache::{self as area, Control, LinkRecord, Record},
+    ENTRY_OFFSET, GUEST_PAGES, LinkPoint, MAX_LINK_POINTS, STATE_VA, STOP_BL, State,
+    cache::{self as area, Control, LinkRecord, Record, SLOT, SLOT_BYTES, SLOT_VA, SLOT_WRITE_VA},
 };
-pub use natemu_abi::execution::cache::{Block, DEAD, FLUSH, MAX_VCPUS, PAGES, SHADOWS, STEP};
+pub use natemu_abi::execution::cache::{Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, FLUSH, MAX_VCPUS, PAD_VA, PAGES, SHADOWS, STEP};
 
 /// This vCPU's number (its state record's; checked below `MAX_VCPUS` at start).
 fn vcpu() -> usize {
@@ -42,9 +42,6 @@ fn lookup_area<T>(offset: usize) -> *mut T {
 }
 fn control() -> &'static mut Control {
     unsafe { &mut *lookup_area(area::CONTROL) }
-}
-fn l1(i: usize) -> *mut [u64; 2] {
-    lookup_area::<[u64; 2]>(area::L1).wrapping_add(i)
 }
 /// {guest RIP, block number + 1}; 0 marks an empty slot.
 fn l2(i: usize) -> *mut [u64; 2] {
@@ -102,18 +99,55 @@ fn hash(rip: u64, context: [u64; 2]) -> usize {
 /// Called with no generated code live and the state banked (links already undone, see [`unlink_all`]).
 pub fn reset() {
     let c = control();
-    (c.code_used, c.meta_used, c.blocks, c.links) = (0, 0, 0, 0);
+    (c.code_used, c.meta_used, c.blocks, c.links) = (area::HEAD_BYTES as u64, 0, 0, 0);
     clear_l1();
     unsafe { ptr::write_bytes(lookup_area::<u8>(area::L2), 0, area::L2_ENTRIES * 16) };
     for page in 0..GUEST_PAGES {
         mask(area::CODE_PAGES, page).fetch_and(!own(), SeqCst);
     }
 }
+/// Code-area offset of L1 entry `i`.
+fn l1_entry(i: usize) -> u64 {
+    (area::L1_CODE + i * area::L1_ENTRY_BYTES) as u64
+}
+/// The L1 entry at `at` for `rip`, entering code-area offset `entry`: `movz/movk x2, #rip; sub x2, x2, x0; cbnz x2,
+/// miss; b entry` (the dispatcher's miss), then `udf`.
+fn l1_words(at: u64, rip: u64, entry: u64) -> [u32; 8] {
+    let half = |k: u32| ((rip >> (16 * k)) & 0xffff) as u32;
+    let miss = area::DISPATCH_MISS as u64;
+    [
+        0xd280_0002 | half(0) << 5,
+        0xf2a0_0002 | half(1) << 5,
+        0xf2c0_0002 | half(2) << 5,
+        0xf2e0_0002 | half(3) << 5,
+        0xcb00_0042,
+        0xb500_0002 | ((miss.wrapping_sub(at + 20) >> 2) as u32 & 0x7_ffff) << 5,
+        branch(at + 24, entry),
+        0,
+    ]
+}
+/// Empties L1 entry `i` (its first word branches to the dispatcher's miss); the caller synchronizes the code.
+fn empty_l1(i: usize) {
+    let at = l1_entry(i);
+    unsafe { ((area::CODE_WRITE_VA + at) as *mut u32).write_volatile(branch(at, area::DISPATCH_MISS as u64)) };
+}
 fn clear_l1() {
     for i in 0..area::L1_ENTRIES {
-        // A RIP whose low bits are not `i` never matches slot `i`.
-        unsafe { l1(i).write([i as u64 ^ 1, 0]) };
+        empty_l1(i);
     }
+    let bytes = area::L1_ENTRIES * area::L1_ENTRY_BYTES;
+    synchronize_code(area::CODE_WRITE_VA + l1_entry(0), area::CODE_VA + l1_entry(0), bytes);
+}
+
+/// Fills the code area's head once, before any block runs: the stop pad's `ret` (the rest of its granule stays zero,
+/// `udf`) and the dispatcher's code.
+pub fn fill_head(dispatcher: &[u8]) {
+    unsafe {
+        ((area::CODE_WRITE_VA + area::PAD as u64) as *mut u32).write_volatile(0xd65f_03c0); // ret
+        copy_record((area::CODE_WRITE_VA + area::DISPATCH as u64) as *mut u8, dispatcher.as_ptr(), dispatcher.len());
+    }
+    synchronize_code(area::CODE_WRITE_VA + area::PAD as u64, PAD_VA, 4);
+    synchronize_code(area::CODE_WRITE_VA + area::DISPATCH as u64, area::DISPATCH_VA, dispatcher.len());
 }
 
 /// L1 is keyed by RIP alone, so it holds entries of one context: switching clears it.
@@ -125,7 +159,10 @@ pub fn select_l1(context: [u64; 2]) {
     }
 }
 pub fn fill_l1(rip: u64, block: &Block) {
-    unsafe { l1((rip & area::L1_MASK) as usize).write([rip, block.entry()]) };
+    let at = l1_entry((rip & area::L1_MASK) as usize);
+    let words = l1_words(at, rip, block.entry() - area::CODE_VA);
+    unsafe { copy_record((area::CODE_WRITE_VA + at) as *mut u8, words.as_ptr().cast(), size_of_val(&words)) };
+    synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, area::L1_ENTRY_BYTES);
 }
 
 /// The block cached for (`rip`, `context`).
@@ -145,14 +182,16 @@ pub fn lookup(rip: u64, context: [u64; 2]) -> Option<&'static Block> {
 }
 
 /// Places the admitted object at `object` (header `h`) for (`h.guest_rip`, `context`) with its guest-physical
-/// source pages and link points, and enters it in L2. `None` when the code area, the metadata arena or the block
-/// index is full (the caller flushes and places again).
+/// source pages and link points, relocates its stop `bl` and its computed exit's `b` (at `dispatch_exit`, 0 for none;
+/// the reply was checked to hold the placeholders there), and enters it in L2. `None` when the code area, the metadata arena or the
+/// block index is full (the caller flushes and places again).
 pub fn place(
     h: &Header,
     object: *const u8,
     context: [u64; 2],
     source_gpa: [u64; 2],
     links: [LinkPoint; MAX_LINK_POINTS],
+    dispatch_exit: u64,
 ) -> Option<&'static Block> {
     let c = control();
     let code = c.code_used.next_multiple_of(CODE_ALIGN);
@@ -180,6 +219,7 @@ pub fn place(
         at.write(record);
         copy_record(at.add(1).cast(), object.add(h.sites_offset as usize), sites);
         copy_record((area::CODE_WRITE_VA + code) as *mut u8, object.add(h.code_offset as usize), h.code_size as usize);
+        relocate(code, dispatch_exit);
         synchronize_code(area::CODE_WRITE_VA + code, area::CODE_VA + code, h.code_size as usize);
         let n = c.blocks as usize;
         index(n).write(meta as u32);
@@ -202,6 +242,7 @@ pub fn place_step(
     context: [u64; 2],
     source_gpa: [u64; 2],
     links: [LinkPoint; MAX_LINK_POINTS],
+    dispatch_exit: u64,
 ) -> Option<&'static Block> {
     let sites = size_of::<Site>() * h.sites_count as usize;
     if size_of::<Block>() + sites > area::STEP_RECORD_BYTES
@@ -215,7 +256,7 @@ pub fn place_step(
         rip: h.guest_rip,
         context,
         source_gpa,
-        code: 0,
+        code: SLOT as u32,
         code_size: h.code_size,
         sites_count: h.sites_count,
         guest_bytes: h.guest_bytes,
@@ -228,6 +269,7 @@ pub fn place_step(
         at.write(record);
         copy_record(at.add(1).cast(), object.add(h.sites_offset as usize), sites);
         copy_record(SLOT_WRITE_VA as *mut u8, object.add(h.code_offset as usize), h.code_size as usize);
+        relocate(SLOT as u64, dispatch_exit);
         synchronize_code(SLOT_WRITE_VA, SLOT_VA, h.code_size as usize);
         Some(&*at)
     }
@@ -267,20 +309,21 @@ fn rewrite(offset: u64, w: u32) {
 fn branch(from: u64, to: u64) -> u32 {
     0x1400_0000 | (to.wrapping_sub(from) >> 2) as u32 & 0x03ff_ffff
 }
-/// The link point's word is its admitted form, `ldr x0, L` with `L` holding its target.
-fn unlinked(b: &Block, p: &LinkPoint) -> bool {
-    let at = u64::from(b.code) + u64::from(p.offset);
-    let w = word(at);
-    let literal = at.wrapping_add((((w << 8) as i32 >> 13) as i64 * 4) as u64);
-    let inside = literal.wrapping_sub(u64::from(b.code)) <= u64::from(b.code_size).saturating_sub(8);
-    w & 0xff00_001f == 0x5800_0000
-        && inside
-        && unsafe { ((area::CODE_WRITE_VA + literal) as *const u64).read_unaligned() } == p.target
+/// Relocates the placeholders of the block just copied to code-area offset `code` (before its code is synchronized):
+/// its stop check becomes `bl` to the stop pad, its computed exit (at `dispatch_exit`, 0 for none) `b` to the
+/// dispatcher. (The placeholders were checked at the reply.)
+fn relocate(code: u64, dispatch_exit: u64) {
+    let write = |at: u64, w: u32| unsafe { ((area::CODE_WRITE_VA + at) as *mut u32).write_volatile(w) };
+    let at = code + u64::from(STOP_BL);
+    write(at, 0x8000_0000 | branch(at, area::PAD as u64)); // bl
+    if dispatch_exit != 0 {
+        let at = code + dispatch_exit;
+        write(at, branch(at, area::DISPATCH as u64));
+    }
 }
-
-/// The block whose `JITCodeHeader` is at `header`, the value its entry prologue stores in `InlineJITBlockHeader`.
-pub fn block_with_header(header: u64) -> Option<&'static Block> {
-    block_at(header).filter(|b| b.code_va() == header && b.flags & (DEAD | STEP) == 0)
+/// The link point's word is its admitted form (the first word of its RIP move).
+fn unlinked(b: &Block, p: &LinkPoint) -> bool {
+    word(u64::from(b.code) + u64::from(p.offset)) == p.word
 }
 
 pub enum Link {
@@ -299,7 +342,7 @@ pub fn link(source: &Block, target: &Block) -> Link {
     if source.context != target.context || points().next().is_none() {
         return Link::Bad;
     }
-    let entry = u64::from(target.code) + u64::from(natemu_abi::execution::ENTRY_OFFSET);
+    let entry = u64::from(target.code) + u64::from(ENTRY_OFFSET);
     let mut todo = 0;
     for p in points() {
         let at = u64::from(source.code) + u64::from(p.offset);
@@ -336,7 +379,7 @@ pub fn unlink_all() -> Option<u64> {
 fn unlink(r: LinkRecord) -> Option<()> {
     let (source, target) = (block(r.source as usize), block(r.target as usize));
     let at = u64::from(source.code) + u64::from(r.offset);
-    let entry = u64::from(target.code) + u64::from(natemu_abi::execution::ENTRY_OFFSET);
+    let entry = u64::from(target.code) + u64::from(ENTRY_OFFSET);
     (word(at) == branch(at, entry)).then(|| rewrite(at, r.original))
 }
 
@@ -409,9 +452,12 @@ fn kill(doomed: impl Fn(&Block) -> bool) -> Option<u64> {
             continue;
         }
         unsafe { (*block_ptr(n)).flags |= DEAD };
-        let slot = l1((b.rip & area::L1_MASK) as usize);
-        if unsafe { slot.read() } == [b.rip, b.entry()] {
-            unsafe { slot.write([(b.rip & area::L1_MASK) ^ 1, 0]) };
+        let i = (b.rip & area::L1_MASK) as usize;
+        let at = l1_entry(i);
+        let held = |k: usize| unsafe { ((area::CODE_WRITE_VA + at) as *const u32).add(k).read_volatile() };
+        if l1_words(at, b.rip, u64::from(b.code) + u64::from(ENTRY_OFFSET)).iter().enumerate().all(|(k, &w)| held(k) == w) {
+            empty_l1(i);
+            synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, 4);
         }
         let mut i = 0;
         while i < c.links {
@@ -436,11 +482,12 @@ pub fn links_restored() -> bool {
     })
 }
 
-/// The block whose code holds native address `pc` (the single-step block in the slot, or a cache block, dead ones too).
+/// The block whose code holds native address `pc` (the single-step block in the slot, or a cache block, dead ones too;
+/// never the head's pad or dispatcher).
 pub fn block_at(pc: u64) -> Option<&'static Block> {
     if let Some(offset) = pc.checked_sub(SLOT_VA).filter(|&o| o < SLOT_BYTES as u64) {
         let b = step_block();
-        return (offset < u64::from(b.code_size)).then_some(b);
+        return (b.flags & STEP != 0 && offset < u64::from(b.code_size)).then_some(b);
     }
     let offset = pc.checked_sub(area::CODE_VA)?;
     let count = control().blocks as usize;

@@ -1,6 +1,6 @@
 //! General block execution (slices 1 and 2): the vCPU's x86 architectural state bank,
 //! the record the resident and the host exchange per translation, the private layout
-//! of the execution mode (code cache included), and the FEX frame offsets admitted code may touch.
+//! of the execution mode (code cache included), and the resident entries generated code makes.
 //!
 //! Flow: blocks stay in the vCPU's resident code cache ([`cache`]). At a block
 //! exit the resident's dispatcher looks up the next RIP (L1, then L2); only a
@@ -20,42 +20,54 @@ use crate::{
 pub const MODE: u64 = 32;
 /// Resident → host: translate at `cpu.rip` (state record holds the request).
 pub const TRANSLATE_HVC: u64 = 0x4b;
-/// Resident → host: kick vCPU `x0` (see [`STOP_OFFSET`]); returns at once.
+/// Resident → host: kick vCPU `x0` (see [`cache::PAD`]); returns at once.
 pub const KICK_HVC: u64 = 0x4c;
+
+/// `svc` immediates of the resident entries made from generated code (fexc `FexcSvc`). Generated code touches no
+/// emulator data: these and the stop pad's `bl` are its only ways into the resident.
+pub mod svc {
+    /// A literal exit (a [`super::LinkPoint`]), its target RIP in x0: the linker.
+    pub const LINK: u16 = 1;
+    /// The dispatcher's L1 miss (resident code in the code area, [`super::cache::DISPATCH`]), the RIP in x0.
+    pub const MISS: u16 = 2;
+    /// 128/64 unsigned / signed division ([`super::divide`]): x0 high, x1 low, x2 divisor in; x0 quotient, x1
+    /// remainder, x2 = 1 for #DE (else 0) out. Nothing else changes.
+    pub const DIV_U: u16 = 3;
+    pub const DIV_S: u16 = 4;
+}
+/// The 128/64 division of [`svc::DIV_U`] / [`svc::DIV_S`] (FEX's LUDIV/LDIV helpers): the dividend `high:low`
+/// by `divisor`, as (quotient, remainder), or `None` for #DE (a zero divisor, or a quotient that does not fit 64
+/// bits, signed or unsigned). The signed remainder has the dividend's sign.
+pub fn divide(signed: bool, high: u64, low: u64, divisor: u64) -> Option<(u64, u64)> {
+    let n = (high as u128) << 64 | low as u128;
+    if signed {
+        let (n, d) = (n as i128, divisor as i64 as i128);
+        let q = n.checked_div(d)?;
+        i64::try_from(q).ok().map(|q| (q as u64, (n % d) as u64))
+    } else {
+        let d = divisor as u128;
+        (high < divisor).then(|| ((n / d) as u64, (n % d) as u64))
+    }
+}
+/// The register holding an `nzcv=saved` site's incoming NZCV (`mrs x25, nzcv` at its instruction's start; fexc
+/// `FexcPrecision::PreNzcvReg`, the object header's `pre_nzcv_register`).
+pub const PRE_NZCV_REG: u8 = 25;
 
 pub const STATE_OFFSET: usize = 0x22000;
 pub const STATE_VA: u64 = PRIVATE + STATE_OFFSET as u64;
-/// FEX `CpuStateFrame` (x28): private plumbing, never guest state.
+/// FEX `CpuStateFrame`: x28, FEX's guest-state base register, points here at every block entry. Admitted code accesses
+/// only its guest-state fields ([`frame::GUEST_STATE`]), none for the slice-1 instruction set.
 pub const FRAME_OFFSET: usize = 0x23000;
 pub const FRAME_VA: u64 = PRIVATE + FRAME_OFFSET as u64;
-/// x28 = the frame page + `FRAME_BIAS`: every admitted field ([`frame::FIELDS`], offsets up to 3040) stays in the frame
-/// page, and the block entry's stop store (`str xzr, [x28, #frame::INTERRUPT_FAULT_PAGE]`) lands alone in the next page,
-/// the stop page.
-pub const FRAME_BIAS: u64 = 0x400;
-pub const FRAME_POINTER: u64 = FRAME_VA + FRAME_BIAS;
-/// The stop page (precise stop, slice 3): the only page of the vCPU's stop region, `STOP_BYTES` of the window that
-/// hold nothing else, so one IPA granule (4 or 16 KiB, as HVF reports it) covers the stop page alone. To stop a running
-/// vCPU the host write-protects that granule (a kick): its next block entry takes a stage-2 fault at the stop store
-/// with the entry state intact, and the host enters the resident's stop gate.
-pub const STOP_OFFSET: usize = FRAME_OFFSET + 0x1000;
-pub const STOP_BYTES: usize = 0x4000;
-/// Native offset of a block's stop store (its third prologue word, after `adr x0, header; str x0, [x28]`).
-pub const STOP_STORE: u32 = ENTRY_OFFSET + 8;
-/// Code slot: executable alias at `SLOT_VA`, writable alias at `SLOT_WRITE_VA`.
-pub const SLOT_OFFSET: usize = 0x30000;
-pub const SLOT_BYTES: usize = 0x10000;
-pub const SLOT_VA: u64 = PRIVATE + SLOT_OFFSET as u64;
-pub const SLOT_WRITE_VA: u64 = PRIVATE + 0x40000;
+pub const FRAME_POINTER: u64 = FRAME_VA;
+/// Native offset of a block's stop check, `bl` to the stop pad ([`cache::PAD`]): its first word, the entry itself.
+pub const STOP_BL: u32 = ENTRY_OFFSET;
 /// Host-written admitted object (header, code, tables).
 pub const STAGING_OFFSET: usize = 0x70000;
 pub const STAGING_BYTES: usize = 0x20000;
 pub const STAGING_VA: u64 = PRIVATE + STAGING_OFFSET as u64;
-/// Native stack mapped below `crate::STACK_TOP` while code runs.
+/// Native stack mapped below `crate::STACK_TOP` while code runs (SP_EL0; admitted code never uses it).
 pub const STACK_BYTES: usize = 0x4000;
-/// Generated code's native stack (spill area below `crate::STACK_TOP`).
-pub const BLOCK_STACK_BYTES: u32 = 0x2000;
-/// Stack below the spill area a 128/64 division uses: FEX's `lr` push and the helper's saved registers.
-pub const HELPER_STACK_BYTES: u32 = 64;
 /// Guest-physical RAM `[0, GUEST_RAM_BYTES)`: backing offset and resident alias, mapped in 2 MiB blocks.
 pub const GUEST_RAM_OFFSET: usize = 2 * RAM_SIZE;
 pub const GUEST_RAM_BYTES: usize = 0x40_0000;
@@ -74,12 +86,44 @@ pub const GUEST_PAGES: usize = GUEST_RAM_BYTES / 4096;
 pub mod cache {
     use crate::PRIVATE;
     const MIB: usize = 1 << 20;
-    /// Code area: executable alias (blocks run here) and writable alias (the resident places them there).
+    /// Code area: executable alias (blocks run here) and writable alias (the resident places them there). It starts
+    /// with a head the resident fills ([`PAD`], [`SLOT`], [`DISPATCH`], [`L1_CODE`]); blocks follow from [`HEAD_BYTES`].
     pub const CODE_VA: u64 = PRIVATE + 0x1000_0000;
     pub const CODE_WRITE_VA: u64 = PRIVATE + 0x2000_0000;
+    /// Default capacity for blocks (after the head).
     pub const CODE_BYTES: usize = 16 * MIB;
-    /// Every block-to-block branch of a later linking step stays one `b` (±128 MiB).
+    /// The whole area, head included: every branch inside it (links, the stop `bl`, the dispatcher `b`) is one
+    /// `b`/`bl` (±128 MiB).
     pub const CODE_BYTES_MAX: usize = 128 * MIB;
+    /// The stop pad: a `ret` alone in the area's first 16 KiB (the largest IPA granule), so one stage-2 granule per vCPU
+    /// holds it and nothing else. Every block entry is `bl` to it; to stop a running vCPU the host removes execute
+    /// permission from that granule (a kick), so its next block entry takes a stage-2 instruction abort at the pad with
+    /// the entry state intact (x30, an allocator temporary, holds the `bl`'s return address), and the host enters the
+    /// resident's stop gate.
+    pub const PAD: usize = 0;
+    pub const PAD_BYTES: usize = 0x4000;
+    pub const PAD_VA: u64 = CODE_VA + PAD as u64;
+    /// The single-step slot: the uncached one-instruction block ([`STEP`]).
+    pub const SLOT: usize = 0x4000;
+    pub const SLOT_BYTES: usize = 0x10000;
+    pub const SLOT_VA: u64 = CODE_VA + SLOT as u64;
+    pub const SLOT_WRITE_VA: u64 = CODE_WRITE_VA + SLOT as u64;
+    /// The dispatcher, copied from the resident: computed exits branch here with the next RIP in x0 (each one's `b`
+    /// relocated at placement); it branches to the RIP's L1 entry ([`L1_CODE`]). Its `svc #MISS` at [`DISPATCH_MISS`]
+    /// enters the resident.
+    pub const DISPATCH: usize = SLOT + SLOT_BYTES;
+    pub const DISPATCH_BYTES: usize = 0x1000;
+    pub const DISPATCH_VA: u64 = CODE_VA + DISPATCH as u64;
+    pub const DISPATCH_MISS: usize = DISPATCH + 16;
+    /// L1 as code: direct-mapped entries of [`L1_ENTRY_BYTES`] indexed by `rip & L1_MASK` (FEX `L1Pointer/L1Mask`),
+    /// so the dispatcher reads no data. A filled entry is `movz/movk x2, #rip` (4 words); `sub x2, x2, x0`; `cbnz x2,
+    /// miss`; `b entry`; an empty one starts with `b miss`. Only the resident writes them.
+    pub const L1_CODE: usize = DISPATCH + DISPATCH_BYTES;
+    pub const L1_ENTRIES: usize = 4096;
+    pub const L1_MASK: u64 = L1_ENTRIES as u64 - 1;
+    pub const L1_ENTRY_BYTES: usize = 32;
+    /// Blocks are placed from here.
+    pub const HEAD_BYTES: usize = L1_CODE + L1_ENTRIES * L1_ENTRY_BYTES;
     /// The largest block admitted; the code area holds at least one.
     pub const MAX_BLOCK_BYTES: usize = 32 * 1024;
     pub const META_VA: u64 = PRIVATE + 0x3000_0000;
@@ -97,13 +141,8 @@ pub mod cache {
     pub const META_OFFSET: usize = GLOBAL_OFFSET + GLOBAL_BYTES;
     pub const CODE_OFFSET: usize = META_OFFSET + META_BYTES;
 
-    /// Lookup area layout: [`Control`], L1, L2, block index.
+    /// Lookup area layout: [`Control`], L2, block index (L1 is code, [`L1_CODE`]).
     pub const CONTROL: usize = 0;
-    /// L1: direct-mapped {guest RIP, host entry} pairs indexed by `rip & L1_MASK` (FEX `L1Pointer/L1Mask`).
-    /// An empty entry holds a RIP whose low bits differ from its index, so it never matches.
-    pub const L1: usize = 0x1_0000;
-    pub const L1_ENTRIES: usize = 4096;
-    pub const L1_MASK: u64 = L1_ENTRIES as u64 - 1;
     /// L2: open-addressed {guest RIP, block number + 1} table keyed by (RIP, context).
     pub const L2: usize = 0x2_0000;
     pub const L2_ENTRIES: usize = 1 << 16;
@@ -129,13 +168,14 @@ pub mod cache {
     /// vCPUs of one VM (bits of the mask bytes).
     pub const MAX_VCPUS: usize = 4;
 
-    /// Per-vCPU cache bookkeeping at [`CONTROL`]. The host sets `code_bytes` (the code area's capacity) at prepare;
-    /// the resident owns the rest.
+    /// Per-vCPU cache bookkeeping at [`CONTROL`]. The host sets `code_bytes` (the code area's size, head included) at
+    /// prepare; the resident owns the rest.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Control {
         pub code_bytes: u64,
-        /// Bump pointers of the code area and the metadata arena, and blocks placed since the last flush.
+        /// Bump pointers of the code area (from [`HEAD_BYTES`]) and the metadata arena, and blocks placed since the
+        /// last flush.
         pub code_used: u64,
         pub meta_used: u64,
         pub blocks: u64,
@@ -153,7 +193,8 @@ pub mod cache {
         pub context: [u64; 2],
         /// Guest-physical source pages (`u64::MAX` = unused).
         pub source_gpa: [u64; 2],
-        /// Offset of the FEX block (its 4-byte `JITCodeHeader` first) in the code area, and its size.
+        /// Offset of the FEX block (its 4-byte `JITCodeHeader` first) in the code area (the step block's: [`SLOT`]), and
+        /// its size.
         pub code: u32,
         pub code_size: u32,
         pub sites_count: u32,
@@ -168,19 +209,19 @@ pub mod cache {
     /// `Block::flags`: invalidated (a source page was written): out of L1 and L2, no link into or out of it, never run
     /// again; its space is reclaimed at the next flush.
     pub const DEAD: u32 = 1;
-    /// The uncached single-step block, in the slot (not in `INDEX`, L1 or L2; never linked; no source page marked).
+    /// The uncached single-step block, in the slot [`SLOT`] (not in `INDEX`, L1 or L2; never linked; no source page marked).
     pub const STEP: u32 = 2;
     impl Block {
-        /// Its `JITCodeHeader` in the executable alias (what its entry prologue stores in `InlineJITBlockHeader`).
+        /// Its `JITCodeHeader` in the executable alias.
         pub fn code_va(&self) -> u64 {
-            if self.flags & STEP != 0 { super::SLOT_VA } else { CODE_VA + u64::from(self.code) }
+            CODE_VA + u64::from(self.code)
         }
         pub fn entry(&self) -> u64 {
             self.code_va() + u64::from(super::ENTRY_OFFSET)
         }
     }
     /// A patched link point: the first word of link point `offset` of block `source` (block numbers) was `original`
-    /// (`ldr x0, L`) and is now `b` to the entry of block `target`.
+    /// (the first word of its RIP move) and is now `b` to the entry of block `target`.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct LinkRecord {
@@ -214,12 +255,12 @@ pub mod cache {
     const _: () = assert!(META_VA + META_BYTES as u64 <= LOOKUP_VA);
     const _: () = assert!(LOOKUP_VA + LOOKUP_BYTES as u64 <= GLOBAL_VA);
     const _: () = assert!(GLOBAL_VA + GLOBAL_BYTES as u64 <= PRIVATE + (1 << 30));
-    const _: () = assert!(CODE_BYTES <= CODE_BYTES_MAX && CODE_BYTES % BLOCK == 0);
-    const _: () = assert!(MAX_BLOCK_BYTES <= crate::execution::SLOT_BYTES);
+    const _: () = assert!(HEAD_BYTES + CODE_BYTES <= CODE_BYTES_MAX && CODE_BYTES % BLOCK == 0);
+    const _: () = assert!(MAX_BLOCK_BYTES <= SLOT_BYTES && PAD + PAD_BYTES <= SLOT && HEAD_BYTES % 64 == 0);
     const _: () = assert!((CODE_VA | CODE_WRITE_VA | META_VA | LOOKUP_VA | GLOBAL_VA) % BLOCK as u64 == 0);
     const _: () = assert!(CODE_OFFSET % BLOCK == 0 && META_BYTES % BLOCK == 0);
-    const _: () = assert!(core::mem::size_of::<Control>() <= L1);
-    const _: () = assert!(L1 + L1_ENTRIES * 16 <= L2 && L2 + L2_ENTRIES * 16 <= INDEX);
+    const _: () = assert!(core::mem::size_of::<Control>() <= L2 && L2 + L2_ENTRIES * 16 <= INDEX);
+    const _: () = assert!(L1_MASK == 0xfff && L1_ENTRY_BYTES == 32 && L1_CODE - DISPATCH < 1 << 20); // the dispatcher's form
     const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= LINKS);
     const _: () = assert!(LINKS + MAX_LINKS * core::mem::size_of::<LinkRecord>() <= STEP_RECORD);
     const _: () = assert!(STEP_RECORD + STEP_RECORD_BYTES <= LOOKUP_BYTES && STEP_RECORD % core::mem::align_of::<Block>() == 0);
@@ -235,57 +276,33 @@ pub const BACKING_BYTES: usize = cache::CODE_OFFSET;
 
 /// FEX `CpuStateFrame` fields admitted code may access (pinned FEX build).
 pub mod frame {
-    /// `InlineJITBlockHeader`: the entry prologue `adr x0, header; str x0, [x28]` stores the running block's address
-    /// (its only admitted access); the linker reads it to find the block whose literal exit it was called from.
-    pub const BLOCK_HEADER: u32 = 0;
-    /// `State.rip`: every exit stores the next guest RIP here.
-    pub const RIP: u32 = 24;
-    /// `CPUState.flags[RFLAG_NZCV_LOC]`: an instruction's incoming NZCV (`nzcv=frame` sites).
-    pub const PRE_NZCV: u32 = 1032;
-    /// `Pointers.DispatcherLoopTop`: the resident exit gate of computed exits (the fast dispatcher).
-    pub const DISPATCHER_LOOP_TOP: u32 = 2920;
-    /// `Pointers.ExitFunctionLinker`: the resident block linker, the gate of every literal exit (a link point).
-    pub const EXIT_FUNCTION_LINKER: u32 = 2952;
-    /// `Pointers.LUDIVHandler` / `LDIVHandler`: the resident 128/64 unsigned / signed division helpers a 64-bit
-    /// div / idiv calls when its dividend needs 128 bits (FEX's helper ABI, see the runtime's `natemu_ludiv`).
-    pub const LUDIV_HANDLER: u32 = 3024;
-    pub const LDIV_HANDLER: u32 = 3032;
-    /// Native pointers the resident fills; code may only load them.
-    pub const POINTERS: [u32; 4] = [DISPATCHER_LOOP_TOP, EXIT_FUNCTION_LINKER, LUDIV_HANDLER, LDIV_HANDLER];
-    /// `(offset, bytes)` of every admitted access.
-    pub const FIELDS: [(u32, u32); 7] = [
-        (BLOCK_HEADER, 8),
-        (RIP, 8),
-        (PRE_NZCV, 4),
-        (DISPATCHER_LOOP_TOP, 8),
-        (EXIT_FUNCTION_LINKER, 8),
-        (LUDIV_HANDLER, 8),
-        (LDIV_HANDLER, 8),
-    ];
-    /// FEX's `InterruptFaultPage` (`offsetof(InternalThreadState, InterruptFaultPage) - offsetof(.., BaseFrameState)`,
-    /// fexc's `state_abi.state_offsets.natemu_interrupt_fault_page`): the block entry's stop store `str xzr, [x28, #this]`.
-    /// The runtime stops a vCPU by write-protecting the region holding these 8 bytes. Not a member of [`FIELDS`]:
-    /// admission allows that one store and no other access.
-    pub const INTERRUPT_FAULT_PAGE: u32 = 3776;
+    /// Guest-state fields `(offset, bytes)` FEX keeps in its frame that admitted code may access: none yet (the slice-1
+    /// instruction set keeps all guest state in registers; DF, FS/GS bases, MXCSR, x87 and AVX state await their
+    /// design). Every other x28 access is refused.
+    pub const GUEST_STATE: [(u32, u32); 0] = [];
     pub const BYTES: usize = 4096;
 }
 /// Native offset of a FEX block's entry: after its 4-byte `JITCodeHeader`.
 pub const ENTRY_OFFSET: u32 = 4;
 
-/// A literal exit of an admitted block, exactly `ldr x0, L; str x0, [x28, #RIP]; ldr x1, [x28, #EXIT_FUNCTION_LINKER];
-/// br x1` with L holding a proven guest RIP (the block end or its branch's decoded target): the native offset of its
-/// first word, the only word the resident's linker rewrites (to `b` the entry of the block cached for `target`), and
+/// A literal exit of an admitted block, exactly a move of a proven guest RIP (the block end or its branch's decoded
+/// target) into x0 (`movz|movn|orr` then `movk`s) and `svc #LINK`: the native offset of its first word, the only word
+/// the resident's linker rewrites (to `b` the entry of the block cached for `target`), that word as admitted, and
 /// `target`. Offset 0 (the code header) marks an unused entry.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LinkPoint {
     pub offset: u32,
-    pub reserved: u32,
+    pub word: u32,
     pub target: u64,
 }
 impl LinkPoint {
-    pub const NONE: Self = Self { offset: 0, reserved: 0, target: 0 };
+    pub const NONE: Self = Self { offset: 0, word: 0, target: 0 };
 }
+/// The placeholders fexc emits for the resident to relocate when it places a block: the stop check at [`STOP_BL`]
+/// (`bl .`, becomes `bl` to [`cache::PAD`]) and a computed exit's branch (`b .`, becomes `b` to [`cache::DISPATCH`]).
+pub const STOP_PLACEHOLDER: u32 = 0x9400_0000;
+pub const DISPATCH_PLACEHOLDER: u32 = 0x1400_0000;
 /// Link points per block: a slice-1 block ends at one branch (a jcc has two literal exits); admission refuses more.
 pub const MAX_LINK_POINTS: usize = 4;
 /// The static-register map (FEX `x64::SRA`) admission pins for every block: native registers of RAX..R15, then PF
@@ -506,7 +523,8 @@ pub mod stop {
     pub const BAD_LINK: u64 = 9;
     /// The host parked the vCPU ([`super::REPLY_PARK`]).
     pub const PARKED: u64 = 10;
-    /// The stop gate was entered at a PC that is no live block's stop store (`super::STOP_STORE`), or not from EL1t.
+    /// The stop gate was entered other than from a live block's stop `bl` (`super::STOP_BL`, by x30) at the pad, from
+    /// EL1t.
     pub const BAD_STOP: u64 = 11;
     /// A system instruction whose form or operand value the resident does not implement (e.g. MOV from CR2, a CR0 or
     /// CR4 feature bit change, CR3 with PWT/PCD); nothing of it was executed.
@@ -550,6 +568,8 @@ pub struct State {
     /// derives them from `fetch` and the block's length), and its link points (the host's).
     pub source_gpa: [u64; 2],
     pub link_points: [LinkPoint; MAX_LINK_POINTS],
+    /// With a reply: the native offset of the staged block's computed exit `b` ([`DISPATCH_PLACEHOLDER`]), 0 for none.
+    pub dispatch_exit: u64,
     /// With a request: the guest-physical pages of the instruction fetch at `cpu.rip`, walked by the resident (its page,
     /// then the next one if the host asked, [`REPLY_NEXT_PAGE`]; `u64::MAX` = not walked or the walk failed), and the
     /// failure of the last walk ([`fetch`]). The host copies the bytes from these pages only.
@@ -567,10 +587,9 @@ pub struct State {
     /// Bumped by every shadow reset (eviction, protection reset) and cache flush: an abort that repeats the last
     /// retry across one is progress, not a loop.
     pub shadow_generation: u64,
-    /// Block entries through the resident (slow path) and through the fast dispatcher (L1 hits); slow-path L2 hits;
-    /// host translation requests answered.
+    /// Block entries through the resident (slow path); slow-path L2 hits; host translation requests answered.
+    /// (Dispatcher L1 hits are not counted: generated code writes no emulator data.)
     pub blocks: u64,
-    pub fast: u64,
     pub l2_hits: u64,
     pub requests: u64,
     /// Shadow-miss retries, of which read-only → writable upgrades,
@@ -614,6 +633,7 @@ impl State {
             generation: 0,
             source_gpa: [u64::MAX; 2],
             link_points: [LinkPoint::NONE; MAX_LINK_POINTS],
+            dispatch_exit: 0,
             fetch: [u64::MAX; 2],
             fetch_fault: [0; 3],
             stop_at: u64::MAX,
@@ -623,7 +643,6 @@ impl State {
             last_retry: [0; 4],
             shadow_generation: 0,
             blocks: 0,
-            fast: 0,
             l2_hits: 0,
             requests: 0,
             retries: 0,
@@ -647,23 +666,8 @@ impl State {
 }
 const _: () = assert!(core::mem::size_of::<State>() <= 4096);
 const _: () = assert!(STATE_OFFSET + 4096 <= FRAME_OFFSET);
-// Admitted fields stay in the frame page; the stop store's 8 bytes are in the stop page; the stop region is aligned
-// for the largest IPA granule it may be (16 KiB) and holds nothing else.
-const _: () = {
-    let mut i = 0;
-    while i < frame::FIELDS.len() {
-        assert!(FRAME_BIAS as usize + (frame::FIELDS[i].0 + frame::FIELDS[i].1) as usize <= frame::BYTES);
-        i += 1;
-    }
-};
-const _: () = assert!(FRAME_OFFSET + FRAME_BIAS as usize + frame::INTERRUPT_FAULT_PAGE as usize >= STOP_OFFSET);
-const _: () = assert!(FRAME_OFFSET + FRAME_BIAS as usize + frame::INTERRUPT_FAULT_PAGE as usize + 8 <= STOP_OFFSET + 4096);
-const _: () = assert!(FRAME_OFFSET + frame::BYTES == STOP_OFFSET && STOP_OFFSET % STOP_BYTES == 0);
-const _: () = assert!(STOP_OFFSET + STOP_BYTES <= SLOT_OFFSET);
-const _: () = assert!(SLOT_OFFSET + SLOT_BYTES <= 0x40000);
+const _: () = assert!(FRAME_OFFSET + frame::BYTES <= STAGING_OFFSET);
 const _: () = assert!(STAGING_OFFSET + STAGING_BYTES <= crate::resident::TEXT_OFFSET);
-const _: () = assert!(crate::STACK_TOP - PRIVATE >= 0x50000 + BLOCK_STACK_BYTES as u64);
-const _: () = assert!((BLOCK_STACK_BYTES + HELPER_STACK_BYTES) as usize <= STACK_BYTES);
 
 #[cfg(test)]
 mod tests {
@@ -683,6 +687,22 @@ mod tests {
         assert_eq!(guest_flags(0, 0, 0x03, 0x03, false) & 4, 4);
         assert_eq!(guest_flags(0, 0, 0x01, 0x01, false) & 4, 0);
         assert_eq!(guest_flags(0, 0, 0x00, 0x10, false), 0x10 | 1 << 2);
+    }
+
+    #[test]
+    fn division_of_128_by_64_bits() {
+        let neg = |v: i64| v as u64;
+        assert_eq!(divide(false, 1, 0, 2), Some((1 << 63, 0)));
+        assert_eq!(divide(false, 0, 7, 2), Some((3, 1)));
+        assert_eq!(divide(false, 2, 0, 2), None); // quotient 2^64
+        assert_eq!(divide(false, 0, 5, 0), None);
+        assert_eq!(divide(true, neg(-1), neg(-7), 2), Some((neg(-3), neg(-1)))); // remainder takes the dividend's sign
+        assert_eq!(divide(true, 0, 7, neg(-2)), Some((neg(-3), 1)));
+        assert_eq!(divide(true, neg(-1), 1 << 63, neg(-1)), None); // -2^63 / -1 = 2^63
+        assert_eq!(divide(true, neg(-1), 1 << 63, 1), Some((1 << 63, 0))); // -2^63 fits
+        assert_eq!(divide(true, 0, 1 << 63, 1), None); // 2^63 does not
+        assert_eq!(divide(true, i64::MIN as u64, 0, neg(-1)), None); // -2^127 / -1 overflows i128 too
+        assert_eq!(divide(true, 0, 5, 0), None);
     }
 
     #[test]

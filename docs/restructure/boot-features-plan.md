@@ -256,6 +256,13 @@ that vCPU's own state instead of raising #GP/#SS; every other non-canonical addr
 that fails if anything but listed guest-state fields is placed on the page. To verify: which kernel paths may be handed
 arbitrary addresses (tracing/debugger reads with fault fix-ups) and could land there. Survey:
 `docs/research/guest-state-protection-survey.md`.
+**Owner decisions (October 28, after `experiments/track03/native-interrupts/`):** (1) Hypervisor.framework's in-kernel
+GIC (macOS 15+) is the doorbell for every asynchronous x86 event — LAPIC timer on the virtual timer PPI, IPIs and
+cross-vCPU kicks on SGIs, device interrupts on per-vCPU SPIs, NMI as a doorbell plus a resident pending bit; HLT is a
+resident `wfi`; x86 semantics (IF, shadows, NMI blocking, LAPIC priority/TPR/ISR/IRR/EOI, IOAPIC/PIC) are applied by
+the resident at precise stops; host `hv_vm_protect`/`hv_vcpus_exit` remain only as the watchdog fallback. (2) The
+per-entry stop pad is replaced (E1b, before E2) by IRQ-triggered unlinking: the resident's IRQ handler patches the
+running block's exits (including computed exits) to stop, restores them after; nothing on the hot path.
 
 **Decided from evidence (recorded, not questions):** guest RAM default 2 GiB, tests choose their own size (M69);
 INIT/SIPI deferred, unused with the mailbox (`K kernel/smpboot.c:877-928`; M64 keeps the definition); legacy devices

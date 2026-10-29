@@ -84,6 +84,16 @@ inline uint32_t fexc_spill_bytes = 0;             // bytes the entry prologue su
 // global constant, which would also force one instruction per block).
 // ---------------------------------------------------------------------------------------------
 inline bool fexc_slice1 = false;
+// Profile slice1: `svc` immediates of the resident entries generated code makes (crates/abi/src/execution.rs `svc`):
+// a literal exit (RIP in x0), the dispatcher's L1 miss (resident code, listed for completeness) and the 128/64
+// unsigned / signed division (FEX's helper registers: x0 high, x1 low, x2 divisor in; quotient, remainder, #DE out).
+enum FexcSvc : uint16_t { FEXC_SVC_LINK = 1, FEXC_SVC_MISS = 2, FEXC_SVC_DIV_U = 3, FEXC_SVC_DIV_S = 4 };
+// Profile slice1: native offsets of the computed exits' `b` to the resident dispatcher (placeholder `b .`, relocated by
+// the resident when it places the block), per compile attempt.
+inline std::vector<uint32_t> fexc_dispatch_exits;
+// Profile slice1: guest offsets of the instructions whose incoming NZCV the JIT saves in FexcPrecision::PreNzcvReg at
+// their start (an NZCV write precedes one of their fault points), chosen by the flag-elimination pass.
+inline std::set<uint64_t> fexc_pre_nzcv;
 // Which opcode map produced a decoded instruction (DecodedInst::FexcMap, set by the patched decoder).
 enum FexcMap : uint8_t { FEXC_MAP_PRIMARY = 0, FEXC_MAP_TWO = 1, FEXC_MAP_TWO_F3 = 2, FEXC_MAP_TWO_F2 = 3, FEXC_MAP_TWO_66 = 4,
                          FEXC_MAP_0F38 = 5, FEXC_MAP_0F3A = 6, FEXC_MAP_3DNOW = 7 };

@@ -61,9 +61,9 @@ pub(crate) fn exit_vcpus(ids: &mut [u64]) -> i32 {
     unsafe { hv_vcpus_exit(ids.as_mut_ptr(), ids.len() as u32) }
 }
 
-/// Guest memory rights of [`protect`]: as mapped (read/write/execute), or read-only.
+/// Guest memory rights of [`protect`]: as mapped (read/write/execute), or read-write (not executable).
 pub(crate) const MAPPED: u64 = 7;
-pub(crate) const READ_ONLY: u64 = 1;
+pub(crate) const READ_WRITE: u64 = 3;
 /// Sets the stage-2 rights of `[ipa, ipa + size)` (granule-aligned) for every vCPU, running ones included.
 pub(crate) fn protect(ipa: u64, size: usize, rights: u64) -> Result<()> {
     unsafe { hv(hv_vm_protect(ipa, size, rights), "hv_vm_protect") }
@@ -108,6 +108,7 @@ impl Drop for Machine {
     }
 }
 
+pub(crate) const X30: u32 = 30;
 pub(crate) const PC: u32 = 31;
 pub(crate) const CPSR: u32 = 34;
 pub(crate) const SPSR_EL1: u16 = 0xc200;
@@ -124,7 +125,7 @@ pub(crate) enum Exit {
     Hvc(u64),
     /// The host forced the exit ([`exit_vcpus`]).
     Cancelled,
-    /// A stage-2 data abort (EC 0x24) with its syndrome and IPA; PC is the faulting instruction.
+    /// A stage-2 data or instruction abort (EC 0x24, 0x20) with its syndrome and IPA; PC is the faulting instruction.
     Stage2 { syndrome: u64, ipa: u64 },
 }
 
@@ -199,7 +200,7 @@ impl Vcpu {
         self.set_sys(CPACR_EL1, 3 << 20)?;
         self.set_sys(CNTV_CTL_EL0, 0)
     }
-    /// Runs until the next exit: an HVC, a forced exit ([`exit_vcpus`]) or a stage-2 data abort (EC 0x24); any
+    /// Runs until the next exit: an HVC, a forced exit ([`exit_vcpus`]) or a stage-2 abort (EC 0x24, 0x20); any
     /// other exit is an error reporting the exit and PC.
     pub(crate) fn run_until_exit(&self) -> Result<Exit> {
         const CANCELED: u32 = 0;
@@ -210,7 +211,7 @@ impl Vcpu {
             match (exit.reason, syndrome >> 26) {
                 (CANCELED, _) => Ok(Exit::Cancelled),
                 (1, 0x16) => Ok(Exit::Hvc(syndrome & 0xffff)),
-                (1, 0x24) => Ok(Exit::Stage2 { syndrome, ipa }),
+                (1, 0x24 | 0x20) => Ok(Exit::Stage2 { syndrome, ipa }),
                 (reason, _) => Err(self.unexpected(reason, syndrome, ipa)),
             }
         }

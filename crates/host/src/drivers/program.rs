@@ -8,12 +8,12 @@
 //! `--code-cache BYTES` sets each code cache's capacity and `--watchdog-ms MS`
 //! the watchdog (default 10 s). After the run each vCPU's cache link points are
 //! self-checked ([`execution::check_links`]). Run-time defence checks, which corrupt what admission or the resident
-//! would never produce, on vCPU `--tamper-vcpu V` (default 0): `--forge-header` makes every block's entry prologue store
-//! its entry instead of its header (the resident's linker must halt); `--tamper KIND` corrupts the cache when the next
-//! block will not fit and the resident is about to flush (KIND `offset`: a link point outside the code, so the reply is
-//! refused; `word`: a linked point's branch; `literal`: the target literal of a linked point; `record`: a link record),
+//! would never produce, on vCPU `--tamper-vcpu V` (default 0): `--forge-exit` makes every literal exit move another RIP than its link
+//! point's target into x0, the last word of its move altered (the resident's linker must halt); `--tamper KIND` corrupts the cache when the
+//! next block will not fit and the resident is about to flush (KIND `offset`: a link point outside the code, so the reply
+//! is refused; `word`: a linked point's branch; `record`: a link record),
 //! and the unlink must halt (`bad_link`); `--tamper-after KIND` (not `offset`) corrupts after the run, and the host's
-//! self-check must refuse (`links_check`); `--forge-stop` enters the stop gate of its first stop with a forged ELR
+//! self-check must refuse (`links_check`); `--forge-stop` enters the stop gate of its first stop with a forged return address
 //! (the resident must halt: `bad_stop`); `--tamper system` makes the first system reply's decode malformed (the resident
 //! must refuse it: `bad_reply`); `--tamper next-page` answers a block request with [`exec::REPLY_NEXT_PAGE`] twice (the
 //! second after the next page was walked: `bad_reply`); `--tamper site` moves the native offsets of the first block with
@@ -376,15 +376,21 @@ fn page_span(start: u64, length: usize) -> impl Iterator<Item = u64> {
 }
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] \
-                     [--code-cache BYTES] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-header] [--tamper offset|word|literal|record|system] [--tamper-after word|literal|record] \
+                     [--code-cache BYTES] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-exit] [--tamper offset|word|record|system] [--tamper-after word|record] \
                      [--forge-stop] [--kick-vcpu V]... [--kicks M] [--kick-every-us P] [--tamper next-page|site|site-kind] [--ignore-kicks] [--kill-compiler N] [--stall-compiler N] [--compile-deadline-ms MS]";
 
-/// `adr x0, #-4` (the block's header) at the entry becomes `adr x0, #0` (the entry itself).
-fn forge_header(object: &mut [u8]) {
+/// Every literal exit's RIP move puts another RIP in x0: bit 0 of the immediate of its last word (the one before its
+/// `svc #LINK`) flips. A one-word move would change the link point's first word itself, which the host's self-check
+/// refuses after the run; the RIPs of test programs need two words.
+fn forge_exit(object: &mut [u8]) {
     let h: natemu_abi::code_object::Header = unsafe { std::ptr::read_unaligned(object.as_ptr().cast()) };
-    let at = (h.code_offset + exec::ENTRY_OFFSET) as usize;
-    assert_eq!(object[at..at + 4], 0x10ff_ffe0u32.to_le_bytes());
-    object[at..at + 4].copy_from_slice(&0x1000_0000u32.to_le_bytes());
+    let link = (0xd400_0001u32 | u32::from(exec::svc::LINK) << 5).to_le_bytes();
+    let code = h.code_offset as usize;
+    for at in (code + exec::STOP_BL as usize + 4..code + h.code_region_end as usize).step_by(4) {
+        if object[at..at + 4] == link {
+            object[at - 4] ^= 1 << 5;
+        }
+    }
 }
 
 /// The first link record and its source block, if the vCPU has linked anything.
@@ -404,23 +410,17 @@ fn flushing_next(area: Area) -> bool {
 #[derive(Clone, Copy)]
 enum Corrupt {
     Word,
-    Literal,
     Record,
 }
-/// Corrupts the first linked point, its literal or its record; false when nothing is linked yet.
+/// Corrupts the first linked point or its record; false when nothing is linked yet.
 fn corrupt(area: Area, kind: Corrupt) -> bool {
     let Some((b, r)) = first_link(area) else { return false };
     let at = cache::CODE_OFFSET + b.code as usize + r.offset as usize;
     match kind {
         Corrupt::Word => area.copy(at, &0x1400_0001u32.to_le_bytes()), // b .+4
-        Corrupt::Literal => {
-            let literal = at.wrapping_add((((r.original << 8) as i32 >> 13) as i64 * 4) as usize);
-            let value = u64::from_le_bytes(area.read::<8>(literal)) ^ 1 << 20;
-            area.copy(literal, &value.to_le_bytes());
-        }
         Corrupt::Record => {
-            let record = cache::LinkRecord { original: r.original.wrapping_add(1 << 5), ..r };
-            area.write_record(cache::LOOKUP_OFFSET + cache::LINKS, record); // the literal one word further
+            let record = cache::LinkRecord { original: r.original ^ 1 << 5, ..r };
+            area.write_record(cache::LOOKUP_OFFSET + cache::LINKS, record); // another immediate
         }
     }
     true
@@ -490,9 +490,6 @@ fn tamper_site_kind(area: Area, state: &mut State) -> bool {
 fn tamper_word(area: Area, state: &mut State) -> bool {
     admitted(state) && flushing_next(area) && corrupt(area, Corrupt::Word)
 }
-fn tamper_literal(area: Area, state: &mut State) -> bool {
-    admitted(state) && flushing_next(area) && corrupt(area, Corrupt::Literal)
-}
 fn tamper_record(area: Area, state: &mut State) -> bool {
     admitted(state) && flushing_next(area) && corrupt(area, Corrupt::Record)
 }
@@ -534,7 +531,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             "--code-cache" => code_bytes = value()?,
             "--watchdog-ms" => watchdog_ms = value()? as u64,
             "--tamper-vcpu" => target = value()?,
-            "--forge-header" => forge = true,
+            "--forge-exit" => forge = true,
             "--forge-stop" => forge_stop = true,
             "--ignore-kicks" => ignore_kicks = true,
             "--compile-deadline-ms" => deadline_ms = value()? as u64,
@@ -547,7 +544,6 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 tamper = Some(match options.next().map(String::as_str) {
                     Some("offset") => tamper_offset,
                     Some("word") => tamper_word,
-                    Some("literal") => tamper_literal,
                     Some("record") => tamper_record,
                     Some("system") => tamper_system,
                     Some("next-page") => tamper_next_page,
@@ -559,7 +555,6 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             "--tamper-after" => {
                 tamper_after = Some(match options.next().map(String::as_str) {
                     Some("word") => Corrupt::Word,
-                    Some("literal") => Corrupt::Literal,
                     Some("record") => Corrupt::Record,
                     _ => return Err(USAGE.into()),
                 })
@@ -623,7 +618,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         compiler.deadline = std::time::Duration::from_millis(deadline_ms);
         let mut requests = execution::Requests::default();
         if v == target {
-            compiler.tamper = forge.then_some(forge_header as fn(&mut [u8]));
+            compiler.tamper = forge.then_some(forge_exit as fn(&mut [u8]));
             compiler.signal_at = signal_at;
             requests.tamper = tamper;
             requests.forge_stop = forge_stop;
@@ -786,9 +781,8 @@ fn report(area: Area, space: &Space, guest: &Tables, ran: Ran, tampering: bool, 
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"fast\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]}}",
+        "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]}}",
         s.blocks,
-        s.fast,
         s.l2_hits,
         s.requests,
         ran.rips.len(),
@@ -827,11 +821,11 @@ fn kick_report(area: Area, stops: &execution::Stops) -> String {
     let (k, pending) = stops.report(area.vcpu);
     let entries: std::collections::HashSet<u64> = execution::placed_blocks(area)
         .iter()
-        .map(|b| b.code_va() + u64::from(exec::STOP_STORE))
-        .chain([exec::SLOT_VA + u64::from(exec::STOP_STORE)])
+        .map(|b| b.code_va() + u64::from(exec::STOP_BL))
+        .chain([cache::SLOT_VA + u64::from(exec::STOP_BL)])
         .collect();
     let at_entry = k.pcs.keys().all(|pc| entries.contains(pc));
-    let at_step = k.pcs.get(&(exec::SLOT_VA + u64::from(exec::STOP_STORE))).copied().unwrap_or(0);
+    let at_step = k.pcs.get(&(cache::SLOT_VA + u64::from(exec::STOP_BL))).copied().unwrap_or(0);
     let pcs: Vec<String> = k.pcs.iter().map(|(pc, n)| format!("[\"{pc:#x}\",{n}]")).collect();
     let quantiles = |host: bool| {
         let mut ns: Vec<u64> = k.latency.iter().filter(|l| l.1 == host).map(|l| l.0).collect();
@@ -851,19 +845,11 @@ fn kick_report(area: Area, stops: &execution::Stops) -> String {
     )
 }
 
-/// The FEX frame holds nothing but its admitted fields (guest code cannot have written
-/// private memory there), and its native pointers (exit gate, division helpers) still point into the resident.
+/// The FEX frame holds nothing outside its guest-state fields (guest code cannot have written private memory there).
 fn frame_intact(area: Area) -> bool {
     let frame: [u8; exec::frame::BYTES] = area.read_record(exec::FRAME_OFFSET);
-    // x28 is the page + FRAME_BIAS.
-    let bias = exec::FRAME_BIAS as usize;
-    let admitted = |i: usize| exec::frame::FIELDS.iter().any(|&(at, len)| (bias + at as usize..bias + (at + len) as usize).contains(&i));
-    let text = |offset: usize| PRIVATE + offset as u64;
-    let in_text = |at: u32| {
-        let pointer = u64::from_le_bytes(frame[bias + at as usize..][..8].try_into().unwrap());
-        (text(natemu_abi::resident::TEXT_OFFSET)..text(natemu_abi::resident::TEXT_END)).contains(&pointer)
-    };
-    frame.iter().enumerate().all(|(i, &b)| b == 0 || admitted(i)) && exec::frame::POINTERS.into_iter().all(in_text)
+    let admitted = |i: usize| exec::frame::GUEST_STATE.iter().any(|&(at, len)| (at as usize..(at + len) as usize).contains(&i));
+    frame.iter().enumerate().all(|(i, &b)| b == 0 || admitted(i))
 }
 
 #[cfg(test)]

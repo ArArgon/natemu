@@ -19,7 +19,7 @@ from run_qemu import host_state  # noqa: E402
 
 # qemu-system-x86_64 TCG on the same host, steady-state ns/insn (S2p, bench-qemu-20261027-01).
 QEMU = {'int': 0.200, 'mem64': 0.346, 'mem4096': 0.398, 'call': 0.744, 'branchy': 0.597, 'mixed': 0.283}
-STATS = ('blocks', 'fast', 'compiles', 'linker', 'links', 'linked', 'flushes', 'retries')
+STATS = ('blocks', 'compiles', 'linker', 'links', 'linked', 'flushes', 'retries')
 
 
 def main():
@@ -78,7 +78,7 @@ def main():
         slopes = [1e9 * (t2 - t1) / (i2 - i1) for t1, t2 in zip(times[(b['name'], n)], times[(b['name'], 2 * n)])]
         med = statistics.median(slopes)
         # Computed exits (ret) take the dispatcher every iteration: its hits grow with N; nothing else may.
-        steady = all(stats[(b['name'], n)][x] == stats[(b['name'], 2 * n)][x] for x in STATS if x != 'fast')
+        steady = all(stats[(b['name'], n)][x] == stats[(b['name'], 2 * n)][x] for x in STATS)
         r = {'name': b['name'], 'n': n, 'insns': [i1, i2], 'ns_per_insn': {'median': med, 'min': min(slopes), 'max': max(slopes),
              'range_pct': 100 * (max(slopes) - min(slopes)) / med, 'all': slopes}, 'qemu_ns_per_insn': QEMU.get(b['name']),
              'times_s': {'n': times[(b['name'], n)], '2n': times[(b['name'], 2 * n)]},

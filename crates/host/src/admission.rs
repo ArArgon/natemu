@@ -3,11 +3,11 @@
 //! feature profile against the vCPU's ID registers, sorted in-body access sites
 //! of supported kinds and guest-RIP relocations of the requested RIP; then the
 //! code itself ([`structure`]): every instruction decoded, frame accesses, address
-//! guards, split and #DE checks, exits and indirect branches verified on the words.
-//! Literal slots are resolved here, and the literal exits returned as link points;
-//! the resident fills the frame's native pointers itself.
+//! guards, split and #DE checks and exits verified on the words. The tail's literal
+//! slot is resolved here; the literal exits are returned as link points and the
+//! computed exit's branch for the resident to relocate.
 use natemu_abi::code_object::{self as object, Header, PcEntry, Reloc, Site};
-use natemu_abi::execution::{ENTRY_OFFSET, LinkPoint, MAX_LINK_POINTS, SRA, STAGING_BYTES, cache::MAX_BLOCK_BYTES, frame};
+use natemu_abi::execution::{ENTRY_OFFSET, LinkPoint, MAX_LINK_POINTS, PRE_NZCV_REG, SRA, STAGING_BYTES, cache::MAX_BLOCK_BYTES};
 
 mod structure;
 
@@ -121,6 +121,8 @@ pub(crate) struct Admitted {
     pub end_reason: u8,
     /// Its literal exits, the only words the resident's linker may rewrite.
     pub links: Vec<LinkPoint>,
+    /// Its computed exit's branch to the dispatcher, which the resident relocates.
+    pub dispatch_exit: Option<u32>,
 }
 
 /// Direct branch target of the x86 instruction `insn` ending at `end`
@@ -155,11 +157,11 @@ pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Re
         guest_bytes: h.guest_bytes,
         targets: &parts.targets,
     };
-    let links = structure::check(&c).map_err(|e| format!("object refused: {e}"))?;
+    let (links, dispatch_exit) = structure::check(&c).map_err(|e| format!("object refused: {e}"))?;
     if links.len() > MAX_LINK_POINTS {
         return Err(format!("object refused: {} literal exits, at most {MAX_LINK_POINTS}", links.len()));
     }
-    admitted.links = links;
+    (admitted.links, admitted.dispatch_exit) = (links, dispatch_exit);
     Ok(admitted)
 }
 
@@ -215,7 +217,7 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
         || h.spill_bytes != 0
         || h.guest_bytes == 0
         || h.guest_bytes as usize > source.len()
-        || h.pre_nzcv_offset != frame::PRE_NZCV
+        || h.pre_nzcv_register != u32::from(PRE_NZCV_REG)
     {
         return fail("code layout");
     }
@@ -283,12 +285,15 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
                 out[code + at..code + at + 8].copy_from_slice(&r.value.to_le_bytes());
                 literals.push(at..at + 8);
             }
-            // Materialised in the code by fexc for the requested RIP.
+            // Materialised in the code by fexc for the requested RIP (structure checks the value), and the computed
+            // exit's branch (structure checks the word).
             object::RELOC_GUEST_RIP_MOVE if r.size == 0 && at % 4 == 0 && at < region as usize && r.register < 31 => {}
+            object::RELOC_DISPATCH_BRANCH if r.size == 0 && at % 4 == 0 && at < region as usize => {}
             _ => return fail(&format!("relocation at {at:#x}")),
         }
     }
-    let admitted = Admitted { object: out, guest_bytes: h.guest_bytes, guest_insns: h.guest_insns, end_reason: h.end_reason, links: Vec::new() };
+    let admitted =
+        Admitted { object: out, guest_bytes: h.guest_bytes, guest_insns: h.guest_insns, end_reason: h.end_reason, links: Vec::new(), dispatch_exit: None };
     let targets = [Some(end), target].into_iter().flatten().collect();
     Ok((admitted, Parts { header: h, sites, pcs, relocs, literals, targets }))
 }
@@ -320,7 +325,7 @@ fn site_fields_valid(s: &Site, h: &Header, region: u32) -> bool {
         && s.shift <= 4
         && s.writeback <= object::WB_POST
         && s.data_class == object::CLASS_GPR
-        && s.nzcv <= object::NZCV_FRAME
+        && s.nzcv <= object::NZCV_SAVED
         && s.completed_effects == object::EFFECTS_NONE
         && s.located == 1
 }
@@ -453,7 +458,7 @@ mod tests {
             feature_count: 32,
             dcache_line_log2: 4,
             reserved: [0; 2],
-            pre_nzcv_offset: frame::PRE_NZCV,
+            pre_nzcv_register: u32::from(PRE_NZCV_REG),
         };
         let mut out = vec![0; h.total_size as usize];
         let put = |out: &mut Vec<u8>, at: usize, bytes: &[u8]| out[at..at + bytes.len()].copy_from_slice(bytes);
@@ -614,7 +619,7 @@ mod tests {
         assert!(admit(&with_stub(stub(GUARD, 12), BRK1), RIP, &SOURCE, ALL).is_err()); // no access there
         assert!(admit(&with_stub(Site { width: 4, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
         assert!(admit(&with_stub(Site { segment: object::SEG_SS, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
-        assert!(admit(&with_stub(Site { nzcv: object::NZCV_FRAME, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&with_stub(Site { nzcv: object::NZCV_SAVED, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
         assert!(admit(&with_stub(Site { index_reg: 3, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
         // The address register at the stub may differ from the access's (x1 after an add).
         assert!(admit(&with_stub(Site { base_reg: 1, imm: 0, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_ok());

@@ -212,51 +212,18 @@ resume_exception:
 enter_allocated:
     msr spsel, #1
     b resume_exception
-// The fast dispatcher (`Pointers.DispatcherLoopTop`, FEX's dispatcher loop): every
-// block exit branches here with the next guest RIP in the frame and guest state
-// in the static registers. An L1 hit enters the cached block directly; anything
-// else takes the slow path into the resident. Uses only x0-x3 (FEX's temporaries
-// at a block boundary) and keeps NZCV: no flag-setting instruction.
-.global dispatch_fast
-dispatch_fast:
-    ldr x0, [x28, #{frame_rip}]
-    ldr x1, ={l1_address}
-    and x2, x0, #{l1_mask}
-    add x1, x1, x2, lsl #4
-    ldp x2, x3, [x1]
-    sub x2, x2, x0
-    cbnz x2, returned_allocated
-    ldr x1, ={fast_counter}
-    ldr x2, [x1]
-    add x2, x2, #1
-    str x2, [x1]
-    br x3
-.ltorg
 
-.global returned_allocated
-returned_allocated:
-    msr spsel, #1
-    save_native
-    mrs x9, sp_el0
-    str x9, [sp, #{sp_offset}]
-    mrs x9, nzcv
-    str x9, [sp, #{nzcv_offset}]
-    mov x0, sp
-    mov x1, #0
-    bl finish
-    b .
-
-// The block linker (`Pointers.ExitFunctionLinker`, FEX's `ExitFunctionLinker`): every literal exit, with its
-// target RIP in the frame, until the resident links it. Always the slow path, once per edge.
-.global link_exit
-link_exit:
-    msr spsel, #1
-    save_native
-    mrs x9, sp_el0
-    str x9, [sp, #{sp_offset}]
-    mrs x9, nzcv
-    str x9, [sp, #{nzcv_offset}]
-    mov x0, sp
-    mov x1, #2
-    bl finish
-    b .
+// The dispatcher, copied by the resident into the code area (`cache::DISPATCH`) so that computed exits reach it with
+// one `b`; it runs from there, never here. Position-independent and data-free: x0 = the next guest RIP, guest state in
+// the static registers. It branches to the RIP's L1 entry, code the resident writes (`cache::L1_CODE`): a hit enters
+// the cached block, a miss comes back to the `svc #MISS` here (`cache::DISPATCH_MISS`, the last word), which enters
+// the resident. Uses only x0-x2 (FEX's temporaries at a block boundary) and keeps NZCV: no flag-setting instruction.
+.global dispatch_template
+.global dispatch_template_end
+dispatch_template:
+    and x1, x0, #0xfff
+    adr x2, . + {l1_code_delta}
+    add x2, x2, x1, lsl #5
+    br x2
+    svc #{svc_miss}
+dispatch_template_end:

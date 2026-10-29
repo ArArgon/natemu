@@ -78,15 +78,15 @@ from N vCPUs while one clears A/D and INVLPGs, remap with per-vCPU INVLPG, 2 MiB
 contended A/D walks (data, fetch, both) that must never halt; at 2 and 4 vCPUs (default), block sizes default and 1.
 
 `limits`: 5 vCPUs are refused (0 cannot be written: a description without `cpu` lines is one vCPU; the host's
-`prepare` refuses 0 in its unit test); a forged block header on vCPU V of 4 (V = 0..3; the others spin in a linked
+`prepare` refuses 0 in its unit test); a forged literal exit (its RIP move altered after admission) on vCPU V of 4 (V = 0..3; the others spin in a linked
 loop) halts V with bad_link, cancels and joins the others, and the VM is destroyed (the driver reports only then).
 
 `contain` (S3h, containment and progress; runs one at a time, each a fresh process). Every failing run must exit as stated,
 end within its bound (10 s; watchdog runs: the watchdog + 5 s) and print the driver's teardown line with every vCPU joined
 and destroyed, the VM destroyed (status 0) and no child process left (no compile server alive or unreaped); each is
 followed at once by a fresh process running fixture programs on as many vCPUs, which must match QEMU. (1, 4) Every
-run-time tamper of the driver (forged header, link-point offset, next-page reply given twice, system decode, linked word,
-literal and record before a flush, forged stop PC, access sites off the instruction grid or of the wrong kind) on each vCPU v at N = 1..4, the others in linked loops: v halts with
+run-time tamper of the driver (forged literal exit, link-point offset, next-page reply given twice, system decode, linked
+word and link record before a flush, forged stop return address, access sites off the instruction grid or of the wrong kind) on each vCPU v at N = 1..4, the others in linked loops: v halts with
 its defence's stop (bad_link, bad_reply, bad_stop, unknown_abort, site_mismatch) with its FEX frame intact and its banked
 state at a block boundary the run reached (the system, site and site-kind tampers: the unchanged start state, rip
 0x100000 and every GPR 0), the others are cancelled, exit 0. A run that outlives its bound by 5 s is killed and fails.
@@ -275,7 +275,7 @@ def cmd_smp(a, host, runtime):
         diffs += smp.compare(prog, got, model_smp.expected(prog))
         if prog['name'] in qemu: diffs += ['qemu: ' + d for d in smp.compare(prog, got, qemu[prog['name']])]
         outcome = 'fail' if diffs else 'match'
-        stats = [{k: cpu['stats'][k] for k in ('blocks', 'fast', 'requests', 'links', 'retries')} for cpu in cpus]
+        stats = [{k: cpu['stats'][k] for k in ('blocks', 'requests', 'links', 'retries')} for cpu in cpus]
         return [{**e, 'outcome': outcome, 'diffs': diffs, 'stats': stats}]
     entries = run_groups(a, host, runtime, groups, judge)
     by = collections.defaultdict(collections.Counter)
@@ -354,11 +354,11 @@ def cmd_limits(a, host, runtime):
     straight = vm.description(json.loads((ROOT / 'fixtures/slice1/programs.json').read_text())['programs'][0])
     for v in range(4):
         text = ''.join('cpu\n' + (straight if w == v else 'rip 0x100000\nbody 0x100000 ebfe\n') for w in range(4))
-        rc, out, err = driver(host, runtime, a.fexc, text, a.out / 'work' / f'forge{v}', ['--forge-header', '--tamper-vcpu', v])
+        rc, out, err = driver(host, runtime, a.fexc, text, a.out / 'work' / f'forge{v}', ['--forge-exit', '--tamper-vcpu', v])
         stops = [(c['stop'], c['reason']) for c in out['cpus']] if out else None
         report[f'forge{v}'] = {'returncode': rc, 'stops': stops, 'stderr': err.strip()[-300:]}
         want = [('resident', 'bad_link status=1 detail=9') if w == v else ('cancelled', '') for w in range(4)]
-        if rc or stops != want: failures.append(f'forged header on vCPU {v}: {rc} {stops} {err.strip()[-200:]}')
+        if rc or stops != want: failures.append(f'forged exit on vCPU {v}: {rc} {stops} {err.strip()[-200:]}')
     for f in failures: print(f)
     print(json.dumps(report, indent=1))
     (a.out / 'limits.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1) + '\n')
@@ -434,7 +434,7 @@ def cmd_kicks(a, host, runtime):
             e = {'name': prog['name'], 'rep': i}
             if rc: return [{**e, 'diffs': [f'driver exit {rc}: {err.strip()[-300:]}']}]
             return [{**e, 'diffs': judge_smp(prog, want, out, [a.kicks] * n), 'kicks': [c['kicks'] for c in out['cpus']],
-                     'stats': [{k: c['stats'][k] for k in ('blocks', 'fast', 'requests', 'stops', 'linker')} for c in out['cpus']]}]
+                     'stats': [{k: c['stats'][k] for k in ('blocks', 'requests', 'stops', 'linker')} for c in out['cpus']]}]
         entries = run_groups(a, host, runtime, groups, judge)
         for e in entries:
             ks = e.get('kicks', [])
@@ -740,13 +740,13 @@ def tamper_kinds(fixture):
     flush = ['1', '--code-cache', 32768]
     system = 'rip 0x100000\ncpl 0\ncode ' + ref.assemble('mov rax, cr0\nnop').hex() + '\n'
     load = 'rip 0x100000\ncode ' + ref.assemble('mov rax, qword ptr [0x200000]\nnop').hex() + '\nmemory 0x200000 0102030405060708\n'
-    return [('forge-header', ['--forge-header'], fixture, 'bad_link'),
+    return [('forge-exit', ['--forge-exit'], fixture, 'bad_link'),
             ('offset', ['--tamper', 'offset'], fixture, 'bad_reply'),
             ('next-page', ['--tamper', 'next-page'], fixture, 'bad_reply'),
             ('system', ['--tamper', 'system'], system, 'bad_reply'),
             ('site', ['--tamper', 'site'], load, 'unknown_abort'),
             ('site-kind', ['--tamper', 'site-kind'], load, 'site_mismatch'),
-            *[(k, flush + ['--tamper', k], chain_section(), 'bad_link') for k in ('word', 'literal', 'record')],
+            *[(k, flush + ['--tamper', k], chain_section(), 'bad_link') for k in ('word', 'record')],
             ('forge-stop', ['--kicks', 1, '--forge-stop'], LOOP, 'bad_stop')]
 
 
@@ -758,10 +758,11 @@ AT_START = ('site', 'site-kind', 'system')
 def halted_state(name, section, cpu):
     """The tampered vCPU's banked state (contracts 56, 58: a defence halts before any effect, nothing fabricated): the
     FEX frame intact; for AT_START tampers the start state (rip 0x100000, every GPR 0), for the others a block boundary
-    the run reached: the entry of a block it translated, or the section's end (a forged header halts the linker at the
-    exit of the block before it)."""
+    the run reached: the entry of a block it translated, or the section's end (a forged exit halts the linker at the
+    exit of the block before it, with the RIP the forged move left in x0: the driver flips bit 0 of the move's last
+    immediate, `movk w0, #imm, lsl #16` for these RIPs, so the RIP the exit should have had differs in bit 16)."""
     problems = [] if cpu['frame_intact'] else ['FEX frame changed']
-    rip = smp.num(cpu['rip'])
+    rip = smp.num(cpu['rip']) ^ (1 << 16 if name == 'forge-exit' else 0)
     end = 0x100000 + len(re.search(r'(?:code|body 0x100000) ([0-9a-f]+)', section).group(1)) // 2
     if name in AT_START:
         if rip != 0x100000 or any(smp.num(g) for g in cpu['gpr']):
@@ -843,7 +844,7 @@ def cmd_contain(a, host, runtime):
                 rc, out, err, secs = run(label, text, extra + kick + ['--tamper-vcpu', v], 10)
                 want = [('resident', reason) if w == v else ('cancelled', '') for w in range(n)]
                 stops, diffs = judge(n, rc, out, err, secs, want, 10)
-                if out and name != 'forge-header' and not out['cpus'][v]['tampered']: diffs.append('not tampered')
+                if out and name != 'forge-exit' and not out['cpus'][v]['tampered']: diffs.append('not tampered')
                 if out: diffs += halted_state(name, section, out['cpus'][v])
                 diffs += fresh(n, label)
                 report['tamper'].append({'label': label, 'stops': stops, 'seconds': round(secs, 2), 'diffs': diffs})

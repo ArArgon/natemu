@@ -26,13 +26,19 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as ten commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as eleven commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series10` (S3e: the same ten patches; the shims admit
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series11` (E1, October 28: patch 0011, code that
+touches no emulator data: literal exits `movz/movk x0, #rip; svc #1`, computed exits `mov x0, xR; b .` relocated by the
+resident to its dispatcher (a `dispatch_branch` relocation), the 128/64 division as `svc #3`/`#4`, no block-header store,
+the stop check a `bl .` relocated to the vCPU's stop pad, the pre-NZCV save `mrs x25, nzcv` instead of a frame store;
+object version 4, header field `pre_nzcv_register` = 25; the same sites, blocks and guest instructions as series10 on the
+fixtures, seed 4242, the flow corpus and the benchmarks, 13.5% fewer words: `experiments/track03/el0-study/e1census.py`).
+Kept for comparison only: `series10` (S3e: the shims admit
 memory xchg as a `swap` site (kind 12: one `swpal`, LSE on as before through the `atomics_lse` feature default; an address
 guard, no split check), lfence/mfence/sfence and pause; objects identical to series9 on the 64 fixtures and the 44 seed-4242 programs, which have none of
-these forms). Kept for comparison only: `series9` (series8 with `loop/loope/loopne/jrcxz` allowlisted, S2d), `series8` (patches 0001-0010, loop/jrcxz cut), `series7` (patches 0001-0009, literal exits through DispatcherLoopTop), `series6` (patches 0001-0008, before self-loop exits and the stop check), `series5`, `series4`
+these forms), `series9` (series8 with `loop/loope/loopne/jrcxz` allowlisted, S2d), `series8` (patches 0001-0010, loop/jrcxz cut), `series7` (patches 0001-0009, literal exits through DispatcherLoopTop), `series6` (patches 0001-0008, before self-loop exits and the stop check), `series5`, `series4`
 (patches 0001-0007, before division), `series2` (patches 0001-0006, the "before" of the guard cost), `s1c` (slice1
 without the precision patches, the "before" of the precision cost) and `c1b` (the v1 build without sites). The earlier `series1` (flag rule before the cheaper one below) and `s1b1` are gone.
 
@@ -61,6 +67,7 @@ Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--v
 | 0008 | slice1 #DE for div/idiv (width record in the dispatcher, check after FEX's LUDIV/LDIV call, divide ops as flag fault points) |
 | 0009 | slice1 self-loop exits (no `JumpTargets` lookup for the taken edge of jcc/jrcxz/loop) and FEX's pending-interrupt fault check at every block entry |
 | 0010 | slice1 literal exits through `Pointers.ExitFunctionLinker` (computed exits keep `DispatcherLoopTop`): FEX's linker/dispatcher split, so the resident can link them |
+| 0011 | slice1 code that touches no emulator data (E1): literal exits `movz/movk x0; svc #1`, computed exits `mov x0, xR; b .` (relocated by the resident), the 128/64 division by `svc #3/#4`, no header store, the stop check `bl .` (relocated to the stop pad), the pre-NZCV save `mrs x25, nzcv` (the JIT emits it at the instruction start the flag pass chose, `fexc_pre_nzcv`); FEX's BLOCK_DEBUGGING exit branch back to its upstream form |
 
 Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in `shim/` and `fexc.cpp`; the patches only
 include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then
@@ -255,15 +262,15 @@ The scripts that read `fixtures/slice1/programs.json` (git-ignored; `smoke.py`, 
   emulation off (hardware TSO, so plain `ldr`/`str`, `ordering: plain`), no end marker, dense PC table, multiblock off
   (`--multiblock` and `--sparse-pc` are refused; `--no-tso` and `--no-end-marker` are no-ops), FlagM required
   (`features.required_by_settings_profile`; `--feature flagm=0` is refused).
-- **Exits.** `BranchOps.cpp::ExitFunction` takes FEX's existing `BLOCK_DEBUGGING` branch when the runtime flag
-  `fexc_slice1` is set (the compile-time constant stays off: `Core.cpp::CompileBlock` would force one instruction per
-  block). Every exit to a literal RIP is `ldr x0,<rip literal>; str x0,[x28,#State.rip]; ldr x1,[x28,#Pointers.ExitFunctionLinker];
-  br x1` (a link point: since patch 0010 the resident's linker rewrites its first word into `b <target entry>`); a computed
-  exit stores its register and loads `Pointers.DispatcherLoopTop` instead. The 8-byte RIP literal is placed in the code and registered as a
-  `guest_rip_literal` relocation (FEX's debugging branch leaves it unregistered). No exit-linker literal is emitted, so there
-  is no `named_symbol_literal`, in-code L1 lookup, FEX jump thunk or x25 call-return stack; the only state pointers loaded
-  are `ExitFunctionLinker`, `DispatcherLoopTop` and the division helpers. Guest RIP constants for RIP-relative addresses and pushed return addresses stay `guest_rip_move`.
-  The literals are data inside the code region (check_sites masks them from its disassembly).
+- **Exits** (patch 0011; before it, patches 0005/0010 used FEX's `BLOCK_DEBUGGING` branch with a `State.rip` store and a
+  frame pointer load). Under `fexc_slice1`, `BranchOps.cpp::ExitFunction` emits an exit to a literal RIP as
+  `InsertGuestRIPMove(x0, rip)` (`movz/movn/orr` then `movk`s, a `guest_rip_move` relocation with register 0) and `svc #1`
+  (a link point: the resident's linker rewrites its first word into `b <target entry>`); a computed exit as `mov x0, xR`
+  and a placeholder `b .` recorded as a `dispatch_branch` relocation, which the resident relocates to its dispatcher when it
+  places the block. No literal, no frame access, no `br`; no exit-linker literal, `named_symbol_literal`, FEX jump thunk or
+  x25 call-return stack; `state_pointer_loads` is empty. Guest RIP constants for RIP-relative addresses and pushed return
+  addresses stay `guest_rip_move` into other registers. The block entry is a placeholder `bl .` (the stop check, relocated
+  to the stop pad); there is no header store.
 - **Block cutting.** Before each instruction `GenerateIR` asks `shim/fexc_slice1.inc` (`FexcSlice1::Cut`). If the instruction
   is outside the allowlist, the block ends before it: `ExitFunction` to its RIP (or, when it is the first instruction, no
   code: `status: no_code`, rc 1, with `guest.end`). `guest.end.reason` is `system_instruction` or `unsupported_form`, with
@@ -362,7 +369,7 @@ The site's `imm`, `writeback` and `writeback_delta` (address = base register val
 equals `writeback_delta`, post-index: `imm` is 0) are read from the emitted instruction word (FEX's `Push` with
 `NeedsMoveAfterwards` emits `stur [base,#-n]` and updates the base with a later `sub`, which is no writeback of the access).
 
-`--object FILE` (only when the status is `ok`) writes the binary form, version 3 (v2 plus `pre_nzcv_offset` at byte 124, the frame offset of the pre-NZCV save slot, 1032 under slice1 and `NONE32` otherwise): a 128-byte header, the code (relocation
+`--object FILE` (only when the status is `ok`) writes the binary form, version 4 (v2 plus `pre_nzcv_register` at byte 124, the register of the pre-NZCV save, 25 under slice1 and `NONE32` otherwise; version 3 had the frame offset 1032 there; relocation kind 4 is a `dispatch_branch`): a 128-byte header, the code (relocation
 slots zeroed), then site, PC-entry and relocation tables, layout in `crates/abi/src/code_object.rs`. Besides what the JSON
 carries per site (including `located`), the header records the profile, the `settings` bits (TSO, multiblock, dense PC, end
 marker), the end reason code (the `guest.end.reason` string), the feature profile (`feature_bits`: bit i is the i-th member
@@ -381,7 +388,7 @@ generated corpus and the 613-form matrix, except the host address of FEX's exit-
 | 2b | `...::EliminateDeadCode`, `RegisterAllocationPass.cpp::Run` (forward) | a guest load with a dead value (`cmp`/`test`/`bt [m]`) is kept; its destination register is freed at once |
 | 3 | `RegisterAllocationPass.cpp::Run` (backwards) | a guest-memory op and a guest instruction boundary (`GuestOpcode`) count as an access of every static register, so a value is coalesced into its SRA register only if no access (and no instruction boundary) lies between its definition and its store; this covers constants pooled across instructions. A load's own value never gets an SRA register (DDI0487 D1.4.1.4); a pop's writeback stack pointer stays in RSP's register (the access is its only write) |
 | 4 | `RegisterAllocationPass.cpp::Run` (forward) | `TryPostRAMerge`'s candidate is reset at `GuestOpcode`: no push/pop pair, no merge across instructions |
-| 5 | `RedundantFlagCalculationElimination.cpp::Run` | an instruction with an NZCV writer (FEX's flag table or `ImplicitFlagClobber`) before one of its accesses gets `LoadNZCV; StoreContext` (`mrs xT, nzcv; str wT, [x28, #1032]`) right after its `GuestOpcode`; its sites say `nzcv=frame`. The slot is `CPUState.flags[RFLAG_NZCV_LOC]`, FEX's own NZCV home outside the JIT, reported as `state_abi.state_offsets.natemu_pre_nzcv` (JSON only; the binary object has no field for it) |
+| 5 | `RedundantFlagCalculationElimination.cpp::Run` | an instruction with an NZCV writer (FEX's flag table or `ImplicitFlagClobber`) before one of its accesses is recorded in `fexc_pre_nzcv`; the JIT emits `mrs x25, nzcv` right after its `GuestOpcode` (patch 0011; before it, an IR `LoadNZCV; StoreContext` to the frame slot 1032); its sites say `nzcv=saved`. x25 is FEX's call-return stack pointer, unused under slice1, never allocated; reported as `state_abi.state_offsets.natemu_pre_nzcv_register` |
 
 The patch-3 boundary barrier is stricter than the contract (which only names accesses): it keeps every static-register
 write inside its own instruction, so each PC-table entry has the exact state and flag writes can be checked per instruction.
@@ -393,7 +400,7 @@ is `none`, or `unverified` if the recorder sees an earlier store site or an unsa
 
 `verify_precision.py [--before FEXC0] [CORPUS.json ...]` checks the guarantee on the emitted code (docstring: P1-P7):
 between a site's instruction start and the site no static-register (GPR, x26, x27, xmm) write, no store, no frame write
-but the pre-NZCV save, no NZCV write unless `nzcv=frame` with the save first; load destinations not static registers; at
+but the pre-NZCV save, no NZCV write unless `nzcv=saved` with the save first; load destinations not static registers; at
 most one store site per instruction and last; no fused pair; `completed_effects=none`; no skippable site; for annotated
 programs every flag a later site observes has a native write in its defining instruction (flags.py rules; coarse: any NZCV
 writer satisfies CF/ZF/SF/OF, any x26/x27 writer PF/AF); load destinations are read from the disassembly at the site; on
@@ -477,11 +484,11 @@ instruction; `verify_precision.py` P1/P2/P11 check it on the code.
 | idiv 8/16/32 | `sxt x1, wD; cbz x1`; dividend in 32 (8, 16) or 64 bits (32); `sdiv x0, x0, x1; sub x0, x0, w0, sxt{b,h,w}; cbnz x0` (6, 7, 7: the quotient does not fit W bits, -2^63 / -1 included) |
 | idiv 64 | `cbz xD` + RDX:RAX = -2^63 with divisor -1 (FEX's inline path) in 6 words; a 128-bit dividend takes LDIV, then `cbnz x2` (1) |
 
-FEX's 128/64 call is unchanged: `mov x0..x2 <- RDX, RAX, divisor; ldr x3, [x28, #Pointers.LUDIVHandler|LDIVHandler]; str x30, [sp,
-#-16]!; blr x3; ldr x30, [sp], #16`. The resident provides both handlers (runtime `natemu_ludiv`/`natemu_ldiv`; admission allows
-loads, never stores, of those two frame words): FEX's convention (x0 = high, x1 = low, x2 = divisor in; x0 = quotient, x1 =
-remainder out; x0-x3 clobbered), plus x2 = 1 for #DE; NZCV and all other registers preserved, no guest memory, 48 bytes of
-native stack. A divide op is a fault point for flag elimination (`FexcPrecision::FaultPoint`): the flags an earlier
+FEX's 128/64 call is `mov x0..x2 <- RDX, RAX, divisor` then (patch 0011) `svc #3` (div) or `svc #4` (idiv) instead of its
+`ldr x3, [x28, #Pointers.LUDIVHandler|LDIVHandler]; str x30, [sp, #-16]!; blr x3; ldr x30, [sp], #16`. The resident divides
+(runtime `division`, abi `execution::divide`): FEX's convention (x0 = high, x1 = low, x2 = divisor in; x0 = quotient, x1 =
+remainder out), plus x2 = 1 for #DE; only x0-x2 change, NZCV and all other registers preserved, no guest memory, no native
+stack. A divide op is a fault point for flag elimination (`FexcPrecision::FaultPoint`): the flags an earlier
 instruction defines stay computed before a div even when a later instruction overwrites them (found by P6 on fixture
 random-38: an `add`'s flags were eliminated before an `idiv`).
 
@@ -517,7 +524,8 @@ six self-loop programs, `emitted_value` aside), patch 0009:
   The field is `offsetof(InternalThreadState, InterruptFaultPage) - offsetof(.., BaseFrameState)` = 3776 = `0xec0`, JSON
   `state_abi.state_offsets.natemu_interrupt_fault_page` (slice1 only). FEX places that page directly after `CpuStateFrame`
   (4 KiB aligned); we only need the 8 bytes at `x28 + 3776` to lie in a region of their own.
-- **What the runtime must provide.** (1) `x28 + 3776` (8 bytes) is mapped writable in the resident's stage-1 tables and its IPA
+- **What the runtime must provide** (before patch 0011, which replaces the store with `bl .` to the resident's stop pad: a
+  kick takes execute permission from the pad's stage-2 granule). (1) `x28 + 3776` (8 bytes) is mapped writable in the resident's stage-1 tables and its IPA
   lies in a region that holds nothing else the vCPU or host writes, whose bounds are a multiple of the stage-2 granule (HVF
   protects at host-page granularity, 16 KiB on Apple silicon; `hv_vm_protect` rejects anything else). Simplest layout: the
   frame ends at a 16 KiB boundary S and the stop region is [S, S + 16 KiB), so x28 = S - 3776. The abi's 4096-byte frame

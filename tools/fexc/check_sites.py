@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1a check: fexc's access sites against the fixture programs and against the emitted code.
 
-usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series10 build)
+usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series11 build)
 
 --slice1 compiles with `--profile slice1` (S1c): hardware TSO (plain ldr/str), exits through the dispatcher gate, block
 cutting (no fixture instruction is cut since S3e admitted memory xchg, a `swap` site); the exit
@@ -44,7 +44,7 @@ def fixture_programs():
     if not path.exists():
         subprocess.run([sys.executable, '-B', str(REPO / 'tools/reference/build_slice1.py'), '--programs-only'], check=True)
     return json.loads(path.read_text())['programs']
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series10/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series11/obj/fexc')
 KNOWN_OK = False
 PROFILE = []   # extra fexc arguments for every compile: ['--profile', 'slice1'] under --slice1
 
@@ -152,7 +152,7 @@ def run(hexs, rip, tmp, *extra):
 def read_object(path):
     f = Path(path).read_bytes()
     h = struct.unpack_from('<8sIIIIQ14I20sBBBBQBB2sI', f, 0)
-    assert h[0] == b'NFXOBJ\0\x01' and h[1] in (2, 3) and h[2] == 128 and h[3] == len(f)   # 2: builds before the pre-NZCV header field
+    assert h[0] == b'NFXOBJ\0\x01' and h[1] in (2, 3, 4) and h[2] == 128 and h[3] == len(f)   # 2: builds before the pre-NZCV header field; 4: pre-NZCV register (series11)
     (_, _, _, _, bitness, rip, gbytes, ginsns, coff, csize, body, marker, region_end, spill, soff, scount, poff, pcount, roff, rcount,
      sra, nsra, profile, end_reason, settings, fbits, fcount, dcache, _, pre_nzcv) = h
     sites = [struct.unpack_from('<IIIIi20B', f, soff + 40 * i) for i in range(scount)]
@@ -174,10 +174,10 @@ def object_vs_json(o, d):
             ('ginsns', g['instructions_translated']), ('gbytes', g['bytes_translated']),
             ('fbits', sum(1 << i for i, v in enumerate(d['features']['host_features'].values()) if v)),
             ('fcount', len(d['features']['host_features'])), ('dcache', d['features']['dcache_line_log2']),
-            ('pre_nzcv', d['state_abi']['state_offsets'].get('natemu_pre_nzcv', 0xFFFFFFFF)),
+            ('pre_nzcv', d['state_abi']['state_offsets'].get('natemu_pre_nzcv_register', 0xFFFFFFFF)),
             ('pcs', len(d['pc_table']['entries'])), ('relocs', len(d['code']['relocations']))]
     for k, v in want:
-        if k == 'pre_nzcv' and o['version'] < 3:
+        if k == 'pre_nzcv' and o['version'] < 4:
             continue
         if o[k] != v:
             out.append(f'object {k}={o[k]} but JSON says {v}')
