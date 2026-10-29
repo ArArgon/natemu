@@ -2,8 +2,12 @@
 transactions, written from the Intel SDM (vol. 2: MOV - Move to/from Control Registers, INVLPG, RDMSR, WRMSR; vol. 3:
 2.2.1 EFER, 2.5 control registers, 4.5 CR3 in 4-level paging), not from natemu's code.
 
-Processor profile (natemu's CPU model, declared): Intel, MAXPHYADDR 40, 64-bit mode (CS.L = 1, EFER.LMA = 1), no PCID,
-no SMAP; the only MSR is IA32_EFER (others raise #GP(0)). CR4 bits of features the profile does not have are reserved.
+Processor profile (natemu's CPU model): read from `models/cpu_profile.json` through `models/cpu_profile.py`, which is the
+accepted CPU 16/17 profile (INV-03-01 CLM-03-01-16/-17) with a source on every value. This module no longer holds its own
+list: the valid CR0/CR4/EFER bits, the MAXPHYADDR of the CR3 check and the MSR set (index, writable mask, canonical,
+memory-type and MISC_ENABLE rules) all come from the profile, so a CR4 bit is valid only if its CPUID feature is
+advertised (SDM Vol. 3 2.5). 64-bit mode (CS.L = 1, EFER.LMA = 1) is assumed. x2APIC MSR indices (0x800-0x8ff) belong
+to the LAPIC owner and raise ValueError, like the unmodelled 0f 01 forms.
 
 `fault(code, gpr, cpl, cr0, cr4, efer)` -> (vector, error code) the instruction at the start of `code` raises, or None.
 Used where neither QEMU nor modes_model gives the answer: pinned QEMU 11.1.2 accepts several of these writes
@@ -11,14 +15,21 @@ Used where neither QEMU nor modes_model gives the answer: pinned QEMU 11.1.2 acc
 LME changes with paging on, unknown MSRs) and hangs on others (reserved CR4 bits, SMAP without SMAP, CR3 bits above
 MAXPHYADDR, clearing CR0.PG).
 """
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from models import cpu_profile
+
+PROFILE = cpu_profile.load()
 UD, GP = (6, 0), (13, 0)
-CR0 = dict(PE=0, MP=1, EM=2, TS=3, ET=4, NE=5, WP=16, AM=18, NW=29, CD=30, PG=31)
-# CR4 features of the profile (SDM vol. 3 §2.5): everything else, PCIDE (17) and SMAP (21) included, is reserved.
-CR4_PROFILE = dict(VME=0, PVI=1, TSD=2, DE=3, PSE=4, PAE=5, MCE=6, PGE=7, PCE=8, OSFXSR=9, OSXMMEXCPT=10, UMIP=11, LA57=12,
-                   VMXE=13, SMXE=14, FSGSBASE=16, OSXSAVE=18, SMEP=20, PKE=22)
-EFER = dict(SCE=0, LME=8, LMA=10, NXE=11)
-MSR_EFER = 0xC0000080
-MAXPHYADDR = 40
+_C = PROFILE.d['control']
+CR0 = {n: v['bit'] for n, v in _C['cr0']['bits'].items()}
+CR4_ALL = {n: v['bit'] for n, v in _C['cr4']['bits'].items()}
+# CR4 bits whose CPUID feature the profile advertises (everything else, PCIDE and SMAP included, is reserved).
+CR4_PROFILE = {n: v['bit'] for n, v in _C['cr4']['bits'].items() if v['valid']}
+EFER = {n: v['bit'] for n, v in _C['efer']['bits'].items()}
+MAXPHYADDR = PROFILE.d['identity']['maxphyaddr']
 
 
 def bits(names): return sum(1 << b for b in names.values())
@@ -56,11 +67,12 @@ def fault(code, gpr, cpl, cr0, cr4, efer):
         if cr == 3 and v >> MAXPHYADDR: return GP                        # bits 63:MAXPHYADDR (PCIDE = 0: bit 63 too)
         if cr == 4:
             if v & ~bits(CR4_PROFILE): return GP
-            if (v ^ cr4) & (1 << CR4_PROFILE['PAE'] | 1 << CR4_PROFILE['LA57']): return GP   # with EFER.LMA = 1
+            if (v ^ cr4) & (1 << CR4_ALL['PAE'] | 1 << CR4_ALL['LA57']): return GP   # with EFER.LMA = 1
     if op in (0x30, 0x32):
-        if gpr[1] & 0xFFFFFFFF != MSR_EFER: return GP
-        if op == 0x30:
+        idx = gpr[1] & 0xFFFFFFFF
+        if op == 0x32:
+            if not PROFILE.msr_read_ok(idx): return GP
+        else:
             v = (gpr[2] & 0xFFFFFFFF) << 32 | gpr[0] & 0xFFFFFFFF
-            if v & ~bits(EFER): return GP
-            if (v ^ efer) >> EFER['LME'] & 1 and cr0 >> CR0['PG'] & 1: return GP
+            if not PROFILE.msr_write_ok(idx, v, cr0=cr0, efer=efer): return GP
     return None

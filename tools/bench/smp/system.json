@@ -7536,6 +7536,908 @@
  },
  {
   "format": "natemu-smp-v1",
+  "name": "sysfault-cr4-vme@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be785600000f20e0480fbae8004839f30f22e0"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x110015"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-cr4-pvi@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be785600000f20e0480fbae8014839f30f22e0"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x110015"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-cr4-mce@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be785600000f20e0480fbae8064839f30f22e0"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x110015"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-cr4-umip@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be785600000f20e0480fbae80b4839f30f22e0"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x110015"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-cr4-la57@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be785600000f20e0480fbae80c4839f30f22e0"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x110015"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-cr4-vmxe@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be785600000f20e0480fbae80d4839f30f22e0"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x110015"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-cr4-smxe@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be785600000f20e0480fbae80e4839f30f22e0"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x110015"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-cr4-pke@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be785600000f20e0480fbae8164839f30f22e0"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x110015"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-wrmsr-fsbase-noncanonical@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be78560000b9000100c0b800000000ba008000004839f30f30"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x11001c"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-wrmsr-lstar-noncanonical@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be78560000b9820000c0b800000000ba008000004839f30f30"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x11001c"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-wrmsr-sysenter-eip-noncanonical@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be78560000b976010000b800000000ba008000004839f30f30"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x11001c"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-wrmsr-tsc-aux-high@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be78560000b9030100c0b800000000ba010000004839f30f30"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x11001c"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-wrmsr-pat-bad-type@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be78560000b977020000b802000000ba000000004839f30f30"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x11001c"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-wrmsr-misc-enable-eist@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be78560000b9a0010000b801180100ba000000004839f30f30"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x11001c"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-wrmsr-mtrr-def-type-reserved@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be78560000b9ff020000b806020000ba000000004839f30f30"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x11001c"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-wrmsr-mtrr-base-bad-type@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be78560000b900020000b802000000ba000000004839f30f30"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x11001c"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-wrmsr-ucode-rev-low@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be78560000b98b000000b801000000ba000000004839f30f30"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x11001c"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-wrmsr-bios-updt-trig@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be78560000b979000000b800000000ba000000004839f30f30"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x11001c"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-wrmsr-apic-base-extd-without-en@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be78560000b91b000000b80004e0feba000000004839f30f30"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x11001c"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-rdmsr-platform-info@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be78560000b9ce0000004839f30f32"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x110012"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-rdmsr-tsc-deadline@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be78560000b9e00600004839f30f32"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x110012"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
+  "name": "sysfault-rdmsr-bios-updt-trig@1",
+  "ncpu": 1,
+  "system": true,
+  "bodies": [
+   {
+    "addr": "0x110000",
+    "code": "bb34120000be78560000b9790000004839f30f32"
+   }
+  ],
+  "cpus": [
+   {
+    "rip": "0x110000",
+    "gpr": [
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x3e1800",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0",
+     "0x0"
+    ],
+    "rflags": 0,
+    "cpl": 0
+   }
+  ],
+  "memory": [],
+  "params": {
+   "fault_at": "0x110012"
+  }
+ },
+ {
+  "format": "natemu-smp-v1",
   "name": "sysfault-cr0-pg-clear@1",
   "ncpu": 1,
   "system": true,

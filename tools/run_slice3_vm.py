@@ -599,8 +599,24 @@ def either_check(prog, out):
 def unsupported_cases():
     """Instructions the resident refuses (`unsupported_system`), each alone at CPL0 after a flag-setting prefix."""
     cases = {'cr0-cd': 'mov rax, cr0\nbts rax, 30\nmov cr0, rax', 'cr4-osfxsr': 'mov rax, cr4\nbts rax, 9\nmov cr4, rax',
-             'mov-from-cr2': 'mov rax, cr2', 'mov-to-cr8': 'xor eax, eax\nmov cr8, rax', 'cr3-pwt': 'mov rax, cr3\nbts rax, 3\nmov cr3, rax'}
+             'mov-from-cr2': 'mov rax, cr2', 'mov-to-cr8': 'xor eax, eax\nmov cr8, rax', 'cr3-pwt': 'mov rax, cr3\nbts rax, 3\nmov cr3, rax',
+             # Valid under the CPU 16/17 profile but not implemented yet (S1/S2): the resident must refuse, never #GP.
+             'cr4-pce': 'mov rax, cr4\nbts rax, 8\nmov cr4, rax', 'rdmsr-apic-base': 'mov ecx, 0x1b\nrdmsr',
+             'rdmsr-pat': 'mov ecx, 0x277\nrdmsr', 'wrmsr-pat': 'mov ecx, 0x277\nmov eax, 0x00070406\nmov edx, 0x00070406\nwrmsr',
+             'rdmsr-tsc-aux': 'mov ecx, 0xC0000103\nrdmsr', 'wrmsr-fs-base': 'mov ecx, 0xC0000100\nxor eax, eax\nxor edx, edx\nwrmsr',
+             'rdmsr-misc-enable': 'mov ecx, 0x1a0\nrdmsr', 'rdmsr-mtrrcap': 'mov ecx, 0xfe\nrdmsr'}
     return {k: ref.assemble('mov rbx, 1\n' + v).hex() for k, v in cases.items()}
+
+
+# Resident behaviour that disagrees with the CPU 16/17 profile (tools/models/cpu_profile.json, via tools/system_fault_model.py)
+# and is waiting for chunk S1/S2: the case runs and its mismatch is printed as GAP, not counted as a failure. A listed case that
+# starts to pass is a failure, so the entry must be deleted when the resident is fixed.
+SYSTEM_GAPS = {
+    **{f'sysfault-cr4-{n}@1': 'crates/runtime/src/execution.rs CR4_UNSUPPORTED (0x457f5f) refuses the write as unsupported_system instead of #GP; '
+                              'CPUID bit clear in the profile makes the bit reserved (SDM Vol.3 2.5)' for n in ('vme', 'pvi', 'mce', 'umip', 'vmxe', 'smxe', 'pke')},
+    **{f'unsupported {n}': 'resident raises #GP for every MSR but EFER (execution.rs:724); the profile has this MSR (CPU 16/17, SDM Vol.4)'
+       for n in ('rdmsr-apic-base', 'rdmsr-pat', 'wrmsr-pat', 'rdmsr-tsc-aux', 'wrmsr-fs-base', 'rdmsr-misc-enable', 'rdmsr-mtrrcap')},
+}
 
 
 def cmd_system(a, host, runtime):
@@ -611,7 +627,7 @@ def cmd_system(a, host, runtime):
     from models import modes_model as modes
     programs = [p for p in json.loads((ROOT / 'tools/bench/smp/system.json').read_text()) if not a.programs or any(n in p['name'] for n in a.programs)]
     stub = smp.build_stub(a.out / 'qemu-build')
-    report, failures = [], []
+    report, failures, gaps = [], [], []
 
     def qemu(prog, label, timeout=120):
         rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), a.out / 'qemu' / label, 'multi', timeout=timeout)
@@ -669,8 +685,10 @@ def cmd_system(a, host, runtime):
                     diffs += smp.compare(prog, vm_state(prog, out), want)
             entry['runs'].append({'max_block': limit[0] if limit else None, 'diffs': diffs,
                                   'systems': out and [c['stats']['systems'] for c in out['cpus']]})
-            failures += [f"{name}{' (max-block 1)' if limit else ''}: {d}" for d in diffs]
-        print(f"{name}: {'ok' if not any(r['diffs'] for r in entry['runs']) else 'FAIL'}"
+            (gaps if name in SYSTEM_GAPS else failures).extend([f"{name}{' (max-block 1)' if limit else ''}: {d}" for d in diffs])
+        bad = any(r['diffs'] for r in entry['runs'])
+        if name in SYSTEM_GAPS and not bad: failures.append(f'{name}: listed in SYSTEM_GAPS but passes')
+        print(f"{name}: {('GAP' if name in SYSTEM_GAPS else 'FAIL') if bad else 'ok'}"
               + (f"; QEMU full run: {entry['qemu']}" if 'qemu' in entry else '') + (f"; modes model {entry['modes_model']}" if 'modes_model' in entry else '')
               + (f"; history {entry['either']}" if 'either' in entry else ''), flush=True)
         report.append(entry)
@@ -679,9 +697,11 @@ def cmd_system(a, host, runtime):
         text = f'cpl 0\nrip 0x110000\ncode {code}\n'
         rc, out, err = driver(host, runtime, a.fexc, text, a.out / 'work' / f'unsupported-{name}')
         ok = rc == 0 and out['stop'] == 'resident' and out['reason'].startswith('unsupported_system') and smp.num(out['gpr'][3]) == 1
-        print(f'unsupported {name}: {"ok" if ok else "FAIL"} {out and (out["stop"], out["reason"], out["rip"])}', flush=True)
+        print(f'unsupported {name}: {"ok" if ok else ("GAP" if f"unsupported {name}" in SYSTEM_GAPS else "FAIL")} {out and (out["stop"], out["reason"], out["rip"])}', flush=True)
         report.append({'name': f'unsupported-{name}', 'ok': ok})
-        if not ok: failures.append(f'unsupported {name}: {rc} {out and out["reason"]} {err.strip()[-200:]}')
+        if f'unsupported {name}' in SYSTEM_GAPS:
+            (gaps if not ok else failures).append(f'unsupported {name}: ' + (f'{rc} {out and out["stop"]} {out and out["reason"]}' if not ok else 'listed in SYSTEM_GAPS but passes'))
+        elif not ok: failures.append(f'unsupported {name}: {rc} {out and out["reason"]} {err.strip()[-200:]}')
     # A malformed system reply (driver `--tamper system`: length 16) is refused before anything of it runs.
     if not a.programs:
         prog = next(p for p in programs if p['name'] == 'sys-cr3-switch@1')
@@ -691,8 +711,9 @@ def cmd_system(a, host, runtime):
         print(f'tampered system reply: {"ok" if ok else "FAIL"} {stops}', flush=True)
         report.append({'name': 'tamper-system', 'ok': ok, 'stops': stops})
         if not ok: failures.append(f'tampered system reply: {rc} {stops} {err.strip()[-200:]}')
+    for g in gaps: print('GAP', g, '--', SYSTEM_GAPS[g.split(':')[0].replace(' (max-block 1)', '')])
     for f in failures: print(f)
-    (a.out / 'system.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
+    (a.out / 'system.json').write_text(json.dumps({'report': report, 'failures': failures, 'gaps': gaps}, indent=1, default=str) + '\n')
     return len(failures)
 
 
