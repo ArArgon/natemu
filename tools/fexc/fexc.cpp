@@ -311,7 +311,7 @@ static void ResetGlobals() {
   Diagnostics.clear();
   W = {};
   fexc_sites.clear(); fexc_insns.clear(); fexc_cf_inverted.clear(); fexc_spill_bytes = 0; fexc_cut = {};
-  fexc_rip_relative.clear(); fexc_rmw_same_address.clear(); fexc_target_check.clear(); fexc_div_width.clear();
+  fexc_rip_relative.clear(); fexc_target_check.clear(); fexc_div_width.clear();
 }
 
 // The CLI's body. `args` are the command-line arguments (args[0] is the program name); `given` replaces --hex/--file with the
@@ -707,7 +707,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
   j.kv("per_access", "present: sites[] (native offset, guest instruction, kind, width, intent, address registers and offset form, segment, writeback, data registers)");
   if (slice1) {
     j.kv("flag_location_at_site", "nzcv=pstate (PSTATE) or nzcv=saved (in register state_abi.state_offsets.natemu_pre_nzcv_register, saved at the instruction start), with cf_inverted at the guest instruction start");
-    j.kv("guest_state_at_fault", "present (precision patches 2-5): at each site with completed_effects=none, static registers, PF/AF and NZCV (per nzcv) hold the state before the site's guest instruction; checked on the code by verify_precision.py. Guard sites (brk stubs): the address guard before every non-RIP-relative access (#GP(0), #SS(0) for segment=ss) and the check of every indirect branch target (base_reg = target register, #GP(0)); split sites: a store wider than 1 byte (read-modify-write included) crossing a 4 KiB page (the runtime completes it all-or-nothing and resumes after access_native_offset). Same state at a stub as at its access; checked by verify_precision.py");
+    j.kv("guest_state_at_fault", "present (precision patches 2-5): at each site with completed_effects=none, static registers, PF/AF and NZCV (per nzcv) hold the state before the site's guest instruction; checked on the code by verify_precision.py. Guard sites (brk stubs): the check of every indirect branch target (base_reg = target register, #GP(0)); no address guard (E3: a non-canonical access faults in hardware at its site); split sites: a store wider than 1 byte (read-modify-write included) crossing a 4 KiB page (the runtime completes it all-or-nothing and resumes after access_native_offset). Same state at a stub as at its access; checked by verify_precision.py");
     j.kv("committed_effects", "completed_effects=none per site (unverified if the recorder saw an earlier store site or an unsaved NZCV write in the instruction)");
   } else {
     j.kv("flag_location_at_site", "nzcv=pstate with cf_inverted at the guest instruction start, plus flags_written_before_site; the saved copy (nzcv=saved) is absent until the precision patches");
@@ -717,7 +717,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
   j.kv("pc_table", st.dense_pc ? "present_dense" : "present_sparse");
   j.kv("static_register_map", "present").kv("flag_representation", "NZCV in PSTATE with carry inverted per cf_inverted; PF/AF in x26/x27 (see state_abi)");
   j.kv("spill_bytes", "present: code.layout.spill_bytes");
-  j.kv("note", slice1 ? "Sites are recorded from the final IR after register allocation, so each is exact for the emitted code. Profile slice1 adds the precision patches, block cutting, single-gate exits, guard and split stubs."
+  j.kv("note", slice1 ? "Sites are recorded from the final IR after register allocation, so each is exact for the emitted code. Profile slice1 adds the precision patches, block cutting, single-gate exits, branch-target and split stubs."
                        : "Sites are recorded from the final IR after register allocation, so each is exact for the emitted code. What is still absent is the guarantee that guest state at a site equals the state before its guest instruction (slice-1 chunk S1b), the address guard and split-store check, and block cutting/exits (S1c).");
   j.end_obj();
   j.arr("diagnostics");

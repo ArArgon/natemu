@@ -383,7 +383,7 @@ fn page_span(start: u64, length: usize) -> impl Iterator<Item = u64> {
 }
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] \
-                     [--code-cache BYTES] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-exit] [--tamper offset|word|record|system] [--tamper-after word|record] \
+                     [--code-shape] [--code-cache BYTES] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-exit] [--tamper offset|word|record|system] [--tamper-after word|record] \
                      [--forge-stop] [--forge-entry HEX[,HEX]...] [--kick-vcpu V]... [--kicks M] [--kick-every-us P] [--kick-jitter-us J] [--tamper next-page|site|site-kind|armed|dispatch|target] [--ignore-kicks] [--kill-compiler N] [--stall-compiler N] [--compile-deadline-ms MS]";
 
 /// Every literal exit's RIP move puts another RIP in x0: bit 0 of the immediate of its last word (the one before its
@@ -575,10 +575,12 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let (mut tamper, mut tamper_after): (Option<fn(Area, &mut State) -> bool>, Option<Corrupt>) = (None, None);
     let (mut forge_stop, mut forged, mut kicked, mut kicks, mut every_us, mut jitter_us) = (false, None, Vec::new(), 10_000, 0, 0);
     let (mut ignore_kicks, mut signal_at, mut deadline_ms) = (false, None, execution::COMPILE_DEADLINE.as_millis() as u64);
+    let mut code_shape = false;
     let mut options = options.iter();
     while let Some(option) = options.next() {
         let mut value = || -> Result<usize> { options.next().and_then(|v| v.parse().ok()).ok_or(USAGE.into()) };
         match option.as_str() {
+            "--code-shape" => code_shape = true,
             "--code-cache" => code_bytes = value()?,
             "--watchdog-ms" => watchdog_ms = value()? as u64,
             "--tamper-vcpu" => target = value()?,
@@ -681,6 +683,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let run_vcpu = |v: usize, cpu: &Vcpu, cancelled: &AtomicBool| -> Result<(Stop, Compiler, execution::Requests)> {
         let mut compiler = Compiler::new(Path::new(fexc), cpu, max_instructions)?;
         compiler.deadline = std::time::Duration::from_millis(deadline_ms);
+        compiler.shape = code_shape;
         let mut requests = execution::Requests::default();
         if v == target {
             compiler.tamper = forge.then_some(forge_exit as fn(&mut [u8]));

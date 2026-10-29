@@ -28,42 +28,21 @@ inline bool FaultPoint(FEXCore::IR::IROps Op) {
 // allocator never hands it out and no other word writes it (admission checks this).
 inline constexpr uint32_t PreNzcvReg = 25;
 
-// Profile slice1 (address guard, branch-target check): called at the start of register allocation, while operands are
+// Profile slice1 (split-store check, branch-target check): called at the start of register allocation, while operands are
 // still SSA nodes. Records each guest load/store whose base is an EntrypointOffset (a RIP-relative operand: its address
-// is a compile-time constant), each store that uses its instruction's load address (the same SSA values: the store of a
-// read-modify-write needs no second guard), and for each ExitFunction with a computed RIP the node after which the JIT checks it: the
+// is a compile-time constant), and for each ExitFunction with a computed RIP the node after which the JIT checks it: the
 // target's definition when that lies inside the exit's guest instruction (after its GuestOpcode), else the GuestOpcode.
 inline void Prescan(const FEXCore::IR::IRListView& IR) {
   using namespace FEXCore::IR;
   fexc_rip_relative.clear();
   fexc_target_check.clear();
-  fexc_rmw_same_address.clear();
-  const IROp_LoadMem* Load = nullptr;   // the instruction's last plain load
-  auto SameOffset = [&](OrderedNodeWrapper A, OrderedNodeWrapper B) {
-    if (A == B) return true;
-    if (A.IsInvalid() || B.IsInvalid()) return false;
-    const auto a = IR.GetOp<IROp_Header>(A), b = IR.GetOp<IROp_Header>(B);
-    return a->Op == OP_INLINECONSTANT && b->Op == OP_INLINECONSTANT &&
-           a->C<IROp_InlineConstant>()->Constant == b->C<IROp_InlineConstant>()->Constant;
-  };
   std::vector<uint32_t> Owner(IR.GetSSACount(), ~0u);   // node ID -> GuestOpcode node ID in force
   uint32_t Guest = ~0u;
   for (auto [BlockNode, BlockHeader] : IR.GetBlocks()) {
     for (auto [CodeNode, IROp] : IR.GetCode(BlockNode)) {
       const uint32_t ID = IR.GetID(CodeNode).Value;
-      if (IROp->Op == OP_GUESTOPCODE) {
-        Guest = ID;
-        Load = nullptr;
-      }
+      if (IROp->Op == OP_GUESTOPCODE) Guest = ID;
       Owner[ID] = Guest;
-      if (IROp->Op == OP_LOADMEM) Load = IROp->C<IROp_LoadMem>();
-      if (IROp->Op == OP_STOREMEM && Load) {
-        const auto St = IROp->C<IROp_StoreMem>();
-        if (St->Addr == Load->Addr && SameOffset(St->Offset, Load->Offset) && St->OffsetType == Load->OffsetType &&
-            St->OffsetScale == Load->OffsetScale) {
-          fexc_rmw_same_address.insert(ID);
-        }
-      }
       OrderedNodeWrapper Addr = OrderedNodeWrapper::WrapOffset(0);
       switch (IROp->Op) {
       case OP_LOADMEM: Addr = IROp->C<IROp_LoadMem>()->Addr; break;

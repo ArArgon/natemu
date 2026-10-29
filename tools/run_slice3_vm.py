@@ -88,7 +88,8 @@ contended A/D walks (data, fetch, both) that must never halt; at 2 and 4 vCPUs (
 `prepare` refuses 0 in its unit test); a forged literal exit (its RIP move altered after admission) on vCPU V of 4 (V = 0..3; the others spin in a linked
 loop) halts V with bad_reply (the resident decodes each link point's move at the reply), cancels and joins the others, and the VM is destroyed (the driver reports only then).
 
-`contain` (S3h, containment and progress; runs one at a time, each a fresh process). Every failing run must exit as stated,
+`contain` (S3h, containment and progress; runs one at a time, each a fresh process; admission's code-shape debug check
+off, as by default: containment must hold with object validation alone, E3). Every failing run must exit as stated,
 end within its bound (10 s; watchdog runs: the watchdog + 5 s) and print the driver's teardown line with every vCPU joined
 and destroyed, the VM destroyed (status 0) and no child process left (no compile server alive or unreaped); each is
 followed at once by a fresh process running fixture programs on as many vCPUs, which must match QEMU. (1, 4) Every
@@ -130,7 +131,7 @@ def driver(host, runtime, fexc, text, work, extra=(), timeout=None):
     work.mkdir(parents=True, exist_ok=True)
     (work / 'program.txt').write_text(text)
     try:
-        run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work, *map(str, extra)],
+        run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work, *CODE_SHAPE, *map(str, extra)],
                              capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired as e:
         err = e.stderr.decode(errors='replace') if isinstance(e.stderr, bytes) else e.stderr or ''
@@ -817,6 +818,8 @@ def cmd_sharedpt(a, host, runtime):
 
 
 # ---- contain (S3h): containment and progress --------------------------------------------------------------------------
+# The driver's code-shape option (admission's debug check), on for every mode but `contain` (main clears it there).
+CODE_SHAPE = vm.CODE_SHAPE
 LOOP = 'rip 0x100000\nbody 0x100000 ebfe\n'          # jmp $: a linked loop with no exit, in its own space
 TEARDOWN = 'teardown: vcpus {n} joined {n} destroyed {n} vm_destroy 0 children none'
 SLACK = 5                                             # seconds a contain run may outlive its bound before it is killed
@@ -847,7 +850,10 @@ def tamper_kinds(fixture):
             # Not LOOP: its entry word is its exit's link point, which the reply check refuses (bad_reply) once forged.
             ('forge-stop', ['--kicks', 1, '--forge-stop'], fixture, 'bad_stop'),
             ('armed', ['--kicks', 1, '--tamper', 'armed'], LOOP, 'bad_stop'),
-            # EL0 isolation by hardware (E2): words admission never admits, forged over the first block's entry.
+            # EL0 isolation by hardware (E2, E3): words forged over the first block's entry after admission. With the
+            # code-shape check off (contain's setting) admission's object validation alone would still refuse most of
+            # them (x28 operands, branches, svc); the system words that name no x25/x28 it would admit as unknown words,
+            # which the hardware traps. Either way the defence measured here is the hardware's.
             *[(f'el0-{name}', ['--forge-entry', words], fixture, stop) for name, words, stop in EL0_FORGED]]
 
 
@@ -1100,6 +1106,9 @@ def main():
     if a.mode == 'sharedpt' and '--cpus' not in sys.argv: a.cpus = [2, 4]
     a.out.mkdir(parents=True, exist_ok=True)
     host, runtime = vm.build()
+    if a.mode == 'contain':
+        global CODE_SHAPE
+        CODE_SHAPE = []   # containment holds with object validation alone (the host's default)
     if a.mode == 'kicks' and a.kicks is None: a.kicks = 10_000
     failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'litmus': cmd_litmus, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'coherence': cmd_coherence, 'sharedpt': cmd_sharedpt, 'contain': cmd_contain}[a.mode](a, host, runtime)
     print('failures:', failed)

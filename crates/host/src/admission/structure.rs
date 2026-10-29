@@ -1,41 +1,45 @@
-//! Structural verification of a slice-1 code region: the isolation and precision checks fexc emits are verified on
-//! the native words, every time, instead of being trusted to the producer and its offline verifier
-//! (`tools/fexc/verify_precision.py` P8-P11). One linear pass decodes every executable word with a small table of the
-//! A64 classes fexc emits (anything else is refused, never guessed) and applies the per-word rules; each access site,
-//! check stub and exit is then verified in a short backward window. Generated code touches no emulator data: its only
-//! ways into the resident are `svc`, the check stubs, aborts and interrupts. Rules:
+//! Structural verification of a slice-1 code region, in two parts. Generated code runs at EL0, where the hardware
+//! isolates the resident (system instructions trap, private pages are EL1-only or execute-only, every non-canonical
+//! address faults); its only ways into the resident are `svc`, the check stubs, aborts and interrupts, and the resident
+//! classifies each by the block's records. One linear pass decodes every word with a small table of the A64 classes
+//! fexc emits.
 //!
-//! - Words: only the decoded classes; `mrs`/`msr` of NZCV only; no `ret`, `bl`, `br`, `blr`, system or SIMD instruction; the
-//!   only exception-generating words are the stubs' `brk` and `svc #LINK` / `#DIV_U` / `#DIV_S` (below); x28 is never
-//!   written, x25 only by `mrs x25, nzcv` (the pre-NZCV save); sp is neither written nor accessed; direct branches go
-//!   forward to a decoded word of the code region; no word falls through into a literal slot or past the region; there
-//!   are no literal loads.
-//! - Memory: base x28 (FEX's guest-state frame) only inside its guest-state fields (`frame::GUEST_STATE`, none for
-//!   slice 1). Every other access is an access site whose record matches the word.
-//! - Address guard: every access not addressed by a guest-RIP move is preceded in its instruction by `eor x0, xA, xA,
-//!   lsl #16; tbnz x0, #63, G` (or `tbz x0, #63, +8; b G`), G a guard stub linked to it, xA its base or x1 computed as
-//!   exactly its address (`add|sub x1, base, #imm`, `add x1, base, index{, ext #s}`, or a mov/movk constant into x1 and
-//!   `add x1, base, x1`); base and index unchanged up to the access. A read-modify-write store may share its load's
-//!   guard. A guest-RIP-addressed access has its move's value checked (decoded constant = relocation value, and the
-//!   value is the instruction end plus a displacement found in its bytes); a non-canonical address needs `b G` right
-//!   before the access.
-//! - Split: every store wider than one byte has `add x0, xA, #w-1; eor x0, x0, xA; tbnz w0, #12, S` on exactly its
-//!   address, only x0/x1 written between it and the store (guest-RIP-addressed: `b S` iff it crosses a page).
+//! **Object validation (always):** what the resident relies on to place, link, stop and recover the block.
+//! - Words: a word the decoder does not know is admitted only if it is no branch or exception-generating word and
+//!   names neither x25 nor x28 in any register field ([`screened`]); x28 (FEX's guest-state base) is never written and
+//!   addresses only FEX's guest-state fields (`frame::GUEST_STATE`, none for slice 1); x25 is written only by `mrs x25,
+//!   nzcv` (the pre-NZCV save the resident reads at `nzcv=saved` sites); the only `svc`s are `#LINK`, `#DIV_U` and
+//!   `#DIV_S`; direct branches go forward to a word of the code region; no word falls through into a literal slot, a
+//!   check stub or past the region. So every path ends at an exit the resident knows (a link point or the dispatch
+//!   branch, which a precise stop patches) or at a check stub.
+//! - Sites: each access site lies inside its guest instruction and its word is a load, store or swap exactly as recorded
+//!   (the resident computes the faulting address and completes split stores from the record).
 //! - Exits: a literal exit is a link point, exactly a guest-RIP move into x0 then `svc #LINK`, its value the block end
 //!   or the decoded target of its branch, and no branch enters it after its first word (the linker rewrites that word
-//!   to `b` the target's entry; a precise stop patches it to the resident's stop `brk`); `svc #LINK` occurs nowhere else. A computed exit (at most one) is exactly `mov x0, xR;
-//!   b .` at a dispatch relocation (the resident relocates the `b` to its dispatcher, and a stop patches it), with `eor x0, xG, xG, lsl #16;
-//!   tbnz x0, #63, G` in its instruction (G a branch-target guard, xG's value reaching xR through moves) and no branch
-//!   into it after the check. Admission returns the link points and the dispatch branch.
+//!   to `b` the target's entry; a precise stop patches it to the resident's stop `brk`); `svc #LINK` occurs nowhere
+//!   else. A computed exit (at most one) is exactly `mov x0, xR; b .` at a dispatch relocation (the resident relocates
+//!   the `b` to its dispatcher, and a stop patches it). Admission returns the link points and the dispatch branch.
+//! - Guest-RIP moves: each decodes to its relocation's value, the instruction end plus a displacement in its bytes.
+//! - Division: each `svc #DIV_U` / `#DIV_S` lies in a 64-bit div / idiv.
+//!
+//! **Code shape (debug, `Code::shape`; off by default, on in the test suites):** that fexc emitted the x86 checks
+//! exactly and nothing else, a producer-correctness check whose violation stays confined to the vCPU's guest.
+//! - Words: only the decoded classes (no system, SIMD, `ret`, `bl`, `br` or `blr` word; `brk` only at stubs); sp is
+//!   neither written nor accessed; no literal loads; every load and store is an access site; a swap keeps its result.
+//! - Split: every store wider than one byte has `add x0, xA, #w-1; eor x0, x0, xA; tbnz w0, #12, S` on exactly its
+//!   address (xA its base, or x1 computed as exactly its address: `add|sub x1, base, #imm`, `add x1, base, index{, ext
+//!   #s}`, or a mov/movk constant into x1 and `add x1, base, x1`), only x0/x1 written between it and the store
+//!   (guest-RIP-addressed: `b S` iff it crosses a page, nothing entering between the move and the access).
+//! - Branch target: the computed exit's RIP is checked by `eor x0, xG, xG, lsl #16; tbnz x0, #63, G` in its
+//!   instruction (G a branch-target stub, xG's value reaching xR through moves; x86 raises #GP at the branch).
 //! - Division: each div/idiv (from its x86 opcode: width, signedness) has exactly its per-width #DE checks, in their
 //!   exact form, before FEX's divide, reading that divide's own divisor (and, at 8 bits, dividend) registers; the
-//!   128/64 division (`svc #DIV_U` for div, `#DIV_S` for idiv) gets the same divisor and is followed by `cbnz x2, D`.
+//!   128/64 division is followed by `cbnz x2, D`.
 //! - Every stub is reached by exactly one branch, which is one of the checks above, and no branch enters a check's
 //!   window (from the check's first word to the access, exit or divide) from before it.
 //!
-//! Premise: register values derived from x28 (a private address) may flow anywhere, because every guest access is
-//! guarded on its exact address and every private address has bit 47 != bit 63 (non-canonical). x30 is an ordinary
-//! allocator temporary: no `bl` is admitted, so it never holds a return address the resident relies on.
+//! There is no address guard (E3): a guest access to a non-canonical address faults at its site and the resident
+//! raises #GP/#SS from the record. x30 is an ordinary allocator temporary: no `bl` is admitted.
 use std::ops::Range;
 
 use natemu_abi::code_object::{self as object, PcEntry, Reloc, Site};
@@ -89,6 +93,8 @@ enum Insn {
     Dispatch,
     Brk,
     Udf,
+    /// A word the decoder does not know, admitted by [`screened`] with the code-shape check off: no branch, no x25/x28.
+    Other,
 }
 impl Insn {
     /// Registers written (bit 31: sp).
@@ -209,12 +215,26 @@ fn memory(w: u32) -> Option<Insn> {
     Some(Insn::Mem(Mem { load, size: 1 << size, rt, form, addr, delta }))
 }
 
+/// Object validation of a word the decoder does not know (admitted only with the code-shape check off; the hardware
+/// contains whatever it does at EL0): nothing from the branch, exception-generating and system group (op0 = x101) but
+/// its system class (0xd5: MSR/MRS/SYS/hints/barriers, which trap or are harmless at EL0), so no branch of any present
+/// or future encoding (e.g. Armv9.6 CMPBR) can loop or skip an exit: every exit, stop and resident entry is a form
+/// verified here. And no register field names x25 or x28 (CASP's pairs: nor x24 or x27), so it neither writes them
+/// nor addresses the frame through x28. ponytail: conservative, refuses any such word even when the field is an
+/// immediate; LD64B (8 registers) is UNDEFINED on the M4 and traps at EL0.
+fn screened(w: u32) -> bool {
+    let branch = w & 0x1c00_0000 == 0x1400_0000 && w >> 24 != 0xd5;
+    let pair = w & 0xbfa0_7c00 == 0x0820_7c00; // casp: Rs, Rs+1 and Rt, Rt+1
+    let named = |r: u32| r == 25 || r == 28 || (pair && (r == 24 || r == 27));
+    !branch && ![w & 31, w >> 5 & 31, w >> 10 & 31, w >> 16 & 31].into_iter().any(named)
+}
+
 // Exact words of the fixed sequences.
 const SVC_LINK: u32 = 0xd400_0001 | (svc::LINK as u32) << 5;
 const SVC_DIV_U: u32 = 0xd400_0001 | (svc::DIV_U as u32) << 5;
 const SVC_DIV_S: u32 = 0xd400_0001 | (svc::DIV_S as u32) << 5;
 const MRS_PRE_NZCV: u32 = 0xd53b_4200 | PRE_NZCV_REG as u32; // mrs x25, nzcv
-/// `eor x0, xA, xA, lsl #16`
+/// `eor x0, xA, xA, lsl #16` (the branch-target check)
 fn eor_guard(a: u32) -> u32 {
     0xca00_4000 | a << 16 | a << 5
 }
@@ -260,6 +280,8 @@ pub(super) struct Code<'a> {
     pub guest_bytes: u32,
     /// The guest RIPs a literal exit may go to: the block end, and the direct target of the branch ending it.
     pub targets: &'a [u64],
+    /// Also run the code-shape check (debug).
+    pub shape: bool,
 }
 
 pub(super) fn canonical(a: u64) -> bool {
@@ -282,17 +304,22 @@ struct Verifier<'a> {
     dispatch: Option<u32>,
 }
 
-/// Verifies the code; returns its link points and its computed exit's dispatch branch.
+/// Verifies the code (object validation, and the code-shape check when `c.shape`); returns its link points and its
+/// computed exit's dispatch branch.
 pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>), String> {
     let mut v = Verifier::new(c)?;
     v.words()?;
-    v.sites()?;
     v.exits()?;
-    v.divisions()?;
-    match v.claimed.iter().position(|&ok| !ok) {
-        Some(i) => Err(format!("stub at {:#x} is reached by no check of its kind", c.stubs[i].native_offset)),
-        None => Ok((v.links, v.dispatch)),
+    if c.shape {
+        v.stub_checks()?;
+        v.sites()?;
+        v.branch_target()?;
+        v.divisions()?;
+        if let Some(i) = v.claimed.iter().position(|&ok| !ok) {
+            return Err(format!("stub at {:#x} is reached by no check of its kind", c.stubs[i].native_offset));
+        }
     }
+    Ok((v.links, v.dispatch))
 }
 
 impl<'a> Verifier<'a> {
@@ -304,7 +331,11 @@ impl<'a> Verifier<'a> {
                 continue;
             }
             let w = u32::from_le_bytes(c.code[i * 4..i * 4 + 4].try_into().unwrap());
-            *slot = Some(decode(w, i as u32 * 4).ok_or(format!("unrecognised instruction {w:#010x} at {:#x}", i * 4))?);
+            *slot = Some(match decode(w, i as u32 * 4) {
+                Some(insn) => insn,
+                None if !c.shape && screened(w) => Insn::Other,
+                None => return Err(format!("unrecognised instruction {w:#010x} at {:#x}", i * 4)),
+            });
         }
         // The computed exit's branch placeholder, relocated by the resident (at most one: a block ends at one branch).
         let mut dispatch = None;
@@ -344,21 +375,26 @@ impl<'a> Verifier<'a> {
                 v.moves.push((words, r.register, value));
             }
         }
-        for s in c.stubs {
-            let reached: Vec<u32> = v.branches_into(s.native_offset - 1, s.native_offset).map(|(src, _)| src).collect();
+        Ok(v)
+    }
+
+    /// Code shape: how each stub is reached (exactly one branch).
+    fn stub_checks(&mut self) -> Result<(), String> {
+        for s in self.c.stubs {
+            let reached: Vec<u32> = self.branches_into(s.native_offset - 1, s.native_offset).map(|(src, _)| src).collect();
             let [src] = reached[..] else {
                 return Err(format!("stub at {:#x} is reached by {} branches", s.native_offset, reached.len()));
             };
-            let check = match v.insn(src) {
-                Some(Insn::Cond(_)) => Check { start: src, end: src, cond: Some(normalize(v.word(src))) },
-                _ if src >= 4 && matches!(v.insn(src - 4), Some(Insn::Cond(t)) if t == src as i64 + 4) && is_cbtb(v.word(src - 4)) => {
-                    Check { start: src - 4, end: src, cond: Some(normalize(v.word(src - 4)) ^ 1 << 24) }
+            let check = match self.insn(src) {
+                Some(Insn::Cond(_)) => Check { start: src, end: src, cond: Some(normalize(self.word(src))) },
+                _ if src >= 4 && matches!(self.insn(src - 4), Some(Insn::Cond(t)) if t == src as i64 + 4) && is_cbtb(self.word(src - 4)) => {
+                    Check { start: src - 4, end: src, cond: Some(normalize(self.word(src - 4)) ^ 1 << 24) }
                 }
                 _ => Check { start: src, end: src, cond: None },
             };
-            v.checks.push(check);
+            self.checks.push(check);
         }
-        Ok(v)
+        Ok(())
     }
 
     fn word(&self, at: u32) -> u32 {
@@ -448,16 +484,18 @@ impl<'a> Verifier<'a> {
         disp == 0 || i32::try_from(disp).is_ok_and(|d| insn.windows(4).any(|b| b == d.to_le_bytes()))
     }
 
-    /// The per-word rules of the linear pass.
+    /// The per-word rules of the linear pass, then the site words.
     fn words(&self) -> Result<(), String> {
         let fail = |at: u32, what: &str| Err(format!("{what} at {at:#x}"));
+        let shape = self.c.shape;
+        let site = |at: u32| self.c.accesses.binary_search_by_key(&at, |s| s.native_offset).is_ok();
         for at in (ENTRY_OFFSET..self.c.code.len() as u32).step_by(4) {
             let Some(i) = self.insn(at) else { continue };
             let w = self.word(at);
             if i.writes() & 1 << 28 != 0 {
                 return fail(at, "write to x28");
             }
-            if i.writes() & 1 << 31 != 0 {
+            if shape && i.writes() & 1 << 31 != 0 {
                 return fail(at, "write to sp");
             }
             if i.writes() & 1 << PRE_NZCV_REG != 0 && w != MRS_PRE_NZCV {
@@ -466,24 +504,49 @@ impl<'a> Verifier<'a> {
             match i {
                 Insn::Mem(m) => match m.addr.base {
                     28 => self.frame_access(m, at)?,
-                    SP => return fail(at, "stack access"),
-                    _ => self.site_word(m, at)?,
+                    SP if shape => return fail(at, "stack access"),
+                    _ if shape && !site(at) => return fail(at, "unrecorded memory access"),
+                    _ => {}
                 },
-                Insn::Swap { size, rs, rt, rn } => self.swap_word(size, rs, rt, rn, at)?,
-                Insn::Literal { .. } => return fail(at, "literal load"),
-                // Division `svc`s are checked by `divisions`, link points' by `exits`.
+                Insn::Swap { rn: 28, .. } => return fail(at, "frame access by a swap"),
+                // With Rt = XZR, SWPAL is not an acquire (the architecture drops the load-acquire when the result is discarded).
+                Insn::Swap { rt: 31, .. } if shape => return fail(at, "swap discards its result (Rt is XZR): no acquire semantics"),
+                Insn::Swap { .. } if shape && !site(at) => return fail(at, "swap that is not a swap site"),
+                Insn::Literal { .. } if shape => return fail(at, "literal load"),
+                // Division `svc`s are checked below, link points' by `exits`.
                 Insn::Svc(svc::LINK | svc::DIV_U | svc::DIV_S) => {}
                 Insn::Svc(_) => return fail(at, "svc"),
-                Insn::Brk if self.c.stubs.binary_search_by_key(&at, |s| s.native_offset).is_err() => return fail(at, "brk"),
+                Insn::Brk if shape && self.c.stubs.binary_search_by_key(&at, |s| s.native_offset).is_err() => return fail(at, "brk"),
                 _ => {}
             }
             if i.falls_through() && self.insn(at + 4).is_none() {
                 return fail(at, "fall-through into data");
             }
+            // The 128/64 division (`svc #DIV_U` for div, `#DIV_S` for idiv) only inside a 64-bit div/idiv.
+            if let Insn::Svc(imm @ (svc::DIV_U | svc::DIV_S)) = i {
+                let divide = self.instruction(at).and_then(|(g, _)| x86_divide(self.guest_insn(g)));
+                if divide != Some((imm == svc::DIV_S, 64)) {
+                    return fail(at, "division svc outside a 64-bit div/idiv of its signedness");
+                }
+            }
         }
         for s in self.c.stubs {
             if self.insn(s.native_offset - 4).is_some_and(|i| i.falls_through()) {
                 return fail(s.native_offset, "fall-through into a stub");
+            }
+        }
+        // Each access site lies inside its guest instruction, and its word is the access it records.
+        for s in self.c.accesses {
+            let at = s.native_offset;
+            let lo = s.insn_native_offset;
+            let entry = self.c.pcs.iter().any(|p| (p.native_offset, p.guest_offset) == (lo, s.guest_offset));
+            if !entry || self.c.pcs.iter().any(|p| lo < p.native_offset && p.native_offset <= at && p.guest_offset != s.guest_offset) {
+                return Err(format!("access at {at:#x}: not inside its guest instruction"));
+            }
+            match self.insn(at) {
+                Some(Insn::Mem(m)) if s.kind != object::kind::SWAP => self.site_word(m, at)?,
+                Some(Insn::Swap { size, rs, rt, rn }) if s.kind == object::kind::SWAP => self.swap_word(size, rs, rt, rn, at)?,
+                _ => return Err(format!("access at {at:#x}: no memory access of its kind there")),
             }
         }
         Ok(())
@@ -532,10 +595,6 @@ impl<'a> Verifier<'a> {
     /// A swap word must be a swap site recording exactly it: base (a guest register or a computed address, never x28
     /// or sp), width, Rt and Rs; no offset, index or writeback.
     fn swap_word(&self, size: u8, rs: u8, rt: u8, rn: u8, at: u32) -> Result<(), String> {
-        // With Rt = XZR, SWPAL is not an acquire (the architecture drops the load-acquire when the result is discarded).
-        if rt == 31 {
-            return Err(format!("swap at {at:#x} discards its result (Rt is XZR): no acquire semantics"));
-        }
         let s = self.c.accesses.binary_search_by_key(&at, |s| s.native_offset).ok().map(|i| &self.c.accesses[i]);
         match s {
             Some(s)
@@ -562,7 +621,7 @@ impl<'a> Verifier<'a> {
         (0..self.c.stubs.len()).filter(|&i| self.c.stubs[i].guest_offset2 == at && self.c.stubs[i].kind == kind).collect()
     }
 
-    /// The address x1 holds after the word at `def` (one of the guard's address forms) and that form's first word.
+    /// The address x1 holds after the word at `def` (one of the split check's address forms) and that form's first word.
     fn x1_address(&self, def: u32, from: u32) -> Option<(Addr, u32)> {
         let w = self.word(def);
         let (rn, rm) = ((w >> 5 & 31) as u8, (w >> 16 & 31) as u8);
@@ -607,24 +666,19 @@ impl<'a> Verifier<'a> {
         !self.written(regs, from, at)
     }
 
-    /// Guard, split and guest-RIP rules of every access site.
+    /// Code shape: split and guest-RIP rules of every access site.
     fn sites(&mut self) -> Result<(), String> {
-        let mut guarded: Vec<(u32, u32, u32)> = Vec::new(); // access, window start, check end
         for s in self.c.accesses {
             let at = s.native_offset;
             let fail = |what: &str| Err(format!("access at {at:#x}: {what}"));
             let lo = s.insn_native_offset;
-            let entry = self.c.pcs.iter().any(|p| (p.native_offset, p.guest_offset) == (lo, s.guest_offset));
-            if !entry || self.c.pcs.iter().any(|p| lo < p.native_offset && p.native_offset <= at && p.guest_offset != s.guest_offset) {
-                return fail("not inside its guest instruction");
-            }
-            // A swap is a guarded access without split check (an operand crossing 16 bytes faults at the swap).
+            // A swap has no split check (an operand crossing 16 bytes faults at the swap).
             let (addr, size, store, swap) = match self.insn(at) {
-                Some(Insn::Mem(m)) if s.kind != object::kind::SWAP => (m.addr, m.size, !m.load, false),
-                Some(Insn::Swap { size, rn, .. }) if s.kind == object::kind::SWAP => (Addr { base: rn, index: None, imm: 0 }, size, false, true),
+                Some(Insn::Mem(m)) => (m.addr, m.size, !m.load, false),
+                Some(Insn::Swap { size, rn, .. }) => (Addr { base: rn, index: None, imm: 0 }, size, false, true),
                 _ => return fail("no memory access of its kind there"),
             };
-            let (guards, splits) = (self.linked(at, object::kind::GUARD), self.linked(at, object::kind::SPLIT));
+            let splits = self.linked(at, object::kind::SPLIT);
             // Guest-RIP-addressed: the base was last written by a guest-RIP move.
             let mv = (addr.index.is_none())
                 .then(|| self.last_write(addr.base, lo, at))
@@ -632,25 +686,22 @@ impl<'a> Verifier<'a> {
                 .and_then(|w| self.moves.iter().find(|(words, r, _)| *r == addr.base && words.contains(&w)).cloned());
             if let Some((words, _, value)) = mv {
                 let a = value.wrapping_add(addr.imm as u64);
-                if swap && (a & 15) + size as u64 > 16 {
+                // A split lock (a declared refusal); with any byte non-canonical x86's #GP comes first (raised at run time).
+                if swap && canonical(a) && canonical(a.wrapping_add(size as u64 - 1)) && (a & 15) + size as u64 > 16 {
                     return fail(&format!("swap at {a:#x} crosses a 16-byte boundary (unsupported_atomic)"));
                 }
                 let crosses = store && size > 1 && (a ^ a.wrapping_add(size as u64 - 1)) & 0x1000 != 0;
-                let need = if !canonical(a) { Some((object::kind::GUARD, &guards)) } else if crosses { Some((object::kind::SPLIT, &splits)) } else { None };
-                let stubs = guards.len() + splits.len();
                 // With a `b stub`, nothing may enter between the move and the access, not even from before the `b`.
                 let mut sealed_to = words.start;
-                match need {
-                    None if stubs == 0 => {}
-                    Some((_, list)) if stubs == 1 && list.len() == 1 => {
-                        let (i, st) = (list[0], &self.c.stubs[list[0]]);
-                        let c = self.checks[i];
+                match (crosses, &splits[..]) {
+                    (false, []) => {}
+                    (true, &[i]) => {
+                        let (st, c) = (&self.c.stubs[i], self.checks[i]);
                         if c.cond.is_some() || c.start + 4 != at || (st.base_reg, st.imm as i64) != (addr.base, addr.imm) {
                             return fail("guest-RIP address needs `b stub` right before the access");
                         }
-                        let stub = st.native_offset;
                         sealed_to = c.start;
-                        self.claim(stub);
+                        self.claim(st.native_offset);
                     }
                     _ => return fail(&format!("guest-RIP address {a:#x} has the wrong stubs")),
                 }
@@ -658,40 +709,6 @@ impl<'a> Verifier<'a> {
                     return fail("a branch enters between its guest-RIP move and the access");
                 }
                 continue;
-            }
-            // Address guard.
-            match guards[..] {
-                [g] => {
-                    let (st, c) = (self.c.stubs[g], self.checks[g]);
-                    let a = st.base_reg;
-                    let eor = c.start.wrapping_sub(4);
-                    let ok = c.cond == Some(TBNZ_X0_63)
-                        && st.imm == 0
-                        && eor >= lo
-                        && c.end < at
-                        && self.word(eor) == eor_guard(a as u32)
-                        && self.address_in(a, lo, eor).is_some_and(|(x, from)| {
-                            x == addr && self.kept(addr, from, at) && self.sealed(from, c.end, at) && {
-                                guarded.push((at, from, c.end));
-                                true
-                            }
-                        });
-                    if !ok {
-                        return fail("no address guard `eor x0, xA, xA, lsl #16; tbnz x0, #63` on exactly its address");
-                    }
-                    self.claim(st.native_offset);
-                }
-                // A read-modify-write store shares its load's guard.
-                [] if s.rmw == object::RMW_STORE => {
-                    let load = self.c.accesses.iter().find(|l| l.guest_offset == s.guest_offset && l.rmw == object::RMW_LOAD);
-                    let shared = load.and_then(|l| guarded.iter().find(|g| g.0 == l.native_offset)).filter(|&&(l, from, end)| {
-                        matches!(self.insn(l), Some(Insn::Mem(lm)) if lm.addr == addr) && self.kept(addr, from, at) && self.sealed(from, end, at)
-                    });
-                    if shared.is_none() {
-                        return fail("read-modify-write store without a guard, and its load's guard does not cover it");
-                    }
-                }
-                _ => return fail(&format!("{} guard stubs", guards.len())),
             }
             // Split check on every store wider than a byte.
             match (store && size > 1, &splits[..]) {
@@ -721,8 +738,7 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    /// Every exit: each `svc #LINK` ends a link point to a proven RIP; the dispatch branch follows `mov x0, xR`, xR
-    /// checked canonical by a branch-target guard in its instruction.
+    /// Every exit: each `svc #LINK` ends a link point to a proven RIP; the dispatch branch follows `mov x0, xR`.
     fn exits(&mut self) -> Result<(), String> {
         for at in (ENTRY_OFFSET..self.c.code.len() as u32).step_by(4) {
             if !matches!(self.insn(at), Some(Insn::Svc(svc::LINK))) {
@@ -737,11 +753,21 @@ impl<'a> Verifier<'a> {
             }
             self.links.push(LinkPoint { offset, word: self.word(offset), target });
         }
-        let Some(at) = self.dispatch else { return Ok(()) };
+        if self.dispatch.is_some() && self.computed_exit().is_none() {
+            return Err(format!("exit at {:#x}: the dispatch branch does not follow `mov x0, xR`", self.dispatch.unwrap()));
+        }
+        Ok(())
+    }
+    /// The dispatch branch and the register R of the `mov x0, xR` before it.
+    fn computed_exit(&self) -> Option<(u32, u8)> {
+        let at = self.dispatch?;
         let mov = at.checked_sub(4).map(|m| self.word(m)).filter(|w| w & 0xffe0_ffff == 0xaa00_03e0); // mov x0, xR
-        let Some(r) = mov.map(|w| (w >> 16 & 31) as u8).filter(|&r| r != 0 && r != 31) else {
-            return Err(format!("exit at {at:#x}: the dispatch branch does not follow `mov x0, xR`"));
-        };
+        mov.map(|w| (at, (w >> 16 & 31) as u8)).filter(|&(_, r)| r != 0 && r != 31)
+    }
+    /// Code shape: the computed exit's xR is checked canonical by a branch-target stub in its instruction (x86 raises
+    /// #GP at the branch, before any push, pop or RIP change).
+    fn branch_target(&mut self) -> Result<(), String> {
+        let Some((at, r)) = self.computed_exit() else { return Ok(()) };
         let Some((g, lo)) = self.instruction(at) else { return Err(format!("exit at {at:#x} outside the PC table")) };
         let found = (0..self.c.stubs.len()).find(|&i| {
             let (st, c) = (&self.c.stubs[i], self.checks[i]);
@@ -970,7 +996,7 @@ mod tests {
     use super::*;
     use natemu_abi::code_object::Header;
 
-    /// Real fexc (series12, profile slice1) objects and the guest bytes they were compiled from.
+    /// Real fexc (series13, profile slice1) objects and the guest bytes they were compiled from.
     macro_rules! fixture {
         ($name:literal) => {
             (
@@ -990,27 +1016,43 @@ mod tests {
         fixture!("fix-edge-rip-relative"),
         fixture!("xchg-fences"),
     ];
-    fn admit((object, source): (&[u8], &[u8])) -> Result<(), String> {
-        let h: Header = super::super::record(object, 0);
-        super::super::admit(object, h.guest_rip, source, u64::MAX).map(|_| ())
+    /// Admission with the code-shape check (as in the test suites).
+    fn admit(fixture: (&[u8], &[u8])) -> Result<(), String> {
+        admit_with(fixture, true)
     }
-    /// `fixture` with the code word at `at` (which must be `old`) replaced by `new`: refused with `why` in the error.
-    fn refused(fixture: (&[u8], &[u8]), at: u32, old: u32, new: u32, why: &str) {
+    fn admit_with((object, source): (&[u8], &[u8]), shape: bool) -> Result<(), String> {
+        let h: Header = super::super::record(object, 0);
+        super::super::admit(object, h.guest_rip, source, u64::MAX, shape).map(|_| ())
+    }
+    /// `fixture` with the code word at `at` (which must be `old`) replaced by `new`.
+    fn patched(fixture: (&[u8], &[u8]), at: u32, old: u32, new: u32) -> Vec<u8> {
         let h: Header = super::super::record(fixture.0, 0);
         let mut object = fixture.0.to_vec();
         let word = &mut object[(h.code_offset + at) as usize..][..4];
         assert_eq!(u32::from_le_bytes(word.try_into().unwrap()), old, "word at {at:#x}");
         word.copy_from_slice(&new.to_le_bytes());
-        let e = admit((&object, fixture.1)).expect_err(&format!("{new:#010x} at {at:#x} was admitted"));
+        object
+    }
+    /// `fixture` patched: refused with `why` in the error (with the code-shape check).
+    fn refused(fixture: (&[u8], &[u8]), at: u32, old: u32, new: u32, why: &str) {
+        let e = admit((&patched(fixture, at, old, new), fixture.1)).expect_err(&format!("{new:#010x} at {at:#x} was admitted"));
         assert!(e.contains(why), "{new:#010x} at {at:#x}: {e}");
+    }
+    /// `fixture` patched: refused with `why` by object validation alone (`why` = None: admitted without the code-shape check).
+    fn validated(fixture: (&[u8], &[u8]), at: u32, old: u32, new: u32, why: Option<&str>) {
+        match (admit_with((&patched(fixture, at, old, new), fixture.1), false), why) {
+            (Ok(()), None) => {}
+            (Err(e), Some(why)) => assert!(e.contains(why), "{new:#010x} at {at:#x}: {e}"),
+            (r, _) => panic!("{new:#010x} at {at:#x}: {r:?}, want {why:?}"),
+        }
     }
     const NOP: u32 = 0xaa00_03e0; // mov x0, x0
     const ADDRESS: (&[u8], &[u8]) = FIXTURES[0];
     const DIVISION: (&[u8], &[u8]) = FIXTURES[1];
-    /// `call rsp`: branch-target guard at 0x4, `mov x0, x22` at 0x3c, the dispatch branch at 0x40.
+    /// `call rsp`: branch-target check at 0x4, `mov x0, x22` at 0x34, the dispatch branch at 0x38.
     const CALL: (&[u8], &[u8]) = FIXTURES[2];
     /// A word in the middle of a straight-line block (`mov x4, x20` after the first load).
-    const MIDDLE: (u32, u32) = (0x18, 0xaa14_03e4);
+    const MIDDLE: (u32, u32) = (0xc, 0xaa14_03e4);
 
     #[test]
     fn real_blocks_are_admitted() {
@@ -1058,63 +1100,66 @@ mod tests {
     }
 
     #[test]
-    fn address_guards_are_verified() {
-        refused(ADDRESS, 0xc, 0xca01_4020, NOP, "address guard"); // eor x0, x1, x1, lsl #16 removed
-        refused(ADDRESS, 0xc, 0xca01_4020, 0xca02_4040, "address guard"); // guard on x2
-        refused(ADDRESS, 0x8, 0x9100_4281, 0x9100_6281, "address guard"); // add x1, x20, #0x18: not the access's address
-        refused(ADDRESS, 0x4, 0x8b07_0cd4, 0x1400_0004, "address guard"); // b 0x18: enters the guarded window
-        refused(ADDRESS, 0x10, 0xb7f8_0900, NOP, "reached by 0 branches"); // tbnz removed
-        // add x6, x6, #1 between a read-modify-write's (shared) guard and its store
-        refused(ADDRESS, 0x90, 0xca04_0295, 0x9100_04c6, "read-modify-write store");
-        let large = FIXTURES[5];
-        refused(large, 0x4, 0x5282_0001, 0x5284_0001, "address guard"); // mov w1, #0x2000 for an access at +0x1000
+    fn no_address_guards() {
+        // The only `eor x0, xA, xA, lsl #16` is a computed exit's branch-target check, and no guard stub covers an access.
+        for (i, &f) in FIXTURES.iter().enumerate() {
+            let h: Header = super::super::record(f.0, 0);
+            let code = &f.0[h.code_offset as usize..][..h.code_region_end as usize];
+            let guards = code.chunks(4).filter(|w| (0..31).any(|a| *w == eor_guard(a).to_le_bytes())).count();
+            assert_eq!(guards, usize::from(i == 2), "fixture {i}");
+            let sites: Vec<Site> = (0..h.sites_count as usize).map(|k| super::super::record(f.0, h.sites_offset as usize + k * size_of::<Site>())).collect();
+            assert!(sites.iter().all(|s| s.kind != object::kind::GUARD || s.guest_offset2 == object::NONE32), "fixture {i}");
+        }
     }
 
     #[test]
     fn split_checks_are_verified() {
-        refused(ADDRESS, 0x30, 0x9100_1c20, 0x9100_0c20, "split check"); // add x0, x1, #3 for an 8-byte store
-        refused(ADDRESS, 0x30, 0x9100_1c20, NOP, "split check");
+        refused(ADDRESS, 0x1c, 0x9100_1c20, 0x9100_0c20, "split check"); // add x0, x1, #3 for an 8-byte store
+        refused(ADDRESS, 0x1c, 0x9100_1c20, NOP, "split check");
+        refused(ADDRESS, 0x18, 0x8b34_e0c1, 0x8b34_e4c1, "split check"); // add x1, x6, x20, sxtx #1: not its address
+        refused(ADDRESS, 0x4, 0x8b07_0cd4, 0x1400_0006, "split check"); // b 0x1c: enters the checked window
+        refused(ADDRESS, 0x24, 0x3760_0580, NOP, "reached by 0 branches"); // tbnz removed
+        let large = FIXTURES[5];
+        refused(large, 0x20, 0x5284_0001, 0x5282_0001, "split check"); // mov w1, #0x1000 for a store at +0x2000
+        // Without the code-shape check none of this is refused: a missing or wrong split check is a producer bug whose
+        // effect (a page-crossing store committed in part) stays in the guest.
+        validated(ADDRESS, 0x24, 0x3760_0580, NOP, None);
+        validated(ADDRESS, 0x1c, 0x9100_1c20, 0x9100_0c20, None);
     }
 
     #[test]
     fn guest_rip_addresses_are_verified() {
         let (rip, noncanonical) = (FIXTURES[3], FIXTURES[4]);
         refused(rip, 0x8, 0x72a0_0214, 0x72a0_0234, "guest-RIP move"); // movk w20, #0x11, lsl #16
-        refused(rip, 0x1c, 0x1400_0020, NOP, "reached by 0 branches"); // the crossing store's `b split`
-        refused(noncanonical, 0x10, 0x1400_000c, NOP, "reached by 0 branches"); // the non-canonical load's `b guard`
+        validated(rip, 0x8, 0x72a0_0214, 0x72a0_0234, Some("guest-RIP move")); // a relocation: object validation
+        refused(rip, 0x1c, 0x1400_001d, NOP, "reached by 0 branches"); // the crossing store's `b split`
+        // A non-canonical guest-RIP load has no stub (it faults at its site); the crossing non-canonical store keeps
+        // its `b split` (the resident's split raises #GP before writing).
+        refused(noncanonical, 0x24, 0x1400_0006, NOP, "reached by 0 branches");
         refused(noncanonical, 0xc, 0xf2d0_0014, 0xf2c0_0014, "guest-RIP move"); // canonical, but not the relocation
-        // Review H1: `mov rax, [rip + 0x40000ff9]` = PRIVATE (0x8000_4000_0000), `b G` jumped over by a branch between
-        // the move and the `b`: the window is sealed from the move, the `b` included.
-        let h: Header = super::super::record(noncanonical.0, 0);
-        let (mut object, mut source) = (noncanonical.0.to_vec(), noncanonical.1.to_vec());
-        source[3..7].copy_from_slice(&[0xf9, 0x0f, 0x00, 0x40]);
-        let reloc = h.relocs_offset as usize;
-        assert_eq!(object[reloc..reloc + 6], [0x04, 0, 0, 0, object::RELOC_GUEST_RIP_MOVE, 20]);
-        object[reloc + 8..reloc + 16].copy_from_slice(&0x8000_4000_0000u64.to_le_bytes());
-        for (at, w) in [(0x04, 0xd2a8_0014u32), (0x08, 0xf2d0_0014), (0x0c, 0x1400_0002)] {
-            object[(h.code_offset + at) as usize..][..4].copy_from_slice(&w.to_le_bytes());
-        }
-        let e = admit((&object, &source)).expect_err("branch over `b guard` admitted");
-        assert!(e.contains("a branch enters between its guest-RIP move and the access"), "{e}");
-        object[(h.code_offset + 0x0c) as usize..][..4].copy_from_slice(&NOP.to_le_bytes());
-        admit((&object, &source)).unwrap(); // the same block without the branch is admitted
+        // `mov x4, x20` replaced by a branch over the store's move and `b split` to the store itself: the window is
+        // sealed from the move, the `b` included.
+        refused(noncanonical, 0x14, 0xaa14_03e4, 0x1400_0005, "a branch enters between its guest-RIP move and the access");
     }
 
     #[test]
     fn computed_exits_are_verified() {
         refused(CALL, 0x4, 0xca08_4100, 0xca09_4120, "branch-target guard"); // checks x9, exits through rsp's copy
-        refused(CALL, 0x34, 0xaa08_03f6, 0xaa09_03f6, "branch-target guard"); // mov x22, x9: an unchecked RIP
-        refused(CALL, 0x3c, 0xaa16_03e0, 0xaa16_03e1, "does not follow `mov x0, xR`"); // mov x1, x22
-        refused(CALL, 0x3c, 0xaa16_03e0, NOP, "does not follow `mov x0, xR`");
-        refused(CALL, 0x40, DISPATCH_PLACEHOLDER, DISPATCH_PLACEHOLDER + 1, "placeholder"); // a real branch
-        refused(CALL, 0x40, DISPATCH_PLACEHOLDER, SVC_LINK, "placeholder"); // a literal exit's gate instead
+        refused(CALL, 0x2c, 0xaa08_03f6, 0xaa09_03f6, "branch-target guard"); // mov x22, x9: an unchecked RIP
+        validated(CALL, 0x2c, 0xaa08_03f6, 0xaa09_03f6, None); // x86 semantics: the code-shape check
+        refused(CALL, 0x34, 0xaa16_03e0, 0xaa16_03e1, "does not follow `mov x0, xR`"); // mov x1, x22
+        validated(CALL, 0x34, 0xaa16_03e0, 0xaa16_03e1, Some("does not follow `mov x0, xR`")); // the exit's form
+        refused(CALL, 0x34, 0xaa16_03e0, NOP, "does not follow `mov x0, xR`");
+        refused(CALL, 0x38, DISPATCH_PLACEHOLDER, DISPATCH_PLACEHOLDER + 1, "placeholder"); // a real branch
+        validated(CALL, 0x38, DISPATCH_PLACEHOLDER, DISPATCH_PLACEHOLDER + 1, Some("placeholder"));
+        refused(CALL, 0x38, DISPATCH_PLACEHOLDER, SVC_LINK, "placeholder"); // a literal exit's gate instead
         // The placeholder where no dispatch relocation names it.
         let (at, old) = MIDDLE;
         refused(ADDRESS, at, old, DISPATCH_PLACEHOLDER, "not forward");
         // Admission returns the dispatch branch.
         let h: Header = super::super::record(CALL.0, 0);
-        let a = super::super::admit(CALL.0, h.guest_rip, CALL.1, u64::MAX).unwrap();
-        assert_eq!((a.dispatch_exit, a.links.len()), (Some(0x40), 0));
+        let a = super::super::admit(CALL.0, h.guest_rip, CALL.1, u64::MAX, false).unwrap();
+        assert_eq!((a.dispatch_exit, a.links.len()), (Some(0x38), 0));
     }
 
     /// `jcc` (`cmp rax, rcx; jne +0x40`): the taken exit's link point at 0x1c, the fall-through's at 0x10.
@@ -1125,7 +1170,7 @@ mod tests {
     #[test]
     fn link_points_are_returned() {
         let h: Header = super::super::record(JCC.0, 0);
-        let a = super::super::admit(JCC.0, h.guest_rip, JCC.1, u64::MAX).unwrap();
+        let a = super::super::admit(JCC.0, h.guest_rip, JCC.1, u64::MAX, false).unwrap();
         let point = |offset, word, target| LinkPoint { offset, word, target };
         assert_eq!(a.links, [point(LINK_FT, MOV_W0_5, h.guest_rip + 5), point(0x1c, 0x5280_08a0, h.guest_rip + 0x45)]);
         assert_eq!(a.dispatch_exit, None);
@@ -1144,7 +1189,9 @@ mod tests {
         // `svc #LINK` anywhere else: in a straight-line block, or as a computed exit's gate.
         let (mid, old) = MIDDLE;
         refused(ADDRESS, mid, old, SVC_LINK, "not exactly a link point");
-        refused(CALL, 0x40, DISPATCH_PLACEHOLDER, SVC_LINK, "dispatch branch");
+        refused(CALL, 0x38, DISPATCH_PLACEHOLDER, SVC_LINK, "dispatch branch");
+        validated(JCC, at + 8, SVC_LINK, NOP, Some("not a literal exit")); // object validation
+        validated(ADDRESS, mid, old, SVC_LINK, Some("not exactly a link point"));
     }
 
     #[test]
@@ -1189,35 +1236,38 @@ mod tests {
 
     #[test]
     fn division_checks_are_pinned() {
-        refused(DIVISION, 0xfc, 0xcb27_4000, 0xcb27_2000, "divide stub"); // div ecx: uxtw -> uxth
+        refused(DIVISION, 0xe8, 0xcb27_4000, 0xcb27_2000, "divide stub"); // div ecx: uxtw -> uxth
         refused(DIVISION, 0xc, 0xd348_3ee0, 0xd349_42e0, "divide stub"); // div cl: ubfx x0, x23, #9, #8
-        refused(DIVISION, 0x17c, SVC_DIV_U, SVC_DIV_S, "divide stub"); // div rcx with the signed division
-        refused(DIVISION, 0x1b0, 0xb400_0d54, 0xb400_0d55, "zero check"); // idiv: cbz x21, overflow tests x20
+        refused(DIVISION, 0x15c, SVC_DIV_U, SVC_DIV_S, "division svc outside"); // div rcx with the signed division
+        validated(DIVISION, 0x15c, SVC_DIV_U, SVC_DIV_S, Some("division svc outside")); // object validation
+        refused(DIVISION, 0x184, 0xb400_0c74, 0xb400_0c75, "zero check"); // idiv: cbz x21, overflow tests x20
         refused(DIVISION, 0x14, 0xb6f8_0000 | DIVISION_STUB_IMM, NOP, "reached by 0 branches"); // check removed
+        validated(DIVISION, 0x14, 0xb6f8_0000 | DIVISION_STUB_IMM, NOP, None); // x86 semantics: the code-shape check
         // The checks read FEX's own operands.
         refused(DIVISION, 0x10, 0xcb34_0000, 0xcb35_0000, "operands"); // div cl: sub x0, x0, w21, uxtb (divisor is w20)
         refused(DIVISION, 0xc, 0xd348_3ee0, 0xd348_3ec0, "operands"); // div cl: ubfx x0, x22 (dividend is x23)
-        refused(DIVISION, 0x60, 0x1300_1e81, 0x1300_1ea1, "operands"); // idiv bh: sxtb w1, w21
-        refused(DIVISION, 0xc0, 0x1300_3e81, 0x1300_3ea1, "operands"); // idiv r9w: sxth w1, w21 (FEX divides by sxth w1, w20)
-        refused(DIVISION, 0x168, 0xb400_0f27, 0xb400_0f26, "operands"); // div rcx: cbz x6
-        refused(DIVISION, 0x178, 0xaa07_03e2, 0xaa06_03e2, "operands"); // div rcx: the division gets x6 as divisor
+        refused(DIVISION, 0x58, 0x1300_1e81, 0x1300_1ea1, "operands"); // idiv bh: sxtb w1, w21
+        refused(DIVISION, 0xac, 0x1300_3e81, 0x1300_3ea1, "operands"); // idiv r9w: sxth w1, w21 (FEX divides by sxth w1, w20)
+        refused(DIVISION, 0x148, 0xb400_0e07, 0xb400_0e06, "operands"); // div rcx: cbz x6
+        refused(DIVISION, 0x158, 0xaa07_03e2, 0xaa06_03e2, "operands"); // div rcx: the division gets x6 as divisor
         // Review H1: FEX's 64-bit fast-path selector and the 8-bit dividend copy are pinned.
-        refused(DIVISION, 0x16c, 0xb400_0125, 0xb400_0126, "selector"); // div rcx: cbz x6, inline
-        refused(DIVISION, 0x16c, 0xb400_0125, 0xb400_013f, "selector"); // cbz xzr: always the inline divide
-        refused(DIVISION, 0x16c, 0xb400_0125, 0x1400_0009, "selector"); // b inline
-        refused(DIVISION, 0x1d0, 0xca05_0000, 0xca00_0000, "selector"); // idiv: eor x0, x0, x0
+        refused(DIVISION, 0x14c, 0xb400_0125, 0xb400_0126, "selector"); // div rcx: cbz x6, inline
+        refused(DIVISION, 0x14c, 0xb400_0125, 0xb400_013f, "selector"); // cbz xzr: always the inline divide
+        refused(DIVISION, 0x14c, 0xb400_0125, 0x1400_0009, "selector"); // b inline
+        refused(DIVISION, 0x1a4, 0xca05_0000, 0xca00_0000, "selector"); // idiv: eor x0, x0, x0
         refused(DIVISION, 0x8, 0x5300_3c97, 0x5300_3cd7, "dividend"); // div cl: uxth w23, w6 (AX is w4)
         refused(DIVISION, 0x4, 0x5300_1cf4, 0x5300_1ce4, "dividend"); // div cl: uxtb w4, w7 writes RAX first
         // A division `svc` without its verdict, or anywhere else.
-        refused(DIVISION, 0x180, 0xb500_0e82, NOP, "reached by 0 branches");
+        refused(DIVISION, 0x160, 0xb500_0d62, NOP, "reached by 0 branches");
         let (at, old) = MIDDLE;
-        refused(ADDRESS, at, old, SVC_DIV_U, "without its division");
+        refused(ADDRESS, at, old, SVC_DIV_U, "division svc outside");
+        validated(ADDRESS, at, old, SVC_DIV_U, Some("division svc outside"));
     }
-    /// The div-cl check's tbz offset field (stub at 0x31c from 0x18).
-    const DIVISION_STUB_IMM: u32 = ((0x31c - 0x18) / 4) << 5;
+    /// The div-cl check's tbz offset field (stub at 0x2e0 from 0x14).
+    const DIVISION_STUB_IMM: u32 = ((0x2e0 - 0x14) / 4) << 5;
 
     /// `mov eax, 5; xchg [rbx], eax; lfence; mfence; sfence; pause; lock xchg [rbx+8], rcx; xchg [rip+0x10], al;
-    /// xchg dx, [rsp]; mov [rbx], eax`: swaps at 0x14 (guard at 0x0c), ...; fences at 0x18-0x20.
+    /// xchg dx, [rsp]; mov [rbx], eax`: swaps at 0x8, 0x20, 0x2c, 0x34; fences and pause at 0xc-0x18.
     const XCHG: (&[u8], &[u8]) = FIXTURES[8];
     const SWPAL_W4_X6: u32 = 0xb8e4_80c4; // swpal w4, w4, [x6]
 
@@ -1227,17 +1277,20 @@ mod tests {
         assert!(matches!(decode(0x38e4_8294, 0), Some(Insn::Swap { size: 1, rs: 4, rt: 20, rn: 20 }))); // swpalb
         // Only the acquire-release swap: swp, swpa, swpl are refused (not FEX's xchg), as are other barriers and hints.
         for other in [0xb824_80c4, 0xb8a4_80c4, 0xb864_80c4, 0xd503_39bf, 0xd503_3bbf, 0xd503_3fdf, 0xd503_205f, 0xd503_3f9f] {
-            refused(XCHG, 0x14, 0xd503_3dbf, other, "unrecognised"); // swp swpa swpl; dmb ishld ish; isb; wfe; dsb sy
+            refused(XCHG, 0xc, 0xd503_3dbf, other, "unrecognised"); // swp swpa swpl; dmb ishld ish; isb; wfe; dsb sy
         }
-        refused(XCHG, 0x10, SWPAL_W4_X6, SWPAL_W4_X6 | 31, "XZR"); // swpal w4, wzr, [x6]: Rt = XZR loses the acquire
-        refused(XCHG, 0x10, SWPAL_W4_X6, SWPAL_W4_X6 + 1, "swap site"); // Rt w5: the record says w4
-        refused(XCHG, 0x10, SWPAL_W4_X6, SWPAL_W4_X6 + (1 << 16), "swap site"); // Rs w5
-        refused(XCHG, 0x10, SWPAL_W4_X6, SWPAL_W4_X6 & !(31 << 5) | 28 << 5, "swap site"); // [x28]: the frame
-        refused(XCHG, 0x10, SWPAL_W4_X6, SWPAL_W4_X6 | 1 << 30, "swap site"); // 8 bytes, recorded 4
-        refused(XCHG, 0x4, 0x5280_00a4, SWPAL_W4_X6, "swap at 0x4 is not a swap site"); // a swap where no site is
-        refused(XCHG, 0x10, SWPAL_W4_X6, 0xb900_00c4, "does not describe its instruction"); // str w4, [x6] at the swap site
-        refused(XCHG, 0xc, 0xb7f8_0360, NOP, "reached by 0 branches"); // the swap's guard branch removed
-        refused(XCHG, 0x8, 0xca06_40c0, NOP, "address guard"); // its eor removed
+        refused(XCHG, 0x8, SWPAL_W4_X6, SWPAL_W4_X6 | 31, "XZR"); // swpal w4, wzr, [x6]: Rt = XZR loses the acquire
+        refused(XCHG, 0x8, SWPAL_W4_X6, SWPAL_W4_X6 + 1, "swap site"); // Rt w5: the record says w4
+        refused(XCHG, 0x8, SWPAL_W4_X6, SWPAL_W4_X6 + (1 << 16), "swap site"); // Rs w5
+        refused(XCHG, 0x8, SWPAL_W4_X6, SWPAL_W4_X6 & !(31 << 5) | 28 << 5, "frame access by a swap"); // [x28]: the frame
+        refused(XCHG, 0x8, SWPAL_W4_X6, SWPAL_W4_X6 | 1 << 30, "swap site"); // 8 bytes, recorded 4
+        refused(XCHG, 0x4, 0x5280_00a4, SWPAL_W4_X6, "swap that is not a swap site at 0x4"); // a swap where no site is
+        refused(XCHG, 0x8, SWPAL_W4_X6, 0xb900_00c4, "no memory access of its kind"); // str w4, [x6] at the swap site
+        // Object validation: a site's word is its access, x28 is never a swap's base; the rest is code shape.
+        validated(XCHG, 0x8, SWPAL_W4_X6, SWPAL_W4_X6 + 1, Some("swap site"));
+        validated(XCHG, 0x4, 0x5280_00a4, SWPAL_W4_X6 & !(31 << 5) | 28 << 5, Some("frame access by a swap"));
+        validated(XCHG, 0x4, 0x5280_00a4, SWPAL_W4_X6, None);
+        validated(XCHG, 0xc, 0xd503_3dbf, 0xd503_3fdf, None); // isb
         // A guest-RIP swap whose operand crosses 16 bytes (`xchg [rip+0x18], eax` at 0x100000: 0x10001e) is refused.
         let e = admit(fixture!("xchg-rip-crossing")).expect_err("split lock admitted");
         assert!(e.contains("crosses a 16-byte boundary"), "{e}");
@@ -1259,5 +1312,50 @@ mod tests {
         refused(ADDRESS, at, old, 0xf940_00c5, "unrecorded memory access"); // ldr x5, [x6]
         refused(ADDRESS, at, old, 0x17ff_ffff, "not forward"); // b .-4
         refused(ADDRESS, at, old, 0xd420_0020, "brk"); // brk #1 that is no stub
+    }
+
+    #[test]
+    fn object_validation_without_the_code_shape_check() {
+        let (at, old) = MIDDLE;
+        // Words the decoder does not know are left to the hardware at EL0 (it traps or contains them) unless they branch
+        // or name x25/x28; so are sp, literal and unrecorded accesses, and brk words at no stub.
+        for word in [0x1e62_2820, 0xd503_3fdf, 0xd51b_4220, 0xf940_03e0, 0xf81f_0ffe, 0x5800_0040, 0xf940_00c5, 0xd420_0020, 0x9100_029f] {
+            validated(ADDRESS, at, old, word, None); // fadd d0; isb; msr daif; ldr [sp]; str x30 [sp, #-16]!; ldr literal; ldr [x6]; brk #1; mov sp
+        }
+        for (word, why) in [
+            (0xd63f_00a0, "unrecognised"),     // blr x5
+            (0xd61f_0020, "unrecognised"),     // br x1
+            (0xd65f_03c0, "unrecognised"),     // ret
+            (0x9400_0000, "unrecognised"),     // bl .
+            (0xd400_0002, "unrecognised"),     // hvc #0
+            (0xd51b_d059, "unrecognised"),     // msr tpidr_el0, x25
+            (0x3dc0_0380, "unrecognised"),     // ldr q0, [x28]
+            (0xa940_0780, "unrecognised"),     // ldp x0, x1, [x28]
+            (0x0820_7f18, "unrecognised"),     // casp w0, w1, w24, w25, [x24]: writes x25
+            // The whole branch, exception and system group but its system class (0xd5), whatever the encoding:
+            (0x7400_0020, "unrecognised"),     // Armv9.6 CMPBR (compare and branch, may go backward)
+            (0x7500_0041, "unrecognised"),     // CMPBR
+            (0xf400_0020, "unrecognised"),     // CMPBR, 64-bit
+            (0xf500_0041, "unrecognised"),     // CMPBR, 64-bit
+            (0xd71f_0820, "unrecognised"),     // braa x1, x0
+            (0xd65f_0bff, "unrecognised"),     // retaa
+            (0xd400_0003, "unrecognised"),     // smc #0
+            (0x1600_0000, "not forward"),      // b .-0x8000000: decoded, a backward branch
+            (0x5400_0010, "unrecognised"),     // bc.eq .
+            (0xd400_0001, "svc at"),           // svc #0
+            (0xd400_0001 | 2 << 5, "svc at"),  // svc #MISS: the dispatcher's own
+            (0xaa14_03fc, "write to x28"),     // mov x28, x20
+            (0xaa14_03f9, "write to x25"),     // mov x25, x20
+            (0xf940_0380, "frame access"),     // ldr x0, [x28]
+            (0x17ff_ffff, "not forward"),      // b .-4
+            (0xd4000021, "not exactly a link point"),
+        ] {
+            validated(ADDRESS, at, old, word, Some(why));
+        }
+        // Real blocks: the same results either way.
+        for (i, &f) in FIXTURES.iter().enumerate() {
+            admit_with(f, false).unwrap_or_else(|e| panic!("fixture {i}: {e}"));
+        }
+        assert!(admit_with(fixture!("xchg-rip-crossing"), false).is_ok()); // a split lock: the resident's halt at run time
     }
 }

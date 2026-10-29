@@ -1,11 +1,13 @@
 //! Admission of fexc code objects (`natemu_abi::code_object`) for the execution
-//! mode, before anything reaches the VM: header, profile, sizes and offsets,
-//! feature profile against the vCPU's ID registers, sorted in-body access sites
-//! of supported kinds and guest-RIP relocations of the requested RIP; then the
-//! code itself ([`structure`]): every instruction decoded, frame accesses, address
-//! guards, split and #DE checks and exits verified on the words. The tail's literal
-//! slot is resolved here; the literal exits are returned as link points and the
-//! computed exit's branch for the resident to relocate.
+//! mode, before anything reaches the VM. Object validation, always: header, profile, sizes and offsets, feature
+//! profile against the vCPU's ID registers, sorted in-body access sites of supported kinds, check-stub records and
+//! guest-RIP relocations of the requested RIP; then the code ([`structure`]): x25/x28 rules, sites, exits, division
+//! `svc`s and control flow, everything the resident relies on. The code-shape check (that fexc emitted exactly the
+//! split, branch-target and #DE checks and only the instruction classes it is known to emit) is a debug option
+//! (the caller's [`crate::execution::Compiler::shape`]: the program driver's `--code-shape`, which the test runners
+//! pass, except `run_slice3_vm.py contain`): isolation is the hardware's (translated code runs at EL0), so a
+//! violation stays a producer bug confined to the vCPU's guest. The tail's literal slot is resolved here; the literal
+//! exits are returned as link points and the computed exit's branch for the resident to relocate.
 use natemu_abi::code_object::{self as object, Header, PcEntry, Reloc, Site};
 use natemu_abi::execution::{ENTRY_OFFSET, LinkPoint, MAX_LINK_POINTS, PRE_NZCV_REG, SRA, STAGING_BYTES, cache::MAX_BLOCK_BYTES};
 
@@ -138,8 +140,8 @@ fn branch_target(insn: &[u8], end: u64) -> Option<u64> {
 }
 
 /// Admits `bytes`, an fexc `--object` compiled at `rip` from `source` (the guest
-/// bytes given to fexc), for a vCPU executing `supported` feature bits.
-pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Result<Admitted, String> {
+/// bytes given to fexc), for a vCPU executing `supported` feature bits; `shape` adds the code-shape check.
+pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64, shape: bool) -> Result<Admitted, String> {
     let (mut admitted, parts) = admit_records(bytes, rip, source, supported)?;
     let h = &parts.header;
     let code = &admitted.object[h.code_offset as usize..][..h.code_region_end as usize];
@@ -156,6 +158,7 @@ pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Re
         rip,
         guest_bytes: h.guest_bytes,
         targets: &parts.targets,
+        shape,
     };
     let (links, dispatch_exit) = structure::check(&c).map_err(|e| format!("object refused: {e}"))?;
     if links.len() > MAX_LINK_POINTS {
@@ -247,9 +250,9 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
             || s.guest_offset2 != object::NONE32
             || !matches!(
                 s.kind,
-                object::kind::LOAD | object::kind::STORE | object::kind::LOAD_PAIR | object::kind::STORE_PAIR | object::kind::PUSH | object::kind::POP | object::kind::SWAP
+                object::kind::LOAD | object::kind::STORE | object::kind::PUSH | object::kind::POP | object::kind::SWAP
             )
-            || !matches!(s.width, 1 | 2 | 4 | 8 | 16)
+            || !matches!(s.width, 1 | 2 | 4 | 8)
             || s.intent != intent(s)
         {
             return fail(&format!("access site at native offset {:#x}", s.native_offset));
@@ -303,9 +306,9 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
 fn intent(s: &Site) -> u8 {
     use object::kind::*;
     match (s.kind, s.rmw) {
-        (STORE | STORE_PAIR | PUSH, object::RMW_NONE | object::RMW_STORE) | (SWAP, object::RMW_NONE) => object::INTENT_WRITE,
-        (LOAD | LOAD_PAIR, object::RMW_LOAD) => object::INTENT_WRITE,
-        (LOAD | LOAD_PAIR | POP, object::RMW_NONE) => object::INTENT_READ,
+        (STORE | PUSH, object::RMW_NONE | object::RMW_STORE) | (SWAP, object::RMW_NONE) => object::INTENT_WRITE,
+        (LOAD, object::RMW_LOAD) => object::INTENT_WRITE,
+        (LOAD | POP, object::RMW_NONE) => object::INTENT_READ,
         _ => u8::MAX,
     }
 }
@@ -333,7 +336,7 @@ fn site_fields_valid(s: &Site, h: &Header, region: u32) -> bool {
 fn is_stub(s: &Site) -> bool {
     matches!(s.kind, object::kind::GUARD | object::kind::SPLIT | object::kind::DIVIDE)
 }
-/// `brk #1` (guard), `brk #2` (split) or `brk #3` (divide).
+/// `brk #1` (branch target), `brk #2` (split) or `brk #3` (divide).
 pub(crate) fn stub_word(kind: u8) -> u32 {
     let imm = match kind {
         object::kind::GUARD => 1,
@@ -342,12 +345,13 @@ pub(crate) fn stub_word(kind: u8) -> u32 {
     };
     0xd420_0000 | imm << 5
 }
-/// A stub's record against the access site it covers (`None`: no site at `guest_offset2`). At a stub the guest
-/// state is that of its access, so instruction, flags location, width, intent and data registers are the access's;
-/// its address is `base_reg + imm` without index or writeback. A split covers a store wider than one byte whose data
-/// registers survive the check (x0/x1 are the check's scratch). A guard without an access is a branch-target guard:
-/// the target is in `base_reg`. The address register at a stub is neither x0 (the check's scratch, overwritten by it)
-/// nor sp (the checks cannot name it). A divide stub (#DE) has no access and no address.
+/// A stub's record against the access site it covers (`None`: no site at `guest_offset2`). A split stub covers a store
+/// wider than one byte whose data register survives the check (x0/x1 are the check's scratch); at it the guest state is
+/// that of its access, so instruction, flags location, width, intent and data registers are the access's, and its
+/// address is `base_reg + imm` without index or writeback (the resident completes the store from it). A guard stub is a
+/// branch-target check with no access: the target is in `base_reg` (there is no address guard since E3). The address
+/// register at a stub is neither x0 (the check's scratch, overwritten by it) nor sp (the checks cannot name it). A
+/// divide stub (#DE) has no access and no address.
 fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
     use object::kind::*;
     if s.kind == DIVIDE {
@@ -369,11 +373,7 @@ fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
             let same = (s.guest_offset, s.insn_native_offset, s.width, s.intent, s.rmw, s.segment)
                 == (a.guest_offset, a.insn_native_offset, a.width, a.intent, a.rmw, a.segment)
                 && (s.data_reg, s.data_class, s.nzcv, s.cf_inverted) == (a.data_reg, a.data_class, a.nzcv, a.cf_inverted);
-            let store = matches!(a.kind, STORE | STORE_PAIR | PUSH);
-            let pair = a.kind == STORE_PAIR;
-            let survives = |r: u8| r > 1;
-            let split_ok = s.kind != SPLIT
-                || (store && a.width > 1 && survives(a.data_reg[0]) && (!pair || survives(a.data_reg[1])));
+            let split_ok = s.kind == SPLIT && matches!(a.kind, STORE | PUSH) && a.width > 1 && a.data_reg[0] > 1;
             address_only && same && split_ok
         }
     }
@@ -535,9 +535,21 @@ mod tests {
             with(object(), at, |s: &mut Site| s.native_offset = 4),
             with(object(), at, |s: &mut Site| s.base_reg = 28),
             with(object(), at, |s: &mut Site| s.guest_offset = 3),
+            // Pair kinds: fexc emits none under slice1 and the resident completes split stores of one register only.
+            with(object(), at, |s: &mut Site| s.kind = object::kind::LOAD_PAIR),
+            with(object(), at, |s: &mut Site| (s.kind, s.width) = (object::kind::LOAD_PAIR, 16)),
+            with(object(), at, |s: &mut Site| (s.kind, s.intent) = (object::kind::STORE_PAIR, object::INTENT_WRITE)),
+            with(object(), at, |s: &mut Site| s.width = 16),
         ] {
             assert!(admit(&bad, RIP, &SOURCE, ALL).is_err());
         }
+        // Review E4: a STORE_PAIR record over a single-register store with a split stub (the resident would have
+        // written two registers) is refused.
+        let pair = Site { kind: object::kind::STORE_PAIR, intent: object::INTENT_WRITE, data_reg: [4, 5], width: 16, ..load_site(8) };
+        let split = Site { native_offset: 20, kind: object::kind::SPLIT, guest_offset2: 8, ..pair };
+        assert!(admit(&with(object_with(&[pair, split]), 128 + 20, |w: &mut u32| *w = 0xd420_0040), RIP, &SOURCE, ALL).is_err());
+        let store = Site { kind: object::kind::STORE, width: 8, ..pair };
+        assert!(admit(&with(object_with(&[store, Site { kind: object::kind::SPLIT, width: 8, ..split }]), 128 + 20, |w: &mut u32| *w = 0xd420_0040), RIP, &SOURCE, ALL).is_ok());
     }
 
     #[test]
@@ -613,38 +625,37 @@ mod tests {
     #[test]
     fn check_stubs_must_be_brk_words_covering_a_matching_access() {
         use object::kind::*;
-        assert!(admit(&with_stub(stub(GUARD, 8), BRK1), RIP, &SOURCE, ALL).is_ok());
-        assert!(admit(&with_stub(stub(GUARD, 8), BRK2), RIP, &SOURCE, ALL).is_err());
-        assert!(admit(&with_stub(stub(GUARD, 8), 0xd61f_0020), RIP, &SOURCE, ALL).is_err());
+        // No address guard (E3): a guard stub covering an access is refused.
+        assert!(admit(&with_stub(stub(GUARD, 8), BRK1), RIP, &SOURCE, ALL).is_err());
         assert!(admit(&with_stub(stub(GUARD, 12), BRK1), RIP, &SOURCE, ALL).is_err()); // no access there
-        assert!(admit(&with_stub(Site { width: 4, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
-        assert!(admit(&with_stub(Site { segment: object::SEG_SS, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
-        assert!(admit(&with_stub(Site { nzcv: object::NZCV_SAVED, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
-        assert!(admit(&with_stub(Site { index_reg: 3, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
-        // The address register at the stub may differ from the access's (x1 after an add).
-        assert!(admit(&with_stub(Site { base_reg: 1, imm: 0, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_ok());
         // A split covers only a store wider than a byte whose data register survives the check.
         assert!(admit(&with_stub(stub(SPLIT, 8), BRK2), RIP, &SOURCE, ALL).is_err());
         let store = Site { kind: STORE, intent: object::INTENT_WRITE, data_reg: [4, 0], ..load_site(8) };
         let split = Site { native_offset: 20, kind: SPLIT, guest_offset2: 8, ..store };
         let both = |a: Site, s: Site| with(object_with(&[a, s]), 128 + 20, |w: &mut u32| *w = BRK2);
         assert!(admit(&both(store, split), RIP, &SOURCE, ALL).is_ok());
-        assert!(admit(&both(store, Site { kind: GUARD, ..split }), RIP, &SOURCE, ALL).is_err()); // brk #2 for a guard
+        assert!(admit(&with(object_with(&[store, split]), 128 + 20, |w: &mut u32| *w = BRK1), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&with(object_with(&[store, split]), 128 + 20, |w: &mut u32| *w = 0xd61f_0020), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&both(store, Site { kind: GUARD, ..split }), RIP, &SOURCE, ALL).is_err()); // an address guard
+        assert!(admit(&both(store, Site { width: 4, ..split }), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&both(store, Site { segment: object::SEG_SS, ..split }), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&both(store, Site { nzcv: object::NZCV_SAVED, ..split }), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&both(store, Site { index_reg: 3, ..split }), RIP, &SOURCE, ALL).is_err());
         assert!(admit(&both(Site { data_reg: [0, 0], ..store }, Site { data_reg: [0, 0], ..split }), RIP, &SOURCE, ALL).is_err());
         assert!(admit(&both(Site { width: 1, ..store }, Site { width: 1, ..split }), RIP, &SOURCE, ALL).is_err());
-        // The stub's address register survives the check: not x0 (its scratch), not sp.
+        // The stub's address register survives the check: x1 after an add, not x0 (its scratch), not sp.
         assert!(admit(&both(store, Site { base_reg: 1, ..split }), RIP, &SOURCE, ALL).is_ok());
         assert!(admit(&both(store, Site { base_reg: 0, ..split }), RIP, &SOURCE, ALL).is_err());
         assert!(admit(&both(store, Site { base_reg: 31, ..split }), RIP, &SOURCE, ALL).is_err());
-        assert!(admit(&with_stub(Site { base_reg: 0, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
-        assert!(admit(&with_stub(Site { base_reg: 31, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
         // Branch-target guard: no access, width 0, target register.
         let target = Site { width: 0, base_reg: 4, ..stub(GUARD, object::NONE32) };
         assert!(admit(&with_stub(target, BRK1), RIP, &SOURCE, ALL).is_ok());
+        assert!(admit(&with_stub(target, BRK2), RIP, &SOURCE, ALL).is_err());
         assert!(admit(&with_stub(Site { width: 8, ..target }, BRK1), RIP, &SOURCE, ALL).is_err());
         assert!(admit(&with_stub(Site { base_reg: 31, ..target }, BRK1), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&with_stub(Site { base_reg: 0, ..target }, BRK1), RIP, &SOURCE, ALL).is_err());
         // Stubs follow every access site.
-        let early = with(object_with(&[Site { native_offset: 8, kind: GUARD, guest_offset2: 12, ..load_site(8) }, load_site(12)]), 128 + 8, |w: &mut u32| *w = BRK1);
+        let early = with(object_with(&[Site { native_offset: 8, ..split }, Site { native_offset: 12, ..store }]), 128 + 8, |w: &mut u32| *w = BRK2);
         assert!(admit(&early, RIP, &SOURCE, ALL).is_err());
     }
 
@@ -664,7 +675,8 @@ mod tests {
         assert!(admit(&with_stub(Site { base_reg: object::NO_REG, ..stub(GUARD, 8) }, BRK1), RIP, &SOURCE, ALL).is_err());
     }
 
-    /// Every object in `$NATEMU_ADMIT_CORPUS` (`NAME.obj` compiled at its header RIP from `NAME.src`) is admitted;
+    /// Every object in `$NATEMU_ADMIT_CORPUS` (`NAME.obj` compiled at its header RIP from `NAME.src`) is admitted with
+    /// the code-shape check;
     /// prints the admission time per block. `cargo test --release -p natemu-host corpus -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -677,7 +689,7 @@ mod tests {
             let (bytes, source) = (std::fs::read(obj).unwrap(), std::fs::read(obj.with_extension("src")).unwrap());
             let h: Header = record(&bytes, 0);
             let t = std::time::Instant::now();
-            let r = super::admit(&bytes, h.guest_rip, &source, ALL);
+            let r = super::admit(&bytes, h.guest_rip, &source, ALL, true);
             time += t.elapsed();
             n += 1;
             words += h.code_region_end as u64 / 4;

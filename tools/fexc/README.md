@@ -10,7 +10,7 @@ sites, `spill_bytes`, `cf_inverted` per PC entry, and `--object` (binary record 
 programs and the emitted code. **S1c done**: profile `slice1` (allowlist block cutting, single-gate exits, see
 "Profile slice1"). **S1b1 done**: the precision patches under `--profile slice1` and `verify_precision.py` (see
 "Precision (S1b1)"). **S1b2 done**: address guard, split-store check and canonical branch targets under `--profile slice1`
-(patch 0007, see "Guards (S1b2)"). **S1f done**: div/idiv admitted with #DE checks and the 128/64 helper call (patch 0008,
+(patch 0007, see "Guards (S1b2)"); **E3**: the address guard removed (series13). **S1f done**: div/idiv admitted with #DE checks and the 128/64 helper call (patch 0008,
 see "Division (S1f)").
 
 ## Build
@@ -29,9 +29,14 @@ jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never 
 (series applied as twelve commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series12` (E1b, October 28: patch 0012, no stop
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series13` (E3, October 28: no address guard; the
+patches are series12's, the change is in `shim/fexc_sites.inc` and `shim/fexc_precision.h`: `FexcBeforeOp` emits only the
+split check, the read-modify-write prescan is gone; generated code runs at EL0, where every non-canonical address faults
+in hardware at its site and the runtime raises #GP/#SS; 556 blocks and 4,233 guest instructions on the census corpora
+as before, 19,712 words, 17.4% fewer than series12, 0 address-guard words: `experiments/track03/el0-study/e1census.py
+--before`). Kept for comparison: `series12` (E1b, October 28: patch 0012, no stop
 check at the block entry: the resident stops a vCPU by IRQ-triggered unlinking; otherwise series11; 556 blocks, 23,866
-words on the census corpora, none touching emulator data and no `bl`). Kept for comparison: `series11` (E1: patch 0011, code that
+words on the census corpora, none touching emulator data and no `bl`), `series11` (E1: patch 0011, code that
 touches no emulator data: literal exits `movz/movk x0, #rip; svc #1`, computed exits `mov x0, xR; b .` relocated by the
 resident to its dispatcher (a `dispatch_branch` relocation), the 128/64 division as `svc #3`/`#4`, no block-header store,
 the stop check a `bl .` relocated to the vCPU's stop pad, the pre-NZCV save `mrs x25, nzcv` instead of a frame store;
@@ -65,7 +70,7 @@ Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--v
 | 0004 | access-site recording: CF inversion capture, `FexcAfterOp` in the JIT, spill size |
 | 0005 | slice1 block cutting (`FexcMap` in the decoder, `FexcSlice1::Cut`) and single-gate exits |
 | 0006 | slice1 precision (flag elimination, register allocation, pre-NZCV save) |
-| 0007 | slice1 address guard, split-store check, branch-target check (JIT hooks, pre-RA scan, `ret` without writeback) |
+| 0007 | slice1 check hooks (JIT hooks, pre-RA scan, `ret` without writeback): split-store check, branch-target check; the address guard until series12 (E3 removed it in `shim/`) |
 | 0008 | slice1 #DE for div/idiv (width record in the dispatcher, check after FEX's LUDIV/LDIV call, divide ops as flag fault points) |
 | 0009 | slice1 self-loop exits (no `JumpTargets` lookup for the taken edge of jcc/jrcxz/loop) and FEX's pending-interrupt fault check at every block entry |
 | 0010 | slice1 literal exits through `Pointers.ExitFunctionLinker` (computed exits keep `DispatcherLoopTop`): FEX's linker/dispatcher split, so the resident can link them |
@@ -415,7 +420,17 @@ pooled constants and RMW flag results, unsaved NZCV writes, load destinations in
 loads and flag writes); `series2` passed P1-P7 and fails only the guard checks P8-P10 added with S1b2 (missing guards,
 split checks and branch-target checks; 666 of the 911 compiled programs including the seed-77 corpus); `series4` passes all.
 
-## Guards (S1b2)
+## Guards (S1b2; address guard removed in E3)
+
+**E3 (series13): there is no address guard.** Translated code runs at EL0, where every x86-non-canonical address is
+unmapped (both holes and everything outside the two TTBR ranges: translation faults), EL1-only or EL0 execute-only (the
+resident's private window: permission faults). A guest access there faults in hardware at its own site; the runtime
+(`crates/runtime/src/execution.rs` `aborted`) classifies the abort by site first and raises #GP(0), or #SS(0) for a
+stack-segment site, from the site's recorded address (`pages()`: unless both the first and the last byte are canonical).
+Kept, as x86 semantics: the split check (Arm may commit part of a page-crossing store), the branch-target check (x86
+raises #GP at the branch, before a call's push, a ret's pop or any RIP change), RIP-relative `b S` for a page-crossing
+store (canonical or not), the #DE checks, the precision patches and the site map. The rest of this section describes
+series4-12; the guard rows no longer apply.
 
 Under `--profile slice1` only (default-profile JSON unchanged on the 64 fixtures, the 613-form matrix and a 264-program
 `--seed 77` corpus, except the exit-linker host address), patch 0007 adds three flag-free checks ([contract](../../docs/restructure/slice1-contract.md)
@@ -577,8 +592,10 @@ layout as series7: only that one load word per literal exit differs.
   guards (P8-P10: guard on exactly the access address, split check on every store wider than 1 byte, stubs reached only by their checks,
   indirect targets checked before any state write; series2 fails them, series4 passes) and P11 (every div/idiv has exactly
   its per-width #DE checks in their exact form, on its divide's own operands, before its divide; every `blr` is the 128/64
-  helper call followed by its #DE branch), P12 (entry prologue and the stop store pinned, no other access to it) and P13 (every branch forward). Admission (`crates/host/src/admission/structure.rs`) re-checks P8-P11 on the
-  native words of every block it admits.
+  helper call followed by its #DE branch), P12 (entry prologue and the stop store pinned, no other access to it) and P13 (every branch forward). Since E3 (series13) P8
+  requires that no access has an address guard. Admission (`crates/host/src/admission/structure.rs`) re-checks P8-P11 on
+  the native words of every block it admits when its code-shape debug check is on (the program driver's `--code-shape`, the test
+  suites); its object validation runs always.
 - `python3 tools/fexc/check_sites.py [--known-ok] [--slice1]`: the 64 reference programs; expected accesses from the fixture `asm`
   against the sites, sites against the `xcrun objdump` disassembly of the code (every load/store with a base other than
   x28/sp must be a site and the reverse), dense versus sparse code bytes, binary object versus JSON.

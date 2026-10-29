@@ -472,6 +472,9 @@ pub(crate) struct Compiler {
     /// Test drivers only: once `.0` requests have reached the server, it gets signal `.1` before the next (SIGKILL: the
     /// server dies mid-run; SIGSTOP: it stays alive and never answers). The run must fail with the cause.
     pub(crate) signal_at: Option<(u64, i32)>,
+    /// Admission's code-shape debug check ([`admission`]); off unless the caller sets it (the program driver's
+    /// `--code-shape`).
+    pub(crate) shape: bool,
 }
 /// The default [`Compiler::deadline`]: a large multiple of the slowest compile measured on the regression sets
 /// (S3h: at most 13.4 ms, server start included, over 6,080 vCPU runs of the corpora at N = 4 and N = 2 with block size 1).
@@ -485,7 +488,8 @@ impl Compiler {
         Ok(Self::with_features(fexc, admission::supported_features(&id), max_instructions))
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
-        Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), compiles: 0, hits: 0, tamper: None, deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, signal_at: None }
+        Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), compiles: 0, hits: 0, tamper: None, deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, signal_at: None,
+               shape: false }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
     /// `rip` the resident executes, or fexc's end reason when it produced no code.
@@ -545,7 +549,7 @@ impl Compiler {
         }
         match &self.cache[&body] {
             Compiled::Object(object) => {
-                let mut admitted = admission::admit(object, rip, bytes, self.supported)?;
+                let mut admitted = admission::admit(object, rip, bytes, self.supported, self.shape)?;
                 if let Some(tamper) = self.tamper {
                     tamper(&mut admitted.object);
                 }

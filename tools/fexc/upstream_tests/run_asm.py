@@ -109,7 +109,7 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
         want = {k.upper(): [int(v, 0) for v in (vals if isinstance(vals, list) else [vals])] for k, vals in h.get('REGDATA', {}).items()}
         vector = sorted(k for k in want if k not in GPR and k != 'RIP')
         (work / 'program.txt').write_text(description(h, binary))
-        run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work] + ([str(max_block)] if max_block else []), capture_output=True, text=True, timeout=120)
+        run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work] + ([str(max_block)] if max_block else []) + vm1.CODE_SHAPE, capture_output=True, text=True, timeout=120)
         if run.returncode:
             err = run.stderr.strip()[-300:]
             if 'guest RAM exhausted' in err: return {**rec, 'outcome': 'unsupported', 'reason': 'region beyond 4 MiB guest RAM'}

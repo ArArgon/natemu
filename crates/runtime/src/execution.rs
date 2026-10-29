@@ -923,50 +923,49 @@ fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, ac
     }
 }
 
-/// A synchronous exception from generated code (EL0) other than an `svc` or a stop: an instruction the hardware refused
-/// at EL0 halts (`trapped`), as does an abort in the resident's private window (`private_access`); else a check stub's
-/// `brk` or a data abort at an access site of the block holding ELR ([`access_aborted`]); anything else halts.
+/// A synchronous exception from generated code (EL0) other than an `svc` or a stop, classified by site first: a `brk`
+/// at a check stub of the block holding ELR, or a data abort at one of its access sites whose recorded address range
+/// holds FAR ([`access_aborted`]: a shadow miss to retry, or a guest fault; any non-canonical address, the private
+/// window included, is #GP or #SS). Only an exception at no site, or not of its site's kind, halts: an instruction the
+/// hardware refused at EL0 (`trapped`), an abort in the resident's private window (`private_access`), else
+/// `site_mismatch` at a site and `unknown_abort` elsewhere.
 unsafe fn aborted(f: &NativeFrame) -> ! {
     unsafe {
         let (esr, far, elr, spsr): (u64, u64, u64, u64);
         asm!("mrs {0}, esr_el1", "mrs {1}, far_el1", "mrs {2}, elr_el1", "mrs {3}, spsr_el1",
              out(reg) esr, out(reg) far, out(reg) elr, out(reg) spsr);
         let mut s = load();
-        s.native = [esr, far, elr];
-        // UNDEFINED (system registers, TLB maintenance, `eret`, `hvc`, `udf`), WFI/WFE, illegal execution state, MSR/MRS/SYS
-        // traps (DAIF, cache maintenance, CTR_EL0, debug channel, counters), SME, PC and SP alignment.
-        if matches!(esr >> 26, 0x00 | 0x01 | 0x0e | 0x18 | 0x1d | 0x22 | 0x26) {
-            halt(s, stop::TRAPPED)
-        }
-        // Instruction or data abort from EL0 in the private window (FAR is valid for both).
-        if matches!(esr >> 26, 0x20 | 0x24) && WINDOW.contains(&far) {
-            halt(s, stop::PRIVATE_ACCESS)
-        }
-        let Some(b) = cache::block_at(elr) else {
-            halt(s, stop::UNKNOWN_ABORT)
+        let block = cache::block_at(elr);
+        let all = block.map_or(&[][..], cache::sites);
+        // `native` for every outcome: ESR, FAR, and ELR as an offset in its block when it is in one, else absolute.
+        let at = block.map_or(elr, |b| elr - b.code_va());
+        s.native = [esr, far, at];
+        let found = all.binary_search_by_key(&at, |site| site.native_offset as u64).ok().map(|i| all[i]);
+        // The syndrome must be the class this site's kind produces, before anything is taken or stepped: BRK from
+        // AArch64 with the stub's immediate (1 branch target, 2 split, 3 divide), else a data abort from EL0 inside the
+        // site's access (access_aborted checks the rest).
+        let brk = |imm: u64| esr >> 26 == 0x3c && esr & 0xffff == imm;
+        let ours = |site: &Site| {
+            from_el0(spsr)
+                && match site.kind {
+                    object::kind::GUARD => brk(1),
+                    object::kind::SPLIT => brk(2),
+                    object::kind::DIVIDE => brk(3),
+                    _ => esr >> 26 == 0x24 && far.wrapping_sub(site_address(site, f)) < u64::from(site.width),
+                }
         };
-        let at = elr - b.code_va();
-        s.native[2] = at;
-        let all = cache::sites(b);
-        let Ok(i) = all.binary_search_by_key(&at, |site| site.native_offset as u64) else {
-            halt(s, stop::UNKNOWN_ABORT)
+        let (Some(b), Some(site)) = (block, found.filter(ours)) else {
+            // UNDEFINED (system registers, TLB maintenance, `eret`, `hvc`, `udf`), WFI/WFE, illegal execution state,
+            // MSR/MRS/SYS traps (DAIF, cache maintenance, CTR_EL0, debug channel, counters), SME, PC and SP alignment.
+            if matches!(esr >> 26, 0x00 | 0x01 | 0x0e | 0x18 | 0x1d | 0x22 | 0x26) {
+                halt(s, stop::TRAPPED)
+            }
+            // Instruction or data abort from EL0 in the private window (FAR is valid for both), at no access site.
+            if matches!(esr >> 26, 0x20 | 0x24) && WINDOW.contains(&far) {
+                halt(s, stop::PRIVATE_ACCESS)
+            }
+            halt(s, if found.is_some() { stop::SITE_MISMATCH } else { stop::UNKNOWN_ABORT })
         };
-        let site = all[i];
-        if !from_el0(spsr) {
-            halt(s, stop::SITE_MISMATCH)
-        }
-        // The syndrome must be the class this site's kind produces, before anything is taken or stepped (a malformed
-        // abort stops here): BRK from AArch64 with the stub's immediate (1 guard, 2 split, 3 divide), else a data
-        // abort from EL0 (access_aborted checks the rest).
-        let expected = match site.kind {
-            object::kind::GUARD => (0x3c, 1),
-            object::kind::SPLIT => (0x3c, 2),
-            object::kind::DIVIDE => (0x3c, 3),
-            _ => (0x24, esr & 0xffff),
-        };
-        if (esr >> 26, esr & 0xffff) != expected {
-            halt(s, stop::SITE_MISMATCH)
-        }
         // Invalidations queued while `b` ran (a resident entry takes them): if they dropped `b`, it must not run on.
         let generation = s.generation;
         take_invalidations(&mut s);
@@ -974,14 +973,11 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             step_from(s, f, b, &site)
         }
         match site.kind {
-            object::kind::GUARD | object::kind::SPLIT | object::kind::DIVIDE => {
-                match site.kind {
-                    object::kind::GUARD => guest_fault(s, f, b, &site, noncanonical(&site)),
-                    // #DE: no error code.
-                    object::kind::DIVIDE => guest_fault(s, f, b, &site, [0, 0, 0]),
-                    _ => split(s, f, b, all, &site, spsr),
-                }
-            }
+            // A branch target checked non-canonical: #GP(0) at the branch.
+            object::kind::GUARD => guest_fault(s, f, b, &site, noncanonical(&site)),
+            // #DE: no error code.
+            object::kind::DIVIDE => guest_fault(s, f, b, &site, [0, 0, 0]),
+            object::kind::SPLIT => split(s, f, b, all, &site, spsr),
             _ => access_aborted(s, f, b, &site, [esr, far, elr, spsr]),
         }
     }
@@ -989,15 +985,20 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
 
 /// A data abort at an access site: a shadow miss to retry, or a guest fault.
 unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, [esr, far, elr, spsr]: [u64; 4]) -> ! {
-    let store = matches!(site.kind, object::kind::STORE | object::kind::STORE_PAIR | object::kind::PUSH);
+    let store = matches!(site.kind, object::kind::STORE | object::kind::PUSH);
     // A swap (memory XCHG) may report either direction (WnR is not defined strictly for atomics); it writes nothing.
     let swap = site.kind == object::kind::SWAP;
     let write_abort = (esr >> 6) & 1 != 0;
     let write = site.intent == object::INTENT_WRITE;
     let address = site_address(site, f);
     let width = u64::from(site.width);
-    // A swap whose operand crosses 16 bytes takes an alignment fault (LSE2) before any effect: a split lock, not completed.
+    let touched = pages(address, width);
+    // A swap whose operand crosses 16 bytes takes an alignment fault (LSE2) before any effect: a split lock, not
+    // completed, unless x86's canonical check (made first) fails.
     if swap && esr & 63 == 0x21 && esr >> 26 == 0x24 && (address & 15) + width > 16 {
+        if touched.is_none() {
+            guest_fault(s, f, b, site, noncanonical(site))
+        }
         bank_at(&mut s, f, b, site);
         halt(s, stop::UNSUPPORTED_ATOMIC)
     }
@@ -1010,8 +1011,9 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
     {
         halt(s, stop::SITE_MISMATCH)
     }
-    // A non-canonical access that passed the guard (other than A[63] != A[47]: level-0 or gap faults).
-    let Some(touched) = pages(address, width) else {
+    // A non-canonical address (unmapped, EL1-only, or execute-only in the private window: generated code runs at EL0
+    // with no address guard) is #GP, or #SS for a stack-segment site, whichever byte faulted.
+    let Some(touched) = touched else {
         guest_fault(s, f, b, site, noncanonical(site))
     };
     // A repeat of the last retry with its shadow untouched, and no shadow reset or flush since, would loop.
@@ -1039,7 +1041,7 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
 }
 
 /// `ACCESS_COMPLETED` for a page-crossing store (split stub): translate both pages
-/// with write intent, then write the access's data register(s) through owned RAM in
+/// with write intent, then write the access's data register through owned RAM in
 /// guest byte order, apply its writeback and resume after it. A fault on either page
 /// stops before any byte is written.
 unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &Site, spsr: u64) -> ! {
@@ -1047,9 +1049,8 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
         halt(s, stop::SITE_MISMATCH)
     };
     let access = all[i];
-    let pair = access.kind == object::kind::STORE_PAIR;
     let width = access.width as usize;
-    if !pair && width > 8 {
+    if width > 8 {
         halt(s, stop::SITE_MISMATCH)
     }
     let address = site_address(stub, f);
@@ -1068,15 +1069,12 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
         }
     };
     let gpa = [gpa0, gpa1];
-    let reg = |r: u8| if r == 31 { 0 } else { f.x[r as usize] };
-    let mut bytes = [0u8; 16];
-    if pair {
-        let half = width / 2;
-        bytes[..half].copy_from_slice(&reg(access.data_reg[0]).to_le_bytes()[..half]);
-        bytes[half..width].copy_from_slice(&reg(access.data_reg[1]).to_le_bytes()[..half]);
-    } else {
-        bytes[..width].copy_from_slice(&reg(access.data_reg[0]).to_le_bytes()[..width]);
+    // One data register (admission admits no pair kind).
+    let bytes = match access.data_reg[0] {
+        31 => 0,
+        r => f.x[r as usize],
     }
+    .to_le_bytes();
     let head = (4096 - (address & 4095)) as usize;
     let (Some(to0), Some(to1)) = (RAM.range(gpa[0], head as u64), RAM.range(gpa[1], (width - head) as u64)) else {
         halt(s, stop::SHADOW)

@@ -16,6 +16,9 @@ Files:
   review's memwords approach); exit status 1 if any word loads or stores emulator data (a non-site access, a literal
   load, an sp access). With series11 on the four corpora of §2 it finds none; series10 gives the 3,019 x28, 783 literal
   and 42 sp words of the follow-up's table.
+  Since E3 it also counts address-guard words (a guard stub covering an access, its branch and its `eor`; exit status
+  1 if any) and, with `--before FEXC0`, the word-count change: series13 has 0 (series12: 3,735), 19,712 words against
+  series12's 23,866 (-17.4%), the same 556 blocks and 4,233 guest instructions.
 - Raw output is in `/private/tmp/claude-501/-Users-liaozping-orca-natemu/025ed521-9978-4fb2-aaf7-b90da95d37f3/scratchpad/el0/`:
   - `final.txt`: the run reported here, `probe 9 2`;
   - `try2.txt`: a replicate;

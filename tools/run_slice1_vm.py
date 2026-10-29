@@ -17,6 +17,11 @@ import argparse, json, pathlib, subprocess, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
 import ref  # noqa: E402
+# The driver option that turns on admission's code-shape debug check (off by default in the host). Passed by every test
+# runner (run_slice1_vm, run_slice1_faults, run_slice2_vm through run_program, run_slice2_faults, run_slice2_probes,
+# run_slice3_vm except `contain`, upstream_tests/run_asm); not by `contain` (isolation must not depend on it) or
+# tools/bench/run_natemu.py (the host's default admission).
+CODE_SHAPE = ['--code-shape']
 
 def build():
     cargo = ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release']
@@ -67,6 +72,7 @@ def run_program(host, runtime, fexc, p, expected, work, max_block=None):
     work.mkdir(parents=True, exist_ok=True)
     (work / 'program.txt').write_text(description(p))
     limit = [str(max_block)] if max_block else []
+    limit += CODE_SHAPE
     run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work] + limit, capture_output=True, text=True)
     entry = {'name': p['name'], 'returncode': run.returncode, 'stderr': run.stderr[-2000:]}
     if run.returncode == 0:

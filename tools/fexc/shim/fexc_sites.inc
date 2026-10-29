@@ -241,25 +241,25 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
 }
 
 // ---------------------------------------------------------------------------------------------
-// Profile slice1: address guard (contract §1 patch 7), split-store check (patch 8) and branch-target check.
+// Profile slice1: split-store check (contract §1 patch 8) and branch-target check.
 //
 // Each check branches with tbnz to an out-of-line `brk` stub emitted after the block body (FexcEmitStubs). The stub's
-// PC is a guard or split site: the runtime finds it by ELR like any site. The checks use only TMP1/TMP2 (x0/x1, never
+// PC is a split or guard site: the runtime finds it by ELR like any site. The checks use only TMP1/TMP2 (x0/x1, never
 // allocated by the RA and dead between IR ops), do not write NZCV, and sit right before the access op (or right after
 // the branch target is defined), so at a stub the guest state is exactly that of the access site: the state before the
 // guest instruction, with no effect of it committed. No helper call, no new IR op.
-//   guard   eor x0, A, A, lsl #16; tbnz x0, #63, stub       A[63] != A[47]: the private half, the TTBR1 gap and the
-//           (A = base, or x1 = base + index|imm first)       non-canonical lower addresses; the rest is in neither
-//                                                            TTBR range (level-0 translation fault at the site)
-//   split   add x0, A, #w-1; eor x0, x0, A; tbnz x0, #12, stub   store wider than 1 byte crossing a 4 KiB page
-//   target  eor x0, T, T, lsl #16; tbnz x0, #63, stub       indirect jmp/call/ret: T = the exit's computed RIP
-// A RIP-relative address (base = EntrypointOffset, no index) is a compile-time constant: a non-canonical one or a
-// page-crossing store gets an unconditional `b` to its stub instead. Direct branches to non-canonical targets are
-// cut at decode (FexcSlice1::Cut).
+//   split   [add/sub x1, base, index|imm;] add x0, A, #w-1; eor x0, x0, A; tbnz x0, #12, stub
+//                                                            store wider than 1 byte crossing a 4 KiB page (A = base or x1)
+//   target  eor x0, T, T, lsl #16; tbnz x0, #63, stub       indirect jmp/call/ret: T = the exit's computed RIP (x86 raises
+//                                                            #GP at the branch, before its push, pop or RIP change)
+// There is no address guard (E3): generated code runs at EL0, where every non-canonical address is unmapped, EL1-only or
+// execute-only, so a data access to it faults in hardware at its site and the runtime raises #GP/#SS from the site.
+// A RIP-relative address (base = EntrypointOffset, no index) is a compile-time constant: a page-crossing store gets an
+// unconditional `b` to its split stub instead. Direct branches to non-canonical targets are cut at decode (FexcSlice1::Cut).
 // ---------------------------------------------------------------------------------------------
 namespace {
 constexpr bool FexcCanonical(uint64_t A) { return uint64_t(int64_t(A << 16) >> 16) == A; }
-constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3;   // brk immediates (the runtime keys on the PC)
+constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3;   // brk immediates (the runtime keys on the PC); 1: branch target
 } // namespace
 
 // A new guard/split site for the current guest instruction, recorded like an access site at this point (width, intent,
@@ -330,30 +330,26 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
     break;
   }
   case IROps::OP_POP: { const auto Op = IROp->C<IR::IROp_Pop>(); Addr = &Op->InoutAddr; W = IR::OpSizeToSize(Op->Size); break; }
-  // Memory xchg: the guard only. No split check: an operand crossing 16 bytes (a page included) takes an alignment fault
-  // at the swap itself, before any effect (LSE2), which the runtime stops as unsupported.
-  case IROps::OP_ATOMICSWAP: Addr = &IROp->C<IR::IROp_AtomicSwap>()->Addr; break;
+  // Memory xchg: no split check: an operand crossing 16 bytes (a page included) takes an alignment fault at the swap
+  // itself, before any effect (LSE2), which the runtime stops as unsupported.
+  case IROps::OP_ATOMICSWAP: return;
   case IROps::OP_UDIV: case IROps::OP_DIV: FexcDivCheck(IROp); return;
   default: return;
   }
+  // Every store wider than one byte gets the split check, read-modify-write stores included: with both pages already
+  // shadowed readable the load does not fault, only the store faults on the second page, and Arm may commit the first
+  // part (DDI0487 B2.8.2.1). Loads, byte stores and swaps need no check: a fault anywhere commits nothing.
+  if (!Store || W < 2) return;
   bool Index = false;
   uint64_t C;
   if (Offset && !Offset->IsInvalid()) {
     if (IsInlineConstant(*Offset, &C)) Imm += int64_t(C);
     else Index = true;
   }
-  // Every store wider than one byte gets the split check, read-modify-write stores included: with both pages already
-  // shadowed readable the load does not fault, only the store faults on the second page, and Arm may commit the first
-  // part (DDI0487 B2.8.2.1). The store of a read-modify-write (same rule as the recorder) whose address is the very
-  // value its load guarded skips only the guard.
-  const bool Rmw = (IROp->Op == IROps::OP_STOREMEM || IROp->Op == IROps::OP_STOREMEMTSO) && FexcLoadSite >= 0 &&
-                   fexc_sites[FexcLoadSite].width == W;
-  const bool Split = Store && W > 1;
-
   const auto Base = GetReg(*Addr).X();
   // A stub site records the address as it is at the stub: register + imm (the checked register, or the RIP-relative base).
-  auto Stub = [&](uint8_t Kind, ARMEmitter::Register R, int64_t Off) {
-    auto* L = FexcStub(Kind, true);
+  auto Stub = [&](ARMEmitter::Register R, int64_t Off) {
+    auto* L = FexcStub(FEXC_SITE_SPLIT, true);
     fexc_sites.back().base_reg = uint8_t(R.Idx());
     fexc_sites.back().imm = int32_t(Off);
     return L;
@@ -361,12 +357,9 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   const auto Rip = fexc_rip_relative.find(IR->GetID(Node).Value);
   if (Rip != fexc_rip_relative.end() && !Index) {   // RIP-relative: a compile-time address
     const uint64_t A = Entry + Rip->second + Imm;
-    if (!FexcCanonical(A)) b_OrRestart(Stub(FEXC_SITE_GUARD, Base, Imm));
-    else if (Split && ((A ^ (A + W - 1)) & 0x1000)) b_OrRestart(Stub(FEXC_SITE_SPLIT, Base, Imm));
+    if ((A ^ (A + W - 1)) & 0x1000) b_OrRestart(Stub(Base, Imm));
     return;
   }
-  const bool Shared = Rmw && fexc_rmw_same_address.count(IR->GetID(Node).Value);
-  if (Shared && !Split) return;
   ARMEmitter::Register A = Base;
   if (Index) {
     const auto Ext = Type == IR::MemOffsetType::UXTW ? ARMEmitter::ExtendedType::UXTW :
@@ -379,18 +372,13 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
     else { LoadConstant(ARMEmitter::Size::i64Bit, TMP2, uint64_t(Imm)); add(ARMEmitter::Size::i64Bit, TMP2, Base, TMP2); }
     A = TMP2;
   }
-  if (!Shared) {
-    eor(ARMEmitter::Size::i64Bit, TMP1, A, A, ARMEmitter::ShiftType::LSL, 16);
-    tbnz_OrRestart(TMP1, 63, Stub(FEXC_SITE_GUARD, A, 0));
-  }
-  if (Split) {
-    add(ARMEmitter::Size::i64Bit, TMP1, A, W - 1);
-    eor(ARMEmitter::Size::i64Bit, TMP1, TMP1, A);
-    tbnz_OrRestart(TMP1, 12, Stub(FEXC_SITE_SPLIT, A, 0));
-  }
+  add(ARMEmitter::Size::i64Bit, TMP1, A, W - 1);
+  eor(ARMEmitter::Size::i64Bit, TMP1, TMP1, A);
+  tbnz_OrRestart(TMP1, 12, Stub(A, 0));
 }
 
-// The stubs, after the block body (reached only by their checks; the body before them ends in an exit `br`).
+// The stubs, after the block body (reached only by their checks; the body before them ends in an exit: `svc #1` or the
+// dispatch `b`).
 void Arm64JITCore::FexcEmitStubs() {
   if (FexcTargetsDone != fexc_target_check.size()) {
     ERROR_AND_DIE_FMT("fexc slice1: {} of {} indirect branch targets were not checked", fexc_target_check.size() - FexcTargetsDone,

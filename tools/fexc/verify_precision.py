@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1b1 check: the slice-1 precision guarantee, verified statically on the code fexc emits (profile slice1).
 
-usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series12 build)
+usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series13 build)
 
 Corpora: fixtures/slice1/programs.json, the single-instruction matrix of scan_skips.py, the adversarial programs below
 (one per precision patch), and every CORPUS.json given (gen_slice1.py format, e.g. a fresh `--seed` corpus).
@@ -30,9 +30,10 @@ For every compile, from the disassembly, the sites, the dense PC table and the s
       instruction, and width, base, index, immediate and writeback match the instruction (check_sites.code_vs_sites);
       (b) for programs with `asm` (fixtures, generated, adversarial): check_sites' comparison of expected accesses, sites,
       object and JSON, with no eliminated access.
-  P8-P10 (S1b2, see guards()): every non-RIP-relative access has the address guard on exactly its address, every pure
-      store wider than one byte the split check, every stub is reached only by its check, and every indirect exit checks
-      its target before any state write; the guard/split/branch-target stubs are sites, so P1/P2 hold at their branches.
+  P8-P10 (S1b2, E3, see guards()): no access has an address guard (E3: a non-canonical access faults in hardware at
+      its site), every store wider than one byte has the split check, every stub is reached only by its check, and every
+      indirect exit checks its target before any state write; the split/branch-target stubs are sites, so P1/P2 hold at
+      their branches.
   P11 (S1f, see divides()): every div/idiv (width and signedness from its x86 bytes) has exactly its #DE checks in
       their exact per-width form (DIV_FORMS: opcodes, extends, bitfield positions and scratch registers pinned; the far
       form `inverse test; b stub` accepted), the zero check directly before the overflow check, all before FEX's own
@@ -70,7 +71,7 @@ import check_sites, scan_skips  # noqa: E402
 from check_sites import code_vs_sites  # noqa: E402
 import flags as F  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series12/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series13/obj/fexc')
 
 NZCV_WRITERS = {'adds', 'adcs', 'subs', 'sbcs', 'ands', 'bics', 'negs', 'ngcs', 'cmp', 'cmn', 'tst', 'ccmp', 'ccmn', 'fcmp',
                 'fcmpe', 'fccmp', 'fccmpe', 'setf8', 'setf16', 'rmif', 'cfinv', 'axflag', 'xaflag'}
@@ -217,17 +218,14 @@ def checked_expr(reg, lo, hi, dis, order):
 
 
 def guards(d, dis, order):
-    """P8-P10 (slice1 address guard, split-store check, branch-target check) on one compile.
-    Returns (violations, {stub: its check branch}, cost {'guard'|'split'|'branch'|'stub': native words}).
-      P8  every access site (non-stub) other than a RIP-relative one: in its instruction, after the last write of its
-          address registers, `eor x0, xA, xA, lsl #16; tbnz x0, #63, G` where G is a guard stub linked to the site and xA
-          holds exactly the site's address (xA = base, or x1 = base + index|imm by the guard's own add/sub; a `mov` copy
-          of the base into the site's base after the guard is followed). The store of a read-modify-write may share its
-          load's guard (same address form, registers unchanged). A RIP-relative access (base last written by a guest-RIP
-          move, no index) needs no guard when its constant address is canonical, else an unconditional `b` to a guard.
-          Every store wider than one byte (store, store_pair, push; read-modify-write stores too: with both pages shadowed
+    """P8-P10 (slice1 split-store check and branch-target check; no address guard since E3) on one compile.
+    Returns (violations, {stub: its check branch}, cost {'guard'|'split'|'branch'|'stub': native words}; 'guard' stays 0).
+      P8  no access site has a guard stub (the address guard is gone: a non-canonical access faults in hardware at its
+          site, where the runtime raises #GP/#SS). Every store wider than one byte (store, store_pair, push; read-modify-write stores too: with both pages shadowed
           only the store faults, and Arm may commit its first part) is preceded by `add x0, xA, #w-1; eor x0, x0, xA;
-          tbnz x0, #12, S` on exactly its address (or, RIP-relative and crossing, `b S`) with S a split stub linked to it, and
+          tbnz x0, #12, S` on exactly its address (xA = base, or x1 = base + index|imm by the check's own add/sub; or,
+          RIP-relative (base last written by a guest-RIP move, no index) and crossing a page, canonical or not, `b S`) with
+          S a split stub linked to it, and
           between that branch and the store only x0, x1 or the store's own base are written (the runtime's completion of
           a split store subsumes them). No other site has a split stub.
       P9  every guard/split site is a `brk #1`/`brk #2` word after the body, reached by exactly one branch, which is one of
@@ -302,7 +300,7 @@ def guards(d, dis, order):
         r = next((r for r in rel if bw and r['register'] == b and r['offset'] <= bw[-1] < r['offset'] + 16), None)
         if r and ix is None:   # RIP-relative: compile-time address
             A = (int(r['guest_rip'], 16) + s['imm']) & M64
-            want_g, want_s = not canonical(A), canonical(A) and pure and bool((A ^ (A + s['width'] - 1)) & 0x1000)
+            want_g, want_s = False, pure and bool((A ^ (A + s['width'] - 1)) & 0x1000)
             for kind, want, have in (('guard', want_g, gs), ('split', want_s, sp)):
                 if len(have) != want:
                     out.append(f'{tag}: RIP-relative address {A:#x} needs {int(want)} {kind} stub(s), has {len(have)}')
@@ -313,33 +311,9 @@ def guards(d, dis, order):
                     else:
                         ok.add(o); cost[kind] += 1
             continue
-        # P8 address guard
-        if not gs and s['rmw'] == 'store':
-            ld = next((x for x in by_off.values() if x['guest_offset'] == s['guest_offset'] and x['rmw'] == 'load'), None)
-            lg = [x for x in linked.get(ld['native_offset'], []) if x['kind'] == 'guard'] if ld else []
-            lexpr = ld and (ld['base_reg'], ld['index_reg'], ld['extend'] if ld['index_reg'] is not None else 'none',
-                            ld['shift'] if ld['index_reg'] is not None else 0, ld['imm'])
-            if not (lg and lexpr == expr and lg[0]['native_offset'] in check_at and not written(b, check_at[lg[0]['native_offset']], at)
-                    and (ix is None or not written(ix, check_at[lg[0]['native_offset']], at))):
-                out.append(f'{tag}: read-modify-write store without a guard, and its load\'s guard does not cover its address')
-        elif len(gs) != 1:
-            out.append(f'{tag}: {len(gs)} guard stubs')
-        else:
-            g = gs[0]
-            t = check_at.get(g['native_offset'])
-            A = g['base_reg']
-            c = cond(t, 63, g['native_offset'])
-            if c is None or not (lo <= c and t < at) or dis.get(c - 4) != f'eor x0, x{A}, x{A}, lsl #16' or g['imm'] != 0:
-                out.append(f'{tag}: guard +{g["native_offset"]} is not `eor x0, xA, xA, lsl #16; tbnz x0, #63` in the instruction')
-            else:
-                ce = checked_expr(A, lo, c - 4, dis, order)
-                if ce is None or ce != expr or written(ce[0], c - 4, at) or (ix is not None and written(ix, c - 4, at)):
-                    out.append(f'{tag}: guard checks {ce} (x{A}), the access is {expr} (or its registers change before it)')
-                ok.add(t)
-                q = c - 8   # the guard's address words: the run writing only x1 right before the eor
-                while A == 1 and q >= lo and writes(dis.get(q, '')) == {('x', 1)}:
-                    cost['guard'] += 1; q -= 4
-                cost['guard'] += 2 + (t - c) // 4
+        # P8: no address guard
+        if gs:
+            out.append(f'{tag}: {len(gs)} address guard stubs')
         # P8 split check
         if pure:
             if len(sp) != 1:
@@ -356,10 +330,9 @@ def guards(d, dis, order):
                     out.append(f'{tag}: split stub +{x["native_offset"]} is not `add x0, xA, #w-1; eor x0, x0, xA; tbnz x0, #12` on the store address ({ce} vs {expr})')
                 else:
                     ok.add(t2); cost['split'] += 3 + (t2 - c2) // 4
-                    if not gs:   # a shared read-modify-write guard: the store's own address words count here
-                        q = c2 - 12
-                        while A == 1 and q >= lo and writes(dis.get(q, '')) == {('x', 1)}:
-                            cost['split'] += 1; q -= 4
+                    q = c2 - 12   # the check's own address words: the run writing only x1 right before the add
+                    while A == 1 and q >= lo and writes(dis.get(q, '')) == {('x', 1)}:
+                        cost['split'] += 1; q -= 4
                     # The runtime completes a split store from the registers as they are at the stub: nothing between the
                     # check and the store may write anything but the scratch registers x0/x1 (not the base, not the data).
                     for o in (o for o in order if t2 < o < at):

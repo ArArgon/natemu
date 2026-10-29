@@ -135,11 +135,11 @@ the chunks most exposed to those costs (S3 syscall/PTI CR3 switches, X3 IPIs); n
 
 ```
 Foundation: E1 (done) → E1b (GIC doorbell + unlinking stop) → E2 (EL0) → E3 (guard off, admission split) → E4 review
-            then G1 (guest-state page) and K1 (code cache across CR3/INVLPG); L0 (host split) any time
+            then G1 (guest-state page), K1 (code cache across CR3/INVLPG) and U1 (shadows per x86 CPL); L0 (host split) any time
 C0 (download allowed) ─────────────────────── feeds I1–I8
 ISA:        I1 → I7 → I2 → I3 → I5a → I5b → I6, (I8)
-System:     S1 → S2a → S2b → S3 (needs I7) → S4 (TF single-step, DR breakpoints; after X1a)
-Delivery:   X1a (needs S2b) → X1b (needs S3 for LSL) → X1c
+System:     S1 → S2a → S2b → S3 (needs I7, U1) → S4 (TF single-step, DR breakpoints; after X1a)
+Delivery:   X1a (needs S2b) → X1b (needs S3 for LSL, U1 before any IRETQ to CPL3) → X1c
 Events:     X2 (GIC doorbell events from E1b; needs X1a) → X3 (needs M3, L5) → X4 (needs I3, I7)
 Memory:     M1 → M2 → M3
 Devices:    L0 → L1, L2;  L3 → L4a → L4b;  L5
@@ -172,8 +172,8 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 | **E2** EL0 switch | Page roles (code execute-only, L1 code, EL1-only resident), lower-EL vectors, EC 0x24/0x20 at EL0, stop and fault paths from EL0 | Standing suite; trap checks for system instructions at EL0 | standing suite | all green at EL0 |
 | **E3** guard off, admission split | Remove patch-0007 guard words and checks; admission = mandatory object validation + optional code-shape debug; negative tests: every former window address and both canonical straddles give #GP/#SS | Faults suite + new negative cells; census | standing suite | 0 guard words; all #GP/#SS exact |
 | **E4** review | Independent review of E1b–E3 as one design | — | standing suite | ACCEPT |
-| **P1** x86 privilege in shadows | E2 shadows carry no x86 U/S (the walker checks at the current CPL; CPL is fixed per run today). Before any CPL transition (X1b delivery from CPL3, S3 SYSCALL/SYSRET, IRETQ to CPL3): keep one shadow space per x86 CPL class (separate ASIDs/roots for CPL0 and CPL3) so a CPL change switches spaces instead of resetting, and a CPL0 shadow can never serve a CPL3 access | Fault matrix at both CPLs across transitions; syscall/IRET round trips that touch supervisor pages before and after | standing suite | no CPL3 access through a CPL0 shadow; no shadow flush per transition |
-| **G1** guest-state page | One EL0 page per vCPU at a fixed non-canonical address holding only FEX guest-state fields (DF, FS/GS, MXCSR, x87, AVX-high); documented deviation; invariant test | Layout test; non-#GP limited to that page | standing suite | invariant test fails on any non-guest field |
+| **U1** x86 privilege in shadows | E2 shadows carry no x86 U/S (the walker checks at the current CPL; CPL is fixed per run today). Before any CPL transition (X1b delivery from CPL3, S3 SYSCALL/SYSRET, IRETQ to CPL3): keep one shadow space per x86 CPL class (separate ASIDs/roots for CPL0 and CPL3) so a CPL change switches spaces instead of resetting, and a CPL0 shadow can never serve a CPL3 access | Fault matrix at both CPLs across transitions; syscall/IRET round trips that touch supervisor pages before and after | standing suite | no CPL3 access through a CPL0 shadow; no shadow flush per transition |
+| **G1** guest-state page | One EL0 page per vCPU at a fixed non-canonical address holding only FEX guest-state fields (DF, FS/GS, MXCSR, x87, AVX-high); documented deviation (a guest access to that page reaches its own state instead of #GP); the page lies outside the private window `[PRIVATE, PRIVATE+1 GiB)` or is exempted explicitly in `aborted`; invariant test | Layout test; non-#GP limited to that page | standing suite | invariant test fails on any non-guest field |
 | **K1** code cache across CR3/INVLPG | Blocks filed by guest-physical source pages; CR3/INVLPG drop only shadows; linear→physical revalidation on lookup; per-page invalidation for host/device writes | Address-space switch programs keep translations (counted); remap/rewrite always retranslated; QEMU at 1–4 vCPUs | `system`, `coherence`, `sharedpt` | no full flush on CR3 |
 | **S4** debug: TF and breakpoints | TF/RF single-step, DR0–3/DR7 execute and data breakpoints, #DB delivery, interaction with linking/dispatch (CPU 16 requires it) | QEMU programs; SDM model | standing suite | #DB exact per SDM |
 | **C0** census (after Q2) | Static census of instruction forms admission refuses, over the Debian decompressor, the decompressed vmlinux and the initramfs `/init` binaries, by H §2's static-share method with fexc's classifier | Counts per form and per binary; spot-check against `llvm-objdump` | — | every refused form is listed with its I-chunk or a proposed typed refusal |
@@ -291,6 +291,23 @@ access to the debug channel, counters/timers and PMU traps to EL1, not the host 
 recorded access site must become #GP/#SS from the walker by `site_address`, even with FAR in the window or a permission
 fault on the code area; `private_access` stays only for an ELR that is no access site. G1's page must lie outside the
 window or be exempted explicitly.
+*Built (E3):* the address guard is gone (fexc series13: a change in `tools/fexc/shim/`, the patches are series12's).
+Kept as x86 semantics: the split check, the branch-target check (#GP at the branch, before a call's push, a ret's pop or
+any RIP change: a lazy check at dispatch would come too late), the #DE checks, precision and the site map. `aborted`
+classifies by site first: a `brk` at a stub, or a data abort at an access site whose recorded address range holds FAR,
+goes to the site's handler (any non-canonical address, the window included, is #GP or #SS from the record; a
+non-canonical swap crossing 16 bytes is #GP, not a split lock); only an exception at no site, or not of its site's kind,
+halts `trapped`, `private_access`, `site_mismatch` or `unknown_abort`. Admission is split: object validation always
+(records, register map, relocations, link points and their targets, the dispatch exit's form, division `svc`s only in
+64-bit div/idiv, x25 written only by the pre-NZCV save, x28 never written and never a base outside `GUEST_STATE`, only
+`svc #LINK/#DIV`, forward branches, no fall-through into data or stubs, each site's word its recorded access, and
+unknown words only if they neither branch nor name x25/x28); the code-shape check (allowlist, sp, literals, unrecorded
+accesses, split/branch-target/#DE check forms, stubs reached once) is a debug option, `NATEMU_CODE_SHAPE=1`, on in the
+test runners and off in `contain`. Negative cases (faults suite, `window_probes`): every former window class, both
+holes, poison values, both canonical straddles and RIP-relative accesses into and across the low hole, with every data,
+stack, split-store, XCHG and call/ret form, give exact #GP/#SS at block sizes default and 1 (386 cases; the faults
+suite is 3,829 at both). Census: 0 address-guard
+words (series12: 3,735); 19,712 words against 23,866 (-17.4%), same blocks and guest instructions.
 **Owner decision (October 28): MTRRs enabled by the virtual firmware, RAM write-back, device ranges uncached** (plan Q3).
 **Deferred (owner, October 28):** replacing the host's minimal JSON reader (`crates/host/src/json.rs`, used only for
 fexc's per-compile report: end reason and cut opcode) by carrying those fields in the code-object header; no registry

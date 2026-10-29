@@ -13,7 +13,7 @@ import sys
 import unittest
 from pathlib import Path
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series12/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series13/obj/fexc')
 HERE = Path(__file__).resolve().parent
 
 # (name, x86 hex, rip, bitness, decoded instructions, expected end reason)

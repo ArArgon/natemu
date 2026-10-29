@@ -62,6 +62,10 @@ names, and none of that instruction's effects is committed. FEX patches that pro
    non-canonical values take level-0 translation faults and canonical-end overruns land in the unmapped 1 GiB below
    `PRIVATE`, both classified at the site. RIP-relative addresses are checked at compile time; this relies on admission requiring every guest-RIP
    relocation to equal the compile RIP's value (a future relocating code cache must re-check). Stubs (`brk`) are sites.
+   *Superseded by E3 (fexc series13):* there is no address guard. Translated code runs at EL0, where every
+   non-canonical address is unmapped, EL1-only or execute-only, so the access faults in hardware at its own site; the
+   resident classifies an abort by site first and raises #GP(0), or #SS(0) for a stack-segment site, from the site's
+   recorded address (`crates/runtime/src/execution.rs` `aborted`, `access_aborted`). The branch-target check stays.
 8. Split check for every guest store wider than 1 byte, including RMW, push/call and pair stores:
    `add x0, a, #w-1; eor x0, x0, a; tbnz x0, #12, split`. The split stub is a service site: the runtime walks both pages
    with write intent, writes both parts through owned RAM or neither (#PF), applies any recorded writeback, and resumes
@@ -181,5 +185,9 @@ invalidation on read-only → writable upgrade; plus §6 step 2's single guest-m
    H1): isolation no longer rests on the producer and its offline verifier alone. Open policy: an access wrapping past
    2^64 (e.g. 8 bytes at `0xffff_ffff_ffff_fffc`) passes the guard (its first byte is canonical) and reaches guest page
    0, never private memory; x86 semantics for the wrap (#GP versus wrap) are not yet decided.
+   *Superseded by E3:* the guard is gone (hardware faults at EL0, site-first classification, as in item 7). Admission
+   always validates the object (records, exits, link points, x25/x28 and control-flow rules); its code-shape check
+   (split, branch-target and #DE forms, the instruction allowlist) is a debug option the test runners turn on.
+   Isolation rests on the hardware, not on admission or the producer.
 5. **TSO evidence before two vCPUs** (§2); upkeep of patches to upstream RA, flag elimination and dispatcher. Slice 1
    drops block linking, L1 lookup, call-ret stack and push/pop fusion (code-cache step restores them). No scope change.

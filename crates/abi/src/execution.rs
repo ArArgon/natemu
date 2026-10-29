@@ -581,8 +581,9 @@ pub mod stop {
     /// alignment fault at its `swpal`, before any effect; contract: split locks wait for the boot phase).
     pub const UNSUPPORTED_ATOMIC: u64 = 13;
     /// Generated code (EL0) touched the resident's private window (`PRIVATE..PRIVATE + 1 GiB`): a data or instruction
-    /// abort there (its pages are EL1-only, or EL0 execute-only code). With the address guard on (until E3) only a guard
-    /// bypass or a bug reaches it; `State::native` holds the abort.
+    /// abort there (its pages are EL1-only, or EL0 execute-only code) at no access site of the block (a guest access to the
+    /// window is #GP/#SS at its site): only code the code-shape check refuses, or forged code, reaches it.
+    /// `State::native` holds the abort (ESR, FAR, ELR as an offset in its block when ELR is in one, else absolute).
     pub const PRIVATE_ACCESS: u64 = 14;
     /// Generated code ran an instruction the hardware refuses at EL0 (a system register, cache or TLB maintenance,
     /// `eret`, `hvc`, `wfi`, `udf`, the debug channel, counters and timers: ESR classes 0x00, 0x01, 0x18; also an illegal

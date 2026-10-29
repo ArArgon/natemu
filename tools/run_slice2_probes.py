@@ -255,7 +255,7 @@ def main():
         work = a.out / 'work' / name
         work.mkdir(parents=True, exist_ok=True)
         (work / 'program.txt').write_text(vm.description(program))
-        r = subprocess.run([host, runtime, 'run-program', a.fexc, work / 'program.txt', work] + args, capture_output=True, text=True)
+        r = subprocess.run([host, runtime, 'run-program', a.fexc, work / 'program.txt', work] + args + vm.CODE_SHAPE, capture_output=True, text=True)
         return (json.loads(r.stdout) if r.returncode == 0 else None), r.stderr.strip()[-300:]
 
     for name, args, flushes in RUNS:

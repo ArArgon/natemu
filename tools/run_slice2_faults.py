@@ -142,7 +142,7 @@ def main():
             work.mkdir(parents=True, exist_ok=True)
             (work / 'program.txt').write_text(vm.description(p) + ''.join(f'{mode} {pg:#x}\n' for mode, pg in muts))
             import subprocess
-            run = subprocess.run([host, runtime, 'run-program', a.fexc, work / 'program.txt', work] + ([] if size == 'default' else [size]),
+            run = subprocess.run([host, runtime, 'run-program', a.fexc, work / 'program.txt', work] + ([] if size == 'default' else [size]) + vm.CODE_SHAPE,
                                  capture_output=True, text=True)
             entry = {'case': name, 'size': size, 'qemu_fault': want.get('fault'), 'qemu_executed': want.get('executed_insns'), 'returncode': run.returncode, 'stderr': run.stderr[-500:]}
             if run.returncode:

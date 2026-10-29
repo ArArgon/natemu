@@ -27,7 +27,12 @@ Cases are derived from program descriptions, never written per program:
   The reference runs are QEMU user-mode, i.e. CPL 3; the CPL 0 cells compare the VM against them, which is valid only
   while the corpus has no pushf/popf or other privileged or CPL-dependent instruction.
 * Built-in probes (PROBES below): non-canonical data and stack addresses (#GP(0)/#SS(0)), stack accesses across the
-  canonical gap (#SS(0)), branches to non-canonical targets (#GP(0) at the branch), instruction fetch from a
+  canonical gap (#SS(0)), E3's negative cases (`window_probes`; `--no-window` leaves them out): every class of the
+  former private window (frame, state, tables, stacks, staging, resident text, shadow pool, guest-RAM alias, code area,
+  dispatcher, code-write alias, metadata, lookup, global), both holes and poison values, each with every data form,
+  page-crossing stores and pushes, and a call's push, plus both canonical straddles (first byte canonical and last not,
+  and the reverse) with loads, stores, RMW, XCHG and stack forms, and RIP-relative accesses into the low hole and
+  across into it: all fault in hardware at their site (no address guard), branches to non-canonical targets (#GP(0) at the branch), instruction fetch from a
   not-present code page, and divide errors (#DE: zero divisor and quotient overflow per width and signedness,
   register and memory divisors, a not-present divisor page before #DE, 64-bit divisions whose dividend needs 128 bits
   after a run of such divisions that do not fault).
@@ -307,8 +312,51 @@ REGS = {'rax': 0x1122334455667788, 'rcx': 0x7fffffffffffffff, 'rdx': 5, 'rbx': D
         'rbp': D + 0x400, 'rsp': S + 0x1000, 'r8': 3}
 SS_SPAN = [(0x8000_0000_0004, 'push', 'push rax'), (0xffff_8000_0000_0004, 'push', 'push rax'), (0x8000_0000_0004, 'pop', 'pop rcx'),
            (0x7fff_ffff_fffc, 'pop', 'pop rcx'), (0xffff_7fff_ffff_fffc, 'pop', 'pop rcx')]
-def probes():
+# E3 (no address guard): every class of the former private window and both holes, each a hardware fault at the access
+# site that must give #GP(0), or #SS(0) for a stack access, with the exact state. (name, page; abi `PRIVATE` layout.)
+WINDOW = [('tables', PRIVATE + 0x1_0000), ('shared', PRIVATE + 0x2_0000), ('state', PRIVATE + 0x2_2000), ('frame', PRIVATE + 0x2_3000),
+          ('stack', PRIVATE + 0x5_3000), ('exception-stack', PRIVATE + 0x6_3000), ('staging', PRIVATE + 0x7_0000),
+          ('text', PRIVATE + 0xa_0000), ('pool', PRIVATE + 0xe_0000), ('guest-ram', PRIVATE + 0x20_0000 + D),
+          ('code', PRIVATE + 0x1003_1000), ('dispatch', PRIVATE + 0x1001_0000), ('code-write', PRIVATE + 0x2003_1000),
+          ('meta', PRIVATE + 0x3000_0000), ('lookup', PRIVATE + 0x3800_0000), ('global', PRIVATE + 0x3c00_0000),
+          ('low-hole', 0x0000_ffff_ffff_e000), ('low-hole-kernel', 0x0000_8880_1234_5000),
+          ('high-hole', 0xffff_0000_0000_0000), ('high-hole-mid', 0xffff_4000_0000_0000), ('poison', 0xdead_0000_0000_0000)]
+# Forms besides DATA_FORMS (address offset from the page): a page-crossing store and push (split stubs), a call's push.
+WINDOW_FORMS = [('split-store', 'rbx', 0, 'mov qword ptr [rbx + 0xffc], rax'), ('push-split', 'rsp', 0x1004, 'push rax'),
+                ('call', 'rsp', 0x800, 'call rdx')]
+# Both canonical straddles: the first byte canonical and the last not, and the reverse; (form, base, address offset, line).
+STRADDLES = [0x0000_7fff_ffff_fffc, 0xffff_7fff_ffff_fffc]
+STRADDLE_FORMS = [('load', 'rbx', 0, 'mov rax, qword ptr [rbx]'), ('store', 'rbx', 0, 'mov qword ptr [rbx], rax'),
+                  ('rmw', 'rbx', 0, 'add qword ptr [rbx], 1'), ('read-index', 'rsi', -3, 'cmp word ptr [rsi + r8*2], 5'),
+                  ('xchg', 'rbx', 0, 'xchg qword ptr [rbx], rax'), ('rbp-load', 'rbp', 0, 'mov rax, qword ptr [rbp]'),
+                  ('rsp-store', 'rsp', 0, 'mov qword ptr [rsp], rax'), ('push', 'rsp', 8, 'push rax'), ('pop', 'rsp', 0, 'pop rcx'),
+                  ('ret', 'rsp', 0, 'ret'), ('call', 'rsp', 8, 'call rdx'), ('push-mem', 'rbx', 0, 'push qword ptr [rbx]')]
+
+def window_probes():
     out = []
+    for cls, page in WINDOW:
+        for name, base, line in DATA_FORMS:
+            out.append((f'window-{cls}-{name}', REGS, PRELUDE + [f'movabs {base}, {page + 0x800}', line] + AFTER, len(PRELUDE) + 1, {}))
+    for cls, page in WINDOW + [(f'{a:#x}', a & ~(PAGE - 1)) for a in NONCANONICAL]:
+        for name, base, off, line in WINDOW_FORMS:
+            out.append((f'window-{cls}-{name}', REGS, PRELUDE + [f'movabs {base}, {page + off}', line] + AFTER, len(PRELUDE) + 1, {}))
+    for a in STRADDLES:
+        for name, base, off, line in STRADDLE_FORMS:
+            out.append((f'straddle-{a:#x}-{name}', REGS, PRELUDE + [f'movabs {base}, {(a + off) & M64}', line] + AFTER, len(PRELUDE) + 1, {}))
+    # RIP-relative (a guest-RIP move, no stub but a page-crossing store's `b split`): code at the top of the lower half
+    # addressing the low hole, and straddling into it.
+    for name, line in [('load', 'mov rax, qword ptr [rip + {d}]'), ('store', 'mov qword ptr [rip + {d}], rax'),
+                       ('rmw', 'add qword ptr [rip + {d}], 1'), ('xchg', 'xchg qword ptr [rip + {d}], rax')]:
+        for where, target in [('hole', RIP_TOP + 0x1_0000), ('straddle', 0x8000_0000_0000 - 4)]:
+            lines = PRELUDE + [line.format(d=0x1000)] + AFTER
+            d = target - (RIP_TOP + offsets(lines)[1][len(PRELUDE) + 1])
+            lines[len(PRELUDE)] = line.format(d=hex(d))
+            out.append((f'rip-{where}-{name}', REGS, lines, len(PRELUDE), {'rip': RIP_TOP}))
+    return out
+RIP_TOP = 0x7fff_ffff_e000          # the RIP-relative probes' code page (the last two of the lower half)
+
+def probes(window=True):
+    out = window_probes() if window else []
     for name, base, line in DATA_FORMS:
         for a in NONCANONICAL:
             out.append((f'noncanonical-{name}-{a:#x}', REGS, PRELUDE + [f'movabs {base}, {a}', line] + AFTER, len(PRELUDE) + 1, {}))
@@ -664,12 +712,15 @@ def main():
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--max-block', type=int)
     ap.add_argument('--no-probes', action='store_true')
+    ap.add_argument('--no-window', action='store_true', help='leave out the E3 window and straddle probes')
+    ap.add_argument('--only', help='run only the cases whose name contains this')
     ap.add_argument('--no-paging', action='store_true', help='only the slice-1 page mutations and probes')
     a = ap.parse_args()
     host, runtime = vm.build()
     programs = [p for f in a.programs for p in json.loads(f.read_text())['programs']]
     a.out.mkdir(parents=True, exist_ok=True)
-    cases = expectations(programs, [] if a.no_probes else probes(), a.out / 'ref', paging=not a.no_paging)
+    cases = expectations(programs, [] if a.no_probes else probes(not a.no_window), a.out / 'ref', paging=not a.no_paging)
+    if a.only: cases = [c for c in cases if a.only in c[0]]
     at_access = {} if a.no_paging else access_cells(cases)
     counts, results = {'match': 0, 'unsupported': 0, 'fail': 0}, []
     for n, case in enumerate(cases):
@@ -677,7 +728,7 @@ def main():
         work = a.out / 'work' / f'c{n:04d}'; work.mkdir(parents=True, exist_ok=True)
         (work / 'program.txt').write_text(case_description(case))
         limit = [str(a.max_block)] if a.max_block else []
-        run = subprocess.run([host, runtime, 'run-program', a.fexc, work / 'program.txt', work] + limit, capture_output=True, text=True)
+        run = subprocess.run([host, runtime, 'run-program', a.fexc, work / 'program.txt', work] + limit + vm.CODE_SHAPE, capture_output=True, text=True)
         entry = {'case': name, 'kind': kind, 'returncode': run.returncode, 'stderr': run.stderr[-1000:]}
         if run.returncode:
             entry['outcome'], diffs = 'fail', ['host error']

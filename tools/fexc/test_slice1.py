@@ -1,6 +1,6 @@
 """S1c checks: profile slice1 of fexc (block cutting at an allowlist, single-gate exits, profile record).
 
-Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series12 build)
+Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series13 build)
 
 The x86 bytes below are assembled by hand and only drive the compiler; every expectation (where the block ends, why)
 comes from the instruction's architectural class, never from fexc's output. The cut position is also compared with a
@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402  (disassemble, object reader)
 import scan_skips  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series12/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series13/obj/fexc')
 REPO = HERE.parents[1]
 RIP = 0x102000
 PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
@@ -222,9 +222,9 @@ class Slice1Cutting(unittest.TestCase):
         self.assertEqual((rc, d['guest']['instructions_translated'], d['guest']['end']['reason']), (0, 3, 'max_instructions'))
 
     def test_block_over_32k_after_far_branch_restart(self):
-        # 1500 x `mov qword ptr [rbx+8], rax` (48 89 43 08): guard + split checks push the block past tbnz's 32 KiB
+        # 1500 x `mov qword ptr [rbx+8], rax` (48 89 43 08): split checks and stubs push the block past tbnz's 32 KiB
         # range, FEX restarts with far branches; the PC table must hold one entry per instruction, in order, and the
-        # guards (far form) must verify.
+        # checks (far form) must verify.
         import verify_precision
         d, rc = run('48894308' * 1500, RIP, '--max-insts', '1500')
         self.assertEqual((rc, d['guest']['instructions_translated']), (0, 1500))

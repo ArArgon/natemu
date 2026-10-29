@@ -35,7 +35,7 @@ inline bool fexc_dense_pc_table = false;
 enum FexcSiteKind : uint8_t {
   FEXC_SITE_LOAD = 0, FEXC_SITE_STORE = 1, FEXC_SITE_LOAD_PAIR = 2, FEXC_SITE_STORE_PAIR = 3,
   FEXC_SITE_PUSH = 4, FEXC_SITE_POP = 5,
-  FEXC_SITE_GUARD = 6, FEXC_SITE_SPLIT = 7, // slice1 stubs (address guard / branch-target check, split-store check)
+  FEXC_SITE_GUARD = 6, FEXC_SITE_SPLIT = 7, // slice1 stubs (branch-target check; series4-12 also the address guard, split-store check)
   FEXC_SITE_PUSH_PAIR = 8, FEXC_SITE_POP_PAIR = 9, // FEX fused two guest push/pop into one stp/ldp
   FEXC_SITE_OTHER = 10,                     // guest-memory IR op the site record cannot describe
   FEXC_SITE_DIVIDE = 11,                    // slice1 stub: div/idiv #DE (zero divisor or quotient overflow)
@@ -113,7 +113,6 @@ inline FexcCut fexc_cut {};
 // Profile slice1, filled by FexcPrecision::Prescan before register allocation (post-RA the JIT sees physical registers,
 // not the SSA nodes behind them); keys are IR node IDs, which RA does not change.
 inline std::map<uint32_t, int64_t> fexc_rip_relative;   // guest-memory op -> its base EntrypointOffset (offset from the block RIP)
-inline std::set<uint32_t> fexc_rmw_same_address;        // store whose address is its instruction's load's (same SSA values)
 struct FexcTarget { uint32_t def; int sra; };            // the target's node, or (sra >= 0) the static register it reads
 inline std::map<uint32_t, FexcTarget> fexc_target_check; // node after which to check an indirect exit's target
 // Profile slice1, recorded by the dispatcher's DIVOp/IDIVOp: guest RIP of each div/idiv -> its x86 operand width in bytes
