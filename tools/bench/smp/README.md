@@ -132,7 +132,7 @@ identity page or either alias); both PTEs' A/D after each round are exact. `cont
 while the others INVLPG and access it (store/load, or run code from its page); `-max` pauses nowhere (walkers are starved but finish). The final PTE bytes come from
 a last synchronized round. Memory the schedule decides (pre-INVLPG store words, phase-2 words, logs) is not captured; registers are not compared.
 
-## (a) Deterministic programs (`programs.json`, 5 programs x 2/3/4 CPUs)
+## (a) Deterministic programs (`programs.json`, 8 programs x 2/3/4 CPUs)
 
 Every one ends in `cmp r11, r11` (all six flags defined) and has a schedule-independent final state; spin waits only on flags written by a
 specific peer (handshake), never on an unordered race. `model_smp.py` computes each from its specification:
@@ -143,7 +143,9 @@ specific peer (handshake), never on an unordered race. `model_smp.py` computes e
 | shared-ro | all CPUs read a shared 64 KiB LCG table with CPU-specific strides, store a checksum into CPU-specific slots | shared read-only data, per-CPU output slots |
 | handshake | CPU 0 (body A) fills a 256-qword table, publishes a flag; CPUs > 0 (body B) wait for it, checksum the table (per-CPU multiplier), set a done flag; CPU 0 waits for all done flags and sums the results | two bodies, release/acquire by TSO order, no LOCK |
 | token-ring | a single token word passes 0 -> 1 -> ... -> n-1 -> 0 for 1000 rounds; each holder logs to its own slot of an interleaved log | strictly alternating, log content deterministic |
-| xchg-lock | spin lock with `xchg [m], eax` guarding a read-modify-write of a shared counter, 5000 iterations per CPU | the only program with an implicit-LOCK instruction (slice 3's memory XCHG); final counter = n * 5000 |
+| xchg-lock | spin lock with `xchg [m], eax` guarding a read-modify-write of a shared counter, 5000 iterations per CPU | slice 3's memory XCHG (implicit LOCK); final counter = n * 5000 |
+| lock-counter | (I3, contention) every CPU runs 20000 rounds of LOCKed read-modify-writes on shared qwords at `r15` (0x260000, one 256-byte block): +0 `lock xadd` 1, +8 `lock inc`, +16 `lock add` 3, +24 `lock sub dword` 2, +32 two `lock neg` (the word starts at 1), +40 `lock cmpxchg` +1 retried until it succeeds, +48 two `lock xor` of the CPU's token r8, +56 `lock bts` then `lock btr` of the CPU's bit r9 = i, +64 `lock or dword` of r10 = 1 << i, +80 a 128-bit +1 by `lock cmpxchg16b` retried, +96 a 64-bit +1 by `lock cmpxchg8b` retried; ends with rax rbx rcx rdx zeroed | final words: +0, +8, +40 = n * 20000; +16 = 3 n * 20000; +24 dword = -2 n * 20000 mod 2^32; +32 = 1; +48, +56 = 0; +64 dword = 2^n - 1; +80 (128-bit) and +96 (64-bit) = n * 20000; registers r15 r8 r9 r10 as started, rsi = 0 |
+| neg-race, neg-private | (I3) 20000 `lock neg qword [r15]` per CPU on one shared word (race) or each CPU's own (private), each starting at 1 | every word ends 1; the runner also requires some CPU of `neg-race` to link more exits than any of `neg-private` (the lost-race exit to the NEG's own RIP ran) |
 
 ## (b) Litmus programs (`litmus.json`: sb mp lb wrc iriw sb-mfence sb-xchg iriw-mfence, each at `thread=multi` k=32768 and a `-pause` form)
 

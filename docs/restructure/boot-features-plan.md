@@ -459,6 +459,140 @@ loop 164 ns), `rep movsq` 166 ns (`memcpy` 62 ns), DF = 1 `rep stosq` 182 ns, `r
 kernel 5,725 → 0, initramfs 2,969 → 0 (`experiments/track03/kernel-census/README.md`). Not built: ERMS/FSRM stay
 unadvertised; an element per pass bounds `rep movsb` (Linux's uaccess copy before alternatives); chunked passes (several
 elements per pass, each with its own PC entry) are the upgrade if the census of executed strings asks for it.
+*Built (S2b, descriptors and segments):* the bank (`Cpu`) gains `seg` (ES, CS, SS, DS, FS, GS in Sreg order: selector and
+hidden attributes = descriptor bits 47:40 and 55:52; null = 0), `ldtr`/`tr` (selector, base, byte-granular limit,
+attributes, from 16-byte descriptors), `gdtr`/`idtr` and `mov_ss` (set by MOV SS, cleared by the next system transaction;
+X2 owns its effect and its end inside generated code). Flat 64-bit only: CS/SS/DS/ES bases and limits are not used,
+FS/GS bases stay `fs_base`/`gs_base` (I7). `Cpu::control` now also requires CS.L = 1, D = 0, so every path that loads a
+compatibility-mode CS stops `unsupported_mode` (owner decision 3). Start state (`flat_segments(cpl)`): the pinned QEMU
+stub's (CPL 0: CS 0x08, SS = DS = ES 0x10, FS = GS null; CPL 3: CS 0x23, SS 0x1b, rest null); GDTR/IDTR and LDTR/TR the
+SDM reset values (base 0, limit FFFFH; the stub never loads LDTR). The driver's `switch` (`SET_CPL`) also loads that CPL's
+flat CS and SS, so CS.RPL = CPL holds. Host decode (`system.rs`, ModRM/SIB shared): LGDT/LIDT/SGDT/SIDT m, LLDT/LTR/SLDT/STR
+r/m, MOV r/m, Sreg and MOV Sreg, r/m, JMP/CALL far m16:32 and m16:64, RET far (`cb`, `ca iw`, 32- or 64-bit) and IRET
+(`cf`, IRETD/IRETQ); FS/GS overrides add their base; a 66 prefix on a far transfer, 0x67, and CS/DS/ES/SS overrides on
+these memory forms are not decoded (the vCPU stops with fexc's reason). The resident (`execution/segments.rs`) executes
+them as transactions per the SDM: #UD for LOCK, MOV to CS and Sreg 6/7; #GP(0) at CPL > 0 for LGDT/LIDT/LLDT/LTR (SGDT,
+SIDT, SLDT, STR at any CPL: UMIP is not in the profile); LGDT/LIDT #GP(0) for a non-canonical base (AMD APM, KVM; Intel's
+list is silent); data and stack segment loads with the MOV rules (SS: RPL = DPL = CPL, writable data, #SS(sel) not present,
+null at CPL < 3 with RPL = CPL; DS/ES/FS/GS: data or readable code, max(CPL, RPL) <= DPL unless conforming, #NP(sel); FS/GS
+take the 32-bit base, a null load clears it); LLDT/LTR on 16-byte descriptors (type 2 / 9, #NP(sel), upper type field 0
+and a canonical base, else #GP(sel)), LTR #GP(0) for null, the busy bit written; JMP/CALL far to a same-CPL code segment
+(conforming DPL <= CPL, nonconforming RPL <= CPL and DPL = CPL; L = D = 1 #GP(sel); TSS/task gate #GP(sel); a 64-bit call
+gate stops `unsupported_system`; CALL #SS(0) before the canonical RIP check, then its pushes); RET far and IRET to the same
+or an outer level (IRET: CS, RIP, SS, delivery_model's order; RET to an outer level: CS, SS, RIP, its pseudocode; IRET
+always reloads SS:RSP; a null SS only for a new CPL < 3 with RPL = that CPL, per Intel's IRET/RET 64-bit #GP(0) text, which
+is stricter than delivery_model A7; IRET's RFLAGS masks by CPL/IOPL, VIF/VIP only at CPL 0; a return to CPL 1 or 2 stops
+`unsupported_mode` before any effect; an outer return nulls DS/ES/FS/GS below the new CPL, keeping the FS/GS bases, and
+calls `set_cpl`). Every descriptor-table and TSS-descriptor access is an implicit supervisor access through the walker at CPL 0
+(`segments::linear`, never a shadow; a write into a page holding translations invalidates it first), operand and stack
+accesses explicit at the CPL; the SDM's accessed-bit write on a segment load (CS included) and LTR's busy write are real
+writes, atomic on the guest byte (`segments::atomic_byte`: an atomic OR for A; a compare-exchange 9 -> B for busy, so of two
+vCPUs loading one TSS descriptor the second takes #GP(selector)), so a clear A bit in a read-only GDT page is #PF(3) at
+descriptor + 5. Refused (typed): compatibility-mode targets
+(`unsupported_mode`, the record holding that CS and RIP at the instruction), call gates, an IRET setting TF (S4)
+(`unsupported_system`); RF from an IRET frame is dropped (no breakpoints before S4). Oracle:
+`tools/models/segment_model.py` (independent of the code, from the SDM; reuses `delivery_model`'s bus and descriptor
+fields; its IRETQ agrees with delivery_model's on 26 frames in `test_segment_model.py`), ambiguities B1-B9 in its
+docstring; at B2 (non-canonical LGDT base: #GP(0) or the load), B8 (CR2 at descriptor + 0, 4 or 5) and B9 (#SS or #NP
+for IRET's SS) each result carries the set of outcomes the SDM permits, and the runner accepts any of them for natemu and
+QEMU (an independent review derived 37 cases by hand; the oracle matched all). Checks (`run_slice3_vm.py system`, `tools/bench/smp/segments.py`, all at block sizes default and 1): 12
+positive programs (plus an IRETQ CPL 3 -> 3 whose frame sets VIF/VIP) against QEMU (registers, GDT/LDT/result memory): every form once (`seg-basic`), the cited Linux
+sequences transcribed (`seg-boot`: decompressor `head_64.S:298-306,366-374,440-443`, trampoline `trampoline_64.S:214-248`,
+kernel head `head_64.S:338-353`, LTR on the writable GDT, then loads from a read-only copy with A preset), LRETQ and IRETQ to
+CPL 3 (DS/ES/FS/GS nulled, user state read, a #GP(0) there ends both runs), each at 1, 2 and 4 vCPUs; 44 fault cases
+judged by segment_model (QEMU within its permitted outcomes on 39; outside on 5, listed in `QEMU_DIFFERS`: null SS with
+RPL != CPL for MOV and for IRET (QEMU then does not finish), null LTR, a non-canonical far CALL/RET target (QEMU commits
+and faults at the target)); 4 refusals; `seg-ltr-race@2/@4` (natemu only, QEMU's LTR is not atomic): every vCPU loads TR
+from one descriptor, exactly one succeeds and the others take #GP(0x70), 20 runs each. QEMU sets no accessed bit for a CS
+load by a far transfer: `seg-boot` compares the SDM's value there (`params.sdm_bytes`). `check_resident_stack.py` now keys
+a second copy of one function (two codegen units) separately; the runtime target builds with `-C jump-tables=no`
+(`.cargo/config.toml`), since the audit refuses any unlisted `br`. FEX ASM suite: 7 tests that expect FEX's Linux user-mode
+descriptor tables (unchecked selectors, a fixed SGDT answer; `Primary_8C`, `_8C_2`, `_CF`, `5_FF_05*`, `07_XX_00`) now run
+these instructions architecturally against the driver's tables and are counted unsupported with that reason
+(`run_asm.py` `OS_SEGMENTS`); passes unchanged at 443. Not built: POP/PUSH FS/GS (no use in the census), LAR/LSL/
+VERR/VERW (S3), SWAPGS (S3), call gates and task switches, the MOV SS shadow's effect and IRET's NMI unblocking (X2).
+**For X1a:** `segments::linear` (implicit supervisor or CPL access through the walker) and `descriptor` (GDT/LDT code and
+data descriptors) are reusable, but `descriptor`'s #GP masks the error to `selector & 0xfffc` (delivery must OR in EXT),
+it is not for IDT lookups (gates are 16 bytes and their error code is vector * 8 + 2 + EXT), and neither helper checks the
+TSS limit (#TS on RSPn/ISTn is delivery's); delivery_model A7 accepts a null SS with any RPL on IRETQ, where this chunk
+follows Intel's stricter text (segment_model B6).
+*Built (I3, LOCK forms; fexc series17, series18 after review):* LOCK on every lockable memory form (ADD ADC SUB SBB AND OR XOR, INC DEC NOT NEG,
+BTS BTR BTC, XADD, CMPXCHG, XCHG) and CMPXCHG8B/16B with or without LOCK compile to FEX's LSE lowering, one acquire-release
+atomic per instruction: `ldaddal` (add/adc/sbb/sub/inc/dec/xadd; adc/sbb add `src + CF`), `ldclral` (and, btr), `ldeoral`
+(xor, not, btc), `ldsetal` (or, bts; bt* on FEX's byte, the slice-1 policy), `casal` (cmpxchg), `caspal` of two W or two X
+registers (cmpxchg8b/16b: RDX:RAX compared and, on failure, loaded; RCX:RBX stored). Each is a site of kind 13 `atomic`
+(`data_reg` = [Rt, Rs], write intent); admission decodes exactly these words (even CASP pairs, no XZR result with the
+code-shape check) and requires each to be an atomic site describing it. The resident treats them as it does `swpal`:
+an abort commits nothing (CAS/CASP restore their compare register, DDI0487 C6.2), a translation or permission fault is a
+write-intent walk (the access is a write, Arm ARM MemAtomic, also for a CAS whose comparison fails; ESR.WnR is not relied
+on: the M4 reports a CAS translation fault as a read), retry or #PF; a 16-byte `caspal` not 16-byte aligned is #GP(0)
+before any walk (SDM CMPXCHG16B; QEMU's order; Arm ARM abort prioritization takes the instruction's alignment fault before
+any translation or permission fault); any other atomic crossing 16 bytes takes the alignment fault and stops
+`unsupported_atomic` with the state at the instruction. **Owner decision (recorded): LOCKed accesses crossing 16 bytes
+(inside a line, across a line or a page) stop** (`unsupported_atomic`, slice-3 contract §2 and §5 decision 2); an unlocked
+CMPXCHG8B crossing 16 bytes stops too (it is the same `caspal`: a documented deviation). Also documented: LOCK
+BTS/BTR/BTC are a byte atomic on the byte holding the bit (FEX's form, the slice-1 bt policy), where x86 performs an
+operand-size locked access, so a dword or qword that crosses 16 bytes or a page faults or is a split lock on x86 but not
+here. Hits: the kernel census cannot
+decide alignment statically; FEX's ASM suite has 45 such tests (its Atomics tests cross 16 bytes on purpose); the QEMU
+corpora, litmus and contention programs none; the fault probes 8, by design. **LOCK NEG** (FEX: a CAS loop, a native
+backward branch admission refuses and the unlinking stop cannot interrupt) is, under slice1, one attempt per pass (patch
+0016, `FexcLockNeg`): a write-intent load site, `neg`, one `casal` site, and on a lost race a literal exit to the
+instruction's own RIP (the dispatcher completes the flags and puts CF in the exit ABI's form first, so that exit holds the
+state before the instruction); it ends its block (as a REP string, `FEXC_CUT_STRING`), and admission proves the self-exit
+target from the guest bytes (`admission::lock_neg`). Chosen over a resident transaction (a VM entry per NEG) and over a
+bounded loop (any backward branch defeats the stop); ADC/SBB need no loop (`ldaddal` of `src + CF`). **LOCK elsewhere**
+(a register destination, a non-lockable opcode, a system instruction, whether FEX's decoder took it or not) is a system cut;
+the host names it `system::LOCK_UD` and the resident raises #UD (a guest-fault stop, vector 6, until X1 delivers it).
+Refused (`unsupported_form`, no SDM meaning): F2/F3 with LOCK (XACQUIRE/XRELEASE; HLE is not advertised) and 66/F2/F3 on
+CMPXCHG8B/16B (6 ASM tests). CPUID advertises CX8 and CX16 (profile 1.EDX[8], 1.ECX[13]). Patch 0016 also keeps the result
+of a swap or fetch-and-op atomic out of static registers (after an abort a load's destination is UNKNOWN, DDI0487 D1.4.1.4;
+S3e's `swpal` wrote RCX's register directly), frees an unused one (LOCK NOT), and gives a LOCK instruction no pooled
+constant (LOCK forms in a long block spilled, which slice1 refuses); objects of every earlier corpus are unchanged but one
+I7 program with a memory XCHG. **Ordering:** every AL atomic is acquire and release (the Linux arm64 kernel implements its
+fully ordered atomics with these words alone); litmus confirms each word as a full barrier on the M4 (below). A *failing*
+`casal`/`caspal` writes nothing (Arm ARM CAS: no store when the comparison fails; `Unpredictable_WRITEFAILEDCAS` is FALSE),
+so it has no release effect and only its read is an acquire: a store before it may be reordered after its read (B2.3
+Barrier-ordered-before gives no edge from an earlier store to an acquire read), while x86's failing LOCK CMPXCHG is a full
+barrier (it writes the old value back). **Coordinator decision (October 29, under the owner's architecture principle):**
+LOCK CMPXCHG, CMPXCHG8B and CMPXCHG16B emit `dmb ish` immediately BEFORE their `casal`/`caspal` (series18), which orders
+every earlier access before the CAS's read whether or not it then writes; a barrier after the CAS would not cover the case
+where the failing CAS's read is itself the observing load (`cas-read` below). Not for unlocked CMPXCHG8B/16B (no ordering
+required), the `ld<op>al` forms (they always write) or LOCK NEG's CAS (it retries until it writes). Admission accepts a
+`dmb ish` only right before such a CAS and, with the code-shape check, requires it there. A CAS/CASP whose comparison fails
+still faults on a read-only page (MemAtomic translates for a write before the compare, `requirewrite`), which x86's write
+cycle needs (#PF W, D set). Checks (suite `natemu-raw/suite-i3-20261029/` with series17, its `rerun-series18/` after the
+barrier): `tools/reference/gen_i3.py` corpus (105 programs: every LOCK form at every width with register and immediate
+sources, boundary values, every address form and an FS override, aligned and unaligned inside 16 bytes, CMPXCHG8B/16B
+locked and unlocked, equal and unequal, the kernel's shapes, 60 random mixes; QEMU 7.2 keeps stale flags after
+CMPXCHG8B/16B, so each is preceded by `pushfq`, tools/reference/README.md) 105/105 at block sizes default and 1. `litmus`
+(series18) at N = 2..4, aligned and unaligned, the sb families also split and split-hi on their plain locations: sb with one
+LOCKed RMW of each Arm word (xadd, and, xor, or, cmpxchg, cmpxchg-fail, cmpxchg8b, cmpxchg8b-fail, cmpxchg16b, neg), the
+chains `xadd` (every outcome a permutation, the counter n) and `cas` (one winner), and `cas-read`/`cas8b-read` (store x_i,
+then a failing LOCK CMPXCHG/CMPXCHG8B on x_{i+1} as the observing read: all-zero forbidden): 144 cells × 60,000 trials, 0
+forbidden. Before/after cannot be told apart on the M4: series17 (no barrier, run with the code-shape check off, which
+now refuses a LOCK CMPXCHG CAS without it) also gave 0 forbidden in the 12 `cas-read`/`cas8b-read` cells (720,000 trials);
+the barrier is there for the architecture. `--control drop-lock` (the programs without LOCK) shows forbidden outcomes in
+17 of 18 cells (sb-xadd, xadd, cas-read; the all-zero ring outcome at N = 3 is rare: `sb-xadd@3 unaligned` showed it in
+the series17 run, not in two series18 runs of 20,000 and 100,000 trials). The model extension (`ordering_model.py` `rmw`:
+an empty own buffer, then one indivisible read and write) has positive controls (a drain-free or non-atomic RMW exposes the
+forbidden outcomes) and an independent review (ACCEPT; its editorial guards applied). Contention (`smp`, 3 runs each at
+N = 2..4, all exact): `lock-counter` (20,000 rounds per vCPU of every atomic word on one 256-byte block, CMPXCHG/8B/16B retry
+loops, its LOCK NEG word starting at 1 and ending 1), and `neg-race` (20,000 LOCK NEG per vCPU on one word) against
+`neg-private` (each vCPU its own word): the race links the NEG's own-RIP exit (4 linked exits on some vCPU against 3 for
+every race-free vCPU), so the lost-race path ran. Faults: `run_slice1_faults.py` 7,581 cases at block sizes default and 1
+(LOCK data forms in the paging cells, window, non-canonical and straddle probes; CMPXCHG8B/16B #PF, CMPXCHG16B #GP(0)
+aligned or not mapped, a failing LOCK CMPXCHG on a read-only page #PF W, 8 split-lock stops, 9 LOCK #UD); page mutations
+on the I3 corpus 329 cases at both sizes; all match. The first series17 run at block size 1 had one host error,
+`paging-lock-bts@high/cpl0-unmap@1-0xffff808000200000`, `hv_vm_create: 0xfae94007` (a VM held by the concurrent S2b agent;
+`suite-i3-20261029/faults-1-first-run.txt`), and matched on rerun. `verify_precision` clean on every corpus (P3 now covers
+swap/fetch-and-op destinations, P4 counts atomics as store-class, a LOCK adversarial program). Admission tests: the
+`dmb ish` + CAS pair accepted only at a LOCK CMPXCHG* site, a stray `dmb ish` refused (also without the code-shape check),
+a missing one refused with it (fixture `lock-forms`). FEX ASM suite 443 → 480 pass, 0 fail (45 split-lock stops, 6 refused
+prefixes). Census LOCK class: kernel 10,020 → 0, initramfs 1,385 → 0, kernel `cmpxchg16b` 19 admitted
+(`experiments/track03/kernel-census/README.md`). Standing suite (series17) green but two items outside I3: `system`
+`seg-iret-null-ss-rpl@1` (an S2b program, QEMU reference timeout) and VM-creation collisions with the concurrent S2b agent
+(rerun clean).
 **Owner decision (October 28): MTRRs enabled by the virtual firmware, RAM write-back, device ranges uncached** (plan Q3).
 **Deferred (owner, October 28):** replacing the host's minimal JSON reader (`crates/host/src/json.rs`, used only for
 fexc's per-compile report: end reason and cut opcode) by carrying those fields in the code-object header; no registry

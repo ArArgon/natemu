@@ -17,6 +17,7 @@
 //! peer's SGI): each stops the vCPU precisely at a block boundary ([`interrupted`]) and the resident drains there.
 use super::*;
 use crate::cache::{self, Block};
+mod segments;
 use natemu_abi::{
     code_object::{self as object, Header, Site},
     cpu, cpu_profile,
@@ -678,7 +679,11 @@ const GP: [u64; 2] = [13, 0];
 /// invalidations before the request and again before the next instruction is looked up.
 fn system(s: &mut State, i: System) {
     s.systems += 1;
+    s.cpu.mov_ss = 0; // the shadow of a MOV SS ends after the next instruction (X2 ends it inside generated code)
     if i.kind == system::SET_CPL {
+        // The test hook owns the rest of the transition: the flat CS and SS of the new CPL (RPL = CPL).
+        let flat = flat_segments(u64::from(i.cr));
+        (s.cpu.seg[SREG_CS], s.cpu.seg[SREG_SS]) = (flat[SREG_CS], flat[SREG_SS]);
         set_cpl(s, u64::from(i.cr));
         return commit(s, i, false);
     }
@@ -690,12 +695,18 @@ fn system(s: &mut State, i: System) {
     let unsupported = |s: &State| -> ! { halt(*s, stop::UNSUPPORTED_SYSTEM) };
     let moves = matches!(i.kind, system::MOV_TO_CR | system::MOV_FROM_CR);
     let debug = matches!(i.kind, system::MOV_TO_DR | system::MOV_FROM_DR);
-    if i.lock != 0 || (moves && !matches!(i.cr, 0 | 2 | 3 | 4 | 8)) || (debug && i.cr > 7) {
+    // MOV to/from Sreg: ModRM.reg 6, 7 name no segment register; CS cannot be loaded.
+    let sreg = matches!(i.kind, system::MOV_TO_SREG | system::MOV_FROM_SREG)
+        && (i.cr as usize > SREG_GS || (i.kind == system::MOV_TO_SREG && i.cr as usize == SREG_CS));
+    if i.lock != 0 || (moves && !matches!(i.cr, 0 | 2 | 3 | 4 | 8)) || (debug && i.cr > 7) || sreg {
         fault(s, UD)
     }
-    // CPUID runs at any CPL; RDTSC/RDTSCP at CPL > 0 unless CR4.TSD, RDPMC with CR4.PCE; the rest at CPL 0 only.
+    // CPUID runs at any CPL; RDTSC/RDTSCP at CPL > 0 unless CR4.TSD, RDPMC with CR4.PCE; SGDT/SIDT/SLDT/STR (CR4.UMIP is
+    // not in the profile), segment register moves and far transfers at any CPL; the rest at CPL 0 only.
     let unprivileged = match i.kind {
         system::CPUID => true,
+        system::SGDT | system::SIDT | system::SLDT | system::STR => true,
+        system::MOV_TO_SREG | system::MOV_FROM_SREG | system::JMP_FAR | system::CALL_FAR | system::RET_FAR | system::IRET => true,
         system::RDTSC | system::RDTSCP => c.cr4 & CR4_TSD == 0,
         system::RDPMC => c.cr4 & CR4_PCE != 0,
         _ => false,
@@ -878,6 +889,22 @@ fn system(s: &mut State, i: System) {
                 s.cpu.efer != c.efer || cpu::is_mtrr(index)
             }
         }
+        // Descriptor tables, segment registers and far transfers ([`segments`]). The resident has no jump tables (an
+        // unlisted `br` fails tools/check_resident_stack.py; the runtime target builds with `-C jump-tables=no`), and
+        // the kinds are grouped in ranges besides.
+        system::LGDT..=system::IRET => match segments::execute(s, i) {
+            Ok(None) => false,
+            // A far transfer: RIP is the target (nothing to add), and the mode check of [`commit`] applies.
+            Ok(Some(rip)) => {
+                s.cpu.rip = rip;
+                return commit(s, System { length: 0, ..i }, false);
+            }
+            Err([vector, error, cr2]) => {
+                s.cpu = c;
+                s.fault = [vector, cr2, error, c.rip];
+                halt(*s, stop::GUEST_FAULT)
+            }
+        },
         _ => halt(*s, stop::BAD_REPLY),
     };
     commit(s, i, changed)
@@ -1149,16 +1176,25 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
 /// A data abort at an access site: a shadow miss to retry, or a guest fault.
 unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, [esr, far, elr, spsr]: [u64; 4]) -> ! {
     let store = matches!(site.kind, object::kind::STORE | object::kind::PUSH);
-    // A swap (memory XCHG) may report either direction (WnR is not defined strictly for atomics); it writes nothing.
-    let swap = site.kind == object::kind::SWAP;
+    // A swap (memory XCHG) or LOCK atomic (I3: ld<op>al, casal, caspal) may report either direction: its translation is a
+    // write (Arm ARM MemAtomic, also when a CAS comparison fails), but ESR.WnR is not reliable for atomics (the M4 reports a
+    // translation fault of one as a read); it writes nothing.
+    let swap = matches!(site.kind, object::kind::SWAP | object::kind::ATOMIC);
     let write_abort = (esr >> 6) & 1 != 0;
     let write = site.intent == object::INTENT_WRITE;
     let address = site_address(site, f);
     let width = u64::from(site.width);
     let touched = pages(address, width);
-    // A swap whose operand crosses 16 bytes takes an alignment fault (LSE2) before any effect: a split lock, not
-    // completed, unless x86's canonical check (made first) fails.
-    if swap && esr & 63 == 0x21 && esr >> 26 == 0x24 && (address & 15) + width > 16 {
+    let alignment = esr & 63 == 0x21 && esr >> 26 == 0x24;
+    // CMPXCHG16B (a 16-byte caspal) on an operand that is not 16-byte aligned: #GP(0) (SDM CMPXCHG16B), checked before the
+    // address is translated (QEMU's order; Arm ARM abort prioritization: an alignment fault from the instruction's own
+    // alignment requirement is taken before any translation, access-flag or permission fault).
+    if site.kind == object::kind::ATOMIC && width == 16 && alignment && address & 15 != 0 {
+        guest_fault(s, f, b, site, [13, 0, 0])
+    }
+    // A swap or atomic whose operand crosses 16 bytes takes an alignment fault (LSE2) before any effect: a split lock, not
+    // completed (owner decision: LOCKed accesses crossing 16 bytes stop), unless x86's canonical check (made first) fails.
+    if swap && alignment && (address & 15) + width > 16 {
         if touched.is_none() {
             guest_fault(s, f, b, site, noncanonical(site))
         }

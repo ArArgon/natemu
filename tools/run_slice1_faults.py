@@ -39,6 +39,13 @@ Cases are derived from program descriptions, never written per program:
   at a far, a negative and a wrapping base with a not-present page (CR2 = base + EA), a page-crossing access, a
   non-canonical address, a canonical straddle and the private window, and indirect branches through FS/GS operands to a
   non-canonical target. Any corpus of `tools/reference/gen_i7.py` works as input (its page mutations fault at base + EA).
+* I3: DATA_FORMS also holds LOCK forms (one atomic each, write intent: a read-only page faults W even when LOCK CMPXCHG's
+  comparison fails, the SDM's write cycle; LOCK NEG a load then a compare-and-swap; LOCK BTS FEX's byte). CMPXCHG8B/16B are
+  probes only (the pinned QEMU's full runs keep stale flags after them; the prefix state is right): not-present and
+  read-only pages, CMPXCHG16B not 16-byte aligned (#GP(0) before the page walk, QEMU's order), split locks (every LOCK
+  form and CMPXCHG8B, locked or not, crossing 16 bytes, a line or a page: `unsupported_atomic` with the QEMU prefix state),
+  and LOCK on forms that are not lockable (#UD, nothing executed: a register destination, a non-lockable opcode, a system
+  instruction). Any corpus of `tools/reference/gen_i3.py` works as input (bt* with a register bit offset is skipped).
 * Built-in probes (PROBES below): non-canonical data and stack addresses (#GP(0)/#SS(0)), stack accesses across the
   canonical gap (#SS(0)), E3's negative cases (`window_probes`; `--no-window` leaves them out): every class of the
   former private window (frame, state, tables, stacks, staging, resident text, shadow pool, guest-RAM alias, code area,
@@ -73,7 +80,7 @@ sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' /
 import ref, gen_slice1 as gen, gen_i1, run_slice1_vm as vm  # noqa: E402
 
 M64, PAGE = 2**64 - 1, 4096
-SIZES = {'byte': 1, 'word': 2, 'dword': 4, 'qword': 8}
+SIZES = {'byte': 1, 'word': 2, 'dword': 4, 'qword': 8, 'xmmword': 16}
 STACK_BASES = {'rsp', 'rbp'}
 
 def canonical(a): return a >> 47 in (0, 0x1ffff)
@@ -87,7 +94,7 @@ def split_operands(text):
         else: cur += c
     return [o for o in ops + [cur.strip()] if o]
 
-MEM = re.compile(r'(?:(byte|word|dword|qword) ptr )?(?:([cdefgs]s):)?\[(.*)\]')
+MEM = re.compile(r'(?:(byte|word|dword|qword|xmmword) ptr )?(?:([cdefgs]s):)?\[(.*)\]')
 
 def address(expr, regs, next_rip):
     """Intel address expression `base + index*scale + disp` (64-bit registers, rip) -> (address, base register)."""
@@ -138,11 +145,24 @@ def string_events(text, regs):
              'cmps': [(dst, False), (src, False)]}[op]
     return [('access', a, w, write, False) for a, write in order]
 
+# I3 (SDM Vol.2 "LOCK"): the forms LOCK may prefix, each with a memory destination (xchg: either operand).
+LOCKABLE = {'add', 'adc', 'and', 'btc', 'btr', 'bts', 'cmpxchg', 'cmpxchg8b', 'cmpxchg16b', 'dec', 'inc', 'neg', 'not', 'or', 'sbb',
+            'sub', 'xor', 'xadd', 'xchg'}
+
 def events(text, regs, next_rip):
     """One instruction's guest data accesses and branch-target check, in architectural order:
     ('access', address, bytes, write intent, stack segment), ('target', register value | ('mem', address)) and
-    ('divide', signed, bytes, divisor value | ('mem', address), rax, rdx)."""
+    ('divide', signed, bytes, divisor value | ('mem', address), rax, rdx); I3: ('ud',) for LOCK on a form that is not
+    lockable (#UD before anything), ('align',) for CMPXCHG16B on an operand not 16-byte aligned (#GP(0) before any access)."""
+    if text.startswith('lock '):
+        text = text[5:]
+        m, ops = text.split()[0], split_operands(text)
+        if m not in LOCKABLE or not any(MEM.fullmatch(o) for o in (ops if m == 'xchg' else ops[:1])): return [('ud',)]
     m, ops = text.split()[0], split_operands(text)
+    if m == 'cmpxchg16b' and MEM.fullmatch(ops[0]):
+        x = MEM.fullmatch(ops[0]); a, _ = address(x[3], regs, next_rip)
+        if x[2] in ('fs', 'gs'): a = (a + regs.get(x[2], 0)) & M64
+        if a & 15: return [('align',)]
     # I2: a single string instruction is one element; a REP form's later elements depend on the earlier ones (counted
     # per element by tools/run_slice2_faults.py from QEMU's signal context), so it is never guessed here.
     if (one := string_events(text, regs)) is not None:
@@ -288,6 +308,7 @@ class Machine:
 def first_fault(evs, machine, read):
     """The x86 exception of one instruction's events on the `Machine`, or None (its accesses set A/D)."""
     for e in evs:
+        if e[0] in ('ud', 'align'): return (6, 0, 0) if e[0] == 'ud' else (13, 0, 0)
         if e[0] == 'divide':
             _, signed, w, src, rax, rdx = e
             d = int.from_bytes(read(src[1], w), 'little') if isinstance(src, tuple) else src
@@ -317,6 +338,8 @@ def layout(p, mutations):
 def describe(line, evs, f, fetched=False):
     m = line.split()[0]
     acc = [e for e in evs if e[0] == 'access']
+    if f[0] == 6: return f'#UD {line}'
+    if any(e[0] == 'align' for e in evs): return f'#GP align {line}'
     if f[0] == 0: return f'#DE {m}{8 * next(e[2] for e in evs if e[0] == "divide")}' + (' mem' if acc else '')
     crossing = ' crossing' if any((a ^ (a + w - 1)) >> 12 for _, a, w, _, _ in acc) else ''
     if fetched: what = 'fetch'
@@ -363,7 +386,15 @@ DATA_FORMS = [('load', 'rbx', 'mov rax, qword ptr [rbx + 8]'), ('store', 'rbx', 
               ('popcnt', 'rsi', 'popcnt rax, qword ptr [rsi + r8*2]'), ('tzcnt', 'rbx', 'tzcnt eax, dword ptr [rbx + 4]'),
               ('andn', 'rbx', 'andn rax, rcx, qword ptr [rbx]'), ('shrx', 'rbp', 'shrx eax, dword ptr [rbp + 4], ecx'),
               ('movnti', 'rbx', 'movnti qword ptr [rbx], rcx'), ('pushf', 'rsp', 'pushfq'), ('enter', 'rsp', 'enter 16, 0'),
-              ('leave', 'rbp', 'leave'), ('prefetch', 'rbx', 'prefetcht0 byte ptr [rbx]')]
+              ('leave', 'rbp', 'leave'), ('prefetch', 'rbx', 'prefetcht0 byte ptr [rbx]'),
+              # I3 LOCK forms: one atomic each (write intent, nothing written at an abort; a failing CMPXCHG compare still
+              # faults as a write, SDM: the destination always receives a write cycle), LOCK NEG a load then a compare-and-swap,
+              # LOCK BTS FEX's byte. CMPXCHG8B/16B are probes (PAIR_PROBES): the pinned QEMU's full runs keep stale flags there.
+              ('lock-add', 'rbx', 'lock add qword ptr [rbx], rcx'), ('lock-adc-byte', 'rbp', 'lock adc byte ptr [rbp + 3], cl'),
+              ('lock-xadd', 'rbp', 'lock xadd dword ptr [rbp + 8], ecx'), ('lock-cmpxchg', 'rbx', 'lock cmpxchg qword ptr [rbx], rcx'),
+              ('lock-neg', 'rsi', 'lock neg word ptr [rsi + r8*2]'), ('lock-not', 'rbp', 'lock not byte ptr [rbp]'),
+              ('lock-bts', 'rbx', 'lock bts qword ptr [rbx], 5'), ('lock-dec', 'rbx', 'lock dec dword ptr [rbx + 4]'),
+              ('lock-xchg', 'rbx', 'lock xchg qword ptr [rbx], rax')]
 # Mnemonics that access memory without a bracketed operand (the stack forms).
 IMPLICIT_ACCESS = ('push', 'pop', 'call', 'ret', 'pushfq', 'enter', 'leave')
 # Forms that never fault (a prefetch hint): their probes expect the QEMU full run.
@@ -390,7 +421,8 @@ STRADDLE_FORMS = [('load', 'rbx', 0, 'mov rax, qword ptr [rbx]'), ('store', 'rbx
                   ('rmw', 'rbx', 0, 'add qword ptr [rbx], 1'), ('read-index', 'rsi', -3, 'cmp word ptr [rsi + r8*2], 5'),
                   ('xchg', 'rbx', 0, 'xchg qword ptr [rbx], rax'), ('rbp-load', 'rbp', 0, 'mov rax, qword ptr [rbp]'),
                   ('rsp-store', 'rsp', 0, 'mov qword ptr [rsp], rax'), ('push', 'rsp', 8, 'push rax'), ('pop', 'rsp', 0, 'pop rcx'),
-                  ('ret', 'rsp', 0, 'ret'), ('call', 'rsp', 8, 'call rdx'), ('push-mem', 'rbx', 0, 'push qword ptr [rbx]')]
+                  ('ret', 'rsp', 0, 'ret'), ('call', 'rsp', 8, 'call rdx'), ('push-mem', 'rbx', 0, 'push qword ptr [rbx]'),
+                  ('lock-add', 'rbx', 0, 'lock add qword ptr [rbx], rcx'), ('lock-cmpxchg16b', 'rbx', 0, 'lock cmpxchg16b xmmword ptr [rbx]')]
 
 # G1 (I1): the guest-state page, the one EL0 data page of the window (abi GUEST_STATE_VA): an access inside it reaches
 # the vCPU's own guest state (documented deviation): a non-field byte reads 0 and the IF byte the banked IF (1). Its
@@ -448,6 +480,30 @@ def probes(window=True):
     for name, line in [('16', 'xchg qword ptr [rbx + 0xc], rax'), ('line', 'xchg dword ptr [rbx + 0x3e], ecx'),
                        ('page', 'xchg qword ptr [rbx + 0xefc], rax'), ('16-word', 'xchg word ptr [rbp + 0xf], dx')]:
         out.append((f'xchg-crossing-{name}', REGS, PRELUDE + [line] + AFTER, len(PRELUDE), {'atomic': True}))
+    # I3: every LOCK form crossing 16 bytes (owner decision: LOCKed crossing accesses stop) and CMPXCHG8B, locked or not (one
+    # caspal either way: an unlocked one crossing 16 bytes stops too, a documented deviation).
+    for name, line in [('add-16', 'lock add qword ptr [rbx + 0xc], rcx'), ('xadd-line', 'lock xadd dword ptr [rbx + 0x3e], ecx'),
+                       ('cmpxchg-page', 'lock cmpxchg qword ptr [rbx + 0xefc], rcx'), ('neg-16', 'lock neg word ptr [rbp + 0xf]'),
+                       ('inc-16', 'lock inc dword ptr [rsi + 0xe]'), ('sbb-16', 'lock sbb qword ptr [rbx + 0x9], rax'),
+                       ('cmpxchg8b-16', 'lock cmpxchg8b qword ptr [rbx + 0xc]'), ('cmpxchg8b-unlocked-line', 'cmpxchg8b qword ptr [rbx + 0x3c]')]:
+        out.append((f'lock-crossing-{name}', REGS, PRELUDE + [line] + AFTER, len(PRELUDE), {'atomic': True}))
+    # I3: CMPXCHG8B/16B faults (prefix-state references only: see DATA_FORMS), CMPXCHG16B's alignment #GP(0) before its page
+    # walk, LOCK on forms that are not lockable (#UD; a register destination, a non-lockable opcode, a system instruction).
+    for name, line, mut in [('cmpxchg16b-unmapped', 'lock cmpxchg16b xmmword ptr [rbx]', {'unmap': [D]}),
+                            ('cmpxchg16b-readonly', 'lock cmpxchg16b xmmword ptr [rbx]', {'readonly': [D]}),
+                            ('cmpxchg16b-unlocked-readonly', 'cmpxchg16b xmmword ptr [rbx + 0x10]', {'readonly': [D]}),
+                            ('cmpxchg8b-unmapped', 'cmpxchg8b qword ptr [rbp + 8]', {'unmap': [D]}),
+                            ('cmpxchg8b-readonly', 'lock cmpxchg8b qword ptr [rbx + 4]', {'readonly': [D]}),
+                            ('cmpxchg16b-misaligned-8', 'lock cmpxchg16b xmmword ptr [rbx + 8]', {}),
+                            ('cmpxchg16b-misaligned-unmapped', 'lock cmpxchg16b xmmword ptr [rbx + 1]', {'unmap': [D]}),
+                            ('cmpxchg16b-unlocked-misaligned', 'cmpxchg16b xmmword ptr [rsi + 4]', {}),
+                            ('neg-unmapped', 'lock neg qword ptr [rbx]', {'unmap': [D]}),
+                            ('cmpxchg-readonly-unequal', 'lock cmpxchg dword ptr [rbx], ecx', {'readonly': [D]}),
+                            ('ud-mov', 'lock mov qword ptr [rbx], rax', {}), ('ud-register', 'lock add rax, rcx', {}),
+                            ('ud-cmp', 'lock cmp qword ptr [rbx], 1', {}), ('ud-bt', 'lock bt qword ptr [rbx], 1', {}),
+                            ('ud-xchg-register', 'lock xchg rax, rcx', {}), ('ud-nop', 'lock nop', {}), ('ud-hlt', 'lock hlt', {}),
+                            ('ud-cpuid', 'lock cpuid', {}), ('ud-inc-register', 'lock inc rax', {})]:
+        out.append((f'lock-{name}', dict(REGS, rdi=S + 0x300), PRELUDE + [line] + AFTER, len(PRELUDE), mut))   # (the prelude's store off D)
     # Page order of a crossing access (first page tested first, also when its first byte is near the page end).
     out.append(('crossing-first-page-readonly', dict(REGS, rbx=D, rdi=S + 0x300), PRELUDE + ['mov qword ptr [rbx + 0xffc], rax'] + AFTER, len(PRELUDE),
                 {'readonly': [D], 'unmap': [D + 0x1000]}))

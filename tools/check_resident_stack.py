@@ -81,7 +81,12 @@ def parse(text):
     funcs, words, current = {}, {}, None
     for line in text.splitlines():
         if m := re.match(r'^([0-9a-f]+) <(.+)>:$', line):
-            current = funcs.setdefault(re.sub(r' \(\.llvm\.\d+\)$', '', m[2]), [])
+            # Two codegen units may each keep a copy of one function (one of them with the suffix): later copies of a
+            # name are keyed `name #2`, ... so each is analysed at its own address.
+            name, k = re.sub(r' \(\.llvm\.\d+\)$', '', m[2]), 1
+            while funcs.get(key := name if k == 1 else f'{name} #{k}'):
+                k += 1
+            current = funcs.setdefault(key, [])
         elif m := re.match(r'^\s*([0-9a-f]+):\s+(?:[0-9a-f]{2} ){4}\s*\.word\s+(0x[0-9a-f]+)', line):
             words[int(m[1], 16)] = int(m[2], 16)
         elif (m := re.match(r'^\s*([0-9a-f]+):\s+(\S+)(?:\s+([^/]*?))?\s*(?://.*)?$', line)) and current is not None:

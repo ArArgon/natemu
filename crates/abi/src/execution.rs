@@ -427,7 +427,79 @@ pub struct Cpu {
     pub cr8: u64,
     /// DR0..DR3, DR6, DR7 (MOV DR4/DR5 reach DR6/DR7 while CR4.DE = 0). State only: no breakpoint is armed (S4).
     pub dr: [u64; 6],
+    /// ES, CS, SS, DS, FS, GS in the x86 Sreg order ([`SREG_ES`] ..): selector and hidden attributes. 64-bit mode ignores
+    /// their bases and limits (flat 64-bit only, plan D1): FS/GS bases are [`Cpu::fs_base`]/[`Cpu::gs_base`], so `base`
+    /// stays 0 here; `limit` is recorded. CS.RPL is [`Cpu::cpl`]; CS is a 64-bit code segment ([`Cpu::control`]).
+    pub seg: [Segment; 6],
+    /// LDTR and TR: selector and the hidden base, limit and attributes LLDT/LTR loaded (from 16-byte descriptors).
+    pub ldtr: Segment,
+    pub tr: Segment,
+    pub gdtr: Table,
+    pub idtr: Table,
+    /// 1 after a MOV SS (its interrupt and debug shadow, SDM Vol.2 MOV); the next system transaction clears it. X2 owns
+    /// its effect and its end at the next instruction boundary inside generated code.
+    pub mov_ss: u64,
 }
+
+/// A segment register's visible selector and hidden part. `attributes` are descriptor bits 47:40 (type, S, DPL, P) in
+/// 7:0 and bits 55:52 (AVL, L, D/B, G) in 15:12; a null load leaves 0 (P = 0: unusable). `limit` is byte-granular.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment {
+    pub selector: u16,
+    pub attributes: u16,
+    pub limit: u32,
+    pub base: u64,
+}
+/// GDTR or IDTR.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Table {
+    pub base: u64,
+    pub limit: u64,
+}
+pub const SREG_ES: usize = 0;
+pub const SREG_CS: usize = 1;
+pub const SREG_SS: usize = 2;
+pub const SREG_DS: usize = 3;
+pub const SREG_FS: usize = 4;
+pub const SREG_GS: usize = 5;
+pub const ATTR_P: u16 = 0x80;
+pub const ATTR_L: u16 = 1 << 13;
+pub const ATTR_D: u16 = 1 << 14;
+impl Segment {
+    pub const NULL: Self = Self { selector: 0, attributes: 0, limit: 0, base: 0 };
+    /// `selector` loaded from the 8-byte descriptor `raw` (SDM Vol.3 3.4.5): its attributes, its limit scaled by G, and
+    /// the 32-bit base (the low half of a 16-byte system descriptor's).
+    pub const fn loaded(selector: u16, raw: u64) -> Self {
+        let limit = (raw & 0xffff | (raw >> 32) & 0xf_0000) as u32;
+        let g = raw & 1 << 55 != 0;
+        Self {
+            selector,
+            attributes: (raw >> 40) as u16 & 0xf0ff,
+            limit: if g { limit << 12 | 0xfff } else { limit },
+            base: (raw >> 16) & 0xff_ffff | (raw >> 56) << 24,
+        }
+    }
+}
+/// The segments of a driver-started vCPU at `cpl`, as the pinned QEMU stub (`tools/bench/smp/stub_smp.asm`) enters its
+/// bodies: CPL 0 CS 0x08 (64-bit code), SS = DS = ES = 0x10 (data), FS = GS null; CPL 3 CS 0x23, SS 0x1b and the rest
+/// null (its IRETQ nulls DS/ES). Flat descriptors, accessed bit set.
+pub const fn flat_segments(cpl: u64) -> [Segment; 6] {
+    let (code, data) = if cpl == 3 {
+        (Segment::loaded(0x23, 0x00af_fb00_0000_ffff), Segment::loaded(0x1b, 0x00cf_f300_0000_ffff))
+    } else {
+        (Segment::loaded(0x08, 0x00af_9b00_0000_ffff), Segment::loaded(0x10, 0x00cf_9300_0000_ffff))
+    };
+    let other = if cpl == 3 { Segment::NULL } else { data };
+    [other, code, data, other, Segment::NULL, Segment::NULL]
+}
+/// GDTR and IDTR at reset (SDM Vol.3 Table 10-1: base 0, limit FFFFH).
+pub const TABLE_RESET: Table = Table { base: 0, limit: 0xffff };
+/// LDTR and TR at reset (SDM Vol.3 Table 10-1: selector 0, base 0, limit FFFFH, present; an LDT and a busy TSS). The
+/// QEMU stub never loads LDTR, so a TI = 1 selector reaches this LDT there too.
+pub const LDTR_RESET: Segment = Segment { selector: 0, attributes: 0x82, limit: 0xffff, base: 0 };
+pub const TR_RESET: Segment = Segment { selector: 0, attributes: 0x8b, limit: 0xffff, base: 0 };
 
 pub const CR0_PE: u64 = 1;
 /// MP, EM, TS (SDM Vol.3 2.5, Table 2-2): recorded; they gate x87/MMX/SSE (#NM, #UD), which no admitted form is yet (I5, I6).
@@ -484,7 +556,9 @@ impl Cpu {
             && self.cr4 & (CR4_LA57 | CR4_SMAP) == 0
             && self.efer & (EFER_LME | EFER_LMA) == EFER_LME | EFER_LMA;
         let alignment_check = self.cr0 & CR0_AM != 0 && self.rflags & RFLAGS_AC != 0 && self.cpl == 3;
-        (long && !alignment_check && matches!(self.cpl, 0 | 3) && self.cr3 & !(paging::PA_MASK | CR3_IGNORED) == 0).then_some(Control {
+        // 64-bit mode: CS.L = 1, CS.D = 0 (compatibility mode is not built, owner decision 3).
+        let bits64 = self.seg[SREG_CS].attributes & (ATTR_L | ATTR_D) == ATTR_L;
+        (long && bits64 && !alignment_check && matches!(self.cpl, 0 | 3) && self.cr3 & !(paging::PA_MASK | CR3_IGNORED) == 0).then_some(Control {
             cr3: self.cr3 & paging::PA_MASK,
             cpl: self.cpl,
             wp: u64::from(self.cr0 & CR0_WP != 0),
@@ -586,15 +660,25 @@ pub struct System {
     pub length: u32,
     /// The instruction has a LOCK prefix (#UD).
     pub lock: u32,
-    /// MOV CR/DR: the control or debug register number (0..15, REX.R included) and the general register.
+    /// MOV CR/DR: the control or debug register number (0..15, REX.R included) and the general register. MOV to/from
+    /// Sreg: the segment register (ModRM.reg, 0..7; 6, 7 and MOV to CS are #UD). An r/m operand that is a register
+    /// (`memory` = 0): `reg`.
     pub cr: u32,
     pub reg: u32,
-    /// INVLPG's memory operand: base register ([`system::RIP`] for RIP-relative, [`system::NO_REG`] for none), index
-    /// register ([`system::NO_REG`]: none), scale (a shift, 0..3) and displacement; 64-bit address size.
+    /// A memory operand (INVLPG, descriptor-table and segment forms, far JMP/CALL): base register ([`system::RIP`] for
+    /// RIP-relative, [`system::NO_REG`] for none), index register ([`system::NO_REG`]: none), scale (a shift, 0..3) and
+    /// displacement; 64-bit address size. RET far: `disp` is the imm16 released.
     pub base: u32,
     pub index: u32,
     pub scale: u32,
     pub disp: i64,
+    /// 1: the r/m operand is the memory operand above.
+    pub memory: u32,
+    /// Operand size in bytes where the form has one: a register written by MOV r, Sreg / SLDT / STR (2: its low 16 bits;
+    /// 4, 8: the selector zero-extended), the offset of a far pointer and the width of RET far / IRET pops (4 or 8).
+    pub size: u32,
+    /// An FS or GS segment override on the memory operand ([`SREG_FS`], [`SREG_GS`]: its base is added), else 0.
+    pub fs_gs: u32,
 }
 pub mod system {
     /// CR `cr` := GPR `reg`; GPR `reg` := CR `cr`.
@@ -616,24 +700,58 @@ pub mod system {
     pub const MOV_FROM_DR: u32 = 11;
     /// RDPMC (the profile has no performance counters: always #GP(0) or #UD).
     pub const RDPMC: u32 = 12;
+    /// LGDT/LIDT m16&64, SGDT/SIDT m (memory operand). The resident dispatches these by ranges of kinds (the runtime
+    /// may not use jump tables, `tools/check_resident_stack.py`): keep each group contiguous.
+    pub const LGDT: u32 = 13;
+    pub const LIDT: u32 = 14;
+    pub const SGDT: u32 = 15;
+    pub const SIDT: u32 = 16;
+    /// SLDT/STR r/m and MOV r/m := Sreg `cr` (`size` for a register destination).
+    pub const SLDT: u32 = 17;
+    pub const STR: u32 = 18;
+    pub const MOV_FROM_SREG: u32 = 19;
+    /// LLDT/LTR r/m16 and MOV Sreg `cr` := r/m16.
+    pub const LLDT: u32 = 20;
+    pub const LTR: u32 = 21;
+    pub const MOV_TO_SREG: u32 = 22;
+    /// JMP/CALL far through a memory m16:`size` pointer.
+    pub const JMP_FAR: u32 = 23;
+    pub const CALL_FAR: u32 = 24;
+    /// RET far (`size`-byte pops, `disp` released) and IRET (`size`-byte pops).
+    pub const RET_FAR: u32 = 25;
+    pub const IRET: u32 = 26;
+    /// A LOCK prefix on an instruction that is not lockable (I3; SDM Vol.2 "LOCK"): #UD, whatever the instruction (fexc
+    /// cuts it as a system instruction; `lock` is 1, `length` is not used: the fault leaves RIP at the instruction).
+    pub const LOCK_UD: u32 = 0xf0;
     /// `System::base` of a RIP-relative operand (relative to the next instruction).
     pub const RIP: u32 = 16;
     pub const NO_REG: u32 = 0xff;
     impl super::System {
-        pub const NONE: Self = Self { kind: 0, length: 0, lock: 0, cr: 0, reg: 0, base: NO_REG, index: NO_REG, scale: 0, disp: 0 };
+        pub const NONE: Self = Self {
+            kind: 0, length: 0, lock: 0, cr: 0, reg: 0, base: NO_REG, index: NO_REG, scale: 0, disp: 0, memory: 0, size: 0, fs_gs: 0,
+        };
         /// Field ranges the resident relies on (it checks every reply).
         pub fn well_formed(&self) -> bool {
             let reg = |r: u32| r < 16;
+            let address = (reg(self.base) || self.base == RIP || self.base == NO_REG)
+                && (reg(self.index) || self.index == NO_REG)
+                && self.scale <= 3
+                && (self.base != RIP || self.index == NO_REG)
+                && matches!(self.fs_gs as usize, 0 | super::SREG_FS | super::SREG_GS);
+            let rm = if self.memory == 1 { address } else { self.memory == 0 && reg(self.reg) && self.fs_gs == 0 };
             (1..=15).contains(&self.length)
                 && self.lock <= 1
                 && match self.kind {
                     MOV_TO_CR | MOV_FROM_CR | MOV_TO_DR | MOV_FROM_DR => reg(self.cr) && reg(self.reg),
-                    INVLPG => (reg(self.base) || self.base == RIP || self.base == NO_REG)
-                        && (reg(self.index) || self.index == NO_REG)
-                        && self.scale <= 3
-                        && (self.base != RIP || self.index == NO_REG),
+                    INVLPG => address && self.fs_gs == 0,
                     RDMSR | WRMSR | CPUID | RDTSC | RDTSCP | RDPMC => true,
                     SET_CPL => matches!(self.cr, 0 | 3),
+                    LGDT..=SIDT => self.memory == 1 && address,
+                    SLDT..=MOV_FROM_SREG => rm && self.cr < 8 && matches!(self.size, 2 | 4 | 8),
+                    LLDT..=MOV_TO_SREG => rm && self.cr < 8,
+                    JMP_FAR..=CALL_FAR => self.memory == 1 && address && matches!(self.size, 4 | 8),
+                    RET_FAR..=IRET => matches!(self.size, 4 | 8) && (self.kind == IRET || (0..=0xffff).contains(&self.disp)),
+                    LOCK_UD => self.lock == 1,
                     _ => false,
                 }
         }
@@ -670,8 +788,9 @@ pub mod stop {
     /// A system instruction whose form or operand value the resident does not implement (e.g. CR3 with PWT/PCD, a DR7
     /// enabling a breakpoint); nothing of it was executed.
     pub const UNSUPPORTED_SYSTEM: u64 = 12;
-    /// A locked access the resident does not complete: a memory XCHG whose operand crosses a 16-byte boundary (an
-    /// alignment fault at its `swpal`, before any effect; contract: split locks wait for the boot phase).
+    /// A locked access the resident does not complete: a memory XCHG or LOCK read-modify-write (or an unlocked CMPXCHG8B,
+    /// which is lowered to the same `caspal`) whose operand crosses a 16-byte boundary: an alignment fault at its atomic
+    /// word, before any effect (owner decision: LOCKed accesses crossing 16 bytes stop; slice-3 contract §2).
     pub const UNSUPPORTED_ATOMIC: u64 = 13;
     /// Generated code (EL0) touched the resident's private window (`PRIVATE..PRIVATE + 1 GiB`): a data or instruction
     /// abort there (its pages are EL1-only, or EL0 execute-only code) at no access site of the block (a guest access to the
@@ -922,8 +1041,17 @@ mod tests {
         let mov = System { kind: system::MOV_TO_CR, length: 3, cr: 3, ..System::NONE };
         let invlpg = System { kind: system::INVLPG, length: 7, base: system::RIP, ..System::NONE };
         assert!(mov.well_formed() && invlpg.well_formed());
+        let ltr = System { kind: system::LTR, length: 3, reg: 0, ..System::NONE };
+        let far = System { kind: system::JMP_FAR, length: 3, memory: 1, size: 8, base: 0, fs_gs: SREG_GS as u32, ..System::NONE };
+        let ret = System { kind: system::RET_FAR, length: 3, size: 4, disp: 0xffff, ..System::NONE };
+        assert!(ltr.well_formed() && far.well_formed() && ret.well_formed());
+        assert!(!System { disp: 0x1_0000, ..ret }.well_formed() && !System { memory: 1, base: 17, ..ltr }.well_formed());
         for bad in [
-            System { kind: 13, ..mov },
+            System { kind: 27, ..mov },
+            System { kind: system::LGDT, ..mov }, // no memory operand
+            System { kind: system::IRET, size: 2, ..mov },
+            System { kind: system::MOV_FROM_SREG, size: 8, memory: 0, reg: 16, ..mov },
+            System { kind: system::JMP_FAR, size: 8, memory: 1, fs_gs: 3, ..mov },
             System { kind: system::MOV_FROM_DR, cr: 16, ..mov },
             System { length: 0, ..mov },
             System { length: 16, ..mov },
@@ -954,9 +1082,21 @@ mod tests {
             cr2: 0,
             cr8: 0,
             dr: DR_RESET,
+            seg: flat_segments(3),
+            ldtr: LDTR_RESET,
+            tr: TR_RESET,
+            gdtr: TABLE_RESET,
+            idtr: TABLE_RESET,
+            mov_ss: 0,
         };
         let c = cpu.control().unwrap();
         assert_eq!((c.cr3, c.cpl, c.wp, c.nxe, c.smep), (0x1000, 3, 1, 1, 0));
+        // The driver's flat segments (QEMU stub's selectors) and a descriptor's hidden part.
+        assert_eq!(flat_segments(0)[SREG_CS], Segment { selector: 0x08, attributes: 0xa09b, limit: 0xffff_ffff, base: 0 });
+        assert_eq!(flat_segments(3)[SREG_SS], Segment { selector: 0x1b, attributes: 0xc0f3, limit: 0xffff_ffff, base: 0 });
+        assert_eq!(flat_segments(3)[SREG_DS], Segment::NULL);
+        assert_eq!(Segment::loaded(0x50, 0x12cf_9334_5678_0067), Segment { selector: 0x50, attributes: 0xc093, limit: 0xf006_7fff, base: 0x1234_5678 });
+        assert_eq!(Segment::loaded(0x70, 0x0000_8900_0000_0067).limit, 0x67); // byte-granular
         for bad in [
             Cpu { cr0: CR0_PE, ..cpu },
             Cpu { cr4: 0, ..cpu },
@@ -966,6 +1106,8 @@ mod tests {
             Cpu { cr3: 0x1008, ..cpu },
             Cpu { cr3: 0x1000 | 1 << 40, ..cpu },
             Cpu { cr0: cpu.cr0 | CR0_AM, rflags: cpu.rflags | RFLAGS_AC, ..cpu }, // #AC would be due (not built)
+            Cpu { seg: [Segment { attributes: 0xc0fb, ..cpu.seg[1] }; 6], ..cpu }, // compatibility mode (CS.L = 0)
+            Cpu { seg: [Segment { attributes: 0xe0fb, ..cpu.seg[1] }; 6], ..cpu }, // CS.L = CS.D = 1
         ] {
             assert_eq!(bad.control(), None);
         }

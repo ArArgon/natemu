@@ -211,7 +211,7 @@ int SegmentOverride(uint32_t flags) {
 void JoinSites(uint64_t rip) {
   for (auto& s : Cap.sites) {
     s.segment = (s.kind == FEXC_SITE_PUSH || s.kind == FEXC_SITE_POP || s.kind == FEXC_SITE_PUSH_PAIR || s.kind == FEXC_SITE_POP_PAIR) ? 1 : 0;
-    if (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP)
+    if (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP || s.kind == FEXC_SITE_ATOMIC)
       for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) {
         if ((!i.mem.present && (i.sets_rip || i.name == "LEAVE")) || (!i.seg && (i.mem.base == 4 || i.mem.base == 5))) s.segment = 1;
         break;
@@ -227,7 +227,7 @@ void JoinSites(uint64_t rip) {
     }
   }
 }
-const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other", "divide", "swap"};
+const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other", "divide", "swap", "atomic"};
 const char* const ExtendName[] = {"none", "uxtw", "sxtw", "sxtx"};
 const char* const RmwName[] = {"none", "load", "store"};
 const char* const OrderingName[] = {"plain", "acquire", "release"};
@@ -296,7 +296,7 @@ static const char* CutReasonName() {
 }
 static std::string CutDetail() {
   if (fexc_cut.reason == FEXC_CUT_DECODER) return "at " + Hex64(fexc_cut.rip) + " (decoder status on the first instruction; no code, no NoExec block)";
-  if (fexc_cut.reason == FEXC_CUT_STRING) return "REP string instruction (it exits to its own RIP until it is done)";
+  if (fexc_cut.reason == FEXC_CUT_STRING) return "an instruction that exits to its own RIP (a REP string instruction until it is done, a LOCK NEG until its compare-and-swap succeeds)";
   char b[64]; snprintf(b, sizeof b, "opcode map %d opcode 0x%02x", int(fexc_cut.map), fexc_cut.opcode);
   return std::string(fexc_cut.why) + " (" + b + (fexc_cut.has_modrm ? (std::string(" /") + std::to_string((fexc_cut.modrm >> 3) & 7)) : "") +
          ", FEX decoded it as '" + fexc_cut.name + "')";
@@ -325,7 +325,7 @@ static void ResetGlobals() {
   Diagnostics.clear();
   W = {};
   fexc_sites.clear(); fexc_insns.clear(); fexc_cf_inverted.clear(); fexc_spill_bytes = 0; fexc_cut = {}; fexc_after_rep = 0;
-  fexc_rip_relative.clear(); fexc_target_check.clear(); fexc_div_width.clear(); fexc_movs.clear();
+  fexc_rip_relative.clear(); fexc_target_check.clear(); fexc_div_width.clear(); fexc_movs.clear(); fexc_lock_cas.clear();
 }
 
 // The CLI's body. `args` are the command-line arguments (args[0] is the program name); `given` replaces --hex/--file with the
@@ -700,7 +700,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     j.kv("extend", ExtendName[s.extend]).kv("shift", int(s.shift)).kv("imm", s.imm);
     j.arr("data_regs"); j.sep(); j.s += std::to_string(s.data_reg[0]);
     if (s.kind == FEXC_SITE_LOAD_PAIR || s.kind == FEXC_SITE_STORE_PAIR || s.kind == FEXC_SITE_PUSH_PAIR || s.kind == FEXC_SITE_POP_PAIR ||
-        s.kind == FEXC_SITE_SWAP) { j.sep(); j.s += std::to_string(s.data_reg[1]); }
+        s.kind == FEXC_SITE_SWAP || s.kind == FEXC_SITE_ATOMIC) { j.sep(); j.s += std::to_string(s.data_reg[1]); }
     j.end_arr();
     j.kv("data_class", s.data_class ? "fpr" : "gpr").kv("writeback", WritebackName[s.writeback]).kv("writeback_delta", int(s.writeback_delta))
      .kv("ordering", OrderingName[s.ordering]).kv("nzcv", s.nzcv ? "saved" : "pstate").kv("cf_inverted", bool(s.cf_inverted))
@@ -711,7 +711,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     }
     const Capture::Inst* in = nullptr;
     for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) { if (i.mem.present) in = &i; break; }
-    if (in && (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP)) {
+    if (in && (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP || s.kind == FEXC_SITE_ATOMIC)) {
       const auto* m = &in->mem;
       j.obj("x86").kv("rip_relative", m->rip_relative).kv("base", m->base).kv("index", m->index).kv("scale", m->scale).kv("disp", m->disp);
       if (in->seg) j.kv("segment_override", in->seg == 4 ? "fs" : "gs"); else j.null("segment_override");

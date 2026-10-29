@@ -71,6 +71,21 @@ def spec(name, n):
         c = bytearray(0x100); q(c, 0x80, n * 5000); mem[0x250000] = c       # lock word ends 0, counter = cpus * iterations
         for i in range(n):
             init.append(dict(rbx=0x250000, rbp=0x250080, rcx=5000)); fin.append(dict(rbx=0x250000, rbp=0x250080))
+    elif name == 'lock-counter':    # (I3) every LOCKed RMW of every CPU took effect exactly once, whatever the interleaving
+        R, c, m32 = 20000, bytearray(0x100), (1 << 32) - 1
+        q(c, 0, n * R); q(c, 8, n * R); q(c, 16, 3 * n * R); c[24:28] = (-2 * n * R & m32).to_bytes(4, 'little')
+        q(c, 32, 1); q(c, 40, n * R); c[64:68] = ((1 << n) - 1).to_bytes(4, 'little'); q(c, 80, n * R); c[96:100] = (n * R).to_bytes(4, 'little')
+        mem[0x260000] = c                 # +32 starts at 1, negated an even number of times; +48 (xor twice), +56 (bts then btr) end 0
+        for i in range(n):
+            regs = dict(r15=0x260000, r8=(0x0123456789abcdef * (i + 1)) & M, r9=i, r10=1 << i)
+            init.append(dict(regs, rsi=R)); fin.append(regs)
+    elif name in ('neg-race', 'neg-private'):    # (I3) n * 20000 LOCK NEGs of words starting at 1: each ends 1
+        R, c = 20000, bytearray(0x200)
+        for i in range(n if name == 'neg-private' else 1): q(c, 0x80 * i, 1)
+        mem[0x270000] = c
+        for i in range(n):
+            regs = dict(r15=0x270000 + (0x80 * i if name == 'neg-private' else 0))
+            init.append(dict(regs, rsi=R)); fin.append(regs)
     else: raise KeyError(name)
     return init, fin, mem
 

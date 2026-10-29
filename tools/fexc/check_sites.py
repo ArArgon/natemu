@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1a check: fexc's access sites against the fixture programs and against the emitted code.
 
-usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series16 build)
+usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series18 build)
 
 --slice1 compiles with `--profile slice1` (S1c): hardware TSO (plain ldr/str), exits through the dispatcher gate, block
 cutting (no fixture instruction is cut since S3e admitted memory xchg, a `swap` site); the exit
@@ -44,7 +44,7 @@ def fixture_programs():
     if not path.exists():
         subprocess.run([sys.executable, '-B', str(REPO / 'tools/reference/build_slice1.py'), '--programs-only'], check=True)
     return json.loads(path.read_text())['programs']
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series16/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series18/obj/fexc')
 KNOWN_OK = False
 PROFILE = []   # extra fexc arguments for every compile: ['--profile', 'slice1'] under --slice1
 
@@ -76,7 +76,7 @@ def blocks(p):
     bytes and `asm`/`insns` from each block's start through its REP (the last one through the end)."""
     import ref   # tools/reference (on the path of the callers that pass programs with `asm`)
     asm = p['asm']
-    cuts = [i + 1 for i, a in enumerate(asm) if re.match(r'(rep|repe|repne)\s', a)]
+    cuts = [i + 1 for i, a in enumerate(asm) if re.match(r'(rep|repe|repne)\s|lock neg\s', a)]   # (I3: LOCK NEG ends its block too)
     if not cuts: return [p]
     sizes = [len(ref.assemble(a)) for a in asm]
     out, start = [], 0
@@ -94,10 +94,18 @@ def expected(asm):
     if x := STRING.fullmatch(asm.strip()):
         w = {'b': 1, 'w': 2, 'd': 4, 'q': 8}.get(x[2]) or WIDTH[re.search(r'(byte|word|dword|qword) ptr', x[3])[1]]
         return [(k, w) for k in STRING_ACCESSES[x[1]]]
-    mn, _, rest = asm.partition(' ')
+    locked = asm.startswith('lock ')
+    mn, _, rest = asm[5 if locked else 0:].partition(' ')
     ops = [o.strip() for o in rest.split(',')] if rest else []
     mem = [i for i, o in enumerate(ops) if '[' in o]
-    ptr = lambda o: WIDTH[o.split(' ptr')[0].split()[-1]]
+    ptr = lambda o: dict(WIDTH, xmmword=16)[o.split(' ptr')[0].split()[-1]]
+    # I3: a LOCK read-modify-write is one atomic site (bt*: FEX's byte at the bit, as unlocked); LOCK NEG loads, then
+    # compare-and-swaps (patch 0016); cmpxchg8b/16b are one caspal, locked or not.
+    if mn in ('cmpxchg8b', 'cmpxchg16b'):
+        return [('atomic', ptr(ops[0]))]
+    if locked and mn != 'xchg':
+        w = ptr(ops[0])
+        return [('atomic', 1)] if mn in ('bts', 'btr', 'btc') else [('load', w), ('atomic', w)] if mn == 'neg' else [('atomic', w)]
     if mn == 'push':
         if mem:
             return [('load', ptr(ops[0])), ('push', ptr(ops[0]))]
@@ -149,12 +157,15 @@ def site_classes(sites):
 def native_access(w):
     """Width of a load/store mnemonic line, (direction, width, base, index, imm, writeback) or None."""
     m = re.match(r'(\w+)\s+(.*)$', w)
-    if not m or not m.group(1).startswith(('ld', 'st', 'swp')) or '[' not in m.group(2):
+    if not m or not m.group(1).startswith(('ld', 'st', 'swp', 'cas')) or '[' not in m.group(2):
         return None
     mn, ops = m.group(1), m.group(2)
     base = re.search(r'\[(x\d+|sp)', ops).group(1)
+    size = 1 if mn.endswith('b') else 2 if mn.endswith('h') else 4 if ops.startswith('w') else 8
     if mn.startswith('swp'):        # swpal{b,h} Rs, Rt, [Rn]: a memory xchg
-        return ('swap', 1 if mn.endswith('b') else 2 if mn.endswith('h') else 4 if ops.startswith('w') else 8, base, None, 0, 'none')
+        return ('swap', size, base, None, 0, 'none')
+    if mn.startswith(('ldadd', 'ldclr', 'ldeor', 'ldset', 'cas')):   # I3: LOCK atomics (casp: both elements)
+        return ('atomic', 2 * size if mn.startswith('casp') else size, base, None, 0, 'none')
     regs = re.findall(r'\b([wxbhsdq])(?:\d+|zr)\b', ops.split('[')[0])
     if mn.endswith('b') and mn != 'ldaddb':
         width = 1
@@ -253,7 +264,7 @@ def code_vs_sites(sites, dis):
         elif s and not a:
             out.append(f'site at +{off} ({s["ir_op"]}) is not on a load/store: "{dis.get(off)}"')
         else:
-            dirn = 'load' if s['kind'] in ('load', 'pop', 'load_pair', 'pop_pair') else 'swap' if s['kind'] == 'swap' else 'store'
+            dirn = 'load' if s['kind'] in ('load', 'pop', 'load_pair', 'pop_pair') else s['kind'] if s['kind'] in ('swap', 'atomic') else 'store'
             if (a[0], a[1], a[2]) != (dirn, s['width'], f'x{s["base_reg"]}'):
                 out.append(f'site +{off} ({s["kind"]} w{s["width"]} base x{s["base_reg"]}) vs "{dis[off]}"')
             if a[3] != s['index_reg'] or a[5] != s['writeback'] or (a[5] == 'none' and a[3] is None and a[4] != s['imm']):
@@ -261,7 +272,8 @@ def code_vs_sites(sites, dis):
             elif a[5] == 'pre' and not (a[4] == s['imm'] == s['writeback_delta']) or a[5] == 'post' and not (a[4] == s['writeback_delta'] and s['imm'] == 0):
                 out.append(f'site +{off} writeback (imm {s["imm"]} delta {s["writeback_delta"]}) vs "{dis[off]}"')
             regs = [31 if r.endswith('zr') else int(r[1:]) for r in re.findall(r'\b([wxbhsdq](?:\d+|zr))\b', dis[off].split(' ', 1)[1].split('[')[0])]
-            if s['kind'] == 'swap': regs = regs[::-1]        # swpal Rs, Rt; the record is [Rt, Rs]
+            if s['kind'] in ('swap', 'atomic'): regs = regs[::-1]   # swpal/ld<op>al/casal Rs, Rt; the record is [Rt, Rs]
+            if s['kind'] == 'atomic' and len(regs) == 4: regs = [regs[1], regs[3]]   # caspal Rs, Rs+1, Rt, Rt+1: the even ones
             if regs != s['data_regs']:
                 out.append(f'site +{off} data registers {s["data_regs"]} vs "{dis[off]}"')
     return out
@@ -283,7 +295,7 @@ def check_program(p, tmp):
         cut = first_cut(asm)
         if cut is not None:
             asm, want_end = asm[:cut], 'unsupported_form'
-    if asm and re.match(r'(rep|repe|repne)\s', asm[-1]): want_end = 'block_ending_instruction'   # I2: a REP ends its block
+    if asm and re.match(r'(rep|repe|repne)\s|lock neg\s', asm[-1]): want_end = 'block_ending_instruction'   # I2/I3: a REP or LOCK NEG ends its block
     if len(insts) != len(asm) or d['guest']['end']['reason'] != want_end:
         return [('ERROR', f"translated {len(insts)} of {len(asm)} instructions, end={d['guest']['end']['reason']} (want {want_end})")], 0
     if want_end == 'unsupported_form' and int(d['guest']['end']['rip'], 16) != int(p['rip'], 16) + sum(i['size'] for i in insts):
@@ -305,7 +317,7 @@ def check_program(p, tmp):
         if exp.get(off) == got.get(off):
             continue
         a = asm_at.get(off, '?')
-        mn = a.split()[0]
+        mn = a.removeprefix('lock ').split()[0]
         msg = f'guest +{off} "{a}": expected {exp.get(off)} sites {got.get(off)}'
         if got.get(off) is None and mn in LOAD_DST:
             problems.append(('ELIMINATED', msg))
@@ -315,12 +327,12 @@ def check_program(p, tmp):
             problems.append(('ERROR', msg))
     for s in sites:
         a = asm_at.get(s['guest_offset'], '?')
-        mn = a.split()[0]
+        mn = a.removeprefix('lock ').split()[0]
         if s['kind'] in STUBS:
             continue
         if s['kind'] == 'load' and s['rmw'] == 'load' and s['intent'] != 'write':
             problems.append(('ERROR', f'rmw load without write intent at {s["native_offset"]}'))
-        is_rmw = mn in RMW_DST and '[' in a.partition(',')[0]
+        is_rmw = mn in RMW_DST and '[' in a.partition(',')[0] or (a.startswith('lock neg') and s['kind'] == 'load')
         if s['kind'] in ('load', 'store') and (s['rmw'] != 'none') != is_rmw:
             problems.append(('ERROR', f'guest +{s["guest_offset"]} "{a}": rmw={s["rmw"]} but fixture rmw={is_rmw}'))
         if s['kind'] == 'load' and s['rmw'] == 'none' and s['intent'] != 'read':
@@ -329,7 +341,7 @@ def check_program(p, tmp):
             problems.append(('ERROR', f'store without write intent at {s["native_offset"]}'))
         # I7: an FS/GS-overridden operand is FS/GS (#GP), whatever its base; the implicit stack accesses stay SS.
         ss = s['kind'] in ('push', 'pop', 'push_pair', 'pop_pair') or \
-            bool(re.search(r'\[(rsp|rbp)\b', a) and not re.search(r'\b[fg]s:\[', a) and s['kind'] in ('load', 'store')) or \
+            bool(re.search(r'\[(rsp|rbp)\b', a) and not re.search(r'\b[fg]s:\[', a) and s['kind'] in ('load', 'store', 'swap', 'atomic')) or \
             (mn == 'leave' and s['kind'] == 'load')
         if (s['segment'] == 'ss') != ss:
             problems.append(('ERROR', f'guest +{s["guest_offset"]} "{a}": segment {s["segment"]}'))
@@ -351,7 +363,7 @@ def check_program(p, tmp):
     o = read_object(tmp / 'o.bin')
     if o['code'] != code or o['spill'] != d['code']['layout']['spill_bytes'] or len(o['sites']) != len(sites) or o['rip'] != int(p['rip'], 16):
         problems.append(('ERROR', 'object header/code disagrees with the JSON'))
-    kinds = ['load', 'store', 'load_pair', 'store_pair', 'push', 'pop', 'guard', 'split', 'push_pair', 'pop_pair', 'other', 'divide', 'swap']
+    kinds = ['load', 'store', 'load_pair', 'store_pair', 'push', 'pop', 'guard', 'split', 'push_pair', 'pop_pair', 'other', 'divide', 'swap', 'atomic']
     for rec, s in zip(o['sites'], sites):
         if (rec[0], rec[1], kinds[rec[5]], rec[6]) != (s['native_offset'], s['guest_offset'], s['kind'], s['width']):
             problems.append(('ERROR', f'object site {rec[:4]} disagrees with JSON {s["native_offset"]}'))

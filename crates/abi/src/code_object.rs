@@ -27,7 +27,11 @@ pub const NO_REG: u8 = 0xff;
 /// Push/pop pairs exist while FEX fuses two guest push/pop into one `stp`/`ldp`; `OTHER` is a guest-memory operation
 /// the record cannot describe, which a consumer must refuse. `SWAP` is a memory XCHG (implicitly locked): one `swpal`
 /// (`data_reg` = [Rt, Rs]), write intent, nothing written if it aborts; an operand crossing 16 bytes takes an alignment
-/// fault there (LSE2), which the runtime does not complete.
+/// fault there (LSE2), which the runtime does not complete. `ATOMIC` (I3) is a LOCK read-modify-write: one
+/// `ld{add,clr,eor,set}al`, `casal` or `caspal` (`data_reg` = [Rt, Rs]; caspal: the even registers of both pairs, `width`
+/// both elements), write intent, nothing written if it aborts (CAS/CASP even when the comparison fails: the Arm ARM's
+/// MemAtomic translates the access as a write before the compare, so a read-only page faults whatever the outcome); an operand crossing 16 bytes takes an alignment fault there (LSE2), as does a 16-byte caspal that is
+/// not 16-byte aligned (CMPXCHG16B: #GP(0)). LOCK NEG's `casal` follows a load site of the same operand (`rmw`: the pair).
 pub mod kind {
     pub const LOAD: u8 = 0;
     pub const STORE: u8 = 1;
@@ -42,6 +46,7 @@ pub mod kind {
     pub const OTHER: u8 = 10;
     pub const DIVIDE: u8 = 11;
     pub const SWAP: u8 = 12;
+    pub const ATOMIC: u8 = 13;
 }
 /// [`Site::intent`].
 pub const INTENT_READ: u8 = 0;

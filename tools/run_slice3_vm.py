@@ -40,9 +40,15 @@ their locations aligned, unaligned inside a 16-byte block, or (`split`, `split-h
 takes the split-store service; exchanged locations stay aligned; the changing byte is on the first page for `split`, on the
 second for `split-hi`, so both halves of a split store are observed), R runs of K iterations per cell. Every iteration's outcome
 must be in tools/models/ordering_model.py's allowed set for that program (the model enumerates it; nothing is written per
-test), and an XCHG chain's outcome must also be one linear order of the exchanges (`check_xchg_chain`). Every vCPU
+test), and an XCHG chain's outcome must also be one linear order of the exchanges (`check_xchg_chain`). I3 adds the
+LOCKed read-modify-write families (`RMW_FAMILIES`): sb with one LOCKed RMW of each Arm atomic word FEX emits between the
+store and the load (xadd, and, xor, or, cmpxchg, cmpxchg8b, cmpxchg16b, neg, and failing cmpxchg/cmpxchg8b), the RMW chains
+`xadd` (a counter) and `cas` (one winner), and `cas-read`/`cas8b-read` (a failing LOCK CMPXCHG as SB's observing read),
+judged by the model's `rmw` operation; RMW locations never split (a LOCKed access crossing 16 bytes stops). Every vCPU
 reaches its end having done all K iterations. `--control drop-fence` runs sb-mfence without its MFENCEs, judged
-against sb-mfence's allowed set: it must show the forbidden SB outcome (the harness can see a violation); its run diffs and
+against sb-mfence's allowed set: it must show the forbidden SB outcome (the harness can see a violation); `--control
+drop-lock` (I3) likewise runs sb-xadd and the xadd counter chain (or `--families`) with their LOCK prefixes removed (plain
+read-modify-writes); its run diffs and
 trial counts are judged as in a normal run; aligned and unaligned only (`--variants` with a split variant is refused: a split
 store completes in the resident with `dsb ish`, so SB cannot relax there).
 
@@ -307,7 +313,7 @@ def cmd_smp(a, host, runtime):
         diffs += smp.compare(prog, got, model_smp.expected(prog))
         if prog['name'] in qemu: diffs += ['qemu: ' + d for d in smp.compare(prog, got, qemu[prog['name']])]
         outcome = 'fail' if diffs else 'match'
-        stats = [{k: cpu['stats'][k] for k in ('blocks', 'requests', 'links', 'retries')} for cpu in cpus]
+        stats = [{k: cpu['stats'][k] for k in ('blocks', 'requests', 'links', 'retries', 'linked', 'link_points')} for cpu in cpus]
         return [{**e, 'outcome': outcome, 'diffs': diffs, 'stats': stats}]
     entries = run_groups(a, host, runtime, groups, judge)
     by = collections.defaultdict(collections.Counter)
@@ -315,20 +321,30 @@ def cmd_smp(a, host, runtime):
     for name, c in by.items(): print(f'{name}: {dict(c)}', flush=True)
     for e in entries:
         if e['outcome'] != 'match': print(f"{e['name']} rep{e['rep']} {e['outcome']}: {'; '.join(e['diffs'])[:400]}")
+    # I3: LOCK NEG's lost-race exit to its own RIP must have run: under the race some CPU linked an exit that no CPU of the
+    # race-free loop ever takes (the same code; its other exits are taken in both).
+    lost = 0
+    for n in a.cpus:
+        race = [s['linked'] for e in entries if e['name'] == f'neg-race@{n}' for s in e['stats']]
+        free = [s['linked'] for e in entries if e['name'] == f'neg-private@{n}' for s in e['stats']]
+        if race and free:
+            print(f"neg-race@{n}: linked exits per CPU {sorted(set(race))}, race-free {sorted(set(free))}", flush=True)
+            if max(race) <= max(free): lost += 1; print(f'neg-race@{n}: no CPU took the lost-race self-exit')
     (a.out / 'smp.json').write_text(json.dumps({'results': entries}, indent=1) + '\n')
-    return sum(c['fail'] for c in by.values())
+    return sum(c['fail'] for c in by.values()) + lost
 
 
 def cmd_litmus(a, host, runtime):
     from models import ordering_model as model
-    control = a.control == 'drop-fence'
-    families = ['sb-mfence'] if control else a.families or list(programs.FAMILIES)
+    control = a.control in ('drop-fence', 'drop-lock')
+    # drop-lock (I3): the LOCKed RMW families without their LOCK prefix (plain read-modify-writes: no barrier, not atomic).
+    families = (a.families or ['sb-xadd', 'xadd']) if a.control == 'drop-lock' else ['sb-mfence'] if control else a.families or list(programs.FAMILIES)
     # The control refuses the split variants: a split store completes in the resident with `dsb ish`, so SB cannot relax there.
     if control and a.variants and any(v.startswith('split') for v in a.variants):
-        sys.exit('--control drop-fence cannot run split variants: a split store completes with dsb ish, so SB cannot relax there')
+        sys.exit(f'--control {a.control} cannot run split variants: a split store completes with dsb ish, so SB cannot relax there')
     variants = a.variants or [v for v in programs.VARIANTS if not (control and v.startswith('split'))]
     cells = [(f, n, v) for f in families for n in a.cpus for v in variants
-             if programs.litmus_family(f, n) and not (f == 'xchg' and v.startswith('split'))]
+             if programs.litmus_family(f, n) and not (f in ('xchg', 'xadd', 'cas', 'cas-read', 'cas8b-read') and v.startswith('split'))]   # (no plain location to split)
     failures, report = [], []
     for f, n, v in cells:
         test = programs.litmus_family(f, n)
@@ -354,7 +370,7 @@ def cmd_litmus(a, host, runtime):
             for o in hist:
                 try: model.check_xchg_chain({i: i + 1 for i in range(n)}, dict(enumerate(o[:n])), o[n])
                 except ValueError as e: unchained.append((o, str(e)))
-        label = f'{f}@{n} {v}' + (' without MFENCE' if control else '')
+        label = f'{f}@{n} {v}' + ((' without LOCK' if a.control == 'drop-lock' else ' without MFENCE') if control else '')
         trials = sum(hist.values())
         print(f"{label}: {trials} trials, {len(hist)} distinct outcomes ({len(allowed)} allowed), forbidden {sum(forbidden.values())} "
               f"{dict(sorted(forbidden.items()))}; histogram {dict(sorted(hist.items()))}", flush=True)
@@ -372,7 +388,7 @@ def cmd_litmus(a, host, runtime):
                        'histogram': {str(o): c for o, c in sorted(hist.items())}, 'allowed': len(allowed),
                        'forbidden': {str(o): c for o, c in forbidden.items()}, 'run_diffs': bad})
     for x in failures: print(x)
-    (a.out / ('litmus-control.json' if control else 'litmus.json')).write_text(json.dumps({'report': report, 'failures': failures}, indent=1) + '\n')
+    (a.out / (f'litmus-{a.control}.json' if control else 'litmus.json')).write_text(json.dumps({'report': report, 'failures': failures}, indent=1) + '\n')
     return len(failures)
 
 
@@ -670,7 +686,13 @@ def unsupported_cases():
 SYSTEM_GAPS = {}
 # Fault cases where pinned QEMU raises another exception than the SDM and the profile (system_fault_model) give: the
 # model judges; QEMU's answer is recorded, not compared.
-QEMU_DIFFERS = {'sysfault-rdpmc@1': 'QEMU raises #UD for RDPMC at CPL 0 (unimplemented); with no counters (CPUID.0AH = 0) every ECX is an invalid counter: #GP(0)'}
+QEMU_DIFFERS = {'sysfault-rdpmc@1': 'QEMU raises #UD for RDPMC at CPL 0 (unimplemented); with no counters (CPUID.0AH = 0) every ECX is an invalid counter: #GP(0)',
+                # S2b (segment_model): QEMU's choices where the SDM (or the model's recorded choice) differs.
+                'seg-ss-null-rpl1@1': 'QEMU loads a null SS with RPL != CPL at CPL 0; SDM MOV 64-bit mode exceptions: #GP(0)',
+                'seg-ltr-null@1': 'QEMU loads a null TR; SDM LTR: #GP(0) for a null selector',
+                'seg-call-far-noncanonical@1': 'QEMU commits the call and faults at the fetch of the non-canonical RIP; SDM CALL: #GP(0) at the CALL',
+                'seg-lret-noncanonical@1': 'QEMU commits the return and faults at the fetch of the non-canonical RIP; SDM RET: #GP(0) at the RET',
+                'seg-iret-null-ss-rpl@1': 'QEMU accepts the null SS with RPL != the new CPL and does not reach the end (timeout); SDM IRET 64-bit mode exceptions: #GP(0) (segment_model B6)'}
 
 
 # ---- S1: the presented CPU, judged by tools/models/cpu_profile.py (QEMU presents its own CPU) --------------------------------
@@ -818,6 +840,92 @@ def cpl3_cases():
     return cases
 
 
+def segment_runs(a, host, runtime, qemu, report, failures):
+    """S2b (tools/bench/smp/segments.py): descriptor tables, segment loads and far transfers at block sizes default and 1.
+    Positive programs (1, 2 and 4 vCPUs) and fault cases against QEMU system mode (registers, captured memory, fault);
+    every fault case's outcome (fault (vector, error, RIP, CR2) or completion) must be one segment_model permits, for
+    natemu and for QEMU (unless listed in QEMU_DIFFERS); registers and memory are compared where both took the same one.
+    Refused cases (compatibility-mode CS, call gate, TF from IRETQ) stop `unsupported_mode`/`unsupported_system` at the
+    instruction; QEMU is not run for them. The LTR race (natemu only) runs 10 times per block size: exactly one vCPU
+    loads TR, every other takes #GP(0x70) at its LTR."""
+    import segments
+    for prog in segments.programs():
+        name, model = prog['name'], prog['params'].get('model')
+        if a.programs and not any(n in name for n in a.programs):
+            continue
+        entry = {'name': name, 'runs': []}
+        if 'race' in prog['params']:
+            for limit in ([], [1]):
+                for rep in range(10):
+                    rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f"{name}{'-1' if limit else ''}", limit)
+                    stops = out and [(c['stop'], vm_fault(c)) for c in out['cpus']]
+                    won = out and sum(s == 'reached' for s, _ in stops)
+                    lost = out and sum(f == (13, 0x70, at, 0) for (_, f), at in zip(stops, prog['params']['race']))
+                    ok = rc == 0 and won == 1 and won + lost == prog['ncpu']
+                    entry['runs'].append({'max_block': limit[0] if limit else None, 'ok': ok, 'stops': stops})
+                    if not ok: failures.append(f"{name}{' (max-block 1)' if limit else ''} rep {rep}: {rc} {stops} {err.strip()[-200:]}")
+            print(f"{name}: {'ok' if all(r['ok'] for r in entry['runs']) else 'FAIL'} ({len(entry['runs'])} runs, one LTR each)", flush=True)
+            report.append(entry)
+            continue
+        if model and model['outcome'] == 'refused':
+            want_stop = 'unsupported_mode' if model['reason'].startswith('compatibility') else 'unsupported_system'
+            for limit in ([], [1]):
+                rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f"{name}{'-1' if limit else ''}", limit)
+                cpu = out and out['cpus'][0]
+                ok = rc == 0 and cpu['stop'] == 'resident' and cpu['reason'].startswith(want_stop) and smp.num(cpu['rip']) == model['at']
+                entry['runs'].append({'max_block': limit[0] if limit else None, 'ok': ok})
+                if not ok: failures.append(f"{name}{' (max-block 1)' if limit else ''}: want {want_stop} at {model['at']:#x}, got {rc} {cpu and (cpu['stop'], cpu['reason'], cpu['rip'])} {err.strip()[-200:]}")
+            print(f"{name}: {'ok' if all(r['ok'] for r in entry['runs']) else 'FAIL'} (refused: {model['reason']})", flush=True)
+            report.append(entry)
+            continue
+        want, rc = qemu(prog, name, timeout=30 if name in QEMU_DIFFERS else 120)
+        if want is None and not (model and name in QEMU_DIFFERS): failures.append(f'{name}: QEMU run failed ({rc})'); continue
+        # A listed case QEMU does not finish (it takes another path) is judged by segment_model alone.
+        want = want or {'cpus': [{'fault': f'QEMU: {rc}'}], 'memory': []}
+        for c in want['cpus']: c['fault'] = qemu_fault(c['fault']) if not isinstance(c['fault'], str) else c['fault']
+        # Bytes where QEMU leaves what the SDM changes (an accessed bit set by a CS load): QEMU must differ there, and the
+        # SDM's value is compared instead.
+        for addr, value in prog['params'].get('sdm_bytes', {}).items():
+            region = next(r for r in want['memory'] if r['addr'] <= smp.num(addr) < r['addr'] + len(r['data']))
+            at = smp.num(addr) - region['addr']
+            if region['data'][at] == value: failures.append(f'{name}: QEMU writes the SDM value at {addr}: drop sdm_bytes')
+            region['data'] = region['data'][:at] + bytes([value]) + region['data'][at + 1:]
+        permitted = None
+        if model:
+            # segment_model's permitted outcomes as faults in smp's shape (None: the instruction completes).
+            fault = lambda f: f and (f[0], f[1], model['at'], f[2] if f[0] == 14 else 0)
+            permitted = {fault(f) for _, f in model['permitted']}
+            entry['qemu'] = qf = want['cpus'][0]['fault']
+            if qf not in permitted:
+                if name in QEMU_DIFFERS: entry['qemu_differs'] = QEMU_DIFFERS[name]
+                else: failures.append(f"{name}: QEMU {qf}, segment_model permits {sorted(permitted, key=str)}")
+            elif name in QEMU_DIFFERS: failures.append(f'{name}: listed in QEMU_DIFFERS but QEMU is permitted')
+        for limit in ([], [1]):
+            rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f"{name}{'-1' if limit else ''}", limit)
+            if rc:
+                diffs = [f'driver exit {rc}: {err.strip()[-300:]}']
+            else:
+                diffs = []
+                for v_, (c, cpu) in enumerate(zip(prog['cpus'], out['cpus'])):
+                    end = body_end(prog, smp.num(c['rip']))
+                    done = want['cpus'][v_]['fault'] is None if permitted is None else vm_fault(cpu) is None
+                    if done and (cpu['stop'] != 'reached' or smp.num(cpu['rip']) != end):
+                        diffs.append(f"cpu{v_} stopped {cpu['stop']} {cpu['reason']} at {cpu['rip']} (end {end:#x})")
+                    diffs += [f'cpu{v_} ' + d for d in per_vcpu_checks(cpu)]
+                got = vm_state(prog, out)
+                g = got['cpus'][0]['fault']
+                if permitted is not None and g not in permitted:
+                    diffs.append(f"fault {g} not permitted by segment_model {sorted(permitted, key=str)}")
+                if permitted is None or g == want['cpus'][0]['fault']:
+                    diffs += smp.compare(prog, got, want)
+            entry['runs'].append({'max_block': limit[0] if limit else None, 'diffs': diffs})
+            failures.extend(f"{name}{' (max-block 1)' if limit else ''}: {d}" for d in diffs)
+        bad = any(r['diffs'] for r in entry['runs'])
+        print(f"{name}: {'FAIL' if bad else 'ok'}" + (f"; model {model['fault']}" + (f" (permits {len(permitted)})" if len(permitted) > 1 else '') if model else '')
+              + (f"; QEMU differs: {entry['qemu']}" if 'qemu_differs' in entry else ''), flush=True)
+        report.append(entry)
+
+
 def cmd_system(a, host, runtime):
     """S3c1: system programs (tools/bench/smp/system.json) against QEMU system mode; fault cases against
     tools/system_fault_model.py at the state QEMU reaches just before the instruction (and modes_model where it covers
@@ -897,6 +1005,7 @@ def cmd_system(a, host, runtime):
               + (f"; QEMU full run: {entry['qemu']}" if 'qemu' in entry else '') + (f"; modes model {entry['modes_model']}" if 'modes_model' in entry else '')
               + (f"; history {entry['either']}" if 'either' in entry else ''), flush=True)
         report.append(entry)
+    segment_runs(a, host, runtime, qemu, report, failures)
     # Refusals: the vCPU stops `unsupported_system` at the instruction, after the prefix.
     for name, code in ([] if a.programs else unsupported_cases().items()):
         text = f'cpl 0\nrip 0x110000\ncode {code}\n'
@@ -1511,7 +1620,7 @@ def main():
     ap.add_argument('--variants', type=lambda s: s.split(','))
     ap.add_argument('--k', type=int, default=25_000, help='litmus: iterations per run')
     ap.add_argument('--runs', type=int, default=4, help='litmus: runs per cell')
-    ap.add_argument('--control', choices=['drop-fence'])
+    ap.add_argument('--control', choices=['drop-fence', 'drop-lock'])
     ap.add_argument('--programs', type=lambda s: s.split(','))
     ap.add_argument('--reps', type=int, default=1)
     ap.add_argument('--kicks', type=int, help='kicks per vCPU (kicks: default 10000; corpora: off unless given)')

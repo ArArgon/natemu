@@ -148,6 +148,16 @@ def string(pre, op):   # pre: the prefix bytes (leading)
     if source and ss and not high: return 'FS/GS', 'SS naming the DS:RSI source'
     return 'admitted', ''
 
+def lockable(k, op, modrm):
+    """I3 (fexc_slice1.inc `Lockable`, SDM Vol.2 LOCK): the memory-destination forms of add/or/adc/sbb/and/sub/xor, group 1
+    but cmp, xchg, not/neg, inc/dec, bts/btr/btc, cmpxchg, xadd, cmpxchg8b/16b."""
+    if modrm is None or modrm >> 6 == 3: return False
+    reg = (modrm >> 3) & 7
+    if k == 'p':
+        return (op < 0x38 and op & 7 <= 1) or (op in (0x80, 0x81, 0x83) and reg != 7) or op in (0x86, 0x87) or \
+               (op in (0xF6, 0xF7) and reg in (2, 3)) or (op in (0xFE, 0xFF) and reg <= 1)
+    return k == '0f' and (op in (0xAB, 0xB3, 0xBB, 0xB0, 0xB1, 0xC0, 0xC1) or (op == 0xBA and reg >= 5) or (op == 0xC7 and reg == 1))
+
 def classify(b, mnem):
     """-> (class, why). Classes: admitted SSE AVX x87 LOCK string system BMI FS/GS small-int other bad"""
     p = parse(b)
@@ -166,13 +176,17 @@ def classify(b, mnem):
     elif k == '0f38': v, br = (SYS if 0x80 <= op <= 0x82 else UNS), False
     else: v, br = UNS, False
     plainmod = modrm
+    # I3: cmpxchg8b/16b m (fexc: one caspal, locked or not; no 66/F2/F3)
+    if k == '0f' and op == 0xC7 and modrm is not None and (modrm >> 3) & 7 == 1 and modrm >> 6 != 3:
+        if pre & {0x66, 0xF2, 0xF3}: return 'LOCK', 'prefix on cmpxchg8b/16b'
+        return segment(b, k, op) or ('admitted', '')
     # fences and endbr64 are admitted whatever the opcode table says
     if k == '0f' and op == 0xAE and modrm in (0xE8, 0xF0, 0xF8) and not (pre & {0x66, 0xF2, 0xF3}):
         return segment(b, k, op) or ('admitted', '')
     if v != ALLOW:
         if k == '0f' and op == 0x1E and modrm == 0xFA and 0xF3 in pre and not (pre & {0xF0, 0xF2, 0x66, 0x67, 0x64, 0x65}): return 'admitted', ''
     else:
-        if 0xF0 in pre and not (k == 'p' and op in (0x86, 0x87) and modrm >> 6 != 3): return 'LOCK', 'LOCK on an admitted opcode'
+        if 0xF0 in pre and not lockable(k, op, modrm): return 'LOCK', 'LOCK on a form that is not lockable (#UD)'   # I3
         if 0xF2 in pre: return 'other', 'REPNE/bnd prefix on an admitted opcode'
         if 0xF3 in pre and not (k == 'p' and (op == 0xC3 or (op == 0x90 and not (p['rex'] & 1)))) and not (k == '0f' and op in (0xB8, 0xBC, 0xBD)):
             return 'other', 'REP prefix on an admitted opcode'
@@ -298,12 +312,14 @@ def selftest():
              ('64aa', 'stos %fs', 'FS/GS'), ('36ac', 'lods %ss:', 'FS/GS'), ('f30f1efa', 'endbr64', 'admitted'), ('64488b042528000000', 'mov %fs:', 'admitted'),
              ('6548ff0425f0ff0000', 'incq %gs:', 'admitted'), ('644889c8', 'fs mov reg', 'FS/GS'), ('642e488b00', 'fs cs mov', 'FS/GS'),
              ('36488b03', 'ss mov (%rbx)', 'FS/GS'), ('36488b0424', 'ss mov (%rsp)', 'admitted'), ('3e488b4500', 'ds mov (%rbp)', 'FS/GS'),
-             ('3e48ff24c500000000', 'notrack jmp *tbl', 'admitted'), ('65c4e2f0f200', 'andn %gs:', 'admitted'), ('f065480fc108', 'lock xadd %gs:', 'LOCK'),
+             ('3e48ff24c500000000', 'notrack jmp *tbl', 'admitted'), ('65c4e2f0f200', 'andn %gs:', 'admitted'), ('f065480fc108', 'lock xadd %gs:', 'admitted'),
              ('65c3', 'gs ret', 'FS/GS'), ('3e4c8b2424', 'ds mov (%rsp),%r12', 'FS/GS'), ('3e498b0424', 'ds mov (%r12)', 'admitted'),
              ('0f22d8', 'mov %cr3', 'system'), ('0f28c1', 'movaps', 'SSE'), ('c5f877', 'vzeroupper', 'AVX'), ('d9c0', 'fld', 'x87'),
-             ('f3480fb8c1', 'popcnt', 'admitted'), ('f0480fb10a', 'lock cmpxchg', 'LOCK'), ('480fa4c10c', 'shld', 'admitted'), ('f2c3', 'bnd ret', 'other'),
+             ('f3480fb8c1', 'popcnt', 'admitted'), ('f0480fb10a', 'lock cmpxchg', 'admitted'), ('f0480fc70e', 'lock cmpxchg16b', 'admitted'),
+             ('f04801c8', 'lock add reg', 'LOCK'), ('f0488908', 'lock mov', 'LOCK'), ('f2f0480108', 'xacquire lock add', 'other'),
+             ('f0f71b', 'lock neg', 'admitted'), ('f0480fba2b05', 'lock bts', 'admitted'), ('f0480fba2305', 'lock bt', 'LOCK'), ('480fa4c10c', 'shld', 'admitted'), ('f2c3', 'bnd ret', 'other'),
              ('fc', 'cld', 'admitted'), ('9c', 'pushfq', 'admitted'), ('9d', 'popfq', 'system'), ('c8100001', 'enter', 'small-int'), ('c9', 'leave', 'admitted'),
-             ('480fc70e', 'cmpxchg16b', 'small-int'), ('0f0d08', 'prefetchw', 'small-int'), ('0f1808', 'prefetcht0', 'admitted'), ('660fa4c10c', 'shldw', 'small-int'),
+             ('480fc70e', 'cmpxchg16b', 'admitted'), ('66480fc70e', 'o16 cmpxchg16b', 'LOCK'), ('0f0d08', 'prefetchw', 'small-int'), ('0f1808', 'prefetcht0', 'admitted'), ('660fa4c10c', 'shldw', 'small-int'),
              ('c4e2fbf5c1', 'pdep', 'BMI'), ('c4e27cf2c1', 'andn', 'BMI'), ('c4e278f2c1', 'andn', 'admitted'), ('f3480fbc00', 'tzcnt', 'admitted'),
              ('f3c3', 'rep ret', 'admitted'), ('c3', 'ret', 'admitted'), ('cc', 'int3', 'int3'), ('3effe0', 'notrack jmp', 'admitted'), ('0f05', 'syscall', 'system'),
              ('c5f8f7', 'bmi?', 'AVX'), ('c4e260f7c1', 'shlx', 'admitted'), ('c4e2f8f7c1', 'shlxq', 'admitted')]

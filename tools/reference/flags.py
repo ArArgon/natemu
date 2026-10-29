@@ -65,6 +65,8 @@ def step(insn, undefined):
     if op in ('clc', 'stc', 'cmc'): return undefined & ~CF
     if op == 'sahf': return undefined & ~(SF | ZF | AF | PF | CF)    # OF unaffected
     if op in ('cmpxchg', 'xadd', 'popcnt'): return undefined & ~ALL6   # cmp / add; popcnt: ZF by source, the rest cleared
+    if op in ('cmpxchg8b', 'cmpxchg16b'): return undefined & ~ZF       # I3: ZF = equal; CF PF AF SF OF unaffected
+    # I3: a LOCK prefix (annotation `lock`) changes no flag rule: each locked form has its unlocked form's flags.
     if op in ZCNT: return (undefined & ~ALL6) | OF | SF | PF | AF
     if op in BMI_LOGIC:
         # blsi/blsmsk/blsr: CF is not compared. The pinned QEMU (7.2) leaves cc_src stale for them (BLSI src = 0 gives

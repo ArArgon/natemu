@@ -23,7 +23,8 @@ ALU = ['add', 'adc', 'sub', 'sbb', 'and', 'or', 'xor', 'cmp']
 
 
 def annotate(text, count=None):
-    """Instruction annotation for flag analysis, derived from the assembly text."""
+    """Instruction annotation for flag analysis, derived from the assembly text (I3: `lock X` is X's, plus `lock`)."""
+    if text.startswith('lock '): return annotate(text[5:], count) | {'lock': True}
     m = text.split()[0]; ops = [o.strip() for o in text[len(m):].split(',')] if len(text.split()) > 1 else []
     cc = None
     if m.startswith('set'): op, cc = 'setcc', m[3:]

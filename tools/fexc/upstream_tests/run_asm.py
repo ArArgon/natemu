@@ -41,6 +41,12 @@ PAGE = 4096
 DEFAULT_REGIONS = [(0xe0000000, 10 * PAGE), (0xe8000000 - PAGE, 2 * PAGE)]
 # RegData key -> index into the driver's GPR array (rax rcx rdx rbx rsp rbp rsi rdi r8..r15)
 GPR = {'RAX': 0, 'RCX': 1, 'RDX': 2, 'RBX': 3, 'RSP': 4, 'RBP': 5, 'RSI': 6, 'RDI': 7, **{f'R{i}': i for i in range(8, 16)}}
+# Tests whose expectations are FEX's Linux user-mode environment, not x86 semantics: FEX loads any selector unchecked,
+# returns through IRETQ/far JMP without descriptor checks and answers SGDT with a fixed GDTR. natemu executes these
+# instructions architecturally (plan S2b) against the driver's start-up descriptor tables (GDTR base 0, limit FFFFH), so the
+# selectors fault or SGDT reads other values: counted unsupported with this reason.
+OS_SEGMENTS = {'Primary/Primary_8C.asm', 'Primary/Primary_8C_2.asm', 'Primary/Primary_CF.asm', 'PrimaryGroup/5_FF_05.asm',
+               'PrimaryGroup/5_FF_05_03_o64.asm', 'PrimaryGroup/5_FF_05_03_o64_imm.asm', 'Secondary/07_XX_00.asm'}
 
 
 def header(text):
@@ -99,6 +105,8 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
         h = header(text)
         if h.get('MODE', '64BIT').upper() != '64BIT':
             return {**rec, 'outcome': 'unsupported', 'reason': '32-bit code'}
+        if name in OS_SEGMENTS:
+            return {**rec, 'outcome': 'unsupported', 'reason': "needs FEX's Linux user-mode descriptor tables"}
         rec['env'] = h.get('ENV')
         rec['host_features'] = h.get('HOSTFEATURES')
         (work / 't.asm').write_text('BITS 64\n' + text + '\nret\n')

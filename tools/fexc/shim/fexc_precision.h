@@ -15,6 +15,21 @@ inline bool GuestMemOp(FEXCore::IR::IROps Op) {
   switch (Op) {
   case OP_LOADMEM: case OP_LOADMEMTSO: case OP_STOREMEM: case OP_STOREMEMTSO: case OP_LOADMEMPAIR: case OP_STOREMEMPAIR:
   case OP_PUSH: case OP_PUSHTWO: case OP_POP: case OP_POPTWO: case OP_ATOMICSWAP: return true;
+  // LOCK read-modify-writes (I3)
+  case OP_ATOMICFETCHADD: case OP_ATOMICFETCHSUB: case OP_ATOMICFETCHAND: case OP_ATOMICFETCHCLR: case OP_ATOMICFETCHOR:
+  case OP_ATOMICFETCHXOR: case OP_ATOMICFETCHNEG: case OP_CAS: case OP_CASPAIR: return true;
+  default: return false;
+  }
+}
+// Ops whose result is loaded from guest memory by their faulting word: plain loads, and the swap and fetch-and-op atomics
+// (`swpal`, `ld<op>al`). After a synchronous abort a load's destination is UNKNOWN (DDI0487 D1.4.1.4), so register
+// allocation never prefers a static register for it (the result reaches the guest register by a move after the site).
+// CAS/CASP are not listed: their compared-and-loaded register is restored on an abort (DDI0487 C6.2 CAS, CASP).
+inline bool LoadsInto(FEXCore::IR::IROps Op) {
+  using namespace FEXCore::IR;
+  switch (Op) {
+  case OP_LOADMEM: case OP_LOADMEMTSO: case OP_ATOMICSWAP: case OP_ATOMICFETCHADD: case OP_ATOMICFETCHSUB: case OP_ATOMICFETCHAND:
+  case OP_ATOMICFETCHCLR: case OP_ATOMICFETCHOR: case OP_ATOMICFETCHXOR: return true;
   default: return false;
   }
 }
@@ -52,6 +67,15 @@ inline void Prescan(const FEXCore::IR::IRListView& IR) {
       case OP_LOADMEMPAIR: Addr = IROp->C<IROp_LoadMemPair>()->Addr; break;
       case OP_STOREMEMPAIR: Addr = IROp->C<IROp_StoreMemPair>()->Addr; break;
       case OP_ATOMICSWAP: Addr = IROp->C<IROp_AtomicSwap>()->Addr; break;
+      case OP_CAS: Addr = IROp->C<IROp_CAS>()->Addr; break;
+      case OP_CASPAIR: Addr = IROp->C<IROp_CASPair>()->Addr; break;
+      case OP_ATOMICFETCHADD: Addr = IROp->C<IROp_AtomicFetchAdd>()->Addr; break;
+      case OP_ATOMICFETCHSUB: Addr = IROp->C<IROp_AtomicFetchSub>()->Addr; break;
+      case OP_ATOMICFETCHAND: Addr = IROp->C<IROp_AtomicFetchAnd>()->Addr; break;
+      case OP_ATOMICFETCHCLR: Addr = IROp->C<IROp_AtomicFetchCLR>()->Addr; break;
+      case OP_ATOMICFETCHOR: Addr = IROp->C<IROp_AtomicFetchOr>()->Addr; break;
+      case OP_ATOMICFETCHXOR: Addr = IROp->C<IROp_AtomicFetchXor>()->Addr; break;
+      case OP_ATOMICFETCHNEG: Addr = IROp->C<IROp_AtomicFetchNeg>()->Addr; break;
       default: break;
       }
       if (!Addr.IsInvalid()) {

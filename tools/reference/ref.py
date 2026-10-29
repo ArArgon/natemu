@@ -261,7 +261,7 @@ SUFFIX = {'b': 8, 'w': 16, 'l': 32, 'q': 64}
 BRANCH_OPS = {'jcc', 'jmp', 'call', 'ret', 'loop', 'loope', 'loopne', 'jrcxz'}      # control flow: no operand width to check
 # No explicit (or only a fixed) operand: no width to check (I1).
 NO_WIDTH_OPS = {'clc', 'stc', 'cmc', 'cld', 'std', 'lahf', 'sahf', 'pushf', 'leave', 'enter', 'prefetcht0', 'prefetcht1',
-                'prefetcht2', 'prefetchnta'}
+                'prefetcht2', 'prefetchnta', 'cmpxchg8b', 'cmpxchg16b'}       # (I3: the mnemonic names cmpxchg8b/16b's width)
 
 STRING_PREFIXES = ('rep', 'repz', 'repnz', 'repe', 'repne')
 
@@ -300,7 +300,7 @@ def att_width(ann, m, ops):
     if m[-1] in SUFFIX: return SUFFIX[m[-1]]
     regs = [o for o in ops if o[1:] in WIDTH]                  # memory destination: the last register operand (I1:
     return WIDTH.get(regs[-1][1:]) if regs and ann['op'] in REG_WIDTH_OPS else None   # shld/shrd, cmpxchg, xadd, movnti)
-REG_WIDTH_OPS = {'shld', 'shrd', 'cmpxchg', 'xadd', 'movnti'}
+REG_WIDTH_OPS = {'shld', 'shrd', 'cmpxchg', 'xadd', 'movnti', 'xchg', 'bt', 'bts', 'btr', 'btc'}   # (I3: memory xchg, bt* m, r)
 
 def check_one(ann, a, m, t, prev):
     """One annotation against QEMU's disassembly (`m` mnemonic, `t` text) of the instruction at `a`; `prev` is the text of the
@@ -312,6 +312,10 @@ def check_one(ann, a, m, t, prev):
         rep = {'rep': 'rep', 'repz': 'repe', 'repe': 'repe', 'repnz': 'repne', 'repne': 'repne'}.get(word)
         require(rep == ann.get('rep'), f'annotation {ann} does not match the repeat prefix of "{t}" at {a:#x}')
         return
+    # I3: a LOCK prefix must be what the annotation says (`lock`); the rest is checked as for the unlocked form.
+    locked = t.split()[0] == 'lock'
+    require(locked == bool(ann.get('lock')), f'annotation {ann} does not match the LOCK prefix of "{t}" at {a:#x}')
+    if locked: t = t.split(None, 1)[1]; m = t.split()[0]
     require(mnemonic_ok(ann, m), f'annotation {ann} does not match disassembly "{t}" at {a:#x}')
     ops = att_operands(t)
     w = att_width(ann, m, ops)

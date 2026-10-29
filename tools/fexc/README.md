@@ -26,10 +26,27 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as fifteen commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as sixteen commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series16` (I2, October 29: string instructions.
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series18` (I3 after review, October 29: series17 plus
+`dmb ish` immediately before the `casal`/`caspal` of LOCK CMPXCHG/CMPXCHG8B/CMPXCHG16B (`fexc_lock_cas`): a failing Arm CAS
+writes nothing and is only an acquire, while x86 orders a failing locked compare. Kept for comparison: `series17` (I3, October 29: LOCK forms. Patch 0016
+and the shims: every lockable memory form with LOCK (ADD ADC SUB SBB AND OR XOR INC DEC NOT NEG BTS BTR BTC XADD CMPXCHG
+XCHG) and CMPXCHG8B/16B, locked or not, compile to FEX's LSE lowering, one acquire-release atomic each (`ldaddal`,
+`ldclral`, `ldeoral`, `ldsetal`, `casal`, `caspal`), recorded as a site of kind 13 `atomic` (`data_reg` = [Rt, Rs], write
+intent; caspal's width is both elements). LOCK NEG, which FEX lowers to a CAS loop (a native backward branch), is under
+slice1 one attempt (`FexcLockNeg`: a write-intent load site, `neg`, one `casal` site, and on a lost race a literal exit to
+the instruction's own RIP; the dispatcher completes the flags and puts CF in the exit ABI's form first) and ends its block
+like a REP string instruction. Register allocation never prefers a static register for the result of a swap or
+fetch-and-op atomic (`FexcPrecision::LoadsInto`: after an abort a load's destination is UNKNOWN; CAS/CASP restore theirs)
+and frees an unused one (LOCK NOT); a LOCK instruction neither reuses nor leaves a pooled constant (LOCK forms in long
+blocks spilled otherwise). LOCK on any form that is not lockable is a system cut ("LOCK prefix on an instruction that is
+not lockable (#UD)"), also when FEX's decoder refused the instruction (judged from its ModRM, else its opcode); the host
+names it `LOCK_UD` and the resident raises #UD. Refused (`unsupported_form`): F2/F3 with LOCK (XACQUIRE/XRELEASE, no HLE)
+and 66/F2/F3 on cmpxchg8b/16b (no SDM meaning). Objects of the 64 fixtures and the seed-4242, flow, I1, I2 and I7 corpora
+are byte-identical to series16 but one I7 program with a memory XCHG (its `swpal` result now goes through a temporary).)
+Kept for comparison: `series16` (I2, October 29: string instructions.
 Patch 0015: under slice1 MOVS/STOS/LODS/SCAS/CMPS (`FexcStringOp`) translate ONE element: its accesses (movs reads DS:RSI
 then writes ES:RDI, cmps reads [RDI] then [RSI], FEX's and the pinned QEMU's order), RSI/RDI stepped by DF from the
 registers. With REP/REPE/REPNE: `cbz x7` (RCX = 0) to the next instruction, the element, RCX - 1, then a literal exit to
@@ -116,6 +133,7 @@ Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--v
 | 0013 | slice1 I1 forms: the decoder's VEX map record, CMPXCHG/XADD without LOCK as plain read-modify-writes, LEAVE's load before RSP/RBP |
 | 0014 | slice1 no coalescing of a value stored twice to one static register (the later store was a self-move without a native write) |
 | 0015 | slice1 string instructions one element per pass (`FexcStringOp`; REP exits to its own RIP), `fexc_movs` for the site recorder |
+| 0016 | slice1 LOCK forms: LOCK NEG as one compare-and-swap attempt (`FexcLockNeg`, an exit to its own RIP on a lost race), `dmb ish` before LOCK CMPXCHG*'s CAS, swap/fetch-and-op results never preferred into a static register, no pooled constant across a LOCK instruction |
 
 Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in `shim/` and `fexc.cpp`; the patches only
 include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then
@@ -346,20 +364,24 @@ The scripts that read `fixtures/slice1/programs.json` (git-ignored; `smoke.py`, 
   (I1): popcnt, tzcnt, lzcnt (f3 0f b8/bc/bd; the CPU profile advertises POPCNT, BMI1 and LZCNT, and FEX decodes f3 0f
   bc/bd as TZCNT/LZCNT unconditionally). VEX (I1): andn, bextr, blsi/blsmsk/blsr, bzhi, mulx, rorx, sarx/shlx/shrx with
   VEX.L = 0 and no 66/REX/F2/F3/LOCK before the VEX prefix. Still cut: pdep/pext (FEX emits a native loop), prefetchw/0f 0d
-  (PREFETCHW not advertised), cmpxchg8b/16b, 16-bit shld/shrd, enter with a nesting level, LOCK forms, popf. Strings (I2):
+  (PREFETCHW not advertised), 16-bit shld/shrd, enter with a nesting level, popf. LOCK (I3): on every lockable memory form
+  (add/or/adc/sbb/and/sub/xor r/m,r and group 1 but cmp, inc/dec, not/neg, bts/btr/btc, cmpxchg, xadd, xchg), one LSE
+  atomic each (LOCK NEG: one compare-and-swap per pass, ending its block); cmpxchg8b/16b (0f c7 /1 m) with or without LOCK,
+  not with 66/F2/F3; F2/F3 with LOCK cut. Strings (I2):
   movs/cmps/stos/lods/scas (a4-a7, aa-af) at every width, alone or with REP (all five) and REPE/REPNE (cmps/scas); a REP
   form ends its block; cut: REP with REPNE, 0x67, SS on the source, and by policy (hardware repeats or ignores them) REPNE on
   movs/stos/lods and FS/GS on stos/scas.
   Branches (end the block): jcc rel8/rel32,
   jmp rel8/rel32 and near indirect, call rel32/indirect, ret, rep ret (f3 c3), ret imm16. All with no LOCK, REP/REPNE (except
-  rep ret, endbr64, pause and the strings; LOCK only on memory xchg), address-size override, and (branches) no operand-size prefix; FS/GS
+  rep ret, endbr64, pause and the strings; LOCK only on the lockable forms), address-size override, and (branches) no operand-size prefix; FS/GS
   overrides only on an explicit memory operand and alone, CS/DS/ES/SS only naming the default segment (I7); 66-prefixed bswap
   (undefined result) is cut.
 - **System class** (reason `system_instruction`): segment push/pop and moves, lss/lfs/lgs, far call/jmp/ret, iret,
   int/int3/into/icebp, ud2/ud1/ud0, popf/cli/sti, hlt, port I/O, all of 0f 00 and 0f 01 (descriptor tables, invlpg,
   swapgs, rdtscp, xgetbv, ...), lar/lsl, syscall/sysret/sysenter/sysexit, clts, invd/wbinvd, clflush, mov cr/dr, wrmsr/rdmsr/rdpmc,
-  rdtsc, cpuid, rd/wr fs/gs base, vmread/vmwrite, invept/invvpid/invpcid. Everything else outside the allowlist (the string
-  refusals above, LOCK forms but memory xchg, x87/SSE/AVX, loop/jrcxz with a 67 prefix, the I1 refusals above, ...) is `unsupported_form`.
+  rdtsc, cpuid, rd/wr fs/gs base, vmread/vmwrite, invept/invvpid/invpcid; and (I3) LOCK on any instruction that is not a
+  lockable memory form, decoded or not (#UD: the host's `LOCK_UD`). Everything else outside the allowlist (the string
+  refusals above, x87/SSE/AVX, loop/jrcxz with a 67 prefix, the I1 refusals above, ...) is `unsupported_form`.
 
 ### Native control flow inside one guest instruction
 `scan_skips.py` (and a test in `test_slice1.py`) looks, in the emitted code, for a forward branch inside one guest

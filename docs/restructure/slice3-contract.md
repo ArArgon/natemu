@@ -122,7 +122,8 @@ precise for data (nothing was written) but not for page-table bits: the write-in
 set A/D of the pages it walked, as an x86 walk does before a faulting access; and if a crossed page is absent or
 read-only that walk faults first, so the guest sees #PF, not `unsupported_atomic`. `swpal` is admitted only with Rt ≠ XZR
 (with the result discarded the architecture drops its acquire semantics; FEX never emits that form). Split locks,
-LOCK ADD/CMPXCHG/XADD/BT* and CMPXCHG16B wait for the boot phase.
+LOCK ADD/CMPXCHG/XADD/BT* and CMPXCHG16B wait for the boot phase (built in I3, boot-features plan, Built (I3): every LOCK
+form one LSE atomic at an `atomic` site; LOCKed accesses crossing 16 bytes keep this stop, owner decision).
 
 ## 3. Covering the old specialized paths
 "Delete": the family code, host driver, runner, checker and worker go; the independent models (`i4v_ordering_model`,

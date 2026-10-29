@@ -560,7 +560,8 @@ impl Compiler {
                 1 => {
                     let json = crate::json::parse(&String::from_utf8_lossy(&json))?;
                     let reason = end_reason(&json).ok_or("fexc report without guest.end.reason")?;
-                    match system_cut(&json, rip).and_then(|(map, opcode)| crate::system::decode(bytes, map, opcode)) {
+                    let decoded = |(map, opcode)| crate::system::decode(bytes, map, opcode).or_else(|| crate::system::lock_ud(bytes));
+                    match system_cut(&json, rip).and_then(decoded) {
                         Some(s) if reason == "system_instruction" => Compiled::System(s),
                         _ => Compiled::NoCode(reason.into()),
                     }
@@ -896,7 +897,7 @@ mod tests {
         let ram = guest_ram(&memory);
         assert!(ram.copy_in(0x5ff0, &[0xaa; 16]) && ram.copy_in(0x9000, &[0xbb; 16]));
         let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0 };
-        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1ff0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET });
+        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1ff0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0 });
         s.fetch = [0x5000, u64::MAX];
         let f = fetched(area, &s, None).unwrap().unwrap();
         assert_eq!((f.bytes, f.more, f.next_fault), (vec![0xaa; 16], true, None));

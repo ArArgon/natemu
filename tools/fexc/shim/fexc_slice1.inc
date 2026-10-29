@@ -98,7 +98,10 @@ inline Verdict Two(uint8_t op, bool plain, bool has_modrm, uint8_t mod, uint8_t 
   switch (op) {
   case 0x1F: return Allow();                                        // multi-byte nop
   case 0xA4: case 0xA5: case 0xAC: case 0xAD: return Allow();       // shld/shrd (16-bit refused below)
-  case 0xB0: case 0xB1: case 0xC0: case 0xC1: return Allow();       // cmpxchg/xadd (LOCK refused below: chunk I3)
+  case 0xB0: case 0xB1: case 0xC0: case 0xC1: return Allow();       // cmpxchg/xadd, with or without LOCK (I3)
+  // cmpxchg8b/16b (I3): FEX's caspal with or without LOCK (an unlocked one is atomic too, which x86 allows); the other
+  // group-9 forms (rdrand, rdseed, rdpid, vmptrld...) are not admitted.
+  case 0xC7: return has_modrm && mod != 3 && reg == 1 ? Allow() : Uns("group 9 other than cmpxchg8b/16b m");
   case 0x18: return has_modrm && mod != 3 && reg <= 3 ? Allow() : Uns("0f 18 other than prefetchnta/t0/t1/t2 m8");
   case 0xC3: return has_modrm && mod != 3 ? Allow() : Uns("movnti with a register operand");
   case 0x0D: return Uns("prefetchw/0f 0d: PREFETCHW is not advertised (cpu_profile 0x80000001.ecx.8)");
@@ -136,11 +139,41 @@ inline Verdict Vex(uint8_t vex, uint8_t op, bool has_modrm, uint8_t reg) {
   return Uns("VEX form other than BMI1/BMI2 (AVX: chunk I8)");
 }
 
+// LOCK (SDM Vol.2 "LOCK"): allowed only on the memory-destination forms of ADD, ADC, AND, BTC, BTR, BTS, CMPXCHG,
+// CMPXCHG8B/16B, DEC, INC, NEG, NOT, OR, SBB, SUB, XOR, XADD and XCHG; on any other instruction, or one of these with a
+// register destination, it raises #UD.
+// Without a ModRM (`opcode_only`: FEX's decoder failed before it), whether some lockable form has this opcode.
+inline bool Lockable(const DecodedInst& d, bool has_modrm, uint8_t mod, uint8_t reg, bool opcode_only = false) {
+  const uint8_t op = d.OPRaw;
+  if (opcode_only)
+    return d.FexcMap == FEXC_MAP_PRIMARY ? (op < 0x38 && (op & 7) <= 1) || op == 0x80 || op == 0x81 || op == 0x83 || op == 0x86 ||
+                                             op == 0x87 || op == 0xF6 || op == 0xF7 || op == 0xFE || op == 0xFF
+         : d.FexcMap == FEXC_MAP_TWO && (op == 0xAB || op == 0xB3 || op == 0xBB || op == 0xBA || op == 0xB0 || op == 0xB1 ||
+                                         op == 0xC0 || op == 0xC1 || op == 0xC7);
+  if (!has_modrm || mod == 3) return false;
+  if (d.FexcMap == FEXC_MAP_PRIMARY)
+    return (op < 0x38 && (op & 7) <= 1) ||                                    // add/or/adc/sbb/and/sub/xor r/m, r
+           ((op == 0x80 || op == 0x81 || op == 0x83) && reg != 7) ||          // group 1 but cmp
+           op == 0x86 || op == 0x87 ||                                       // xchg
+           ((op == 0xF6 || op == 0xF7) && (reg == 2 || reg == 3)) ||         // not, neg
+           ((op == 0xFE || op == 0xFF) && reg <= 1);                         // inc, dec
+  if (d.FexcMap == FEXC_MAP_TWO)
+    return op == 0xAB || op == 0xB3 || op == 0xBB || (op == 0xBA && reg >= 5) ||   // bts/btr/btc r/m, r and /5../7 imm8
+           op == 0xB0 || op == 0xB1 || op == 0xC0 || op == 0xC1 || (op == 0xC7 && reg == 1);   // cmpxchg, xadd, cmpxchg8b/16b
+  return false;
+}
+
 inline Verdict Classify(const DecodedInst& d, bool decoded) {
   const bool has_modrm = d.Flags & DecodeFlags::FLAG_DECODED_MODRM;
   const uint8_t mod = d.ModRM >> 6, reg = (d.ModRM >> 3) & 7;
   const uint8_t op = d.OPRaw;
   const uint32_t f = d.Flags;
+  // LOCK on a form that is not lockable: #UD, whatever the instruction (I3). A system cut, which the host decodes as a LOCK
+  // #UD and the resident raises (a guest fault until delivery is built). FEX's decoder refuses many such forms itself (it
+  // fails on LOCK with a register operand or a non-lockable opcode); after a failure the form is known not lockable from
+  // its ModRM when that was decoded, else only from an opcode no lockable form has.
+  if ((f & DecodeFlags::FLAG_LOCK) && (decoded || has_modrm ? !Lockable(d, has_modrm, mod, reg) : !Lockable(d, false, 0, 0, true)))
+    return Sys("LOCK prefix on an instruction that is not lockable (#UD)");
   Verdict v;
   switch (d.FexcMap) {
   case FEXC_MAP_PRIMARY: v = Primary(op, has_modrm, mod, reg); break;
@@ -171,8 +204,9 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   }
   if (!decoded) return Uns("did not decode");
   const bool primary = d.FexcMap == FEXC_MAP_PRIMARY;
-  // LOCK only on memory xchg (implicitly locked anyway; on a register form LOCK is #UD).
-  if ((f & DecodeFlags::FLAG_LOCK) && !(primary && (op == 0x86 || op == 0x87) && mod != 3)) return Uns("LOCK prefix");
+  // LOCK (I3): admitted on every lockable form (the others are cut above as #UD). FEX lowers each to one LSE atomic (LOCK NEG:
+  // one compare-and-swap per pass, patch 0016). 66 on cmpxchg8b/16b is refused by policy (the SDM gives it no meaning).
+  if (d.FexcMap == FEXC_MAP_TWO && op == 0xC7 && (f & DecodeFlags::FLAG_OPERAND_SIZE)) return Uns("operand-size prefix on cmpxchg8b/16b");
   // String instructions (I2): REP (F3) on all five, REPE (F3) and REPNE (F2) on cmps/scas. Refused: both prefixes together,
   // and by policy F2 on movs/stos/lods (hardware repeats as with REP; the SDM calls it reserved).
   const bool string = primary && ((op >= 0xA4 && op <= 0xA7) || (op >= 0xAA && op <= 0xAF));
@@ -248,10 +282,10 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
 // instruction (and, mid-block, to let FEX end the block at a decoder end-of-input status with its own reason).
 inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, bool first, const DecodedInst& d, uint64_t rip) {
   using S = Frontend::Decoder::DecodedBlockStatus;
-  // A REP string instruction ends its block (I2): the next instruction starts the next block.
+  // A REP string instruction (I2) or a LOCK NEG (I3) ends its block: the next instruction starts the next block.
   if (first) fexc_after_rep = 0;
   if (!first && rip == fexc_after_rep) {
-    fexc_cut = {FEXC_CUT_STRING, rip, d.FexcMap, d.OPRaw, d.ModRM, false, "?", "after a REP string instruction"};
+    fexc_cut = {FEXC_CUT_STRING, rip, d.FexcMap, d.OPRaw, d.ModRM, false, "?", "after a self-exiting instruction (REP string, LOCK NEG)"};
     return true;
   }
   const bool failed = last && status != S::SUCCESS;
@@ -272,6 +306,10 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
     const uint64_t target = rip + d.InstSize + d.Src[0].Literal();
     const bool string = d.FexcMap == FEXC_MAP_PRIMARY && ((op >= 0xA4 && op <= 0xA7) || (op >= 0xAA && op <= 0xAF));
     if (string && (d.Flags & (DecodeFlags::FLAG_REP_PREFIX | DecodeFlags::FLAG_REPNE_PREFIX))) fexc_after_rep = rip + d.InstSize;
+    // LOCK NEG m (I3, patch 0016) exits to its own RIP when its compare-and-swap loses a race: it ends its block too.
+    const bool lock_neg = d.FexcMap == FEXC_MAP_PRIMARY && (op == 0xF6 || op == 0xF7) && ((d.ModRM >> 3) & 7) == 3 &&
+                          (d.Flags & DecodeFlags::FLAG_LOCK);
+    if (lock_neg) fexc_after_rep = rip + d.InstSize;
     if (!rel || uint64_t(int64_t(target << 16) >> 16) == target) return false;
     v = Uns("direct branch to a non-canonical target");
   }

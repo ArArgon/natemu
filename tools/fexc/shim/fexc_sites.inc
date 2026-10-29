@@ -56,9 +56,8 @@ bool FexcIsOtherMemoryOp(std::string_view n) {
   // Guest-memory IR ops with no site description; the producer must refuse them (contract: unsupported_form).
   static constexpr std::string_view names[] = {"VLoadVectorMasked", "VStoreVectorMasked", "VLoadVectorGatherMasked",
     "VLoadVectorGatherMaskedQPS", "VLoadVectorElement", "VStoreVectorElement", "VBroadcastFromMem", "StoreMemX87SVEOptPredicate",
-    "LoadMemX87SVEOptPredicate", "MemSet", "MemCpy", "VStoreNonTemporal", "VStoreNonTemporalPair", "VLoadNonTemporal", "CAS",
-    "CASPair", "AtomicFetchAdd", "AtomicFetchSub", "AtomicFetchAnd", "AtomicFetchCLR", "AtomicFetchOr",
-    "AtomicFetchXor", "AtomicFetchNeg", "CacheLineClear", "CacheLineClean", "CacheLineZero"};
+    "LoadMemX87SVEOptPredicate", "MemSet", "MemCpy", "VStoreNonTemporal", "VStoreNonTemporalPair", "VLoadNonTemporal",
+    "AtomicFetchNeg", "CacheLineClear", "CacheLineClean", "CacheLineZero"};   // AtomicFetchNeg: a CAS loop (slice1: patch 0016)
   for (auto s : names) if (s == n) return true;
   return false;
 }
@@ -194,6 +193,29 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
     S.kind = FEXC_SITE_SWAP; S.width = Size; S.intent = 1;
     break;
   }
+  // LOCK read-modify-writes (I3), one LSE word each with SupportsAtomics: `ld{add,clr,eor,set}al Rs, Rt, [Rn]`, `casal Rs,
+  // Rt, [Rn]`, `caspal Rs, Rs+1, Rt, Rt+1, [Rn]` (CMPXCHG8B/16B: both elements). A write access that commits nothing if it
+  // aborts; an operand crossing 16 bytes takes an alignment fault there (LSE2; caspal of two X registers: unless 16-aligned).
+  case IROps::OP_ATOMICFETCHADD: case IROps::OP_ATOMICFETCHSUB: case IROps::OP_ATOMICFETCHAND: case IROps::OP_ATOMICFETCHCLR:
+  case IROps::OP_ATOMICFETCHOR: case IROps::OP_ATOMICFETCHXOR: case IROps::OP_CAS:
+    S.kind = FEXC_SITE_ATOMIC; S.width = Size; S.intent = 1;
+    break;
+  case IROps::OP_CASPAIR:
+    S.kind = FEXC_SITE_ATOMIC; S.width = uint8_t(2 * IR::OpSizeToSize(IROp->ElementSize)); S.intent = 1;
+    break;
+  case IROps::OP_ATOMICFETCHNEG: {
+    if (!fexc_slice1) { S.kind = FEXC_SITE_OTHER; break; }   // FEX's CAS loop
+    // FexcLockNeg: `ldr` (the read-modify-write load, recorded here) then `casal` (the atomic site, found below).
+    FexcSiteInfo L = S;
+    uint32_t w;
+    std::memcpy(&w, CodeData.BlockBegin + FexcNegLoad, 4);
+    L.kind = FEXC_SITE_LOAD; L.width = Size; L.native_offset = FexcNegLoad; L.located = 1;
+    L.base_reg = uint8_t((w >> 5) & 31); L.data_reg[0] = uint8_t(w & 31); L.imm = 0;
+    FexcLoadSite = int(fexc_sites.size());
+    fexc_sites.push_back(L);
+    S.kind = FEXC_SITE_ATOMIC; S.width = Size; S.intent = 1;
+    break;
+  }
   default:
     Record = false;
     if (FexcIsNzcvWriter(Name) || (fexc_slice1 && IR::ImplicitFlagClobber(IROp->Op))) FexcNzcvWritten = true;
@@ -216,7 +238,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
     // The transfer register(s) actually encoded (e.g. a push of the base register stores a TMP copy in the default profile).
     S.data_reg[0] = uint8_t(w & 31);
     if (((w >> 27) & 7) == 5) S.data_reg[1] = uint8_t((w >> 10) & 31);
-    if (S.kind == FEXC_SITE_SWAP) S.data_reg[1] = uint8_t((w >> 16) & 31);   // Rs
+    if (S.kind == FEXC_SITE_SWAP || S.kind == FEXC_SITE_ATOMIC) S.data_reg[1] = uint8_t((w >> 16) & 31);   // Rs
     const FexcAddr A = FexcDecodeAddr(w);
     if (A.imm_form) { S.imm = A.imm; S.index_reg = 0xff; S.extend = 0; S.shift = 0; S.writeback = A.wb; S.writeback_delta = A.delta; }
     break;
@@ -229,15 +251,16 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
   // an instruction that also has a plain store site is the RMW load and must be walked with write intent
   // (x86 reports such a fault as a write). Valid because the admitted instructions have at most one explicit
   // memory operand, but MOVS (I2: its load reads DS:RSI, its store writes ES:RDI); implicit stack accesses are
-  // push/pop kinds and never match.
+  // push/pop kinds and never match. LOCK NEG (I3) loads, then compare-and-swaps the same operand: the same pair.
   const int Index = int(fexc_sites.size());
   if (S.kind == FEXC_SITE_LOAD) { FexcLoadSite = Index; }
-  else if (S.kind == FEXC_SITE_STORE && FexcLoadSite >= 0 && fexc_sites[FexcLoadSite].width == S.width && !fexc_movs.count(Entry + FexcGuest)) {
+  else if ((S.kind == FEXC_SITE_STORE || S.kind == FEXC_SITE_ATOMIC) && FexcLoadSite >= 0 && fexc_sites[FexcLoadSite].width == S.width &&
+           !fexc_movs.count(Entry + FexcGuest)) {
     fexc_sites[FexcLoadSite].rmw = 1; fexc_sites[FexcLoadSite].intent = 1; S.rmw = 2;
   }
   if (S.kind == FEXC_SITE_PUSH_PAIR || S.kind == FEXC_SITE_POP_PAIR) FexcPendingFused.push_back(size_t(Index));
   if (S.kind == FEXC_SITE_STORE || S.kind == FEXC_SITE_STORE_PAIR || S.kind == FEXC_SITE_PUSH || S.kind == FEXC_SITE_PUSH_PAIR ||
-      S.kind == FEXC_SITE_OTHER || S.kind == FEXC_SITE_SWAP) FexcStoreSeen = true;
+      S.kind == FEXC_SITE_OTHER || S.kind == FEXC_SITE_SWAP || S.kind == FEXC_SITE_ATOMIC) FexcStoreSeen = true;
   fexc_sites.push_back(S);
 }
 
@@ -333,7 +356,7 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   case IROps::OP_POP: { const auto Op = IROp->C<IR::IROp_Pop>(); Addr = &Op->InoutAddr; W = IR::OpSizeToSize(Op->Size); break; }
   // Memory xchg: no split check: an operand crossing 16 bytes (a page included) takes an alignment fault at the swap
   // itself, before any effect (LSE2), which the runtime stops as unsupported.
-  case IROps::OP_ATOMICSWAP: return;
+  case IROps::OP_ATOMICSWAP: return;   // likewise every LOCK atomic (I3; the default case)
   case IROps::OP_UDIV: case IROps::OP_DIV: FexcDivCheck(IROp); return;
   default: return;
   }
@@ -452,6 +475,36 @@ void Arm64JITCore::FexcDivCheck(const IR::IROp_Header* IROp) {
     sub(S, TMP1, TMP1, TMP1, Sxt);
     cbnz_OrRestart(S, TMP1, Stub());
   }
+}
+
+// LOCK NEG m (I3, patch 0016). FEX lowers AtomicFetchNeg to a compare-and-swap loop, a native backward branch that admission
+// refuses and the unlinking stop could not interrupt. Under slice1: ONE attempt; a lost race leaves through a literal exit to
+// the instruction's own RIP, where the next pass starts (the instruction ends its block, FexcSlice1::Cut). Only x0-x3 are
+// written before that exit and the dispatcher completed the flags and put CF in the exit ABI's form first, so the exit holds
+// exactly the state before the instruction, as its two sites do:
+//   ldr   x1, [A]            load site, the read-modify-write load (write intent)
+//   neg   x2, x1; mov x3, x1
+//   casal x1, x2, [A]        atomic site: x1 := memory; -x1 stored iff memory still held x1 (acquire + release)
+//   sub   x2, x1, x3; cbz x2, done
+//   movz/movk x0, #RIP; svc #LINK                lost the race: retry
+// done: mov Dst, x1          the old value (the dispatcher computes NEG's flags from it)
+void Arm64JITCore::FexcLockNeg(const IR::IROp_Header* IROp, IR::Ref Node) {
+  const auto Op = IROp->C<IR::IROp_AtomicFetchNeg>();
+  const auto EmitSize = ConvertSize(IROp);
+  const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+  const auto MemSrc = GetReg(Op->Addr);
+  FexcNegLoad = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
+  ldr(SubEmitSize, TMP2, MemSrc);
+  neg(EmitSize, TMP3, TMP2);
+  mov(EmitSize, TMP4, TMP2);
+  casal(SubEmitSize, TMP2, TMP3, MemSrc);
+  sub(EmitSize, TMP3, TMP2, TMP4);
+  ARMEmitter::ForwardLabel Done;
+  (void)cbz(EmitSize, TMP3, &Done);
+  InsertGuestRIPMove(TMP1, Entry + FexcGuest);
+  svc(FEXC_SVC_LINK);
+  (void)Bind(&Done);
+  mov(EmitSize, GetReg(Node), TMP2.R());
 }
 
 // A computed exit (its RIP already in x0) branches to the resident's dispatcher: a placeholder `b .` the resident

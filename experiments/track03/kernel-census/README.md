@@ -31,6 +31,13 @@ String class: kernel 5,725 → 0 (decompressor 23, vmlinux `.text` 5,014, `.init
 initramfs init chain 349 → 0, other executables 1,616 → 0, other libraries 1,004 → 0. Every one moved to admitted (each
 region's admitted count rose by exactly its string count); `rep ins/outs` stay `system` (port I/O, chunk L3).
 
+**I3 re-check (October 29).** `census.py` ports the I3 LOCK rules (fexc series17: LOCK on every lockable memory form, one
+LSE atomic each; LOCK elsewhere is #UD, still counted `LOCK`; CMPXCHG8B/16B locked or not, never with 66/F2/F3). Rerun into
+`natemu-raw/kernel-census-i3-20261029-01/` (`x` linked to the C0 data; report in its `report/`). LOCK class: kernel
+(decompressor + vmlinux) 10,020 → 0, initramfs 1,385 → 0; small-int kernel 36 → 17 (the 19 `cmpxchg16b` admitted; the 17
+`prefetchw` stay). Every one moved to admitted (kernel admitted +10,039, initramfs +1,385); no LOCK on a form that is not
+lockable occurs. Whether an operand crosses 16 bytes (the `unsupported_atomic` stop) is not decidable statically.
+
 Files here: `extract.py`, `census.py`, `report.py`, `results.md` (every table, generated), `forms-kernel.tsv` (every refused
 form of the decompressor and vmlinux, one row per mnemonic + operand shape, first-use order). The same for the
 initramfs is `RAW/forms-initrd.tsv`; `RAW/census.json` holds every row.

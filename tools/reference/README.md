@@ -71,6 +71,13 @@ The tool checks final RIP = `rip+len(code)`, and QEMU's `-d in_asm` log must sho
     against QEMU's disassembly (`rep`, `repz`, `repnz`) instead of the operand width (the generator writes the width into
     the mnemonic). QEMU ends a block at a REP string instruction and translates it again as the next block's start, so
     the straight-line cross-check takes each translated address once (`disasm`).
+  - I3 (`gen_i3.py`): a LOCK prefix changes no flag rule (each locked form has its unlocked form's flags); an annotation
+    `lock: true` must match a `lock` prefix in QEMU's disassembly (and its absence the absence of one); cmpxchg8b/16b define
+    ZF only (the rest unaffected) and carry no width check (the mnemonic names it). The pinned QEMU (7.2) computes
+    cmpxchg8b/16b's other flags from a stale lazy-flag state when an earlier instruction of the same translation block set
+    them (`mov eax, 0xff; mul al; cmpxchg8b m; sbb m, r8d`: QEMU subtracts no borrow; Rosetta 2, the SDM and natemu keep
+    MUL's CF = 1), and crashes on `mul al; cmpxchg8b m; setb`; the I3 generator puts `pushfq` (which makes QEMU store that
+    state) right before every cmpxchg8b/16b and pops the slot after.
   State is carried forward: a later instruction that writes a flag defines it again. An instruction reading an undefined
   flag (adc/sbb/setcc/cmovcc) is rejected, because the undefined value would flow into registers; the generator inserts a
   `cmp` first. `rflags_compare_mask = 0xcd5 & ~undefined_flags` (0x8d5 before I1: DF was not compared).

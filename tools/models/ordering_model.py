@@ -8,7 +8,12 @@ flush steps make its oldest store globally visible. Loads forward the youngest
 same-location buffered store, otherwise read the one shared coherent memory.
 MFENCE drains the issuing buffer. Implicit-locked XCHG drains that buffer and
 has one globally ordered indivisible memory/register effect. No other CPU's
-buffer is drained merely because a fence or XCHG executes.
+buffer is drained merely because a fence or XCHG executes. A LOCKed
+read-modify-write (I3: `rmw`, e.g. LOCK XADD/ADD/OR/AND/XOR/CMPXCHG) is the same
+kind of event as XCHG (the same section: "locked instructions have a total
+order"; "reads and writes are not reordered with locked instructions"): it may execute only with its own buffer empty, then reads the
+shared memory word and writes its new value in one indivisible step (the write
+is globally visible at once, never buffered); its register gets the old word.
 
 This is an explicit finite reference, not herd, a universal x86 proof, an Arm
 model, a probability model, or a model of guest translation/device effects.
@@ -35,8 +40,11 @@ def word(value, name='word'):
 class Litmus:
     name: str
     # Operations: ('load', destination, address), ('store', address, value),
-    # ('fence',), ('xchg', destination, address, input_value). Values are u32
-    # constants or names of registers written earlier by the same participant.
+    # ('fence',), ('xchg', destination, address, input_value),
+    # ('rmw', destination | None, address, function, operand): a LOCKed
+    # read-modify-write, `function` in RMW_FUNCTIONS (operand a u32, or for 'cas'
+    # a pair (expected, desired)); destination None discards the old word. Values
+    # are u32 constants or names of registers written earlier by the same participant.
     # Outputs: (participant, register), or ('final', address): the word's value once everything finished and
     # every buffered store reached memory (2+2W, exchange chains).
     programs: tuple
@@ -78,6 +86,17 @@ PROFILES = {
 }
 
 
+# new word of a LOCKed read-modify-write from (old word, operand); 'cas' stores `desired` iff old == `expected`.
+RMW_FUNCTIONS = {
+    'add': lambda old, v: (old + v) & 0xffffffff,
+    'and': lambda old, v: old & v,
+    'or': lambda old, v: old | v,
+    'xor': lambda old, v: old ^ v,
+    'neg': lambda old, v: -old & 0xffffffff,
+    'cas': lambda old, v: v[1] if old == v[0] else old,
+}
+
+
 def profile(test):
     if type(test) is str:
         require(test in PROFILES, 'unknown finite ordering profile')
@@ -103,9 +122,23 @@ def validate(test):
         for op in program:
             require(type(op) is tuple and bool(op), 'tuple operation')
             kind = op[0]
-            require(kind in ('load', 'store', 'fence', 'xchg'), 'unsupported operation')
-            require(len(op) == {'load': 3, 'store': 3, 'fence': 1, 'xchg': 4}[kind], 'operation shape')
+            require(kind in ('load', 'store', 'fence', 'xchg', 'rmw'), 'unsupported operation')
+            require(len(op) == {'load': 3, 'store': 3, 'fence': 1, 'xchg': 4, 'rmw': 5}[kind], 'operation shape')
             if kind == 'fence':
+                continue
+            if kind == 'rmw':
+                require(op[2] in memory, 'operation addresses declared RAM word')
+                require(op[3] in RMW_FUNCTIONS, 'unsupported read-modify-write function')
+                operand = op[4]
+                if op[3] == 'cas':
+                    require(type(operand) is tuple and len(operand) == 2, 'cas operand is (expected, desired)')
+                    for value in operand:
+                        word(value, 'cas operand')
+                else:
+                    word(operand, 'read-modify-write operand')
+                if op[1] is not None:
+                    require(type(op[1]) is str and bool(op[1]), 'named result register')
+                    defined.add(op[1])
                 continue
             address = op[1] if kind == 'store' else op[2]
             require(address in memory, 'operation addresses declared RAM word')
@@ -167,10 +200,18 @@ def _transitions(test, state, addresses, register_names):
         op = program[pc]
         kind = op[0]
         buffer = state.buffers[cpu]
-        if kind in ('fence', 'xchg') and buffer:
+        if kind in ('fence', 'xchg', 'rmw') and buffer:
             continue
         memory, buffers, registers = state.memory, state.buffers, state.registers
-        if kind != 'fence':
+        if kind == 'rmw':
+            # One indivisible step with an empty own buffer: read the shared word, write the new one (no buffering).
+            address = addresses.index(op[2])
+            old = memory[address]
+            memory = replace_at(memory, address, RMW_FUNCTIONS[op[3]](old, op[4]))
+            if op[1] is not None:
+                index = register_names[cpu].index(op[1])
+                registers = replace_at(registers, cpu, replace_at(registers[cpu], index, old))
+        elif kind != 'fence':
             address = addresses.index(op[1] if kind == 'store' else op[2])
             if kind in ('store', 'xchg'):
                 value = (registers[cpu][register_names[cpu].index(op[-1])]

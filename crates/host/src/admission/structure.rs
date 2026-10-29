@@ -13,7 +13,8 @@
 //!   `#DIV_S`; direct branches go forward to a word of the code region; no word falls through into a literal slot, a
 //!   check stub or past the region. So every path ends at an exit the resident knows (a link point or the dispatch
 //!   branch, which a precise stop patches) or at a check stub.
-//! - Sites: each access site lies inside its guest instruction and its word is a load, store or swap exactly as recorded
+//! - Sites: each access site lies inside its guest instruction and its word is a load, store, swap or LOCK atomic
+//!   (`ld{add,clr,eor,set}al`, `casal`, `caspal`) exactly as recorded
 //!   (the resident computes the faulting address and completes split stores from the record).
 //! - Exits: a literal exit is a link point, exactly a guest-RIP move into x0 then `svc #LINK`, its value the block end
 //!   or the decoded target of its branch, and no branch enters it after its first word (the linker rewrites that word
@@ -26,7 +27,8 @@
 //! **Code shape (debug, `Code::shape`; off by default, on in the test suites):** that fexc emitted the x86 checks
 //! exactly and nothing else, a producer-correctness check whose violation stays confined to the vCPU's guest.
 //! - Words: only the decoded classes (no system, SIMD, `ret`, `bl`, `br` or `blr` word; `brk` only at stubs); sp is
-//!   neither written nor accessed; no literal loads; every load and store is an access site; a swap keeps its result.
+//!   neither written nor accessed; no literal loads; every load and store is an access site; a swap or fetch-and-op
+//!   atomic keeps its result (with XZR there the architecture drops the acquire).
 //! - Split: every store wider than one byte has `add x0, xA, #w-1; eor x0, x0, xA; tbnz w0, #12, S` on exactly its
 //!   address (xA its base, or x1 computed as exactly its address: `add|sub x1, base, #imm`, `add x1, base, index{, ext
 //!   #s}`, or a mov/movk constant into x1 and `add x1, base, x1`), only x0/x1 written between it and the store
@@ -83,6 +85,13 @@ enum Insn {
     Mem(Mem),
     /// `swpal{b,h} Rs, Rt, [Rn]` (a memory XCHG): `size` bytes at Rn (no offset), Rt receives the old value.
     Swap { size: u8, rs: u8, rt: u8, rn: u8 },
+    /// A LOCK read-modify-write (I3), acquire and release: `ld{add,clr,eor,set}al{b,h} Rs, Rt, [Rn]` (Rt receives the old
+    /// value), `casal{b,h} Rs, Rt, [Rn]` (Rs compared and receives the old value) or `caspal Rs, Rs+1, Rt, Rt+1, [Rn]`
+    /// (even pairs; `size` is both elements). No offset.
+    Atomic { op: AtomicOp, size: u8, rs: u8, rt: u8, rn: u8 },
+    /// `dmb ish`: only right before the casal/caspal of a LOCK CMPXCHG / CMPXCHG8B / CMPXCHG16B (I3: x86 orders a locked
+    /// compare that fails, while a failing Arm CAS writes nothing and has only acquire semantics).
+    DmbIsh,
     /// `ldr xT, label` (refused).
     Literal { rt: u8 },
     B(i64),
@@ -107,7 +116,9 @@ impl Insn {
                 let wb = if matches!(m.form, Form::Pre | Form::Post) { 1 << m.addr.base } else { 0 };
                 wb | if m.load { bit(m.rt) } else { 0 }
             }
-            Insn::Literal { rt, .. } | Insn::Swap { rt, .. } => bit(rt),
+            Insn::Literal { rt, .. } | Insn::Swap { rt, .. } | Insn::Atomic { op: AtomicOp::Fetch, rt, .. } => bit(rt),
+            Insn::Atomic { op: AtomicOp::Cas, rs, .. } => bit(rs),
+            Insn::Atomic { op: AtomicOp::Casp, rs, .. } => bit(rs) | bit(rs + 1),
             Insn::Svc(svc::DIV_U | svc::DIV_S) => 0b111, // the division's contract: x0-x2 change
             _ => 0,
         }
@@ -115,6 +126,13 @@ impl Insn {
     fn falls_through(&self) -> bool {
         !matches!(self, Insn::B(_) | Insn::Dispatch | Insn::Svc(svc::LINK) | Insn::Brk | Insn::Udf)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AtomicOp {
+    Fetch,
+    Cas,
+    Casp,
 }
 
 fn sext(v: u32, bits: u32) -> i64 {
@@ -139,9 +157,24 @@ fn decode(w: u32, at: u32) -> Option<Insn> {
         // The ordering words and hints FEX emits for x86 instructions (S3e): exactly these.
         0xd503_3dbf | 0xd503_3fbf | 0xd503_3ebf => Data(None), // dmb ld (LFENCE), dmb sy (MFENCE), dmb st (SFENCE)
         0xd503_203f => Data(None),                             // yield (PAUSE)
+        0xd503_3bbf => DmbIsh,                                 // dmb ish (LOCK CMPXCHG*, checked by `words`)
         _ if w & 0x3fe0_fc00 == 0x38e0_8000 => {
             let reg = |shift: u32| (w >> shift & 31) as u8;
             Swap { size: 1 << (w >> 30), rs: reg(16), rt: reg(0), rn: reg(5) } // swpal{b,h,,x}
+        }
+        // LOCK atomics (I3), exactly the acquire-release forms FEX emits with LSE: ldaddal, ldclral, ldeoral, ldsetal (opc
+        // 0xx, o3 = 0), casal, caspal (even pairs: odd ones are UNDEFINED).
+        _ if w & 0x3fe0_cc00 == 0x38e0_0000 => {
+            let reg = |shift: u32| (w >> shift & 31) as u8;
+            Atomic { op: AtomicOp::Fetch, size: 1 << (w >> 30), rs: reg(16), rt: reg(0), rn: reg(5) }
+        }
+        _ if w & 0x3fe0_fc00 == 0x08e0_fc00 => {
+            let reg = |shift: u32| (w >> shift & 31) as u8;
+            Atomic { op: AtomicOp::Cas, size: 1 << (w >> 30), rs: reg(16), rt: reg(0), rn: reg(5) }
+        }
+        _ if w & 0xbfe0_fc00 == 0x0860_fc00 && w >> 16 & 1 == 0 && w & 1 == 0 => {
+            let reg = |shift: u32| (w >> shift & 31) as u8;
+            Atomic { op: AtomicOp::Casp, size: 8 << (w >> 30 & 1), rs: reg(16), rt: reg(0), rn: reg(5) }
         }
         _ if w & 0xffff_ffe0 == 0xd53b_4200 => Data(zr(rd)), // mrs xT, nzcv
         _ if w & 0xffff_ffe0 == 0xd51b_4200 => Data(None),   // msr nzcv, xT
@@ -434,6 +467,12 @@ impl<'a> Verifier<'a> {
         Some((p.guest_offset, p.native_offset))
     }
     /// The guest bytes of the instruction at guest offset `g`.
+    /// The word at `at` is the casal/caspal site of a LOCK CMPXCHG, CMPXCHG8B or CMPXCHG16B (the guest bytes say so).
+    fn lock_cas(&self, at: u32) -> bool {
+        let site = self.c.accesses.binary_search_by_key(&at, |s| s.native_offset).ok().map(|i| &self.c.accesses[i]);
+        matches!(self.insn(at), Some(Insn::Atomic { op: AtomicOp::Cas | AtomicOp::Casp, .. }))
+            && site.is_some_and(|s| s.kind == object::kind::ATOMIC && lock_cmpxchg(self.guest_insn(s.guest_offset)))
+    }
     fn guest_insn(&self, g: u32) -> &[u8] {
         let end = (self.c.pcs.iter().map(|p| p.guest_offset).filter(|&o| o > g).min()).unwrap_or(self.c.guest_bytes);
         &self.c.source[g as usize..end as usize]
@@ -521,6 +560,17 @@ impl<'a> Verifier<'a> {
                 // With Rt = XZR, SWPAL is not an acquire (the architecture drops the load-acquire when the result is discarded).
                 Insn::Swap { rt: 31, .. } if shape => return fail(at, "swap discards its result (Rt is XZR): no acquire semantics"),
                 Insn::Swap { .. } if shape && !site(at) => return fail(at, "swap that is not a swap site"),
+                Insn::Atomic { rn: 28, .. } => return fail(at, "frame access by an atomic"),
+                // A fetch-and-op or CAS whose result is XZR is not an acquire (as for SWPAL); FEX never emits one.
+                Insn::Atomic { op: AtomicOp::Fetch, rt: 31, .. } | Insn::Atomic { op: AtomicOp::Cas, rs: 31, .. } if shape => {
+                    return fail(at, "atomic discards its result (XZR): no acquire semantics")
+                }
+                Insn::Atomic { .. } if shape && !site(at) => return fail(at, "atomic that is not an atomic site"),
+                // A barrier only right before the CAS of a LOCK CMPXCHG*; and (code shape) every such CAS has it.
+                Insn::DmbIsh if !self.lock_cas(at + 4) => return fail(at, "dmb ish that is not right before a LOCK CMPXCHG's CAS"),
+                Insn::Atomic { op: AtomicOp::Cas | AtomicOp::Casp, .. } if shape && self.lock_cas(at) && !matches!(self.insn(at - 4), Some(Insn::DmbIsh)) => {
+                    return fail(at, "LOCK CMPXCHG's CAS without the dmb ish before it")
+                }
                 Insn::Literal { .. } if shape => return fail(at, "literal load"),
                 // Division `svc`s are checked below, link points' by `exits`.
                 Insn::Svc(svc::LINK | svc::DIV_U | svc::DIV_S) => {}
@@ -553,8 +603,9 @@ impl<'a> Verifier<'a> {
                 return Err(format!("access at {at:#x}: not inside its guest instruction"));
             }
             match self.insn(at) {
-                Some(Insn::Mem(m)) if s.kind != object::kind::SWAP => self.site_word(m, at)?,
+                Some(Insn::Mem(m)) if !matches!(s.kind, object::kind::SWAP | object::kind::ATOMIC) => self.site_word(m, at)?,
                 Some(Insn::Swap { size, rs, rt, rn }) if s.kind == object::kind::SWAP => self.swap_word(size, rs, rt, rn, at)?,
+                Some(Insn::Atomic { size, rs, rt, rn, .. }) if s.kind == object::kind::ATOMIC => self.atomic_word(size, rs, rt, rn, at)?,
                 _ => return Err(format!("access at {at:#x}: no memory access of its kind there")),
             }
         }
@@ -590,7 +641,7 @@ impl<'a> Verifier<'a> {
             Some((r, ext, shift)) => (s.index_reg, s.shift) == (r, shift) && (s.extend == ext || (ext == EXT_X && s.extend == object::EXT_NONE)),
         };
         let load = matches!(s.kind, object::kind::LOAD | object::kind::POP);
-        if !(s.kind != object::kind::SWAP
+        if !(!matches!(s.kind, object::kind::SWAP | object::kind::ATOMIC)
             && index
             && load == m.load
             && (s.base_reg, s.width, s.data_reg[0]) == (m.addr.base, m.size, m.rt)
@@ -616,6 +667,24 @@ impl<'a> Verifier<'a> {
                 Ok(())
             }
             _ => Err(format!("swap at {at:#x} is not a swap site describing it")),
+        }
+    }
+
+    /// An atomic word must be an atomic site recording exactly it: base (never x28 or sp), width, Rt and Rs; no offset,
+    /// index or writeback; alone, or the store half of a read-modify-write (LOCK NEG's `casal` after its load).
+    fn atomic_word(&self, size: u8, rs: u8, rt: u8, rn: u8, at: u32) -> Result<(), String> {
+        let s = self.c.accesses.binary_search_by_key(&at, |s| s.native_offset).ok().map(|i| &self.c.accesses[i]);
+        match s {
+            Some(s)
+                if s.kind == object::kind::ATOMIC
+                    && !matches!(rn, 28 | SP)
+                    && (s.base_reg, s.width, s.data_reg) == (rn, size, [rt, rs])
+                    && (s.imm, s.index_reg, s.writeback) == (0, object::NO_REG, object::WB_NONE)
+                    && matches!(s.rmw, object::RMW_NONE | object::RMW_STORE) =>
+            {
+                Ok(())
+            }
+            _ => Err(format!("atomic at {at:#x} is not an atomic site describing it")),
         }
     }
 
@@ -682,10 +751,12 @@ impl<'a> Verifier<'a> {
             let at = s.native_offset;
             let fail = |what: &str| Err(format!("access at {at:#x}: {what}"));
             let lo = s.insn_native_offset;
-            // A swap has no split check (an operand crossing 16 bytes faults at the swap).
+            // A swap or LOCK atomic has no split check (an operand crossing 16 bytes faults at the atomic). A 16-byte caspal
+            // (CMPXCHG16B) faults unless 16-aligned: #GP(0) at run time, never refused here.
             let (addr, size, store, swap) = match self.insn(at) {
                 Some(Insn::Mem(m)) => (m.addr, m.size, !m.load, false),
                 Some(Insn::Swap { size, rn, .. }) => (Addr { base: rn, index: None, imm: 0 }, size, false, true),
+                Some(Insn::Atomic { size, rn, .. }) => (Addr { base: rn, index: None, imm: 0 }, size, false, size < 16),
                 _ => return fail("no memory access of its kind there"),
             };
             let splits = self.linked(at, object::kind::SPLIT);
@@ -698,7 +769,7 @@ impl<'a> Verifier<'a> {
                 let a = value.wrapping_add(addr.imm as u64);
                 // A split lock (a declared refusal); with any byte non-canonical x86's #GP comes first (raised at run time).
                 if swap && canonical(a) && canonical(a.wrapping_add(size as u64 - 1)) && (a & 15) + size as u64 > 16 {
-                    return fail(&format!("swap at {a:#x} crosses a 16-byte boundary (unsupported_atomic)"));
+                    return fail(&format!("locked access at {a:#x} crosses a 16-byte boundary (unsupported_atomic)"));
                 }
                 let crosses = store && size > 1 && (a ^ a.wrapping_add(size as u64 - 1)) & 0x1000 != 0;
                 // With a `b stub`, nothing may enter between the move and the access, not even from before the `b`.
@@ -969,6 +1040,20 @@ impl<'a> Verifier<'a> {
     }
 }
 
+/// Legacy prefixes including LOCK, an optional REX, then cmpxchg (0f b0/b1) or cmpxchg8b/16b (0f c7 /1).
+fn lock_cmpxchg(insn: &[u8]) -> bool {
+    let start = insn.iter().position(|b| !matches!(b, 0xf0 | 0xf2 | 0xf3 | 0x66 | 0x67 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65));
+    let Some(start) = start else { return false };
+    let o = if insn[start] & 0xf0 == 0x40 { start + 1 } else { start };
+    insn[..start].contains(&0xf0)
+        && insn.get(o) == Some(&0x0f)
+        && match insn.get(o + 1) {
+            Some(0xb0 | 0xb1) => true,
+            Some(0xc7) => insn.get(o + 2).is_some_and(|m| m >> 3 & 7 == 1),
+            _ => false,
+        }
+}
+
 fn is_cbtb(w: u32) -> bool {
     w & 0x7c00_0000 == 0x3400_0000
 }
@@ -1015,7 +1100,7 @@ mod tests {
             )
         };
     }
-    const FIXTURES: [(&[u8], &[u8]); 9] = [
+    const FIXTURES: [(&[u8], &[u8]); 10] = [
         fixture!("address-forms"),
         fixture!("division-forms"),
         fixture!("call-rsp"),
@@ -1025,6 +1110,9 @@ mod tests {
         fixture!("jcc"),
         fixture!("fix-edge-rip-relative"),
         fixture!("xchg-fences"),
+        // I3 (series18): lock add, lock cmpxchg (`dmb ish` at 0x18, casal at 0x1c), cmpxchg8b (caspal at 0x30, no barrier),
+        // lock cmpxchg16b (`dmb ish` at 0x54, caspal at 0x58), lock xadd, lock neg (load, casal, its own-RIP exit).
+        fixture!("lock-forms"),
     ];
     /// Admission with the code-shape check (as in the test suites).
     fn admit(fixture: (&[u8], &[u8])) -> Result<(), String> {
@@ -1092,6 +1180,22 @@ mod tests {
         assert_eq!(x86_divide(&[0x66, 0x41, 0xf7, 0xf9]), Some((true, 16)));
         assert_eq!(x86_divide(&[0xf6, 0x33]), Some((false, 8)));
         assert_eq!(x86_divide(&[0xf7, 0xe1]), None); // mul ecx
+    }
+
+    #[test]
+    fn lock_cmpxchg_barrier_pairs() {
+        const LOCK: (&[u8], &[u8]) = FIXTURES[9];
+        const DMB_ISH: u32 = 0xd503_3bbf;
+        // Each LOCK CMPXCHG* CAS needs its `dmb ish` right before it (code shape) ...
+        refused(LOCK, 0x18, DMB_ISH, NOP, "without the dmb ish");
+        refused(LOCK, 0x54, DMB_ISH, NOP, "without the dmb ish");
+        validated(LOCK, 0x18, DMB_ISH, NOP, None);
+        // ... and a `dmb ish` anywhere else is refused, also by object validation alone: before the unlocked cmpxchg8b's
+        // caspal, before LOCK XADD's ldaddal, in a straight-line block.
+        for (f, at, old) in [(LOCK, 0x2c, 0xaa05_03f5), (LOCK, 0x74, 0x2a04_03f4), (ADDRESS, MIDDLE.0, MIDDLE.1)] {
+            refused(f, at, old, DMB_ISH, "dmb ish that is not right before");
+            validated(f, at, old, DMB_ISH, Some("dmb ish that is not right before"));
+        }
     }
 
     #[test]
@@ -1294,8 +1398,11 @@ mod tests {
         assert!(matches!(decode(SWPAL_W4_X6, 0), Some(Insn::Swap { size: 4, rs: 4, rt: 4, rn: 6 })));
         assert!(matches!(decode(0x38e4_8294, 0), Some(Insn::Swap { size: 1, rs: 4, rt: 20, rn: 20 }))); // swpalb
         // Only the acquire-release swap: swp, swpa, swpl are refused (not FEX's xchg), as are other barriers and hints.
-        for other in [0xb824_80c4, 0xb8a4_80c4, 0xb864_80c4, 0xd503_39bf, 0xd503_3bbf, 0xd503_3fdf, 0xd503_205f, 0xd503_3f9f] {
-            refused(XCHG, 0xc, 0xd503_3dbf, other, "unrecognised"); // swp swpa swpl; dmb ishld ish; isb; wfe; dsb sy
+        for other in [0xb824_80c4, 0xb8a4_80c4, 0xb864_80c4, 0xd503_39bf, 0xd503_3fdf, 0xd503_205f, 0xd503_3f9f] {
+            refused(XCHG, 0xc, 0xd503_3dbf, other, "unrecognised"); // swp swpa swpl; dmb ishld; isb; wfe; dsb sy
+        }
+        {
+            refused(XCHG, 0xc, 0xd503_3dbf, 0xd503_3bbf, "dmb ish that is not right before"); // dmb ish (I3: only before a LOCK CMPXCHG CAS)
         }
         refused(XCHG, 0x8, SWPAL_W4_X6, SWPAL_W4_X6 | 31, "XZR"); // swpal w4, wzr, [x6]: Rt = XZR loses the acquire
         refused(XCHG, 0x8, SWPAL_W4_X6, SWPAL_W4_X6 + 1, "swap site"); // Rt w5: the record says w4

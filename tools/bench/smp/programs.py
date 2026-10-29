@@ -141,7 +141,73 @@ def xchg_lock(n):
     cpus = [cpu(i, BODY0, rbx=XL_L, rbp=XL_C, rcx=XL_R) for i in range(n)]
     return dict(name=f'xchg-lock@{n}', ncpu=n, bodies=[body(BODY0, text)], cpus=cpus, memory=[zero(XL_L, 0x100)], params={'iters': XL_R})
 
-DET = (disjoint_lcg, shared_ro, handshake, token_ring, xchg_lock)
+# I3 contention: every CPU runs LC_R rounds of LOCKed read-modify-writes on shared words of one line pair at r15 (each Arm
+# atomic FEX emits: ldaddal, casal, caspal W/X, ldeoral, ldsetal, ldclral, LOCK NEG's one-attempt casal) plus CMPXCHG retry
+# loops; every final word is exact (counters n * LC_R, self-inverse pairs back to 0, the OR of each CPU's bit).
+LC_C, LC_R = 0x260000, 20000
+def lock_counter(n):
+    text = """.l: mov eax, 1
+    lock xadd [r15], rax
+    lock inc qword [r15+8]
+    lock add qword [r15+16], 3
+    lock sub dword [r15+24], 2
+    lock neg qword [r15+32]
+    lock neg qword [r15+32]
+.cas: mov rax, [r15+40]
+    lea rdx, [rax+1]
+    lock cmpxchg [r15+40], rdx
+    jnz .cas
+    lock xor qword [r15+48], r8
+    lock xor qword [r15+48], r8
+    lock bts qword [r15+56], r9
+    lock btr qword [r15+56], r9
+    lock or dword [r15+64], r10d
+.c16: mov rax, [r15+80]
+    mov rdx, [r15+88]
+    mov rbx, rax
+    add rbx, 1
+    mov rcx, rdx
+    adc rcx, 0
+    lock cmpxchg16b [r15+80]
+    jnz .c16
+.c8: mov eax, [r15+96]
+    mov edx, [r15+100]
+    mov ebx, eax
+    add ebx, 1
+    mov ecx, edx
+    adc ecx, 0
+    lock cmpxchg8b [r15+96]
+    jnz .c8
+    dec rsi
+    jnz .l
+    xor eax, eax
+    xor ebx, ebx
+    xor ecx, ecx
+    xor edx, edx
+    cmp r11, r11"""
+    cpus = [cpu(i, BODY0, r15=LC_C, rsi=LC_R, r8=0x0123456789abcdef * (i + 1), r9=i, r10=1 << i) for i in range(n)]
+    init = bytearray(0x100); init[32] = 1          # the LOCK NEG word starts at 1: its sign flips with every NEG
+    return dict(name=f'lock-counter@{n}', ncpu=n, bodies=[body(BODY0, text)], cpus=cpus, memory=[{'addr': f'0x{LC_C:x}', 'data': init.hex()}],
+                params={'iters': LC_R})
+
+# I3: LOCK NEG under contention. Every CPU negates one shared qword (starting at 1) NR times, so some compare-and-swaps lose
+# races and their instruction exits to its own RIP and runs again (patch 0016); `neg-private` is the same loop on a word of
+# each CPU's own (no race). Final word 1 (n * NR negations, NR even). The runner (`smp`) requires the race's self-exit link
+# point to have been taken: some CPU links more exits than any CPU of `neg-private` at the same n.
+NR_C, NR_R = 0x270000, 20000
+def neg_race(n, private=False):
+    text = """.l: lock neg qword [r15]
+    dec rsi
+    jnz .l
+    cmp r11, r11"""
+    cpus = [cpu(i, BODY0, r15=NR_C + (0x80 * i if private else 0), rsi=NR_R) for i in range(n)]
+    init = bytearray(0x200)
+    for i in range(n if private else 1): init[0x80 * i] = 1
+    return dict(name=f"{'neg-private' if private else 'neg-race'}@{n}", ncpu=n, bodies=[body(BODY0, text)], cpus=cpus,
+                memory=[{'addr': f'0x{NR_C:x}', 'data': init.hex()}], params={'iters': NR_R})
+def neg_private(n): return neg_race(n, True)
+
+DET = (disjoint_lcg, shared_ro, handshake, token_ring, xchg_lock, lock_counter, neg_race, neg_private)
 def det_all():
     out = []
     for f in DET:
@@ -165,7 +231,36 @@ def litmus_decl(name):
     return m.Litmus(name, ((('store', 'x', 1),), (('store', 'y', 1),), (('load', 'r0', 'x'), ('fence',), ('load', 'r1', 'y')),
                            (('load', 'r2', 'y'), ('fence',), ('load', 'r3', 'x'))), (('x', 0), ('y', 0)), ((2, 'r0'), (2, 'r1'), (3, 'r2'), (3, 'r3')))
 
-def litmus_cpu_text(test, i, pause, locs=LOC, stride=2, fences=True, delay=63, shifts={}):
+# I3: the x86 form of a family's LOCKed read-modify-writes, one per Arm word FEX emits for them (LSE, acquire-release):
+# ldaddal (xadd), ldclral (and), ldeoral (xor), ldsetal (or), casal (cmpxchg; neg: a load then one casal per pass, exiting
+# to its own RIP on a lost race), caspal of two W (cmpxchg8b) or X registers (cmpxchg16b). (model function, operand) of each.
+# `-fail`: a comparison that never succeeds (x86 still writes and orders; Arm's CAS then writes nothing).
+RMW_FORMS = {'xadd': ('add', 1), 'and': ('and', 0xfffffff3), 'xor': ('xor', 5), 'or': ('or', 4), 'cmpxchg': ('cas', (0, 7)),
+             'cmpxchg-fail': ('cas', (1, 7)), 'cmpxchg8b': ('cas', (0, 7)), 'cmpxchg8b-fail': ('cas', (1, 7)), 'cmpxchg16b': ('cas', (0, 7)),
+             'neg': ('neg', 0)}
+
+def rmw_text(form, op, loc, dest):
+    """x86 of one LOCKed read-modify-write ('rmw', destination, location, function, operand) of form `form` on the dword at
+    rdi + `loc`; the old word into `dest` (a 32-bit register name) or nowhere. Scratch: rax, rcx, r12, r15 (rbx and rdx,
+    the iteration count and its bound, are saved around cmpxchg8b/16b)."""
+    _, _, _, function, operand = op
+    assert RMW_FORMS[form][0] == function, (form, function)
+    assert dest is None or form in ('xadd', 'cmpxchg', 'cmpxchg-fail', 'cmpxchg8b', 'cmpxchg8b-fail', 'cmpxchg16b'), form   # (and/xor/or/neg return nothing)
+    m = f'[rdi+{loc}]'
+    if form == 'xadd': return [f'mov {dest or "r12d"}, {operand}', f'lock xadd dword {m}, {dest or "r12d"}']
+    if form in ('and', 'xor', 'or'):
+        return [f'lock {form} dword {m}, {operand - (1 << 32) if operand >> 31 else operand}']
+    if form == 'neg': return [f'lock neg dword {m}']
+    exp, des = operand
+    form = form.removesuffix('-fail')
+    if form == 'cmpxchg':
+        return [f'mov eax, {exp}', f'mov r12d, {des}', f'lock cmpxchg dword {m}, r12d'] + ([f'mov {dest}, eax'] if dest else [])
+    wide = form == 'cmpxchg16b'    # the dword is the low half of the qword (8b) or oword (16b, 16-byte aligned); the rest is 0
+    a, d, b, c = ('rax', 'rdx', 'rbx', 'rcx') if wide else ('eax', 'edx', 'ebx', 'ecx')
+    return ['mov r12, rbx', 'mov r15, rdx', f'mov {a}, {exp}', f'xor {d}, {d}', f'mov {b}, {des}', f'xor {c}, {c}',
+            f'lock {form} {"oword" if wide else "qword"} {m}'] + ([f'mov {dest}, eax'] if dest else []) + ['mov rbx, r12', 'mov rdx, r15']
+
+def litmus_cpu_text(test, i, pause, locs=LOC, stride=2, fences=True, delay=63, shifts={}, rmw_form=None):
     """CPU i's body: `locs` = location -> offset from SYNC, `stride` = result bytes per iteration, `fences` = False drops
     every fence (a positive control), `delay` = mask of the random start delay (spins), `shifts` = location -> bit shift of its
     value (a plain store writes `value << shift`, a load or final read shifts it back, so the changing byte sits in the
@@ -173,6 +268,7 @@ def litmus_cpu_text(test, i, pause, locs=LOC, stride=2, fences=True, delay=63, s
     n = len(test.programs); mem = dict(test.initial); pz = '        pause\n' if pause else ''
     regs, lines = {}, []
     def r(name):
+        assert name in regs or len(regs) < 4, 'r8..r11 only: r12 is the RMW scratch, r13/r14 the delay'
         if name not in regs: regs[name] = f'r{8 + len(regs)}'
         return regs[name]
     L = [f'    mov ebx, 1', '.top:']
@@ -192,6 +288,9 @@ def litmus_cpu_text(test, i, pause, locs=LOC, stride=2, fences=True, delay=63, s
             L.append(f'    mov {r(op[1])}d, [rdi+{locs[op[2]]}]')
             if shifts.get(op[2]): L.append(f'    shr {r(op[1])}d, {shifts[op[2]]}')
         elif op[0] == 'fence': L.append('    mfence' if fences else '')
+        elif op[0] == 'rmw':
+            # The positive control (`fences` False) drops the LOCK prefix, so the RMW is neither atomic nor a barrier.
+            L += ['    ' + (x if fences else x.replace('lock ', '')) for x in rmw_text(rmw_form, op, locs[op[2]], op[1] and r(op[1]) + 'd')]
         else: assert op[0] == 'xchg' and type(op[3]) is int; L += [f'    mov {r(op[1])}d, {op[3]}', f'    xchg [rdi+{locs[op[2]]}], {r(op[1])}d']
     outs = [reg for c, reg in test.outputs if c == i]
     for k, reg in enumerate(outs): L.append(f'    mov [rsi+{k}], {regs[reg]}b')
@@ -233,7 +332,15 @@ def litmus_outcomes(prog, test, got, k, stride=2, res=RES):
 # ---- (b2) generated litmus families on the general path (S3e; natemu only, judged by the model) ----------------------------
 # Each family is the classic shape generalised to n participants (rings for sb/lb/2+2W, a propagation chain for wrc, n-1
 # readers for mp, n exchangers for xchg); the model enumerates the allowed outcomes, nothing is written per test.
-FAMILIES = ('sb', 'sb-mfence', 'sb-xchg', 'mp', 'lb', 'wrc', 'iriw', '2+2w', 'xchg')
+# I3: sb-<form> puts one LOCKed RMW of each Arm word (RMW_FORMS) between each store and load, on a location of its own (the
+# full-barrier test); `xadd` (n LOCK XADD +1 on one counter: the returned words a permutation and the counter n) and `cas`
+# (n LOCK CMPXCHG 0 -> i+1: one winner) are RMW chains.
+# `cas-read`/`cas8b-read`: SB where the observing load IS a failing LOCK CMPXCHG / CMPXCHG8B on the next CPU's location
+# (store x_i; lock cmpxchg [x_{i+1}] expecting 7, never there): all reading 0 is forbidden. A barrier after the CAS would
+# not order its read after the store; natemu's `dmb ish` before it does.
+CAS_READ = {'cas-read': 'cmpxchg', 'cas8b-read': 'cmpxchg8b'}
+RMW_FAMILIES = tuple(f'sb-{f}' for f in RMW_FORMS) + ('xadd', 'cas') + tuple(CAS_READ)
+FAMILIES = ('sb', 'sb-mfence', 'sb-xchg', 'mp', 'lb', 'wrc', 'iriw', '2+2w', 'xchg') + RMW_FAMILIES
 VARIANTS = ('aligned', 'unaligned', 'split', 'split-hi')
 
 def litmus_family(name, n):
@@ -242,6 +349,19 @@ def litmus_family(name, n):
     X = [f'x{i}' for i in range(n)]
     nxt = lambda i: X[(i + 1) % n]
     zero = lambda names: tuple((a, 0) for a in names)
+    if name.startswith('sb-') and name[3:] in RMW_FORMS:
+        function, operand = RMW_FORMS[name[3:]]
+        progs = tuple((('store', X[i], 1), ('rmw', None, f'd{i}', function, operand), ('load', f'r{i}', nxt(i))) for i in range(n))
+        return m.Litmus(f'{name}@{n}', progs, zero(X + [f'd{i}' for i in range(n)]), tuple((i, f'r{i}') for i in range(n)))
+    if name in CAS_READ:
+        progs = tuple((('store', X[i], 1), ('rmw', f'r{i}', nxt(i), 'cas', (7, 9))) for i in range(n))
+        return m.Litmus(f'{name}@{n}', progs, zero(X), tuple((i, f'r{i}') for i in range(n)))
+    if name == 'xadd':
+        return m.Litmus(f'xadd@{n}', tuple((('rmw', f'o{i}', 't', 'add', 1),) for i in range(n)), zero(['t']),
+                        tuple((i, f'o{i}') for i in range(n)) + (('final', 't'),))
+    if name == 'cas':
+        return m.Litmus(f'cas@{n}', tuple((('rmw', f'o{i}', 't', 'cas', (0, i + 1)),) for i in range(n)), zero(['t']),
+                        tuple((i, f'o{i}') for i in range(n)) + (('final', 't'),))
     if name in ('sb', 'sb-mfence', 'sb-xchg'):
         mid = {'sb': lambda i: (), 'sb-mfence': lambda i: (('fence',),), 'sb-xchg': lambda i: (('xchg', f'o{i}', f'd{i}', i + 1),)}[name]
         progs = tuple((('store', X[i], 1),) + mid(i) + (('load', f'r{i}', nxt(i)),) for i in range(n))
@@ -273,17 +393,18 @@ def family_locations(test, variant):
     16-byte block); `split` each plain location crossing a page boundary of its own (exchanged locations stay aligned: a
     split XCHG is not supported), its changing byte (byte 0) on the first page; `split-hi` the same placement with the
     changing byte on the second page (byte 3: see `family_shifts`)."""
-    xchg = {op[2] for prog in test.programs for op in prog if op[0] == 'xchg'}
+    xchg = {op[2] for prog in test.programs for op in prog if op[0] in ('xchg', 'rmw')}    # (I3: and LOCKed RMWs)
+    wide = test.name.startswith('sb-cmpxchg16b')          # CMPXCHG16B's operand stays 16-byte aligned (else #GP)
     out = {}
     for j, (a, _) in enumerate(test.initial):
         if variant.startswith('split') and a not in xchg: out[a] = 0x1000 * (j + 1) - 2
-        else: out[a] = 0x400 + 0x80 * j + (5 if variant == 'unaligned' else 0)
+        else: out[a] = 0x400 + 0x80 * j + (5 if variant == 'unaligned' and not (wide and a in xchg) else 0)
     return out
 
 def family_shifts(test, variant):
     """Location -> bit shift of its value: `split-hi` stores `value << 24` (byte 3, on the second page) in every split
     location, so the half of a split store that lands on the second page is what the loads observe."""
-    xchg = {op[2] for prog in test.programs for op in prog if op[0] == 'xchg'}
+    xchg = {op[2] for prog in test.programs for op in prog if op[0] in ('xchg', 'rmw')}
     return {a: 24 for a, _ in test.initial if variant == 'split-hi' and a not in xchg}
 
 FAMILY_RES = lambda i: 0x220000 + 0x20000 * i
@@ -292,7 +413,8 @@ def family_program(test, variant, k, fences=True, delay=255):
     n, locs, shifts = len(test.programs), family_locations(test, variant), family_shifts(test, variant)
     stride = max(sum(1 for c, _ in test.outputs if (0 if c == 'final' else c) == i) for i in range(n))
     assert 1 <= k and stride * k <= 0x20000
-    bodies = [body(BODY0 + 0x1000 * i, litmus_cpu_text(test, i, False, locs, stride, fences, delay, shifts)) for i in range(n)]
+    form = test.name.split('@')[0][3:] if test.name.startswith('sb-') else {'xadd': 'xadd', 'cas': 'cmpxchg', **CAS_READ}.get(test.name.split('@')[0])
+    bodies = [body(BODY0 + 0x1000 * i, litmus_cpu_text(test, i, False, locs, stride, fences, delay, shifts, form)) for i in range(n)]
     cpus = [cpu(i, BODY0 + 0x1000 * i, rdi=SYNC, rsi=FAMILY_RES(i), rdx=k, r14=0x9e3779b97f4a7c15 * (i + 1)) for i in range(n)]
     mem = [zero(SYNC, 0x6000)] + [zero(FAMILY_RES(i), stride * k) for i in range(n)
                                   if any((0 if c == 'final' else c) == i for c, _ in test.outputs)]

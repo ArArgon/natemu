@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: natemu <natemu@example.invalid>
+Date: Thu, 29 Oct 2026 00:00:00 +0000
+Subject: [PATCH 16/16] FEXCore: slice1 LOCK forms: one atomic per instruction
+
+Under --profile slice1 (I3):
+- LOCK NEG m (AtomicFetchNeg) is one compare-and-swap attempt instead of
+  FEX's CAS loop (a native backward branch): the JIT calls the shim's
+  FexcLockNeg (a load, one casal, and on a lost race a literal exit to the
+  instruction's own RIP). The dispatcher completes the flags and puts CF in
+  the exit ABI's form before it, so that exit holds the state before the
+  instruction.
+- LOCK CMPXCHG / CMPXCHG8B / CMPXCHG16B (recorded in fexc_lock_cas by the
+  dispatcher) get `dmb ish` immediately before their casal/caspal: x86 orders
+  a locked compare that fails, while a failing Arm CAS writes nothing and has
+  only acquire semantics.
+- Register allocation never prefers a static register for the result of a
+  swap or fetch-and-op atomic (FexcPrecision::LoadsInto, as for a load: the
+  destination is UNKNOWN after an abort), and frees the register of one whose
+  result is unused (LOCK NOT), as for an unused load.
+- A LOCK instruction neither reuses nor leaves a pooled constant: its atomic
+  takes the value in a register, and a block-wide pooled constant would hold
+  a register from first to last use (slice1 admits no spill).
+---
+  FEXCore/Source/Interface/Core/Core.cpp                     |  9 +++++++++
+  FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp            | 14 ++++++++++++++
+  FEXCore/Source/Interface/Core/JIT/JITClass.h               |  3 +++
+  FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp         | 12 ++++++++++++
+  .../Source/Interface/IR/Passes/RegisterAllocationPass.cpp  |  4 ++--
+  5 files changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 95d9442..3ce4ce8 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -706,7 +706,16 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+           }
+ 
+           Thread->OpDispatcher->SetForceTSO(ForceTSO);
++          // natemu slice1: a LOCK instruction neither reuses nor leaves a pooled constant. Its atomic takes the value in a
++          // register, and a constant pooled block-wide holds its register from first to last use, so LOCK forms in a long
++          // block would exhaust the allocator, and slice1 admits no spill.
++          if (fexc_slice1 && IsLocked) {
++            Thread->OpDispatcher->NrConstants = 0;
++          }
+           std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
++          if (fexc_slice1 && IsLocked) {
++            Thread->OpDispatcher->NrConstants = 0;
++          }
+           if (Thread->OpDispatcher->HadDecodeFailure()) {
+             HadDispatchError = true;
+           } else {
+diff --git a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+index 014a8c6..e3a735b 100644
+--- a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+@@ -5,6 +5,7 @@ tags: backend|arm64
+ $end_info$
+ */
+ 
++#include <fexc_hook.h>
+ #include "Interface/Context/Context.h"
+ #include "Interface/Core/Dispatcher/Dispatcher.h"
+ #include "Interface/Core/JIT/JITClass.h"
+@@ -45,6 +46,11 @@ DEF_OP(CASPair) {
+     // ISA limitations. But by making them 64-bit, Firestorm can rename.
+     mov(ARMEmitter::Size::i64Bit, CaspalDst0, Expected0);
+     mov(ARMEmitter::Size::i64Bit, CaspalDst1, Expected1);
++    if (fexc_slice1 && fexc_lock_cas.count(Entry + FexcGuest)) {
++      // natemu: LOCK CMPXCHG8B/16B is a full barrier also when its comparison fails; a failing CASPAL writes nothing and
++      // has only acquire semantics, so earlier accesses are ordered before its read by a barrier right before it.
++      dmb(ARMEmitter::BarrierScope::ISH);
++    }
+     caspal(EmitSize, CaspalDst0, CaspalDst1, Desired0, Desired1, MemSrc);
+ 
+     if (CaspalDst0 != Dst0) {
+@@ -103,10 +109,14 @@ DEF_OP(CAS) {
+   auto Dst = GetReg(Node);
+ 
+   if (CTX->HostFeatures.SupportsAtomics) {
++    // natemu: LOCK CMPXCHG likewise (a `dmb ish` right before the casal).
++    const bool FexcBarrier = fexc_slice1 && fexc_lock_cas.count(Entry + FexcGuest);
+     if (Expected == Dst && Dst != MemSrc && Dst != Desired) {
++      if (FexcBarrier) dmb(ARMEmitter::BarrierScope::ISH);
+       casal(SubEmitSize, Dst, Desired, MemSrc);
+     } else {
+       mov(EmitSize, TMP2, Expected);
++      if (FexcBarrier) dmb(ARMEmitter::BarrierScope::ISH);
+       casal(SubEmitSize, TMP2, Desired, MemSrc);
+       mov(EmitSize, Dst, TMP2.R());
+     }
+@@ -296,6 +306,10 @@ DEF_OP(AtomicFetchXor) {
+ }
+ 
+ DEF_OP(AtomicFetchNeg) {
++  if (fexc_slice1) {
++    // natemu slice1: one compare-and-swap attempt, a lost race exits to the instruction's own RIP (no backward branch).
++    return FexcLockNeg(IROp, Node);
++  }
+   auto Op = IROp->C<IR::IROp_AtomicFetchNeg>();
+   const auto EmitSize = ConvertSize(IROp);
+   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index 8a29e03..e2a4bd3 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -550,6 +550,9 @@ private:
+   void FexcDivAfterCall();
+   // natemu (fexc), profile slice1: a computed exit's branch to the resident's dispatcher (same file).
+   void FexcDispatchExit();
++  // natemu (fexc), profile slice1: LOCK NEG m as one compare-and-swap attempt with an exit to its own RIP (same file).
++  void FexcLockNeg(const IR::IROp_Header* IROp, IR::Ref Node);
++  uint32_t FexcNegLoad {};
+   // (targets and RIP-relative accesses come from FexcPrecision::Prescan, run before register allocation)
+   fextl::map<size_t, ARMEmitter::ForwardLabel> FexcStubs;   // guard/split site index -> its stub
+   fextl::vector<size_t> FexcPendingLink;                    // guard/split sites waiting for their access's native offset
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 012b62f..4437099 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -3851,6 +3851,12 @@ void OpDispatchBuilder::NEGOp(OpcodeArgs) {
+   auto ZeroConst = Constant(0);
+ 
+   if (DestIsLockedMem(Op)) {
++    if (fexc_slice1) {
++      // natemu: the slice1 lowering of AtomicFetchNeg may leave through a literal exit to this instruction's RIP (a lost
++      // compare-and-swap), so the guest flags are complete and CF is in the exit ABI's form before it.
++      CalculateDeferredFlags();
++      RectifyCarryInvert(CFInvertedABI);
++    }
+     Ref DestMem = MakeSegmentAddress(Op, Op->Dest);
+     Ref Dest = _AtomicFetchNeg(Size, DestMem);
+     CalculateFlags_SUB(Size, ZeroConst, Dest);
+@@ -4080,6 +4086,9 @@ void OpDispatchBuilder::CMPXCHGOp(OpcodeArgs) {
+   } else {
+     Ref Src2 = LoadSourceGPR(Op, Op->Src[0], Op->Flags);
+     HandledLock = Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_LOCK;
++    if (fexc_slice1 && HandledLock) {
++      fexc_lock_cas.insert(Op->PC);   // natemu: a `dmb ish` before its casal (a failing CAS is no barrier on Arm)
++    }
+ 
+     auto Src3 = LoadGPRRegister(X86State::REG_RAX);
+     auto Src3Lower = _Bfe(OpSize::i64Bit, OpSizeAsBits(Size), 0, Src3);
+@@ -4139,6 +4148,9 @@ void OpDispatchBuilder::CMPXCHGPairOp(OpcodeArgs) {
+ 
+   Ref Result_Lower = _AllocateGPR(true);
+   Ref Result_Upper = _AllocateGPRAfter(Result_Lower);
++  if (fexc_slice1 && HandledLock) {
++    fexc_lock_cas.insert(Op->PC);     // natemu: a `dmb ish` before its caspal (LOCK only)
++  }
+   _CASPair(Size, Expected_Lower, Expected_Upper, Desired_Lower, Desired_Upper, Src1, Result_Lower, Result_Upper);
+ 
+   HandleNZCV_RMW();
+diff --git a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+index 4fca1f0..9276e03 100644
+--- a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+@@ -645,7 +645,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+         }
+ 
+         if (fexc_slice1 && (FexcPrecision::GuestMemOp(IROp->Op) || IROp->Op == OP_GUESTOPCODE)) {
+-          if (IROp->Op == OP_LOADMEM || IROp->Op == OP_LOADMEMTSO) {
++          if (FexcPrecision::LoadsInto(IROp->Op)) {
+             PreferredReg[IR->GetID(CodeNode).Value] = PhysicalRegister::Invalid();
+           }
+           PhysicalRegister Keep = PhysicalRegister::Invalid();
+@@ -792,7 +792,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+       // Assign destinations.
+       if (GetHasDest(IROp->Op) && PhysicalRegister(CodeNode).IsInvalid()) {
+         AssignReg(IROp, BlockIROp, CodeNode, IROp);
+-        if (fexc_slice1 && (IROp->Op == OP_LOADMEM || IROp->Op == OP_LOADMEMTSO) && CodeNode->GetUses() == 0) {
++        if (fexc_slice1 && FexcPrecision::LoadsInto(IROp->Op) && CodeNode->GetUses() == 0) {
+           FreeReg(PhysicalRegister(CodeNode));
+         }
+       }
+-- 
+2.39.0
+

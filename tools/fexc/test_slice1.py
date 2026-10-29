@@ -1,6 +1,6 @@
 """S1c checks: profile slice1 of fexc (block cutting at an allowlist, single-gate exits, profile record).
 
-Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series16 build)
+Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series18 build)
 
 The x86 bytes below are assembled by hand and only drive the compiler; every expectation (where the block ends, why)
 comes from the instruction's architectural class, never from fexc's output. The cut position is also compared with a
@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402  (disassemble, object reader)
 import scan_skips  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series16/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series18/obj/fexc')
 REPO = HERE.parents[1]
 RIP = 0x102000
 PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
@@ -46,12 +46,13 @@ SYSTEM = {
 
 # name -> hex. Decodable instructions that are not slice-1 forms, and admitted opcodes with an excluded prefix or operand.
 UNSUPPORTED = {
-    'lock xchg rax,rcx (#UD)': 'f04887c1', 'rep xchg r8,rax (not pause)': 'f34190', 'o16 mfence': '660faef0',
+    'rep xchg r8,rax (not pause)': 'f34190', 'o16 mfence': '660faef0',
     'lfence modrm e9': '0faee9', 'rep mfence': 'f30faef0',
-    'lock add [rax],rcx': 'f0480108', 'lock inc [rax]': 'f0ff00', 'lock cmpxchg [rax],ecx': 'f00fb108', 'lock xadd [rax],ecx': 'f00fc108',
+    # I3: LOCK with a REP prefix (XACQUIRE/XRELEASE without HLE), an operand-size prefix on cmpxchg8b/16b (no SDM meaning)
+    'rep lock add [rax],rcx': 'f3f0480108', 'repne lock xadd [rax],ecx': 'f2f00fc108', 'o16 cmpxchg8b': '660fc708',
     # I2: string forms outside the allowlist (REPNE only on cmps/scas, never with REP; no 0x67; FS/GS and SS rules)
     'repne movsb': 'f2a4', 'repne stosq': 'f248ab', 'rep repne cmpsb': 'f3f2a6', 'addr32 rep movsb': '67f3a4', 'addr32 lodsb': '67ac',
-    'fs stosb (ES:RDI only)': '64aa', 'gs rep scasq': '65f348af', 'ss lodsb': '36ac', 'fs gs movsb': '6465a4', 'lock movsb': 'f0a4',
+    'fs stosb (ES:RDI only)': '64aa', 'gs rep scasq': '65f348af', 'ss lodsb': '36ac', 'fs gs movsb': '6465a4',
     'mov eax,[eax] (addr32)': '678b00',
     # I7: an FS/GS override with nothing to override, or with a second segment prefix (no SDM rule; FEX and QEMU differ)
     'fs mov rax,rcx': '644889c8', 'gs push rax': '6550', 'gs ret': '65c3', 'fs leave': '64c9', 'gs pushf': '659c', 'fs jmp rel8': '64eb00',
@@ -63,8 +64,8 @@ UNSUPPORTED = {
     'o16 pushf': '669c', 'o16 leave': '66c9', 'enter level 1': 'c8080001', 'o16 shld': '660fa4c101', 'o16 shrd cl': '660fadc1',
     'prefetchw': '0f0d08', 'prefetch /4 (reserved nop)': '0f1820', 'prefetch reg (reserved nop)': '0f18c0', 'movnti reg': '0fc3c1',
     'pdep': 'c4e2fbf5c1', 'pext': 'c4e2faf5c1', 'andn L=1': 'c4e27cf2c1', 'blsr /0 (#UD)': 'c4e278f3c1', 'vpxor': 'c5f9efc0',
-    'rex andn (#UD)': '48c4e278f2c1', 'o16 andn (#UD)': '66c4e278f2c1', 'lock andn': 'f0c4e278f2c1', 'rep popcnt-like f2 0f b8': 'f20fb8c1',
-    'fxsave': '0fae00', 'loop 67-prefix': '67e2fe', 'jecxz': '67e3fe', 'loop o16': '66e2fe', 'rdrand': '0fc7f0', 'rdseed': '0fc7f8', 'cmpxchg16b': '480fc708', 'cmpxchg8b': '0fc708',
+    'rex andn (#UD)': '48c4e278f2c1', 'o16 andn (#UD)': '66c4e278f2c1', 'rep popcnt-like f2 0f b8': 'f20fb8c1',
+    'fxsave': '0fae00', 'loop 67-prefix': '67e2fe', 'jecxz': '67e3fe', 'loop o16': '66e2fe', 'rdrand': '0fc7f0', 'rdseed': '0fc7f8',
     'xlat': 'd7', 'movbe': '0f38f000', 'sal /6 alias': 'd1f0',
     'bnd ret': 'f2c3', 'o16 ret': '66c3', 'o16 jmp': '66e9fbffffff', 'bswap r9w (undefined)': '66410fc9', 'bswap ax': '660fc8',
     # FEX branches around the whole access for a zero count (static or dynamic), losing a guest #PF
@@ -74,7 +75,22 @@ UNSUPPORTED = {
 }
 
 # One instruction each, all inside the allowlist; every one must translate completely.
+# I3: LOCK on a form that is not lockable is #UD whatever the instruction: a system cut (the host names it, the resident raises
+# #UD), whether FEX's decoder took the instruction (cmp, bt, andn) or refused it (a register operand, mov, nop, movs).
+LOCK_UD = {
+    'lock xchg rax,rcx': 'f04887c1', 'lock add rax,rcx': 'f04801c8', 'lock mov [rax],rcx': 'f0488908', 'lock cmp [rax],1': 'f048833801',
+    'lock bt [rax],1': 'f0480fba2001', 'lock nop': 'f090', 'lock movsb': 'f0a4', 'lock andn': 'f0c4e278f2c1', 'lock inc rax': 'f048ffc0',
+    'lock cmpxchg rcx,rdx': 'f0480fb1d1', 'lock lea rax,[rax]': 'f0488d00', 'lock movaps': 'f00f2800',
+}
+
 ALLOWED = {
+    # I3: every lockable memory form with LOCK (one LSE atomic each), cmpxchg8b/16b with or without it
+    'lock add [rax],rcx': 'f0480108', 'lock inc [rax]': 'f0ff00', 'lock cmpxchg [rax],ecx': 'f00fb108', 'lock xadd [rax],ecx': 'f00fc108',
+    'lock adc [rax],cl': 'f01008', 'lock sbb word [rax],5': '66f0831805', 'lock and [rax],rcx': 'f0482108', 'lock or [rax],ecx': 'f00908',
+    'lock xor byte [rax],1': 'f0803001', 'lock sub [rax],rcx': 'f0482908', 'lock dec qword [rax]': 'f048ff08', 'lock not [rax]': 'f0f710',
+    'lock bts [rax],rcx': 'f0480fab08', 'lock btr [rax],5': 'f00fba3005', 'lock btc word [rax],cx': '66f00fbb08', 'lock xadd [rax],cl': 'f00fc008',
+    'lock cmpxchg16b': 'f0480fc708', 'lock cmpxchg8b': 'f00fc708', 'cmpxchg16b': '480fc708', 'cmpxchg8b': '0fc708',
+    'fs lock add [rax],rcx': '64f0480108', 'lock gs or [rax+8],ecx': 'f0650948 08'.replace(' ', ''),
     'nop': '90', 'nop dword [rax]': '0f1f00', 'nop word [rax+rax]': '660f1f440000', 'xchg rax,rcx': '4891', 'xchg rcx,rdx': '4887d1',
     'xchg al,ah': '86c4', 'add [rax],rcx': '480108', 'add rcx,[rax]': '480308', 'sub eax,5': '83e805', 'adc rax,rbx': '4811d8',
     'sbb rax,[rax]': '481b00', 'and al,1': '2401', 'or ax,0x1234': '660d3412', 'xor eax,eax': '31c0', 'cmp [rax],rcx': '483908',
@@ -114,6 +130,9 @@ ALLOWED = {
     'movsb': 'a4', 'movsq': '48a5', 'o16 cmpsw': '66a7', 'stosq': '48ab', 'stosd': 'ab', 'lodsb': 'ac', 'scasb': 'ae', 'cmpsb': 'a6',
     'fs movsq': '6448a5', 'gs lodsd': '65ad', 'fs cmpsb': '64a6', 'ds movsb': '3ea4', 'es stosb': '26aa',
 }
+
+# I3: LOCK NEG ends its block too (one compare-and-swap per pass, exiting to its own RIP on a lost race).
+LOCK_NEGS = {'lock neg [rax]': 'f0f718', 'lock neg byte [rax+8]': 'f0f65808', 'lock neg qword fs:[rax]': '64f048f718'}
 
 # I2: REP/REPE/REPNE string instructions end their block (they exit to their own RIP until RCX is 0).
 REPS = {'rep movsb': 'f3a4', 'rep movsq': 'f348a5', 'rep stosq': 'f348ab', 'rep stosb': 'f3aa', 'rep lodsw': '66f3ad', 'repe cmpsb': 'f3a6',
@@ -170,6 +189,25 @@ class Slice1Cutting(unittest.TestCase):
         for name, x in SYSTEM.items():
             with self.subTest(name):
                 self.cut_after_two(name, x, 'system_instruction')
+
+    def test_lock_on_forms_that_are_not_lockable_is_ud(self):
+        for name, x in LOCK_UD.items():
+            with self.subTest(name):
+                self.cut_after_two(name, x, 'system_instruction')
+                d, _ = run(x + PRE)
+                self.assertIn('not lockable (#UD)', d['guest']['end']['detail'], name)
+
+    def test_lock_neg_ends_its_block(self):
+        for name, x in LOCK_NEGS.items():
+            with self.subTest(name):
+                d, rc = run(PRE + x + PRE)
+                g = d['guest']
+                self.assertEqual((rc, g['instructions_translated'], g['end']['reason']), (0, 3, 'block_ending_instruction'), (name, g['end']))
+                at = RIP + len(PRE) // 2
+                moves = sorted(r['guest_rip'] for r in d['code']['relocations'] if r['kind'] == 'guest_rip_move' and r['register'] == 0)
+                self.assertEqual(moves, sorted([hex(at), hex(at + len(x) // 2)]), name)    # its own RIP (retry) and the next
+                sites = [(s['kind'], s['rmw'], s['intent']) for s in d['sites']]
+                self.assertEqual(sites, [('load', 'load', 'write'), ('atomic', 'store', 'write')], name)
 
     def test_unsupported_forms(self):
         for name, x in UNSUPPORTED.items():
@@ -329,7 +367,7 @@ class Slice1Cutting(unittest.TestCase):
 
     def test_default_profile_does_not_cut(self):
         # the same system instructions translate (or fail) as before in the default profile: no cut is ever reported
-        for x in (SYSTEM['mov cr3,rax'], SYSTEM['cli'], UNSUPPORTED['lock add [rax],rcx']):
+        for x in (SYSTEM['mov cr3,rax'], SYSTEM['cli'], UNSUPPORTED['repne movsb']):
             d, rc = run(PRE + x + PRE, profile=None)
             self.assertNotIn(d['guest']['end']['reason'], ('system_instruction', 'unsupported_form'))
             self.assertNotIn('cut_opcode', d['guest']['end'])

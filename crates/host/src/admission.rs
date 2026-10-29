@@ -150,6 +150,28 @@ fn rep_string(insn: &[u8]) -> bool {
     rep && opcode.is_some_and(|o| o <= start + 1 && o + 1 == insn.len() && matches!(insn[o], 0xa4..=0xa7 | 0xaa..=0xaf))
 }
 
+/// Whether `insn` is exactly one LOCK NEG with a memory operand (legacy prefixes including F0, an optional REX, f6/f7 /3,
+/// mod != 3, its SIB and displacement bytes). Its compare-and-swap exits to its own RIP when it loses a race (I3, fexc
+/// patch 0016), and it ends its block, so that RIP is a proven literal-exit target. Other legacy prefixes (F2/F3 included,
+/// which fexc refuses with LOCK) are accepted here: this only proves the exit target from the bytes, never that the form
+/// is admitted (the allowlist decides that).
+fn lock_neg(insn: &[u8]) -> bool {
+    let start = insn.iter().position(|b| !matches!(b, 0xf0 | 0xf2 | 0xf3 | 0x66 | 0x67 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65));
+    let Some(start) = start else { return false };
+    let o = if insn[start] & 0xf0 == 0x40 { start + 1 } else { start };
+    let (Some(&op), Some(&modrm)) = (insn.get(o), insn.get(o + 1)) else { return false };
+    let (mode, reg, rm) = (modrm >> 6, modrm >> 3 & 7, modrm & 7);
+    let sib = usize::from(mode != 3 && rm == 4);
+    let disp = match mode {
+        0 if rm == 5 || (sib == 1 && insn.get(o + 2).is_some_and(|b| b & 7 == 5)) => 4,
+        0 => 0,
+        1 => 1,
+        2 => 4,
+        _ => return false,
+    };
+    insn[..start].contains(&0xf0) && matches!(op, 0xf6 | 0xf7) && reg == 3 && o + 2 + sib + disp == insn.len()
+}
+
 /// Admits `bytes`, an fexc `--object` compiled at `rip` from `source` (the guest
 /// bytes given to fexc), for a vCPU executing `supported` feature bits; `shape` adds the code-shape check.
 pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64, shape: bool) -> Result<Admitted, String> {
@@ -261,9 +283,9 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
             || s.guest_offset2 != object::NONE32
             || !matches!(
                 s.kind,
-                object::kind::LOAD | object::kind::STORE | object::kind::PUSH | object::kind::POP | object::kind::SWAP
+                object::kind::LOAD | object::kind::STORE | object::kind::PUSH | object::kind::POP | object::kind::SWAP | object::kind::ATOMIC
             )
-            || !matches!(s.width, 1 | 2 | 4 | 8)
+            || !(matches!(s.width, 1 | 2 | 4 | 8) || (s.kind == object::kind::ATOMIC && s.width == 16))
             || s.intent != intent(s)
         {
             return fail(&format!("access site at native offset {:#x}", s.native_offset));
@@ -308,7 +330,8 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
     }
     let admitted =
         Admitted { object: out, guest_bytes: h.guest_bytes, guest_insns: h.guest_insns, end_reason: h.end_reason, links: Vec::new(), dispatch_exit: None };
-    let own = rep_string(&source[last..h.guest_bytes as usize]).then_some(rip.wrapping_add(last as u64));
+    let tail = &source[last..h.guest_bytes as usize];
+    let own = (rep_string(tail) || lock_neg(tail)).then_some(rip.wrapping_add(last as u64));
     let targets = [Some(end), target, own].into_iter().flatten().collect();
     Ok((admitted, Parts { header: h, sites, pcs, relocs, literals, targets }))
 }
@@ -318,7 +341,7 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
 fn intent(s: &Site) -> u8 {
     use object::kind::*;
     match (s.kind, s.rmw) {
-        (STORE | PUSH, object::RMW_NONE | object::RMW_STORE) | (SWAP, object::RMW_NONE) => object::INTENT_WRITE,
+        (STORE | PUSH | ATOMIC, object::RMW_NONE | object::RMW_STORE) | (SWAP, object::RMW_NONE) => object::INTENT_WRITE,
         (LOAD, object::RMW_LOAD) => object::INTENT_WRITE,
         (LOAD | POP, object::RMW_NONE) => object::INTENT_READ,
         _ => u8::MAX,
@@ -502,6 +525,20 @@ mod tests {
     const SOURCE: [u8; 3] = [0x48, 0xeb, 0x01];
 
     #[test]
+    fn lock_neg_forms() {
+        // lock neg [rbx]; lock neg qword [rax+rcx*8+0x10]; lock neg byte [rip+x]; fs lock neg word [rsp]; [rbp+0] (mod 1).
+        for insn in [&[0xf0, 0xf7, 0x1b][..], &[0xf0, 0x48, 0xf7, 0x5c, 0xc8, 0x10], &[0xf0, 0xf6, 0x1d, 1, 2, 3, 4], &[0x64, 0x66, 0xf0, 0xf7, 0x1c, 0x24],
+                     &[0xf0, 0xf7, 0x5d, 0x00], &[0xf0, 0xf7, 0x1c, 0x25, 0, 0x10, 0, 0]] {
+            assert!(super::lock_neg(insn), "{insn:x?}");
+        }
+        // No LOCK, a register operand, /2 (not), a short or long span, two REX bytes.
+        for insn in [&[0xf7, 0x1b][..], &[0xf0, 0xf7, 0xdb], &[0xf0, 0xf7, 0x13], &[0xf0, 0xf7, 0x5b], &[0xf0, 0xf7, 0x1b, 0x90],
+                     &[0xf0, 0x48, 0x48, 0xf7, 0x1b], &[0xf0], &[]] {
+            assert!(!super::lock_neg(insn), "{insn:x?}");
+        }
+    }
+
+    #[test]
     fn rep_string_forms() {
         for insn in [&[0xf3, 0x48, 0xab][..], &[0xf3, 0xa4], &[0xf2, 0xae], &[0xf3, 0x66, 0xa7], &[0x64, 0xf3, 0x48, 0xa5], &[0xf3, 0x65, 0xac]] {
             assert!(super::rep_string(insn), "{insn:x?}");
@@ -603,6 +640,12 @@ mod tests {
         assert!(admit(&site(|s| (s.kind, s.intent) = (object::kind::SWAP, object::INTENT_WRITE)), RIP, &SOURCE, ALL).is_ok());
         assert!(admit(&site(|s| (s.kind, s.intent) = (object::kind::SWAP, object::INTENT_READ)), RIP, &SOURCE, ALL).is_err());
         assert!(admit(&site(|s| (s.kind, s.intent, s.rmw) = (object::kind::SWAP, object::INTENT_WRITE, object::RMW_LOAD)), RIP, &SOURCE, ALL).is_err());
+        // A LOCK atomic writes (LOCK NEG's casal: as the store half after its load); CMPXCHG16B's caspal is 16 bytes.
+        assert!(admit(&site(|s| (s.kind, s.intent) = (object::kind::ATOMIC, object::INTENT_WRITE)), RIP, &SOURCE, ALL).is_ok());
+        assert!(admit(&site(|s| (s.kind, s.intent) = (object::kind::ATOMIC, object::INTENT_READ)), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&site(|s| (s.kind, s.intent, s.rmw) = (object::kind::ATOMIC, object::INTENT_WRITE, object::RMW_LOAD)), RIP, &SOURCE, ALL).is_err());
+        assert!(admit(&site(|s| (s.kind, s.intent, s.width) = (object::kind::ATOMIC, object::INTENT_WRITE, 16)), RIP, &SOURCE, ALL).is_ok());
+        assert!(admit(&site(|s| (s.kind, s.intent, s.width) = (object::kind::SWAP, object::INTENT_WRITE, 16)), RIP, &SOURCE, ALL).is_err());
     }
 
     #[test]

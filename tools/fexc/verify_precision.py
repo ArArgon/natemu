@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1b1 check: the slice-1 precision guarantee, verified statically on the code fexc emits (profile slice1).
 
-usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series16 build)
+usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series18 build)
 
 Corpora: fixtures/slice1/programs.json, the single-instruction matrix of scan_skips.py, the adversarial programs below
 (one per precision patch), and every CORPUS.json given (gen_slice1.py format, e.g. a fresh `--seed` corpus).
@@ -75,7 +75,7 @@ import check_sites, scan_skips  # noqa: E402
 from check_sites import code_vs_sites  # noqa: E402
 import flags as F  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series16/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series18/obj/fexc')
 
 NZCV_WRITERS = {'adds', 'adcs', 'subs', 'sbcs', 'ands', 'bics', 'negs', 'ngcs', 'cmp', 'cmn', 'tst', 'ccmp', 'ccmn', 'fcmp',
                 'fcmpe', 'fccmp', 'fccmpe', 'setf8', 'setf16', 'rmif', 'cfinv', 'axflag', 'xaflag'}
@@ -106,7 +106,9 @@ def effects(text):
     toks = [t for t in pre.split(',') if t.strip()]
     acc = check_sites.native_access(text)
     dests = set()
-    if mn.startswith('st') and acc:
+    if acc and acc[0] in ('swap', 'atomic'):   # swp/ld<op>: Rt receives the old value; cas: Rs; casp: Rs, Rs+1 (I3)
+        dests |= {reg(toks[1])} if not mn.startswith('cas') else {reg(toks[0])} | ({reg(toks[1])} if mn.startswith('casp') else set())
+    elif mn.startswith('st') and acc:
         if mn.startswith(('stxr', 'stlxr', 'stxp', 'stlxp')):
             dests.add(reg(toks[0]))
     elif mn in PAIR_LOADS:
@@ -141,6 +143,8 @@ def flag_writes(a):
         return F.CF, F.CF
     if op == 'sahf':
         return F.ALL6 & ~F.OF, F.ALL6 & ~F.OF
+    if op in ('cmpxchg8b', 'cmpxchg16b'):   # I3: ZF only
+        return F.ZF, F.ZF
     if op in F.SHIFTS | F.ROTATES | {'shld', 'shrd'}:
         if a.get('count') is None:
             return F.ALL6, 0
@@ -672,8 +676,14 @@ def verify(d, tmp, insns=None):
             bad = loaded_regs(dis[at]) & sra
             if bad:
                 out.append(f'{tag}: load destination {",".join(sorted(map(name, bad)))} of "{dis[at]}" is a static register')
+        # I3: a swap or fetch-and-op atomic loads into Rt, UNKNOWN after an abort like any load; CAS/CASP restore their
+        # compared-and-loaded register on an abort (DDI0487 C6.2 CAS, CASP), so it may be a static register.
+        if acc and acc[0] in ('swap', 'atomic') and not dis[at].startswith('cas'):
+            bad = {reg(dis[at].partition(' ')[2].split(',')[1])} & sra
+            if bad:
+                out.append(f'{tag}: atomic destination {",".join(sorted(map(name, bad)))} of "{dis[at]}" is a static register')
     for g, ss in by_insn.items():
-        stores = [s for s in ss if s['kind'] in ('store', 'store_pair', 'push', 'push_pair')]
+        stores = [s for s in ss if s['kind'] in ('store', 'store_pair', 'push', 'push_pair', 'swap', 'atomic')]
         if len(stores) > 1:
             out.append(f'guest +{g}: {len(stores)} store sites')
         if stores and stores[-1]['native_offset'] != max(s['native_offset'] for s in ss):
@@ -714,6 +724,12 @@ ADVERSARIAL = {   # one or more per precision patch; registers point into the ge
     'test-bt-mem-dead-flags': ['test dword ptr [rsi], 1', 'sub rax, rax', 'bt qword ptr [rdi], 3', 'xor eax, eax'],
     'push-pop-pairs': ['push rax', 'push rbx', 'pop rcx', 'pop rdx', 'push 7', 'push rsp', 'pop rsp'],
     'rmw-add-carry-in-out': ['sub rax, rcx', 'add qword ptr [rbx], rcx', 'adc rdx, 0'],
+    # I3: every LOCK form after flag writers (the atomic is the instruction's only, store-class site; its destination never a
+    # static register but CAS/CASP's restored compare register), LOCK NEG's load + casal and self-exit, cmpxchg8b/16b.
+    'lock-forms': ['sub rax, rcx', 'lock add qword ptr [rbx], rcx', 'stc', 'lock adc dword ptr [rsi], 5', 'lock xadd qword ptr [rdi], rax',
+                   'lock cmpxchg qword ptr [rbx], rdx', 'lock inc word ptr [rsi]', 'lock not byte ptr [rdi]', 'lock bts qword ptr [rbx], rax',
+                   'lock sbb qword ptr [rbx], r9', 'xchg qword ptr [rsi], r9', 'lock cmpxchg16b xmmword ptr [rbx]', 'cmpxchg8b qword ptr [rsi]',
+                   'lock dec dword ptr [rdi]', 'lock neg qword ptr [rdi]'],
     'rmw-forms': ['add byte ptr [rbx], 1', 'and qword ptr [rbx], rcx', 'inc qword ptr [rsi]', 'neg dword ptr [rdi]',
                   'sub rax, rdx', 'sbb qword ptr [rbx], rax', 'shl qword ptr [rbx], cl', 'btc qword ptr [rdi], rax', 'not word ptr [rsi]'],
     'flags-before-store-kept': ['add rax, rcx', 'mov qword ptr [rbx], rdx', 'sub rax, rcx'],

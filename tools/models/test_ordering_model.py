@@ -200,5 +200,84 @@ class ExchangeChainTests(unittest.TestCase):
             model.validate(model.Litmus('bad', ((('store', 'x', 1),),), (('x', 0),), (('final', 'y'),)))
 
 
+class LockedReadModifyWriteTests(unittest.TestCase):
+    """I3: ('rmw', destination, address, function, operand), a LOCKed read-modify-write."""
+    SB = model.Litmus('sb-rmw', ((('store', 'x', 1), ('rmw', None, 'd0', 'add', 1), ('load', 'r0', 'y')),
+                                 (('store', 'y', 1), ('rmw', 'o1', 'd1', 'or', 4), ('load', 'r1', 'x'))),
+                      (('d0', 0), ('d1', 0), ('x', 0), ('y', 0)), ((0, 'r0'), (1, 'r1')))
+
+    def test_locked_rmw_is_a_full_barrier_in_sb(self):
+        self.assertEqual(model.enumerate_outcomes(self.SB).outcomes, {(0, 1), (1, 0), (1, 1)})
+        with self.assertRaises(ValueError):
+            model.check_outcome(self.SB, (0, 0))
+
+    def test_counter_chain_returns_one_linear_order(self):
+        # n LOCK XADD +1 on one counter: the returned words are a permutation of 0..n-1 and the counter ends at n.
+        for n in (2, 3, 4):
+            chain = model.Litmus(f'xadd@{n}', tuple((('rmw', f'o{i}', 'c', 'add', 1),) for i in range(n)), (('c', 0),),
+                                 tuple((i, f'o{i}') for i in range(n)) + (('final', 'c'),))
+            outcomes = model.enumerate_outcomes(chain).outcomes
+            self.assertEqual(outcomes, {perm + (n,) for perm in itertools.permutations(range(n))})
+
+    def test_compare_and_swap_has_one_winner(self):
+        race = model.Litmus('cas@3', tuple((('rmw', f'o{i}', 'c', 'cas', (0, i + 1)),) for i in range(3)), (('c', 0),),
+                            tuple((i, f'o{i}') for i in range(3)) + (('final', 'c'),))
+        for o in model.enumerate_outcomes(race).outcomes:
+            winners = [i for i in range(3) if o[i] == 0]
+            self.assertEqual(len(winners), 1, o)
+            self.assertEqual(o[3], winners[0] + 1)
+            self.assertTrue(all(o[i] == o[3] for i in range(3) if i not in winners))
+
+    def test_functions_and_old_word(self):
+        for function, operand, new in [('add', 0xffffffff, 4), ('and', 6, 4), ('or', 1, 5), ('xor', 7, 2), ('neg', 0, 0xfffffffb),
+                                       ('cas', (5, 9), 9), ('cas', (4, 9), 5)]:
+            test = model.Litmus('one', ((('rmw', 'old', 'c', function, operand), ('load', 'now', 'c')),), (('c', 5),),
+                                ((0, 'old'), (0, 'now')))
+            self.assertEqual(model.enumerate_outcomes(test).outcomes, {(5, new)}, function)
+
+    def test_rmw_waits_for_its_own_buffer_and_writes_memory_directly(self):
+        test = model.Litmus('rmw-after-store', ((('store', 'x', 7), ('rmw', 'old', 'x', 'add', 1)), (('load', 'r', 'x'),)),
+                            (('x', 0),), ((0, 'old'), (1, 'r')))
+        addresses, registers = model.validate(test)
+        first = dict(model._transitions(test, model.initial_state(test), addresses, registers))[('execute', 0)]
+        self.assertNotIn(('execute', 0), dict(model._transitions(test, first, addresses, registers)))   # buffer not empty
+        self.assertEqual(model.enumerate_outcomes(test).outcomes, {(7, 0), (7, 7), (7, 8)})
+        flushed = dict(model._transitions(test, first, addresses, registers))[('flush', 0)]
+        after = dict(model._transitions(test, flushed, addresses, registers))[('execute', 0)]
+        self.assertEqual((after.buffers[0], after.memory), ((), (8,)))
+
+    def test_positive_controls_atomicity_and_drain_are_load_bearing(self):
+        ordinary = model._transitions
+
+        def no_drain(test, state, addresses, registers):     # an rmw that ignores its own buffer (as a plain RMW would)
+            yield from ordinary(test, state, addresses, registers)
+            for cpu, program in enumerate(test.programs):
+                pc = state.pcs[cpu]
+                if pc < len(program) and program[pc][0] == 'rmw' and state.buffers[cpu]:
+                    op = program[pc]; a = addresses.index(op[2]); old = state.memory[a]
+                    regs = state.registers
+                    if op[1] is not None:
+                        regs = model.replace_at(regs, cpu, model.replace_at(regs[cpu], registers[cpu].index(op[1]), old))
+                    yield ('execute', cpu), model.State(model.replace_at(state.pcs, cpu, pc + 1), state.buffers,
+                                                        model.replace_at(state.memory, a, model.RMW_FUNCTIONS[op[3]](old, op[4])), regs)
+        with patch.object(model, '_transitions', no_drain):
+            self.assertIn((0, 0), model.enumerate_outcomes(self.SB).outcomes)
+        # Two loads may both read 0 before either store (what lets a non-atomic increment lose an update); the locked adds'
+        # exact outcome set below, with no (0, 0, 1), is the load-bearing atomicity check.
+        split = model.Litmus('split-add', tuple((('load', f'o{i}', 'c'), ('store', 'c', i + 1)) for i in range(2)), (('c', 0),),
+                             ((0, 'o0'), (1, 'o1'), ('final', 'c')))
+        self.assertIn((0, 0, 2), model.enumerate_outcomes(split).outcomes)     # both read 0: one update lost
+        locked = model.Litmus('locked-add', tuple((('rmw', f'o{i}', 'c', 'add', 1),) for i in range(2)), (('c', 0),),
+                              ((0, 'o0'), (1, 'o1'), ('final', 'c')))
+        self.assertNotIn((0, 0, 1), model.enumerate_outcomes(locked).outcomes)
+        self.assertEqual(model.enumerate_outcomes(locked).outcomes, {(0, 1, 2), (1, 0, 2)})
+
+    def test_rmw_shapes_are_validated(self):
+        for op in (('rmw', 'o', 'c', 'mul', 2), ('rmw', 'o', 'c', 'cas', 1), ('rmw', 'o', 'c', 'add', 1 << 32), ('rmw', 'o', 'z', 'add', 1),
+                   ('rmw', '', 'c', 'add', 1), ('rmw', 'o', 'c', 'add')):
+            with self.subTest(op=op), self.assertRaises(ValueError):
+                model.validate(model.Litmus('bad', ((op,),), (('c', 0),), ((0, 'o'),) if op[1] else (('final', 'c'),)))
+
+
 if __name__ == '__main__':
     unittest.main()

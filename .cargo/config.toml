@@ -2,4 +2,5 @@
 jobs = 2
 
 [target.aarch64-unknown-none]
-rustflags = ["-C", "link-arg=-Tcrates/runtime/linker.ld", "-C", "relocation-model=static"]
+# No jump tables in the resident: tools/check_resident_stack.py refuses any unlisted indirect branch (`br`).
+rustflags = ["-C", "link-arg=-Tcrates/runtime/linker.ld", "-C", "relocation-model=static", "-C", "jump-tables=no"]
