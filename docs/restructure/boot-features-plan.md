@@ -134,11 +134,13 @@ The owner decides which measured costs, if any, enter this phase; the performanc
 the chunks most exposed to those costs (S3 syscall/PTI CR3 switches, X3 IPIs); no result is presumed.
 
 ```
-C0 (needs Q2) ────────────────────────────── feeds I1–I8
+Foundation: E1 (done) → E1b (GIC doorbell + unlinking stop) → E2 (EL0) → E3 (guard off, admission split) → E4 review
+            then G1 (guest-state page) and K1 (code cache across CR3/INVLPG); L0 (host split) any time
+C0 (download allowed) ─────────────────────── feeds I1–I8
 ISA:        I1 → I7 → I2 → I3 → I5a → I5b → I6, (I8)
-System:     S1 → S2a → S2b → S3 (needs I7)
+System:     S1 → S2a → S2b → S3 (needs I7) → S4 (TF single-step, DR breakpoints; after X1a)
 Delivery:   X1a (needs S2b) → X1b (needs S3 for LSL) → X1c
-Events:     X2 (driver-injected events; needs X1a) → X3 (needs M3, L5) → X4 (needs I3, I7)
+Events:     X2 (GIC doorbell events from E1b; needs X1a) → X3 (needs M3, L5) → X4 (needs I3, I7)
 Memory:     M1 → M2 → M3
 Devices:    L0 → L1, L2;  L3 → L4a → L4b;  L5
 P1 decision ─ before S3 and X3
@@ -166,6 +168,13 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 
 | Chunk | Content | Check (reference) | Keep green (focus) | Stop when |
 | --- | --- | --- | --- | --- |
+| **E1b** GIC doorbell + unlinking stop | HVF GIC; kicks and cross-vCPU posts as SGIs/SPIs; IRQ handler patches the running block's exits; `bl pad` removed (fexc series12) | `kicks` precision at 1/2/4 vCPUs incl. oversubscribed; adversarial random-IRQ test; QEMU | standing suite | every stop at a block boundary; per-entry cost gone |
+| **E2** EL0 switch | Page roles (code execute-only, L1 code, EL1-only resident), lower-EL vectors, EC 0x24/0x20 at EL0, stop and fault paths from EL0 | Standing suite; trap checks for system instructions at EL0 | standing suite | all green at EL0 |
+| **E3** guard off, admission split | Remove patch-0007 guard words and checks; admission = mandatory object validation + optional code-shape debug; negative tests: every former window address and both canonical straddles give #GP/#SS | Faults suite + new negative cells; census | standing suite | 0 guard words; all #GP/#SS exact |
+| **E4** review | Independent review of E1b–E3 as one design | — | standing suite | ACCEPT |
+| **G1** guest-state page | One EL0 page per vCPU at a fixed non-canonical address holding only FEX guest-state fields (DF, FS/GS, MXCSR, x87, AVX-high); documented deviation; invariant test | Layout test; non-#GP limited to that page | standing suite | invariant test fails on any non-guest field |
+| **K1** code cache across CR3/INVLPG | Blocks filed by guest-physical source pages; CR3/INVLPG drop only shadows; linear→physical revalidation on lookup; per-page invalidation for host/device writes | Address-space switch programs keep translations (counted); remap/rewrite always retranslated; QEMU at 1–4 vCPUs | `system`, `coherence`, `sharedpt` | no full flush on CR3 |
+| **S4** debug: TF and breakpoints | TF/RF single-step, DR0–3/DR7 execute and data breakpoints, #DB delivery, interaction with linking/dispatch (CPU 16 requires it) | QEMU programs; SDM model | standing suite | #DB exact per SDM |
 | **C0** census (after Q2) | Static census of instruction forms admission refuses, over the Debian decompressor, the decompressed vmlinux and the initramfs `/init` binaries, by H §2's static-share method with fexc's classifier | Counts per form and per binary; spot-check against `llvm-objdump` | — | every refused form is listed with its I-chunk or a proposed typed refusal |
 | **L0** host split | Host library + driver crate; generic stop-ELR hook for `forge_stop` (slice-3 phase-end deviation); manifest-taking boot entry stub | Standing suite; `contain` tampers fire | all | green; no tamper code in the library |
 | **S1** CPU profile | CPUID table and MSR whitelist keyed to the CPU 9/16/17 tables plus a grep of every non-safe `rdmsr`/`wrmsr` in the fetched sources (and C0 when available); UCODE_REV latch, TSC_AUX, MTRR state from the manifest; CPUID/RDMSR/WRMSR transactions; rederived fault-model profile (independent author) | Unit tests per leaf and per MSR against the record tables; `verify_cpu` and LA57 transcriptions; unknown MSR → #GP | `system` | every leaf of the CPU 16 table and every non-safe MSR found by the grep has a test |
