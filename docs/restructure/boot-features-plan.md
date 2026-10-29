@@ -276,6 +276,9 @@ running block's exits (including computed exits) to stop, restores them after; n
 `hv_vcpus_exit` under the watchdog (a failed or lost doorbell is contained — the run stops — not recovered). A precise
 host fallback remains possible if wanted (exit, then enter the resident's IRQ path with the exited PC). Owner informed.
 **Owner decision (October 28): MTRRs enabled by the virtual firmware, RAM write-back, device ranges uncached** (plan Q3).
+**Deferred (owner, October 28):** replacing the host's minimal JSON reader (`crates/host/src/json.rs`, used only for
+fexc's per-compile report: end reason and cut opcode) by carrying those fields in the code-object header; no registry
+dependency (serde_json) is added.
 
 **Decided from evidence (recorded, not questions):** guest RAM default 2 GiB, tests choose their own size (M69);
 INIT/SIPI deferred, unused with the mailbox (`K kernel/smpboot.c:877-928`; M64 keeps the definition); legacy devices
