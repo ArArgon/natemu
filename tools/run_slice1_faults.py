@@ -120,11 +120,34 @@ def divide_error(signed, w, divisor, rax, rdx):
     q = abs(n) // abs(d) * (1 if (n < 0) == (d < 0) else -1)
     return not -(1 << (bits - 1)) <= q < 1 << (bits - 1)
 
+STRING = re.compile(r'(?:(rep|repe|repne)\s+)?(movs|stos|lods|scas|cmps)([bwdq]?)\b(.*)')
+
+def string_events(text, regs):
+    """I2: the accesses of ONE element of a string instruction at the registers `regs` (the element they point at), or None
+    if `text` is no string instruction. In architectural order: movs reads [RSI] then writes [RDI], cmps reads [RDI] then
+    [RSI] (QEMU's and fexc's order; the SDM gives none); the DS:RSI source adds an FS/GS base (`regs['fs']`/`regs['gs']`),
+    ES:RDI takes no override; a REP form with RCX = 0 accesses nothing. Never a stack reference (#GP(0) when non-canonical)."""
+    x = STRING.fullmatch(text.strip())
+    if not x: return None
+    rep, op, suffix, rest = x.groups()
+    w = {'b': 1, 'w': 2, 'd': 4, 'q': 8}.get(suffix) or SIZES[re.search(r'(byte|word|dword|qword) ptr', rest)[1]]
+    if rep and regs['rcx'] == 0: return []
+    seg = re.search(r'([fg]s):\[rsi\]', rest)
+    src, dst = (regs['rsi'] + (regs.get(seg[1], 0) if seg else 0)) & M64, regs['rdi']
+    order = {'movs': [(src, False), (dst, True)], 'stos': [(dst, True)], 'lods': [(src, False)], 'scas': [(dst, False)],
+             'cmps': [(dst, False), (src, False)]}[op]
+    return [('access', a, w, write, False) for a, write in order]
+
 def events(text, regs, next_rip):
     """One instruction's guest data accesses and branch-target check, in architectural order:
     ('access', address, bytes, write intent, stack segment), ('target', register value | ('mem', address)) and
     ('divide', signed, bytes, divisor value | ('mem', address), rax, rdx)."""
     m, ops = text.split()[0], split_operands(text)
+    # I2: a single string instruction is one element; a REP form's later elements depend on the earlier ones (counted
+    # per element by tools/run_slice2_faults.py from QEMU's signal context), so it is never guessed here.
+    if (one := string_events(text, regs)) is not None:
+        if STRING.fullmatch(text.strip())[1]: raise Unsupported(text)
+        return one
     def mem(op):
         # I7: an FS/GS override adds that segment's base (`regs['fs']`/`regs['gs']`, from the program) and makes the
         # reference an FS/GS one (#GP(0) when non-canonical, whatever the base register); CS/DS/ES/SS add nothing (the

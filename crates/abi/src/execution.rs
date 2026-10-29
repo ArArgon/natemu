@@ -417,12 +417,26 @@ pub struct Cpu {
     pub cpl: u64,
     /// FS.base and GS.base (64-bit mode: the only segment bases that apply, I7). Authoritative here: the resident writes
     /// them into the guest-state page ([`frame::FS_BASE`], [`frame::GS_BASE`]) at every block entry and never reads
-    /// them back; only the resident changes them (WRFSBASE/WRGSBASE, the MSRs and SWAPGS are its transactions, S3).
+    /// them back, so a guest store into the page changes what that vCPU's prefixed accesses use only until the next
+    /// `enter`; only the resident changes them (WRFSBASE/WRGSBASE, the MSRs and SWAPGS are its transactions, S3).
     pub fs_base: u64,
     pub gs_base: u64,
+    /// CR2 (the page-fault linear address: any 64-bit value; #PF delivery writes it, X1) and CR8 (the task-priority
+    /// class, bits 3:0; SDM Vol.3 10.8.6.1: it becomes an alias of the LAPIC's TPR bits 7:4 when the LAPIC exists, X3).
+    pub cr2: u64,
+    pub cr8: u64,
+    /// DR0..DR3, DR6, DR7 (MOV DR4/DR5 reach DR6/DR7 while CR4.DE = 0). State only: no breakpoint is armed (S4).
+    pub dr: [u64; 6],
 }
 
 pub const CR0_PE: u64 = 1;
+/// MP, EM, TS (SDM Vol.3 2.5, Table 2-2): recorded; they gate x87/MMX/SSE (#NM, #UD), which no admitted form is yet (I5, I6).
+pub const CR0_MP: u64 = 1 << 1;
+pub const CR0_EM: u64 = 1 << 2;
+pub const CR0_TS: u64 = 1 << 3;
+/// Alignment mask: with RFLAGS.AC at CPL 3, alignment checking (#AC), which is not built: [`Cpu::control`] refuses it.
+pub const CR0_AM: u64 = 1 << 18;
+pub const RFLAGS_AC: u64 = 1 << 18;
 /// Hard-wired to 1 (SDM vol. 3 §2.5); writes are ignored.
 pub const CR0_ET: u64 = 1 << 4;
 pub const CR0_WP: u64 = 1 << 16;
@@ -433,6 +447,23 @@ pub const CR4_SMAP: u64 = 1 << 21;
 pub const CR4_LA57: u64 = 1 << 12;
 pub const CR4_PGE: u64 = 1 << 7;
 pub const CR4_PCIDE: u64 = 1 << 17;
+/// Debug extensions: MOV DR4/DR5 raise #UD instead of aliasing DR6/DR7 (SDM Vol.3 17.2.2).
+pub const CR4_DE: u64 = 1 << 3;
+/// RDPMC allowed at CPL > 0.
+pub const CR4_PCE: u64 = 1 << 8;
+/// DR6 and DR7 in 64-bit mode (SDM Vol.3 17.2.3, 17.2.4; no RTM or bus-lock detection in the profile): bits 63:32
+/// reserved (#GP on a write of 1); DR6 writable B0..B3, BD, BS, BT, the rest fixed (1 in 31:16 and 11:4, 0 in 12); DR7
+/// writable L0..G3, LE, GE, GD and the R/W, LEN fields, bit 10 fixed 1, bits 11, 12, 14, 15 fixed 0.
+pub const DR6_FIXED: u64 = 0xffff_0ff0;
+pub const DR6_WRITABLE: u64 = 0xe00f;
+pub const DR6_BD: u64 = 1 << 13;
+pub const DR7_FIXED: u64 = 0x400;
+pub const DR7_WRITABLE: u64 = 0xffff_23ff;
+pub const DR7_GD: u64 = 1 << 13;
+/// DR7 L0..L3, G0..G3: a set bit arms a breakpoint (S4).
+pub const DR7_ENABLES: u64 = 0xff;
+/// [`Cpu::dr`] at reset (SDM Vol.3 Table 10-1: DR0..DR3 0, DR6 FFFF0FF0H, DR7 400H).
+pub const DR_RESET: [u64; 6] = [0, 0, 0, 0, DR6_FIXED, DR7_FIXED];
 /// CR3 bits a 4-level walk ignores without PCIDE (kept in CR3): 2:0 and 11:5. PWT/PCD (4:3) are not ignored.
 pub const CR3_IGNORED: u64 = 0xfe7;
 pub const EFER_SCE: u64 = 1;
@@ -445,12 +476,15 @@ impl Cpu {
     /// (paging off, legacy/PAE, LA57, SMAP: not supported by this slice), and
     /// for a CR3 with PWT/PCD or bits above the physical-address width set (memory types of the
     /// root table are not modelled; refused rather than ignored). [`CR3_IGNORED`] bits are ignored.
+    /// Also `None` while alignment checking is on (CR0.AM, RFLAGS.AC, CPL 3; SDM Vol.3 6.15 #AC): no access site checks
+    /// alignment, so that state is refused, not run without #AC.
     pub fn control(&self) -> Option<Control> {
         let long = self.cr0 & (CR0_PE | CR0_PG) == CR0_PE | CR0_PG
             && self.cr4 & CR4_PAE != 0
             && self.cr4 & (CR4_LA57 | CR4_SMAP) == 0
             && self.efer & (EFER_LME | EFER_LMA) == EFER_LME | EFER_LMA;
-        (long && matches!(self.cpl, 0 | 3) && self.cr3 & !(paging::PA_MASK | CR3_IGNORED) == 0).then_some(Control {
+        let alignment_check = self.cr0 & CR0_AM != 0 && self.rflags & RFLAGS_AC != 0 && self.cpl == 3;
+        (long && !alignment_check && matches!(self.cpl, 0 | 3) && self.cr3 & !(paging::PA_MASK | CR3_IGNORED) == 0).then_some(Control {
             cr3: self.cr3 & paging::PA_MASK,
             cpl: self.cpl,
             wp: u64::from(self.cr0 & CR0_WP != 0),
@@ -552,7 +586,7 @@ pub struct System {
     pub length: u32,
     /// The instruction has a LOCK prefix (#UD).
     pub lock: u32,
-    /// MOV CR: the control register number (0..15, REX.R included) and the general register.
+    /// MOV CR/DR: the control or debug register number (0..15, REX.R included) and the general register.
     pub cr: u32,
     pub reg: u32,
     /// INVLPG's memory operand: base register ([`system::RIP`] for RIP-relative, [`system::NO_REG`] for none), index
@@ -577,6 +611,11 @@ pub mod system {
     pub const CPUID: u32 = 7;
     pub const RDTSC: u32 = 8;
     pub const RDTSCP: u32 = 9;
+    /// DR `cr` := GPR `reg`; GPR `reg` := DR `cr`.
+    pub const MOV_TO_DR: u32 = 10;
+    pub const MOV_FROM_DR: u32 = 11;
+    /// RDPMC (the profile has no performance counters: always #GP(0) or #UD).
+    pub const RDPMC: u32 = 12;
     /// `System::base` of a RIP-relative operand (relative to the next instruction).
     pub const RIP: u32 = 16;
     pub const NO_REG: u32 = 0xff;
@@ -588,12 +627,12 @@ pub mod system {
             (1..=15).contains(&self.length)
                 && self.lock <= 1
                 && match self.kind {
-                    MOV_TO_CR | MOV_FROM_CR => reg(self.cr) && reg(self.reg),
+                    MOV_TO_CR | MOV_FROM_CR | MOV_TO_DR | MOV_FROM_DR => reg(self.cr) && reg(self.reg),
                     INVLPG => (reg(self.base) || self.base == RIP || self.base == NO_REG)
                         && (reg(self.index) || self.index == NO_REG)
                         && self.scale <= 3
                         && (self.base != RIP || self.index == NO_REG),
-                    RDMSR | WRMSR | CPUID | RDTSC | RDTSCP => true,
+                    RDMSR | WRMSR | CPUID | RDTSC | RDTSCP | RDPMC => true,
                     SET_CPL => matches!(self.cr, 0 | 3),
                     _ => false,
                 }
@@ -603,7 +642,9 @@ pub mod system {
 
 /// `State::stop`: why the resident stopped the VM (`hvc #0x49`).
 pub mod stop {
-    /// The bank does not describe a supported mode.
+    /// The bank does not describe a supported mode ([`super::Cpu::control`] is `None`). When a transaction's change
+    /// caused it (e.g. alignment checking: CR0.AM with RFLAGS.AC at CPL 3), the record holds the new CR0/CPL and the old
+    /// RIP (the instruction that made the change).
     pub const UNSUPPORTED_MODE: u64 = 1;
     /// The host reply or staged object is unusable.
     pub const BAD_REPLY: u64 = 2;
@@ -626,8 +667,8 @@ pub mod stop {
     /// A stop that is not one: an IRQ outside generated code or in a dead block, a [`super::STOP_WORD`] trap at a word
     /// the resident did not patch, or an armed patch record whose words do not hold the stop word.
     pub const BAD_STOP: u64 = 11;
-    /// A system instruction whose form or operand value the resident does not implement (e.g. MOV from CR2, a CR0 or
-    /// CR4 feature bit change, CR3 with PWT/PCD); nothing of it was executed.
+    /// A system instruction whose form or operand value the resident does not implement (e.g. CR3 with PWT/PCD, a DR7
+    /// enabling a breakpoint); nothing of it was executed.
     pub const UNSUPPORTED_SYSTEM: u64 = 12;
     /// A locked access the resident does not complete: a memory XCHG whose operand crosses a 16-byte boundary (an
     /// alignment fault at its `swpal`, before any effect; contract: split locks wait for the boot phase).
@@ -882,7 +923,8 @@ mod tests {
         let invlpg = System { kind: system::INVLPG, length: 7, base: system::RIP, ..System::NONE };
         assert!(mov.well_formed() && invlpg.well_formed());
         for bad in [
-            System { kind: 10, ..mov },
+            System { kind: 13, ..mov },
+            System { kind: system::MOV_FROM_DR, cr: 16, ..mov },
             System { length: 0, ..mov },
             System { length: 16, ..mov },
             System { reg: 16, ..mov },
@@ -909,6 +951,9 @@ mod tests {
             cpl: 3,
             fs_base: 0,
             gs_base: 0,
+            cr2: 0,
+            cr8: 0,
+            dr: DR_RESET,
         };
         let c = cpu.control().unwrap();
         assert_eq!((c.cr3, c.cpl, c.wp, c.nxe, c.smep), (0x1000, 3, 1, 1, 0));
@@ -920,10 +965,19 @@ mod tests {
             Cpu { cpl: 1, ..cpu },
             Cpu { cr3: 0x1008, ..cpu },
             Cpu { cr3: 0x1000 | 1 << 40, ..cpu },
+            Cpu { cr0: cpu.cr0 | CR0_AM, rflags: cpu.rflags | RFLAGS_AC, ..cpu }, // #AC would be due (not built)
         ] {
             assert_eq!(bad.control(), None);
         }
         // Ignored CR3 bits stay in CR3 (and in the code context) but not in the walk's root.
         assert_eq!(Cpu { cr3: 0x1fe7, ..cpu }.control().unwrap().cr3, 0x1000);
+        // AM or AC alone, or both at CPL 0, check nothing.
+        for fine in [
+            Cpu { cr0: cpu.cr0 | CR0_AM, ..cpu },
+            Cpu { rflags: cpu.rflags | RFLAGS_AC, ..cpu },
+            Cpu { cr0: cpu.cr0 | CR0_AM, rflags: cpu.rflags | RFLAGS_AC, cpl: 0, ..cpu },
+        ] {
+            assert!(fine.control().is_some());
+        }
     }
 }

@@ -1,9 +1,9 @@
 //! System instructions the resident executes as transactions (`natemu_abi::execution::System`): operand decoding of
 //! the instruction fexc cut a block before. FEX's decoder classifies the instruction (fexc's `system_instruction` cut
 //! with its opcode map and opcode); it does not decode the ModRM of `0f 20..23` (two bytes there), so the operands of
-//! the supported forms are decoded here and must agree with FEX's opcode: MOV to/from CR0..CR15 (`0f 22`/`0f 20`,
-//! ModRM always a register pair), INVLPG m (`0f 01 /7`, mod != 3), RDMSR (`0f 32`), WRMSR (`0f 30`), CPUID (`0f a2`),
-//! RDTSC (`0f 31`) and RDTSCP (`0f 01 f9`) in 64-bit mode. Anything else (other system instructions, F2/F3 prefixes, an address-size prefix or an FS/GS override on
+//! the supported forms are decoded here and must agree with FEX's opcode: MOV to/from CR0..CR15 (`0f 22`/`0f 20`) and
+//! DR0..DR15 (`0f 23`/`0f 21`; ModRM always a register pair), INVLPG m (`0f 01 /7`, mod != 3), RDMSR (`0f 32`), WRMSR
+//! (`0f 30`), RDPMC (`0f 33`), CPUID (`0f a2`), RDTSC (`0f 31`) and RDTSCP (`0f 01 f9`) in 64-bit mode. Anything else (other system instructions, F2/F3 prefixes, an address-size prefix or an FS/GS override on
 //! INVLPG) is `None`: the vCPU stops with fexc's reason, as for code it cannot compile.
 use natemu_abi::execution::{System, system};
 
@@ -39,14 +39,15 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
     at += 2;
     let mut s = System { lock: u32::from(lock), ..System::NONE };
     match opcode {
-        0x20 | 0x22 => {
+        0x20..=0x23 => {
             // The mod field is ignored: the operand is always a register.
             let modrm = *bytes.get(at)?;
             at += 1;
-            s.kind = if opcode == 0x22 { system::MOV_TO_CR } else { system::MOV_FROM_CR };
+            s.kind = [system::MOV_FROM_CR, system::MOV_FROM_DR, system::MOV_TO_CR, system::MOV_TO_DR][usize::from(opcode - 0x20)];
             (s.cr, s.reg) = (u32::from(modrm >> 3 & 7) | r, u32::from(modrm & 7) | b);
         }
         0x30 | 0x32 => s.kind = if opcode == 0x30 { system::WRMSR } else { system::RDMSR },
+        0x33 => s.kind = system::RDPMC,
         0xa2 => s.kind = system::CPUID,
         0x31 => s.kind = system::RDTSC,
         0x01 if *bytes.get(at)? == 0xf9 => {
@@ -125,6 +126,11 @@ mod tests {
         assert_eq!(d("f00fa2", 0xa2), Some(System { kind: CPUID, length: 3, lock: 1, ..System::NONE })); // #UD
         assert_eq!(d("480f31", 0x31), Some(System { kind: RDTSC, length: 3, ..System::NONE }));
         assert_eq!(d("670f01f9", 0x01), Some(System { kind: RDTSCP, length: 4, ..System::NONE })); // 67 ignored
+        assert_eq!(d("0f21c0", 0x21), Some(mov(MOV_FROM_DR, 0, 0, 3, 0))); // mov rax, dr0
+        assert_eq!(d("0f23f9", 0x23), Some(mov(MOV_TO_DR, 7, 1, 3, 0))); // mov dr7, rcx
+        assert_eq!(d("450f21e3", 0x21), Some(mov(MOV_FROM_DR, 12, 11, 4, 0))); // mov r11, dr12 (REX.R: #UD in the resident)
+        assert_eq!(d("f00f2300", 0x23), Some(mov(MOV_TO_DR, 0, 0, 4, 1))); // lock mov dr0, rax (mod 0 ignored)
+        assert_eq!(d("0f33", 0x33), Some(System { kind: RDPMC, length: 2, ..System::NONE }));
     }
 
     #[test]
@@ -147,7 +153,8 @@ mod tests {
             ("670f0138", MAP_TWO, 0x01), // 32-bit address
             ("650f0138", MAP_TWO, 0x01), // GS override
             ("f30f22d8", MAP_TWO, 0x22), // F3
-            ("0f21c0", MAP_TWO, 0x21),   // mov from a debug register
+            ("0f21c0", MAP_TWO, 0x23),   // FEX's opcode disagrees
+            ("f30f33", MAP_TWO, 0x33),   // F3 rdpmc
             ("0f22", MAP_TWO, 0x22),     // truncated ModRM
             ("0f013c", MAP_TWO, 0x01),   // truncated SIB
             ("0f017810", MAP_TWO, 0x01), // fine, but see below: complete

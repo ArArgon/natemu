@@ -78,7 +78,7 @@ paging-off support), and the slice-1/2 contracts. Runners (all under `tools/`, e
 | 41 | faults and loop faults at block sizes default and 1, precision verifier, admission. |
 | 42 | Retired (S3a2 table): no acknowledgement protocol; shadows are each vCPU's TLB. |
 | 43 | litmus XCHG chains (linearizable), faults (XCHG access forms, split-lock probes → `unsupported_atomic`), loop faults (XCHG stride). Under remap: retired with 42. LOCK ADD/CMPXCHG/XADD/BT*, CMPXCHG8B/16B, split locks: boot phase. |
-| 44 | Boot phase (REP partial progress). |
+| 44 | I2: REP strings one element per pass (registers exact at every element): QEMU corpus `gen_i2.py` at block sizes default and 1; mid-string faults against QEMU's signal context (`run_slice2_faults.py` on its flow form, 112 midway); kicks `rep@N` (stops between elements, resumed exactly). Read-once of device sources: M3 (MMIO strings are a typed stop). |
 | 45 | Retired (S3h table): no global service lock or queue; successor property checked by coherence `mutual`. |
 | 46 | Replaced by the synchronous shootdown (S3h table): coherence `fresh-reused` (control: shootdown off fails), contain `unacked`. |
 | 47 | contain progress, litmus, sharedpt contended walks (S3h table); the heads bound retired with the queue. |

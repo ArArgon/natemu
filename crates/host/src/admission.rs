@@ -139,6 +139,17 @@ fn branch_target(insn: &[u8], end: u64) -> Option<u64> {
     Some(end.wrapping_add(rel as u64))
 }
 
+/// Whether `insn` is a REP/REPE/REPNE string instruction (movs, cmps, stos, lods, scas): legacy prefixes including F2 or
+/// F3, an optional REX, then a4-a7/aa-af as the instruction's last byte. Such an instruction ends its block and exits to its own RIP while RCX is
+/// not 0 (I2), so that RIP is a proven literal-exit target.
+fn rep_string(insn: &[u8]) -> bool {
+    let start = insn.iter().position(|b| !matches!(b, 0xf0 | 0xf2 | 0xf3 | 0x66 | 0x67 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65));
+    let Some(start) = start else { return false };
+    let opcode = insn[start..].iter().position(|b| b & 0xf0 != 0x40).map(|i| start + i);
+    let rep = insn[..start].iter().any(|&b| b == 0xf2 || b == 0xf3);
+    rep && opcode.is_some_and(|o| o <= start + 1 && o + 1 == insn.len() && matches!(insn[o], 0xa4..=0xa7 | 0xaa..=0xaf))
+}
+
 /// Admits `bytes`, an fexc `--object` compiled at `rip` from `source` (the guest
 /// bytes given to fexc), for a vCPU executing `supported` feature bits; `shape` adds the code-shape check.
 pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64, shape: bool) -> Result<Admitted, String> {
@@ -297,7 +308,8 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
     }
     let admitted =
         Admitted { object: out, guest_bytes: h.guest_bytes, guest_insns: h.guest_insns, end_reason: h.end_reason, links: Vec::new(), dispatch_exit: None };
-    let targets = [Some(end), target].into_iter().flatten().collect();
+    let own = rep_string(&source[last..h.guest_bytes as usize]).then_some(rip.wrapping_add(last as u64));
+    let targets = [Some(end), target, own].into_iter().flatten().collect();
     Ok((admitted, Parts { header: h, sites, pcs, relocs, literals, targets }))
 }
 
@@ -488,6 +500,19 @@ mod tests {
     const ALL: u64 = u64::MAX;
     /// Guest bytes of the test block: `rex jmp $+1` (target RIP + 4).
     const SOURCE: [u8; 3] = [0x48, 0xeb, 0x01];
+
+    #[test]
+    fn rep_string_forms() {
+        for insn in [&[0xf3, 0x48, 0xab][..], &[0xf3, 0xa4], &[0xf2, 0xae], &[0xf3, 0x66, 0xa7], &[0x64, 0xf3, 0x48, 0xa5], &[0xf3, 0x65, 0xac]] {
+            assert!(super::rep_string(insn), "{insn:x?}");
+        }
+        // No repeat prefix, a REP on a non-string opcode (rep ret, pause), two REX bytes, a ModRM-like tail, or bytes after the
+        // opcode (the span must be exactly one instruction) is not one.
+        for insn in [&[0x48, 0xab][..], &[0xa4], &[0xf3, 0xc3], &[0xf3, 0x90], &[0xf3, 0x48, 0x48, 0xab], &[0xf3, 0x0f, 0xa4], &[0xf3], &[],
+                     &[0xf3, 0xab, 0x90], &[0xf3, 0xa4, 0x75, 0x40]] {
+            assert!(!super::rep_string(insn), "{insn:x?}");
+        }
+    }
 
     #[test]
     fn valid_object_is_admitted_with_resolved_literal() {

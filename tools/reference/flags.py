@@ -37,6 +37,10 @@ ZCNT = {'tzcnt', 'lzcnt'}                                       # CF = (src == 0
 BMI_LOGIC = {'andn': ZF | SF, 'bextr': ZF, 'blsi': ZF | SF, 'blsmsk': SF, 'blsr': ZF | SF, 'bzhi': ZF | SF}
 #   defined: ZF/SF as given by the result (blsmsk: ZF cleared), CF (andn, bextr: cleared; blsi: src != 0; blsmsk, blsr:
 #   src == 0; bzhi: index > size-1), OF cleared; AF and PF undefined, and SF too where not listed.
+# I2 string instructions. movs/stos/lods write no flags; cmps/scas define all six like cmp (each element), so a REP form
+# with an initial count of 0 (annotation `count`) leaves them untouched.
+STRING_MOVES = {'movs', 'stos', 'lods'}
+STRING_COMPARES = {'cmps', 'scas'}
 
 
 def step(insn, undefined):
@@ -56,7 +60,8 @@ def step(insn, undefined):
     elif op == 'pushf': reads = ARITH                                # the pushed image holds every flag
     if reads & undefined:
         raise ValueError(f"{op} {insn.get('cc', '')} reads undefined flag(s) {reads & undefined:#x}")
-    if op in NO_FLAGS | NO_FLAGS_I1 | {'lahf', 'pushf'}: return undefined
+    if op in NO_FLAGS | NO_FLAGS_I1 | STRING_MOVES | {'lahf', 'pushf'}: return undefined
+    if op in STRING_COMPARES: return undefined if insn.get('count') == 0 else undefined & ~ALL6
     if op in ('clc', 'stc', 'cmc'): return undefined & ~CF
     if op == 'sahf': return undefined & ~(SF | ZF | AF | PF | CF)    # OF unaffected
     if op in ('cmpxchg', 'xadd', 'popcnt'): return undefined & ~ALL6   # cmp / add; popcnt: ZF by source, the rest cleared

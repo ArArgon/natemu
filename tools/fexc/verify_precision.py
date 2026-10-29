@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1b1 check: the slice-1 precision guarantee, verified statically on the code fexc emits (profile slice1).
 
-usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series15 build)
+usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series16 build)
 
 Corpora: fixtures/slice1/programs.json, the single-instruction matrix of scan_skips.py, the adversarial programs below
 (one per precision patch), and every CORPUS.json given (gen_slice1.py format, e.g. a fresh `--seed` corpus).
@@ -17,7 +17,8 @@ For every compile, from the disassembly, the sites, the dense PC table and the s
       data_regs; a writeback base (push/pop on RSP) is allowed, the access itself is its only write;
   P4  at most one store-class site (store, store_pair, push) per guest instruction, and it is the instruction's last site;
       no fused pair sites; every site says completed_effects=none;
-  P5  no site can be skipped by a forward branch inside its instruction (scan_skips.skips);
+  P5  no site can be skipped by a forward branch inside its instruction (scan_skips.skips), but the `cbz x7` (RCX = 0) of a
+      REP string instruction to that instruction's end (the next PC entry or its literal exit), which accesses nothing (I2);
   P6  for annotated programs (`insns`, the generator's flag annotations): for each site and each arithmetic flag, the last
       earlier instruction of the block that writes the flag, if it defines it (tools/reference/flags.py rules; an
       instruction that leaves the flag undefined defines nothing, which matches the compiler's InvalidateFlags-as-write
@@ -74,7 +75,7 @@ import check_sites, scan_skips  # noqa: E402
 from check_sites import code_vs_sites  # noqa: E402
 import flags as F  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series15/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series16/obj/fexc')
 
 NZCV_WRITERS = {'adds', 'adcs', 'subs', 'sbcs', 'ands', 'bics', 'negs', 'ngcs', 'cmp', 'cmn', 'tst', 'ccmp', 'ccmn', 'fcmp',
                 'fcmpe', 'fccmp', 'fccmpe', 'setf8', 'setf16', 'rmif', 'cfinv', 'axflag', 'xaflag'}
@@ -132,7 +133,7 @@ def flag_writes(a):
     """(written, defined) arithmetic-flag masks of one annotated instruction (flags.py rules); a shift or rotate by an
     unknown count may write nothing, so it defines nothing."""
     op = a['op']
-    if op in F.NO_FLAGS | F.NO_FLAGS_I1 | {'lahf', 'pushf'}:
+    if op in F.NO_FLAGS | F.NO_FLAGS_I1 | F.STRING_MOVES | {'lahf', 'pushf'} or op in F.STRING_COMPARES and a.get('count') == 0:
         return 0, 0
     if op == 'cmc':     # FEX flips its CF-inversion state at compile time (no native word; sites record cf_inverted), so
         return 0, 0     # the CF a later site observes is the earlier definer's, inverted: look past cmc to that write
@@ -678,7 +679,16 @@ def verify(d, tmp, insns=None):
         if stores and stores[-1]['native_offset'] != max(s['native_offset'] for s in ss):
             out.append(f'guest +{g}: the store site +{stores[-1]["native_offset"]} is not the last access of the instruction')
     out += code_vs_sites(d['sites'], dis)   # P7, code half, on every compile: no unrecorded or misdescribed access
-    out += [f'skippable site: {s}' for s in scan_skips.skips(d, tmp)]
+    # P5 (I2): a REP string instruction with RCX = 0 accesses nothing (SDM REP): its `cbz` on RCX's register (x7) to the
+    # instruction's end (the next instruction's PC entry, or the literal exit to its RIP) is x86, not a lost access.
+    rip = int(d['input']['rip'], 16)
+    ends = {}
+    for i in d['guest']['instructions']:
+        if i['translated'] and check_sites.rep_string(bytes.fromhex(i['bytes_hex'])):
+            nxt = i['offset'] + i['size']
+            ends[i['offset']] = {e['native_offset'] for e in d['pc_table']['entries'] if e['guest_offset'] == nxt} | \
+                {r['offset'] for r in d['code']['relocations'] if r['kind'] == 'guest_rip_move' and int(r['guest_rip'], 16) == rip + nxt}
+    out += [f'skippable site: {s}' for s in scan_skips.skips(d, tmp) if not (s[4].startswith('cbz x7,') and s[2] in ends.get(s[0], ()))]
     if insns:
         out += stale_flags(d, insns, dis, order)
         out += df_stores(d, insns, dis, order)
@@ -713,6 +723,9 @@ ADVERSARIAL = {   # one or more per precision patch; registers point into the ge
     'killed-by-undefined-then-access': ['add rdx, 5', 'or rsi, rdi', 'mov rax, qword ptr [rbx]', 'sub rax, rcx', 'imul rdx, rcx',
                                         'mov qword ptr [rsi], rax', 'add rax, 1', 'mul qword ptr [rdi]'],
     'undefined-flags-before-access': ['add rax, rcx', 'shl qword ptr [rbx], 3', 'mul qword ptr [rsi]', 'imul rax, qword ptr [rbx]'],
+    # I1/I2: AF = 0 from popcnt and from a cmpxchg whose operands are one register is one pooled constant; stored to x27
+    # by both instructions, it must be written natively in each (patch 0014), not coalesced into x27 once.
+    'pooled-af-constant-twice': ['popcnt r14d, r12d', 'mov qword ptr [rsi], rbx', 'cmpxchg ax, r10w', 'mov qword ptr [rbx], rax'],
     'division-flags': ['sub rax, rcx', 'div qword ptr [rbx]', 'mov qword ptr [rsi], rdx', 'add r8, 1', 'idiv ecx', 'mov rax, qword ptr [rdi]',
                        'cmp r9, r10', 'div r11b', 'adc qword ptr [rsi], 1'],
 }
@@ -775,6 +788,7 @@ def run_corpus(label, progs, tmp, before=None):
     """Verify every program; returns (violations, compiled, totals)."""
     bad, ok, sites = 0, 0, 0
     tot = {'g': 0, 'i': 0, 'b': 0, 'g0': 0, 'i0': 0, 'b0': 0, 'guard': 0, 'split': 0, 'branch': 0, 'stub': 0}
+    progs = [q for p in progs for q in (check_sites.blocks(p) if 'asm' in p else [p])]   # I2: a REP ends its block
     for p in progs:
         d = compile_(FEXC, p['code'], p['rip'])
         if d['status'] != 'ok':

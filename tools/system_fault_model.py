@@ -1,6 +1,7 @@
 """Independent reference for the exceptions of the long-mode system instructions natemu executes as resident
-transactions, written from the Intel SDM (vol. 2: MOV - Move to/from Control Registers, INVLPG, RDMSR, WRMSR; vol. 3:
-2.2.1 EFER, 2.5 control registers, 4.5 CR3 in 4-level paging), not from natemu's code.
+transactions, written from the Intel SDM (vol. 2: MOV - Move to/from Control Registers, MOV - Move to/from Debug
+Registers, INVLPG, RDMSR, WRMSR, RDPMC; vol. 3: 2.2.1 EFER, 2.5 control registers, 4.5 CR3 in 4-level paging, 10.8.6
+CR8, 17.2 debug registers), not from natemu's code.
 
 Processor profile (natemu's CPU model): read from `models/cpu_profile.json` through `models/cpu_profile.py`, which is the
 accepted CPU 16/17 profile (INV-03-01 CLM-03-01-16/-17) with a source on every value. This module no longer holds its own
@@ -9,7 +10,20 @@ memory-type and MISC_ENABLE rules) all come from the profile, so a CR4 bit is va
 advertised (SDM Vol. 3 2.5). 64-bit mode (CS.L = 1, EFER.LMA = 1) is assumed. x2APIC MSR indices (0x800-0x8ff) belong
 to the LAPIC owner and raise ValueError, like the unmodelled 0f 01 forms.
 
-`fault(code, gpr, cpl, cr0, cr4, efer)` -> (vector, error code) the instruction at the start of `code` raises, or None.
+`fault(code, gpr, cpl, cr0, cr4, efer, dr7)` -> (vector, error code) the instruction at the start of `code` raises, or None.
+
+Order of the checks where the SDM lists several without a priority: decode-class #UD first (LOCK, CR1/CR5..7/CR9..15,
+DR8..DR15 through REX.R), then #GP(0) at CPL > 0, then for MOV DR the CR4.DE #UD of DR4/DR5 (the SDM gives no order
+between these two: this follows QEMU, from reading its code; KVM's VMX exit path checks DE first; Linux runs with DE = 0,
+so the difference is not observable there), then general detect (DR7.GD: #DB, a fault before the MOV executes, SDM Vol.3 17.2.4), then the value checks
+(DR6/DR7 bits 63:32). The profile has no PMU (CPUID.0AH = 0), so every RDPMC counter index is invalid: #GP(0) at any
+CPL. Pinned QEMU agrees on all of these but two: it raises #UD for RDPMC at CPL 0 (unimplemented) and accepts CR8 bits
+63:4.
+
+`dr_write(n, value)` -> the value DR6 (n = 6) or DR7 (n = 7) reads back after a write that raised nothing (SDM Vol.3
+17.2.3, 17.2.4, no RTM or bus-lock detection): DR6 keeps B0-B3, BD, BS, BT, with bits 31:16 and 11:4 reading 1 and bit
+12 reading 0; DR7 keeps L0-G3, LE, GE, GD and the R/W, LEN fields, with bit 10 reading 1 and bits 11, 12, 14, 15 reading 0.
+
 Used where neither QEMU nor modes_model gives the answer: pinned QEMU 11.1.2 accepts several of these writes
 (reserved CR0 bits 63:32, PE=0 with PG=1, NW without CD, PCIDE without PCID, clearing CR4.PAE, reserved EFER bits,
 LME changes with paging on, unknown MSRs) and hangs on others (reserved CR4 bits, SMAP without SMAP, CR3 bits above
@@ -22,7 +36,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from models import cpu_profile
 
 PROFILE = cpu_profile.load()
-UD, GP = (6, 0), (13, 0)
+UD, GP, DB = (6, 0), (13, 0), (1, 0)
 _C = PROFILE.d['control']
 CR0 = {n: v['bit'] for n, v in _C['cr0']['bits'].items()}
 CR4_ALL = {n: v['bit'] for n, v in _C['cr4']['bits'].items()}
@@ -44,19 +58,30 @@ def decode(code):
     i += bool(rex)
     assert code[i] == 0x0F, 'not a two-byte opcode'
     op = code[i + 1]
-    modrm = code[i + 2] if op in (0x01, 0x20, 0x22) else None
+    modrm = code[i + 2] if op in (0x01, 0x20, 0x21, 0x22, 0x23) else None
     return lock, rex, op, modrm
 
 
-def fault(code, gpr, cpl, cr0, cr4, efer):
+def dr_write(n, value):
+    assert n in (6, 7) and value >> 32 == 0
+    return value & 0xE00F | 0xFFFF0FF0 if n == 6 else value & 0xFFFF23FF | 0x400
+
+
+def fault(code, gpr, cpl, cr0, cr4, efer, dr7=0x400):
     lock, rex, op, modrm = decode(code)
     if lock: return UD                                                   # LOCK on a non-lockable instruction
-    if op in (0x20, 0x22):
+    if op in (0x20, 0x21, 0x22, 0x23):
         cr = (modrm >> 3 & 7) | (8 if rex & 4 else 0)
-        if cr not in (0, 2, 3, 4, 8): return UD
+        if op in (0x20, 0x22) and cr not in (0, 2, 3, 4, 8): return UD
+        if op in (0x21, 0x23) and cr > 7: return UD                       # DR8..DR15
     if op == 0x01 and (modrm >> 3 & 7 != 7 or modrm >> 6 == 3):
         raise ValueError('0f 01: only INVLPG m (/7, memory operand) is modelled')
+    if op == 0x33: return GP                                             # RDPMC: CPL > 0 without PCE, or no such counter
     if cpl != 0: return GP
+    if op in (0x21, 0x23):
+        if cr in (4, 5) and cr4 >> CR4_ALL['DE'] & 1: return UD
+        if dr7 >> 13 & 1: return DB                                      # general detect
+        if op == 0x23 and cr in (4, 5, 6, 7) and gpr[(modrm & 7) | (8 if rex & 1 else 0)] >> 32: return GP
     if op == 0x22:
         v = gpr[(modrm & 7) | (8 if rex & 1 else 0)]
         if cr == 0:
@@ -65,6 +90,7 @@ def fault(code, gpr, cpl, cr0, cr4, efer):
             if v >> CR0['NW'] & 1 and not v >> CR0['CD'] & 1: return GP
             if not v >> CR0['PG'] & 1: return GP                         # clearing PG in 64-bit mode
         if cr == 3 and v >> MAXPHYADDR: return GP                        # bits 63:MAXPHYADDR (PCIDE = 0: bit 63 too)
+        if cr == 8 and v >> 4: return GP                                 # TPR class: bits 63:4 reserved
         if cr == 4:
             if v & ~bits(CR4_PROFILE): return GP
             if (v ^ cr4) & (1 << CR4_ALL['PAE'] | 1 << CR4_ALL['LA57']): return GP   # with EFER.LMA = 1

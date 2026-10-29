@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: natemu <natemu@example.invalid>
+Date: Wed, 28 Oct 2026 00:00:00 +0000
+Subject: [PATCH 14/15] FEXCore: slice1 a value stored twice to one static
+ register is not coalesced into it
+
+Under --profile slice1 the backwards register-allocation pass no longer gives a
+value its static register as the preferred register when the value is stored to
+that same register by two StoreRegister/StorePF/StoreAF ops (a constant pooled
+across guest instructions: AF = 0 from popcnt and from cmpxchg r16, r16). The
+later store would otherwise be a self-move that emits nothing, so its guest
+instruction had no native write of the register; the value was the same, but the
+per-instruction write that verify_precision P6 checks was missing.
+---
+ .../Interface/IR/Passes/RegisterAllocationPass.cpp       | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+index 525cc62..4fca1f0 100644
+--- a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+@@ -584,6 +584,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+   }
+ 
+   PreferredReg.resize(IR->GetSSACount(), PhysicalRegister::Invalid());
++  fextl::vector<bool> FexcStoredTwice(fexc_slice1 ? IR->GetSSACount() : 0, false);
+   SSAToReg.resize(IR->GetSSACount(), PhysicalRegister::Invalid());
+   Seen.resize(IR->GetSSACount(), false);
+ 
+@@ -615,6 +616,12 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+         if (auto Node = DecodeSRANode(IROp, CodeNode); Node != nullptr) {
+           auto Reg = DecodeSRAReg(IROp, CodeNode);
+ 
++          // natemu slice1: a value stored to the same static register twice (a constant pooled across guest
++          // instructions, e.g. AF = 0) is not coalesced into it: the later store would become a self-move and its
++          // instruction has no native write of that register (verify_precision P6).
++          if (fexc_slice1 && Node != CodeNode && PreferredReg[IR->GetID(Node).Value] == Reg) {
++            FexcStoredTwice[IR->GetID(Node).Value] = true;
++          }
+           PreferredReg[IR->GetID(Node).Value] = Reg;
+           GetClass(Reg)->RegToSSA[Reg.Reg] = CodeNode;
+         }
+@@ -632,7 +639,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+           auto Node = GetClass(Reg)->RegToSSA[Reg.Reg];
+           IROp_Header* Header = IR->GetOp<IROp_Header>(Node);
+ 
+-          if (CodeNode != DecodeSRANode(Header, Node)) {
++          if (CodeNode != DecodeSRANode(Header, Node) || (fexc_slice1 && FexcStoredTwice[IR->GetID(CodeNode).Value])) {
+             PreferredReg[IR->GetID(CodeNode).Value] = PhysicalRegister::Invalid();
+           }
+         }

@@ -291,17 +291,19 @@ static uint8_t EndReasonCode(const std::string& r) {
   return 255;
 }
 static const char* CutReasonName() {
+  if (fexc_cut.reason == FEXC_CUT_STRING) return "block_ending_instruction";
   return fexc_cut.reason == FEXC_CUT_SYSTEM ? "system_instruction" : fexc_cut.reason == FEXC_CUT_DECODER ? StatusName(fexc_cut.status) : "unsupported_form";
 }
 static std::string CutDetail() {
   if (fexc_cut.reason == FEXC_CUT_DECODER) return "at " + Hex64(fexc_cut.rip) + " (decoder status on the first instruction; no code, no NoExec block)";
+  if (fexc_cut.reason == FEXC_CUT_STRING) return "REP string instruction (it exits to its own RIP until it is done)";
   char b[64]; snprintf(b, sizeof b, "opcode map %d opcode 0x%02x", int(fexc_cut.map), fexc_cut.opcode);
   return std::string(fexc_cut.why) + " (" + b + (fexc_cut.has_modrm ? (std::string(" /") + std::to_string((fexc_cut.modrm >> 3) & 7)) : "") +
          ", FEX decoded it as '" + fexc_cut.name + "')";
 }
 static void CutJson(Json& j) {
   j.obj("end").kv("rip", Hex64(fexc_cut.rip)).kv("reason", CutReasonName()).kv("detail", CutDetail());
-  if (fexc_cut.reason != FEXC_CUT_DECODER) j.kv("cut_opcode_map", int(fexc_cut.map)).kv("cut_opcode", int(fexc_cut.opcode)).kv("cut_fex_name", fexc_cut.name);
+  if (fexc_cut.reason != FEXC_CUT_DECODER && fexc_cut.reason != FEXC_CUT_STRING) j.kv("cut_opcode_map", int(fexc_cut.map)).kv("cut_opcode", int(fexc_cut.opcode)).kv("cut_fex_name", fexc_cut.name);
   j.end_obj();
 }
 
@@ -322,8 +324,8 @@ static void ResetGlobals() {
   Cap = {};
   Diagnostics.clear();
   W = {};
-  fexc_sites.clear(); fexc_insns.clear(); fexc_cf_inverted.clear(); fexc_spill_bytes = 0; fexc_cut = {};
-  fexc_rip_relative.clear(); fexc_target_check.clear(); fexc_div_width.clear();
+  fexc_sites.clear(); fexc_insns.clear(); fexc_cf_inverted.clear(); fexc_spill_bytes = 0; fexc_cut = {}; fexc_after_rep = 0;
+  fexc_rip_relative.clear(); fexc_target_check.clear(); fexc_div_width.clear(); fexc_movs.clear();
 }
 
 // The CLI's body. `args` are the command-line arguments (args[0] is the program name); `given` replaces --hex/--file with the
@@ -667,7 +669,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     else reason = "other"; // e.g. dispatcher-requested block end (system/exception instruction) or FEX's own limit
     end_reason_str = reason;
     j.obj("end").kv("rip", Hex64(end_rip)).kv("reason", reason).kv("detail", detail);
-    if (fexc_cut.reason) j.kv("cut_opcode_map", int(fexc_cut.map)).kv("cut_opcode", int(fexc_cut.opcode)).kv("cut_fex_name", fexc_cut.name);
+    if (fexc_cut.reason && fexc_cut.reason != FEXC_CUT_STRING) j.kv("cut_opcode_map", int(fexc_cut.map)).kv("cut_opcode", int(fexc_cut.opcode)).kv("cut_fex_name", fexc_cut.name);
     j.end_obj();
   }
   j.end_obj(); // guest

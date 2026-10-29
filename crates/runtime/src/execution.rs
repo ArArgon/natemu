@@ -414,7 +414,7 @@ fn reset_shadows(s: &mut State) {
 /// x28 with its flag bytes (TF, IF, DF, IOPL, NT, AC, VIF, VIP, ID; RF and VM as 0) and the FS/GS bases (FEX's
 /// `fs_cached`/`gs_cached`, which every FS-/GS-prefixed access adds) written from the bank. The bases are rewritten at
 /// every entry and never read back, so the bank stays authoritative: a guest store into the page (the documented
-/// deviation) changes only what that vCPU's own prefixed accesses use until its next resident entry.
+/// deviation) changes only what that vCPU's own prefixed accesses use until the next `enter`.
 unsafe fn enter(mut s: State, block: &Block) -> ! {
     served(&mut s);
     for (at, value) in frame::flag_bytes(s.cpu.rflags) {
@@ -646,20 +646,23 @@ unsafe fn stopped(frame: &NativeFrame, elr: u64, spsr: u64, (armed, n): ([u32; M
 }
 
 /// CR0 bits (SDM vol. 3 §2.5): those defined; the others in 31:0 are reserved and ignored on a load (they stay clear),
-/// those in 63:32 raise #GP. Of the defined bits the resident implements changes of WP only (PG, PE are fixed in
-/// 64-bit code: clearing either raises #GP; ET is hard-wired).
+/// those in 63:32 raise #GP. Every defined bit is accepted (PG, PE are fixed in 64-bit code: clearing either raises
+/// #GP; ET is hard-wired). WP is the walker's. MP, EM, TS, NE are recorded: they gate x87/MMX/SSE forms (#NM with TS
+/// or EM, #UD for SSE with EM; NE selects native x87 error reporting), none of which is admitted yet (I5, I6), and a
+/// change drops this vCPU's code like any control change, so a block never outlives the gating state it was made
+/// under. CD and NW are recorded: RAM is write-back whatever they say (memory types are M2's). AM is recorded;
+/// alignment checking (AM with RFLAGS.AC at CPL 3) is refused as a mode ([`Cpu::control`]).
 const CR0_DEFINED: u64 = cpu_profile::CR0_VALID;
 const CR0_CD: u64 = 1 << 30;
 const CR0_NW: u64 = 1 << 29;
 /// CR4: a bit outside the presented CPU's valid set (`cpu_profile::CR4_VALID`: its CPUID feature is advertised, SDM
-/// Vol.3 2.5) is reserved (#GP). Of the valid bits the resident implements PAE (fixed in long mode), PGE, SMEP, PSE (no
-/// effect with 4-level paging, SDM Vol.3 4.1) and TSD (RDTSC/RDTSCP #GP at CPL > 0); a change of the others (DE, PCE,
-/// OSFXSR, OSXMMEXCPT, FSGSBASE, OSXSAVE) is refused as unsupported until their features exist.
+/// Vol.3 2.5) is reserved (#GP); every valid bit is accepted. PAE is fixed in long mode; PGE, SMEP are the walker's; PSE
+/// has no effect with 4-level paging (SDM Vol.3 4.1); TSD makes RDTSC/RDTSCP #GP at CPL > 0, PCE allows RDPMC there
+/// (which then #GPs for want of counters), DE makes DR4/DR5 #UD. OSFXSR, OSXMMEXCPT, OSXSAVE (CPUID.1:ECX.OSXSAVE
+/// follows it) gate SSE and XSAVE forms (I5); FSGSBASE gates RDFSBASE..WRGSBASE (S3): recorded state until then.
 const CR4_TSD: u64 = 1 << 2;
-const CR4_PSE: u64 = 1 << 4;
-const CR4_SUPPORTED: u64 = CR4_PAE | CR4_PGE | CR4_SMEP | CR4_PSE | CR4_TSD;
-const CR4_UNSUPPORTED: u64 = cpu_profile::CR4_VALID & !CR4_SUPPORTED;
 const UD: [u64; 2] = [6, 0];
+const DB: [u64; 2] = [1, 0];
 const GP: [u64; 2] = [13, 0];
 
 /// Executes the system instruction at `s.cpu.rip` (`i`, the host's decode, checked by [`request`]) as a transaction
@@ -686,13 +689,15 @@ fn system(s: &mut State, i: System) {
     };
     let unsupported = |s: &State| -> ! { halt(*s, stop::UNSUPPORTED_SYSTEM) };
     let moves = matches!(i.kind, system::MOV_TO_CR | system::MOV_FROM_CR);
-    if i.lock != 0 || (moves && !matches!(i.cr, 0 | 2 | 3 | 4 | 8)) {
+    let debug = matches!(i.kind, system::MOV_TO_DR | system::MOV_FROM_DR);
+    if i.lock != 0 || (moves && !matches!(i.cr, 0 | 2 | 3 | 4 | 8)) || (debug && i.cr > 7) {
         fault(s, UD)
     }
-    // CPUID runs at any CPL; RDTSC/RDTSCP at CPL > 0 unless CR4.TSD; the rest at CPL 0 only.
+    // CPUID runs at any CPL; RDTSC/RDTSCP at CPL > 0 unless CR4.TSD, RDPMC with CR4.PCE; the rest at CPL 0 only.
     let unprivileged = match i.kind {
         system::CPUID => true,
         system::RDTSC | system::RDTSCP => c.cr4 & CR4_TSD == 0,
+        system::RDPMC => c.cr4 & CR4_PCE != 0,
         _ => false,
     };
     if c.cpl != 0 && !unprivileged {
@@ -705,9 +710,10 @@ fn system(s: &mut State, i: System) {
         system::MOV_FROM_CR => {
             s.cpu.gpr[i.reg as usize] = match i.cr {
                 0 => c.cr0,
+                2 => c.cr2,
                 3 => c.cr3,
                 4 => c.cr4,
-                _ => unsupported(s), // CR2 (no exception delivery yet), CR8 (no APIC)
+                _ => c.cr8,
             };
             false
         }
@@ -718,9 +724,6 @@ fn system(s: &mut State, i: System) {
                     let new = v & CR0_DEFINED | CR0_ET;
                     if v >> 32 != 0 || new & CR0_PG == 0 || new & CR0_PE == 0 || new & (CR0_NW | CR0_CD) == CR0_NW {
                         fault(s, GP)
-                    }
-                    if (new ^ c.cr0) & !CR0_WP != 0 {
-                        unsupported(s)
                     }
                     s.cpu.cr0 = new;
                 }
@@ -736,18 +739,56 @@ fn system(s: &mut State, i: System) {
                     return commit(s, i, true); // a load of the same value too
                 }
                 4 => {
-                    if v & !(CR4_SUPPORTED | CR4_UNSUPPORTED) != 0 || (v ^ c.cr4) & (CR4_PAE | CR4_LA57) != 0 {
+                    if v & !cpu_profile::CR4_VALID != 0 || (v ^ c.cr4) & (CR4_PAE | CR4_LA57) != 0 {
                         fault(s, GP)
-                    }
-                    if (v ^ c.cr4) & CR4_UNSUPPORTED != 0 {
-                        unsupported(s)
                     }
                     s.cpu.cr4 = v;
                 }
-                _ => unsupported(s),
+                // CR2 takes any value (no canonical check, SDM Vol.2 MOV CR); CR8 bits 63:4 are reserved. Neither
+                // touches a translation.
+                2 => {
+                    s.cpu.cr2 = v;
+                    return commit(s, i, false);
+                }
+                _ => {
+                    if v >> 4 != 0 {
+                        fault(s, GP)
+                    }
+                    s.cpu.cr8 = v;
+                    return commit(s, i, false);
+                }
             }
             s.cpu != c
         }
+        // SDM Vol.2 MOV DR, Vol.3 17.2: (DR8..DR15 #UD and CPL > 0 #GP above) DR4/DR5 #UD with CR4.DE, else DR6/DR7;
+        // general detect (DR7.GD): #DB, a fault before the MOV, with DR6.BD set (B0..B3 kept: the SDM lets the CPU
+        // clear them or not); delivering it clears DR7.GD (X1/S4). Then a write of 1 to bits 63:32 of DR6/DR7 is #GP.
+        // DR0..DR3 take any value. A DR7 that enables a breakpoint (L0..G3) is refused until S4 arms them.
+        system::MOV_FROM_DR | system::MOV_TO_DR => {
+            if i.cr & 6 == 4 && c.cr4 & CR4_DE != 0 {
+                fault(s, UD)
+            }
+            if c.dr[5] & DR7_GD != 0 {
+                s.cpu.dr[4] |= DR6_BD;
+                fault(s, DB)
+            }
+            let n = if i.cr < 4 { i.cr as usize } else { 4 + (i.cr & 1) as usize };
+            if i.kind == system::MOV_FROM_DR {
+                s.cpu.gpr[i.reg as usize] = c.dr[n];
+            } else {
+                let v = gpr(i.reg);
+                s.cpu.dr[n] = match n {
+                    0..=3 => v,
+                    _ if v >> 32 != 0 => fault(s, GP),
+                    4 => v & DR6_WRITABLE | DR6_FIXED,
+                    _ if v & DR7_ENABLES != 0 => unsupported(s),
+                    _ => v & DR7_WRITABLE | DR7_FIXED,
+                };
+            }
+            false
+        }
+        // The profile has no performance counters (CPUID.0AH = 0): every ECX names an invalid counter (SDM Vol.2 RDPMC).
+        system::RDPMC => fault(s, GP),
         system::INVLPG => {
             let base = match i.base {
                 system::RIP => c.rip.wrapping_add(u64::from(i.length)),
@@ -881,12 +922,14 @@ fn tsc() -> u64 {
 /// or reset: blocks are keyed by CPL ([`Cpu::code_context`]: a fetch's U/S and SMEP checks were made at the CPL it was
 /// translated at), and shadows live in one space per privilege class, the CPL's loaded at every entry into generated
 /// code ([`tables::select`]), so a supervisor shadow never serves a CPL3 access. Implicit supervisor accesses
-/// (descriptor tables, the delivery frame) are the resident's, through the walker, never shadows.
+/// (descriptor tables, the delivery frame) are the resident's, through the walker, never shadows. A CPL the bank
+/// cannot run at ([`Cpu::control`]: e.g. CPL 3 with CR0.AM and RFLAGS.AC, whose #AC is not built) stops
+/// `unsupported_mode` here, with the new CPL in the stop record and RIP still at the instruction.
 pub fn set_cpl(s: &mut State, cpl: u64) {
-    if cpl > 3 {
+    s.cpu.cpl = cpl;
+    if cpl > 3 || s.cpu.control().is_none() {
         halt(*s, stop::UNSUPPORTED_MODE)
     }
-    s.cpu.cpl = cpl;
 }
 
 /// Guest GPRs and arithmetic flags from the native state: the static-register map,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1a check: fexc's access sites against the fixture programs and against the emitted code.
 
-usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series15 build)
+usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series16 build)
 
 --slice1 compiles with `--profile slice1` (S1c): hardware TSO (plain ldr/str), exits through the dispatcher gate, block
 cutting (no fixture instruction is cut since S3e admitted memory xchg, a `swap` site); the exit
@@ -44,7 +44,7 @@ def fixture_programs():
     if not path.exists():
         subprocess.run([sys.executable, '-B', str(REPO / 'tools/reference/build_slice1.py'), '--programs-only'], check=True)
     return json.loads(path.read_text())['programs']
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series15/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series16/obj/fexc')
 KNOWN_OK = False
 PROFILE = []   # extra fexc arguments for every compile: ['--profile', 'slice1'] under --slice1
 
@@ -57,8 +57,43 @@ WORD_REGS = {'ax', 'cx', 'dx', 'bx', 'sp', 'bp', 'si', 'di'} | {f'r{i}w' for i i
 STUBS = ('guard', 'split', 'divide')   # slice1 check stubs (brk words after the body), not accesses: verify_precision.py checks them
 
 
+STRING = re.compile(r'(?:(?:rep|repe|repne)\s+)?(movs|stos|lods|scas|cmps)([bwdq]?)\b(.*)')
+# I2: one element's accesses (movs: [RSI] then [RDI]; cmps: [RDI] then [RSI]).
+STRING_ACCESSES = {'movs': ['load', 'store'], 'stos': ['store'], 'lods': ['load'], 'scas': ['load'], 'cmps': ['load', 'load']}
+
+
+def rep_string(b):
+    """Whether the instruction bytes `b` are a REP/REPE/REPNE string instruction: legacy prefixes including F2/F3, at most
+    one REX, then a4-a7/aa-af as the last byte (the same rule as crates/host/src/admission.rs `rep_string`)."""
+    i = next((k for k, x in enumerate(b) if x not in (0xf0, 0xf2, 0xf3, 0x66, 0x67, 0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65)), None)
+    if i is None or not any(x in (0xf2, 0xf3) for x in b[:i]): return False
+    o = i + 1 if 0x40 <= b[i] <= 0x4f else i
+    return o + 1 == len(b) and (0xa4 <= b[o] <= 0xa7 or 0xaa <= b[o] <= 0xaf)
+
+
+def blocks(p):
+    """I2: a REP string instruction ends its block, so a program with one is checked as one sub-program per block: the
+    bytes and `asm`/`insns` from each block's start through its REP (the last one through the end)."""
+    import ref   # tools/reference (on the path of the callers that pass programs with `asm`)
+    asm = p['asm']
+    cuts = [i + 1 for i, a in enumerate(asm) if re.match(r'(rep|repe|repne)\s', a)]
+    if not cuts: return [p]
+    sizes = [len(ref.assemble(a)) for a in asm]
+    out, start = [], 0
+    for c in cuts + [len(asm)]:
+        if c <= start: continue
+        lo, hi = sum(sizes[:start]), sum(sizes[:c])
+        q = dict(p, name=f"{p['name']}@{start}", code=p['code'][2 * lo:2 * hi], rip=hex(int(p['rip'], 16) + lo), asm=asm[start:c])
+        if 'insns' in p: q['insns'] = p['insns'][start:c]
+        out.append(q); start = c
+    return out
+
+
 def expected(asm):
     """[(class, width)] for one `asm` line, class in load/store/push/pop; None if the form is not understood."""
+    if x := STRING.fullmatch(asm.strip()):
+        w = {'b': 1, 'w': 2, 'd': 4, 'q': 8}.get(x[2]) or WIDTH[re.search(r'(byte|word|dword|qword) ptr', x[3])[1]]
+        return [(k, w) for k in STRING_ACCESSES[x[1]]]
     mn, _, rest = asm.partition(' ')
     ops = [o.strip() for o in rest.split(',')] if rest else []
     mem = [i for i, o in enumerate(ops) if '[' in o]
@@ -248,6 +283,7 @@ def check_program(p, tmp):
         cut = first_cut(asm)
         if cut is not None:
             asm, want_end = asm[:cut], 'unsupported_form'
+    if asm and re.match(r'(rep|repe|repne)\s', asm[-1]): want_end = 'block_ending_instruction'   # I2: a REP ends its block
     if len(insts) != len(asm) or d['guest']['end']['reason'] != want_end:
         return [('ERROR', f"translated {len(insts)} of {len(asm)} instructions, end={d['guest']['end']['reason']} (want {want_end})")], 0
     if want_end == 'unsupported_form' and int(d['guest']['end']['rip'], 16) != int(p['rip'], 16) + sum(i['size'] for i in insts):

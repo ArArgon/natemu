@@ -66,6 +66,11 @@ The tool checks final RIP = `rip+len(code)`, and QEMU's `-d in_asm` log must sho
     blsmsk/blsr AF PF (and SF where the SDM leaves it) undefined; mulx/rorx/sarx/shlx/shrx/prefetch/movnti/enter/leave
     none. blsi/blsmsk/blsr CF is not compared: the pinned QEMU 7.2 computes it from a stale cc_src (BLSI with a zero
     source gives CF = 1; fixed upstream in QEMU 8.0, "target/i386: Fix C flag for BLSI, BLSMSK, BLSR").
+  - I2 (`gen_i2.py`): movs/stos/lods none; cmps/scas all six defined, untouched by a REP form whose annotation `count`
+    (initial RCX) is 0. A string annotation also names its repeat prefix (`rep`: rep/repe/repne, absent for none), checked
+    against QEMU's disassembly (`rep`, `repz`, `repnz`) instead of the operand width (the generator writes the width into
+    the mnemonic). QEMU ends a block at a REP string instruction and translates it again as the next block's start, so
+    the straight-line cross-check takes each translated address once (`disasm`).
   State is carried forward: a later instruction that writes a flag defines it again. An instruction reading an undefined
   flag (adc/sbb/setcc/cmovcc) is rejected, because the undefined value would flow into registers; the generator inserts a
   `cmp` first. `rflags_compare_mask = 0xcd5 & ~undefined_flags` (0x8d5 before I1: DF was not compared).

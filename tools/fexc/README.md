@@ -26,10 +26,28 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as thirteen commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as fifteen commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series15` (I7, October 28: FS/GS segment overrides
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series16` (I2, October 29: string instructions.
+Patch 0015: under slice1 MOVS/STOS/LODS/SCAS/CMPS (`FexcStringOp`) translate ONE element: its accesses (movs reads DS:RSI
+then writes ES:RDI, cmps reads [RDI] then [RSI], FEX's and the pinned QEMU's order), RSI/RDI stepped by DF from the
+registers. With REP/REPE/REPNE: `cbz x7` (RCX = 0) to the next instruction, the element, RCX - 1, then a literal exit to
+the instruction's own RIP (REPE/REPNE whose ZF ends the repetition branch forward to the next instruction). The resident
+links that exit to the block starting at the REP and its unlinking stop patches it, so a stop, an interrupt window or a
+fault is always between elements with RCX/RSI/RDI and RIP exact, and the block has no backward branch. The shim ends the
+block after a REP string instruction (`FEXC_CUT_STRING`, reason `block_ending_instruction`: one REP and at most three link
+points per block) and admits the five opcodes (REP on all, REPE/REPNE on cmps/scas; REP with REPNE and 0x67 cut, and by
+policy, not by an x86 rule, F2 on movs/stos/lods (hardware repeats as with REP; the SDM calls it reserved); FS/GS and the
+null prefixes only on the DS:RSI source of movs/cmps/lods, never SS there; FS/GS on stos/scas, which hardware ignores, is
+cut by policy); a MOVS's load and
+store are not an RMW pair (`fexc_movs`), so its load is read intent. FEX's own lowering (MemSet/MemCpy ops for REP
+STOS/MOVS, IR loops with backward branches for CMPS/SCAS/LODS, all without partial progress) is the default profile's.
+Patch 0014 (I1 carry-over): the backwards register-allocation pass does not coalesce a value into a static register it is
+stored to twice (a constant pooled across instructions: AF = 0 from popcnt and from `cmpxchg r16, r16`); the later store
+was a self-move, value-correct, but its instruction had no native x27 write (verify_precision P6). Binary objects of the
+64 fixtures and the seed-4242, flow, I1 and I7 corpora: see the I2 note in the boot-features plan.)
+Kept for comparison: `series15` (I7, October 28: FS/GS segment overrides
 in 64-bit mode. The patches are series14's; the change is in `shim/` and `fexc.cpp`: the allowlist admits an FS or GS
 prefix on every admitted form with an explicit memory operand (FEX adds `fs_cached`/`gs_cached`, x28 + 1000/992, to the
 effective address; the site's native address is then the x86 linear address, so recovery, the split check and the
@@ -95,6 +113,9 @@ Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--v
 | 0010 | slice1 literal exits through `Pointers.ExitFunctionLinker` (computed exits keep `DispatcherLoopTop`): FEX's linker/dispatcher split, so the resident can link them |
 | 0011 | slice1 code that touches no emulator data (E1): literal exits `movz/movk x0; svc #1`, computed exits `mov x0, xR; b .` (relocated by the resident), the 128/64 division by `svc #3/#4`, no header store, the stop check `bl .` (relocated to the stop pad), the pre-NZCV save `mrs x25, nzcv` (the JIT emits it at the instruction start the flag pass chose, `fexc_pre_nzcv`); FEX's BLOCK_DEBUGGING exit branch back to its upstream form |
 | 0012 | slice1 no stop check at block entry (E1b): `EmitSuspendInterruptCheck` emits nothing; the resident's IRQ handler stops a vCPU by patching the interrupted block's exits |
+| 0013 | slice1 I1 forms: the decoder's VEX map record, CMPXCHG/XADD without LOCK as plain read-modify-writes, LEAVE's load before RSP/RBP |
+| 0014 | slice1 no coalescing of a value stored twice to one static register (the later store was a self-move without a native write) |
+| 0015 | slice1 string instructions one element per pass (`FexcStringOp`; REP exits to its own RIP), `fexc_movs` for the site recorder |
 
 Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in `shim/` and `fexc.cpp`; the patches only
 include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then
@@ -325,16 +346,20 @@ The scripts that read `fixtures/slice1/programs.json` (git-ignored; `smoke.py`, 
   (I1): popcnt, tzcnt, lzcnt (f3 0f b8/bc/bd; the CPU profile advertises POPCNT, BMI1 and LZCNT, and FEX decodes f3 0f
   bc/bd as TZCNT/LZCNT unconditionally). VEX (I1): andn, bextr, blsi/blsmsk/blsr, bzhi, mulx, rorx, sarx/shlx/shrx with
   VEX.L = 0 and no 66/REX/F2/F3/LOCK before the VEX prefix. Still cut: pdep/pext (FEX emits a native loop), prefetchw/0f 0d
-  (PREFETCHW not advertised), cmpxchg8b/16b, 16-bit shld/shrd, enter with a nesting level, LOCK forms, popf. Branches (end the block): jcc rel8/rel32,
+  (PREFETCHW not advertised), cmpxchg8b/16b, 16-bit shld/shrd, enter with a nesting level, LOCK forms, popf. Strings (I2):
+  movs/cmps/stos/lods/scas (a4-a7, aa-af) at every width, alone or with REP (all five) and REPE/REPNE (cmps/scas); a REP
+  form ends its block; cut: REP with REPNE, 0x67, SS on the source, and by policy (hardware repeats or ignores them) REPNE on
+  movs/stos/lods and FS/GS on stos/scas.
+  Branches (end the block): jcc rel8/rel32,
   jmp rel8/rel32 and near indirect, call rel32/indirect, ret, rep ret (f3 c3), ret imm16. All with no LOCK, REP/REPNE (except
-  rep ret, endbr64 and pause; LOCK only on memory xchg), address-size override, and (branches) no operand-size prefix; FS/GS
+  rep ret, endbr64, pause and the strings; LOCK only on memory xchg), address-size override, and (branches) no operand-size prefix; FS/GS
   overrides only on an explicit memory operand and alone, CS/DS/ES/SS only naming the default segment (I7); 66-prefixed bswap
   (undefined result) is cut.
 - **System class** (reason `system_instruction`): segment push/pop and moves, lss/lfs/lgs, far call/jmp/ret, iret,
   int/int3/into/icebp, ud2/ud1/ud0, popf/cli/sti, hlt, port I/O, all of 0f 00 and 0f 01 (descriptor tables, invlpg,
   swapgs, rdtscp, xgetbv, ...), lar/lsl, syscall/sysret/sysenter/sysexit, clts, invd/wbinvd, clflush, mov cr/dr, wrmsr/rdmsr/rdpmc,
-  rdtsc, cpuid, rd/wr fs/gs base, vmread/vmwrite, invept/invvpid/invpcid. Everything else outside the allowlist (string ops,
-  LOCK forms but memory xchg, x87/SSE/AVX, loop/jrcxz with a 67 prefix, the I1 refusals above, ...) is `unsupported_form`.
+  rdtsc, cpuid, rd/wr fs/gs base, vmread/vmwrite, invept/invvpid/invpcid. Everything else outside the allowlist (the string
+  refusals above, LOCK forms but memory xchg, x87/SSE/AVX, loop/jrcxz with a 67 prefix, the I1 refusals above, ...) is `unsupported_form`.
 
 ### Native control flow inside one guest instruction
 `scan_skips.py` (and a test in `test_slice1.py`) looks, in the emitted code, for a forward branch inside one guest
@@ -344,7 +369,9 @@ register; bt family; cmov, bsf/bsr, imul, movzx/movsx, ALU forms, setcc, push/po
 programs. Divide stubs are not accesses: the branch around a 64-bit division's helper call (and its #DE test) is FEX's
 inline path and skips no access. Only rcl/rcr with a memory operand were found (a `cbz` on the count around the load/store, and no
 access at all for a masked-to-zero static count: rcl/rcr by 0 or 32 at 8/16/64 bits); they are cut. All other forms access
-memory unconditionally, including shifts and rotates by CL and by an immediate that masks to zero.
+memory unconditionally, including shifts and rotates by CL and by an immediate that masks to zero. Since I2 a REP string instruction's
+`cbz x7` (RCX = 0) skips its element's sites, which is x86 (no access when the count is 0); `verify_precision.py` P5
+exempts exactly that branch of exactly those instructions.
 
 ## Access sites (natemu-fexc-v2)
 

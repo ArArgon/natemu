@@ -135,6 +135,19 @@ def segment(b, k, op):
         return 'FS/GS', 'CS/DS/ES/SS override naming another segment than the default'
     return None
 
+def string(pre, op):   # pre: the prefix bytes (leading)
+    """fexc_slice1.inc's string-instruction rules (I2): REP on all five, REPE/REPNE on cmps/scas only, never both; no
+    address-size prefix or LOCK; FS/GS (alone) and CS/DS/ES only on the DS:RSI source of movs/cmps/lods, never SS there."""
+    compare, source = op in (0xA6, 0xA7, 0xAE, 0xAF), op <= 0xA7 or op in (0xAC, 0xAD)
+    ss, data, high = pre.count(0x36), sum(pre.count(x) for x in (0x26, 0x2E, 0x3E)), pre.count(0x64) + pre.count(0x65)
+    if 0xF0 in pre: return 'LOCK', 'LOCK on a string instruction'
+    if 0xF2 in pre and 0xF3 in pre: return 'string', 'REP and REPNE together'
+    if 0xF2 in pre and not compare: return 'string', 'REPNE on movs/stos/lods'
+    if 0x67 in pre: return 'string', 'address-size prefix'
+    if high and (not source or ss + data + high != 1): return 'FS/GS', 'FS/GS on a string instruction without a source, or with another prefix'
+    if source and ss and not high: return 'FS/GS', 'SS naming the DS:RSI source'
+    return 'admitted', ''
+
 def classify(b, mnem):
     """-> (class, why). Classes: admitted SSE AVX x87 LOCK string system BMI FS/GS small-int other bad"""
     p = parse(b)
@@ -146,6 +159,7 @@ def classify(b, mnem):
         if v and vex_allowed(v, b): return segment(b, k, p['op']) or ('admitted', '')
         return ('BMI' if base in BMI or base[:-1] in BMI else 'AVX'), 'vex/evex'
     if k == 'xop': return 'other', 'xop'
+    if k == 'p' and (0xA4 <= op <= 0xA7 or 0xAA <= op <= 0xAF): return string(leading(b), op)     # I2
     if k == 'p': v, br = primary(op, modrm)
     elif k == '0f' and op in (0xB8, 0xBC, 0xBD) and last_mandatory(b) == 0xF3 and 0xF2 not in pre: v, br = ALLOW, False   # I1
     elif k == '0f': v, br = two(op, not (0xF2 in pre or 0xF3 in pre), modrm)
@@ -279,7 +293,9 @@ def job(a):
 def selftest():
     h = bytes.fromhex
     cases = [('f390', 'pause', 'admitted'), ('0faee8', 'lfence', 'admitted'), ('f0488708', 'lock xchg', 'admitted'), ('f04887c1', 'lock xchg reg', 'LOCK'),
-             ('f3a4', 'rep movsb', 'string'), ('f30f1efa', 'endbr64', 'admitted'), ('64488b042528000000', 'mov %fs:', 'admitted'),
+             ('f3a4', 'rep movsb', 'admitted'), ('f348ab', 'rep stos', 'admitted'), ('f2ae', 'repnz scas', 'admitted'),
+             ('f2a4', 'repnz movsb', 'string'), ('67f3a4', 'addr32 rep movsb', 'string'), ('64f348a5', 'rep movs %fs:', 'admitted'),
+             ('64aa', 'stos %fs', 'FS/GS'), ('36ac', 'lods %ss:', 'FS/GS'), ('f30f1efa', 'endbr64', 'admitted'), ('64488b042528000000', 'mov %fs:', 'admitted'),
              ('6548ff0425f0ff0000', 'incq %gs:', 'admitted'), ('644889c8', 'fs mov reg', 'FS/GS'), ('642e488b00', 'fs cs mov', 'FS/GS'),
              ('36488b03', 'ss mov (%rbx)', 'FS/GS'), ('36488b0424', 'ss mov (%rsp)', 'admitted'), ('3e488b4500', 'ds mov (%rbp)', 'FS/GS'),
              ('3e48ff24c500000000', 'notrack jmp *tbl', 'admitted'), ('65c4e2f0f200', 'andn %gs:', 'admitted'), ('f065480fc108', 'lock xadd %gs:', 'LOCK'),

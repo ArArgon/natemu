@@ -243,11 +243,14 @@ def parse_output(p, out):
 
 LINE = re.compile(r'^0x([0-9a-f]+):\s+((?:[0-9a-f]{2}(?=\s|$)\s?)+)\s*(\S.*)?$')
 def disasm(log, rip, length):
-    """Instructions QEMU translated inside [rip, rip+length): [(addr, bytes, text)]."""
-    insns, raw = [], bytearray()
+    """Instructions QEMU translated inside [rip, rip+length): [(addr, bytes, text)], each address once. QEMU ends a block at
+    a REP string instruction and translates it again as the start of the block that repeats it (I2); a straight-line
+    program has no other address translated twice."""
+    insns, raw, seen = [], bytearray(), set()
     for line in log.splitlines():
         m = LINE.match(line)
-        if not m or not (rip <= int(m[1], 16) < rip + length): continue
+        if not m or not (rip <= int(m[1], 16) < rip + length) or (m[3] and int(m[1], 16) in seen): continue
+        if m[3]: seen.add(int(m[1], 16))
         raw += bytes.fromhex(m[2].replace(' ', ''))
         if m[3]: insns.append((int(m[1], 16), m[3].split()[0], m[3]))
     return insns, bytes(raw)
@@ -259,6 +262,13 @@ BRANCH_OPS = {'jcc', 'jmp', 'call', 'ret', 'loop', 'loope', 'loopne', 'jrcxz'}  
 # No explicit (or only a fixed) operand: no width to check (I1).
 NO_WIDTH_OPS = {'clc', 'stc', 'cmc', 'cld', 'std', 'lahf', 'sahf', 'pushf', 'leave', 'enter', 'prefetcht0', 'prefetcht1',
                 'prefetcht2', 'prefetchnta'}
+
+STRING_PREFIXES = ('rep', 'repz', 'repnz', 'repe', 'repne')
+
+def string_mnemonic(t):
+    """The mnemonic of a disassembled string instruction after its repeat and segment prefixes (I2), or None."""
+    words = [w for w in t.split() if w not in STRING_PREFIXES and w not in ('fs', 'gs', 'ds', 'es', 'cs', 'ss')]
+    return words[0] if words and re.fullmatch(r'(movs|stos|lods|cmps|scas)[bwlq]?', words[0]) else None
 
 def mnemonic_ok(insn, m):
     op = insn['op']
@@ -295,6 +305,13 @@ REG_WIDTH_OPS = {'shld', 'shrd', 'cmpxchg', 'xadd', 'movnti'}
 def check_one(ann, a, m, t, prev):
     """One annotation against QEMU's disassembly (`m` mnemonic, `t` text) of the instruction at `a`; `prev` is the text of the
     instruction executed before it."""
+    if ann['op'] in flags.STRING_MOVES | flags.STRING_COMPARES:    # I2: the repeat prefix must match too (width: the generator's)
+        sm = string_mnemonic(t)
+        require(sm is not None and sm[:4] == ann['op'], f'annotation {ann} does not match disassembly "{t}" at {a:#x}')
+        word = t.split()[0]
+        rep = {'rep': 'rep', 'repz': 'repe', 'repe': 'repe', 'repnz': 'repne', 'repne': 'repne'}.get(word)
+        require(rep == ann.get('rep'), f'annotation {ann} does not match the repeat prefix of "{t}" at {a:#x}')
+        return
     require(mnemonic_ok(ann, m), f'annotation {ann} does not match disassembly "{t}" at {a:#x}')
     ops = att_operands(t)
     w = att_width(ann, m, ops)

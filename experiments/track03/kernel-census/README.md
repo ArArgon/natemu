@@ -24,6 +24,13 @@ alone; CS/DS/ES/SS naming the operand's default segment; a segment prefix before
 12,676 → 2 (two `jb` with an FS prefix and no memory operand, probably data in a code section). Every one of them moved
 to admitted; no instruction admitted before is refused now (no CS/DS/ES/SS prefix names a non-default segment).
 
+**I2 re-check (October 29).** `census.py` ports the I2 string rules (fexc series16: movs/cmps/stos/lods/scas alone or with
+REP, REPE/REPNE on cmps/scas only, no 0x67, no REP with REPNE, FS/GS and null prefixes only on the DS:RSI source, never
+SS there). Rerun into `natemu-raw/kernel-census-i2-20261029-01/` (`x` linked to the C0 data; report in its `report/`).
+String class: kernel 5,725 → 0 (decompressor 23, vmlinux `.text` 5,014, `.init.text` 685, `.altinstr_replacement` 3);
+initramfs init chain 349 → 0, other executables 1,616 → 0, other libraries 1,004 → 0. Every one moved to admitted (each
+region's admitted count rose by exactly its string count); `rep ins/outs` stay `system` (port I/O, chunk L3).
+
 Files here: `extract.py`, `census.py`, `report.py`, `results.md` (every table, generated), `forms-kernel.tsv` (every refused
 form of the decompressor and vmlinux, one row per mnemonic + operand shape, first-use order). The same for the
 initramfs is `RAW/forms-initrd.tsv`; `RAW/census.json` holds every row.

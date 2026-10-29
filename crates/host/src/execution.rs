@@ -896,7 +896,7 @@ mod tests {
         let ram = guest_ram(&memory);
         assert!(ram.copy_in(0x5ff0, &[0xaa; 16]) && ram.copy_in(0x9000, &[0xbb; 16]));
         let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0 };
-        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1ff0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0 });
+        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1ff0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET });
         s.fetch = [0x5000, u64::MAX];
         let f = fetched(area, &s, None).unwrap().unwrap();
         assert_eq!((f.bytes, f.more, f.next_fault), (vec![0xaa; 16], true, None));

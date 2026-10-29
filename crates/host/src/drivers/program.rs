@@ -687,6 +687,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 cpl: c.cpl,
                 fs_base: c.fs_base,
                 gs_base: c.gs_base,
+                cr2: 0,
+                cr8: 0,
+                dr: exec::DR_RESET,
             },
         );
     }
@@ -1006,7 +1009,7 @@ mod tests {
     fn next_page_tamper_answers_a_block_request_twice() {
         let memory = Memory::with_size(4096).unwrap();
         let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0 };
-        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1000, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0 });
+        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1000, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET });
         s.fetch = [0x5000, u64::MAX];
         s.reply = exec::REPLY_SYSTEM;
         assert!(!tamper_next_page(area, &mut s) && s.reply == exec::REPLY_SYSTEM);

@@ -102,7 +102,9 @@ enum FexcMap : uint8_t { FEXC_MAP_PRIMARY = 0, FEXC_MAP_TWO = 1, FEXC_MAP_TWO_F3
                          FEXC_MAP_0F38 = 5, FEXC_MAP_0F3A = 6, FEXC_MAP_3DNOW = 7, FEXC_MAP_VEX = 8 };
 // FEXC_CUT_DECODER: the FIRST instruction hit a decoder end-of-input status (partial_decode, not_executable, bad_relocation):
 // no code, never FEX's NoExec/SIGSEGV block. `status` is the Frontend::Decoder::DecodedBlockStatus value.
-enum FexcCutReason : uint8_t { FEXC_CUT_NONE = 0, FEXC_CUT_SYSTEM = 1, FEXC_CUT_UNSUPPORTED = 2, FEXC_CUT_DECODER = 3 };
+// FEXC_CUT_STRING (I2): the instruction after a REP string instruction, which ends its block like a branch (it exits to
+// its own RIP while RCX is not 0): end reason block_ending_instruction, so a block has at most one REP and its link points.
+enum FexcCutReason : uint8_t { FEXC_CUT_NONE = 0, FEXC_CUT_SYSTEM = 1, FEXC_CUT_UNSUPPORTED = 2, FEXC_CUT_DECODER = 3, FEXC_CUT_STRING = 4 };
 struct FexcCut {
   uint8_t reason = FEXC_CUT_NONE; // set when the block ended before an instruction outside the allowlist
   uint64_t rip = 0;               // that instruction
@@ -113,6 +115,7 @@ struct FexcCut {
   uint8_t status = 0;
 };
 inline FexcCut fexc_cut {};
+inline uint64_t fexc_after_rep = 0;   // slice1: the RIP after the block's REP string instruction (0: none yet)
 // Profile slice1, filled by FexcPrecision::Prescan before register allocation (post-RA the JIT sees physical registers,
 // not the SSA nodes behind them); keys are IR node IDs, which RA does not change.
 inline std::map<uint32_t, int64_t> fexc_rip_relative;   // guest-memory op -> its base EntrypointOffset (offset from the block RIP)
@@ -121,3 +124,6 @@ inline std::map<uint32_t, FexcTarget> fexc_target_check; // node after which to 
 // Profile slice1, recorded by the dispatcher's DIVOp/IDIVOp: guest RIP of each div/idiv -> its x86 operand width in bytes
 // (the #DE check needs it; FEX's IR widens the 8-bit forms).
 inline std::map<uint64_t, uint8_t> fexc_div_width;
+// Profile slice1 (I2), recorded by the dispatcher's string instructions: guest RIP of each MOVS, whose load and store are two
+// memory operands (DS:RSI read, ES:RDI written), not a read-modify-write of one.
+inline std::set<uint64_t> fexc_movs;

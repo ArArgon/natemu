@@ -1227,6 +1227,14 @@ mod tests {
         source[3] = 0x90; // nop instead of jne: the block's branch has no decoded target
         let e = admit((&object, &source)).expect_err("link target without a branch admitted");
         assert!(e.contains("neither the block end nor its branch target"), "{e}");
+        // I2: the last instruction's own RIP is a target only when that instruction is a REP string (its self-exit).
+        set(&mut object, h.guest_rip + 3, 0x5280_0060); // mov w0, #3: the jne's own RIP
+        let e = admit((&object, JCC.1)).expect_err("exit to a non-REP last instruction's RIP admitted");
+        assert!(e.contains(&format!("literal {:#x} is neither", h.guest_rip + 3)), "{e}");
+        let mut source = JCC.1.to_vec();
+        source[3..5].copy_from_slice(&[0xf3, 0xaa]); // rep stosb in the jne's place: its RIP becomes proven
+        let e = admit((&object, &source)).expect_err("the taken exit has no branch to prove it");
+        assert!(!e.contains(&format!("literal {:#x}", h.guest_rip + 3)), "{e}");
     }
 
     #[test]
@@ -1342,6 +1350,16 @@ mod tests {
         refused(ADDRESS, at, old, 0xf901_f794, "frame access"); // str x20, [x28, #1000]: the resident's
         refused(ADDRESS, at, old, 0xf901_f394, "frame access"); // str x20, [x28, #992]
         refused(ADDRESS, at, old, 0xf941_ef94, "frame access"); // ldr x20, [x28, #984]: below gs_cached (ds_cached)
+        // Loads that straddle or cover both bases. `ldur x20, [x28, #1004]` has no encoding (imm9 is -256..255) and
+        // neither has `ldp x20, x21, [x28, #992]` (imm7 * 8 <= 504): the unscaled form is refused at any offset, and the
+        // pair at 992 exists only for q registers.
+        refused(ADDRESS, at, old, 0xf84f_c394, "frame access"); // ldur x20, [x28, #252]: unscaled
+        refused(ADDRESS, at, old, 0x3dc0_fb80, "unrecognised"); // ldr q0, [x28, #992]: both bases in one load
+        refused(ADDRESS, at, old, 0xad5f_0780, "unrecognised"); // ldp q0, q1, [x28, #992]
+        refused(ADDRESS, at, old, 0xf941_fb94, "frame access"); // ldr x20, [x28, #1008]: past fs_cached
+        for word in [0xf84f_c394, 0x3dc0_fb80, 0xad5f_0780, 0xf941_fb94] {
+            validated(ADDRESS, at, old, word, Some("")); // the same without the code-shape check
+        }
         // POPCNT without FEAT_CSSC, and prefetch hints.
         for word in [0x9e67_00c0, 0x1e27_00e0, 0x0e20_5800, 0x0e31_b800, 0x0e20_bc00, 0x0e01_3c04, 0xf980_00c0] {
             admitted(word); // fmov d0, x6; fmov s0, w7; cnt v0.8b; addv b0, v0.8b; umov w4, v0.b[0]; prfm pldl1keep, [x6]

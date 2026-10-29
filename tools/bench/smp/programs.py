@@ -479,6 +479,138 @@ SYS = {
     mov r8, [{V:#x}]""",
 }
 
+# S2a: every CR0 bit the profile makes valid, set and read back (TS/EM with only integer code after them; CD/NW have no
+# memory-type effect: V is still read); every valid CR4 bit with CPUID.1:ECX.OSXSAVE (bit 27 only: the leaves differ)
+# following CR4.OSXSAVE; CR2 (any value, non-canonical too) and CR8 (bits 3:0); DR0..DR3 any value, DR6/DR7 fixed bits on
+# read-back, DR4/DR5 aliasing DR6/DR7 with CR4.DE = 0, DR7 R/W, LEN, LE, GE fields without an enabled breakpoint.
+SYS['cr0-bits'] = """    mov r13, cr0
+    mov rax, r13
+    or eax, 0x2e
+    mov cr0, rax
+    mov rbx, cr0
+    bts rax, 18
+    mov cr0, rax
+    mov rsi, cr0
+    bts rax, 30
+    mov cr0, rax
+    mov rdi, cr0
+    bts rax, 29
+    mov cr0, rax
+    mov r8, cr0
+    mov r9, [{V:#x}]
+    btr rax, 3
+    mov cr0, rax
+    mov r10, cr0
+    mov cr0, r13
+    mov r12, cr0"""
+SYS['cr4-bits'] = """    mov r13, cr4
+    mov r14, r13
+    bts r14, 3
+    mov cr4, r14
+    mov rsi, cr4
+    bts r14, 8
+    mov cr4, r14
+    mov rdi, cr4
+    or r14, 0x600
+    mov cr4, r14
+    mov r8, cr4
+    bts r14, 16
+    mov cr4, r14
+    mov r9, cr4
+    bts r14, 18
+    mov cr4, r14
+    mov r10, cr4
+    mov eax, 1
+    xor ecx, ecx
+    cpuid
+    shr ecx, 27
+    and ecx, 1
+    mov r12, rcx
+    btr r14, 18
+    mov cr4, r14
+    mov eax, 1
+    xor ecx, ecx
+    cpuid
+    shr ecx, 27
+    and ecx, 1
+    mov r15, rcx
+    xor ebx, ebx
+    mov cr4, r13
+    mov rbp, cr4"""
+SYS['cr2-cr8'] = """    mov rax, 0xffff888012345678
+    mov cr2, rax
+    mov rbx, cr2
+    mov rax, 0x8000000000000001
+    mov cr2, rax
+    mov rsi, cr2
+    mov rdi, cr8
+    mov eax, 15
+    mov cr8, rax
+    mov r8, cr8
+    mov eax, 5
+    mov cr8, rax
+    mov r9, cr8
+    xor eax, eax
+    mov cr8, rax
+    mov r10, cr8"""
+SYS['debug-regs'] = """    mov r9, dr6
+    mov r10, dr7
+    mov rax, 0xffffffff81000000
+    mov dr0, rax
+    mov rax, 0x00007fff00001000
+    mov dr1, rax
+    mov rax, 0x8000000000000000
+    mov dr2, rax
+    mov rax, {d:#x}
+    mov dr3, rax
+    mov rbx, dr0
+    mov rsi, dr1
+    mov rdi, dr2
+    mov r8, dr3
+    xor eax, eax
+    mov dr6, rax
+    mov r12, dr6
+    mov eax, 0x600f
+    mov dr6, rax
+    mov r13, dr4
+    mov eax, 0xffff0300
+    mov dr5, rax
+    mov r14, dr7
+    xor eax, eax
+    mov dr7, rax
+    mov r15, dr5
+    mov dr0, rax
+    mov dr1, rax
+    mov dr2, rax
+    mov dr3, rax"""
+# The kernel head's EFER and CR0 set-up (K arch/x86/kernel/head_64.S:375-401, v6.12.107), transcribed: CPUID 0x80000001
+# for NX, EFER.SCE (and NX, already on) through RDMSR/WRMSR, `early_pmd_flags` as a data word, CR0 = CR0_STATE
+# (PE MP ET NE WP AM PG). The `pushq $0; popfq` after it is X2's (POPF). EDI (CPUID's EDX: QEMU's CPU differs) is cleared.
+SYS['head-cr0'] = """    mov eax, 0x80000001
+    cpuid
+    mov edi, edx
+    mov ecx, 0xC0000080
+    rdmsr
+    mov edx, eax
+    bts eax, 0
+    bt edi, 20
+    jnc .nonx
+    bts eax, 11
+    bts qword [{V:#x}+0x100], 63
+.nonx:
+    cmp eax, edx
+    je .same
+    xor edx, edx
+    wrmsr
+.same:
+    mov eax, 0x80050033
+    mov cr0, rax
+    mov rbx, cr0
+    mov ecx, 0xC0000080
+    rdmsr
+    mov rsi, rax
+    xor edi, edi"""
+
 def msr_write(index, value):
     return f'    mov ecx, {index:#x}\n    mov rax, {value}\n    mov rdx, rax\n    shr rdx, 32\n    wrmsr\n'
 
@@ -573,13 +705,34 @@ SYS_FAULTS = {
     'lock-cpuid': 'xor eax, eax\n    db 0xf0, 0x0f, 0xa2',
     'lock-rdtsc': 'db 0xf0, 0x0f, 0x31',
     'wrmsr-invalid': 'mov ecx, 0x12345678\n    xor eax, eax\n    xor edx, edx\n    wrmsr',
+    # S2a: CR8 reserved bits, DR8 (REX.R), LOCK, DR6/DR7 (and DR5's alias) bits 63:32, DR4/DR5 with CR4.DE, general
+    # detect on a read and a write, RDPMC without counters (SYS_FAULT_CONTROLS: the state a prefix sets).
+    'cr8-reserved': 'mov eax, 0x10\n    mov cr8, rax',
+    'mov-from-dr8': 'db 0x44, 0x0f, 0x21, 0xc0',
+    'lock-mov-from-dr7': 'db 0xf0, 0x0f, 0x21, 0xf8',
+    'dr6-high': 'mov rax, 1 << 32\n    mov dr6, rax',
+    'dr7-high': 'mov rax, 1 << 32\n    mov dr7, rax',
+    'dr5-high': 'mov rax, 1 << 63\n    mov dr5, rax',
+    'dr4-de': 'mov rax, cr4\n    bts rax, 3\n    mov cr4, rax\n    mov rax, dr4',
+    'dr5-de-write': 'mov rax, cr4\n    bts rax, 3\n    mov cr4, rax\n    xor eax, eax\n    mov dr5, rax',
+    'dr7-gd-read': 'mov eax, 0x2400\n    mov dr7, rax\n    mov rax, dr0',
+    'dr7-gd-write': 'mov eax, 0x2400\n    mov dr7, rax\n    mov dr7, rax',
+    'rdpmc': 'xor ecx, ecx\n    rdpmc',
+    'lock-rdpmc': 'xor ecx, ecx\n    db 0xf0, 0x0f, 0x33',
 }
+# Controls a fault case's prefix sets (CR0/CR4/EFER/DR7 otherwise the start-up values), given to system_fault_model.
+SYS_FAULT_CONTROLS = {'dr4-de': {'cr4': 0x28}, 'dr5-de-write': {'cr4': 0x28}, 'dr7-gd-read': {'dr7': 0x2400}, 'dr7-gd-write': {'dr7': 0x2400}}
 SYS_CPL3 = {
     'cpl3-mov-to-cr0': 'mov rax, 0x80010011\n    mov cr0, rax',
     'cpl3-mov-from-cr3': 'mov rax, cr3',
     'cpl3-invlpg': 'invlpg [rsp]',
     'cpl3-rdmsr': 'mov ecx, 0xC0000080\n    rdmsr',
     'cpl3-wrmsr': 'mov ecx, 0xC0000080\n    mov eax, 0xd00\n    xor edx, edx\n    wrmsr',
+    'cpl3-mov-from-cr2': 'mov rax, cr2',
+    'cpl3-mov-to-cr8': 'xor eax, eax\n    mov cr8, rax',
+    'cpl3-mov-from-dr7': 'mov rax, dr7',
+    'cpl3-mov-to-dr0': 'xor eax, eax\n    mov dr0, rax',
+    'cpl3-rdpmc': 'xor ecx, ecx\n    rdpmc',
 }
 
 def sys_fault(name):
@@ -591,6 +744,7 @@ def sys_fault(name):
     prog = {'format': 'natemu-smp-v1', 'name': f'sysfault-{name}@1', 'ncpu': 1, 'system': True,
             'bodies': [body(SYS_CODE(0), '\n'.join(lines))], 'cpus': [dict(cpu(0, SYS_CODE(0)), cpl=3 if cpl3 else 0)], 'memory': [],
             'params': {'fault_at': f"0x{SYS_CODE(0) + len(asm(chr(10).join(lines[:-1]))):x}"}}
+    if name in SYS_FAULT_CONTROLS: prog['params']['controls'] = SYS_FAULT_CONTROLS[name]
     return prog
 
 # ---- (d) concurrent controls (contract 33): CPU 0 rewrites CR3 / CR0.WP / EFER.NXE while its peers run on the same tables ----

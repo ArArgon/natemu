@@ -35,6 +35,8 @@ inline Verdict Primary(uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
   // as 0: the image clears them); DF lives there too (cld/std write it). clc/stc/cmc, lahf/sahf: arithmetic flags only.
   case 0x9C: case 0xFC: case 0xFD: case 0xF5: case 0xF8: case 0xF9: case 0x9E: case 0x9F: return Allow();
   case 0xC9: return Allow();                                       // leave
+  // movs/cmps/stos/lods/scas (I2): one element per pass, REP through an exit to the instruction's own RIP (patch 0015)
+  case 0xA4: case 0xA5: case 0xA6: case 0xA7: case 0xAA: case 0xAB: case 0xAC: case 0xAD: case 0xAE: case 0xAF: return Allow();
   case 0xC8: return Allow();                                       // enter (nesting level 0 only, checked below)
   case 0xF4: return Sys("hlt");
   case 0xE4: case 0xE5: case 0xE6: case 0xE7: case 0xEC: case 0xED: case 0xEE: case 0xEF:
@@ -171,9 +173,15 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   const bool primary = d.FexcMap == FEXC_MAP_PRIMARY;
   // LOCK only on memory xchg (implicitly locked anyway; on a register form LOCK is #UD).
   if ((f & DecodeFlags::FLAG_LOCK) && !(primary && (op == 0x86 || op == 0x87) && mod != 3)) return Uns("LOCK prefix");
-  if (f & DecodeFlags::FLAG_REPNE_PREFIX) return Uns("REPNE prefix");
+  // String instructions (I2): REP (F3) on all five, REPE (F3) and REPNE (F2) on cmps/scas. Refused: both prefixes together,
+  // and by policy F2 on movs/stos/lods (hardware repeats as with REP; the SDM calls it reserved).
+  const bool string = primary && ((op >= 0xA4 && op <= 0xA7) || (op >= 0xAA && op <= 0xAF));
+  const bool compare = string && (op == 0xA6 || op == 0xA7 || op == 0xAE || op == 0xAF);
+  const bool source = string && (op <= 0xA7 || op == 0xAC || op == 0xAD);   // movs, cmps, lods: DS:RSI
+  if ((f & DecodeFlags::FLAG_REP_PREFIX) && (f & DecodeFlags::FLAG_REPNE_PREFIX)) return Uns("REP and REPNE prefixes together");
+  if ((f & DecodeFlags::FLAG_REPNE_PREFIX) && !compare) return Uns(string ? "REPNE prefix on movs/stos/lods" : "REPNE prefix");
   // rep ret is a ret; F3 90 (no REX.B: that would be xchg r8, rax) is PAUSE, FEX's `yield`.
-  if ((f & DecodeFlags::FLAG_REP_PREFIX) && !(primary && (op == 0xC3 || (op == 0x90 && !(f & DecodeFlags::FLAG_REX_XGPR_B)))))
+  if ((f & DecodeFlags::FLAG_REP_PREFIX) && !string && !(primary && (op == 0xC3 || (op == 0x90 && !(f & DecodeFlags::FLAG_REX_XGPR_B)))))
     return Uns("REP prefix");
   // Segment prefixes in 64-bit mode (I7). FS/GS: FEX adds fs_cached/gs_cached (guest-state page loads) to the effective
   // address of the explicit memory operand, as x86 adds FS.base/GS.base; never to the implicit stack accesses of push/
@@ -184,12 +192,16 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   //   - several segment prefixes with an FS/GS one (Vol. 2 §2.1.1 gives no rule for two prefixes of one group; FEX keeps
   //     the last FS/GS prefix and drops CS/DS/ES/SS, QEMU lets the last segment prefix win, a null one included);
   //   - SS naming an operand whose default is DS, or CS/DS/ES one whose default is SS (#SS(0) versus #GP(0) for a
-  //     non-canonical address: AMD ignores these overrides, so the default segment decides);
+  //     non-canonical address: AMD APM Vol. 3 §1.2.4 makes CS/DS/ES/SS null prefixes in 64-bit mode, so the default
+  //     segment decides, while Intel SDM Vol. 1 §3.3.7.1 suggests #SS for an SS override);
   //   - FS/GS on an instruction with no explicit memory operand (nothing to override).
+  // String instructions: ES:RDI takes no override (SDM Vol. 2 MOVS/STOS/CMPS/SCAS); the DS:RSI source of movs/cmps/lods
+  // takes FS/GS and the DS-default rules above (RSI is no stack base); stos/scas have no overridable operand, so FS/GS
+  // there (which hardware ignores) is refused by policy.
   {
     const uint32_t seg = f & DecodeFlags::FLAG_SEGMENTS;
     const bool fsgs = seg == DecodeFlags::FLAG_FS_PREFIX || seg == DecodeFlags::FLAG_GS_PREFIX;
-    const bool memory = (has_modrm && mod != 3) || (primary && op >= 0xA0 && op <= 0xA3);
+    const bool memory = (has_modrm && mod != 3) || (primary && op >= 0xA0 && op <= 0xA3) || source;
     const uint8_t* b = fexc_guest_bytes ? fexc_guest_bytes(d.PC, d.InstSize) : nullptr;
     if (!b) return Uns("segment prefixes: instruction bytes unavailable");
     int ss = 0, data = 0, high = 0;   // 36; 26/2E/3E; 64/65
@@ -203,8 +215,9 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
     if (fsgs && !memory) return Uns("FS/GS override on an instruction without a memory operand");
     if (fsgs && ss + data + high != 1) return Uns("FS/GS override with another segment prefix (no SDM rule for several)");
     if (!fsgs && memory && ss + data) {
-      int base = -1;
+      int base = source ? int(FEXCore::X86State::REG_RSI) : -1;
       for (const auto* o : {&d.Dest, &d.Src[0], &d.Src[1], &d.Src[2]}) {
+        if (source) break;
         if (o->IsGPRDirect()) base = o->Data.GPR.GPR;
         else if (o->IsGPRIndirect()) base = o->Data.GPRIndirect.GPR;
         else if (o->IsSIB()) base = o->Data.SIB.Base;
@@ -235,6 +248,12 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
 // instruction (and, mid-block, to let FEX end the block at a decoder end-of-input status with its own reason).
 inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, bool first, const DecodedInst& d, uint64_t rip) {
   using S = Frontend::Decoder::DecodedBlockStatus;
+  // A REP string instruction ends its block (I2): the next instruction starts the next block.
+  if (first) fexc_after_rep = 0;
+  if (!first && rip == fexc_after_rep) {
+    fexc_cut = {FEXC_CUT_STRING, rip, d.FexcMap, d.OPRaw, d.ModRM, false, "?", "after a REP string instruction"};
+    return true;
+  }
   const bool failed = last && status != S::SUCCESS;
   if (failed && status != S::INVALID_INST && status != S::UNIMPLEMENTED_INST) {
     // Mid-block, FEX already ends the block before such an instruction (HadInvalidInst) without emitting anything for it.
@@ -251,6 +270,8 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
     const bool rel = (d.FexcMap == FEXC_MAP_PRIMARY && ((op >= 0x70 && op <= 0x7F) || op == 0xE8 || op == 0xE9 || op == 0xEB)) ||
                      (d.FexcMap == FEXC_MAP_TWO && op >= 0x80 && op <= 0x8F);
     const uint64_t target = rip + d.InstSize + d.Src[0].Literal();
+    const bool string = d.FexcMap == FEXC_MAP_PRIMARY && ((op >= 0xA4 && op <= 0xA7) || (op >= 0xAA && op <= 0xAF));
+    if (string && (d.Flags & (DecodeFlags::FLAG_REP_PREFIX | DecodeFlags::FLAG_REPNE_PREFIX))) fexc_after_rep = rip + d.InstSize;
     if (!rel || uint64_t(int64_t(target << 16) >> 16) == target) return false;
     v = Uns("direct branch to a non-canonical target");
   }

@@ -48,6 +48,7 @@ def cases(programs):
 def accesses(text, regs, next_rip):
     """The data accesses of one instruction (tools/run_slice1_faults.py `events`) plus the control transfers it does not model:
     a direct `call` pushes; other direct branches access nothing."""
+    if (one := F.string_events(text, regs)) is not None: return one     # I2: the element `regs` point at
     m, ops = text.split()[0], F.split_operands(text)
     direct = bool(ops) and not (F.MEM.fullmatch(ops[0]) or ops[0] in ref.R64)
     if m == 'call' and direct: return [('access', (regs['rsp'] - 8) & F.M64, 8, True, True)]
@@ -63,7 +64,7 @@ def expected_fault(p, muts, want):
     insns = [l for l in p['asm'] if not l.endswith(':')]
     i = p['offsets'].index(rip - ref.num(p['rip']))
     ends = p['offsets'][1:] + [len(p['code']) // 2]
-    evs = accesses(insns[i], F.state(want), rip + ends[i] - p['offsets'][i])
+    evs = accesses(insns[i], F.state(want) | F.bases(p), rip + ends[i] - p['offsets'][i])
     layout = F.layout(p, {mode: [pg] for mode, pg in muts})
     got = F.first_fault(evs, layout, F.reader(want))
     problems = []
@@ -85,6 +86,27 @@ def compare_fault(expected, out):
     return diffs
 
 
+def strings(job):
+    """Indices of the job's string instructions (I2)."""
+    return {i for i, l in enumerate(l for l in job['asm'] if not l.endswith(':')) if F.STRING.fullmatch(l.strip())}
+
+
+def unroll(job, result):
+    """Whether a faulting job's exact state comes from its unrolled path: every fault but one inside a string instruction
+    (I2). QEMU translates each REP pass as its own block, so a fault at an element sees the flags the previous pass left
+    in its state: the signal context (RCX/RSI/RDI and memory at the faulting element) is exact there; no straight-line
+    program reproduces a REP stopped mid-way. A fault after a string instruction is unrolled with the REP once (`path`)."""
+    if not result.get('fault'): return False
+    return job['offsets'].index(ref.num(result['qemu']['rip']) - ref.num(job['rip'])) not in strings(job)
+
+
+def path(job, ix):
+    """The executed path with each run of one REP string instruction's passes as that instruction once (it runs to its end
+    in the straight-line program as it did on the path)."""
+    s = strings(job)
+    return [i for k, i in enumerate(ix) if not (k and i == ix[k - 1] and i in s)]
+
+
 def reference(jobs, work):
     """QEMU's result for each job: the fault context its SIGSEGV delivers (`fault`: CR2, error code) and the precise state at
     the fault. Phase 1 runs the job in fault mode (single-stepped, the page made absent or read-only): the faulting RIP, the
@@ -97,13 +119,13 @@ def reference(jobs, work):
     for i in range(0, len(jobs), 200):      # batches bound the disk the QEMU logs take
         first += ref.run_programs(jobs[i:i + 200], work, qemu_path())[0]
         shutil.rmtree(work / 'jobs')
-    exact = [dict(gen.unrolled(j, r['path_ix']), name=j['name'] + '/path', faults={'protect': []}) for j, r in zip(jobs, first) if r.get('fault')]
+    exact = [dict(gen.unrolled(j, path(j, r['path_ix'])), name=j['name'] + '/path', faults={'protect': []}) for j, r in zip(jobs, first) if unroll(j, r)]
     for i in range(0, len(exact), 200):
         second += ref.run_programs(exact[i:i + 200], work, qemu_path())[0]
         shutil.rmtree(work / 'jobs')
     second, results, diffs = iter(second), [], []
     for j, r in zip(jobs, first):
-        if r.get('fault'):
+        if unroll(j, r):
             t = next(second)
             q1, q2 = r['qemu'], dict(t['qemu'], rip=r['qemu']['rip'])
             changed = (ref.num(q1['rflags']) ^ ref.num(q2['rflags'])) & ref.num(t['rflags_compare_mask'])

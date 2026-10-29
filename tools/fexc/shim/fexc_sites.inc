@@ -228,10 +228,11 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
   // A memory-destination read-modify-write loads then stores the one explicit memory operand, so the load of
   // an instruction that also has a plain store site is the RMW load and must be walked with write intent
   // (x86 reports such a fault as a write). Valid because the admitted instructions have at most one explicit
-  // memory operand; implicit stack accesses are push/pop kinds and never match.
+  // memory operand, but MOVS (I2: its load reads DS:RSI, its store writes ES:RDI); implicit stack accesses are
+  // push/pop kinds and never match.
   const int Index = int(fexc_sites.size());
   if (S.kind == FEXC_SITE_LOAD) { FexcLoadSite = Index; }
-  else if (S.kind == FEXC_SITE_STORE && FexcLoadSite >= 0 && fexc_sites[FexcLoadSite].width == S.width) {
+  else if (S.kind == FEXC_SITE_STORE && FexcLoadSite >= 0 && fexc_sites[FexcLoadSite].width == S.width && !fexc_movs.count(Entry + FexcGuest)) {
     fexc_sites[FexcLoadSite].rmw = 1; fexc_sites[FexcLoadSite].intent = 1; S.rmw = 2;
   }
   if (S.kind == FEXC_SITE_PUSH_PAIR || S.kind == FEXC_SITE_POP_PAIR) FexcPendingFused.push_back(size_t(Index));

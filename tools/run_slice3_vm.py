@@ -50,7 +50,9 @@ store completes in the resident with `dsb ish`, so SB cannot relax there).
 code page), every vCPU kicked M times (default 10,000) by its own host kicker thread (its GIC SPI doorbell), R runs of
 it, P at once (P * N above the core count: oversubscribed); (1b) adversarial: the same at N vCPUs with kicks at random
 times (0..`--jitter-us` after each stop) into `adversarial_program` (computed jumps through the dispatcher and L1 every
-round, a division `svc` resumed mid-block, self-modifying stores single-stepped, peers rung by SGI), and over all its
+round, a division `svc` resumed mid-block, self-modifying stores single-stepped, peers rung by SGI), (1c, I2) the same
+kicks into `rep_program` (long REP STOSQ/MOVSQ both directions, REPE CMPSB, REPNE SCASB: stops between elements at the
+REP's own exit, resumed there), and over all its
 runs stops must have been taken at every place (block entry, dispatcher, L1, armed exit, resident entry, in the step
 block, re-armed after a mid-block resume; at a resident entry only with N > 1: peers' SGIs); (2) a peer's resident kick: vCPU 1 writes data on vCPU 0's
 code page while vCPU 0 spins in its hot loop, so vCPU 1's resident posts the page to vCPU 0 and rings its SGI; (3)
@@ -68,11 +70,13 @@ QEMU. Latency (ring -> the resident's stop, per vCPU, one clock) and the mean ac
 `system` (S3c1, long-mode system instructions as resident transactions): see cmd_system. Each system program of
 tools/bench/smp/system.json runs at block sizes default and 1 against QEMU system mode (smp.SYSTEM_CPU), except the PTE
 change without INVLPG (coherence_model) and the fault cases (tools/system_fault_model.py at QEMU's state just before
-the instruction; modes_model where it covers them; QEMU's own outcome is reported and must agree where it raises an
-exception); refused forms stop `unsupported_system`; a tampered system reply stops `bad_reply`. The presented CPU (S1,
+the instruction and the controls the case declares; modes_model where it covers them; QEMU's own outcome is reported
+and must agree where it raises an exception, but for QEMU_DIFFERS); refused forms stop `unsupported_system`; a tampered system reply stops `bad_reply`. The presented CPU (S1,
 tools/models/cpu_profile.py as the judge, QEMU's CPU being another): CPUID leaf by leaf, MSR reset values, MISC_ENABLE,
 the UCODE_REV latch, TSC/RDTSC/RDTSCP and CR4.PSE/TSD at 1, 2 and 4 vCPUs (`profile_program`), and CPUID/RDTSC at CPL3,
-RDTSC/RDTSCP #GP at CPL3 with CR4.TSD (SDM Vol.2 RDTSC).
+RDTSC/RDTSCP #GP at CPL3 with CR4.TSD (SDM Vol.2 RDTSC). S2a: CR0/CR4 bits, CR2, CR8, DR0..DR7 read-backs and the
+kernel head's EFER/CR0 sequence against QEMU; CR8/DR/RDPMC fault cases; a breakpoint-enabling DR7 refused; CR0.AM with
+RFLAGS.AC at CPL3 refused (`unsupported_mode`, no #AC).
 
 `coherence` (S3d, cross-vCPU code coherence): the programs of tools/bench/smp/coherence.json (`programs.coherence_all`:
 code written at run time by one CPU and run by others — fresh code on a new page and on a page used for data before, a
@@ -410,6 +414,28 @@ def hot_program(n, iterations):
             'memory': [{'addr': '0x120000', 'size': 64, 'fill': 'zero'}], 'params': {}, 'format': 'natemu-smp-v1'}
 
 
+REP_BUF, REP_STRIDE, REP_QWORDS = 0x130000, 0x20000, 0x1000     # per vCPU: two 32 KiB halves and a sentinel page above
+REP_LOOP = ref.assemble(
+    '1: mov rdi, rbx\nmov ecx, 0x1000\nmov rax, r8\nrep stosq\n'              # fill the low half with r8
+    'mov rsi, rbx\nlea rdi, [rbx + 0x8000]\nmov ecx, 0x1000\nrep movsq\n'     # copy it up
+    'lea rsi, [rbx + 0x7ff8]\nlea rdi, [rbx + 0xfff8]\nmov ecx, 0x1000\nstd\nrep movsq\ncld\n'   # and down again
+    'lea rsi, [rbx + 1]\nmov rdi, rbx\nmov ecx, 0xfff\nrepe cmpsb\nadd r9, rcx\n'   # equal bytes: REPE runs to the end
+    'lea rdi, [rbx + 0x8000]\nmov ecx, 0x8000\nmov al, 0x5a\nrepne scasb\nadd r10, rcx\n'
+    'mov rdx, 0x0101010101010101\nadd r8, rdx\ndec r12\njnz 1b').hex()
+
+
+def rep_program(n, iterations):
+    """I2: N vCPUs, each `iterations` rounds of 32 KiB REP STOSQ, REP MOVSQ up and (DF = 1) down, REPE CMPSB and REPNE
+    SCASB over its own buffer (rbx); nearly all its time is inside REP strings, so kicks stop it between elements (the
+    REP's own exit) and it must resume there: final registers, buffers and the sentinel page above them equal QEMU's."""
+    cpus = [{'rip': '0x110000', 'rflags': 0,
+             'gpr': [f'{x:#x}' for x in (0, 0, 0, REP_BUF + REP_STRIDE * v, int(stack(v), 16), 0, 0, 0, 0x1111111111111111 * (v + 1), 0, 0, 0,
+                                          iterations + v)] + ['0x0'] * 3} for v in range(n)]
+    return {'name': f'rep@{n}', 'ncpu': n, 'bodies': [{'addr': '0x110000', 'code': REP_LOOP}], 'cpus': cpus, 'params': {},
+            'format': 'natemu-smp-v1', 'memory': [{'addr': f'{REP_BUF + REP_STRIDE * v:#x}', 'size': 0x11000, 'fill': 'lcg', 'seed': v + 1}
+                                                   for v in range(n)]}
+
+
 def peer_program(iterations):
     """vCPU 0: set the flag at 0x120000, then the hot loop (its first block, flag store to jnz, is placed before the
     store runs, so the code page is marked before the flag is seen). vCPU 1 (own code page): wait for the flag, then
@@ -491,6 +517,25 @@ def cmd_kicks(a, host, runtime):
                   f"latency p50/p99/p999/max us {[(l['p50'] / 1e3, l['p99'] / 1e3, l['p999'] / 1e3, l['max'] / 1e3) for l in lat]}", flush=True)
             failures += [f"{e['name']} rep{e['rep']}: {d}" for d in e['diffs']]
         report['hot'] += entries
+    # I2: kicks into long REP strings (rep_program): every stop lands between elements and the run must still match QEMU.
+    report['rep'] = []
+    for n in a.cpus:
+        prog = rep_program(n, a.rep_iterations)
+        want = qemu_reference(prog, a.out / 'qemu' / prog['name'])
+        extra = [x for v in range(n) for x in ('--kick-vcpu', v)] + ['--kicks', a.kicks]
+        groups = [(f"{prog['name']}-{r}", smp_description(prog), extra) for r in range(a.reps)]
+
+        def judge(i, rc, out, err, prog=prog, want=want, n=n):
+            e = {'name': prog['name'], 'rep': i}
+            if rc: return [{**e, 'diffs': [f'driver exit {rc}: {err.strip()[-300:]}']}]
+            return [{**e, 'diffs': judge_smp(prog, want, out, [a.kicks] * n), 'kicks': [c['kicks'] for c in out['cpus']],
+                     'stats': [{k: c['stats'][k] for k in ('blocks', 'requests', 'stops', 'linker')} for c in out['cpus']]}]
+        for e in run_groups(a, host, runtime, groups, judge):
+            ks = e.get('kicks', [])
+            print(f"{e['name']} rep{e['rep']}: {'ok' if not e['diffs'] else 'FAIL ' + '; '.join(e['diffs'])[:400]}; "
+                  f"issued {[k['issued'] for k in ks]} stops {[k['stops'] for k in ks]} {places(ks)}", flush=True)
+            failures += [f"{e['name']} rep{e['rep']}: {d}" for d in e['diffs']]
+            report['rep'].append(e)
     # Adversarial: kicks at random times (0..J us after each stop) into a program that keeps every vCPU moving through
     # blocks, the dispatcher, L1, mid-block resident entries and the step block, with peers' SGIs from its code writes.
     # Every run matches QEMU with the doorbell accounting; over all runs every place must have taken stops.
@@ -611,11 +656,9 @@ def either_check(prog, out):
 
 def unsupported_cases():
     """Instructions the resident refuses (`unsupported_system`), each alone at CPL0 after a flag-setting prefix."""
-    cases = {'cr0-cd': 'mov rax, cr0\nbts rax, 30\nmov cr0, rax', 'cr4-osfxsr': 'mov rax, cr4\nbts rax, 9\nmov cr4, rax',
-             'mov-from-cr2': 'mov rax, cr2', 'mov-to-cr8': 'xor eax, eax\nmov cr8, rax', 'cr3-pwt': 'mov rax, cr3\nbts rax, 3\nmov cr3, rax',
-             # Valid under the CPU 16/17 profile but not implemented yet: the resident must refuse, never #GP.
-             'cr4-pce': 'mov rax, cr4\nbts rax, 8\nmov cr4, rax', 'cr4-de': 'mov rax, cr4\nbts rax, 3\nmov cr4, rax',
-             'cr4-fsgsbase': 'mov rax, cr4\nbts rax, 16\nmov cr4, rax', 'cr4-osxsave': 'mov rax, cr4\nbts rax, 18\nmov cr4, rax',
+    cases = {'cr3-pwt': 'mov rax, cr3\nbts rax, 3\nmov cr3, rax',
+             # A DR7 that enables a breakpoint (L0, G3): breakpoints are S4's.
+             'dr7-l0': 'mov eax, 0x401\nmov dr7, rax', 'dr7-g3': 'mov eax, 0x480\nmov dr7, rax',
              # IA32_APIC_BASE moved (a valid value): the LAPIC's page and mode, no LAPIC yet.
              'wrmsr-apic-base-move': 'mov ecx, 0x1b\nmov eax, 0xfed00800\nxor edx, edx\nwrmsr'}
     return {k: ref.assemble('mov rbx, 1\n' + v).hex() for k, v in cases.items()}
@@ -625,6 +668,9 @@ def unsupported_cases():
 # the case runs and its mismatch is printed as GAP, not counted as a failure. A listed case that starts to pass is a failure,
 # so the entry must be deleted when the resident is fixed. Empty since S1.
 SYSTEM_GAPS = {}
+# Fault cases where pinned QEMU raises another exception than the SDM and the profile (system_fault_model) give: the
+# model judges; QEMU's answer is recorded, not compared.
+QEMU_DIFFERS = {'sysfault-rdpmc@1': 'QEMU raises #UD for RDPMC at CPL 0 (unimplemented); with no counters (CPUID.0AH = 0) every ECX is an invalid counter: #GP(0)'}
 
 
 # ---- S1: the presented CPU, judged by tools/models/cpu_profile.py (QEMU presents its own CPU) --------------------------------
@@ -736,7 +782,8 @@ def profile_program(n):
 
 def cpl3_cases():
     """(name, description, check(out) -> problems): CPUID and RDTSC/RDTSCP run at CPL3; with CR4.TSD both are #GP(0) at
-    CPL3 (SDM Vol.2 RDTSC, RDTSCP). One vCPU, the driver's user space; the CPL drops through a `switch` nop."""
+    CPL3 (SDM Vol.2 RDTSC, RDTSCP); CR0.AM with RFLAGS.AC at CPL3 is refused. One vCPU, the driver's user space; the CPL
+    drops through a `switch` nop."""
     from models import cpu_profile as cp
     want = cp.load().cpuid(1)
     cpuid = 'mov eax, 1\nmov ecx, 7\ncpuid\nrdtsc\nmov r8, rax\nrdtscp\nmov r9, rcx\ncmp r11, r11'
@@ -754,6 +801,20 @@ def cpl3_cases():
             f = out.get('fault')
             return [] if out['stop'] == 'guest_fault' and [smp.num(x) for x in f] == [13, 0, 0, at] else [f"{out['stop']} {out['reason']} {f}"]
         cases.append((f'tsd-cpl3-{name}', f"cpl 0\nrip 0x110000\nswitch {0x110000 + len(head):#x} 3\ncode {code.hex()}\n", gp))
+    # Alignment checking (CR0.AM, RFLAGS.AC, CPL 3: #AC on a misaligned access) is not built: entering that state is
+    # refused (`unsupported_mode`) at the change; AM and AC at CPL 0, or AM without AC at CPL 3, run.
+    head = ref.assemble('mov rax, cr0\nbts rax, 18\nmov cr0, rax\nmov rbx, 1')
+    tail = ref.assemble('mov rcx, [rip+1]\ncmp r11, r11')                # a misaligned load (no #AC without AC)
+    code, at = head + b'\x90' + tail, 0x110000 + len(head)
+
+    def refused(out):
+        return [] if out['stop'] == 'resident' and out['reason'].startswith('unsupported_mode') and smp.num(out['gpr'][3]) == 1 \
+            else [f"{out['stop']} {out['reason']} at {out['rip']}"]
+
+    def runs(out):
+        return [] if out['stop'] == 'reached' else [f"{out['stop']} {out['reason']} at {out['rip']}"]
+    for name, rflags, check in (('am-ac-cpl3', 0x40000, refused), ('am-cpl3', 0, runs)):
+        cases.append((name, f"cpl 0\nrflags {rflags:#x}\nrip 0x110000\nswitch {at:#x} 3\ncode {code.hex()}\n", check))
     return cases
 
 
@@ -781,17 +842,23 @@ def cmd_system(a, host, runtime):
             if want is None: failures.append(f'{name}: QEMU prefix run failed ({rc})'); continue
             code = bytes.fromhex(prog['bodies'][0]['code'])[at - smp.num(prog['bodies'][0]['addr']):]
             c = prog['cpus'][0]
-            # The model is given the start-up controls: the prefix must not have written any (MOV to CR 0f 22, WRMSR 0f 30).
+            # The model is given the start-up controls (CR0, CR4, EFER, DR7) and those the case declares (params.controls):
+            # the prefix must not have written others (MOV to CR 0f 22, WRMSR 0f 30, MOV to DR 0f 23).
+            declared = prog['params'].get('controls', {})
             prefix = bytes.fromhex(prog['bodies'][0]['code'])[:at - smp.num(prog['bodies'][0]['addr'])]
-            assert b'\x0f\x22' not in prefix and b'\x0f\x30' not in prefix, f'{name}: the prefix changes controls'
-            vector = sfm.fault(code, want['cpus'][0]['gpr'], c.get('cpl', 3), 0x80010011, 0x20, 0xd00)
+            assert (b'\x0f\x22' not in prefix or 'cr4' in declared) and b'\x0f\x30' not in prefix \
+                and (b'\x0f\x23' not in prefix or 'dr7' in declared), f'{name}: the prefix changes controls'
+            ctl = {'cr0': 0x80010011, 'cr4': 0x20, 'efer': 0xd00, 'dr7': 0x400, **declared}
+            vector = sfm.fault(code, want['cpus'][0]['gpr'], c.get('cpl', 3), ctl['cr0'], ctl['cr4'], ctl['efer'], ctl['dr7'])
             if vector is None: failures.append(f'{name}: the model expects no fault'); continue
             want['cpus'][0]['fault'] = (*vector, at, 0)
             full, rc = qemu(prog, name, timeout=10)
             entry['qemu'] = 'hang' if rc == 'timeout' else (full and full['cpus'][0]['fault'] and list(full['cpus'][0]['fault'])) or 'no fault'
             # Where QEMU does raise an exception, it is the model's.
             if isinstance(entry['qemu'], list) and tuple(entry['qemu']) != want['cpus'][0]['fault']:
-                failures.append(f"{name}: QEMU raises {entry['qemu']}, the model {want['cpus'][0]['fault']}")
+                if name in QEMU_DIFFERS: entry['qemu_differs'] = QEMU_DIFFERS[name]
+                else: failures.append(f"{name}: QEMU raises {entry['qemu']}, the model {want['cpus'][0]['fault']}")
+            elif name in QEMU_DIFFERS: failures.append(f'{name}: listed in QEMU_DIFFERS but QEMU agrees ({entry["qemu"]})')
         else:
             want, rc = qemu(prog, name)
             if want is None: failures.append(f'{name}: QEMU run failed ({rc})'); continue
@@ -1449,6 +1516,7 @@ def main():
     ap.add_argument('--reps', type=int, default=1)
     ap.add_argument('--kicks', type=int, help='kicks per vCPU (kicks: default 10000; corpora: off unless given)')
     ap.add_argument('--iterations', type=int, default=400_000_000, help='hot-loop iterations per vCPU (kicks)')
+    ap.add_argument('--rep-iterations', type=int, default=3000, help='REP-string rounds per vCPU (kicks, I2)')
     ap.add_argument('--adversarial-iterations', type=int, default=2_000_000, help='adversarial rounds per vCPU (kicks)')
     ap.add_argument('--jitter-us', type=int, default=40, help='adversarial kicks: random extra delay 0..J us after each stop')
     ap.add_argument('--cpus-contain', type=int, nargs='+', default=[1, 2, 3, 4], help='contain: N for the tamper matrix')

@@ -1,6 +1,6 @@
 """S1c checks: profile slice1 of fexc (block cutting at an allowlist, single-gate exits, profile record).
 
-Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series15 build)
+Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series16 build)
 
 The x86 bytes below are assembled by hand and only drive the compiler; every expectation (where the block ends, why)
 comes from the instruction's architectural class, never from fexc's output. The cut position is also compared with a
@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402  (disassemble, object reader)
 import scan_skips  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series15/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series16/obj/fexc')
 REPO = HERE.parents[1]
 RIP = 0x102000
 PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
@@ -49,7 +49,9 @@ UNSUPPORTED = {
     'lock xchg rax,rcx (#UD)': 'f04887c1', 'rep xchg r8,rax (not pause)': 'f34190', 'o16 mfence': '660faef0',
     'lfence modrm e9': '0faee9', 'rep mfence': 'f30faef0',
     'lock add [rax],rcx': 'f0480108', 'lock inc [rax]': 'f0ff00', 'lock cmpxchg [rax],ecx': 'f00fb108', 'lock xadd [rax],ecx': 'f00fc108',
-    'rep movsb': 'f3a4', 'movsb': 'a4', 'stosq': '48ab', 'scasb': 'ae', 'cmpsb': 'a6', 'lodsb': 'ac',
+    # I2: string forms outside the allowlist (REPNE only on cmps/scas, never with REP; no 0x67; FS/GS and SS rules)
+    'repne movsb': 'f2a4', 'repne stosq': 'f248ab', 'rep repne cmpsb': 'f3f2a6', 'addr32 rep movsb': '67f3a4', 'addr32 lodsb': '67ac',
+    'fs stosb (ES:RDI only)': '64aa', 'gs rep scasq': '65f348af', 'ss lodsb': '36ac', 'fs gs movsb': '6465a4', 'lock movsb': 'f0a4',
     'mov eax,[eax] (addr32)': '678b00',
     # I7: an FS/GS override with nothing to override, or with a second segment prefix (no SDM rule; FEX and QEMU differ)
     'fs mov rax,rcx': '644889c8', 'gs push rax': '6550', 'gs ret': '65c3', 'fs leave': '64c9', 'gs pushf': '659c', 'fs jmp rel8': '64eb00',
@@ -108,7 +110,14 @@ ALLOWED = {
     'ss mov rax,[rbp+8]': '36488b4508', 'ds mov rax,[rax+rbp*2]': '3e488b0468', 'ds movabs rax,[moffs]': '3e48a10102030405060708',
     'cs push rax': '2e50', 'ds mov rax,rcx': '3e4889c8', 'cs ds mov rax,[rbx]': '2e3e488b03', 'ss ss mov rax,[rsp+8]': '3636488b442408',
     'cs nop word [rax+rax]': '662e0f1f840000000000',
+    # I2: string instructions without a repeat prefix (one element)
+    'movsb': 'a4', 'movsq': '48a5', 'o16 cmpsw': '66a7', 'stosq': '48ab', 'stosd': 'ab', 'lodsb': 'ac', 'scasb': 'ae', 'cmpsb': 'a6',
+    'fs movsq': '6448a5', 'gs lodsd': '65ad', 'fs cmpsb': '64a6', 'ds movsb': '3ea4', 'es stosb': '26aa',
 }
+
+# I2: REP/REPE/REPNE string instructions end their block (they exit to their own RIP until RCX is 0).
+REPS = {'rep movsb': 'f3a4', 'rep movsq': 'f348a5', 'rep stosq': 'f348ab', 'rep stosb': 'f3aa', 'rep lodsw': '66f3ad', 'repe cmpsb': 'f3a6',
+        'repne cmpsd': 'f2a7', 'repe scasq': 'f348af', 'repne scasb': 'f2ae', 'fs rep movsq': '64f348a5', 'gs repe cmpsb': '65f3a6'}
 
 # (name, hex, translated-instruction count): control transfers end the block with their normal exit.
 BRANCHES = {
@@ -174,6 +183,24 @@ class Slice1Cutting(unittest.TestCase):
                 g = d['guest']
                 self.assertEqual(rc, 0, name)
                 self.assertEqual((g['instructions_translated'], g['end']['reason']), (5, 'end_of_input'), (name, g['end']))
+
+    def test_rep_strings_end_their_block(self):
+        for name, x in REPS.items():
+            with self.subTest(name):
+                d, rc = run(PRE + x + PRE)
+                g = d['guest']
+                self.assertEqual(rc, 0, name)
+                self.assertEqual((g['instructions_translated'], g['end']['reason']), (3, 'block_ending_instruction'), (name, g['end']))
+                at = RIP + len(PRE) // 2
+                self.assertEqual(g['end']['rip'], hex(at + len(x) // 2), name)
+                # Literal exits: the instruction's own RIP (next pass) and the next instruction's (done).
+                moves = sorted(r['guest_rip'] for r in d['code']['relocations'] if r['kind'] == 'guest_rip_move' and r['register'] == 0)
+                self.assertEqual(moves, sorted([hex(at), hex(at + len(x) // 2)]), name)
+                kinds = [s['kind'] for s in d['sites'] if s['kind'] in ('load', 'store')]
+                self.assertEqual(kinds, {'mov': ['load', 'store'], 'sto': ['store'], 'lod': ['load'], 'cmp': ['load', 'load'],
+                                         'sca': ['load']}[name.split()[-1][:3]], name)
+                self.assertTrue(all(s['intent'] == ('write' if s['kind'] == 'store' else 'read') and s['rmw'] == 'none'
+                                    for s in d['sites'] if s['kind'] in ('load', 'store')), name)
 
     def test_rip_relative_after_an_immediate(self):
         # [rip + disp] is relative to the end of the instruction, immediates included (SDM vol. 2 §2.2.1.6): shld/shrd imm8

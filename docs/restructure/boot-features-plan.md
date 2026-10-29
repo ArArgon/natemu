@@ -68,7 +68,7 @@ composite or a named check.
 | --- | --- | --- | --- | --- |
 | CPUID | `verify_cpu`: leaves 0, 1, 0x80000000/1; REQUIRED_MASK0 = FPU, PSE, MSR, PAE, CX8, PGE, FXSR, CMOV, SSE, SSE2; MASK1 = LM (`K kernel/verify_cpu.S:52-131`, `include/asm/required-features.h:13-81`); 7.0/7.1/0xD (`K kernel/cpu/common.c:995-1009`); 0x15 (`tsc.c:659-730`); LA57 probe (`K boot/compressed/pgtable_64.c:109-143`); microcode read does CPUID 1 (below) | The CPU 16 table leaf by leaf: 0, 1, 2 (`0x0000ff01`), 4 (four cache levels), 6 (ARAT), 7.0, 0xB (topology), 0xD.0–2 (XCR0 0x7), 0x15 = (3, 125, 24000000) (CPU 13), 0x40000000 (`NatemuNatemu`), 0x80000000–8 (brand, invariant TSC, 40/48 bits); dynamic OSXSAVE and APIC bits; MISC_ENABLE bit 22 limit (CPU 17); a draining entry | Unit test per leaf against the CPU 16 table; `verify_cpu` and LA57 probe transcriptions | S1 |
 | MSRs, Linux-reached set | Non-safe: GS_BASE (`K kernel/head_64.S:61-69,365-368`), EFER SCE+NX (`head_64.S:378-396`), MISC_ENABLE (`verify_cpu.S:93-97`, `kernel/cpu/intel.c:233,333,463,576`), UCODE_REV 0x8B written 0, CPUID 1, read (`K include/asm/microcode.h:62-75`, `intel.c:246`; latch per CPU 17), TSC_AUX written because RDTSCP is advertised (`common.c:2213-2214`), STAR/LSTAR/SFMASK (`common.c:2121,2146,2158`), FS_BASE/KERNEL_GS_BASE (`common.c:2341-2342`), PAT (`mm/pat/memtype.c:234,257`), MTRRcap/def-type and, when MTRRdefType.E=1, the variable and fixed ranges through `mtrr_generic_set_state` (`kernel/cpu/mtrr/mtrr.c:584-600`, `kernel/cpu/cacheinfo.c:1115-1129`), TSC, APIC_BASE (`head_64.S:247`). `_safe`: SYSENTER_* (`common.c:2131-2139`), PLATFORM_INFO, MISC_FEATURES_ENABLES, TEST_CTRL (`intel.c:528-549,997`) | Whitelist = CPU 9/16/17 tables; validation before commit; canonical checks (FS/GS/KERNEL_GS/LSTAR); all else **delivered** #GP(0). Initial MTRR state (enabled or not, ranges) is a manifest field (Q3) | `system_fault_model.py` with the rederived profile; QEMU for value formats | S1 |
-| CR0: PE, MP, ET, NE, WP, AM, PG; TS/EM; CD/NW | `CR0_STATE` on every CPU (`K kernel/head_64.S:398-401`); TS/EM cleared (`K kernel/fpu/init.c:32-36`); CD set/cleared with WBINVD around MTRR programming when MTRRs are enabled (`cacheinfo.c:1052-1110`) | Accept MP/NE/AM/TS/EM/CD/NW (today only WP, H §3) with effects: TS → #NM; CD/NW no cache model; AM: #AC needs CPL3 + RFLAGS.AC, which stays a typed refusal unless built | `system_fault_model.py`; QEMU | S2a |
+| CR0: PE, MP, ET, NE, WP, AM, PG; TS/EM; CD/NW | `CR0_STATE` on every CPU (`K kernel/head_64.S:398-401`); TS/EM cleared (`K kernel/fpu/init.c:32-36`); CD set/cleared with WBINVD around MTRR programming when MTRRs are enabled (`cacheinfo.c:1052-1110`) | Accept MP/NE/AM/TS/EM/CD/NW (today only WP, H §3) with effects: TS → #NM; CD/NW no cache model; AM: #AC needs CPL3 + RFLAGS.AC, which stays a typed refusal (S2a) until X2 builds it | `system_fault_model.py`; QEMU | S2a |
 | CR4 | PSE/PGE (`head_64.S:212-223`), OSFXSR/OSXMMEXCPT (`fpu/init.c:25-30`), OSXSAVE (`kernel/fpu/xstate.c:173-195`), FSGSBASE (`common.c:2283-2292`), SMEP (`common.c:367-368`), pinning (`common.c:407,494-498`) | Valid per CPU 16: DE, TSD, PSE, PAE, PGE, PCE, OSFXSR, OSXMMEXCPT, FSGSBASE, OSXSAVE, SMEP; reserved: VME, PVI, MCE, UMIP, LA57, VMXE, SMXE, PCIDE, SMAP, PKE and the rest (H §3). The fault model's current CR4 profile (`tools/system_fault_model.py:17-18`, lists UMIP, LA57, VMXE, SMXE, PKE, MCE as valid) must be rederived from CPU 16 by an independent author | Same | S1, S2a |
 | CR2, CR8 | #PF handlers read CR2 (`K boot/compressed/ident_map_64.c:363`, `kernel/head64.c:365`); CR8 = TPR | State; CR8 ↔ LAPIC TPR | QEMU | S2a, X3 |
 | Debug registers | `initialize_debug_regs` on every CPU (`K kernel/cpu/common.c:2182-2191`) | DR0–7 as state. **TF, RF and enabled breakpoints stay a typed refusal: this amends CPU 16 ("Debug registers, TF/RF … remain required") and needs the owner (Q4)** | QEMU | S2a |
@@ -175,7 +175,7 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 | **U1** x86 privilege in shadows | E2 shadows carry no x86 U/S (the walker checks at the current CPL; CPL is fixed per run today). Before any CPL transition (X1b delivery from CPL3, S3 SYSCALL/SYSRET, IRETQ to CPL3): keep one shadow space per x86 CPL class (separate ASIDs/roots for CPL0 and CPL3) so a CPL change switches spaces instead of resetting, and a CPL0 shadow can never serve a CPL3 access | Fault matrix at both CPLs across transitions; syscall/IRET round trips that touch supervisor pages before and after | standing suite | no CPL3 access through a CPL0 shadow; no shadow flush per transition |
 | **G1** guest-state page (minimum built in I1; remainder (MXCSR, x87, AVX-high fields) with I5/I6/I8) | One EL0 page per vCPU at a fixed non-canonical address holding only FEX guest-state fields (DF, FS/GS, MXCSR, x87, AVX-high); documented deviation (a guest access to that page reaches its own state instead of #GP); the page lies outside the private window `[PRIVATE, PRIVATE+1 GiB)` or is exempted explicitly in `aborted`; invariant test | Layout test; non-#GP limited to that page | standing suite | invariant test fails on any non-guest field |
 | **K1** code cache across CR3/INVLPG | Blocks filed by guest-physical source pages; CR3/INVLPG drop only shadows; linear→physical revalidation on lookup; per-page invalidation for host/device writes | Address-space switch programs keep translations (counted); remap/rewrite always retranslated; QEMU at 1–4 vCPUs | `system`, `coherence`, `sharedpt` | no full flush on CR3 |
-| **S4** debug: TF and breakpoints | TF/RF single-step, DR0–3/DR7 execute and data breakpoints, #DB delivery, interaction with linking/dispatch (CPU 16 requires it) | QEMU programs; SDM model | standing suite | #DB exact per SDM |
+| **S4** debug: TF and breakpoints | TF/RF single-step, DR0–3/DR7 execute and data breakpoints, #DB delivery, interaction with linking/dispatch (CPU 16 requires it); once breakpoints are armed, writes to DR0–3 and DR7 must flush this vCPU's code or key it by them | QEMU programs; SDM model | standing suite | #DB exact per SDM |
 | **C0** census (after Q2) | Static census of instruction forms admission refuses, over the Debian decompressor, the decompressed vmlinux and the initramfs `/init` binaries, by H §2's static-share method with fexc's classifier | Counts per form and per binary; spot-check against `llvm-objdump` | — | every refused form is listed with its I-chunk or a proposed typed refusal |
 | **L0** host split | Host library + driver crate; generic stop-ELR hook for `forge_stop` (slice-3 phase-end deviation); manifest-taking boot entry stub | Standing suite; `contain` tampers fire | all | green; no tamper code in the library |
 | **S1** CPU profile | CPUID table and MSR whitelist keyed to the CPU 9/16/17 tables plus a grep of every non-safe `rdmsr`/`wrmsr` in the fetched sources (and C0 when available); UCODE_REV latch, TSC_AUX, MTRR state from the manifest; CPUID/RDMSR/WRMSR transactions; rederived fault-model profile (independent author) | Unit tests per leaf and per MSR against the record tables; `verify_cpu` and LA57 transcriptions; unknown MSR → #GP | `system` | every leaf of the CPU 16 table and every non-safe MSR found by the grep has a test |
@@ -186,13 +186,13 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 | **L2** ACPI tables | M24/M69 tables, no `_CST`/P_BLK | `iasl -d` clean; MADT ↔ CPUID ↔ mailbox | unit | tables cross-agree for N = 1..4 |
 | **S2a** control registers (~1 run) | CR0 bits, CR4 per profile, CR2, CR8 store, DR0–7, EFER.SCE | `system_fault_model.py` (rederived); QEMU; head sequence `head_64.S:378-405` transcribed | `system` | cited sequences match |
 | **S2b** descriptors and segments (~1 run) | LGDT/LIDT/LTR/SGDT/SIDT/STR/LLDT, MOV Sreg, MOV r←Sreg, LRETQ; descriptor fetch helper with A/busy writes | Same; decompressor and head GDT/segment sequences; read-only GDT case | `system`, `coherence` | cited sequences match; A-bit write on a read-only page faults per SDM |
-| **X1a** same-CPL delivery + IRET + delivery model | IDT walk, gates, error codes, CR2, IRETQ CPL0→CPL0, INT3/INT n/INTO/UD2; the delivery model (independent author). **Old corpora:** the driver supplies a default logging IDT whose handlers record vector, error, CR2 and frame and then `hlt`; programs with no IDT get it, and the fault runners are migrated explicitly to compare that log (references above) instead of a stop | Migrated slice-1/2 fault corpora; decompressor-style on-demand #PF program; `int3_selftest` transcription | faults, loop faults, `system`, stack audit | all migrated corpora pass; model and QEMU agree on the sample |
+| **X1a** same-CPL delivery + IRET + delivery model | IDT walk, gates, error codes, CR2, RF = 1 in the frame of a fault between iterations of a partly executed REP string (I2 note: needs the self-exit signal), IRETQ CPL0→CPL0, INT3/INT n/INTO/UD2; the delivery model (independent author). **Old corpora:** the driver supplies a default logging IDT whose handlers record vector, error, CR2 and frame and then `hlt`; programs with no IDT get it, and the fault runners are migrated explicitly to compare that log (references above) instead of a stop. A #DB fault from DR7.GD clears DR7.GD on delivery; DR6.BD is already set by S2a (a handler-side check of DR6.BD after a GD #DB comes with delivery) | Migrated slice-1/2 fault corpora; decompressor-style on-demand #PF program; `int3_selftest` transcription | faults, loop faults, `system`, stack audit | all migrated corpora pass; model and QEMU agree on the sample |
 | **S3** syscall, time, misc system | SWAPGS, SYSCALL/SYSRET, RDGSBASE/WRGSBASE, RDTSC/RDTSCP/TSC_AUX, RDRAND (if kept), **LSL**, VERW, WBINVD/INVD/CLFLUSH, CPUID/IRET draining | QEMU CPL0↔3 round trips with SWAPGS and `%gs`; LSL/VERW vs SDM model; TSC model; RDRAND per §1b | `system`, `smp` | round trips match at N = 1..4 |
 | **X1b** CPL3 stack switch + IST | TSS.RSP0, IST1–7, IRETQ to CPL3 | QEMU frames; delivery model; paranoid-entry-shaped NMI/#DF/#DB programs using `lsl` (`calling.h:401-420`) | faults, `system` | CPL3 faults and IST vectors match |
 | **X1c** #DF, nesting, refusals → exceptions | #DF classes, faults during delivery, triple fault → typed stop; refused-but-defined cases (unknown MSR, reserved bits) delivered | Delivery model only for #DF/nesting; QEMU frames otherwise | faults, `system` | model cases pass; no defined exception remains a stop |
 | **M2** memory types | PAT/PWT/PCD/MTRR in the walker | Paging cells with PAT bits (model updated, independent author); QEMU | faults, `sharedpt` | no `detail=7` halt from a valid PAT setup |
 | **M3** MMIO completion | Device ranges, site-based completion, typed stops | QEMU programs on a test device page; fault priority | faults, `contain` | 1–8-byte device accesses complete exactly once |
-| **X2** eligibility, HLT, NMI | IF, STI/MOV SS shadows, POPF, pending events, priority, HLT park/wake, NMI pending/blocking (M64). **Event source:** a driver hook posts a vector or NMI into the vCPU's real pending-event state and kicks it (instrumentation controls a real site; vm-restructure "Correctness"), so X2 does not wait for X3's ICR | Eligibility model; QEMU programs whose interrupts come from QEMU's own sources at matching points | `kicks`, `contain` progress | contract 49 has a general-path check |
+| **X2** eligibility, HLT, NMI | IF, STI/MOV SS shadows, interrupt windows between REP string iterations with RF = 1 saved (I2 note: take the window at the REP's self-exit or record that the last exit was one), POPF, pending events, priority, HLT park/wake, NMI pending/blocking (M64). **Event source:** a driver hook posts a vector or NMI into the vCPU's real pending-event state and kicks it (instrumentation controls a real site; vm-restructure "Correctness"), so X2 does not wait for X3's ICR. **#AC:** alignment checking at CPL 3 with CR0.AM and RFLAGS.AC (checks at access sites, or blocks keyed by the AC state), replacing S2a's `unsupported_mode` refusal | Eligibility model; QEMU programs whose interrupts come from QEMU's own sources at matching points | `kicks`, `contain` progress | contract 49 has a general-path check |
 | **L5** clock service | V, TSC, 24 MHz LAPIC rationals; host wake-ups; measure kick latency for timer expiry (§2 design choice) | Exact-conversion unit tests; cross-vCPU monotonicity | unit | rates and epochs exact |
 | **X3** LAPIC and IPIs | §1a LAPIC rows on M3; ICR → pending + kick; timer on L5 | QEMU APIC register programs; IPIs at 2–4 vCPUs; timer model | `smp`, `kicks` | Linux-used registers and IPIs match |
 | **X4** mailbox AP start | Resident waiting state, responder, N = 1..4 | Mailbox model; trampoline + `secondary_startup_64` prefix transcription vs QEMU | `smp` | APs reach their stacks with the lock released |
@@ -331,7 +331,8 @@ and so does every other window page (`run_slice1_faults.py` window class `guest-
 guest access inside the page reaches the vCPU's own guest state instead of #GP. What the resident trusts: it reads back
 only DF (FEX's byte at `frame::DF`, banked in `bank`); TF, IF, IOPL, NT, AC, VIF, VIP and ID bytes (RF, VM as 0) are
 rewritten from the bank at every block entry (`frame::flag_bytes`), so a guest write to them lasts at most to the next
-entry and only `pushf` sees it. Admission lets x28 load the flag bytes and store only DF. Invariants: the abi tests
+entry and only `pushf` sees it; the FS/GS bases (`frame::FS_BASE`/`GS_BASE`, I7) are likewise written from the bank at
+every `enter` and never read back. Admission lets x28 load the flag bytes and store only DF. Invariants: the abi tests
 `guest_state_page_layout` (fields inside the page, `pushf` image, DF round trip) and the per-run frame check in
 `drivers/program.rs` (`frame_intact`: any nonzero byte outside `frame::GUEST_STATE` fails the run). Open (owner): check
 which kernel paths may be handed arbitrary addresses that could land in `PRIVATE + 0x24000..0x25000` (user-supplied
@@ -359,7 +360,7 @@ by `cpu_profile.py`, MSR read-backs against QEMU, 11 new fault cases).
 *Built (I7, FS/GS overrides; fexc series15):* FS.base and GS.base are the bank's `Cpu::fs_base`/`gs_base`, the only copy
 the resident trusts; it writes them into FEX's `fs_cached`/`gs_cached` (`frame::FS_BASE` 1000, `frame::GS_BASE` 992, in
 `frame::GUEST_STATE`) at every block entry and never reads them back, so a guest store through the guest-state page
-(the documented deviation) changes at most that vCPU's own later prefixed accesses until its next resident entry, never
+(the documented deviation) changes at most that vCPU's own later prefixed accesses until the next `enter`, never
 the bank. Admission lets x28 load them, never store. Translated code cannot change them: WRFSBASE/WRGSBASE and SWAPGS
 stay system cuts (S3); WRMSR goes through the resident (S1). Until S3 the driver's `fsbase`/`gsbase` items set them.
 fexc admits an FS/GS prefix on every admitted form with an explicit memory operand: FEX folds the base into the native
@@ -369,7 +370,8 @@ swap's 16-byte test all see the x86 linear address with no runtime change. Branc
 changes where `jmp`/`call [mem]` load the target. CS/DS/ES/SS prefixes were already admitted silently (FEX's decoder
 drops them in 64-bit mode); now they are admitted only naming the operand's default segment. Refused (`unsupported_form`,
 vendors differ and the SDM gives no rule): FS/GS with a second segment prefix or with no memory operand; SS on a
-DS-default operand and CS/DS/ES on an RSP/RBP one (#SS versus #GP). Checks: `tools/reference/gen_i7.py` corpus (67
+DS-default operand and CS/DS/ES on an RSP/RBP one (#SS versus #GP: AMD APM Vol. 3 §1.2.4 makes CS/DS/ES/SS null
+prefixes in 64-bit mode, so the default segment decides, while Intel Vol. 1 §3.3.7.1 suggests #SS for an SS override). Checks: `tools/reference/gen_i7.py` corpus (67
 programs, bases near, far, negative and 0; QEMU sets them with WRFSBASE/WRGSBASE) 67/67 at CPL 3 and 0, block sizes
 default and 1; faults: 252 `segment_probes` and 979 page-mutation cases on that corpus (#PF at base + EA), all match;
 `verify_precision.py` matrix and adversarial programs with FS/GS forms clean; on the corpus it finds one defect that is
@@ -377,6 +379,86 @@ I1's, not I7's (also on series14 with the prefixes removed): after a 16-bit regi
 FEX leaves AF's x27 write out, so a fault at a later access in the block would bank a stale AF (P6, program
 `i7-random-45`). Census FS/GS class: kernel 36,958 → 0,
 initramfs 27,599 → 2. FEX ASM suite unchanged (its FS/GS tests need WRFSBASE/WRGSBASE or SSE).
+*Built (S2a, control and debug registers):* the bank (`Cpu`) gains CR2, CR8 and DR0-3/DR6/DR7 (`Cpu::dr`, reset
+`DR_RESET`: DR6 FFFF0FF0H, DR7 400H). MOV CR0 accepts every bit of the profile (PE MP EM TS ET NE WP AM NW CD PG), with
+the existing #GP rules (bits 63:32, PG without PE, NW without CD, PG or PE cleared in 64-bit mode); reserved low bits are
+ignored. MOV CR4 accepts every valid bit (`cpu_profile::CR4_VALID`; DE, PCE, OSFXSR, OSXMMEXCPT, FSGSBASE, OSXSAVE are no
+longer refused; CPUID.1:ECX.OSXSAVE follows CR4, S1). CR2 takes any value; CR8 holds the TPR class (bits 63:4 #GP; X3 makes
+it the LAPIC TPR bits 7:4, SDM Vol.3 10.8.6.1). Neither touches a translation; every CR0/CR4 change still drops the vCPU's
+code and shadows. MOV DR (host decode `0f 21`/`0f 23`): #UD for LOCK and DR8-15 (REX.R), #GP(0) at CPL > 0, #UD for
+DR4/DR5 with CR4.DE (else DR6/DR7; the SDM gives no order between the CPL #GP and this #UD: the model and the resident
+follow QEMU, from reading its code, while KVM's VMX exit path checks DE first; Linux runs with DE = 0, so the difference
+is not observable there), DR7.GD a #DB fault (vector 1) before the access with DR6.BD set in the bank (B0-B3
+kept; the SDM lets either happen), then #GP for a 1 in bits 63:32 of DR6/DR7; DR0-3 take any 64-bit value; DR6 keeps
+B0-3/BD/BS/BT, DR7 L0-G3/LE/GE/GD/R/W/LEN, the other bits read as fixed (no RTM, no bus-lock detection; `system_fault_model.dr_write` models the read-back). RDPMC (`0f 33`):
+#GP(0) at CPL > 0 without CR4.PCE, and at any CPL otherwise, since the profile has no counters (CPUID.0AH = 0: every ECX is
+invalid). Choices: **AM/AC** — alignment checking is not built; the state CR0.AM ∧ RFLAGS.AC ∧ CPL 3 is refused as a mode
+(`Cpu::control` is `None`, stop `unsupported_mode`, the record holding the new CR0/CPL and the old RIP) wherever it would
+begin: driver start, a CR0 write (`commit`'s mode check) and every CPL change (`set_cpl` makes the same check). The future
+RFLAGS writers (POPF, IRET, SYSRET) must use the same check. AM or AC alone, or both at CPL 0, run. Building #AC (alignment
+checks at CPL 3 access sites, or blocks keyed by the AC state) is X2's, the chunk that builds POPF and IRET eligibility.
+**GD** — the #DB is a guest-fault stop like every exception today; X1 delivers it as a fault (RIP at the MOV) and must
+clear DR7.GD on delivery (SDM Vol.3 17.2.4); S4 orders it with the other #DB sources. **Breakpoints** — a DR7 write
+setting any of L0-G3 stops `unsupported_system` (Q4 deferral) until S4 arms them; DR0-3 are stored only. **TS/EM/MP,
+OSFXSR/OSXMMEXCPT/OSXSAVE** — recorded; no admitted form depends on them today (no x87/MMX/SSE/XSAVE form is admitted). I5a,
+I5b and I6 must make translation honour them per the SDM tables (x87: #NM with EM or TS, WAIT/FWAIT #NM with TS and MP; MMX: #UD with EM, #NM with TS;
+SSE: #UD with EM or without OSFXSR, #NM with TS, unmasked SIMD exceptions #XM with OSXMMEXCPT else #UD; XSAVE family and
+XGETBV/XSETBV #UD without OSXSAVE, XSAVE family #NM with TS; FXSAVE/FXRSTOR #NM with TS or EM, never #UD for EM and no
+OSFXSR #UD; VEX/AVX ignore EM, #UD unless OSXSAVE and XCR0[2:1] = 11b, #NM with TS; PAUSE, PREFETCHh, SFENCE/LFENCE/MFENCE,
+MOVNTI and CLFLUSH are not gated by EM, TS or OSFXSR) and rely on the flush at each CR0/CR4 change, or add the bits to `Cpu::code_context` if
+a later chunk keeps blocks across control changes; NE = 0 (x87 errors through FERR#/IRQ 13) is I6's to refuse. **CD/NW**
+— recorded with no memory-type effect (RAM is write-back; M2 owns memory types). Not built: CLTS (`0f 06`, no use in the
+census; the host still declines its decode), LMSW/SMSW. Checks: `run_slice3_vm.py system` 0 failures, 0 GAPs: new QEMU
+programs `sys-cr0-bits`, `sys-cr4-bits`, `sys-cr2-cr8`, `sys-debug-regs` and `sys-head-cr0` (the kernel head's EFER/CR0
+set-up, `K kernel/head_64.S:375-401`; its `pushq $0; popfq` is X2's) at 1/2/4 vCPUs and block sizes default and 1; 17 new
+fault cases judged by `system_fault_model.py` (extended: CR8, DR, RDPMC; a case may declare the controls its prefix
+sets), QEMU agreeing on all but RDPMC at CPL 0 (QEMU #UD, `QEMU_DIFFERS`) and CR8 bits 63:4 (QEMU accepts); refusals
+`dr7-l0`, `dr7-g3`; `am-ac-cpl3` refused, `am-cpl3` runs; model, host decode and abi unit tests.
+*Built (I2, string instructions; fexc series16):* MOVS/STOS/LODS/SCAS/CMPS at every width, alone and with REP (all five)
+and REPE/REPNE (CMPS/SCAS), both DF directions. Choice (b) of the I2 brief: a block holds ONE element per pass and loops
+through a literal exit to the instruction's own RIP, which the resident links (a self-link when the REP starts the block)
+and the unlinking stop patches like any exit. FEX's own lowering was not usable: REP STOS/MOVS become MemSet/MemCpy ops that
+run the whole count natively (no partial progress, no site per element) and CMPS/SCAS/LODS become IR loops with a native
+backward branch, which admission refuses and the unlinking stop cannot interrupt. A resident transaction (c) would cost a
+VM-side decode and a resident entry per element (or per chunk) for `clear_page`'s `rep stosq`. Patch 0015 (`FexcStringOp`):
+`cbz x7` (RCX = 0) to the next instruction; the element's accesses as sites (MOVS reads DS:RSI then writes ES:RDI, CMPS
+reads [RDI] then [RSI], FEX's and the pinned QEMU's order; the SDM gives none), nothing written before them; RSI/RDI stepped
+by DF from the registers; RCX - 1; the exit to its own RIP, or for REPE/REPNE whose ZF ends the repetition a forward branch
+to the next instruction. So every fault, stop or interrupt window is between elements with RCX/RSI/RDI and RIP exact and the
+block has no backward branch (contract 44's register rule). **RF (for X1/X2):** the SDM saves RF = 1 in the frame of a
+fault, trap or interrupt delivered between iterations of a REP string instruction that has done some of them (Vol. 3
+"RF"; RF = 0 before the first iteration and after the last). A stop at a block entry whose block starts with the REP
+cannot tell whether elements have run, so X1/X2 need a signal: either take the interrupt window only at the REP's
+self-exit (elements have run), or record in the vCPU's state that its last exit was a REP self-exit (cleared by any other
+exit), and set RF from it on delivery. A REP string instruction ends its block
+(`FEXC_CUT_STRING`, reason `block_ending_instruction`: one self-exit, at most three link points per block). Admission
+proves the self-exit target from the guest bytes (`admission::rep_string`: the block's last instruction is a REP string).
+Refused (`unsupported_form`): 0x67 (32-bit addressing), LOCK (#UD), REP with REPNE, SS on the DS:RSI source, and by policy,
+not by an x86 rule, REPNE on MOVS/STOS/LODS (hardware repeats as with REP; the SDM calls the combination reserved) and
+FS/GS on STOS/SCAS (hardware ignores it: ES:RDI takes no override); FS/GS (alone) and CS/DS/ES are
+admitted on the source of MOVS/LODS/CMPS (FEX's non-REP LODS ignored the prefix and its MOVS stepped RSI from base + RSI;
+`FexcStringOp` does neither). A MOVS's load and store are two operands, not an RMW pair (`fexc_movs`): its load is read
+intent, so a read-only source does not fault (the fault cases found this). Part 0 (I1 carry-over): the stale-AF report
+was a missing native x27 write, not a wrong value: `cmpxchg r16, r16` (equal operands) sets AF's raw value to the pooled
+constant 0 that popcnt had already coalesced into x27, so its store became a self-move; the banked AF was right, but the
+per-instruction write that verify_precision P6 checks was absent. Patch 0014 stops the backwards RA pass from coalescing a
+value stored twice to one static register (adversarial program `pooled-af-constant-twice`; the I7 reproducer now passes).
+Objects differ from series15 in 13 of 450 programs of the old corpora (fixtures 2, seed-4242 1, I1 7, I7 3, flow 0), all
+by patch 0014 (a constant such as `xor edx, edx` stored by two instructions now goes through a temporary). Checks:
+`tools/reference/gen_i2.py` corpus (484 programs: every form × width × repeat × DF at counts 0/1/random, large counts in a
+64 KiB region, misaligned and page-crossing elements, overlapping MOVS, REPE/REPNE ended early, FS/GS sources, long strings
+crossing a page midway, random mixes with slice-1 forms) 484/484 against QEMU at block sizes default and 1; fault cases:
+its flow form under `run_slice2_faults.py` (QEMU fault mode, the context at the faulting element): 4,356 cases, 1,271
+faulting (112 midway through a REP, 51 on the second page of a straddling element), all exact at block sizes default, 1
+and 2 (the runner unrolls a fault after a string with each REP once; a fault inside one keeps QEMU's signal context);
+`run_slice3_vm.py kicks` `rep@N` (32 KiB REP STOSQ/MOVSQ up and down, REPE CMPSB, REPNE SCASB): 1,000 kicks per vCPU at
+N = 1, 2, 4, every stop at a block entry or exit (between elements), every run equal to QEMU; verify_precision clean on the
+corpus (P5 exempts exactly a REP's `cbz x7`); FEX ASM suite 376 → 443 pass, 0 fail (67 string/REP tests; left: a32 forms).
+Throughput (M4, slope of 20,000 vs 40,000 rounds): 4 KiB `rep stosq` 151 ns (native `memset` 43 ns, a native `str`
+loop 164 ns), `rep movsq` 166 ns (`memcpy` 62 ns), DF = 1 `rep stosq` 182 ns, `rep movsb` 1,049 ns. Census string class:
+kernel 5,725 → 0, initramfs 2,969 → 0 (`experiments/track03/kernel-census/README.md`). Not built: ERMS/FSRM stay
+unadvertised; an element per pass bounds `rep movsb` (Linux's uaccess copy before alternatives); chunked passes (several
+elements per pass, each with its own PC entry) are the upgrade if the census of executed strings asks for it.
 **Owner decision (October 28): MTRRs enabled by the virtual firmware, RAM write-back, device ranges uncached** (plan Q3).
 **Deferred (owner, October 28):** replacing the host's minimal JSON reader (`crates/host/src/json.rs`, used only for
 fexc's per-compile report: end reason and cut opcode) by carrying those fields in the code-object header; no registry
