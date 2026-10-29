@@ -167,8 +167,10 @@ def norm(p):
             require(mode in ('unmap', 'readonly') and page % PAGE == 0 and any(a <= page and page + PAGE <= a + len(d) for a, d in regions),
                     f'protection {mode} {page:#x}: a whole page of a memory region')
         faults = protect
+    cpu = p.get('cpu', 'qemu64')
+    require(re.fullmatch(r'qemu64(,\+[a-z0-9_]+)*', cpu) is not None, f'cpu {cpu!r}: qemu64 plus +feature flags only')
     return dict(name=p.get('name', ''), code=code, rip=rip, gpr=gpr, rflags=rflags, regions=regions, insns=p.get('insns'), prefix=prefix,
-                flow=flow, offsets=offsets, faults=faults)
+                flow=flow, offsets=offsets, faults=faults, cpu=cpu)
 
 
 def build_elf(p):
@@ -218,7 +220,7 @@ def parse_output(p, out):
     require(extra == 0 or (p['faults'] is not None and extra == FAULT_BYTES), f'QEMU output length {len(out)}, expected {144 + sum(sizes)}')
     v = struct.unpack('<18Q', out[:144]); at = 144 + extra; mem = []
     for (a, d) in p['regions']: mem.append({'addr': hx(a), 'data': out[at:at + len(d)].hex()}); at += len(d)
-    require(v[16] & ~flags.ARITH == flags.FIXED, f'RFLAGS {v[16]:#x}: unexpected non-arithmetic bits')
+    require(v[16] & ~(flags.ARITH | flags.DF) == flags.FIXED, f'RFLAGS {v[16]:#x}: unexpected non-arithmetic bits')
     final = {'gpr': [hx(x) for x in v[:16]], 'rflags': hx(v[16]), 'rip': hx(v[17]), 'memory': mem}
     if extra:      # the signal handler ran: the context at the fault
         err, trapno, cr2, si_addr = struct.unpack('<4Q', out[144:144 + FAULT_BYTES])
@@ -242,6 +244,9 @@ IMPLICIT = {'cbw': ('cbtw', 16), 'cwde': ('cwtl', 32), 'cdqe': ('cltq', 64), 'cw
 SUFFIX = {'b': 8, 'w': 16, 'l': 32, 'q': 64}
 
 BRANCH_OPS = {'jcc', 'jmp', 'call', 'ret', 'loop', 'loope', 'loopne', 'jrcxz'}      # control flow: no operand width to check
+# No explicit (or only a fixed) operand: no width to check (I1).
+NO_WIDTH_OPS = {'clc', 'stc', 'cmc', 'cld', 'std', 'lahf', 'sahf', 'pushf', 'leave', 'enter', 'prefetcht0', 'prefetcht1',
+                'prefetcht2', 'prefetchnta'}
 
 def mnemonic_ok(insn, m):
     op = insn['op']
@@ -270,7 +275,10 @@ def att_width(ann, m, ops):
     if ann['op'] in IMPLICIT: return IMPLICIT[ann['op']][1]
     if ann['op'] == 'setcc': return 8
     if ops and ops[-1].startswith('%'): return WIDTH[ops[-1][1:]]
-    return SUFFIX.get(m[-1]) if m[-1] in SUFFIX else None
+    if m[-1] in SUFFIX: return SUFFIX[m[-1]]
+    regs = [o for o in ops if o.startswith('%')]                  # memory destination: the last register operand (I1:
+    return WIDTH.get(regs[-1][1:]) if regs and ann['op'] in REG_WIDTH_OPS else None   # shld/shrd, cmpxchg, xadd, movnti)
+REG_WIDTH_OPS = {'shld', 'shrd', 'cmpxchg', 'xadd', 'movnti'}
 
 def check_one(ann, a, m, t, prev):
     """One annotation against QEMU's disassembly (`m` mnemonic, `t` text) of the instruction at `a`; `prev` is the text of the
@@ -278,7 +286,7 @@ def check_one(ann, a, m, t, prev):
     require(mnemonic_ok(ann, m), f'annotation {ann} does not match disassembly "{t}" at {a:#x}')
     ops = att_operands(t)
     w = att_width(ann, m, ops)
-    require(ann['op'] in BRANCH_OPS or w == ann.get('width', 64),
+    require(ann['op'] in BRANCH_OPS | NO_WIDTH_OPS or w == ann.get('width', 64),
             f'annotated width {ann.get("width")} but disassembly "{t}" implies {w} at {a:#x}')
     if ann['op'] in flags.SHIFTS | flags.ROTATES:
         if ops[0] == '%cl':          # count came from CL: the previous instruction must be mov $N, %cl
@@ -368,6 +376,8 @@ def run_programs(programs, workdir, qemu):
         for marker, on in (('flow', p['flow']), ('faults', p['faults'] is not None)):
             if on: (d / marker).write_text('1')
             elif (d / marker).exists(): (d / marker).unlink()
+        if p['cpu'] != 'qemu64': (d / 'cpu').write_text(p['cpu'])
+        elif (d / 'cpu').exists(): (d / 'cpu').unlink()
     token = uuid.uuid4().hex; name = 'natemu-ref-' + token; cidfile = workdir / 'container-id'
     if cidfile.exists(): cidfile.unlink()
     args = ['docker', 'create', '--name', name, '--label', 'natemu.qemu.token=' + token, '--cidfile', str(cidfile), '--network', 'none', '--read-only',
@@ -393,8 +403,9 @@ def run_programs(programs, workdir, qemu):
         else:
             text = check_annotations(p, (d / 'qemu.log').read_text())
             und = flags.analyze(p['insns'])
-        results.append({'name': p['name'], 'qemu': final, 'disasm': text, 'undefined_flags': hx(und), 'rflags_compare_mask': hx(flags.ARITH & ~und)}
+        results.append({'name': p['name'], 'qemu': final, 'disasm': text, 'undefined_flags': hx(und), 'rflags_compare_mask': hx(flags.TRACKED & ~und)}
                        | ({'prefix': p['prefix']} if p['prefix'] is not None else {})
+                       | ({'cpu': p['cpu']} if p['cpu'] != 'qemu64' else {})
                        | ({'executed_insns': len(executed)} if p['flow'] else {})
                        | ({'fault': fault, 'path_ix': path_ix} if fault else {}))
     prov = {'format': FORMAT, 'image': IMAGE, 'qemu_sha256': digest, 'qemu_package': 'qemu-user-static 1:7.2+dfsg-7+deb12u18+b3 arm64',

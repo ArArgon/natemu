@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1a check: fexc's access sites against the fixture programs and against the emitted code.
 
-usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series13 build)
+usage: check_sites.py [--known-ok] [--slice1] [FEXC_BINARY]      (default $FEXC, else the series14 build)
 
 --slice1 compiles with `--profile slice1` (S1c): hardware TSO (plain ldr/str), exits through the dispatcher gate, block
 cutting (no fixture instruction is cut since S3e admitted memory xchg, a `swap` site); the exit
@@ -44,13 +44,13 @@ def fixture_programs():
     if not path.exists():
         subprocess.run([sys.executable, '-B', str(REPO / 'tools/reference/build_slice1.py'), '--programs-only'], check=True)
     return json.loads(path.read_text())['programs']
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series13/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series14/obj/fexc')
 KNOWN_OK = False
 PROFILE = []   # extra fexc arguments for every compile: ['--profile', 'slice1'] under --slice1
 
 WIDTH = {'byte': 1, 'word': 2, 'dword': 4, 'qword': 8}
 RMW_DST = {'add', 'adc', 'sub', 'sbb', 'and', 'or', 'xor', 'inc', 'dec', 'neg', 'not', 'shl', 'shr', 'sar', 'sal', 'rol',
-           'ror', 'rcl', 'rcr', 'bts', 'btr', 'btc'}
+           'ror', 'rcl', 'rcr', 'bts', 'btr', 'btc', 'shld', 'shrd', 'cmpxchg', 'xadd'}   # I1: shld/shrd, cmpxchg/xadd without LOCK
 LOAD_DST = {'cmp', 'test', 'bt'}
 LOAD_ONLY_1OP = {'mul', 'imul', 'div', 'idiv'}
 WORD_REGS = {'ax', 'cx', 'dx', 'bx', 'sp', 'bp', 'si', 'di'} | {f'r{i}w' for i in range(8, 16)}
@@ -67,6 +67,12 @@ def expected(asm):
         if mem:
             return [('load', ptr(ops[0])), ('push', ptr(ops[0]))]
         return [('push', 2 if ops[0] in WORD_REGS else 8)]
+    if mn in ('pushfq', 'enter'):     # I1 (enter: nesting level 0, one push of RBP)
+        return [('push', 8)]
+    if mn == 'leave':                # I1: a plain load of [RBP] (slice1), then RSP and RBP
+        return [('load', 8)]
+    if mn.startswith('prefetch'):    # a hint: no access
+        return []
     if mn == 'pop':
         if mem:
             return [('pop', ptr(ops[0])), ('store', ptr(ops[0]))]
@@ -79,7 +85,7 @@ def expected(asm):
         return [('swap', w)]
     if i > 0:
         return [('load', w)]
-    if mn in ('mov', 'movabs') or mn.startswith('set'):
+    if mn in ('mov', 'movabs', 'movnti') or mn.startswith('set'):
         return [('store', w)]
     if mn in RMW_DST:
         return [('load', w), ('store', w)]
@@ -285,7 +291,8 @@ def check_program(p, tmp):
             problems.append(('ERROR', f'plain load with write intent at {s["native_offset"]}'))
         if s['kind'] in ('store', 'push', 'push_pair') and s['intent'] != 'write':
             problems.append(('ERROR', f'store without write intent at {s["native_offset"]}'))
-        ss = s['kind'] in ('push', 'pop', 'push_pair', 'pop_pair') or bool(re.search(r'\[(rsp|rbp)\b', a) and s['kind'] in ('load', 'store'))
+        ss = s['kind'] in ('push', 'pop', 'push_pair', 'pop_pair') or bool(re.search(r'\[(rsp|rbp)\b', a) and s['kind'] in ('load', 'store')) or \
+            (mn == 'leave' and s['kind'] == 'load')
         if (s['segment'] == 'ss') != ss:
             problems.append(('ERROR', f'guest +{s["guest_offset"]} "{a}": segment {s["segment"]}'))
         if not s['located']:

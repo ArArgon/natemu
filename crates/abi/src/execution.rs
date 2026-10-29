@@ -62,11 +62,18 @@ pub const PRE_NZCV_REG: u8 = 25;
 
 pub const STATE_OFFSET: usize = 0x22000;
 pub const STATE_VA: u64 = PRIVATE + STATE_OFFSET as u64;
-/// FEX `CpuStateFrame`: x28, FEX's guest-state base register, points here at every block entry. Admitted code accesses
-/// only its guest-state fields ([`frame::GUEST_STATE`]), none for the slice-1 instruction set.
+/// FEX `CpuStateFrame` (one page per vCPU, the guest-state page): the resident's EL1-only alias. Admitted code accesses
+/// only its guest-state fields ([`frame::GUEST_STATE`]), through x28 = [`FRAME_POINTER`].
 pub const FRAME_OFFSET: usize = 0x23000;
 pub const FRAME_VA: u64 = PRIVATE + FRAME_OFFSET as u64;
-pub const FRAME_POINTER: u64 = FRAME_VA;
+/// The guest-state page's EL0 read/write alias (G1 minimum, I1): x28 points here at every block entry, so generated
+/// code reaches the guest-state fields at EL0. It lies in the private window, whose other pages stay EL1-only or EL0
+/// execute-only; it is the one window page EL0 may read and write. Documented deviation: a guest access to this page
+/// (a non-canonical address, #GP on x86) reaches the vCPU's own guest state instead; the page holds nothing but guest
+/// state (the resident rewrites the flag bytes from its bank at every block entry and reads back only DF).
+pub const GUEST_STATE_OFFSET: usize = 0x24000;
+pub const GUEST_STATE_VA: u64 = PRIVATE + GUEST_STATE_OFFSET as u64;
+pub const FRAME_POINTER: u64 = GUEST_STATE_VA;
 /// Host-written admitted object (header, code, tables).
 pub const STAGING_OFFSET: usize = 0x70000;
 pub const STAGING_BYTES: usize = 0x20000;
@@ -289,11 +296,39 @@ pub const BACKING_BYTES: usize = cache::CODE_OFFSET;
 
 /// FEX `CpuStateFrame` fields admitted code may access (pinned FEX build).
 pub mod frame {
-    /// Guest-state fields `(offset, bytes)` FEX keeps in its frame that admitted code may access: none yet (the slice-1
-    /// instruction set keeps all guest state in registers; DF, FS/GS bases, MXCSR, x87 and AVX state await their
-    /// design). Every other x28 access is refused.
-    pub const GUEST_STATE: [(u32, u32); 0] = [];
+    /// FEX's RFLAGS bytes (`State.flags[]`): the flag of RFLAGS bit `b` is the byte at `FLAGS + b`. FEX keeps the
+    /// arithmetic flags in NZCV/x26/x27; the bytes of TF (8), IF (9), DF (10), IOPL (12, the two-bit value), NT (14),
+    /// RF (16), VM (17), AC (18), VIF (19), VIP (20) and ID (21) are what `pushf` reads, and DF is what `cld`/`std` write
+    /// (FEX: 1 = clear, -1 = set).
+    pub const FLAGS: u32 = 0x3f0;
+    pub const DF: u32 = FLAGS + 10;
+    /// Guest-state fields `(offset, bytes)` admitted code may read through x28: the RFLAGS bytes above. FS/GS bases,
+    /// MXCSR, x87 and AVX state await their chunks. Every other x28 access is refused.
+    pub const GUEST_STATE: [(u32, u32); 4] = [(FLAGS + 8, 3), (FLAGS + 12, 1), (FLAGS + 14, 1), (FLAGS + 16, 6)];
+    /// The fields admitted code may also write: DF only. TF, IF, IOPL, NT, AC, VIF, VIP and ID are the resident's.
+    pub const GUEST_STATE_WRITABLE: [(u32, u32); 1] = [(DF, 1)];
     pub const BYTES: usize = 4096;
+    /// RFLAGS bits held in the flag bytes.
+    const BITS: [u32; 10] = [8, 9, 10, 12, 14, 16, 17, 18, 19, 20];
+    /// The flag bytes `(offset, value)` for the bank's `rflags`, written by the resident at every block entry: each
+    /// flag's bit as 0/1 (IOPL its two-bit value; DF as FEX's 1/-1; RF and VM as 0, which `pushf` clears in its image).
+    pub fn flag_bytes(rflags: u64) -> [(u32, u8); 11] {
+        let mut out = [(0, 0); 11];
+        for (slot, &b) in out.iter_mut().zip(BITS.iter().chain(&[21])) {
+            let bit = (rflags >> b & 1) as u8;
+            *slot = (FLAGS + b, match b {
+                10 => if bit == 1 { 0xff } else { 1 },
+                12 => (rflags >> 12 & 3) as u8,
+                16 | 17 => 0,
+                _ => bit,
+            });
+        }
+        out
+    }
+    /// RFLAGS.DF from FEX's DF byte.
+    pub fn df(byte: u8) -> bool {
+        (byte as i8) < 0
+    }
 }
 /// Native offset of a FEX block's entry: after its 4-byte `JITCodeHeader`.
 pub const ENTRY_OFFSET: u32 = 4;
@@ -524,6 +559,9 @@ pub mod system {
     /// EDX:EAX := MSR ECX; MSR ECX := EDX:EAX.
     pub const RDMSR: u32 = 4;
     pub const WRMSR: u32 = 5;
+    /// Test drivers only (no x86 instruction; the host's decoder never yields it): the `length`-byte instruction at RIP
+    /// is replaced by a change of the CPL to `cr` (0 or 3) at any CPL, through the resident's general CPL change.
+    pub const SET_CPL: u32 = 6;
     /// `System::base` of a RIP-relative operand (relative to the next instruction).
     pub const RIP: u32 = 16;
     pub const NO_REG: u32 = 0xff;
@@ -543,6 +581,7 @@ pub mod system {
                         && self.scale <= 3
                         && (self.base != RIP || self.index == NO_REG),
                     RDMSR | WRMSR => true,
+                    SET_CPL => matches!(self.cr, 0 | 3),
                     _ => false,
                 }
         }
@@ -747,12 +786,37 @@ impl State {
 }
 const _: () = assert!(core::mem::size_of::<State>() <= 4096);
 const _: () = assert!(STATE_OFFSET + 4096 <= FRAME_OFFSET);
-const _: () = assert!(FRAME_OFFSET + frame::BYTES <= STAGING_OFFSET);
+const _: () = assert!(FRAME_OFFSET + frame::BYTES <= GUEST_STATE_OFFSET);
+const _: () = assert!(GUEST_STATE_OFFSET + frame::BYTES <= (crate::STACK_TOP - PRIVATE) as usize - STACK_BYTES);
 const _: () = assert!(STAGING_OFFSET + STAGING_BYTES <= crate::resident::TEXT_OFFSET);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G1 invariants: the guest-state fields lie in the page, the writable ones among them; `pushf` sees the bank's
+    /// flags exactly (FEX ORs each byte shifted by its bit; DF is the byte's sign); DF round-trips.
+    #[test]
+    fn guest_state_page_layout() {
+        let inside = |f: &[(u32, u32)], at: u32| f.iter().any(|&(o, n)| (o..o + n).contains(&at));
+        for &(o, n) in frame::GUEST_STATE.iter().chain(&frame::GUEST_STATE_WRITABLE) {
+            assert!(o as usize + n as usize <= frame::BYTES);
+        }
+        assert!(frame::GUEST_STATE_WRITABLE.iter().all(|&(o, n)| (o..o + n).all(|b| inside(&frame::GUEST_STATE, b))));
+        assert_eq!(GUEST_STATE_VA % 4096, 0);
+        assert_eq!(FRAME_POINTER, GUEST_STATE_VA);
+        for rflags in [0x2u64, 0x202, 0x3202, 0x7_7702, 0x24_7f02, 0x40d02, 0x30_0302 | 1 << 14] {
+            let mut image = 0u64;
+            for (at, v) in frame::flag_bytes(rflags) {
+                assert!(inside(&frame::GUEST_STATE, at), "{at:#x}");
+                let b = at - frame::FLAGS;
+                image |= if b == 10 { u64::from(frame::df(v)) } else { u64::from(v) } << b;
+            }
+            assert_eq!(image, rflags & 0x3f_7700 & !(3 << 16), "{rflags:#x}");
+            assert_eq!(frame::df(frame::flag_bytes(rflags)[2].1), rflags & 0x400 != 0);
+        }
+        assert!(!frame::df(0) && !frame::df(1) && frame::df(0xff));
+    }
 
     #[test]
     fn flags_round_trip_through_fex_registers() {

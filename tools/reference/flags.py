@@ -9,7 +9,8 @@ both are asserted as the fixed pattern 0x202 rather than compared.  TF, NT, RF,
 VM, AC, VIF, VIP, ID and IOPL are not representable here and never set.
 """
 CF, PF, AF, ZF, SF, DF, OF = 0x1, 0x4, 0x10, 0x40, 0x80, 0x400, 0x800
-ARITH = CF | PF | AF | ZF | SF | OF          # 0x8d5: the tracked flags
+ARITH = CF | PF | AF | ZF | SF | OF          # 0x8d5: the arithmetic flags
+TRACKED = ARITH | DF                          # compared (DF: cld/std since I1; initial DF is 0)
 FIXED = 0x202                                 # bit1 and IF, constant in Linux-user
 ALL6 = ARITH
 
@@ -29,6 +30,13 @@ MULS = {'mul', 'imul'}                                          # SF ZF AF PF un
 DIVS = {'div', 'idiv'}                                          # all six undefined
 BITTEST = {'bt', 'bts', 'btr', 'btc'}                           # CF = selected bit; OF SF AF PF undefined; ZF unaffected
 BITSCAN = {'bsf', 'bsr'}                                        # ZF = (src == 0); CF OF SF AF PF undefined
+# I1 forms (SDM Vol. 2 "Flags Affected").
+NO_FLAGS_I1 = {'cld', 'std', 'leave', 'enter', 'mulx', 'rorx', 'sarx', 'shlx', 'shrx', 'prefetcht0', 'prefetcht1', 'prefetcht2',
+               'prefetchnta', 'movnti'}                         # arithmetic flags untouched (cld/std: DF only)
+ZCNT = {'tzcnt', 'lzcnt'}                                       # CF = (src == 0), ZF = (result == 0); OF SF PF AF undefined
+BMI_LOGIC = {'andn': ZF | SF, 'bextr': ZF, 'blsi': ZF | SF, 'blsmsk': SF, 'blsr': ZF | SF, 'bzhi': ZF | SF}
+#   defined: ZF/SF as given by the result (blsmsk: ZF cleared), CF (andn, bextr: cleared; blsi: src != 0; blsmsk, blsr:
+#   src == 0; bzhi: index > size-1), OF cleared; AF and PF undefined, and SF too where not listed.
 
 
 def step(insn, undefined):
@@ -43,9 +51,26 @@ def step(insn, undefined):
     if op in ('adc', 'sbb'): reads = CF
     elif op in ('setcc', 'cmovcc', 'jcc'): reads = CC_READS[insn['cc']]
     elif op in ('loope', 'loopne'): reads = ZF
+    elif op == 'cmc': reads = CF
+    elif op == 'lahf': reads = SF | ZF | AF | PF | CF               # copied into AH
+    elif op == 'pushf': reads = ARITH                                # the pushed image holds every flag
     if reads & undefined:
         raise ValueError(f"{op} {insn.get('cc', '')} reads undefined flag(s) {reads & undefined:#x}")
-    if op in NO_FLAGS: return undefined
+    if op in NO_FLAGS | NO_FLAGS_I1 | {'lahf', 'pushf'}: return undefined
+    if op in ('clc', 'stc', 'cmc'): return undefined & ~CF
+    if op == 'sahf': return undefined & ~(SF | ZF | AF | PF | CF)    # OF unaffected
+    if op in ('cmpxchg', 'xadd', 'popcnt'): return undefined & ~ALL6   # cmp / add; popcnt: ZF by source, the rest cleared
+    if op in ZCNT: return (undefined & ~ALL6) | OF | SF | PF | AF
+    if op in BMI_LOGIC:
+        # blsi/blsmsk/blsr: CF is not compared. The pinned QEMU (7.2) leaves cc_src stale for them (BLSI src = 0 gives
+        # CF = 1; fixed upstream in 8.0, "target/i386: Fix C flag for BLSI, BLSMSK, BLSR"); FEX sets CF per the SDM.
+        stale = CF if op.startswith('bls') else 0
+        return (undefined & ~ALL6) | stale | (AF | PF | (SF & ~BMI_LOGIC[op] if op != 'blsmsk' else 0))
+    if op in ('shld', 'shrd'):
+        if width not in (32, 64): raise ValueError(f'{op}: 16-bit forms are not generated (result undefined above 16)')
+        count = insn['count'] & (0x3f if width == 64 else 0x1f)
+        if count == 0: return undefined                  # flags and destination untouched
+        return (undefined & ~ALL6) | AF | (0 if count == 1 else OF)
     if op in ADD_LIKE: return undefined & ~ALL6
     if op in ('inc', 'dec'): return undefined & ~(ALL6 & ~CF)
     if op in LOGIC: return (undefined & ~ALL6) | AF

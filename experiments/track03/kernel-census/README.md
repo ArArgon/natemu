@@ -11,6 +11,12 @@ python3 -I census.py   RAW      # objdump every executable section, classify  (p
 python3 -I report.py   RAW .    # results.md, forms-kernel.tsv, RAW/forms-initrd.tsv
 ```
 
+**I1 re-check (October 28).** `census.py` now ports the I1 allowlist (fexc series14); `results.md` and `forms-kernel.tsv`
+below stay the C0 snapshot (series13). Rerun into `natemu-raw/kernel-census-i1-20261028-01/` (`x` linked to the C0 data):
+kernel small-int 1,330 → 36 refused (cmpxchg16b 19, prefetchw 17; the 104 `cmpxchg`/`xadd` with a `%gs:` override are
+now counted as FS/GS, chunk I7), kernel BMI 1,939 → 0, `pushfq` 539 admitted (`popfq` stays system); initramfs small-int
+7,108 → 0, BMI 7,501 → 8 (`mulx` with an address-size or legacy prefix before VEX).
+
 Files here: `extract.py`, `census.py`, `report.py`, `results.md` (every table, generated), `forms-kernel.tsv` (every refused
 form of the decompressor and vmlinux, one row per mnemonic + operand shape, first-use order). The same for the
 initramfs is `RAW/forms-initrd.tsv`; `RAW/census.json` holds every row.

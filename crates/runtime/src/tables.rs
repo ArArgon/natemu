@@ -1,17 +1,23 @@
 //! This owner's native translation tables: guest shadows through
-//! `natemu_abi::shadow::Space`, with maintenance on this CPU.
+//! `natemu_abi::shadow::Space`, with maintenance on this CPU. Two shadow spaces, one per x86 privilege class
+//! (supervisor: CPL 0-2; user: CPL 3), each with its own roots and ASID; generated code always runs with the space of
+//! the vCPU's CPL loaded ([`select`]), and every removal hits both ([`unmap`], [`reset`]).
 use super::*;
-use natemu_abi::shadow::{Error, LOWER_ROOT, Maintenance, POOL_PAGES, Space};
+use natemu_abi::shadow::{Error, Maintenance, POOL_PAGES, ROOTS, Space};
 
 const OUTPUT: u64 = 0x0000_ffff_ffff_f000;
+/// The user space's ASID bit (TTBR0_EL1[48]): an owner's supervisor ASID is even (the host's, loaded at boot) and its
+/// user ASID is the next one.
+const USER_ASID: u64 = 1 << 48;
 
-/// Local (non-broadcast) maintenance of this owner's ASID: each owner's tables are
-/// walked only by its own vCPU, and its entries are not global (they carry its ASID,
-/// TTBR0_EL1[63:48]), so no other vCPU's entries are hit or invalidated. Shared tables
-/// would need the inner-shareable TLBI forms.
+/// Local (non-broadcast) maintenance of this owner's ASIDs: each owner's tables are
+/// walked only by its own vCPU, and its entries are not global (they carry the ASID of
+/// their space, TTBR0_EL1[63:48]), so no other vCPU's entries are hit or invalidated.
+/// Shared tables would need the inner-shareable TLBI forms.
 pub struct Tlb {
-    /// The ASID in TLBI operand position (bits 63:48).
+    /// The space's ASID and the owner's supervisor ASID, in TLBI operand position (bits 63:48).
     asid: u64,
+    supervisor: u64,
 }
 impl Maintenance for Tlb {
     fn publish(&mut self) {
@@ -23,22 +29,51 @@ impl Maintenance for Tlb {
         unsafe { asm!("dsb ishst", "tlbi vae1, {0}", "dsb ish", "isb", in(reg) operand) }
     }
     fn invalidate_all(&mut self) {
-        unsafe { asm!("dsb ishst", "tlbi aside1, {0}", "dsb ish", "isb", in(reg) self.asid) }
+        let (s, u) = (self.supervisor, self.supervisor | USER_ASID);
+        unsafe { asm!("dsb ishst", "tlbi aside1, {0}", "tlbi aside1, {1}", "dsb ish", "isb", in(reg) s, in(reg) u) }
     }
 }
 
-/// The owner's tables; the window's IPA and the ASID come from its TTBR0, and the
-/// upper half is in use unless TCR_EL1.EPD1 (bit 23) disables TTBR1 walks. Every owner
-/// has an ASID of its own (never 0) and tags its shadows with it.
-pub fn space() -> Space<Tlb> {
+/// The owner's `user` (CPL 3) or supervisor space; the window's IPA and the ASIDs come from its TTBR0 (whichever
+/// space it holds), and the upper half is in use unless TCR_EL1.EPD1 (bit 23) disables TTBR1 walks. Every owner has
+/// ASIDs of its own (never 0) and tags each space's shadows with that space's.
+pub fn space(user: bool) -> Space<Tlb> {
     let (root, tcr): (u64, u64);
     unsafe { asm!("mrs {0}, ttbr0_el1", "mrs {1}, tcr_el1", out(reg) root, out(reg) tcr) };
+    let asid = root & 0xffff << 48;
+    let loaded = ROOTS[(asid & USER_ASID != 0) as usize][0] as u64;
+    let supervisor = asid & !USER_ASID;
     Space {
         window: PRIVATE as *mut u8,
-        ipa: (root & OUTPUT) - LOWER_ROOT as u64,
+        ipa: (root & OUTPUT) - loaded,
         pool_pages: POOL_PAGES,
         upper: tcr & 1 << 23 == 0,
-        tlb: Tlb { asid: root & 0xffff << 48 },
+        user,
+        tlb: Tlb { asid: supervisor | if user { USER_ASID } else { 0 }, supervisor },
+    }
+}
+/// The space of an access at `cpl`: x86 grants supervisor rights at CPL 0-2, user rights at 3.
+fn user(cpl: u64) -> bool {
+    cpl == 3
+}
+
+/// Loads the shadow space of `cpl` (TTBR0 with its ASID, and TTBR1), unless it is loaded: called before every entry
+/// into generated code, so a CPL change needs no flush. Both roots map the resident's private region alike. TTBR1
+/// carries no ASID (TCR_EL1.A1 = 0: TTBR0's tags both halves), so TTBR1 walks are disabled (EPD1) while the roots
+/// change: no walk ever pairs one space's upper root with the other's ASID.
+pub fn select(cpl: u64) {
+    let root: u64;
+    unsafe { asm!("mrs {0}, ttbr0_el1", out(reg) root) };
+    if (root & USER_ASID != 0) == user(cpl) {
+        return;
+    }
+    let s = space(user(cpl));
+    let [lower, upper] = ROOTS[user(cpl) as usize];
+    let (ttbr0, ttbr1) = ((s.ipa + lower as u64) | s.tlb.asid, s.ipa + upper as u64);
+    unsafe {
+        asm!("mrs {t}, tcr_el1", "orr {d}, {t}, #0x800000", "msr tcr_el1, {d}", "isb",
+             "msr ttbr1_el1, {t1}", "msr ttbr0_el1, {t0}", "isb", "msr tcr_el1, {t}", "isb",
+             t = out(reg) _, d = out(reg) _, t0 = in(reg) ttbr0, t1 = in(reg) ttbr1);
     }
 }
 
@@ -49,17 +84,29 @@ fn native(va: u64) -> Option<u64> {
     (par & 1 == 0).then_some((par & OUTPUT) | (va & 4095))
 }
 
-/// Shadow guest linear page `va` with guest-physical page `gpa` of `ram`,
-/// read-only unless `writable` (the walk granted W and D is set).
-pub fn install(va: u64, ram: &GuestRam, gpa: u64, writable: bool) -> Result<(), Error> {
+/// Shadow guest linear page `va` with guest-physical page `gpa` of `ram` in the space of `cpl` (whose rights the walk
+/// granted), read-only unless `writable` (the walk granted W and D is set).
+pub fn install(cpl: u64, va: u64, ram: &GuestRam, gpa: u64, writable: bool) -> Result<(), Error> {
     let page = ram.range(gpa & !4095, 4096).ok_or(Error::OutsideRam)?;
     let ipa = native(page as u64).ok_or(Error::OutsideRam)?;
-    space().map(va & !4095, ipa, writable)
+    space(user(cpl)).map(va & !4095, ipa, writable)
 }
+/// Removes `va`'s shadow from both spaces. An address no space can map (the gap, or the upper half with TTBR1 walks
+/// off) has no shadow: nothing to remove.
 pub fn unmap(va: u64) -> Result<(), Error> {
-    space().unmap(va)
+    for user in [false, true] {
+        match space(user).unmap(va) {
+            Ok(()) | Err(Error::Noncanonical) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
-/// The native leaf descriptor shadowing `va` (0 when none).
-pub fn descriptor(va: u64) -> u64 {
-    space().descriptor(va)
+/// Removes every shadow of both spaces.
+pub fn reset() {
+    space(false).reset()
+}
+/// The native leaf descriptor shadowing `va` in the space of `cpl` (0 when none).
+pub fn descriptor(cpl: u64, va: u64) -> u64 {
+    space(user(cpl)).descriptor(va)
 }

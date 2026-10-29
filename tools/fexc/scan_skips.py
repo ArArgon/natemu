@@ -12,7 +12,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series13/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series14/obj/fexc')
 BR = [re.compile(r'b\.\w+\s+0x([0-9a-f]+)$'), re.compile(r'(?:cbz|cbnz)\s+\w+,\s+0x([0-9a-f]+)$'),
       re.compile(r'(?:tbz|tbnz)\s+\w+,\s+#\d+,\s+0x([0-9a-f]+)$'), re.compile(r'b\s+0x([0-9a-f]+)$')]
 
@@ -63,7 +63,25 @@ def matrix():
                                    ('255', 'c0' if b else 'c1', 'ff')):
                 for mem in (True, False):
                     out[f'{mn}{size} {"[rax]" if mem else "rcx"},{form}'] = pre[size] + op + (modrm(reg) if mem else modrm(reg, 1, 3)) + tail
-        # shld/shrd are cut; bit tests
+        # I1: shld/shrd (16-bit cut), cmpxchg/xadd without LOCK, popcnt/tzcnt/lzcnt, BMI (32/64)
+        if size in (32, 64):
+            for mn, op2 in (('shld', 'a4'), ('shrd', 'ac')):
+                for c in (0, 1, 5, 31, 32, 63, 255):
+                    out[f'{mn}{size} [rax],rcx,{c}'] = pre[size] + '0f' + op2 + modrm(1) + '%02x' % c
+                out[f'{mn}{size} [rax],rcx,cl'] = pre[size] + '0f' + '%02x' % (int(op2, 16) + 1) + modrm(1)
+            for mn, op2 in (('popcnt', 'b8'), ('tzcnt', 'bc'), ('lzcnt', 'bd')):
+                out[f'{mn}{size} rcx,[rax]'] = 'f3' + pre[size] + '0f' + op2 + modrm(1)
+            w = int(size == 64)
+            vex = lambda m, pp, op, reg=1, vvvv=2: 'c4%02x%02x%s' % (0xe0 | m, w << 7 | (~vvvv & 15) << 3 | pp, op) + modrm(reg)
+            for mn, h in (('andn', vex(2, 0, 'f2')), ('bextr', vex(2, 0, 'f7')), ('bzhi', vex(2, 0, 'f5')), ('shlx', vex(2, 1, 'f7')),
+                          ('sarx', vex(2, 2, 'f7')), ('shrx', vex(2, 3, 'f7')), ('mulx', vex(2, 3, 'f6')), ('blsr', vex(2, 0, 'f3', 1)),
+                          ('blsmsk', vex(2, 0, 'f3', 2)), ('blsi', vex(2, 0, 'f3', 3)), ('rorx', vex(3, 3, 'f0', 1, 0) + '07')):
+                out[f'{mn}{size} [rax]'] = h
+        if size == 16:
+            out['popcnt16 cx,[rax]'] = '66f30fb8' + modrm(1)
+        for mn, op2 in (('cmpxchg', 'b0' if size == 8 else 'b1'), ('xadd', 'c0' if size == 8 else 'c1')):
+            out[f'{mn}{size} [rax],rcx'] = pre[size] + '0f' + op2 + modrm(1)
+        # bit tests
         for mn, op2 in (('bt', 'a3'), ('bts', 'ab'), ('btr', 'b3'), ('btc', 'bb')):
             if size != 8:
                 out[f'{mn}{size} [rax],rcx'] = pre[size] + '0f' + op2 + modrm(1)
@@ -98,7 +116,8 @@ def matrix():
         out[f'set{cc:x} [rax]'] = '0f9%x' % cc + modrm(0)
     out.update({'push [rax]': 'ff30', 'pop [rax]': '8f00', 'call [rax]': 'ff10', 'jmp [rax]': 'ff20', 'push rax': '50', 'pop rax': '58',
                 'push r9': '4151', 'pop r9': '4159', 'push ax': '6650', 'pop ax': '6658', 'movsxd rcx,[rax]': '486308',
-                'xchg rax,rcx': '4891', 'lea': '488d0408', 'movabs al,[moffs]': 'a00102030405060708', 'movabs [moffs],rax': '48a30102030405060708'})
+                'xchg rax,rcx': '4891', 'lea': '488d0408', 'leave [rbp]': 'c9', 'enter [rsp]': 'c8100000', 'pushf [rsp]': '9c',
+                'movnti [rax],rcx': '480fc308', 'prefetcht0 [rax]': '0f1808', 'prefetchnta [rax]': '0f1800', 'movabs al,[moffs]': 'a00102030405060708', 'movabs [moffs],rax': '48a30102030405060708'})
     return out
 
 
@@ -116,7 +135,7 @@ def scan():
             s = skips(d, tmp)
             if s:
                 bad[name] = s[0]
-            elif '[' in name and 'lea' not in name and not d['sites']:
+            elif '[' in name and 'lea' not in name and not name.startswith('prefetch') and not d['sites']:   # prefetch: a hint, no access
                 bad[name] = ('no site at all', 'the memory access is not emitted')
         programs = check_sites.fixture_programs()
         fixtures = 0

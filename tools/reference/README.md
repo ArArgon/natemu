@@ -48,7 +48,7 @@ The tool checks final RIP = `rip+len(code)`, and QEMU's `-d in_asm` log must sho
 
 - Settable and meaningful under Linux-user: CF PF AF ZF SF OF (mask 0x8d5). Initial RFLAGS may set only these.
 - Fixed: bit 1 = 1 and IF = 1 (user-mode POPF cannot clear IF); asserted as `rflags & ~0x8d5 == 0x202`, not compared.
-- DF is outside the tracked set (initial DF unsupported). TF/NT/RF/VM/AC/ID/IOPL are not represented.
+- DF is compared since I1 (`flags.TRACKED`; initial DF is 0, cld/std change it). TF/NT/RF/VM/AC/ID/IOPL are not represented.
 - Undefined bits are masked by rule, never per program: each instruction annotation `{op, width, count?, cc?}`
   goes through the table in `flags.py` (Intel SDM "Flags Affected"):
   - and/or/xor/test: AF. mul/imul: SF ZF AF PF. div/idiv: all six.
@@ -61,9 +61,14 @@ The tool checks final RIP = `rip+len(code)`, and QEMU's `-d in_asm` log must sho
     into the source immediately before); without it the analysis rejects the program.
   - none: add/adc/sub/sbb/cmp/neg (all six defined), inc/dec (CF untouched), mov/movzx/movsx/lea/push/pop/not/setcc/
     cmovcc/xchg/bswap/cbw/cwde/cdqe/cwd/cdq/cqo.
+  - I1 (`gen_i1.py`): clc/stc/cmc CF; sahf SF ZF AF PF CF; lahf and cmc read flags, pushf reads all six; shld/shrd as
+    shifts (32/64 only); cmpxchg/xadd/popcnt all defined; tzcnt/lzcnt OF SF PF AF undefined; andn/bextr/bzhi/blsi/
+    blsmsk/blsr AF PF (and SF where the SDM leaves it) undefined; mulx/rorx/sarx/shlx/shrx/prefetch/movnti/enter/leave
+    none. blsi/blsmsk/blsr CF is not compared: the pinned QEMU 7.2 computes it from a stale cc_src (BLSI with a zero
+    source gives CF = 1; fixed upstream in QEMU 8.0, "target/i386: Fix C flag for BLSI, BLSMSK, BLSR").
   State is carried forward: a later instruction that writes a flag defines it again. An instruction reading an undefined
   flag (adc/sbb/setcc/cmovcc) is rejected, because the undefined value would flow into registers; the generator inserts a
-  `cmp` first. `rflags_compare_mask = 0x8d5 & ~undefined_flags`.
+  `cmp` first. `rflags_compare_mask = 0xcd5 & ~undefined_flags` (0x8d5 before I1: DF was not compared).
 - `insns` is required for every program. It is cross-checked against QEMU's own disassembly of the executed bytes:
   instruction count, mnemonic, operand width (destination register, else size suffix), immediate shift counts, and for
   CL shifts the preceding `mov $N, %cl`.
@@ -105,7 +110,8 @@ unrolled executed path instead (`gen_slice2.unrolled`).
   faults, exceptions as architectural events (a fault kills the process: nonzero exit is an error), IF/IOPL/TF changes,
   other CPUs/ordering. Use the existing independent models for those.
 - Address window for program bytes [0x10000, 0x3_0000_0000); tested to ~0x2_0000_1000; harness pages
-  0x40000..0x44000 are reserved. CPU model `-cpu qemu64` (no AVX/BMI etc.). Code bytes must not overlap memory regions
+  0x40000..0x44000 are reserved. CPU model `-cpu qemu64` (no AVX/BMI etc.), or a program's `cpu` (qemu64 plus `+feature`
+  flags, e.g. the I1 corpus's `qemu64,+bmi1,+bmi2,+abm,+popcnt`, recorded in its result). Code bytes must not overlap memory regions
   (same page is fine). Max 100 regions.
 - QEMU is a software model of x86, not hardware: behavior of undefined bits and a few corners (e.g. 8/16-bit
   shift CF beyond width) is whatever QEMU 7.2 does; those bits are masked, not trusted.

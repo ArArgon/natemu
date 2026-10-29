@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: natemu <natemu@example.invalid>
+Date: Wed, 28 Oct 2026 00:00:00 +0000
+Subject: [PATCH 13/13] FEXCore: slice1 I1 forms: VEX map, plain RMW and leave
+
+Decoder (all profiles; metadata only): a VEX-encoded instruction records
+FexcMap = FEXC_MAP_VEX with its opcode byte (FexcVexOp) and map_select, pp
+and VEX.L (FexcVex), so the slice-1 allowlist can admit exactly the BMI1/BMI2
+general-register forms. OPRaw stays the c4/c5 byte.
+
+Dispatcher, under fexc_slice1 only:
+- CMPXCHG m, r and XADD m, r without LOCK are plain read-modify-writes (the
+  SDM makes them atomic only with LOCK): a load, the compare or add, the store
+  (CMPXCHG always writes, its own value on failure), then the register (RAX on
+  failure, or the old value), so nothing is committed before the store site.
+  FEX emits CAS / atomic fetch-add for them otherwise. LOCK forms are unchanged
+  (refused by the allowlist).
+- LEAVE loads [RBP] first and then writes RSP and RBP (FEX's pop moves RBP
+  into RSP's register before the access).
+- SHLD/SHRD m by an immediate count that masks to 0 still write the memory
+  operand back (FEX stored nothing at 64 bits), so the access stays a
+  read-modify-write like a shift by a zero count.
+- The per-instruction register-cache flush (SRA-only mode) also stores DF,
+  so CLD/STD write the guest-state page in their own instruction; FEX kept
+  DF cached to the block end, merging or dropping earlier writes, so a fault
+  at a later site would have banked a stale DF.
+---
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index 184e12b..73d9157 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -813,6 +813,9 @@ Decoder::DecodedBlockStatus Decoder::NormalOpHeader(const FEXCore::X86Tables::X8
+     }
+ 
+     uint16_t VEXOp = ReadByte();
++    DecodeInst->FexcMap = FEXC_MAP_VEX; // natemu: the VEX map, pp, L and opcode byte (OPRaw stays the c4/c5 byte)
++    DecodeInst->FexcVexOp = uint8_t(VEXOp);
++    DecodeInst->FexcVex = uint8_t(map_select | pp << 2 | (options.L ? 16 : 0));
+ #define OPD(map_select, pp, opcode) (((map_select - 1) << 10) | (pp << 8) | (opcode))
+     Op = OPD(map_select, pp, VEXOp);
+ #undef OPD
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 0f88c99..01a7169 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -481,6 +481,15 @@ void OpDispatchBuilder::LEAVEOp(OpcodeArgs) {
+   const auto GPRSize = GetGPROpSize();
+   const auto OperandSize = (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_OPERAND_SIZE) ? OpSize::i16Bit : GPRSize;
+ 
++  if (fexc_slice1) {
++    // natemu: load [RBP] first, then write RSP and RBP, so nothing is committed before the access (FEX's pop would
++    // move RBP into RSP's register before it). fexc records the load as an implicit stack (SS) access.
++    auto BP = LoadGPRRegister(X86State::REG_RBP);
++    auto Value = _LoadMemGPR(OperandSize, BP, OperandSize);
++    StoreGPRRegister(X86State::REG_RSP, Add(GPRSize, BP, IR::OpSizeToSize(OperandSize)), GPRSize);
++    StoreGPRRegister(X86State::REG_RBP, Value, OperandSize);
++    return;
++  }
+   // First we move RBP in to RSP and then behave effectively like a pop
+   auto SP = _RMWHandle(LoadGPRRegister(X86State::REG_RBP));
+   auto NewGPR = Pop(OperandSize, SP);
+@@ -1539,8 +1548,9 @@ void OpDispatchBuilder::SHLDImmediateOp(OpcodeArgs) {
+     CalculateFlags_ShiftLeftImmediate(OpSizeFromSrc(Op), Res, Dest, Shift, true);
+     CalculateDeferredFlags();
+     StoreResultGPR(Op, Res);
+-  } else if (Shift == 0 && Size == 32) {
++  } else if (Shift == 0 && (Size == 32 || (fexc_slice1 && !Op->Dest.IsGPR()))) {
+     // Ensure Zext still occurs
++    // natemu: and a memory destination is still read and written back, as a shift by a count masking to 0 (x86 RMW access)
+     StoreResultGPR(Op, Dest);
+   }
+ }
+@@ -1603,8 +1613,9 @@ void OpDispatchBuilder::SHRDImmediateOp(OpcodeArgs) {
+ 
+     StoreResultGPR(Op, Res);
+     CalculateFlags_ShiftRightDoubleImmediate(OpSizeFromSrc(Op), Res, Dest, Shift);
+-  } else if (Shift == 0 && Size == 32) {
++  } else if (Shift == 0 && (Size == 32 || (fexc_slice1 && !Op->Dest.IsGPR()))) {
+     // Ensure Zext still occurs
++    // natemu: and a memory destination is still read and written back, as a shift by a count masking to 0 (x86 RMW access)
+     StoreResultGPR(Op, Dest);
+   }
+ }
+@@ -2844,6 +2855,13 @@ void OpDispatchBuilder::XADDOp(OpcodeArgs) {
+ 
+     // Calculated value gets stored in dst (order is important if dst is same as src)
+     StoreResultGPR(Op, Result);
++  } else if (fexc_slice1 && !(Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_LOCK)) {
++    // natemu: without LOCK, XADD m, r is a plain read-modify-write (SDM: atomic only with LOCK): load, add, store the
++    // sum, then the old value into the register, so nothing is committed before the store site.
++    Ref Old = LoadSourceGPR(Op, Op->Dest, Op->Flags);
++    Ref Sum = CalculateFlags_ADD(OpSizeFromSrc(Op), Old, Src);
++    StoreResultGPR(Op, Sum);
++    StoreResultGPR(Op, Op->Src[0], Old);
+   } else {
+     HandledLock = Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_LOCK;
+     Dest = AppendSegmentOffset(Dest, Op->Flags);
+@@ -3940,6 +3958,21 @@ void OpDispatchBuilder::CMPXCHGOp(OpcodeArgs) {
+     } else {
+       StoreResultGPR(Op, DestResult);
+     }
++  } else if (fexc_slice1 && !(Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_LOCK)) {
++    // natemu: without LOCK, CMPXCHG m, r is a plain read-modify-write (SDM: the destination is always written, with
++    // its own value when the comparison fails); the accumulator is written after the store, on failure only.
++    Ref Src2 = LoadSourceGPR(Op, Op->Src[0], Op->Flags);
++    Ref Src3 = LoadGPRRegister(X86State::REG_RAX);
++    Ref Src3Lower = _Bfe(OpSize::i64Bit, OpSizeAsBits(Size), 0, Src3);
++    Ref Old = LoadSourceGPR(Op, Op->Dest, Op->Flags);
++    CalculateFlags_SUB(Size, Src3Lower, Old);
++    CalculateDeferredFlags();
++    StoreResultGPR(Op, NZCVSelect(OpSize::i64Bit, CondClass::EQ, Src2, Old));
++    if (GPRSize == OpSize::i64Bit && Size == OpSize::i32Bit) {
++      StoreGPRRegister(X86State::REG_RAX, NZCVSelect(OpSize::i64Bit, CondClass::EQ, Src3, Old), OpSize::i64Bit);
++    } else {
++      StoreGPRRegister(X86State::REG_RAX, Old, Size);
++    }
+   } else {
+     Ref Src2 = LoadSourceGPR(Op, Op->Src[0], Op->Flags);
+     HandledLock = Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_LOCK;
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 8a2ea35..4b5d02b 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -2,6 +2,7 @@
+ #pragma once
+ 
+ #include "Interface/Core/Frontend.h"
++#include <fexc_hook.h>
+ #include "Interface/Core/X86Tables/X86Tables.h"
+ #include "Interface/Core/Addressing.h"
+ #include "Interface/Context/Context.h"
+@@ -1202,7 +1203,9 @@ public:
+       const uint64_t GPRMask = ((1ull << (AFIndex - GPR0Index + 1)) - 1) << GPR0Index;
+       const uint64_t FPRMask = ((1ull << (FPR15Index - FPR0Index + 1)) - 1) << FPR0Index;
+ 
+-      Mask &= (GPRMask | FPRMask);
++      // natemu (fexc_slice1): DF is guest state the resident banks at a fault (the guest-state page), so cld/std store it
++      // in their own instruction like a static register, never sunk to the block end or merged with a later write.
++      Mask &= (GPRMask | FPRMask | (fexc_slice1 ? 1ull << DFIndex : 0));
+       Bits &= Mask;
+     }
+ 
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h b/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
+index 2871fd2..7ff3d87 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
++++ b/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
+@@ -242,6 +242,8 @@ struct DecodedInst {
+   uint8_t InstSize;
+   int8_t REXIndex;
+   uint8_t FexcMap; // natemu: FexcMap (shim/fexc_hook.h) that produced this instruction
++  uint8_t FexcVexOp; // natemu: FEXC_MAP_VEX only: the opcode byte after the VEX prefix
++  uint8_t FexcVex;   // natemu: FEXC_MAP_VEX only: map_select | pp << 2 | VEX.L << 4
+ };
+ 
+ union ModRMDecoded {
+-- 
+2.39.0
+

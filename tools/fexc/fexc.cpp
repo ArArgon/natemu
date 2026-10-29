@@ -196,7 +196,8 @@ int CfInverted(uint64_t guest, uint64_t native) {
 
 // Join each site with FEX's own decode of its guest instruction: segment (stack ops and RSP/RBP-based operands use SS,
 // which decides #SS(0) vs #GP(0) for a non-canonical address) and the x86 addressing form.
-// A load of a RIP-setting instruction without an explicit memory operand is the implicit stack access of slice1's ret.
+// A load of a RIP-setting instruction without an explicit memory operand is the implicit stack access of slice1's ret;
+// leave's load of [RBP] (slice1: a plain load, then RSP and RBP) is a stack access too.
 // Guard/split stubs (slice1) take the width, intent, segment and data registers of the access they cover (their own
 // base_reg + imm is the address as it is at the stub); a branch-target guard (no access) has its target register in
 // base_reg and is DS (#GP(0)).
@@ -204,7 +205,7 @@ void JoinSites(uint64_t rip) {
   for (auto& s : Cap.sites) {
     s.segment = (s.kind == FEXC_SITE_PUSH || s.kind == FEXC_SITE_POP || s.kind == FEXC_SITE_PUSH_PAIR || s.kind == FEXC_SITE_POP_PAIR) ? 1 : 0;
     if (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP)
-      for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) { if ((!i.mem.present && i.sets_rip) || i.mem.base == 4 || i.mem.base == 5) s.segment = 1; break; }
+      for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) { if ((!i.mem.present && (i.sets_rip || i.name == "LEAVE")) || i.mem.base == 4 || i.mem.base == 5) s.segment = 1; break; }
   }
   for (auto& s : Cap.sites) {
     if ((s.kind != FEXC_SITE_GUARD && s.kind != FEXC_SITE_SPLIT) || s.access_native_offset == FEXC_NONE32) continue;

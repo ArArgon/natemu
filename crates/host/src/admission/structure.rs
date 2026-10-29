@@ -6,8 +6,9 @@
 //!
 //! **Object validation (always):** what the resident relies on to place, link, stop and recover the block.
 //! - Words: a word the decoder does not know is admitted only if it is no branch or exception-generating word and
-//!   names neither x25 nor x28 in any register field ([`screened`]); x28 (FEX's guest-state base) is never written and
-//!   addresses only FEX's guest-state fields (`frame::GUEST_STATE`, none for slice 1); x25 is written only by `mrs x25,
+//!   names neither x25 nor x28 in any register field ([`screened`]); x28 (FEX's guest-state base, the guest-state page)
+//!   is never written and addresses only FEX's guest-state fields: loads of `frame::GUEST_STATE`, stores only to
+//!   `frame::GUEST_STATE_WRITABLE` (DF); x25 is written only by `mrs x25,
 //!   nzcv` (the pre-NZCV save the resident reads at `nzcv=saved` sites); the only `svc`s are `#LINK`, `#DIV_U` and
 //!   `#DIV_S`; direct branches go forward to a word of the code region; no word falls through into a literal slot, a
 //!   check stub or past the region. So every path ends at an exit the resident knows (a link point or the dispatch
@@ -166,6 +167,14 @@ fn decode(w: u32, at: u32) -> Option<Insn> {
         _ if w & 0x5fe0_0000 == 0x1ac0_0000 && matches!(w >> 10 & 63, 2 | 3 | 8..=11) => Data(zr(rd)), // div, shifts
         _ if w & 0x5fff_0000 == 0x5ac0_0000 && w >> 10 & 63 <= 5 => Data(zr(rd)), // rbit, rev*, clz, cls
         _ if w & 0x7f00_0000 == 0x1b00_0000 && matches!(w >> 21 & 7, 0 | 1 | 2 | 5 | 6) => Data(zr(rd)), // madd..umulh
+        // POPCNT without FEAT_CSSC (I1, FEX JIT/ALUOps.cpp Popcount): `fmov d0, xN | fmov s0, wN; cnt v0.8b, v0.8b;
+        // addv b0, v0.8b | addp v0.8b, v0.8b, v0.8b; umov wD, v0.b[0]`, exactly these on v0 (FEX's VTMP1).
+        _ if w & 0xffff_fc1f == 0x9e67_0000 => Data(None),   // fmov d0, xN
+        _ if w & 0xffff_fc1f == 0x1e27_0000 => Data(None),   // fmov s0, wN (32- and 16-bit sources)
+        0x0e20_5800 | 0x0e31_b800 | 0x0e20_bc00 => Data(None), // cnt v0.8b, v0.8b; addv b0, v0.8b; addp v0.8b (16-bit)
+        _ if w & 0xffff_ffe0 == 0x0e01_3c00 => Data(zr(rd)), // umov wD, v0.b[0]
+        // Prefetch hints (I1, x86 prefetchh: never faults): `prfm <op>, [xN{, #imm}]`, no data transfer.
+        _ if w & 0xffc0_0000 == 0xf980_0000 => Data(None),
         _ => return memory(w),
     })
 }
@@ -552,12 +561,13 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    /// x28 accesses: unsigned offset inside one of FEX's guest-state fields (none for slice 1).
+    /// x28 accesses: unsigned offset inside one of FEX's guest-state fields; a store only inside a writable one (DF).
     fn frame_access(&self, m: Mem, at: u32) -> Result<(), String> {
         // i64: an unscaled access can be at a negative offset (`stur x0, [x28, #-4]`), outside every field.
         let (offset, end) = (m.addr.imm, m.addr.imm + m.size as i64);
         let inside = |&(field, len): &(u32, u32)| offset >= field as i64 && end <= (field + len) as i64;
-        if m.form == Form::Unsigned && frame::GUEST_STATE.iter().any(inside) {
+        let fields: &[(u32, u32)] = if m.load { &frame::GUEST_STATE } else { &frame::GUEST_STATE_WRITABLE };
+        if m.form == Form::Unsigned && fields.iter().any(inside) {
             Ok(())
         } else {
             Err(format!("frame access {:#010x} at {at:#x}: not a guest-state field", self.word(at)))
@@ -996,7 +1006,7 @@ mod tests {
     use super::*;
     use natemu_abi::code_object::Header;
 
-    /// Real fexc (series13, profile slice1) objects and the guest bytes they were compiled from.
+    /// Real fexc (series13, profile slice1; unchanged by series14) objects and the guest bytes they were compiled from.
     macro_rules! fixture {
         ($name:literal) => {
             (
@@ -1312,6 +1322,25 @@ mod tests {
         refused(ADDRESS, at, old, 0xf940_00c5, "unrecorded memory access"); // ldr x5, [x6]
         refused(ADDRESS, at, old, 0x17ff_ffff, "not forward"); // b .-4
         refused(ADDRESS, at, old, 0xd420_0020, "brk"); // brk #1 that is no stub
+    }
+
+    #[test]
+    fn guest_state_fields_and_i1_words() {
+        let (at, old) = MIDDLE;
+        let admitted = |new: u32| admit((&patched(ADDRESS, at, old, new), ADDRESS.1)).unwrap_or_else(|e| panic!("{new:#010x}: {e}"));
+        admitted(0x390f_eb94); // strb w20, [x28, #0x3fa]: cld/std write DF
+        admitted(0x394f_e795); // ldrb w21, [x28, #0x3f9]: pushf reads IF
+        admitted(0x398f_eb95); // ldrsb x21, [x28, #0x3fa]: pushf reads DF
+        admitted(0x3950_1795); // ldrb w21, [x28, #0x405]: pushf reads ID
+        refused(ADDRESS, at, old, 0x390f_e794, "frame access"); // strb w20, [x28, #0x3f9]: IF is the resident's
+        refused(ADDRESS, at, old, 0x390f_f394, "frame access"); // strb w20, [x28, #0x3fc]: IOPL
+        refused(ADDRESS, at, old, 0x394f_ef95, "frame access"); // ldrb w21, [x28, #0x3fb]: no field
+        refused(ADDRESS, at, old, 0x3950_1b95, "frame access"); // ldrb w21, [x28, #0x406]: past the flags
+        // POPCNT without FEAT_CSSC, and prefetch hints.
+        for word in [0x9e67_00c0, 0x1e27_00e0, 0x0e20_5800, 0x0e31_b800, 0x0e20_bc00, 0x0e01_3c04, 0xf980_00c0] {
+            admitted(word); // fmov d0, x6; fmov s0, w7; cnt v0.8b; addv b0, v0.8b; umov w4, v0.b[0]; prfm pldl1keep, [x6]
+        }
+        refused(ADDRESS, at, old, 0x0e01_3c19, "write to x25"); // umov w25, v0.b[0]
     }
 
     #[test]

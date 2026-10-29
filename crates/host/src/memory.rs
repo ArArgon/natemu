@@ -164,17 +164,20 @@ pub(crate) fn load_elf(memory: &Memory, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Protection of a private alias, none of it EL0 data: resident text is EL1 read-only and EL1-executable; generated
-/// code (the code area: blocks, the step slot, the dispatcher and L1) is EL1 read-only and EL0 execute-only, so EL1
-/// never executes it and EL0 can neither read nor write it; everything else is EL1 read/write and never executable.
+/// Protection of a private alias: resident text is EL1 read-only and EL1-executable; generated code (the code area:
+/// blocks, the step slot, the dispatcher and L1) is EL1 read-only and EL0 execute-only, so EL1 never executes it and
+/// EL0 can neither read nor write it; the guest-state page's EL0 alias (`execution::GUEST_STATE_VA`, the only EL0 data
+/// in the window) is EL0 and EL1 read/write; everything else is EL1 read/write; none of it is executable but as said.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Rights {
     Text,
     Code,
     Data,
+    Guest,
 }
-/// AP 10 (EL1 read-only, no EL0 access), PXN and UXN.
+/// AP 10 (EL1 read-only, no EL0 access), AP 01 (EL1 and EL0 read/write), PXN and UXN.
 const READ_ONLY: u64 = 1 << 7;
+const EL0_DATA: u64 = 1 << 6;
 const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
 /// `bytes` of the resident's private address space at `PRIVATE + offset`,
@@ -211,6 +214,14 @@ impl Span {
             rights: Rights::Data,
         }
     }
+    pub(crate) const fn guest(offset: usize, bytes: usize, target: usize) -> Self {
+        Self {
+            offset,
+            bytes,
+            target,
+            rights: Rights::Guest,
+        }
+    }
 }
 /// Private descriptors are not global: every owner maps the same private addresses to its own backing, so its
 /// entries carry its ASID.
@@ -225,13 +236,15 @@ const PRIVATE_L2: usize = 0x13000;
 /// TTBR0 (`shadow::LOWER_ROOT`) holds the boot identity alias, the private
 /// region `PRIVATE..PRIVATE + 2 MiB` with exactly `spans`, and the lower guest
 /// shadow window; with `upper`, TTBR1 (`shadow::UPPER_ROOT`) pre-links the
-/// upper window. The runtime's table pages, shadow state and shadow pool are
-/// always mapped.
+/// upper window. The user (CPL 3) shadow space's roots start empty but for the
+/// private region, linked as in TTBR0. The runtime's table pages, shadow state
+/// and shadow pool are always mapped.
 pub(crate) fn private_space(memory: &Memory, window: usize, spans: &[Span], upper: bool) {
     let word = |at: usize, value| memory.word(window + at, value);
     let table = |offset: usize| IPA + (window + offset) as u64 + 3;
     word(shadow::LOWER_ROOT, table(0x11000));
     word(shadow::LOWER_ROOT + 256 * 8, table(0x12000));
+    word(shadow::USER_LOWER_ROOT + 256 * 8, table(0x12000));
     // Low alias exists only for MMU enable and is removed by startup.
     word(0x11000 + 8, IPA | 1 | 1 << 10 | 1 << 11 | 3 << 8);
     word(0x11000, table(0x15000));
@@ -260,6 +273,7 @@ pub(crate) fn private_space(memory: &Memory, window: usize, spans: &[Span], uppe
         window,
         &[
             own(shadow::STATE_OFFSET, 4096),
+            own(shadow::USER_LOWER_ROOT, shadow::USER_UPPER_ROOT + 4096 - shadow::USER_LOWER_ROOT),
             own(shadow::POOL_OFFSET, shadow::POOL_PAGES * 4096),
         ],
     );
@@ -274,6 +288,7 @@ pub(crate) fn map_private(memory: &Memory, window: usize, spans: &[Span]) {
             Rights::Text => READ_ONLY | UXN,
             Rights::Code => READ_ONLY | PXN,
             Rights::Data => PXN | UXN,
+            Rights::Guest => EL0_DATA | PXN | UXN,
         };
         if span.offset >= BLOCK_BYTES {
             assert!((span.offset | span.bytes | span.target) % BLOCK_BYTES == 0 && span.offset + span.bytes <= 1 << 30);
@@ -438,17 +453,23 @@ mod tests {
             u64::from_le_bytes(memory.read::<8>(window + 0x14000 + offset / 4096 * 8))
         };
         // The runtime reaches its tables, state and pool through own-window RW aliases.
-        for offset in [shadow::LOWER_ROOT, shadow::UPPER_LEAF, shadow::STATE_OFFSET]
+        for offset in [shadow::LOWER_ROOT, shadow::UPPER_LEAF, shadow::STATE_OFFSET, shadow::USER_LOWER_ROOT, shadow::USER_UPPER_ROOT]
             .into_iter()
             .chain((0..shadow::POOL_PAGES).map(|i| shadow::POOL_OFFSET + i * 4096))
         {
             assert_eq!(leaf(offset), (IPA + (window + offset) as u64) | PAGE | PXN | UXN);
+        }
+        // Both spaces' TTBR0 roots reach the private region through the same table.
+        for root in [shadow::LOWER_ROOT, shadow::USER_LOWER_ROOT] {
+            let entry = u64::from_le_bytes(memory.read::<8>(window + root + 256 * 8));
+            assert_eq!(entry, IPA + (window + 0x12000) as u64 + 3);
         }
         let mut space = shadow::Space {
             window: unsafe { memory.0.add(window) },
             ipa: IPA + window as u64,
             pool_pages: shadow::POOL_PAGES,
             upper: true,
+            user: false,
             tlb: Quiet,
         };
         for va in [0x10_0000, shadow::HIGH_BASE + 0x10_0000] {
@@ -469,6 +490,7 @@ mod tests {
             ipa: IPA,
             pool_pages: 2,
             upper: false,
+            user: false,
             tlb: Quiet,
         };
         assert_eq!(

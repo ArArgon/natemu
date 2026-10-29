@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """S1b1 check: the slice-1 precision guarantee, verified statically on the code fexc emits (profile slice1).
 
-usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series13 build)
+usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series14 build)
 
 Corpora: fixtures/slice1/programs.json, the single-instruction matrix of scan_skips.py, the adversarial programs below
 (one per precision patch), and every CORPUS.json given (gen_slice1.py format, e.g. a fresh `--seed` corpus).
@@ -25,7 +25,8 @@ For every compile, from the disassembly, the sites, the dense PC table and the s
       write that a later site observes was eliminated (div/idiv leave all six flags undefined, so they define none; FEX
       keeps the incoming flags, which a later site may observe like any other undefined value). COARSE: any NZCV-writing instruction in that range satisfies each of
       CF, ZF, SF and OF (and any x26 / x27 writer PF / AF); it does not check that the right bit holds the right value.
-      Values are covered by the QEMU comparison (S1e), not here;
+      Values are covered by the QEMU comparison (S1e), not here. P6b (I1): every cld/std stores DF to the guest-state
+      page in its own range (df_stores);
   P7  (a) every compile: every native load/store with a base other than x28/sp is a site, every site is on such an
       instruction, and width, base, index, immediate and writeback match the instruction (check_sites.code_vs_sites);
       (b) for programs with `asm` (fixtures, generated, adversarial): check_sites' comparison of expected accesses, sites,
@@ -45,8 +46,9 @@ For every compile, from the disassembly, the sites, the dense PC table and the s
       same forms on every block it admits.
   P12 (E1, E1b, see entry_and_branches()): the entry prologue is empty: the block's first word is its first guest
       instruction (no stop check, spill or TF check; the resident stops a vCPU by unlinking the interrupted block's
-      exits). No `bl`, `blr`, `br` or `ret` in the block, no x28 frame access, no sp access and no literal load (the code
-      touches no emulator data);
+      exits). No `bl`, `blr`, `br` or `ret` in the block, no sp access and no literal load, and x28 only for a byte of
+      the guest-state page's RFLAGS fields (G1, I1: loads of TF/IF/DF/IOPL/NT/RF/VM/AC/VIF/VIP/ID by `pushf`, stores
+      only to DF by `cld`/`std`; crates/abi/src/execution.rs `frame`), so the code touches no emulator data;
   P13 (S2c0): every branch in the block goes forward to an instruction of the code region, so a block never loops
       internally: a jcc back to its own entry exits through the gate like any taken edge (no multiblock, no self-loop).
 Assumption by construction, NOT checked: every static-register write of guest instruction k-1 is emitted before the PC-table
@@ -71,7 +73,7 @@ import check_sites, scan_skips  # noqa: E402
 from check_sites import code_vs_sites  # noqa: E402
 import flags as F  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series13/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series14/obj/fexc')
 
 NZCV_WRITERS = {'adds', 'adcs', 'subs', 'sbcs', 'ands', 'bics', 'negs', 'ngcs', 'cmp', 'cmn', 'tst', 'ccmp', 'ccmn', 'fcmp',
                 'fcmpe', 'fccmp', 'fccmpe', 'setf8', 'setf16', 'rmif', 'cfinv', 'axflag', 'xaflag'}
@@ -129,9 +131,15 @@ def flag_writes(a):
     """(written, defined) arithmetic-flag masks of one annotated instruction (flags.py rules); a shift or rotate by an
     unknown count may write nothing, so it defines nothing."""
     op = a['op']
-    if op in F.NO_FLAGS:
+    if op in F.NO_FLAGS | F.NO_FLAGS_I1 | {'lahf', 'pushf'}:
         return 0, 0
-    if op in F.SHIFTS | F.ROTATES:
+    if op == 'cmc':     # FEX flips its CF-inversion state at compile time (no native word; sites record cf_inverted), so
+        return 0, 0     # the CF a later site observes is the earlier definer's, inverted: look past cmc to that write
+    if op in ('clc', 'stc'):     # I1: CF only; sahf: all but OF
+        return F.CF, F.CF
+    if op == 'sahf':
+        return F.ALL6 & ~F.OF, F.ALL6 & ~F.OF
+    if op in F.SHIFTS | F.ROTATES | {'shld', 'shrd'}:
         if a.get('count') is None:
             return F.ALL6, 0
         if not a['count'] & (0x3f if a['width'] == 64 else 0x1f):
@@ -164,6 +172,22 @@ def stale_flags(d, insns, dis, order):
             if i is not None and flag_writes(insns[i])[1] & f and not wrote[i][loc]:
                 out.append(f'guest +{gl[k]} has a site, but flag {f:#x} defined by guest +{gl[i]} ({insns[i]["op"]}) has no native '
                            f'{loc} write (eliminated)')
+    return out
+
+
+def df_stores(d, insns, dis, order):
+    """P6b (I1): every cld/std stores DF to the guest-state page (`strb wN, [x28, #0x3fa]`) in its own native range, so a
+    fault at any later site sees it there (the resident banks DF from the page)."""
+    starts = {}
+    for e in d['pc_table']['entries']:
+        starts[e['guest_offset']] = max(starts.get(e['guest_offset'], -1), e['native_offset'])
+    gl = [i['offset'] for i in d['guest']['instructions'] if i['translated']]
+    ends = [starts.get(g, None) for g in gl[1:]] + [d['code']['layout']['code_region_end']]
+    out = []
+    for k, g in enumerate(gl):
+        if k < len(insns) and insns[k]['op'] in ('cld', 'std') and not any(
+                starts[g] <= o < ends[k] and re.fullmatch(r'strb w\d+, \[x28, #0x3fa\]', dis[o]) for o in order):
+            out.append(f'guest +{g} ({insns[k]["op"]}) stores no DF in its own range')
     return out
 
 
@@ -550,6 +574,12 @@ def divides(d, dis, order, stubs, check_at):
     return out, ok
 
 
+# G1 (I1): the guest-state RFLAGS bytes at x28 + 0x3f0 + bit (crates/abi/src/execution.rs `frame`): readable TF, IF,
+# DF, IOPL, NT, RF, VM, AC, VIF, VIP, ID; writable DF only.
+GUEST_STATE_FLAGS = {0x3f0 + b for b in (8, 9, 10, 12, 14, 16, 17, 18, 19, 20, 21)}
+GUEST_STATE_DF = {0x3f0 + 10}
+
+
 def entry_and_branches(d, dis, order):
     """P12 and P13 on one compile."""
     out = []
@@ -559,7 +589,9 @@ def entry_and_branches(d, dis, order):
     for off in order:
         acc = check_sites.native_access(dis[off])
         mn = dis[off].split(' ')[0]
-        if acc and acc[2] in ('x28', 'sp'):
+        guest_state = acc and acc[2] == 'x28' and acc[1] == 1 and acc[3] is None and acc[5] == 'none' and \
+            acc[4] in (GUEST_STATE_DF if acc[0] == 'store' else GUEST_STATE_FLAGS)
+        if acc and acc[2] in ('x28', 'sp') and not guest_state:
             out.append(f'+{off} "{dis[off]}" accesses emulator data ({acc[2]})')
         if re.fullmatch(r'ldr\w* \w+, 0x[0-9a-f]+', dis[off]):
             out.append(f'+{off} "{dis[off]}" is a literal load')
@@ -644,6 +676,7 @@ def verify(d, tmp, insns=None):
     out += [f'skippable site: {s}' for s in scan_skips.skips(d, tmp)]
     if insns:
         out += stale_flags(d, insns, dis, order)
+        out += df_stores(d, insns, dis, order)
     return out, cost_
 
 

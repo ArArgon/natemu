@@ -30,7 +30,12 @@ inline Verdict Primary(uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
   case 0x8C: case 0x8E: return Sys("segment register move");
   case 0x9A: case 0xEA: case 0xCA: case 0xCB: case 0xCF: return Sys("far transfer or iret");
   case 0xCC: case 0xCD: case 0xCE: case 0xF1: return Sys("software interrupt");
-  case 0x9C: case 0x9D: case 0xFA: case 0xFB: return Sys("flag control (pushf/popf/cli/sti)");
+  case 0x9D: case 0xFA: case 0xFB: return Sys("flag control (popf/cli/sti: IF, IOPL, AC, TF are the resident's)");
+  // pushf reads TF/IF/IOPL/NT/AC/VIF/VIP/ID from the guest-state page (the resident writes them at every entry, RF/VM
+  // as 0: the image clears them); DF lives there too (cld/std write it). clc/stc/cmc, lahf/sahf: arithmetic flags only.
+  case 0x9C: case 0xFC: case 0xFD: case 0xF5: case 0xF8: case 0xF9: case 0x9E: case 0x9F: return Allow();
+  case 0xC9: return Allow();                                       // leave
+  case 0xC8: return Allow();                                       // enter (nesting level 0 only, checked below)
   case 0xF4: return Sys("hlt");
   case 0xE4: case 0xE5: case 0xE6: case 0xE7: case 0xEC: case 0xED: case 0xEE: case 0xEF:
   case 0x6C: case 0x6D: case 0x6E: case 0x6F: return Sys("port I/O");
@@ -90,6 +95,11 @@ inline Verdict Two(uint8_t op, bool plain, bool has_modrm, uint8_t mod, uint8_t 
   if (!plain) return Uns("mandatory-prefix (F3/F2/66) overlay opcode");
   switch (op) {
   case 0x1F: return Allow();                                        // multi-byte nop
+  case 0xA4: case 0xA5: case 0xAC: case 0xAD: return Allow();       // shld/shrd (16-bit refused below)
+  case 0xB0: case 0xB1: case 0xC0: case 0xC1: return Allow();       // cmpxchg/xadd (LOCK refused below: chunk I3)
+  case 0x18: return has_modrm && mod != 3 && reg <= 3 ? Allow() : Uns("0f 18 other than prefetchnta/t0/t1/t2 m8");
+  case 0xC3: return has_modrm && mod != 3 ? Allow() : Uns("movnti with a register operand");
+  case 0x0D: return Uns("prefetchw/0f 0d: PREFETCHW is not advertised (cpu_profile 0x80000001.ecx.8)");
   case 0xA3: case 0xAB: case 0xB3: case 0xBB: case 0xAF: case 0xB6: case 0xB7: case 0xBE: case 0xBF:
   case 0xBC: case 0xBD: return Allow();                             // bt/bts/btr/btc, imul, movzx/movsx, bsf/bsr
   case 0xBA: return has_modrm && reg >= 4 ? Allow() : Uns("group 8 below /4");
@@ -102,6 +112,28 @@ inline Verdict Two(uint8_t op, bool plain, bool has_modrm, uint8_t mod, uint8_t 
   return Uns("not in the slice-1 allowlist");
 }
 
+// VEX map (FEXC_MAP_VEX): only the BMI1/BMI2 general-register forms the profile advertises. `vex` = map_select | pp << 2 |
+// L << 4. VEX.L = 1 is #UD for all of them.
+inline Verdict Vex(uint8_t vex, uint8_t op, bool has_modrm, uint8_t reg) {
+  const uint8_t map = vex & 3, pp = vex >> 2 & 3;
+  if (vex & 16) return Uns("VEX.L = 1 (BMI forms #UD)");
+  if (map == 2) {
+    switch (op) {
+    case 0xF2: if (pp == 0) return Allow(); break;                                     // andn
+    case 0xF3: if (pp == 0 && has_modrm && reg >= 1 && reg <= 3) return Allow(); break; // blsr/blsmsk/blsi
+    case 0xF5:
+      if (pp == 0) return Allow();                                                     // bzhi
+      if (pp >= 2) return Uns("pdep/pext: FEX emits a native loop (backward branch)");
+      break;
+    case 0xF6: if (pp == 3) return Allow(); break;                                     // mulx
+    case 0xF7: return Allow();                                                         // bextr/shlx/sarx/shrx
+    default: break;
+    }
+  }
+  if (map == 3 && op == 0xF0 && pp == 3) return Allow();                               // rorx
+  return Uns("VEX form other than BMI1/BMI2 (AVX: chunk I8)");
+}
+
 inline Verdict Classify(const DecodedInst& d, bool decoded) {
   const bool has_modrm = d.Flags & DecodeFlags::FLAG_DECODED_MODRM;
   const uint8_t mod = d.ModRM >> 6, reg = (d.ModRM >> 3) & 7;
@@ -110,8 +142,13 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   Verdict v;
   switch (d.FexcMap) {
   case FEXC_MAP_PRIMARY: v = Primary(op, has_modrm, mod, reg); break;
-  case FEXC_MAP_TWO: case FEXC_MAP_TWO_F3: case FEXC_MAP_TWO_F2: case FEXC_MAP_TWO_66:
+  case FEXC_MAP_TWO: case FEXC_MAP_TWO_F2: case FEXC_MAP_TWO_66:
     v = Two(op, d.FexcMap == FEXC_MAP_TWO, has_modrm, mod, reg); break;
+  case FEXC_MAP_TWO_F3:
+    // popcnt, tzcnt, lzcnt: the profile advertises POPCNT, BMI1 and LZCNT, so f3 0f bc/bd are TZCNT/LZCNT (FEX
+    // decodes them so unconditionally: X86Tables/SecondaryTables.cpp RepModOps).
+    v = (op == 0xB8 || op == 0xBC || op == 0xBD) ? Allow() : Two(op, false, has_modrm, mod, reg); break;
+  case FEXC_MAP_VEX: v = Vex(d.FexcVex, d.FexcVexOp, has_modrm, reg); break;
   case FEXC_MAP_0F38:
     v = (op >= 0x80 && op <= 0x82) ? Sys("invept/invvpid/invpcid") : Uns("0f38 map"); break;
   default: v = Uns("0f3a/3dnow map"); break;
@@ -144,6 +181,14 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   if (v.branch && (f & DecodeFlags::FLAG_OPERAND_SIZE)) return Uns("operand-size prefix on a branch");
   if (d.FexcMap == FEXC_MAP_TWO && op >= 0xC8 && op <= 0xCF && (f & DecodeFlags::FLAG_OPERAND_SIZE) && !(f & DecodeFlags::FLAG_REX_WIDENING))
     return Uns("16-bit bswap (undefined result)");
+  if (d.FexcMap == FEXC_MAP_TWO && (op == 0xA4 || op == 0xA5 || op == 0xAC || op == 0xAD) && (f & DecodeFlags::FLAG_OPERAND_SIZE))
+    return Uns("16-bit shld/shrd (result undefined for counts above 16)");
+  if (primary && (op == 0x9C || op == 0xC8 || op == 0xC9) && (f & DecodeFlags::FLAG_OPERAND_SIZE))
+    return Uns("operand-size prefix on pushf/enter/leave (16-bit stack forms)");
+  if (primary && op == 0xC8 && ((d.Src[0].Literal() >> 16) & 0x1F) != 0)
+    return Uns("enter with a nesting level (several stores)");
+  if (d.FexcMap == FEXC_MAP_VEX && (f & (DecodeFlags::FLAG_OPERAND_SIZE | DecodeFlags::FLAG_REX_PREFIX)))
+    return Uns("66 or REX before VEX (#UD)");
   return v;
 }
 
@@ -171,7 +216,7 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
     if (!rel || uint64_t(int64_t(target << 16) >> 16) == target) return false;
     v = Uns("direct branch to a non-canonical target");
   }
-  fexc_cut = {v.kind == SYSTEM ? FEXC_CUT_SYSTEM : FEXC_CUT_UNSUPPORTED, rip, d.FexcMap, d.OPRaw, d.ModRM,
+  fexc_cut = {v.kind == SYSTEM ? FEXC_CUT_SYSTEM : FEXC_CUT_UNSUPPORTED, rip, d.FexcMap, d.FexcMap == FEXC_MAP_VEX ? d.FexcVexOp : d.OPRaw, d.ModRM,
               bool(d.Flags & DecodeFlags::FLAG_DECODED_MODRM), d.TableInfo && d.TableInfo->Name ? d.TableInfo->Name : "?", v.why};
   return true;
 }

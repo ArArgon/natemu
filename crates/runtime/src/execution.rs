@@ -223,7 +223,8 @@ unsafe fn request(s: &mut State, kind: u64) -> Reply {
     (s.fetch, s.fetch_fault) = ([u64::MAX; 2], [fetch::NONE; 3]);
     // The host stops the run at its stop RIP: nothing there is fetched.
     if s.cpu.rip != s.stop_at {
-        fetch_page(s, page, 0, block);
+        // Walked at RIP itself: a fault's CR2 is the fetched address, not its page.
+        fetch_page(s, s.cpu.rip, 0, block);
     }
     loop {
         unsafe {
@@ -298,7 +299,7 @@ fn link_point(h: &Header, p: &LinkPoint) -> bool {
     }
     matches!(move_value(&words[..n], 0), Some((k, value)) if k <= 4 && k < n && words[k] == svc_link && value == p.target)
 }
-/// Walks the fetch of page `va` for a request into `s.fetch[i]` (or its failure into `s.fetch_fault`); for a block,
+/// Walks the fetch of `va` (its page) for a request into `s.fetch[i]` (or its failure into `s.fetch_fault`); for a block,
 /// marks it ([`mark`]).
 fn fetch_page(s: &mut State, va: u64, i: usize, block: bool) {
     match fetch_walk(s, va) {
@@ -401,16 +402,21 @@ fn flush(s: &mut State) {
     s.generation += 1;
     s.shadow_generation += 1;
 }
-/// Removes every shadow of this vCPU and its writable bits, and counts the reset.
+/// Removes every shadow of this vCPU (both spaces) and its writable bits, and counts the reset.
 fn reset_shadows(s: &mut State) {
-    tables::space().reset();
+    tables::reset();
     cache::shadows_reset();
     s.shadow_generation += 1;
 }
 
-/// Enters `block` from the bank: GPRs and PF/AF in their static registers, NZCV with C = !CF, the frame in x28.
+/// Enters `block` from the bank: GPRs and PF/AF in their static registers, NZCV with C = !CF, the guest-state page in
+/// x28 with its flag bytes (TF, IF, DF, IOPL, NT, AC, VIF, VIP, ID; RF and VM as 0) written from the bank.
 unsafe fn enter(mut s: State, block: &Block) -> ! {
     served(&mut s);
+    for (at, value) in frame::flag_bytes(s.cpu.rflags) {
+        // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA; `at` lies inside it.
+        unsafe { (FRAME_VA as *mut u8).add(at as usize).write_volatile(value) };
+    }
     let mut f = NativeFrame::ZERO;
     for (&reg, &value) in SRA.iter().zip(&s.cpu.gpr) {
         f.x[reg as usize] = value;
@@ -425,6 +431,7 @@ unsafe fn enter(mut s: State, block: &Block) -> ! {
         write_record(record(), s);
         let entry = &raw mut (*shared()).initial;
         write_record(entry, f);
+        tables::select(s.cpu.cpl);
         enter_allocated(entry, block.entry(), BLOCK_SPSR | nzcv)
     }
 }
@@ -512,6 +519,7 @@ unsafe fn resume(s: &State, frame: *const NativeFrame, pc: u64, spsr: u64) -> ! 
         }
         cache::control().rearms += 1;
     }
+    tables::select(s.cpu.cpl);
     unsafe { resume_exception(frame, pc, spsr) }
 }
 /// A wanted stop is served by a resident entry at a block boundary (the resident drained or will drain before the
@@ -595,6 +603,7 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
     if !cache::arm(b) {
         bad(s)
     }
+    tables::select(s.cpu.cpl);
     unsafe {
         write_record(record(), s);
         resume_exception(&raw const (*shared()).captured, elr, spsr)
@@ -648,13 +657,18 @@ const GP: [u64; 2] = [13, 0];
 /// Executes the system instruction at `s.cpu.rip` (`i`, the host's decode, checked by [`request`]) as a transaction
 /// with x86 semantics in 64-bit mode: its checks raise their exception (#UD, then #GP) with the state unchanged;
 /// otherwise its effect commits, RIP moves past it and RFLAGS stay. Every control change (and every CR3 load) drops
-/// this vCPU's cached code and shadows: they are its instruction and data TLBs, which may always lose entries, and are
-/// keyed by values a change makes stale (a block's context, a shadow's rights). INVLPG drops the shadows and blocks of
-/// the 2 MiB-aligned range holding the address (a superset of its page in either page size). Only this vCPU's
-/// state, cache and shadows change. Forms and operand values the resident does not implement stop it
-/// (`unsupported_system`) before any effect.
+/// this vCPU's cached code and shadows (both privilege spaces): they are its instruction and data TLBs, which may always
+/// lose entries, and are keyed by values a change makes stale (a block's context, a shadow's rights). INVLPG drops the
+/// shadows (both spaces) and blocks of the 2 MiB-aligned range holding the address (a superset of its page in either
+/// page size). Only this vCPU's state, cache and shadows change. Forms and operand values the resident does not
+/// implement stop it (`unsupported_system`) before any effect. A test driver's [`system::SET_CPL`] changes the CPL
+/// ([`set_cpl`]) at any CPL.
 fn system(s: &mut State, i: System) {
     s.systems += 1;
+    if i.kind == system::SET_CPL {
+        set_cpl(s, u64::from(i.cr));
+        return commit(s, i, false);
+    }
     let c = s.cpu;
     let fault = |s: &mut State, [vector, error]: [u64; 2]| -> ! {
         s.fault = [vector, 0, error, s.cpu.rip];
@@ -729,7 +743,7 @@ fn system(s: &mut State, i: System) {
             if paging::canonical(address) {
                 let start = address & !(LARGE_PAGE - 1);
                 for page in (0..LARGE_PAGE / 4096).map(|k| start + k * 4096) {
-                    if tables::descriptor(page) & 1 != 0 && tables::unmap(page).is_err() {
+                    if tables::unmap(page).is_err() {
                         halt(*s, stop::SHADOW)
                     }
                 }
@@ -773,15 +787,32 @@ fn commit(s: &mut State, i: System, flush_all: bool) {
 }
 const LARGE_PAGE: u64 = 0x20_0000;
 
+/// Changes the vCPU's CPL (0..=3), at a block boundary with the state banked: the one place a CPL changes (exception
+/// delivery, SYSCALL/SYSRET and IRET call it; today only the test drivers' [`system::SET_CPL`]). Nothing is flushed
+/// or reset: blocks are keyed by CPL ([`Cpu::code_context`]: a fetch's U/S and SMEP checks were made at the CPL it was
+/// translated at), and shadows live in one space per privilege class, the CPL's loaded at every entry into generated
+/// code ([`tables::select`]), so a supervisor shadow never serves a CPL3 access. Implicit supervisor accesses
+/// (descriptor tables, the delivery frame) are the resident's, through the walker, never shadows.
+pub fn set_cpl(s: &mut State, cpl: u64) {
+    if cpl > 3 {
+        halt(*s, stop::UNSUPPORTED_MODE)
+    }
+    s.cpu.cpl = cpl;
+}
+
 /// Guest GPRs and arithmetic flags from the native state: the static-register map,
 /// PF/AF registers and `nzcv` (PSTATE layout) with the given CF inversion.
+/// DF from the guest-state page (`cld`/`std` write it; the other flag bytes are the bank's own, never written by code).
 fn bank(cpu: &mut Cpu, f: &NativeFrame, nzcv: u64, cf_inverted: bool) {
     let reg = |i: usize| f.x[SRA[i] as usize];
     for (i, value) in cpu.gpr.iter_mut().enumerate() {
         *value = reg(i);
     }
-    cpu.rflags = guest_flags(cpu.rflags, nzcv, reg(16), reg(17), cf_inverted);
+    // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA.
+    let df = frame::df(unsafe { (FRAME_VA as *const u8).add(frame::DF as usize).read_volatile() });
+    cpu.rflags = guest_flags(cpu.rflags, nzcv, reg(16), reg(17), cf_inverted) & !RFLAGS_DF | if df { RFLAGS_DF } else { 0 };
 }
+const RFLAGS_DF: u64 = 1 << 10;
 
 /// Stops with an x86 exception due at `site`'s guest instruction in `b` (`vector`,
 /// CR2, error code): the bank holds the exact state at that instruction's
@@ -907,7 +938,7 @@ fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, ac
                     code_written(s, f, b, site, t.gpa);
                 }
             }
-            let old = tables::descriptor(va);
+            let old = tables::descriptor(s.cpu.cpl, va);
             if writable && old & 1 != 0 && old & READ_ONLY != 0 {
                 s.upgrades += 1;
             }
@@ -1018,7 +1049,7 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
     };
     // A repeat of the last retry with its shadow untouched, and no shadow reset or flush since, would loop.
     // (Native PCs repeat legitimately: cached blocks run again.)
-    if s.last_retry == [elr, far, tables::descriptor(far), s.shadow_generation] {
+    if s.last_retry == [elr, far, tables::descriptor(s.cpu.cpl, far), s.shadow_generation] {
         halt(s, stop::NO_PROGRESS)
     }
     let access = if write { Access::Write } else { Access::Read };
@@ -1032,7 +1063,7 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
             }
         }
     }
-    s.last_retry = [elr, far, tables::descriptor(far), s.shadow_generation];
+    s.last_retry = [elr, far, tables::descriptor(s.cpu.cpl, far), s.shadow_generation];
     s.retries += 1;
     unsafe {
         write_record(record(), s);
@@ -1109,7 +1140,7 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
 /// set again and the marks read again, and a page marked meanwhile is shadowed read-only (the access faults again and
 /// takes the code-write path).
 fn install(s: &mut State, va: u64, gpa: u64, writable: bool) {
-    match tables::install(va, &RAM, gpa, writable) {
+    match tables::install(s.cpu.cpl, va, &RAM, gpa, writable) {
         Ok(()) => {}
         Err(shadow::Error::Capacity) => {
             reset_shadows(s);
@@ -1118,7 +1149,7 @@ fn install(s: &mut State, va: u64, gpa: u64, writable: bool) {
                 !cache::translated(gpa)
             };
             s.evictions += 1;
-            if tables::install(va, &RAM, gpa, writable).is_err() {
+            if tables::install(s.cpu.cpl, va, &RAM, gpa, writable).is_err() {
                 halt(*s, stop::SHADOW)
             }
         }

@@ -15,6 +15,7 @@
         [--parallel P]
     tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR sharedpt [--programs SUBSTR,...] [--reps R]
         [--cpus 2 4] [--parallel P]
+    tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR privilege
     tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR contain [--cpus-contain 1 2 3 4] [--watchdog-ms MS] [--compile-deadline-ms MS]
         [--spin-iterations I] [--no-progress] [--reps R] [--kill-reps R]
 
@@ -116,6 +117,8 @@ stop, and reaches its end under the default budget: the watchdog bounds every sp
 budget and location (guest code or resident) are what separate the two, not the stop kind. Progress: the coherence
 programs with sustained cross-vCPU code writes (`mutual`, `data`, `rewrite`, `stale`) and CPUs ending while a peer
 translates their page (`finish`, `finish-late`), as `coherence` (QEMU reference, block sizes default and 1).
+
+`privilege` (U1, x86 privilege in shadows: one shadow space per CPL class): see cmd_privilege.
 
 Writes DIR/<mode>.json; exit status 1 on any failure."""
 import argparse, collections, concurrent.futures as cf, json, os, pathlib, random, re, subprocess, sys
@@ -818,6 +821,202 @@ def cmd_sharedpt(a, host, runtime):
     return len(failures)
 
 
+# ---- privilege (U1): one shadow space per x86 privilege class --------------------------------------------------------
+# CPU i: code at PRIV_CODE(i), two pages (the first supervisor, the second user), its own tables A/B (programs.sys_tables,
+# identity, loaded by the program's first instruction at CPL0) and data pages at programs.SYS_D(i). The CPL changes only at
+# the driver's `switch` items (no x86 instruction changes it yet): the first at the supervisor page's last byte, so the
+# CPL3 part runs from the user page.
+PRIV_CODE = lambda i: 0x110000 + 0x2000 * i
+PRIV_PAGES = {'S': (0x0000, False, True), 'SR': (0x1000, False, False), 'UW': (0x2000, True, True), 'UR': (0x3000, True, False)}
+PRIV_V, PRIV_F1, PRIV_F2 = 0x4000, 0x5000, 0x6000
+PTE_FLAGS = 0x61                                       # P | A | D; | RW (2) | US (4) per page
+
+
+def priv_word(i, page, k):
+    """The initial qword k of CPU i's data page at offset `page`."""
+    return 0x1111_0000_0000 * (page // 0x1000 + 1) + 0x100 * i + k
+
+
+def priv_cpu(i, n, text, wp=1):
+    """CPU i's code (`text`: labels sw3/sw0... are switch points, `swN_<cpl>` naming the CPL) and memory."""
+    d, user = programs.SYS_D(i), programs.LEAF
+    over = {}
+    for j in range(n):
+        over[PRIV_CODE(j)] = PRIV_CODE(j) | PTE_FLAGS | 2           # supervisor code page
+        over[PRIV_CODE(j) + 0x1000] = PRIV_CODE(j) + 0x1000 | user  # user code page
+    for name, (o, u, w) in PRIV_PAGES.items():
+        over[d + o] = d + o | PTE_FLAGS | 2 * w | 4 * u
+    over_b = dict(over)
+    over[d + PRIV_V], over_b[d + PRIV_V] = d + PRIV_F1 | user, d + PRIV_F2 | user
+    tables = programs.sys_tables(i, 0, n, over) + programs.sys_tables(i, 1, n, over_b)
+    memory = [(smp.num(t['addr']), bytes.fromhex(t['data'])) for t in tables]
+    memory += [(d + o, b''.join(priv_word(i, o, k).to_bytes(8, 'little') for k in range(4)))
+               for o in [o for o, _, _ in PRIV_PAGES.values()] + [PRIV_F1, PRIV_F2]]
+    fields = {f'{k}': d + o for k, (o, _, _) in PRIV_PAGES.items()} | dict(V=d + PRIV_V, ta=programs.SYS_T(i, 0), tb=programs.SYS_T(i, 1),
+                                                                         la=programs.sys_leaf(i, 0, d + PRIV_V), F2=d + PRIV_F2)
+    code, labels = ref.assemble(text.format(**fields), labels=True)
+    switches = [(PRIV_CODE(i) + off, int(name.rsplit('_', 1)[1])) for name, off in labels.items() if name.startswith('sw')]
+    # Control writes (MOV to CR): each resets the shadows once.
+    controls = len(re.findall(r'\bmov cr\d', text))
+    return {'addr': PRIV_CODE(i), 'code': code, 'controls': controls, 'labels': {k: PRIV_CODE(i) + v for k, v in labels.items()},
+            'memory': memory, 'switches': switches, 'wp': wp, 'fields': fields}
+
+
+def priv_description(cpus):
+    lines = ['identity'] + [f"body {c['addr']:#x} {c['code'].hex()}" for c in cpus]
+    lines += [f'memory {a:#x} {b.hex()}' for c in cpus for a, b in c['memory']]
+    for c in cpus:
+        lines += ['cpu', f"rip {c['addr']:#x}", 'cpl 0', f"wp {c['wp']}"] + [f'switch {r:#x} {p}' for r, p in c['switches']]
+    return '\n'.join(lines) + '\n'
+
+
+PRIV_HEAD = 'mov rax, {ta}\nmov cr3, rax\n'
+PRIV_TO_USER = 'jmp sw_3\n.org 0xfff, 0xcc\nsw_3: nop\n'   # the switch is the supervisor page's last byte
+
+
+def priv_access(reg, page, write, offset):
+    return f'mov qword ptr [{{{page}}}+{offset}], 0x5a' if write else f'mov {reg}, qword ptr [{{{page}}}+{offset}]'
+
+
+def priv_pf(cpl, user, rw, write, wp):
+    """#PF error code of a data access to a present page (SDM vol. 3 §4.6: U/S, R/W, CR0.WP; SMAP is not advertised),
+    or None: CPL3 needs U/S = 1 and, to write, R/W = 1; CPL0 writes need R/W = 1 only with WP = 1."""
+    if cpl == 3 and (not user or (write and not rw)): return 1 | 2 * write | 4
+    if cpl == 0 and write and not rw and wp: return 1 | 2
+    return None
+
+
+def priv_matrix():
+    """(name, case) for each prime/probe pair: the page is accessed at one CPL (allowed there, so shadowed in that CPL's
+    space), the CPL changes, and the same page is accessed at the other CPL; the probe's outcome must be a fresh check at
+    the new CPL (never the shadow's)."""
+    cases = []
+    for page, (_, user, rw) in PRIV_PAGES.items():
+        for p in (0, 3):
+            for a in (0, 1):
+                for b in (0, 1):
+                    for wp in (0, 1):
+                        if priv_pf(p, user, rw, a, wp) is not None: continue
+                        prime, probe = priv_access('rbx', page, a, 8), 'probe: ' + priv_access('r8', page, b, 16 if b else 24)
+                        text = PRIV_HEAD + (prime + '\n' + PRIV_TO_USER + probe if p == 0 else
+                                            PRIV_TO_USER + prime + '\nsw_0: nop\n' + probe) + '\nmov r9, 1\n'
+                        cases.append((f"{page}-{'rw'[a]}{p}-{'rw'[b]}{3 - p}-wp{wp}",
+                                      dict(text=text, wp=wp, error=priv_pf(3 - p, user, rw, b, wp), page=page, prime=a, probe=b)))
+    return cases
+
+
+def priv_expect(c, case):
+    """Expected (fault or None, {register: value}) of a matrix case on CPU c."""
+    o = PRIV_PAGES[case['page']][0]
+    if case['error'] is not None:
+        return (14, case['error'], c['labels']['probe'], c['fields'][case['page']] + 16 if case['probe'] else c['fields'][case['page']] + 24), {}
+    regs = {9: 1}
+    if not case['prime']: regs[3] = priv_word(c['i'], o, 1)
+    if not case['probe']: regs[8] = priv_word(c['i'], o, 3)
+    return None, regs
+
+
+def priv_programs(i):
+    """Named programs beyond the matrix: {name: (text, wp, expect(c) -> (fault, regs))}."""
+    f1, f2 = (lambda c: priv_word(c['i'], PRIV_F1, 0)), (lambda c: priv_word(c['i'], PRIV_F2, 0))
+    remap = lambda change: (PRIV_HEAD + 'mov rbx, qword ptr [{V}]\n' + PRIV_TO_USER + 'mov r8, qword ptr [{V}]\nsw1_0: nop\n'
+                            + change + 'mov r9, qword ptr [{V}]\nsw2_3: nop\nmov r10, qword ptr [{V}]\n')
+    both = lambda c: (None, {3: f1(c), 8: f1(c), 9: f2(c), 10: f2(c)})
+    smep = (PRIV_HEAD + 'mov rax, cr4\nbts rax, 20\nmov cr4, rax\nmov rbx, qword ptr [{UW}]\n' + PRIV_TO_USER
+            + 'mov r8, qword ptr [{UW}]\nsw_0: nop\nafter: mov r9, 1\n')
+    return {
+        # INVLPG at CPL0 drops V's shadow from both spaces: each CPL reads the new frame.
+        'invlpg': (remap('mov qword ptr [{la}], {F2}+0x67\nmov rax, {V}\ninvlpg [rax]\n'), 1, both),
+        # A CR3 load (table B maps V to F2) drops both spaces.
+        'cr3': (remap('mov rax, {tb}\nmov cr3, rax\n'), 1, both),
+        # SMEP: a CPL0 read of a user page is allowed; back at CPL0 on the user code page, the fetch faults (#PF 0x11).
+        'smep': (smep, 1, lambda c: ((14, 0x11, c['labels']['after'], c['labels']['after']), {3: priv_word(c['i'], 0x2000, 0)})),
+    }
+
+
+def priv_loop(iterations):
+    """Accesses at CPL0 (supervisor page, user page) and CPL3 (user pages) in a loop of 2 switches per round."""
+    text = (PRIV_HEAD + f'mov rcx, {iterations}\nxor r12, r12\nxor r13, r13\nloop0:\nmov rax, qword ptr [{{S}}]\nadd r12, rax\n'
+            'mov qword ptr [{S}+8], rcx\nmov rax, qword ptr [{UW}]\nadd r12, rax\n' + PRIV_TO_USER
+            + 'mov rax, qword ptr [{UW}]\nadd r13, rax\nmov qword ptr [{UW}+8], rcx\nmov rax, qword ptr [{UR}]\nadd r13, rax\n'
+            'sw_0: nop\ndec rcx\njnz loop0\n')
+    def expect(c):
+        w = lambda o: priv_word(c['i'], o, 0)
+        m = (1 << 64) - 1
+        return None, {1: 0, 12: iterations * (w(0) + w(0x2000)) & m, 13: iterations * (w(0x2000) + w(0x3000)) & m}
+    return text, expect
+
+
+def cmd_privilege(a, host, runtime):
+    """U1: x86 privilege in the shadows. (1) The fault matrix: every page kind (supervisor/user, writable/read-only) accessed
+    at one CPL and then the other (WP 0 and 1), each case alone (1 vCPU) and four at once (4 vCPUs, one case each); the
+    probe's #PF or success is the SDM rule at the new CPL (`priv_pf`), never the first access's shadow. (2) INVLPG and a CR3
+    load drop both spaces (each CPL reads the new frame); SMEP still faults a CPL0 fetch from the user page after a CPL3
+    phase. (3) A loop of 2 CPL changes per round: the same shadow resets (the CR3 load and the final halt) and retries at
+    10 and 1,000 rounds: no flush per change. Block sizes default and 1; every run also passes the per-vCPU checks."""
+    failures, report = [], []
+    named = priv_programs(0)
+    loops = {f'loop{n}': (*priv_loop(n), n) for n in (10, 1000)}
+
+    def run(label, cpus, expects, limit, extra_checks=None):
+        rc, out, err = driver(host, runtime, a.fexc, priv_description(cpus), a.out / 'work' / f"{label}{'-1' if limit else ''}", limit)
+        diffs = [] if rc == 0 else [f'driver exit {rc}: {err.strip()[-300:]}']
+        for v, (c, (fault, regs)) in enumerate(zip(cpus, expects)):
+            if rc: break
+            cpu = out['cpus'][v] if 'cpus' in out else out
+            got = vm_fault(cpu)
+            if fault is not None and got != fault: diffs.append(f'cpu{v} fault {got} != {fault} ({cpu["stop"]} {cpu["reason"]})')
+            if fault is None and (cpu['stop'] != 'reached' or smp.num(cpu['rip']) != c['addr'] + len(c['code'])):
+                diffs.append(f"cpu{v} stopped {cpu['stop']} {cpu['reason']} at {cpu['rip']}")
+            for r, want in regs.items():
+                if smp.num(cpu['gpr'][r]) != want: diffs.append(f"cpu{v} gpr{r} {cpu['gpr'][r]} != {want:#x}")
+            # Every switch reached is one system transaction; resets: the controls written (CR3, CR4) and the final halt.
+            controls = c['controls']
+            if cpu['stats']['shadow_resets'] != controls + 1:
+                diffs.append(f"cpu{v} shadow resets {cpu['stats']['shadow_resets']} != {controls + 1}")
+            diffs += [f'cpu{v} ' + d for d in per_vcpu_checks(cpu)]
+            if extra_checks: diffs += extra_checks(v, cpu)
+        stats = out and [{k: (c['stats'] if 'cpus' in out else out['stats'])[k] for k in ('systems', 'retries', 'shadow_resets', 'flushes')}
+                         for c in (out['cpus'] if 'cpus' in out else [out])]
+        report.append({'name': label, 'max_block': limit[0] if limit else None, 'diffs': diffs, 'stats': stats})
+        failures.extend(f"{label}{' (max-block 1)' if limit else ''}: {d}" for d in diffs)
+        return out
+    matrix = priv_matrix()
+    for limit in ([], [1]):
+        bad = len(failures)
+        for name, case in matrix:
+            c = dict(priv_cpu(0, 1, case['text'], case['wp']), i=0)
+            run(f'matrix-{name}', [c], [priv_expect(c, case)], limit)
+        for g in range(0, len(matrix), 4):
+            group = matrix[g:g + 4]
+            cpus = [dict(priv_cpu(i, len(group), case['text'], case['wp']), i=i) for i, (_, case) in enumerate(group)]
+            run(f'matrix4-{g // 4}', cpus, [priv_expect(c, case) for c, (_, case) in zip(cpus, group)], limit)
+        print(f"matrix ({len(matrix)} cases, 1 and 4 vCPUs){' max-block 1' if limit else ''}: {'ok' if len(failures) == bad else 'FAIL'}", flush=True)
+        for name, (text, wp, expect) in named.items():
+            for n in (1, 4):
+                bad = len(failures)
+                cpus = [dict(priv_cpu(i, n, text, wp), i=i) for i in range(n)]
+                run(f'{name}{n}', cpus, [expect(c) for c in cpus], limit)
+                print(f"{name} at {n} vCPU(s){' max-block 1' if limit else ''}: {'ok' if len(failures) == bad else 'FAIL'}", flush=True)
+        seen = {}
+        for name, (text, expect, rounds) in loops.items():
+            for n in (1, 4):
+                bad = len(failures)
+                cpus = [dict(priv_cpu(i, n, text), i=i) for i in range(n)]
+                # 2 switches per round plus the CR3 load.
+                check = lambda v, cpu, rounds=rounds: [] if cpu['stats']['systems'] == 2 * rounds + 1 else [f"systems {cpu['stats']['systems']} != {2 * rounds + 1}"]
+                out = run(f'{name}-{n}', cpus, [expect(c) for c in cpus], limit, check)
+                seen[name, n] = out and [c['stats']['retries'] for c in (out['cpus'] if 'cpus' in out else [out])]
+                print(f"{name} at {n} vCPU(s){' max-block 1' if limit else ''}: {'ok' if len(failures) == bad else 'FAIL'} retries {seen[name, n]}", flush=True)
+        # Shadow work does not grow with the number of CPL changes.
+        for n in (1, 4):
+            if seen.get(('loop10', n)) != seen.get(('loop1000', n)):
+                failures.append(f"retries at 10 and 1000 rounds differ ({n} vCPUs{', max-block 1' if limit else ''}): {seen.get(('loop10', n))} {seen.get(('loop1000', n))}")
+    for f in failures: print(f)
+    (a.out / 'privilege.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
+    return len(failures)
+
+
 # ---- contain (S3h): containment and progress --------------------------------------------------------------------------
 # The driver's code-shape option (admission's debug check), on for every mode but `contain` (main clears it there).
 CODE_SHAPE = vm.CODE_SHAPE
@@ -860,7 +1059,8 @@ def tamper_kinds(fixture):
 
 
 # Forged block entries (name, A64 words, expected halt): system instructions trap at EL0 (ESR classes 0x00, 0x01,
-# 0x18); loads, stores and branches into the private window (x28 is the EL1-only frame page; `adr` names the
+# 0x18); loads, stores and branches into the private window (`sub x0, x28, #0x1000` names the EL1-only frame alias; a
+# branch to x28 is a branch into the window, the guest-state page being EL0 data, never executable; `adr` names the
 # execute-only code area) abort there.
 EL0_FORGED = [('msr-daifset', 'd50342df', 'trapped'), ('msr-ttbr0', 'd5182000', 'trapped'),
               ('mrs-sctlr', 'd5381000', 'trapped'), ('mrs-ctr', 'd53b0020', 'trapped'), ('tlbi', 'd508871f', 'trapped'),
@@ -871,7 +1071,9 @@ EL0_FORGED = [('msr-daifset', 'd50342df', 'trapped'), ('msr-ttbr0', 'd5182000', 
               ('mrs-cntvct', 'd53be040', 'trapped'), ('msr-cntv-ctl', 'd51be320', 'trapped'), ('dc-zva', 'd50b743c', 'trapped'), ('mrs-pmccntr', 'd53b9d00', 'trapped'),
               # A literal exit to a RIP none of the block's link points targets: the linker's own check.
               ('link-forged', 'd2824680,d4000021', 'bad_link'),
-              ('load-frame', 'f940039f', 'private_access'), ('store-frame', 'f900039c', 'private_access'),
+              # x28 is the guest-state page's EL0 alias since I1 (G1: EL0 may read and write it); its EL1-only alias, one
+              # page below in the window (abi FRAME_VA), stays unreachable.
+              ('load-frame', 'd1400780,f940001f', 'private_access'), ('store-frame', 'd1400780,f900001c', 'private_access'),
               ('branch-frame', 'd61f0380', 'private_access'), ('read-code', '10000000,f9400000', 'private_access')]
 
 
@@ -1078,7 +1280,7 @@ def cmd_contain(a, host, runtime):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=['corpora', 'smp', 'litmus', 'limits', 'kicks', 'system', 'coherence', 'sharedpt', 'contain'])
+    ap.add_argument('mode', choices=['corpora', 'smp', 'litmus', 'limits', 'kicks', 'system', 'coherence', 'sharedpt', 'contain', 'privilege'])
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--cpus', type=int, nargs='+', default=[2, 3, 4])
@@ -1115,7 +1317,7 @@ def main():
         global CODE_SHAPE
         CODE_SHAPE = []   # containment holds with object validation alone (the host's default)
     if a.mode == 'kicks' and a.kicks is None: a.kicks = 10_000
-    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'litmus': cmd_litmus, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'coherence': cmd_coherence, 'sharedpt': cmd_sharedpt, 'contain': cmd_contain}[a.mode](a, host, runtime)
+    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'litmus': cmd_litmus, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'coherence': cmd_coherence, 'sharedpt': cmd_sharedpt, 'contain': cmd_contain, 'privilege': cmd_privilege}[a.mode](a, host, runtime)
     print('failures:', failed)
     sys.exit(1 if failed else 0)
 

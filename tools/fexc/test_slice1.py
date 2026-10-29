@@ -1,6 +1,6 @@
 """S1c checks: profile slice1 of fexc (block cutting at an allowlist, single-gate exits, profile record).
 
-Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series13 build)
+Run: python3 -m unittest tools/fexc/test_slice1.py      (binary: $FEXC, default the series14 build)
 
 The x86 bytes below are assembled by hand and only drive the compiler; every expectation (where the block ends, why)
 comes from the instruction's architectural class, never from fexc's output. The cut position is also compared with a
@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402  (disassemble, object reader)
 import scan_skips  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series13/obj/fexc')
+FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series14/obj/fexc')
 REPO = HERE.parents[1]
 RIP = 0x102000
 PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
@@ -39,7 +39,7 @@ SYSTEM = {
     'hlt': 'f4', 'invlpg [rax]': '0f0138', 'invd': '0f08', 'wbinvd': '0f09', 'clflush [rax]': '0fae38', 'clts': '0f06',
     'invpcid': '660f3882' + '00',
     'syscall': '0f05', 'sysret': '480f07', 'sysenter': '0f34', 'sysexit': '0f35',
-    'cli': 'fa', 'sti': 'fb', 'popfq': '9d', 'pushfq': '9c',
+    'cli': 'fa', 'sti': 'fb', 'popfq': '9d',
     'cpuid': '0fa2', 'rdtsc': '0f31', 'rdtscp': '0f01f9', 'xgetbv': '0f01d0', 'swapgs': '0f01f8', 'clac (FEX cannot decode)': '0f01ca',
     'rdfsbase': 'f3480faec0', 'wrfsbase': 'f3480faed0', 'ud2': '0f0b',
 }
@@ -48,14 +48,16 @@ SYSTEM = {
 UNSUPPORTED = {
     'lock xchg rax,rcx (#UD)': 'f04887c1', 'rep xchg r8,rax (not pause)': 'f34190', 'o16 mfence': '660faef0',
     'lfence modrm e9': '0faee9', 'rep mfence': 'f30faef0',
-    'lock add [rax],rcx': 'f0480108', 'lock inc [rax]': 'f0ff00', 'cmpxchg [rax],ecx': '0fb108', 'xadd [rax],ecx': '0fc108',
+    'lock add [rax],rcx': 'f0480108', 'lock inc [rax]': 'f0ff00', 'lock cmpxchg [rax],ecx': 'f00fb108', 'lock xadd [rax],ecx': 'f00fc108',
     'rep movsb': 'f3a4', 'movsb': 'a4', 'stosq': '48ab', 'scasb': 'ae', 'cmpsb': 'a6', 'lodsb': 'ac',
     'mov rax,fs:[rax]': '64488b00', 'mov rax,gs:[rax]': '65488b00', 'mov eax,[eax] (addr32)': '678b00',
-    'addps': '0f58c1', 'movaps': '0f28c1', 'fld st0': 'd9c0', 'vzeroupper': 'c5f877', 'cld': 'fc', 'std': 'fd',
-    'clc': 'f8', 'stc': 'f9', 'lahf': '9f', 'sahf': '9e',
-    'fxsave': '0fae00', 'loop 67-prefix': '67e2fe', 'jecxz': '67e3fe', 'loop o16': '66e2fe', 'shld': '0fa4c101', 'shrd': '0facc101', 'popcnt': 'f3480fb8c1',
-    'tzcnt': 'f30fbcc1', 'lzcnt': 'f30fbdc1', 'rdrand': '0fc7f0', 'rdseed': '0fc7f8', 'cmpxchg16b': '480fc708', 'cmpxchg8b': '0fc708',
-    'leave': 'c9', 'enter': 'c8080000', 'xlat': 'd7', 'movbe': '0f38f000', 'prefetch': '0f1808', 'sal /6 alias': 'd1f0',
+    'addps': '0f58c1', 'movaps': '0f28c1', 'fld st0': 'd9c0', 'vzeroupper': 'c5f877',
+    'o16 pushf': '669c', 'o16 leave': '66c9', 'enter level 1': 'c8080001', 'o16 shld': '660fa4c101', 'o16 shrd cl': '660fadc1',
+    'prefetchw': '0f0d08', 'prefetch /4 (reserved nop)': '0f1820', 'prefetch reg (reserved nop)': '0f18c0', 'movnti reg': '0fc3c1',
+    'pdep': 'c4e2fbf5c1', 'pext': 'c4e2faf5c1', 'andn L=1': 'c4e27cf2c1', 'blsr /0 (#UD)': 'c4e278f3c1', 'vpxor': 'c5f9efc0',
+    'rex andn (#UD)': '48c4e278f2c1', 'o16 andn (#UD)': '66c4e278f2c1', 'lock andn': 'f0c4e278f2c1', 'rep popcnt-like f2 0f b8': 'f20fb8c1',
+    'fxsave': '0fae00', 'loop 67-prefix': '67e2fe', 'jecxz': '67e3fe', 'loop o16': '66e2fe', 'rdrand': '0fc7f0', 'rdseed': '0fc7f8', 'cmpxchg16b': '480fc708', 'cmpxchg8b': '0fc708',
+    'xlat': 'd7', 'movbe': '0f38f000', 'sal /6 alias': 'd1f0',
     'bnd ret': 'f2c3', 'o16 ret': '66c3', 'o16 jmp': '66e9fbffffff', 'bswap r9w (undefined)': '66410fc9', 'bswap ax': '660fc8',
     # FEX branches around the whole access for a zero count (static or dynamic), losing a guest #PF
     'rcl dword [rax],1': 'd110', 'rcr qword [rax],cl': '48d318', 'rcr qword [rax],0': '48c11800', 'rcl byte [rax],cl': 'd210',
@@ -83,6 +85,14 @@ ALLOWED = {
     'cbw': '6698', 'cwde': '98', 'cdqe': '4898', 'cwd': '6699', 'cdq': '99', 'cqo': '4899', 'push rax': '50', 'push r9': '4151',
     'endbr64': 'f30f1efa', 'xchg [rax],ecx': '8708', 'xchg [rax],rcx': '488708', 'xchg [rax],cl': '8608', 'xchg cx,[rax]': '668708',
     'lock xchg [rax],rcx': 'f0488708', 'pause': 'f390', 'lfence': '0faee8', 'mfence': '0faef0', 'sfence': '0faef8', 'rcl rax,cl': '48d3d0', 'rcr eax,1': 'd1d8', 'rcl al,5': 'c0d005', 'pop rbx': '5b', 'push imm8': '6a01', 'push imm32': '6800010000', 'push [rax]': 'ff30', 'pop [rax]': '8f00', 'push ax': '6650',
+    # I1: flag moves, pushf, small integer and BMI forms
+    'cld': 'fc', 'std': 'fd', 'clc': 'f8', 'stc': 'f9', 'cmc': 'f5', 'lahf': '9f', 'sahf': '9e', 'pushfq': '9c',
+    'leave': 'c9', 'enter': 'c8080000', 'shld': '0fa4c101', 'shrd': '0facc101', 'shld [rax],cl': '480fa508', 'shrd [rax],5': '0fac0805',
+    'cmpxchg [rax],ecx': '0fb108', 'cmpxchg [rax],cl': '0fb008', 'cmpxchg rcx,rdx': '480fb1d1', 'xadd [rax],ecx': '0fc108', 'xadd rcx,rdx': '480fc1d1',
+    'popcnt': 'f3480fb8c1', 'popcnt [rax]': 'f30fb800', 'o16 popcnt': '66f30fb8c1', 'tzcnt': 'f30fbcc1', 'lzcnt': 'f30fbdc1', 'tzcnt [rax]': 'f3480fbc00',
+    'prefetcht0': '0f1808', 'prefetchnta': '0f1800', 'prefetcht1': '0f1810', 'prefetcht2': '0f1818', 'movnti [rax],rcx': '480fc308',
+    'andn': 'c4e278f2c1', 'andn [rax]': 'c4e2f8f200', 'bextr': 'c4e270f7c1', 'blsr': 'c4e278f3c9', 'blsmsk': 'c4e278f3d1', 'blsi': 'c4e2f8f3d8',
+    'bzhi': 'c4e270f5c1', 'mulx': 'c4e2f3f6c2', 'rorx': 'c4e3fbf0c107', 'sarx': 'c4e2faf7c1', 'shlx': 'c4e2f9f7c1', 'shrx [rax]': 'c4e2fbf700',
 }
 
 # (name, hex, translated-instruction count): control transfers end the block with their normal exit.
@@ -148,6 +158,16 @@ class Slice1Cutting(unittest.TestCase):
                 g = d['guest']
                 self.assertEqual(rc, 0, name)
                 self.assertEqual((g['instructions_translated'], g['end']['reason']), (5, 'end_of_input'), (name, g['end']))
+
+    def test_rip_relative_after_an_immediate(self):
+        # [rip + disp] is relative to the end of the instruction, immediates included (SDM vol. 2 §2.2.1.6): shld/shrd imm8
+        # (the pinned QEMU 7.2 is one byte low here), rorx imm8 and add imm8, each at 0x1000 with disp 0x100.
+        for name, x, n in (('shld', '4c0fa4350001000020', 9), ('shrd', '4c0fac350001000005', 9), ('rorx', 'c4e3fbf0050001000005', 10),
+                           ('add', '4883050001000005', 8)):
+            with self.subTest(name):
+                d, rc = run(x, 0x1000)
+                moves = [int(r['guest_rip'], 16) for r in d['code']['relocations'] if r['kind'] == 'guest_rip_move' and r['register'] != 0]
+                self.assertIn(0x1000 + n + 0x100, moves, (name, moves))
 
     def test_branches_end_block_with_normal_exit(self):
         for name, x in BRANCHES.items():

@@ -95,6 +95,8 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize) -> Result<Bac
             own(SHARED_OFFSET, 4096),
             own(exec::STATE_OFFSET, 4096),
             own(exec::FRAME_OFFSET, exec::frame::BYTES),
+            // The guest-state page's EL0 alias (x28 of generated code), backed by the same page (G1 minimum).
+            Span::guest(exec::GUEST_STATE_OFFSET, exec::frame::BYTES, base + exec::FRAME_OFFSET),
             own((STACK_TOP - PRIVATE) as usize - exec::STACK_BYTES, exec::STACK_BYTES),
             own((EXCEPTION_STACK_TOP - PRIVATE) as usize - 0x8000, 0x8000),
             own(exec::STAGING_OFFSET, exec::STAGING_BYTES),
@@ -122,11 +124,14 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize) -> Result<Bac
 pub(crate) fn set_cpu(area: Area, cpu: Cpu) {
     area.write_record(exec::STATE_OFFSET, State::new(area.vcpu as u64, cpu));
 }
-/// Enters the vCPU at the resident in its window, its tables tagged with its own ASID (its number + 1), as GIC vCPU
-/// `area.vcpu` with its peer doorbell enabled (`doorbell`; disabled only by a test driver's never-answering peer).
+/// Enters the vCPU at the resident in its window, its tables tagged with its own ASIDs (2v + 2 for its supervisor
+/// shadow space, loaded at boot; the resident uses 2v + 3 for its user space), as GIC vCPU `area.vcpu` with its peer
+/// doorbell enabled (`doorbell`; disabled only by a test driver's never-answering peer).
 pub(crate) fn enter(cpu: &Vcpu, area: Area, doorbell: bool) -> Result<()> {
+    // 8-bit ASIDs, never 0.
+    const _: () = assert!(2 * cache::MAX_VCPUS + 1 <= 255);
     cpu.doorbell(area.vcpu, doorbell)?;
-    cpu.enter_resident_with_asid(area.base, natemu_abi::shadow::TCR_BOTH, area.vcpu as u8 + 1)
+    cpu.enter_resident_with_asid(area.base, natemu_abi::shadow::TCR_BOTH, 2 * area.vcpu as u8 + 2)
 }
 
 /// The global area word at `offset` (shared by all vCPUs; atomic access only).
@@ -139,6 +144,10 @@ fn global_u64(memory: &Memory, offset: usize) -> &AtomicU64 {
 fn record_word(memory: &Memory, v: usize, i: Option<usize>) -> &AtomicU64 {
     let record = cache::RECORDS + v * size_of::<cache::Record>();
     global_u64(memory, record + i.map_or(0, |i| std::mem::offset_of!(cache::Record, stale) + 8 * i))
+}
+/// vCPU `area.vcpu`'s shadow resets so far (the resident's counter: evictions, shootdowns, control changes, halts).
+pub(crate) fn shadow_resets(area: Area) -> u64 {
+    global_u64(area.memory, cache::RESETS + 8 * area.vcpu).load(SeqCst)
 }
 /// Guest RAM was written by the host (only while every vCPU is stopped): each vCPU drops its cached code before it
 /// next runs guest code.
@@ -638,6 +647,9 @@ pub(crate) struct Requests {
     /// reply kind); then `tampered` is set. Checks the resident's run-time defences.
     pub(crate) tamper: Option<fn(Area, &mut State) -> bool>,
     pub(crate) tampered: bool,
+    /// Test drivers only: RIPs whose one-byte instruction is executed as a CPL change to the value
+    /// ([`exec::system::SET_CPL`]); blocks are fetched up to each, so it is reached at a block boundary.
+    pub(crate) switches: std::collections::BTreeMap<u64, u64>,
 }
 
 /// Runs the vCPU (entered at the resident, see [`enter`]) until it stops; `stop_at` is a RIP at
@@ -762,7 +774,17 @@ fn translation(
     if Some(rip) == stop_at {
         return Ok(Err(Stop::Reached));
     }
-    let Fetched { bytes, more, next_fault } = match fetched(area, state, stop_at)? {
+    if let Some(&cpl) = requests.switches.get(&rip) {
+        // A step request is for a block's access site, never a switch (blocks end before one).
+        if step {
+            return Err(format!("step at {rip:#x}: a CPL switch"));
+        }
+        state.system = exec::System { kind: exec::system::SET_CPL, length: 1, cr: cpl as u32, ..exec::System::NONE };
+        return Ok(Ok(exec::REPLY_SYSTEM));
+    }
+    // Blocks end at the stop RIP and at every switch after RIP.
+    let limit = requests.switches.range(rip..).map(|(&r, _)| r).chain(stop_at).filter(|&l| l > rip).min();
+    let Fetched { bytes, more, next_fault } = match fetched(area, state, limit)? {
         Ok(fetched) => fetched,
         Err(stop) => return Ok(Err(stop)),
     };

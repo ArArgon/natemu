@@ -25,7 +25,15 @@ Cases are derived from program descriptions, never written per program:
   (`access_cells`, checked before any VM run). A cell without a fault expects the program's QEMU full run. A fetch
   fault at the first instruction must come before any compile.
   The reference runs are QEMU user-mode, i.e. CPL 3; the CPL 0 cells compare the VM against them, which is valid only
-  while the corpus has no pushf/popf or other privileged or CPL-dependent instruction.
+  while the corpus has no popf or other privileged or CPL-dependent instruction (pushf, admitted since I1, pushes the
+  same image at both: IF = 1, IOPL = 0, AC = 0).
+* I1: DATA_FORMS also holds the I1 memory forms (shld/shrd, cmpxchg and xadd without LOCK, popcnt/tzcnt, BMI loads,
+  movnti, pushf, enter, leave) and a prefetch hint, which never faults (SDM PREFETCHh): its window and non-canonical
+  probes expect the QEMU full run (`NOFAULT`). shld/shrd with a memory destination and a count masking to 0 is a
+  write-intent read-modify-write like a shift by 0 (#PF W on a read-only page): the SDM gives the value ("no
+  operation") but not the access; the pinned QEMU faults with error 7 for shld/shrd by 0, 64 (64-bit), 32 (32-bit) and
+  CL = 0 alike (October 28), and fexc series14 writes the value back. The guest-state page (G1) is a documented
+  deviation: `guest_state_probes`. Any corpus of `tools/reference/gen_i1.py` works as input too.
 * Built-in probes (PROBES below): non-canonical data and stack addresses (#GP(0)/#SS(0)), stack accesses across the
   canonical gap (#SS(0)), E3's negative cases (`window_probes`; `--no-window` leaves them out): every class of the
   former private window (frame, state, tables, stacks, staging, resident text, shadow pool, guest-RAM alias, code area,
@@ -57,7 +65,7 @@ import argparse, json, pathlib, re, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
-import ref, gen_slice1 as gen, run_slice1_vm as vm  # noqa: E402
+import ref, gen_slice1 as gen, gen_i1, run_slice1_vm as vm  # noqa: E402
 
 M64, PAGE = 2**64 - 1, 4096
 SIZES = {'byte': 1, 'word': 2, 'dword': 4, 'qword': 8}
@@ -133,6 +141,12 @@ def events(text, regs, next_rip):
             a, base = address(MEM.fullmatch(ops[0])[2], dict(regs, rsp=(rsp + w) & M64), next_rip)
             out.append(('access', a, w, True, base in STACK_BASES))
         return out
+    # I1: pushf and enter (nesting level 0) push one qword; leave reads [RBP] (a stack access; RSP and RBP change after it);
+    # a prefetch hint never faults (SDM PREFETCHh: no exceptions but #UD for LOCK), whatever its address.
+    if m in ('pushfq', 'enter') and (m == 'pushfq' or len(ops) == 2 and int(ops[1], 0) == 0):
+        return [('access', (rsp - 8) & M64, 8, True, True)]
+    if m == 'leave' and not ops: return [('access', regs['rbp'], 8, False, True)]
+    if m.startswith('prefetch'): return []
     if m == 'ret' and (not ops or len(ops) == 1 and re.fullmatch(r'\d+|0x[0-9a-f]+', ops[0])):    # ret / ret imm16
         return [('access', rsp, 8, False, True), ('target', ('mem', rsp))]
     if m in ('jmp', 'call') and len(ops) == 1 and (mem(ops[0]) or ops[0] in ref.R64):
@@ -141,7 +155,7 @@ def events(text, regs, next_rip):
         out = [('access', x[0], 8, False, x[2]), ('target', ('mem', x[0]))] if x else [('target', regs[ops[0]])]
         return out + ([('access', (rsp - 8) & M64, 8, True, True)] if m == 'call' else [])     # the push follows the check
     # Anything else that transfers control (jcc, direct jmp/call, loop, ...) is not straight-line: never guessed.
-    if m in ('jmp', 'call', 'ret', 'push', 'pop') or m.startswith('j') or m.startswith('loop') or m in ('iret', 'iretq', 'int', 'syscall'):
+    if m in ('jmp', 'call', 'ret', 'push', 'pop', 'enter', 'pushf', 'popf', 'popfq') or m.startswith('j') or m.startswith('loop') or m in ('iret', 'iretq', 'int', 'syscall'):
         raise Unsupported(text)
     if m in ('div', 'idiv') and len(ops) == 1:      # the divisor is read, then checked
         x = mem(ops[0])
@@ -307,7 +321,19 @@ DATA_FORMS = [('load', 'rbx', 'mov rax, qword ptr [rbx + 8]'), ('store', 'rbx', 
               ('push-mem', 'rbx', 'push qword ptr [rbx]'), ('rbp-load', 'rbp', 'mov rax, qword ptr [rbp + 16]'),
               ('rsp-store', 'rsp', 'mov qword ptr [rsp + 8], rax'), ('push', 'rsp', 'push rax'), ('pop', 'rsp', 'pop rcx'),
               ('rmw-byte', 'rbp', 'not byte ptr [rbp]'), ('ret', 'rsp', 'ret'),
-              ('xchg', 'rbx', 'xchg qword ptr [rbx], rax'), ('xchg-byte', 'rbp', 'xchg cl, byte ptr [rbp + 3]')]
+              ('xchg', 'rbx', 'xchg qword ptr [rbx], rax'), ('xchg-byte', 'rbp', 'xchg cl, byte ptr [rbp + 3]'),
+              # I1 memory forms: RMW (shld/shrd, cmpxchg and xadd without LOCK), loads (popcnt/tzcnt, BMI), a store (movnti),
+              # stack forms (pushf, enter, leave) and a prefetch hint (never faults)
+              ('shld', 'rbx', 'shld qword ptr [rbx], rcx, 5'), ('shld-zero', 'rbx', 'shld qword ptr [rbx], rcx, 64'), ('shrd', 'rsi', 'shrd dword ptr [rsi + r8*2], ecx, 31'),
+              ('cmpxchg', 'rbx', 'cmpxchg dword ptr [rbx], ecx'), ('xadd', 'rbp', 'xadd qword ptr [rbp + 8], rcx'),
+              ('popcnt', 'rsi', 'popcnt rax, qword ptr [rsi + r8*2]'), ('tzcnt', 'rbx', 'tzcnt eax, dword ptr [rbx + 4]'),
+              ('andn', 'rbx', 'andn rax, rcx, qword ptr [rbx]'), ('shrx', 'rbp', 'shrx eax, dword ptr [rbp + 4], ecx'),
+              ('movnti', 'rbx', 'movnti qword ptr [rbx], rcx'), ('pushf', 'rsp', 'pushfq'), ('enter', 'rsp', 'enter 16, 0'),
+              ('leave', 'rbp', 'leave'), ('prefetch', 'rbx', 'prefetcht0 byte ptr [rbx]')]
+# Mnemonics that access memory without a bracketed operand (the stack forms).
+IMPLICIT_ACCESS = ('push', 'pop', 'call', 'ret', 'pushfq', 'enter', 'leave')
+# Forms that never fault (a prefetch hint): their probes expect the QEMU full run.
+NOFAULT = {'prefetch': {'nofault': True}}
 REGS = {'rax': 0x1122334455667788, 'rcx': 0x7fffffffffffffff, 'rdx': 5, 'rbx': D + 0x100, 'rsi': D + 0x200, 'rdi': D + 0x300,
         'rbp': D + 0x400, 'rsp': S + 0x1000, 'r8': 3}
 SS_SPAN = [(0x8000_0000_0004, 'push', 'push rax'), (0xffff_8000_0000_0004, 'push', 'push rax'), (0x8000_0000_0004, 'pop', 'pop rcx'),
@@ -332,11 +358,27 @@ STRADDLE_FORMS = [('load', 'rbx', 0, 'mov rax, qword ptr [rbx]'), ('store', 'rbx
                   ('rsp-store', 'rsp', 0, 'mov qword ptr [rsp], rax'), ('push', 'rsp', 8, 'push rax'), ('pop', 'rsp', 0, 'pop rcx'),
                   ('ret', 'rsp', 0, 'ret'), ('call', 'rsp', 8, 'call rdx'), ('push-mem', 'rbx', 0, 'push qword ptr [rbx]')]
 
+# G1 (I1): the guest-state page, the one EL0 data page of the window (abi GUEST_STATE_VA): an access inside it reaches
+# the vCPU's own guest state (documented deviation): a non-field byte reads 0 and the IF byte the banked IF (1). Its
+# extent is pinned by straddles into it (from the EL1-only frame alias) and out of it, and by the page above: each #GP.
+GUEST_STATE = PRIVATE + 0x2_4000
+GUEST_STATE_EDGES = [GUEST_STATE - 4, GUEST_STATE + 0xffc, GUEST_STATE + 0x1000]
+GUEST_STATE_FORMS = [('load', 'mov rax, qword ptr [rbx]'), ('store', 'mov qword ptr [rbx], rax'), ('rmw', 'add qword ptr [rbx], 1')]
+
+def guest_state_probes():
+    out = [('window-guest-state', REGS, PRELUDE + [f'movabs rbx, {GUEST_STATE}', 'mov rax, qword ptr [rbx]',
+                                                    'movzx ecx, byte ptr [rbx + 0x3f9]'], len(PRELUDE) + 1,
+            {'deviation': {'rax': 0, 'rcx': 1}})]
+    for a in GUEST_STATE_EDGES:
+        for name, line in GUEST_STATE_FORMS:
+            out.append((f'guest-state-edge-{a:#x}-{name}', REGS, PRELUDE + [f'movabs rbx, {a}', line] + AFTER, len(PRELUDE) + 1, {}))
+    return out
+
 def window_probes():
-    out = []
+    out = guest_state_probes()
     for cls, page in WINDOW:
         for name, base, line in DATA_FORMS:
-            out.append((f'window-{cls}-{name}', REGS, PRELUDE + [f'movabs {base}, {page + 0x800}', line] + AFTER, len(PRELUDE) + 1, {}))
+            out.append((f'window-{cls}-{name}', REGS, PRELUDE + [f'movabs {base}, {page + 0x800}', line] + AFTER, len(PRELUDE) + 1, NOFAULT.get(name, {})))
     for cls, page in WINDOW + [(f'{a:#x}', a & ~(PAGE - 1)) for a in NONCANONICAL]:
         for name, base, off, line in WINDOW_FORMS:
             out.append((f'window-{cls}-{name}', REGS, PRELUDE + [f'movabs {base}, {page + off}', line] + AFTER, len(PRELUDE) + 1, {}))
@@ -359,7 +401,7 @@ def probes(window=True):
     out = window_probes() if window else []
     for name, base, line in DATA_FORMS:
         for a in NONCANONICAL:
-            out.append((f'noncanonical-{name}-{a:#x}', REGS, PRELUDE + [f'movabs {base}, {a}', line] + AFTER, len(PRELUDE) + 1, {}))
+            out.append((f'noncanonical-{name}-{a:#x}', REGS, PRELUDE + [f'movabs {base}, {a}', line] + AFTER, len(PRELUDE) + 1, NOFAULT.get(name, {})))
     # Canonical start, non-canonical end: a page-crossing store (split stub) and load (abort in the gap).
     for name, line in [('store', 'mov qword ptr [rbx], rax'), ('load', 'mov rax, qword ptr [rbx]'), ('rmw', 'add dword ptr [rbx + 2], ecx')]:
         out.append((f'noncanonical-end-{name}', REGS, PRELUDE + ['movabs rbx, 0x7ffffffffffc', line] + AFTER, len(PRELUDE) + 1, {}))
@@ -455,7 +497,7 @@ def probe_program(name, regs, lines, rip):
     mem = [{'addr': hex(D), 'data': bytes((i * 37) & 0xff for i in range(0x2000)).hex()},
            {'addr': hex(S), 'data': bytes((i * 11) & 0xff for i in range(0x2000)).hex()}]
     return {'name': name, 'code': code.hex(), 'rip': hex(rip), 'gpr': [hex(g) for g in gpr], 'rflags': '0x1', 'memory': mem,
-            'insns': [gen.annotate(l) for l in lines], 'asm': lines}
+            'insns': [gen_i1.annotate(l) for l in lines], 'asm': lines} | ({'cpu': gen_i1.cpu(lines)} if gen_i1.cpu(lines) else {})
 
 # Paging cells (generated on every program, see `variants`): controls, then (mutation, entry level, 2 MiB leaf) on a
 # data page an access touches or on the code page. `supervisor` in the controls: the code pages' leaves are supervisor.
@@ -495,9 +537,10 @@ PLACEMENTS = [('low', (SLOT, 0, 2 * SLOT)), ('high', (HIGH, HIGH + SLOT, HIGH + 
 def paging_programs():
     """The access-form programs. `rdi` (the prelude's and the tail's stores) points into `SCR`, a page of its own, so
     the page under test is never the prelude's; `ret` returns to the instruction after it through a code pointer in the
-    stack (`codeptr`: moved with the code). `access`: the index of the instruction under test."""
+    stack (`codeptr`: moved with the code); `leave` loads a data pointer and `enter` pushes one (`dataptr`: moved with
+    the data). `access`: the index of the instruction under test."""
     out = []
-    for name, line in [(n, l) for n, _, l in DATA_FORMS] + CROSSING:
+    for name, line in [(n, l) for n, _, l in DATA_FORMS if n not in NOFAULT] + CROSSING:
         lines = PRELUDE + [line] + AFTER
         p = probe_program(f'paging-{name}', dict(REGS, rdi=SCR + 0x300), lines, gen.CODE)
         p['memory'].append({'addr': hex(SCR), 'data': bytes(0x1000).hex()})
@@ -506,6 +549,11 @@ def paging_programs():
             target = gen.CODE + offsets(lines)[1][len(PRELUDE) + 1]
             data = bytearray(bytes.fromhex(p['memory'][1]['data'])); data[0x1000:0x1008] = target.to_bytes(8, 'little')
             p['memory'][1]['data'] = data.hex(); p['codeptr'] = [S + 0x1000]
+        if line == 'leave':     # leave loads RBP from [RBP]: a data pointer there (`dataptr`: moved with the data)
+            data = bytearray(bytes.fromhex(p['memory'][0]['data'])); data[0x400:0x408] = (D + 0x400).to_bytes(8, 'little')
+            p['memory'][0]['data'] = data.hex(); p['dataptr'] = [D + 0x400]
+        if line.startswith('enter'):    # enter pushes RBP (a data pointer) to RSP - 8: that slot moves with the data
+            p['dataptr'] = [REGS['rsp'] - 8]
         out.append(p)
     return out
 
@@ -527,9 +575,9 @@ def relocate(p, results, mine, code, data, scr):
         out = []
         for m in ms:
             a, bytes_ = ref.num(m['addr']), bytearray.fromhex(m['data'])
-            for at in p.get('codeptr', []):
+            for at, by in [(at, code) for at in p.get('codeptr', [])] + [(at, delta(at)) for at in p.get('dataptr', [])]:
                 if a <= at < a + len(bytes_):
-                    bytes_[at - a:at - a + 8] = ((int.from_bytes(bytes_[at - a:at - a + 8], 'little') + code) & M64).to_bytes(8, 'little')
+                    bytes_[at - a:at - a + 8] = ((int.from_bytes(bytes_[at - a:at - a + 8], 'little') + by) & M64).to_bytes(8, 'little')
             out.append(dict(m, addr=hex(a + delta(a)), data=bytes_.hex()))
         return out
     q = dict(p, rip=hex(ref.num(p['rip']) + code), gpr=moved(p['gpr']), memory=mem(p['memory']), scratch=p['scratch'] + scr)
@@ -571,7 +619,7 @@ def expectations(programs, probe_specs, work, paging=True):
         if code.hex() != p['code']: print(f"skip {p['name']}: asm does not assemble to the code"); continue
         at = {}
         for i, line in enumerate(p['asm']):
-            if '[' in line or line.split()[0] in ('push', 'pop', 'call', 'ret'): at[i] = len(jobs); jobs.append(dict(p, prefix=offs[i]))
+            if '[' in line or line.split()[0] in IMPLICIT_ACCESS: at[i] = len(jobs); jobs.append(dict(p, prefix=offs[i]))
         plan.append((p, offs, at, len(jobs), not p.get('relocatable')))
         jobs.append(dict(p))
     probing = []
@@ -583,7 +631,7 @@ def expectations(programs, probe_specs, work, paging=True):
         probing.append((p, offs, k, {m: v for m, v in mut.items() if m != 'rip'}, len(jobs)))
         # Outside QEMU's program window the (position-independent) code runs at the same page offset in it.
         here = rip if rip + offs[-1] <= 0x3_0000_0000 else gen.CODE + (rip & (PAGE - 1))
-        jobs.append(dict(p, prefix=offs[k], rip=hex(here)))
+        jobs.append(dict(p, rip=hex(here)) if mut.get('nofault') else dict(p, prefix=offs[k], rip=hex(here)))
     results, _ = ref.run_programs(jobs, work, ref_qemu())
     cases, counters, skipped = [], {}, []
     def take(key, items, n):
@@ -629,6 +677,15 @@ def expectations(programs, probe_specs, work, paging=True):
         fetched = m.fetch(rip + offs[k], offs[k + 1] - offs[k])
         if mut.get('atomic'):
             cases.append((p['name'], p, mut, None, offs[k], r, ATOMIC, None)); continue
+        if mut.get('deviation'):    # the guest-state page: runs to its end, the QEMU prefix plus the loads' values
+            r = json.loads(json.dumps(r))
+            for reg, v in mut['deviation'].items(): r['qemu']['gpr'][ref.REGS.index(reg)] = ref.hx(v)
+            r['qemu']['rip'] = ref.hx(rip + offs[-1])
+            cases.append((p['name'], p, {}, None, offs[-1], r, 'guest-state deviation', None)); continue
+        if mut.get('nofault'):      # the full run: the program reaches its end
+            if first_fault(evs, m, reader(r)): raise ValueError(f"{p['name']}: a no-fault probe faults in the model")
+            r['qemu']['rip'] = ref.hx(rip + offs[-1])
+            cases.append((p['name'], p, {}, None, offs[-1], r, 'runs to its end', None)); continue
         f = fetched or first_fault(evs, m, reader(r))
         if not f: raise ValueError(f"{p['name']}: the probe does not fault")
         cases.append((p['name'], p, mut, f, offs[k], r, describe(p['asm'][k], [] if fetched else evs, f, bool(fetched)), None))

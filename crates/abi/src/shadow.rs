@@ -5,6 +5,15 @@
 //! The x86 non-canonical gap is never mapped. Tables live in the owner's 1 MiB
 //! window: the host pre-links the lower and upper 2 MiB windows at fixed pages,
 //! and further intermediate tables come from a bounded pool.
+//!
+//! Each owner has two shadow spaces, one per x86 privilege class: supervisor
+//! (CPL 0-2; roots [`LOWER_ROOT`]/[`UPPER_ROOT`], the host's pre-linked windows)
+//! and user (CPL 3; [`USER_LOWER_ROOT`]/[`USER_UPPER_ROOT`]), each with its own
+//! ASID. A space shadows only accesses the software walker granted at its
+//! privilege, so a supervisor shadow never serves a CPL3 access and a CPL change
+//! switches roots instead of dropping shadows. Both spaces share the pool;
+//! [`Space::reset`] empties both, and unmapping is per space (callers unmap a
+//! page in both, as for INVLPG).
 pub const HIGH_BASE: u64 = 0xffff_8000_0000_0000;
 pub const WINDOW_BYTES: u64 = 0x20_0000;
 pub const LOWER_ROOT: usize = 0x10000;
@@ -13,6 +22,11 @@ pub const UPPER_ROOT: usize = 0x17000;
 pub const UPPER_L1: usize = 0x18000;
 pub const UPPER_L2: usize = 0x19000;
 pub const UPPER_LEAF: usize = 0x1a000;
+/// Roots of the user (CPL 3) space; its TTBR0 root links the resident's private region like [`LOWER_ROOT`].
+pub const USER_LOWER_ROOT: usize = 0x1c000;
+pub const USER_UPPER_ROOT: usize = 0x1d000;
+/// `[lower, upper]` roots of the supervisor (index 0) and user (index 1) spaces.
+pub const ROOTS: [[usize; 2]; 2] = [[LOWER_ROOT, UPPER_ROOT], [USER_LOWER_ROOT, USER_UPPER_ROOT]];
 /// Pool allocation count (one u64) in its own private page.
 pub const STATE_OFFSET: usize = 0x1b000;
 /// Intermediate/leaf table pages allocated on demand; never freed except by `reset`.
@@ -21,11 +35,9 @@ pub const POOL_PAGES: usize = 32;
 pub const TCR_BOTH: u64 =
     16 | 1 << 8 | 1 << 10 | 3 << 12 | 16 << 16 | 1 << 24 | 1 << 26 | 3 << 28 | 2 << 30 | 2 << 32;
 /// Valid page, AF, inner shareable, normal memory (MAIR index 0), EL0 read/write (AP 01: generated code runs at EL0),
-/// UXN and PXN: generated code never executes from guest pages. x86 privilege is not in the descriptor: a shadow exists
-/// only for a data access the software walker granted at the vCPU's CPL (U/S, WP; SMEP concerns fetches, which never use
-/// shadows), so a CPL0 vCPU's shadows of
-/// supervisor pages and a CPL3 vCPU's of user pages are alike; a CPL change would have to reset the shadows (there is
-/// none yet: the CPL is fixed for a run).
+/// UXN and PXN: generated code never executes from guest pages. x86 privilege is not in the descriptor but in the space:
+/// a shadow exists only for a data access the software walker granted at the space's CPL class (U/S, WP; SMEP concerns
+/// fetches, which never use shadows), and generated code runs with the space of its CPL selected.
 pub const PAGE: u64 = 3 | 1 << 10 | 3 << 8 | 1 << 6 | 3 << 53;
 /// nG: the entry is tagged with the owner's ASID (every owner maps the same
 /// addresses differently, so its entries must not match another owner's).
@@ -36,6 +48,7 @@ const TABLE: u64 = 3;
 const OUTPUT: u64 = 0x0000_ffff_ffff_f000;
 const _: () = assert!(POOL_OFFSET + POOL_PAGES * 4096 <= crate::RAM_SIZE);
 const _: () = assert!(crate::resident::TEXT_END <= POOL_OFFSET);
+const _: () = assert!(STATE_OFFSET < USER_LOWER_ROOT && USER_UPPER_ROOT + 4096 <= crate::SHARED_OFFSET);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -59,28 +72,31 @@ pub enum Error {
 pub trait Maintenance {
     /// Complete prior table stores for the walker (DSB), then ISB.
     fn publish(&mut self);
-    /// Complete prior table stores, invalidate `va`'s cached translations,
-    /// complete the invalidation, then ISB.
+    /// Complete prior table stores, invalidate `va`'s cached translations
+    /// in this space (its ASID), complete the invalidation, then ISB.
     fn invalidate(&mut self, va: u64);
+    /// The same for every translation of both of the owner's spaces.
     fn invalidate_all(&mut self);
 }
 
 /// The owner's private tables: window offset 0 is at resident address
 /// `window` and at IPA `ipa`. `upper` says whether TTBR1 walks are enabled
 /// (TCR_EL1.EPD1 clear); without it the upper half and its tables are unused
-/// and their pages need not be mapped.
+/// and their pages need not be mapped. `user` selects the space (CPL 3, else
+/// supervisor) that `map`, `unmap` and `descriptor` work on; `tlb` names its ASID.
 pub struct Space<M> {
     pub window: *mut u8,
     pub ipa: u64,
     pub pool_pages: usize,
     pub upper: bool,
+    pub user: bool,
     pub tlb: M,
 }
 /// The pre-linked lower and upper shadow tables below the roots.
 const LOWER_TABLES: [usize; 3] = [0x11000, 0x15000, LOWER_LEAF];
 const UPPER_TABLES: [usize; 3] = [UPPER_L1, UPPER_L2, UPPER_LEAF];
 /// Window pages holding the owner's tables and shadow state: never a target.
-const PRIVATE_TABLES: core::ops::Range<usize> = LOWER_ROOT..STATE_OFFSET + 4096;
+const PRIVATE_TABLES: core::ops::Range<usize> = LOWER_ROOT..USER_UPPER_ROOT + 4096;
 
 impl<M: Maintenance> Space<M> {
     fn slot(&self, table: usize, index: usize) -> *mut u64 {
@@ -112,20 +128,22 @@ impl<M: Maintenance> Space<M> {
         Ok(table)
     }
     fn root(&self, va: u64) -> Result<usize, Error> {
+        let [lower, upper] = ROOTS[self.user as usize];
         if va >> 47 == 0 {
-            Ok(LOWER_ROOT)
+            Ok(lower)
         } else if va >= HIGH_BASE && self.upper {
-            Ok(UPPER_ROOT)
+            Ok(upper)
         } else {
             Err(Error::Noncanonical)
         }
     }
-    /// Guest halves as (root, L0 indices); the private region (lower index
-    /// 256) and the non-canonical gap are never included.
+    /// Guest halves of both spaces as (root, L0 indices); the private region
+    /// (lower index 256) and the non-canonical gap are never included.
     fn halves(&self) -> impl Iterator<Item = (usize, core::ops::Range<usize>)> + use<M> {
-        [(LOWER_ROOT, 0..256), (UPPER_ROOT, 256..512)]
-            .into_iter()
-            .take(if self.upper { 2 } else { 1 })
+        let upper = self.upper;
+        ROOTS.into_iter().flat_map(move |[lower, high]| {
+            [(lower, 0..256), (high, 256..512)].into_iter().take(if upper { 2 } else { 1 })
+        })
     }
     fn pool(&self, offset: usize, pages: usize) -> bool {
         offset
@@ -139,8 +157,9 @@ impl<M: Maintenance> Space<M> {
             return Ok(None);
         }
         let offset = (descriptor & OUTPUT).wrapping_sub(self.ipa) as usize;
-        let table = LOWER_TABLES.contains(&offset)
-            || (self.upper && UPPER_TABLES.contains(&offset))
+        // The host pre-links its windows in the supervisor space only.
+        let table = (!self.user && LOWER_TABLES.contains(&offset))
+            || (!self.user && self.upper && UPPER_TABLES.contains(&offset))
             || self.pool(offset, self.allocated());
         if descriptor & 3 != TABLE || !table {
             return Err(Error::Corrupt);
@@ -209,8 +228,9 @@ impl<M: Maintenance> Space<M> {
             _ => 0,
         }
     }
-    /// Evict everything: unlink both guest halves and return the pool. Tables
-    /// the host pre-linked are dropped too; later maps allocate from the pool.
+    /// Evict everything in both spaces: unlink every guest half and return the
+    /// pool. Tables the host pre-linked are dropped too; later maps allocate
+    /// from the pool.
     pub fn reset(&mut self) {
         for (root, indices) in self.halves() {
             for index in indices {
@@ -257,6 +277,7 @@ mod tests {
             ipa: IPA,
             pool_pages,
             upper: true,
+            user: false,
             tlb: Log::default(),
         }
     }
@@ -381,6 +402,50 @@ mod tests {
         // Every shadow is tagged with the owner's ASID.
         s.map(va, 0x4007_0000, false).unwrap();
         assert_eq!(s.descriptor(va), 0x4007_0000 | LEAF | READ_ONLY);
+    }
+
+    #[test]
+    fn user_and_supervisor_spaces_are_separate_and_reset_together() {
+        let mut m = window();
+        let mut s = space(&mut m, POOL_PAGES);
+        s.map(0x10_0000, 0x4007_0000, true).unwrap();
+        s.user = true;
+        // Nothing of the supervisor space shows in the user space, and the reverse.
+        assert_eq!(s.descriptor(0x10_0000), 0);
+        s.map(0x10_0000, 0x4008_0000, false).unwrap();
+        s.map(HIGH_BASE + 0x20_0000, 0x4009_0000, true).unwrap();
+        assert_eq!(s.descriptor(0x10_0000), 0x4008_0000 | LEAF | READ_ONLY);
+        s.user = false;
+        assert_eq!(s.descriptor(0x10_0000), 0x4007_0000 | LEAF);
+        assert_eq!(s.descriptor(HIGH_BASE + 0x20_0000), 0);
+        // One pool: 3 + 3 + 3 tables.
+        assert_eq!(s.used(), 9);
+        // A space's own table pages, roots included, are never targets.
+        for own in [USER_LOWER_ROOT, USER_UPPER_ROOT] {
+            assert_eq!(s.map(0x30_0000, IPA + own as u64, false), Err(Error::Private));
+        }
+        s.unmap(0x10_0000).unwrap();
+        assert_eq!(s.descriptor(0x10_0000), 0);
+        s.user = true;
+        assert_eq!(s.descriptor(0x10_0000), 0x4008_0000 | LEAF | READ_ONLY);
+        s.reset();
+        assert_eq!((s.used(), s.descriptor(0x10_0000), s.descriptor(HIGH_BASE + 0x20_0000)), (0, 0, 0));
+        drop(s);
+        // Both spaces' guest halves are unlinked; the private region index stays.
+        m[USER_LOWER_ROOT / 8 + 256] = 7;
+        let mut s = space(&mut m, POOL_PAGES);
+        s.reset();
+        drop(s);
+        for [lower, upper] in ROOTS {
+            assert!((0..256).all(|i| word(&m, lower + i * 8) == 0));
+            assert!((256..512).all(|i| word(&m, upper + i * 8) == 0));
+        }
+        assert_eq!(word(&m, USER_LOWER_ROOT + 256 * 8), 7);
+        // The host's pre-linked tables belong to the supervisor space: a user root linking one is corrupt.
+        m[USER_LOWER_ROOT / 8] = (IPA + 0x11000) | 3;
+        let mut s = space(&mut m, POOL_PAGES);
+        s.user = true;
+        assert_eq!(s.map(0x1000, 0x4000_0000, true), Err(Error::Corrupt));
     }
 
     #[test]

@@ -6,7 +6,8 @@ import pathlib, subprocess
 for d in sorted(pathlib.Path('/work/jobs').iterdir()):
     debug = 'in_asm,exec,nochain' if (d / 'flow').exists() else 'in_asm'
     step = ['-singlestep'] if (d / 'faults').exists() else []
+    cpu = (d / 'cpu').read_text().strip() if (d / 'cpu').exists() else 'qemu64'    # e.g. qemu64,+bmi1 for the I1 forms
     with open(d / 'qemu.stdout', 'wb') as out:
-        r = subprocess.run(['/qemu', '-cpu', 'qemu64', *step, '-d', debug, '-D', 'qemu.log', 'prog.elf'], cwd=d, stdout=out,
+        r = subprocess.run(['/qemu', '-cpu', cpu, *step, '-d', debug, '-D', 'qemu.log', 'prog.elf'], cwd=d, stdout=out,
                            stderr=open(d / 'qemu.stderr', 'wb'), timeout=60)
     (d / 'rc').write_text(str(r.returncode))

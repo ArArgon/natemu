@@ -13,12 +13,12 @@ never runs guest code.
 
 | Piece | What it does | Where |
 | --- | --- | --- |
-| Compiler (fexc) | Native macOS build of FEX's decoder, IR, optimizer, allocator and emitter. Takes x86 bytes, RIP and CPU context; returns ARM64 code with every guest-memory access site, exits, link points and relocations (code object v4; since E1 the code touches no emulator data: exits by `svc`/a relocated `b`, division by `svc`; since E1b no stop check; since E3 no address guard: a non-canonical access faults in hardware at its site). Cuts a block before any system instruction or unsupported form. One `fexc --serve` child process per vCPU. | `tools/fexc/` (build, patch series, shims), `third_party/FEX` (pinned submodule); binary: `../natemu-raw/fexc-native-20261026-01/series13/obj/fexc` |
+| Compiler (fexc) | Native macOS build of FEX's decoder, IR, optimizer, allocator and emitter. Takes x86 bytes, RIP and CPU context; returns ARM64 code with every guest-memory access site, exits, link points and relocations (code object v4; since E1 the code touches no emulator data: exits by `svc`/a relocated `b`, division by `svc`; since E1b no stop check; since E3 no address guard: a non-canonical access faults in hardware at its site). Cuts a block before any system instruction or unsupported form. One `fexc --serve` child process per vCPU. | `tools/fexc/` (build, patch series, shims), `third_party/FEX` (pinned submodule); binary: `../natemu-raw/fexc-native-20261026-01/series14/obj/fexc` (I1) |
 | Admission | Object validation of each block before it reaches the VM: header, profile, features against the vCPU's ID registers, offsets, sites and their words, relocations, exits and link points, x25/x28 rules, control flow. Since E3 the code-shape check (instruction allowlist, sp, literals, every memory word a site, split/branch-target/#DE check forms) is a debug option (the program driver's `--code-shape`, passed by the test runners except `contain`). | `crates/host/src/admission.rs`, `admission/structure.rs`; format `crates/abi/src/code_object.rs` |
 | Host | VM, GIC and vCPU lifecycle (`vm.rs`), guest RAM and the resident image (`memory.rs`), one thread per vCPU with start barrier, cancellation and join-before-destroy (`owners.rs`), the per-vCPU service loop: compile requests, system-instruction decode, kicks (doorbells), watchdog (`execution.rs`, `system.rs`). | `crates/host/src/` |
-| Resident | Boots each vCPU's private address space, banks x86 state, walks guest page tables (four-level, A/D by compare-exchange), installs owner-private shadows (native stage-1 tables tagged with the vCPU's ASID), places and links blocks, recovers faults precisely, executes system instructions, drains invalidations. | `crates/runtime/src/` (`execution.rs`, `cache.rs`, `tables.rs`, `gates.S`); shared layouts `crates/abi/src/` (`execution.rs`, `paging.rs`, `shadow.rs`, `guest_memory.rs`) |
+| Resident | Boots each vCPU's private address space, banks x86 state, walks guest page tables (four-level, A/D by compare-exchange), installs owner-private shadows (native stage-1 tables, one space per x86 privilege class: supervisor and user, each with its own roots and ASID, two ASIDs per vCPU; the CPL's space is loaded at every entry into generated code, U1), places and links blocks, recovers faults precisely, executes system instructions, drains invalidations. | `crates/runtime/src/` (`execution.rs`, `cache.rs`, `tables.rs`, `gates.S`); shared layouts `crates/abi/src/` (`execution.rs`, `paging.rs`, `shadow.rs`, `guest_memory.rs`) |
 | Code cache, dispatch, linking | Per vCPU: code area (16 MiB default, up to 128 MiB) with a write alias, metadata arena, L1 (4,096 entries by RIP, as code in the code area since E1) and L2 (key = RIP, CR3, CPL, mode and controls). The dispatcher (copied into the code area) branches into L1 from generated code; a miss enters the resident (`svc`), which looks up L2 or requests a compile. Literal exits go to the linker (`svc`) once and are then patched to branch directly. Overflow or any context change flushes the whole cache. | `runtime/src/cache.rs`, `gates.S` (`dispatch_template`); [slice-2 contract](slice2-contract.md) |
-| Precise faults | Every guest-memory access is a registered site. A native abort is matched to its site first (else halt `trapped`, `private_access`, `unknown_abort` or `site_mismatch`); a non-canonical address at a site, the private window included, is #GP/#SS; the resident walks with the access's intent and retries, splits a page-crossing store, or banks the exact pre-instruction state and stops with the guest fault (vector, error, CR2). | `runtime/src/execution.rs` (`aborted`, `access_aborted`, `split`); [slice-1 contract](slice1-contract.md) |
+| Precise faults | Every guest-memory access is a registered site. A native abort is matched to its site first (else halt `trapped`, `private_access`, `unknown_abort` or `site_mismatch`); a non-canonical address at a site, the private window included, is #GP/#SS, except the documented guest-state page (`PRIVATE + 0x24000`, one 4 KiB page per vCPU, EL0 read/write since I1: an access there reaches the vCPU's own guest state; boot-features plan, Built (I1, G1 minimum)); the resident walks with the access's intent and retries, splits a page-crossing store, or banks the exact pre-instruction state and stops with the guest fault (vector, error, CR2). | `runtime/src/execution.rs` (`aborted`, `access_aborted`, `split`); [slice-1 contract](slice1-contract.md) |
 | Precise stop | Since E1b, by doorbell and unlinking, all in the VM: the HVF in-kernel GIC (macOS 15+) gives each vCPU an SPI (host kicks, `hv_gic_set_spi`) and SGI 1 (peers' residents, `ICC_SGI1R_EL1`). Generated code runs with IRQs unmasked; the resident's IRQ handler (`interrupted`) acknowledges, then stops at once when interrupted in the dispatcher, L1 or at a block's first word, else patches every exit of the interrupted block to `brk #6` (`cache::arm`); the block stops at its exit with the exit's exact state (`stopped`), or at its next resident entry; patched words are restored at every resident entry (`cache::disarm`). No host exit; nothing on the hot path. `hv_vcpus_exit` stays the watchdog/cancellation; `hv_vm_protect` is no longer used. | `runtime/src/execution.rs`, `cache.rs`, `gates.S` `irq_gate`; `host/src/vm.rs` (GIC); boot-features plan §5 |
 | System instructions | Host decodes (FEX decoder), resident executes as a transaction: MOV to/from CR0/CR3/CR4 (WP, PGE, SMEP), INVLPG, RDMSR/WRMSR EFER; #UD/#GP per SDM, else commit. Every control change and CR3 load flushes the vCPU's cache and shadows; INVLPG drops its 2 MiB range. | `runtime/src/execution.rs` `system`, `host/src/system.rs`; slice-3 §4 S3c |
 | Cross-vCPU coherence | Global per-page code and writable masks, one invalidation record and a shadow-reset counter per vCPU (atomic RMWs only). A write to a page with code bits posts the page to the holders and kicks them; marking a new code page shoots down peers' writable shadows synchronously; drains at every resident entry and after placing a block (a killed block steps one instruction). Shadows stay per vCPU: x86 TLB semantics, INVLPG/CR3 per vCPU. | `runtime/src/cache.rs`, `abi/src/execution.rs` (`cache`); slice-3 §1 |
@@ -36,8 +36,8 @@ and runtime; contract-by-contract mapping: [contracts.md](contracts.md), "Genera
 | `tools/run_slice1_vm.py` | 64 fixtures and seeded corpora (seed 4242: 44 programs) against pinned QEMU; `--max-block 1` too |
 | `tools/run_slice1_faults.py` | 3,443 precise-fault cases (paging cells, access forms, probes) against QEMU prefix runs |
 | `tools/run_slice2_vm.py`, `run_slice2_faults.py`, `run_slice2_probes.py` | control flow (64 × 3 block sizes), faults inside loops (846 × 3), code-cache/SMC probes (85) |
-| `tools/fexc/upstream_tests/run_asm.py` | FEX's ASM suite (235 admitted tests) |
-| `tools/run_slice3_vm.py MODE` | `corpora`, `smp`, `limits`, `kicks`, `system`, `coherence`, `sharedpt`, `litmus`, `contain` |
+| `tools/fexc/upstream_tests/run_asm.py` | FEX's ASM suite (235 admitted tests; 372 since I1) |
+| `tools/run_slice3_vm.py MODE` | `corpora`, `smp`, `limits`, `kicks`, `system`, `coherence`, `sharedpt`, `litmus`, `contain`, `privilege` (U1) |
 | `tools/check_resident_stack.py` | resident stack bound and gate/ERET binary shape of the built runtime |
 | `tools/models/` | independent ordering, coherence, PAE and modes models (used by the runners) |
 
@@ -47,7 +47,7 @@ the phase-end ones):
 ```sh
 # From the repository root; works in zsh and bash (no word-splitting of variables; run in full under zsh and
 # argument-checked under bash at the phase end).
-F=../natemu-raw/fexc-native-20261026-01/series13/obj/fexc   # tools/fexc/build.sh rebuilds it
+F=../natemu-raw/fexc-native-20261026-01/series14/obj/fexc   # tools/fexc/build.sh rebuilds it
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 O=../natemu-raw/suite-$(date +%Y%m%d-%H%M%S)                  # a fresh output directory
@@ -76,6 +76,7 @@ s3 --out "$O/coherence" coherence --reps 1 --parallel 2
 s3 --out "$O/sharedpt" sharedpt --reps 1 --parallel 2
 s3 --out "$O/litmus" litmus --k 5000 --runs 1 --parallel 2
 s3 --out "$O/contain" contain
+s3 --out "$O/privilege" privilege
 ```
 
 QEMU references run in the pinned container image (`tools/reference/ref.py` holds the pins) or Homebrew
@@ -86,7 +87,7 @@ QEMU references run in the pinned container image (`tools/reference/ref.py` hold
 | Area | Supported | Not supported (refused, never silently wrong) |
 | --- | --- | --- |
 | Mode | 64-bit long mode, CPL 0 and 3 | 32-bit, compatibility, paging off, real mode (owner decision 3); non-flat segments |
-| ISA | Integer, loads/stores 1–8 bytes at any alignment, control flow (incl. `loop`/`jrcxz`, indirect, call/ret), 128/64 division (resident helper), LFENCE/MFENCE/SFENCE, memory XCHG, PAUSE | SSE/AVX/x87, REP string ops, LOCK forms other than XCHG, CMPXCHG8B/16B, split locks, segment-prefixed accesses (`unsupported_form` / `unsupported_atomic`) |
+| ISA | Integer, loads/stores 1–8 bytes at any alignment, control flow (incl. `loop`/`jrcxz`, indirect, call/ret), 128/64 division (resident helper), LFENCE/MFENCE/SFENCE, memory XCHG, PAUSE; since I1 CLC/STC/CMC, CLD/STD (DF in the guest-state page), LAHF/SAHF, PUSHF, ENTER (level 0)/LEAVE, SHLD/SHRD (32/64), CMPXCHG/XADD without LOCK, POPCNT/TZCNT/LZCNT, BMI1/BMI2 but PDEP/PEXT, PREFETCHh, MOVNTI | SSE/AVX/x87, REP string ops, LOCK forms other than XCHG, CMPXCHG8B/16B, split locks, segment-prefixed accesses (`unsupported_form` / `unsupported_atomic`) |
 | System | MOV CR0 (WP), CR3, CR4 (PGE, SMEP), MOV from CR0/CR3/CR4, INVLPG, RDMSR/WRMSR EFER | Everything else: §3 (`unsupported_system`, #GP or #UD per the model) |
 | Paging | Four-level, 4 KiB and 2 MiB pages, WP, NXE, SMEP, A/D per SDM with a declared fault-path policy (leaf A only after the permission check) | 1 GiB pages, PCID, SMAP, LA57, PWT/PCD/PAT memory types (halt), MAXPHYADDR above 40 |
 | vCPUs | 1–4 (`MAX_VCPUS`). N = 0 cannot be described; `execution::prepare` refuses it (unit test); 5 is refused (`limits`) | APIC, IPIs, INIT/SIPI |
@@ -97,13 +98,15 @@ QEMU references run in the pinned container image (`tools/reference/ref.py` hold
 ### ISA coverage measured (October 28, after the phase)
 
 Admission takes about 151 of 256 primary-map slots and about 70 two-byte slots, all integer: roughly 85–90% of the
-legacy integer ISA, under 10% of all x86-64 forms. Refused entirely: SSE/MMX, AVX, x87, BMI/ABM, string and REP, every
-LOCK form but memory XCHG, flag moves (`cld`/`std`/`stc`/`clc`/`lahf`/`sahf`), `shld`/`shrd`, `popcnt`/`lzcnt`/`tzcnt`,
-`cmpxchg`/`xadd`, `enter`/`leave`, `pushf`/`popf`, CPUID, RDTSC.
+legacy integer ISA, under 10% of all x86-64 forms. Refused entirely: SSE/MMX, AVX, x87, string and REP, every LOCK form
+but memory XCHG, `popf`, CPUID, RDTSC. Since I1 (series14) admitted: the flag moves, `lahf`/`sahf`, `pushf`, `enter`
+(level 0)/`leave`, `shld`/`shrd` (32/64), `cmpxchg`/`xadd` without LOCK, `popcnt`/`lzcnt`/`tzcnt`, BMI1/BMI2 but
+`pdep`/`pext`, `prefetch`h, `movnti` (the ISA row above); still refused of these families: `pdep`/`pext`, `prefetchw`,
+`cmpxchg8b`/`16b`, 16-bit `shld`/`shrd`, `enter` with a nesting level, 66-prefixed `pushf`/`enter`/`leave`.
 
 | Measure | Result |
 | --- | --- |
-| FEX ASM suite | 235 / 2,270 pass (10.4%), 0 fail. First refused instruction of the 2,035 unsupported tests: AVX 726, SSE/MMX/AES/SHA 480, x87 401, flag moves 205 (mostly test set-up), LOCK/cmpxchg/xadd 90, system 41, BMI 38, shld/shrd 17, other 37 |
+| FEX ASM suite | 235 / 2,270 pass (10.4%), 0 fail (I1, series14: 372 pass, 0 fail; remaining I1-class refusals: 16-bit shld/shrd 19, cmpxchg8b/16b, popf, o16 enter/leave, enter with a nesting level). First refused instruction of the 2,035 unsupported tests: AVX 726, SSE/MMX/AES/SHA 480, x87 401, flag moves 205 (mostly test set-up), LOCK/cmpxchg/xadd 90, system 41, BMI 38, shld/shrd 17, other 37 |
 | Static share of admitted instructions in macOS x86-64 binaries | bash 97.5%, ls 97.7%, ld 92.3%: the rest is almost all SSE (`movaps`/`movups`/`xorps` from compiler copies and zeroing, scalar SSE float), present in nearly every function, so most real functions fail |
 
 Suggested order for the ISA track: flag moves and small integer forms (cheap), REP strings with partial progress (44),
@@ -133,6 +136,7 @@ cells, OSFXSR/XSAVE), then x87 (FEX's soft-float helpers must run in the residen
 | 32-bit and paging-off modes, compatibility mode, far transfers, descriptor loads, legacy/PAE walking | Deleted; start from [s3g-plan.md](s3g-plan.md) (transaction list S3g1–S3g3); the legacy walker `crates/abi/src/paging32.rs` is in commit 4902ee5; the 32-bit families in `8d529f9` | owner decision 3 |
 | Segment bases and limits, A20, 16-bit code, device/hole resolver | Deleted; build only if the boot path needs them | owner decision 1 |
 | Tearing across 16 bytes inside a line | Documented deviation; a diagnostic may count such stores | owner decision 2 |
+| A guest access to the guest-state page (`PRIVATE + 0x24000`, non-canonical: #GP on x86) | Documented deviation: it reaches the vCPU's own guest state; one 4 KiB page per vCPU, straddles into it fault; the resident reads back only DF | G1 minimum (I1); boot-features plan, Built (I1, G1 minimum) |
 | Kernel not pinned: Debian 6.12.107 (64-bit boot protocol, ACPI-mailbox APs: no 32-bit or paging-off instruction runs with LA57 = 0) or Ubuntu 6.8 (its AP trampoline always goes 64 → compatibility → paging off → PAE/LME/PG → 64, so it needs the 32-bit items and LOCK BTS) | Choose first | s3g-plan.md §1, owner decision 3 |
 | Guest RAM beyond 4 MiB, a loader (bzImage, boot params, initramfs), devices, timer (APIC timer or TSC deadline), console (serial) | None | phase boundary |
 | Host writes to guest RAM (DMA, loader) | Only with every vCPU stopped; each sets FLUSH in every record | slice-3 §1 |

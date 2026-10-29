@@ -173,7 +173,7 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 | **E3** guard off, admission split | Remove patch-0007 guard words and checks; admission = mandatory object validation + optional code-shape debug; negative tests: every former window address and both canonical straddles give #GP/#SS | Faults suite + new negative cells; census | standing suite | 0 guard words; all #GP/#SS exact |
 | **E4** review | Independent review of E1b–E3 as one design | — | standing suite | ACCEPT |
 | **U1** x86 privilege in shadows | E2 shadows carry no x86 U/S (the walker checks at the current CPL; CPL is fixed per run today). Before any CPL transition (X1b delivery from CPL3, S3 SYSCALL/SYSRET, IRETQ to CPL3): keep one shadow space per x86 CPL class (separate ASIDs/roots for CPL0 and CPL3) so a CPL change switches spaces instead of resetting, and a CPL0 shadow can never serve a CPL3 access | Fault matrix at both CPLs across transitions; syscall/IRET round trips that touch supervisor pages before and after | standing suite | no CPL3 access through a CPL0 shadow; no shadow flush per transition |
-| **G1** guest-state page | One EL0 page per vCPU at a fixed non-canonical address holding only FEX guest-state fields (DF, FS/GS, MXCSR, x87, AVX-high); documented deviation (a guest access to that page reaches its own state instead of #GP); the page lies outside the private window `[PRIVATE, PRIVATE+1 GiB)` or is exempted explicitly in `aborted`; invariant test | Layout test; non-#GP limited to that page | standing suite | invariant test fails on any non-guest field |
+| **G1** guest-state page (minimum built in I1; remainder (MXCSR, x87, AVX-high fields) with I5/I6/I8) | One EL0 page per vCPU at a fixed non-canonical address holding only FEX guest-state fields (DF, FS/GS, MXCSR, x87, AVX-high); documented deviation (a guest access to that page reaches its own state instead of #GP); the page lies outside the private window `[PRIVATE, PRIVATE+1 GiB)` or is exempted explicitly in `aborted`; invariant test | Layout test; non-#GP limited to that page | standing suite | invariant test fails on any non-guest field |
 | **K1** code cache across CR3/INVLPG | Blocks filed by guest-physical source pages; CR3/INVLPG drop only shadows; linear→physical revalidation on lookup; per-page invalidation for host/device writes | Address-space switch programs keep translations (counted); remap/rewrite always retranslated; QEMU at 1–4 vCPUs | `system`, `coherence`, `sharedpt` | no full flush on CR3 |
 | **S4** debug: TF and breakpoints | TF/RF single-step, DR0–3/DR7 execute and data breakpoints, #DB delivery, interaction with linking/dispatch (CPU 16 requires it) | QEMU programs; SDM model | standing suite | #DB exact per SDM |
 | **C0** census (after Q2) | Static census of instruction forms admission refuses, over the Debian decompressor, the decompressed vmlinux and the initramfs `/init` binaries, by H §2's static-share method with fexc's classifier | Counts per form and per binary; spot-check against `llvm-objdump` | — | every refused form is listed with its I-chunk or a proposed typed refusal |
@@ -281,8 +281,8 @@ traps arrive at the lower-EL vectors, every other vector is a resident fault tha
 (blocks, slot, dispatcher, L1) is EL1 read-only and EL0 execute-only (never EL1-executable); resident text is
 EL1-executable only; every other private page (State, tables, records, frame page, stacks, guest-RAM alias) is
 EL1-only; shadows are EL0 read/write or read-only. x86 CPL stays in the software walker: a shadow exists only for an
-access granted at the vCPU's CPL, so CPL0 shadows of supervisor pages and CPL3 shadows of user pages map alike (a CPL
-change would have to reset shadows; none exists yet). Isolation is the hardware's: forged system instructions halt
+access granted at the vCPU's CPL, so CPL0 shadows of supervisor pages and CPL3 shadows of user pages map alike
+(superseded by U1: one shadow space per CPL class, switched without a reset). Isolation is the hardware's: forged system instructions halt
 `trapped` (ESR 0x00/0x01/0x18) and loads, stores and branches into the private window `private_access`
 (`contain` EL0_FORGED). The guard stays; a guest access cannot reach the window through it. Steady-state benchmarks
 unchanged. Also: the resident decodes each link point's move at the reply (it must build the point's target). EL0
@@ -308,6 +308,34 @@ holes, poison values, both canonical straddles and RIP-relative accesses into an
 stack, split-store, XCHG and call/ret form, give exact #GP/#SS at block sizes default and 1 (386 cases; the faults
 suite is 3,829 at both). Census: 0 address-guard
 words (series12: 3,735); 19,712 words against 23,866 (-17.4%), same blocks and guest instructions.
+*Built (U1):* each vCPU has two shadow spaces, supervisor (CPL 0-2) and user (CPL 3), with their own roots (window
+0x10000/0x17000 and 0x1c000/0x1d000) and ASIDs (2v + 2, 2v + 3); one table pool. The resident loads the CPL's space
+before every entry into generated code (`tables::select`, TTBR1 walks off while the roots change); CR3 loads, control
+changes, INVLPG, shootdowns, evictions and halts remove from both. Blocks stay keyed by CPL (fetch U/S and SMEP are
+checked at translation). API: `execution::set_cpl(s, cpl)` at a block boundary with the state banked; it changes only
+the CPL and flushes nothing. Callers (X1b delivery, S3 SYSCALL/SYSRET, IRET) still own the rest of the transition: CS/SS
+loads with RPL = CPL, the stack switch (TSS.RSP0/IST, null SS on entry to CPL0), RFLAGS masking, no implicit SWAPGS,
+and every implicit supervisor access (frames, descriptor tables) through the walker, never shadows. Test hook: the
+driver's `switch ADDR 0|3` (system kind `SET_CPL`, never decoded from x86). Check: `run_slice3_vm.py privilege`
+(fault matrix of 40 cases at 1 and 4 vCPUs, INVLPG/CR3 dropping both spaces, SMEP after a CPL3 phase, 10 vs 1,000
+rounds of switches with equal shadow resets and retries; block sizes default and 1). Left to K1: each CPL change
+still clears L1 (it is per code context).
+
+*Built (I1, G1 minimum):* the guest-state page is the vCPU's existing FEX frame page with a second alias: EL0 read/write
+at `PRIVATE + 0x24000` (`execution::GUEST_STATE_VA`, x28 at every block entry), while the EL1-only alias stays at
+`FRAME_VA` (`PRIVATE + 0x23000`, the resident's view; the E3 window probes of that page still give #GP). It is inside the
+window, as the owner's one page per vCPU at a fixed non-canonical address; `aborted` needs no exemption because the page
+is mapped, so an access to it never aborts and `private_access` cannot misfire. Extent: exactly one 4 KiB page per vCPU;
+an access straddling into it from `PRIVATE + 0x23000` or out of it into `PRIVATE + 0x25000` faults (#GP from the site),
+and so does every other window page (`run_slice1_faults.py` window class `guest-state` and its straddles). Deviation: a
+guest access inside the page reaches the vCPU's own guest state instead of #GP. What the resident trusts: it reads back
+only DF (FEX's byte at `frame::DF`, banked in `bank`); TF, IF, IOPL, NT, AC, VIF, VIP and ID bytes (RF, VM as 0) are
+rewritten from the bank at every block entry (`frame::flag_bytes`), so a guest write to them lasts at most to the next
+entry and only `pushf` sees it. Admission lets x28 load the flag bytes and store only DF. Invariants: the abi tests
+`guest_state_page_layout` (fields inside the page, `pushf` image, DF round trip) and the per-run frame check in
+`drivers/program.rs` (`frame_intact`: any nonzero byte outside `frame::GUEST_STATE` fails the run). Open (owner): check
+which kernel paths may be handed arbitrary addresses that could land in `PRIVATE + 0x24000..0x25000` (user-supplied
+pointers before access_ok, probing helpers), where x86 would raise #GP.
 **Owner decision (October 28): MTRRs enabled by the virtual firmware, RAM write-back, device ranges uncached** (plan Q3).
 **Deferred (owner, October 28):** replacing the host's minimal JSON reader (`crates/host/src/json.rs`, used only for
 fexc's per-compile report: end reason and cut opcode) by carrying those fields in the code-object header; no registry

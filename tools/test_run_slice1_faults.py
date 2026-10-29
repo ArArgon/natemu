@@ -59,7 +59,7 @@ class AccessFormTests(unittest.TestCase):
             for where, deltas in F.PLACEMENTS:
                 q, _ = F.relocate(p, [], [], *deltas)
                 regs, rip = dict(zip(ref.REGS, (ref.num(v) for v in q['gpr']))), ref.num(q['rip'])
-                evs = {k: F.events(l, regs, rip + offs[k + 1]) for k, l in enumerate(q['asm']) if '[' in l or l.split()[0] in ('push', 'pop', 'ret')}
+                evs = {k: F.events(l, regs, rip + offs[k + 1]) for k, l in enumerate(q['asm']) if '[' in l or l.split()[0] in F.IMPLICIT_ACCESS}
                 regions = [(ref.num(m['addr']), bytes.fromhex(m['data'])) for m in q['memory']]
                 def read(k):
                     return lambda a, n: next(d[a - b:a - b + n] for b, d in regions if b <= a < b + len(d))

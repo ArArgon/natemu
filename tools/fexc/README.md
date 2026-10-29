@@ -26,10 +26,18 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as twelve commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as thirteen commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series13` (E3, October 28: no address guard; the
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series14` (I1, October 28: the small integer and
+BMI forms. Patch 0013: the decoder records a VEX instruction's map, pp, L and opcode byte (`FEXC_MAP_VEX`, metadata only);
+under slice1, CMPXCHG/XADD with a memory operand and no LOCK are plain read-modify-writes (FEX emits CAS / atomic
+fetch-add otherwise) and LEAVE loads [RBP] before writing RSP and RBP (FEX's pop moved RBP into RSP's register first);
+fexc records LEAVE's load as a stack (SS) access; SHLD/SHRD to memory by an immediate count masking to 0 writes the value
+back (a write-intent read-modify-write like a shift by 0; the pinned QEMU faults W on a read-only page for these too);
+CLD/STD store DF in their own instruction (the per-instruction register-cache flush includes DF). The allowlist (`shim/fexc_slice1.inc`) adds the I1 forms listed under
+"Allowlist". Objects of the 64 fixtures, the seed-4242 corpus and the flow corpus are byte-identical to series13.)
+Kept for comparison: `series13` (E3, October 28: no address guard; the
 patches are series12's, the change is in `shim/fexc_sites.inc` and `shim/fexc_precision.h`: `FexcBeforeOp` emits only the
 split check, the read-modify-write prescan is gone; generated code runs at EL0, where every non-canonical address faults
 in hardware at its site and the runtime raises #GP/#SS; 556 blocks and 4,233 guest instructions on the census corpora
@@ -298,18 +306,23 @@ The scripts that read `fixtures/slice1/programs.json` (git-ignored; `smoke.py`, 
   static or dynamic zero count, which would lose a guest #PF), group 3 inc/dec-style
   ops (test /0, not, neg, mul, imul, div, idiv), fe/ff inc/dec/push, nop, endbr64 (f3 0f 1e fa, a no-op), pause (f3 90 without
   REX.B, FEX's `yield`), xchg (86/87, 90-97; with a memory operand, LOCK prefix allowed, it is FEX's `swpal` at a `swap` site, S3e),
-  cbw/cwde/cdqe and cwd/cdq/cqo. Two-byte map (no mandatory-prefix overlay): nop (0f 1f), cmovcc,
+  cbw/cwde/cdqe and cwd/cdq/cqo; since I1 clc/stc/cmc, cld/std (DF in the guest-state page), lahf/sahf, pushf (no 66),
+  leave (no 66), enter with nesting level 0 (no 66). Two-byte map (no mandatory-prefix overlay): nop (0f 1f), cmovcc,
   setcc, bt/bts/btr/btc (a3/ab/b3/bb, ba /4-7), imul, movzx, movsx, bsf/bsr, bswap; lfence/mfence/sfence (exactly 0f ae e8/f0/f8,
-  no 66/F2/F3: FEX's `dmb ld`/`dmb sy`/`dmb st`). Branches (end the block): jcc rel8/rel32,
+  no 66/F2/F3: FEX's `dmb ld`/`dmb sy`/`dmb st`); since I1 shld/shrd (32/64-bit), cmpxchg/xadd without LOCK,
+  prefetchnta/t0/t1/t2 with a memory operand (0f 18 /0-3, `prfm`, never faults) and movnti m (a plain store). F3 overlay
+  (I1): popcnt, tzcnt, lzcnt (f3 0f b8/bc/bd; the CPU profile advertises POPCNT, BMI1 and LZCNT, and FEX decodes f3 0f
+  bc/bd as TZCNT/LZCNT unconditionally). VEX (I1): andn, bextr, blsi/blsmsk/blsr, bzhi, mulx, rorx, sarx/shlx/shrx with
+  VEX.L = 0 and no 66/REX/F2/F3/LOCK before the VEX prefix. Still cut: pdep/pext (FEX emits a native loop), prefetchw/0f 0d
+  (PREFETCHW not advertised), cmpxchg8b/16b, 16-bit shld/shrd, enter with a nesting level, LOCK forms, popf. Branches (end the block): jcc rel8/rel32,
   jmp rel8/rel32 and near indirect, call rel32/indirect, ret, rep ret (f3 c3), ret imm16. All with no LOCK, REP/REPNE (except
   rep ret, endbr64 and pause; LOCK only on memory xchg), FS/GS override, address-size override, and (branches) no operand-size prefix; 66-prefixed bswap
   (undefined result) is cut.
 - **System class** (reason `system_instruction`): segment push/pop and moves, lss/lfs/lgs, far call/jmp/ret, iret,
-  int/int3/into/icebp, ud2/ud1/ud0, pushf/popf/cli/sti, hlt, port I/O, all of 0f 00 and 0f 01 (descriptor tables, invlpg,
+  int/int3/into/icebp, ud2/ud1/ud0, popf/cli/sti, hlt, port I/O, all of 0f 00 and 0f 01 (descriptor tables, invlpg,
   swapgs, rdtscp, xgetbv, ...), lar/lsl, syscall/sysret/sysenter/sysexit, clts, invd/wbinvd, clflush, mov cr/dr, wrmsr/rdmsr/rdpmc,
   rdtsc, cpuid, rd/wr fs/gs base, vmread/vmwrite, invept/invvpid/invpcid. Everything else outside the allowlist (string ops,
-  LOCK forms but memory xchg, cmpxchg/xadd, x87/SSE/AVX, cld/std, clc/stc, lahf/sahf, loop/jrcxz with a 67 prefix, shld/shrd,
-  tzcnt/popcnt, prefetch, leave/enter, ...) is `unsupported_form`.
+  LOCK forms but memory xchg, x87/SSE/AVX, loop/jrcxz with a 67 prefix, the I1 refusals above, ...) is `unsupported_form`.
 
 ### Native control flow inside one guest instruction
 `scan_skips.py` (and a test in `test_slice1.py`) looks, in the emitted code, for a forward branch inside one guest
