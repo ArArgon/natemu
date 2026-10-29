@@ -16,7 +16,7 @@
     tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR sharedpt [--programs SUBSTR,...] [--reps R]
         [--cpus 2 4] [--parallel P]
     tools/with-env python3 tools/run_slice3_vm.py --fexc FEXC --out DIR contain [--cpus-contain 1 2 3 4] [--watchdog-ms MS] [--compile-deadline-ms MS]
-        [--spin-iterations I] [--no-progress] [--reps R]
+        [--spin-iterations I] [--no-progress] [--reps R] [--kill-reps R]
 
 `corpora`: the single-vCPU corpora — the slice-1 fixtures, the control-flow corpus (default: the S2d run's
 programs and QEMU results under NATEMU_RAW_ROOT/s2d/corpus) and the slice-1 fault cases (QEMU prefix references, as
@@ -106,8 +106,9 @@ shootdown (`--ignore-kicks` on vCPU k = 1..3 of 4: its doorbells are disabled an
 stops or drains, while a host kicker rings it every millisecond, unheard: its kicks issued, its doorbell pending, no IRQ
 taken): vCPU 0, waiting in the resident for k's shadow reset, is stopped by its
 watchdog, reported `resident` with k's `SHADOWS` request still pending; k is cancelled; an untampered control matches QEMU
-with a shootdown. (3) vCPU k's compile server (k = 1..3 of 4) killed before its 51st request: exit 1, stderr names the
-vCPU, the server and its signal; the same server stopped instead (SIGSTOP: alive, never answering): the request deadline
+with a shootdown. (3) vCPU k's compile server (k = 1..3 of 4) killed before its 51st request: exit 1 within 2 s, stderr
+names the vCPU, the server and its signal (`--kill-reps R`: each case R times, a stress check); the same server stopped
+instead (SIGSTOP: alive, never answering): the request deadline
 (`--compile-deadline-ms`, 2 s here, driver default 30 s) kills it, exit 1, stderr names the vCPU, the server and
 "no reply within". (5) A guest loop that never ends on vCPU v of 4 is stopped by the watchdog (`guest`)
 while the others reach their ends and match; a guest that legitimately spins past a tight budget is a `guest` watchdog
@@ -822,6 +823,7 @@ def cmd_sharedpt(a, host, runtime):
 CODE_SHAPE = vm.CODE_SHAPE
 LOOP = 'rip 0x100000\nbody 0x100000 ebfe\n'          # jmp $: a linked loop with no exit, in its own space
 TEARDOWN = 'teardown: vcpus {n} joined {n} destroyed {n} vm_destroy 0 children none'
+KILL_BOUND = 2                                        # seconds a compile-server-kill run may take (normally ~0.05)
 SLACK = 5                                             # seconds a contain run may outlive its bound before it is killed
 
 
@@ -1002,15 +1004,17 @@ def cmd_contain(a, host, runtime):
         print(f"{label}: {'ok' if not diffs else 'FAIL ' + '; '.join(diffs)[:300]} {stops and stops[0]} ({secs:.2f} s)", flush=True)
         failures += [f'{label}: {d}' for d in diffs]
 
-    # 3: vCPU k's compile server dies mid-run (killed before its 51st request): the run fails naming the cause.
-    for k in (1, 2, 3):
-        label = f'compiler-v{k}'
+    # 3: vCPU k's compile server dies mid-run (killed before its 51st request): the run fails at once (KILL_BOUND, far
+    # below the peers' watchdogs) naming the cause; `--kill-reps R` repeats each case (a fresh process after the first only).
+    for k, rep in ((k, rep) for k in (1, 2, 3) for rep in range(a.kill_reps)):
+        label = f'compiler-v{k}' + (f'-r{rep}' if rep else '')
         text = ''.join('cpu\n' + (chain_section() if w == k else LOOP) for w in range(4))
         rc, out, err, secs = run(label, text, ['1', '--kill-compiler', 50, '--tamper-vcpu', k], 10)
         diffs = [] if rc == 1 and out is None else [f'driver exit {rc}, want 1']
         if f'owner {k}: fexc --serve (pid' not in err or 'signal: 9' not in err: diffs.append(f'cause not named: {err.strip()[-300:]}')
-        diffs += teardown(4, err) + ([f'took {secs:.1f} s'] if secs > 10 else [])
-        diffs += fresh(4, label)
+        diffs += teardown(4, err) + ([f'took {secs:.1f} s (bound {KILL_BOUND} s)'] if secs > KILL_BOUND else [])
+        diffs += fresh(4, label) if not rep else []
+        if rep and not diffs: continue
         report['compiler'].append({'label': label, 'stderr': err.strip()[-600:], 'seconds': round(secs, 2), 'diffs': diffs})
         print(f"{label}: {'ok' if not diffs else 'FAIL ' + '; '.join(diffs)[:300]} ({secs:.2f} s)", flush=True)
         failures += [f'{label}: {d}' for d in diffs]
@@ -1102,6 +1106,7 @@ def main():
     ap.add_argument('--compile-deadline-ms', type=int, default=2000, help='contain: the compile deadline of the stalled-server runs')
     ap.add_argument('--spin-iterations', type=int, default=1_500_000_000, help='contain: the legitimate spin delay loop')
     ap.add_argument('--no-progress', action='store_true', help='contain: skip the coherence progress programs')
+    ap.add_argument('--kill-reps', type=int, default=1, help='contain: runs of each compile-server-kill case (stress)')
     a = ap.parse_args()
     if a.mode == 'sharedpt' and '--cpus' not in sys.argv: a.cpus = [2, 4]
     a.out.mkdir(parents=True, exist_ok=True)

@@ -352,6 +352,12 @@ struct Server {
 }
 impl Server {
     fn start(fexc: &Path) -> Result<Self> {
+        // One spawn at a time in the process. On macOS, std makes a child's pipes with `pipe` and only then marks them
+        // close-on-exec, so a server spawned by another owner in between inherits this one's pipe end: a server holding
+        // a killed sibling's stdout hides its death (no EOF) until the holder exits, and the request waits for its
+        // deadline or the peers' watchdogs (seen with `lsof` in the compile-server-kill runs).
+        static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _spawn = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
         let mut child = Command::new(fexc)
             .arg("--serve")
             .stdin(Stdio::piped())
