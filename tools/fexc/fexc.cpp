@@ -347,6 +347,7 @@ static void CutJson(Json& j) {
   if (fexc_cut.reason != FEXC_CUT_DECODER && fexc_cut.reason != FEXC_CUT_STRING) j.kv("cut_opcode_map", int(fexc_cut.map)).kv("cut_opcode", int(fexc_cut.opcode)).kv("cut_fex_name", fexc_cut.name);
   if (fexc_cut.gated_mmx) j.kv("cut_gated", "mmx");
   else if (fexc_cut.gated) j.kv("cut_gated", true);
+  if (fexc_cut.ud) j.kv("cut_ud", true);
   j.end_obj();
 }
 

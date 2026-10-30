@@ -1229,13 +1229,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         // The profile has no performance counters (CPUID.0AH = 0): every ECX names an invalid counter (SDM Vol.2 RDPMC).
         system::RDPMC => return Err(GP),
         system::INVLPG => {
-            let base = match i.base {
-                system::RIP => c.rip.wrapping_add(u64::from(i.length)),
-                system::NO_REG => 0,
-                r => gpr(r),
-            };
-            let index = if i.index == system::NO_REG { 0 } else { gpr(i.index) << i.scale };
-            let address = base.wrapping_add(index).wrapping_add(i.disp as u64);
+            let address = segments::address(&c, &i); // INVLPG drops segment overrides (system::decode)
             // A non-canonical address invalidates nothing.
             if paging::canonical(address) {
                 let t0 = ticks();

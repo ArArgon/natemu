@@ -102,6 +102,18 @@ left: EVEX/AVX-512, VAES/VPCLMULQDQ at 256/512 bits, GFNI, VNNI: not advertised;
 `system`; left: 1,435 0x67 address-size forms, XOP 144, CET RDSSP/INCSSP 41, RTM 9, PadLock 4, a few others), admitted +15,895,
 system 5,601 -> 8,266. The census itself: the earlier "MMX 1,381" counted SHA (1,297) and MOVBE (68) under the MMX note (one
 classifier branch); the MMX forms proper were 16.
+
+**I10 re-check (October 30).** `census.py` ports the I10 shim change (fexc series34: 0x67 admitted everywhere but on BT* m, r,
+strings included; XLAT admitted; the CET hint space 0f 1e admitted as NOPs; `system` (#UD, fexc's `cut_ud`): XOP and 8f /1../7,
+EVEX, RTM XBEGIN/XABORT and group 11 /1../6, PadLock 0f a6/a7, 3DNow!, invalid-in-64-bit opcodes, group 4/5/8 reserved members,
+VEX forms the profile does not define and reserved VEX L/W/vvvv/operand kinds (scalar LIG forms with VEX.L = 1 stay refused),
+the MMX/SSE shift groups' reserved encodings, F3 MOVBE, INCSSP). Rerun into `natemu-raw/kernel-census-i10-20261030-01/` (`x`
+linked to the C0 data; report in its `report/`). Kernel: AVX 11 -> 0 (EVEX `vpermi2d` 2, `vprord` 8, AMX `tilerelease` 1: #UD),
+system 16,803 -> 16,815 (with the review round's `tpause` 1: WAITPKG not advertised, #UD); left: `prefetchw` 17. Initramfs: other 1,650 -> 15 (0x67
+1,435 admitted: `leal` 1,196, `addr32 callq` 181, the register forms; XOP 144, INCSSP 28, RTM 9, PadLock 4 #UD; RDSSP 13 and
+XLAT 1 admitted; left `pushq` 11, `xorl` 2, `subb` 2, none I10's), BMI 6 -> 0 (`addr32 mulx`), AVX 218,126 -> 10 (EVEX 205,405 and
+unadvertised VEX 12,715 #UD; left: the 10 VEX gathers, owner decision), admitted 4,702,372 -> 4,703,831, system 8,266 -> 226,564.
+Masked stores (MASKMOVQ, MASKMOVDQU, VMASKMOV/VPMASKMOV, owner decision: refused): 0 sites in kernel and initramfs.
 Files here: `extract.py`, `census.py`, `report.py`, `results.md` (every table, generated), `forms-kernel.tsv` (every refused
 form of the decompressor and vmlinux, one row per mnemonic + operand shape, first-use order). The same for the
 initramfs is `RAW/forms-initrd.tsv`; `RAW/census.json` holds every row.

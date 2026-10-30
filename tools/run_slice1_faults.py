@@ -549,7 +549,7 @@ def sse(op, keys): return dict(keys, insn={'op': op, 'sse': True})
 STRADDLE_FETCH = [
     ('0f', [], '{disp32} jne {next}', 0, JNE), ('0f85', [], '{disp32} jne {next}', 0, JNE), ('0f8500', [], '{disp32} jne {next}', 0, JNE),
     ('0f', ['nop'], '{disp32} jne {next}', 0, JNE), ('0f3a', [], 'palignr mm0, mm1, 8', 0, sse('palignr', SSSE3)),
-    ('660f3a', [], 'palignr xmm0, xmm1, 8', 0, sse('palignr', SSSE3)), ('0f0f', [], 'pfadd mm0, mm1', 1, sse('pfadd', {})),
+    ('660f3a', [], 'palignr xmm0, xmm1, 8', 0, sse('palignr', SSSE3)), ('0f0f', [], 'pfadd mm0, mm1', 0, sse('pfadd', {'expect': (6, 0, 0)})),
     ('0fc7', [], 'cmpxchg8b qword ptr [rbx]', 0, {}), ('660f', [], 'movdqa xmm0, xmm1', 0, sse('movdqa', SSE)),
     ('f30f', [], 'popcnt eax, ecx', 0, POPCNT), ('c4', [], 'andn eax, ecx, eax', 0, POPCNT), ('c4e2', [], 'andn eax, ecx, eax', 0, POPCNT),
     # I8: AVX forms, here without CR4.OSXSAVE (QEMU's qemu64: no AVX): #UD at the instruction once it is fetched.
@@ -560,13 +560,15 @@ STRADDLE_FETCH = [
     ('8f', [], 'pop qword ptr [rbx]', 0, {}), ('e8', [], 'call {next}', 0, {}), ('66f30f', [], 'popcnt ax, cx', 0, POPCNT),
     ('f048', [], 'lock add qword ptr [rbx], rcx', 0, {}), ('3e488b', [], 'mov rax, qword ptr ds:[rbx]', 0, {}),
     ('0f01', [], 'xgetbv', 0, sse('xgetbv', {'expect': (6, 0, 0)})),       # without CR4.OSXSAVE (QEMU's qemu64: no XSAVE): #UD
-    ('62', [], 'vaddps zmm0, zmm0, zmm0', 2, sse('vaddps', {}))]
+    # I10: 3DNow! and EVEX are not advertised: #UD once fetched (fexc waits for EVEX's prefix, opcode and ModRM, so the absent
+    # page is #PF first, as for every other form).
+    ('62', [], 'vaddps zmm0, zmm0, zmm0', 0, sse('vaddps', {'expect': (6, 0, 0)}))]
 
 def straddle_probes():
     """Each STRADDLE_FETCH instruction with its first bytes the last of page 0x100000: with the next page present it
     runs as one instruction (the QEMU full run; a refused form stops `unsupported_form` at its RIP); with it not present,
     #PF at 0x101000 with RIP at the instruction (SDM: the fetch fault comes before its decode), whatever the bytes before
-    the page end decode to. EVEX (62) is refused before its fetch completes, the next page present or not."""
+    the page end decode to (I10: EVEX and 3DNow! included, #UD once fetched)."""
     out = []
     for head, lead, line, refused, keys in STRADDLE_FETCH:
         k = len(PRELUDE) + len(lead)

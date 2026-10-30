@@ -17,8 +17,8 @@ instruction's exception table; Vol.3 6.15):
   - #PF with CR2 = the first faulting byte's page in address order (a 32-byte access crossing into a not-present or
     read-only second page: CR2 = that page), error P | W | U;
   - refusals (typed, before any effect): VMASKMOV/VPMASKMOV (FEX's element loop), the gathers, VCVTPS2PH to memory (its
-    conversion's MXCSR flags would be committed before a faulting store); an encoding x86 makes #UD is refused under the
-    gating too; VLDMXCSR/VSTMXCSR run LDMXCSR/STMXCSR's transaction under the AVX gating;
+    conversion's MXCSR flags would be committed before a faulting store); an encoding x86 makes #UD is #UD under the
+    gating too (I10: delivered); VLDMXCSR/VSTMXCSR run LDMXCSR/STMXCSR's transaction under the AVX gating;
   - the YMM upper halves exact at a fault right after register-only vector instructions (they stay cached there);
   - HADD/HSUB with two QNaNs: the SDM's operand order (HADD high element first) with the first-source rule.
 At a fault: RIP the instruction, and the general registers, XMM, the YMM upper halves, MXCSR and the data region exactly as
@@ -187,14 +187,14 @@ def cases():
                                    ('vhaddps-y', 'vhaddps ymm1, ymm1, ymm1', nan4, [sb | sb << 32] * 4), ('vhsubps-x', 'vhsubps xmm1, xmm1, xmm1', nan4, [sa | sa << 32] * 2 + [0, 0])]:
         out.append(case(f'nan2-{name}', insn, [f'memory {D + 0x400:#x} {data}'], ['reg', 1, want], ymmh=False,
                         prelude=[f'vmovdqu ymm1, ymmword ptr [{D + 0x400}]']))
-    # I8 review: an encoding x86 makes #UD stays an encoding refusal under the gating too (not #NM): VPGATHERDD with a register
+    # I8 review: an encoding x86 makes #UD stays an encoding #UD under the gating too (not #NM; I10: delivered, was refused): VPGATHERDD with a register
     # operand (the reviewer's c4e27d90c1), VAESENC with VEX.L = 1 (VAES not advertised), under TS and without OSXSAVE.
     # (I8 re-review: a gather without a SIB byte, and one whose destination and mask are the same register, likewise.)
     for tag, b in [('gather-reg', '0xc4, 0xe2, 0x7d, 0x90, 0xc1'), ('vaesenc-l1', '0xc4, 0xe2, 0x7d, 0xdc, 0xc2'),
                    ('gather-nosib', '0xc4, 0xe2, 0x7d, 0x90, 0x00'), ('gather-same-dst-mask', '0xc4, 0xe2, 0x7d, 0x90, 0x04, 0x0f'),
                    ('gather-same-dst-index', '0xc4, 0xe2, 0x6d, 0x90, 0x0c, 0x08')]:
-        out.append(case(f'ts-invalid-{tag}', f'.byte {b}', [], ['nocode', 'unsupported_form'], prelude=ts, cpl=0))
-        out.append(case(f'noosxsave-invalid-{tag}', f'.byte {b}', [], ['nocode', 'unsupported_form'], xcr0=0))
+        out.append(case(f'ts-invalid-{tag}', f'.byte {b}', [], UD, prelude=ts, cpl=0))
+        out.append(case(f'noosxsave-invalid-{tag}', f'.byte {b}', [], UD, xcr0=0))
     # VLDMXCSR/VSTMXCSR (I8 review): the LDMXCSR/STMXCSR transaction under the AVX gating (not CR0.EM/CR4.OSFXSR).
     out.append(case('vldmxcsr-ok', f'vldmxcsr dword ptr [{D + 0x400}]', [f'memory {D + 0x400:#x} 805f0000'], ['mxcsr', 0x5f80]))
     out.append(case('vstmxcsr-ok', f'vstmxcsr dword ptr [{D + 0x400}]', [], ['mem', D + 0x400, '801f0000']))

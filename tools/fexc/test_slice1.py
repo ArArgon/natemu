@@ -52,39 +52,49 @@ SYSTEM = {
 
 # name -> hex. Decodable instructions that are not slice-1 forms, and admitted opcodes with an excluded prefix or operand.
 UNSUPPORTED = {
-    'rep xchg r8,rax (not pause)': 'f34190', 'o16 mfence': '660faef0',
-    'lfence modrm e9': '0faee9', 'rep mfence': 'f30faef0',
+    'rep xchg r8,rax (not pause)': 'f34190',
+    'lfence modrm e9': '0faee9',
     # I3: LOCK with a REP prefix (XACQUIRE/XRELEASE without HLE), an operand-size prefix on cmpxchg8b/16b (no SDM meaning)
     'rep lock add [rax],rcx': 'f3f0480108', 'repne lock xadd [rax],ecx': 'f2f00fc108', 'o16 cmpxchg8b': '660fc708',
-    # I2: string forms outside the allowlist (REPNE only on cmps/scas, never with REP; no 0x67; FS/GS and SS rules)
-    'repne movsb': 'f2a4', 'repne stosq': 'f248ab', 'rep repne cmpsb': 'f3f2a6', 'addr32 rep movsb': '67f3a4', 'addr32 lodsb': '67ac',
+    # I2: string forms outside the allowlist (REPNE only on cmps/scas, never with REP; FS/GS and SS rules)
+    'repne movsb': 'f2a4', 'repne stosq': 'f248ab', 'rep repne cmpsb': 'f3f2a6',
     'fs stosb (ES:RDI only)': '64aa', 'gs rep scasq': '65f348af', 'ss lodsb': '36ac', 'fs gs movsb': '6465a4',
-    'mov eax,[eax] (addr32)': '678b00',
+    # I10: 0x67 on BT/BTS/BTR/BTC m, r (no SDM rule for the register's offset with a 32-bit address); SS on xlat
+    'addr32 bt [eax],ecx': '670fa308', 'addr32 bts [eax],rcx': '67480fab08', 'ss xlat': '36d7',
     # I7: an FS/GS override with nothing to override, or with a second segment prefix (no SDM rule; FEX and QEMU differ)
     'fs mov rax,rcx': '644889c8', 'gs push rax': '6550', 'gs ret': '65c3', 'fs leave': '64c9', 'gs pushf': '659c', 'fs jmp rel8': '64eb00',
     'fs cs mov rax,[rax]': '642e488b00', 'ds gs mov rax,[rax]': '3e65488b00', 'fs gs mov rax,[rax]': '6465488b00', 'fs fs mov [rax],rcx': '6464894808',
-    'fs addr32 mov rax,[eax]': '6467488b00',
     # Intel's class since series27; still cut: SS with CS/DS/ES (mixed classes), SS on a moffs operand
     'ss ds mov rax,[rbx] (mixed)': '363e488b03', 'ss movabs rax,[moffs]': '3648a10102030405060708',
-    'maskmovq (I9: a masked store)': '0ff7c1', 'psllq mm /3 (#UD, refused)': '0f73d801', 'pi2fd (3DNow!)': '0f0fc10d', 'maskmovdqu': '660ff7c1', 'f3 66 movss': 'f3660f10c1',
+    'maskmovq (I9: a masked store)': '0ff7c1', 'maskmovdqu': '660ff7c1', 'f3 66 movss': 'f3660f10c1',
     'insertps m32 zeroing its element': '660f3a21000f',
-    # I8: AVX forms FEX cannot do exactly, VEX encodings x86 makes #UD (refused, not delivered), unadvertised VEX forms
+    # I8: AVX forms FEX cannot do exactly (I10: the encodings x86 makes #UD are in UD)
     'vpgatherdd': 'c4e26d90040f', 'vmaskmovps ld': 'c4e2752c00', 'vmaskmovps st': 'c4e2752e08', 'vmaskmovdqu': 'c5f9f7ca',
-'vcvtps2ph m': 'c4e37d1d3004', 'vaesenc L=1 (VAES)': 'c4e275dcc2', 'vpclmulqdq L=1': 'c4e37544c200', 'vpcmpistri L=1 (#UD)': 'c4e37d63c112',
-    'vmovd L=1 (#UD)': 'c5fd6ec6', 'vaddss L=1 (LIG)': 'c5f658c2', 'vpermq L=0 (#UD)': 'c4e3f900c11b', 'vpermq W0 (#UD)': 'c4e37d00c11b',
-    'vmovaps vvvv (#UD)': 'c5f428c1', 'vpdpbusd (VNNI)': 'c4e27950e1', 'addr32 vmovdqu': '67c5fe6f00',
+    'vcvtps2ph m': 'c4e37d1d3004', 'vaddss L=1 (LIG)': 'c5f658c2',
     'vinsertps m32 zeroing its element': 'c4e37921001f',
     'o16 pushf': '669c', 'o16 leave': '66c9', 'enter level 1': 'c8080001', 'o16 shld': '660fa4c101', 'o16 shrd cl': '660fadc1',
     'prefetchw': '0f0d08', 'prefetch /4 (reserved nop)': '0f1820', 'prefetch reg (reserved nop)': '0f18c0', 'movnti reg': '0fc3c1',
-    'andn L=1': 'c4e27cf2c1', 'blsr /0 (#UD)': 'c4e278f3c1',
     'rep popcnt-like f2 0f b8': 'f20fb8c1',
-    'loop 67-prefix': '67e2fe', 'jecxz': '67e3fe', 'loop o16': '66e2fe', 
-    'xlat': 'd7', 'f3 movbe (undefined)': 'f30f38f000', 'sal /6 alias': 'd1f0',
+    'loop o16': '66e2fe', 'sal /6 alias': 'd1f0',
     'bnd ret': 'f2c3', 'o16 ret': '66c3', 'o16 jmp': '66e9fbffffff', 'bswap r9w (undefined)': '66410fc9', 'bswap ax': '660fc8',
     # FEX branches around the whole access for a zero count (static or dynamic), losing a guest #PF
     'rcl dword [rax],1': 'd110', 'rcr qword [rax],cl': '48d318', 'rcr qword [rax],0': '48c11800', 'rcl byte [rax],cl': 'd210',
     'rcr word [rax],5': '66c11805', 'rcl dword [rax],cl': 'd310', 'rcr dword [rax+rcx*4+8],cl': 'd35c8808', 'rcl byte [rax],32': 'c01020',
     'rcr [rax],imm (c1, rex.w)': '48c11805',
+}
+
+# I10: encodings the presented CPU raises #UD for, reserved or not advertised: a system cut with `cut_ud` (the host's UD).
+UD = {
+    'psllq mm /3': '0f73d801', 'psrlw mm, m (mmx shift, memory)': '0f7110', 'pi2fd (3DNow!)': '0f0fc10d',
+    'vaesenc L=1 (VAES)': 'c4e275dcc2', 'vpclmulqdq L=1': 'c4e37544c200', 'vpcmpistri L=1': 'c4e37d63c112', 'vmovd L=1': 'c5fd6ec6',
+    'vpermq L=0': 'c4e3f900c11b', 'vpermq W0': 'c4e37d00c11b', 'vmovaps vvvv': 'c5f428c1', 'vpdpbusd (VNNI)': 'c4e27950e1',
+    'andn L=1': 'c4e27cf2c1', 'blsr /0': 'c4e278f3c1', 'vmovhlps L=1': 'c5fc12c1', 'f3 movbe': 'f30f38f000', 'f3 movbe store': 'f30f38f108',
+    'vprotd (XOP)': '8fe878c2c005', 'pop /1 (reserved)': '8fc8', 'evex vpxord': '62f17d48efc0', 'xbegin (RTM)': 'c7f800000000',
+    'xabort (RTM)': 'c6f805', 'mov /1 (reserved)': 'c708', 'xstorerng (PadLock)': '0fa7c0', 'rep xcryptecb (PadLock)': 'f30fa7c8',
+    'montmul (PadLock)': 'f30fa6c0', 'incsspq': 'f3480faee8', 'incsspd': 'f30faee8', 'daa': '27', 'pusha': '60', 'aam': 'd40a',
+    'group 1 82': '82c001', 'fe /2': 'fed0', 'ff /7': 'fff8', 'bt group /0': '0fba0001',
+    # WAITPKG (not advertised): 66/F3/F2 0f ae /6 register (the earlier `o16 mfence`/`rep mfence` refusals are these)
+    'tpause eax': '660faef0', 'umonitor rax': 'f30faef0', 'umwait ecx': 'f20faef1', 'tpause rex': '66410faef3',
 }
 
 # One instruction each, all inside the allowlist; every one must translate completely.
@@ -93,7 +103,7 @@ UNSUPPORTED = {
 LOCK_UD = {
     'lock xchg rax,rcx': 'f04887c1', 'lock add rax,rcx': 'f04801c8', 'lock mov [rax],rcx': 'f0488908', 'lock cmp [rax],1': 'f048833801',
     'lock bt [rax],1': 'f0480fba2001', 'lock nop': 'f090', 'lock movsb': 'f0a4', 'lock andn': 'f0c4e278f2c1', 'lock inc rax': 'f048ffc0',
-    'lock cmpxchg rcx,rdx': 'f0480fb1d1', 'lock lea rax,[rax]': 'f0488d00', 'lock movaps': 'f00f2800',
+    'lock cmpxchg rcx,rdx': 'f0480fb1d1', 'lock lea rax,[rax]': 'f0488d00', 'lock movaps': 'f00f2800', 'lock endbr64': 'f0f30f1efa',
 }
 
 # I8: a 66, F2 or F3 prefix before VEX, or a REX right before it, is #UD whatever the instruction (a system cut, the host's vex_ud).
@@ -101,6 +111,14 @@ VEX_UD = {'rex andn': '48c4e278f2c1', 'o16 andn': '66c4e278f2c1', 'o16 vzerouppe
           'f2 vpbroadcastb': 'f2c4e27d78ff'}
 
 ALLOWED = {
+    # I10: 0x67 (32-bit addresses), XLAT, the CET hint space 0f 1e as NOPs (ENDBR, RDSSP)
+    'mov eax,[eax] (addr32)': '678b00', 'fs addr32 mov rax,[eax]': '6467488b00', 'addr32 lodsb': '67ac', 'addr32 vmovdqu': '67c5fe6f00',
+    'addr32 lea rax,[eax+ebx*4+8]': '67488d449808', 'addr32 mov eax,[eip+8]': '678b0508000000', 'addr32 movabs eax,[moffs32]': '67a144332211',
+    'addr32 lock add [esi],eax': '67f00106', 'addr32 fld dword [eax]': '67d900', 'addr32 movups xmm0,[eax]': '670f1000',
+    'addr32 bt [eax],5': '670fba2005', 'addr32 crc32 eax,dword [eax]': '67f20f38f100', 'addr32 mulx': '67c4e2f3f6c0',
+    'xlat': 'd7', 'addr32 xlat': '67d7', 'gs xlat': '65d7', 'ds xlat': '3ed7',
+    'endbr64': 'f30f1efa', 'endbr32': 'f30f1efb', 'rdsspq rax': 'f3480f1ec8', 'rdsspd eax': 'f30f1ec8', 'nop 0f 1e [rax]': '0f1e00',
+    'o16 0f 1e': '660f1ec0', 'f2 0f 1e [rax+0x100]': 'f20f1e8000010000',
     # I9: MOVBE m, MMX, AES-NI/PCLMULQDQ (legacy and VEX.128), PDEP/PEXT, FFREEP
     'movbe eax,[rax]': '0f38f000', 'movbe [rax],rcx': '480f38f108', 'movbe ax,[rax]': '660f38f000', 'paddd mm0,mm1': '0ffec1',
     'paddb mm0,[rax]': '0ffc00', 'punpcklbw mm1,[rax]': '0f6008', 'movq mm0,rax': '480f6ec0', 'movd [rax],mm1': '0f7e08', 'emms': '0f77',
@@ -178,13 +196,17 @@ LOCK_NEGS = {'lock neg [rax]': 'f0f718', 'lock neg byte [rax+8]': 'f0f65808', 'l
 
 # I2: REP/REPE/REPNE string instructions end their block (they exit to their own RIP until RCX is 0).
 REPS = {'rep movsb': 'f3a4', 'rep movsq': 'f348a5', 'rep stosq': 'f348ab', 'rep stosb': 'f3aa', 'rep lodsw': '66f3ad', 'repe cmpsb': 'f3a6',
-        'repne cmpsd': 'f2a7', 'repe scasq': 'f348af', 'repne scasb': 'f2ae', 'fs rep movsq': '64f348a5', 'gs repe cmpsb': '65f3a6'}
+        'repne cmpsd': 'f2a7', 'repe scasq': 'f348af', 'repne scasb': 'f2ae', 'fs rep movsq': '64f348a5', 'gs repe cmpsb': '65f3a6',
+        'addr32 rep movsb': '67f3a4', 'addr32 rep stosq': '67f348ab', 'addr32 repne scasb': '67f2ae', 'fs addr32 rep movsd': '6467f3a5'}
 
 # (name, hex, translated-instruction count): control transfers end the block with their normal exit.
 BRANCHES = {
     'jmp rel8': 'eb05', 'jmp rel32': 'e905000000', 'jne rel8': '7505', 'je rel32': '0f8405000000', 'call rel32': 'e805000000',
     'ds jne rel8 (hint, ignored)': '3e7505', 'gs jmp [rax+8]': '65ff6008', 'fs call [rip+0x10]': '64ff1510000000',
     'loop rel8': 'e205', 'loope rel8': 'e105', 'loopne rel8': 'e005', 'jrcxz rel8': 'e305',
+    # I10: 0x67: ECX for LOOP/JECXZ, ignored by direct branches (a relaxed `addr32 call`), the memory operand's address
+    'addr32 loop': '67e205', 'jecxz': '67e305', 'addr32 call rel32': '67e805000000', 'addr32 jmp rel8': '67eb05', 'addr32 jne rel32': '670f8505000000',
+    'addr32 call [eax]': '67ff10', 'addr32 jmp [eip+8]': '67ff2508000000', 'addr32 ret': '67c3',
     'ret': 'c3', 'rep ret': 'f3c3', 'ret 8': 'c20800', 'jmp rax': 'ffe0', 'call rax': 'ffd0', 'jmp [rax]': 'ff20', 'call [rax]': 'ff10',
 }
 
@@ -243,12 +265,37 @@ class Slice1Cutting(unittest.TestCase):
         # I8 review: an encoding x86 makes #UD (VPGATHERDD with a register operand, VAESENC with VEX.L = 1) is refused under
         # the AVX gating too, never a gated cut (#NM under TS would be wrong); a valid refused form is gated.
         # (I8 re-review: VPGATHERDD without a SIB byte, or with two of destination, mask and index the same register: #UD too.)
+        # I10: those encodings are delivered #UD (`cut_ud`), still never gated.
         for hexs, gated in (('c4e27d90c1', False), ('c4e27ddcc2', False), ('c4e27d9000', False), ('c4e27d90040f', False),
                             ('c4e26d900c08', False), ('c4e26d901410', False), ('c4e26d900408', True), ('c4e279dcc2', True)):
             with self.subTest(hexs):
                 d, _ = run(hexs + '90', RIP, '--avx-gated')
                 e = d['guest']['end']
-                self.assertEqual((e['reason'], e.get('cut_gated', False)), ('system_instruction', True) if gated else ('unsupported_form', False))
+                self.assertEqual((e['reason'], e.get('cut_gated', False), e.get('cut_ud', False)),
+                                 ('system_instruction', True, False) if gated else ('system_instruction', False, True))
+
+    def test_reserved_and_unadvertised_forms_are_ud(self):
+        for name, x in UD.items():
+            for extra in ((), ('--avx-gated',), ('--x87-gated',), ('--sse-gated',)):
+                with self.subTest(name, extra=extra):
+                    d, rc = run(PRE + x + PRE, RIP, *extra)
+                    g = d['guest']
+                    self.assertEqual((g['instructions_translated'], g['end']['reason']), (2, 'system_instruction'), name)
+                    d, rc = run(x + PRE, RIP, *extra)   # at the block's RIP: no code, the cut the host answers
+                    e = d['guest']['end']
+                    self.assertEqual((d['status'], e['reason'], e.get('cut_ud'), e.get('cut_gated')), ('no_code', 'system_instruction', True, None), name)
+
+    def test_ud_encodings_are_fetched_first(self):
+        # I10 review: an undecoded #UD encoding cut at the end of the supplied bytes before its last byte (ModRM, SIB,
+        # displacement, immediate) is partial_decode (the host fetches on: a fetch fault comes first); over 15 bytes, too long.
+        for hexs, want in (('c4e27850', 'partial_decode'), ('c4e27850c0', 'system_instruction'), ('f30f38f0', 'partial_decode'),
+                           ('8fe878c2c0', 'partial_decode'), ('8fe878c2c005', 'system_instruction'), ('62f17d48ef', 'partial_decode'),
+                           ('62f17d48efc0', 'system_instruction'), ('2e' * 9 + '62f17d48efc0', 'system_instruction'),
+                           ('2e' * 10 + '62f17d48efc0', 'instruction_too_long'), ('2e' * 9 + '8fe878c2c005', 'system_instruction'), ('2e' * 10 + '8fe878c2c005', 'instruction_too_long'),
+                           ('27', 'system_instruction')):
+            with self.subTest(hexs):
+                d, _ = run(hexs)
+                self.assertEqual(d['guest']['end']['reason'], want)
 
     def test_vldmxcsr_is_a_system_cut(self):
         for hexs in ('c5f8ae10', 'c5f8ae18', 'c4c178ae5c2408'):
@@ -510,7 +557,8 @@ class Slice1Exits(unittest.TestCase):
                     d, rc = run(PRE + x)
                     self.assertEqual(rc, 0)
                     n, _ = check_exits(self, d, tmp, name)
-                    self.assertEqual(n, 2 if name in ('jne rel8', 'ds jne rel8 (hint, ignored)', 'je rel32', 'loop rel8', 'loope rel8', 'loopne rel8', 'jrcxz rel8') else 1, name)   # taken and fall-through gates
+                    self.assertEqual(n, 2 if name in ('jne rel8', 'ds jne rel8 (hint, ignored)', 'je rel32', 'loop rel8', 'loope rel8', 'loopne rel8', 'jrcxz rel8',
+                                                     'addr32 loop', 'jecxz', 'addr32 jne rel32') else 1, name)   # taken and fall-through gates
             for name, x in (('fall off the window', PRE), ('cut before cr3 write', PRE + SYSTEM['mov cr3,rax'])):
                 with self.subTest(name):
                     d, rc = run(x)

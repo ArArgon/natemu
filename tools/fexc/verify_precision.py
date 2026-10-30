@@ -17,7 +17,8 @@ For every compile, from the disassembly, the sites, the dense PC table and the s
       data_regs; a writeback base (push/pop on RSP) is allowed, the access itself is its only write;
   P4  at most one store-class site (store, store_pair, push) per guest instruction, and it is the instruction's last site;
       no fused pair sites; every site says completed_effects=none;
-  P5  no site can be skipped by a forward branch inside its instruction (scan_skips.skips), but the `cbz x7` (RCX = 0) of a
+  P5  no site can be skipped by a forward branch inside its instruction (scan_skips.skips), but the `cbz x7` (RCX = 0; `cbz w7`,
+      ECX = 0, with 0x67) of a
       REP string instruction to that instruction's end (the next PC entry or its literal exit), which accesses nothing (I2);
   P6  for annotated programs (`insns`, the generator's flag annotations): for each site and each arithmetic flag, the last
       earlier instruction of the block that writes the flag, if it defines it (tools/reference/flags.py rules; an
@@ -742,7 +743,8 @@ def verify(d, tmp, insns=None):
         if stores and stores[-1]['native_offset'] != max(s['native_offset'] for s in ss):
             out.append(f'guest +{g}: the store site +{stores[-1]["native_offset"]} is not the last access of the instruction')
     out += code_vs_sites(d['sites'], dis)   # P7, code half, on every compile: no unrecorded or misdescribed access
-    # P5 (I2): a REP string instruction with RCX = 0 accesses nothing (SDM REP): its `cbz` on RCX's register (x7) to the
+    # P5 (I2): a REP string instruction with RCX = 0 accesses nothing (SDM REP): its `cbz` on RCX's register (x7; I10: `cbz w7`,
+    # ECX, with 0x67) to the
     # instruction's end (the next instruction's PC entry, or the literal exit to its RIP) is x86, not a lost access.
     rip = int(d['input']['rip'], 16)
     ends = {}
@@ -751,7 +753,7 @@ def verify(d, tmp, insns=None):
             nxt = i['offset'] + i['size']
             ends[i['offset']] = {e['native_offset'] for e in d['pc_table']['entries'] if e['guest_offset'] == nxt} | \
                 {r['offset'] for r in d['code']['relocations'] if r['kind'] == 'guest_rip_move' and int(r['guest_rip'], 16) == rip + nxt}
-    out += [f'skippable site: {s}' for s in scan_skips.skips(d, tmp) if not (s[4].startswith('cbz x7,') and s[2] in ends.get(s[0], ()))]
+    out += [f'skippable site: {s}' for s in scan_skips.skips(d, tmp) if not (s[4].startswith(('cbz x7,', 'cbz w7,')) and s[2] in ends.get(s[0], ()))]
     if insns:
         out += stale_flags(d, insns, dis, order)
         out += df_stores(d, insns, dis, order)

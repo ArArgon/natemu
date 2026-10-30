@@ -1171,7 +1171,8 @@ pub mod system {
     pub const OUT: u32 = 0x61;
     pub const INS: u32 = 0x62;
     pub const OUTS: u32 = 0x63;
-    /// [`super::System::prefixes`] bits.
+    /// [`super::System::prefixes`] bits. I10: [`ADDRESS32`] on any memory operand (0x67): the effective address is truncated
+    /// to 32 bits and zero-extended before the FS/GS base.
     pub const REP: u32 = 1;
     pub const ADDRESS32: u32 = 2;
     impl super::System {
@@ -1189,7 +1190,7 @@ pub mod system {
             let rm = if self.memory == 1 { address } else { self.memory == 0 && reg(self.reg) && self.segment == 0 };
             (1..=15).contains(&self.length)
                 && self.lock <= 1
-                && (self.prefixes == 0 || matches!(self.kind, INS | OUTS))
+                && (self.prefixes == 0 || matches!(self.kind, INS | OUTS) || (self.memory == 1 && self.prefixes == ADDRESS32))
                 && match self.kind {
                     MOV_TO_CR | MOV_FROM_CR | MOV_TO_DR | MOV_FROM_DR => reg(self.cr) && reg(self.reg),
                     INVLPG => address && self.segment == 0,

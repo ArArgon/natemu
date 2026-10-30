@@ -209,6 +209,7 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 | **I6b** x87 helper forms without a helper library | Research (Oct 29, read-only): no general in-VM helper library (needs an EL0 stack page and an EL0 rodata page, helper code outside admission, IRQ/stop handling inside helpers; pays off only for full 80-bit mode, which the owner did not choose). Instead: FSIN/FCOS/FSINCOS/FPTAN/FPATAN/F2XM1/FYL2X/FYL2XP1/FSCALE/FPREM/FPREM1 by `svc` to the resident (division precedent), computed with the toolchain's compiler_builtins libm, with x87's C2 out-of-range rule and FPREM's quotient bits and partial remainder (FEX has neither); PCMPISTRI/PCMPESTRI (I5c) the same way, porting FEX's pure C++; FLD/FSTP m80 cost goes with K2, then inline conversion in fexc only if still hot (one 10-byte crossing check before the first store) | x87 corpus extended with these forms; SDM C2/quotient-bit cases; census | ASM, faults | refused forms executed or refused with reason |
 | **I8** AVX/AVX2 (if Q3 keeps them) | YMM ops | FEX ASM VEX tests | ASM | as I5a |
 | **I9** remaining advertised forms | MOVBE, MMX (x87 aliasing decided), AES-NI/PCLMULQDQ, PDEP/PEXT, FFREEP; #UD for unadvertised ADX/SHA | QEMU corpus; fault matrix with the x87/MMX state; FEX ASM; census | ASM, faults | every advertised form executed or refused with reason |
+| **I10** remaining architectural refusals (owner, October 30) | 0x67 address size in 64-bit mode (every memory form, strings, LOOP/JECXZ, moffs, EIP-relative, XLAT); XLAT; #UD for unadvertised/reserved encodings (XOP, RTM, PadLock, reserved VEX/MMX, F3 MOVBE...); CET hint space as NOPs; gathers/masked stores stay refused | QEMU corpus at both block sizes; fault/#UD/NOP case matrix by the SDM; FEX ASM; census; Debian boot | standing suite | every 0x67 form exact with exact fault sites; every listed #UD delivered |
 | **R1a** single-vCPU composites (~1 run) | Decompressor entry; kernel head (`head_64.S:37-405`); early #PF table building; `int3_selftest`; alternatives/static-call patching through a second mapping under another CR3; syscall round trip with PTI CR3 switch and VERW; timer tick into `sti; hlt`; serial write with IRQ4 | QEMU system mode with the same programs | all | each matches at block sizes default/1 |
 | **R1b** SMP composites (~1 run) | Mailbox AP start into the head; `text_poke_bp` + IPI `sync_core`; paranoid NMI with `lsl`; IPIs under load | QEMU at N = 2..4 | all | each matches at N = 2..4 |
 | **R2** phase-end audit | Contract inventory (44, 49, 51, SSE parts of 1/2/5, LOCK parts of 43); stack audit; integration handoff page | Independent review of the whole path | all | §4 holds |
@@ -2652,6 +2653,121 @@ the old l3 coverage condition aside), fault suites spot-checked on the review-fi
 caching user-space code independent of its RIP (objects carry RIP literals; about 1 M of the initrd boot's 1.14 M
 compiles); translating fall-through successors ahead of use, which the calibration windows need; the in-memory cache
 still clears wholesale at 65,536 entries; eviction is oldest-written, not least-used.
+
+*Built (I10, the remaining architectural refusals of the gap audit (owner decisions of October 30): 0x67 address size, XLAT, #UD
+for reserved and unadvertised encodings, the CET hint space; fexc series34 = series33 + patch 0025 + shim changes; independent
+review: nothing blocking, its fixes and the WAITPKG addendum in series36, below):* **0x67 (SDM Vol.1 3.3.7, Vol.3 4.5.1).** In 64-bit mode the address size becomes 32 bits: the effective address
+is computed, truncated to 32 bits and zero-extended, then the FS/GS base is added. FEX already does exactly this for every
+ModRM/SIB/moffs operand (`DecodeAddress` sets `AddrSize` 32; `LoadEffectiveAddress` adds base, displacement and scaled index
+in 64 bits, then `Bfe` 32, then the segment base; `SelectAddressMode` folds nothing when the sizes differ), RIP-relative
+included (RIP + disp, then truncated: EIP-relative), moffs with a 4-byte offset, LEA (the truncated address zero-extended into
+a 64-bit destination, the low 16 into a 16-bit one), JECXZ (ECX) and the stack's own accesses (RSP whatever 0x67), so the
+shim's refusal (since I1) is lifted for every admitted form: loads, stores, read-modify-writes, LOCK forms, XCHG, CMPXCHG8B/16B,
+PUSH/POP m, indirect CALL/JMP m, SSE, AVX (VEX forms after 0x67), MMX, x87, MOVBE, CRC32, BMI (`addr32 mulx`). The native
+access uses the truncated register, so every site's recorded address (`site_address`), #PF CR2, the canonical check (never
+#GP for a garbage upper half; FS.base + EA non-canonical is #GP(0)), the split-store and alignment checks and #AC are the
+x86 linear address with no runtime change; admission needs no new site rule (the address register is the access's own), and
+direct branches ignore 0x67 (`branch_target` skips it: Linux/glibc linkers relax `call *f@GOTPCREL(%rip)` to `addr32 call
+f`, libcrypt 181 sites). **Patch 0025** fixes what FEX got wrong: the one-element string pass (`FexcStringOp`) uses ESI/EDI/ECX
+(read zero-extended, each update written zero-extended, the count test `cbz w7`, verify_precision's P5 exemption extended);
+LOOP/LOOPcc with 0x67 writes ECX zero-extended (FEX inserted 32 bits and kept RCX[63:32]; QEMU and Bochs zero-extend, as any
+32-bit register write); XLAT adds AL to RBX (EBX + AL truncated with 0x67) before the FS/GS base (FEX added the base to RBX
+first). Host-decoded memory forms (descriptor tables, MOV Sreg m, LAR/LSL/VERR/VERW, INVLPG, CLFLUSH, LDMXCSR/STMXCSR,
+VLDMXCSR/VSTMXCSR, x87 FLDCW/FLDENV/FNSTENV/FRSTOR/FNSAVE/FLD m80/FSTP m80, FXSAVE/XSAVE family, far pointers, BT* under alignment
+checking) take 0x67 as `System::prefixes` `ADDRESS32` (`well_formed` allows it on a memory operand) and `segments::address`
+truncates before the segment base (INVLPG uses it now too); I/O strings had it since L3. M3 completion records are made with
+0x67 too (the device address is the site's). Still refused (`unsupported_form`): BT/BTS/BTR/BTC m, r with 0x67 (the SDM gives
+no rule for how the register's byte offset combines with a 32-bit effective address: FEX adds it after the truncation, QEMU
+before; 0 census sites).
+**XLAT/XLATB** (d7): AL = [seg: (RBX + zero-extended AL)], DS default, CS/DS/ES and FS/GS prefixes, EBX + AL with 0x67; an SS
+prefix is refused (no site class for a non-ModRM operand, as moffs); a non-canonical RBX + AL is #GP(0).
+**#UD for reserved and unadvertised encodings** (owner: architecture, not a choice). The shim's verdict `Ud` is a system cut
+with `cut_ud` in the reply; the host answers `system::UD` (length 1, nothing decoded), and it comes before any gating (decode
+faults are priority 7 before #NM, SDM Vol.3 Table 6-2; an invalid VEX encoding under CR0.TS is #UD, not #NM). Delivered: 8f
+/1../7 (AMD's XOP, map_select >= 8, is not advertised; Intel's group 1A has /0 only), EVEX (62; AVX-512 not advertised; the slice-1
+straddle probes `straddle-62-*` and `straddle-0f0f-*` now expect #UD with the next page present, #PF with it absent), RTM
+XBEGIN/XABORT (c7/c6 f8: "#UD If CPUID.7.0:EBX.RTM[11] = 0") and group 11 /1../6, XTEST/XEND (S3 already), VIA PadLock (0f
+a6/a7, reserved in Intel's map), 3DNow! (0f 0f, CPUID.80000001H:EDX[31] = 0), DAA/DAS/AAA/AAS/PUSHA/POPA/AAM/AAD/82 ("#UD If in
+64-bit mode"), group 4 /2../7, group 5 /7, group 8 /0../3 (reserved), the VEX encodings I8 refused (deviation 1: VEX.L, VEX.W,
+reserved VEX.vvvv, register/memory operand kind, gathers without VSIB or with repeated registers; every VEX opcode the
+advertised AVX/AVX2/FMA/F16C/BMI1/BMI2/AES/PCLMULQDQ do not define, including those FEX does not decode: AVX-VNNI, VAES and
+VPCLMULQDQ at 256 bits, GFNI, AVX-512 mask forms, AMX), the MMX/SSE shift groups' reserved encodings (I9 deviation 3; 0f 71..73
+other than /2 /4 /6 register, 66 0f 73 /3 /7), NP 0f 38/0f 3a opcodes that are no MMX form, SSE/MMX operand kinds x86 makes #UD,
+F3 MOVBE (SDM MOVBE "#UD ... If REP (F3H) prefix is used"). Kept refused, the SDM giving no #UD: scalar LIG VEX forms with VEX.L
+= 1 (hardware ignores L), a REX before VEX with another prefix between, the shift-group /6 (SAL) and TEST /1 aliases, the
+undocumented x87 aliases, F2/F3 on the MMX shift groups (blank columns), 66 0f a6/a7 (FEX's 66 overlay map), PREFETCHW and the
+0f 18 /4../7 and 0f 19..1d hint NOPs (NOPs, not #UD), MASKMOVQ,
+MASKMOVDQU, VMASKMOV/VPMASKMOV and the VEX gathers (owner decision (2)).
+**CET** (CPUID.7.0:ECX.CET_SS = EDX.CET_IBT = 0, so CR4.CET stays 0). The 0f 1e space runs as a NOP with any 66/F2/F3 and ModRM
+(no access, so an unmapped or non-canonical operand does not fault; LOCK is #UD): ENDBR32/ENDBR64 ("a NOP on processors that do
+not support CET"), RDSSPD/RDSSPQ ("a NOP when CET shadow stacks are not enabled and on processors that do not support CET", its
+destination unchanged; glibc and libgcc zero the register first and skip the shadow-stack code on 0). **INCSSPD/INCSSPQ is not
+a NOP:** the SDM's INCSSP raises "#UD If CR4.CET = 0" (Operation: `IF (CR4.CET & IA32_U_CET.SH_STK_EN) = 0 THEN #UD`), so
+natemu delivers #UD (the owner's note of October 30 called it a NOP; libgcc reaches it only after a nonzero RDSSP, which cannot
+happen here), as SAVEPREVSSP (f3 0f 01 ea), RSTORSSP (f3 0f 01 /5 m), SETSSBSY, CLRSSBSY, WRSS/WRUSS.
+**Census** (`natemu-raw/kernel-census-i10-20261030-01`, `census.py` ports the shim): kernel AVX 11 -> 0 (EVEX `vpermi2d` 2,
+`vprord` 8, AMX `tilerelease` 1: #UD), system 16,803 -> 16,814; initramfs other 1,650 -> 15 (0x67 1,435 admitted: `leal` 1,196,
+`addr32 callq` 181, register forms; XOP 144, INCSSP 28, RTM 9, PadLock 4 #UD; RDSSP 13, XLAT 1 admitted; left `pushq` 11, `xorl` 2,
+`subb` 2, not I10's), BMI 6 -> 0, AVX 218,126 -> 10 (EVEX 205,405 and unadvertised VEX 12,715 #UD), admitted +1,459, system 8,266
+-> 226,564. Gathers: the 10 VEX ones in `libmvec.so.1` (`vgatherqpd` 6, `vgatherdpd` 4) stay refused, the 34 EVEX ones are #UD;
+masked stores: 0 sites in kernel and initramfs.
+**Checks** (series34, a copy of f8f3fa2 with these changes): `tools/reference/gen_i10.py` corpus against QEMU 7.2
+(`natemu-raw/i10-corpus-20261030-01`, 88 programs: 40 EA programs of 14 0x67 accesses each, every base and index register loaded
+with a random upper half and the low halves chosen so base + index * scale + disp wraps past 4 GiB into the data region (loads,
+stores, RMW, LOCK, XCHG, MOVZX/MOVSX, CMP, BT m,imm, LEA 16/32/64, PUSH/POP m, SSE, AVX, x87), FS-based with FS.base above and
+below 0; 16 EIP-relative/moffs32/XLAT (with and without 0x67, FS)/addr32 call/jmp; 24 strings with 0x67 at every width, REP/REPE/
+REPNE, both directions, RSI/RDI/RCX with garbage upper halves; 8 LOOP/LOOPE/LOOPNE and not-taken JECXZ with garbage RCX):
+88/88 at block sizes default and 1 (series33: 88 refused). `tools/run_i10_faults.py` (SDM rules, the run cut before the
+instruction as the reference, `i8`'s harness): 21 forms (loads, stores, RMW, LOCK, XCHG, CMPXCHG16B, PUSH m, SSE, AVX 32-byte, x87,
+BT m,imm, MOVBE, and the host-decoded FLDCW/LDMXCSR) each through a garbage upper half (runs; #PF not present/read-only with CR2
+the truncated address), a 4 GiB wrap with base + disp and with SIB, a truncation to 0xFFFFF000 (#PF there, not #GP), a 64-bit
+non-canonical base that runs, a page crossing (CR2 the second page; the first page read-only), FS.base + EA non-canonical
+(#GP(0)) and FS.base below 0; EIP-relative wrap (#PF at 0xfffxxxxx), moffs32 load/store, XLAT 32 and its truncation, XLAT 64
+non-canonical #GP, INVLPG/FXSAVE with 0x67, #AC at CPL 3 by the truncated address (REP MOVSD too), BT* m, r refused, REP MOVSB
+and REP STOSQ (DF = 1) faulting midway (RSI/RDI/RCX zero-extended), LODSD/REP STOSB zero-extension, ECX = 0 with RCX's upper half
+set (no element, nothing written), LOOP and JECXZ on ECX, addr32 call's return address, LEA zero-extension and 16-bit LEA, 38
+#UD forms, #UD before #NM under CR0.TS, 7 CET hint NOPs (RDSSP's destination kept; no access through an unmapped or
+non-canonical operand), and M3 device loads/stores through a garbage upper half and a 4 GiB wrap: 272/272 at both block sizes
+(series33: 241 of the 269 non-device cases not as expected; with patch 0025's zero-extensions undone: the 5 LOOP/REP register cases fail, and 32 of the
+88 corpus programs). `test_slice1.py` 33 (new: `UD` 34 forms at the RIP with `cut_ud` and under every gating, the 0x67/XLAT/CET
+forms in `ALLOWED`, `REPS` and `BRANCHES`, BT* m, r and SS XLAT in `UNSUPPORTED`; I8's invalid-encoding test now expects
+`cut_ud`); host `system` tests (ADDRESS32 on LGDT/MOV Sreg/FLDCW/LDMXCSR/FXSAVE/INVLPG; SAVEPREVSSP, SETSSBSY, RSTORSSP #UD);
+admission `branch_target` (addr32 call/jecxz). FEX ASM suite: 1,847 -> 1,864 pass, 0 fail, 48 precision deviations,
+375 -> 358 unsupported (the 39 tests that now get #UD for an unadvertised form, 3DNow!, VAES/VPCLMULQDQ ymm and AVX-VNNI, are
+counted unsupported by name, as ADX/SHA since I9). Standing suite in the copy (`natemu-raw/suite-i10-20261030`; one retry on
+`hv_vm_create` 0xfae94007 for l4b, whose first QEMU S5 reference then did not power off, green on rerun): cargo test (50 + 79),
+stack audit, python unit 277, `test_slice1.py` 33, fix/fix-1 64, seed/seed-1 44, slice-1 faults/faults-1 7,833 (was 7,830 + 3
+unsupported: the 3DNow!/EVEX straddles now #UD present, #PF absent), flow 64, loopfaults 846, probes 83, slice-3 corpora 7,034/7,035/
+7,036 at N = 2..4, smp, limits, kicks, system, coherence, sharedpt, litmus, contain, privilege, delivery, events, i6 faults 275 x 2,
+`run_m3.py`, `run_l1.py`, `run_l2.py`, `run_l2_iasl.py`, `run_k2.py`, `run_x3.py`, `run_x4.py`, `run_k1.py`, `run_m1.py` 20, `run_l3.py`,
+`run_l4a.py`, `run_l4b.py`, `run_i5b.py` 411, I8 corpora 136 x 2 and 329/336 x 2 (the 7 recorded QEMU two-NaN departures), i8 faults
+851 x 2 (the 10 `*-invalid-*` cases now expect #UD under TS and without OSXSAVE), I6b corpus 112 x 2 and cases 129 x 2, I9 corpus
+120 x 2, `--big` 5 x 2, I9 faults 586 x 2, I10 corpus 88 x 2 and cases 272 x 2: 0 failures.
+*I10 review round and addendum (October 30; fexc series36 = series34's patches with patch 0025's comment fixed + shim
+changes):* **Fetch before #UD (review 1, 3).** A #UD encoding FEX does not decode (it stops at the byte it does not know: EVEX,
+an unknown VEX opcode, XOP, F3 MOVBE, the reserved primary/0f members) is #UD only once the whole instruction is fetched
+(`FexcUdLength`: prefixes, opcode bytes, ModRM, SIB, displacement and the immediate its map or opcode has; the opcodes invalid
+in 64-bit mode by their opcode byte): with fewer bytes fexc answers `partial_decode` (the host fetches on, a not-present page
+is #PF first: SDM Vol.3 Table 6-2), and one over 15 bytes is `instruction_too_long` (#GP(0)), as every other instruction.
+**WAITPKG (addendum).** TPAUSE/UMONITOR/UMWAIT (66/F3/F2 0f ae /6 register; "#UD If CPUID.7.0:ECX.WAITPKG[bit 5] = 0") are #UD
+(the earlier `o16 mfence`/`rep mfence` refusals were these; NP 0f ae f0 stays MFENCE); census: the kernel's `tpause` 1 #UD.
+**INVLPG with 0x67 (review 2):** `run_k1.py remap-invlpg-a32`: the PTE changed, `invlpg [eax]` with RAX's upper half garbage,
+the next call runs the new frame, vs QEMU at 1-4 vCPUs and both block sizes; with the runtime's truncation removed it fails
+(`r9: 0x1 != 0x2`). Checks (series36): `run_i10_faults.py` 296/296 at both block sizes (new: 10 `fetch-*` cases, an undecoded VEX/F3 MOVBE/XOP/EVEX form cut at a
+page end, #PF with the next page absent and #UD present; 8 `length-*` cases at 15 and 16 bytes, #UD and #GP(0); the WAITPKG
+forms and TPAUSE under CR0.TS; series34: 11 of them fail); `test_slice1.py` 34 (new: fetch-first and length
+cut reasons; the WAITPKG forms in `UD`); `run_k1.py` all programs at 1-4 vCPUs, both block sizes; FEX ASM 1,864 pass, 0 fail,
+48 precision deviations, 358 unsupported; slice-1 faults/faults-1 7,833; I10 corpus 88; i8 faults 851; i9 faults 586.
+**Kernel** (Debian 6.12, 2 GiB, N = 1, `console=ttyS0 earlyprintk=serial mitigations=off nokaslr --initrd` Debian's initrd, series34,
+compile cache cold for the new fexc): "Run /init as init process" at 7.5 s guest time, syslogd/klogd, the installer's screen
+session and its first dialog "[!!] Select a language" after 75 s host time (341 serial lines; then ended by the script).
+Serial log: `natemu-raw/i10-kernel-20261030-01/serial.txt`.
+**Deviations** (I10): none new. Resolved: I8 deviation 1 and the 0x67 part of 6, I9 deviation 3; I2's 0x67 refusal.
+**Not built (remaining, with reasons):** BT* m, r with 0x67 (no SDM rule); the refusals the SDM gives no #UD for (above);
+a `cut_ud` mid-block is reported only when the RIP reaches the
+instruction (the cut at its own RIP is what the host answers, as for every system cut); the crypt() path through libcrypt's
+`addr32 call` was not run (no static x86-64 toolchain here to build a test program into the initrd; the installer's password step
+needs input).
 
 *Built (S4, debug: single-step, INT1, instruction breakpoints, DR6/DR7; no fexc change, series32):* **Single-step.**
 `find` reads TF at every instruction start; under TF the instruction runs alone (X2's step: a one-instruction block in

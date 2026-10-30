@@ -26,10 +26,23 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as twenty-four commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as twenty-five commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series33` (October 30, P3: series32's patches with
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series36` (October 30, I10 review: series34's patches,
+patch 0025's FexcStringOp comment fixed, and shim changes: an undecoded #UD encoding is fetched whole first (`FexcUdLength`;
+`partial_decode` when its bytes run past the input, `instruction_too_long` over 15 bytes), TPAUSE/UMONITOR/UMWAIT #UD (WAITPKG
+not advertised). Boot-features plan, Built (I10) review round.) Before it, series34 (October 30, I10: series33 plus patch 0025
+and shim changes. Patch 0025: under slice1 the one-element string pass uses ESI/EDI/ECX with 0x67 (read zero-extended, each
+update written zero-extended, the count test `cbz w7`); LOOP/LOOPcc with 0x67 writes ECX zero-extended into RCX (FEX kept
+RCX[63:32]); XLAT computes RBX + AL (EBX + AL truncated with 0x67) before the FS/GS base (FEX added the base first). Shim: the
+0x67 refusal is gone (FEX's `LoadEffectiveAddress` truncates and zero-extends the 32-bit address before the segment base, RIP-
+relative included; 4-byte moffs; JECXZ on ECX; direct branches ignore it); BT/BTS/BTR/BTC m, r with 0x67 stay refused; XLAT is
+admitted; encodings the presented CPU raises #UD for (reserved or unadvertised: XOP and 8f /1../7, EVEX, RTM XBEGIN/XABORT and
+group 11 /1../6, PadLock 0f a6/a7, 3DNow!, invalid-in-64-bit opcodes, group 4/5/8 reserved members, the reserved VEX L/W/vvvv/
+operand-kind encodings and VEX forms FEX does not decode, the MMX/SSE shift groups' reserved encodings, F3 MOVBE, INCSSP) are
+system cuts with `cut_ud` (the host answers `system::UD`, no decode), before any gating; 0f 1e /r (ENDBR, RDSSP, the CET hint
+space) is a NOP. Boot-features plan, Built (I10).) Before it, series33 (October 30, P3: series32's patches with
 `fexc.cpp` and shim changes, no patch change: the compile server runs requests in process and reports what each compile read,
 see "Compile server" below; the host needs series33's reply format). Before it, series32 (October 30, I9: series31 plus patch 0024
 and shim changes. Patch 0024 (all under slice1): every MMX instruction sets TOP = 0 and the abridged tag byte FFH at its end,
@@ -147,7 +160,7 @@ the instruction's own RIP (REPE/REPNE whose ZF ends the repetition branch forwar
 links that exit to the block starting at the REP and its unlinking stop patches it, so a stop, an interrupt window or a
 fault is always between elements with RCX/RSI/RDI and RIP exact, and the block has no backward branch. The shim ends the
 block after a REP string instruction (`FEXC_CUT_STRING`, reason `block_ending_instruction`: one REP and at most three link
-points per block) and admits the five opcodes (REP on all, REPE/REPNE on cmps/scas; REP with REPNE and 0x67 cut, and by
+points per block) and admits the five opcodes (REP on all, REPE/REPNE on cmps/scas; REP with REPNE cut (I10: 0x67 admitted), and by
 policy, not by an x86 rule, F2 on movs/stos/lods (hardware repeats as with REP; the SDM calls it reserved); FS/GS and the
 null prefixes only on the DS:RSI source of movs/cmps/lods, never SS there; FS/GS on stos/scas, which hardware ignores, is
 cut by policy); a MOVS's load and
@@ -489,11 +502,11 @@ The scripts that read `fixtures/slice1/programs.json` (git-ignored; `smoke.py`, 
   atomic each (LOCK NEG: one compare-and-swap per pass, ending its block); cmpxchg8b/16b (0f c7 /1 m) with or without LOCK,
   not with 66/F2/F3; F2/F3 with LOCK cut. Strings (I2):
   movs/cmps/stos/lods/scas (a4-a7, aa-af) at every width, alone or with REP (all five) and REPE/REPNE (cmps/scas); a REP
-  form ends its block; cut: REP with REPNE, 0x67, SS on the source, and by policy (hardware repeats or ignores them) REPNE on
+  form ends its block (I10: with 0x67, ESI/EDI/ECX); cut: REP with REPNE, SS on the source, and by policy (hardware repeats or ignores them) REPNE on
   movs/stos/lods and FS/GS on stos/scas.
   Branches (end the block): jcc rel8/rel32,
   jmp rel8/rel32 and near indirect, call rel32/indirect, ret, rep ret (f3 c3), ret imm16. All with no LOCK, REP/REPNE (except
-  rep ret, endbr64, pause and the strings; LOCK only on the lockable forms), address-size override, and (branches) no operand-size prefix; FS/GS
+  rep ret, the 0f 1e NOPs, pause and the strings; LOCK only on the lockable forms; I10: 0x67 admitted but on BT* m, r), and (branches) no operand-size prefix; FS/GS
   overrides only on an explicit memory operand and alone, CS/DS/ES/SS only naming the default segment (I7); 66-prefixed bswap
   (undefined result) is cut.
 - **System class** (reason `system_instruction`): segment push/pop and moves, lss/lfs/lgs, far call/jmp/ret, iret,

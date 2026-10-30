@@ -609,10 +609,11 @@ impl Reply {
 }
 
 /// What fexc answered (errors are not kept): an object, or no code with its end reason and, when the instruction at the RIP
-/// cut the block, its opcode map and opcode and whether its gating cut it (`Some(mmx)`: an MMX form).
+/// cut the block, its opcode map and opcode and whether its gating cut it (`Some(mmx)`: an MMX form), or (`ud`, I10) whether
+/// fexc found an encoding the presented CPU raises #UD for (reserved or unadvertised: `cut_ud`).
 enum Answer {
     Object(Vec<u8>),
-    Cut { reason: String, cut: Option<(u8, u8)>, gated: Option<bool> },
+    Cut { reason: String, cut: Option<(u8, u8)>, gated: Option<bool>, ud: bool },
 }
 impl Answer {
     fn new(reply: Reply, rip: u64) -> Result<Self> {
@@ -621,8 +622,10 @@ impl Answer {
         }
         let json = crate::json::parse(&String::from_utf8_lossy(&reply.json))?;
         let reason = end_reason(&json).ok_or("fexc report without guest.end.reason")?.to_string();
-        let gated = json.get("guest").and_then(|g| g.get("end")).and_then(|e| e.get("cut_gated")).map(|v| v.as_str() == Some("mmx"));
-        Ok(Answer::Cut { reason, cut: system_cut(&json, rip), gated })
+        let end = json.get("guest").and_then(|g| g.get("end"));
+        let gated = end.and_then(|e| e.get("cut_gated")).map(|v| v.as_str() == Some("mmx"));
+        let ud = end.and_then(|e| e.get("cut_ud")).is_some();
+        Ok(Answer::Cut { reason, cut: system_cut(&json, rip), gated, ud })
     }
 }
 /// A kept answer and what it was compiled from: the gating values (those with a bit in `read` matter) and the guest bytes
@@ -801,7 +804,7 @@ impl Compiler {
                     Ok(Code::Block(admitted))
                 }
             },
-            Answer::Cut { reason, cut, gated } => {
+            Answer::Cut { reason, cut, gated, ud } => {
                 let decoded = |(map, opcode)| {
                     crate::system::decode(bytes, map, opcode).or_else(|| crate::system::lock_ud(bytes)).or_else(|| crate::system::vex_ud(bytes))
                 };
@@ -813,9 +816,13 @@ impl Compiler {
                     let kind = if mmx { exec::system::MMX_GATED } else if x87 { exec::system::X87_GATED } else if map == 8 { exec::system::AVX_GATED } else { exec::system::SSE_GATED };
                     Some(exec::System { kind, length: 1, ..exec::System::NONE })
                 };
-                match cut.and_then(|cut| match gated {
-                    Some(mmx) => gated_kind(cut, *mmx),
-                    None => decoded(cut),
+                // I10: an encoding fexc found reserved or unadvertised: #UD whatever its operands (RIP stays at it).
+                let ud = ud.then_some(exec::System { kind: exec::system::UD, length: 1, ..exec::System::NONE });
+                match ud.or_else(|| {
+                    cut.and_then(|cut| match gated {
+                        Some(mmx) => gated_kind(cut, *mmx),
+                        None => decoded(cut),
+                    })
                 }) {
                     Some(s) if reason == "system_instruction" => Ok(Code::System(s)),
                     // Longer than 15 bytes with all of its first 15 fetched: #GP(0) (a fetch fault was `partial_decode`).

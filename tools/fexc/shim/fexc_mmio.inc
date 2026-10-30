@@ -7,8 +7,8 @@
 // rewritten since): MOV loads into a general register (x86 register, AH..BH, destination size, zero- or sign-extension
 // from the access width) and MOV stores (the data is the site's native transfer register: what the translated
 // instruction stores, an immediate or AH..BH included), and the instruction length. Only these forms get a record:
-// 88/89/8A/8B with a memory operand, C6/C7 /0, A0..A3, 63 (MOVSXD), 0F B6/B7/BE/BF; with LOCK, REP/REPNE or an
-// address-size prefix none. fexc.cpp attaches it to the instruction's one load or store site when the site's width and
+// 88/89/8A/8B with a memory operand, C6/C7 /0, A0..A3, 63 (MOVSXD), 0F B6/B7/BE/BF; with LOCK or REP/REPNE none. (I10: with
+// 0x67 too: the device address is the site's, already the truncated one; the record holds no address.) fexc.cpp attaches it to the instruction's one load or store site when the site's width and
 // direction agree (and the site is not half of a read-modify-write); every other device access stays a typed refusal.
 //
 // Record (u32, the binary site's `guest_offset2` slot of a load/store site; crates/abi code_object::completion):
@@ -18,7 +18,7 @@ inline void FexcMmioRecord(const DecodedInst& d, uint64_t rip) {
   using namespace DecodeFlags;
   const uint32_t f = d.Flags;
   if (d.FexcMap != FEXC_MAP_PRIMARY && d.FexcMap != FEXC_MAP_TWO) return;
-  if (f & (FLAG_LOCK | FLAG_REP_PREFIX | FLAG_REPNE_PREFIX | FLAG_ADDRESS_SIZE)) return;
+  if (f & (FLAG_LOCK | FLAG_REP_PREFIX | FLAG_REPNE_PREFIX)) return;
   const uint8_t op = d.OPRaw;
   const bool primary = d.FexcMap == FEXC_MAP_PRIMARY, modrm = f & FLAG_DECODED_MODRM;
   const bool memory = modrm && (d.ModRM >> 6) != 3;

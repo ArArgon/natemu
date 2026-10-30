@@ -142,9 +142,11 @@ pub(crate) struct Admitted {
 /// (jmp/jcc rel8/rel32, loopne/loope/loop/jrcxz rel8, call rel32), if it is one. REX and the ES/CS/SS/DS segment
 /// overrides may precede the opcode: in 64-bit mode those segments are null and a near direct branch has no memory
 /// operand, so they change nothing (2E/3E are Jcc hints; Linux's `-mindirect-branch-cs-prefix` emits `2e e8 rel32`).
+/// 0x67 (I10) may too: the target is RIP + rel in 64-bit mode whatever the address size (it selects only ECX for
+/// LOOP/JECXZ); linkers relax `call *f@GOTPCREL(%rip)` to `addr32 call f`.
 /// FS/GS (their use with a branch is reserved) and 66 (rel16 operand size) are not skipped: such a branch is not proven.
 fn branch_target(insn: &[u8], end: u64) -> Option<u64> {
-    let start = insn.iter().position(|&b| b & 0xf0 != 0x40 && !matches!(b, 0x26 | 0x2e | 0x36 | 0x3e))?;
+    let start = insn.iter().position(|&b| b & 0xf0 != 0x40 && !matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0x67))?;
     let rel = match &insn[start..] {
         [0xeb | 0x70..=0x7f | 0xe0..=0xe3, r] => *r as i8 as i64,
         [0xe9 | 0xe8, r @ ..] | [0x0f, 0x80..=0x8f, r @ ..] if r.len() == 4 => i32::from_le_bytes(r.try_into().unwrap()) as i64,
@@ -726,6 +728,9 @@ mod tests {
         assert_eq!(branch_target(&[0x2e, 0xe8, 0xfa, 0xff, 0xff, 0xff], 0x10), Some(0x0a));
         assert_eq!(branch_target(&[0x3e, 0xe8, 1, 0, 0, 0], 0x10), Some(0x11));
         assert_eq!(branch_target(&[0x3e, 0x0f, 0x84, 1, 0, 0, 0], 0x10), Some(0x11));
+        assert_eq!(branch_target(&[0x67, 0xe8, 0xfa, 0xff, 0xff, 0xff], 0x10), Some(0x0a)); // addr32 call (I10)
+        assert_eq!(branch_target(&[0x67, 0xe3, 0xfe], 0x10), Some(0x0e)); // jecxz
+        assert_eq!(branch_target(&[0x67, 0x66, 0xe8, 1, 0, 0, 0], 0x10), None);
         assert_eq!(branch_target(&[0x2e, 0x74, 0x02], 0x10), Some(0x12));
         assert_eq!(branch_target(&[0x26, 0x36, 0x48, 0xe9, 0, 0, 0, 0], 0x10), Some(0x10));
         // Not proven: 66 (rel16), FS/GS, and an indirect CS-prefixed call.

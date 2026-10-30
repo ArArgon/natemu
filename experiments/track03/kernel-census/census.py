@@ -17,16 +17,18 @@ def primary(op, modrm):
     if op in (0x63, 0x68, 0x6A, 0x69, 0x6B, 0x84, 0x85, 0x88, 0x89, 0x8A, 0x8B, 0x8D, 0x98, 0x99, 0xA0, 0xA1, 0xA2, 0xA3, 0xA8, 0xA9,
               0x80, 0x81, 0x83, 0x86, 0x87): return ALLOW, False
     if op in (0x9C, 0xFC, 0xFD, 0xF5, 0xF8, 0xF9, 0x9E, 0x9F, 0xC8, 0xC9): return ALLOW, False   # I1 (enter: level 0, below)
-    if op == 0x8F: return (ALLOW if reg == 0 else UNS), False
+    if op == 0x8F: return (ALLOW if reg == 0 else SYS), False                                  # I10: 8f /1../7 #UD
+    if op in (0x27, 0x2F, 0x37, 0x3F, 0x60, 0x61, 0xD4, 0xD5, 0x82): return SYS, False             # I10: invalid in 64-bit mode (#UD)
+    if op == 0xD7: return ALLOW, False                                                             # I10: xlat
     if op in (0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3):
         return (UNS if reg == 6 or (reg in (2, 3) and mod != 3) else ALLOW), False
-    if op in (0xC6, 0xC7): return (ALLOW if reg == 0 else UNS), False
+    if op in (0xC6, 0xC7): return (ALLOW if reg == 0 else SYS), False                      # I10: RTM xabort/xbegin, reserved: #UD
     if op in (0xF6, 0xF7): return (UNS if reg == 1 else ALLOW), False
-    if op == 0xFE: return (ALLOW if reg <= 1 else UNS), False
+    if op == 0xFE: return (ALLOW if reg <= 1 else SYS), False                              # I10: reserved: #UD
     if op == 0xFF:
         if reg in (3, 5): return SYS, False
         if reg in (2, 4): return ALLOW, True
-        return (ALLOW if reg <= 1 or reg == 6 else UNS), False
+        return (ALLOW if reg <= 1 or reg == 6 else SYS), False                             # I10: ff /7 #UD
     if op in (0xC2, 0xC3, 0xE8, 0xE9, 0xEB, 0xE0, 0xE1, 0xE2, 0xE3): return ALLOW, True
     if 0x50 <= op <= 0x5F or 0x90 <= op <= 0x97 or 0xB0 <= op <= 0xBF: return ALLOW, False
     if 0x70 <= op <= 0x7F: return ALLOW, True
@@ -43,12 +45,13 @@ def two(op, plain, modrm):
         return UNS, False
     if op == 0xC7 and mod == 3 and reg >= 6: return SYS, False                                      # S3: rdrand, rdseed, rdpid
     if op == 0xC7 and mod != 3 and 3 <= reg <= 5: return SYS, False                                 # I5b: xrstors/xsavec/xsaves (#UD)
+    if op in (0xA6, 0xA7, 0x0F): return SYS, False                    # I10: VIA PadLock, 3DNow! (not advertised: #UD)
     if not plain: return UNS, False
     if op in (0x1F, 0xA3, 0xAB, 0xB3, 0xBB, 0xAF, 0xB6, 0xB7, 0xBE, 0xBF, 0xBC, 0xBD): return ALLOW, False
     if op in (0xA4, 0xA5, 0xAC, 0xAD, 0xB0, 0xB1, 0xC0, 0xC1): return ALLOW, False                 # I1: shld/shrd, cmpxchg/xadd
     if op == 0x18: return (ALLOW if mod != 3 and reg <= 3 else UNS), False                         # I1: prefetchh m8
     if op == 0xC3: return (ALLOW if mod != 3 else UNS), False                                      # I1: movnti m
-    if op == 0xBA: return (ALLOW if reg >= 4 else UNS), False
+    if op == 0xBA: return (ALLOW if reg >= 4 else SYS), False                                      # I10: /0../3 #UD
     if 0x40 <= op <= 0x4F or 0x90 <= op <= 0x9F or 0xC8 <= op <= 0xCF: return ALLOW, False
     if 0x80 <= op <= 0x8F: return ALLOW, True
     return UNS, False
@@ -89,7 +92,7 @@ def vex_allowed(v, b=b''):
     """fexc_slice1.inc Vex(): the BMI1/BMI2 general-register forms but pdep/pext, VEX.L = 0, no prefix before VEX but a
     segment prefix (I7; its rules are segment()'s)"""
     m, pp, l, op, reg, prefixed = v
-    if l or (prefixed and not set(leading(b)) <= SEGS): return False
+    if l or (prefixed and not set(leading(b)) <= SEGS | {0x67}): return False      # I10: 0x67 admitted
     if m == 2:   # I9: pdep/pext (0xF5, pp 3/2) admitted (patch 0024's straight-line lowering)
         return (op == 0xF2 and pp == 0 or op == 0xF3 and pp == 0 and 1 <= reg <= 3 or op == 0xF5 and pp in (0, 2, 3)
                 or op == 0xF6 and pp == 3 or op == 0xF7)
@@ -189,6 +192,11 @@ def avx_allowed(f, b):
     ok = bool(r & (L1 if L else L0)) and not ((r & W0) and W) and not ((r & W1) and not W) and not ((r & NOV) and vvvv)
     if m == 1 and op == 0x77: return ok, True
     ok = ok and modrm is not None and not ((r & MEM) and mod == 3) and not ((r & REG) and mod != 3)
+    if not ok and not (m == 3 and op == 0x1d and mod != 3):   # I10: an encoding x86 makes #UD (vcvtps2ph m: a refusal), but LIG L = 1
+        lig = L and ((m == 1 and ((pp >= 2 and op in (0x10, 0x11, 0x2a, 0x2c, 0x2d, 0x51, 0x52, 0x53, 0x58, 0x59, 0x5a, 0x5c, 0x5d, 0x5e, 0x5f, 0xc2))
+                                  or (pp <= 1 and op in (0x2e, 0x2f)))) or (m == 2 and pp == 1 and op in (0x99, 0x9b, 0x9d, 0x9f, 0xa9, 0xab, 0xad, 0xaf, 0xb9, 0xbb, 0xbd, 0xbf))
+                     or (m == 3 and pp == 1 and op in (0x0a, 0x0b)))
+        if not lig: return False, 'ud'
     if ok and m == 3 and op == 0x21 and mod != 3 and b:   # vinsertps m32 whose zero mask clears the inserted element
         imm = b[-1]; ok = not ((imm & 0xF) & (1 << (imm >> 4 & 3)))
     return ok, True
@@ -200,7 +208,7 @@ def leading(b):
     return b[:i]
 
 NO_MODRM_P = {0x50 + i for i in range(16)} | {0x70 + i for i in range(16)} | {0x90 + i for i in range(10)} | {0xB0 + i for i in range(16)} | \
-    {0x68, 0x6A, 0x9C, 0x9E, 0x9F, 0xA0, 0xA1, 0xA2, 0xA3, 0xA8, 0xA9, 0xC2, 0xC3, 0xC8, 0xC9, 0xE0, 0xE1, 0xE2, 0xE3, 0xE8, 0xE9, 0xEB,
+    {0xD7, 0x68, 0x6A, 0x9C, 0x9E, 0x9F, 0xA0, 0xA1, 0xA2, 0xA3, 0xA8, 0xA9, 0xC2, 0xC3, 0xC8, 0xC9, 0xE0, 0xE1, 0xE2, 0xE3, 0xE8, 0xE9, 0xEB,
      0xF5, 0xF8, 0xF9, 0xFC, 0xFD} | {o for o in range(0x40) if o & 7 in (4, 5)}
 
 def mem_base(b, k, op):
@@ -244,7 +252,6 @@ def string(pre, op):   # pre: the prefix bytes (leading)
     if 0xF0 in pre: return 'LOCK', 'LOCK on a string instruction'
     if 0xF2 in pre and 0xF3 in pre: return 'string', 'REP and REPNE together'
     if 0xF2 in pre and not compare: return 'string', 'REPNE on movs/stos/lods'
-    if 0x67 in pre: return 'string', 'address-size prefix'
     if high and (not source or ss + data + high != 1): return 'FS/GS', 'FS/GS on a string instruction without a source, or with another prefix'
     if source and ss and not high: return 'FS/GS', 'SS naming the DS:RSI source'
     return 'admitted', ''
@@ -300,9 +307,10 @@ def sse_form(m, pfx, op, modrm):
         if m == 1 and pfx == 0x66 and op == 0xF7: return UNS, 'maskmovdqu'
         mx = mmx_form(m, pfx, op, modrm)
         if mx is not None: return mx
-        if m in (5, 6) and pfx == 0: return UNS, '0f38/0f3a form without a prefix that is no MMX form'
+        if m in (5, 6) and pfx == 0: return SYS, '0f38/0f3a form without a prefix that is no MMX form (I10: #UD)'
+        if m == 1 and pfx in (0, 0x66) and op in (0x71, 0x72, 0x73): return SYS, 'MMX/SSE shift group encoding x86 makes #UD'   # I10
         return None
-    if (reg_only and mod != 3) or (mem_only and mod == 3): return UNS, 'SSE form with an operand x86 makes #UD'
+    if (reg_only and mod != 3) or (mem_only and mod == 3): return SYS, 'SSE form with an operand x86 makes #UD'   # I10: delivered
     return ALLOW
 
 def mmx_form(m, pfx, op, modrm):
@@ -315,13 +323,13 @@ def mmx_form(m, pfx, op, modrm):
         elif op in (0xC5, 0xD7): reg_only = True
         elif op == 0xE7: mem_only = True
         elif 0x71 <= op <= 0x73:
-            if not (mod == 3 and (reg in (2, 6) or (op != 0x73 and reg == 4))): return UNS, 'MMX shift group encoding x86 makes #UD'
+            if not (mod == 3 and (reg in (2, 6) or (op != 0x73 and reg == 4))): return SYS, 'MMX shift group encoding x86 makes #UD'   # I10
         elif op == 0xF7: return UNS, 'maskmovq'
         else: return None
     elif m == 1 and pfx == 0x66 and op in (0x2A, 0x2C, 0x2D): pass
     elif m == 1 and pfx in (0xF3, 0xF2) and op == 0xD6: reg_only = True
     elif not ((m == 5 and pfx == 0 and (op <= 0x0B or 0x1C <= op <= 0x1E)) or (m == 6 and pfx == 0 and op == 0x0F)): return None
-    if (reg_only and mod != 3) or (mem_only and mod == 3): return UNS, 'MMX form with an operand x86 makes #UD'
+    if (reg_only and mod != 3) or (mem_only and mod == 3): return SYS, 'MMX form with an operand x86 makes #UD'   # I10
     return ALLOW
 
 def x87_form(op, m):
@@ -363,9 +371,12 @@ def classify(b, mnem):
         if f and f[:3] == (1, 0, 0) and f[4] == 0 and f[5] == 0xAE and f[6] is not None and f[6] >> 6 != 3 and f[6] >> 3 & 7 in (2, 3):
             return 'system', 'vldmxcsr/vstmxcsr (I8 review: the resident\'s MXCSR transaction)'
         if v and vex_allowed(v, b): return segment(b, k, p['op']) or ('admitted', '')
-        if f and avx_allowed(f, b)[0] and 0x67 not in leading(b): return segment(b, k, p['op']) or ('admitted', '')   # I8
+        if b[len(leading(b))] == 0x62: return 'system', 'evex (AVX-512 not advertised: #UD)'                        # I10
+        a = avx_allowed(f, b) if f else (False, True)
+        if a[0]: return segment(b, k, p['op']) or ('admitted', '')   # I8 (I10: 0x67 admitted)
+        if a[1] in (False, 'ud'): return 'system', 'VEX form not advertised or reserved encoding (#UD)'             # I10
         return ('BMI' if base in BMI or base[:-1] in BMI else 'AVX'), 'vex/evex'
-    if k == 'xop': return 'other', 'xop'
+    if k == 'xop': return 'system', 'xop / 8f /1../7 (not advertised, reserved: #UD)'   # I10
     if k == 'p' and (0xA4 <= op <= 0xA7 or 0xAA <= op <= 0xAF): return string(leading(b), op)     # I2
     if k == '0f' and op == 0x77 and not (set(leading(b)) & {0x66, 0xF2, 0xF3, 0x67}):   # I9: EMMS
         return ('LOCK', 'LOCK on a form that is not lockable (#UD)') if 0xF0 in leading(b) else ('admitted', '')
@@ -375,29 +386,33 @@ def classify(b, mnem):
         lead = leading(b)
         if k == '0f38' and op in (0xF0, 0xF1) and 0xF2 not in lead and 0xF3 not in lead and modrm >> 6 == 3: return 'system', 'movbe register form (#UD)'
         if k == '0f38' and op in (0xF5, 0xF6): return 'system', 'adcx/adox, wrss/wruss (not advertised: #UD)'
+        if k == '0f38' and op in (0xF0, 0xF1) and 0xF3 in lead: return 'system', 'movbe with F3 (#UD)'   # I10
         if not (set(lead) & {0x66, 0xF2, 0xF3}) and ((k == '0f38' and 0xC8 <= op <= 0xCD) or (k == '0f3a' and op == 0xCC)):
             return 'system', 'sha (not advertised: #UD)'
+    # I10 addendum: TPAUSE/UMONITOR/UMWAIT (66/F3/F2 0f ae /6 register): WAITPKG not advertised, #UD
+    if k == '0f' and op == 0xAE and modrm is not None and modrm >> 6 == 3 and (modrm >> 3) & 7 == 6 and set(leading(b)) & {0x66, 0xF2, 0xF3}:
+        return 'system', 'tpause/umonitor/umwait (WAITPKG not advertised: #UD)'
+    # I10: INCSSP (F3 0f ae /5 register): #UD with CR4.CET = 0
+    if k == '0f' and op == 0xAE and modrm is not None and modrm >> 6 == 3 and (modrm >> 3) & 7 == 5 and 0xF3 in leading(b) and 0xF2 not in leading(b):
+        return 'system', 'incssp (#UD: CET not advertised)'
     # I5a: SSE..SSE4.2 (fexc_slice1.inc Sse), CRC32, LDMXCSR/STMXCSR (system: the resident's transactions)
     if k in ('0f', '0f38', '0f3a') and modrm is not None:
         lead = leading(b)
         p66, pf2, pf3 = 0x66 in lead, 0xF2 in lead, 0xF3 in lead
         if k == '0f38' and op in (0xF0, 0xF1) and not pf2 and not pf3:   # I9: MOVBE m
-            if 0x67 in lead: return 'other', 'address-size prefix on an admitted opcode'
             if 0xF0 in lead: return 'LOCK', 'LOCK on a form that is not lockable (#UD)'
             return segment(b, k, op) or ('admitted', '')
         if k == '0f38' and op in (0xF0, 0xF1) and pf2 and not pf3:
-            if 0x67 in lead: return 'other', 'address-size prefix on an admitted opcode'
             return segment(b, k, op) or ('admitted', '')
         if k == '0f' and op == 0xAE and modrm >> 6 != 3 and (modrm >> 3) & 7 in (2, 3) and not (p66 or pf2 or pf3): return 'system', 'ldmxcsr/stmxcsr'
         v = sse_form({'0f': 1, '0f38': 5, '0f3a': 6}[k], 0xF3 if pf3 else 0xF2 if pf2 else 0x66 if p66 else 0, op, modrm)
         if v == ALLOW:
             if (pf2 and pf3) or ((pf2 or pf3) and p66): return 'SSE', 'several mandatory prefixes'
             if 0xF0 in lead: return 'LOCK', 'LOCK on a form that is not lockable (#UD)'
-            if 0x67 in lead: return 'other', 'address-size prefix on an admitted opcode'
             if k == '0f3a' and op == 0x21 and modrm >> 6 != 3 and (b[-1] & 0xF) & (1 << (b[-1] >> 4 & 3)):
                 return 'SSE', 'insertps m32 zeroing its inserted element'
             return segment(b, k, op) or ('admitted', '')
-        if v is not None: return 'SSE', v[1]
+        if v is not None: return ('system' if v[0] == SYS else 'SSE'), v[1]
     # I6: x87 (fexc_slice1.inc X87, series23-i6): admitted forms, the resident's (system), refused ones (class x87, why)
     if k == 'p' and ((0xD8 <= op <= 0xDF and modrm is not None) or op == 0x9B):
         v, why = (ALLOW, '') if op == 0x9B else x87_form(op, modrm)
@@ -407,7 +422,6 @@ def classify(b, mnem):
         if pre & {0x66, 0xF2, 0xF3}: return 'x87', '66/F2/F3 prefix on an x87 form'
         seg = segment(b, k, op)
         if seg: return seg
-        if 0x67 in pre: return 'other', 'address-size prefix on an admitted opcode'
         return 'admitted', ''
     if k == 'p': v, br = primary(op, modrm)
     elif k == '0f' and op in (0xB8, 0xBC, 0xBD) and last_mandatory(b) == 0xF3 and 0xF2 not in pre: v, br = ALLOW, False   # I1
@@ -423,7 +437,7 @@ def classify(b, mnem):
     if k == '0f' and op == 0xAE and modrm in (0xE8, 0xF0, 0xF8) and not (pre & {0x66, 0xF2, 0xF3}):
         return segment(b, k, op) or ('admitted', '')
     if v != ALLOW:
-        if k == '0f' and op == 0x1E and modrm == 0xFA and 0xF3 in pre and not (pre & {0xF0, 0xF2, 0x66, 0x67, 0x64, 0x65}): return 'admitted', ''
+        if k == '0f' and op == 0x1E and 0xF0 not in pre: return 'admitted', ''   # I10: the CET hint space
     else:
         if 0xF0 in pre and not lockable(k, op, modrm): return 'LOCK', 'LOCK on a form that is not lockable (#UD)'   # I3
         if 0xF2 in pre: return 'other', 'REPNE/bnd prefix on an admitted opcode'
@@ -431,7 +445,8 @@ def classify(b, mnem):
             return 'other', 'REP prefix on an admitted opcode'
         seg = segment(b, k, op)      # I7: FS/GS overrides admitted on memory operands
         if seg: return seg
-        if 0x67 in pre: return 'other', 'address-size prefix on an admitted opcode'
+        if 0x67 in pre and k == '0f' and op in (0xA3, 0xAB, 0xB3, 0xBB) and modrm >> 6 != 3:   # I10: refused with 0x67
+            return 'other', 'address-size prefix on bt/bts/btr/btc m, r'
         if br and 0x66 in pre: return 'other', 'operand-size prefix on a branch'
         if k == '0f' and 0xC8 <= op <= 0xCF and 0x66 in pre and not p['rex'] & 8: return 'other', '16-bit bswap'
         if k == '0f' and op in (0xA4, 0xA5, 0xAC, 0xAD) and 0x66 in pre: return 'small-int', '16-bit shld/shrd'
@@ -547,23 +562,30 @@ def selftest():
     h = bytes.fromhex
     cases = [('f390', 'pause', 'admitted'), ('0faee8', 'lfence', 'admitted'), ('f0488708', 'lock xchg', 'admitted'), ('f04887c1', 'lock xchg reg', 'LOCK'),
              ('f3a4', 'rep movsb', 'admitted'), ('f348ab', 'rep stos', 'admitted'), ('f2ae', 'repnz scas', 'admitted'),
-             ('f2a4', 'repnz movsb', 'string'), ('67f3a4', 'addr32 rep movsb', 'string'), ('64f348a5', 'rep movs %fs:', 'admitted'),
+             ('f2a4', 'repnz movsb', 'string'), ('67f3a4', 'addr32 rep movsb', 'admitted'), ('64f348a5', 'rep movs %fs:', 'admitted'),
              ('64aa', 'stos %fs', 'FS/GS'), ('36ac', 'lods %ss:', 'FS/GS'), ('f30f1efa', 'endbr64', 'admitted'), ('64488b042528000000', 'mov %fs:', 'admitted'),
              ('6548ff0425f0ff0000', 'incq %gs:', 'admitted'), ('644889c8', 'fs mov reg', 'FS/GS'), ('642e488b00', 'fs cs mov', 'FS/GS'),
              ('36488b03', 'ss mov (%rbx)', 'FS/GS'), ('36488b0424', 'ss mov (%rsp)', 'admitted'), ('3e488b4500', 'ds mov (%rbp)', 'FS/GS'),
              ('3e48ff24c500000000', 'notrack jmp *tbl', 'admitted'), ('65c4e2f0f200', 'andn %gs:', 'admitted'), ('f065480fc108', 'lock xadd %gs:', 'admitted'),
              ('65c3', 'gs ret', 'FS/GS'), ('3e4c8b2424', 'ds mov (%rsp),%r12', 'FS/GS'), ('3e498b0424', 'ds mov (%r12)', 'admitted'),
-             ('0f22d8', 'mov %cr3', 'system'), ('0f28c1', 'movaps', 'admitted'), ('0f6fc1', 'movq mm', 'admitted'), ('0ff7c1', 'maskmovq', 'SSE'), ('0f77', 'emms', 'admitted'), ('480f38f007', 'movbe m', 'admitted'), ('480f38f0c1', 'movbe reg', 'system'), ('66480f38f6c1', 'adcx', 'system'), ('0f38cbc1', 'sha256rnds2', 'system'), ('660f38dcc1', 'aesenc', 'admitted'), ('c4e271dcc2', 'vaesenc', 'admitted'), ('c4e275dcc2', 'vaesenc ymm', 'AVX'), ('dfc1', 'ffreep', 'admitted'), ('660f3a63c100', 'pcmpistri', 'admitted'), ('0fae10', 'ldmxcsr', 'system'), ('f20f38f1c1', 'crc32', 'admitted'), ('66f30f10c1', 'movss 66', 'SSE'), ('660f73f804', 'pslldq', 'admitted'), ('c5f877', 'vzeroupper', 'admitted'), ('c5f96efe', 'vmovd', 'admitted'), ('c4e27d78ff', 'vpbroadcastb', 'admitted'),
+             ('0f22d8', 'mov %cr3', 'system'), ('0f28c1', 'movaps', 'admitted'), ('0f6fc1', 'movq mm', 'admitted'), ('0ff7c1', 'maskmovq', 'SSE'), ('0f77', 'emms', 'admitted'), ('480f38f007', 'movbe m', 'admitted'), ('480f38f0c1', 'movbe reg', 'system'), ('66480f38f6c1', 'adcx', 'system'), ('0f38cbc1', 'sha256rnds2', 'system'), ('660f38dcc1', 'aesenc', 'admitted'), ('c4e271dcc2', 'vaesenc', 'admitted'), ('c4e275dcc2', 'vaesenc ymm', 'system'), ('dfc1', 'ffreep', 'admitted'), ('660f3a63c100', 'pcmpistri', 'admitted'), ('0fae10', 'ldmxcsr', 'system'), ('f20f38f1c1', 'crc32', 'admitted'), ('66f30f10c1', 'movss 66', 'SSE'), ('660f73f804', 'pslldq', 'admitted'), ('c5f877', 'vzeroupper', 'admitted'), ('c5f96efe', 'vmovd', 'admitted'), ('c4e27d78ff', 'vpbroadcastb', 'admitted'),
              ('c4e27d90040f', 'vpgatherdd', 'AVX'), ('c5f8ae5c2404', 'vstmxcsr', 'system'), ('66c5f877', 'vzeroupper 66', 'system'), ('c5fc28c1', 'vmovaps', 'admitted'),
-             ('c4e2fd78ff', 'vpbroadcastb W1', 'AVX'), ('c5f877c5fc77', 'vzeroupper', 'admitted'), ('d9c0', 'fld', 'admitted'), ('d9fe', 'fsin', 'admitted'), ('dbe3', 'fninit', 'system'),
+             ('c4e2fd78ff', 'vpbroadcastb W1', 'system'), ('c5f877c5fc77', 'vzeroupper', 'admitted'), ('d9c0', 'fld', 'admitted'), ('d9fe', 'fsin', 'admitted'), ('dbe3', 'fninit', 'system'),
              ('f3480fb8c1', 'popcnt', 'admitted'), ('f0480fb10a', 'lock cmpxchg', 'admitted'), ('f0480fc70e', 'lock cmpxchg16b', 'admitted'),
              ('f04801c8', 'lock add reg', 'LOCK'), ('f0488908', 'lock mov', 'LOCK'), ('f2f0480108', 'xacquire lock add', 'other'),
              ('f0f71b', 'lock neg', 'admitted'), ('f0480fba2b05', 'lock bts', 'admitted'), ('f0480fba2305', 'lock bt', 'LOCK'), ('480fa4c10c', 'shld', 'admitted'), ('f2c3', 'bnd ret', 'other'),
              ('fc', 'cld', 'admitted'), ('9c', 'pushfq', 'admitted'), ('9d', 'popfq', 'system'), ('c8100001', 'enter', 'small-int'), ('c9', 'leave', 'admitted'),
              ('480fc70e', 'cmpxchg16b', 'admitted'), ('66480fc70e', 'o16 cmpxchg16b', 'LOCK'), ('0f0d08', 'prefetchw', 'small-int'), ('0f1808', 'prefetcht0', 'admitted'), ('660fa4c10c', 'shldw', 'small-int'),
-             ('c4e2fbf5c1', 'pdep', 'admitted'), ('c4e27cf2c1', 'andn', 'BMI'), ('c4e278f2c1', 'andn', 'admitted'), ('f3480fbc00', 'tzcnt', 'admitted'),
+             ('c4e2fbf5c1', 'pdep', 'admitted'), ('c4e27cf2c1', 'andn', 'system'), ('c4e278f2c1', 'andn', 'admitted'), ('f3480fbc00', 'tzcnt', 'admitted'),
              ('f3c3', 'rep ret', 'admitted'), ('c3', 'ret', 'admitted'), ('cc', 'int3', 'int3'), ('3effe0', 'notrack jmp', 'admitted'), ('0f05', 'syscall', 'system'),
-             ('c5f8f7c1', 'bmi?', 'AVX'), ('c4e260f7c1', 'shlx', 'admitted'), ('c4e2f8f7c1', 'shlxq', 'admitted')]
+             ('c5f8f7c1', 'bmi?', 'system'), ('c4e260f7c1', 'shlx', 'admitted'), ('c4e2f8f7c1', 'shlxq', 'admitted'),
+             # I10: 0x67 admitted (BT* m, r refused), XLAT, #UD forms (system), the CET hint space
+             ('678b00', 'addr32 mov', 'admitted'), ('67e800000000', 'addr32 call', 'admitted'), ('678d0418', 'leal', 'admitted'),
+             ('670fa308', 'addr32 bt m,r', 'other'), ('d7', 'xlatb', 'admitted'), ('67c4e2f3f6c0', 'addr32 mulx', 'admitted'),
+             ('8fe878c2c005', 'vprotd', 'system'), ('c7f800000000', 'xbegin', 'system'), ('c6f805', 'xabort', 'system'), ('0fa7c0', 'xstorerng', 'system'),
+             ('f3480f1ec8', 'rdsspq', 'admitted'), ('f30faee8', 'incsspd', 'system'), ('f30f38f000', 'f3 movbe', 'system'), ('62f17d48efc0', 'evex', 'system'),
+             ('c4e27950e1', 'vpdpbusd', 'system'), ('c5fe58c1', 'vaddss L1', 'AVX'), ('0f7110', 'psrlw m', 'system'), ('27', 'daa', 'system'),
+             ('660faef0', 'tpause', 'system'), ('0faef0', 'mfence', 'admitted')]
     for hx, mn, want in cases:
         got = classify(h(hx), mn if mn != 'shlx' else 'shlxq')[0]
         if mn in ('popcnt', 'pdep', 'andn', 'tzcnt'): got = classify(h(hx), mn)[0]

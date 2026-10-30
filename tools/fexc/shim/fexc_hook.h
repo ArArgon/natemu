@@ -119,6 +119,7 @@ struct FexcCut {
   uint8_t status = 0;
   bool gated = false;             // I5a: an SSE instruction cut because the vCPU's CR0/CR4 gate it (#UD or #NM; --sse-gated)
   bool gated_mmx = false;         // I9: an MMX instruction cut by CR0.EM/TS (#UD or #NM; --x87-gated): reported as cut_gated "mmx"
+  bool ud = false;                // I10: an encoding the presented CPU raises #UD for (reserved or unadvertised): reported as cut_ud
 };
 inline FexcCut fexc_cut {};
 inline uint64_t fexc_after_rep = 0;   // slice1: the RIP after the block's self-exiting instruction (REP string, LOCK NEG; 0: none yet)

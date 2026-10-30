@@ -11,7 +11,7 @@
 //! `/5`), RDRAND (`0f c7 /6`, register), INVD/WBINVD/WBNOINVD (`0f 08`, `0f 09`, `f3 0f 09`), CLFLUSH m (`0f ae /7`); L3:
 //! IN/OUT (`e4..e7`, `ec..ef`) and INS/OUTS (`6c..6f`; F3 = REP, 0x67); I5b: FXSAVE/FXRSTOR/XSAVE/XRSTOR m (`0f ae /0 /1 /4
 //! /5`), XGETBV/XSETBV (`0f 01 d0`, `d1`); and forms the presented CPU raises #UD for whatever their operands (unadvertised or VMX/SVM-only instructions). Anything
-//! else (other system instructions, F2/F3 prefixes on other forms, an address-size prefix on a memory operand, a 66 prefix on a far transfer, segment
+//! else (other system instructions, F2/F3 prefixes on other forms, a 66 prefix on a far transfer, segment
 //! prefixes of different classes or an FS/GS override on INVLPG) is `None`: the vCPU stops with fexc's reason, as for code it cannot
 //! compile.
 use natemu_abi::execution::{SREG_DS, SREG_FS, SREG_GS, SREG_SS, System, system};
@@ -109,7 +109,8 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         // operation the presented CPU has none of: ENCLV, VMCALL/VMLAUNCH/VMRESUME/VMXOFF, PCONFIG, WRMSRNS, MONITOR/MWAIT, CLAC/STAC, TDCALL,
         // ENCLS, VMFUNC/XEND/XTEST/ENCLU, the SVM group, SERIALIZE and XSUSLDTRK/XRESLDTRK (f2 e8/e9), RDPKRU/WRPKRU, MONITORX/MWAITX, CLZERO, RDPRU and the
         // RMP/INVLPGB group: #UD whatever the prefixes (SDM Vol.2 each: "#UD If CPUID ... = 0" / "not in VMX operation").
-        (MAP_TWO, 0x01) if matches!(*bytes.get(at)?, 0xc0..=0xc6 | 0xc8..=0xcc | 0xcf | 0xd4..=0xdf | 0xe8 | 0xe9 | 0xee | 0xef | 0xfa..=0xff) => {
+        // I10: SAVEPREVSSP (f3 0f 01 ea; SETSSBSY is f3 e8): "#UD If CR4.CET = 0" (CET not advertised); reserved otherwise.
+        (MAP_TWO, 0x01) if matches!(*bytes.get(at)?, 0xc0..=0xc6 | 0xc8..=0xcc | 0xcf | 0xd4..=0xdf | 0xe8 | 0xe9 | 0xea | 0xee | 0xef | 0xfa..=0xff) => {
             (at, rep_used, s.kind) = (at + 1, true, system::UD);
         }
         // I5b: XGETBV and XSETBV (`0f 01 d0`, `d1`; NP: with 66 not decoded).
@@ -125,6 +126,11 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
                 2 => system::LGDT,
                 3 => system::LIDT,
                 7 => system::INVLPG,
+                // I10: RSTORSSP m64 (f3 0f 01 /5): "#UD If CR4.CET = 0" (CET not advertised).
+                5 if s.memory == 1 && rep == 0xf3 => {
+                    rep_used = true;
+                    system::UD
+                }
                 _ => return None,
             };
             if s.memory == 0 || (s.kind == system::INVLPG && matches!(segment, 0x64 | 0x65)) {
@@ -348,8 +354,9 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         s = System { kind: system::UD, lock: s.lock, ..System::NONE };
     }
     if s.memory == 1 {
+        // I10: 0x67 makes the effective address 32 bits (truncated, zero-extended, then the FS/GS base: `segments::address`).
         if address_size {
-            return None;
+            s.prefixes |= system::ADDRESS32;
         }
         // CS/DS/ES/SS (base 0 in 64-bit mode) only choose the exception for a non-canonical address. The presented CPU is
         // GenuineIntel, so Intel's rule (SDM Vol. 3A 4.5.1): an SS prefix makes the reference SS-class (#SS(0)) whatever the
@@ -505,7 +512,10 @@ mod tests {
         assert_eq!(p("f048cf", 0xcf), Some(System { kind: IRET, size: 8, length: 3, lock: 1, ..System::NONE })); // #UD
         assert_eq!(p("2e8e18", 0x8e).map(|s| s.segment), Some(SREG_DS as u32)); // mov ds, cs:[rax]
         assert_eq!(p("368e5d08", 0x8e).map(|s| s.segment), Some(SREG_SS as u32)); // mov ds, ss:[rbp+8]
-        for (hex, op) in [("66cb", 0xcb), ("66ff28", 0xff), ("ffe8", 0xff), ("ff20", 0xff), ("362e8e18", 0x8e), ("678e18", 0x8e), ("8ed8", 0x8c)] {
+        // I10: 0x67 on a memory operand (mov ds, [eax]; lgdt [eip+0x80]).
+        assert_eq!(p("678e18", 0x8e), Some(System { cr: 3, size: 4, prefixes: ADDRESS32, ..mem(MOV_TO_SREG, 0, 0, 3) }));
+        assert_eq!(d("670f011580000000", 0x01), Some(System { prefixes: ADDRESS32, ..mem(LGDT, RIP, 0x80, 8) }));
+        for (hex, op) in [("66cb", 0xcb), ("66ff28", 0xff), ("ffe8", 0xff), ("ff20", 0xff), ("362e8e18", 0x8e), ("8ed8", 0x8c)] {
             assert_eq!(p(hex, op), None, "{hex}");
         }
         for (hex, op) in [("0f0120", 0x01), ("0f00f8", 0x00), ("f30f00e0", 0x00)] {
@@ -604,9 +614,10 @@ mod tests {
         assert_eq!(x87("64dd30", 0xdd).map(|s| (s.kind, s.segment)), Some((FNSAVE, SREG_FS as u32))); // fnsave fs:[rax]
         assert_eq!(x87("db2b", 0xdb).map(|s| s.kind), Some(FLD80));
         assert_eq!(x87("db3b", 0xdb).map(|s| s.kind), Some(FSTP80));
-        for (hex, op) in [("d9e8", 0xd9), ("dbc0", 0xdb), ("dd00", 0xdd), ("d900", 0xd9), ("f3d92b", 0xd9), ("67d92b", 0xd9)] {
-            assert_eq!(x87(hex, op), None, "{hex}"); // admitted forms, register operands, F3, a 32-bit address
+        for (hex, op) in [("d9e8", 0xd9), ("dbc0", 0xdb), ("dd00", 0xdd), ("d900", 0xd9), ("f3d92b", 0xd9)] {
+            assert_eq!(x87(hex, op), None, "{hex}"); // admitted forms, register operands, F3
         }
+        assert_eq!(x87("67d92b", 0xd9).map(|s| (s.kind, s.prefixes)), Some((FLDCW, ADDRESS32))); // fldcw [ebx] (I10)
         assert_eq!(d("410fae5c2408", 0xae), Some(mem(STMXCSR, 12, 8, 6))); // stmxcsr [r12+8]
         assert_eq!(d("640fae18", 0xae), Some(System { segment: 4, ..mem(STMXCSR, 0, 0, 4) })); // stmxcsr fs:[rax]
         // I8: VLDMXCSR/VSTMXCSR (map 8: fexc's VEX map); VEX.B/X extend base and index; VEX.L 1 or vvvv != 1111b is no form here.
@@ -618,9 +629,10 @@ mod tests {
         assert_eq!(v("c4c178ae5c2408").map(|s| (s.kind, s.base, s.disp, s.length)), Some((VSTMXCSR, 12, 8, 7))); // vstmxcsr [r12+8]
         assert_eq!(v("64c5f8ae18").map(|s| (s.kind, s.segment)), Some((VSTMXCSR, SREG_FS as u32))); // vstmxcsr fs:[rax]
         assert!(v("c5fcae10").is_none() && v("c5f0ae10").is_none() && v("c5f8aed0").is_none() && v("66c5f8ae10").is_none());
-        for hex in ["660fae10", "f30fae10", "670fae10"] {
-            assert_eq!(d(hex, 0xae), None, "{hex}"); // 66, f3, 32-bit address
+        for hex in ["660fae10", "f30fae10"] {
+            assert_eq!(d(hex, 0xae), None, "{hex}"); // 66, f3
         }
+        assert_eq!(d("670fae10", 0xae), Some(System { prefixes: ADDRESS32, ..mem(LDMXCSR, 0, 0, 4) })); // ldmxcsr [eax] (I10)
     }
 
     #[test]
@@ -638,9 +650,10 @@ mod tests {
             assert_eq!(d(hex, 0xc7).map(|s| s.kind), Some(UD), "{hex}"); // xrstors, xsavec, xsaves64
         }
         assert_eq!(d("0fc708", 0xc7), None); // cmpxchg8b stays admitted
-        for hex in ["660fae00", "f30fae20", "f20fae28", "670fae00"] {
-            assert_eq!(d(hex, 0xae), None, "{hex}"); // NP forms with 66/F2/F3, a 32-bit address
+        for hex in ["660fae00", "f30fae20", "f20fae28"] {
+            assert_eq!(d(hex, 0xae), None, "{hex}"); // NP forms with 66/F2/F3
         }
+        assert_eq!(d("670fae00", 0xae), Some(System { prefixes: ADDRESS32, ..mem(FXSAVE, 0, 0, 4) })); // fxsave [eax] (I10)
         assert_eq!(d("0f01d0", 0x01), Some(System { kind: XGETBV, length: 3, ..System::NONE }));
         assert_eq!(d("0f01d1", 0x01), Some(System { kind: XSETBV, length: 3, ..System::NONE }));
         assert_eq!(d("f00f01d1", 0x01).map(|s| (s.kind, s.lock)), Some((XSETBV, 1))); // LOCK: #UD in the resident
@@ -657,6 +670,7 @@ mod tests {
         assert_eq!(d("0f013c25f0ffffff", 0x01), Some(invlpg(NO_REG, NO_REG, 0, -16, 8))); // [disp32]
         assert_eq!(d("0f01bc2400000080", 0x01), Some(invlpg(4, NO_REG, 0, -0x8000_0000, 8))); // [rsp+disp32]
         assert_eq!(d("0f017d00", 0x01), Some(invlpg(5, NO_REG, 0, 0, 4))); // [rbp+0]
+        assert_eq!(d("670f0138", 0x01), Some(System { prefixes: ADDRESS32, ..invlpg(0, NO_REG, 0, 0, 4) })); // [eax] (I10)
     }
 
     #[test]
@@ -665,7 +679,6 @@ mod tests {
         for (hex, map, op) in [
             ("0f01e0", MAP_TWO, 0x01),   // smsw eax (mod 3)
             ("0f0120", MAP_TWO, 0x01),   // smsw is /4
-            ("670f0138", MAP_TWO, 0x01), // 32-bit address
             ("650f0138", MAP_TWO, 0x01), // GS override
             ("f30f22d8", MAP_TWO, 0x22), // F3
             ("0f21c0", MAP_TWO, 0x23),   // FEX's opcode disagrees
@@ -746,7 +759,7 @@ mod tests {
         assert_eq!(d("0fae3b", 0xae), Some(mem(CLFLUSH, 3, 0, 3))); // clflush [rbx]
         assert_eq!(d("650fae7808", 0xae), Some(System { segment: 5, ..mem(CLFLUSH, 0, 8, 5) })); // clflush gs:[rax+8]
         assert_eq!(d("660fae38", 0xae), k(UD, 4)); // clflushopt
-        for hex in ["0f01c0", "0f01c5", "0f01c6", "f20f01e9", "0f01ca", "0f01cb", "0f01c8", "0f01c9", "0f01e8", "0f01ee", "0f01ef", "0f01c1", "0f01d9", "660f01cc", "f30f01fe", "f20f01ff"] {
+        for hex in ["0f01c0", "0f01c5", "0f01c6", "f20f01e9", "0f01ca", "0f01cb", "0f01c8", "0f01c9", "0f01e8", "0f01ee", "0f01ef", "0f01c1", "0f01d9", "660f01cc", "f30f01fe", "f20f01ff", "f30f01ea", "f30f01e8", "f30f012b"] {
             assert_eq!(d(hex, 0x01), k(UD, hex.len() as u32 / 2), "{hex}");
         }
         assert_eq!(d("0f78c0", 0x78), k(UD, 2));
