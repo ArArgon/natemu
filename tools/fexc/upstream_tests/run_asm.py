@@ -56,7 +56,9 @@ GPR = {'RAX': 0, 'RCX': 1, 'RDX': 2, 'RBX': 3, 'RSP': 4, 'RBP': 5, 'RSI': 6, 'RD
 NOT_ADVERTISED = {'rdpid', 'rdseed', 'clflushopt', 'clzero', 'clwb', 'serialize', 'rdpkru', 'wrpkru', 'monitorx', 'mwaitx', 'rdpru'}
 # Tests whose expectation is FEX's own x87 behaviour where it is not x86's (the test says so): natemu gives the SDM's.
 FEX_EXPECTS_ITS_BUG = {'X87/FXAM_Simple.asm': "expects FEX's FXAM of +0 (its comment: 'should be 0x4000 for zero, but there's no "
-                                              "support'); natemu gives the SDM's 4000H (patch 0019)"}
+                                              "support'); natemu gives the SDM's 4000H (patch 0019)",
+                      'VEX/vldmxcsr.asm': "expects FEX's VSTMXCSR, which masks off the exception flags (FFC0H); x86 stores MXCSR as "
+                                          "VLDMXCSR loaded it, FFFFH (SDM STMXCSR; natemu's is the resident's transaction, I8 review)"}
 NEEDS_OS = {'syscall'}   # #UD with EFER.SCE = 0: no OS has set up SYSCALL here
 OS_SEGMENTS = {'Primary/Primary_8C.asm', 'Primary/Primary_8C_2.asm', 'Primary/Primary_CF.asm', 'PrimaryGroup/5_FF_05.asm',
                'PrimaryGroup/5_FF_05_03_o64.asm', 'PrimaryGroup/5_FF_05_03_o64_imm.asm', 'Secondary/07_XX_00.asm'}
@@ -174,8 +176,9 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
             return {**rec, 'outcome': 'fail', 'reason': 'harness: nasm failed', 'detail': n.stderr[-500:]}
         binary = (work / 't.bin').read_bytes()
         want = {k.upper(): [int(v, 0) for v in (vals if isinstance(vals, list) else [vals])] for k, vals in h.get('REGDATA', {}).items()}
-        # Expectations natemu cannot check: MMn (x87/MMX, I6), XMM16+ and nonzero YMM upper halves (AVX, I8).
-        vector = sorted(k for k in want if k not in GPR and k != 'RIP' and not (re.fullmatch(r'XMM\d+', k) and int(k[3:]) < 16 and not any(want[k][2:]))
+        # Expectations natemu cannot check: XMM16+ (AVX-512). MMn is x87/MMX (I6); XMM0..15 with four values a YMM register
+        # (I8: the upper half from the report's `ymmh`).
+        vector = sorted(k for k in want if k not in GPR and k != 'RIP' and not (re.fullmatch(r'XMM\d+', k) and int(k[3:]) < 16)
                         and not re.fullmatch(r'MM[0-7]', k))
         (work / 'program.txt').write_text(description(h, binary))
         run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work] + ([str(max_block)] if max_block else []) + vm1.CODE_SHAPE, capture_output=True, text=True, timeout=120)
@@ -219,6 +222,7 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
             return {**rec, 'outcome': 'fail', 'reason': 'did not reach hlt', 'detail': rec['stop'] + ' fault=' + json.dumps(s['fault'])}
         gpr = [int(v, 0) for v in s['gpr']]
         xmm = [int(v, 0) for v in s['xmm']]
+        ymmh = [int(v, 0) for v in s['ymmh']]
         reduced = 'FEX_X87REDUCEDPRECISION' in (h.get('ENV') or {})
         x87 = X87_TEXT.search(text) is not None
         mm = [int(v, 0) for v in s['x87']['mm']]
@@ -226,10 +230,14 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
         for k, vals in want.items():
             if k == 'RIP': got = rip
             elif k in GPR: got = gpr[GPR[k]]
-            elif re.fullmatch(r'XMM\d+', k) and int(k[3:]) < 16 and not any(vals[2:]):   # I5a: XMM (low, high); YMM upper must be 0
+            elif re.fullmatch(r'XMM\d+', k) and int(k[3:]) < 16:   # I5a: XMM (low, high); I8: YMM (four quadwords)
                 n = int(k[3:])
-                if xmm[2 * n:2 * n + 2] != vals[:2]:
-                    d = f'{k}: got {xmm[2 * n]:#x} {xmm[2 * n + 1]:#x}, want {vals[0]:#x} {vals[1]:#x}'
+                got4 = xmm[2 * n:2 * n + 2] + ymmh[2 * n:2 * n + 2]
+                if got4[:len(vals)] != vals[:4]:
+                    d = f'{k}: got {" ".join(f"{v:#x}" for v in got4[:len(vals)])}, want {" ".join(f"{v:#x}" for v in vals)}'
+                    if len(vals) > 2 and xmm[2 * n:2 * n + 2] == vals[:2]:
+                        diffs.append(d)
+                        continue
                     g80, w80 = image80(xmm[2 * n:2 * n + 2]), image80(vals[:2])
                     (soft if x87 and not reduced and g80 and w80 and x87_value_ok(g80, w80, name) else diffs).append(d)
                 continue

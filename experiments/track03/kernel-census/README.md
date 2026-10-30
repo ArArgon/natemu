@@ -73,6 +73,17 @@ data; report in its `report/`). Kernel (decompressor + vmlinux): x87 10 -> 0 (`f
 initramfs `xgetbv` 9, already `system`); XSAVEOPT, XSAVEC, XSAVES, XRSTORS and CLWB are #UD (not advertised: the kernel's
 alternatives select them only when CPUID says so).
 
+**I8 re-check (October 30).** `census.py` ports the I8 allowlist (fexc series29: `avx_allowed`, a port of
+`fexc_slice1.inc` `Avx()`: AVX, AVX2, FMA and F16C VEX forms by map, pp, VEX.L, VEX.W, VEX.vvvv and operand kind; a 66/F2/F3
+prefix or an adjacent REX before VEX is `system` (#UD); 0x67 stays refused). Rerun into
+`natemu-raw/kernel-census-i8-20261030-01/` (`x` linked to the C0 data; report in its `report/`). Kernel (decompressor +
+vmlinux): AVX 64 -> 11 (left: the EVEX `vpermi2d` 2 and `vprord` 8, AMX `tilerelease` 1; none executes without AVX-512/AMX
+in CPUID), admitted +53; initramfs: AVX 329,545 -> 229,288, admitted +100,257 (left: EVEX/AVX-512 forms, VAES and
+VPCLMULQDQ (`vaesenc` 34,137, `vpclmulqdq` 41,748), GFNI, the VEX AES forms, gathers and masked moves, `vcvtps2ph` to
+memory, VNNI). After the I8 review (fexc series30), VLDMXCSR/VSTMXCSR are `system` (the resident's MXCSR transaction):
+rerun `natemu-raw/kernel-census-i8-20261030-02`, initramfs AVX 229,288 -> 229,216, system 5,529 -> 5,601 (36 of each, glibc's
+FMA/AVX2 libm).
+
 Files here: `extract.py`, `census.py`, `report.py`, `results.md` (every table, generated), `forms-kernel.tsv` (every refused
 form of the decompressor and vmlinux, one row per mnemonic + operand shape, first-use order). The same for the
 initramfs is `RAW/forms-initrd.tsv`; `RAW/census.json` holds every row.

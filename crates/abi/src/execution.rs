@@ -422,20 +422,20 @@ pub mod frame {
     pub const X87_FTW: u32 = 0x4b2;
     pub const X87_EXCEPTIONS: u32 = 0x4b4;
     /// The upper 128 bits of YMM0..YMM15 (I5b; XSAVE state component 2, YMM_Hi128): FEX's `avx_high[16][2]`, where FEX keeps
-    /// them without SVE256, two little-endian quadwords per register. Only XRSTOR (load or init) writes them and XSAVE reads
-    /// them while no AVX form is admitted; I8 admits generated code's accesses (adding the range to [`GUEST_STATE`] and
-    /// [`GUEST_STATE_WRITABLE`]). Zero at reset with the rest of the page.
+    /// them without SVE256, two little-endian quadwords per register. Generated code reads and writes them (I8: the VEX forms,
+    /// each instruction storing the halves it wrote before the next starts); XSAVE and XRSTOR use the same copy. Zero at
+    /// reset with the rest of the page.
     pub const AVX_HIGH: u32 = 0xc0;
     /// Guest-state fields `(offset, bytes)` admitted code may read through x28: the segment bases, the RFLAGS bytes
-    /// above and the x87 state (I6). MXCSR is the bank's; AVX state awaits its chunk. Every other x28 access is refused.
-    pub const GUEST_STATE: [(u32, u32); 12] = [
-        (GS_BASE, 8), (FS_BASE, 8), (FLAGS + 8, 3), (FLAGS + 12, 1), (FLAGS + 14, 1), (FLAGS + 16, 6),
+    /// above, the x87 state (I6) and the YMM upper halves (I8). MXCSR is the bank's. Every other x28 access is refused.
+    pub const GUEST_STATE: [(u32, u32); 13] = [
+        (AVX_HIGH, 256), (GS_BASE, 8), (FS_BASE, 8), (FLAGS + 8, 3), (FLAGS + 12, 1), (FLAGS + 14, 1), (FLAGS + 16, 6),
         (X87_IE, 1), (X87_PE, 2), (X87_C0, 4), (X87_C3, 1), (X87_MM, 128), (X87_FCW, 8),
     ];
-    /// The fields admitted code may also write: DF and the x87 state but FCW. TF, IF, IOPL, NT, AC, VIF, VIP and ID are the
-    /// resident's, and so is FCW (FLDCW, FNINIT, FLDENV, FRSTOR are transactions).
-    pub const GUEST_STATE_WRITABLE: [(u32, u32); 7] =
-        [(DF, 1), (X87_IE, 1), (X87_PE, 2), (X87_C0, 4), (X87_C3, 1), (X87_MM, 128), (X87_FTW, 6)];
+    /// The fields admitted code may also write: DF, the x87 state but FCW, and the YMM upper halves. TF, IF, IOPL, NT, AC, VIF,
+    /// VIP and ID are the resident's, and so is FCW (FLDCW, FNINIT, FLDENV, FRSTOR are transactions).
+    pub const GUEST_STATE_WRITABLE: [(u32, u32); 8] =
+        [(AVX_HIGH, 256), (DF, 1), (X87_IE, 1), (X87_PE, 2), (X87_C0, 4), (X87_C3, 1), (X87_MM, 128), (X87_FTW, 6)];
     pub const BYTES: usize = 4096;
     /// RFLAGS bits held in the flag bytes.
     const BITS: [u32; 10] = [8, 9, 10, 12, 14, 16, 17, 18, 19, 20];
@@ -756,6 +756,11 @@ impl Cpu {
     /// (bit 14 and FCW.RC in 16:15: a translation runs x87 arithmetic under that FPCR), and alignment checking (X2: a
     /// translation under it cuts every BT* memory form,
     /// and RFLAGS.AC changes without dropping code).
+    /// I8: the VEX AVX forms run (SDM Vol.1 13.2, Vol.2 2.8: no #UD) only with CR4.OSXSAVE and XCR0[2:1] = 11b; CR0.TS still
+    /// makes them #NM. Part of [`Self::code_context`] (XSETBV changes XCR0 without a flush).
+    pub fn avx_enabled(&self) -> bool {
+        self.cr4 & CR4_OSXSAVE != 0 && self.xcr0 & 6 == 6
+    }
     pub fn code_context(&self) -> [u64; 2] {
         let bit = |on: bool, n: u32| u64::from(on) << n;
         let word = self.cpl & 3
@@ -771,7 +776,8 @@ impl Cpu {
             | bit(self.cr4 & CR4_OSFXSR != 0, 11)
             | bit(self.alignment_check(), 12)
             | bit(self.cr0 & CR0_MP != 0, 13)
-            | (x87_fpcr(self.fcw, self.mxcsr) != 0) as u64 * (1 | (self.fcw >> 10 & 3) << 1) << 14;
+            | (x87_fpcr(self.fcw, self.mxcsr) != 0) as u64 * (1 | (self.fcw >> 10 & 3) << 1) << 14
+            | bit(self.avx_enabled(), 17);
         [self.cr3, word]
     }
 }
@@ -962,6 +968,13 @@ pub mod system {
     /// An SSE instruction under CR0.EM, CR0.TS or without CR4.OSFXSR (I5a; fexc cut it, `--sse-gated`): #UD or #NM from the
     /// bank's controls (`length` is not used: the fault leaves RIP at the instruction).
     pub const SSE_GATED: u32 = 33;
+    /// A VEX-encoded AVX/AVX2/FMA/F16C instruction without CR4.OSXSAVE, with XCR0[2:1] != 11b, or under CR0.TS (I8; fexc cut
+    /// it, `--avx-gated`): #UD, else #NM, from the bank's controls (SDM Vol.2 2.8; `length` is not used).
+    pub const AVX_GATED: u32 = 49;
+    /// VLDMXCSR/VSTMXCSR m32 (I8; `VEX.L0.0F.WIG ae /2`, `/3`): LDMXCSR/STMXCSR's transaction without their CR0.EM/CR4.OSFXSR
+    /// gating (fexc cut them under the AVX gating, `--avx-gated`, which the resident raises as [`AVX_GATED`]).
+    pub const VLDMXCSR: u32 = 50;
+    pub const VSTMXCSR: u32 = 51;
     /// S3: SWAPGS (`0f 01 f8`), SYSCALL (`0f 05`), SYSRET (`0f 07`, `size` 8 with REX.W, else 4: compatibility mode).
     pub const SWAPGS: u32 = 34;
     pub const SYSCALL: u32 = 35;
@@ -1064,8 +1077,8 @@ pub mod system {
                     JMP_FAR..=CALL_FAR => self.memory == 1 && address && matches!(self.size, 4 | 8),
                     RET_FAR..=IRET => matches!(self.size, 4 | 8) && (self.kind == IRET || (0..=0xffff).contains(&self.disp)),
                     LOCK_UD => self.lock == 1,
-                    LDMXCSR | STMXCSR => self.memory == 1 && address,
-                    SSE_GATED => true,
+                    LDMXCSR | STMXCSR | VLDMXCSR | VSTMXCSR => self.memory == 1 && address,
+                    SSE_GATED | AVX_GATED => true,
                     INT => self.cr < 256,
                     INT3 | INTO | UD | TOO_LONG => true,
                     SWAPGS | SYSCALL | WBINVD => true,
@@ -1490,6 +1503,9 @@ mod tests {
         }
         assert!(inside(&frame::GUEST_STATE, frame::X87_FCW + 1) && !inside(&frame::GUEST_STATE_WRITABLE, frame::X87_FCW));
         assert!(!inside(&frame::GUEST_STATE, frame::X87_MM + 128) && !inside(&frame::GUEST_STATE, frame::X87_IE + 1));
+        // I8: FEX's avx_high[16][2] (the pinned CPUState), readable and writable, nothing around it.
+        assert!((frame::AVX_HIGH..frame::AVX_HIGH + 256).all(|b| inside(&frame::GUEST_STATE_WRITABLE, b)));
+        assert!(!inside(&frame::GUEST_STATE, frame::AVX_HIGH - 1) && !inside(&frame::GUEST_STATE, frame::AVX_HIGH + 256));
     }
 
     /// I6: x87 arithmetic runs under MXCSR's FPCR when FCW.RC equals MXCSR.RC and neither FTZ nor DAZ is set, else under its own.

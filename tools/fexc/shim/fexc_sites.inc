@@ -408,9 +408,13 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   FEXC_MEM(OP_STOREMEMTSO, IROp_StoreMemTSO, true)
 #undef FEXC_MEM
   // (I5a: MOVAPS/MOVAPD/MOVDQA m128 are an X-register pair, patch 0018: `Pair`, alignment-checked like a plain access.)
-  case IROps::OP_LOADMEMPAIR: { const auto Op = IROp->C<IR::IROp_LoadMemPair>(); Addr = &Op->Addr; Imm = Op->Offset; W *= 2; Pair = true; break; }
+  // (I8: the pair's offset is a signed imm7 multiple, held unsigned in the IR: a VEX.256 operand at [base - 32] is -32.)
+  case IROps::OP_LOADMEMPAIR: {
+    const auto Op = IROp->C<IR::IROp_LoadMemPair>(); Addr = &Op->Addr; Imm = int32_t(Op->Offset); W *= 2; Pair = true; break;
+  }
   case IROps::OP_STOREMEMPAIR: {
-    const auto Op = IROp->C<IR::IROp_StoreMemPair>(); Addr = &Op->Addr; Imm = Op->Offset; W *= 2; Store = true; Pair = true; break;
+    const auto Op = IROp->C<IR::IROp_StoreMemPair>(); Addr = &Op->Addr; Imm = int32_t(Op->Offset); W *= 2; Store = true; Pair = true;
+    break;
   }
   case IROps::OP_PUSH: {
     const auto Op = IROp->C<IR::IROp_Push>(); Addr = &Op->Addr; W = IR::OpSizeToSize(Op->ValueSize); Imm = -int64_t(W); Store = true;
@@ -430,7 +434,10 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   // the alignment check first: `and x0, A, #15; cbnz x0, stub` (#GP(0) at the stub, before any walk: QEMU's order; an
   // aligned 16-byte operand never crosses a page). FEX may load fewer bytes than the x86 operand (e.g. punpcklbw's low
   // half); the check is on the operand's address all the same.
-  const bool Align = fexc_slice1 && (Offset || Pair) && FexcLoadSite < 0 && !FexcStoreSeen && fexc_align16.count(Entry + FexcGuest);
+  // I8: VMOVAPS/VMOVAPD/VMOVDQA/VMOVNT* ymm: 32-byte alignment (`and x0, A, #31`); their VEX.128 forms are fexc_align16's.
+  const bool Align32 = fexc_slice1 && fexc_align32.count(Entry + FexcGuest);
+  const bool Align = fexc_slice1 && (Offset || Pair) && FexcLoadSite < 0 && !FexcStoreSeen && (Align32 || fexc_align16.count(Entry + FexcGuest));
+  const uint64_t AlignMask = Align32 ? 31 : 15;
   const bool Split = Store && W >= 2;
   if (!Align && !Split) return;
   bool Index = false;
@@ -450,7 +457,7 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   const auto Rip = fexc_rip_relative.find(IR->GetID(Node).Value);
   if (Rip != fexc_rip_relative.end() && !Index) {   // RIP-relative: a compile-time address
     const uint64_t A = Entry + Rip->second + Imm;
-    if (Align && (A & 15)) { b_OrRestart(Stub(Base, Imm, FEXC_SITE_ALIGN)); return; }
+    if (Align && (A & AlignMask)) { b_OrRestart(Stub(Base, Imm, FEXC_SITE_ALIGN)); return; }
     if (Split && ((A ^ (A + W - 1)) & 0x1000)) b_OrRestart(Stub(Base, Imm));
     return;
   }
@@ -467,7 +474,7 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
     A = TMP2;
   }
   if (Align) {
-    and_(ARMEmitter::Size::i64Bit, TMP1, A, 15);
+    and_(ARMEmitter::Size::i64Bit, TMP1, A, AlignMask);
     cbnz_OrRestart(ARMEmitter::Size::i64Bit, TMP1, Stub(A, 0, FEXC_SITE_ALIGN));
   }
   if (!Split) return;

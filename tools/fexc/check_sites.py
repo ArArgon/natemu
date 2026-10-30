@@ -102,7 +102,7 @@ def expected(asm):
     mn, _, rest = asm[5 if locked else 0:].partition(' ')
     ops = [o.strip() for o in rest.split(',')] if rest else []
     mem = [i for i, o in enumerate(ops) if '[' in o]
-    ptr = lambda o: dict(WIDTH, xmmword=16)[o.split(' ptr')[0].split()[-1]]
+    ptr = lambda o: dict(WIDTH, xmmword=16, ymmword=32)[o.split(' ptr')[0].split()[-1]]
     # I3: a LOCK read-modify-write is one atomic site (bt*: FEX's byte at the bit, as unlocked); LOCK NEG loads, then
     # compare-and-swaps (patch 0016); cmpxchg8b/16b are one caspal, locked or not.
     if mn in ('cmpxchg8b', 'cmpxchg16b'):
@@ -132,8 +132,9 @@ def expected(asm):
         return [('swap', w)]
     # I5a: an SSE form (an xmm operand, or crc32) loads its memory operand, or stores it when it is the destination; FEX
     # reads only the low 8 bytes of the 16-byte source of the unpack-low forms and pmovsx/zx's narrower operand as given.
-    if 'xmm' in rest or mn == 'crc32':
-        if i == 0 and mn not in ('ptest', 'comiss', 'ucomiss', 'comisd', 'ucomisd', 'crc32'):
+    # I8: the VEX forms likewise (ymm operands too; VPTEST/VTESTPS/VTESTPD and VCOMISS & co. only read).
+    if 'xmm' in rest or 'ymm' in rest or mn == 'crc32':
+        if i == 0 and mn.removeprefix('v') not in ('ptest', 'testps', 'testpd', 'comiss', 'ucomiss', 'comisd', 'ucomisd', 'crc32'):
             return [('store', w)]
         return [('load', w)]
     # I6: an x87 memory form loads its operand, but the stores (FST/FSTP/FIST/FISTP/FISTTP, FNSTSW/FNSTCW m16).
@@ -167,7 +168,7 @@ def site_classes(sites):
                 out.setdefault(g, []).append((k[:-5], w // 2))
         elif k in ('load', 'store', 'push', 'pop'):
             out.setdefault(s['guest_offset'], []).append((k, w))
-        elif k in ('load_pair', 'store_pair') and w == 16:   # I5a: MOVAPS/MOVAPD/MOVDQA m128, one 16-byte X-register pair
+        elif k in ('load_pair', 'store_pair') and w in (16, 32):   # I5a: MOVAPS m128's X-register pair; I8: a 32-byte Q pair
             out.setdefault(s['guest_offset'], []).append((k[:-5], w))
         else:
             out.setdefault(s['guest_offset'], []).append((k, w))

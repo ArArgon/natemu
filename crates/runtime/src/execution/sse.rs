@@ -47,14 +47,18 @@ fn gate(c: &Cpu) -> Result<(), Exception> {
 /// operand at the CPL (#SS(0) or #GP(0) for a non-canonical one by its class, `segments::noncanonical`; #PF), then for LDMXCSR #GP(0)
 /// for a 1 in a reserved bit (31:16, MXCSR_MASK = FFFFH; SDM Vol.2 LDMXCSR). `Ok`: committed.
 pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
-    gate(&s.cpu)?;
+    // I8: VLDMXCSR/VSTMXCSR are gated as VEX forms (OSXSAVE, XCR0, TS), at translation time: not by CR0.EM or CR4.OSFXSR.
+    let vex = matches!(i.kind, system::VLDMXCSR | system::VSTMXCSR);
+    if !vex {
+        gate(&s.cpu)?;
+    }
     if i.kind == system::SSE_GATED {
         // The host cut it as gated under these very controls.
         halt(s, stop::BAD_REPLY)
     }
     let va = address(&s.cpu, &i);
     let noncanonical = super::segments::noncanonical(&i);
-    if i.kind == system::LDMXCSR {
+    if matches!(i.kind, system::LDMXCSR | system::VLDMXCSR) {
         let mut buf = [0; 4];
         linear(s, va, &mut buf, false, false, noncanonical)?;
         let value = u64::from(u32::from_le_bytes(buf));

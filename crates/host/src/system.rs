@@ -21,6 +21,8 @@ use natemu_abi::execution::{SREG_DS, SREG_FS, SREG_GS, SREG_SS, System, system};
 const MAP_PRIMARY: u8 = 0;
 const MAP_TWO: u8 = 1;
 const MAP_0F38: u8 = 5;
+/// fexc's VEX map (`FEXC_MAP_VEX`, I8): the opcode byte after the VEX prefix.
+const MAP_VEX: u8 = 8;
 
 /// Decodes the instruction at the start of `bytes`, which fexc cut as a system instruction with opcode map `map` and
 /// opcode `opcode`.
@@ -48,7 +50,7 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         at += 1;
     }
     let mut rep_used = false;
-    let rex = match bytes[at] {
+    let mut rex = match bytes[at] {
         r @ 0x40..=0x4f => {
             at += 1;
             r
@@ -60,6 +62,21 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         MAP_TWO if *bytes.get(at)? == 0x0f && *bytes.get(at + 1)? == opcode => at += 2,
         MAP_PRIMARY if *bytes.get(at)? == opcode => at += 1,
         MAP_0F38 if bytes.get(at..at + 3)? == [0x0f, 0x38, opcode] => at += 3,
+        // I8: only VLDMXCSR/VSTMXCSR: map 0F, pp 0, VEX.L 0, VEX.vvvv 1111b (fexc admitted nothing else here); VEX.B and VEX.X
+        // extend the ModRM operand's base and index as REX would. No legacy SSE prefix or REX before VEX (`vex_ud`).
+        MAP_VEX if rex == 0 && !operand16 && rep == 0 => {
+            let (b1, b2) = (*bytes.get(at + 1)?, *bytes.get(at + 2)?);
+            let (map_select, p, op_at, xb) = match bytes[at] {
+                0xc5 => (1, b1, at + 2, 0),
+                0xc4 => (b1 & 31, b2, at + 3, (!b1 >> 5 & 1) | (!b1 >> 6 & 1) << 1),
+                _ => return None,
+            };
+            if map_select != 1 || p & 0x7f != 0x78 || *bytes.get(op_at)? != opcode {
+                return None;
+            }
+            rex = xb;
+            at = op_at + 1;
+        }
         _ => return None,
     }
     let mut s = System { lock: u32::from(lock), ..System::NONE };
@@ -271,6 +288,14 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
                 return None;
             }
         }
+        (MAP_VEX, 0xae) => {
+            let reg = rm(bytes, &mut at, rex, &mut s)?;
+            s.kind = match (s.memory, reg) {
+                (1, 2) => system::VLDMXCSR,
+                (1, 3) => system::VSTMXCSR,
+                _ => return None,
+            };
+        }
         (MAP_TWO, 0xae) => {
             let reg = rm(bytes, &mut at, rex, &mut s)?;
             s.kind = match (s.memory, reg) {
@@ -335,8 +360,33 @@ pub(crate) fn lock_ud(bytes: &[u8]) -> Option<System> {
     prefixes.take(14).any(|&b| b == 0xf0).then_some(System { kind: system::LOCK_UD, lock: 1, length: 1, ..System::NONE })
 }
 
+/// I8: a VEX prefix (C4/C5, 64-bit mode) after a 66, F2 or F3 prefix, or right after a REX: #UD (SDM Vol.2 2.3.2), whatever
+/// the instruction and its gating (fexc cuts it as a system instruction).
+pub(crate) fn vex_ud(bytes: &[u8]) -> Option<System> {
+    let (mut legacy, mut rex) = (false, false);
+    for &b in bytes.iter().take(15) {
+        match b {
+            0xc4 | 0xc5 => return (legacy || rex).then_some(System { kind: system::UD, length: 1, ..System::NONE }),
+            0x40..=0x4f => rex = true,
+            0x66 | 0xf2 | 0xf3 => (legacy, rex) = (true, false),
+            0xf0 | 0x67 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 => rex = false,
+            _ => return None,
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod lock_tests {
+    #[test]
+    fn legacy_prefix_before_vex() {
+        for bytes in [&[0x66, 0xc5, 0xf8, 0x77][..], &[0xf3, 0xc5, 0xfe, 0x6f, 0x07], &[0xf2, 0x64, 0xc4, 0xe2, 0x7d, 0x78, 0xff], &[0x48, 0xc5, 0xf8, 0x77]] {
+            assert!(super::vex_ud(bytes).is_some_and(|s| s.well_formed() && s.kind == super::system::UD), "{bytes:x?}");
+        }
+        for bytes in [&[0xc5, 0xf8, 0x77][..], &[0x64, 0xc5, 0xfe, 0x6f, 0x07], &[0x66, 0x0f, 0x6f, 0xc5], &[0x48, 0x89, 0xc4]] {
+            assert!(super::vex_ud(bytes).is_none(), "{bytes:x?}");
+        }
+    }
     #[test]
     fn lock_prefix_anywhere_in_the_legacy_prefixes() {
         for bytes in [&[0xf0, 0x89, 0x03][..], &[0x66, 0xf0, 0x01, 0xd8], &[0xf3, 0xf0, 0x0f, 0x1e, 0xfa], &[0x64, 0xf0, 0xf4]] {
@@ -541,6 +591,15 @@ mod tests {
         }
         assert_eq!(d("410fae5c2408", 0xae), Some(mem(STMXCSR, 12, 8, 6))); // stmxcsr [r12+8]
         assert_eq!(d("640fae18", 0xae), Some(System { segment: 4, ..mem(STMXCSR, 0, 0, 4) })); // stmxcsr fs:[rax]
+        // I8: VLDMXCSR/VSTMXCSR (map 8: fexc's VEX map); VEX.B/X extend base and index; VEX.L 1 or vvvv != 1111b is no form here.
+        let v = |h: &str| {
+            let bytes: Vec<u8> = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect();
+            decode(&[bytes, vec![0x90; 4]].concat(), MAP_VEX, 0xae)
+        };
+        assert_eq!(v("c5f8ae10").map(|s| (s.kind, s.base, s.memory, s.length)), Some((VLDMXCSR, 0, 1, 4))); // vldmxcsr [rax]
+        assert_eq!(v("c4c178ae5c2408").map(|s| (s.kind, s.base, s.disp, s.length)), Some((VSTMXCSR, 12, 8, 7))); // vstmxcsr [r12+8]
+        assert_eq!(v("64c5f8ae18").map(|s| (s.kind, s.segment)), Some((VSTMXCSR, SREG_FS as u32))); // vstmxcsr fs:[rax]
+        assert!(v("c5fcae10").is_none() && v("c5f0ae10").is_none() && v("c5f8aed0").is_none() && v("66c5f8ae10").is_none());
         for hex in ["660fae10", "f30fae10", "670fae10"] {
             assert_eq!(d(hex, 0xae), None, "{hex}"); // 66, f3, 32-bit address
         }

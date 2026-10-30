@@ -356,7 +356,8 @@ def guards(d, dis, order):
                     ok.add(o)
             continue
         # I5a: the alignment check `and x0, xA, #0xf; cbnz x0, stub` on exactly the access's address (the first access of a
-        # legacy SSE instruction whose 16-byte operand must be aligned), then only scratch writes and the split check.
+        # legacy SSE instruction whose 16-byte operand must be aligned), then only scratch writes and the split check. I8:
+        # `#0x1f` for a 32-byte access (VMOVAPS ymm and the like).
         al = [x for x in mine if x['kind'] == 'align']
         if len(al) > 1:
             out.append(f'{tag}: {len(al)} alignment stubs')
@@ -365,7 +366,7 @@ def guards(d, dis, order):
             t3 = check_at.get(x['native_offset'])
             ce = checked_expr(A, lo, t3 - 4, dis, order) if t3 is not None else None
             if t3 is None or not (lo <= t3 - 4 and t3 < at) or dis.get(t3) != f'cbnz x0, {x["native_offset"]:#x}' or \
-                    dis.get(t3 - 4) != f'and x0, x{A}, #0xf' or x['imm'] != 0 or ce != expr or written(ce[0], t3 - 4, at) or \
+                    dis.get(t3 - 4) != f'and x0, x{A}, #{0x1f if s["width"] == 32 else 0xf:#x}' or x['imm'] != 0 or ce != expr or written(ce[0], t3 - 4, at) or \
                     (ix is not None and written(ix, t3 - 4, at)):
                 out.append(f'{tag}: alignment stub +{x["native_offset"]} is not `and x0, xA, #0xf; cbnz x0` on the access address ({ce} vs {expr})')
             else:
@@ -623,6 +624,8 @@ GUEST_STATE_BASES = ((0x3e0, 8), (0x3e8, 8))
 X87_STATE = ((0x410, 1), (0x415, 2), (0x418, 4), (0x41e, 1), (0x4b2, 1), (0x4b4, 4))
 X87_FCW = (0x4b0, 2)
 X87_EXCEPTIONS = 0x4b4
+# I8: the YMM upper halves (abi `frame::AVX_HIGH`, FEX's avx_high[16][2]), read and written (single or paired Q, `stp xzr`).
+AVX_HIGH = ((0xc0, 256),)
 
 
 def entry_and_branches(d, dis, order):
@@ -639,7 +642,7 @@ def entry_and_branches(d, dis, order):
         guest_state = guest_state or (acc and acc[2] == 'x28' and acc[0] == 'load' and acc[3] is None and acc[5] == 'none' and
                                       any(f <= acc[4] and acc[4] + acc[1] <= f + n for f, n in GUEST_STATE_BASES))
         inside = lambda fields: acc and acc[3] is None and acc[5] == 'none' and any(f <= acc[4] and acc[4] + acc[1] <= f + n for f, n in fields)
-        guest_state = guest_state or (acc and acc[2] == 'x28' and (inside(X87_STATE) or (acc[0] == 'load' and inside((X87_FCW,)))))
+        guest_state = guest_state or (acc and acc[2] == 'x28' and (inside(X87_STATE) or inside(AVX_HIGH) or (acc[0] == 'load' and inside((X87_FCW,)))))
         if acc and acc[2] in ('x28', 'sp') and not guest_state:
             out.append(f'+{off} "{dis[off]}" accesses emulator data ({acc[2]})')
         if re.fullmatch(r'ldr\w* \w+, 0x[0-9a-f]+', dis[off]):

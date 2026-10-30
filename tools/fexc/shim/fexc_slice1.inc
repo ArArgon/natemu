@@ -18,8 +18,10 @@ using namespace FEXCore::X86Tables;
 enum Kind : uint8_t { ALLOW, SYSTEM, UNSUPPORTED };
 // `simd`: an SSE form, gated by CR0.EM/TS and CR4.OSFXSR (I5a); `align`: its 16-byte memory operand must be 16-byte aligned.
 // `x87` (I6): 1 = a documented x87 form (d8..df: #NM under CR0.EM or CR0.TS whatever else it is), 2 = WAIT/FWAIT (9b: #NM
-// under CR0.TS with CR0.MP). `gated`: cut because of that gating (the host's `cut_gated`).
-struct Verdict { Kind kind; bool branch; const char* why; bool simd = false; bool align = false; uint8_t x87 = 0; bool gated = false; };
+// under CR0.TS with CR0.MP). `gated`: cut because of that gating (the host's `cut_gated`). `avx` (I8): a VEX-encoded AVX/AVX2/
+// FMA/F16C form, gated by CR4.OSXSAVE, XCR0[2:1] and CR0.TS; `align32`: its 32-byte memory operand must be 32-byte aligned.
+struct Verdict { Kind kind; bool branch; const char* why; bool simd = false; bool align = false; uint8_t x87 = 0; bool gated = false;
+                 bool avx = false; bool align32 = false; };
 
 inline Verdict Allow(bool branch = false) { return {ALLOW, branch, ""}; }
 inline Verdict Sys(const char* why) { return {SYSTEM, false, why}; }
@@ -149,6 +151,139 @@ inline Verdict Vex(uint8_t vex, uint8_t op, bool has_modrm, uint8_t reg) {
   }
   if (map == 3 && op == 0xF0 && pp == 3) return Allow();                               // rorx
   return Uns("VEX form other than BMI1/BMI2 (AVX: chunk I8)");
+}
+
+// The VEX prefix as encoded (SDM Vol.2 2.3.5): C5 (map 0F, W 0) or C4 (map_select, W); vvvv and the register-extension bits
+// inverted. `legacy`: a 66, F2 or F3 prefix before it, or a REX immediately before it (#UD, SDM Vol.2 2.3.2); `rex_far`: a
+// REX before it with another prefix in between (no SDM text: refused).
+struct VexBytes { bool ok = false, legacy = false, rex_far = false; uint8_t map = 0, pp = 0, L = 0, W = 0, vvvv = 0, R = 0, X = 0; unsigned op = 0; };
+inline VexBytes ParseVex(const uint8_t* b, unsigned n) {
+  VexBytes v;
+  unsigned i = 0;
+  bool rex = false;
+  for (; i < n; ++i) {
+    const uint8_t x = b[i];
+    if (x >= 0x40 && x <= 0x4F) { rex = true; continue; }
+    if (x == 0x66 || x == 0xF2 || x == 0xF3) v.legacy = true;
+    else if (!(x == 0x26 || x == 0x2E || x == 0x36 || x == 0x3E || x == 0x64 || x == 0x65 || x == 0x67 || x == 0xF0)) break;
+    if (rex) { v.rex_far = true; rex = false; }
+  }
+  if (rex) v.legacy = true;
+  if (i + 2 >= n) return v;
+  if (b[i] == 0xC5) {
+    v.map = 1; v.W = 0; v.vvvv = (~b[i + 1] >> 3) & 15; v.L = (b[i + 1] >> 2) & 1; v.pp = b[i + 1] & 3; v.ok = true;
+    v.R = (~b[i + 1] >> 7) & 1; v.op = i + 2;
+  } else if (b[i] == 0xC4 && i + 3 < n) {
+    v.map = b[i + 1] & 31; v.W = b[i + 2] >> 7; v.vvvv = (~b[i + 2] >> 3) & 15; v.L = (b[i + 2] >> 2) & 1; v.pp = b[i + 2] & 3; v.ok = true;
+    v.R = (~b[i + 1] >> 7) & 1; v.X = (~b[i + 1] >> 6) & 1; v.op = i + 3;
+  }
+  return v;
+}
+
+// AVX, AVX2, FMA and F16C (I8; the profile advertises all four: CPUID.1:ECX 28, 12, 29 and CPUID.7.0:EBX 5) on XMM/YMM
+// registers, VEX-encoded (SDM Vol.2 chapters 3-5 per instruction, 2.3, 2.5). FEX's AVX128 lowering (no SVE256 on the M4):
+// each 256-bit operation as two 128-bit halves, the upper halves in the guest-state page (`avx_high`, frame::AVX_HIGH), a
+// 32-byte memory operand as one LDP/STP of two Q registers. Rows: the VEX.L values the form has (L0: 128-bit only, L1:
+// 256-bit only; a scalar "LIG" form is admitted with L = 0 only, by policy), a VEX.W requirement (W0/W1, else WIG), NOV:
+// VEX.vvvv is reserved (1111b, else #UD: refused), MEM/REG: memory or register operand only, ALIGN: VMOVAPS/VMOVAPD/
+// VMOVDQA/VMOVNTPS/VMOVNTPD/VMOVNTDQ/VMOVNTDQA, whose operand must be aligned to its size (#GP(0); every other VEX form
+// has no alignment requirement, Vol.2 2.5 exception class 4). Anything else is refused (`unsupported_form`) with its reason;
+// `avx` is also set on the refused forms x86 defines, so their gating (#UD/#NM) is delivered first.
+inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
+  enum : uint16_t { L0 = 1, L1 = 2, LL = 3, W0 = 4, W1 = 8, NOV = 16, MEM = 32, REG = 64, ALIGN = 128, NONE = 0x8000 };
+  auto in = [](uint8_t v, std::initializer_list<int> l) { for (int x : l) if (x == v) return true; return false; };
+  // A form x86 defines but I8 refuses: its own row first, so an encoding x86 makes #UD stays an encoding refusal (never a
+  // gated #UD/#NM); `refuse` is returned (avx set, so a valid encoding is gated first) only after the encoding checks.
+  const char* refuse = nullptr;
+  bool mxcsr = false;
+  uint16_t r = NONE;
+  if (map == 1 && pp == 0) {
+    if (in(op, {0x10, 0x11, 0x51, 0x52, 0x53, 0x5a, 0x5b})) r = LL | NOV;
+    else if (op == 0x12 || op == 0x16) r = L0;                                   // vmovlps/vmovhlps, vmovhps/vmovlhps
+    else if (op == 0x13 || op == 0x17) r = L0 | NOV | MEM;
+    else if (in(op, {0x14, 0x15, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5c, 0x5d, 0x5e, 0x5f, 0xc2, 0xc6})) r = LL;
+    else if (op == 0x28 || op == 0x29) r = LL | NOV | ALIGN;
+    else if (op == 0x2b) r = LL | NOV | MEM | ALIGN;
+    else if (op == 0x2e || op == 0x2f) r = L0 | NOV;
+    else if (op == 0x50) r = LL | NOV | REG;
+    else if (op == 0x77) r = LL | NOV;                                           // vzeroupper (L0), vzeroall (L1)
+    else if (op == 0xae && has_modrm && (reg == 2 || reg == 3)) { r = L0 | NOV | MEM; mxcsr = true; }   // vldmxcsr/vstmxcsr m32
+  } else if (map == 1 && pp == 1) {
+    if (in(op, {0x10, 0x11, 0x51, 0x5a, 0x5b, 0x70, 0xe6})) r = LL | NOV;
+    else if (op == 0x12 || op == 0x16) r = L0 | MEM;                             // vmovlpd/vmovhpd xmm, xmm, m64
+    else if (op == 0x13 || op == 0x17) r = L0 | NOV | MEM;
+    else if (in(op, {0x28, 0x29, 0x6f, 0x7f})) r = LL | NOV | ALIGN;
+    else if (op == 0x2b || op == 0xe7) r = LL | NOV | MEM | ALIGN;
+    else if (op == 0x2e || op == 0x2f || op == 0x6e || op == 0x7e || op == 0xd6) r = L0 | NOV;
+    else if (op == 0x50 || op == 0xd7) r = LL | NOV | REG;
+    else if (op == 0xc4) r = L0;
+    else if (op == 0xc5) r = L0 | NOV | REG;
+    else if (op == 0x71 || op == 0x72 || op == 0x73) {                          // shifts by imm8: VEX.vvvv is the destination
+      if (has_modrm && mod == 3 && (reg == 2 || reg == 6 || (op != 0x73 && reg == 4) || (op == 0x73 && (reg == 3 || reg == 7)))) r = LL;
+    } else if (op == 0xf7) { r = L0 | NOV | REG; refuse = "vmaskmovdqu: a byte-masked store (FEX stores all 16 bytes)"; }
+    else if (in(op, {0x14, 0x15, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5c, 0x5d, 0x5e, 0x5f, 0x74, 0x75, 0x76, 0x7c, 0x7d, 0xc2, 0xc6, 0xd0}) ||
+             (op >= 0x60 && op <= 0x6d) || (op >= 0xd1 && op <= 0xd5) || (op >= 0xd8 && op <= 0xe5) || (op >= 0xe8 && op <= 0xef) ||
+             (op >= 0xf1 && op <= 0xf6) || (op >= 0xf8 && op <= 0xfe))
+      r = LL;
+  } else if (map == 1 && pp == 2) {
+    if (op == 0x10 || op == 0x11) r = mod == 3 ? L0 : L0 | NOV;                  // vmovss: NDS for registers only
+    else if (in(op, {0x12, 0x16, 0x5b, 0x6f, 0x70, 0x7f, 0xe6})) r = LL | NOV;
+    else if (in(op, {0x2a, 0x51, 0x52, 0x53, 0x58, 0x59, 0x5a, 0x5c, 0x5d, 0x5e, 0x5f, 0xc2})) r = L0;
+    else if (op == 0x2c || op == 0x2d || op == 0x7e) r = L0 | NOV;
+  } else if (map == 1 && pp == 3) {
+    if (op == 0x10 || op == 0x11) r = mod == 3 ? L0 : L0 | NOV;                  // vmovsd
+    else if (in(op, {0x12, 0x70, 0xe6})) r = LL | NOV;
+    else if (in(op, {0x2a, 0x51, 0x58, 0x59, 0x5a, 0x5c, 0x5d, 0x5e, 0x5f, 0xc2})) r = L0;
+    else if (op == 0x2c || op == 0x2d) r = L0 | NOV;
+    else if (in(op, {0x7c, 0x7d, 0xd0})) r = LL;
+    else if (op == 0xf0) r = LL | NOV | MEM;                                     // vlddqu
+  } else if (map == 2 && pp == 1) {
+    if (op <= 0x0b || in(op, {0x28, 0x29, 0x2b, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x45, 0x47})) r = LL;
+    else if (op == 0x0c || op == 0x0d || op == 0x46) r = LL | W0;
+    else if (in(op, {0x0e, 0x0f, 0x13, 0x18, 0x58, 0x59, 0x78, 0x79})) r = LL | W0 | NOV;
+    else if (op == 0x16 || op == 0x36) r = L1 | W0;                              // vpermps, vpermd
+    else if (op == 0x17 || (op >= 0x1c && op <= 0x1e) || (op >= 0x20 && op <= 0x25) || (op >= 0x30 && op <= 0x35)) r = LL | NOV;
+    else if (op == 0x19) r = L1 | W0 | NOV;                                      // vbroadcastsd
+    else if (op == 0x1a || op == 0x5a) r = L1 | W0 | NOV | MEM;                  // vbroadcastf128, vbroadcasti128
+    else if (op == 0x2a) r = LL | NOV | MEM | ALIGN;                             // vmovntdqa
+    else if (op == 0x41) r = L0 | NOV;                                           // vphminposuw
+    else if (in(op, {0x96, 0x97, 0x98, 0x9a, 0x9c, 0x9e, 0xa6, 0xa7, 0xa8, 0xaa, 0xac, 0xae, 0xb6, 0xb7, 0xb8, 0xba, 0xbc, 0xbe})) r = LL;
+    else if (in(op, {0x99, 0x9b, 0x9d, 0x9f, 0xa9, 0xab, 0xad, 0xaf, 0xb9, 0xbb, 0xbd, 0xbf})) r = L0;   // FMA scalar
+    else if (in(op, {0x2c, 0x2d, 0x2e, 0x2f, 0x8c, 0x8e})) {
+      r = LL | MEM | (op <= 0x2f ? W0 : 0);
+      refuse = "vmaskmovps/pd, vpmaskmovd/q: FEX's masked load and store are element loops (branches over accesses)";
+    } else if (op >= 0x90 && op <= 0x93) { r = LL | MEM; refuse = "vgather*/vpgather*: FEX's gather is an element loop (one site per element)"; }
+    else if (op == 0xdb) { r = L0 | NOV; refuse = "VEX AES (not in I8)"; }        // vaesimc
+    else if (op >= 0xdc && op <= 0xdf) { r = L0; refuse = "VEX AES (not in I8)"; }   // vaesenc/last, vaesdec/last (VAES not advertised)
+  } else if (map == 3 && pp == 1) {
+    if (op == 0x00 || op == 0x01) r = L1 | W1 | NOV;                             // vpermq, vpermpd
+    else if (op == 0x02 || op == 0x4a || op == 0x4b || op == 0x4c) r = LL | W0;  // vpblendd, vblendvps/pd, vpblendvb
+    else if (op == 0x04 || op == 0x05 || op == 0x1d) r = LL | W0 | NOV;          // vpermilps/pd imm8, vcvtps2ph
+    else if (op == 0x06 || op == 0x18 || op == 0x38 || op == 0x46) r = L1 | W0;  // vperm2f128, vinsertf128, vinserti128, vperm2i128
+    else if (op == 0x19 || op == 0x39) r = L1 | W0 | NOV;                        // vextractf128, vextracti128
+    else if (op == 0x08 || op == 0x09) r = LL | NOV;
+    else if (op == 0x0a || op == 0x0b || op == 0x20 || op == 0x21 || op == 0x22 || op == 0x41) r = L0;
+    else if (in(op, {0x0c, 0x0d, 0x0e, 0x0f, 0x40, 0x42})) r = LL;
+    else if (op >= 0x14 && op <= 0x17) r = L0 | NOV;
+    else if (op >= 0x60 && op <= 0x63) { r = L0 | NOV; refuse = "vpcmpestri/m, vpcmpistri/m: FEX calls a host helper"; }
+    else if (op == 0x44) { r = L0; refuse = "VEX PCLMULQDQ (not in I8)"; }                 // VPCLMULQDQ ymm not advertised
+    else if (op == 0xdf) { r = L0 | NOV; refuse = "VEX AESKEYGENASSIST (not in I8)"; }
+  }
+  if (r == NONE) return Uns("VEX form not in the I8 allowlist");
+  if (!(r & (L ? L1 : L0))) return Uns(L ? "VEX.L = 1 on a 128-bit or scalar form (#UD, or LIG: refused)" : "VEX.L = 0 on a 256-bit-only form (#UD)");
+  if (((r & W0) && W) || ((r & W1) && !W)) return Uns("VEX.W the form does not define (#UD)");
+  if ((r & NOV) && vvvv != 0) return Uns("VEX.vvvv not 1111b on a form without a VEX.vvvv operand (#UD)");
+  if (op == 0x77 && map == 1) { Verdict v = Allow(); v.avx = true; return v; }
+  if (!has_modrm || ((r & MEM) && mod == 3) || ((r & REG) && mod != 3)) return Uns("AVX form with an operand x86 makes #UD");
+  if (refuse) { Verdict v = Uns(refuse); v.avx = true; return v; }
+  // VLDMXCSR/VSTMXCSR m32: the resident's LDMXCSR/STMXCSR transaction (the host's VLDMXCSR/VSTMXCSR: no CR0.EM/CR4.OSFXSR
+  // gating, the AVX gating being this cut's).
+  if (mxcsr) { Verdict v = Sys("vldmxcsr/vstmxcsr (the resident's MXCSR transaction)"); v.avx = true; return v; }
+  Verdict v = Allow();
+  v.avx = true;
+  v.align = mod != 3 && (r & ALIGN);
+  v.align32 = v.align && L;
+  return v;
 }
 
 // SSE, SSE2, SSE3, SSSE3, SSE4.1, SSE4.2 (I5a; the profile advertises all six: CPUID.1 EDX 25/26, ECX 0/9/19/20) on XMM
@@ -344,7 +479,37 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
     // popcnt, tzcnt, lzcnt: the profile advertises POPCNT, BMI1 and LZCNT, so f3 0f bc/bd are TZCNT/LZCNT (FEX
     // decodes them so unconditionally: X86Tables/SecondaryTables.cpp RepModOps).
     v = (op == 0xB8 || op == 0xBC || op == 0xBD) ? Allow() : Two(op, false, has_modrm, mod, reg); break;
-  case FEXC_MAP_VEX: v = Vex(d.FexcVex, d.FexcVexOp, has_modrm, reg); break;
+  case FEXC_MAP_VEX: {
+    // I8: a VEX form after a 66, F2 or F3 prefix, or right after a REX, is #UD (SDM Vol.2 2.3.2), whatever the gating: cut as a
+    // system instruction (the host's `vex_ud`). Then the BMI forms (general registers, not gated), else the AVX table, whose
+    // forms are gated by CR4.OSXSAVE, XCR0[2:1] and CR0.TS (the host's `--avx-gated`; the resident raises #UD or #NM).
+    const uint8_t* b = decoded && fexc_guest_bytes ? fexc_guest_bytes(d.PC, d.InstSize) : nullptr;
+    if (!b) return Uns("VEX: instruction bytes unavailable");
+    const VexBytes x = ParseVex(b, d.InstSize);
+    if (!x.ok) return Uns("VEX prefix not found in the bytes");
+    if (x.legacy) return Sys("66, F2, F3 or REX prefix before VEX (#UD)");
+    if (x.rex_far) return Uns("REX before VEX with another prefix between them (no SDM rule)");
+    // I8 re-review: a gather (VEX.66.0F38 90..93) is #UD unless ModRM.rm = 100b (a SIB byte: VSIB) and its destination
+    // (ModRM.reg, VEX.R), mask (VEX.vvvv) and index (SIB.index, VEX.X) registers are three different ones (SDM VPGATHERDD
+    // and the like): an encoding refusal, so never a gated #NM.
+    if (x.map == 2 && x.pp == 1 && d.FexcVexOp >= 0x90 && d.FexcVexOp <= 0x93 && has_modrm && mod != 3) {
+      const unsigned at = x.op + 1;
+      const uint8_t rm = at < d.InstSize ? b[at] & 7 : 0;
+      const uint8_t dst = reg | x.R << 3, index = rm == 4 && at + 1 < d.InstSize ? ((b[at + 1] >> 3) & 7) | x.X << 3 : 0xFF;
+      if (rm != 4) return Uns("gather without a SIB byte (VSIB; #UD)");
+      if (dst == x.vvvv || dst == index || x.vvvv == index) return Uns("gather whose destination, index and mask registers are not all different (#UD)");
+    }
+    v = Vex(d.FexcVex, d.FexcVexOp, has_modrm, reg);
+    if (v.kind != ALLOW) {
+      v = Avx(x.map, x.pp, x.L, x.W, x.vvvv, d.FexcVexOp, has_modrm, mod, reg);
+      if (v.avx && fexc_avx_gated) {
+        v = Sys("AVX form gated by CR4.OSXSAVE, XCR0[2:1] or CR0.TS (#UD/#NM)");
+        v.gated = true;
+        return v;
+      }
+    }
+    break;
+  }
   case FEXC_MAP_0F38:
     v = (op >= 0x80 && op <= 0x82) ? Sys("invept/invvpid/invpcid") : Uns("0f38 map"); break;
   default: v = Uns("0f3a/3dnow map"); break;
@@ -430,8 +595,15 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
     return Uns("operand-size prefix on pushf/enter/leave (16-bit stack forms)");
   if (primary && op == 0xC8 && ((d.Src[0].Literal() >> 16) & 0x1F) != 0)
     return Uns("enter with a nesting level (several stores)");
-  if (d.FexcMap == FEXC_MAP_VEX && (f & (DecodeFlags::FLAG_OPERAND_SIZE | DecodeFlags::FLAG_REX_PREFIX)))
-    return Uns("66 or REX before VEX (#UD)");
+  // I8: VCVTPS2PH m: the conversion raises its MXCSR flags (FPSR) before the store, which may fault; x86 commits neither.
+  if (d.FexcMap == FEXC_MAP_VEX && v.avx && (d.FexcVex & 3) == 3 && d.FexcVexOp == 0x1D && has_modrm && mod != 3)
+    return Uns("vcvtps2ph m: its MXCSR flags would be raised before the store, which may fault");
+  // I8: VINSERTPS m32 whose zero mask clears the inserted element: FEX drops the load and its #PF (as INSERTPS, I5a).
+  if (d.FexcMap == FEXC_MAP_VEX && v.avx && (d.FexcVex & 3) == 3 && d.FexcVexOp == 0x21 && has_modrm && mod != 3) {
+    const uint8_t* b = fexc_guest_bytes(d.PC, d.InstSize);
+    const uint8_t imm = b[d.InstSize - 1];
+    if ((imm & 0xF) & (1 << (imm >> 4 & 3))) return Uns("vinsertps m32 whose zero mask clears the inserted element (FEX drops the load and its #PF)");
+  }
   return v;
 }
 
@@ -470,7 +642,7 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
     const bool lock_neg = d.FexcMap == FEXC_MAP_PRIMARY && (op == 0xF6 || op == 0xF7) && ((d.ModRM >> 3) & 7) == 3 &&
                           (d.Flags & DecodeFlags::FLAG_LOCK);
     if (lock_neg) fexc_after_rep = rip + d.InstSize;
-    if (v.align) fexc_align16.insert(rip);   // I5a: its first access gets the alignment check (#GP(0))
+    if (v.align) (v.align32 ? fexc_align32 : fexc_align16).insert(rip);   // I5a/I8: its first access gets the alignment check (#GP(0))
     FexcMmioRecord(d, rip);                  // M3: completion record of a MOV-family device access
     if (v.x87 == 1) {   // I6: FSW exception flags from FPSR, the x87 FPCR; FCOM forms and FTST signal, FIST/FRNDINT raise PE
       const uint8_t m = d.ModRM, r = (m >> 3) & 7;
@@ -483,6 +655,14 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
       // fistp m64 and frndint: frintx (PE); m16/m32 FIST computes PE itself (patch 0019: none beside an out-of-range IE)
       if ((memory && op == 0xDF && r == 7) || (op == 0xD9 && m == 0xFC))
         fexc_round_inexact.insert(rip);
+    }
+    if (v.avx) {   // I8: the same for the VEX forms (FEX's AVX128 lowering uses the same IR ops)
+      const uint8_t* b = fexc_guest_bytes(d.PC, d.InstSize);
+      const VexBytes x = ParseVex(b, d.InstSize);
+      const uint8_t vop = d.FexcVexOp;
+      if (x.map == 1 && x.pp <= 1 && vop == 0x2F) fexc_fp_signal.insert(rip);
+      if (x.map == 1 && (x.pp == 0 || x.pp == 2) && (vop == 0x52 || vop == 0x53)) fexc_fp_quiet.insert(rip);
+      if (x.map == 3 && vop >= 0x08 && vop <= 0x0B && !(b[d.InstSize - 1] & 8)) fexc_round_inexact.insert(rip);
     }
     if (v.simd) {   // I5a: the MXCSR flags FEX's lowering would get wrong (fexc_hook.h)
       const uint8_t* b = fexc_guest_bytes(d.PC, d.InstSize);

@@ -72,7 +72,8 @@ def step(insn, undefined):
     # FCOMI & co.: the SDM clears OF, SF and AF ("set the OF, SF, and AF flags to zero", natemu/FEX do); the pinned QEMU 7.2
     # keeps them (helper_fcomi), so they are not compared after one.
     if insn.get('sse') and op in ('fcomi', 'fcomip', 'fucomi', 'fucomip'): return (undefined & ~ALL6) | OF | SF | AF
-    if insn.get('sse'): return undefined & ~ALL6 if op in ('comiss', 'ucomiss', 'comisd', 'ucomisd', 'ptest') else undefined
+    # I8: their VEX forms, and VTESTPS/VTESTPD, likewise.
+    if insn.get('sse'): return undefined & ~ALL6 if op.removeprefix('v') in ('comiss', 'ucomiss', 'comisd', 'ucomisd', 'ptest', 'testps', 'testpd') else undefined
     if op in NO_FLAGS | NO_FLAGS_I1 | STRING_MOVES | {'lahf', 'pushf'}: return undefined
     if op in STRING_COMPARES: return undefined if insn.get('count') == 0 else undefined & ~ALL6
     if op in ('clc', 'stc', 'cmc'): return undefined & ~CF

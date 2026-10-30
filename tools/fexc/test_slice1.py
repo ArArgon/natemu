@@ -64,11 +64,17 @@ UNSUPPORTED = {
     # Intel's class since series27; still cut: SS with CS/DS/ES (mixed classes), SS on a moffs operand
     'ss ds mov rax,[rbx] (mixed)': '363e488b03', 'ss movabs rax,[moffs]': '3648a10102030405060708',
     'paddd mm (MMX, I6)': '0ffec1', 'pcmpistri (host helper)': '660f3a63c100', 'maskmovdqu': '660ff7c1', 'f3 66 movss': 'f3660f10c1',
-    'insertps m32 zeroing its element': '660f3a21000f', 'aesenc': '660f38dcc1', 'vzeroupper': 'c5f877',
+    'insertps m32 zeroing its element': '660f3a21000f', 'aesenc': '660f38dcc1',
+    # I8: AVX forms FEX cannot do exactly, VEX encodings x86 makes #UD (refused, not delivered), unadvertised VEX forms
+    'vpgatherdd': 'c4e26d90040f', 'vmaskmovps ld': 'c4e2752c00', 'vmaskmovps st': 'c4e2752e08', 'vmaskmovdqu': 'c5f9f7ca',
+'vcvtps2ph m': 'c4e37d1d3004', 'vpcmpistri': 'c4e3796300 12'.replace(' ', ''), 'vaesenc': 'c4e271dcc2',
+    'vmovd L=1 (#UD)': 'c5fd6ec6', 'vaddss L=1 (LIG)': 'c5f658c2', 'vpermq L=0 (#UD)': 'c4e3f900c11b', 'vpermq W0 (#UD)': 'c4e37d00c11b',
+    'vmovaps vvvv (#UD)': 'c5f428c1', 'vpdpbusd (VNNI)': 'c4e27950e1', 'addr32 vmovdqu': '67c5fe6f00',
+    'vinsertps m32 zeroing its element': 'c4e37921001f',
     'o16 pushf': '669c', 'o16 leave': '66c9', 'enter level 1': 'c8080001', 'o16 shld': '660fa4c101', 'o16 shrd cl': '660fadc1',
     'prefetchw': '0f0d08', 'prefetch /4 (reserved nop)': '0f1820', 'prefetch reg (reserved nop)': '0f18c0', 'movnti reg': '0fc3c1',
-    'pdep': 'c4e2fbf5c1', 'pext': 'c4e2faf5c1', 'andn L=1': 'c4e27cf2c1', 'blsr /0 (#UD)': 'c4e278f3c1', 'vpxor': 'c5f9efc0',
-    'rex andn (#UD)': '48c4e278f2c1', 'o16 andn (#UD)': '66c4e278f2c1', 'rep popcnt-like f2 0f b8': 'f20fb8c1',
+    'pdep': 'c4e2fbf5c1', 'pext': 'c4e2faf5c1', 'andn L=1': 'c4e27cf2c1', 'blsr /0 (#UD)': 'c4e278f3c1',
+    'rep popcnt-like f2 0f b8': 'f20fb8c1',
     'loop 67-prefix': '67e2fe', 'jecxz': '67e3fe', 'loop o16': '66e2fe', 
     'xlat': 'd7', 'movbe': '0f38f000', 'sal /6 alias': 'd1f0',
     'bnd ret': 'f2c3', 'o16 ret': '66c3', 'o16 jmp': '66e9fbffffff', 'bswap r9w (undefined)': '66410fc9', 'bswap ax': '660fc8',
@@ -87,7 +93,18 @@ LOCK_UD = {
     'lock cmpxchg rcx,rdx': 'f0480fb1d1', 'lock lea rax,[rax]': 'f0488d00', 'lock movaps': 'f00f2800',
 }
 
+# I8: a 66, F2 or F3 prefix before VEX, or a REX right before it, is #UD whatever the instruction (a system cut, the host's vex_ud).
+VEX_UD = {'rex andn': '48c4e278f2c1', 'o16 andn': '66c4e278f2c1', 'o16 vzeroupper': '66c5f877', 'f3 vaddps': 'f3c5f458c2',
+          'f2 vpbroadcastb': 'f2c4e27d78ff'}
+
 ALLOWED = {
+    # I8: AVX, AVX2, FMA, F16C (VEX)
+    'vzeroupper': 'c5f877', 'vzeroall': 'c5fc77', 'vpxor': 'c5f9efc0', 'vmovd xmm7,esi': 'c5f96efe', 'vpbroadcastb ymm7,xmm7': 'c4e27d78ff',
+    'vmovdqu ymm1,[rdi]': 'c5fe6f0f', 'vmovdqu [rdx],ymm1': 'c5fe7f0a', 'vmovaps ymm1,[rax]': 'c5fc2808', 'vmovdqa xmm1,[rax]': 'c5f96f08',
+    'vpcmpeqb ymm0,ymm7,ymm1': 'c5c574c1', 'vpmovmskb eax,ymm0': 'c5fdd7c0', 'vfmadd231ps ymm0,ymm1,[rax]': 'c4e275b800',
+    'vcvtph2ps ymm1,xmm2': 'c4e27d13ca', 'vcmpps ymm1,ymm2,[rax],30': 'c5ecc2081e', 'vpermq ymm1,ymm2,27': 'c4e3fd00ca1b',
+    'vbroadcastss ymm1,[rax]': 'c4e27d1808', 'vpinsrd xmm1,xmm2,[rax],2': 'c4e369220802', 'vextracti128 [rax],ymm1,1': 'c4e37d390801',
+    'fs vmovdqu ymm1,[rax]': '64c5fe6f08', 'vmovntdq [rax],ymm1': 'c5fde708',
     # I3: every lockable memory form with LOCK (one LSE atomic each), cmpxchg8b/16b with or without it
     'lock add [rax],rcx': 'f0480108', 'lock inc [rax]': 'f0ff00', 'lock cmpxchg [rax],ecx': 'f00fb108', 'lock xadd [rax],ecx': 'f00fc108',
     'lock adc [rax],cl': 'f01008', 'lock sbb word [rax],5': '66f0831805', 'lock and [rax],rcx': 'f0482108', 'lock or [rax],ecx': 'f00908',
@@ -204,6 +221,31 @@ class Slice1Cutting(unittest.TestCase):
                 self.cut_after_two(name, x, 'system_instruction')
                 d, _ = run(x + PRE)
                 self.assertIn('not lockable (#UD)', d['guest']['end']['detail'], name)
+
+    def test_invalid_avx_encodings_are_not_gated(self):
+        # I8 review: an encoding x86 makes #UD (VPGATHERDD with a register operand, VAESENC with VEX.L = 1) is refused under
+        # the AVX gating too, never a gated cut (#NM under TS would be wrong); a valid refused form is gated.
+        # (I8 re-review: VPGATHERDD without a SIB byte, or with two of destination, mask and index the same register: #UD too.)
+        for hexs, gated in (('c4e27d90c1', False), ('c4e27ddcc2', False), ('c4e27d9000', False), ('c4e27d90040f', False),
+                            ('c4e26d900c08', False), ('c4e26d901410', False), ('c4e26d900408', True), ('c4e279dcc2', True)):
+            with self.subTest(hexs):
+                d, _ = run(hexs + '90', RIP, '--avx-gated')
+                e = d['guest']['end']
+                self.assertEqual((e['reason'], e.get('cut_gated', False)), ('system_instruction', True) if gated else ('unsupported_form', False))
+
+    def test_vldmxcsr_is_a_system_cut(self):
+        for hexs in ('c5f8ae10', 'c5f8ae18', 'c4c178ae5c2408'):
+            with self.subTest(hexs):
+                d, _ = run(hexs + '90')
+                self.assertIn('vldmxcsr/vstmxcsr', d['guest']['end']['detail'])
+                self.assertEqual(d['guest']['end']['reason'], 'system_instruction')
+
+    def test_prefix_before_vex_is_ud(self):
+        for name, x in VEX_UD.items():
+            with self.subTest(name):
+                self.cut_after_two(name, x, 'system_instruction')
+                d, _ = run(x + PRE)
+                self.assertIn('before VEX (#UD)', d['guest']['end']['detail'], name)
 
     def test_lock_neg_ends_its_block(self):
         for name, x in LOCK_NEGS.items():

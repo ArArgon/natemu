@@ -1944,6 +1944,166 @@ clocksource at 25.3 s, and the panic at 42.9 s (287 lines, 78 s of wall time wit
 
 **Owner decisions (October 30, after L4b):** (1) both remedies for ticks lost while a vCPU is held in the host: a per-device lost-tick policy for periodic timer modes (PIT modes 2/3, the RTC periodic interrupt, the LAPIC periodic timer), either *reinject* (count missed periods and deliver them when the vCPU can take them) or *discard*, with each device's default taken from what QEMU/KVM actually default to (checked, not assumed) and recorded; one-shot timers are unaffected; and (2) remove the cause: K1 (keep translations across CR3/control-register changes) moves up to right after I8, followed by a measured boot breakdown (wall time per phase, compiles, exits by kind, halted time, flushes) against QEMU to the same point. Context: the Debian boot to the root-fs panic took 90,277 host compiles of 0.4–2 ms each; tick expiries merged during those stalls, so the refined-jiffies watchdog marked the TSC unstable and quick PIT calibration failed.
 
+*Built (I8, AVX/AVX2/FMA/F16C; fexc series29 = series28 + patch 0021 + shim changes; reviewed October 30, no blocking defect; the review round's fixes in series30, below):*
+**Forms.** FEX's AVX128 lowering (`SupportsAVX`, no SVE256 on the M4: each 256-bit operation as two 128-bit halves, YMM
+upper halves in the guest-state page's `avx_high`). `FexcSlice1::Avx` admits the VEX forms of the four advertised features
+by VEX map, pp, L, W and reserved vvvv and by operand kind (SDM Vol.2 per instruction): VEX.128 and VEX.256 SSE equivalents,
+AVX2 integer forms, VPERMD/VPERMPS/VPERMQ/VPERMPD, VPERM2F128/VPERM2I128, VINSERT/VEXTRACT F128/I128, VBROADCASTSS/SD/F128/
+I128, VPBROADCASTB/W/D/Q, VPBLENDD, VPSLLV/VPSRLV/VPSRAV, VPERMILPS/PD, VTESTPS/PD, FMA (packed, scalar, ADDSUB/SUBADD in
+the three orders), VCVTPH2PS and VCVTPS2PH (register destination), VZEROUPPER/VZEROALL. Scalar ("LIG") forms are admitted
+with VEX.L = 0 only (policy). The BMI1/BMI2 forms are as I1 (`pdep`/`pext` still refused). Refused with their reason
+(`unsupported_form`, before any effect): VGATHER*/VPGATHER* (FEX's element loop), VMASKMOVPS/PD, VPMASKMOVD/Q and
+VMASKMOVDQU (FEX's masked load/store loops or a full store), VLDMXCSR/VSTMXCSR (the resident's MXCSR transaction decodes the
+legacy forms only), VCVTPS2PH to memory (its conversion raises MXCSR flags before the store, which may fault),
+VPCMPESTRx/VPCMPISTRx (host helper), the VEX AES/PCLMULQDQ forms (not in I8), VINSERTPS m32 whose zero mask clears the
+inserted element (FEX drops the load, as I5a), and every encoding the SDM makes #UD (VEX.L, VEX.W, reserved VEX.vvvv,
+register/memory kind) or the profile does not advertise (AVX-VNNI): refused, not delivered.
+**Gating (translation time).** The host passes `--avx-gated` when the bank has no CR4.OSXSAVE, XCR0[2:1] != 11b or CR0.TS
+(`execution::avx_gated`); fexc cuts every AVX form, the refused ones x86 defines included, as gated (`cut_gated`, map 8),
+the host answers `system::AVX_GATED` (49), and the resident raises #UD without OSXSAVE or with XCR0[2:1] != 11b, else #NM
+(SDM Vol.2 2.8; CR0.EM and CR4.OSFXSR do not gate VEX forms; BMI is not gated). `Cpu::code_context` gains bit 17,
+`Cpu::avx_enabled()` (OSXSAVE and XCR0[2:1] = 11b), so XSETBV (no flush) cannot leave a block compiled under the other
+gating; CR0/CR4 changes already flush. A 66, F2 or F3 prefix before VEX, or a REX right before it, is a system cut the host
+decodes as `UD` (`system::vex_ud`), #UD whatever the gating (QEMU's order too); LOCK is I3's `LOCK_UD`; a REX before VEX with
+another prefix between them is refused (no SDM text).
+**State.** `frame::AVX_HIGH` (C0H, 256 bytes) joins `GUEST_STATE` and `GUEST_STATE_WRITABLE` (I5b's hook 1): generated code
+reads and writes the upper halves there (`ldr/str q`, `ldp/stp q`, `stp xzr, xzr` for a VEX.128 destination's zeroed half,
+VZEROUPPER's `stp q0, q0` sweep), and XSAVE/XRSTOR component 2 is that same copy. Patch 0021 flushes them per instruction
+(`FlushRegisterCache(true)` now covers AVXHigh0..15): FEX kept dirty upper halves cached across instructions and VZEROUPPER's
+invalidation dropped them, so a fault in between would have reported stale upper halves. Admission decodes the Q-register
+pair (`ldp/stp qT, qT2, [xN, #imm7*16]`) and admits x28 pair accesses inside a field; the program driver reports `ymmh`
+(32 quadwords) and `frame_intact` no longer needs its AVX exception.
+**Memory forms.** A 32-byte operand is one `ldp`/`stp` of two Q registers, a site of kind `load_pair`/`store_pair` with
+width 32 and class FPR (admitted only so; patch 0021 also keeps it one pair with an FS/GS base). Its destinations are FEX
+temporaries (the GuestOpcode/access barrier keeps loads out of static registers: `verify_precision` P3). Every store wider
+than a byte has its split check (`add x0, A, #31` for 32 bytes); the resident completes a page-crossing 32-byte store from
+the pair's two Q registers (`split`), after walking both pages for write, so a fault on either page writes nothing.
+**Alignment:** VMOVAPS/VMOVAPD/VMOVDQA, VMOVNTPS/PD/DQ and VMOVNTDQA get `and x0, xA, #15` (VEX.128) or `#31` (VEX.256) on
+the first access (`fexc_align16`/`fexc_align32`; admission and P10 check the mask by width): #GP(0) before any walk; every
+other VEX form has no alignment requirement (class 4). **#AC** (X2): under alignment checking a misaligned 32-byte vector
+access is #AC(0), an 8-byte-aligned one is refused `unsupported_mode` as I5a's 16-byte one ("may or may not"). **Atomicity
+(decision):** SDM Vol.3 9.1.1 guarantees single-copy atomicity only for the 16-byte VEX.128 VMOVAPS/VMOVAPD/VMOVDQA (and
+the legacy forms): patch 0021 lowers their memory forms to one 16-byte aligned LDP/STP of two X registers as I5a's MOVAPS
+(FEAT_LSE2); a 32-byte access has no x86 atomicity guarantee, not even per 16-byte half, and an Arm LDP/STP of Q registers
+is single-copy atomic per aligned 64 bits, which x86 does not promise beyond either. VMOVNT* are plain accesses, ordered as
+any store (allowed). Element forms (VMOVLPS/HPS/LPD/HPD, VPINSR*, VPEXTR*, VEXTRACTPS m) use I5a's plain element accesses;
+broadcasts from memory are a plain element load and a duplicate (not `ld1r`). **Device pages:** no VEX site carries an M3
+completion record, so any AVX access to a device page stops `unsupported_mmio` (form) before any effect; reads of the
+all-ones unassigned pages run natively (the L3 shadow), whatever their width.
+**MXCSR exactness.** FEX's AVX128 lowering uses the I5a IR ops, so I5a's fixes key on the VEX forms too (VCOMISS/VCOMISD
+`fcmpe`, VRCP*/VRSQRT* quiet, VROUND* `frintx`, VDPPS/VDPPD's masked inputs, a dead FCmp kept). Found by the corpus, fixed
+in patch 0021: the AVX compare predicates 8..31 raised IE per FEX's choice of `fcmeq`/`fcmgt` and none for FALSE/TRUE;
+under slice1 the predicate's operands are first compared for order by two quiet `fcmeq` (IE for an SNaN, DE for a denormal),
+FEX's lowering then runs on operands whose unordered lanes are zero (no NaN reaches a signalling compare), the unordered
+value is ORed in, and a signalling predicate adds one `fcmge` (IE for a QNaN) whose all-zero contribution keeps it live;
+VFMADDSUB/VFMSUBADD negated the subtracted lanes' addend by an XOR of the sign bit, flipping a NaN's sign: now `fneg`, which
+keeps a NaN under FPCR.AH = 1, selected per lane. FMA is Arm's fused multiply-add (one rounding); its NaN choice, signs and
+flags matched QEMU on the corpus. F16C follows the SDM where QEMU 7.2 does not: VCVTPS2PH ignores MXCSR.FTZ (FPCR.FZ16
+stays clear: a tiny result is a half denormal, UE and PE when inexact) and VCVTPH2PS ignores DAZ and reports no DE. DE as
+I5a (IDC unless DAZ), judged by hand cases below.
+**Deviations** (I8): (1) the SDM's #UD encodings of VEX forms (reserved VEX.L/W/vvvv, wrong operand kind, unadvertised VEX
+forms such as AVX-VNNI) are typed refusals, not delivered #UD; (2) scalar LIG forms with VEX.L = 1 are refused (hardware
+runs them); (3) gathers, masked moves (so the SDM's non-faulting masked-off element is not built), VLDMXCSR/VSTMXCSR,
+VCVTPS2PH m, VPCMPxSTRx and VEX AES/PCLMULQDQ are refused; (4) a 32-byte vector access that is 8-byte aligned under
+alignment checking is refused `unsupported_mode` (as I5a's 16-byte); (5) any AVX access to a device page stops
+`unsupported_mmio`; (6) 0x67 and a REX separated from VEX by another prefix are refused; (7) G1's page deviation (I5b) now
+covers live YMM_Hi128: a guest data access to the guest-state page reaches the vCPU's own upper halves.
+**QEMU 7.2 departures found** (recorded, not compared): VCVTPS2PH flushes tiny results under MXCSR.FTZ (SDM: "MXCSR.FTZ is
+ignored"); VCVTPH2PS treats half denormals as zero under DAZ (SDM: "MXCSR.DAZ is ignored and is treated as if it 0"; "No
+denormal exception is reported"); its disassembler prints VBROADCASTI128 as `.byte` (the annotation check cannot follow it,
+so the corpus leaves it to the fault matrix and the ASM tests). The generator keeps F16C out of FTZ/DAZ groups.
+**Found by the checks, fixed:** a pair access's IR offset is unsigned (`u32`), so FEX's `[base - 32]` pair (a displacement
+that is a multiple of 16 folded into the LDP/STP) made the split check and its stub compute base + 0xFFFFFFE0; admission
+refused the block ("no split check ... on exactly its address", FEX's `modrm_oob/VEX.asm`); `FexcBeforeOp` now sign-extends
+it (`run_i8_faults.py` `*-negoff*`).
+**Checks** (series29; `tools/reference/gen_i8.py`, `tools/run_i8_faults.py`): QEMU 7.2 corpus (`natemu-raw/i8-corpus-20261030-01`,
+136 programs, 601 form templates at both widths, every rounding mode, FTZ/DAZ, data across the page boundary, VZEROUPPER/
+VZEROALL in random mixes): 136/136 match at block sizes default and 1 (before the two MXCSR/NaN fixes: 8 failed, each
+located by running its prefixes on both sides). `run_i8_faults.py` 803 cases at both block sizes, every one as expected:
+#PF not present/read-only on 50 load/store forms, page-crossing 2..32-byte operands at three offsets (#PF on the second
+page, CR2 its first byte, or on a read-only first page; the crossing store completed when both pages are writable), alignment
+#GP for VMOVAPS/VMOVAPD/VMOVDQA/VMOVNT*/VMOVNTDQA (16 and 32; also with the page not present and with a non-canonical RSP
+base), no alignment fault for every other form, non-canonical #GP/#SS and straddles, negative and large pair offsets; at
+every fault GPRs, XMM, the YMM upper halves, MXCSR and the data region equal the run cut before the instruction; gating
+(14 forms incl. the refused gather/VMASKMOV: #NM under TS, #UD without OSXSAVE, with XCR0 = 3, and with TS as well; CR0.EM
+runs; BMI not gated); 66/F2/F3/REX/LOCK before VEX #UD (also under TS); DS before VEX runs; XSETBV clearing XCR0[2] makes
+the already-run VEX form #UD; 7 refusals; all-ones unassigned pages read natively by 4 forms, device pages and stores
+refused `unsupported_mmio`; XSAVE/XRSTOR round trips (RFBM 7 and AVX only) with live YMM state, the image's XMM and
+YMM_Hi128 areas equal the registers; MXCSR hand cases (VCVTPH2PS of a half denormal: no flag; VFMADD231PS, VADDPS ymm upper
+half, VCMPPS: DE; VCVTPS2PH of a float denormal: DE, UE, PE). `verify_precision.py` on the corpus (696 compiles, 8,990 sites)
+P1-P13 clean (P10 accepts `#0x1f` for 32-byte accesses, P12 the YMM upper halves); `check_sites.py --slice1` 64 programs;
+`test_slice1.py` 30 tests (new: AVX forms admitted, I8 refusals, prefix-before-VEX #UD). FEX ASM suite 1,053 -> 1,603 pass,
+0 fail, 22 precision deviations (I6's); the review counted 152 I8-related refusals (155 with PDEP/PEXT), VCVTPS2PH m among
+them (series30's count below). Census (`natemu-raw/kernel-census-i8-20261030-01`): kernel AVX 64 -> 11 (EVEX/AMX only), initramfs
+AVX 329,545 -> 229,288 (`experiments/track03/kernel-census/README.md`). Standing suite on series29, all 0 failures:
+cargo build/test (45 + 74), stack audit (gate 18,976 bytes, 23,056 nested, of 32,768: `split`'s 32-byte buffer), python unit
+281, fix/fix-1 64, seed/seed-1 44, faults/faults-1 7,828 + 5 unsupported each (the three VEX `straddle-*-present` probes now
+expect #UD: no OSXSAVE in that harness, as QEMU's qemu64), flow 64 x 2, loopfaults 846 x 2, probes 83, corpora (N = 2..4),
+smp, limits, kicks, system, coherence, sharedpt, litmus, contain, privilege, delivery, events, i5a faults 454 x 2, i5a DE 351,
+i6 faults 276 x 2, I8 corpus 136 x 2, I8 faults 803 x 2, `run_m3.py`, `run_l1.py` 41/41, `run_l2.py`, `run_l2_iasl.py`,
+`run_k2.py`, `run_x3.py`, `run_m1.py` 20, `run_l3.py`, `run_l4a.py`, `run_l4b.py`, `run_i5b.py` 411.
+**Kernel** (Debian 6.12, 2 GiB, `console=ttyS0 earlyprintk=serial mitigations=off nokaslr --initrd` Debian's initrd): past
+the AVX2 `strrchr` (`vmovd xmm7, esi; vpbroadcastb ymm7, xmm7`) where it stopped before; 224 console lines (last: "Freeing
+initrd memory: 39772K", "hrtimer: interrupt took 256723411 ns"), 55 s guest time, 81,025 compiles; stops `nocode`
+`unsupported_form` at CPL 3, RIP 0x7f057f100d42 (CR3 0x4aa6000), `pcmpistri $0x12, (%rax), %xmm0` (`66 0f 3a 63 00 12`) at
+libc.so.6 + 0x184d42, glibc's SSE4.2 `strcspn`/`strpbrk` family (PCMPISTRI: I5a's refusal, FEX calls a host helper; not I8's).
+The process (series30, from its stack strings): `/sbin/modprobe -q -- crypto-hmac(sha256)`.
+**Not built:** gathers, masked loads/stores (and so the SDM's non-faulting masked-off element), VLDMXCSR/VSTMXCSR, VCVTPS2PH to
+memory, VPCMPxSTRx, VEX AES/PCLMULQDQ, delivered #UD for reserved VEX encodings, unmasked SIMD exceptions (as I5a), AVX-512.
+*I8 review round (October 30; fexc series30 = series29 + patch 0022 + shim changes):* the review found no blocking defect and
+judged deviations 1 and 2 (the #UD encodings refused, not delivered; scalar LIG forms with VEX.L = 1 refused) acceptable.
+Fixed: (1) **an invalid encoding under the gating**: `Avx()` set `avx` on a refused form before its VEX.L/W/vvvv/operand
+checks, so under CR0.TS an encoding x86 makes #UD (the reviewer's `c4e27d90c1`, VPGATHERDD with a register operand) was cut
+as gated (#NM), and its VEX AES range (`op >= 0xdb`) also covered BMI's 0xf2-0xf7 (BMI matched first, no wrong verdict):
+every refused form now has its own row (L, W, vvvv, operand kind) checked first, the AES range is 0xdb-0xdf (VAES's L = 1 not
+advertised: an encoding refusal); `test_slice1.py`, `run_i8_faults.py` `*-invalid-*`. (2) **HADD's operand order**: the SDM
+adds each pair high element first (HADDPD: DEST[63:0] := SRC1[127:64] + SRC1[63:0]; HADDPS: DEST[31:0] := SRC1[63:32] +
+SRC1[31:0]; the VEX.256 forms per lane), so under Vol.1 Table 4-7's first-source rule two QNaNs give the high one; Arm's
+FADDP adds low first. Patch 0022 computes UZP2 + UZP1 for HADDPS/HADDPD and VHADDPS/VHADDPD (I5a's legacy forms too); HSUB's
+order already was the SDM's (DEST[31:0] := SRC1[31:0] - SRC1[63:32]: low first, FEX's UZP1 - UZP2). Evidence: the SDM
+pseudocode only (hardware unverified); QEMU 7.2 picks two SSE NaNs by its x87 rule (the larger significand), so it agrees
+with the SDM order only when the high NaN has the larger significand (the review's case) and not otherwise (extended corpus,
+below); `run_i8_faults.py` `nan2-*` (8 cases: HADDPD/HSUBPD/HADDPS/HSUBPS, legacy, VEX.128 and VEX.256). Found while
+re-running: legacy CMPPS/CMPPD/CMPSS/CMPSD and VEX UNORD_Q/ORD_Q (predicates 3, 7) raised IE for a QNaN (FEX's fcmge/fcmgt;
+an I5a defect the I5a corpus never met): they take I8's exact-flag path now, which finds unordered lanes by integer compares
+of |x| with infinity (no flag) and takes the flags from one fcmeq (quiet) or fcmge (signalling) of the operands, so no DE
+beside a NaN either (`run_i5a_de.py` caught the first version's DE beside a QNaN; `run_i8_faults.py` `de-vcmpps-*`). (3) **The
+upper-half write-back cost**: series29 stored each written upper half at the instruction's end and reloaded it in the next,
+a store-to-load round trip on a dependent chain. Patch 0022 writes the written halves through at each instruction start (one
+STR each: the state at every fault and exit stays exact) and keeps them cached across register-only vector instructions (VEX or
+SSE map, no memory operand: `CanHaveSideEffects` false; at most 6 cached, so no spill); every other instruction starts with
+the cache dropped. The reviewer's `bench.py` (20 M iterations, best of 3, ns per iteration, series29 -> series30): ymm-dep
+10.33 -> 3.07, ymm-indep 1.55 -> 1.64, xmm-vex-dep 2.39 -> 2.39, xmm-sse-dep 2.39 -> 2.39, xmm-sse-dep-2x 4.19 -> 4.20,
+empty 1.02 -> 1.03 (a first version that kept the halves cached without writing them through gave ymm-indep 3.52: its block-end
+stores came last, before the next iteration's reloads). `run_i8_faults.py` `chain*-*` (15): a #PF of a VEX store, of a
+general-register load, a misaligned MOVAPS, a #DE and a load after VZEROUPPER, right after 1, 3 or 15 register-only vector
+instructions (12 registers written), each with GPRs, XMM, the upper halves, MXCSR and memory equal to the run cut before it.
+(4) **VLDMXCSR/VSTMXCSR** (VEX.L0, vvvv 1111b, m32; glibc's FMA/AVX2 libm, SET_RESTORE_ROUND: 36 of each in the initramfs)
+are system cuts the host decodes as `system::VLDMXCSR`/`VSTMXCSR` (50, 51): LDMXCSR/STMXCSR's transaction without CR0.EM/
+CR4.OSFXSR gating, under the AVX gating (`AVX_GATED`); 12 cases (load, store, reserved bits #GP, the unmasking refusal,
+#PF, #SS, FS, #NM/#UD gating, CR0.EM and no OSFXSR running); FEX's `VEX/vldmxcsr.asm` expects its own VSTMXCSR (flags masked,
+FFC0H) where x86 stores FFFFH: listed as FEX's expectation. (5) **Corpus**: `gen_i8.py` now emits every template k = 2 times
+per width under each of four MXCSR groups, mixes legacy SSE forms into the random programs (the reviewer's `gen_rev.py` list),
+adds in-range VPSLLV/VPSRLV/VPSRAV, VPTEST/VTESTPS/VCOMISS flag captures and RIP-relative/SIB/FS-based 32-byte operands, and
+keeps F16C out of FTZ/DAZ groups; corpus `natemu-raw/i8-corpus-20261030-02`, 336 programs: 329 match QEMU at block sizes
+default and 1; the 7 others (`i8-forms-001`, `-045`, `i8-random-067`, `-077`, `-097`, `-111`, `-126`) each first differ, by
+their prefix runs, at an SSE/AVX float operation with two NaN operands (VADDPD, VHADDPS x2, VMULSS, VSUBPD, DPPS, VDPPS):
+QEMU takes the NaN with the larger significand (or the QNaN over an SNaN), natemu the first source quieted (Table 4-7),
+I5a's recorded QEMU departure. The first corpus (`-01`) still matches 136/136.
+**Census** (`natemu-raw/kernel-census-i8-20261030-02`): VLDMXCSR/VSTMXCSR are `system` (initramfs AVX 229,288 -> 229,216).
+**Re-review** (passed, no blocking defect; the write-through invariant confirmed with kick stress, SMC and fault cases, the 7
+corpus mismatches confirmed as QEMU's two-NaN rule): a gather is #UD also without a SIB byte (ModRM.rm != 100b) and when two of
+its destination (ModRM.reg, VEX.R), mask (VEX.vvvv) and index (SIB.index, VEX.X) registers are the same; those encodings went
+through the gated path (#NM under TS); the shim now refuses them first (series30 rebuilt in place; `test_slice1.py`,
+`run_i8_faults.py` `*-invalid-gather-*`; 851 cases at both block sizes; FEX ASM `VEX/` 342 pass, 0 fail).
+**Checks** (series30): `run_i8_faults.py` 845 cases at both block sizes, all as expected; I8 corpora `-01` 136/136 and `-02`
+329/336 (the 7 above) at both block sizes; `verify_precision.py` on both clean; `test_slice1.py` 32; `check_sites.py --slice1`
+64; FEX ASM 1,605 pass, 0 fail, 22 precision deviations; I8-related refusals 150 (153 with PDEP/PEXT 3): gathers 97,
+VPCMPxSTRx 16, VEX AES/PCLMULQDQ 13, VCVTPS2PH m 9, masked moves 9, VNNI 4, 0x67 1, VLDMXCSR (FEX's expectation) 1;
+`run_i5a_faults.py` 454 x 2, `run_i5a_de.py` 351, `run_i5b.py` 411, corpora (N = 2..4), slice-1 faults 7,828 + 5, cargo test
+(45 + 74), python unit 281, stack audit (gate 18,976 bytes, 23,056 nested). **Kernel** (series30, the same command): the same
+stop, `pcmpistri` at libc.so.6 + 0x184d42 in `/sbin/modprobe -q -- crypto-hmac(sha256)` (224 lines, 56 s), nothing earlier.
+
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 
 **Owner decision (October 29, amendment after L3):** unassigned memory pages (including the legacy hole 0xA0000–0x100000) are mapped read-only and non-executable onto one shared all-ones page, so every read form (compare, checksum, string, SSE) runs natively and exactly; reads are counted per page on first touch (shadow fill), writes stay counted per access and complete as ignored for MOV forms (other write forms keep their typed refusals); fetch stays a typed stop; the strict switch still turns all of it into stops. Context: Linux's `reserve_ibft_region`, `probe_roms`, DMI and `smp_scan_config` scan 0x80000–0xFFFFF with CMP/checksum/string loops. Pages a device claims stay unshadowed (M3); the LAPIC's possible page is always a device page.

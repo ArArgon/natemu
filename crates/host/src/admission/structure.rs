@@ -251,6 +251,16 @@ fn memory(w: u32) -> Option<Insn> {
         let addr = Addr { base: rn, index: None, imm: sext(w >> 15 & 0x7f, 7) * 8 };
         return Some(Insn::Mem(Mem { load, size: 16, rt, form: Form::Pair, addr, delta: 0, vector: false, rt2: Some(rt2) }));
     }
+    // I8: `ldp`/`stp qT, qT2, [xN, #imm7*16]` (signed offset, no writeback): a VEX.256 operand's 32 bytes, and FEX's paired
+    // accesses to the YMM upper halves in the guest-state page. A load naming one register twice is UNPREDICTABLE.
+    if matches!(w & 0xffc0_0000, 0xad00_0000 | 0xad40_0000) {
+        let (load, rt2) = (w >> 22 & 1 == 1, (w >> 10 & 31) as u8);
+        if load && rt == rt2 {
+            return None;
+        }
+        let addr = Addr { base: rn, index: None, imm: sext(w >> 15 & 0x7f, 7) * 16 };
+        return Some(Insn::Mem(Mem { load, size: 32, rt, form: Form::Pair, addr, delta: 0, vector: true, rt2: Some(rt2) }));
+    }
     let vector = w >> 26 & 1 != 0;
     let opc = w >> 22 & 3;
     let (size, load) = if vector {
@@ -654,13 +664,14 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    /// x28 accesses: unsigned offset inside one of FEX's guest-state fields; a store only inside a writable one (DF).
+    /// x28 accesses: unsigned offset (or a signed-offset pair, I8: FEX's paired YMM upper-half accesses) inside one of FEX's
+    /// guest-state fields; a store only inside a writable one.
     fn frame_access(&self, m: Mem, at: u32) -> Result<(), String> {
         // i64: an unscaled access can be at a negative offset (`stur x0, [x28, #-4]`), outside every field.
         let (offset, end) = (m.addr.imm, m.addr.imm + m.size as i64);
         let inside = |&(field, len): &(u32, u32)| offset >= field as i64 && end <= (field + len) as i64;
         let fields: &[(u32, u32)] = if m.load { &frame::GUEST_STATE } else { &frame::GUEST_STATE_WRITABLE };
-        if m.form == Form::Unsigned && fields.iter().any(inside) {
+        if matches!(m.form, Form::Unsigned | Form::Pair) && fields.iter().any(inside) {
             Ok(())
         } else {
             Err(format!("frame access {:#010x} at {at:#x}: not a guest-state field", self.word(at)))
@@ -846,7 +857,7 @@ impl<'a> Verifier<'a> {
                 // A misaligned SSE operand (I5a): `b` to its alignment stub instead of any split check.
                 if let &[i] = &aligns[..] {
                     let (st, c) = (&self.c.stubs[i], self.checks[i]);
-                    if !splits.is_empty() || a & 15 == 0 || c.cond.is_some() || c.start + 4 != at || (st.base_reg, st.imm as i64) != (addr.base, addr.imm) {
+                    if !splits.is_empty() || a & if size == 32 { 31 } else { 15 } == 0 || c.cond.is_some() || c.start + 4 != at || (st.base_reg, st.imm as i64) != (addr.base, addr.imm) {
                         return fail("guest-RIP address: an alignment stub needs a misaligned address and `b stub` right before the access");
                     }
                     self.claim(st.native_offset);
@@ -875,8 +886,8 @@ impl<'a> Verifier<'a> {
                 continue;
             }
             // The alignment check (I5a), before the split check: `and x0, xA, #15; cbnz x0, A` on exactly the access's address,
-            // then only x0/x1 written and at most the access's split check. (Which SSE instructions need one is the
-            // producer's table, FexcSlice1::Sse: not re-derived here.)
+            // then only x0/x1 written and at most the access's split check; `#31` for a 32-byte access (I8: VMOVAPS ymm and
+            // the like). (Which SSE/AVX instructions need one is the producer's table, FexcSlice1::Sse/Avx: not re-derived here.)
             match &aligns[..] {
                 [] => {}
                 &[x] => {
@@ -889,7 +900,7 @@ impl<'a> Verifier<'a> {
                         && st.imm == 0
                         && and >= lo
                         && c.end < at
-                        && self.word(and) == 0x9240_0c00 | a << 5
+                        && self.word(and) == if size == 32 { 0x9240_1000 } else { 0x9240_0c00 } | a << 5
                         && self.address_in(st.base_reg, lo, and).is_some_and(|(x, from)| {
                             x == addr && self.kept(addr, from, at) && self.sealed(from.min(and), c.end, at)
                         })
@@ -897,7 +908,7 @@ impl<'a> Verifier<'a> {
                             matches!(self.insn(o), Some(Insn::Data(d)) if d.is_none_or(|r| r < 2)) || split_branch(o)
                         });
                     if !ok {
-                        return fail("no alignment check `and x0, xA, #15; cbnz x0` on exactly its address, then only x0/x1 written");
+                        return fail("no alignment check `and x0, xA, #15|#31; cbnz x0` on exactly its address, then only x0/x1 written");
                     }
                     self.claim(st.native_offset);
                 }
@@ -1576,11 +1587,18 @@ mod tests {
         // pair at 992 exists only for q registers.
         refused(ADDRESS, at, old, 0xf84f_c394, "frame access"); // ldur x20, [x28, #252]: unscaled
         refused(ADDRESS, at, old, 0x3dc0_fb80, "frame access"); // ldr q0, [x28, #992]: both bases in one load (I5a: decoded)
-        refused(ADDRESS, at, old, 0xad5f_0780, "unrecognised"); // ldp q0, q1, [x28, #992]
+        refused(ADDRESS, at, old, 0xad5f_0780, "frame access"); // ldp q0, q1, [x28, #992] (I8: a decoded pair)
         refused(ADDRESS, at, old, 0xf941_fb94, "frame access"); // ldr x20, [x28, #1008]: past fs_cached
         for word in [0xf84f_c394, 0x3dc0_fb80, 0xad5f_0780, 0xf941_fb94] {
             validated(ADDRESS, at, old, word, Some("")); // the same without the code-shape check
         }
+        // I8: the YMM upper halves (avx_high, 0xc0..0x1c0) by Q registers, single or paired (FEX's register cache, VZEROUPPER's
+        // ContextClear), and FEX's zero store of a VEX.128 destination's upper half (`stp xzr, xzr`); nothing past them.
+        for word in [0x3dc0_3380, 0x3d80_3380, 0xad00_0380 | 12 << 15, 0xad40_0780 | 12 << 15, 0xa900_7f9f | 0x1e << 15, 0xad00_0380 | 0x1a << 15] {
+            admitted(word); // ldr q0, [x28, #0xc0]; str q0, [x28, #0xc0]; stp q0, q0 / ldp q0, q1, [x28, #0xc0]; stp xzr, xzr, [x28, #0xf0]; stp q0, q0, [x28, #0x1a0]
+        }
+        refused(ADDRESS, at, old, 0xad00_0380 | 0x1c << 15, "frame access"); // stp q0, q0, [x28, #0x1c0]: past avx_high
+        refused(ADDRESS, at, old, 0x3d80_2f80, "frame access"); // str q0, [x28, #0xb0]: below it
         // POPCNT without FEAT_CSSC, and prefetch hints.
         for word in [0x9e67_00c0, 0x1e27_00e0, 0x0e20_5800, 0x0e31_b800, 0x0e20_bc00, 0x0e01_3c04, 0xf980_00c0] {
             admitted(word); // fmov d0, x6; fmov s0, w7; cnt v0.8b; addv b0, v0.8b; umov w4, v0.b[0]; prfm pldl1keep, [x6]

@@ -1,0 +1,251 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: natemu <natemu@example.invalid>
+Date: Fri, 30 Oct 2026 00:00:00 +0000
+Subject: [PATCH 21/21] FEXCore: slice1 I8 AVX128 sites, YMM upper halves, exact
+ flags
+
+Under fexc_slice1 only (FEX's AVX128 lowering: no SVE256 on the M4).
+
+- OpcodeDispatcher.h FlushRegisterCache(SRAOnly): the YMM upper halves
+  (avx_high) are flushed per instruction like the static registers, so no
+  write is dropped (VZEROUPPER's invalidation) or sunk past a later fault.
+- OpcodeDispatcher.h _LoadMemPairAutoTSO/_StoreMemPairAutoTSO: an FS/GS-based
+  32-byte operand is one LDP/STP too (one store site, no partial update).
+- AVX_128.cpp: VMOVAPS/VMOVAPD/VMOVDQA VEX.128 m128 as one aligned LDP/STP of
+  two X registers (SDM Vol.3 9.1.1, as patch 0018); VMOVNT* and VMOVNTDQA as
+  plain accesses (32 bytes: one pair); element loads/stores through
+  FexcLoadElement/FexcStoreElement; VBROADCAST* from memory as a plain element
+  load and a duplicate; VFMADDSUB/VFMSUBADD negate the addend with fneg (a
+  NaN keeps its sign under FPCR.AH = 1) instead of an XOR of the sign bit.
+- Vector.cpp VFCMPOpImpl/InsertScalarFCMPOpImpl: the AVX predicates 8..31
+  with x86's MXCSR flags (quiet predicates raise IE only for an SNaN, the
+  signalling ones for a QNaN too; FALSE/TRUE compare as well).
+---
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index dda20cf..544c250 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -1207,7 +1207,10 @@ public:
+ 
+       // natemu (fexc_slice1): DF is guest state the resident banks at a fault (the guest-state page), so cld/std store it
+       // in their own instruction like a static register, never sunk to the block end or merged with a later write.
+-      Mask &= (GPRMask | FPRMask | (fexc_slice1 ? 1ull << DFIndex : 0));
++      // natemu (fexc_slice1, I8): likewise the YMM upper halves (avx_high, the resident's XSAVE component 2 and the state a
++      // fault reports): each instruction stores the ones it wrote, so no write is dropped (VZEROUPPER's invalidation) or sunk.
++      const uint64_t AVXHighMask = ((1ull << (AVXHigh15Index - AVXHigh0Index + 1)) - 1) << AVXHigh0Index;
++      Mask &= (GPRMask | FPRMask | (fexc_slice1 ? (1ull << DFIndex) | AVXHighMask : 0));
+       Bits &= Mask;
+     }
+ 
+@@ -1448,7 +1451,7 @@ private:
+   void MOVScalarOpImpl(OpcodeArgs, IR::OpSize ElementSize);
+   void VMOVScalarOpImpl(OpcodeArgs, IR::OpSize ElementSize);
+ 
+-  Ref VFCMPOpImpl(OpSize Size, IR::OpSize ElementSize, Ref Src1, Ref Src2, uint8_t CompType);
++  Ref VFCMPOpImpl(OpSize Size, IR::OpSize ElementSize, Ref Src1, Ref Src2, uint8_t CompType, bool FexcInner = false);
+ 
+   void VTESTOpImpl(OpSize SrcSize, IR::OpSize ElementSize, Ref Src1, Ref Src2);
+ 
+@@ -2567,8 +2570,9 @@ private:
+   RefPair _LoadMemPairAutoTSO(RegClass Class, OpSize Size, const AddressMode& A, OpSize Align = OpSize::i8Bit) {
+     const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
+ 
+-    // Use ldp if possible, otherwise fallback on two loads.
+-    if (!AtomicTSO && !A.Segment && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
++    // Use ldp if possible, otherwise fallback on two loads. natemu slice1 (I8): with an FS/GS base too (SelectPairAddressMode
++    // adds it), so a 32-byte operand is always one access.
++    if (!AtomicTSO && (!A.Segment || fexc_slice1) && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
+       const auto B = SelectPairAddressMode(A, Size);
+       return LoadMemPair(Class, Size, B.Base, B.Offset);
+     }
+@@ -2606,8 +2610,8 @@ private:
+     const auto SizeInt = IR::OpSizeToSize(Size);
+     const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
+ 
+-    // Use stp if possible, otherwise fallback on two stores.
+-    if (!AtomicTSO && !A.Segment && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
++    // Use stp if possible, otherwise fallback on two stores. natemu slice1 (I8): with an FS/GS base too (one store site).
++    if (!AtomicTSO && (!A.Segment || fexc_slice1) && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
+       const auto B = SelectPairAddressMode(A, Size);
+       _StoreMemPair(Class, Size, Value1, Value2, B.Base, B.Offset);
+     } else {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
+index 59466b9..6fa6893 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
+@@ -132,6 +132,21 @@ void OpDispatchBuilder::AVX128_VMOVAPS(OpcodeArgs) {
+   const auto SrcSize = GetSrcSize(Op);
+   const auto Is128Bit = SrcSize == Core::CPUState::XMM_SSE_REG_SIZE;
+ 
++  if (Is128Bit && fexc_slice1 && fexc_align16.count(Op->PC) && !(Op->Dest.IsGPR() && Op->Src[0].IsGPR())) {
++    // natemu slice1 (I8): VMOVAPS/VMOVAPD/VMOVDQA VEX.128 with a memory operand are single-copy atomic on processors that
++    // enumerate AVX (SDM Vol.3 9.1.1), as MOVAPS (patch 0018): one 16-byte aligned LDP/STP of two X registers (FEAT_LSE2),
++    // its alignment checked first (#GP(0); fexc_align16 holds exactly the aligned forms here).
++    if (!Op->Dest.IsGPR()) {
++      auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, false);
++      Ref Addr = MakeSegmentAddress(Op, Op->Dest);
++      _StoreMemPair(RegClass::GPR, OpSize::i64Bit, _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, Src.Low, 0),
++                    _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, Src.Low, 1), Addr, 0);
++    } else {
++      RefPair V = LoadMemPair(RegClass::GPR, OpSize::i64Bit, MakeSegmentAddress(Op, Op->Src[0]), 0);
++      AVX128_StoreResult_WithOpSize(Op, Op->Dest, RefPair {.Low = _VLoadTwoGPRs(V.Low, V.High), .High = LoadZeroVector(OpSize::i128Bit)});
++    }
++    return;
++  }
+   if (Is128Bit) {
+     // Zero upper 128-bits
+     auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, false);
+@@ -357,6 +372,11 @@ void OpDispatchBuilder::AVX128_MOVVectorNT(OpcodeArgs) {
+     ///< MOVNTDQA load non-temporal comes from SSE4.1 and is extended by AVX/AVX2.
+     RefPair Src {};
+     Ref SrcAddr = LoadSourceGPR(Op, Op->Src[0], Op->Flags, {.LoadData = false});
++    if (fexc_slice1) {
++      // natemu slice1 (I8): plain loads (recorded sites), a 32-byte operand as one LDP of two Q registers.
++      Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, !Is128Bit);
++      if (Is128Bit) Src.High = LoadZeroVector(OpSize::i128Bit);
++    } else {
+     Src.Low = _VLoadNonTemporal(OpSize::i128Bit, SrcAddr, 0);
+ 
+     if (Is128Bit) {
+@@ -364,9 +384,15 @@ void OpDispatchBuilder::AVX128_MOVVectorNT(OpcodeArgs) {
+     } else {
+       Src.High = _VLoadNonTemporal(OpSize::i128Bit, SrcAddr, 16);
+     }
++    }
+     AVX128_StoreResult_WithOpSize(Op, Op->Dest, Src);
+   } else {
+     auto Src = AVX128_LoadSource_WithOpSize(Op, Op->Src[0], Op->Flags, !Is128Bit, MemoryAccessType::STREAM);
++    if (fexc_slice1) {
++      // natemu slice1 (I8): a plain store (a recorded site; ordered as any store, allowed for MOVNT), a 32-byte one as one STP.
++      AVX128_StoreResult_WithOpSize(Op, Op->Dest, Is128Bit ? RefPair {.Low = Src.Low} : Src);
++      return;
++    }
+     Ref Dest = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.LoadData = false});
+ 
+     if (Is128Bit) {
+@@ -410,7 +436,7 @@ void OpDispatchBuilder::AVX128_VMOVLP(OpcodeArgs) {
+     // Bits[63:0] come from Src2[63:0]
+     // Bits[127:64] come from Src1[127:64]
+     auto Src2 = MakeSegmentAddress(Op, Op->Src[1]);
+-    Ref Result_Low = _VLoadVectorElement(OpSize::i128Bit, OpSize::i64Bit, Src1.Low, 0, Src2);
++    Ref Result_Low = FexcLoadElement(OpSize::i128Bit, OpSize::i64Bit, Src1.Low, 0, Src2);
+     Ref ZeroVector = LoadZeroVector(OpSize::i128Bit);
+ 
+     AVX128_StoreResult_WithOpSize(Op, Op->Dest, RefPair {.Low = Result_Low, .High = ZeroVector});
+@@ -432,14 +458,14 @@ void OpDispatchBuilder::AVX128_VMOVHP(OpcodeArgs) {
+     ///< VMOVHPS/PD mem64, xmm1
+     // Need to store Bits[127:64]. Use a vector element store.
+     auto Dest = MakeSegmentAddress(Op, Op->Dest);
+-    _VStoreVectorElement(OpSize::i128Bit, OpSize::i64Bit, Src1.Low, 1, Dest);
++    FexcStoreElement(OpSize::i128Bit, OpSize::i64Bit, Src1.Low, 1, Dest);
+   } else if (!Op->Src[1].IsGPR()) {
+     ///< VMOVHPS/PD xmm2, xmm1, mem64
+     auto Src2 = MakeSegmentAddress(Op, Op->Src[1]);
+ 
+     // Bits[63:0] come from Src1[63:0]
+     // Bits[127:64] come from Src2[63:0]
+-    Ref Result_Low = _VLoadVectorElement(OpSize::i128Bit, OpSize::i64Bit, Src1.Low, 1, Src2);
++    Ref Result_Low = FexcLoadElement(OpSize::i128Bit, OpSize::i64Bit, Src1.Low, 1, Src2);
+     Ref ZeroVector = LoadZeroVector(OpSize::i128Bit);
+ 
+     AVX128_StoreResult_WithOpSize(Op, Op->Dest, RefPair {.Low = Result_Low, .High = ZeroVector});
+@@ -513,7 +539,13 @@ void OpDispatchBuilder::AVX128_VBROADCAST(OpcodeArgs, IR::OpSize ElementSize) {
+   } else {
+     // Get the address to broadcast from into a GPR.
+     Ref Address = MakeSegmentAddress(Op, Op->Src[0], GetGPROpSize());
++    if (fexc_slice1) {
++      // natemu slice1 (I8): a plain load of the element (a recorded site) and a register duplicate, not FEX's ld1r.
++      Src.Low = _LoadMemAutoTSO(RegClass::FPR, ElementSize, Address, OpSize::i8Bit);
++      if (ElementSize != OpSize::i128Bit) Src.Low = _VDupElement(OpSize::i128Bit, ElementSize, Src.Low, 0);
++    } else {
+     Src.Low = _VBroadcastFromMem(OpSize::i128Bit, ElementSize, Address);
++    }
+   }
+ 
+   if (Is128Bit) {
+@@ -769,7 +801,7 @@ void OpDispatchBuilder::AVX128_PExtr(OpcodeArgs, IR::OpSize ElementSize) {
+ 
+   // If we are storing to memory then we store the size of the element extracted
+   Ref Dest = MakeSegmentAddress(Op, Op->Dest);
+-  _VStoreVectorElement(OpSize::i128Bit, OverridenElementSize, Src.Low, Index, Dest);
++  FexcStoreElement(OpSize::i128Bit, OverridenElementSize, Src.Low, Index, Dest);
+ }
+ 
+ void OpDispatchBuilder::AVX128_ExtendVectorElements(OpcodeArgs, IR::OpSize ElementSize, IR::OpSize DstElementSize, bool Signed) {
+@@ -921,7 +953,7 @@ void OpDispatchBuilder::AVX128_PINSRImpl(OpcodeArgs, IR::OpSize ElementSize, con
+   } else {
+     // If loading from memory then we only load the element size
+     auto Src2 = MakeSegmentAddress(Op, Src2Op);
+-    Result.Low = _VLoadVectorElement(OpSize::i128Bit, ElementSize, Src1.Low, Index, Src2);
++    Result.Low = FexcLoadElement(OpSize::i128Bit, ElementSize, Src1.Low, Index, Src2);
+   }
+ 
+   Result.High = LoadZeroVector(OpSize::i128Bit);
+@@ -2039,13 +2071,19 @@ void OpDispatchBuilder::AVX128_VFMAddSubImpl(OpcodeArgs, bool AddSub, uint8_t Sr
+     ConstantEOR = LoadAndCacheNamedVectorConstant(
+       OpSize::i128Bit, ElementSize == OpSize::i32Bit ? NAMED_VECTOR_PSUBADDPS_INVERT : NAMED_VECTOR_PSUBADDPD_INVERT);
+   }
+-  auto InvertedSourceLow = _VXor(OpSize::i128Bit, Sources[AddendIdx - 1].Low, ConstantEOR);
++  // natemu slice1 (I8): the subtracted lanes' addend negated by fneg, which keeps a NaN's sign under FPCR.AH = 1 (x86 returns
++  // the NaN operand itself); FEX's XOR with the sign mask flipped it. The lanes come from the sign mask.
++  auto FexcNegate = [&](Ref Addend) {
++    Ref Lanes = _VSShrI(OpSize::i128Bit, ElementSize, ConstantEOR, ElementSize == OpSize::i32Bit ? 31 : 63);
++    return _VBSL(OpSize::i128Bit, Lanes, _VFNeg(OpSize::i128Bit, ElementSize, Addend), Addend);
++  };
++  auto InvertedSourceLow = fexc_slice1 ? FexcNegate(Sources[AddendIdx - 1].Low) : _VXor(OpSize::i128Bit, Sources[AddendIdx - 1].Low, ConstantEOR);
+ 
+   Result.Low = _VFMLA(OpSize::i128Bit, ElementSize, Sources[Src1Idx - 1].Low, Sources[Src2Idx - 1].Low, InvertedSourceLow);
+   if (Is128Bit) {
+     Result.High = LoadZeroVector(OpSize::i128Bit);
+   } else {
+-    auto InvertedSourceHigh = _VXor(OpSize::i128Bit, Sources[AddendIdx - 1].High, ConstantEOR);
++    auto InvertedSourceHigh = fexc_slice1 ? FexcNegate(Sources[AddendIdx - 1].High) : _VXor(OpSize::i128Bit, Sources[AddendIdx - 1].High, ConstantEOR);
+     Result.High = _VFMLA(OpSize::i128Bit, ElementSize, Sources[Src1Idx - 1].High, Sources[Src2Idx - 1].High, InvertedSourceHigh);
+   }
+   AVX128_StoreResult_WithOpSize(Op, Op->Dest, Result);
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+index 874204a..288a131 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+@@ -531,6 +531,10 @@ void OpDispatchBuilder::AVXInsertScalarRound(OpcodeArgs, IR::OpSize ElementSize)
+ 
+ Ref OpDispatchBuilder::InsertScalarFCMPOpImpl(OpSize Size, IR::OpSize OpDstSize, IR::OpSize ElementSize, Ref Src1, Ref Src2,
+                                               uint8_t CompType, bool ZeroUpperBits) {
++  // natemu slice1 (I8): VCMPSS/VCMPSD with an AVX predicate: the packed form's exact flags on the low element (VFCMPOpImpl).
++  if (fexc_slice1 && CompType >= 8 && !ZeroUpperBits) {
++    return _VInsElement(OpDstSize, ElementSize, 0, 0, Src1, VFCMPOpImpl(ElementSize, ElementSize, Src1, Src2, CompType));
++  }
+   switch (static_cast<VectorCompareType>(CompType)) {
+   case VectorCompareType::EQ_OQ:
+   case VectorCompareType::EQ_OS: return _VFCMPScalarInsert(Size, ElementSize, Src1, Src2, FloatCompareOp::EQ, ZeroUpperBits);
+@@ -2897,7 +2901,26 @@ void OpDispatchBuilder::MOVBetweenGPR_FPR(OpcodeArgs, VectorOpType VectorType) {
+   }
+ }
+ 
+-Ref OpDispatchBuilder::VFCMPOpImpl(OpSize Size, IR::OpSize ElementSize, Ref Src1, Ref Src2, uint8_t CompType) {
++Ref OpDispatchBuilder::VFCMPOpImpl(OpSize Size, IR::OpSize ElementSize, Ref Src1, Ref Src2, uint8_t CompType, bool FexcInner) {
++  if (fexc_slice1 && CompType >= 8 && !FexcInner) {
++    // natemu slice1 (I8): the AVX predicates 8..31 with x86's MXCSR flags (SDM Vol.2 CMPPS, Table 3-1: "Signals #IA on
++    // QNAN"). FEX lowers each to fcmeq (quiet) or fcmgt/fcmge (signalling) whatever the predicate says, and FALSE/TRUE to a
++    // constant (no flag at all). Here: Ordered from two quiet fcmeq (IE for an SNaN, DE for a denormal: every predicate),
++    // FEX's lowering on the operands with their unordered lanes zeroed (no NaN reaches a signalling compare), then the
++    // predicate's unordered value, and for a signalling predicate one fcmge of the operands (IE for a QNaN) whose all-zero
++    // contribution keeps it live.
++    const uint8_t C = CompType & 15;
++    const bool Unordered = C == 3 || C == 4 || C == 5 || C == 6 || C == 8 || C == 9 || C == 10 || C == 15;
++    const bool Signalling = (C == 1 || C == 2 || C == 5 || C == 6 || C == 9 || C == 10 || C == 13 || C == 14) != (CompType >= 16);
++    Ref Ordered = _VAnd(Size, _VFCMPEQ(Size, ElementSize, Src1, Src1), _VFCMPEQ(Size, ElementSize, Src2, Src2));
++    Ref Result = _VAnd(Size, VFCMPOpImpl(Size, ElementSize, _VAnd(Size, Src1, Ordered), _VAnd(Size, Src2, Ordered), CompType, true), Ordered);
++    if (Unordered) Result = _VOr(Size, Result, _VNot(Size, Ordered));
++    if (Signalling) {
++      Ref Flag = _VFCMPLE(Size, ElementSize, Src1, Src2);
++      Result = _VOr(Size, Result, _VAnd(Size, Flag, _VNot(Size, Flag)));
++    }
++    return Result;
++  }
+   switch (static_cast<VectorCompareType>(CompType)) {
+   case VectorCompareType::EQ_OQ:
+   case VectorCompareType::EQ_OS: return _VFCMPEQ(Size, ElementSize, Src1, Src2);
+-- 
+2.39.5
+

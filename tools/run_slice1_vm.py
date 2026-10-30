@@ -48,6 +48,7 @@ def description(p):
     lines += [f"{k} {ref.num(p[k]) & (2**64 - 1):#x}" for k in ('fsbase', 'gsbase') if k in p]     # I7: segment bases
     lines += [f"cpl {p['cpl']}"] if 'cpl' in p else []
     lines += ['sse 1'] if p.get('sse') else []                                                        # I5a: CR4.OSFXSR
+    lines += ['xcr0 7'] if p.get('avx') else []                                                       # I8: CR4.OSXSAVE, XCR0 = 7
     return '\n'.join(lines) + '\n'
 
 def declared_limit(vm):

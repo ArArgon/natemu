@@ -95,6 +95,100 @@ def vex_allowed(v, b=b''):
                 or op == 0xF6 and pp == 3 or op == 0xF7)
     return m == 3 and op == 0xF0 and pp == 3
 
+def vex_fields(b):
+    """I8: (map, pp, L, W, vvvv, opcode, modrm or None, legacy) of a c4/c5 instruction (fexc_slice1.inc ParseVex), else None;
+    legacy: a 66/F2/F3 before it or a REX right before it (#UD)."""
+    i, rex, legacy = 0, False, False
+    while i < len(b) and (b[i] in LEGACY or 0x40 <= b[i] <= 0x4F):
+        if 0x40 <= b[i] <= 0x4F: rex = True
+        else:
+            legacy |= b[i] in (0x66, 0xF2, 0xF3); rex = False
+        i += 1
+    legacy |= rex
+    if i + 2 >= len(b) or b[i] not in (0xC4, 0xC5): return None
+    if b[i] == 0xC5:
+        p, op, at = b[i + 1], b[i + 2], i + 3
+        return 1, p & 3, p >> 2 & 1, 0, (~p >> 3) & 15, op, b[at] if at < len(b) else None, legacy
+    if i + 3 >= len(b): return None
+    p1, p2, op, at = b[i + 1], b[i + 2], b[i + 3], i + 4
+    return p1 & 31, p2 & 3, p2 >> 2 & 1, p2 >> 7, (~p2 >> 3) & 15, op, b[at] if at < len(b) else None, legacy
+
+def avx_allowed(f, b):
+    """I8: fexc_slice1.inc Avx() (AVX, AVX2, FMA, F16C) -> (admitted, an AVX form x86 defines)."""
+    m, pp, L, W, vvvv, op, modrm, _ = f
+    mod, reg = (modrm >> 6, modrm >> 3 & 7) if modrm is not None else (3, 0)
+    L0, L1, LL, W0, W1, NOV, MEM, REG, NONE = 1, 2, 3, 4, 8, 16, 32, 64, 0x8000
+    r = NONE
+    if m == 1 and pp == 0:
+        if op in (0x10, 0x11, 0x51, 0x52, 0x53, 0x5a, 0x5b, 0x77): r = LL | NOV
+        elif op in (0x12, 0x16): r = L0
+        elif op in (0x13, 0x17): r = L0 | NOV | MEM
+        elif op in (0x14, 0x15, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5c, 0x5d, 0x5e, 0x5f, 0xc2, 0xc6): r = LL
+        elif op in (0x28, 0x29): r = LL | NOV
+        elif op == 0x2b: r = LL | NOV | MEM
+        elif op in (0x2e, 0x2f): r = L0 | NOV
+        elif op == 0x50: r = LL | NOV | REG
+        elif op == 0xae and mod != 3 and reg in (2, 3): return False, True   # vldmxcsr/vstmxcsr: classify()'s `system`
+    elif m == 1 and pp == 1:
+        if op in (0x10, 0x11, 0x51, 0x5a, 0x5b, 0x70, 0xe6, 0x28, 0x29, 0x6f, 0x7f): r = LL | NOV
+        elif op in (0x12, 0x16): r = L0 | MEM
+        elif op in (0x13, 0x17): r = L0 | NOV | MEM
+        elif op in (0x2b, 0xe7): r = LL | NOV | MEM
+        elif op in (0x2e, 0x2f, 0x6e, 0x7e, 0xd6): r = L0 | NOV
+        elif op in (0x50, 0xd7): r = LL | NOV | REG
+        elif op == 0xc4: r = L0
+        elif op == 0xc5: r = L0 | NOV | REG
+        elif op in (0x71, 0x72, 0x73):
+            if mod == 3 and (reg in (2, 6) or (op != 0x73 and reg == 4) or (op == 0x73 and reg in (3, 7))): r = LL
+        elif op == 0xf7: return False, True
+        elif op in (0x14, 0x15, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5c, 0x5d, 0x5e, 0x5f, 0x74, 0x75, 0x76, 0x7c, 0x7d, 0xc2, 0xc6, 0xd0) or \
+                0x60 <= op <= 0x6d or 0xd1 <= op <= 0xd5 or 0xd8 <= op <= 0xe5 or 0xe8 <= op <= 0xef or 0xf1 <= op <= 0xf6 or 0xf8 <= op <= 0xfe:
+            r = LL
+    elif m == 1 and pp == 2:
+        if op in (0x10, 0x11): r = L0 if mod == 3 else L0 | NOV
+        elif op in (0x12, 0x16, 0x5b, 0x6f, 0x70, 0x7f, 0xe6): r = LL | NOV
+        elif op in (0x2a, 0x51, 0x52, 0x53, 0x58, 0x59, 0x5a, 0x5c, 0x5d, 0x5e, 0x5f, 0xc2): r = L0
+        elif op in (0x2c, 0x2d, 0x7e): r = L0 | NOV
+    elif m == 1 and pp == 3:
+        if op in (0x10, 0x11): r = L0 if mod == 3 else L0 | NOV
+        elif op in (0x12, 0x70, 0xe6): r = LL | NOV
+        elif op in (0x2a, 0x51, 0x58, 0x59, 0x5a, 0x5c, 0x5d, 0x5e, 0x5f, 0xc2): r = L0
+        elif op in (0x2c, 0x2d): r = L0 | NOV
+        elif op in (0x7c, 0x7d, 0xd0): r = LL
+        elif op == 0xf0: r = LL | NOV | MEM
+    elif m == 2 and pp == 1:
+        if op <= 0x0b or op in (0x28, 0x29, 0x2b, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x45, 0x47): r = LL
+        elif op in (0x0c, 0x0d, 0x46): r = LL | W0
+        elif op in (0x0e, 0x0f, 0x13, 0x18, 0x58, 0x59, 0x78, 0x79): r = LL | W0 | NOV
+        elif op in (0x16, 0x36): r = L1 | W0
+        elif op == 0x17 or 0x1c <= op <= 0x1e or 0x20 <= op <= 0x25 or 0x30 <= op <= 0x35: r = LL | NOV
+        elif op == 0x19: r = L1 | W0 | NOV
+        elif op in (0x1a, 0x5a): r = L1 | W0 | NOV | MEM
+        elif op == 0x2a: r = LL | NOV | MEM
+        elif op == 0x41: r = L0 | NOV
+        elif op in (0x96, 0x97, 0x98, 0x9a, 0x9c, 0x9e, 0xa6, 0xa7, 0xa8, 0xaa, 0xac, 0xae, 0xb6, 0xb7, 0xb8, 0xba, 0xbc, 0xbe): r = LL
+        elif op in (0x99, 0x9b, 0x9d, 0x9f, 0xa9, 0xab, 0xad, 0xaf, 0xb9, 0xbb, 0xbd, 0xbf): r = L0
+        elif op in (0x2c, 0x2d, 0x2e, 0x2f, 0x8c, 0x8e) or 0x90 <= op <= 0x93 or op >= 0xdb: return False, True
+    elif m == 3 and pp == 1:
+        if op in (0x00, 0x01): r = L1 | W1 | NOV
+        elif op in (0x02, 0x4a, 0x4b, 0x4c): r = LL | W0
+        elif op in (0x04, 0x05): r = LL | W0 | NOV
+        elif op == 0x1d: r = LL | W0 | NOV | REG          # vcvtps2ph m: refused (its flags before a faulting store)
+        elif op in (0x06, 0x18, 0x38, 0x46): r = L1 | W0
+        elif op in (0x19, 0x39): r = L1 | W0 | NOV
+        elif op in (0x08, 0x09): r = LL | NOV
+        elif op in (0x0a, 0x0b, 0x20, 0x21, 0x22, 0x41): r = L0
+        elif op in (0x0c, 0x0d, 0x0e, 0x0f, 0x40, 0x42): r = LL
+        elif 0x14 <= op <= 0x17: r = L0 | NOV
+        elif 0x60 <= op <= 0x63 or op in (0x44, 0xdf): return False, True
+    if r == NONE: return False, False
+    ok = bool(r & (L1 if L else L0)) and not ((r & W0) and W) and not ((r & W1) and not W) and not ((r & NOV) and vvvv)
+    if m == 1 and op == 0x77: return ok, True
+    ok = ok and modrm is not None and not ((r & MEM) and mod == 3) and not ((r & REG) and mod != 3)
+    if ok and m == 3 and op == 0x21 and mod != 3 and b:   # vinsertps m32 whose zero mask clears the inserted element
+        imm = b[-1]; ok = not ((imm & 0xF) & (1 << (imm >> 4 & 3)))
+    return ok, True
+
 def leading(b):
     """The legacy prefix and REX bytes before the opcode, in order (duplicates kept)."""
     i = 0
@@ -241,7 +335,12 @@ def classify(b, mnem):
     base = mnem.split()[-1] if mnem else ''
     if k == 'vex':
         v = vex(b)
+        f = vex_fields(b) if b[len(leading(b))] != 0x62 else None
+        if f and f[7]: return 'system', 'prefix before VEX (#UD)'          # I8
+        if f and f[:3] == (1, 0, 0) and f[4] == 0 and f[5] == 0xAE and f[6] is not None and f[6] >> 6 != 3 and f[6] >> 3 & 7 in (2, 3):
+            return 'system', 'vldmxcsr/vstmxcsr (I8 review: the resident\'s MXCSR transaction)'
         if v and vex_allowed(v, b): return segment(b, k, p['op']) or ('admitted', '')
+        if f and avx_allowed(f, b)[0] and 0x67 not in leading(b): return segment(b, k, p['op']) or ('admitted', '')   # I8
         return ('BMI' if base in BMI or base[:-1] in BMI else 'AVX'), 'vex/evex'
     if k == 'xop': return 'other', 'xop'
     if k == 'p' and (0xA4 <= op <= 0xA7 or 0xAA <= op <= 0xAF): return string(leading(b), op)     # I2
@@ -417,7 +516,9 @@ def selftest():
              ('36488b03', 'ss mov (%rbx)', 'FS/GS'), ('36488b0424', 'ss mov (%rsp)', 'admitted'), ('3e488b4500', 'ds mov (%rbp)', 'FS/GS'),
              ('3e48ff24c500000000', 'notrack jmp *tbl', 'admitted'), ('65c4e2f0f200', 'andn %gs:', 'admitted'), ('f065480fc108', 'lock xadd %gs:', 'admitted'),
              ('65c3', 'gs ret', 'FS/GS'), ('3e4c8b2424', 'ds mov (%rsp),%r12', 'FS/GS'), ('3e498b0424', 'ds mov (%r12)', 'admitted'),
-             ('0f22d8', 'mov %cr3', 'system'), ('0f28c1', 'movaps', 'admitted'), ('0f6fc1', 'movq mm', 'SSE'), ('660f3a63c100', 'pcmpistri', 'SSE'), ('0fae10', 'ldmxcsr', 'system'), ('f20f38f1c1', 'crc32', 'admitted'), ('66f30f10c1', 'movss 66', 'SSE'), ('660f73f804', 'pslldq', 'admitted'), ('c5f877', 'vzeroupper', 'AVX'), ('d9c0', 'fld', 'admitted'), ('d9fe', 'fsin', 'x87'), ('dbe3', 'fninit', 'system'),
+             ('0f22d8', 'mov %cr3', 'system'), ('0f28c1', 'movaps', 'admitted'), ('0f6fc1', 'movq mm', 'SSE'), ('660f3a63c100', 'pcmpistri', 'SSE'), ('0fae10', 'ldmxcsr', 'system'), ('f20f38f1c1', 'crc32', 'admitted'), ('66f30f10c1', 'movss 66', 'SSE'), ('660f73f804', 'pslldq', 'admitted'), ('c5f877', 'vzeroupper', 'admitted'), ('c5f96efe', 'vmovd', 'admitted'), ('c4e27d78ff', 'vpbroadcastb', 'admitted'),
+             ('c4e27d90040f', 'vpgatherdd', 'AVX'), ('c5f8ae5c2404', 'vstmxcsr', 'system'), ('66c5f877', 'vzeroupper 66', 'system'), ('c5fc28c1', 'vmovaps', 'admitted'),
+             ('c4e2fd78ff', 'vpbroadcastb W1', 'AVX'), ('c5f877c5fc77', 'vzeroupper', 'admitted'), ('d9c0', 'fld', 'admitted'), ('d9fe', 'fsin', 'x87'), ('dbe3', 'fninit', 'system'),
              ('f3480fb8c1', 'popcnt', 'admitted'), ('f0480fb10a', 'lock cmpxchg', 'admitted'), ('f0480fc70e', 'lock cmpxchg16b', 'admitted'),
              ('f04801c8', 'lock add reg', 'LOCK'), ('f0488908', 'lock mov', 'LOCK'), ('f2f0480108', 'xacquire lock add', 'other'),
              ('f0f71b', 'lock neg', 'admitted'), ('f0480fba2b05', 'lock bts', 'admitted'), ('f0480fba2305', 'lock bt', 'LOCK'), ('480fa4c10c', 'shld', 'admitted'), ('f2c3', 'bnd ret', 'other'),
@@ -425,7 +526,7 @@ def selftest():
              ('480fc70e', 'cmpxchg16b', 'admitted'), ('66480fc70e', 'o16 cmpxchg16b', 'LOCK'), ('0f0d08', 'prefetchw', 'small-int'), ('0f1808', 'prefetcht0', 'admitted'), ('660fa4c10c', 'shldw', 'small-int'),
              ('c4e2fbf5c1', 'pdep', 'BMI'), ('c4e27cf2c1', 'andn', 'BMI'), ('c4e278f2c1', 'andn', 'admitted'), ('f3480fbc00', 'tzcnt', 'admitted'),
              ('f3c3', 'rep ret', 'admitted'), ('c3', 'ret', 'admitted'), ('cc', 'int3', 'int3'), ('3effe0', 'notrack jmp', 'admitted'), ('0f05', 'syscall', 'system'),
-             ('c5f8f7', 'bmi?', 'AVX'), ('c4e260f7c1', 'shlx', 'admitted'), ('c4e2f8f7c1', 'shlxq', 'admitted')]
+             ('c5f8f7c1', 'bmi?', 'AVX'), ('c4e260f7c1', 'shlx', 'admitted'), ('c4e2f8f7c1', 'shlxq', 'admitted')]
     for hx, mn, want in cases:
         got = classify(h(hx), mn if mn != 'shlx' else 'shlxq')[0]
         if mn in ('popcnt', 'pdep', 'andn', 'tzcnt'): got = classify(h(hx), mn)[0]

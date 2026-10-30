@@ -299,11 +299,16 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
                 object::kind::LOAD | object::kind::STORE | object::kind::PUSH | object::kind::POP | object::kind::SWAP | object::kind::ATOMIC
                     | object::kind::LOAD_PAIR | object::kind::STORE_PAIR
             )
-            || !(matches!(s.width, 1 | 2 | 4 | 8) || (matches!(s.kind, object::kind::ATOMIC | object::kind::LOAD | object::kind::STORE | object::kind::LOAD_PAIR | object::kind::STORE_PAIR) && s.width == 16))
-            // I5a: an X-register pair is MOVAPS/MOVAPD/MOVDQA m128's one 16-byte access, two general registers.
-            || (matches!(s.kind, object::kind::LOAD_PAIR | object::kind::STORE_PAIR) && (s.width != 16 || s.data_class != object::CLASS_GPR))
-            // Vector registers (I5a): only plain loads and stores transfer them; a 16-byte plain access is a vector one.
-            || (s.data_class == object::CLASS_FPR && !matches!(s.kind, object::kind::LOAD | object::kind::STORE))
+            || !(matches!(s.width, 1 | 2 | 4 | 8)
+                || (matches!(s.kind, object::kind::ATOMIC | object::kind::LOAD | object::kind::STORE | object::kind::LOAD_PAIR | object::kind::STORE_PAIR) && s.width == 16)
+                || (matches!(s.kind, object::kind::LOAD_PAIR | object::kind::STORE_PAIR) && s.width == 32))
+            // I5a: an X-register pair is MOVAPS/MOVAPD/MOVDQA m128's one 16-byte access, two general registers; I8: a Q-register
+            // pair is a VEX.256 operand's one 32-byte access.
+            || (matches!(s.kind, object::kind::LOAD_PAIR | object::kind::STORE_PAIR)
+                && !matches!((s.width, s.data_class), (16, object::CLASS_GPR) | (32, object::CLASS_FPR)))
+            // Vector registers (I5a): only plain loads and stores and (I8) 32-byte pairs transfer them; a 16-byte plain access
+            // is a vector one.
+            || (s.data_class == object::CLASS_FPR && !matches!(s.kind, object::kind::LOAD | object::kind::STORE | object::kind::LOAD_PAIR | object::kind::STORE_PAIR))
             || (s.width == 16 && matches!(s.kind, object::kind::LOAD | object::kind::STORE) && s.data_class != object::CLASS_FPR)
             || s.intent != intent(s)
         {

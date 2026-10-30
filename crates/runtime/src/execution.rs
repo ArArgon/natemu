@@ -909,9 +909,20 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             }
             return Ok(());
         }
-        system::LDMXCSR | system::STMXCSR | system::SSE_GATED => {
+        system::LDMXCSR | system::STMXCSR | system::SSE_GATED | system::VLDMXCSR | system::VSTMXCSR => {
             sse::transaction(s, i)?;
             return Ok(commit(s, i, false));
+        }
+        // I8: a VEX AVX form under its gating: #UD without CR4.OSXSAVE or with XCR0[2:1] != 11b, else #NM with CR0.TS (SDM
+        // Vol.2 2.8, Vol.1 14.3: the XCR0/OSXSAVE checks come before CR0.TS; CR0.EM and CR4.OSFXSR do not gate VEX forms).
+        system::AVX_GATED => {
+            if !s.cpu.avx_enabled() {
+                return Err(UD);
+            }
+            if s.cpu.cr0 & CR0_TS != 0 {
+                return Err([7, 0, 0]);
+            }
+            halt(s, stop::BAD_REPLY) // the host cut it as gated under these very controls
         }
         // I6: the resident's x87 forms and a gated x87 form or WAIT (#NM).
         system::X87_GATED..=system::FSTP80 => {
@@ -1509,14 +1520,15 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
         guest_fault(s, f, b, site, [13, 0, 0])
     }
     // X2: under x86 alignment checking (SCTLR_EL1.A while it runs), a misaligned access is #AC(0) after the canonical
-    // check (made first, as for every access) and before any page walk, so before a split lock too. A 16-byte vector
-    // access that is 8-byte aligned is not one the SDM lets fault (MOVUPS and the like: "may or may not" only below 8-byte
-    // alignment, Vol.3 7.15); completing it is not built: refused with the state at the instruction.
+    // check (made first, as for every access) and before any page walk, so before a split lock too. A 16- or 32-byte vector
+    // access (I8: a VEX.256 operand, one Q-register pair) that is 8-byte aligned is not one the SDM lets fault (MOVUPS and the
+    // like: "may or may not" only below 8-byte alignment, Vol.3 7.15); completing it is not built: refused with the state at
+    // the instruction.
     if alignment && alignment_check(&s.cpu) != 0 {
         if touched.is_none() {
             guest_fault(s, f, b, site, noncanonical(site))
         }
-        if width == 16 && site.data_class == object::CLASS_FPR && address & 7 == 0 {
+        if width >= 16 && site.data_class == object::CLASS_FPR && address & 7 == 0 {
             bank_at(&mut s, f, b, site);
             halt(&s, stop::UNSUPPORTED_MODE)
         }
@@ -1588,7 +1600,8 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
     };
     let access = all[i];
     let width = access.width as usize;
-    if width > 16 || (width > 8 && access.data_class != object::CLASS_FPR && access.kind != object::kind::STORE_PAIR) {
+    let vector_pair = access.kind == object::kind::STORE_PAIR && access.data_class == object::CLASS_FPR;
+    if (width > 16 && !(width == 32 && vector_pair)) || (width > 8 && access.data_class != object::CLASS_FPR && access.kind != object::kind::STORE_PAIR) {
         halt(&s, stop::SITE_MISMATCH)
     }
     let address = site_address(stub, f);
@@ -1600,7 +1613,7 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
     };
     // X2: a store crossing a page is misaligned: #AC(0) under alignment checking (an 8-byte aligned 16-byte vector store
     // excepted, as in [`access_aborted`]: completed here).
-    if alignment_check(&s.cpu) != 0 && !(width == 16 && access.data_class == object::CLASS_FPR && address & 7 == 0) {
+    if alignment_check(&s.cpu) != 0 && !(width >= 16 && access.data_class == object::CLASS_FPR && address & 7 == 0) {
         guest_fault(s, f, b, stub, [17, 0, 0])
     }
     // A contended walk resumes at the stub, which takes this path again.
@@ -1617,13 +1630,22 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
     }
     let gpa = [gpa0, gpa1];
     // One data register: a general one, or the low `width` bytes of a vector one (I5a); or MOVAPS m128's X-register pair
-    // (I5a, `STORE_PAIR`: aligned, so it never crosses a page, but completed alike).
+    // (I5a, `STORE_PAIR`: aligned, so it never crosses a page, but completed alike); or a VEX.256 operand's Q-register pair
+    // (I8: `stp qA, qB`, 32 bytes, low half first).
     let x = |r: u8| if r == 31 { 0 } else { f.x[r as usize] };
-    let bytes = match (access.data_class, access.data_reg[0]) {
-        (object::CLASS_FPR, r) => f.q[r as usize & 31],
-        (_, r) if access.kind == object::kind::STORE_PAIR => (u128::from(x(r)) | u128::from(x(access.data_reg[1])) << 64).to_le_bytes(),
-        (_, r) => u128::from(x(r)).to_le_bytes(),
-    };
+    let mut bytes = [0u8; 32];
+    match (access.data_class, access.data_reg[0]) {
+        (object::CLASS_FPR, r) => {
+            bytes[..16].copy_from_slice(&f.q[r as usize & 31]);
+            if vector_pair {
+                bytes[16..].copy_from_slice(&f.q[access.data_reg[1] as usize & 31]);
+            }
+        }
+        (_, r) if access.kind == object::kind::STORE_PAIR => {
+            bytes[..16].copy_from_slice(&(u128::from(x(r)) | u128::from(x(access.data_reg[1])) << 64).to_le_bytes())
+        }
+        (_, r) => bytes[..16].copy_from_slice(&u128::from(x(r)).to_le_bytes()),
+    }
     let head = (4096 - (address & 4095)) as usize;
     let (Some(to0), Some(to1)) = (guest_ram().range(gpa[0], head as u64), guest_ram().range(gpa[1], (width - head) as u64)) else {
         halt(&s, stop::SHADOW)

@@ -145,6 +145,11 @@ inline bool fexc_alignment_gated = false;
 // Profile slice1 (I5a), recorded by the allowlist: guest RIP of each legacy SSE instruction whose 16-byte memory operand must be
 // 16-byte aligned (#GP(0) otherwise: SDM Vol.2 2.5, exception classes 1, 2 and 4); its first access gets an alignment check.
 inline std::set<uint64_t> fexc_align16;
+// Profile slice1 (I8): the same for VMOVAPS/VMOVAPD/VMOVDQA/VMOVNT* ymm, whose 32-byte memory operand must be 32-byte aligned.
+inline std::set<uint64_t> fexc_align32;
+// Profile slice1 (I8): the vCPU's controls gate the VEX AVX forms (`--avx-gated`, from the host: CR4.OSXSAVE clear, XCR0[2:1]
+// not 11b, or CR0.TS): every one is cut as a system instruction (the resident raises #UD, else #NM).
+inline bool fexc_avx_gated = false;
 // Profile slice1 (I5a), recorded by the allowlist so the JIT raises the MXCSR exception flags x86 does (FPSR is MXCSR's flags):
 // COMISS/COMISD compare signalling (`fcmpe`: IE for a QNaN too; FEX emits UCOMIS's quiet `fcmp` for both); RCPPS/RCPSS/
 // RSQRTPS/RSQRTSS raise none (FEX divides exactly: FPSR is saved and restored around the op); ROUNDPS/PD/SS/SD with imm8

@@ -1306,6 +1306,9 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
         byte(exec::frame::X87_FTW),
         list(&mm)
     );
+    // I8: YMM0..15's upper halves (the guest-state page's avx_high, two quadwords per register).
+    let ymmh: Vec<u64> = (0..32).map(|q| u64::from_le_bytes(frame[(exec::frame::AVX_HIGH + 8 * q) as usize..][..8].try_into().unwrap())).collect();
+    let _ = write!(out, ",\"ymmh\":[{}]", list(&ymmh));
     let l = execution::lapic(area);
     let _ = write!(out, ",\"lapic\":{{\"cntfrq\":{},\"svr\":\"{:#x}\",\"tpr\":\"{:#x}\",\"isr\":[{}],\"esr\":\"{:#x}\"}}", l.frequency, l.svr, s.cpu.cr8, list(&l.isr), l.esr);
     out += ",\"pages\":[";
@@ -1406,12 +1409,11 @@ fn kick_report(area: Area, stops: &execution::Stops) -> String {
     )
 }
 
-/// The FEX frame holds nothing outside its guest-state fields (guest code cannot have written private memory there) and
-/// YMM_Hi128 (I5b: the resident's, [`exec::frame::AVX_HIGH`]).
+/// The FEX frame holds nothing outside its guest-state fields (guest code cannot have written private memory there; I8:
+/// YMM_Hi128 is one of them).
 fn frame_intact(area: Area) -> bool {
     let frame: [u8; exec::frame::BYTES] = area.read_record(exec::FRAME_OFFSET);
-    let avx = exec::frame::AVX_HIGH as usize..exec::frame::AVX_HIGH as usize + 256;
-    let admitted = |i: usize| avx.contains(&i) || exec::frame::GUEST_STATE.iter().any(|&(at, len)| (at as usize..(at + len) as usize).contains(&i));
+    let admitted = |i: usize| exec::frame::GUEST_STATE.iter().any(|&(at, len)| (at as usize..(at + len) as usize).contains(&i));
     frame.iter().enumerate().all(|(i, &b)| b == 0 || admitted(i))
 }
 

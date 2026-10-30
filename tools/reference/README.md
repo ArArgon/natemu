@@ -55,6 +55,16 @@ and `flags.step` lets COMISS/UCOMISS/COMISD/UCOMISD and PTEST define all six fla
 of the SSE rule (SDM Vol.1 Table 4-7: the first source), MIN/MAX under DAZ return the original denormal (the SDM's DAZ converts
 it to a signed zero before the operation; the generator keeps MIN/MAX out of DAZ groups), and DE is never set.
 
+## I8 (AVX) programs
+
+`gen_i8.py` programs carry `sse: true` and `avx: true` (the VM runner sets CR4.OSFXSR, CR4.OSXSAVE and XCR0 = 7) and `cpu:
+qemu64,+ssse3,+sse4_1,+sse4_2,+popcnt,+xsave,+avx,+avx2,+fma,+f16c,+bmi1,+bmi2`. They load YMM0..15 from the pattern block,
+set MXCSR with LDMXCSR, run the VEX forms at VEX.128 and VEX.256, and store YMM0..15 and STMXCSR (DE masked out) into the data
+region. Annotations are `{op, sse: true}` (`flags.step` lets VCOMISS & co., VPTEST, VTESTPS and VTESTPD define the six
+flags). QEMU 7.2 departures the generator avoids: MIN/MAX under DAZ (as I5a), VCVTPS2PH under FTZ and VCVTPH2PS under DAZ
+(QEMU flushes; the SDM ignores both), and VBROADCASTI128 (its disassembler prints `.byte`, which the annotation check cannot
+follow).
+
 ## RFLAGS
 
 - Settable and meaningful under Linux-user: CF PF AF ZF SF OF (mask 0x8d5). Initial RFLAGS may set only these.

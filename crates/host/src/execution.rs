@@ -616,6 +616,9 @@ pub(crate) struct Compiler {
     /// The vCPU's controls gate SSE (I5a: CR0.EM, CR0.TS or no CR4.OSFXSR, [`sse_gated`]): fexc cuts every SSE form as a
     /// system instruction, which the resident raises as #UD or #NM. Set per request (part of the request, so of the cache key).
     pub(crate) sse_gated: bool,
+    /// The vCPU's controls gate the VEX AVX forms (I8: no CR4.OSXSAVE, XCR0[2:1] != 11b, or CR0.TS, [`avx_gated`]): fexc cuts
+    /// them as system instructions, which the resident raises as #UD or #NM. Set per request, like `sse_gated`.
+    pub(crate) avx_gated: bool,
     /// The vCPU runs under alignment checking (X2: CR0.AM, RFLAGS.AC, CPL 3): fexc cuts every BT* memory form as a system
     /// instruction, which the resident checks for #AC and then steps compiled without it (`State::plain_step`).
     pub(crate) alignment_gated: bool,
@@ -644,6 +647,11 @@ pub(crate) fn x87_args(cpu: &exec::Cpu) -> Vec<String> {
 pub(crate) fn sse_gated(cpu: &exec::Cpu) -> bool {
     cpu.cr0 & (exec::CR0_EM | exec::CR0_TS) != 0 || cpu.cr4 & exec::CR4_OSFXSR == 0
 }
+/// Whether `cpu`'s controls gate the VEX AVX forms (SDM Vol.2 2.8: #UD without CR4.OSXSAVE or with XCR0[2:1] != 11b, #NM
+/// with CR0.TS; CR0.EM and CR4.OSFXSR do not apply). XCR0 changes by XSETBV without a flush: [`exec::Cpu::code_context`] keys it.
+pub(crate) fn avx_gated(cpu: &exec::Cpu) -> bool {
+    !cpu.avx_enabled() || cpu.cr0 & exec::CR0_TS != 0
+}
 /// The default [`Compiler::deadline`]: a large multiple of the slowest compile measured on the regression sets
 /// (S3h: at most 13.4 ms, server start included, over 6,080 vCPU runs of the corpora at N = 4 and N = 2 with block size 1).
 pub(crate) const COMPILE_DEADLINE: Duration = Duration::from_secs(30);
@@ -657,7 +665,7 @@ impl Compiler {
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
         Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), compiles: 0, hits: 0, tamper: None, deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, signal_at: None,
-               shape: false, sse_gated: false, alignment_gated: false, x87: vec![] }
+               shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![] }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
     /// `rip` the resident executes, or fexc's end reason when it produced no code.
@@ -671,6 +679,9 @@ impl Compiler {
         }
         if self.sse_gated {
             args.push("--sse-gated".into());
+        }
+        if self.avx_gated {
+            args.push("--avx-gated".into());
         }
         if self.alignment_gated {
             args.push("--alignment-gated".into());
@@ -707,12 +718,15 @@ impl Compiler {
                 1 => {
                     let json = crate::json::parse(&String::from_utf8_lossy(&json))?;
                     let reason = end_reason(&json).ok_or("fexc report without guest.end.reason")?;
-                    let decoded = |(map, opcode)| crate::system::decode(bytes, map, opcode).or_else(|| crate::system::lock_ud(bytes));
+                    let decoded = |(map, opcode)| {
+                        crate::system::decode(bytes, map, opcode).or_else(|| crate::system::lock_ud(bytes)).or_else(|| crate::system::vex_ud(bytes))
+                    };
                     // An SSE form cut by its gating (I5a): no operand matters, the resident raises #UD or #NM.
-                    // I6: an x87 form or WAIT (primary d8..df, 9b) cut by its gating: #NM.
+                    // I6: an x87 form or WAIT (primary d8..df, 9b) cut by its gating: #NM. I8: a VEX form (fexc's map 8): #UD or #NM.
                     let gated = |(map, op): (u8, u8)| {
                         let x87 = map == 0 && matches!(op, 0xd8..=0xdf | 0x9b);
-                        Some(exec::System { kind: if x87 { exec::system::X87_GATED } else { exec::system::SSE_GATED }, length: 1, ..exec::System::NONE })
+                        let kind = if x87 { exec::system::X87_GATED } else if map == 8 { exec::system::AVX_GATED } else { exec::system::SSE_GATED };
+                        Some(exec::System { kind, length: 1, ..exec::System::NONE })
                     };
                     let gated_cut = json.get("guest").and_then(|g| g.get("end")).and_then(|e| e.get("cut_gated")).is_some();
                     match system_cut(&json, rip).and_then(|cut| if gated_cut { gated(cut) } else { decoded(cut) }) {
@@ -1047,6 +1061,7 @@ fn translation(
         Err(stop) => return Ok(Err(stop)),
     };
     compiler.sse_gated = sse_gated(&state.cpu);
+    compiler.avx_gated = avx_gated(&state.cpu);
     compiler.x87 = x87_args(&state.cpu);
     compiler.alignment_gated = state.cpu.alignment_check() && !(step && state.plain_step != 0);
     let code = compiler.compile(&bytes, rip, step)?;

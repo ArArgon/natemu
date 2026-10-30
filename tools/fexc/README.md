@@ -26,10 +26,32 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as twenty commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as twenty-two commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series28` (October 29: series27 plus patch 0020: an
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series30` (October 30, I8 review: series29 plus patch
+0022 and shim changes. Patch 0022: HADDPS/HADDPD and their VEX forms add each pair high element first (the SDM's order:
+UZP2 + UZP1, not FADDP), so two NaNs give the high one; UNORD_Q/ORD_Q (CMPPS/CMPPD/CMPSS/CMPSD and VEX, also I5a's legacy
+forms) take the exact-flag path, which now finds unordered lanes by integer compares (no flag) and takes the flags from one
+fcmeq/fcmge (x86's DE precedence); the YMM upper halves are written through at each instruction start (one STR each) and stay
+cached across register-only vector instructions (at most 6), instead of a store and reload per instruction. Shim: an
+encoding x86 makes #UD is refused under `--avx-gated` too (the encoding checks come before a gated refusal; the VEX AES
+range is 0xdb-0xdf, no longer BMI's 0xf2-0xf7); VLDMXCSR/VSTMXCSR are system cuts (the host's `VLDMXCSR`/`VSTMXCSR`: the
+LDMXCSR/STMXCSR transaction under the AVX gating); a pair access's offset is sign-extended in the split/alignment checks.)
+Previous: `series29` (October 30, I8: series28 plus patch 0021
+and shim changes: the VEX AVX, AVX2, FMA and F16C forms through FEX's AVX128 lowering (`SupportsAVX` on, no SVE256: each
+256-bit operation as two 128-bit halves, YMM upper halves in the guest-state page's `avx_high`, a 32-byte operand as one
+LDP/STP of two Q registers). The allowlist's `Avx` table (`shim/fexc_slice1.inc`, VEX fields parsed from the bytes: map, pp,
+L, W, vvvv) admits the forms by VEX.L, VEX.W, reserved VEX.vvvv and operand kind and refuses the rest with a reason
+(gathers, VMASKMOV/VPMASKMOV/VMASKMOVDQU, VLDMXCSR/VSTMXCSR, VCVTPS2PH to memory, VPCMPxSTRx, VEX AES/PCLMULQDQ, scalar forms
+with VEX.L = 1); a 66/F2/F3 prefix or an adjacent REX before VEX is a system cut (the host's `vex_ud`: #UD); `--avx-gated`
+(the host's: no CR4.OSXSAVE, XCR0[2:1] != 11b or CR0.TS) cuts every AVX form as gated (`cut_gated`, the host's
+`AVX_GATED`); VMOVAPS/VMOVAPD/VMOVDQA/VMOVNT*/VMOVNTDQA get the alignment check `and x0, xA, #15|#31` (`fexc_align16`/
+`fexc_align32`). Patch 0021: the YMM upper halves flushed per instruction (`FlushRegisterCache(true)`), FS/GS-based 32-byte
+operands as one pair, VEX.128 VMOVAPS/VMOVAPD/VMOVDQA m128 as one aligned X-register LDP/STP, VMOVNT* and broadcasts from
+memory as plain accesses, element accesses through `FexcLoadElement`/`FexcStoreElement`, VFMADDSUB/VFMSUBADD's addend negated
+by `fneg` (NaN sign kept under FPCR.AH = 1), the AVX compare predicates 8..31 with x86's MXCSR flags. Boot-features plan,
+Built (I8).) Previous: `series28` (October 29: series27 plus patch 0020: an
 instruction that starts in the supplied bytes and runs past them is `partial_decode`, whatever FEX's zero-filled decode of
 the missing bytes gives; before it, `0f`, `0f 3a`, `0f 0f`, `0f c7`, `66 0f`, `f3 0f`, `c4`, `c4 e2`, `c5` at the end of the
 input were `not_executable` and the Debian kernel stopped at a `jne rel32` whose `0f` ends a page. An instruction that
@@ -187,6 +209,8 @@ Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--v
 | 0018 | slice1 I5a after review: MOVAPS/MOVAPD/MOVDQA m128 as one aligned LDP/STP, DPPS/DPPD flags, a dead FCmp kept |
 | 0019 | slice1 I6 x87 reduced precision: the x87 stack pass on its slow path, flushed after every op, TOP masked, ST(i) as context-indexed accesses; stack faults with their masked response (the indefinite, IE, SF, C1); C1 on pushes, FCHS/FABS and FCOMI; FCHS/FABS as sign-bit operations; FLD m64 and FST m64 quieting an SNaN (IE; FLD m64's DE); FIST/FISTP/FISTTP with the integer indefinite (flag-free); FXAM's classes; FNSTSW's exception flags from the x87 exception word and FEX's IE, PE and SF bytes |
 | 0020 | Decoder: `PARTIAL_DECODE_INST` when an instruction read at least one byte and then needed an unreadable one within 15 bytes (`ReadData`: its field's first unreadable byte), whatever the substituted zero bytes decode to; `TOO_LONG_INST` (new) when it needs a 16th byte, readable or not (`ReadByte` at `>=` 15, a `ReadData` field ending past 15, 15 prefixes); NOEXEC only when its first byte is unreadable |
+| 0021 | slice1 I8 AVX128: YMM upper halves flushed per instruction, FS/GS-based 32-byte operands as one LDP/STP, VEX.128 VMOVAPS/VMOVAPD/VMOVDQA m128 as one aligned X-register pair, VMOVNT*/VMOVNTDQA and broadcasts from memory as plain accesses, element loads/stores as plain element accesses, VFMADDSUB/VFMSUBADD's addend by `fneg`, AVX compare predicates 8..31 with exact MXCSR flags |
+| 0022 | slice1 I8 review: HADDPS/HADDPD (legacy and VEX) high element first, UNORD_Q/ORD_Q with exact flags (integer unordered test, one flag compare), the YMM upper halves written through per instruction and kept cached across register-only vector instructions |
 
 Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in `shim/` and `fexc.cpp`; the patches only
 include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then
