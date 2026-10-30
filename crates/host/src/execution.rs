@@ -508,24 +508,24 @@ impl Server {
         let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
         Ok(Self { child, stdin, stdout })
     }
-    /// The server's reply to one request body: (fexc's exit code for it, JSON report or error text, object); a
-    /// `TimedOut` error when the whole reply has not arrived by `deadline`. (The request itself is written without a
-    /// deadline: a body is at most a few KiB, which the pipe takes whether or not the server reads.)
-    fn request(&mut self, body: &[u8], deadline: Instant) -> std::io::Result<(i32, Vec<u8>, Vec<u8>)> {
+    /// The server's reply to one request body; a `TimedOut` error when the whole reply has not arrived by `deadline`. (The
+    /// request itself is written without a deadline: a body is at most a few KiB, which the pipe takes whether or not the
+    /// server reads.)
+    fn request(&mut self, body: &[u8], deadline: Instant) -> std::io::Result<Reply> {
         self.stdin.write_all(&(body.len() as u32).to_le_bytes())?;
         self.stdin.write_all(body)?;
         let mut word = [0; 4];
         self.read_by(&mut word, deadline)?;
         let mut reply = vec![0; u32::from_le_bytes(word) as usize];
         self.read_by(&mut reply, deadline)?;
-        let field = |at: usize| u32::from_le_bytes(reply[at..at + 4].try_into().unwrap()) as usize;
-        if reply.len() < 12 || reply.len() != 12 + field(4) + field(8) {
+        let field = |at: usize| u32::from_le_bytes(reply[at..at + 4].try_into().unwrap());
+        if reply.len() < 20 || reply.len() != 20 + field(4) as usize + field(8) as usize {
             return Err(std::io::Error::other("malformed fexc reply"));
         }
-        let (code, json_len) = (field(0) as i32, field(4));
-        let object = reply.split_off(12 + json_len);
-        let json = reply.split_off(12);
-        Ok((code, json, object))
+        let (code, json_len, extent, read) = (field(0) as i32, field(4) as usize, field(12), field(16));
+        let object = reply.split_off(20 + json_len);
+        let json = reply.split_off(20);
+        Ok(Reply { code, json, object, extent, read })
     }
     /// Fills `buf` from the server's stdout, waiting (poll) at most until `deadline`.
     fn read_by(&mut self, buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
@@ -580,12 +580,68 @@ impl Drop for Server {
     }
 }
 
-/// What fexc answered for one request (errors are not kept): an object, a system instruction at the RIP (decoded,
-/// [`crate::system`]), or no code with fexc's end reason.
-enum Compiled {
+/// fexc's reply to one request (protocol in tools/fexc/fexc.cpp): its exit code (0 object, 1 no code, else an error), the
+/// JSON report (error text for an error), the object; `extent` and `read` say what the compile depended on: the guest bytes
+/// before `extent` (and their length only when `extent` reaches it) and the gating arguments with a bit in `read` (bits in
+/// [`Compiler::gating`] order).
+struct Reply {
+    code: i32,
+    json: Vec<u8>,
+    object: Vec<u8>,
+    extent: u32,
+    read: u32,
+}
+impl Reply {
+    /// As the persistent cache stores it (the JSON only for an answer without code: nothing else reads it).
+    fn payload(&self) -> Vec<u8> {
+        let json: &[u8] = if self.code == 0 { &[] } else { &self.json };
+        let mut p = [self.code as u32, self.extent, self.read, json.len() as u32].map(u32::to_le_bytes).concat();
+        p.extend_from_slice(json);
+        p.extend_from_slice(&self.object);
+        p
+    }
+    fn from_payload(p: &[u8]) -> Option<Self> {
+        let field = |i: usize| p.get(4 * i..4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+        let (code, extent, read, json_len) = (field(0)?, field(1)?, field(2)?, field(3)? as usize);
+        let json = p.get(16..16 + json_len)?.to_vec();
+        Some(Self { code: code as i32, json, object: p[16 + json_len..].to_vec(), extent, read })
+    }
+}
+
+/// What fexc answered (errors are not kept): an object, or no code with its end reason and, when the instruction at the RIP
+/// cut the block, its opcode map and opcode and whether its gating cut it (`Some(mmx)`: an MMX form).
+enum Answer {
     Object(Vec<u8>),
-    System(exec::System),
-    NoCode(String),
+    Cut { reason: String, cut: Option<(u8, u8)>, gated: Option<bool> },
+}
+impl Answer {
+    fn new(reply: Reply, rip: u64) -> Result<Self> {
+        if reply.code == 0 {
+            return Ok(Answer::Object(reply.object));
+        }
+        let json = crate::json::parse(&String::from_utf8_lossy(&reply.json))?;
+        let reason = end_reason(&json).ok_or("fexc report without guest.end.reason")?.to_string();
+        let gated = json.get("guest").and_then(|g| g.get("end")).and_then(|e| e.get("cut_gated")).map(|v| v.as_str() == Some("mmx"));
+        Ok(Answer::Cut { reason, cut: system_cut(&json, rip), gated })
+    }
+}
+/// A kept answer and what it was compiled from: the gating values (those with a bit in `read` matter) and the guest bytes
+/// before the compile's extent (`whole`: the extent reached their end, so their length matters too).
+struct Entry {
+    read: u32,
+    gating: [u64; 6],
+    prefix: Vec<u8>,
+    whole: bool,
+    answer: Answer,
+}
+impl Entry {
+    /// fexc gives the same answer for `bytes` under `gating`: it reads nothing that differs (tools/fexc/fexc.cpp, `Extent`
+    /// and `FexcArg`).
+    fn matches(&self, bytes: &[u8], gating: &[u64; 6]) -> bool {
+        self.read >> 6 == 0
+            && (0..6).all(|i| self.read & 1 << i == 0 || self.gating[i] == gating[i])
+            && if self.whole { bytes == self.prefix } else { bytes.starts_with(&self.prefix) }
+    }
 }
 /// What [`Compiler::compile`] gives the service loop.
 pub(crate) enum Code {
@@ -594,20 +650,30 @@ pub(crate) enum Code {
     None(String),
 }
 
-/// fexc for one vCPU's feature set: one persistent `fexc --serve` process (started at the first compile) and a cache of its
-/// answers keyed by the whole request (arguments: RIP, profile, block limit, features; and the guest bytes), so a repeated
-/// request is not compiled again. Objects are byte-identical to the one-shot CLI's.
+/// fexc for one vCPU's feature set: one persistent `fexc --serve` process (started at the first compile), a cache of its
+/// answers in memory and, when set, the persistent one on disk. Objects are byte-identical to the one-shot CLI's.
+/// In memory an answer is kept by RIP and block limit (the profile and features are the compiler's) with what fexc says the
+/// compile read: the guest bytes up to its extent and the gating arguments it consulted. A request equal in those gets it
+/// (fexc is deterministic and would read the same), so a block is not compiled again because later bytes on its page or
+/// an unrelated control bit changed. On disk, answers are kept by the exact request and the fexc build (`compile_cache`).
+/// Every object, from fexc or a cache, goes through admission's mandatory validation when it is used: a damaged or forged
+/// cache entry can at worst be refused (a stop) or give the guest the effects of other x86 code inside its own containment,
+/// as a faulty fexc could; it cannot give code a way out of it.
 pub(crate) struct Compiler {
     fexc: PathBuf,
     server: Option<Server>,
     supported: u64,
     /// Block size limit in guest instructions (fexc's own limit when `None`).
     max_instructions: Option<u32>,
-    cache: HashMap<Vec<u8>, Compiled>,
+    cache: HashMap<(u64, Option<u32>), Vec<Entry>>,
+    cached: usize,
+    /// The persistent cache (`boot-linux` sets it; test drivers never do).
+    pub(crate) disk: Option<std::sync::Arc<crate::compile_cache::DiskCache>>,
     /// Requests that reached fexc.
     pub(crate) compiles: u64,
-    /// Requests answered from the cache.
+    /// Requests answered from the cache in memory, and from the persistent one.
     pub(crate) hits: u64,
+    pub(crate) disk_hits: u64,
     /// Test drivers only: rewrites each admitted object before it is staged, to check the resident's run-time defences
     /// against code admission refuses.
     pub(crate) tamper: Option<fn(&mut [u8])>,
@@ -674,8 +740,8 @@ impl Compiler {
         Ok(Self::with_features(fexc, admission::supported_features(&id), max_instructions))
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
-        Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), compiles: 0, hits: 0, tamper: None, deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, signal_at: None,
-               shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![] }
+        Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), cached: 0, disk: None, compiles: 0, hits: 0, disk_hits: 0, tamper: None,
+               deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, signal_at: None, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![] }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
     /// `rip` the resident executes, or fexc's end reason when it produced no code.
@@ -692,9 +758,74 @@ impl Compiler {
             }
         }
     }
+    /// The gating arguments' values, in fexc's `FEXC_ARG_*` order: SSE, AVX, alignment, x87, WAIT, x87 FPCR.
+    fn gating(&self) -> [u64; 6] {
+        let flag = |a: &str| u64::from(self.x87.iter().any(|x| x == a));
+        let fpcr = self.x87.iter().position(|x| x == "--x87-fpcr").and_then(|i| self.x87.get(i + 1));
+        let fpcr = fpcr.and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
+        [self.sse_gated.into(), self.avx_gated.into(), self.alignment_gated.into(), flag("--x87-gated"), flag("--wait-gated"), fpcr]
+    }
     /// [`Compiler::compile`] with an instruction limit; `Err(n)`: the object's code is too large for a block (n guest
     /// instructions translated).
     fn compile_once(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>) -> Result<std::result::Result<Code, u32>> {
+        let (key, gating) = ((rip, limit), self.gating());
+        let index = match self.cache.get(&key).and_then(|v| v.iter().position(|e| e.matches(bytes, &gating))) {
+            Some(i) => {
+                self.hits += 1;
+                i
+            }
+            None => {
+                let reply = self.ask(bytes, rip, limit)?;
+                // ponytail: wholesale reset at a size cap; a real eviction policy when runs outgrow it
+                if self.cached >= 1 << 16 {
+                    self.cache.clear();
+                    self.cached = 0;
+                }
+                let (whole, end) = (reply.extent as usize >= bytes.len(), bytes.len().min(reply.extent as usize));
+                let (read, prefix) = (reply.read, bytes[..end].to_vec());
+                let entries = self.cache.entry(key).or_default();
+                entries.push(Entry { read, gating, prefix, whole, answer: Answer::new(reply, rip)? });
+                self.cached += 1;
+                entries.len() - 1
+            }
+        };
+        Ok(match &self.cache[&key][index].answer {
+            Answer::Object(object) => match admission::oversized(object) {
+                Some(n) => Err(n),
+                None => {
+                    let mut admitted = admission::admit(object, rip, bytes, self.supported, self.shape)?;
+                    if let Some(tamper) = self.tamper {
+                        tamper(&mut admitted.object);
+                    }
+                    Ok(Code::Block(admitted))
+                }
+            },
+            Answer::Cut { reason, cut, gated } => {
+                let decoded = |(map, opcode)| {
+                    crate::system::decode(bytes, map, opcode).or_else(|| crate::system::lock_ud(bytes)).or_else(|| crate::system::vex_ud(bytes))
+                };
+                // An SSE form cut by its gating (I5a): no operand matters, the resident raises #UD or #NM.
+                // I6: an x87 form or WAIT (primary d8..df, 9b) cut by its gating: #NM. I8: a VEX form (fexc's map 8): #UD or #NM.
+                // I9: an MMX form (fexc's `cut_gated` "mmx"): #UD or #NM by CR0.EM/TS alone.
+                let gated_kind = |(map, op): (u8, u8), mmx: bool| {
+                    let x87 = map == 0 && matches!(op, 0xd8..=0xdf | 0x9b);
+                    let kind = if mmx { exec::system::MMX_GATED } else if x87 { exec::system::X87_GATED } else if map == 8 { exec::system::AVX_GATED } else { exec::system::SSE_GATED };
+                    Some(exec::System { kind, length: 1, ..exec::System::NONE })
+                };
+                match cut.and_then(|cut| match gated {
+                    Some(mmx) => gated_kind(cut, *mmx),
+                    None => decoded(cut),
+                }) {
+                    Some(s) if reason == "system_instruction" => Ok(Code::System(s)),
+                    // Longer than 15 bytes with all of its first 15 fetched: #GP(0) (a fetch fault was `partial_decode`).
+                    _ if reason == "instruction_too_long" => Ok(Code::System(exec::System { kind: exec::system::TOO_LONG, length: 1, ..exec::System::NONE })),
+                    _ => Ok(Code::None(reason.clone())),
+                }
+            }
+        })
+    }
+    /// The request body for `bytes` at `rip` (protocol in tools/fexc/fexc.cpp).
+    fn body(&self, bytes: &[u8], rip: u64, limit: Option<u32>) -> Vec<u8> {
         let mut args = vec!["--profile".to_string(), "slice1".into(), "--rip".into(), format!("{rip:#x}")];
         if let Some(n) = limit {
             args.extend(["--max-insts".into(), n.to_string()]);
@@ -716,77 +847,44 @@ impl Compiler {
         let mut body = (args.len() as u32).to_le_bytes().to_vec();
         body.extend(args);
         body.extend(bytes);
-        if !self.cache.contains_key(&body) {
-            if self.server.is_none() {
-                self.server = Some(Server::start(&self.fexc)?);
-            }
-            let server = self.server.as_mut().unwrap();
-            if let Some((_, signal)) = self.signal_at.filter(|s| s.0 == self.compiles) {
-                unsafe extern "C" {
-                    fn kill(pid: i32, signal: i32) -> i32;
-                }
-                unsafe { kill(server.child.id() as i32, signal) };
-            }
-            let began = Instant::now();
-            let (code, json, object) = match server.request(&body, began + self.deadline) {
-                Ok(reply) => reply,
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    let _ = server.child.kill();
-                    return Err(format!("{}: no reply within {:?}, killed", server.failed(e), self.deadline));
-                }
-                Err(e) => return Err(server.failed(e)),
-            };
-            self.slowest = self.slowest.max(began.elapsed());
-            self.compiles += 1;
-            let compiled = match code {
-                0 => Compiled::Object(object),
-                1 => {
-                    let json = crate::json::parse(&String::from_utf8_lossy(&json))?;
-                    let reason = end_reason(&json).ok_or("fexc report without guest.end.reason")?;
-                    let decoded = |(map, opcode)| {
-                        crate::system::decode(bytes, map, opcode).or_else(|| crate::system::lock_ud(bytes)).or_else(|| crate::system::vex_ud(bytes))
-                    };
-                    // An SSE form cut by its gating (I5a): no operand matters, the resident raises #UD or #NM.
-                    // I6: an x87 form or WAIT (primary d8..df, 9b) cut by its gating: #NM. I8: a VEX form (fexc's map 8): #UD or #NM.
-                    // I9: an MMX form (fexc's `cut_gated` "mmx"): #UD or #NM by CR0.EM/TS alone.
-                    let mmx = json.get("guest").and_then(|g| g.get("end")).and_then(|e| e.get("cut_gated")).and_then(|v| v.as_str()) == Some("mmx");
-                    let gated = |(map, op): (u8, u8)| {
-                        let x87 = map == 0 && matches!(op, 0xd8..=0xdf | 0x9b);
-                        let kind = if mmx { exec::system::MMX_GATED } else if x87 { exec::system::X87_GATED } else if map == 8 { exec::system::AVX_GATED } else { exec::system::SSE_GATED };
-                        Some(exec::System { kind, length: 1, ..exec::System::NONE })
-                    };
-                    let gated_cut = json.get("guest").and_then(|g| g.get("end")).and_then(|e| e.get("cut_gated")).is_some();
-                    match system_cut(&json, rip).and_then(|cut| if gated_cut { gated(cut) } else { decoded(cut) }) {
-                        Some(s) if reason == "system_instruction" => Compiled::System(s),
-                        // Longer than 15 bytes with all of its first 15 fetched: #GP(0) (a fetch fault was `partial_decode`).
-                        _ if reason == "instruction_too_long" => Compiled::System(exec::System { kind: exec::system::TOO_LONG, length: 1, ..exec::System::NONE }),
-                        _ => Compiled::NoCode(reason.into()),
-                    }
-                }
-                _ => return Err(format!("fexc failed at {rip:#x}: {}", String::from_utf8_lossy(&json))),
-            };
-            // ponytail: wholesale reset at a size cap; a real eviction policy when runs outgrow it
-            if self.cache.len() >= 1 << 16 {
-                self.cache.clear();
-            }
-            self.cache.insert(body.clone(), compiled);
-        } else {
-            self.hits += 1;
+        body
+    }
+    /// fexc's reply to the request for `bytes` at `rip`: from the persistent cache, else from the server (then stored).
+    fn ask(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>) -> Result<Reply> {
+        let body = self.body(bytes, rip, limit);
+        let stored = self.disk.as_ref().filter(|d| !d.is_empty()).and_then(|d| d.get(&d.key(&body)));
+        if let Some(reply) = stored.and_then(|p| Reply::from_payload(&p)).filter(|r| r.code < 2) {
+            self.disk_hits += 1;
+            return Ok(reply);
         }
-        Ok(match &self.cache[&body] {
-            Compiled::Object(object) => match admission::oversized(object) {
-                Some(n) => Err(n),
-                None => {
-                    let mut admitted = admission::admit(object, rip, bytes, self.supported, self.shape)?;
-                    if let Some(tamper) = self.tamper {
-                        tamper(&mut admitted.object);
-                    }
-                    Ok(Code::Block(admitted))
-                }
-            },
-            Compiled::System(s) => Ok(Code::System(*s)),
-            Compiled::NoCode(reason) => Ok(Code::None(reason.clone())),
-        })
+        if self.server.is_none() {
+            self.server = Some(Server::start(&self.fexc)?);
+        }
+        let server = self.server.as_mut().unwrap();
+        if let Some((_, signal)) = self.signal_at.filter(|s| s.0 == self.compiles) {
+            unsafe extern "C" {
+                fn kill(pid: i32, signal: i32) -> i32;
+            }
+            unsafe { kill(server.child.id() as i32, signal) };
+        }
+        let began = Instant::now();
+        let reply = match server.request(&body, began + self.deadline) {
+            Ok(reply) => reply,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                let _ = server.child.kill();
+                return Err(format!("{}: no reply within {:?}, killed", server.failed(e), self.deadline));
+            }
+            Err(e) => return Err(server.failed(e)),
+        };
+        self.slowest = self.slowest.max(began.elapsed());
+        self.compiles += 1;
+        if reply.code >= 2 {
+            return Err(format!("fexc failed at {rip:#x}: {}", String::from_utf8_lossy(&reply.json)));
+        }
+        if let Some(disk) = &self.disk {
+            disk.put(body, rip >> 63 != 0, reply.payload());
+        }
+        Ok(reply)
     }
 }
 /// `guest.end.reason` of fexc's report.
@@ -1142,7 +1240,7 @@ mod tests {
     use super::*;
     /// With `FEXC` set: a repeated request is answered from the cache, a different RIP, bytes or block limit is compiled.
     #[test]
-    fn compiler_caches_exact_requests() {
+    fn compiler_keys_answers_by_what_fexc_read() {
         let Some(fexc) = std::env::var_os("FEXC") else { return };
         let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
         let code = [0x48, 0x01, 0xd8, 0xc3];
@@ -1176,6 +1274,61 @@ mod tests {
         let long = [&[0x66; 4][..], &[0x4a, 0xc7, 0x84, 0x83, 0, 1, 0, 0, 0, 0, 0, 0]].concat();
         assert!(matches!(c.compile(&long, 0x3000, false).unwrap(), Code::System(s) if s.kind == exec::system::TOO_LONG));
         assert!(matches!(c.compile(&[0x90, 0x0f, 0x22, 0xd8], 0x3000, false).unwrap(), Code::Block(_)));
+        // P3: an answer is kept by what fexc read. Bytes after the block's end (`ret`) and a gating argument its forms do not
+        // consult leave the request the same; the bytes of a block that ran to the end of its input, or an SSE form under other
+        // SSE gating, do not.
+        let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        let tail = |t: u8| [&code[..], &[t; 64]].concat();
+        let first = object(&mut c, &tail(0x90), 0x1000);
+        assert_eq!(object(&mut c, &tail(0xcc), 0x1000), first);
+        c.sse_gated = true;
+        c.x87 = vec!["--x87-gated".into()];
+        assert_eq!(object(&mut c, &tail(0x0f), 0x1000), first);
+        assert_eq!((c.compiles, c.hits), (1, 2));
+        object(&mut c, &code[..3], 0x1000);
+        object(&mut c, &[&code[..3], &[0x90]].concat(), 0x1000);
+        assert_eq!((c.compiles, c.hits), (3, 2));
+        let movaps = [0x0f, 0x28, 0xc1, 0xc3];
+        assert!(matches!(c.compile(&movaps, 0x2000, false).unwrap(), Code::System(s) if s.kind == exec::system::SSE_GATED));
+        c.sse_gated = false;
+        object(&mut c, &movaps, 0x2000);
+        assert_eq!((c.compiles, c.hits), (5, 2));
+    }
+
+    /// With `FEXC` set: the persistent cache answers a later compiler (no request reaches its fexc); an entry forged under a
+    /// request's key (here: an object whose code jumps through x28, the resident's state register) is refused by admission,
+    /// never staged.
+    #[test]
+    fn persistent_cache_answers_and_forgeries_are_refused() {
+        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let (fexc, dir) = (std::path::PathBuf::from(fexc), std::env::temp_dir().join(format!("natemu-pc-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&dir);
+        let open = |d: &str| Some(std::sync::Arc::new(crate::compile_cache::DiskCache::open(&dir.join(d), &fexc, 1 << 30).unwrap()));
+        let code = [0x48, 0x01, 0xd8, 0xc3];
+        let new = |disk| super::Compiler { disk, ..super::Compiler::with_features(&fexc, u64::MAX, None) };
+        let block = |c: &mut super::Compiler| match c.compile(&code, 0x5000, false) {
+            Ok(Code::Block(b)) => Ok(b.object),
+            Ok(_) => Err("no block".to_string()),
+            Err(e) => Err(e),
+        };
+        let mut c = new(open("good"));
+        let first = block(&mut c).unwrap();
+        let body = c.body(&code, 0x5000, None);
+        drop(c); // writes the pack
+        let mut c = new(open("good"));
+        assert_eq!((block(&mut c).unwrap(), c.compiles, c.disk_hits), (first, 0, 1));
+        let disk = c.disk.clone().unwrap();
+        let mut reply = super::Reply::from_payload(&disk.get(&disk.key(&body)).unwrap()).unwrap();
+        let word = |o: &[u8], at: usize| u32::from_le_bytes(o[at..at + 4].try_into().unwrap()) as usize;
+        let at = word(&reply.object, 40) + word(&reply.object, 48);
+        reply.object[at..at + 4].copy_from_slice(&0xd61f_0380u32.to_le_bytes()); // br x28
+        let forged = open("forged").unwrap();
+        forged.put(body.clone(), false, reply.payload());
+        drop(forged);
+        let mut c = new(open("forged"));
+        let e = block(&mut c).unwrap_err();
+        assert!(e.contains("refused") && c.compiles == 0, "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

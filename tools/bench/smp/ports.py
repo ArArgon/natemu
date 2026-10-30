@@ -275,15 +275,28 @@ def protection_program(name):
     return build(f'l3-io-{name}', t, memory=memory)
 
 
+TIMER_VECTOR, TIMER_ROUNDS, TIMER_COUNT, TIMER_OUTS = 0x50, 64, 480, 512
+STRESS_LOG_AT, STRESS_LOG = 0x340000, 0x40000   # 4,096 entries: every delivery of the run is logged
+
+
 def stress_program(rounds=150):
-    """natemu only (kicks with events): REP OUTSB of SOURCE to the THR and, in loopback with FIFO, REP OUTSB then REP INSB
-    of 16 bytes, `rounds` times with IF = 1, so events land between elements."""
+    """natemu only (kicks with events). First, TIMER_ROUNDS times, the local APIC's one-shot timer (vector TIMER_VECTOR,
+    TIMER_COUNT ticks of the 24 MHz crystal at divide 1: 20 us) is armed right before a REP OUTSB of TIMER_OUTS bytes to an
+    unassigned port (each element a port access, far longer in all than 20 us), so the interrupt
+    arrives between its elements whatever the host's timing; then REP OUTSB of SOURCE to the THR and, in loopback with
+    FIFO, REP OUTSB then REP INSB of 16 bytes, `rounds` times with IF = 1, so the driver's kicks land between elements too.
+    Every delivery is logged (STRESS_LOG)."""
     t = Text()
-    t += f'    sti\n    xor r9d, r9d\n    mov rdi, {DATA(0) + 0x100:#x}'
+    t += f'    sti\n    mov ecx, 0x83e\n    mov eax, 0xb\n    xor edx, edx\n    wrmsr\n    mov ecx, 0x832\n    mov eax, {TIMER_VECTOR:#x}\n    wrmsr'
+    t += '    xor r9d, r9d'
+    t += f'l3_tround:\n    mov ecx, 0x838\n    mov eax, {TIMER_COUNT}\n    xor edx, edx\n    wrmsr'
+    t += f'    mov edx, {UNASSIGNED_DX[1]:#x}\n    mov rsi, {SRC:#x}\n    mov ecx, {TIMER_OUTS}\nl3_touts:\n    rep outsb'
+    t += f'    inc r9\n    cmp r9, {TIMER_ROUNDS}\n    jb l3_tround'
+    t += f'    xor r9d, r9d\n    mov rdi, {DATA(0) + 0x100:#x}'
     t += 'l3_round:'
     t += f'    mov edx, {COM1:#x}\n    mov rsi, {SRC:#x}\n    mov ecx, {len(SOURCE)}\nl3_outs:\n    rep outsb'
     t += f'    mov edx, {COM1 + 4:#x}\n    mov al, 0x1f\n    out dx, al\n    mov edx, {COM1 + 2:#x}\n    mov al, 0x07\n    out dx, al'
     t += f'    mov edx, {COM1:#x}\n    mov rsi, {SRC:#x}\n    mov ecx, 16\nl3_loop_outs:\n    rep outsb\n    mov ecx, 16\nl3_ins:\n    rep insb'
     t += f'    mov edx, {COM1 + 4:#x}\n    mov al, 0x08\n    out dx, al\n    mov edx, {COM1 + 2:#x}\n    xor eax, eax\n    out dx, al'
     t += f'    inc r9\n    cmp r9, {rounds}\n    jb l3_round\n    cli'
-    return build('l3-stress', t, memory=tables, log_size=0x4000)
+    return build('l3-stress', t, memory=tables, log_size=STRESS_LOG, log_at=lambda i: STRESS_LOG_AT)

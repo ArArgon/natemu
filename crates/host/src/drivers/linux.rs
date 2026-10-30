@@ -149,6 +149,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let ended_first = std::sync::atomic::AtomicUsize::new(usize::MAX);
     let body = |v: usize, cpu: &Vcpu, cancelled: &std::sync::atomic::AtomicBool| -> Result<(Stop, u64)> {
         let mut compiler = Compiler::new(Path::new(fexc), cpu, max_block)?;
+        compiler.disk = crate::compile_cache::shared(Path::new(fexc)); // P3: the persistent compile cache (NATEMU_COMPILE_CACHE)
         let mut requests = execution::Requests { doorbell: Some(machine.doorbell()), devices: Some(devices.clone()), ..Default::default() };
         let stop_at = if v == 0 { stop_at } else { None };
         let stop = execution::run(cpu, backing.vcpu(v), &mut compiler, stop_at, watchdog, &mut requests, &stops, cancelled);

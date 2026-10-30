@@ -2549,6 +2549,68 @@ known "Incorrect checksum in table [APIC]" (Linux zeroes the mailbox address).
 **Not built:** INIT/SIPI (above); the mailbox's version 1 (reset vector, Test command; Linux would then offline CPUs
 through it); CPU offlining and kexec; a measured breakdown of the block-size-1 wake latency.
 
+*Built (P3, translation latency; fexc series33 = series32's patches + `fexc.cpp` and shim changes; independent review: no
+blocking defect, its should-fix items done below):* The boot breakdown found 90-93% of boot wall time waiting for fexc:
+a fork per request (0.48 ms), a new FEX context (0.05 ms) and hex-dumping the guest bytes into a JSON the host did not read;
+the compile itself takes microseconds. **Fork-free server** (`--serve-mode reuse`, the default; `fork` kept for debugging):
+one FEX context per configuration (Config values, host features, profile), kept, with nothing of a request left in it:
+fexc runs FEX's `CompileBlock` without its caches (`ContextImpl::CompileCode`: the block never enters the lookup cache,
+which had answered a repeated RIP with the old block), clears its relocations and empties the code buffer; FEX's
+process-global Config is rebuilt from nothing per request. **The leak's root cause:** the earlier in-process mode made a
+context and thread per request and could never destroy them (FEX's destructors assume a running emulator thread), about
+145 KiB each; `Config::Initialize` added its layer with `emplace`, which keeps an existing one, so an earlier request's
+`--config` survived. **Fixed cost:** the server's JSON leaves out the hex dumps (input, each instruction, the code; only
+the CLI's consumers read them): 0.063 -> 0.034 ms per request. **Host key by what fexc read:** the reply reports `extent`
+(the end of every guest range read or checked, all through `InWindow`) and `args_read` (the gating arguments are
+`FexcArg`s: reading one sets its bit; the shim tests the form before the flag); the host keeps an answer under RIP, block
+limit, the bytes before the extent (all of them, and their length, when it reaches their end) and the gating values read,
+and decodes system instructions again from the current bytes. **Persistent cache** (`crates/host/src/compile_cache.rs`,
+`boot-linux` only; `NATEMU_COMPILE_CACHE=DIR|off`, default `~/Library/Caches/natemu/fexc`, `NATEMU_COMPILE_CACHE_MB`
+default 512): key SHA-256(fexc binary's SHA-256, exact request), value fexc's raw reply with a SHA-256 of key and payload
+(a damaged entry is a miss); immutable packs written by rename by a writer thread off the compile path (each key once per
+process, a pack per 4 MiB or 2 s, so a run killed by a signal loses at most 2 s), `k-` packs for kernel-half RIPs and `u-`
+for the rest; nothing is written past the cap, and an open over it evicts user packs before kernel ones, oldest first.
+SHA-256 uses the Armv8 instructions (FEAT_SHA256), the portable code as fallback, checked equal at lengths 0-600 and
+across part splits. Every object, from fexc or a cache, goes through admission's mandatory validation when used: a forged
+entry is refused (`cargo test`: code jumping through x28), never staged; a writer of the cache directory can change guest
+behaviour within its containment, as a replaced fexc binary could, not break it. **Review fixes:** the cold-run cost (the
+key hashed twice and stores on the compile path: 20% over cache-off) now under 2%; the cap enforced during a run and
+counted with each pack's framing; the lost tail on SIGINT; one copy per key with several vCPUs; `run_l1_smoke.py` sets the
+cache off; `read_index` adds with `checked_add`. **Proof:** both boots' logged request sets (76,610 and 1,338,107) through
+series32 forked and series33 in process: 0 differences (objects; JSON less the dumps); each request again with the bytes
+after its extent inverted and the unread gating arguments toggled, then cut at its extent: 0 differences; 1.18 M derived
+keys, none with two answers; server memory 10 MiB over 1.34 M requests (22-29 MiB with `test_serve.py`'s many
+configurations); `test_serve.py` 1,970 requests identical in both modes (gating and FPCR variants added). Fork mode is not
+the same environment: CNTFRQ_EL0 reads 24 MHz in a forked child and 1 GHz otherwise on this macOS (review), which changes
+the default profile's RDTSC/CPUID 15H code, not slice1's. **Boots** (Debian 6.12, 2 GiB, `console=ttyS0
+earlyprintk=serial mitigations=off nokaslr`, the breakdown's instrumented builds of 7a2f714, medians of 3 unless noted;
+wall from process start to the stop; compile = waiting for fexc plus cache reads and stores):
+
+| | HEAD (series32) | cache off | cold | warm | QEMU |
+| --- | --- | --- | --- | --- | --- |
+| To the root-fs panic (cap 512 MiB) | 43.55 s, compile 40.37 s, 76,478 compiles | 4.65 s, 2.20 s, 62,891 | 4.72 s, 2.26 s, 62,897 | 2.47 s, 0.15 s, 70 (62.6 k cache hits) | 2.02 s |
+| To "Select a language" (initrd) | 653.2 s, 574.8 s, 1,153,931 | 68.0 s (67.7-80.4), 35.4 s, 1,142,555 | 74.3 s, 39.9 s, 1,142,931 (1 run, cap 512) | 68.8 s, 35.0 s, 964,280 (178.7 k hits; 1 run) | 6.55 s |
+| TSC marked unstable | yes | no | no | no | no |
+| Quick PIT calibration | fails | fails | fails | fails | succeeds |
+
+One no-initrd boot stores about 36 MiB; the initrd boot reached the 512 MiB cap (659 k entries kept, user packs evicted
+first). User-space code at randomized addresses is compiled again per process (the RIP is part of each block): with
+`norandmaps` the initrd boot makes 140 k compiles and takes 33.7 s cold, 29.6 s warm (old cache code, cap 4096 MiB, 1 run
+each). **Quick PIT calibration (review's diagnosis):** first-time blocks run inside the timed windows of
+`quick_pit_calibrate`, whose two reads' error d1 + d2 must stay under 24.4 us; a first-time block costs about 35 us cold,
+about 20 us on a disk hit, 4-6 us on a memory hit and about 2 us resident, so even warm runs fail (re-measured after the
+review fixes: still fails, 3 of 3). **l3 `stress` redesign** (the faster compiles exposed it; review's cause: back-to-back
+kicks always stopped the vCPU before a REP's first element): a local APIC one-shot of 20 us armed right before each of 64
+REP OUTSB of 512 bytes to an unassigned port makes deliveries between elements deterministic (63 of 64 each run; at most
+two may come before the first), every delivery is logged (4,096 entries) and judged, and the kicks stay as coverage (every
+20-60 us): green 10 of 10; with a scratch mutation giving RF = 0 between elements it fails (3,027 problems).
+**Checks:** `cargo test` (50 + 79), the stack audit, `test_slice1.py` 32, `test_serve.py` both modes, `run_l3.py`,
+`run_l1_smoke.py`, the standing suite on the first P3 build (every runner green; collisions with other agents' VMs and
+the old l3 coverage condition aside), fault suites spot-checked on the review-fix build. **Not built / remaining:**
+caching user-space code independent of its RIP (objects carry RIP literals; about 1 M of the initrd boot's 1.14 M
+compiles); translating fall-through successors ahead of use, which the calibration windows need; the in-memory cache
+still clears wholesale at 65,536 entries; eviction is oldest-written, not least-used.
+
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 
 **Owner decision (October 29, amendment after L3):** unassigned memory pages (including the legacy hole 0xA0000–0x100000) are mapped read-only and non-executable onto one shared all-ones page, so every read form (compare, checksum, string, SSE) runs natively and exactly; reads are counted per page on first touch (shadow fill), writes stay counted per access and complete as ignored for MOV forms (other write forms keep their typed refusals); fetch stays a typed stop; the strict switch still turns all of it into stops. Context: Linux's `reserve_ibft_region`, `probe_roms`, DMI and `smp_scan_config` scan 0x80000–0xFFFFF with CMP/checksum/string loops. Pages a device claims stay unshadowed (M3); the LAPIC's possible page is always a device page.

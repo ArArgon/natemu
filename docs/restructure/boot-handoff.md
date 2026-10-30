@@ -63,7 +63,7 @@ the phase-end ones):
 ```sh
 # From the repository root; works in zsh and bash (no word-splitting of variables; run in full under zsh and
 # argument-checked under bash at the phase end).
-F=../natemu-raw/fexc-native-20261026-01/series32/obj/fexc   # tools/fexc/build.sh rebuilds it; MOVBE, MMX, AES-NI/PCLMULQDQ, PDEP/PEXT, FFREEP and the ADX/SHA #UD cuts (I9) need series32; the x87 helper forms and PCMPxSTRx by svc (I6b) need series31; VEX AVX/AVX2/FMA/F16C forms (I8) need series29, its review fixes (HADD order, UNORD flags, VLDMXCSR, the upper-half cache) series30; instructions straddling a page end and over 15 bytes (#GP) need series28; CS/DS/ES/SS prefixes by Intel's class (Linux's `ds btr`) need series27; I5b's FXSAVE/XSAVE cuts need series26-i5b or later; S3's `system` programs (RDRAND/RDSEED/RDPID) need series21-s3 or later, X2's BT* #AC cases series22; since I6 the host passes x87 arguments; series25 is the combined I6 + M3 build
+F=../natemu-raw/fexc-native-20261026-01/series33/obj/fexc   # tools/fexc/build.sh rebuilds it; the host needs series33 (P3: the server's reply reports what each compile read); MOVBE, MMX, AES-NI/PCLMULQDQ, PDEP/PEXT, FFREEP and the ADX/SHA #UD cuts (I9) need series32; the x87 helper forms and PCMPxSTRx by svc (I6b) need series31; VEX AVX/AVX2/FMA/F16C forms (I8) need series29, its review fixes (HADD order, UNORD flags, VLDMXCSR, the upper-half cache) series30; instructions straddling a page end and over 15 bytes (#GP) need series28; CS/DS/ES/SS prefixes by Intel's class (Linux's `ds btr`) need series27; I5b's FXSAVE/XSAVE cuts need series26-i5b or later; S3's `system` programs (RDRAND/RDSEED/RDPID) need series21-s3 or later, X2's BT* #AC cases series22; since I6 the host passes x87 arguments; series25 is the combined I6 + M3 build
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 O=../natemu-raw/suite-$(date +%Y%m%d-%H%M%S)                  # a fresh output directory
@@ -235,8 +235,15 @@ iteration is unexplained. Known costs and limits:
 - **Resident stack:** 14,176 bytes at the deepest gate path, 19,616 with one nested entry to its halt, of a 32 KiB
   exception stack (13,152 bytes margin; boot path 7,728 of 16 KiB; `tools/check_resident_stack.py`, E2). New resident paths (delivery, devices) must be
   re-checked. An overflow is contained to the vCPU but overwrites its boot/block stack before it halts.
-- **Compile latency:** every distinct block is a host round trip on first use (about 0.4 ms per block with the compile
-  server, S2a; 13.4 ms the slowest measured, including the server's start).
+- **Compile latency:** every distinct block is a host round trip on first use: since P3 about 0.04 ms per block (the
+  server compiles in process; 0.45-0.5 ms forked before), the host keeps answers by what fexc read (bytes to the
+  compile's extent, gating arguments consulted) and `boot-linux` keeps them across runs on disk
+  (`crates/host/src/compile_cache.rs`): `NATEMU_COMPILE_CACHE=DIR|off` (default `~/Library/Caches/natemu/fexc`),
+  `NATEMU_COMPILE_CACHE_MB` (default 512: a boot without initrd takes about 36 MiB, the initrd boot to the installer
+  658 MiB, mostly user code; past the cap a run stores nothing more, and the next open evicts user packs before kernel
+  ones). Test drivers never open it (`run_l1_smoke.py` sets it off). User-space code at randomized addresses is compiled
+  again per process (the RIP is part of each block): the initrd boot to the installer makes about 1.14 M compiles,
+  140 k with `norandmaps`.
 
 ## 5. Open questions for the owner or the next phase
 

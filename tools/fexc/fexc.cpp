@@ -7,6 +7,7 @@
 // General by construction: input bytes + RIP + mode + feature profile in, code +
 // FEX metadata out. Nothing here is keyed by program name.
 #include "FEXCore/Debug/InternalThreadState.h"
+#include "Interface/Context/Context.h"
 #include "Interface/Core/CPUBackend.h"
 #include "Interface/Core/Frontend.h"
 #include "Interface/Core/JIT/DebugData.h"
@@ -129,7 +130,16 @@ static std::string Hex64(uint64_t v) { char b[24]; snprintf(b, sizeof b, "0x%llx
 // ---------------------------------------------------------------- guest window
 namespace {
 struct Window { uint64_t base = 0, size = 0; const uint8_t* bytes = nullptr; } W;
-bool InWindow(uint64_t a, uint64_t n) { return a >= W.base && a - W.base <= W.size && n <= W.size - (a - W.base); }
+// The end (offset from the window base) of every guest range the compile checked or read, saturating (an address below the
+// base counts as the whole address space). Every look at the guest bytes or at the window's size goes through InWindow: FEX's
+// decoder learns the size from QueryGuestExecutableRange but only checks a range with it before reading that range. So the
+// compile depends on bytes[0, Extent) alone and, when Extent < size, not on the size: the host keys its cache on that prefix.
+uint64_t Extent = 0;
+bool InWindow(uint64_t a, uint64_t n) {
+  const uint64_t off = a - W.base;
+  Extent = std::max(Extent, a < W.base || off + n < off ? UINT64_MAX : off + n);
+  return a >= W.base && off <= W.size && n <= W.size - off;
+}
 
 struct Handler final : HLE::SyscallHandler {
   void HandleSyscall(Core::CpuStateFrame*) override {}
@@ -306,7 +316,7 @@ static const char* StatusName(int s) {
 }
 
 // A served request's result (--serve): exit code as the CLI would return it, the JSON report and the binary object.
-struct Reply { int code = 0; std::string json; std::vector<uint8_t> object; };
+struct Reply { int code = 0; std::string json; std::vector<uint8_t> object; uint32_t extent = 0, args_read = 0; };
 static Reply* Served = nullptr;   // set while a --serve request is compiled
 
 static int Fail(const std::string& msg, int code = 2) {
@@ -360,13 +370,15 @@ static void ResetGlobals() {
   fexc_sites.clear(); fexc_insns.clear(); fexc_cf_inverted.clear(); fexc_spill_bytes = 0; fexc_cut = {}; fexc_after_rep = 0;
   fexc_rip_relative.clear(); fexc_target_check.clear(); fexc_div_width.clear(); fexc_movs.clear(); fexc_lock_cas.clear();
   fexc_align16.clear(); fexc_align32.clear(); fexc_avx_gated = false; fexc_sse_gated = false; fexc_alignment_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear(); fexc_mmio.clear();
-  fexc_x87_gated = fexc_wait_gated = false; fexc_x87_fpcr = 0; fexc_x87.clear();
+  fexc_x87_gated = false; fexc_wait_gated = false; fexc_x87_fpcr = 0; fexc_x87.clear();
+  fexc_args_read = 0; Extent = 0;
 }
 
 // The CLI's body. `args` are the command-line arguments (args[0] is the program name); `given` replaces --hex/--file with the
 // bytes themselves and `rep` collects the outputs instead of stdout/--out/--object (both set only by --serve).
-// `reuse` (--serve-mode reuse, diagnostic): contexts are kept per configuration instead of created per request.
-static bool ReuseContexts = false;
+// One FEX context per configuration (everything fixed at its creation: the Config values set below, the host features, the
+// profile), created at its first request and kept: a context is never torn down (FEX's destructors assume a running emulator
+// thread). A request leaves nothing behind in it (see the compile below), so a kept context compiles exactly as a new one.
 struct Ctx { fextl::unique_ptr<Context::Context> ctx; Core::InternalThreadState* thread = nullptr; Handler handler; Signals signals; Core::CPUState::gdt_segment gdt[32] {}; };
 static int CompileRequest(const std::vector<std::string>& args, const std::vector<uint8_t>* given, Reply* rep) {
   Served = rep;
@@ -446,19 +458,20 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     return Fail("RIP window is outside the guest address space (non-canonical, wraps, or exceeds 32 bits)");
   W = {rip, bytes.size(), bytes.data()};
 
-  // ---- configure FEX (before creating the context; the mode is fixed per context)
+  // ---- configure FEX. Config is process-global: rebuilt from nothing for every request, so no earlier request's values
+  // (e.g. a --config) remain; a context reads it at its creation, the compile reads some options again.
+  std::vector<std::pair<Config::ConfigOption, std::string>> sets = {
+    {Config::CONFIG_IS64BIT_MODE, bitness == 64 ? "1" : "0"}, {Config::CONFIG_DISABLETELEMETRY, "1"},
+    {Config::CONFIG_MULTIBLOCK, st.multiblock ? "1" : "0"}, {Config::CONFIG_TSOENABLED, st.tso ? "1" : "0"},
+    {Config::CONFIG_VECTORTSOENABLED, st.tso ? "1" : "0"}, {Config::CONFIG_MEMCPYSETTSOENABLED, st.tso ? "1" : "0"}};
+  // slice1 (I6): x87 in FEX's reduced-precision mode (doubles; owner direction, boot-features plan I6).
+  if (slice1) sets.push_back({Config::CONFIG_X87REDUCEDPRECISION, "1"});
+  for (auto& c : configs) { Config::ConfigOption o; ConfigOptionByName(c.first, o); sets.push_back({o, c.second}); }
   LogMan::Throw::InstallHandler(AssertHandler);
   LogMan::Msg::InstallHandler(MsgHandler);
+  Config::Shutdown();
   Config::Initialize();
-  Config::Set(Config::CONFIG_IS64BIT_MODE, bitness == 64 ? "1" : "0");
-  Config::Set(Config::CONFIG_DISABLETELEMETRY, "1");
-  Config::Set(Config::CONFIG_MULTIBLOCK, st.multiblock ? "1" : "0");
-  Config::Set(Config::CONFIG_TSOENABLED, st.tso ? "1" : "0");
-  Config::Set(Config::CONFIG_VECTORTSOENABLED, st.tso ? "1" : "0");
-  Config::Set(Config::CONFIG_MEMCPYSETTSOENABLED, st.tso ? "1" : "0");
-  // slice1 (I6): x87 in FEX's reduced-precision mode (doubles; owner direction, boot-features plan I6).
-  if (slice1) Config::Set(Config::CONFIG_X87REDUCEDPRECISION, "1");
-  for (auto& c : configs) { Config::ConfigOption o; ConfigOptionByName(c.first, o); Config::Set(o, c.second); }
+  for (auto& c : sets) Config::Set(c.first, c.second);
 
   HostFeatures hf {};
   auto table = FeatureTable();
@@ -478,23 +491,19 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
   fexc_dense_pc_table = st.dense_pc;
   fexc_slice1 = slice1;
 
-  // One context per request (a Ctx is never torn down: FEX's destructors assume a running emulator thread). Diagnostic
-  // --serve-mode reuse keeps one per configuration instead; its LookupCache then answers a repeated RIP with the old block.
   static std::map<std::string, Ctx*> kept;
-  std::string key = std::to_string(bitness) + (st.tso ? "t" : "n") + (st.multiblock ? "m" : "s") + "|";
+  std::string key = st.profile + (st.dense_pc ? "|d" : "|s") + (st.end_marker ? "e|" : "n|") + std::to_string(st.dcache_line_log2) + "|";
   for (auto& f : table) key += f.get(hf) ? '1' : '0';
-  for (auto& c : configs) key += "|" + c.first + "=" + c.second;
-  Ctx* kc = ReuseContexts && kept.count(key) ? kept[key] : nullptr;
+  for (auto& c : sets) key += "|" + std::to_string(int(c.first)) + "=" + c.second;
+  Ctx*& kc = kept[key];
   if (!kc) {
     kc = new Ctx;
     kc->ctx = Context::Context::CreateNewContext(hf);
     kc->ctx->SetSignalDelegator(&kc->signals);
     kc->ctx->SetSyscallHandler(&kc->handler);
-    if (!kc->ctx->InitCore()) return Fail("InitCore failed", 3);
+    if (!kc->ctx->InitCore()) { kept.erase(key); return Fail("InitCore failed", 3); }
     kc->thread = kc->ctx->CreateThread();
-    if (ReuseContexts) kept[key] = kc;
   }
-  auto& ctx = kc->ctx;
   auto* thread = kc->thread;
   {
     // Code segment as a flat user CS (same setup FEX's CodeSizeValidation uses).
@@ -509,19 +518,34 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     state.cs_cached = Core::CPUState::CalculateGDTBase(*g);
     g->L = bitness == 64; g->D = bitness != 64;
   }
-  ctx->CompileRIPCount(thread, rip, st.max_insts > 0 ? uint64_t(st.max_insts) : 0);
+  {
+    // FEX's CompileBlock without its caches: the block is never entered into the context's lookup cache (which would answer
+    // a later request at this RIP with this block), its relocations are cleared and its code buffer is emptied (the hook
+    // has copied the code), so the context holds nothing of this request afterwards.
+    auto* impl = static_cast<Context::ContextImpl*>(kc->ctx.get());
+    const uint64_t max = st.max_insts > 0 ? uint64_t(st.max_insts) : 0;
+    thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(thread, rip, max);
+    (void)impl->CompileCode(thread, rip, max);
+    thread->CPUBackend->ClearRelocations();
+    impl->GetLatest()->Reset();
+  }
 
   // ---- describe
   Json j;
   j.open('{');
   j.kv("format", "natemu-fexc-v2");
   j.obj("producer").kv("tool", "fexc").kv("fex_commit", "48d71752e2a363d5535181f803b0b0e9666c1825").kv("host", "macos-arm64-native").end_obj();
-  j.obj("input").kv("bytes_hex", Hex(bytes.data(), bytes.size())).kv("size", bytes.size()).kv("rip", Hex64(rip)).kv("bitness", bitness);
+  // --serve leaves the hex dumps out (input bytes, each instruction's, the code): its caller has the bytes, the object has the
+  // code, and dumping them was most of a request's fixed cost.
+  const bool dumps = !rep;
+  j.obj("input");
+  if (dumps) j.kv("bytes_hex", Hex(bytes.data(), bytes.size()));
+  j.kv("size", bytes.size()).kv("rip", Hex64(rip)).kv("bitness", bitness);
   if (st.max_insts > 0) j.kv("max_instructions", st.max_insts); else j.null("max_instructions");
   j.end_obj();
   j.obj("settings").kv("profile", st.profile).kv("block_cutting", slice1 ? "allowlist" : "none")
    .kv("exits", slice1 ? "dispatcher_gate" : "linked").kv("tso", st.tso).kv("multiblock", st.multiblock).kv("dense_pc_table", st.dense_pc).kv("end_marker", st.end_marker)
-   .kv("fresh_context_per_request", true);
+   .kv("fresh_context_per_request", true);   // (a kept context holds nothing of earlier requests: see the compile above)
   if (!configs.empty()) {   // only when given: output without --config is unchanged
     j.obj("config");
     for (auto& c : configs) j.kv(c.first.c_str(), c.second);
@@ -628,8 +652,10 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     j.null("tail");
   }
   j.end_obj(); // layout
-  j.kv("hex", Hex(code.data(), code.size()));
-  j.kv("hex_note", "relocation literal slots are zeroed; emitted values are in relocations[]");
+  if (dumps) {
+    j.kv("hex", Hex(code.data(), code.size()));
+    j.kv("hex_note", "relocation literal slots are zeroed; emitted values are in relocations[]");
+  }
   j.end_obj(); // code
 
   j.obj("state_abi").kv("state_register", "x28").kv("state_struct", "FEXCore::Core::CpuStateFrame");
@@ -685,7 +711,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
   uint64_t idx = 0;
   for (auto& i : Cap.insts) {
     j.elem_obj().kv("translated", idx++ < Cap.info.TotalInstructions).kv("rip", Hex64(i.pc)).kv("offset", i.pc - rip).kv("size", i.size).kv("name", i.name).kv("ends_block", i.block_end).kv("sets_rip", i.sets_rip);
-    if (InWindow(i.pc, i.size)) j.kv("bytes_hex", Hex(W.bytes + (i.pc - rip), i.size));
+    if (dumps && InWindow(i.pc, i.size)) j.kv("bytes_hex", Hex(W.bytes + (i.pc - rip), i.size));
     j.end_obj();
   }
   j.end_arr();
@@ -701,7 +727,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     else if (Cap.info.TotalInstructions < Cap.insts.size()) {
       const auto& stop = Cap.insts[Cap.info.TotalInstructions];
       const bool no_table = stop.name == "?";
-      if (no_table && lb.status == int(Frontend::Decoder::DecodedBlockStatus::NOEXEC_INST) && end_rip >= W.base + W.size) {
+      if (no_table && lb.status == int(Frontend::Decoder::DecodedBlockStatus::NOEXEC_INST) && !InWindow(end_rip, 1)) {
         reason = "end_of_input"; detail = "the next instruction lies outside the supplied bytes";
       } else if (no_table && lb.status != int(Frontend::Decoder::DecodedBlockStatus::SUCCESS)) {
         reason = StatusName(lb.status); detail = "at " + Hex64(stop.pc);
@@ -713,7 +739,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     else if (!Cap.insts.empty() && (Cap.insts.back().block_end || Cap.insts.back().sets_rip)) { reason = "block_ending_instruction"; detail = Cap.insts.back().name; }
     else if (st.max_insts > 0 && Cap.info.TotalInstructions >= uint64_t(st.max_insts)) reason = "max_instructions";
     else if (Cap.info.TotalInstructions >= uint64_t(Config::Get_MAXINST())) { reason = "fex_instruction_limit"; detail = "FEX's per-block default (MAXINST)"; }
-    else if (end_rip == W.base + W.size) { reason = "end_of_input"; detail = "last instruction ends at the end of the supplied bytes"; }
+    else if (!InWindow(end_rip, 1)) { reason = "end_of_input"; detail = "last instruction ends at the end of the supplied bytes"; }
     else reason = "other"; // e.g. dispatcher-requested block end (system/exception instruction) or FEX's own limit
     end_reason_str = reason;
     j.obj("end").kv("rip", Hex64(end_rip)).kv("reason", reason).kv("detail", detail);
@@ -857,7 +883,10 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
 // ---------------------------------------------------------------- --serve
 // Framing, all integers little-endian u32. Request: len, then payload = args_len, args (NUL-terminated strings, the CLI's
 // arguments without --hex/--file/--out/--object), then the guest bytes. Reply: len, then payload = code (i32, the CLI's exit
-// code: 0 object, 1 no code (json = report), >=2 error (json = message)), json_len, object_len, json, object.
+// code: 0 object, 1 no code (json = report), >=2 error (json = message)), json_len, object_len, extent, args_read, json, object.
+// extent: the compile read or checked only guest bytes [0, extent) and, if extent < the bytes' length, would be the same for
+// any longer input with that prefix (saturating). args_read: bit i set if the compile read the gating argument FEXC_ARG_* i;
+// it is the same under any value of the others. Both are 0 for an error. The JSON leaves out the CLI's hex dumps.
 // EOF on stdin ends the server. One request at a time, in order.
 static bool ReadAll(int fd, void* p, size_t n) {
   for (auto* c = static_cast<char*>(p); n;) { ssize_t r = read(fd, c, n); if (r <= 0) return false; c += r; n -= size_t(r); }
@@ -867,9 +896,10 @@ static void WriteAll(int fd, const void* p, size_t n) {
   for (auto* c = static_cast<const char*>(p); n;) { ssize_t r = write(fd, c, n); if (r <= 0) _exit(3); c += r; n -= size_t(r); }
 }
 static void SendReply(const Reply& r) {
-  std::vector<uint8_t> f(16);
+  std::vector<uint8_t> f(24);
   auto put = [&](size_t at, uint32_t v) { for (int i = 0; i < 4; ++i) f[at + i] = uint8_t(v >> (8 * i)); };
   put(4, uint32_t(r.code)); put(8, uint32_t(r.json.size())); put(12, uint32_t(r.object.size()));
+  if (r.code < 2) { put(16, r.extent); put(20, r.args_read); }
   f.insert(f.end(), r.json.begin(), r.json.end());
   f.insert(f.end(), r.object.begin(), r.object.end());
   put(0, uint32_t(f.size() - 4));
@@ -877,11 +907,13 @@ static void SendReply(const Reply& r) {
 }
 static void Compile(const std::vector<std::string>& args, const std::vector<uint8_t>& bytes, Reply& r) {
   r.code = CompileRequest(args, &bytes, &r);
+  r.extent = uint32_t(std::min<uint64_t>(Extent, UINT32_MAX));
+  r.args_read = fexc_args_read;
 }
-// mode "fork": a child process per request (fresh state, no leak, a crash costs one request); "fresh": a new FEX context per
-// request in this process; "reuse": diagnostic, see CompileRequest.
+// mode "reuse" (the default): every request in this process, in the kept context of its configuration (CompileRequest);
+// "fork" (debugging): each request in a forked child of a server that never compiles, so nothing at all crosses requests and
+// a crash costs one request (about 0.5 ms more per request).
 static int Serve(const std::string& mode) {
-  ReuseContexts = mode == "reuse";
   for (;;) {
     uint32_t len;
     if (!ReadAll(0, &len, 4)) return 0;
@@ -905,8 +937,8 @@ static int Serve(const std::string& mode) {
 
 int main(int argc, char** argv) {
   if (argc >= 2 && std::string(argv[1]) == "--serve") {
-    std::string mode = argc >= 4 && std::string(argv[2]) == "--serve-mode" ? argv[3] : "fork";
-    if (mode != "fork" && mode != "fresh" && mode != "reuse") return Fail("--serve-mode fork|fresh|reuse");
+    std::string mode = argc >= 4 && std::string(argv[2]) == "--serve-mode" ? argv[3] : "reuse";
+    if (mode != "fork" && mode != "reuse") return Fail("--serve-mode reuse|fork");
     return Serve(mode);   // stdin EOF; contexts are never torn down (see Ctx), so leave without destructors
   }
   int code = CompileRequest(std::vector<std::string>(argv, argv + argc), nullptr, nullptr);

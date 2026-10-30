@@ -133,16 +133,27 @@ inline std::map<uint64_t, uint8_t> fexc_div_width;
 // Profile slice1 (I2), recorded by the dispatcher's string instructions: guest RIP of each MOVS, whose load and store are two
 // memory operands (DS:RSI read, ES:RDI written), not a read-modify-write of one.
 inline std::set<uint64_t> fexc_movs;
+// The request arguments that gate forms (`--sse-gated` ... `--x87-fpcr`): reading one through its conversion sets its bit in
+// `fexc_args_read` (bit = FexcArg's Bit), so fexc can tell its caller which of them this compile depended on (fexc never read
+// the others: the compile is the same under any value of them, which lets the host's cache leave them out of its key).
+inline uint32_t fexc_args_read = 0;
+template<class T, int Bit>
+struct FexcArg {
+  T value {};
+  operator T() const { fexc_args_read |= 1u << Bit; return value; }
+  FexcArg& operator=(T v) { value = v; return *this; }
+};
+enum : int { FEXC_ARG_SSE_GATED, FEXC_ARG_AVX_GATED, FEXC_ARG_ALIGNMENT_GATED, FEXC_ARG_X87_GATED, FEXC_ARG_WAIT_GATED, FEXC_ARG_X87_FPCR };
 // Profile slice1 (I3), recorded by the dispatcher: guest RIP of each LOCK CMPXCHG / CMPXCHG8B / CMPXCHG16B, whose casal/caspal
 // the JIT precedes with `dmb ish` (x86 orders a failing locked compare; a failing Arm CAS writes nothing, acquire only).
 inline std::set<uint64_t> fexc_lock_cas;
 // Profile slice1 (I5a): the vCPU runs with CR0.EM or CR0.TS set or CR4.OSFXSR clear (`--sse-gated`, from the host): every SSE
 // form is cut as a system instruction (the resident raises #UD or #NM, SDM Vol.3 Table 2-2 and the SSE exception tables).
-inline bool fexc_sse_gated = false;
+inline FexcArg<bool, FEXC_ARG_SSE_GATED> fexc_sse_gated;
 // Profile slice1 (X2): the vCPU runs under x86 alignment checking (CR0.AM, RFLAGS.AC, CPL 3; `--alignment-gated`, from the
 // host): BT/BTS/BTR/BTC with a memory operand are cut as system instructions. FEX accesses the one byte holding the bit, so the
 // operand-size access x86 checks (#AC) never happens natively; the resident checks the operand's alignment, then steps it.
-inline bool fexc_alignment_gated = false;
+inline FexcArg<bool, FEXC_ARG_ALIGNMENT_GATED> fexc_alignment_gated;
 // Profile slice1 (I5a), recorded by the allowlist: guest RIP of each legacy SSE instruction whose 16-byte memory operand must be
 // 16-byte aligned (#GP(0) otherwise: SDM Vol.2 2.5, exception classes 1, 2 and 4); its first access gets an alignment check.
 inline std::set<uint64_t> fexc_align16;
@@ -150,7 +161,7 @@ inline std::set<uint64_t> fexc_align16;
 inline std::set<uint64_t> fexc_align32;
 // Profile slice1 (I8): the vCPU's controls gate the VEX AVX forms (`--avx-gated`, from the host: CR4.OSXSAVE clear, XCR0[2:1]
 // not 11b, or CR0.TS): every one is cut as a system instruction (the resident raises #UD, else #NM).
-inline bool fexc_avx_gated = false;
+inline FexcArg<bool, FEXC_ARG_AVX_GATED> fexc_avx_gated;
 // Profile slice1 (I5a), recorded by the allowlist so the JIT raises the MXCSR exception flags x86 does (FPSR is MXCSR's flags):
 // COMISS/COMISD compare signalling (`fcmpe`: IE for a QNaN too; FEX emits UCOMIS's quiet `fcmp` for both); RCPPS/RCPSS/
 // RSQRTPS/RSQRTSS raise none (FEX divides exactly: FPSR is saved and restored around the op); ROUNDPS/PD/SS/SD with imm8
@@ -164,8 +175,9 @@ inline std::map<uint64_t, uint32_t> fexc_mmio;
 // fields. From the host: `--x87-gated` (CR0.EM or CR0.TS) cuts every x87 form d8..df as a system instruction (#NM),
 // `--wait-gated` (CR0.TS and CR0.MP) cuts WAIT/FWAIT (9b) likewise; `--x87-fpcr V` (V nonzero) is the FPCR x87 arithmetic
 // runs under (FCW.RC, no flush to zero) when it differs from MXCSR's (the resident enters blocks with MXCSR's FPCR).
-inline bool fexc_x87_gated = false, fexc_wait_gated = false;
-inline uint64_t fexc_x87_fpcr = 0;
+inline FexcArg<bool, FEXC_ARG_X87_GATED> fexc_x87_gated;
+inline FexcArg<bool, FEXC_ARG_WAIT_GATED> fexc_wait_gated;
+inline FexcArg<uint64_t, FEXC_ARG_X87_FPCR> fexc_x87_fpcr;
 // Profile slice1 (I6), recorded by the allowlist: guest RIP of each admitted x87 instruction. Its floating-point ops run
 // with FPSR cleared (MXCSR's flags saved around them) and, with `fexc_x87_fpcr`, under that FPCR; the cumulative FPSR flags
 // they raise are or-ed into the x87 exception word at FEXC_X87_EXCEPTIONS (a guest-state field in FEX's CPUState padding

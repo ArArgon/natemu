@@ -23,6 +23,7 @@ Compared: the zero page after the decompressor; every GPR, RIP, RFLAGS, CR0, CR2
 difference is QEMU's missing accessed bit on a far-transfer CS load, S2b's known QEMU difference). Writes DIR/smoke.json; exit 1 on
 a difference or a natemu stop other than reaching ENTRY."""
 import argparse, hashlib, json, os, pathlib, re, socket, struct, subprocess, sys, tempfile, time
+os.environ.setdefault('NATEMU_COMPILE_CACHE', 'off')   # P3: hermetic; boot-linux keeps compiles across runs otherwise
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 RAW = ROOT.parent / 'natemu-raw/kernel-census-20261028-01'

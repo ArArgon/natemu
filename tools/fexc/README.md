@@ -29,7 +29,9 @@ jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never 
 (series applied as twenty-four commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series32` (October 30, I9: series31 plus patch 0024
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series33` (October 30, P3: series32's patches with
+`fexc.cpp` and shim changes, no patch change: the compile server runs requests in process and reports what each compile read,
+see "Compile server" below; the host needs series33's reply format). Before it, series32 (October 30, I9: series31 plus patch 0024
 and shim changes. Patch 0024 (all under slice1): every MMX instruction sets TOP = 0 and the abridged tag byte FFH at its end,
 after its memory accesses (`FexcEndMMX`, called after each instruction's handler in Core.cpp), so a fault leaves both as they
 were, and every one does (FEX did it once per block); the MMX registers join the per-instruction register-cache flush (none
@@ -236,20 +238,41 @@ Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in
 include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then
 `git -C BUILD_DIR/src format-patch --no-signature --zero-commit -o tools/fexc/patches 48d7175..HEAD`.
 
-### Compile server (`fexc --serve`, S2a)
+### Compile server (`fexc --serve`, S2a; P3)
 
 One persistent process answers compile requests, length-prefixed (u32 little-endian) on stdin/stdout; EOF on stdin ends it.
 Request: `len`, `args_len`, the CLI arguments as NUL-terminated strings (without `--hex/--file/--out/--object`), then the
-guest bytes. Reply: `len`, `code` (i32: the CLI's exit code), `json_len`, `object_len`, JSON report (error text for
-`code >= 2`), binary object (always produced for `code 0`). Object and JSON equal the one-shot CLI's (the one JSON value that
-differs between two CLI runs, the dispatcher's host address `emitted_value`, aside).
+guest bytes. Reply: `len`, `code` (i32: the CLI's exit code), `json_len`, `object_len`, `extent`, `args_read`, JSON report
+(error text for `code >= 2`), binary object (always produced for `code 0`). The object equals the one-shot CLI's; so does
+the JSON, less the CLI's hex dumps (`input.bytes_hex`, each instruction's `bytes_hex`, `code.hex`), which the server leaves
+out (its caller has the bytes, the object the code; building them was most of a request's fixed cost), and the one value
+that differs between two CLI runs, the dispatcher's host address `emitted_value`.
 
-**Each request runs in a forked child of the server** (`--serve-mode fork`, the default), which does exactly what the CLI
-does. The parent never touches FEX, so no state of any kind crosses requests, and a crash costs one request. In-process
-alternatives were measured and rejected (`--serve-mode fresh|reuse`, `test_serve.py --mode`): one reused context answers a
-repeated RIP from FEX's block cache without compiling (wrong or missing code, even for other bytes), and a context per request
-in the same process still leaks `Config::Set` values (e.g. `--config`), the process-global recorders, and about 150 KiB of
-unreleasable memory per request (FEX contexts cannot be destroyed). `test_serve.py FEXC --corpus C.json` checks identity.
+`extent` and `args_read` say what the compile depended on, for the caller's cache key (the host's `Compiler`). Every look
+at the guest bytes or at the input's size goes through `InWindow` (FEX's decoder learns the size from
+`QueryGuestExecutableRange` but uses it only to check a range it then reads), which records the end of each range: the
+compile read only bytes `[0, extent)` and, when `extent` is less than their length, gives the same object, end reason and
+cut for any input of at least `extent` bytes with that prefix (the JSON differs in `input.size`, the input's length). The gating arguments (`--sse-gated`, `--avx-gated`, `--alignment-gated`, `--x87-gated`,
+`--wait-gated`, `--x87-fpcr`) are `FexcArg`s in `shim/fexc_hook.h`: reading one sets its bit (`FEXC_ARG_*`) in `args_read`;
+the shim tests the form before the flag, so a block without a gated form reads none of them. Both are 0 for an error.
+
+**Requests run in this process** (`--serve-mode reuse`, the default since P3): one FEX context per configuration (Config
+values, host features, profile), kept, and nothing of a request left in it: the compile is FEX's `CompileBlock` without
+its caches (the block never enters the context's lookup cache, its relocations are cleared, the code buffer is emptied
+after the hook copies the code), FEX's process-global Config is rebuilt from nothing per request (`Config::Shutdown`, then
+`Initialize`; a plain `Initialize` kept an earlier request's `--config` values) and the recorders are reset
+(`ResetGlobals`). About 0.04 ms per request against 0.45 ms forked (the boot's request set). Server memory is bounded
+by the number of configurations, not of requests: about 10 MiB with the host's one (1.34 M requests of a boot), 22-29 MiB
+with the many of `test_serve.py` (each kept context holds a thread, its JIT and dispatcher). Contexts are never torn down
+(FEX's destructors assume a running emulator thread), so the earlier context per request leaked about 145 KiB each
+(`--serve-mode fresh`, removed). `--serve-mode fork` (debugging) runs each request in a forked child of a server that never
+compiles: no FEX state crosses requests and a crash costs one request. It is not the same process environment, though:
+on this macOS, CNTFRQ_EL0 reads 1 GHz in a normal process and 24 MHz in a forked child (P3 review), so under the default
+profile the code FEX emits for RDTSC and CPUID leaf 15H, which reads it, differs between fork mode and the CLI or the
+in-process server. Profile slice1 does not use it (both are system instructions the resident runs), so slice1 objects are
+the same in every mode. `test_serve.py FEXC [--mode M] [--corpus C.json]` checks either mode against the CLI (requests at one RIP with
+other bytes and settings in shuffled orders included); the P3 replay of a boot's 76,610 logged requests found no
+difference from series32's fork mode.
 
 ## What builds
 

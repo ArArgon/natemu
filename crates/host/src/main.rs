@@ -7,6 +7,7 @@ use vm::*;
 mod admission;
 mod boot;
 mod clock;
+mod compile_cache;
 mod devices;
 mod drivers;
 mod execution;

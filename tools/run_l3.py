@@ -18,9 +18,11 @@ plan, L3; programs in tools/bench/smp/ports.py).
   the UART's reset values, and QEMU's output is taken after SeaBIOS's banner. Not compared with QEMU (QEMU 11.1.2 departs
   from a PC there): an access crossing 3FFH (QEMU aborts, serial.c:476), a misaligned wide access to an unassigned port
   (QEMU's memory core reads 0, not all-ones) and a wide access at FFFFH (its upper bytes lie past QEMU's 64 KiB I/O space; not run).
-- `stress` (natemu only): REP OUTSB to the THR and loopback REP OUTSB/REP INSB in a loop with IF = 1 while kicks post
-  events (`--kick-events`): every delivery at a REP's RIP has RF = 1 and 0 < RCX < count (or RF = 0 before the first
-  element), RF = 0 elsewhere; the UART's output and the received bytes are exactly the program's (each element once).
+- `stress` (natemu only): a local APIC one-shot timer armed 20 us before each of 64 REP OUTSB of 512 bytes to an unassigned
+  port (all but two of its interrupts must arrive between elements: deterministic, P3 review), then REP OUTSB to the THR
+  and loopback REP OUTSB/REP INSB in a loop with IF = 1 while kicks post events (`--kick-events`, every 20-60 us): every
+  delivery at a REP's RIP has RF = 1 and 0 < RCX < count (or RF = 0 before the first element), RF = 0 elsewhere (every
+  delivery is logged); the UART's output and the received bytes are exactly the program's (each element once).
 - `cases` (natemu only, judged by the SDM and the owner's rule): the strict switch (IN, REP OUTSD crossing into an
   unassigned port), Linux's PCI type 1/type 2 probes and `read_pci_config_16` with no PCI (all-ones; 0xCF8 does not hold
   its value: no type-1 mechanism), the port wrap at FFFFH, an access crossing the UART's end (byte by byte), LOCK IN (#UD), F3 IN (not decoded: a typed stop), INS to a device
@@ -99,38 +101,50 @@ def cmd_qemu(a, report):
 
 
 def cmd_stress(a, report):
+    """Deliveries between the elements of REP string instructions (RF = 1, RCX between its start and 0) and before the first
+    (RF = 0, RCX unchanged), never elsewhere at a REP. The timer phase makes them deterministic: each of its one-shot
+    interrupts must arrive between elements (at most two may come before the first, e.g. while the round's first
+    translation is compiled); the driver's kicks (every 20 us plus up to 40 us at random, events 0x40/0x41) add coverage."""
     rounds = 150
     p = ports.stress_program(rounds)
     labels = p['labels'][0]
-    reps = {labels['l3_outs']: len(ports.SOURCE), labels['l3_loop_outs']: 16, labels['l3_ins']: 16}
-    failures, mids = [], []
+    reps = {labels['l3_outs']: len(ports.SOURCE), labels['l3_loop_outs']: 16, labels['l3_ins']: 16, labels['l3_touts']: ports.TIMER_OUTS}
+    failures = []
     for block in (None, 1):
-        extra = ([block] if block else []) + ['--kick-vcpu', 0, '--kicks', a.kicks, '--kick-events', '0x40,0x41']
+        extra = ([block] if block else []) + ['--kick-vcpu', 0, '--kicks', a.kicks, '--kick-every-us', 20, '--kick-jitter-us', 40,
+                                              '--kick-events', '0x40,0x41']
         out, problems = natemu(a, p, a.out / 'stress' / f'{block}', extra, timeout=600)
         stats = {}
         if out:
             c = out['cpus'][0]
-            problems += kick_checks(c)
+            # The timer's expiries ring the doorbell too (at most one per round): host doorbells are the kicks plus those.
+            problems += [d for d in kick_checks(c) if not d.startswith('host doorbells')]
+            k = c['kicks']
+            if not 0 <= k['irqs'] - k['irq_sgis'] + k['pending'] - k['issued'] <= ports.TIMER_ROUNDS:
+                problems.append(f"host doorbells {k['irqs'] - k['irq_sgis']} + pending {k['pending']}: not issued {k['issued']} plus timer rings")
             memory = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in c['memory']}
-            log = events.log(memory[ports.LOG(0)])
-            mid = 0
+            log = events.log(memory[ports.STRESS_LOG_AT])
+            mid, timer, timer_mid = 0, 0, 0
             for vector, _, rip, rflags, _, rcx, _ in log:
-                if vector not in (0x40, 0x41):
+                if vector not in (0x40, 0x41, ports.TIMER_VECTOR):
                     problems.append(f'vector {vector} at {rip:#x}'); continue
+                timer += vector == ports.TIMER_VECTOR
                 if rip in reps:
                     n = reps[rip]
-                    if 0 < rcx < n and rflags & RF: mid += 1
+                    if 0 < rcx < n and rflags & RF:
+                        mid += 1
+                        timer_mid += vector == ports.TIMER_VECTOR and rip == labels['l3_touts']
                     elif not (rcx == n and not rflags & RF): problems.append(f'delivery at the REP {rip:#x}: RCX {rcx}, RF {rflags >> 16 & 1}')
                 elif rflags & RF: problems.append(f'RF = 1 at {rip:#x} (not a REP)')
+            if len(log) * 0x40 >= ports.STRESS_LOG: problems.append('the log is full: deliveries were not logged')
+            if timer != ports.TIMER_ROUNDS: problems.append(f'{timer} timer interrupts for {ports.TIMER_ROUNDS} rounds')
+            if timer_mid < ports.TIMER_ROUNDS - 2: problems.append(f'only {timer_mid} of {ports.TIMER_ROUNDS} timer interrupts between elements')
             if bytes.fromhex(out.get('uart', '')) != ports.SOURCE * rounds: problems.append('UART output differs from the program\'s')
             if memory[ports.DATA(0)][0x100:0x100 + 16 * rounds] != ports.SOURCE[:16] * rounds: problems.append('received bytes differ')
-            mids.append(mid)
-            stats = {'deliveries': len(log), 'mid_string': mid, 'kicks': c['kicks']['issued']}
+            stats = {'deliveries': len(log), 'mid_string': mid, 'timer_mid': timer_mid, 'kicks': c['kicks']['issued']}
         report['stress'].append({'block': block, 'stats': stats, 'problems': problems})
         failures += [f'stress block={block}: {d}' for d in problems]
         print(f"stress block={block}: {stats} {'ok' if not problems else problems[:4]}", flush=True)
-    # The log keeps the first 256 deliveries; under host load they may all fall outside the REPs in one run, not in both.
-    if not any(mids): failures.append('stress: no delivery between elements in either run')
     return failures
 
 

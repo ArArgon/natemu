@@ -605,8 +605,9 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   if (v.mmx && fexc_x87_gated) { v = Sys("MMX gated by CR0.EM/TS (#UD/#NM)"); v.mmx = true; v.gated = true; return v; }
   // X2: BT/BTS/BTR/BTC m, r and m, imm8 (0f a3/ab/b3/bb, 0f ba /4../7) under alignment checking (the host's --alignment-gated):
   // the resident checks the operand-size alignment (#AC), then steps the instruction compiled without this flag.
-  if (fexc_alignment_gated && d.FexcMap >= FEXC_MAP_TWO && d.FexcMap <= FEXC_MAP_TWO_66 && has_modrm && mod != 3 &&
-      (op == 0xA3 || op == 0xAB || op == 0xB3 || op == 0xBB || (op == 0xBA && reg >= 4)))
+  // (The form first: fexc_alignment_gated is read only for the forms it gates; see FexcArg.)
+  if (d.FexcMap >= FEXC_MAP_TWO && d.FexcMap <= FEXC_MAP_TWO_66 && has_modrm && mod != 3 &&
+      (op == 0xA3 || op == 0xAB || op == 0xB3 || op == 0xBB || (op == 0xBA && reg >= 4)) && fexc_alignment_gated)
     return Sys("bt/bts/btr/btc with a memory operand under alignment checking (#AC: the resident's check)");
   const bool primary = d.FexcMap == FEXC_MAP_PRIMARY;
   // LOCK (I3): admitted on every lockable form (the others are cut above as #UD). FEX lowers each to one LSE atomic (LOCK NEG:

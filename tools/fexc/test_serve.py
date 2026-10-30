@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """fexc --serve against the one-shot CLI: same inputs, byte-identical object and JSON (S2a).
 
-    test_serve.py FEXC [--mode fork|fresh|reuse] [--cli FEXC] [--corpus PROGRAMS.json]... [--time]
+    test_serve.py FEXC [--mode reuse|fork] [--cli FEXC] [--corpus PROGRAMS.json]... [--time]
 
 Inputs: the 64 fixture programs, every --corpus (gen_slice1.py format, e.g. `--seed 4242 --random 20` = 44 programs) and the
 scan_skips.py memory-form matrix, each under profile slice1 and default, plus 32-bit, --max-insts, --feature, --config and
 error requests. One server process answers all of them, then the whole list again in reverse order (same RIPs with
-other bytes in between: a reused context would answer from its cache), then an adversarial set at one RIP (several byte
-strings x settings) in six shuffled orders. Exit status 1 on any difference.
+other bytes in between: a context that kept FEX's block cache would answer from it), then an adversarial set at one RIP
+(several byte strings x settings) in six shuffled orders. Exit status 1 on any difference. The server's JSON lacks the CLI's
+hex dumps (input bytes, each instruction's, the code), which are dropped from the CLI's before comparing.
 --time prints mean/p95 compile latency of the CLI and of the server."""
 import argparse, json, os, random, statistics, struct, subprocess, sys, tempfile, time
 from pathlib import Path
@@ -30,8 +31,8 @@ class Server:
         self.p.stdin.flush()
         n, = struct.unpack('<I', self.p.stdout.read(4))
         r = self.p.stdout.read(n)
-        c, jl, ol = struct.unpack('<iII', r[:12])
-        return c, r[12:12 + jl], r[12 + jl:12 + jl + ol]
+        c, jl, ol, self.extent, self.args_read = struct.unpack('<iIIII', r[:20])
+        return c, r[20:20 + jl], r[20 + jl:20 + jl + ol]
 
     def close(self):
         self.p.stdin.close(); self.p.wait()
@@ -54,6 +55,9 @@ def norm(r):
         d = json.loads(js)
         for x in d.get('code', {}).get('relocations', []):
             if x['kind'] == 'named_symbol_literal': x['emitted_value'] = None
+        d.get('input', {}).pop('bytes_hex', None)
+        d.get('code', {}).pop('hex', None); d.get('code', {}).pop('hex_note', None)
+        for i in d.get('guest', {}).get('instructions', []): i.pop('bytes_hex', None)
         js = json.dumps(d, sort_keys=True).encode()
     return code, js, obj
 
@@ -83,11 +87,17 @@ def adversarial():
     """Everything at ONE RIP: several byte strings (a prefix of each other too) under every setting. Served in shuffled orders,
     a server that kept FEX's block cache, Config or any recorder state between requests answers some of them wrongly."""
     codes = [bytes.fromhex(h) for h in ('4801d84883c001c3', '4801d84883c001', '4801d8', '4829d84883e801c3', '480fafc3c3', '4831c04889d8c3',
-                                        '488b03c3', '488903c3', 'f7f3c3', '48f7f3c3', 'd9c0d9c9c3', '0f05')]
+                                        '488b03c3', '488903c3', 'f7f3c3', '48f7f3c3', 'd9c0d9c9c3', '0f05',
+                                        # P3: forms each gating argument gates: MOVAPS, VADDPS ymm, BT m, FADD, FWAIT
+                                        '0f28c1c3', 'c5fc58c1c3', '0fa303c3', 'd8c1c3', '9bc3')]
     variants = [[], FIXED, ['--max-insts', '1'], FIXED + ['--max-insts', '1'], ['--max-insts', '2'], FIXED + ['--max-insts', '2'],
                 FIXED + ['--feature', 'atomics_lse=0'], FIXED + ['--feature', 'flagm=0'], ['--feature', 'flagm=0'], ['--feature', 'x86_avx=0'],
                 ['--bitness', '32'], ['--no-tso'], ['--multiblock'], ['--sparse-pc'], ['--no-end-marker'],
-                ['--config', 'X87REDUCEDPRECISION=1'], FIXED + ['--config', 'X87REDUCEDPRECISION=1'], ['--config', 'MAXINST=2']]
+                ['--config', 'X87REDUCEDPRECISION=1'], FIXED + ['--config', 'X87REDUCEDPRECISION=1'], ['--config', 'MAXINST=2'],
+                # P3: the gating arguments (slice1), alone and together, and an x87 FPCR
+                FIXED + ['--sse-gated'], FIXED + ['--avx-gated'], FIXED + ['--alignment-gated'], FIXED + ['--x87-gated'],
+                FIXED + ['--x87-gated', '--wait-gated'], FIXED + ['--x87-fpcr', '0x400000'],
+                FIXED + ['--sse-gated', '--avx-gated', '--alignment-gated', '--x87-gated', '--wait-gated', '--x87-fpcr', '0xc00000']]
     return [(f'adv {c.hex()} {" ".join(v)}', v + ['--rip', '0x1000'], c) for c in codes for v in variants]
 
 
@@ -97,7 +107,7 @@ def p95(v):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('fexc'); ap.add_argument('--mode', default='fork')
+    ap.add_argument('fexc'); ap.add_argument('--mode', default='reuse')
     ap.add_argument('--cli', help='fexc binary for the one-shot side (default: FEXC)')
     ap.add_argument('--corpus', action='append', default=[]); ap.add_argument('--time', action='store_true')
     a = ap.parse_args()
