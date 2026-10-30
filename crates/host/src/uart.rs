@@ -16,11 +16,12 @@
 //! **Time.** The FIFO character timeout (CTI, 4 character times after the last receive or RBR read with data left)
 //! is evaluated at each register access from the host's monotonic clock: its effect on IIR and the line is the timer's
 //! as seen by any access, but the line does not rise between accesses. **IRQ4** ([`Uart::irq`]): the UART drives its
-//! interrupt output (high while IIR names an interrupt); routing through the I/O APIC/PIC is L4a's. Today every change
-//! is made by a vCPU's own access (synchronous). The hook reports level changes only; QEMU's edge-mode IOAPIC delivers on
-//! every raise, a raise while already high included, so L4a decides which edge rule its IOAPIC input applies. ponytail: once the line is wired, the CTI and any host input source
-//! are asynchronous host sources: they need a host timer or thread that posts through `execution::post` and vetoes
-//! ending halted vCPUs while it can fire (X3's rule, as `kickers_left` does).
+//! interrupt output (high while IIR names an interrupt), wired by L4a (`irq::install`) to ISA IRQ 4: PIC input 4 and I/O
+//! APIC pin 4. Today every change is made by a vCPU's own access (synchronous). The hook reports level changes only, and
+//! the board treats an edge as a 0 -> 1 change (QEMU's edge-mode I/O APIC delivers on every raise, a raise while already
+//! high included: a departure recorded in `ioapic.rs`). ponytail: the CTI and any host input source are asynchronous:
+//! they need a host timer or thread calling `irq::Irqs::line` and holding an `Irqs::busy` guard while they can fire
+//! (X3's rule for ending halted vCPUs).
 use crate::devices::Device;
 use std::collections::VecDeque;
 use std::io::Write;
@@ -81,7 +82,7 @@ pub(crate) struct Uart {
     pub(crate) sink: Option<Box<dyn Write + Send>>,
     /// The interrupt output's level.
     pub(crate) line: bool,
-    /// L4a's hook: called with the new level whenever the interrupt output changes.
+    /// L4a's hook (`irq::install`: ISA IRQ 4): called with the new level whenever the interrupt output changes.
     pub(crate) irq: Option<Box<dyn FnMut(bool) + Send>>,
 }
 

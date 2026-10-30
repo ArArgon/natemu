@@ -43,6 +43,12 @@
 //! access, unassigned-page access or UART output happened, the output gains `ports` (per port touched: reads, writes,
 //! unassigned), `unassigned_pages` (per page: reads = shadow fills, writes) and `uart` (the bytes transmitted, hex).
 //!
+//! L4a: the VM has the I/O APIC at 0xFEC00000 and the 8259 pair with its ELCR (`irq`), the UART's IRQ4 wired into both.
+//! `--irq-source PORT` registers the asynchronous test source (`irq::TestSource`) on PORT..PORT+7: a 32-bit OUT at PORT
+//! asks a host thread to pulse (bit 8 clear) or assert (bit 8 set) line bits 7:0 after bits 31:16 microseconds, an OUT at
+//! PORT+4 deasserts a line at once; a request vetoes ending halted vCPUs until it fired (`--irq-source-no-veto`: not, the
+//! negative control of that rule).
+//!
 //! X2: with `--kick-events E[,E..]` (vectors 16..255 or `nmi`) each kick first posts one of them, chosen at random, so
 //! events arrive at random times. A halted vCPU (HLT) can be woken only by an event: once every kicker has ended and
 //! every vCPU is halted or ended, the driver asks each halted one to end (`stop` `resident`, reason `halted`).
@@ -528,7 +534,7 @@ fn log_images(base: u64) -> [Vec<u8>; 2] {
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] \
                      [--code-shape] [--code-cache BYTES] [--ram BYTES] [--place GPA] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-exit] [--tamper offset|word|record|system] [--tamper-after word|record] \
-                     [--forge-stop] [--forge-entry HEX[,HEX]...] [--kick-vcpu V]... [--kicks M] [--kick-every-us P] [--kick-jitter-us J] [--kick-events E,..] [--tamper next-page|site|site-kind|armed|dispatch|target] [--ignore-kicks] [--kill-compiler N] [--stall-compiler N] [--compile-deadline-ms MS] [--strict-unassigned] [--device-at GPA]...";
+                     [--forge-stop] [--forge-entry HEX[,HEX]...] [--kick-vcpu V]... [--kicks M] [--kick-every-us P] [--kick-jitter-us J] [--kick-events E,..] [--tamper next-page|site|site-kind|armed|dispatch|target] [--ignore-kicks] [--kill-compiler N] [--stall-compiler N] [--compile-deadline-ms MS] [--strict-unassigned] [--device-at GPA]... [--irq-source PORT] [--irq-source-no-veto]";
 
 /// Every literal exit's RIP move puts another RIP in x0: bit 0 of the immediate of its last word (the one before its
 /// `svc #LINK`) flips. A one-word move would change the link point's first word itself, which the host's self-check
@@ -740,6 +746,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let (mut ignore_kicks, mut signal_at, mut deadline_ms) = (false, None, execution::COMPILE_DEADLINE.as_millis() as u64);
     let (mut code_shape, mut device_tamper, mut strict) = (false, false, false);
     let mut device_at: Vec<u64> = Vec::new();
+    // L4a: the asynchronous test source's ports, and whether its requests veto ending halted vCPUs.
+    let (mut irq_source, mut irq_veto) = (None, true);
     // M1: the VM's guest RAM and where the driver starts placing pages; the environment's defaults let a whole suite run
     // at another size or placement unchanged.
     let env = |name: &str, default: u64| std::env::var(name).map_or(Ok(default), |v| number(&v));
@@ -751,6 +759,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             "--code-shape" => code_shape = true,
             "--strict-unassigned" => strict = true,
             "--device-at" => device_at.push(number(options.next().ok_or(USAGE)?)?),
+            "--irq-source" => irq_source = Some(number(options.next().ok_or(USAGE)?)?),
+            "--irq-source-no-veto" => irq_veto = false,
             "--code-cache" => code_bytes = value()?,
             "--ram" => ram_bytes = number(options.next().ok_or(USAGE)?)?,
             "--place" => place = number(options.next().ok_or(USAGE)?)?,
@@ -853,6 +863,13 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     // L3: COM1, a 16550A at 3F8H (output reported as `uart`); the unassigned rule, or with `--strict-unassigned` stops.
     let uart = Arc::new(Mutex::new(crate::uart::Uart::new()));
     registry.register_ports(crate::boot::acpi::platform::COM1_PORT.into(), 8, uart.clone())?;
+    // L4a: the I/O APIC, the 8259 pair and their wires; the UART's IRQ4 into them.
+    let irqs = crate::irq::install(&mut registry, &backing.memory, n, &uart)?;
+    if let Some(port) = irq_source {
+        let mut source = crate::irq::TestSource::new(&irqs);
+        source.veto = irq_veto;
+        registry.register_ports(port as u32, 8, Arc::new(Mutex::new(source)))?;
+    }
     registry.strict = strict;
     let registry = Arc::new(registry);
     // A space is built for the first vCPU using it (its rip places `code` bodies).
@@ -921,6 +938,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
 
     let machine = Machine::create(&backing.memory)?;
+    irqs.attach(machine.doorbell());
     let stops = execution::Stops::new(&backing, !kicked.is_empty());
     // vCPU v passed the start barrier: every vCPU exists. A kicker waits for it: an SPI rung while vCPUs are being
     // created would also find no vCPU to take it. Its end (`Stops::end`, under its kick mutex) stops its kicker.
@@ -999,7 +1017,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                         let area = backing.vcpu(v);
                         let taken = stops.taken(area);
                         if !kick_events.is_empty() && !stops.ended(v) {
-                            execution::post(&backing.memory, v, kick_events[(rng >> 33) as usize % kick_events.len()]);
+                            let _ = execution::post(&backing.memory, v, kick_events[(rng >> 33) as usize % kick_events.len()], false);
                         }
                         if !stops.kick(machine, v)? {
                             break;
@@ -1041,18 +1059,23 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         // asynchronous host source (the kickers here; L4a's PIT, RTC, UART and device SPIs) must post through
         // `execution::post`, so the posts count sees it, and must keep the decision off while it may still post, as
         // `kickers_left` does.
-        let (stops, backing, machine, kickers_left, all_ended) = (&stops, &backing, &machine, &kickers_left, &all_ended);
+        let (stops, backing, machine, kickers_left, all_ended, irqs) = (&stops, &backing, &machine, &kickers_left, &all_ended, &irqs);
         let idle = scope.spawn(move || -> Result<()> {
             let mut asked = vec![false; n];
             while !all_ended.load(SeqCst) {
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                if kickers_left.load(SeqCst) != 0 {
-                    continue;
-                }
                 let read = || (0..n).map(|v| (!stops.ended(v)).then(|| execution::park_state(&backing.memory, v))).collect::<Vec<_>>();
                 let (first, second) = (read(), read());
                 let halted: Vec<usize> = (0..n).filter(|&v| first[v].is_some()).collect();
-                if !halted.is_empty() && halted.iter().all(|&v| first[v] == second[v] && first[v].is_some_and(execution::idle)) {
+                // The vetoes are read after the two reads (L4a): a source that may still fire (a kicker, or an
+                // asynchronous interrupt source's `Irqs::busy` guard) vetoes. A guard is taken by a vCPU's device access,
+                // before that vCPU can halt, or held continuously by a host source while armed; so if every vCPU was idle
+                // across both reads, any guard taken before then is visible here, and none can be taken after (no vCPU
+                // runs). Checked before the reads instead, a guard taken between the check and the reads by a vCPU that
+                // then halted went unseen and its vCPU was ended (`run_l4a.py halt` with a 30 ms delay forced there: red
+                // 5/5; this order: green 5/5).
+                let vetoed = kickers_left.load(SeqCst) != 0 || irqs.live() != 0;
+                if !vetoed && !halted.is_empty() && halted.iter().all(|&v| first[v] == second[v] && first[v].is_some_and(execution::idle)) {
                     for &v in halted.iter().filter(|&&v| !std::mem::replace(&mut asked[v], true)) {
                         execution::end_when_halted(&backing.memory, v);
                         stops.kick(machine, v)?;

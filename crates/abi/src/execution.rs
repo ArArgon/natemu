@@ -347,6 +347,12 @@ pub mod cache {
         /// whose `halted` carries the current count has looked at every event posted to it: with the state 1, nothing
         /// can wake it but a new post (the host's rule for ending halted vCPUs).
         pub posts: u64,
+        /// L4a: the TMR (SDM Vol.3 11.8.4): the trigger mode of each vector as last accepted into the IRR, written by the
+        /// sender with the IRR bit (set for a level-triggered interrupt, cleared for an edge one, before the IRR bit).
+        pub tmr: [u64; 4],
+        /// L4a: the level of the LINT0 input (1: the 8259's INT output is asserted), kept current by the host's chipset;
+        /// the resident applies its LVT LINT0 entry (ExtINT: the vector from the PIC's INTA cycle, `REQUEST_IRQ`).
+        pub lint0: u64,
     }
     /// `Events::halted`: the shift of the `posts` count the vCPU had seen.
     pub const HALTED_SEEN_SHIFT: u32 = 8;
@@ -830,6 +836,11 @@ pub const REPLY_PORT: u64 = 0x32;
 /// path) or [`mmio::UNASSIGNED`] (unassigned under the strict switch: refused).
 pub const REQUEST_PAGE: u64 = 0x33;
 pub const REPLY_PAGE: u64 = 0x33;
+/// L4a: the interrupt controllers, through the [`Mmio`] record: `write` 1, the EOI broadcast of the level-triggered
+/// vector in `value` (a LAPIC's EOI of a vector whose TMR bit is set); `write` 0, the INTA cycle of an ExtINT taken from
+/// LINT0, the 8259's vector returned in `value`. The host answers [`REPLY_IRQ`] with `status` [`mmio::DONE`].
+pub const REQUEST_IRQ: u64 = 0x34;
+pub const REPLY_IRQ: u64 = 0x34;
 
 /// A request's instruction fetch, walked by the resident (`State::fetch_fault`): why the walk of the last page it walked
 /// failed — kind, then the #PF address and error code for [`fetch::PAGE`].

@@ -5,7 +5,7 @@
 //!       [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]
 //!       [--serial FILE] [--strict-unassigned]
 //!
-//! L3: the VM has COM1, a 16550A at ports 3F8H-3FFH ([`crate::uart`]), whose output goes to `--serial FILE` as it is
+//! L4a: and the I/O APIC and 8259 pair ([`crate::irq`]). L3: the VM has COM1, a 16550A at ports 3F8H-3FFH ([`crate::uart`]), whose output goes to `--serial FILE` as it is
 //! sent; every other port and every device-range page is unassigned (all-ones reads, ignored writes, counted; with
 //! `--strict-unassigned` a typed stop). The result gains `ports` and `unassigned_pages` (counts) and `serial_bytes`.
 //!
@@ -110,9 +110,12 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
     let mut devices = crate::devices::Devices::new(layout.low_end);
     devices.register_ports(boot::acpi::platform::COM1_PORT.into(), 8, uart.clone())?;
+    // L4a: the I/O APIC, the 8259 pair and their wires.
+    let irqs = crate::irq::install(&mut devices, &backing.memory, 1, &uart)?;
     devices.strict = strict;
     let devices = std::sync::Arc::new(devices);
     let machine = Machine::create(&backing.memory)?;
+    irqs.attach(machine.doorbell());
     let stops = execution::Stops::new(&backing, false);
     let watchdog = std::time::Duration::from_millis(watchdog_ms);
     let prepare = |v: usize| -> Result<Vcpu> {

@@ -27,11 +27,11 @@ plan, L3; programs in tools/bench/smp/ports.py).
   page (refused before the port is read), INS #AC and #PF at CPL 3 (the port not read), CPL 3 with the driver's TSS (no
   bitmap: #GP(0)), and CS/DS-prefixed near branches (admission).
 - `pages` (natemu only, the owner's rule of October 29 and its amendment; a CPL 0 program on its own tables): unassigned
-  pages (the legacy hole, 0xC0000000 above 2 GiB of RAM, 0x80_0000_0000 above 4 GiB, the IOAPIC page) read through the
+  pages (the legacy hole, 0xC0000000 above 2 GiB of RAM, 0x80_0000_0000 above 4 GiB, 0xFED00000) read through the
   shared all-ones shadow by CMP, LODS, REPE CMPSB, MOVUPS and a load-op ADD (one fill each, counted), MOV writes ignored and
   counted, RMW/XCHG/STOS refused, strict read and write stops; a read crossing from RAM's last page; two vCPUs each filling;
   the xAPIC page disabled and in x2APIC mode (all-ones from the LAPIC, never shadowed, not counted) and a device at
-  0xFEC00000 (never shadowed); the shadow drops: a write after a fill, a remap after INVLPG and after a CR3 reload (hole to
+  0xFEC00000, the I/O APIC's (L4a; never shadowed); the shadow drops: a write after a fill, a remap after INVLPG and after a CR3 reload (hole to
   RAM, RAM to hole), an APIC base moved onto a filled page, and two vCPUs with different APIC bases.
 
 Writes DIR/l3.json; exit status 1 on any failure."""
@@ -314,7 +314,7 @@ def cmd_cases(a, report):
 # 0xff bytes), and at WINDOW + 0x1000 k the guest-physical pages of PAGES[k].
 TABLES, BUF, WINDOW, RAM_END = 0x300000, 0x400000, 0x500000, 2 << 30
 PAGES = {'last-ram': RAM_END - 0x1000, 'above-ram': 0xC000_0000, 'above-4g': 0x80_0000_0000, 'hole': 0xE_0000,
-         'ioapic': 0xFEC0_0000, 'xapic': 0xFEE0_0000}
+         'hpet': 0xFED0_0000, 'ioapic': 0xFEC0_0000, 'xapic': 0xFEE0_0000}
 VA = {k: WINDOW + 0x1000 * i for i, k in enumerate(PAGES)}
 
 
@@ -364,7 +364,7 @@ def page_cases():
              'lea rsi, [rbx + 0x20]\nmov rdi, {buf}\nmov ecx, 16\nrepe cmpsb\nsete r10b\nmov r11, rcx\n'
              'movups xmm0, xmmword ptr [rbx + 0x40]\nmovq rdx, xmm0\nmov eax, 1\nadd eax, dword ptr [rbx + 0xff0]')
     writes = 'mov rbx, {va}\nmov dword ptr [rbx + 8], eax\nmov byte ptr [rbx], 1\nmov qword ptr [rbx + 0x100], rbx\nmov rcx, qword ptr [rbx]'
-    for k in ('hole', 'above-ram', 'above-4g', 'ioapic'):
+    for k in ('hole', 'above-ram', 'above-4g', 'hpet'):
         gpa, va = PAGES[k], VA[k]
         case(f'{k}-reads', reads.format(va=va, buf=BUF), counted(gpa, 1, 0, halted(r8=1, r9=2**64 - 1, r10=1, r11=0, rdx=2**64 - 1, rax=0)))
         case(f'{k}-writes', writes.format(va=va), counted(gpa, 1, 3, halted(rcx=2**64 - 1)))
@@ -387,9 +387,10 @@ def page_cases():
          lambda o: halted(r8=0xffff_ffff, r9=2**64 - 1, r10=0x50014)(o) + ([f"counted {o['unassigned_pages']}"] if o.get('unassigned_pages') else []))
     case('xapic-disabled-cmp', off + f'cmp dword ptr [{xa + 0x30:#x}], 0', stopped('form'))
     case('xapic-x2', 'mov ecx, 0x1b\nrdmsr\nor eax, 0xc00\nwrmsr\n' + f'mov r8d, dword ptr [{xa + 0x30:#x}]', halted(r8=0xffff_ffff))
-    # A device registered at the IOAPIC's page (before the run: the registry is fixed then) is never all-ones-shadowed.
+    # L4a: the I/O APIC's page is a device's (registered before the run: the registry is fixed then), never all-ones-shadowed:
+    # a MOV reads its register (offset 8 folds to nothing: 0), a CMP is refused as a device page's.
     io = VA['ioapic']
-    case('ioapic-device', f'mov r8d, dword ptr [{io + 8:#x}]\ncmp dword ptr [{io + 8:#x}], 0', stopped('form'), ['--device-at', '0xfec00000'])
+    case('ioapic-device', f'mov r8d, dword ptr [{io + 8:#x}]\ncmp dword ptr [{io + 8:#x}], 0', stopped('form'))
     # Shadow drops (the second review's cases): an all-ones shadow is a TLB entry like any other, and a page that becomes the
     # vCPU's APIC page must lose it.
     pt = lambda k: TABLES + 0x3000 + 8 * ((VA[k] - 0x400000) >> 12)  # noqa: E731

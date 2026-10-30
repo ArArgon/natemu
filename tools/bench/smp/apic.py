@@ -162,7 +162,7 @@ ap_log0:
     call {'ap_log0' if error else 'ap_log'}
     inc qword [{COUNTS(i) + 8 * v:#x}]
 {bodies.get(v, '')}
-""" + (f'    add qword [rsp+56], 2\n' if error else '') + ('' if v in (NMI, GP) or v < 32 else eoi(m) + '\n') + f"""    pop r15
+""" + (f'    add qword [rsp+56], 2\n' if error else '') + ('' if v in (NMI, GP) or v < 32 else eoi(m) + '\n') + (bodies[v + 0x100] + '\n' if v + 0x100 in bodies else '') + f"""    pop r15
     pop r14
     pop rbx
     pop rdx
@@ -173,7 +173,8 @@ ap_log0:
 
 
 def build(name, m, texts, vectors, bodies=None, memory=(), capture_ring=False):
-    """A natemu-smp-v1 program: CPU i runs head + texts[i] + the handlers; `bodies` {vector: text} per CPU or shared."""
+    """A natemu-smp-v1 program: CPU i runs head + texts[i] + the handlers; `bodies` {vector: text} per CPU or shared
+    (key -v: before the log entry; v: before the EOI; v + 0x100: after it)."""
     n = len(texts)
     bodies = bodies or {}
     progs, labels = {'name': f'{name}@{n}', 'ncpu': n, 'system': True, 'format': 'natemu-smp-v1', 'params': {},

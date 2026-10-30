@@ -72,7 +72,8 @@ pub mod icr {
 }
 
 /// One vCPU's local APIC state, private to its resident (a record in its state page, [`crate::execution::LAPIC_OFFSET`]).
-/// The IRR is the vCPU's shared [`crate::execution::cache::Events::vectors`] (senders set bits there), the TPR is the
+/// The IRR and TMR are the vCPU's shared [`crate::execution::cache::Events`] `vectors` and `tmr` (senders set bits there,
+/// L4a: the TMR with the IRR bit, as the I/O APIC's level-triggered messages need), the TPR is the
 /// bank's `Cpu::cr8` (bits 7:0; CR8 is TPR[7:4]), and what senders need to match a destination is published in
 /// [`crate::execution::cache::Events::apic`] ([`published`]).
 #[repr(C)]
@@ -83,9 +84,6 @@ pub struct Lapic {
     pub ldr: u64,
     pub dfr: u64,
     pub isr: [u64; 4],
-    /// Trigger mode of each vector in service (11.8.4): set on acceptance of a level-triggered interrupt. No source of
-    /// this chunk is level-triggered (IPIs and the LVT timer and error are edge), so it reads 0 until the I/O APIC (L4a).
-    pub tmr: [u64; 4],
     pub lvt: [u64; 6],
     /// ICR low (bits 31:0) and high (bits 63:32: the xAPIC destination in 63:56, the x2APIC one in 63:32).
     pub icr: u64,
@@ -112,7 +110,6 @@ pub const RESET: Lapic = Lapic {
     ldr: 0,
     dfr: DFR_RESET,
     isr: [0; 4],
-    tmr: [0; 4],
     lvt: [MASKED; 6],
     icr: 0,
     esr: 0,
@@ -185,6 +182,15 @@ pub fn x2apic_ldr(id: u64) -> u64 {
 pub const HW_ENABLED: u64 = 1 << 40;
 pub const X2APIC: u64 = 1 << 41;
 pub const SW_ENABLED: u64 = 1 << 42;
+/// L4a: the APIC passes an ExtINT at LINT0 to the core (LVT LINT0 unmasked with delivery mode ExtINT, or the APIC
+/// hardware disabled: the 8259 wired through), so the chipset rings it when the 8259's output rises.
+pub const EXTINT: u64 = 1 << 43;
+/// L4a: LVT LINT1 is unmasked with delivery mode NMI (the MADT's LINT1 wiring): the board's NMI input reaches the core.
+pub const LINT1_NMI: u64 = 1 << 44;
+/// L4a: LVT LINT0 is unmasked, delivery mode fixed, edge-triggered: a rising LINT0 input is accepted as the edge
+/// interrupt whose vector is in bits 55:48 (11.5.1: "fixed" delivers the LVT vector; QEMU instead passes the 8259 through
+/// in any unmasked mode). A level-triggered fixed LINT0 (its LVT remote IRR) is not built.
+pub const LINT0_FIXED: u64 = 1 << 45;
 pub fn published(apic_base: u64, l: &Lapic, id: u64) -> u64 {
     let (en, extd) = (apic_base >> 11 & 1 != 0, apic_base >> 10 & 1 != 0);
     let ldr = if extd { x2apic_ldr(id) } else { l.ldr & 0xff00_0000 };
@@ -192,6 +198,9 @@ pub fn published(apic_base: u64, l: &Lapic, id: u64) -> u64 {
         | if en { HW_ENABLED } else { 0 }
         | if en && extd { X2APIC } else { 0 }
         | if en && l.svr & SVR_ENABLE != 0 { SW_ENABLED } else { 0 }
+        | if !en || l.lvt[LINT0] & (MASKED | 0x700) == 0x700 { EXTINT } else { 0 }
+        | if en && l.lvt[LINT1] & (MASKED | 0x700) == 0x400 { LINT1_NMI } else { 0 }
+        | if en && l.lvt[LINT0] & (MASKED | 0x700 | 0x8000) == 0 { LINT0_FIXED | (l.lvt[LINT0] & 0xff) << 48 } else { 0 }
 }
 /// The target `id` with published word `word` is in the destination `dest` (11.6.2): physical (the ID; all-ones
 /// broadcast, 11.6.2.1) or logical (11.6.2.2: xAPIC flat: LDR[31:24] AND dest, so all ones reaches every APIC with a
@@ -289,5 +298,13 @@ mod tests {
         assert!(!in_destination(x2, 0x13, 0x0_0008, true, true) && in_destination(x2, 0x13, 0xffff_ffff, true, true));
         assert!(in_destination(x2, 0x13, 0x13, false, true) && !in_destination(x2, 0x13, 0xff, false, true));
         assert_eq!(published(0xfee0_0000, &l(0, DFR_RESET), 0) & (HW_ENABLED | SW_ENABLED), 0);
+        // L4a's LINT inputs: a hardware-disabled APIC passes the 8259 through (EXTINT whatever its LVT); LINT0 ExtINT,
+        // fixed edge (with its vector), LINT1 NMI; masked or level-triggered fixed: none.
+        let lint = |base, lint0, lint1| published(base, &Lapic { lvt: [MASKED, MASKED, MASKED, lint0, lint1, MASKED], ..l(0, DFR_RESET) }, 0) >> 43;
+        assert_eq!(lint(0xfee0_0000, MASKED, MASKED), 1);
+        assert_eq!(lint(0xfee0_0800, MASKED | 0x700, MASKED | 0x400), 0);
+        assert_eq!(lint(0xfee0_0800, 0x700, 0x400), 0b011);
+        assert_eq!(lint(0xfee0_0800, 0x31, MASKED), 0x31 << 5 | 0b100);
+        assert_eq!(lint(0xfee0_0800, 0x8031, 0x431), 0b010);
     }
 }

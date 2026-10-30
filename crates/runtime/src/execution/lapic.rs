@@ -29,14 +29,21 @@
 //! takes every expiry due (an unmasked LVT sets the vector's IRR bit; periodic expiries that pass while one is pending
 //! merge, as in the IRR) and arms the next. The current count is computed from V when read.
 //!
-//! **Not built:** LINT0/LINT1 sources (the PIC/IOAPIC, L4a: their LVT entries are stored and read back; an ExtINT or a
-//! level-triggered fixed interrupt needs L4a's vector and EOI broadcast), thermal and performance-counter sources (none
-//! in the profile), INIT/start-up (X4), TSC-deadline (not advertised).
+//! **L4a:** the TMR is the shared `Events::tmr` (the sender sets or clears the bit with the IRR bit); an EOI of a vector
+//! whose TMR bit is set is broadcast to the host's I/O APIC (`REQUEST_IRQ`, one host exit only then). LINT0 is the 8259's
+//! output (`Events::lint0`): with LVT LINT0 ExtINT and unmasked (or the APIC hardware disabled) it is taken before the
+//! IRR when RFLAGS.IF allows, its vector from the PIC's INTA cycle (`REQUEST_IRQ`), never entering the IRR or ISR.
+//!
+//! LINT1 in NMI mode is published (`lapic::LINT1_NMI`): the host's NMI input posts the NMI to the APICs taking it.
+//!
+//! **Not built:** LINT0/LINT1 in fixed mode (no board source drives them so), thermal
+//! and performance-counter sources (none in the profile), INIT/start-up (X4), TSC-deadline (not advertised).
 use super::*;
 use super::segments::Exception;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use natemu_abi::clock;
 use natemu_abi::execution::cache::{EVENTS, Events, GLOBAL_VA};
+use natemu_abi::execution::{MMIO_VA, Mmio, REPLY_IRQ, REQUEST_IRQ};
 use natemu_abi::lapic::{self as apic, Lapic, icr};
 
 const EN: u64 = 1 << 11;
@@ -61,6 +68,17 @@ pub(super) fn event_word(v: u64, field: usize) -> &'static AtomicU64 {
 }
 fn irr_word(v: u64, w: usize) -> &'static AtomicU64 {
     event_word(v, core::mem::offset_of!(Events, vectors) + 8 * w)
+}
+fn tmr_word(v: u64, w: usize) -> &'static AtomicU64 {
+    event_word(v, core::mem::offset_of!(Events, tmr) + 8 * w)
+}
+/// Accepts edge-triggered `vector` into vCPU `v`'s IRR (11.8.4): its TMR bit cleared, then the IRR bit set (the host's
+/// `post` order). Every resident source is edge-triggered (LVT timer and error, IPIs: the trigger of a fixed IPI is
+/// ignored, 11.6.1), so a vector last accepted level-triggered must not keep TMR = 1 (its EOI would broadcast).
+fn accept_edge(v: u64, vector: u64) {
+    let (w, bit) = (vector as usize / 64, 1 << (vector % 64));
+    tmr_word(v, w).fetch_and(!bit, SeqCst);
+    irr_word(v, w).fetch_or(bit, SeqCst);
 }
 fn word_of(v: u64) -> u64 {
     event_word(v, core::mem::offset_of!(Events, apic)).load(SeqCst)
@@ -120,13 +138,50 @@ pub(super) fn accept(s: &State, v: u64) {
     irr_word(s.vcpu, v as usize / 64).fetch_and(!(1 << (v % 64)), SeqCst);
     lapic().isr[v as usize / 64] |= 1 << (v % 64);
 }
-fn eoi() {
+/// EOI: the highest in-service vector ends; a level-triggered one (its TMR bit set, L4a) is broadcast to the I/O APIC
+/// (one host exit: QEMU's `apic_eoi`; no directed EOI, SVR bit 12 is reserved).
+fn eoi(s: &mut State) {
     let l = lapic();
     if let Some(v) = apic::highest(&l.isr) {
         l.isr[v as usize / 64] &= !(1 << (v % 64));
-        // A level-triggered vector would broadcast its EOI to the I/O APICs here (L4a): none is accepted yet (TMR = 0).
-        l.tmr[v as usize / 64] &= !(1 << (v % 64));
+        if tmr_word(s.vcpu, v as usize / 64).load(SeqCst) >> (v % 64) & 1 != 0 {
+            controller(s, true, v);
+        }
     }
+}
+/// L4a: a request to the host's interrupt controllers ([`REQUEST_IRQ`]): the EOI broadcast of `value` (`eoi`), or the
+/// INTA cycle of an ExtINT, whose vector is returned. The state goes to the record and back in place (as `refill`). The
+/// exchange record is put back afterwards: an xAPIC EOI is itself a device access in progress (`mmio::device`), and the
+/// record keeps describing the last device access for the run report.
+#[inline(never)]
+fn controller(s: &mut State, eoi: bool, value: u64) -> u64 {
+    let exchange = MMIO_VA as *mut Mmio;
+    let bytes = size_of::<State>();
+    unsafe {
+        let saved = read_record(exchange);
+        write_record(exchange, Mmio { write: u64::from(eoi), value, completed: saved.completed, ..Mmio::default() });
+        (s.request, s.reply) = (REQUEST_IRQ, NONE);
+        copy_record(record().cast(), (&raw const *s).cast(), bytes);
+        asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
+        copy_record((&raw mut *s).cast(), record().cast(), bytes);
+        s.request = NONE;
+        let m = read_record(exchange);
+        if s.reply != REPLY_IRQ || m.status != natemu_abi::execution::mmio::DONE {
+            halt(s, stop::BAD_REPLY)
+        }
+        write_record(exchange, saved);
+        m.value & 0xff
+    }
+}
+/// L4a: an ExtINT is pending at LINT0 (the 8259's output asserted) and this APIC passes it to the core: hardware
+/// disabled (the PIC wired through, QEMU's `apic_accept_pic_intr`), or LVT LINT0 unmasked with delivery mode ExtINT.
+/// It ignores the priority rules (QEMU's `apic_get_interrupt` takes it before the IRR) and needs RFLAGS.IF.
+pub(super) fn extint(s: &State) -> bool {
+    event_word(s.vcpu, core::mem::offset_of!(Events, lint0)).load(SeqCst) != 0 && word_of(s.vcpu) & apic::EXTINT != 0
+}
+/// L4a: takes the ExtINT: the PIC's vector (its INTA cycle, which may give the spurious IRQ 7 when a peer took it first).
+pub(super) fn take_extint(s: &mut State) -> u64 {
+    controller(s, false, 0)
 }
 /// A local interrupt (LVT, self IPI) with `vector`: into this vCPU's IRR, or a receive-illegal-vector error (11.5.3);
 /// a software-disabled APIC accepts none (as from a peer, [`send`]).
@@ -134,7 +189,7 @@ fn raise(s: &mut State, vector: u64) {
     if vector < 16 {
         error(s, apic::RECEIVE_ILLEGAL)
     } else if lapic().svr & apic::SVR_ENABLE != 0 {
-        irr_word(s.vcpu, vector as usize / 64).fetch_or(1 << (vector % 64), SeqCst);
+        accept_edge(s.vcpu, vector);
     }
 }
 /// An APIC error: recorded for the next ESR write, and the LVT error interrupt raised unless masked.
@@ -147,7 +202,7 @@ fn error(s: &mut State, bits: u64) {
         if v < 16 {
             l.errors |= apic::RECEIVE_ILLEGAL;
         } else {
-            irr_word(s.vcpu, v as usize / 64).fetch_or(1 << (v % 64), SeqCst);
+            accept_edge(s.vcpu, v);
         }
     }
 }
@@ -258,7 +313,7 @@ fn read(s: &State, reg: u64, x2apic: bool) -> Option<u64> {
         0xe if !x2apic => l.dfr,
         0xf => l.svr,
         0x10..=0x17 => bits32(&l.isr, reg - 0x10),
-        0x18..=0x1f => bits32(&l.tmr, reg - 0x18),
+        0x18..=0x1f => tmr_word(s.vcpu, (reg - 0x18) as usize / 2).load(SeqCst) >> (32 * (reg % 2)) & 0xffff_ffff,
         0x20..=0x27 => {
             let w = (reg - 0x20) as usize / 2;
             irr_word(s.vcpu, w).load(SeqCst) >> (32 * (reg % 2)) & 0xffff_ffff
@@ -282,7 +337,7 @@ fn write_xapic(s: &mut State, reg: u64, v: u64) {
         // ID (read-only here: model specific, 11.4.6), version, APR, PPR, RRD, ISR, TMR, IRR, current count.
         0x2 | 0x3 | 0x9 | 0xa | 0xc | 0x10..=0x27 | 0x39 => {}
         0x8 => s.cpu.cr8 = v & 0xff,
-        0xb => eoi(),
+        0xb => eoi(s),
         0xd => {
             l.ldr = v & 0xff00_0000;
             publish(s);
@@ -337,6 +392,9 @@ fn write_common(s: &mut State, reg: u64, v: u64) -> bool {
             if i == apic::TIMER {
                 timer(s);
             }
+            if i == apic::LINT0 || i == apic::LINT1 {
+                publish(s); // L4a: whether it takes an ExtINT, an NMI at LINT1
+            }
         }
         0x38 => {
             (l.initial, l.start, l.fired, l.spent) = (v & 0xffff_ffff, clock::crystal(now(), l.frequency), 0, 0);
@@ -388,7 +446,7 @@ pub(super) fn wrmsr(s: &mut State, index: u32, v: u64) -> Result<(), Exception> 
     }
     match reg {
         0x8 => s.cpu.cr8 = v,
-        0xb => eoi(),
+        0xb => eoi(s),
         0x30 => {
             lapic().icr = v;
             send(s, v, true);
@@ -424,12 +482,19 @@ pub(super) fn set_base(s: &mut State, new: u64) -> Result<(), Exception> {
         publish(s);
         let frequency = lapic().frequency;
         *lapic() = Lapic { frequency, ..apic::RESET };
-        (0..4).for_each(|w| irr_word(s.vcpu, w).store(0, SeqCst));
+        (0..4).for_each(|w| {
+            irr_word(s.vcpu, w).store(0, SeqCst);
+            tmr_word(s.vcpu, w).store(0, SeqCst);
+        });
         s.cpu.cr8 = 0;
         cntv(None);
     }
     if from == 0 && to != 0 {
-        (0..4).for_each(|w| irr_word(s.vcpu, w).store(0, SeqCst)); // a post that raced the disable (above)
+        // A post that raced the disable (above).
+        (0..4).for_each(|w| {
+            irr_word(s.vcpu, w).store(0, SeqCst);
+            tmr_word(s.vcpu, w).store(0, SeqCst);
+        });
     }
     publish(s);
     Ok(())
@@ -461,7 +526,7 @@ fn send(s: &mut State, icr: u64, x2apic: bool) {
             let accepting = (0..s.vcpus).filter(|&t| targets >> t & 1 != 0 && word_of(t) & apic::SW_ENABLED != 0);
             // Lowest priority: the lowest-numbered member of the set (the arbitration is model specific, 11.6.2.4).
             for t in accepting.take(if mode == icr::LOWEST { 1 } else { 64 }) {
-                irr_word(t, vector as usize / 64).fetch_or(1 << (vector % 64), SeqCst);
+                accept_edge(t, vector);
                 ring(t);
             }
         }

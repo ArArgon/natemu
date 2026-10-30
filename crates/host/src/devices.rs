@@ -63,10 +63,12 @@ pub(crate) struct Devices {
     /// L3: [reads, writes] per port (every access, by its first port), and per unassigned page.
     port_counts: Mutex<BTreeMap<u16, [u64; 2]>>,
     page_counts: Mutex<BTreeMap<u64, [u64; 2]>>,
+    /// L4a: the interrupt controllers (`irq::install`), for the resident's EOI broadcasts and INTA cycles.
+    pub(crate) irqs: Option<crate::irq::Irqs>,
 }
 impl Devices {
     pub(crate) fn new(ram_end: u64) -> Self {
-        Self { ranges: Vec::new(), ram_end, ports: Vec::new(), strict: false, port_counts: Mutex::default(), page_counts: Mutex::default() }
+        Self { ranges: Vec::new(), ram_end, ports: Vec::new(), strict: false, port_counts: Mutex::default(), page_counts: Mutex::default(), irqs: None }
     }
     /// L3: registers `device` on ports `[base, base + count)`, inside the 16-bit space and not overlapping another range.
     pub(crate) fn register_ports(&mut self, base: u32, count: u32, device: Shared) -> crate::Result<()> {

@@ -1313,7 +1313,7 @@ reserved bit set in a WRMSR #GP; QEMU accepts it); the timer's count starts at t
 initial-count write (`clock::crystal` floors V), so its first tick may come up to one crystal period (41.7 ns) early
 relative to the write itself (none when CNTFRQ is the crystal rate, as on the M4); APR and RRD are not implemented (Table 11-1 note 1; xAPIC reads 0, x2APIC #GP); lowest priority goes to the
 lowest-numbered member of the set (11.6.2.4: model-specific arbitration); the timer's period is exactly the initial count
-in divided ticks; no spurious interrupt; TMR reads 0 (no level-triggered source yet). **Checks** (`tools/run_x3.py`,
+in divided ticks; no spurious interrupt; TMR reads 0 (no level-triggered source yet; L4a: the shared `Events::tmr`). **Checks** (`tools/run_x3.py`,
 block sizes default and 1 unless stated): `qemu` 9 programs x 2 (register read-backs in xAPIC and x2APIC; priority, TPR
 and EOI order with nested self IPIs in both modes; CR8; the x2APIC fault program, 40 cases; x2APIC IPIs at 2, 3, 4
 vCPUs: fixed physical, all-but-self, NMI, logical cluster, peers to CPU 0): natemu equals QEMU (registers, logs without
@@ -1685,6 +1685,95 @@ around it). Cause: with one byte (`0f`) before the page end FEX's decoder report
 component (I8); FOP/FIP/FDP (I6 deviation 8); XINUSE tracking (all ones).
 
 **Owner decisions (October 29, L2):** (1) the ACPI tables come from natemu's own Rust builder (`crates/host/src/boot/acpi.rs`) using QEMU's conventional values, instead of reusing QEMU's C builder and linker (the Q6 deviation is accepted); it is judged by an independently written checker (`tools/models/acpi_model.py`, `tools/run_l2.py`) and by Linux 6.12's own parse of the same tables under QEMU. (2) Intel's ACPICA tools (`iasl`, Homebrew `acpica` 20260408) are installed for the standard `iasl -d` disassembly check.
+
+*Built (L4a, the I/O APIC, the 8259 pair and interrupt routing; no fexc change, series27):*
+**Models** (host, QEMU 11.1.2 transcribed, tag v11.1.2, line numbers cited in each module): `crates/host/src/ioapic.rs`
+(`hw/intc/ioapic.c`: version 20H with the EOI register at 40H, 24 entries, ID 4 bits, ARB = ID, IOREGSEL any width,
+IOWIN/EOI 32-bit only, the page folded every 100H; Remote IRR and delivery status read-only; edge: a rise while unmasked
+delivered once, a rise while masked lost; level: the input kept while masked, delivered while asserted, unmasked and Remote
+IRR clear, Remote IRR set only when a LAPIC accepted the message (82093AA; QEMU sets it on sending) and cleared by the
+EOI broadcast or the EOI register, re-evaluated at every redirection write) and
+`crates/host/src/pic.rs` (`hw/intc/i8259.c`, `i8259_common.c`: ICW1-4, OCW1-3, IRR/ISR/IMR, specific and non-specific EOI,
+rotations, auto-EOI, poll, special mask, special fully nested, the cascade on IR2, the INTA cycle with the spurious IRQ 7
+of either chip, ELCR at 4D0H/4D1H with masks F8H/DEH, byte registers). **Board** (`crates/host/src/irq.rs`, QEMU's
+`gsi_handler` and `pic_irq_request`): ISA IRQ n -> PIC input n and I/O APIC pin n (IRQ0 -> pin 2), GSI 16-23 -> the I/O
+APIC only; the master's INT output -> every LAPIC's LINT0; the UART's IRQ4 hook (`irq::install`, both drivers); the
+I/O APIC page is a registry device, so it is no longer all-ones-shadowed (`run_l3.py` moved its unassigned-page cases to
+0xFED00000). One mutex orders the chipset. **Inputs are levels and an edge is a 0 -> 1 change** (an edge detector's
+view; the board passes changes only), a departure from QEMU's edge-mode I/O APIC, which delivers on every raise call,
+1 -> 1 included: the compared programs make no redundant raise. **Delivery to the LAPICs:** a message's 8-bit destination
+(bits 63:56) is matched per target from its published word (`natemu_abi::lapic::in_destination`; an x2APIC-mode target
+matches a physical destination by its ID, 0xFF not being a broadcast for it, and a logical one as an x2APIC cluster/bit
+destination, as QEMU's `apic_get_delivery_bitmask`); fixed and ExtINT (vector from the PIC's INTA, delivered as fixed, as
+QEMU) post to every target, lowest priority to the lowest-numbered accepting one (X3's arbitration), NMI posts the NMI;
+SMI (no SMM) and INIT (X4) reach no core; vectors 0..15 are dropped (ponytail: the receive-illegal error would need a
+resident-side flag). Every delivery goes through `execution::post` (acceptance, the post count; it now returns whether the
+target accepted) then the target's doorbell. A software-disabled APIC accepts no fixed message (X3's reading of SDM
+11.4.7.2, "held" = kept pending, nothing new accepted; QEMU accepts them into its IRR), so a level message nobody accepted
+leaves Remote IRR clear and the input pending.
+**LAPIC side** (X3's open items): the TMR is the shared `Events::tmr`, written by the sender with the IRR bit (`post`'s new
+`level` argument: set for level, cleared for edge, as `apic_set_irq`), and every resident edge source (LVT timer and
+error, self and peer IPIs) accepts through one helper, `lapic::accept_edge`, which clears the TMR bit before the IRR bit
+(review finding: without it a vector once accepted level kept TMR = 1 and its edge EOI broadcast, which could clear Remote
+IRR on a pin still in service; `l4a-tmr` checks it); re-enabling the APIC clears the TMR with the IRR; the EOI of a vector whose TMR bit is set makes one
+host exit, `REQUEST_IRQ` (0x34) with `Mmio::write` 1, the broadcast to the I/O APIC (`lapic::eoi`; an edge EOI stays
+exit-free); LINT0 is `Events::lint0`, the PIC's output kept current by the chipset: with LVT LINT0 unmasked ExtINT (or the
+APIC hardware disabled, the PIC wired through) an ExtINT is taken before the IRR when RFLAGS.IF and no shadow allow it
+(QEMU's `apic_get_interrupt`), its vector from the PIC by `REQUEST_IRQ` with `write` 0 (the INTA cycle), never entering IRR
+or ISR (`events::Next::ExtInt`); the published word gains `EXTINT` and `LINT1_NMI` (LVT LINT0/LINT1 writes republish), so
+a PIC output rise posts to and rings only the APICs taking ExtINTs; `LINT0_FIXED` (bits 55:48 the vector): LVT LINT0
+unmasked, fixed, edge-triggered takes each rise of the PIC's output as that vector's edge interrupt, with no INTA (SDM
+11.5.1; QEMU passes the 8259 through in any unmasked mode, so Linux's `check_timer` virtual-wire fallback, which
+programs LINT0 fixed, would behave differently there; a level-triggered fixed LINT0 is not built); and the board's NMI input (`Irqs::nmi`, LINT1 per the
+MADT; no source drives it on this board yet) posts NMIs to the APICs with LINT1 unmasked in NMI mode. **Asynchronous
+sources (the API for L4b):** `irq::Irqs` (clone, any thread): `line(irq, level)` (ISA IRQ 0..15 or GSI 16..23, 1 =
+asserted), `busy()` a guard held while the source may still fire, `live()` read by the program driver's halted-vCPU
+watcher next to `kickers_left` (X3's rule) after its two park-state reads (review finding: read before them, a guard taken
+in between by a vCPU that then halted went unseen; with a 30 ms delay forced there `halt` was red 5/5, in this order
+green 5/5), `nmi()`; `devices.irqs` reaches it from a device. **Test source** (`run-program
+--irq-source PORT`, `irq::TestSource`): a host thread pulses or asserts a line (or the NMI input) after a guest-chosen
+delay, deasserts on request, counts what fired; `--irq-source-no-veto` is the halted rule's negative control. **QEMU
+departures (not compared):** the edge rule above; QEMU's storm delay after 10,000 successive EOIs (here immediate);
+QEMU's INTA for a masked or coalesced ExtINT entry (here only on delivery); polarity stored, not applied (inputs are
+logical, as QEMU); 8-byte I/O APIC accesses refused; LINT0 fixed mode (above); the BSP's LVT LINT0 resets masked (SDM
+11.4.7.1; QEMU 700H, ExtINT, `apic_reset_common`: the programs set LINT0 explicitly); lowest priority skips
+software-disabled APICs (QEMU does not); a software-disabled APIC refuses fixed I/O APIC messages (above); a fixed ICR IPI
+with the level trigger bit is edge (SDM 11.6.1: the trigger mode is used only for INIT de-assert; QEMU sets the TMR for
+it). Matching QEMU and the datasheet: after ICW1 the 8259's edge detector is reset (`last_irr` 0), so a line held high
+requests again only after it falls and rises. `controller()` puts the exchange record back after its request, so an
+xAPIC EOI's broadcast does not overwrite the record of the device access in progress (the run report's `mmio`). **Checks** (`tools/run_l4a.py`, programs `tools/bench/smp/irqs.py`):
+`qemu` 13 programs, each at block sizes default and 1, natemu equal to pinned QEMU (registers, captured memory, logs
+without their TSC at one CPU, counts at several, UART bytes) and both equal to the datasheet/SDM model: I/O APIC register
+read-backs (ID, VER 0x170020, ARB, all 24 entries, every field with the read-only bits attempted, IOREGSEL widths, the
+100H fold, byte IOWIN, the EOI register) in xAPIC and x2APIC mode; IRQ4 edge through pin 4 (4 deliveries: IER 0 -> 2, a
+THR write, a rise while masked lost, TMR clear); level (4 deliveries: Remote IRR and TMR set in each handler, the EOI with
+the line high redelivering, IER 0 and an IIR read ending it, masked -> unmasked delivering at the unmask, the EOI register);
+the 8259 pair (Linux's probe_8259A reads FBH, init_8259A, OCW3 IRR/ISR, ELCR F8H/DEH, an IRR latched while masked and
+cleared by ICW1, ExtINT 34H through LINT0 with no LAPIC ISR bit, poll 84H, ELCR level mode re-requesting after a PIC EOI,
+auto-EOI, rotation and special mask) in both modes; the TMR across triggers (54H level from pin 4, then a self IPI: TMR 1
+then 0) in both modes; destinations at 2, 3, 4 CPUs in x2APIC mode (each physical ID,
+two logical sets, lowest priority to CPU 1, NMI, level to a peer whose handler lowers the line before its EOI broadcast).
+QEMU's runs stop its PIT first (control word 30H). `xapic` 4 (the destination program at 2-4 CPUs, flat logical IDs,
+Linux's path, counts by the model; `l4a-lint0`: LINT0 fixed 45H, one delivery per rise of the PIC's output and no INTA,
+then the APIC hardware disabled: ExtINT 34H passed through). `stress` 2 (4 and 2 CPUs, each CPU's GSI routed to its neighbour, 300 edge then 300
+level rounds per source at a pseudo-random 0..255 us from the host thread): every target 600 deliveries and 600
+completions per source, none lost or doubled. `halt` 2: a vCPU halted until a 50 ms request fires reaches its end; with
+`--irq-source-no-veto` it is ended `halted` (the veto is what keeps it). `lint1` 1: 2 NMIs of 3 pulses (one while LINT1
+masked). Negative control: with the resident's EOI broadcast removed (scratch build) the level program gets 1 delivery,
+Remote IRR stuck (0xc054 after every step). Standing suite on this tree: `run_x3.py` (qemu 9, ipi 4, timers 24, stress 6,
+halt 10, cases 54), `run_l3.py` (qemu 8, stress 2, cases 24, pages 40), `run_m3.py`, `run_l2.py` (N = 1..4), events 136,
+system 246, `check_resident_stack.py` (gate 18,960 bytes, unchanged), cargo test (45 + 71: `pic`, `ioapic` (Remote IRR
+on acceptance), `irq` (the board's change filter: a raise while high is no edge, IRQ0 -> pin 2) and `lapic` (the LINT
+bits, the disabled APIC's pass-through) unit tests), python unit 281. After the review's fixes, on series28: `run_l4a.py`
+22/22, `run_x3.py`, `run_l3.py`, events 136, system 246, cargo test and the stack audit again green. **Kernel** (Debian 6.12, 2 GiB, `console=ttyS0 earlyprintk=serial mitigations=off nokaslr`): on
+series27 unchanged, 173 lines, `nocode` at the page-straddling `jne` 0xffffffff817f0fff; on series28 (the straddle fix,
+in progress elsewhere; rerun after the review's fixes: the same 290 lines, no "Failed to find ioapic for gsi") without an
+initrd it reaches "ACPI: Using IOAPIC for interrupt routing", "APIC: Switch to symmetric
+I/O mode setup", "ttyS0 at I/O 0x3f8 (irq = 4) is a 16550A" and panics "VFS: Unable to mount root fs" (290 lines); with
+Debian's initrd it frees the initrd (223 lines) and stops `nocode` `unsupported_form` in a CPL 3 process at
+0x7f6546c96470. **Not built:** a PIT/RTC/SCI source (L4b: `Irqs::line` and `busy`), UART input and the CTI timer as
+asynchronous sources, a level-triggered fixed LINT0 and a fixed LINT1, the receive-illegal-vector error for an I/O APIC vector 0..15, ExtINT
+through an I/O APIC entry wired to the PIC (modelled as QEMU, unexercised), SMI and INIT messages.
 
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 

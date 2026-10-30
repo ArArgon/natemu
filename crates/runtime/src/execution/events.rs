@@ -5,8 +5,8 @@
 //! x86 semantics are applied here, at every boundary the resident sees: the top of `find`'s loop (every precise stop,
 //! every resident entry that dispatches, and after every system instruction). An event is taken when it is eligible
 //! (SDM Vol.3 7.9 Table 7-2: NMI before maskable interrupts; `tools/models/delivery_model.py` `recognise`):
-//! - a maskable interrupt (the one the local APIC delivers by its priority rules, [`lapic::deliverable`], X3) needs
-//!   RFLAGS.IF and no shadow;
+//! - a maskable interrupt (the one the local APIC delivers by its priority rules, [`lapic::deliverable`], X3, or before
+//!   it an ExtINT from the 8259 at LINT0, [`lapic::extint`], L4a) needs RFLAGS.IF and no shadow;
 //! - an NMI needs NMI blocking clear (set when one is delivered, released by IRET) and no shadow. The model permits an
 //!   STI shadow to block NMIs or not (A9); this one blocks them (one rule for both shadows).
 //! An event blocked only by a shadow (the STI shadow when STI set IF, or the MOV SS shadow) is taken at the boundary
@@ -45,18 +45,25 @@ fn word(s: &State, field: usize) -> &'static AtomicU64 {
 enum Next {
     Nmi,
     Interrupt(u64),
+    /// L4a: an ExtINT at LINT0 (its vector comes from the PIC when taken).
+    ExtInt,
     /// An event a shadow alone blocks.
     Step,
 }
 /// The event this boundary may take (Table 7-2), if any.
 fn next(s: &State) -> Option<Next> {
     let nmi = s.nmi_blocked == 0 && word(s, core::mem::offset_of!(Events, nmi)).load(SeqCst) != 0;
-    let vector = if s.cpu.rflags & IF == 0 { None } else { lapic::deliverable(s) };
-    match (nmi, vector) {
+    // L4a: an ExtINT ignores the APIC's priority and comes before the IRR (QEMU's `apic_get_interrupt`).
+    let interrupt = match s.cpu.rflags & IF {
+        0 => None,
+        _ if lapic::extint(s) => Some(Next::ExtInt),
+        _ => lapic::deliverable(s).map(Next::Interrupt),
+    };
+    match (nmi, interrupt) {
         (false, None) => None,
         _ if s.cpu.mov_ss != 0 || s.sti_shadow != 0 => Some(Next::Step),
         (true, _) => Some(Next::Nmi),
-        (false, Some(v)) => Some(Next::Interrupt(v)),
+        (false, i) => i,
     }
 }
 
@@ -77,6 +84,10 @@ pub(super) fn take(s: &mut State) -> bool {
                 lapic::accept(s, v);
                 s.interrupts += 1;
                 v
+            }
+            Some(Next::ExtInt) => {
+                s.interrupts += 1;
+                lapic::take_extint(s)
             }
         };
         let mid_string = s.mid_string != 0;

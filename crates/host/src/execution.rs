@@ -206,23 +206,42 @@ fn event_word(memory: &Memory, v: usize, field: usize) -> &AtomicU64 {
 /// `post` value of an NMI (else an interrupt vector, 0..=255).
 pub(crate) const NMI: u64 = 256;
 /// Posts `event` (a vector, or [`NMI`]) into vCPU `v`'s event record (X2); the caller then rings its doorbell, which makes
-/// it stop precisely and take the event when it is eligible.
-pub(crate) fn post(memory: &Memory, v: usize, event: u64) {
+/// it stop precisely and take the event when it is eligible. L4a: `level`, a level-triggered interrupt: its TMR bit is
+/// set (else cleared) before the IRR bit, as the LAPIC accepts it (SDM Vol.3 11.8.4), so its EOI is broadcast. Returns
+/// whether the target accepted it.
+pub(crate) fn post(memory: &Memory, v: usize, event: u64, level: bool) -> bool {
     // X3: as from a peer's APIC: an NMI needs the target's APIC hardware enabled, an interrupt also software enabled
     // (SDM Vol.3 11.4.7.2); otherwise the message is not accepted.
     let apic = event_word(memory, v, std::mem::offset_of!(cache::Events, apic)).load(SeqCst);
     let needs = if event == NMI { natemu_abi::lapic::HW_ENABLED } else { natemu_abi::lapic::SW_ENABLED };
     if apic & needs == 0 {
-        return;
+        return false;
     }
     match event {
         NMI => event_word(memory, v, std::mem::offset_of!(cache::Events, nmi)).store(1, SeqCst),
         _ => {
-            let word = event_word(memory, v, std::mem::offset_of!(cache::Events, vectors) + 8 * (event as usize / 64 % 4));
-            word.fetch_or(1 << (event % 64), SeqCst);
+            let w = 8 * (event as usize / 64 % 4);
+            let tmr = event_word(memory, v, std::mem::offset_of!(cache::Events, tmr) + w);
+            if level { tmr.fetch_or(1 << (event % 64), SeqCst) } else { tmr.fetch_and(!(1 << (event % 64)), SeqCst) };
+            event_word(memory, v, std::mem::offset_of!(cache::Events, vectors) + w).fetch_or(1 << (event % 64), SeqCst);
         }
     }
     event_word(memory, v, std::mem::offset_of!(cache::Events, posts)).fetch_add(1, SeqCst);
+    true
+}
+/// L4a: vCPU `v`'s published APIC word (what senders match destinations against, `natemu_abi::lapic::published`).
+pub(crate) fn published(memory: &Memory, v: usize) -> u64 {
+    event_word(memory, v, std::mem::offset_of!(cache::Events, apic)).load(SeqCst)
+}
+/// L4a: vCPU `v`'s LINT0 input level (the 8259's output). A rise at an APIC that passes ExtINTs to its core
+/// (`natemu_abi::lapic::EXTINT`) counts as a post: true, the caller rings it.
+pub(crate) fn set_lint0(memory: &Memory, v: usize, level: bool) -> bool {
+    event_word(memory, v, std::mem::offset_of!(cache::Events, lint0)).store(u64::from(level), SeqCst);
+    let post = level && published(memory, v) & natemu_abi::lapic::EXTINT != 0;
+    if post {
+        event_word(memory, v, std::mem::offset_of!(cache::Events, posts)).fetch_add(1, SeqCst);
+    }
+    post
 }
 /// vCPU `v`'s park state (X3): its `halted` word and its `posts` count, read in that order.
 pub(crate) fn park_state(memory: &Memory, v: usize) -> (u64, u64) {
@@ -941,6 +960,15 @@ fn serve(
                 area.write_record(exec::STATE_OFFSET, state);
                 continue;
             }
+            // L4a: an EOI broadcast or an ExtINT's INTA cycle, at the interrupt controllers (never parked).
+            exec::REQUEST_IRQ => {
+                if cancelled.load(SeqCst) {
+                    return Ok(Stop::Cancelled);
+                }
+                crate::irq::serve(area, &mut state, requests.devices.as_deref());
+                area.write_record(exec::STATE_OFFSET, state);
+                continue;
+            }
             // K2: an RDRAND found the pool empty; it was topped up above.
             exec::REQUEST_ENTROPY => {
                 requests.entropy += 1;
@@ -989,7 +1017,7 @@ fn translation(
         return Ok(Ok(exec::REPLY_SYSTEM));
     }
     if let Some(&event) = requests.posts.get(&rip) {
-        post(area.memory, area.vcpu, event);
+        let _ = post(area.memory, area.vcpu, event, false);
         requests.doorbell.ok_or("an event source without a doorbell")?.ring(area.vcpu)?;
         state.system = exec::System { kind: exec::system::EVENT_HOOK, length: 1, ..exec::System::NONE };
         return Ok(Ok(exec::REPLY_SYSTEM));
