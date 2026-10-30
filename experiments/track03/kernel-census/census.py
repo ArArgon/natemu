@@ -180,7 +180,8 @@ def avx_allowed(f, b):
         elif op in (0x0a, 0x0b, 0x20, 0x21, 0x22, 0x41): r = L0
         elif op in (0x0c, 0x0d, 0x0e, 0x0f, 0x40, 0x42): r = LL
         elif 0x14 <= op <= 0x17: r = L0 | NOV
-        elif 0x60 <= op <= 0x63 or op in (0x44, 0xdf): return False, True
+        elif 0x60 <= op <= 0x63: r = L0 | NOV           # I6b: vpcmpestri/m, vpcmpistri/m (the resident's, svc #STRING)
+        elif op in (0x44, 0xdf): return False, True
     if r == NONE: return False, False
     ok = bool(r & (L1 if L else L0)) and not ((r & W0) and W) and not ((r & W1) and not W) and not ((r & NOV) and vvvv)
     if m == 1 and op == 0x77: return ok, True
@@ -290,8 +291,8 @@ def sse_form(m, pfx, op, modrm):
     elif m == 6 and pfx == 0x66:
         if op in (0x0A, 0x0B, 0x14, 0x15, 0x16, 0x17, 0x20, 0x21, 0x22): form = 's'
         elif 0x08 <= op <= 0x0F or 0x40 <= op <= 0x42: form = 'a'
+        elif 0x60 <= op <= 0x63: form = 'u'   # I6b: pcmpestri/m, pcmpistri/m (the resident's, svc #STRING), no alignment
     if form is None:
-        if m == 6 and pfx == 0x66 and 0x60 <= op <= 0x63: return UNS, 'pcmpestri/m, pcmpistri/m (FEX host helper)'
         if m == 1 and pfx == 0x66 and op == 0xF7: return UNS, 'maskmovdqu'
         if (m == 5 and pfx == 0x66 and op >= 0xDB) or (m == 6 and pfx == 0x66 and op in (0x44, 0xDF)): return UNS, 'AES/PCLMULQDQ'
         if ((m == 1 and pfx in (0, 0x66) and (op in (0x2A, 0x2C, 0x2D) or (pfx == 0 and (0x60 <= op <= 0x7F or op in (0xC4, 0xC5) or op >= 0xD0))))
@@ -305,7 +306,7 @@ def x87_form(op, m):
     """fexc_slice1.inc X87 (I6): (ALLOW|SYS|UNS, why)."""
     mod, reg = m >> 6, (m >> 3) & 7
     ok, res = (ALLOW, ''), (SYS, 'x87 control/state')
-    helper, alias = (UNS, 'transcendental/remainder/scale (FEX host helper)'), (UNS, 'undocumented or reserved x87 encoding')
+    alias = (UNS, 'undocumented or reserved x87 encoding')
     if mod != 3:
         if op in (0xD8, 0xDA, 0xDC, 0xDE): return ok
         if op == 0xD9: return alias if reg == 1 else res if 4 <= reg <= 6 else ok
@@ -315,8 +316,8 @@ def x87_form(op, m):
     if op == 0xD8: return ok
     if op == 0xD9:
         if reg <= 1 or m == 0xD0 or m in (0xE0, 0xE1, 0xE4, 0xE5, 0xF6, 0xF7, 0xFA, 0xFC) or 0xE8 <= m <= 0xEE: return ok
-        if m == 0xF4: return UNS, 'fxtract (FEX: wrong for a denormal double)'
-        return helper if m in (0xF0, 0xF1, 0xF2, 0xF3, 0xF5, 0xF8, 0xF9, 0xFB, 0xFD, 0xFE, 0xFF) else alias
+        # I6b: the transcendental, remainder, scale and extract forms (the resident's, svc #X87)
+        return ok if m in (0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF8, 0xF9, 0xFB, 0xFD, 0xFE, 0xFF) else alias
     if op == 0xDA: return ok if reg <= 3 or m == 0xE9 else alias
     if op == 0xDB:
         if reg <= 3 or reg in (5, 6): return ok
@@ -516,9 +517,9 @@ def selftest():
              ('36488b03', 'ss mov (%rbx)', 'FS/GS'), ('36488b0424', 'ss mov (%rsp)', 'admitted'), ('3e488b4500', 'ds mov (%rbp)', 'FS/GS'),
              ('3e48ff24c500000000', 'notrack jmp *tbl', 'admitted'), ('65c4e2f0f200', 'andn %gs:', 'admitted'), ('f065480fc108', 'lock xadd %gs:', 'admitted'),
              ('65c3', 'gs ret', 'FS/GS'), ('3e4c8b2424', 'ds mov (%rsp),%r12', 'FS/GS'), ('3e498b0424', 'ds mov (%r12)', 'admitted'),
-             ('0f22d8', 'mov %cr3', 'system'), ('0f28c1', 'movaps', 'admitted'), ('0f6fc1', 'movq mm', 'SSE'), ('660f3a63c100', 'pcmpistri', 'SSE'), ('0fae10', 'ldmxcsr', 'system'), ('f20f38f1c1', 'crc32', 'admitted'), ('66f30f10c1', 'movss 66', 'SSE'), ('660f73f804', 'pslldq', 'admitted'), ('c5f877', 'vzeroupper', 'admitted'), ('c5f96efe', 'vmovd', 'admitted'), ('c4e27d78ff', 'vpbroadcastb', 'admitted'),
+             ('0f22d8', 'mov %cr3', 'system'), ('0f28c1', 'movaps', 'admitted'), ('0f6fc1', 'movq mm', 'SSE'), ('660f3a63c100', 'pcmpistri', 'admitted'), ('0fae10', 'ldmxcsr', 'system'), ('f20f38f1c1', 'crc32', 'admitted'), ('66f30f10c1', 'movss 66', 'SSE'), ('660f73f804', 'pslldq', 'admitted'), ('c5f877', 'vzeroupper', 'admitted'), ('c5f96efe', 'vmovd', 'admitted'), ('c4e27d78ff', 'vpbroadcastb', 'admitted'),
              ('c4e27d90040f', 'vpgatherdd', 'AVX'), ('c5f8ae5c2404', 'vstmxcsr', 'system'), ('66c5f877', 'vzeroupper 66', 'system'), ('c5fc28c1', 'vmovaps', 'admitted'),
-             ('c4e2fd78ff', 'vpbroadcastb W1', 'AVX'), ('c5f877c5fc77', 'vzeroupper', 'admitted'), ('d9c0', 'fld', 'admitted'), ('d9fe', 'fsin', 'x87'), ('dbe3', 'fninit', 'system'),
+             ('c4e2fd78ff', 'vpbroadcastb W1', 'AVX'), ('c5f877c5fc77', 'vzeroupper', 'admitted'), ('d9c0', 'fld', 'admitted'), ('d9fe', 'fsin', 'admitted'), ('dbe3', 'fninit', 'system'),
              ('f3480fb8c1', 'popcnt', 'admitted'), ('f0480fb10a', 'lock cmpxchg', 'admitted'), ('f0480fc70e', 'lock cmpxchg16b', 'admitted'),
              ('f04801c8', 'lock add reg', 'LOCK'), ('f0488908', 'lock mov', 'LOCK'), ('f2f0480108', 'xacquire lock add', 'other'),
              ('f0f71b', 'lock neg', 'admitted'), ('f0480fba2b05', 'lock bts', 'admitted'), ('f0480fba2305', 'lock bt', 'LOCK'), ('480fa4c10c', 'shld', 'admitted'), ('f2c3', 'bnd ret', 'other'),

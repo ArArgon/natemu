@@ -93,7 +93,7 @@ inline const uint8_t* (*fexc_guest_bytes)(uint64_t Address, uint64_t Size) = nul
 // Profile slice1: `svc` immediates of the resident entries generated code makes (crates/abi/src/execution.rs `svc`):
 // a literal exit (RIP in x0), the dispatcher's L1 miss (resident code, listed for completeness) and the 128/64
 // unsigned / signed division (FEX's helper registers: x0 high, x1 low, x2 divisor in; quotient, remainder, #DE out).
-enum FexcSvc : uint16_t { FEXC_SVC_LINK = 1, FEXC_SVC_MISS = 2, FEXC_SVC_DIV_U = 3, FEXC_SVC_DIV_S = 4 };
+enum FexcSvc : uint16_t { FEXC_SVC_LINK = 1, FEXC_SVC_MISS = 2, FEXC_SVC_DIV_U = 3, FEXC_SVC_DIV_S = 4, FEXC_SVC_X87 = 5, FEXC_SVC_STRING = 6 };
 // Profile slice1: native offsets of the computed exits' `b` to the resident dispatcher (placeholder `b .`, relocated by
 // the resident when it places the block), per compile attempt.
 inline std::vector<uint32_t> fexc_dispatch_exits;

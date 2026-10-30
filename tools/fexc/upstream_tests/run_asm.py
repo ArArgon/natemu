@@ -57,6 +57,8 @@ NOT_ADVERTISED = {'rdpid', 'rdseed', 'clflushopt', 'clzero', 'clwb', 'serialize'
 # Tests whose expectation is FEX's own x87 behaviour where it is not x86's (the test says so): natemu gives the SDM's.
 FEX_EXPECTS_ITS_BUG = {'X87/FXAM_Simple.asm': "expects FEX's FXAM of +0 (its comment: 'should be 0x4000 for zero, but there's no "
                                               "support'); natemu gives the SDM's 4000H (patch 0019)",
+                      'X87/D9_F9.asm': "FYL2XP1 of 2.0, outside the SDM's range (|x| < 1 - sqrt(2)/2: 'undefined'); expects 15 * "
+                                       "log2(3) to give 8.0 (FEX lists the test as disabled); natemu gives 23.77",
                       'VEX/vldmxcsr.asm': "expects FEX's VSTMXCSR, which masks off the exception flags (FFC0H); x86 stores MXCSR as "
                                           "VLDMXCSR loaded it, FFFFH (SDM STMXCSR; natemu's is the resident's transaction, I8 review)"}
 NEEDS_OS = {'syscall'}   # #UD with EFER.SCE = 0: no OS has set up SYSCALL here
@@ -95,6 +97,48 @@ def rounded80(m, se, bits, rc):
     kept += bool(up)
     if kept >> bits: kept, e = kept >> 1, e + 1
     return kept << drop, sign << 15 | e
+# I6b: the helper forms on an operand FLD m80 rounded to a double (deviation 2). The transcendental ones within 53-bit ulps
+# of the 80-bit expectation (libm's result within an ulp, the operand's rounding another: 2; FPTAN's 3, its slope
+# sec^2(x) = 3.6 at the test's operand growing the operand's error). The remainders are exact, so their result must be
+# exactly the remainder of the operands as FLD m80 rounded them under one of the four rounding controls (computed below
+# from the test's operands: dividend, divisor, FPREM1's round-to-nearest quotient).
+HELPER_PRECISION = {**{f'X87/precision_test_{n}{f}.asm': 2 for n in ('', 'neg_') for f in ('fsin', 'fyl2x', 'fyl2xp1')},
+                    **{f'X87/precision_test_{n}ftan.asm': 3 for n in ('', 'neg_')}}
+def _log2(v):
+    """floor(log2(v)) of a positive Fraction."""
+    from fractions import Fraction
+    e = v.numerator.bit_length() - v.denominator.bit_length()
+    return e - 1 if Fraction(2) ** e > v else e
+def _f80_of(text):
+    """The 80-bit (significand, sign|exponent) nasm's `dt TEXT` assembles (round to nearest, ties to even)."""
+    from fractions import Fraction
+    v = Fraction(text); sign = v < 0; v = abs(v)
+    e = _log2(v)
+    q, r = divmod(v * Fraction(2) ** (63 - e), 1)
+    q += r > Fraction(1, 2) or (r == Fraction(1, 2) and q & 1)
+    if q >> 64: q, e = q >> 1, e + 1
+    return int(q), sign << 15 | (e + 16383)
+HELPER_REMAINDERS = {**{f'X87/precision_test_{n}{f}.asm': ((0x8222222222222222, se), (1 << 63, 0x3fff), f == 'fprem1')
+                        for n, se in (('', 0x3fff), ('neg_', 0xbfff)) for f in ('fprem', 'fprem1')},
+                     'X87/D9_F5.asm': (_f80_of('5.1'), _f80_of('3.0'), True)}
+def remainder_ok(got, name):
+    """`got` is exactly FPREM/FPREM1 of the test's operands rounded to doubles under some rounding control."""
+    from fractions import Fraction
+    val = lambda m, se: (-1) ** (se >> 15) * Fraction(m) * Fraction(2) ** ((se & 0x7fff) - 16383 - 63)
+    (xm, xse), (ym, yse), nearest = HELPER_REMAINDERS[name]
+    for rc in range(4):
+        x, y = val(*rounded80(xm, xse, 53, rc)), val(*rounded80(ym, yse, 53, rc))
+        q = x / y
+        n = int(q) if not nearest else round(q)   # Python's round: to nearest, ties to even
+        r = x - n * y
+        if r == 0: want = (0, xse & 0x8000)
+        else:
+            e = _log2(abs(r))
+            m = abs(r) * Fraction(2) ** (63 - e)
+            if m.denominator != 1: continue
+            want = (int(m), (r < 0) << 15 | (e + 16383))
+        if tuple(got) == want: return True
+    return False
 def x87_value_ok(got, want, name):
     """`got` (an 80-bit image our double widens to) against the 80-bit expectation `want` (both [significand, sign|exponent])."""
     gm, gse, wm, wse = got[0], got[1] & 0xffff, want[0], want[1] & 0xffff
@@ -102,6 +146,9 @@ def x87_value_ok(got, want, name):
     if wse & 0x7fff == 0x7fff and wm << 1 & (2**64 - 1):              # a NaN: sign, quiet bit, top 51 significand bits
         return gse == wse and gm >> 11 == wm >> 11
     if any(rounded80(wm, wse, 53, rc) == (gm, gse) for rc in range(4)): return True
+    if name in HELPER_REMAINDERS: return remainder_ok((gm, gse), name)
+    if name in HELPER_PRECISION:
+        return gse == wse and gm >> 63 and wm >> 63 and abs(gm - wm) <= HELPER_PRECISION[name] << 11
     if name not in PRECISION_PC_TESTS: return False
     # FCW.PC = single: the expectation is our double rounded to 24 bits. PC = double or extended: the operand was rounded by FLD m80
     # under the group's RC before the operation (deviation 2), so the result may be one 53-bit ulp off the x87 result.

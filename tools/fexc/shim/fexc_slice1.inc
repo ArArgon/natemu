@@ -265,7 +265,7 @@ inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, 
     else if (op == 0x0a || op == 0x0b || op == 0x20 || op == 0x21 || op == 0x22 || op == 0x41) r = L0;
     else if (in(op, {0x0c, 0x0d, 0x0e, 0x0f, 0x40, 0x42})) r = LL;
     else if (op >= 0x14 && op <= 0x17) r = L0 | NOV;
-    else if (op >= 0x60 && op <= 0x63) { r = L0 | NOV; refuse = "vpcmpestri/m, vpcmpistri/m: FEX calls a host helper"; }
+    else if (op >= 0x60 && op <= 0x63) r = L0 | NOV;                             // vpcmpestrm/i, vpcmpistrm/i (I6b: svc #STRING)
     else if (op == 0x44) { r = L0; refuse = "VEX PCLMULQDQ (not in I8)"; }                 // VPCLMULQDQ ymm not advertised
     else if (op == 0xdf) { r = L0 | NOV; refuse = "VEX AESKEYGENASSIST (not in I8)"; }
   }
@@ -291,7 +291,7 @@ inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, 
 // Returns nullopt-like {UNSUPPORTED, .., why = nullptr} when the opcode is no SSE form here (the integer allowlist decides).
 // Refused: MMX-register forms (x87/MMX state is I6's: cvtpi2ps/pd, cvt(t)ps2pi/pd2pi, movq2dq, movdq2q, the no-prefix 0f 38/
 // 0f 3a and 0f 60..7f/c4/c5/d0..ff forms), maskmovdqu (a byte-masked store FEX lowers as a load, select and store of all
-// 16 bytes: it would fault and write where x86 does not), pcmpestri/m and pcmpistri/m (FEX calls a host helper), AES and
+// 16 bytes: it would fault and write where x86 does not), AES and
 // PCLMULQDQ (other features), SSE4a (not advertised). Memory-operand sizes and alignment: SDM Vol.2 per instruction and
 // 2.5 (exception classes 1, 2, 4: a 16-byte operand must be 16-byte aligned, except movups/movupd/movdqu/lddqu).
 inline Verdict Sse(uint8_t map, uint8_t pfx, uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
@@ -332,9 +332,9 @@ inline Verdict Sse(uint8_t map, uint8_t pfx, uint8_t op, bool has_modrm, uint8_t
   } else if (map == 6 && pfx == 0x66) {
     if (in(op, {0x0a, 0x0b, 0x14, 0x15, 0x16, 0x17, 0x20, 0x21, 0x22})) form = SMALL;
     else if ((op >= 0x08 && op <= 0x0f && op != 0x0a && op != 0x0b) || (op >= 0x40 && op <= 0x42)) form = M128;
+    else if (op >= 0x60 && op <= 0x63) form = UNALIGNED;   // pcmpestrm/i, pcmpistrm/i: no alignment (SDM); I6b: svc #STRING
   }
   if (form == NO) {
-    if (map == 6 && pfx == 0x66 && op >= 0x60 && op <= 0x63) return Uns("pcmpestri/m, pcmpistri/m: FEX calls a host helper");
     if (map == 1 && pfx == 0x66 && op == 0xf7) return Uns("maskmovdqu: FEX stores all 16 bytes (a masked store needs its own lowering)");
     if ((map == 5 && pfx == 0x66 && op >= 0xdb) || (map == 6 && pfx == 0x66 && (op == 0x44 || op == 0xdf))) return Uns("AES/PCLMULQDQ (not in I5a)");
     if ((map == 1 && (pfx == 0 || pfx == 0x66) && (in(op, {0x2a, 0x2c, 0x2d}) || (pfx == 0 && ((op >= 0x60 && op <= 0x7f) || in(op, {0xc4, 0xc5}) || op >= 0xd0)))) ||
@@ -352,13 +352,12 @@ inline Verdict Sse(uint8_t map, uint8_t pfx, uint8_t op, bool has_modrm, uint8_t
 // x87 (I6), FEX's reduced-precision mode (doubles). `modrm` is the byte after d8..df. Admitted: loads, stores and integer
 // conversions at every width but m80, the arithmetic and compares (FCOM forms compare signalling, as COMISS), FXCH, FCMOV,
 // constants, FCHS/FABS/FSQRT/FRNDINT, FXAM (patch 0019: x86's classes of a double), FINCSTP/FDECSTP/FFREE/FNOP, FNSTSW and FNSTCW. The resident's (system cuts): FNINIT,
-// FNCLEX, FLDCW, FLDENV/FNSTENV, FRSTOR/FNSAVE and FLD/FSTP m80 (FCW, the environment, 80-bit images). Refused: the
-// transcendental, remainder and scale forms (FEX calls a host libm helper there), FBLD/FBSTP (a host helper), FXTRACT (FEX's split is wrong for a denormal double), the 287 no-ops FENI/FDISI/
-// FSETPM, and the undocumented aliases (DC D0/D8, DD C8, DE D0, DF C0..DF) and reserved encodings.
+// FNCLEX, FLDCW, FLDENV/FNSTENV, FRSTOR/FNSAVE and FLD/FSTP m80 (FCW, the environment, 80-bit images). I6b: the transcendental,
+// remainder, scale and extract forms run whole in the resident by `svc #X87` (patch 0023). Refused: FBLD/FBSTP (a host helper),
+// the 287 no-ops FENI/FDISI/FSETPM, and the undocumented aliases (DC D0/D8, DD C8, DE D0, DF C0..DF) and reserved encodings.
 inline Verdict X87(uint8_t op, uint8_t modrm) {
   const uint8_t mod = modrm >> 6, reg = (modrm >> 3) & 7;
   const Verdict ok = Allow(), res = Sys("x87 control or state instruction (the resident's: FCW, environment, 80-bit image)");
-  const Verdict helper = Uns("x87 transcendental, remainder or scale (FEX's reduced-precision mode calls a host libm helper)");
   const Verdict alias = Uns("undocumented or reserved x87 encoding");
   if (mod != 3) {
     switch (op) {
@@ -376,8 +375,8 @@ inline Verdict X87(uint8_t op, uint8_t modrm) {
     switch (modrm) {
     case 0xE0: case 0xE1: case 0xE4: case 0xE5: case 0xF6: case 0xF7: case 0xFA: case 0xFC: return ok;   // fchs fabs ftst fxam fdecstp fincstp fsqrt frndint
     case 0xE8: case 0xE9: case 0xEA: case 0xEB: case 0xEC: case 0xED: case 0xEE: return ok;   // fld1 fldl2t fldl2e fldpi fldlg2 fldln2 fldz
-    case 0xF4: return Uns("fxtract (FEX's reduced-precision split is wrong for a denormal double)");
-    case 0xF0: case 0xF1: case 0xF2: case 0xF3: case 0xF5: case 0xF8: case 0xF9: case 0xFB: case 0xFD: case 0xFE: case 0xFF: return helper;
+    case 0xF0: case 0xF1: case 0xF2: case 0xF3: case 0xF4: case 0xF5: case 0xF8: case 0xF9: case 0xFB: case 0xFD: case 0xFE: case 0xFF:
+      return ok;   // f2xm1 fyl2x fptan fpatan fxtract fprem1 fprem fyl2xp1 fsincos fscale fsin fcos (I6b: the resident's, svc #X87)
     default: return alias;
     }
   case 0xDA: return reg <= 3 || modrm == 0xE9 ? ok : alias;                    // fcmovb/e/be/u, fucompp

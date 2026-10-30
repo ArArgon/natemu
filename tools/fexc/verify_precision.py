@@ -116,7 +116,7 @@ def effects(text):
         dests |= {reg(toks[0]), reg(toks[1])}
     elif mn in ('bl', 'blr'):
         dests.add(('x', 30))
-    elif mn == 'svc':   # a division's (svc #3/#4): the resident changes x0-x2; a literal exit's never returns
+    elif mn == 'svc':   # a division's (svc #3/#4): the resident changes x0-x2; I6b's helpers' (#5/#6) at most x0; a literal exit's never returns
         dests |= {('x', 0), ('x', 1), ('x', 2)}
     elif mn not in NO_DEST and not mn.startswith('b.') and toks:
         dests.add(reg(toks[0]))
@@ -543,7 +543,13 @@ def divides(d, dis, order, stubs, check_at):
             continue
         ok.add(t)
         checks.setdefault(g, []).append((f[0], f[1], t, f[2]))
-    for o in (o for o in order if dis[o].startswith('svc') and dis[o] != 'svc #0x1'):
+    for o in (o for o in order if dis[o] in ('svc #0x5', 'svc #0x6')):
+        # I6b: the resident's x87 helper / string compare: right after the `movz w0` of its function code or control word, in the
+        # same instruction (admission checks the value against the instruction's bytes).
+        g, lo, hi = insn_at(o)
+        if not (lo < o < hi and re.fullmatch(r'mov w0, #0x[0-9a-f]+', dis.get(o - 4, ''))):
+            out.append(f'svc +{o} "{dis[o]}" (guest +{g}) without its movz w0 in its instruction')
+    for o in (o for o in order if dis[o].startswith('svc') and dis[o] not in ('svc #0x1', 'svc #0x5', 'svc #0x6')):
         g, lo, hi = insn_at(o)
         want = DIV_SVC.get(names.get(g))
         nxt = dis.get(o + 4, '')

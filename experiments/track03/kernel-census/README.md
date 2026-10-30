@@ -84,6 +84,13 @@ memory, VNNI). After the I8 review (fexc series30), VLDMXCSR/VSTMXCSR are `syste
 rerun `natemu-raw/kernel-census-i8-20261030-02`, initramfs AVX 229,288 -> 229,216, system 5,529 -> 5,601 (36 of each, glibc's
 FMA/AVX2 libm).
 
+
+**I6b re-check (October 30).** `census.py` ports the I6b shim change (fexc series31: PCMPESTRI/PCMPESTRM/PCMPISTRI/PCMPISTRM,
+legacy and VEX.128, and the x87 transcendental, remainder, scale and extract forms admitted: the resident's, by `svc`). Rerun
+into `natemu-raw/kernel-census-i6b-20261030-01/` (`x` linked to the C0 data). Kernel unchanged. Initramfs: SSE 7,236 -> 6,835
+(PCMPISTRI 401 -> 0), x87 59 -> 3 (FPATAN 22, FSCALE 9, FYL2XP1 8, F2XM1 5, FPREM 4, FYL2X 4, FXTRACT 3, FPREM1 1 -> 0; left:
+FFREEP 3), admitted +457; no VEX string compare occurs. Left in the SSE class: AES 4,367, SHA 1,297, ADCX 736, PCLMULQDQ 351,
+MOVBE 68, MMX 16.
 Files here: `extract.py`, `census.py`, `report.py`, `results.md` (every table, generated), `forms-kernel.tsv` (every refused
 form of the decompressor and vmlinux, one row per mnemonic + operand shape, first-use order). The same for the
 initramfs is `RAW/forms-initrd.tsv`; `RAW/census.json` holds every row.

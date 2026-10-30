@@ -26,10 +26,16 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as twenty-two commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as twenty-three commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series30` (October 30, I8 review: series29 plus patch
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series31` (October 30, I6b: series30 plus patch 0023
+and shim changes. Patch 0023: the x87 transcendental, remainder, scale and extract forms (F2XM1 FYL2X FPTAN FPATAN FXTRACT
+FPREM1 FPREM FYL2XP1 FSINCOS FSCALE FSIN FCOS) lower to one IR op `FexcX87Svc`, `movz w0, #<D9 second byte>; svc #5`, run whole
+by the resident on the guest-state page's x87 state; VPCMPISTRX/VPCMPESTRX (PCMPxSTRx, legacy and VEX.128) call
+`FexcStringSvc` (`v0`, `v1`, `x1` = RAX, `x2` = RDX, `movz w0, #control; svc #6`) instead of FEX's host helper. Shim: the
+allowlist admits these forms (PCMPxSTRx memory operands with no alignment check); `FexcSvc` gains `FEXC_SVC_X87` = 5 and
+`FEXC_SVC_STRING` = 6. Boot-features plan, Built (I6b).) Previous: `series30` (October 30, I8 review: series29 plus patch
 0022 and shim changes. Patch 0022: HADDPS/HADDPD and their VEX forms add each pair high element first (the SDM's order:
 UZP2 + UZP1, not FADDP), so two NaNs give the high one; UNORD_Q/ORD_Q (CMPPS/CMPPD/CMPSS/CMPSD and VEX, also I5a's legacy
 forms) take the exact-flag path, which now finds unordered lanes by integer compares (no flag) and takes the flags from one

@@ -12,7 +12,8 @@ that must not run; data pages may be not present or read-only, CR0 set by the pr
   - at a fault: RIP the instruction, the general registers as the prelude left them, the x87 state as the prelude left it
     (TOP, tags, ST values, C0..C3) and no byte of a store written;
   - a typed stop `unsupported_system` for an FCW clearing an exception mask (FLDCW, FLDENV, FRSTOR), before any effect;
-    `unsupported_form` (no code) for the forms FEX's reduced-precision mode calls a host helper for;
+    `unsupported_form` (no code) for FBSTP (a host helper; the transcendental, remainder and scale forms run since I6b:
+    tools/run_i6b.py);
   - FLD m80 onto a full stack and FSTP m80 from an empty ST(0): IE and SF, C1 = 1 / 0, the indefinite loaded or stored;
   - LOCK on an x87 form: #UD.
 And the FPU probes Linux runs: the decompressor's FNINIT; FNSTSW; FNSTCW (status 0, control 037FH: an FPU is present), and the
@@ -85,7 +86,6 @@ def cases():
             case('fldenv-unmasked', 'fldenv [rdi]', [f'memory {D + 0x200:#x} 7303'], ['stop', 'unsupported_system'], x87=STATE0),
             case('frstor-unmasked', 'frstor [rdi]', [f'memory {D + 0x200:#x} 3302'], ['stop', 'unsupported_system'], x87=STATE0),
             case('fldcw-masked-ok', 'fldcw word ptr [rdi]', [f'memory {D + 0x200:#x} 7f0f'], None),
-            case('fsin-refused', 'fsin', [], ['nocode', 'unsupported_form']),
             case('fbstp-refused', 'fbstp tbyte ptr [rdi]', [], ['nocode', 'unsupported_form']),
             case('lock-fadd', '.byte 0xf0, 0xd8, 0xc1', [], ['ud', 6, 0, 0], x87=STATE0)]
     # Stack faults the resident handles exactly (masked responses): FLD m80 onto a full stack, FSTP m80 from an empty one.

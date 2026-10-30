@@ -94,6 +94,40 @@ pub(super) fn ftw() -> u64 {
     })
 }
 
+/// I6b: the helper instruction D9 `function` (`svc #X87`, [`natemu_abi::x87::helper`]) on the page's stack under FCW `fcw`:
+/// reads ST(0), ST(1) and whether TOP - 1 is empty, writes the values, tags, TOP, the condition codes the instruction defines
+/// and ORs its flags into the exception word. False (nothing written) for a function that is no helper.
+pub(super) fn helper(function: u64, fcw: u64) -> bool {
+    let t = top();
+    let reg = |i: u64| valid(t + i).then(|| mm(t + i));
+    let o = natemu_abi::x87::Operands { st0: reg(0), st1: reg(1), free: !valid(t + 7), rc: fcw >> 10 & 3 };
+    let Some(e) = u8::try_from(function).ok().and_then(|f| natemu_abi::x87::helper(f, o)) else { return false };
+    for (i, v) in [(0, e.st0), (1, e.st1)] {
+        if let Some(v) = v {
+            set_mm(t + i, v);
+            set_valid(t + i, true);
+        }
+    }
+    let mut t = t;
+    if e.pop {
+        set_valid(t, false);
+        t = (t + 1) & 7;
+    }
+    if let Some(v) = e.push {
+        t = (t + 7) & 7;
+        set_mm(t, v);
+        set_valid(t, true);
+    }
+    set8(frame::X87_TOP, t);
+    for (at, c) in [(frame::X87_C0, e.c[0]), (frame::X87_C1, e.c[1]), (frame::X87_C2, e.c[2]), (frame::X87_C3, e.c[3])] {
+        if let Some(c) = c {
+            set8(at, u64::from(c));
+        }
+    }
+    set32(frame::X87_EXCEPTIONS, get32(frame::X87_EXCEPTIONS) | u64::from(e.flags));
+    true
+}
+
 /// #NM under CR0.EM or CR0.TS (any x87 form; WAIT, which the host gates only under TS with MP, as well).
 fn gate(c: &Cpu) -> Result<(), Exception> {
     if c.cr0 & (CR0_EM | CR0_TS) != 0 { Err(NM) } else { Ok(()) }

@@ -20,6 +20,7 @@ use super::*;
 use crate::cache::{self, Block};
 mod delivery;
 mod events;
+mod helpers;
 mod lapic;
 mod mmio;
 mod ports;
@@ -612,6 +613,8 @@ pub unsafe fn returned(frame: &NativeFrame, kind: u64) -> ! {
             svc::LINK => linker(frame, elr),
             svc::MISS if elr == miss => missed(frame),
             imm @ (svc::DIV_U | svc::DIV_S) => division(imm == svc::DIV_S, frame, elr, spsr),
+            svc::X87 => helpers::x87(frame, elr, spsr),
+            svc::STRING => helpers::string(frame, elr, spsr),
             _ => {}
         }
         halt_native([esr, 0, elr], stop::UNKNOWN_ABORT)

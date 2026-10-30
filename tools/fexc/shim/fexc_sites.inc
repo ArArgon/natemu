@@ -112,6 +112,39 @@ void Arm64JITCore::FexcX87Begin() {
     msr(ARMEmitter::SystemRegister::FPCR, TMP1);
   }
 }
+// I6b: an x87 transcendental, remainder, scale or extract instruction (patch 0023's FexcX87Svc), run whole by the resident on the
+// x87 state in the guest-state page: `movz w0, #fn; svc #X87`, fn the D9 opcode's second byte. No register changes (x0 is FEX's
+// TMP1); the resident leaves NZCV and every register as they were, and admission accepts the svc only right after that movz in
+// that very instruction.
+DEF_OP(FexcX87Svc) {
+  const auto Op = IROp->C<IR::IROp_FexcX87Svc>();
+  movz(ARMEmitter::Size::i32Bit, TMP1, Op->Function);
+  svc(FEXC_SVC_X87);
+}
+// I6b (I5c): PCMPxSTRx's intermediate result (FEX's VPCMPISTRX/VPCMPESTRX, a host helper otherwise) by the resident: v0 = xmm1,
+// v1 = xmm2/m128 (FEX's VTMP1/VTMP2), x1 = RAX, x2 = RDX for the explicit forms, then `movz w0, #control; svc #STRING` with
+// control = imm8 | REX.W << 8 (FEX's own bit 8) | explicit << 9; w0 out (IntRes2 and the flags in bits 31:28, as FEX's helper).
+// The resident changes only x0; temporaries x0-x2 and v0/v1 hold no allocated value.
+void Arm64JITCore::FexcStringSvc(const IR::IROp_Header* IROp, IR::Ref Node) {
+  uint32_t Control;
+  if (IROp->Op == IR::OP_VPCMPESTRX) {
+    const auto Op = IROp->C<IR::IROp_VPCMPESTRX>();
+    mov(VTMP1.Q(), GetVReg(Op->LHS).Q());
+    mov(VTMP2.Q(), GetVReg(Op->RHS).Q());
+    mov(TMP2, GetReg(Op->RAX).X());
+    mov(TMP3, GetReg(Op->RDX).X());
+    Control = uint32_t(Op->Control) | 1u << 9;
+  } else {
+    const auto Op = IROp->C<IR::IROp_VPCMPISTRX>();
+    mov(VTMP1.Q(), GetVReg(Op->LHS).Q());
+    mov(VTMP2.Q(), GetVReg(Op->RHS).Q());
+    Control = Op->Control;
+  }
+  movz(ARMEmitter::Size::i32Bit, TMP1, Control);
+  svc(FEXC_SVC_STRING);
+  mov(GetReg(Node).W(), TMP1.W());
+}
+
 void Arm64JITCore::FexcX87End() {
   if (fexc_x87_fpcr) msr(ARMEmitter::SystemRegister::FPCR, TMP3);
   mrs(TMP1, ARMEmitter::SystemRegister::FPSR);

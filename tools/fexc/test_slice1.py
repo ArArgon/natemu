@@ -63,11 +63,11 @@ UNSUPPORTED = {
     'fs addr32 mov rax,[eax]': '6467488b00',
     # Intel's class since series27; still cut: SS with CS/DS/ES (mixed classes), SS on a moffs operand
     'ss ds mov rax,[rbx] (mixed)': '363e488b03', 'ss movabs rax,[moffs]': '3648a10102030405060708',
-    'paddd mm (MMX, I6)': '0ffec1', 'pcmpistri (host helper)': '660f3a63c100', 'maskmovdqu': '660ff7c1', 'f3 66 movss': 'f3660f10c1',
+    'paddd mm (MMX, I6)': '0ffec1', 'maskmovdqu': '660ff7c1', 'f3 66 movss': 'f3660f10c1',
     'insertps m32 zeroing its element': '660f3a21000f', 'aesenc': '660f38dcc1',
     # I8: AVX forms FEX cannot do exactly, VEX encodings x86 makes #UD (refused, not delivered), unadvertised VEX forms
     'vpgatherdd': 'c4e26d90040f', 'vmaskmovps ld': 'c4e2752c00', 'vmaskmovps st': 'c4e2752e08', 'vmaskmovdqu': 'c5f9f7ca',
-'vcvtps2ph m': 'c4e37d1d3004', 'vpcmpistri': 'c4e3796300 12'.replace(' ', ''), 'vaesenc': 'c4e271dcc2',
+'vcvtps2ph m': 'c4e37d1d3004', 'vaesenc': 'c4e271dcc2', 'vpcmpistri L=1 (#UD)': 'c4e37d63c112',
     'vmovd L=1 (#UD)': 'c5fd6ec6', 'vaddss L=1 (LIG)': 'c5f658c2', 'vpermq L=0 (#UD)': 'c4e3f900c11b', 'vpermq W0 (#UD)': 'c4e37d00c11b',
     'vmovaps vvvv (#UD)': 'c5f428c1', 'vpdpbusd (VNNI)': 'c4e27950e1', 'addr32 vmovdqu': '67c5fe6f00',
     'vinsertps m32 zeroing its element': 'c4e37921001f',
@@ -98,6 +98,11 @@ VEX_UD = {'rex andn': '48c4e278f2c1', 'o16 andn': '66c4e278f2c1', 'o16 vzerouppe
           'f2 vpbroadcastb': 'f2c4e27d78ff'}
 
 ALLOWED = {
+    # I6b: the resident's helper forms (`svc #X87`, `svc #STRING`)
+    'pcmpistri xmm0,[rax],0x12': '660f3a630012', 'rex.w pcmpestri': '66480f3a61c14c', 'pcmpestrm xmm1,xmm2,0x40': '660f3a60ca40',
+    'vpcmpistrm xmm1,[rax+1],0': 'c4e37962480100', 'vex.w1 vpcmpestri': 'c4e3f961ca01', 'fsin': 'd9fe', 'fcos': 'd9ff', 'fsincos': 'd9fb',
+    'fptan': 'd9f2', 'fpatan': 'd9f3', 'f2xm1': 'd9f0', 'fyl2x': 'd9f1', 'fyl2xp1': 'd9f9', 'fscale': 'd9fd', 'fprem': 'd9f8',
+    'fprem1': 'd9f5', 'fxtract': 'd9f4',
     # I8: AVX, AVX2, FMA, F16C (VEX)
     'vzeroupper': 'c5f877', 'vzeroall': 'c5fc77', 'vpxor': 'c5f9efc0', 'vmovd xmm7,esi': 'c5f96efe', 'vpbroadcastb ymm7,xmm7': 'c4e27d78ff',
     'vmovdqu ymm1,[rdi]': 'c5fe6f0f', 'vmovdqu [rdx],ymm1': 'c5fe7f0a', 'vmovaps ymm1,[rax]': 'c5fc2808', 'vmovdqa xmm1,[rax]': 'c5f96f08',
@@ -439,7 +444,8 @@ class Slice1Cutting(unittest.TestCase):
 # The code touches no emulator data, and its only ways out are the resident's: a literal exit is exactly a guest-RIP move
 # into x0 then `svc #1` (the resident links it), a computed one `mov x0, xR` then the placeholder `b .` at a
 # dispatch_branch relocation (the resident relocates it to its dispatcher). The only other `svc`s are the 128/64
-# division's (verify_precision.py P11 checks its #DE branch); there is no `bl` (no stop check: E1b unlinks instead).
+# division's (verify_precision.py P11 checks its #DE branch) and I6b's helpers' (`svc #5`, `#6`, each right after a `movz w0`);
+# there is no `bl` (no stop check: E1b unlinks instead).
 def literal_exits(d):
     return sorted(r['guest_rip'] for r in d['code']['relocations'] if r['kind'] == 'guest_rip_move' and r['register'] == 0)
 
@@ -469,7 +475,9 @@ def check_exits(test, d, tmp, what):
             test.assertRegex(lines[i - 1][1], r'^mov x0, x([1-9]|[12]\d|30)$', (what, o))
         else:
             test.assertIsNone(re.match(r'(blr|br|ret|bl)\s', t), (what, o, t))
-            test.assertIsNone(re.match(r'svc\s', t) if t not in ('svc #0x3', 'svc #0x4') else None, (what, o, t))
+            test.assertIsNone(re.match(r'svc\s', t) if t not in ('svc #0x3', 'svc #0x4', 'svc #0x5', 'svc #0x6') else None, (what, o, t))
+            if t in ('svc #0x5', 'svc #0x6'):   # I6b: right after the movz of its function code or control word
+                test.assertRegex(lines[i - 1][1], r'^mov w0, #0x[0-9a-f]+$', (what, o))
             # no frame or stack access but a guest-state load of the FS/GS base (I7: ldr xN, [x28, #0x3e0|#0x3e8])
             if not re.fullmatch(r'ldr x\d+, \[x28, #0x3e[08]\]', t):
                 test.assertIsNone(re.search(r'\[(x28|sp)\b', t), (what, o, t))

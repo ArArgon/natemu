@@ -9,8 +9,8 @@
 //!   names neither x25 nor x28 in any register field ([`screened`]); x28 (FEX's guest-state base, the guest-state page)
 //!   is never written and addresses only FEX's guest-state fields: loads of `frame::GUEST_STATE`, stores only to
 //!   `frame::GUEST_STATE_WRITABLE` (DF); x25 is written only by `mrs x25,
-//!   nzcv` (the pre-NZCV save the resident reads at `nzcv=saved` sites); the only `svc`s are `#LINK`, `#DIV_U` and
-//!   `#DIV_S`; direct branches go forward to a word of the code region; no word falls through into a literal slot, a
+//!   nzcv` (the pre-NZCV save the resident reads at `nzcv=saved` sites); the only `svc`s are `#LINK`, `#DIV_U`,
+//!   `#DIV_S`, `#X87` and `#STRING`; direct branches go forward to a word of the code region; no word falls through into a literal slot, a
 //!   check stub or past the region. So every path ends at an exit the resident knows (a link point or the dispatch
 //!   branch, which a precise stop patches) or at a check stub.
 //! - Sites: each access site lies inside its guest instruction and its word is a load, store, swap or LOCK atomic
@@ -23,6 +23,9 @@
 //!   the `b` to its dispatcher, and a stop patches it). Admission returns the link points and the dispatch branch.
 //! - Guest-RIP moves: each decodes to its relocation's value, the instruction end plus a displacement in its bytes.
 //! - Division: each `svc #DIV_U` / `#DIV_S` lies in a 64-bit div / idiv.
+//! - Helpers (I6b): each `svc #X87` lies in an x87 transcendental, remainder, scale or extract instruction and each
+//!   `svc #STRING` in a PCMPxSTRx, right after a `movz w0` of that instruction's function code or control word (in the same
+//!   instruction, no branch to the `svc`).
 //!
 //! **Code shape (debug, `Code::shape`; off by default, on in the test suites):** that fexc emitted the x86 checks
 //! exactly and nothing else, a producer-correctness check whose violation stays confined to the vCPU's guest.
@@ -126,6 +129,7 @@ impl Insn {
             Insn::Atomic { op: AtomicOp::Cas, rs, .. } => bit(rs),
             Insn::Atomic { op: AtomicOp::Casp, rs, .. } => bit(rs) | bit(rs + 1),
             Insn::Svc(svc::DIV_U | svc::DIV_S) => 0b111, // the division's contract: x0-x2 change
+            Insn::Svc(svc::STRING) => 0b1,                // the string compare's: w0 (`#X87` changes no register)
             _ => 0,
         }
     }
@@ -326,6 +330,11 @@ fn screened(w: u32) -> bool {
 const SVC_LINK: u32 = 0xd400_0001 | (svc::LINK as u32) << 5;
 const SVC_DIV_U: u32 = 0xd400_0001 | (svc::DIV_U as u32) << 5;
 const SVC_DIV_S: u32 = 0xd400_0001 | (svc::DIV_S as u32) << 5;
+#[cfg(test)]
+const SVC_X87: u32 = 0xd400_0001 | (svc::X87 as u32) << 5;
+#[cfg(test)]
+const SVC_STRING: u32 = 0xd400_0001 | (svc::STRING as u32) << 5;
+const MOVZ_W0: u32 = 0x5280_0000; // movz w0, #imm16 (imm16 << 5)
 const MRS_PRE_NZCV: u32 = 0xd53b_4200 | PRE_NZCV_REG as u32; // mrs x25, nzcv
 /// `eor x0, xA, xA, lsl #16` (the branch-target check)
 fn eor_guard(a: u32) -> u32 {
@@ -625,7 +634,7 @@ impl<'a> Verifier<'a> {
                 }
                 Insn::Literal { .. } if shape => return fail(at, "literal load"),
                 // Division `svc`s are checked below, link points' by `exits`.
-                Insn::Svc(svc::LINK | svc::DIV_U | svc::DIV_S) => {}
+                Insn::Svc(svc::LINK | svc::DIV_U | svc::DIV_S | svc::X87 | svc::STRING) => {}
                 Insn::Svc(_) => return fail(at, "svc"),
                 Insn::Brk if shape && self.c.stubs.binary_search_by_key(&at, |s| s.native_offset).is_err() => return fail(at, "brk"),
                 _ => {}
@@ -638,6 +647,20 @@ impl<'a> Verifier<'a> {
                 let divide = self.instruction(at).and_then(|(g, _)| x86_divide(self.guest_insn(g)));
                 if divide != Some((imm == svc::DIV_S, 64)) {
                     return fail(at, "division svc outside a 64-bit div/idiv of its signedness");
+                }
+            }
+            // I6b: a helper `svc` only inside its x86 instruction, right after the `movz w0` of the instruction's function code
+            // (x87) or control word (PCMPxSTRx), in the same instruction, with no branch to the `svc`.
+            if let Insn::Svc(imm @ (svc::X87 | svc::STRING)) = i {
+                let code = self.instruction(at).and_then(|(g, _)| {
+                    let insn = self.guest_insn(g);
+                    if imm == svc::X87 { x86_x87_helper(insn) } else { x86_string_compare(insn) }
+                });
+                let movz = at >= ENTRY_OFFSET + 4 && self.instruction(at - 4) == self.instruction(at) && self.sealed(at - 4, at - 4, at);
+                match code {
+                    Some(c) if movz && self.word(at - 4) == MOVZ_W0 | c << 5 => {}
+                    Some(_) => return fail(at, "helper svc without its instruction's movz w0 right before it"),
+                    None => return fail(at, "helper svc outside its x86 instruction"),
                 }
             }
         }
@@ -1209,6 +1232,35 @@ fn x86_divide(insn: &[u8]) -> Option<(bool, u32)> {
     Some((reg == 7, if op == 0xf6 { 8 } else if rex_w { 64 } else if size16 { 16 } else { 32 }))
 }
 
+/// I6b: the helper function of an x87 transcendental, remainder, scale or extract instruction, the D9 opcode's second byte (F0..F5,
+/// F8, F9, FB, FD..FF), after segment, address-size and REX prefixes (fexc refuses 66, F2 and F3 on x87 forms).
+fn x86_x87_helper(insn: &[u8]) -> Option<u32> {
+    let mut i = insn.iter().take_while(|b| matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x67)).count();
+    i += usize::from(matches!(insn.get(i), Some(0x40..=0x4f)));
+    match insn.get(i..)? {
+        [0xd9, m @ (0xf0..=0xf5 | 0xf8 | 0xf9 | 0xfb | 0xfd..=0xff)] => Some(u32::from(*m)),
+        _ => None,
+    }
+}
+/// I6b: the control word of PCMPESTRM/PCMPESTRI/PCMPISTRM/PCMPISTRI (66 [REX] 0F 3A 60..63 or VEX.128.66.0F3A 60..63): imm8 (the
+/// instruction's last byte), and for the explicit-length forms (60, 61) REX.W/VEX.W << 8 and 1 << 9.
+fn x86_string_compare(insn: &[u8]) -> Option<u32> {
+    let i = insn.iter().take_while(|b| matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x67 | 0x66)).count();
+    let opsize = insn[..i].contains(&0x66);
+    let (w, op) = match insn.get(i..)? {
+        [0xc4, p1, p2, op, ..] if !opsize && p1 & 0x1f == 3 && p2 & 7 == 1 => (p2 >> 7, *op), // map 0F3A, L = 0, pp = 66
+        [rex @ 0x40..=0x4f, 0x0f, 0x3a, op, ..] if opsize => (rex >> 3 & 1, *op),
+        [0x0f, 0x3a, op, ..] if opsize => (0, *op),
+        _ => return None,
+    };
+    let imm = u32::from(*insn.last()?);
+    match op {
+        0x60 | 0x61 => Some(imm | u32::from(w) << 8 | natemu_abi::strings::EXPLICIT),
+        0x62 | 0x63 => Some(imm),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1223,7 +1275,7 @@ mod tests {
             )
         };
     }
-    const FIXTURES: [(&[u8], &[u8]); 10] = [
+    const FIXTURES: [(&[u8], &[u8]); 11] = [
         fixture!("address-forms"),
         fixture!("division-forms"),
         fixture!("call-rsp"),
@@ -1236,6 +1288,10 @@ mod tests {
         // I3 (series18): lock add, lock cmpxchg (`dmb ish` at 0x18, casal at 0x1c), cmpxchg8b (caspal at 0x30, no barrier),
         // lock cmpxchg16b (`dmb ish` at 0x54, caspal at 0x58), lock xadd, lock neg (load, casal, its own-RIP exit).
         fixture!("lock-forms"),
+        // I6b (series31): fld qword [rax]; fsin; fprem; pcmpistri xmm1, [rbx + 3], 0x12; REX.W pcmpestri xmm1, xmm2, 0x4c;
+        // vpcmpistrm xmm2, xmm3, 0x40; fstp qword [rax]. `movz w0, #fn; svc #X87` at 0x98 (FSIN) and 0xa0 (FPREM); `movz w0,
+        // #control; svc #STRING` at 0xb4 (0x12), 0xf0 (0x34c: explicit, REX.W) and 0x11c (0x40).
+        fixture!("helper-forms"),
     ];
     /// Admission with the code-shape check (as in the test suites).
     fn admit(fixture: (&[u8], &[u8])) -> Result<(), String> {
@@ -1508,6 +1564,45 @@ mod tests {
         refused(ADDRESS, at, old, SVC_DIV_U, "division svc outside");
         validated(ADDRESS, at, old, SVC_DIV_U, Some("division svc outside"));
     }
+    /// I6b: a helper `svc` only in its instruction, right after the `movz w0` of exactly its function code or control word.
+    #[test]
+    fn helper_svcs_only_in_their_instruction() {
+        const HELPERS: (&[u8], &[u8]) = FIXTURES[10];
+        let movz = |c: u32| MOVZ_W0 | c << 5;
+        admit(HELPERS).unwrap();
+        for (at, old, new) in [
+            (0x98, movz(0xfe), movz(0xff)),   // FSIN's svc with FCOS's function code
+            (0xa0, movz(0xf8), movz(0xf5)),   // FPREM's with FPREM1's
+            (0xa0, movz(0xf8), NOP),          // no movz
+            (0xb4, movz(0x12), movz(0x13)),   // another imm8
+            (0xf0, movz(0x34c), movz(0x24c)), // REX.W dropped
+            (0xf0, movz(0x34c), movz(0x14c)), // the explicit bit dropped
+            (0x11c, movz(0x40), movz(0x240)), // an implicit form with the explicit bit
+        ] {
+            refused(HELPERS, at, old, new, "movz w0");
+            validated(HELPERS, at, old, new, Some("movz w0"));
+        }
+        // A branch to the svc, over its movz.
+        refused(HELPERS, 0x94, u32::from_le_bytes(HELPERS.0[(super::super::record::<Header>(HELPERS.0, 0).code_offset + 0x94) as usize..][..4].try_into().unwrap()),
+                0x1400_0002, "movz w0");
+        // The other helper's svc, or a helper svc in any other instruction.
+        for (fixture, at, old, new) in [(HELPERS, 0x9c, SVC_X87, SVC_STRING), (HELPERS, 0xb8, SVC_STRING, SVC_X87),
+                                        (ADDRESS, MIDDLE.0, MIDDLE.1, SVC_X87), (ADDRESS, MIDDLE.0, MIDDLE.1, SVC_STRING)] {
+            refused(fixture, at, old, new, "helper svc outside");
+            validated(fixture, at, old, new, Some("helper svc outside"));
+        }
+        // The decoders: prefixes, REX, the helper set, the control word.
+        assert_eq!(x86_x87_helper(&[0x64, 0x41, 0xd9, 0xf4]), Some(0xf4));
+        assert_eq!([0xf6, 0xf7, 0xfa, 0xfc, 0xe0].map(|m| x86_x87_helper(&[0xd9, m])), [None; 5]);
+        assert_eq!(x86_x87_helper(&[0x66, 0xd9, 0xfe]), None);
+        assert_eq!(x86_string_compare(&[0x66, 0x0f, 0x3a, 0x60, 0xca, 0x7f]), Some(0x27f));
+        assert_eq!(x86_string_compare(&[0x66, 0x4c, 0x0f, 0x3a, 0x63, 0xca, 0x7f]), Some(0x7f)); // REX.W: no length registers
+        assert_eq!(x86_string_compare(&[0xc4, 0xe3, 0xf9, 0x61, 0xca, 0x01]), Some(0x301));   // VEX.W1
+        assert_eq!(x86_string_compare(&[0xc4, 0xe3, 0x7d, 0x61, 0xca, 0x01]), None);          // VEX.L1
+        assert_eq!(x86_string_compare(&[0x0f, 0x3a, 0x61, 0xca, 0x01]), None);                // no 66
+        assert_eq!(x86_string_compare(&[0x66, 0x0f, 0x3a, 0x64, 0xca, 0x01]), None);
+    }
+
     /// The div-cl check's tbz offset field (stub at 0x2e0 from 0x14).
     const DIVISION_STUB_IMM: u32 = ((0x2e0 - 0x14) / 4) << 5;
 

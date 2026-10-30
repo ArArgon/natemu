@@ -2104,6 +2104,112 @@ VPCMPxSTRx 16, VEX AES/PCLMULQDQ 13, VCVTPS2PH m 9, masked moves 9, VNNI 4, 0x67
 (45 + 74), python unit 281, stack audit (gate 18,976 bytes, 23,056 nested). **Kernel** (series30, the same command): the same
 stop, `pcmpistri` at libc.so.6 + 0x184d42 in `/sbin/modprobe -q -- crypto-hmac(sha256)` (224 lines, 56 s), nothing earlier.
 
+*Built (I6b, the x87 helper forms and PCMPxSTRx by `svc` to the resident; fexc series31 = series30 + patch 0023 + shim changes):*
+**Design.** No helper library in the VM and no host helper: two new `svc` numbers enter the resident from generated code, as
+the 128/64 division does (`execution::svc`, fexc `FexcSvc`). **`svc #X87` (5)**: `movz w0, #fn; svc #5`, fn the D9 opcode's
+second byte (F0 F2XM1, F1 FYL2X, F2 FPTAN, F3 FPATAN, F4 FXTRACT, F5 FPREM1, F8 FPREM, F9 FYL2XP1, FB FSINCOS, FD FSCALE, FE
+FSIN, FF FCOS). The whole instruction runs in the resident (`execution/helpers.rs` -> `x87::helper`, math in
+`natemu_abi::x87::helper`) on the x87 state FEX's stack pass leaves exact in the guest-state page at every instruction boundary
+(I6): it reads TOP, the tag byte, ST(0), ST(1) and whether TOP - 1 is empty, writes the values and tags, TOP, the condition
+codes the SDM defines for the instruction and ORs the flags into the x87 exception word. FEX's F64 IR ops carry only a value,
+so lowering them would have needed FEX-side C2, conditional pushes and quotient bits; patch 0023 instead lowers the instruction
+(`X87OpHelper` for the nine helper IR ops only, not FCHS/FABS/FSQRT/FRNDINT, `X87FYL2X`, `X87FXTRACTF64`) to one new IR op
+`FexcX87Svc` (side effects; the JIT op in `shim/fexc_sites.inc`). No register changes; FCW comes from the bank (`Cpu::fcw`).
+**`svc #STRING` (6)**: FEX's PCMPxSTRx lowering stays (it derives ECX or XMM0 and RFLAGS from the intermediate result); only its
+VPCMPISTRX/VPCMPESTRX helper call becomes `mov v0, xmm1; mov v1, xmm2/m128; [mov x1, RAX; mov x2, RDX]; movz w0, #control; svc
+#6` (`FexcStringSvc`, from `Op_Unhandled` under slice1), control = imm8 | REX.W/VEX.W << 8 (FEX's own bit) | explicit << 9;
+the resident (`natemu_abi::strings::pcmpstr`, written from FEX's `VectorFallbacks.h` loops with the SDM's validity overrides)
+returns w0 = IntRes2 | SF ZF CF OF << 28 and changes nothing else. **What the resident preserves:** every register but w0
+(`STRING`) and none (`X87`), NZCV, FPCR and FPSR: the gates save all 32 Q registers, FPCR and FPSR and `resume` restores them
+from the captured frame, so the resident's own libm and vector use never reaches guest state (its FPCR is 0 since I5a). Each
+handler checks that the `svc` came from a block and that the function code or control is one it knows (else `unknown_abort`).
+**Admission** (object validation, `admission/structure.rs`): `#X87` and `#STRING` join the allowed `svc`s; each must lie in its
+x86 instruction (`x86_x87_helper`: D9 F0..F5/F8/F9/FB/FD..FF after segment, 67 and REX prefixes; `x86_string_compare`: 66 [REX]
+0F 3A 60..63 or VEX.128.66.0F3A 60..63) right after a `movz w0` of exactly that instruction's function code or control word
+(imm8, W and the explicit bit from the bytes), in the same instruction, with no branch to the `svc`; `#STRING` writes x0.
+Negative tests (`helper_svcs_only_in_their_instruction`, a real series31 fixture `helper-forms`): a wrong function code
+(FCOS's on FSIN, FPREM1's on FPREM), no movz, a wrong imm8, REX.W or explicit bit dropped, an implicit form with the explicit
+bit, a branch over the movz to the `svc`, the other helper's `svc` in each instruction, and either `svc` in an ordinary
+instruction: all refused, with and without the code-shape check. (Found by the ASM suite while building:
+FEX routes FCHS, FABS, FSQRT and FRNDINT through `X87OpHelper` too, and admission refused the `svc` it then emitted there.)
+**Forms.** PCMPESTRI/PCMPESTRM/PCMPISTRI/PCMPISTRM legacy and VEX.128 (VEX.L = 0, vvvv = 1111b, W either), register and memory
+operands: the 16-byte operand is an ordinary FPR load site with no alignment check (SDM: none for these), so #PF/#GP/#SS are
+precise as any SSE load and a crossing load faults on the second page with nothing written. x87: all twelve helper forms,
+FXTRACT included (exact for a double denormal: its 80-bit exponent). Gating as I6/I8 (`--x87-gated`, `--sse-gated`,
+`--avx-gated`: #NM/#UD before the `svc` is ever reached). **x87 rules** (SDM per instruction, Vol.1 8.5 masked responses;
+Bochs where the SDM gives none; QEMU's partial step): FSIN/FCOS/FPTAN/FSINCOS with |x| >= 2^63 set C2 and leave ST(0)
+unchanged with nothing pushed and no exception; an infinity is IE with the indefinite (FPTAN/FSINCOS: in both registers); a NaN
+propagates quieted (IE for an SNaN; FPTAN pushes the NaN too, Bochs); FPREM/FPREM1 set C0 = Q2, C3 = Q1, C1 = Q0 of the exact
+quotient (the low bits from fmod(|x|, 8|y|) - fmod(|x|, |y|); FPREM1 rounds to nearest even) with C2 = 0 when the exponent
+difference D < 64, else the partial remainder x - y * QQ * 2^(D - N), N = 32 + D mod 32, truncating, C2 = 1 and C0 C1 C3 = 0
+(AMD's rule, which QEMU follows and Intel matches empirically: the last step of a loop gives the complete quotient's bits);
+ST(0) infinite or ST(1) zero is IE, ST(1) infinite or ST(0) zero leaves ST(0); FYL2X/FYL2XP1/FPATAN by the SDM tables (log of a
+negative, 0 * log2(0), inf * log2(1): IE; a zero argument with a finite nonzero ST(1): ZE and the signed infinity), each
+popping; FSCALE truncates ST(1), rounds by FCW.RC (`from_f80`), OE/UE/PE at the double's thresholds, the SDM table for
+infinite ST(1); FXTRACT of zero is ZE (-inf, then the zero), of an infinity +inf then it. Stack faults: an empty operand is
+underflow, a non-empty TOP - 1 before a push overflow: IE and SF, C1 = 0 / 1, every destination the indefinite (FPTAN,
+FSINCOS and FXTRACT: both registers, Bochs), popping forms pop. PE whenever the result is inexact (exact cases recognized:
+zeros, cos 0, 2^+-1 - 1, log2 of a power of two times an exactly representable product, atan2 zeros); no DE (a double is never
+an 80-bit denormal). **Accuracy:** values from compiler_builtins' libm for `aarch64-unknown-none` (sin cos tan atan2 expm1 log2
+log1p fmod ldexp fma; F2XM1 as expm1(x ln 2), FYL2XP1 as log1p(x) log2(e)), to nearest whatever FCW.RC/PC.
+**Deviations** (I6b; the reduced-precision class): (1) FSIN/FCOS/FPTAN/FSINCOS/F2XM1/FYL2X/FYL2XP1/FPATAN results are double
+libm results, rounded to nearest whatever FCW.RC, within about 1 ulp of the double nearest the exact value (an 80-bit x87
+rounds by RC at 64 bits; I6 deviation 1 already covers 53 bits). libm reduces a large trigonometric argument exactly (Payne-Hanek),
+where x87 hardware reduces by a 66-bit approximation of pi: for |x| far from 0, and most near 2^63, natemu's FSIN/FCOS/FPTAN/
+FSINCOS differ from a real CPU's by many ulps (natemu being the closer to the exact value); (2) their C1 is 0, never the round-up bit (I6 deviation 5);
+(3) F2XM1 outside [-1, 1] and FYL2XP1 outside |x| < 1 - sqrt(2)/2, which the SDM leaves undefined, compute the formula
+(QEMU: invalid); (4) FPTAN of a NaN pushes the NaN (Bochs; QEMU 1.0); (5) the partial remainder's N is AMD's rule (the SDM:
+"implementation-dependent, 32..63"); (6) UE/OE at the double's thresholds (I6 deviation 1).
+**QEMU 7.2 departures found** (recorded, stepped around in the corpus, judged by the SDM in `cases`): its new decoder drops
+REX.W/VEX.W for PCMPESTRI/PCMPESTRM (`gen_PCMPESTRI` passes the bare imm8, so RAX/RDX are always read as 32 bits; SDM, XED and
+FEX use RAX/RDX); FPREM1 never reports quotient bits (`floatx80_modrem` gets no quotient pointer for the IEEE remainder: C0 C1
+C3 read 0); FSIN/FCOS/FPTAN/FSINCOS go through the host's double libm with no flag at all and test |x| > 2^63 (the SDM:
+>=); F2XM1 of |x| > 1 is invalid.
+**Checks** (series31). `cargo test`: `strings::port_matches_sdm_every_imm8` (the port against a separately written SDM model,
+every imm8, implicit and explicit lengths, REX.W, 200 random string pairs each), `x87::helpers` (the SDM cases above). QEMU 7.2
+corpus (`tools/reference/gen_i6b.py`, `natemu-raw/i6b-corpus-20261030-01`, 112 programs: 64 string programs, every imm8 four
+times across the four forms, legacy and VEX, register and unaligned or page-crossing memory operands, explicit lengths
+negative, saturating and with upper bits, REX.W/VEX.W where QEMU agrees, YMM0's zeroed upper half; 48 x87 programs, each form
+alone and mixed, FNCLEX then FSW masked to what both define, results popped with FSTP m64): 112/112 match at block sizes default
+and 1 (`tools/run_i6b.py corpus`), the 540 x87 results QEMU computes in 80 bits or with its host's libm compared within 2 ulps:
+500 equal, 40 one ulp apart; before the generator stepped around the departures above, 81 programs differed, each traced to one
+of them. `tools/run_i6b.py cases` (SDM rules, natemu only): 129 as expected at both block sizes: C2 at 2^63, -2^63, 2^64, 1e300
+and in range at 2^63 - 1024 for the four trigonometric forms, infinities, zeros, SNaNs; FPREM/FPREM1 quotient bits (7/2, -7/2,
+29/3, 2^62 + 2048 by 3), partial remainders against exact rational arithmetic (2^100/3, 1e300/7.25, a denormal divisor) and
+glibc's fmod loop to the complete remainder and bits; IE/ZE/OE/UE/PE cases; underflow (empty ST(0), empty ST(1)) and overflow
+for every form with the masked responses; FPTAN's 1.0, FSINCOS's push order; #NM under CR0.TS; PCMPISTRI/PCMPESTRM/VPCMPISTRM/
+VPCMPESTRI #PF not present and crossing (CR2 the second page), #GP/#SS non-canonical and straddling, ECX/XMM0/RFLAGS unwritten
+at the fault, a misaligned operand running; 64-bit lengths with REX.W and VEX.W (and 32-bit without) against a third, Python SDM
+model. `verify_precision.py` (new rule: each `svc #5/#6` right after its `movz w0` in its instruction) clean on the corpus
+bodies (112 compiled, 10,531 sites) and on its own corpora; `test_slice1.py` 32 (the helper forms in `ALLOWED`; `svc #5/#6`
+each after `mov w0`); FEX ASM suite 1,605 -> 1,703 pass, 0 fail, 22 -> 45 precision deviations (every H0F3A/VEX PCMPxSTRx test
+and FEX_bugs/pcmpestri_garbage_rcx pass; new deviations: D9_F2 D9_F3 D9_F5 D9_F8 D9_FB D9_FE D9_FF and the 16 FEX
+precision_test_* of these forms, bounded in `run_asm.py` (`HELPER_PRECISION`, `HELPER_REMAINDERS`): 2 ulps for the transcendental ones, 3 for FPTAN,
+and for the remainders (FPREM and FPREM1 tests and D9_F5) exactly the remainder of the operands as FLD m80 rounded them to doubles
+under one of the four rounding controls, computed from each test's operands; `X87/D9_F9`, FYL2XP1 of 2.0 outside the SDM's
+range, expects 8.0 for 15 log2(3), a test FEX disables: listed as FEX's expectation). Census (`natemu-raw/kernel-census-i6b-20261030-01`):
+initramfs SSE 7,236 -> 6,835 (PCMPISTRI 401 -> 0), x87 59 -> 3 (the 56 helper sites -> 0; FFREEP 3 left), kernel unchanged.
+Standing suite on series31 (with K1's in-progress tree; `natemu-raw/suite-20261030-050513`, retries in `suite-i6b-retry`):
+cargo build/test (49 + 75), stack audit (gate 18,944 bytes, 23,024 nested, of 32,768; libm adds no indirect branch), python
+unit 281, fix/fix-1 64, seed/seed-1 44, flow 64 x 2, probes 83, FEX ASM as above, corpora (N = 2..4, after one retry), smp,
+limits, kicks, system, coherence, sharedpt, litmus, contain, privilege, delivery, events, i6 faults 275 x 2 (the FSIN refusal
+case removed), `run_m3.py`, `run_l1.py` 41/41, `run_l2.py`, `run_l2_iasl.py`, `run_k2.py`, `run_x3.py`, `run_m1.py` 20, `run_l3.py`,
+`run_l4a.py`, `run_i5b.py` 411, I8 corpora 136/136 x 2 and 329/336 x 2 (the 7 recorded QEMU two-NaN departures), i8 faults
+851 at block size 1, i6b corpus and cases as above: 0 failures. Every other failure was `hv_vm_create: 0xfae94007` (VM
+contention with another agent's runs), on different cases in the first run and the retry: slice-1 faults 7,824 + 5 + 4 and
+7,825 + 5 + 3 (faults-1 7,828 + 5 on retry), loopfaults default 844 of 846 on retry (block sizes 1 and 2 846), i8 faults 850
+of 851 on retry. `run_l4b.py`: `l4b-s5-x2`'s QEMU reference run did not power off (exit 0, 16-byte dump) in both runs, a
+QEMU-side check that involves none of these forms; every other L4b group passed.
+**Kernel** (Debian 6.12, 2 GiB, `console=ttyS0 earlyprintk=serial mitigations=off nokaslr --initrd` Debian's initrd, series31,
+with K1's in-progress tree): past `pcmpistri` in `/sbin/modprobe -q -- crypto-hmac(sha256)` and on to "Run /init as init
+process"; 279 console lines (last: "x86/mm: Checked W+X mappings: passed, no W+X pages found.", "Run /init as init process"),
+163 s host time, 256,532 compiles; stops `nocode` `unsupported_form` at CPL 3 on a MOVBE in glibc's `memcmp` (`movbe rax,
+qword ptr [rdi]`, `48 0f 38 f0 07`, then `movbe rcx, [rsi]; sub rax, rcx`; the linear address varies from run to run with the
+library's placement, read through the guest's page tables from a RAM dump), in `/bin/udevadm trigger --action=add` (stack
+strings) under the initramfs's `/init`. MOVBE is outside I6b (68 initramfs sites, filed under SSE as another feature).
+**Not built:** FFREEP (the undocumented alias, 3 sites), FBLD/FBSTP, unmasked x87 exceptions (#MF), x87 results rounded by
+FCW.RC/PC, MOVBE, AES/SHA/PCLMULQDQ/ADX, MMX.
+
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 
 **Owner decision (October 29, amendment after L3):** unassigned memory pages (including the legacy hole 0xA0000–0x100000) are mapped read-only and non-executable onto one shared all-ones page, so every read form (compare, checksum, string, SSE) runs natively and exactly; reads are counted per page on first touch (shadow fill), writes stay counted per access and complete as ignored for MOV forms (other write forms keep their typed refusals); fetch stays a typed stop; the strict switch still turns all of it into stops. Context: Linux's `reserve_ibft_region`, `probe_roms`, DMI and `smp_scan_config` scan 0x80000–0xFFFFF with CMP/checksum/string loops. Pages a device claims stay unshadowed (M3); the LAPIC's possible page is always a device page.

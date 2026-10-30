@@ -41,6 +41,14 @@ pub mod svc {
     /// remainder, x2 = 1 for #DE (else 0) out. Nothing else changes.
     pub const DIV_U: u16 = 3;
     pub const DIV_S: u16 = 4;
+    /// I6b: an x87 transcendental, remainder, scale or extract instruction ([`crate::x87::helper`]), run whole on the x87
+    /// state in the guest-state page: w0 = the instruction's second byte (D9 F0..FF: F2XM1 FYL2X FPTAN FPATAN FXTRACT
+    /// FPREM1 FPREM FYL2XP1 FSINCOS FSCALE FSIN FCOS). No register changes; only the page's x87 fields.
+    pub const X87: u16 = 5;
+    /// I6b (I5c's PCMPxSTRx): FEX's VPCMPISTRX/VPCMPESTRX intermediate ([`crate::strings::pcmpstr`]): v0 = xmm1, v1 =
+    /// xmm2/m128, w0 = imm8 | REX.W/VEX.W << 8 | explicit << 9, x1 = RAX and x2 = RDX (explicit forms); w0 out = IntRes2
+    /// (bits 15:0) | flags (bits 31:28: SF ZF CF OF as NZCV). Nothing else changes.
+    pub const STRING: u16 = 6;
 }
 /// The 128/64 division of [`svc::DIV_U`] / [`svc::DIV_S`] (FEX's LUDIV/LDIV helpers): the dividend `high:low`
 /// by `divisor`, as (quotient, remainder), or `None` for #DE (a zero divisor, or a quotient that does not fit 64
