@@ -186,14 +186,7 @@ pub(super) fn park(s: &mut State) {
     let posts = word(s, core::mem::offset_of!(Events, posts));
     let mut parked = false;
     loop {
-        // Doorbells that woke it count as one stop taken at a resident entry (the others merged into it): the host's
-        // kickers wait for one, so it is made visible at once.
-        let n = acknowledge();
-        if n > 0 {
-            taken(s);
-            (s.stops_resident, s.merged) = (s.stops_resident + 1, s.merged + n - 1);
-            unsafe { write_record(record(), *s) };
-        }
+        doorbells(s);
         take_invalidations(s);
         // X3: the posts seen are counted before the look, so a post after it shows as unseen (senders count after the bit).
         let seen = posts.load(SeqCst);
@@ -220,6 +213,80 @@ pub(super) fn park(s: &mut State) {
     }
     halted.store(0, SeqCst);
 }
+/// Doorbells that woke a waiting vCPU count as one stop taken at a resident entry (the others merged into it): the host's
+/// kickers wait for one, so it is made visible at once.
+fn doorbells(s: &mut State) {
+    let n = acknowledge();
+    if n > 0 {
+        taken(s);
+        (s.stops_resident, s.merged) = (s.stops_resident + 1, s.merged + n - 1);
+        unsafe { write_record(record(), *s) };
+    }
+}
+
+/// X4: an AP in the firmware's waiting state (`State::mailbox`), before it ever runs: the responder of the ACPI
+/// multiprocessor wakeup mailbox, version 0 (ACPI 6.5 5.2.12.19). The OS writes the APIC ID and the wakeup vector, then
+/// the command (Linux: a release store, `acpi_wakeup_cpu`). The AP whose APIC ID (= its vCPU number, L2) matches a
+/// Wakeup command caches the vector, then clears the command to Noop as its acknowledgement and starts at the vector in
+/// its bank's state, the firmware's (long mode, paging with the vector's page identity mapped, flat selectors, IF = 0:
+/// the host's); any other ID or command is ignored, and the mailbox is never looked at again (one wakeup per AP).
+///
+/// **The wait** is the code cache's own write watch: the AP marks the mailbox page as holding its translations
+/// ([`super::mark`]: no vCPU keeps a writable shadow of it once that returns), so any later guest store to the page
+/// faults in its writer's resident, which posts the page to the AP and rings its doorbell (`cache::written`) before the
+/// store completes; the AP sleeps in `wfi` (no host exit with the in-kernel GIC) and, on each doorbell, drains, marks
+/// the page again and reads the mailbox. A store made before a mark is seen by the read after it, one made after rings
+/// the AP: no wake-up is lost and nothing polls. (Measured alternative: `ldaxr` + `wfe`, the exclusive monitor's wake,
+/// does not sleep under HVF: `wfe` returned about every 0.8 us.) While waiting the vCPU is idle for the watchdog and the
+/// host's end rule (`Events::halted` state 1, every post seen: no post wakes it, the APIC's events stay pending for
+/// after the wakeup); the host's end request is read before the mailbox, so a command written before the decision to
+/// end (by a vCPU that then halted) is still served.
+pub(super) fn wait_mailbox(s: &mut State) {
+    let gpa = s.mailbox;
+    let Some(p) = guest_ram().range(gpa, 16).filter(|_| gpa % 4096 == 0) else { halt(s, stop::UNSUPPORTED_MODE) };
+    let (halted, posts, end) = (word(s, core::mem::offset_of!(Events, halted)), word(s, core::mem::offset_of!(Events, posts)),
+        word(s, core::mem::offset_of!(Events, end)));
+    loop {
+        doorbells(s);
+        take_invalidations(s);
+        halted.store(1 | posts.load(SeqCst) << natemu_abi::execution::cache::HALTED_SEEN_SHIFT, SeqCst);
+        let ending = end.load(SeqCst) != 0;
+        // The re-mark's cost (the review's item): it may spin until a writer that holds a writable shadow of the page
+        // resets its shadows (a writer in the host answers only when it next enters the VM), and each such writer
+        // drops all its shadows (`State::shootdowns` counts the writers asked).
+        let t0 = ticks();
+        super::mark(s, gpa);
+        s.mailbox_mark_ticks += ticks() - t0;
+        // SAFETY: aligned loads of guest RAM through the resident's alias; the vector after the command (acquire).
+        let head = unsafe { AtomicU64::from_ptr(p.cast()) }.load(SeqCst);
+        if head & 0xffff == mailbox::WAKEUP && head >> 32 == s.vcpu {
+            // ORDER (an invariant held by this code, checked by inspection; no test can see it, since the OS may write
+            // the vector again only after the acknowledgement, and `run_x4.py`'s probe of that window rarely lands in
+            // it): the vector is read here, before the acknowledgement's store below (ACPI 6.5 5.2.12.19: the firmware
+            // "must cache the content in the mailbox which might be used later before clear the command").
+            s.cpu.rip = unsafe { core::ptr::read_volatile(p.add(mailbox::VECTOR as usize).cast::<u64>()) };
+            (s.mailbox, s.mailbox_acked) = (0, ticks());
+            halted.store(0, SeqCst); // running before the OS can see the acknowledgement (the host's end rule)
+            // The acknowledgement, a store through the alias with the code-write protocol (peers' marks: other waiting APs).
+            if cache::translated(gpa) {
+                match cache::written(gpa) {
+                    Some(n) => (s.invalidations, s.unlinks) = (s.invalidations + 1, s.unlinks + n),
+                    None => halt(s, stop::BAD_LINK),
+                }
+            }
+            unsafe { core::sync::atomic::AtomicU16::from_ptr(p.cast()) }.store(0, SeqCst);
+            cache::rechecked(gpa);
+            return;
+        }
+        if ending {
+            halt(s, stop::HALTED)
+        }
+        s.mailbox_wakes += 1;
+        // SAFETY: waits for an interrupt (masked at EL1: it only wakes the PE); no memory effect.
+        unsafe { asm!("dsb sy", "wfi") };
+    }
+}
+
 /// Acknowledges and ends every pending doorbell (ICC_IAR1_EL1 until it reads a spurious INTID, ICC_EOIR1_EL1 each);
 /// how many there were.
 fn acknowledge() -> u64 {

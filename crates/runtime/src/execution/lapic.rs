@@ -20,8 +20,8 @@
 //!
 //! **IPIs** (11.6): an ICR write sends at once (delivery status always idle): fixed and lowest-priority set the target's
 //! IRR bit, NMI its NMI bit, by atomic OR, then ring it (an SGI to a peer; this vCPU looks at its own events at its next
-//! boundary). INIT and start-up are X4's (`ap_start`: a typed stop), SMI and the reserved modes stop
-//! `unsupported_system` before any effect.
+//! boundary). INIT and start-up stop `unsupported_system` (`ap_start`: real mode does not exist; X4 starts APs through the ACPI
+//! mailbox), as do SMI and the reserved modes, before any effect.
 //!
 //! **Timer** (11.5.4): counts the crystal clock (`clock::CRYSTAL_HZ`) through the divider from V = CNTVCT, exactly
 //! (`clock`); the next expiry's V is programmed into the Arm virtual timer (CNTV, PPI 27 through the in-kernel GIC), whose
@@ -37,7 +37,8 @@
 //! LINT1 in NMI mode is published (`lapic::LINT1_NMI`): the host's NMI input posts the NMI to the APICs taking it.
 //!
 //! **Not built:** LINT0/LINT1 in fixed mode (no board source drives them so), thermal
-//! and performance-counter sources (none in the profile), INIT/start-up (X4), TSC-deadline (not advertised).
+//! and performance-counter sources (none in the profile), INIT/start-up (real mode; X4 uses the mailbox), TSC-deadline
+//! (not advertised).
 use super::*;
 use super::segments::Exception;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
@@ -608,7 +609,10 @@ fn send(s: &mut State, icr: u64, x2apic: bool) {
         _ => halt(s, stop::UNSUPPORTED_SYSTEM),
     }
 }
-/// INIT and start-up IPIs (X4's AP start): a typed stop at the sending instruction, nothing sent.
+/// INIT and start-up IPIs: a typed stop at the sending instruction, nothing sent. X4 decided to keep it: APs start
+/// through the ACPI wakeup mailbox ([`super::events::wait_mailbox`]), which Linux prefers whenever the MADT has one
+/// (`do_boot_cpu`); INIT-SIPI-SIPI would start the target in real mode at vector << 12 (SDM Vol.3 9.4.4), and no 16- or
+/// 32-bit execution exists, so it is deferred with them (an INIT alone, the wait-for-SIPI state, is deferred with it).
 fn ap_start(s: &State) -> ! {
     halt(s, stop::UNSUPPORTED_SYSTEM)
 }

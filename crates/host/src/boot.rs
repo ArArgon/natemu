@@ -271,6 +271,8 @@ pub(crate) const PAGE_TABLES: u64 = 0x10_0000;
 /// ACPI NVS for the RSDP, the table graph, FACS and the AP mailbox (L2), and the boot-service scratch (X4).
 pub(crate) const ACPI_NVS: (u64, u64) = (0x60_0000, 0x80_0000);
 pub(crate) const SCRATCH_NVS: (u64, u64) = (0x80_0000, 0x100_0000);
+/// X4: the APs' GDT in the NVS boot scratch.
+pub(crate) const AP_GDT: u64 = SCRATCH_NVS.0;
 impl Layout {
     /// The default boot map: L = 2 GiB, H = 0 (M69).
     pub(crate) const DEFAULT: Layout = Layout { low_end: 2 * GIB, high: 0 };
@@ -327,6 +329,8 @@ pub(crate) struct Loaded {
     pub(crate) initrd: Option<(u64, u64)>,
     pub(crate) map: Vec<E820>,
     pub(crate) cpu: Cpu,
+    /// X4: an AP's state when the ACPI mailbox wakes it (the firmware's wake state, RIP = the wakeup vector then).
+    pub(crate) ap: Cpu,
     /// Every guest-physical range the loader wrote, in order (gpa, bytes).
     pub(crate) writes: Vec<(u64, u64)>,
 }
@@ -343,6 +347,13 @@ const LARGE: u64 = 1 << 7;
 fn place(ram: &GuestRam, writes: &mut Vec<(u64, u64)>, gpa: u64, bytes: &[u8]) -> Result<(), LoadError> {
     writes.push((gpa, bytes.len() as u64));
     ram.copy_in(gpa, bytes).then_some(()).ok_or(LoadError::RamNotBacked { gpa, bytes: bytes.len() as u64 })
+}
+
+/// X4: the firmware's mailbox wake state on top of `base` (which supplies paging, CR3, the GDT and flat selectors): CPL 0,
+/// IF = 0 (RFLAGS 2), EFER.LME/LMA and the firmware's NXE (see `load`), no IDT, general registers 0, RIP 0 (the
+/// resident sets the vector). The loader's `Loaded::ap` and the test driver's `mailbox` sections both use it.
+pub(crate) fn ap_wake(base: Cpu) -> Cpu {
+    Cpu { gpr: [0; 16], rip: 0, rflags: 2, cpl: 0, efer: exec::EFER_LME | exec::EFER_LMA | exec::EFER_NXE, idtr: Table { base: 0, limit: 0 }, ..base }
 }
 
 /// M1: `ram` is one range from 0; high RAM (`Layout::high`) needs a multi-range RAM description here (`GuestRam::and`)
@@ -429,6 +440,8 @@ pub(crate) fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<L
     cmd.push(0);
     place(ram, &mut w, CMDLINE, &cmd)?;
     place(ram, &mut w, GDT, &GDT_ENTRIES.iter().flat_map(|e| e.to_le_bytes()).collect::<Vec<u8>>())?;
+    // X4: the APs' GDT, a copy in the NVS boot scratch (the loader's lies in conventional RAM, which Linux reuses).
+    place(ram, &mut w, AP_GDT, &GDT_ENTRIES.iter().flat_map(|e| e.to_le_bytes()).collect::<Vec<u8>>())?;
     // Identity map of [0, L) with 2 MiB pages (it covers the window, boot_params, the command line, the GDT, the initrd
     // and the NVS ranges): PML4 -> PDPT -> one PD per GiB, supervisor read/write/execute, write-back.
     let (pml4, pdpt) = (PAGE_TABLES, PAGE_TABLES + PAGE);
@@ -478,7 +491,15 @@ pub(crate) fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<L
         fcw: exec::FCW_INIT,
         xcr0: natemu_abi::cpu_profile::XCR0_RESET,
     };
-    Ok(Loaded { setup: s, kernel, window, zero_page: ZERO_PAGE, cmdline: CMDLINE, initrd, map, cpu, writes: w })
+    // X4: an AP woken by the mailbox (ACPI 6.5 Table 5.44, Intel processors): long mode, paging with the vector's page
+    // identity mapped (the loader's map of [0, L), reserved memory: it covers both places a vector may lie, the mailbox's
+    // OS area in the ACPI NVS and memory below 1 MiB), IF = 0, every selector flat (CS 64-bit code, the others flat data,
+    // from the GDT in the NVS scratch), no IDT (limit 0); the general registers 0. Where the table leaves the state open,
+    // the firmware's choice: EFER.NXE set (the profile has NX; UEFI firmware enables it, and under TDX, the mailbox's
+    // origin, EFER.NXE is fixed at 1), which an OS may rely on before it writes EFER: Linux's 64-bit trampoline loads page
+    // tables whose data pages are XD (reserved with NXE = 0) and pushes onto them.
+    let ap = ap_wake(Cpu { seg: [data, code, data, data, data, data], gdtr: Table { base: AP_GDT, limit: (8 * GDT_ENTRIES.len() - 1) as u64 }, ..cpu });
+    Ok(Loaded { setup: s, kernel, window, zero_page: ZERO_PAGE, cmdline: CMDLINE, initrd, map, cpu, ap, writes: w })
 }
 
 #[cfg(test)]
@@ -676,5 +697,12 @@ mod tests {
         assert_eq!((cpu.seg[exec::SREG_CS].selector, cpu.seg[exec::SREG_DS].selector, cpu.seg[exec::SREG_SS].selector), (0x10, 0x18, 0x18));
         assert_eq!(cpu.seg[exec::SREG_CS].attributes & (exec::ATTR_L | exec::ATTR_D), exec::ATTR_L);
         assert!(cpu.control().is_some(), "a mode the resident runs");
+        // X4: the AP wake state (ACPI 6.5 Table 5.44): long mode, paging through the identity map, IF = 0, flat selectors
+        // from the GDT in the NVS scratch (written there), NXE; no IDT.
+        let ap = l.ap;
+        assert_eq!((ap.cr3, ap.cr0, ap.efer, ap.rflags, ap.gdtr.base, ap.idtr.limit), (PAGE_TABLES, cpu.cr0, 0xd00, 2, AP_GDT, 0));
+        assert_eq!(ap.seg.map(|s| s.selector), [0x18, 0x10, 0x18, 0x18, 0x18, 0x18]);
+        assert_eq!(r.read::<u64>(AP_GDT + 16), Some(GDT_ENTRIES[2]));
+        assert!(ap.control().is_some());
     }
 }

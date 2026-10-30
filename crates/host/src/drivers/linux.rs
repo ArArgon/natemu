@@ -12,8 +12,14 @@
 //! sent; every other port and every device-range page is unassigned (all-ones reads, ignored writes, counted; with
 //! `--strict-unassigned` a typed stop). The result gains `ports` and `unassigned_pages` (counts) and `serial_bytes`.
 //!
-//! The ACPI tables ([`boot::acpi`]) describe `--vcpus` processors (default 1; more only with `--load-only` until AP
-//! start, X4) and start with the RSDP at `--rsdp` (default the ACPI NVS range's start).
+//! The ACPI tables ([`boot::acpi`]) describe `--vcpus` processors (default 1, at most `cache::MAX_VCPUS`) and start with
+//! the RSDP at `--rsdp` (default the ACPI NVS range's start). X4: the VM has that many vCPUs; vCPU 0 is the BSP, each
+//! other one starts as an AP in the firmware's waiting state on the tables' wakeup mailbox (`State::mailbox`), with
+//! the loader's AP wake state (`Loaded::ap`) and a reset local APIC. The run ends when any vCPU's run ends (the BSP's
+//! `--stop-at`, a stop, its watchdog): the others are cancelled. The result's `stop`, `state` and `stats` are the BSP's;
+//! `ended_first` names the vCPU whose end ended the run and its stop; `vcpus` lists every vCPU's stop, RIP, blocks,
+//! compiles, shootdowns asked and mailbox record ([GPA still waited on, sleeps, the guest TSC at its acknowledgement, us
+//! spent marking the page]).
 //! The map's low RAM ends at `--ram` (default: the boot map's 2 GiB), which is also the VM's guest RAM (M1).
 //! `--code-cache BYTES` sets the code cache (default: the largest, `CODE_BYTES_MAX` less its head). `--load-only` loads into host memory and runs nothing (no VM: RUNTIME and FEXC are not opened).
 //! `--dump FILE` writes what the loader wrote into guest RAM (before any run) as records `[u64 gpa][u64 length][bytes]`,
@@ -77,8 +83,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
     let image = memory::read_input(image, MAX_INPUT)?;
     let initrd = initrd.map(|p| memory::read_input(&p, MAX_INPUT)).transpose()?;
-    if !(1..=exec::cache::MAX_VCPUS).contains(&vcpus) || vcpus > 1 && !load_only {
-        return Err(format!("--vcpus {vcpus}: 1..={} with --load-only, 1 for a run (AP start is X4)", exec::cache::MAX_VCPUS));
+    if !(1..=exec::cache::MAX_VCPUS).contains(&vcpus) {
+        return Err(format!("--vcpus {vcpus}: 1..={}", exec::cache::MAX_VCPUS));
     }
     let tables = boot::acpi::build(vcpus, rsdp);
     let inputs = Inputs { image: &image, cmdline: &cmdline, initrd: initrd.as_deref(), acpi: Some(&tables) };
@@ -99,16 +105,23 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let backing = execution::prepare(resident, code_bytes, 1, layout.low_end as usize)?;
-    require_vcpus(1)?;
+    let backing = execution::prepare(resident, code_bytes, vcpus, layout.low_end as usize)?;
+    require_vcpus(vcpus)?;
     let guest = backing.ram;
     let loaded = boot::load(&guest, &layout, &inputs).map_err(|e| e.to_string())?;
     if let Some(path) = &dump {
         write_dump(path, &guest, &loaded)?;
     }
     execution::guest_ram_written(&backing.memory);
-    execution::set_cpu(backing.vcpu(0), loaded.cpu);
-    execution::set_lapic(backing.vcpu(0), natemu_abi::lapic::Lapic { reinject: u64::from(lost.lapic), ..natemu_abi::lapic::RESET });
+    for v in 0..vcpus {
+        execution::set_cpu(backing.vcpu(v), if v == 0 { loaded.cpu } else { loaded.ap });
+        execution::set_lapic(backing.vcpu(v), natemu_abi::lapic::Lapic { reinject: u64::from(lost.lapic), ..natemu_abi::lapic::RESET });
+        if v > 0 {
+            let mut state: State = backing.vcpu(v).read_record(exec::STATE_OFFSET);
+            state.mailbox = tables.mailbox;
+            backing.vcpu(v).write_record(exec::STATE_OFFSET, state);
+        }
+    }
 
     // L3: COM1 and the unassigned rule.
     let uart = std::sync::Arc::new(std::sync::Mutex::new(crate::uart::Uart::new()));
@@ -118,7 +131,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let mut devices = crate::devices::Devices::new(layout.low_end);
     devices.register_ports(boot::acpi::platform::COM1_PORT.into(), 8, uart.clone())?;
     // L4a: the I/O APIC, the 8259 pair and their wires.
-    let irqs = crate::irq::install(&mut devices, &backing.memory, 1, &uart)?;
+    let irqs = crate::irq::install(&mut devices, &backing.memory, vcpus, &uart)?;
     // L4b: the PIT and port 61H, the RTC, the ACPI PM block and reset register.
     let board = crate::clock::install(&mut devices, &irqs, lost)?;
     devices.strict = strict;
@@ -133,11 +146,18 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         machine.route(v)?;
         Ok(cpu)
     };
+    let ended_first = std::sync::atomic::AtomicUsize::new(usize::MAX);
     let body = |v: usize, cpu: &Vcpu, cancelled: &std::sync::atomic::AtomicBool| -> Result<(Stop, u64)> {
         let mut compiler = Compiler::new(Path::new(fexc), cpu, max_block)?;
         let mut requests = execution::Requests { doorbell: Some(machine.doorbell()), devices: Some(devices.clone()), ..Default::default() };
+        let stop_at = if v == 0 { stop_at } else { None };
         let stop = execution::run(cpu, backing.vcpu(v), &mut compiler, stop_at, watchdog, &mut requests, &stops, cancelled);
         stops.end(v);
+        // X4: one vCPU's end ends the machine's run; the first to end (not cancelled) is reported as the run's cause.
+        if !matches!(stop, Ok(Stop::Cancelled)) {
+            let _ = ended_first.compare_exchange(usize::MAX, v, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst);
+        }
+        owners::cancel_owners(cancelled);
         Ok((stop?, compiler.compiles))
     };
     let started = std::time::Instant::now();
@@ -161,7 +181,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 }
             });
         }
-        let s = owners::supervise(1, &prepare, &body);
+        let s = owners::supervise(vcpus, &prepare, &body);
         tracing.store(false, std::sync::atomic::Ordering::SeqCst);
         Ok(s)
     })?;
@@ -171,7 +191,28 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     if let Some(e) = supervision.error {
         return Err(e);
     }
-    let (stop, compiles) = supervision.outputs.into_iter().next().flatten().ok_or("vCPU without a result")?;
+    let mut outputs = supervision.outputs.into_iter();
+    let (stop, compiles) = outputs.next().flatten().ok_or("vCPU without a result")?;
+    let mut each = vec![(stop_name(&stop), compiles)];
+    each.extend(outputs.map(|o| o.map_or(("none".into(), 0), |(s, c)| (stop_name(&s), c))));
+    let vcpu_json: Vec<String> = each
+        .iter()
+        .enumerate()
+        .map(|(v, (stop, compiles))| {
+            let s: State = backing.vcpu(v).read_record(exec::STATE_OFFSET);
+            let acked = if s.mailbox_acked == 0 { 0 } else { execution::ticks_ns(s.mailbox_acked) - execution::ticks_ns(backing.vcpu(v).epoch) };
+            format!(
+                "{{\"stop\":\"{}\",\"rip\":{},\"blocks\":{},\"compiles\":{compiles},\"halts\":{},\"interrupts\":{},\"mailbox\":[{},{},{acked},{}],\"shootdowns\":{},\"fault\":\"{:x?}\",\"state\":{}}}",
+                stop.replace('"', "'"), hex(s.cpu.rip), s.blocks, s.halts, s.interrupts, hex(s.mailbox), s.mailbox_wakes,
+                execution::ticks_ns(s.mailbox_mark_ticks) / 1000, s.shootdowns, s.fault, cpu_json(&s.cpu)
+            )
+        })
+        .collect();
+    let first = ended_first.load(std::sync::atomic::Ordering::SeqCst);
+    let first_json = match each.get(first) {
+        Some((stop, _)) => format!("{{\"vcpu\":{first},\"stop\":\"{}\"}}", stop.replace('"', "'")),
+        None => "null".into(),
+    };
     for (gpa, length, path) in &saves {
         let mut bytes = vec![0u8; *length as usize];
         if !guest.copy_out(*gpa, &mut bytes) {
@@ -199,7 +240,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         other => (format!("{other:?}").split(['(', ' ', '{']).next().unwrap().to_lowercase(), format!("{other:?}")),
     };
     println!(
-        "{},\"stop\":\"{kind}\",\"reason\":\"{}\",\"state\":{},\"stats\":{{\"blocks\":{},\"compiles\":{compiles},\"systems\":{},\"flushes\":{},\"interrupts\":{},\"evictions\":{},\"retries\":{},\"shadow_resets\":{},\"cache\":{{\"code_used\":{},\"code_bytes\":{},\"meta_used\":{},\"blocks\":{}}},\"seconds\":{:.3},\"requests\":{},\"invalidations\":{},\"steps\":{},\"links\":{},\"unlinks\":{},\"k1\":{}}},{},\"serial_bytes\":{},\"ticks\":{{\"pit\":{},\"rtc\":{},\"lapic\":{{\"fired\":{},\"missed\":{},\"reinjected\":{}}}}}}}",
+        "{},\"stop\":\"{kind}\",\"reason\":\"{}\",\"state\":{},\"stats\":{{\"blocks\":{},\"compiles\":{compiles},\"systems\":{},\"flushes\":{},\"interrupts\":{},\"evictions\":{},\"retries\":{},\"shadow_resets\":{},\"cache\":{{\"code_used\":{},\"code_bytes\":{},\"meta_used\":{},\"blocks\":{}}},\"seconds\":{:.3},\"requests\":{},\"invalidations\":{},\"steps\":{},\"links\":{},\"unlinks\":{},\"k1\":{}}},{},\"serial_bytes\":{},\"ticks\":{{\"pit\":{},\"rtc\":{},\"lapic\":{{\"fired\":{},\"missed\":{},\"reinjected\":{}}}}},\"ended_first\":{},\"vcpus\":[{}]}}",
         placement(&loaded, &layout),
         reason.replace('"', "'"),
         cpu_json(&s.cpu),
@@ -227,9 +268,19 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         board.rtc.json(),
         lapic_end.fired,
         lapic_end.missed,
-        lapic_end.reinjected
+        lapic_end.reinjected,
+        first_json,
+        vcpu_json.join(",")
     );
     Ok(())
+}
+
+/// A stop as the result names it: its kind, and for a resident stop its reason.
+fn stop_name(stop: &Stop) -> String {
+    match stop {
+        Stop::Resident { stop, status, detail } => format!("resident {} status={status} detail={detail}", exec::stop::name(*stop)),
+        other => format!("{other:?}").chars().take(200).collect(),
+    }
 }
 
 /// The loader's writes, read back from guest RAM.

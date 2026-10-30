@@ -109,6 +109,10 @@ pub unsafe fn start() -> ! {
              "mov {t}, #1", "msr S3_0_C12_C12_7, {t}", "isb",                                // ICC_IGRPEN1_EL1
              t = out(reg) _);
     }
+    // X4: an AP waits for the ACPI mailbox before it first runs.
+    if s.mailbox != 0 {
+        events::wait_mailbox(&mut s);
+    }
     unsafe { dispatch(s) }
 }
 

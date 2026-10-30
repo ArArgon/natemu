@@ -1365,6 +1365,25 @@ pub struct State {
     pub nmis: u64,
     pub halts: u64,
     pub shadow_steps: u64,
+    /// X4: the guest-physical address of the ACPI multiprocessor wakeup mailbox (ACPI 6.5 5.2.12.19, [`mailbox`]) this
+    /// vCPU waits on before it runs (an AP in the firmware's waiting state, its bank the firmware's wake state), else 0.
+    /// The resident clears it when the mailbox wakes the vCPU.
+    pub mailbox: u64,
+    /// X4: the times the waiting vCPU slept (`wfi`) before its wakeup command (stores to the mailbox page that land before
+    /// it marks the page again coalesce into one doorbell), the CNTVCT of its acknowledgement, and the CNTVCT ticks it
+    /// spent marking the page (waiting for writers to drop their writable shadows of it).
+    pub mailbox_wakes: u64,
+    pub mailbox_acked: u64,
+    pub mailbox_mark_ticks: u64,
+}
+/// X4: the ACPI multiprocessor wakeup mailbox, version 0 (ACPI 6.5 Table 5.44; the 6.6 snapshot's Table 5.46, whose
+/// Test command and reset vector belong to version 1): little endian, `command` (u16) at 0, reserved (u16) at 2,
+/// `apic_id` (u32) at 4, `wakeup_vector` (u64) at 8, then 2032 bytes for the OS and 2048 for the firmware.
+pub mod mailbox {
+    /// Command 1, Wakeup: the AP whose APIC ID matches jumps to the wakeup vector. 0 is Noop (and the acknowledgement);
+    /// every other value is reserved in version 0 (ignored, not acknowledged).
+    pub const WAKEUP: u64 = 1;
+    pub const VECTOR: u64 = 8;
 }
 impl State {
     pub const fn new(vcpu: u64, cpu: Cpu) -> Self {
@@ -1426,6 +1445,10 @@ impl State {
             nmis: 0,
             halts: 0,
             shadow_steps: 0,
+            mailbox: 0,
+            mailbox_wakes: 0,
+            mailbox_acked: 0,
+            mailbox_mark_ticks: 0,
         }
     }
 }

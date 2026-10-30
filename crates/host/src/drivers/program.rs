@@ -78,6 +78,11 @@
 //!   | switch ADDR 0|3 (repeatable: the one-byte instruction at ADDR, a `nop`, runs as a change of the CPL to the value,
 //!     the resident's general CPL change; no x86 instruction changes the CPL yet. Blocks end before it.)
 //!   | if 0|1 (RFLAGS.IF at the start, default 1; RFLAGS is the `rflags` value with bit 1 and this)
+//!   | mailbox GPA (X4: the vCPU starts as an AP waiting on the ACPI wakeup mailbox at guest-physical GPA, page-aligned;
+//!     its state is the firmware's wake state (`boot::ap_wake`: CPL 0, IF = 0, EFER.NXE, no IDT, GPRs 0) over the
+//!     section's paging and segments, RIP replaced by the mailbox's wakeup vector when a Wakeup command
+//!     for its APIC ID (its vCPU number) arrives; the report's `stats.mailbox` is [GPA still waited on (0: woken),
+//!     sleeps while waiting, the guest TSC at the acknowledgement or 0, us spent marking the page])
 //!   | svr VALUE (X3: the local APIC's spurious-interrupt vector register at the start, default its reset value 0xff,
 //!     software disabled; e.g. 0x1ff lets `post` items reach the core without guest APIC set-up)
 //!   | post ADDR VECTOR | nmi ADDR (X2 event sources, repeatable: the one-byte instruction at ADDR, a `nop`, makes the host
@@ -176,6 +181,8 @@ struct Section {
     interrupts: bool,
     /// X3: the local APIC's SVR at the start (`svr VALUE`, default the reset value 0xff: software disabled).
     svr: u64,
+    /// X4: the guest-physical ACPI mailbox the vCPU waits on before it runs (`mailbox GPA`), else 0.
+    mailbox: u64,
 }
 #[derive(Debug, PartialEq)]
 struct Description {
@@ -204,7 +211,7 @@ fn parse(text: &str) -> Result<Description> {
             _ => chunks.last_mut().unwrap().push(line),
         }
     }
-    let new = |space| Section { rip: 0, rflags: 0, gpr: [0; 16], cpl: 3, wp: true, smep: false, nxe: true, fs_base: 0, gs_base: 0, sse: false, fsgsbase: false, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, xcr0: 0, space, switches: vec![], posts: vec![], interrupts: true, svr: natemu_abi::lapic::SVR_RESET };
+    let new = |space| Section { rip: 0, rflags: 0, gpr: [0; 16], cpl: 3, wp: true, smep: false, nxe: true, fs_base: 0, gs_base: 0, sse: false, fsgsbase: false, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, xcr0: 0, space, switches: vec![], posts: vec![], interrupts: true, svr: natemu_abi::lapic::SVR_RESET, mailbox: 0 };
     let mut d = Description { spaces: vec![Space::default()], cpus: vec![], sections: chunks.len() > 1 };
     if d.sections {
         items(&chunks[0], &mut d.spaces[0], None)?;
@@ -266,6 +273,7 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
             ("nmi", [a]) => state(&mut cpu, line)?.posts.push((number(a)?, execution::NMI)),
             ("if", [v @ ("0" | "1")]) => state(&mut cpu, line)?.interrupts = *v == "1",
             ("svr", [v]) if number(v)? & !natemu_abi::lapic::SVR_WRITABLE == 0 => state(&mut cpu, line)?.svr = number(v)?,
+            ("mailbox", [g]) if number(g)? % 4096 == 0 && number(g)? != 0 => state(&mut cpu, line)?.mailbox = number(g)?,
             ("wp" | "smep" | "nxe" | "sse" | "fsgsbase", [v @ ("0" | "1")]) => {
                 let c = state(&mut cpu, line)?;
                 *match words[0] {
@@ -948,6 +956,14 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             },
         );
         execution::set_lapic(backing.vcpu(v), natemu_abi::lapic::Lapic { svr: c.svr, reinject: u64::from(lost.lapic), ..natemu_abi::lapic::RESET });
+        let mut state: State = backing.vcpu(v).read_record(exec::STATE_OFFSET);
+        state.mailbox = c.mailbox;
+        if c.mailbox != 0 {
+            // X4: the firmware's wake state (`boot::ap_wake`, as `boot-linux`'s APs), over the section's paging and segments.
+            state.cpu = crate::boot::ap_wake(state.cpu);
+            state.cpu.rip = c.rip;
+        }
+        backing.vcpu(v).write_record(exec::STATE_OFFSET, state);
     }
 
     let machine = Machine::create(&backing.memory)?;
@@ -1324,7 +1340,7 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"shadow_resets\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{},\"dispatch_exits\":{},\"interrupts\":{},\"nmis\":{},\"halts\":{},\"shadow_steps\":{},\"decode_exits\":{},\"decodes\":{{{}}},\"entropy_exits\":{},\"k1\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]{}}}",
+        "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"shadow_resets\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{},\"dispatch_exits\":{},\"interrupts\":{},\"nmis\":{},\"halts\":{},\"shadow_steps\":{},\"mailbox\":[{},{},{},{}],\"decode_exits\":{},\"decodes\":{{{}}},\"entropy_exits\":{},\"k1\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]{}}}",
         s.blocks,
         s.l2_hits,
         s.requests,
@@ -1355,6 +1371,11 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
         s.nmis,
         s.halts,
         s.shadow_steps,
+        s.mailbox,
+        s.mailbox_wakes,
+        // As the guest's TSC (ns since the VM's epoch, the MSR's offset), 0 if never acknowledged.
+        if s.mailbox_acked == 0 { 0 } else { execution::ticks_ns(s.mailbox_acked) - execution::ticks_ns(area.epoch) },
+        execution::ticks_ns(s.mailbox_mark_ticks) / 1000,
         ran.decodes.values().sum::<u64>(),
         decodes,
         ran.entropy,

@@ -1448,7 +1448,7 @@ loader); the reverse map; resizing the code-cache pools.
 (`Inputs::acpi`, replacing L1's `Inputs::rsdp`) refuses any blob outside the ACPI NVS range 0x600000..0x800000
 (`BAD_TABLES`), places every blob (so `Loaded::writes`, `--dump` and the smoke test's QEMU blobs carry them) and puts
 the RSDP's address in `acpi_rsdp_addr`. `boot-linux` always builds them: `--rsdp ADDR` is the graph's base (default
-0x600000), `--vcpus N` its processor count (1..4 with `--load-only`, 1 for a run until X4). **Sources:** ACPI 6.5
+0x600000), `--vcpus N` its processor count (1..4; a run has that many vCPUs since X4). **Sources:** ACPI 6.5
 layouts (the repo's snapshot is 6.6 chapter 5, the same offsets for every field written); contents from M69 (and M22-24)
 and, where M69 names no value, QEMU 11.1.2's own PC tables (`-machine pc` under SeaBIOS, read back with `iasl -d`;
 owner decision below). **Layout (N = 1):** RSDP 0x600000, XSDT 0x600040, FADT 0x600080, FACS 0x6001c0, DSDT 0x600200,
@@ -2454,6 +2454,100 @@ address-size forms (initramfs 1,435, + 6 `addr32 mulx`; refused since I1), VEX g
 refused instead of #UD: XOP VPROTD/VPROTQ (144, AMD), RTM XBEGIN/XABORT (9), VIA PadLock (4); CET RDSSP/INCSSP (41: on a CPU without
 CET they are NOPs in the hint space, glibc runs them only with shadow stacks enabled), PREFETCHW (kernel 17, not advertised;
 Haswell executes 0f 0d /1 as a NOP); unmasked x87/SIMD exceptions (#MF/#XM, I5c).
+
+*Built (X4, AP start through the ACPI multiprocessor wakeup mailbox; no fexc change, series32):*
+**Protocol** (ACPI 6.5 5.2.12.19, Table 5.44; version 0, L2's table at `Tables::mailbox`): vCPUs 1..N-1 start as APs in the
+firmware's waiting state (`State::mailbox` = the mailbox's guest-physical address; the resident's `events::wait_mailbox`
+runs before the first dispatch). The AP whose APIC ID (= its vCPU number) matches a Wakeup command (1) reads the vector
+after the command (acquire), records it, marks itself running, then clears the command to Noop as the acknowledgement (a
+store through the RAM alias with the code-write protocol) and starts at the vector; any other APIC ID, Noop or a
+reserved command (2..FFFFH: version 0 has no Test command) is ignored and not acknowledged; an AP takes one wakeup and
+never looks at the mailbox again. **Wake state** (`boot::Loaded::ap`, the firmware's): long mode with paging through the
+loader's identity map of [0, L) (reserved memory; it covers both places a vector may lie: below 1 MiB and the mailbox's
+OS area), IF = 0, every selector flat (CS 0x10 64-bit, the others 0x18) from a GDT copy in the NVS boot scratch
+(`boot::AP_GDT` = 0x800000; the loader's GDT lies in conventional RAM, which Linux reuses), no IDT (limit 0), general
+registers 0, RIP = the vector, a reset local APIC (`boot::ap_wake` applies the wake rules; the test driver's `mailbox`
+sections use the same function over their own paging and segments). **EFER.NXE = 1** is the firmware's choice where the table is silent
+(UEFI firmware enables NX; under TDX, the mailbox's origin, NXE is fixed at 1): found necessary, as Linux's
+`trampoline_start64` loads `trampoline_pgd`, whose data pages are XD, and pushes onto its stack before
+`secondary_startup_64` writes EFER; with NXE = 0 bit 63 is reserved and the push took #PF, then a shutdown (the first
+2-vCPU boot: AP stopped `shutdown` at 0x9a17e, `push 0x10` after `mov cr3`). **The wait (decision):** the code cache's
+own write watch. The waiting AP marks the mailbox page as holding its translations (`execution::mark`: once it returns
+no vCPU holds a writable shadow of the page), so any later guest store to the page faults in its writer's resident,
+which posts the page to the AP and rings its doorbell (SGI) before the store completes (`cache::written`); the AP sleeps
+in `wfi` (no host exit with the in-kernel GIC), and on each doorbell drains, marks again and reads the mailbox. A store
+before a mark is seen by the read after it, one after it rings the AP: no wake-up is lost, nothing polls, no host thread
+takes part. Stores that land before an AP marks the page again coalesce into one doorbell, so Linux's three stores per
+AP (ID, vector, command) wake a waiting AP one to three times (the kernel runs show 1, 3 and 4 sleeps for APs 1-3 at
+N = 4). **Uncounted before review, now counted** (`State::mailbox_mark_ticks`, `shootdowns`): each re-mark makes a writer
+that holds a writable shadow of the page drop all its shadows (one shootdown), and the AP spins in `mark` until that
+writer resets them, longer while the writer is in the host (a compile), which answers only when it next enters the VM:
+measured in a 4-vCPU boot to the root-fs panic (`boot-linux` `vcpus[].mailbox[3]`), 0.51-0.56 ms per AP spent
+marking over its 2-5 marks, and 1-2 shootdowns per AP over its whole run (the counter is not split by phase). **Measured and rejected:** `ldaxr` + `wfe` (the
+exclusive monitor's wake, Linux's `smp_cond_load_acquire` pattern) does not sleep under HVF: `wfe` returned every
+~0.8 us (177,917 returns in a 145 ms wait), a busy loop; polling with a bounded timeout or a host thread were not needed.
+**Wake latency** (`run_x4.py units`, the guest TSC from the BSP's RDTSC just before its command store to the AP's
+acknowledgement, every acknowledged step after a run's first, whose store waits for its block's first translation):
+5.5 / 16.6 / 56.6 us min / median / max over 12 wakes at the default block size; at block size 1 5.9 / 252 / 557 us (not
+analysed further); the suite's run, both sizes together, 7.3 / 26.1 / 688 us over 24. **End rule and watchdog:** a waiting AP publishes `Events::halted` state 1 with every post seen (no
+post wakes it; its APIC's events stay pending for after the wakeup), so the watchdog treats it as idle and the host's
+end rule (Built (X3)) holds unchanged: a waiting AP can only be woken by a store from a running vCPU, and it reads the
+host's end request before the mailbox, so a Wakeup written before the decision (by a vCPU that then halted) is still
+served (`halting`: the BSP writes a Wakeup and halts for good at once; AP 1 still starts). **INIT/SIPI (decision): kept
+as the typed stop** (`lapic::ap_start`, `unsupported_system`): INIT-SIPI-SIPI starts the target in real mode at
+vector << 12 (SDM Vol.3 9.4.4), and no 16- or 32-bit execution exists; deferred with 32-bit support (an INIT alone, the
+wait-for-SIPI state, with it). Linux uses the mailbox whenever the MADT has one (`do_boot_cpu`). **Host lifecycle**
+(`drivers/linux.rs`): `boot-linux --vcpus N` (1..4) runs N vCPUs, one thread and one `fexc --serve` each; vCPU 0 is the
+BSP at the loader's entry state, the others APs at `Loaded::ap` waiting on the mailbox, every APIC reset; `--stop-at` is
+the BSP's; one vCPU's end ends the run (the others are cancelled); the result's `vcpus` lists each vCPU's stop, RIP,
+blocks, compiles, halts, interrupts, shootdowns asked, mailbox record [address still waited on, sleeps, acknowledgement
+TSC, us marking the page], fault and state, and `ended_first` the vCPU whose end ended the run and its stop (the others
+then read `cancelled`). The program driver gains `mailbox GPA` per CPU section and reports `stats.mailbox`.
+**Checks.** `tools/run_x4.py` (new): `units` 33/33 at N = 2, 3, 4 and block sizes default and 1 (`turns`, `reverse`,
+`ignored`: absent APIC ID, the BSP's, a reserved command; `again`: a second Wakeup for a woken AP; `partial`; `halting`),
+judged by `tools/models/mailbox_model.py` (independent author, from ACPI 6.5 alone; `run` for the acknowledgements and
+starts, `check_trace` for the trace; 14 unit tests with negative controls in `test_mailbox_model.py`) and the wake state
+each AP records (IF = 0, CR0.PG/PE, the BSP's CR3 and CS, CR4.PAE, EFER.LME/LMA/NXE, CPUID's APIC ID, one start at its
+vector); never-woken APs end `halted` still waiting. **Not shown by any test (review):** that the AP reads the vector
+before it acknowledges. The BSP overwrites the vector right after it sees the acknowledgement, but that probe catches a
+late read only if it lands between the acknowledgement and the read, and a mutation that read the vector after the
+acknowledgement passed every run; the order is an invariant of `events::wait_mailbox`, checked by inspection and
+commented there. `adversarial` (the review's cases, both block sizes): `reversed` (command before APIC ID), `early` (the
+Wakeup in the mailbox before any vCPU runs), `alias` (the mailbox through a second linear page), `noise` (an awake AP
+storing into the page's OS area while the others are woken), `nowait` (two Wakeups with no wait for the first
+acknowledgement; AP 2 starts, AP 1 starts or keeps waiting, never at AP 2's vector): 28/28. `trampoline` 6/6 vs pinned QEMU at N = 2..4, both block
+sizes: Linux 6.12's `trampoline_start64` 64-bit branch (LIDT, LGDT, the LA57 check, LOCK BTS lock with PAUSE, the
+real-mode stack, MOV SS/DS/ES/FS/GS, MOV CR3, LRETQ) and `secondary_startup_64` to the lock release (`verify_cpu`
+inlined, CR3, CR4 PSE then PGE, STARTUP_READ_APICID through the xAPIC page, the CPU-number lookup, the per-CPU stack, the
+release), every AP recording RSP, CPU number, CR3/CR4, selectors, SGDT/SIDT and the trampoline stack read under the
+lock; QEMU has no mailbox responder, so its stub starts the APs at the same vector in the equivalent 64-bit state (all
+at once, contending for the lock); registers and memory equal, except the start RFLAGS.IOPL (QEMU's stub 3, the
+firmware's wake state 0), which `verify_cpu`'s PUSHF leaves on the trampoline stack and is masked there. Re-run after
+the review: units 33/33, adversarial 28/28, trampoline 6/6; `cargo test` 50 + 75; stack audit gate 19,120 bytes,
+23,264 nested. `cargo test` (the loader test checks the AP state).
+**Standing suite** (series32, in a scratch copy of this tree with the concurrent P3 compile-server edits to
+`host/src/execution.rs`, `main.rs` and `tools/fexc/` left at HEAD, since the host they make needs series33): cargo build
+and test (50 + 75), the stack audit (gate 19,024 bytes, 23,136 nested), Python tests 277 OK (295 in the working tree, with P3's); fix/seed 64/44 at both block
+sizes; faults 7,830 + 3 unsupported at both; flow 64 x 3; loopfaults 846; probes 74; ASM 1,847 pass, 0 fail; `corpora`,
+`limits`, `kicks`, `system`, `coherence`, `sharedpt`, `litmus`, `contain`, `privilege`, `delivery`, `events` 0 failures;
+`smp` 1 failure in the suite run (`neg-race@2`: no CPU took LOCK NEG's lost-race exit, a timing-dependent check of I3;
+no program there has a mailbox), 0 in two reruns; i6 faults 275/275 x 2; m3 0 failures; l1 12/12 and 41/41, l2 N = 1..4
+pass, l2-iasl pass; k2 22/22; x3 9/9, 4/4, 24/24, 6/6, 10/10, 54/54; x4 33/33 and 6/6; k1 184 runs, 0 failures; m1 20/0; l3 0 failures;
+l4a 13/13, 4/4, 2/2, 2/2, 1/1; l4b 5/5, 2/2, 3/3, 11/11, 7/7, 1/1; i5b 411/411; i8 136 x 2; i8b 329 + the 7 known QEMU
+NaN departures x 2; i8 faults 851 x 2; i6b 112 x 2, cases 129 x 2; i9 120 x 2, big 5 x 2, faults 586 x 2.
+**Kernel** (Debian 6.12.107, 2 GiB, `console=ttyS0 earlyprintk=serial mitigations=off nokaslr`, 10 s watchdog, no
+initrd; guest times are the kernel's printk timestamps, its `local_clock`: TSC-based sched_clock, which once the TSC is
+marked unstable is kept against the jiffies-based clocksource, not host time): `--vcpus 2`: "smp: Brought up 1 node, 2
+CPUs" (CPU 1 booted 9.93 -> 12.00 s guest time), "Total of 2 processors
+activated", root-fs panic at 39.2 s guest, 61.7 s wall (incl. the watchdog), 295 serial lines; `--vcpus 4`: "#1 #2 #3",
+"Brought up 1 node, 4 CPUs" (9.90 -> 16.23 s), root-fs panic at 52.7 s guest, 75.0 s wall, 296 lines. With Debian's
+initrd (60 s watchdog): the installer's "Select a language" dialog at N = 2 after 546 s host (354 lines, "Run /init" at
+81.5 s guest) and at N = 4 after 561 s (353 lines, "Run /init" at 112.0 s guest); runs ended by the script at the dialog.
+No CPU bring-up error, no "TSC synchronization" warning (the TSC is marked unstable by the clocksource watchdog before
+SMP bring-up, as at 1 vCPU, Built (K1), so Linux skips the sync check) and no APIC error; the one APIC line is L2's
+known "Incorrect checksum in table [APIC]" (Linux zeroes the mailbox address).
+**Not built:** INIT/SIPI (above); the mailbox's version 1 (reset vector, Test command; Linux would then offline CPUs
+through it); CPU offlining and kexec; a measured breakdown of the block-size-1 wake latency.
 
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 
