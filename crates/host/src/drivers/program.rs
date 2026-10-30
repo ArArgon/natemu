@@ -1281,6 +1281,8 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
     rips.sort_unstable();
     // K2: decodes by kind ("0x7": n). A suite can collect them: with NATEMU_EXIT_LOG set, one line per vCPU is appended.
     let decodes = ran.decodes.iter().map(|(k, n)| format!(r#""{k:#x}":{n}"#)).collect::<Vec<_>>().join(",");
+    // S4's counters live in the cache's control record (not copied with the state).
+    let control: natemu_abi::execution::cache::Control = area.read_record(natemu_abi::execution::cache::LOOKUP_OFFSET + natemu_abi::execution::cache::CONTROL);
     if let Some(path) = std::env::var_os("NATEMU_EXIT_LOG") {
         use std::io::Write as _;
         let line = format!(r#"{{"systems":{},"entropy":{},"decodes":{{{decodes}}}}}"#, s.systems, ran.entropy) + "\n";
@@ -1340,7 +1342,7 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"shadow_resets\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{},\"dispatch_exits\":{},\"interrupts\":{},\"nmis\":{},\"halts\":{},\"shadow_steps\":{},\"mailbox\":[{},{},{},{}],\"decode_exits\":{},\"decodes\":{{{}}},\"entropy_exits\":{},\"k1\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]{}}}",
+        "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"shadow_resets\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{},\"dispatch_exits\":{},\"interrupts\":{},\"nmis\":{},\"halts\":{},\"shadow_steps\":{},\"debug_steps\":{},\"debug_traps\":{},\"code_breaks\":{},\"watch_hits\":{},\"watchpoints\":{},\"mailbox\":[{},{},{},{}],\"decode_exits\":{},\"decodes\":{{{}}},\"entropy_exits\":{},\"k1\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]{}}}",
         s.blocks,
         s.l2_hits,
         s.requests,
@@ -1371,6 +1373,11 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
         s.nmis,
         s.halts,
         s.shadow_steps,
+        control.debug_steps,
+        control.debug_traps,
+        control.code_breaks,
+        control.watch_hits,
+        control.watchpoints,
         s.mailbox,
         s.mailbox_wakes,
         // As the guest's TSC (ns since the VM's epoch, the MSR's offset), 0 if never acknowledged.

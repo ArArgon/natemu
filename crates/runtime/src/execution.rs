@@ -27,6 +27,7 @@ mod ports;
 mod segments;
 mod sse;
 mod syscalls;
+mod watch;
 mod x87;
 mod xsave;
 use delivery::{Event, deliver};
@@ -139,10 +140,34 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
         take_invalidations(s);
         // X3: the LAPIC timer's expiries due by now (its virtual-timer doorbell only stopped the vCPU).
         lapic::poll(s);
+        // S4 (one test on the common path): a pending trap, TF or an armed breakpoint.
+        let debugging = s.debug & debug::TRAP != 0 || s.cpu.rflags & RFLAGS_TF != 0 || s.cpu.dr[5] & DR7_ENABLES != 0;
+        // S4: a trap-class #DB owed by the instruction that just completed comes first (Table 7-2 class 4).
+        if debugging && trap_due(s) {
+            continue;
+        }
         // X2: the events this boundary may take; an event a shadow alone blocks waits for exactly one more instruction,
         // run alone (never cached or linked: the linker does not link to the step block).
-        if events::take(s) {
-            s.shadow_steps += 1;
+        let held = s.debug & debug::TRAP; // (a data trap a MOV SS shadow holds)
+        let shadowed = events::take(s);
+        // S4: an event's frame store that met a data breakpoint: its trap comes before the handler's first instruction.
+        if s.debug & debug::TRAP != held {
+            continue;
+        }
+        // S4: an armed instruction breakpoint at RIP (Table 7-2 class 7).
+        if debugging && code_break(s) {
+            continue;
+        }
+        // S4: under TF the instruction runs alone and owes a single-step trap when it completes (SDM Vol.3 18.3.1.4).
+        let traced = s.cpu.rflags & RFLAGS_TF != 0;
+        // (A data breakpoint trap held by a MOV SS shadow waits for exactly one more instruction, SDM Vol.3 7.15 #DB.)
+        if shadowed || traced || s.debug & debug::TRAP != 0 {
+            s.debug = s.debug & !debug::STEP | if traced { debug::STEP } else { 0 };
+            if traced {
+                cache::control().debug_steps += 1;
+            } else {
+                s.shadow_steps += 1;
+            }
             match unsafe { step_here(s) } {
                 Some(block) => return Some(block),
                 None => continue,
@@ -212,9 +237,59 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
                 }
             },
         };
-        cache::fill_l1(s.cpu.rip, block);
+        // S4: a block at an armed instruction breakpoint is entered only from here, after the check above.
+        if !at_breakpoint(&s.cpu, block) {
+            cache::fill_l1(s.cpu.rip, block);
+        }
         return Some(block);
     }
+}
+/// S4: whether `b` starts at an armed instruction breakpoint: it is never linked to nor put in L1 (every entry passes
+/// [`find`]'s check).
+fn at_breakpoint(c: &Cpu, b: &Block) -> bool {
+    c.dr[5] & DR7_ENABLES != 0 && c.code_breakpoints().any(|a| a == b.rip)
+}
+/// S4: delivers the trap-class #DB pending at this boundary (`State::debug_trap`), unless a MOV SS shadow holds, which
+/// discards a single-step trap (delivery_model A9). True when delivered.
+#[cold]
+#[inline(never)]
+fn trap_due(s: &mut State) -> bool {
+    let hits = s.debug & debug::TRAP;
+    if hits == 0 {
+        return false;
+    }
+    if s.cpu.mov_ss != 0 {
+        s.debug &= !DR6_BS;
+        return false;
+    }
+    cache::control().debug_traps += 1;
+    s.debug &= !debug::TRAP;
+    let mid_string = s.mid_string != 0;
+    debug_exception(s, hits, Event::Debug { length: 0, mid_string });
+    true
+}
+/// S4: an armed instruction breakpoint at RIP is a #DB fault before the instruction, unless RF is set or a MOV SS shadow
+/// suppresses it (delivery_model A9), or the boundary is between two iterations of a REP string; its frame holds the
+/// current RF, 0 (Vol.3 18.3.1.1). True when delivered.
+#[cold]
+#[inline(never)]
+fn code_break(s: &mut State) -> bool {
+    // Never between two iterations of a REP string: the instruction has begun (its start was checked, or a MOV SS shadow
+    // suppressed the check there; RF may still be 0 after such a suppression or at a port string's element).
+    if s.cpu.mov_ss != 0 || s.mid_string != 0 || s.cpu.rflags & RFLAGS_RF != 0 || !s.cpu.code_breakpoints().any(|b| b == s.cpu.rip) {
+        return false;
+    }
+    cache::control().code_breaks += 1;
+    debug_exception(s, 0, Event::Debug { length: 0, mid_string: false });
+    true
+}
+/// S4: delivers a #DB (`event`) after setting DR6: `hits` (BS) or-ed in, B0..B3 replaced by the breakpoints whose
+/// condition RIP meets (enabled or not: the SDM lets the processor report disabled ones, Vol.3 18.2.3, and clear B0..B3
+/// at a #DB; pinned QEMU does both). BD, BS and BT stay as they were (sticky).
+fn debug_exception(s: &mut State, hits: u64, event: Event) {
+    let matched = (0..4).filter(|&n| dr7_rw(s.cpu.dr[5], n) == 0 && s.cpu.dr[n] == s.cpu.rip).fold(0, |m, n| m | 1 << n);
+    s.cpu.dr[4] = s.cpu.dr[4] & !0xf | matched | hits;
+    deliver(s, event);
 }
 
 /// Whether `b`, just placed for a request made at cache generation `missed`, may stay: invalidations are taken; a
@@ -258,24 +333,32 @@ unsafe fn step_here(s: &mut State) -> Option<&'static Block> {
     // A system instruction whose decode is kept runs from it (K2): nothing to compile.
     if let Some(i) = kept_system(s) {
         system(s, i);
-        return None;
+        if s.plain_step == 0 {
+            return None;
+        }
     }
-    let reply = unsafe { request(s, REQUEST_STEP) };
-    s.plain_step = 0;
-    match reply {
-        Reply::Block(h) => {
-            let context = s.cpu.code_context();
-            let placed = cache::place_step(&h, STAGING_VA as *const u8, context, s.source_gpa, s.link_points, s.dispatch_exit, s.rep_exits);
-            Some(placed.unwrap_or_else(|| halt(s, stop::BAD_REPLY)))
-        }
-        Reply::System(instruction) => {
-            system(s, instruction);
-            None
-        }
-        Reply::Fault(fault) => {
-            deliver(s, Event::Exception(fault));
-            None
-        }
+    loop {
+        let reply = unsafe { request(s, REQUEST_STEP) };
+        s.plain_step = 0;
+        return match reply {
+            Reply::Block(h) => {
+                let context = s.cpu.code_context();
+                let placed = cache::place_step(&h, STAGING_VA as *const u8, context, s.source_gpa, s.link_points, s.dispatch_exit, s.rep_exits);
+                Some(placed.unwrap_or_else(|| halt(s, stop::BAD_REPLY)))
+            }
+            Reply::System(instruction) => {
+                system(s, instruction);
+                // A BT* form found aligned (X2) runs at once, compiled plain: no boundary lies between its check and it.
+                if s.plain_step != 0 {
+                    continue;
+                }
+                None
+            }
+            Reply::Fault(fault) => {
+                deliver(s, Event::Exception(fault));
+                None
+            }
+        };
     }
 }
 
@@ -290,13 +373,13 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
     unsafe {
         let mut s = load();
         bank(&mut s.cpu, frame, frame.nzcv, true);
-        completed(&mut s);
         s.cpu.rip = frame.x[0];
         s.linker += 1;
         // A REP string's self-exit (X2): the boundary is between two of its iterations.
         if let Some(b) = cache::block_at(elr.wrapping_sub(4)).filter(|b| link_point_of(b, elr.wrapping_sub(4)).is_some_and(|o| b.rep_exit(o))) {
             rep_exited(&mut s, b);
         }
+        completed(&mut s);
         // The RIP must be one of the block's link targets (its `svc #LINK` follows that target's move).
         let target = |b: &Block| b.links.iter().any(|p| p.offset != 0 && p.target == s.cpu.rip);
         let source = match cache::block_at(elr.wrapping_sub(4)) {
@@ -322,6 +405,8 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             Some(_) if target.rip != rip => {}
             // An instruction run alone to end a shadow (X2): never linked to.
             Some(_) if target.flags & cache::STEP != 0 => {}
+            // S4: nor a block at an armed instruction breakpoint.
+            Some(_) if at_breakpoint(&s.cpu, target) => {}
             Some(source) => match cache::link(source, target) {
                 cache::Link::Linked(n) => s.links += n,
                 cache::Link::Full => s.full_links += 1,
@@ -650,6 +735,11 @@ pub unsafe fn returned(frame: &NativeFrame, kind: u64) -> ! {
             resident_fault([esr, far, elr])
         }
         let Some(armed) = cache::disarm() else { halt_native([0, 0, frame.x[30]], stop::BAD_STOP) };
+        // S4: a watched access's software step completed; any other entry abandons a step in flight.
+        if esr >> 26 == 0x32 && kind != 3 {
+            watch::stepped(elr, spsr)
+        }
+        let spsr = watch::cancel(spsr);
         if kind == 3 {
             interrupted(frame)
         }
@@ -857,13 +947,13 @@ unsafe fn stopped(frame: &NativeFrame, elr: u64, spsr: u64, (armed, n): ([u32; M
         halt(&s, stop::BAD_STOP)
     };
     bank(&mut s.cpu, frame, frame.nzcv, true);
-    completed(&mut s);
     s.cpu.rip = rip;
     // At a REP string's self-exit (X2): between two of its iterations.
     let offset = at.wrapping_sub(block.map_or(0, |b| u64::from(b.code)));
     if let Some(b) = block.filter(|b| b.rep_exit(offset)) {
         rep_exited(&mut s, b);
     }
+    completed(&mut s);
     s.stop_wanted = 0;
     s.stops_exit += 1;
     taken(&mut s);
@@ -950,6 +1040,11 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             deliver(s, Event::Software { vector, length: u64::from(i.length) });
             return Ok(());
         }
+        // S4: INT1 delivers #DB as a trap (RIP past it, the current RF; model A12), DR6 unchanged.
+        system::INT1 => {
+            deliver(s, Event::Debug { length: u64::from(i.length), mid_string: false });
+            return Ok(());
+        }
         system::INTO | system::UD => return Err(UD),
         system::TOO_LONG => return Err(GP),
         // X2: interrupt-flag control, HLT (it parks after its commit) and the test drivers' event hook.
@@ -962,7 +1057,8 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         system::CLI | system::STI | system::POPF | system::HLT | system::EVENT_HOOK => {
             events::transaction(s, i)?;
             commit(s, i, false);
-            if i.kind == system::HLT {
+            // S4: a pending single-step trap wakes a HLT at once (delivery_model A10): no park.
+            if i.kind == system::HLT && s.debug & debug::TRAP == 0 {
                 events::park(s);
             }
             return Ok(());
@@ -1099,7 +1195,10 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         // SDM Vol.2 MOV DR, Vol.3 17.2: (DR8..DR15 #UD and CPL > 0 #GP above) DR4/DR5 #UD with CR4.DE, else DR6/DR7;
         // general detect (DR7.GD): #DB, a fault before the MOV, with DR6.BD set (B0..B3 kept: the SDM lets the CPU
         // clear them or not); delivering it clears DR7.GD (X1/S4). Then a write of 1 to bits 63:32 of DR6/DR7 is #GP.
-        // DR0..DR3 take any value. A DR7 that enables a breakpoint (L0..G3) is refused until S4 arms them.
+        // DR0..DR3 take any value. S4: DR7 arms instruction breakpoints (R/W = 00); a write that arms an address not armed
+        // before drops this vCPU's translations (blocks are cut before the armed ones, [`Cpu::code_breakpoints`]). Data
+        // breakpoints (R/W 01, 11) arm watchpoints ([`watch::program`], after every write); I/O breakpoints (R/W 10) need
+        // CR4.DE (without it the SDM leaves R/W 10 undefined: refused, `unsupported_system`).
         system::MOV_FROM_DR | system::MOV_TO_DR => {
             if i.cr & 6 == 4 && c.cr4 & CR4_DE != 0 {
                 return Err(UD)
@@ -1117,9 +1216,13 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                     0..=3 => v,
                     _ if v >> 32 != 0 => return Err(GP),
                     4 => v & DR6_WRITABLE | DR6_FIXED,
-                    _ if v & DR7_ENABLES != 0 => unsupported(s),
+                    _ if (0..4).any(|n| dr7_enabled(v, n) && dr7_rw(v, n) == 2) && c.cr4 & CR4_DE == 0 => unsupported(s),
                     _ => v & DR7_WRITABLE | DR7_FIXED,
                 };
+                if s.cpu.code_breakpoints().any(|b| !c.code_breakpoints().any(|a| a == b)) {
+                    flush(s);
+                }
+                watch::program(s);
             }
             false
         }
@@ -1251,6 +1354,8 @@ fn commit(s: &mut State, i: System, flush_all: bool) {
     }
     if i.kind != system::IRET {
         completed(s);
+    } else {
+        stepped(s); // an IRET with TF at its start traps after it, whatever TF it loads
     }
     if flush_all {
         tlb(s, true);
@@ -1313,9 +1418,26 @@ const RFLAGS_DF: u64 = 1 << 10;
 /// IRET). Applied where the resident sees an instruction complete: a block's exit (linker, dispatcher miss or a stop in the
 /// dispatcher or L1, armed exit) and a committed system instruction; a stop at a block's entry or a fault at its first
 /// instruction keeps it.
+/// S4: between two iterations of a REP string (`mid_string`) the instruction has not completed: RF stays (x86 clears it
+/// only when the REP completes), while an iteration under TF owes its single-step trap ([`stepped`]).
 fn completed(s: &mut State) {
-    s.cpu.rflags &= !(1 << 16);
+    if s.mid_string == 0 {
+        s.cpu.rflags &= !RFLAGS_RF;
+    }
+    stepped(s);
 }
+/// S4: the instruction run alone under TF (`State::debug_step`) completed (or did one REP iteration): a single-step trap
+/// is pending at the next boundary.
+#[inline(always)]
+fn stepped(s: &mut State) {
+    if s.debug & !debug::TRAP != 0 {
+        // The data and I/O breakpoints it met (or this REP iteration met) trap after it, with a single step's BS.
+        let bs = if s.debug & debug::STEP != 0 { DR6_BS } else { 0 };
+        s.debug = s.debug & debug::TRAP | bs | s.debug >> debug::HITS & 0xf;
+    }
+}
+const RFLAGS_RF: u64 = 1 << 16;
+const RFLAGS_TF: u64 = 1 << 8;
 /// The vCPU left `b` by its REP string's self-exit (X2), with RIP the REP's: between two iterations (`mid_string`), or,
 /// after its last element (RCX = 0: I2's pass exits to its own RIP whatever the count left), past the instruction, the
 /// boundary x86 has there (the REP ends `b`; a REP with RCX = 0 changes nothing).
@@ -1390,9 +1512,13 @@ fn step(mut s: State) -> ! {
         let h = match reply {
             Reply::Block(h) => h,
             // Its fetch faults (a peer changed the tables): delivered, and the handler's first instruction is stepped.
+            // (Then the handler's first instruction is a boundary like any: `find`'s checks, breakpoints included.)
             Reply::Fault(fault) => {
                 deliver(&mut s, Event::Exception(fault));
-                continue;
+                match unsafe { find(&mut s) } {
+                    Some(block) => unsafe { enter(s, block) },
+                    None => continue,
+                }
             }
             // A system instruction (a peer replaced the instruction, e.g. by an INT3 as Linux's text_poke_bp does): executed
             // as `find` executes it, then the next boundary is `find`'s (events a POPF, IRET or STI made eligible, invalidations),
@@ -1536,6 +1662,8 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
                     object::kind::SPLIT => brk(2),
                     object::kind::DIVIDE => brk(3),
                     object::kind::ALIGN => brk(4),
+                    // S4: a watchpoint (EC 0x34, from EL0) at an access site: FAR names a watched byte, not necessarily the access's.
+                    _ if esr >> 26 == 0x34 => !matches!(site.kind, object::kind::OTHER),
                     _ => esr >> 26 == 0x24 && far.wrapping_sub(site_address(site, f)) < u64::from(site.width),
                 }
         };
@@ -1556,6 +1684,9 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
         take_invalidations(&mut s);
         if b.flags & cache::STEP == 0 && (s.generation != generation || b.flags & cache::DEAD != 0) {
             step_from(s, f, b, &site)
+        }
+        if esr >> 26 == 0x34 {
+            watch::hit(s, f, b, &site, elr, spsr)
         }
         match site.kind {
             // A branch target checked non-canonical: #GP(0) at the branch.
@@ -1675,6 +1806,14 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
         halt(&s, stop::SITE_MISMATCH)
     }
     let address = site_address(stub, f);
+    // S4: a page-crossing store meeting a data breakpoint traps after its instruction: run alone (its step block's split
+    // records the bits).
+    if s.cpu.dr[5] & DR7_ENABLES != 0 && data_hits(&s.cpu.dr, address, width as u64, true) != 0 {
+        if b.flags & cache::STEP == 0 {
+            step_from(s, f, b, stub)
+        }
+        s.debug |= data_hits(&s.cpu.dr, address, width as u64, true) << debug::HITS;
+    }
     let Some([Some(first), Some(second)]) = pages(address, width as u64) else {
         match pages(address, width as u64) {
             None => guest_fault(s, f, b, stub, noncanonical(stub)),

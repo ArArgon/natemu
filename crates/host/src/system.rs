@@ -216,6 +216,8 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
             at += 1;
         }
         (MAP_PRIMARY, 0xce) => s.kind = system::INTO,
+        // S4: INT1 (ICEBP), a #DB trap the resident delivers.
+        (MAP_PRIMARY, 0xf1) => s.kind = system::INT1,
         // X2: CLI, STI, HLT; POPF pops 8 bytes in 64-bit mode (REX.W changes nothing), 2 with a 66 prefix.
         (MAP_PRIMARY, 0xfa) => s.kind = system::CLI,
         (MAP_PRIMARY, 0xfb) => s.kind = system::STI,
@@ -536,6 +538,7 @@ mod tests {
     fn software_interrupts_and_ud() {
         let s = |kind, cr, length| Some(System { kind, cr, length, ..System::NONE });
         assert_eq!(super::decode(&[0xcc], MAP_PRIMARY, 0xcc), s(INT3, 0, 1));
+        assert_eq!(super::decode(&[0xf1], MAP_PRIMARY, 0xf1), s(INT1, 0, 1));
         assert_eq!(super::decode(&[0xcd, 0x80], MAP_PRIMARY, 0xcd), s(INT, 0x80, 2));
         assert_eq!(super::decode(&[0xcd], MAP_PRIMARY, 0xcd), None); // truncated immediate
         assert_eq!(super::decode(&[0xce], MAP_PRIMARY, 0xce), s(INTO, 0, 1));

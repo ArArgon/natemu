@@ -4,14 +4,19 @@
 //!
 //! - SWAPGS (CPL 0, else #GP(0)) exchanges the bank's GS.base with IA32_KERNEL_GS_BASE; the guest-state page takes the new
 //!   base at the next block entry (I7).
-//! - SYSCALL (#UD without EFER.SCE; under TF it stops `unsupported_system` before any change, single-step being S4's): RCX := the next RIP, R11 := RFLAGS, RFLAGS &= !IA32_FMASK, CS := STAR[47:32] & !3 and
+//! - SYSCALL (#UD without EFER.SCE): RCX := the next RIP, R11 := RFLAGS, RFLAGS &= !IA32_FMASK, CS := STAR[47:32] & !3 and
 //!   SS := STAR[47:32] + 8 (unmasked, as the SDM writes it) with the SDM's fixed flat attributes (no descriptor is read), CPL 0, RIP := IA32_LSTAR. No stack switch.
 //! - SYSRET (#UD without EFER.SCE, then #GP(0) at CPL > 0, then #GP(0) for a non-canonical RCX, Intel's check at CPL 0
 //!   before any change): RIP := RCX, RFLAGS := R11 & 3C7FD7H | 2, CS := (STAR[63:48] + 16) | 3 (64-bit) and SS :=
 //!   (STAR[63:48] + 8) | 3 with the fixed attributes, CPL 3. SYSRETL returns to compatibility mode, which is not built:
 //!   [`set_cpl`] stops `unsupported_mode` with the new RFLAGS, CS and SS and RIP at the instruction. CR0.AM with an AC from R11
-//!   turns alignment checking on (X2): the SYSRET completes and the next misaligned access at CPL 3 is #AC(0). A TF from R11
-//!   stops `unsupported_system` before any change (single-step is S4's).
+//!   turns alignment checking on (X2): the SYSRET completes and the next misaligned access at CPL 3 is #AC(0).
+//! - S4, single-step: SYSCALL and SYSRET trap (#DB, DR6.BS) right after themselves when the TF they leave is 1, not when
+//!   TF was 1 at their start: a SYSCALL whose FMASK clears TF enters CPL 0 without a trap, and a SYSRET loading TF = 1
+//!   traps before the first CPL 3 instruction (unlike IRET and POPF, whose TF acts after the next instruction). The SDM's
+//!   SYSCALL/SYSRET pages say nothing either way; this is pinned QEMU's rule (`gen_eob_syscall`: "TF is checked after the
+//!   syscall insn completes") and the behaviour Linux relies on (`entry_64.S`: SYSRET "can restore TF, but unlike IRET,
+//!   restoring TF results in a trap from userspace immediately after SYSRET").
 //! - RDFSBASE..WRGSBASE (#UD without CR4.FSGSBASE, any CPL): 32-bit forms read the low half zero-extended and write the
 //!   zero-extended low half; a 64-bit write of a non-canonical value is #GP(0).
 //! - RDRAND: the next word of the vCPU's entropy pool ([`Entropy`], filled by the host): CF = 1, OF SF ZF AF PF = 0, the
@@ -65,10 +70,6 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             if c.efer & EFER_SCE == 0 {
                 return Err(UD);
             }
-            // Single-step (S4) is not built: a SYSCALL under TF would owe a #DB after it.
-            if c.rflags & RFLAGS_TF != 0 {
-                halt(s, stop::UNSUPPORTED_SYSTEM)
-            }
             let selector = (msr_get(slot(cpu::MSR_STAR)) >> 32) as u16;
             s.cpu.gpr[1] = c.rip.wrapping_add(u64::from(i.length));
             s.cpu.gpr[11] = c.rflags;
@@ -76,6 +77,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             s.cpu.seg[SREG_CS] = flat(selector & 0xfffc, CS64);
             s.cpu.seg[SREG_SS] = flat(selector.wrapping_add(8), SS_FLAT);
             set_cpl(s, 0);
+            s.debug = s.debug & !debug::STEP | if s.cpu.rflags & RFLAGS_TF != 0 { debug::STEP } else { 0 };
             return Ok(Some(msr_get(slot(cpu::MSR_LSTAR))));
         }
         system::SYSRET => {
@@ -91,14 +93,12 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
                 return Err(GP0);
             }
             let rflags = c.gpr[11] & SYSRET_FLAGS | 2;
-            if rflags & RFLAGS_TF != 0 {
-                halt(s, stop::UNSUPPORTED_SYSTEM)
-            }
             let base = (msr_get(slot(cpu::MSR_STAR)) >> 48) as u16;
             s.cpu.rflags = rflags;
             s.cpu.seg[SREG_CS] = flat(base.wrapping_add(if wide { 16 } else { 0 }) | 3, if wide { CS64 } else { CS32 } | DPL3);
             s.cpu.seg[SREG_SS] = flat(base.wrapping_add(8) | 3, SS_FLAT | DPL3);
             set_cpl(s, 3);
+            s.debug = s.debug & !debug::STEP | if rflags & RFLAGS_TF != 0 { debug::STEP } else { 0 };
             return Ok(Some(rip));
         }
         system::RDFSBASE..=system::WRGSBASE => {

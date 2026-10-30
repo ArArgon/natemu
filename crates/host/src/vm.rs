@@ -44,6 +44,8 @@ unsafe extern "C" {
     fn hv_vcpu_set_sys_reg(vcpu: u64, reg: u16, value: u64) -> i32;
     fn hv_vcpu_get_sys_reg(vcpu: u64, reg: u16, value: *mut u64) -> i32;
     fn hv_vcpu_run(vcpu: u64) -> i32;
+    fn hv_vcpu_set_trap_debug_exceptions(vcpu: u64, value: bool) -> i32;
+    fn hv_vcpu_set_trap_debug_reg_accesses(vcpu: u64, value: bool) -> i32;
     fn hv_vcpu_set_vtimer_offset(vcpu: u64, offset: u64) -> i32;
     fn hv_vcpus_exit(vcpus: *mut u64, count: u32) -> i32;
     fn hv_vm_get_max_vcpu_count(count: *mut u32) -> i32;
@@ -354,6 +356,12 @@ impl Vcpu {
         self.set_sys(ACTLR_EL1, 2)?;
         self.set_sys(CPACR_EL1, 3 << 20)?;
         self.set_sys(MDSCR_EL1, MDSCR_TDCC)?;
+        // S4: the VM owns its debug registers and debug exceptions: the resident programs the watchpoints that implement
+        // x86 data breakpoints and takes their exceptions and its own software steps (never the host's).
+        unsafe {
+            hv(hv_vcpu_set_trap_debug_reg_accesses(self.id, false), "hv_vcpu_set_trap_debug_reg_accesses")?;
+            hv(hv_vcpu_set_trap_debug_exceptions(self.id, false), "hv_vcpu_set_trap_debug_exceptions")?;
+        }
         self.set_sys(CNTKCTL_EL1, 0)?;
         self.set_sys(CNTV_CTL_EL0, 0)
     }

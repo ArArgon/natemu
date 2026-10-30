@@ -674,8 +674,8 @@ def either_check(prog, out):
 def unsupported_cases():
     """Instructions the resident refuses (`unsupported_system`), each alone at CPL0 after a flag-setting prefix."""
     cases = {'cr3-pwt': 'mov rax, cr3\nbts rax, 3\nmov cr3, rax',
-             # A DR7 that enables a breakpoint (L0, G3): breakpoints are S4's.
-             'dr7-l0': 'mov eax, 0x401\nmov dr7, rax', 'dr7-g3': 'mov eax, 0x480\nmov dr7, rax',
+             # A DR7 that enables an I/O breakpoint (R/W 10: L0, G3) without CR4.DE, which the SDM leaves undefined (S4).
+             'dr7-l0': 'mov eax, 0x20401\nmov dr7, rax', 'dr7-g3': 'mov eax, 0x20000480\nmov dr7, rax',
              # IA32_APIC_BASE moved onto guest RAM (a valid value): the resident cannot overlay RAM with the xAPIC page (X3;
              # a move to a device page works, tools/run_x3.py `relocate-device`).
              'wrmsr-apic-base-onto-ram': 'mov ecx, 0x1b\nmov eax, 0x200800\nxor edx, edx\nwrmsr'}
@@ -1074,9 +1074,9 @@ def x2_cases():
         pop = b'\x68' + v.to_bytes(4, 'little') + b'\x9d' if size == 8 else b'\x66\x68' + (v & 0xffff).to_bytes(2, 'little') + b'\x66\x9d'
         code = pop + ref.assemble('pushfq\npop rbx\ncli\ncmp r11, r11')
         cases.append((f'x2-popf{size * 8}-cpl0', f'cpl 0\nrip {base:#x}\n{stack}code {code.hex()}\n', reached(rbx=want)))
-    # POPF setting TF: single-step is S4's (refused before any effect). LOCK CLI: #UD.
-    popf_tf = ref.assemble('push 0x102\npopfq')
-    cases.append(('x2-popf-tf', f'cpl 0\nrip {base:#x}\n{stack}code {popf_tf.hex()}\n', refused('unsupported_system')))
+    # POPF setting TF (S4): the trap follows the next instruction (#DB, RIP after the NOP). LOCK CLI: #UD.
+    popf_tf = ref.assemble('push 0x102\npopfq\nnop\nnop')
+    cases.append(('x2-popf-tf', f'cpl 0\nrip {base:#x}\n{stack}code {popf_tf.hex()}\n', fault(1, base + 7)))
     lock_cli = bytes([0x90, 0xf0, 0xfa]) + ref.assemble('cmp r11, r11')
     cases.append(('x2-lock-cli', f'cpl 0\nrip {base:#x}\ncode {lock_cli.hex()}\n', fault(6, base + 1)))
     # HLT with no event that can wake it: IF = 0 and an interrupt pending (masked, model A10), or nothing pending. The
@@ -1272,7 +1272,7 @@ def segment_runs(a, host, runtime, qemu, report, failures, progs=None):
     Positive programs (1, 2 and 4 vCPUs) and fault cases against QEMU system mode (registers, captured memory, fault);
     every fault case's outcome (fault (vector, error, RIP, CR2) or completion) must be one segment_model permits, for
     natemu and for QEMU (unless listed in QEMU_DIFFERS); registers and memory are compared where both took the same one.
-    Refused cases (compatibility-mode CS, call gate, TF from IRETQ) stop `unsupported_mode`/`unsupported_system` at the
+    Refused cases (compatibility-mode CS, call gate) stop `unsupported_mode`/`unsupported_system` at the
     instruction; QEMU is not run for them. The LTR race (natemu only) runs 10 times per block size: exactly one vCPU
     loads TR, every other takes #GP(0x70) at its LTR."""
     import segments

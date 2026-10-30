@@ -171,7 +171,7 @@ class Transfers(unittest.TestCase):
                 else:
                     self.assertEqual(ours['fault'][:2], theirs['events'][0], (frame, cpl))
         s = push(machine(), 0x40_2000, 0x08, 0x302, STACK, 0x10)
-        self.assertEqual(m.iret(s)['outcome'], 'refused')                                 # TF: single-step is S4's
+        self.assertEqual(m.iret(s)['state']['rflags'], 0x302)                             # TF loaded (its trap: S4)
 
     def test_iretq_flags_and_null_ss(self):
         # VIF/VIP are restored only at CPL 0 (SDM IRET); at CPL 3 the frame's bits are ignored.

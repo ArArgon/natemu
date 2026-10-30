@@ -157,6 +157,8 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
         };
     }
     (s.cpu.mov_ss, s.sti_shadow, s.mid_string) = (0, 0, 0);
+    // S4: the device access meets data breakpoints as any (the linear address, x86's width).
+    super::watch::access(&mut s, site_address(site, f), width, c.store);
     completed(&mut s);
     s.cpu.rip = s.cpu.rip.wrapping_add(u64::from(c.length));
     unsafe {

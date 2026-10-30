@@ -288,6 +288,13 @@ pub mod cache {
         pub page_faults: u64,
         pub page_fault_ticks: u64,
         pub scanned: u64,
+        /// S4 counters: instructions run alone under TF, trap-class #DBs and instruction-breakpoint #DBs delivered,
+        /// watchpoint exceptions taken; and the Arm watchpoints this PE implements (ID_AA64DFR0_EL1.WRPs + 1).
+        pub debug_steps: u64,
+        pub debug_traps: u64,
+        pub code_breaks: u64,
+        pub watch_hits: u64,
+        pub watchpoints: u64,
     }
     /// A block placed in the cache: its record in the metadata arena (at the offset `INDEX` lists), its access sites
     /// ([`crate::code_object::Site`]) right after it.
@@ -770,11 +777,36 @@ pub const CR4_OSXSAVE: u64 = 1 << 18;
 pub const DR6_FIXED: u64 = 0xffff_0ff0;
 pub const DR6_WRITABLE: u64 = 0xe00f;
 pub const DR6_BD: u64 = 1 << 13;
+/// DR6.BS (S4): the #DB is a single-step trap (RFLAGS.TF at the start of the instruction that completed).
+pub const DR6_BS: u64 = 1 << 14;
 pub const DR7_FIXED: u64 = 0x400;
 pub const DR7_WRITABLE: u64 = 0xffff_23ff;
 pub const DR7_GD: u64 = 1 << 13;
 /// DR7 L0..L3, G0..G3: a set bit arms a breakpoint (S4).
 pub const DR7_ENABLES: u64 = 0xff;
+/// S4: whether DR7 arms breakpoint `n` (L or G: no task switches in IA-32e mode, so both mean the same) and its R/W field
+/// (00 execute, 01 write, 10 I/O with CR4.DE, 11 read/write; SDM Vol.3 18.2.4).
+pub fn dr7_enabled(dr7: u64, n: usize) -> bool {
+    dr7 >> (2 * n) & 3 != 0
+}
+pub fn dr7_rw(dr7: u64, n: usize) -> u64 {
+    dr7 >> (16 + 4 * n) & 3
+}
+/// S4: the bytes breakpoint `n` covers for a data or I/O breakpoint (SDM Vol.3 18.2.5): LEN 00, 01, 11, 10 = 1, 2, 4, 8
+/// bytes, the address's low bits masked by the length (a range is aligned to its length).
+pub fn dr_range(dr: &[u64; 6], n: usize) -> (u64, u64) {
+    let len = [1, 2, 8, 4][(dr[5] >> (18 + 4 * n) & 3) as usize];
+    (dr[n] & !(len - 1), len)
+}
+/// S4: the DR6 B bits of the armed data breakpoints an access of `width` bytes at linear `va` meets: any byte of the
+/// access inside the breakpoint's range, R/W 01 for a write, 11 for a read or a write (SDM Vol.3 18.2.4, 18.2.5). LE and
+/// GE are ignored (breakpoints are exact on these processors).
+pub fn data_hits(dr: &[u64; 6], va: u64, width: u64, write: bool) -> u64 {
+    (0..4).filter(|&n| dr7_enabled(dr[5], n) && matches!((dr7_rw(dr[5], n), write), (1, true) | (3, _))).fold(0, |m, n| {
+        let (base, len) = dr_range(dr, n);
+        m | u64::from(base.wrapping_sub(va) < width || va.wrapping_sub(base) < len) << n
+    })
+}
 /// [`Cpu::dr`] at reset (SDM Vol.3 Table 10-1: DR0..DR3 0, DR6 FFFF0FF0H, DR7 400H).
 pub const DR_RESET: [u64; 6] = [0, 0, 0, 0, DR6_FIXED, DR7_FIXED];
 /// CR3 bits a 4-level walk ignores without PCIDE (kept in CR3): 2:0 and 11:5. PWT/PCD (4:3) are not ignored.
@@ -810,6 +842,23 @@ impl Cpu {
     pub fn alignment_check(&self) -> bool {
         self.cr0 & CR0_AM != 0 && self.rflags & RFLAGS_AC != 0 && self.cpl == 3
     }
+    /// S4: whether DR7 arms a data breakpoint (R/W 01 or 11).
+    pub fn data_breakpoints(&self) -> bool {
+        (0..4).any(|n| dr7_enabled(self.dr[5], n) && dr7_rw(self.dr[5], n) & 1 != 0)
+    }
+    /// Whether BT/BTS/BTR/BTC memory forms are cut as system instructions (`--alignment-gated`): under alignment checking
+    /// (X2), and while a data breakpoint is armed (S4: FEX accesses only the byte holding the bit, x86 the operand-sized
+    /// unit, which the resident checks).
+    pub fn bit_tests_cut(&self) -> bool {
+        self.alignment_check() || self.data_breakpoints()
+    }
+    /// S4: the linear addresses of the armed instruction breakpoints (DR7 Ln/Gn with R/W = 00; DRn, matched against RIP:
+    /// CS.base is 0 in 64-bit mode). LEN is ignored: the SDM requires 00 for them and leaves other values undefined
+    /// (Vol.3 18.2.5); this matches the address exactly, as pinned QEMU does. The host ends every block before each
+    /// one, so each is the first instruction of whatever runs it, and the resident checks it there.
+    pub fn code_breakpoints(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..4).filter(|&n| dr7_enabled(self.dr[5], n) && dr7_rw(self.dr[5], n) == 0).map(|n| self.dr[n])
+    }
     /// What code at a RIP is compiled and cached under besides the RIP and its source bytes (K1: not CR3; a block's
     /// guest-physical source pages are checked against the current tables instead): a word of the CPL, the code mode
     /// (bit 2: 64-bit, the only mode yet), and the SSE gating bits (I5a: CR0.EM, CR0.TS, CR4.OSFXSR; a translation cuts every
@@ -832,7 +881,7 @@ impl Cpu {
             | bit(self.cr0 & CR0_EM != 0, 9)
             | bit(self.cr0 & CR0_TS != 0, 10)
             | bit(self.cr4 & CR4_OSFXSR != 0, 11)
-            | bit(self.alignment_check(), 12)
+            | bit(self.bit_tests_cut(), 12)
             | bit(self.cr0 & CR0_MP != 0, 13)
             | (x87_fpcr(self.fcw, self.mxcsr) != 0) as u64 * (1 | (self.fcw >> 10 & 3) << 1) << 14
             | bit(self.avx_enabled(), 17);
@@ -1077,6 +1126,9 @@ pub mod system {
     /// it, `--alignment-gated`): `cr` 0..3 = BT, BTS, BTR, BTC; `reg` the bit-offset register, or [`NO_REG`] for the imm8
     /// form; `size` the operand size (2, 4, 8). The resident checks the operand's alignment (#AC(0)), then steps it.
     pub const BT_ALIGNED: u32 = 0x45;
+    /// S4: INT1 (`f1`, ICEBP): #DB delivered as a trap (RIP past it) with EXT = 1 and no gate DPL check (a privileged
+    /// software exception, SDM Vol.2 INT n/INTO/INT3/INT1); DR6 unchanged.
+    pub const INT1: u32 = 0x46;
     /// x87 (I6, numbered apart): an x87 instruction under CR0.EM or CR0.TS, or WAIT under CR0.TS and CR0.MP (fexc cut it,
     /// `--x87-gated`/`--wait-gated`): #NM (`length` is not used). FNINIT (`db e3`), FNCLEX (`db e2`), FLDCW m16 (`d9 /5`),
     /// FLDENV/FNSTENV m (`d9 /4`, `/6`; `size` 2 with a 66 prefix: the 14-byte image, else 4: 28 bytes), FRSTOR/FNSAVE m
@@ -1141,7 +1193,7 @@ pub mod system {
                     LDMXCSR | STMXCSR | VLDMXCSR | VSTMXCSR => self.memory == 1 && address,
                     SSE_GATED | AVX_GATED | MMX_GATED => true,
                     INT => self.cr < 256,
-                    INT3 | INTO | UD | TOO_LONG => true,
+                    INT3 | INT1 | INTO | UD | TOO_LONG => true,
                     SWAPGS | SYSCALL | WBINVD => true,
                     SYSRET => matches!(self.size, 4 | 8),
                     RDFSBASE..=WRGSBASE => self.memory == 0 && reg(self.reg) && self.segment == 0 && matches!(self.size, 4 | 8),
@@ -1375,6 +1427,21 @@ pub struct State {
     pub mailbox_wakes: u64,
     pub mailbox_acked: u64,
     pub mailbox_mark_ticks: u64,
+    /// S4, one word (the state record is copied at every resident entry, so it stays small; [`debug`]): the DR6 bits of
+    /// a trap-class #DB pending at the next boundary (BS, B0..B3; taken first there, SDM Vol.3 Table 7-2 class 4, but a MOV
+    /// SS shadow discards a single-step trap and holds a data breakpoint's, delivery_model A9); the B bits the instruction
+    /// in progress met with a data or I/O access (added to the trap when it completes, dropped by a delivery); and the
+    /// step mark, set while the instruction at RIP runs alone because RFLAGS.TF was 1 at its start (SDM Vol.3 18.3.1.4;
+    /// SYSCALL and SYSRET set it from the TF they leave).
+    pub debug: u64,
+}
+/// S4: [`State::debug`]'s fields.
+pub mod debug {
+    /// The pending trap's DR6 bits.
+    pub const TRAP: u64 = 0xffff;
+    /// B0..B3 the instruction in progress met, at this shift.
+    pub const HITS: u32 = 16;
+    pub const STEP: u64 = 1 << 20;
 }
 /// X4: the ACPI multiprocessor wakeup mailbox, version 0 (ACPI 6.5 Table 5.44; the 6.6 snapshot's Table 5.46, whose
 /// Test command and reset vector belong to version 1): little endian, `command` (u16) at 0, reserved (u16) at 2,
@@ -1449,6 +1516,7 @@ impl State {
             mailbox_wakes: 0,
             mailbox_acked: 0,
             mailbox_mark_ticks: 0,
+            debug: 0,
         }
     }
 }
@@ -1548,6 +1616,22 @@ const _: () = assert!(STAGING_OFFSET + STAGING_BYTES <= crate::resident::TEXT_OF
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S4: data breakpoint ranges (LEN masks the address), R/W 01 writes only, 11 either, straddles, several bits.
+    #[test]
+    fn data_breakpoint_hits() {
+        // DR0: 4 bytes at 0x1003 (masked to 0x1000), write only; DR1: 8 bytes at 0x1008, read or write; DR2 disabled.
+        let dr = [0x1003, 0x1008, 0x1000, 0, DR6_FIXED, 0x400 | 1 | 4 | (1 | 3 << 2) << 16 | (3 | 2 << 2) << 20];
+        assert_eq!(dr_range(&dr, 0), (0x1000, 4));
+        assert_eq!(dr_range(&dr, 1), (0x1008, 8));
+        assert_eq!(data_hits(&dr, 0x1000, 1, false), 0);
+        assert_eq!(data_hits(&dr, 0x1000, 1, true), 1);
+        assert_eq!(data_hits(&dr, 0xffe, 4, true), 1); // straddles into DR0's range
+        assert_eq!(data_hits(&dr, 0xffc, 4, true), 0);
+        assert_eq!(data_hits(&dr, 0x1002, 8, true), 3); // both ranges
+        assert_eq!(data_hits(&dr, 0x1002, 8, false), 2);
+        assert_eq!(data_hits(&dr, 0x1010, 8, false), 0);
+    }
 
     /// G1 invariants: the guest-state fields lie in the page, the writable ones among them; `pushf` sees the bank's
     /// flags exactly (FEX ORs each byte shifted by its bit; DF is the byte's sign); DF round-trips.

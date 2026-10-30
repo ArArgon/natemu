@@ -1943,6 +1943,8 @@ clocksource at 25.3 s, and the panic at 42.9 s (287 lines, 78 s of wall time wit
   value, and gives the alarm the time register's PM flag. At 11:59:59 AM an alarm at 12:00:00 PM sets AF here within
   3 s (k9 = 1); QEMU does not (k9 = 0).
 
+**Owner decisions (October 30, after the gap audit):** (1) 64-bit code with the 0x67 address-size prefix is **built**, not refused: exact 32-bit effective-address truncation for LEA, memory forms, strings and branches with exact fault sites (initramfs: 1,435 sites incl. libcrypt's relaxed `addr32 call` and libgcrypt `leal`). (2) VEX gathers and the masked stores (MASKMOVQ, MASKMOVDQU, VMASKMOV/VPMASKMOV) stay **accepted typed refusals**, recorded with census counts. (3) Unmasked floating-point exceptions are **built**: exact #XM for SSE/AVX (and #UD per CR4.OSXMMEXCPT) and #MF for x87 (CR0.NE), replacing the unmasking refusals (I5c). (4) The host split (L0) is **approved**: a host library plus driver crates, tamper hooks turned into a generic stop hook supplied by the test driver, and a clean boot entry for integration. Also from the audit, as architecture rather than choices: forms the profile does not advertise (XOP, RTM, PadLock, reserved VEX/MMX encodings) deliver #UD instead of stopping; the CET hint space (RDSSP, ENDBR) executes as the NOPs it is without CET, while INCSSP, SAVEPREVSSP and RSTORSSP are #UD with CR4.CET = 0 per their SDM pages (corrected after I10; an earlier draft of this paragraph called INCSSP a NOP); XLAT is built.
+
 **Owner decisions (October 30, after L4b):** (1) both remedies for ticks lost while a vCPU is held in the host: a per-device lost-tick policy for periodic timer modes (PIT modes 2/3, the RTC periodic interrupt, the LAPIC periodic timer), either *reinject* (count missed periods and deliver them when the vCPU can take them) or *discard*, with each device's default taken from what QEMU/KVM actually default to (checked, not assumed) and recorded; one-shot timers are unaffected; and (2) remove the cause: K1 (keep translations across CR3/control-register changes) moves up to right after I8, followed by a measured boot breakdown (wall time per phase, compiles, exits by kind, halted time, flushes) against QEMU to the same point. Context: the Debian boot to the root-fs panic took 90,277 host compiles of 0.4–2 ms each; tick expiries merged during those stalls, so the refined-jiffies watchdog marked the TSC unstable and quick PIT calibration failed.
 
 *Built (I8, AVX/AVX2/FMA/F16C; fexc series29 = series28 + patch 0021 + shim changes; reviewed October 30, no blocking defect; the review round's fixes in series30, below):*
@@ -2610,6 +2612,166 @@ the old l3 coverage condition aside), fault suites spot-checked on the review-fi
 caching user-space code independent of its RIP (objects carry RIP literals; about 1 M of the initrd boot's 1.14 M
 compiles); translating fall-through successors ahead of use, which the calibration windows need; the in-memory cache
 still clears wholesale at 65,536 entries; eviction is oldest-written, not least-used.
+
+*Built (S4, debug: single-step, INT1, instruction breakpoints, DR6/DR7; no fexc change, series32):* **Single-step.**
+`find` reads TF at every instruction start; under TF the instruction runs alone (X2's step: a one-instruction block in
+the step slot, never cached or linked, every exit back into the resident; a system instruction as its transaction, from
+its kept decode when K2 has one) with `State::debug_step` set, and its completion (`completed`: a block exit, a committed
+transaction, IRET included) turns it into a pending trap, `State::debug_trap` = DR6.BS, which `find` delivers first at
+the next boundary (Table 7-2 class 4: before NMI and INTR) as `Event::Debug` (EXT = 1, the current RF, RIP the next
+instruction), DR6 = BS with B0-B3 replaced by the instruction breakpoints whose address is the new RIP (enabled or not,
+as the SDM permits and pinned QEMU does); BD/BS/BT are sticky. Any delivery (a fault, INT n/INT3/INTO/INT1) drops the
+pending step: no trap after a faulting or interrupting instruction. TF set by POPF or IRET acts from the next
+instruction; TF cleared by them traps after them (TF at the start decides). A MOV SS shadow discards the trap at its
+boundary (delivery_model A9); the next instruction, still under TF, traps once. A REP string traps after every
+iteration (RIP at the REP, RF = 1 in the frame between iterations, RF = 0 after the last; RCX = 0: one trap after it).
+HLT under TF completes and does not park: the trap is delivered at once with RIP after it (model A10). SYSCALL and
+SYSRET trap after themselves when the TF they leave is 1 (FMASK clearing TF: none; SYSRET loading TF: a #DB before the
+first CPL 3 instruction): the SYSCALL/SYSRET pages say nothing, so this is a choice (accepted October 30) following
+pinned QEMU's rule (`gen_eob_syscall`) and what Linux's `entry_64.S` states for SYSRET; run_s4's `s4-sysret` matches QEMU. Every TF refusal is gone (POPF, IRETQ,
+SYSCALL, SYSRET; syscall_model C3 and segment_model no longer refuse). **Mechanism choice:** (a) Arm hardware step
+(MDSCR_EL1.SS) steps one A64 instruction, while an x86 instruction is several and a block's end is its exit, so it adds
+nothing to (b); (b) the existing step slot: exact, no code-cache or context change, but every stepped non-system
+instruction is a host compile request (answered from the host's compile cache after the first); (c) code keyed by TF in
+`code_context` with cached one-instruction blocks would save that exit, at the cost of a context bit and never linking or
+filling L1 in that context. (b) was taken: TF is rare (debuggers, kprobes/uprobes single-stepping one instruction out of
+line, ptrace), it reuses a checked path, and it costs nothing when TF = 0; (c) is the upgrade if a measured
+single-stepping workload needs it. **INT1** (`f1`, host decode `system::INT1`; fexc already cut it): #DB as a trap,
+RIP past it, EXT = 1, no gate DPL check, the current RF (model A12), DR6 unchanged; DR7.GD cleared on entry as for every
+#DB. **Instruction breakpoints** (DR7 Ln/Gn with R/W = 00; `Cpu::code_breakpoints`): the host ends every block before
+each armed address (`translation`'s byte limit, like the stop RIP and the test hooks; an address inside an instruction
+on that path gives `partial_decode` and is passed over, as the CPU never matches it), so each is the first instruction
+of whatever runs it; `find` checks RIP against them (Table 7-2 class 7, after NMI/INTR) unless RF = 1 or a MOV SS shadow
+holds, and delivers the #DB fault with DR6.Bn and the current RF (0) in the frame (Vol.3 18.3.1.1). A block at an armed
+address is never linked to nor put in L1, so every entry passes the check; a MOV to DR0-3/DR7 that arms an address not
+armed before drops this vCPU's translations (`flush`: blocks translated earlier may span it); disarming keeps them.
+LEN is ignored for R/W = 00 (the SDM requires 00 and leaves others undefined; pinned QEMU ignores it). RF now survives a
+REP string's iterations: `completed` keeps it at a self-exit between iterations (X2's noted difference), so a
+breakpoint on a REP fires once. **Data and I/O breakpoints:** below. **Kernel:** nothing kernel-specific; Linux's
+`clear_debug_registers` (DR0-3, DR6, DR7 = 0) and `local_db_save` reads arm nothing and cost nothing; `hw_breakpoint`,
+kprobes and uprobes single-stepping and `TIF_SINGLESTEP` use TF, INT3 and execute breakpoints, all built.
+**Cost.** The common path gains one test per `find` iteration (a pending trap, TF or any DR7 enable; the work is in
+cold functions) and none in generated code, the dispatcher or links; with no breakpoint armed every object is
+byte-identical (the host's limit list is empty). `run_k2.py cost`, HEAD and S4 interleaved three times each (us per
+iteration, medians): CLI 0.481 / 0.482, STI 0.509 / 0.523, PUSHFQ+POPFQ 0.542 / 0.542, SWAPGS 0.550 / 0.556, RDTSC
+0.512 / 0.514, CPUID 0.488 / 0.495, WRMSR 0.495 / 0.511, FLD+FSTP m80 0.629 / 0.629, `div` 0.153 / 0.150 (a first
+unguarded version cost about 60 ns per resident entry; hence the single guard). Single-stepping costs 5.3 us per
+traced instruction, its #DB and the handler's IRETQ included (a loop of `dec rcx; jnz` under TF, 40,000 and 80,000
+steps; one host step request per instruction, answered from the host's compile cache). **Checks** (`tools/run_s4.py`,
+programs `tools/bench/smp/debug.py`, block sizes default and 1; every event log judged against the SDM's expected log,
+`debug.expect`, and registers/memory against pinned QEMU 11.1.2 system mode): `s4-step` (31 events: MOV/ADD/JMP/CALL/
+RET/PUSH/POP/INC m, REP MOVSB x3, REP STOSB with RCX 0, REPE CMPSB ended at its third element, CPUID, the POPF clearing
+TF), `s4-popf-iret` (15), `s4-movss` (6), `s4-soft` (10: INT3, INT 21H, INT1 under TF; INT1 with DR6 preset),
+`s4-faults` (14: UD2, WRMSR #GP, a #PF whose handler maps the page, each under TF), `s4-xbp` (16: a breakpoint armed
+inside a block already translated and linked; one reached twice by CALL RAX; loop head, mid-block and a kept CPUID
+twice; inside an instruction (never); after MOV SS (suppressed); at REP MOVSB (once); LEN 11; a single-step trap
+landing on an armed address: BS with B3, then no fault (the handler's RF)), `s4-dr` (DR6 write/read-back, DR4/DR5
+aliases, DR7 R/W fields, DR7.GD #DB at the MOV with BD, GD cleared in the handler), `s4-sticky` (7: BS kept over traps,
+then B0|BS at a breakpoint, INT1 leaving DR6 as is), `s4-sysret` (9: SYSRET with TF from R11 at CPL 3, SYSCALL with
+FMASK leaving and clearing TF): 18 of 18 runs match the SDM's logs; `cases` (natemu only, both block sizes): HLT under TF
+(#DB, RIP after the HLT), DR7 refusals for write, read/write, I/O with and without CR4.DE, an instruction breakpoint
+with LEN 01: 12 of 12. Negative controls, each red in a scratch build: no flush when arming (`s4-xbp` misses the
+breakpoint inside the translated block, both block sizes), blocks not cut by the host (misses mid-block ones at the
+default size), blocks at breakpoints linked and put in L1 (misses the second CALL RAX), RF cleared at a REP's self-exit
+(the REP's breakpoint fires at every iteration). Earlier refusal cases updated: X2's `x2-popf-tf` now expects the #DB
+after the next instruction; S2a's `dr7-l0`/`dr7-g3` arm data breakpoints (still refused); S3's `sc-sysret-tf`/
+`sc-syscall-tf` and S2b's `seg-iret-tf` refusal cases removed (their behaviour is `s4-sysret`, `s4-popf-iret`).
+**QEMU departures (pinned 11.1.2), judged by the SDM:** a REP string with RCX = 0 under TF traps once at itself with RF
+= 1 before its normal trap (SDM: no iteration, one trap after it); no instruction-breakpoint suppression after MOV SS
+(model A9 suppresses); the DR7.GD #DB frame holds RF = 0 (a fault: RF = 1, X1a); DR6 bit 12 keeps a written 1 (reserved,
+reads 0); HLT under TF halts with no #DB (model A10: the trap wakes it; QEMU's run never ends). In those programs the
+event log is judged by the SDM alone; their registers and other memory still equal QEMU's.
+**Data and I/O breakpoints** (SDM Vol.3 18.2.4, 18.2.5, 18.3.1.2; `execution/watch.rs`). *Rule:* R/W 01 matches writes,
+11 reads or writes (no fetch), 10 I/O reads or writes and only with CR4.DE (without it the SDM leaves R/W 10 undefined:
+refused, `unsupported_system`); LEN 1, 2, 4, 8 with the address's low bits masked by the length; an access matches when
+any of its bytes lies in the range, so a straddling access matches, several ranges set several B bits; LE/GE are ignored
+(exact breakpoints). A match is a trap after the instruction (`State::data_hits` become `debug_trap` at its completion,
+so a single step's BS comes in the same #DB; a fault or interrupt of the instruction drops them); a REP string traps
+after the iteration that matched (RIP at the REP, RF = 1 in the frame); a MOV SS shadow holds the trap one more
+instruction, even when that one is INT n/INT3 (then before the handler's first instruction; SDM Vol.3A interrupt 1).
+*Generated code:* one Arm watchpoint per armed data breakpoint (DBGWVRn/DBGWCRn: EL0 only, stores for 01, loads and
+stores for 11, its bytes in one doubleword); the host turns off HVF's debug-register and debug-exception traps, so the
+VM owns them (OSLAR_EL1 still traps to the host; the OS lock is found clear). EL0 virtual addresses are x86 linear
+addresses. A watchpoint exception (EC 0x34) in an ordinary block runs the instruction again alone from its start (the
+site's state, as a fault does); in that step block each one adds the bits the site's access meets by the x86 rule,
+then the one Arm access runs with MDSCR_EL1.MDE clear under a hardware software step (IRQs masked) and the step
+exception (EC 0x32) turns watching back on; any other exception taken first (a shadow miss, a split store: SPSR.SS is
+then 1) abandons the step, and the access is watched again when retried. The registers are written only by MOV DR, and
+MDE is set only while one is armed: with none armed nothing changes. *The resident's accesses* are checked where they
+are made: `segments::linear` for every explicit access (POPF, IRET and far-return pops, LGDT/LIDT operands, SGDT/SIDT/
+SLDT/STR stores, LDMXCSR/STMXCSR, FXSAVE/XSAVE images, x87 environment, state and m80 images, OUTS sources), the
+delivery frame's stores (stack writes, not among the SDM's implicit supervisor accesses; the SDM says data breakpoints
+may be detected during FRED event delivery and stay pending after it, Vol.3A 8.3.3, and IDT delivery is taken alike;
+Linux's `hw_breakpoint.c` refuses breakpoints on `cpu_entry_area` because one near an IST stack's top causes
+unrecoverable recursion, Lutomirski's "Prevent data breakpoints on cpu_entry_area"; a breakpoint near the top of
+the handler's stack recurses, as Linux's `hw_breakpoint` notes for its entry stacks), INS destinations, a split
+store, a device completion (M3), the operand-sized unit of BT* (cut while a data breakpoint is armed: FEX touches only
+the byte holding the bit; `bit_tests_cut` is in the code context), and the port of IN/OUT/INS/OUTS for I/O
+breakpoints. Implicit supervisor accesses never count (an accepted choice: the SDM text at hand does not say): descriptor tables,
+the TSS, the IDT, page-table walks and their A/D writes, descriptor accessed and busy bits. A breakpoint whose range is
+not canonical meets no x86 access and is not programmed as a watchpoint (it could otherwise match the resident's private
+window or the guest-state page). *Premise:* a step block holds no exclusive load/store loop (LDAXR/STLXR), which would
+never complete under the hardware step: FEX emits LSE atomics for every LOCK form (I3), and the runners' code-shape
+check, whose allowlist has no exclusive form, refuses any other word. Debug registers and watchpoints are each vCPU's own. *Audit of FEX
+forms:* the native access is x86's for every admitted form the checks exercise (MOV of 1-8 bytes, RMW, LOCK, XCHG,
+CMPXCHG with a failed compare (its write-back is an x86 write: matched), PUSH m, x87 m64, SSE m128, AVX m256, MOVBE,
+MOVS/STOS/LODS/SCAS, CALL/RET, PUSH/POP); BT* differs and is cut; x87 m80, FXSAVE/XSAVE and the system forms are the
+resident's. **Checks** (`run_s4.py`, block sizes default and 1, logs judged by the SDM's expected log and compared with
+QEMU): `s4-d-len{1,2,4,8}-rw{1,3}` (every load and store of 1-8 bytes at the edges of two adjacent ranges, DR0's low bits
+set to be masked: 11-32 events each), `s4-d-forms` (22: RMW, LOCK, XCHG, CMPXCHG failed and succeeded, PUSH m, BT/BTS
+units, x87 m64 and m80, MOVUPS, VMOVDQU ymm, MOVBE, SGDT, a page-crossing store), `s4-d-reps` (7: REP STOSB, MOVSB,
+LODSB, REPE SCASB, MOVSQ), `s4-d-stack` (18: CALL/RET, PUSH/POP, PUSH/POPF, IRETQ, an INT3 frame, MOV SS and MOV SS +
+INT3, TF with a data breakpoint: BS|B0), `s4-d-io` (9: IN/OUT 1 and 2 bytes, REP OUTSB with a source and port match,
+REP INSB with a destination and port match), and after the review `s4-d-sys` (15: FXSAVE, XSAVE/XRSTOR, SGDT/LGDT,
+SIDT/LIDT, MOV DS/LLDT/STR/SLDT memory operands, PCMPISTRI m128, a far CALL's pushes) and `s4-d-edges` (54 of 112
+accesses hit: 28 forms at both edges of a range, a byte inside, a byte past; the byte-exactness audit of FEX's native
+accesses: none wider or narrower than x86's; QEMU agrees on every one): all match the SDM's logs; cases: a
+device-page store and load (and a miss), the per-vCPU registers at 2 vCPUs, R/W 10 without DE refused: all pass. A
+negative control for each resident check is red when it is disabled (explicit accesses, INS, ports, split store, device
+completion, BT unit, BT cut, delivery frame, and running the hit in place instead of stepping its instruction).
+**QEMU departures (data/I-O):** QEMU does not mask DRn by LEN; reports one B bit when two ranges match and keeps stale
+hit bits on later #DBs; traps a REP string after the whole instruction; ends REP OUTS after the element that met an I/O
+breakpoint (RIP past it); pushes RF = 1 for I/O breakpoint traps; does not hold a data breakpoint over MOV SS; aborts
+(`bql_lock_impl` assertion) when an exception frame's store meets a breakpoint, so `s4-d-stack` is judged by the SDM
+alone.
+**Boot:** Debian 6.12 without initrd at N = 1 (as K1's run) reaches the root-fs panic at 29.87 s guest, 52.1 s wall.
+*S4 review round (October 30; an independent review, one blocking defect):* **Blocking, fixed:** an instruction
+breakpoint could fire between iterations of a REP string: after MOV SS then a REP MOVSB at an armed address (the
+shadow suppressed it at the start, RF stayed 0, so it fired at the first self-exit) and on REP OUTSB/INSB entered with
+RF = 1 (the port transaction committed, clearing RF, before marking the boundary mid-string): once per element. The
+check is never made mid-instruction now (`code_break` skips a boundary with `mid_string`), and a port string marks
+the boundary before it commits, so RF stays between its elements. Regression programs `s4-r-movss-rep` (no #DB),
+`s4-r-rep-outs` (one, before the REP) and `s4-r-tf-outs` (a trap per element, RF = 1 between) match the SDM at both
+block sizes. **Also:** `step()`'s fetch-fault fallback now goes through `find`'s boundary (it stepped the handler's
+first instruction without the breakpoint check); a BT* form under alignment checking runs its plain step at once
+inside `step_here` (TF counted once, `plain_step` never left for another instruction); segment_model keeps the RF an
+IRETQ frame holds; `completed` touches nothing new when TF is off and nothing is armed (the review measured about
+13 ns per resident entry from writing the step marker unconditionally). **Untested choice:** a SYSRET with TF = 1 at
+its start and TF = 0 in R11 gives no trap (the rule above: the TF it leaves decides); QEMU agrees; Intel's behaviour is
+not known.
+*S4 part-2 review (October 30; an independent review, no blocking defect, two fixed):* an external interrupt or NMI
+whose frame store met a data breakpoint trapped one instruction late (after the handler's first instruction): event
+delivery now ends `events::take`'s loop when a trap is pending and `find` takes the trap first (`s4-d-ext-frame`, an
+x2APIC self-IPI whose frame meets a write breakpoint; red with the check removed); a breakpoint on a non-canonical range
+was programmed as a watchpoint and one over the guest-state page halted the run (`unknown_abort`): such ranges are no
+longer programmed (`s4-d-noncanon`, the review's four breakpoints on guest-state fields; red with the check removed).
+QEMU departure: it takes no trap for the interrupt frame's store.
+*S4 final (f8f3fa2 + S4, fexc series33):* the state record grows by one word (`State::debug`: the pending trap's DR6
+bits, the instruction's data/I-O hits, the step mark; the counters `debug_steps`, `debug_traps`, `code_breaks`,
+`watch_hits` and `watchpoints` live in the cache's control record, which is not copied: a 64-byte larger state alone
+measured about +10 ns per resident entry). `run_k2.py cost` (5 repetitions, N = 200,000, interleaved, load average 5),
+f8f3fa2 / S4, us per iteration: CLI 0.5226 / 0.5241, STI 0.5485 / 0.5499, PUSHFQ+POPFQ 0.5745 / 0.5738, SWAPGS 0.5884 /
+0.5917, WRMSR 0.5486 / 0.5498, CPUID 0.5252 / 0.5295, FLD+FSTP m80 0.6660 / 0.6531, `div` 0.1626 / 0.1690 (run-to-run
+noise about 10 ns). ID_AA64DFR0_EL1.WRPs = 3 on the M4: 4 watchpoints, one per x86 breakpoint (a fifth could not be
+armed; the resident refuses one beyond the PE's count). `run_s4.py`: 28 programs x 2 block sizes, 56 of 56 runs match
+the SDM's logs, 14 of 14 cases. Negative controls, each red in a scratch build (natemu-side SDM failures): explicit
+resident accesses 44, INS 2, ports 18, split store 2, device completion 4 (cases), BT unit 32, BT cut 32, delivery
+frame 20, the mid-REP guard 2, no flush when arming 30, no host cut 14, blocks at breakpoints linked or in L1 28, a hit
+run in place instead of its instruction stepped 32; RF kept over a REP's self-exits no longer shows (the mid-REP guard
+covers what it protected; kept as the SDM's state). Boot without initrd at N = 1, warm compile cache, two runs each:
+f8f3fa2 12.50, 12.54 and 12.62 s wall, root-fs panic at 1.31-1.38 s guest; S4 (final build) 12.69 and 12.76 s, 1.41 and
+1.42 s. The standing suite on f8f3fa2 + S4 is green (i8b's 7 known QEMU NaN departures; one L4b run lost QEMU's S5
+power-off, green on rerun).
 
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 

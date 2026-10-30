@@ -57,7 +57,7 @@ class FastCalls(unittest.TestCase):
         self.assertEqual(m.syscall(s)['fault'], UD)
         s = machine(cpl=3)
         s['rflags'] = 0x302
-        self.assertEqual(m.syscall(s)['outcome'], 'refused')                            # TF (C3)
+        self.assertEqual(m.syscall(s)['outcome'], 'done')                               # TF (C3): FMASK decides
         s = machine(cpl=3)
         s['msrs']['star'] = 0x0023_0013_0000_0000                                       # C2: SS keeps the RPL bits
         k = m.syscall(s)['state']
@@ -83,9 +83,9 @@ class FastCalls(unittest.TestCase):
         self.assertEqual(m.sysret(bad)['fault'], GP)                                    # non-canonical before TF
         self.assertEqual(m.sysret(bad, width=4)['outcome'], 'refused')                  # SYSRETL: no RCX check
         s['gpr']['r11'] = 0x302
-        self.assertEqual(m.sysret(s)['outcome'], 'refused')                             # TF after (C3)
+        self.assertEqual(done(self, m.sysret(s))['rflags'], 0x302)                     # TF after (C3)
         s['gpr']['r11'] = 0x202
-        self.assertEqual(m.sysret(dict(s, rflags=0x302))['outcome'], 'refused')         # TF before (C3)
+        self.assertEqual(done(self, m.sysret(dict(s, rflags=0x302)))['rflags'], 0x202)  # TF before (C3)
         s['gpr']['r11'] = 0x40202
         self.assertEqual(m.sysret(s)['outcome'], 'done')                                # AC, CR0.AM = 0
         self.assertEqual(m.sysret(dict(s, cr0=0x8005_0011))['outcome'], 'done')         # AC with AM: completes (C5)

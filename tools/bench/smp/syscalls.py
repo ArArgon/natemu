@@ -309,9 +309,6 @@ def cases():
         ('sysret-sce0', '', None, 'o64 sysret', lambda: sc.sysret(state(0, gpr={'rcx': u, 'r11': 2})), 0),
         ('sysret-noncanonical', SCE + f'    mov rcx, {NONCANONICAL:#x}\n    mov r11d, 2\n', None, 'o64 sysret',
          lambda: sc.sysret(state(0, efer=0xd01, gpr={'rcx': NONCANONICAL, 'r11': 2})), 0),
-        ('sysret-tf', SCE + f'    mov rcx, {u:#x}\n    mov r11d, 0x102\n', None, 'o64 sysret',
-         lambda: sc.sysret(state(0, efer=0xd01, gpr={'rcx': u, 'r11': 0x102})), 0, 'unsupported_system'),
-        ('syscall-tf', SCE, None, 'syscall', lambda: sc.syscall(dict(state(0, efer=0xd01), rflags=0x102)), 0, 'unsupported_system'),
         ('sysretl', SCE + f'    mov ecx, {u:#x}\n    mov r11d, 2\n', None, 'sysret',
          lambda: sc.sysret(state(0, efer=0xd01, gpr={'rcx': u, 'r11': 2}), width=4), 0, 'unsupported_mode'),
         ('swapgs-cpl3', '', '', 'swapgs', lambda: sc.swapgs(state(3)), 3),
@@ -363,8 +360,6 @@ def fault_programs():
                                     'permitted': sorted(([o, zero(list(x)) if x else None] for o, x in r['permitted']), key=str)}}
         if stop:
             prog['params']['stop'] = stop
-        if name == 'syscall-tf':
-            prog['cpus'][0]['rflags'] = '0x102'   # natemu only (a refusal: QEMU is not run); TF from the start
         out.append(prog)
     return out
 

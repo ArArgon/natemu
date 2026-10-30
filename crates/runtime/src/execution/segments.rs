@@ -26,7 +26,6 @@ fn ss(selector: u16) -> Exception {
     [12, u64::from(selector & 0xfffc), 0]
 }
 const RFLAGS_NT: u64 = 1 << 14;
-const RFLAGS_TF: u64 = 1 << 8;
 const RFLAGS_IF: u64 = 1 << 9;
 const RFLAGS_IOPL: u64 = 3 << 12;
 const RFLAGS_VM: u64 = 1 << 17;
@@ -160,6 +159,10 @@ pub(super) fn linear(s: &mut State, va: u64, buf: &mut [u8], write: bool, superv
         }
     }
     let gpa = pages(s, va, n, write, supervisor, noncanonical)?;
+    // S4: an explicit access meets data breakpoints; an implicit supervisor one (descriptor tables, TSS, IDT) never does.
+    if !supervisor {
+        super::watch::access(s, va, n, write);
+    }
     let first = (4096 - (va & 4095)).min(n) as usize;
     // Only guest RAM is accessed, and nothing is written unless every byte is RAM (M3: a device page stops first).
     if !super::mmio::ram(gpa[0]) || (first < n as usize && !super::mmio::ram(gpa[1])) {
@@ -423,7 +426,7 @@ fn far_transfer(s: &mut State, i: System) -> Result<u64, Exception> {
 /// refused (`unsupported_mode`) before any effect. IRET's RFLAGS follow the CPL and IOPL masks. A return to an outer
 /// level nulls DS/ES/FS/GS that are null or hold data or nonconforming code with DPL below the new CPL (segment_model B5)
 /// and changes the CPL ([`set_cpl`]). IRET releases NMI blocking before this runs, even when it faults (`system`); a TF
-/// it would set stops `unsupported_system` (single-step is S4's); RF is loaded from the frame.
+/// it loads takes effect after the next instruction (S4); RF is loaded from the frame.
 fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     let c = s.cpu;
     let (w, iret, release) = (u64::from(i.size), i.kind == system::IRET, i.disp as u64);
@@ -495,11 +498,8 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     if iret {
         let mask = IRET_ALWAYS | if cpl <= (c.rflags & RFLAGS_IOPL) >> 12 { RFLAGS_IF } else { 0 } | if cpl == 0 { IRET_CPL0 } else { 0 };
         rflags = (c.rflags & !mask | words[2] & mask) & !RFLAGS_VM | 2;
-        if rflags & RFLAGS_TF != 0 {
-            halt(s, stop::UNSUPPORTED_SYSTEM)
-        }
         // RF comes from the frame (X1a) and lasts until the next instruction completes (`execution::completed`); it
-        // suppresses instruction breakpoints, which S4 arms.
+        // suppresses an instruction breakpoint there (S4).
     }
     accessed(s, va, raw)?;
     if let Some((_, _, Some((ss_va, ss_raw)))) = stack {

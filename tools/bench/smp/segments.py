@@ -391,7 +391,7 @@ def cases():
     c.append(('jmp-far-compat',) + far(0x38) + (lambda s: sm.far(_ptr(s, 0x110000, 0x38), 'jmp', d + PTR + 0x90), {}))
     c.append(('jmp-far-call-gate',) + far(0xb0) + (lambda s: sm.far(_ptr(s, 0x110000, 0xb0), 'jmp', d + PTR + 0x90), {}))
     c.append(('lret-compat',) + ret([0x110000, 0x38]))
-    c.append(('iret-tf',) + iret([0x110000, 0x08, 0x102, P.STACK(0), 0x10]))
+    # (An IRETQ loading TF is no longer a refusal: its single-step trap is S4's, tools/run_s4.py `s4-popf-iret`.)
     c.append(('iret-null-ss-rpl',) + iret([0x110000, 0x08, 2, P.STACK(0), 0x1]))
     c.append(('iret-dpl3-ss',) + iret([0x110000, 0x08, 2, P.STACK(0), 0x18]))
     c.append(('iret-ss-not-present',) + iret([0x110000, 0x08, 2, P.STACK(0), 0xc8]))

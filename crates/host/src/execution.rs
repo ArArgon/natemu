@@ -694,8 +694,9 @@ pub(crate) struct Compiler {
     /// The vCPU's controls gate the VEX AVX forms (I8: no CR4.OSXSAVE, XCR0[2:1] != 11b, or CR0.TS, [`avx_gated`]): fexc cuts
     /// them as system instructions, which the resident raises as #UD or #NM. Set per request, like `sse_gated`.
     pub(crate) avx_gated: bool,
-    /// The vCPU runs under alignment checking (X2: CR0.AM, RFLAGS.AC, CPL 3): fexc cuts every BT* memory form as a system
-    /// instruction, which the resident checks for #AC and then steps compiled without it (`State::plain_step`).
+    /// The vCPU runs under alignment checking (X2: CR0.AM, RFLAGS.AC, CPL 3) or with a data breakpoint armed (S4,
+    /// `Cpu::bit_tests_cut`): fexc cuts every BT* memory form as a system instruction, which the resident checks (#AC, the
+    /// operand-sized unit against the breakpoints) and then steps compiled without it (`State::plain_step`).
     pub(crate) alignment_gated: bool,
     /// The vCPU's x87 gating and rounding (I6, [`x87_args`]): fexc's `--x87-gated`, `--wait-gated` and `--x87-fpcr` arguments.
     pub(crate) x87: Vec<String>,
@@ -1181,18 +1182,31 @@ fn translation(
     }
     // Blocks end at the stop RIP and at every switch and event source after RIP.
     let hooks = requests.switches.range(rip..).map(|(&r, _)| r).chain(requests.posts.range(rip..).map(|(&r, _)| r));
-    let limit = hooks.chain(stop_at).filter(|&l| l > rip).min();
-    let Fetched { bytes, more, next_fault } = match fetched(area, state, limit)? {
-        Ok(fetched) => fetched,
-        // RIP's page faults: the resident delivers it (`state.fetch_fault`); nothing is compiled.
-        Err(Stop::FetchFault(Fault::Page { .. } | Fault::Noncanonical)) => return Ok(Ok(exec::REPLY_FETCH_FAULT)),
-        Err(stop) => return Ok(Err(stop)),
+    let hooks = hooks.chain(stop_at).filter(|&l| l > rip).min();
+    // S4: and before every armed instruction breakpoint, so each is the first instruction of a block (the resident checks
+    // it there); one inside an instruction on this path is never reached and is passed over.
+    let mut breakpoints: Vec<u64> = state.cpu.code_breakpoints().filter(|&b| b > rip).collect();
+    let (code, more, next_fault) = loop {
+        let limit = breakpoints.iter().copied().chain(hooks).min();
+        let Fetched { bytes, more, next_fault } = match fetched(area, state, limit)? {
+            Ok(fetched) => fetched,
+            // RIP's page faults: the resident delivers it (`state.fetch_fault`); nothing is compiled.
+            Err(Stop::FetchFault(Fault::Page { .. } | Fault::Noncanonical)) => return Ok(Ok(exec::REPLY_FETCH_FAULT)),
+            Err(stop) => return Ok(Err(stop)),
+        };
+        compiler.sse_gated = sse_gated(&state.cpu);
+        compiler.avx_gated = avx_gated(&state.cpu);
+        compiler.x87 = x87_args(&state.cpu);
+        compiler.alignment_gated = state.cpu.bit_tests_cut() && !(step && state.plain_step != 0);
+        let code = compiler.compile(&bytes, rip, step)?;
+        match &code {
+            // The instruction at RIP runs past a breakpoint the bytes were cut at.
+            Code::None(reason) if reason == "partial_decode" && limit != hooks && limit == Some(rip + bytes.len() as u64) => {
+                breakpoints.retain(|&b| Some(b) != limit)
+            }
+            _ => break (code, more, next_fault),
+        }
     };
-    compiler.sse_gated = sse_gated(&state.cpu);
-    compiler.avx_gated = avx_gated(&state.cpu);
-    compiler.x87 = x87_args(&state.cpu);
-    compiler.alignment_gated = state.cpu.alignment_check() && !(step && state.plain_step != 0);
-    let code = compiler.compile(&bytes, rip, step)?;
     let ran_out = match &code {
         Code::Block(b) => b.end_reason == natemu_abi::code_object::end_reason::END_OF_INPUT,
         Code::None(reason) => reason == "partial_decode" || reason == "end_of_input",

@@ -26,8 +26,9 @@ C1  SYSCALL's R11 image of RF: pseudocode "R11 := RFLAGS" (model: RF as it was);
     alternatives: R11 with RF = 0. The new RFLAGS has RF = 0 (RF is cleared when an instruction completes, Vol. 3B).
 C2  SYSCALL SS selector = STAR[47:32] + 8, RPL bits not masked (SDM pseudocode; AMD APM and KVM agree); QEMU masks it to
     RPL 0. Not widened (the SDM is explicit), but QEMU differs: compare against QEMU only with STAR[33:32] = 0.
-C3  Single-step (not built): SYSCALL with TF = 1 on entry, and SYSRET with TF = 1 before or after, are 'refused' after
-    every fault check (whether SYSCALL traps when FMASK clears TF is not stated in the SYSCALL page).
+C3  Single-step: TF changes neither instruction (the SYSCALL/SYSRET pages say nothing of it). Whether a #DB trap follows
+    them is outside this model (natemu's S4, tools/run_s4.py: after SYSCALL or SYSRET when the TF they leave is 1, pinned
+    QEMU's rule and the behaviour Linux's entry_64.S describes for SYSRET).
 C4  SYSRET to 64-bit mode with non-canonical RCX: #GP(0) at CPL 0 before any change (Intel). AMD completes SYSRET and
     faults at CPL 3 on the fetch; AMD also leaves stale SS attributes. Neither widened (Intel profile).
 C5  SYSRET whose new RFLAGS.AC = 1 with CR0.AM = 1 completes (alignment checking, built by X2, then applies to the
@@ -106,8 +107,6 @@ def syscall(state):
         if not s['efer'] & SCE:
             raise Fault(UD)
         flags = s['rflags']
-        if flags & TF:
-            raise Refused('TF (single-step)')                       # C3
         sel = s['msrs']['star'] >> 32 & 0xFFFF
         s['gpr']['rcx'] = s['rip'] + s['length']
         s['gpr']['r11'] = flags                                     # C1
@@ -140,8 +139,6 @@ def sysret(state, width=8):
         if not canonical(rcx):
             raise Fault(GP, 0)                                      # C4
         flags = s['gpr']['r11'] & SYSRET_FLAGS | 2
-        if (s['rflags'] | flags) & TF:
-            raise Refused('TF (single-step)')                       # C3
         base = s['msrs']['star'] >> 48 & 0xFFFF
         s['rip'], s['rflags'], s['cpl'] = rcx, flags, 3
         s['cs'], s['ss'] = (base + 16 | 3) & 0xFFFF, (base + 8 | 3) & 0xFFFF

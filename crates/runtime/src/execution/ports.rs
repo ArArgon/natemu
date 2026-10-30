@@ -97,6 +97,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     if matches!(i.kind, system::IN | system::OUT) {
         let port = if i.reg == system::NO_REG { u64::from(i.cr) } else { c.gpr[2] & 0xffff };
         permitted(s, port, size)?;
+        super::watch::port(s, port, size);
         if i.kind == system::IN {
             let v = access(s, port, size, None);
             let rax = &mut s.cpu.gpr[0];
@@ -152,19 +153,21 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             }
             cache::rechecked(gpa);
         }
+        super::watch::access(s, va, size, true);
     } else {
         segments::linear(s, va, element, false, false, GP0)?;
         access(s, port, size, Some(u64::from(u32::from_le_bytes(bytes))));
     }
+    super::watch::port(s, port, size);
     let step = if c.rflags & RFLAGS_DF != 0 { size.wrapping_neg() } else { size };
     s.cpu.gpr[reg] = offset.wrapping_add(step) & wide;
     if rep {
         let count = (c.gpr[1] & wide) - 1;
         s.cpu.gpr[1] = count;
         if count != 0 {
-            // Between two elements: RIP stays at the instruction (its kept decode runs the next element).
-            commit(s, System { length: 0, ..i }, false);
+            // Between two elements: RIP stays at the instruction (its kept decode runs the next element); RF stays (S4).
             s.mid_string = 1;
+            commit(s, System { length: 0, ..i }, false);
             return Ok(());
         }
     }

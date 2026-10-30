@@ -12,8 +12,8 @@ TSS available/busy, C = call gate), "TSS Descriptor in 64-bit Mode" and "LDT" (1
 
 Scope: IA-32e mode, CS a 64-bit code segment (L = 1, D = 0). Compatibility mode is not built (natemu's owner decision 3):
 a far transfer or return whose target CS is not a 64-bit code segment (L = 0, or L = D = 1) is `refused`, after the
-descriptor checks the SDM makes before the mode matters; so is a 64-bit call gate (not built) and an IRET that would set
-TF (single-step: natemu's S4). Paging is delivery_model's abstraction (`memory`: page number -> {'data', 'write',
+descriptor checks the SDM makes before the mode matters; so is a 64-bit call gate (not built). An IRET loading TF is
+done (its single-step trap after the next instruction is natemu's S4). Paging is delivery_model's abstraction (`memory`: page number -> {'data', 'write',
 'user'}); descriptor-table and TSS-descriptor accesses are implicit supervisor accesses (CPL 0 rights, U/S = 0 in a #PF),
 operand and stack accesses are made at the CPL.
 
@@ -324,9 +324,7 @@ def ret(state, width=8, release=0, iret=False):
         if iret:
             mask = IRET_ALWAYS | (IF if cpl <= (s['rflags'] & IOPL) >> 12 else 0) | (IOPL | VIF | VIP if cpl == 0 else 0)
             flags = (s['rflags'] & ~mask | words[2] & mask) & ~VM | 2
-            if flags & TF:
-                raise Refused('TF (single-step)')
-            s['rflags'] = flags & ~RF                              # natemu drops RF (no breakpoints before S4)
+            s['rflags'] = flags                                    # RF from the frame (it suppresses an instruction breakpoint)
         _accessed(bus, caddr, raw)
         if stack and stack[2]:
             _accessed(bus, *stack[2])

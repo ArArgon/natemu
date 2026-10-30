@@ -92,6 +92,11 @@ pub(super) fn take(s: &mut State) -> bool {
         };
         let mid_string = s.mid_string != 0;
         deliver(s, Event::External { vector: event, mid_string });
+        // S4: a frame store that met a data breakpoint traps before anything else at the handler's first boundary
+        // (the caller takes it first; a delivery ended any shadow, so nothing holds it).
+        if s.debug & debug::TRAP != 0 {
+            return false;
+        }
     }
 }
 
@@ -124,7 +129,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
 /// POPF/POPFQ (SDM Vol.2 POPF, 64-bit mode, VM = 0): pops 8 bytes (2 with a 66 prefix) at RSP (#SS(0) non-canonical,
 /// #PF, #AC at CPL 3) and writes the flags the CPL allows: at CPL 0 every flag of [`POPF_FLAGS`]; above CPL 0 not IOPL,
 /// and not IF when CPL > IOPL (both stay as they were, no fault). RF, VM, VIF and VIP are unaffected (RF then ends with
-/// the instruction, `commit`). Setting TF stops `unsupported_system` before any effect: single-step is S4's.
+/// the instruction, `commit`). A TF it sets takes effect after the next instruction (S4: `find` reads TF at each start).
 fn popf(s: &mut State, i: System) -> Result<(), Exception> {
     let n = i.size as usize;
     let rsp = s.cpu.gpr[4];
@@ -137,11 +142,7 @@ fn popf(s: &mut State, i: System) -> Result<(), Exception> {
             mask &= !IF;
         }
     }
-    let rflags = s.cpu.rflags & !mask | u64::from_le_bytes(b) & mask;
-    if rflags & TF != 0 {
-        halt(s, stop::UNSUPPORTED_SYSTEM)
-    }
-    s.cpu.rflags = rflags | 2;
+    s.cpu.rflags = s.cpu.rflags & !mask | u64::from_le_bytes(b) & mask | 2;
     s.cpu.gpr[4] = rsp.wrapping_add(n as u64);
     Ok(())
 }
@@ -169,6 +170,9 @@ pub(super) fn bit_test(s: &mut State, i: System) -> Result<(), Exception> {
         ea.wrapping_add((offset >> (size * 8).trailing_zeros()) as u64 * size)
     };
     let last = unit.wrapping_add(size - 1);
+    // S4: the operand-sized unit x86 accesses (a read, a write too for BTS/BTR/BTC) meets data breakpoints; the plain step
+    // that follows touches only the byte holding the bit.
+    super::watch::access(s, unit, size, i.cr != 0);
     if s.cpu.alignment_check() && ea & (size - 1) != 0 && paging::canonical(unit) && paging::canonical(last) && last > unit {
         return Err([17, 0, 0]);
     }
