@@ -229,6 +229,11 @@ pub(crate) fn post(memory: &Memory, v: usize, event: u64, level: bool) -> bool {
     event_word(memory, v, std::mem::offset_of!(cache::Events, posts)).fetch_add(1, SeqCst);
     true
 }
+/// L4b: whether `vector` is still in vCPU `v`'s IRR (posted, not yet accepted into service).
+pub(crate) fn pending(memory: &Memory, v: usize, vector: u64) -> bool {
+    let w = event_word(memory, v, std::mem::offset_of!(cache::Events, vectors) + 8 * (vector as usize / 64 % 4)).load(SeqCst);
+    w >> (vector % 64) & 1 != 0
+}
 /// L4a: vCPU `v`'s published APIC word (what senders match destinations against, `natemu_abi::lapic::published`).
 pub(crate) fn published(memory: &Memory, v: usize) -> u64 {
     event_word(memory, v, std::mem::offset_of!(cache::Events, apic)).load(SeqCst)
@@ -466,6 +471,9 @@ pub(crate) enum Stop {
     Watchdog { pc: u64, el0: bool, asked: u8 },
     /// A peer's failure cancelled the run (imprecise when the vCPU was forced out).
     Cancelled,
+    /// L4b: a port write asked the platform to power off (PM1a_CNT SLP_EN with `_S5`'s SLP_TYP, `pm::POWEROFF`) or to
+    /// reset (the FADT reset register, `pm::RESET`); the write was made, RIP is at the writing instruction.
+    Power(u8),
 }
 
 /// One `fexc --serve` process (protocol in tools/fexc/fexc.cpp): length-prefixed requests and replies on its stdin/stdout.
@@ -960,6 +968,11 @@ fn serve(
                 }
                 crate::devices::serve_port(area, &mut state, requests.devices.as_deref());
                 area.write_record(exec::STATE_OFFSET, state);
+                // L4b: power off or reset ends the run here (the driver cancels the other vCPUs).
+                match requests.devices.as_deref().map_or(0, |d| d.power()) {
+                    0 => {}
+                    power => return Ok(Stop::Power(power)),
+                }
                 continue;
             }
             // L4a: an EOI broadcast or an ExtINT's INTA cycle, at the interrupt controllers (never parked).

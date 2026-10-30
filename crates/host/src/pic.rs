@@ -33,7 +33,6 @@ pub(crate) struct Chip {
     master: bool,
 }
 impl Chip {
-    #[cfg(test)]
     pub(crate) fn irr_bits(&self) -> u8 {
         self.irr
     }
@@ -195,6 +194,11 @@ impl Pic {
     pub(crate) fn set_irq(&mut self, irq: u8, level: bool) {
         self.chips[usize::from(irq >= 8)].set_irq(irq & 7, level);
         self.cascade();
+    }
+    /// L4b: whether line `irq` (0..15) is masked: at its chip's IMR, or a slave line at the master's IRQ 2.
+    pub(crate) fn masked(&self, irq: u8) -> bool {
+        let m = |chip: usize, bit: u8| self.chips[chip].imr >> bit & 1 != 0;
+        if irq < 8 { m(0, irq) } else { m(1, irq - 8) || m(0, 2) }
     }
     /// The master's INT output (`pic_get_output`).
     pub(crate) fn output(&self) -> bool {

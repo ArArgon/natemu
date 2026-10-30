@@ -5,7 +5,10 @@
 //!       [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]
 //!       [--serial FILE] [--strict-unassigned]
 //!
-//! L4a: and the I/O APIC and 8259 pair ([`crate::irq`]). L3: the VM has COM1, a 16550A at ports 3F8H-3FFH ([`crate::uart`]), whose output goes to `--serial FILE` as it is
+//! L4a: and the I/O APIC and 8259 pair ([`crate::irq`]). L4b: the PIT, the RTC and the ACPI PM block ([`crate::clock::install`]);
+//! S5 or the reset register end the run with the stop `poweroff` or `reset`. L5: `--lost-ticks pit=reinject|discard,rtc=..,
+//! lapic=..` sets the periodic sources' lost-tick policies (`clock::LostTicks`); the result gains `ticks` (each source's
+//! counts), and `--clock-trace FILE` writes them every 20 ms against the guest's TSC. L3: the VM has COM1, a 16550A at ports 3F8H-3FFH ([`crate::uart`]), whose output goes to `--serial FILE` as it is
 //! sent; every other port and every device-range page is unassigned (all-ones reads, ignored writes, counted; with
 //! `--strict-unassigned` a typed stop). The result gains `ports` and `unassigned_pages` (counts) and `serial_bytes`.
 //!
@@ -27,7 +30,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] \
-                     [--rsdp ADDR] [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N] [--serial FILE] [--strict-unassigned]";
+                     [--rsdp ADDR] [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N] [--serial FILE] [--strict-unassigned] [--lost-ticks SPEC] [--clock-trace FILE]";
 /// Largest image or initrd read (the protocol's 32-bit sizes).
 const MAX_INPUT: usize = 1 << 32;
 
@@ -48,6 +51,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let (mut stop_at, mut saves, mut watchdog_ms, mut max_block) = (None, Vec::new(), 60_000, None);
     let mut code_bytes = exec::cache::CODE_BYTES_MAX - exec::cache::HEAD_BYTES;
     let (mut serial, mut strict) = (None, false);
+    let (mut lost, mut trace) = (crate::clock::LostTicks::DEFAULT, None);
     let mut options = options.iter();
     while let Some(option) = options.next() {
         let mut value = || options.next().ok_or_else(|| USAGE.to_string());
@@ -61,6 +65,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             "--load-only" => load_only = true,
             "--serial" => serial = Some(value()?.clone()),
             "--strict-unassigned" => strict = true,
+            "--lost-ticks" => lost = crate::clock::LostTicks::parse(value()?)?,
+            "--clock-trace" => trace = Some(value()?.clone()),
             "--dump" => dump = Some(value()?.clone()),
             "--stop-at" => stop_at = Some(number(value()?)?),
             "--save" => saves.push((number(value()?)?, number(value()?)?, value()?.clone())),
@@ -102,6 +108,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
     execution::guest_ram_written(&backing.memory);
     execution::set_cpu(backing.vcpu(0), loaded.cpu);
+    execution::set_lapic(backing.vcpu(0), natemu_abi::lapic::Lapic { reinject: u64::from(lost.lapic), ..natemu_abi::lapic::RESET });
 
     // L3: COM1 and the unassigned rule.
     let uart = std::sync::Arc::new(std::sync::Mutex::new(crate::uart::Uart::new()));
@@ -112,6 +119,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     devices.register_ports(boot::acpi::platform::COM1_PORT.into(), 8, uart.clone())?;
     // L4a: the I/O APIC, the 8259 pair and their wires.
     let irqs = crate::irq::install(&mut devices, &backing.memory, 1, &uart)?;
+    // L4b: the PIT and port 61H, the RTC, the ACPI PM block and reset register.
+    let board = crate::clock::install(&mut devices, &irqs, lost)?;
     devices.strict = strict;
     let devices = std::sync::Arc::new(devices);
     let machine = Machine::create(&backing.memory)?;
@@ -132,7 +141,30 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         Ok((stop?, compiler.compiles))
     };
     let started = std::time::Instant::now();
-    let supervision = owners::supervise(1, &prepare, &body);
+    // L5: `--clock-trace FILE`, every 20 ms: TSC ns since the VM's epoch (the guest's TSC), then the PIT's and RTC's tick
+    // counts (`clock::TickStats`) and the LAPIC timer's expiries taken, merged and reinjected (its record, read racily).
+    let tracing = std::sync::atomic::AtomicBool::new(trace.is_some());
+    let supervision = std::thread::scope(|scope| -> Result<_> {
+        if let Some(path) = &trace {
+            let mut file = std::io::BufWriter::new(fs::File::create(path).map_err(|e| format!("{path}: {e}"))?);
+            let (board, backing, tracing) = (&board, &backing, &tracing);
+            scope.spawn(move || {
+                use std::io::Write as _;
+                let area = backing.vcpu(0);
+                let n = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::SeqCst);
+                while tracing.load(std::sync::atomic::Ordering::SeqCst) {
+                    let t = execution::ticks_ns(crate::clock::now()) - execution::ticks_ns(area.epoch);
+                    let (p, r, l) = (&board.pit, &board.rtc, execution::lapic(area));
+                    let _ = writeln!(file, "{t} pit {} {} {} {} {} {} rtc {} {} {} lapic {} {} {}", n(&p.rises), n(&p.fresh), n(&p.coalesced), n(&p.dropped),
+                        n(&p.missed), n(&p.reinjected), n(&r.rises), n(&r.missed), n(&r.reinjected), l.fired, l.missed, l.reinjected);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            });
+        }
+        let s = owners::supervise(1, &prepare, &body);
+        tracing.store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(s)
+    })?;
     let destroyed = machine.destroy();
     let supervision = supervision?;
     hv(destroyed, "destroy VM")?;
@@ -148,11 +180,13 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         fs::write(path, bytes).map_err(|e| format!("{path}: {e}"))?;
     }
     let s: State = backing.vcpu(0).read_record(exec::STATE_OFFSET);
+    let lapic_end = execution::lapic(backing.vcpu(0));
     // M1 pool use: the code cache and metadata arena filled since the last flush, and the shadow pool's resets.
     let c: exec::cache::Control = backing.vcpu(0).read_record(exec::cache::LOOKUP_OFFSET + exec::cache::CONTROL);
     let (kind, reason) = match &stop {
         Stop::Reached => ("reached".to_string(), String::new()),
         Stop::Resident { stop: exec::stop::SHUTDOWN, .. } => ("shutdown".into(), format!("fault {:x?}", s.fault)),
+        Stop::Power(p) => (super::program::power_name(*p).into(), String::new()),
         Stop::Resident { stop, status, detail } => {
             let m: exec::Mmio = backing.vcpu(0).read_record(exec::MMIO_OFFSET);
             // The access only where the host answered for it (a refusal before any request names none: just its status).
@@ -165,7 +199,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         other => (format!("{other:?}").split(['(', ' ', '{']).next().unwrap().to_lowercase(), format!("{other:?}")),
     };
     println!(
-        "{},\"stop\":\"{kind}\",\"reason\":\"{}\",\"state\":{},\"stats\":{{\"blocks\":{},\"compiles\":{compiles},\"systems\":{},\"flushes\":{},\"interrupts\":{},\"evictions\":{},\"retries\":{},\"shadow_resets\":{},\"cache\":{{\"code_used\":{},\"code_bytes\":{},\"meta_used\":{},\"blocks\":{}}},\"seconds\":{:.3}}},{},\"serial_bytes\":{}}}",
+        "{},\"stop\":\"{kind}\",\"reason\":\"{}\",\"state\":{},\"stats\":{{\"blocks\":{},\"compiles\":{compiles},\"systems\":{},\"flushes\":{},\"interrupts\":{},\"evictions\":{},\"retries\":{},\"shadow_resets\":{},\"cache\":{{\"code_used\":{},\"code_bytes\":{},\"meta_used\":{},\"blocks\":{}}},\"seconds\":{:.3}}},{},\"serial_bytes\":{},\"ticks\":{{\"pit\":{},\"rtc\":{},\"lapic\":{{\"fired\":{},\"missed\":{},\"reinjected\":{}}}}}}}",
         placement(&loaded, &layout),
         reason.replace('"', "'"),
         cpu_json(&s.cpu),
@@ -182,7 +216,12 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         c.blocks,
         started.elapsed().as_secs_f64(),
         devices.report(),
-        uart.lock().unwrap_or_else(|e| e.into_inner()).output.len()
+        uart.lock().unwrap_or_else(|e| e.into_inner()).output.len(),
+        board.pit.json(),
+        board.rtc.json(),
+        lapic_end.fired,
+        lapic_end.missed,
+        lapic_end.reinjected
     );
     Ok(())
 }

@@ -1796,6 +1796,154 @@ Debian's initrd it frees the initrd (223 lines) and stops `nocode` `unsupported_
 asynchronous sources, a level-triggered fixed LINT0 and a fixed LINT1, the receive-illegal-vector error for an I/O APIC vector 0..15, ExtINT
 through an I/O APIC entry wired to the PIC (modelled as QEMU, unexercised), SMI and INIT messages.
 
+*Built (L4b, the PIT and port 61H, the RTC, the ACPI PM block, S5 and the reset register; and L5's HLT wake; no fexc change, series28; reviewed October 30, fixes in the review-round note below):*
+**Time base** (`natemu_abi::clock`: `PIT_HZ` 1,193,182, `PM_TIMER_HZ` 3,579,545, `count_at`, the exact inverse of `scale` at
+any rate; host `clock.rs`: V = `mach_absolute_time`, its rate from the mach timebase, exact): every device clock is a floor
+of V x rate / CNTFRQ, as the TSC and the LAPIC timer are, so none can drift from another. **Asynchronous devices** run
+on a `clock::Timer` thread each: it sleeps until the V of the device's next event and lets the device act as of that V
+(lateness delays an interrupt, never changes a count). The threads take the time-constraint scheduling policy: a
+default-policy thread's timer fires up to half its interval late on macOS (host `nanosleep` of 0.05/0.2/1/2/4/10 ms:
+27/102/505/976/1,804/4,350 us late on average; under the policy 1-5 us). An access wakes the thread only when it moved
+the device's next event (waking it on every access cost ~5 us per port access: quick_pit_calibrate's verify pair went
+from 11.4 to 6.0 us). Each device holds an `Irqs::busy` guard while it can still raise its line (L4a's rule).
+**PIT** (`pit.rs`; QEMU 11.1.2 `hw/timer/i8254.c` 53-258, `i8254_common.c` 44-130, `hw/audio/pcspk.c` port 61H): counts,
+OUT, control words, read-back (count and status latches, a second latch ignored until read), LSB/MSB/word access and
+toggles, count 0 = 10000H, gate restarts of modes 1/2/3/5, all QEMU's, with d = PIT edges since the load from V.
+Channel 0 drives ISA IRQ 0 at the level QEMU's interrupt timer gives it (QEMU re-evaluates OUT only at the transitions it
+schedules, and its ns round trip floors each scheduled tick k to k - 1; the effective level is OUT except in mode 2, high
+from d = c, low at d = c - 1 mod c from 2c - 1: rising edges every count), each change processed at its own V (no edge
+lost when the thread is late). Port 61H: gate 2, speaker data, the refresh bit toggled per read, OUT2. **Departures:** at
+reset no channel counts until its first count is written (QEMU's reset programs mode 3, 10000H, running, as firmware
+would; this machine has none, and the 8254 is undefined until programmed), so IRQ0 is quiet and no guard is held until the
+guest programs channel 0; modes 6 and 7 act as 2 and 3 (datasheet; QEMU computes OUT for them as mode 0). As QEMU (not
+the datasheet): binary counting only (BCD stored and read back), no NULL COUNT status bit, a control word neither stops
+the count nor updates IRQ0 (Linux's PIT-disable sequence 30H, 0, 0, 30H thus gives one more IRQ0 55 ms later, as on
+QEMU), the gate does not stop modes 0 and 4.
+**RTC** (`rtc.rs`; QEMU `hw/rtc/mc146818rtc.c` 74-760, the `pc` machine's base year 2000 and lost-tick policy `discard`):
+the host's UTC time at VM creation, advanced from V (ns = `scale(V, 1e9)`, the periodic divider `scale(V, 32768)`);
+every register rule QEMU's: BCD/binary and 12/24-hour encodings, SET, divider reset and the half-second restart, UIP in
+the last 244 us (latched until the update), UF/AF (don't-care C0H-FFH)/PF with IRQF and IRQ 8, B enabling a flag already
+set raising at once, C read clearing and lowering IRQ 8, C and D read-only (D = 80H), 37H = the century at 32H, 70H
+reading FFH and its bit 7 (the NMI mask on PCs) dropped as QEMU drops it; other CMOS bytes plain RAM, zero (QEMU's
+`pc_cmos_init` data is firmware's). Guard: while PIE runs, or the update timer runs with UIE or AIE.
+**ACPI PM block** (`pm.rs`; QEMU `hw/acpi/core.c` 390-760; ACPI 6.5 4.8): PM1_STS write-1-to-clear, PM1_EN all 16 bits
+read back, the SCI (ISA IRQ 9, a level line through L4a) = STS & EN & (TMR|GBL|PWRBTN|RTC); the 24-bit PM timer
+counted from VM creation, writes ignored; TMR_STS on each bit-23 toggle, its overflow scheduled (and guarded) while TMR_EN
+and TMR_STS clear. PM1_CNT: SCI_EN set and read-only (ACPI-only mode, Table 4.13 "OSPM always preserves this bit";
+**departure:** QEMU lets a write clear it), SLP_EN write-only; SLP_EN with `_S5`'s SLP_TYP (0) ends the run with the typed
+stop `poweroff`; another SLP_TYP with SLP_EN is refused (`unsupported_port` at the instruction, register unchanged: no
+S1-S4 here). Reset register (one byte at B040H, the FADT's; QEMU's PIIX4 has none): 6 ends the run with the typed stop
+`reset`, other values do nothing, it reads 0. **Departure:** TMR_STS is first set at the first toggle, 2^23 ticks after
+creation (QEMU starts its overflow time at 0, so TMR_STS reads 1 from reset). Every register is reached by bytes (a wider
+access is its bytes; a 32-bit write at B000H is one update); QEMU decodes PM1 at 16 bits and the timer at 32.
+**Typed stops:** `execution::Stop::Power` after the port access that asked (`Devices::power`), reported `poweroff` or
+`reset` by both drivers (the program driver cancels the other vCPUs). **Wiring:** `clock::install` registers the PIT at
+40H-43H and 61H (`devices::At`, one device on several ranges), the RTC at 70H-71H, the PM block at B000H/B004H/B008H and
+B040H, in `run-program` and `boot-linux`.
+**L5, the HLT wake** (`runtime/src/execution/lapic.rs` `wait`, `events.rs` `park`): the X3 lateness was macOS's timer
+leeway on the blocked vCPU thread (the same 50 % as host `nanosleep`; QoS had been ruled out by X3). A halted vCPU now arms
+CNTV at half the time left to its timer's expiry and waits again on each wake; with at most 25 us left it spins on CNTVCT
+until the expiry or a pending interrupt (ISR_EL1.I). The timer is left armed at the expiry. HLT one-shot lateness (X3's
+program, 5 rounds, x2APIC, 3 runs each), before -> after: 50 us sleep 29-30 -> 4.0-5.5 us; 0.2 ms 105-107 -> 4.3-5.2 us;
+1 ms 506-510 -> 4.3-4.4 us; 2 ms 1,007-1,010 -> 4.2-4.5 us; 4 ms 2,005-2,008 -> 4.5-4.7 us; 10 ms 5,005-5,011 -> 5.0-7.2 us;
+200 us periodic HLT 38-109 -> 4.2-6.7 us.
+**Checks** (`tools/run_l4b.py`, programs `tools/bench/smp/timers.py`): `qemu` 4 programs (PIT, RTC, PM at block sizes
+default and 1; S5), natemu equal to pinned QEMU on every compared result (64 slots: values that do not depend on timing)
+and both equal to the model; QEMU runs under SeaBIOS, and the PM programs first set the PIIX4 PM's PMBA/PMIOSE through
+0CF8H (natemu: unassigned, ignored) and write 0F1H to B2H (QEMU's ACPI enable). PIT: read-back status after mode 0/2/3
+loads, count and status latches, LSB-only and MSB-only access, a second counter latch ignored, a second status latch
+ignored, port 61H (gate, data, refresh toggle, OUT2 low then high in mode 0), Linux's `pit_calibrate_tsc` (natemu:
+t2 - t1 = 9.998 ms against the model's 10.0001 ms less the poll gap; Linux's own acceptance holds, 3,133-3,190 polls,
+max/min 4.2-4.3), Linux's `quick_pit_calibrate` (QEMU and natemu succeed; natemu 999,937-999,963 kHz, i = 182-186, d1/d2
+9.3-9.8 us; it runs 8 times: each failure ends on a path not yet translated, and a host compile costs more than the 214 us
+an MSB lasts), IRQ0 at the mode 2 rate through pin 2 (20 deliveries, none before its edge, 7-22 us late from HLT) and
+Linux's PIT-disable sequence (one IRQ0 more, as QEMU). RTC: 70H, A-D, SET and read-back, 23:59:58 31 Dec 1999 rolling
+into 00:00:00 Saturday 1 Jan 2000 (century 20H), UIP, binary/12-hour and the re-encoding on a format change (entering
+binary under SET reinterprets the BCD century 20H as 32: year 3200, on both), 37H, CMOS RAM, IRQ 8 periodic (16 at 1024
+Hz, C = C0H), update-ended (C = 90H) and alarm (C = B0H). PM: SCI_EN, PM1_EN read-backs, PM1_STS clear, PM timer
+monotonic and 24-bit, natemu's PM ticks within one of the exact count, the PM timer's SCI through pin 9 level (one
+delivery, TMR_STS seen, cleared by the handler). S5: QEMU powers off, natemu stops `poweroff`. `halt` 2 (a vCPU halted on
+a 55 ms PIT one-shot reaches its end with pin 2 unmasked, and is ended `halted` with it masked, once the one-shot fired).
+`stress` 3 (1, 2, 4 CPUs, xAPIC: IRQ 0 at ~1 kHz and IRQ 8 at 1024 Hz broadcast; every CPU takes 200 of each from HLT;
+between its 50th and 200th IRQ 0 exactly 150 PIT periods pass, within one: none merged once its code is translated;
+before that, first translations merge 10-17). `cases` 10 (S5 by a 16-bit and a high-byte write, reset, other reset
+values ignored and the register reading 0, SLP_TYP 1 refused, SCI_EN read-only, TMR_STS clear at start, a 32-bit PM1
+write, PM timer writes ignored, the PIT's reset status 86H). `clocks` 1 (400 samples over 10 s, each read between its own
+two TSCs: the PM timer, the PIT (channel 2 mode 2, unwrapped), the LAPIC current count and the RTC's seconds all within one
+tick of the exact count from the TSC window against sample 1; widest windows 58 PM, 24 PIT, 195 crystal ticks; 10 RTC
+second changes one second apart). Unit tests: `clock` (the inverse at both rates), `pit` (each mode's IRQ0 changes against
+its level, QEMU's counts and OUT), `rtc` (calendar). **Kick latency for timer expiry (§2):** a host timer's interrupt
+(PIT thread -> I/O APIC -> post -> SPI doorbell -> stop at a block boundary -> delivery) arrives 7-22 us after its edge;
+the LAPIC timer on the in-VM CNTV 10-14 us running and 5.5-7.5 us from HLT (`run_x3.py timers`): both routes are
+microseconds, so no second route is needed for timer expiries.
+**Kernel** (Debian 6.12, 2 GiB, `console=ttyS0 earlyprintk=serial mitigations=off nokaslr`, no initrd, series28): it
+reaches "VFS: Unable to mount root fs" as before (293 lines, guest 41.1 s, about 67 s of wall time). The RTC answers:
+"Unable to read current time from RTC" is gone, and `rtc_cmos 00:01: registered as rtc0`, "setting system clock to
+<host UTC>". "PM-Timer failed consistency check" is gone: `clocksource: acpi_pm` registers (21.9 s) and is the clocksource
+selected. Linux programs PIT channel 0 periodic (34H) and leaves it running. Still present, neither in the clocks: **"tsc:
+Fast TSC calibration failed"** (quick_pit_calibrate saw the MSB leave FFH before its first check: its first run pays a
+host compile per new path, 0.4-2 ms, against the 214 us an MSB lasts; the same code warm succeeds at 999,9xx kHz above;
+the TSC frequency still comes from CPUID 15H, "Detected 1000.000 MHz") and **the TSC marked unstable** at 10.97 s by
+the watchdog `refined-jiffies` (acpi_pm registers only at fs_initcall, 21.9 s): jiffies advanced 120 ticks (480 ms at
+HZ 250) while the TSC advanced 579.6 ms, so about 25 ticks were lost, in this window of first translations (the run
+makes 90,277 compiles; "hrtimer: interrupt took 301 ms" later). Every clock here derives from V and agrees within a tick
+(`clocks`); a periodic tick that expires while the vCPU is held in the host for a compile merges with the pending one, as
+an x86 IRR merges (L5's rule: V never pauses), so tick-counted jiffies fall behind wall time. Remedies are owner choices,
+not clock fixes: shorter or fewer stalls (compile latency), or a lost-tick policy for timer interrupts (catch-up
+delivery, as KVM's PIT `reinject`), or pausing V while a vCPU is held in the host. The selected clocksource is acpi_pm
+because the TSC was marked unstable.
+**Not built:** the PIT's speaker output, BCD counting and NULL COUNT (QEMU has none); RTC_STS, power button and GPE
+sources (none on this board); S1-S4; the 8254's datasheet control-word semantics (QEMU's kept, above).
+
+*Built (L4b review round and the lost-tick policies, owner decisions of October 30; no fexc change, series28):*
+**Review fixes.** The device thread read V twice per turn, so `at - now` could wrap and the thread slept for centuries
+(the review's `frozen` probe, now `run_l4b.py cases frozen`: a mode 3 PIT, count 6, never accessed again, 20,000
+windows of 100 us each needing an IRQ 0 edge in the PIC's IRR; red on the old loop, 1 of 3 runs with 19,999 windows
+empty; green 7 of 7 since): V is read once per turn. Every access first takes every event already due
+(`clock::Timer::access`), so a reload cannot drop a due edge and C's flags are exact; the review's `lost-edge` (300
+trials each at counts 24 and 60) and `oneshots` (5,000) probes miss nothing. The PIT follows channel 0 up to now in one
+step (every change due at once; rising edges that passed together make one edge), and a thread takes at most one turn
+per 20 us and drops the device's lock between turns. The review's 3-4.6 ms for the three OUTs of the PIT-disable sequence
+at count 2 was first translation, not the lock: the same cold sequence takes 2.96 ms at count 255, and warm it takes
+7.0 us at count 2 against 9.8 us at count 255. A halted vCPU whose timer cannot deliver (LVT masked, IF = 0, a class
+not above the PPR) waits plainly, with no early wakes or spin; early timer wakes count as neither stops nor IRQs
+(`lapic::timer_irq` reports whether the expiry was due). The early-wake scheme costs about 2 % of a core at a 250 Hz
+periodic timer and 5.4 % at 1 kHz (the review's `hltcpu` probe); lateness is 4-7 us typically, with a tail of
+90-388 us. A host real-time thread that rings at a deadline the parking vCPU publishes was not built.
+**Lost-tick policies** (`clock::LostTicks`; `--lost-ticks pit=..,rtc=..,lapic=..` on both drivers): *reinject* delivers
+each missed period later, one per acceptance of the previous; *discard* merges them. Missed means the edges passed
+together, or the vector was still pending in the IRR; the chipset now reports what each rise did (`irq::Delivery`:
+fresh, coalesced, or taken by nobody). Defaults, from the sources:
+- **PIT reinject.** KVM's in-kernel PIT: `kvm_pit_set_reinject(pit, true)`, arch/x86/kvm/i8254.c 702; its pending count
+  is injected one per `irq_ack`, 248-273; QEMU's `kvm-pit` keeps `lost_tick_policy` `delay`, hw/i386/kvm/i8254.c
+  322-323. QEMU's own PIT has no policy. Here a retry every quarter count re-raises IRQ 0 until a fresh acceptance;
+  a count load or a rise nobody takes clears the debt, as KVM's reset and mask notifier do.
+- **RTC discard.** QEMU's mc146818 default; `slew` is `-rtc driftfix=slew`, reinjection on each read of C.
+- **LAPIC discard.** KVM's `apic_timer_expired` returns while an expiry is pending, arch/x86/kvm/lapic.c 1920-1921. The
+  resident's reinject (`lapic::reinject`) raises an owed expiry at a boundary once the vector's IRR bit is clear.
+`run_l4b.py modes`: each source at ~1 kHz with IF = 0 for 20 ms, then 20 ms with IF = 1; reinject delivered every period
+(PIT 40 of 40, RTC 41 of 41, LAPIC 40 of 40), discard one per IF = 1 period plus the merged one (21 of 20 each).
+**Which timer loses ticks** (`boot-linux --clock-trace`): Linux runs the PIT-disable sequence at boot (CPUID 15H gives
+the LAPIC timer's rate, so `apic_needs_pit` is false). IRQ 0 rose once in the whole boot, 55 ms later, masked. The tick
+is CPU 0's LAPIC timer in periodic mode until the switch to one-shot. Across the watchdog's 0.5 s window, 31 of about
+125 LAPIC expiries merged (Linux counted 24 jiffies lost); 345 merged before the switch. The LAPIC's default stays
+discard, KVM's practice, so **the policy does not remove this symptom**; K1 removes the compile stalls that cause it.
+With `--lost-ticks lapic=reinject` (343 reinjected) the TSC stays stable: tsc-early at 9.78 s, then the tsc
+clocksource at 25.3 s, and the panic at 42.9 s (287 lines, 78 s of wall time with a 10 s watchdog).
+**Tests added:**
+- `qemu l4b-more` (natemu equals QEMU on k0-k8, each at block sizes default and 1):
+  - PIT mode 4 (38H): one IRQ 0, status 38H before and after the strobe;
+  - mode 1 (B2H): status 32H, OUT2 high after the gate rise;
+  - mode 5 (BAH): status 3AH, OUT2 low before and 1 ms after;
+  - the RTC's period change from rate 15 to 14, 100 ms after an interrupt: the next comes 249.9 ms after it (QEMU
+    251.1), the lost-clock path.
+- `modes`: PIT modes 6/7 per the datasheet: 23 IRQ 0s in 20 ms each, status keeping M2..M0 (QEMU: one edge).
+- **Departure, fixed per the MC146818 datasheet:** QEMU decodes a 12-hour hours register with its PM bit inside the BCD
+  value, and gives the alarm the time register's PM flag. At 11:59:59 AM an alarm at 12:00:00 PM sets AF here within
+  3 s (k9 = 1); QEMU does not (k9 = 0).
+
+**Owner decisions (October 30, after L4b):** (1) both remedies for ticks lost while a vCPU is held in the host: a per-device lost-tick policy for periodic timer modes (PIT modes 2/3, the RTC periodic interrupt, the LAPIC periodic timer), either *reinject* (count missed periods and deliver them when the vCPU can take them) or *discard*, with each device's default taken from what QEMU/KVM actually default to (checked, not assumed) and recorded; one-shot timers are unaffected; and (2) remove the cause: K1 (keep translations across CR3/control-register changes) moves up to right after I8, followed by a measured boot breakdown (wall time per phase, compiles, exits by kind, halted time, flushes) against QEMU to the same point. Context: the Debian boot to the root-fs panic took 90,277 host compiles of 0.4–2 ms each; tick expiries merged during those stalls, so the refined-jiffies watchdog marked the TSC unstable and quick PIT calibration failed.
+
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 
 **Owner decision (October 29, amendment after L3):** unassigned memory pages (including the legacy hole 0xA0000–0x100000) are mapped read-only and non-executable onto one shared all-ones page, so every read form (compare, checksum, string, SSE) runs natively and exactly; reads are counted per page on first touch (shadow fill), writes stay counted per access and complete as ignored for MOV forms (other write forms keep their typed refusals); fetch stays a typed stop; the strict switch still turns all of it into stops. Context: Linux's `reserve_ibft_region`, `probe_roms`, DMI and `smp_scan_config` scan 0x80000–0xFFFFF with CMP/checksum/string loops. Pages a device claims stay unshadowed (M3); the LAPIC's possible page is always a device page.

@@ -215,8 +215,8 @@ pub(super) fn park(s: &mut State) {
             parked = true;
             s.halts += 1; // it waits: an event it could take at once never parks it
         }
-        // SAFETY: waits for an interrupt (masked at EL1: it only wakes the PE); no memory effect.
-        unsafe { asm!("dsb sy", "wfi") };
+        // L5: `wfi`, woken on time for the timer's next expiry.
+        lapic::wait(s);
     }
     halted.store(0, SeqCst);
 }
@@ -231,11 +231,13 @@ fn acknowledge() -> u64 {
         if intid >= 1020 {
             return any;
         }
-        any += 1;
-        if intid == lapic::TIMER_PPI {
-            lapic::timer_irq();
-        }
+        // L5: a timer IRQ before its expiry (a halted vCPU's early wake, `lapic::wait`) is no stop and no counted IRQ.
+        let counted = intid != lapic::TIMER_PPI || lapic::timer_irq();
         unsafe { asm!("msr S3_0_C12_C12_1, {i}", "isb", i = in(reg) intid) };
+        if !counted {
+            continue;
+        }
+        any += 1;
         let c = cache::control();
         c.irqs += 1;
         c.irq_sgis += u64::from(intid < 16);

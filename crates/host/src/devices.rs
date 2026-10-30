@@ -35,6 +35,16 @@ pub(crate) trait Device: Send {
     fn write(&mut self, vcpu: usize, offset: u64, size: u64, value: u64) -> bool;
 }
 pub(crate) type Shared = Arc<Mutex<dyn Device>>;
+/// A view of `.0` whose offsets start at `.1` (one device registered on several ranges, each told apart by its offset).
+pub(crate) struct At(pub(crate) Shared, pub(crate) u64);
+impl Device for At {
+    fn read(&mut self, vcpu: usize, offset: u64, size: u64) -> Option<u64> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).read(vcpu, self.1 + offset, size)
+    }
+    fn write(&mut self, vcpu: usize, offset: u64, size: u64, value: u64) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).write(vcpu, self.1 + offset, size, value)
+    }
+}
 
 /// The guest-physical device ranges of a VM and its I/O port bus (L3).
 ///
@@ -65,10 +75,17 @@ pub(crate) struct Devices {
     page_counts: Mutex<BTreeMap<u64, [u64; 2]>>,
     /// L4a: the interrupt controllers (`irq::install`), for the resident's EOI broadcasts and INTA cycles.
     pub(crate) irqs: Option<crate::irq::Irqs>,
+    /// L4b: a power request made by a device access (`pm::POWEROFF`, `pm::RESET`; 0 none): the accessing vCPU's run
+    /// ends with that typed stop after the access.
+    pub(crate) power: Arc<std::sync::atomic::AtomicU8>,
 }
 impl Devices {
     pub(crate) fn new(ram_end: u64) -> Self {
-        Self { ranges: Vec::new(), ram_end, ports: Vec::new(), strict: false, port_counts: Mutex::default(), page_counts: Mutex::default(), irqs: None }
+        Self { ranges: Vec::new(), ram_end, ports: Vec::new(), strict: false, port_counts: Mutex::default(), page_counts: Mutex::default(), irqs: None, power: Arc::default() }
+    }
+    /// L4b: the power request made so far (0 none).
+    pub(crate) fn power(&self) -> u8 {
+        self.power.load(std::sync::atomic::Ordering::SeqCst)
     }
     /// L3: registers `device` on ports `[base, base + count)`, inside the 16-bit space and not overlapping another range.
     pub(crate) fn register_ports(&mut self, base: u32, count: u32, device: Shared) -> crate::Result<()> {

@@ -49,6 +49,10 @@
 //! PORT+4 deasserts a line at once; a request vetoes ending halted vCPUs until it fired (`--irq-source-no-veto`: not, the
 //! negative control of that rule).
 //!
+//! L4b/L5: the PIT, the RTC and the ACPI PM block (`clock::install`); `--lost-ticks pit=reinject|discard,rtc=..,lapic=..`
+//! sets the lost-tick policies of the periodic sources (default `clock::LostTicks::DEFAULT`: PIT reinject, RTC and LAPIC
+//! discard).
+//!
 //! X2: with `--kick-events E[,E..]` (vectors 16..255 or `nmi`) each kick first posts one of them, chosen at random, so
 //! events arrive at random times. A halted vCPU (HLT) can be woken only by an event: once every kicker has ended and
 //! every vCPU is halted or ended, the driver asks each halted one to end (`stop` `resident`, reason `halted`).
@@ -723,6 +727,10 @@ struct Ran {
     decodes: std::collections::BTreeMap<u32, u64>,
     entropy: u64,
 }
+/// L4b: a power stop's name (`pm::POWEROFF`, `pm::RESET`).
+pub(crate) fn power_name(p: u8) -> &'static str {
+    if p == crate::pm::RESET { "reset" } else { "poweroff" }
+}
 /// A vCPU's own end (it parks; peers run on). Any other stop cancels the peers.
 fn finished(stop: &Stop) -> bool {
     matches!(
@@ -748,6 +756,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let mut device_at: Vec<u64> = Vec::new();
     // L4a: the asynchronous test source's ports, and whether its requests veto ending halted vCPUs.
     let (mut irq_source, mut irq_veto) = (None, true);
+    // L5: the lost-tick policies (`clock::LostTicks`).
+    let mut lost = crate::clock::LostTicks::DEFAULT;
     // M1: the VM's guest RAM and where the driver starts placing pages; the environment's defaults let a whole suite run
     // at another size or placement unchanged.
     let env = |name: &str, default: u64| std::env::var(name).map_or(Ok(default), |v| number(&v));
@@ -761,6 +771,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             "--device-at" => device_at.push(number(options.next().ok_or(USAGE)?)?),
             "--irq-source" => irq_source = Some(number(options.next().ok_or(USAGE)?)?),
             "--irq-source-no-veto" => irq_veto = false,
+            "--lost-ticks" => lost = crate::clock::LostTicks::parse(options.next().ok_or(USAGE)?)?,
             "--code-cache" => code_bytes = value()?,
             "--ram" => ram_bytes = number(options.next().ok_or(USAGE)?)?,
             "--place" => place = number(options.next().ok_or(USAGE)?)?,
@@ -865,6 +876,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     registry.register_ports(crate::boot::acpi::platform::COM1_PORT.into(), 8, uart.clone())?;
     // L4a: the I/O APIC, the 8259 pair and their wires; the UART's IRQ4 into them.
     let irqs = crate::irq::install(&mut registry, &backing.memory, n, &uart)?;
+    // L4b: the PIT and port 61H, the RTC, the ACPI PM block and reset register.
+    crate::clock::install(&mut registry, &irqs, lost)?;
     if let Some(port) = irq_source {
         let mut source = crate::irq::TestSource::new(&irqs);
         source.veto = irq_veto;
@@ -934,7 +947,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 mov_ss: 0,
             },
         );
-        execution::set_lapic(backing.vcpu(v), natemu_abi::lapic::Lapic { svr: c.svr, ..natemu_abi::lapic::RESET });
+        execution::set_lapic(backing.vcpu(v), natemu_abi::lapic::Lapic { svr: c.svr, reinject: u64::from(lost.lapic), ..natemu_abi::lapic::RESET });
     }
 
     let machine = Machine::create(&backing.memory)?;
@@ -1246,6 +1259,7 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
             ("watchdog", format!("{place} pc={pc:#x} shadows_asked={asked:?} retries={}", s.retries), [0; 4])
         }
         Stop::Cancelled => ("cancelled", String::new(), [0; 4]),
+        Stop::Power(p) => (power_name(*p), String::new(), [0; 4]),
     };
     let mut rips: Vec<u64> = ran.rips.iter().copied().collect();
     rips.sort_unstable();

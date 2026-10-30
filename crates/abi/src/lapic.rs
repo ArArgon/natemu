@@ -102,6 +102,13 @@ pub struct Lapic {
     pub spent: u64,
     /// CNTFRQ_EL0 as the resident read it at start (V's rate; 0 before).
     pub frequency: u64,
+    /// L5: the periodic timer's lost-tick policy (1: reinject, 0: discard; set by the host, kept across APIC resets),
+    /// the expiries still to deliver under reinject, and since start the expiries that merged (with one taken, or into
+    /// a pending IRR bit) and those reinjected.
+    pub reinject: u64,
+    pub backlog: u64,
+    pub missed: u64,
+    pub reinjected: u64,
 }
 /// The state at power-up, reset and after a disable through IA32_APIC_BASE (11.4.7.1, "local APIC state after power-up
 /// or reset"; 11.12.5.1: entering the disabled state resets it).
@@ -121,6 +128,10 @@ pub const RESET: Lapic = Lapic {
     deadline: u64::MAX,
     spent: 0,
     frequency: 0,
+    reinject: 0,
+    backlog: 0,
+    missed: 0,
+    reinjected: 0,
 };
 
 /// The highest vector set in a 256-bit register.

@@ -38,6 +38,9 @@ struct Lapics {
     lint0: bool,
     /// I/O APIC messages sent (diagnostics and the board's unit test).
     messages: std::cell::Cell<u64>,
+    /// L4b: fixed interrupts accepted into an IRR where the vector was clear (fresh) or already pending (coalesced).
+    fresh: std::cell::Cell<u64>,
+    coalesced: std::cell::Cell<u64>,
 }
 // SAFETY: see `memory`; every access through it is an atomic word of the global area.
 unsafe impl Send for Lapics {}
@@ -74,7 +77,12 @@ impl Lapics {
             return false;
         }
         let post = |t: usize, event: u64| {
+            let was = event != execution::NMI && execution::pending(self.memory(), t, event);
             let accepted = execution::post(self.memory(), t, event, m.level);
+            if accepted {
+                let c = if was { &self.coalesced } else { &self.fresh };
+                c.set(c.get() + 1);
+            }
             if accepted {
                 self.ring(t);
             }
@@ -141,22 +149,45 @@ impl Chipset {
             }
         }
     }
-    /// `gsi_handler`: line `irq` (ISA IRQ 0..15 or GSI 16..23) at `level`, passed on when it changes.
-    fn line(&mut self, irq: usize, level: bool) {
+    /// `gsi_handler`: line `irq` (ISA IRQ 0..15 or GSI 16..23) at `level`, passed on when it changes; what a rise did.
+    fn line(&mut self, irq: usize, level: bool) -> Delivery {
         if irq >= ioapic::PINS || (self.lines >> irq & 1 != 0) == level {
-            return;
+            return Delivery::None;
         }
         self.lines ^= 1 << irq;
+        let (fresh, coalesced) = (self.lapics.fresh.get(), self.lapics.coalesced.get());
+        let mut pic = Delivery::None;
         if irq < 16 {
+            // Through the 8259: an unmasked rise with an APIC taking the PIC's output (ExtINT or LINT0 fixed) is fresh,
+            // or coalesced when its IRR bit was already set.
+            let (chip, bit) = (irq / 8, 1u8 << (irq % 8));
+            let was = self.pic.chips[chip].irr_bits() & bit != 0;
             self.pic.set_irq(irq as u8, level);
+            let taker = (0..self.lapics.vcpus).any(|v| execution::published(self.lapics.memory(), v) & (lapic::EXTINT | lapic::LINT0_FIXED) != 0);
+            if level && taker && !self.pic.masked(irq as u8) {
+                pic = if was { Delivery::Coalesced } else { Delivery::Fresh };
+            }
         }
         let pin = if irq == 0 { crate::boot::acpi::platform::IRQ0_GSI as usize } else { irq };
         let (a, mut w) = self.wires();
         a.set_irq(pin, level, &mut w);
         self.sync();
+        match (self.lapics.fresh.get() > fresh, self.lapics.coalesced.get() > coalesced) {
+            (true, _) => Delivery::Fresh,
+            (_, true) => Delivery::Coalesced,
+            _ => pic,
+        }
     }
 }
 
+/// L4b: what a rising edge on a line did (for the lost-tick policies): some APIC took it into a clear IRR bit, or every
+/// taker had it pending already (it merged), or nothing took it (masked, or no destination accepts).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    Fresh,
+    Coalesced,
+    None,
+}
 /// A shared handle on the chipset, for devices, drivers and asynchronous sources (any thread).
 #[derive(Clone)]
 pub(crate) struct Irqs {
@@ -174,8 +205,8 @@ impl Irqs {
     fn lock(&self) -> MutexGuard<'_, Chipset> {
         self.chipset.lock().unwrap_or_else(|e| e.into_inner())
     }
-    /// Sets line `irq` (ISA IRQ 0..15, GSI 16..23) to `level` (1 = asserted), from any thread.
-    pub(crate) fn line(&self, irq: usize, level: bool) {
+    /// Sets line `irq` (ISA IRQ 0..15, GSI 16..23) to `level` (1 = asserted), from any thread; what a rise did.
+    pub(crate) fn line(&self, irq: usize, level: bool) -> Delivery {
         self.lock().line(irq, level)
     }
     /// A guard a source holds while it may still fire.
@@ -270,7 +301,7 @@ impl Device for View {
 
 /// Puts the chipset on `devices` for a VM of `vcpus` vCPUs on `memory`, and wires `uart`'s IRQ (COM1, ISA IRQ 4) into it.
 pub(crate) fn install(devices: &mut Devices, memory: &Memory, vcpus: usize, uart: &Arc<Mutex<crate::uart::Uart>>) -> crate::Result<Irqs> {
-    let lapics = Lapics { memory, vcpus, doorbell: None, lint0: false, messages: Default::default() };
+    let lapics = Lapics { memory, vcpus, doorbell: None, lint0: false, messages: Default::default(), fresh: Default::default(), coalesced: Default::default() };
     let chipset = Chipset { ioapic: Ioapic::new(), pic: Pic::new(), lines: 0, lapics };
     let irqs = Irqs { chipset: Arc::new(Mutex::new(chipset)), live: Arc::default() };
     let view = |kind| -> Shared { Arc::new(Mutex::new(View(irqs.clone(), kind))) };
@@ -280,7 +311,9 @@ pub(crate) fn install(devices: &mut Devices, memory: &Memory, vcpus: usize, uart
     devices.register_ports(0x4d0, 2, view(Kind::Elcr))?;
     let line = irqs.clone();
     let irq = crate::boot::acpi::platform::COM1_IRQ.into();
-    uart.lock().unwrap_or_else(|e| e.into_inner()).irq = Some(Box::new(move |level| line.line(irq, level)));
+    uart.lock().unwrap_or_else(|e| e.into_inner()).irq = Some(Box::new(move |level| {
+        line.line(irq, level);
+    }));
     devices.irqs = Some(irqs.clone());
     Ok(irqs)
 }
@@ -375,7 +408,9 @@ impl Device for TestSource {
                 let due = std::time::Instant::now() + std::time::Duration::from_micros(value >> 16 & 0xffff);
                 let _ = self.jobs.as_ref().map(|j| j.send((due, line, value & 0x100 != 0, busy)));
             }
-            4 => self.irqs.line(line, false),
+            4 => {
+                self.irqs.line(line, false);
+            }
             _ => {}
         }
         true
@@ -389,7 +424,7 @@ mod tests {
     /// ISA IRQ0 enters pin 2, IRQ n pin n and PIC input n. No vCPU (`vcpus` 0): only the messages are counted.
     #[test]
     fn line_changes_only() {
-        let lapics = Lapics { memory: std::ptr::null(), vcpus: 0, doorbell: None, lint0: false, messages: Default::default() };
+        let lapics = Lapics { memory: std::ptr::null(), vcpus: 0, doorbell: None, lint0: false, messages: Default::default(), fresh: Default::default(), coalesced: Default::default() };
         let mut c = Chipset { ioapic: Ioapic::new(), pic: Pic::new(), lines: 0, lapics };
         for (sel, v) in [(0x10 + 2 * 4, 0x41), (0x10 + 2 * 2, 0x42)] {
             let (a, mut w) = c.wires();

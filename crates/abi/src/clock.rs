@@ -37,9 +37,18 @@ pub const fn crystal(count: u64, frequency: u64) -> u64 {
 /// The first V at which the crystal count reaches `edges` (ceil(edges x frequency / CRYSTAL_HZ), saturated): the
 /// exact inverse of [`crystal`] (`crystal(v) >= edges` iff `v >= count_at_crystal(edges)`).
 pub const fn count_at_crystal(edges: u64, frequency: u64) -> u64 {
-    let v = (edges as u128 * frequency as u128).div_ceil(CRYSTAL_HZ as u128);
+    count_at(edges, CRYSTAL_HZ, frequency)
+}
+/// The first V at which a clock at `hz` reaches `edges` (ceil(edges x frequency / hz), saturated): the exact inverse of
+/// [`scale`] (`scale(v, hz, frequency) >= edges` iff `v >= count_at(edges, hz, frequency)`).
+pub const fn count_at(edges: u64, hz: u64, frequency: u64) -> u64 {
+    let v = (edges as u128 * frequency as u128).div_ceil(hz as u128);
     if v > u64::MAX as u128 { u64::MAX } else { v as u64 }
 }
+/// L4b: the 8254 PIT's input clock (QEMU's `PIT_FREQ`, Linux's `PIT_TICK_RATE`: 14.31818 MHz / 12, rounded).
+pub const PIT_HZ: u64 = 1_193_182;
+/// L4b: the ACPI PM timer (ACPI 6.5 4.8.3.3: 3.579545 MHz; QEMU's `PM_TIMER_FREQUENCY`, Linux's `PMTMR_TICKS_PER_SEC`).
+pub const PM_TIMER_HZ: u64 = 3_579_545;
 /// The common TSC count at V = `count` (each vCPU adds its own offset, the TSC MSR's slot).
 pub const fn tsc(count: u64, frequency: u64) -> u64 {
     scale(count, cpu_profile::TSC_HZ, frequency)
@@ -68,6 +77,13 @@ mod tests {
             for v in (0..5000u64).chain([1 << 50, u64::MAX / 2]) {
                 let e = crystal(v, f);
                 assert!(count_at_crystal(e, f) <= v && count_at_crystal(e + 1, f) > v);
+            }
+            // L4b's clocks: the same inverse at the PIT and PM timer rates.
+            for hz in [PIT_HZ, PM_TIMER_HZ] {
+                for v in (0..3000u64).chain([1 << 44, 987_654_321_987]) {
+                    let e = scale(v, hz, f);
+                    assert!(count_at(e, hz, f) <= v && count_at(e + 1, hz, f) > v, "{f} {hz} {v}");
+                }
             }
         }
     }

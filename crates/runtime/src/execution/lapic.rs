@@ -118,11 +118,14 @@ fn cntv(at: Option<u64>) {
 }
 /// The virtual timer's IRQ, before its end of interrupt: with the expiry due, the timer goes off (it is level-triggered:
 /// left on, it would interrupt again at once) and the next boundary ([`poll`]) takes the expiry and arms the next one;
-/// an IRQ that comes after the timer was re-armed for a later expiry (it was pending while the resident ran) leaves the
-/// timer armed, or nothing would wake a halted vCPU at that expiry.
-pub(super) fn timer_irq() {
+/// an IRQ that comes before the expiry (a halted vCPU's early wake, [`wait`], or one pending while the timer was
+/// re-armed for a later expiry) leaves the timer armed at the expiry, or nothing would wake a halted vCPU then.
+/// Whether the expiry was due.
+pub(super) fn timer_irq() -> bool {
     let d = lapic().deadline;
-    cntv((d != u64::MAX && now() < d).then_some(d));
+    let early = d != u64::MAX && now() < d;
+    cntv(early.then_some(d));
+    !early
 }
 
 /// The interrupt the APIC delivers now (11.8.4), if any: hardware and software enabled, the highest IRR vector above PPR.
@@ -221,10 +224,19 @@ fn timer(s: &mut State) {
     let periodic = l.lvt[apic::TIMER] & apic::PERIODIC != 0;
     let n = if l.spent != 0 { 0 } else { apic::expiries(l.initial, periodic, ticks(l)) };
     if n > l.fired {
+        // L5: expiries that passed while one was due merge into one (the IRR's rule); so does one whose vector is still
+        // pending. Under reinject each is delivered later, one per acceptance ([`reinject`]).
+        let merged = n - l.fired - 1;
         (l.fired, l.spent) = (n, u64::from(!periodic));
         if l.lvt[apic::TIMER] & apic::MASKED == 0 {
             let v = l.lvt[apic::TIMER] & 0xff;
+            let missed = merged + u64::from(v >= 16 && irr_pending(s.vcpu, v));
             raise(s, v);
+            let l = lapic();
+            l.missed += missed;
+            if l.reinject != 0 && periodic {
+                l.backlog += missed;
+            }
         }
     }
     let l = lapic();
@@ -236,13 +248,67 @@ fn timer(s: &mut State) {
     l.deadline = next.unwrap_or(u64::MAX);
     cntv(next);
 }
-/// At every resident boundary (`find`, a halted vCPU's wake): the timer's expiries that are due.
+/// At every resident boundary (`find`, a halted vCPU's wake): the timer's expiries that are due, and under reinject the
+/// next owed one once the last was accepted.
 pub(super) fn poll(s: &mut State) {
     let d = lapic().deadline;
     if d != u64::MAX && now() >= d {
         timer(s)
     }
+    if lapic().backlog != 0 {
+        reinject(s)
+    }
 }
+/// L5 reinject: one owed expiry, raised when the vector's IRR bit is clear (the previous one accepted), as KVM's PIT
+/// injects its next pending tick on the acknowledge of the last; a masked or periodic-off timer owes nothing.
+fn reinject(s: &mut State) {
+    let l = lapic();
+    let t = l.lvt[apic::TIMER];
+    let v = t & 0xff;
+    if t & apic::MASKED != 0 || t & apic::PERIODIC == 0 || v < 16 {
+        l.backlog = 0;
+    } else if !irr_pending(s.vcpu, v) {
+        (l.backlog, l.reinjected) = (l.backlog - 1, l.reinjected + 1);
+        raise(s, v);
+    }
+}
+fn irr_pending(v: u64, vector: u64) -> bool {
+    irr_word(v, vector as usize / 64).load(SeqCst) >> (vector % 64) & 1 != 0
+}
+/// L5: one wait of a halted vCPU for an interrupt (`park`'s `wfi`), woken on time for its timer's next expiry. macOS
+/// lets a blocked thread's timer fire up to half its interval late (measured: a `wfi` on CNTV for 0.2, 2 and 10 ms woke
+/// 0.1, 1 and 5 ms late; host `nanosleep` the same), so CNTV is armed at half the time left and the wait repeats; once
+/// at most [`SPIN_US`] are left the vCPU spins on CNTVCT until the expiry or a pending interrupt (ISR_EL1.I). The timer
+/// is left armed at the expiry itself, as `timer` set it. The early wakes are not stops ([`timer_irq`] says the expiry
+/// was not due; `park` does not count them). Measured cost: the vCPU's core is busy about 2 % at a 250 Hz periodic
+/// timer and 5.4 % at 1 kHz (the review's `hltcpu` probe); lateness 4-7 us typically, with a tail of 90-388 us when the
+/// final short wait or the spin is preempted.
+pub(super) fn wait(s: &State) {
+    let (d, f, n) = (lapic().deadline, lapic().frequency, now());
+    // With nothing its timer can deliver (masked, IF = 0, a class not above the PPR) the timer cannot end the halt:
+    // a plain wait, no early wakes, no spin.
+    if d == u64::MAX || d <= n || !can_wake(s) {
+        // SAFETY: waits for an interrupt (masked at EL1: it only wakes the PE); no memory effect.
+        return unsafe { asm!("dsb sy", "wfi") };
+    }
+    if d - n <= clock::scale(SPIN_US, f, 1_000_000) {
+        while now() < d {
+            let isr: u64;
+            // SAFETY: reads the pending-interrupt status.
+            unsafe { asm!("mrs {}, isr_el1", out(reg) isr) };
+            if isr & 1 << 7 != 0 {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        return;
+    }
+    cntv(Some(n + (d - n) / 2));
+    unsafe { asm!("dsb sy", "wfi") };
+    cntv(Some(d));
+}
+/// The longest a halted vCPU spins for its timer instead of waiting ([`wait`]).
+const SPIN_US: u64 = 25;
 /// The timer will interrupt this vCPU by itself: armed, LVT unmasked, and the vector its expiry raises (its own, or the
 /// LVT error vector for an illegal one) deliverable then (RFLAGS.IF, its class above the PPR's).
 pub(super) fn can_wake(s: &State) -> bool {
@@ -480,8 +546,8 @@ pub(super) fn set_base(s: &mut State, new: u64) -> Result<(), Exception> {
         // first, so senders stop posting before the IRR is cleared; one that read the old word may still post after the
         // clear, and that bit is cleared again when the APIC is enabled (nothing is accepted while disabled).
         publish(s);
-        let frequency = lapic().frequency;
-        *lapic() = Lapic { frequency, ..apic::RESET };
+        let l = lapic();
+        *l = Lapic { frequency: l.frequency, reinject: l.reinject, missed: l.missed, reinjected: l.reinjected, ..apic::RESET };
         (0..4).for_each(|w| {
             irr_word(s.vcpu, w).store(0, SeqCst);
             tmr_word(s.vcpu, w).store(0, SeqCst);

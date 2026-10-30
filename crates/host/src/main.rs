@@ -6,6 +6,7 @@ use vm::*;
 
 mod admission;
 mod boot;
+mod clock;
 mod devices;
 mod drivers;
 mod execution;
@@ -15,6 +16,9 @@ mod json;
 mod memory;
 mod owners;
 mod pic;
+mod pit;
+mod pm;
+mod rtc;
 mod system;
 mod uart;
 mod vm;
