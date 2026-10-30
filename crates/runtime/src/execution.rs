@@ -1637,7 +1637,8 @@ fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, ac
 /// at a check stub of the block holding ELR, or a data abort at one of its access sites whose recorded address range
 /// holds FAR ([`access_aborted`]: a shadow miss to retry, or a guest fault; any non-canonical address, the private
 /// window included, is #GP or #SS). Only an exception at no site, or not of its site's kind, halts: an instruction the
-/// hardware refused at EL0 (`trapped`), an abort in the resident's private window (`private_access`), else
+/// hardware refused at EL0 (`trapped`), an abort in the resident's private window or the guest-state alias's slot
+/// (`private_access`), else
 /// `site_mismatch` at a site and `unknown_abort` elsewhere.
 unsafe fn aborted(f: &NativeFrame) -> ! {
     unsafe {
@@ -1673,8 +1674,9 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             if matches!(esr >> 26, 0x00 | 0x01 | 0x0e | 0x18 | 0x1d | 0x22 | 0x26) {
                 halt(&s, stop::TRAPPED)
             }
-            // Instruction or data abort from EL0 in the private window (FAR is valid for both), at no access site.
-            if matches!(esr >> 26, 0x20 | 0x24) && WINDOW.contains(&far) {
+            // Instruction or data abort from EL0 in the private window or the guest-state alias's slot (G1: a fetch from
+            // the page, or an access beside it; FAR is valid for both), at no access site.
+            if matches!(esr >> 26, 0x20 | 0x24) && (WINDOW.contains(&far) || GUEST_STATE_SLOT.contains(&far)) {
                 halt(&s, stop::PRIVATE_ACCESS)
             }
             halt(&s, if found.is_some() { stop::SITE_MISMATCH } else { stop::UNKNOWN_ABORT })
@@ -1753,8 +1755,8 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
     {
         halt(&s, stop::SITE_MISMATCH)
     }
-    // A non-canonical address (unmapped, EL1-only, or execute-only in the private window: generated code runs at EL0
-    // with no address guard) is #GP, or #SS for a stack-segment site, whichever byte faulted.
+    // A non-canonical address (unmapped, EL1-only, or execute-only in the private window, or beside the guest-state alias
+    // in its slot: generated code runs at EL0 with no address guard) is #GP, or #SS for a stack-segment site, whichever byte faulted.
     let Some(touched) = touched else {
         guest_fault(s, f, b, site, noncanonical(site))
     };

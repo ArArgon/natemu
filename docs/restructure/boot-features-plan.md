@@ -325,22 +325,62 @@ driver's `switch ADDR 0|3` (system kind `SET_CPL`, never decoded from x86). Chec
 rounds of switches with equal shadow resets and retries; block sizes default and 1). Left to K1: each CPL change
 still clears L1 (it is per code context).
 
-*Built (I1, G1 minimum):* the guest-state page is the vCPU's existing FEX frame page with a second alias: EL0 read/write
-at `PRIVATE + 0x24000` (`execution::GUEST_STATE_VA`, x28 at every block entry), while the EL1-only alias stays at
-`FRAME_VA` (`PRIVATE + 0x23000`, the resident's view; the E3 window probes of that page still give #GP). It is inside the
-window, as the owner's one page per vCPU at a fixed non-canonical address; `aborted` needs no exemption because the page
-is mapped, so an access to it never aborts and `private_access` cannot misfire. Extent: exactly one 4 KiB page per vCPU;
-an access straddling into it from `PRIVATE + 0x23000` or out of it into `PRIVATE + 0x25000` faults (#GP from the site),
-and so does every other window page (`run_slice1_faults.py` window class `guest-state` and its straddles). Deviation: a
-guest access inside the page reaches the vCPU's own guest state instead of #GP. What the resident trusts: it reads back
-only DF (FEX's byte at `frame::DF`, banked in `bank`); TF, IF, IOPL, NT, AC, VIF, VIP and ID bytes (RF, VM as 0) are
-rewritten from the bank at every block entry (`frame::flag_bytes`), so a guest write to them lasts at most to the next
-entry and only `pushf` sees it; the FS/GS bases (`frame::FS_BASE`/`GS_BASE`, I7) are likewise written from the bank at
-every `enter` and never read back. Admission lets x28 load the flag bytes and store only DF. Invariants: the abi tests
-`guest_state_page_layout` (fields inside the page, `pushf` image, DF round trip) and the per-run frame check in
-`drivers/program.rs` (`frame_intact`: any nonzero byte outside `frame::GUEST_STATE` fails the run). Open (owner): check
-which kernel paths may be handed arbitrary addresses that could land in `PRIVATE + 0x24000..0x25000` (user-supplied
-pointers before access_ok, probing helpers), where x86 would raise #GP.
+*Built (I1, G1 minimum; moved October 30, below):* the guest-state page is the vCPU's existing FEX frame page with a
+second alias, EL0 read/write (`execution::GUEST_STATE_VA`, x28 at every block entry), while the EL1-only alias stays at
+`FRAME_VA` (`PRIVATE + 0x23000`, the resident's view; the E3 window probes of that page still give #GP). `aborted` needs
+no exemption for the page itself because it is mapped, so an access to it never aborts. Extent: exactly one 4 KiB page
+per vCPU; an access straddling into it or out of it faults (#GP from the site), and so does every window page
+(`run_slice1_faults.py` window class `guest-state` and its straddles). Deviation: a guest access inside the page reaches
+the vCPU's own guest state instead of #GP. What the resident trusts: it reads back only DF (FEX's byte at `frame::DF`,
+banked in `bank`); TF, IF, IOPL, NT, AC, VIF, VIP and ID bytes (RF, VM as 0) are rewritten from the bank at every block
+entry (`frame::flag_bytes`), so a guest write to them lasts at most to the next entry and only `pushf` sees it; the
+FS/GS bases (`frame::FS_BASE`/`GS_BASE`, I7) and FCW are likewise written from the bank at every `enter` and never read
+back. Admission lets x28 load the flag bytes and store only DF (and the x87/AVX fields, I6/I8). Invariants: the abi
+tests `guest_state_page_layout` (fields inside the page, `pushf` image, DF round trip, the address's class) and the
+per-run frame check in `drivers/program.rs` (`frame_intact`: any nonzero byte outside `frame::GUEST_STATE` fails the
+run).
+*G1 fix (October 30; guest kernel/user isolation):* the EL0 alias was at `PRIVATE + 0x24000` = `0x0000_8000_4002_4000`,
+non-canonical but with bit 63 clear. Linux 6.12's `put_user` (`arch/x86/lib/putuser.S`, `sar $63; or`) folds only
+addresses with bit 63 set and leaves a lower-half non-canonical one to the hardware #GP, so an unprivileged process
+could make the kernel store chosen bytes into the page with ordinary system calls (`set_tid_address` then
+`prctl(PR_GET_TID_ADDRESS, alias + 0x3E0)` writes the GS base the kernel's own `gs:` accesses use until the next
+resident entry; `time(alias)`), and the call returned success instead of -EFAULT: DF at CPL0, the kernel's per-CPU base
+and another task's lazily saved x87 state were reachable. Host isolation was not affected. **Now:** the alias is
+`0xffff_4000_0000_1000`, in the upper Arm translation table's entries 0..255 (`0xffff_0000_0000_0000..0xffff_8000_0000_0000`):
+x86 non-canonical with bit 63 set, so `put_user` folds it to all-ones (#PF, -EFAULT), `get_user`/`access_ok`/`copy_*_user`
+refuse it (above `USER_PTR_MAX`), the nofault reads fail their canonical check, and no guest shadow ever uses those
+entries (`shadow::Space` refuses the range; its `halves`/`reset` touch only entries 256..511 of an upper root).
+*Mapping:* the host (`memory::guest_state_alias`) links upper-root entry 128 of both shadow spaces (`UPPER_ROOT`,
+`USER_UPPER_ROOT`) to three owner tables (`execution::GUEST_STATE_TABLES`, window pages `0x28000..0x2b000`, after the
+guest-RAM alias's level-2 tables, never mapped in the window, so the resident cannot change those three pages); their
+only leaf is the frame page, AP 01 (EL0 and EL1 read/write), PXN and UXN, not global (each space's ASID). Entry 128 itself
+lies in the upper roots, which the resident writes: it is protected only by the shadow paths' entry range
+(`Space::root` refuses addresses below `HIGH_BASE`; `halves`/`reset` touch only entries 256..511). `Space::map` also
+refuses the frame page and the three alias tables as shadow targets (defence in depth; shadow targets are guest RAM or
+the all-ones page anyway). *TCR:* `TCR_BOTH` (T1SZ = 16:
+48-bit upper half, TG1 4 KiB, EPD1 clear, A1 = 0, no TBI); EPD1 is set only inside `tables::select`, at EL1 while the
+roots change, and cleared before it returns, so the alias is walkable whenever generated code runs; the execution mode
+always runs with the upper half on (`private_space(.., true)`, `TCR_BOTH`). The window page at the old address is
+unmapped now (no window page is EL0 data; its neighbours, the frame page and the RAM tables, are EL1-only or unmapped),
+so a guest access there is #GP like any other non-canonical address. *Aborts:* an EL0 abort at no access site with FAR in
+the alias's 512 GiB slot (`execution::GUEST_STATE_SLOT`: a fetch from the page, an access beside it) halts
+`private_access`, as in the window; at an access site, the slot is non-canonical: #GP/#SS. *x87 slots:* admission's
+code-shape check now also requires that no branch enters between the `and wI, wN, #7` mask and its `[x0, #0x420]`
+access, so every path masks the index (the slot stays at x28 + 0x420..0x498; before, a forward branch past the mask was
+admitted, a negative control of `x87_slot_index_is_masked_on_every_path`). The code-shape check is a debug check
+(`Compiler::shape` defaults to off; `boot-linux` runs without it), so the containment that holds in every run is the
+hardware's: the alias's slot maps exactly one page, and an x0 outside it faults (`private_access` at no site).
+**Remaining deviation (recorded):** a guest access inside the page, at any CPL, reaches the vCPU's own guest state
+instead of #GP, as before. A user-mode access reaches only what that vCPU's own state already is: the bases and flag
+bytes it may write are rewritten at the next resident entry, and every CPL change (SYSCALL, interrupt, exception, IRET)
+passes through the resident, so the kernel never runs with a value a user process stored there; a user DF or x87 value
+stored there is that task's own state. A kernel path reaches the page only through a kernel bug (an unchecked
+`__get_user`/`__put_user`/`unsafe_*_user` on a user pointer, which x86 would turn into #GP) or privileged BPF direct
+loads (`BPF_PROBE_MEM`, which read only, needing CAP_BPF/CAP_PERFMON). **Constraint for later:** never advertise LA57
+or more than 48 linear-address bits (CPUID 7.ECX[16], 80000008H.EAX[15:8] = 48): with 57-bit linear addresses the
+alias would be canonical and the guest could map it. Nor LAM (CPUID 7.1:EAX[26], CR4.LAM_SUP bit 28): it ignores bits
+62:48 of a supervisor pointer, so `0xffff_4000_...` would alias a canonical kernel address. Both are asserted by
+`guest_state_page_layout`.
 *Built (S1, presented CPU):* `tools/models/gen_cpu_profile_rs.py` generates `crates/abi/src/cpu_profile.rs` from
 `cpu_profile.json` (CPUID leaves, MSR access/reset/writable mask/rules, CR0/CR4/EFER/XCR0 sets, the selected "enabled"
 MTRR state) plus `cpu_profile.py`'s answers as test vectors; `crates/abi/src/cpu.rs` (CPUID with its dynamic fields,
@@ -2754,7 +2794,7 @@ whose frame store met a data breakpoint trapped one instruction late (after the 
 delivery now ends `events::take`'s loop when a trap is pending and `find` takes the trap first (`s4-d-ext-frame`, an
 x2APIC self-IPI whose frame meets a write breakpoint; red with the check removed); a breakpoint on a non-canonical range
 was programmed as a watchpoint and one over the guest-state page halted the run (`unknown_abort`): such ranges are no
-longer programmed (`s4-d-noncanon`, the review's four breakpoints on guest-state fields; red with the check removed).
+longer programmed (`s4-d-noncanon`, the review's four breakpoints on guest-state fields, at the page's EL0 alias since the G1 fix; red with the check removed).
 QEMU departure: it takes no trap for the interrupt frame's store.
 *S4 final (f8f3fa2 + S4, fexc series33):* the state record grows by one word (`State::debug`: the pending trap's DR6
 bits, the instruction's data/I-O hits, the step mark; the counters `debug_steps`, `debug_traps`, `code_breaks`,

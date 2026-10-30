@@ -103,8 +103,6 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize, ram_bytes: us
             own(SHARED_OFFSET, 4096),
             own(exec::STATE_OFFSET, 4096),
             own(exec::FRAME_OFFSET, exec::frame::BYTES),
-            // The guest-state page's EL0 alias (x28 of generated code), backed by the same page (G1 minimum).
-            Span::guest(exec::GUEST_STATE_OFFSET, exec::frame::BYTES, base + exec::FRAME_OFFSET),
             own((STACK_TOP - PRIVATE) as usize - exec::STACK_BYTES, exec::STACK_BYTES),
             own((EXCEPTION_STACK_TOP - PRIVATE) as usize - 0x8000, 0x8000),
             own(exec::STAGING_OFFSET, exec::STAGING_BYTES),
@@ -117,6 +115,8 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize, ram_bytes: us
             Span::data((cache::GLOBAL_VA - PRIVATE) as usize, cache::GLOBAL_BYTES, cache::GLOBAL_OFFSET),
         ]);
         private_space(&memory, base, &spans, true);
+        // The guest-state page's EL0 alias (x28 of generated code), backed by the frame page (G1).
+        guest_state_alias(&memory, base, base + exec::FRAME_OFFSET);
         // SAFETY: Control is plain integers; the resident owns everything but the capacity.
         let mut control: cache::Control = unsafe { std::mem::zeroed() };
         control.code_bytes = (cache::HEAD_BYTES + code_bytes) as u64;

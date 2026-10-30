@@ -931,13 +931,14 @@ i_after:
     xor edx, edx
     wrmsr
 """
-NONCANON = """    mov rax, 0x8000400243f8
+# Breakpoints on the guest-state page's EL0 alias (abi GUEST_STATE_VA, G1): DF/flag bytes, x87 C1, mm[0], FCW.
+NONCANON = """    mov rax, 0xffff4000000013f8
     mov dr0, rax
-    mov rax, 0x800040024418
+    mov rax, 0xffff400000001418
     mov dr1, rax
-    mov rax, 0x800040024420
+    mov rax, 0xffff400000001420
     mov dr2, rax
-    mov rax, 0x8000400244b0
+    mov rax, 0xffff4000000014b0
     mov dr3, rax
     mov rax, 0xbbbb00ff
     mov dr7, rax

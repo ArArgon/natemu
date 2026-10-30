@@ -703,7 +703,9 @@ impl<'a> Verifier<'a> {
 
     /// I6 (code shape): an x87 stack slot, FEX's `mm[I]` in the guest-state page: `add x0, x28, xI, lsl #4` right before an
     /// 8-byte access `[x0, #mm]` (I = (TOP + i) & 7, which fexc masks; the hardware keeps any address inside EL0's mappings).
-    /// The index register's last write before the `add` must be `and wI, wN, #7` (fexc masks every index: TOP is guest data).
+    /// The index register's last write before the `add` must be `and wI, wN, #7` (fexc masks every index: TOP is guest data),
+    /// and no branch may enter after that `and` up to the access, so every path to the access masks the index and adds it
+    /// (the slot stays inside the guest-state page: x28 + 0x420 + 7 * 16 + 8 <= x28 + 0x498).
     fn x87_slot(&self, m: Mem, at: u32) -> bool {
         if at < ENTRY_OFFSET + 4
             || self.word(at - 4) & 0xffe0_ffff != 0x8b00_1380
@@ -716,7 +718,8 @@ impl<'a> Verifier<'a> {
         while k > ENTRY_OFFSET {
             k -= 4;
             if self.insn(k).is_some_and(|i| i.writes() & 1 << index != 0) {
-                return self.word(k) & 0xffff_fc1f == 0x1200_0800 | index;   // and wI, wN, #0x7
+                return self.word(k) & 0xffff_fc1f == 0x1200_0800 | index   // and wI, wN, #0x7
+                    && self.branches_into(k, at).next().is_none();
             }
         }
         false
@@ -1565,6 +1568,21 @@ mod tests {
         validated(ADDRESS, at, old, SVC_DIV_U, Some("division svc outside"));
     }
     /// I6b: a helper `svc` only in its instruction, right after the `movz w0` of exactly its function code or control word.
+    /// G1: an x87 stack slot (`ldrb w20, [x28, #0x41b]` (TOP) at 0x1c0, `and w20, w20, #7` at 0x1c4, `add x0, x28, x20, lsl #4` at 0x1c8, `ldr d2, [x0, #0x420]` at
+    /// 0x1cc: fstp's ST(0)) is admitted only when no branch enters after the mask: a path skipping it could index outside
+    /// the guest-state page.
+    #[test]
+    fn x87_slot_index_is_masked_on_every_path() {
+        const HELPERS: (&[u8], &[u8]) = FIXTURES[10];
+        let ldrb_top = 0x1c0;
+        assert_eq!(super::super::record::<Header>(HELPERS.0, 0).code_offset, 0x80);
+        // `b` to the mask itself: every path still masks.
+        admit((&patched(HELPERS, ldrb_top, 0x3950_6f94, 0x1400_0001), HELPERS.1)).unwrap();
+        // `b` past the mask to the `add`, or to the access.
+        refused(HELPERS, ldrb_top, 0x3950_6f94, 0x1400_0002, "unrecorded memory access at 0x1cc");
+        refused(HELPERS, ldrb_top, 0x3950_6f94, 0x1400_0003, "unrecorded memory access at 0x1cc");
+    }
+
     #[test]
     fn helper_svcs_only_in_their_instruction() {
         const HELPERS: (&[u8], &[u8]) = FIXTURES[10];

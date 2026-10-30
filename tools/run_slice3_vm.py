@@ -1638,6 +1638,8 @@ def priv_description(cpus):
 
 
 PRIV_HEAD = 'mov rax, {ta}\nmov cr3, rax\n'
+# G1: the guest-state page's EL0 alias (abi execution::GUEST_STATE_VA) and its former address (PRIVATE + 0x24000).
+G1_PAGE, G1_OLD = 0xffff_4000_0000_1000, 0x0000_8000_4002_4000
 PRIV_TO_USER = 'jmp sw_3\n.org 0xfff, 0xcc\nsw_3: nop\n'   # the switch is the supervisor page's last byte
 
 
@@ -1691,7 +1693,21 @@ def priv_programs(i):
     both = lambda c: (None, {3: f1(c), 8: f1(c), 9: f2(c), 10: f2(c)})
     smep = (PRIV_HEAD + 'mov rax, cr4\nbts rax, 20\nmov cr4, rax\nmov rbx, qword ptr [{UW}]\n' + PRIV_TO_USER
             + 'mov r8, qword ptr [{UW}]\nsw_0: nop\nafter: mov r9, 1\n')
-    return {
+    # G1: the guest-state page's EL0 alias (abi GUEST_STATE_VA) and its former address in the private window (PRIVATE +
+    # 0x24000), each accessed at CPL0 and at CPL3 through a computed pointer. The former address is #GP(0) like every
+    # non-canonical address; the alias is the documented deviation at both CPLs: a store and a load back reach the vCPU's
+    # own page (a non-field qword, restored to 0, so the frame check holds).
+    old = lambda tail: lambda c: ((13, 0, c['labels'][tail], 0), {})
+    new = lambda c: (None, {8: 0x1234, 9: 1})
+    old_access = 'tail: mov rbx, qword ptr [rax]\n'
+    new_access = 'mov rcx, 0x1234\nmov qword ptr [rax+8], rcx\nmov r8, qword ptr [rax+8]\nmov qword ptr [rax+8], 0\nmov r9, 1\n'
+    guest_state = {
+        'gs-old0': (PRIV_HEAD + f'mov rax, {G1_OLD:#x}\n' + old_access, 1, old('tail')),
+        'gs-old3': (PRIV_HEAD + PRIV_TO_USER + f'mov rax, {G1_OLD:#x}\n' + old_access, 1, old('tail')),
+        'gs-new0': (PRIV_HEAD + f'mov rax, {G1_PAGE:#x}\n' + new_access, 1, new),
+        'gs-new3': (PRIV_HEAD + PRIV_TO_USER + f'mov rax, {G1_PAGE:#x}\n' + new_access, 1, new),
+    }
+    return guest_state | {
         # INVLPG at CPL0 drops V's shadow from both spaces: each CPL reads the new frame.
         'invlpg': (remap('mov qword ptr [{la}], {F2}+0x67\nmov rax, {V}\ninvlpg [rax]\n'), 1, both),
         # A CR3 load (table B maps V to F2) drops both spaces.
@@ -1826,9 +1842,10 @@ def tamper_kinds(fixture):
 
 
 # Forged block entries (name, A64 words, expected halt): system instructions trap at EL0 (ESR classes 0x00, 0x01,
-# 0x18); loads, stores and branches into the private window (`sub x0, x28, #0x1000` names the EL1-only frame alias; a
-# branch to x28 is a branch into the window, the guest-state page being EL0 data, never executable; `adr` names the
-# execute-only code area) abort there.
+# 0x18); loads, stores and branches into the private window (the EL1-only frame alias and the former guest-state alias
+# by movz/movk; `adr` names the execute-only code area) or into the guest-state alias's slot (G1: `sub x0, x28, #0x1000`
+# names the unmapped page below the alias; a branch to x28 is a fetch from the alias, EL0 data, never executable) abort
+# there.
 EL0_FORGED = [('msr-daifset', 'd50342df', 'trapped'), ('msr-ttbr0', 'd5182000', 'trapped'),
               ('mrs-sctlr', 'd5381000', 'trapped'), ('mrs-ctr', 'd53b0020', 'trapped'), ('tlbi', 'd508871f', 'trapped'),
               ('dc-civac', 'd50b7e20', 'trapped'), ('ic-ivau', 'd50b7520', 'trapped'), ('eret', 'd69f03e0', 'trapped'),
@@ -1838,10 +1855,16 @@ EL0_FORGED = [('msr-daifset', 'd50342df', 'trapped'), ('msr-ttbr0', 'd5182000', 
               ('mrs-cntvct', 'd53be040', 'trapped'), ('msr-cntv-ctl', 'd51be320', 'trapped'), ('dc-zva', 'd50b743c', 'trapped'), ('mrs-pmccntr', 'd53b9d00', 'trapped'),
               # A literal exit to a RIP none of the block's link points targets: the linker's own check.
               ('link-forged', 'd2824680,d4000021', 'bad_link'),
-              # x28 is the guest-state page's EL0 alias since I1 (G1: EL0 may read and write it); its EL1-only alias, one
-              # page below in the window (abi FRAME_VA), stays unreachable.
-              ('load-frame', 'd1400780,f940001f', 'private_access'), ('store-frame', 'd1400780,f900001c', 'private_access'),
-              ('branch-frame', 'd61f0380', 'private_access'), ('read-code', '10000000,f9400000', 'private_access'),
+              # x28 is the guest-state page's EL0 alias (G1: EL0 may read and write it, abi GUEST_STATE_VA, outside the
+              # window); its EL1-only alias (abi FRAME_VA = PRIVATE + 0x23000) and the former EL0 alias (PRIVATE + 0x24000,
+              # now unmapped) stay unreachable, and so does the rest of the alias's slot.
+              ('load-frame', 'd2860000,f2a80040,f2d00000,f940001f', 'private_access'),
+              ('store-frame', 'd2860000,f2a80040,f2d00000,f900001c', 'private_access'),
+              ('branch-frame', 'd2860000,f2a80040,f2d00000,d61f0000', 'private_access'),
+              ('load-old-alias', 'd2880000,f2a80040,f2d00000,f940001f', 'private_access'),
+              ('store-old-alias', 'd2880000,f2a80040,f2d00000,f900001c', 'private_access'),
+              ('load-slot', 'd1400780,f940001f', 'private_access'), ('store-slot', 'd1400780,f900001c', 'private_access'),
+              ('branch-alias', 'd61f0380', 'private_access'), ('read-code', '10000000,f9400000', 'private_access'),
               # M1: the guest-RAM alias (abi GUEST_RAM_VA = PRIVATE + 1 GiB, x0 by movz/movk) is EL1-only too.
               ('load-ram-alias', 'd2b00000,f2d00000,f940001f', 'private_access'),
               ('store-ram-alias', 'd2b00000,f2d00000,f900001f', 'private_access')]

@@ -74,14 +74,24 @@ pub const STATE_VA: u64 = PRIVATE + STATE_OFFSET as u64;
 /// only its guest-state fields ([`frame::GUEST_STATE`]), through x28 = [`FRAME_POINTER`].
 pub const FRAME_OFFSET: usize = 0x23000;
 pub const FRAME_VA: u64 = PRIVATE + FRAME_OFFSET as u64;
-/// The guest-state page's EL0 read/write alias (G1 minimum, I1): x28 points here at every block entry, so generated
-/// code reaches the guest-state fields at EL0. It lies in the private window, whose other pages stay EL1-only or EL0
-/// execute-only; it is the one window page EL0 may read and write. Documented deviation: a guest access to this page
-/// (a non-canonical address, #GP on x86) reaches the vCPU's own guest state instead; the page holds nothing but guest
-/// state (the resident rewrites the flag bytes from its bank at every block entry and reads back only DF).
-pub const GUEST_STATE_OFFSET: usize = 0x24000;
-pub const GUEST_STATE_VA: u64 = PRIVATE + GUEST_STATE_OFFSET as u64;
+/// The guest-state page's EL0 read/write alias (G1, I1): x28 points here at every block entry, so generated code reaches
+/// the guest-state fields at EL0. It lies outside the private window, in the upper Arm translation table's entries
+/// 0..255 (`0xffff_0000_0000_0000..0xffff_8000_0000_0000`: non-canonical on x86 with bit 63 set, never a guest shadow,
+/// `shadow::Space` refuses it), mapped by both shadow spaces' upper roots through the owner's own tables
+/// ([`GUEST_STATE_TABLES`], written by the host, never mapped in the window). Bit 63 matters: Linux's user-access paths
+/// fold or refuse an address with it set before any access (`put_user`'s `sar $63; or`, `access_ok`), so a user pointer
+/// naming the page faults there, as on x86, instead of the kernel storing into it. Documented deviation: a guest access
+/// inside this page reaches the vCPU's own guest state instead of #GP; every other address of its table slot faults (#GP).
+/// The page holds nothing but guest state (the resident rewrites the flag bytes and the FS/GS bases from its bank at
+/// every block entry and reads back only DF). Needs 48-bit linear addresses and no LAM: with LA57 it would be canonical,
+/// with LAM_SUP it would alias a canonical kernel address (neither is advertised).
+pub const GUEST_STATE_VA: u64 = 0xffff_4000_0000_1000;
 pub const FRAME_POINTER: u64 = GUEST_STATE_VA;
+/// The alias's level-1, level-2 and leaf tables (window pages after the guest-RAM alias's level-2 tables).
+pub const GUEST_STATE_TABLES: [usize; 3] = [RAM_TABLES_OFFSET + 0x3000, RAM_TABLES_OFFSET + 0x4000, RAM_TABLES_OFFSET + 0x5000];
+/// The alias's top-level slot (512 GiB, one upper-root entry): every address in it walks only the owner's tables.
+pub const GUEST_STATE_SLOT: core::ops::Range<u64> = (GUEST_STATE_VA & !((1 << 39) - 1))..(GUEST_STATE_VA & !((1 << 39) - 1)) + (1 << 39);
+const _: () = assert!(GUEST_STATE_SLOT.start >= 0xffff_0000_0000_0000 && GUEST_STATE_SLOT.end <= crate::shadow::HIGH_BASE);
 /// Host-written admitted object (header, code, tables).
 pub const STAGING_OFFSET: usize = 0x70000;
 pub const STAGING_BYTES: usize = 0x20000;
@@ -115,8 +125,9 @@ pub const unsafe fn guest_ram(bytes: u64, va: u64) -> crate::guest_memory::Guest
 /// The private window: the first GiB's areas ([`cache`]), then the guest-RAM alias.
 pub const PRIVATE_BYTES: u64 = (1 << 30) + MAX_GUEST_RAM_BYTES as u64;
 const _: () = assert!(MAX_GUEST_RAM_BYTES % (2 << 20) == 0 && MAX_GUEST_PAGES % 64 == 0);
-const _: () = assert!(GUEST_STATE_OFFSET + frame::BYTES <= RAM_TABLES_OFFSET);
-const _: () = assert!(RAM_TABLES_OFFSET + (MAX_GUEST_RAM_BYTES >> 30) * 4096 <= (crate::STACK_TOP - PRIVATE) as usize - STACK_BYTES);
+const _: () = assert!(FRAME_OFFSET + frame::BYTES <= RAM_TABLES_OFFSET);
+const _: () = assert!(RAM_TABLES_OFFSET + (MAX_GUEST_RAM_BYTES >> 30) * 4096 <= GUEST_STATE_TABLES[0]);
+const _: () = assert!(GUEST_STATE_TABLES[2] + 4096 <= (crate::STACK_TOP - PRIVATE) as usize - STACK_BYTES);
 
 /// The code cache (slice 2). Per vCPU: an executable code area with a writable
 /// alias, a metadata arena (block records and their access sites) and the lookup
@@ -1609,8 +1620,6 @@ pub const MMIO_VA: u64 = PRIVATE + MMIO_OFFSET as u64;
 const _: () = assert!(ENTROPY_OFFSET + core::mem::size_of::<Entropy>() <= MMIO_OFFSET);
 const _: () = assert!(MMIO_OFFSET + core::mem::size_of::<Mmio>() <= STATE_OFFSET + 4096);
 const _: () = assert!(STATE_OFFSET + 4096 <= FRAME_OFFSET);
-const _: () = assert!(FRAME_OFFSET + frame::BYTES <= GUEST_STATE_OFFSET);
-const _: () = assert!(GUEST_STATE_OFFSET + frame::BYTES <= (crate::STACK_TOP - PRIVATE) as usize - STACK_BYTES);
 const _: () = assert!(STAGING_OFFSET + STAGING_BYTES <= crate::resident::TEXT_OFFSET);
 
 #[cfg(test)]
@@ -1644,6 +1653,18 @@ mod tests {
         assert!(frame::GUEST_STATE_WRITABLE.iter().all(|&(o, n)| (o..o + n).all(|b| inside(&frame::GUEST_STATE, b))));
         assert_eq!(GUEST_STATE_VA % 4096, 0);
         assert_eq!(FRAME_POINTER, GUEST_STATE_VA);
+        // G1: x86 non-canonical with bit 63 set (Linux's user-access paths refuse it), outside the window and outside
+        // every guest shadow (both halves), and inside its own slot.
+        assert!(!crate::paging::canonical(GUEST_STATE_VA) && !crate::paging::canonical(GUEST_STATE_VA + 4095));
+        assert!(GUEST_STATE_VA >> 63 == 1 && GUEST_STATE_SLOT.contains(&GUEST_STATE_VA) && GUEST_STATE_SLOT.contains(&(GUEST_STATE_VA + 4095)));
+        assert!(!(PRIVATE..PRIVATE + PRIVATE_BYTES).contains(&GUEST_STATE_VA));
+        // ... which holds only with 48-bit linear addresses and no masking of the upper bits: no LA57 (CPUID 7.0:ECX[16],
+        // CR4 bit 12), 48 linear bits (80000008H:EAX[15:8]), and no LAM (CPUID 7.1:EAX[26], CR4 bit 28 LAM_SUP: it would
+        // make the alias's supervisor address canonical by ignoring bits 62:48).
+        let d = crate::cpu::Dynamic { vcpus: 1, vcpu: 0, cr4: 0, apic_base: 0xfee0_0800, misc_enable: 0x1801, xcr0: 1 };
+        let leaf = |l: u32, sub: u32| crate::cpu::cpuid(l, sub, &d);
+        assert!(leaf(7, 0)[2] & 1 << 16 == 0 && crate::cpu_profile::CR4_VALID & 1 << 12 == 0 && leaf(0x8000_0008, 0)[0] >> 8 & 0xff == 48);
+        assert!(leaf(7, 1)[0] & 1 << 26 == 0 && crate::cpu_profile::CR4_VALID & 1 << 28 == 0);
         for rflags in [0x2u64, 0x202, 0x3202, 0x7_7702, 0x24_7f02, 0x40d02, 0x30_0302 | 1 << 14] {
             let mut image = 0u64;
             for (at, v) in frame::flag_bytes(rflags) {

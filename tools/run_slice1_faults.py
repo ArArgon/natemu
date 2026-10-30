@@ -417,6 +417,8 @@ SS_SPAN = [(0x8000_0000_0004, 'push', 'push rax'), (0xffff_8000_0000_0004, 'push
 WINDOW = [('tables', PRIVATE + 0x1_0000), ('shared', PRIVATE + 0x2_0000), ('state', PRIVATE + 0x2_2000), ('frame', PRIVATE + 0x2_3000),
           ('stack', PRIVATE + 0x5_3000), ('exception-stack', PRIVATE + 0x6_3000), ('staging', PRIVATE + 0x7_0000),
           ('text', PRIVATE + 0xa_0000), ('pool', PRIVATE + 0xe_0000), ('guest-ram', PRIVATE + 0x4000_0000 + D), ('ram-tables', PRIVATE + 0x2_5000), ('pool-high', PRIVATE + 0x1f_f000),
+          # G1: the guest-state page's former EL0 alias (unmapped since the alias left the window) and its tables' pages.
+          ('old-guest-state', PRIVATE + 0x2_4000), ('guest-state-tables', PRIVATE + 0x2_8000),
           ('code', PRIVATE + 0x1003_1000), ('dispatch', PRIVATE + 0x1001_0000), ('code-write', PRIVATE + 0x2003_1000),
           ('meta', PRIVATE + 0x3000_0000), ('lookup', PRIVATE + 0x3800_0000), ('global', PRIVATE + 0x3c00_0000),
           ('low-hole', 0x0000_ffff_ffff_e000), ('low-hole-kernel', 0x0000_8880_1234_5000),
@@ -433,17 +435,22 @@ STRADDLE_FORMS = [('load', 'rbx', 0, 'mov rax, qword ptr [rbx]'), ('store', 'rbx
                   ('ret', 'rsp', 0, 'ret'), ('call', 'rsp', 8, 'call rdx'), ('push-mem', 'rbx', 0, 'push qword ptr [rbx]'),
                   ('lock-add', 'rbx', 0, 'lock add qword ptr [rbx], rcx'), ('lock-cmpxchg16b', 'rbx', 0, 'lock cmpxchg16b xmmword ptr [rbx]')]
 
-# G1 (I1): the guest-state page, the one EL0 data page of the window (abi GUEST_STATE_VA): an access inside it reaches
-# the vCPU's own guest state (documented deviation): a non-field byte reads 0 and the IF byte the banked IF (1). Its
-# extent is pinned by straddles into it (from the EL1-only frame alias) and out of it, and by the page above: each #GP.
-GUEST_STATE = PRIVATE + 0x2_4000
+# G1: the guest-state page's EL0 alias (abi GUEST_STATE_VA), outside the window in the upper half's x86 non-canonical
+# range: an access inside it reaches the vCPU's own guest state (documented deviation): a non-field byte reads 0, the IF
+# byte the banked IF (1), and a store to a non-field qword reads back (then restored to 0, as the frame check needs). Its
+# extent is pinned by straddles into it (from the unmapped page below in its slot) and out of it, and by the page above:
+# each #GP. The window's former alias (PRIVATE + 0x24000) is a WINDOW class above.
+GUEST_STATE = 0xffff_4000_0000_1000
 GUEST_STATE_EDGES = [GUEST_STATE - 4, GUEST_STATE + 0xffc, GUEST_STATE + 0x1000]
 GUEST_STATE_FORMS = [('load', 'mov rax, qword ptr [rbx]'), ('store', 'mov qword ptr [rbx], rax'), ('rmw', 'add qword ptr [rbx], 1')]
 
 def guest_state_probes():
     out = [('window-guest-state', REGS, PRELUDE + [f'movabs rbx, {GUEST_STATE}', 'mov rax, qword ptr [rbx]',
                                                     'movzx ecx, byte ptr [rbx + 0x3f9]'], len(PRELUDE) + 1,
-            {'deviation': {'rax': 0, 'rcx': 1}})]
+            {'deviation': {'rax': 0, 'rcx': 1}}),
+           ('window-guest-state-store', REGS, PRELUDE + [f'movabs rbx, {GUEST_STATE}', 'mov qword ptr [rbx + 8], rdx',
+                                                          'mov rcx, qword ptr [rbx + 8]', 'mov qword ptr [rbx + 8], 0'], len(PRELUDE) + 1,
+            {'deviation': {'rcx': 2}})]
     for a in GUEST_STATE_EDGES:
         for name, line in GUEST_STATE_FORMS:
             out.append((f'guest-state-edge-{a:#x}-{name}', REGS, PRELUDE + [f'movabs rbx, {a}', line] + AFTER, len(PRELUDE) + 1, {}))

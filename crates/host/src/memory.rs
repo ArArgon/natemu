@@ -168,14 +168,13 @@ pub(crate) fn load_elf(memory: &Memory, data: &[u8]) -> Result<()> {
 
 /// Protection of a private alias: resident text is EL1 read-only and EL1-executable; generated code (the code area:
 /// blocks, the step slot, the dispatcher and L1) is EL1 read-only and EL0 execute-only, so EL1 never executes it and
-/// EL0 can neither read nor write it; the guest-state page's EL0 alias (`execution::GUEST_STATE_VA`, the only EL0 data
-/// in the window) is EL0 and EL1 read/write; everything else is EL1 read/write; none of it is executable but as said.
+/// EL0 can neither read nor write it; everything else is EL1 read/write; none of it is executable but as said. No window
+/// page is EL0 data: the guest-state page's EL0 alias lies outside the window ([`guest_state_alias`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Rights {
     Text,
     Code,
     Data,
-    Guest,
 }
 /// AP 10 (EL1 read-only, no EL0 access), AP 01 (EL1 and EL0 read/write), PXN and UXN.
 const READ_ONLY: u64 = 1 << 7;
@@ -214,14 +213,6 @@ impl Span {
             bytes,
             target,
             rights: Rights::Data,
-        }
-    }
-    pub(crate) const fn guest(offset: usize, bytes: usize, target: usize) -> Self {
-        Self {
-            offset,
-            bytes,
-            target,
-            rights: Rights::Guest,
         }
     }
 }
@@ -298,7 +289,6 @@ pub(crate) fn map_private(memory: &Memory, window: usize, spans: &[Span]) {
             Rights::Text => READ_ONLY | UXN,
             Rights::Code => READ_ONLY | PXN,
             Rights::Data => PXN | UXN,
-            Rights::Guest => EL0_DATA | PXN | UXN,
         };
         if span.offset >= BLOCK_BYTES {
             assert!((span.offset | span.bytes | span.target) % BLOCK_BYTES == 0);
@@ -321,6 +311,24 @@ pub(crate) fn map_private(memory: &Memory, window: usize, spans: &[Span]) {
             );
         }
     }
+}
+
+/// G1: the guest-state page's EL0 alias (`execution::GUEST_STATE_VA`, x28 of generated code), EL0 and EL1 read/write,
+/// never executable, backed by window `window`'s page at backing offset `target` (its frame page): one upper-root entry of
+/// both shadow spaces (an entry below 256, which no shadow uses) links the owner's own tables
+/// (`execution::GUEST_STATE_TABLES`, never mapped in the window), whose only leaf is this page.
+pub(crate) fn guest_state_alias(memory: &Memory, window: usize, target: usize) {
+    let va = natemu_abi::execution::GUEST_STATE_VA;
+    let [l1, l2, leaf] = natemu_abi::execution::GUEST_STATE_TABLES;
+    let index = |level: u32| (va >> (39 - 9 * level) & 511) as usize * 8;
+    let word = |at: usize, value| memory.word(window + at, value);
+    let table = |offset: usize| IPA + (window + offset) as u64 + 3;
+    for root in [shadow::UPPER_ROOT, shadow::USER_UPPER_ROOT] {
+        word(root + index(0), table(l1));
+    }
+    word(l1 + index(1), table(l2));
+    word(l2 + index(2), table(leaf));
+    word(leaf + index(3), (IPA + target as u64) | PAGE | EL0_DATA | PXN | UXN);
 }
 
 /// The resident's boot and extended text in window `window`.
@@ -434,6 +442,39 @@ mod tests {
                 assert_eq!(pte & (PXN | UXN | 3 << 6), PXN | UXN);
             }
         }
+    }
+
+    /// G1: the guest-state alias is one EL0 read/write page in both spaces' upper roots, at an upper-root entry below 256
+    /// (no guest shadow's), and no window page is EL0 data (the old alias, `PRIVATE + 0x24000`, is unmapped).
+    #[test]
+    fn guest_state_alias_is_one_el0_page_outside_the_window() {
+        use natemu_abi::execution::{FRAME_OFFSET, GUEST_STATE_VA};
+        let memory = Memory::new().unwrap();
+        let mut spans = resident_text(0);
+        spans.push(Span::data(FRAME_OFFSET, 4096, FRAME_OFFSET));
+        private_space(&memory, 0, &spans, true);
+        guest_state_alias(&memory, 0, FRAME_OFFSET);
+        let word = |offset: usize| u64::from_le_bytes(memory.read::<8>(offset));
+        let walk = |root: usize, va: u64| {
+            let mut table = root;
+            for level in 0..4 {
+                let entry = word(table + (va >> (39 - 9 * level) & 511) as usize * 8);
+                if level == 3 || entry & 1 == 0 {
+                    return entry;
+                }
+                table = (entry & 0x0000_ffff_ffff_f000) as usize - IPA as usize;
+            }
+            unreachable!()
+        };
+        assert!((GUEST_STATE_VA >> 39 & 511) < 256);
+        for root in [shadow::UPPER_ROOT, shadow::USER_UPPER_ROOT] {
+            assert_eq!(walk(root, GUEST_STATE_VA), (IPA + FRAME_OFFSET as u64) | PAGE | EL0_DATA | PXN | UXN);
+            assert_eq!([walk(root, GUEST_STATE_VA - 4096), walk(root, GUEST_STATE_VA + 4096)], [0, 0]);
+        }
+        for offset in (0..RAM_SIZE).step_by(4096) {
+            assert_eq!(word(PRIVATE_LEAF + offset / 4096 * 8) & EL0_DATA, 0, "{offset:#x}");
+        }
+        assert_eq!(word(PRIVATE_LEAF + 0x24000 / 4096 * 8), 0);
     }
 
     #[test]

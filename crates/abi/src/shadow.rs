@@ -99,6 +99,11 @@ const LOWER_TABLES: [usize; 3] = [0x11000, 0x15000, LOWER_LEAF];
 const UPPER_TABLES: [usize; 3] = [UPPER_L1, UPPER_L2, UPPER_LEAF];
 /// Window pages holding the owner's tables and shadow state: never a target.
 const PRIVATE_TABLES: core::ops::Range<usize> = LOWER_ROOT..USER_UPPER_ROOT + 4096;
+/// G1: the frame page (the guest-state page, also reached by its EL0 alias) and the alias's tables: never a target.
+const GUEST_STATE: [core::ops::Range<usize>; 2] = [
+    crate::execution::FRAME_OFFSET..crate::execution::FRAME_OFFSET + 4096,
+    crate::execution::GUEST_STATE_TABLES[0]..crate::execution::GUEST_STATE_TABLES[2] + 4096,
+];
 
 impl<M: Maintenance> Space<M> {
     fn slot(&self, table: usize, index: usize) -> *mut u64 {
@@ -196,7 +201,7 @@ impl<M: Maintenance> Space<M> {
             return Err(Error::Misaligned);
         }
         let own = target.wrapping_sub(self.ipa) as usize;
-        if PRIVATE_TABLES.contains(&own) || self.pool(own, POOL_PAGES) {
+        if PRIVATE_TABLES.contains(&own) || GUEST_STATE.iter().any(|r| r.contains(&own)) || self.pool(own, POOL_PAGES) {
             return Err(Error::Private);
         }
         let (table, index) = self.leaf(va, true)?.ok_or(Error::Corrupt)?;
@@ -466,6 +471,11 @@ mod tests {
         drop(s);
         // Both spaces' guest halves are unlinked; the private region index stays.
         m[USER_LOWER_ROOT / 8 + 256] = 7;
+        // G1: the guest-state alias's upper-root entry (below 256) stays in both spaces.
+        let alias = (crate::execution::GUEST_STATE_VA >> 39 & 511) as usize;
+        for [_, upper] in ROOTS {
+            m[upper / 8 + alias] = 9;
+        }
         let mut s = space(&mut m, POOL_PAGES);
         s.reset();
         drop(s);
@@ -474,6 +484,7 @@ mod tests {
             assert!((256..512).all(|i| word(&m, upper + i * 8) == 0));
         }
         assert_eq!(word(&m, USER_LOWER_ROOT + 256 * 8), 7);
+        assert!(ROOTS.iter().all(|&[_, upper]| word(&m, upper + alias * 8) == 9));
         // The host's pre-linked tables belong to the supervisor space: a user root linking one is corrupt.
         m[USER_LOWER_ROOT / 8] = (IPA + 0x11000) | 3;
         let mut s = space(&mut m, POOL_PAGES);
@@ -534,7 +545,9 @@ mod tests {
             assert_eq!(s.map(0, 0x4000_0000, true), Err(Error::Corrupt));
         }
         let mut s = space(&mut m, POOL_PAGES);
-        for own in [LOWER_ROOT, 0x14000, STATE_OFFSET, POOL_OFFSET + 31 * 4096] {
+        // G1: also the frame page and the guest-state alias's tables.
+        let [l1, _, leaf] = crate::execution::GUEST_STATE_TABLES;
+        for own in [LOWER_ROOT, 0x14000, STATE_OFFSET, POOL_OFFSET + 31 * 4096, crate::execution::FRAME_OFFSET, l1, leaf] {
             let target = IPA + own as u64;
             assert_eq!(s.map(0x20_0000, target, false), Err(Error::Private));
         }
