@@ -146,7 +146,7 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
         }
         let context = s.cpu.code_context();
         cache::select_l1(context);
-        let block = match cache::lookup(s.cpu.rip, context) {
+        let block = match cache::lookup(s.cpu.rip, context, |b| mapped(s, b)) {
             // K2: a system instruction's decode, kept when it was translated: executed with no host exit.
             Some(b) if b.flags & cache::SYSTEM != 0 => {
                 s.l2_hits += 1;
@@ -167,6 +167,7 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
                         if flushed {
                             halt(s, stop::BAD_REPLY)
                         }
+                        cache::control().capacity_flushes += 1;
                         flush(s);
                         flushed = true;
                         continue;
@@ -187,6 +188,7 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
                             if flushed {
                                 halt(s, stop::BAD_REPLY)
                             }
+                            cache::control().capacity_flushes += 1;
                             flush(s);
                             flushed = true;
                             continue;
@@ -237,8 +239,11 @@ unsafe fn executed(s: &mut State, i: System) -> Option<&'static Block> {
 }
 /// K2: the decode kept for the system instruction at `s.cpu.rip` in this context, unless the instruction must be compiled
 /// plain (`State::plain_step`).
-fn kept_system(s: &State) -> Option<System> {
-    let b = cache::lookup(s.cpu.rip, s.cpu.code_context()).filter(|b| b.flags & cache::SYSTEM != 0 && s.plain_step == 0)?;
+fn kept_system(s: &mut State) -> Option<System> {
+    let b = cache::lookup(s.cpu.rip, s.cpu.code_context(), |b| mapped(s, b)).filter(|b| b.flags & cache::SYSTEM != 0)?;
+    if s.plain_step != 0 {
+        return None;
+    }
     Some(cache::system_of(b))
 }
 
@@ -436,7 +441,7 @@ fn link_point(h: &Header, p: &LinkPoint) -> bool {
 /// marks it ([`mark`]).
 fn fetch_page(s: &mut State, va: u64, i: usize, block: bool) {
     match fetch_walk(s, va) {
-        Ok(gpa) => {
+        Ok((gpa, _)) => {
             s.fetch[i] = gpa;
             if block {
                 mark(s, gpa);
@@ -445,23 +450,37 @@ fn fetch_page(s: &mut State, va: u64, i: usize, block: bool) {
         Err(fault) => s.fetch_fault = fault,
     }
 }
-/// The guest-physical page `va` is fetched from (the walk sets A bits like the CPU's), or why not ([`fetch`]). A walk
+/// The guest-physical page `va` is fetched from and whether its leaf is global (the walk sets A bits like the CPU's), or
+/// why not ([`fetch`]). A walk
 /// losing its A/D races to peers walks again, as x86 does (the watchdog contains a livelock). No block of this vCPU runs
 /// now (a step's source block is abandoned, and the linker checks that its source is not dead after finding the
 /// target), so an A write into a page holding translations just invalidates it ([`cache::written`]).
-fn fetch_walk(s: &mut State, va: u64) -> Result<u64, [u64; 3]> {
+fn fetch_walk(s: &mut State, va: u64) -> Result<(u64, bool), [u64; 3]> {
     let Some(control) = s.cpu.control() else {
         halt(s, stop::UNSUPPORTED_MODE)
     };
     loop {
         let mut tables = GuestTables::observed(guest_ram(), CodeWrites(FetchWrites(s)));
         match paging::walk(&mut tables, control, va, Access::Fetch) {
-            Ok(t) if t.wb && guest_ram().range(t.gpa & !4095, 4096).is_some() => return Ok(t.gpa & !4095),
+            Ok(t) if t.wb && guest_ram().range(t.gpa & !4095, 4096).is_some() => return Ok((t.gpa & !4095, t.global)),
             Ok(_) => return Err([fetch::NOT_RAM, 0, 0]),
             Err(Fault::Contended) => {}
             Err(f) => return Err(fetch::encode(f)),
         }
     }
+}
+/// K1: whether `b`'s source pages are where its linear pages are fetched from now (a fetch walk of each, as the CPU's
+/// after a TLB miss: A bits set, any fault meaning no): `Some(global)`, global when every leaf is and CR4.PGE is set.
+/// The walk's A writes may invalidate `b` ([`cache::lookup`] looks again).
+fn mapped(s: &mut State, b: &Block) -> Option<bool> {
+    let mut global = s.cpu.cr4 & CR4_PGE != 0;
+    for (k, &gpa) in b.source_gpa.iter().enumerate() {
+        if gpa != u64::MAX {
+            let (_, g) = fetch_walk(s, (b.rip & !4095).wrapping_add(4096 * k as u64)).ok().filter(|&(at, _)| at == gpa)?;
+            global &= g;
+        }
+    }
+    Some(global)
 }
 /// The fetch walk's code-page writes (see [`fetch_walk`]).
 struct FetchWrites<'a>(&'a mut State);
@@ -534,6 +553,34 @@ fn flush(s: &mut State) {
     cache::reset();
     s.generation += 1;
     s.shadow_generation += 1;
+}
+/// K1: a TLB flush (a CR3 load; `global`: a paging control change or an MTRR write, global entries too): every shadow
+/// goes (the data TLB) and blocks no longer current leave L1 and their links ([`cache::tlb`]); no translation is dropped.
+fn tlb(s: &mut State, global: bool) {
+    let t0 = ticks();
+    match cache::tlb(global) {
+        Some(n) => s.unlinks += n,
+        None => halt(s, stop::BAD_LINK),
+    }
+    reset_shadows(s);
+    cache::control().tlb_ticks += ticks() - t0;
+}
+fn ticks() -> u64 {
+    let t: u64;
+    unsafe { asm!("isb", "mrs {0}, cntvct_el0", out(reg) t) };
+    t
+}
+/// K1: a #PF invalidates the TLB entries of its linear address (SDM Vol.3 4.10.4.1): the blocks with bytes on `cr2`'s
+/// page stop being current (its shadow, if any, is the faulting access's miss: none to drop).
+pub(super) fn page_faulted(s: &mut State, cr2: u64) {
+    let t0 = ticks();
+    match cache::invalidate_linear(cr2 & !4095, 4096) {
+        Some(n) => s.unlinks += n,
+        None => halt(s, stop::BAD_LINK),
+    }
+    let c = cache::control();
+    c.page_faults += 1;
+    c.page_fault_ticks += ticks() - t0;
 }
 /// Removes every shadow of this vCPU (both spaces) and its writable bits, and counts the reset.
 fn reset_shadows(s: &mut State) {
@@ -822,9 +869,8 @@ unsafe fn stopped(frame: &NativeFrame, elr: u64, spsr: u64, (armed, n): ([u32; M
 /// CR0 bits (SDM vol. 3 §2.5): those defined; the others in 31:0 are reserved and ignored on a load (they stay clear),
 /// those in 63:32 raise #GP. Every defined bit is accepted (PG, PE are fixed in 64-bit code: clearing either raises
 /// #GP; ET is hard-wired). WP is the walker's. MP, EM, TS, NE are recorded: they gate x87/MMX/SSE forms (#NM with TS
-/// or EM, #UD for SSE with EM; NE selects native x87 error reporting), none of which is admitted yet (I5, I6), and a
-/// change drops this vCPU's code like any control change, so a block never outlives the gating state it was made
-/// under. CD and NW are recorded: RAM is write-back whatever they say (memory types are M2's). AM with
+/// or EM, #UD for SSE with EM; NE selects native x87 error reporting); MP, EM, TS are in a block's context
+/// ([`Cpu::code_context`]), so a block never runs under other gating than it was made under (K1). CD and NW are recorded: RAM is write-back whatever they say (memory types are M2's). AM with
 /// RFLAGS.AC at CPL 3 turns alignment checking on (X2, [`alignment_check`]); translations depend on it only through the
 /// BT* cut, and it is part of [`Cpu::code_context`].
 const CR0_DEFINED: u64 = cpu_profile::CR0_VALID;
@@ -836,17 +882,22 @@ const CR0_NW: u64 = 1 << 29;
 /// (which then #GPs for want of counters), DE makes DR4/DR5 #UD. OSFXSR, OSXMMEXCPT, OSXSAVE (CPUID.1:ECX.OSXSAVE
 /// follows it) gate SSE and XSAVE forms (I5); FSGSBASE gates RDFSBASE..WRGSBASE ([`syscalls`]).
 const CR4_TSD: u64 = 1 << 2;
+/// K1: the CR4 bits a walk depends on (a change flushes the TLBs, global entries too; SDM Vol.3 4.10.4.1).
+const CR4_PAGING: u64 = CR4_PGE | CR4_PAE | CR4_SMEP | CR4_SMAP | CR4_PCIDE | CR4_LA57;
 const UD: [u64; 3] = [6, 0, 0];
 const DB: [u64; 3] = [1, 0, 0];
 const GP: [u64; 3] = [13, 0, 0];
 
 /// Executes the system instruction at `s.cpu.rip` (`i`, the host's decode, checked by [`request`]) as a transaction
 /// with x86 semantics in 64-bit mode: its checks raise their exception (#UD, then #GP) with the state unchanged;
-/// otherwise its effect commits, RIP moves past it and RFLAGS stay. Every control change (and every CR3 load) drops
-/// this vCPU's cached code and shadows (both privilege spaces): they are its instruction and data TLBs, which may always
-/// lose entries, and are keyed by values a change makes stale (a block's context, a shadow's rights). INVLPG drops the
-/// shadows (both spaces) and blocks of the 2 MiB-aligned range holding the address (a superset of its page in either
-/// page size). Only this vCPU's state, cache and shadows change. Forms and operand values the resident does not
+/// otherwise its effect commits, RIP moves past it and RFLAGS stay. K1: a CR3 load, a change of a paging control bit
+/// (CR0.PG/WP, CR4's [`CR4_PAGING`], EFER.NXE/LME/LMA) and an MTRR write are TLB flushes ([`tlb`]): this vCPU's shadows
+/// (both privilege spaces, its data TLB) go, and its blocks (its instruction TLB entries) stop being current, but for
+/// global ones at a CR3 load; a block is run again only after a fetch walk finds its source pages where its RIP is
+/// fetched from ([`cache::lookup`]), so no translation is dropped. Other control bits change no walk; those a
+/// translation depends on are in its context ([`Cpu::code_context`]). INVLPG drops the shadows (both spaces) of the 2
+/// MiB-aligned range holding the address (a superset of its page in either page size) and makes the blocks with bytes
+/// there not current. Only this vCPU's state, cache and shadows change. Forms and operand values the resident does not
 /// implement stop it (`unsupported_system`) before any effect. A test driver's [`system::SET_CPL`] changes the CPL
 /// ([`set_cpl`]) at any CPL. CPUID, RDMSR/WRMSR, RDTSC and RDTSCP answer from the presented CPU ([`natemu_abi::cpu`]).
 /// CPUID is serialising: like every system instruction it is a draining entry, since [`find`] drains this vCPU's
@@ -920,6 +971,16 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         // Vol.2 2.8, Vol.1 14.3: the XCR0/OSXSAVE checks come before CR0.TS; CR0.EM and CR4.OSFXSR do not gate VEX forms).
         system::AVX_GATED => {
             if !s.cpu.avx_enabled() {
+                return Err(UD);
+            }
+            if s.cpu.cr0 & CR0_TS != 0 {
+                return Err([7, 0, 0]);
+            }
+            halt(s, stop::BAD_REPLY) // the host cut it as gated under these very controls
+        }
+        // I9: an MMX form under its gating: #UD with CR0.EM, else #NM with CR0.TS (SDM Vol.3 Table 12-1).
+        system::MMX_GATED => {
+            if s.cpu.cr0 & CR0_EM != 0 {
                 return Err(UD);
             }
             if s.cpu.cr0 & CR0_TS != 0 {
@@ -1005,7 +1066,8 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                         unsupported(s)
                     }
                     s.cpu.cr3 = v;
-                    return Ok(commit(s, i, true)); // a load of the same value too
+                    tlb(s, false); // a load of the same value too
+                    return Ok(commit(s, i, false));
                 }
                 4 => {
                     if v & !cpu_profile::CR4_VALID != 0 || (v ^ c.cr4) & (CR4_PAE | CR4_LA57) != 0 {
@@ -1027,7 +1089,8 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                     return Ok(commit(s, i, false));
                 }
             }
-            s.cpu != c
+            // K1: a change of a bit the walks depend on flushes the TLBs; the gating and rounding bits are in the context.
+            (s.cpu.cr0 ^ c.cr0) & (CR0_PG | CR0_WP) != 0 || (s.cpu.cr4 ^ c.cr4) & CR4_PAGING != 0
         }
         // SDM Vol.2 MOV DR, Vol.3 17.2: (DR8..DR15 #UD and CPL > 0 #GP above) DR4/DR5 #UD with CR4.DE, else DR6/DR7;
         // general detect (DR7.GD): #DB, a fault before the MOV, with DR6.BD set (B0..B3 kept: the SDM lets the CPU
@@ -1068,16 +1131,17 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             let address = base.wrapping_add(index).wrapping_add(i.disp as u64);
             // A non-canonical address invalidates nothing.
             if paging::canonical(address) {
+                let t0 = ticks();
                 let start = address & !(LARGE_PAGE - 1);
-                for page in (0..LARGE_PAGE / 4096).map(|k| start + k * 4096) {
-                    if tables::unmap(page).is_err() {
-                        halt(s, stop::SHADOW)
-                    }
+                if tables::unmap_large(start).is_err() {
+                    halt(s, stop::SHADOW)
                 }
+                cache::control().invlpgs += 1;
                 match cache::invalidate_linear(start, LARGE_PAGE) {
                     Some(n) => s.unlinks += n,
                     None => halt(s, stop::BAD_LINK),
                 }
+                cache::control().invlpg_ticks += ticks() - t0;
             }
             false
         }
@@ -1151,9 +1215,9 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                     // PAT and the MTRRs are recorded: memory types are the walker's (M2), RAM runs as write-back.
                     _ => msr_set(at, v),
                 }
-                // A changed EFER ends the paging and code assumptions; an MTRR write invalidates TLBs including global
-                // entries (CPU 9).
-                s.cpu.efer != c.efer || cpu::is_mtrr(index)
+                // A change of EFER's paging bits flushes the TLBs (SCE gates only SYSCALL/SYSRET, checked as they run);
+                // an MTRR write invalidates TLBs including global entries (CPU 9). No translation depends on either.
+                (s.cpu.efer ^ c.efer) & (EFER_NXE | EFER_LME | EFER_LMA) != 0 || cpu::is_mtrr(index)
             }
         }
         // Descriptor tables, segment registers and far transfers ([`segments`]). The resident has no jump tables (an
@@ -1176,7 +1240,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
     Ok(commit(s, i, changed))
 }
 /// Ends a system transaction: RIP past the instruction (it completed: RF ends, except the RF an IRET just loaded); with
-/// `flush`, this vCPU's cached code and shadows go.
+/// `flush_all`, a global TLB flush ([`tlb`]: shadows go, translations stay).
 fn commit(s: &mut State, i: System, flush_all: bool) {
     if s.cpu.control().is_none() {
         halt(s, stop::UNSUPPORTED_MODE)
@@ -1185,8 +1249,7 @@ fn commit(s: &mut State, i: System, flush_all: bool) {
         completed(s);
     }
     if flush_all {
-        flush(s);
-        reset_shadows(s);
+        tlb(s, true);
     }
     s.cpu.rip = s.cpu.rip.wrapping_add(u64::from(i.length));
 }
@@ -1315,7 +1378,7 @@ fn step(mut s: State) -> ! {
     loop {
         s.steps += 1;
         // A system instruction whose decode is kept runs from it (K2), as a decoded reply below does.
-        let reply = match kept_system(&s) {
+        let reply = match kept_system(&mut s) {
             Some(i) => Reply::System(i),
             None => unsafe { request(&mut s, REQUEST_STEP) },
         };

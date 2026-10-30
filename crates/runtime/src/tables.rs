@@ -1,7 +1,7 @@
 //! This owner's native translation tables: guest shadows through
 //! `natemu_abi::shadow::Space`, with maintenance on this CPU. Two shadow spaces, one per x86 privilege class
 //! (supervisor: CPL 0-2; user: CPL 3), each with its own roots and ASID; generated code always runs with the space of
-//! the vCPU's CPL loaded ([`select`]), and every removal hits both ([`unmap`], [`reset`]).
+//! the vCPU's CPL loaded ([`select`]), and every removal hits both ([`unmap_large`], [`reset`]).
 use super::*;
 use natemu_abi::shadow::{Error, Maintenance, POOL_PAGES, ROOTS, Space};
 
@@ -96,11 +96,11 @@ pub fn install(cpl: u64, va: u64, ram: &GuestRam, gpa: u64, writable: bool) -> R
 pub fn install_ones(cpl: u64, va: u64) -> Result<(), Error> {
     space(user(cpl)).map(va & !4095, natemu_abi::ALL_ONES_IPA, false)
 }
-/// Removes `va`'s shadow from both spaces. An address no space can map (the gap, or the upper half with TTBR1 walks
-/// off) has no shadow: nothing to remove.
-pub fn unmap(va: u64) -> Result<(), Error> {
+/// Removes the shadows of the 2 MiB-aligned range holding `va` from both spaces (an INVLPG). An address no space can map
+/// (the gap, or the upper half with TTBR1 walks off) has no shadow: nothing to remove.
+pub fn unmap_large(va: u64) -> Result<(), Error> {
     for user in [false, true] {
-        match space(user).unmap(va) {
+        match space(user).unmap_large(va) {
             Ok(()) | Err(Error::Noncanonical) => {}
             Err(e) => return Err(e),
         }

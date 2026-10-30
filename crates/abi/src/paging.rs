@@ -40,6 +40,8 @@ pub struct Translation {
     pub executable: bool,
     pub dirty: bool,
     pub wb: bool,
+    /// The leaf's G bit (a global translation only with CR4.PGE, which the caller knows).
+    pub global: bool,
 }
 /// Outcome of replacing a table entry the walker has just read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,6 +166,7 @@ fn walk_once<T: Tables>(
                 executable,
                 dirty: value & DIRTY != 0 || access == Access::Write,
                 wb,
+                global: value & 256 != 0,
             });
         }
         if value & ACCESSED == 0 {

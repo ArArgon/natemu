@@ -160,13 +160,13 @@ pub mod cache {
     pub const HEAD_BYTES: usize = L1_CODE + L1_ENTRIES * L1_ENTRY_BYTES;
     /// The largest block admitted; the code area holds at least one.
     pub const MAX_BLOCK_BYTES: usize = 32 * 1024;
-    /// M1 pool sizes: the Debian kernel's early boot averaged 261 code and 230 metadata bytes per block, so the arena holds
-    /// about [`MAX_BLOCKS`] (32 Ki) blocks, which fill about 8.5 MiB of code. Not larger until invalidation stops scanning
-    /// every block (`cache::invalidate`): doubling them slowed a cross-modifying-code program by a third (M1).
+    /// Pool sizes: the Debian kernel's early boot averaged 261 code and 230 metadata bytes per block (M1), so the arena
+    /// holds about [`MAX_BLOCKS`] (K1: 256 Ki, after the reverse map ended invalidation's scan of every block; a boot
+    /// into user space overflowed 128 Ki) blocks, which fill about 68 MiB of code.
     pub const META_VA: u64 = PRIVATE + 0x3000_0000;
-    pub const META_BYTES: usize = 8 * MIB;
+    pub const META_BYTES: usize = 64 * MIB;
     pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
-    pub const LOOKUP_BYTES: usize = 2 * MIB;
+    pub const LOOKUP_BYTES: usize = (LINEAR_HEADS + 4 * LINEAR_BUCKETS).next_multiple_of(BLOCK);
     pub const GLOBAL_VA: u64 = PRIVATE + 0x3c00_0000;
     pub const GLOBAL_BYTES: usize = 2 * MIB;
     /// Mapping granule of the areas.
@@ -178,20 +178,23 @@ pub mod cache {
     pub const META_OFFSET: usize = GLOBAL_OFFSET + GLOBAL_BYTES;
     pub const CODE_OFFSET: usize = META_OFFSET + META_BYTES;
 
-    /// Lookup area layout: [`Control`], L2, block index (L1 is code, [`L1_CODE`]).
+    /// Lookup area layout: [`Control`], L1's owners, L2, block index (L1 is code, [`L1_CODE`]).
     pub const CONTROL: usize = 0;
+    /// K1: the block each L1 entry enters (u32 block number + 1; 0: empty), so a CR3 load empties only the entries of
+    /// blocks it makes stale.
+    pub const L1_OWNERS: usize = 0x1_0000;
     /// L2: open-addressed {guest RIP, block number + 1} table keyed by (RIP, context).
     pub const L2: usize = 0x2_0000;
-    pub const L2_ENTRIES: usize = 1 << 16;
+    pub const L2_ENTRIES: usize = 1 << 19;
     /// Block index: metadata offsets of the blocks in placement (= code address) order.
-    pub const INDEX: usize = 0x12_0000;
+    pub const INDEX: usize = L2 + 16 * L2_ENTRIES;
     /// At most half of L2, so probes stay short.
     pub const MAX_BLOCKS: usize = L2_ENTRIES / 2;
     /// Link records ([`LinkRecord`]), one per patched link point; a full area means no new links.
-    pub const LINKS: usize = 0x14_0000;
-    pub const MAX_LINKS: usize = 32 * 1024;
+    pub const LINKS: usize = INDEX + 4 * MAX_BLOCKS;
+    pub const MAX_LINKS: usize = 64 * 1024;
     /// The single-step block's record (its code is in the slot, `SLOT_VA`) and its access sites after it.
-    pub const STEP_RECORD: usize = 0x1c_0000;
+    pub const STEP_RECORD: usize = LINKS + 16 * MAX_LINKS;
     pub const STEP_RECORD_BYTES: usize = 0x3_c000;
     /// M1: this vCPU's summaries of the code-page and writable mask words it set bits in (bit i % 64 of u64 i / 64: word
     /// i of the mask may hold its bits), so clearing its bits visits only those words, not all of guest RAM's (only the
@@ -199,6 +202,15 @@ pub mod cache {
     pub const CODE_SUMMARY: usize = STEP_RECORD + STEP_RECORD_BYTES;
     pub const SUMMARY_BYTES: usize = MASK_BYTES / 64;
     pub const WRITABLE_SUMMARY: usize = CODE_SUMMARY + SUMMARY_BYTES;
+    /// K1, the reverse map: per guest-physical page (u32 each, [`super::MAX_GUEST_PAGES`]), the last block filed with a
+    /// source byte in it (number + 1; 0: none); each block chains to the previous one of each of its source pages
+    /// ([`Block::next`]). Nonzero only for pages in this vCPU's code summary.
+    pub const PAGE_BLOCKS: usize = (WRITABLE_SUMMARY + SUMMARY_BYTES).next_multiple_of(4096);
+    /// K1, the linear map: [`LINEAR_BUCKETS`] chain heads (u32, block number + 1) by a hash of a linear page; each block is
+    /// on the chains of the linear pages of its first and last byte ([`Block::lnext`]), so an INVLPG or a #PF looks only at
+    /// blocks hashed to its pages. Dead blocks leave a chain when a walk of it meets them.
+    pub const LINEAR_HEADS: usize = PAGE_BLOCKS + 4 * super::MAX_GUEST_PAGES;
+    pub const LINEAR_BUCKETS: usize = 1 << 16;
 
     /// Global area layout, shared by all vCPUs and updated only by atomic read-modify-writes (host and resident): one
     /// shadow-reset counter (u64) per vCPU and the per-vCPU [`Events`] in its first 64 KiB; then the per-page structures,
@@ -228,8 +240,8 @@ pub mod cache {
         pub code_used: u64,
         pub meta_used: u64,
         pub blocks: u64,
-        /// The lookup context (CR3, context word) L1 was filled under.
-        pub l1_context: [u64; 2],
+        /// The context word ([`super::Cpu::code_context`]) L1 was filled under.
+        pub l1_context: u64,
         /// Link records in use.
         pub links: u64,
         /// The armed stop ([`super::STOP_WORD`]): `armed` words of the interrupted block, each (code-area offset, its
@@ -249,6 +261,33 @@ pub mod cache {
         pub rearms: u64,
         /// The VM's guest RAM, R (M1; set by the host at prepare, last so the resident's fields keep their places).
         pub ram_bytes: u64,
+        /// K1: this vCPU's TLB epochs. `epoch` moves at every CR3 load and every global TLB flush (a paging control
+        /// change, an MTRR write); `global_epoch` is the `epoch` of the last global flush. A block is current (its source
+        /// mapping may be used as a TLB entry) when [`Block::checked`] is `epoch`, or, for a [`GLOBAL`] block, at least
+        /// `global_epoch` (MOV to CR3 keeps global entries, SDM Vol.3 4.10.4.1).
+        pub epoch: u64,
+        pub global_epoch: u64,
+        /// K1 counters: CR3 loads, global TLB flushes, INVLPGs; blocks found again by a fetch walk (`revalidated`) or not
+        /// (`remapped`: the linear page maps other bytes now); flushes for capacity; blocks killed (a write to a source
+        /// page) and made not current by an INVLPG.
+        pub cr3_loads: u64,
+        pub global_flushes: u64,
+        pub invlpgs: u64,
+        pub revalidated: u64,
+        pub remapped: u64,
+        pub capacity_flushes: u64,
+        pub killed: u64,
+        pub unvalidated: u64,
+        /// K1: the linear 2 MiB regions (bit r % 1024) a live block's guest bytes may lie in, so an INVLPG elsewhere looks
+        /// at no block.
+        pub regions: [u64; 16],
+        /// K1: CNTVCT ticks spent in TLB flushes (`cache::tlb`) and INVLPGs (shadows and blocks).
+        pub tlb_ticks: u64,
+        pub invlpg_ticks: u64,
+        /// K1: #PFs delivered (each invalidates its page's blocks) and their ticks; blocks visited on linear chains.
+        pub page_faults: u64,
+        pub page_fault_ticks: u64,
+        pub scanned: u64,
     }
     /// A block placed in the cache: its record in the metadata arena (at the offset `INDEX` lists), its access sites
     /// ([`crate::code_object::Site`]) right after it.
@@ -256,9 +295,17 @@ pub mod cache {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Block {
         pub rip: u64,
-        pub context: [u64; 2],
+        /// [`super::Cpu::code_context`] it was translated under (K1: not CR3; the source pages below say which bytes).
+        pub context: u64,
+        /// K1: the TLB epoch ([`Control::epoch`]) at which a fetch walk last found its source pages at its linear
+        /// address (its placement's, or a revalidation's); 0: never current (an INVLPG of its range).
+        pub checked: u64,
         /// Guest-physical source pages (`u64::MAX` = unused).
         pub source_gpa: [u64; 2],
+        /// K1: per source page, the block filed from it before this one (number + 1; 0: none), [`PAGE_BLOCKS`]' chains.
+        pub next: [u32; 2],
+        /// K1: per linear page of its first and last byte, the next block on that page's [`LINEAR_HEADS`] chain.
+        pub lnext: [u32; 2],
         /// Offset of the FEX block (its 4-byte `JITCodeHeader` first) in the code area (the step block's: [`SLOT`]), and
         /// its size.
         pub code: u32,
@@ -286,6 +333,12 @@ pub mod cache {
     /// are): no code (`code_size` 0, `code` the code area's fill point when placed), never in L1, never entered or linked;
     /// in L2 and invalidated exactly as a block of the same source pages and guest bytes.
     pub const SYSTEM: u32 = 4;
+    /// K1: every source page was mapped global (PTE.G with CR4.PGE) when it was last checked: it stays current across
+    /// CR3 loads.
+    pub const GLOBAL: u32 = 8;
+    /// K1: a link may enter it (set when one is made, cleared when the block is cut and the links into it pruned), so
+    /// making blocks not current, or dead, prunes the link records only when one of them may be a target.
+    pub const INBOUND: u32 = 16;
     impl Block {
         /// Its `JITCodeHeader` in the executable alias.
         pub fn code_va(&self) -> u64 {
@@ -378,7 +431,8 @@ pub mod cache {
     const _: () = assert!(MAX_BLOCK_BYTES <= SLOT_BYTES && HEAD_BYTES % 64 == 0);
     const _: () = assert!((CODE_VA | CODE_WRITE_VA | META_VA | LOOKUP_VA | GLOBAL_VA) % BLOCK as u64 == 0);
     const _: () = assert!(CODE_OFFSET % BLOCK == 0 && META_BYTES % BLOCK == 0);
-    const _: () = assert!(core::mem::size_of::<Control>() <= L2 && L2 + L2_ENTRIES * 16 <= INDEX);
+    const _: () = assert!(core::mem::size_of::<Control>() <= L1_OWNERS && L1_OWNERS + 4 * L1_ENTRIES <= L2 && L2 + L2_ENTRIES * 16 <= INDEX);
+    const _: () = assert!(WRITABLE_SUMMARY + SUMMARY_BYTES <= PAGE_BLOCKS && PAGE_BLOCKS + 4 * super::MAX_GUEST_PAGES <= LINEAR_HEADS && LINEAR_HEADS + 4 * LINEAR_BUCKETS <= LOOKUP_BYTES);
     const _: () = assert!(L1_MASK == 0xfff && L1_ENTRY_BYTES == 32 && L1_CODE - DISPATCH < 1 << 20); // the dispatcher's form
     const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= LINKS);
     const _: () = assert!(LINKS + MAX_LINKS * core::mem::size_of::<LinkRecord>() <= STEP_RECORD);
@@ -756,9 +810,9 @@ impl Cpu {
     pub fn alignment_check(&self) -> bool {
         self.cr0 & CR0_AM != 0 && self.rflags & RFLAGS_AC != 0 && self.cpl == 3
     }
-    /// What code at a RIP is compiled and cached under besides the RIP: CR3, and a word of the CPL, the code mode
-    /// (bit 2: 64-bit, the only mode yet) and the paging controls a translation depends on (CR0.PG/WP,
-    /// CR4.PGE/PCIDE/SMEP, EFER.NXE), and the SSE gating bits (I5a: CR0.EM, CR0.TS, CR4.OSFXSR; a translation cuts every
+    /// What code at a RIP is compiled and cached under besides the RIP and its source bytes (K1: not CR3; a block's
+    /// guest-physical source pages are checked against the current tables instead): a word of the CPL, the code mode
+    /// (bit 2: 64-bit, the only mode yet), and the SSE gating bits (I5a: CR0.EM, CR0.TS, CR4.OSFXSR; a translation cuts every
     /// SSE form when they gate it, so a block is never entered under other gating than it was made for, even should a
     /// control change ever keep the code), CR0.MP (I6: WAIT's gating with TS), the x87 rounding when it differs from MXCSR's
     /// (bit 14 and FCW.RC in 16:15: a translation runs x87 arithmetic under that FPCR), and alignment checking (X2: a
@@ -769,16 +823,12 @@ impl Cpu {
     pub fn avx_enabled(&self) -> bool {
         self.cr4 & CR4_OSXSAVE != 0 && self.xcr0 & 6 == 6
     }
-    pub fn code_context(&self) -> [u64; 2] {
+    pub fn code_context(&self) -> u64 {
         let bit = |on: bool, n: u32| u64::from(on) << n;
         let word = self.cpl & 3
             | bit(true, 2)
-            | bit(self.cr0 & CR0_PG != 0, 3)
-            | bit(self.cr0 & CR0_WP != 0, 4)
-            | bit(self.cr4 & CR4_PGE != 0, 5)
-            | bit(self.cr4 & CR4_PCIDE != 0, 6)
-            | bit(self.cr4 & CR4_SMEP != 0, 7)
-            | bit(self.efer & EFER_NXE != 0, 8)
+            // (Bits 3-8 held CR0.PG/WP, CR4.PGE/PCIDE/SMEP and EFER.NXE before K1: a change of one is a global TLB flush,
+            // after which a block's fetch is walked again under the new controls before it runs.)
             | bit(self.cr0 & CR0_EM != 0, 9)
             | bit(self.cr0 & CR0_TS != 0, 10)
             | bit(self.cr4 & CR4_OSFXSR != 0, 11)
@@ -786,7 +836,7 @@ impl Cpu {
             | bit(self.cr0 & CR0_MP != 0, 13)
             | (x87_fpcr(self.fcw, self.mxcsr) != 0) as u64 * (1 | (self.fcw >> 10 & 3) << 1) << 14
             | bit(self.avx_enabled(), 17);
-        [self.cr3, word]
+        word
     }
 }
 
@@ -983,6 +1033,9 @@ pub mod system {
     /// gating (fexc cut them under the AVX gating, `--avx-gated`, which the resident raises as [`AVX_GATED`]).
     pub const VLDMXCSR: u32 = 50;
     pub const VSTMXCSR: u32 = 51;
+    /// An MMX instruction (EMMS included; I9: fexc cut it, `--x87-gated`) under CR0.EM (#UD) or CR0.TS (#NM), from the bank's
+    /// controls (SDM Vol.3 Table 12-1; CR4.OSFXSR does not gate MMX forms; `length` is not used).
+    pub const MMX_GATED: u32 = 52;
     /// S3: SWAPGS (`0f 01 f8`), SYSCALL (`0f 05`), SYSRET (`0f 07`, `size` 8 with REX.W, else 4: compatibility mode).
     pub const SWAPGS: u32 = 34;
     pub const SYSCALL: u32 = 35;
@@ -1086,7 +1139,7 @@ pub mod system {
                     RET_FAR..=IRET => matches!(self.size, 4 | 8) && (self.kind == IRET || (0..=0xffff).contains(&self.disp)),
                     LOCK_UD => self.lock == 1,
                     LDMXCSR | STMXCSR | VLDMXCSR | VSTMXCSR => self.memory == 1 && address,
-                    SSE_GATED | AVX_GATED => true,
+                    SSE_GATED | AVX_GATED | MMX_GATED => true,
                     INT => self.cr < 256,
                     INT3 | INTO | UD | TOO_LONG => true,
                     SWAPGS | SYSCALL | WBINVD => true,

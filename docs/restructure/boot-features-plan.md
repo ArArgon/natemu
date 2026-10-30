@@ -2104,6 +2104,115 @@ VPCMPxSTRx 16, VEX AES/PCLMULQDQ 13, VCVTPS2PH m 9, masked moves 9, VNNI 4, 0x67
 (45 + 74), python unit 281, stack audit (gate 18,976 bytes, 23,056 nested). **Kernel** (series30, the same command): the same
 stop, `pcmpistri` at libc.so.6 + 0x184d42 in `/sbin/modprobe -q -- crypto-hmac(sha256)` (224 lines, 56 s), nothing earlier.
 
+*Built (K1, the code cache across CR3 loads, INVLPG and control changes; no fexc change, series30; independent review:
+no blocking defect, its two cheap findings applied):*
+**Design.** Blocks and kept system records are filed by their guest-physical source pages and looked up by (linear RIP,
+context); the context (`Cpu::code_context`, now one word) no longer holds CR3, nor CR0.PG/WP, CR4.PGE/PCIDE/SMEP or
+EFER.NXE: a change of one of those is a global TLB flush, after which every block's fetch is walked again under the new
+controls before it runs. It keeps everything the host gives fexc: CPL, SSE and AVX gating, x87 gating and rounding,
+alignment checking. A block records `checked` (the TLB epoch at which a walk last found its source pages at its linear
+address) and `GLOBAL` (every source leaf has G, with CR4.PGE). **TLB model** (per vCPU: `Control::epoch`,
+`global_epoch`): a block is *current* when `checked == epoch`, or `GLOBAL` and `checked >= global_epoch` (MOV to CR3
+keeps global entries, SDM Vol.3 4.10.4.1). Lookup takes a current candidate; any other is revalidated by a fetch walk of
+each source page (A bits set, as the CPU's TLB miss; a fault means no): on a match `checked` moves up and `GLOBAL` is
+recomputed, else the next candidate is tried, so blocks of other address spaces at the same RIP stay for when their
+mapping returns. New blocks start current and not global. A PTE change without invalidation keeps the old translation
+(TLB-stale-legal), as the shadows already do. The dispatcher's L1 and block-to-block links run with no check, so every
+way a block stops being current also cuts them: L1 records each entry's block (`L1_OWNERS`) and `prune()` undoes every
+link into a block not current or dead and out of a dead one; links out of a block only not current stay (it runs again
+only after a revalidating lookup). The linker links only to a target `find` just made current. **Events:**
+
+| Event | Shadows (data TLB) | Blocks |
+| --- | --- | --- |
+| MOV to CR3 (any value, the same too) | all reset | epoch + 1: non-global ones stop being current |
+| CR0.PG/WP, CR4.PGE/PAE/SMEP/SMAP/PCIDE/LA57, EFER.NXE/LME/LMA change; MTRR write | all reset | global flush: `global_epoch` = epoch + 1, none current |
+| Other CR0/CR4/EFER bits (TS, EM, MP, OSFXSR, OSXSAVE, AM, TSD, ...), XSETBV, FCW/MXCSR | none | none: the context keys what code depends on |
+| INVLPG | the 2 MiB-aligned range (one walk, `unmap_large`) | blocks with bytes in the range: `checked` 0 |
+| #PF delivered (SDM Vol.3 4.10.4.1; a gap before K1 too) | none (the miss had none) | blocks with bytes on CR2's page: `checked` 0 |
+| Guest, peer or walker write to a page with translations | as before | the page's blocks killed (reverse map) |
+| Pool full; the host's `FLUSH` (guest RAM written while stopped: only at load) | as before | **the only full flushes left** |
+
+Translations do not depend on MTRRs or PAT (RAM runs write-back; the walker's write-back check is redone at
+revalidation). PCID is not advertised. Each vCPU's epochs, L1, links and blocks are its own: a CR3 load on one never
+touches another. **Reverse map:** a per-page head array (`PAGE_BLOCKS`, u32 per guest page, cleared at reset through the
+code summary; `file()` sets the summary bit too) chained through each block's `next[2]`, so a written page finds its
+blocks without scanning; kills take the block out of L2 (backward-shift deletion: with the larger pools dead copies
+otherwise piled up along probe paths, and `coherence` cc-data@4 hit the watchdog); an INVLPG looks at blocks only when a
+1,024-bit filter of 2 MiB regions (`Control::regions`, both ends of each block) says one may lie there, then (review
+round, below) only at the blocks on the linear map's chains of its pages. **Pools**, from the boots (80.6 k live blocks,
+20.9 MB of metadata at the panic, 3 capacity flushes at the old size; 237.8 k blocks and 62.7 MB into user space, below):
+256 Ki blocks (L2 512 Ki entries), 64 MiB of metadata, 64 Ki links. Counters: `Control` cr3_loads, global_flushes,
+invlpgs, revalidated, remapped, capacity_flushes, killed, unvalidated and the ticks of TLB flushes and INVLPGs (the
+drivers' `k1` stats). Measured cost over the boot: 81 ms for 18,557 CR3 loads and 38 global flushes, 24 ms for 70,227
+INVLPGs.
+**Checks.** `tools/run_k1.py` (new), each CPU with its own tables A and B, at 1-4 vCPUs and block sizes default and 1,
+96 of 96 runs green. Against QEMU: remap + INVLPG; remap + CR3 reload; K rounds of CR3 A/B with different bytes at one
+linear address; a write to the other space's idle block; the remap and CR3 cases through linked direct jumps (links made
+and cut); an instruction crossing into a remapped page (INVLPG of the second page alone, then a third frame and a CR3
+reload); the same across a 2 MiB boundary (0x1ffffe). By the architecture's rules, natemu only: a PTE change with no
+invalidation (either frame, then the new one after INVLPG); global pages (the block found global is kept across a load of
+B, asserted; a CR4.PGE toggle or INVLPG forces the new bytes); a revalidation walk whose A-bit write kills its own
+candidate (the PTE is the instruction's immediate: the new bytes run); a #PF whose handler remaps without INVLPG (the new
+bytes run). Each new check was red with its mechanism disabled in a scratch build: the second page's walk (cross: r9
+0x100 for 0x200, r10 0x100 for 0x300), the last byte's region bit (straddle, default block size: r9 0x100 for 0x200; at
+block size 1 another block marks the region), the dead re-check after the walk (walk: r9 Q|7 for Q|0x27), `GLOBAL`
+(global: r9, r10 2 for 1), the #PF invalidation (pf-remap: r9 1 for 2). Counts (1 vCPU, CR3 ping-pong over shared code
+at 50 and 100 rounds): 14 and 14 resident requests (HEAD: 356 and 706, with 103 and 203 full flushes); host compiles 22
+either way (its own cache). Standing suite on the tree with I6b's work in progress (series30): green, `system` 0
+failures, `coherence`, `sharedpt`, `contain`, `privilege`, `delivery`, `events`, `litmus`, `kicks`, `smp`, corpora
+(N = 2..4 all match), faults 7,828 + 5, loopfaults, probes, asm, fix/seed (both block sizes), `run_k2.py` (cost, RDRAND,
+XMC, coherence), `run_m3.py` (XMC included), `run_m1.py` 20 cases, x3, l3, l4a, l4b, i5b, i6 and i8 faults, i8; i8b with
+its 7 known QEMU NaN departures; cargo test (49 + 75), the stack audit. Failures seen on the way were `hv_vm_create`
+0xfae94007 collisions with another agent's VMs (clean on rerun) and one l4b RTC reinject count of 43 for [39, 42]
+(timing; green on rerun).
+**Boot** (Debian 6.12 bzImage, 2 GiB, no initrd, `console=ttyS0 earlyprintk=serial mitigations=off nokaslr`, 10 s
+watchdog, one VM at a time):
+
+| | HEAD (before K1) | K1 |
+| --- | --- | --- |
+| Wall time to the root-fs panic | 59.6 s (61.8 s) | 40.8 s (40.2 s) |
+| Guest time at the panic | 36.4 s | 29.3 s |
+| Host compiles | 90,453 | 76,488 |
+| Resident translation requests | 1,777,737 | 79,920 |
+| Full flushes | 18,604 | 1 (the load) |
+| By cause | 18,557 CR3 loads, 38 global (PGE toggles, paging bits, MTRRs), 1 load: each a full flush | 18,557 CR3 loads and 38 global flushes, none flushing code; 70,227 INVLPGs (no block in range); 0 for capacity |
+| Blocks killed by writes / revalidated by a walk | (not counted) | 29,646 / 47,312 |
+| TSC marked unstable | yes | yes (77 ms skew over 508 ms) |
+| Quick PIT calibration | fails | fails |
+
+The remaining 76.5 k compiles are first translations of code that runs once (about 80 k blocks) plus blocks killed by
+the kernel's text patching (about 30 k) and translated again from their new bytes; their stalls still merge ticks.
+**Not built / remaining:** compile latency (the next lever: first translation off the critical path, finer than page
+invalidation for text patching, or a virtual-time remedy), and the measured boot breakdown the October 30 decision asks
+for; shadows still reset at every CR3 load (19,481 resets, about 456 k shadow-miss retries in the boot: global shadows or
+one shadow set per address space); an INVLPG inside a guest 1 GiB page covers 2 MiB (as before); a lookup walks each stale
+duplicate at a RIP again (many address spaces with private code at one address); a flush zeroes the 4 MiB L2.
+
+*K1 review round (October 30; an independent review, no blocking defect; it reproduced the boot numbers and passed nine
+adversarial programs):* **#PF and INVLPG no longer scan every block.** Both looked at every block once a 2 MiB region's
+bit was set (bits clear only at reset; the review measured about half the early #PFs scanning, ~280 us each with 77 k
+blocks). Now a linear map (`LINEAR_HEADS`: 64 Ki chain heads by a hash of the linear page; each block on the chains of
+its first and last byte's pages through `Block::lnext`) gives the blocks of a page; a walk of a chain drops the dead
+blocks it meets, so each leaves once. Making blocks not current prunes the link records only when one may be a link
+target (`INBOUND`, set when a link is made, cleared when the block is cut and its links pruned). Counted and timed in the
+`k1` stats (`page_faults`, `page_fault_us`, `invlpg_us`, `scanned`). **Boot with the initrd** to the current user-space
+stop (`unsupported_form` after "Run /init", the coordinator's /bin/udevadm MOVBE stop; fexc series31, otherwise as above): before the change
+141.1 s, 255,231 compiles, 256,992 requests, one capacity flush (128 Ki blocks), 72,236 INVLPGs in 350 ms; after it 135.0
+s, 234,390 compiles, 234,905 requests, no flush at 256 Ki blocks, INVLPGs 142 ms, 3,532 #PFs in 4.1 ms, 2.47 M chain
+entries visited over the run. Without the initrd: 41.5 s to the panic, guest 29.4 s, 76,536 compiles (as before).
+**Also:** `lookup` and `cut` work on a copy of the block (the revalidation walk may kill it; reading it through a shared
+reference after that write was undefined behaviour); stale comments fixed (`host/src/execution.rs` SSE gating,
+`runtime/src/execution/sse.rs`, the handoff's system-instruction row, `run_k1.py`'s `global`); the review's adversarial
+programs are in `run_k1.py` (NX by PTE change + INVLPG or CR3 reload, SMEP set, U/S change under SMEP, code remapping its
+own page with INVLPG, CR3 reload or a PGE toggle, one frame at two linear addresses rewritten, global/non-global page
+crossings, a fetch #PF then a remap without INVLPG); `sharedpt` at 1 vCPU skips the contended walks (they need a
+clearer and a walker; red at HEAD too). **Checks:** `run_k1.py` 184 of 184 at 1-4 vCPUs and both block sizes, counts 14
+and 14 requests; `system`, `coherence`, `sharedpt` (also at 1 vCPU), `events`, `run_k2.py`, `run_m3.py` (XMC included)
+0 failures; cargo test, stack audit green. **Not done:** blocks of other address spaces at one RIP are not bounded: a
+lookup walks each stale copy (`remapped` counts them: 160 in the user-space boot), and they leave only when written or at
+a flush; bounding needs a kill inside the lookup or at placement, left until a program with many private copies at one
+address shows the cost.
+
 *Built (I6b, the x87 helper forms and PCMPxSTRx by `svc` to the resident; fexc series31 = series30 + patch 0023 + shim changes):*
 **Design.** No helper library in the VM and no host helper: two new `svc` numbers enter the resident from generated code, as
 the 128/64 division does (`execution::svc`, fexc `FexcSvc`). **`svc #X87` (5)**: `movz w0, #fn; svc #5`, fn the D9 opcode's

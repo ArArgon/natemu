@@ -363,7 +363,8 @@ PROGRAMS = {
 }
 
 def generate(names=None, cpus=(2, 4)):
-    return [PROGRAMS[k](n) for k in PROGRAMS if not names or any(x in k for x in names) for n in cpus]
+    # The contended walks need a clearer and at least one walker: never at 1 CPU.
+    return [PROGRAMS[k](n) for k in PROGRAMS if not names or any(x in k for x in names) for n in cpus if n > 1 or not k.startswith('contended')]
 
 
 # ---- judging ------------------------------------------------------------------------------------------------------------

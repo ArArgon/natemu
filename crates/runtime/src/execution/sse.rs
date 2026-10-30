@@ -2,10 +2,10 @@
 //! FEX's static vector registers v16..v31 and FPCR/FPSR at every block entry and resident entry; LDMXCSR/STMXCSR as
 //! transactions; the gating of every SSE form (SDM Vol.2 2.5, exception classes 1-5 and 7: #UD with CR0.EM or without
 //! CR4.OSFXSR, then #NM with CR0.TS). Translated SSE forms are gated at translation time (the host's `--sse-gated` cut, which
-//! arrives here as [`system::SSE_GATED`]): every CR0/CR4 change drops the vCPU's code, so a block never outlives the
-//! controls it was made under; the gating bits are also part of `Cpu::code_context`. Obligation on every path that changes
+//! arrives here as [`system::SSE_GATED`]): the gating bits are part of `Cpu::code_context`, so a block is never found
+//! under other controls than it was made under (K1: control changes keep the code). Obligation on every path that changes
 //! CR0.EM, CR0.TS or CR4.OSFXSR (MOV CR0/CR4 today; INIT/SIPI, CLTS, LMSW and task switches if ever added, host edits of
-//! the bank; XSETBV for XCR0 once AVX is gated): flush the vCPU's code or key it, as MOV CR0/CR4 do. Every MXCSR exception
+//! the bank): the next lookup must use the new context (it is computed from the bank at every lookup), or flush. Every MXCSR exception
 //! flag, DE included, comes from FPSR (`mxcsr_flags`: IDC is DE unless DAZ). Unmasked SIMD exceptions (#XM, or #UD without
 //! OSXMMEXCPT) are not built: an LDMXCSR that would clear any exception mask stops `unsupported_system` before any effect
 //! (the plan's I5c holds the design; FP trap enables stay clear: FPCR is built from MXCSR without them).

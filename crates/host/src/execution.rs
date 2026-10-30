@@ -266,6 +266,15 @@ pub(crate) fn end_when_halted(memory: &Memory, v: usize) {
 pub(crate) fn shadow_resets(area: Area) -> u64 {
     global_u64(area.memory, cache::RESETS + 8 * area.vcpu).load(SeqCst)
 }
+/// K1: vCPU `area.vcpu`'s TLB events and revalidations (`cache::Control`), as a JSON object.
+pub(crate) fn k1_stats(area: Area) -> String {
+    let c: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+    format!(
+        "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{}}}",
+        c.cr3_loads, c.global_flushes, c.invlpgs, c.revalidated, c.remapped, c.capacity_flushes, c.killed, c.unvalidated,
+        ticks_ns(c.tlb_ticks) / 1000, ticks_ns(c.invlpg_ticks) / 1000, c.page_faults, ticks_ns(c.page_fault_ticks) / 1000, c.scanned
+    )
+}
 /// Guest RAM was written by the host (only while every vCPU is stopped): each vCPU drops its cached code before it
 /// next runs guest code.
 pub(crate) fn guest_ram_written(memory: &Memory) {
@@ -643,7 +652,8 @@ pub(crate) fn x87_args(cpu: &exec::Cpu) -> Vec<String> {
     args
 }
 /// Whether `cpu`'s controls gate SSE instructions (SDM Vol.3 Table 2-2, Vol.2 2.5: #UD with CR0.EM or without CR4.OSFXSR,
-/// #NM with CR0.TS). Blocks are made under one gating state: every CR0/CR4 change drops the vCPU's code.
+/// #NM with CR0.TS). Blocks are made under one gating state: the gating bits are part of their context
+/// (`Cpu::code_context`), so a block is never found under other gating (K1).
 pub(crate) fn sse_gated(cpu: &exec::Cpu) -> bool {
     cpu.cr0 & (exec::CR0_EM | exec::CR0_TS) != 0 || cpu.cr4 & exec::CR4_OSFXSR == 0
 }
@@ -723,9 +733,11 @@ impl Compiler {
                     };
                     // An SSE form cut by its gating (I5a): no operand matters, the resident raises #UD or #NM.
                     // I6: an x87 form or WAIT (primary d8..df, 9b) cut by its gating: #NM. I8: a VEX form (fexc's map 8): #UD or #NM.
+                    // I9: an MMX form (fexc's `cut_gated` "mmx"): #UD or #NM by CR0.EM/TS alone.
+                    let mmx = json.get("guest").and_then(|g| g.get("end")).and_then(|e| e.get("cut_gated")).and_then(|v| v.as_str()) == Some("mmx");
                     let gated = |(map, op): (u8, u8)| {
                         let x87 = map == 0 && matches!(op, 0xd8..=0xdf | 0x9b);
-                        let kind = if x87 { exec::system::X87_GATED } else if map == 8 { exec::system::AVX_GATED } else { exec::system::SSE_GATED };
+                        let kind = if mmx { exec::system::MMX_GATED } else if x87 { exec::system::X87_GATED } else if map == 8 { exec::system::AVX_GATED } else { exec::system::SSE_GATED };
                         Some(exec::System { kind, length: 1, ..exec::System::NONE })
                     };
                     let gated_cut = json.get("guest").and_then(|g| g.get("end")).and_then(|e| e.get("cut_gated")).is_some();

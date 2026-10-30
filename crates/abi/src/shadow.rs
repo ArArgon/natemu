@@ -223,6 +223,20 @@ impl<M: Maintenance> Space<M> {
         }
         Ok(())
     }
+    /// Removes every shadow of the 2 MiB-aligned range holding `va` (its leaf table's entries: one walk) and invalidates
+    /// each.
+    pub fn unmap_large(&mut self, va: u64) -> Result<(), Error> {
+        let start = va & !0x1f_ffff;
+        if let Some((table, _)) = self.leaf(start, false)? {
+            for index in 0..512 {
+                if self.get(table, index) & 1 != 0 {
+                    self.set(table, index, 0);
+                    self.tlb.invalidate(start + 4096 * index as u64);
+                }
+            }
+        }
+        Ok(())
+    }
     /// The leaf descriptor shadowing `va` (0 when none).
     pub fn descriptor(&mut self, va: u64) -> u64 {
         match self.leaf(va & !4095, false) {
@@ -290,6 +304,23 @@ mod tests {
         memory[offset / 8]
     }
 
+    /// K1: `unmap_large` removes and invalidates exactly the shadows of the 2 MiB region holding its address.
+    #[test]
+    fn unmap_large_clears_one_region() {
+        let mut m = window();
+        let mut s = space(&mut m, POOL_PAGES);
+        for va in [0x20_0000, 0x20_3000, 0x3f_f000, 0x40_0000] {
+            s.map(va, 0x4007_0000, false).unwrap();
+        }
+        s.tlb.0.clear();
+        s.unmap_large(0x21_2345).unwrap();
+        assert_eq!(s.tlb.0, vec![0x20_0000, 0x20_3000, 0x3f_f000]);
+        assert_eq!([0x20_0000, 0x20_3000, 0x3f_f000].map(|va| s.descriptor(va)), [0; 3]);
+        assert_ne!(s.descriptor(0x40_0000), 0);
+        // A region with no leaf table: nothing to do.
+        s.unmap_large(0x80_0000).unwrap();
+        assert_eq!(s.tlb.0.len(), 3);
+    }
     #[test]
     fn halves_allocate_tables_from_the_pool_and_gap_is_refused() {
         let mut m = window();

@@ -20,7 +20,7 @@ use natemu_abi::execution::{
     ENTRY_OFFSET, KICK_SGI, LinkPoint, MAX_LINK_POINTS, STATE_VA, STOP_WORD, State, System,
     cache::{self as area, Control, LinkRecord, Record, SLOT, SLOT_BYTES, SLOT_VA, SLOT_WRITE_VA},
 };
-pub use natemu_abi::execution::cache::{Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, HEAD_BYTES, MAX_VCPUS, PAGES, SHADOWS, STEP, SYSTEM};
+pub use natemu_abi::execution::cache::{Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL, HEAD_BYTES, INBOUND, MAX_VCPUS, PAGES, SHADOWS, STEP, SYSTEM};
 /// L1's code (the dispatcher's head ends there).
 pub const L1_VA: u64 = CODE_VA + area::L1_CODE as u64;
 
@@ -143,8 +143,8 @@ fn resets(v: usize) -> &'static AtomicU64 {
     unsafe { AtomicU64::from_ptr(global::<u64>(area::RESETS).wrapping_add(v)) }
 }
 
-fn hash(rip: u64, context: [u64; 2]) -> usize {
-    let h = rip ^ context[0].rotate_left(23) ^ context[1].rotate_left(47);
+fn hash(rip: u64, context: u64) -> usize {
+    let h = rip ^ context.rotate_left(47);
     (h.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - area::L2_ENTRIES.trailing_zeros())) as usize
 }
 
@@ -153,9 +153,65 @@ fn hash(rip: u64, context: [u64; 2]) -> usize {
 pub fn reset() {
     let c = control();
     (c.code_used, c.meta_used, c.blocks, c.links) = (area::HEAD_BYTES as u64, 0, 0, 0);
+    // A `checked` of 0 is never current.
+    (c.epoch, c.global_epoch) = (c.epoch.max(1), c.global_epoch.max(1));
+    c.regions = [0; 16];
     clear_l1();
     unsafe { ptr::write_bytes(lookup_area::<u8>(area::L2), 0, area::L2_ENTRIES * 16) };
+    unsafe { ptr::write_bytes(lhead(0), 0, area::LINEAR_BUCKETS) };
+    // The reverse map's heads: only pages this vCPU marked (its code summary) can hold one.
+    for k in 0..pages().div_ceil(16 * 64) {
+        let mut bits = unsafe { summary(area::CODE_PAGES).add(k).read() };
+        while bits != 0 {
+            let first = 16 * (64 * k + bits.trailing_zeros() as usize);
+            unsafe { ptr::write_bytes(head(first), 0, 16) };
+            bits &= bits - 1;
+        }
+    }
     clear_own(area::CODE_PAGES);
+}
+/// The linear map's bucket of linear page `page` ([`area::LINEAR_HEADS`]) and its head.
+fn lbucket(page: u64) -> usize {
+    (page.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - area::LINEAR_BUCKETS.trailing_zeros())) as usize
+}
+fn lhead(bucket: usize) -> *mut u32 {
+    lookup_area::<u32>(area::LINEAR_HEADS).wrapping_add(bucket)
+}
+/// The linear pages of a block's first and last guest byte (all of its bytes: a block's source is at most two pages).
+fn lpages(b: &Block) -> [u64; 2] {
+    [b.rip >> 12, b.rip.wrapping_add(u64::from(b.guest_bytes).max(1) - 1) >> 12]
+}
+/// Calls `f` with every live block with a guest byte on linear page `page`, from the page's bucket chain; dead blocks met
+/// leave the chain (each once: the chain's cost follows the blocks placed). `f` must not kill blocks.
+fn on_linear_page(page: u64, mut f: impl FnMut(usize)) {
+    let c = control();
+    let h = lbucket(page);
+    let mut prev: Option<(usize, usize)> = None;
+    let mut cur = unsafe { lhead(h).read() };
+    while cur != 0 {
+        let n = cur as usize - 1;
+        let b = *block(n);
+        let pages = lpages(&b);
+        let k = usize::from(lbucket(pages[0]) != h);
+        let next = b.lnext[k];
+        c.scanned += 1;
+        if b.flags & DEAD != 0 {
+            match prev {
+                None => unsafe { lhead(h).write(next) },
+                Some((m, j)) => unsafe { (*block_ptr(m)).lnext[j] = next },
+            }
+        } else {
+            if pages.contains(&page) {
+                f(n);
+            }
+            prev = Some((n, k));
+        }
+        cur = next;
+    }
+}
+/// The reverse map's head of guest-physical page `page` ([`area::PAGE_BLOCKS`]).
+fn head(page: usize) -> *mut u32 {
+    lookup_area::<u32>(area::PAGE_BLOCKS).wrapping_add(page)
 }
 /// Code-area offset of L1 entry `i`.
 fn l1_entry(i: usize) -> u64 {
@@ -177,8 +233,13 @@ fn l1_words(at: u64, rip: u64, entry: u64) -> [u32; 8] {
         0,
     ]
 }
+/// L1 entry `i`'s owner: the block it enters, number + 1 (0: empty).
+fn l1_owner(i: usize) -> *mut u32 {
+    lookup_area::<u32>(area::L1_OWNERS).wrapping_add(i)
+}
 /// Empties L1 entry `i` (its first word branches to the dispatcher's miss); the caller synchronizes the code.
 fn empty_l1(i: usize) {
+    unsafe { l1_owner(i).write(0) };
     let at = l1_entry(i);
     unsafe { ((area::CODE_WRITE_VA + at) as *mut u32).write_volatile(branch(at, area::DISPATCH_MISS as u64)) };
 }
@@ -197,7 +258,7 @@ pub fn fill_head(dispatcher: &[u8]) {
 }
 
 /// L1 is keyed by RIP alone, so it holds entries of one context: switching clears it.
-pub fn select_l1(context: [u64; 2]) {
+pub fn select_l1(context: u64) {
     let c = control();
     if c.l1_context != context {
         clear_l1();
@@ -205,6 +266,7 @@ pub fn select_l1(context: [u64; 2]) {
     }
 }
 pub fn fill_l1(rip: u64, block: &Block) {
+    unsafe { l1_owner((rip & area::L1_MASK) as usize).write(block.number + 1) };
     let at = l1_entry((rip & area::L1_MASK) as usize);
     let words = l1_words(at, rip, block.entry() - area::CODE_VA);
     // Already there (a resident entry that ends at the same block again, e.g. after a system instruction): no code change.
@@ -215,20 +277,67 @@ pub fn fill_l1(rip: u64, block: &Block) {
     synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, area::L1_ENTRY_BYTES);
 }
 
-/// The block cached for (`rip`, `context`).
-pub fn lookup(rip: u64, context: [u64; 2]) -> Option<&'static Block> {
+/// K1: `b`'s source mapping may be used now, as a TLB entry ([`Control::epoch`]).
+pub fn current(b: &Block) -> bool {
+    let c = control();
+    b.checked == c.epoch || (b.flags & GLOBAL != 0 && b.checked >= c.global_epoch)
+}
+/// The block cached for (`rip`, `context`) whose source pages are where `rip` is fetched from now: a current one, or one
+/// `mapped` finds so (it walks the fetch of each source page's linear page: `Some(global)` when each maps to the block's
+/// page; the walk may write an A bit, so the block is looked at again). Blocks of other address spaces at the same RIP
+/// stay for when their mapping returns.
+pub fn lookup(rip: u64, context: u64, mut mapped: impl FnMut(&Block) -> Option<bool>) -> Option<&'static Block> {
     let mut i = hash(rip, context);
     loop {
         let [key, number] = unsafe { l2(i).read() };
         if number == 0 {
             return None;
         }
-        let b = block(number as usize - 1);
+        let n = number as usize - 1;
+        // A copy: the walk below may kill the block (its record is written then).
+        let b = *block(n);
         if key == rip && b.rip == rip && b.context == context && b.flags & DEAD == 0 {
-            return Some(b);
+            if current(&b) {
+                return Some(block(n));
+            }
+            let global = mapped(&b);
+            let c = control();
+            if let Some(global) = global.filter(|_| block(n).flags & DEAD == 0) {
+                c.revalidated += 1;
+                unsafe { (*block_ptr(n)).checked = c.epoch };
+                unsafe { (*block_ptr(n)).flags = (*block_ptr(n)).flags & !GLOBAL | if global { GLOBAL } else { 0 } };
+                return Some(block(n));
+            }
+            c.remapped += 1;
         }
         i = (i + 1) & (area::L2_ENTRIES - 1);
     }
+}
+/// K1: a TLB flush of this vCPU (`global`: global entries too): the epoch moves, and every L1 entry and link into a block
+/// no longer current goes (the blocks stay, found again by [`lookup`] after a fetch walk). Returns the links undone;
+/// `None` if a record does not describe its word (as [`unlink_all`]).
+pub fn tlb(global: bool) -> Option<u64> {
+    let c = control();
+    c.epoch += 1;
+    if global {
+        c.global_epoch = c.epoch;
+        c.global_flushes += 1;
+        clear_l1();
+    } else {
+        c.cr3_loads += 1;
+        let mut emptied = false;
+        for i in 0..area::L1_ENTRIES {
+            let owner = unsafe { l1_owner(i).read() };
+            if owner != 0 && !current(block(owner as usize - 1)) {
+                empty_l1(i);
+                emptied = true;
+            }
+        }
+        if emptied {
+            synchronize_code(area::CODE_WRITE_VA + l1_entry(0), area::CODE_VA + l1_entry(0), area::L1_ENTRIES * area::L1_ENTRY_BYTES);
+        }
+    }
+    prune()
 }
 
 /// Places the admitted object at `object` (header `h`) for (`h.guest_rip`, `context`) with its guest-physical
@@ -238,7 +347,7 @@ pub fn lookup(rip: u64, context: [u64; 2]) -> Option<&'static Block> {
 pub fn place(
     h: &Header,
     object: *const u8,
-    context: [u64; 2],
+    context: u64,
     source_gpa: [u64; 2],
     links: [LinkPoint; MAX_LINK_POINTS],
     dispatch_exit: u64,
@@ -253,7 +362,10 @@ pub fn place(
     let record = Block {
         rip: h.guest_rip,
         context,
+        checked: c.epoch,
         source_gpa,
+        next: [0; 2],
+        lnext: [0; 2],
         code: code as u32,
         code_size: h.code_size,
         sites_count: h.sites_count,
@@ -276,11 +388,11 @@ pub fn place(
 }
 /// K2: enters the host's decode `i` of the system instruction at `rip` (`guest_bytes` long, from `source_gpa`) in the
 /// cache for `context` as a [`SYSTEM`] record (no code); `None` when the metadata arena or the block index is full.
-pub fn place_system(rip: u64, context: [u64; 2], source_gpa: [u64; 2], guest_bytes: u32, i: &System) -> Option<&'static Block> {
+pub fn place_system(rip: u64, context: u64, source_gpa: [u64; 2], guest_bytes: u32, i: &System) -> Option<&'static Block> {
     // `code` at the fill point keeps the records in address order ([`block_at`]); a size of 0 holds no PC.
     let code = control().code_used as u32;
     let links = [LinkPoint::NONE; MAX_LINK_POINTS];
-    let record = Block { rip, context, source_gpa, code, code_size: 0, sites_count: 0, guest_bytes, number: 0, flags: SYSTEM, dispatch_exit: 0, rep_exits: 0, links };
+    let record = Block { rip, context, checked: control().epoch, source_gpa, next: [0; 2], lnext: [0; 2], code, code_size: 0, sites_count: 0, guest_bytes, number: 0, flags: SYSTEM, dispatch_exit: 0, rep_exits: 0, links };
     unsafe { file(record, (i as *const System).cast(), size_of::<System>()) }
 }
 /// The decode a [`SYSTEM`] record holds.
@@ -300,7 +412,30 @@ unsafe fn file(record: Block, tail: *const u8, tail_bytes: usize) -> Option<&'st
     let n = c.blocks as usize;
     unsafe {
         let at = (area::META_VA + meta) as *mut Block;
-        at.write(Block { number: n as u32, ..record });
+        // Chained into each source page's list (pages outside guest RAM hold no code: fetches need RAM).
+        let mut next = [0; 2];
+        for (k, &g) in record.source_gpa.iter().enumerate() {
+            let page = (g >> 12) as usize;
+            if g != u64::MAX && page < pages() {
+                next[k] = head(page).read();
+                head(page).write(n as u32 + 1);
+                // In the code summary even if a reset came between its mark and here, so the next reset clears the head.
+                *summary(area::CODE_PAGES).add(page / 16 / 64) |= 1 << (page / 16 % 64);
+            }
+        }
+        let mut lnext = [0; 2];
+        let [b0, b1] = lpages(&record).map(lbucket);
+        lnext[0] = lhead(b0).read();
+        lhead(b0).write(n as u32 + 1);
+        if b1 != b0 {
+            lnext[1] = lhead(b1).read();
+            lhead(b1).write(n as u32 + 1);
+        }
+        at.write(Block { number: n as u32, next, lnext, ..record });
+        for r in [record.rip >> 21, record.rip.wrapping_add(u64::from(record.guest_bytes).max(1) - 1) >> 21] {
+            let (w, bit) = region(r);
+            c.regions[w] |= bit;
+        }
         copy_record(at.add(1).cast(), tail, tail_bytes);
         index(n).write(meta as u32);
         let mut i = hash(record.rip, record.context);
@@ -321,7 +456,7 @@ unsafe fn file(record: Block, tail: *const u8, tail_bytes: usize) -> Option<&'st
 pub fn place_step(
     h: &Header,
     object: *const u8,
-    context: [u64; 2],
+    context: u64,
     source_gpa: [u64; 2],
     links: [LinkPoint; MAX_LINK_POINTS],
     dispatch_exit: u64,
@@ -338,7 +473,10 @@ pub fn place_step(
     let record = Block {
         rip: h.guest_rip,
         context,
+        checked: 0,
         source_gpa,
+        next: [0; 2],
+        lnext: [0; 2],
         code: SLOT as u32,
         code_size: h.code_size,
         sites_count: h.sites_count,
@@ -499,6 +637,7 @@ pub fn link(source: &Block, target: &Block) -> Link {
         let original = word(at);
         rewrite(at, branch(at, entry));
         unsafe { record(c.links as usize).write(LinkRecord { source: source.number, offset: p.offset, original, target: target.number }) };
+        unsafe { (*block_ptr(target.number as usize)).flags |= INBOUND };
         c.links += 1;
     }
     Link::Linked(todo as u64)
@@ -571,10 +710,21 @@ pub fn kick(v: usize) {
 /// Invalidates every live block of this vCPU translated from `gpa`'s page (the page is about to be written, or was):
 /// each leaves L1 and L2, every link into or out of it is undone and its record dropped, and it is marked dead. Then
 /// this vCPU's bit for the page is cleared. Returns the links undone; `None` if a record does not describe its word
-/// (as [`unlink_all`]).
-// ponytail: scans every block and record; a reverse map (page → blocks, block → records) if profiles show it.
+/// (as [`unlink_all`]). K1: the blocks are found from the page's chain ([`area::PAGE_BLOCKS`]), which then empties (every
+/// block on it is dead).
 pub fn invalidate(gpa: u64) -> Option<u64> {
-    let unlinked = kill(|b| b.source_gpa.iter().any(|&g| g != u64::MAX && g >> 12 == gpa >> 12))?;
+    let page = (gpa >> 12) as usize;
+    if page >= pages() {
+        return Some(0);
+    }
+    let first = unsafe { head(page).read() };
+    let chain = core::iter::successors(Some(first).filter(|&x| x != 0), |&x| {
+        let b = block(x as usize - 1);
+        let k = usize::from(b.source_gpa[0] >> 12 != page as u64);
+        Some(b.next[k]).filter(|&y| y != 0)
+    });
+    let unlinked = cut(chain.map(|x| x as usize - 1), true)?;
+    unsafe { head(page).write(0) };
     if let Some((m, shift)) = code_page(gpa) {
         m.fetch_and(!(u64::from(own()) << shift), SeqCst);
     }
@@ -583,44 +733,118 @@ pub fn invalidate(gpa: u64) -> Option<u64> {
 /// Invalidates the live block `b` alone (as [`invalidate`], its pages' marks untouched): a block placed from a page
 /// whose mark this vCPU lost while it was fetched.
 pub fn discard(b: &Block) -> Option<u64> {
-    let number = b.number;
-    kill(|x| x.number == number)
+    cut(core::iter::once(b.number as usize), true)
 }
-/// Invalidates (as [`invalidate`]) every live block of this vCPU with guest bytes in the linear range
-/// `[start, start + bytes)` (a guest INVLPG). Its code-page bits stay: they only say it may hold translations.
+/// The bit of linear 2 MiB region `r` in [`Control::regions`].
+fn region(r: u64) -> (usize, u64) {
+    ((r % 1024 / 64) as usize, 1 << (r % 64))
+}
+/// A guest INVLPG (or a #PF) of the linear range `[start, start + bytes)` (K1; inside one 2 MiB region): every live
+/// block of this vCPU with guest bytes in it is no longer current (`checked` 0, global or not): out of L1, every link
+/// into it undone; it stays in L2 and is found again only after a fetch walk ([`lookup`]). Its code-page bits stay: they
+/// only say it may hold translations. Blocks are looked for only when a 2 MiB region the range touches may hold one
+/// ([`Control::regions`]), then on the linear map's chains of the range's pages ([`area::LINEAR_HEADS`]).
 pub fn invalidate_linear(start: u64, bytes: u64) -> Option<u64> {
-    kill(|b| b.rip.wrapping_sub(start) < bytes || start.wrapping_sub(b.rip) < u64::from(b.guest_bytes))
+    let c = control();
+    let held = |r: u64| {
+        let (w, bit) = region(r);
+        c.regions[w] & bit != 0
+    };
+    if !held(start >> 21) && !held(start.wrapping_add(bytes - 1) >> 21) {
+        return Some(0);
+    }
+    let mut inbound = false;
+    for page in start >> 12..=start.wrapping_add(bytes - 1) >> 12 {
+        on_linear_page(page, |n| inbound |= cut_one(n, false));
+    }
+    if inbound { prune() } else { Some(0) }
 }
-/// Marks every live block `doomed` selects dead: out of L1 and L2, every link into or out of it undone and its record
-/// dropped. Returns the links undone; `None` if a record does not describe its word.
-fn kill(doomed: impl Fn(&Block) -> bool) -> Option<u64> {
+/// Takes block `n`'s entry out of L2 (linear probing's backward-shift deletion), so probes never pass dead blocks: a
+/// page rewritten over and over leaves no trail of dead copies at its RIPs. A [`lookup`] under way (its walk may kill)
+/// at worst misses its block and asks for it again.
+fn l2_remove(n: usize) {
+    let b = *block(n);
+    let mask = area::L2_ENTRIES - 1;
+    let mut i = hash(b.rip, b.context);
+    loop {
+        let [_, number] = unsafe { l2(i).read() };
+        if number == 0 {
+            return; // not filed (cannot happen)
+        }
+        if number as usize == n + 1 {
+            break;
+        }
+        i = (i + 1) & mask;
+    }
+    let mut j = i;
+    loop {
+        j = (j + 1) & mask;
+        let [key, number] = unsafe { l2(j).read() };
+        if number == 0 {
+            unsafe { l2(i).write([0, 0]) };
+            return;
+        }
+        // The entry at j moves into the hole at i unless its home lies cyclically in (i, j].
+        let home = hash(key, block(number as usize - 1).context);
+        if (j.wrapping_sub(home) & mask) >= (j.wrapping_sub(i) & mask) {
+            unsafe { l2(i).write([key, number]) };
+            i = j;
+        }
+    }
+}
+/// Kills (`dead`) the blocks numbered `doomed`, or makes them no longer current: each leaves L1; then one pass over the
+/// link records undoes every link into a block no longer current or dead and out of a dead one (links out of a block
+/// only not current stay: they run only once it is entered, which needs a fetch walk first). Dead blocks leave L2 (as
+/// [`lookup`] skips them). Returns the links undone; `None` if a record does not describe its word.
+fn cut(doomed: impl Iterator<Item = usize>, dead: bool) -> Option<u64> {
+    let mut prune_needed = false;
+    for n in doomed {
+        prune_needed |= cut_one(n, dead);
+    }
+    if prune_needed { prune() } else { Some(0) }
+}
+/// [`cut`]'s work on block `n` but the link records: whether they need a pass (a link may enter it, or it is dead and
+/// links may leave it).
+fn cut_one(n: usize, dead: bool) -> bool {
+    let c = control();
+    let b = *block(n);
+    if b.flags & DEAD != 0 || (!dead && b.checked == 0) {
+        return false;
+    }
+    let linked = b.flags & INBOUND != 0 || (dead && b.links.iter().any(|p| p.offset != 0));
+    unsafe { (*block_ptr(n)).flags &= !INBOUND };
+    if dead {
+        unsafe { (*block_ptr(n)).flags |= DEAD };
+        c.killed += 1;
+        l2_remove(n);
+    } else {
+        unsafe { (*block_ptr(n)).checked = 0 };
+        c.unvalidated += 1;
+    }
+    let i = (b.rip & area::L1_MASK) as usize;
+    let at = l1_entry(i);
+    if unsafe { l1_owner(i).read() } == b.number + 1 {
+        empty_l1(i);
+        synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, 4);
+    }
+    linked
+}
+/// Undoes every link whose target is no longer current or dead, or whose source is dead, and drops its record.
+fn prune() -> Option<u64> {
     let c = control();
     let mut unlinked = 0;
-    for n in 0..c.blocks as usize {
-        let b = block(n);
-        if b.flags & DEAD != 0 || !doomed(b) {
+    let mut i = 0;
+    while i < c.links {
+        let r = unsafe { record(i as usize).read() };
+        let target = block(r.target as usize);
+        if current(target) && target.flags & DEAD == 0 && block(r.source as usize).flags & DEAD == 0 {
+            i += 1;
             continue;
         }
-        unsafe { (*block_ptr(n)).flags |= DEAD };
-        let i = (b.rip & area::L1_MASK) as usize;
-        let at = l1_entry(i);
-        let held = |k: usize| unsafe { ((area::CODE_WRITE_VA + at) as *const u32).add(k).read_volatile() };
-        if b.flags & SYSTEM == 0 && l1_words(at, b.rip, u64::from(b.code) + u64::from(ENTRY_OFFSET)).iter().enumerate().all(|(k, &w)| held(k) == w) {
-            empty_l1(i);
-            synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, 4);
-        }
-        let mut i = 0;
-        while i < c.links {
-            let r = unsafe { record(i as usize).read() };
-            if r.source as usize == n || r.target as usize == n {
-                unlink(r)?;
-                unlinked += 1;
-                c.links -= 1;
-                unsafe { record(i as usize).write(record(c.links as usize).read()) };
-            } else {
-                i += 1;
-            }
-        }
+        unlink(r)?;
+        unlinked += 1;
+        c.links -= 1;
+        unsafe { record(i as usize).write(record(c.links as usize).read()) };
     }
     Some(unlinked)
 }

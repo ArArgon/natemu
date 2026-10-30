@@ -58,12 +58,14 @@ fn class(e: Event) -> Class {
 pub(super) fn deliver(s: &mut State, mut event: Event) {
     if let Event::Exception([14, _, cr2]) = event {
         s.cpu.cr2 = cr2; // §7.15 interrupt 14: CR2 before delivery
+        super::page_faulted(s, cr2);
     }
     loop {
         s.deliveries += 1;
         let Err(f) = attempt(s, event) else { return };
         if f[0] == 14 {
             s.cpu.cr2 = f[2]; // a detected #PF writes CR2 whatever follows
+            super::page_faulted(s, f[2]);
         }
         let nested = Event::Exception(f);
         event = match (class(event), class(nested)) {

@@ -1324,7 +1324,7 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
     }
     let _ = write!(
         out,
-        "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"shadow_resets\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{},\"dispatch_exits\":{},\"interrupts\":{},\"nmis\":{},\"halts\":{},\"shadow_steps\":{},\"decode_exits\":{},\"decodes\":{{{}}},\"entropy_exits\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]{}}}",
+        "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"shadow_resets\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{},\"dispatch_exits\":{},\"interrupts\":{},\"nmis\":{},\"halts\":{},\"shadow_steps\":{},\"decode_exits\":{},\"decodes\":{{{}}},\"entropy_exits\":{},\"k1\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]{}}}",
         s.blocks,
         s.l2_hits,
         s.requests,
@@ -1358,6 +1358,7 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
         ran.decodes.values().sum::<u64>(),
         decodes,
         ran.entropy,
+        execution::k1_stats(area),
         list(&fault),
         list(&s.native),
         frame_intact(area),

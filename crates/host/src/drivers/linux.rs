@@ -199,7 +199,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         other => (format!("{other:?}").split(['(', ' ', '{']).next().unwrap().to_lowercase(), format!("{other:?}")),
     };
     println!(
-        "{},\"stop\":\"{kind}\",\"reason\":\"{}\",\"state\":{},\"stats\":{{\"blocks\":{},\"compiles\":{compiles},\"systems\":{},\"flushes\":{},\"interrupts\":{},\"evictions\":{},\"retries\":{},\"shadow_resets\":{},\"cache\":{{\"code_used\":{},\"code_bytes\":{},\"meta_used\":{},\"blocks\":{}}},\"seconds\":{:.3}}},{},\"serial_bytes\":{},\"ticks\":{{\"pit\":{},\"rtc\":{},\"lapic\":{{\"fired\":{},\"missed\":{},\"reinjected\":{}}}}}}}",
+        "{},\"stop\":\"{kind}\",\"reason\":\"{}\",\"state\":{},\"stats\":{{\"blocks\":{},\"compiles\":{compiles},\"systems\":{},\"flushes\":{},\"interrupts\":{},\"evictions\":{},\"retries\":{},\"shadow_resets\":{},\"cache\":{{\"code_used\":{},\"code_bytes\":{},\"meta_used\":{},\"blocks\":{}}},\"seconds\":{:.3},\"requests\":{},\"invalidations\":{},\"steps\":{},\"links\":{},\"unlinks\":{},\"k1\":{}}},{},\"serial_bytes\":{},\"ticks\":{{\"pit\":{},\"rtc\":{},\"lapic\":{{\"fired\":{},\"missed\":{},\"reinjected\":{}}}}}}}",
         placement(&loaded, &layout),
         reason.replace('"', "'"),
         cpu_json(&s.cpu),
@@ -215,6 +215,12 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         c.meta_used,
         c.blocks,
         started.elapsed().as_secs_f64(),
+        s.requests,
+        s.invalidations,
+        s.steps,
+        s.links,
+        s.unlinks,
+        execution::k1_stats(backing.vcpu(0)),
         devices.report(),
         uart.lock().unwrap_or_else(|e| e.into_inner()).output.len(),
         board.pit.json(),

@@ -188,7 +188,8 @@ def per_vcpu_checks(out):
     if not out.get('tso'): problems.append('EnTSO not read back')
     if not out.get('frame_intact'): problems.append('FEX frame changed')
     st = out['stats']
-    if st['flushes'] == 1 and st['invalidations'] == 0 and st['steps'] == 0 and st['host_requests'] != st['distinct']:
+    # (K1: a RIP whose linear page maps other bytes now, `remapped`, is translated again from those.)
+    if st['flushes'] == 1 and st['invalidations'] == 0 and st['steps'] == 0 and not st.get('k1', {}).get('remapped') and st['host_requests'] != st['distinct']:
         problems.append(f"host requests {st['host_requests']} != distinct blocks {st['distinct']}")
     return problems
 
