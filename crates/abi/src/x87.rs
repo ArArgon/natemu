@@ -426,6 +426,29 @@ pub fn helper(function: u8, o: Operands) -> Option<Effect> {
 mod tests {
     use super::*;
     /// Widening is exact and rounding back is the identity on doubles; 80-bit values round by RC.
+    /// I9: an MMX value is the raw 64 bits of its slot, which the 80-bit images (FXSAVE/XSAVE/FNSAVE then FXRSTOR/XRSTOR/FRSTOR)
+    /// carry as that double widened: every bit pattern must come back unchanged under any RC (NaN payloads, SNaNs, denormals).
+    #[test]
+    fn mmx_values_round_trip() {
+        let mut v = 0x9e37_79b9_7f4a_7c15u64;
+        let mut check = |d: u64| {
+            let (m, se) = to_f80(d);
+            for rc in 0..4 {
+                assert_eq!(from_f80(m, se, rc), d, "{d:#x} rc {rc}");
+            }
+        };
+        for top in 0..1u64 << 13 {
+            for low in [0, 1, 0x7ff, 1 << 51, (1 << 52) - 1] {
+                check(top << 51 | low);
+            }
+        }
+        for _ in 0..1_000_000 {
+            v ^= v << 13;
+            v ^= v >> 7;
+            v ^= v << 17;
+            check(v);
+        }
+    }
     #[test]
     fn f80_conversions() {
         for d in [0u64, 1 << 63, 1, 0x000f_ffff_ffff_ffff, 0x0010_0000_0000_0000, 0x3ff0_0000_0000_0000, 0xc009_21fb_5444_2d18,

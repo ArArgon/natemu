@@ -208,6 +208,7 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 | **I6** x87 reduced precision | FEX reduced mode; 80-bit images; helper inventory | `X87_F64`; QEMU exact-by-construction | ASM | 0 fail; deviation recorded |
 | **I6b** x87 helper forms without a helper library | Research (Oct 29, read-only): no general in-VM helper library (needs an EL0 stack page and an EL0 rodata page, helper code outside admission, IRQ/stop handling inside helpers; pays off only for full 80-bit mode, which the owner did not choose). Instead: FSIN/FCOS/FSINCOS/FPTAN/FPATAN/F2XM1/FYL2X/FYL2XP1/FSCALE/FPREM/FPREM1 by `svc` to the resident (division precedent), computed with the toolchain's compiler_builtins libm, with x87's C2 out-of-range rule and FPREM's quotient bits and partial remainder (FEX has neither); PCMPISTRI/PCMPESTRI (I5c) the same way, porting FEX's pure C++; FLD/FSTP m80 cost goes with K2, then inline conversion in fexc only if still hot (one 10-byte crossing check before the first store) | x87 corpus extended with these forms; SDM C2/quotient-bit cases; census | ASM, faults | refused forms executed or refused with reason |
 | **I8** AVX/AVX2 (if Q3 keeps them) | YMM ops | FEX ASM VEX tests | ASM | as I5a |
+| **I9** remaining advertised forms | MOVBE, MMX (x87 aliasing decided), AES-NI/PCLMULQDQ, PDEP/PEXT, FFREEP; #UD for unadvertised ADX/SHA | QEMU corpus; fault matrix with the x87/MMX state; FEX ASM; census | ASM, faults | every advertised form executed or refused with reason |
 | **R1a** single-vCPU composites (~1 run) | Decompressor entry; kernel head (`head_64.S:37-405`); early #PF table building; `int3_selftest`; alternatives/static-call patching through a second mapping under another CR3; syscall round trip with PTI CR3 switch and VERW; timer tick into `sti; hlt`; serial write with IRQ4 | QEMU system mode with the same programs | all | each matches at block sizes default/1 |
 | **R1b** SMP composites (~1 run) | Mailbox AP start into the head; `text_poke_bp` + IPI `sync_core`; paranoid NMI with `lsl`; IPIs under load | QEMU at N = 2..4 | all | each matches at N = 2..4 |
 | **R2** phase-end audit | Contract inventory (44, 49, 51, SSE parts of 1/2/5, LOCK parts of 43); stack audit; integration handoff page | Independent review of the whole path | all | §4 holds |
@@ -2318,6 +2319,141 @@ library's placement, read through the guest's page tables from a RAM dump), in `
 strings) under the initramfs's `/init`. MOVBE is outside I6b (68 initramfs sites, filed under SSE as another feature).
 **Not built:** FFREEP (the undocumented alias, 3 sites), FBLD/FBSTP, unmasked x87 exceptions (#MF), x87 results rounded by
 FCW.RC/PC, MOVBE, AES/SHA/PCLMULQDQ/ADX, MMX.
+
+*Built (I9, the remaining advertised forms user space hits: MOVBE, MMX, AES-NI/PCLMULQDQ, PDEP/PEXT, FFREEP; and #UD for the
+unadvertised ADX/SHA/CET_SS forms; fexc series32 = series31 + patch 0024 + shim changes):* **Profile** (`cpu_profile.json`):
+CPUID.1:ECX advertises MOVBE (22), AES (25), PCLMULQDQ (1); CPUID.1:EDX MMX (23); CPUID.7.0:EBX = 1A9H: BMI1, AVX2, SMEP, BMI2
+(8) and FSGSBASE, not ADX (19), SHA (29), ERMS or AVX-512; CPUID.7.0:ECX = 0 (no VAES, VPCLMULQDQ, GFNI, CET_SS); no 3DNow!.
+**MOVBE** (0f 38 f0/f1, none or 66): admitted with memory operands at 16, 32 and 64 bits. FEX lowers it to a plain load or store
+plus REV (REV16 for a 16-bit store; a 16-bit load is REV32 and a BFXIL into the register), so the access is an ordinary recorded
+site: #PF/#GP/#SS precise, a crossing store completed by the resident, #AC natively (SCTLR.A at CPL 3 under CR0.AM/RFLAGS.AC, X2).
+Not gated. A register operand (SDM MOVBE: #UD) is a system cut the host decodes as `system::UD`; F3 0f 38 f0/f1 is refused (FEX's
+decoder fails before its ModRM).
+**AES-NI and PCLMULQDQ** (legacy 66 0f 38 db..df, 66 0f 3a 44/df; VEX.128 forms, AES and AVX both advertised): FEX's Arm
+crypto lowering, AESE/AESD with a zero round key then AESMC/AESIMC and an EOR with the x86 round key (x86's ShiftRows, SubBytes,
+MixColumns, AddRoundKey order), AESKEYGENASSIST through AESE and a TBL swizzle, PCLMULQDQ through PMULL/PMULL2 with imm8 bits 0
+and 4. Legacy memory operands are 16-byte aligned (exception class 4: #GP(0) before any walk, I5a's check), VEX.128 ones not;
+gated as SSE (CR0.EM, CR4.OSFXSR, CR0.TS) or AVX (OSXSAVE, XCR0, TS). VEX.256 (VAES/VPCLMULQDQ) stays an encoding refusal (not
+advertised). **PDEP/PEXT** (BMI2): patch 0024 replaces FEX's loops (backward branches, refused since I1) under slice1 by
+straight-line code in the JIT on its scratch registers, flags untouched: PEXT is Hacker's Delight 7-4 "compress" (log2(width)
+rounds of a parallel-suffix XOR and two masked moves: 83 instructions per site at 64 bits, 65 at 32), PDEP since the review
+round 7-5 "expand" (the compress rounds record each round's moved bits, two of them in v0/v1 and one recomputed at the end, then
+the source moves back round by round: 102 per site at 64 bits, 82 at 32; the first version, one step per source bit, was 387). **FFREEP** (df c0+i): undocumented by Intel but executed by Intel and
+AMD x87 units (the sources FEX's table cites: AMD's Athlon x86 Code Optimization Guide, "Use FFREEP Macro to Pop One Register
+from the FPU Stack"; pagetable.com/?p=16); FEX ran it as FINCSTP; patch 0024 frees ST(i) and pops (ST(0) empty, TOP + 1), as
+QEMU and Bochs do; an x87 form (#NM under CR0.EM or TS). FBLD/FBSTP stay refused (0 sites in the census; FEX's helper).
+**#UD for the unadvertised forms** (Vol.2 each: "#UD If CPUID ... = 0"): ADCX/ADOX and the rest of 0f 38 f6, WRSS/WRUSS
+(WRUSS 66 0f 38 f5, WRSS NP 0f 38 f6), SHA1*/SHA256* (NP 0f 38 c8..cd, NP 0f 3a cc) are system cuts the host decodes as `system::UD` (the resident raises
+#UD), whatever their operands.
+**MMX.** Every MMX-register form FEX supports (`FexcSlice1::Mmx`): the MMX arithmetic, logical, compare, pack/unpack and shift
+forms (by imm8 and by register/memory), MOVD/MOVQ with general registers and memory, EMMS, MOVNTQ, and SSE's, SSE2's and SSSE3's
+MMX forms (PSHUFW, PINSRW, PEXTRW, PMOVMSKB, PAVGB/W, PMIN/PMAX, PSADBW, PMULHUW, PMULUDQ, PADDQ/PSUBQ, PSHUFB..PABSD, PALIGNR),
+and the conversions with an XMM operand (CVTPI2PS/PD, CVT(T)PS2PI, CVT(T)PD2PI, MOVQ2DQ, MOVDQ2Q). Refused: MASKMOVQ (a byte-masked
+store: FEX writes all 8 bytes; gated first), the shift groups' #UD encodings, 3DNow! (not advertised). **State:** FEX keeps MMn
+as the low 64 bits of x87 slot `mm[n]` (`frame::X87_MM`, the slot of physical register n, I6), the slot whose low 64 bits are the
+reduced-precision x87 value (a double) when x87 code wrote it; FEX also stores FFFFH at bytes 8..9 of an MMX-written slot, which
+nothing reads under reduced precision. Patch 0024: every MMX instruction but EMMS sets TOP = 0 and the abridged tag byte to FFH
+(all valid) at its end, after its memory accesses (`FexcEndMMX`, after each handler; FEX did it once per block, at the first
+MMX instruction and before its accesses, so a later MMX instruction after x87 code left TOP alone and a fault saw them changed);
+the MMX registers join slice1's per-instruction register-cache flush (written back at each instruction and never cached across
+one, which may be x87 code writing the same slot through the stack pass); PUNPCKLBW/WD/DQ mm, m32 read 4 bytes (FEX read 8: a
+fault or device access past x86's operand). EMMS empties the tags (FEX's `_InvalidateStack`). **Gating:** pure MMX forms (EMMS and
+MASKMOVQ included) are cut under the host's `--x87-gated` (CR0.EM or TS) with `cut_gated: "mmx"`, which the host answers as the
+new `system::MMX_GATED` (52): #UD with CR0.EM, else #NM (SDM Vol.3 Table 12-1; CR4.OSFXSR does not gate them); the forms with an
+XMM operand gate as SSE (#UD with EM or without OSFXSR, #NM with TS). **Aliasing (decision: a recorded deviation, not exact
+aliasing, not a refusal).** Exact aliasing needs each register in two representations (a double for x87 code, the 80-bit image
+for MMX: significand = MMn, bits 79:64 = FFFFH) and a conversion at every MMX/x87 transition: the representation as a bit of
+`Cpu::code_context`, x87 forms cut under MMX representation and MMX forms under x87 representation, a resident transaction that
+converts all eight slots and re-dispatches the instruction, and FXSAVE/FNSAVE/XSAVE reading the raw form. Not built because what
+it changes is only x87 code reading MMX values or MMX code reading x87 values without EMMS in between, which hardware turns into
+NaN/infinity operands and which the SDM tells software not to do (SDM Vol.1 chapter 9: EMMS before x87 code; x87 code after MMX
+without it overflows the full stack); a typed refusal of mixed use is not possible statically (the transition is at run time,
+across blocks and context switches). What is exact: MMX results, TOP = 0 and all-valid tags after every MMX instruction, EMMS's
+empty tags (an x87 FLD after EMMS works; one after MMX without EMMS overflows with x87's masked response), and every MMX value
+through FXSAVE/FXRSTOR, XSAVE/XRSTOR and FNSAVE/FRSTOR made by natemu: the image holds `to_f80(v as a double)` and restoring it
+gives `from_f80(...)` = v for all 2^64 patterns under every FCW.RC (abi test `x87::tests::mmx_values_round_trip`: every 13-bit
+sign/exponent/quiet prefix with five payloads, and 10^6 random patterns), so a context switch or a signal frame keeps MMX state.
+**Deviations** (I9): (1) an x87 read of an MMX-written register sees v's bits as a double (hardware: {FFFFH, v}, a negative NaN,
+negative infinity or an unsupported encoding), and an MMX read of an x87-written register sees the double's bits (hardware: the
+80-bit significand); (2) an FXSAVE/XSAVE/FNSAVE image of an MMX-written register holds the double view widened, not {v, FFFFH},
+FNSAVE/FNSTENV tag words of such registers come from the double view (I6 deviation 11), and an image whose register holds
+{v, FFFFH} (made by hardware or by hand) restores its x87 value (I6 deviation 2: v is lost); (3) MASKMOVQ, F3 0f 38 f0/f1 and the
+MMX shift groups' #UD encodings are refused, not delivered (as I8 deviation 1); (4) G1's page deviation covers the MMX registers.
+**Checks** (series32): `tools/reference/gen_i9.py` corpus against QEMU 7.2 (`natemu-raw/i9-corpus-20261030-01`, 120 programs: 16
+MOVBE (all widths, loads and stores, unaligned and across the page boundary), 48 MMX (every admitted form, memory operands at the
+page boundary, PUNPCKL* m32 in a page's last 4 bytes, after x87 use, FXSAVE's FSW and tag byte after MMX and after EMMS, an x87
+round trip after EMMS), 24 AES/PCLMULQDQ (legacy and VEX.128, register and memory, every selecting imm8), 16 PDEP/PEXT (32/64,
+register and memory masks, sparse, dense, zero, all ones), 16 FFREEP (random ST(i) on random stacks, FSW/tags/ST fields)): 120/120
+at block sizes default and 1. `tools/run_i9_faults.py` (378 cases, SDM rules, the run cut before the instruction as the reference,
+x87/MMX state included): #PF not present/read-only/crossing (CR2 the second page; the first page read-only), the operand ending at
+a page end with the next unmapped (no fault), #GP/#SS non-canonical and straddling for 27 MOVBE/MMX/AES/PCLMULQDQ/PDEP/PEXT
+memory forms, alignment #GP for legacy AES/PCLMULQDQ/CVTPD2PI m128 (also with the page not present), none for VEX.128; at each
+fault GPRs, XMM, MXCSR, memory and MM0..7/TOP/tags/condition codes unchanged (also right after an MMX instruction and after
+EMMS + FLD); gating (10 MMX forms: #NM under TS, #UD under EM and EM + TS, running without OSFXSR; the XMM-operand forms and
+AES/PCLMULQDQ as SSE; VAESENC as AVX; MOVBE/PDEP/PEXT ungated; FFREEP #NM); #UD for MOVBE register forms, ADCX, ADOX, SHA1MSG1,
+SHA256RNDS2, SHA1RNDS4; #AC at CPL 3 for misaligned MOVBE (2/4/8), MOVQ/MOVD/PADDB/PINSRW MMX operands and aligned controls;
+MASKMOVQ refused; 378/378 at both block sizes. `test_slice1.py` 32 (the I9 forms in `ALLOWED`, the #UD forms in `SYSTEM`,
+MASKMOVQ/VAESENC L=1/F3 MOVBE refused); host `system` tests (the #UD decodes); `run_asm.py` selftest (new: an 80-bit value beyond
+the double's range, MMn as a 64-bit value). FEX ASM suite: 1,703 -> 1,846 pass, 0 fail, 45 -> 48 precision deviations,
+unsupported 522 -> 376: newly passing MOVBE (H0F38 0_F0, 0_F1), the AES/PCLMULQDQ tests (H0F38, H0F3A, SSELanePreservation,
+VEX.128), PDEP/PEXT (and FEX_bugs/pdep_overlap), FFREEP (X87/DF_C0, D9_F5_2/3) and 114 MMX tests (TwoByte, H0F38/H0F3A MMX forms,
+OpSize, REP/REPNE D6, X87 D9_F6/F7 ...); `run_asm.py` now compares an MMn expectation given as one 64-bit value with the slot's
+low half, extends the reduced-precision bound to FLD m80 of values beyond the double's range and unnormals (I6 deviation 2: the 3
+FEX_bugs fxsave/fxrstor tests whose FFREEP now runs), lists ADX and SHA as not advertised, and records X87/X87MMXInteraction and
+FEX_bugs/mmx_x87_register_conflating as expecting the 80-bit aliasing (deviation 1-2 above; their MMX results match). Census
+(`natemu-raw/kernel-census-i9-20261030-01`, `census.py` ports the shim): SSE class kernel 5 -> 0 (EMMS admitted, WRUSSQ 4 #UD),
+initramfs 6,835 -> 0 (AES 4,367, PCLMULQDQ 351, MOVBE 68 and MMX 16 admitted; SHA 1,297 and ADCX 736 `system`, #UD); x87 3 -> 0
+(FFREEP); AVX initramfs 229,216 -> 218,126 (11,090 VEX.128 AES/PCLMULQDQ admitted; left: EVEX/AVX-512, VAES/VPCLMULQDQ at 256/512
+bits and GFNI, not advertised, and 10 VEX gathers); `other` initramfs 2,282 -> 1,650 (ADOX 632 #UD); `system` kernel 16,799 ->
+16,803, initramfs 5,601 -> 8,266. Standing suite on series32 (`natemu-raw/suite-i9-20261030`, with K1's in-progress tree), all 0 failures but the two below:
+cargo build/test (50 + 75), python unit 281, fix/fix-1 64, seed/seed-1 44, flow 64 x 3, loopfaults 846 x 3, probes, FEX ASM as
+above, smp, limits, kicks, system, coherence, sharedpt, litmus, contain, privilege, delivery, events, i6 faults 275 x 2, `run_m3.py`,
+`run_l1.py`, `run_l2.py`, `run_l2_iasl.py`, `run_k2.py`, `run_x3.py`, `run_k1.py`, `run_m1.py` 20, `run_l3.py`, `run_l4a.py`,
+`run_l4b.py`, `run_i5b.py` 411, I8 corpora 136/136 x 2 and 329/336 x 2 (the 7 recorded QEMU two-NaN departures), i8 faults 851
+x 2, I6b corpus 112 x 2 and cases 129 x 2, I9 corpus 120 x 2 and faults 378 x 2. Slice-1 faults/faults-1 and the slice-3
+corpora gave 2 failures each: the straddle probes `straddle-0f38-present` (MOVBE) and `straddle-0f3a-present` (PALIGNR mm)
+expected `unsupported_form`; both forms run now, so `run_slice1_faults.py` expects them to run to their end (QEMU with
++movbe/+ssse3): the straddle probes 160 + 3 unsupported at both block sizes, the slice-3 corpora 7,031/7,032/7,033 + 3 unsupported
+at N = 2..4 (slice-1 faults: 7,830 + 3 unsupported, the 3 EVEX/3DNow! straddles). Stack audit: gate 18,864 bytes, 22,944 nested,
+of 32,768.
+**Kernel** (Debian 6.12, 2 GiB, `console=ttyS0 earlyprintk=serial mitigations=off nokaslr --initrd` Debian's initrd, series32,
+with K1's in-progress tree): past the MOVBE in glibc's `memcmp` (`/bin/udevadm trigger`) and the rest of the initramfs's `/init`;
+`syslogd`/`klogd` start ("Starting system log daemon"), the installer's GNU screen session opens its windows (installer, two
+shells, log) and the Debian installer shows its first dialog, "[!!] Select a language" (C / English, `<Tab> moves; <Space>
+selects; <Enter> activates buttons`), then waits for keyboard input with the status-line clock advancing each minute; 351 serial
+lines (279 kernel lines to "Run /init as init process" at 67.8 s guest time), no stop: the run was ended by hand after 14.7 min host
+time (1 min 56 s of CPU: the vCPU idles in HLT). Serial log: `natemu-raw/i9-kernel-20261030-01/serial.txt`.
+*I9 review round (October 30; series32 rebuilt in place, patch 0024 extended; independent review: one blocking defect):* **Block
+size (blocking).** fexc sized its temporary JIT buffer as two pages plus 24 bytes per IR node and, with no guard-page handler,
+died with SIGBUS when a block's code outgrew it (21 PDEP64, 45 PDEP32 or 100 PEXT64 in one block: "fexc child died, status 10");
+smaller runs gave objects over `MAX_BLOCK_BYTES` (32 KiB), which admission refused ("code layout") with no retry. Fixed on both
+sides, for every form: (a) patch 0024 checks, before each IR node and before the block's tail (stubs, thunks, RIP entries), that
+64 KiB of the buffer remain (no node emits that much), else restarts the compile with the doubled estimate, FEX's own
+`NeedsLargerJITSpace` restart that only its signal handler raised, so fexc never writes past its buffer; (b) the host
+(`Compiler::compile`) translates a RIP whose object is over `MAX_BLOCK_BYTES` again with half the instructions it held
+(`admission::oversized`), until it fits; one instruction too large for a block stops `code_too_large`. The cost of a long
+lowering is therefore a block cut at about 32 KiB of code (408 bytes per PDEP64 site, 332 per PEXT64: some 75 or 95 per
+block; the 120-PEXT64 case is 2 blocks in 3 translations, the 1,000-PCMPISTRI case 4 blocks in 7). Found too: FEX's `FEX_bugs/add_sub_carry_2.asm` (a block over 32 KiB) now
+runs. Checks: `gen_i9.py --big` (`natemu-raw/i9-big-20261030-01`: 25 and 40 PDEP64, 60 PDEP32, 120 PEXT64 and 1,000 PCMPISTRI in
+one straight run each, against QEMU 7.2; the PCMPISTRI run is byte-checked but not annotation-checked, `ref.py`'s new
+`unannotated`, as QEMU's in_asm log garbles an instruction crossing 1 KiB of a translation block): 5/5 at block sizes default
+and 1. **PDEP cost:** the expand above; the corpus's PDEP cases and the reviewer's 28 masks (`rv-bmi2`, stc/clc, 32/64) match.
+**Other fixes:** the dead F3 branch of the MOVBE #UD cut is gone (fexc never sees a ModRM there); the WRSS/WRUSS encodings are
+named right; `run_i9_faults.py` gains SDM-judged cases (586 now): CVTPI2PS/CVTPI2PD m64 leave TOP and the tags (no MMX
+transition; QEMU 7.2 enters MMX for them), the register forms, CVTPS2PI, CVTTPD2PI m128 and MOVQ2DQ set TOP 0 and tags FFH, EMMS
+empties them; MMX shifts by register and imm8 counts 0..63, 64, 255 and 2^32 + 1 for all eight forms against the SDM rule.
+**Record:** the three `MMX_GATED` hunks (`crates/abi/src/execution.rs` the kind and its `well_formed` arm, `crates/runtime/src/
+execution.rs` the #UD/#NM arm, `crates/host/src/execution.rs` the `cut_gated: "mmx"` mapping) landed in commit f4ec290 (K1's).
+**Re-runs** (series32 as rebuilt): cargo test (50 + 75), stack audit (gate 18,864 bytes, 22,944 nested), `test_slice1.py` 32,
+python unit 281, FEX ASM 1,847 pass, 0 fail, 48 precision deviations, 375 unsupported, I9 corpus 120 x 2, `--big` 5 x 2, I9 faults
+586 x 2, slice-1 faults/faults-1 7,830 + 3 unsupported each, `run_k2.py` (exit counts flat, XMC checks 0 mismatches).
+**Not built (remaining, with reasons):** exact 80-bit MMX/x87 aliasing (above: the representation keyed in the code context);
+MASKMOVQ (a masked store, as MASKMOVDQU/VMASKMOV); FBLD/FBSTP (0 census sites; FEX's BCD helper); the other undocumented x87
+aliases (DC D0/D8, DD C8, DE D0, DF C8..DF: 0 sites); the forms the census still refuses although advertised: 0x67
+address-size forms (initramfs 1,435, + 6 `addr32 mulx`; refused since I1), VEX gathers (10; I8), XLAT (1); not advertised but
+refused instead of #UD: XOP VPROTD/VPROTQ (144, AMD), RTM XBEGIN/XABORT (9), VIA PadLock (4); CET RDSSP/INCSSP (41: on a CPU without
+CET they are NOPs in the hint space, glibc runs them only with shadow stacks enabled), PREFETCHW (kernel 17, not advertised;
+Haswell executes 0f 0d /1 as a NOP); unmasked x87/SIMD exceptions (#MF/#XM, I5c).
 
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 

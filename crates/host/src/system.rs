@@ -21,6 +21,7 @@ use natemu_abi::execution::{SREG_DS, SREG_FS, SREG_GS, SREG_SS, System, system};
 const MAP_PRIMARY: u8 = 0;
 const MAP_TWO: u8 = 1;
 const MAP_0F38: u8 = 5;
+const MAP_0F3A: u8 = 6;
 /// fexc's VEX map (`FEXC_MAP_VEX`, I8): the opcode byte after the VEX prefix.
 const MAP_VEX: u8 = 8;
 
@@ -62,6 +63,7 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         MAP_TWO if *bytes.get(at)? == 0x0f && *bytes.get(at + 1)? == opcode => at += 2,
         MAP_PRIMARY if *bytes.get(at)? == opcode => at += 1,
         MAP_0F38 if bytes.get(at..at + 3)? == [0x0f, 0x38, opcode] => at += 3,
+        MAP_0F3A if bytes.get(at..at + 3)? == [0x0f, 0x3a, opcode] => at += 3,
         // I8: only VLDMXCSR/VSTMXCSR: map 0F, pp 0, VEX.L 0, VEX.vvvv 1111b (fexc admitted nothing else here); VEX.B and VEX.X
         // extend the ModRM operand's base and index as REX would. No legacy SSE prefix or REX before VEX (`vex_ud`).
         MAP_VEX if rex == 0 && !operand16 && rep == 0 => {
@@ -169,6 +171,19 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         }
         // VMREAD/VMWRITE outside VMX operation; INVEPT/INVVPID (likewise) and INVPCID (not advertised): #UD.
         (MAP_TWO, 0x78 | 0x79) | (MAP_0F38, 0x80..=0x82) => (s.kind, rep_used) = (system::UD, true),
+        // I9: MOVBE with a register operand (SDM MOVBE: #UD); F2 is CRC32, F3 is refused by fexc and a memory MOVBE is
+        // admitted, none ever cut. ADCX (66 0f 38 f6) and ADOX (F3; ADX not advertised), WRSS (NP 0f 38 f6) and WRUSS (66 0f 38
+        // f5; CET_SS not advertised) and the rest of 0f 38 f5/f6, SHA (NP 0f 38 c8..cd, NP 0f 3a cc; not advertised): #UD
+        // whatever their operands.
+        (MAP_0F38, 0xf0 | 0xf1) => {
+            rm(bytes, &mut at, rex, &mut s)?;
+            if rep != 0 || s.memory != 0 {
+                return None;
+            }
+            (s.kind, rep_used) = (system::UD, true);
+        }
+        (MAP_0F38, 0xf5 | 0xf6) => (s.kind, rep_used) = (system::UD, true),
+        (MAP_0F38, 0xc8..=0xcd) | (MAP_0F3A, 0xcc) if !operand16 && rep == 0 => s.kind = system::UD,
         (MAP_PRIMARY, 0x8c | 0x8e) => {
             s.cr = rm(bytes, &mut at, rex, &mut s)?;
             s.kind = if opcode == 0x8c { system::MOV_FROM_SREG } else { system::MOV_TO_SREG };
@@ -733,6 +748,16 @@ mod tests {
         }
         assert_eq!(d("0f78c0", 0x78), k(UD, 2));
         assert_eq!(super::decode(&[0x66, 0x0f, 0x38, 0x82, 0x00, 0x90], MAP_0F38, 0x82), k(UD, 4)); // invpcid
+        // I9: MOVBE register forms, ADCX/ADOX, WRUSS, SHA: #UD; a memory MOVBE and CRC32 are never decoded here.
+        assert_eq!(super::decode(&[0x48, 0x0f, 0x38, 0xf0, 0xc1], MAP_0F38, 0xf0), k(UD, 5));
+        assert_eq!(super::decode(&[0x66, 0x0f, 0x38, 0xf1, 0xc8], MAP_0F38, 0xf1), k(UD, 5));
+        assert_eq!(super::decode(&[0x0f, 0x38, 0xf0, 0x07], MAP_0F38, 0xf0), None);
+        assert_eq!(super::decode(&[0xf2, 0x0f, 0x38, 0xf0, 0xc1], MAP_0F38, 0xf0), None);
+        assert_eq!(super::decode(&[0x66, 0x48, 0x0f, 0x38, 0xf6, 0xc1], MAP_0F38, 0xf6), k(UD, 5));
+        assert_eq!(super::decode(&[0xf3, 0x48, 0x0f, 0x38, 0xf6, 0x07], MAP_0F38, 0xf6), k(UD, 5));
+        assert_eq!(super::decode(&[0x0f, 0x38, 0xcb, 0xc1], MAP_0F38, 0xcb), k(UD, 3));
+        assert_eq!(super::decode(&[0x0f, 0x3a, 0xcc, 0xc1, 0x01], MAP_0F3A, 0xcc), k(UD, 3));
+        assert_eq!(super::decode(&[0x66, 0x0f, 0x3a, 0xcc, 0xc1, 0x01], MAP_0F3A, 0xcc), None);
         assert_eq!(d("f00f01f8", 0x01).map(|s| (s.kind, s.lock)), Some((SWAPGS, 1))); // #UD by LOCK
     }
 }

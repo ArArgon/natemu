@@ -1,0 +1,308 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: natemu <natemu@example.invalid>
+Date: Fri, 30 Oct 2026 12:00:00 +0000
+Subject: [PATCH] FEXCore: slice1 I9: MMX state, PDEP/PEXT, FFREEP, JIT buffer room
+
+Under fexc_slice1: every MMX instruction sets TOP = 0 and the abridged tag byte
+FFH at its end, after its memory accesses (FexcEndMMX), so a fault leaves
+them; the MMX registers are flushed per instruction (none cached across one);
+PUNPCKL* mm, m32 loads 4 bytes; PDEP (Hacker's Delight expand) and PEXT
+(compress) are straight-line code (no backward branch); FFREEP ST(i) frees
+ST(i) and pops (FEX ran FINCSTP). Always: before each IR node and before the
+block tail at least 64 KiB must remain in the temporary code buffer, else the
+compile restarts with the doubled estimate (FEX's NeedsLargerJITSpace, which
+only its guard-page signal handler raised: fexc has none and died with SIGBUS).
+---
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 101f450..62077ca 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -724,6 +724,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+             Thread->OpDispatcher->NrConstants = 0;
+           }
+           std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
++          if (fexc_slice1) Thread->OpDispatcher->FexcEndMMX();   // natemu (I9): an MMX instruction's TOP and tags, last
+           if (fexc_slice1 && IsLocked) {
+             Thread->OpDispatcher->NrConstants = 0;
+           }
+diff --git a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp b/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
+index 9718fc9..3cc35f5 100644
+--- a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
+@@ -757,6 +757,65 @@ DEF_OP(PDep) {
+       bdep(ARMEmitter::SubRegSize::i64Bit, VTMP1.Z(), VTMP1.Z(), VTMP2.Z());
+       umov<ARMEmitter::SubRegSize::i64Bit>(Dest, VTMP1, 0);
+     }
++  } else if (fexc_slice1) {
++    // natemu (I9): straight-line, no branch (admission refuses a backward branch): Hacker's Delight 7-5 "expand", log2(width)
++    // rounds. The forward pass compresses the mask as PEXT does and records each round's moved bits mv[i]; the backward pass
++    // moves the source bits left by 2^i into mv[i]'s positions, last round first; the result is masked by the original mask.
++    // Registers: TMP1..TMP4 and Dest; the source, the mask and mv[1], mv[2] in VTMP1/VTMP2 (Dest may alias either input, so both
++    // are saved before Dest is written); mv[3] in Dest, mv[4] in TMP4 (64-bit), the last round's in TMP2; mv[0] is recomputed
++    // from the mask at the end. 102 instructions at 64 bits, 82 at 32.
++    const auto M = TMP1.R(), MK = TMP2.R(), MP = TMP3.R(), T4 = TMP4.R();
++    const uint32_t Bits = EmitSize == ARMEmitter::Size::i64Bit ? 64 : 32;
++    const uint32_t Rounds = Bits == 64 ? 6 : 5;
++    auto prefix = [&](ARMEmitter::Register Out, ARMEmitter::Register In) {   // Out = the parallel-suffix XOR of In
++      eor(EmitSize, Out, In, In, ARMEmitter::ShiftType::LSL, 1);
++      for (uint32_t k = 2; k < Bits; k <<= 1) {
++        eor(EmitSize, Out, Out, Out, ARMEmitter::ShiftType::LSL, k);
++      }
++    };
++    ins(ARMEmitter::SubRegSize::i64Bit, VTMP1, 0, OrigInput);
++    ins(ARMEmitter::SubRegSize::i64Bit, VTMP1, 1, OrigMask);
++    mov(ARMEmitter::Size::i64Bit, M, OrigMask);
++    mvn(EmitSize, MK, M);
++    lsl(EmitSize, MK, MK, 1);
++    auto holder = [&](uint32_t i) -> ARMEmitter::Register { return i == Rounds - 1 ? MK : i == 3 ? Dest : T4; };
++    for (uint32_t i = 0; i < Rounds; ++i) {
++      const bool last = i == Rounds - 1;
++      prefix(MP, MK);
++      const auto MV = holder(i);
++      and_(EmitSize, MV, MP, M);
++      if (i == 1 || i == 2) ins(ARMEmitter::SubRegSize::i64Bit, VTMP2, i - 1, MV.X());
++      if (!last) {
++        eor(EmitSize, M, M, MV);
++        orr(EmitSize, M, M, MV, ARMEmitter::ShiftType::LSR, 1U << i);
++        bic(EmitSize, MK, MK, MP);
++      }
++    }
++    // Backward: X in TMP1, the shifted copy in TMP3.
++    const auto X = M, T = MP;
++    umov<ARMEmitter::SubRegSize::i64Bit>(X, VTMP1, 0);
++    auto step = [&](uint32_t i, ARMEmitter::Register MV) {
++      lsl(EmitSize, T, X, 1U << i);
++      bic(EmitSize, X, X, MV);
++      and_(EmitSize, T, T, MV);
++      orr(EmitSize, X, X, T);
++    };
++    for (uint32_t i = Rounds - 1; i >= 1; --i) {
++      ARMEmitter::Register MV = holder(i);
++      if (i == 1 || i == 2) {
++        MV = T4;
++        umov<ARMEmitter::SubRegSize::i64Bit>(T4, VTMP2, i - 1);
++      }
++      step(i, MV);
++    }
++    // mv[0] from the original mask (T4), into Dest; the result is masked by it.
++    umov<ARMEmitter::SubRegSize::i64Bit>(T4, VTMP1, 1);
++    mvn(EmitSize, MK, T4);
++    lsl(EmitSize, MK, MK, 1);
++    prefix(Dest, MK);
++    and_(EmitSize, Dest, Dest, T4);
++    step(0, Dest);
++    and_(EmitSize, Dest, X, T4);
+   } else {
+     // PDep implementation follows the ideas from
+     // http://0x80.pl/articles/pdep-soft-emu.html ... Basically, iterate the *set*
+@@ -833,6 +892,35 @@ DEF_OP(PExt) {
+       bext(ARMEmitter::SubRegSize::i64Bit, VTMP1.Z(), VTMP1.Z(), VTMP2.Z());
+       umov<ARMEmitter::SubRegSize::i64Bit>(Dest, VTMP1, 0);
+     }
++  } else if (fexc_slice1) {
++    // natemu (I9): straight-line, no branch (admission refuses a backward branch): Hacker's Delight 7-4 "compress", log2(width)
++    // rounds; each moves the selected bits right by 2^i across the zeros of the mask below them (a parallel-suffix XOR of mk).
++    // x stays a subset of m, so x & mv = x & mp. Intel SDM PEXT: the mask's set bits, low to high, gather into DEST from bit 0.
++    // 83 instructions at 64 bits, 65 at 32.
++    const auto X = TMP1.R();
++    const auto M = TMP2.R();
++    const auto MK = TMP3.R();
++    const auto MP = TMP4.R();
++    const auto T = Dest;   // the inputs are dead once X and M hold them
++    const uint32_t Bits = EmitSize == ARMEmitter::Size::i64Bit ? 64 : 32;
++    mov(ARMEmitter::Size::i64Bit, M, Mask);
++    and_(EmitSize, X, Input, M);
++    mvn(EmitSize, MK, M);
++    lsl(EmitSize, MK, MK, 1);
++    for (uint32_t s = 1; s < Bits; s <<= 1) {
++      eor(EmitSize, MP, MK, MK, ARMEmitter::ShiftType::LSL, 1);
++      for (uint32_t k = 2; k < Bits; k <<= 1) {
++        eor(EmitSize, MP, MP, MP, ARMEmitter::ShiftType::LSL, k);
++      }
++      and_(EmitSize, T, X, MP);
++      bic(EmitSize, MK, MK, MP);
++      and_(EmitSize, MP, MP, M);
++      eor(EmitSize, M, M, MP);
++      orr(EmitSize, M, M, MP, ARMEmitter::ShiftType::LSR, s);
++      eor(EmitSize, X, X, T);
++      orr(EmitSize, X, X, T, ARMEmitter::ShiftType::LSR, s);
++    }
++    mov(EmitSize, Dest, X);
+   } else {
+     const auto MaskReg = TMP1;
+     const auto BitReg = TMP2;
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index 04fd986..6abfce4 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -893,6 +893,19 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
+   return AllocatedInfo;
+ }
+ 
++// natemu: never write past the temporary code buffer. FEX relies on a guard page and a signal handler that restarts the
++// compile with a larger buffer (NeedsLargerJITSpace); fexc has no handler, so a block whose code outgrew its estimate
++// (24 bytes per IR node; PDEP/PEXT and the resident-helper forms emit far more) died with SIGBUS. Before each IR node, and
++// before the tail (stubs, thunks, RIP entries: `Extra` bytes), at least FexcJITSlack bytes must remain, else the compile
++// restarts with the doubled estimate, as FEX's handler would. No single node emits FexcJITSlack bytes.
++static uint32_t FexcUsableRange = 0;
++static constexpr uint32_t FexcJITSlack = 64 * 1024;
++void Arm64JITCore::FexcEnsureRoom(size_t Extra) {
++  if (GetCursorOffset() + FexcJITSlack + Extra > FexcUsableRange) {
++    FEXCore::UncheckedLongJump::LongJump(ThreadState->RestartJump, FEXCore::ToUnderlying(RestartOptions::Control::NeedsLargerJITSpace));
++  }
++}
++
+ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size, bool SingleInst, const FEXCore::IR::IRListView* IR,
+                                                    FEXCore::Core::DebugData* DebugData, bool CheckTF) {
+   FEXCORE_PROFILE_SCOPED("Arm64::CompileCode");
+@@ -947,6 +960,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+   const uint32_t UsableBufferRange = TempCodeBufferInfo.Size - FEXC_HOST_PAGE_SIZE;
+ 
+   SetBuffer(TempCodeBuffer, UsableBufferRange);
++  FexcUsableRange = UsableBufferRange;
+ 
+   ThreadState->JITGuardPage = reinterpret_cast<uintptr_t>(TempCodeBuffer) + UsableBufferRange;
+   ThreadState->JITGuardOverflowArgument = FEXCore::ToUnderlying(RestartOptions::Control::NeedsLargerJITSpace);
+@@ -1039,6 +1053,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+     }
+ 
+     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
++      FexcEnsureRoom(0);
+       if (fexc_slice1) FexcBeforeOp(IROp, CodeNode);
+       const uint32_t FexcBegin = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
+       switch (IROp->Op) {
+@@ -1066,6 +1081,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+     b_OrRestart(PendingTargetLabel);
+   }
+   PendingTargetLabel = nullptr;
++  FexcEnsureRoom(FexcStubs.size() * 64 + PendingJumpThunks.size() * 64 + DebugData->GuestOpcodes.size() * 20);
+   if (fexc_slice1) FexcEmitStubs();
+ 
+   ARMEmitter::ForwardLabel l_ExitLink;
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index 0daf46d..421bdbc 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -81,6 +81,7 @@ private:
+   // FEXCore makes assumptions in the JIT about certain conditions being true.
+   // In the rare case when those assumptions are broken, FEX needs to safely restart the JIT.
+   RestartOptions RestartControl {};
++  void FexcEnsureRoom(size_t Extra);   // natemu: restart with a larger buffer before it could overflow
+   bool RequiresFarARM64Jumps {};
+   // Default to 6 instructions per SSA node.
+   uint32_t SSANodeMultiplier {24};
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 6f91170..029a10b 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -748,6 +748,7 @@ public:
+   void X87EMMS(OpcodeArgs);
+   void X87FCMOV(OpcodeArgs);
+   void X87FFREE(OpcodeArgs);
++  void X87FFREEP(OpcodeArgs);
+   void X87FLDCW(OpcodeArgs);
+   void X87FNSAVE(OpcodeArgs);
+   void X87FNSTENV(OpcodeArgs);
+@@ -1217,7 +1218,11 @@ public:
+       // natemu (fexc_slice1, I8): likewise the YMM upper halves (avx_high, the resident's XSAVE component 2 and the state a
+       // fault reports): each instruction stores the ones it wrote, so no write is dropped (VZEROUPPER's invalidation) or sunk.
+       const uint64_t AVXHighMask = ((1ull << (AVXHigh15Index - AVXHigh0Index + 1)) - 1) << AVXHigh0Index;
+-      Mask &= (GPRMask | FPRMask | (fexc_slice1 ? (1ull << DFIndex) | AVXHighMask : 0));
++      // natemu (fexc_slice1, I9): and the MMX registers (MM0..MM7, the x87 slots' low halves): each instruction stores the
++      // ones it wrote (with FEX's FFFFH in bits 79:64), and none stays cached across an instruction, which may be x87 code
++      // writing the same slot through the stack pass.
++      const uint64_t MMMask = ((1ull << (MM7Index - MM0Index + 1)) - 1) << MM0Index;
++      Mask &= (GPRMask | FPRMask | (fexc_slice1 ? (1ull << DFIndex) | AVXHighMask | MMMask : 0));
+       // (I8 review: before a register-only vector instruction, FexcKeepAVXHigh (Core.cpp), the stored upper halves stay
+       // cached too, so the next one reads its register instead of reloading what was just stored: write-through.)
+       if (FexcKeepAVXHigh) Keep = AVXHighMask;
+@@ -2447,12 +2452,32 @@ private:
+ 
+   void ChgStateX87_MMX() override {
+     LOGMAN_THROW_A_FMT(MMXState == MMXState_X87, "Expected state to be x87");
++    // natemu (fexc_slice1, I9): every MMX instruction (not only a block's first) sets TOP = 0 and every tag valid, and only
++    // after its memory accesses, so a fault leaves both as they were: FexcEndMMX emits them at the instruction's end.
++    if (fexc_slice1) {
++      FexcMMXInst = true;
++      MMXState = MMXState_MMX;
++      return;
++    }
+     _StackForceSlow();
+     SetX87Top(Constant(0)); // top reset to zero
+     _StoreContextGPR(OpSize::i8Bit, Constant(0xFFFFUL), offsetof(FEXCore::Core::CPUState, AbridgedFTW));
+     MMXState = MMXState_MMX;
+   }
+ 
++public:
++  bool FexcMMXInst = false;
++  // natemu (fexc_slice1, I9): after an MMX instruction's handler (Core.cpp): TOP = 0, the abridged tag byte FFH (all valid),
++  // then the next instruction starts in the x87 state again (FEX's MMX register cache is flushed per instruction in slice1).
++  void FexcEndMMX() {
++    if (!FexcMMXInst) return;
++    FexcMMXInst = false;
++    _StackForceSlow();
++    SetX87Top(Constant(0));
++    _StoreContextGPR(OpSize::i8Bit, Constant(0xFFUL), offsetof(FEXCore::Core::CPUState, AbridgedFTW));
++    MMXState = MMXState_X87;
++  }
++protected:
+   void ChgStateMMX_X87() override {
+     LOGMAN_THROW_A_FMT(MMXState == MMXState_MMX, "Expected state to be MMX");
+     // The opcode dispatcher register cache is used for MMX, but the x87 pass register cache is used for x87, spill to
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+index 3b8e02c..046ba24 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+@@ -843,7 +843,9 @@ void OpDispatchBuilder::PUNPCKLOp(OpcodeArgs, IR::OpSize ElementSize) {
+   const auto Size = OpSizeFromSrc(Op);
+ 
+   Ref Dest = LoadSourceFPR(Op, Op->Dest, Op->Flags);
+-  Ref Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
++  // natemu (I9): the MMX forms read m32 (SDM PUNPCKLBW/WD/DQ mm, mm/m32), not 8 bytes (a fault or device access beyond x86's).
++  Ref Src = fexc_slice1 && Size == OpSize::i64Bit && !Op->Src[0].IsGPR() ? LoadSourceFPR_WithOpSize(Op, Op->Src[0], OpSize::i32Bit, Op->Flags) :
++                                                                          LoadSourceFPR(Op, Op->Src[0], Op->Flags);
+ 
+   auto ALUOp = _VZip(Size, ElementSize, Dest, Src);
+   StoreResult_WithAVXInsert(VectorOpType::SSE, RegClass::FPR, Op, ALUOp);
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+index 4932c56..692d2e7 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+@@ -844,6 +844,12 @@ void OpDispatchBuilder::X87FFREE(OpcodeArgs) {
+   _InvalidateStack(Op->OP & 7);
+ }
+ 
++// natemu (I9): FFREEP ST(i) frees ST(i) and then pops (ST(0) marked empty, TOP + 1), as QEMU and Bochs; FEX ran it as FINCSTP.
++void OpDispatchBuilder::X87FFREEP(OpcodeArgs) {
++  _InvalidateStack(Op->OP & 7);
++  _PopStackDestroy();
++}
++
+ void OpDispatchBuilder::X87EMMS(OpcodeArgs) {
+   // Tags all get set to 0b11
+   _InvalidateStack(0xff);
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/X87Tables.cpp b/FEXCore/Source/Interface/Core/X86Tables/X87Tables.cpp
+index 5d2dff3..bec9f4d 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/X87Tables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/X87Tables.cpp
+@@ -279,7 +279,7 @@ constexpr std::array<DispatchTableEntry, 140> X87F64OpTable = {{
+ 
+   // XXX: This should also set the x87 tag bits to empty
+   // We don't support this currently, so just pop the stack
+-  {OPD(0xDF, 0xC0), 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87ModifySTP, true>},
++  {OPD(0xDF, 0xC0), 8, &OpDispatchBuilder::X87FFREEP},
+   {OPD(0xDF, 0xC8), 8, &OpDispatchBuilder::FXCH},
+   {OPD(0xDF, 0xD0), 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FSTToStack>},
+   {OPD(0xDF, 0xD8), 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FSTToStack>},
+@@ -540,7 +540,7 @@ constexpr std::array<DispatchTableEntry, 140> X87F80OpTable = {{
+ 
+   // XXX: This should also set the x87 tag bits to empty
+   // We don't support this currently, so just pop the stack
+-  {OPD(0xDF, 0xC0), 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87ModifySTP, true>},
++  {OPD(0xDF, 0xC0), 8, &OpDispatchBuilder::X87FFREEP},
+   {OPD(0xDF, 0xC8), 8, &OpDispatchBuilder::FXCH},
+   {OPD(0xDF, 0xD0), 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FSTToStack>},
+   {OPD(0xDF, 0xD8), 8, &OpDispatchBuilder::Bind<&OpDispatchBuilder::FSTToStack>},
+-- 
+2.50.1
+

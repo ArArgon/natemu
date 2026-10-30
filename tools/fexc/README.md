@@ -26,10 +26,24 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as twenty-three commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as twenty-four commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series31` (October 30, I6b: series30 plus patch 0023
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series32` (October 30, I9: series31 plus patch 0024
+and shim changes. Patch 0024 (all under slice1): every MMX instruction sets TOP = 0 and the abridged tag byte FFH at its end,
+after its memory accesses (`FexcEndMMX`, called after each instruction's handler in Core.cpp), so a fault leaves both as they
+were, and every one does (FEX did it once per block); the MMX registers join the per-instruction register-cache flush (none
+cached across an instruction, which may be x87 code writing the same slot); PUNPCKLBW/WD/DQ mm, m32 load 4 bytes (FEX loaded 8);
+PDEP and PEXT are straight-line code (Hacker's Delight's expand and compress, log2(width) rounds: 102 and 83 instructions at
+64 bits; FEX's loops branched backwards); FFREEP ST(i) frees ST(i) and pops (FEX ran it as FINCSTP); and, for every form, before
+each IR node and before the block's tail at least 64 KiB must remain in the temporary code buffer, else the compile restarts with
+the doubled estimate (FEX's `NeedsLargerJITSpace`, raised before only by its guard-page signal handler, which fexc does not
+have: a block of many long lowerings died with SIGBUS). The host translates a block over 32 KiB again with half its
+instructions (I9 review). Shim: MOVBE m admitted (a register
+operand or F3 is a system cut the host decodes as #UD); MMX (`Mmx()`: every MMX-register form FEX supports but MASKMOVQ, gated
+by `--x87-gated` as `cut_gated: "mmx"`, the host's `MMX_GATED`: #UD under CR0.EM, else #NM); AES-NI and PCLMULQDQ, legacy
+(16-byte aligned m128) and VEX.128; PDEP/PEXT; FFREEP; ADCX/ADOX, WRSS/WRUSS and SHA (not advertised) system cuts the host
+decodes as #UD. Boot-features plan, Built (I9).) Previous: `series31` (October 30, I6b: series30 plus patch 0023
 and shim changes. Patch 0023: the x87 transcendental, remainder, scale and extract forms (F2XM1 FYL2X FPTAN FPATAN FXTRACT
 FPREM1 FPREM FYL2XP1 FSINCOS FSCALE FSIN FCOS) lower to one IR op `FexcX87Svc`, `movz w0, #<D9 second byte>; svc #5`, run whole
 by the resident on the guest-state page's x87 state; VPCMPISTRX/VPCMPESTRX (PCMPxSTRx, legacy and VEX.128) call

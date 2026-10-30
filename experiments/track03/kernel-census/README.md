@@ -91,6 +91,17 @@ into `natemu-raw/kernel-census-i6b-20261030-01/` (`x` linked to the C0 data). Ke
 (PCMPISTRI 401 -> 0), x87 59 -> 3 (FPATAN 22, FSCALE 9, FYL2XP1 8, F2XM1 5, FPREM 4, FYL2X 4, FXTRACT 3, FPREM1 1 -> 0; left:
 FFREEP 3), admitted +457; no VEX string compare occurs. Left in the SSE class: AES 4,367, SHA 1,297, ADCX 736, PCLMULQDQ 351,
 MOVBE 68, MMX 16.
+
+**I9 re-check (October 30).** `census.py` ports the I9 shim change (fexc series32: MOVBE m, MMX (`mmx_form`, a port of
+`FexcSlice1::Mmx`; EMMS; MASKMOVQ refused), AES-NI/PCLMULQDQ legacy and VEX.128, PDEP/PEXT, FFREEP admitted; MOVBE with a register
+operand or F3, 0f 38 f5/f6 (WRSS/WRUSS, ADCX/ADOX) and SHA filed `system`: the host's #UD, none advertised). Rerun into
+`natemu-raw/kernel-census-i9-20261030-01/` (`x` linked to the C0 data; report in its `report/`). Kernel: SSE 5 -> 0 (EMMS admitted,
+`wrussq` 4 #UD), admitted +1, system 16,799 -> 16,803. Initramfs: SSE 6,835 -> 0 (AES 4,367, PCLMULQDQ 351, MOVBE 68, MMX 16
+admitted; SHA 1,297 and ADCX 736 `system`), x87 3 -> 0 (FFREEP), AVX 229,216 -> 218,126 (VEX.128 AES/PCLMULQDQ 11,090 admitted;
+left: EVEX/AVX-512, VAES/VPCLMULQDQ at 256/512 bits, GFNI, VNNI: not advertised; 10 VEX gathers), other 2,282 -> 1,650 (ADOX 632
+`system`; left: 1,435 0x67 address-size forms, XOP 144, CET RDSSP/INCSSP 41, RTM 9, PadLock 4, a few others), admitted +15,895,
+system 5,601 -> 8,266. The census itself: the earlier "MMX 1,381" counted SHA (1,297) and MOVBE (68) under the MMX note (one
+classifier branch); the MMX forms proper were 16.
 Files here: `extract.py`, `census.py`, `report.py`, `results.md` (every table, generated), `forms-kernel.tsv` (every refused
 form of the decompressor and vmlinux, one row per mnemonic + operand shape, first-use order). The same for the
 initramfs is `RAW/forms-initrd.tsv`; `RAW/census.json` holds every row.

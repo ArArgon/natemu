@@ -680,8 +680,23 @@ impl Compiler {
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
     /// `rip` the resident executes, or fexc's end reason when it produced no code.
     fn compile(&mut self, bytes: &[u8], rip: u64, step: bool) -> Result<Code> {
+        // I9 review: a block whose code is over `MAX_BLOCK_BYTES` (PDEP/PEXT, PCMPxSTRx and other long lowerings in numbers)
+        // is translated again from the same RIP with half its instructions, until it fits; one instruction too large for a
+        // block stops `code_too_large`.
+        let mut limit = if step { Some(1) } else { self.max_instructions };
+        loop {
+            match self.compile_once(bytes, rip, limit)? {
+                Ok(code) => return Ok(code),
+                Err(n) if n > 1 => limit = Some(n / 2),
+                Err(_) => return Ok(Code::None("code_too_large".into())),
+            }
+        }
+    }
+    /// [`Compiler::compile`] with an instruction limit; `Err(n)`: the object's code is too large for a block (n guest
+    /// instructions translated).
+    fn compile_once(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>) -> Result<std::result::Result<Code, u32>> {
         let mut args = vec!["--profile".to_string(), "slice1".into(), "--rip".into(), format!("{rip:#x}")];
-        if let Some(n) = if step { Some(1) } else { self.max_instructions } {
+        if let Some(n) = limit {
             args.extend(["--max-insts".into(), n.to_string()]);
         }
         for feature in admission::feature_overrides(self.supported) {
@@ -758,17 +773,20 @@ impl Compiler {
         } else {
             self.hits += 1;
         }
-        match &self.cache[&body] {
-            Compiled::Object(object) => {
-                let mut admitted = admission::admit(object, rip, bytes, self.supported, self.shape)?;
-                if let Some(tamper) = self.tamper {
-                    tamper(&mut admitted.object);
+        Ok(match &self.cache[&body] {
+            Compiled::Object(object) => match admission::oversized(object) {
+                Some(n) => Err(n),
+                None => {
+                    let mut admitted = admission::admit(object, rip, bytes, self.supported, self.shape)?;
+                    if let Some(tamper) = self.tamper {
+                        tamper(&mut admitted.object);
+                    }
+                    Ok(Code::Block(admitted))
                 }
-                Ok(Code::Block(admitted))
-            }
+            },
             Compiled::System(s) => Ok(Code::System(*s)),
             Compiled::NoCode(reason) => Ok(Code::None(reason.clone())),
-        }
+        })
     }
 }
 /// `guest.end.reason` of fexc's report.

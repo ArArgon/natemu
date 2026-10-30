@@ -541,14 +541,14 @@ JNE = {'insn': {'op': 'jcc', 'cc': 'ne'}}
 def sse(op, keys): return dict(keys, insn={'op': op, 'sse': True})
 STRADDLE_FETCH = [
     ('0f', [], '{disp32} jne {next}', 0, JNE), ('0f85', [], '{disp32} jne {next}', 0, JNE), ('0f8500', [], '{disp32} jne {next}', 0, JNE),
-    ('0f', ['nop'], '{disp32} jne {next}', 0, JNE), ('0f3a', [], 'palignr mm0, mm1, 8', 1, sse('palignr', {})),
+    ('0f', ['nop'], '{disp32} jne {next}', 0, JNE), ('0f3a', [], 'palignr mm0, mm1, 8', 0, sse('palignr', SSSE3)),
     ('660f3a', [], 'palignr xmm0, xmm1, 8', 0, sse('palignr', SSSE3)), ('0f0f', [], 'pfadd mm0, mm1', 1, sse('pfadd', {})),
     ('0fc7', [], 'cmpxchg8b qword ptr [rbx]', 0, {}), ('660f', [], 'movdqa xmm0, xmm1', 0, sse('movdqa', SSE)),
     ('f30f', [], 'popcnt eax, ecx', 0, POPCNT), ('c4', [], 'andn eax, ecx, eax', 0, POPCNT), ('c4e2', [], 'andn eax, ecx, eax', 0, POPCNT),
     # I8: AVX forms, here without CR4.OSXSAVE (QEMU's qemu64: no AVX): #UD at the instruction once it is fetched.
     ('c4e27d', [], 'vbroadcastss ymm0, xmm0', 0, sse('vbroadcastss', {'expect': (6, 0, 0)})),
     ('c5', [], 'vzeroupper', 0, sse('vzeroupper', {'expect': (6, 0, 0)})), ('c5f8', [], 'vzeroupper', 0, sse('vzeroupper', {'expect': (6, 0, 0)})),
-    ('0fae', [], 'mfence', 0, sse('mfence', {})), ('0f38', [], 'movbe eax, dword ptr [rbx]', 1, sse('movbe', {})),
+    ('0fae', [], 'mfence', 0, sse('mfence', {})), ('0f38', [], 'movbe eax, dword ptr [rbx]', 0, sse('movbe', {'cpu': 'qemu64,+movbe'})),
     ('660f38', [], 'pshufb xmm0, xmm1', 0, sse('pshufb', SSSE3)), ('66', [], 'add ax, cx', 0, {}), ('48', [], 'add rax, rcx', 0, {}),
     ('8f', [], 'pop qword ptr [rbx]', 0, {}), ('e8', [], 'call {next}', 0, {}), ('66f30f', [], 'popcnt ax, cx', 0, POPCNT),
     ('f048', [], 'lock add qword ptr [rbx], rcx', 0, {}), ('3e488b', [], 'mov rax, qword ptr ds:[rbx]', 0, {}),

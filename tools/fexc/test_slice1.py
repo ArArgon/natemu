@@ -28,6 +28,9 @@ PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
 
 # name -> hex. Architecturally: privilege/descriptor/MSR/segment/interrupt/IO/TLB/cache/flag-control, or VM-owned values.
 SYSTEM = {
+    # I9: #UD the host decodes (MOVBE with a register operand; ADX, CET_SS and SHA not advertised)
+    'movbe rax,rcx (#UD)': '480f38f0c1', 'movbe cx,ax (#UD)': '660f38f1c1', 'adcx rax,rcx (#UD)': '66480f38f6c1', 'adox (#UD)': 'f3480f38f6c1',
+    'sha256rnds2 (#UD)': '0f38cbc1', 'sha1rnds4 (#UD)': '0f3accc101', 'wrussq (#UD)': '66480f38f508',
     'mov cr0,rax': '0f22c0', 'mov cr3,rax': '0f22d8', 'mov cr4,rax': '0f22e0', 'mov cr8,rax': '440f22c0',
     'mov rax,cr0': '0f20c0', 'mov rax,cr3': '0f20d8', 'mov rax,cr4': '0f20e0', 'mov dr7,rax': '0f23f8', 'mov rax,dr0': '0f21c0',
     'lgdt [rax]': '0f0110', 'lidt [rax]': '0f0118', 'sgdt [rax]': '0f0100', 'ltr ax': '0f00d8', 'lldt ax': '0f00d0',
@@ -63,20 +66,20 @@ UNSUPPORTED = {
     'fs addr32 mov rax,[eax]': '6467488b00',
     # Intel's class since series27; still cut: SS with CS/DS/ES (mixed classes), SS on a moffs operand
     'ss ds mov rax,[rbx] (mixed)': '363e488b03', 'ss movabs rax,[moffs]': '3648a10102030405060708',
-    'paddd mm (MMX, I6)': '0ffec1', 'maskmovdqu': '660ff7c1', 'f3 66 movss': 'f3660f10c1',
-    'insertps m32 zeroing its element': '660f3a21000f', 'aesenc': '660f38dcc1',
+    'maskmovq (I9: a masked store)': '0ff7c1', 'psllq mm /3 (#UD, refused)': '0f73d801', 'pi2fd (3DNow!)': '0f0fc10d', 'maskmovdqu': '660ff7c1', 'f3 66 movss': 'f3660f10c1',
+    'insertps m32 zeroing its element': '660f3a21000f',
     # I8: AVX forms FEX cannot do exactly, VEX encodings x86 makes #UD (refused, not delivered), unadvertised VEX forms
     'vpgatherdd': 'c4e26d90040f', 'vmaskmovps ld': 'c4e2752c00', 'vmaskmovps st': 'c4e2752e08', 'vmaskmovdqu': 'c5f9f7ca',
-'vcvtps2ph m': 'c4e37d1d3004', 'vaesenc': 'c4e271dcc2', 'vpcmpistri L=1 (#UD)': 'c4e37d63c112',
+'vcvtps2ph m': 'c4e37d1d3004', 'vaesenc L=1 (VAES)': 'c4e275dcc2', 'vpclmulqdq L=1': 'c4e37544c200', 'vpcmpistri L=1 (#UD)': 'c4e37d63c112',
     'vmovd L=1 (#UD)': 'c5fd6ec6', 'vaddss L=1 (LIG)': 'c5f658c2', 'vpermq L=0 (#UD)': 'c4e3f900c11b', 'vpermq W0 (#UD)': 'c4e37d00c11b',
     'vmovaps vvvv (#UD)': 'c5f428c1', 'vpdpbusd (VNNI)': 'c4e27950e1', 'addr32 vmovdqu': '67c5fe6f00',
     'vinsertps m32 zeroing its element': 'c4e37921001f',
     'o16 pushf': '669c', 'o16 leave': '66c9', 'enter level 1': 'c8080001', 'o16 shld': '660fa4c101', 'o16 shrd cl': '660fadc1',
     'prefetchw': '0f0d08', 'prefetch /4 (reserved nop)': '0f1820', 'prefetch reg (reserved nop)': '0f18c0', 'movnti reg': '0fc3c1',
-    'pdep': 'c4e2fbf5c1', 'pext': 'c4e2faf5c1', 'andn L=1': 'c4e27cf2c1', 'blsr /0 (#UD)': 'c4e278f3c1',
+    'andn L=1': 'c4e27cf2c1', 'blsr /0 (#UD)': 'c4e278f3c1',
     'rep popcnt-like f2 0f b8': 'f20fb8c1',
     'loop 67-prefix': '67e2fe', 'jecxz': '67e3fe', 'loop o16': '66e2fe', 
-    'xlat': 'd7', 'movbe': '0f38f000', 'sal /6 alias': 'd1f0',
+    'xlat': 'd7', 'f3 movbe (undefined)': 'f30f38f000', 'sal /6 alias': 'd1f0',
     'bnd ret': 'f2c3', 'o16 ret': '66c3', 'o16 jmp': '66e9fbffffff', 'bswap r9w (undefined)': '66410fc9', 'bswap ax': '660fc8',
     # FEX branches around the whole access for a zero count (static or dynamic), losing a guest #PF
     'rcl dword [rax],1': 'd110', 'rcr qword [rax],cl': '48d318', 'rcr qword [rax],0': '48c11800', 'rcl byte [rax],cl': 'd210',
@@ -98,6 +101,15 @@ VEX_UD = {'rex andn': '48c4e278f2c1', 'o16 andn': '66c4e278f2c1', 'o16 vzerouppe
           'f2 vpbroadcastb': 'f2c4e27d78ff'}
 
 ALLOWED = {
+    # I9: MOVBE m, MMX, AES-NI/PCLMULQDQ (legacy and VEX.128), PDEP/PEXT, FFREEP
+    'movbe eax,[rax]': '0f38f000', 'movbe [rax],rcx': '480f38f108', 'movbe ax,[rax]': '660f38f000', 'paddd mm0,mm1': '0ffec1',
+    'paddb mm0,[rax]': '0ffc00', 'punpcklbw mm1,[rax]': '0f6008', 'movq mm0,rax': '480f6ec0', 'movd [rax],mm1': '0f7e08', 'emms': '0f77',
+    'pshufw mm1,mm2,0x1b': '0f70ca1b', 'pinsrw mm1,[rax],1': '0fc40801', 'pextrw eax,mm1,2': '0fc5c102', 'psllq mm3,7': '0f73f307',
+    'movntq [rax],mm1': '0fe708', 'pshufb mm0,mm1': '0f3800c1', 'palignr mm0,[rax],3': '0f3a0f0003', 'cvtpi2ps xmm1,mm2': '0f2aca',
+    'cvtpd2pi mm1,[rax]': '660f2d08', 'movq2dq xmm1,mm2': 'f30fd6ca', 'movdq2q mm1,xmm2': 'f20fd6ca',
+    'aesenc xmm1,xmm2': '660f38dcca', 'aesdeclast xmm1,[rax]': '660f38df08', 'aesimc': '660f38dbca', 'aeskeygenassist': '660f3adfca07',
+    'pclmulqdq': '660f3a44ca11', 'vaesenc': 'c4e271dcc2', 'vaesimc': 'c4e279dbca', 'vpclmulqdq': 'c4e37144c201',
+    'vaeskeygenassist': 'c4e379dfca07', 'pdep': 'c4e2fbf5c1', 'pext': 'c4e2faf5c1', 'pext ecx,edx,[rax]': 'c4e26af508', 'ffreep st1': 'dfc1',
     # I6b: the resident's helper forms (`svc #X87`, `svc #STRING`)
     'pcmpistri xmm0,[rax],0x12': '660f3a630012', 'rex.w pcmpestri': '66480f3a61c14c', 'pcmpestrm xmm1,xmm2,0x40': '660f3a60ca40',
     'vpcmpistrm xmm1,[rax+1],0': 'c4e37962480100', 'vex.w1 vpcmpestri': 'c4e3f961ca01', 'fsin': 'd9fe', 'fcos': 'd9ff', 'fsincos': 'd9fb',

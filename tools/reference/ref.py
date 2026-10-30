@@ -177,7 +177,7 @@ def norm(p):
     if any(bases) and '+fsgsbase' not in cpu: cpu += ',+fsgsbase'
     require(re.fullmatch(r'qemu64(,\+[a-z0-9_]+)*', cpu) is not None, f'cpu {cpu!r}: qemu64 plus +feature flags only')
     return dict(name=p.get('name', ''), code=code, rip=rip, gpr=gpr, rflags=rflags, regions=regions, insns=p.get('insns'), prefix=prefix,
-                flow=flow, offsets=offsets, faults=faults, cpu=cpu, bases=bases)
+                flow=flow, offsets=offsets, faults=faults, cpu=cpu, bases=bases, unannotated=bool(p.get('unannotated')))
 
 
 def build_elf(p):
@@ -337,6 +337,9 @@ def check_annotations(p, log):
     """Cross-check the annotations (mnemonic, operand width, shift count) against QEMU's disassembly of the executed bytes."""
     insns, raw = disasm(log, p['rip'], len(p['code']))
     require(raw == p['code'], 'QEMU did not translate exactly the supplied code bytes')
+    # I9 review: a straight run longer than QEMU's in_asm log disassembles cleanly (it garbles an instruction crossing 1 KiB
+    # of a translation block, gen_i6): the bytes are checked, the per-instruction annotations are not.
+    if p['unannotated']: return [t for _, _, t in insns]
     if p['prefix'] is not None: p['insns'] = p['insns'][:len(insns)]     # the annotations of what ran
     require(len(insns) == len(p['insns']), f'{len(insns)} instructions executed, {len(p["insns"])} annotated')
     prev = ''

@@ -53,7 +53,18 @@ GPR = {'RAX': 0, 'RCX': 1, 'RDX': 2, 'RBX': 3, 'RSP': 4, 'RBP': 5, 'RSI': 6, 'RD
 # returns through IRETQ/far JMP without descriptor checks and answers SGDT with a fixed GDTR. natemu executes these
 # instructions architecturally (plan S2b) against the driver's start-up descriptor tables (GDTR base 0, limit FFFFH), so the
 # selectors fault or SGDT reads other values: counted unsupported with this reason.
-NOT_ADVERTISED = {'rdpid', 'rdseed', 'clflushopt', 'clzero', 'clwb', 'serialize', 'rdpkru', 'wrpkru', 'monitorx', 'mwaitx', 'rdpru'}
+NOT_ADVERTISED = {'rdpid', 'rdseed', 'clflushopt', 'clzero', 'clwb', 'serialize', 'rdpkru', 'wrpkru', 'monitorx', 'mwaitx', 'rdpru',
+                  # I9: ADX and SHA (CPUID.7.0:EBX bits 19, 29 = 0)
+                  'adcx', 'adox', 'sha1msg1', 'sha1msg2', 'sha1nexte', 'sha1rnds4', 'sha256msg1', 'sha256msg2', 'sha256rnds2'}
+# I9: tests whose expectation needs the 80-bit aliasing of MMX and x87 registers (an MMX write's bits 79:64 = FFFFH, an MMX read
+# of an x87 register's 64-bit significand, FNSAVE tags of MMX values), which natemu does not build: MMn is the slot's low 64 bits
+# and the reduced-precision x87 value is a double there (plan I9, MMX deviations); their MMX-only results match.
+MMX_X87_ALIASING = {
+    'X87/X87MMXInteraction.asm': "expects 80-bit MMX/x87 aliasing (bits 79:64 FFFFH after an MMX write, FNSAVE's tags of MMX values; "
+                                 "plan I9 deviation) and FEX's tag word for zeros",
+    'FEX_bugs/mmx_x87_register_conflating.asm': "x87 values from FLD m80 of random 80-bit data beyond the double's range through "
+                                                "XSAVE/XRSTOR between MMX phases (I6 deviation 2; the MMX results match)",
+}
 # Tests whose expectation is FEX's own x87 behaviour where it is not x86's (the test says so): natemu gives the SDM's.
 FEX_EXPECTS_ITS_BUG = {'X87/FXAM_Simple.asm': "expects FEX's FXAM of +0 (its comment: 'should be 0x4000 for zero, but there's no "
                                               "support'); natemu gives the SDM's 4000H (patch 0019)",
@@ -146,6 +157,16 @@ def x87_value_ok(got, want, name):
     if wse & 0x7fff == 0x7fff and wm << 1 & (2**64 - 1):              # a NaN: sign, quiet bit, top 51 significand bits
         return gse == wse and gm >> 11 == wm >> 11
     if any(rounded80(wm, wse, 53, rc) == (gm, gse) for rc in range(4)): return True
+    if wse & 0x7fff not in (0, 0x7fff) and not wm >> 63:             # an unnormal: FLD m80 loads the indefinite (deviation 2)
+        return (gm, gse) == (0xc000000000000000, 0xffff)
+    e = (wse & 0x7fff) - 16383
+    if wse & 0x7fff not in (0, 0x7fff) and not -1075 <= e <= 1023:   # beyond the double's range: FLD m80 rounds it to a double
+        sign = wse & 0x8000                                            # by some RC (deviation 2): an infinity, the largest finite,
+        big = [(1 << 63, sign | 0x7fff), (0xfffffffffffff800, sign | 0x43fe)]   # a zero or the smallest denormal
+        small = [(0, sign), (1 << 63, sign | 0x3bcd)]
+        return (gm, gse) in (big if e > 0 else small)
+    if wse & 0x7fff not in (0, 0x7fff) and e < -1022:                 # a double denormal: fewer significand bits
+        return any(rounded80(wm, wse, 53 - (-1022 - e), rc) == (gm, gse) for rc in range(4))
     if name in HELPER_REMAINDERS: return remainder_ok((gm, gse), name)
     if name in HELPER_PRECISION:
         return gse == wse and gm >> 63 and wm >> 63 and abs(gm - wm) <= HELPER_PRECISION[name] << 11
@@ -256,7 +277,7 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
                 # X1a: INT3/INT n/INTO/UD0-2 are delivered through the driver's logging IDT; these tests expect Linux's
                 # signal for them (before X1a: no code, `system_instruction`).
                 return {**rec, 'outcome': 'unsupported', 'reason': f"software interrupt or #UD instruction delivered (vector {int(s['fault'][0], 0)}): {rec.get('at', '?')}"}
-            if vector == 6 and rec.get('at') in NOT_ADVERTISED:
+            if vector == 6 and (rec.get('at') or '').split()[-1:] and (rec.get('at') or '').split()[-1] in NOT_ADVERTISED:
                 # S3: #UD for an instruction the presented CPU (tools/models/cpu_profile.json) does not advertise, as the SDM
                 # gives; FEX's tests assume its host's features.
                 return {**rec, 'outcome': 'unsupported', 'reason': f"#UD: {rec['at']} not advertised by the CPU profile"}
@@ -285,11 +306,15 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
                     if len(vals) > 2 and xmm[2 * n:2 * n + 2] == vals[:2]:
                         diffs.append(d)
                         continue
-                    g80, w80 = image80(xmm[2 * n:2 * n + 2]), image80(vals[:2])
+                    # (the image we stored may be a zero: an 80-bit value below the double's range, deviation 2)
+                    g80, w80 = xmm[2 * n:2 * n + 2] if xmm[2 * n + 1] <= 0xffff else None, image80(vals[:2])
                     (soft if x87 and not reduced and g80 and w80 and x87_value_ok(g80, w80, name) else diffs).append(d)
                 continue
             elif re.fullmatch(r'MM[0-7]', k):   # I6: x87 register n (physical), 80-bit, or a double under reduced precision
                 g = mm[int(k[2])]
+                if len(vals) == 1:   # I9: an MMX register's 64-bit value: the slot's raw low half (FEX's MMn), exactly
+                    if g != vals[0]: diffs.append(f'{k}: got {g:#x}, want {vals[0]:#x}')
+                    continue
                 got2 = [g, 0] if reduced else list(f80(g))
                 if got2 != vals[:2]:
                     d = f'{k}: got {got2[0]:#x} {got2[1]:#x}, want {vals[0]:#x} {vals[1]:#x}'
@@ -297,6 +322,8 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
                 continue
             else: continue
             if got != vals[0]: diffs.append(f'{k}: got {got:#x}, want {vals[0]:#x}')
+        if (diffs or soft) and name in MMX_X87_ALIASING:
+            return {**rec, 'outcome': 'unsupported', 'reason': MMX_X87_ALIASING[name], 'detail': '; '.join(diffs + soft)}
         if (diffs or soft) and name in FEX_EXPECTS_ITS_BUG:
             return {**rec, 'outcome': 'unsupported', 'reason': FEX_EXPECTS_ITS_BUG[name], 'detail': '; '.join(diffs + soft)}
         if diffs: return {**rec, 'outcome': 'fail', 'reason': 'registers differ', 'detail': '; '.join(diffs + soft), 'stats': s['stats']}
@@ -354,8 +381,11 @@ SELFTEST = {   # synthetic tests: (source, expected outcome, reason prefix)
     'hole_nan_payload.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0xc000000000100000","0x7fff"]}}\n%endif\nfld qword [rel v]\nhlt\nv: dq 0x7ff8000000000001\n', 'fail', 'registers differ'),
     'hole_denormal_want.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0x1","0x0"]}}\n%endif\nfldz\nhlt\n', 'fail', 'registers differ'),
     'nan_ok.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0xc000000000000a00","0x7fff"]}}\n%endif\nfld qword [rel v]\nhlt\nv: dq 0x7ff8000000000001\n', 'precision deviation', '80-bit'),
+    # I9: an 80-bit value beyond the double's range loads as the infinity (deviation 2), but 1.0 never matches it.
+    'range_ok.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0x8000000000000000","0x478f"]}}\n%endif\nfld tword [rel v]\nhlt\nv: dq 0x8000000000000000\ndw 0x478f\n', 'precision deviation', '80-bit'),
+    'hole_range.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0x8000000000000000","0x478f"]}}\n%endif\nfld1\nhlt\n', 'fail', 'registers differ'),
     'mm_far.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0x8000000000000000","0x4000"]}}\n%endif\nfld1\nhlt\n', 'fail', 'registers differ'),
-    'vector_insn.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0"}}\n%endif\nxor eax,eax\npaddd mm0, mm1\nhlt\n', 'unsupported', 'unsupported_form'),
+    'vector_insn.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0"}}\n%endif\nxor eax,eax\nmaskmovq mm0, mm1\nhlt\n', 'unsupported', 'unsupported_form'),
     'xmm.asm': ('%ifdef CONFIG\n{"RegData":{"XMM0":["0x1","0x0"],"XMM1":["0x0","0x0","0x0","0x0"]}}\n%endif\nmov eax, 1\nmovd xmm0, eax\nhlt\n', 'pass', ''),
     'xmm_wrong.asm': ('%ifdef CONFIG\n{"RegData":{"XMM0":["0x2","0x0"]}}\n%endif\nmov eax, 1\nmovd xmm0, eax\nhlt\n', 'fail', 'registers differ'),
     'bits32.asm': ('%ifdef CONFIG\n{"Mode":"32BIT","RegData":{"RAX":"0"}}\n%endif\nhlt\n', 'unsupported', '32-bit'),

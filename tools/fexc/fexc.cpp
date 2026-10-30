@@ -335,7 +335,8 @@ static std::string CutDetail() {
 static void CutJson(Json& j) {
   j.obj("end").kv("rip", Hex64(fexc_cut.rip)).kv("reason", CutReasonName()).kv("detail", CutDetail());
   if (fexc_cut.reason != FEXC_CUT_DECODER && fexc_cut.reason != FEXC_CUT_STRING) j.kv("cut_opcode_map", int(fexc_cut.map)).kv("cut_opcode", int(fexc_cut.opcode)).kv("cut_fex_name", fexc_cut.name);
-  if (fexc_cut.gated) j.kv("cut_gated", true);
+  if (fexc_cut.gated_mmx) j.kv("cut_gated", "mmx");
+  else if (fexc_cut.gated) j.kv("cut_gated", true);
   j.end_obj();
 }
 

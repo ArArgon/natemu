@@ -95,6 +95,14 @@ pub(crate) fn feature_overrides(supported: u64) -> Vec<String> {
         .collect()
 }
 
+/// I9 review: the guest instructions of an object whose code is over [`MAX_BLOCK_BYTES`] (the host translates the RIP again
+/// with fewer), or `None` (including an object too short to hold a header: [`admit`] refuses it).
+pub(crate) fn oversized(bytes: &[u8]) -> Option<u32> {
+    (bytes.len() >= std::mem::size_of::<Header>())
+        .then(|| record::<Header>(bytes, 0))
+        .filter(|h| h.code_size as usize > MAX_BLOCK_BYTES)
+        .map(|h| h.guest_insns)
+}
 fn record<T: Copy>(bytes: &[u8], offset: usize) -> T {
     assert!(offset + size_of::<T>() <= bytes.len());
     unsafe { std::ptr::read_unaligned(bytes.as_ptr().add(offset).cast()) }
