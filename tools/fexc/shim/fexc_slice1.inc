@@ -94,9 +94,16 @@ inline Verdict Two(uint8_t op, bool plain, bool has_modrm, uint8_t mod, uint8_t 
   case 0xAE:
     if (has_modrm && mod != 3 && reg == 7) return Sys("clflush/clflushopt (cache maintenance)");
     if (has_modrm && mod == 3 && reg < 4) return Sys("rd/wr fs/gs base");
-    return Uns("fxsave/xsave, ldmxcsr/stmxcsr, a fence with another ModRM");
+    // I5b: fxsave/fxrstor and xsave/xrstor m (the resident's transactions); /6 m is xsaveopt, (66) clwb or (F3) clrssbsy,
+    // none advertised (#UD). With F3, /4 m is ptwrite (not advertised either), which the host does not decode (a stop).
+    if (has_modrm && mod != 3 && (reg <= 1 || (reg >= 4 && reg <= 6)))
+      return Sys("fxsave/fxrstor/xsave/xrstor m, xsaveopt/clwb/clrssbsy m (#UD), or (F3 /4) ptwrite (not decoded)");
+    return Uns("ldmxcsr/stmxcsr with a prefix, a fence with another ModRM");
   // rdrand (/6), rdseed and rdpid (/7, F3): the entropy service and TSC_AUX are the resident's (S3).
-  case 0xC7: if (has_modrm && mod == 3 && reg >= 6) return Sys("rdrand/rdseed/rdpid"); break;
+  case 0xC7:
+    if (has_modrm && mod == 3 && reg >= 6) return Sys("rdrand/rdseed/rdpid");
+    if (has_modrm && mod != 3 && reg >= 3 && reg <= 5) return Sys("xrstors/xsavec/xsaves (not advertised: #UD)");
+    break;
   default: break;
   }
   if (!plain) return Uns("mandatory-prefix (F3/F2/66) overlay opcode");
@@ -381,18 +388,19 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   // Segment prefixes in 64-bit mode (I7). FS/GS: FEX adds fs_cached/gs_cached (guest-state page loads) to the effective
   // address of the explicit memory operand, as x86 adds FS.base/GS.base; never to the implicit stack accesses of push/
   // pop/call/ret/enter/leave/pushf (SS, which no prefix overrides). CS/DS/ES/SS: base 0 in 64-bit mode, and FEX's decoder
-  // drops them (they never set FLAG_SEGMENTS there), so they are admitted as no-ops when they name the operand's default
-  // segment (SS for an RSP/RBP base, else DS; CS and ES behave as DS: #GP(0) for a non-canonical address) or the
-  // instruction has no explicit memory operand. Refused, where vendors differ and the SDM gives no rule:
+  // drops them (they never set FLAG_SEGMENTS there), so they only choose the exception for a non-canonical address. The
+  // presented CPU is GenuineIntel, so Intel's rule (SDM Vol. 3A §4.5.1; Vol. 1 §3.3.7.1): #SS(0) only for a reference
+  // that uses SS, implicitly (an RSP/RBP base, no override) or explicitly (an SS prefix, whatever the base); CS/DS/ES
+  // name a DS-class reference, #GP(0) even on an RSP/RBP base. fexc's JoinSites gives the explicit ModRM operand's sites
+  // that class from these bytes (Linux's SMP alternatives turn LOCK into DS on one CPU: `ds btr [rbp+...]`). Refused:
   //   - several segment prefixes with an FS/GS one (Vol. 2 §2.1.1 gives no rule for two prefixes of one group; FEX keeps
-  //     the last FS/GS prefix and drops CS/DS/ES/SS, QEMU lets the last segment prefix win, a null one included);
-  //   - SS naming an operand whose default is DS, or CS/DS/ES one whose default is SS (#SS(0) versus #GP(0) for a
-  //     non-canonical address: AMD APM Vol. 3 §1.2.4 makes CS/DS/ES/SS null prefixes in 64-bit mode, so the default
-  //     segment decides, while Intel SDM Vol. 1 §3.3.7.1 suggests #SS for an SS override);
+  //     the last FS/GS prefix and drops CS/DS/ES/SS, QEMU lets the last segment prefix win, a null one included), and SS
+  //     with CS/DS/ES (mixed classes, the same);
+  //   - SS on a moffs or string source operand (JoinSites classes only an explicit ModRM operand);
   //   - FS/GS on an instruction with no explicit memory operand (nothing to override).
   // String instructions: ES:RDI takes no override (SDM Vol. 2 MOVS/STOS/CMPS/SCAS); the DS:RSI source of movs/cmps/lods
-  // takes FS/GS and the DS-default rules above (RSI is no stack base); stos/scas have no overridable operand, so FS/GS
-  // there (which hardware ignores) is refused by policy.
+  // takes FS/GS and CS/DS/ES (DS-class either way); stos/scas have no overridable operand, so FS/GS there (which hardware
+  // ignores) is refused by policy.
   {
     const uint32_t seg = f & DecodeFlags::FLAG_SEGMENTS;
     const bool fsgs = seg == DecodeFlags::FLAG_FS_PREFIX || seg == DecodeFlags::FLAG_GS_PREFIX;
@@ -409,19 +417,8 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
     }
     if (fsgs && !memory) return Uns("FS/GS override on an instruction without a memory operand");
     if (fsgs && ss + data + high != 1) return Uns("FS/GS override with another segment prefix (no SDM rule for several)");
-    if (!fsgs && memory && ss + data) {
-      int base = source ? int(FEXCore::X86State::REG_RSI) : -1;
-      for (const auto* o : {&d.Dest, &d.Src[0], &d.Src[1], &d.Src[2]}) {
-        if (source) break;
-        if (o->IsGPRDirect()) base = o->Data.GPR.GPR;
-        else if (o->IsGPRIndirect()) base = o->Data.GPRIndirect.GPR;
-        else if (o->IsSIB()) base = o->Data.SIB.Base;
-        else if (!o->IsRIPRelative()) continue;
-        break;
-      }
-      const bool stack = base == FEXCore::X86State::REG_RSP || base == FEXCore::X86State::REG_RBP;
-      if ((ss && !stack) || (data && stack)) return Uns("CS/DS/ES/SS override naming another segment than the operand's default (#GP versus #SS)");
-    }
+    if (memory && ss && data) return Uns("SS with a CS/DS/ES prefix (mixed segment prefixes)");
+    if (ss && memory && !(has_modrm && mod != 3)) return Uns("SS override on a moffs or string source operand");
   }
   if (f & DecodeFlags::FLAG_ADDRESS_SIZE) return Uns("address-size override");
   if (v.branch && (f & DecodeFlags::FLAG_OPERAND_SIZE)) return Uns("operand-size prefix on a branch");

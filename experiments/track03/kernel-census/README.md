@@ -64,6 +64,15 @@ unadvertised or VMX/SVM/SGX/TDX-only forms (`clac` 190, `stac` 106, `vmmcall` 51
 12, `monitor`/`mwait`(`x`) 19, `serialize` 7, `rmpadjust`, `pvalidate`, `psmash`, `rmpupdate`, `tdcall`, `lkgs`, `invpcid`,
 `rdseedq`, `clflushopt`).
 
+**I5b re-check (October 29).** `census.py` ports the I5b shim change (fexc series26-i5b: `0f ae /0 /1 /4 /5 /6` and `0f c7
+/3 /4 /5` with a memory operand are system cuts). Rerun into `natemu-raw/kernel-census-i5b-20261029-01/` (`x` linked to the C0
+data; report in its `report/`). Kernel (decompressor + vmlinux): x87 10 -> 0 (`fxsave64` 4, `fxsave` 1, `fxrstor64` 5), other
+28 -> 1 (`xrstor64` 8, `xsave64` 3, `xrstors64` 8, `xsaves64` 3, `xsavec64` 2, `xsaveopt64` 2, `clwb` 1), system 16,762 ->
+16,799; initramfs: x87 65 -> 59 (`fxsave` 3, `fxrstor` 3), other 2,294 -> 2,282 (`xrstor` 6, `xsave` 3, `xsavec` 3), system
+5,511 -> 5,529. The resident executes FXSAVE/FXRSTOR, XSAVE/XRSTOR and XGETBV/XSETBV (kernel `xgetbv` 5, `xsetbv` 2,
+initramfs `xgetbv` 9, already `system`); XSAVEOPT, XSAVEC, XSAVES, XRSTORS and CLWB are #UD (not advertised: the kernel's
+alternatives select them only when CPUID says so).
+
 Files here: `extract.py`, `census.py`, `report.py`, `results.md` (every table, generated), `forms-kernel.tsv` (every refused
 form of the decompressor and vmlinux, one row per mnemonic + operand shape, first-use order). The same for the
 initramfs is `RAW/forms-initrd.tsv`; `RAW/census.json` holds every row.

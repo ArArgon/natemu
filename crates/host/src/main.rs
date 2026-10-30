@@ -13,6 +13,7 @@ mod json;
 mod memory;
 mod owners;
 mod system;
+mod uart;
 mod vm;
 
 type Result<T> = std::result::Result<T, String>;

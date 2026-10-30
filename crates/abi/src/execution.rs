@@ -90,6 +90,20 @@ pub const MAX_GUEST_RAM_BYTES: usize = 3 << 30;
 /// Guest-physical pages the per-page structures cover (only the VM's first R / 4096 are used).
 pub const MAX_GUEST_PAGES: usize = MAX_GUEST_RAM_BYTES / 4096;
 pub const RAM_TABLES_OFFSET: usize = 0x25000;
+/// The PC's legacy hole (VGA memory and option/system ROM on a PC) is not RAM (owner decision, October 29: unassigned
+/// ports and addresses behave as on a PC): an access goes the device path (unassigned until a device claims it: a read
+/// then shadows the page read-only onto the shared all-ones page, `crate::ALL_ONES_IPA`, never onto its RAM alias), a
+/// fetch from it is not RAM. Its alias and per-page slots exist but are never used. Everything else
+/// below 16 MiB that the boot map reserves (loader tables, the NVS ranges) is RAM, as on a PC.
+pub const LEGACY_HOLE: core::ops::Range<u64> = 0xa_0000..0x10_0000;
+/// Guest RAM `[0, bytes)` less [`LEGACY_HOLE`], aliased from `va` (host or resident).
+///
+/// # Safety
+/// As `GuestRam::new`: `[va, va + bytes)` backs `[0, bytes)` while the value is used; `bytes` >= 1 MiB.
+pub const unsafe fn guest_ram(bytes: u64, va: u64) -> crate::guest_memory::GuestRam {
+    let (start, end) = (LEGACY_HOLE.start, LEGACY_HOLE.end);
+    unsafe { crate::guest_memory::GuestRam::new(0, start, va).and(end, bytes - end, va + end) }
+}
 /// The private window: the first GiB's areas ([`cache`]), then the guest-RAM alias.
 pub const PRIVATE_BYTES: u64 = (1 << 30) + MAX_GUEST_RAM_BYTES as u64;
 const _: () = assert!(MAX_GUEST_RAM_BYTES % (2 << 20) == 0 && MAX_GUEST_PAGES % 64 == 0);
@@ -401,6 +415,11 @@ pub mod frame {
     pub const X87_FCW: u32 = 0x4b0;
     pub const X87_FTW: u32 = 0x4b2;
     pub const X87_EXCEPTIONS: u32 = 0x4b4;
+    /// The upper 128 bits of YMM0..YMM15 (I5b; XSAVE state component 2, YMM_Hi128): FEX's `avx_high[16][2]`, where FEX keeps
+    /// them without SVE256, two little-endian quadwords per register. Only XRSTOR (load or init) writes them and XSAVE reads
+    /// them while no AVX form is admitted; I8 admits generated code's accesses (adding the range to [`GUEST_STATE`] and
+    /// [`GUEST_STATE_WRITABLE`]). Zero at reset with the rest of the page.
+    pub const AVX_HIGH: u32 = 0xc0;
     /// Guest-state fields `(offset, bytes)` admitted code may read through x28: the segment bases, the RFLAGS bytes
     /// above and the x87 state (I6). MXCSR is the bank's; AVX state awaits its chunk. Every other x28 access is refused.
     pub const GUEST_STATE: [(u32, u32); 12] = [
@@ -548,6 +567,9 @@ pub struct Cpu {
     /// ([`frame::X87_FCW`]) at every block entry; FLDCW, FNINIT, FLDENV and FRSTOR are the resident's transactions. Every
     /// exception mask stays set (an FCW that clears one is refused). The rest of the x87 state lives in the page.
     pub fcw: u64,
+    /// XCR0 (I5b; SDM Vol.1 13.3): written by XSETBV (one of the profile's [`crate::cpu_profile::XCR0_VALID`]), read by XGETBV and
+    /// CPUID.0DH.0:EBX, and the requested-feature bitmap's mask for XSAVE/XRSTOR. Reset 1 (x87 only).
+    pub xcr0: u64,
 }
 /// The first native vector register of XMM0 (FEX's x64 `SRAFPR`: XMM0..XMM15 in v16..v31).
 pub const XMM_VREG: usize = 16;
@@ -672,6 +694,8 @@ pub const CR4_PCE: u64 = 1 << 8;
 /// SSE enabled (FXSAVE/FXRSTOR save XMM, SSE forms run; else #UD) and unmasked SIMD exceptions as #XM (else #UD).
 pub const CR4_OSFXSR: u64 = 1 << 9;
 pub const CR4_OSXMMEXCPT: u64 = 1 << 10;
+/// CR4.OSXSAVE (I5b): XSAVE/XRSTOR, XGETBV and XSETBV are #UD without it; CPUID.1:ECX.OSXSAVE reads it.
+pub const CR4_OSXSAVE: u64 = 1 << 18;
 /// DR6 and DR7 in 64-bit mode (SDM Vol.3 17.2.3, 17.2.4; no RTM or bus-lock detection in the profile): bits 63:32
 /// reserved (#GP on a write of 1); DR6 writable B0..B3, BD, BS, BT, the rest fixed (1 in 31:16 and 11:4, 0 in 12); DR7
 /// writable L0..G3, LE, GE, GD and the R/W, LEN fields, bit 10 fixed 1, bits 11, 12, 14, 15 fixed 0.
@@ -796,6 +820,16 @@ pub const REPLY_DEVICE: u64 = 0x30;
 /// [`REPLY_ENTROPY`].
 pub const REQUEST_ENTROPY: u64 = 0x31;
 pub const REPLY_ENTROPY: u64 = 0x31;
+/// L3: one I/O port access described by the [`Mmio`] record (`gpa` holds the port, 0..=0xffff); the host performs it on
+/// its port bus (devices, or the unassigned-port rule) and answers [`REPLY_PORT`] with the record's reply half.
+pub const REQUEST_PORT: u64 = 0x32;
+pub const REPLY_PORT: u64 = 0x32;
+/// L3 (amendment): a read touched the guest-physical page `Mmio::gpa` that is not RAM and that no resident device claims:
+/// the host answers [`REPLY_PAGE`] with `Mmio::status` [`mmio::DONE`] (unassigned: the resident shadows it read-only onto
+/// the shared all-ones page, `crate::ALL_ONES_IPA`; the host counts the fill), [`mmio::CLAIMED`] (a device's: the device
+/// path) or [`mmio::UNASSIGNED`] (unassigned under the strict switch: refused).
+pub const REQUEST_PAGE: u64 = 0x33;
+pub const REPLY_PAGE: u64 = 0x33;
 
 /// A request's instruction fetch, walked by the resident (`State::fetch_fault`): why the walk of the last page it walked
 /// failed — kind, then the #PF address and error code for [`fetch::PAGE`].
@@ -853,8 +887,13 @@ pub struct System {
     /// Operand size in bytes where the form has one: a register written by MOV r, Sreg / SLDT / STR (2: its low 16 bits;
     /// 4, 8: the selector zero-extended), the offset of a far pointer and the width of RET far / IRET pops (4 or 8).
     pub size: u32,
-    /// An FS or GS segment override on the memory operand ([`SREG_FS`], [`SREG_GS`]: its base is added), else 0.
-    pub fs_gs: u32,
+    /// A segment override on the memory operand: [`SREG_FS`], [`SREG_GS`] (its base is added); [`SREG_SS`] (an SS prefix)
+    /// or [`SREG_DS`] (CS, DS or ES), which add nothing in 64-bit mode but make the reference SS- or DS-class for a
+    /// non-canonical address (#SS(0) or #GP(0), Intel SDM Vol. 3A 4.5.1); else 0 (the operand's default: SS for an RSP or
+    /// RBP base).
+    pub segment: u32,
+    /// L3, INS/OUTS: [`system::REP`] (an F3 prefix) and [`system::ADDRESS32`] (a 0x67 prefix: ESI/EDI and ECX); else 0.
+    pub prefixes: u32,
 }
 pub mod system {
     /// CR `cr` := GPR `reg`; GPR `reg` := CR `cr`.
@@ -963,9 +1002,29 @@ pub mod system {
     pub const FNSAVE: u32 = 0x4f;
     pub const FLD80: u32 = 0x50;
     pub const FSTP80: u32 = 0x51;
+    /// I5b (numbered apart: 0x68..=0x6f): FXSAVE/FXRSTOR m512 (`0f ae /0`, `/1`; REX.W's FXSAVE64 image is the same here:
+    /// the x87 pointers are 0), XSAVE/XRSTOR m (`0f ae /4`, `/5`, standard format; EDX:EAX the instruction mask), XGETBV and
+    /// XSETBV (`0f 01 d0`, `d1`; ECX the XCR). The memory forms have a 64-bit address and no 66/F2/F3.
+    pub const FXSAVE: u32 = 0x68;
+    pub const FXRSTOR: u32 = 0x69;
+    pub const XSAVE: u32 = 0x6a;
+    pub const XRSTOR: u32 = 0x6b;
+    pub const XGETBV: u32 = 0x6c;
+    pub const XSETBV: u32 = 0x6d;
+    /// Port I/O (L3, numbered apart; SDM Vol.2 IN, OUT, INS, OUTS; Vol.1 19): `size` 1, 2 or 4 (66: 2; REX.W does not
+    /// promote); IN/OUT name their port by DX (`reg` 2) or an imm8 (`reg` [`NO_REG`], the port in `cr`); INS/OUTS move one
+    /// element per transaction between DX's port and ES:RDI (INS) or DS:RSI (OUTS; `segment` an FS/GS override), with
+    /// [`super::System::prefixes`].
+    pub const IN: u32 = 0x60;
+    pub const OUT: u32 = 0x61;
+    pub const INS: u32 = 0x62;
+    pub const OUTS: u32 = 0x63;
+    /// [`super::System::prefixes`] bits.
+    pub const REP: u32 = 1;
+    pub const ADDRESS32: u32 = 2;
     impl super::System {
         pub const NONE: Self = Self {
-            kind: 0, length: 0, lock: 0, cr: 0, reg: 0, base: NO_REG, index: NO_REG, scale: 0, disp: 0, memory: 0, size: 0, fs_gs: 0,
+            kind: 0, length: 0, lock: 0, cr: 0, reg: 0, base: NO_REG, index: NO_REG, scale: 0, disp: 0, memory: 0, size: 0, segment: 0, prefixes: 0,
         };
         /// Field ranges the resident relies on (it checks every reply).
         pub fn well_formed(&self) -> bool {
@@ -974,13 +1033,14 @@ pub mod system {
                 && (reg(self.index) || self.index == NO_REG)
                 && self.scale <= 3
                 && (self.base != RIP || self.index == NO_REG)
-                && matches!(self.fs_gs as usize, 0 | super::SREG_FS | super::SREG_GS);
-            let rm = if self.memory == 1 { address } else { self.memory == 0 && reg(self.reg) && self.fs_gs == 0 };
+                && matches!(self.segment as usize, 0 | super::SREG_SS | super::SREG_DS | super::SREG_FS | super::SREG_GS);
+            let rm = if self.memory == 1 { address } else { self.memory == 0 && reg(self.reg) && self.segment == 0 };
             (1..=15).contains(&self.length)
                 && self.lock <= 1
+                && (self.prefixes == 0 || matches!(self.kind, INS | OUTS))
                 && match self.kind {
                     MOV_TO_CR | MOV_FROM_CR | MOV_TO_DR | MOV_FROM_DR => reg(self.cr) && reg(self.reg),
-                    INVLPG => address && self.fs_gs == 0,
+                    INVLPG => address && self.segment == 0,
                     RDMSR | WRMSR | CPUID | RDTSC | RDTSCP | RDPMC => true,
                     SET_CPL => matches!(self.cr, 0 | 3),
                     LGDT..=SIDT => self.memory == 1 && address,
@@ -995,10 +1055,10 @@ pub mod system {
                     INT3 | INTO | UD => true,
                     SWAPGS | SYSCALL | WBINVD => true,
                     SYSRET => matches!(self.size, 4 | 8),
-                    RDFSBASE..=WRGSBASE => self.memory == 0 && reg(self.reg) && self.fs_gs == 0 && matches!(self.size, 4 | 8),
+                    RDFSBASE..=WRGSBASE => self.memory == 0 && reg(self.reg) && self.segment == 0 && matches!(self.size, 4 | 8),
                     LAR | LSL => rm && reg(self.cr) && matches!(self.size, 2 | 4 | 8),
                     VERR | VERW => rm,
-                    RDRAND => self.memory == 0 && reg(self.reg) && self.fs_gs == 0 && matches!(self.size, 2 | 4 | 8),
+                    RDRAND => self.memory == 0 && reg(self.reg) && self.segment == 0 && matches!(self.size, 2 | 4 | 8),
                     CLFLUSH => self.memory == 1 && address,
                     CLI | STI | HLT => true,
                     POPF => matches!(self.size, 2 | 8),
@@ -1007,6 +1067,11 @@ pub mod system {
                     X87_GATED | FNINIT | FNCLEX => true,
                     FLDCW | FLD80 | FSTP80 => self.memory == 1 && address,
                     FLDENV..=FNSAVE => self.memory == 1 && address && matches!(self.size, 2 | 4),
+                    FXSAVE..=XRSTOR => self.memory == 1 && address,
+                    XGETBV | XSETBV => self.memory == 0,
+                    IN | OUT => self.memory == 0 && matches!(self.size, 1 | 2 | 4) && (self.reg == 2 || (self.reg == NO_REG && self.cr < 256)),
+                    INS => self.memory == 0 && matches!(self.size, 1 | 2 | 4) && self.prefixes < 4 && self.segment == 0,
+                    OUTS => self.memory == 0 && matches!(self.size, 1 | 2 | 4) && self.prefixes < 4 && matches!(self.segment as usize, 0 | super::SREG_FS | super::SREG_GS),
                     _ => false,
                 }
         }
@@ -1067,6 +1132,10 @@ pub mod stop {
     /// (M3, numbered apart.) A device access the resident does not complete ([`super::Mmio`]: its `status` says why):
     /// a precise stop with the state at the instruction, nothing of it done (the device untouched).
     pub const UNSUPPORTED_MMIO: u64 = 48;
+    /// (L3.) A port access the host refused ([`super::Mmio`] holds the port in `gpa`, `status` why: `unassigned` under the
+    /// strict switch, or `device`): a precise stop with the state at the instruction (for a REP INS/OUTS, after the elements
+    /// it completed), the access not made.
+    pub const UNSUPPORTED_PORT: u64 = 49;
 
     pub fn name(code: u64) -> &'static str {
         match code {
@@ -1086,6 +1155,7 @@ pub mod stop {
             SHUTDOWN => "shutdown",
             HALTED => "halted",
             UNSUPPORTED_MMIO => "unsupported_mmio",
+            UNSUPPORTED_PORT => "unsupported_port",
             _ => "none",
         }
     }
@@ -1325,8 +1395,11 @@ pub mod mmio {
     /// Refusals (the vCPU stops [`super::stop::UNSUPPORTED_MMIO`] at the instruction, nothing of it done, the device untouched):
     /// a LOCK read-modify-write, memory XCHG or other atomic site; a pair, push or pop site; an access crossing a page with a
     /// device page on either side; a site without a completion record (every x86 form but MOV loads and stores of 1, 2, 4,
-    /// 8 bytes, MOV of an immediate, moffs, MOVZX, MOVSX, MOVSXD); a page no device claims; a device refusing the access
-    /// (e.g. a width it does not implement); a system instruction's or a delivery's own access to a device page.
+    /// 8 bytes, MOV of an immediate, moffs, MOVZX, MOVSX, MOVSXD); a page no device claims, only under the host's strict
+    /// switch (L3, owner decision of October 29 and its amendment: otherwise a read shadows the page onto the all-ones page
+    /// and runs natively, and a MOV store is completed as ignored, counted per access, status [`DONE`]); a device refusing the access (e.g. a width it does
+    /// not implement); a system instruction's or a delivery's own access to a device page. Port accesses (L3,
+    /// [`super::REQUEST_PORT`]) use [`DONE`], [`UNASSIGNED`] and [`DEVICE`] alike.
     pub const ATOMIC: u64 = 2;
     pub const SITE: u64 = 3;
     pub const CROSSING: u64 = 4;
@@ -1334,6 +1407,8 @@ pub mod mmio {
     pub const UNASSIGNED: u64 = 6;
     pub const DEVICE: u64 = 7;
     pub const SYSTEM: u64 = 8;
+    /// [`super::REQUEST_PAGE`]'s reply for a page a device claims.
+    pub const CLAIMED: u64 = 9;
     pub fn name(status: u64) -> &'static str {
         match status {
             DONE => "done",
@@ -1344,6 +1419,7 @@ pub mod mmio {
             UNASSIGNED => "unassigned",
             DEVICE => "device",
             SYSTEM => "system",
+            CLAIMED => "claimed",
             _ => "none",
         }
     }
@@ -1452,7 +1528,7 @@ mod tests {
         let invlpg = System { kind: system::INVLPG, length: 7, base: system::RIP, ..System::NONE };
         assert!(mov.well_formed() && invlpg.well_formed());
         let ltr = System { kind: system::LTR, length: 3, reg: 0, ..System::NONE };
-        let far = System { kind: system::JMP_FAR, length: 3, memory: 1, size: 8, base: 0, fs_gs: SREG_GS as u32, ..System::NONE };
+        let far = System { kind: system::JMP_FAR, length: 3, memory: 1, size: 8, base: 0, segment: SREG_GS as u32, ..System::NONE };
         let ret = System { kind: system::RET_FAR, length: 3, size: 4, disp: 0xffff, ..System::NONE };
         assert!(ltr.well_formed() && far.well_formed() && ret.well_formed());
         assert!(!System { disp: 0x1_0000, ..ret }.well_formed() && !System { memory: 1, base: 17, ..ltr }.well_formed());
@@ -1462,7 +1538,7 @@ mod tests {
             System { kind: system::LGDT, ..mov }, // no memory operand
             System { kind: system::IRET, size: 2, ..mov },
             System { kind: system::MOV_FROM_SREG, size: 8, memory: 0, reg: 16, ..mov },
-            System { kind: system::JMP_FAR, size: 8, memory: 1, fs_gs: 3, ..mov },
+            System { kind: system::JMP_FAR, size: 8, memory: 1, segment: 1, ..mov }, // CS: decoded as SREG_DS
             System { kind: system::MOV_FROM_DR, cr: 16, ..mov },
             System { length: 0, ..mov },
             System { length: 16, ..mov },
@@ -1502,6 +1578,7 @@ mod tests {
             xmm: [[0; 2]; 16],
             mxcsr: MXCSR_RESET,
             fcw: FCW_INIT,
+            xcr0: crate::cpu_profile::XCR0_RESET,
         };
         let c = cpu.control().unwrap();
         assert_eq!((c.cr3, c.cpl, c.wp, c.nxe, c.smep), (0x1000, 3, 1, 1, 0));

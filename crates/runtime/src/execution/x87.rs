@@ -42,6 +42,13 @@ pub(super) fn mm(r: u64) -> u64 {
 pub(super) fn set_mm(r: u64, v: u64) {
     unsafe { (page(frame::X87_MM + 16 * (r as u32 & 7)) as *mut u64).write_volatile(v) }
 }
+/// The abridged tag byte (bit i: physical register i is not empty; FXSAVE's FTW field) and its write (I5b).
+pub(super) fn abridged() -> u64 {
+    get8(frame::X87_FTW)
+}
+pub(super) fn set_abridged(v: u64) {
+    set8(frame::X87_FTW, v & 0xff)
+}
 fn valid(r: u64) -> bool {
     get8(frame::X87_FTW) >> (r & 7) & 1 != 0
 }

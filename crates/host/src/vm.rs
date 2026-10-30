@@ -82,6 +82,10 @@ pub(crate) fn exit_vcpus(ids: &mut [u64]) -> i32 {
 
 /// Guest memory rights: read/write/execute.
 const MAPPED: u64 = 7;
+/// Read only (HV_MEMORY_READ), and the all-ones page's size (the host's page size).
+const READ: u64 = 1;
+const ALL_ONES: u64 = natemu_abi::ALL_ONES_BYTES;
+const _: () = assert!(GIC_REDISTRIBUTORS + (32 << 20) <= natemu_abi::ALL_ONES_IPA);
 /// IPAs of the GIC's distributor (64 KiB) and redistributor region (128 KiB per vCPU, 32 MiB), below guest memory.
 const GIC_DISTRIBUTOR: u64 = 0x0800_0000;
 const GIC_REDISTRIBUTORS: u64 = 0x0900_0000;
@@ -165,6 +169,16 @@ impl Machine {
             machine.set_distributor(gicd(GICD_ISENABLER, n, 1), 1 << (n % 32))?;
         }
         unsafe { hv(hv_vm_map(memory.0.cast(), IPA, memory.1, MAPPED), "hv_vm_map")? };
+        // L3 (amendment): the shared all-ones page that shadows of unassigned guest-physical pages map, read-only here too.
+        // ponytail: one page per VM leaked for the process (a VM per process today); free it with the VM if VMs come and go.
+        let ones = unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(ALL_ONES as usize, ALL_ONES as usize).unwrap()) };
+        if ones.is_null() {
+            return Err("all-ones page: out of memory".into());
+        }
+        unsafe {
+            ones.write_bytes(0xff, ALL_ONES as usize);
+            hv(hv_vm_map(ones.cast(), natemu_abi::ALL_ONES_IPA, ALL_ONES as usize, READ), "hv_vm_map all-ones page")?;
+        }
         Ok(machine)
     }
     fn distributor(&self, reg: u16) -> Result<u64> {

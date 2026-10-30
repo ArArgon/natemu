@@ -3,6 +3,12 @@
 // The resident's window layout and its record shared with the host. Pointers are owned native addresses, never guest
 // GPAs.
 pub const IPA: u64 = 0x4000_0000;
+/// L3 (owner decision of October 29, amendment after L3): the IPA of one shared page of all-ones bytes, mapped read-only
+/// at stage 2 (16 KiB: the host's page size), below the backing and above the GIC's redistributors (host `vm.rs`). Shadows
+/// of unassigned guest-physical pages map it read-only and never executable, so every read form of them runs natively.
+pub const ALL_ONES_IPA: u64 = 0x0c00_0000;
+pub const ALL_ONES_BYTES: u64 = 0x4000;
+const _: () = assert!(ALL_ONES_IPA + ALL_ONES_BYTES <= IPA);
 pub const PRIVATE: u64 = 0x0000_8000_4000_0000;
 pub const RAM_SIZE: usize = 0x10_0000;
 pub const SHARED_OFFSET: usize = 0x2_0000;

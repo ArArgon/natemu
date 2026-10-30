@@ -160,8 +160,9 @@ struct Capture {
   std::vector<uint8_t> sra_gpr, sra_fpr;
   // The explicit x86 memory operand FEX decoded (base/index are x86 register numbers, -1 = none).
   struct X86Mem { bool present = false, rip_relative = false; int base = -1, index = -1; unsigned scale = 1; int64_t disp = 0; };
-  // seg: the FS/GS override FEX applies (4 fs, 5 gs, 0 none; CS/DS/ES/SS are ignored in 64-bit mode).
-  struct Inst { uint64_t pc; unsigned size; std::string name; bool block_end; bool sets_rip; X86Mem mem; int seg; };
+  // seg: the FS/GS override FEX applies (4 fs, 5 gs, 0 none); null_seg: a CS/DS/ES (2) or SS (1) prefix, 0 none, which
+  // 64-bit mode ignores but for the exception of a non-canonical address (FEX's decoder drops them).
+  struct Inst { uint64_t pc; unsigned size; std::string name; bool block_end; bool sets_rip; X86Mem mem; int seg; int null_seg; };
   struct Block { uint64_t entry, size, count; int status; bool entry_point; };
   std::vector<Inst> insts;
   std::vector<Block> blocks;
@@ -199,10 +200,24 @@ int SegmentOverride(uint32_t flags) {
   const uint32_t s = flags & X86Tables::DecodeFlags::FLAG_SEGMENTS;
   return s == X86Tables::DecodeFlags::FLAG_FS_PREFIX ? 4 : s == X86Tables::DecodeFlags::FLAG_GS_PREFIX ? 5 : 0;
 }
+// The CS/DS/ES/SS prefix among the legacy prefixes of the instruction at `pc` (2: CS/DS/ES, 1: SS, 0: none). The shim's
+// allowlist refuses SS with CS/DS/ES on a memory operand, so one class is left.
+int NullSegment(uint64_t pc, unsigned size) {
+  const uint8_t* b = fexc_guest_bytes ? fexc_guest_bytes(pc, size) : nullptr;
+  int seg = 0;
+  for (unsigned i = 0; b && i < size; ++i) {
+    const uint8_t x = b[i];
+    if (x == 0x36) seg = 1;
+    else if (x == 0x26 || x == 0x2E || x == 0x3E) seg = 2;
+    else if (!(x == 0xF0 || x == 0xF2 || x == 0xF3 || x == 0x66 || x == 0x67 || x == 0x64 || x == 0x65 || (x >= 0x40 && x <= 0x4F))) break;
+  }
+  return seg;
+}
 
-// Join each site with FEX's own decode of its guest instruction: segment (stack ops and RSP/RBP-based operands use SS,
-// which decides #SS(0) vs #GP(0) for a non-canonical address; an FS/GS-overridden operand is FS/GS, #GP(0), whatever its
-// base) and the x86 addressing form.
+// Join each site with FEX's own decode of its guest instruction: segment (stack ops use SS, which decides #SS(0) vs #GP(0)
+// for a non-canonical address; an explicit operand uses SS with an SS prefix, or with an RSP/RBP base and no segment
+// prefix, else DS: a CS/DS/ES prefix makes even an RSP/RBP-based operand DS-class, Intel SDM Vol. 3A §4.5.1; an
+// FS/GS-overridden operand is FS/GS, #GP(0), whatever its base) and the x86 addressing form.
 // A load of a RIP-setting instruction without an explicit memory operand is the implicit stack access of slice1's ret;
 // leave's load of [RBP] (slice1: a plain load, then RSP and RBP) is a stack access too.
 // Guard/split/alignment stubs (slice1) take the width, intent, segment and data registers of the access they cover (their own
@@ -214,7 +229,8 @@ void JoinSites(uint64_t rip) {
     if (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP || s.kind == FEXC_SITE_ATOMIC ||
         s.kind == FEXC_SITE_LOAD_PAIR || s.kind == FEXC_SITE_STORE_PAIR)   // (I5a: MOVAPS m128's X pair: its operand's segment)
       for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) {
-        if ((!i.mem.present && (i.sets_rip || i.name == "LEAVE")) || (!i.seg && (i.mem.base == 4 || i.mem.base == 5))) s.segment = 1;
+        const bool stack_base = i.mem.base == 4 || i.mem.base == 5;
+        if (!i.mem.present ? i.sets_rip || i.name == "LEAVE" : !i.seg && (i.null_seg == 1 || (!i.null_seg && stack_base))) s.segment = 1;
         break;
       }
   }
@@ -269,7 +285,7 @@ void Hook(Core::InternalThreadState* t, const FexcCompileInfo& info, const uint8
       Cap.insts.push_back({d.PC, d.InstSize, d.TableInfo && d.TableInfo->Name ? d.TableInfo->Name : "?",
                            d.TableInfo && (d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_BLOCK_END),
                            d.TableInfo && (d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_SETS_RIP), MemOperand(d),
-                           SegmentOverride(d.Flags)});
+                           SegmentOverride(d.Flags), NullSegment(d.PC, d.InstSize)});
     }
   }
 }

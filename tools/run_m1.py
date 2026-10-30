@@ -6,10 +6,12 @@
 - `top`: at 4 MiB, 2 GiB and 3 GiB, every table and data page placed in RAM's last MiB (`--place`): a store and a load
   there complete and CR3 (read at CPL 0) lies in that MiB.
 - `hole`: the first page above RAM (R, the start of the map's reserved range to 4 GiB) is a device page: an access
-  there stops `unsupported_mmio` with status `unassigned`; an `mmio` item on RAM's last page is refused by the driver.
-- `legacy-around`: placing from 0x9e000 puts the tables at 0x9e000, 0x9f000, 0xa0000 and up (CR3 = 0x9e000; the run
-  completes). The legacy hole 0xA0000-0xFFFFF is still RAM: making it non-RAM waits for L3's unassigned-address rule
-  (boot-features plan, Built (M1)).
+  there stops `unsupported_mmio` with status `unassigned` under `--strict-unassigned`, and reads all-ones, counted, without
+  it (L3's rule, `hole-rule`); an `mmio` item on RAM's last page is refused by the driver.
+- `legacy-around`: placing from 0x9e000 puts the tables at 0x9e000, 0x9f000, then above the legacy hole (CR3 = 0x9e000;
+  the run completes).
+- `legacy-*` (L3 + M1's patch: 0xA0000-0xFFFFF is not RAM): an unassigned page there reads all-ones (counted), a test
+  device registers there, and an identity page there is refused by the driver.
 - `xmc-high`: cross-modifying and self-modifying code in a code page near the top of 2 GiB (`--place 0x7ff00000`: the
   code page's mask word and its invalidation-record summary bits are the highest ones). vCPU 1 rewrites the immediate
   of X (`mov esi, 1` -> 2) after a delay, then sets a flag; vCPU 0 runs X in a loop until it sees the flag, executes
@@ -61,15 +63,28 @@ def cases(a):
                   ['--ram', ram, '--place', ram - MIB])
         c = first(top)
         yield f'top-{ram:#x}', c['stop'] == 'reached' and int(c['gpr'][1], 0) == 0x1234 and ram - MIB <= int(c['gpr'][0], 0) < ram, c
-        hole = run(a, f'hole-{ram:#x}', f'rip {CODE:#x}\nrflags 0x2\n{gprs({2: 0x200000})}\ncode {load_rdx}\n'
-                   f'mmio 0x200000 {ram:#x} unassigned\n{other_device(ram + 0x10000)}', ['--ram', ram])
+        text = f'rip {CODE:#x}\nrflags 0x2\n{gprs({2: 0x200000})}\ncode {load_rdx}\nmmio 0x200000 {ram:#x} unassigned\n{other_device(ram + 0x10000)}'
+        hole = run(a, f'hole-{ram:#x}', text, ['--ram', ram, '--strict-unassigned'])
         yield f'hole-{ram:#x}', unassigned(hole), first(hole)
+        # L3: without the strict switch the page at R reads all-ones (the unassigned rule), counted.
+        hole = first(run(a, f'hole-rule-{ram:#x}', text, ['--ram', ram]))
+        yield f'hole-rule-{ram:#x}', (hole['stop'] == 'reached' and int(hole['gpr'][0], 0) == 0xffff_ffff
+                                     and hole.get('unassigned_pages') == [{'page': f'{ram:#x}', 'reads': 1, 'writes': 0}]), hole
         inside = run(a, f'inside-{ram:#x}', f'rip {CODE:#x}\nrflags 0x2\ncode 90\nmmio 0x200000 {ram - 4096:#x} unassigned\n', ['--ram', ram])
         yield f'inside-{ram:#x}', inside['stop'] == 'driver' and 'is guest RAM' in inside['reason'], inside
     out = run(a, 'legacy-around', f'rip {CODE:#x}\nrflags 0x2\n{gprs({0: 0x1234, 3: 0x300000})}\ncode {store}\ncpl 0\nregion 0x300000 0x1000\n',
               ['--place', 0x9_e000])
     c = first(out)
     yield 'legacy-around', c['stop'] == 'reached' and int(c['gpr'][0], 0) == 0x9_e000 and int(c['gpr'][1], 0) == 0x1234, c
+    # L3 + M1: the legacy hole 0xA0000-0xFFFFF is not RAM: an unassigned page there reads all-ones (counted); a test device
+    # registers there; an identity page in it is refused.
+    out = first(run(a, 'legacy-unassigned', f'rip {CODE:#x}\nrflags 0x2\n{gprs({2: 0x200000})}\ncode {load_rdx}\nmmio 0x200000 0xe0000 unassigned\n'))
+    yield 'legacy-unassigned', (out['stop'] == 'reached' and int(out['gpr'][0], 0) == 0xffff_ffff
+                                and out.get('unassigned_pages') == [{'page': '0xe0000', 'reads': 1, 'writes': 0}]), out
+    out = first(run(a, 'legacy-device', f'rip {CODE:#x}\nrflags 0x2\n{gprs({2: 0x200000})}\ncode {load_rdx}\nmmio 0x200000 0xb8000\nmemory 0x200008 78563412\n'))
+    yield 'legacy-device', out['stop'] == 'reached' and int(out['gpr'][0], 0) == 0x1234_5678 and out['devices'][0]['reads'] == [1], out
+    out = run(a, 'legacy-identity', f'identity\nrip {CODE:#x}\nrflags 0x2\ncode 90\nmemory 0xa0000 00\n')
+    yield 'legacy-identity', out['stop'] == 'driver' and 'legacy hole' in out['reason'], out
     # Cross- and self-modifying code in a code page near the top of 2 GiB.
     x = asm('mov esi, 1\njmp r13').hex()
     c0 = asm(f'start:\nlea r13, [rip + back]\nmov rax, {X:#x}\njmp rax\nback:\ncmp byte ptr [{FLAG:#x}], 1\njne start\n'

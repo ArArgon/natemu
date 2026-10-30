@@ -91,6 +91,11 @@ pub fn install(cpl: u64, va: u64, ram: &GuestRam, gpa: u64, writable: bool) -> R
     let ipa = native(page as u64).ok_or(Error::OutsideRam)?;
     space(user(cpl)).map(va & !4095, ipa, writable)
 }
+/// L3 (amendment): shadow guest linear page `va`, which maps an unassigned guest-physical page, read-only onto the shared
+/// all-ones page (`natemu_abi::ALL_ONES_IPA`, read-only at stage 2 too; never executable: `PAGE` has PXN/UXN).
+pub fn install_ones(cpl: u64, va: u64) -> Result<(), Error> {
+    space(user(cpl)).map(va & !4095, natemu_abi::ALL_ONES_IPA, false)
+}
 /// Removes `va`'s shadow from both spaces. An address no space can map (the gap, or the upper half with TTBR1 walks
 /// off) has no shadow: nothing to remove.
 pub fn unmap(va: u64) -> Result<(), Error> {

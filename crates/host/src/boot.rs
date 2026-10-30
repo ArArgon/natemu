@@ -10,11 +10,13 @@
 //!
 //! Physical map: INV-03-03 claim 69 (the selected cold-boot manifest), parameterised by the end of low RAM `L` and the
 //! size of high RAM `H` above 4 GiB ([`Layout`]); M1 grows guest RAM, L2 places the ACPI tables in the NVS range and
-//! passes the RSDP ([`Inputs::rsdp`]), X4 uses the NVS boot-service scratch. The independent judge of the result is
+//! passes the tables built by [`acpi`] ([`Inputs::acpi`]), X4 uses the NVS boot-service scratch. The independent judge of the result is
 //! `tools/models/bootproto.py` (`tools/run_l1.py`).
 use natemu_abi::execution::{self as exec, Cpu, Segment, Table};
 use natemu_abi::guest_memory::GuestRam;
 use std::fmt;
+
+pub(crate) mod acpi;
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
@@ -96,8 +98,8 @@ pub(crate) enum LoadError {
     KernelDoesNotFit { start: u64, bytes: u64 },
     /// No page-aligned place for the initrd in low RAM below `initrd_addr_max` above the kernel's window.
     InitrdDoesNotFit { bytes: u64 },
-    /// The RSDP does not lie in the map's ACPI NVS range.
-    BadRsdp(u64),
+    /// An ACPI blob (the RSDP, a table, the AP mailbox) at this address does not lie in the map's ACPI NVS range.
+    BadTables(u64),
 }
 impl LoadError {
     pub(crate) fn code(&self) -> &'static str {
@@ -122,7 +124,7 @@ impl LoadError {
             CmdlineNul => "CMDLINE_NUL",
             KernelDoesNotFit { .. } => "KERNEL_DOES_NOT_FIT",
             InitrdDoesNotFit { .. } => "INITRD_DOES_NOT_FIT",
-            BadRsdp(_) => "BAD_RSDP",
+            BadTables(_) => "BAD_TABLES",
         }
     }
 }
@@ -307,11 +309,11 @@ pub(crate) struct Inputs<'a> {
     pub(crate) image: &'a [u8],
     pub(crate) cmdline: &'a str,
     pub(crate) initrd: Option<&'a [u8]>,
-    /// L2's hook: the RSDP's guest-physical address (written by the table builder into the ACPI NVS range), published
-    /// in `boot_params.acpi_rsdp_addr`; `None` leaves it 0. Kernels of protocol 2.12/2.13 predate the field (boot.rst
-    /// "Protocol 2.14 ... Add ACPI RSDP address"; zero-page.rst marks it ALL) and ignore it, finding the RSDP by their
-    /// own search; L2 covers that only if such kernels matter. L2's table writes must be added to [`Loaded::writes`] (the dump and the QEMU smoke image use that list).
-    pub(crate) rsdp: Option<u64>,
+    /// The ACPI tables ([`acpi::build`]): every blob is placed (so [`Loaded::writes`] carries them) and must lie in the
+    /// ACPI NVS range; the RSDP's address goes to `boot_params.acpi_rsdp_addr`. `None` leaves it 0. Kernels of protocol
+    /// 2.12/2.13 predate the field (boot.rst "Protocol 2.14 ... Add ACPI RSDP address"; zero-page.rst marks it ALL) and
+    /// ignore it, finding the RSDP by their own search, which these tables do not serve (none lies below 1 MiB).
+    pub(crate) acpi: Option<&'a acpi::Tables>,
 }
 /// Where everything went, and the BSP's entry state.
 #[derive(Debug, Clone)]
@@ -383,11 +385,10 @@ pub(crate) fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<L
             Some((at.ok_or(LoadError::InitrdDoesNotFit { bytes })?, bytes))
         }
     };
-    // The RSDP (36 bytes: revision 2, with the XSDT address; ACPI 6.5 5.2.5.3) lies in the map's ACPI NVS range.
-    if let Some(rsdp) = inputs.rsdp
-        && !(ACPI_NVS.0 <= rsdp && rsdp <= ACPI_NVS.1 - 36)
-    {
-        return Err(LoadError::BadRsdp(rsdp));
+    // The RSDP, the tables it reaches and the AP mailbox lie in the map's ACPI NVS range (claim 69).
+    let blobs = inputs.acpi.map_or(&[][..], |t| &t.blobs[..]);
+    if let Some((gpa, _)) = blobs.iter().find(|(a, b)| !(ACPI_NVS.0 <= *a && a.checked_add(b.len() as u64).is_some_and(|end| end <= ACPI_NVS.1))) {
+        return Err(LoadError::BadTables(*gpa));
     }
 
     // boot_params: zeroed, then the setup header from 0x1f1 to its end, then the loader's fields.
@@ -414,7 +415,7 @@ pub(crate) fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<L
     put32(&mut z, at::HARDWARE_SUBARCH, 0);
     z[at::HARDWARE_SUBARCH_DATA..at::HARDWARE_SUBARCH_DATA + 8].fill(0);
     z[at::SETUP_DATA..at::SETUP_DATA + 8].fill(0);
-    z[at::ACPI_RSDP_ADDR..at::ACPI_RSDP_ADDR + 8].copy_from_slice(&inputs.rsdp.unwrap_or(0).to_le_bytes());
+    z[at::ACPI_RSDP_ADDR..at::ACPI_RSDP_ADDR + 8].copy_from_slice(&inputs.acpi.map_or(0, |t| t.rsdp).to_le_bytes());
     z[at::E820_ENTRIES] = map.len() as u8;
     for (i, e) in map.iter().enumerate() {
         let o = at::E820_TABLE + 20 * i;
@@ -441,6 +442,9 @@ pub(crate) fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<L
     place(ram, &mut w, kernel, &inputs.image[s.pm_offset..s.pm_offset + s.pm_size])?;
     if let (Some((a, _)), Some(d)) = (initrd, inputs.initrd) {
         place(ram, &mut w, a, d)?;
+    }
+    for (gpa, bytes) in blobs {
+        place(ram, &mut w, *gpa, bytes)?;
     }
 
     // The BSP: 64-bit mode, paging (4-level, LA57 = 0), PAE, protected mode, ET (fixed) and NE; long mode; IF = 0.
@@ -472,6 +476,7 @@ pub(crate) fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<L
         xmm: [[0; 2]; 16],
         mxcsr: exec::MXCSR_RESET,
         fcw: exec::FCW_INIT,
+        xcr0: natemu_abi::cpu_profile::XCR0_RESET,
     };
     Ok(Loaded { setup: s, kernel, window, zero_page: ZERO_PAGE, cmdline: CMDLINE, initrd, map, cpu, writes: w })
 }
@@ -514,7 +519,7 @@ mod tests {
         (v, r)
     }
     fn inputs<'a>(image: &'a [u8], cmdline: &'a str, initrd: Option<&'a [u8]>) -> Inputs<'a> {
-        Inputs { image, cmdline, initrd, rsdp: None }
+        Inputs { image, cmdline, initrd, acpi: None }
     }
 
     /// One malformed image per header rejection, in `parse`'s order.
@@ -576,12 +581,15 @@ mod tests {
         // initrd_addr_max 24 MiB - 1: below the kernel's window end (20 MiB) there is no room for 5 MiB.
         let low = set(ok.clone(), at::INITRD_ADDR_MAX, &(24 * MIB as u32 - 1).to_le_bytes());
         assert_eq!(bad(SMALL, inputs(&low, "", Some(&rd[..5 * MIB as usize]))), InitrdDoesNotFit { bytes: 5 * MIB });
-        let i = Inputs { rsdp: Some(0x1000), ..inputs(&ok, "", None) };
-        assert_eq!(bad(SMALL, i), BadRsdp(0x1000));
-        let i = Inputs { rsdp: Some(ACPI_NVS.1 - 35), ..inputs(&ok, "", None) };
-        assert_eq!(bad(SMALL, i), BadRsdp(ACPI_NVS.1 - 35)); // crosses into the boot-service scratch
-        let i = Inputs { rsdp: Some(u64::MAX - 8), ..inputs(&ok, "", None) };
-        assert_eq!(bad(SMALL, i), BadRsdp(u64::MAX - 8));
+        let t = acpi::build(1, 0x1000);
+        let i = Inputs { acpi: Some(&t), ..inputs(&ok, "", None) };
+        assert_eq!(bad(SMALL, i), BadTables(0x1000));
+        let t = acpi::build(1, ACPI_NVS.1 - 35);
+        let i = Inputs { acpi: Some(&t), ..inputs(&ok, "", None) };
+        assert_eq!(bad(SMALL, i), BadTables(ACPI_NVS.1 - 35)); // crosses into the boot-service scratch
+        let t = acpi::build(1, u64::MAX - 8);
+        let i = Inputs { acpi: Some(&t), ..inputs(&ok, "", None) };
+        assert_eq!(bad(SMALL, i), BadTables(u64::MAX - 8));
         // A non-relocatable kernel over the loader's own data (zero page, GDT) or in high RAM; an alignment overflow.
         for pref in [0x1_0000u64, GDT, 4 * GIB] {
             let fixed = set(set(ok.clone(), at::RELOCATABLE_KERNEL, &[0]), at::PREF_ADDRESS, &pref.to_le_bytes());
@@ -630,7 +638,8 @@ mod tests {
         let ok = image(0x1000);
         let (_v, r) = ram(SMALL.low_end);
         let rd = vec![7u8; 5000];
-        let l = load(&r, &SMALL, &Inputs { image: &ok, cmdline: "mitigations=off nokaslr", initrd: Some(&rd), rsdp: Some(ACPI_NVS.0) }).unwrap();
+        let tables = acpi::build(2, ACPI_NVS.0);
+        let l = load(&r, &SMALL, &Inputs { image: &ok, cmdline: "mitigations=off nokaslr", initrd: Some(&rd), acpi: Some(&tables) }).unwrap();
         assert_eq!((l.kernel, l.window), (RAM_START, 4 * MIB));
         assert_eq!(l.initrd, Some((SMALL.low_end - 2 * PAGE, 5000)));
         let mut z = vec![0u8; 4096];
@@ -645,6 +654,11 @@ mod tests {
         assert_eq!(u32_at(&z, at::CMD_LINE_PTR), CMDLINE as u32);
         assert_eq!((u32_at(&z, at::RAMDISK_IMAGE), u32_at(&z, at::RAMDISK_SIZE)), ((SMALL.low_end - 2 * PAGE) as u32, 5000));
         assert_eq!(u64_at(&z, at::ACPI_RSDP_ADDR), ACPI_NVS.0);
+        // Every table byte is in guest RAM and inside one of the loader's recorded writes.
+        for (gpa, bytes) in &tables.blobs {
+            assert!(r.matches(*gpa, bytes));
+            assert!(l.writes.iter().any(|&(a, n)| a <= *gpa && gpa + bytes.len() as u64 <= a + n), "{gpa:#x}");
+        }
         assert_eq!(z[at::E820_ENTRIES] as usize, SMALL.e820().unwrap().len());
         assert!(z[0x26c..].iter().enumerate().all(|(i, &b)| b == 0 || (at::E820_TABLE - 0x26c..at::E820_TABLE - 0x26c + 20 * 9).contains(&i)));
         let mut c = vec![0u8; 24];

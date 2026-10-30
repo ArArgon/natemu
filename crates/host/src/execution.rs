@@ -129,7 +129,7 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize, ram_bytes: us
         memory.flush_instruction_cache(base, RAM_SIZE);
     }
     // SAFETY: the alias is the backing's last `ram_bytes`, which lives as long as the Backing holding this value.
-    let ram = unsafe { GuestRam::new(0, ram_bytes as u64, memory.0 as u64 + ram_offset as u64) };
+    let ram = unsafe { exec::guest_ram(ram_bytes as u64, memory.0 as u64 + ram_offset as u64) };
     Ok(Backing { memory, n, stride, ram, epoch: unsafe { mach_absolute_time() } })
 }
 /// Sets the vCPU's initial architectural state (before it first runs).
@@ -923,6 +923,24 @@ fn serve(
                 area.write_record(exec::STATE_OFFSET, state);
                 continue;
             }
+            // L3 (amendment): a read reached a non-RAM page: claimed by a device, or unassigned (all-ones shadow, counted).
+            exec::REQUEST_PAGE => {
+                if cancelled.load(SeqCst) {
+                    return Ok(Stop::Cancelled);
+                }
+                crate::devices::serve_page(area, &mut state, requests.devices.as_deref());
+                area.write_record(exec::STATE_OFFSET, state);
+                continue;
+            }
+                        // L3: a port access, made once on the port bus (never parked).
+            exec::REQUEST_PORT => {
+                if cancelled.load(SeqCst) {
+                    return Ok(Stop::Cancelled);
+                }
+                crate::devices::serve_port(area, &mut state, requests.devices.as_deref());
+                area.write_record(exec::STATE_OFFSET, state);
+                continue;
+            }
             // K2: an RDRAND found the pool empty; it was topped up above.
             exec::REQUEST_ENTROPY => {
                 requests.entropy += 1;
@@ -1090,7 +1108,7 @@ mod tests {
         let ram = unsafe { GuestRam::new(0, 2 << 20, memory.0 as u64 + exec::BACKING_BYTES as u64) };
         assert!(ram.copy_in(0x5ff0, &[0xaa; 16]) && ram.copy_in(0x9000, &[0xbb; 16]));
         let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0, ram };
-        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1ff0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, fcw: exec::FCW_INIT });
+        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1ff0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, fcw: exec::FCW_INIT, xcr0: 1 });
         s.fetch = [0x5000, u64::MAX];
         let f = fetched(area, &s, None).unwrap().unwrap();
         assert_eq!((f.bytes, f.more, f.next_fault), (vec![0xaa; 16], true, None));

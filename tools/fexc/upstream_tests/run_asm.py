@@ -34,6 +34,8 @@ value that is exactly the 80-bit expectation rounded to 53 bits under some round
 XMM register holding an 80-bit image), it is `precision deviation` (recorded in the plan's I6 deviations), never a pass; any
 GPR, RIP or other difference fails. An FLDCW/FLDENV/FRSTOR that clears
 an x87 exception mask stops `unsupported_system` (unmasked x87 exceptions, #MF, are not built): unsupported with that reason.
+I5b: likewise an FXRSTOR/XRSTOR whose FCW or MXCSR clears a mask (#XM is not built either). Tests run with CR4.OSXSAVE and
+XCR0 = 7, as Linux leaves user mode on this profile.
 Known_Failures / Disabled_Tests (the jit lists and the ARMv8.4 class file, the M4's class) are reported as `listed`, separately;
 the test is still run."""
 import argparse, collections, concurrent.futures as cf, json, pathlib, re, shutil, subprocess, sys, tempfile
@@ -134,7 +136,7 @@ def lists(src):
 
 
 def description(h, binary):
-    lines = [f'rip {CODE:#x}', 'rflags 0x202', 'gpr ' + ' '.join(['0'] * 16), f'code {binary.hex()}', 'sse 1', 'fsgsbase 1']   # I5a: CR4.OSFXSR, S3: CR4.FSGSBASE, as Linux
+    lines = [f'rip {CODE:#x}', 'rflags 0x202', 'gpr ' + ' '.join(['0'] * 16), f'code {binary.hex()}', 'sse 1', 'fsgsbase 1', 'xcr0 7']   # I5a: CR4.OSFXSR, S3: CR4.FSGSBASE, I5b: CR4.OSXSAVE and XCR0 7, as Linux
     regions = DEFAULT_REGIONS + [(int(a, 0), int(n, 0)) for a, n in h.get('MEMORYREGIONS', {}).items()]
     regions.append((CODE, -(-len(binary) // PAGE) * PAGE))   # FEX maps the code RWX
     lines += [f'region {a:#x} {n:#x}' for a, n in regions]
@@ -212,6 +214,8 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
                 return {**rec, 'outcome': 'unsupported', 'reason': f"#UD: {rec['at']} with EFER.SCE = 0 (needs an OS)"}
             if s['stop'] == 'resident' and s['reason'].startswith('unsupported_system') and rec.get('at') in ('fldcw', 'fldenv', 'frstor'):
                 return {**rec, 'outcome': 'unsupported', 'reason': f"x87 FCW unmasking an exception (refused: #MF not built): {rec['at']}"}
+            if s['stop'] == 'resident' and s['reason'].startswith('unsupported_system') and rec.get('at') in ('fxrstor', 'fxrstor64', 'xrstor', 'xrstor64'):
+                return {**rec, 'outcome': 'unsupported', 'reason': f"FCW or MXCSR unmasking an exception (refused: #MF/#XM not built): {rec['at']}"}
             return {**rec, 'outcome': 'fail', 'reason': 'did not reach hlt', 'detail': rec['stop'] + ' fault=' + json.dumps(s['fault'])}
         gpr = [int(v, 0) for v in s['gpr']]
         xmm = [int(v, 0) for v in s['xmm']]

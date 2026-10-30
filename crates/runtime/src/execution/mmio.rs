@@ -1,5 +1,8 @@
-//! M3, device accesses from translated code. A guest-physical page that is not guest RAM is a device page: shadows never
-//! map one, so every access to it aborts at its access site. The site's walk runs first ([`translate`]: #PF, and before
+//! M3, device accesses from translated code. A guest-physical page that is not guest RAM is a device page if a device
+//! claims it (the host's registry, or this vCPU's LAPIC page whatever its mode) and unassigned otherwise. Shadows never map
+//! a device page, so every access to it aborts at its access site. An unassigned page is shadowed only for reads, read-only
+//! onto the shared all-ones page, once a read touches it ([`ones`], L3's amendment: every read form then runs natively);
+//! a write to it aborts as to a device page. The site's walk runs first ([`translate`]: #PF, and before
 //! it the canonical #GP/#SS and #AC checks of [`access_aborted`]), so every fault the guest tables owe comes before the
 //! device (its A/D updates stay, as on x86, also when the access is then refused). The instruction is completed from its
 //! site's completion record (`code_object::completion`, fexc's decode of the instruction it translated, never the guest
@@ -17,7 +20,7 @@
 //! Cost: each device access ends its block (the resident dispatches at the next RIP, an L1/L2 lookup, not a re-entry of
 //! the rest of the block) and, unless [`local`] serves it, makes one host exit.
 use super::*;
-use natemu_abi::execution::{MMIO_VA, Mmio, REPLY_DEVICE, REQUEST_DEVICE, mmio as status};
+use natemu_abi::execution::{MMIO_VA, Mmio, REPLY_DEVICE, REPLY_PAGE, REQUEST_DEVICE, REQUEST_PAGE, mmio as status};
 
 /// `gpa` is guest RAM (anything else is a device page).
 pub(super) fn ram(gpa: u64) -> bool {
@@ -26,11 +29,11 @@ pub(super) fn ram(gpa: u64) -> bool {
 fn exchange() -> *mut Mmio {
     MMIO_VA as *mut Mmio
 }
+/// A refusal made before any request: the record names no access (its request fields are cleared, the count kept).
 fn stop_with(s: &State, why: u64) -> ! {
     unsafe {
-        let mut m = read_record(exchange());
-        m.status = why;
-        write_record(exchange(), m);
+        let m = read_record(exchange());
+        write_record(exchange(), Mmio { status: why, completed: m.completed, ..Mmio::default() });
     }
     halt(s, stop::UNSUPPORTED_MMIO)
 }
@@ -43,6 +46,54 @@ pub(super) fn refuse(mut s: State, f: &NativeFrame, b: &Block, site: &Site, why:
 /// A system instruction's or a delivery's own access (`segments::linear`) to a device page: refused at the instruction.
 pub(super) fn system_access(s: &State) -> ! {
     stop_with(s, status::SYSTEM)
+}
+
+/// L3 (amendment): a read at `site` whose non-RAM pages (`device`, of the linear pages `touched`; walked, so every fault
+/// came first) are all unassigned: each is shadowed read-only onto the shared all-ones page and `true` returned (the caller
+/// retries the instruction, which then runs natively, any read form). `false`: a page is a device's (this vCPU's LAPIC page
+/// whatever its mode, or one the host's registry claims): the device path. Under the strict switch the read stops
+/// (`unassigned`). The host counts each page asked about as a read (a fill), also one then found next to a claimed page.
+pub(super) fn ones(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, touched: [Option<u64>; 2], device: [Option<u64>; 2]) -> bool {
+    if device.iter().flatten().any(|&g| super::lapic::claims(g)) {
+        return false;
+    }
+    // A page already shadowed onto the all-ones page (the access aborted on its other page) is not asked about again.
+    let ones = |va: Option<u64>| va.is_some_and(|va| tables::descriptor(s.cpu.cpl, va) & 0xffff_ffff_f001 == natemu_abi::ALL_ONES_IPA | 1);
+    let fresh = [0, 1].map(|k| device[k].filter(|_| !ones(touched[k])));
+    let mut claimed = false;
+    for &gpa in fresh.iter().flatten() {
+        match unsafe { page(s, gpa & !4095) } {
+            status::DONE => {}
+            status::CLAIMED => claimed = true,
+            status::UNASSIGNED => refuse(*s, f, b, site, status::UNASSIGNED),
+            _ => halt(s, stop::BAD_REPLY),
+        }
+    }
+    if claimed {
+        return false;
+    }
+    for (va, gpa) in touched.into_iter().zip(fresh) {
+        if let (Some(va), Some(_)) = (va, gpa) {
+            super::install_ones(s, va);
+        }
+    }
+    true
+}
+/// Asks the host about non-RAM page `gpa` ([`REQUEST_PAGE`]): its status.
+unsafe fn page(s: &mut State, gpa: u64) -> u64 {
+    unsafe {
+        let completed = read_record(exchange()).completed;
+        write_record(exchange(), Mmio { gpa, completed, ..Mmio::default() });
+        (s.request, s.reply) = (REQUEST_PAGE, NONE);
+        write_record(record(), *s);
+        asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
+        *s = load();
+        s.request = NONE;
+        if s.reply != REPLY_PAGE {
+            halt(s, stop::BAD_REPLY)
+        }
+        read_record(exchange()).status
+    }
 }
 
 /// The resident's own devices (fast path, no host exit): the access to `gpa` of `width` bytes (a store's `data`, or a

@@ -44,7 +44,7 @@ fn gate(c: &Cpu) -> Result<(), Exception> {
 }
 
 /// LDMXCSR, STMXCSR and a gated SSE instruction (any CPL; LOCK is #UD before this): the gating exception, then the m32
-/// operand at the CPL (#SS(0) for a non-canonical RSP/RBP-based one without FS/GS, else #GP(0); #PF), then for LDMXCSR #GP(0)
+/// operand at the CPL (#SS(0) or #GP(0) for a non-canonical one by its class, `segments::noncanonical`; #PF), then for LDMXCSR #GP(0)
 /// for a 1 in a reserved bit (31:16, MXCSR_MASK = FFFFH; SDM Vol.2 LDMXCSR). `Ok`: committed.
 pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     gate(&s.cpu)?;
@@ -53,7 +53,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         halt(s, stop::BAD_REPLY)
     }
     let va = address(&s.cpu, &i);
-    let noncanonical = if matches!(i.base, 4 | 5) && i.fs_gs == 0 { [12, 0, 0] } else { GP };
+    let noncanonical = super::segments::noncanonical(&i);
     if i.kind == system::LDMXCSR {
         let mut buf = [0; 4];
         linear(s, va, &mut buf, false, false, noncanonical)?;

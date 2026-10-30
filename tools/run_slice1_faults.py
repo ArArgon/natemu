@@ -39,6 +39,8 @@ Cases are derived from program descriptions, never written per program:
   at a far, a negative and a wrapping base with a not-present page (CR2 = base + EA), a page-crossing access, a
   non-canonical address, a canonical straddle and the private window, and indirect branches through FS/GS operands to a
   non-canonical target. Any corpus of `tools/reference/gen_i7.py` works as input (its page mutations fault at base + EA).
+  CS/DS/ES/SS prefixes take Intel's class (fexc series27; SDM Vol. 3A 4.5.1): SS-class with an SS prefix or an RSP/RBP
+  base and no prefix, else DS-class; `null_segment_probes` put CS/DS/ES on RSP/RBP bases and SS on others.
 * I3: DATA_FORMS also holds LOCK forms (one atomic each, write intent: a read-only page faults W even when LOCK CMPXCHG's
   comparison fails, the SDM's write cycle; LOCK NEG a load then a compare-and-swap; LOCK BTS FEX's byte). CMPXCHG8B/16B are
   probes only (the pinned QEMU's full runs keep stale flags after them; the prefix state is right): not-present and
@@ -172,13 +174,13 @@ def events(text, regs, next_rip):
         return one
     def mem(op):
         # I7: an FS/GS override adds that segment's base (`regs['fs']`/`regs['gs']`, from the program) and makes the
-        # reference an FS/GS one (#GP(0) when non-canonical, whatever the base register); CS/DS/ES/SS add nothing (the
-        # corpus names only the operand's default segment with them: fexc refuses the others).
+        # reference an FS/GS one (#GP(0) when non-canonical, whatever the base register); CS/DS/ES/SS add nothing but the
+        # class (Intel SDM Vol. 3A 4.5.1): SS-class (#SS(0)) with an SS override or an RSP/RBP base and no override.
         x = MEM.fullmatch(op)
         if not x: return None
         a, base = address(x[3], regs, next_rip)
         if x[2] in ('fs', 'gs'): return (a + regs.get(x[2], 0)) & M64, SIZES[x[1]] if x[1] else None, False
-        return a, SIZES[x[1]] if x[1] else None, base in STACK_BASES
+        return a, SIZES[x[1]] if x[1] else None, x[2] == 'ss' or (not x[2] and base in STACK_BASES)
     def reg_width(op, default=8): return ref.WIDTH[op] // 8 if op in ref.WIDTH else default
     rsp = regs['rsp']
     def operand_width(op):     # push/pop operand: memory with its size (qword or word), r64/r16, or an immediate (8)
@@ -194,7 +196,7 @@ def events(text, regs, next_rip):
         if MEM.fullmatch(ops[0]):     # the destination address uses RSP after the increment
             x = MEM.fullmatch(ops[0]); a, base = address(x[3], dict(regs, rsp=(rsp + w) & M64), next_rip)
             seg = x[2] in ('fs', 'gs')
-            out.append(('access', (a + regs.get(x[2], 0)) & M64 if seg else a, w, True, base in STACK_BASES and not seg))
+            out.append(('access', (a + regs.get(x[2], 0)) & M64 if seg else a, w, True, x[2] == 'ss' or (not x[2] and base in STACK_BASES)))
         return out
     # I1: pushf and enter (nesting level 0) push one qword; leave reads [RBP] (a stack access; RSP and RBP change after it);
     # a prefetch hint never faults (SDM PREFETCHh: no exceptions but #UD for LOCK), whatever its address.
@@ -523,7 +525,7 @@ def probes(window=True):
         out.append((f'fetch-{name}', REGS, lines, None, {'unmap': [0x101000], 'rip': 0x101000 - 11 - pad}))
         # Falling through (or straddling) the end of the lower canonical half: #GP at the next fetch.
         out.append((f'fetch-noncanonical-{name}', REGS, lines, None, {'rip': 0x8000_0000_0000 - 11 - pad}))
-    return out + division_probes() + segment_probes()
+    return out + division_probes() + segment_probes() + null_segment_probes()
 
 # I7: FS/GS-overridden accesses. For each (segment, base) and form, the pointer register is set so that base + EA (mod 2^64)
 # is the target: a not-present page (#PF, CR2 = base + EA), the second page of a crossing access (#PF at that page), a
@@ -558,6 +560,27 @@ def segment_probes():
             regs = dict(REGS, rbx=(D + 0x40 - base) & M64, rax=0x8000_0000_0000_0000)
             lines = PRELUDE + [f'mov qword ptr {seg}:[rbx], rax', f'{name} qword ptr {seg}:[rbx]'] + AFTER
             out.append((f'segment-{seg}-{base:#x}-{name}-target', regs, lines, len(PRELUDE) + 1, {f'{seg}base': base}))
+    return out
+
+# Intel's class for a CS/DS/ES/SS prefix (64-bit mode adds no base; SDM Vol. 3A 4.5.1): CS/DS/ES make an RSP/RBP-based
+# operand DS-class (#GP(0) when non-canonical), SS makes a DS-default operand SS-class (#SS(0)). Every target of
+# SEGMENT_TARGETS but `pf-crossing` for the locked forms (a split lock) and BT* (its one byte does not cross).
+NULL_SEGMENT_FORMS = [(s, *f) for s in ('ds', 'es', 'cs') for f in [
+    ('rbp-load', 'rbp', 16, 'mov rax, qword ptr {s}:[rbp + 16]'), ('rsp-store', 'rsp', 8, 'mov qword ptr {s}:[rsp + 8], rax'),
+    ('rbp-rmw', 'rbp', 0, 'xor qword ptr {s}:[rbp], rax'), ('rbp-lock', 'rbp', 0, 'lock add qword ptr {s}:[rbp], rax'),
+    ('rbp-bts', 'rbp', 0, 'bts qword ptr {s}:[rbp], 5'), ('rsp-xchg', 'rsp', 0, 'xchg qword ptr {s}:[rsp], rax')]] + \
+    [('ss', *f) for f in [
+    ('load', 'rbx', 8, 'mov rax, qword ptr {s}:[rbx + 8]'), ('store', 'rbx', 0, 'mov qword ptr {s}:[rbx], rcx'),
+    ('rmw', 'rbx', 0, 'add qword ptr {s}:[rbx], 1'), ('lock', 'rbx', 0, 'lock add qword ptr {s}:[rbx], rcx'),
+    ('btr', 'rsi', 6, 'btr qword ptr {s}:[rsi + r8*2], 5'), ('xchg', 'rbx', 0, 'xchg qword ptr {s}:[rbx], rax')]]
+
+def null_segment_probes():
+    out = []
+    for seg, name, reg, ea, line in NULL_SEGMENT_FORMS:
+        for tname, target, mut in SEGMENT_TARGETS:
+            if tname == 'pf-crossing' and name.endswith(('lock', 'xchg', 'bts', 'btr')): continue    # split lock; BT*'s byte
+            regs = dict(REGS, **{reg: (target - ea) & M64})
+            out.append((f'null-segment-{seg}-{name}-{tname}', regs, PRELUDE + [line.format(s=seg)] + AFTER, len(PRELUDE), mut))
     return out
 
 DIVISOR = {1: 'r9b', 2: 'r9w', 4: 'r9d', 8: 'r9'}

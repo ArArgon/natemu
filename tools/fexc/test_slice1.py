@@ -32,6 +32,7 @@ SYSTEM = {
     'mov rax,cr0': '0f20c0', 'mov rax,cr3': '0f20d8', 'mov rax,cr4': '0f20e0', 'mov dr7,rax': '0f23f8', 'mov rax,dr0': '0f21c0',
     'lgdt [rax]': '0f0110', 'lidt [rax]': '0f0118', 'sgdt [rax]': '0f0100', 'ltr ax': '0f00d8', 'lldt ax': '0f00d0',
     'wrmsr': '0f30', 'rdmsr': '0f32', 'rdpmc': '0f33',
+    'fxsave [rax] (I5b)': '0fae00',
     'mov ds,ax': '8ed8', 'mov ss,ax': '8ed0', 'mov fs,ax': '8ee0', 'mov ax,ds': '8cd8', 'push fs': '0fa0', 'pop gs': '0fa9',
     'lss eax,[rax]': '0fb200', 'lgs eax,[rax]': '0fb500',
     'int3': 'cc', 'int 0x80': 'cd80', 'iretq': '48cf', 'iretd': 'cf', 'retf': 'cb', 'jmp far [rax]': 'ff28', 'call far [rax]': 'ff18',
@@ -60,15 +61,15 @@ UNSUPPORTED = {
     'fs mov rax,rcx': '644889c8', 'gs push rax': '6550', 'gs ret': '65c3', 'fs leave': '64c9', 'gs pushf': '659c', 'fs jmp rel8': '64eb00',
     'fs cs mov rax,[rax]': '642e488b00', 'ds gs mov rax,[rax]': '3e65488b00', 'fs gs mov rax,[rax]': '6465488b00', 'fs fs mov [rax],rcx': '6464894808',
     'fs addr32 mov rax,[eax]': '6467488b00',
-    'ss mov rax,[rbx] (#SS or #GP)': '36488b03', 'ds mov rax,[rbp] (#GP or #SS)': '3e488b4500', 'cs mov [rsp+8],rcx': '2e48894c2408',
-    'ss mov rax,[rip]': '36488b0500000000', 'es push [rbp+8]': '26ff7508',
+    # Intel's class since series27; still cut: SS with CS/DS/ES (mixed classes), SS on a moffs operand
+    'ss ds mov rax,[rbx] (mixed)': '363e488b03', 'ss movabs rax,[moffs]': '3648a10102030405060708',
     'paddd mm (MMX, I6)': '0ffec1', 'pcmpistri (host helper)': '660f3a63c100', 'maskmovdqu': '660ff7c1', 'f3 66 movss': 'f3660f10c1',
-    'insertps m32 zeroing its element': '660f3a21000f', 'aesenc': '660f38dcc1', 'fld st0': 'd9c0', 'vzeroupper': 'c5f877',
+    'insertps m32 zeroing its element': '660f3a21000f', 'aesenc': '660f38dcc1', 'vzeroupper': 'c5f877',
     'o16 pushf': '669c', 'o16 leave': '66c9', 'enter level 1': 'c8080001', 'o16 shld': '660fa4c101', 'o16 shrd cl': '660fadc1',
     'prefetchw': '0f0d08', 'prefetch /4 (reserved nop)': '0f1820', 'prefetch reg (reserved nop)': '0f18c0', 'movnti reg': '0fc3c1',
     'pdep': 'c4e2fbf5c1', 'pext': 'c4e2faf5c1', 'andn L=1': 'c4e27cf2c1', 'blsr /0 (#UD)': 'c4e278f3c1', 'vpxor': 'c5f9efc0',
     'rex andn (#UD)': '48c4e278f2c1', 'o16 andn (#UD)': '66c4e278f2c1', 'rep popcnt-like f2 0f b8': 'f20fb8c1',
-    'fxsave': '0fae00', 'loop 67-prefix': '67e2fe', 'jecxz': '67e3fe', 'loop o16': '66e2fe', 
+    'loop 67-prefix': '67e2fe', 'jecxz': '67e3fe', 'loop o16': '66e2fe', 
     'xlat': 'd7', 'movbe': '0f38f000', 'sal /6 alias': 'd1f0',
     'bnd ret': 'f2c3', 'o16 ret': '66c3', 'o16 jmp': '66e9fbffffff', 'bswap r9w (undefined)': '66410fc9', 'bswap ax': '660fc8',
     # FEX branches around the whole access for a zero count (static or dynamic), losing a guest #PF
@@ -129,6 +130,10 @@ ALLOWED = {
     'ss mov rax,[rbp+8]': '36488b4508', 'ds mov rax,[rax+rbp*2]': '3e488b0468', 'ds movabs rax,[moffs]': '3e48a10102030405060708',
     'cs push rax': '2e50', 'ds mov rax,rcx': '3e4889c8', 'cs ds mov rax,[rbx]': '2e3e488b03', 'ss ss mov rax,[rsp+8]': '3636488b442408',
     'cs nop word [rax+rax]': '662e0f1f840000000000',
+    # series27: Intel's class (SDM Vol. 3A 4.5.1): SS on a DS-default operand (#SS), CS/DS/ES on an RSP/RBP one (#GP)
+    'ss mov rax,[rbx]': '36488b03', 'ds mov rax,[rbp]': '3e488b4500', 'cs mov [rsp+8],rcx': '2e48894c2408',
+    'ss mov rax,[rip]': '36488b0500000000', 'es push [rbp+8]': '26ff7508', 'ds btr [rbp+0x540],rdx (Linux)': '3e480fb39540050000',
+    'fld st0 (I6, reduced precision)': 'd9c0',
     # I2: string instructions without a repeat prefix (one element)
     'movsb': 'a4', 'movsq': '48a5', 'o16 cmpsw': '66a7', 'stosq': '48ab', 'stosd': 'ab', 'lodsb': 'ac', 'scasb': 'ae', 'cmpsb': 'a6',
     'fs movsq': '6448a5', 'gs lodsd': '65ad', 'fs cmpsb': '64a6', 'ds movsb': '3ea4', 'es stosb': '26aa',

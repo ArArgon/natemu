@@ -22,10 +22,12 @@ mod delivery;
 mod events;
 mod lapic;
 mod mmio;
+mod ports;
 mod segments;
 mod sse;
 mod syscalls;
 mod x87;
+mod xsave;
 use delivery::{Event, deliver};
 use natemu_abi::{
     code_object::{self as object, Header, Site},
@@ -48,9 +50,10 @@ fn dispatcher() -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(start, end as usize - start as usize) }
 }
 
-/// Guest-physical RAM `[0, R)` through the resident's alias (M1: R is the VM's, `Control::ram_bytes`, set by the host).
+/// Guest-physical RAM `[0, R)` less the legacy hole (`LEGACY_HOLE`), through the resident's alias (M1: R is the VM's,
+/// `Control::ram_bytes`, set by the host).
 fn guest_ram() -> GuestRam {
-    unsafe { GuestRam::new(0, cache::control().ram_bytes, GUEST_RAM_VA) }
+    unsafe { natemu_abi::execution::guest_ram(cache::control().ram_bytes, GUEST_RAM_VA) }
 }
 /// EL0t, IRQs unmasked (the doorbell), D, A and F masked; NZCV is or-ed in. The resident itself runs with DAIF masked.
 const BLOCK_SPSR: u64 = 0x340;
@@ -914,6 +917,15 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             x87::transaction(s, i)?;
             return Ok(commit(s, i, false));
         }
+        // I5b: FXSAVE/FXRSTOR, XSAVE/XRSTOR, XGETBV/XSETBV ([`xsave`]; XSETBV checks its CPL). No flush: FCW and MXCSR are
+        // keyed in `Cpu::code_context`, and XCR0 gates no admitted form.
+        system::FXSAVE..=system::XSETBV => {
+            xsave::transaction(s, i)?;
+            return Ok(commit(s, i, false));
+        }
+        // L3: port I/O ([`ports`]): each checks its own privilege (IOPL, the TSS I/O bitmap) and commits itself (a REP
+        // INS/OUTS stays at the instruction between elements).
+        system::IN..=system::OUTS => return ports::transaction(s, i),
         // S3: each checks its own privilege ([`syscalls`]); SYSCALL/SYSRET commit to their target RIP.
         system::SWAPGS..=system::CLFLUSH => {
             let c = s.cpu;
@@ -1061,7 +1073,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                 cr4: c.cr4,
                 apic_base: msr_get(slot(cpu::MSR_APIC_BASE)),
                 misc_enable: msr_get(slot(cpu::MSR_MISC_ENABLE)),
-                xcr0: cpu_profile::XCR0_RESET, // no XSETBV yet (I5b)
+                xcr0: c.xcr0,
             };
             let [eax, ebx, ecx, edx] = cpu::cpuid(gpr(0) as u32, gpr(1) as u32, &d);
             [0, 3, 1, 2].into_iter().zip([eax, ebx, ecx, edx]).for_each(|(r, v)| s.cpu.gpr[r] = u64::from(v));
@@ -1374,7 +1386,7 @@ impl CodePages for DataWrites<'_> {
 /// fault stops with the precise state. Returns the guest-physical address of `va`, or `None` when the
 /// walk kept losing A/D races to peers (nothing installed: the caller resumes the instruction, which
 /// faults and walks again, as x86 re-walks). A device page (not guest RAM) is walked but not shadowed: its address is
-/// returned for the device path. Translated pages are shadowed read-only whatever the
+/// returned for the device path (L3: an unassigned one may then be shadowed onto the all-ones page, `mmio::ones`). Translated pages are shadowed read-only whatever the
 /// walk grants; a write to one, or an A/D update in one, takes [`code_written`] first (which may step
 /// the instruction instead of returning), and each A/D update is re-checked after it is made.
 fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, access: Access) -> Option<u64> {
@@ -1552,7 +1564,9 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
             Some(_) => {}
         }
     }
-    if device != [None; 2] {
+    // L3 (amendment): a read whose non-RAM pages are all unassigned shadows them onto the all-ones page and retries, so
+    // every read form runs natively; anything else (a write, a device's page) takes the device path.
+    if device != [None; 2] && (write || !mmio::ones(&mut s, f, b, site, touched, device)) {
         mmio::device(s, f, b, site, device[0].filter(|_| touched[1].is_none()))
     }
     s.last_retry = [elr, far, tables::descriptor(s.cpu.cpl, far), s.shadow_generation];
@@ -1635,6 +1649,19 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
         s.splits += 1;
         write_record(record(), s);
         self::resume(&s, resume, b.code_va() + access.native_offset as u64 + 4, spsr)
+    }
+}
+
+/// L3 (amendment): shadows linear page `va` (of an unassigned guest-physical page) read-only onto the all-ones page; on
+/// table capacity exhaustion evicts every shadow once and retries.
+fn install_ones(s: &mut State, va: u64) {
+    if tables::install_ones(s.cpu.cpl, va).is_ok() {
+        return;
+    }
+    reset_shadows(s);
+    s.evictions += 1;
+    if tables::install_ones(s.cpu.cpl, va).is_err() {
+        halt(s, stop::SHADOW)
     }
 }
 

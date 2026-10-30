@@ -100,7 +100,7 @@ The census C0 (§3) lists the forms the real binaries contain; rows below are th
 
 | Feature | Use | General path must | Check | Chunk |
 | --- | --- | --- | --- | --- |
-| Guest RAM and layout | **Decided:** M69 map, default L = 2 GiB (configurable 1–3 GiB), H = 0; tests choose their own size | Built (M1): guest RAM a run-time size R (2 MiB multiples to 3 GiB, default 2 GiB), per-page structures sized for 3 GiB and scanned by use, [R, 4 GiB) non-RAM, shadow pool 288 pages, resets counted; the legacy hole becomes non-RAM with L3's unassigned rule | Standing suite at 4 MiB and 2 GiB; programs above 16 MiB and at holes | M1 |
+| Guest RAM and layout | **Decided:** M69 map, default L = 2 GiB (configurable 1–3 GiB), H = 0; tests choose their own size | Built (M1): guest RAM a run-time size R (2 MiB multiples to 3 GiB, default 2 GiB), per-page structures sized for 3 GiB and scanned by use, [R, 4 GiB) non-RAM, shadow pool 288 pages, resets counted; the legacy hole non-RAM since L3 (the unassigned rule) | Standing suite at 4 MiB and 2 GiB; programs above 16 MiB and at holes | M1 |
 | Memory types: PAT, PWT/PCD, MTRR | Linux PAT = WB, WC, UC-, UC, WB, WP, UC-, WT (`K mm/pat/memtype.c:344`, written `:234`); LAPIC/IOAPIC mapped UC | Walker evaluates PAT/PWT/PCD (and MTRR if advertised) instead of halting (`shadow status=1 detail=7`, slice-3 S3a2); RAM of any type runs as coherent WB (declared deviation); device pages take M3 | Paging cells with PAT bits (`coherence_model.py` profile updated); QEMU | M2 |
 | MMIO from translated code | xAPIC, IOAPIC | Device ranges never shadowed; an abort at a load/store site completes once through the device owner from the site's completion record (fexc's decode of the translated instruction: width, direction, register and merge, length), then resumes after the instruction; every other form (string, vector, RMW, atomic) → typed stop | QEMU programs on device pages; #PF-before-device priority | M3 |
 | 1 GiB pages | Only with GBPAGES | Not advertised (CPU 16); PS in a PDPTE → #PF(RSVD) (contract 10) | Existing cells | — |
@@ -200,7 +200,7 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 | **X4** mailbox AP start | Resident waiting state, responder, N = 1..4 | Mailbox model; trampoline + `secondary_startup_64` prefix transcription vs QEMU | `smp` | APs reach their stacks with the lock released |
 | **L3** port I/O and UART | IN/OUT/INS/OUTS, IOPL/bitmap, unassigned-port rule, 16550A, IRQ4 line | QEMU for assigned ports; the manifest rule for unassigned | `system`, `contain` | 8250 sequences give QEMU's results |
 | **L4a** IOAPIC + PIC (~1 run) | QEMU models in the host; IRQ routing to X3; EOI back | QEMU device models; IRQ4 → IOAPIC → LAPIC once per edge | `smp` | routing and EOI match |
-| **L4b** PIT/0x61, RTC, PM timer/PM1, S5 (~1 run) | From V; quick-PIT-calibrate and PIT-disable sequences; PM timer as watchdog source | QEMU device models; PM/TSC rate agreement | `smp`, `contain` | cited Linux sequences produce QEMU's values |
+| **L4b** PIT/0x61, RTC, PM timer/PM1, S5, ACPI reset register (~1 run) | From V; the FADT reset register (one byte at I/O 0xb040, value 6: Linux's default ACPI reboot writes it first) and PM1 enable bits that read back (L2); quick-PIT-calibrate and PIT-disable sequences; PM timer as watchdog source | QEMU device models; PM/TSC rate agreement | `smp`, `contain` | cited Linux sequences produce QEMU's values |
 | **I2** REP strings | §1c REP row | QEMU corpora; element-boundary fault matrix; interrupt windows (after X2) | faults, ASM REP/STOS | contract 44 has a general-path check |
 | **I3** LOCK forms | §1c LOCK row | `litmus` RMW cells (model extended, independent author); chains; faults | `litmus`, faults | ASM `Atomics` pass or refused with reason |
 | **I5a** SSE state and arithmetic (~1–2 runs) | XMM/MXCSR in the frame, vector sites, recovery, ordering cells | FEX ASM SSE; QEMU corpora; vector fault matrix; litmus vector cells | ASM, `litmus`, faults | SSE ASM tests pass or refused with reason, 0 fail |
@@ -382,6 +382,27 @@ I1's, not I7's (also on series14 with the prefixes removed): after a 16-bit regi
 FEX leaves AF's x27 write out, so a fault at a later access in the block would bank a stale AF (P6, program
 `i7-random-45`). Census FS/GS class: kernel 36,958 → 0,
 initramfs 27,599 → 2. FEX ASM suite unchanged (its FS/GS tests need WRFSBASE/WRGSBASE or SSE).
+*Revised (October 29, fexc series27; coordinator's decision): CS/DS/ES/SS prefixes follow Intel.* The presented CPU is
+GenuineIntel, so Intel's rule decides the exception for a non-canonical address, Intel SDM Vol. 3A §4.5.1 (Vol. 1
+§3.3.7.1): #SS(0) only for a reference that uses SS, implicitly (an RSP/RBP base, no override; the stack instructions) or
+explicitly (an SS prefix, whatever the base); a CS/DS/ES prefix makes even an RSP/RBP-based operand a DS-class reference,
+#GP(0). The earlier refusal of SS on a DS-default operand and of CS/DS/ES on an RSP/RBP one is lifted: the shim admits a
+single CS/DS/ES prefix on an RSP/RBP base and a single SS prefix on any explicit ModRM operand; still cut are SS with
+CS/DS/ES (mixed classes, no SDM rule) and SS on a moffs or string source operand. fexc's `JoinSites` takes the class from
+the raw prefix bytes (FEX's decoder drops these prefixes), and the resident's site mapping gives the vector. The host's
+decoded memory forms (every `segments::linear` caller: descriptor-table, segment and far-transfer operands, LAR/LSL/VERR/
+VERW, LDMXCSR/STMXCSR, the x87 and FXSAVE/XSAVE transactions, CLFLUSH, the BT* cut under alignment checking) record the
+class in `System::segment` (`SREG_SS` or `SREG_DS`), which `segments::noncanonical` reads (SSE's LDMXCSR/STMXCSR now use it
+too); prefixes of two classes are not decoded, INVLPG drops them. Motivation: Linux 6.12's SMP alternatives replace LOCK by
+DS on one CPU, giving `ds btr %rdx, 0x540(%rbp)`. QEMU 11.1.2 (TCG, system mode) raises #GP(0) for every non-canonical
+data address, never #SS(0), so its agreement on the #GP cases says nothing and the #SS cases are judged by the rule
+(`run_i5b.py`'s `segment-*` cases; `segment-none-*` are the default-segment controls). Checks: `run_i5b.py` 221
+`segment-*` cases at block sizes default and 1 (DS/ES/CS on RBP and on RSP via `[rsp + rbx]`, SS on RBX and `[rsi + 8]`,
+the defaults as controls; loads, stores, RMW, LOCK ADD, BTR, LOCK BTS, LDMXCSR, FXSAVE, XSAVE; canonical runs,
+non-canonical and straddling addresses; BTS under alignment checking at CPL 3: aligned runs, misaligned #AC, non-canonical
+the class's exception; the kernel's own bytes), all as expected, QEMU agreeing on every #GP case and raising #GP for the 36
+#SS ones; `run_slice1_faults.py` `null_segment_probes` (108: DS/ES/CS on RBP/RSP and SS on RBX/RSI for load, store, RMW,
+LOCK, BT*, XCHG at the I7 targets) match at both block sizes.
 *Built (S2a, control and debug registers):* the bank (`Cpu`) gains CR2, CR8 and DR0-3/DR6/DR7 (`Cpu::dr`, reset
 `DR_RESET`: DR6 FFFF0FF0H, DR7 400H). MOV CR0 accepts every bit of the profile (PE MP EM TS ET NE WP AM NW CD PG), with
 the existing #GP rules (bits 63:32, PG without PE, NW without CD, PG or PE cleared in 64-bit mode); reserved low bits are
@@ -755,7 +776,8 @@ PCMPISTRI 401, ADX/MOVBE and MMX the rest); LDMXCSR/STMXCSR are `system` (kernel
 transactions in `execution/syscalls.rs` and `segments::inspect`, decoded by `system.rs` (F2/F3 now parsed; only the forms
 that name them take them). **SWAPGS** (#GP(0) at CPL > 0) swaps the bank's GS.base with IA32_KERNEL_GS_BASE's slot; the
 page takes it at the next `enter` (I7). **SYSCALL** (#UD without EFER.SCE; under TF it stops `unsupported_system` before any change, as SYSRET does): RCX, R11 := RFLAGS as is (RF included,
-syscall_model C1), RFLAGS &= ~FMASK, CS = STAR[47:32] & FFFCH and SS = STAR[47:32] + 8 (unmasked) with the fixed flat
+syscall_model C1; L3 met it after an IRETQ loading RF = 1: QEMU 11.1.2 and AMD's APM clear RF in R11, Intel's SYSCALL
+operation copies RFLAGS, so Intel's text is kept), RFLAGS &= ~FMASK, CS = STAR[47:32] & FFFCH and SS = STAR[47:32] + 8 (unmasked) with the fixed flat
 attributes, `set_cpl(0)`, RIP := LSTAR, no stack switch. **SYSRET** (#UD, then #GP(0) at CPL > 0, then #GP(0) for a
 non-canonical RCX, Intel's order at CPL 0): RFLAGS := R11 & 3C7FD7H | 2, CS/SS from STAR[63:48] with RPL 3, `set_cpl(3)`
 (since X2 an AC from R11 with CR0.AM turns alignment checking on: the next misaligned access at CPL 3 is #AC(0)); a TF from R11 stops `unsupported_system`; SYSRETL
@@ -1351,15 +1373,14 @@ from it (`guest_ram()`). `run-program --ram BYTES` (default 2 GiB) and `--place 
 tables and pages, default 0x1000); `NATEMU_RAM`/`NATEMU_PLACE` set those defaults, so any runner runs a whole suite at
 another size or placement unchanged. `boot-linux` runs a VM of the map's L (default 2 GiB) and gains `--code-cache`
 (default the largest) and pool reporting (`evictions`, `shadow_resets`, `retries`, the cache fill; a watchdog stop reports the walk `retries` so far). **Legacy hole
-(owner decision, October 29: 0xA0000-0xFFFFF is not RAM; the reserved ranges that are RAM on a PC stay RAM): not
-applied, it waits for L3's unassigned-address rule.** Built and measured: RAM as two ranges ([0, 0xA0000) and [1 MiB,
+(owner decision, October 29: 0xA0000-0xFFFFF is not RAM; the reserved ranges that are RAM on a PC stay RAM): applied with
+L3 (Built (L3)), which gives its pages the unassigned rule.** Built and measured: RAM as two ranges ([0, 0xA0000) and [1 MiB,
 R)), the hole through the device path, never shadowed, a fetch from it not RAM, the driver placing around it and refusing
 identity pages in it, devices registrable there (patch kept at
 `/Users/liaozping/orca/natemu-raw/m1-legacy-hole-20261029.diff`).
-With the typed `unassigned` stop the L1 smoke test then stops after 242 blocks: the decompressor's `get_rsdp_addr()`
-(`acpi_rsdp_addr` is 0 until L2) searches the EBDA and 0xE0000-0xFFFFF for "RSD PTR" with plain loads. So the hole
-becomes non-RAM together with all-ones reads and ignored, counted writes for unassigned device addresses (L3; or once
-L2 fills `acpi_rsdp_addr`, which skips the search). Everything else the boot map reserves below 16 MiB is RAM and stays
+With the typed `unassigned` stop the L1 smoke test then stopped after 242 blocks: the decompressor's `get_rsdp_addr()`
+(`acpi_rsdp_addr` 0) searches the EBDA and 0xE0000-0xFFFFF for "RSD PTR" with plain loads; with L3's rule the search
+reads all-ones and completes (L2 now fills `acpi_rsdp_addr`, which skips it). Everything else the boot map reserves below 16 MiB is RAM and stays
 RAM.
 **Per-page structures** (global area), sized once for 3 GiB, only the first R / 4096 pages used, untouched pages never
 backed: the code-page and writable masks hold 4 bits per page (bit v = vCPU v), page p's nibble at bit 4 (p % 16) of
@@ -1421,7 +1442,253 @@ neither LSE nor the control record's layout, cause not isolated (the independent
 (HEAD shows the same xmc signature under that load). **Not built:** high RAM above 4 GiB (needs per-page structures and
 an alias beyond 4 GiB of guest-physical space, a second RAM range in the resident's description and a multi-range
 loader); the reverse map; resizing the code-cache pools.
+*Built (L2, the ACPI tables of the virtual firmware; no fexc change, series25; after an independent review):*
+`crates/host/src/boot/acpi.rs` builds the tables at load time for N processors (`acpi::build(n, base)`); the loader
+(`Inputs::acpi`, replacing L1's `Inputs::rsdp`) refuses any blob outside the ACPI NVS range 0x600000..0x800000
+(`BAD_TABLES`), places every blob (so `Loaded::writes`, `--dump` and the smoke test's QEMU blobs carry them) and puts
+the RSDP's address in `acpi_rsdp_addr`. `boot-linux` always builds them: `--rsdp ADDR` is the graph's base (default
+0x600000), `--vcpus N` its processor count (1..4 with `--load-only`, 1 for a run until X4). **Sources:** ACPI 6.5
+layouts (the repo's snapshot is 6.6 chapter 5, the same offsets for every field written); contents from M69 (and M22-24)
+and, where M69 names no value, QEMU 11.1.2's own PC tables (`-machine pc` under SeaBIOS, read back with `iasl -d`;
+owner decision below). **Layout (N = 1):** RSDP 0x600000, XSDT 0x600040, FADT 0x600080, FACS 0x6001c0, DSDT 0x600200,
+MADT after the DSDT, each 64-byte aligned, then the 4 KiB AP mailbox on the next page (0x601000), written as zeros
+(command Noop). **RSDP:** revision 2, 36 bytes, no RSDT (address 0), the XSDT (FADT, MADT). **FADT** (revision 6, minor
+5, 276 bytes; not hardware-reduced: L4b provides PM1 and the PM timer): FIRMWARE_CTRL = FACS (X_FIRMWARE_CTRL 0, as the
+spec requires), DSDT in both fields; interrupt-model byte 1 (QEMU's; ACPI 1.0's INT_MODEL, reserved since 2.0, "one
+should also be supported"); PM profile 0; SCI_INT 9; SMI_CMD 0 and ACPI_ENABLE/DISABLE 0 (ACPI-only mode, M69); PM1a
+event 0xb000 (4 bytes), PM1a control 0xb004 (2), PM timer 0xb008 (4), the X_ fields equal; no GPE blocks; P_LVL2/P_LVL3
+latency 0x0fff (C2/C3 unsupported); century 0x32; IAPC_BOOT_ARCH 0x5 (legacy ISA devices, VGA not present; no 8042,
+CMOS RTC present); flags WBINVD, PROC_C1, SLP_BUTTON, RESET_REG_SUP, USE_PLATFORM_CLOCK (0x8425; 24-bit PM timer);
+reset register one byte at I/O 0xb040, value 6 (M69). **FACS:** 64 bytes, version 3, the rest 0. **DSDT** (revision 2,
+AML generated in Rust): `\_S5` = Package {0, 0, 0, 0} (M22); `\_SB.COM1` (PNP0501, `_UID` 1, I/O 0x3f8 length 8,
+IRQNoFlags {4}); `\_SB.RTC` (PNP0B00, I/O 0x70 length 2, IRQNoFlags {8}); `\_SB.C000..` one `Device (ACPI0007)` per
+vCPU with `_UID` = vCPU index; no `_CST`, no P_BLK (only C1 = HLT idle is reachable), no S3/S4 objects. **MADT**
+(revision 6): local APIC address 0xfee00000, PCAT_COMPAT; one Local APIC entry per vCPU (UID = APIC ID = vCPU index,
+enabled; CPUID 1/0xB and X3); IOAPIC ID 0 at 0xfec00000, GSI base 0; interrupt source overrides IRQ0 -> GSI 2 (flags 0)
+and the SCI IRQ9 -> GSI 9 level, active high (flags 0x000d: QEMU's, whose PIIX4 PM drives 1 = asserted; ACPI 5.2.9 makes
+the SCI level/active low only when no override says otherwise); Local APIC NMI on LINT1 for all processors (UID 0xff);
+the multiprocessor wakeup structure, version 0, 16 bytes, pointing at the mailbox. No HPET, MCFG, RSDT or EFI tables.
+The device constants are `boot::acpi::platform`, the one description L3/L4a/L4b/X3/X4 implement.
+**Deviations from QEMU's PC tables, each deliberate:** RESET_REG_SUP and the reset register (M69 adds them; QEMU's PC
+FADT is revision 1 without them); RTC_S4 clear (QEMU sets it; this machine has no S4, M22); IAPC_BOOT_ARCH 0x5 (QEMU's
+revision-1 FADT has no such field; Linux reads it from revision 2, and these bits describe this machine); no SMI command
+(QEMU's 0xb2 belongs to SeaBIOS's SMM; M69 selects ACPI-only mode); no GPE0 block (QEMU's PIIX4 has 0xafe0 length 4; a
+zero block is legal and no hotplug or GPE source is wired; L4b adds it with a source); no overrides for PCI link IRQs 5,
+10, 11 and no PCI host bridge (no PCI devices); no HPET or WAET; FACS version 3 (QEMU's 0); no virtio-MMIO devices
+(LNRO0005, M69; not in this phase). **The one iasl exception:** the wakeup structure is the 16-byte version-0 form of
+ACPI 6.5 (Table 5.43); iasl 20260408 knows only the 24-byte 6.6 form (version 1, with ResetVector), so its disassembly
+ends with "ACPI table terminates in the middle of a data structure!" after it. Version 1 is not used: Linux 6.12 would
+take its ResetVector (here 0) for the offline/kexec path (`madt_wakeup.c` `acpi_parse_mp_wake`).
+**Checks.** `cargo test boot::` (8: checksums, lengths and the pointer graph; MADT against CPUID 1/0xB APIC IDs and
+counts, IA32_APIC_BASE, the DSDT processors, the mailbox and the e820 for N = 1..4; the FADT ports, flags and the RTC
+bytes; AML encodings; every table byte in a recorded write). `tools/run_l2_iasl.py` (N = 1..4): `iasl -d` of XSDT,
+FADT, FACS, DSDT and MADT clean except the one exception above, required in place; the DSDT recompiled from iasl's
+disassembly with `-oa` equals ours except checksum and compiler fields; iasl's RSDP template filled with our values
+compiles to our RSDP byte for byte. `tools/run_l2.py` (the independently written checker `tools/models/acpi_model.py`,
+with negative controls in `test_acpi_model.py`): pass for N = 1..4, its remaining flags the deviations above.
+`tools/run_l1.py` 12/12, 41/41 (`bootproto.py` also verifies the RSDP); the L1 smoke test at 2 GiB matches QEMU at the
+kernel entry, now in 2,101 blocks (2,112 before: the decompressor's RSDP search is skipped). **Linux's own parse:** the
+Debian 6.12.107 kernel, loaded by natemu's loader (`--load-only --dump`) and run under QEMU 11.1.2 (`-machine pc`, TCG,
+no BIOS, the smoke test's firmware stub, serial to a file; scratch script `l2/qemu_kernel.py`), lists all six tables,
+"PM-Timer IO Port: 0xb008", the LINT1 NMI, IOAPIC[0] GSI 0-23, the IRQ0 override (`..TIMER: pin1=2`), "Allowing N
+present CPUs" for N = 1 and 4, `acpi_wakeup_cpu()` replacing INIT/SIPI, the AML loaded, "Interpreter enabled", "supports
+S0 S5", PnP ACPI COM1 (ttyS0 0x3f8 IRQ 4); at N = 4 it then waits in `acpi_wakeup_cpu` (QEMU has no mailbox responder:
+X4). Three warnings, explained: "Incorrect checksum in table [APIC]" (Linux zeroes the wakeup structure's mailbox address
+after caching it, `acpi_mp_disable_offlining`, a Linux convention: the MADT stays writable RAM); "PM-Timer failed
+consistency check" and "Could not disable RealTimeClock events" (without firmware QEMU's PIIX4 PM block is not decoded
+at 0xb000, M21; under natemu L4b's PM1 must answer). Inside natemu the kernel stops at its first port access, before it
+parses ACPI (L3). **For X4:** the mailbox is `Tables::mailbox` (0x601000 by default), version 0, APs addressed by APIC ID
+= vCPU index; tables for a run describe exactly the vCPUs run. **For L4a:** IOAPIC ID 0 at 0xfec00000, 24 pins; ISA
+IRQ0 -> GSI 2, IRQ n -> GSI n otherwise; the SCI on GSI 9 level, active high; COM1 IRQ 4 and RTC IRQ 8 edge, active high;
+the 8259 pair present; LINT1 = NMI. **For L4b:** PM1a status/enable at 0xb000 (enable bits read back, including
+PWRBTN_EN and RTC_EN: the fixed power button and RTC status are in PM1), PM1a control 0xb004 (SLP_TYP 0 + SLP_EN = S5),
+the 24-bit PM timer at 0xb008, SCI_EN in ACPI-only mode, the reset byte 0xb040 value 6, RTC at 0x70-0x71 with century
+at CMOS 0x32; a GPE0 block only with a GPE source, then the FADT says so. **For L3:** COM1 at 0x3f8 (`platform::COM1_PORT`).
+
+*Built (L3, port I/O, the 16550A UART and the unassigned rule, with the owner's amendment; no fexc change, series25; after an independent review):*
+**Port I/O.** fexc already cut IN/OUT/INS/OUTS as system instructions; the host decodes them (`system.rs`, kinds
+0x60-0x63: imm8 or DX, 1/2/4 bytes, 66 = 16 bits, REX.W does not promote; INS/OUTS with `System::prefixes` REP (F3) and
+ADDRESS32 (0x67), INS always ES, OUTS with FS/GS; SS on OUTS, F2 on INS/OUTS and F2/F3 on IN/OUT are not decoded: a typed
+stop with fexc's reason; LOCK #UD) and the resident runs them from the kept decode (K2) as transactions
+(`execution/ports.rs`): at CPL > IOPL the TSS I/O permission bitmap (TR present, type 9 or 11, limit >= 67H, the map base
+at TSS + 66H, the two bytes at base + port / 8 inside the limit, QEMU's and Bochs's `check_io`), #GP(0) when denied, the
+check made before a REP's zero-count test (QEMU's and Bochs's order); one host exit per access (`REQUEST_PORT`, the `Mmio`
+record with the port in `gpa`, `dsb sy` first: I/O ordered with memory both ways); the hook `ports::local` for later hot
+ports (empty). INS/OUTS move one element per transaction (I2's rule: RIP at the instruction between elements,
+`mid_string` set, so events are taken there with RF = 1), DF, 0x67 (ESI/EDI/ECX, written zero-extended); INS walks its
+destination (canonical, #AC, #PF for a write, a device page refused `unsupported_mmio`/`system`) before reading the port
+and writes through that walk. Ports are 16 bits: a wide access at FFFFH continues at 0. **Port bus** (`devices.rs`):
+`Devices::register_ports(base, count, Device)` with M3's contract (per-device mutex, exactly once, cancellation checked
+first); an access inside one range is one call, any other byte by byte (each byte its owner's or the rule's; a device
+refusing a later byte leaves the earlier bytes made: no device refuses a byte today); every access counted at each port it
+touches. **0xCF8/0xCFC** are left to the rule: no host bridge, so no type-1 mechanism (Linux's `pci_check_type1` reads
+0xCF8 back as all-ones and decides there is no PCI; `read_pci_config_16` returns FFFFH). **UART** (`uart.rs`): QEMU
+11.1.2's `hw/char/serial.c` transcribed (line numbers in the module), byte registers (wider accesses split, as QEMU's
+`impl.max_access_size` 1), MCR reset OUT2 (QEMU's), MSR of a backend without modem control, instantaneous transmit,
+loopback, the FIFO timeout checked at each access; COM1 at `platform::COM1_PORT`; output to `boot-linux --serial FILE` and
+`run-program`'s `uart`. **Unassigned rule (owner, October 29, and its amendment):** an unassigned port reads all-ones at
+its width, a write is ignored; an unassigned page (not RAM, no device: the legacy hole, [R, 4 GiB) but device pages, above
+4 GiB) is shadowed read-only, never executable, onto one shared all-ones page (`ALL_ONES_IPA` 0xC000000, 16 KiB, mapped
+read-only at stage 2) when a read first touches it: the resident asks the host (`REQUEST_PAGE`: `CLAIMED`, `DONE` with
+the fill counted as the page's read, or `UNASSIGNED` under strict) and every read form then runs natively (CMP, string,
+SSE, a read crossing from RAM: RAM's bytes then 0xff); a write aborts into M3's path: MOV stores complete as ignored, each
+counted; RMW, POP m, string stores (`form`), LOCK and XCHG (`atomic`), a crossing store (`crossing`) and system
+instructions' own accesses (`system`) keep their typed refusals; a fetch from such a page is no RAM (typed stop).
+`--strict-unassigned` (both drivers) makes every one a stop (`unsupported_port`, new stop 49; `unsupported_mmio` status
+`unassigned`), counted. Pages a device claims are never shadowed: this vCPU's LAPIC page whatever its mode (disabled or in
+x2APIC mode it answers MOV forms as an unassigned page would, other forms are refused as a device page's); an
+IA32_APIC_BASE move drops the vCPU's shadows (its new page may hold an all-ones shadow; moves are rare and Linux makes
+none). The registry is fixed before the vCPUs run, so no page shadowed all-ones can become a device's at run time; a
+device registered at 0xFEC00000 before the run is never shadowed (`run_l3.py` `ioapic-device`). The host refuses a device
+or page request for RAM (a bad reply), so a resident error cannot be answered all-ones. Reports: `ports` (per port:
+reads, writes, unassigned), `unassigned_pages` (reads = fills, writes = accesses), `uart`/`serial_bytes`. **Admission
+fix found by the kernel run:** `branch_target` now skips the ES/CS/SS/DS overrides before a near direct branch (null in
+64-bit mode; Linux's `-mindirect-branch-cs-prefix` emits `2e e8 rel32`); 66 (rel16) and FS/GS are not skipped. **Checks**
+(`tools/run_l3.py`, programs in `tools/bench/smp/ports.py`): `qemu` 8 programs x block sizes default and 1 equal to pinned
+QEMU (registers, captured memory, UART bytes): every UART width and register, Linux's 8250 `autoconfig`,
+`autoconfig_16550a`, `clear_fifos` and earlyprintk sequences, loopback FIFO with overrun, unassigned ports at every width,
+REP INS/OUTS forms with #PF midway, and five CPL 3 IOPL/bitmap configurations (19 cases each, zero counts included);
+`stress` (kicks with events between elements: RF and RCX exact at every delivery, output exact); `cases` 14 natemu-only
+SDM/rule cases (strict, PCI probes, wrap, crossing the UART's end, LOCK, F3, INS on a device page, INS #AC/#PF with the port
+unread, CPL 3 without a bitmap); `pages` 40 cases: the hole, 0xC0000000 at 2 GiB, 0x80_0000_0000 and the IOAPIC page each
+with CMP/LODS/REPE CMPSB/MOVUPS/load-op reads (one fill), MOV writes ignored and counted, RMW/XCHG/STOS refused, strict
+read and write stops; a read crossing from RAM's last page into [R, 4 GiB); two vCPUs filling the hole; the xAPIC page
+disabled and in x2APIC mode (all-ones, never shadowed, the version readable at once after re-enable); a device at
+0xFEC00000; the shadow drops (a write after a fill; remaps hole -> RAM after INVLPG and after a CR3 reload, RAM -> hole
+after INVLPG; an APIC base moved onto a filled page; two vCPUs with different APIC bases), each drop case shown failing
+with its drop disabled. `run_m3.py` `unassigned` (10), `run_m1.py` (20), `run_x3.py` cases updated to the rule. QEMU departures kept
+out of the comparisons: an access crossing 3FFH (QEMU aborts, serial.c:476), a misaligned wide read of an unassigned port
+(QEMU reads 0), a wide access at FFFFH; SeaBIOS uses COM1 first (programs reset it). L1 smoke test with the hole: equal to
+QEMU; with `acpi_rsdp_addr` forced to 0 (scratch build) the decompressor's RSDP scan reads 0xE0000-0xFFFFF all-ones and
+the result is still equal. **Kernel** (Debian 6.12, 2 GiB, `console=ttyS0 earlyprintk=serial mitigations=off nokaslr`):
+117 console lines to `SRBDS: Unknown: Dependent on hypervisor status`, then fexc stops `unsupported_form` at FXSAVE
+(0xffffffff83369a1d, `mxcsr_feature_mask_init`, I5b). **For L4a:** the UART's `irq` hook reports level changes (a THR
+write gives low then high again); QEMU's edge-mode IOAPIC delivers on every raise, 1 -> 1 included, so L4a must decide
+whether a raise while high is an edge (QEMU) or none (a real edge detector); the CTI timeout and any host input become
+asynchronous sources: they must post through `execution::post` and veto ending halted vCPUs while they can fire (X3's
+rule). The xAPIC page while its APIC is disabled or in x2APIC mode answers MOV forms with all-ones (writes ignored) from
+the resident's LAPIC, is not counted in `unassigned_pages` (it is a device page, never a fill), and refuses every other
+read form (`form`, as a device page). The kernel's "ACPI BIOS Warning (bug): Incorrect checksum in table [APIC]" is not
+L2's: Linux's `acpi_mp_disable_offlining` zeroes the MADT's multiprocessor-wakeup mailbox address in the table itself
+(the second review verified that only bytes 0x600323-0x600324 changed), after the checksum was computed. Not built: UART
+input, a host timer for CTI, hot-port resident devices, runtime device registration.
+
+*Built (I5b, FXSAVE/XSAVE family and gating; fexc series26-i5b = series25 + a shim change; reviewed October 29, its
+fixes in series27):*
+**Forms.** The shim cuts `0f ae /0 /1 /4 /5 /6` and `0f c7 /3 /4 /5` with a memory operand as system instructions (`0f 01
+d0/d1` already were); the host decodes FXSAVE/FXRSTOR, XSAVE/XRSTOR (REX.W's 64-bit forms too; NP: 66/F2/F3 and 0x67 are
+not decoded, a typed stop) and XGETBV/XSETBV as kinds **0x68-0x6d** (`system::FXSAVE..=XSETBV`; 0x68-0x6f reserved for
+I5b), and decodes XSAVEOPT (`/6`), CLWB (66 `/6`), XRSTORS, XSAVEC, XSAVES as #UD: CPUID.(EAX=0DH,ECX=1):EAX = 0 and
+CPUID.7.0:EBX.CLWB = 0 (the profile: XCR0 ⊆ 7, standard format only, no XGETBV with ECX = 1, no IA32_XSS). The resident
+runs them from the kept decode (K2) in `execution/xsave.rs`. **State.** XCR0 is `Cpu::xcr0` (reset 1); CPUID.0DH.0:EBX
+now follows it (576/832). YMM_Hi128 (component 2) lives in the guest-state page at FEX's `avx_high` (`frame::AVX_HIGH`
+= C0H, 256 bytes), outside `GUEST_STATE` (no admitted code reads it; the driver's `frame_intact` admits the range), so
+it is zero until an XRSTOR loads it and XSAVE stores what it holds; it was not put in `Cpu` because every copy of the
+bank on the resident's deepest paths grew the gate bound past its headroom (22,032 bytes). Deviation (as I6 deviation 12
+for the x87 fields, G1's page deviation): a guest data access to the guest-state page reaches the vCPU's own YMM_Hi128. **Images** (SDM Vol.2 FXSAVE
+Tables 3-46/3-47, Vol.1 13.4): FCW, FSW (`x87::fsw()`), the abridged tag byte as the page holds it, byte 5 and FOP,
+FIP/FCS, FDP/FDS 0 (I6 deviation 8: so FXSAVE and FXSAVE64 store the same bytes), MXCSR, MXCSR_MASK FFFFH, ST0..7 widened
+exactly from the doubles at 32 + 16i with bytes 10..15 0, XMM0..15 at 160; bytes 416..511 are never written. FXRSTOR and
+XRSTOR load FCW, FSW (`x87::set_fsw`), the tag byte and ST(i) rounded to doubles by the new FCW.RC (I6 deviation 2).
+XSAVE stores what RFBM = XCR0 ∧ EDX:EAX selects (MXCSR/MXCSR_MASK with RFBM[1] or RFBM[2]), then XSTATE_BV := old ∨ RFBM
+(XINUSE is all ones, which the SDM allows: QEMU does the same); no other header byte is written. XRSTOR, standard form:
+#GP(0) for XCOMP_BV ≠ 0 (bit 63, the compacted form, needs XSAVEC), XSTATE_BV outside XCR0 or header bytes 16..23 ≠ 0
+(bytes 24..63 are not checked: the current SDM checks 23:8); per component of RFBM, load (XSTATE_BV bit set) or the
+initial configuration (x87: FCW 037FH, FSW 0, tags empty, ST 0; XMM 0; YMM_Hi128 0); MXCSR from memory with RFBM[1] or
+RFBM[2], #GP(0) for a reserved bit (FXRSTOR too, whatever CR4.OSFXSR). **Choices the SDM leaves open:** misalignment
+(16 bytes FX*, 64 bytes X*) is #GP(0), never #AC (both instructions' #AC text: "where #AC is not signaled, #GP is
+signaled in its place"), checked before the operand's canonical form and its walk; the canonical check (#GP(0), or #SS(0)
+for an SS-class reference) covers exactly the bytes accessed, a range wrapping past 2^64 included: FX* bytes 0..415,
+XSAVE the span from its first to its last stored byte, XRSTOR the header, then what it restores (review fix: it was the
+nominal 512 or 832 bytes); FXSAVE/FXRSTOR save and restore XMM and
+MXCSR whatever CR4.OSFXSR ("may not ... implementation dependent"; QEMU skips them); #UD (no CR4.OSXSAVE) before #NM (TS).
+**Gating:** FX* #NM with CR0.TS or CR0.EM; XSAVE/XRSTOR #UD without OSXSAVE, then #NM with TS (EM does not gate them);
+XGETBV/XSETBV #UD without OSXSAVE; XSETBV #GP(0) at CPL > 0, for ECX ≠ 0 (ECX's upper half ignored) or a value not in
+the profile's {1, 3, 7} (bit 0 clear, XCR0[2:1] = 10b, unsupported bits, EDX ≠ 0); XGETBV #GP(0) for ECX ≠ 0; LOCK #UD.
+No flush: FCW and MXCSR are keyed in `code_context`; XCR0 gates no admitted form. **Precision:** every byte read is read
+and every page written is walked for write before anything changes (XSAVE walks the span from its first to its last
+stored byte, each page of which it stores to, then stores part by part; XRSTOR reads the header first, then only the
+legacy part and AVX area it loads), so a #PF or #GP leaves state and memory unchanged; nothing is stored unless the whole
+span is guest RAM (review fix: XSAVE stored its RAM part before stopping at a device page, because `pages` returns device
+addresses; it now stops `unsupported_mmio` first, as `linear` does). **Fault order (unverifiable):** the SDM orders none of
+XSAVE's or XRSTOR's accesses and QEMU's stub cannot show it, so these are natemu's choices: XSAVE walks its whole stored span
+for write, lowest page first, before it reads XSTATE_BV, so a fault is reported on the span's first faulting page with write
+intent (a read-only header page is #PF with W, never a read fault of the header); XRSTOR reads the header first, so a fault
+there comes before one on a lower legacy page; hardware may order them otherwise, and may store part of the area before a
+fault, which natemu never does. As FLDCW/LDMXCSR, an FCW or MXCSR
+that would unmask an exception stops `unsupported_system` after every fault check and before any effect (an XRSTOR that
+does not load x87 does not check its FCW). **What I8 must hook:** (1) admit generated code's x28 accesses to
+`frame::AVX_HIGH` (add it to `GUEST_STATE`/`GUEST_STATE_WRITABLE`): FEX keeps YMM upper halves there without SVE256, so
+XSAVE/XRSTOR and the VEX forms then share one copy; (2) gate VEX at translation time (#UD unless CR4.OSXSAVE and XCR0[2:1]
+= 11b, #NM with TS) and key XCR0[2:1] and OSXSAVE in `Cpu::code_context` (or flush on XSETBV), I5a's obligation; (3)
+VEX.128 forms zero the upper half (FEX's lowering) and the 32-byte memory forms need sites, alignment (VMOVAPS/VMOVDQA ymm)
+and atomicity as I5a's. **Checks** (series26-i5b; `tools/run_i5b.py`, QEMU 11.1.2 `-cpu Haswell,-pcid,-hle,-rtm,-invpcid`,
+whose leaf 0DH sub-leaves 0 and 2 and leaf 1 ECX equal the profile's; sub-leaf 1 also advertises XSAVEOPT, which no
+comparison executes, because this QEMU loops in `vmexit(-1)` after setting CR4.OSXSAVE with `-xsaveopt`): `images` 37 CPL0
+programs at block sizes default and 1, GPRs and a 16 KiB pattern-filled data region byte by byte against QEMU: FXSAVE and
+FXSAVE64 of known x87 (doubles: 1.5, -2.25, 3e10, pi, 1e-300, -0, inf, a double denormal), MXCSR and XMM state, full and
+empty stacks; Linux's MXCSR_MASK probe (`fpu__init_system_mxcsr`: FFFFH); FXRSTOR of crafted images (TOP 3, tags B5H, C1
+C3, ZE PE, RC up and down, NaN/inf/zero/min-normal, REX.W) then FXSAVE, FNSTENV, STMXCSR and every XMM; round trips;
+`fpu__init_cpu_xstateregs`-style XSETBV 1/3/7/3/1 with XGETBV, CPUID.0DH.0 and CPUID.1:ECX after each, ECX's upper half
+ignored; XGETBV at reset; XSAVE under each of the 8 RFBMs into pattern-filled areas with a pattern XSTATE_BV; XSAVE64 with
+XCR0 = 3; XRSTOR of crafted images under 13 (XSTATE_BV, RFBM) pairs then XSAVE/FNSTENV/STMXCSR (init vs load per
+component); header bytes 24..63 ignored; XCR0 = 3 then 7; XRSTOR/FXSAVE/FXRSTOR/XSAVE chains; an XSAVE -> XRSTOR round trip
+with AVX state. Declared differences, compared only on natemu's side: FOP/FIP/FCS/FDP/FDS (QEMU tracks them; natemu 0,
+I6 deviation 8), ST slot bytes 10..15 (QEMU leaves them; natemu writes 0), an 80-bit ST value with more than 53
+significand bits (natemu: rounded by FCW.RC, I6 deviation 2), and MXCSR under RFBM = AVX without SSE (the SDM saves and
+loads it; QEMU does neither). All 37 equal at both block sizes. `faults` 149 cases at both block sizes, each judged by the
+SDM rule (vector, error code, CR2, RIP) with GPRs, XMM, MXCSR, the x87 report and the data region equal to natemu's run
+of the same program cut before the instruction: alignment for every form (also with the page not present: #GP first);
+#PF with the image across a page boundary at 3 FX offsets and 5 X offsets, second or first page not present or read-only,
+XSAVE under RFBM 7/1/3 (a fault only where its stores reach) and XRSTOR (the header first: CR2 = its address), XRSTOR
+with RFBM 0 or an initialised component never reading the legacy page; non-canonical #GP/#SS (RSP) and straddles; #NM
+under TS (4 forms) and EM (FX* only), #UD without OSXSAVE (XSAVE, XRSTOR, XGETBV, XSETBV, also with TS), XGETBV under TS
+and FXSAVE without OSFXSR run; LOCK; the 5 unadvertised forms; 9 XSETBV and 1 XGETBV #GP values, XSETBV at CPL 3, XGETBV
+and XSAVE at CPL 3 run; 9 XRSTOR header cases (bit 3, outside XCR0 = 3, compacted, XCOMP_BV low, bytes 16 and 23, bit 63;
+byte 24 runs); MXCSR reserved bits under RFBM SSE/AVX (#GP) and x87-only/none (runs), FXRSTOR's; FCW/MXCSR unmasking
+refused (FXRSTOR, XRSTOR), not when x87 is not loaded; CPL 3 with CR0.AM and RFLAGS.AC: #GP, not #AC. QEMU ran the 60
+cases that need no paging mutation or CPL change and agreed on all but 6 recorded in `QEMU_DIFFERS`: no #NM for
+XSAVE/XRSTOR under TS (SDM: #NM), no reserved-MXCSR #GP for FXRSTOR/XRSTOR (SDM: #GP), XSAVEOPT runs (its model
+advertises it). All 149 as expected. FEX ASM suite (barely exercising these forms: the coverage is `run_i5b.py`'s; tests now run with CR4.OSXSAVE and XCR0 = 7, the program driver's new
+`xcr0` item, as Linux leaves user mode): 1,052 -> 1,053 pass (`SecondaryModRM/Reg_2_0`, XGETBV), 0 fail, 22 precision
+deviations; the FXSAVE/XSAVE tests stop on their MMX or FFREEP forms, or (`fxch_tag_word`, `fincstp_tag_word`,
+`fst_st0_tag_word`, `PFRCPIT1_MM0_selfmove`) on FXRSTOR images whose MXCSR is 0 (all exceptions unmasked: refused, a new
+`run_asm.py` reason). Census (`natemu-raw/kernel-census-i5b-20261029-01/`): kernel x87 10 -> 0 and other 28 -> 1 (the
+FXSAVE/XSAVE forms are `system`), initramfs x87 65 -> 59, other 2,294 -> 2,282 (`experiments/track03/kernel-census/README.md`).
+Standing suite on series26-i5b, all 0 failures: cargo build/test, stack audit (gate 18,960 bytes, 23,040 with a nested
+entry, of 32,768), python unit 281, fix/fix-1 64, seed/seed-1 44, faults/faults-1 7,659 each, flow 64 x 2, loopfaults 846 x
+2, probes 83, corpora, smp (one rerun: `neg-race@2`'s "no CPU took the lost-race self-exit" coverage check, a timing
+outcome, passed on the rerun), limits, kicks, system, coherence, sharedpt, litmus, contain, privilege, delivery, events,
+i6 faults 276 at both block sizes, i5a faults 454, i5a DE 351, `run_m3.py`, `run_l1.py`, `run_l2.py`, `run_l2_iasl.py`,
+`run_k2.py`, `run_x3.py`, `run_m1.py`, `run_l3.py`, `run_i5b.py` 186 (corpora and m3 rerun after the Docker daemon was
+restarted). After review, on series27 (the fixes and I7's revised prefix rule), all 0 failures: cargo build/test, stack
+audit (gate 18,960 bytes, 23,040 nested), python unit 281, fexc `test_slice1.py` 28 (its stale `fld st0` and `fxsave`
+entries moved: admitted since I6, a system cut since I5b) and `check_sites.py --slice1` 64, fix/fix-1 64, seed/seed-1 44,
+faults/faults-1 7,767 each (+108 `null_segment_probes`), flow 64 x 2, loopfaults 846 x 2, probes 83, corpora, smp, limits,
+kicks, system, coherence, sharedpt, litmus, contain, privilege, delivery, events, i6 faults 276 x 2, i5a faults 454, i5a
+DE 351, `run_m3.py`, `run_l1.py`, `run_l2.py`, `run_l2_iasl.py`, `run_k2.py`, `run_x3.py`, `run_m1.py`, `run_l3.py`,
+`run_i5b.py` 410 (+3 `mmio-xsave-*`, +221 `segment-*`), FEX ASM 1,053 pass, 22 precision deviations, 0 fail.
+**Kernel** (Debian 6.12, 2 GiB, `console=ttyS0 earlyprintk=serial mitigations=off nokaslr`): past the MXCSR probe and
+`fpu__init_cpu_xstateregs` ("x86/fpu: Enabled xstate features 0x7, context size is 832 bytes, using 'standard' format"),
+then fexc stops `unsupported_form` at 0xffffffff810a79b2, `ds btr %rdx, 0x540(%rbp)`: on one CPU the kernel's
+SMP alternatives replace that LOCK prefix by DS (bytes `3e 48 0f b3 95 40 05 00 00` in guest memory), and a DS override on an
+RBP-based operand names a non-default segment, which I7's rule refuses (in 64-bit mode DS and SS both have base 0, so the
+rule could admit it; I7's or the next chunk's decision, not I5b's). 122 console lines, 16 s. On series27 (Intel's class
+for that prefix, I7's revised note) the kernel runs on to 175 console lines in 40 s, past "ACPI: 1 ACPI AML tables
+successfully acquired and loaded", and stops `nocode` (`not_executable`) at 0xffffffff817f0fff, a `jne rel32` (`0f 85`)
+whose first byte is its page's last, in `acpi_irq_stats_init` (drivers/acpi/sysfs.c: its calls are `__kmalloc_noprof`,
+`acpi_install_global_event_handler`, `sprintf`, `kstrdup`, `sysfs_create_group`; the stripped vmlinux's exported symbols
+around it). Cause: with one byte (`0f`) before the page end FEX's decoder reports `not_executable`, not `partial_decode`
+(as it does from two bytes on), and the host asks the resident for the next page only on `partial_decode` or
+`end_of_input` (`crates/host/src/execution.rs`, `ran_out`); the next page is ordinary kernel text in the same 2 MiB page.
+**Not built:** XSAVEOPT/XSAVEC/XSAVES/XRSTORS, XGETBV with ECX = 1 and XFD (not advertised); AVX state beyond its XSAVE
+component (I8); FOP/FIP/FDP (I6 deviation 8); XINUSE tracking (all ones).
+
+**Owner decisions (October 29, L2):** (1) the ACPI tables come from natemu's own Rust builder (`crates/host/src/boot/acpi.rs`) using QEMU's conventional values, instead of reusing QEMU's C builder and linker (the Q6 deviation is accepted); it is judged by an independently written checker (`tools/models/acpi_model.py`, `tools/run_l2.py`) and by Linux 6.12's own parse of the same tables under QEMU. (2) Intel's ACPICA tools (`iasl`, Homebrew `acpica` 20260408) are installed for the standard `iasl -d` disassembly check.
+
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
+
+**Owner decision (October 29, amendment after L3):** unassigned memory pages (including the legacy hole 0xA0000–0x100000) are mapped read-only and non-executable onto one shared all-ones page, so every read form (compare, checksum, string, SSE) runs natively and exactly; reads are counted per page on first touch (shadow fill), writes stay counted per access and complete as ignored for MOV forms (other write forms keep their typed refusals); fetch stays a typed stop; the strict switch still turns all of it into stops. Context: Linux's `reserve_ibft_region`, `probe_roms`, DMI and `smp_scan_config` scan 0x80000–0xFFFFF with CMP/checksum/string loops. Pages a device claims stay unshadowed (M3); the LAPIC's possible page is always a device page.
 
 **Owner decision (October 28): MTRRs enabled by the virtual firmware, RAM write-back, device ranges uncached** (plan Q3).
 **Deferred (owner, October 28):** replacing the host's minimal JSON reader (`crates/host/src/json.rs`, used only for

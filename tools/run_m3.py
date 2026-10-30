@@ -3,7 +3,7 @@
 semantics, through the host's device registry (boot-features plan, M3).
 
     tools/with-env python3 tools/run_m3.py --fexc FEXC --out DIR [--programs 60] [--seed S] [--kicks 1000]
-        [--iterations 20000] [--cpus 1 2 3 4] [--xmc-iterations N] [--xmc-peer N] [--only corpus,faults,refusals,kicks,contain,xmc]
+        [--iterations 20000] [--cpus 1 2 3 4] [--xmc-iterations N] [--xmc-peer N] [--only corpus,faults,refusals,unassigned,kicks,contain,xmc,boundary]
 
 Every description maps linear page 0x200000 to guest-physical 0xfeb00000 (`mmio` item), where the driver registers its
 test device (`crates/host/src/devices.rs` TestDevice: a counter register at 0xf00 whose every read counts, a sequence
@@ -26,7 +26,13 @@ every access counted and logged). Needs fexc series23-m3 (completion records on 
 - `refusals`: every form the device path does not complete stops `unsupported_mmio` with its reason, RIP at the
   instruction and the device untouched: read-modify-write, compare, BT, CMPXCHG, SETcc, PUSH/POP, MOVNTI, string, SSE,
   LOCK and XCHG (`atomic`), a load or store crossing between RAM and the device page either way (`crossing`), a page no device claims
-  (`unassigned`), an access the device refuses (`device`).
+  (`unassigned`, under `--strict-unassigned` since L3), an access the device refuses (`device`).
+- `unassigned` (L3, the owner's rule of October 29 and its amendment): on a page no device claims, a read shadows the
+  page read-only onto the shared all-ones page (one fill, counted as the page's read), so every read form runs natively:
+  MOV forms all-ones at their width (x86's merge and extension), CMP, PUSH m, a load crossing into RAM; MOV stores are
+  ignored, each counted; RMW and POP m (`form`), LOCK and XCHG (`atomic`), a store crossing (`crossing`) and a system
+  instruction's own access (LGDT: `system`) keep their typed refusals, uncounted; `--strict-unassigned` turns a load or
+  store into the `unassigned` stop (counted).
 - `kicks`: 1-4 vCPUs loop `iterations` times over a counter read (each vCPU checks the values it gets increase) and a
   sequence write (n-th write carries n) while host kickers stop each vCPU at random times (`--kicks` per vCPU): every vCPU
   reaches its end, the device saw exactly `iterations` reads and writes from each (no access dropped or repeated by a
@@ -319,16 +325,71 @@ def refusal_cases():
         return p
     cases.append(('refuse-device', f'rip {CODE:#x}\nrflags 0\n{regs()}\ncode {asm("mov eax, dword ptr [rbx + 0xffc]").hex()}\n{mmio_lines(bytes(16))}',
                   lambda out: refused('device')(out)))
+    # L3: an unassigned page stops only under the strict switch (the unassigned rule is `unassigned_cases`).
     cases.append(('refuse-unassigned', f'rip {CODE:#x}\nrflags 0\n{regs()}\ncode {asm("mov eax, dword ptr [rbx + 8]").hex()}\n'
-                  f'mmio {DEV:#x} {GPA:#x} unassigned\nmmio 0x210000 {GPA + 0x10000:#x}\n', unassigned))
+                  f'mmio {DEV:#x} {GPA:#x} unassigned\nmmio 0x210000 {GPA + 0x10000:#x}\n', unassigned, ['--strict-unassigned']))
+    return cases
+
+
+def unassigned_cases():
+    """L3, the owner's unassigned rule on a page no device claims: every MOV form with a completion record reads all-ones at
+    its width (merged as x86 merges: 8/16-bit keep the rest, 32-bit zero-extends, MOVZX/MOVSX/MOVSXD extend) and has its
+    stores ignored, each access counted for the page; every other form keeps its typed refusal (M3's: `form`, `atomic`,
+    `site`, `crossing`, `system`), the page untouched."""
+    asm, cases = ref.assemble, []
+    page = f'mmio {DEV:#x} {GPA:#x} unassigned\n'
+    movs = [('mov al, byte ptr [rbx + 8]', 'rax', 0x1111_1111_1111_11ff), ('mov cx, word ptr [rbx + 8]', 'rcx', 0x2222_2222_2222_ffff),
+            ('mov edx, dword ptr [rbx + 8]', 'rdx', 0xffff_ffff), ('mov rbp, qword ptr [rbx + 8]', 'rbp', M64),
+            ('movzx r8d, byte ptr [rbx + 8]', 'r8', 0xff), ('movsx r9, word ptr [rbx + 8]', 'r9', M64),
+            ('movsxd r10, dword ptr [rbx + 8]', 'r10', M64), ('mov ah, byte ptr [rbx + 9]', 'rax', 0x1111_1111_1111_ffff),
+            ('movzx r14, word ptr [rbx + 0xffe]', 'r14', 0xffff),
+            ('mov dword ptr [rbx + 8], 0x12345678', None, None), ('mov qword ptr [rbx + 16], r15', None, None),
+            ('mov byte ptr [rbx + 24], ah', None, None), ('mov r11, qword ptr [rbx + 8]', 'r11', M64),
+            (f'movabs eax, dword ptr [{DEV + 8:#x}]', 'rax', 0xffff_ffff)]
+    want = {r: v for _, r, v in movs if r}
+    # Reads are counted per shadow fill (one: the page's all-ones shadow serves every later read), writes per access.
+    reads, writes = 1, sum(1 for _, r, _ in movs if not r)
+    def rule(out):
+        p = [] if out['stop'] == 'reached' else [f"stop {out['stop']} {out['reason']}"]
+        p += [f"{k} {out['gpr'][REGS.index(k)]} != {v:#x}" for k, v in want.items() if int(out['gpr'][REGS.index(k)], 0) != v]
+        if out.get('unassigned_pages') != [{'page': f'{GPA:#x}', 'reads': reads, 'writes': writes}]: p.append(f"counts {out.get('unassigned_pages')}")
+        return p
+    init = regs(rax=0x1111_1111_1111_1111, rcx=0x2222_2222_2222_2222, rdx=0x3333_3333_3333_3333, rbp=5, r15=7)
+    cases.append(('rule-movs', f'rip {CODE:#x}\nrflags 0\n{init}\ncode {asm(chr(10).join(t for t, _, _ in movs)).hex()}\n{page}', rule))
+    def stop(status, counted=None):
+        def check(out):
+            p = []
+            if (out['stop'], out['reason'].split()[0], out.get('mmio', {}).get('status')) != ('resident', 'unsupported_mmio', status):
+                p.append(f"stop {out['stop']} {out['reason']} {out.get('mmio')}")
+            if int(out['rip'], 0) != CODE: p.append(f"rip {out['rip']}")
+            if out.get('unassigned_pages') != counted: p.append(f"counted {out.get('unassigned_pages')} != {counted}")
+            return p
+        return check
+    # Every other read form runs natively on the all-ones shadow (CMP, PUSH m, a load crossing into RAM: all-ones, then RAM).
+    reads_text = 'cmp eax, dword ptr [rbx + 8]\nsete cl\npush qword ptr [rbx + 8]\npop rdx\nmov rsi, qword ptr [rbx + 0xffc]'
+    def native(out):
+        p = [] if out['stop'] == 'reached' else [f"stop {out['stop']} {out['reason']}"]
+        g = {r: int(out['gpr'][REGS.index(r)], 0) for r in ('rcx', 'rdx', 'rsi')}
+        if g != {'rcx': 1, 'rdx': M64, 'rsi': 0xffff_ffff}: p.append(f'{g}')
+        if out.get('unassigned_pages') != [{'page': f'{GPA:#x}', 'reads': 1, 'writes': 0}]: p.append(f"counts {out.get('unassigned_pages')}")
+        return p
+    cases.append(('rule-reads', f'rip {CODE:#x}\nrflags 0\n{regs(rax=0xffff_ffff)}\ncode {asm(reads_text).hex()}\n{page}region {NEXT:#x} 0x1000\nregion 0x3e0000 0x10000\n', native))
+    for name, text, why in (('add', 'add dword ptr [rbx + 8], eax', 'form'), ('pop', 'pop qword ptr [rbx + 8]', 'form'),
+                            ('lock-add', 'lock add dword ptr [rbx + 8], eax', 'atomic'),
+                            ('xchg', 'xchg dword ptr [rbx + 8], eax', 'atomic'), ('crossing', 'mov qword ptr [rbx + 0xffc], rax', 'crossing'),
+                            ('lgdt', 'lgdt [rbx + 8]', 'system')):
+        cpl = 0 if name == 'lgdt' else 3
+        cases.append((f'rule-refuse-{name}', f'rip {CODE:#x}\nrflags 0\ncpl {cpl}\n{regs()}\ncode {asm(text).hex()}\n{page}region {NEXT:#x} 0x1000\nregion 0x3e0000 0x10000\n', stop(why)))
+    cases.append(('strict-load', f'rip {CODE:#x}\nrflags 0\n{regs()}\ncode {asm("mov eax, dword ptr [rbx + 8]").hex()}\n{page}', stop('unassigned', [{'page': f'{GPA:#x}', 'reads': 1, 'writes': 0}]), ['--strict-unassigned']))
+    cases.append(('strict-store', f'rip {CODE:#x}\nrflags 0\n{regs()}\ncode {asm("mov dword ptr [rbx + 8], eax").hex()}\n{page}', stop('unassigned', [{'page': f'{GPA:#x}', 'reads': 0, 'writes': 1}]), ['--strict-unassigned']))
     return cases
 
 
 def run_cases(a, host, runtime, cases, report, key):
     failures, rows = [], []
     def one(job):
-        (name, text, check), block = job
-        rc, out, err = driver(host, runtime, a.fexc, text, a.out / key / f'{name}-{block}', [block] if block else [])
+        (name, text, check, *extra), block = job
+        rc, out, err = driver(host, runtime, a.fexc, text, a.out / key / f'{name}-{block}', ([block] if block else []) + list(*extra))
         return (name, block, [f'driver {rc}: {err}'] if out is None else check(out))
     jobs = [(c, b) for c in cases for b in (None, 1)]
     with cf.ThreadPoolExecutor(a.parallel) as pool:
@@ -492,7 +553,7 @@ def main():
     ap.add_argument('--cpus', type=int, nargs='+', default=[1, 2, 3, 4])
     ap.add_argument('--xmc-iterations', type=int, default=300_000, help='xmc: device-access loop rounds of vCPU 0')
     ap.add_argument('--xmc-peer', type=int, default=20_000_000, help='xmc: code rewrites of vCPU 1')
-    ap.add_argument('--only', type=lambda s: s.split(','), default=['corpus', 'faults', 'refusals', 'kicks', 'contain', 'xmc', 'boundary'])
+    ap.add_argument('--only', type=lambda s: s.split(','), default=['corpus', 'faults', 'refusals', 'unassigned', 'kicks', 'contain', 'xmc', 'boundary'])
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     host, runtime = vm.build()
@@ -500,6 +561,7 @@ def main():
     if 'corpus' in a.only: failures += corpus(a, host, runtime, report)
     if 'faults' in a.only: failures += run_cases(a, host, runtime, fault_cases(), report, 'faults')
     if 'refusals' in a.only: failures += run_cases(a, host, runtime, refusal_cases(), report, 'refusals')
+    if 'unassigned' in a.only: failures += run_cases(a, host, runtime, unassigned_cases(), report, 'unassigned')
     if 'kicks' in a.only: failures += kicks(a, host, runtime, report)
     if 'contain' in a.only: failures += contain(a, host, runtime, report)
     if 'xmc' in a.only: failures += xmc(a, host, runtime, report)

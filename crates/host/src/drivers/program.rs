@@ -35,6 +35,14 @@
 //! destroyed, success or failure: vCPUs joined and destroyed, the VM's destroy status, and whether any child process
 //! (compile server) is left, alive or unreaped.
 //!
+//! L3: the VM has COM1, a 16550A UART at ports 3F8H-3FFH (`uart::Uart`), and no other port device. An unassigned port
+//! reads all-ones at its width and ignores writes; an unassigned page is shadowed read-only onto the all-ones page at its
+//! first read (every read form then runs natively) and ignores MOV stores; `--strict-unassigned` makes such accesses typed
+//! stops (`unsupported_port`; `unsupported_mmio` status `unassigned`). `--device-at GPA` (repeatable) registers a test
+//! device (`devices::TestDevice`) at that page, outside guest RAM, as an `mmio` item does without mapping it. Once any port
+//! access, unassigned-page access or UART output happened, the output gains `ports` (per port touched: reads, writes,
+//! unassigned), `unassigned_pages` (per page: reads = shadow fills, writes) and `uart` (the bytes transmitted, hex).
+//!
 //! X2: with `--kick-events E[,E..]` (vectors 16..255 or `nmi`) each kick first posts one of them, chosen at random, so
 //! events arrive at random times. A halted vCPU (HLT) can be woken only by an event: once every kicker has ended and
 //! every vCPU is halted or ended, the driver asks each halted one to end (`stop` `resident`, reason `halted`).
@@ -56,6 +64,7 @@
 //!   | fsbase ADDR | gsbase ADDR (FS.base, GS.base, default 0, canonical; no x86 instruction changes them yet)
 //!   | sse 0|1 (CR4.OSFXSR and OSXMMEXCPT, default 0) | xmm N LO HI (XMMn's quadwords) | mxcsr VALUE (default 0x1f80; every
 //!     exception masked: unmasked SIMD exceptions are not built) (I5a; the report lists `xmm` as 32 quadwords and `mxcsr`)
+//!   | xcr0 1|3|7 (I5b: CR4.OSXSAVE set and XCR0 this value, as Linux leaves user mode; default OSXSAVE clear, XCR0 1)
 //!   | switch ADDR 0|3 (repeatable: the one-byte instruction at ADDR, a `nop`, runs as a change of the CPL to the value,
 //!     the resident's general CPL change; no x86 instruction changes the CPL yet. Blocks end before it.)
 //!   | if 0|1 (RFLAGS.IF at the start, default 1; RFLAGS is the `rflags` value with bit 1 and this)
@@ -67,14 +76,14 @@
 //! CR0 is PE, ET, PG and WP as set, CR4 PAE and SMEP as set, EFER LME, LMA and NXE as set; CPL0 code may change them
 //! with system instructions (the resident's transactions).
 //! Address-space items: code HEX (a body at the section's rip) | body ADDR HEX | memory ADDR HEX
-//!   | identity   (every page maps to the guest-physical page of its own address, inside guest RAM; no `large`)
+//!   | identity   (every page maps to the guest-physical page of its own address, inside guest RAM, outside the legacy hole; no `large`)
 //!   | region ADDR SIZE   (zero-filled writable pages covering the byte range; eager: guest RAM bounds the total)
 //!   | large ADDR   (the 2 MiB-aligned range holding ADDR is one present 2 MiB leaf (PDE with PS), writable if any page
 //!     of the space in it is, not executable unless one is code; at most one per run: guest RAM holds one such frame)
 //!   | unmap ADDR | readonly ADDR   (mutations: clear P or R/W in the leaf entry of ADDR's page after setup)
-//!   | mmio ADDR GPA [unassigned]   (M3: ADDR's page maps the guest-physical page GPA, above guest RAM, writable, not
+//!   | mmio ADDR GPA [unassigned]   (M3: ADDR's page maps the guest-physical page GPA, above guest RAM or in the legacy hole, writable, not
 //!     executable, where the driver registers a test device (`devices::TestDevice`, one per distinct GPA; none with
-//!     `unassigned`); `memory` items on that page preload
+//!     `unassigned`: the unassigned rule then answers, L3); `memory` items on that page preload
 //!     its bytes and are reported from it; the mutations below apply to it. The output gains `devices` (each test
 //!     device's per-vCPU reads and writes, order errors and access log) and per vCPU `mmio` (device accesses completed,
 //!     the last status: `done` or the refusal). Not in identity spaces.)
@@ -146,6 +155,8 @@ struct Section {
     fsgsbase: bool,
     xmm: [[u64; 2]; 16],
     mxcsr: u64,
+    /// I5b: XCR0 with CR4.OSXSAVE, or 0 (OSXSAVE clear, XCR0 at reset).
+    xcr0: u64,
     space: usize,
     /// `switch` items: (RIP, CPL).
     switches: Vec<(u64, u64)>,
@@ -183,7 +194,7 @@ fn parse(text: &str) -> Result<Description> {
             _ => chunks.last_mut().unwrap().push(line),
         }
     }
-    let new = |space| Section { rip: 0, rflags: 0, gpr: [0; 16], cpl: 3, wp: true, smep: false, nxe: true, fs_base: 0, gs_base: 0, sse: false, fsgsbase: false, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, space, switches: vec![], posts: vec![], interrupts: true, svr: natemu_abi::lapic::SVR_RESET };
+    let new = |space| Section { rip: 0, rflags: 0, gpr: [0; 16], cpl: 3, wp: true, smep: false, nxe: true, fs_base: 0, gs_base: 0, sse: false, fsgsbase: false, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, xcr0: 0, space, switches: vec![], posts: vec![], interrupts: true, svr: natemu_abi::lapic::SVR_RESET };
     let mut d = Description { spaces: vec![Space::default()], cpus: vec![], sections: chunks.len() > 1 };
     if d.sections {
         items(&chunks[0], &mut d.spaces[0], None)?;
@@ -237,6 +248,7 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
             ("mxcsr", [v]) if number(v)? & !exec::MXCSR_MASK == 0 && number(v)? & exec::MXCSR_MASKS == exec::MXCSR_MASKS => {
                 state(&mut cpu, line)?.mxcsr = number(v)?
             }
+            ("xcr0", [v]) if natemu_abi::cpu_profile::XCR0_VALID.contains(&number(v)?) => state(&mut cpu, line)?.xcr0 = number(v)?,
             ("cpl", ["0"]) => state(&mut cpu, line)?.cpl = 0,
             ("cpl", ["3"]) => state(&mut cpu, line)?.cpl = 3,
             ("switch", [a, c @ ("0" | "3")]) => state(&mut cpu, line)?.switches.push((number(a)?, c.parse().unwrap())),
@@ -305,7 +317,7 @@ struct Builder {
 }
 impl Builder {
     fn page(&mut self) -> Result<u64> {
-        while self.reserved.contains(&self.next) {
+        while self.reserved.contains(&self.next) || exec::LEGACY_HOLE.contains(&self.next) {
             self.next += 4096;
         }
         let gpa = self.next;
@@ -516,7 +528,7 @@ fn log_images(base: u64) -> [Vec<u8>; 2] {
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] \
                      [--code-shape] [--code-cache BYTES] [--ram BYTES] [--place GPA] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-exit] [--tamper offset|word|record|system] [--tamper-after word|record] \
-                     [--forge-stop] [--forge-entry HEX[,HEX]...] [--kick-vcpu V]... [--kicks M] [--kick-every-us P] [--kick-jitter-us J] [--kick-events E,..] [--tamper next-page|site|site-kind|armed|dispatch|target] [--ignore-kicks] [--kill-compiler N] [--stall-compiler N] [--compile-deadline-ms MS]";
+                     [--forge-stop] [--forge-entry HEX[,HEX]...] [--kick-vcpu V]... [--kicks M] [--kick-every-us P] [--kick-jitter-us J] [--kick-events E,..] [--tamper next-page|site|site-kind|armed|dispatch|target] [--ignore-kicks] [--kill-compiler N] [--stall-compiler N] [--compile-deadline-ms MS] [--strict-unassigned] [--device-at GPA]...";
 
 /// Every literal exit's RIP move puts another RIP in x0: bit 0 of the immediate of its last word (the one before its
 /// `svc #LINK`) flips. A one-word move would change the link point's first word itself, which the host's self-check
@@ -713,7 +725,7 @@ fn finished(stop: &Stop) -> bool {
             | Stop::Logged
             | Stop::FetchFault(_)
             | Stop::NoCode(_)
-            | Stop::Resident { stop: exec::stop::SHUTDOWN | exec::stop::UNSUPPORTED_ATOMIC | exec::stop::HALTED | exec::stop::UNSUPPORTED_MMIO, .. }
+            | Stop::Resident { stop: exec::stop::SHUTDOWN | exec::stop::UNSUPPORTED_ATOMIC | exec::stop::HALTED | exec::stop::UNSUPPORTED_MMIO | exec::stop::UNSUPPORTED_PORT, .. }
     )
 }
 
@@ -726,7 +738,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let (mut forge_stop, mut forged, mut kicked, mut kicks, mut every_us, mut jitter_us) = (false, None, Vec::new(), 10_000, 0, 0);
     let mut kick_events: Vec<u64> = Vec::new();
     let (mut ignore_kicks, mut signal_at, mut deadline_ms) = (false, None, execution::COMPILE_DEADLINE.as_millis() as u64);
-    let (mut code_shape, mut device_tamper) = (false, false);
+    let (mut code_shape, mut device_tamper, mut strict) = (false, false, false);
+    let mut device_at: Vec<u64> = Vec::new();
     // M1: the VM's guest RAM and where the driver starts placing pages; the environment's defaults let a whole suite run
     // at another size or placement unchanged.
     let env = |name: &str, default: u64| std::env::var(name).map_or(Ok(default), |v| number(&v));
@@ -736,6 +749,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let mut value = || -> Result<usize> { options.next().and_then(|v| v.parse().ok()).ok_or(USAGE.into()) };
         match option.as_str() {
             "--code-shape" => code_shape = true,
+            "--strict-unassigned" => strict = true,
+            "--device-at" => device_at.push(number(options.next().ok_or(USAGE)?)?),
             "--code-cache" => code_bytes = value()?,
             "--ram" => ram_bytes = number(options.next().ok_or(USAGE)?)?,
             "--place" => place = number(options.next().ok_or(USAGE)?)?,
@@ -805,7 +820,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     if place % 4096 != 0 || place == 0 || place >= ram_bytes {
         return Err(format!("--place {place:#x}: a nonzero page inside guest RAM"));
     }
-    if let Some(&(_, gpa, _)) = d.spaces.iter().flat_map(|s| &s.mmio).find(|m| m.1 < ram_bytes) {
+    if let Some(&(_, gpa, _)) = d.spaces.iter().flat_map(|s| &s.mmio).find(|m| m.1 < ram_bytes && !exec::LEGACY_HOLE.contains(&m.1)) {
         return Err(format!("mmio page {gpa:#x} is guest RAM"));
     }
     let backing = execution::prepare(resident, code_bytes, n, ram_bytes as usize)?;
@@ -814,8 +829,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     // Identity-mapped pages first: the allocator never hands them out (the logging pages of identity spaces too).
     for c in d.cpus.iter().filter(|c| d.spaces[c.space].identity) {
         for page in identity_pages(&d.spaces[c.space], c.rip) {
-            if page >= ram_bytes || page == 0 {
-                return Err(format!("identity page {page:#x} outside guest RAM (or page 0)"));
+            if page >= ram_bytes || page == 0 || exec::LEGACY_HOLE.contains(&page) {
+                return Err(format!("identity page {page:#x} outside guest RAM (or page 0, or the legacy hole)"));
             }
             if (LOG_IDENTITY..LOG_IDENTITY + 0x7000).contains(&page) {
                 return Err(format!("identity page {page:#x} is the driver's logging IDT"));
@@ -827,13 +842,18 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     // M3: one test device per distinct `mmio` page, registered for every vCPU.
     let mut test_devices: BTreeMap<u64, Arc<Mutex<TestDevice>>> = BTreeMap::new();
     let mut registry = Devices::new(ram_bytes);
-    for &(_, gpa, _) in d.spaces.iter().flat_map(|s| s.mmio.iter().filter(|m| m.2)) {
+    let items = d.spaces.iter().flat_map(|s| s.mmio.iter().filter(|m| m.2)).map(|m| m.1);
+    for gpa in items.chain(device_at.iter().copied()) {
         if !test_devices.contains_key(&gpa) {
             let device = Arc::new(Mutex::new(TestDevice::new()));
             registry.register(gpa, 4096, device.clone())?;
             test_devices.insert(gpa, device);
         }
     }
+    // L3: COM1, a 16550A at 3F8H (output reported as `uart`); the unassigned rule, or with `--strict-unassigned` stops.
+    let uart = Arc::new(Mutex::new(crate::uart::Uart::new()));
+    registry.register_ports(crate::boot::acpi::platform::COM1_PORT.into(), 8, uart.clone())?;
+    registry.strict = strict;
     let registry = Arc::new(registry);
     // A space is built for the first vCPU using it (its rip places `code` bodies).
     let mut spaces: Vec<Option<Tables>> = d.spaces.iter().map(|_| None).collect();
@@ -877,7 +897,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 rflags: c.rflags | 2 | if c.interrupts { 0x200 } else { 0 },
                 cr0: exec::CR0_PE | exec::CR0_ET | exec::CR0_PG | bit(c.wp, exec::CR0_WP),
                 cr3: spaces[c.space].as_ref().unwrap().cr3,
-                cr4: exec::CR4_PAE | bit(c.smep, exec::CR4_SMEP) | bit(c.sse, exec::CR4_OSFXSR | exec::CR4_OSXMMEXCPT) | bit(c.fsgsbase, 1 << 16),
+                cr4: exec::CR4_PAE | bit(c.smep, exec::CR4_SMEP) | bit(c.sse, exec::CR4_OSFXSR | exec::CR4_OSXMMEXCPT) | bit(c.fsgsbase, 1 << 16) | bit(c.xcr0 != 0, exec::CR4_OSXSAVE),
                 efer: exec::EFER_LME | exec::EFER_LMA | bit(c.nxe, exec::EFER_NXE),
                 cpl: c.cpl,
                 fs_base: c.fs_base,
@@ -885,6 +905,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 xmm: c.xmm,
                 mxcsr: c.mxcsr,
                 fcw: exec::FCW_INIT,
+                xcr0: if c.xcr0 != 0 { c.xcr0 } else { natemu_abi::cpu_profile::XCR0_RESET },
                 cr2: 0,
                 cr8: 0,
                 dr: exec::DR_RESET,
@@ -1075,7 +1096,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let mmio = if test_devices.is_empty() && m.completed == 0 && m.status == 0 {
             String::new()
         } else {
-            format!(",\"mmio\":{{\"completed\":{},\"status\":\"{}\"}}", m.completed, exec::mmio::name(m.status))
+            // The address only where the host answered for it (a refusal before any request names none).
+            let address = if matches!(m.status, exec::mmio::UNASSIGNED | exec::mmio::DEVICE) { format!(",\"address\":\"{:#x}\"", m.gpa) } else { String::new() };
+            format!(",\"mmio\":{{\"completed\":{},\"status\":\"{}\"{address}}}", m.completed, exec::mmio::name(m.status))
         };
         out.push(json + &kick_report(backing.vcpu(v), &stops) + &mmio + "}");
     }
@@ -1084,7 +1107,14 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let log: Vec<String> = d.log.iter().map(|e| format!("[{},{},{},{},\"{:#x}\"]", e[0], e[1], e[2], e[3], e[4])).collect();
         format!("{{\"gpa\":\"{gpa:#x}\",\"reads\":{:?},\"writes\":{:?},\"order_errors\":{},\"log\":[{}]}}", &d.reads[..n], &d.writes[..n], d.order_errors, log.join(","))
     });
-    let devices = if test_devices.is_empty() { String::new() } else { format!(",\"devices\":[{}]", devices.collect::<Vec<_>>().join(",")) };
+    let mut devices = if test_devices.is_empty() { String::new() } else { format!(",\"devices\":[{}]", devices.collect::<Vec<_>>().join(",")) };
+    // L3: port and unassigned-page counts and the UART's output, once there are any.
+    let counts = registry.report();
+    let output = std::mem::take(&mut uart.lock().unwrap_or_else(|e| e.into_inner()).output);
+    if counts != "\"ports\":[],\"unassigned_pages\":[]" || !output.is_empty() {
+        let hex: String = output.iter().map(|b| format!("{b:02x}")).collect();
+        let _ = write!(devices, ",{counts},\"uart\":\"{hex}\"");
+    }
     if d.sections {
         println!("{{\"cpus\":[{}]{devices}}}", out.join(","));
     } else {
@@ -1339,10 +1369,12 @@ fn kick_report(area: Area, stops: &execution::Stops) -> String {
     )
 }
 
-/// The FEX frame holds nothing outside its guest-state fields (guest code cannot have written private memory there).
+/// The FEX frame holds nothing outside its guest-state fields (guest code cannot have written private memory there) and
+/// YMM_Hi128 (I5b: the resident's, [`exec::frame::AVX_HIGH`]).
 fn frame_intact(area: Area) -> bool {
     let frame: [u8; exec::frame::BYTES] = area.read_record(exec::FRAME_OFFSET);
-    let admitted = |i: usize| exec::frame::GUEST_STATE.iter().any(|&(at, len)| (at as usize..(at + len) as usize).contains(&i));
+    let avx = exec::frame::AVX_HIGH as usize..exec::frame::AVX_HIGH as usize + 256;
+    let admitted = |i: usize| avx.contains(&i) || exec::frame::GUEST_STATE.iter().any(|&(at, len)| (at as usize..(at + len) as usize).contains(&i));
     frame.iter().enumerate().all(|(i, &b)| b == 0 || admitted(i))
 }
 
@@ -1376,7 +1408,7 @@ mod tests {
     fn next_page_tamper_answers_a_block_request_twice() {
         let memory = Memory::with_size(4096).unwrap();
         let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0, ram: unsafe { GuestRam::new(0, 4096, memory.0 as u64) } };
-        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1000, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, fcw: exec::FCW_INIT });
+        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1000, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, fcw: exec::FCW_INIT, xcr0: 1 });
         s.fetch = [0x5000, u64::MAX];
         s.reply = exec::REPLY_SYSTEM;
         assert!(!tamper_next_page(area, &mut s) && s.reply == exec::REPLY_SYSTEM);

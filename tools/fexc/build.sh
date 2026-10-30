@@ -7,6 +7,7 @@
 # `git format-patch`; never committed), BUILD_DIR/obj the CMake/Ninja build. third_party/FEX itself is never modified.
 set -eu
 build=$1
+case $build in /*) ;; *) build=$PWD/$build ;; esac   # git -C below would resolve a relative path inside the submodule
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH= cd -- "$here/../.." && pwd)
 fex=$root/third_party/FEX

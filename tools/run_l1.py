@@ -12,7 +12,7 @@
 - `rejections`: every header rejection of `bootproto.parse_bzimage`, applied to the Debian header and to the synthetic
   image: the driver refuses with the model's code (`load refused: CODE`); plus the loader's own refusals reachable from
   the command line (low RAM below the map's RAM start, a kernel window or initrd that does not fit, a command line over
-  cmdline_size, an RSDP outside the ACPI NVS range).
+  cmdline_size, ACPI tables outside the ACPI NVS range).
 
 Writes DIR/l1.json; exit status 1 on any failure. The VM smoke test is `tools/run_l1_smoke.py`."""
 import argparse, json, pathlib, struct, subprocess, sys
@@ -213,7 +213,7 @@ def rejections(host, work, kernel, initrd):
               ('kernel-window', kernel, ['--ram', 64 * MIB], 'KERNEL_DOES_NOT_FIT'),
               ('initrd-room', kernel, ['--ram', 96 * MIB, '--initrd', initrd], 'INITRD_DOES_NOT_FIT'),
               ('cmdline-size', kernel, ['--cmdline', 'x' * 2048], 'CMDLINE_TOO_LONG'),
-              ('rsdp-outside-nvs', kernel, ['--rsdp', 0x1000], 'BAD_RSDP'),
+              ('tables-outside-nvs', kernel, ['--rsdp', 0x1000], 'BAD_TABLES'),
               ('fixed-over-zero-page', synthetic(reloc=0, align=0, pref=0x10000, init_size=0x1000), ['--ram', 64 * MIB], 'KERNEL_DOES_NOT_FIT'),
               ('fixed-over-gdt', synthetic(reloc=0, align=0, pref=0x18000, init_size=0x1000), ['--ram', 64 * MIB], 'KERNEL_DOES_NOT_FIT'),
               ('pref-overflow', synthetic(pref=2**64 - 0x1000), [], 'KERNEL_DOES_NOT_FIT')]

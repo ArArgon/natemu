@@ -44,6 +44,9 @@ and runtime; contract-by-contract mapping: [contracts.md](contracts.md), "Genera
 | `tools/run_m1.py` | M1 guest RAM: tables and data in RAM's top MiB at 4 MiB, 2 GiB and 3 GiB, the device page at R, placement across 0xA0000, cross- and self-modifying code at 0x7ff00000; any runner runs at another size or placement with `NATEMU_RAM`/`NATEMU_PLACE` |
 | `tools/run_m3.py` | M3 device pages: MOV-family corpus vs QEMU (on RAM) and `tools/models/mmio_model.py`, fault priority, refused forms, exactly-once under kicks at 1-4 vCPUs, a tampered reply, cross-modifying code at a device access (needs series23-m3) |
 | `tools/run_l1.py`, `tools/run_l1_smoke.py` | L1 boot-protocol loader: Debian and synthetic bzImages judged by `tools/models/bootproto.py`, every header and loader refusal with the model's codes (no VM); the smoke test (Debian decompressor to its jump into vmlinux vs QEMU) runs in-tree at 2 GiB since M1 (boot-features plan, Built (L1), Built (M1)) |
+| `tools/run_l2.py`, `tools/run_l2_iasl.py` | L2 ACPI tables at N = 1..4 from load-only dumps: the independently written checker `tools/models/acpi_model.py` (structure, AML, CPUID/LAPIC/e820/device-set agreement; controls in `test_acpi_model.py`), and ACPICA `iasl` (Homebrew `acpica`): `-d` clean except the version-0 wakeup structure, the DSDT recompiled from its disassembly and the RSDP from iasl's template byte-equal (no VM; boot-features plan, Built (L2)) |
+| `tools/run_l3.py` | L3 port I/O, UART and the unassigned rule (programs `tools/bench/smp/ports.py`): `qemu` UART widths, Linux's 8250 probe and earlyprintk sequences, unassigned ports, REP INS/OUTS with faults midway, CPL 3 IOPL/TSS-bitmap configurations vs pinned QEMU (COM1 = `-serial file`); `stress` events between string elements; `cases` strict switch, PCI probes, wrap, refusals; `pages` unassigned pages (hole, above RAM, above 4 GiB, IOAPIC page) on the all-ones shadow, writes, refusals, strict, SMP, the xAPIC page (boot-features plan, Built (L3)) |
+| `tools/run_i5b.py` | I5b FXSAVE/FXRSTOR, XSAVE/XRSTOR, XGETBV/XSETBV: `images` (FXSAVE/XSAVE/XRSTOR images and XCR0/CPUID.0DH sequences byte by byte against QEMU's Haswell model, block sizes default and 1, declared differences compared on natemu's side), `faults` (alignment, #PF at page boundaries with no partial update, #NM/#UD gating, XSETBV/XGETBV and XRSTOR header #GP, refusals, #AC never; SDM rules, QEMU where it can run the case) (boot-features plan, Built (I5b)) |
 | `tools/check_resident_stack.py` | resident stack bound and gate/ERET binary shape of the built runtime |
 | `tools/models/` | independent ordering, coherence, PAE and modes models (used by the runners) |
 
@@ -53,7 +56,7 @@ the phase-end ones):
 ```sh
 # From the repository root; works in zsh and bash (no word-splitting of variables; run in full under zsh and
 # argument-checked under bash at the phase end).
-F=../natemu-raw/fexc-native-20261026-01/series25/obj/fexc   # tools/fexc/build.sh rebuilds it; S3's `system` programs (RDRAND/RDSEED/RDPID) need series21-s3 or later, X2's BT* #AC cases series22; since I6 the host passes x87 arguments; series25 is the combined I6 + M3 build
+F=../natemu-raw/fexc-native-20261026-01/series27/obj/fexc   # tools/fexc/build.sh rebuilds it; CS/DS/ES/SS prefixes by Intel's class (Linux's `ds btr`) need series27; I5b's FXSAVE/XSAVE cuts need series26-i5b or later; S3's `system` programs (RDRAND/RDSEED/RDPID) need series21-s3 or later, X2's BT* #AC cases series22; since I6 the host passes x87 arguments; series25 is the combined I6 + M3 build
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 O=../natemu-raw/suite-$(date +%Y%m%d-%H%M%S)                  # a fresh output directory
@@ -89,9 +92,13 @@ tools/with-env python3 tools/run_i6_faults.py --fexc "$F" --out "$O/i6-faults"  
 tools/with-env python3 tools/run_i6_faults.py --fexc "$F" --out "$O/i6-faults-1" --max-block 1
 tools/with-env python3 tools/run_m3.py --fexc "$F" --out "$O/m3"   # M3: device pages (QEMU via Docker, mmio_model, kicks)
 python3 tools/run_l1.py --out "$O/l1"                        # L1: loader vs bootproto.py, refusals (load-only, no VM)
+python3 tools/run_l2.py --out "$O/l2"                        # L2: ACPI tables vs the independent checker, N = 1..4 (load-only, no VM)
+python3 tools/run_l2_iasl.py --out "$O/l2-iasl"               # L2: the same tables through iasl -d, DSDT and RSDP recompiled
 tools/with-env python3 tools/run_k2.py --fexc "$F" --out "$O/k2"   # K2: system-instruction cost, RDRAND refill, XMC at system instructions
 tools/with-env python3 tools/run_x3.py --fexc "$F" --out "$O/x3"   # X3: local APIC, IPIs, timers vs QEMU and the SDM model; stress; HLT across peers
 tools/with-env python3 tools/run_m1.py --fexc "$F" --out "$O/m1"   # M1: RAM top at 4 MiB/2 GiB/3 GiB, the holes, code near the RAM top
+tools/with-env python3 tools/run_l3.py --fexc "$F" --out "$O/l3"   # L3: port I/O, UART, IOPL/bitmap vs QEMU; unassigned ports and pages (all-ones shadow), strict switch
+tools/with-env python3 tools/run_i5b.py --fexc "$F" --out "$O/i5b"   # I5b: FXSAVE/XSAVE images vs QEMU (Haswell model), the fault matrix by the SDM rules
 ```
 
 QEMU references run in the pinned container image (`tools/reference/ref.py` holds the pins) or Homebrew
@@ -151,7 +158,7 @@ cells, OSFXSR/XSAVE), then x87 (FEX's soft-float helpers must run in the residen
 | 32-bit and paging-off modes, compatibility mode, far transfers, descriptor loads, legacy/PAE walking | Deleted; start from [s3g-plan.md](s3g-plan.md) (transaction list S3g1–S3g3); the legacy walker `crates/abi/src/paging32.rs` is in commit 4902ee5; the 32-bit families in `8d529f9` | owner decision 3 |
 | Segment bases and limits, A20, 16-bit code, device/hole resolver | Deleted; build only if the boot path needs them | owner decision 1 |
 | Tearing across 16 bytes inside a line | Documented deviation; a diagnostic may count such stores | owner decision 2 |
-| A guest access to the guest-state page (`PRIVATE + 0x24000`, non-canonical: #GP on x86) | Documented deviation: it reaches the vCPU's own guest state; one 4 KiB page per vCPU, straddles into it fault; the resident reads back only DF (since I7 it also writes the FS/GS bases there at every entry) | G1 minimum (I1); boot-features plan, Built (I1, G1 minimum) |
+| A guest access to the guest-state page (`PRIVATE + 0x24000`, non-canonical: #GP on x86) | Documented deviation: it reaches the vCPU's own guest state; one 4 KiB page per vCPU, straddles into it fault; the resident reads back only DF (since I7 it also writes the FS/GS bases there at every entry). Since I6 the x87 state lives there (I6 deviation 12) and since I5b the AVX upper halves (YMM_Hi128, `frame::AVX_HIGH` C0H, outside `GUEST_STATE`): a guest data access to the page reaches that vCPU's own copy | G1 minimum (I1); boot-features plan, Built (I1, G1 minimum) |
 | Kernel not pinned: Debian 6.12.107 (64-bit boot protocol, ACPI-mailbox APs: no 32-bit or paging-off instruction runs with LA57 = 0) or Ubuntu 6.8 (its AP trampoline always goes 64 → compatibility → paging off → PAE/LME/PG → 64, so it needs the 32-bit items and LOCK BTS) | Choose first | s3g-plan.md §1, owner decision 3 |
 | Guest RAM beyond 4 MiB, a loader (bzImage, boot params, initramfs), devices, timer (APIC timer or TSC deadline), console (serial) | None | phase boundary |
 | Host writes to guest RAM (DMA, loader) | Only with every vCPU stopped; each sets FLUSH in every record | slice-3 §1 |

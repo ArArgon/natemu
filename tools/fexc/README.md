@@ -29,7 +29,15 @@ jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never 
 (series applied as nineteen commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series25` (I6 after review and M3, October 29: patches
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series27` (October 29: series26-i5b's patches and
+the tree's shim and `fexc.cpp`. I5b's review fixes (the PTWRITE cut reason) and Intel's rule for CS/DS/ES/SS prefixes in
+64-bit mode (SDM Vol. 3A §4.5.1): a single CS/DS/ES prefix is now admitted on an RSP/RBP-based operand and a single SS
+prefix on any explicit ModRM operand. They add no base; `JoinSites` takes the class of the explicit operand's sites from
+the raw prefix bytes (`NullSegment`): SS with an SS prefix, or with an RSP/RBP base and no prefix, else DS, so a
+non-canonical address is #SS(0) or #GP(0) as on Intel. Still cut: SS with CS/DS/ES (mixed classes) and SS on a moffs or
+string source operand. Linux 6.12's `ds btr %rdx, 0x540(%rbp)` (its SMP alternatives turn LOCK into DS on one CPU) now
+compiles, its sites DS-class. Previous: `series26-i5b` (I5b: the FXSAVE/XSAVE family cut as system instructions). Previous:
+`series25` (I6 after review and M3, October 29: patches
 0001-0019 and the tree's shim, which holds I6's hunks and M3's `fexc_mmio.inc` completion records. Previous:
 `series24-i6` (I6 before review: series23-i6's sources plus
 x87 stack faults with their masked response in patch 0019; built from an I6-only copy of the shim in `series24-i6/fexc-tools`,
@@ -103,7 +111,7 @@ canonical check see base + EA), and CS/DS/ES/SS prefixes, which 64-bit mode igno
 name the operand's default segment or there is no memory operand. Cut (`unsupported_form`): FS/GS with no memory
 operand or with a second segment prefix (no SDM rule for two of one group; FEX and QEMU differ), and SS naming a
 DS-default operand or CS/DS/ES an RSP/RBP-based one (#SS versus #GP for a non-canonical address differs between
-vendors). The allowlist reads the prefix bytes through `fexc_guest_bytes` (`shim/fexc_hook.h`). An FS/GS-overridden
+vendors; admitted with Intel's class since series27). The allowlist reads the prefix bytes through `fexc_guest_bytes` (`shim/fexc_hook.h`). An FS/GS-overridden
 operand is recorded `segment: ds` (#GP(0)) whatever its base; the site JSON's `x86` object carries `segment_override`.
 Binary objects of the 64 fixtures and the seed-4242, flow and I1 corpora (383 programs) are byte-identical to series14.)
 Kept for comparison: `series14` (I1, October 28: the small integer and

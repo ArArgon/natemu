@@ -2,8 +2,15 @@
 //! entry state on one vCPU. A driver over the library pieces (boot, execution, vm, owners): no tamper, no fixture.
 //!
 //!   natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--rsdp ADDR]
-//!       [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]
+//!       [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]
+//!       [--serial FILE] [--strict-unassigned]
 //!
+//! L3: the VM has COM1, a 16550A at ports 3F8H-3FFH ([`crate::uart`]), whose output goes to `--serial FILE` as it is
+//! sent; every other port and every device-range page is unassigned (all-ones reads, ignored writes, counted; with
+//! `--strict-unassigned` a typed stop). The result gains `ports` and `unassigned_pages` (counts) and `serial_bytes`.
+//!
+//! The ACPI tables ([`boot::acpi`]) describe `--vcpus` processors (default 1; more only with `--load-only` until AP
+//! start, X4) and start with the RSDP at `--rsdp` (default the ACPI NVS range's start).
 //! The map's low RAM ends at `--ram` (default: the boot map's 2 GiB), which is also the VM's guest RAM (M1).
 //! `--code-cache BYTES` sets the code cache (default: the largest, `CODE_BYTES_MAX` less its head). `--load-only` loads into host memory and runs nothing (no VM: RUNTIME and FEXC are not opened).
 //! `--dump FILE` writes what the loader wrote into guest RAM (before any run) as records `[u64 gpa][u64 length][bytes]`,
@@ -20,7 +27,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] \
-                     [--rsdp ADDR] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]";
+                     [--rsdp ADDR] [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N] [--serial FILE] [--strict-unassigned]";
 /// Largest image or initrd read (the protocol's 32-bit sizes).
 const MAX_INPUT: usize = 1 << 32;
 
@@ -36,9 +43,11 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let [_, resident, _, fexc, image, options @ ..] = args else {
         return Err(USAGE.into());
     };
-    let (mut initrd, mut cmdline, mut ram, mut rsdp, mut load_only, mut dump) = (None, String::new(), None, None, false, None);
+    let (mut initrd, mut cmdline, mut ram, mut rsdp, mut load_only, mut dump) = (None, String::new(), None, boot::ACPI_NVS.0, false, None);
+    let mut vcpus = 1;
     let (mut stop_at, mut saves, mut watchdog_ms, mut max_block) = (None, Vec::new(), 60_000, None);
     let mut code_bytes = exec::cache::CODE_BYTES_MAX - exec::cache::HEAD_BYTES;
+    let (mut serial, mut strict) = (None, false);
     let mut options = options.iter();
     while let Some(option) = options.next() {
         let mut value = || options.next().ok_or_else(|| USAGE.to_string());
@@ -46,9 +55,12 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             "--initrd" => initrd = Some(value()?.clone()),
             "--cmdline" => cmdline = value()?.clone(),
             "--ram" => ram = Some(number(value()?)?),
-            "--rsdp" => rsdp = Some(number(value()?)?),
+            "--rsdp" => rsdp = number(value()?)?,
+            "--vcpus" => vcpus = number(value()?)? as usize,
             "--code-cache" => code_bytes = number(value()?)? as usize,
             "--load-only" => load_only = true,
+            "--serial" => serial = Some(value()?.clone()),
+            "--strict-unassigned" => strict = true,
             "--dump" => dump = Some(value()?.clone()),
             "--stop-at" => stop_at = Some(number(value()?)?),
             "--save" => saves.push((number(value()?)?, number(value()?)?, value()?.clone())),
@@ -59,7 +71,11 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
     let image = memory::read_input(image, MAX_INPUT)?;
     let initrd = initrd.map(|p| memory::read_input(&p, MAX_INPUT)).transpose()?;
-    let inputs = Inputs { image: &image, cmdline: &cmdline, initrd: initrd.as_deref(), rsdp };
+    if !(1..=exec::cache::MAX_VCPUS).contains(&vcpus) || vcpus > 1 && !load_only {
+        return Err(format!("--vcpus {vcpus}: 1..={} with --load-only, 1 for a run (AP start is X4)", exec::cache::MAX_VCPUS));
+    }
+    let tables = boot::acpi::build(vcpus, rsdp);
+    let inputs = Inputs { image: &image, cmdline: &cmdline, initrd: initrd.as_deref(), acpi: Some(&tables) };
 
     let layout = Layout { low_end: ram.unwrap_or(Layout::DEFAULT.low_end), high: 0 };
     layout.e820().map_err(|e| e.to_string())?; // before allocating L bytes
@@ -87,6 +103,15 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     execution::guest_ram_written(&backing.memory);
     execution::set_cpu(backing.vcpu(0), loaded.cpu);
 
+    // L3: COM1 and the unassigned rule.
+    let uart = std::sync::Arc::new(std::sync::Mutex::new(crate::uart::Uart::new()));
+    if let Some(path) = &serial {
+        uart.lock().unwrap().sink = Some(Box::new(fs::File::create(path).map_err(|e| format!("{path}: {e}"))?));
+    }
+    let mut devices = crate::devices::Devices::new(layout.low_end);
+    devices.register_ports(boot::acpi::platform::COM1_PORT.into(), 8, uart.clone())?;
+    devices.strict = strict;
+    let devices = std::sync::Arc::new(devices);
     let machine = Machine::create(&backing.memory)?;
     let stops = execution::Stops::new(&backing, false);
     let watchdog = std::time::Duration::from_millis(watchdog_ms);
@@ -98,7 +123,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     };
     let body = |v: usize, cpu: &Vcpu, cancelled: &std::sync::atomic::AtomicBool| -> Result<(Stop, u64)> {
         let mut compiler = Compiler::new(Path::new(fexc), cpu, max_block)?;
-        let mut requests = execution::Requests { doorbell: Some(machine.doorbell()), ..Default::default() };
+        let mut requests = execution::Requests { doorbell: Some(machine.doorbell()), devices: Some(devices.clone()), ..Default::default() };
         let stop = execution::run(cpu, backing.vcpu(v), &mut compiler, stop_at, watchdog, &mut requests, &stops, cancelled);
         stops.end(v);
         Ok((stop?, compiler.compiles))
@@ -125,11 +150,19 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let (kind, reason) = match &stop {
         Stop::Reached => ("reached".to_string(), String::new()),
         Stop::Resident { stop: exec::stop::SHUTDOWN, .. } => ("shutdown".into(), format!("fault {:x?}", s.fault)),
-        Stop::Resident { stop, status, detail } => ("resident".into(), format!("{} status={status} detail={detail} fault={:x?}", exec::stop::name(*stop), s.fault)),
+        Stop::Resident { stop, status, detail } => {
+            let m: exec::Mmio = backing.vcpu(0).read_record(exec::MMIO_OFFSET);
+            // The access only where the host answered for it (a refusal before any request names none: just its status).
+            let access = match m.status {
+                exec::mmio::UNASSIGNED | exec::mmio::DEVICE => format!(" access={:#x}/{}/{} {}", m.gpa, m.width, if m.write != 0 { "w" } else { "r" }, exec::mmio::name(m.status)),
+                status => format!(" mmio={}", exec::mmio::name(status)),
+            };
+            ("resident".into(), format!("{} status={status} detail={detail} fault={:x?}{access}", exec::stop::name(*stop), s.fault))
+        }
         other => (format!("{other:?}").split(['(', ' ', '{']).next().unwrap().to_lowercase(), format!("{other:?}")),
     };
     println!(
-        "{},\"stop\":\"{kind}\",\"reason\":\"{}\",\"state\":{},\"stats\":{{\"blocks\":{},\"compiles\":{compiles},\"systems\":{},\"flushes\":{},\"interrupts\":{},\"evictions\":{},\"retries\":{},\"shadow_resets\":{},\"cache\":{{\"code_used\":{},\"code_bytes\":{},\"meta_used\":{},\"blocks\":{}}},\"seconds\":{:.3}}}}}",
+        "{},\"stop\":\"{kind}\",\"reason\":\"{}\",\"state\":{},\"stats\":{{\"blocks\":{},\"compiles\":{compiles},\"systems\":{},\"flushes\":{},\"interrupts\":{},\"evictions\":{},\"retries\":{},\"shadow_resets\":{},\"cache\":{{\"code_used\":{},\"code_bytes\":{},\"meta_used\":{},\"blocks\":{}}},\"seconds\":{:.3}}},{},\"serial_bytes\":{}}}",
         placement(&loaded, &layout),
         reason.replace('"', "'"),
         cpu_json(&s.cpu),
@@ -144,7 +177,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         c.code_bytes,
         c.meta_used,
         c.blocks,
-        started.elapsed().as_secs_f64()
+        started.elapsed().as_secs_f64(),
+        devices.report(),
+        uart.lock().unwrap_or_else(|e| e.into_inner()).output.len()
     );
     Ok(())
 }

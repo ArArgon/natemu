@@ -455,14 +455,14 @@ def cases():
         return BASE + len(ref.assemble(text)) if text else BASE
     # xAPIC MMIO: a 32-bit read of the version; other widths and offsets inside a register's 16 bytes are refused
     # (11.4.1) as the device's (state at the instruction); the APIC disabled through IA32_APIC_BASE leaves the page to no
-    # device (unassigned).
+    # device: unassigned, so a read gives all-ones (L3's rule).
     case('xapic-version', mmio_ld(0x30) + 'mov ebx, eax\n', reached(rbx=0x50014))
     case('xapic-byte', 'nop\nmovabs al, byte ptr [0xfee00030]\n', stopped('unsupported_mmio', BASE + 1, 'device'))
     case('xapic-word', 'nop\nmovabs ax, word ptr [0xfee00030]\n', stopped('unsupported_mmio', BASE + 1, 'device'))
     case('xapic-qword', 'nop\nmovabs rax, qword ptr [0xfee00030]\n', stopped('unsupported_mmio', BASE + 1, 'device'))
     case('xapic-misaligned', 'nop\nmovabs eax, dword ptr [0xfee00034]\n', stopped('unsupported_mmio', BASE + 1, 'device'))
     off = 'mov ecx, 0x1b\nrdmsr\nand eax, 0xfffff7ff\nwrmsr\n'
-    case('xapic-disabled', off + 'movabs eax, dword ptr [0xfee00030]\n', stopped('unsupported_mmio', at(off), 'unassigned'))
+    case('xapic-disabled', off + 'movabs eax, dword ptr [0xfee00030]\n', reached(rax=0xffffffff))
     # Re-enabled after a disable: every register at reset (SVR 0xff, LVT masked, TPR 0, LDR 0, DFR all ones).
     on = 'mov ecx, 0x1b\nrdmsr\nor eax, 0x800\nwrmsr\n'
     setup = 'mov eax, 0x40\n' + mmio_st(0x80) + 'mov eax, 0x1ff\n' + mmio_st(0xf0) + 'mov eax, 0x20033\n' + mmio_st(0x320) + 'mov eax, 0x5000000\n' + mmio_st(0xd0)
@@ -503,9 +503,9 @@ def cases():
          'mov ecx, 0x832\nmov eax, 0x40\nwrmsr\nrdmsr\nmov esi, eax\n' + SVR_ON + 'mov ecx, 0x832\nmov eax, 0x40\nwrmsr\nrdmsr\nmov edi, eax\n', reached(rbx=0, rsi=0x10040, rdi=0x40))
     # Disabling through SVR masks every LVT entry.
     case('svr-disable-masks', X2_ON + SVR_ON + 'mov ecx, 0x835\nmov eax, 0x700\nxor edx, edx\nwrmsr\nmov ecx, 0x80f\nmov eax, 0xff\nwrmsr\nmov ecx, 0x835\nrdmsr\nmov ebx, eax\n', reached(rbx=0x10700))
-    # x2APIC MSRs in xAPIC mode, and xAPIC's page in x2APIC mode (no APIC there: unassigned).
+    # x2APIC MSRs in xAPIC mode, and xAPIC's page in x2APIC mode (no APIC there: unassigned, all-ones by L3's rule).
     case('x2-msr-in-xapic', 'nop\nmov ecx, 0x803\nrdmsr\n', lambda o: [] if o['stop'] == 'guest_fault' and [smp.num(x) for x in o['fault']] == [13, 0, 0, BASE + 6] else [f"{o['stop']} {o['reason']} {o.get('fault')}"])
-    case('xapic-page-in-x2', X2_ON + 'movabs eax, dword ptr [0xfee00030]\n', stopped('unsupported_mmio', at(X2_ON), 'unassigned'))
+    case('xapic-page-in-x2', X2_ON + 'movabs eax, dword ptr [0xfee00030]\n', reached(rax=0xffffffff))
     # Timer register writes while it counts (11.5.4): a one-shot count that reached 0 (masked) stays 0 with no expiry when
     # the LVT switches to periodic and unmasks; a divide change keeps the current count (counting on at the new rate).
     lvt = lambda v: f'mov ecx, 0x832\nmov eax, {v:#x}\nxor edx, edx\nwrmsr\n'

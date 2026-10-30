@@ -39,8 +39,10 @@ def two(op, plain, modrm):
     if op == 0xAE:
         if mod != 3 and reg == 7: return SYS, False
         if mod == 3 and reg < 4: return SYS, False
+        if mod != 3 and (reg <= 1 or 4 <= reg <= 6): return SYS, False     # I5b: fxsave/fxrstor/xsave/xrstor (xsaveopt/clwb: #UD)
         return UNS, False
     if op == 0xC7 and mod == 3 and reg >= 6: return SYS, False                                      # S3: rdrand, rdseed, rdpid
+    if op == 0xC7 and mod != 3 and 3 <= reg <= 5: return SYS, False                                 # I5b: xrstors/xsavec/xsaves (#UD)
     if not plain: return UNS, False
     if op in (0x1F, 0xA3, 0xAB, 0xB3, 0xBB, 0xAF, 0xB6, 0xB7, 0xBE, 0xBF, 0xBC, 0xBD): return ALLOW, False
     if op in (0xA4, 0xA5, 0xAC, 0xAD, 0xB0, 0xB1, 0xC0, 0xC1): return ALLOW, False                 # I1: shld/shrd, cmpxchg/xadd

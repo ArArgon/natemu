@@ -206,13 +206,22 @@ pub(super) fn can_wake(s: &State) -> bool {
         && vector.is_some_and(|v| v & 0xf0 > apic::ppr(s.cpu.cr8, &l.isr) & 0xf0)
 }
 
-/// The xAPIC page: `gpa`'s access of `width` bytes (a store's `data`, else a load). `None`: not this vCPU's APIC page
-/// (hardware disabled, x2APIC mode, or another page); `Some(Err)`: an access the APIC does not implement (11.4.1:
-/// registers are 32 bits wide at 16-byte-aligned offsets).
+/// Whether `gpa` lies in this vCPU's APIC page (IA32_APIC_BASE's address, whatever the APIC's mode): a resident device
+/// page, never shadowed onto the all-ones page (L3 amendment), so enabling the APIC needs no shadow change.
+pub(super) fn claims(gpa: u64) -> bool {
+    gpa & BASE == base() & BASE
+}
+/// The xAPIC page: `gpa`'s access of `width` bytes (a store's `data`, else a load). `None`: not this vCPU's APIC page;
+/// `Some(Err)`: an access the APIC does not implement (11.4.1: registers are 32 bits wide at 16-byte-aligned offsets).
+/// With the APIC hardware disabled or in x2APIC mode the page is no APIC's: it answers as an unassigned page does (L3:
+/// a read all-ones at its width, a write ignored), any width.
 pub(super) fn mmio(s: &mut State, gpa: u64, width: u64, data: Option<u64>) -> Option<Result<u64, ()>> {
     let b = base();
-    if b & (EN | EXTD) != EN || gpa & BASE != b & BASE {
+    if !claims(gpa) {
         return None;
+    }
+    if b & (EN | EXTD) != EN {
+        return Some(Ok(if data.is_some() { 0 } else if width == 8 { u64::MAX } else { (1 << (8 * width)) - 1 }));
     }
     let offset = gpa & 0xfff;
     if width != 4 || offset & 0xf != 0 {
@@ -401,7 +410,13 @@ pub(super) fn set_base(s: &mut State, new: u64) -> Result<(), Exception> {
     if to == EN && mmio::ram(new & BASE) {
         halt(s, stop::UNSUPPORTED_SYSTEM)
     }
+    let moved = (new ^ base()) & BASE != 0;
     msr_set(base_slot(), new);
+    // L3 (amendment): the new page may hold an all-ones shadow (it was unassigned for this vCPU): drop this vCPU's shadows,
+    // so its next access finds the APIC. Shadows are per vCPU, as the APIC page is; the old page simply becomes unassigned.
+    if moved {
+        super::reset_shadows(s);
+    }
     if from != 0 && to == 0 {
         // Entering the disabled state resets the APIC (11.12.5.1); the TPR is the bank's. The disabled word is published
         // first, so senders stop posting before the IRR is cleared; one that read the old word may still post after the

@@ -116,17 +116,21 @@ pub(super) fn address(c: &Cpu, i: &System) -> u64 {
         r => c.gpr[r as usize],
     };
     let index = if i.index == system::NO_REG { 0 } else { c.gpr[i.index as usize] << i.scale };
-    let segment = match i.fs_gs as usize {
+    let segment = match i.segment as usize {
         SREG_FS => c.fs_base,
         SREG_GS => c.gs_base,
         _ => 0,
     };
     base.wrapping_add(index).wrapping_add(i.disp as u64).wrapping_add(segment)
 }
-/// A non-canonical memory operand: #SS(0) through the stack segment (an RSP or RBP base, no FS/GS override; I7), else
-/// #GP(0).
+/// A non-canonical memory operand: #SS(0) for an SS-class reference (an SS override, or an RSP or RBP base with no
+/// override), else #GP(0) (a CS/DS/ES override even on an RSP/RBP base; FS/GS, I7): Intel SDM Vol. 3A 4.5.1.
 pub(super) fn noncanonical(i: &System) -> Exception {
-    if matches!(i.base, 4 | 5) && i.fs_gs == 0 { SS0 } else { GP0 }
+    match i.segment as usize {
+        SREG_SS => SS0,
+        0 if matches!(i.base, 4 | 5) => SS0,
+        _ => GP0,
+    }
 }
 
 /// Copies between `buf` and linear `va` for the instruction at RIP: an explicit access at the CPL, or an implicit

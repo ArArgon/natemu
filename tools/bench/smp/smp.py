@@ -79,18 +79,19 @@ def build_image(prog, stub):
     return bytes(img)
 
 
-def qemu_args(n, mode, dbg, img, cpu='max'):
+def qemu_args(n, mode, dbg, img, cpu='max', extra=()):
     return [QEMU, '-accel', f'tcg,thread={mode}', '-cpu', cpu, '-smp', str(n), '-m', '64', '-machine', 'pc', '-nographic', '-nodefaults',
-            '-monitor', 'none', '-serial', 'none', '-device', 'isa-debug-exit,iobase=0xf4,iosize=0x04', '-no-reboot',
-            '-debugcon', f'file:{dbg}', '-kernel', str(img)]
+            '-monitor', 'none', *([] if '-serial' in extra else ['-serial', 'none']), '-device', 'isa-debug-exit,iobase=0xf4,iosize=0x04', '-no-reboot',
+            '-debugcon', f'file:{dbg}', '-kernel', str(img), *extra]
 
 
-def run_image(prog, img, work, mode='multi', timeout=120):
+def run_image(prog, img, work, mode='multi', timeout=120, extra=()):
+    """`extra`: more QEMU arguments (L3: `-serial file:PATH` gives the machine COM1 at 3F8H, in place of `-serial none`)."""
     work.mkdir(parents=True, exist_ok=True); p, dbg = work / 'image.bin', work / 'dbg.out'
     p.write_bytes(img); dbg.unlink(missing_ok=True); t0 = time.perf_counter()
     try:
         cpu = SYSTEM_CPU if prog.get('system') else 'max'
-        r = subprocess.run(qemu_args(prog['ncpu'], mode, dbg, p, cpu), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=timeout)
+        r = subprocess.run(qemu_args(prog['ncpu'], mode, dbg, p, cpu, extra), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=timeout)
         rc, err = r.returncode, r.stderr.decode(errors='replace')[-300:]
     except subprocess.TimeoutExpired:
         rc, err = 'timeout', ''
