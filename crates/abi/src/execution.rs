@@ -982,6 +982,10 @@ pub mod system {
     pub const WBINVD: u32 = 46;
     /// CLFLUSH m8 (`0f ae /7`, memory).
     pub const CLFLUSH: u32 = 47;
+    /// An instruction that needs a 16th byte (fexc `instruction_too_long`): #GP(0) at it (SDM Vol.3 Interrupt 13,
+    /// "Exceeding the instruction length limit of 15 bytes"; `length` is not used). A fetch fault within its first 15 bytes
+    /// comes first (fexc reports `partial_decode` there); the 16th byte is never fetched (natemu policy).
+    pub const TOO_LONG: u32 = 48;
     /// `System::base` of a RIP-relative operand (relative to the next instruction).
     pub const RIP: u32 = 16;
     pub const NO_REG: u32 = 0xff;
@@ -1063,7 +1067,7 @@ pub mod system {
                     LDMXCSR | STMXCSR => self.memory == 1 && address,
                     SSE_GATED => true,
                     INT => self.cr < 256,
-                    INT3 | INTO | UD => true,
+                    INT3 | INTO | UD | TOO_LONG => true,
                     SWAPGS | SYSCALL | WBINVD => true,
                     SYSRET => matches!(self.size, 4 | 8),
                     RDFSBASE..=WRGSBASE => self.memory == 0 && reg(self.reg) && self.segment == 0 && matches!(self.size, 4 | 8),

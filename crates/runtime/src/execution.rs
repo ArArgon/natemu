@@ -893,6 +893,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             return Ok(());
         }
         system::INTO | system::UD => return Err(UD),
+        system::TOO_LONG => return Err(GP),
         // X2: interrupt-flag control, HLT (it parks after its commit) and the test drivers' event hook.
         // X2: a BT* memory form under alignment checking: #AC(0) when misaligned, else it is stepped (`find`), RIP kept.
         system::BT_ALIGNED => {

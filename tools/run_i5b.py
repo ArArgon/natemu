@@ -218,10 +218,13 @@ def fault_cases():
     # Non-canonical operands: #GP(0), #SS(0) through RSP/RBP.
     for insn in ('fxsave', 'fxrstor', 'xsave', 'xrstor'):
         case(f'noncanonical-{insn}', full + [f'mov rbx, {NONCANON:#x}', f'{insn} [rbx]'], GP)
-        # (Not on QEMU: its stub cannot take an exception at CPL 0 on that RSP, and maps no page below the straddle, so its
-        # #PF there says nothing of the order; natemu checks the whole range's canonical form first, as I6's transactions.)
+        # (natemu only. RSP: QEMU's stub cannot take an exception at CPL 0 on that RSP. Straddle: QEMU maps no page below
+        # the canonical gap, so its #PF there says nothing of the order; natemu checks each accessed range's canonical form
+        # before walking it, as I6's transactions, so the range reaching into the gap is #GP(0).)
         case(f'noncanonical-rsp-{insn}', full + [f'mov rsp, {NONCANON:#x}', f'{insn} [rsp]'], SS, qemu=False)
         case(f'straddle-{insn}', full + [f'mov rbx, {NONCANON - 0x40:#x}', f'{insn} [rbx]'], GP, qemu=False)
+    # XRSTOR reads its header first, but a non-canonical base is #GP(0) even with the header at +512 canonical (and absent).
+    case('noncanonical-base-xrstor', full + [f'mov rbx, {0xffff_7fff_ffff_fe00:#x}', 'xrstor [rbx]'], GP, qemu=False)
     # Gating: CR0.TS (#NM for all four), CR0.EM (#NM for FX* only: XSAVE runs), no CR4.OSXSAVE (#UD, XGETBV/XSETBV too).
     cr0 = lambda bits: ['mov rax, cr0', f'or rax, {bits}', 'mov cr0, rax']
     no_osxsave = ['mov rax, cr4', 'btr rax, 18', 'mov cr4, rax']

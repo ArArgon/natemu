@@ -709,6 +709,8 @@ impl Compiler {
                     let gated_cut = json.get("guest").and_then(|g| g.get("end")).and_then(|e| e.get("cut_gated")).is_some();
                     match system_cut(&json, rip).and_then(|cut| if gated_cut { gated(cut) } else { decoded(cut) }) {
                         Some(s) if reason == "system_instruction" => Compiled::System(s),
+                        // Longer than 15 bytes with all of its first 15 fetched: #GP(0) (a fetch fault was `partial_decode`).
+                        _ if reason == "instruction_too_long" => Compiled::System(exec::System { kind: exec::system::TOO_LONG, length: 1, ..exec::System::NONE }),
                         _ => Compiled::NoCode(reason.into()),
                     }
                 }
@@ -1109,7 +1111,12 @@ mod tests {
         assert_eq!((s.kind, s.cr, s.reg, s.length), (exec::system::MOV_TO_CR, 3, 0, 3));
         assert_eq!(decoded(&mut c, 0x3000), Some(s));
         assert_eq!((c.compiles, c.hits), (5, 2));
-        assert!(matches!(c.compile(&[0xf4], 0x3000, false).unwrap(), Code::None(r) if r == "system_instruction")); // hlt
+        assert!(matches!(c.compile(&[0xf4], 0x3000, false).unwrap(), Code::System(s) if s.kind == exec::system::HLT)); // X2
+        // A system instruction the host does not decode (SYSENTER) is no code.
+        assert!(matches!(c.compile(&[0x0f, 0x34], 0x3000, false).unwrap(), Code::None(r) if r == "system_instruction"));
+        // Longer than 15 bytes (fexc series28): #GP(0) through the resident.
+        let long = [&[0x66; 4][..], &[0x4a, 0xc7, 0x84, 0x83, 0, 1, 0, 0, 0, 0, 0, 0]].concat();
+        assert!(matches!(c.compile(&long, 0x3000, false).unwrap(), Code::System(s) if s.kind == exec::system::TOO_LONG));
         assert!(matches!(c.compile(&[0x90, 0x0f, 0x22, 0xd8], 0x3000, false).unwrap(), Code::Block(_)));
     }
 

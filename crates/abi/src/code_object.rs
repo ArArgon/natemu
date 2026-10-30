@@ -111,6 +111,8 @@ pub mod end_reason {
     pub const NOT_EXECUTABLE: u8 = 10;
     pub const BAD_RELOCATION: u8 = 11;
     pub const UNIMPLEMENTED_INSTRUCTION: u8 = 12;
+    /// An instruction that needs a 16th byte (fexc series28): #GP(0) at it.
+    pub const INSTRUCTION_TOO_LONG: u8 = 13;
     /// Any other reason string.
     pub const OTHER: u8 = 255;
 }

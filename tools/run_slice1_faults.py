@@ -302,7 +302,11 @@ class Machine:
                 return k, 0
     def fetch(self, start, length):
         """The exception of fetching an instruction's bytes, or None: #GP(0) at a non-canonical byte, else #PF with
-        CR2 = its first byte in the faulting page, pages in address order."""
+        CR2 = its first byte in the faulting page, pages in address order. Only the first 15 bytes are fetched: a longer
+        instruction is #GP(0) (SDM Vol.3 Interrupt 13 (#GP), "Exceeding the instruction length limit of 15 bytes"),
+        after a fetch fault in its first 15 bytes (Vol.3 Table 7-2). Not fetching the 16th is natemu policy: the SDM is
+        silent; Bochs does the same, QEMU fetches the next page first (#PF wins there)."""
+        length = min(length, 15)
         for page in sorted({start & ~(PAGE - 1), (start + length - 1) & ~(PAGE - 1)}):
             if not canonical(max(start, page)): return (13, 0, 0)
             leaf, error = self.walk(max(start, page), 'x')
@@ -343,6 +347,7 @@ def describe(line, evs, f, fetched=False):
     m = line.split()[0]
     acc = [e for e in evs if e[0] == 'access']
     if f[0] == 6: return f'#UD {line}'
+    if f[0] == 13 and not evs and not fetched: return '#GP instruction too long'
     if any(e[0] == 'align' for e in evs): return f'#GP align {line}'
     if f[0] == 0: return f'#DE {m}{8 * next(e[2] for e in evs if e[0] == "divide")}' + (' mem' if acc else '')
     crossing = ' crossing' if any((a ^ (a + w - 1)) >> 12 for _, a, w, _, _ in acc) else ''
@@ -525,7 +530,80 @@ def probes(window=True):
         out.append((f'fetch-{name}', REGS, lines, None, {'unmap': [0x101000], 'rip': 0x101000 - 11 - pad}))
         # Falling through (or straddling) the end of the lower canonical half: #GP at the next fetch.
         out.append((f'fetch-noncanonical-{name}', REGS, lines, None, {'rip': 0x8000_0000_0000 - 11 - pad}))
-    return out + division_probes() + segment_probes() + null_segment_probes()
+    return out + division_probes() + segment_probes() + null_segment_probes() + straddle_probes()
+
+# An instruction straddling a page end (fexc series28): (its bytes in the first page, a line before it, the instruction,
+# natemu refuses the form (1; 2: before its fetch completes), program keys). The bytes before the page end cover every
+# prefix whose substituted zero bytes FEX decodes as invalid (0f, 0f 3a, 0f 0f, 0f c7, 66 0f, f3 0f, c4, c4 e2, c5, 90 0f),
+# others that stop mid-field, VEX/EVEX and multi-prefix forms. The Debian kernel's: jne rel32 with 0f the page's last byte.
+SSE, SSSE3, POPCNT = {'sse': 1}, {'sse': 1, 'cpu': 'qemu64,+ssse3'}, {'cpu': gen_i1.CPU}
+JNE = {'insn': {'op': 'jcc', 'cc': 'ne'}}
+def sse(op, keys): return dict(keys, insn={'op': op, 'sse': True})
+STRADDLE_FETCH = [
+    ('0f', [], '{disp32} jne {next}', 0, JNE), ('0f85', [], '{disp32} jne {next}', 0, JNE), ('0f8500', [], '{disp32} jne {next}', 0, JNE),
+    ('0f', ['nop'], '{disp32} jne {next}', 0, JNE), ('0f3a', [], 'palignr mm0, mm1, 8', 1, sse('palignr', {})),
+    ('660f3a', [], 'palignr xmm0, xmm1, 8', 0, sse('palignr', SSSE3)), ('0f0f', [], 'pfadd mm0, mm1', 1, sse('pfadd', {})),
+    ('0fc7', [], 'cmpxchg8b qword ptr [rbx]', 0, {}), ('660f', [], 'movdqa xmm0, xmm1', 0, sse('movdqa', SSE)),
+    ('f30f', [], 'popcnt eax, ecx', 0, POPCNT), ('c4', [], 'andn eax, ecx, eax', 0, POPCNT), ('c4e2', [], 'andn eax, ecx, eax', 0, POPCNT),
+    ('c4e27d', [], 'vbroadcastss ymm0, xmm0', 1, sse('vbroadcastss', {})), ('c5', [], 'vzeroupper', 1, sse('vzeroupper', {})),
+    ('c5f8', [], 'vzeroupper', 1, sse('vzeroupper', {})),
+    ('0fae', [], 'mfence', 0, sse('mfence', {})), ('0f38', [], 'movbe eax, dword ptr [rbx]', 1, sse('movbe', {})),
+    ('660f38', [], 'pshufb xmm0, xmm1', 0, sse('pshufb', SSSE3)), ('66', [], 'add ax, cx', 0, {}), ('48', [], 'add rax, rcx', 0, {}),
+    ('8f', [], 'pop qword ptr [rbx]', 0, {}), ('e8', [], 'call {next}', 0, {}), ('66f30f', [], 'popcnt ax, cx', 0, POPCNT),
+    ('f048', [], 'lock add qword ptr [rbx], rcx', 0, {}), ('3e488b', [], 'mov rax, qword ptr ds:[rbx]', 0, {}),
+    ('0f01', [], 'xgetbv', 0, sse('xgetbv', {'expect': (6, 0, 0)})),       # without CR4.OSXSAVE (QEMU's qemu64: no XSAVE): #UD
+    ('62', [], 'vaddps zmm0, zmm0, zmm0', 2, sse('vaddps', {}))]
+
+def straddle_probes():
+    """Each STRADDLE_FETCH instruction with its first bytes the last of page 0x100000: with the next page present it
+    runs as one instruction (the QEMU full run; a refused form stops `unsupported_form` at its RIP); with it not present,
+    #PF at 0x101000 with RIP at the instruction (SDM: the fetch fault comes before its decode), whatever the bytes before
+    the page end decode to. EVEX (62) is refused before its fetch completes, the next page present or not."""
+    out = []
+    for head, lead, line, refused, keys in STRADDLE_FETCH:
+        k = len(PRELUDE) + len(lead)
+        lines = PRELUDE + lead + [line.replace('{next}', f'e{k}')] + AFTER
+        code, offs = offsets(lines)
+        assert code[offs[k]:].startswith(bytes.fromhex(head)), (head, line)
+        name, rip = '-'.join(lead + [head]), 0x101000 - offs[k] - len(head) // 2
+        # Annotations gen_i1 cannot derive (QEMU checks the mnemonic; `sse`: no flag written, the first three letters).
+        insns = {len(PRELUDE) + i: {'op': l, 'sse': True} for i, l in enumerate(lead)} | ({k: keys['insn']} if 'insn' in keys else {})
+        keys = dict({m: v for m, v in keys.items() if m != 'insn'}, rip=rip, insns=insns, straddle=True)
+        present = {'refused': True} if refused else {} if 'expect' in keys else {'nofault': True}
+        out.append((f'straddle-{name}-present', REGS, lines, k, dict(keys, **present)))
+        absent = dict({m: v for m, v in keys.items() if m != 'expect'}, unmap=[0x101000], **({'refused': True} if refused == 2 else {}))
+        out.append((f'straddle-{name}-absent', REGS, lines, k if refused == 2 else None, absent))
+        if head == '0f' and not lead:       # the next page present but not executable at CPL 3: XD, or supervisor
+            for what, edit in (('xd', (0x101000, None, XD, 0)), ('supervisor', (0x101000, None, 0, US))):
+                out.append((f'straddle-0f-{what}', REGS, lines, None, dict(keys, entry=[edit])))
+    return out + long_probes()
+
+# Over-long instructions (fexc series28): 66 prefixes on `mov qword ptr [rbx + r8*4 + 0x100], 0` (12 bytes), and a 3DNow!
+# form whose suffix opcode would be its 17th byte. (name, prefixes, bytes in the first page or None (one page), the next
+# page present, the expectation: None runs, else the fault).
+LONG_MOV = '4ac7848300010000' + '00000000'
+GP0, PF_NEXT = (13, 0, 0), 'fetch'
+LONG_FORMS = [('15', '66' * 3 + LONG_MOV, None, True, None), ('16', '66' * 4 + LONG_MOV, None, True, GP0),
+              ('17', '66' * 5 + LONG_MOV, None, True, GP0), ('3dnow-17', '66' * 8 + '0f0f8488000000009e', None, True, GP0),
+              ('16-split10-present', '66' * 4 + LONG_MOV, 10, True, GP0), ('16-split10-absent', '66' * 4 + LONG_MOV, 10, False, PF_NEXT),
+              ('16-split15-present', '66' * 4 + LONG_MOV, 15, True, GP0),
+              ('16-split15-absent', '66' * 4 + LONG_MOV, 15, False, GP0),       # natemu policy (Machine.fetch): not #PF
+              ('15-prefixes', '66' * 15 + '90', None, True, GP0), ('16-readbyte', '66' * 14 + '0f8500000000', None, True, GP0)]
+
+def long_probes():
+    """An instruction longer than 15 bytes is #GP(0) at it (SDM Vol.3 Interrupt 13 (#GP), "Exceeding the instruction
+    length limit of 15 bytes"), after a fetch fault within its first 15 bytes (Vol.3 Table 7-2) and, by natemu policy
+    (`Machine.fetch`), with no fetch of its 16th: all bytes present (a field past byte 15, 15 prefixes, a 16th opcode byte), split at byte
+    10 or 15 of a page end with the next page present or not. The 15-byte form runs (QEMU full run)."""
+    out = []
+    for name, code, head, present, want in LONG_FORMS:
+        k = len(PRELUDE)
+        lines = PRELUDE + ['.byte ' + ', '.join(f'{b:#x}' for b in bytes.fromhex(code))] + AFTER
+        rip = 0x101000 - offsets(lines)[1][k] - head if head else gen.CODE
+        keys = {'rip': rip, 'straddle': True, 'insns': {k: {'op': 'mov', 'width': 64}}} | ({} if present else {'unmap': [0x101000]})
+        keys |= {'nofault': True} if want is None else {'expect': want} if want != PF_NEXT else {}
+        out.append((f'long-{name}', REGS, lines, k, keys))
+    return out
 
 # I7: FS/GS-overridden accesses. For each (segment, base) and form, the pointer register is set so that base + EA (mod 2^64)
 # is the target: a not-present page (#PF, CR2 = base + EA), the second page of a crossing access (#PF at that page), a
@@ -777,7 +855,9 @@ def expectations(programs, probe_specs, work, paging=True):
         rip = mut.get('rip', gen.CODE)
         p, (_, offs) = probe_program(name, regs, lines, rip), offsets(lines)
         p.update({b: hex(mut[b]) for b in ('fsbase', 'gsbase') if b in mut})      # I7: the segment bases
-        mut = {m: v for m, v in mut.items() if m not in ('fsbase', 'gsbase')}
+        p.update({b: mut[b] for b in ('cpu', 'sse') if b in mut})                  # QEMU's CPU model, CR4.OSFXSR
+        for i, ann in mut.get('insns', {}).items(): p['insns'][i] = ann           # annotations gen_i1 cannot derive
+        mut = {m: v for m, v in mut.items() if m not in ('fsbase', 'gsbase', 'cpu', 'sse', 'insns')}
         if k is None:       # fetch probe: the first instruction with a byte in a not-present page
             k = next(i for i in range(len(lines)) if layout(p, mut).fetch(rip + offs[i], offs[i + 1] - offs[i]))
         probing.append((p, offs, k, {m: v for m, v in mut.items() if m != 'rip'}, len(jobs)))
@@ -824,11 +904,14 @@ def expectations(programs, probe_specs, work, paging=True):
     for p, offs, k, mut, j in probing:
         rip, r = ref.num(p['rip']), results[j]
         r['qemu']['rip'] = ref.hx(rip + offs[k])
-        evs = events(p['asm'][k], dict(state(r), **bases(p)), rip + offs[k + 1])
         m = layout(p, mut)
         fetched = m.fetch(rip + offs[k], offs[k + 1] - offs[k])
-        if mut.get('atomic'):
-            cases.append((p['name'], p, mut, None, offs[k], r, ATOMIC, None)); continue
+        try: evs = events(p['asm'][k], dict(state(r), **bases(p)), rip + offs[k + 1])
+        except Unsupported:     # a straddling branch: its fetch fault or the QEMU full run is the reference
+            if not mut.get('straddle'): raise
+            evs = []
+        if mut.get('atomic') or mut.get('refused'):
+            cases.append((p['name'], p, mut, None, offs[k], r, ATOMIC if mut.get('atomic') else REFUSED, None)); continue
         if mut.get('deviation'):    # the guest-state page: runs to its end, the QEMU prefix plus the loads' values
             r = json.loads(json.dumps(r))
             for reg, v in mut['deviation'].items(): r['qemu']['gpr'][ref.REGS.index(reg)] = ref.hx(v)
@@ -838,7 +921,7 @@ def expectations(programs, probe_specs, work, paging=True):
             if first_fault(evs, m, reader(r)): raise ValueError(f"{p['name']}: a no-fault probe faults in the model")
             r['qemu']['rip'] = ref.hx(rip + offs[-1])
             cases.append((p['name'], p, {}, None, offs[-1], r, 'runs to its end', None)); continue
-        f = fetched or first_fault(evs, m, reader(r))
+        f = fetched or mut.get('expect') or first_fault(evs, m, reader(r))
         if not f: raise ValueError(f"{p['name']}: the probe does not fault")
         cases.append((p['name'], p, mut, f, offs[k], r, describe(p['asm'][k], [] if fetched else evs, f, bool(fetched)), None))
     if skipped: print(f'{len(skipped)} paging cells skipped (fetch fault after the first instruction, no QEMU prefix): {skipped[:5]}')
@@ -882,6 +965,7 @@ def case_description(case):
     return out
 
 ATOMIC = 'unsupported_atomic'      # a probe's kind: the VM stops so at the instruction, before any effect
+REFUSED = 'unsupported_form'       # the same for a form fexc refuses (straddle probes), an `unsupported` outcome
 
 def evaluate(case, out):
     """{'expected_fault', 'vm', 'outcome', 'diffs'} of the VM's final state `out` (driver JSON) for a fault case (or
@@ -890,13 +974,14 @@ def evaluate(case, out):
     rip = ref.num(p['rip']) + off
     want = [*f, rip] if f else [0, 0, 0, 0]
     entry = {'expected_fault': [hex(x) for x in want], 'vm': {k: out[k] for k in ('stop', 'reason', 'rip', 'fault', 'native', 'stats', 'frame_intact')}}
-    if case[6] == ATOMIC:
+    if case[6] in (ATOMIC, REFUSED):
         # Data and registers are those of the QEMU prefix. The leaf A/D bits are NOT checked here: the swap's write-intent
         # walk may already have set A (and D) before the alignment fault stopped it.
-        diffs = [] if (out['stop'], out['reason'].split(' ')[0]) == ('resident', ATOMIC) else [f"stopped {out['stop']} {out['reason']} at {out['rip']}, not {ATOMIC}"]
+        stop = 'resident' if case[6] == ATOMIC else 'no_code'
+        diffs = [] if (out['stop'], out['reason'].split(' ')[0]) == (stop, case[6]) else [f"stopped {out['stop']} {out['reason']} at {out['rip']}, not {case[6]}"]
         diffs += ref.compare(prefix, [ref.num(v) for v in out['gpr']], ref.num(out['rflags']), ref.num(out['rip']), out['memory'])
         if not out['frame_intact']: diffs.append('FEX frame changed')
-        return {**entry, 'outcome': 'fail' if diffs else 'match', 'diffs': diffs}
+        return {**entry, 'outcome': 'fail' if diffs else 'match' if case[6] == ATOMIC else 'unsupported', 'diffs': diffs}
     limit_hit = vm.declared_limit(out)
     if limit_hit and ref.num(out['rip']) < rip:
         return {**entry, 'outcome': 'unsupported', 'diffs': [f"stopped at {out['rip']}: {limit_hit}"]}

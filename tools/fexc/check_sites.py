@@ -234,7 +234,7 @@ def read_object(path):
 
 END_REASONS = ['', 'end_of_input', 'block_ending_instruction', 'max_instructions', 'fex_instruction_limit', 'system_instruction',
                'unsupported_form', 'dispatch_failure', 'invalid_instruction', 'partial_decode', 'not_executable', 'bad_relocation',
-               'unimplemented_instruction']
+               'unimplemented_instruction', 'instruction_too_long']
 
 
 def object_vs_json(o, d):

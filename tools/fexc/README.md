@@ -26,10 +26,20 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as nineteen commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as twenty commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series27` (October 29: series26-i5b's patches and
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series28` (October 29: series27 plus patch 0020: an
+instruction that starts in the supplied bytes and runs past them is `partial_decode`, whatever FEX's zero-filled decode of
+the missing bytes gives; before it, `0f`, `0f 3a`, `0f 0f`, `0f c7`, `66 0f`, `f3 0f`, `c4`, `c4 e2`, `c5` at the end of the
+input were `not_executable` and the Debian kernel stopped at a `jne rel32` whose `0f` ends a page. An instruction that
+needs a 16th byte is `instruction_too_long` (end reason 13; the host answers it as system kind `TOO_LONG`, #GP(0) in the
+resident: SDM Vol.3 Interrupt 13 (#GP), "Exceeding the instruction length limit of 15 bytes"), unless an unreadable byte within
+its first 15 comes first (`partial_decode`: the fetch fault); the 16th byte is never fetched, so it is #GP(0) even when
+unreadable (natemu policy: the SDM is silent; Bochs does the same, QEMU takes the #PF). Before it, a
+16- or 17-byte instruction whose bytes were all present was translated and run, and a long 3DNow! form wrote past FEX's
+15-byte instruction buffer. Objects that do not reach the end of the input and are not over-long are byte-identical to
+series27's.) Previous: `series27` (October 29: series26-i5b's patches and
 the tree's shim and `fexc.cpp`. I5b's review fixes (the PTWRITE cut reason) and Intel's rule for CS/DS/ES/SS prefixes in
 64-bit mode (SDM Vol. 3A §4.5.1): a single CS/DS/ES prefix is now admitted on an RSP/RBP-based operand and a single SS
 prefix on any explicit ModRM operand. They add no base; `JoinSites` takes the class of the explicit operand's sites from
@@ -176,6 +186,7 @@ Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--v
 | 0017 | slice1 I5a SSE: sites, vector constants in their register, MXCSR flags as x86 raises them |
 | 0018 | slice1 I5a after review: MOVAPS/MOVAPD/MOVDQA m128 as one aligned LDP/STP, DPPS/DPPD flags, a dead FCmp kept |
 | 0019 | slice1 I6 x87 reduced precision: the x87 stack pass on its slow path, flushed after every op, TOP masked, ST(i) as context-indexed accesses; stack faults with their masked response (the indefinite, IE, SF, C1); C1 on pushes, FCHS/FABS and FCOMI; FCHS/FABS as sign-bit operations; FLD m64 and FST m64 quieting an SNaN (IE; FLD m64's DE); FIST/FISTP/FISTTP with the integer indefinite (flag-free); FXAM's classes; FNSTSW's exception flags from the x87 exception word and FEX's IE, PE and SF bytes |
+| 0020 | Decoder: `PARTIAL_DECODE_INST` when an instruction read at least one byte and then needed an unreadable one within 15 bytes (`ReadData`: its field's first unreadable byte), whatever the substituted zero bytes decode to; `TOO_LONG_INST` (new) when it needs a 16th byte, readable or not (`ReadByte` at `>=` 15, a `ReadData` field ending past 15, 15 prefixes); NOEXEC only when its first byte is unreadable |
 
 Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in `shim/` and `fexc.cpp`; the patches only
 include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then
@@ -312,7 +323,7 @@ NAME=0|1` overrides one bit. Later this table is to be derived from the VM's vCP
   (status), every decoded instruction (`translated`, FEX's mnemonic, `ends_block`,
   `sets_rip`) and `end` = {rip, reason, detail}. Reasons: `max_instructions`,
   `fex_instruction_limit`, `block_ending_instruction`, `end_of_input`,
-  `invalid_instruction`/`partial_decode`/`not_executable`/`unimplemented_instruction`
+  `invalid_instruction`/`partial_decode`/`not_executable`/`unimplemented_instruction`/`instruction_too_long`
   (decoder status), `dispatch_failure` (OpDispatcher cannot translate), `other`
   (e.g. the dispatcher itself requested a block end).
 - `pc_table`: FEX's `DebugData.GuestOpcodes` verbatim (guest offset, native offset), plus

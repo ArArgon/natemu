@@ -269,7 +269,7 @@ class Slice1Cutting(unittest.TestCase):
 
     def test_decoder_failure_on_first_instruction_gives_no_code(self):
         # not FEX's NoExec/SIGSEGV block, and never an object file
-        for name, x, reason in (('lone REX', '48', 'partial_decode'), ('lone 0f', '0f', 'not_executable'), ('0f 01 without ModRM', '0f01', 'partial_decode'),
+        for name, x, reason in (('lone REX', '48', 'partial_decode'), ('lone 0f', '0f', 'partial_decode'), ('0f 01 without ModRM', '0f01', 'partial_decode'),
                                 ('lone 66', '66', 'partial_decode'), ('f3 48', 'f348', 'partial_decode')):
             with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
                 obj = Path(tmp) / 'o.bin'
@@ -279,9 +279,22 @@ class Slice1Cutting(unittest.TestCase):
                 self.assertNotIn('hex', d.get('code', {}))
                 self.assertFalse(obj.exists(), name)
 
+    def test_instruction_too_long(self):
+        # Over 15 bytes (SDM Vol.3 Interrupt 13: #GP(0)): 15 prefixes; a 16-byte mov (its imm32 ends past byte 15); a 16th
+        # opcode byte. First: no code; mid-block: the block ends before it. Its 15-byte form translates.
+        mov = '4ac7848300010000' + '00000000'
+        for name, x in (('15 prefixes', '66' * 15 + '90'), ('16-byte mov', '66' * 4 + mov), ('16th opcode byte', '66' * 14 + '0f8500000000')):
+            with self.subTest(name):
+                d, rc = run(x)
+                self.assertEqual((rc, d['guest']['end']['rip'], d['guest']['end']['reason']), (1, hex(RIP), 'instruction_too_long'), name)
+                d, rc = run(PRE + x)
+                self.assertEqual((rc, d['guest']['instructions_translated'], d['guest']['end']['reason']), (0, 2, 'instruction_too_long'), name)
+        d, rc = run('66' * 3 + mov)
+        self.assertEqual((rc, d['guest']['instructions_translated']), (0, 1))
+
     def test_decoder_failure_mid_block_ends_the_block_without_a_signal_block(self):
         ref, _ = run(PRE)
-        for name, x, reason in (('lone REX', '48', 'partial_decode'), ('lone 0f', '0f', 'not_executable'), ('lone 66', '66', 'partial_decode')):
+        for name, x, reason in (('lone REX', '48', 'partial_decode'), ('lone 0f', '0f', 'partial_decode'), ('lone 66', '66', 'partial_decode')):
             with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
                 obj = Path(tmp) / 'o.bin'
                 d, rc = run(PRE + x, RIP, '--object', str(obj))

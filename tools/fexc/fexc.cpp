@@ -300,6 +300,7 @@ static const char* StatusName(int s) {
   case S::PARTIAL_DECODE_INST: return "partial_decode";
   case S::BAD_RELOCATION: return "bad_relocation";
   case S::UNIMPLEMENTED_INST: return "unimplemented_instruction";
+  case S::TOO_LONG_INST: return "instruction_too_long";
   }
   return "unknown";
 }
@@ -316,7 +317,7 @@ static int Fail(const std::string& msg, int code = 2) {
 // Codes shared with crates/abi/src/code_object.rs (end_reason).
 static uint8_t EndReasonCode(const std::string& r) {
   static const char* const names[] = {"", "end_of_input", "block_ending_instruction", "max_instructions", "fex_instruction_limit", "system_instruction",
-    "unsupported_form", "dispatch_failure", "invalid_instruction", "partial_decode", "not_executable", "bad_relocation", "unimplemented_instruction"};
+    "unsupported_form", "dispatch_failure", "invalid_instruction", "partial_decode", "not_executable", "bad_relocation", "unimplemented_instruction", "instruction_too_long"};
   for (size_t i = 1; i < sizeof names / sizeof *names; ++i) if (r == names[i]) return uint8_t(i);
   return 255;
 }

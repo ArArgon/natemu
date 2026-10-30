@@ -1599,8 +1599,10 @@ RFBM[2], #GP(0) for a reserved bit (FXRSTOR too, whatever CR4.OSFXSR). **Choices
 (16 bytes FX*, 64 bytes X*) is #GP(0), never #AC (both instructions' #AC text: "where #AC is not signaled, #GP is
 signaled in its place"), checked before the operand's canonical form and its walk; the canonical check (#GP(0), or #SS(0)
 for an SS-class reference) covers exactly the bytes accessed, a range wrapping past 2^64 included: FX* bytes 0..415,
-XSAVE the span from its first to its last stored byte, XRSTOR the header, then what it restores (review fix: it was the
-nominal 512 or 832 bytes); FXSAVE/FXRSTOR save and restore XMM and
+XSAVE the span from its first to its last stored byte, XRSTOR the area's base through the header, then what it restores
+(review fix: it was the nominal 512 or 832 bytes; since series28's review, XRSTOR's first check starts at the base, so an
+area whose base is non-canonical but whose header at +512 is canonical is #GP/#SS, not a #PF on the header's page, as
+hardware most likely checks the base first); FXSAVE/FXRSTOR save and restore XMM and
 MXCSR whatever CR4.OSFXSR ("may not ... implementation dependent"; QEMU skips them); #UD (no CR4.OSXSAVE) before #NM (TS).
 **Gating:** FX* #NM with CR0.TS or CR0.EM; XSAVE/XRSTOR #UD without OSXSAVE, then #NM with TS (EM does not gate them);
 XGETBV/XSETBV #UD without OSXSAVE; XSETBV #GP(0) at CPL > 0, for ECX ≠ 0 (ECX's upper half ignored) or a value not in
@@ -1683,6 +1685,25 @@ around it). Cause: with one byte (`0f`) before the page end FEX's decoder report
 `end_of_input` (`crates/host/src/execution.rs`, `ran_out`); the next page is ordinary kernel text in the same 2 MiB page.
 **Not built:** XSAVEOPT/XSAVEC/XSAVES/XRSTORS, XGETBV with ECX = 1 and XFD (not advertised); AVX state beyond its XSAVE
 component (I8); FOP/FIP/FDP (I6 deviation 8); XINUSE tracking (all ones).
+
+*Built (straddle/over-long, the decoder at the end of its input and the 15-byte limit; fexc series28 = series27 + patch
+0020; after an independent review):* **Straddle.** An instruction that starts in the bytes fexc was given and needs an
+unreadable byte within its first 15 is `partial_decode`, whatever FEX's zero-filled decode of the missing bytes gives
+(it was `not_executable` for `0f`, `0f 3a`, `0f 0f`, `0f c7`, `66 0f`, `f3 0f`, `c4`, `c4 e2`, `c5` at the end), so the
+host asks for the next page: present, the instruction is translated across the boundary; not present (or XD, or
+supervisor at CPL 3), the resident delivers its #PF, CR2 the next page's first byte, RIP the instruction (Vol.3 Table
+7-2: a fetch fault before decode). The host is unchanged. **Over-long.** An instruction that needs a 16th byte is
+`instruction_too_long` (end reason 13), answered as system kind `TOO_LONG`: #GP(0) at it (SDM Vol.3 Interrupt 13,
+"Exceeding the instruction length limit of 15 bytes"). Before, FEX's `ReadData` never checked the limit (a 16- or
+17-byte instruction with every byte present ran) and a long 3DNow! form wrote past FEX's 15-byte buffer. **natemu
+policy (the SDM is silent):** the 16th byte is never fetched, so an over-long instruction whose 16th byte is on a page
+that faults is #GP(0), not #PF; Bochs does the same, QEMU fetches the next page first and takes the #PF. **Refusal kept:**
+EVEX (`62`) is `unsupported_form` before its fetch completes, so a truncated EVEX form at a not-present page stops there
+instead of taking the #PF. **Checks:** faults' `straddle-*` (27 instructions, next page present and absent, plus XD and
+supervisor) and `long-*` (15 bytes; 16 and 17; 15 prefixes; a 16th opcode byte; a 17-byte 3DNow! form; 16 bytes split at
+byte 10 and 15, next page present and absent) at both block sizes; `test_slice1.py`; objects byte-identical to series27
+over 30,344 inputs but the 54 that end mid-instruction at the end of the input (end-reason byte only). Kernel (2 GiB, no
+initrd): past `acpi_irq_stats_init` to "VFS: Unable to mount root fs" (293 console lines), then panic's delay loop.
 
 **Owner decisions (October 29, L2):** (1) the ACPI tables come from natemu's own Rust builder (`crates/host/src/boot/acpi.rs`) using QEMU's conventional values, instead of reusing QEMU's C builder and linker (the Q6 deviation is accepted); it is judged by an independently written checker (`tools/models/acpi_model.py`, `tools/run_l2.py`) and by Linux 6.12's own parse of the same tables under QEMU. (2) Intel's ACPICA tools (`iasl`, Homebrew `acpica` 20260408) are installed for the standard `iasl -d` disassembly check.
 

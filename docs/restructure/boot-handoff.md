@@ -57,7 +57,7 @@ the phase-end ones):
 ```sh
 # From the repository root; works in zsh and bash (no word-splitting of variables; run in full under zsh and
 # argument-checked under bash at the phase end).
-F=../natemu-raw/fexc-native-20261026-01/series27/obj/fexc   # tools/fexc/build.sh rebuilds it; CS/DS/ES/SS prefixes by Intel's class (Linux's `ds btr`) need series27; I5b's FXSAVE/XSAVE cuts need series26-i5b or later; S3's `system` programs (RDRAND/RDSEED/RDPID) need series21-s3 or later, X2's BT* #AC cases series22; since I6 the host passes x87 arguments; series25 is the combined I6 + M3 build
+F=../natemu-raw/fexc-native-20261026-01/series28/obj/fexc   # tools/fexc/build.sh rebuilds it; instructions straddling a page end and over 15 bytes (#GP) need series28; CS/DS/ES/SS prefixes by Intel's class (Linux's `ds btr`) need series27; I5b's FXSAVE/XSAVE cuts need series26-i5b or later; S3's `system` programs (RDRAND/RDSEED/RDPID) need series21-s3 or later, X2's BT* #AC cases series22; since I6 the host passes x87 arguments; series25 is the combined I6 + M3 build
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 O=../natemu-raw/suite-$(date +%Y%m%d-%H%M%S)                  # a fresh output directory

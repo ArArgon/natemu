@@ -47,8 +47,10 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     if i.memory == 1 && va & if fx { 15 } else { 63 } != 0 {
         return Err(GP);
     }
-    // The canonical check (a range that wraps past 2^64 included) covers exactly the bytes accessed, by `linear` and
-    // `pages` below: FX* 0..415, XSAVE the span it stores, XRSTOR the header, then what it restores.
+    // The canonical check (#GP(0), or #SS(0) for an SS-class reference; a range wrapping past 2^64 is non-canonical) is
+    // made on each range below before its walk, by `linear` and `pages`: FX* bytes 0..415, XSAVE the span from its first
+    // to its last stored byte, XRSTOR first the base through the header (the base checked though only the header is read
+    // then), then each part it restores.
     let mut img = [0u8; AREA];
     let word = |img: &[u8], at: usize| u64::from_le_bytes(img[at..at + 8].try_into().unwrap());
     match i.kind {
@@ -97,6 +99,12 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             }
         }
         system::XRSTOR => {
+            // The header is read first, but its canonical check starts at the area's base: a non-canonical base is
+            // #GP/#SS before a #PF on the header's page.
+            let last = va.wrapping_add(HEADER as u64 + 23);
+            if !paging::canonical(va) || !paging::canonical(last) || last < va {
+                return Err(nc);
+            }
             linear(s, va.wrapping_add(HEADER as u64), &mut img[HEADER..HEADER + 24], false, false, nc)?;
             let (bv, comp, reserved) = (word(&img, HEADER), word(&img, HEADER + 8), word(&img, HEADER + 16));
             // Standard form only (XCOMP_BV[63] = 1 is the compacted form: #GP without XSAVEC); XSTATE_BV within XCR0, header
