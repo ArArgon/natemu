@@ -2,7 +2,7 @@
 //! translation tables (4 KiB granule, 48-bit VA, separate from guest
 //! translation). TTBR0 maps the guest lower canonical half (below 2^47) beside
 //! the resident's private region at L0 index 256; TTBR1 maps the upper half.
-//! The x86 non-canonical gap is never mapped. Tables live in the owner's 1 MiB
+//! The x86 non-canonical gap is never mapped. Tables live in the owner's 2 MiB
 //! window: the host pre-links the lower and upper 2 MiB windows at fixed pages,
 //! and further intermediate tables come from a bounded pool.
 //!
@@ -29,9 +29,11 @@ pub const USER_UPPER_ROOT: usize = 0x1d000;
 pub const ROOTS: [[usize; 2]; 2] = [[LOWER_ROOT, UPPER_ROOT], [USER_LOWER_ROOT, USER_UPPER_ROOT]];
 /// Pool allocation count (one u64) in its own private page.
 pub const STATE_OFFSET: usize = 0x1b000;
-/// Intermediate/leaf table pages allocated on demand; never freed except by `reset`.
+/// Intermediate/leaf table pages allocated on demand; never freed except by `reset` (a full pool resets: the vCPU's
+/// `evictions`). M1: 288 pages, to the end of the window's 2 MiB (the execution mode's block owns it; the leaf maps it),
+/// so the shadows of a kernel's working set (one leaf table per 2 MiB of linear addresses) span up to ~560 MiB.
 pub const POOL_OFFSET: usize = 0xe0000;
-pub const POOL_PAGES: usize = 32;
+pub const POOL_PAGES: usize = 288;
 pub const TCR_BOTH: u64 =
     16 | 1 << 8 | 1 << 10 | 3 << 12 | 16 << 16 | 1 << 24 | 1 << 26 | 3 << 28 | 2 << 30 | 2 << 32;
 /// Valid page, AF, inner shareable, normal memory (MAIR index 0), EL0 read/write (AP 01: generated code runs at EL0),
@@ -46,7 +48,7 @@ pub const NOT_GLOBAL: u64 = 1 << 11;
 pub const READ_ONLY: u64 = 1 << 7;
 const TABLE: u64 = 3;
 const OUTPUT: u64 = 0x0000_ffff_ffff_f000;
-const _: () = assert!(POOL_OFFSET + POOL_PAGES * 4096 <= crate::RAM_SIZE);
+const _: () = assert!(POOL_OFFSET + POOL_PAGES * 4096 <= 2 * crate::RAM_SIZE);
 const _: () = assert!(crate::resident::TEXT_END <= POOL_OFFSET);
 const _: () = assert!(STATE_OFFSET < USER_LOWER_ROOT && USER_UPPER_ROOT + 4096 <= crate::SHARED_OFFSET);
 
@@ -282,7 +284,7 @@ mod tests {
         }
     }
     fn window() -> Vec<u64> {
-        vec![0; crate::RAM_SIZE / 8]
+        vec![0; 2 * crate::RAM_SIZE / 8]
     }
     fn word(memory: &[u64], offset: usize) -> u64 {
         memory[offset / 8]

@@ -5,8 +5,8 @@
 //! x86 semantics are applied here, at every boundary the resident sees: the top of `find`'s loop (every precise stop,
 //! every resident entry that dispatches, and after every system instruction). An event is taken when it is eligible
 //! (SDM Vol.3 7.9 Table 7-2: NMI before maskable interrupts; `tools/models/delivery_model.py` `recognise`):
-//! - a maskable interrupt (the highest vector pending: an IRR until the LAPIC exists, X3) needs RFLAGS.IF and no
-//!   shadow;
+//! - a maskable interrupt (the one the local APIC delivers by its priority rules, [`lapic::deliverable`], X3) needs
+//!   RFLAGS.IF and no shadow;
 //! - an NMI needs NMI blocking clear (set when one is delivered, released by IRET) and no shadow. The model permits an
 //!   STI shadow to block NMIs or not (A9); this one blocks them (one rule for both shadows).
 //! An event blocked only by a shadow (the STI shadow when STI set IF, or the MOV SS shadow) is taken at the boundary
@@ -27,7 +27,8 @@
 use super::segments::{Exception, linear};
 use super::*;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
-use natemu_abi::execution::cache::{EVENTS, Events, GLOBAL_VA};
+use super::lapic;
+use natemu_abi::execution::cache::Events;
 
 const IF: u64 = 1 << 9;
 const TF: u64 = 1 << 8;
@@ -37,13 +38,7 @@ const POPF_FLAGS: u64 = 0x1 | 0x4 | 0x10 | 0x40 | 0x80 | TF | IF | 1 << 10 | 1 <
 
 /// This vCPU's event record word at `field` (an offset in [`Events`]).
 fn word(s: &State, field: usize) -> &'static AtomicU64 {
-    let at = GLOBAL_VA + (EVENTS + s.vcpu as usize * size_of::<Events>() + field) as u64;
-    // SAFETY: the global area is mapped EL1 read/write in every vCPU's window; `at` is an aligned word of this vCPU's
-    // record (`s.vcpu` < MAX_VCPUS, checked at start). Producers and the host only use atomic accesses on it.
-    unsafe { AtomicU64::from_ptr(at as *mut u64) }
-}
-fn vectors(s: &State, w: usize) -> &'static AtomicU64 {
-    word(s, core::mem::offset_of!(Events, vectors) + 8 * w)
+    lapic::event_word(s.vcpu, field)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -56,14 +51,7 @@ enum Next {
 /// The event this boundary may take (Table 7-2), if any.
 fn next(s: &State) -> Option<Next> {
     let nmi = s.nmi_blocked == 0 && word(s, core::mem::offset_of!(Events, nmi)).load(SeqCst) != 0;
-    let vector = if s.cpu.rflags & IF == 0 {
-        None
-    } else {
-        (0..4).rev().find_map(|w| match vectors(s, w).load(SeqCst) {
-            0 => None,
-            bits => Some(64 * w as u64 + 63 - u64::from(bits.leading_zeros())),
-        })
-    };
+    let vector = if s.cpu.rflags & IF == 0 { None } else { lapic::deliverable(s) };
     match (nmi, vector) {
         (false, None) => None,
         _ if s.cpu.mov_ss != 0 || s.sti_shadow != 0 => Some(Next::Step),
@@ -86,7 +74,7 @@ pub(super) fn take(s: &mut State) -> bool {
                 2
             }
             Some(Next::Interrupt(v)) => {
-                vectors(s, v as usize / 64).fetch_and(!(1 << (v % 64)), SeqCst);
+                lapic::accept(s, v);
                 s.interrupts += 1;
                 v
             }
@@ -184,7 +172,7 @@ pub(super) fn park(s: &mut State) {
     served(s);
     unsafe { write_record(record(), *s) };
     let halted = word(s, core::mem::offset_of!(Events, halted));
-    halted.store(1, SeqCst);
+    let posts = word(s, core::mem::offset_of!(Events, posts));
     let mut parked = false;
     loop {
         // Doorbells that woke it count as one stop taken at a resident entry (the others merged into it): the host's
@@ -196,10 +184,20 @@ pub(super) fn park(s: &mut State) {
             unsafe { write_record(record(), *s) };
         }
         take_invalidations(s);
+        // X3: the posts seen are counted before the look, so a post after it shows as unseen (senders count after the bit).
+        let seen = posts.load(SeqCst);
+        lapic::poll(s);
         if next(s).is_some() {
             break;
         }
-        if word(s, core::mem::offset_of!(Events, end)).load(SeqCst) != 0 {
+        // X3: armed, its own LAPIC timer wakes it (the host does not end it then).
+        let wakes = lapic::can_wake(s);
+        halted.store(if wakes { 2 } else { 1 } | seen << natemu_abi::execution::cache::HALTED_SEEN_SHIFT, SeqCst);
+        if !wakes && word(s, core::mem::offset_of!(Events, end)).load(SeqCst) != 0 {
+            // A peer's post may land between `next` and the load of `end`: look once more before ending.
+            if next(s).is_some() {
+                break;
+            }
             halt(s, stop::HALTED)
         }
         if !parked {
@@ -223,6 +221,9 @@ fn acknowledge() -> u64 {
             return any;
         }
         any += 1;
+        if intid == lapic::TIMER_PPI {
+            lapic::timer_irq();
+        }
         unsafe { asm!("msr S3_0_C12_C12_1, {i}", "isb", i = in(reg) intid) };
         let c = cache::control();
         c.irqs += 1;

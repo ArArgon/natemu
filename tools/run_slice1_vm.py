@@ -12,7 +12,7 @@ to the code's own page stopped `unsupported_smc` until S2e and now run). Every o
 difference, is a failure. Independent page checks: a dirty page is
 accessed, every page whose bytes changed is dirty, the code pages are accessed.
 Writes DIR/results.json; exit status 1 on any failure."""
-import argparse, json, pathlib, subprocess, sys
+import argparse, json, os, pathlib, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
@@ -36,9 +36,10 @@ def build():
     cargo = ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release']
     subprocess.run(cargo + ['-p', 'natemu-host'], cwd=ROOT, check=True)
     subprocess.run(cargo + ['-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], cwd=ROOT, check=True)
-    host = ROOT / 'target/release/natemu-host'
+    target = pathlib.Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target'))  # cargo's own output directory
+    host = target / 'release/natemu-host'
     subprocess.run(['codesign', '--force', '--sign', '-', '--entitlements', ROOT / 'crates/host/entitlements.plist', host], check=True)
-    return host, ROOT / 'target/aarch64-unknown-none/release/natemu-runtime'
+    return host, target / 'aarch64-unknown-none/release/natemu-runtime'
 
 def description(p):
     lines = [f"rip {ref.num(p['rip']):#x}", f"rflags {ref.num(p['rflags']):#x}",

@@ -20,6 +20,7 @@ use super::*;
 use crate::cache::{self, Block};
 mod delivery;
 mod events;
+mod lapic;
 mod mmio;
 mod segments;
 mod sse;
@@ -47,16 +48,18 @@ fn dispatcher() -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(start, end as usize - start as usize) }
 }
 
-/// Guest-physical RAM through the resident's alias.
-const RAM: GuestRam = unsafe { GuestRam::new(0, GUEST_RAM_BYTES as u64, GUEST_RAM_VA) };
+/// Guest-physical RAM `[0, R)` through the resident's alias (M1: R is the VM's, `Control::ram_bytes`, set by the host).
+fn guest_ram() -> GuestRam {
+    unsafe { GuestRam::new(0, cache::control().ram_bytes, GUEST_RAM_VA) }
+}
 /// EL0t, IRQs unmasked (the doorbell), D, A and F masked; NZCV is or-ed in. The resident itself runs with DAIF masked.
 const BLOCK_SPSR: u64 = 0x340;
 /// SPSR.M of generated code (EL0t): every exception the resident serves came from there.
 fn from_el0(spsr: u64) -> bool {
     spsr & 0x1f == 0
 }
-/// The resident's private window (its pages are EL1-only, the code area EL0 execute-only).
-const WINDOW: core::ops::Range<u64> = PRIVATE..PRIVATE + (1 << 30);
+/// The resident's private window (its pages are EL1-only, the code area EL0 execute-only; the guest-RAM alias included).
+const WINDOW: core::ops::Range<u64> = PRIVATE..PRIVATE + PRIVATE_BYTES;
 
 fn record() -> *mut State {
     STATE_VA as *mut State
@@ -94,6 +97,7 @@ pub unsafe fn start() -> ! {
     }
     cache::reset();
     cache::fill_head(dispatcher());
+    lapic::init();
     // The GIC CPU interface: system registers on, every priority unmasked, group 1 (the doorbells) enabled.
     unsafe {
         asm!("mrs {t}, S3_0_C12_C12_5", "orr {t}, {t}, #1", "msr S3_0_C12_C12_5, {t}", "isb", // ICC_SRE_EL1.SRE
@@ -125,6 +129,8 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
     let mut flushed = false;
     loop {
         take_invalidations(s);
+        // X3: the LAPIC timer's expiries due by now (its virtual-timer doorbell only stopped the vCPU).
+        lapic::poll(s);
         // X2: the events this boundary may take; an event a shadow alone blocks waits for exactly one more instruction,
         // run alone (never cached or linked: the linker does not link to the step block).
         if events::take(s) {
@@ -444,9 +450,9 @@ fn fetch_walk(s: &mut State, va: u64) -> Result<u64, [u64; 3]> {
         halt(s, stop::UNSUPPORTED_MODE)
     };
     loop {
-        let mut tables = GuestTables::observed(RAM, CodeWrites(FetchWrites(s)));
+        let mut tables = GuestTables::observed(guest_ram(), CodeWrites(FetchWrites(s)));
         match paging::walk(&mut tables, control, va, Access::Fetch) {
-            Ok(t) if t.wb && RAM.range(t.gpa & !4095, 4096).is_some() => return Ok(t.gpa & !4095),
+            Ok(t) if t.wb && guest_ram().range(t.gpa & !4095, 4096).is_some() => return Ok(t.gpa & !4095),
             Ok(_) => return Err([fetch::NOT_RAM, 0, 0]),
             Err(Fault::Contended) => {}
             Err(f) => return Err(fetch::encode(f)),
@@ -700,6 +706,9 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
     if intid >= 1020 {
         unsafe { resume(&s, &raw const (*shared()).captured, elr, spsr) }
     }
+    if intid == lapic::TIMER_PPI {
+        lapic::timer_irq();
+    }
     let t1: u64;
     unsafe { asm!("msr S3_0_C12_C12_1, {i}", "isb", "mrs {t1}, cntvct_el0", i = in(reg) intid, t1 = out(reg) t1) }; // ICC_EOIR1_EL1
     let c = cache::control();
@@ -945,7 +954,8 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                 2 => c.cr2,
                 3 => c.cr3,
                 4 => c.cr4,
-                _ => c.cr8,
+                // X3: CR8 is TPR[7:4] (SDM Vol.3 11.8.6.1); the bank's `cr8` holds the whole TPR.
+                _ => c.cr8 >> 4,
             };
             false
         }
@@ -986,7 +996,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                     if v >> 4 != 0 {
                         return Err(GP)
                     }
-                    s.cpu.cr8 = v;
+                    s.cpu.cr8 = v << 4; // TPR[3:0] cleared (11.8.6.1)
                     return Ok(commit(s, i, false));
                 }
             }
@@ -1071,6 +1081,16 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         system::RDMSR | system::WRMSR => {
             // ECX selects; the profile's checks (cpu::read_ok/write_ok) decide #GP(0) before any effect.
             let index = gpr(1) as u32;
+            // X3: the x2APIC registers are the local APIC's ([`lapic`]).
+            if (0x800..=0x8ff).contains(&index) {
+                if i.kind == system::RDMSR {
+                    let v = lapic::rdmsr(s, index)?;
+                    (s.cpu.gpr[0], s.cpu.gpr[2]) = (v & 0xffff_ffff, v >> 32);
+                } else {
+                    lapic::wrmsr(s, index, gpr(2) << 32 | gpr(0) & 0xffff_ffff)?;
+                }
+                return Ok(commit(s, i, false));
+            }
             let Some(at) = cpu::msr(index) else { return Err(GP) };
             let m = cpu_profile::MSRS[at];
             if i.kind == system::RDMSR {
@@ -1098,9 +1118,8 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                     cpu::MSR_GS_BASE => s.cpu.gs_base = v,
                     cpu::MSR_TSC => msr_set(at, v.wrapping_sub(tsc().wrapping_sub(msr_get(at)))),
                     cpu::MSR_MISC_ENABLE => msr_set(at, cpu::misc_enable_after_write(v)),
-                    // EN/EXTD and the base select the LAPIC's mode and page: no LAPIC yet (its chunk), so a write that
-                    // changes them is refused; the BSP flag (bit 8, R/W) alone is stored.
-                    cpu::MSR_APIC_BASE if (v ^ msr_get(at)) & !APIC_BASE_BSP != 0 => unsupported(s),
+                    // EN/EXTD and the base select the LAPIC's mode and page (X3: its transitions, [`lapic::set_base`]).
+                    cpu::MSR_APIC_BASE => lapic::set_base(s, v)?,
                     // UCODE_REV keeps the high half (the low is 0 by the mask); KERNEL_GS_BASE is SWAPGS's ([`syscalls`]);
                     // PAT and the MTRRs are recorded: memory types are the walker's (M2), RAM runs as write-back.
                     _ => msr_set(at, v),
@@ -1145,7 +1164,6 @@ fn commit(s: &mut State, i: System, flush_all: bool) {
     s.cpu.rip = s.cpu.rip.wrapping_add(u64::from(i.length));
 }
 const LARGE_PAGE: u64 = 0x20_0000;
-const APIC_BASE_BSP: u64 = 1 << 8;
 
 /// MSR slot `at` of the vCPU's MSR record (`MSRS_VA`, its own; the host wrote the reset values), read and written.
 fn msr_get(at: usize) -> u64 {
@@ -1158,14 +1176,14 @@ fn msr_set(at: usize, value: u64) {
     // SAFETY: as in msr_get.
     unsafe { (MSRS_VA as *mut u64).add(at).write_volatile(value) }
 }
-/// The vCPU's TSC. Provisional until the clock service (plan L5): CNTVCT_EL0 scaled to the profile's rate
-/// (`cpu_profile::TSC_HZ`, 1 GHz) plus the vCPU's offset (the TSC MSR's slot: the host sets it from one CNTVCT sample
-/// shared by all vCPUs, so every TSC starts near 0 at VM creation and the vCPUs agree; a WRMSR of the TSC moves it).
+/// The vCPU's TSC (L5, `natemu_abi::clock`): the profile's rate (`cpu_profile::TSC_HZ`, 1 GHz = the 24 MHz crystal x
+/// 125 / 3, CPUID.15H) from V = CNTVCT_EL0 at CNTFRQ_EL0, exactly, plus the vCPU's offset (the TSC MSR's slot: the host
+/// sets it from one CNTVCT sample shared by all vCPUs, so every TSC starts near 0 at VM creation and the vCPUs agree; a
+/// WRMSR of the TSC moves it).
 fn tsc() -> u64 {
     let (count, hz): (u64, u64);
     unsafe { asm!("isb", "mrs {c}, cntvct_el0", "mrs {f}, cntfrq_el0", c = out(reg) count, f = out(reg) hz) };
-    let scaled = u128::from(count) * u128::from(cpu_profile::TSC_HZ) / u128::from(hz.max(1));
-    (scaled as u64).wrapping_add(msr_get(cpu::msr(cpu::MSR_TSC).unwrap()))
+    natemu_abi::clock::tsc(count, hz.max(1)).wrapping_add(msr_get(cpu::msr(cpu::MSR_TSC).unwrap()))
 }
 
 /// Changes the vCPU's CPL (0..=3), at a block boundary with the state banked: the one place a CPL changes (exception
@@ -1363,7 +1381,7 @@ fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, ac
     let Some(control) = s.cpu.control() else {
         halt(s, stop::UNSUPPORTED_MODE)
     };
-    let walk = paging::walk(&mut GuestTables::observed(RAM, CodeWrites(DataWrites { s: &mut *s, f, b, site })), control, va, access);
+    let walk = paging::walk(&mut GuestTables::observed(guest_ram(), CodeWrites(DataWrites { s: &mut *s, f, b, site })), control, va, access);
     match walk {
         // M3: a page that is not guest RAM is a device page whatever its memory type (device ranges are uncached): never
         // shadowed; the caller completes the access through the device path ([`mmio::device`]).
@@ -1592,7 +1610,7 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
         (_, r) => u128::from(x(r)).to_le_bytes(),
     };
     let head = (4096 - (address & 4095)) as usize;
-    let (Some(to0), Some(to1)) = (RAM.range(gpa[0], head as u64), RAM.range(gpa[1], (width - head) as u64)) else {
+    let (Some(to0), Some(to1)) = (guest_ram().range(gpa[0], head as u64), guest_ram().range(gpa[1], (width - head) as u64)) else {
         halt(&s, stop::SHADOW)
     };
     unsafe {
@@ -1625,7 +1643,7 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
 /// set again and the marks read again, and a page marked meanwhile is shadowed read-only (the access faults again and
 /// takes the code-write path).
 fn install(s: &mut State, va: u64, gpa: u64, writable: bool) {
-    match tables::install(s.cpu.cpl, va, &RAM, gpa, writable) {
+    match tables::install(s.cpu.cpl, va, &guest_ram(), gpa, writable) {
         Ok(()) => {}
         Err(shadow::Error::Capacity) => {
             reset_shadows(s);
@@ -1634,7 +1652,7 @@ fn install(s: &mut State, va: u64, gpa: u64, writable: bool) {
                 !cache::translated(gpa)
             };
             s.evictions += 1;
-            if tables::install(s.cpu.cpl, va, &RAM, gpa, writable).is_err() {
+            if tables::install(s.cpu.cpl, va, &guest_ram(), gpa, writable).is_err() {
                 halt(s, stop::SHADOW)
             }
         }

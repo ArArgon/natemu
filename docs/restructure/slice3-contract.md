@@ -20,7 +20,7 @@ owner service stays until the family drivers retire (S3i). Any resident halt or 
 
 **Global area.** (a) Code-page mask: a byte per guest-physical page, bit v = vCPU v holds blocks from the page (exists).
 (b) Writable mask: a byte per page, bit v = vCPU v may hold a writable shadow of it (moved from the per-vCPU lookup
-bitmap: peers read it). (c) Per vCPU an invalidation record `{pending, stale[GUEST_PAGES/64]}` replacing the 30-entry
+bitmap: peers read it). (c) Per vCPU an invalidation record `{pending, stale[GUEST_PAGES/64]}` (M1: `{pending, summary, stale}` sized for 3 GiB, the masks 4 bits per page; boot-features plan, Built (M1)) replacing the 30-entry
 `Queue`: `pending` bits PAGES, FLUSH, SHADOWS; `stale` is a page bitmap. Producers only set bits (atomic OR), the page bit
 before `pending`; the consumer swaps `pending` to 0, then each `stale` word: no overflow, no lock, no lost entry. (d) Per
 vCPU a shadow-reset counter. All mask, record and counter updates are atomic RMWs (SeqCst

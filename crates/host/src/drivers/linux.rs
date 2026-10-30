@@ -2,16 +2,14 @@
 //! entry state on one vCPU. A driver over the library pieces (boot, execution, vm, owners): no tamper, no fixture.
 //!
 //!   natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--rsdp ADDR]
-//!       [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]
+//!       [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]
 //!
-//! The map's low RAM ends at `--ram` (default: the VM's guest RAM, `GUEST_RAM_BYTES`; with `--load-only`, the boot
-//! map's 2 GiB). `--load-only` loads into host memory and runs nothing (no VM: RUNTIME and FEXC are not opened).
+//! The map's low RAM ends at `--ram` (default: the boot map's 2 GiB), which is also the VM's guest RAM (M1).
+//! `--code-cache BYTES` sets the code cache (default: the largest, `CODE_BYTES_MAX` less its head). `--load-only` loads into host memory and runs nothing (no VM: RUNTIME and FEXC are not opened).
 //! `--dump FILE` writes what the loader wrote into guest RAM (before any run) as records `[u64 gpa][u64 length][bytes]`,
 //! one per write ([`Loaded::writes`]; guest RAM is zero elsewhere). `--stop-at ADDR` ends the run when the BSP is about to
 //! execute linear ADDR (the execution mode's stop RIP: a block boundary, nothing fetched there). `--save` writes guest-physical
-//! bytes after the run. **Until M1** the in-tree guest RAM is 4 MiB (`GUEST_RAM_BYTES`), below the map's 16 MiB RAM
-//! start: a VM run refuses `BAD_LAYOUT` (or `RAM_NOT_BACKED` with a larger `--ram`) and needs a build with more guest
-//! RAM (boot-features plan, Built (L1)). Prints one JSON object: the placement (kernel, window, zero page, command line, initrd, e820,
+//! bytes after the run. Prints one JSON object: the placement (kernel, window, zero page, command line, initrd, e820,
 //! entry state) and, after a run, the stop and the final state.
 use super::super::*;
 use crate::boot::{self, Inputs, Layout, Loaded};
@@ -22,7 +20,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] \
-                     [--rsdp ADDR] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]";
+                     [--rsdp ADDR] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]";
 /// Largest image or initrd read (the protocol's 32-bit sizes).
 const MAX_INPUT: usize = 1 << 32;
 
@@ -40,6 +38,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     };
     let (mut initrd, mut cmdline, mut ram, mut rsdp, mut load_only, mut dump) = (None, String::new(), None, None, false, None);
     let (mut stop_at, mut saves, mut watchdog_ms, mut max_block) = (None, Vec::new(), 60_000, None);
+    let mut code_bytes = exec::cache::CODE_BYTES_MAX - exec::cache::HEAD_BYTES;
     let mut options = options.iter();
     while let Some(option) = options.next() {
         let mut value = || options.next().ok_or_else(|| USAGE.to_string());
@@ -48,6 +47,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             "--cmdline" => cmdline = value()?.clone(),
             "--ram" => ram = Some(number(value()?)?),
             "--rsdp" => rsdp = Some(number(value()?)?),
+            "--code-cache" => code_bytes = number(value()?)? as usize,
             "--load-only" => load_only = true,
             "--dump" => dump = Some(value()?.clone()),
             "--stop-at" => stop_at = Some(number(value()?)?),
@@ -61,9 +61,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let initrd = initrd.map(|p| memory::read_input(&p, MAX_INPUT)).transpose()?;
     let inputs = Inputs { image: &image, cmdline: &cmdline, initrd: initrd.as_deref(), rsdp };
 
+    let layout = Layout { low_end: ram.unwrap_or(Layout::DEFAULT.low_end), high: 0 };
+    layout.e820().map_err(|e| e.to_string())?; // before allocating L bytes
     if load_only {
-        let layout = Layout { low_end: ram.unwrap_or(Layout::DEFAULT.low_end), high: 0 };
-        layout.e820().map_err(|e| e.to_string())?; // before allocating L bytes
         // Zero-filled on demand: only the pages the loader writes are touched.
         let mut host = vec![0u64; layout.low_end as usize / 8];
         // SAFETY: `host` backs [0, L) and outlives `guest`.
@@ -77,10 +77,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let backing = execution::prepare(resident, exec::cache::CODE_BYTES, 1)?;
+    let backing = execution::prepare(resident, code_bytes, 1, layout.low_end as usize)?;
     require_vcpus(1)?;
-    let guest = execution::guest_ram(&backing.memory);
-    let layout = Layout { low_end: ram.unwrap_or(exec::GUEST_RAM_BYTES as u64), high: 0 };
+    let guest = backing.ram;
     let loaded = boot::load(&guest, &layout, &inputs).map_err(|e| e.to_string())?;
     if let Some(path) = &dump {
         write_dump(path, &guest, &loaded)?;
@@ -121,6 +120,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         fs::write(path, bytes).map_err(|e| format!("{path}: {e}"))?;
     }
     let s: State = backing.vcpu(0).read_record(exec::STATE_OFFSET);
+    // M1 pool use: the code cache and metadata arena filled since the last flush, and the shadow pool's resets.
+    let c: exec::cache::Control = backing.vcpu(0).read_record(exec::cache::LOOKUP_OFFSET + exec::cache::CONTROL);
     let (kind, reason) = match &stop {
         Stop::Reached => ("reached".to_string(), String::new()),
         Stop::Resident { stop: exec::stop::SHUTDOWN, .. } => ("shutdown".into(), format!("fault {:x?}", s.fault)),
@@ -128,7 +129,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         other => (format!("{other:?}").split(['(', ' ', '{']).next().unwrap().to_lowercase(), format!("{other:?}")),
     };
     println!(
-        "{},\"stop\":\"{kind}\",\"reason\":\"{}\",\"state\":{},\"stats\":{{\"blocks\":{},\"compiles\":{compiles},\"systems\":{},\"flushes\":{},\"interrupts\":{},\"seconds\":{:.3}}}}}",
+        "{},\"stop\":\"{kind}\",\"reason\":\"{}\",\"state\":{},\"stats\":{{\"blocks\":{},\"compiles\":{compiles},\"systems\":{},\"flushes\":{},\"interrupts\":{},\"evictions\":{},\"retries\":{},\"shadow_resets\":{},\"cache\":{{\"code_used\":{},\"code_bytes\":{},\"meta_used\":{},\"blocks\":{}}},\"seconds\":{:.3}}}}}",
         placement(&loaded, &layout),
         reason.replace('"', "'"),
         cpu_json(&s.cpu),
@@ -136,6 +137,13 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         s.systems,
         s.generation,
         s.interrupts,
+        s.evictions,
+        s.retries,
+        execution::shadow_resets(backing.vcpu(0)),
+        c.code_used,
+        c.code_bytes,
+        c.meta_used,
+        c.blocks,
         started.elapsed().as_secs_f64()
     );
     Ok(())

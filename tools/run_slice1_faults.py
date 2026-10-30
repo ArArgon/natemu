@@ -409,7 +409,7 @@ SS_SPAN = [(0x8000_0000_0004, 'push', 'push rax'), (0xffff_8000_0000_0004, 'push
 # site that must give #GP(0), or #SS(0) for a stack access, with the exact state. (name, page; abi `PRIVATE` layout.)
 WINDOW = [('tables', PRIVATE + 0x1_0000), ('shared', PRIVATE + 0x2_0000), ('state', PRIVATE + 0x2_2000), ('frame', PRIVATE + 0x2_3000),
           ('stack', PRIVATE + 0x5_3000), ('exception-stack', PRIVATE + 0x6_3000), ('staging', PRIVATE + 0x7_0000),
-          ('text', PRIVATE + 0xa_0000), ('pool', PRIVATE + 0xe_0000), ('guest-ram', PRIVATE + 0x20_0000 + D),
+          ('text', PRIVATE + 0xa_0000), ('pool', PRIVATE + 0xe_0000), ('guest-ram', PRIVATE + 0x4000_0000 + D), ('ram-tables', PRIVATE + 0x2_5000), ('pool-high', PRIVATE + 0x1f_f000),
           ('code', PRIVATE + 0x1003_1000), ('dispatch', PRIVATE + 0x1001_0000), ('code-write', PRIVATE + 0x2003_1000),
           ('meta', PRIVATE + 0x3000_0000), ('lookup', PRIVATE + 0x3800_0000), ('global', PRIVATE + 0x3c00_0000),
           ('low-hole', 0x0000_ffff_ffff_e000), ('low-hole-kernel', 0x0000_8880_1234_5000),

@@ -5,10 +5,10 @@ each event at LOG(i) + 0x40 * k: vector, error code (-1 for none), the frame's R
 flags, IF, DF, RF), r12 (the main line's progress marker), RCX and the vectors 0..63 whose handlers were running; then return with IRETQ (an exception resumes at r13;
 an interrupt is ended with an x2APIC EOI). Event sources are marked in the text:
   SIGNAL v | SIGNAL nmi   an event becomes pending here (rcx, rax, rdx clobbered);
-  EOI, APIC_ON            the x2APIC's end-of-interrupt and enable (QEMU only).
+  EOI, APIC_ON            the x2APIC's end-of-interrupt and enable (both variants; natemu's LAPIC since X3).
 QEMU's variant raises the event through its own x2APIC (a self IPI by the SELF_IPI MSR for a vector, an NMI by the ICR to
-the CPU's own APIC ID) with `wrmsr`; natemu's has two `nop`s in place of each `wrmsr` (the same length, so every address
-is the same), and its driver posts the event at the second `nop` (`post`/`nmi` items: the host posts into the vCPU's
+the CPU's own APIC ID) with `wrmsr`; natemu's has two `nop`s in place of each signalling `wrmsr` (the same length, so every
+address is the same), and its driver posts the event at the second `nop` (`post`/`nmi` items: the host posts into the vCPU's
 event record and rings its doorbell, X2). The SDM makes QEMU's event pending when the `wrmsr` completes; natemu's is
 pending when the hook completes: the same boundary.
 
@@ -100,11 +100,11 @@ def expand(text, i, qemu):
             out += ['    wrmsr'] if qemu else ['    nop', f'{label}:', '    nop']
             hooks.append((label, NMI if e == NMI else int(e, 0)))
         elif words[:1] == ['EOI']:
-            out += ['    mov ecx, 0x80b', '    xor eax, eax', '    xor edx, edx'] + (['    wrmsr'] if qemu else ['    nop', '    nop'])
+            out += ['    mov ecx, 0x80b', '    xor eax, eax', '    xor edx, edx', '    wrmsr']
         elif words[:1] == ['APIC_ON']:
             base = 0xfee00d00 if i == 0 else 0xfee00c00
-            out += ['    mov ecx, 0x1b', f'    mov eax, {base:#x}', '    xor edx, edx'] + (['    wrmsr'] if qemu else ['    nop', '    nop'])
-            out += ['    mov ecx, 0x80f', '    mov eax, 0x1ff', '    xor edx, edx'] + (['    wrmsr'] if qemu else ['    nop', '    nop'])
+            out += ['    mov ecx, 0x1b', f'    mov eax, {base:#x}', '    xor edx, edx', '    wrmsr']
+            out += ['    mov ecx, 0x80f', '    mov eax, 0x1ff', '    xor edx, edx', '    wrmsr']
         else:
             out.append(line)
     return '\n'.join(out), hooks

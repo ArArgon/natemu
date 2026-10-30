@@ -70,9 +70,11 @@ impl Memory {
         self.check(offset, size_of::<T>());
         assert_eq!(offset % align_of::<T>(), 0, "misaligned record");
     }
-    /// Makes host-written code visible to instruction fetch before any vCPU runs.
-    pub(crate) fn flush_instruction_cache(&self) {
-        unsafe { sys_icache_invalidate(self.0.cast(), self.1) };
+    /// Makes host-written code in `[offset, offset + length)` visible to instruction fetch before any vCPU runs (only
+    /// the windows' resident text: flushing the whole backing would touch every page of guest RAM).
+    pub(crate) fn flush_instruction_cache(&self, offset: usize, length: usize) {
+        self.check(offset, length);
+        unsafe { sys_icache_invalidate(self.0.add(offset).cast(), length) };
     }
     /// Copies the loaded resident text from window 0 into another owner's window.
     pub(crate) fn replicate_resident_text(&self, window: usize) {
@@ -231,6 +233,12 @@ const BLOCK: u64 = 1 | 1 << 10 | 1 << 11 | 3 << 8;
 const PRIVATE_LEAF: usize = 0x14000;
 /// Level-2 table of `PRIVATE..PRIVATE + 1 GiB`; its first entry links `PRIVATE_LEAF`.
 const PRIVATE_L2: usize = 0x13000;
+/// Level-2 table of the private window's GiB `g` (`PRIVATE_L2`, then the guest-RAM alias's, M1).
+fn private_l2(g: usize) -> usize {
+    if g == 0 { PRIVATE_L2 } else { natemu_abi::execution::RAM_TABLES_OFFSET + (g - 1) * 4096 }
+}
+/// GiBs of the private window.
+const PRIVATE_GIBS: usize = (natemu_abi::execution::PRIVATE_BYTES >> 30) as usize;
 
 /// Private tables of the owner whose window starts at backing offset `window`:
 /// TTBR0 (`shadow::LOWER_ROOT`) holds the boot identity alias, the private
@@ -249,7 +257,9 @@ pub(crate) fn private_space(memory: &Memory, window: usize, spans: &[Span], uppe
     word(0x11000 + 8, IPA | 1 | 1 << 10 | 1 << 11 | 3 << 8);
     word(0x11000, table(0x15000));
     word(0x15000, table(shadow::LOWER_LEAF));
-    word(0x12000 + 8, table(PRIVATE_L2));
+    for g in 0..PRIVATE_GIBS {
+        word(0x12000 + 8 * (1 + g), table(private_l2(g)));
+    }
     word(PRIVATE_L2, table(PRIVATE_LEAF));
     if upper {
         word(shadow::UPPER_ROOT + 256 * 8, table(shadow::UPPER_L1));
@@ -280,7 +290,7 @@ pub(crate) fn private_space(memory: &Memory, window: usize, spans: &[Span], uppe
 }
 
 /// Maps `spans` into window `window`'s private region (replacing earlier entries): 4 KiB pages in its first 2 MiB,
-/// 2 MiB blocks (offset, size and target 2 MiB aligned) above, up to 1 GiB.
+/// 2 MiB blocks (offset, size and target 2 MiB aligned) above, up to `execution::PRIVATE_BYTES`.
 pub(crate) fn map_private(memory: &Memory, window: usize, spans: &[Span]) {
     const BLOCK_BYTES: usize = 2 * RAM_SIZE;
     for span in spans {
@@ -291,10 +301,12 @@ pub(crate) fn map_private(memory: &Memory, window: usize, spans: &[Span]) {
             Rights::Guest => EL0_DATA | PXN | UXN,
         };
         if span.offset >= BLOCK_BYTES {
-            assert!((span.offset | span.bytes | span.target) % BLOCK_BYTES == 0 && span.offset + span.bytes <= 1 << 30);
+            assert!((span.offset | span.bytes | span.target) % BLOCK_BYTES == 0);
+            assert!(span.offset + span.bytes <= natemu_abi::execution::PRIVATE_BYTES as usize);
             for block in (0..span.bytes).step_by(BLOCK_BYTES) {
+                let at = span.offset + block;
                 memory.word(
-                    window + PRIVATE_L2 + (span.offset + block) / BLOCK_BYTES * 8,
+                    window + private_l2(at >> 30) + (at % (1 << 30)) / BLOCK_BYTES * 8,
                     (IPA + (span.target + block) as u64) | BLOCK | protection,
                 );
             }
@@ -436,6 +448,15 @@ mod tests {
         // Generated code: EL1 read-only, EL0 execute-only (AP 10, UXN clear), never EL1-executable.
         assert_eq!(l2(0x3000_0000), (IPA + 6 * mib as u64) | BLOCK | READ_ONLY | PXN);
         assert_eq!(l2(0x1040_0000), 0);
+        // M1: the guest-RAM alias's GiBs (1 to 3 of the window) have level-2 tables of their own; a span crossing a GiB
+        // continues in the next table, and the last 2 MiB of the window is mappable.
+        let gib = 1 << 30;
+        map_private(&memory, 0, &[Span::data(gib + gib - 2 * mib, 4 * mib, 0), Span::data(4 * gib - 2 * mib, 2 * mib, 0)]);
+        let ram = |g: usize, offset: usize| u64::from_le_bytes(memory.read::<8>(private_l2(g) + offset / (2 * mib) * 8));
+        assert_eq!(ram(1, gib - 2 * mib), IPA | BLOCK | PXN | UXN);
+        assert_eq!(ram(2, 0), (IPA + 2 * mib as u64) | BLOCK | PXN | UXN);
+        assert_eq!(ram(3, gib - 2 * mib), IPA | BLOCK | PXN | UXN);
+        assert_eq!((PRIVATE_GIBS, private_l2(1), private_l2(3)), (4, 0x25000, 0x27000));
     }
 
     #[test]

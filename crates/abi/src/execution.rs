@@ -12,7 +12,7 @@
 //! target the same way and then patches the exit into a direct branch to it, so a
 //! linked edge never leaves generated code. Shadow misses are served in the resident.
 use crate::{
-    PRIVATE, RAM_SIZE,
+    PRIVATE,
     paging::{self, Control},
 };
 
@@ -80,20 +80,29 @@ pub const STAGING_BYTES: usize = 0x20000;
 pub const STAGING_VA: u64 = PRIVATE + STAGING_OFFSET as u64;
 /// Native stack mapped below `crate::STACK_TOP` while code runs (SP_EL0; admitted code never uses it).
 pub const STACK_BYTES: usize = 0x8000;
-/// Guest-physical RAM `[0, GUEST_RAM_BYTES)`: backing offset and resident alias, mapped in 2 MiB blocks.
-pub const GUEST_RAM_OFFSET: usize = 2 * RAM_SIZE;
-pub const GUEST_RAM_BYTES: usize = 0x40_0000;
-pub const GUEST_RAM_VA: u64 = PRIVATE + GUEST_RAM_OFFSET as u64;
-/// Guest-physical pages of guest RAM.
-pub const GUEST_PAGES: usize = GUEST_RAM_BYTES / 4096;
+/// Guest-physical RAM `[0, R)` (M1): R is the VM's, chosen at run time (a 2 MiB multiple up to [`MAX_GUEST_RAM_BYTES`],
+/// the boot map's largest low RAM; [`cache::Control::ram_bytes`]). The resident's EL1-only alias starts at the private
+/// window's second GiB and is mapped in 2 MiB blocks through one level-2 table per GiB (window pages from
+/// [`RAM_TABLES_OFFSET`], written by the host, never mapped); the backing holds RAM after every vCPU's block (the host's
+/// `Backing`).
+pub const GUEST_RAM_VA: u64 = PRIVATE + (1 << 30);
+pub const MAX_GUEST_RAM_BYTES: usize = 3 << 30;
+/// Guest-physical pages the per-page structures cover (only the VM's first R / 4096 are used).
+pub const MAX_GUEST_PAGES: usize = MAX_GUEST_RAM_BYTES / 4096;
+pub const RAM_TABLES_OFFSET: usize = 0x25000;
+/// The private window: the first GiB's areas ([`cache`]), then the guest-RAM alias.
+pub const PRIVATE_BYTES: u64 = (1 << 30) + MAX_GUEST_RAM_BYTES as u64;
+const _: () = assert!(MAX_GUEST_RAM_BYTES % (2 << 20) == 0 && MAX_GUEST_PAGES % 64 == 0);
+const _: () = assert!(GUEST_STATE_OFFSET + frame::BYTES <= RAM_TABLES_OFFSET);
+const _: () = assert!(RAM_TABLES_OFFSET + (MAX_GUEST_RAM_BYTES >> 30) * 4096 <= (crate::STACK_TOP - PRIVATE) as usize - STACK_BYTES);
 
 /// The code cache (slice 2). Per vCPU: an executable code area with a writable
 /// alias, a metadata arena (block records and their access sites) and the lookup
 /// structures. Shared between vCPUs ([`cache::GLOBAL_VA`]): the code-page and
 /// writable-shadow masks over guest-physical pages, one invalidation record and one
-/// shadow-reset counter per vCPU. Areas are mapped in 2 MiB blocks; the backing
-/// places them after guest RAM, the code area last because its size is set at
-/// `prepare`. vCPU v's own areas (window, lookup, metadata, code) sit at the same
+/// shadow-reset counter per vCPU. Areas are mapped in 2 MiB blocks; vCPU v's block of
+/// the backing holds its window, then these areas at the offsets below, the code area
+/// last because its size is set at `prepare`; guest RAM follows the last block. vCPU v's own areas (window, lookup, metadata, code) sit at the same
 /// private addresses as every other vCPU's, backed by its own block of the backing.
 pub mod cache {
     use crate::PRIVATE;
@@ -129,6 +138,9 @@ pub mod cache {
     pub const HEAD_BYTES: usize = L1_CODE + L1_ENTRIES * L1_ENTRY_BYTES;
     /// The largest block admitted; the code area holds at least one.
     pub const MAX_BLOCK_BYTES: usize = 32 * 1024;
+    /// M1 pool sizes: the Debian kernel's early boot averaged 261 code and 230 metadata bytes per block, so the arena holds
+    /// about [`MAX_BLOCKS`] (32 Ki) blocks, which fill about 8.5 MiB of code. Not larger until invalidation stops scanning
+    /// every block (`cache::invalidate`): doubling them slowed a cross-modifying-code program by a third (M1).
     pub const META_VA: u64 = PRIVATE + 0x3000_0000;
     pub const META_BYTES: usize = 8 * MIB;
     pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
@@ -138,8 +150,8 @@ pub mod cache {
     /// Mapping granule of the areas.
     pub const BLOCK: usize = 2 * MIB;
 
-    /// Backing offsets (2 MiB aligned).
-    pub const LOOKUP_OFFSET: usize = crate::execution::GUEST_RAM_OFFSET + crate::execution::GUEST_RAM_BYTES;
+    /// Backing offsets in a vCPU's block (2 MiB aligned), after its window's 2 MiB.
+    pub const LOOKUP_OFFSET: usize = 2 * crate::RAM_SIZE;
     pub const GLOBAL_OFFSET: usize = LOOKUP_OFFSET + LOOKUP_BYTES;
     pub const META_OFFSET: usize = GLOBAL_OFFSET + GLOBAL_BYTES;
     pub const CODE_OFFSET: usize = META_OFFSET + META_BYTES;
@@ -158,23 +170,33 @@ pub mod cache {
     pub const MAX_LINKS: usize = 32 * 1024;
     /// The single-step block's record (its code is in the slot, `SLOT_VA`) and its access sites after it.
     pub const STEP_RECORD: usize = 0x1c_0000;
-    pub const STEP_RECORD_BYTES: usize = 0x4_0000;
+    pub const STEP_RECORD_BYTES: usize = 0x3_c000;
+    /// M1: this vCPU's summaries of the code-page and writable mask words it set bits in (bit i % 64 of u64 i / 64: word
+    /// i of the mask may hold its bits), so clearing its bits visits only those words, not all of guest RAM's (only the
+    /// resident of this vCPU reads or writes them).
+    pub const CODE_SUMMARY: usize = STEP_RECORD + STEP_RECORD_BYTES;
+    pub const SUMMARY_BYTES: usize = MASK_BYTES / 64;
+    pub const WRITABLE_SUMMARY: usize = CODE_SUMMARY + SUMMARY_BYTES;
 
-    /// Global area layout, shared by all vCPUs and updated only by atomic read-modify-writes (host and resident):
-    /// a code-page mask byte per guest-physical page (bit v: vCPU v holds translations from the page), a writable
-    /// mask byte per page (bit v: vCPU v may hold a writable shadow of it), one invalidation [`Record`] per vCPU and
-    /// one shadow-reset counter (u64) per vCPU.
-    pub const CODE_PAGES: usize = 0;
-    pub const WRITABLE_PAGES: usize = 0x1000;
-    pub const RECORDS: usize = 0x2000;
+    /// Global area layout, shared by all vCPUs and updated only by atomic read-modify-writes (host and resident): one
+    /// shadow-reset counter (u64) per vCPU and the per-vCPU [`Events`] in its first 64 KiB; then the per-page structures,
+    /// sized for [`super::MAX_GUEST_PAGES`] (the VM uses its first R / 4096 pages; pages never touched are never backed):
+    /// the code-page mask (bit v of a page's nibble: vCPU v holds translations from the page) and the writable mask
+    /// (bit v: vCPU v may hold a writable shadow of it), 4 bits per page, page p's nibble at bit 4 (p % 16) of u64 word
+    /// p / 16, so one atomic word operation reads or changes every vCPU's bit of a page (M1); then one invalidation
+    /// [`Record`] per vCPU.
+    pub const CODE_PAGES: usize = 0x1_0000;
+    pub const MASK_BYTES: usize = super::MAX_GUEST_PAGES / 2;
+    pub const WRITABLE_PAGES: usize = CODE_PAGES + MASK_BYTES;
+    pub const RECORDS: usize = WRITABLE_PAGES + MASK_BYTES;
     pub const RESETS: usize = 0x3000;
     /// Per-vCPU [`Events`] records (X2).
     pub const EVENTS: usize = 0x3100;
-    /// vCPUs of one VM (bits of the mask bytes).
+    /// vCPUs of one VM (bits of the mask nibbles).
     pub const MAX_VCPUS: usize = 4;
 
-    /// Per-vCPU cache bookkeeping at [`CONTROL`]. The host sets `code_bytes` (the code area's size, head included) at
-    /// prepare; the resident owns the rest.
+    /// Per-vCPU cache bookkeeping at [`CONTROL`]. The host sets `code_bytes` (the code area's size, head included) and
+    /// `ram_bytes` (the VM's guest RAM, R) at prepare; the resident owns the rest.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Control {
@@ -203,6 +225,8 @@ pub mod cache {
         /// Stops armed again in the interrupted block after a resident entry that resumed it mid-block (a division,
         /// a retried access, a split store).
         pub rearms: u64,
+        /// The VM's guest RAM, R (M1; set by the host at prepare, last so the resident's fields keep their places).
+        pub ram_bytes: u64,
     }
     /// A block placed in the cache: its record in the metadata arena (at the offset `INDEX` lists), its access sites
     /// ([`crate::code_object::Site`]) right after it.
@@ -269,42 +293,54 @@ pub mod cache {
         pub target: u32,
     }
     /// Invalidation requests to one vCPU, drained at each of its resident entries. Producers only set bits (atomic
-    /// OR), the page's `stale` bit before `pending`; the consumer swaps `pending` to 0, then each `stale` word, so no
-    /// entry is lost and nothing overflows.
+    /// OR), the page's `stale` bit, then its word's `summary` bit, before `pending`; the consumer swaps `pending` to 0, then
+    /// each `summary` word and the `stale` words it names, so no entry is lost, nothing overflows and a drain visits only
+    /// the words posted to (M1).
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Record {
         /// [`PAGES`], [`FLUSH`], [`SHADOWS`].
         pub pending: u64,
+        /// Bit i % 64 of word i / 64: `stale` word i may be nonzero.
+        pub summary: [u64; super::MAX_GUEST_PAGES / 64 / 64],
         /// Guest-physical pages whose translations are stale (bit p % 64 of word p / 64).
-        pub stale: [u64; crate::execution::GUEST_PAGES / 64],
+        pub stale: [u64; super::MAX_GUEST_PAGES / 64],
     }
     /// `Record::pending`: `stale` lists pages; drop the whole cache; reset all shadows (and writable bits).
     pub const PAGES: u64 = 1;
     pub const FLUSH: u64 = 2;
     pub const SHADOWS: u64 = 4;
-    /// One vCPU's pending asynchronous x86 events (X2), shared: producers (the host's event sources today, the LAPIC of
-    /// peers in X3) set bits with an atomic OR and then ring the vCPU's doorbell; its resident takes them at precise
-    /// stops and resident entries (an atomic AND of the bit it accepts). Until the LAPIC exists, `vectors` is an IRR-like
-    /// set and the highest vector is taken first.
+    /// One vCPU's pending asynchronous x86 events (X2), shared: producers (peers' local APICs, X3; the host's event
+    /// sources) set bits with an atomic OR and then ring the vCPU's doorbell; its resident takes them at precise stops
+    /// and resident entries (an atomic AND of the bit it accepts). `vectors` is the local APIC's IRR (X3: delivered by
+    /// its priority rules, [`crate::lapic::deliverable`]).
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Events {
-        /// Pending external interrupt vectors (bit v % 64 of word v / 64).
+        /// The IRR: pending interrupt vectors (bit v % 64 of word v / 64).
         pub vectors: [u64; 4],
         /// 1: an NMI is pending (one pending bit: NMIs posted while one is pending merge, SDM Vol.3 7.7.2 / M64).
         pub nmi: u64,
         /// 1: the host ends the vCPU's run if it is halted with no event it can take ([`crate::execution::stop::HALTED`]).
         pub end: u64,
-        /// 1 while the vCPU is halted (HLT, parked in `wfi` in the VM): the host's watchdog treats it as idle.
+        /// While the vCPU is halted (HLT, parked in `wfi` in the VM; the host's watchdog treats it as idle): bits 7:0 are 1,
+        /// or 2 when its own LAPIC timer can interrupt it (X3: it wakes itself); bits 63:8 hold the `posts` count it read
+        /// before it last found no event to take ([`HALTED_SEEN_SHIFT`]). 0 while it runs.
         pub halted: u64,
-        pub reserved: u64,
+        /// X3: what senders match an IPI's destination against, written by the owner only ([`crate::lapic::published`]).
+        pub apic: u64,
+        /// X3: events posted to this vCPU so far (every sender adds 1 after setting its bit, before ringing). A halted vCPU
+        /// whose `halted` carries the current count has looked at every event posted to it: with the state 1, nothing
+        /// can wake it but a new post (the host's rule for ending halted vCPUs).
+        pub posts: u64,
     }
+    /// `Events::halted`: the shift of the `posts` count the vCPU had seen.
+    pub const HALTED_SEEN_SHIFT: u32 = 8;
 
-    const _: () = assert!(crate::execution::GUEST_RAM_OFFSET + crate::execution::GUEST_RAM_BYTES <= LOOKUP_OFFSET);
-    const _: () = assert!((crate::execution::GUEST_RAM_OFFSET | crate::execution::GUEST_RAM_BYTES | LOOKUP_OFFSET) % BLOCK == 0);
-    // The guest RAM alias ends below the code area; every area lies in PRIVATE..PRIVATE + 1 GiB, 2 MiB aligned.
-    const _: () = assert!(crate::execution::GUEST_RAM_VA + crate::execution::GUEST_RAM_BYTES as u64 <= CODE_VA);
+    // The window's 2 MiB (its pages and the shadow pool) precede the areas in a vCPU's block.
+    const _: () = assert!(crate::shadow::POOL_OFFSET + crate::shadow::POOL_PAGES * 4096 <= LOOKUP_OFFSET && LOOKUP_OFFSET % BLOCK == 0);
+    // Every area lies in PRIVATE..PRIVATE + 1 GiB, 2 MiB aligned, below the guest RAM alias (its own GiBs).
+    const _: () = assert!(crate::execution::GUEST_RAM_VA == PRIVATE + (1 << 30));
     const _: () = assert!(CODE_VA + CODE_BYTES_MAX as u64 <= CODE_WRITE_VA);
     const _: () = assert!(CODE_WRITE_VA + CODE_BYTES_MAX as u64 <= META_VA);
     const _: () = assert!(META_VA + META_BYTES as u64 <= LOOKUP_VA);
@@ -318,16 +354,18 @@ pub mod cache {
     const _: () = assert!(L1_MASK == 0xfff && L1_ENTRY_BYTES == 32 && L1_CODE - DISPATCH < 1 << 20); // the dispatcher's form
     const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= LINKS);
     const _: () = assert!(LINKS + MAX_LINKS * core::mem::size_of::<LinkRecord>() <= STEP_RECORD);
-    const _: () = assert!(STEP_RECORD + STEP_RECORD_BYTES <= LOOKUP_BYTES && STEP_RECORD % core::mem::align_of::<Block>() == 0);
-    const _: () = assert!(CODE_PAGES + crate::execution::GUEST_PAGES <= WRITABLE_PAGES);
-    const _: () = assert!(WRITABLE_PAGES + crate::execution::GUEST_PAGES <= RECORDS);
-    const _: () = assert!(RECORDS + MAX_VCPUS * core::mem::size_of::<Record>() <= RESETS && RECORDS % 8 == 0);
+    const _: () = assert!(STEP_RECORD + STEP_RECORD_BYTES <= CODE_SUMMARY && STEP_RECORD % core::mem::align_of::<Block>() == 0);
+    // The largest step record: its Block and a sites table, which lies inside one staged object (admission).
+    const _: () = assert!(core::mem::size_of::<Block>() + crate::execution::STAGING_BYTES <= STEP_RECORD_BYTES);
+    const _: () = assert!(WRITABLE_SUMMARY + SUMMARY_BYTES <= LOOKUP_BYTES && SUMMARY_BYTES * 64 == MASK_BYTES);
+    const _: () = assert!(MAX_VCPUS <= 4); // a nibble per page
+    const _: () = assert!(EVENTS + MAX_VCPUS * core::mem::size_of::<Events>() <= CODE_PAGES && CODE_PAGES % 8 == 0);
+    const _: () = assert!(RECORDS + MAX_VCPUS * core::mem::size_of::<Record>() <= GLOBAL_BYTES && MASK_BYTES % 8 == 0);
     const _: () = assert!(RESETS + MAX_VCPUS * 8 <= EVENTS && EVENTS % 64 == 0);
     const _: () = assert!(EVENTS + MAX_VCPUS * core::mem::size_of::<Events>() <= GLOBAL_BYTES);
-    const _: () = assert!(crate::execution::GUEST_PAGES % 64 == 0);
 }
 
-/// Backing bytes the execution mode needs before the code area: window 0, guest RAM and the cache's fixed areas.
+/// Bytes of a vCPU's block of the backing before its code area: its window and the cache's fixed areas.
 pub const BACKING_BYTES: usize = cache::CODE_OFFSET;
 
 /// FEX `CpuStateFrame` fields admitted code may access (pinned FEX build).
@@ -481,8 +519,8 @@ pub struct Cpu {
     /// `enter`; only the resident changes them (WRFSBASE/WRGSBASE, the MSRs and SWAPGS are its transactions, S3).
     pub fs_base: u64,
     pub gs_base: u64,
-    /// CR2 (the page-fault linear address: any 64-bit value; #PF delivery writes it, X1) and CR8 (the task-priority
-    /// class, bits 3:0; SDM Vol.3 10.8.6.1: it becomes an alias of the LAPIC's TPR bits 7:4 when the LAPIC exists, X3).
+    /// CR2 (the page-fault linear address: any 64-bit value; #PF delivery writes it, X1) and, in the field `cr8`, the
+    /// local APIC's whole TPR (bits 7:0, X3): CR8 reads and writes its bits 7:4 (SDM Vol.3 11.8.6.1).
     pub cr2: u64,
     pub cr8: u64,
     /// DR0..DR3, DR6, DR7 (MOV DR4/DR5 reach DR6/DR7 while CR4.DE = 0). State only: no breakpoint is armed (S4).
@@ -1237,7 +1275,12 @@ impl State {
 pub const MSRS_OFFSET: usize = STATE_OFFSET + 0x800;
 pub const MSRS_VA: u64 = PRIVATE + MSRS_OFFSET as u64;
 const _: () = assert!(core::mem::size_of::<State>() <= MSRS_OFFSET - STATE_OFFSET);
-const _: () = assert!(MSRS_OFFSET + core::mem::size_of::<crate::cpu::Msrs>() <= ENTROPY_OFFSET);
+const _: () = assert!(MSRS_OFFSET + core::mem::size_of::<crate::cpu::Msrs>() <= LAPIC_OFFSET);
+/// X3: the vCPU's local APIC ([`crate::lapic::Lapic`]), a record of its own in the state page; the host writes
+/// [`crate::lapic::RESET`] before the vCPU first runs, the resident owns it.
+pub const LAPIC_OFFSET: usize = STATE_OFFSET + 0xa00;
+pub const LAPIC_VA: u64 = PRIVATE + LAPIC_OFFSET as u64;
+const _: () = assert!(LAPIC_OFFSET + core::mem::size_of::<crate::lapic::Lapic>() <= ENTROPY_OFFSET);
 /// The vCPU's entropy service (S3, RDRAND): a pool of random words the host fills and the resident consumes, a record of
 /// its own in the state page. The host writes the record only while the vCPU is in the host (at reset and at each of its
 /// exits it tops the pool up: [`Entropy::taken`] words are replaced, `taken` returns to 0); the resident only while the

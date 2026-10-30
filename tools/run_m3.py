@@ -462,7 +462,7 @@ def boundary(a, host, runtime, report):
         peer = asm(f'1: mov byte ptr [{x}], {toggle[1]}\nmov byte ptr [{x}], {toggle[0]}\ndec rcx\njnz 1b')
         for block in (None, 1):
             text = (f'body {CODE:#x} {code.hex()}\nbody 0x101000 {peer.hex()}\nmemory 0x100800 00\nregion 0x3e0000 0x10000\n'
-                    f'cpu\nrip {CODE:#x}\nrflags 0\nif 0\ncpl 0\npost {CODE:#x} 0x40\n{regs(rcx=a.xmc_iterations)}\n'
+                    f'cpu\nrip {CODE:#x}\nrflags 0\nif 0\ncpl 0\nsvr 0x1ff\npost {CODE:#x} 0x40\n{regs(rcx=a.xmc_iterations)}\n'
                     f'cpu\nrip 0x101000\nrflags 0\n{regs(rcx=a.xmc_peer)}\n')
             rc, out, err = driver(host, runtime, a.fexc, text, a.out / 'boundary' / f'{name}-{block}', [block] if block else [])
             problems = []

@@ -675,8 +675,9 @@ def unsupported_cases():
     cases = {'cr3-pwt': 'mov rax, cr3\nbts rax, 3\nmov cr3, rax',
              # A DR7 that enables a breakpoint (L0, G3): breakpoints are S4's.
              'dr7-l0': 'mov eax, 0x401\nmov dr7, rax', 'dr7-g3': 'mov eax, 0x480\nmov dr7, rax',
-             # IA32_APIC_BASE moved (a valid value): the LAPIC's page and mode, no LAPIC yet.
-             'wrmsr-apic-base-move': 'mov ecx, 0x1b\nmov eax, 0xfed00800\nxor edx, edx\nwrmsr'}
+             # IA32_APIC_BASE moved onto guest RAM (a valid value): the resident cannot overlay RAM with the xAPIC page (X3;
+             # a move to a device page works, tools/run_x3.py `relocate-device`).
+             'wrmsr-apic-base-onto-ram': 'mov ecx, 0x1b\nmov eax, 0x200800\nxor edx, edx\nwrmsr'}
     return {k: ref.assemble('mov rbx, 1\n' + v).hex() for k, v in cases.items()}
 
 
@@ -1082,7 +1083,7 @@ def x2_cases():
     for name, text in (('masked', 'cli\nnop\nhlt\nnop'), ('idle', 'cli\nhlt\nnop')):
         code = ref.assemble(text + '\ncmp r11, r11')
         at = base + len(ref.assemble(text.rsplit('\n', 1)[0]))
-        post = f'post {base + 1:#x} 0x40\n' if name == 'masked' else ''
+        post = f'svr 0x1ff\npost {base + 1:#x} 0x40\n' if name == 'masked' else ''  # X3: an enabled APIC, so IF alone masks it
         cases.append((f'x2-hlt-{name}', f'cpl 0\nrip {base:#x}\n{post}code {code.hex()}\n', halted(at)))
     cases += ac_cases(fault, reached, refused)
     return cases
@@ -1839,7 +1840,10 @@ EL0_FORGED = [('msr-daifset', 'd50342df', 'trapped'), ('msr-ttbr0', 'd5182000', 
               # x28 is the guest-state page's EL0 alias since I1 (G1: EL0 may read and write it); its EL1-only alias, one
               # page below in the window (abi FRAME_VA), stays unreachable.
               ('load-frame', 'd1400780,f940001f', 'private_access'), ('store-frame', 'd1400780,f900001c', 'private_access'),
-              ('branch-frame', 'd61f0380', 'private_access'), ('read-code', '10000000,f9400000', 'private_access')]
+              ('branch-frame', 'd61f0380', 'private_access'), ('read-code', '10000000,f9400000', 'private_access'),
+              # M1: the guest-RAM alias (abi GUEST_RAM_VA = PRIVATE + 1 GiB, x0 by movz/movk) is EL1-only too.
+              ('load-ram-alias', 'd2b00000,f2d00000,f940001f', 'private_access'),
+              ('store-ram-alias', 'd2b00000,f2d00000,f900001f', 'private_access')]
 
 
 # Tampers whose section is a single instruction at 0x100000 with all GPRs 0: the vCPU halted before its first

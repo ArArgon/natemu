@@ -6,7 +6,9 @@
 //! body holding its start RIP ends: that RIP is its stop address. Prints the final
 //! state as JSON. An optional block size limit makes every program run as several blocks;
 //! `--code-cache BYTES` sets each code cache's capacity and `--watchdog-ms MS`
-//! the watchdog (default 10 s). After the run each vCPU's cache link points are
+//! the watchdog (default 10 s). M1: `--ram BYTES` is the VM's guest RAM (a 2 MiB multiple to 3 GiB; default 2 GiB, or
+//! `NATEMU_RAM`) and `--place GPA` the guest-physical page the driver places tables and pages from, upwards (default
+//! 0x1000, or `NATEMU_PLACE`); the environment defaults let a suite's runner run unchanged at another size or placement. After the run each vCPU's cache link points are
 //! self-checked ([`execution::check_links`]). Run-time defence checks, which corrupt what admission or the resident
 //! would never produce, on vCPU `--tamper-vcpu V` (default 0): `--forge-exit` makes every literal exit move another RIP than its link
 //! point's target into x0, the last word of its move altered (the resident refuses the reply: `bad_reply`); `--tamper KIND` corrupts the cache when the
@@ -57,13 +59,15 @@
 //!   | switch ADDR 0|3 (repeatable: the one-byte instruction at ADDR, a `nop`, runs as a change of the CPL to the value,
 //!     the resident's general CPL change; no x86 instruction changes the CPL yet. Blocks end before it.)
 //!   | if 0|1 (RFLAGS.IF at the start, default 1; RFLAGS is the `rflags` value with bit 1 and this)
+//!   | svr VALUE (X3: the local APIC's spurious-interrupt vector register at the start, default its reset value 0xff,
+//!     software disabled; e.g. 0x1ff lets `post` items reach the core without guest APIC set-up)
 //!   | post ADDR VECTOR | nmi ADDR (X2 event sources, repeatable: the one-byte instruction at ADDR, a `nop`, makes the host
 //!     post the external interrupt VECTOR (16..255) or an NMI into the vCPU's event record and ring its doorbell; the
 //!     vCPU takes it when eligible. Blocks end before it.)
 //! CR0 is PE, ET, PG and WP as set, CR4 PAE and SMEP as set, EFER LME, LMA and NXE as set; CPL0 code may change them
 //! with system instructions (the resident's transactions).
 //! Address-space items: code HEX (a body at the section's rip) | body ADDR HEX | memory ADDR HEX
-//!   | identity   (every page maps to the guest-physical page of its own address, below 4 MiB; no `large`)
+//!   | identity   (every page maps to the guest-physical page of its own address, inside guest RAM; no `large`)
 //!   | region ADDR SIZE   (zero-filled writable pages covering the byte range; eager: guest RAM bounds the total)
 //!   | large ADDR   (the 2 MiB-aligned range holding ADDR is one present 2 MiB leaf (PDE with PS), writable if any page
 //!     of the space in it is, not executable unless one is code; at most one per run: guest RAM holds one such frame)
@@ -149,6 +153,8 @@ struct Section {
     posts: Vec<(u64, u64)>,
     /// RFLAGS.IF at the start (`if 0|1`, default 1).
     interrupts: bool,
+    /// X3: the local APIC's SVR at the start (`svr VALUE`, default the reset value 0xff: software disabled).
+    svr: u64,
 }
 #[derive(Debug, PartialEq)]
 struct Description {
@@ -177,7 +183,7 @@ fn parse(text: &str) -> Result<Description> {
             _ => chunks.last_mut().unwrap().push(line),
         }
     }
-    let new = |space| Section { rip: 0, rflags: 0, gpr: [0; 16], cpl: 3, wp: true, smep: false, nxe: true, fs_base: 0, gs_base: 0, sse: false, fsgsbase: false, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, space, switches: vec![], posts: vec![], interrupts: true };
+    let new = |space| Section { rip: 0, rflags: 0, gpr: [0; 16], cpl: 3, wp: true, smep: false, nxe: true, fs_base: 0, gs_base: 0, sse: false, fsgsbase: false, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, space, switches: vec![], posts: vec![], interrupts: true, svr: natemu_abi::lapic::SVR_RESET };
     let mut d = Description { spaces: vec![Space::default()], cpus: vec![], sections: chunks.len() > 1 };
     if d.sections {
         items(&chunks[0], &mut d.spaces[0], None)?;
@@ -237,6 +243,7 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
             ("post", [a, v]) if (16..256).contains(&number(v)?) => state(&mut cpu, line)?.posts.push((number(a)?, number(v)?)),
             ("nmi", [a]) => state(&mut cpu, line)?.posts.push((number(a)?, execution::NMI)),
             ("if", [v @ ("0" | "1")]) => state(&mut cpu, line)?.interrupts = *v == "1",
+            ("svr", [v]) if number(v)? & !natemu_abi::lapic::SVR_WRITABLE == 0 => state(&mut cpu, line)?.svr = number(v)?,
             ("wp" | "smep" | "nxe" | "sse" | "fsgsbase", [v @ ("0" | "1")]) => {
                 let c = state(&mut cpu, line)?;
                 *match words[0] {
@@ -253,7 +260,7 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
             ("region", [a, n]) if number(n)? > 0 => space.regions.push((number(a)?, number(n)?)),
             ("large", [a]) => space.large.push(number(a)? & !(LARGE - 1)),
             ("identity", []) => space.identity = true,
-            ("mmio", [a, g, rest @ ..]) if number(g)? % 4096 == 0 && number(g)? >= exec::GUEST_RAM_BYTES as u64 && matches!(rest, [] | ["unassigned"]) => {
+            ("mmio", [a, g, rest @ ..]) if number(g)? % 4096 == 0 && matches!(rest, [] | ["unassigned"]) => {
                 space.mmio.push((number(a)? & !4095, number(g)?, rest.is_empty()))
             }
             ("unmap", [a]) => space.edits.push(Edit { va: number(a)?, level: None, set: 0, clear: PRESENT }),
@@ -412,7 +419,7 @@ fn build(b: &mut Builder, space: &Space, rip: u64, nxe: bool, devices: &BTreeMap
     }
     let ranges = space.memory.iter().map(|(a, d)| (*a, d.len() as u64)).chain(space.regions.iter().copied());
     for (address, length) in ranges {
-        if length > exec::GUEST_RAM_BYTES as u64 {
+        if length > b.top {
             return Err("guest RAM exhausted".into());
         }
         for page in page_span(address, length as usize) {
@@ -508,7 +515,7 @@ fn log_images(base: u64) -> [Vec<u8>; 2] {
 }
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] \
-                     [--code-shape] [--code-cache BYTES] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-exit] [--tamper offset|word|record|system] [--tamper-after word|record] \
+                     [--code-shape] [--code-cache BYTES] [--ram BYTES] [--place GPA] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-exit] [--tamper offset|word|record|system] [--tamper-after word|record] \
                      [--forge-stop] [--forge-entry HEX[,HEX]...] [--kick-vcpu V]... [--kicks M] [--kick-every-us P] [--kick-jitter-us J] [--kick-events E,..] [--tamper next-page|site|site-kind|armed|dispatch|target] [--ignore-kicks] [--kill-compiler N] [--stall-compiler N] [--compile-deadline-ms MS]";
 
 /// Every literal exit's RIP move puts another RIP in x0: bit 0 of the immediate of its last word (the one before its
@@ -720,12 +727,18 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let mut kick_events: Vec<u64> = Vec::new();
     let (mut ignore_kicks, mut signal_at, mut deadline_ms) = (false, None, execution::COMPILE_DEADLINE.as_millis() as u64);
     let (mut code_shape, mut device_tamper) = (false, false);
+    // M1: the VM's guest RAM and where the driver starts placing pages; the environment's defaults let a whole suite run
+    // at another size or placement unchanged.
+    let env = |name: &str, default: u64| std::env::var(name).map_or(Ok(default), |v| number(&v));
+    let (mut ram_bytes, mut place) = (env("NATEMU_RAM", 2 << 30)?, env("NATEMU_PLACE", 0x1000)?);
     let mut options = options.iter();
     while let Some(option) = options.next() {
         let mut value = || -> Result<usize> { options.next().and_then(|v| v.parse().ok()).ok_or(USAGE.into()) };
         match option.as_str() {
             "--code-shape" => code_shape = true,
             "--code-cache" => code_bytes = value()?,
+            "--ram" => ram_bytes = number(options.next().ok_or(USAGE)?)?,
+            "--place" => place = number(options.next().ok_or(USAGE)?)?,
             "--watchdog-ms" => watchdog_ms = value()? as u64,
             "--tamper-vcpu" => target = value()?,
             "--forge-exit" => forge = true,
@@ -789,13 +802,19 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     if kicked.iter().any(|&v| v >= n) {
         return Err(format!("--kick-vcpu: {n} vCPUs"));
     }
-    let backing = execution::prepare(resident, code_bytes, n)?;
+    if place % 4096 != 0 || place == 0 || place >= ram_bytes {
+        return Err(format!("--place {place:#x}: a nonzero page inside guest RAM"));
+    }
+    if let Some(&(_, gpa, _)) = d.spaces.iter().flat_map(|s| &s.mmio).find(|m| m.1 < ram_bytes) {
+        return Err(format!("mmio page {gpa:#x} is guest RAM"));
+    }
+    let backing = execution::prepare(resident, code_bytes, n, ram_bytes as usize)?;
     require_vcpus(n)?;
-    let mut builder = Builder { ram: execution::guest_ram(&backing.memory), next: 0x1000, top: exec::GUEST_RAM_BYTES as u64, reserved: Default::default() };
+    let mut builder = Builder { ram: backing.ram, next: place, top: ram_bytes, reserved: Default::default() };
     // Identity-mapped pages first: the allocator never hands them out (the logging pages of identity spaces too).
     for c in d.cpus.iter().filter(|c| d.spaces[c.space].identity) {
         for page in identity_pages(&d.spaces[c.space], c.rip) {
-            if page >= exec::GUEST_RAM_BYTES as u64 || page == 0 {
+            if page >= ram_bytes || page == 0 {
                 return Err(format!("identity page {page:#x} outside guest RAM (or page 0)"));
             }
             if (LOG_IDENTITY..LOG_IDENTITY + 0x7000).contains(&page) {
@@ -807,7 +826,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
     // M3: one test device per distinct `mmio` page, registered for every vCPU.
     let mut test_devices: BTreeMap<u64, Arc<Mutex<TestDevice>>> = BTreeMap::new();
-    let mut registry = Devices::default();
+    let mut registry = Devices::new(ram_bytes);
     for &(_, gpa, _) in d.spaces.iter().flat_map(|s| s.mmio.iter().filter(|m| m.2)) {
         if !test_devices.contains_key(&gpa) {
             let device = Arc::new(Mutex::new(TestDevice::new()));
@@ -877,6 +896,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 mov_ss: 0,
             },
         );
+        execution::set_lapic(backing.vcpu(v), natemu_abi::lapic::Lapic { svr: c.svr, ..natemu_abi::lapic::RESET });
     }
 
     let machine = Machine::create(&backing.memory)?;
@@ -989,16 +1009,29 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 })
             })
             .collect();
-        // X2: a halted vCPU can only be woken by an event; in this driver every source is a kicker (or a vCPU's own
-        // `post`/`nmi` items, which a halted vCPU cannot reach). Once every kicker has ended and every vCPU is halted or
-        // ended, no halted vCPU can wake: each is asked to end its run (`halted`).
+        // X2: a halted vCPU can only be woken by an event; in this driver every source is a kicker, a vCPU's own
+        // `post`/`nmi` items (which a halted vCPU cannot reach), a running vCPU's IPI or a vCPU's own LAPIC timer (X3).
+        // X3: once every kicker has ended, the park state of every vCPU not ended is read twice: when both reads are
+        // equal and idle (halted, its timer unable to wake it, every post to it seen), no vCPU can run again. (A vCPU
+        // that runs again must leave its park, which needs a post it has not seen, made by a vCPU running then, which
+        // left its park the same way; the first to leave did so between the reads, which changes its post count.) Each
+        // is then asked to end its run (`halted`). One read alone could take a vCPU just woken by a peer as idle.
+        // The argument covers only sources that are vCPUs or that veto the decision while they can still fire: every
+        // asynchronous host source (the kickers here; L4a's PIT, RTC, UART and device SPIs) must post through
+        // `execution::post`, so the posts count sees it, and must keep the decision off while it may still post, as
+        // `kickers_left` does.
         let (stops, backing, machine, kickers_left, all_ended) = (&stops, &backing, &machine, &kickers_left, &all_ended);
         let idle = scope.spawn(move || -> Result<()> {
             let mut asked = vec![false; n];
             while !all_ended.load(SeqCst) {
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                let halted: Vec<usize> = (0..n).filter(|&v| !stops.ended(v) && execution::halted(&backing.memory, v)).collect();
-                if kickers_left.load(SeqCst) == 0 && !halted.is_empty() && (0..n).all(|v| stops.ended(v) || halted.contains(&v)) {
+                if kickers_left.load(SeqCst) != 0 {
+                    continue;
+                }
+                let read = || (0..n).map(|v| (!stops.ended(v)).then(|| execution::park_state(&backing.memory, v))).collect::<Vec<_>>();
+                let (first, second) = (read(), read());
+                let halted: Vec<usize> = (0..n).filter(|&v| first[v].is_some()).collect();
+                if !halted.is_empty() && halted.iter().all(|&v| first[v] == second[v] && first[v].is_some_and(execution::idle)) {
                     for &v in halted.iter().filter(|&&v| !std::mem::replace(&mut asked[v], true)) {
                         execution::end_when_halted(&backing.memory, v);
                         stops.kick(machine, v)?;
@@ -1038,7 +1071,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let mut json = report(backing.vcpu(v), &d.spaces[d.cpus[v].space], tables, log, ran, tampering, tamper_after.filter(|_| v == target))?;
         json.pop();
         let m: exec::Mmio = backing.vcpu(v).read_record(exec::MMIO_OFFSET);
-        let mmio = if test_devices.is_empty() {
+        // With test devices, or once the vCPU made a device access (X3: its xAPIC page) or had one refused.
+        let mmio = if test_devices.is_empty() && m.completed == 0 && m.status == 0 {
             String::new()
         } else {
             format!(",\"mmio\":{{\"completed\":{},\"status\":\"{}\"}}", m.completed, exec::mmio::name(m.status))
@@ -1155,7 +1189,8 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
         Stop::Watchdog { pc, el0, asked } => {
             let place = if *el0 { "guest" } else { "resident" };
             let asked: Vec<u32> = (0..8).filter(|p| asked & 1 << p != 0).collect();
-            ("watchdog", format!("{place} pc={pc:#x} shadows_asked={asked:?}"), [0; 4])
+            // M1: the walk retries (lost A/D races) so far, to tell a retry storm from a stall at one instruction.
+            ("watchdog", format!("{place} pc={pc:#x} shadows_asked={asked:?} retries={}", s.retries), [0; 4])
         }
         Stop::Cancelled => ("cancelled", String::new(), [0; 4]),
     };
@@ -1204,6 +1239,8 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
         byte(exec::frame::X87_FTW),
         list(&mm)
     );
+    let l = execution::lapic(area);
+    let _ = write!(out, ",\"lapic\":{{\"cntfrq\":{},\"svr\":\"{:#x}\",\"tpr\":\"{:#x}\",\"isr\":[{}],\"esr\":\"{:#x}\"}}", l.frequency, l.svr, s.cpu.cr8, list(&l.isr), l.esr);
     out += ",\"pages\":[";
     for (i, (va, &(_, leaf))) in guest.pages.iter().filter(|(va, _)| !(log..log + 0x7000).contains(*va)).enumerate() {
         let entry = guest.ram.read::<u64>(leaf).unwrap();
@@ -1338,7 +1375,7 @@ mod tests {
     #[test]
     fn next_page_tamper_answers_a_block_request_twice() {
         let memory = Memory::with_size(4096).unwrap();
-        let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0 };
+        let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0, ram: unsafe { GuestRam::new(0, 4096, memory.0 as u64) } };
         let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1000, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, fcw: exec::FCW_INIT });
         s.fetch = [0x5000, u64::MAX];
         s.reply = exec::REPLY_SYSTEM;

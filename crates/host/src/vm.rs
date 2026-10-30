@@ -22,6 +22,9 @@ struct HvExit {
 unsafe extern "C" {
     fn hv_vm_create(config: *const c_void) -> i32;
     fn hv_vm_config_create() -> *mut c_void;
+    fn hv_vm_config_get_default_ipa_size(bits: *mut u32) -> i32;
+    fn hv_vm_config_get_max_ipa_size(bits: *mut u32) -> i32;
+    fn hv_vm_config_set_ipa_size(config: *mut c_void, bits: u32) -> i32;
     fn os_release(object: *mut c_void);
     fn hv_gic_config_create() -> *mut c_void;
     fn hv_gic_config_set_distributor_base(config: *mut c_void, ipa: u64) -> i32;
@@ -98,6 +101,8 @@ const GICD_IROUTER: u16 = 0x6000;
 /// Redistributor SGI-frame registers of the SGIs and PPIs (`hv_gic_redistributor_reg_t`).
 const GICR_IGROUPR0: u32 = 0x1_0080;
 const GICR_ISENABLER0: u32 = 0x1_0100;
+/// The virtual timer's PPI (`hv_gic_types.h`), the resident's LAPIC-timer doorbell.
+const VTIMER_PPI: u32 = 27;
 const MPIDR_EL1: u16 = 0xc005;
 
 /// The process VM with all of `memory` mapped read/write/execute at `IPA`, and its GIC: each vCPU's doorbells are the
@@ -108,9 +113,23 @@ pub(crate) struct Machine {
 }
 impl Machine {
     pub(crate) fn create(memory: &Memory) -> Result<Self> {
-        memory.flush_instruction_cache();
         unsafe {
             let config = hv_vm_config_create();
+            // M1: the IPA space must hold the whole backing (guest RAM included); HVF's default IPA size (36 bits on
+            // this host) is raised when it does not, up to its maximum.
+            let bits = 64 - (IPA + memory.1 as u64 - 1).leading_zeros();
+            let (mut default, mut max) = (0, 0);
+            let sized = hv(hv_vm_config_get_default_ipa_size(&mut default), "default IPA size")
+                .and_then(|()| hv(hv_vm_config_get_max_ipa_size(&mut max), "maximum IPA size"))
+                .and_then(|()| match bits {
+                    b if b <= default => Ok(()),
+                    b if b <= max => hv(hv_vm_config_set_ipa_size(config, b), "set IPA size"),
+                    b => Err(format!("backing needs {b} IPA bits; HVF allows {max}")),
+                });
+            if let Err(e) = sized {
+                os_release(config);
+                return Err(e);
+            }
             let created = hv(hv_vm_create(config), "hv_vm_create");
             os_release(config);
             created?;
@@ -263,10 +282,10 @@ impl Vcpu {
     /// `mach_absolute_time`), so the resident's stop times compare with the host's kick times.
     /// `enabled` false leaves the SGI disabled (a test driver's peer that never answers).
     pub(crate) fn doorbell(&self, v: usize, enabled: bool) -> Result<()> {
-        // GICR_IGROUPR0 holds the group of every SGI and PPI: this write sets the kick SGI to group 1 and leaves the
-        // rest in group 0. X2 (the LAPIC timer on the virtual timer, PPI 27) must add bit 27 here, or the timer's IRQ is
-        // group 0 and never reaches the resident (only group 1 is enabled, ICC_IGRPEN1_EL1).
-        let bit = 1 << natemu_abi::execution::KICK_SGI;
+        // GICR_IGROUPR0 holds the group of every SGI and PPI: this write sets the kick SGI and the virtual timer's PPI 27
+        // (X3: the LAPIC timer's doorbell) to group 1 and leaves the rest in group 0 (only group 1 reaches the resident,
+        // ICC_IGRPEN1_EL1).
+        let bit = 1 << natemu_abi::execution::KICK_SGI | 1 << VTIMER_PPI;
         self.set_sys(MPIDR_EL1, v as u64)?;
         let _gic = gic();
         unsafe {

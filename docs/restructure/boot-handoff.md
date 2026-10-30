@@ -39,9 +39,11 @@ and runtime; contract-by-contract mapping: [contracts.md](contracts.md), "Genera
 | `tools/fexc/upstream_tests/run_asm.py` | FEX's ASM suite (235 admitted tests; 372 since I1, 376 after I7, 443 since I2, 480 since I3, 781 since I5a) |
 | `tools/run_slice3_vm.py MODE` | `corpora`, `smp`, `limits`, `kicks`, `system`, `coherence`, `sharedpt`, `litmus`, `contain`, `privilege` (U1), `delivery` (X1a), `events` (X2: interrupt eligibility, shadows, POPF, HLT, NMI, #AC; QEMU x2APIC programs, natemu-only cases, random-time stress) |
 | `tools/run_i6_faults.py` | I6 x87: gating (#NM), precise faults with the x87 state unchanged, refusals, FXAM classes, FIST indefinite, MXCSR isolation, Linux's FPU probes (SDM rules; `--max-block 1` too); the x87 QEMU corpus is `tools/reference/gen_i6.py` + `ref.py` + `run_slice1_vm.py` |
-| `tools/run_k2.py` | K2 resident system path: cost per CLI/STI/POPF/SWAPGS/RDTSC/CPUID/WRMSR/FLD+FSTP m80 loop iteration (decode exits must not grow with N), RDRAND beyond the pool, cross-modifying code at a system instruction (old or new, never a stop) |
+| `tools/run_k2.py` | K2 resident system path: cost per CLI/STI/POPF/SWAPGS/RDTSC/CPUID/WRMSR/FLD+FSTP m80 loop iteration (decode exits must not grow with N), RDRAND beyond the pool, cross-modifying code at a system instruction (the x86 protocol: after the writer's flag and a CPUID the new instruction runs, every rewrite checked; deterministic) |
+| `tools/run_x3.py` | X3 local APIC: register read-backs (xAPIC MMIO, x2APIC), priority/TPR/EOI with nested self IPIs, CR8, the x2APIC #GP rules and x2APIC IPIs at 2-4 vCPUs vs QEMU and the SDM model; xAPIC IPIs at 2/4 vCPUs, one-shot/periodic/masked/HLT timers (exact model from TSC and CNTFRQ), random IPI + timer stress at 2/4 vCPUs, HLT across peers (the driver's end rule), driver fault and typed-stop cases; `--only cost` for APIC access costs |
+| `tools/run_m1.py` | M1 guest RAM: tables and data in RAM's top MiB at 4 MiB, 2 GiB and 3 GiB, the device page at R, placement across 0xA0000, cross- and self-modifying code at 0x7ff00000; any runner runs at another size or placement with `NATEMU_RAM`/`NATEMU_PLACE` |
 | `tools/run_m3.py` | M3 device pages: MOV-family corpus vs QEMU (on RAM) and `tools/models/mmio_model.py`, fault priority, refused forms, exactly-once under kicks at 1-4 vCPUs, a tampered reply, cross-modifying code at a device access (needs series23-m3) |
-| `tools/run_l1.py`, `tools/run_l1_smoke.py` | L1 boot-protocol loader: Debian and synthetic bzImages judged by `tools/models/bootproto.py`, every header and loader refusal with the model's codes (no VM); the smoke test (Debian decompressor to its jump into vmlinux vs QEMU) needs a host built with more guest RAM until M1 (boot-features plan, Built (L1)) |
+| `tools/run_l1.py`, `tools/run_l1_smoke.py` | L1 boot-protocol loader: Debian and synthetic bzImages judged by `tools/models/bootproto.py`, every header and loader refusal with the model's codes (no VM); the smoke test (Debian decompressor to its jump into vmlinux vs QEMU) runs in-tree at 2 GiB since M1 (boot-features plan, Built (L1), Built (M1)) |
 | `tools/check_resident_stack.py` | resident stack bound and gate/ERET binary shape of the built runtime |
 | `tools/models/` | independent ordering, coherence, PAE and modes models (used by the runners) |
 
@@ -88,6 +90,8 @@ tools/with-env python3 tools/run_i6_faults.py --fexc "$F" --out "$O/i6-faults-1"
 tools/with-env python3 tools/run_m3.py --fexc "$F" --out "$O/m3"   # M3: device pages (QEMU via Docker, mmio_model, kicks)
 python3 tools/run_l1.py --out "$O/l1"                        # L1: loader vs bootproto.py, refusals (load-only, no VM)
 tools/with-env python3 tools/run_k2.py --fexc "$F" --out "$O/k2"   # K2: system-instruction cost, RDRAND refill, XMC at system instructions
+tools/with-env python3 tools/run_x3.py --fexc "$F" --out "$O/x3"   # X3: local APIC, IPIs, timers vs QEMU and the SDM model; stress; HLT across peers
+tools/with-env python3 tools/run_m1.py --fexc "$F" --out "$O/m1"   # M1: RAM top at 4 MiB/2 GiB/3 GiB, the holes, code near the RAM top
 ```
 
 QEMU references run in the pinned container image (`tools/reference/ref.py` holds the pins) or Homebrew
@@ -102,7 +106,7 @@ QEMU references run in the pinned container image (`tools/reference/ref.py` hold
 | System | MOV CR0 (WP), CR3, CR4 (PGE, SMEP), MOV from CR0/CR3/CR4, INVLPG, RDMSR/WRMSR EFER | Everything else: §3 (`unsupported_system`, #GP or #UD per the model) |
 | Paging | Four-level, 4 KiB and 2 MiB pages, WP, NXE, SMEP, A/D per SDM with a declared fault-path policy (leaf A only after the permission check) | 1 GiB pages, PCID, SMAP, LA57, PWT/PCD/PAT memory types (halt), MAXPHYADDR above 40 |
 | vCPUs | 1–4 (`MAX_VCPUS`). N = 0 cannot be described; `execution::prepare` refuses it (unit test); 5 is refused (`limits`) | APIC, IPIs, INIT/SIPI |
-| Memory | Guest RAM 4 MiB (`GUEST_RAM_BYTES`), guest-physical from 0; 32 shadow-table pool pages per vCPU (reset on exhaustion); since M3 device pages above RAM: MOV-family loads and stores of 1-8 bytes completed once from their sites' completion records through the host's device registry (fexc series23-m3; boot-features plan, Built (M3)) | Other forms on device pages (`unsupported_mmio`), holes; host writes only with every vCPU stopped |
+| Memory | Guest RAM of a run-time size since M1 (2 MiB multiples to 3 GiB, default 2 GiB, `--ram`); 288 shadow-table pool pages per vCPU (reset on exhaustion, counted); since M3 device pages above RAM: MOV-family loads and stores of 1-8 bytes completed once from their sites' completion records through the host's device registry (fexc series23-m3; boot-features plan, Built (M3)) | Other forms on device pages (`unsupported_mmio`), holes; host writes only with every vCPU stopped |
 | Faults | Precise guest faults reported as a stop (vector, error, CR2, banked state) | Delivery to the guest (no IDT); the run ends at the fault |
 | Atomicity | Aligned 1–8 bytes and unaligned within 16 bytes single-copy atomic | Non-LOCKed access crossing 16 bytes inside a line may tear for peers (owner decision 2) |
 

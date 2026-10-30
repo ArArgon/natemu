@@ -19,21 +19,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Guest-physical RAM of the execution mode, through the host's alias.
-pub(crate) fn guest_ram(memory: &Memory) -> GuestRam {
-    assert!(memory.1 >= exec::BACKING_BYTES);
-    let host = memory.0 as u64 + exec::GUEST_RAM_OFFSET as u64;
-    unsafe { GuestRam::new(0, exec::GUEST_RAM_BYTES as u64, host) }
-}
-
-/// The execution mode's backing for `n` vCPUs. Block 0 holds vCPU 0's window, guest RAM, its lookup area, the global
-/// area, its metadata arena and its code area (the `exec`/`cache` offsets); block v (`v * stride` further) holds vCPU
-/// v's own window, lookup area, metadata arena and code area at the same offsets and leaves the ranges of guest RAM
-/// and the global area unused (never mapped, so never backed): every vCPU maps the shared ones of block 0.
+/// The execution mode's backing for `n` vCPUs. Block 0 holds vCPU 0's window, its lookup area, the global area, its
+/// metadata arena and its code area (the `exec`/`cache` offsets); block v (`v * stride` further) holds vCPU v's own
+/// window, lookup area, metadata arena and code area at the same offsets and leaves the global area's range unused
+/// (never mapped, so never backed): every vCPU maps block 0's. Guest RAM (M1: `ram_bytes`, chosen at prepare) follows
+/// the last block, at `n * stride`; only the pages the guest or the host touch are ever backed.
 pub(crate) struct Backing {
     pub(crate) memory: Memory,
     pub(crate) n: usize,
     stride: usize,
+    /// Guest-physical RAM through the host's alias.
+    pub(crate) ram: GuestRam,
     /// One CNTVCT sample (the host's `mach_absolute_time`: every vCPU's virtual counter has offset 0) taken when the VM
     /// was prepared: each vCPU's TSC starts from it, so all start near 0 and agree.
     epoch: u64,
@@ -42,7 +38,7 @@ impl Backing {
     /// vCPU `v`'s view.
     pub(crate) fn vcpu(&self, v: usize) -> Area<'_> {
         assert!(v < self.n);
-        Area { memory: &self.memory, vcpu: v, vcpus: self.n, epoch: self.epoch, base: v * self.stride }
+        Area { memory: &self.memory, vcpu: v, vcpus: self.n, epoch: self.epoch, base: v * self.stride, ram: self.ram }
     }
 }
 /// One vCPU's own part of the backing: offsets are those of block 0 (`exec`/`cache`), relocated to its block.
@@ -55,6 +51,8 @@ pub(crate) struct Area<'a> {
     pub(crate) epoch: u64,
     /// Backing offset of its block (its window).
     pub(crate) base: usize,
+    /// The VM's guest RAM ([`Backing::ram`]).
+    pub(crate) ram: GuestRam,
 }
 impl Area<'_> {
     pub(crate) fn read_record<T: Copy>(&self, offset: usize) -> T {
@@ -71,12 +69,16 @@ impl Area<'_> {
     }
 }
 
-/// Backing for the execution mode with `n` vCPUs (1..=`cache::MAX_VCPUS`): the resident loaded into each vCPU's
-/// window, each vCPU's private address space and shared record in place; guest RAM is zero. Each vCPU's code cache
-/// holds `code_bytes` of generated code (at most `cache::CODE_BYTES_MAX`).
-pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize) -> Result<Backing> {
+/// Backing for the execution mode with `n` vCPUs (1..=`cache::MAX_VCPUS`) and `ram_bytes` of guest RAM (a 2 MiB
+/// multiple, at most `exec::MAX_GUEST_RAM_BYTES`): the resident loaded into each vCPU's window, each vCPU's private
+/// address space and shared record in place; guest RAM is zero. Each vCPU's code cache holds `code_bytes` of generated
+/// code (at most `cache::CODE_BYTES_MAX`).
+pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize, ram_bytes: usize) -> Result<Backing> {
     if !(1..=cache::MAX_VCPUS).contains(&n) {
         return Err(format!("{n} vCPUs: the execution mode runs 1 to {}", cache::MAX_VCPUS));
+    }
+    if ram_bytes == 0 || ram_bytes % cache::BLOCK != 0 || ram_bytes > exec::MAX_GUEST_RAM_BYTES {
+        return Err(format!("guest RAM of {ram_bytes:#x} bytes: a nonzero 2 MiB multiple up to {:#x}", exec::MAX_GUEST_RAM_BYTES));
     }
     if !(cache::MAX_BLOCK_BYTES..=cache::CODE_BYTES_MAX - cache::HEAD_BYTES).contains(&code_bytes) {
         return Err(format!(
@@ -87,7 +89,8 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize) -> Result<Bac
     }
     let code_mapped = (cache::HEAD_BYTES + code_bytes).next_multiple_of(cache::BLOCK);
     let stride = exec::BACKING_BYTES + code_mapped;
-    let memory = Memory::with_size(n * stride)?;
+    let ram_offset = n * stride;
+    let memory = Memory::with_size(ram_offset + ram_bytes)?;
     load_resident(&memory, resident)?;
     for v in 0..n {
         let base = v * stride;
@@ -96,7 +99,6 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize) -> Result<Bac
         }
         let mut spans = resident_text(base);
         let own = |offset, bytes| Span::data(offset, bytes, base + offset);
-        let shared = |offset, bytes| Span::data(offset, bytes, offset);
         spans.extend([
             own(SHARED_OFFSET, 4096),
             own(exec::STATE_OFFSET, 4096),
@@ -106,7 +108,7 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize) -> Result<Bac
             own((STACK_TOP - PRIVATE) as usize - exec::STACK_BYTES, exec::STACK_BYTES),
             own((EXCEPTION_STACK_TOP - PRIVATE) as usize - 0x8000, 0x8000),
             own(exec::STAGING_OFFSET, exec::STAGING_BYTES),
-            shared(exec::GUEST_RAM_OFFSET, exec::GUEST_RAM_BYTES),
+            Span::data((exec::GUEST_RAM_VA - PRIVATE) as usize, ram_bytes, ram_offset),
             // Generated code runs at EL0 from the code area (EL0 execute-only); the resident writes it through its alias.
             Span::code((cache::CODE_VA - PRIVATE) as usize, code_mapped, base + cache::CODE_OFFSET),
             Span::data((cache::CODE_WRITE_VA - PRIVATE) as usize, code_mapped, base + cache::CODE_OFFSET),
@@ -118,26 +120,43 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize) -> Result<Bac
         // SAFETY: Control is plain integers; the resident owns everything but the capacity.
         let mut control: cache::Control = unsafe { std::mem::zeroed() };
         control.code_bytes = (cache::HEAD_BYTES + code_bytes) as u64;
+        control.ram_bytes = ram_bytes as u64;
         memory.write_record(base + cache::LOOKUP_OFFSET + cache::CONTROL, control);
         // SAFETY: Shared is plain integers; all-zero is its empty value.
         let mut shared: Shared = unsafe { std::mem::zeroed() };
         shared.mode = exec::MODE;
         memory.write_record(base + SHARED_OFFSET, shared);
+        memory.flush_instruction_cache(base, RAM_SIZE);
     }
-    Ok(Backing { memory, n, stride, epoch: unsafe { mach_absolute_time() } })
+    // SAFETY: the alias is the backing's last `ram_bytes`, which lives as long as the Backing holding this value.
+    let ram = unsafe { GuestRam::new(0, ram_bytes as u64, memory.0 as u64 + ram_offset as u64) };
+    Ok(Backing { memory, n, stride, ram, epoch: unsafe { mach_absolute_time() } })
 }
 /// Sets the vCPU's initial architectural state (before it first runs).
 pub(crate) fn set_cpu(area: Area, cpu: Cpu) {
     let mut state = State::new(area.vcpu as u64, cpu);
     state.vcpus = area.vcpus as u64;
     area.write_record(exec::STATE_OFFSET, state);
-    // The TSC (provisional, plan L5) is the resident's CNTVCT scaled to TSC_HZ plus this offset: from the shared epoch.
+    // The TSC (L5, `natemu_abi::clock::tsc`) is the resident's CNTVCT scaled to TSC_HZ plus this offset: from the shared epoch.
     const _: () = assert!(natemu_abi::cpu_profile::TSC_HZ == 1_000_000_000); // ticks_ns scales like the resident
     let mut msrs = natemu_abi::cpu::reset_msrs(area.vcpu == 0);
     msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_TSC).unwrap()] = ticks_ns(area.epoch).wrapping_neg();
     area.write_record(exec::MSRS_OFFSET, msrs);
     area.write_record(exec::ENTROPY_OFFSET, exec::Entropy { taken: exec::ENTROPY_WORDS as u64, words: [0; exec::ENTROPY_WORDS] });
     refill_entropy(area);
+    set_lapic(area, natemu_abi::lapic::RESET);
+}
+/// Sets the vCPU's local APIC record (X3) and the word peers match IPI destinations against, from its reset
+/// IA32_APIC_BASE (before it first runs).
+pub(crate) fn set_lapic(area: Area, l: natemu_abi::lapic::Lapic) {
+    area.write_record(exec::LAPIC_OFFSET, l);
+    let base = natemu_abi::cpu::reset_msrs(area.vcpu == 0)[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_APIC_BASE).unwrap()];
+    let word = natemu_abi::lapic::published(base, &l, area.vcpu as u64);
+    event_word(area.memory, area.vcpu, std::mem::offset_of!(cache::Events, apic)).store(word, SeqCst);
+}
+/// The vCPU's local APIC record (X3; the resident's once it runs).
+pub(crate) fn lapic(area: Area) -> natemu_abi::lapic::Lapic {
+    area.read_record(exec::LAPIC_OFFSET)
 }
 /// Tops up the vCPU's entropy pool (RDRAND, [`exec::Entropy`]) while it is in the host: the words it took are replaced
 /// from the host's entropy source (`getentropy`, macOS's kernel CSPRNG). If the source fails, the pool stays as it is
@@ -189,6 +208,13 @@ pub(crate) const NMI: u64 = 256;
 /// Posts `event` (a vector, or [`NMI`]) into vCPU `v`'s event record (X2); the caller then rings its doorbell, which makes
 /// it stop precisely and take the event when it is eligible.
 pub(crate) fn post(memory: &Memory, v: usize, event: u64) {
+    // X3: as from a peer's APIC: an NMI needs the target's APIC hardware enabled, an interrupt also software enabled
+    // (SDM Vol.3 11.4.7.2); otherwise the message is not accepted.
+    let apic = event_word(memory, v, std::mem::offset_of!(cache::Events, apic)).load(SeqCst);
+    let needs = if event == NMI { natemu_abi::lapic::HW_ENABLED } else { natemu_abi::lapic::SW_ENABLED };
+    if apic & needs == 0 {
+        return;
+    }
     match event {
         NMI => event_word(memory, v, std::mem::offset_of!(cache::Events, nmi)).store(1, SeqCst),
         _ => {
@@ -196,10 +222,17 @@ pub(crate) fn post(memory: &Memory, v: usize, event: u64) {
             word.fetch_or(1 << (event % 64), SeqCst);
         }
     }
+    event_word(memory, v, std::mem::offset_of!(cache::Events, posts)).fetch_add(1, SeqCst);
 }
-/// vCPU `v` is halted (HLT, parked in the VM).
-pub(crate) fn halted(memory: &Memory, v: usize) -> bool {
-    event_word(memory, v, std::mem::offset_of!(cache::Events, halted)).load(SeqCst) != 0
+/// vCPU `v`'s park state (X3): its `halted` word and its `posts` count, read in that order.
+pub(crate) fn park_state(memory: &Memory, v: usize) -> (u64, u64) {
+    let halted = event_word(memory, v, std::mem::offset_of!(cache::Events, halted)).load(SeqCst);
+    (halted, event_word(memory, v, std::mem::offset_of!(cache::Events, posts)).load(SeqCst))
+}
+/// A park state in which nothing but a new post can wake the vCPU: halted, its own timer unable to wake it, and every
+/// post seen.
+pub(crate) fn idle((halted, posts): (u64, u64)) -> bool {
+    halted & 0xff == 1 && halted >> cache::HALTED_SEEN_SHIFT == posts & (u64::MAX >> cache::HALTED_SEEN_SHIFT)
 }
 /// Asks vCPU `v` to end its run when it is halted with no event it can take (`stop::HALTED`); the caller rings it.
 pub(crate) fn end_when_halted(memory: &Memory, v: usize) {
@@ -709,7 +742,7 @@ struct Fetched {
 /// The bytes at `state.cpu.rip` up to the end of its page, continuing through the next page when the resident walked
 /// it, never past `limit` (when it lies ahead); or the vCPU's stop, when the walk of RIP's page failed.
 fn fetched(area: Area, state: &State, limit: Option<u64>) -> Result<std::result::Result<Fetched, Stop>> {
-    let ram = guest_ram(area.memory);
+    let ram = area.ram;
     let rip = state.cpu.rip;
     let fault = exec::fetch::decode(state.fetch_fault);
     if state.fetch[0] == u64::MAX {
@@ -1037,10 +1070,15 @@ mod tests {
     #[test]
     fn one_to_four_vcpus() {
         for n in [0, cache::MAX_VCPUS + 1] {
-            let e = super::prepare("/nonexistent", cache::CODE_BYTES, n).err().unwrap();
+            let e = super::prepare("/nonexistent", cache::CODE_BYTES, n, 4 << 20).err().unwrap();
             assert!(e.contains(&format!("{n} vCPUs")), "{e}");
         }
         assert_eq!(cache::MAX_VCPUS, 4);
+        // M1: guest RAM is a nonzero 2 MiB multiple up to 3 GiB.
+        for ram in [0, 3 << 20, exec::MAX_GUEST_RAM_BYTES + (2 << 20)] {
+            let e = super::prepare("/nonexistent", cache::CODE_BYTES, 1, ram).err().unwrap();
+            assert!(e.contains("guest RAM"), "{e}");
+        }
     }
 
     /// The bytes come only from the pages the resident walked: RIP's page to its end (more may follow until the next
@@ -1048,10 +1086,10 @@ mod tests {
     /// is the fetch fault stop.
     #[test]
     fn fetched_bytes_follow_the_resident_walk() {
-        let memory = Memory::with_size(exec::BACKING_BYTES).unwrap();
-        let ram = guest_ram(&memory);
+        let memory = Memory::with_size(exec::BACKING_BYTES + (2 << 20)).unwrap();
+        let ram = unsafe { GuestRam::new(0, 2 << 20, memory.0 as u64 + exec::BACKING_BYTES as u64) };
         assert!(ram.copy_in(0x5ff0, &[0xaa; 16]) && ram.copy_in(0x9000, &[0xbb; 16]));
-        let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0 };
+        let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0, ram };
         let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1ff0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, fcw: exec::FCW_INIT });
         s.fetch = [0x5000, u64::MAX];
         let f = fetched(area, &s, None).unwrap().unwrap();

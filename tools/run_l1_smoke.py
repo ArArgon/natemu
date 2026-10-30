@@ -16,8 +16,7 @@ GDTR, IDTR, CS/DS/ES/SS/FS/GS, RFLAGS, RSP, RSI, every other GPR 0, FNINIT) at t
 are `-device loader` blobs at their guest-physical addresses (RAM is otherwise zero); a gdbstub hardware breakpoint at
 ENTRY stops it, `info registers` and `pmemsave` read the state and the window.
 
-**Until M1** the in-tree guest RAM is 4 MiB and natemu refuses the load (`BAD_LAYOUT`/`RAM_NOT_BACKED`): run it with a
-host and runtime built with more guest RAM (boot-features plan, Built (L1): the saved 128 MiB diff).
+`--ram` (default 2 GiB, the boot map's default L) is both natemu's guest RAM (M1: a run-time size) and QEMU's `-m`.
 
 Compared: the zero page after the decompressor; every GPR, RIP, RFLAGS, CR0, CR2, CR3, CR4, EFER, the segment selectors, GDTR and IDTR; the window's bytes
 (each vmlinux PT_LOAD segment also against the ELF's file bytes, and the whole window, where the only accepted
@@ -259,7 +258,7 @@ def main():
     a.add_argument('--host', required=True)
     a.add_argument('--runtime', required=True)
     a.add_argument('--fexc', required=True)
-    a.add_argument('--ram', type=lambda v: int(v, 0), default=128 << 20)
+    a.add_argument('--ram', type=lambda v: int(v, 0), default=2 << 30)
     a.add_argument('--kernel', type=pathlib.Path, default=RAW / 'dl/linux')
     a.add_argument('--vmlinux', type=pathlib.Path, default=RAW / 'x/vmlinux.elf')
     a.add_argument('--cmdline', default='mitigations=off nokaslr')

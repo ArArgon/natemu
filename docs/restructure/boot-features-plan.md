@@ -100,7 +100,7 @@ The census C0 (§3) lists the forms the real binaries contain; rows below are th
 
 | Feature | Use | General path must | Check | Chunk |
 | --- | --- | --- | --- | --- |
-| Guest RAM and layout | **Decided:** M69 map, default L = 2 GiB (configurable 1–3 GiB), H = 0; tests choose their own size | `GUEST_RAM_BYTES` (4 MiB, `crates/abi/src/execution.rs:61`) and all per-page structures from the manifest; holes are non-RAM; shadow pool (`POOL_PAGES` = 32, `crates/abi/src/shadow.rs:20`) sized for a kernel working set, resets counted | Standing suite at 4 MiB and 2 GiB; programs above 16 MiB and at holes | M1 |
+| Guest RAM and layout | **Decided:** M69 map, default L = 2 GiB (configurable 1–3 GiB), H = 0; tests choose their own size | Built (M1): guest RAM a run-time size R (2 MiB multiples to 3 GiB, default 2 GiB), per-page structures sized for 3 GiB and scanned by use, [R, 4 GiB) non-RAM, shadow pool 288 pages, resets counted; the legacy hole becomes non-RAM with L3's unassigned rule | Standing suite at 4 MiB and 2 GiB; programs above 16 MiB and at holes | M1 |
 | Memory types: PAT, PWT/PCD, MTRR | Linux PAT = WB, WC, UC-, UC, WB, WP, UC-, WT (`K mm/pat/memtype.c:344`, written `:234`); LAPIC/IOAPIC mapped UC | Walker evaluates PAT/PWT/PCD (and MTRR if advertised) instead of halting (`shadow status=1 detail=7`, slice-3 S3a2); RAM of any type runs as coherent WB (declared deviation); device pages take M3 | Paging cells with PAT bits (`coherence_model.py` profile updated); QEMU | M2 |
 | MMIO from translated code | xAPIC, IOAPIC | Device ranges never shadowed; an abort at a load/store site completes once through the device owner from the site's completion record (fexc's decode of the translated instruction: width, direction, register and merge, length), then resumes after the instruction; every other form (string, vector, RMW, atomic) → typed stop | QEMU programs on device pages; #PF-before-device priority | M3 |
 | 1 GiB pages | Only with GBPAGES | Not advertised (CPU 16); PS in a PDPTE → #PF(RSVD) (contract 10) | Existing cells | — |
@@ -1189,7 +1189,7 @@ PE|ET|NE|PG, CR4 = PAE, EFER = LME|LMA, RFLAGS = 2, CS 0x10, DS/ES/SS 0x18, FS/G
 the kernel's own IDT is a shutdown). Typed refusals (`LoadError`), each tested. For L2: table writes must be added to
 `Loaded::writes` (the dump and the QEMU image use it). For M1: `load` takes one RAM range from 0; high RAM needs a
 multi-range description first. Driver `natemu-host RUNTIME boot-linux FEXC BZIMAGE [--initrd] [--cmdline] [--ram]
-[--rsdp] [--load-only] [--dump] [--stop-at] [--save]` (`drivers/linux.rs`, no tamper). **RAM limit:** in-tree guest RAM is
+[--rsdp] [--load-only] [--dump] [--stop-at] [--save]` (`drivers/linux.rs`, no tamper). **RAM limit (superseded by M1, Built (M1): guest RAM is a run-time size, the VM path runs in-tree):** in-tree guest RAM was
 `GUEST_RAM_BYTES` = 4 MiB, below the map's 16 MiB RAM start, so a VM run refuses `BAD_LAYOUT` until M1. Causes: the
 constant itself; the global area's code-page and writable-page masks (one byte per page in 0x1000-byte slots, so 16 MiB
 before RECORDS/RESETS/EVENTS move); the guest-RAM alias must end below `cache::CODE_VA` (PRIVATE + 256 MiB, alias from
@@ -1210,6 +1210,219 @@ would be comparable. Checks: `boot::` unit tests (5: every header and loader ref
 aligned-up, fixed-address and stale-write-field images; three corrupted-dump controls), rejections 41/41 (16 header
 mutations on two images with the model's codes, 9 loader refusals); `bootproto.py` gained the setup_data rule
 (independent author). Not done: a KASLR run (needs a stop rule other than a fixed RIP); the VM path in-tree (M1).
+*Built (X3, local APIC, its timer and IPIs, and L5's clock minimum; no fexc change, series25; after two independent reviews):*
+(Section numbers are the APIC chapter's as the plan cites it, ch. 11; the repo's SDM snapshot,
+`artifacts/research/track01/source-snapshots/2026-09-03/intel-sdm-vol3a.txt`, numbers it 13: 11.x there is 13.x.) **Profile** (`cpu_profile.json`, kept as CPU 16): xAPIC and x2APIC (CPUID.1:ECX.21) advertised, TSC-deadline not
+(ECX.24 clear: LVT timer bit 18 reserved, IA32_TSC_DEADLINE #GP), ARAT advertised; integrated APIC version 0x00050014
+(QEMU's): six LVT entries (timer, thermal, PMC, LINT0, LINT1, error; no CMCI, the profile clears MCE/MCA), no directed
+EOI (SVR bit 12 reserved); the timer counts the 24 MHz crystal of CPUID.15H through its divider. **State**
+(`crates/abi/src/lapic.rs`: record, rules, unit tests; `runtime/src/execution/lapic.rs`): a per-vCPU record in the
+state page (`LAPIC_OFFSET` +0xa00, written by the host at reset, `execution::set_lapic`; the resident's): SVR, LDR,
+DFR, ISR, TMR, LVT[6], ICR, ESR (latched) and errors since its last write, the timer (initial count, DCR, start crystal
+count, expiries taken, the V of the next expiry, a spent one-shot flag) and CNTFRQ as read at start. The IRR is X2's
+`Events.vectors`; the TPR is the bank's `Cpu::cr8`, which now holds TPR[7:0] (CR8 reads and writes TPR[7:4], MOV to
+CR8 clears TPR[3:0]); `Events.reserved` became `Events.apic`, the word senders match destinations against (LDR, DFR
+model, hardware/x2APIC/software enable; owner-written, `lapic::published`). **Priority** (11.8): PPR = TPR if its class
+is at least the highest ISR vector's, else that class; the highest IRR vector is delivered when its class is above
+PPR's and the APIC is hardware and software enabled (`events::next`, replacing X2's highest vector); taking it moves
+the IRR bit to the ISR; EOI clears the highest ISR bit. EOI and TPR writes need nothing more: every transaction and
+device access returns to `find`. No spurious interrupt is ever generated (acceptance and delivery are one resident
+step), so delivery status always reads idle. **Access:** xAPIC MMIO at the base page in `mmio::local` (M3's hook: no
+host exit; 32-bit accesses at 16-byte-aligned offsets only, anything else refused `unsupported_mmio` status `device`;
+unimplemented offsets set ESR bit 7 and read 0; read-only registers ignore writes); x2APIC MSRs 0x800-0x8ff as resident
+transactions with 11.12's rules (#GP: an index not in Table 11-6, WRMSR to a read-only or RDMSR of a write-only
+register, a nonzero EOI or ESR write, any reserved bit (11.12.1.3), outside x2APIC mode; ICR one 64-bit write, SELF_IPI,
+LDR derived and read-only). IA32_APIC_BASE: x2APIC -> xAPIC and disabled -> x2APIC #GP (EXTD without EN by the profile
+rule); entering the disabled state resets the APIC (record, IRR, TPR, timer): the disabled word is published first, so senders
+stop before the IRR is cleared, and the IRR is cleared again when the APIC is enabled (nothing is accepted while
+disabled); what remains is a sender that read the old enabled word before the disable and posts after the re-enable's
+clear (a resident descheduled that long between its read and its OR), whose stale bit is then held like any pending one; a base moved to a device page is answered
+there (the resident answers before the registry), onto guest RAM stops `unsupported_system` before any effect (it
+cannot overlay RAM; Linux never moves it). SVR software disable masks every LVT and keeps them masked. **IPIs** (11.6):
+an ICR write sends at once: fixed and lowest priority set the target's IRR bit, NMI its NMI bit (atomic OR), count a
+post (`Events.posts`) and ring it (SGI 1; this vCPU's own events are looked at at its next boundary); destinations
+physical (FFH broadcast, 11.6.2.1), logical flat (MDA AND LDR[31:24]: all ones reaches every APIC with a logical ID bit
+set, not one whose LDR is 0, as 11.6.2.2's bit-wise AND reads), cluster (all ones matches every cluster), x2APIC cluster
+(FFFF_FFFFH broadcast, 11.12.9), shorthands self/all/all-but-self; a fixed message to a
+software-disabled APIC is not accepted (11.4.7.2), and the host's `post` applies the same rule; vectors 0..15 set ESR
+send/receive illegal and send nothing. INIT and start-up go to `lapic::ap_start` (X4's hook: a typed stop
+`unsupported_system` at the sending instruction, nothing sent); INIT level de-assert has no effect; SMI and reserved
+modes stop `unsupported_system`. **Timer** (11.5.4): one-shot and periodic from V = CNTVCT, exactly; the next expiry's V
+(`clock::count_at_crystal`, never early) is programmed into the Arm virtual timer (CNTV, PPI 27: `vm.rs` puts it in
+GICR group 1 and enables it, as the native-interrupts study noted). Its IRQ only rings: `timer_irq` turns CNTV off when
+the expiry is due (level-triggered) or leaves it armed for a later deadline (a stale IRQ after a re-arm left a halted
+vCPU with no timer: found by the HLT tests, fixed); `lapic::poll` at the top of `find` and in `park` takes every expiry
+due (an unmasked LVT sets the vector's IRR bit; expiries passing while one is pending merge, as in the IRR) and arms the
+next. The current count is computed from V when read. Writes to the LVT timer, DCR and SVR first take the expiries due
+under the old settings (a masked LVT drops them); a mode change counts no expiry that passed under the old mode, a
+one-shot count that reached 0 stays 0 until the initial count is written, a DCR write keeps the current count and
+counts on at the new rate (review findings 1-3). **HLT:** `park` polls the timer, wakes on its IRQ, and checks `next`
+again after seeing `end` (X2's note); `Events.halted` holds state 1, or 2 while its own timer can wake it (armed,
+unmasked, IF = 1, its class above PPR), and the posts count it read before it last found nothing to take.
+**Ending halted vCPUs (first review's finding 4, sound rule):** with peers posting at any time, the program driver now reads
+every vCPU's park state twice and ends them only if both reads are equal and every vCPU is in state 1 with every post
+seen (`execution::idle`): a vCPU that runs again must leave its park, which needs an unseen post from a running vCPU,
+and the first to leave did so between the reads, changing its post count. The old rule (one read of each `halted`)
+ended a vCPU a peer was about to wake: the IPI ring `apic-pingpong` stopped after 12-111 of 3,000 receipts in all 4
+runs (2 and 4 vCPUs, block sizes default and 1); the new rule passes 4/4. State 2 (its own timer can wake it) uses the
+vector the expiry actually raises: the timer's, or for an illegal timer vector (0..15) the LVT error vector when that
+entry is unmasked with a legal one (the second review's repro: before, such a vCPU was in state 1 and ended although
+its timer woke it); `selfwake-timer`, `selfwake-illegal-timer-via-error` (delivered, RIP after the HLT) and
+`selfwake-none` (both vectors illegal: ended `halted`) cover it (`halt` 10/10). **Condition on host sources:** the argument holds only
+for sources that are vCPUs or veto the decision; every asynchronous host source (the driver's kickers; L4a's PIT, RTC,
+UART and device SPIs) must post through `execution::post` (it applies acceptance and counts the post) and keep the
+decision off while it may still fire, as `kickers_left` does (`program.rs`). **L5 minimum** (`crates/abi/src/clock.rs`):
+CRYSTAL_HZ from CPUID.15H ECX (24 MHz), a compile-time check that TSC_HZ = crystal x EBX / EAX (1 GHz = x 125 / 3),
+`scale`/`crystal`/`tsc` (floors of V x rate / CNTFRQ) and `count_at_crystal` (their exact inverse), unit-tested for
+exactness at five rates; the resident's TSC uses it, so the TSC is final at 1 GHz (leaf 0x16 not advertised).
+**CNTFRQ is measured, never assumed:** the guest reads 24,000,000 (each run reports it, `lapic.cntfrq`), while macOS
+26 on the M4 gives host EL0 1,000,000,000. **QoS (tried, reverted):** running the vCPU threads at the user-interactive
+QoS class did not change the HLT wake lateness (measured both ways: 49-112 us at a 200 us period, 0.14-1.0 ms for a 2 ms
+one-shot; the earlier HLT failures were the stale-IRQ bug and first translations), cost about 15 ns per system round trip
+(K2's loops), and could starve the host's default-class threads under load (each vCPU's `fexc` compile server, the
+service threads): a vCPU waiting for its compile then stalls while its peers spin. vCPU threads stay at the default
+class. **Model choices and facts:** the xAPIC ID is read-only (11.4.6, model
+specific); a periodic -> one-shot switch whose count has already passed N ticks makes the count 0 with no expiry (legal;
+QEMU does the same, and Linux writes TMICT next); a software-disabled APIC holds its IRR undelivered and accepts no new
+fixed message (11.4.7.2: "pending interrupts in the IRR and ISR registers are held", while it "responds normally" only
+to INIT, NMI, SMI and SIPI; we read "held" as kept pending, not delivered, as QEMU does; KVM delivers them); x2APIC
+ICR bit 12 is #GP (11.12.9: the delivery status bit "is removed" in x2APIC mode, so it is reserved, and 11.12.1.3 makes a
+reserved bit set in a WRMSR #GP; QEMU accepts it); the timer's count starts at the crystal edge at or before the
+initial-count write (`clock::crystal` floors V), so its first tick may come up to one crystal period (41.7 ns) early
+relative to the write itself (none when CNTFRQ is the crystal rate, as on the M4); APR and RRD are not implemented (Table 11-1 note 1; xAPIC reads 0, x2APIC #GP); lowest priority goes to the
+lowest-numbered member of the set (11.6.2.4: model-specific arbitration); the timer's period is exactly the initial count
+in divided ticks; no spurious interrupt; TMR reads 0 (no level-triggered source yet). **Checks** (`tools/run_x3.py`,
+block sizes default and 1 unless stated): `qemu` 9 programs x 2 (register read-backs in xAPIC and x2APIC; priority, TPR
+and EOI order with nested self IPIs in both modes; CR8; the x2APIC fault program, 40 cases; x2APIC IPIs at 2, 3, 4
+vCPUs: fixed physical, all-but-self, NMI, logical cluster, peers to CPU 0): natemu equals QEMU (registers, logs without
+their TSC, counters; logs only at 1 vCPU) and both the SDM model; `ipi` xAPIC MMIO IPIs at 2 and 4 vCPUs (physical,
+logical flat, all-including-self, NMI, lowest priority; QEMU's BSP cannot be xAPIC with peers): counts exact, 4/4;
+`timers` 24/24 (one-shot, periodic /1 and /16, masked, HLT one-shot, HLT periodic, both modes; two rounds, the second
+measured): every current-count sample is the model's count at some V between the RDTSCs around it, no delivery before
+its expiry, each expiry delivered (possibly merged) within 2 ms, one-shot exactly once, masked never; measured lateness
+7-20 us running, 50-117 us from HLT at a 200 us period, 0.45-1.0 ms from HLT for a 2 ms one-shot, about 0.4 ms for the first delivery at a resume point not yet translated (host compile; expiries merge
+meanwhile); `stress` 6/6 (4 vCPUs in each mode, 2 vCPUs x2APIC: 2,000 random IPIs per vCPU under per-flow ordering, a
+periodic timer on each, nested handlers): sent = received on every flow (8,000 at 4 vCPUs), 0 priority violations at
+any handler entry, timer deliveries never above expiries (about 45 % delivered, the rest merged); `halt` 10/10 (above).
+**HLT wake lateness is macOS's, proportional to the sleep:** a HLT one-shot measured with 5 rounds (the handler and every
+path translated in round 1, `apic.timer_program(rounds=5)`) is late by 106 us for a 0.2 ms sleep, 0.96-1.01 ms for 2 ms
+and 2.0-5.0 ms for 10 ms (3 runs each; the same at the default QoS class), about half the sleep: not a first translation but the
+wake of a vCPU parked in `wfi` on the virtual timer (HVF's park and macOS's timer leeway). A halted Linux CPU's 4 ms tick
+can thus come about 2 ms late; L5 should own the remedy (e.g. arming CNTV short of the deadline and re-arming on each
+wake, or a host-side wake), measured;
+`cases` 54/54 (xAPIC widths and alignment, the page while disabled or in x2APIC mode, re-enable resets, relocation,
+INIT/start-up/SMI typed stops, INIT de-assert, ESR send/receive illegal and its latch, illegal register, read-only
+registers, software disable, x2APIC MSRs in xAPIC mode, CR8 <-> TPR, the two timer-write cases of the review); abi unit
+tests 9 new (clock, lapic). X2's `events` programs now enable the APIC and end interrupts for real in natemu too
+(`events.py`): 136 ok; `run_m3.py` `boundary` and `x2-hlt-masked` set `svr 0x1ff`; `system`'s APIC-base case now moves
+the base onto RAM (the typed stop). **Cost** (`run_x3.py --only cost`, slope over N = 100,000 and 200,000, median of 3,
+CPL 0, 1 vCPU): xAPIC EOI write 0.745 us, TPR write 0.658 us, register read 0.661 us per access (each ends its block:
+the site's walk, the completion, a dispatch; no host exit); x2APIC EOI WRMSR 0.451 us, TPR WRMSR 0.452 us (K2's
+resident transaction path). **Round-trip cost** (second review: the full tree was +7.6 % per system round trip over HEAD): measured with interleaved
+A/B runs (CLI and CPUID loops, slope over 100,000 and 200,000 iterations, 30-40 rounds, medians; the machine was shared,
+so +-10 ns): HEAD 466, HEAD + M1 (the tree without X3's runtime) 481, the tree before 514, after 497 ns per CLI. The QoS
+class was 15 ns of it (reverted, above). The rest, about 15 ns, is not in executed X3 code: removing `lapic::poll` from
+`find` (it is a load and a compare when no timer is armed), the LAPIC priority call in `events::next` (not reached with
+IF = 0), the PPI 27 set-up and the timer-IRQ check each changed nothing measurable, and `system`'s disassembly is the same
+instructions; it follows the runtime binary (host and runtime swapped between builds), so code layout is the likely
+cause, left for P2's instrumentation. **`run_k2.py xmc` made deterministic** (its old check, "X translated again", failed
+under load when the peer stalled): vCPU 1 rewrites one byte of X only after vCPU 0 advanced 100 iterations, raises a flag
+and waits for vCPU 0's acknowledgement; vCPU 0, on the flag, runs CPUID and must then execute the new instruction
+(observed: IF, ECX of RDTSCP, the loaded x87 value; INT3 taken); vCPU 0 runs until 2,000 rewrites are checked. Green 10/10
+alone and 50/50 under 12 `yes` hogs (5 runs), 0 mismatches; red 10/10 with kept system records never invalidated (the K2
+control: 999-1,000 of 2,000 checks ran the old instruction, and the INT3 was never taken). **QEMU deviations** (11.1.2; judged by the SDM, `run_x3.py` `QEMU_DEVIATIONS`; on the other 20 fault cases natemu
+equals QEMU, #GP or not and the faulting RIP): it accepts
+WRMSR to read-only and RDMSR of write-only x2APIC registers, nonzero EOI/ESR writes, every reserved bit, an APR read and
+ICR-high, x2APIC MSRs with the APIC disabled, and advertises TSC-deadline (20 of the 40 fault cases); it cannot
+re-enable an APIC once disabled. **For X4:** replace `lapic::ap_start` (INIT/start-up arrive at the sending
+instruction with the target set computed) by posting into the target's events; `lapic::event_word(v, field)`,
+`cache::kick(v)` and `park` are the pieces; APs start from the reset APIC with their published word written.
+**For L4a:** host `execution::post` + the vCPU's SPI is the external-interrupt path (it applies acceptance and counts
+the post); `natemu_abi::lapic::{published, in_destination}` match I/O APIC destinations from the global area; a
+level-triggered source must set TMR on acceptance and get the EOI broadcast at the marked place in `lapic::eoi`; LINT0
+(ExtINT) and LINT1 (NMI) entries are stored and read back with no source. **For L5:** `natemu_abi::clock` and the
+final TSC; PIT/RTC/PM from V by `clock::scale`; the wake latencies above (a halted vCPU's timer wake is macOS's).
+**Not built:** TSC-deadline (not advertised), INIT/SIPI (X4), LINT sources, ExtINT, level-triggered interrupts and EOI
+broadcast (L4a), thermal and PMC sources (none in the profile), APR.
+*Built (M1, guest RAM and the address-space layout; no fexc change, series25; after an independent review):* **RAM size**
+is a run-time parameter: R, a 2 MiB multiple up to 3 GiB (`execution::MAX_GUEST_RAM_BYTES`, the map's largest L), chosen
+at `execution::prepare` and stored in each vCPU's `cache::Control::ram_bytes`; the resident builds its RAM description
+from it (`guest_ram()`). `run-program --ram BYTES` (default 2 GiB) and `--place GPA` (where the driver starts placing
+tables and pages, default 0x1000); `NATEMU_RAM`/`NATEMU_PLACE` set those defaults, so any runner runs a whole suite at
+another size or placement unchanged. `boot-linux` runs a VM of the map's L (default 2 GiB) and gains `--code-cache`
+(default the largest) and pool reporting (`evictions`, `shadow_resets`, `retries`, the cache fill; a watchdog stop reports the walk `retries` so far). **Legacy hole
+(owner decision, October 29: 0xA0000-0xFFFFF is not RAM; the reserved ranges that are RAM on a PC stay RAM): not
+applied, it waits for L3's unassigned-address rule.** Built and measured: RAM as two ranges ([0, 0xA0000) and [1 MiB,
+R)), the hole through the device path, never shadowed, a fetch from it not RAM, the driver placing around it and refusing
+identity pages in it, devices registrable there (patch kept at
+`/Users/liaozping/orca/natemu-raw/m1-legacy-hole-20261029.diff`).
+With the typed `unassigned` stop the L1 smoke test then stops after 242 blocks: the decompressor's `get_rsdp_addr()`
+(`acpi_rsdp_addr` is 0 until L2) searches the EBDA and 0xE0000-0xFFFFF for "RSD PTR" with plain loads. So the hole
+becomes non-RAM together with all-ones reads and ignored, counted writes for unassigned device addresses (L3; or once
+L2 fills `acpi_rsdp_addr`, which skips the search). Everything else the boot map reserves below 16 MiB is RAM and stays
+RAM.
+**Per-page structures** (global area), sized once for 3 GiB, only the first R / 4096 pages used, untouched pages never
+backed: the code-page and writable masks hold 4 bits per page (bit v = vCPU v), page p's nibble at bit 4 (p % 16) of
+word p / 16, so one atomic word op still reads or changes every vCPU's bit of a page (the protocol is unchanged; 384 KiB
+each at 3 GiB). The 4-bit groups limit a VM to 4 vCPUs (`MAX_VCPUS <= 4`, asserted); more vCPUs need 8-bit groups (768
+KiB per mask at 3 GiB). Each vCPU's invalidation record is `{pending, summary, stale}`: producers set the stale bit, then
+its word's summary bit, then `pending`; the consumer swaps `pending`, then each nonzero summary word and the nonzero
+stale words it names. Each vCPU also keeps private summaries of the mask words it set bits in (lookup area
+`CODE_SUMMARY`/`WRITABLE_SUMMARY`), so a cache reset or a shadow reset clears only those words: resets and drains cost
+what was marked, not R (without them the 2 GiB scans took a cross-modifying-code program from 7 s to the 10 s watchdog).
+**Address space.**
+
+| Private offset (PRIVATE = 0x8000_4000_0000) | Size | Content | EL1 | EL0 |
+| --- | --- | --- | --- | --- |
+| 0 - 0xe0000 | 4 KiB pages | window pages (unchanged) | as before | guest-state page RW only (G1) |
+| 0x25000 - 0x27000 | 3 pages | level-2 tables of the RAM alias, one per GiB (walked, never mapped) | - | - |
+| 0xe0000 - 0x200000 | 288 pages | shadow pool (was 32 pages to 1 MiB) | RW | none |
+| 256 MiB / 512 MiB | <= 128 MiB each | code area / its write alias | R / RW | X / none |
+| 768 MiB, 896 MiB, 960 MiB | 8, 2, 2 MiB | metadata, lookup (summaries at 0x1fc000), global (masks 0x10000, records 0xd0000) | RW | none |
+| 1 GiB - 1 GiB + R (<= 4 GiB) | R | guest-RAM alias (was PRIVATE + 2 MiB) | RW | none |
+
+Backing per vCPU block: window (2 MiB, pool included), lookup, global (block 0 only), metadata, code; guest RAM after the
+last block. Stage 2: `hv_vm_map` of the whole backing at IPA 1 GiB; the default IPA size is 36 bits (maximum 40) and the
+largest backing ends near 4.6 GiB; `Machine::create` checks the fit and would raise the size. The instruction-cache
+flush covers only the windows' resident text. Device ranges (`devices::Devices::new(R)`) lie above R; [R, 4 GiB) is the
+map's reserved range and not RAM. The resident's atomics are single LSE instructions
+(`+lse`): an LL/SC loop can livelock when every pass meets a vCPU exit. **Renames:** `GUEST_RAM_BYTES`,
+`GUEST_RAM_OFFSET`, `GUEST_PAGES` removed (`MAX_GUEST_RAM_BYTES`, `MAX_GUEST_PAGES`, `PRIVATE_BYTES`,
+`RAM_TABLES_OFFSET`, `cache::{MASK_BYTES, CODE_SUMMARY, WRITABLE_SUMMARY, SUMMARY_BYTES}`,
+`Control::ram_bytes` (last field), `Record::summary` added; `GUEST_RAM_VA` keeps its name); host `prepare(.., ram_bytes)`,
+`Backing.ram`/`Area.ram` replace `guest_ram(memory)`, `Devices::new(ram_end)` (no `Default`),
+`flush_instruction_cache(offset, len)`; the resident's `RAM` constant became `guest_ram()`.
+**Pools.** Shadow pool 288 pages (about 560 MiB of shadowed linear addresses; a full pool resets, counted as
+`evictions`). Code cache and records stay at 32 Ki blocks, 8 MiB of metadata (code: `--code-cache`, `boot-linux` 128 MiB):
+the Debian kernel's early boot averaged 261 code and 230 metadata bytes per block. Doubling them (64 Ki blocks, 16 MiB)
+made the cross-modifying-code program a third slower (7.2 s to 10 s): invalidation scans every live block
+(`cache::invalidate`), so larger pools need a page-to-block reverse map first. **Kernel run** (2 GiB, `mitigations=off
+nokaslr`, earlycon): past the decompressor into vmlinux, 35,531 blocks, 3,340 compiles, 10 flushes (control-register
+changes), 0 evictions, 100 shadow resets, 1,708 blocks live; it stops in `setup_arch` (trim_snb_memory ->
+snb_gfx_workaround_needed -> read_pci_config_16: `out dx, eax` at 0xffffffff81c7c422, PCI config address 0x80001000),
+the first port I/O (symbols inferred from the code: the image's System.map is the placeholder). **Checks** (shared tree
+with X3, 2 GiB unless noted): cargo test 45 + 59; stack audit ok (gate 18,816 of 32,768, nested 22,864, boot 12,688;
+HEAD 18,464/22,528/12,512); python unit 263; fix/fix-1 64, seed/seed-1 44, flow 64 x 3, loopfaults 846 x 3, probes 85,
+faults/faults-1 7,659 each, twice (78 new window probes: the new alias, its tables, the high pool), ASM 1,052 pass (22
+precision deviations), corpora 6,860 at N = 2, 3, 4, smp, limits, kicks, system 246, coherence (N = 1-4), sharedpt (N =
+2-4; N = 1's contended programs need a peer and fail at HEAD too), litmus, contain (400 cases, 373 controls; new: EL0
+loads and stores into the RAM alias halt `private_access`), privilege, delivery, events, i6 276 x 2, i5a 454, i5a DE 351,
+`run_m3.py`, `run_k2.py`, `run_x3.py`; at 4 MiB (`NATEMU_RAM`) fix, seed, flow, probes, corpora, limits, kicks, system,
+coherence, sharedpt, contain, privilege, delivery, events, i5a, i6, m3, k2, x3; placed at 1 GiB (`NATEMU_PLACE`, CR3 =
+0x40000000) fix, seed, flow, corpora, system, coherence, faults 7,659; `tools/run_m1.py` 14 cases (RAM's top MiB at 4 MiB,
+2 GiB, 3 GiB; the device page at R; placement across 0xA0000; cross- and self-modifying code in a code page at 0x7ff00000 at both block sizes, its invalidation
+posted through the highest summary words); the L1 smoke test in-tree at 2 GiB (reaches 0x1000c43 in 2,112 blocks,
+registers, zero page equal to QEMU's, the window but the known accessed bit). The suites are size-agnostic: their
+default is now 2 GiB. **Measurements** (us per iteration, HEAD -> M1): CR3 reload (full flush and shadow reset) 60.6 ->
+53.6-54.3 (sizes 4 MiB-3 GiB; noisy, never slower); INVLPG 4.54 -> 4.53-4.59; start-up of a trivial program 11.6 ms ->
+8.1 ms at every size; K2 system-instruction round trips +2-6% (CLI 0.414-0.420 -> 0.431-0.438), size-independent,
+neither LSE nor the control record's layout, cause not isolated (the independent review measured no M1 cost). The
+`xmc cli-nop` and m3 watchdog reports during X3's runs reproduced only with another suite running VMs at the same time
+(HEAD shows the same xmc signature under that load). **Not built:** high RAM above 4 GiB (needs per-page structures and
+an alias beyond 4 GiB of guest-physical space, a second RAM range in the resident's description and a multi-range
+loader); the reverse map; resizing the code-cache pools.
+**Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
+
 **Owner decision (October 28): MTRRs enabled by the virtual firmware, RAM write-back, device ranges uncached** (plan Q3).
 **Deferred (owner, October 28):** replacing the host's minimal JSON reader (`crates/host/src/json.rs`, used only for
 fexc's per-compile report: end reason and cut opcode) by carrying those fields in the code-object header; no registry

@@ -21,7 +21,7 @@ use natemu_abi::execution::{MMIO_VA, Mmio, REPLY_DEVICE, REQUEST_DEVICE, mmio as
 
 /// `gpa` is guest RAM (anything else is a device page).
 pub(super) fn ram(gpa: u64) -> bool {
-    RAM.range(gpa, 1).is_some()
+    guest_ram().range(gpa, 1).is_some()
 }
 fn exchange() -> *mut Mmio {
     MMIO_VA as *mut Mmio
@@ -46,10 +46,13 @@ pub(super) fn system_access(s: &State) -> ! {
 }
 
 /// The resident's own devices (fast path, no host exit): the access to `gpa` of `width` bytes (a store's `data`, or a
-/// load), answered with the load's value (0 for a store), or `None` when no resident device claims the page. None today;
-/// X3's per-vCPU LAPIC (xAPIC page, e.g. EOI and TPR writes) is meant to answer here, with this vCPU's state at hand.
-fn local(_s: &mut State, _gpa: u64, _width: u64, _data: Option<u64>) -> Option<u64> {
-    None
+/// load), answered with the load's value (0 for a store), or `None` when no resident device claims the page: this vCPU's
+/// local APIC in xAPIC mode (X3, [`super::lapic::mmio`]; an access it does not implement is refused as a device's).
+fn local(s: &mut State, gpa: u64, width: u64, data: Option<u64>) -> Option<u64> {
+    match super::lapic::mmio(s, gpa, width, data)? {
+        Ok(v) => Some(v),
+        Err(()) => stop_with(s, status::DEVICE),
+    }
 }
 
 /// Completes the access at `site` of `b` to device byte `gpa` (`None`: the access crosses a page, refused).

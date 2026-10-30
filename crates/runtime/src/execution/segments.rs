@@ -170,11 +170,11 @@ pub(super) fn linear(s: &mut State, va: u64, buf: &mut [u8], write: bool, superv
             if cache::translated(gpa) {
                 FetchWrites(s).code_write(gpa);
             }
-            let done = RAM.copy_in(gpa, chunk);
+            let done = guest_ram().copy_in(gpa, chunk);
             cache::rechecked(gpa);
             done
         } else {
-            RAM.copy_out(gpa, chunk)
+            guest_ram().copy_out(gpa, chunk)
         };
         if !done {
             halt(s, stop::UNSUPPORTED_SYSTEM)
@@ -199,7 +199,7 @@ pub(super) fn pages(s: &mut State, va: u64, n: u64, write: bool, supervisor: boo
     let mut gpa = [0u64; 2];
     for (k, at) in [va, last & !4095].into_iter().enumerate().take(1 + usize::from(crosses)) {
         gpa[k] = loop {
-            match paging::walk(&mut GuestTables::observed(RAM, CodeWrites(FetchWrites(s))), control, at, access) {
+            match paging::walk(&mut GuestTables::observed(guest_ram(), CodeWrites(FetchWrites(s))), control, at, access) {
                 Ok(t) if t.wb || !super::mmio::ram(t.gpa) => break t.gpa,
                 Ok(_) => halt(s, stop::UNSUPPORTED_SYSTEM),
                 Err(Fault::Page { address, error }) => return Err([14, error, address]),
@@ -216,7 +216,7 @@ pub(super) fn pages(s: &mut State, va: u64, n: u64, write: bool, supervisor: boo
 /// hardware sets by a locked read-modify-write.
 fn atomic_byte(s: &mut State, va: u64, update: impl FnMut(u8) -> Option<u8>) -> Result<Result<u8, u8>, Exception> {
     let gpa = pages(s, va, 1, true, true, GP0)?[0];
-    let Some(p) = RAM.range(gpa, 1) else { super::mmio::system_access(s) };
+    let Some(p) = guest_ram().range(gpa, 1) else { super::mmio::system_access(s) };
     if cache::translated(gpa) {
         FetchWrites(s).code_write(gpa);
     }

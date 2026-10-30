@@ -15,9 +15,9 @@
 use super::*;
 use natemu_abi::code_object::{Header, Site};
 use core::mem::align_of;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering::SeqCst};
+use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use natemu_abi::execution::{
-    ENTRY_OFFSET, GUEST_PAGES, KICK_SGI, LinkPoint, MAX_LINK_POINTS, STATE_VA, STOP_WORD, State, System,
+    ENTRY_OFFSET, KICK_SGI, LinkPoint, MAX_LINK_POINTS, STATE_VA, STOP_WORD, State, System,
     cache::{self as area, Control, LinkRecord, Record, SLOT, SLOT_BYTES, SLOT_VA, SLOT_WRITE_VA},
 };
 pub use natemu_abi::execution::cache::{Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, HEAD_BYTES, MAX_VCPUS, PAGES, SHADOWS, STEP, SYSTEM};
@@ -28,9 +28,17 @@ pub const L1_VA: u64 = CODE_VA + area::L1_CODE as u64;
 fn vcpu() -> usize {
     unsafe { (&raw const (*(STATE_VA as *const State)).vcpu).read_volatile() as usize }
 }
-/// This vCPU's bit in the mask bytes.
+/// This vCPU's bit in the mask nibbles.
 fn own() -> u8 {
     1 << vcpu()
+}
+/// This vCPU's bit in every nibble of a mask word.
+fn own_all() -> u64 {
+    0x1111_1111_1111_1111 << vcpu()
+}
+/// Guest-physical pages of guest RAM (the VM's R / 4096; the host set `ram_bytes` at prepare).
+fn pages() -> usize {
+    (control().ram_bytes / 4096) as usize
 }
 /// Code placement alignment (a cache line).
 const CODE_ALIGN: u64 = 64;
@@ -71,14 +79,49 @@ fn record(i: usize) -> *mut LinkRecord {
 fn global<T>(offset: usize) -> *mut T {
     (area::GLOBAL_VA + offset as u64) as *mut T
 }
-/// Mask byte of `page` in the mask at `mask` (code or writable pages).
-fn mask(mask: usize, page: usize) -> &'static AtomicU8 {
-    unsafe { AtomicU8::from_ptr(global::<u8>(mask).wrapping_add(page)) }
+/// The word of the mask at global offset `at` (code or writable pages) holding `page`'s nibble, and the nibble's shift.
+fn mask(at: usize, page: usize) -> (&'static AtomicU64, u32) {
+    (unsafe { AtomicU64::from_ptr(global::<u64>(at).wrapping_add(page / 16)) }, 4 * (page % 16) as u32)
 }
-/// The code-page mask of guest-physical `gpa`; `None` outside guest RAM.
-fn code_page(gpa: u64) -> Option<&'static AtomicU8> {
+/// The vCPUs whose bits are set in nibble `shift` of mask word `w`.
+fn nibble(w: u64, shift: u32) -> u8 {
+    (w >> shift) as u8 & 0xf
+}
+/// The code-page mask word and shift of guest-physical `gpa`; `None` outside guest RAM.
+fn code_page(gpa: u64) -> Option<(&'static AtomicU64, u32)> {
     let page = (gpa >> 12) as usize;
-    (page < GUEST_PAGES).then(|| mask(area::CODE_PAGES, page))
+    (page < pages()).then(|| mask(area::CODE_PAGES, page))
+}
+/// This vCPU's summary of the mask at `mask` (`area::CODE_SUMMARY`, `area::WRITABLE_SUMMARY`).
+fn summary(mask: usize) -> *mut u64 {
+    lookup_area(if mask == area::CODE_PAGES { area::CODE_SUMMARY } else { area::WRITABLE_SUMMARY })
+}
+/// Sets this vCPU's bit of `page` in the mask at `mask`, noting its word in the summary.
+fn set_own(mask_at: usize, page: usize) {
+    let (m, shift) = mask(mask_at, page);
+    m.fetch_or(u64::from(own()) << shift, SeqCst);
+    unsafe { *summary(mask_at).add(page / 16 / 64) |= 1 << (page / 16 % 64) };
+}
+/// Clears this vCPU's bits in the mask at `mask_at`: only in the words its summary names (only this vCPU sets its bits, so
+/// no other word holds one; peers only clear them), and empties the summary. Its cost follows what was marked, not R:
+/// zero summary words are only read, and a word whose load shows none of its bits (a peer cleared them) is not written.
+fn clear_own(mask_at: usize) {
+    let own = own_all();
+    for k in 0..pages().div_ceil(16 * 64) {
+        let s = unsafe { summary(mask_at).add(k) };
+        let mut bits = unsafe { s.read() };
+        if bits == 0 {
+            continue;
+        }
+        unsafe { s.write(0) };
+        while bits != 0 {
+            let w = unsafe { AtomicU64::from_ptr(global::<u64>(mask_at).wrapping_add(k * 64 + bits.trailing_zeros() as usize)) };
+            if w.load(SeqCst) & own != 0 {
+                w.fetch_and(!own, SeqCst);
+            }
+            bits &= bits - 1;
+        }
+    }
 }
 /// vCPU `v`'s invalidation record: its `pending` word and `stale` word `i`.
 fn record_word(v: usize, i: Option<usize>) -> &'static AtomicU64 {
@@ -90,6 +133,11 @@ fn record_word(v: usize, i: Option<usize>) -> &'static AtomicU64 {
         })
     }
 }
+/// vCPU `v`'s invalidation record's `summary` word `k`.
+fn summary_word(v: usize, k: usize) -> &'static AtomicU64 {
+    let r = global::<Record>(area::RECORDS).wrapping_add(v);
+    unsafe { AtomicU64::from_ptr((&raw mut (*r).summary).cast::<u64>().wrapping_add(k)) }
+}
 /// vCPU `v`'s shadow-reset counter.
 fn resets(v: usize) -> &'static AtomicU64 {
     unsafe { AtomicU64::from_ptr(global::<u64>(area::RESETS).wrapping_add(v)) }
@@ -97,7 +145,7 @@ fn resets(v: usize) -> &'static AtomicU64 {
 
 fn hash(rip: u64, context: [u64; 2]) -> usize {
     let h = rip ^ context[0].rotate_left(23) ^ context[1].rotate_left(47);
-    (h.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 48) as usize & (area::L2_ENTRIES - 1)
+    (h.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - area::L2_ENTRIES.trailing_zeros())) as usize
 }
 
 /// Empties the cache: bump pointers, L1, L2, block index, link records and this vCPU's code-page bits.
@@ -107,9 +155,7 @@ pub fn reset() {
     (c.code_used, c.meta_used, c.blocks, c.links) = (area::HEAD_BYTES as u64, 0, 0, 0);
     clear_l1();
     unsafe { ptr::write_bytes(lookup_area::<u8>(area::L2), 0, area::L2_ENTRIES * 16) };
-    for page in 0..GUEST_PAGES {
-        mask(area::CODE_PAGES, page).fetch_and(!own(), SeqCst);
-    }
+    clear_own(area::CODE_PAGES);
 }
 /// Code-area offset of L1 entry `i`.
 fn l1_entry(i: usize) -> u64 {
@@ -481,8 +527,8 @@ fn unlink(r: LinkRecord) -> Option<()> {
 /// its next block entry) and invalidates this vCPU's own blocks from it ([`invalidate`]). A write through the RAM
 /// alias is followed by [`rechecked`].
 pub fn written(gpa: u64) -> Option<u64> {
-    if let Some(m) = code_page(gpa) {
-        post(m.swap(0, SeqCst) & !own(), gpa);
+    if let Some((m, shift)) = code_page(gpa) {
+        post(nibble(m.fetch_and(!(0xf << shift), SeqCst), shift) & !own(), gpa);
     }
     invalidate(gpa)
 }
@@ -490,10 +536,11 @@ pub fn written(gpa: u64) -> Option<u64> {
 /// marked the page after [`written`] cleared it, or after a check found it unmarked, may have been given the old
 /// bytes. Posts the page to every such peer and clears their bits (this vCPU marks no page while it writes one).
 pub fn rechecked(gpa: u64) {
-    if let Some(m) = code_page(gpa) {
+    if let Some((m, shift)) = code_page(gpa) {
         unsafe { asm!("dmb ish") };
-        if m.load(SeqCst) & !own() != 0 {
-            post(m.fetch_and(own(), SeqCst) & !own(), gpa);
+        let peers = 0xf & !own();
+        if nibble(m.load(SeqCst), shift) & peers != 0 {
+            post(nibble(m.fetch_and(!(u64::from(peers) << shift), SeqCst), shift) & peers, gpa);
         }
     }
 }
@@ -502,6 +549,7 @@ fn post(peers: u8, gpa: u64) {
     let page = (gpa >> 12) as usize;
     for v in (0..MAX_VCPUS).filter(|v| peers & 1 << v != 0) {
         record_word(v, Some(page / 64)).fetch_or(1 << (page % 64), SeqCst);
+        summary_word(v, page / 64 / 64).fetch_or(1 << (page / 64 % 64), SeqCst);
         record_word(v, None).fetch_or(PAGES, SeqCst);
         kick(v);
     }
@@ -527,8 +575,8 @@ pub fn kick(v: usize) {
 // ponytail: scans every block and record; a reverse map (page → blocks, block → records) if profiles show it.
 pub fn invalidate(gpa: u64) -> Option<u64> {
     let unlinked = kill(|b| b.source_gpa.iter().any(|&g| g != u64::MAX && g >> 12 == gpa >> 12))?;
-    if let Some(mask) = code_page(gpa) {
-        mask.fetch_and(!own(), SeqCst);
+    if let Some((m, shift)) = code_page(gpa) {
+        m.fetch_and(!(u64::from(own()) << shift), SeqCst);
     }
     Some(unlinked)
 }
@@ -611,19 +659,25 @@ pub fn block_at(pc: u64) -> Option<&'static Block> {
 /// write to the page posts it to this vCPU. Returns the vCPUs that may hold a writable shadow of it, read after the
 /// mark (a writable install sets its bit before it reads the marks, so it either sees this mark or is returned here).
 pub fn mark(gpa: u64) -> u8 {
-    let Some(m) = code_page(gpa) else { return 0 };
-    m.fetch_or(own(), SeqCst);
+    if code_page(gpa).is_none() {
+        return 0;
+    }
+    set_own(area::CODE_PAGES, (gpa >> 12) as usize);
     writable(gpa)
 }
 /// This vCPU's mark of `gpa`'s page is still set (no write cleared it since [`mark`]); pages outside guest RAM count as
 /// marked (no code is fetched from them).
 pub fn marked(gpa: u64) -> bool {
-    code_page(gpa).is_none_or(|m| m.load(SeqCst) & own() != 0)
+    code_page(gpa).is_none_or(|(m, shift)| nibble(m.load(SeqCst), shift) & own() != 0)
 }
 /// The vCPUs that may hold a writable shadow of `gpa`'s page.
 pub fn writable(gpa: u64) -> u8 {
     let page = (gpa >> 12) as usize;
-    if page < GUEST_PAGES { mask(area::WRITABLE_PAGES, page).load(SeqCst) } else { 0 }
+    if page >= pages() {
+        return 0;
+    }
+    let (m, shift) = mask(area::WRITABLE_PAGES, page);
+    nibble(m.load(SeqCst), shift)
 }
 /// vCPU `v`'s shadow-reset count (it moves each time `v` drops all its shadows, see [`shadows_reset`]).
 pub fn resets_of(v: usize) -> u64 {
@@ -636,35 +690,45 @@ pub fn ask_shadows(v: usize) {
 }
 /// Some vCPU holds translations from `gpa`'s page: shadows of it stay read-only.
 pub fn translated(gpa: u64) -> bool {
-    code_page(gpa).is_some_and(|m| m.load(SeqCst) != 0)
+    code_page(gpa).is_some_and(|(m, shift)| nibble(m.load(SeqCst), shift) != 0)
 }
 /// Records that this vCPU shadows `gpa`'s page writable.
 pub fn shadowed_writable(gpa: u64) {
     let page = (gpa >> 12) as usize;
-    if page < GUEST_PAGES {
-        mask(area::WRITABLE_PAGES, page).fetch_or(own(), SeqCst);
+    if page < pages() {
+        set_own(area::WRITABLE_PAGES, page);
     }
 }
 /// This vCPU's shadows were all removed (and the TLB invalidated): clears its writable bits, then counts the reset
 /// (a peer waiting for this vCPU to drop its writable shadows waits for the counter to change).
 pub fn shadows_reset() {
-    for page in 0..GUEST_PAGES {
-        mask(area::WRITABLE_PAGES, page).fetch_and(!own(), SeqCst);
-    }
+    clear_own(area::WRITABLE_PAGES);
     resets(vcpu()).fetch_add(1, SeqCst);
 }
 
-/// Takes this vCPU's pending invalidations: swaps `pending` to 0, then each stale word, and invalidates each listed
+/// Takes this vCPU's pending invalidations: swaps `pending` to 0, then each summary word and each stale word it names
+/// (a word that loads 0 is skipped unwritten: a bit set after that load comes with a later `pending`, as its producer
+/// sets the stale bit, then the summary bit, then `pending`), and invalidates each listed
 /// page ([`invalidate`], whose `None` this returns) unless the whole cache goes anyway. Returns the pending bits;
 /// the caller flushes on [`FLUSH`] and resets its shadows on [`SHADOWS`].
 pub fn drain() -> Option<u64> {
     let pending = record_word(vcpu(), None).swap(0, SeqCst);
     if pending & PAGES != 0 {
-        for i in 0..GUEST_PAGES / 64 {
-            let mut bits = record_word(vcpu(), Some(i)).swap(0, SeqCst);
-            while bits != 0 && pending & FLUSH == 0 {
-                invalidate(((i * 64 + bits.trailing_zeros() as usize) as u64) << 12)?;
-                bits &= bits - 1;
+        for k in 0..pages().div_ceil(64 * 64) {
+            let summary = summary_word(vcpu(), k);
+            if summary.load(SeqCst) == 0 {
+                continue;
+            }
+            let mut words = summary.swap(0, SeqCst);
+            while words != 0 {
+                let i = k * 64 + words.trailing_zeros() as usize;
+                let stale = record_word(vcpu(), Some(i));
+                let mut bits = if stale.load(SeqCst) == 0 { 0 } else { stale.swap(0, SeqCst) };
+                while bits != 0 && pending & FLUSH == 0 {
+                    invalidate(((i * 64 + bits.trailing_zeros() as usize) as u64) << 12)?;
+                    bits &= bits - 1;
+                }
+                words &= words - 1;
             }
         }
     }

@@ -35,16 +35,20 @@ pub(crate) trait Device: Send {
 pub(crate) type Shared = Arc<Mutex<dyn Device>>;
 
 /// The guest-physical device ranges of a VM.
-#[derive(Default)]
 pub(crate) struct Devices {
     ranges: Vec<(u64, u64, Shared)>,
+    /// The end of the VM's guest RAM (M1: its run-time size): no device below it.
+    ram_end: u64,
 }
 impl Devices {
-    /// Registers `device` at `[base, base + bytes)`: page-aligned, outside guest RAM, below MAXPHYADDR (40 bits), not
+    pub(crate) fn new(ram_end: u64) -> Self {
+        Self { ranges: Vec::new(), ram_end }
+    }
+    /// Registers `device` at `[base, base + bytes)`: page-aligned, above guest RAM, below MAXPHYADDR (40 bits), not
     /// overlapping another range.
     pub(crate) fn register(&mut self, base: u64, bytes: u64, device: Shared) -> crate::Result<()> {
         let end = base.checked_add(bytes).filter(|&e| bytes > 0 && e <= 1 << 40);
-        let Some(end) = end.filter(|_| base % 4096 == 0 && bytes % 4096 == 0 && base >= exec::GUEST_RAM_BYTES as u64) else {
+        let Some(end) = end.filter(|_| base % 4096 == 0 && bytes % 4096 == 0 && base >= self.ram_end) else {
             return Err(format!("device range {base:#x}+{bytes:#x}: page-aligned, above guest RAM, below 2^40"));
         };
         if self.ranges.iter().any(|&(b, e, _)| base < e && b < end) {
@@ -166,7 +170,7 @@ mod tests {
 
     #[test]
     fn registry_and_test_device() {
-        let mut d = Devices::default();
+        let mut d = Devices::new(4 << 20);
         let t: Shared = Arc::new(Mutex::new(TestDevice::new()));
         assert!(d.register(0xfeb0_0000, 4096, t.clone()).is_ok());
         assert!(d.register(0xfeb0_0000, 4096, t.clone()).is_err()); // overlaps

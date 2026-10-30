@@ -2,18 +2,17 @@
 """K2 checks: system instructions run from the decoded record kept in the code cache (boot-features plan, K2).
 
     tools/with-env python3 tools/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence] [--n 100000] [--reps 3]
-        [--xmc-iterations N] [--xmc-peer N] [--host HOST --runtime RUNTIME]
+        [--xmc-rewrites N] [--host HOST --runtime RUNTIME]
 
 - `cost`: microseconds per loop iteration of one system instruction (CLI, STI, PUSHFQ+POPFQ, SWAPGS, RDTSC, CPUID,
   WRMSR KERNEL_GS_BASE, FLD+FSTP m80) at CPL 0 on 1 vCPU, as the slope (t(2N) - t(N)) / N of the driver's wall time
   (start-up and compiles fall into the intercept); every run must reach its end. With the stats `decode_exits` per
   run: after K2 a loop's decode exits do not grow with N.
 - `rdrand`: 4,000 RDRANDs in a loop (the pool holds 32): all succeed, about one entropy refill exit per 32, values differ.
-- `xmc`: cross-modifying code at a system instruction: vCPU 0 loops `X; dec r8; jnz` at CPL 0 while vCPU 1 rewrites
-  one byte of X with no synchronisation, toggling a system instruction with an ordinary one (CLI <-> NOP, FILD m32 <->
-  FLD m80) or with another system instruction (CLI <-> STI, SWAPGS <-> RDTSCP, INT3 <-> CLI). x86 runs the old or the
-  new instruction: vCPU 0 reaches its end (INT3: or takes #BP, RIP after it), never stops otherwise; each run translates
-  X again (decode exits > 1) and some INT3 run takes #BP. Block sizes default and 1.
+- `xmc`: cross-modifying code at a system instruction, by the x86 protocol (deterministic: see `xmc`): vCPU 1 rewrites
+  one byte of X (CLI <-> NOP, CLI <-> STI, SWAPGS <-> RDTSCP, FLD m80 <-> FILD m32, CLI -> INT3) paced by vCPU 0's
+  progress, then raises a flag; vCPU 0, after CPUID, must execute the new instruction (observed) every time; INT3 must be
+  taken. Block sizes default and 1.
 - `coherence`: a kept record never outlives its bytes or mapping (own writes, remap + INVLPG or CR3, an alias write, a
   page-crossing instruction's second page, a peer's write before a serializing CPUID) and a kept BTS record under
   alignment checking (see `coherence`).
@@ -27,6 +26,9 @@ import ref, run_slice1_vm as vm, programs as P  # noqa: E402
 
 CODE, DATA, STACK = 0x100000, 0x300000, 0x3f0000
 F80_ONE = bytes.fromhex('0000000000000080ff3f')
+# xmc: vCPU 0 iterations between the peer's rewrites; RFLAGS.IF after X (old CLI: 0).
+XMC_K = 100
+OBS_IF = 'pushfq\npop rax\nshr eax, 9\nand eax, 1'
 # name: (loop body, extra gpr settings); r8 counts the iterations.
 COSTS = {
     'cli': ('cli', {}),
@@ -105,38 +107,106 @@ def rdrand(a, report):
 
 
 def xmc(a, report):
+    """Cross-modifying code at a system instruction, deterministic (the x86 protocol, SDM Vol.3 9.1.3): vCPU 0 loops
+    `P; X; observe; ...` at CPL 0 and counts each iteration in ACK; vCPU 1 rewrites one byte of X (old <-> new), but only
+    after ACK has advanced by `XMC_K` since its last rewrite, then raises FLAG (its rewrite count) and waits for vCPU 0 to
+    acknowledge it in SEEN. vCPU 0, on seeing FLAG change, runs CPUID (serialising) and must then execute the instruction
+    FLAG's parity names: the old one (observed 0) or the new one (observed 1); any other observation is a mismatch. Before
+    the serialising instruction either is allowed. vCPU 0 runs until it has checked `--xmc-rewrites` rewrites, so both
+    vCPUs' work follows the other's progress and every count is exact whatever the scheduling. INT3 <-> CLI: the first rewrite
+    puts INT3 there, which vCPU 0 must take (#BP, RIP after it) right after its CPUID. Block sizes default and 1. Prints
+    both vCPUs' counters (iterations, checks, mismatches; rewrites)."""
     asm, failures, runs = ref.assemble, [], []
-    # name: (X, the byte offset in X the peer toggles, the two byte values: X's own first)
-    modes = {'cli-nop': ('cli', 0, (0xfa, 0x90)), 'cli-sti': ('cli', 0, (0xfa, 0xfb)),
-             'swapgs-rdtscp': ('swapgs', 2, (0xf8, 0xf9)), 'int3-cli': ('cli', 0, (0xfa, 0xcc)),
-             'fld80-fild': ('fld tbyte ptr [rbx]', 1, (0x2b, 0x03))}
-    for mode, (x, at, (own, other)) in modes.items():
-        c0 = asm(f'1: {x}\ndec r8\njnz 1b')
-        c1 = asm(f'1: mov byte ptr [{CODE + at:#x}], {other:#x}\nmov byte ptr [{CODE + at:#x}], {own:#x}\ndec rcx\njnz 1b')
+    ack, flag, seen = 0x3e0000, 0x3e0008, 0x3e0010
+    # name: (setup, P, X, observe (eax = 0 for the old instruction, 1 for the new), byte offset in X, (old, new))
+    modes = {'cli-nop': ('', 'sti', 'cli', OBS_IF, 0, (0xfa, 0x90)),
+             'cli-sti': ('', 'cli', 'cli', OBS_IF, 0, (0xfa, 0xfb)),
+             'swapgs-rdtscp': ('mov ecx, 0xc0000103\nmov eax, 1\nxor edx, edx\nwrmsr\n', 'xor ecx, ecx', 'swapgs', 'mov eax, ecx', 2, (0xf8, 0xf9)),
+             'fld80-fild': ('', '', 'fld tbyte ptr [rbx]', 'fstp qword ptr [rbx + 16]\nmov rax, qword ptr [rbx + 16]\ntest rax, rax\nsetz al\nmovzx eax, al', 1, (0x2b, 0x03)),
+             'int3-cli': ('', '', 'cli', 'xor eax, eax', 0, (0xfa, 0xcc))}
+    for mode, (setup, pre, x, observe, at, (own, other)) in modes.items():
+        rewrites = 1 if mode == 'int3-cli' else a.xmc_rewrites
+        c0, lab = asm(f"""xor r9d, r9d
+xor r10d, r10d
+xor r11d, r11d
+xor r12d, r12d
+{setup}
+1: {pre}
+x: {x}
+{observe}
+test r11, r11
+jz 2f
+inc r12
+xor r11d, r11d
+mov qword ptr [{seen:#x}], r10
+cmp rax, r13
+je 2f
+inc r9
+2: inc qword ptr [{ack:#x}]
+mov rax, qword ptr [{flag:#x}]
+cmp rax, r10
+je 4f
+mov r10, rax
+mov r14, rbx
+xor eax, eax
+cpuid
+mov rbx, r14
+mov r13, r10
+and r13, 1
+mov r11d, 1
+4: inc r8
+cmp r12, {rewrites}
+jb 1b""", labels=True)
+        byte = CODE + lab['x'] + at
+        c1 = asm(f"""xor ecx, ecx
+1: mov r8, qword ptr [{ack:#x}]
+2: mov rax, qword ptr [{ack:#x}]
+sub rax, r8
+cmp rax, {XMC_K}
+jae 3f
+pause
+jmp 2b
+3: inc ecx
+mov al, {own:#x}
+test cl, 1
+jz 5f
+mov al, {other:#x}
+5: mov byte ptr [{byte:#x}], al
+mov qword ptr [{flag:#x}], rcx
+cmp ecx, {rewrites}
+jae 9f
+6: cmp qword ptr [{seen:#x}], rcx
+je 1b
+pause
+jmp 6b
+9: nop""")
         for block in (None, 1):
+            # (The `memory` item on X's page makes it writable for the peer, at CPL 3.)
             text = (f'body {CODE:#x} {c0.hex()}\nbody 0x101000 {c1.hex()}\nmemory 0x100800 00\nmemory {DATA:#x} {F80_ONE.hex()}\nregion 0x3e0000 0x10000\n'
-                    f'cpu\nrip {CODE:#x}\nrflags 0x2\ncpl 0\nif 0\n{gprs({8: a.xmc_iterations, 3: DATA})}\n'
-                    f'cpu\nrip 0x101000\nrflags 0x2\n{gprs({1: a.xmc_peer})}\n')
+                    f'cpu\nrip {CODE:#x}\nrflags 0x2\ncpl 0\nif 0\n{gprs({3: DATA})}\n'
+                    f'cpu\nrip 0x101000\nrflags 0x2\n{gprs({})}\n')
             _, out, err = driver(a, text, a.out / 'xmc' / f'{mode}-{block}', [block] if block else [])
             problems = []
             if out is None: problems.append(f'driver: {err}')
             else:
                 c, peer = out['cpus']
-                left = int(c['gpr'][8], 0)
-                bp = c['stop'] == 'guest_fault' and [int(v, 0) for v in c['fault']][:3] == [3, 0, 0] and int(c['fault'][3], 0) == CODE + 1
-                if not (c['stop'] == 'reached' and left == 0) and not (mode == 'int3-cli' and bp):
-                    problems.append(f"vCPU 0 stop {c['stop']} {c['reason']} fault {c['fault']} rip {c['rip']} r8 {left}")
+                g = lambda cpu, r: int(cpu['gpr'][r], 0)
+                iterations, mismatches, checks, done = g(c, 8), g(c, 9), g(c, 12), g(peer, 1)
+                bp = c['stop'] == 'guest_fault' and [int(v, 0) for v in c['fault']][:3] == [3, 0, 0] and int(c['fault'][3], 0) == CODE + lab['x'] + 1
+                if mode == 'int3-cli':
+                    if not bp: problems.append(f"vCPU 0 stop {c['stop']} {c['reason']} fault {c['fault']} rip {c['rip']}: the INT3 was not taken after CPUID")
+                else:
+                    if c['stop'] != 'reached': problems.append(f"vCPU 0 stop {c['stop']} {c['reason']} fault {c['fault']} rip {c['rip']}")
+                    if mismatches: problems.append(f'{mismatches} of {checks} checks ran the old instruction after the serialising CPUID')
+                    if (checks, done) != (rewrites, rewrites): problems.append(f'{checks} checks, {done} rewrites, {rewrites} wanted')
                 if peer['stop'] != 'reached': problems.append(f"vCPU 1 stop {peer['stop']} {peer['reason']}")
-                # The record was rewritten under vCPU 0 and translated again (a record never invalidated decodes once).
-                if c['stats']['decode_exits'] <= 1: problems.append(f"decode exits {c['stats']['decode_exits']}: X never translated again")
-                runs.append({'mode': mode, 'block': block, 'stop': c['stop'], 'bp': bp, 'iterations': a.xmc_iterations - left,
+                runs.append({'mode': mode, 'block': block, 'stop': c['stop'], 'bp': bp, 'iterations': iterations, 'checks': checks,
+                             'mismatches': mismatches, 'rewrites': done,
                              **{k: c['stats'].get(k) for k in ('systems', 'decode_exits', 'steps', 'invalidations')}})
                 print(json.dumps(runs[-1]), flush=True)
             if problems: failures.append(f"xmc {mode} block={block}: {'; '.join(problems)}")
-    if not any(r['bp'] for r in runs if r['mode'] == 'int3-cli'): failures.append('xmc int3-cli: the INT3 never ran (#BP never taken)')
     report['xmc'] = {'runs': runs, 'failures': failures}
     return failures
-
 
 def coherence(a, report):
     """A kept record never outlives the bytes or the mapping it was decoded from (the K2 review's cases). Each case runs
@@ -224,8 +294,7 @@ def main():
     ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence'])
     ap.add_argument('--n', type=int, default=100_000)
     ap.add_argument('--reps', type=int, default=3)
-    ap.add_argument('--xmc-iterations', type=int, default=300_000)
-    ap.add_argument('--xmc-peer', type=int, default=20_000_000)
+    ap.add_argument('--xmc-rewrites', type=int, default=2000, help='xmc: rewrites, each checked (one per XMC_K or more iterations of vCPU 0)')
     ap.add_argument('--host', type=pathlib.Path)
     ap.add_argument('--runtime', type=pathlib.Path)
     a = ap.parse_args()

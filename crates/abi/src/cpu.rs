@@ -31,8 +31,8 @@ pub fn is_mtrr(index: u32) -> bool {
 pub fn msr(index: u32) -> Option<usize> {
     profile::MSRS.iter().position(|m| (m.index..=m.last).contains(&index))
 }
-/// RDMSR is allowed. x2APIC registers are not: they exist only while IA32_APIC_BASE.EXTD = 1, which no write sets
-/// (changes of IA32_APIC_BASE are refused until the LAPIC exists).
+/// RDMSR is allowed. The x2APIC range's entry is not (`owned-by-LAPIC`): the resident's local APIC answers 0x800-0x8ff
+/// before the profile is consulted (X3).
 pub fn read_ok(m: &Msr) -> bool {
     matches!(m.access, access::RO | access::RW)
 }
