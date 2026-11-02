@@ -235,6 +235,35 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 - [ ] Standing suite green; `check_resident_stack.py` passes on the final binary; nothing staged.
 - [ ] Integration handoff page: boot command, manifest inputs, known limits and costs (incl. PTI CR3 flushes).
 
+**R1 coverage (R1a, November 2).** Each §1 row with the R1a composite that exercises it (if any) and the named checks
+that judge it. *1a:* IDT delivery: `r1-demand`, `r1-int3`, `r1-boot` (#UD); `run_slice3_vm.py delivery`. TSS.RSP0/IST:
+`run_x1.py qemu` (no composite; R1b's paranoid NMI). IRETQ, NMI unblocking: every composite's handlers, `r1-poke`'s
+`sync_core`; `run_x1.py`, `events`. #DF classes: `delivery` (X1c matrix). INT3/INT n/UD2: `r1-int3`, `r1-poke`, `r1-boot`;
+`delivery`. LSL paranoid entry: `run_x1.py qemu`, `system` (LSL tables). IF/STI shadow/HLT: `r1-timer`, `r1-serial`;
+`events`. NMI: `events`, `run_x1.py`, `run_x3.py qemu`. xAPIC MMIO: `r1-timer`, `r1-int3`, `r1-serial` (PPR/ISR/IRR/TPR
+reads per delivery); `run_x3.py`. LAPIC timer: `r1-timer`; `run_x3.py timers`. IPIs: `run_x3.py`. Mailbox AP start:
+`run_x4.py`. PIC/PIT/RTC/IOAPIC/PM: `r1-serial` (8259 init, I/O APIC pin 4); `run_l4a.py`, `run_l4b.py`. Idle states:
+`run_l2.py` (no `_CST`/P_BLK), `r1-timer` (HLT idle). *1b:* CPUID: `tools/models/test_cpu_profile.py`, `system`
+(`profile_program`), `run_x4.py trampoline` (`verify_cpu`). MSRs: `r1-boot` (EFER, GS_BASE), `r1-syscall`
+(STAR/LSTAR/FMASK/KERNEL_GS_BASE); `system` (`sys-msr-*`). CR0, CR4: `r1-boot`; `system`. CR2: `r1-demand`; CR8:
+`run_x3.py` (`apic-cr8`). Debug registers: `run_s4.py`. Descriptor tables and segments: `r1-boot` (LGDT, LRETQ, LIDT,
+SGDT/SIDT, null selectors), `r1-syscall` (LTR); `system` (`seg-boot` and the S2b programs). SWAPGS/SYSCALL/SYSRET:
+`r1-syscall`; `system` (`sc-roundtrip`). RDTSC/RDTSCP: `system` (`profile_program`), `run_x3.py timers`. RDRAND:
+`system`, `run_k2.py`. VERW: `r1-syscall`; `system` (syscall_model tables). XSAVE family: `run_i5b.py`, ASM. WBINVD,
+CLFLUSH, PAUSE, HLT: `system` (S3 cache cases), `run_m2.py`; HLT `r1-timer`. Kernel self-modifying code: `r1-poke`;
+`run_k1.py`, `run_k2.py` (XMC), `coherence`, `run_slice2_probes.py`. *1c:* small integer forms: slice-1 corpora, ASM.
+FS/GS overrides: `r1-boot` (%gs:40), `r1-syscall`; I7 corpora. REP strings: `r1-demand` (REP STOSQ faulting at its
+start and midway), `r1-boot`; `run_slice1_faults.py`, ASM. LOCK: `litmus`, `smp` (`lock-counter`), ASM. SSE: ASM, the
+I5a corpora. AVX: `run_i8_faults.py`, the I8 corpora. x87: `run_i6_faults.py`, `run_i6b.py`, ASM `X87_F64`. NOPL:
+`r1-poke` (the NOP5 runs before it is patched); ENDBR64: `run_i10_faults.py` (the `0f 1e` NOPs). *1d:* guest RAM:
+`run_m1.py`. Memory types: `run_m2.py`. MMIO from translated code: `run_m3.py`; `r1-timer`, `r1-serial`. 1 GiB pages:
+`run_slice1_faults.py` (PS in a PDPTE). *1e:* loader: `run_l1.py`, `run_l1_smoke.py`. ACPI tables: `run_l2.py`,
+`run_l2_iasl.py`. Port I/O and the 16550A: `r1-serial`; `run_l3.py`. Legacy island: `run_l4a.py`, `run_l4b.py`.
+Virtual time: the L5 unit tests (`cargo test`), `run_l4b.py clocks`. Shutdown: `run_l4b.py` (S5). **Rows without any
+check:** none. Partial: the decompressor's LA57 probe is not transcribed (CPUID.7.ECX[16] = 0 and CR4.LA57 reserved are
+unit-tested); a CPL 3 -> 0 stack switch, NMI, IPIs and the mailbox start appear in no R1a composite (single vCPU, CPL 0
+start) and are R1b's; the C0 census half of the first checkbox is open.
+
 ## 5. Owner questions and recorded decisions
 
 **Owner decisions (October 28):** kernel = Debian 6.12 (32-bit stays deferred); fetching the Debian kernel,
@@ -3361,6 +3390,46 @@ initramfs line's position and the post-SMP `Memory: … available` figure (varie
 `--stop-at` the vmlinux entry identical but its timing keys. No tamper code, `TestDevice` or `TestSource` in
 `crates/host/src` (grep: only `mem::forget`, doc comments, the compile cache's forged-entry unit test and its `kill(pid,
 0)` liveness check), and `strings target/release/natemu` has no tamper/forge.
+
+*Built (R1a, single-vCPU composites; checks only, no emulator or fexc change, series43-x1, on 3c12567):*
+`tools/run_r1.py r1a` runs seven programs (natemu-smp-v1, CPL 0 start, one vCPU), each chaining features built in
+earlier chunks. Pinned QEMU (the smp stub, COM1 = `-serial file:`) runs each once, natemu at block sizes default and 1;
+natemu must equal QEMU (every GPR, RFLAGS under 0x8d5, every captured region with the TSC field of the delivery logs
+masked, the UART bytes) and both must give the state the SDM fixes for the program (`expect` in the runner), so a
+defect QEMU shared would still fail. **`r1-boot`** (`K kernel/head_64.S:37-405` shape): REP STOSQ of five garbage-filled
+table pages, 4-level tables with the identity map and a kernel map at 0xffffffff80000000 (2 MiB leaves, global),
+CR4 = PAE|PSE|PGE, CR3, an indirect jump into the kernel map, LGDT with a kernel-map base, null DS/SS/ES/FS/GS, the GS
+base onto a per-CPU page and a canary at %gs:40, LRETQ to __KERNEL_CS 0x10, EFER SCE|NX, CR0_STATE (0x80050033), LIDT
+of an early IDT in the kernel map whose #UD handler fixes up a UD2, `push 0; popfq`, a call through the kernel map, then
+back to the identity map: CR0/CR4/CR3/EFER, SGDT/SIDT, CS/SS, the #UD frame (RF = 1) and the canary asserted.
+**`r1-demand`** (decompressor `ident_map_64.c:361-387`, `head64.c:362-366` shape): a #PF handler reads CR2, walks
+from CR3, takes table pages from a garbage-filled pool (zeroing each) and frames in order, maps the 4 KiB page and
+returns; a read needing three tables, a neighbour write (leaf only), a read under a new PDPTE, a fetch (#PF 0x10; the
+frame holds code) and a REP STOSQ faulting at its start and again midway: the fault log (CR2, error code, RIP), the
+A/A+D bits the retried accesses set, every frame and pool page compared. **`r1-int3`** (`int3_selftest`,
+`alternative.c:1829-1855`): the handler matches regs->ip - 1 against `int3_selftest_ip` and stores 1 through RDI; an
+INT3 elsewhere, INT3 with IF = 1, INT 3 (CD 03); frames (CS, RFLAGS, RSP, SS) and the delivery log. **`r1-poke`**
+(`__text_poke`, `alternative.c:2086-2160`): stores through a poking address that only a second table set maps onto the
+code frame (the code page unmapped there), under that CR3, INVLPG of it, CR3 back, `sync_core` (IRETQ to self); a plain
+immediate patch of an already-run block, the `text_poke_bp` order (INT3 first byte and sync; a call meanwhile takes #BP
+and the handler emulates the new instruction; tail and sync; first byte and sync) and a static-call NOP5 -> JMP rel32:
+1, 2, 3 (emulated), 3, 7, 9 and one #BP. **`r1-syscall`** (`entry/entry_64.S:87-166` with PTI): SWAPGS, the user RSP
+to the per-CPU page, CR3 to the kernel tables (user tables = kernel + 0x8000), the kernel stack (kernel tables only), a
+read of a page the user tables do not map and of one that maps to different frames in each; exit: user CR3, SWAPGS,
+VERW of __KERNEL_DS, SYSRETQ; three round trips, VERW at CPL 3 (0x10: ZF 0; 0x1b: ZF 1), a last call ending the
+program at CPL 0. **`r1-timer`**: the xAPIC one-shot timer waking `sti; hlt` four times (frame RIP after the HLT,
+current count 0), an expiry pending with IF = 0 taken after STI's shadow, a masked expiry never pending.
+**`r1-serial`**: 8250 THRE transmit driven by IRQ4 through I/O APIC pin 4 (edge, 44H): IER = 2, the handler reads IIR
+and writes the next byte or clears IER; the main line halts until done: 43 deliveries for 42 bytes, IIR 02H in each,
+the bytes equal to QEMU's file. **Results** (`natemu-raw/r1-20261102-01/`): 7 of 7 match QEMU and the SDM expectations
+at both block sizes; five further repeats 7 of 7. **Negative controls** (natemu run on a wrong variant against the
+correct program's QEMU state; each must be flagged, and is): LRETQ to 0x08 (CS differs), leaves one frame too far (every
+load differs), regs->ip compared without the INT3's length (the selftest value stays 0), the poking address onto another
+frame (stale bytes run: 1, 1, 1 and no #BP), no switch to the user CR3 on exit (the user sees the kernel's frame), the
+handler stopping one byte early (UART, count, IIR log); for `r1-timer` QEMU's expected log mutated to wake RIPs at the
+HLT itself. **Program note:** an undefined flag must not reach compared state: XOR and SHR leave AF undefined, and natemu
+(default block size) sets it where QEMU clears it; `r1-boot` therefore writes its gate before `popfq` and zeroes R14
+with MOV (not an emulator defect). No emulator defect found.
 
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 
