@@ -1019,7 +1019,7 @@ first pass ACCEPT (its non-blocking findings taken); the second found the host's
 code and the step's system reply (P1), both fixed as above. **Not built:** RMW, string, vector and LOCK forms on device pages
 and crossing accesses (typed stops; Linux's device paths use none), an MMIO rule for unassigned pages, a resident device
 (`mmio::local` is X3's), a relocatable or mutable registry (M1/X3).
-**I5c (recorded, not built; the I5a review's design): unmasked SIMD exceptions.** Hardware FP traps are not used although
+**I5c (recorded; the I5a review's design, Built (I5c) below): unmasked SIMD exceptions.** Hardware FP traps are not used although
 the M4 has them (the review's probe: FPCR's trap enables stick and a trapped divide by zero is a synchronous exception, EC
 0x2C): a trap reports one Arm operation's exceptions, while x86 delivers #XM (#UD without CR4.OSXMMEXCPT) for the whole
 instruction, before writing its destination, with the flags of every element and x86's precedence; FEX lowers one x86
@@ -1116,8 +1116,8 @@ class the owner accepted, every other one listed):**
 (FPATAN 22, FSCALE 9, FYL2XP1 8, F2XM1 5, FPREM 4, FYL2X 4, FPREM1 1: 53 initramfs sites, none in the kernel; FEX's helpers
 need resident or native implementations); FXTRACT (3, a denormal-aware split); FBLD/FBSTP (0 in the census); FFREEP (DF C0+i,
 an undocumented alias: 3); MMX (the x87 registers as MM0..7: 1,381 initramfs sites and 1 kernel site, filed under SSE by the census); unmasked x87 exceptions
-(#MF: the I5c-style design applies, blocks keyed by FCW's masks with per-instruction FPSR checks; FLDCW/FLDENV/FRSTOR refuse
-them today, 160 + 44 + 0 initramfs sites take the transaction); FIP/FDP (0 in images); FLD/FSTP m80 as resident round
+(#MF: built since I5c, Built (I5c); before it FLDCW/FLDENV/FRSTOR refused
+them, 160 + 44 + 0 initramfs sites take the transaction); FIP/FDP (0 in images); FLD/FSTP m80 as resident round
 trips (2,411 FLD m80 and 1,098 FSTP m80 initramfs sites): a loop of FLD m80 + FSTP m80 takes 11.4 us per iteration against
 under 0.1 us for FLD/FSTP m64, because every system instruction is a host request for its decode today (a resident decode
 cache, L5, or native 80-bit conversions would remove it) (K2: 0.5 us per pair, no host exit; Built (K2)).
@@ -2482,8 +2482,8 @@ one straight run each, against QEMU 7.2; the PCMPISTRI run is byte-checked but n
 `unannotated`, as QEMU's in_asm log garbles an instruction crossing 1 KiB of a translation block): 5/5 at block sizes default
 and 1. **PDEP cost:** the expand above; the corpus's PDEP cases and the reviewer's 28 masks (`rv-bmi2`, stc/clc, 32/64) match.
 **Other fixes:** the dead F3 branch of the MOVBE #UD cut is gone (fexc never sees a ModRM there); the WRSS/WRUSS encodings are
-named right; `run_i9_faults.py` gains SDM-judged cases (586 now): CVTPI2PS/CVTPI2PD m64 leave TOP and the tags (no MMX
-transition; QEMU 7.2 enters MMX for them), the register forms, CVTPS2PI, CVTTPD2PI m128 and MOVQ2DQ set TOP 0 and tags FFH, EMMS
+named right; `run_i9_faults.py` gains SDM-judged cases (586 now): CVTPI2PD m64 leaves TOP and the tags (no MMX
+transition; corrected for CVTPI2PS m64 by the I9 addendum below), the register forms, CVTPS2PI, CVTTPD2PI m128 and MOVQ2DQ set TOP 0 and tags FFH, EMMS
 empties them; MMX shifts by register and imm8 counts 0..63, 64, 255 and 2^32 + 1 for all eight forms against the SDM rule.
 **Record:** the three `MMX_GATED` hunks (`crates/abi/src/execution.rs` the kind and its `well_formed` arm, `crates/runtime/src/
 execution.rs` the #UD/#NM arm, `crates/host/src/execution.rs` the `cut_gated: "mmx"` mapping) landed in commit f4ec290 (K1's).
@@ -3109,6 +3109,81 @@ type runs as coherent write-back, UC's strong ordering not kept; Built (M2)) is 
 or UC- are not accessed natively by translated code running on: every access traps and is made in the resident's control
 with the barriers strong ordering requires (SDM Vol.3 11.2.5, 14.3), with permission, #PF, CPL and data-breakpoint checks
 unchanged; WC, WT, WP and WB stay native. Built: M2 addendum 2.
+
+*Built (I5c, unmasked floating-point exceptions; owner decision 3 of October 30; fexc series39-i5c = series36 + patch 0026 + shim changes; one independent review, its four blocking findings fixed below):*
+**Design (the recorded one, kept).** Hardware FP traps stay unused (FPCR's enables clear). Code is keyed by the unmasked
+sets (`Cpu::code_context` bits 18..23 MXCSR's, DE left out under DAZ, bits 24..29 FCW's: `simd_unmasked`, `x87_unmasked`);
+the host passes them as fexc's `--simd-unmasked` / `--x87-unmasked` only when nonzero (both gating arguments of the compile
+cache key, `GATING` = 8). Every mask change is a resident transaction that ends its block (LDMXCSR, VLDMXCSR, FXRSTOR,
+XRSTOR, FLDCW, FLDENV, FRSTOR, FNINIT, FNSAVE, FNSTENV): the refusals are gone. With every exception masked, as Linux
+runs, nothing is emitted: 12,252 blocks of the I5a/I6/I6b/I8/I9/I10 corpora and seed 4242 compile byte-identical (code,
+sites, PC table) under series36 and series39-i5c. **SIMD (#XM; SDM Vol.1 11.5, Vol.3 event 19).** Patch 0026's
+`FexcSimdCheck`, placed by `FexcPrecision::PlaceFPChecks` right before an instruction's first committing op, after all its
+floating-point ops (a fault point: no value is coalesced into a static register across it, so the stub sees the state
+before the instruction; COMISS's NZCV through the pre-NZCV save): `mrs x0, fpsr; movz w1, #M; and; cbnz w1, S` to a `brk #5`
+stub (kind 15 `simd`), else the flags move into the SIMD flag byte (FEX's unused flag byte 33, `frame::SIMD_FLAGS`, banked
+into MXCSR at every resident entry, cleared at `enter`) and `msr fpsr, xzr`, so FPSR holds one instruction's flags at every
+check. The resident (`fp_exception`, `sse::exception`) sets MXCSR by the SDM's steps (11.5.3.2/3, `simd_fault_flags`): an
+unmasked pre-computation exception (IE, ZE, DE) in any element sets the pre-computation flags only; else every element's
+flags, masked ones included; then #XM, or #UD without CR4.OSXMMEXCPT (flags still set). Exact tiny results: x86 reports UE
+for a nonzero tiny result whether or not exact when UE is unmasked (4.9.1.5, 11.5.2.5), Arm's UFC only when inexact, so
+under an unmasked UE each result lane of an op that can underflow (arithmetic, FMA, narrowing conversions, VCVTPS2PH's
+upper half `VFCVTN2`) is tested for a nonzero zero-exponent value; FTZ is ignored then (10.2.3.3: `fpcr` sets FZ only with
+UM). DPPS/DPPD: a check after every multiply and add step in order (DPPS "in the order of their execution"; VFAddV's first
+level checks itself). VDPPS ymm: the SDM orders the steps of one dot product, not the two halves (unspecified); natemu
+runs the low half's first, and the test accepts either order. **x87 (#MF; Vol.1 8.5-8.7, Vol.3 event 16).** The
+instruction's ops collect their flags in a pending byte (flag byte 34, folded into the exception word at the instruction's
+end by the stack pass, dropped at `enter`); `FexcX87Check` compares them and the stack pass's stack-fault, overflow,
+invalid-operand (FIST's NaN/out of range, FST m64's SNaN) and exact-tiny (FST m64) bits against the exceptions that leave
+the operands unaltered: IE (stack faults included), DE, ZE, and OE/UE for FST/FSTP m32/m64. A hit reaches a `brk #7` stub
+(kind 16 `x87`, width the instruction's length; `x87_fault_flags`): only the flags (a stack fault IE SF C1; an aborted store
+OE or UE without PE and C1 = 0) are set and the instruction is done (RIP + length, RF/TF as a completed instruction). PE,
+and OE/UE to a register, store the result. ES and B derive from the flags and FCW (`fsw_summary`; FNSTSW in code, FNSTENV,
+FNSAVE, FXSAVE, XSAVE images). Every waiting instruction (all admitted x87 forms but FNSTSW/FNSTCW, WAIT, every MMX-register
+form but CVTPI2PD xmm, m64) starts with the FSW test to a `brk #8` stub (kind 17 `pending`): #MF at it with CR0.NE; the
+resident's waiting transactions (FLDCW, FLDENV, FRSTOR, FLD/FSTP m80, after #NM, before memory) the same; FNINIT, FNCLEX,
+FNSTENV (which then masks every exception, SDM FNSTENV), FNSAVE, FXSAVE/FXRSTOR, XSAVE/XRSTOR ignore a pending exception.
+Helper forms (`svc #X87`): an unmasked stack fault, IE or ZE leaves the operands. (`brk #6` is the resident's stop word.)
+**CR0.NE = 0 (decision): a typed stop `unsupported_ferr`** at the waiting instruction, the state there. The SDM's MS-DOS
+compatibility mode reports through FERR#, the PIC's IRQ13, port F0H and IGNNE# (8.7.2, Appendix D), freezes before the
+waiting instruction, asserts FERR# at the faulting or the waiting instruction "depending on the type of processor", and
+"limits newer processors to operate with one logical processor active"; this board wires neither FERR# nor IGNNE#, so the
+processor would freeze there for ever: the stop is that outcome, made visible. **Admission:** the stubs are address-free
+(`addressless`), the x87 one's width must equal its instruction's length; the code shape checks each check sequence word
+for word (`fp_checks`). **Checks:** `tools/run_i5c.py` (SDM expectations; QEMU 7.2 raises no #XM, delivers #MF only at
+FWAIT and pops/writes on unmasked ZE: probed, `natemu-raw/i5c-qemu-20261102/`), 236 cases at block sizes default and 1, all as
+expected: 47 SSE/AVX/FMA/F16C forms masked, with each raised flag unmasked and with the others unmasked; multi-element
+precedence (SDM Figure 11-9 included); exact tiny, FTZ, DAZ; DPPS/VDPPS steps; YMM; RCPPS's FPSR not leaking; #UD without
+OSXMMEXCPT; LDMXCSR/VLDMXCSR/FXRSTOR/XRSTOR re-keying; #MF at 18 kinds of waiting instruction; the non-waiting ones;
+aborted IE/DE/ZE, stack faults (resident m80 forms included), FST/FIST stores, PE/OE stores, FLDCW/FLDENV unmasking a set
+flag, helpers, a #PF after a passed check (FSW unchanged), TF over an aborted instruction, CR0.NE = 0. Compile sweep: every
+block of the seven FP corpora under five unmasked sets (417,590 instructions), no compile failure. The I5a/I5b/I6/I8 refusal
+cases now expect the load. Standing suite (series39-i5c) green but the 7 recorded I8 two-NaN QEMU departures; FEX ASM 1,870 pass, 0 fail, 48 precision deviations. **Negative controls:** HEAD 5d7f62e's binaries with series36: 236 of 236 red (the driver takes no unmasked `mxcsr` nor `ne`); this build with the host passing no unmasked set (no checks compiled): 127 red, exactly the cases expecting #XM/#UD/#MF/an abort, the 109 masked and no-fault ones green. **Cost** (a loop of ADDPS, MULPS, FLD/FADD/FSTP m64; and XOR + CPUID, a resident entry and block entry per iteration; 2.2 M minus 0.2 M iterations, best of 3, two rounds): every exception masked, HEAD 21.7 and 21.9 ns, I5c 21.6 and 21.7 ns per FP iteration, CPUID 537.7/540.7 against 533.9/536.1 ns: no measurable change (the generated code is identical; the resident adds two byte stores at `enter` and one byte load per entry). Every exception unmasked: 41.4 ns per FP iteration (the checks, the flag fold, the pending tests).
+**Deviations (new, the reduced-precision class):** (1) a register-destination OE/UE with the exception unmasked stores the
+double's masked result (no 2^24576-biased exponent, no round-up C1); (2) I6's deviations 1 and 4 (OE, UE and DE detected at
+the double's range: `1e300 * 1e300` overflows, a result below the double's normal range underflows, a double denormal is a
+denormal operand, where an 80-bit x87 holds all of these as normal values) now become exception differences when OM, UM or
+DM is clear: FMUL 1e300 * 1e300 with OM clear, or a double-denormal result with UM clear, reaches #MF where x86 raises
+nothing; x87 arithmetic, FST m32 or FCOMI on a double denormal with DM clear aborts the instruction and reaches #MF; (3)
+FIP/FDP stay 0 (deviation 8), so an #MF handler cannot locate the faulting instruction from the image; (4) a masked stack
+fault drops the operation's own flags (x86's precedence, SDM Vol.1 4.9.2) only with x87 exceptions unmasked; with every
+exception masked those flags are still ORed in as before (the old departure, kept so the masked path is unchanged).
+
+*Built (I9 addendum, CVTPI2PS m64's MMX transition; fexc series40-i5c-add = series39-i5c + patch 0027):* the SDM's CVTPI2PD page exempts only "operands xmm, m64" from the x87-to-MMX transition; CVTPI2PS's page gives the transition (TOP = 0, every tag valid; a pending x87 exception handled first) with no operand exception, for `mm/m64` alike. I9 had read the CVTPI2PD sentence into CVTPI2PS: FEX made the transition only when an operand is an MMX register, so CVTPI2PS xmm, m64 left TOP and the tags. Patch 0027 makes it for every CVTPI2PS (at the instruction's end, as every MMX form since patch 0024). The whole MMX/SSE interop list was probed (TOP and tags after FNINIT; FLD1; the form): CVTPI2PS m64 was the only wrong one; CVTPI2PD m64 makes none, and CVTPI2PS/PD mm, CVT(T)PS2PI and CVT(T)PD2PI (register and memory sources), MOVQ2DQ, MOVDQ2Q, MOVNTQ, MOVD/MOVQ m, mm, PEXTRW, PMOVMSKB, PADDB/PSHUFW/PALIGNR with m64 sources make it. **Checks:** `run_i9_faults.py` `state-cvtpi2ps-m` now expects TOP 0 and tags FFH: red with series36 (HEAD) and series39-i5c, green with series40-i5c-add; 586 cases at block sizes default and 1, the I9 corpus 120/120 against QEMU 7.2 (which makes the transition there too) at both sizes, `run_i5c.py` 236 and `run_i6_faults.py` 275 as expected; of 8,131 corpus blocks compiled by series39-i5c and series40-i5c-add only the two holding a CVTPI2PS m64 differ.
+
+*Built (I5c review round; fexc series42-i5c = series40-i5c-add + patch 0028; one independent review, two blocking and
+three should-fix findings, all taken):* (1) FST/FSTP m64 with UE unmasked took +-DBL_MIN, a normal double, for an exact
+tiny result (an off-by-one in the stack pass's flag-free test) and stored nothing: the test is now magnitude nonzero and
+exponent field zero; every other boundary test (`FexcTinyLanes`) was checked and has the form already. (2) CVTPS2PI and
+CVTTPS2PI mm, xmm converted all four floats of the XMM register (FEX's 128-bit `.4s` conversion), so the upper two raised
+MXCSR flags (an I9 bug when masked, a spurious #XM when unmasked): they convert the low 64 bits as the m64 form does. A sweep
+of every register-source form reading fewer lanes than its Arm op could touch (the scalar SS/SD forms of SSE, AVX and FMA,
+CVTSS2SD, CVTSD2SS, CVTPS2PD, VCVTPS2PD, CVTDQ2PD, CVTSS2SI, CVTSD2SI, ROUNDSS/SD, RCPSS, VCVTPH2PS, CVT(T)PS2PI) with
+SNaNs in the unread lanes and every exception masked found no other flag leak. (3)-(5) the deviation wording and the
+VDPPS order above. **Checks:** `run_i5c.py` gains the review's 19 cases (VCVTPS2PH's upper lanes one by one, FMA inf * 0 +
+QNaN, VCVTPH2PS/VCVTPS2PH denormals, CVT(T)PS2PI's upper lanes masked and unmasked, FST m64 +-DBL_MIN and a negative
+denormal, FST m32 FLT_MIN and an exact float denormal, FISTTP/FISTP invalid): the DBL_MIN and CVT(T)PS2PI ones red with
+series40-i5c-add, all green with series42-i5c.
 
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 

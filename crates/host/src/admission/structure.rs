@@ -41,6 +41,11 @@
 //! - Division: each div/idiv (from its x86 opcode: width, signedness) has exactly its per-width #DE checks, in their
 //!   exact form, before FEX's divide, reading that divide's own divisor (and, at 8 bits, dividend) registers; the
 //!   128/64 division is followed by `cbnz x2, D`.
+//! - Floating-point exceptions (I5c): a SIMD stub is reached by exactly `mrs x0, fpsr; movz w1, #M; and w1, w0, w1; cbnz w1`
+//!   followed by the flags' move into the SIMD flag byte and `msr fpsr, xzr`; an x87 stub by the pending byte with the
+//!   operands' bits (`ldrb w0; sub w1, wF, #1; and w0, w0, w1; orr w0, w0, wR, lsl #8..11; movz w1, #M; and w1, w0, w1;
+//!   cbnz w1`); a pending stub by the FSW flags' test at its instruction's first word. (Which instructions need one is the
+//!   producer's table, as for alignment.)
 //! - Every stub is reached by exactly one branch, which is one of the checks above, and no branch enters a check's
 //!   window (from the check's first word to the access, exit or divide) from before it.
 //!
@@ -417,6 +422,7 @@ pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>), String> {
         v.sites()?;
         v.branch_target()?;
         v.divisions()?;
+        v.fp_checks()?;
         if let Some(i) = v.claimed.iter().position(|&ok| !ok) {
             return Err(format!("stub at {:#x} is reached by no check of its kind", c.stubs[i].native_offset));
         }
@@ -1184,6 +1190,77 @@ impl<'a> Verifier<'a> {
             if self.division_svc(at) && !found.iter().any(|f| f.1 == DivCheck::Verdict && f.2 == at) {
                 return Err(format!("division svc at {at:#x} without its division's #DE verdict"));
             }
+        }
+        Ok(())
+    }
+}
+
+/// `ldrb|ldr wT, [x28, #at]` (unsigned offset).
+const fn ldr_state(size: u32, t: u32, at: u32) -> u32 {
+    (if size == 1 { 0x3940_0000 } else { 0xb940_0000 }) | (at / size) << 10 | 28 << 5 | t
+}
+const MOVZ_W1: u32 = 0x5280_0001; // movz w1, #imm16 (imm16 << 5)
+const AND_W1_W0_W1: u32 = 0x0a01_0001;
+const AND_W0_W0_W1: u32 = 0x0a01_0000;
+impl Verifier<'_> {
+    /// Code shape (I5c): each floating-point exception stub is reached by its exact check.
+    fn fp_checks(&mut self) -> Result<(), String> {
+        use object::kind::*;
+        for i in 0..self.c.stubs.len() {
+            let (st, c) = (self.c.stubs[i], self.checks[i]);
+            if !matches!(st.kind, SIMD | X87 | PENDING) {
+                continue;
+            }
+            let at = st.native_offset;
+            let fail = || Err(format!("floating-point stub at {at:#x}: its branch is not its exact check"));
+            // The compared bits: FPSR's flags (IOC DZC OFC UFC IXC IDC), for x87 also its operand bits 11:8.
+            let mask = |w: u32, bits: u32| w & 0xffe0_001f == MOVZ_W1 && w >> 5 & 0xffff != 0 && w >> 5 & !bits & 0xffff == 0;
+            let words = |n: u32| (c.start >= 4 * n).then(|| (0..n).map(|k| self.word(c.start - 4 * (n - k))).collect::<Vec<_>>());
+            let insn = self.instruction(c.start).filter(|&(g, _)| g == st.guest_offset);
+            let start = match st.kind {
+                SIMD => {
+                    let after = [ldr_state(1, 1, frame::SIMD_FLAGS), 0x2a00_0021, ldr_state(1, 1, frame::SIMD_FLAGS) & !(1 << 22), 0xd51b_443f];
+                    let ok = c.cond == Some(CBNZ_W | 1)
+                        && words(3).is_some_and(|w| w[0] == 0xd53b_4420 && mask(w[1], 0x9f) && w[2] == AND_W1_W0_W1)
+                        && after.iter().enumerate().all(|(k, &w)| self.word(c.end + 4 + 4 * k as u32) == w);
+                    if !ok {
+                        return fail();
+                    }
+                    c.start - 12
+                }
+                X87 => {
+                    let ok = c.cond == Some(CBNZ_W | 1)
+                        && words(9).is_some_and(|w| {
+                            let f = w[1] >> 5 & 31;
+                            w[0] == ldr_state(1, 0, frame::X87_PENDING)
+                                && w[1] & 0xffff_fc1f == 0x5100_0401
+                                && f < 31
+                                && w[2] == AND_W0_W0_W1
+                                && w[3] == 0x2a00_2000 | f << 16
+                                && (4..7).all(|k| w[k] & 0xffe0_ffff == 0x2a00_0000 | (k as u32 + 5) << 10)
+                                && mask(w[7], 0xf9f)
+                                && w[8] == AND_W1_W0_W1
+                        });
+                    if !ok {
+                        return fail();
+                    }
+                    c.start - 36
+                }
+                _ => {
+                    let want = [ldr_state(1, 0, frame::X87_IE), ldr_state(1, 1, frame::X87_PE), 0x2a01_1000, ldr_state(4, 1, frame::X87_EXCEPTIONS), 0x2a01_0000];
+                    let ok = c.cond == Some(CBNZ_W)
+                        && words(7).is_some_and(|w| w[..5] == want && mask(w[5], 0x9f) && w[6] == AND_W0_W0_W1)
+                        && insn.is_some_and(|(_, lo)| lo == c.start - 28);
+                    if !ok {
+                        return fail();
+                    }
+                    c.start - 28
+                }
+            };
+            if insn.is_none_or(|(_, lo)| start < lo) || !self.sealed(start, c.end, c.end + 4) {
+                return fail();
+            }
+            self.claimed[i] = true;
         }
         Ok(())
     }

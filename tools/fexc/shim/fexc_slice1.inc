@@ -25,7 +25,8 @@ enum Kind : uint8_t { ALLOW, SYSTEM, UNSUPPORTED };
 // FMA/F16C form, gated by CR4.OSXSAVE, XCR0[2:1] and CR0.TS; `align32`: its 32-byte memory operand must be 32-byte aligned.
 // `mmx` (I9): an MMX form on MM registers only (gated by CR0.EM: #UD, and CR0.TS: #NM; not by CR4.OSFXSR).
 struct Verdict { Kind kind; bool branch; const char* why; bool simd = false; bool align = false; uint8_t x87 = 0; bool gated = false;
-                 bool avx = false; bool align32 = false; bool mmx = false; bool ud = false; };
+                 bool avx = false; bool align32 = false; bool mmx = false; bool ud = false; bool mmreg = false; };
+// `mmreg` (I5c): an instruction on MMX registers (MMX, EMMS, CVTPI2PS and the like): #MF for a pending x87 exception first.
 
 inline Verdict Allow(bool branch = false) { return {ALLOW, branch, ""}; }
 inline Verdict Sys(const char* why) { return {SYSTEM, false, why}; }
@@ -330,7 +331,7 @@ inline Verdict Mmx(uint8_t map, uint8_t pfx, uint8_t op, bool has_modrm, uint8_t
       pure = true;
     else if (op == 0xc5 || op == 0xd7) pure = reg_only = true;                  // pextrw, pmovmskb
     else if (op == 0xe7) pure = mem_only = true;                                // movntq
-    else if (op == 0x77) return [] { Verdict v = Allow(); v.mmx = true; return v; }();   // emms
+    else if (op == 0x77) return [] { Verdict v = Allow(); v.mmx = v.mmreg = true; return v; }();   // emms
     else if (op >= 0x71 && op <= 0x73) {                                        // psrl/psra/psll mm, imm8 (0f 73: /2 and /6 only)
       if (!(has_modrm && mod == 3 && (reg == 2 || reg == 6 || (op != 0x73 && reg == 4)))) return Ud("MMX shift group encoding x86 makes #UD");
       pure = reg_only = true;
@@ -351,6 +352,9 @@ inline Verdict Mmx(uint8_t map, uint8_t pfx, uint8_t op, bool has_modrm, uint8_t
   Verdict v = Allow();
   v.mmx = pure;
   v.simd = mixed;
+  // I5c: #MF for a pending x87 exception first, but CVTPI2PD xmm, m64 ("does not cause a transition to MMX technology and does
+  // not take x87 FPU exceptions", SDM CVTPI2PD).
+  v.mmreg = !(pfx == 0x66 && op == 0x2a && mod != 3);
   v.align = align && mod != 3;
   return v;
 }
@@ -829,6 +833,17 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
     if (lock_neg) fexc_after_rep = rip + d.InstSize;
     if (v.align) (v.align32 ? fexc_align32 : fexc_align16).insert(rip);   // I5a/I8: its first access gets the alignment check (#GP(0))
     FexcMmioRecord(d, rip);                  // M3: completion record of a MOV-family device access
+    // I5c: the waiting instructions (all but FNSTSW and FNSTCW of the admitted x87 forms; WAIT; MMX-register forms), the
+    // FST/FSTP m32/m64 stores and the x87 instructions' lengths.
+    if (v.x87 == 2 || v.mmreg) fexc_x87_waiting.insert(rip);
+    if (v.x87 == 1) {
+      const uint8_t m = d.ModRM, r = (m >> 3) & 7;
+      const bool memory = (m >> 6) != 3;
+      const bool nowait = (memory && (op == 0xD9 || op == 0xDD) && r == 7) || (op == 0xDF && m == 0xE0);   // fnstcw, fnstsw m16 / ax
+      if (!nowait) fexc_x87_waiting.insert(rip);
+      if (memory && (op == 0xD9 || op == 0xDD) && (r == 2 || r == 3)) fexc_x87_store.insert(rip);
+      fexc_x87_length[rip] = uint8_t(d.InstSize);
+    }
     if (v.x87 == 1) {   // I6: FSW exception flags from FPSR, the x87 FPCR; FCOM forms and FTST signal, FIST/FRNDINT raise PE
       const uint8_t m = d.ModRM, r = (m >> 3) & 7;
       fexc_x87.insert(rip);

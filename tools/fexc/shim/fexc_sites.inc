@@ -149,13 +149,157 @@ void Arm64JITCore::FexcX87End() {
   if (fexc_x87_fpcr) msr(ARMEmitter::SystemRegister::FPCR, TMP3);
   mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
   msr(ARMEmitter::SystemRegister::FPSR, TMP4);
+  if (fexc_x87_unmasked) {
+    // I5c: under unmasked x87 exceptions the instruction's flags gather in FEXC_X87_PENDING, which its check reads and the x87
+    // stack pass folds into the exception word at its end (so a fault or check stub inside it leaves FSW unchanged).
+    ldrb(TMP2.W(), STATE, FEXC_X87_PENDING);
+    orr(ARMEmitter::Size::i32Bit, TMP2, TMP2, TMP1);
+    strb(TMP2.W(), STATE, FEXC_X87_PENDING);
+    return;
+  }
   ldr(TMP2.W(), STATE, FEXC_X87_EXCEPTIONS);
   orr(ARMEmitter::Size::i32Bit, TMP2, TMP2, TMP1);
   str(TMP2.W(), STATE, FEXC_X87_EXCEPTIONS);
 }
 
+// ---------------------------------------------------------------------------------------------
+// I5c: unmasked floating-point exceptions (FexcPrecision::PlaceFPChecks places the check ops). Each check is a fault point:
+// at its stub the guest state is the state before the instruction (no static register written, the incoming NZCV in PSTATE
+// or x25), so the resident delivers or completes from the bank exactly as at an access site. Only x0/x1 are written.
+//   SIMD   mrs x0, fpsr; movz w1, #M; and w1, w0, w1; cbnz w1, S      (M: the FPSR bits of the unmasked MXCSR exceptions)
+//          ldrb w1, [x28, #simd_flags]; orr w1, w1, w0; strb w1, [x28, #simd_flags]; msr fpsr, xzr
+//   x87    ldrb w0, [x28, #x87_pending]; sub w1, wF, #1; and w0, w0, w1 (a stack fault drops the operation's flags: it has
+//          precedence, SDM Vol.1 4.9.2); orr w0, w0, wF, lsl #8; orr w0, w0, wO, lsl #9; orr w0, w0, wI, lsl #10;
+//          orr w0, w0, wT, lsl #11; movz w1, #M; and w1, w0, w1; cbnz w1, X
+//   #MF    (at a waiting instruction's start) ldrb w0, [x28, #ie]; ldrb w1, [x28, #pe]; orr w0, w0, w1, lsl #4;
+//          ldr w1, [x28, #exceptions]; orr w0, w0, w1; movz w1, #M; and w0, w0, w1; cbnz w0, P
+// ---------------------------------------------------------------------------------------------
+void Arm64JITCore::FexcSimdCheckWords(uint32_t Mask) {
+  mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
+  movz(ARMEmitter::Size::i32Bit, TMP2, Mask);
+  and_(ARMEmitter::Size::i32Bit, TMP2, TMP1, TMP2);
+  cbnz_OrRestart(ARMEmitter::Size::i32Bit, TMP2, FexcStub(FEXC_SITE_SIMD, false));
+  ldrb(TMP2.W(), STATE, FEXC_SIMD_FLAGS);
+  orr(ARMEmitter::Size::i32Bit, TMP2, TMP2, TMP1);
+  strb(TMP2.W(), STATE, FEXC_SIMD_FLAGS);
+  msr(ARMEmitter::SystemRegister::FPSR, ARMEmitter::XReg::zr);
+}
+DEF_OP(FexcSimdCheck) {
+  FexcSimdCheckWords(IROp->C<IR::IROp_FexcSimdCheck>()->Mask);
+}
+// DPPS's first add level, between VFAddV's two `faddp` (SDM DPPS: "Exceptions are determined separately for each add and
+// multiply operation, in the order of their execution"; the multiply has its own check op, PlaceFPChecks): the two sums'
+// exact-tiny test and their check. Nothing of the instruction is committed yet, so the state before it holds here too.
+void Arm64JITCore::FexcSimdStep(ARMEmitter::VRegister R) {
+  if (!fexc_simd_checked.count(Entry + FexcGuest)) return;
+  FexcTinyLanes(R, 4, 2, uint64_t(fexc_simd_unmasked));
+  uint32_t Mask = 0;
+  constexpr uint32_t Arm[6] = {1, 1u << 7, 2, 4, 8, 16};
+  for (int b = 0; b < 6; ++b) if (fexc_simd_unmasked >> b & 1) Mask |= Arm[b];
+  FexcSimdCheckWords(Mask);
+}
+DEF_OP(FexcX87Check) {
+  const auto Op = IROp->C<IR::IROp_FexcX87Check>();
+  ldrb(TMP1.W(), STATE, FEXC_X87_PENDING);
+  sub(ARMEmitter::Size::i32Bit, TMP2, GetReg(Op->Fault), 1);
+  and_(ARMEmitter::Size::i32Bit, TMP1, TMP1, TMP2);
+  orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, GetReg(Op->Fault), ARMEmitter::ShiftType::LSL, 8);
+  orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, GetReg(Op->Overflow), ARMEmitter::ShiftType::LSL, 9);
+  orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, GetReg(Op->Invalid), ARMEmitter::ShiftType::LSL, 10);
+  orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, GetReg(Op->Tiny), ARMEmitter::ShiftType::LSL, 11);
+  movz(ARMEmitter::Size::i32Bit, TMP2, Op->Mask);
+  and_(ARMEmitter::Size::i32Bit, TMP2, TMP1, TMP2);
+  const auto it = fexc_x87_length.find(Entry + FexcGuest);
+  if (it == fexc_x87_length.end()) ERROR_AND_DIE_FMT("fexc slice1 (I5c): an x87 check outside an x87 instruction");
+  auto* L = FexcStub(FEXC_SITE_X87, false);
+  fexc_sites.back().width = it->second;
+  cbnz_OrRestart(ARMEmitter::Size::i32Bit, TMP2, L);
+}
+// The #MF check at the start of a waiting x87, WAIT or MMX instruction (SDM Vol.1 8.7.1): an exception flag whose mask is clear
+// is pending (FSW.ES). FSW's flags: FEX's IE byte, its PE byte and the exception word (FPSR order).
+void Arm64JITCore::FexcPendingCheck() {
+  const uint64_t M = fexc_x87_unmasked;
+  if (!M) return;
+  constexpr uint32_t Arm[6] = {1, 1u << 7, 2, 4, 8, 16};
+  uint32_t Mask = 0;
+  for (int b = 0; b < 6; ++b) if (M >> b & 1) Mask |= Arm[b];
+  ldrb(TMP1.W(), STATE, offsetof(FEXCore::Core::CPUState, flags) + FEXCore::X86State::X87FLAG_IE_LOC);
+  ldrb(TMP2.W(), STATE, offsetof(FEXCore::Core::CPUState, flags) + FEXCore::X86State::X87FLAG_PE_LOC);
+  orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, TMP2, ARMEmitter::ShiftType::LSL, 4);
+  ldr(TMP2.W(), STATE, FEXC_X87_EXCEPTIONS);
+  orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, TMP2);
+  movz(ARMEmitter::Size::i32Bit, TMP2, Mask);
+  and_(ARMEmitter::Size::i32Bit, TMP1, TMP1, TMP2);
+  cbnz_OrRestart(ARMEmitter::Size::i32Bit, TMP1, FexcStub(FEXC_SITE_PENDING, false));
+}
+// I5c: x86 reports an unmasked underflow for a tiny result whether or not it is exact (SDM Vol.1 4.9.1.5, 11.5.2.5); Arm's FPSR.UFC
+// (untrapped) only for a tiny inexact one. Under an unmasked UE (FPCR.FZ is then clear: MXCSR.FTZ is ignored) an exact tiny
+// result is a nonzero denormal: after each op of a checked instruction that can underflow, every result lane is tested
+// (flag-free: t = lane << (65 - bits) drops the sign; t != 0 and t's exponent field zero) and a hit sets FPSR.UFC. SSE/AVX arithmetic, FMA and narrowing
+// conversions; x87: FST m32's narrowing (FST m64's test is the stack pass's, register results have the double's range only).
+void Arm64JITCore::FexcTinyCheck(const IR::IROp_Header* IROp, IR::Ref Node) {
+  using IR::IROps;
+  const uint64_t Rip = Entry + FexcGuest;
+  const bool X87 = fexc_x87.count(Rip) != 0;
+  if (X87 ? !fexc_x87_store.count(Rip) : !fexc_simd_checked.count(Rip)) return;
+  uint32_t Elem = IR::OpSizeToSize(IROp->ElementSize), Lanes = 0, First = 0;
+  switch (IROp->Op) {
+  case IROps::OP_VFADD: case IROps::OP_VFSUB: case IROps::OP_VFMUL: case IROps::OP_VFDIV: case IROps::OP_VFADDP: case IROps::OP_VFCADD:
+  case IROps::OP_VFMLA: case IROps::OP_VFMLS: case IROps::OP_VFNMLA: case IROps::OP_VFNMLS:
+    Lanes = X87 ? 0 : IR::OpSizeToSize(IROp->Size) / Elem; break;
+  case IROps::OP_VFADDV: case IROps::OP_VFADDSCALARINSERT: case IROps::OP_VFSUBSCALARINSERT: case IROps::OP_VFMULSCALARINSERT:
+  case IROps::OP_VFDIVSCALARINSERT: case IROps::OP_VFMLASCALARINSERT: case IROps::OP_VFMLSSCALARINSERT: case IROps::OP_VFNMLASCALARINSERT:
+  case IROps::OP_VFNMLSSCALARINSERT:
+    Lanes = X87 ? 0 : 1; break;
+  case IROps::OP_VFTOFSCALARINSERT: {
+    const auto Op = IROp->C<IR::IROp_VFToFScalarInsert>();
+    Lanes = !X87 && Elem < IR::OpSizeToSize(Op->SrcElementSize) ? 1 : 0; break;
+  }
+  case IROps::OP_FLOAT_FTOF: {
+    const auto Op = IROp->C<IR::IROp_Float_FToF>();
+    Elem = IR::OpSizeToSize(IROp->Size);
+    Lanes = Elem < IR::OpSizeToSize(Op->SrcElementSize) ? 1 : 0; break;
+  }
+  case IROps::OP_VECTOR_FTOF: {
+    const auto Op = IROp->C<IR::IROp_Vector_FToF>();
+    const uint32_t Src = IR::OpSizeToSize(Op->SrcElementSize);
+    Lanes = !X87 && Elem < Src ? IR::OpSizeToSize(IROp->Size) / Src : 0; break;
+  }
+  case IROps::OP_VFCVTN2:   // narrowing into the upper half (VCVTPS2PH ymm's upper four; ElementSize the result's)
+    First = IR::OpSizeToSize(IROp->Size) / Elem / 2;
+    Lanes = X87 ? 0 : First; break;
+  default: return;
+  }
+  if (Lanes) FexcTinyLanes(GetVReg(Node), Elem, Lanes, X87 ? uint64_t(fexc_x87_unmasked) : uint64_t(fexc_simd_unmasked), First);
+}
+// The exact-tiny test of `Lanes` lanes of `Elem` bytes in R from lane `First` under unmasked set `Unmasked` (x86 flag order): nothing unless UE
+// is unmasked; a nonzero lane with a zero exponent field sets FPSR.UFC.
+void Arm64JITCore::FexcTinyLanes(ARMEmitter::VRegister R, uint32_t Elem, uint32_t Lanes, uint64_t Unmasked, uint32_t First) {
+  if (!(Unmasked & 16)) return;
+  const uint32_t Bits = 8 * Elem, Exp = Elem == 2 ? 5 : Elem == 4 ? 8 : 11;
+  ARMEmitter::ForwardLabel Tiny, Done;
+  for (uint32_t i = First; i < First + Lanes; ++i) {
+    ARMEmitter::ForwardLabel Next;
+    if (Elem == 8) umov<ARMEmitter::SubRegSize::i64Bit>(TMP1, R, i);
+    else if (Elem == 4) umov<ARMEmitter::SubRegSize::i32Bit>(TMP1, R, i);
+    else umov<ARMEmitter::SubRegSize::i16Bit>(TMP1, R, i);
+    lsl(ARMEmitter::Size::i64Bit, TMP1, TMP1, 65 - Bits);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &Next);   // a zero
+    lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 64 - Exp);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &Tiny);   // exponent field zero: a denormal
+    (void)Bind(&Next);
+  }
+  (void)b(&Done);
+  (void)Bind(&Tiny);
+  mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
+  orr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 8);
+  msr(ARMEmitter::SystemRegister::FPSR, TMP1);
+  (void)Bind(&Done);
+}
+
 void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32_t Begin) {
   if (FexcQuietOp(IROp)) msr(ARMEmitter::SystemRegister::FPSR, TMP4);
+  if (fexc_slice1) FexcTinyCheck(IROp, Node);
   if (FexcX87Op(IROp)) FexcX87End();
   FexcRecordOp(IROp, Node, Begin);
   if (fexc_slice1) FexcCheckTarget(Node);
@@ -177,6 +321,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
     for (auto i : FexcPendingFused) fexc_sites[i].guest_offset2 = FexcGuest;
     FexcPendingFused.clear();
     fexc_insns.push_back({FexcGuest, Begin, FexcCf});
+    if (fexc_slice1 && fexc_x87_waiting.count(Op->GuestEntryOffset + Entry)) FexcPendingCheck();   // I5c: #MF before it runs
     if (fexc_slice1 && fexc_pre_nzcv.count(Op->GuestEntryOffset)) {
       static_assert(FexcPrecision::PreNzcvReg == 25);
       mrs(ARMEmitter::XReg::x25, ARMEmitter::SystemRegister::NZCV);   // the incoming NZCV (patch 5)
@@ -376,7 +521,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
 // ---------------------------------------------------------------------------------------------
 namespace {
 constexpr bool FexcCanonical(uint64_t A) { return uint64_t(int64_t(A << 16) >> 16) == A; }
-constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3, FexcBrkAlign = 4;   // brk immediates (the runtime keys on the PC); 1: branch target
+constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3, FexcBrkAlign = 4, FexcBrkSimd = 5, FexcBrkX87 = 7, FexcBrkPending = 8;   // brk immediates (the runtime keys on the PC); 1: branch target (6 is the resident's stop word)
 } // namespace
 
 // A new guard/split site for the current guest instruction, recorded like an access site at this point (width, intent,
@@ -394,7 +539,8 @@ ARMEmitter::ForwardLabel* Arm64JITCore::FexcStub(uint8_t Kind, bool Link) {
   S.completed_effects = !FexcStoreSeen && (!FexcNzcvWritten || FexcNzcvSaved) ? 0 : 1;
   S.located = 1;
   S.access_native_offset = FEXC_NONE32;
-  S.ir_op = Kind == FEXC_SITE_SPLIT ? "split" : Kind == FEXC_SITE_DIVIDE ? "divide" : Kind == FEXC_SITE_ALIGN ? "align" : "guard";
+  S.ir_op = Kind == FEXC_SITE_SPLIT ? "split" : Kind == FEXC_SITE_DIVIDE ? "divide" : Kind == FEXC_SITE_ALIGN ? "align" :
+            Kind == FEXC_SITE_SIMD ? "simd" : Kind == FEXC_SITE_X87 ? "x87" : Kind == FEXC_SITE_PENDING ? "pending" : "guard";
   const size_t Index = fexc_sites.size();
   fexc_sites.push_back(S);
   if (Link) FexcPendingLink.push_back(Index);
@@ -527,7 +673,8 @@ void Arm64JITCore::FexcEmitStubs() {
     BindOrRestart(&Label);
     fexc_sites[Index].native_offset = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
     const uint8_t K = fexc_sites[Index].kind;
-    brk(K == FEXC_SITE_SPLIT ? FexcBrkSplit : K == FEXC_SITE_DIVIDE ? FexcBrkDivide : K == FEXC_SITE_ALIGN ? FexcBrkAlign : FexcBrkGuard);
+    brk(K == FEXC_SITE_SPLIT ? FexcBrkSplit : K == FEXC_SITE_DIVIDE ? FexcBrkDivide : K == FEXC_SITE_ALIGN ? FexcBrkAlign :
+        K == FEXC_SITE_SIMD ? FexcBrkSimd : K == FEXC_SITE_X87 ? FexcBrkX87 : K == FEXC_SITE_PENDING ? FexcBrkPending : FexcBrkGuard);
   }
 }
 

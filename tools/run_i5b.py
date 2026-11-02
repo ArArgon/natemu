@@ -267,12 +267,12 @@ def fault_cases():
         case(f'xrstor-mxcsr-reserved-{tag}', [f'mov eax, {rfbm}', 'xor edx, edx', 'xrstor [rdi + 0x1000]'], want, d=d)
     d = data(); d[0x1000:0x11a0] = legacy_image(mxcsr=0x21f80)
     case('fxrstor-mxcsr-reserved', ['fxrstor [rdi + 0x1000]'], GP, d=d)
-    # Refusals (unmasked exceptions are not built): before any effect, after every fault check.
+    # Images clearing a mask load (I5c: unmasked exceptions are built, tools/run_i5c.py).
     for tag, kw in (('fcw', {'fcw': 0x037e}), ('mxcsr', {'mxcsr': 0x1f00})):
         d = data(); d[0x1000:0x11a0] = legacy_image(**kw)
-        case(f'fxrstor-unmasked-{tag}', ['fxrstor [rdi + 0x1000]'], ('stop', 'unsupported_system'), d=d, qemu=False)
+        case(f'fxrstor-unmasked-{tag}', ['fxrstor [rdi + 0x1000]'], None, d=d, qemu=False)
         d = data(); d[0x1000:0x1000 + 832] = xsave_image(7, **kw)
-        case(f'xrstor-unmasked-{tag}', ['mov eax, 7', 'xor edx, edx', 'xrstor [rdi + 0x1000]'], ('stop', 'unsupported_system'), d=d, qemu=False)
+        case(f'xrstor-unmasked-{tag}', ['mov eax, 7', 'xor edx, edx', 'xrstor [rdi + 0x1000]'], None, d=d, qemu=False)
     d = data(); d[0x1000:0x1000 + 832] = xsave_image(6, fcw=0x037e)          # x87 not restored: the FCW is not loaded
     case('xrstor-unmasked-fcw-not-restored', ['mov eax, 7', 'xor edx, edx', 'xrstor [rdi + 0x1000]'], None, d=d)
     # M3: an XSAVE whose stores reach a device page stops `unsupported_mmio` before writing any byte (the RAM part included;

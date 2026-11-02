@@ -43,6 +43,10 @@ enum FexcSiteKind : uint8_t {
   FEXC_SITE_ATOMIC = 13,                    // slice1 (I3): a LOCK read-modify-write, one ld{add,clr,eor,set}al / casal / caspal
                                             // (data_reg[0] = Rt, data_reg[1] = Rs; caspal: the even registers of both pairs)
   FEXC_SITE_ALIGN = 14,                     // slice1 stub (I5a): a legacy SSE 16-byte memory operand not 16-byte aligned (#GP(0))
+  FEXC_SITE_SIMD = 15,                      // slice1 stub (I5c): an SSE/AVX instruction raised an unmasked SIMD exception (#XM/#UD)
+  FEXC_SITE_X87 = 16,                       // slice1 stub (I5c): an x87 instruction raised an unmasked exception that leaves its
+                                            // operands unaltered (width: the instruction's length; w0: its check word)
+  FEXC_SITE_PENDING = 17,                   // slice1 stub (I5c): a waiting x87, WAIT or MMX instruction with an x87 exception pending (#MF)
 };
 inline constexpr uint32_t FEXC_NONE32 = 0xFFFFFFFFu;
 struct FexcSiteInfo {
@@ -144,7 +148,8 @@ struct FexcArg {
   operator T() const { fexc_args_read |= 1u << Bit; return value; }
   FexcArg& operator=(T v) { value = v; return *this; }
 };
-enum : int { FEXC_ARG_SSE_GATED, FEXC_ARG_AVX_GATED, FEXC_ARG_ALIGNMENT_GATED, FEXC_ARG_X87_GATED, FEXC_ARG_WAIT_GATED, FEXC_ARG_X87_FPCR };
+enum : int { FEXC_ARG_SSE_GATED, FEXC_ARG_AVX_GATED, FEXC_ARG_ALIGNMENT_GATED, FEXC_ARG_X87_GATED, FEXC_ARG_WAIT_GATED, FEXC_ARG_X87_FPCR,
+             FEXC_ARG_SIMD_UNMASKED, FEXC_ARG_X87_UNMASKED };
 // Profile slice1 (I3), recorded by the dispatcher: guest RIP of each LOCK CMPXCHG / CMPXCHG8B / CMPXCHG16B, whose casal/caspal
 // the JIT precedes with `dmb ish` (x86 orders a failing locked compare; a failing Arm CAS writes nothing, acquire only).
 inline std::set<uint64_t> fexc_lock_cas;
@@ -185,3 +190,24 @@ inline FexcArg<uint64_t, FEXC_ARG_X87_FPCR> fexc_x87_fpcr;
 // after AbridgedFTW: FPSR bit order, IOC IE, DZC ZE, OFC OE, UFC UE, IXC PE, IDC DE; bit 6 is the resident's stack fault SF).
 inline std::set<uint64_t> fexc_x87;
 constexpr uint32_t FEXC_X87_EXCEPTIONS = 0x4b4;
+// Profile slice1 (I5c): unmasked floating-point exceptions. From the host, in x86 flag order (bit 0 IE, 1 DE, 2 ZE, 3 OE, 4 UE,
+// 5 PE): `--simd-unmasked M`, the MXCSR exceptions whose mask is clear (DE left out under DAZ, which never raises it), and
+// `--x87-unmasked M`, the FCW exceptions whose mask is clear. 0 (both, as Linux runs): every exception masked, no check emitted.
+// Under them the compiled code checks each instruction's exception flags before it commits anything (shim/fexc_sites.inc).
+inline FexcArg<uint64_t, FEXC_ARG_SIMD_UNMASKED> fexc_simd_unmasked;
+inline FexcArg<uint64_t, FEXC_ARG_X87_UNMASKED> fexc_x87_unmasked;
+// Two bytes of FEX's flag array no FEX code uses (X87FLAG_DE_LOC, X87FLAG_ZE_LOC), guest-state fields for I5c, both in FPSR's
+// flag order: the MXCSR flags SIMD-checked instructions raised since the last resident entry (folded there into MXCSR), and the
+// flags the x87 ops of the current x87 instruction raised so far (folded into the x87 exception word at its end).
+constexpr uint32_t FEXC_SIMD_FLAGS = 0x3f0 + 33, FEXC_X87_PENDING = 0x3f0 + 34;
+// Recorded by the allowlist (I5c): guest RIP of each waiting x87 instruction, WAIT/FWAIT and MMX instruction (it delivers a
+// pending x87 exception, #MF, before it runs: SDM Vol.1 8.7.1), of each FST/FSTP m32/m64 (an unmasked OE/UE stores nothing)
+// and each x87 instruction's length (the resident resumes after one whose unmasked exception left its operands unaltered).
+inline std::set<uint64_t> fexc_x87_waiting, fexc_x87_store;
+inline std::map<uint64_t, uint8_t> fexc_x87_length;
+// The x87 lowering's check operands per guest RIP (I5c; IR nodes, FEX's Ref): stack fault, stack overflow, invalid operand
+// (FST m64's SNaN, FIST's out-of-range value) and exact tiny (FST m64), each a 0/1 value or null.
+struct FexcX87Extras { void* fault {}; void* overflow {}; void* invalid {}; void* tiny {}; };
+inline std::map<uint64_t, FexcX87Extras> fexc_x87_extra;
+// Filled when the checks are placed (I5c): guest RIP of each instruction given a SIMD exception check.
+inline std::set<uint64_t> fexc_simd_checked;

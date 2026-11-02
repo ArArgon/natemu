@@ -136,10 +136,10 @@ def cases():
                           ('paddb-mm-4', 'paddb mm1, qword ptr [rdi + 4]', True), ('pinsrw-1', 'pinsrw mm1, word ptr [rdi + 1], 0', True),
                           ('pinsrw-2', 'pinsrw mm1, word ptr [rdi + 2], 0', False), ('movq-mm-st-4', 'movq qword ptr [rdi + 4], mm1', True)]:
         out.append(case(f'ac-{tag}', insn, ['rflags 0x40202', f'switch {nop_at:#x} 3'], AC if ac else None, prelude=head + ['nop'] + X87PRE, cpl=0))
-    # The MMX transition (SDM CVTPI2PS/CVTPI2PD: "CVTPI2PS xmm, m64 ... does not cause a transition to MMX technology"; with an
-    # MMX register source it does: TOP = 0, all tags valid). After X87PRE: TOP 6, tag byte C0H (registers 6 and 7). QEMU 7.2
-    # enters the MMX state for the m64 forms too: judged by the SDM only.
-    for g, top, ftw in [(f'cvtpi2ps xmm1, qword ptr [{D + 0x100}]', 6, 0xc0), (f'cvtpi2pd xmm1, qword ptr [{D + 0x100}]', 6, 0xc0),
+    # The MMX transition (TOP = 0, all tags valid): SDM CVTPI2PD "For operands xmm, m64: the instruction does not cause a
+    # transition to MMX technology"; CVTPI2PS makes it for both operand forms (its page has no such exception; I9 addendum:
+    # QEMU 7.2 agrees there). After X87PRE: TOP 6, tag byte C0H (registers 6 and 7). Judged by the SDM.
+    for g, top, ftw in [(f'cvtpi2ps xmm1, qword ptr [{D + 0x100}]', 0, 0xff), (f'cvtpi2pd xmm1, qword ptr [{D + 0x100}]', 6, 0xc0),
                         ('cvtpi2ps xmm1, mm2', 0, 0xff), ('cvtpi2pd xmm1, mm2', 0, 0xff), ('cvtps2pi mm1, xmm2', 0, 0xff),
                         (f'cvttpd2pi mm1, xmmword ptr [{D + 0x100}]', 0, 0xff), ('movq2dq xmm1, mm2', 0, 0xff), ('emms', 6, 0)]:
         out.append(case(f'state-{g.split()[0]}-{"m" if "ptr" in g else "r"}', g, [], ['x87', top, ftw], prelude=X87PRE))

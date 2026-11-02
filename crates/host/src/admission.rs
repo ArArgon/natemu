@@ -328,7 +328,14 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
     let word = |at: u32| u32::from_le_bytes(bytes[code + at as usize..code + at as usize + 4].try_into().unwrap());
     for s in stubs {
         let access = accesses.binary_search_by_key(&s.guest_offset2, |a| a.native_offset).ok().map(|i| &accesses[i]);
-        if !is_stub(s) || !site_fields_valid(s, &h, region) || word(s.native_offset) != stub_word(s.kind) || !stub_matches(s, access) {
+        // I5c: an x87 stub's width is its instruction's length (the resident resumes after it): to the next PC-table entry.
+        let length = pcs.iter().map(|p| p.guest_offset).filter(|&g| g > s.guest_offset).min().unwrap_or(h.guest_bytes) - s.guest_offset;
+        if !is_stub(s)
+            || !site_fields_valid(s, &h, region)
+            || word(s.native_offset) != stub_word(s.kind)
+            || !stub_matches(s, access)
+            || (s.kind == object::kind::X87 && u32::from(s.width) != length)
+        {
             return fail(&format!("check stub at native offset {:#x}", s.native_offset));
         }
     }
@@ -393,7 +400,7 @@ fn site_fields_valid(s: &Site, h: &Header, region: u32) -> bool {
         && s.insn_native_offset <= s.native_offset
         && s.guest_offset < h.guest_bytes
         && s.segment <= object::SEG_SS
-        && (register(s.base_reg) || s.base_reg == 31 || (s.kind == object::kind::DIVIDE && s.base_reg == object::NO_REG))
+        && (register(s.base_reg) || s.base_reg == 31 || (addressless(s) && s.base_reg == object::NO_REG))
         && (register(s.index_reg) || s.index_reg == object::NO_REG)
         && s.extend <= object::EXT_SXTX
         && s.shift <= 4
@@ -405,14 +412,22 @@ fn site_fields_valid(s: &Site, h: &Header, region: u32) -> bool {
 }
 
 fn is_stub(s: &Site) -> bool {
-    matches!(s.kind, object::kind::GUARD | object::kind::SPLIT | object::kind::DIVIDE | object::kind::ALIGN)
+    matches!(s.kind, object::kind::GUARD | object::kind::SPLIT | object::kind::DIVIDE | object::kind::ALIGN) || addressless(s)
 }
-/// `brk #1` (branch target), `brk #2` (split), `brk #3` (divide) or `brk #4` (alignment, I5a).
+/// A stub with no access and no address: divide (#DE) and (I5c) the floating-point exception checks.
+fn addressless(s: &Site) -> bool {
+    matches!(s.kind, object::kind::DIVIDE | object::kind::SIMD | object::kind::X87 | object::kind::PENDING)
+}
+/// `brk #1` (branch target), `brk #2` (split), `brk #3` (divide), `brk #4` (alignment, I5a), and (I5c) `brk #5` (SIMD
+/// exception), `brk #7` (x87 exception), `brk #8` (pending x87 exception); `brk #6` is the resident's stop word.
 pub(crate) fn stub_word(kind: u8) -> u32 {
     let imm = match kind {
         object::kind::GUARD => 1,
         object::kind::SPLIT => 2,
         object::kind::ALIGN => 4,
+        object::kind::SIMD => 5,
+        object::kind::X87 => 7,
+        object::kind::PENDING => 8,
         _ => 3,
     };
     0xd420_0000 | imm << 5
@@ -424,14 +439,17 @@ pub(crate) fn stub_word(kind: u8) -> u32 {
 /// (I5a) is the same record for the first (vector) access of an SSE instruction whose operand must be 16-byte aligned. A guard stub is a
 /// branch-target check with no access: the target is in `base_reg` (there is no address guard since E3). The address
 /// register at a stub is neither x0 (the check's scratch, overwritten by it) nor sp (the checks cannot name it). A
-/// divide stub (#DE) has no access and no address.
+/// divide stub (#DE) and the floating-point exception stubs (I5c) have no access and no address; an x87 one's width is its
+/// instruction's length (the resident resumes after it).
 fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
     use object::kind::*;
-    if s.kind == DIVIDE {
+    if addressless(s) {
+        let width = if s.kind == X87 { (1..=15).contains(&s.width) } else { s.width == 0 };
         return access.is_none()
             && s.guest_offset2 == object::NONE32
             && (s.base_reg, s.index_reg, s.imm, s.writeback) == (object::NO_REG, object::NO_REG, 0, object::WB_NONE)
-            && (s.width, s.intent, s.rmw, s.segment) == (0, object::INTENT_READ, object::RMW_NONE, object::SEG_DS);
+            && width
+            && (s.intent, s.rmw, s.segment) == (object::INTENT_READ, object::RMW_NONE, object::SEG_DS);
     }
     let address_only = s.index_reg == object::NO_REG && s.writeback == object::WB_NONE && !matches!(s.base_reg, 0 | 31);
     match access {

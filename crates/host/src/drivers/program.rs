@@ -72,8 +72,9 @@
 //! Description (text, one item per line). State items: rip ADDR | rflags VALUE | gpr V0 .. V15
 //!   | cpl 0|3 (default 3) | wp 0|1 (CR0.WP, default 1) | smep 0|1 (CR4.SMEP, default 0) | nxe 0|1 (EFER.NXE, default 1)
 //!   | fsbase ADDR | gsbase ADDR (FS.base, GS.base, default 0, canonical; no x86 instruction changes them yet)
-//!   | sse 0|1 (CR4.OSFXSR and OSXMMEXCPT, default 0) | xmm N LO HI (XMMn's quadwords) | mxcsr VALUE (default 0x1f80; every
-//!     exception masked: unmasked SIMD exceptions are not built) (I5a; the report lists `xmm` as 32 quadwords and `mxcsr`)
+//!   | sse 0|1 (CR4.OSFXSR and OSXMMEXCPT, default 0) | xmm N LO HI (XMMn's quadwords) | mxcsr VALUE (default 0x1f80; I5c:
+//!     any masks) (I5a; the report lists `xmm` as 32 quadwords and `mxcsr`) | ne 0|1 (I5c: CR0.NE, x87 errors as #MF, as
+//!     Linux sets it; default 0)
 //!   | xcr0 1|3|7 (I5b: CR4.OSXSAVE set and XCR0 this value, as Linux leaves user mode; default OSXSAVE clear, XCR0 1)
 //!   | switch ADDR 0|3 (repeatable: the one-byte instruction at ADDR, a `nop`, runs as a change of the CPL to the value,
 //!     the resident's general CPL change; no x86 instruction changes the CPL yet. Blocks end before it.)
@@ -168,6 +169,8 @@ struct Section {
     sse: bool,
     /// S3: CR4.FSGSBASE (RDFSBASE..WRGSBASE enabled, as Linux sets it).
     fsgsbase: bool,
+    /// I5c: CR0.NE.
+    ne: bool,
     xmm: [[u64; 2]; 16],
     mxcsr: u64,
     /// I5b: XCR0 with CR4.OSXSAVE, or 0 (OSXSAVE clear, XCR0 at reset).
@@ -211,7 +214,7 @@ fn parse(text: &str) -> Result<Description> {
             _ => chunks.last_mut().unwrap().push(line),
         }
     }
-    let new = |space| Section { rip: 0, rflags: 0, gpr: [0; 16], cpl: 3, wp: true, smep: false, nxe: true, fs_base: 0, gs_base: 0, sse: false, fsgsbase: false, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, xcr0: 0, space, switches: vec![], posts: vec![], interrupts: true, svr: natemu_abi::lapic::SVR_RESET, mailbox: 0 };
+    let new = |space| Section { rip: 0, rflags: 0, gpr: [0; 16], cpl: 3, wp: true, smep: false, nxe: true, fs_base: 0, gs_base: 0, sse: false, fsgsbase: false, ne: false, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, xcr0: 0, space, switches: vec![], posts: vec![], interrupts: true, svr: natemu_abi::lapic::SVR_RESET, mailbox: 0 };
     let mut d = Description { spaces: vec![Space::default()], cpus: vec![], sections: chunks.len() > 1 };
     if d.sections {
         items(&chunks[0], &mut d.spaces[0], None)?;
@@ -262,7 +265,7 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
                 *if words[0] == "fsbase" { &mut c.fs_base } else { &mut c.gs_base } = base;
             }
             ("xmm", [n, lo, hi]) if number(n)? < 16 => state(&mut cpu, line)?.xmm[number(n)? as usize] = [number(lo)?, number(hi)?],
-            ("mxcsr", [v]) if number(v)? & !exec::MXCSR_MASK == 0 && number(v)? & exec::MXCSR_MASKS == exec::MXCSR_MASKS => {
+            ("mxcsr", [v]) if number(v)? & !exec::MXCSR_MASK == 0 => {
                 state(&mut cpu, line)?.mxcsr = number(v)?
             }
             ("xcr0", [v]) if natemu_abi::cpu_profile::XCR0_VALID.contains(&number(v)?) => state(&mut cpu, line)?.xcr0 = number(v)?,
@@ -274,13 +277,14 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
             ("if", [v @ ("0" | "1")]) => state(&mut cpu, line)?.interrupts = *v == "1",
             ("svr", [v]) if number(v)? & !natemu_abi::lapic::SVR_WRITABLE == 0 => state(&mut cpu, line)?.svr = number(v)?,
             ("mailbox", [g]) if number(g)? % 4096 == 0 && number(g)? != 0 => state(&mut cpu, line)?.mailbox = number(g)?,
-            ("wp" | "smep" | "nxe" | "sse" | "fsgsbase", [v @ ("0" | "1")]) => {
+            ("wp" | "smep" | "nxe" | "sse" | "fsgsbase" | "ne", [v @ ("0" | "1")]) => {
                 let c = state(&mut cpu, line)?;
                 *match words[0] {
                     "wp" => &mut c.wp,
                     "smep" => &mut c.smep,
                     "sse" => &mut c.sse,
                     "fsgsbase" => &mut c.fsgsbase,
+                    "ne" => &mut c.ne,
                     _ => &mut c.nxe,
                 } = *v == "1";
             }
@@ -933,7 +937,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 gpr: c.gpr,
                 rip: c.rip,
                 rflags: c.rflags | 2 | if c.interrupts { 0x200 } else { 0 },
-                cr0: exec::CR0_PE | exec::CR0_ET | exec::CR0_PG | bit(c.wp, exec::CR0_WP),
+                cr0: exec::CR0_PE | exec::CR0_ET | exec::CR0_PG | bit(c.wp, exec::CR0_WP) | bit(c.ne, exec::CR0_NE),
                 cr3: spaces[c.space].as_ref().unwrap().cr3,
                 cr4: exec::CR4_PAE | bit(c.smep, exec::CR4_SMEP) | bit(c.sse, exec::CR4_OSFXSR | exec::CR4_OSXMMEXCPT) | bit(c.fsgsbase, 1 << 16) | bit(c.xcr0 != 0, exec::CR4_OSXSAVE),
                 efer: exec::EFER_LME | exec::EFER_LMA | bit(c.nxe, exec::EFER_NXE),

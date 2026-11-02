@@ -515,6 +515,14 @@ pub mod frame {
     pub const X87_FCW: u32 = 0x4b0;
     pub const X87_FTW: u32 = 0x4b2;
     pub const X87_EXCEPTIONS: u32 = 0x4b4;
+    /// I5c (unmasked floating-point exceptions), two bytes of FEX's flag array FEX's code never uses (its X87FLAG_DE_LOC and
+    /// X87FLAG_ZE_LOC), both in FPSR's flag order: the MXCSR flags SIMD-checked instructions raised since the last resident
+    /// entry (generated code folds each checked instruction's FPSR into it; the resident ORs it into MXCSR and clears it at
+    /// every entry), and the flags the x87 ops of the current x87 instruction raised so far (folded into
+    /// [`X87_EXCEPTIONS`] at the instruction's end; anything left there at a resident entry belongs to an instruction that did
+    /// not complete and is dropped). Both are 0 while every exception is masked.
+    pub const SIMD_FLAGS: u32 = FLAGS + 33;
+    pub const X87_PENDING: u32 = FLAGS + 34;
     /// The upper 128 bits of YMM0..YMM15 (I5b; XSAVE state component 2, YMM_Hi128): FEX's `avx_high[16][2]`, where FEX keeps
     /// them without SVE256, two little-endian quadwords per register. Generated code reads and writes them (I8: the VEX forms,
     /// each instruction storing the halves it wrote before the next starts); XSAVE and XRSTOR use the same copy. Zero at
@@ -522,14 +530,14 @@ pub mod frame {
     pub const AVX_HIGH: u32 = 0xc0;
     /// Guest-state fields `(offset, bytes)` admitted code may read through x28: the segment bases, the RFLAGS bytes
     /// above, the x87 state (I6) and the YMM upper halves (I8). MXCSR is the bank's. Every other x28 access is refused.
-    pub const GUEST_STATE: [(u32, u32); 13] = [
+    pub const GUEST_STATE: [(u32, u32); 14] = [
         (AVX_HIGH, 256), (GS_BASE, 8), (FS_BASE, 8), (FLAGS + 8, 3), (FLAGS + 12, 1), (FLAGS + 14, 1), (FLAGS + 16, 6),
-        (X87_IE, 1), (X87_PE, 2), (X87_C0, 4), (X87_C3, 1), (X87_MM, 128), (X87_FCW, 8),
+        (X87_IE, 1), (SIMD_FLAGS, 2), (X87_PE, 2), (X87_C0, 4), (X87_C3, 1), (X87_MM, 128), (X87_FCW, 8),
     ];
     /// The fields admitted code may also write: DF, the x87 state but FCW, and the YMM upper halves. TF, IF, IOPL, NT, AC, VIF,
     /// VIP and ID are the resident's, and so is FCW (FLDCW, FNINIT, FLDENV, FRSTOR are transactions).
-    pub const GUEST_STATE_WRITABLE: [(u32, u32); 8] =
-        [(AVX_HIGH, 256), (DF, 1), (X87_IE, 1), (X87_PE, 2), (X87_C0, 4), (X87_C3, 1), (X87_MM, 128), (X87_FTW, 6)];
+    pub const GUEST_STATE_WRITABLE: [(u32, u32); 9] =
+        [(AVX_HIGH, 256), (DF, 1), (X87_IE, 1), (SIMD_FLAGS, 2), (X87_PE, 2), (X87_C0, 4), (X87_C3, 1), (X87_MM, 128), (X87_FTW, 6)];
     pub const BYTES: usize = 4096;
     /// RFLAGS bits held in the flag bytes.
     const BITS: [u32; 10] = [8, 9, 10, 12, 14, 16, 17, 18, 19, 20];
@@ -664,8 +672,8 @@ pub struct Cpu {
     /// ([`mxcsr_flags`]). LDMXCSR/STMXCSR are the resident's transactions.
     pub mxcsr: u64,
     /// The x87 FPU control word (I6; SDM Vol.1 8.1.5): authoritative here, written into the guest-state page
-    /// ([`frame::X87_FCW`]) at every block entry; FLDCW, FNINIT, FLDENV and FRSTOR are the resident's transactions. Every
-    /// exception mask stays set (an FCW that clears one is refused). The rest of the x87 state lives in the page.
+    /// ([`frame::X87_FCW`]) at every block entry; FLDCW, FNINIT, FLDENV and FRSTOR are the resident's transactions. Its
+    /// exception masks key the code (I5c: unmasked x87 exceptions, #MF). The rest of the x87 state lives in the page.
     pub fcw: u64,
     /// XCR0 (I5b; SDM Vol.1 13.3): written by XSETBV (one of the profile's [`crate::cpu_profile::XCR0_VALID`]), read by XGETBV and
     /// CPUID.0DH.0:EBX, and the requested-feature bitmap's mask for XSAVE/XRSTOR. Reset 1 (x87 only).
@@ -680,11 +688,58 @@ pub const MXCSR_MASK: u64 = 0xffff;
 /// MXCSR exception masks (IM DM ZM OM UM PM, bits 12:7).
 pub const MXCSR_MASKS: u64 = 0x1f80;
 /// FPCR for generated code under `mxcsr` (FEX compiles with FEAT_AFP, DDI0487 FPCR): AH (x86 NaN and min/max rules) and NEP
-/// (scalar results keep the vector's upper lanes) always; FIZ = DAZ, FZ = FTZ (with AH, an output flush only), RMode from
-/// RC (x86 00 nearest, 01 down, 10 up, 11 toward zero; Arm RN 00, RP 01, RM 10, RZ 11).
+/// (scalar results keep the vector's upper lanes) always; FIZ = DAZ, FZ = FTZ (with AH, an output flush only) unless the
+/// underflow exception is unmasked (I5c: "If the underflow exception is not masked, the flush-to-zero bit is ignored", SDM
+/// Vol.1 10.2.3.3), RMode from RC (x86 00 nearest, 01 down, 10 up, 11 toward zero; Arm RN 00, RP 01, RM 10, RZ 11).
 pub const fn fpcr(mxcsr: u64) -> u64 {
     let rmode = [0, 2, 1, 3][(mxcsr >> 13 & 3) as usize];
-    1 << 1 | 1 << 2 | (mxcsr >> 6 & 1) | (mxcsr >> 15 & 1) << 24 | rmode << 22
+    1 << 1 | 1 << 2 | (mxcsr >> 6 & 1) | (mxcsr >> 15 & mxcsr >> 11 & 1) << 24 | rmode << 22
+}
+/// I5c: the MXCSR exceptions whose mask is clear, in flag order (bit 0 IE .. 5 PE); DE left out under DAZ, which never raises
+/// it (SDM Vol.1 10.2.3.4). 0 as Linux runs: fexc's `--simd-unmasked`, part of [`Cpu::code_context`].
+pub const fn simd_unmasked(mxcsr: u64) -> u64 {
+    !(mxcsr >> 7) & 0x3f & if mxcsr & MXCSR_DAZ != 0 { !2 } else { !0 }
+}
+/// I5c: the FCW exceptions whose mask is clear, in flag order (fexc's `--x87-unmasked`, part of [`Cpu::code_context`]).
+pub const fn x87_unmasked(fcw: u64) -> u64 {
+    !fcw & FCW_MASKS
+}
+/// I5c: the FPSR cumulative-flag bits (IOC 0, DZC 1, OFC 2, UFC 3, IXC 4, IDC 7) of x86 exception flags in flag order (IE
+/// DE ZE OE UE PE), the order generated code's checks compare in.
+pub const fn fpsr_bits(x86: u64) -> u64 {
+    (x86 & 1) | (x86 >> 1 & 1) << 7 | (x86 >> 2 & 0xf) << 1
+}
+/// FPSR's pre-computation flags (IOC, DZC, IDC: invalid, divide-by-zero, denormal; SDM Vol.1 4.9.2, 11.5.3).
+pub const FPSR_PRE: u64 = 1 | 2 | 0x80;
+/// I5c: the FPSR flags an SSE/AVX instruction that raised an unmasked SIMD exception sets in MXCSR (SDM Vol.1 11.5.3.2,
+/// 11.5.3.3), from `raised`, its operation's FPSR flags (every element's): with an unmasked pre-computation exception the
+/// pre-computation flags only (post-computation conditions are not looked for), else all of them, masked ones included.
+pub const fn simd_fault_flags(raised: u64, mxcsr: u64) -> u64 {
+    let pre = raised & FPSR_PRE;
+    if pre & fpsr_bits(simd_unmasked(mxcsr)) != 0 { pre } else { raised & (FPSR_PRE | 0x1c) }
+}
+/// I5c: what an x87 instruction whose check found an unmasked exception that leaves its operands unaltered sets in FSW, from
+/// its check word `w` (its FPSR flags in 7:0, then its stack fault (8), stack overflow (9), invalid operand (10: FIST's NaN or
+/// out-of-range source, FST m64's SNaN) and exact tiny result (11: FST m64)) under `fcw`: the exception-word bits (FPSR order,
+/// SF in bit 6) and C1 when it is written. By the SDM's precedence (Vol.1 4.9.2, 8.5): a stack fault with IE unmasked is IE
+/// and SF, C1 = 1 for an overflow, 0 for an underflow (8.5.1.1); else the unmasked pre-computation exceptions (IE, DE, ZE) set
+/// the pre-computation flags only; else an unmasked OE or UE of a store to memory sets that flag alone (no PE) and clears C1
+/// (8.5.4, 8.5.5, 4.9.1.6). Nothing else of the instruction is done (TOP and the operands unchanged).
+pub const fn x87_fault_flags(w: u64, fcw: u64) -> (u64, Option<bool>) {
+    let unmasked = fpsr_bits(x87_unmasked(fcw));
+    if w >> 8 & 1 != 0 && unmasked & 1 != 0 {
+        return (1 | 0x40, Some(w >> 9 & 1 != 0));
+    }
+    let pre = w & FPSR_PRE | w >> 10 & 1;
+    if pre & unmasked != 0 {
+        return (pre, None);
+    }
+    (w & 4 | (w | w >> 8) & 8, Some(false))
+}
+/// FSW.ES (error summary) and B (busy): set while an exception flag (FSW 5:0) whose FCW mask is clear is set (SDM Vol.1
+/// 8.1.3.1, 8.1.3.3: B reflects ES).
+pub const fn fsw_summary(fsw: u64, fcw: u64) -> u64 {
+    if fsw & x87_unmasked(fcw) != 0 { 1 << 7 | 1 << 15 } else { 0 }
 }
 /// MXCSR exception flags for the FPSR cumulative flags generated code raised under `mxcsr`: IOC -> IE, DZC -> ZE, OFC -> OE,
 /// UFC -> UE, IXC -> PE, and IDC -> DE unless DAZ. With FPCR.AH = 1 and FIZ = 0 the M4 sets IDC for a denormal input it
@@ -774,6 +829,9 @@ pub const CR0_PE: u64 = 1;
 pub const CR0_MP: u64 = 1 << 1;
 pub const CR0_EM: u64 = 1 << 2;
 pub const CR0_TS: u64 = 1 << 3;
+/// CR0.NE (I5c): x87 errors through #MF (native mode); clear, through the FERR# pin (MS-DOS compatibility), which this board
+/// does not wire (SDM Vol.1 8.7.2; a pending x87 exception there stops `unsupported_ferr`).
+pub const CR0_NE: u64 = 1 << 5;
 /// Alignment mask: with RFLAGS.AC at CPL 3, alignment checking (#AC), which is not built: [`Cpu::control`] refuses it.
 pub const CR0_AM: u64 = 1 << 18;
 pub const RFLAGS_AC: u64 = 1 << 18;
@@ -909,7 +967,11 @@ impl Cpu {
             | bit(self.bit_tests_cut(), 12)
             | bit(self.cr0 & CR0_MP != 0, 13)
             | (x87_fpcr(self.fcw, self.mxcsr) != 0) as u64 * (1 | (self.fcw >> 10 & 3) << 1) << 14
-            | bit(self.avx_enabled(), 17);
+            | bit(self.avx_enabled(), 17)
+            // I5c: the unmasked MXCSR and FCW exceptions (0 with every exception masked): a translation checks each
+            // floating-point instruction for them.
+            | simd_unmasked(self.mxcsr) << 18
+            | x87_unmasked(self.fcw) << 24;
         word
     }
 }
@@ -1291,6 +1353,11 @@ pub mod stop {
     /// `State::fault` holds the last exception detected (vector, CR2, error code, RIP of the original event); the bank
     /// holds the state at the original event (CR2 as written by any #PF detected on the way); nothing was delivered.
     pub const SHUTDOWN: u64 = 16;
+    /// (I5c.) An x87 exception was due at a waiting x87, WAIT or MMX instruction with CR0.NE clear: MS-DOS compatibility mode,
+    /// whose report is the FERR# pin, wired by the board through IRQ13 and port F0H and IGNNE# (SDM Vol.1 8.7.2, Appendix D;
+    /// whether FERR# asserts at the faulting or the waiting instruction is processor-specific). The board has neither, so the
+    /// processor would freeze there for ever: a precise stop with the state at the waiting instruction instead.
+    pub const UNSUPPORTED_FERR: u64 = 17;
     /// (X2, numbered apart from the other chunks' reasons.) The vCPU was halted (HLT) with no event it could take, and the
     /// host ended its run ([`super::cache::Events::end`]: no source could wake it). The bank holds the state after the
     /// HLT.
@@ -1319,6 +1386,7 @@ pub mod stop {
             PRIVATE_ACCESS => "private_access",
             TRAPPED => "trapped",
             SHUTDOWN => "shutdown",
+            UNSUPPORTED_FERR => "unsupported_ferr",
             HALTED => "halted",
             UNSUPPORTED_MMIO => "unsupported_mmio",
             UNSUPPORTED_PORT => "unsupported_port",
@@ -1705,7 +1773,10 @@ mod tests {
             assert!(inside(&frame::GUEST_STATE_WRITABLE, at), "{at:#x}");
         }
         assert!(inside(&frame::GUEST_STATE, frame::X87_FCW + 1) && !inside(&frame::GUEST_STATE_WRITABLE, frame::X87_FCW));
-        assert!(!inside(&frame::GUEST_STATE, frame::X87_MM + 128) && !inside(&frame::GUEST_STATE, frame::X87_IE + 1));
+        assert!(!inside(&frame::GUEST_STATE, frame::X87_MM + 128) && !inside(&frame::GUEST_STATE, frame::X87_IE + 3));
+        // I5c: the SIMD flag byte and the x87 pending byte, FEX's flag bytes 33 and 34, readable and writable.
+        assert_eq!((frame::SIMD_FLAGS, frame::X87_PENDING), (0x411, 0x412));
+        assert!([frame::SIMD_FLAGS, frame::X87_PENDING].iter().all(|&b| inside(&frame::GUEST_STATE_WRITABLE, b)));
         // I8: FEX's avx_high[16][2] (the pinned CPUState), readable and writable, nothing around it.
         assert!((frame::AVX_HIGH..frame::AVX_HIGH + 256).all(|b| inside(&frame::GUEST_STATE_WRITABLE, b)));
         assert!(!inside(&frame::GUEST_STATE, frame::AVX_HIGH - 1) && !inside(&frame::GUEST_STATE, frame::AVX_HIGH + 256));
@@ -1722,6 +1793,43 @@ mod tests {
         assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15), fpcr(MXCSR_RESET)); // FTZ
         assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | MXCSR_DAZ), fpcr(MXCSR_RESET));
         assert_eq!(x87_fpcr(FCW_INIT & !0x300, MXCSR_RESET), 0); // precision control has no FPCR effect (doubles throughout)
+    }
+
+    /// I5c: FTZ only flushes with the underflow exception masked; the unmasked sets in flag order, DE dropped under DAZ.
+    #[test]
+    fn unmasked_exceptions_and_flush_to_zero() {
+        assert_eq!(fpcr(MXCSR_RESET | 1 << 15) & 1 << 24, 1 << 24);
+        assert_eq!(fpcr((MXCSR_RESET | 1 << 15) & !(1 << 11)) & 1 << 24, 0);
+        assert_eq!((simd_unmasked(MXCSR_RESET), simd_unmasked(0), simd_unmasked(MXCSR_DAZ), simd_unmasked(MXCSR_RESET & !(1 << 9))), (0, 0x3f, 0x3d, 4));
+        assert_eq!((x87_unmasked(FCW_INIT), x87_unmasked(0x37b), x87_unmasked(0x340)), (0, 4, 0x3f));
+        let mut c = Cpu { gpr: [0; 16], rip: 0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0,
+                          dr: DR_RESET, seg: flat_segments(3), ldtr: LDTR_RESET, tr: TR_RESET, gdtr: TABLE_RESET, idtr: TABLE_RESET, mov_ss: 0,
+                          xmm: [[0; 2]; 16], mxcsr: MXCSR_RESET, fcw: FCW_INIT, xcr0: 1 };
+        let masked = c.code_context();
+        c.mxcsr &= !(1 << 12);
+        assert_eq!(c.code_context(), masked | 32 << 18);
+        c.fcw = 0x37e;
+        assert_eq!(c.code_context(), masked | 32 << 18 | 1 << 24);
+        assert_eq!((fpsr_bits(0x3f), fpsr_bits(2), fpsr_bits(4)), (0x9f, 0x80, 2));
+    }
+
+    /// I5c: the flags an unmasked SIMD or x87 exception leaves (SDM Vol.1 4.9.2, 8.5, 11.5.3).
+    #[test]
+    fn unmasked_exception_flags() {
+        let (ioc, dzc, ofc, ufc, ixc, idc) = (1, 2, 4, 8, 0x10, 0x80);
+        // Unmasked IE beside another element's overflow: IE only; masked pre beside an unmasked PE: all; DE under DAZ is no DE.
+        assert_eq!(simd_fault_flags(ioc | ofc | ixc, 0x1f80 & !(1 << 7)), ioc);
+        assert_eq!(simd_fault_flags(idc | ixc, 0x1f80 & !(1 << 12)), idc | ixc);
+        assert_eq!(simd_fault_flags(idc | ofc | ixc, 0x1f80 & !(1 << 8)), idc);
+        assert_eq!(simd_fault_flags(idc | ufc | ixc, (0x1f80 | MXCSR_DAZ) & !(1 << 8 | 1 << 11)), idc | ufc | ixc);
+        // x87: a stack overflow with IE unmasked; an unmasked ZE; FST m64 with UE unmasked (an exact tiny result); FIST's invalid.
+        assert_eq!(x87_fault_flags(1 << 8 | 1 << 9 | idc, 0x37e), (ioc | 0x40, Some(true)));
+        assert_eq!(x87_fault_flags(1 << 8, 0x37e), (ioc | 0x40, Some(false)));
+        assert_eq!(x87_fault_flags(dzc, 0x37b), (dzc, None));
+        assert_eq!(x87_fault_flags(1 << 11, 0x36f), (ufc, Some(false)));
+        assert_eq!(x87_fault_flags(ofc | ixc, 0x377), (ofc, Some(false)));
+        assert_eq!(x87_fault_flags(1 << 10, 0x37e), (ioc, None));
+        assert_eq!((fsw_summary(0x20, 0x37f), fsw_summary(0x20, 0x35f), fsw_summary(0x40, 0x340)), (0, 0x8080, 0));
     }
 
     #[test]

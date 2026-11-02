@@ -732,6 +732,11 @@ unsafe fn enter(mut s: State, block: &Block) -> ! {
     }
     // I6: FCW, which FNSTCW reads there; like the bases, never read back.
     unsafe { (FRAME_VA as *mut u16).byte_add(frame::X87_FCW as usize).write_volatile(s.cpu.fcw as u16) };
+    // I5c: the SIMD flag byte (banked into MXCSR at every resident entry) and the x87 instruction's pending flags (an
+    // instruction that did not complete leaves its own there) start empty.
+    for at in [frame::SIMD_FLAGS, frame::X87_PENDING] {
+        unsafe { (FRAME_VA as *mut u8).add(at as usize).write_volatile(0) };
+    }
     let mut f = NativeFrame::ZERO;
     for (&reg, &value) in SRA.iter().zip(&s.cpu.gpr) {
         f.x[reg as usize] = value;
@@ -1712,6 +1717,9 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
                     object::kind::SPLIT => brk(2),
                     object::kind::DIVIDE => brk(3),
                     object::kind::ALIGN => brk(4),
+                    object::kind::SIMD => brk(5),
+                    object::kind::X87 => brk(7),
+                    object::kind::PENDING => brk(8),
                     // S4: a watchpoint (EC 0x34, from EL0) at an access site: FAR names a watched byte, not necessarily the access's.
                     _ if esr >> 26 == 0x34 => !matches!(site.kind, object::kind::OTHER),
                     _ => esr >> 26 == 0x24 && far.wrapping_sub(site_address(site, f)) < u64::from(site.width),
@@ -1746,10 +1754,37 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             object::kind::DIVIDE => guest_fault(s, f, b, &site, [0, 0, 0]),
             // A legacy SSE operand that is not 16-byte aligned (I5a): #GP(0) before any walk.
             object::kind::ALIGN => guest_fault(s, f, b, &site, [13, 0, 0]),
+            object::kind::SIMD | object::kind::X87 | object::kind::PENDING => fp_exception(s, f, b, &site),
             object::kind::SPLIT => split(s, f, b, all, &site, spsr),
             _ => access_aborted(s, f, b, &site, [esr, far, elr, spsr]),
         }
     }
+}
+
+/// I5c: a floating-point exception check stub (the state before its instruction is at the stub, as at an access site):
+/// an SSE/AVX instruction's unmasked SIMD exception (#XM or #UD, its operation's flags in FPSR), an x87 instruction's
+/// unmasked exception that leaves its operands unaltered (its check word in w0: only the flags are set, and the
+/// instruction is done, `width` its length; #MF waits for the next waiting instruction), or a waiting instruction with an
+/// x87 exception pending (#MF with CR0.NE, else the stop `unsupported_ferr`: [`x87::pending`]).
+#[inline(never)]
+fn fp_exception(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
+    let before = s.cpu.mxcsr;
+    bank_at(&mut s, f, b, site);
+    let e = match site.kind {
+        object::kind::SIMD => sse::exception(&mut s.cpu, before, f.fpsr),
+        object::kind::X87 => {
+            x87::exception(s.cpu.fcw, f.x[0]);
+            s.cpu.rip = s.cpu.rip.wrapping_add(u64::from(site.width));
+            completed(&mut s);
+            unsafe { dispatch(s) }
+        }
+        _ => match x87::pending(&s) {
+            Err(e) => e,
+            Ok(()) => halt(&s, stop::SITE_MISMATCH), // the check saw a flag the page does not hold
+        },
+    };
+    deliver(&mut s, Event::Exception(e));
+    unsafe { dispatch(s) }
 }
 
 /// A data abort at an access site: a shadow miss to retry, or a guest fault.

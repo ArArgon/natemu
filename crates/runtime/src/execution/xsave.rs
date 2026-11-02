@@ -14,9 +14,9 @@
 //! them); XINUSE is all ones (a processor may track any component as in use), so XSAVE sets XSTATE_BV[i] for every i in
 //! RFBM. Gating: FX* #NM with CR0.TS or CR0.EM; X* and XGETBV/XSETBV #UD without CR4.OSXSAVE, then X* #NM with CR0.TS
 //! (QEMU 11.1.2 raises no #NM for them). Every transaction is precise: all bytes it reads are read and every page it writes is walked
-//! for write before any state or memory changes (a #PF or #GP leaves both as they were). As for FLDCW/LDMXCSR, an FCW or
-//! MXCSR that would unmask an exception stops `unsupported_system` before any effect (#MF/#XM are not built), after every
-//! fault check.
+//! for write before any state or memory changes (a #PF or #GP leaves both as they were). I5c: an FCW or MXCSR with masks
+//! clear re-keys the code (`Cpu::code_context`); FXRSTOR/XRSTOR, like FXSAVE/XSAVE, ignore a pending x87 exception (SDM
+//! Vol.3 event 16), and an unmasked flag they load is pending for the next waiting x87 instruction.
 use super::segments::{Exception, address, linear, noncanonical, pages};
 use super::*;
 
@@ -61,7 +61,6 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         system::FXRSTOR => {
             linear(s, va, &mut img[..LEGACY], false, false, nc)?;
             let mxcsr = mxcsr(&img)?;
-            refuse(s, Some(&img), Some(mxcsr));
             load_x87(s, &img);
             s.cpu.mxcsr = mxcsr;
             load_xmm(&mut s.cpu, Some(&img));
@@ -122,7 +121,6 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
                 linear(s, va.wrapping_add(AVX as u64), &mut img[AVX..AREA], false, false, nc)?;
             }
             let mxcsr = if rfbm & 6 != 0 { Some(mxcsr(&img)?) } else { None };
-            refuse(s, (restore & 1 != 0).then_some(&img[..]), mxcsr);
             if restore & 1 != 0 {
                 load_x87(s, &img);
             } else if rfbm & 1 != 0 {
@@ -176,7 +174,7 @@ fn set_ymm_hi(q: usize, v: u64) {
 /// The legacy region's first 416 bytes for `c` and the x87 state in the page.
 fn legacy(c: &Cpu, img: &mut [u8]) {
     img[0..2].copy_from_slice(&(c.fcw as u16).to_le_bytes());
-    img[2..4].copy_from_slice(&(x87::fsw() as u16).to_le_bytes());
+    img[2..4].copy_from_slice(&(x87::fsw(c.fcw) as u16).to_le_bytes());
     img[4] = x87::abridged() as u8;
     img[24..28].copy_from_slice(&(c.mxcsr as u32).to_le_bytes());
     img[28..32].copy_from_slice(&(MXCSR_MASK as u32).to_le_bytes());
@@ -196,15 +194,6 @@ fn legacy(c: &Cpu, img: &mut [u8]) {
 fn mxcsr(img: &[u8]) -> Result<u64, Exception> {
     let m = u64::from(u32::from_le_bytes(img[24..28].try_into().unwrap()));
     if m & !MXCSR_MASK != 0 { Err(GP) } else { Ok(m) }
-}
-/// Stops `unsupported_system` (before any effect) when the image's FCW (`x87`: its x87 part is loaded) or `mxcsr` would
-/// unmask an exception.
-fn refuse(s: &State, x87: Option<&[u8]>, mxcsr: Option<u64>) {
-    // ponytail: unmasked x87/SIMD exceptions are refused, not raised (plans I5c, I6).
-    let fcw = x87.map(|img| u64::from(u16::from_le_bytes([img[0], img[1]])));
-    if fcw.is_some_and(|f| !x87::masked(f)) || mxcsr.is_some_and(|m| m & MXCSR_MASKS != MXCSR_MASKS) {
-        halt(s, stop::UNSUPPORTED_SYSTEM)
-    }
 }
 /// FCW, FSW, the abridged tags and ST0..7 (rounded to doubles by the new FCW.RC: the reduced-precision deviation).
 fn load_x87(s: &mut State, img: &[u8]) {

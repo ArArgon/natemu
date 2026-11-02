@@ -263,11 +263,13 @@ uint32_t MmioRecord(const FexcSiteInfo& s, uint64_t rip) {
   const auto it = fexc_mmio.find(rip + s.guest_offset);
   if (it == fexc_mmio.end()) return 0;
   int accesses = 0;
-  for (auto& a : Cap.sites) accesses += a.guest_offset == s.guest_offset && a.kind != FEXC_SITE_GUARD && a.kind != FEXC_SITE_SPLIT && a.kind != FEXC_SITE_ALIGN && a.kind != FEXC_SITE_DIVIDE;
+  for (auto& a : Cap.sites) accesses += a.guest_offset == s.guest_offset && a.kind != FEXC_SITE_GUARD && a.kind != FEXC_SITE_SPLIT && a.kind != FEXC_SITE_ALIGN && a.kind != FEXC_SITE_DIVIDE &&
+                                                       a.kind < FEXC_SITE_SIMD;
   const uint32_t r = it->second;
   return accesses == 1 && (1u << ((r >> 12) & 3)) == s.width && ((r >> 4) & 1) == uint32_t(s.kind == FEXC_SITE_STORE) ? r : 0;
 }
-const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other", "divide", "swap", "atomic", "align"};
+const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other", "divide", "swap", "atomic", "align",
+                                "simd", "x87", "pending"};
 const char* const ExtendName[] = {"none", "uxtw", "sxtw", "sxtx"};
 const char* const RmwName[] = {"none", "load", "store"};
 const char* const OrderingName[] = {"plain", "acquire", "release"};
@@ -372,6 +374,7 @@ static void ResetGlobals() {
   fexc_rip_relative.clear(); fexc_target_check.clear(); fexc_div_width.clear(); fexc_movs.clear(); fexc_lock_cas.clear();
   fexc_align16.clear(); fexc_align32.clear(); fexc_avx_gated = false; fexc_sse_gated = false; fexc_alignment_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear(); fexc_mmio.clear();
   fexc_x87_gated = false; fexc_wait_gated = false; fexc_x87_fpcr = 0; fexc_x87.clear();
+  fexc_simd_unmasked = 0; fexc_x87_unmasked = 0; fexc_x87_waiting.clear(); fexc_x87_store.clear(); fexc_x87_length.clear(); fexc_simd_checked.clear(); fexc_x87_extra.clear();
   fexc_args_read = 0; Extent = 0;
 }
 
@@ -417,6 +420,8 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     else if (a == "--x87-gated") fexc_x87_gated = true;   // slice1 (I6): CR0.EM or CR0.TS: x87 forms are system cuts (#NM)
     else if (a == "--wait-gated") fexc_wait_gated = true; // slice1 (I6): CR0.TS and CR0.MP: WAIT/FWAIT is a system cut (#NM)
     else if (a == "--x87-fpcr") fexc_x87_fpcr = strtoull(next(), nullptr, 0);   // slice1 (I6): FPCR of x87 arithmetic when MXCSR's differs
+    else if (a == "--simd-unmasked") fexc_simd_unmasked = strtoull(next(), nullptr, 0) & 0x3f;   // slice1 (I5c): MXCSR's unmasked exceptions
+    else if (a == "--x87-unmasked") fexc_x87_unmasked = strtoull(next(), nullptr, 0) & 0x3f;     // slice1 (I5c): FCW's unmasked exceptions
     else if (a == "--feature") { std::string v = next(); auto eq = v.find('='); if (eq == std::string::npos) return Fail("--feature NAME=0|1"); overrides.push_back({v.substr(0, eq), v.substr(eq + 1) != "0"}); }
     else if (a == "--config") { std::string v = next(); auto eq = v.find('='); Config::ConfigOption o; if (eq == std::string::npos || !ConfigOptionByName(v.substr(0, eq), o)) return Fail("--config NAME=VALUE (NAME: a FEX config option, e.g. X87REDUCEDPRECISION)"); configs.push_back({v.substr(0, eq), v.substr(eq + 1)}); }
     else if (a == "--out") out = next();
@@ -424,7 +429,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     else return Fail("unknown argument " + a);
   }
   if (!missing.empty()) return Fail(missing + " needs a value");
-  if (!have_rip || (!given && hex.empty() == file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--avx-gated] [--alignment-gated] [--x87-gated] [--wait-gated] [--x87-fpcr V] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
+  if (!have_rip || (!given && hex.empty() == file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--avx-gated] [--alignment-gated] [--x87-gated] [--wait-gated] [--x87-fpcr V] [--simd-unmasked M] [--x87-unmasked M] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
   if (bitness != 32 && bitness != 64) return Fail("--bitness must be 32 or 64");
   const bool slice1 = st.profile == "slice1";
   if (slice1 && bitness != 64) return Fail("profile slice1 is 64-bit only");

@@ -638,11 +638,13 @@ impl Answer {
         Ok(Answer::Cut { reason, cut: system_cut(&json, rip), gated, ud })
     }
 }
+/// The number of fexc's gating arguments (`FEXC_ARG_*`, [`Compiler::gating`]).
+const GATING: usize = 8;
 /// A kept answer and what it was compiled from: the gating values (those with a bit in `read` matter) and the guest bytes
 /// before the compile's extent (`whole`: the extent reached their end, so their length matters too).
 struct Entry {
     read: u32,
-    gating: [u64; 6],
+    gating: [u64; GATING],
     prefix: Vec<u8>,
     whole: bool,
     answer: Answer,
@@ -650,9 +652,9 @@ struct Entry {
 impl Entry {
     /// fexc gives the same answer for `bytes` under `gating`: it reads nothing that differs (tools/fexc/fexc.cpp, `Extent`
     /// and `FexcArg`).
-    fn matches(&self, bytes: &[u8], gating: &[u64; 6]) -> bool {
-        self.read >> 6 == 0
-            && (0..6).all(|i| self.read & 1 << i == 0 || self.gating[i] == gating[i])
+    fn matches(&self, bytes: &[u8], gating: &[u64; GATING]) -> bool {
+        self.read >> GATING == 0
+            && (0..GATING).all(|i| self.read & 1 << i == 0 || self.gating[i] == gating[i])
             && if self.whole { bytes == self.prefix } else { bytes.starts_with(&self.prefix) }
     }
 }
@@ -711,11 +713,13 @@ pub(crate) struct Compiler {
     /// `Cpu::bit_tests_cut`): fexc cuts every BT* memory form as a system instruction, which the resident checks (#AC, the
     /// operand-sized unit against the breakpoints) and then steps compiled without it (`State::plain_step`).
     pub(crate) alignment_gated: bool,
-    /// The vCPU's x87 gating and rounding (I6, [`x87_args`]): fexc's `--x87-gated`, `--wait-gated` and `--x87-fpcr` arguments.
+    /// The vCPU's x87 gating and rounding (I6, [`x87_args`]) and its unmasked floating-point exceptions (I5c): fexc's
+    /// `--x87-gated`, `--wait-gated`, `--x87-fpcr`, `--simd-unmasked` and `--x87-unmasked` arguments.
     pub(crate) x87: Vec<String>,
 }
 /// fexc's x87 arguments for `cpu` (I6; SDM Vol.3 Table 2-2): every x87 form #NM under CR0.EM or CR0.TS, WAIT/FWAIT under CR0.TS
-/// with CR0.MP; x87 arithmetic under its own FPCR when FCW.RC or MXCSR's flush-to-zero/DAZ differ ([`exec::x87_fpcr`]). The
+/// with CR0.MP; x87 arithmetic under its own FPCR when FCW.RC or MXCSR's flush-to-zero/DAZ differ ([`exec::x87_fpcr`]); and
+/// (I5c) the MXCSR and FCW exceptions whose masks are clear, each instruction then checked for them (none as Linux runs). The
 /// same state is part of `Cpu::code_context`.
 pub(crate) fn x87_args(cpu: &exec::Cpu) -> Vec<String> {
     let mut args = vec![];
@@ -728,6 +732,11 @@ pub(crate) fn x87_args(cpu: &exec::Cpu) -> Vec<String> {
     match exec::x87_fpcr(cpu.fcw, cpu.mxcsr) {
         0 => {}
         fpcr => args.extend(["--x87-fpcr".into(), format!("{fpcr:#x}")]),
+    }
+    for (name, unmasked) in [("--simd-unmasked", exec::simd_unmasked(cpu.mxcsr)), ("--x87-unmasked", exec::x87_unmasked(cpu.fcw))] {
+        if unmasked != 0 {
+            args.extend([name.into(), format!("{unmasked:#x}")]);
+        }
     }
     args
 }
@@ -772,12 +781,16 @@ impl Compiler {
             }
         }
     }
-    /// The gating arguments' values, in fexc's `FEXC_ARG_*` order: SSE, AVX, alignment, x87, WAIT, x87 FPCR.
-    fn gating(&self) -> [u64; 6] {
+    /// The gating arguments' values, in fexc's `FEXC_ARG_*` order: SSE, AVX, alignment, x87, WAIT, x87 FPCR, and (I5c) the
+    /// unmasked SIMD and x87 exceptions.
+    fn gating(&self) -> [u64; GATING] {
         let flag = |a: &str| u64::from(self.x87.iter().any(|x| x == a));
-        let fpcr = self.x87.iter().position(|x| x == "--x87-fpcr").and_then(|i| self.x87.get(i + 1));
-        let fpcr = fpcr.and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
-        [self.sse_gated.into(), self.avx_gated.into(), self.alignment_gated.into(), flag("--x87-gated"), flag("--wait-gated"), fpcr]
+        let value = |a: &str| {
+            let v = self.x87.iter().position(|x| x == a).and_then(|i| self.x87.get(i + 1));
+            v.and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0)
+        };
+        [self.sse_gated.into(), self.avx_gated.into(), self.alignment_gated.into(), flag("--x87-gated"), flag("--wait-gated"),
+         value("--x87-fpcr"), value("--simd-unmasked"), value("--x87-unmasked")]
     }
     /// [`Compiler::compile`] with an instruction limit; `Err(n)`: the object's code is too large for a block (n guest
     /// instructions translated).

@@ -51,6 +51,13 @@ pub mod kind {
     pub const SWAP: u8 = 12;
     pub const ATOMIC: u8 = 13;
     pub const ALIGN: u8 = 14;
+    /// I5c check stubs (no access, no address): an SSE/AVX instruction raised an unmasked SIMD exception (#XM, or #UD without
+    /// CR4.OSXMMEXCPT; `brk #5`); an x87 instruction raised an unmasked exception that leaves its operands unaltered (`brk #7`:
+    /// `width` its length, its check word in w0); a waiting x87, WAIT or MMX instruction found an x87 exception pending (#MF,
+    /// `brk #8`). (`brk #6` is the resident's stop word, `execution::STOP_IMM`.)
+    pub const SIMD: u8 = 15;
+    pub const X87: u8 = 16;
+    pub const PENDING: u8 = 17;
 }
 /// [`Site::intent`].
 pub const INTENT_READ: u8 = 0;

@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: natemu <natemu@example.invalid>
+Date: Mon, 2 Nov 2026 14:00:00 +0000
+Subject: [PATCH] FEXCore: slice1 I5c review: DBL_MIN not tiny, CVT(T)PS2PI lanes
+
+Under fexc_slice1: the x87 stack pass's exact-tiny bit for FST/FSTP m64
+(unmasked UE) took +-DBL_MIN, a normal double, for tiny (an off-by-one
+in its flag-free test): it is now "magnitude nonzero and exponent field
+zero". CVTPS2PI/CVTTPS2PI mm, xmm converted all four floats of the XMM
+register, so its upper two raised MXCSR flags (and, unmasked, a spurious
+#XM); they convert the low 64 bits, as the m64 form does.
+---
+ FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp       | 4 +++-
+ FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp | 9 ++++++---
+ 2 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+index b2f2241..b44d429 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+@@ -2816,7 +2816,9 @@ void OpDispatchBuilder::XMM_To_MMX_Vector_CVT_Float_To_Int(OpcodeArgs, IR::OpSiz
+   // If loading a vector, use the full size, so we don't
+   // unnecessarily zero extend the vector. Otherwise, if
+   // memory, then we want to load the element size exactly.
+-  const auto SrcSize = Op->Src[0].IsGPR() ? OpSize::i128Bit : OpSizeFromSrc(Op);
++  // natemu slice1 (I5c review, I9): CVT(T)PS2PI mm, xmm converts xmm's low two floats only; converting all four raised the
++  // upper two's MXCSR flags (and a spurious #XM when unmasked). CVT(T)PD2PI's two doubles fill the register.
++  const auto SrcSize = Op->Src[0].IsGPR() ? (fexc_slice1 && SrcElementSize == OpSize::i32Bit ? OpSize::i64Bit : OpSize::i128Bit) : OpSizeFromSrc(Op);
+   const auto DstSize = OpSizeFromDst(Op);
+   Ref Src = LoadSourceFPR_WithOpSize(Op, Op->Src[0], SrcSize, Op->Flags);
+   Ref Result = Vector_CVT_Float_To_Int32Impl(Op, DstSize, Src, SrcSize, SrcElementSize, HostRoundingMode, false /* TODO? */);
+diff --git a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+index 4437f33..ac32864 100644
+--- a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+@@ -247,10 +247,13 @@ private:
+       if (fexc_slice1 && Op->StoreSize == OpSize::i64Bit) StackNode = QuietSNaN(StackNode);   // natemu slice1 (I6)
+       if (fexc_slice1 && Op->StoreSize == OpSize::i64Bit && (fexc_x87_unmasked & 16)) {
+         // natemu slice1 (I5c): a nonzero double denormal stored to m64 is tiny (exact): x86's unmasked UE (SDM Vol.1 8.5.5).
++        // natemu slice1 (I5c review): tiny = the magnitude H = Bits << 1 is nonzero and its exponent field H >> 53 is zero (DBL_MIN
++        // is not tiny), flag-free: ((H >> 53) - 1) >> 63 and (H | -H) >> 63.
+         Ref Bits = IREmit->_VExtractToGPR(OpSize::i64Bit, OpSize::i64Bit, StackNode, 0);
+-        Ref Hi = IREmit->_Lshr(OpSize::i64Bit, IREmit->_Sub(OpSize::i64Bit, IREmit->_Lshl(OpSize::i64Bit, Bits, GetConstant(1)), GetConstant(1)),
+-                               GetConstant(53));
+-        Tiny = IREmit->_Lshr(OpSize::i64Bit, IREmit->_Sub(OpSize::i64Bit, Hi, GetConstant(1)), GetConstant(63));
++        Ref H = IREmit->_Lshl(OpSize::i64Bit, Bits, GetConstant(1));
++        Ref ExpZero = IREmit->_Lshr(OpSize::i64Bit, IREmit->_Sub(OpSize::i64Bit, IREmit->_Lshr(OpSize::i64Bit, H, GetConstant(53)), GetConstant(1)), GetConstant(63));
++        Ref NonZero = IREmit->_Lshr(OpSize::i64Bit, IREmit->_Or(OpSize::i64Bit, H, IREmit->_Neg(OpSize::i64Bit, H)), GetConstant(63));
++        Tiny = IREmit->_And(OpSize::i64Bit, ExpZero, NonZero);
+       }
+       IREmit->_StoreMemFPR(Op->StoreSize, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
+       break;
+-- 
+2.39.0
+

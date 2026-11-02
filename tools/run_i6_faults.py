@@ -11,7 +11,7 @@ that must not run; data pages may be not present or read-only, CR0 set by the pr
   - #PF (CR2 the first faulting byte's page, error P | W | U), #GP(0) or #SS(0) (RSP base) for a non-canonical operand;
   - at a fault: RIP the instruction, the general registers as the prelude left them, the x87 state as the prelude left it
     (TOP, tags, ST values, C0..C3) and no byte of a store written;
-  - a typed stop `unsupported_system` for an FCW clearing an exception mask (FLDCW, FLDENV, FRSTOR), before any effect;
+  - an FCW clearing an exception mask (FLDCW, FLDENV, FRSTOR) loads (I5c: unmasked exceptions are tools/run_i5c.py's);
     `unsupported_form` (no code) for FBSTP (a host helper; the transcendental, remainder and scale forms run since I6b:
     tools/run_i6b.py);
   - FLD m80 onto a full stack and FSTP m80 from an empty ST(0): IE and SF, C1 = 1 / 0, the indefinite loaded or stored;
@@ -82,9 +82,10 @@ def cases():
         out.append({'name': f'{ctl}-wait', 'lines': PRELUDE + cr0(bits) + ['fwait'] + AFTER, 'setup': [], 'want': want, 'cpl': 0,
                     'mem_check': None, 'x87': None, 'insn': 'fwait'})
     # Refusals.
-    out += [case('fldcw-unmasked', 'fldcw word ptr [rdi]', [f'memory {D + 0x200:#x} 7e03'], ['stop', 'unsupported_system'], x87=STATE0),
-            case('fldenv-unmasked', 'fldenv [rdi]', [f'memory {D + 0x200:#x} 7303'], ['stop', 'unsupported_system'], x87=STATE0),
-            case('frstor-unmasked', 'frstor [rdi]', [f'memory {D + 0x200:#x} 3302'], ['stop', 'unsupported_system'], x87=STATE0),
+    # (I5c: an FCW clearing a mask loads; unmasked x87 exceptions are tools/run_i5c.py's.)
+    out += [case('fldcw-unmasked', 'fldcw word ptr [rdi]', [f'memory {D + 0x200:#x} 7e03'], None, x87=STATE0),
+            case('fldenv-unmasked', 'fldenv [rdi]', [f'memory {D + 0x200:#x} 7303'], None),
+            case('frstor-unmasked', 'frstor [rdi]', [f'memory {D + 0x200:#x} 3302'], None),
             case('fldcw-masked-ok', 'fldcw word ptr [rdi]', [f'memory {D + 0x200:#x} 7f0f'], None),
             case('fbstp-refused', 'fbstp tbyte ptr [rdi]', [], ['nocode', 'unsupported_form']),
             case('lock-fadd', '.byte 0xf0, 0xd8, 0xc1', [], ['ud', 6, 0, 0], x87=STATE0)]

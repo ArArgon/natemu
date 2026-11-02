@@ -1,0 +1,238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: natemu <natemu@example.invalid>
+Date: Mon, 2 Nov 2026 12:00:00 +0000
+Subject: [PATCH] FEXCore: slice1 I5c: unmasked floating-point exceptions
+
+Under fexc_slice1 with unmasked MXCSR or FCW exceptions (fexc's
+--simd-unmasked / --x87-unmasked; nothing changes while every exception
+is masked): two check ops, FexcSimdCheck and FexcX87Check, placed by
+FexcPrecision::PlaceFPChecks at the start of flag elimination, right
+before the first op that commits anything of a floating-point
+instruction (fault points; register allocation coalesces no value into
+a static register across one, so their stubs see the state before the
+instruction). DPPS also checks after its multiply and (VFAddV) after its
+first add level. The x87 stack pass records each instruction's stack
+fault, stack overflow, invalid operand (FST m64's SNaN; FIST's NaN or
+out-of-range source, from the dispatcher) and exact-tiny (FST m64)
+values for its check, and folds the instruction's flags from the pending
+byte into the exception word at its end (a stack fault drops the
+operation's own flags). FNSTSW sets ES and B from the unmasked flags.
+---
+ FEXCore/Source/Interface/Core/JIT/JITClass.h       |  6 +++
+ FEXCore/Source/Interface/Core/JIT/VectorOps.cpp    |  1 +
+ .../Source/Interface/Core/OpcodeDispatcher/X87.cpp |  7 ++++
+ .../Interface/Core/OpcodeDispatcher/X87F64.cpp     |  1 +
+ FEXCore/Source/Interface/IR/IR.json                | 13 ++++++
+ .../Passes/RedundantFlagCalculationElimination.cpp |  3 ++
+ .../Interface/IR/Passes/RegisterAllocationPass.cpp |  2 +-
+ .../IR/Passes/x87StackOptimizationPass.cpp         | 48 ++++++++++++++++++++--
+ 8 files changed, 76 insertions(+), 5 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index 421bdbc..1440fca 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -560,6 +560,12 @@ private:
+   // natemu (fexc), profile slice1 (I6): x87 floating-point ops: FPSR into the x87 exception word, the x87 FPCR (shim/fexc_sites.inc).
+   bool FexcX87Op(const IR::IROp_Header* IROp);
+   void FexcX87Begin();
++  // natemu (fexc), profile slice1 (I5c): the #MF check of a waiting instruction and the exact-tiny underflow test (shim/fexc_sites.inc).
++  void FexcPendingCheck();
++  void FexcTinyCheck(const IR::IROp_Header* IROp, IR::Ref Node);
++  void FexcTinyLanes(ARMEmitter::VRegister R, uint32_t Elem, uint32_t Lanes, uint64_t Unmasked, uint32_t First = 0);
++  void FexcSimdCheckWords(uint32_t Mask);
++  void FexcSimdStep(ARMEmitter::VRegister R);
+   void FexcX87End();
+   // natemu (fexc), profile slice1 (I6b): PCMPxSTRx's intermediate result by the resident's `svc #STRING` (shim/fexc_sites.inc).
+   void FexcStringSvc(const IR::IROp_Header* IROp, IR::Ref Node);
+diff --git a/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp b/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
+index 555e4f0..780a2b3 100644
+--- a/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
+@@ -1215,6 +1215,7 @@ DEF_OP(VFAddV) {
+     // ASIMD doesn't support faddv, need to use multiple faddp to match behaviour.
+     if (ElementSize == IR::OpSize::i32Bit) {
+       faddp(SubRegSize.Vector, Dst.Q(), Vector.Q(), Vector.Q());
++      if (fexc_slice1) FexcSimdStep(Dst);   // natemu slice1 (I5c): DPPS's first add level has its own exception check
+       faddp(SubRegSize.Scalar, Dst, Dst);
+     } else {
+       faddp(SubRegSize.Scalar, Dst, Vector);
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+index 692d2e7..c684ccc 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+@@ -789,6 +789,13 @@ Ref OpDispatchBuilder::ReconstructFSW_Helper(Ref T) {
+     FSW = _Or(OpSize::i64Bit, FSW, _And(OpSize::i32Bit, Ex, Constant(0x41)));
+     FSW = _Or(OpSize::i64Bit, FSW, _And(OpSize::i32Bit, _Lshr(OpSize::i32Bit, Ex, Constant(6)), Constant(2)));
+     FSW = _Or(OpSize::i64Bit, FSW, _And(OpSize::i32Bit, _Lshl(OpSize::i32Bit, Ex, Constant(1)), Constant(0x3c)));
++    if (const uint64_t Unmasked = fexc_x87_unmasked) {
++      // natemu slice1 (I5c): ES (bit 7) and B (bit 15) are set while an exception flag whose mask is clear is set (SDM Vol.1
++      // 8.1.3.3: ES summarises the unmasked exception flags; B reflects ES).
++      Ref Pending = _And(OpSize::i64Bit, FSW, Constant(Unmasked));
++      Ref Any = _Lshr(OpSize::i64Bit, _Or(OpSize::i64Bit, Pending, _Neg(OpSize::i64Bit, Pending)), Constant(63));
++      FSW = _Orlshl(OpSize::i64Bit, _Orlshl(OpSize::i64Bit, FSW, Any, 7), Any, 15);
++    }
+   }
+ 
+   return FSW;
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87F64.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87F64.cpp
+index f254e28..62ec651 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87F64.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87F64.cpp
+@@ -140,6 +140,7 @@ void OpDispatchBuilder::FISTF64(OpcodeArgs, bool Truncate) {
+       Inexact = _Andn(OpSize::i64Bit, _Lshr(OpSize::i64Bit, _Or(OpSize::i64Bit, Diff2, _Neg(OpSize::i64Bit, Diff2)), Constant(63)), _Neg(OpSize::i64Bit, Mask));
+     }
+     Value = _Or(OpSize::i64Bit, _Andn(OpSize::i64Bit, Value, Mask), _And(OpSize::i64Bit, Mask, Constant(Indefinite)));
++    fexc_x87_extra[Op->PC].invalid = OutOfRange;   // natemu slice1 (I5c): an unmasked IE stores nothing (the x87 check's operand)
+     StoreResultGPR_WithOpSize(Op, Op->Dest, Value, Size, OpSize::i8Bit, MemoryAccessType::NONTSO);
+     if (Size != OpSize::i64Bit) {
+       // After the store (a #PF there leaves FSW as it was, except the FPSR flags already accumulated; plan I6 deviations).
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index 8812678..4fa6368 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -2896,6 +2896,19 @@
+         "DestSize": "OpSize::i64Bit",
+         "JITDispatch": true
+       },
++      "FexcSimdCheck u32:$Mask": {
++        "Desc": ["natemu slice1 (I5c): the SSE/AVX instruction's FPSR flags against the unmasked MXCSR exceptions $Mask (FPSR bit",
++                 "order): a hit branches to its #XM stub, else the flags fold into the SIMD flag byte (FexcPrecision::PlaceFPChecks)"
++                ],
++        "HasSideEffects": true
++      },
++      "FexcX87Check GPR:$Fault, GPR:$Overflow, GPR:$Invalid, GPR:$Tiny, u32:$Mask, u8:$Store": {
++        "Desc": ["natemu slice1 (I5c): the x87 instruction's flags (the pending byte, and its stack fault, overflow, invalid-operand and",
++                 "exact-tiny bits in 8..11) against $Mask: a hit branches to its x87 stub (an unmasked exception that leaves the operands",
++                 "unaltered; $Store: an FST/FSTP m32/m64)"
++                ],
++        "HasSideEffects": true
++      },
+       "FexcX87Svc u8:$Function": {
+         "Desc": ["natemu slice1 (I6b): the x87 instruction D9 $Function (F2XM1 FYL2X FPTAN FPATAN FXTRACT FPREM1 FPREM FYL2XP1",
+                  "FSINCOS FSCALE FSIN FCOS) run whole by the resident on the x87 state in the guest-state page (svc #X87)"
+diff --git a/FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp b/FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp
+index 70de16b..de94e05 100644
+--- a/FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/RedundantFlagCalculationElimination.cpp
+@@ -702,6 +702,9 @@ void DeadFlagCalculationEliminination::OptimizeParity(IREmitter* IREmit, IRListV
+ 
+ void DeadFlagCalculationEliminination::Run(IREmitter* IREmit) {
+   FEXCORE_PROFILE_SCOPED("PassManager::DFE");
++  if (fexc_slice1) {
++    FexcPrecision::PlaceFPChecks(IREmit);   // natemu slice1 (I5c): unmasked floating-point exception checks (fault points)
++  }
+ 
+   auto CurrentIR = IREmit->ViewIR();
+   fextl::deque<uint32_t> Worklist;
+diff --git a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+index 9276e03..ef04a28 100644
+--- a/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp
+@@ -644,7 +644,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
+           }
+         }
+ 
+-        if (fexc_slice1 && (FexcPrecision::GuestMemOp(IROp->Op) || IROp->Op == OP_GUESTOPCODE)) {
++        if (fexc_slice1 && (FexcPrecision::GuestMemOp(IROp->Op) || FexcPrecision::CheckOp(IROp->Op) || IROp->Op == OP_GUESTOPCODE)) {
+           if (FexcPrecision::LoadsInto(IROp->Op)) {
+             PreferredReg[IR->GetID(CodeNode).Value] = PhysicalRegister::Invalid();
+           }
+diff --git a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+index 82ed9bc..4437f33 100644
+--- a/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
++++ b/FEXCore/Source/Interface/IR/Passes/x87StackOptimizationPass.cpp
+@@ -5,6 +5,7 @@
+ #include "Interface/IR/IREmitter.h"
+ #include "Interface/IR/Passes.h"
+ #include <fexc_hook.h>
++#include <fexc_precision.h>
+ #include "Interface/IR/PassManager.h"
+ #include "FEXCore/IR/IR.h"
+ #include "FEXCore/Utils/Profiler.h"
+@@ -244,6 +245,13 @@ private:
+     }
+     case OpSize::i64Bit: {
+       if (fexc_slice1 && Op->StoreSize == OpSize::i64Bit) StackNode = QuietSNaN(StackNode);   // natemu slice1 (I6)
++      if (fexc_slice1 && Op->StoreSize == OpSize::i64Bit && (fexc_x87_unmasked & 16)) {
++        // natemu slice1 (I5c): a nonzero double denormal stored to m64 is tiny (exact): x86's unmasked UE (SDM Vol.1 8.5.5).
++        Ref Bits = IREmit->_VExtractToGPR(OpSize::i64Bit, OpSize::i64Bit, StackNode, 0);
++        Ref Hi = IREmit->_Lshr(OpSize::i64Bit, IREmit->_Sub(OpSize::i64Bit, IREmit->_Lshl(OpSize::i64Bit, Bits, GetConstant(1)), GetConstant(1)),
++                               GetConstant(53));
++        Tiny = IREmit->_Lshr(OpSize::i64Bit, IREmit->_Sub(OpSize::i64Bit, Hi, GetConstant(1)), GetConstant(63));
++      }
+       IREmit->_StoreMemFPR(Op->StoreSize, StackNode, AddrNode, Offset, Align, OffsetType, OffsetScale);
+       break;
+     }
+@@ -287,6 +295,11 @@ private:
+   bool Pushed = false, C1Zero = false;
+   Ref FaultResult(Ref Value);
+   Ref QuietSNaN(Ref Value);
++  // natemu slice1 (I5c): the guest RIP of the instruction being lowered, an FST m64's exact-tiny bit (an unmasked UE stores
++  // nothing), and the end of an instruction: its check operands recorded, its flags folded (FexcEndInstruction).
++  uint64_t FexcRip = ~0ull;
++  Ref Tiny {};
++  void FexcEndInstruction();
+   void StoreStackValueAtOffset_Slow(Ref Value, uint8_t Offset = 0, bool SetValid = true);
+   // Update Top value in slow path for a pop
+   void UpdateTopForPop_Slow(bool InvalidateTag = true);
+@@ -455,7 +468,33 @@ inline void X87StackOptimization::FlushStackFault() {
+   Pushed = C1Zero = false;
+ }
+ 
++inline void X87StackOptimization::FexcEndInstruction() {
++  // natemu slice1 (I5c): the instruction's check operands for FexcPrecision::PlaceFPChecks, and (unmasked x87 exceptions) its
++  // flags from the pending byte into the exception word, after everything it committed.
++  if (FexcRip != ~0ull && (Fault || Overflow || SNaN || Tiny)) {
++    auto& E = fexc_x87_extra[FexcRip];   // (FIST's out-of-range bit, the dispatcher's, may be there already)
++    E.fault = Fault;
++    E.overflow = Overflow;
++    if (SNaN) E.invalid = SNaN;
++    E.tiny = Tiny;
++  }
++  if (FexcRip != ~0ull && fexc_x87.count(FexcRip) && fexc_x87_unmasked) {
++    Ref Pending = IREmit->_LoadContextGPR(OpSize::i8Bit, FEXC_X87_PENDING);
++    // A stack fault has precedence over the operation's own exceptions (SDM Vol.1 4.9.2): their flags are dropped.
++    if (Fault) Pending = IREmit->_And(OpSize::i32Bit, Pending, IREmit->_Sub(OpSize::i32Bit, Fault, GetConstant(1)));
++    Ref Word = IREmit->_LoadContextGPR(OpSize::i32Bit, FEXC_X87_EXCEPTIONS);
++    IREmit->_StoreContextGPR(OpSize::i32Bit, IREmit->_Or(OpSize::i32Bit, Word, Pending), FEXC_X87_EXCEPTIONS);
++    IREmit->_StoreContextGPR(OpSize::i8Bit, GetConstant(0), FEXC_X87_PENDING);
++  }
++  Tiny = {};
++  if (Fault || SNaN || Pushed || C1Zero) {
++    FlushStackFault();
++  }
++}
++
+ inline void X87StackOptimization::Reset() {
++  FexcRip = ~0ull;
++  Tiny = {};
+   Fault = Overflow = OpFault = SNaN = {};
+   Pushed = C1Zero = false;
+   // natemu slice1 (I6): always the slow path, so the x87 state is in the guest-state page at every instruction boundary
+@@ -841,9 +880,10 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+ 
+     IREmit->SetCurrentCodeBlock(BlockNode);
+     for (auto [CodeNode, IROp] : CurrentIR.GetCode(BlockNode)) {
+-      if (fexc_slice1 && IROp->Op == OP_GUESTOPCODE && (Fault || SNaN || Pushed || C1Zero)) {
+-        IREmit->SetWriteCursorBefore(CodeNode);   // natemu slice1 (I6): the previous instruction's stack fault flags
+-        FlushStackFault();
++      if (fexc_slice1 && IROp->Op == OP_GUESTOPCODE) {
++        IREmit->SetWriteCursorBefore(CodeNode);   // natemu slice1 (I6, I5c): the previous instruction's stack fault flags, its checks
++        FexcEndInstruction();
++        FexcRip = HeaderOp->OriginalRIP + IROp->C<IROp_GuestOpcode>()->GuestEntryOffset;
+         continue;
+       }
+       if (!LoweredX87(IROp->Op)) {
+@@ -1352,7 +1392,7 @@ void X87StackOptimization::Run(IREmitter* Emit) {
+     IREmit->SetWriteCursorBefore(LastCodeNode);
+     SynchronizeStackValues();
+     FlushCachedRegs();
+-    if (fexc_slice1) FlushStackFault();
++    if (fexc_slice1) FexcEndInstruction();
+   }
+ }
+ 
+-- 
+2.39.0
+

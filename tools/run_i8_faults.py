@@ -199,7 +199,7 @@ def cases():
     out.append(case('vldmxcsr-ok', f'vldmxcsr dword ptr [{D + 0x400}]', [f'memory {D + 0x400:#x} 805f0000'], ['mxcsr', 0x5f80]))
     out.append(case('vstmxcsr-ok', f'vstmxcsr dword ptr [{D + 0x400}]', [], ['mem', D + 0x400, '801f0000']))
     out.append(case('vldmxcsr-reserved', f'vldmxcsr dword ptr [{D + 0x400}]', [f'memory {D + 0x400:#x} 801f0100'], GP))
-    out.append(case('vldmxcsr-unmasked', f'vldmxcsr dword ptr [{D + 0x400}]', [f'memory {D + 0x400:#x} 001f0000'], ['stop', 'unsupported_system']))
+    out.append(case('vldmxcsr-unmasked', f'vldmxcsr dword ptr [{D + 0x400}]', [f'memory {D + 0x400:#x} 001f0000'], ['mxcsr', 0x1f00]))   # I5c: loads
     out.append(case('vldmxcsr-notpresent', f'vldmxcsr dword ptr [{D + 0x1010}]', [f'unmap {D + 0x1000:#x}'], PF(D + 0x1010, False, False)))
     out.append(case('vstmxcsr-readonly', f'vstmxcsr dword ptr [{D + 0x1010}]', [f'readonly {D + 0x1000:#x}'], PF(D + 0x1010, True, True)))
     out.append(case('vstmxcsr-noncanonical-rsp', 'vstmxcsr dword ptr [rsp]', [], SS, regs={'rsp': NONCANON}))

@@ -102,8 +102,8 @@ def cases():
     # LDMXCSR / STMXCSR: #PF, reserved bits, then the transaction.
     out += [case('ldmxcsr-notpresent', f'ldmxcsr dword ptr [{D + 0x1010}]', [f'unmap {D + 0x1000:#x}'], PF(D + 0x1010, False, False)),
             case('ldmxcsr-reserved', 'ldmxcsr dword ptr [rdi]', [f'memory {D + 0x200:#x} 801f0100'], ['gp', 13, 0, 0]),
-            # Clearing an exception mask: unmasked SIMD exceptions are not built, a typed stop before any effect.
-            case('ldmxcsr-unmasked', 'ldmxcsr dword ptr [rdi]', [f'memory {D + 0x200:#x} 001f0000'], ['stop', 'unsupported_system']),
+            # Clearing an exception mask (I5c: unmasked SIMD exceptions are built, tools/run_i5c.py): it loads.
+            case('ldmxcsr-unmasked', 'ldmxcsr dword ptr [rdi]', [f'memory {D + 0x200:#x} 001f0000'], None),
             case('ldmxcsr-masked-ok', 'ldmxcsr dword ptr [rdi]', [f'memory {D + 0x200:#x} c0ff0000'], None),
             case('ldmxcsr-noncanonical-rsp', 'ldmxcsr dword ptr [rsp]', [], ['ss', 12, 0, 0], regs={'rsp': NONCANON}),
             case('stmxcsr-readonly', f'stmxcsr dword ptr [{D + 0x1010}]', [f'readonly {D + 0x1000:#x}'], PF(D + 0x1010, True, True),

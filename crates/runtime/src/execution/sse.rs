@@ -6,9 +6,10 @@
 //! under other controls than it was made under (K1: control changes keep the code). Obligation on every path that changes
 //! CR0.EM, CR0.TS or CR4.OSFXSR (MOV CR0/CR4 today; INIT/SIPI, CLTS, LMSW and task switches if ever added, host edits of
 //! the bank): the next lookup must use the new context (it is computed from the bank at every lookup), or flush. Every MXCSR exception
-//! flag, DE included, comes from FPSR (`mxcsr_flags`: IDC is DE unless DAZ). Unmasked SIMD exceptions (#XM, or #UD without
-//! OSXMMEXCPT) are not built: an LDMXCSR that would clear any exception mask stops `unsupported_system` before any effect
-//! (the plan's I5c holds the design; FP trap enables stay clear: FPCR is built from MXCSR without them).
+//! flag, DE included, comes from FPSR (`mxcsr_flags`: IDC is DE unless DAZ). Unmasked SIMD exceptions (I5c): blocks made
+//! under an MXCSR with a mask clear (part of `Cpu::code_context`) check each floating-point instruction's flags before it
+//! commits anything; a hit reaches [`exception`] (#XM, or #UD without OSXMMEXCPT), a pass moves its flags into the SIMD flag
+//! byte (banked here). FP trap enables stay clear: FPCR is built from MXCSR without them.
 use super::segments::{Exception, address, linear};
 use super::*;
 
@@ -22,13 +23,27 @@ pub(super) fn fill(f: &mut NativeFrame, c: &Cpu) {
     f.fpcr = fpcr(c.mxcsr);
     f.fpsr = 0;
 }
-/// XMM from v16..v31 and the exception flags FPSR accumulated since the entry into the bank.
+/// XMM from v16..v31 and the exception flags FPSR accumulated since the entry into the bank, with (I5c) those checked
+/// instructions moved into the SIMD flag byte.
 pub(super) fn bank(c: &mut Cpu, f: &NativeFrame) {
     for (x, q) in c.xmm.iter_mut().zip(&f.q[XMM_VREG..]) {
         let v = u128::from_le_bytes(*q);
         *x = [v as u64, (v >> 64) as u64];
     }
-    c.mxcsr |= mxcsr_flags(f.fpsr, c.mxcsr);
+    c.mxcsr |= mxcsr_flags(f.fpsr | checked(), c.mxcsr);
+}
+/// I5c: the SIMD flag byte (FPSR order): the flags of the instructions checked for unmasked SIMD exceptions since the entry.
+fn checked() -> u64 {
+    // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA; the byte lies inside it.
+    unsafe { u64::from((FRAME_VA as *const u8).add(frame::SIMD_FLAGS as usize).read_volatile()) }
+}
+
+/// I5c: an SSE/AVX instruction's check found an unmasked SIMD exception (its stub; SDM Vol.1 11.5.3, Vol.3 events 19 and 6):
+/// the bank holds the state before the instruction, `raised` its operation's FPSR flags. MXCSR gets the flags the SDM's
+/// precedence leaves ([`simd_fault_flags`]), then #XM, or #UD without CR4.OSXMMEXCPT. The destination is unchanged.
+pub(super) fn exception(c: &mut Cpu, before: u64, raised: u64) -> Exception {
+    c.mxcsr = before | mxcsr_flags(checked() | simd_fault_flags(raised, before), before);
+    if c.cr4 & CR4_OSXMMEXCPT != 0 { [19, 0, 0] } else { UD }
 }
 
 /// #UD or #NM for an SSE instruction under `c`'s controls (#UD first: SDM Vol.2 2.5, the SIMD exception classes: CR0.EM,
@@ -65,10 +80,8 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         if value & !MXCSR_MASK != 0 {
             return Err(GP);
         }
-        // ponytail: unmasked SIMD exceptions are refused, not raised; #XM needs per-instruction checks (plan I5a).
-        if value & MXCSR_MASKS != MXCSR_MASKS {
-            halt(s, stop::UNSUPPORTED_SYSTEM)
-        }
+        // I5c: new masks re-key the code (`Cpu::code_context`); a flag set with its mask clear raises nothing until an
+        // instruction raises it again (SDM Vol.3 event 19).
         s.cpu.mxcsr = value;
     } else {
         let mut buf = (s.cpu.mxcsr as u32).to_le_bytes();
