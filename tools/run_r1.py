@@ -783,22 +783,520 @@ def run_one(a, name, report):
     return [f'{name}: {p}' for p in entry['problems']]
 
 
+# ==================================================================================================================
+# R1b: multi-vCPU composites (N = 2, 3, 4), block sizes default and 1. QEMU's BSP is x2APIC with peers, so the IPI
+# and NMI programs use x2APIC. Composites 2-4 are one program each, run by pinned QEMU and natemu; composite 1
+# needs a natemu build (the BSP wakes APs through the ACPI mailbox) and a QEMU build (its stub starts the APs at
+# the same vector), as run_x4.py does. With peers the delivery logs (which vector landed when, the TSC) are not
+# deterministic, so only exact counts, the per-CPU end registers (cleared to a known value), and deterministic
+# captured memory are compared; SDM invariants (LSL = the CPU number, no lost or duplicated IPI, EOI leaving the
+# ISR clear) are judged on both machines. Every address is below 4 MiB and clear of the smp stub's reserved ranges
+# (0x100000-0x10c000, 0x3e0000-0x3f0000); programs that change the GS base restore the start-up value before the
+# end, since QEMU's stub capture is GS-relative. The GS base is saved with RDGSBASE and set with WRGSBASE
+# (CR4.FSGSBASE on), and the start-up GS base differs between the machines, so it is never compared.
+import entry as E  # noqa: E402
+from models import delivery_model as dm  # noqa: E402
+from run_slice3_vm import qemu_reference, smp_description as s3_desc, driver as s3_driver  # noqa: E402
+
+# Clear every GPR but RSP, then the flag-defining compare apic/sys append: machine-specific end registers compare equal.
+CLEAR = '\n'.join(f'    xor {r}, {r}' for r in ('eax', 'ebx', 'ecx', 'edx', 'esi', 'edi', 'ebp', 'r8d', 'r9d', 'r10d', 'r11d', 'r12d', 'r13d', 'r14d', 'r15d'))
+
+
+def nat_desc(prog, mailbox=None):
+    """natemu driver description: start IF = 0, IOPL 3 as on QEMU's stub; `mailbox` = {cpu index: GPA} for APs."""
+    lines, out, k = s3_desc(prog).splitlines(), [], -1
+    for line in lines:
+        if line.startswith('rflags'): line = 'rflags 0x3000'
+        out.append(line)
+        if line == 'cpu': k += 1
+        if line.startswith('rip'):
+            out.append('if 0')
+            if mailbox and k in mailbox: out.append(f'mailbox {mailbox[k]:#x}')
+    return '\n'.join(out) + '\n'
+
+
+def run_nat(a, prog_or_desc, work, extra, desc=False, prog=None):
+    work.mkdir(parents=True, exist_ok=True)
+    text = prog_or_desc if desc else nat_desc(prog_or_desc)
+    rc, out, err = s3_driver(a.host, a.runtime, a.fexc, text, work, extra, timeout=300)
+    if rc: return None, [f'driver exit {rc}: {err.strip()[-300:]}']
+    problems = []
+    if prog is not None:
+        from run_slice3_vm import body_end, per_vcpu_checks
+        for v, c in enumerate(out['cpus']):
+            end = body_end(prog, smp.num(prog['cpus'][v]['rip']))
+            if c['stop'] != 'reached' or smp.num(c['rip']) != end:
+                problems.append(f"cpu{v} stopped {c['stop']} {c['reason']} at {c['rip']} (end {end:#x})")
+            problems += [f'cpu{v} ' + d for d in per_vcpu_checks(c)]
+    return out, problems
+
+
+def captured(prog, out):
+    """natemu's captured regions in smp.parse_dump's shape (GPRs, RFLAGS, captured memory)."""
+    mem = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in out['cpus'][0]['memory']}
+    return {'cpus': [{'gpr': [smp.num(x) for x in c['gpr']], 'rflags': smp.num(c['rflags'])} for c in out['cpus']],
+            'memory': [{'addr': smp.num(r['addr']), 'data': mem[smp.num(r['addr'])]} for r in prog['memory'] if r.get('capture', True)]}
+
+
+def drop_apic_timing(prog, n):
+    """apic.build captures the IDTR+log-cursor page and the log; with peers these are timing-dependent. Keep COUNTS
+    (exact) captured; add a small deterministic DATA head."""
+    for r in prog['memory']:
+        if any(r['addr'] in (f'0x{apic.A(i) + 0x1000:x}', f'0x{apic.LOG(i):x}', f'0x{apic.RING(i):x}') for i in range(n)):
+            r['capture'] = False
+
+
+# ---- r1b-mpstart: ACPI MP-wakeup AP start into a kernel-head-shaped AP sequence --------------------------------
+MP_MB = 0x130000                                  # the ACPI wakeup mailbox (natemu build only)
+MP_V = lambda i: 0x120000 + 0x1000 * i            # AP i's wakeup vector (its head sequence)
+MP_GDT = lambda i: 0x140000 + 0x1000 * i          # per-AP GDT (+0x80 GDTR, +0x90 IDTR)
+MP_IDT = lambda i: 0x150000 + 0x1000 * i
+MP_PC = lambda i: 0x160000 + 0x1000 * i           # per-AP GS block
+MP_OUT = lambda i: 0x170000 + 0x100 * i           # recorded: [0] apic id, [8] sgdt, [0x10] sidt, [0x18] gs set, [0x20] rsp, [0x28] cs, [0x30] stamp
+MP_ARRIVE = 0x180000
+MP_STK = lambda i: 0x1a0000 + 0x2000 * i + 0x1ff0
+MP_SAVE = lambda i: 0x1b0000 + 0x40 * i   # start-up GS base saved here
+MP_BSP = 0x110000
+
+
+def mp_head(i, variant=False):
+    gs = MP_PC(0 if variant else i)               # negative control: every AP uses CPU 0's per-CPU block
+    o, sv = MP_OUT(i), MP_SAVE(i)
+    return f"""bits 64
+    mov ecx, 0xc0000101
+    rdmsr
+    mov [{sv:#x}], eax
+    mov [{sv + 4:#x}], edx
+    lgdt [{MP_GDT(i) + 0x80:#x}]
+    mov eax, 0x10
+    mov ss, eax
+    mov ds, eax
+    mov es, eax
+    mov rsp, {MP_STK(i):#x}
+    push 0x08
+    lea rax, [rel mp_cs{i}]
+    push rax
+    o64 retf
+mp_cs{i}:
+    lidt [{MP_GDT(i) + 0x90:#x}]
+    mov ecx, 0xc0000101
+    mov eax, {gs & 0xffffffff:#x}
+    mov edx, {gs >> 32:#x}
+    wrmsr
+    mov eax, 1
+    cpuid
+    shr ebx, 24
+    mov [{o:#x}], rbx
+    sgdt [{o + 8:#x}]
+    sidt [{o + 0x10:#x}]
+    mov rcx, {gs:#x}
+    mov [{o + 0x18:#x}], rcx
+    mov [{o + 0x20:#x}], rsp
+    mov ecx, cs
+    mov [{o + 0x28:#x}], rcx
+    mov qword [gs:0], {0x100 + i:#x}
+    mov rax, [{gs:#x}]
+    mov [{o + 0x30:#x}], rax
+    mov ecx, 0xc0000101
+    mov eax, [{sv:#x}]
+    mov edx, [{sv + 4:#x}]
+    wrmsr
+    lock inc dword [{MP_ARRIVE:#x}]
+""" + CLEAR + '\n    cmp r11, r11\n'
+
+
+def mp_gdt_region(i):
+    g = bytearray(0x100)
+    for sel, raw in {0x08: sm.code(), 0x10: sm.data(), 0x18: sm.data(3), 0x20: sm.code(3)}.items():
+        g[sel:sel + 8] = raw.to_bytes(8, 'little')
+    g[0x80:0x8a] = (0x27).to_bytes(2, 'little') + q(MP_GDT(i))
+    g[0x90:0x9a] = (16 * 32 - 1).to_bytes(2, 'little') + q(MP_IDT(i))
+    return {'addr': f'0x{MP_GDT(i):x}', 'data': g.hex(), 'capture': False}
+
+
+def mpstart_program(n, variant=False, natemu=False):
+    bodies, cpus, mem = [], [], []
+    for i in range(n):
+        if i == 0:
+            wake = ''.join(f"""    mov dword [{MP_MB + 4:#x}], {j}
+    mov rax, {MP_V(j):#x}
+    mov [{MP_MB + 8:#x}], rax
+    mov word [{MP_MB:#x}], 1
+mp_w{j}: pause
+    cmp word [{MP_MB:#x}], 0
+    jne mp_w{j}
+""" for j in range(1, n)) if natemu else ''
+            text = 'bits 64\n' + wake + f"""mp_all: pause
+    cmp dword [{MP_ARRIVE:#x}], {n - 1}
+    jne mp_all
+""" + CLEAR + '\n    cmp r11, r11\n'
+            bodies.append({'addr': f'0x{MP_BSP:x}', 'code': P.asm(text).hex()})
+            cpus.append({'rip': f'0x{MP_BSP:x}', 'gpr': [f'0x{x:x}' for x in ([0] * 4 + [MP_STK(0)] + [0] * 11)], 'rflags': 0, 'cpl': 0})
+        else:
+            bodies.append({'addr': f'0x{MP_V(i):x}', 'code': P.asm(mp_head(i, variant)).hex()})
+            cpus.append({'rip': f'0x{MP_V(i):x}', 'gpr': [f'0x{x:x}' for x in ([0] * 4 + [MP_STK(i)] + [0] * 11)], 'rflags': 0, 'cpl': 0})
+        mem += [mp_gdt_region(i), dict(P.zero(MP_IDT(i), 0x100), capture=False), dict(P.zero(MP_PC(i), 0x100), capture=False),
+                dict(P.zero(MP_STK(i) - 0xff0, 0x1000), capture=False), dict(P.zero(MP_SAVE(i), 0x40), capture=False), P.zero(MP_OUT(i), 0x40)]
+    mem += [P.zero(MP_ARRIVE, 8)]
+    if natemu: mem.append(dict(P.zero(MP_MB, 0x1000), capture=False))
+    return {'format': 'natemu-smp-v1', 'name': f'r1b-mpstart@{n}', 'ncpu': n, 'system': True, 'bodies': bodies, 'cpus': cpus,
+            'memory': [{**m, 'addr': m['addr'] if isinstance(m['addr'], str) else f"0x{m['addr']:x}"} for m in mem]}
+
+
+def mpstart_expect(n):
+    def e(st, labels):
+        out = [('every AP checked in', st.m(MP_ARRIVE) & 0xffffffff, n - 1)]
+        for i in range(1, n):
+            o = MP_OUT(i)
+            out.append((f'AP{i}: APIC id, GDT base, IDT base, GS base set, RSP, CS, per-CPU stamp',
+                        [st.m(o) & 0xffffffff, st.m(o + 10, 8) & ((1 << 48) - 1), st.m(o + 0x10 + 2, 8) & ((1 << 48) - 1),
+                         st.m(o + 0x18), st.m(o + 0x20), st.m(o + 0x28) & 0xffff, st.m(o + 0x30)],
+                        [i, MP_GDT(i), MP_IDT(i), MP_PC(i), MP_STK(i), 0x08, 0x100 + i]))
+        return out
+    return e
+
+
+# ---- r1b-poke: cross-CPU text_poke_bp while peers execute the site -----------------------------------------------
+FN = 0x340000                                     # the shared run-time code page (coherence pattern: `ret` body at +0,
+FNC = FN + 0x10                                   # the patchable function (mov eax, imm32; ret) in the captured region at +0x10
+K0, K2 = 0x1111, 0x2222
+SYNC_V = 0x50
+PK_READY, PK_DONE = apic.SHARED, apic.SHARED + 0x80
+
+
+def poke_program(n, variant=False):
+    m, first = 'x2', (0xb9 if variant else 0xb8)
+    drive = ['    mov r12, 1']
+    for j in range(1, n):
+        drive += [f'pk_r{j}:', '    pause', f'    cmp qword [{PK_READY + 8 * j:#x}], 1', f'    jne pk_r{j}']
+
+    def sync(tag):
+        out = []
+        for j in range(1, n):
+            # Read the baseline count BEFORE sending, so a delivery between send and read cannot make the wait target too high.
+            out += [f'    mov r9, [{apic.COUNTS(j) + 8 * SYNC_V:#x}]', '    inc r9', apic.send(m, SYNC_V, j),
+                    f'pk_s{tag}{j}:', '    pause', f'    cmp qword [{apic.COUNTS(j) + 8 * SYNC_V:#x}], r9', f'    jne pk_s{tag}{j}']
+        return '\n'.join(out)
+    # text_poke_bp: INT3 on the opcode byte; sync; the imm tail; sync; the new opcode byte; sync.
+    drive += [f'    mov byte [{FNC:#x}], 0xcc', sync('a'),
+              f'    mov dword [{FNC + 1:#x}], {K2:#x}', sync('b'),
+              f'    mov byte [{FNC:#x}], {first:#x}', sync('c'), '    mov r12, 3']
+    for j in range(1, n):
+        drive += [f'pk_k{j}:', '    pause', f'    cmp qword [{apic.DATA(j):#x}], {K2:#x}', f'    jne pk_k{j}']
+    drive += ['    cli', f'    mov qword [{PK_DONE:#x}], 1', CLEAR]
+    texts = ['\n'.join(drive)]
+    for j in range(1, n):
+        peer = ['    sti', f'    mov qword [{PK_READY + 8 * j:#x}], 1', f'pk_loop{j}:', f'    mov rax, {FNC:#x}', '    call rax',
+                f'    mov [{apic.DATA(j):#x}], rax', f'    cmp eax, {K0:#x}', f'    je pk_ok{j}', f'    cmp eax, {K2:#x}', f'    je pk_ok{j}',
+                f'    inc qword [{apic.DATA(j) + 8:#x}]', f'pk_ok{j}:',
+                # A short compute delay between calls: real code calls a patched site periodically, not in a tight hammer
+                # (a continuous store/execute collision on one page makes natemu step every instruction, H section 4).
+                '    mov ecx, 400', f'pk_d{j}:', '    dec ecx', f'    jnz pk_d{j}',
+                f'    cmp qword [{PK_DONE:#x}], 1', f'    jne pk_loop{j}', '    cli', CLEAR]
+        texts.append('\n'.join(peer))
+    # INT3 pushes the RIP after the 0xCC byte (FNC + 1); emulate the mov (rax = K2) and resume at the ret (FNC + 5).
+    bp = '\n'.join([f'    cmp qword [rsp+48], {FNC + 1:#x}', '    jne pk_bp_out', f'    mov qword [rsp+40], {K2:#x}',
+                    f'    mov qword [rsp+48], {FNC + 5:#x}', 'pk_bp_out:'])
+    # The sync IPI's handler returns via the IRETQ apic.build emits: that IRETQ is the serializing sync_core (an
+    # IRET-to-self), so the body needs nothing more.
+    prog, labels = apic.build('r1b-poke', m, texts, [3, SYNC_V], {3: bp})
+    for r_ in prog['memory']:
+        if any(r_['addr'] == f'0x{apic.COUNTS(i):x}' for i in range(n)):  # vector 3 (#BP) count is timing-dependent
+            r_['capture'] = False
+    # The run-time code page: a `ret` body at +0 marks it writable+executable; the function and its final bytes live in
+    # the captured region at +0x10 (coherence pattern). QEMU maps all RAM executable, so the body is a no-op there.
+    prog['bodies'].append({'addr': f'0x{FN:x}', 'code': P.asm('ret').hex()})
+    prog['memory'].append({'addr': f'0x{FNC:x}', 'data': (P.asm(f'mov eax, {K0:#x}') + P.asm('ret') + bytes(0xff0 - 6)).hex()})
+    drop_apic_timing(prog, n)
+    return prog, labels
+
+
+def poke_expect(n):
+    def e(st, labels):
+        out = [('final function bytes = mov eax, K2; ret', st.mb(FNC, 6).hex(), (P.asm(f'mov eax, {K2:#x}') + P.asm('ret')).hex())]
+        for j in range(1, n):
+            out.append((f'peer{j}: last result K2, no torn value ever seen', [st.m(apic.DATA(j)), st.m(apic.DATA(j) + 8)], [K2, 0]))
+        # (Each of the 3 sync IPIs per peer is handshaked by cpu 0, so reaching the end proves they were all delivered;
+        # the #BP count is timing-dependent and is not compared.)
+        return out
+    return e
+
+
+# ---- r1b-nmi: NMI by IPI, IST stack, LSL of a per-CPU descriptor, RDGSBASE/WRGSBASE/SWAPGS ------------------------
+NC = lambda i: 0x110000 + 0x8000 * i              # per-CPU code
+N_GDT = lambda i: 0x150000 + 0x1000 * i           # +0x80 GDTR, +0x90 IDTR
+N_IDT = lambda i: 0x160000 + 0x1000 * i
+N_TSS = lambda i: 0x170000 + 0x1000 * i
+N_STK = lambda i: 0x180000 + 0x2000 * i + 0xff0
+N_PC = lambda i: 0x190000 + 0x1000 * i            # per-CPU GS block
+N_CNT = lambda i: 0x1a0000 + 0x100 * i            # [0] NMIs counted, [8] LSL result (captured)
+N_SH = 0x1d0000                                   # ready[i] at +8i, done at +0x80
+N_SAVE = lambda i: 0x1e0000 + 0x40 * i            # start-up GS base
+N_TABLE = 0x1c0000                                # per-CPU canonical GS bases, indexed by CPU number
+N_K = 8
+
+
+def nmi_handler_text(i):
+    """paranoid NMI: rdgsbase save, LSL cpu#, wrgsbase canonical, swapgs pair, count, record, restore."""
+    return f"""nmi_handler:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    rdgsbase rbx
+    mov eax, {E.CPUNODE:#x}
+    db 0x48
+    lsl eax, eax
+    and eax, 0xfff
+    mov rcx, rax
+    mov rax, [{N_TABLE:#x} + rcx*8]
+    wrgsbase rax
+    swapgs
+    swapgs
+    inc qword [gs:0]
+    mov rax, {N_CNT(0):#x}
+    shl rcx, 8
+    add rax, rcx
+    shr rcx, 8
+    mov rdx, [gs:0]
+    mov [rax], rdx
+    mov [rax + 8], rcx
+    wrgsbase rbx
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    iretq
+"""
+
+
+def nmi_body(i, n):
+    setup = f"""bits 64
+    mov ecx, 0xc0000101
+    rdmsr
+    mov [{N_SAVE(i):#x}], eax
+    mov [{N_SAVE(i) + 4:#x}], edx
+    lgdt [{N_GDT(i) + 0x80:#x}]
+    mov eax, 0x10
+    mov ss, eax
+    mov ds, eax
+    mov es, eax
+    mov eax, 0x30
+    ltr ax
+    lidt [{N_GDT(i) + 0x90:#x}]
+    mov rax, cr4
+    bts rax, 16
+    mov cr4, rax
+    mov ecx, 0x1b
+    rdmsr
+    or eax, 0xc00
+    wrmsr
+    mov ecx, 0x80f
+    mov eax, 0x1ff
+    xor edx, edx
+    wrmsr
+    mov ecx, 0xc0000101
+    mov eax, {N_PC(i) & 0xffffffff:#x}
+    mov edx, {N_PC(i) >> 32:#x}
+    wrmsr
+    mov ecx, 0xc0000102
+    mov eax, {N_PC(i) & 0xffffffff:#x}
+    mov edx, {N_PC(i) >> 32:#x}
+    wrmsr
+"""
+    if i == 0:
+        role = []
+        for j in range(1, n):
+            role += [f'nmi_rdy{j}:', '    pause', f'    cmp qword [{N_SH + 8 * j:#x}], 1', f'    jne nmi_rdy{j}']
+        for j in range(1, n):
+            role += [f'    mov r8d, {N_K}', f'nmi_send{j}:', f'    mov ecx, 0x830', '    mov eax, 0x400', f'    mov edx, {j}', '    wrmsr',
+                     f'    mov r9, {N_K + 1}', '    sub r9, r8', f'nmi_w{j}:', '    pause', f'    cmp qword [{N_CNT(j):#x}], r9',
+                     f'    jne nmi_w{j}', '    dec r8d', f'    jnz nmi_send{j}']
+        role += [f'    mov qword [{N_SH + 0x80:#x}], 1']
+        tail = '\n'.join(role)
+    else:
+        tail = '\n'.join(['    sti', f'    mov qword [{N_SH + 8 * i:#x}], 1', 'nmi_spin:', '    pause',
+                          f'    cmp qword [{N_SH + 0x80:#x}], 1', '    jne nmi_spin', '    cli'])
+    restore = f'    mov ecx, 0xc0000101\n    mov eax, [{N_SAVE(i):#x}]\n    mov edx, [{N_SAVE(i) + 4:#x}]\n    wrmsr\n'
+    return 'bits 64\n    jmp nmi_start\n' + nmi_handler_text(i) + 'nmi_start:\n' + setup[len('bits 64\n'):] + tail + '\n' + restore + CLEAR + '\n    cmp r11, r11\n'
+
+
+def nmi_program(n, variant=False):
+    bodies, cpus, mem = [], [], []
+    for i in range(n):
+        code, labels = P.ref_assemble(nmi_body(i, n))
+        base = NC(i)
+        bodies.append({'addr': f'0x{base:x}', 'code': code.hex()})
+        cpus.append({'rip': f'0x{base:x}', 'gpr': [f'0x{x:x}' for x in ([0] * 4 + [P.STACK(i)] + [0] * 11)], 'rflags': 0, 'cpl': 0})
+        g = bytearray(0x100)
+        for sel, raw in {0x08: sm.code(), 0x10: sm.data(), 0x18: sm.data(3), 0x20: sm.code(3)}.items():
+            g[sel:sel + 8] = raw.to_bytes(8, 'little')
+        g[0x30:0x40] = sm.system_descriptor(N_TSS(i), 0x67, 9)
+        lim = 0 if variant else i                 # negative control: CPU/node limit 0 on every CPU
+        g[0x78:0x80] = (lim & 0xffff | 5 << 40 | 1 << 44 | 3 << 45 | 1 << 47 | (lim >> 16 & 0xf) << 48 | 1 << 54).to_bytes(8, 'little')
+        g[0x80:0x8a] = (0x7f).to_bytes(2, 'little') + q(N_GDT(i))
+        g[0x90:0x9a] = (16 * 0x30 - 1).to_bytes(2, 'little') + q(N_IDT(i))
+        tss = dm.tss(rsp=(N_STK(i), 0, 0), ist=(N_STK(i),) + (0,) * 6)
+        idt = bytearray(16 * 0x30)
+        idt[2 * 16:2 * 16 + 16] = dm.gate(base + labels['nmi_handler'], 0x08, ist=1)
+        mem += [{'addr': f'0x{N_GDT(i):x}', 'data': g.hex(), 'capture': False},
+                {'addr': f'0x{N_TSS(i):x}', 'data': bytes(tss).hex(), 'capture': False},
+                {'addr': f'0x{N_IDT(i):x}', 'data': bytes(idt).hex(), 'capture': False},
+                dict(P.zero(N_STK(i) - 0xff0, 0x1000), capture=False), dict(P.zero(N_PC(i), 0x100), capture=False),
+                dict(P.zero(N_SAVE(i), 0x40), capture=False), P.zero(N_CNT(i), 0x10)]
+    table = b''.join(q(N_PC(i)) for i in range(n))
+    mem += [{'addr': f'0x{N_TABLE:x}', 'data': table.hex(), 'capture': False}, dict(P.zero(N_SH, 0x100), capture=False)]
+    return {'format': 'natemu-smp-v1', 'name': f'r1b-nmi@{n}', 'ncpu': n, 'system': True, 'bodies': bodies, 'cpus': cpus, 'memory': mem}, {}
+
+
+def nmi_expect(n):
+    def e(st, labels):
+        return [(f'CPU{i}: NMIs counted, LSL gave the CPU number', [st.m(N_CNT(i)), st.m(N_CNT(i) + 8)], [N_K, i]) for i in range(1, n)]
+    return e
+
+
+# ---- r1b-ipiload: all-to-all fixed IPIs under memory-heavy loops -------------------------------------------------
+IL_V = lambda s, t: 0x40 + 4 * s + t              # CPU s -> CPU t vector (>= 0x40, distinct per ordered pair)
+IL_K, IL_ITERS = 30, 4000
+IL_PAGE = lambda i: 0x350000 + 0x1000 * i
+IL_READY, IL_DONE = apic.SHARED, apic.SHARED + 0x100
+IL_SENT = lambda s, t: apic.SHARED + 0x200 + 8 * (4 * s + t)
+IL_RECV = lambda t, s: apic.SHARED + 0x300 + 8 * (4 * t + s)
+
+
+def ipiload_program(n, variant=False):
+    m = 'x2'
+    texts, bodies = [], []
+    for s in range(n):
+        page, peers = IL_PAGE(s), [t for t in range(n) if t != s]
+        lines = ['    sti', f'    mov qword [{IL_READY + 8 * s:#x}], 1']
+        for t in range(n):
+            lines += [f'il_rdy{s}_{t}:', '    pause', f'    cmp qword [{IL_READY + 8 * t:#x}], 1', f'    jne il_rdy{s}_{t}']
+        lines += ['    xor r15d, r15d', f'    mov r14, {0x9e3779b97f4a7c15 + s:#x}', f'    mov r13d, {IL_ITERS}', f'il_loop{s}:',
+                  '    mov rax, 6364136223846793005', '    imul r14, rax', '    mov rax, 1442695040888963407', '    add r14, rax',
+                  '    mov rax, r14', '    shr rax, 55', f'    mov rcx, [{page:#x} + rax*8]', '    add rcx, r14', f'    mov [{page:#x} + rax*8], rcx', '    add r15, rcx']
+        for t in peers:
+            kk = (IL_K - 1) if (variant and (s, t) == (0, 1)) else IL_K
+            lines += [f'    mov rax, [{IL_SENT(s, t):#x}]', f'    cmp rax, {kk}', f'    jae il_skip{s}_{t}',
+                      f'    cmp rax, [{IL_RECV(t, s):#x}]', f'    jne il_skip{s}_{t}', '    mov ecx, 0x830', f'    mov eax, {IL_V(s, t):#x}',
+                      f'    mov edx, {t}', '    wrmsr', f'    inc qword [{IL_SENT(s, t):#x}]', f'il_skip{s}_{t}:']
+        lines += ['    dec r13d', f'    jnz il_loop{s}', f'il_drain{s}:', '    pause']
+        for t in peers:
+            kk = (IL_K - 1) if (variant and (s, t) == (0, 1)) else IL_K
+            lines += [f'    mov rax, [{IL_SENT(s, t):#x}]', f'    cmp rax, {kk}', f'    jae il_fdone{s}_{t}',
+                      f'    cmp rax, [{IL_RECV(t, s):#x}]', f'    jne il_drain{s}', '    mov ecx, 0x830', f'    mov eax, {IL_V(s, t):#x}',
+                      f'    mov edx, {t}', '    wrmsr', f'    inc qword [{IL_SENT(s, t):#x}]', f'    jmp il_drain{s}', f'il_fdone{s}_{t}:']
+        lines += [f'    mov qword [{IL_DONE + 8 * s:#x}], 1', f'il_wait{s}:', '    pause']
+        for u in range(n):
+            if u != s:
+                ku = (IL_K - 1) if (variant and (u, s) == (0, 1)) else IL_K
+                lines += [f'    cmp qword [{IL_RECV(s, u):#x}], {ku}', f'    jne il_wait{s}']
+            lines += [f'    cmp qword [{IL_DONE + 8 * u:#x}], 1', f'    jne il_wait{s}']
+        lines += ['    cli', f'    mov [{apic.DATA(s):#x}], r15', apic.rd(m, apic.ISR + 2), f'    mov [{apic.DATA(s) + 8:#x}], eax',
+                  apic.rd(m, apic.PPR), f'    mov [{apic.DATA(s) + 0x10:#x}], eax', CLEAR]
+        texts.append('\n'.join(lines))
+        bodies.append({IL_V(u, s): f'    inc qword [{IL_RECV(s, u):#x}]' for u in peers})
+    vectors = sorted({IL_V(s, t) for s in range(n) for t in range(n) if s != t})
+    prog, labels = apic.build('r1b-ipiload', m, texts, vectors, bodies,
+                              memory=[{'addr': f'0x{IL_PAGE(i):x}', 'size': 0x1000, 'fill': 'lcg', 'seed': 50 + i} for i in range(n)])
+    drop_apic_timing(prog, n)
+    return prog, labels
+
+
+def ipiload_expect(n):
+    def e(st, labels):
+        out = []
+        for t in range(n):
+            for s in range(n):
+                if s != t:
+                    out.append((f'CPU{t} received from CPU{s} (vector {IL_V(s, t):#x})', st.m(apic.COUNTS(t) + 8 * IL_V(s, t)), IL_K))
+        for i in range(n):
+            out.append((f'CPU{i}: ISR and PPR clear at the end (every delivery EOIed)', [st.m(apic.DATA(i) + 8) & 0xffffffff, st.m(apic.DATA(i) + 0x10) & 0xffffffff], [0, 0]))
+        return out
+    return e
+
+
+# name -> (builder(n, variant[, natemu]), expect(n), negative text, dual-build?)
+COMPOSITES_R1B = {
+    'r1b-mpstart': (mpstart_program, mpstart_expect, "every AP uses CPU 0's per-CPU block for its GS base", True),
+    'r1b-poke': (poke_program, poke_expect, 'the restored first byte is the wrong opcode (mov ecx, not mov eax)', False),
+    'r1b-nmi': (nmi_program, nmi_expect, "every CPU's CPU/node descriptor limit is 0 (LSL yields 0, not the CPU number)", False),
+    'r1b-ipiload': (ipiload_program, ipiload_expect, 'CPU 0 sends one fewer IPI toward CPU 1', False),
+}
+
+
+def run_one_r1b(a, name, n, report):
+    build, expect_f, neg, dual = COMPOSITES_R1B[name]
+    expect = expect_f(n)
+    entry = {'name': f'{name}@{n}', 'runs': [], 'problems': []}
+    mailbox = {i: MP_MB for i in range(1, n)} if dual else None
+    if dual:
+        qprog, want = build(n), qemu_reference(build(n), a.out / 'qemu' / f'{name}@{n}')
+    else:
+        prog, labels = build(n)
+        want, _, err = qemu(prog, a.out / 'qemu' / f'{name}@{n}')
+        if want is None:
+            entry['problems'].append(f'QEMU run failed ({err})'); report.append(entry); return [f'{name}@{n}: QEMU fail']
+        entry['problems'] += [f'QEMU vs SDM: {p}' for p in judge(expect, State(want), labels)]
+    for limit in (None, 1):
+        work = a.out / 'work' / f"{name}@{n}-{limit or 'd'}"
+        if dual:
+            np = build(n, natemu=True)
+            out, problems = run_nat(a, nat_desc(np, mailbox), work, [limit] if limit else [], desc=True, prog=np)
+            cprog = qprog
+        else:
+            out, problems = run_natemu(a, prog, work, [limit] if limit else [])
+            np, cprog = prog, prog
+        if out is not None:
+            got = captured(np, out)
+            problems += smp.compare(cprog, got, want)
+            problems += [f'natemu vs SDM: {p}' for p in judge(expect, State(got), labels if not dual else {})]
+        entry['runs'].append({'max_block': limit, 'problems': problems})
+        entry['problems'] += [f'max-block {limit}: {p}' for p in problems]
+    if a.negative:
+        if dual:
+            vnp = build(n, variant=True, natemu=True)
+            out, flagged = run_nat(a, nat_desc(vnp, mailbox), a.out / 'work' / f'{name}@{n}-neg', [], desc=True)
+            cprog, vlab = qprog, {}
+        else:
+            vnp, vlab = build(n, variant=True)
+            out, flagged = run_natemu(a, vnp, a.out / 'work' / f'{name}@{n}-neg', [], reached=False)
+            cprog = vnp
+        flagged = list(flagged)
+        if out is not None:
+            got = captured(vnp, out)
+            flagged += smp.compare(cprog if dual else vnp, got, want) + judge(expect, State(got), vlab)
+        entry['negative'] = {'change': neg, 'flagged': flagged[:8]}
+        if not flagged: entry['problems'].append(f'negative control not flagged ({neg})')
+    report.append(entry)
+    print(f"{name}@{n}: {'FAIL' if entry['problems'] else 'ok'}" + (f"; negative flagged {len(entry['negative']['flagged'])}+"
+          if a.negative and entry.get('negative', {}).get('flagged') else ''), *entry['problems'][:6], sep='\n  ', flush=True)
+    return [f'{name}@{n}: {p}' for p in entry['problems']]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=['r1a'])
+    ap.add_argument('mode', choices=['r1a', 'r1b'])
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--host', type=pathlib.Path)
     ap.add_argument('--runtime', type=pathlib.Path)
     ap.add_argument('--programs', type=lambda s: s.split(','))
+    ap.add_argument('--cpus', type=int, nargs='+', default=[2, 3, 4])
     ap.add_argument('--no-negative', dest='negative', action='store_false')
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     if not (a.host and a.runtime): a.host, a.runtime = vm.build()
     report, failures = [], []
-    for name in COMPOSITES:
-        if not a.programs or name in a.programs:
-            failures += run_one(a, name, report)
+    if a.mode == 'r1a':
+        for name in COMPOSITES:
+            if not a.programs or name in a.programs:
+                failures += run_one(a, name, report)
+    else:
+        for name in COMPOSITES_R1B:
+            if not a.programs or name in a.programs:
+                for n in a.cpus:
+                    failures += run_one_r1b(a, name, n, report)
     (a.out / f'{a.mode}.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
     for f in failures: print('FAIL', f)
     sys.exit(1 if failures else 0)
