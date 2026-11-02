@@ -248,8 +248,8 @@ iteration is unexplained. Known costs and limits:
   compile's extent, gating arguments consulted) and `boot-linux` keeps them across runs on disk
   (`crates/host/src/compile_cache.rs`): `NATEMU_COMPILE_CACHE=DIR|off` (default `~/Library/Caches/natemu/fexc`),
   `NATEMU_COMPILE_CACHE_MB` (default 512: a boot without initrd takes about 36 MiB, the initrd boot to the installer
-  658 MiB, mostly user code; past the cap a run stores nothing more, and the next open evicts user packs before kernel
-  ones). Test drivers never open it (`run_l1_smoke.py` sets it off). User-space code at randomized addresses is compiled
+  658 MiB, mostly user code; past the cap a run stores nothing more; an open above 3/4 of the cap evicts other fexc
+  builds' packs, then user packs, then kernel ones, down to 3/4, so a run always has room). Test drivers never open it (`run_l1_smoke.py` sets it off). User-space code at randomized addresses is compiled
   again per process (the RIP is part of each block): the initrd boot to the installer makes about 1.14 M compiles,
   140 k with `norandmaps`.
 

@@ -8,12 +8,14 @@
 //!
 //! Layout: `DIR/{k,u}-*.pack`, immutable files written whole under a temporary name and renamed (atomic, so concurrent
 //! processes only ever see complete packs): a magic, the payloads, then an index (key, offset, length, sum per entry), its
-//! count and a magic. `k` packs hold blocks at upper-half (kernel) RIPs, `u` packs the others. A process reads every pack's
-//! index at start; a writer thread hashes its new entries (each key once, off the compile path) into one pending pack per
-//! half, written when it reaches [`PACK_BYTES`], when its oldest entry is [`PACK_AGE`] old (a run killed by a signal loses
-//! at most that), and when the cache is dropped. Cap: at start, once the total exceeds it, the oldest `u` packs go, then the oldest
-//! `k` ones, until it is at most 3/4 of the cap (kernel code is the same every boot; user code at randomized addresses
-//! rarely is); during a run, nothing more is written once the total reaches it.
+//! count and a magic. `k` packs hold blocks at upper-half (kernel) RIPs, `u` packs the others; a pack's name carries the first
+//! 8 bytes of its fexc identity (`k-IDENTITY-PID-NANOS-N.pack`; a name without one is another build's). A process reads the
+//! index of every pack of its own identity at start; a writer thread hashes its new entries (each key once, off the
+//! compile path) into one pending pack per half, written when it reaches [`PACK_BYTES`], when its oldest entry is [`PACK_AGE`] old (a run killed by a signal loses
+//! at most that), and when the cache is dropped. Cap: at start, once the total exceeds 3/4 of the cap, other
+//! builds' packs go (they can never hit), then the oldest `u` packs, then the oldest `k` ones, until it is at most 3/4 of the
+//! cap (kernel code is the same every boot; user code at randomized addresses rarely is), so every run has a quarter of the
+//! cap to write into; during a run, nothing more is written once the total reaches the cap.
 //! Configuration: `NATEMU_COMPILE_CACHE` = a directory or `off` (default `~/Library/Caches/natemu/fexc`),
 //! `NATEMU_COMPILE_CACHE_MB` = the cap (default 512). Only `boot-linux` opens it ([`shared`]); the test drivers never do.
 
@@ -171,6 +173,11 @@ pub(crate) struct DiskCache {
     pub(crate) entries: usize,
 }
 
+/// The part of a pack's name that says which fexc build wrote it.
+fn tag(identity: &[u8; 32]) -> String {
+    format!("{:016x}", u64::from_be_bytes(identity[..8].try_into().unwrap()))
+}
+
 fn key(identity: &[u8; 32], body: &[u8]) -> [u8; 32] {
     sha256(&[b"natemu-fexc-cache-1\0", identity, body])
 }
@@ -180,7 +187,7 @@ impl DiskCache {
     pub(crate) fn open(dir: &Path, fexc: &Path, cap: u64) -> Result<Self, String> {
         let identity = sha256(&[&fs::read(fexc).map_err(|e| format!("{}: {e}", fexc.display()))?]);
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let mut packs = vec![];
+        let (mut packs, tag) = (vec![], tag(&identity));
         for e in fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?.flatten() {
             let (path, name) = (e.path(), e.file_name().to_string_lossy().into_owned());
             if let Some(pid) = name.strip_suffix(".tmp").and_then(|n| n.split('-').next()).and_then(|p| p.parse::<i32>().ok()) {
@@ -189,23 +196,28 @@ impl DiskCache {
                 }
             } else if name.ends_with(".pack") {
                 if let Ok(m) = e.metadata() {
-                    packs.push((name.starts_with("k-"), m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len(), path));
+                    let own = name.get(2..).is_some_and(|n| n.strip_prefix(&tag).is_some_and(|n| n.starts_with('-')));
+                    packs.push((own, name.starts_with("k-"), m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len(), path));
                 }
             }
         }
-        // User packs before kernel ones, each oldest first: the eviction order.
+        // Other builds' packs, then user packs, then kernel ones, each oldest first: the eviction order.
         packs.sort();
-        let mut total: u64 = packs.iter().map(|p| p.2).sum();
-        if total > cap {
-            // ponytail: oldest-written first within a half (no access times); an LRU needs a write per hit.
-            while total > cap / 4 * 3 && !packs.is_empty() {
-                let (_, _, size, path) = packs.remove(0);
-                let _ = fs::remove_file(path);
-                total -= size;
-            }
+        let mut total: u64 = packs.iter().map(|p| p.3).sum();
+        // Down to 3/4 of the cap as soon as the total is above it, not only above the cap: a cache left just under the cap
+        // would let nothing more be written (see `Writer::put`) and never be evicted.
+        // ponytail: oldest-written first within a half (no access times); an LRU needs a write per hit.
+        while total > cap / 4 * 3 && !packs.is_empty() {
+            let (_, _, _, size, path) = packs.remove(0);
+            let _ = fs::remove_file(path);
+            total -= size;
         }
         let (mut files, mut index, mut bytes) = (vec![], HashMap::new(), 0);
-        for (_, _, size, path) in packs {
+        for (own, _, _, size, path) in packs {
+            if !own {
+                bytes += size; // on disk and counted, but its keys are another build's: not read
+                continue;
+            }
             match File::open(&path).ok().and_then(|f| read_index(&f, size).map(|i| (f, i))) {
                 Some((file, records)) => {
                     let pack = files.len();
@@ -309,7 +321,7 @@ impl Writer {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
         let name = format!("{}-{nanos}-{}", std::process::id(), self.written);
         let tmp = self.dir.join(format!("{name}.tmp"));
-        let pack = self.dir.join(format!("{}-{name}.pack", ["k", "u"][half]));
+        let pack = self.dir.join(format!("{}-{}-{name}.pack", ["k", "u"][half], tag(&self.identity)));
         if fs::write(&tmp, &f).and_then(|_| fs::rename(&tmp, pack)).is_err() {
             let _ = fs::remove_file(&tmp); // a full disk costs the entries, not the run
         }
@@ -466,6 +478,60 @@ mod tests {
         assert_eq!(packs(), 3);
         let c = DiskCache::open(&store, &fexc, 2 * PACK_BYTES as u64 + 8192).unwrap(); // over: down to 3/4 of it
         assert_eq!([0u8, 1, 2].map(|i| c.get(&c.key(&[i])).is_some()), [false, false, true]); // the user pack, then the older kernel one
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A directory of small packs: `put`s of `n` payloads of 1000 bytes by build `fexc`, one pack per half, each batch its own open.
+    fn fill(store: &Path, fexc: &Path, n: u8) {
+        let c = DiskCache::open(store, fexc, 1 << 30).unwrap();
+        for i in 0..n {
+            c.put(vec![i], i % 2 == 0, vec![i; 1000]);
+        }
+        drop(c);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    fn dir_bytes(store: &Path) -> u64 {
+        fs::read_dir(store).unwrap().flatten().map(|e| e.metadata().unwrap().len()).sum()
+    }
+
+    /// A cache left just under the cap (the writer refuses to pass it, and an open evicts only above it) gets room at the next open.
+    #[test]
+    fn cache_just_under_the_cap_gets_room() {
+        let dir = std::env::temp_dir().join(format!("natemu-cc-room-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fexc = dir.join("fexc");
+        fs::write(&fexc, b"build 1").unwrap();
+        let store = dir.join("store");
+        fill(&store, &fexc, 2);
+        let cap = dir_bytes(&store) + 100; // full: another pack does not fit
+        {
+            let c = DiskCache::open(&store, &fexc, cap).unwrap();
+            assert!(c.bytes <= cap / 4 * 3, "{} of {cap}", c.bytes);
+            c.put(b"new request".to_vec(), true, vec![9; 1000]);
+        }
+        let c = DiskCache::open(&store, &fexc, 1 << 30).unwrap();
+        assert_eq!(c.get(&c.key(b"new request")), Some(vec![9; 1000]));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Packs of another fexc build can never hit, so they go before the current build's, even when newer.
+    #[test]
+    fn other_builds_packs_go_first() {
+        let dir = std::env::temp_dir().join(format!("natemu-cc-other-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (fexc, other) = (dir.join("fexc"), dir.join("other"));
+        fs::write(&fexc, b"build 1").unwrap();
+        fs::write(&other, b"build 2").unwrap();
+        let store = dir.join("store");
+        fill(&store, &fexc, 2); // oldest: a kernel and a user pack of this build
+        fill(&store, &other, 2); // newest: the same of the other
+        let cap = dir_bytes(&store) * 2 / 3 + 64; // 3/4 of it is just over half: the two other packs go, no more
+        let c = DiskCache::open(&store, &fexc, cap).unwrap();
+        assert_eq!(c.entries, 2);
+        assert_eq!(fs::read_dir(&store).unwrap().count(), 2);
+        assert!(c.get(&c.key(&[0])).is_some() && c.get(&c.key(&[1])).is_some());
         fs::remove_dir_all(&dir).unwrap();
     }
 }
