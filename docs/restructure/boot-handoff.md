@@ -15,7 +15,7 @@ never runs guest code.
 | --- | --- | --- |
 | Compiler (fexc) | Native macOS build of FEX's decoder, IR, optimizer, allocator and emitter. Takes x86 bytes, RIP and CPU context; returns ARM64 code with every guest-memory access site, exits, link points and relocations (code object v4; since E1 the code touches no emulator data: exits by `svc`/a relocated `b`, division by `svc`; since E1b no stop check; since E3 no address guard: a non-canonical access faults in hardware at its site). Cuts a block before any system instruction or unsupported form. One `fexc --serve` child process per vCPU. | `tools/fexc/` (build, patch series, shims), `third_party/FEX` (pinned submodule); binary: `../natemu-raw/fexc-native-20261026-01/series22/obj/fexc` (X2: series21-s3, which cut group 9's register forms, plus `--alignment-gated`) |
 | Admission | Object validation of each block before it reaches the VM: header, profile, features against the vCPU's ID registers, offsets, sites and their words, relocations, exits and link points, x25/x28 rules, control flow. Since E3 the code-shape check (instruction allowlist, sp, literals, every memory word a site, split/branch-target/#DE check forms) is a debug option (the program driver's `--code-shape`, passed by the test runners except `contain`). | `crates/host/src/admission.rs`, `admission/structure.rs`; format `crates/abi/src/code_object.rs` |
-| Host | VM, GIC and vCPU lifecycle (`vm.rs`), guest RAM and the resident image (`memory.rs`), one thread per vCPU with start barrier, cancellation and join-before-destroy (`owners.rs`), the per-vCPU service loop: compile requests, system-instruction decode, kicks (doorbells), watchdog (`execution.rs`, `system.rs`). | `crates/host/src/` |
+| Host | VM, GIC and vCPU lifecycle (`vm.rs`), guest RAM and the resident image (`memory.rs`), one thread per vCPU with start barrier, cancellation and join-before-destroy (`owners.rs`), the per-vCPU service loop: compile requests, system-instruction decode, kicks (doorbells), watchdog (`execution.rs`, `system.rs`); the boot entry (`linux.rs`). Since L0 a library (package `natemu`) with the boot stub `natemu`; the test driver is its own crate. | `crates/host/src/` (library), `crates/driver/src/` (test driver) |
 | Resident | Boots each vCPU's private address space, banks x86 state, walks guest page tables (four-level, A/D by compare-exchange), installs owner-private shadows (native stage-1 tables, one space per x86 privilege class: supervisor and user, each with its own roots and ASID, two ASIDs per vCPU; the CPL's space is loaded at every entry into generated code, U1), places and links blocks, recovers faults precisely, executes system instructions, drains invalidations. | `crates/runtime/src/` (`execution.rs`, `cache.rs`, `tables.rs`, `gates.S`); shared layouts `crates/abi/src/` (`execution.rs`, `paging.rs`, `shadow.rs`, `guest_memory.rs`) |
 | Code cache, dispatch, linking | Per vCPU: code area (16 MiB default, up to 128 MiB) with a write alias, metadata arena, L1 (4,096 entries by RIP, as code in the code area since E1) and L2 (key = RIP, CR3, CPL, mode and controls). The dispatcher (copied into the code area) branches into L1 from generated code; a miss enters the resident (`svc`), which looks up L2 or requests a compile. Literal exits go to the linker (`svc`) once and are then patched to branch directly. Overflow or any context change flushes the whole cache. | `runtime/src/cache.rs`, `gates.S` (`dispatch_template`); [slice-2 contract](slice2-contract.md) |
 | Precise faults | Every guest-memory access is a registered site. A native abort is matched to its site first (else halt `trapped`, `private_access`, `unknown_abort` or `site_mismatch`); a non-canonical address at a site, the private window included, is #GP/#SS, except the documented guest-state page (`0xffff_4000_0000_1000`, x86 non-canonical with bit 63 set, outside the window since the G1 fix; one 4 KiB page per vCPU, EL0 read/write since I1: an access there reaches the vCPU's own guest state; boot-features plan, Built (I1, G1 minimum) and G1 fix); the resident walks with the access's intent and retries, splits a page-crossing store, or banks the exact pre-instruction state and stops with the guest fault (vector, error, CR2). | `runtime/src/execution.rs` (`aborted`, `access_aborted`, `split`); [slice-1 contract](slice1-contract.md) |
@@ -25,8 +25,27 @@ never runs guest code.
 | Ordering | Hardware TSO (ACTLR_EL1.EnTSO, checked at start) for admitted single-register loads and stores; fences as `dmb`; memory XCHG as `swpal` at `swap` sites; since I3 every LOCK read-modify-write as one LSE acquire-release atomic (`ldaddal`, `ldclral`, `ldeoral`, `ldsetal`, `casal`, `caspal`) at `atomic` sites, LOCK CMPXCHG* with `dmb ish` before its CAS. Since M2 addendum 2 UC RAM is strongly ordered: never shadowed while a block runs on, each access runs its instruction alone in the step block with `dmb ish` before and after (the resident's own UC accesses likewise). | slice-3 §2; boot-features plan, Built (M2 addendum 2) |
 | Containment | Any resident halt or host error cancels every vCPU; vCPUs are destroyed before the VM; per-vCPU watchdog (10 s default) reports where it stopped; compile requests have a 30 s deadline; every run prints a `teardown:` line (joined, destroyed, children left). | `host/src/owners.rs`, `execution.rs`; slice-3 §4 S3h |
 
-The only entry point today is the test driver: `natemu-host RUNTIME run-program DESCRIPTION` (`host/src/drivers/`),
-which builds tables, bytes and initial state per vCPU from a description and runs them. A boot loader is new work.
+Entry points (since L0, the host split). The library `natemu` (`crates/host`) has the integration entry
+`natemu::linux::Boot` (fields with defaults from `Boot::new(runtime, fexc, kernel)`; `prepare()` loads the kernel,
+initrd and ACPI tables and builds the devices, `Prepared::run()` runs the VM, `Outcome` gives each vCPU's stop and the vCPU
+that ended the run; the compile cache is off unless the caller sets `compile_cache::Config::from_env()`), and the boot
+stub `natemu RUNTIME FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--vcpus N] [--serial FILE]` over it
+(serial to standard output by default; exit 0 on poweroff, 2 on any other stop, 1 on a host error; it opts into the
+compile cache). The test driver `natemu-host` (`crates/driver`, the package name and binary path the runners use) has
+`run-program DESCRIPTION` (`crates/driver/src/drivers/program.rs`: tables, bytes and initial state per vCPU from a
+description; its tampers, logging IDT, CPL switches and event sources are its `execution::Hook`, which the library calls
+only at host exits, `()` for no hook) and `boot-linux` (`drivers/linux.rs`, over `Boot`, plus the load-only path, dump,
+clock trace, saves and JSON); the M3 test device and L4a's test interrupt source are in `drivers/test_devices.rs`. Raw record and code-cache writes and the hook's
+reply/object/compile-server calls exist only with the library feature `testing` (only the driver enables it); build the
+stub alone (`-p natemu`) so it is left out.
+Build and sign the stub (the runners build and sign `natemu-host` themselves):
+
+```sh
+cargo +1.97.0 build --offline --locked --release -p natemu --bin natemu
+codesign --force --sign - --entitlements crates/host/entitlements.plist target/release/natemu
+cargo +1.97.0 build --offline --locked --release -p natemu-runtime --target aarch64-unknown-none
+target/release/natemu target/aarch64-unknown-none/release/natemu-runtime "$F" BZIMAGE --cmdline 'console=ttyS0'
+```
 
 **Runners and checks** (all `--fexc FEXC --out DIR`, under `./tools/with-env`; each builds and signs the release host
 and runtime; contract-by-contract mapping: [contracts.md](contracts.md), "General-path check per contract"):
@@ -253,7 +272,7 @@ iteration is unexplained. Known costs and limits:
 - **Compile latency:** every distinct block is a host round trip on first use: since P3 about 0.04 ms per block (the
   server compiles in process; 0.45-0.5 ms forked before), the host keeps answers by what fexc read (bytes to the
   compile's extent, gating arguments consulted) and `boot-linux` keeps them across runs on disk
-  (`crates/host/src/compile_cache.rs`): `NATEMU_COMPILE_CACHE=DIR|off` (default `~/Library/Caches/natemu/fexc`),
+  (`crates/host/src/compile_cache.rs`; `natemu` and `boot-linux` opt in by `Config::from_env`): `NATEMU_COMPILE_CACHE=DIR|off` (default `~/Library/Caches/natemu/fexc`),
   `NATEMU_COMPILE_CACHE_MB` (default 512: a boot without initrd takes about 36 MiB, the initrd boot to the installer
   658 MiB, mostly user code; past the cap a run stores nothing more; an open above 3/4 of the cap evicts other fexc
   builds' packs, then user packs, then kernel ones, down to 3/4, so a run always has room). Test drivers never open it (`run_l1_smoke.py` sets it off). User-space code at randomized addresses is compiled

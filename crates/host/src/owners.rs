@@ -16,7 +16,7 @@ use std::{
 
 /// Returned after every owner has joined and destroyed its vCPU. A setup
 /// failure before the start barrier is an `Err` from [`supervise`] instead.
-pub(crate) struct Supervision<T> {
+pub struct Supervision<T> {
     /// Each owner's result, by id (`None` when it failed; `error` holds the first failure).
     pub outputs: Vec<Option<T>>,
     pub error: Option<String>,
@@ -24,7 +24,7 @@ pub(crate) struct Supervision<T> {
 }
 
 /// Cancels every owner: each stops at its next host exit, and the supervisor forces running vCPUs out.
-pub(crate) fn cancel_owners(cancelled: &AtomicBool) {
+pub fn cancel_owners(cancelled: &AtomicBool) {
     cancelled.store(true, Ordering::Release);
 }
 
@@ -35,7 +35,7 @@ pub(crate) fn cancel_owners(cancelled: &AtomicBool) {
 /// which a body may also call itself); running vCPUs are then forced out
 /// repeatedly until every body returned. Every vCPU is destroyed on its own thread
 /// before this returns, so the caller may destroy the VM next.
-pub(crate) fn supervise<T: Send>(
+pub fn supervise<T: Send>(
     n: usize,
     prepare: &(dyn Fn(usize) -> Result<Vcpu> + Sync),
     body: &(dyn Fn(usize, &Vcpu, &AtomicBool) -> Result<T> + Sync),

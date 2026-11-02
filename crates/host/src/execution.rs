@@ -24,26 +24,26 @@ use std::time::{Duration, Instant};
 /// window, lookup area, metadata arena and code area at the same offsets and leaves the global area's range unused
 /// (never mapped, so never backed): every vCPU maps block 0's. Guest RAM (M1: `ram_bytes`, chosen at prepare) follows
 /// the last block, at `n * stride`; only the pages the guest or the host touch are ever backed.
-pub(crate) struct Backing {
-    pub(crate) memory: Memory,
+pub struct Backing {
+    pub memory: Memory,
     pub(crate) n: usize,
     stride: usize,
     /// Guest-physical RAM through the host's alias.
-    pub(crate) ram: GuestRam,
+    pub ram: GuestRam,
     /// One CNTVCT sample (the host's `mach_absolute_time`: every vCPU's virtual counter has offset 0) taken when the VM
     /// was prepared: each vCPU's TSC starts from it, so all start near 0 and agree.
     epoch: u64,
 }
 impl Backing {
     /// vCPU `v`'s view.
-    pub(crate) fn vcpu(&self, v: usize) -> Area<'_> {
+    pub fn vcpu(&self, v: usize) -> Area<'_> {
         assert!(v < self.n);
         Area { memory: &self.memory, vcpu: v, vcpus: self.n, epoch: self.epoch, base: v * self.stride, ram: self.ram }
     }
 }
 /// One vCPU's own part of the backing: offsets are those of block 0 (`exec`/`cache`), relocated to its block.
 #[derive(Clone, Copy)]
-pub(crate) struct Area<'a> {
+pub struct Area<'a> {
     pub(crate) memory: &'a Memory,
     pub(crate) vcpu: usize,
     /// The VM's vCPU count, and the CNTVCT its TSCs start from ([`Backing`]).
@@ -54,15 +54,43 @@ pub(crate) struct Area<'a> {
     /// The VM's guest RAM ([`Backing::ram`]).
     pub(crate) ram: GuestRam,
 }
-impl Area<'_> {
-    pub(crate) fn read_record<T: Copy>(&self, offset: usize) -> T {
-        self.memory.read_record(self.base + offset)
+impl<'a> Area<'a> {
+    pub fn memory(&self) -> &'a Memory {
+        self.memory
     }
-    pub(crate) fn write_record<T>(&self, offset: usize, value: T) {
-        self.memory.write_record(self.base + offset, value)
+    pub fn vcpu(&self) -> usize {
+        self.vcpu
+    }
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    pub fn read_record<T: Copy>(&self, offset: usize) -> T {
+        self.memory.read_record(self.base + offset)
     }
     pub(crate) fn read<const N: usize>(&self, offset: usize) -> [u8; N] {
         self.memory.read(self.base + offset)
+    }
+}
+/// Raw writes into a vCPU's records and code cache, past admission and the resident's checks: test drivers only (the
+/// `testing` feature; the `natemu` stub and library users never have it).
+#[cfg(feature = "testing")]
+impl<'a> Area<'a> {
+    pub fn write_record<T>(&self, offset: usize, value: T) {
+        self.memory.write_record(self.base + offset, value)
+    }
+    pub fn copy(&self, offset: usize, bytes: &[u8]) {
+        self.memory.copy(self.base + offset, bytes)
+    }
+    /// vCPU 0 of one, over the whole of `memory` as its block and its guest RAM (a driver's unit tests).
+    pub fn over(memory: &'a Memory) -> Self {
+        // SAFETY: `memory` is mapped for its length and outlives the area.
+        Area { memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0, ram: unsafe { GuestRam::new(0, memory.1 as u64, memory.0 as u64) } }
+    }
+}
+#[cfg(not(feature = "testing"))]
+impl Area<'_> {
+    pub(crate) fn write_record<T>(&self, offset: usize, value: T) {
+        self.memory.write_record(self.base + offset, value)
     }
     pub(crate) fn copy(&self, offset: usize, bytes: &[u8]) {
         self.memory.copy(self.base + offset, bytes)
@@ -73,7 +101,7 @@ impl Area<'_> {
 /// multiple, at most `exec::MAX_GUEST_RAM_BYTES`): the resident loaded into each vCPU's window, each vCPU's private
 /// address space and shared record in place; guest RAM is zero. Each vCPU's code cache holds `code_bytes` of generated
 /// code (at most `cache::CODE_BYTES_MAX`).
-pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize, ram_bytes: usize) -> Result<Backing> {
+pub fn prepare(resident: &str, code_bytes: usize, n: usize, ram_bytes: usize) -> Result<Backing> {
     if !(1..=cache::MAX_VCPUS).contains(&n) {
         return Err(format!("{n} vCPUs: the execution mode runs 1 to {}", cache::MAX_VCPUS));
     }
@@ -133,7 +161,7 @@ pub(crate) fn prepare(resident: &str, code_bytes: usize, n: usize, ram_bytes: us
     Ok(Backing { memory, n, stride, ram, epoch: unsafe { mach_absolute_time() } })
 }
 /// Sets the vCPU's initial architectural state (before it first runs).
-pub(crate) fn set_cpu(area: Area, cpu: Cpu) {
+pub fn set_cpu(area: Area, cpu: Cpu) {
     let mut state = State::new(area.vcpu as u64, cpu);
     state.vcpus = area.vcpus as u64;
     area.write_record(exec::STATE_OFFSET, state);
@@ -151,14 +179,14 @@ pub(crate) fn set_cpu(area: Area, cpu: Cpu) {
 }
 /// Sets the vCPU's local APIC record (X3) and the word peers match IPI destinations against, from its reset
 /// IA32_APIC_BASE (before it first runs).
-pub(crate) fn set_lapic(area: Area, l: natemu_abi::lapic::Lapic) {
+pub fn set_lapic(area: Area, l: natemu_abi::lapic::Lapic) {
     area.write_record(exec::LAPIC_OFFSET, l);
     let base = natemu_abi::cpu::reset_msrs(area.vcpu == 0)[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_APIC_BASE).unwrap()];
     let word = natemu_abi::lapic::published(base, &l, area.vcpu as u64);
     event_word(area.memory, area.vcpu, std::mem::offset_of!(cache::Events, apic)).store(word, SeqCst);
 }
 /// The vCPU's local APIC record (X3; the resident's once it runs).
-pub(crate) fn lapic(area: Area) -> natemu_abi::lapic::Lapic {
+pub fn lapic(area: Area) -> natemu_abi::lapic::Lapic {
     area.read_record(exec::LAPIC_OFFSET)
 }
 /// Tops up the vCPU's entropy pool (RDRAND, [`exec::Entropy`]) while it is in the host: the words it took are replaced
@@ -184,7 +212,7 @@ fn refill_entropy(area: Area) {
 /// Enters the vCPU at the resident in its window, its tables tagged with its own ASIDs (2v + 2 for its supervisor
 /// shadow space, loaded at boot; the resident uses 2v + 3 for its user space), as GIC vCPU `area.vcpu` with its peer
 /// doorbell enabled (`doorbell`; disabled only by a test driver's never-answering peer).
-pub(crate) fn enter(cpu: &Vcpu, area: Area, doorbell: bool) -> Result<()> {
+pub fn enter(cpu: &Vcpu, area: Area, doorbell: bool) -> Result<()> {
     // 8-bit ASIDs, never 0.
     const _: () = assert!(2 * cache::MAX_VCPUS + 1 <= 255);
     cpu.doorbell(area.vcpu, doorbell)?;
@@ -207,12 +235,12 @@ fn event_word(memory: &Memory, v: usize, field: usize) -> &AtomicU64 {
     global_u64(memory, cache::EVENTS + v * size_of::<cache::Events>() + field)
 }
 /// `post` value of an NMI (else an interrupt vector, 0..=255).
-pub(crate) const NMI: u64 = 256;
+pub const NMI: u64 = 256;
 /// Posts `event` (a vector, or [`NMI`]) into vCPU `v`'s event record (X2); the caller then rings its doorbell, which makes
 /// it stop precisely and take the event when it is eligible. L4a: `level`, a level-triggered interrupt: its TMR bit is
 /// set (else cleared) before the IRR bit, as the LAPIC accepts it (SDM Vol.3 11.8.4), so its EOI is broadcast. Returns
 /// whether the target accepted it.
-pub(crate) fn post(memory: &Memory, v: usize, event: u64, level: bool) -> bool {
+pub fn post(memory: &Memory, v: usize, event: u64, level: bool) -> bool {
     // X3: as from a peer's APIC: an NMI needs the target's APIC hardware enabled, an interrupt also software enabled
     // (SDM Vol.3 11.4.7.2); otherwise the message is not accepted.
     let apic = event_word(memory, v, std::mem::offset_of!(cache::Events, apic)).load(SeqCst);
@@ -252,27 +280,27 @@ pub(crate) fn set_lint0(memory: &Memory, v: usize, level: bool) -> bool {
     post
 }
 /// vCPU `v`'s park state (X3): its `halted` word and its `posts` count, read in that order.
-pub(crate) fn park_state(memory: &Memory, v: usize) -> (u64, u64) {
+pub fn park_state(memory: &Memory, v: usize) -> (u64, u64) {
     let halted = event_word(memory, v, std::mem::offset_of!(cache::Events, halted)).load(SeqCst);
     (halted, event_word(memory, v, std::mem::offset_of!(cache::Events, posts)).load(SeqCst))
 }
 /// A park state in which nothing but a new post can wake the vCPU: halted, its own timer unable to wake it, and every
 /// post seen.
-pub(crate) fn idle((halted, posts): (u64, u64)) -> bool {
+pub fn idle((halted, posts): (u64, u64)) -> bool {
     halted & 0xff == 1 && halted >> cache::HALTED_SEEN_SHIFT == posts & (u64::MAX >> cache::HALTED_SEEN_SHIFT)
 }
 /// Asks vCPU `v` to end its run when it is halted with no event it can take (`stop::HALTED`); the caller rings it.
-pub(crate) fn end_when_halted(memory: &Memory, v: usize) {
+pub fn end_when_halted(memory: &Memory, v: usize) {
     event_word(memory, v, std::mem::offset_of!(cache::Events, end)).store(1, SeqCst);
 }
 /// vCPU `area.vcpu`'s shadow resets so far (the resident's counter: evictions, shootdowns, control changes, halts).
-pub(crate) fn shadow_resets(area: Area) -> u64 {
+pub fn shadow_resets(area: Area) -> u64 {
     global_u64(area.memory, cache::RESETS + 8 * area.vcpu).load(SeqCst)
 }
 /// K1: vCPU `area.vcpu`'s TLB events and revalidations (`cache::Control`), as a JSON object; with M2's data shadows by
 /// memory type (`memory_types`: {"UC": n, ...}, the types with a non-zero count) and its UC accesses (`uncached`:
 /// instructions run alone for one, the resident's own).
-pub(crate) fn k1_stats(area: Area) -> String {
+pub fn k1_stats(area: Area) -> String {
     let c: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
     const NAMES: [&str; 8] = ["UC", "WC", "2", "3", "WT", "WP", "WB", "UC-"];
     let types: Vec<String> = (0..8).filter(|&t| c.memory_types[t] != 0).map(|t| format!("\"{}\":{}", NAMES[t], c.memory_types[t])).collect();
@@ -287,7 +315,7 @@ pub(crate) fn k1_stats(area: Area) -> String {
 }
 /// Guest RAM was written by the host (only while every vCPU is stopped): each vCPU drops its cached code before it
 /// next runs guest code.
-pub(crate) fn guest_ram_written(memory: &Memory) {
+pub fn guest_ram_written(memory: &Memory) {
     for v in 0..cache::MAX_VCPUS {
         record_word(memory, v, None).fetch_or(cache::FLUSH, SeqCst);
     }
@@ -297,26 +325,24 @@ pub(crate) fn guest_ram_written(memory: &Memory) {
 /// (`State::stops`, with its CNTVCT, which is the host's `mach_absolute_time`). A kick that finds v in the host or the
 /// resident (interrupts masked) stays pending in the GIC and stops v as soon as it runs generated code again; a kick
 /// while one is pending merges into it in the GIC. Peers' residents ring v's SGI directly (`cache::kick`), never the host.
-pub(crate) struct Stops {
+pub struct Stops {
     kicks: Vec<Mutex<Kick>>,
     /// vCPU v is in the host (not in `hv_vcpu_run`). Accounting only (`Kick::in_host`, latency classes).
     in_host: Vec<AtomicBool>,
-    /// Per-stop latencies are kept (`Kick::latency`) only when the driver asks.
-    latencies: bool,
 }
 /// One vCPU's host kicks.
 #[derive(Default, Clone)]
-pub(crate) struct Kick {
+pub struct Kick {
     /// Kicks (doorbells rung), of which while the vCPU was in the host.
-    pub(crate) issued: u64,
-    pub(crate) in_host: u64,
+    pub issued: u64,
+    pub in_host: u64,
     /// Nanoseconds spent in the `hv_gic_set_spi` calls.
-    pub(crate) ring_ns: u64,
+    pub ring_ns: u64,
     /// Its doorbell was still pending when it ended (read before the VM goes).
-    pub(crate) pending: bool,
-    /// Per kick a stop followed, if the driver asked ([`Stops::new`]): nanoseconds from the ring to the resident's stop,
-    /// and whether the kick found the vCPU in the host.
-    pub(crate) latency: Vec<(u64, bool)>,
+    pub pending: bool,
+    /// Per kick a stop followed, as the driver reported it ([`Stops::followed`]): nanoseconds from the ring to the
+    /// resident's stop, and whether the kick found the vCPU in the host.
+    pub latency: Vec<(u64, bool)>,
     /// The last ring: `mach_absolute_time`, in the host.
     rung: Option<(u64, bool)>,
     /// The vCPU's run ended (or it never ran): no kick rings it any more ([`Stops::end`]).
@@ -326,7 +352,7 @@ unsafe extern "C" {
     fn mach_absolute_time() -> u64;
 }
 /// Nanoseconds of `ticks` of `mach_absolute_time` (and CNTVCT: 24 MHz on Apple silicon).
-pub(crate) fn ticks_ns(ticks: u64) -> u64 {
+pub fn ticks_ns(ticks: u64) -> u64 {
     #[repr(C)]
     struct Timebase {
         numer: u32,
@@ -340,16 +366,12 @@ pub(crate) fn ticks_ns(ticks: u64) -> u64 {
     (ticks as u128 * u128::from(t.numer) / u128::from(t.denom.max(1))) as u64
 }
 impl Stops {
-    /// Kicks of `backing`'s vCPUs; `latencies`: keep every stop's latency.
-    pub(crate) fn new(backing: &Backing, latencies: bool) -> Self {
-        Self {
-            kicks: (0..backing.n).map(|_| Mutex::default()).collect(),
-            in_host: (0..backing.n).map(|_| AtomicBool::new(true)).collect(),
-            latencies,
-        }
+    /// Kicks of `backing`'s vCPUs.
+    pub fn new(backing: &Backing) -> Self {
+        Self { kicks: (0..backing.n).map(|_| Mutex::default()).collect(), in_host: (0..backing.n).map(|_| AtomicBool::new(true)).collect() }
     }
     /// Stops vCPU `v` of `machine` at its next block boundary; false (nothing rung) once its run [ended](Self::end).
-    pub(crate) fn kick(&self, machine: &Machine, v: usize) -> Result<bool> {
+    pub fn kick(&self, machine: &Machine, v: usize) -> Result<bool> {
         let mut k = self.kicks.get(v).ok_or(format!("kick of vCPU {v}: no such vCPU"))?.lock().unwrap();
         if k.ended {
             return Ok(false);
@@ -365,15 +387,15 @@ impl Stops {
     }
     /// vCPU `v`'s run ended (or it never started): from now on no kick rings it, and a kick in progress has completed
     /// (the mutex). That every GIC call is serialized with vCPU create and destroy is `vm.rs`'s (its GIC lock).
-    pub(crate) fn end(&self, v: usize) {
+    pub fn end(&self, v: usize) {
         self.kicks[v].lock().unwrap().ended = true;
     }
-    pub(crate) fn ended(&self, v: usize) -> bool {
+    pub fn ended(&self, v: usize) -> bool {
         self.kicks[v].lock().unwrap().ended
     }
     /// Whether vCPU `v`'s doorbell is still pending (rung, not acknowledged), asked under its kick mutex: `None` once
     /// its run [ended](Self::end).
-    pub(crate) fn ringing(&self, machine: &Machine, v: usize) -> Result<Option<bool>> {
+    pub fn ringing(&self, machine: &Machine, v: usize) -> Result<Option<bool>> {
         let k = self.kicks[v].lock().unwrap();
         if k.ended {
             return Ok(None);
@@ -381,13 +403,13 @@ impl Stops {
         machine.ringing(v).map(Some)
     }
     /// Stops vCPU `v` (`area`) has taken (the resident's count).
-    pub(crate) fn taken(&self, area: Area) -> u64 {
+    pub fn taken(&self, area: Area) -> u64 {
         area.read_record(exec::STATE_OFFSET + std::mem::offset_of!(State, stops))
     }
-    /// A stop of `area`'s vCPU followed the last kick: its latency.
-    pub(crate) fn followed(&self, area: Area) {
+    /// A stop of `area`'s vCPU followed the last kick (a kicker that waits for it says so): its latency is kept.
+    pub fn followed(&self, area: Area) {
         let mut k = self.kicks[area.vcpu].lock().unwrap();
-        if let (true, Some((at, in_host))) = (self.latencies, k.rung.take()) {
+        if let Some((at, in_host)) = k.rung.take() {
             // The resident writes its record field by field: the stop's time may land just after its count.
             let ticks = || area.read_record::<u64>(exec::STATE_OFFSET + std::mem::offset_of!(State, stop_ticks));
             let stop = (0..10_000).map(|_| ticks()).find(|&t| t >= at).unwrap_or(at);
@@ -395,19 +417,19 @@ impl Stops {
         }
     }
     /// Records whether vCPU `v`'s doorbell is still pending (after it and its kicker ended, before the VM goes).
-    pub(crate) fn pending_at_end(&self, machine: &Machine, v: usize) -> Result<()> {
+    pub fn pending_at_end(&self, machine: &Machine, v: usize) -> Result<()> {
         let pending = machine.ringing(v)?;
         self.kicks[v].lock().unwrap().pending = pending;
         Ok(())
     }
     /// vCPU `v`'s accounting.
-    pub(crate) fn report(&self, v: usize) -> Kick {
+    pub fn report(&self, v: usize) -> Kick {
         self.kicks[v].lock().unwrap().clone()
     }
 }
 
 /// The vCPU's placed blocks, in placement order (read from its metadata arena).
-pub(crate) fn placed_blocks(area: Area) -> Vec<cache::Block> {
+pub fn placed_blocks(area: Area) -> Vec<cache::Block> {
     let control: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
     (0..control.blocks as usize)
         .map(|n| {
@@ -417,7 +439,7 @@ pub(crate) fn placed_blocks(area: Area) -> Vec<cache::Block> {
         .collect()
 }
 /// The link record `i` (written by the resident's linker).
-pub(crate) fn link_record(area: Area, i: usize) -> cache::LinkRecord {
+pub fn link_record(area: Area, i: usize) -> cache::LinkRecord {
     area.read_record(cache::LOOKUP_OFFSET + cache::LINKS + i * size_of::<cache::LinkRecord>())
 }
 
@@ -426,7 +448,7 @@ pub(crate) fn link_record(area: Area, i: usize) -> cache::LinkRecord {
 /// keyed (target, the block's context), and the resident's link records describe exactly the linked ones. A word an
 /// armed stop patched (a vCPU forced out with a stop armed) is judged by its word before the patch. Returns (link
 /// points, linked).
-pub(crate) fn check_links(area: Area) -> Result<(u64, u64)> {
+pub fn check_links(area: Area) -> Result<(u64, u64)> {
     let lookup = |offset: usize| cache::LOOKUP_OFFSET + offset;
     let control: cache::Control = area.read_record(lookup(cache::CONTROL));
     let armed = &control.armed_words[..(control.armed as usize).min(control.armed_words.len())];
@@ -472,14 +494,14 @@ pub(crate) fn check_links(area: Area) -> Result<(u64, u64)> {
 
 /// Why execution stopped.
 #[derive(Debug)]
-pub(crate) enum Stop {
+pub enum Stop {
     /// RIP reached the caller's stop address at a block boundary.
     Reached,
     /// The instruction fetch at RIP faults in a way the resident cannot deliver (`Fault::Unsupported`); #PF and #GP from
     /// a fetch are delivered (X1a, [`exec::REPLY_FETCH_FAULT`]).
     FetchFault(Fault),
-    /// RIP reached a handler of the test driver's logging IDT ([`Requests::handlers`]): an exception was delivered there.
-    Logged,
+    /// The driver's [`Hook::at`] ended the run at RIP ([`At::Stop`], with its code), before anything there was fetched.
+    Hooked(u32),
     /// fexc translated nothing at RIP; its end reason (e.g. `system_instruction`).
     NoCode(String),
     /// The resident stopped the VM: `State::stop` (0 for a non-execution stop) and the shared status/detail.
@@ -674,7 +696,7 @@ pub(crate) enum Code {
 /// Every object, from fexc or a cache, goes through admission's mandatory validation when it is used: a damaged or forged
 /// cache entry can at worst be refused (a stop) or give the guest the effects of other x86 code inside its own containment,
 /// as a faulty fexc could; it cannot give code a way out of it.
-pub(crate) struct Compiler {
+pub struct Compiler {
     fexc: PathBuf,
     server: Option<Server>,
     supported: u64,
@@ -683,26 +705,20 @@ pub(crate) struct Compiler {
     cache: HashMap<(u64, Option<u32>), Vec<Entry>>,
     cached: usize,
     /// The persistent cache (`boot-linux` sets it; test drivers never do).
-    pub(crate) disk: Option<std::sync::Arc<crate::compile_cache::DiskCache>>,
+    pub disk: Option<std::sync::Arc<crate::compile_cache::DiskCache>>,
     /// Requests that reached fexc.
-    pub(crate) compiles: u64,
+    pub compiles: u64,
     /// Requests answered from the cache in memory, and from the persistent one.
     pub(crate) hits: u64,
     pub(crate) disk_hits: u64,
-    /// Test drivers only: rewrites each admitted object before it is staged, to check the resident's run-time defences
-    /// against code admission refuses.
-    pub(crate) tamper: Option<fn(&mut [u8])>,
     /// How long one request may wait for the server's whole reply (the first one includes the server's start); then the
     /// server is killed and the run fails with a host error ([`COMPILE_DEADLINE`] by default).
-    pub(crate) deadline: Duration,
+    pub deadline: Duration,
     /// The longest request so far (reply received), for the deadline's margin.
-    pub(crate) slowest: Duration,
-    /// Test drivers only: once `.0` requests have reached the server, it gets signal `.1` before the next (SIGKILL: the
-    /// server dies mid-run; SIGSTOP: it stays alive and never answers). The run must fail with the cause.
-    pub(crate) signal_at: Option<(u64, i32)>,
+    pub slowest: Duration,
     /// Admission's code-shape debug check ([`admission`]); off unless the caller sets it (the program driver's
     /// `--code-shape`).
-    pub(crate) shape: bool,
+    pub shape: bool,
     /// The vCPU's controls gate SSE (I5a: CR0.EM, CR0.TS or no CR4.OSFXSR, [`sse_gated`]): fexc cuts every SSE form as a
     /// system instruction, which the resident raises as #UD or #NM. Set per request (part of the request, so of the cache key).
     pub(crate) sse_gated: bool,
@@ -753,9 +769,9 @@ pub(crate) fn avx_gated(cpu: &exec::Cpu) -> bool {
 }
 /// The default [`Compiler::deadline`]: a large multiple of the slowest compile measured on the regression sets
 /// (S3h: at most 13.4 ms, server start included, over 6,080 vCPU runs of the corpora at N = 4 and N = 2 with block size 1).
-pub(crate) const COMPILE_DEADLINE: Duration = Duration::from_secs(30);
+pub const COMPILE_DEADLINE: Duration = Duration::from_secs(30);
 impl Compiler {
-    pub(crate) fn new(fexc: &Path, cpu: &Vcpu, max_instructions: Option<u32>) -> Result<Self> {
+    pub fn new(fexc: &Path, cpu: &Vcpu, max_instructions: Option<u32>) -> Result<Self> {
         let mut id = [0; admission::ID_REGISTERS.len()];
         for (value, (name, reg)) in id.iter_mut().zip(admission::ID_REGISTERS) {
             *value = cpu.sys(reg).map_err(|e| format!("{name}: {e}"))?;
@@ -763,18 +779,18 @@ impl Compiler {
         Ok(Self::with_features(fexc, admission::supported_features(&id), max_instructions))
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
-        Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), cached: 0, disk: None, compiles: 0, hits: 0, disk_hits: 0, tamper: None,
-               deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, signal_at: None, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![] }
+        Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), cached: 0, disk: None, compiles: 0, hits: 0, disk_hits: 0,
+               deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![] }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
     /// `rip` the resident executes, or fexc's end reason when it produced no code.
-    fn compile(&mut self, bytes: &[u8], rip: u64, step: bool) -> Result<Code> {
+    fn compile(&mut self, bytes: &[u8], rip: u64, step: bool, hook: &mut impl Hook) -> Result<Code> {
         // I9 review: a block whose code is over `MAX_BLOCK_BYTES` (PDEP/PEXT, PCMPxSTRx and other long lowerings in numbers)
         // is translated again from the same RIP with half its instructions, until it fits; one instruction too large for a
         // block stops `code_too_large`.
         let mut limit = if step { Some(1) } else { self.max_instructions };
         loop {
-            match self.compile_once(bytes, rip, limit)? {
+            match self.compile_once(bytes, rip, limit, hook)? {
                 Ok(code) => return Ok(code),
                 Err(n) if n > 1 => limit = Some(n / 2),
                 Err(_) => return Ok(Code::None("code_too_large".into())),
@@ -794,7 +810,7 @@ impl Compiler {
     }
     /// [`Compiler::compile`] with an instruction limit; `Err(n)`: the object's code is too large for a block (n guest
     /// instructions translated).
-    fn compile_once(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>) -> Result<std::result::Result<Code, u32>> {
+    fn compile_once(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>, hook: &mut impl Hook) -> Result<std::result::Result<Code, u32>> {
         let (key, gating) = ((rip, limit), self.gating());
         let index = match self.cache.get(&key).and_then(|v| v.iter().position(|e| e.matches(bytes, &gating))) {
             Some(i) => {
@@ -802,7 +818,7 @@ impl Compiler {
                 i
             }
             None => {
-                let reply = self.ask(bytes, rip, limit)?;
+                let reply = self.ask(bytes, rip, limit, hook)?;
                 // ponytail: wholesale reset at a size cap; a real eviction policy when runs outgrow it
                 if self.cached >= 1 << 16 {
                     self.cache.clear();
@@ -820,10 +836,10 @@ impl Compiler {
             Answer::Object(object) => match admission::oversized(object) {
                 Some(n) => Err(n),
                 None => {
+                    #[cfg_attr(not(feature = "testing"), allow(unused_mut))]
                     let mut admitted = admission::admit(object, rip, bytes, self.supported, self.shape)?;
-                    if let Some(tamper) = self.tamper {
-                        tamper(&mut admitted.object);
-                    }
+                    #[cfg(feature = "testing")]
+                    hook.admitted(&mut admitted.object);
                     Ok(Code::Block(admitted))
                 }
             },
@@ -889,7 +905,7 @@ impl Compiler {
         body
     }
     /// fexc's reply to the request for `bytes` at `rip`: from the persistent cache, else from the server (then stored).
-    fn ask(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>) -> Result<Reply> {
+    fn ask(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>, _hook: &mut impl Hook) -> Result<Reply> {
         let body = self.body(bytes, rip, limit);
         let stored = self.disk.as_ref().filter(|d| !d.is_empty()).and_then(|d| d.get(&d.key(&body)));
         if let Some(reply) = stored.and_then(|p| Reply::from_payload(&p)).filter(|r| r.code < 2) {
@@ -900,12 +916,8 @@ impl Compiler {
             self.server = Some(Server::start(&self.fexc)?);
         }
         let server = self.server.as_mut().unwrap();
-        if let Some((_, signal)) = self.signal_at.filter(|s| s.0 == self.compiles) {
-            unsafe extern "C" {
-                fn kill(pid: i32, signal: i32) -> i32;
-            }
-            unsafe { kill(server.child.id() as i32, signal) };
-        }
+        #[cfg(feature = "testing")]
+        _hook.before_compile(self.compiles, server.child.id());
         let began = Instant::now();
         let reply = match server.request(&body, began + self.deadline) {
             Ok(reply) => reply,
@@ -991,36 +1003,61 @@ fn fetched(area: Area, state: &State, limit: Option<u64>) -> Result<std::result:
     Ok(Ok(Fetched { bytes, more: next.is_some() && !walked, next_fault: fault }))
 }
 
+/// What [`Hook::at`] makes of the translation request at a RIP.
+pub enum At {
+    /// End the run there ([`Stop::Hooked`] with this code), nothing fetched or compiled.
+    Stop(u32),
+    /// Answer with this system reply ([`exec::REPLY_SYSTEM`]; not counted in [`Requests::decodes`]): any kind, the
+    /// resident's test kinds (`SET_CPL`, `EVENT_HOOK`) included, so test drivers only (the `testing` feature).
+    #[cfg(feature = "testing")]
+    System(exec::System),
+}
+/// Which reply [`Hook::reply`] sees.
+#[cfg(feature = "testing")]
+pub enum ReplyKind {
+    /// A translation request's reply (a block, a decode, a next page or a fetch fault), never a park.
+    Translation,
+    /// A device access's reply (M3).
+    Device,
+}
+/// A driver's view into one vCPU's [`run`], at its host exits only (never in the VM). Every method defaults to doing
+/// nothing; `()` is the hook of a run without one, and compiles to nothing. The test driver supplies its run-time defence
+/// checks (corrupted replies and objects, a killed compile server) and its test programs' hooks (CPL switches, event
+/// sources, the logging IDT) through it. Without the `testing` feature only [`Hook::at`] (ending a run) and
+/// [`Hook::boundary`] exist: nothing that changes what the resident is given.
+pub trait Hook {
+    /// At a translation request for `rip`, after the caller's stop RIP: end the run, or answer it, or (`None`) translate.
+    fn at(&mut self, _area: Area, _rip: u64) -> Result<Option<At>> {
+        Ok(None)
+    }
+    /// The lowest RIP above `rip` [`Hook::at`] answers: blocks are fetched up to it, so it is reached at a block boundary.
+    fn boundary(&self, _rip: u64) -> Option<u64> {
+        None
+    }
+    /// Each admitted object, before it is staged.
+    #[cfg(feature = "testing")]
+    fn admitted(&mut self, _object: &mut [u8]) {}
+    /// Before a request goes to the compile server (`server` is its process ID), after `compiles` requests reached it.
+    #[cfg(feature = "testing")]
+    fn before_compile(&mut self, _compiles: u64, _server: u32) {}
+    /// Each reply, written into `state` (and the block or decode in place) but not yet seen by the resident.
+    #[cfg(feature = "testing")]
+    fn reply(&mut self, _kind: ReplyKind, _area: Area, _state: &mut State) {}
+}
+impl Hook for () {}
+
 /// Host exits of one [`run`].
 #[derive(Default)]
-pub(crate) struct Requests {
+pub struct Requests {
     /// Translation requests answered with a block, and the distinct RIPs among them (single-step requests not included).
-    pub(crate) blocks: u64,
-    pub(crate) rips: std::collections::HashSet<u64>,
-    /// Test drivers only: called at each reply but a park, with the vCPU stopped, the reply (`State::reply`) and its block
-    /// or decode in place but not yet seen by the resident, until it returns true (it corrupted something, possibly the
-    /// reply kind); then `tampered` is set. Checks the resident's run-time defences.
-    pub(crate) tamper: Option<fn(Area, &mut State) -> bool>,
-    /// The same for device replies (M3), only.
-    pub(crate) tamper_device: Option<fn(Area, &mut State) -> bool>,
-    pub(crate) tampered: bool,
-    /// Test drivers only: RIPs whose one-byte instruction is executed as a CPL change to the value
-    /// ([`exec::system::SET_CPL`]); blocks are fetched up to each, so it is reached at a block boundary.
-    pub(crate) switches: std::collections::BTreeMap<u64, u64>,
-    /// Test drivers only: the handler range of the driver's logging IDT; reaching it ends the run ([`Stop::Logged`]) before
-    /// anything there is fetched or compiled.
-    pub(crate) handlers: Option<std::ops::Range<u64>>,
-    /// Test drivers only (X2 event sources): RIPs whose one-byte instruction (a `nop`) posts an event into the vCPU's
-    /// record ([`post`]: a vector, or [`NMI`]) and rings its doorbell (`doorbell`), then completes as
-    /// [`exec::system::EVENT_HOOK`]; blocks are fetched up to each, as for `switches`.
-    pub(crate) posts: std::collections::BTreeMap<u64, u64>,
-    pub(crate) doorbell: Option<crate::vm::Doorbell>,
+    pub blocks: u64,
+    pub rips: std::collections::HashSet<u64>,
     /// M3: the VM's device ranges (shared by every vCPU thread; see [`crate::devices`]).
-    pub(crate) devices: Option<std::sync::Arc<crate::devices::Devices>>,
+    pub devices: Option<std::sync::Arc<crate::devices::Devices>>,
     /// K2: system-instruction decodes answered ([`exec::REPLY_SYSTEM`], by kind; the test hooks not included), and
     /// entropy refills asked for ([`exec::REQUEST_ENTROPY`]).
-    pub(crate) decodes: std::collections::BTreeMap<u32, u64>,
-    pub(crate) entropy: u64,
+    pub decodes: std::collections::BTreeMap<u32, u64>,
+    pub entropy: u64,
 }
 
 /// Runs the vCPU (entered at the resident, see [`enter`]) until it stops; `stop_at` is a RIP at
@@ -1029,7 +1066,7 @@ pub(crate) struct Requests {
 /// for `watchdog` without a host exit is forced out ([`Stop::Watchdog`]); host
 /// work between exits (compiles) is not counted. `cancelled` (a peer failed) ends the
 /// run at the next host exit ([`Stop::Cancelled`]; the supervisor forces the vCPU out).
-pub(crate) fn run(
+pub fn run(
     cpu: &Vcpu,
     area: Area,
     compiler: &mut Compiler,
@@ -1038,6 +1075,7 @@ pub(crate) fn run(
     requests: &mut Requests,
     stops: &Stops,
     cancelled: &AtomicBool,
+    hook: &mut impl Hook,
 ) -> Result<Stop> {
     // The resident fetches nothing at the stop RIP (the run ends there).
     let mut state: State = area.read_record(exec::STATE_OFFSET);
@@ -1065,7 +1103,7 @@ pub(crate) fn run(
             }
         }
     });
-    let stop = serve(cpu, area, compiler, stop_at, requests, stops, &running, cancelled);
+    let stop = serve(cpu, area, compiler, stop_at, requests, stops, &running, cancelled, hook);
     // ponytail: a cancel the watchdog sent just as the guest exited stays pending on the vCPU and would end its next
     // `hv_vcpu_run` at once; harmless while a vCPU serves one run. Drain it (a zero-length run) if vCPUs get reused.
     drop(running);
@@ -1081,6 +1119,7 @@ fn serve(
     stops: &Stops,
     running: &std::sync::mpsc::Sender<bool>,
     cancelled: &AtomicBool,
+    hook: &mut impl Hook,
 ) -> Result<Stop> {
     // The host's own stop, once decided: the vCPU was told to park (it drops its shadows first).
     let mut parked = None;
@@ -1122,18 +1161,15 @@ fn serve(
         let step = match state.request {
             exec::REQUEST_TRANSLATE => false,
             exec::REQUEST_STEP => true,
-            // M3: a device access, completed (or refused) once; never parked (test drivers may tamper with the reply).
+            // M3: a device access, completed (or refused) once; never parked (a driver's hook sees the reply).
             exec::REQUEST_DEVICE => {
                 // A peer failed after this exit: the device is not accessed (the vCPU ends with the access undone).
                 if cancelled.load(SeqCst) {
                     return Ok(Stop::Cancelled);
                 }
                 crate::devices::serve(area, &mut state, requests.devices.as_deref());
-                if let Some(tamper) = requests.tamper_device {
-                    if tamper(area, &mut state) {
-                        (requests.tamper_device, requests.tampered) = (None, true);
-                    }
-                }
+                #[cfg(feature = "testing")]
+                hook.reply(ReplyKind::Device, area, &mut state);
                 area.write_record(exec::STATE_OFFSET, state);
                 continue;
             }
@@ -1178,17 +1214,16 @@ fn serve(
             }
             _ => return Err("translation exit without a request".into()),
         };
-        state.reply = match translation(area, compiler, &mut state, step, stop_at, requests)? {
+        state.reply = match translation(area, compiler, &mut state, step, stop_at, requests, hook)? {
             Ok(reply) => reply,
             Err(stop) => {
                 parked = Some(stop);
                 exec::REPLY_PARK
             }
         };
-        if let Some(tamper) = requests.tamper.filter(|_| parked.is_none()) {
-            if tamper(area, &mut state) {
-                (requests.tamper, requests.tampered) = (None, true);
-            }
+        #[cfg(feature = "testing")]
+        if parked.is_none() {
+            hook.reply(ReplyKind::Translation, area, &mut state);
         }
         area.write_record(exec::STATE_OFFSET, state);
     }
@@ -1203,28 +1238,24 @@ fn translation(
     step: bool,
     stop_at: Option<u64>,
     requests: &mut Requests,
+    hook: &mut impl Hook,
 ) -> Result<std::result::Result<u64, Stop>> {
     let rip = state.cpu.rip;
     if Some(rip) == stop_at {
         return Ok(Err(Stop::Reached));
     }
-    if requests.handlers.as_ref().is_some_and(|h| h.contains(&rip)) {
-        return Ok(Err(Stop::Logged));
-    }
     // (A step request may be at one: X2 steps the instruction after a shadow-setting one.)
-    if let Some(&cpl) = requests.switches.get(&rip) {
-        state.system = exec::System { kind: exec::system::SET_CPL, length: 1, cr: cpl as u32, ..exec::System::NONE };
-        return Ok(Ok(exec::REPLY_SYSTEM));
+    match hook.at(area, rip)? {
+        Some(At::Stop(code)) => return Ok(Err(Stop::Hooked(code))),
+        #[cfg(feature = "testing")]
+        Some(At::System(system)) => {
+            state.system = system;
+            return Ok(Ok(exec::REPLY_SYSTEM));
+        }
+        None => {}
     }
-    if let Some(&event) = requests.posts.get(&rip) {
-        let _ = post(area.memory, area.vcpu, event, false);
-        requests.doorbell.ok_or("an event source without a doorbell")?.ring(area.vcpu)?;
-        state.system = exec::System { kind: exec::system::EVENT_HOOK, length: 1, ..exec::System::NONE };
-        return Ok(Ok(exec::REPLY_SYSTEM));
-    }
-    // Blocks end at the stop RIP and at every switch and event source after RIP.
-    let hooks = requests.switches.range(rip..).map(|(&r, _)| r).chain(requests.posts.range(rip..).map(|(&r, _)| r));
-    let hooks = hooks.chain(stop_at).filter(|&l| l > rip).min();
+    // Blocks end at the stop RIP and at the hook's next RIP.
+    let hooks = hook.boundary(rip).into_iter().chain(stop_at).filter(|&l| l > rip).min();
     // S4: and before every armed instruction breakpoint, so each is the first instruction of a block (the resident checks
     // it there); one inside an instruction on this path is never reached and is passed over.
     let mut breakpoints: Vec<u64> = state.cpu.code_breakpoints().filter(|&b| b > rip).collect();
@@ -1240,7 +1271,7 @@ fn translation(
         compiler.avx_gated = avx_gated(&state.cpu);
         compiler.x87 = x87_args(&state.cpu);
         compiler.alignment_gated = state.cpu.bit_tests_cut() && !(step && state.plain_step != 0);
-        let code = compiler.compile(&bytes, rip, step)?;
+        let code = compiler.compile(&bytes, rip, step, hook)?;
         match &code {
             // The instruction at RIP runs past a breakpoint the bytes were cut at.
             Code::None(reason) if reason == "partial_decode" && limit != hooks && limit == Some(rip + bytes.len() as u64) => {
@@ -1300,7 +1331,7 @@ mod tests {
         let Some(fexc) = std::env::var_os("FEXC") else { return };
         let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
         let code = [0x48, 0x01, 0xd8, 0xc3];
-        let object = |c: &mut super::Compiler, code: &[u8], rip| match c.compile(code, rip, false).unwrap() {
+        let object = |c: &mut super::Compiler, code: &[u8], rip| match c.compile(code, rip, false, &mut ()).unwrap() {
             Code::Block(b) => b.object,
             _ => panic!("no block"),
         };
@@ -1315,7 +1346,7 @@ mod tests {
         assert_eq!((c.compiles, c.hits), (4, 1));
         // A system instruction at the RIP is decoded (and cached with fexc's answer); one later in the block cuts it.
         let mov_cr3 = [0x0f, 0x22, 0xd8, 0x90];
-        let decoded = |c: &mut super::Compiler, rip| match c.compile(&mov_cr3, rip, false).unwrap() {
+        let decoded = |c: &mut super::Compiler, rip| match c.compile(&mov_cr3, rip, false, &mut ()).unwrap() {
             Code::System(s) => Some(s),
             _ => None,
         };
@@ -1323,13 +1354,13 @@ mod tests {
         assert_eq!((s.kind, s.cr, s.reg, s.length), (exec::system::MOV_TO_CR, 3, 0, 3));
         assert_eq!(decoded(&mut c, 0x3000), Some(s));
         assert_eq!((c.compiles, c.hits), (5, 2));
-        assert!(matches!(c.compile(&[0xf4], 0x3000, false).unwrap(), Code::System(s) if s.kind == exec::system::HLT)); // X2
+        assert!(matches!(c.compile(&[0xf4], 0x3000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::HLT)); // X2
         // A system instruction the host does not decode (SYSENTER) is no code.
-        assert!(matches!(c.compile(&[0x0f, 0x34], 0x3000, false).unwrap(), Code::None(r) if r == "system_instruction"));
+        assert!(matches!(c.compile(&[0x0f, 0x34], 0x3000, false, &mut ()).unwrap(), Code::None(r) if r == "system_instruction"));
         // Longer than 15 bytes (fexc series28): #GP(0) through the resident.
         let long = [&[0x66; 4][..], &[0x4a, 0xc7, 0x84, 0x83, 0, 1, 0, 0, 0, 0, 0, 0]].concat();
-        assert!(matches!(c.compile(&long, 0x3000, false).unwrap(), Code::System(s) if s.kind == exec::system::TOO_LONG));
-        assert!(matches!(c.compile(&[0x90, 0x0f, 0x22, 0xd8], 0x3000, false).unwrap(), Code::Block(_)));
+        assert!(matches!(c.compile(&long, 0x3000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::TOO_LONG));
+        assert!(matches!(c.compile(&[0x90, 0x0f, 0x22, 0xd8], 0x3000, false, &mut ()).unwrap(), Code::Block(_)));
         // P3: an answer is kept by what fexc read. Bytes after the block's end (`ret`) and a gating argument its forms do not
         // consult leave the request the same; the bytes of a block that ran to the end of its input, or an SSE form under other
         // SSE gating, do not.
@@ -1345,7 +1376,7 @@ mod tests {
         object(&mut c, &[&code[..3], &[0x90]].concat(), 0x1000);
         assert_eq!((c.compiles, c.hits), (3, 2));
         let movaps = [0x0f, 0x28, 0xc1, 0xc3];
-        assert!(matches!(c.compile(&movaps, 0x2000, false).unwrap(), Code::System(s) if s.kind == exec::system::SSE_GATED));
+        assert!(matches!(c.compile(&movaps, 0x2000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::SSE_GATED));
         c.sse_gated = false;
         object(&mut c, &movaps, 0x2000);
         assert_eq!((c.compiles, c.hits), (5, 2));
@@ -1362,7 +1393,7 @@ mod tests {
         let open = |d: &str| Some(std::sync::Arc::new(crate::compile_cache::DiskCache::open(&dir.join(d), &fexc, 1 << 30).unwrap()));
         let code = [0x48, 0x01, 0xd8, 0xc3];
         let new = |disk| super::Compiler { disk, ..super::Compiler::with_features(&fexc, u64::MAX, None) };
-        let block = |c: &mut super::Compiler| match c.compile(&code, 0x5000, false) {
+        let block = |c: &mut super::Compiler| match c.compile(&code, 0x5000, false, &mut ()) {
             Ok(Code::Block(b)) => Ok(b.object),
             Ok(_) => Err("no block".to_string()),
             Err(e) => Err(e),

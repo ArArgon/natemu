@@ -6,7 +6,7 @@ semantics, through the host's device registry (boot-features plan, M3).
         [--iterations 20000] [--cpus 1 2 3 4] [--xmc-iterations N] [--xmc-peer N] [--only corpus,faults,refusals,unassigned,kicks,contain,xmc,boundary]
 
 Every description maps linear page 0x200000 to guest-physical 0xfeb00000 (`mmio` item), where the driver registers its
-test device (`crates/host/src/devices.rs` TestDevice: a counter register at 0xf00 whose every read counts, a sequence
+test device (`crates/driver/src/drivers/test_devices.rs` TestDevice: a counter register at 0xf00 whose every read counts, a sequence
 register at 0xf08 whose n-th write by a vCPU must carry n, a last 8 bytes that refuse every access, plain memory elsewhere;
 every access counted and logged). Needs fexc series23-m3 (completion records on load/store sites).
 

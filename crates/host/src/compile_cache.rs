@@ -16,8 +16,9 @@
 //! builds' packs go (they can never hit), then the oldest `u` packs, then the oldest `k` ones, until it is at most 3/4 of the
 //! cap (kernel code is the same every boot; user code at randomized addresses rarely is), so every run has a quarter of the
 //! cap to write into; during a run, nothing more is written once the total reaches the cap.
-//! Configuration: `NATEMU_COMPILE_CACHE` = a directory or `off` (default `~/Library/Caches/natemu/fexc`),
-//! `NATEMU_COMPILE_CACHE_MB` = the cap (default 512). Only `boot-linux` opens it ([`shared`]); the test drivers never do.
+//! Configuration: [`Config`], from the environment by [`Config::from_env`]: `NATEMU_COMPILE_CACHE` = a directory or `off`
+//! (default `~/Library/Caches/natemu/fexc`), `NATEMU_COMPILE_CACHE_MB` = the cap (default 512). Only the boot entry opens it
+//! ([`shared`]: `natemu`, `natemu-host boot-linux`); the test drivers never do.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -162,7 +163,7 @@ struct Writer {
 /// A new entry: request body, kernel half, payload.
 type Entry = (Vec<u8>, bool, Vec<u8>);
 
-pub(crate) struct DiskCache {
+pub struct DiskCache {
     identity: [u8; 32],
     packs: Vec<File>,
     index: HashMap<[u8; 32], Slot>,
@@ -372,30 +373,50 @@ fn alive(pid: i32) -> bool {
     found || std::io::Error::last_os_error().raw_os_error() != Some(3) // ESRCH
 }
 
-/// The process's cache for answers of `fexc` (one, shared by every vCPU's compiler; written out when the last drops), or
-/// `None` when `NATEMU_COMPILE_CACHE=off` or it cannot be opened (the run goes on without it, with a warning).
-pub(crate) fn shared(fexc: &Path) -> Option<Arc<DiskCache>> {
-    static SHARED: Mutex<Weak<DiskCache>> = Mutex::new(Weak::new());
-    let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cache) = shared.upgrade() {
-        return Some(cache);
+/// Where the persistent cache lives and its cap in bytes; `dir: None` is no cache ([`Config::OFF`]).
+pub struct Config {
+    pub dir: Option<PathBuf>,
+    pub cap: u64,
+}
+impl Config {
+    pub const OFF: Self = Self { dir: None, cap: 0 };
+    /// The configuration from the environment (callers opt in): `NATEMU_COMPILE_CACHE` = a directory or `off` (default
+    /// `~/Library/Caches/natemu/fexc`), `NATEMU_COMPILE_CACHE_MB` = the cap (default 512).
+    pub fn from_env() -> Self {
+        let dir = match std::env::var_os("NATEMU_COMPILE_CACHE") {
+            Some(v) if v == "off" => None,
+            Some(v) => Some(PathBuf::from(v)),
+            None => std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Caches/natemu/fexc")),
+        };
+        let cap = std::env::var("NATEMU_COMPILE_CACHE_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(512) << 20;
+        Self { dir, cap }
     }
-    let dir = match std::env::var_os("NATEMU_COMPILE_CACHE") {
-        Some(v) if v == "off" => return None,
-        Some(v) => PathBuf::from(v),
-        None => PathBuf::from(std::env::var_os("HOME")?).join("Library/Caches/natemu/fexc"),
-    };
-    let cap = std::env::var("NATEMU_COMPILE_CACHE_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(512) << 20;
-    match DiskCache::open(&dir, fexc, cap) {
+}
+
+/// The process's cache for answers of `fexc` (one, shared by every vCPU's compiler; written out when the last drops), or
+/// `None` when `config` has no directory or it cannot be opened (the run goes on without it, with a warning). While one
+/// is open, a request for another fexc, directory or cap is an error (the open one would answer it).
+pub fn shared(fexc: &Path, config: &Config) -> Result<Option<Arc<DiskCache>>, String> {
+    static SHARED: Mutex<(Weak<DiskCache>, Option<(PathBuf, PathBuf, u64)>)> = Mutex::new((Weak::new(), None));
+    let Some(dir) = &config.dir else { return Ok(None) };
+    let (wanted, cap) = ((fexc.to_path_buf(), dir.clone(), config.cap), config.cap);
+    let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cache) = shared.0.upgrade() {
+        return match &shared.1 {
+            Some(open) if *open == wanted => Ok(Some(cache)),
+            open => Err(format!("compile cache {open:?} is open in this process; another one ({wanted:?}) cannot be")),
+        };
+    }
+    match DiskCache::open(dir, fexc, cap) {
         Ok(cache) => {
             eprintln!("compile cache: {} ({} entries, {:.1} MiB, cap {} MiB)", dir.display(), cache.entries, cache.bytes as f64 / 1048576.0, cap >> 20);
             let cache = Arc::new(cache);
-            *shared = Arc::downgrade(&cache);
-            Some(cache)
+            *shared = (Arc::downgrade(&cache), Some(wanted));
+            Ok(Some(cache))
         }
         Err(e) => {
             eprintln!("compile cache off: {e}");
-            None
+            Ok(None)
         }
     }
 }

@@ -283,7 +283,7 @@ python3 -B -m unittest discover -s tools -p 'test_check_setup.py'
 
 The host of record is M4/macOS26, with SDK26.4 in inherited evidence. New Rust
 builds must record/admit their actual SDK/toolchain; the frozen Track01 checker
-retains its exact original SDK requirement. The workspace now contains `crates/host`, `crates/runtime` and `crates/abi`.
+retains its exact original SDK requirement. The workspace now contains `crates/host` (the library `natemu` and its boot stub), `crates/driver` (the test driver `natemu-host`), `crates/runtime` and `crates/abi`.
 Rust 1.97.0 and the bare-metal target are pinned in `rust-toolchain.toml`; Cargo
 has no registry dependencies. Assembly offsets come from the shared Rust layout.
 I2 used a versioned 128-byte little-endian register/worker packet, with Rust and

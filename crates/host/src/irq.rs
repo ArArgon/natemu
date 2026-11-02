@@ -183,19 +183,19 @@ impl Chipset {
 /// L4b: what a rising edge on a line did (for the lost-tick policies): some APIC took it into a clear IRR bit, or every
 /// taker had it pending already (it merged), or nothing took it (masked, or no destination accepts).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Delivery {
+pub enum Delivery {
     Fresh,
     Coalesced,
     None,
 }
 /// A shared handle on the chipset, for devices, drivers and asynchronous sources (any thread).
 #[derive(Clone)]
-pub(crate) struct Irqs {
+pub struct Irqs {
     chipset: Arc<Mutex<Chipset>>,
     live: Arc<AtomicUsize>,
 }
 /// While held, a source may still fire: halted vCPUs are not ended ([`Irqs::live`]).
-pub(crate) struct Busy(Arc<AtomicUsize>);
+pub struct Busy(pub Arc<AtomicUsize>);
 impl Drop for Busy {
     fn drop(&mut self) {
         self.0.fetch_sub(1, SeqCst);
@@ -206,22 +206,22 @@ impl Irqs {
         self.chipset.lock().unwrap_or_else(|e| e.into_inner())
     }
     /// Sets line `irq` (ISA IRQ 0..15, GSI 16..23) to `level` (1 = asserted), from any thread; what a rise did.
-    pub(crate) fn line(&self, irq: usize, level: bool) -> Delivery {
+    pub fn line(&self, irq: usize, level: bool) -> Delivery {
         self.lock().line(irq, level)
     }
     /// A guard a source holds while it may still fire.
-    pub(crate) fn busy(&self) -> Busy {
+    pub fn busy(&self) -> Busy {
         self.live.fetch_add(1, SeqCst);
         Busy(self.live.clone())
     }
     /// Sources that may still fire (held [`Busy`] guards): while nonzero, no halted vCPU may be ended.
-    pub(crate) fn live(&self) -> usize {
+    pub fn live(&self) -> usize {
         self.live.load(SeqCst)
     }
     /// A pulse on the board's NMI input, wired to every LAPIC's LINT1 (the MADT's Local APIC NMI): an NMI to each APIC
     /// whose LVT LINT1 is unmasked in NMI mode (`lapic::LINT1_NMI`; fixed or ExtINT LINT1 delivery is not wired). No
     /// source drives it on this board yet (no NMI button or watchdog).
-    pub(crate) fn nmi(&self) {
+    pub fn nmi(&self) {
         let c = self.lock();
         for v in 0..c.lapics.vcpus {
             if execution::published(c.lapics.memory(), v) & lapic::LINT1_NMI != 0 {
@@ -232,7 +232,7 @@ impl Irqs {
         }
     }
     /// The machine exists: deliveries ring its doorbells from now on.
-    pub(crate) fn attach(&self, doorbell: Doorbell) {
+    pub fn attach(&self, doorbell: Doorbell) {
         self.lock().lapics.doorbell = Some(doorbell);
     }
     /// A LAPIC's EOI of level-triggered `vector` (the broadcast to the I/O APIC).
@@ -300,7 +300,7 @@ impl Device for View {
 }
 
 /// Puts the chipset on `devices` for a VM of `vcpus` vCPUs on `memory`, and wires `uart`'s IRQ (COM1, ISA IRQ 4) into it.
-pub(crate) fn install(devices: &mut Devices, memory: &Memory, vcpus: usize, uart: &Arc<Mutex<crate::uart::Uart>>) -> crate::Result<Irqs> {
+pub fn install(devices: &mut Devices, memory: &Memory, vcpus: usize, uart: &Arc<Mutex<crate::uart::Uart>>) -> crate::Result<Irqs> {
     let lapics = Lapics { memory, vcpus, doorbell: None, lint0: false, messages: Default::default(), fresh: Default::default(), coalesced: Default::default() };
     let chipset = Chipset { ioapic: Ioapic::new(), pic: Pic::new(), lines: 0, lapics };
     let irqs = Irqs { chipset: Arc::new(Mutex::new(chipset)), live: Arc::default() };
@@ -335,86 +335,6 @@ pub(crate) fn serve(area: execution::Area, state: &mut State, devices: Option<&D
     };
     area.write_record(MMIO_OFFSET, m);
     state.reply = exec::REPLY_IRQ;
-}
-
-/// A test source (`run-program --irq-source PORT`), natemu only: an asynchronous device on 8 ports. A 32-bit write at
-/// +0 asks for line bits 7:0 to fire after bits 31:16 microseconds, from a host thread: an edge (0 -> 1 -> 0) with bit 8
-/// clear, else the line is asserted and held; with bit 9 set, a pulse on the NMI input (LINT1) instead. A write at +4
-/// deasserts line bits 7:0 at once (the handler's acknowledgement of a level-triggered request). A 32-bit read at +0 gives
-/// the requests fired so far. Each request holds a [`Busy`] guard until it fired.
-pub(crate) struct TestSource {
-    jobs: Option<std::sync::mpsc::Sender<(std::time::Instant, usize, bool, Busy)>>,
-    fired: Arc<AtomicUsize>,
-    worker: Option<std::thread::JoinHandle<()>>,
-    irqs: Irqs,
-    /// `--irq-source-no-veto` (a negative control of the halted rule): requests hold no guard.
-    pub(crate) veto: bool,
-}
-impl TestSource {
-    pub(crate) fn new(irqs: &Irqs) -> Self {
-        let (jobs, queue) = std::sync::mpsc::channel::<(std::time::Instant, usize, bool, Busy)>();
-        let (lines, fired) = (irqs.clone(), Arc::new(AtomicUsize::new(0)));
-        let count = fired.clone();
-        let worker = std::thread::spawn(move || {
-            let mut pending = Vec::new();
-            loop {
-                // The earliest due job, or wait for one.
-                pending.sort_by_key(|j: &(std::time::Instant, usize, bool, Busy)| std::cmp::Reverse(j.0));
-                let timeout = pending.last().map(|j| j.0.saturating_duration_since(std::time::Instant::now()));
-                let next = match timeout {
-                    Some(t) => queue.recv_timeout(t),
-                    None => queue.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
-                };
-                match next {
-                    Ok(job) => pending.push(job),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        let (_, line, level, _busy) = pending.pop().unwrap();
-                        if line == NMI_LINE {
-                            lines.nmi();
-                        } else {
-                            lines.line(line, true);
-                            if !level {
-                                lines.line(line, false);
-                            }
-                        }
-                        count.fetch_add(1, SeqCst);
-                    }
-                    Err(_) => return,
-                }
-            }
-        });
-        Self { jobs: Some(jobs), fired, worker: Some(worker), irqs: irqs.clone(), veto: true }
-    }
-}
-/// The test source's job for the NMI input.
-const NMI_LINE: usize = usize::MAX;
-impl Drop for TestSource {
-    fn drop(&mut self) {
-        self.jobs = None;
-        if let Some(w) = self.worker.take() {
-            let _ = w.join();
-        }
-    }
-}
-impl Device for TestSource {
-    fn read(&mut self, _vcpu: usize, offset: u64, _size: u64) -> Option<u64> {
-        Some(if offset == 0 { self.fired.load(SeqCst) as u64 } else { 0 })
-    }
-    fn write(&mut self, _vcpu: usize, offset: u64, _size: u64, value: u64) -> bool {
-        let line = if value & 0x200 != 0 { NMI_LINE } else { (value & 0xff) as usize };
-        match offset {
-            0 => {
-                let busy = if self.veto { self.irqs.busy() } else { Busy(Arc::new(AtomicUsize::new(1))) };
-                let due = std::time::Instant::now() + std::time::Duration::from_micros(value >> 16 & 0xffff);
-                let _ = self.jobs.as_ref().map(|j| j.send((due, line, value & 0x100 != 0, busy)));
-            }
-            4 => {
-                self.irqs.line(line, false);
-            }
-            _ => {}
-        }
-        true
-    }
 }
 
 #[cfg(test)]

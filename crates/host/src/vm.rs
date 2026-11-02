@@ -51,7 +51,7 @@ unsafe extern "C" {
     fn hv_vm_get_max_vcpu_count(count: *mut u32) -> i32;
 }
 
-pub(crate) fn hv(code: i32, operation: &str) -> Result<()> {
+pub fn hv(code: i32, operation: &str) -> Result<()> {
     if code == 0 {
         Ok(())
     } else {
@@ -60,7 +60,7 @@ pub(crate) fn hv(code: i32, operation: &str) -> Result<()> {
 }
 
 /// Fails unless the host can run `n` vCPUs in one VM.
-pub(crate) fn require_vcpus(n: usize) -> Result<()> {
+pub fn require_vcpus(n: usize) -> Result<()> {
     let mut limit = 0;
     unsafe { hv(hv_vm_get_max_vcpu_count(&mut limit), "read host vCPU limit")? };
     if n > limit as usize {
@@ -113,12 +113,12 @@ const MPIDR_EL1: u16 = 0xc005;
 
 /// The process VM with all of `memory` mapped read/write/execute at `IPA`, and its GIC: each vCPU's doorbells are the
 /// SGI `exec::KICK_SGI` (from peers' residents) and its own SPI `spi + v` (from the host), group 1, edge-triggered.
-pub(crate) struct Machine {
+pub struct Machine {
     /// The first SPI: vCPU v's host doorbell is `spi + v`.
     spi: u32,
 }
 impl Machine {
-    pub(crate) fn create(memory: &Memory) -> Result<Self> {
+    pub fn create(memory: &Memory) -> Result<Self> {
         unsafe {
             let config = hv_vm_config_create();
             // M1: the IPA space must hold the whole backing (guest RAM included); HVF's default IPA size (36 bits on
@@ -194,13 +194,13 @@ impl Machine {
         unsafe { hv(hv_gic_set_distributor_reg(reg, value), "write GIC distributor") }
     }
     /// Disables vCPU `v`'s host doorbell (a test driver's peer that never answers).
-    pub(crate) fn silence(&self, v: usize) -> Result<()> {
+    pub fn silence(&self, v: usize) -> Result<()> {
         let n = self.spi + v as u32;
         self.set_distributor(gicd(GICD_ICENABLER, n, 1), 1 << (n % 32))
     }
     /// Routes vCPU `v`'s SPI to it (Aff0 = `v`). Written after the vCPU exists: HVF delivers an SPI whose route was
     /// written before then to no one (`experiments/track03/native-interrupts/`, the IROUTER quirk).
-    pub(crate) fn route(&self, v: usize) -> Result<()> {
+    pub fn route(&self, v: usize) -> Result<()> {
         self.set_distributor(GICD_IROUTER + 8 * (self.spi + v as u32) as u16, v as u64)
     }
     /// Rings vCPU `v`'s host doorbell (an edge on its SPI), from any thread.
@@ -208,7 +208,7 @@ impl Machine {
         self.doorbell().ring(v)
     }
     /// The doorbells alone (X2: what a vCPU's service loop rings for a test driver's event source).
-    pub(crate) fn doorbell(&self) -> Doorbell {
+    pub fn doorbell(&self) -> Doorbell {
         Doorbell { spi: self.spi }
     }
     /// vCPU `v`'s host doorbell is pending (rung, not yet acknowledged).
@@ -217,19 +217,19 @@ impl Machine {
         Ok(self.distributor(gicd(GICD_ISPENDR, n, 1))? >> (n % 32) & 1 != 0)
     }
     /// Destroys the VM now and returns the framework status.
-    pub(crate) fn destroy(self) -> i32 {
+    pub fn destroy(self) -> i32 {
         std::mem::forget(self);
         unsafe { hv_vm_destroy() }
     }
 }
 /// The VM's host doorbells ([`Machine::doorbell`]); valid while the machine exists.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Doorbell {
+pub struct Doorbell {
     spi: u32,
 }
 impl Doorbell {
     /// Rings vCPU `v`'s host doorbell (an edge on its SPI), from any thread.
-    pub(crate) fn ring(&self, v: usize) -> Result<()> {
+    pub fn ring(&self, v: usize) -> Result<()> {
         let _gic = gic();
         unsafe { hv(hv_gic_set_spi(self.spi + v as u32, true), "hv_gic_set_spi") }
     }
@@ -263,7 +263,7 @@ pub(crate) enum Exit {
     Cancelled,
 }
 
-pub(crate) struct Vcpu {
+pub struct Vcpu {
     id: u64,
     exit: *const HvExit,
     alive: bool,
@@ -271,7 +271,7 @@ pub(crate) struct Vcpu {
 impl Vcpu {
     /// Creates a vCPU on the calling thread. FEAT_FlagM is an emulator requirement:
     /// FEX-generated code uses CFINV.
-    pub(crate) fn create() -> Result<Self> {
+    pub fn create() -> Result<Self> {
         let mut cpu = Self {
             id: 0,
             exit: ptr::null(),

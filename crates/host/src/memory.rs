@@ -17,7 +17,7 @@ unsafe extern "C" {
 }
 
 /// Anonymous host backing for guest RAM. It must outlive the VM that maps it.
-pub(crate) struct Memory(pub(crate) *mut u8, pub(crate) usize);
+pub struct Memory(pub(crate) *mut u8, pub(crate) usize);
 // SAFETY: the backing is shared with running vCPUs anyway; every accessor copies through raw pointers. Owner threads
 // touch their own vCPU's records, and areas shared between vCPUs only through atomics.
 unsafe impl Sync for Memory {}
@@ -26,7 +26,7 @@ impl Memory {
     pub(crate) fn new() -> Result<Self> {
         Self::with_size(RAM_SIZE)
     }
-    pub(crate) fn with_size(size: usize) -> Result<Self> {
+    pub fn with_size(size: usize) -> Result<Self> {
         let p = unsafe { mmap(ptr::null_mut(), size, 3, 0x1002, -1, 0) };
         if p as isize == -1 {
             return Err(format!("mmap: {}", std::io::Error::last_os_error()));
@@ -103,7 +103,7 @@ fn u16_at(data: &[u8], offset: usize) -> Result<u16> {
     let bytes = data.get(offset..offset + 2).ok_or("truncated ELF")?;
     Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
 }
-pub(crate) fn read_input(path: &str, max: usize) -> Result<Vec<u8>> {
+pub fn read_input(path: &str, max: usize) -> Result<Vec<u8>> {
     if fs::metadata(path).map_err(|e| e.to_string())?.len() > max as u64 {
         return Err("oversized input".into());
     }

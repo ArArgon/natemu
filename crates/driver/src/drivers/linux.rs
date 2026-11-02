@@ -1,5 +1,6 @@
-//! `boot-linux`: load a bzImage with the 64-bit boot protocol ([`crate::boot`]) and run the BSP from the protocol's
-//! entry state on one vCPU. A driver over the library pieces (boot, execution, vm, owners): no tamper, no fixture.
+//! `boot-linux`: load a bzImage with the 64-bit boot protocol ([`crate::boot`]) and run it on the library's boot entry
+//! ([`natemu::linux::Boot`]): no hook, no fixture. This driver adds the load-only path, the dump, the clock trace, the
+//! saves and the JSON report.
 //!
 //!   natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--rsdp ADDR]
 //!       [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]
@@ -29,11 +30,10 @@
 //! entry state) and, after a run, the stop and the final state.
 use super::super::*;
 use crate::boot::{self, Inputs, Layout, Loaded};
-use crate::execution::{self, Compiler, Stop};
+use crate::execution::{self, Stop};
 use natemu_abi::execution::{self as exec, Cpu, State};
 use natemu_abi::guest_memory::GuestRam;
 use std::fmt::Write as _;
-use std::path::Path;
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] \
                      [--rsdp ADDR] [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N] [--serial FILE] [--strict-unassigned] [--lost-ticks SPEC] [--clock-trace FILE]";
@@ -86,12 +86,11 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     if !(1..=exec::cache::MAX_VCPUS).contains(&vcpus) {
         return Err(format!("--vcpus {vcpus}: 1..={}", exec::cache::MAX_VCPUS));
     }
-    let tables = boot::acpi::build(vcpus, rsdp);
-    let inputs = Inputs { image: &image, cmdline: &cmdline, initrd: initrd.as_deref(), acpi: Some(&tables) };
-
     let layout = Layout { low_end: ram.unwrap_or(Layout::DEFAULT.low_end), high: 0 };
     layout.e820().map_err(|e| e.to_string())?; // before allocating L bytes
     if load_only {
+        let tables = boot::acpi::build(vcpus, rsdp);
+        let inputs = Inputs { image: &image, cmdline: &cmdline, initrd: initrd.as_deref(), acpi: Some(&tables) };
         // Zero-filled on demand: only the pages the loader writes are touched.
         let mut host = vec![0u64; layout.low_end as usize / 8];
         // SAFETY: `host` backs [0, L) and outlives `guest`.
@@ -105,76 +104,44 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let backing = execution::prepare(resident, code_bytes, vcpus, layout.low_end as usize)?;
-    require_vcpus(vcpus)?;
-    let guest = backing.ram;
-    let loaded = boot::load(&guest, &layout, &inputs).map_err(|e| e.to_string())?;
-    if let Some(path) = &dump {
-        write_dump(path, &guest, &loaded)?;
-    }
-    execution::guest_ram_written(&backing.memory);
-    for v in 0..vcpus {
-        execution::set_cpu(backing.vcpu(v), if v == 0 { loaded.cpu } else { loaded.ap });
-        execution::set_lapic(backing.vcpu(v), natemu_abi::lapic::Lapic { reinject: u64::from(lost.lapic), ..natemu_abi::lapic::RESET });
-        if v > 0 {
-            let mut state: State = backing.vcpu(v).read_record(exec::STATE_OFFSET);
-            state.mailbox = tables.mailbox;
-            backing.vcpu(v).write_record(exec::STATE_OFFSET, state);
-        }
-    }
-
-    // L3: COM1 and the unassigned rule.
-    let uart = std::sync::Arc::new(std::sync::Mutex::new(crate::uart::Uart::new()));
+    let mut boot = natemu::linux::Boot {
+        initrd,
+        cmdline,
+        ram: layout.low_end,
+        vcpus,
+        rsdp,
+        code_bytes,
+        strict_unassigned: strict,
+        lost_ticks: lost,
+        watchdog: std::time::Duration::from_millis(watchdog_ms),
+        max_block,
+        stop_at,
+        compile_cache: crate::compile_cache::Config::from_env(),
+        ..natemu::linux::Boot::new(resident, fexc, image)
+    };
     if let Some(path) = &serial {
-        uart.lock().unwrap().sink = Some(Box::new(fs::File::create(path).map_err(|e| format!("{path}: {e}"))?));
+        boot.serial = Some(Box::new(fs::File::create(path).map_err(|e| format!("{path}: {e}"))?));
     }
-    let mut devices = crate::devices::Devices::new(layout.low_end);
-    devices.register_ports(boot::acpi::platform::COM1_PORT.into(), 8, uart.clone())?;
-    // L4a: the I/O APIC, the 8259 pair and their wires.
-    let irqs = crate::irq::install(&mut devices, &backing.memory, vcpus, &uart)?;
-    // L4b: the PIT and port 61H, the RTC, the ACPI PM block and reset register.
-    let board = crate::clock::install(&mut devices, &irqs, lost)?;
-    devices.strict = strict;
-    let devices = std::sync::Arc::new(devices);
-    let machine = Machine::create(&backing.memory)?;
-    irqs.attach(machine.doorbell());
-    let stops = execution::Stops::new(&backing, false);
-    let watchdog = std::time::Duration::from_millis(watchdog_ms);
-    let prepare = |v: usize| -> Result<Vcpu> {
-        let cpu = Vcpu::create()?;
-        execution::enter(&cpu, backing.vcpu(v), true)?;
-        machine.route(v)?;
-        Ok(cpu)
-    };
-    let ended_first = std::sync::atomic::AtomicUsize::new(usize::MAX);
-    let body = |v: usize, cpu: &Vcpu, cancelled: &std::sync::atomic::AtomicBool| -> Result<(Stop, u64)> {
-        let mut compiler = Compiler::new(Path::new(fexc), cpu, max_block)?;
-        compiler.disk = crate::compile_cache::shared(Path::new(fexc)); // P3: the persistent compile cache (NATEMU_COMPILE_CACHE)
-        let mut requests = execution::Requests { doorbell: Some(machine.doorbell()), devices: Some(devices.clone()), ..Default::default() };
-        let stop_at = if v == 0 { stop_at } else { None };
-        let stop = execution::run(cpu, backing.vcpu(v), &mut compiler, stop_at, watchdog, &mut requests, &stops, cancelled);
-        stops.end(v);
-        // X4: one vCPU's end ends the machine's run; the first to end (not cancelled) is reported as the run's cause.
-        if !matches!(stop, Ok(Stop::Cancelled)) {
-            let _ = ended_first.compare_exchange(usize::MAX, v, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst);
-        }
-        owners::cancel_owners(cancelled);
-        Ok((stop?, compiler.compiles))
-    };
+    let prepared = boot.prepare()?;
+    let (backing, loaded, board, devices) = (prepared.backing(), prepared.loaded(), prepared.board(), prepared.devices());
+    let guest = *prepared.guest();
+    if let Some(path) = &dump {
+        write_dump(path, &guest, loaded)?;
+    }
     let started = std::time::Instant::now();
     // L5: `--clock-trace FILE`, every 20 ms: TSC ns since the VM's epoch (the guest's TSC), then the PIT's and RTC's tick
     // counts (`clock::TickStats`) and the LAPIC timer's expiries taken, merged and reinjected (its record, read racily).
     let tracing = std::sync::atomic::AtomicBool::new(trace.is_some());
-    let supervision = std::thread::scope(|scope| -> Result<_> {
+    let outcome = std::thread::scope(|scope| -> Result<_> {
         if let Some(path) = &trace {
             let mut file = std::io::BufWriter::new(fs::File::create(path).map_err(|e| format!("{path}: {e}"))?);
-            let (board, backing, tracing) = (&board, &backing, &tracing);
+            let tracing = &tracing;
             scope.spawn(move || {
                 use std::io::Write as _;
                 let area = backing.vcpu(0);
                 let n = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::SeqCst);
                 while tracing.load(std::sync::atomic::Ordering::SeqCst) {
-                    let t = execution::ticks_ns(crate::clock::now()) - execution::ticks_ns(area.epoch);
+                    let t = execution::ticks_ns(crate::clock::now()) - execution::ticks_ns(area.epoch());
                     let (p, r, l) = (&board.pit, &board.rtc, execution::lapic(area));
                     let _ = writeln!(file, "{t} pit {} {} {} {} {} {} rtc {} {} {} lapic {} {} {}", n(&p.rises), n(&p.fresh), n(&p.coalesced), n(&p.dropped),
                         n(&p.missed), n(&p.reinjected), n(&r.rises), n(&r.missed), n(&r.reinjected), l.fired, l.missed, l.reinjected);
@@ -182,26 +149,19 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 }
             });
         }
-        let s = owners::supervise(vcpus, &prepare, &body);
+        let outcome = prepared.run();
         tracing.store(false, std::sync::atomic::Ordering::SeqCst);
-        Ok(s)
+        outcome
     })?;
-    let destroyed = machine.destroy();
-    let supervision = supervision?;
-    hv(destroyed, "destroy VM")?;
-    if let Some(e) = supervision.error {
-        return Err(e);
-    }
-    let mut outputs = supervision.outputs.into_iter();
-    let (stop, compiles) = outputs.next().flatten().ok_or("vCPU without a result")?;
-    let mut each = vec![(stop_name(&stop), compiles)];
-    each.extend(outputs.map(|o| o.map_or(("none".into(), 0), |(s, c)| (stop_name(&s), c))));
+    let (stop, compiles) = outcome.each[0].as_ref().unwrap();
+    let compiles = *compiles;
+    let each: Vec<(String, u64)> = outcome.each.iter().map(|o| o.as_ref().map_or(("none".into(), 0), |(s, c)| (stop_name(s), *c))).collect();
     let vcpu_json: Vec<String> = each
         .iter()
         .enumerate()
         .map(|(v, (stop, compiles))| {
             let s: State = backing.vcpu(v).read_record(exec::STATE_OFFSET);
-            let acked = if s.mailbox_acked == 0 { 0 } else { execution::ticks_ns(s.mailbox_acked) - execution::ticks_ns(backing.vcpu(v).epoch) };
+            let acked = if s.mailbox_acked == 0 { 0 } else { execution::ticks_ns(s.mailbox_acked) - execution::ticks_ns(backing.vcpu(v).epoch()) };
             format!(
                 "{{\"stop\":\"{}\",\"rip\":{},\"blocks\":{},\"compiles\":{compiles},\"halts\":{},\"interrupts\":{},\"mailbox\":[{},{},{acked},{}],\"shootdowns\":{},\"fault\":\"{:x?}\",\"state\":{}}}",
                 stop.replace('"', "'"), hex(s.cpu.rip), s.blocks, s.halts, s.interrupts, hex(s.mailbox), s.mailbox_wakes,
@@ -209,7 +169,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             )
         })
         .collect();
-    let first = ended_first.load(std::sync::atomic::Ordering::SeqCst);
+    let first = outcome.ended_first;
     let first_json = match each.get(first) {
         Some((stop, _)) => format!("{{\"vcpu\":{first},\"stop\":\"{}\"}}", stop.replace('"', "'")),
         None => "null".into(),
@@ -225,7 +185,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let lapic_end = execution::lapic(backing.vcpu(0));
     // M1 pool use: the code cache and metadata arena filled since the last flush, and the shadow pool's resets.
     let c: exec::cache::Control = backing.vcpu(0).read_record(exec::cache::LOOKUP_OFFSET + exec::cache::CONTROL);
-    let (kind, reason) = match &stop {
+    let (kind, reason) = match stop {
         Stop::Reached => ("reached".to_string(), String::new()),
         Stop::Resident { stop: exec::stop::SHUTDOWN, .. } => ("shutdown".into(), format!("fault {:x?}", s.fault)),
         Stop::Power(p) => (super::program::power_name(*p).into(), String::new()),
@@ -264,7 +224,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         s.unlinks,
         execution::k1_stats(backing.vcpu(0)),
         devices.report(),
-        uart.lock().unwrap_or_else(|e| e.into_inner()).output.len(),
+        prepared.serial_bytes(),
         board.pit.json(),
         board.rtc.json(),
         lapic_end.fired,

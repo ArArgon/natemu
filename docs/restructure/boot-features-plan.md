@@ -3309,6 +3309,59 @@ QEMU NaN departures; `run_x1` 6/6 and 188/188, delivery 51, `run_i5c` 255/255 ×
 Intel profile, are counted as not advertised). Debian 6.12 release boots: no initrd at N = 1 and N = 2 reach the root-fs
 panic (14.6 s and 13.1 s wall), the initrd boot at N = 2 reaches the installer's language dialog (56.7 s wall).
 
+*Built (L0, the host split; owner decision 4 of October 30; no fexc change, series43-x1):* **Layout.** `crates/host` is
+the library package `natemu` (`src/lib.rs`; no library file moved) with the boot stub binary `natemu` (`src/main.rs`);
+`crates/driver` is the package and binary `natemu-host` (`src/main.rs`, `src/drivers/{mod,program,linux,test_devices}.rs`,
+moved from `crates/host/src`), so `cargo build -p natemu-host`, `target/release/natemu-host` and every runner are
+unchanged; `Cargo.lock` regenerated; both crates are default members. **Public surface:** `pub(crate)` stays the default;
+only what the driver uses was promoted to `pub` (about 170 items: 79 functions, 29 structs, 5 enums, 2 traits, 42
+constants, about 100 fields, 14 public modules; `admission`, `system`, `json`, `ioapic`, `pic`, `pit` and `rtc` stay
+private; 182 `pub(crate)` remain). The documented integration API is `natemu::linux::{Boot, Prepared, Outcome}`.
+**Boot entry** (`linux.rs`): `Boot` (runtime, fexc, kernel, initrd, cmdline, RAM, vCPUs, RSDP, code cache, serial sink,
+strict unassigned, lost-tick policies, watchdog, block limit, stop RIP, compile cache; defaults from `Boot::new`),
+`prepare()` (backing, loader, ACPI tables, CPU/LAPIC/mailbox state, UART, I/O APIC and 8259, PIT/RTC/PM),
+`Prepared::run()` (VM, vCPU threads, the first vCPU to end ends the run, destroy) and `Outcome` (each vCPU's stop and
+compiles, the vCPU that ended the run). The compile cache is opt-in: `compile_cache::Config::from_env()` (the moved
+environment code; `Config::OFF` by default); `natemu` and `boot-linux` opt in. `boot-linux` is argument parsing, the
+load-only path, then `prepare` → `--dump` → `--clock-trace` around `run` → `--save` → the same JSON. The stub: `natemu
+RUNTIME FEXC BZIMAGE [--initrd] [--cmdline] [--ram] [--vcpus] [--serial]`, serial to standard output by default, exit 0
+on poweroff, 2 on another stop, 1 on a host error. **Hook** (`execution.rs`): `trait Hook { at, boundary, admitted,
+before_compile, reply }`, every method a no-op by default and `impl Hook for ()`, generic through `run`/`serve`/
+`translation`/`Compiler::compile`/`compile_once`/`ask`, so a run without one (both boot paths) compiles the calls away;
+every call sits on a host exit. `At::Stop(code)` ends the run as `Stop::Hooked(code)` (replaces `Stop::Logged`),
+`At::System` answers with a system reply; `ReplyKind::Translation` (never while parked) and `Device`. The driver's
+`ProgramHook` holds the logging IDT's handler range, the CPL switches and event sources (with its doorbell), and on the
+tampered vCPU `--forge-exit`, `--kill-compiler`/`--stall-compiler` and the reply tampers (each disarms when it fires; the
+device tamper excludes the translation one), moved verbatim. Removed from the library: `Compiler.tamper`/`signal_at`,
+`Requests.tamper`/`tamper_device`/`tampered`/`switches`/`handlers`/`posts`/`doorbell`; `TestDevice` and `TestSource`
+moved to `drivers/test_devices.rs` with their two unit tests. **Knobs:** `Stops::new`'s latency flag is gone (only a
+kicker, which only the driver has, reports a followed stop; identical behaviour). `Machine::silence` and
+`enter(.., doorbell)`/`Vcpu::doorbell(enabled)` (`--ignore-kicks`) stay as documented options: they configure the GIC
+while vCPUs are created, before any run; a hook sees only runs, and the hook would still need the same library calls.
+`Compiler.shape` (`--code-shape`) and `Devices.strict` stay options, off by default. **Review round:** raw writes into a
+vCPU's records and code cache (`Area::write_record`/`copy`, a test `Area::over`) and the hook's `admitted`, `reply`,
+`before_compile` and `At::System` (any system kind, `SET_CPL` included) exist only with the library feature `testing`,
+which only `crates/driver` enables; `Area`'s fields and `Memory`'s pointer are crate-private (getters `memory`, `vcpu`,
+`epoch`); without it a hook can only end a run (`at`, `At::Stop`, `boundary`). The stub built alone (`-p natemu`) has no
+`testing` cfg (checked with `cargo build -v`; a whole-workspace build unifies the feature into it). `Prepared::run` runs
+once (a second call is an error); `compile_cache::shared` refuses a second fexc, directory or cap while one cache is open.
+After the round: `cargo test`, `check_resident_stack.py`, contain (410 tampers, every stop as before), faults 7,912,
+x1 6/6 and 188/188, delivery 51, and a `natemu` boot to poweroff at N = 1. Out of scope: the resident still
+implements `SET_CPL` and `EVENT_HOOK`; without a hook the host never sends them. **Checks** (baseline 959e430 and after,
+same commands): every standing-suite command at both block sizes where the suite has them, outputs diffed with timing keys
+dropped (`seconds`, `*_ns`, `*_us`, `*_ms`, `*_ns_mean`, latencies, `t2_t1_ns`, `wake_latency_us`); 47 of 64 runner
+outputs identical (corpora, faults, ASM, the I-series, L1/L2/L2-iasl stdout and dumps among them); the other 17 (smp,
+kicks, system, coherence, sharedpt, litmus, contain, events, m3, k2, x3, x4, l3, l4b, m2's cost line) differ in counts
+that also differ between two baseline runs (races, kick and timer timing, PIDs), with equal verdicts; contain's 410
+tamper cases give identical stops. `cargo test` 147 + 1 ignored before and after (the two moved tests renamed);
+`check_resident_stack.py` identical; Python tests 317. Debian kernel + initrd (`rdinit=/bin/busybox -- poweroff -f`,
+compile cache off) at 1 and 4 vCPUs through `boot-linux` before and after and through `natemu`: final stop poweroff in
+every run, serial logs equal but wall-clock, sched_clock and deferred-init timing lines and, at 4 vCPUs, the async
+initramfs line's position and the post-SMP `Memory: … available` figure (varies between runs of one binary);
+`--stop-at` the vmlinux entry identical but its timing keys. No tamper code, `TestDevice` or `TestSource` in
+`crates/host/src` (grep: only `mem::forget`, doc comments, the compile cache's forged-entry unit test and its `kill(pid,
+0)` liveness check), and `strings target/release/natemu` has no tamper/forge.
+
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 
 **Owner decision (October 29, amendment after L3):** unassigned memory pages (including the legacy hole 0xA0000–0x100000) are mapped read-only and non-executable onto one shared all-ones page, so every read form (compare, checksum, string, SSE) runs natively and exactly; reads are counted per page on first touch (shadow fill), writes stay counted per access and complete as ignored for MOV forms (other write forms keep their typed refusals); fetch stays a typed stop; the strict switch still turns all of it into stops. Context: Linux's `reserve_ibft_region`, `probe_roms`, DMI and `smp_scan_config` scan 0x80000–0xFFFFF with CMP/checksum/string loops. Pages a device claims stay unshadowed (M3); the LAPIC's possible page is always a device page.

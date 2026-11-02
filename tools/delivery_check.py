@@ -1,6 +1,6 @@
 """Judge a delivery to the program driver's logging IDT against tools/models/delivery_model.py (X1a).
 
-The driver (crates/host/src/drivers/program.rs, "logging IDT") gives every vCPU a GDT, TSSs and an IDT of 256 interrupt
+The driver (crates/driver/src/drivers/program.rs, "logging IDT") gives every vCPU a GDT, TSSs and an IDT of 256 interrupt
 gates (CS 0x08, DPL 3, IST 1) at LOG_BASE (driver-built spaces) or LOG_IDENTITY (identity spaces); reaching a handler
 ends the run and the driver reports `delivered` (vector, raw frame RIP CS RFLAGS RSP SS error, handler RSP and CPL).
 `problems(out, ...)` rebuilds that environment as the model's state at the faulting instruction (its RIP, RSP, RFLAGS,

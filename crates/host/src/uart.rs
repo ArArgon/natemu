@@ -58,7 +58,7 @@ const FCR_FE: u8 = 0x01;
 const FIFO: usize = 16;
 const BAUD_BASE: f32 = 115_200.0;
 
-pub(crate) struct Uart {
+pub struct Uart {
     divider: u16,
     rbr: u8,
     ier: u8,
@@ -77,9 +77,9 @@ pub(crate) struct Uart {
     timeout_at: Option<Instant>,
     char_time: Duration,
     /// Every byte transmitted outside loopback, in order.
-    pub(crate) output: Vec<u8>,
+    pub output: Vec<u8>,
     /// Where transmitted bytes also go (the driver's `--serial`).
-    pub(crate) sink: Option<Box<dyn Write + Send>>,
+    pub sink: Option<Box<dyn Write + Send>>,
     /// The interrupt output's level.
     pub(crate) line: bool,
     /// L4a's hook (`irq::install`: ISA IRQ 4): called with the new level whenever the interrupt output changes.
@@ -87,7 +87,7 @@ pub(crate) struct Uart {
 }
 
 impl Uart {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             divider: 0x0c,
             rbr: 0,

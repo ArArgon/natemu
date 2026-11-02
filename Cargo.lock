@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "natemu"
+version = "0.1.0"
+dependencies = [
+ "natemu-abi",
+]
+
+[[package]]
 name = "natemu-abi"
 version = "0.1.0"
 
@@ -10,6 +17,7 @@ version = "0.1.0"
 name = "natemu-host"
 version = "0.1.0"
 dependencies = [
+ "natemu",
  "natemu-abi",
 ]
 

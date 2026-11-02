@@ -39,12 +39,12 @@
 //! reads all-ones at its width and ignores writes; an unassigned page is shadowed read-only onto the all-ones page at its
 //! first read (every read form then runs natively) and ignores MOV stores; `--strict-unassigned` makes such accesses typed
 //! stops (`unsupported_port`; `unsupported_mmio` status `unassigned`). `--device-at GPA` (repeatable) registers a test
-//! device (`devices::TestDevice`) at that page, outside guest RAM, as an `mmio` item does without mapping it. Once any port
+//! device (`test_devices::TestDevice`) at that page, outside guest RAM, as an `mmio` item does without mapping it. Once any port
 //! access, unassigned-page access or UART output happened, the output gains `ports` (per port touched: reads, writes,
 //! unassigned), `unassigned_pages` (per page: reads = shadow fills, writes) and `uart` (the bytes transmitted, hex).
 //!
 //! L4a: the VM has the I/O APIC at 0xFEC00000 and the 8259 pair with its ELCR (`irq`), the UART's IRQ4 wired into both.
-//! `--irq-source PORT` registers the asynchronous test source (`irq::TestSource`) on PORT..PORT+7: a 32-bit OUT at PORT
+//! `--irq-source PORT` registers the asynchronous test source (`test_devices::TestSource`) on PORT..PORT+7: a 32-bit OUT at PORT
 //! asks a host thread to pulse (bit 8 clear) or assert (bit 8 set) line bits 7:0 after bits 31:16 microseconds, an OUT at
 //! PORT+4 deasserts a line at once; a request vetoes ending halted vCPUs until it fired (`--irq-source-no-veto`: not, the
 //! negative control of that rule).
@@ -98,7 +98,7 @@
 //!     of the space in it is, not executable unless one is code; at most one per run: guest RAM holds one such frame)
 //!   | unmap ADDR | readonly ADDR   (mutations: clear P or R/W in the leaf entry of ADDR's page after setup)
 //!   | mmio ADDR GPA [unassigned]   (M3: ADDR's page maps the guest-physical page GPA, above guest RAM or in the legacy hole, writable, not
-//!     executable, where the driver registers a test device (`devices::TestDevice`, one per distinct GPA; none with
+//!     executable, where the driver registers a test device (`test_devices::TestDevice`, one per distinct GPA; none with
 //!     `unassigned`: the unassigned rule then answers, L3); `memory` items on that page preload
 //!     its bytes and are reported from it; the mutations below apply to it. The output gains `devices` (each test
 //!     device's per-vCPU reads and writes, order errors and access log) and per vCPU `mmio` (device accesses completed,
@@ -126,7 +126,8 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
-use crate::devices::{Devices, TestDevice};
+use super::test_devices::TestDevice;
+use crate::devices::Devices;
 
 /// One address space's contents.
 #[derive(Default, Debug, PartialEq)]
@@ -508,7 +509,7 @@ fn page_span(start: u64, length: usize) -> impl Iterator<Item = u64> {
 /// TSS of vCPU v at 0x30 + 16v; accessed bits preset), the TSSs (RSP0 and IST1 = vCPU v's own stack page), and an IDT of
 /// 256 present 64-bit interrupt gates (CS 0x08, DPL 3 so INT n logs at any CPL, IST 1) whose handler for vector n is
 /// `log_base + 0x2000 + 16n`. Each vCPU starts with GDTR, IDTR and TR (hidden part, busy) naming them. The handler page is
-/// never mapped or fetched: reaching it ends the run (`Stop::Logged`, before any fetch) and the report reads the frame
+/// never mapped or fetched: reaching it ends the run (`Stop::Hooked(LOGGED)`, before any fetch) and the report reads the frame
 /// from the vCPU's stack, as a handler that logs and halts would. A program that loads its own GDT, IDT, TSS or tables
 /// owns delivery from then on. Pages: GDT and TSSs at +0, IDT at +0x1000, stacks at +0x3000 + 0x1000v (vCPUs 0..3), all
 /// writable, supervisor-only (CPL 3 code cannot change them), not executable; at `LOG_BASE` (its own PML4 entry) in driver-built spaces, identity-mapped at
@@ -726,6 +727,77 @@ fn tamper_record(area: Area, state: &mut State) -> bool {
 const SIGKILL: i32 = 9;
 const SIGSTOP: i32 = 17;
 
+/// A reply tamper: called with the vCPU stopped, the reply (`State::reply`) and its block or decode in place but not yet
+/// seen by the resident, until it returns true (it corrupted something, possibly the reply kind).
+type Tamper = fn(Area, &mut State) -> bool;
+/// [`Stop::Hooked`]'s code for the logging IDT.
+const LOGGED: u32 = 0;
+/// The driver's [`execution::Hook`] for one vCPU: its program's hooks and, on the tampered vCPU, the run-time defence
+/// checks.
+struct ProgramHook {
+    /// RIPs whose one-byte instruction is executed as a CPL change to the value ([`exec::system::SET_CPL`]).
+    switches: BTreeMap<u64, u64>,
+    /// X2 event sources: RIPs whose one-byte instruction (a `nop`) posts an event into the vCPU's record
+    /// ([`execution::post`]: a vector, or [`execution::NMI`]) and rings its doorbell, then completes as
+    /// [`exec::system::EVENT_HOOK`].
+    posts: BTreeMap<u64, u64>,
+    /// The logging IDT's handler range: reaching it ends the run ([`LOGGED`]) before anything there is fetched.
+    handlers: std::ops::Range<u64>,
+    doorbell: Doorbell,
+    /// `--forge-exit`: rewrites each admitted object before it is staged ([`forge_exit`]).
+    forge_exit: bool,
+    /// `--kill-compiler`/`--stall-compiler`: once `.0` requests have reached the server, it gets signal `.1` before the next
+    /// (SIGKILL: the server dies mid-run; SIGSTOP: it stays alive and never answers). The run must fail with the cause.
+    signal_at: Option<(u64, i32)>,
+    /// The translation reply tamper and the device reply tamper (M3); each disarms once it returns true.
+    tamper: Option<Tamper>,
+    tamper_device: Option<Tamper>,
+    tampered: bool,
+}
+impl execution::Hook for ProgramHook {
+    fn at(&mut self, area: Area, rip: u64) -> Result<Option<execution::At>> {
+        if self.handlers.contains(&rip) {
+            return Ok(Some(execution::At::Stop(LOGGED)));
+        }
+        if let Some(&cpl) = self.switches.get(&rip) {
+            return Ok(Some(execution::At::System(exec::System { kind: exec::system::SET_CPL, length: 1, cr: cpl as u32, ..exec::System::NONE })));
+        }
+        if let Some(&event) = self.posts.get(&rip) {
+            let _ = execution::post(area.memory(), area.vcpu(), event, false);
+            self.doorbell.ring(area.vcpu())?;
+            return Ok(Some(execution::At::System(exec::System { kind: exec::system::EVENT_HOOK, length: 1, ..exec::System::NONE })));
+        }
+        Ok(None)
+    }
+    fn boundary(&self, rip: u64) -> Option<u64> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let after = |m: &BTreeMap<u64, u64>| m.range((Excluded(rip), Unbounded)).next().map(|(&r, _)| r);
+        after(&self.switches).into_iter().chain(after(&self.posts)).min()
+    }
+    fn admitted(&mut self, object: &mut [u8]) {
+        if self.forge_exit {
+            forge_exit(object);
+        }
+    }
+    fn before_compile(&mut self, compiles: u64, server: u32) {
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        if let Some((_, signal)) = self.signal_at.filter(|s| s.0 == compiles) {
+            unsafe { kill(server as i32, signal) };
+        }
+    }
+    fn reply(&mut self, kind: execution::ReplyKind, area: Area, state: &mut State) {
+        let tamper = match kind {
+            execution::ReplyKind::Translation => &mut self.tamper,
+            execution::ReplyKind::Device => &mut self.tamper_device,
+        };
+        if tamper.is_some_and(|t| t(area, state)) {
+            (*tamper, self.tampered) = (None, true);
+        }
+    }
+}
+
 /// What one vCPU's thread returns.
 struct Ran {
     stop: Stop,
@@ -748,7 +820,7 @@ fn finished(stop: &Stop) -> bool {
     matches!(
         stop,
         Stop::Reached
-            | Stop::Logged
+            | Stop::Hooked(_)
             | Stop::FetchFault(_)
             | Stop::NoCode(_)
             | Stop::Resident { stop: exec::stop::SHUTDOWN | exec::stop::UNSUPPORTED_ATOMIC | exec::stop::HALTED | exec::stop::UNSUPPORTED_MMIO | exec::stop::UNSUPPORTED_PORT, .. }
@@ -760,7 +832,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         return Err(USAGE.into());
     };
     let (mut max_instructions, mut code_bytes, mut watchdog_ms, mut forge, mut target) = (None, exec::cache::CODE_BYTES, 10_000, false, 0);
-    let (mut tamper, mut tamper_after): (Option<fn(Area, &mut State) -> bool>, Option<Corrupt>) = (None, None);
+    let (mut tamper, mut tamper_after): (Option<Tamper>, Option<Corrupt>) = (None, None);
     let (mut forge_stop, mut forged, mut kicked, mut kicks, mut every_us, mut jitter_us) = (false, None, Vec::new(), 10_000, 0, 0);
     let mut kick_events: Vec<u64> = Vec::new();
     let (mut ignore_kicks, mut signal_at, mut deadline_ms) = (false, None, execution::COMPILE_DEADLINE.as_millis() as u64);
@@ -891,7 +963,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     // L4b: the PIT and port 61H, the RTC, the ACPI PM block and reset register.
     crate::clock::install(&mut registry, &irqs, lost)?;
     if let Some(port) = irq_source {
-        let mut source = crate::irq::TestSource::new(&irqs);
+        let mut source = super::test_devices::TestSource::new(&irqs);
         source.veto = irq_veto;
         registry.register_ports(port as u32, 8, Arc::new(Mutex::new(source)))?;
     }
@@ -972,47 +1044,50 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
 
     let machine = Machine::create(&backing.memory)?;
     irqs.attach(machine.doorbell());
-    let stops = execution::Stops::new(&backing, !kicked.is_empty());
+    let stops = execution::Stops::new(&backing);
     // vCPU v passed the start barrier: every vCPU exists. A kicker waits for it: an SPI rung while vCPUs are being
     // created would also find no vCPU to take it. Its end (`Stops::end`, under its kick mutex) stops its kicker.
     let started: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
     let watchdog = std::time::Duration::from_millis(watchdog_ms);
-    let run_vcpu = |v: usize, cpu: &Vcpu, cancelled: &AtomicBool| -> Result<(Stop, Compiler, execution::Requests)> {
+    let run_vcpu = |v: usize, cpu: &Vcpu, cancelled: &AtomicBool| -> Result<(Stop, Compiler, execution::Requests, ProgramHook)> {
         let mut compiler = Compiler::new(Path::new(fexc), cpu, max_instructions)?;
         compiler.deadline = std::time::Duration::from_millis(deadline_ms);
         compiler.shape = code_shape;
         let handlers = log_base(d.spaces[d.cpus[v].space].identity) + LOG_HANDLERS;
-        let mut requests = execution::Requests {
+        let mut requests = execution::Requests { devices: Some(registry.clone()), ..Default::default() };
+        let mut hook = ProgramHook {
             switches: d.cpus[v].switches.iter().copied().collect(),
-            handlers: Some(handlers..handlers + 0x1000),
             posts: d.cpus[v].posts.iter().copied().collect(),
-            doorbell: Some(machine.doorbell()),
-            devices: Some(registry.clone()),
-            ..Default::default()
+            handlers: handlers..handlers + 0x1000,
+            doorbell: machine.doorbell(),
+            forge_exit: false,
+            signal_at: None,
+            tamper: None,
+            tamper_device: None,
+            tampered: false,
         };
         if v == target {
-            compiler.tamper = forge.then_some(forge_exit as fn(&mut [u8]));
-            compiler.signal_at = signal_at;
-            requests.tamper = if forged_entry.is_some() { Some(tamper_forge_entry) } else { tamper };
+            (hook.forge_exit, hook.signal_at) = (forge, signal_at);
+            hook.tamper = if forged_entry.is_some() { Some(tamper_forge_entry) } else { tamper };
             // M3: the device reply tamper runs on device replies only.
             if device_tamper {
-                (requests.tamper, requests.tamper_device) = (None, tamper);
+                (hook.tamper, hook.tamper_device) = (None, tamper);
             }
         }
         // A peer that never answers: alive (no watchdog of its own), never stopping.
         let watchdog = if v == target && ignore_kicks { std::time::Duration::from_secs(86_400) } else { watchdog };
-        let stop = execution::run(cpu, backing.vcpu(v), &mut compiler, Some(stop_at[v]), watchdog, &mut requests, &stops, cancelled)?;
-        Ok((stop, compiler, requests))
+        let stop = execution::run(cpu, backing.vcpu(v), &mut compiler, Some(stop_at[v]), watchdog, &mut requests, &stops, cancelled, &mut hook)?;
+        Ok((stop, compiler, requests, hook))
     };
     let body = |v: usize, cpu: &Vcpu, cancelled: &AtomicBool| -> Result<Ran> {
         started[v].store(true, SeqCst);
         let ran = run_vcpu(v, cpu, cancelled);
         stops.end(v);
-        let (stop, compiler, requests) = ran?;
+        let (stop, compiler, requests, hook) = ran?;
         if !finished(&stop) {
             owners::cancel_owners(cancelled);
         }
-        Ok(Ran { stop, compiles: compiler.compiles, slowest: compiler.slowest, blocks: requests.blocks, rips: requests.rips, tampered: requests.tampered, decodes: requests.decodes, entropy: requests.entropy })
+        Ok(Ran { stop, compiles: compiler.compiles, slowest: compiler.slowest, blocks: requests.blocks, rips: requests.rips, tampered: hook.tampered, decodes: requests.decodes, entropy: requests.entropy })
     };
     // HVF's GIC calls never race vCPU create/destroy (`vm.rs`, one lock).
     let prepare = |v: usize| -> Result<Vcpu> {
@@ -1232,7 +1307,7 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
     let mut s: State = area.read_record(exec::STATE_OFFSET);
     let list = |v: &[u64]| v.iter().map(|x| format!("\"{x:#x}\"")).collect::<Vec<_>>().join(",");
     let mut delivered = String::new();
-    if matches!(ran.stop, Stop::Logged) {
+    if matches!(ran.stop, Stop::Hooked(LOGGED)) {
         let vector = (s.cpu.rip - log - LOG_HANDLERS) / 16;
         // From the event, not the vector: INT n to an error-code vector pushes none.
         if s.delivered[0] != vector {
@@ -1269,7 +1344,7 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
         Stop::FetchFault(Fault::Noncanonical) => ("guest_fault", "fetch".into(), [13, 0, 0, s.cpu.rip]),
         Stop::FetchFault(f) => ("fetch_fault", format!("{f:?}"), [0; 4]),
         Stop::NoCode(reason) => ("no_code", reason.clone(), [0; 4]),
-        Stop::Logged => ("guest_fault", "delivered".into(), s.fault),
+        Stop::Hooked(_) => ("guest_fault", "delivered".into(), s.fault),
         Stop::Resident { stop: exec::stop::SHUTDOWN, .. } => ("shutdown", "triple fault".into(), s.fault),
         Stop::Resident { stop, status, detail } => ("resident", format!("{} status={status} detail={detail}", exec::stop::name(*stop)), [0; 4]),
         Stop::Watchdog { pc, el0, asked } => {
@@ -1294,7 +1369,7 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
     }
     let mut out = format!(
         "{{\"vcpu\":{},\"tso\":{},\"stop\":\"{kind}\",\"reason\":\"{reason}\",\"gpr\":[{}],\"rip\":\"{:#x}\",\"rflags\":\"{:#x}\",\"xmm\":[{}],\"mxcsr\":\"{:#x}\",\"memory\":[",
-        area.vcpu,
+        area.vcpu(),
         shared.actlr & 2 != 0,
         list(&s.cpu.gpr),
         s.cpu.rip,
@@ -1385,7 +1460,7 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
         s.mailbox,
         s.mailbox_wakes,
         // As the guest's TSC (ns since the VM's epoch, the MSR's offset), 0 if never acknowledged.
-        if s.mailbox_acked == 0 { 0 } else { execution::ticks_ns(s.mailbox_acked) - execution::ticks_ns(area.epoch) },
+        if s.mailbox_acked == 0 { 0 } else { execution::ticks_ns(s.mailbox_acked) - execution::ticks_ns(area.epoch()) },
         execution::ticks_ns(s.mailbox_mark_ticks) / 1000,
         ran.decodes.values().sum::<u64>(),
         decodes,
@@ -1405,7 +1480,7 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
 /// `,"kicks":{..}` for vCPU `area.vcpu`: its host kicks, the resident's doorbells and stops, and the latency
 /// distribution from each ring to the stop that followed.
 fn kick_report(area: Area, stops: &execution::Stops) -> String {
-    let k = stops.report(area.vcpu);
+    let k = stops.report(area.vcpu());
     let s: State = area.read_record(exec::STATE_OFFSET);
     let c: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
     let quantiles = |host: bool| {
@@ -1453,6 +1528,7 @@ fn frame_intact(area: Area) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use natemu::memory::Memory;
     #[test]
     fn description_parses_and_rejects_malformed_lines() {
         let d = parse("rip 0x100000\nrflags 0x1\ngpr 0 1 2 3 4 5 6 7 8 9 a b c d e f\ncode 90c3\nmemory 0x200000 0102\nunmap 0x200010\nreadonly 0x201000\ncpl 0\nwp 0\nsmep 1\nnxe 0\nlarge 0x3fffff\nentry 0x200000 2 set 0x10000000000\nentry 0x200000 4 clear 4\n").unwrap();
@@ -1479,7 +1555,7 @@ mod tests {
     #[test]
     fn next_page_tamper_answers_a_block_request_twice() {
         let memory = Memory::with_size(4096).unwrap();
-        let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0, ram: unsafe { GuestRam::new(0, 4096, memory.0 as u64) } };
+        let area = Area::over(&memory);
         let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1000, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, fcw: exec::FCW_INIT, xcr0: 1 });
         s.fetch = [0x5000, u64::MAX];
         s.reply = exec::REPLY_SYSTEM;

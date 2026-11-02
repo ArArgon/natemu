@@ -20,7 +20,7 @@
 //! L3/L4a/L4b/X3/X4 implement: if a device moves, change it here and the tables follow.
 
 /// The machine the tables describe (claim 69, M23, M60; X3 for the local APIC).
-pub(crate) mod platform {
+pub mod platform {
     /// xAPIC MMIO base (IA32_APIC_BASE reset, X3).
     pub(crate) const LAPIC_BASE: u32 = 0xfee0_0000;
     /// The IOAPIC (L4a): ID 0 (QEMU's `ACPI_BUILD_IOAPIC_ID`), MMIO base, GSI base 0.
@@ -29,7 +29,7 @@ pub(crate) mod platform {
     /// ISA IRQ0 (PIT) enters the IOAPIC at GSI 2 (M23); every other ISA IRQ n is GSI n.
     pub(crate) const IRQ0_GSI: u32 = 2;
     /// COM1 (L3, M60): 8 ports at 0x3f8, ISA IRQ 4, edge, active high.
-    pub(crate) const COM1_PORT: u16 = 0x3f8;
+    pub const COM1_PORT: u16 = 0x3f8;
     pub(crate) const COM1_IRQ: u8 = 4;
     /// ACPI PM registers (L4b): PM1a event block (PM1_STS, PM1_EN) at PM_BASE, PM1a control at +4, the 24-bit PM timer
     /// at +8. The SCI is ISA IRQ 9 (FADT SCI_INT, ACPI 6.5 5.2.9: "a sharable, level, active low interrupt" unless an
@@ -61,10 +61,10 @@ use platform::*;
 
 /// The built tables: the RSDP's address, the AP wakeup mailbox page (X4), and every blob at its guest-physical address.
 #[derive(Debug, Clone)]
-pub(crate) struct Tables {
+pub struct Tables {
     pub(crate) rsdp: u64,
     #[allow(dead_code)] // X4's responder watches it
-    pub(crate) mailbox: u64,
+    pub mailbox: u64,
     pub(crate) blobs: Vec<(u64, Vec<u8>)>,
 }
 
@@ -261,7 +261,7 @@ fn madt(vcpus: usize, mailbox: u64) -> Vec<u8> {
 
 /// Builds the tables for `vcpus` processors with the RSDP at `base`, each next table 64-byte aligned after it, then
 /// the mailbox page. Addresses wrap rather than overflow; the loader refuses any blob outside the ACPI NVS range.
-pub(crate) fn build(vcpus: usize, base: u64) -> Tables {
+pub fn build(vcpus: usize, base: u64) -> Tables {
     assert!((1..=254).contains(&vcpus), "xAPIC MADT entries hold APIC IDs below 255");
     let next = |at: u64, len: usize, align: u64| (at.wrapping_add(len as u64)).wrapping_add(align - 1) & !(align - 1);
     let (rsdp, xsdt) = (base, next(base, 36, 64));

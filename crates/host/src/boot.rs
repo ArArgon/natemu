@@ -16,7 +16,7 @@ use natemu_abi::execution::{self as exec, Cpu, Segment, Table};
 use natemu_abi::guest_memory::GuestRam;
 use std::fmt;
 
-pub(crate) mod acpi;
+pub mod acpi;
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
@@ -74,7 +74,7 @@ const E820_MAX: usize = 128;
 /// Why an image or a load was refused. The header codes and their order are those of `tools/models/bootproto.py`'s
 /// `parse_bzimage` (checked by `tools/run_l1.py rejections`); the others are the loader's own.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LoadError {
+pub enum LoadError {
     TruncatedHeader(usize),
     BadBootFlag(u16),
     BadMagic,
@@ -136,8 +136,8 @@ impl fmt::Display for LoadError {
 
 /// The validated setup header of a bzImage.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Setup {
-    pub(crate) version: u16,
+pub struct Setup {
+    pub version: u16,
     /// End of the setup header (0x202 + the byte at 0x201).
     pub(crate) header_end: usize,
     pub(crate) relocatable: bool,
@@ -243,19 +243,19 @@ pub(crate) const E820_RAM: u32 = 1;
 pub(crate) const E820_RESERVED: u32 = 2;
 pub(crate) const E820_NVS: u32 = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct E820 {
-    pub(crate) addr: u64,
-    pub(crate) size: u64,
-    pub(crate) kind: u32,
+pub struct E820 {
+    pub addr: u64,
+    pub size: u64,
+    pub kind: u32,
 }
 
 /// The selected physical map (INV-03-03 claim 69), half-open ranges. Low RAM ends at `low_end` (L: 2 GiB by default,
 /// 1-3 GiB for a boot; any 2 MiB multiple above [`RAM_START`] up to 3 GiB is accepted, so tests choose their size);
 /// `high` bytes of RAM above 4 GiB (H, 0 initially).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Layout {
-    pub(crate) low_end: u64,
-    pub(crate) high: u64,
+pub struct Layout {
+    pub low_end: u64,
+    pub high: u64,
 }
 /// Start of ordinary low RAM: the kernel's window lies above it (M69 "K >= 16 MiB").
 pub(crate) const RAM_START: u64 = 16 * MIB;
@@ -269,15 +269,15 @@ pub(crate) const GDT: u64 = 0x1_8000;
 /// Reserved loader page tables (M69 `0x100000..0x200000`): PML4, PDPT, then one PD per GiB.
 pub(crate) const PAGE_TABLES: u64 = 0x10_0000;
 /// ACPI NVS for the RSDP, the table graph, FACS and the AP mailbox (L2), and the boot-service scratch (X4).
-pub(crate) const ACPI_NVS: (u64, u64) = (0x60_0000, 0x80_0000);
+pub const ACPI_NVS: (u64, u64) = (0x60_0000, 0x80_0000);
 pub(crate) const SCRATCH_NVS: (u64, u64) = (0x80_0000, 0x100_0000);
 /// X4: the APs' GDT in the NVS boot scratch.
 pub(crate) const AP_GDT: u64 = SCRATCH_NVS.0;
 impl Layout {
     /// The default boot map: L = 2 GiB, H = 0 (M69).
-    pub(crate) const DEFAULT: Layout = Layout { low_end: 2 * GIB, high: 0 };
+    pub const DEFAULT: Layout = Layout { low_end: 2 * GIB, high: 0 };
     /// The E820 table (sorted, disjoint): RAM and NVS where they exist, reserved for the holes.
-    pub(crate) fn e820(&self) -> Result<Vec<E820>, LoadError> {
+    pub fn e820(&self) -> Result<Vec<E820>, LoadError> {
         let l = self.low_end;
         if l <= RAM_START || l > 3 * GIB || l % (2 * MIB) != 0 {
             return Err(LoadError::BadLayout(format!(
@@ -307,32 +307,32 @@ impl Layout {
 }
 
 /// What the loader is given besides the map.
-pub(crate) struct Inputs<'a> {
-    pub(crate) image: &'a [u8],
-    pub(crate) cmdline: &'a str,
-    pub(crate) initrd: Option<&'a [u8]>,
+pub struct Inputs<'a> {
+    pub image: &'a [u8],
+    pub cmdline: &'a str,
+    pub initrd: Option<&'a [u8]>,
     /// The ACPI tables ([`acpi::build`]): every blob is placed (so [`Loaded::writes`] carries them) and must lie in the
     /// ACPI NVS range; the RSDP's address goes to `boot_params.acpi_rsdp_addr`. `None` leaves it 0. Kernels of protocol
     /// 2.12/2.13 predate the field (boot.rst "Protocol 2.14 ... Add ACPI RSDP address"; zero-page.rst marks it ALL) and
     /// ignore it, finding the RSDP by their own search, which these tables do not serve (none lies below 1 MiB).
-    pub(crate) acpi: Option<&'a acpi::Tables>,
+    pub acpi: Option<&'a acpi::Tables>,
 }
 /// Where everything went, and the BSP's entry state.
 #[derive(Debug, Clone)]
-pub(crate) struct Loaded {
-    pub(crate) setup: Setup,
-    pub(crate) kernel: u64,
+pub struct Loaded {
+    pub setup: Setup,
+    pub kernel: u64,
     /// The kernel's reserved window `[kernel, kernel + window)`.
-    pub(crate) window: u64,
-    pub(crate) zero_page: u64,
-    pub(crate) cmdline: u64,
-    pub(crate) initrd: Option<(u64, u64)>,
-    pub(crate) map: Vec<E820>,
-    pub(crate) cpu: Cpu,
+    pub window: u64,
+    pub zero_page: u64,
+    pub cmdline: u64,
+    pub initrd: Option<(u64, u64)>,
+    pub map: Vec<E820>,
+    pub cpu: Cpu,
     /// X4: an AP's state when the ACPI mailbox wakes it (the firmware's wake state, RIP = the wakeup vector then).
-    pub(crate) ap: Cpu,
+    pub ap: Cpu,
     /// Every guest-physical range the loader wrote, in order (gpa, bytes).
-    pub(crate) writes: Vec<(u64, u64)>,
+    pub writes: Vec<(u64, u64)>,
 }
 
 /// `__BOOT_CS` (64-bit code, execute/read, accessed) and `__BOOT_DS` (data, read/write, accessed), 4 GiB flat (G = 1,
@@ -352,7 +352,7 @@ fn place(ram: &GuestRam, writes: &mut Vec<(u64, u64)>, gpa: u64, bytes: &[u8]) -
 /// X4: the firmware's mailbox wake state on top of `base` (which supplies paging, CR3, the GDT and flat selectors): CPL 0,
 /// IF = 0 (RFLAGS 2), EFER.LME/LMA and the firmware's NXE (see `load`), no IDT, general registers 0, RIP 0 (the
 /// resident sets the vector). The loader's `Loaded::ap` and the test driver's `mailbox` sections both use it.
-pub(crate) fn ap_wake(base: Cpu) -> Cpu {
+pub fn ap_wake(base: Cpu) -> Cpu {
     Cpu { gpr: [0; 16], rip: 0, rflags: 2, cpl: 0, efer: exec::EFER_LME | exec::EFER_LMA | exec::EFER_NXE, idtr: Table { base: 0, limit: 0 }, ..base }
 }
 
@@ -360,7 +360,7 @@ pub(crate) fn ap_wake(base: Cpu) -> Cpu {
 /// before it is enabled.
 /// Loads `inputs` into `ram` per the 64-bit protocol and the `layout` map; returns the placement and the BSP's state.
 /// `ram` must be zero where the loader leaves zeros (fresh guest RAM).
-pub(crate) fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<Loaded, LoadError> {
+pub fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<Loaded, LoadError> {
     let s = parse(inputs.image)?;
     let map = layout.e820()?;
     for e in map.iter().filter(|e| e.kind != E820_RESERVED) {

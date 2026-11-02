@@ -19,7 +19,7 @@ unsafe extern "C" {
     fn mach_absolute_time() -> u64;
 }
 /// V now.
-pub(crate) fn now() -> u64 {
+pub fn now() -> u64 {
     unsafe { mach_absolute_time() }
 }
 /// V's rate in hertz (1e9 x denominator / numerator of the mach timebase, exact).
@@ -172,15 +172,15 @@ fn time_constraint() {
 /// - LAPIC periodic timer: **discard**. KVM merges: `apic_timer_expired` returns while an expiry is pending
 ///   (arch/x86/kvm/lapic.c 1920-1921); QEMU's APIC likewise sets the IRR bit again.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct LostTicks {
+pub struct LostTicks {
     pub(crate) pit: bool,
     pub(crate) rtc: bool,
-    pub(crate) lapic: bool,
+    pub lapic: bool,
 }
 impl LostTicks {
-    pub(crate) const DEFAULT: Self = Self { pit: true, rtc: false, lapic: false };
+    pub const DEFAULT: Self = Self { pit: true, rtc: false, lapic: false };
     /// `pit=reinject,rtc=discard,lapic=reinject` (any subset; the rest default).
-    pub(crate) fn parse(text: &str) -> crate::Result<Self> {
+    pub fn parse(text: &str) -> crate::Result<Self> {
         let mut p = Self::DEFAULT;
         for item in text.split(',') {
             let (dev, policy) = item.split_once('=').ok_or(format!("lost-ticks {item}: DEVICE=reinject|discard"))?;
@@ -202,16 +202,16 @@ impl LostTicks {
 /// A periodic source's rising edges and what became of them (the run report, `--clock-trace`): delivered into a clear
 /// IRR bit, merged into a pending one, taken by nobody, missed in all (merged, here or in an IRR), and reinjected.
 #[derive(Default, Debug)]
-pub(crate) struct TickStats {
-    pub(crate) rises: std::sync::atomic::AtomicU64,
-    pub(crate) fresh: std::sync::atomic::AtomicU64,
-    pub(crate) coalesced: std::sync::atomic::AtomicU64,
-    pub(crate) dropped: std::sync::atomic::AtomicU64,
-    pub(crate) missed: std::sync::atomic::AtomicU64,
-    pub(crate) reinjected: std::sync::atomic::AtomicU64,
+pub struct TickStats {
+    pub rises: std::sync::atomic::AtomicU64,
+    pub fresh: std::sync::atomic::AtomicU64,
+    pub coalesced: std::sync::atomic::AtomicU64,
+    pub dropped: std::sync::atomic::AtomicU64,
+    pub missed: std::sync::atomic::AtomicU64,
+    pub reinjected: std::sync::atomic::AtomicU64,
 }
 impl TickStats {
-    pub(crate) fn json(&self) -> String {
+    pub fn json(&self) -> String {
         let l = |a: &std::sync::atomic::AtomicU64| a.load(SeqCst);
         format!(
             "{{\"rises\":{},\"fresh\":{},\"coalesced\":{},\"dropped\":{},\"missed\":{},\"reinjected\":{}}}",
@@ -220,15 +220,15 @@ impl TickStats {
     }
 }
 /// The board's timed sources, for reports.
-pub(crate) struct Board {
-    pub(crate) pit: Arc<TickStats>,
-    pub(crate) rtc: Arc<TickStats>,
+pub struct Board {
+    pub pit: Arc<TickStats>,
+    pub rtc: Arc<TickStats>,
 }
 
 /// L4b: puts the board's timed devices on `devices`, wired into `irqs`: the PIT at ports 40H-43H and 61H, the RTC at
 /// 70H-71H, the ACPI PM block at B000H-B00BH and its reset register at B040H (`boot::acpi::platform`). Each runs on its
 /// own [`Timer`] thread, joined when `devices` drops.
-pub(crate) fn install(devices: &mut crate::devices::Devices, irqs: &crate::irq::Irqs, lost: LostTicks) -> crate::Result<Board> {
+pub fn install(devices: &mut crate::devices::Devices, irqs: &crate::irq::Irqs, lost: LostTicks) -> crate::Result<Board> {
     use crate::boot::acpi::platform as p;
     use crate::devices::{At, Shared};
     let f = frequency();
