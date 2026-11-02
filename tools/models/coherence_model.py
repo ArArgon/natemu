@@ -13,8 +13,11 @@ Declared policy and CPU profile (contracts §3 items 4 and 12), not SDM requirem
   (SDM §4.8 does not say whether a faulting access sets the leaf's A; True models the other permitted choice).
 - MAXPHYADDR (40): four-level entry bits 51:MAXPHYADDR are reserved (RSVD fault).
 - No 1 GiB pages: PS in a PDPTE (or PML4E) is reserved; the CPUID profile must report Page1GB = 0.
-- Memory types: any PWT, PCD or PAT bit makes the route non-write-back (`Route.wb` false; conservative: under the
-  default PAT some of these combinations are write-back); natemu refuses to shadow such a page.
+- Memory types: a route carries its leaf's PAT index (PAT, PCD, PWT; SDM Vol.3 §14.12.3 Table 14-11); `route_type`
+  turns it into the architectural effective type from IA32_PAT and the MTRRs (§14.5.2.2 Table 14-7, §14.11.4.1).
+  Non-leaf PWT/PCD and CR3 PWT/PCD never contribute. No route is refused for its type: WB, WT, WP and WC RAM run
+  natively in natemu, UC RAM keeps strong ordering (each access runs its instruction alone between full barriers; owner
+  decision, November 2); the translation is the same for every type. Device pages are separate and not modelled here.
 The legacy32 and PAE modes serve the boot phase only (owner decision 3).
 """
 from dataclasses import dataclass, field
@@ -26,6 +29,11 @@ A, D, P, RW, US, PS, NX = 32, 64, 1, 2, 4, 128, 1 << 63
 MODES = ('legacy32', 'pae', 'four')
 LEAF_A_ON_FAULT = False
 MAXPHYADDR = 40
+# Memory-type encodings (SDM Vol.3 Tables 14-8 and 14-10); UC- exists only as a PAT entry.
+UC, WC, WT, WP, WB, UC_MINUS = 0, 1, 4, 5, 6, 7
+MTRR_TYPES, PAT_TYPES = (UC, WC, WT, WP, WB), (UC, WC, WT, WP, WB, UC_MINUS)
+PAT_RESET = 0x0007040600070406     # Table 14-12: WB, WT, UC-, UC, WB, WT, UC-, UC
+CR3_MEMORY_TYPE = 0x18             # CR3.PWT/PCD: accepted, never part of a page's type
 
 
 def require(condition, message):
@@ -60,7 +68,7 @@ class Route:
     user: bool
     executable: bool
     dirty: bool
-    wb: bool
+    pat_index: int
 
 
 @dataclass
@@ -93,12 +101,11 @@ def _validate(context, address, access):
     require(access in ('read', 'write', 'fetch'), 'access intent')
     require(context.cr3 >= 0, 'CR3 width')
     if context.mode == 'legacy32':
-        require(context.cr3 <= 0xffffffff and context.cr3 & 0x18 == 0
-                and not context.nxe and not context.smep, 'admitted legacy control bits')
+        require(context.cr3 <= 0xffffffff and not context.nxe and not context.smep, 'admitted legacy control bits')
     elif context.mode == 'pae':
         require(context.hidden.generation > 0 and len(context.hidden.entries) == 4, 'loaded hidden PAE root')
     else:
-        require(context.cr3 & ~PA_MASK == 0, 'aligned four-level root')
+        require(context.cr3 & ~(PA_MASK | CR3_MEMORY_TYPE) == 0, 'aligned four-level root')
 
 
 def _fault_error(context, access):
@@ -134,7 +141,8 @@ def walk(tables, context, address, access):
     if context.mode == 'four' and address >> 48 != (0xffff if address & (1 << 47) else 0):
         result.vector = 13
         return result
-    writable = user = executable = wb = True
+    writable = user = executable = True
+    pat_index = 0
     if context.mode == 'legacy32':
         base, levels, bits = context.cr3 & ~4095, (22, 12), 32
     elif context.mode == 'pae':
@@ -142,9 +150,8 @@ def walk(tables, context, address, access):
         if not root & P:
             return fault()
         base, levels, bits = root & PA_MASK, (21, 12), 64
-        wb = not root & 0x18
     else:
-        base, levels, bits = context.cr3, (39, 30, 21, 12), 64
+        base, levels, bits = context.cr3 & PA_MASK, (39, 30, 21, 12), 64
     for shift in levels:
         at = base + ((address >> shift) & (1023 if bits == 32 else 511)) * (bits // 8)
         entry = read(at, bits)
@@ -159,10 +166,10 @@ def walk(tables, context, address, access):
         writable = writable and bool(entry & RW)
         user = user and bool(entry & US)
         executable = executable and not bool(bits == 64 and entry & NX)
-        wb = wb and not bool(entry & 0x18)
         leaf = shift == 12 or large
         if leaf:
-            wb = wb and not bool(entry & (4096 if large else PS))
+            # Table 14-11 index: PAT is bit 7 of a 4KiB PTE, bit 12 of a larger-page entry; PCD/PWT are bits 4/3.
+            pat_index = (bool(entry & (4096 if large else PS)) << 2) | (bool(entry & 16) << 1) | bool(entry & 8)
             if ((context.cpl == 3 and not user)
                     or (access == 'write' and not writable and (context.wp or context.cpl == 3))
                     or (access == 'fetch' and (not executable or (context.cpl == 0 and context.smep and user)))):
@@ -174,11 +181,78 @@ def walk(tables, context, address, access):
             frame = entry & (0xfffff000 if bits == 32 else PA_MASK) & ~(size - 1)
             result.route = Route(frame | (address & (size - 1)), size, at,
                                  writable or (context.cpl == 0 and not context.wp), user,
-                                 executable, bool(entry & D or access == 'write'), bool(wb))
+                                 executable, bool(entry & D or access == 'write'), pat_index)
             return result
         update(at, entry | A)
         base = entry & (0xfffff000 if bits == 32 else PA_MASK)
     raise ValueError('walker exhausted without leaf')
+
+
+def pat_type(pat, index):
+    """PAT entry `index` (0-7) of an IA32_PAT value; a reserved encoding or non-zero upper bits would #GP at WRMSR."""
+    require(type(pat) is int and 0 <= pat < 1 << 64 and 0 <= index < 8, 'PAT value and index')
+    require(all(pat >> 8 * i & 0xff in PAT_TYPES for i in range(8)), 'PAT entry encodings (WRMSR would #GP)')
+    return pat >> 8 * index & 0xff
+
+
+def _fixed_field(address):
+    """(fixed MTRR index, byte number) of Table 14-9 for a physical address below 1 MiB."""
+    if address < 0x80000:
+        return 0x250, address >> 16
+    if address < 0xc0000:
+        return 0x258 + ((address - 0x80000) >> 17), address >> 14 & 7
+    return 0x268 + ((address - 0xc0000) >> 15), address >> 12 & 7
+
+
+def mtrr_type(mtrr, address):
+    """MTRR type at a physical address (SDM Vol.3 §14.11.4.1) from {MSR index: value}; None where the SDM leaves it
+    undefined (overlapping variable ranges other than identical, any with UC, or exactly WT+WB). An empty state is
+    the reset state (E clear). Variable pairs are 0x200..0x20f; the model's CPU profile has 8."""
+    require(type(address) is int and 0 <= address < 1 << MAXPHYADDR, 'physical address width')
+    default = mtrr.get(0x2ff, 0)
+    require(default & ~0xcff == 0 and default & 0xff in MTRR_TYPES, 'IA32_MTRR_DEF_TYPE encoding')
+    if not default & 0x800:                                  # E clear: UC for everything, FE ignored
+        return UC
+    if address < 0x100000 and default & 0x400:               # FE: fixed ranges win below 1 MiB
+        register, byte = _fixed_field(address)
+        found = mtrr.get(register, 0) >> 8 * byte & 0xff
+        require(found in MTRR_TYPES, 'fixed-range MTRR type encoding')
+        return found
+    found = set()
+    for n in range(8):
+        base, mask = mtrr.get(0x200 + 2 * n, 0), mtrr.get(0x201 + 2 * n, 0)
+        if mask & 0x800 and (address ^ base) & mask & PA_MASK == 0:
+            require(base & 0xff in MTRR_TYPES, 'variable-range MTRR type encoding')
+            found.add(base & 0xff)
+    if not found:
+        return default & 0xff
+    if len(found) == 1:
+        return next(iter(found))
+    if UC in found:
+        return UC
+    return WT if found == {WT, WB} else None
+
+
+# Table 14-7, rows = MTRR type, columns = PAT entry in the order UC UC- WC WT WB WP; effective types (UC1/UC2 are both UC).
+_PAT_ORDER = (UC, UC_MINUS, WC, WT, WB, WP)
+_TABLE_14_7 = {UC: (UC, UC, WC, UC, UC, UC), WC: (UC, WC, WC, UC, WC, UC), WT: (UC, UC, WC, WT, WT, WP),
+               WB: (UC, UC, WC, WT, WB, WP), WP: (UC, WC, WC, WT, WP, WP)}
+
+
+def effective_type(mtrr_memory_type, pat_memory_type):
+    """Table 14-7 (normal caching): None when the MTRR type is None (undefined overlap)."""
+    require(pat_memory_type in PAT_TYPES and (mtrr_memory_type is None or mtrr_memory_type in MTRR_TYPES),
+            'memory type encodings')
+    if mtrr_memory_type is None:
+        return None
+    return _TABLE_14_7[mtrr_memory_type][_PAT_ORDER.index(pat_memory_type)]
+
+
+def route_type(route, pat=PAT_RESET, mtrr=None, address=None):
+    """Architectural effective memory type of a route's page at physical `address` (default: the route's GPA).
+    The translation does not depend on it; natemu runs WB/WT/WP/WC RAM natively and UC RAM strongly ordered (M2 addendum 2)."""
+    address = route.gpa if address is None else address
+    return effective_type(mtrr_type(mtrr or {}, address), pat_type(pat, route.pat_index))
 
 
 @dataclass(frozen=True)
@@ -228,7 +302,7 @@ def access_outcomes(tables, context, address, access, cache=None, policy='either
                    and (access != 'fetch' or route.executable and not (context.cpl == 0 and context.smep and route.user)))
         if allowed:
             current = Route((route.gpa & ~4095) | (address & 4095), route.leaf_bytes, route.leaf_address,
-                            route.writable, route.user, route.executable, route.dirty, route.wb)
+                            route.writable, route.user, route.executable, route.dirty, route.pat_index)
             result.append(Result('cached', dict(tables), route=current, address=address))
     if policy != 'cached' or not result:
         result.append(walk(tables, context, address, access))

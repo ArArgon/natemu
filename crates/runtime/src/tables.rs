@@ -110,6 +110,16 @@ pub fn unmap_large(va: u64) -> Result<(), Error> {
     }
     Ok(())
 }
+/// Removes the shadow of linear page `va` from both spaces (M2: a UC page shadowed for one instruction).
+pub fn unmap(va: u64) -> Result<(), Error> {
+    for user in [false, true] {
+        match space(user).unmap(va) {
+            Ok(()) | Err(Error::Noncanonical) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
 /// Removes every shadow of both spaces.
 pub fn reset() {
     space(false).reset()

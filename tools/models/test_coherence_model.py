@@ -264,10 +264,272 @@ class DeclaredPolicyTests(unittest.TestCase):
         r = m.walk(*self.four(level=3, bits=m.PS)[:2], 0x100000, 'read')     # PS in the PDPTE
         self.assertEqual((r.vector, r.error), (14, 13))
 
-    def test_pwt_pcd_or_pat_make_the_route_non_write_back(self):
-        self.assertTrue(m.walk(*self.four()[:2], 0x100000, 'read').route.wb)
-        for level, bit in ((1, 8), (1, 16), (1, m.PS), (2, 8), (3, 16)):
-            self.assertFalse(m.walk(*self.four(level=level, bits=bit)[:2], 0x100000, 'read').route.wb, (level, bit))
+    def test_cr3_pwt_pcd_accepted_and_do_not_change_the_walk(self):
+        for mode in m.MODES:
+            tables, context, layout = m.fixture(mode)
+            base = m.walk(tables, context, 0x100023, 'read')
+            for bits in (0x08, 0x10, 0x18):
+                got = m.walk(tables, replace(context, cr3=context.cr3 | bits), 0x100023, 'read')
+                self.assertEqual((got.vector, got.route, got.reads), (0, base.route, base.reads), (mode, bits))
+        tables, context, _ = m.fixture('four')
+        for bad in (1 << 40, 1 << 63, 0x20, 0x4):           # bits 63:40 stay reserved; other low bits as before
+            with self.assertRaises(ValueError):
+                m.walk(tables, replace(context, cr3=context.cr3 | bad), 0x100000, 'read')
+        tables, context, _ = m.fixture('legacy32')
+        with self.assertRaises(ValueError):
+            m.walk(tables, replace(context, cr3=context.cr3 | 1 << 32), 0x100000, 'read')
+
+
+# The SDM's own tables, transcribed independently of the model's encoding.
+TYPES = {'UC': m.UC, 'UC-': m.UC_MINUS, 'WC': m.WC, 'WT': m.WT, 'WB': m.WB, 'WP': m.WP}
+TABLE_14_7 = [        # (MTRR type, PAT entry value, effective type), Vol.3 Table 14-7 rows in print order
+    ('UC', 'UC', 'UC'), ('UC', 'UC-', 'UC'), ('UC', 'WC', 'WC'), ('UC', 'WT', 'UC'), ('UC', 'WB', 'UC'), ('UC', 'WP', 'UC'),
+    ('WC', 'UC', 'UC'), ('WC', 'UC-', 'WC'), ('WC', 'WC', 'WC'), ('WC', 'WT', 'UC'), ('WC', 'WB', 'WC'), ('WC', 'WP', 'UC'),
+    ('WT', 'UC', 'UC'), ('WT', 'UC-', 'UC'), ('WT', 'WC', 'WC'), ('WT', 'WT', 'WT'), ('WT', 'WB', 'WT'), ('WT', 'WP', 'WP'),
+    ('WB', 'UC', 'UC'), ('WB', 'UC-', 'UC'), ('WB', 'WC', 'WC'), ('WB', 'WT', 'WT'), ('WB', 'WB', 'WB'), ('WB', 'WP', 'WP'),
+    ('WP', 'UC', 'UC'), ('WP', 'UC-', 'WC'), ('WP', 'WC', 'WC'), ('WP', 'WT', 'WT'), ('WP', 'WB', 'WP'), ('WP', 'WP', 'WP')]
+# Table 14-9: (register, first address, bytes per field)
+FIXED = [(0x250, 0x00000, 0x10000), (0x258, 0x80000, 0x4000), (0x259, 0xa0000, 0x4000)] + [
+    (0x268 + k, 0xc0000 + 0x8000 * k, 0x1000) for k in range(8)]
+
+
+def mtrr_state(default=m.WB, fe=False, e=True, fixed=None, variable=()):
+    """{MSR: value}: default type, E/FE, optional {register: value}, and variable (base, size, type[, valid]) ranges."""
+    state = {0x2ff: default | fe << 10 | e << 11, **(fixed or {})}
+    for n, (base, size, kind, *valid) in enumerate(variable):
+        state[0x200 + 2 * n] = base | kind
+        state[0x201 + 2 * n] = (~(size - 1) & 0xfffffff000) | (0x800 if not valid or valid[0] else 0)
+    return state
+
+
+class MemoryTypeTests(unittest.TestCase):
+    def test_table_14_7_every_row(self):
+        self.assertEqual(len(TABLE_14_7), 30)
+        self.assertEqual(len({(a, b) for a, b, _ in TABLE_14_7}), 30)
+        for mtrr, pat, effective in TABLE_14_7:
+            self.assertEqual(m.effective_type(TYPES[mtrr], TYPES[pat]), TYPES[effective], (mtrr, pat))
+        self.assertIsNone(m.effective_type(None, m.WB))
+
+    def test_table_14_7_through_pat_msr_mtrr_and_route(self):
+        for mtrr, pat, effective in TABLE_14_7:
+            for index in range(8):
+                value = m.PAT_RESET & ~(0xff << 8 * index) | TYPES[pat] << 8 * index
+                route = replace(m.walk(*m.fixture('four')[:2], 0x100000, 'read').route, pat_index=index)
+                state = mtrr_state(default=TYPES[mtrr])
+                self.assertEqual(m.route_type(route, value, state), TYPES[effective], (mtrr, pat, index))
+
+    def test_pat_msr_reset_value_and_validation(self):
+        self.assertEqual(m.PAT_RESET, 0x0007040600070406)
+        self.assertEqual([m.pat_type(m.PAT_RESET, i) for i in range(8)],
+                         [m.WB, m.WT, m.UC_MINUS, m.UC, m.WB, m.WT, m.UC_MINUS, m.UC])
+        for bad in (0x02, 0x03, 0x08, 0x80, 0xff):          # reserved encodings #GP at WRMSR
+            with self.assertRaises(ValueError):
+                m.pat_type(m.PAT_RESET & ~0xff | bad, 1)
+        with self.assertRaises(ValueError):
+            m.pat_type(m.PAT_RESET | 1 << 63, 0)               # reserved high bits of PA7
+        with self.assertRaises(ValueError):
+            m.pat_type(m.PAT_RESET & ~(0xff << 40) | 3 << 40, 0)    # reserved encoding in PA5
+
+    def test_default_pat_indexes_with_firmware_mtrrs(self):
+        # Default PAT, WB-default MTRR: PWT/PCD pick WB, WT, UC, UC for both PAT-bit values.
+        route = m.walk(*m.fixture('four')[:2], 0x100000, 'read').route
+        want = [m.WB, m.WT, m.UC, m.UC] * 2
+        self.assertEqual([m.route_type(replace(route, pat_index=i), m.PAT_RESET, mtrr_state()) for i in range(8)], want)
+
+    def test_mtrr_disabled_is_uc_even_with_fe_and_variable_ranges(self):
+        for address in (0, 0x9ffff, 0x100000, 0x7fffffff, 0x200000000):
+            for fe in (False, True):
+                state = mtrr_state(e=False, fe=fe, fixed={0x250: 0x0606060606060606},
+                                   variable=[(0, 1 << 40, m.WB)])
+                self.assertEqual(m.mtrr_type(state, address), m.UC)
+        self.assertEqual(m.mtrr_type({}, 0x1000), m.UC)           # reset state
+
+    def test_default_type_for_unmatched_addresses(self):
+        for kind in m.MTRR_TYPES:
+            state = mtrr_state(default=kind, variable=[(0x40000000, 0x40000000, m.UC)])
+            self.assertEqual(m.mtrr_type(state, 0x200000), kind)
+            self.assertEqual(m.mtrr_type(state, 0x40000000 - 1), kind)
+            self.assertEqual(m.mtrr_type(state, 0x100000000), kind)
+            self.assertEqual(m.mtrr_type(state, 0x40000000), m.UC)
+
+    def test_fixed_range_fields_follow_table_14_9(self):
+        wb, wt = 0x0606060606060606, m.WT
+        self.assertEqual(len(FIXED), 11)
+        for register, start, size in FIXED:
+            for field in range(8):
+                state = mtrr_state(fe=True, fixed={r: wb for r, _, _ in FIXED} | {register: wb & ~(0xff << 8 * field) | wt << 8 * field})
+                first = start + field * size
+                for address in (first, first + 1, first + size - 1):
+                    self.assertEqual(m.mtrr_type(state, address), wt, (hex(register), field, hex(address)))
+                for address in (first - 1, first + size) if (first, first + size) != (0, 0) else ():
+                    if 0 <= address < 0x100000:
+                        self.assertEqual(m.mtrr_type(state, address), m.WB, (hex(register), field, hex(address)))
+        # The ranges tile 0..1 MiB exactly.
+        self.assertEqual(sum(size * 8 for _, _, size in FIXED), 0x100000)
+
+    def test_fixed_ranges_take_priority_below_1mib_only_when_enabled(self):
+        fixed = {0x250: 0x0101010101010101, 0x258: 0x0505050505050505, 0x259: 0, 0x268: 0x0404040404040404}
+        for kinds, address in ((m.WC, 0x70000), (m.WP, 0x80000), (m.UC, 0xa0000), (m.WT, 0xc0000)):
+            on = mtrr_state(fe=True, fixed=fixed, variable=[(0, 1 << 30, m.WB)])
+            self.assertEqual(m.mtrr_type(on, address), kinds)
+            off = mtrr_state(fixed=fixed, variable=[(0, 1 << 30, m.WB)])
+            self.assertEqual(m.mtrr_type(off, address), m.WB)       # variable range still maps it
+            self.assertEqual(m.mtrr_type(mtrr_state(fixed=fixed, default=m.WP), address), m.WP)
+        self.assertEqual(m.mtrr_type(mtrr_state(fe=True, fixed=fixed, default=m.WP), 0x100000), m.WP)   # not fixed at 1 MiB
+        self.assertEqual(m.mtrr_type(mtrr_state(fe=True, fixed=fixed, default=m.WP), 0xc7fff), m.WT)
+
+    def test_variable_range_matching_valid_bit_size_and_base(self):
+        state = mtrr_state(default=m.UC, variable=[(0x00200000, 0x00200000, m.WB), (0x10000000, 0x1000, m.WT),
+                                                   (0x30000000, 0x10000000, m.WP, False)])
+        for address, want in ((0x1fffff, m.UC), (0x200000, m.WB), (0x3fffff, m.WB), (0x400000, m.UC),
+                              (0x0fffffff, m.UC), (0x10000000, m.WT), (0x10000fff, m.WT), (0x10001000, m.UC),
+                              (0x30000000, m.UC)):              # last pair has V clear
+            self.assertEqual(m.mtrr_type(state, address), want, hex(address))
+        high = mtrr_state(default=m.WB, variable=[(0xff00000000, 1 << 32, m.UC)])    # bits up to MAXPHYADDR
+        self.assertEqual((m.mtrr_type(high, 0xff00000000), m.mtrr_type(high, 0xffffffffff), m.mtrr_type(high, 0xfeffffffff)),
+                         (m.UC, m.UC, m.WB))
+
+    def test_variable_overlap_precedence(self):
+        both = lambda a, b, default=m.WB: mtrr_state(default=default, variable=[(0, 1 << 30, a), (0, 1 << 20, b)])
+        for a in m.MTRR_TYPES:
+            self.assertEqual(m.mtrr_type(both(a, a), 0x1000), a)              # identical types
+            self.assertEqual(m.mtrr_type(both(a, m.UC), 0x1000), m.UC)        # UC wins
+            self.assertEqual(m.mtrr_type(both(m.UC, a), 0x1000), m.UC)
+            self.assertEqual(m.mtrr_type(both(a, a), 0x2000000), a)           # only the larger range
+        self.assertEqual(m.mtrr_type(both(m.WT, m.WB), 0x1000), m.WT)         # WT + WB = WT, either order
+        self.assertEqual(m.mtrr_type(both(m.WB, m.WT), 0x1000), m.WT)
+        for pair in ((m.WC, m.WT), (m.WC, m.WB), (m.WC, m.WP), (m.WP, m.WT), (m.WP, m.WB)):
+            for a, b in (pair, pair[::-1]):
+                self.assertIsNone(m.mtrr_type(both(a, b), 0x1000), pair)      # otherwise undefined
+                self.assertEqual(m.mtrr_type(both(a, b), 0x2000000), a)       # but a single match is fine
+        triple = lambda *kinds: mtrr_state(variable=[(0, 1 << 20, k) for k in kinds])
+        self.assertEqual(m.mtrr_type(triple(m.WT, m.WB, m.WB), 0), m.WT)
+        self.assertEqual(m.mtrr_type(triple(m.WB, m.WT, m.WT, m.WB), 0), m.WT)
+        self.assertEqual(m.mtrr_type(triple(m.WT, m.WB, m.UC), 0), m.UC)
+        self.assertIsNone(m.mtrr_type(triple(m.WT, m.WB, m.WC), 0))
+        self.assertIsNone(m.mtrr_type(triple(m.WT, m.WB, m.WP), 0))
+        self.assertIsNone(m.route_type(m.walk(*m.fixture('four')[:2], 0x100000, 'read').route, m.PAT_RESET, triple(m.WC, m.WB), address=0x1000))
+
+    def test_variable_ranges_do_not_override_fixed_below_1mib(self):
+        fixed = {0x250: 0x0606060606060606}
+        state = mtrr_state(fe=True, fixed=fixed, variable=[(0, 1 << 20, m.UC)])
+        self.assertEqual(m.mtrr_type(state, 0x10000), m.WB)       # fixed WB beats variable UC
+        self.assertEqual(m.mtrr_type(mtrr_state(fixed=fixed, variable=[(0, 1 << 20, m.UC)]), 0x10000), m.UC)
+
+    def test_invalid_mtrr_encodings_are_refused_not_guessed(self):
+        for state in ({0x2ff: 0x802}, {0x2ff: 0x1800}, {0x2ff: 0xc06, 0x250: 2}, {0x2ff: 0xc06, 0x250: 0x02}):
+            with self.assertRaises(ValueError):
+                m.mtrr_type(state, 0)
+
+    def test_profile_firmware_state_agrees_with_independent_reading(self):
+        from models import cpu_profile
+        profile = cpu_profile.load()
+        for limit in (None, 0x80000000, 0x60000000):
+            state = profile.mtrr_state(limit)
+            top = 0x80000000 if limit is None else limit
+            for address, want in ((0, m.WB), (0x9ffff, m.WB), (0xa0000, m.UC), (0xfffff, m.UC), (0x100000, m.WB),
+                                  (top - 1, m.WB), (top, m.UC), (0xf0000000, m.UC), (0xfee00000, m.UC),
+                                  (0xffffffff, m.UC), (0x100000000, m.WB), (0x1ffffffff, m.WB)):
+                self.assertEqual(m.mtrr_type(state, address), want, (limit, hex(address)))
+                self.assertEqual(m.mtrr_type(state, address), profile.memory_type(state, address))
+
+    def test_route_type_defaults_to_the_route_gpa_and_reset_mtrrs(self):
+        route = m.walk(*m.fixture('four')[:2], 0x100023, 'read').route
+        self.assertEqual(m.route_type(route), m.UC)               # E clear: UC under PAT0 = WB
+        state = mtrr_state(variable=[(0x100000, 0x1000, m.UC)])
+        self.assertEqual(m.route_type(route, m.PAT_RESET, state), m.UC)
+        self.assertEqual(m.route_type(route, m.PAT_RESET, state, address=0x300000), m.WB)
+
+
+class PatIndexTests(unittest.TestCase):
+    """Leaf PAT/PCD/PWT -> Route.pat_index at both leaf sizes, under every upper-level PWT/PCD pattern."""
+    def setup(self, mode, size):
+        """(tables, context, leaf address, upper-entry addresses, leaf base value)."""
+        tables, context, layout = m.fixture(mode)
+        # Non-leaf entries above the leaf: legacy PDE | PAE PDPTE (hidden) + PDE | four PML4E + PDPTE + PDE.
+        above = {'legacy32': [], 'pae': ['pdpte'], 'four': [0x1000, 0x2000]}[mode]
+        if size == 4096:
+            leaf, value = layout['first'] + 256 * layout['entry_bytes'], 0x100007
+            upper = above + [layout['parent']]
+        else:
+            leaf, value, upper = layout['parent'], 0x87, above
+        return tables, context, leaf, upper, value
+
+    def route(self, mode, size, leaf_bits, upper_bits):
+        tables, context, leaf, upper, value = self.setup(mode, size)
+        for level, at in enumerate(upper):
+            bits = upper_bits >> 2 * level & 3
+            if at == 'pdpte':
+                tables[0x1020] |= bits << 3
+                hidden, _ = m.load_hidden(tables, context.cr3, context.hidden)
+                context = replace(context, hidden=hidden, generation=2)
+            else:
+                tables[at] |= bits << 3
+        tables[leaf] = value | leaf_bits
+        return m.walk(tables, context, 0x100023, 'read')
+
+    @staticmethod
+    def leaf_bits(pat, pcd, pwt, size):
+        return pwt << 3 | pcd << 4 | pat << (7 if size == 4096 else 12)
+
+    def test_index_from_leaf_alone_at_4k_and_2m_under_all_upper_patterns(self):
+        for mode, size in (('legacy32', 4096), ('pae', 4096), ('four', 4096), ('pae', 1 << 21), ('four', 1 << 21)):
+            levels = len(self.setup(mode, size)[3])
+            for upper_bits in range(1 << 2 * levels):
+                for index in range(8):
+                    pat, pcd, pwt = index >> 2, index >> 1 & 1, index & 1
+                    r = self.route(mode, size, self.leaf_bits(pat, pcd, pwt, size), upper_bits)
+                    self.assertEqual((r.vector, r.route.pat_index, r.route.leaf_bytes, r.route.gpa),
+                                     (0, index, size, 0x100023), (mode, size, upper_bits, index))
+
+    def test_upper_level_counts(self):
+        self.assertEqual([len(self.setup(*c)[3]) for c in (('legacy32', 4096), ('pae', 4096), ('four', 4096),
+                                                           ('pae', 1 << 21), ('four', 1 << 21))], [1, 2, 3, 1, 2])
+
+    def test_pat_bit_position_depends_on_leaf_size(self):
+        for mode in ('pae', 'four'):
+            # 4KiB: bit 12 is address, bit 7 is PAT.  2MiB: bit 7 is PS, bit 12 is PAT.
+            r = self.route(mode, 4096, 1 << 7, 0)
+            self.assertEqual((r.route.pat_index, r.route.gpa), (4, 0x100023))
+            r = self.route(mode, 4096, 1 << 12, 0)
+            self.assertEqual((r.route.pat_index, r.route.gpa), (0, 0x101023))
+            r = self.route(mode, 1 << 21, 1 << 12, 0)
+            self.assertEqual((r.route.pat_index, r.route.gpa), (4, 0x100023))
+            r = self.route(mode, 1 << 21, 0, 0)
+            self.assertEqual((r.route.pat_index, r.route.leaf_bytes), (0, 1 << 21))
+
+    def test_no_route_is_refused_for_its_memory_type_and_data_is_unchanged(self):
+        for mode in m.MODES:
+            for bits in (0, 8, 16, 24, 0x80, 0x98):
+                tables, context, layout = m.fixture(mode)
+                leaf = layout['first'] + 256 * layout['entry_bytes']
+                tables[leaf] |= bits
+                for access in ('read', 'write'):
+                    r = m.walk(tables, context, 0x100000, access)
+                    self.assertEqual((r.vector, r.route.gpa, r.route.leaf_bytes), (0, 0x100000, 4096))
+
+    def test_cached_route_keeps_its_index_until_invalidated(self):
+        tables, context, layout = m.fixture('four')
+        leaf = layout['first'] + 256 * 8
+        first = m.walk(tables, context, 0x100000, 'read')
+        cache = m.Cache(); cache.remember(context, first)
+        changed = dict(first.tables); changed[leaf] |= 0x98                    # PAT=1, PCD=1, PWT=1
+        permitted = m.access_outcomes(changed, context, 0x100000, 'read', cache)
+        self.assertEqual([(r.policy, r.route.pat_index) for r in permitted], [('cached', 0), ('fresh', 7)])
+        after = m.access_outcomes(changed, context, 0x100123, 'read', cache, invalidated=True)
+        self.assertEqual([r.route.pat_index for r in after], [7])
+        # A cached route keeps the index at another byte offset in the same page.
+        self.assertEqual(m.access_outcomes(changed, context, 0x100123, 'read', cache, policy='cached')[0].route.pat_index, 0)
+
+    def test_all_eight_pat_entries_are_independent(self):
+        # A rewritten PAT makes all eight entries independent (the default repeats PA0-PA3 in PA4-PA7).
+        route = m.walk(*m.fixture('four')[:2], 0x100000, 'read').route
+        pat = 0x0705040100070601      # PA0..PA7 = WC, WB, UC-, UC, WC, WT, WP, UC-
+        want = [m.WC, m.WB, m.UC_MINUS, m.UC, m.WC, m.WT, m.WP, m.UC_MINUS]
+        self.assertEqual([m.pat_type(pat, i) for i in range(8)], want)
+        state = mtrr_state(default=m.WB)
+        self.assertEqual([m.route_type(replace(route, pat_index=i), pat, state) for i in range(8)],
+                         [m.WC, m.WB, m.UC, m.UC, m.WC, m.WT, m.WP, m.UC])
 
 if __name__ == '__main__':
     unittest.main()

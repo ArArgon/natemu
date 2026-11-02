@@ -244,6 +244,34 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
         return Some(block);
     }
 }
+/// M2 (owner decision, November 2): uncached RAM keeps x86 strong ordering. UC reads and writes are made in program
+/// order, none out of order or speculatively (SDM Vol.3 14.3, Table 14-2 "Strong Ordering"; 11.2.5): generated code
+/// never reaches UC RAM through a shadow a block keeps running with. A walk finding UC RAM shadows it only for the step
+/// block ([`translate`]), so an access to it in any other block runs its instruction alone ([`access_aborted`] steps it
+/// from its start: every fault, permission, CPL and data-breakpoint check as for any access), behind a full barrier made
+/// before the access is retried there. Generated code runs again from the resident only through [`enter`] (a retry,
+/// [`resume`], continues the same instruction), which first ends it here: a second barrier makes the access globally
+/// visible before any later one, and the pages so shadowed go. The resident's own accesses to UC RAM
+/// (`segments::pages`, [`split`]) are made after a barrier and owe this one too (a split store makes its own).
+/// (A page so shadowed writable keeps this vCPU's writable bit until its next shadow reset: a peer marking it as code
+/// then asks this vCPU for a reset it need not make, which is conservative.)
+fn uncached_end(s: &mut State) {
+    let (n, pages, fence) = {
+        let c = cache::control();
+        (c.uncached_count as usize, c.uncached, c.uncached_fence)
+    };
+    if n == 0 && fence == 0 {
+        return;
+    }
+    unsafe { asm!("dmb ish") };
+    if n > pages.len() {
+        reset_shadows(s);
+    } else if pages[..n].iter().any(|&va| tables::unmap(va).is_err()) {
+        halt(s, stop::SHADOW)
+    }
+    let c = cache::control();
+    (c.uncached_count, c.uncached_fence) = (0, 0);
+}
 /// S4: whether `b` starts at an armed instruction breakpoint: it is never linked to nor put in L1 (every entry passes
 /// [`find`]'s check).
 fn at_breakpoint(c: &Cpu, b: &Block) -> bool {
@@ -551,7 +579,8 @@ fn fetch_walk(s: &mut State, va: u64) -> Result<(u64, bool), [u64; 3]> {
     loop {
         let mut tables = GuestTables::observed(guest_ram(), CodeWrites(FetchWrites(s)));
         match paging::walk(&mut tables, control, va, Access::Fetch) {
-            Ok(t) if t.wb && guest_ram().range(t.gpa & !4095, 4096).is_some() => return Ok((t.gpa & !4095, t.global)),
+            // M2: guest RAM of any memory type (code may run from UC memory, SDM Vol.3 14.3.3).
+            Ok(t) if guest_ram().range(t.gpa & !4095, 4096).is_some() => return Ok((t.gpa & !4095, t.global)),
             Ok(_) => return Err([fetch::NOT_RAM, 0, 0]),
             Err(Fault::Contended) => {}
             Err(f) => return Err(fetch::encode(f)),
@@ -684,6 +713,7 @@ fn reset_shadows(s: &mut State) {
 /// every entry and never read back, so the bank stays authoritative: a guest store into the page (the documented
 /// deviation) changes only what that vCPU's own prefixed accesses use until the next `enter`.
 unsafe fn enter(mut s: State, block: &Block) -> ! {
+    uncached_end(&mut s);
     served(&mut s);
     s.mid_string = 0; // the next resident entry is at another boundary
     // X2: a shadow still set here covers the block's first instruction with no event pending (else `find` stepped it).
@@ -964,7 +994,7 @@ unsafe fn stopped(frame: &NativeFrame, elr: u64, spsr: u64, (armed, n): ([u32; M
 /// those in 63:32 raise #GP. Every defined bit is accepted (PG, PE are fixed in 64-bit code: clearing either raises
 /// #GP; ET is hard-wired). WP is the walker's. MP, EM, TS, NE are recorded: they gate x87/MMX/SSE forms (#NM with TS
 /// or EM, #UD for SSE with EM; NE selects native x87 error reporting); MP, EM, TS are in a block's context
-/// ([`Cpu::code_context`]), so a block never runs under other gating than it was made under (K1). CD and NW are recorded: RAM is write-back whatever they say (memory types are M2's). AM with
+/// ([`Cpu::code_context`]), so a block never runs under other gating than it was made under (K1). CD and NW are recorded: they change no memory type or ordering (Table 14-5: CD stops cache fills, not the types or orderings, M2). AM with
 /// RFLAGS.AC at CPL 3 turns alignment checking on (X2, [`alignment_check`]); translations depend on it only through the
 /// BT* cut, and it is part of [`Cpu::code_context`].
 const CR0_DEFINED: u64 = cpu_profile::CR0_VALID;
@@ -1158,12 +1188,9 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                     s.cpu.cr0 = new;
                 }
                 3 => {
-                    // Without PCIDE, bits 63:MAXPHYADDR are reserved (bit 63 included); PWT/PCD are not modelled.
-                    if v & !(paging::PA_MASK | 0xfff) != 0 {
-                        return Err(GP)
-                    }
+                    // Without PCIDE, bits 63:MAXPHYADDR are reserved (bit 63 included); PWT/PCD are kept ([`CR3_IGNORED`]).
                     if v & !(paging::PA_MASK | CR3_IGNORED) != 0 {
-                        unsupported(s)
+                        return Err(GP)
                     }
                     s.cpu.cr3 = v;
                     tlb(s, false); // a load of the same value too
@@ -1313,11 +1340,12 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                     // EN/EXTD and the base select the LAPIC's mode and page (X3: its transitions, [`lapic::set_base`]).
                     cpu::MSR_APIC_BASE => lapic::set_base(s, v)?,
                     // UCODE_REV keeps the high half (the low is 0 by the mask); KERNEL_GS_BASE is SWAPGS's ([`syscalls`]);
-                    // PAT and the MTRRs are recorded: memory types are the walker's (M2), RAM runs as write-back.
+                    // PAT and the MTRRs are recorded: the walker's memory types read them ([`cpu::memory_type`], M2).
                     _ => msr_set(at, v),
                 }
                 // A change of EFER's paging bits flushes the TLBs (SCE gates only SYSCALL/SYSRET, checked as they run);
-                // an MTRR write invalidates TLBs including global entries (CPU 9). No translation depends on either.
+                // an MTRR write invalidates TLBs including global entries (CPU 9; the SDM allows it, Vol.3 5.10.4.1). No
+                // translation or shadow depends on either: a PAT write needs no flush (Vol.3 14.12.4 leaves it to software).
                 (s.cpu.efer ^ c.efer) & (EFER_NXE | EFER_LME | EFER_LMA) != 0 || cpu::is_mtrr(index)
             }
         }
@@ -1363,6 +1391,11 @@ fn msr_get(at: usize) -> u64 {
     assert!(at < cpu_profile::MSRS.len());
     // SAFETY: the record is mapped EL1 read/write in this vCPU's window and only this vCPU's resident uses it.
     unsafe { (MSRS_VA as *const u64).add(at).read_volatile() }
+}
+/// The vCPU's MSR record (see [`msr_get`]).
+fn msrs() -> &'static cpu::Msrs {
+    // SAFETY: as in msr_get; only this vCPU's resident writes it, never while a reference is held.
+    unsafe { &*(MSRS_VA as *const cpu::Msrs) }
 }
 fn msr_set(at: usize, value: u64) {
     assert!(at < cpu_profile::MSRS.len());
@@ -1585,13 +1618,16 @@ impl CodePages for DataWrites<'_> {
 }
 
 /// Walks `va` with `access` for the guest instruction at `site` of `b` and shadows the page; a guest
-/// fault stops with the precise state. Returns the guest-physical address of `va`, or `None` when the
-/// walk kept losing A/D races to peers (nothing installed: the caller resumes the instruction, which
+/// fault stops with the precise state. Returns the guest-physical address of `va` and whether it is UC RAM, or `None`
+/// when the walk kept losing A/D races to peers (nothing installed: the caller resumes the instruction, which
 /// faults and walks again, as x86 re-walks). A device page (not guest RAM) is walked but not shadowed: its address is
 /// returned for the device path (L3: an unassigned one may then be shadowed onto the all-ones page, `mmio::ones`). Translated pages are shadowed read-only whatever the
 /// walk grants; a write to one, or an A/D update in one, takes [`code_written`] first (which may step
-/// the instruction instead of returning), and each A/D update is re-checked after it is made.
-fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, access: Access) -> Option<u64> {
+/// the instruction instead of returning), and each A/D update is re-checked after it is made. M2 (owner decision,
+/// November 2): a page of UC RAM is shadowed only for the step block, whose one instruction it serves until the next
+/// boundary ([`uncached_end`]); for any other block it is walked (its faults and A/D updates, the code-write protocol for
+/// a write) but not shadowed, and the caller runs the instruction alone ([`access_aborted`]) or completes it ([`split`]).
+fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, access: Access) -> Option<(u64, bool)> {
     let Some(control) = s.cpu.control() else {
         halt(s, stop::UNSUPPORTED_MODE)
     };
@@ -1599,27 +1635,46 @@ fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, ac
     match walk {
         // M3: a page that is not guest RAM is a device page whatever its memory type (device ranges are uncached): never
         // shadowed; the caller completes the access through the device path ([`mmio::device`]).
-        Ok(t) if !mmio::ram(t.gpa) => Some(t.gpa),
-        Ok(t) if t.wb => {
+        Ok(t) if !mmio::ram(t.gpa) => Some((t.gpa, false)),
+        // M2: WB, WT, WP and WC RAM run natively under TSO (Apple silicon is coherent, and HVF's stage 2 maps RAM Normal
+        // write-back): WT, WP and WB have x86's processor ordering (SDM Vol.3 Table 14-2), and WC's weak ordering allows
+        // every TSO outcome. UC is strongly ordered (a UC- PAT entry gives UC unless the MTRRs say WC, Table 14-7): see above.
+        Ok(t) => {
+            let kind = cpu::memory_type(msrs(), t.gpa, t.pat);
+            let uncached = kind == cpu::memory_type::UC;
+            let shadow = !uncached || b.flags & cache::STEP != 0;
             let writable = access == Access::Write && t.writable && t.dirty;
             // As a mark is set before the writable bits are read ([`mark`]), the writable bit is set before the marks
             // are read: a vCPU marking the page then either shoots this shadow down or is seen here, and the write
-            // takes the code-write path.
+            // takes the code-write path. (Unshadowed, a write is made by the step block or [`split`] after this check.)
             if writable {
-                cache::shadowed_writable(t.gpa);
+                if shadow {
+                    cache::shadowed_writable(t.gpa);
+                }
                 if cache::translated(t.gpa) {
                     code_written(s, f, b, site, t.gpa);
                 }
             }
+            if !shadow {
+                return Some((t.gpa, true));
+            }
+            cache::control().memory_types[kind as usize] += 1;
             let old = tables::descriptor(s.cpu.cpl, va);
             if writable && old & 1 != 0 && old & READ_ONLY != 0 {
                 s.upgrades += 1;
             }
             install(s, va, t.gpa, writable);
-            Some(t.gpa)
+            // Recorded once per page (an upgrade to writable or a re-install after a reset installs it again).
+            let c = cache::control();
+            let recorded = c.uncached_count.min(c.uncached.len() as u64) as usize;
+            if uncached && !c.uncached[..recorded].contains(&(va & !4095)) {
+                if let Some(slot) = c.uncached.get_mut(c.uncached_count as usize) {
+                    *slot = va & !4095;
+                }
+                c.uncached_count += 1;
+            }
+            Some((t.gpa, uncached))
         }
-        // Only write-back guest memory is shadowed.
-        Ok(_) => halt(s, stop::SHADOW),
         Err(Fault::Page { address, error }) => guest_fault(*s, f, b, site, [14, address, error]),
         Err(Fault::Noncanonical) => guest_fault(*s, f, b, site, noncanonical(site)),
         Err(Fault::Contended) => None,
@@ -1763,21 +1818,30 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
     // Every page the access touches, in address order, before the retry. A contended walk resumes at once, outside
     // the no-progress test (the abort repeats until the walk wins; the watchdog contains a livelock). M3: a device page
     // among them (walked, so every fault it owes came first) takes the device path instead of a retry.
-    let mut device = [None; 2];
+    let (mut device, mut uncached) = ([None; 2], false);
     for (k, va) in touched.into_iter().flatten().enumerate() {
         match translate(&mut s, f, b, site, va, access) {
             None => unsafe {
                 write_record(record(), s);
                 resume(&s, &raw const (*shared()).captured, elr, spsr)
             },
-            Some(gpa) if !mmio::ram(gpa) => device[k] = Some(gpa),
-            Some(_) => {}
+            Some((gpa, _)) if !mmio::ram(gpa) => device[k] = Some(gpa),
+            Some((_, uc)) => uncached |= uc,
         }
     }
     // L3 (amendment): a read whose non-RAM pages are all unassigned shadows them onto the all-ones page and retries, so
     // every read form runs natively; anything else (a write, a device's page) takes the device path.
     if device != [None; 2] && (write || !mmio::ones(&mut s, f, b, site, touched, device)) {
         mmio::device(s, f, b, site, device[0].filter(|_| touched[1].is_none()))
+    }
+    // M2 (UC): an access touching UC RAM (either page of a crossing one) runs its instruction alone, from its start; in
+    // the step block the page is now shadowed, and every access before it is made globally visible first.
+    if uncached {
+        if b.flags & cache::STEP == 0 {
+            cache::control().uncached_steps += 1;
+            step_from(s, f, b, site)
+        }
+        unsafe { asm!("dmb ish") };
     }
     s.last_retry = [elr, far, tables::descriptor(s.cpu.cpl, far), s.shadow_generation];
     s.retries += 1;
@@ -1823,7 +1887,7 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
     }
     // A contended walk resumes at the stub, which takes this path again.
     let gpa = [first, second].map(|va| translate(&mut s, f, b, stub, va, Access::Write));
-    let [Some(gpa0), Some(gpa1)] = gpa else {
+    let [Some((gpa0, uc0)), Some((gpa1, uc1))] = gpa else {
         unsafe {
             write_record(record(), s);
             resume(&s, &raw const (*shared()).captured, b.code_va() + stub.native_offset as u64, spsr)
@@ -1856,6 +1920,12 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
         halt(&s, stop::SHADOW)
     };
     unsafe {
+        // M2 (UC): a store to UC RAM is made after every earlier access is globally visible (and, by the `dsb` after it,
+        // before any later one).
+        if uc0 || uc1 {
+            cache::control().uncached_resident += 1;
+            asm!("dmb ish");
+        }
         guest_memory::copy_volatile(to0, bytes.as_ptr(), head);
         guest_memory::copy_volatile(to1, bytes[head..].as_ptr(), width - head);
         asm!("dsb ish");

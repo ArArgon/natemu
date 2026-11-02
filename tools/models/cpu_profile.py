@@ -133,13 +133,26 @@ class Profile:
 
     def mtrr_state(self, ram_limit=None):
         """{msr index: value} of the selected initial MTRR state (owner decision Oct 28: enabled, RAM WB, devices UC).
-        `ram_limit` L (default: the profile's) moves the UC aperture [L, 4 GiB); the fixed ranges do not depend on it."""
+        `ram_limit` L (default: the profile's; the VM's guest RAM [0, L), a 2 MiB multiple up to 3 GiB, M1) moves the
+        UC aperture [L, 4 GiB): default type WB and [L, 4 GiB) as UC pairs (`uc_pairs`). When those need more pairs than
+        IA32_MTRRCAP.VCNT (L with many low bits, e.g. 1 GiB + 2 MiB: ten), the same map in the other encoding: default
+        type UC and [0, L) as WB pairs, the fewer of L's power-of-two blocks or one block to the next power of two with
+        [L, it) carved out by UC pairs (UC wins an overlap, SDM Vol.3 11.11.4.1). The fixed ranges do not depend on L."""
         m = self.d['parameters']['mtrr_initial']
         if m['selected'] != 'enabled': raise ValueError('only the "enabled" initial state carries values')
         L = _i(m['ram_limit_L']) if ram_limit is None else ram_limit
         st = {_i(k): _i(v) for k, v in m['msr_values_for_default_L'].items() if _i(k) >= 0x250 or _i(k) == 0x2ff}
-        for i, (base, size) in enumerate(uc_pairs(L, 1 << 32)):
-            st[0x200 + 2 * i] = base
+        vcnt = _i(self.msr(0xfe)['reset']) & 0xff
+        pairs = [(base, size, 0) for base, size in uc_pairs(L, 1 << 32)]
+        if len(pairs) > vcnt:
+            st[0x2ff] &= ~0xff                                          # default type UC
+            top = 1 << (L - 1).bit_length()
+            blocks = [(base, size, 6) for base, size in uc_pairs(0, L)]
+            carved = [(0, top, 6)] + [(base, size, 0) for base, size in uc_pairs(L, top)]
+            pairs = min(blocks, carved, key=len)
+            assert len(pairs) <= vcnt, hex(L)
+        for i, (base, size, t) in enumerate(pairs):
+            st[0x200 + 2 * i] = base | t
             st[0x201 + 2 * i] = ~(size - 1) & 0xFFFFFFF000 | 0x800
         return st
 
@@ -299,10 +312,9 @@ class Profile:
         if mi['selected'] not in (None, 'disabled', 'enabled'): err('mtrr_initial.selected')
         if mi['selected'] == 'enabled':
             st = self.mtrr_state()
-            if {k: v for k, v in st.items()} != {_i(k): _i(v) for k, v in mi['msr_values_for_default_L'].items()}: err('mtrr_initial values != uc_pairs(L)')
+            if {k: v for k, v in st.items()} != {_i(k): _i(v) for k, v in mi['msr_values_for_default_L'].items()}: err('mtrr_initial values != mtrr_state(L)')
             for k, v in st.items():
                 if not self.msr_write_ok(k, v): err(f'mtrr_initial: WRMSR {k:#x} <- {v:#x} would #GP')
-            if len(uc_pairs(1 << 30, 1 << 32)) > 8: err('too many variable pairs')
         return out
 
 

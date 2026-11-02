@@ -13,7 +13,9 @@ Cases are derived from program descriptions, never written per program:
 * Paging cells (S3a2; `--no-paging` leaves them out): the controls CPL 3/0, CR0.WP, CR4.SMEP (also with supervisor
   code pages), EFER.NXE (CONTROLS) crossed with a mutation (`unmap`: P; `readonly`: R/W; `supervisor`: U/S; `reserved`:
   bit 51, PS in a PML4E/PDPTE or bit 13 of a 2 MiB leaf; `np-garbage`: every bit but P; `noexec`: XD) of the entry at
-  level 1-4 of a touched data page's walk or of the code page's, with that page's 2 MiB range one PDE leaf or not.
+  level 1-4 of a touched data page's walk or of the code page's, with that page's 2 MiB range one PDE leaf or not; and
+  (M2) memory-type bits in that page's walk, from one rotation (`MEMTYPES`: the leaf's PAT index 0-7 by PWT, PCD and PAT,
+  crossed with PWT/PCD patterns in the PML4E, PDPTE and PDE; the label's `-patNuM`), which change no outcome.
   Each corpus program takes the next cells of one rotation per target (data/code), so the corpus covers every
   combination. The access-form programs (`paging_programs`: DATA_FORMS, pop/ret reads and page-crossing accesses) take,
   for each page they touch, every control x mutation of its leaf, then the next cells of a rotation over the upper levels
@@ -258,11 +260,10 @@ class Machine:
     the accesses of an instruction and the pages of one access go in order, so an earlier page keeps A/D when a later
     one faults.
 
-    Walker refusals (the resident halts instead of guessing; a refusal, never a wrong result; boot-phase prerequisites,
-    docs/restructure/slice3-contract.md): any PWT, PCD or PAT bit makes a page non-write-back and the resident halts
-    (`shadow status=1 detail=7`), although under the default PAT some of them are write-back on x86, so the model and
-    the corpus never set them; PS in a PDPTE is reserved (no 1 GiB pages: the boot-phase CPUID must report Page1GB=0);
-    the A bit of a non-leaf entry is set by the walk but not compared."""
+    Memory types (M2): PWT, PCD and PAT bits select a memory type and change no walk outcome or value here (UC RAM's
+    accesses run their instruction alone, M2 addendum 2); the cells set them (`MEMTYPES`). Walker refusals (the resident halts instead of guessing; a
+    refusal, never a wrong result): PS in a PDPTE is reserved (no 1 GiB pages: the boot-phase CPUID must report
+    Page1GB=0); the A bit of a non-leaf entry is set by the walk but not compared."""
     def __init__(self, code, data, mut):
         self.cpl, self.wp, self.smep, self.nxe = (mut.get(k, d) for k, d in (('cpl', 3), ('wp', 1), ('smep', 0), ('nxe', 1)))
         self.large = {r & ~(LARGE - 1) for r in mut.get('large', [])}
@@ -756,15 +757,28 @@ DATA_VARIANTS, CODE_VARIANTS = variants(DATA_KINDS), variants(CODE_KINDS)
 LEAF_VARIANTS = [v for v in DATA_VARIANTS if v[2] == 1 and not v[3]]
 UPPER_VARIANTS = [v for v in DATA_VARIANTS if v not in LEAF_VARIANTS]
 
-def cell(variant, page, code_pages):
-    """(label, mutations) of a paging cell on `page`."""
+# M2: every paging cell also gives its page memory-type bits, from one rotation over the leaf's PAT index (PWT, PCD and
+# PAT: bit 7 of a PTE, bit 12 of a 2 MiB leaf; Table 14-11) crossed with PWT/PCD patterns of the PML4E, PDPTE and PDE
+# above it (each bit pair at each level). They change no fault and no value (UC pages' accesses run their instruction
+# alone; the driver's PAT is the reset one, its MTRRs the firmware's); before M2 the resident halted on any of them.
+PWT, PCD = 1 << 3, 1 << 4
+UPPER_TYPES = [(0, 0, 0), (PWT, PCD, PWT | PCD), (PCD, PWT | PCD, PWT), (PWT | PCD, PWT, PCD)]
+MEMTYPES = [(k, u) for u in range(len(UPPER_TYPES)) for k in range(8)]
+
+def cell(variant, page, code_pages, memtype=(0, 0)):
+    """(label, mutations) of a paging cell on `page`, with the memory-type bits `memtype` (PAT index, upper pattern) in
+    its walk, set before the cell's own mutation."""
     (cname, controls), kind, level, large = variant
     mut = {k: v for k, v in controls.items() if k != 'supervisor'}
     region = page & ~(LARGE - 1)
     if large: mut['large'] = [region]
     sup = [(pg, None, 0, US) for pg in sorted(code_pages)] if controls.get('supervisor') else []
-    mut['entry'] = sup + [(page, level, *mutation(kind, level, large))]
-    return f"{cname}-{kind}@{level}{'L' if large else ''}-{page:#x}", mut
+    index, upper = memtype
+    pat = (index & 1) * PWT | (index >> 1 & 1) * PCD | (index >> 2) << (12 if large else 7)
+    types = [(page, lv, b, 0) for lv, b in zip((4, 3, 2), UPPER_TYPES[upper]) if b and not (large and lv == 2)]
+    types += [(page, 2 if large else 1, pat, 0)] if pat else []
+    mut['entry'] = sup + types + [(page, level, *mutation(kind, level, large))]
+    return f"{cname}-{kind}@{level}{'L' if large else ''}-{page:#x}-pat{index}u{upper}", mut
 
 # Base programs for the paging cells besides the corpus: the data access forms (no fault unmutated), and accesses
 # crossing the data page boundary. Position independent (no rip-relative operand): they also run in the upper half.
@@ -909,8 +923,8 @@ def expectations(programs, probe_specs, work, paging=True):
             for page in touched:
                 if page in data_pages(q):     # the access forms: every control x mutation of the leaf, then a rotation of the rest
                     for v in ([] if corpus else LEAF_VARIANTS) + take(('data', corpus, where), DATA_VARIANTS if corpus else UPPER_VARIANTS, n):
-                        case(*cell(v, page, code_pages))
-            for v in take(('code', corpus, where), CODE_VARIANTS, n + 1): case(*cell(v, min(code_pages), code_pages))
+                        case(*cell(v, page, code_pages, take('memtype', MEMTYPES, 1)[0]))
+            for v in take(('code', corpus, where), CODE_VARIANTS, n + 1): case(*cell(v, min(code_pages), code_pages, take('memtype', MEMTYPES, 1)[0]))
     for p, offs, k, mut, j in probing:
         rip, r = ref.num(p['rip']), results[j]
         r['qemu']['rip'] = ref.hx(rip + offs[k])

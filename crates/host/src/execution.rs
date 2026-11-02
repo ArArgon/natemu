@@ -141,6 +141,9 @@ pub(crate) fn set_cpu(area: Area, cpu: Cpu) {
     const _: () = assert!(natemu_abi::cpu_profile::TSC_HZ == 1_000_000_000); // ticks_ns scales like the resident
     let mut msrs = natemu_abi::cpu::reset_msrs(area.vcpu == 0);
     msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_TSC).unwrap()] = ticks_ns(area.epoch).wrapping_neg();
+    // The virtual firmware's MTRRs cover the guest RAM this VM has (M1's run-time size, set at prepare).
+    let control: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+    natemu_abi::cpu::firmware_mtrrs(&mut msrs, control.ram_bytes);
     area.write_record(exec::MSRS_OFFSET, msrs);
     area.write_record(exec::ENTROPY_OFFSET, exec::Entropy { taken: exec::ENTROPY_WORDS as u64, words: [0; exec::ENTROPY_WORDS] });
     refill_entropy(area);
@@ -266,13 +269,20 @@ pub(crate) fn end_when_halted(memory: &Memory, v: usize) {
 pub(crate) fn shadow_resets(area: Area) -> u64 {
     global_u64(area.memory, cache::RESETS + 8 * area.vcpu).load(SeqCst)
 }
-/// K1: vCPU `area.vcpu`'s TLB events and revalidations (`cache::Control`), as a JSON object.
+/// K1: vCPU `area.vcpu`'s TLB events and revalidations (`cache::Control`), as a JSON object; with M2's data shadows by
+/// memory type (`memory_types`: {"UC": n, ...}, the types with a non-zero count) and its UC accesses (`uncached`:
+/// instructions run alone for one, the resident's own).
 pub(crate) fn k1_stats(area: Area) -> String {
     let c: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+    const NAMES: [&str; 8] = ["UC", "WC", "2", "3", "WT", "WP", "WB", "UC-"];
+    let types: Vec<String> = (0..8).filter(|&t| c.memory_types[t] != 0).map(|t| format!("\"{}\":{}", NAMES[t], c.memory_types[t])).collect();
     format!(
-        "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{}}}",
+        "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}}}}",
         c.cr3_loads, c.global_flushes, c.invlpgs, c.revalidated, c.remapped, c.capacity_flushes, c.killed, c.unvalidated,
-        ticks_ns(c.tlb_ticks) / 1000, ticks_ns(c.invlpg_ticks) / 1000, c.page_faults, ticks_ns(c.page_fault_ticks) / 1000, c.scanned
+        ticks_ns(c.tlb_ticks) / 1000, ticks_ns(c.invlpg_ticks) / 1000, c.page_faults, ticks_ns(c.page_fault_ticks) / 1000, c.scanned,
+        types.join(","),
+        c.uncached_steps,
+        c.uncached_resident
     )
 }
 /// Guest RAM was written by the host (only while every vCPU is stopped): each vCPU drops its cached code before it
@@ -927,7 +937,7 @@ fn fetched(area: Area, state: &State, limit: Option<u64>) -> Result<std::result:
     if state.fetch[0] == u64::MAX {
         return match fault {
             Some(fault) => Ok(Err(Stop::FetchFault(fault))),
-            None => Err(format!("code at {rip:#x} is not write-back guest RAM")),
+            None => Err(format!("code at {rip:#x} is not guest RAM")),
         };
     }
     // Bytes of [va, the end of its page), cut at the limit when it lies inside; and whether it did.

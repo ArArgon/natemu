@@ -39,7 +39,10 @@ pub struct Translation {
     pub user: bool,
     pub executable: bool,
     pub dirty: bool,
-    pub wb: bool,
+    /// The leaf's PAT index, 4*PAT + 2*PCD + PWT (SDM Vol.3 5.9.2, Table 14-11 "Selection of PAT Entries"): PAT is bit 7 of a
+    /// PTE and bit 12 of a 2 MiB PDE. Non-leaf PWT/PCD (and CR3's) select the type of the next table's read only; the walker
+    /// reads tables from coherent RAM, so they change nothing here ([`crate::cpu::memory_type`] gives the page's type).
+    pub pat: u8,
     /// The leaf's G bit (a global translation only with CR4.PGE, which the caller knows).
     pub global: bool,
 }
@@ -124,7 +127,7 @@ fn walk_once<T: Tables>(
         address: va,
         error: base_error | extra,
     };
-    let (mut table, mut rw, mut user, mut executable, mut wb) = (c.cr3, true, true, true, true);
+    let (mut table, mut rw, mut user, mut executable) = (c.cr3, true, true, true);
     // Match the selected QEMU ordering: nonleaf A before descent, leaf A/D after permissions.
     for level in (1..=4).rev() {
         let at = table + ((va >> (12 + 9 * (level - 1))) & 511) * 8;
@@ -143,8 +146,6 @@ fn walk_once<T: Tables>(
         rw &= value & 2 != 0;
         user &= value & 4 != 0;
         executable &= value >> 63 == 0;
-        wb &=
-            value & 0x18 == 0 && !(level == 1 && value & 128 != 0) && !(large && value & 4096 != 0);
 
         if level == 1 || large {
             if (c.cpl == 3 && !user)
@@ -165,7 +166,7 @@ fn walk_once<T: Tables>(
                 user,
                 executable,
                 dirty: value & DIRTY != 0 || access == Access::Write,
-                wb,
+                pat: ((if large { value >> 12 } else { value >> 7 } & 1) << 2 | value >> 3 & 3) as u8,
                 global: value & 256 != 0,
             });
         }
@@ -287,6 +288,29 @@ mod tests {
                 error: 17
             })
         );
+    }
+    /// M2: SDM Vol.3 5.9.2 and Table 14-11: the page's PAT index is 4*PAT + 2*PCD + PWT of the entry that maps it (PAT: bit 7 of
+    /// a PTE, bit 12 of a 2 MiB PDE); the PWT/PCD of the entries above select only the type of the next table's read.
+    #[test]
+    fn pat_index_comes_from_the_leaf_alone() {
+        for upper in [0, 0x8, 0x10, 0x18] {
+            for i in 0..8u64 {
+                let (mut m, c) = setup();
+                for at in [0, 512, 1024] {
+                    m.0[at] |= upper;
+                }
+                m.0[1792] |= (i & 3) << 3 | (i >> 2) << 7;
+                let t = walk(&mut m, c, 0x100000, Access::Read).unwrap();
+                assert_eq!((t.gpa, t.pat), (0x5000, i as u8));
+                let (mut m, c) = setup();
+                for at in [0, 512] {
+                    m.0[at] |= upper;
+                }
+                m.0[1024] = 0x200087 | (i & 3) << 3 | (i >> 2) << 12;
+                let t = walk(&mut m, c, 0x101234, Access::Write).unwrap();
+                assert_eq!((t.gpa, t.leaf_bytes, t.pat), (0x301234, 0x200000, i as u8));
+            }
+        }
     }
     #[test]
     fn large_leaf_and_route_are_not_guest_faults() {

@@ -106,10 +106,10 @@
 //!     LEVEL, 4 = PML4E .. 1 = PTE, after setup; mutations apply in order, and the levels above must be present).
 //! Every entry is present and user; leaves of code pages are read-only and executable, the others writable and
 //! (with NXE) not executable; the space's tables follow the NXE of the first vCPU using it.
-//! The resident's walker refuses what it does not model (a refusal is a halt, never a wrong result): any PWT, PCD or PAT
-//! bit (entry bits 3, 4; bit 7 of a PTE; bit 12 of a 2 MiB leaf) makes the page non-write-back (`shadow status=1
-//! detail=7`), although under the default PAT some such pages are write-back on x86; PS in a PML4E/PDPTE is reserved
-//! (no 1 GiB pages); the A bit of a non-leaf entry is set but never compared.
+//! The resident's walker refuses what it does not model (a refusal is a halt, never a wrong result): PS in a PML4E/PDPTE is
+//! reserved (no 1 GiB pages); the A bit of a non-leaf entry is set but never compared. PWT, PCD and PAT bits (entry bits
+//! 3, 4; bit 7 of a PTE; bit 12 of a 2 MiB leaf) select the page's memory type (M2); UC RAM's accesses run their instruction alone
+//! (strong ordering), and the output's `memory_types` counts data shadows by type, `uncached` the UC accesses.
 //! Without `cpu` lines the description is one program on one vCPU (output: one state object). Each `cpu` line starts
 //! the next vCPU's section (vCPUs 0.., output `{"cpus": [...]}`); address-space items before the first `cpu` line
 //! form the shared address space, which a section uses unless it has address-space items of its own (then it gets

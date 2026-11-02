@@ -673,8 +673,8 @@ def either_check(prog, out):
 
 def unsupported_cases():
     """Instructions the resident refuses (`unsupported_system`), each alone at CPL0 after a flag-setting prefix."""
-    cases = {'cr3-pwt': 'mov rax, cr3\nbts rax, 3\nmov cr3, rax',
-             # A DR7 that enables an I/O breakpoint (R/W 10: L0, G3) without CR4.DE, which the SDM leaves undefined (S4).
+    # (CR3 with PWT/PCD left this list in M2: the walker accepts them, tools/run_m2.py.)
+    cases = {# A DR7 that enables an I/O breakpoint (R/W 10: L0, G3) without CR4.DE, which the SDM leaves undefined (S4).
              'dr7-l0': 'mov eax, 0x20401\nmov dr7, rax', 'dr7-g3': 'mov eax, 0x20000480\nmov dr7, rax',
              # IA32_APIC_BASE moved onto guest RAM (a valid value): the resident cannot overlay RAM with the xAPIC page (X3;
              # a move to a device page works, tools/run_x3.py `relocate-device`).
@@ -779,7 +779,9 @@ def profile_program(n):
         cpus.append(dict(programs.cpu(i, code), cpl=0))
         memory.append(programs.zero(res(i), at[0]))
     prog = {'format': 'natemu-smp-v1', 'name': f'profile@{n}', 'ncpu': n, 'system': True, 'bodies': bodies, 'cpus': cpus, 'memory': memory}
-    reset = {**{m: cp._i(P.msr(m)['reset']) for m in readable}, **P.mtrr_state()}
+    # The firmware's MTRRs follow the VM's guest RAM (the driver's `--ram`/NATEMU_RAM, hex; default 2 GiB).
+    ram = int(os.environ.get('NATEMU_RAM', '0x80000000').removeprefix('0x'), 16)
+    reset = {**{m: cp._i(P.msr(m)['reset']) for m in readable}, **P.mtrr_state(ram)}
 
     def judge(datas):
         order = [int.from_bytes(d[o:o + 8], 'little') for d, lay in zip(datas, layouts) for kind, _, o in lay if kind == 'order']

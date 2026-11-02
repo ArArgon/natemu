@@ -71,7 +71,7 @@ composite or a named check.
 | CR0: PE, MP, ET, NE, WP, AM, PG; TS/EM; CD/NW | `CR0_STATE` on every CPU (`K kernel/head_64.S:398-401`); TS/EM cleared (`K kernel/fpu/init.c:32-36`); CD set/cleared with WBINVD around MTRR programming when MTRRs are enabled (`cacheinfo.c:1052-1110`) | Accept MP/NE/AM/TS/EM/CD/NW (today only WP, H §3) with effects: TS → #NM; CD/NW no cache model; AM: #AC needs CPL3 + RFLAGS.AC, which stays a typed refusal (S2a) until X2 builds it | `system_fault_model.py`; QEMU | S2a |
 | CR4 | PSE/PGE (`head_64.S:212-223`), OSFXSR/OSXMMEXCPT (`fpu/init.c:25-30`), OSXSAVE (`kernel/fpu/xstate.c:173-195`), FSGSBASE (`common.c:2283-2292`), SMEP (`common.c:367-368`), pinning (`common.c:407,494-498`) | Valid per CPU 16: DE, TSD, PSE, PAE, PGE, PCE, OSFXSR, OSXMMEXCPT, FSGSBASE, OSXSAVE, SMEP; reserved: VME, PVI, MCE, UMIP, LA57, VMXE, SMXE, PCIDE, SMAP, PKE and the rest (H §3). The fault model's current CR4 profile (`tools/system_fault_model.py:17-18`, lists UMIP, LA57, VMXE, SMXE, PKE, MCE as valid) must be rederived from CPU 16 by an independent author | Same | S1, S2a |
 | CR2, CR8 | #PF handlers read CR2 (`K boot/compressed/ident_map_64.c:363`, `kernel/head64.c:365`); CR8 = TPR | State; CR8 ↔ LAPIC TPR | QEMU | S2a, X3 |
-| Debug registers | `initialize_debug_regs` on every CPU (`K kernel/cpu/common.c:2182-2191`) | DR0–7 as state. **TF, RF and enabled breakpoints stay a typed refusal: this amends CPU 16 ("Debug registers, TF/RF … remain required") and needs the owner (Q4)** | QEMU | S2a |
+| Debug registers | `initialize_debug_regs` on every CPU (`K kernel/cpu/common.c:2182-2191`) | DR0–7 as state (S2a); TF single-step, RF and instruction, data and I/O breakpoints built per the SDM (S4: Arm EL0 watchpoints for translated code, software checks for the resident's own accesses) | SDM-derived logs; QEMU where it follows the SDM | S2a, S4 |
 | Descriptor tables and segments: LGDT/LIDT/LTR/SGDT/SIDT/STR, LLDT, MOV Sreg (64-bit), MOV r←Sreg, LRETQ | Decompressor (`K boot/compressed/head_64.S:303-306,368,374,443`), kernel head (`K kernel/head_64.S:71-77,338-353`), trampoline (above), `load_mm_ldt` (`common.c:2362`; its LLDT form to be confirmed); LTR runs with the writable direct GDT (`common.c:719-726,2278`); later loads use the read-only fixmap GDT (`common.c:730-737`, `mm/cpu_entry_area.c:178-199`) | Descriptor fetch through the guest walk; the SDM accessed-bit and TSS busy-bit writes are real writes (through `CodeWrites`, s3g-plan §3): a clear A bit in a read-only GDT page faults as on hardware, so S2b verifies the kernel's descriptors carry A set; flat 64-bit only (D1) | `system_fault_model.py` + `modes_model.py`; QEMU | S2b |
 | SWAPGS, SYSCALL/SYSRET, RDGSBASE/WRGSBASE | `entry_SYSCALL_64` (`K entry/entry_64.S:87-166`); paranoid WRGSBASE (`entry_64.S:989,1428`) | Transactions; SYSRET canonical-RCX rule; FS/GS bases in the FEX frame (I7) | QEMU CPL0↔3 | S3 |
 | RDTSC/RDTSCP, TSC_AUX | KASLR entropy in the decompressor uses RDTSC (`K lib/kaslr.c:73-80`); TSC clocksource (`tsc.c:694-695`) | `base(V) + offset` per vCPU at 1 GHz (M29, M61, CPU 13); TSC_AUX | Model (monotonic, exact rate) | S3, L5 |
@@ -101,7 +101,7 @@ The census C0 (§3) lists the forms the real binaries contain; rows below are th
 | Feature | Use | General path must | Check | Chunk |
 | --- | --- | --- | --- | --- |
 | Guest RAM and layout | **Decided:** M69 map, default L = 2 GiB (configurable 1–3 GiB), H = 0; tests choose their own size | Built (M1): guest RAM a run-time size R (2 MiB multiples to 3 GiB, default 2 GiB), per-page structures sized for 3 GiB and scanned by use, [R, 4 GiB) non-RAM, shadow pool 288 pages, resets counted; the legacy hole non-RAM since L3 (the unassigned rule) | Standing suite at 4 MiB and 2 GiB; programs above 16 MiB and at holes | M1 |
-| Memory types: PAT, PWT/PCD, MTRR | Linux PAT = WB, WC, UC-, UC, WB, WP, UC-, WT (`K mm/pat/memtype.c:344`, written `:234`); LAPIC/IOAPIC mapped UC | Walker evaluates PAT/PWT/PCD (and MTRR if advertised) instead of halting (`shadow status=1 detail=7`, slice-3 S3a2); RAM of any type runs as coherent WB (declared deviation); device pages take M3 | Paging cells with PAT bits (`coherence_model.py` profile updated); QEMU | M2 |
+| Memory types: PAT, PWT/PCD, MTRR | Linux PAT = WB, WC, UC-, UC, WB, WP, UC-, WT (`K mm/pat/memtype.c:344`, written `:234`); LAPIC/IOAPIC mapped UC | Walker evaluates PAT/PWT/PCD (and MTRR if advertised) instead of halting (`shadow status=1 detail=7`, slice-3 S3a2); WB/WT/WP/WC RAM runs natively, UC RAM keeps strong ordering (owner decision, November 2: each access runs its instruction alone between full barriers); device pages take M3 | Paging cells with PAT bits (`coherence_model.py` profile updated); QEMU | M2 |
 | MMIO from translated code | xAPIC, IOAPIC | Device ranges never shadowed; an abort at a load/store site completes once through the device owner from the site's completion record (fexc's decode of the translated instruction: width, direction, register and merge, length), then resumes after the instruction; every other form (string, vector, RMW, atomic) → typed stop | QEMU programs on device pages; #PF-before-device priority | M3 |
 | 1 GiB pages | Only with GBPAGES | Not advertised (CPU 16); PS in a PDPTE → #PF(RSVD) (contract 10) | Existing cells | — |
 
@@ -473,7 +473,7 @@ XGETBV/XSETBV #UD without OSXSAVE, XSAVE family #NM with TS; FXSAVE/FXRSTOR #NM 
 OSFXSR #UD; VEX/AVX ignore EM, #UD unless OSXSAVE and XCR0[2:1] = 11b, #NM with TS; PAUSE, PREFETCHh, SFENCE/LFENCE/MFENCE,
 MOVNTI and CLFLUSH are not gated by EM, TS or OSFXSR) and rely on the flush at each CR0/CR4 change, or add the bits to `Cpu::code_context` if
 a later chunk keeps blocks across control changes; NE = 0 (x87 errors through FERR#/IRQ 13) is I6's to refuse. **CD/NW**
-— recorded with no memory-type effect (RAM is write-back; M2 owns memory types). Not built: CLTS (`0f 06`, no use in the
+— recorded with no memory-type effect (M2 owns memory types; since M2: Table 14-5's CD stops cache fills, not the types or orderings). Not built: CLTS (`0f 06`, no use in the
 census; the host still declines its decode), LMSW/SMSW. Checks: `run_slice3_vm.py system` 0 failures, 0 GAPs: new QEMU
 programs `sys-cr0-bits`, `sys-cr4-bits`, `sys-cr2-cr8`, `sys-debug-regs` and `sys-head-cr0` (the kernel head's EFER/CR0
 set-up, `K kernel/head_64.S:375-401`; its `pushq $0; popfq` is X2's) at 1/2/4 vCPUs and block sizes default and 1; 17 new
@@ -838,8 +838,8 @@ refills the pool first; it becomes reachable with a resident decode cache (L5) o
 retry loop handles it. **WBINVD/INVD/WBNOINVD** (#GP(0) at CPL > 0; WBNOINVD is not advertised and runs as WBINVD, as on
 processors that ignore its F3) change nothing: RAM is coherent write-back with no cache model, so INVD's discard is WBINVD
 (no worse: no data is lost). **CLFLUSH** has a byte load's faults at the CPL (#GP(0)/#SS(0) non-canonical, #PF with a read
-error code; the walk sets A) and no other effect; on a page that is not write-back RAM (e.g. a UC device mapping) it stops
-`unsupported_system` today, as every resident operand access does (M2/M3 own memory types and device pages). **#UD** for forms the profile does not advertise or that need VMX/SVM/
+error code; the walk sets A) and no other effect; on a page that is not write-back RAM (e.g. a UC device mapping) it stopped
+`unsupported_system`, as every resident operand access did (since M2 RAM of any type is accessed and a device page has nothing to flush). **#UD** for forms the profile does not advertise or that need VMX/SVM/
 SGX/TDX operation: RDSEED, RDPID, CLFLUSHOPT, CLAC/STAC, MONITOR/MWAIT(X), SERIALIZE, RDPKRU/WRPKRU, ENCLS/ENCLU, VMCALL and
 the VMX group, VMMCALL and the SVM group, TDCALL, the RMP group, CLZERO, RDPRU, XTEST, LKGS, VMREAD/VMWRITE, INVEPT/INVVPID/
 INVPCID, ENCLV, PCONFIG, WRMSRNS, XSUSLDTRK/XRESLDTRK, and 0f ae register forms without F3. IRET-to-self and CPUID were already draining entries (every system
@@ -955,7 +955,7 @@ guest-physical page that is not guest RAM is a device page; the host owns a regi
 hole: the resident already walks at every shadow miss, so `translate` returning a non-RAM gpa unshadowed makes every access
 abort at its recorded site in the resident, where the site gives the precise state; a stage-2 hole would exit to the host
 from inside the block with no site, banked state or walk (the walk's #PF must come first). Memory type does not matter for a
-device page (device ranges are UC; RAM with a non-WB type still stops, M2's). **Fault priority:** at the abort the walk of
+device page (device ranges are UC; RAM with a non-WB type stopped until M2, which runs it natively, and UC RAM one instruction at a time since M2 addendum 2). **Fault priority:** at the abort the walk of
 every page touched has run, so canonical #GP/#SS, #AC (SCTLR.A, X2) and every #PF the tables owe (not present, U/S, R/W with
 WP, reserved bits, upper levels, the second page of a crossing access) come before any device effect; the walk's A/D updates
 stay when the access is then refused (as on x86). **Completion from the site** (`execution/mmio.rs`): fexc records, from
@@ -2176,8 +2176,8 @@ only after a revalidating lookup). The linker links only to a target `find` just
 | Guest, peer or walker write to a page with translations | as before | the page's blocks killed (reverse map) |
 | Pool full; the host's `FLUSH` (guest RAM written while stopped: only at load) | as before | **the only full flushes left** |
 
-Translations do not depend on MTRRs or PAT (RAM runs write-back; the walker's write-back check is redone at
-revalidation). PCID is not advertised. Each vCPU's epochs, L1, links and blocks are its own: a CR3 load on one never
+Translations do not depend on MTRRs or PAT (until M2 the walker's write-back check was redone at revalidation; since M2 a
+fetch walk accepts RAM of any type, and UC data is reached through the step block, M2 addendum 2). PCID is not advertised. Each vCPU's epochs, L1, links and blocks are its own: a CR3 load on one never
 touches another. **Reverse map:** a per-page head array (`PAGE_BLOCKS`, u32 per guest page, cleared at reset through the
 code summary; `file()` sets the summary bit too) chained through each block's `next[2]`, so a written page finds its
 blocks without scanning; kills take the block out of L2 (backward-shift deletion: with the larger pools dead copies
@@ -2928,6 +2928,187 @@ covers what it protected; kept as the SDM's state). Boot without initrd at N = 1
 f8f3fa2 12.50, 12.54 and 12.62 s wall, root-fs panic at 1.31-1.38 s guest; S4 (final build) 12.69 and 12.76 s, 1.41 and
 1.42 s. The standing suite on f8f3fa2 + S4 is green (i8b's 7 known QEMU NaN departures; one L4b run lost QEMU's S5
 power-off, green on rerun).
+
+*Built (M2, memory types: PAT, PWT/PCD, MTRRs; no fexc change, series36):* **Walker.** `paging::Translation` carries the
+leaf's PAT index, 4*PAT + 2*PCD + PWT of the entry that maps the page (SDM Vol.3 5.9.2, Table 14-11; PAT is bit 7 of a PTE
+and bit 12 of a 2 MiB PDE), in place of the old `wb` flag. The PWT/PCD of the PML4E, PDPTE and non-leaf PDE, and CR3's,
+select only the type of the next table's read (5.9.2); the walker reads tables from coherent guest RAM, so they change
+nothing, and MOV to CR3 and `Cpu::control` now keep PWT/PCD (`CR3_IGNORED` = 0xfff; bits 63:40 stay #GP). **Type.**
+`cpu::memory_type` (abi, pure) combines the PAT entry the index selects with the MTRRs' type of the guest-physical page:
+`mtrr_type` follows "MTRR Precedences" (14.11.4.1: E clear is UC for everything; below 1 MiB with FE the fixed field of
+Table 14-9; else the matching variable ranges, `gpa & PhysMask == PhysBase & PhysMask` with V: one type, identical types,
+UC among them UC, WT with WB WT; none matching the default type) and `effective_type` is Table 14-7 transcribed (UC- only
+from the PAT; it never results). The overlaps the SDM leaves undefined (WC or WP with WB, WC with WT, ...) and a large page
+over several MTRR types (14.11.9) are not halts: the type is computed per 4 KiB page, and an undefined overlap is taken as
+UC. CR0.CD changes no type (Table 14-5: no-fill mode keeps the types and orderings). **Behaviour.** Guest RAM of every type
+ran as coherent write-back (since addendum 2, below, UC RAM's accesses run their instruction alone): data shadows, the fetch walk (code may run from UC memory, 14.3.3) and the resident's operand
+accesses (`segments::pages`, CLFLUSH) take RAM whatever its type; a device page goes to M3's path whatever its type and is
+never shadowed. The halts this removes: `translate`'s `shadow status=1 detail=7` for a non-WB RAM page, the fetch walk's
+`NOT_RAM` for one (the host's "not write-back guest RAM"), `segments::pages`' `unsupported_system`, and MOV CR3's
+`unsupported_system` for PWT/PCD. The `stop::SHADOW` halts left are internal invariants, none a memory type: a corrupt
+shadow table at INVLPG, a split store's RAM page missing after its walk, and shadow-table capacity or a private target after
+a full eviction. WRMSR's #GP rules for IA32_PAT (each entry 0, 1, 4-7; Table 14-10) and the MTRRs (types 0, 1, 4-6, the
+reserved bits of DEF_TYPE, PHYSBASE and PHYSMASK, MTRRCAP read-only; Table 14-8, 14.11.2) are S1's, now also checked byte by
+byte and bit by bit in the abi tests. **Recorded:** the resident counts data shadows of RAM by effective type
+(`cache::Control::memory_types`, in the control record, not the copied state; reported as `stats.k1.memory_types`, by
+`run-program` and `boot-linux`), so a run shows when RAM with another x86 type was used. **Invalidation:** shadows and
+translations depend on no type, so a PAT write flushes nothing (14.12.4 leaves the TLB flush to software); an MTRR write keeps
+its global flush (CPU 9; allowed by 5.10.4.1, "the processor is always free to invalidate additional entries"). A shadow
+filled before a PAT or MTRR change keeps its count, as a TLB may keep an entry's type (5.9.3). **What is observable on a
+coherent machine, and the deviation.** WT, WP and WB RAM differ only in caching: their orderings are the same ("speculative
+processor ordering", Table 14-2) and a write reaches memory in all three, so running them as WB is exact; WC is weakly
+ordered (14.3.1, 11.2.5), so TSO is one of its permitted behaviours (combining and delaying writes is allowed, not
+required); MOVNT* stores likewise. UC and UC- force strong ordering (11.2.5: "out-of-order or speculative accesses are not
+performed"): a store-buffering pattern between two vCPUs on UC RAM may show both loads old under natemu's TSO, which x86
+forbids there. That was the declared deviation (the plan's decision: RAM of any type is coherent write-back; Apple silicon
+is coherent and HVF's stage 2 maps RAM Normal write-back), withdrawn by the owner on November 2 (addendum 2, below). UC's other properties hold:
+device pages are never accessed speculatively (each access completes once from its site, M3), and x87/SIMD accesses to UC
+memory "may occur more than once" only matters for devices, whose such forms M3 refuses. Aliasing one page with different
+types is unsupported by Intel (14.12.4); natemu stays coherent. **Kernel** (Debian 6.12.107, 2 GiB, `console=ttyS0
+earlyprintk=serial mitigations=off nokaslr`, no initrd, N = 1, warm compile cache, on fc60f51): HEAD (three runs) and M2 (two) both reach
+the root-fs panic (guest 1.23-1.34 s HEAD, 1.20-1.27 s M2; "x86/PAT: Configuration [0-7]: WB WC UC- UC WB WP UC- WT");
+M2's counts: 508,373 WB and 23 UC data shadows, the UC ones from the window where Linux's `cache_disable` clears
+MTRRdefType.E around its PAT set-up (`K kernel/cpu/cacheinfo.c:1089`, `kernel/cpu/mtrr/generic.c:953`: all memory UC
+while E = 0). **Checks:** abi tests (Table 14-7 row by row; the precedences, every fixed field, FE clear, overlaps, a
+discontinuous mask, the default and E clear; every PAT/MTRR type byte and reserved bit at WRMSR; the walker's PAT index at
+4 KiB and 2 MiB leaves under every upper-level PWT/PCD pattern); `tools/run_m2.py`: `types` 25 cases (counts against the
+runner's own transcription of the SDM rules), `devices` 32 (a device page with each PAT index under the firmware's UC, a
+WC or WB range and MTRRs off: one read and one write each, no shadow counted), `qemu` 8 (`pat` and `mtrr` at 1 and 2 CPUs,
+block sizes default and 1, against pinned QEMU, which ignores memory types and so judges only that every type behaves as
+RAM; it cannot judge the types themselves or UC ordering); `run_slice1_faults.py` paging cells now carry a rotation of PAT
+indices 0-7 and upper-level PWT/PCD patterns (7,912 cases, all match, at block sizes default and 1). Negative controls on HEAD (fc60f51 binaries):
+`types` 25 of 25 red (`shadow status=1 detail=7`, the host's "not write-back guest RAM", or no counts), `qemu` 8 of 8 red
+(`pat` halts detail=7; `mtrr` ran, since HEAD ignored MTRRs, and is red only for its counts), the faults runner's
+`paging-store` cells 12 of 129 red (detail=7; the others fault before the access or drew index 0 with no upper bits);
+`devices` passes on HEAD too (M3 already sent device pages to their device whatever the bits). **For the independent
+author of `tools/models/coherence_model.py`:** replace `Route.wb` (any PWT/PCD/PAT bit = not write-back) by the leaf's PAT
+index (PAT bit 7 of a PTE, 12 of a 2 MiB leaf; non-leaf and CR3 PWT/PCD ignored for the page) and the effective type from
+IA32_PAT and the MTRRs (Table 14-7, 14.11.4.1), with the firmware MTRR state of `cpu_profile.json` and the reset PAT
+0x0007040600070406; no route is refused for its type; and the profile notes there (CR3 PWT/PCD accepted). **Not built /
+for the owner:** the firmware MTRR state was fixed for L = 2 GiB, so at `--ram` 3 GiB RAM in [2 GiB, R) was UC by the
+MTRRs; since addendum 1 (below) it follows R. UC RAM's strong ordering: addendum 2 (below). `run_slice3_vm.py system` loses its
+`cr3-pwt` refusal case (built now). The standing suite on 9110c6f + M2 (fexc series36) is green but for i8b's 7 known
+QEMU NaN departures at both block sizes and `test_check_setup` in the scratch copy (its raw-root default resolved through
+the copy's symlink to `natemu-raw`, an artefact of the copy). Raw evidence: `natemu-raw/m2-20261030-01/` (the boots,
+the HEAD negative-control logs).
+
+*Built (M2 addendum 1, the firmware's MTRRs follow guest RAM; no fexc change):* the virtual firmware programs the MTRRs
+for the RAM it reports. `cpu::firmware_mtrrs(msrs, R)` (abi) writes IA32_MTRR_DEF_TYPE and the eight variable pairs for
+guest RAM [0, R) over the reset state, and the host's `set_cpu` applies it for the VM's R (`Control::ram_bytes`, set at
+prepare) on every vCPU, BSP and APs alike. Rule (`cpu_profile.py` `mtrr_state(ram_limit)`, the same in Rust): default type
+WB and [R, 4 GiB) as UC power-of-two pairs; when that needs more than IA32_MTRRCAP.VCNT = 8 pairs (an R with many low bits,
+e.g. 1 GiB + 2 MiB), the same map with default type UC and [0, R) as WB pairs, the fewer of R's power-of-two blocks or one
+block to the next power of two with [R, it) carved out by UC pairs (UC wins an overlap, SDM Vol.3 14.11.4.1). The fixed
+ranges do not depend on R (0-0x9ffff WB, 0xa0000-0xfffff UC). At R = 2 GiB the state is the profile's former one
+(`MTRR_INITIAL`); 1 GiB is two UC pairs ([1, 2) and [2, 4) GiB), 3 GiB one ([3, 4) GiB). Every RAM page is then WB by the
+MTRRs and every other address below 4 GiB UC (the legacy hole, [R, 4 GiB) with the I/O APIC and the local APIC).
+**Lockstep:** `gen_cpu_profile_rs.py` emits `vectors::MTRR_FOR_RAM` (nine sizes, 2 MiB to 3 GiB, both encodings) from
+`mtrr_state`, the abi test compares `firmware_mtrrs` with them and the stale check covers the file; the abi test also runs
+every 2 MiB multiple to 3 GiB (1,536 sizes: each page below 1 MiB and the first and last page of each 2 MiB block above
+it WB below R, UC from R) and `test_cpu_profile.py` the same over the model (pairs within VCNT, WRMSR accepts the
+state). `run_slice3_vm.py`'s `profile` reset values and `run_m2.py`'s firmware state follow `NATEMU_RAM`. **Checks:**
+`run_m2.py firmware` (4 cases: R = 4 MiB, 1, 2 and 3 GiB, tables in RAM's last MiB): RDMSR of DEF_TYPE, the 16 variable
+and the 11 fixed MSRs equal `mtrr_state(R)`, by which every page below 0xa0000, every 2 MiB block of [1 MiB, R) is WB
+and the hole and [R, 4 GiB) UC, and the one store is one WB shadow; 4 of 4 pass, and on the M2 binaries 3 of 4 fail
+(the 2 GiB one is the old state). `types`, `devices`: 57 pass. **Kernel** (Debian 6.12.107, `--ram 3 GiB`, the M2
+command line, no initrd, N = 1): "MTRR map: 3 entries (2 fixed + 1 variable; max 18), built from 8 variable MTRRs", no
+trimming or "BIOS bug" line, "Memory: 3024776K/3129980K available" (all of e820's usable RAM), data shadows WB 514,878 and
+UC 23 (the `cache_disable` window); on the M2 binaries the same boot counts 97,866 UC shadows ([2 GiB, R) UC by the
+MTRRs; Linux does not trim it, its default type being WB). Both reach the root-fs panic (3.11 and 3.04 s guest; the run then
+ends at the default 60 s watchdog: 64.9 and 64.6 s wall). Raw evidence: `natemu-raw/m2-20261102-01/` (`addendum-*`, `boot-*-3g`).
+
+*Built (M2 addendum 2, uncached RAM keeps x86 strong ordering; owner decision, November 2; no fexc change):* **Rule.**
+UC (and UC-, which Table 14-7 makes UC under a WB MTRR) is "Strong Ordering" (SDM Vol.3 Table 14-2): "all reads and
+writes appear on the system bus and are executed in program order without reordering. No speculative memory accesses"
+(14.3), "out-of-order or speculative accesses are not performed" (11.2.5). WT, WP and WB have "Speculative Processor
+Ordering" (Table 14-2), x86's ordinary model, which hardware TSO gives; their differences are caching only, invisible on a
+coherent machine. WC is "Weak Ordering" (Table 14-2, 14.3.1: writes may be delayed and combined), so every TSO outcome is
+one WC allows; MOVNT* likewise. Those four stay native. **Mechanism** (`runtime/src/execution.rs` `translate`,
+`access_aborted`, `uncached_end`, `split`; `segments::pages`): generated code never reaches UC RAM through a shadow a block
+keeps running with. A data walk that finds UC RAM shadows it only for the step block (the one-instruction block in the slot,
+every exit of which enters the resident); for any other block the page is walked (#GP/#SS, #AC, every #PF, A/D, the
+code-write protocol: all as for any access, before anything else) but not shadowed, and the instruction is run alone from
+its start (`step_from`, the state at the instruction). In the step block the page is shadowed and recorded
+(`Control::uncached`), `dmb ish` makes every earlier access globally visible, and the access is retried; the one
+instruction completes (or faults); the resident is entered at its exit, and `enter` (the one way generated code starts
+again from the resident; a retry continues the same instruction) makes a second `dmb ish` and removes the pages so
+shadowed (both CPL spaces; more than four in one instruction: every shadow). So each UC access is ordered after every
+earlier and before every later access of its vCPU, both ways and with WB accesses too (stronger than 11.2.5 needs, which
+x86 permits); none is made speculatively by translated code running ahead. Every form runs as it does on WB, in the step
+block: loads, stores, RMW, LOCK forms (LSE atomics), XCHG, CMPXCHG8B/16B, strings (one element per pass, each its own
+step), push/pop/call/ret on a UC stack, SSE/AVX/x87 accesses, accesses straddling WB|UC or UC|WB; data breakpoints are the
+step block's Arm watchpoints as before. The resident's own accesses to UC RAM (`segments::pages`: system-instruction
+operands, event frames, INS, XSAVE/FXSAVE images, x87 m80; CLFLUSH's walk) and its page-crossing stores (`split`) are made
+after a `dmb ish` and before the closing one. Instruction fetch is unchanged: code on UC RAM is translated and runs (14.3.3;
+the code-write protocol keeps it current). Device pages are unchanged (M3). Linux's `cache_disable` window (MTRRdefType.E
+clear: all RAM UC, the stack and the code's data included) is just many such accesses. Counters: `stats.k1.memory_types`
+counts a UC shadow per access, `stats.k1.uncached` the instructions run alone (`steps`) and the resident's own UC accesses
+(`resident`). **Checks** (`tools/run_m2.py`, fexc series36): `qemu` 12 (`pat`, `mtrr` (E clear included), and the new
+`uc` forms program at 1 and 2 CPUs, block sizes default and 1, against pinned QEMU, each CPU with UC accesses run alone:
+the `uc` program 115 per CPU and 7 by the resident), `faults` 27 (every case with the data page UC and WB: identical
+outcome, the expected #PF/#AC/#DB or completion), `litmus` 6 (store buffering, K = 10,000, two runs: on UC pages at 2, 3
+and 4 vCPUs no every-load-old outcome in 20,000 iterations each, on WB pages at 2 vCPUs 406 of 20,000), `types`,
+`devices`, `firmware` 61 (unchanged): 108 cases, 0 failures. **Negative controls** (the addendum-1 binaries, without this
+change): `litmus` UC red at 2, 3 and 4 vCPUs with 418, 11 and 0 every-load-old outcomes (all three red for no instruction
+run alone); `qemu` 12 of 12 red (values equal, nothing run alone); `faults` the 6 completing cases red, the 21 faulting
+ones green (faults were already right). **Cost** (`run_m2.py cost`, CPL 0, 20,000 iterations): about 4.8 us per MOV load,
+4.7 us per MOV store, 4.3 us per LOCK ADD on UC RAM against 7-11 ns per WB iteration; each UC access is one abort, one
+host step request (the host answers repeated steps from its in-run compile memo) and one resident entry. **Kernel**
+(Debian 6.12.107, 2 GiB, the M2 command line, no initrd, `--watchdog-ms 10000`, a private warm compile cache, release
+host, two runs each): N = 1 before 1.176 and 1.172 s guest (12.24 and 12.24 s wall), after 1.199 and 1.191 s (12.31 and
+12.25 s); N = 2 before 1.386 and 1.375 s (12.13 and 12.12 s), after 1.362 and 1.342 s (12.10 and 12.09 s): within run-to-run
+noise. The BSP runs 533 instructions alone (`cache_disable`'s window; about 2.6 ms at the measured cost); UC data shadows 563
+against 23 before (now one per access). With the shared compile cache at its 512 MiB cap (other runs' entries) the same
+boots take 3.0-4.0 s guest before and after alike; at 3 GiB (addendum 1) the BSP also runs 533 alone. **Review** (independent):
+no blocking defect; applied: the resident's own guest accesses (`segments::pages`) also make the closing barrier while a UC
+access is pending (it came only at `enter`, after `find`'s event delivery and kept system instructions, covered until then
+only by `cache::drain`'s acquire-release swap), a page is recorded once per instruction, comments. Not changed: an unmapped
+UC shadow keeps the writable bit until the next reset (conservative), and the cost (one host step request per access; a
+resident-kept step block would remove it, the performance rule defers it). Raw evidence: `natemu-raw/m2-20261102-01/`
+(`uc-*`, `boot-*`).
+
+*M2 integration (November 2, after the second independent review: no blocking defect, one should-fix):* **What orders UC
+accesses today.** The review found that `litmus` cannot see the two barriers: with both `dmb ish` (the retry in
+`access_aborted`, `uncached_end` at `enter`) made `nop` it stays green. A mixed store-buffering case was added
+(`litmus-sb@2-mixed`, x0 UC and x1 WB: vCPU 0 stores UC x0 then loads WB x1, with no host exit between the step block and
+the load; vCPU 1 stores WB x1 then loads UC x0). Both old is forbidden because UC reads and writes "are executed in program
+order without reordering" (SDM Vol.3 14.3, Table 14-2 "Strong Ordering"; 11.2.5: "out-of-order or speculative accesses
+are not performed"), while 11.2.2's reads passing older writes is stated for WB regions. With the barriers it is green:
+20,000 iterations, 0 both old (3 / 9,227 / 10,770 of the other three outcomes; WB control at 2 vCPUs 434 both old). It
+cannot tell the barriers apart either. Without the two barriers it is green (0 both old in 20,000), and also when
+`cache::drain`'s swap is skipped as well for an empty record (0 in 20,000; that build with the barriers: 0). The reason
+is how a UC access is reached: always through an abort into the resident, whose `aborted` and `find` drain with a
+`swpal` (an acquire-release swap, a full barrier), and outside the step block through a host step request (a VM exit). So
+the other vCPU's access to a UC location comes microseconds after its own previous access, and a store does not stay
+buffered that long. No arrangement makes the barriers observable today. UC ordering also rests on the host exit, the
+resident entry's swap and that latency. The barriers are what the Arm architecture guarantees it by, and they become
+load-bearing if step blocks are kept in the resident or the drain's swap becomes conditional; a litmus can show it only
+once a UC access costs less than a store's time in the buffer. **Within one instruction.** An instruction with several
+accesses on UC (ENTER with a nonzero level, PUSH/POP m, MOVS, CMPXCHG16B, the vector and x87 forms) runs inside one step
+under TSO, with no barrier between its own accesses. This is acceptable: the SDM gives no order among an instruction's
+constituent accesses (Vol.3 11.2.3.1: "there are no guarantees regarding the relative order in which the constituent
+memory accesses are made"). **Large pages.** A 2 MiB page that spans several MTRR types is undefined (Vol.3 14.11.9: "the
+processor can behave in an undefined manner if a large page is mapped to a region of memory that MTRRs have mapped with
+multiple memory types"). natemu types each 4 KiB of such a page on its own, which 14.11.9 also names as the way to avoid
+the problem ("multiple 4-KByte pages each with its own memory type"). **Added checks:** `types` `pat-to-uc-cr3` and
+`pat-to-uc-invlpg`: a page shadowed WB (PAT index 4), a PAT write making entry 4 UC, a CR3 reload or INVLPG, then a store.
+Each must give one WB and one UC shadow and one instruction run alone. `pat-to-uc-no-flush` has no flush, so the WB shadow
+is kept (5.9.3). The independently written `tools/models/coherence_model.py` now types routes (`route_type`, Table 14-7
+and 14.11.4.1). An earlier sweep of 20,000 random PAT/MTRR states agreed with `cpu::memory_type` on 159,548 defined cases,
+with 0 disagreements; all 452 cases the SDM leaves undefined are UC in natemu and undefined in the model. **Checks on
+94ed0ca + M2** (fexc series36): cargo build and tests, the resident stack check, the Python unit tests; `run_m2.py`
+112 cases, 0 failures; `run_slice1_faults.py` 7,912 match at block sizes default and 1; `run_slice3_vm.py` `system`,
+`smp`, `litmus`, `sharedpt`, `coherence` 0 failures; `run_s4.py` and `run_k1.py` green. Debian 6.12.107 (2 GiB, the M2
+command line, no initrd, shared compile cache, release host) reaches the root-fs panic at N = 1 (3.05 s guest, 14.6 s
+wall) and N = 2 (2.23 s, 13.2 s), with UC 563 data shadows and 533 instructions run alone. Raw evidence:
+`natemu-raw/m2-20261102-02/` (`litmus-A..D.json`: as built, the barriers removed, the drain's swap also skipped, the
+swap alone skipped).
+
+**Owner decision (November 2): uncached RAM keeps x86 strong ordering.** The earlier declared deviation (RAM of every
+type runs as coherent write-back, UC's strong ordering not kept; Built (M2)) is withdrawn. Pages whose effective type is UC
+or UC- are not accessed natively by translated code running on: every access traps and is made in the resident's control
+with the barriers strong ordering requires (SDM Vol.3 11.2.5, 14.3), with permission, #PF, CPL and data-breakpoint checks
+unchanged; WC, WT, WP and WB stay native. Built: M2 addendum 2.
 
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 

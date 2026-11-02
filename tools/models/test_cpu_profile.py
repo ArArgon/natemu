@@ -247,6 +247,22 @@ class Consistency(unittest.TestCase):
             for k, v in st.items(): self.assertTrue(P.msr_write_ok(k, v), hex(k))
         self.assertEqual(cp.uc_pairs(1 << 30, 1 << 32), [(1 << 30, 1 << 30), (2 << 30, 2 << 30)])
 
+    def test_mtrr_initial_follows_every_ram_size(self):
+        """M2 addendum: for guest RAM of every 2 MiB multiple to 3 GiB (M1) the state fits IA32_MTRRCAP.VCNT pairs, WRMSR
+        accepts it, RAM is WB and the rest below 4 GiB UC (every 2 MiB block at 1, 2 and 3 GiB; the edges at the others)."""
+        WB, UC, MiB = 6, 0, 1 << 20
+        for L in range(2 * MiB, (3 << 30) + 1, 2 * MiB):
+            st = P.mtrr_state(L)
+            self.assertLessEqual(len([k for k in st if 0x200 <= k < 0x210 and k % 2 == 0]), 8, hex(L))
+            for k, v in st.items(): self.assertTrue(P.msr_write_ok(k, v), (hex(L), hex(k)))
+            full = L in (1 << 30, 2 << 30, 3 << 30)
+            blocks = range(0, 1 << 32, 2 * MiB) if full else {0, L - 2 * MiB, L, (L + (1 << 32)) // 2 & ~(2 * MiB - 1), (1 << 32) - 2 * MiB}
+            for a in blocks:
+                for x in {max(a, MiB), a + 2 * MiB - 0x1000}:
+                    self.assertEqual(P.memory_type(st, x), WB if x < L else UC, (hex(L), hex(x)))
+            for a in (0x1000, 0x9f000, 0xa0000, 0xff000, 0xfec00000, 0xfee00000):
+                self.assertEqual(P.memory_type(st, a), WB if a < 0xa0000 else UC, (hex(L), hex(a)))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -415,12 +415,14 @@ def family_locations(test, variant):
     """Location -> offset from SYNC: `aligned` 32-bit words on lines of their own; `unaligned` 5 bytes in (inside one
     16-byte block); `split` each plain location crossing a page boundary of its own (exchanged locations stay aligned: a
     split XCHG is not supported), its changing byte (byte 0) on the first page; `split-hi` the same placement with the
-    changing byte on the second page (byte 3: see `family_shifts`)."""
+    changing byte on the second page (byte 3: see `family_shifts`); `page` (M2, not in VARIANTS) each location at the start
+    of a page of its own, SYNC's page j + 1 (a test may give those pages another memory type)."""
     xchg = {op[2] for prog in test.programs for op in prog if op[0] in ('xchg', 'rmw')}    # (I3: and LOCKed RMWs)
     wide = test.name.startswith('sb-cmpxchg16b')          # CMPXCHG16B's operand stays 16-byte aligned (else #GP)
     out = {}
     for j, (a, _) in enumerate(test.initial):
-        if variant.startswith('split') and a not in xchg: out[a] = 0x1000 * (j + 1) - 2
+        if variant == 'page': out[a] = 0x1000 * (j + 1)
+        elif variant.startswith('split') and a not in xchg: out[a] = 0x1000 * (j + 1) - 2
         else: out[a] = 0x400 + 0x80 * j + (5 if variant == 'unaligned' and not (wide and a in xchg) else 0)
     return out
 

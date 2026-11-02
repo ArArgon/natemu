@@ -306,6 +306,20 @@ pub mod cache {
         pub code_breaks: u64,
         pub watch_hits: u64,
         pub watchpoints: u64,
+        /// M2: data shadows of guest RAM installed, by the page's effective memory type (index: the encoding,
+        /// [`crate::cpu::memory_type`]). A UC page is shadowed only while the instruction accessing it runs alone (owner
+        /// decision, November 2: uncached RAM keeps x86 strong ordering), so its count is one per such access and page (and per re-install, e.g. an upgrade to writable).
+        pub memory_types: [u64; 8],
+        /// M2 (UC): the linear pages of UC RAM shadowed for the instruction running alone (`uncached_count` of them; more
+        /// than fit: every shadow goes when it ends), removed at the next boundary after a full barrier; `uncached_fence`:
+        /// the resident accessed UC RAM itself since the last boundary (that barrier is owed too).
+        pub uncached: [u64; 4],
+        pub uncached_count: u64,
+        pub uncached_fence: u64,
+        /// M2 (UC): instructions run alone for an access to UC RAM, and the resident's own accesses to UC RAM (operands of
+        /// system instructions, event frames, split stores).
+        pub uncached_steps: u64,
+        pub uncached_resident: u64,
     }
     /// A block placed in the cache: its record in the metadata arena (at the offset `INDEX` lists), its access sites
     /// ([`crate::code_object::Site`]) right after it.
@@ -820,8 +834,9 @@ pub fn data_hits(dr: &[u64; 6], va: u64, width: u64, write: bool) -> u64 {
 }
 /// [`Cpu::dr`] at reset (SDM Vol.3 Table 10-1: DR0..DR3 0, DR6 FFFF0FF0H, DR7 400H).
 pub const DR_RESET: [u64; 6] = [0, 0, 0, 0, DR6_FIXED, DR7_FIXED];
-/// CR3 bits a 4-level walk ignores without PCIDE (kept in CR3): 2:0 and 11:5. PWT/PCD (4:3) are not ignored.
-pub const CR3_IGNORED: u64 = 0xfe7;
+/// CR3 bits that do not change a 4-level walk without PCIDE (kept in CR3): 2:0 and 11:5 are ignored; PWT/PCD (4:3)
+/// select the PAT entry for the PML4 table's read (SDM Vol.3 5.9.2), which reads coherent guest RAM like every table (M2).
+pub const CR3_IGNORED: u64 = 0xfff;
 pub const EFER_SCE: u64 = 1;
 pub const EFER_LME: u64 = 1 << 8;
 pub const EFER_LMA: u64 = 1 << 10;
@@ -830,8 +845,7 @@ pub const EFER_NXE: u64 = 1 << 11;
 impl Cpu {
     /// Walk controls for 4-level long-mode paging; `None` for any other mode
     /// (paging off, legacy/PAE, LA57, SMAP: not supported by this slice), and
-    /// for a CR3 with PWT/PCD or bits above the physical-address width set (memory types of the
-    /// root table are not modelled; refused rather than ignored). [`CR3_IGNORED`] bits are ignored.
+    /// for a CR3 with bits above the physical-address width set. [`CR3_IGNORED`] bits are ignored.
     /// Alignment checking (CR0.AM, RFLAGS.AC, CPL 3; SDM Vol.3 7.15 #AC) runs since X2: generated code then runs with
     /// SCTLR_EL1.A, and the resident's explicit CPL 3 accesses check it.
     pub fn control(&self) -> Option<Control> {
@@ -974,7 +988,7 @@ pub mod fetch {
     pub const PAGE: u64 = 1;
     pub const NONCANONICAL: u64 = 2;
     pub const UNSUPPORTED: u64 = 3;
-    /// The page is not write-back memory or lies outside guest RAM (code is fetched only from guest RAM).
+    /// The page lies outside guest RAM (a device page: code is fetched only from guest RAM, of any memory type).
     pub const NOT_RAM: u64 = 4;
     pub fn encode(f: Fault) -> [u64; 3] {
         match f {
@@ -1258,8 +1272,7 @@ pub mod stop {
     /// A stop that is not one: an IRQ outside generated code or in a dead block, a [`super::STOP_WORD`] trap at a word
     /// the resident did not patch, or an armed patch record whose words do not hold the stop word.
     pub const BAD_STOP: u64 = 11;
-    /// A system instruction whose form or operand value the resident does not implement (e.g. CR3 with PWT/PCD, a DR7
-    /// enabling a breakpoint); nothing of it was executed.
+    /// A system instruction whose form or operand value the resident does not implement; nothing of it was executed.
     pub const UNSUPPORTED_SYSTEM: u64 = 12;
     /// A locked access the resident does not complete: a memory XCHG or LOCK read-modify-write (or an unlocked CMPXCHG8B,
     /// which is lowered to the same `caspal`) whose operand crosses a 16-byte boundary: an alignment fault at its atomic
@@ -1815,7 +1828,6 @@ mod tests {
             Cpu { cr4: CR4_PAE | CR4_LA57, ..cpu },
             Cpu { efer: EFER_LME, ..cpu },
             Cpu { cpl: 1, ..cpu },
-            Cpu { cr3: 0x1008, ..cpu },
             Cpu { cr3: 0x1000 | 1 << 40, ..cpu },
             Cpu { seg: [Segment { attributes: 0xc0fb, ..cpu.seg[1] }; 6], ..cpu }, // compatibility mode (CS.L = 0)
             Cpu { seg: [Segment { attributes: 0xe0fb, ..cpu.seg[1] }; 6], ..cpu }, // CS.L = CS.D = 1
@@ -1823,7 +1835,8 @@ mod tests {
             assert_eq!(bad.control(), None);
         }
         // Ignored CR3 bits stay in CR3 (and in the code context) but not in the walk's root.
-        assert_eq!(Cpu { cr3: 0x1fe7, ..cpu }.control().unwrap().cr3, 0x1000);
+        // M2: PWT/PCD (4:3) too: they select the PML4 read's PAT entry, and tables are read from coherent RAM.
+        assert_eq!(Cpu { cr3: 0x1fff, ..cpu }.control().unwrap().cr3, 0x1000);
         // AM or AC alone, or both at CPL 0, check nothing; both at CPL 3 run with alignment checking (X2).
         for fine in [
             Cpu { cr0: cpu.cr0 | CR0_AM, rflags: cpu.rflags | RFLAGS_AC, ..cpu },

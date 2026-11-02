@@ -139,8 +139,8 @@ pub(super) fn noncanonical(i: &System) -> Exception {
 /// supervisor one (`supervisor`: descriptor tables, TSS). Both pages of a crossing range are walked (A/D set as the CPU
 /// does) before any byte moves, so a #PF (CR2 the first faulting byte's page start, or `va`) leaves memory unchanged;
 /// a non-canonical range raises `noncanonical`. A write into a page holding translations invalidates them first
-/// ([`FetchWrites`]: no block of this vCPU runs during a transaction). Only write-back guest RAM is accessed: other memory
-/// types stop `unsupported_system` (M2's), device pages `unsupported_mmio` (status `system`, M3).
+/// ([`FetchWrites`]: no block of this vCPU runs during a transaction). Guest RAM of any memory type is accessed (M2: UC RAM
+/// in program order, [`pages`]); device pages stop `unsupported_mmio` (status `system`, M3).
 pub(super) fn linear(s: &mut State, va: u64, buf: &mut [u8], write: bool, supervisor: bool, noncanonical: Exception) -> Result<(), Exception> {
     let n = buf.len() as u64;
     // X2: an explicit access at CPL 3 under alignment checking (SDM Vol.3 7.15, Table 7-7): #AC(0) after the canonical
@@ -194,7 +194,9 @@ pub(super) fn linear(s: &mut State, va: u64, buf: &mut [u8], write: bool, superv
 }
 /// The guest-physical addresses of `[va, va + n)` (its page, and the next one when it crosses), walked for [`linear`]
 /// (which accesses only guest RAM) and for CLFLUSH (M3: a device page is uncached, nothing to flush; the walk's faults
-/// are all it has).
+/// are all it has). M2 (owner decision, November 2): when either page is UC RAM, or a UC access was made since the last
+/// boundary, every earlier access is made globally visible before the caller's access (a barrier here), and the next
+/// boundary makes a UC one so before any later one (`uncached_end`).
 pub(super) fn pages(s: &mut State, va: u64, n: u64, write: bool, supervisor: bool, noncanonical: Exception) -> Result<[u64; 2], Exception> {
     let last = va.wrapping_add(n - 1);
     if !paging::canonical(va) || !paging::canonical(last) || last < va {
@@ -210,8 +212,21 @@ pub(super) fn pages(s: &mut State, va: u64, n: u64, write: bool, supervisor: boo
     for (k, at) in [va, last & !4095].into_iter().enumerate().take(1 + usize::from(crosses)) {
         gpa[k] = loop {
             match paging::walk(&mut GuestTables::observed(guest_ram(), CodeWrites(FetchWrites(s))), control, at, access) {
-                Ok(t) if t.wb || !super::mmio::ram(t.gpa) => break t.gpa,
-                Ok(_) => halt(s, stop::UNSUPPORTED_SYSTEM),
+                Ok(t) => {
+                    let c = cache::control();
+                    // A UC access made since the last boundary (an instruction run alone, or the resident's own) is
+                    // globally visible before this one, whatever this one's type.
+                    let owed = c.uncached_count != 0 || c.uncached_fence != 0;
+                    let uncached = super::mmio::ram(t.gpa) && cpu::memory_type(msrs(), t.gpa, t.pat) == cpu::memory_type::UC;
+                    if uncached {
+                        (c.uncached_fence, c.uncached_resident) = (1, c.uncached_resident + 1);
+                    }
+                    if owed || uncached {
+                        // SAFETY: a barrier; no other effect.
+                        unsafe { asm!("dmb ish") };
+                    }
+                    break t.gpa;
+                }
                 Err(Fault::Page { address, error }) => return Err([14, error, address]),
                 Err(Fault::Contended) => {}
                 Err(_) => halt(s, stop::UNSUPPORTED_MODE),

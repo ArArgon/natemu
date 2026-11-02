@@ -171,6 +171,13 @@ def render():
     for i, ap, bsp in rs:
         w(f'        ({h(i)}, {h(ap)}, {h(bsp)}),')
     w('    ];')
+    sizes = [2 << 20, 4 << 20, 1 << 30, (1 << 30) + (2 << 20), 0x70000000, 2 << 30, (2 << 30) + (2 << 20), (3 << 30) - (2 << 20), 3 << 30]
+    w('    /// M2 addendum: guest RAM size -> the firmware\'s IA32_MTRR_DEF_TYPE and IA32_MTRR_PHYSBASE0..PHYSMASK7 (`mtrr_state(ram)`)')
+    w(f'    pub const MTRR_FOR_RAM: [(u64, [(u32, u64); 17]); {len(sizes)}] = [')
+    for r in sizes:
+        st = p.mtrr_state(r)
+        w(f'        ({h(r)}, [{", ".join(f"({h(k)}, {h(st.get(k, 0))})" for k in [0x2ff] + list(range(0x200, 0x210)))}]),')
+    w('    ];')
     w('}')
     return '\n'.join(L) + '\n'
 
