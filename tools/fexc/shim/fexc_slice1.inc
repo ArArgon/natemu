@@ -133,7 +133,11 @@ inline Verdict Two(uint8_t op, bool plain, bool has_modrm, uint8_t mod, uint8_t 
   case 0xC7: return has_modrm && mod != 3 && reg == 1 ? Allow() : Uns("group 9 other than cmpxchg8b/16b m");
   case 0x18: return has_modrm && mod != 3 && reg <= 3 ? Allow() : Uns("0f 18 other than prefetchnta/t0/t1/t2 m8");
   case 0xC3: return has_modrm && mod != 3 ? Allow() : Uns("movnti with a register operand");
-  case 0x0D: return Uns("prefetchw/0f 0d: PREFETCHW is not advertised (cpu_profile 0x80000001.ecx.8)");
+  // X1c: PREFETCHW m8 (0f 0d /1) is "merely a hint and does not affect program behavior", with no #UD for a CPU that does
+  // not enumerate it (SDM Vol.2 PREFETCHW: only LOCK) and no fault; CLDEMOTE m8 (NP 0f 1c /0) is "treated as a NOP" on
+  // processors without it (SDM Vol.2 CLDEMOTE). The other 0f 0d, 0f 18 and 0f 19..1d encodings: the Reserved-NOP rule below.
+  case 0x0D: return has_modrm && mod != 3 && reg == 1 ? Allow() : Uns("0f 0d other than prefetchw m8: reserved (Reserved-NOP or blank)");
+  case 0x1C: return has_modrm && mod != 3 && reg == 0 ? Allow() : Uns("0f 1c other than cldemote m8: Reserved-NOP");
   case 0xA6: case 0xA7: return Ud("0f a6/a7: VIA PadLock (not advertised; reserved in Intel's map: #UD)");
   case 0xA3: case 0xAB: case 0xB3: case 0xBB: case 0xAF: case 0xB6: case 0xB7: case 0xBE: case 0xBF:
   case 0xBC: case 0xBD: return Allow();                             // bt/bts/btr/btc, imul, movzx/movsx, bsf/bsr
@@ -642,6 +646,18 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   if (d.FexcMap == FEXC_MAP_TWO && op == 0xAE && has_modrm && (d.ModRM == 0xE8 || d.ModRM == 0xF0 || d.ModRM == 0xF8) &&
       !(f & (DecodeFlags::FLAG_OPERAND_SIZE | DecodeFlags::FLAG_REP_PREFIX | DecodeFlags::FLAG_REPNE_PREFIX)))
     v = Allow();
+  // X1c (owner decision, November 2): the Reserved-NOP cells of 0f 0d and 0f 18..1d execute as NOPs, as on the modelled
+  // processor (SDM Vol.2 A.1: "may behave as NOP on certain processors"; pinned QEMU does so for every one): cut as system
+  // instructions, the host decodes the ModRM and the resident completes them with no memory access (LOCK: #UD, above).
+  // Natively compiled stay PREFETCHW (NP 0f 0d /1 m), PREFETCHh (0f 18 /0../3 m, no F2/F3) and CLDEMOTE (NP 0f 1c /0 m);
+  // 0f 0d with a register operand is #UD (PREFETCHW takes m8; Table A-3 lists no other form; pinned QEMU agrees).
+  if (d.FexcMap >= FEXC_MAP_TWO && d.FexcMap <= FEXC_MAP_TWO_66 && has_modrm && (op == 0x0D || (op >= 0x18 && op <= 0x1D))) {
+    const bool prefixed = f & (DecodeFlags::FLAG_OPERAND_SIZE | DecodeFlags::FLAG_REP_PREFIX | DecodeFlags::FLAG_REPNE_PREFIX);
+    const bool rep = f & (DecodeFlags::FLAG_REP_PREFIX | DecodeFlags::FLAG_REPNE_PREFIX);
+    if (op == 0x0D && mod == 3) return Ud("0f 0d with a register operand (PREFETCHW takes m8: #UD)");
+    const bool native = (op == 0x0D && reg == 1 && !prefixed) || (op == 0x18 && mod != 3 && reg <= 3 && !rep) || (op == 0x1C && mod != 3 && reg == 0 && !prefixed);
+    if (!native) return Sys("Reserved-NOP cell (a NOP: the host decodes it, the resident completes it)");
+  }
   if (v.kind != ALLOW) {
     // I10: 0f 1e /r is the CET hint space (ENDBR32/ENDBR64 f3 0f 1e fb/fa, RDSSPD/RDSSPQ f3 0f 1e /1 register, the other
     // encodings reserved NOPs): without CET (not advertised; CR4.CET stays 0) every one executes as a NOP: SDM ENDBR64 "a NOP on
@@ -676,7 +692,11 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   const bool compare = string && (op == 0xA6 || op == 0xA7 || op == 0xAE || op == 0xAF);
   const bool source = string && (op <= 0xA7 || op == 0xAC || op == 0xAD);   // movs, cmps, lods: DS:RSI
   if ((f & DecodeFlags::FLAG_REP_PREFIX) && (f & DecodeFlags::FLAG_REPNE_PREFIX)) return Uns("REP and REPNE prefixes together");
-  if ((f & DecodeFlags::FLAG_REPNE_PREFIX) && !compare) return Uns(string ? "REPNE prefix on movs/stos/lods" : "REPNE prefix");
+  // X1c (owner decision, November 2): F2 on a near CALL, RET, JMP or Jcc is MPX's BND prefix, ignored where MPX is not
+  // enumerated (as on the modelled processor; pinned QEMU agrees): FEX compiles the branch as without it. Not on
+  // LOOP/LOOPcc/JrCXZ (BND does not apply there).
+  const bool bnd = v.branch && !(primary && d.OPRaw >= 0xE0 && d.OPRaw <= 0xE3);
+  if ((f & DecodeFlags::FLAG_REPNE_PREFIX) && !compare && !bnd) return Uns(string ? "REPNE prefix on movs/stos/lods" : "REPNE prefix");
   // rep ret is a ret; F3 90 (no REX.B: that would be xchg r8, rax) is PAUSE, FEX's `yield`.
   if ((f & DecodeFlags::FLAG_REP_PREFIX) && !string && !(primary && (op == 0xC3 || (op == 0x90 && !(f & DecodeFlags::FLAG_REX_XGPR_B)))))
     return Uns("REP prefix");
@@ -820,9 +840,11 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
   }
   if (v.kind == ALLOW) {
     // A direct branch to a non-canonical target raises #GP(0) at the branch (Intel), before a call pushes. Its target is
-    // known here, so it is cut instead of compiled; slice 1 does not deliver that #GP.
+    // known here, so it is cut instead of compiled; the host delivers that #GP (X1c).
     const uint8_t op = d.OPRaw;
-    const bool rel = (d.FexcMap == FEXC_MAP_PRIMARY && ((op >= 0x70 && op <= 0x7F) || op == 0xE8 || op == 0xE9 || op == 0xEB)) ||
+    // X1c: LOOPNE/LOOPE/LOOP/JrCXZ (e0..e3) too: the host decodes the cut (`system::branch`) and the resident raises the
+    // #GP only when the branch is taken (`system::BRANCH`), with RCX not decremented.
+    const bool rel = (d.FexcMap == FEXC_MAP_PRIMARY && ((op >= 0x70 && op <= 0x7F) || (op >= 0xE0 && op <= 0xE3) || op == 0xE8 || op == 0xE9 || op == 0xEB)) ||
                      (d.FexcMap == FEXC_MAP_TWO && op >= 0x80 && op <= 0x8F);
     const uint64_t target = rip + d.InstSize + d.Src[0].Literal();
     const bool string = d.FexcMap == FEXC_MAP_PRIMARY && ((op >= 0xA4 && op <= 0xA7) || (op >= 0xAA && op <= 0xAF));

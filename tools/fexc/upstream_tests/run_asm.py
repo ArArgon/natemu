@@ -61,7 +61,9 @@ NOT_ADVERTISED = {'rdpid', 'rdseed', 'clflushopt', 'clzero', 'clwb', 'serialize'
                   'pi2fw', 'pi2fd', 'pf2iw', 'pf2id', 'pfrcpv', 'pfrsqrtv', 'pfnacc', 'pfpnacc', 'pfcmpge', 'pfmin', 'pfrcp', 'pfrsqrt',
                   'pfsub', 'pfadd', 'pfcmpgt', 'pfmax', 'pfrcpit1', 'pfrsqit1', 'pfsubr', 'pfacc', 'pfcmpeq', 'pfmul', 'pfrcpit2',
                   'pmulhrwa', 'pswapd', 'pavgusb', 'femms', 'vaesenc', 'vaesenclast', 'vaesdec', 'vaesdeclast', 'vpclmullqlqdq',
-                  'vpclmulhqlqdq', 'vpclmullqhqdq', 'vpclmulhqhqdq', 'vpclmulqdq', '{vex}'}
+                  'vpclmulhqlqdq', 'vpclmullqhqdq', 'vpclmulhqhqdq', 'vpclmulqdq', '{vex}',
+                  # X1c: AMD's SSE4a MOVNTSS/MOVNTSD (F3/F2 0f 2b): blank cells of Intel's Table A-3 on the GenuineIntel profile
+                  'movntss', 'movntsd'}
 # I9: tests whose expectation needs the 80-bit aliasing of MMX and x87 registers (an MMX write's bits 79:64 = FFFFH, an MMX read
 # of an x87 register's 64-bit significand, FNSAVE tags of MMX values), which natemu does not build: MMn is the slot's low 64 bits
 # and the reduced-precision x87 value is a double there (plan I9, MMX deviations); their MMX-only results match.

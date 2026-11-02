@@ -140,6 +140,11 @@ def analyse(funcs, words, tops):
                 if target != name:
                     if start == int(m[1], 16):
                         callees.add(target)
+                    elif (v := re.fullmatch(r'__CortexA53843419_([0-9A-Fa-f]+)', name)) and int(m[1], 16) == int(v[1], 16) + 4 \
+                            and owner(int(v[1], 16))[1] == target \
+                            and any(a == int(v[1], 16) and re.fullmatch(rf'b 0x{insns[0][0]:x} <.*>', i) for a, i in funcs[target]):
+                        pass                    # lld's erratum-843419 veneer resumes after the instruction it displaced, in the
+                                                # function whose `b` at that address enters it
                     elif (name, target) in SHARED_BODIES:
                         callees.add((target, 'body'))
                     else:

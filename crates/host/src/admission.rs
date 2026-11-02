@@ -144,9 +144,10 @@ pub(crate) struct Admitted {
 /// operand, so they change nothing (2E/3E are Jcc hints; Linux's `-mindirect-branch-cs-prefix` emits `2e e8 rel32`).
 /// 0x67 (I10) may too: the target is RIP + rel in 64-bit mode whatever the address size (it selects only ECX for
 /// LOOP/JECXZ); linkers relax `call *f@GOTPCREL(%rip)` to `addr32 call f`.
+/// X1c: F2 too: MPX's BND prefix on CALL/RET/JMP/Jcc, ignored without MPX (fexc compiles such a branch as without it).
 /// FS/GS (their use with a branch is reserved) and 66 (rel16 operand size) are not skipped: such a branch is not proven.
 fn branch_target(insn: &[u8], end: u64) -> Option<u64> {
-    let start = insn.iter().position(|&b| b & 0xf0 != 0x40 && !matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0x67))?;
+    let start = insn.iter().position(|&b| b & 0xf0 != 0x40 && !matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0x67 | 0xf2))?;
     let rel = match &insn[start..] {
         [0xeb | 0x70..=0x7f | 0xe0..=0xe3, r] => *r as i8 as i64,
         [0xe9 | 0xe8, r @ ..] | [0x0f, 0x80..=0x8f, r @ ..] if r.len() == 4 => i32::from_le_bytes(r.try_into().unwrap()) as i64,

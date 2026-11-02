@@ -20,6 +20,8 @@ use natemu_abi::execution::{SREG_DS, SREG_FS, SREG_GS, SREG_SS, System, system};
 /// 66 overlay, map 4, is not reported for these opcodes).
 const MAP_PRIMARY: u8 = 0;
 const MAP_TWO: u8 = 1;
+const MAP_TWO_F3: u8 = 2;
+const MAP_TWO_66: u8 = 4;
 const MAP_0F38: u8 = 5;
 const MAP_0F3A: u8 = 6;
 /// fexc's VEX map (`FEXC_MAP_VEX`, I8): the opcode byte after the VEX prefix.
@@ -61,6 +63,8 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
     let (w, r) = (rex & 8 != 0, u32::from(rex >> 2 & 1) << 3);
     match map {
         MAP_TWO if *bytes.get(at)? == 0x0f && *bytes.get(at + 1)? == opcode => at += 2,
+        // X1c: a Reserved-NOP cell under a mandatory-prefix overlay map (F3, F2, 66): the same two-byte opcode.
+        MAP_TWO_F3..=MAP_TWO_66 if matches!(opcode, 0x0d | 0x18..=0x1d) && *bytes.get(at)? == 0x0f && *bytes.get(at + 1)? == opcode => at += 2,
         MAP_PRIMARY if *bytes.get(at)? == opcode => at += 1,
         MAP_0F38 if bytes.get(at..at + 3)? == [0x0f, 0x38, opcode] => at += 3,
         MAP_0F3A if bytes.get(at..at + 3)? == [0x0f, 0x3a, opcode] => at += 3,
@@ -110,7 +114,10 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         // ENCLS, VMFUNC/XEND/XTEST/ENCLU, the SVM group, SERIALIZE and XSUSLDTRK/XRESLDTRK (f2 e8/e9), RDPKRU/WRPKRU, MONITORX/MWAITX, CLZERO, RDPRU and the
         // RMP/INVLPGB group: #UD whatever the prefixes (SDM Vol.2 each: "#UD If CPUID ... = 0" / "not in VMX operation").
         // I10: SAVEPREVSSP (f3 0f 01 ea; SETSSBSY is f3 e8): "#UD If CR4.CET = 0" (CET not advertised); reserved otherwise.
-        (MAP_TWO, 0x01) if matches!(*bytes.get(at)?, 0xc0..=0xc6 | 0xc8..=0xcc | 0xcf | 0xd4..=0xdf | 0xe8 | 0xe9 | 0xea | 0xee | 0xef | 0xfa..=0xff) => {
+        // X1c: the rest of mod = 11 outside SMSW (/4) and LMSW (/6): PBNDKB (c7), TDX SEAMRET/SEAMOPS (66 cd/ce; reserved
+        // without 66), FRED ERETS/ERETU (f2/f3 ca, in c8..cc), UIRET (f3 ec): not advertised; d2, d3, eb, ed and the unprefixed forms are blank
+        // in Table A-6 (reserved: #UD, SDM Vol.3 7.15 interrupt 6).
+        (MAP_TWO, 0x01) if matches!(*bytes.get(at)?, 0xc0..=0xcf | 0xd2..=0xdf | 0xe8..=0xef | 0xfa..=0xff) => {
             (at, rep_used, s.kind) = (at + 1, true, system::UD);
         }
         // I5b: XGETBV and XSETBV (`0f 01 d0`, `d1`; NP: with 66 not decoded).
@@ -126,21 +133,28 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
                 2 => system::LGDT,
                 3 => system::LIDT,
                 7 => system::INVLPG,
-                // I10: RSTORSSP m64 (f3 0f 01 /5): "#UD If CR4.CET = 0" (CET not advertised).
-                5 if s.memory == 1 && rep == 0xf3 => {
+                // I10: RSTORSSP m64 (f3 0f 01 /5): "#UD If CR4.CET = 0" (CET not advertised); X1c: /5 m without F3 is blank in
+                // Table A-6 (reserved).
+                5 if s.memory == 1 => {
                     rep_used = true;
                     system::UD
                 }
+                // X1c: SMSW r/m16, r32, r64 (`size`; a memory destination is always 16 bits) and LMSW r/m16.
+                4 => {
+                    s.size = size;
+                    system::SMSW
+                }
+                6 => system::LMSW,
                 _ => return None,
             };
-            if s.memory == 0 || (s.kind == system::INVLPG && matches!(segment, 0x64 | 0x65)) {
+            if (s.memory == 0 && matches!(s.kind, system::LGDT..=system::SIDT | system::INVLPG)) || (s.kind == system::INVLPG && matches!(segment, 0x64 | 0x65)) {
                 return None;
             }
         }
         (MAP_TWO, 0x00) => {
             let reg = rm(bytes, &mut at, rex, &mut s)?;
-            s.kind = *[system::SLDT, system::STR, system::LLDT, system::LTR, system::VERR, system::VERW, system::UD].get(reg as usize)?;
-            // /6: LKGS (f2) is not advertised, and reserved without it.
+            s.kind = [system::SLDT, system::STR, system::LLDT, system::LTR, system::VERR, system::VERW, system::UD, system::UD][reg as usize];
+            // /6: LKGS (f2) is not advertised, and reserved without it; X1c: /7 is blank in Table A-6 (reserved).
             rep_used = s.kind == system::UD;
             s.size = size;
         }
@@ -151,6 +165,34 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
             s.size = size;
         }
         (MAP_TWO, 0x05) => s.kind = system::SYSCALL,
+        // X1c: a Reserved-NOP cell fexc cut (its rule decides which): the ModRM decoded for the length, nothing accessed; any
+        // 66/F2/F3 prefix. A register-operand 0f 0d is fexc's #UD (`cut_ud`), never decoded here.
+        (MAP_TWO..=MAP_TWO_66, 0x0d | 0x18..=0x1d) => {
+            rm(bytes, &mut at, rex, &mut s)?;
+            (s.kind, rep_used) = (system::RESERVED_NOP, true);
+            if opcode == 0x0d && s.memory == 0 {
+                return None;
+            }
+        }
+        // X1c: PUSH FS/GS, POP FS/GS: 64-bit operand size by default, 16 with 66 (REX.W wins; no 32-bit form in 64-bit mode).
+        (MAP_TWO, 0xa0 | 0xa1 | 0xa8 | 0xa9) => {
+            s.kind = if opcode & 1 == 0 { system::PUSH_SREG } else { system::POP_SREG };
+            s.cr = if opcode < 0xa8 { SREG_FS } else { SREG_GS } as u32;
+            s.size = if operand16 && !w { 2 } else { 8 };
+        }
+        // X1c: CLTS; SYSENTER; SYSEXIT (REX.W: to 64-bit mode, else compatibility mode).
+        (MAP_TWO, 0x06) => s.kind = system::CLTS,
+        (MAP_TWO, 0x34) => s.kind = system::SYSENTER,
+        (MAP_TWO, 0x35) => {
+            s.kind = system::SYSEXIT;
+            s.size = if w { 8 } else { 4 };
+        }
+        // X1c: LSS/LFS/LGS with a register operand: "an operand type that is invalid for its accompanying opcode" (SDM Vol.3
+        // 7.15 interrupt 6, its example is LES); the memory forms are not built.
+        (MAP_TWO, 0xb2 | 0xb4 | 0xb5) if *bytes.get(at)? >= 0xc0 => (s.kind, rep_used) = (system::UD, true),
+        // X1c: PUSH ES/CS/SS/DS, POP ES/SS/DS and CALL/JMP ptr16:16/32 are "Invalid" in 64-bit mode (SDM Vol.2 PUSH, POP,
+        // CALL, JMP opcode tables; PUSH: "#UD If the PUSH is of CS, SS, DS, or ES"; Table A-2 "i64").
+        (MAP_PRIMARY, 0x06 | 0x07 | 0x0e | 0x16 | 0x17 | 0x1e | 0x1f | 0x9a | 0xea) => (s.kind, rep_used) = (system::UD, true),
         (MAP_TWO, 0x07) => {
             s.kind = system::SYSRET;
             s.size = far_size?;
@@ -201,9 +243,12 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
                 5 => system::JMP_FAR,
                 _ => return None,
             };
-            s.size = far_size?;
+            // X1c: a register operand is "an operand type that is invalid for its accompanying opcode" (SDM Vol.3 7.15
+            // interrupt 6; JMP/CALL far take m16:16/32/64 only): #UD whatever the operand size.
             if s.memory == 0 {
-                return None; // a register operand is #UD; not decoded
+                s.kind = system::UD;
+            } else {
+                s.size = far_size?;
             }
         }
         (MAP_PRIMARY, 0xca | 0xcb | 0xcf) => {
@@ -322,6 +367,9 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         (MAP_TWO, 0xae) => {
             let reg = rm(bytes, &mut at, rex, &mut s)?;
             s.kind = match (s.memory, reg) {
+                // X1c: PTWRITE r/m (F3 /4): "#UD If CPUID.(EAX=14H, ECX=0):EBX.PTWRITE[bit 4] = 0"; leaf 14H is Intel PT's
+                // (CPUID.07H:EBX.PT, not advertised).
+                (_, 4) if rep == 0xf3 && !operand16 && !advertised(PT.unwrap()) => system::UD,
                 (1, 2) if !operand16 => system::LDMXCSR,
                 (1, 3) if !operand16 => system::STMXCSR,
                 // I5b: FXSAVE, FXRSTOR, XSAVE, XRSTOR (NP); /6 is XSAVEOPT (CPUID.(EAX=0DH,ECX=1):EAX.XSAVEOPT = 0) or with
@@ -398,6 +446,288 @@ pub(crate) fn vex_ud(bytes: &[u8]) -> Option<System> {
         }
     }
     None
+}
+
+/// A CPUID feature bit of the presented CPU: (leaf, subleaf, register EAX..EDX = 0..3, bit), read from the generated
+/// profile (`cpu_profile::CPUID`, from tools/models/cpu_profile.json).
+type Feature = (u32, u32, usize, u32);
+fn advertised((leaf, sub, reg, bit): Feature) -> bool {
+    use natemu_abi::cpu_profile::{ANY, CPUID};
+    CPUID.iter().find(|&&(l, s, _)| l == leaf && (s == ANY || s == sub)).is_some_and(|(_, _, r)| r[reg] >> bit & 1 != 0)
+}
+/// SSE and SSE2 (with MMX) are part of every 64-bit processor: their cells are defined whatever the profile.
+const BASE: Option<Feature> = None;
+const SSE3: Option<Feature> = Some((1, 0, 2, 0));
+const SSSE3: Option<Feature> = Some((1, 0, 2, 9));
+const SSE4_1: Option<Feature> = Some((1, 0, 2, 19));
+const SSE4_2: Option<Feature> = Some((1, 0, 2, 20));
+const PCLMULQDQ: Option<Feature> = Some((1, 0, 2, 1));
+const AES: Option<Feature> = Some((1, 0, 2, 25));
+const MOVBE: Option<Feature> = Some((1, 0, 2, 22));
+const ADX: Option<Feature> = Some((7, 0, 1, 19));
+const SHA: Option<Feature> = Some((7, 0, 1, 29));
+const CET_SS: Option<Feature> = Some((7, 0, 2, 7));
+const GFNI: Option<Feature> = Some((7, 0, 2, 8));
+const KL: Option<Feature> = Some((7, 0, 2, 23));
+const MOVDIRI: Option<Feature> = Some((7, 0, 2, 27));
+const MOVDIR64B: Option<Feature> = Some((7, 0, 2, 28));
+const ENQCMD: Option<Feature> = Some((7, 0, 2, 29));
+/// Intel PT (PTWRITE is enumerated in its leaf 14H, which exists only with PT).
+const PT: Option<Feature> = Some((7, 0, 1, 25));
+/// The legacy (non-VEX) cells of the SIMD rows of SDM Vol.2 Tables A-3 (two-byte), A-4 (0f 38) and A-5 (0f 3a): (map: 1,
+/// 2 or 3; first and last opcode; the mandatory prefixes defined there: N none, 6 66, 3 F3, 2 F2; the feature defining
+/// them). A cell of these rows not listed is blank.
+const SIMD: &[(u8, u8, u8, &[u8], Option<Feature>)] = &[
+    (1, 0x10, 0x11, b"N632", BASE), (1, 0x12, 0x12, b"N6", BASE), (1, 0x12, 0x12, b"32", SSE3), (1, 0x13, 0x15, b"N6", BASE),
+    (1, 0x16, 0x16, b"N6", BASE), (1, 0x16, 0x16, b"3", SSE3), (1, 0x17, 0x17, b"N6", BASE), (1, 0x28, 0x29, b"N6", BASE),
+    (1, 0x2a, 0x2a, b"N632", BASE), (1, 0x2b, 0x2b, b"N6", BASE), (1, 0x2c, 0x2d, b"N632", BASE), (1, 0x2e, 0x2f, b"N6", BASE),
+    (1, 0x50, 0x50, b"N6", BASE), (1, 0x51, 0x51, b"N632", BASE), (1, 0x52, 0x53, b"N3", BASE), (1, 0x54, 0x57, b"N6", BASE),
+    (1, 0x58, 0x5a, b"N632", BASE), (1, 0x5b, 0x5b, b"N63", BASE), (1, 0x5c, 0x5f, b"N632", BASE), (1, 0x60, 0x6b, b"N6", BASE),
+    (1, 0x6c, 0x6d, b"6", BASE), (1, 0x6e, 0x6e, b"N6", BASE), (1, 0x6f, 0x6f, b"N63", BASE), (1, 0x70, 0x70, b"N632", BASE),
+    (1, 0x71, 0x76, b"N6", BASE), (1, 0x77, 0x77, b"N", BASE), (1, 0x7c, 0x7d, b"62", SSE3), (1, 0x7e, 0x7f, b"N63", BASE),
+    (1, 0xc2, 0xc2, b"N632", BASE), (1, 0xc4, 0xc6, b"N6", BASE), (1, 0xd0, 0xd0, b"62", SSE3), (1, 0xd1, 0xd5, b"N6", BASE),
+    (1, 0xd6, 0xd6, b"632", BASE), (1, 0xd7, 0xe5, b"N6", BASE), (1, 0xe6, 0xe6, b"632", BASE), (1, 0xe7, 0xef, b"N6", BASE),
+    (1, 0xf0, 0xf0, b"2", SSE3), (1, 0xf1, 0xfe, b"N6", BASE),
+    (2, 0x00, 0x0b, b"N6", SSSE3), (2, 0x10, 0x10, b"6", SSE4_1), (2, 0x14, 0x15, b"6", SSE4_1), (2, 0x17, 0x17, b"6", SSE4_1),
+    (2, 0x1c, 0x1e, b"N6", SSSE3), (2, 0x20, 0x25, b"6", SSE4_1), (2, 0x28, 0x2b, b"6", SSE4_1), (2, 0x30, 0x35, b"6", SSE4_1),
+    (2, 0x37, 0x37, b"6", SSE4_2), (2, 0x38, 0x41, b"6", SSE4_1), (2, 0x80, 0x82, b"6", BASE), (2, 0xc8, 0xcd, b"N", SHA),
+    (2, 0xcf, 0xcf, b"6", GFNI), (2, 0xd8, 0xd8, b"3", KL), (2, 0xdb, 0xdf, b"6", AES), (2, 0xdc, 0xdf, b"3", KL),
+    (2, 0xf0, 0xf1, b"N6", MOVBE), (2, 0xf0, 0xf1, b"2", SSE4_2), (2, 0xf5, 0xf5, b"6", CET_SS), (2, 0xf6, 0xf6, b"63", ADX),
+    (2, 0xf8, 0xf8, b"6", MOVDIR64B), (2, 0xf8, 0xf8, b"32", ENQCMD), (2, 0xf9, 0xf9, b"N", MOVDIRI), (2, 0xfa, 0xfb, b"3", KL),
+    (3, 0x08, 0x0e, b"6", SSE4_1), (3, 0x0f, 0x0f, b"N6", SSSE3), (3, 0x14, 0x17, b"6", SSE4_1), (3, 0x20, 0x22, b"6", SSE4_1),
+    (3, 0x40, 0x42, b"6", SSE4_1), (3, 0x44, 0x44, b"6", PCLMULQDQ), (3, 0x60, 0x63, b"6", SSE4_2), (3, 0xcc, 0xcc, b"N", SHA),
+    (3, 0xce, 0xcf, b"6", GFNI), (3, 0xdf, 0xdf, b"6", AES),
+];
+/// Two-byte opcodes whose rows are SIMD rows (the mandatory prefix selects the instruction); elsewhere F2/F3 are REP
+/// prefixes and 66 the operand size (SDM Vol.2 2.1.1: reserved, not #UD, on other instructions).
+fn simd_row(op: u8) -> bool {
+    matches!(op, 0x10..=0x17 | 0x28..=0x2f | 0x50..=0x77 | 0x7c..=0x7f | 0xc2 | 0xc4..=0xc6 | 0xd0..=0xfe)
+}
+
+/// X1c: an encoding fexc refuses (`unsupported_form`) that the SDM makes #UD whatever its operands:
+/// - blank cells: Table A-2 `d6`; Table A-3 `0f 04 0a 0c 0e 24..27 36 39 3b 3c..3f 7a 7b`, JMPE `0f b8` without F3
+///   ("reserved for emulator on IPF") and 66/F2 `0f b8`; group 9's `0f c7` register forms /0../5 and memory forms /0 /2;
+///   and every mandatory-prefix cell of the SIMD rows of Tables A-3/A-4/A-5 that [`SIMD`] does not define, or defines by a
+///   feature the profile does not advertise (CPUID's "#UD if CPUID.(...) = 0" of each page);
+/// - "an operand type that is invalid for its accompanying opcode" (Vol.3 7.15 interrupt 6): a register operand of LEA
+///   (`8d`), MOVNTI (`0f c3`), the memory-only SIMD forms (MOVLPS/MOVHPS/MOVLPD/MOVHPD stores `0f 13`/`0f 17` and 66 loads
+///   `66 0f 12`/`66 0f 16`, MOVNTPS/PD `0f 2b`, MOVNTQ/MOVNTDQ `0f e7`, LDDQU `f2 0f f0`, MOVNTDQA `66 0f 38 2a`), CMPXCHG8B/
+///   16B; a memory operand of the register-only ones (MOVMSKPS/PD `0f 50`, PMOVMSKB `0f d7`, MASKMOVQ/DQU `0f f7`, the
+///   shift groups `0f 71..73`, PEXTRW `0f c5`, MOVQ2DQ/MOVDQ2Q `f3/f2 0f d6`);
+/// - unadvertised instructions: GETSEC (`0f 37`, CR4.SMXE = 0), RSM outside SMM (`0f aa`), the VMX group-9 forms (`0f c7
+///   /6`, `/7` m, any prefix: "#UD If not in VMX operation"); PTWRITE (`f3 0f ae /4`, Intel PT not advertised) is the
+///   system decode's.
+/// A cell with both 66 and F2/F3 is left alone (no claim on which prefix decides). fexc's own `cut_ud` covers what it
+/// classifies; this covers what it refuses instead.
+pub(crate) fn undefined(bytes: &[u8]) -> Option<System> {
+    let mut at = 0;
+    let (mut p66, mut rep) = (false, 0);
+    loop {
+        match *bytes.get(at)? {
+            0x66 => p66 = true,
+            p @ (0xf2 | 0xf3) => rep = p,
+            0x67 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 => {}
+            _ => break,
+        }
+        at += 1;
+    }
+    if matches!(bytes[at], 0x40..=0x4f) {
+        at += 1;
+    }
+    let modrm = |k: usize| bytes.get(at + k).map(|m| (m >> 6 == 3, m >> 3 & 7));
+    let prefix = match (p66, rep) {
+        (true, 0xf2 | 0xf3) => None,
+        (_, 0xf3) => Some(b'3'),
+        (_, 0xf2) => Some(b'2'),
+        (true, _) => Some(b'6'),
+        _ => Some(b'N'),
+    };
+    // A SIMD-row cell: blank or unadvertised (Some(true)), defined (Some(false)), not a SIMD row or both prefixes (None).
+    let cell = |map: u8, op: u8| -> Option<bool> {
+        let p = prefix?;
+        let defined = SIMD.iter().any(|&(m, lo, hi, ps, f)| m == map && (lo..=hi).contains(&op) && ps.contains(&p) && f.is_none_or(advertised));
+        Some(!defined)
+    };
+    let ud = match *bytes.get(at)? {
+        0x8d => modrm(1)?.0,
+        0xd6 => true,
+        0x0f => match *bytes.get(at + 1)? {
+            0x04 | 0x0a | 0x0c | 0x0e | 0x24..=0x27 | 0x36 | 0x37 | 0x39 | 0x3b | 0x3c..=0x3f | 0x7a | 0x7b | 0xaa => true,
+            0xb8 => rep != 0xf3,
+            0xc3 => modrm(2)?.0,
+            // PTWRITE r (F3 /4 register; the memory form is a system cut, [`decode`]): Intel PT not advertised.
+            0xae => rep == 0xf3 && !p66 && modrm(2)? == (true, 4) && !advertised(PT.unwrap()),
+            0xc7 => match modrm(2)? {
+                (true, reg) => reg <= 5,
+                (false, reg) => matches!(reg, 0 | 2 | 6 | 7),
+            },
+            op if simd_row(op) => {
+                let (register, reg) = modrm(2)?;
+                let p = prefix;
+                cell(1, op)? || match op {
+                    0x13 | 0x17 | 0x2b | 0xe7 => register,
+                    0x12 | 0x16 => register && p == Some(b'6'),
+                    0xf0 => register,
+                    0x50 | 0xd7 | 0xf7 | 0xc5 => !register,
+                    0x71 | 0x72 => !register || !matches!(reg, 2 | 4 | 6),
+                    0x73 => !register || !(matches!(reg, 2 | 6) || (matches!(reg, 3 | 7) && p == Some(b'6'))),
+                    0xd6 => !register && p != Some(b'6'),
+                    _ => false,
+                }
+            }
+            0x38 => {
+                let op = *bytes.get(at + 2)?;
+                cell(2, op)? || (op == 0x2a && modrm(3)?.0)
+            }
+            0x3a => cell(3, *bytes.get(at + 2)?)?,
+            _ => false,
+        },
+        _ => false,
+    };
+    ud.then_some(System { kind: system::UD, length: 1, ..System::NONE })
+}
+
+/// X1c: a direct near branch whose target is not canonical, which fexc refuses (`unsupported_form`, its "direct branch
+/// to a non-canonical target", or a prefix it does not compile): JMP rel8/rel32 `eb`/`e9`, CALL rel32 `e8`, Jcc rel8/rel32
+/// `70..7f`/`0f 80..8f`, LOOPNE/LOOPE/LOOP/JrCXZ `e0..e3`. SDM Vol.2 JMP, CALL, Jcc, LOOP/LOOPcc, JrCXZ (64-bit mode):
+/// #GP(0) if the target is non-canonical, raised only when the branch is taken; the resident evaluates the condition and
+/// the count ([`system::BRANCH`]: `cr` the condition, `size` the count's width, `disp` the displacement). Prefixes a near
+/// branch ignores in 64-bit mode are skipped, so the outcome is the unprefixed form's: segment overrides (2e/3e are Jcc
+/// hints), 66 ("operand size prefixes are silently ignored ... the displacement field for relative branches is still
+/// limited to 32 bits", Vol.1 3.3.7 / 64-bit near branches), REX (W included: the operand size is forced to 64 bits), F2
+/// (BND, ignored without MPX) and F3; 0x67 sets the count's width of `e0..e3` and is ignored by the others.
+pub(crate) fn branch(bytes: &[u8], rip: u64) -> Option<System> {
+    let mut at = 0;
+    let mut a32 = false;
+    while let Some(&p @ (0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf2 | 0xf3)) = bytes.get(at) {
+        a32 |= p == 0x67;
+        at += 1;
+    }
+    if matches!(bytes.get(at), Some(0x40..=0x4f)) {
+        at += 1;
+    }
+    let op = *bytes.get(at)?;
+    let rel8 = || bytes.get(at + 1).map(|&b| i64::from(b as i8));
+    let rel32 = |k: usize| bytes.get(at + k..at + k + 4).map(|b| i64::from(i32::from_le_bytes(b.try_into().unwrap())));
+    let (cr, disp, length) = match op {
+        0x70..=0x7f => (u32::from(op & 15), rel8()?, 2),
+        0xeb => (16, rel8()?, 2),
+        0xe9 => (16, rel32(1)?, 5),
+        0xe8 => (17, rel32(1)?, 5),
+        0xe0..=0xe3 => (18 + u32::from(op - 0xe0), rel8()?, 2),
+        0x0f if matches!(*bytes.get(at + 1)?, 0x80..=0x8f) => (u32::from(bytes[at + 1] & 15), rel32(2)?, 6),
+        _ => return None,
+    };
+    let length = length + at as u64;
+    if length > 15 {
+        return None;
+    }
+    let target = rip.wrapping_add(length).wrapping_add(disp as u64);
+    let canonical = (target as i64) << 16 >> 16 == target as i64;
+    let size = if a32 && cr >= 18 { 4 } else { 8 };
+    (!canonical).then_some(System { kind: system::BRANCH, cr, size, disp, length: length as u32, ..System::NONE })
+}
+
+#[cfg(test)]
+mod x1c_tests {
+    fn b(hex: &str) -> Vec<u8> {
+        (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+    }
+    #[test]
+    fn undefined_forms() {
+        for hex in ["8dc0", "d6", "0f04", "0f0e", "0f25", "0f37", "0f3f", "0f7b", "0faa", "0f13c0", "660f17c0", "0f2bc0", "660fe7c1",
+                    "f20ff0c0", "0fc3c0", "480fc7c8", "0fc7e8", "0fc700", "0fc710", "f30fc730", "0fc738", "660f382ac0", "0f3850", "0f3a00c000",
+                    // blank mandatory-prefix cells, JMPE, operand types (review)
+                    "0fd0c0", "0fd6c0", "0fe6c0", "0ff000", "0f7cc0", "f30f54c0", "f20f54c0", "f30f2b00", "f20f2b00", "f30f2bc0", "f20f5bc0",
+                    "0fb8c0", "660fb8c0", "f20fb8c0", "660f3850", "660f12c0", "0f5000", "0fd700", "f30fd600", "0f711000", "0f73d8", "f30f38f0c0", "660f3a0000"] {
+            assert!(super::undefined(&b(hex)).is_some_and(|s| s.well_formed() && s.kind == super::system::UD), "{hex}");
+        }
+        for hex in ["8d00", "0f1300", "0fc300", "f30fb8c0", "660f73d8", "f30fd6c0", "660f1200", "66f30f10c0", "0fc708", "0fc7f0", "0fc7f8", "0f38f0c0", "0f3800c0", "0f3a0fc000", "0f05", "0f0d08"] {
+            assert!(super::undefined(&b(hex)).is_none(), "{hex}");
+        }
+    }
+    /// Every feature-gated cell of `SIMD` (and PTWRITE) is #UD exactly when tools/models/cpu_profile.json, the profile's
+    /// source, says its CPUID bit is clear: a profile change cannot leave a false #UD behind (or a missed one).
+    #[test]
+    fn undefined_follows_the_profile() {
+        use crate::json::{Value, parse};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/models/cpu_profile.json");
+        let profile = parse(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let Some(Value::Array(leaves)) = profile.get("cpuid") else { panic!("no cpuid table") };
+        let state = |(leaf, sub, reg, bit): super::Feature| -> String {
+            let entry = leaves.iter().find(|e| {
+                let n = |k: &str| e.get(k).and_then(Value::as_str).map(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap());
+                n("leaf") == Some(leaf) && n("subleaf").is_none_or(|s| s == sub)
+            });
+            let field = entry.and_then(|e| e.get("fields")?.get(["eax", "ebx", "ecx", "edx"][reg])?.get(&bit.to_string()));
+            field.and_then(|f| f.get("state")?.as_str()).unwrap_or_else(|| panic!("CPUID {leaf:#x}.{sub} reg {reg} bit {bit} not in the profile")).to_string()
+        };
+        let mut checked = 0;
+        for &(map, lo, hi, prefixes, feature) in super::SIMD {
+            let Some(feature) = feature else { continue };
+            let on = match state(feature).as_str() {
+                "advertised" => true,
+                "clear" => false,
+                s => panic!("feature {feature:?}: state {s}"),
+            };
+            assert_eq!(super::advertised(feature), on, "{feature:?}: generated profile and cpu_profile.json disagree");
+            for op in lo..=hi {
+                for &p in prefixes {
+                    let pre: &[u8] = match p { b'6' => &[0x66], b'3' => &[0xf3], b'2' => &[0xf2], _ => &[] };
+                    let esc: &[u8] = match map { 1 => &[0x0f], 2 => &[0x0f, 0x38], _ => &[0x0f, 0x3a] };
+                    let bytes = [pre, esc, &[op, 0x00, 0x00]].concat();
+                    // Another feature may define the same cell (e.g. 66 0f 38 dc: AES and KL with F3): judge by all of them.
+                    let any = super::SIMD.iter().any(|&(m, l, h, ps, f)| m == map && (l..=h).contains(&op) && ps.contains(&p) && f.is_none_or(|f| state(f) == "advertised"));
+                    assert_eq!(super::undefined(&bytes).is_some(), !any, "{bytes:02x?} ({feature:?} {})", if on { "advertised" } else { "clear" });
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100, "{checked}");
+        assert_eq!(super::advertised(super::PT.unwrap()), state(super::PT.unwrap()) == "advertised");
+    }
+    #[test]
+    fn reserved_nops() {
+        use super::system::RESERVED_NOP;
+        let d = |hex: &str, map| super::decode(&b(hex), map, b(hex)[b(hex).iter().position(|&x| x == 0x0f).unwrap() + 1]).map(|s| (s.kind, s.length));
+        for (hex, map, length) in [("0f1820", 1, 3), ("0f18c0", 1, 3), ("f30f180400", 2, 5), ("0f1900", 1, 3), ("660f1a00", 4, 4), ("f20f1b8000010000", 3, 8),
+                                   ("0f1cc8", 1, 3), ("0f1d4408f0", 1, 5), ("0f0d00", 1, 3), ("640f0d3d00000000", 1, 8), ("480f1d05ffffffff", 1, 8)] {
+            assert_eq!(d(hex, map), Some((RESERVED_NOP, length)), "{hex}");
+        }
+        assert_eq!(d("0f0dc0", 1), None); // fexc's #UD
+    }
+    #[test]
+    fn push_pop_fs_gs() {
+        use super::system::{POP_SREG, PUSH_SREG};
+        let d = |hex: &str| super::decode(&b(hex), super::MAP_TWO, b(hex).iter().rev().next().copied().unwrap()).map(|s| (s.kind, s.cr, s.size, s.length));
+        let (fs, gs) = (natemu_abi::execution::SREG_FS as u32, natemu_abi::execution::SREG_GS as u32);
+        assert_eq!(d("0fa0"), Some((PUSH_SREG, fs, 8, 2)));
+        assert_eq!(d("660fa9"), Some((POP_SREG, gs, 2, 3)));
+        assert_eq!(d("66480fa8"), Some((PUSH_SREG, gs, 8, 4)));
+        assert_eq!(d("f30fa1"), None); // F3: not a form of it
+    }
+    #[test]
+    fn noncanonical_branches() {
+        use super::system::BRANCH;
+        let s = |hex: &str, rip| super::branch(&b(hex), rip).map(|s| (s.kind, s.cr, s.size, s.disp, s.length));
+        let top = 0x7fff_ffff_fff0;
+        assert_eq!(s("eb20", top), Some((BRANCH, 16, 8, 0x20, 2)));
+        assert_eq!(s("eb0c", top), None); // 0x7fff_ffff_fffe: canonical
+        assert_eq!(s("e810000000", top), Some((BRANCH, 17, 8, 0x10, 5)));
+        assert_eq!(s("0f8410000000", top), Some((BRANCH, 4, 8, 0x10, 6)));
+        assert_eq!(s("75e0", 0xffff_8000_0000_0010), Some((BRANCH, 5, 8, -0x20, 2)));
+        assert_eq!(s("e220", top), Some((BRANCH, 20, 8, 0x20, 2)));
+        assert_eq!(s("67e320", top), Some((BRANCH, 21, 4, 0x20, 3)));
+        assert_eq!(s("67eb20", top), Some((BRANCH, 16, 8, 0x20, 3))); // 0x67 ignored by JMP
+        assert_eq!(s("3e7420", top), Some((BRANCH, 4, 8, 0x20, 3))); // ds (a hint) je
+        assert_eq!(s("48e900100000", top), Some((BRANCH, 16, 8, 0x1000, 6))); // REX.W jmp
+        assert_eq!(s("66e900100000", top), Some((BRANCH, 16, 8, 0x1000, 6))); // 66 ignored: rel32 still
+        assert_eq!(s("f2e800100000", top), Some((BRANCH, 17, 8, 0x1000, 6))); // bnd call
+        assert_eq!(s("2e0f8500100000", top), Some((BRANCH, 5, 8, 0x1000, 7)));
+        assert_eq!(s("f0eb20", top), None); // LOCK: not a branch prefix (#UD elsewhere)
+        assert_eq!(s("90", top), None);
+        assert!(super::branch(&b("e810000000"), top).unwrap().well_formed());
+    }
 }
 
 #[cfg(test)]
@@ -515,11 +845,14 @@ mod tests {
         // I10: 0x67 on a memory operand (mov ds, [eax]; lgdt [eip+0x80]).
         assert_eq!(p("678e18", 0x8e), Some(System { cr: 3, size: 4, prefixes: ADDRESS32, ..mem(MOV_TO_SREG, 0, 0, 3) }));
         assert_eq!(d("670f011580000000", 0x01), Some(System { prefixes: ADDRESS32, ..mem(LGDT, RIP, 0x80, 8) }));
-        for (hex, op) in [("66cb", 0xcb), ("66ff28", 0xff), ("ffe8", 0xff), ("ff20", 0xff), ("362e8e18", 0x8e), ("8ed8", 0x8c)] {
+        for (hex, op) in [("66cb", 0xcb), ("66ff28", 0xff), ("ff20", 0xff), ("362e8e18", 0x8e), ("8ed8", 0x8c)] {
             assert_eq!(p(hex, op), None, "{hex}");
         }
-        for (hex, op) in [("0f0120", 0x01), ("0f00f8", 0x00), ("f30f00e0", 0x00)] {
-            assert_eq!(d(hex, op), None, "{hex}"); // smsw, 0f 00 /7, f3 verr
+        for hex in ["ffe8", "ffd8", "66ffe8"] {
+            assert_eq!(p(hex, 0xff).map(|s| s.kind), Some(UD), "{hex}"); // X1c: far JMP/CALL with a register operand
+        }
+        for (hex, op) in [("f30f0120", 0x01), ("f30f00e0", 0x00)] {
+            assert_eq!(d(hex, op), None, "{hex}"); // f3 smsw, f3 verr (X1c: smsw and 0f 00 /7 decode, `x1c_forms`)
         }
     }
 
@@ -650,8 +983,11 @@ mod tests {
             assert_eq!(d(hex, 0xc7).map(|s| s.kind), Some(UD), "{hex}"); // xrstors, xsavec, xsaves64
         }
         assert_eq!(d("0fc708", 0xc7), None); // cmpxchg8b stays admitted
-        for hex in ["660fae00", "f30fae20", "f20fae28"] {
-            assert_eq!(d(hex, 0xae), None, "{hex}"); // NP forms with 66/F2/F3
+        for hex in ["660fae00", "f20fae28"] {
+            assert_eq!(d(hex, 0xae), None, "{hex}"); // NP forms with 66/F2
+        }
+        for hex in ["f30fae20", "f30faee0"] {
+            assert_eq!(d(hex, 0xae).map(|s| s.kind), Some(UD), "{hex}"); // X1c: PTWRITE m, r (Intel PT not advertised)
         }
         assert_eq!(d("670fae00", 0xae), Some(System { prefixes: ADDRESS32, ..mem(FXSAVE, 0, 0, 4) })); // fxsave [eax] (I10)
         assert_eq!(d("0f01d0", 0x01), Some(System { kind: XGETBV, length: 3, ..System::NONE }));
@@ -677,8 +1013,8 @@ mod tests {
     fn unsupported_forms_are_refused() {
         let bytes = |hex: &str| -> Vec<u8> { (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect() };
         for (hex, map, op) in [
-            ("0f01e0", MAP_TWO, 0x01),   // smsw eax (mod 3)
-            ("0f0120", MAP_TWO, 0x01),   // smsw is /4
+            ("f30f01e0", MAP_TWO, 0x01), // F3 smsw: no SDM form
+            ("0fb218", MAP_TWO, 0xb2),   // lss m16:32: not built
             ("650f0138", MAP_TWO, 0x01), // GS override
             ("f30f22d8", MAP_TWO, 0x22), // F3
             ("0f21c0", MAP_TWO, 0x23),   // FEX's opcode disagrees
@@ -694,6 +1030,31 @@ mod tests {
             let got = decode(&bytes(hex), map, op);
             assert_eq!(got.is_some(), hex == "0f017810", "{hex}");
         }
+    }
+
+    #[test]
+    fn x1c_forms() {
+        let bytes = |hex: &str| -> Vec<u8> { (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect() };
+        let kind = |hex: &str, map, op| decode(&bytes(hex), map, op).map(|s| s.kind);
+        for (hex, map, op) in [("06", MAP_PRIMARY, 0x06), ("1f", MAP_PRIMARY, 0x1f), ("9a00000000080000", MAP_PRIMARY, 0x9a), ("ea000000000800", MAP_PRIMARY, 0xea),
+                               ("0fb4c0", MAP_TWO, 0xb4), ("0f01c7", MAP_TWO, 0x01), ("660f01cd", MAP_TWO, 0x01), ("f20f01d2", MAP_TWO, 0x01), ("0f01d3", MAP_TWO, 0x01),
+                               ("f30f01ec", MAP_TWO, 0x01), ("0f012d00000000", MAP_TWO, 0x01), ("0f00f8", MAP_TWO, 0x00), ("0f003800", MAP_TWO, 0x00)] {
+            assert_eq!(kind(hex, map, op), Some(UD), "{hex}");
+        }
+        assert_eq!(kind("0f06", MAP_TWO, 0x06), Some(CLTS));
+        assert_eq!(kind("0f34", MAP_TWO, 0x34), Some(SYSENTER));
+        let sys = |hex: &str, map, op| decode(&bytes(hex), map, op).map(|s| (s.kind, s.size, s.memory, s.reg, s.length));
+        assert_eq!(sys("0f35", MAP_TWO, 0x35), Some((SYSEXIT, 4, 0, 0, 2)));
+        assert_eq!(sys("480f35", MAP_TWO, 0x35), Some((SYSEXIT, 8, 0, 0, 3)));
+        assert_eq!(sys("0f01e0", MAP_TWO, 0x01), Some((SMSW, 4, 0, 0, 3))); // smsw eax
+        assert_eq!(sys("660f01e3", MAP_TWO, 0x01), Some((SMSW, 2, 0, 3, 4))); // smsw bx
+        assert_eq!(sys("490f01e1", MAP_TWO, 0x01), Some((SMSW, 8, 0, 9, 4))); // smsw r9
+        assert_eq!(sys("0f0120", MAP_TWO, 0x01).map(|s| (s.0, s.2)), Some((SMSW, 1))); // smsw [rax]
+        assert_eq!(sys("0f01f0", MAP_TWO, 0x01).map(|s| (s.0, s.3)), Some((LMSW, 0))); // lmsw ax
+        assert_eq!(sys("0f0130", MAP_TWO, 0x01).map(|s| (s.0, s.2)), Some((LMSW, 1))); // lmsw [rax]
+        assert_eq!(kind("0f01c0", MAP_TWO, 0x01), Some(UD)); // ENCLV/VMX: unchanged
+        assert_eq!(kind("0f01d0", MAP_TWO, 0x01), Some(XGETBV)); // unchanged
+        assert_eq!(kind("0fb218", MAP_TWO, 0xb2), None); // lss m: not built
     }
 
     #[test]

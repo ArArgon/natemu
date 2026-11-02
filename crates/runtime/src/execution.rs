@@ -1081,7 +1081,37 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             return Ok(());
         }
         system::INTO | system::UD => return Err(UD),
+        // X1c: a Reserved-NOP cell: completes, nothing accessed (LOCK was #UD above).
+        system::RESERVED_NOP => return Ok(commit(s, i, false)),
         system::TOO_LONG => return Err(GP),
+        // X1c: a direct branch to a non-canonical target (host `system::branch`): #GP(0) when taken, with nothing changed
+        // (a fault, SDM Vol.3 7.5: LOOP's count is not decremented; CALL checks before its push); not taken, it completes
+        // (LOOPcc decrements its count; with 0x67 ECX, written zero-extended as every 32-bit register result).
+        system::BRANCH => {
+            let flag = |b: u32| s.cpu.rflags >> b & 1 != 0;
+            let (cf, pf, zf, sf, of) = (flag(0), flag(2), flag(6), flag(7), flag(11));
+            let mask = if i.size == 4 { 0xffff_ffff } else { u64::MAX };
+            let count = s.cpu.gpr[1] & mask;
+            let c = i.cr as usize;
+            let taken = match c {
+                0..=15 => [of, cf, zf, cf || zf, sf, pf, sf != of, zf || sf != of][c >> 1] != (c & 1 != 0),
+                16 | 17 => true,
+                18 => count != 1 && !zf,
+                19 => count != 1 && zf,
+                20 => count != 1,
+                _ => count == 0,
+            };
+            if paging::canonical(s.cpu.rip.wrapping_add(u64::from(i.length)).wrapping_add(i.disp as u64)) {
+                halt(s, stop::BAD_REPLY)
+            }
+            if taken {
+                return Err(GP);
+            }
+            if (18..=20).contains(&c) {
+                s.cpu.gpr[1] = count.wrapping_sub(1) & mask;
+            }
+            return Ok(commit(s, i, false));
+        }
         // X2: interrupt-flag control, HLT (it parks after its commit) and the test drivers' event hook.
         // X2: a BT* memory form under alignment checking: #AC(0) when misaligned, else it is stepped (`find`), RIP kept.
         system::BT_ALIGNED => {
@@ -1138,7 +1168,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         // INS/OUTS stays at the instruction between elements).
         system::IN..=system::OUTS => return ports::transaction(s, i),
         // S3: each checks its own privilege ([`syscalls`]); SYSCALL/SYSRET commit to their target RIP.
-        system::SWAPGS..=system::CLFLUSH => {
+        system::SWAPGS..=system::CLFLUSH | system::SYSENTER | system::SYSEXIT => {
             let c = s.cpu;
             return match syscalls::execute(s, i) {
                 Ok(None) => Ok(commit(s, i, false)),
@@ -1157,9 +1187,10 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
     // CPUID runs at any CPL; RDTSC/RDTSCP at CPL > 0 unless CR4.TSD, RDPMC with CR4.PCE; SGDT/SIDT/SLDT/STR (CR4.UMIP is
     // not in the profile), segment register moves and far transfers at any CPL; the rest at CPL 0 only.
     let unprivileged = match i.kind {
-        system::CPUID => true,
+        system::CPUID | system::SMSW => true,
         system::SGDT | system::SIDT | system::SLDT | system::STR => true,
         system::MOV_TO_SREG | system::MOV_FROM_SREG | system::JMP_FAR | system::CALL_FAR | system::RET_FAR | system::IRET => true,
+        system::PUSH_SREG | system::POP_SREG => true,
         system::RDTSC | system::RDTSCP => c.cr4 & CR4_TSD == 0,
         system::RDPMC => c.cr4 & CR4_PCE != 0,
         _ => false,
@@ -1223,6 +1254,39 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             }
             // K1: a change of a bit the walks depend on flushes the TLBs; the gating and rounding bits are in the context.
             (s.cpu.cr0 ^ c.cr0) & (CR0_PG | CR0_WP) != 0 || (s.cpu.cr4 ^ c.cr4) & CR4_PAGING != 0
+        }
+        // X1c (SDM Vol.2 CLTS, SMSW, LMSW; CLTS and LMSW at CPL 0 only, above, SMSW at any CPL: CR4.UMIP is not in the
+        // profile): CLTS clears CR0.TS; SMSW stores CR0[15:0] to m16, or CR0 into a register at its operand size (16 bits
+        // merge, 32 and 64 zero-extend, "defined by the following examples" for 64-bit mode); LMSW loads CR0[3:0] from the
+        // source's low 4 bits, except that it never clears PE. TS, EM and MP are in the code context (no flush).
+        system::CLTS => {
+            s.cpu.cr0 = c.cr0 & !CR0_TS;
+            false
+        }
+        system::SMSW if i.memory == 1 => {
+            let mut buf = (c.cr0 as u16).to_le_bytes();
+            segments::linear(s, segments::address(&c, &i), &mut buf, true, false, segments::noncanonical(&i))?;
+            false
+        }
+        system::SMSW => {
+            let r = &mut s.cpu.gpr[i.reg as usize];
+            *r = match i.size {
+                2 => *r & !0xffff | c.cr0 & 0xffff,
+                4 => c.cr0 & 0xffff_ffff,
+                _ => c.cr0,
+            };
+            false
+        }
+        system::LMSW => {
+            let source = if i.memory == 1 {
+                let mut buf = [0u8; 2];
+                segments::linear(s, segments::address(&c, &i), &mut buf, false, false, segments::noncanonical(&i))?;
+                u64::from(u16::from_le_bytes(buf))
+            } else {
+                gpr(i.reg)
+            };
+            s.cpu.cr0 = c.cr0 & !(CR0_MP | CR0_EM | CR0_TS) | source & (CR0_PE | CR0_MP | CR0_EM | CR0_TS);
+            false
         }
         // SDM Vol.2 MOV DR, Vol.3 17.2: (DR8..DR15 #UD and CPL > 0 #GP above) DR4/DR5 #UD with CR4.DE, else DR6/DR7;
         // general detect (DR7.GD): #DB, a fault before the MOV, with DR6.BD set (B0..B3 kept: the SDM lets the CPU
@@ -1357,7 +1421,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         // Descriptor tables, segment registers and far transfers ([`segments`]). The resident has no jump tables (an
         // unlisted `br` fails tools/check_resident_stack.py; the runtime target builds with `-C jump-tables=no`), and
         // the kinds are grouped in ranges besides.
-        system::LGDT..=system::IRET => match segments::execute(s, i) {
+        system::LGDT..=system::IRET | system::PUSH_SREG | system::POP_SREG => match segments::execute(s, i) {
             Ok(None) => false,
             // A far transfer: RIP is the target (nothing to add), and the mode check of [`commit`] applies.
             Ok(Some(rip)) => {

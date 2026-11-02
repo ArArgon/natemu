@@ -34,7 +34,7 @@ const RFLAGS_VM: u64 = 1 << 17;
 const IRET_ALWAYS: u64 = 0x25_4dd5;
 const IRET_CPL0: u64 = RFLAGS_IOPL | 3 << 19;
 
-/// Executes `i` (LGDT ..= IRET). `Ok(None)`: committed, RIP moves past it; `Ok(Some(rip))`: a far transfer committed to
+/// Executes `i` (LGDT ..= IRET, PUSH_SREG, POP_SREG). `Ok(None)`: committed, RIP moves past it; `Ok(Some(rip))`: a far transfer committed to
 /// `rip`. On `Err` the vCPU's state is unchanged (guest memory may hold an accessed bit a failed load set, as the SDM
 /// allows).
 pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception> {
@@ -99,6 +99,23 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             let selector = selector_operand(s)?;
             load_data(s, i.cr as usize, selector)?;
             s.cpu.mov_ss = u64::from(i.cr as usize == SREG_SS);
+        }
+        // X1c: PUSH FS/GS: the selector zero-extended to the operand size (SDM Vol.2 PUSH), at RSP - size (#SS(0) when
+        // not canonical). POP FS/GS: the popped selector loaded as MOV Sreg does (#GP/#NP checks, FS/GS base from the
+        // descriptor), then RSP + size; a fault leaves RSP unchanged.
+        system::PUSH_SREG => {
+            let n = i.size as usize;
+            let rsp = c.gpr[4].wrapping_sub(u64::from(i.size));
+            let mut b = u64::from(c.seg[i.cr as usize].selector).to_le_bytes();
+            linear(s, rsp, &mut b[..n], true, false, SS0)?;
+            s.cpu.gpr[4] = rsp;
+        }
+        system::POP_SREG => {
+            let n = i.size as usize;
+            let mut b = [0u8; 8];
+            linear(s, c.gpr[4], &mut b[..n], false, false, SS0)?;
+            load_data(s, i.cr as usize, u16::from_le_bytes([b[0], b[1]]))?;
+            s.cpu.gpr[4] = c.gpr[4].wrapping_add(u64::from(i.size));
         }
         system::JMP_FAR..=system::CALL_FAR => return far_transfer(s, i).map(Some),
         system::RET_FAR..=system::IRET => return far_return(s, i).map(Some),

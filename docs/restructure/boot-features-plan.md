@@ -3184,6 +3184,130 @@ VDPPS order above. **Checks:** `run_i5c.py` gains the review's 19 cases (VCVTPS2
 QNaN, VCVTPH2PS/VCVTPS2PH denormals, CVT(T)PS2PI's upper lanes masked and unmasked, FST m64 +-DBL_MIN and a negative
 denormal, FST m32 FLT_MIN and an exact float denormal, FISTTP/FISTP invalid): the DBL_MIN and CVT(T)PS2PI ones red with
 series40-i5c-add, all green with series42-i5c.
+*Built (X1b, X1c: CPL 3 frames, every IST index, paranoid entries, the double-fault matrix, refused-but-defined forms
+delivered; series36, and series38-x1 for the addendum):* **X1b (checks only; X1a built the mechanism).** `tools/bench/smp/entry.py`,
+`run_x1.py qemu`: each CPU loads its own GDT (with a DPL 3 read-only expand-down "CPU/node" descriptor whose limit is the
+CPU number), a TSS whose RSP0 and IST1..7 sit 8 bytes off a 16-byte boundary, an IDT and CR4.FSGSBASE, and IRETQs to
+CPL 3 with GS.base = a user block and KERNEL_GS_BASE = its per-CPU block. Gates: #DE #UD #GP #PF on RSP0, #DF IST1, NMI
+IST2, #DB IST3, 0x12 (the #MC vector, by INT 0x12) IST4, #BP IST5, 0x80 IST6, 0x81 IST7. "Normal" handlers SWAPGS when
+the frame's CS has RPL 3; "paranoid" ones (#DF, NMI, #DB, 0x12) RDGSBASE, LSL the CPU/node selector, index a table of
+per-CPU bases and WRGSBASE, restoring the base before IRETQ (architectural instructions only, SDM Vol.2 SWAPGS,
+RDGSBASE/WRGSBASE, LSL). CPL 3 runs UD2, INT3, INT 0x80, MOV from CR0 (#GP(0)), a supervisor load (#PF(5)), DIV by 0,
+INT1, a single step, INT 0x12 through a DPL 0 gate (#GP(0x92)), INT 0x40 through gates not present (#NP(0x202) serially,
+then #NP(0x5b): #DF on IST1), LSL/RDGSBASE/[gs:0] at CPL 3, then INT 0x81 into CPL 0, where a self-NMI's handler sends
+a second NMI that must wait for its IRETQ (logged with the in-NMI flag clear, same frame RIP), INT 0x12, UD2 with RSP
+8 off 16, INT1 and a CPL 0 #DF (so IST 2 and 4 are met from CPL 0 only; IST selection does not depend on the CPL).
+Every logged frame (SS:RSP, RFLAGS, CS:RIP, error code, RIP-slot address) is compared with pinned QEMU, and
+delivery_model judges, given the logged context, the vector chain, error code, RF and the stack chosen (the slot); the
+second NMI's frame RIP must equal the first's. 1, 2 and 4 CPUs, block sizes default and 1: 3 of 3 programs match (17
+events per CPU). It passes on HEAD too: X1b found no defect. Negative control: IST n read from slot `n & 6` (IST 1
+right, 2..7 wrong) is red (70 failures: frames against the model and memory against QEMU). QEMU departure (RF cleared
+in the QEMU comparison, the model judges natemu's RF): pinned QEMU pushes RF = 1 for INT n/INT3 run after an IRETQ that
+loaded RF = 1 and for NMIs (SDM: 0, and the current RF).
+**X1c, the double-fault matrix** (SDM Vol.3 interrupt 8, Tables 7-4 and 7-5; `run_slice3_vm.py delivery`, judged by
+delivery_model alone since QEMU resets on a triple fault): 51 cases at both block sizes (X1a's 18 and 33 new). A fault
+detected while delivering is a #GP, #NP, #TS or #SS (gate, IDT limit, target CS, TSS limit, RSP0/IST canonical) or a #PF
+(IDT, TSS or frame on a page not present), so the reachable cells are every first class against contributory and page:
+benign then either, serial (#UD, #NM, INT n, INT1, NMI, an external interrupt); contributory then contributory, #DF (first
+#DE, #GP, #NP, #TS, #SS, each); contributory then page, serial; page then contributory (#GP, #NP, #TS, #SS) or page, #DF;
+#DF then contributory or page, shutdown (`stop::SHUTDOWN` with the last fault, the original RIP and CR2; also from an IDT
+limit below every gate, an IDT on a page not present and RSP0 beyond the TSS limit from CPL 3). A benign second
+exception never arises inside a delivery (a data breakpoint on the frame is a trap taken after it, S4's
+`s4-d-ext-frame`), so the benign column is the serial default. Only the last delivery is visible, so where the second
+fault's own gate could take it, that gate is live: serial handling instead of #DF ends at another handler. Negative
+control: page-then-contributory made serial is red on exactly its 4 cases (8 runs). #DF's CS:RIP stay the original
+context (undefined by the SDM; the model accepts any). The independent review found the contributory-then-#PF cell
+indistinguishable from #DF in the first version (both ended in #DF on IST 1); `de-pf` and `gp-pf` now take the #PF
+on IST 1 with #DF's gate on the bad stack (a wrong #DF would end in a shutdown); red with that cell made #DF. **Refused-but-defined.** Every typed stop guest behaviour can reach
+in the resident and host was inventoried and classified as an SDM-defined exception (delivered now), a declared refusal
+of something not built or undefined, or an emulator invariant. Delivered now (each a stop on HEAD, 0 of 87 cases pass
+there): #UD for PUSH/POP ES/CS/SS/DS and JMP/CALL ptr16:32 in 64-bit mode, LSS/LFS/LGS and far JMP/CALL with a register
+operand, the 0f 01 register forms no advertised feature defines and 0f 01 /5 m without F3, 0f 00 /7, and (host
+`system::undefined`, for forms fexc refuses as `unsupported_form`) the blank Table A-2/A-3/A-6 cells (`d6`, `0f 04 0a 0c
+0e 24..27 36 39 3b 3c..3f 7a 7b`, group 9 /0../5 register and /0 /2 memory), register operands of memory-only forms (LEA,
+MOVNTI, MOVLPS/MOVHPS/MOVLPD/MOVHPD stores, MOVNTPS/PD, MOVNTDQ, LDDQU, MOVNTDQA, CMPXCHG8B/16B), GETSEC (CR4.SMXE = 0),
+RSM outside SMM, the VMX group-9 forms and the blank or unadvertised SIMD cells (review round, below); #GP(0) at a
+direct JMP/CALL/Jcc whose target is not canonical, when taken (host `system::branch`, resident `system::BRANCH`: the
+condition from the banked flags, nothing changed, CALL before its push; not taken it completes), which fexc refuses
+("slice 1 does not deliver that #GP"). Also built, defined instructions that stopped: CLTS, SMSW (16-bit merge, 32/64
+zero-extended, m16), LMSW (PE never cleared), SYSENTER and SYSEXIT (REX.W; without it compatibility mode stops
+`unsupported_mode`, as SYSRETL). Declared refusals kept (not built, or undefined): CPL 1/2 and compatibility mode, call
+gates, 66 on far transfers, LSS/LFS/LGS m, ENTER with nesting, the fexc forms not built (RCL/RCR m, 16-bit
+SHLD/SHRD/BSWAP, MASKMOVQ, ...), 66/F3 on a near branch to a canonical target (the SDM ignores them, but FEX's lowering
+is not proven for them), REP prefixes and segment overrides the SDM leaves unpredictable on other instructions, DR7 R/W = 10
+without CR4.DE (undefined), #AC on 8-aligned 16/32-byte vector accesses ("may or may not"), split locks (owner), unmasked
+x87/SIMD exceptions (being built), device-page forms and device refusals (M3, L3, L4b), xAPIC base over RAM, ICR SMI,
+reserved and INIT/SIPI modes (X4), page tables outside guest RAM. Invariants: shadow capacity, a watchpoint beyond the
+PE's (unreachable with 4), the copy-in failures after a walk, and the internal reply/link/abort stops. **Addendum (fexc series38-x1 = series36's patches + a shim change, no FEX patch):** LOOPcc/JrCXZ to a
+non-canonical target were compiled (the #GP came at the target, RCX decremented); the shim's direct-branch set now
+includes `e0..e3` and `system::BRANCH` evaluates the count (RCX, or ECX with 0x67): taken, #GP(0) at the branch with RCX
+unchanged (a fault restores the state, Vol.3 7.5); not taken, RCX decremented (ECX written zero-extended). Indirect
+JMP/CALL/RET to a non-canonical target already fault at the branch (probed). The guest-RIP split lock is no longer
+refused at admission (a host error): its atomic faults and the resident stops `unsupported_atomic` as for a computed
+address. Code on a page that is not guest RAM (since M2 any RAM type is fetched): the owner decisions of October 29 (below:
+unassigned addresses read all-ones; the amendment maps unassigned pages read-only and non-executable) leave no execution
+there, and the SDM defines no exception for fetching from memory-mapped I/O, so it is the typed stop `no_code`
+`fetch_not_ram` at the RIP (was a host error). PUSH/POP FS/GS
+(`system::PUSH_SREG`, `POP_SREG`; SDM Vol.2 PUSH "a zero-extended value" for a 64-bit push, 66: 2 bytes; POP with MOV
+Sreg's checks, RSP unchanged on a fault). Hint NOPs: PREFETCHW m8 (`0f 0d /1`: "merely a hint", no #UD without the CPUID
+bit) and CLDEMOTE m8 (NP `0f 1c /0`: "treated as a NOP" without it) are compiled. **Reserved-NOP cells (owner decision,
+November 2): NOPs, following the modelled processor.** The other `0f 0d` memory forms, `0f 18` other than /0../3 m
+without F2/F3, the `0f 18` and `0f 1c` register forms, the prefixed `0f 1c` and all of `0f 19..1d` (MPX's `0f 1a/1b`
+included: no MPX advertised, and no instruction page in this SDM) are cells SDM Vol.2 A.1 calls "Reserved-NOP": "may
+behave as NOP on certain processors"; a typed stop would halt the VM where the modelled processor executes a NOP. Pinned
+QEMU (system mode, the smp stub) executes all 296 such encodings of a sweep as NOPs with no memory access (each with no
+prefix, 66, F2 and F3, /0../7 on a non-canonical [rax] and register forms; raw evidence `natemu-raw/x1-20261102-01/
+qemu-reserved-nop-sweep.log`, 314 encodings with LOCK and the 0f 0d register forms). fexc cuts them as system
+instructions, the host decodes the ModRM (`system::RESERVED_NOP`, any 66/F2/F3/REX/segment prefix) and the resident
+completes them with nothing accessed; LOCK is #UD (the resident's LOCK rule; QEMU agrees). **`0f 0d` with a register
+operand is #UD** (fexc `cut_ud`): PREFETCHW takes m8 and Table A-3 lists only "prefetchw(/1) Ev" there, the I10 rule
+(#UD for an encoding the SDM does not define as an instruction), and pinned QEMU raises #UD for all 12 such encodings of
+the sweep (owner decision, November 2). Checks:
+`run_x1.py qemu` gains `x1-sreg@1` (PUSH/POP FS/GS of every size, null and DPL 3 selectors, PREFETCHW/CLDEMOTE on a
+non-canonical address) equal to pinned QEMU and the SDM's registers, and `x1-rnop@1` (the sweep's 296 NOP encodings plus
+REX, SIB, displacement and segment-override variants, markers kept) equal to pinned QEMU; `cases` 112 (25 new: LOCK on
+three cells and `0f 0d` register forms #UD; LOOP/LOOPE/LOOPNE/JrCXZ taken
+and not, with and without 0x67, the count wrap; POP FS beyond the GDT #GP(0x7f8), PUSH GS at a non-canonical slot
+#SS(0), POP FS of a DPL 0 selector at CPL 3 #GP(0x10); the split lock; the fetch; the hints), all at both block sizes;
+on the x1-all build with series36, 15 of them, `x1-sreg@1` and `x1-rnop@1` are red (every taken branch, every new form,
+both typed stops, the `0f 0d` register forms); the three LOCK cases were #UD there already (kept as regression checks).
+Compiler slice-1 tests 34 pass, i10 faults 296 of 296 at both block sizes, ASM 1,869 pass.
+**Review round (November 2; an independent review, nothing blocking; fixes):** *Prefixed direct branches:*
+`system::branch` skips every prefix a near branch ignores in 64-bit mode (segment overrides and the 2e/3e Jcc hints; 66:
+"operand size prefixes are silently ignored ... the displacement field for relative branches is still limited to 32
+bits", Vol.1 3.3.7; REX, W included; F2; F3; 0x67 sets only LOOP/JrCXZ's count width), so a prefixed branch to a
+non-canonical target faults (or completes) as the unprefixed one. *Blank cells:* `system::undefined` now carries the
+legacy cells of the SIMD rows of Tables A-3, A-4 and A-5 by mandatory prefix (`SIMD`, each with the CPUID feature that
+defines it, read from the generated profile) and gives #UD for every cell of those rows not defined there, or defined by a
+feature the profile does not advertise (SHA, GFNI, ADX, CET_SS, KL, MOVDIRI, MOVDIR64B, ENQCMD), plus JMPE `0f b8` and
+66/F2 `0f b8`, the operand types of the register-only (`0f 50`, `d7`, `f7`, `c5`, `71..73`, F3/F2 `d6`) and memory-only
+(66 `0f 12/16`) forms, and PTWRITE (F3 `0f ae /4`, Intel PT not advertised; the memory form in the system decode); a cell
+with both 66 and F2/F3 is left alone. A fexc sweep of every 0f/0f 38/0f 3a opcode x NP/66/F3/F2 x memory/register found
+4,190 encodings it refuses in blank SIMD cells; pinned QEMU (system mode) raises #UD for 4,142 of them; it differs on 48
+(its decoder ignores 66/F3/F2 on EMMS `0f 77` and on SHA `0f 38 c8..cd`, `0f 3a cc`, and its CPU model has SHA), where
+the SDM's blank cells decide: #UD (raw evidence `natemu-raw/x1-20261102-01/qemu-blank-cells-sweep.log`).
+`undefined_follows_the_profile` derives the expectation for every feature-gated cell from tools/models/cpu_profile.json
+(advertised: no #UD; clear: #UD) and checks the generated profile agrees, so a profile change cannot leave a false #UD.
+*BND (owner decision, November 2): F2 on near CALL, RET, JMP and Jcc executes as the unprefixed branch, following the
+modelled processor:* MPX's BND prefix was designed to be ignored where MPX is not enumerated or enabled, MPX-era glibc
+emits `bnd jmp`, and processors ignore it; pinned QEMU executes them so (`x1-bnd@1`: BND CALL rel32/RET, JMP rel8/rel32,
+Jcc rel8/rel32, JMP and CALL through a register, equal to QEMU at both block sizes). The shim admits F2 on those branches
+(not on LOOP/JrCXZ) and admission's branch-target proof skips it. *Also:* an IRETQ that faults still releases NMI
+blocking (`iret-fault-nmi-unblocked`: the second NMI is taken at once); `fetch_not_ram` cites the owner decisions of
+October 29; the stack audit accepts a veneer's return only into the function whose `b` at the displaced address entered
+it. Checks: `run_x1.py` 6/6 QEMU programs, 188 cases (every condition taken and not, the prefixed branches, the blank
+cells and PTWRITE) at both block sizes.
+**Stack checker:** this build's layout made
+lld (`--fix-cortex-a53-843419`, the target's default; no option turns it off) move an instruction at a page's end into
+a veneer that branches back into `expm1`; `check_resident_stack.py` now accepts exactly that return (the veneer's own
+address + 4), with a test. Gate bound 19,168 of 32,768 bytes, boot 12,832. **Suite** (5d7f62e + X1b/X1c, series36): green
+but the 7 known i8b QEMU NaN departures (both block sizes) and `test_check_setup`'s launcher default, which differs only
+because the working copy sits behind a symlinked `natemu-raw`; ASM 1,865 pass (FEMMS now #UD, one SMSW test passes). **On 3fc2c4b (after I5c):** the compiler is series43-x1 = series42-i5c's patches (0001-0028) + the X1c shim
+changes (no FEX patch). Standing suite on 3fc2c4b + X1b/X1c with series43-x1, both block sizes: green but the 7 known i8b
+QEMU NaN departures; `run_x1` 6/6 and 188/188, delivery 51, `run_i5c` 255/255 ×2, `run_m2` 112, `run_s4`, i10 faults
+296/296 ×2, compiler slice-1 34 and `test_fexc` pass; ASM 1,875 pass, 0 fail (AMD's SSE4a MOVNTSS/MOVNTSD, now #UD on the
+Intel profile, are counted as not advertised). Debian 6.12 release boots: no initrd at N = 1 and N = 2 reach the root-fs
+panic (14.6 s and 13.1 s wall), the initrd boot at N = 2 reaches the installer's language dialog (56.7 s wall).
 
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 

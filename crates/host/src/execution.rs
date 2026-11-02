@@ -850,6 +850,14 @@ impl Compiler {
                     Some(s) if reason == "system_instruction" => Ok(Code::System(s)),
                     // Longer than 15 bytes with all of its first 15 fetched: #GP(0) (a fetch fault was `partial_decode`).
                     _ if reason == "instruction_too_long" => Ok(Code::System(exec::System { kind: exec::system::TOO_LONG, length: 1, ..exec::System::NONE })),
+                    // X1c: a form fexc refuses at this RIP that x86 defines as an exception: a direct branch to a non-canonical
+                    // target (#GP(0) when taken), or an encoding #UD whatever its operands ([`crate::system::undefined`]).
+                    _ if reason == "unsupported_form" && cut.is_some() => {
+                        match crate::system::branch(bytes, rip).or_else(|| crate::system::undefined(bytes)) {
+                            Some(s) => Ok(Code::System(s)),
+                            None => Ok(Code::None(reason.clone())),
+                        }
+                    }
                     _ => Ok(Code::None(reason.clone())),
                 }
             }
@@ -950,7 +958,11 @@ fn fetched(area: Area, state: &State, limit: Option<u64>) -> Result<std::result:
     if state.fetch[0] == u64::MAX {
         return match fault {
             Some(fault) => Ok(Err(Stop::FetchFault(fault))),
-            None => Err(format!("code at {rip:#x} is not guest RAM")),
+            // X1c: a page that is not guest RAM (a device or unassigned page): the owner decisions of October 29 give such
+            // pages reads of all-ones and writes ignored, and (amendment after L3) map unassigned ones read-only and
+            // non-executable; the SDM defines no exception for fetching from memory-mapped I/O. Code runs only from guest
+            // RAM, so it is a typed stop (`no_code`, reason `fetch_not_ram`) at the RIP, nothing executed.
+            None => Ok(Err(Stop::NoCode("fetch_not_ram".into()))),
         };
     }
     // Bytes of [va, the end of its page), cut at the limit when it lies inside; and whether it did.

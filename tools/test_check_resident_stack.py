@@ -43,6 +43,18 @@ class Synthetic(unittest.TestCase):
         info = graph({'a': ['ret'], 'b': ['blr x8', 'ret']})
         self.assertEqual(c.depth(info, 'a')[2], [])
 
+    def test_erratum_veneer_returns_after_the_displaced_instruction(self):
+        # lld (`--fix-cortex-a53-843419`, the target's default) moves an instruction at a page's last 8 bytes into a veneer
+        # named after its address, which branches back to the next one; only that return is accepted.
+        for back, ok in (('0x1008 <a+0x8>', True), ('0x1004 <a+0x4>', False)):
+            info = graph({'a': ['add x0, x0, #0x1', 'b 0x100c <__CortexA53843419_1004>', 'ret'],
+                          '__CortexA53843419_1004': ['ldr x0, [x0]', f'b {back}']})
+            self.assertEqual(not any('middle' in p for p in c.depth(info, 'a')[2]), ok, back)
+        # The return must land in the function whose `b` at the displaced address entered the veneer.
+        info = graph({'a': ['add x0, x0, #0x1', 'nop', 'ret'], '__CortexA53843419_1004': ['ldr x0, [x0]', 'b 0x1008 <a+0x8>'],
+                      'b': ['b 0x100c <__CortexA53843419_1004>', 'ret']})
+        self.assertTrue(any('middle' in p for p in c.depth(info, 'b')[2]))
+
     def test_branch_into_another_function_body_is_refused(self):
         info = graph({'a': ['b 0x1008 <b+0x4>'], 'b': ['sub sp, sp, #0x10', 'ret']})
         self.assertTrue(any('middle' in p for p in c.depth(info, 'a')[2]))

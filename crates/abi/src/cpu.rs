@@ -6,6 +6,9 @@ use crate::cpu_profile::{self as profile, Msr, access, rule};
 
 pub const MSR_TSC: u32 = 0x10;
 pub const MSR_APIC_BASE: u32 = 0x1b;
+pub const MSR_SYSENTER_CS: u32 = 0x174;
+pub const MSR_SYSENTER_ESP: u32 = 0x175;
+pub const MSR_SYSENTER_EIP: u32 = 0x176;
 pub const MSR_UCODE_REV: u32 = 0x8b;
 pub const MSR_MISC_ENABLE: u32 = 0x1a0;
 pub const MSR_PAT: u32 = 0x277;

@@ -1247,6 +1247,30 @@ pub mod system {
     pub const OUT: u32 = 0x61;
     pub const INS: u32 = 0x62;
     pub const OUTS: u32 = 0x63;
+    /// X1c (numbered apart: 0x70..): CLTS (`0f 06`), SMSW r/m (`0f 01 /4`; `size` of a register destination, 2, 4 or 8; a
+    /// memory destination takes 16 bits), LMSW r/m16 (`0f 01 /6`), SYSENTER (`0f 34`) and SYSEXIT (`0f 35`; `size` 8 with
+    /// REX.W: to 64-bit mode, else 4: to compatibility mode).
+    pub const CLTS: u32 = 0x70;
+    pub const SMSW: u32 = 0x71;
+    pub const LMSW: u32 = 0x72;
+    pub const SYSENTER: u32 = 0x73;
+    pub const SYSEXIT: u32 = 0x74;
+    /// X1c: a direct near branch to a non-canonical target (host `system::branch`; fexc refuses it): `cr` the condition
+    /// (0..15 Jcc's tttn, 16 JMP, 17 CALL, 18 LOOPNE, 19 LOOPE, 20 LOOP, 21 JrCXZ), `size` the width of the count for 18..21
+    /// (8: RCX, 4: ECX with 0x67), `disp` the displacement. Taken: #GP(0), nothing changed (SDM Vol.2 JMP/CALL/Jcc/LOOPcc/
+    /// JrCXZ, 64-bit mode; Vol.3 7.5: a fault restores the state before the instruction, so LOOP's count is not
+    /// decremented; CALL checks before its push); not taken: RIP past it, LOOPcc's count decremented.
+    pub const BRANCH: u32 = 0x75;
+    /// X1c: PUSH FS/GS and POP FS/GS (`0f a0`, `0f a8`, `0f a1`, `0f a9`): `cr` the segment register ([`super::SREG_FS`],
+    /// [`super::SREG_GS`]), `size` the operand size (8, or 2 with 66; REX.W wins). PUSH stores the selector zero-extended
+    /// (SDM Vol.2 PUSH: "a zero-extended value"); POP loads the popped selector as MOV Sreg does, then releases the slot.
+    pub const PUSH_SREG: u32 = 0x76;
+    pub const POP_SREG: u32 = 0x77;
+    /// X1c (owner decision, November 2): a Reserved-NOP cell (`0f 0d` m other than NP /1, `0f 18` other than /0../3 m without
+    /// F2/F3, `0f 19..1d` other than NP `0f 1c /0` m; any 66/F2/F3/REX/segment prefix): a NOP, as on the modelled processor
+    /// (SDM Vol.2 A.1 "may behave as NOP on certain processors"; pinned QEMU agrees). Its ModRM is decoded for `length`;
+    /// the memory operand is never accessed.
+    pub const RESERVED_NOP: u32 = 0x78;
     /// [`super::System::prefixes`] bits. I10: [`ADDRESS32`] on any memory operand (0x67): the effective address is truncated
     /// to 32 bits and zero-extended before the FS/GS base.
     pub const REP: u32 = 1;
@@ -1282,7 +1306,13 @@ pub mod system {
                     SSE_GATED | AVX_GATED | MMX_GATED => true,
                     INT => self.cr < 256,
                     INT3 | INT1 | INTO | UD | TOO_LONG => true,
-                    SWAPGS | SYSCALL | WBINVD => true,
+                    SWAPGS | SYSCALL | WBINVD | CLTS | SYSENTER => true,
+                    SMSW => rm && matches!(self.size, 2 | 4 | 8),
+                    LMSW => rm,
+                    SYSEXIT => matches!(self.size, 4 | 8),
+                    BRANCH => self.cr <= 21 && matches!(self.size, 4 | 8),
+                    RESERVED_NOP => true,
+                    PUSH_SREG | POP_SREG => matches!(self.cr as usize, super::SREG_FS | super::SREG_GS) && matches!(self.size, 2 | 8),
                     SYSRET => matches!(self.size, 4 | 8),
                     RDFSBASE..=WRGSBASE => self.memory == 0 && reg(self.reg) && self.segment == 0 && matches!(self.size, 4 | 8),
                     LAR | LSL => rm && reg(self.cr) && matches!(self.size, 2 | 4 | 8),

@@ -28,6 +28,9 @@ PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
 
 # name -> hex. Architecturally: privilege/descriptor/MSR/segment/interrupt/IO/TLB/cache/flag-control, or VM-owned values.
 SYSTEM = {
+    # X1c: Reserved-NOP cells (owner decision: NOPs, the resident's RESERVED_NOP)
+    '0f 0d /0 m': '0f0d00', 'prefetch /4 m': '0f1820', 'prefetch reg': '0f18c0', 'f3 prefetchnta': 'f30f1800', '0f 19 m': '0f1900',
+    '66 0f 1a m (bndmov form)': '660f1a00', 'f2 0f 1b reg': 'f20f1bc0', '0f 1c reg': '0f1cc0', '66 cldemote': '660f1c00', '0f 1d m': '0f1d00',
     # I9: #UD the host decodes (MOVBE with a register operand; ADX, CET_SS and SHA not advertised)
     'movbe rax,rcx (#UD)': '480f38f0c1', 'movbe cx,ax (#UD)': '660f38f1c1', 'adcx rax,rcx (#UD)': '66480f38f6c1', 'adox (#UD)': 'f3480f38f6c1',
     'sha256rnds2 (#UD)': '0f38cbc1', 'sha1rnds4 (#UD)': '0f3accc101', 'wrussq (#UD)': '66480f38f508',
@@ -73,10 +76,10 @@ UNSUPPORTED = {
     'vcvtps2ph m': 'c4e37d1d3004', 'vaddss L=1 (LIG)': 'c5f658c2',
     'vinsertps m32 zeroing its element': 'c4e37921001f',
     'o16 pushf': '669c', 'o16 leave': '66c9', 'enter level 1': 'c8080001', 'o16 shld': '660fa4c101', 'o16 shrd cl': '660fadc1',
-    'prefetchw': '0f0d08', 'prefetch /4 (reserved nop)': '0f1820', 'prefetch reg (reserved nop)': '0f18c0', 'movnti reg': '0fc3c1',
+    'movnti reg': '0fc3c1',
     'rep popcnt-like f2 0f b8': 'f20fb8c1',
     'loop o16': '66e2fe', 'sal /6 alias': 'd1f0',
-    'bnd ret': 'f2c3', 'o16 ret': '66c3', 'o16 jmp': '66e9fbffffff', 'bswap r9w (undefined)': '66410fc9', 'bswap ax': '660fc8',
+    'bnd loop (BND is not a LOOP prefix)': 'f2e2fe', 'o16 ret': '66c3', 'o16 jmp': '66e9fbffffff', 'bswap r9w (undefined)': '66410fc9', 'bswap ax': '660fc8',
     # FEX branches around the whole access for a zero count (static or dynamic), losing a guest #PF
     'rcl dword [rax],1': 'd110', 'rcr qword [rax],cl': '48d318', 'rcr qword [rax],0': '48c11800', 'rcl byte [rax],cl': 'd210',
     'rcr word [rax],5': '66c11805', 'rcl dword [rax],cl': 'd310', 'rcr dword [rax+rcx*4+8],cl': 'd35c8808', 'rcl byte [rax],32': 'c01020',
@@ -85,6 +88,8 @@ UNSUPPORTED = {
 
 # I10: encodings the presented CPU raises #UD for, reserved or not advertised: a system cut with `cut_ud` (the host's UD).
 UD = {
+    # X1c: 0f 0d with a register operand (PREFETCHW takes m8; pinned QEMU: #UD)
+    'prefetchw reg': '0f0dc8', '66 0f 0d reg': '660f0dc0',
     'psllq mm /3': '0f73d801', 'psrlw mm, m (mmx shift, memory)': '0f7110', 'pi2fd (3DNow!)': '0f0fc10d',
     'vaesenc L=1 (VAES)': 'c4e275dcc2', 'vpclmulqdq L=1': 'c4e37544c200', 'vpcmpistri L=1': 'c4e37d63c112', 'vmovd L=1': 'c5fd6ec6',
     'vpermq L=0': 'c4e3f900c11b', 'vpermq W0': 'c4e37d00c11b', 'vmovaps vvvv': 'c5f428c1', 'vpdpbusd (VNNI)': 'c4e27950e1',
@@ -111,6 +116,8 @@ VEX_UD = {'rex andn': '48c4e278f2c1', 'o16 andn': '66c4e278f2c1', 'o16 vzerouppe
           'f2 vpbroadcastb': 'f2c4e27d78ff'}
 
 ALLOWED = {
+    # X1c: the hints PREFETCHW m8 and CLDEMOTE m8 (SDM: no #UD without their CPUID bits; CLDEMOTE "treated as a NOP")
+    'prefetchw [rax]': '0f0d08', 'cldemote [rax]': '0f1c00',
     # I10: 0x67 (32-bit addresses), XLAT, the CET hint space 0f 1e as NOPs (ENDBR, RDSSP)
     'mov eax,[eax] (addr32)': '678b00', 'fs addr32 mov rax,[eax]': '6467488b00', 'addr32 lodsb': '67ac', 'addr32 vmovdqu': '67c5fe6f00',
     'addr32 lea rax,[eax+ebx*4+8]': '67488d449808', 'addr32 mov eax,[eip+8]': '678b0508000000', 'addr32 movabs eax,[moffs32]': '67a144332211',
@@ -207,6 +214,8 @@ BRANCHES = {
     # I10: 0x67: ECX for LOOP/JECXZ, ignored by direct branches (a relaxed `addr32 call`), the memory operand's address
     'addr32 loop': '67e205', 'jecxz': '67e305', 'addr32 call rel32': '67e805000000', 'addr32 jmp rel8': '67eb05', 'addr32 jne rel32': '670f8505000000',
     'addr32 call [eax]': '67ff10', 'addr32 jmp [eip+8]': '67ff2508000000', 'addr32 ret': '67c3',
+    # X1c: BND (F2) on near branches, ignored without MPX (owner decision, November 2)
+    'bnd ret': 'f2c3', 'bnd jmp rel8': 'f2eb05', 'bnd call rel32': 'f2e805000000', 'bnd jne rel8': 'f27505', 'bnd jmp rax': 'f2ffe0',
     'ret': 'c3', 'rep ret': 'f3c3', 'ret 8': 'c20800', 'jmp rax': 'ffe0', 'call rax': 'ffd0', 'jmp [rax]': 'ff20', 'call [rax]': 'ff10',
 }
 
@@ -557,7 +566,7 @@ class Slice1Exits(unittest.TestCase):
                     d, rc = run(PRE + x)
                     self.assertEqual(rc, 0)
                     n, _ = check_exits(self, d, tmp, name)
-                    self.assertEqual(n, 2 if name in ('jne rel8', 'ds jne rel8 (hint, ignored)', 'je rel32', 'loop rel8', 'loope rel8', 'loopne rel8', 'jrcxz rel8',
+                    self.assertEqual(n, 2 if name in ('jne rel8', 'bnd jne rel8', 'ds jne rel8 (hint, ignored)', 'je rel32', 'loop rel8', 'loope rel8', 'loopne rel8', 'jrcxz rel8',
                                                      'addr32 loop', 'jecxz', 'addr32 jne rel32') else 1, name)   # taken and fall-through gates
             for name, x in (('fall off the window', PRE), ('cut before cr3 write', PRE + SYSTEM['mov cr3,rax'])):
                 with self.subTest(name):

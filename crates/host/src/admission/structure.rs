@@ -864,10 +864,9 @@ impl<'a> Verifier<'a> {
             let lo = s.insn_native_offset;
             // A swap or LOCK atomic has no split check (an operand crossing 16 bytes faults at the atomic). A 16-byte caspal
             // (CMPXCHG16B) faults unless 16-aligned: #GP(0) at run time, never refused here.
-            let (addr, size, store, swap) = match self.insn(at) {
-                Some(Insn::Mem(m)) => (m.addr, m.size, !m.load, false),
-                Some(Insn::Swap { size, rn, .. }) => (Addr { base: rn, index: None, imm: 0 }, size, false, true),
-                Some(Insn::Atomic { size, rn, .. }) => (Addr { base: rn, index: None, imm: 0 }, size, false, size < 16),
+            let (addr, size, store) = match self.insn(at) {
+                Some(Insn::Mem(m)) => (m.addr, m.size, !m.load),
+                Some(Insn::Swap { size, rn, .. }) | Some(Insn::Atomic { size, rn, .. }) => (Addr { base: rn, index: None, imm: 0 }, size, false),
                 _ => return fail("no memory access of its kind there"),
             };
             let splits = self.linked(at, object::kind::SPLIT);
@@ -879,10 +878,8 @@ impl<'a> Verifier<'a> {
                 .and_then(|w| self.moves.iter().find(|(words, r, _)| *r == addr.base && words.contains(&w)).cloned());
             if let Some((words, _, value)) = mv {
                 let a = value.wrapping_add(addr.imm as u64);
-                // A split lock (a declared refusal); with any byte non-canonical x86's #GP comes first (raised at run time).
-                if swap && canonical(a) && canonical(a.wrapping_add(size as u64 - 1)) && (a & 15) + size as u64 > 16 {
-                    return fail(&format!("locked access at {a:#x} crosses a 16-byte boundary (unsupported_atomic)"));
-                }
+                // (A split lock is not refused here: its atomic faults at run time and the resident stops `unsupported_atomic`,
+                // the typed stop of the declared refusal, as for a computed address; X1c.)
                 let crosses = store && size > 1 && (a ^ a.wrapping_add(size as u64 - 1)) & 0x1000 != 0;
                 // With a `b stub`, nothing may enter between the move and the access, not even from before the `b`.
                 let mut sealed_to = words.start;
@@ -1729,9 +1726,9 @@ mod tests {
         validated(XCHG, 0x4, 0x5280_00a4, SWPAL_W4_X6 & !(31 << 5) | 28 << 5, Some("frame access by a swap"));
         validated(XCHG, 0x4, 0x5280_00a4, SWPAL_W4_X6, None);
         validated(XCHG, 0xc, 0xd503_3dbf, 0xd503_3fdf, None); // isb
-        // A guest-RIP swap whose operand crosses 16 bytes (`xchg [rip+0x18], eax` at 0x100000: 0x10001e) is refused.
-        let e = admit(fixture!("xchg-rip-crossing")).expect_err("split lock admitted");
-        assert!(e.contains("crosses a 16-byte boundary"), "{e}");
+        // A guest-RIP swap whose operand crosses 16 bytes (`xchg [rip+0x18], eax` at 0x100000: 0x10001e) is admitted: the
+        // resident's typed stop `unsupported_atomic` refuses it at run time (X1c).
+        admit(fixture!("xchg-rip-crossing")).expect("split lock refused at admission");
     }
 
     #[test]

@@ -17,6 +17,13 @@
 //!   SYSCALL/SYSRET pages say nothing either way; this is pinned QEMU's rule (`gen_eob_syscall`: "TF is checked after the
 //!   syscall insn completes") and the behaviour Linux relies on (`entry_64.S`: SYSRET "can restore TF, but unlike IRET,
 //!   restoring TF results in a trap from userspace immediately after SYSRET").
+//! - SYSENTER (X1c; SEP is advertised, and the presented CPU is GenuineIntel, whose SYSENTER/SYSEXIT run in IA-32e
+//!   mode): #GP(0) when IA32_SYSENTER_CS[15:2] = 0, else RFLAGS.VM and IF cleared (Vol.2 SYSENTER, Operation and "Flags
+//!   Affected": RF is not), CS := SYSENTER_CS & FFFCH and SS := CS + 8 with the fixed flat attributes (64-bit CS), CPL 0,
+//!   RSP := IA32_SYSENTER_ESP, RIP := IA32_SYSENTER_EIP (both canonical: WRMSR checks them).
+//! - SYSEXIT (X1c): #GP(0) when IA32_SYSENTER_CS[15:2] = 0 or CPL > 0, then (REX.W) for a non-canonical RCX or RDX; RSP :=
+//!   RCX, RIP := RDX, CS := (SYSENTER_CS + 32) | 3 (64-bit) and SS := CS + 8, DPL 3, CPL 3; RFLAGS unchanged. Without REX.W
+//!   it returns to compatibility mode (not built): [`set_cpl`] stops `unsupported_mode`, as SYSRETL.
 //! - RDFSBASE..WRGSBASE (#UD without CR4.FSGSBASE, any CPL): 32-bit forms read the low half zero-extended and write the
 //!   zero-extended low half; a 64-bit write of a non-canonical value is #GP(0).
 //! - RDRAND: the next word of the vCPU's entropy pool ([`Entropy`], filled by the host): CF = 1, OF SF ZF AF PF = 0, the
@@ -37,6 +44,8 @@ const GP0: Exception = GP;
 const EFER_SCE: u64 = 1;
 const CR4_FSGSBASE: u64 = 1 << 16;
 const RFLAGS_TF: u64 = 1 << 8;
+const RFLAGS_IF: u64 = 1 << 9;
+const RFLAGS_VM: u64 = 1 << 17;
 /// RFLAGS bits SYSRET loads from R11 (SDM Vol.2 SYSRET: RF, VM and the reserved bits 3, 5, 15, 22..63 cleared).
 const SYSRET_FLAGS: u64 = 0x3c_7fd7;
 /// The fixed hidden attributes SYSCALL and SYSRET load (SDM Vol.2 SYSCALL, SYSRET; `Segment::attributes` encoding):
@@ -53,7 +62,7 @@ fn flat(selector: u16, attributes: u16) -> Segment {
     Segment { selector, attributes, limit: u32::MAX, base: 0 }
 }
 
-/// Executes `i` (SWAPGS ..= CLFLUSH). `Ok(None)`: committed, RIP moves past it; `Ok(Some(rip))`: SYSCALL or SYSRET
+/// Executes `i` (SWAPGS ..= CLFLUSH, SYSENTER, SYSEXIT). `Ok(None)`: committed, RIP moves past it; `Ok(Some(rip))`: SYSCALL or SYSRET
 /// committed to `rip`. On `Err` nothing changed.
 pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception> {
     let c = s.cpu;
@@ -99,6 +108,36 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             s.cpu.seg[SREG_SS] = flat(base.wrapping_add(8) | 3, SS_FLAT | DPL3);
             set_cpl(s, 3);
             s.debug = s.debug & !debug::STEP | if rflags & RFLAGS_TF != 0 { debug::STEP } else { 0 };
+            return Ok(Some(rip));
+        }
+        system::SYSENTER => {
+            let cs = msr_get(slot(cpu::MSR_SYSENTER_CS)) as u16 & 0xfffc;
+            if cs == 0 {
+                return Err(GP0);
+            }
+            s.cpu.rflags = c.rflags & !(RFLAGS_VM | RFLAGS_IF);
+            s.cpu.gpr[4] = msr_get(slot(cpu::MSR_SYSENTER_ESP));
+            s.cpu.seg[SREG_CS] = flat(cs, CS64);
+            s.cpu.seg[SREG_SS] = flat(cs.wrapping_add(8), SS_FLAT);
+            set_cpl(s, 0);
+            return Ok(Some(msr_get(slot(cpu::MSR_SYSENTER_EIP))));
+        }
+        system::SYSEXIT => {
+            let cs = msr_get(slot(cpu::MSR_SYSENTER_CS)) as u16;
+            if cs & 0xfffc == 0 || c.cpl != 0 {
+                return Err(GP0);
+            }
+            let wide = i.size == 8;
+            let mask = if wide { u64::MAX } else { 0xffff_ffff };
+            let (rsp, rip) = (c.gpr[1] & mask, c.gpr[2] & mask);
+            if !paging::canonical(rsp) || !paging::canonical(rip) {
+                return Err(GP0);
+            }
+            let selector = cs.wrapping_add(if wide { 32 } else { 16 }) | 3;
+            s.cpu.gpr[4] = rsp;
+            s.cpu.seg[SREG_CS] = flat(selector, if wide { CS64 } else { CS32 } | DPL3);
+            s.cpu.seg[SREG_SS] = flat(selector.wrapping_add(8), SS_FLAT | DPL3);
+            set_cpl(s, 3);
             return Ok(Some(rip));
         }
         system::RDFSBASE..=system::WRGSBASE => {

@@ -845,6 +845,7 @@ def delivery_log_problems(prog, state):
 
 # ---- X1a: faults during delivery, #DF and shutdown, gate checks (delivery_model only: QEMU resets on a triple fault) --------
 DLV_CODE, DLV_IDT, DLV_PTR, DLV_BAD_STACK = 0x40_0000, 0x60_0000, 0x60_1000, 0x7f_0000
+DLV_ABSENT = 0x7e_0000                            # a page no description maps (X1c)
 DLV_GDT, DLV_TSS = 0x60_2000, 0x60_3000          # a case's own GDT and TSS (`own`), loaded at CPL 0 before its IDT
 
 
@@ -888,29 +889,99 @@ def delivery_cases():
         ('ud-ist-noncanonical', 0, 'ud2', {6: ist1, 12: ok}, 0x50_0800, (0x67, 0x8000_0000_0000_0000, {})),
         # A frame straddling two pages, the lower (second written) not present: #PF there (CR2 judged), on IST 1.
         ('ud-frame-straddle', 0, 'ud2', {6: ok, 14: ist1}, 0x50_0020, None),
+    ] + double_fault_cases()
+
+
+def double_fault_cases():
+    """X1c: SDM Vol.3 Table 7-4 classes x Table 7-5 outcomes, as (name, cpl, text, gates, rsp, own, opts) for
+    `delivery_cases`. A fault detected while delivering is always contributory (#GP, #NP, #TS, #SS from the gate, the
+    target CS or the TSS) or a #PF (IDT, GDT, TSS or frame on a page not present); each row (benign: #UD, #NM, INT n, INT1,
+    NMI, INTR; contributory: #DE, #GP, #NP, #TS, #SS; page: #PF; #DF) meets each of them once. `opts`: 'event' (the
+    model's event when the text's last instruction is not it), 'hook' ('nmi' or a vector: the driver posts it at the
+    text's first `nop`, taken at the boundary after it, the last line), 'idt' ((base, limit) of the loaded IDT), 'svr'.
+    `own` may add the TSS's RSP0 and its base (a page not present: LTR reads only the descriptor). Only the last
+    delivery is visible (vector, frame, handler RSP, CR2), so where the second fault's own gate could deliver it, that
+    gate is live: serial handling instead of #DF (or #DF instead of serial) ends at another handler."""
+    ok, ist1 = (0xE, 0, True, 0), (0xE, 0, True, 1)
+    task, absent = (0x5, 0, True, 0), (0xE, 0, False, 0)
+    gp, pf, de = 'mov rax, 0x8000000000000000\nmov rbx, [rax]', f'mov rbx, [{DLV_ABSENT:#x}]', 'div rcx'                     # RCX = 0 from the start (no flag change before it)
+    short, noncanonical = (0x23, 0x50_0800, {}), (0x67, 0x8000_0000_0000_0000, {})
+    pf_event = {'kind': 'exception', 'vector': 14, 'error': 0, 'cr2': DLV_ABSENT}
+    de_event = {'kind': 'exception', 'vector': 0}
+    nm, nm_event = 'mov rax, cr0\nlea rax, [rax + 8]\nmov cr0, rax\nfninit', {'kind': 'exception', 'vector': 7}   # CR0.TS (LEA: no flag change)
+    hook = 'nop\nnop'
+    return [
+        # Contributory first: a contributory fault while delivering it is #DF; a #PF is delivered serially.
+        ('de-gp-df', 0, de, {0: task, 13: ok, 8: ist1}, 0x50_0800, None, {'event': de_event}),
+        ('de-pf-pf-df', 0, de, {0: ok, 14: ok, 8: ist1}, DLV_BAD_STACK, None, {'event': de_event}),
+        # Contributory then page, serial, seen alone: the #PF on IST 1 (a good stack) is delivered; #DF instead would take
+        # gate 8 on the bad stack and end in a shutdown.
+        ('de-pf', 0, de, {0: ok, 14: ist1, 8: ok}, DLV_BAD_STACK, None, {'event': de_event}),
+        ('gp-pf', 0, gp, {13: ok, 14: ist1, 8: ok}, DLV_BAD_STACK, None),
+        ('gp-gp-df', 0, gp, {13: task, 8: ist1}, 0x50_0800, None),
+        ('gp-ts-df', 0, gp, {13: ist1, 10: ok, 8: ok}, 0x50_0800, short),
+        ('gp-ss-df', 0, gp, {13: ist1, 12: ok, 8: ok}, 0x50_0800, noncanonical),
+        ('int-np-gp-df', 0, 'int 0x41', {0x41: absent, 11: task, 13: ok, 8: ist1}, 0x50_0800, None),
+        ('ud-ts-ts-df', 0, 'ud2', {6: ist1, 10: ist1, 8: ok}, 0x50_0800, short),
+        ('ud-ss-ss-df', 0, 'ud2', {6: ist1, 12: ist1, 8: ok}, 0x50_0800, noncanonical),
+        # Page fault first: a contributory fault or a #PF while delivering it is #DF.
+        ('pf-gp-df', 0, pf, {14: task, 13: ok, 8: ist1}, 0x50_0800, None, {'event': pf_event}),
+        ('pf-np-df', 0, pf, {14: absent, 11: ok, 8: ist1}, 0x50_0800, None, {'event': pf_event}),
+        ('pf-ts-df', 0, pf, {14: ist1, 10: ok, 8: ok}, 0x50_0800, short, {'event': pf_event}),
+        ('pf-ss-df', 0, pf, {14: ist1, 12: ok, 8: ok}, 0x50_0800, noncanonical, {'event': pf_event}),
+        ('pf-pf-df', 0, pf, {14: ok, 8: ist1}, DLV_BAD_STACK, None, {'event': pf_event}),
+        # #DF first: a contributory fault or a #PF while delivering it is a shutdown (triple fault).
+        ('df-gp-shutdown', 0, gp, {13: absent, 8: task}, 0x50_0800, None),
+        ('df-np-shutdown', 0, gp, {13: task, 8: absent}, 0x50_0800, None),
+        ('df-ts-shutdown', 0, gp, {13: absent, 8: ist1}, 0x50_0800, short),
+        ('df-ss-shutdown', 0, gp, {13: absent, 8: ist1}, 0x50_0800, noncanonical),
+        ('df-pf-shutdown', 0, de, {0: ok, 14: ok, 8: ok}, DLV_BAD_STACK, None, {'event': de_event}),
+        # Benign first (INT1, NMI, INTR, #NM; #UD and INT n above): delivered serially.
+        ('int1-gp', 0, '.byte 0xf1', {1: task, 13: ist1}, 0x50_0800, None, {'event': {'kind': 'int1', 'length': 1}}),
+        ('nmi-gp', 0, hook, {2: task, 13: ist1}, 0x50_0800, None, {'hook': 'nmi', 'event': {'kind': 'nmi'}}),
+        ('intr-np', 0, hook, {0x30: absent, 11: ist1}, 0x50_0800, None,
+         {'hook': 0x30, 'event': {'kind': 'intr', 'vector': 0x30}, 'svr': 0x1ff}),
+        ('nmi-pf-pf-df', 0, hook, {2: ok, 14: ok, 8: ist1}, DLV_BAD_STACK, None, {'hook': 'nmi', 'event': {'kind': 'nmi'}}),
+        ('nm-gp', 0, nm, {7: task, 13: ist1}, 0x50_0800, None, {'event': nm_event}),
+        ('nm-pf-pf-df', 0, nm, {7: ok, 14: ok, 8: ist1}, DLV_BAD_STACK, None, {'event': nm_event}),
+        # The IDT, GDT and TSS themselves: an IDT limit below every gate (#UD -> #GP -> #DF -> shutdown), an IDT on a page
+        # not present (#PF at each gate read), a TSS on a page not present (the IST read faults), a gate's CS beyond the
+        # GDT limit (#GP(selector + EXT)), RSP0 on a page not present from CPL 3 (the frame's push faults at CPL 0:
+        # #PF(W), CR2 its slot; the #PF's own push faults: #DF on IST 1, frame of the CPL 3 context).
+        ('idt-limit-shutdown', 0, 'ud2', {6: ok, 13: ok, 8: ist1}, 0x50_0800, None, {'idt': (DLV_IDT, 0x5f)}),
+        ('idt-absent-shutdown', 0, 'ud2', {}, 0x50_0800, None, {'idt': (DLV_ABSENT, 0xfff)}),
+        ('tss-absent-pf', 0, 'ud2', {6: ist1, 14: ok}, 0x50_0800, (0x67, 0x50_0800, {}, 0x50_0800, DLV_ABSENT)),
+        ('gdt-limit-gp', 0, 'ud2', {6: (0xE, 0, True, 0, 0x80), 13: ist1}, 0x50_0800, (0x67, 0x50_0800, {})),
+        ('cpl3-rsp0-pf-pf-df', 3, 'ud2', {6: ok, 14: ok, 8: ist1}, 0x50_0800, (0x67, 0x50_0800, {}, DLV_BAD_STACK)),
+        # RSP0 from CPL 3 non-canonical (#SS(EXT), on IST 1), and beyond the TSS limit (#TS(TR + EXT)) for every gate, #DF's
+        # included: #UD -> #TS -> #TS -> #DF -> #TS, a shutdown.
+        ('cpl3-rsp0-ss', 3, 'ud2', {6: ok, 12: ist1}, 0x50_0800, (0x67, 0x50_0800, {}, 0x8000_0000_0000_0000)),
+        ('cpl3-rsp0-ts-shutdown', 3, 'ud2', {6: ok, 10: ok, 8: ok}, 0x50_0800, (0x0a, 0x50_0800, {})),
     ]
 
 
 def delivery_own(own):
-    """A case's own GDT image and TSS image (`delivery_cases`)."""
+    """A case's own GDT image and TSS image (`delivery_cases`): own = (TSS limit, IST1, extra GDT entries[, RSP0[, TSS
+    base]])."""
     import models.delivery_model as dm
-    limit, ist1, extra = own
+    limit, ist1, extra = own[:3]
+    rsp0, tss = (tuple(own[3:]) + (0x50_0800, DLV_TSS)[len(own) - 3:])[:2]
     entries = {0x08: dm.segment(0), 0x10: dm.segment(0, code=False), 0x28: dm.segment(0, l=0, d=1), **extra}
     gdt = bytearray(0x48)                         # the TSS's 16 bytes at 0x30, extras from 0x40
     for sel, d in entries.items():
         gdt[sel:sel + 8] = d.to_bytes(8, 'little')
-    tss = DLV_TSS
     gdt[0x30:0x40] = (limit | (tss & 0xff_ffff) << 16 | 0x89 << 40 | (tss >> 24 & 0xff) << 56).to_bytes(8, 'little') + (tss >> 32).to_bytes(8, 'little')
-    return bytes(gdt), dm.tss(rsp=(0x50_0800, 0, 0), ist=(ist1,) + (0,) * 6)
+    return bytes(gdt), dm.tss(rsp=(rsp0, 0, 0), ist=(ist1,) + (0,) * 6), tss
 
 
-def delivery_description(cpl, text, gates, rsp, own):
+def delivery_description(cpl, text, gates, rsp, own, opts={}):
     import delivery_check as dc
     idt = bytearray(16 * 0x44)
     for v, g in gates.items():
         gtype, dpl, present, ist = g[:4]
         idt[16 * v:16 * v + 16] = dm_gate(dc.LOG_BASE + 0x2000 + 16 * v, gtype, dpl, present, ist, g[4] if len(g) > 4 else 0x08)
-    ptr = (len(idt) - 1).to_bytes(2, 'little') + DLV_IDT.to_bytes(8, 'little')
+    idt_base, idt_limit = opts.get('idt', (DLV_IDT, len(idt) - 1))
+    ptr = idt_limit.to_bytes(2, 'little') + idt_base.to_bytes(8, 'little')
     setup = f'lgdt [{DLV_PTR + 0x10:#x}]\nmov ax, 0x30\nltr ax\n' if own else ''
     head = ref.assemble(setup + f'lidt [{DLV_PTR:#x}]') + (b'\x90' if cpl == 3 else b'')   # CPL 3: a switch (a nop) after it
     code = head + ref.assemble(text)
@@ -920,11 +991,16 @@ def delivery_description(cpl, text, gates, rsp, own):
              f'memory {DLV_PTR:#x} {(ptr + bytes(6) + (0x47).to_bytes(2, "little") + DLV_GDT.to_bytes(8, "little")).hex()}',
              'region 0x500000 0x1000']
     if own:
-        gdt, tss = delivery_own(own)
+        gdt, tss, _ = delivery_own(own)
         lines += [f'memory {DLV_GDT:#x} {gdt.hex()}', f'memory {DLV_TSS:#x} {tss.hex()}']
     if cpl == 3:
         lines.append(f'switch {DLV_CODE + len(head) - 1:#x} 3')
-    return '\n'.join(lines) + '\n', DLV_CODE + len(code) - len(ref.assemble(text.split('\n')[-1])), idt
+    at = DLV_CODE + len(code) - len(ref.assemble(text.split('\n')[-1]))
+    if 'hook' in opts:                            # posted at the text's first nop (at - 1), taken at `at`
+        lines.append(f'nmi {at - 1:#x}' if opts['hook'] == 'nmi' else f"post {at - 1:#x} {opts['hook']:#x}")
+    if 'svr' in opts:
+        lines.append(f"svr {opts['svr']:#x}")
+    return '\n'.join(lines) + '\n', at, idt
 
 
 def dm_gate(offset, gtype, dpl, present, ist, selector=0x08):
@@ -939,19 +1015,20 @@ def cmd_delivery(a, host, runtime):
     import delivery_check as dc
     from models import delivery_model as dm
     failures, report = [], []
-    for name, cpl, text, gates, rsp, own in delivery_cases():
-        desc, at, idt = delivery_description(cpl, text, gates, rsp, own)
+    for name, cpl, text, gates, rsp, own, *more in delivery_cases():
+        opts = more[0] if more else {}
+        desc, at, idt = delivery_description(cpl, text, gates, rsp, own, opts)
         s = dc._state(dc.LOG_BASE, 0, cpl, at, rsp, 0x202)
-        s['idtr'] = (DLV_IDT, len(idt) - 1)
+        s['idtr'] = opts.get('idt', (DLV_IDT, len(idt) - 1))
         s['memory'][DLV_IDT >> 12] = dm.page(); dm.place(s['memory'], DLV_IDT, bytes(idt))
         s['memory'][0x500] = dm.page(user=True)
         if own:
-            gdt, tss = delivery_own(own)
+            gdt, tss, tss_base = delivery_own(own)
             for addr, data in ((DLV_GDT, gdt), (DLV_TSS, tss)):
                 s['memory'][addr >> 12] = dm.page(); dm.place(s['memory'], addr, data)
-            s['gdtr'], s['tr'] = (DLV_GDT, 0x47), (0x30, DLV_TSS, own[0])
+            s['gdtr'], s['tr'] = (DLV_GDT, 0x47), (0x30, tss_base, own[0])
         insn = ref.assemble(text.split('\n')[-1])
-        event = {'int3': {'kind': 'int3', 'length': 1}, '.byte 0xce': {'kind': 'into', 'length': 1}, 'ud2': {'kind': 'exception', 'vector': 6}}.get(
+        event = opts.get('event') or {'int3': {'kind': 'int3', 'length': 1}, '.byte 0xce': {'kind': 'into', 'length': 1}, 'ud2': {'kind': 'exception', 'vector': 6}}.get(
             text, {'kind': 'int', 'vector': insn[1], 'length': 2} if insn[0] == 0xcd else {'kind': 'exception', 'vector': 13, 'error': 0})
         want = dm.deliver(s, event)
         cr2s = want['undefined']['state'].get('cr2', {want['state']['cr2']})
