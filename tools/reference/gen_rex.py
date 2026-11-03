@@ -62,14 +62,15 @@ JCC = 'o no b ae e ne be a s ns p np l ge le g'.split()
 SEGS = [0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65]
 
 
-def branches(name, rng):
+def branches(name, rng, prefixes=lambda r: r.sample(SEGS, r.randrange(1, 3))):
     """QEMU translates only what runs, so every byte must run: backward loops (taken, then not) and forward branches to the
-    next instruction (rel 0: taken or not, the same path; CALL's pushed address checks the target)."""
+    next instruction (rel 0: taken or not, the same path; CALL's pushed address checks the target). `prefixes(r)`: the
+    prefix bytes before each branch (gen_br66.py: with 66)."""
     r = random.Random(rng.getrandbits(64)); gpr, rf = g.initial(r); p = g.Prog(name, r)
     def raw(line):    # no flag effect
         p.lines.append(line); p.insns.append({'op': 'mov', 'width': 64})
     for k in range(10):
-        pre = '.byte ' + ', '.join(f'{x:#04x}' for x in r.sample(SEGS, r.randrange(1, 3)))
+        pre = '.byte ' + ', '.join(f'{x:#04x}' for x in prefixes(r))
         form = r.choice(['jcc8', 'jcc32', 'jcc0', 'jmp8', 'jmp32', 'call', 'loop', 'jrcxz'])
         if form in ('jcc8', 'jcc32', 'loop'):
             p.emit(f'mov {"ecx" if form == "loop" else "r9d"}, {r.randrange(2, 4)}')

@@ -310,6 +310,15 @@ def cases():
     branch_case('bnd-jmp32', '', 'f2e900100000', True)
     branch_case('ds-jcc32', 'xor eax, eax', '3e0f8400100000', True)
     branch_case('o16-jmp32', '', '66e900100000', True)
+    # 66 (patch 0029: fexc decodes rel8/rel32 as Intel; the target is still non-canonical, so still cut): CALL before its push
+    branch_case('o16-call32', '', '66e800100000', True)
+    branch_case('o16-jmp8', '', '66eb7f', True)
+    branch_case('o16-je8-taken', 'xor eax, eax', '66747f', True)
+    branch_case('o16-jne8-not', 'xor eax, eax', '66757f', False)
+    branch_case('o16-jl32-taken', 'mov eax, 1\ncmp eax, 2', '660f8c00100000', True)
+    branch_case('o16-jg32-not', 'mov eax, 1\ncmp eax, 2', '660f8f00100000', False)
+    branch_case('o16-loop-taken', 'mov ecx, 2', '66e27f', True, 2)
+    branch_case('o16-jrcxz-not', 'mov ecx, 1', '66e37f', False, 1)
     branch_case('rep-jmp8', '', 'f3eb7f', True)
     branch_case('fs-rex-jne32-not', 'xor eax, eax', '64410f8500100000', False)
     # Every condition, taken and not, from flags loaded by POPF (CF 0x1, PF 0x4, ZF 0x40, SF 0x80, OF 0x800).

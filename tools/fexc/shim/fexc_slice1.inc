@@ -683,6 +683,9 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
       (op == 0xA3 || op == 0xAB || op == 0xB3 || op == 0xBB || (op == 0xBA && reg >= 4)) && fexc_alignment_gated)
     return Sys("bt/bts/btr/btc with a memory operand under alignment checking (#AC: the resident's check)");
   const bool primary = d.FexcMap == FEXC_MAP_PRIMARY;
+  // Jcc rel8/rel32, JMP rel8/rel32, CALL rel32, LOOPNE/LOOPE/LOOP/JrCXZ
+  const bool near_direct = (primary && ((op >= 0x70 && op <= 0x7F) || (op >= 0xE0 && op <= 0xE3) || op == 0xE8 || op == 0xE9 || op == 0xEB)) ||
+                           (d.FexcMap == FEXC_MAP_TWO && op >= 0x80 && op <= 0x8F);
   // LOCK (I3): admitted on every lockable form (the others are cut above as #UD). FEX lowers each to one LSE atomic (LOCK NEG:
   // one compare-and-swap per pass, patch 0016). 66 on cmpxchg8b/16b is refused by policy (the SDM gives it no meaning).
   if (d.FexcMap == FEXC_MAP_TWO && op == 0xC7 && (f & DecodeFlags::FLAG_OPERAND_SIZE)) return Uns("operand-size prefix on cmpxchg8b/16b");
@@ -735,10 +738,8 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
     // segment prefixes on a near direct branch (Jcc rel8/rel32, JMP rel8/rel32, CALL rel32, LOOPcc/JrCXZ) are ignored, as
     // processors and pinned QEMU ignore them (SDM Vol.2 2.1.1 calls them reserved); FEX compiles the branch as without
     // them (no memory operand takes a base). To be re-verified on x86 hardware (plan, "to verify on real x86 hardware").
-    const bool direct = (primary && ((op >= 0x70 && op <= 0x7F) || (op >= 0xE0 && op <= 0xE3) || op == 0xE8 || op == 0xE9 || op == 0xEB)) ||
-                        (d.FexcMap == FEXC_MAP_TWO && op >= 0x80 && op <= 0x8F);
-    if (fsgs && !memory && !direct) return Uns("FS/GS override on an instruction without a memory operand");
-    if (fsgs && !direct && ss + data + high != 1) return Uns("FS/GS override with another segment prefix (no SDM rule for several)");
+    if (fsgs && !memory && !near_direct) return Uns("FS/GS override on an instruction without a memory operand");
+    if (fsgs && !near_direct && ss + data + high != 1) return Uns("FS/GS override with another segment prefix (no SDM rule for several)");
     if (memory && ss && data) return Uns("SS with a CS/DS/ES prefix (mixed segment prefixes)");
     if (ss && memory && !(has_modrm && mod != 3)) return Uns("SS override on a moffs, xlat or string source operand");
   }
@@ -746,7 +747,10 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   // it before the FS/GS base (Addressing.cpp LoadEffectiveAddress: `Bfe`), RIP-relative included (EIP-relative: RIP + disp
   // truncated); moffs is 4 bytes; strings use ESI/EDI/ECX, LOOP/JECXZ ECX, XLAT EBX + AL (patch 0025); a direct branch, RET and
   // the stack's own accesses ignore it. The sites see the truncated address (BT* m, r: refused above).
-  if (v.branch && (f & DecodeFlags::FLAG_OPERAND_SIZE)) return Uns("operand-size prefix on a branch");
+  // 66 on a near direct branch (Jcc rel8/rel32, JMP rel8/rel32, CALL rel32, LOOPcc/JrCXZ) is ignored, as on Intel (patch
+  // 0029: the operand size stays 64 bits, the displacement rel8/rel32; SDM Vol.2 CALL/JMP/Jcc, Appendix A "f64"). On RET and
+  // the indirect CALL/JMP it stays refused.
+  if (v.branch && !near_direct && (f & DecodeFlags::FLAG_OPERAND_SIZE)) return Uns("operand-size prefix on a branch");
   if (d.FexcMap == FEXC_MAP_TWO && op >= 0xC8 && op <= 0xCF && (f & DecodeFlags::FLAG_OPERAND_SIZE) && !(f & DecodeFlags::FLAG_REX_WIDENING))
     return Uns("16-bit bswap (undefined result)");
   if (d.FexcMap == FEXC_MAP_TWO && (op == 0xA4 || op == 0xA5 || op == 0xAC || op == 0xAD) && (f & DecodeFlags::FLAG_OPERAND_SIZE))

@@ -80,6 +80,10 @@ FEX_EXPECTS_ITS_BUG = {'X87/FXAM_Simple.asm': "expects FEX's FXAM of +0 (its com
                                        "log2(3) to give 8.0 (FEX lists the test as disabled); natemu gives 23.77",
                       'VEX/vldmxcsr.asm': "expects FEX's VSTMXCSR, which masks off the exception flags (FFC0H); x86 stores MXCSR as "
                                           "VLDMXCSR loaded it, FFFFH (SDM STMXCSR; natemu's is the resident's transaction, I8 review)"}
+# Tests of AMD's 66 on a near direct branch (rel16, IP truncated to 16 bits; FEX lists both as disabled, "can't test this in a
+# real environment"). Intel ignores 66 in 64-bit mode (SDM Vol.2 CALL/JMP; fexc patch 0029): the rel32 that the following bytes
+# form is taken and the fetch there faults (#PF at 0x6ec0017 and 0x7ec0017, the Intel targets).
+AMD_REL16 = {'Primary/Primary_E8.asm', 'Primary/Primary_E9.asm'}
 NEEDS_OS = {'syscall'}   # #UD with EFER.SCE = 0: no OS has set up SYSCALL here
 OS_SEGMENTS = {'Primary/Primary_8C.asm', 'Primary/Primary_8C_2.asm', 'Primary/Primary_CF.asm', 'PrimaryGroup/5_FF_05.asm',
                'PrimaryGroup/5_FF_05_03_o64.asm', 'PrimaryGroup/5_FF_05_03_o64_imm.asm', 'Secondary/07_XX_00.asm'}
@@ -299,6 +303,9 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
                 return {**rec, 'outcome': 'unsupported', 'reason': f"x87 FCW unmasking an exception (refused: #MF not built): {rec['at']}"}
             if s['stop'] == 'resident' and s['reason'].startswith('unsupported_system') and rec.get('at') in ('fxrstor', 'fxrstor64', 'xrstor', 'xrstor64'):
                 return {**rec, 'outcome': 'unsupported', 'reason': f"FCW or MXCSR unmasking an exception (refused: #MF/#XM not built): {rec['at']}"}
+            if vector == 14 and name in AMD_REL16:
+                return {**rec, 'outcome': 'unsupported', 'reason': "expects AMD's 66 rel16 near branch; Intel ignores 66 (patch 0029)",
+                        'detail': json.dumps(s['fault'])}
             return {**rec, 'outcome': 'fail', 'reason': 'did not reach hlt', 'detail': rec['stop'] + ' fault=' + json.dumps(s['fault'])}
         gpr = [int(v, 0) for v in s['gpr']]
         xmm = [int(v, 0) for v in s['xmm']]

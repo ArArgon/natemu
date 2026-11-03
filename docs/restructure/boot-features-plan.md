@@ -355,9 +355,9 @@ segment prefixes (26/2E/36/3E/64/65) on near direct branches ignored (R2 review)
 `0f 0d` with a register operand #UD (X1c, QEMU's 12 encodings); INCSSP without CET #UD (owner decision 5: the SDM, where
 QEMU differs); 66/F3/F2 on EMMS (`0f 77`) and on the SHA cells (`0f 38 c8..cd`, `0f 3a cc`) #UD by the blank cells where
 QEMU ignores the prefix (X1c review); a REX followed by a legacy prefix ignored (R2 review: the SDM's rule, which pinned
-QEMU does not follow); 66 on a near direct branch (Intel ignores it, FEX decodes rel16 as AMD does; refused,
-`unsupported_form`); lowest-priority delivery to the lowest-numbered enabled APIC (X3: model specific); an MTRR overlap the
-SDM leaves undefined taken as UC (R2 fix).
+QEMU does not follow); lowest-priority delivery to the lowest-numbered enabled APIC (X3: model specific); an MTRR overlap the
+SDM leaves undefined taken as UC (R2 fix). Not on the list: 66 on a near direct branch, which the SDM defines (ignored in 64-bit mode;
+Built (66 on near direct branches)).
 
 **Owner decisions (October 28):** kernel = Debian 6.12 (32-bit stays deferred); fetching the Debian kernel,
 config and initramfs into natemu-raw is allowed (nothing committed); mitigations are booted off on the command line
@@ -3638,6 +3638,33 @@ Python 317, faults 7,912 x 2, ASM 1,875 pass / 0 fail / 48 / 347 (the runner's `
 25/25 x 2, `run_x3.py`, `run_x4.py`, `run_l3.py`, `run_l4a.py`, `run_l4b.py`, `run_m1.py`, `run_m2.py` 112/112, `run_x1.py`
 6/6 and 188/188, `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative controls flagged), `run_boot_smoke.py` 3/3 (the
 `cancel` case included); at 4 MiB the three relocated runners (`small-4m/`); the installer boots (boot-handoff §4).
+
+*Built (66 on near direct branches; fexc patch 0029, compiler **series46-br66**; uncommitted on e8f5e49):* in 64-bit mode Intel
+ignores 66 on a near direct branch: the operand size is forced to 64 bits and the displacement stays rel8/rel32 (SDM Vol.2
+CALL: "the operand size for near call (and all near branches) is forced to 64-bits", "In 64-bit mode the relative offset is
+always a 32-bit immediate value which is sign extended to 64-bits"; JMP and Jcc: the rel16 forms "Not supported in 64-bit
+mode", "operand size is fixed at 64 bits"; Vol.2 Appendix A superscript f64, "prefixes that change operand size are ignored
+for this instruction in 64-bit mode", and Vol.1's "operand size prefixes are silently ignored", which the host's
+`system::branch` cites as Vol.1 3.3.7: these two read through secondary quotations of the SDM, not a local copy). FEX decoded rel16 as AMD does, so the shim refused these forms. Patch 0029: under
+slice1 in 64-bit mode the decoder does not narrow a near direct branch (`FLAGS_SETS_RIP`, `FLAGS_SRC_SEXT`, no ModRM,
+`SIZE_64BITDEF`: Jcc rel8/rel32, JMP rel8/rel32, CALL rel32, LOOP/LOOPcc, JrCXZ); the lowering already pushed 8 bytes and
+computed a 64-bit target. Shim: 66 admitted on those forms (RET and indirect CALL/JMP keep the refusal); admission's
+`branch_target` skips 66 (a rel16-length form is no target); the host's `system::branch` already skipped it. Pinned QEMU 7.2
+follows AMD (66 with rel32 decodes rel16 and the scratch probes fault; 66 with rel8 runs as Intel), so the new corpus
+`tools/reference/gen_br66.py` (12 programs: gen_rex.branches with 66 before every branch at a random place among 0-1 segment
+prefixes: Jcc rel8/rel32 backward loops taken then not, Jcc rel8, JMP rel8/rel32, CALL rel32 with its pushed address
+popped, LOOP, JRCXZ) takes the SDM-derived expected state from pinned QEMU's run (without -d) of a twin with each 66
+replaced by 3E, which the branch also ignores (same length, same addresses); `natemu-raw/br66-corpus-20261102-01/`.
+Red/green (`natemu-raw/br66-check-20261102-01/`): series45-r2fix 12 unsupported at both block sizes, series46-br66 12/12
+at both; compiler slice-1 tests 35 pass (24 failures on series45-r2fix: 9 66-prefixed branches end their block and
+compile without a stop check, `66 e8 rel32` pushes RIP + 6 and exits to RIP + 6 + rel32); `run_x1.py` gains 8 cases of 66
+on a branch to a non-canonical target (CALL before its push, Jcc rel8/rel32 taken and not, JMP rel8, LOOP, JRCXZ): still a
+cut delivered by the host, #GP(0) at the branch. Rerun on series46-br66 (`rerun/`): `cargo test` 151 + 1 ignored, the REX corpus
+37/37 and the I10 corpus 88/88 at both block sizes, `run_x1.py` 6/6 and 196/196, i10 faults 296/296 at both, faults 7,912 at
+both, probes 83/83, ASM 1,875 pass / 0 fail / 48 / 347 (FEX's disabled `Primary/Primary_E8.asm`/`E9.asm` test AMD's rel16:
+natemu takes the Intel rel32 target and faults there, at 0x6ec0017/0x7ec0017 as computed from the bytes; `run_asm.py` files
+them unsupported, as the refusal did before), `run_boot_smoke.py` 4/4. Removed from the to-verify list (§5): the SDM
+defines this.
 
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 

@@ -151,10 +151,10 @@ pub(crate) struct Admitted {
 /// LOOP/JECXZ); linkers relax `call *f@GOTPCREL(%rip)` to `addr32 call f`.
 /// X1c: F2 too: MPX's BND prefix on CALL/RET/JMP/Jcc, ignored without MPX (fexc compiles such a branch as without it).
 /// R2 review: FS/GS too (reserved with a branch by the SDM; processors ignore them, and fexc compiles the branch as
-/// without them). 66 (FEX decodes a rel16 operand, as AMD does; Intel ignores it) is not skipped: such a branch is not
-/// proven (fexc refuses it).
+/// without them). 66 too: Intel ignores it on a near direct branch in 64-bit mode (the operand size is forced to 64 bits,
+/// the displacement stays rel8/rel32: SDM Vol.2 CALL/JMP/Jcc, Appendix A "f64"), and fexc decodes it so (patch 0029).
 fn branch_target(insn: &[u8], end: u64) -> Option<u64> {
-    let start = insn.iter().position(|&b| b & 0xf0 != 0x40 && !matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x67 | 0xf2))?;
+    let start = insn.iter().position(|&b| b & 0xf0 != 0x40 && !matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf2))?;
     let rel = match &insn[start..] {
         [0xeb | 0x70..=0x7f | 0xe0..=0xe3, r] => *r as i8 as i64,
         [0xe9 | 0xe8, r @ ..] | [0x0f, 0x80..=0x8f, r @ ..] if r.len() == 4 => i32::from_le_bytes(r.try_into().unwrap()) as i64,
@@ -757,15 +757,19 @@ mod tests {
         assert_eq!(branch_target(&[0x3e, 0x0f, 0x84, 1, 0, 0, 0], 0x10), Some(0x11));
         assert_eq!(branch_target(&[0x67, 0xe8, 0xfa, 0xff, 0xff, 0xff], 0x10), Some(0x0a)); // addr32 call (I10)
         assert_eq!(branch_target(&[0x67, 0xe3, 0xfe], 0x10), Some(0x0e)); // jecxz
-        assert_eq!(branch_target(&[0x67, 0x66, 0xe8, 1, 0, 0, 0], 0x10), None);
+        assert_eq!(branch_target(&[0x67, 0x66, 0xe8, 1, 0, 0, 0], 0x10), Some(0x11));
         assert_eq!(branch_target(&[0x2e, 0x74, 0x02], 0x10), Some(0x12));
         assert_eq!(branch_target(&[0x26, 0x36, 0x48, 0xe9, 0, 0, 0, 0], 0x10), Some(0x10));
         // R2 review: FS/GS ignored as by processors (the census's `65 72 79`).
         assert_eq!(branch_target(&[0x64, 0xe8, 1, 0, 0, 0], 0x10), Some(0x11));
         assert_eq!(branch_target(&[0x65, 0xeb, 1], 0x10), Some(0x11));
         assert_eq!(branch_target(&[0x65, 0x72, 0x79], 0x10), Some(0x89));
-        // Not proven: 66 (rel16 in FEX's decode), and an indirect CS-prefixed call.
+        // 66 ignored (patch 0029): the displacement stays rel32/rel8; a rel16-length form is not a branch target.
+        assert_eq!(branch_target(&[0x66, 0xe8, 0xfa, 0xff, 0xff, 0xff], 0x10), Some(0x0a));
+        assert_eq!(branch_target(&[0x66, 0x0f, 0x85, 1, 0, 0, 0], 0x10), Some(0x11));
+        assert_eq!(branch_target(&[0x66, 0x75, 0xfe], 0x10), Some(0x0e));
         assert_eq!(branch_target(&[0x66, 0xe8, 1, 0], 0x10), None);
+        // Not proven: an indirect CS-prefixed call.
         assert_eq!(branch_target(&[0x2e, 0xff, 0xd0], 0x10), None);
     }
 

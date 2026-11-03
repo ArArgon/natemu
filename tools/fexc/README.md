@@ -26,10 +26,12 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as twenty-eight commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as twenty-nine commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series45-r2fix` (November 2, after the R2 review:
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series46-br66` (November 2: series45-r2fix plus
+patch 0029 and the shim admitting 66 on near direct branches, ignored as on Intel (below, "The patch series"); boot-features
+plan, Built (66 on near direct branches)). Before it, series45-r2fix (November 2, after the R2 review:
 series44-r2 plus the shim admitting segment prefixes on near direct branches, ignored as processors do; boot-features plan,
 Built (R2 review fixes), round 2). Before it, series44-r2 (November 2, R2: patches 0001-0028 and
 the X1c shim, built by `tools/fexc/build.sh`; its `obj/fexc` is byte-identical to the hand-built series43-x1, so they are the
@@ -256,6 +258,13 @@ Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--v
 Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in `shim/` and `fexc.cpp`; the patches only
 include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then
 `git -C BUILD_DIR/src format-patch --no-signature --zero-commit -o tools/fexc/patches 48d7175..HEAD`.
+
+Patches 0023-0028 are described in "Current tree" above and the plan's Built notes. 0029 (series46-br66): under slice1 in
+64-bit mode, 66 on a near direct branch (Jcc rel8/rel32, JMP rel8/rel32, CALL rel32, LOOP/LOOPcc, JrCXZ) no longer narrows
+the decode: the operand size stays 64 bits and the displacement rel8/rel32, as Intel processors do (SDM Vol.2 CALL: "the
+operand size for near call (and all near branches) is forced to 64-bits" and "In 64-bit mode the relative offset is always
+a 32-bit immediate value"; JMP and Jcc: rel16 "Not supported in 64-bit mode"; Appendix A, superscript f64). FEX decoded rel16
+as AMD does; its lowering already used a 64-bit push and target.
 
 ### Compile server (`fexc --serve`, S2a; P3)
 
@@ -512,7 +521,8 @@ The scripts that read `fixtures/slice1/programs.json` (git-ignored; `smoke.py`, 
   movs/stos/lods and FS/GS on stos/scas.
   Branches (end the block): jcc rel8/rel32,
   jmp rel8/rel32 and near indirect, call rel32/indirect, ret, rep ret (f3 c3), ret imm16. All with no LOCK, REP/REPNE (except
-  rep ret, the 0f 1e NOPs, pause and the strings; LOCK only on the lockable forms; I10: 0x67 admitted but on BT* m, r), and (branches) no operand-size prefix; FS/GS
+  rep ret, the 0f 1e NOPs, pause and the strings; LOCK only on the lockable forms; I10: 0x67 admitted but on BT* m, r), and (ret and
+  indirect branches) no operand-size prefix (on near direct branches 66 is ignored as on Intel: patch 0029); FS/GS
   overrides only on an explicit memory operand and alone, CS/DS/ES/SS only naming the default segment (I7); 66-prefixed bswap
   (undefined result) is cut.
 - **System class** (reason `system_instruction`): segment push/pop and moves, lss/lfs/lgs, far call/jmp/ret, iret,

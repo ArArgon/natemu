@@ -78,8 +78,8 @@ UNSUPPORTED = {
     'o16 pushf': '669c', 'o16 leave': '66c9', 'enter level 1': 'c8080001', 'o16 shld': '660fa4c101', 'o16 shrd cl': '660fadc1',
     'movnti reg': '0fc3c1',
     'rep popcnt-like f2 0f b8': 'f20fb8c1',
-    'loop o16': '66e2fe', 'sal /6 alias': 'd1f0',
-    'bnd loop (BND is not a LOOP prefix)': 'f2e2fe', 'o16 ret': '66c3', 'o16 jmp': '66e9fbffffff', 'bswap r9w (undefined)': '66410fc9', 'bswap ax': '660fc8',
+    'sal /6 alias': 'd1f0', 'o16 call rax': '66ffd0', 'o16 jmp [rax]': '66ff20',
+    'bnd loop (BND is not a LOOP prefix)': 'f2e2fe', 'o16 ret': '66c3', 'bswap r9w (undefined)': '66410fc9', 'bswap ax': '660fc8',
     # FEX branches around the whole access for a zero count (static or dynamic), losing a guest #PF
     'rcl dword [rax],1': 'd110', 'rcr qword [rax],cl': '48d318', 'rcr qword [rax],0': '48c11800', 'rcl byte [rax],cl': 'd210',
     'rcr word [rax],5': '66c11805', 'rcl dword [rax],cl': 'd310', 'rcr dword [rax+rcx*4+8],cl': 'd35c8808', 'rcl byte [rax],32': 'c01020',
@@ -216,6 +216,9 @@ BRANCHES = {
     'addr32 call [eax]': '67ff10', 'addr32 jmp [eip+8]': '67ff2508000000', 'addr32 ret': '67c3',
     # X1c: BND (F2) on near branches, ignored without MPX (owner decision, November 2)
     'bnd ret': 'f2c3', 'bnd jmp rel8': 'f2eb05', 'bnd call rel32': 'f2e805000000', 'bnd jne rel8': 'f27505', 'bnd jmp rax': 'f2ffe0',
+    # 66 on a near direct branch: ignored as on Intel, rel8/rel32 kept (patch 0029; SDM Vol.2 CALL/JMP/Jcc, Appendix A "f64")
+    'o16 jmp rel32': '66e905000000', 'o16 call rel32': '66e805000000', 'o16 jne rel32': '660f8505000000', 'o16 jne rel8': '667505',
+    'o16 jmp rel8': '66eb05', 'o16 loop': '66e205', 'o16 jrcxz': '66e305', 'o16 rex.w call rel32': '6648e805000000', 'fs o16 jb rel32': '64660f8205000000',
     'ret': 'c3', 'rep ret': 'f3c3', 'ret 8': 'c20800', 'jmp rax': 'ffe0', 'call rax': 'ffd0', 'jmp [rax]': 'ff20', 'call [rax]': 'ff10',
 }
 
@@ -381,6 +384,15 @@ class Slice1Cutting(unittest.TestCase):
                 self.assertEqual(rc, 0, name)
                 self.assertEqual((g['instructions_translated'], g['end']['reason']), (3, 'block_ending_instruction'), (name, g['end']))
                 self.assertEqual(g['end']['rip'], hex(RIP + (len(PRE) + len(x)) // 2))
+
+    def test_o16_call_rel32_pushes_its_own_end_and_targets_rel32(self):
+        # patch 0029: 66 e8 rel32 is 6 bytes; it pushes RIP + 6 (8 bytes) and exits to RIP + 6 + rel32
+        d, rc = run('66e8fb000000', 0x1000)
+        self.assertEqual(rc, 0)
+        self.assertEqual(d['guest']['bytes_translated'], 6)
+        moves = {int(r['guest_rip'], 16) for r in d['code']['relocations'] if r['kind'] == 'guest_rip_move'}
+        self.assertEqual(moves, {0x1006, 0x1006 + 0xfb}, d['code']['relocations'])
+        self.assertEqual([(x['kind'], x['width']) for x in d['sites'] if x['kind'] == 'push'], [('push', 8)])
 
     def test_decoder_failure_on_first_instruction_gives_no_code(self):
         # not FEX's NoExec/SIGSEGV block, and never an object file
@@ -567,7 +579,8 @@ class Slice1Exits(unittest.TestCase):
                     self.assertEqual(rc, 0)
                     n, _ = check_exits(self, d, tmp, name)
                     self.assertEqual(n, 2 if name in ('jne rel8', 'bnd jne rel8', 'ds jne rel8 (hint, ignored)', 'gs jb rel8', 'je rel32', 'loop rel8', 'loope rel8', 'loopne rel8', 'jrcxz rel8',
-                                                     'addr32 loop', 'jecxz', 'addr32 jne rel32') else 1, name)   # taken and fall-through gates
+                                                     'addr32 loop', 'jecxz', 'addr32 jne rel32', 'o16 jne rel32', 'o16 jne rel8', 'o16 loop', 'o16 jrcxz',
+                                                     'fs o16 jb rel32') else 1, name)   # taken and fall-through gates
             for name, x in (('fall off the window', PRE), ('cut before cr3 write', PRE + SYSTEM['mov cr3,rax'])):
                 with self.subTest(name):
                     d, rc = run(x)
