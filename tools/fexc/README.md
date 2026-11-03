@@ -26,10 +26,14 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as twenty-five commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as twenty-eight commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series36` (October 30, I10 review: series34's patches,
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series44-r2` (November 2, R2: patches 0001-0028 and
+the X1c shim, built by `tools/fexc/build.sh`; its `obj/fexc` is byte-identical to the hand-built series43-x1, so they are the
+same compiler: [boot-handoff.md](../../docs/restructure/boot-handoff.md) §6). Between it and series36: series39-i5c (patch
+0026), series40-i5c-add (0027), series42-i5c (0028), series43-x1 (the X1c shim changes); boot-features plan, Built (I5c),
+Built (I9 addendum), Built (I5c review round), Built (X1b, X1c). Before them, series36 (October 30, I10 review: series34's patches,
 patch 0025's FexcStringOp comment fixed, and shim changes: an undecoded #UD encoding is fetched whole first (`FexcUdLength`;
 `partial_decode` when its bytes run past the input, `instruction_too_long` over 15 bytes), TPAUSE/UMONITOR/UMWAIT #UD (WAITPKG
 not advertised). Boot-features plan, Built (I10) review round.) Before it, series34 (October 30, I10: series33 plus patch 0025

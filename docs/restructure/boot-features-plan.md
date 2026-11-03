@@ -254,10 +254,12 @@ Audit at R2 (November 2; HEAD 16b0576, fexc series44-r2 = series43-x1 byte for b
       sequences; PM timer and TSC agree in rate. At R2: `run_l3.py` 0 failures, `run_l4a.py` (QEMU 13/13 and the
       rest), `run_l4b.py` (QEMU 5/5, cases 11/11, modes 7/7, `clocks` 1/1: PM/PIT/LAPIC/RTC against the TSC).
 - [ ] Guest RAM at 2 GiB with the M69 holes; standing suite green at 4 MiB and 2 GiB. *Met at 2 GiB* (Built (M1), the
-      legacy hole Built (L3); the suite below). *At 4 MiB* every runner that can run there is green, but four cannot
-      by construction: `run_x4.py` and `run_l3.py` identity-map pages at 0x500000/0x400000, `run_m1.py`'s high cases
-      place at 0x7ff00000, `run_m2.py types` builds an MTRR overlap the SDM leaves undefined at that size (its model
-      raises). Not an emulator result; open until those runners skip or resize at small RAM, or the owner accepts it.
+      legacy hole Built (L3); the suite below). *At 4 MiB* every runner that can run there is green; three cannot
+      by construction (fixed guest-physical addresses at or above 4 MiB, refused by the driver): `run_x4.py` and
+      `run_l3.py` identity-map pages at 0x500000/0x400000, `run_m1.py`'s high cases place at 0x7ff00000.
+      `run_m2.py`, which raised at R2 on an MTRR overlap the SDM leaves undefined at that size, is 112/112 there since
+      the R2 fix (Built (R2 fix)). Not an emulator result; open until those three skip or resize at small RAM, or the
+      owner accepts the statement as it stands ([boot-handoff.md](boot-handoff.md) §5).
 - [x] ISA: ASM suite 0 fail with SSE, XSAVE, x87 (`X87_F64`), REP, LOCK and flag-move tests passing or refused with
       reason; AVX per Q3. At R2: 2,270 tests, 1,875 pass, 0 fail, 48 x87 precision deviations (the reduced-precision
       class), 347 unsupported with reasons; AVX/AVX2/FMA/F16C kept by the owner (§5, October 28) and built (I8).
@@ -272,13 +274,16 @@ Audit at R2 (November 2; HEAD 16b0576, fexc series44-r2 = series43-x1 byte for b
       [boot-handoff.md](boot-handoff.md), rewritten at R2: K1 keeps code across CR3 loads; each still resets the data
       shadows (no PCID), the PTI cost with mitigations on.
 
-**Blocking for integration (found at R2):** the library boot entry (`natemu` stub and `boot-linux`, both through
+**Blocking for integration (found at R2; resolved, Built (R2 fix)):** the library boot entry (`natemu` stub and `boot-linux`, both through
 `natemu::linux::Boot`) delivers device interrupts through a dangling pointer: `irq::Lapics::memory` points at the local
 `backing` of `Boot::prepare`, which is then moved into `Prepared` (L0, 3c12567). User-space console output is lost (IRQ 4
 never taken) and the installer initrd hangs after "Run /init" at N = 1, 2 and 4, warm cache or off; 959e430 (before L0)
 and QEMU print. A scratch fix re-pointing it in `Prepared::run` reaches the dialog. Details, evidence and the boot
 tables: [boot-handoff.md](boot-handoff.md) §4. The standing suite cannot see it (`run-program` does not move its
-backing); it needs a library-path boot check.
+backing); it needs a library-path boot check. *Resolved:* `Backing::memory` is shared (`Arc`) with the chipset; the
+library-path check `tools/run_boot_smoke.py` and a unit test are red at b3f6841 and green with the fix; the installer
+boots reach "Select a language" at N = 1 (67.5 s) and 4 (48.7 s) through the stub with a warm cache
+(`natemu-raw/r2-fix-20261102-01/`).
 
 **R1 coverage (R1a, November 2).** Each §1 row with the R1a composite that exercises it (if any) and the named checks
 that judge it. *1a:* IDT delivery: `r1-demand`, `r1-int3`, `r1-boot` (#UD); `run_slice3_vm.py delivery`. TSS.RSP0/IST:
@@ -3523,6 +3528,33 @@ CPU 1 (that pair's count is short). **Construction notes** (not emulator defects
 so RSP must be set before the far return; the AP reads its APIC id by CPUID, not the x2APIC MSR, since the stub leaves
 peers in xAPIC mode; the handshake reads a delivery count before sending, not after, or a delivery between send and read
 would make the wait target unreachable. No emulator defect found.
+
+*Built (R2 fix, the dangling interrupt-controller pointer; no fexc change, series44-r2, on b3f6841, uncommitted):*
+**Root cause** (confirmed): `irq::install` stored `Lapics::memory: *const Memory` pointing at `Boot::prepare`'s local
+`backing`, which `prepare` then moved into `Prepared` (L0, 3c12567); every later post and ring read a stale stack
+`Memory`. **Fix:** `execution::Backing::memory` is `Arc<Memory>`; `irq::install` takes `&Arc<Memory>` and `Lapics` keeps a
+clone (the raw pointer, its SAFETY comment and `unsafe impl Send for Lapics` removed; `Memory` gains `unsafe impl Send`:
+the mapping may be unmapped from any thread). The chipset now keeps the mapping alive itself, so the bug cannot be
+written again without `unsafe`. The vCPU path is unchanged (`Area` still borrows `&Memory`, derefed once when the area
+is made). **Other captures audited** (none dangle after the move): the UART's IRQ hook, the chipset views, PIT/RTC/PM
+and `Devices.irqs` hold `Irqs` (`Arc`s); `Devices` is moved into its `Arc` after registration and nothing points into
+it; `GuestRam` and the watchdog's `halted` word address the mmap, which does not move with `Memory`; the doorbell,
+`Stops` and the compile cache (`compile_cache::shared`, `Arc`) are made in `run`; `Loaded` and the board's stats are
+values or `Arc`s. **Checks** (red at b3f6841 with only the fix reverted, green with it; `natemu-raw/r2-fix-20261102-01/`,
+`red-on-head/`): `tools/run_boot_smoke.py` (the stub built alone, Debian kernel + installer initrd,
+`rdinit=/bin/busybox -- sh -c "echo MARKER; poweroff -f"`, the marker on serial and exit 0 at N = 1 and 4): 0/2 (the
+guest powers off, the echo never appears) then 2/2, about 10 s per boot with the cache off; the unit test
+`linux::tests::interrupts_reach_the_backing_after_prepare_moves_it` (a synthetic resident ELF and bzImage, `prepare`,
+the value moved into a `Box`, 64 KiB of stack zeroed, the I/O APIC pin 4 routed to vector 0x41, COM1's IER THRE bit
+set: the moved backing's vCPU 0 must have 0x41 pending): panicked in `global_u64` on the zeroed `Memory` 3/3, then ok.
+**Phase-end items:** `run_m2.py`'s model judges an MTRR overlap the SDM leaves undefined as natemu's recorded UC (it
+raised `KeyError` in `types` at 4 MiB), and the `qemu` mode's required types for the `mtrr` program come from the
+same model (at 4 MiB the firmware's WB range 0 covers the WC and WP pages: UC); the handoff states which runners cannot
+run at 4 MiB and why; `tools/fexc/README.md` names series44-r2. **Rerun:** `cargo test` 148 + 1 ignored,
+`check_resident_stack.py` `ok`, Python 317, `contain`, `delivery`, `run_x3.py`, `run_x4.py`, `run_l3.py`, `run_l4a.py`,
+`run_l4b.py`, `run_m3.py` green, `run_m2.py` 112/112 at 2 GiB and 4 MiB, `run_r1.py r1a` 7/7 and `r1b` 12/12; the installer
+initrd to "Select a language" through the stub with a warm cache: N = 1 67.5 s ("Run /init" at guest 5.18 s), N = 4
+48.7 s (5.44 s), as the R2 scratch fix (67.4 and 49.2 s).
 
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 

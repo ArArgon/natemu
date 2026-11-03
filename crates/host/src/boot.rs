@@ -503,7 +503,7 @@ pub fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<Loaded, 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A minimal valid bzImage: protocol 2.15, relocatable, 64-bit, 2 MiB alignment, pref_address 16 MiB, one setup

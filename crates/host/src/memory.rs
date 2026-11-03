@@ -21,6 +21,8 @@ pub struct Memory(pub(crate) *mut u8, pub(crate) usize);
 // SAFETY: the backing is shared with running vCPUs anyway; every accessor copies through raw pointers. Owner threads
 // touch their own vCPU's records, and areas shared between vCPUs only through atomics.
 unsafe impl Sync for Memory {}
+// SAFETY: the mapping is not tied to the thread that made it; any thread may unmap it.
+unsafe impl Send for Memory {}
 impl Memory {
     #[cfg(test)]
     pub(crate) fn new() -> Result<Self> {
@@ -341,7 +343,7 @@ pub(crate) fn resident_text(window: usize) -> Vec<Span> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     #[test]
     fn malformed_elf_rejected_without_loading() {
@@ -350,7 +352,7 @@ mod tests {
             assert!(load_elf(&memory, &vec![0; length]).is_err());
         }
     }
-    fn resident_elf(segments: &[(u64, u64)]) -> Vec<u8> {
+    pub(crate) fn resident_elf(segments: &[(u64, u64)]) -> Vec<u8> {
         let payload = 64 + segments.len() * 56;
         let mut data = vec![0; payload + segments.len() * 4];
         data[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");

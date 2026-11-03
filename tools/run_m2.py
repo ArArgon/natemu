@@ -91,7 +91,11 @@ def mtrr_type(m, gpa):
 
 
 def page_type(m, pat, gpa, index):
-    return T14_7[mtrr_type(m, gpa)][pat >> 8 * index & 7]
+    """Table 14-7's effective type; an MTRR overlap the SDM leaves undefined (`mtrr_type` None: at 4 MiB of RAM the
+    firmware's WB range 0 meets the `types` ranges' WC and WP pages) is judged as natemu's recorded choice, UC
+    (`natemu_abi::cpu::mtrr_type`; plan, Built (M2))."""
+    t = mtrr_type(m, gpa)
+    return T14_7[UC if t is None else t][pat >> 8 * index & 7]
 
 
 def bits(index, large=False):
@@ -302,7 +306,12 @@ PROGRAMS = {'pat': (pat_body, lambda i: {T(i, k): T(i, k) | P.LEAF | bits(k) for
             'mtrr': (mtrr_body, lambda i: {}),
             'uc': (uc_body, lambda i: {T(i, k): T(i, k) | P.LEAF | bits(x) for k, x in UC_PAGES.items()})}
 # Non-WB types the SDM gives the test pages (each CPU's counts must include them); a UC access runs its instruction alone.
-QEMU_TYPES = {'pat': {WC, UC, WP, WT}, 'mtrr': {UC, WC, WT, WP}, 'uc': {UC}}
+# `mtrr`: pages 0..3 under the firmware's MTRRs plus MTRR_RANGES (default type UC, PAT entry 0 WB), by `page_type`: UC, WC,
+# WT, WP at 2 GiB; at 4 MiB the firmware's WB range 0 also covers them, so WC and WP meet WB (undefined: natemu's UC).
+_MTRR_PROGRAM = {**FIRMWARE, 0x2ff: 0xc00, **{b: T(0, k) | t for k, (b, t) in enumerate(MTRR_RANGES)},
+                 **{b + 1: MTRR_MASK for b, _ in MTRR_RANGES}}
+QEMU_TYPES = {'pat': {WC, UC, WP, WT}, 'mtrr': {page_type(_MTRR_PROGRAM, PAT_RESET, T(0, k), 0) for k in range(4)} - {WB},
+              'uc': {UC}}
 
 
 def program(name, n):

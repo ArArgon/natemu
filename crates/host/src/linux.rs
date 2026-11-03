@@ -225,3 +225,40 @@ impl Prepared {
         self.uart.lock().unwrap_or_else(|e| e.into_inner()).output.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use natemu_abi::lapic::{RESET, SVR_ENABLE};
+
+    /// Writes 64 KiB of zeros below the caller's frame: whatever a returned function left on the stack is gone.
+    #[inline(never)]
+    fn clobber_stack() {
+        std::hint::black_box([0u8; 64 << 10]);
+    }
+
+    /// R2's blocker: the chipset must post into the guest memory of the `Prepared` it ends up in, after `prepare`
+    /// returned and the value moved (it once kept a pointer to `prepare`'s local backing). No VM: COM1's THRE interrupt
+    /// (IER bit 1) raises ISA IRQ 4, which the I/O APIC routes to vCPU 0 as vector 0x41.
+    #[test]
+    fn interrupts_reach_the_backing_after_prepare_moves_it() {
+        let resident = std::env::temp_dir().join(format!("natemu-linux-test-{}.elf", std::process::id()));
+        std::fs::write(&resident, crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)])).unwrap();
+        let mut boot = Boot::new(&resident, "fexc", boot::tests::image(0x1000));
+        (boot.ram, boot.code_bytes) = (64 << 20, exec::cache::MAX_BLOCK_BYTES);
+        let prepared = boot.prepare();
+        std::fs::remove_file(&resident).unwrap();
+        let prepared = Box::new(prepared.unwrap());
+        clobber_stack();
+        execution::set_lapic(prepared.backing().vcpu(0), natemu_abi::lapic::Lapic { svr: SVR_ENABLE | 0xff, ..RESET });
+        let (ioapic, _) = prepared.devices().find(boot::acpi::platform::IOAPIC_BASE.into()).unwrap();
+        for (select, value) in [(0x18, 0x41), (0x19, 0)] {
+            let mut d = ioapic.lock().unwrap();
+            d.write(0, 0, 4, select);
+            d.write(0, 0x10, 4, value);
+        }
+        assert!(!execution::pending(&prepared.backing().memory, 0, 0x41));
+        prepared.devices().port(0, boot::acpi::platform::COM1_PORT + 1, 1, Some(2)).unwrap();
+        assert!(execution::pending(&prepared.backing().memory, 0, 0x41));
+    }
+}

@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The execution mode's backing for `n` vCPUs. Block 0 holds vCPU 0's window, its lookup area, the global area, its
@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 /// (never mapped, so never backed): every vCPU maps block 0's. Guest RAM (M1: `ram_bytes`, chosen at prepare) follows
 /// the last block, at `n * stride`; only the pages the guest or the host touch are ever backed.
 pub struct Backing {
-    pub memory: Memory,
+    /// Shared (not borrowed) by whatever outlives a move of the Backing: the chipset's LAPIC view ([`crate::irq`]).
+    pub memory: Arc<Memory>,
     pub(crate) n: usize,
     stride: usize,
     /// Guest-physical RAM through the host's alias.
@@ -158,7 +159,7 @@ pub fn prepare(resident: &str, code_bytes: usize, n: usize, ram_bytes: usize) ->
     }
     // SAFETY: the alias is the backing's last `ram_bytes`, which lives as long as the Backing holding this value.
     let ram = unsafe { exec::guest_ram(ram_bytes as u64, memory.0 as u64 + ram_offset as u64) };
-    Ok(Backing { memory, n, stride, ram, epoch: unsafe { mach_absolute_time() } })
+    Ok(Backing { memory: Arc::new(memory), n, stride, ram, epoch: unsafe { mach_absolute_time() } })
 }
 /// Sets the vCPU's initial architectural state (before it first runs).
 pub fn set_cpu(area: Area, cpu: Cpu) {

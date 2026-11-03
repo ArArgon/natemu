@@ -1,7 +1,8 @@
 # Boot integration handoff
 
 Status: November 2, 2026, end of the boot-features phase (chunk R2 of the
-[boot-features plan](boot-features-plan.md), "the plan" below; its §4 checklist says what is met). Emulator code at 9730c4d (16b0576 adds only the R1b runner); the
+[boot-features plan](boot-features-plan.md), "the plan" below; its §4 checklist says what is met). Emulator code at 9730c4d (16b0576 adds only the R1b runner) plus the fix of the blocking interrupt defect found at R2
+(§4; uncommitted on b3f6841); the
 compiler is fexc **series44-r2**, rebuilt by `tools/fexc/build.sh` and byte-identical to the hand-built series43-x1 (§6).
 This page is enough to start the boot integration: how to build and run a boot, what a boot takes as input, what is
 known to cost or differ, and the standing suite. The plan's "Built (...)" paragraphs hold the detail and the evidence;
@@ -34,7 +35,8 @@ target/release/natemu "$R" "$F" "$K" --cmdline 'console=ttyS0 earlyprintk=serial
 target/release/natemu "$R" "$F" "$K" --initrd "$I" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr'
 ```
 
-At 16b0576 the initrd boot hangs after "Run /init" (no user-space console output): §4, "Blocking defect found at R2".
+The initrd boot hung after "Run /init" at 16b0576 (device interrupts through a dangling pointer); fixed after R2 (§4,
+"Blocking defect found at R2 (resolved)").
 
 `natemu RUNTIME FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--vcpus N] [--serial FILE]`: COM1's output
 to standard output (or `--serial FILE`) as it is sent; the stop of the vCPU that ended the run on standard error; exit 0
@@ -82,8 +84,7 @@ submodule `third_party/FEX`); admission `crates/host/src/admission.rs`; host `cr
 `owners.rs`, `execution.rs`, `system.rs`, devices `uart.rs`, `ioapic.rs`, `pic.rs`, `pit.rs`, `rtc.rs`, `pm.rs`,
 `clock.rs`, loader `boot.rs`, `boot/acpi.rs`); resident `crates/runtime/src/` (`execution.rs` and `execution/`:
 delivery, events, segments, syscalls, lapic, mmio, ports, sse, x87, xsave, watch, helpers; `cache.rs`, `tables.rs`, `gates.S`); shared
-layouts `crates/abi/src/`. Everything the boot path needs is built and checked (but the library entry has the blocking
-interrupt defect of §4): delivery of every exception and
+layouts `crates/abi/src/`. Everything the boot path needs is built and checked: delivery of every exception and
 interrupt through the IDT (X1a-X1c, X2), LAPIC timer and IPIs (X3), mailbox AP start (X4), descriptors, SYSCALL/SYSRET,
 SWAPGS, MSRs, CPUID (S1-S3), TF and breakpoints (S4), SSE/AVX/x87/XSAVE (I5-I10), REP and LOCK forms (I2, I3), memory
 types (M2), devices (M3, L1-L4b), translations kept across CR3 and INVLPG (K1), system instructions in the resident
@@ -180,6 +181,7 @@ beside it.)
 
 | To "Select a language" (initrd), wall s ("Run /init" guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
 | --- | --- | --- | --- | --- |
+| `natemu` stub, the fix (`Arc<Memory>`, below), cache warm | 67.5 (5.18) | | | 48.7 (5.44) |
 | `natemu` stub and `boot-linux` at 16b0576, warm or off | never (hangs after "Run /init", see below) | never | | never |
 | stub with the experimental fix below, cache warm | 67.4 (5.20) | | | 49.2 (5.40) |
 | `boot-linux` with the fix, cache warm | 67.4 (5.26) | | | 48.9 (5.41) |
@@ -198,7 +200,7 @@ rows use `thread=single`. Without initrd natemu is within 1.1-1.4x of QEMU with 
 the installer (with the fix) it is 9-10x slower than multi-threaded QEMU, mostly first-time compiles of user code at randomized addresses (the cache barely
 helps there: §4, translation latency).
 
-**Blocking defect found at R2: device interrupts after `Boot::prepare` go through a dangling pointer.**
+**Blocking defect found at R2 (resolved): device interrupts after `Boot::prepare` went through a dangling pointer.**
 `irq::install` keeps `Lapics::memory: *const Memory` pointing at `backing.memory` (`crates/host/src/irq.rs:31-50`),
 but `Boot::prepare` (`crates/host/src/linux.rs`) calls it on its local `backing` and then moves `backing` into the
 returned `Prepared`, so every interrupt a device raises later (`Lapics::memory()` in posting and ringing) reads the
@@ -210,9 +212,16 @@ the boots to the root-fs panic still reach it. The test driver's `run-program` k
 suite's interrupt tests (`r1-serial`, `run_l4a.py`, `run_x3.py`) cannot see it, and L0's checks booted only to a
 `poweroff -f` init. Experimental fix (scratch build only, not in the repository;
 `natemu-raw/r2-20261102-01/diag/rebind-experiment.diff`): `Prepared::run` re-points the pointer at `self.backing.memory`
-before the VM starts; with it the echo prints and both boot paths reach the installer dialog (table above). A real fix
-should not store a pointer into a movable `Backing` (keep `Memory`'s raw base by value, or pin the backing), and the
-suite needs a library-path boot check with interrupt-driven console output.
+before the VM starts; with it the echo prints and both boot paths reach the installer dialog (table above). **Fix** (after R2, uncommitted on b3f6841): `Backing::memory` is an `Arc<Memory>` and the
+chipset's `Lapics` holds a clone of it (no raw pointer, no `unsafe impl Send`; `Memory` is `Send` as a mapping handle),
+so the borrow checker rules out the bug; the vCPU path still borrows `&Memory` through `Area` (unchanged). No other
+pointer or reference captured during `prepare` outlives the move: devices, the UART hook, PIT/RTC/PM and `Devices` hold
+`Arc`s, `GuestRam` and the watchdog's `halted` word address the mmap (which does not move), the doorbell and compile
+cache are set up in `run`. Checks, red at b3f6841 and green with the fix: `tools/run_boot_smoke.py` (§5; the busybox
+echo marker on serial at N = 1 and 4: 0/2 before, 2/2 after) and the unit test
+`linux::tests::interrupts_reach_the_backing_after_prepare_moves_it` (prepare, move into a `Box`, overwrite the old
+stack, COM1's THRE interrupt must post vector 0x41 into the moved backing's vCPU 0: it panicked on the stale `Memory`
+before). Evidence `natemu-raw/r2-fix-20261102-01/` (`red-on-head/`, the reruns, `boot/boots.jsonl`).
 
 ## 5. Standing suite
 
@@ -225,11 +234,22 @@ mapping: [contracts.md](contracts.md), "General-path check per contract".
 
 **Results at R2** (series44-r2, both RAM sizes, every command below plus `run_r1.py r1b`; raw summaries
 `natemu-raw/r2-20261102-01/suite-{4m,2g}/`): at 2 GiB everything green but the 7 known i8b QEMU two-NaN departures at
-both block sizes. At 4 MiB the same, except four runners that cannot run at that size by construction: `run_x4.py` and
-`run_l3.py` identity-map pages at 0x500000 and 0x400000 (the driver refuses a page outside guest RAM), `run_m1.py`'s
-code-near-the-top cases place at 0x7ff00000, and `run_m2.py types` adds variable MTRR ranges whose overlap with the
-4 MiB firmware's UC range the SDM leaves undefined (its model raises `KeyError`). `cargo test` 147 + 1 ignored, Python
-unit tests 317.
+both block sizes. **At 4 MiB** (`NATEMU_RAM=0x400000`) the same for every runner that can run there; three cannot, by
+construction, because their programs use fixed guest-physical addresses at or above 4 MiB and the driver refuses a
+page outside guest RAM: `run_x4.py` (identity-mapped pages at 0x500000), `run_l3.py` (at 0x400000) and `run_m1.py`
+(its code-near-the-top cases at 0x7ff00000; it sets its own sizes for the rest). "Standing suite green at 4 MiB" means
+every other command below green at that size. `run_m2.py` failed at 4 MiB at R2 (its model raised `KeyError` on an
+MTRR overlap the SDM leaves undefined: there the firmware's MTRRs are default UC with a WB range over [0, 4 MiB), which
+meets the `types` and `qemu` programs' WC and WP ranges); since the fix its model judges an undefined overlap as
+natemu's recorded choice, UC, and `run_m2.py` is 112/112 at both sizes. `cargo test` 147 + 1 ignored at R2 (148 + 1
+with the fix's unit test), Python unit tests 317.
+
+**Rerun with the fix** (`natemu-raw/r2-fix-20261102-01/`, 2 GiB unless named): `cargo test` 148 + 1 ignored,
+`check_resident_stack.py` `ok` (same depths), Python 317, boot smoke 2/2, `contain` 0 failures (423 fresh-process
+controls), `delivery` 0 failures, `run_x3.py` (9/9, 4/4, 24/24, 6/6, 10/10, 54/54), `run_x4.py` (33/33, 28/28, 6/6),
+`run_l3.py` 0 failures, `run_l4a.py` (13/13, 4/4, 2/2, 2/2, 1/1), `run_l4b.py` (5/5, 2/2, 3/3, 11/11, 7/7, 1/1),
+`run_m3.py` 0 failures, `run_m2.py` 112/112 at 2 GiB and at 4 MiB, `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative
+controls flagged), and the initrd boots to "Select a language" at N = 1 and 4 (§4 table).
 
 | Runner | Checks (counts at R2) |
 | --- | --- |
@@ -261,6 +281,7 @@ unit tests 317.
 | `tools/run_x1.py` | X1b/X1c (programs `tools/bench/smp/entry.py`): `qemu` `x1-entry@1/2/4` vs pinned QEMU and delivery_model: frames on RSP0 and IST1..7 (CPL 3 -> 0 and 0 -> 0), IRETQ to CPL 3, normal (SWAPGS) and paranoid (RDGSBASE, LSL of a CPU/node descriptor, WRGSBASE) entries of NMI/#DF/#DB/0x12, #DF from CPL 3 and 0, NMI blocking until IRETQ; `x1-sreg@1` PUSH/POP FS/GS and the PREFETCHW/CLDEMOTE hints vs QEMU and the SDM; `x1-rnop@1` the Reserved-NOP cells vs QEMU; `cases` refused-but-defined forms now delivered (SDM rules): #UD encodings (64-bit-invalid opcodes, Table A-2/A-3/A-6 blanks, register operands of memory-only forms, GETSEC, RSM, VMX group 9, unprefixed 0f 38/0f 3a), direct branches (LOOPcc/JrCXZ and 0x67 included) to a non-canonical target (#GP(0) when taken), PUSH/POP FS/GS faults, the split-lock and fetch-from-non-RAM typed stops, CLTS, SMSW, LMSW, SYSENTER, SYSEXIT (boot-features plan, Built (X1b, X1c)) |
 | `tools/run_r1.py r1a` | R1a single-vCPU composites (one program each, feature chains already built): `r1-boot` (64-bit entry into a kernel-head sequence: 4-level tables with a kernel map, CR4/CR3, LGDT/LRETQ to __KERNEL_CS, EFER SCE and NX, CR0_STATE, early IDT fixing up UD2, back to the identity map), `r1-demand` (#PF handler mapping on demand from zeroed pools: read, write, fetch, REP STOSQ faulting twice), `r1-int3` (Linux's `int3_selftest`), `r1-poke` (`__text_poke` through a poking address under a second CR3, `sync_core`, the `text_poke_bp` INT3 protocol, a static-call NOP5 -> JMP), `r1-syscall` (SYSCALL/SYSRET with SWAPGS, a PTI CR3 switch each way and VERW), `r1-timer` (LAPIC one-shot waking `sti; hlt`), `r1-serial` (8250 THRE transmit driven by IRQ4 through the I/O APIC); each vs pinned QEMU at block sizes default and 1 and by the SDM's expected state; a negative control each (boot-features plan, Built (R1a)) |
 | `tools/run_r1.py r1b` | R1b multi-vCPU composites at N = 2, 3, 4 (block sizes default and 1): `r1b-mpstart` (APs started through the ACPI MP-wakeup mailbox, each running a kernel-head-shaped sequence: own GDT/IDT, GS base, stack, arrival check-in; natemu wakes via the mailbox, QEMU's stub starts them at the same vector), `r1b-poke` (the `text_poke_bp` INT3 protocol across CPUs while peers execute the site, the sync IPI's IRETQ as `sync_core`, each peer's #BP handler emulating the new instruction), `r1b-nmi` (NMI by x2APIC IPI on an IST stack, the paranoid handler reading its CPU number by LSL of a per-CPU descriptor with RDGSBASE/WRGSBASE/SWAPGS), `r1b-ipiload` (all-to-all fixed-vector IPIs under memory-heavy loops: per-pair counts exact, EOI leaving the ISR clear, the loop checksums); vs pinned QEMU (x2APIC) with peers by exact counts, per-CPU end state and SDM invariants, plus a negative control each (boot-features plan, Built (R1b)) |
+| `tools/run_boot_smoke.py` | the library boot path (the `natemu` stub, built alone): the Debian bzImage and installer initrd with `rdinit=/bin/busybox -- sh -c "echo MARKER; poweroff -f"` at N = 1 and 4 (`--vcpus`); pass: the marker on its own serial line (busybox's console write goes through the 8250's THRE interrupt, IRQ 4 via the I/O APIC) and exit 0 (S5). Needs `natemu-raw/kernel-census-20261028-01/dl/{linux,initrd.gz}`; compile cache off unless `NATEMU_COMPILE_CACHE` is set; about 25 s. Guards R2's blocker (§4), which `run-program` runners cannot see |
 | `tools/check_resident_stack.py` | resident stack bound and gate/ERET binary shape of the built runtime |
 | `tools/models/` | independent ordering, coherence, PAE and modes models (used by the runners) |
 
@@ -349,6 +370,7 @@ tools/with-env python3 tools/run_i5c.py --fexc "$F" --out "$O/i5c"   # I5c: #XM/
 tools/with-env python3 tools/run_i5c.py --fexc "$F" --out "$O/i5c-1" --max-block 1
 tools/with-env python3 tools/run_x1.py --fexc "$F" --out "$O/x1"   # X1b/X1c: CPL 3 frames, IST1..7, paranoid entries, NMI blocking vs QEMU and delivery_model; refused-but-defined forms delivered
 tools/with-env python3 tools/run_r1.py r1a --fexc "$F" --out "$O/r1a"   # R1a: single-vCPU composites (boot head, on-demand #PF, int3_selftest, text_poke, syscall/PTI/VERW, timer HLT wake, serial IRQ4) vs QEMU at both block sizes; negative controls
+tools/with-env python3 tools/run_boot_smoke.py --fexc "$F" --out "$O/boot-smoke"   # library boot path: Debian initrd, busybox echo on serial (IRQ 4) at N = 1, 4
 tools/with-env python3 tools/run_r1.py r1b --fexc "$F" --out "$O/r1b"   # R1b: multi-vCPU composites (mailbox AP start, cross-CPU text_poke_bp, NMI by IPI on an IST with LSL, IPIs under load) vs QEMU at N = 2..4, both block sizes; negative controls
 ```
 
@@ -363,9 +385,8 @@ the compile cache's entries (keyed by the binary's hash) serve both.
 
 ## 7. Open items before or during integration
 
-- **Blocking:** the dangling interrupt-controller pointer in the library boot entry (§4, "Blocking defect found at
-  R2"): fix, add a library-path boot check with user-space console output to the standing suite, then rerun the
-  installer boots.
+- *Resolved after R2:* the dangling interrupt-controller pointer in the library boot entry (§4, "Blocking defect found
+  at R2 (resolved)"): fixed, `run_boot_smoke.py` in the standing suite, the installer boots rerun.
 - The C0 census half of plan §4's second item: after I10 the initramfs still has 15 refused sites not attributed to a
   chunk (`pushq` 11, `xorl` 2, `subb` 2; plan, Built (I10), Census) and no census was rerun after X1c.
 - P1's outcome and the deferred optimisation list (plan Q5: P2's options A/B) have no owner record.

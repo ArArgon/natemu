@@ -29,9 +29,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 /// The LAPICs as the chipset reaches them: the vCPUs' event records and doorbells.
 struct Lapics {
-    /// The VM's backing (its `Events`). SAFETY: set from the driver's backing, which outlives the registry and every
-    /// thread holding an [`Irqs`] (declared before it; source threads are joined when their device drops).
-    memory: *const Memory,
+    /// The VM's backing (its `Events`), shared with the [`execution::Backing`]: the chipset outlives a move of it.
+    memory: Arc<Memory>,
     vcpus: usize,
     doorbell: Option<Doorbell>,
     /// The master PIC's output as last given to the LINT0s.
@@ -42,11 +41,9 @@ struct Lapics {
     fresh: std::cell::Cell<u64>,
     coalesced: std::cell::Cell<u64>,
 }
-// SAFETY: see `memory`; every access through it is an atomic word of the global area.
-unsafe impl Send for Lapics {}
 impl Lapics {
     fn memory(&self) -> &Memory {
-        unsafe { &*self.memory }
+        &self.memory
     }
     fn ring(&self, v: usize) {
         // Before the machine exists nothing runs (the vCPU sees the post at its first boundary); after a vCPU ended its
@@ -300,8 +297,8 @@ impl Device for View {
 }
 
 /// Puts the chipset on `devices` for a VM of `vcpus` vCPUs on `memory`, and wires `uart`'s IRQ (COM1, ISA IRQ 4) into it.
-pub fn install(devices: &mut Devices, memory: &Memory, vcpus: usize, uart: &Arc<Mutex<crate::uart::Uart>>) -> crate::Result<Irqs> {
-    let lapics = Lapics { memory, vcpus, doorbell: None, lint0: false, messages: Default::default(), fresh: Default::default(), coalesced: Default::default() };
+pub fn install(devices: &mut Devices, memory: &Arc<Memory>, vcpus: usize, uart: &Arc<Mutex<crate::uart::Uart>>) -> crate::Result<Irqs> {
+    let lapics = Lapics { memory: memory.clone(), vcpus, doorbell: None, lint0: false, messages: Default::default(), fresh: Default::default(), coalesced: Default::default() };
     let chipset = Chipset { ioapic: Ioapic::new(), pic: Pic::new(), lines: 0, lapics };
     let irqs = Irqs { chipset: Arc::new(Mutex::new(chipset)), live: Arc::default() };
     let view = |kind| -> Shared { Arc::new(Mutex::new(View(irqs.clone(), kind))) };
@@ -344,7 +341,7 @@ mod tests {
     /// ISA IRQ0 enters pin 2, IRQ n pin n and PIC input n. No vCPU (`vcpus` 0): only the messages are counted.
     #[test]
     fn line_changes_only() {
-        let lapics = Lapics { memory: std::ptr::null(), vcpus: 0, doorbell: None, lint0: false, messages: Default::default(), fresh: Default::default(), coalesced: Default::default() };
+        let lapics = Lapics { memory: Arc::new(Memory::with_size(4096).unwrap()), vcpus: 0, doorbell: None, lint0: false, messages: Default::default(), fresh: Default::default(), coalesced: Default::default() };
         let mut c = Chipset { ioapic: Ioapic::new(), pic: Pic::new(), lines: 0, lapics };
         for (sel, v) in [(0x10 + 2 * 4, 0x41), (0x10 + 2 * 2, 0x42)] {
             let (a, mut w) = c.wires();
