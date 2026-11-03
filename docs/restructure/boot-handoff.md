@@ -303,17 +303,17 @@ plan, Built (R2 review fixes)): green but the 7 known i8b departures at both blo
 `run_r1.py r1a` 7/7 and `r1b` 12/12, `run_boot_smoke.py` 3/3 (with `cancel`); at 4 MiB the three relocated runners
 (above); the installer boots (§4 table).
 
-**Full suite on the final build** (series45-r2fix at HEAD 673667e, clean tree; `natemu-raw/final-suite-20261102-01/`: `2g/` and
+**Full suite on the final build** (series46-br66 at HEAD 8cbbfd1, clean tree; `natemu-raw/final-suite-20261102-02/`: `2g/` and
 `4m/` each hold `results.txt` (exit code and seconds per command) and `logs/`, `extra/` the reruns; per-case outputs
 deleted): every command of the block below, one VM runner at a time with no other `natemu-host` running, once at 2 GiB
-(72 commands) and once at 4 MiB (`NATEMU_RAM=0x400000`, the 63 VM commands; `run_boot_smoke.py`, which sets its own RAM, runs at
+(74 commands) and once at 4 MiB (`NATEMU_RAM=0x400000`, the 65 VM commands; `run_boot_smoke.py`, which sets its own RAM, runs at
 the default only). Everything passed but the 7 known i8b departures (they flag `i8-forms-001`, `-045` and
-`i8-random-067`, `-077`, `-097`, `-111`, `-126`; the runner exits 1; rerun alone once at both block sizes: the same 7).
+`i8-random-067`, `-077`, `-097`, `-111`, `-126`; the runner exits 1; rerun alone once at both block sizes: the same 7, also `cargo test` with `FEXC` set: 151 + 1 ignored).
 
 | Runner | 2 GiB | 4 MiB |
 | --- | --- | --- |
 | `cargo test` (also with `FEXC` set), `check_resident_stack.py`, Python | 151 + 1 ignored in both, `ok`, 317 | not run |
-| `run_slice1_vm.py` fixtures / seed / REX / I8 / I9 / I9-big / I10 (default and `--max-block 1`) | 64 / 44 / 37 / 136 / 120 / 5 / 88, 0 fail | same |
+| `run_slice1_vm.py` fixtures / seed / REX / 66-on-branches / I8 / I9 / I9-big / I10 (default and `--max-block 1`) | 64 / 44 / 37 / 12 / 136 / 120 / 5 / 88, 0 fail | same |
 | `run_slice1_vm.py` I8b | 329 match, 7 known departures | same |
 | `run_slice1_faults.py`, `run_slice2_*` | 7,912; flow 64, loops 846 (x3 block sizes), probes 83; 0 fail | same |
 | `run_asm.py` | 1,875 pass / 0 fail / 48 deviations / 347 unsupported | same |
@@ -321,7 +321,7 @@ the default only). Everything passed but the 7 known i8b departures (they flag `
 | `run_i6_faults.py`, `run_i8_faults.py`, `run_i9_faults.py`, `run_i10_faults.py`, `run_i5b.py`, `run_i5c.py` | 275, 851, 586, 296, 411, 255 as expected | same |
 | `run_i6b.py` corpus / cases | 112 / 129 | same |
 | `run_m3.py`, `run_k1.py`, `run_k2.py`, `run_s4.py` | 0 failures | same |
-| `run_x1.py`, `run_x3.py`, `run_x4.py` | 6/6 + 188/188; 9/9, 4/4, 24/24, 6/6, 10/10, 54/54; 33/33, 28/28, 6/6 | same |
+| `run_x1.py`, `run_x3.py`, `run_x4.py` | 6/6 + 196/196; 9/9, 4/4, 24/24, 6/6, 10/10, 54/54; 33/33, 28/28, 6/6 | same |
 | `run_l1.py` / `run_l2.py` / `run_l2_iasl.py` | 12/12 + 41/41; N = 2..4 pass; N = 2..4 pass | no VM |
 | `run_l3.py`, `run_m1.py`, `run_m2.py` | 0 failures; 20/20; 112/112 | same |
 | `run_l4a.py`, `run_l4b.py` | 13/13, 4/4, 2/2, 2/2, 1/1; 5/5, 2/2, 3/3, 11/11, 7/7, 1/1 | same |
