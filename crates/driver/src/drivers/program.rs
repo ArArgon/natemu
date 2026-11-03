@@ -550,7 +550,7 @@ fn log_images(base: u64) -> [Vec<u8>; 2] {
 }
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] \
-                     [--code-shape] [--code-cache BYTES] [--ram BYTES] [--place GPA] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-exit] [--tamper offset|word|record|system] [--tamper-after word|record] \
+                     [--code-shape] [--check-reuse] [--code-cache BYTES] [--ram BYTES] [--place GPA] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-exit] [--tamper offset|word|record|system] [--tamper-after word|record] \
                      [--forge-stop] [--forge-entry HEX[,HEX]...] [--kick-vcpu V]... [--kicks M] [--kick-every-us P] [--kick-jitter-us J] [--kick-events E,..] [--tamper next-page|site|site-kind|armed|dispatch|target] [--ignore-kicks] [--kill-compiler N] [--stall-compiler N] [--compile-deadline-ms MS] [--strict-unassigned] [--device-at GPA]... [--irq-source PORT] [--irq-source-no-veto]";
 
 /// Every literal exit's RIP move puts another RIP in x0: bit 0 of the immediate of its last word (the one before its
@@ -836,7 +836,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let (mut forge_stop, mut forged, mut kicked, mut kicks, mut every_us, mut jitter_us) = (false, None, Vec::new(), 10_000, 0, 0);
     let mut kick_events: Vec<u64> = Vec::new();
     let (mut ignore_kicks, mut signal_at, mut deadline_ms) = (false, None, execution::COMPILE_DEADLINE.as_millis() as u64);
-    let (mut code_shape, mut device_tamper, mut strict) = (false, false, false);
+    let (mut code_shape, mut device_tamper, mut strict, mut check_reuse) = (false, false, false, false);
     let mut device_at: Vec<u64> = Vec::new();
     // L4a: the asynchronous test source's ports, and whether its requests veto ending halted vCPUs.
     let (mut irq_source, mut irq_veto) = (None, true);
@@ -851,6 +851,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let mut value = || -> Result<usize> { options.next().and_then(|v| v.parse().ok()).ok_or(USAGE.into()) };
         match option.as_str() {
             "--code-shape" => code_shape = true,
+            "--check-reuse" => check_reuse = true,
             "--strict-unassigned" => strict = true,
             "--device-at" => device_at.push(number(options.next().ok_or(USAGE)?)?),
             "--irq-source" => irq_source = Some(number(options.next().ok_or(USAGE)?)?),
@@ -1054,6 +1055,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let mut compiler = Compiler::new(Path::new(fexc), cpu, max_instructions)?;
         compiler.deadline = std::time::Duration::from_millis(deadline_ms);
         compiler.shape = code_shape;
+        // The suites' code-shape option also checks every answer reused at another RIP (perf chunk 4).
+        compiler.check_reuse = code_shape || check_reuse;
         let handlers = log_base(d.spaces[d.cpus[v].space].identity) + LOG_HANDLERS;
         let mut requests = execution::Requests { devices: Some(registry.clone()), ..Default::default() };
         let mut hook = ProgramHook {

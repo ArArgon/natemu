@@ -706,6 +706,7 @@ impl Reply {
 /// What fexc answered (errors are not kept): an object, or no code with its end reason and, when the instruction at the RIP
 /// cut the block, its opcode map and opcode and whether its gating cut it (`Some(mmx)`: an MMX form), or (`ud`, I10) whether
 /// fexc found an encoding the presented CPU raises #UD for (reserved or unadvertised: `cut_ud`).
+#[derive(Clone, Debug, PartialEq)]
 enum Answer {
     Object(Vec<u8>),
     Cut { reason: String, cut: Option<(u8, u8)>, gated: Option<bool>, ud: bool },
@@ -722,12 +723,32 @@ impl Answer {
         let ud = end.and_then(|e| e.get("cut_ud")).is_some();
         Ok(Answer::Cut { reason, cut: system_cut(&json, rip), gated, ud })
     }
+    /// This answer, kept for `from`, as fexc's answer at `to` (same half and page offset): an object relocated
+    /// ([`crate::relocation`]), a no-code answer fexc decides from the bytes alone; `None` when it would not be fexc's.
+    fn at(&self, from: u64, to: u64) -> Option<Self> {
+        match self {
+            Answer::Object(o) => crate::relocation::object(o, from, to).map(Answer::Object),
+            Answer::Cut { reason, .. } => (crate::relocation::same_place(from, to) && crate::relocation::no_code_reusable(reason)).then(|| self.clone()),
+        }
+    }
 }
 /// The number of fexc's gating arguments (`FEXC_ARG_*`, [`Compiler::gating`]).
 const GATING: usize = 8;
-/// A kept answer and what it was compiled from: the gating values (those with a bit in `read` matter) and the guest bytes
-/// before the compile's extent (`whole`: the extent reached their end, so their length matters too).
+/// The memory cache's key (perf chunk 4): the block limit, the RIP's half (bit 63) and page offset, and the first bytes the
+/// answer read (at most [`LEAD`], with their count): an answer is found at every RIP of that half and offset.
+type Key = (Option<u32>, u64, u64);
+const LEAD: usize = 4;
+fn key(limit: Option<u32>, rip: u64, lead: &[u8]) -> Key {
+    (limit, rip & (1 << 63 | 0xfff), lead.iter().fold(lead.len() as u64, |v, &b| v << 8 | u64::from(b)))
+}
+/// Answers per generation of the memory cache ([`Compiler::insert`]): the installer boot keeps about 130 k.
+const GENERATION: usize = 1 << 18;
+/// And bytes per generation (about 80 MB for the installer's answers).
+const GENERATION_BYTES: usize = 128 << 20;
+/// A kept answer and what it was compiled from: its RIP, the gating values (those with a bit in `read` matter) and the guest
+/// bytes before the compile's extent (`whole`: the extent reached their end, so their length matters too).
 struct Entry {
+    rip: u64,
     read: u32,
     gating: [u64; GATING],
     prefix: Vec<u8>,
@@ -735,6 +756,10 @@ struct Entry {
     answer: Answer,
 }
 impl Entry {
+    /// Bytes it keeps (the memory cache's bound).
+    fn size(&self) -> usize {
+        size_of::<Self>() + self.prefix.len() + if let Answer::Object(o) = &self.answer { o.len() } else { 0 }
+    }
     /// fexc gives the same answer for `bytes` under `gating`: it reads nothing that differs (tools/fexc/fexc.cpp, `Extent`
     /// and `FexcArg`).
     fn matches(&self, bytes: &[u8], gating: &[u64; GATING]) -> bool {
@@ -752,10 +777,12 @@ pub(crate) enum Code {
 
 /// fexc for one vCPU's feature set: one persistent `fexc --serve` process (started at the first compile), a cache of its
 /// answers in memory and, when set, the persistent one on disk. Objects are byte-identical to the one-shot CLI's.
-/// In memory an answer is kept by RIP and block limit (the profile and features are the compiler's) with what fexc says the
-/// compile read: the guest bytes up to its extent and the gating arguments it consulted. A request equal in those gets it
-/// (fexc is deterministic and would read the same), so a block is not compiled again because later bytes on its page or
-/// an unrelated control bit changed. On disk, answers are kept by the exact request and the fexc build (`compile_cache`).
+/// In memory an answer is kept by block limit, the RIP's half and page offset and its leading bytes (the profile and
+/// features are the compiler's), with its RIP and what fexc says the compile read: the guest bytes up to its extent and the
+/// gating arguments it consulted. A request equal in those gets it (fexc is deterministic and would read the same), so a
+/// block is not compiled again because later bytes on its page or an unrelated control bit changed; at another RIP the
+/// answer is relocated ([`crate::relocation`], perf chunk 4), or compiled when it cannot be. On disk, answers are kept by
+/// the request with its RIP as half and page offset, with that RIP, and the fexc build (`compile_cache`).
 /// Every object, from fexc or a cache, goes through admission's mandatory validation when it is used: a damaged or forged
 /// cache entry can at worst be refused (a stop) or give the guest the effects of other x86 code inside its own containment,
 /// as a faulty fexc could; it cannot give code a way out of it.
@@ -765,8 +792,11 @@ pub struct Compiler {
     supported: u64,
     /// Block size limit in guest instructions (fexc's own limit when `None`).
     max_instructions: Option<u32>,
-    cache: HashMap<(u64, Option<u32>), Vec<Entry>>,
+    /// Kept answers in two generations ([`Compiler::insert`]): `cache` the newer (`cached` entries), `old` the older.
+    cache: HashMap<Key, Vec<Entry>>,
+    old: HashMap<Key, Vec<Entry>>,
     cached: usize,
+    cached_bytes: usize,
     /// The persistent cache (`boot-linux` sets it; test drivers never do).
     pub disk: Option<std::sync::Arc<crate::compile_cache::DiskCache>>,
     /// Requests that reached fexc.
@@ -774,6 +804,16 @@ pub struct Compiler {
     /// Requests answered from the cache in memory, and from the persistent one.
     pub(crate) hits: u64,
     pub(crate) disk_hits: u64,
+    /// Answers kept for another RIP and used at this one (perf chunk 4: [`crate::relocation`]); answers that could not be
+    /// (compiled instead); relocated objects admission refused (compiled instead, logged; none expected); fresh compiles
+    /// made by the reuse check.
+    pub relocated: u64,
+    pub relocation_refused: u64,
+    pub relocation_fallbacks: u64,
+    pub reuse_checks: u64,
+    /// Debug check (the program driver's `--code-shape` or `--check-reuse`, `boot-linux --check-reuse`): every answer used at
+    /// another RIP than its own is also compiled there, and the two must be equal (else a host error).
+    pub check_reuse: bool,
     /// How long one request may wait for the server's whole reply (the first one includes the server's start); then the
     /// server is killed and the run fails with a host error ([`COMPILE_DEADLINE`] by default).
     pub deadline: Duration,
@@ -858,7 +898,8 @@ impl Compiler {
         Ok(Self::with_features(fexc, admission::supported_features(&id), max_instructions))
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
-        Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), cached: 0, disk: None, compiles: 0, hits: 0, disk_hits: 0,
+        Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), old: HashMap::new(), cached: 0, cached_bytes: 0, disk: None, compiles: 0, hits: 0, disk_hits: 0,
+               relocated: 0, relocation_refused: 0, relocation_fallbacks: 0, reuse_checks: 0, check_reuse: false,
                deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![], perf: None }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
@@ -892,52 +933,140 @@ impl Compiler {
     /// [`Compiler::compile`] with an instruction limit; `Err((n, why))`: the object must be translated again with fewer
     /// than its n guest instructions ([`admission::retry`]).
     fn compile_once(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>, hook: &mut impl Hook) -> Result<std::result::Result<Code, (u32, &'static str)>> {
-        let (key, gating) = ((rip, limit), self.gating());
+        let gating = self.gating();
         let t = self.stamp();
-        let found = self.cache.get(&key).and_then(|v| v.iter().position(|e| e.matches(bytes, &gating)));
+        let found = self.find(bytes, rip, limit, &gating);
         self.charge(crate::perf::LOOKUP, t);
-        let index = match found {
-            Some(i) => {
+        if let Some((key, i)) = found {
+            if let Some(code) = self.reuse(key, i, bytes, rip, limit, hook)? {
                 self.hits += 1;
                 if let Some(r) = &mut self.perf {
                     let prefix = &self.cache[&key][i].prefix;
                     r.sources[0] += 1;
                     r.read = (hash(prefix), prefix.len() as u32);
                 }
-                i
+                return Ok(code);
             }
-            None => {
-                let reply = self.ask(bytes, rip, limit, hook)?;
-                let t = self.stamp();
-                // ponytail: wholesale reset at a size cap; a real eviction policy when runs outgrow it
-                if self.cached >= 1 << 16 {
-                    self.cache.clear();
-                    self.cached = 0;
+        }
+        // Nothing kept, or an answer kept for another RIP that is not fexc's here: the persistent cache only in the first
+        // case (it is keyed as memory is, so it would hold the same answer).
+        let mut disk = found.is_none();
+        loop {
+            let (reply, at) = self.ask(bytes, rip, limit, disk, hook)?;
+            let t = self.stamp();
+            let (whole, end) = (reply.extent as usize >= bytes.len(), bytes.len().min(reply.extent as usize));
+            let (read, prefix) = (reply.read, bytes[..end].to_vec());
+            let entry = Entry { rip: at, read, gating, prefix, whole, answer: Answer::new(reply, at)? };
+            let (key, i) = self.insert(limit, entry);
+            self.charge(crate::perf::KEEP, t);
+            if let Some(r) = &mut self.perf {
+                let prefix = &self.cache[&key][i].prefix;
+                r.read = (hash(prefix), prefix.len() as u32);
+            }
+            match self.reuse(key, i, bytes, rip, limit, hook)? {
+                Some(code) => return Ok(code),
+                None => disk = false, // a disk answer for another RIP that is not fexc's here
+            }
+        }
+    }
+    /// The kept answer matching `bytes` at `rip`, from either generation (an older one is moved to the newer): one kept for
+    /// `rip` itself in any bucket first, then one for another RIP. Keys hold the leading bytes the answer read (at most
+    /// [`LEAD`]), so each length is tried.
+    fn find(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>, gating: &[u64; GATING]) -> Option<(Key, usize)> {
+        for own in [true, false] {
+            for n in (0..=LEAD.min(bytes.len())).rev() {
+                let key = key(limit, rip, &bytes[..n]);
+                let pick = |v: &Vec<Entry>| v.iter().position(|e| (!own || e.rip == rip) && e.matches(bytes, gating));
+                if let Some(i) = self.cache.get(&key).and_then(pick) {
+                    return Some((key, i));
                 }
-                let (whole, end) = (reply.extent as usize >= bytes.len(), bytes.len().min(reply.extent as usize));
-                let (read, prefix) = (reply.read, bytes[..end].to_vec());
-                let entries = self.cache.entry(key).or_default();
-                entries.push(Entry { read, gating, prefix, whole, answer: Answer::new(reply, rip)? });
-                self.cached += 1;
-                let kept = entries.len() - 1;
-                self.charge(crate::perf::KEEP, t);
-                if let Some(r) = &mut self.perf {
-                    let prefix = &self.cache[&key][kept].prefix;
-                    r.read = (hash(prefix), prefix.len() as u32);
+                if let Some(i) = self.old.get(&key).and_then(pick) {
+                    let entry = self.old.get_mut(&key).unwrap().swap_remove(i);
+                    return Some(self.insert(limit, entry));
                 }
-                kept
+            }
+        }
+        None
+    }
+    /// Keeps `entry` in the newer generation; when that holds [`GENERATION`] answers or [`GENERATION_BYTES`] it becomes the
+    /// older one (the older is dropped): every answer used or made in the last generation is kept, at most twice the bound
+    /// (2 x 128 MiB per vCPU).
+    fn insert(&mut self, limit: Option<u32>, entry: Entry) -> (Key, usize) {
+        if self.cached >= GENERATION || self.cached_bytes >= GENERATION_BYTES {
+            self.old = std::mem::take(&mut self.cache);
+            (self.cached, self.cached_bytes) = (0, 0);
+        }
+        let key = key(limit, entry.rip, &entry.prefix[..LEAD.min(entry.prefix.len())]);
+        self.cached_bytes += entry.size();
+        let v = self.cache.entry(key).or_default();
+        v.push(entry);
+        self.cached += 1;
+        (key, v.len() - 1)
+    }
+    /// The answer kept at `i` under `key`, used at `rip`: as it is for its own RIP; for another, relocated (`None`: it
+    /// would not be fexc's at `rip`, or admission refused the relocated object; logged; the caller compiles).
+    fn reuse(&mut self, key: Key, i: usize, bytes: &[u8], rip: u64, limit: Option<u32>, hook: &mut impl Hook) -> Result<Option<std::result::Result<Code, (u32, &'static str)>>> {
+        let from = self.cache[&key][i].rip;
+        let t = self.stamp();
+        let moved = if from == rip {
+            None
+        } else {
+            match self.cache[&key][i].answer.at(from, rip) {
+                Some(answer) => Some(answer),
+                None => {
+                    self.relocation_refused += 1;
+                    return Ok(None);
+                }
             }
         };
-        let t = self.stamp();
-        let code = self.answered(key, index, bytes, rip, hook);
-        let part = if matches!(code, Ok(Ok(Code::Block(_)))) { crate::perf::ADMIT } else { crate::perf::DECODE };
-        self.charge(part, t);
-        code
+        if let (Some(answer), true) = (&moved, self.check_reuse) {
+            let e = &self.cache[&key][i];
+            let read = (e.read, e.whole, e.prefix.len());
+            self.check(answer, read, bytes, rip, limit, from, hook)?;
+        }
+        let code = match &moved {
+            None => self.answered(&self.cache[&key][i].answer, bytes, rip, hook)?,
+            Some(answer) => match self.answered(answer, bytes, rip, hook) {
+                Ok(code) => {
+                    self.relocated += 1;
+                    code
+                }
+                Err(e) => {
+                    self.relocation_fallbacks += 1;
+                    eprintln!("natemu: the answer relocated from {from:#x} to {rip:#x} was refused ({e}); compiled at {rip:#x}");
+                    return Ok(None);
+                }
+            },
+        };
+        self.charge(if matches!(code, Ok(Code::Block(_))) { crate::perf::ADMIT } else { crate::perf::DECODE }, t);
+        Ok(Some(code))
     }
-    /// [`Compiler::compile_once`]'s use of the answer kept at `index` under `key`: admitted, or decoded.
+    /// The reuse check: fexc's own answer at `rip` (no cache) equals `answer`, relocated from `from`.
+    /// `read`: the kept entry's arguments read, whether its extent reached the end of its bytes, and their length to it.
+    #[allow(clippy::too_many_arguments)]
+    fn check(&mut self, answer: &Answer, read: (u32, bool, usize), bytes: &[u8], rip: u64, limit: Option<u32>, from: u64, hook: &mut impl Hook) -> Result<()> {
+        let (reply, _) = self.ask(bytes, rip, limit, false, hook)?;
+        // Counted as checks, not as the run's compiles.
+        self.compiles -= 1;
+        if let Some(r) = &mut self.perf {
+            r.sources[2] -= 1;
+        }
+        self.reuse_checks += 1;
+        let fresh = (reply.read, reply.extent as usize >= bytes.len(), bytes.len().min(reply.extent as usize));
+        if fresh != read || Answer::new(reply, rip)? != *answer {
+            return Err(format!("reuse check: the answer relocated from {from:#x} is not fexc's at {rip:#x}"));
+        }
+        Ok(())
+    }
+    /// Bytes and entries of the kept answers (the run's report).
+    pub fn kept(&self) -> (usize, usize) {
+        let all = || self.cache.values().chain(self.old.values()).flatten();
+        (all().map(Entry::size).sum(), all().count())
+    }
+    /// [`Compiler::compile_once`]'s use of an answer: admitted, or decoded.
     #[cfg_attr(not(feature = "testing"), allow(unused_variables))]
-    fn answered(&mut self, key: (u64, Option<u32>), index: usize, bytes: &[u8], rip: u64, hook: &mut impl Hook) -> Result<std::result::Result<Code, (u32, &'static str)>> {
-        Ok(match &self.cache[&key][index].answer {
+    fn answered(&self, answer: &Answer, bytes: &[u8], rip: u64, hook: &mut impl Hook) -> Result<std::result::Result<Code, (u32, &'static str)>> {
+        Ok(match answer {
             Answer::Object(object) => match admission::retry(object) {
                 Some(n) => Err(n),
                 None => {
@@ -986,7 +1115,15 @@ impl Compiler {
     }
     /// The request body for `bytes` at `rip` (protocol in tools/fexc/fexc.cpp).
     fn body(&self, bytes: &[u8], rip: u64, limit: Option<u32>) -> Vec<u8> {
-        let mut args = vec!["--profile".to_string(), "slice1".into(), "--rip".into(), format!("{rip:#x}")];
+        self.body_with(bytes, format!("{rip:#x}"), limit)
+    }
+    /// The persistent cache's key body (perf chunk 4): the request with the RIP replaced by its half and page offset, as the
+    /// memory cache keys answers.
+    fn disk_body(&self, bytes: &[u8], rip: u64, limit: Option<u32>) -> Vec<u8> {
+        self.body_with(bytes, format!("{}:{:#x}", if rip >> 63 != 0 { 'k' } else { 'u' }, rip & 0xfff), limit)
+    }
+    fn body_with(&self, bytes: &[u8], rip: String, limit: Option<u32>) -> Vec<u8> {
+        let mut args = vec!["--profile".to_string(), "slice1".into(), "--rip".into(), rip];
         if let Some(n) = limit {
             args.extend(["--max-insts".into(), n.to_string()]);
         }
@@ -1009,20 +1146,22 @@ impl Compiler {
         body.extend(bytes);
         body
     }
-    /// fexc's reply to the request for `bytes` at `rip`: from the persistent cache, else from the server (then stored).
-    fn ask(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>, _hook: &mut impl Hook) -> Result<Reply> {
+    /// fexc's reply to the request for `bytes` at `rip` and the RIP it was compiled at: from the persistent cache when `disk`
+    /// (an answer for any RIP of that half and offset, stored with its RIP), else from the server (then stored).
+    fn ask(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>, disk: bool, _hook: &mut impl Hook) -> Result<(Reply, u64)> {
         let t = self.stamp();
-        let body = self.body(bytes, rip, limit);
-        let stored = self.disk.as_ref().filter(|d| !d.is_empty()).and_then(|d| d.get(&d.key(&body)));
-        let stored = stored.and_then(|p| Reply::from_payload(&p)).filter(|r| r.code < 2);
+        let key = self.disk.as_ref().filter(|d| disk && !d.is_empty()).map(|d| d.key(&self.disk_body(bytes, rip, limit)));
+        let stored = key.and_then(|k| self.disk.as_ref().unwrap().get(&k));
+        let stored = stored.and_then(|p| Some((Reply::from_payload(p.get(8..)?)?, u64::from_le_bytes(p.get(..8)?.try_into().unwrap()))));
         self.charge(crate::perf::DISK_GET, t);
-        if let Some(reply) = stored {
+        if let Some((reply, at)) = stored.filter(|(r, _)| r.code < 2) {
             self.disk_hits += 1;
             if let Some(r) = &mut self.perf {
                 r.sources[1] += 1;
             }
-            return Ok(reply);
+            return Ok((reply, at));
         }
+        let body = self.body(bytes, rip, limit);
         let t = self.stamp();
         if self.server.is_none() {
             self.server = Some(Server::start(&self.fexc)?);
@@ -1050,10 +1189,10 @@ impl Compiler {
         }
         let t = self.stamp();
         if let Some(disk) = &self.disk {
-            disk.put(body, rip >> 63 != 0, reply.payload());
+            disk.put(self.disk_body(bytes, rip, limit), rip >> 63 != 0, [&rip.to_le_bytes()[..], &reply.payload()].concat());
         }
         self.charge(crate::perf::DISK_PUT, t);
-        Ok(reply)
+        Ok((reply, rip))
     }
 }
 /// The performance log's hash of the guest bytes an answer read.
@@ -1520,11 +1659,13 @@ mod tests {
         assert_eq!((c.compiles, c.hits), (1, 0));
         assert_eq!(object(&mut c, &code, 0x1000), first);
         assert_eq!((c.compiles, c.hits), (1, 1));
-        object(&mut c, &code, 0x2000);
+        // Perf chunk 4: the same bytes at another RIP of the half and page offset: the answer relocated (no moves here).
+        assert_eq!(object(&mut c, &code, 0x2000)[24..32], 0x2000u64.to_le_bytes());
+        assert_eq!((c.compiles, c.hits, c.relocated), (1, 2, 1));
         object(&mut c, &[0x48, 0x29, 0xd8, 0xc3], 0x1000);
         c.max_instructions = Some(1);
         object(&mut c, &code, 0x1000);
-        assert_eq!((c.compiles, c.hits), (4, 1));
+        assert_eq!((c.compiles, c.hits), (3, 2));
         // A system instruction at the RIP is decoded (and cached with fexc's answer); one later in the block cuts it.
         let mov_cr3 = [0x0f, 0x22, 0xd8, 0x90];
         let decoded = |c: &mut super::Compiler, rip| match c.compile(&mov_cr3, rip, false, &mut ()).unwrap() {
@@ -1534,7 +1675,7 @@ mod tests {
         let s = decoded(&mut c, 0x3000).unwrap();
         assert_eq!((s.kind, s.cr, s.reg, s.length), (exec::system::MOV_TO_CR, 3, 0, 3));
         assert_eq!(decoded(&mut c, 0x3000), Some(s));
-        assert_eq!((c.compiles, c.hits), (5, 2));
+        assert_eq!((c.compiles, c.hits), (4, 3));
         assert!(matches!(c.compile(&[0xf4], 0x3000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::HLT)); // X2
         // SYSENTER is decoded since X1c (the resident delivers its fault); this test predates it (it expected no code).
         assert!(matches!(c.compile(&[0x0f, 0x34], 0x3000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::SYSENTER));
@@ -1563,6 +1704,67 @@ mod tests {
         assert_eq!((c.compiles, c.hits), (5, 2));
     }
 
+    /// With `FEXC` set (perf chunk 4): answers are reused at other RIPs of the same half and page offset, under the reuse
+    /// check (each also compiled and compared); the relocator's refusals are compiled, the reverse canonical case included.
+    #[test]
+    fn answers_are_reused_across_addresses() {
+        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        c.check_reuse = true;
+        let block = |c: &mut super::Compiler, code: &[u8], rip| match c.compile(code, rip, false, &mut ()).unwrap() {
+            Code::Block(b) => b,
+            _ => panic!("no block"),
+        };
+        let user = include_bytes!("../tests/relocation/user.src");
+        let a = block(&mut c, user, 0x7f12_3456_7100);
+        let b = block(&mut c, user, 0x7f12_3456_8100);
+        assert_eq!((a.guest_insns, b.guest_insns, c.compiles, c.relocated, c.reuse_checks), (4, 4, 1, 1, 1)); // the check's compile is not counted
+        assert_ne!(a.object, b.object); // other RIP values
+        block(&mut c, user, 0x7f12_0000_0100); // move length: refused, compiled
+        assert_eq!((c.compiles, c.relocated, c.relocation_refused), (2, 1, 1));
+        // add rax, rbx; jmp +0x7fffffff: cut before the jmp at the half's top; the whole block 15 MiB lower.
+        let cut = include_bytes!("../tests/relocation/cut.src");
+        assert_eq!(block(&mut c, cut, 0x7fff_ff00_0100).guest_bytes, 3);
+        assert_eq!(block(&mut c, cut, 0x7ff0_ff00_0100).guest_bytes, 8);
+        assert_eq!((c.compiles, c.relocated, c.relocation_refused), (4, 1, 2));
+        // A system instruction (no code from fexc, decided from the bytes): reused, decoded at the new RIP.
+        let mov_cr3 = [0x0f, 0x22, 0xd8, 0x90];
+        for rip in [0x7f00_0000_3000, 0x7f00_1234_5000] {
+            assert!(matches!(c.compile(&mov_cr3, rip, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::MOV_TO_CR));
+        }
+        assert_eq!((c.compiles, c.relocated, c.reuse_checks), (5, 2, 2));
+    }
+
+    /// With `FEXC` set, the reuse check's negative control: a kept object whose guest-RIP literal value is tampered with
+    /// relocates (the relocator does not judge values) but is not fexc's answer at the new RIP: under the check a host
+    /// error; without it admission refuses the relocated object and the request is compiled (a counted fallback).
+    #[test]
+    fn reuse_check_catches_a_tampered_relocation() {
+        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let user = include_bytes!("../tests/relocation/user.src");
+        for check in [true, false] {
+            let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+            c.check_reuse = check;
+            assert!(matches!(c.compile(user, 0x7f12_3456_7100, false, &mut ()), Ok(Code::Block(_))));
+            for e in c.cache.values_mut().flatten() {
+                if let Answer::Object(o) = &mut e.answer {
+                    let word = |o: &[u8], at: usize| u32::from_le_bytes(o[at..at + 4].try_into().unwrap()) as usize;
+                    let (at, n) = (word(o, 80), word(o, 84));
+                    let literal = (0..n).map(|i| at + 16 * i).find(|&r| o[r + 4] == natemu_abi::code_object::RELOC_GUEST_RIP_LITERAL).unwrap();
+                    let v = u64::from_le_bytes(o[literal + 8..literal + 16].try_into().unwrap());
+                    o[literal + 8..literal + 16].copy_from_slice(&(v + 0x10).to_le_bytes());
+                }
+            }
+            let r = c.compile(user, 0x7f12_3456_8100, false, &mut ());
+            if check {
+                assert!(r.as_ref().is_err_and(|e| e.contains("reuse check")), "{:?}", r.err());
+            } else {
+                assert!(matches!(r, Ok(Code::Block(_))));
+                assert_eq!((c.compiles, c.relocated, c.relocation_fallbacks), (2, 0, 1));
+            }
+        }
+    }
+
     /// With `FEXC` set: the persistent cache answers a later compiler (no request reaches its fexc); an entry forged under a
     /// request's key (here: an object whose code jumps through x28, the resident's state register) is refused by admission,
     /// never staged.
@@ -1581,17 +1783,23 @@ mod tests {
         };
         let mut c = new(open("good"));
         let first = block(&mut c).unwrap();
-        let body = c.body(&code, 0x5000, None);
+        let body = c.disk_body(&code, 0x5000, None);
         drop(c); // writes the pack
         let mut c = new(open("good"));
         assert_eq!((block(&mut c).unwrap(), c.compiles, c.disk_hits), (first, 0, 1));
+        // Perf chunk 4: kept on disk with the RIP it was compiled at, used at another of its half and page offset.
+        let mut moved = new(open("good"));
+        assert!(matches!(moved.compile(&code, 0x9000, false, &mut ()), Ok(Code::Block(b)) if b.object[24..32] == 0x9000u64.to_le_bytes()));
+        assert_eq!((moved.compiles, moved.disk_hits, moved.relocated), (0, 1, 1));
         let disk = c.disk.clone().unwrap();
-        let mut reply = super::Reply::from_payload(&disk.get(&disk.key(&body)).unwrap()).unwrap();
+        let stored = disk.get(&disk.key(&body)).unwrap();
+        assert_eq!(stored[..8], 0x5000u64.to_le_bytes()); // the RIP it was compiled at
+        let mut reply = super::Reply::from_payload(&stored[8..]).unwrap();
         let word = |o: &[u8], at: usize| u32::from_le_bytes(o[at..at + 4].try_into().unwrap()) as usize;
         let at = word(&reply.object, 40) + word(&reply.object, 48);
         reply.object[at..at + 4].copy_from_slice(&0xd61f_0380u32.to_le_bytes()); // br x28
         let forged = open("forged").unwrap();
-        forged.put(body.clone(), false, reply.payload());
+        forged.put(body.clone(), false, [&stored[..8], &reply.payload()[..]].concat());
         drop(forged);
         let mut c = new(open("forged"));
         let e = block(&mut c).unwrap_err();

@@ -23,6 +23,7 @@ pub mod owners;
 pub mod perf;
 mod pic;
 mod pit;
+mod relocation;
 pub mod pm;
 mod rtc;
 mod system;

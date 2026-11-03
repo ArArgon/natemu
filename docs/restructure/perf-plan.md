@@ -260,7 +260,7 @@ one kept at the same RIP (compiled again after the host's memory cache reset at 
 | Object byte-identical after relocation | 898,394 | 201,481 | reuse |
 | No code, equal (`system_instruction`, `partial_decode`) | 12,680 + 2,710 | 2,480 | reuse |
 | Move length: `LoadConstant` picks movz/movk by the value's non-zero halfwords (also `orr` bitmask and `movn` forms); e.g. `0x7f94c6322000` (movz+movk+movk) at r' becomes `0x7f8faffa0000` (movz+movk) | 595 | 42,111 | refuses (word count) |
-| 32-bit move form (`movzw+movkw`): the value is below 4 GiB, possibly a 32-bit `EntrypointOffset` FEX masks (`ALUOps.cpp:56`, `JIT.cpp:748`), which an added shift would not mask | 24 | 19,173 | refuses |
+| 32-bit move form (`movzw+movkw`): the value is below 4 GiB. (Corrected after review: FEX's 32-bit `EntrypointOffset` mask, `ALUOps.cpp:56`, never applies, since slice1 is 64-bit only; the refusal is kept as a conservative rule that costs only code below 4 GiB) | 24 | 19,173 | refuses |
 | Canonicality: a direct branch to a non-canonical target is cut at decode (`fexc_slice1.inc` 819-873, end reason `unsupported_form`): the block ends earlier (1,045), a move holds another exit (43), the first instruction gives no code (53); a window across the edge is an fexc error (57); plus 3,523 equal or move-length cases | 0 | 4,721 | refuses (non-canonical value) |
 
 Every synthetic difference outside the 4 GiB next to a canonical edge is a move-length change or a 32-bit form; every canonicality case is
@@ -290,6 +290,87 @@ that keeps its 129,859 answers instead of resetting adds the 99.5 k same-RIP rep
 needed; a fixed four-word guest-RIP move would remove the 0.07% refusals at the cost of a word per move, not worth it. A
 KASLR kernel's relocated text still differs in bytes (chunk 1) and is not covered.
 
+### Measured (chunk 4: reuse across load addresses, November 3; uncommitted on a24c785, series48-lean)
+
+**Built** (host only; fexc and the resident unchanged). `crates/host/src/relocation.rs`: the relocator of chunk 3 with the
+review's corrections: `object(raw, from, to)` writes `guest_rip`, adds `to - from` to every guest-RIP literal and move
+value and re-encodes each move with FEX's `LoadConstant` rules (a Rust copy; its logical-immediate encoder checked against
+the decoder on every encoding); it refuses an object whose end reason is `unsupported_form` (the reverse canonical case:
+`add rax, rbx; jmp +0x7fffffff` is a 3-byte object at 0x7fffff000100 and an 8-byte one at 0x7ff0ff000100), a non-canonical
+new value, RIP or block end, a 32-bit move form before or after (conservative), a move whose word count changes, an unknown
+relocation kind and a malformed object. No-code answers are reused only for `system_instruction`, `partial_decode`,
+`instruction_too_long` and `end_of_input`. `execution::Compiler`: the memory key is the block limit, the RIP's half and page
+offset and up to 4 leading bytes the answer read, then `Entry::matches` (an entry kept for the requested RIP first); each
+entry keeps its RIP; a hit at another RIP is relocated, then admitted at the real RIP like a fresh object; a refusal compiles
+at the real RIP (`relocation_refused`; the disk is skipped then, it is keyed alike); a relocated object admission refuses is
+logged and compiled (`relocation_fallbacks`). The wholesale reset at 65,536 entries is replaced by two generations of
+262,144 answers or 128 MiB each, whichever comes first (a full newer generation becomes the older one; a hit in the older
+moves to the newer): at most 256 MiB of kept answers per vCPU. Persistent cache:
+key = SHA-256 of the body with the RIP replaced by `k:`/`u:` and the page offset, the payload prefixed by the RIP it was
+compiled at, so a no-code answer's cut is derived at that RIP (`Answer::new(reply, kept rip)`); key version
+`natemu-fexc-cache-2` (old packs never hit and age out). Debug check: `boot-linux --check-reuse`, and the program driver's
+`--code-shape` (every suite runner passes it) or `--check-reuse`: each answer used at another RIP is also compiled there
+and must be equal, else a host error. The performance log's vCPU line gains `relocated`, `relocation_refused`,
+`relocation_fallbacks`, `reuse_checks`, `kept_bytes`, `kept_answers`. Tests: `relocation.rs` (fixtures
+`crates/host/tests/relocation/`, made by series48-lean's CLI: relocation equals fexc's object at the other RIP both ways
+and is admitted there, each refusal rule, the reverse canonical case, the encoders), and with `FEXC` the compiler reuses,
+refuses and checks (`answers_are_reused_across_addresses`) and the persistent cache relocates.
+
+**After review** (nothing blocking; fixed): the relocator itself refuses RIPs of another half or page offset (a forged
+disk entry's RIP is only checksum-protected); the memory cache is bounded by bytes as well as answers (above); the check
+also compares extent and args_read, and its compiles are counted as `reuse_checks`, not `compiles`; the lookup takes an
+answer kept for the requested RIP in any bucket before relocating one; `natemu_abi::execution::bitmask` no longer overflows
+on the reserved N = 0, imms = 63 in a debug build (it returns `None`); new tests: both refusals, the bitmask, and the
+check's negative control (a kept object's guest-RIP literal tampered with: a host error under the check, a counted
+admission fallback without it). Rerun (`natemu-raw/perf4-20261103-01/review/`): `cargo test` 159 + 1 ignored with `FEXC`
+set; fixtures 64 at both block sizes; `run_k1.py` 192 cases, no problem; one installer boot (N = 1, cache off) with
+`--check-reuse`: 920,414 reused answers compiled again and equal, 532 refused, 0 fallbacks, 126,918 compiles, 78 MB kept.
+The measurements below are of the build before these fixes (none changes a hit or a miss on the boot but the lookup order).
+
+**Proof additions** (`natemu-raw/perf3-20261103-01/`, review points): the tool's `normalise` masked four times the move's
+words (it took a byte count as words; fixed: only the classification of a few cases could move, never an exact
+equality); with the unsupported_form rule, a second recorded boot (1,144,252 requests, stream deleted) gives 914,714
+pairs at another RIP: 898,419 objects and 15,392 no-code answers equal after relocation, 879 move-length and 24 32-bit
+refusals, nothing else; every one of its 129,853 answers (not only the 20,762 met at two RIPs) compiled again at
++4 KiB, the next 2 MiB region and bit 36 flipped (389,297 compiles): 296,816 objects and 2,645 no-code answers equal,
+80,099 move-length and 9,737 32-bit refusals, no other class (`proof2-all.json`).
+
+**Check runs.** One installer boot (N = 1, cache off) with `--check-reuse`: 919,666 answers used at another RIP, each
+compiled again and equal; 884 refused; 0 fallbacks (`natemu-raw/perf4-20261103-01/check/`). The standing suite with the
+program driver's check on (`suite/`, 2 GiB, both block sizes): as chunk 2 (below), no check failure.
+
+**Measured** (chunk 1's method; `natemu-host boot-linux`, installer to "Select a language", 2 GiB, `mitigations=off
+nokaslr`, one VM at a time; three interleaved rounds per cell, before (a24c785) and after each with its own warm cache after
+a warm-up boot; `natemu-raw/perf4-20261103-01/`: `campaign4.sh`, `rest4.sh` (the campaign's shell was stopped by a
+30-minute limit after 43 of 48 boots; the last five ran from it), `boot.py`, `table4.py`, `tables4.json`, `runs/`;
+counts summed over the vCPU threads of the log-on runs, means of 3):
+
+| Installer | build | wall s, log off | wall s, log on | "Run /init" s | compiles | relocated | refused | fexc round trip s | admission s | kept answers / MB | max RSS MB |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| N=1 warm | before | 52.03 (51.84-52.15) | 53.47 | 4.38 | 962.9 k | | | 17.75 | 1.43 | | 685 |
+| N=1 warm | after | **26.18** (26.10-26.25) | 28.00 | 2.95 | 1.3 k | 971.7 k | 1,140 | 0.05 | 1.42 | 127.3 k / 78 | 648 |
+| N=1 off | before | 49.15 (49.07-49.21) | 49.70 | 5.15 | 1,142.9 k | | | 18.57 | 1.27 | | 509 |
+| N=1 off | after | **27.70** (27.35-27.91) | 28.91 | 4.00 | 128.4 k | 924.0 k | 2,413 | 2.18 | 1.33 | 128.4 k / 79 | 640 |
+| N=4 warm | before | 37.46 (37.29-37.65) | 38.78 | 4.47 | 1,080.5 k | | | 23.43 | 1.70 | | 1,201 |
+| N=4 warm | after | **18.83** (18.48-19.11) | 19.62 | 3.08 | 31.7 k | 1,048.4 k | 1,056 | 0.76 | 1.72 | 314.3 k / 194 | 1,235 |
+| N=4 off | before | 38.32 (38.00-38.80) | 38.24 | 6.41 | 1,315.4 k | | | 27.07 | 1.72 | | 1,040 |
+| N=4 off | after | **22.84** (22.65-22.95) | 23.33 | 5.43 | 318.5 k | 942.6 k | 1,495 | 6.71 | 1.78 | 318.5 k / 196 | 1,233 |
+
+**Ship threshold met**: every cell is 15.5-25.9 s faster (-40% to -50%) against spreads of at most 0.8 s; none is slower.
+Achieved at N = 1 cache off: 924.0 k relocated hits, 80.8% of the before build's compiles; compiles fall 88.8% (the
+generations also keep the 99.5 k same-RIP repeats the reset lost); 0 admission fallbacks in all 24 log-on runs. Memory:
+the kept answers are about 79 MB per vCPU (127-128 k answers, about 650 bytes each with their bytes); max RSS +131 MB at N = 1
+off and +193 MB at N = 4 off; warm -37 MB at N = 1, +34 MB at N = 4. At N = 4 each vCPU still keeps
+and compiles its own (the shared cache candidate, below): 318.5 k compiles of 1.26 M requests. The warm cache now pays:
+26.2 s against 27.7 s off at N = 1 (its hits are relocated too: 1.3 k compiles).
+
+**Checks**: `cargo test` 157 + 1 ignored, also with `FEXC` set (5 new); the standing suite parts of chunk 2 on the new build
+(`suite/`): `run_slice1_vm.py` at both block sizes: fixtures 64, seed 44, I8 136, I8b 329 + the 7 known QEMU two-NaN
+departures, I9 120, I9-big 5, I10 88, REX 37, 66-on-branches 12, I7 69; faults 7,912 and the I7 corpus's 6,313 at both;
+ASM 1,875 / 0 fail / 48 / 347; `run_x1.py` 6/6 and 196/196; i10 faults 296 at both; `run_i5c.py` 255 at both;
+`run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7, `r1b` 12/12 (negative controls flagged); all 51 boots (50 measured, 1 check) reached the dialog.
+Not rerun: fexc's own tests (fexc unchanged) and the suite's other runners.
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
@@ -310,7 +391,7 @@ fresh object's refusal stays a host error. **No-code answers** are reused only w
 `system::branch(bytes, rip)` (`execution.rs:891-895`), is compiled at the real RIP. *Correctness risk:* a RIP-derived
 constant FEX folds without a relocation is invisible to admission. First a proof: replay a logged request set through
 fexc at RIP and RIP + k * 4 KiB (several k, each half), requiring objects equal but for relocation values; each
-difference is a fexc patch before reuse ships (done, chunk 3: no patch; the relocator refuses three classes). Under the suites' code-shape option each reused answer is also compiled
+difference is a fexc patch before reuse ships (done, chunk 3: no patch; the relocator refuses three classes; built in chunk 4). Under the suites' code-shape option each reused answer is also compiled
 fresh and compared. *Expected:* about 1 M compiles become hits that still cost a host round trip (4-6 us): roughly 25
 of the 35 s. KASLR: the decompressor's relocations change bytes holding absolute addresses; the kernel's gain is
 measured. *Decides:* reuse bound, proof differences, fallback rate.
@@ -366,7 +447,7 @@ cost; measured with `run_l4b.py`'s `quick_pit_calibrate` sequence cold, against 
 1. The breakdown, accepted by its rule. Nothing else starts before it.
 2. The relocation proof (fexc replay, no VM), in parallel with:
 3. Shared cache with kept admission (small, low risk).
-4. Host reuse across addresses, if the proof is clean.
+4. Host reuse across addresses, if the proof is clean (done: chunk 4).
 5. Breakdown again; then reuse inside the resident, translating and placing ahead of use.
 6. Address-space switches, per-block overhead, resident entry cost, uncached RAM: only where the latest breakdown bounds
    the saving at 5% or more of a boot's wall.

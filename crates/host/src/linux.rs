@@ -55,6 +55,8 @@ pub struct Boot {
     pub stop_at: Option<u64>,
     /// The persistent compile cache (default off; [`compile_cache::Config::from_env`] opts in).
     pub compile_cache: compile_cache::Config,
+    /// Debug: every answer used at another RIP than its own is compiled there too and must equal it (`Compiler::check_reuse`).
+    pub check_reuse: bool,
 }
 
 impl Boot {
@@ -76,6 +78,7 @@ impl Boot {
             max_block: None,
             stop_at: None,
             compile_cache: compile_cache::Config::OFF,
+            check_reuse: false,
         }
     }
 
@@ -121,6 +124,7 @@ impl Boot {
             stop_at: self.stop_at,
             watchdog: self.watchdog,
             compile_cache: self.compile_cache,
+            check_reuse: self.check_reuse,
             ran: AtomicBool::new(false),
             cancel: Arc::default(),
         })
@@ -145,6 +149,7 @@ pub struct Prepared {
     stop_at: Option<u64>,
     watchdog: Duration,
     compile_cache: compile_cache::Config,
+    check_reuse: bool,
     /// [`Prepared::run`] has started: the backing is used.
     ran: AtomicBool,
     /// The run's cancellation flag ([`Prepared::canceller`]).
@@ -230,6 +235,7 @@ impl Prepared {
             let mut compiler = Compiler::new(&self.fexc, cpu, self.max_block)?;
             compiler.disk = compile_cache::shared(&self.fexc, &self.compile_cache)?; // P3: the persistent compile cache
             compiler.perf = crate::perf::Recorder::new(v, start)?;
+            compiler.check_reuse = self.check_reuse;
             let mut requests = execution::Requests { devices: Some(self.devices.clone()), ..Default::default() };
             let stop_at = if v == 0 { self.stop_at } else { None };
             let stop = execution::run(cpu, backing.vcpu(v), &mut compiler, stop_at, self.watchdog, &mut requests, &stops, cancelled, &mut ());
@@ -244,11 +250,13 @@ impl Prepared {
                 let fexc = compiler.finish();
                 let area = backing.vcpu(v);
                 let s: State = area.read_record(exec::STATE_OFFSET);
+                let (kept_bytes, kept_answers) = compiler.kept();
                 let state = format!(
-                    "{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"invalidations\":{},\"steps\":{},\"shootdowns\":{},\"systems\":{},\"halts\":{},\"interrupts\":{},\"deliveries\":{},\"stops\":{},\"shadow_resets\":{},\"compiles\":{},\"hits\":{},\"disk_hits\":{}}}",
+                    "{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"invalidations\":{},\"steps\":{},\"shootdowns\":{},\"systems\":{},\"halts\":{},\"interrupts\":{},\"deliveries\":{},\"stops\":{},\"shadow_resets\":{},\"compiles\":{},\"hits\":{},\"disk_hits\":{},\"relocated\":{},\"relocation_refused\":{},\"relocation_fallbacks\":{},\"reuse_checks\":{},\"kept_bytes\":{},\"kept_answers\":{}}}",
                     s.blocks, s.l2_hits, s.requests, s.retries, s.upgrades, s.evictions, s.linker, s.links, s.unlinks, s.invalidations, s.steps,
                     s.shootdowns, s.systems, s.halts, s.interrupts, s.deliveries, s.stops, execution::shadow_resets(area), compiler.compiles,
-                    compiler.hits, compiler.disk_hits
+                    compiler.hits, compiler.disk_hits, compiler.relocated, compiler.relocation_refused, compiler.relocation_fallbacks,
+                    compiler.reuse_checks, kept_bytes, kept_answers
                 );
                 match log.finish(end, fexc, &area.read_record(exec::perf::OFFSET), &execution::k1_stats(area), &state) {
                     (0, 0) => {}

@@ -581,7 +581,8 @@ impl LinkPoint {
 /// The value of a logical-immediate word's bitmask (DecodeBitMasks), `None` if reserved.
 pub fn bitmask(w: u32) -> Option<u64> {
     let (n, immr, imms) = (w >> 22 & 1, w >> 16 & 63, w >> 10 & 63);
-    let len = 31 - (n << 6 | (!imms & 63)).leading_zeros();
+    // N = 0 with imms = 0b111111 has no element size (reserved): no set bit, so `checked_sub` (a debug build overflowed).
+    let len = 31u32.checked_sub((n << 6 | (!imms & 63)).leading_zeros())?;
     let esize = 1u32.checked_shl(len).filter(|&e| e >= 2 && (w >> 31 == 1 || e <= 32))?;
     let (s, r) = (imms & (esize - 1), immr & (esize - 1));
     if s == esize - 1 {
@@ -1799,6 +1800,13 @@ pub mod perf {
 
 #[cfg(test)]
 mod tests {
+    /// Reserved logical immediates are `None`, among them N = 0 with imms = 63 (no element size).
+    #[test]
+    fn bitmask_reserved_encodings() {
+        assert_eq!(super::bitmask(0x3200_fc00), None); // orr w0, w0, N = 0, imms = 63
+        assert_eq!(super::bitmask(0xb240_fc00), None); // 64-bit, N = 1, imms = 63 (all ones)
+        assert_eq!(super::bitmask(0x3200_0000), Some(0x1_0000_0001)); // N = 0, imms = 0: one bit per 32
+    }
     use super::*;
 
     /// S4: data breakpoint ranges (LEN masks the address), R/W 01 writes only, 11 either, straddles, several bits.

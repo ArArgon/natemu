@@ -9,7 +9,9 @@ only what the host reads; objects, extent and args_read byte-identical; series47
 and `fexc.cpp`: CS/DS/ES/SS prefixes ignored, the last FS/GS prefix applies, FS/GS with no memory operand ignored; plan §5
 and Built (segment prefixes, November 3); series46-br66 is series45-r2fix plus patch 0029 and its shim change: 66 on near
 direct branches ignored as on Intel; series45-r2fix is series44-r2, byte-identical to the hand-built series43-x1, plus the
-review's shim change: segment prefixes on near direct branches ignored; §6), built by `tools/fexc/build.sh`.
+review's shim change: segment prefixes on near direct branches ignored; §6), built by `tools/fexc/build.sh`. Since perf
+chunk 4 (uncommitted on a24c785) the host reuses a translation at every RIP of the same half and page offset by its
+relocation records (`crates/host/src/relocation.rs`; perf plan "Measured (chunk 4)"): installer N = 1 cache off 27.7 s.
 This page is enough to start the boot integration: how to build and run a boot, what a boot takes as input, what is
 known to cost or differ, and the standing suite. The plan's "Built (...)" paragraphs hold the detail and the evidence;
 the [contract inventory](contracts.md) maps each contract to its check. No performance tuning was done beyond the
@@ -66,7 +68,9 @@ mapped while the VM exists. `Boot::run()` is both. The compile cache is off unle
 
 **Test driver boot** (`crates/driver/src/drivers/linux.rs`): `natemu-host RUNTIME boot-linux FEXC BZIMAGE` with the
 stub's options plus `--rsdp`, `--code-cache`, `--watchdog-ms` (default 60,000), `--max-block`, `--stop-at`,
-`--load-only`, `--dump`, `--save`, `--strict-unassigned`, `--lost-ticks`, `--clock-trace`; prints one JSON report (the
+`--load-only`, `--dump`, `--save`, `--strict-unassigned`, `--lost-ticks`, `--clock-trace`, `--check-reuse` (perf chunk 4,
+debug: every translation reused at another RIP is also compiled there and must be byte-equal, else a host error; the
+program driver's `--code-shape` turns the same check on); prints one JSON report (the
 placement, the BSP's stop, state and stats, each vCPU's stop and counters). Same `Boot` underneath. SIGINT or SIGTERM
 cancels its run as the stub's does (the report is still printed; a second one exits 130; both use
 `Canceller::on_signals`).
@@ -219,7 +223,9 @@ and agree with them within 0.6 s. The `natemu` stub cache-warm rows were remeasu
 built alone with `-p natemu` and signed, the same method, after a warm-up boot at N = 1 without and with the initrd, one boot per cell
 (`natemu-raw/final-suite-20261103-01/boot/boots.jsonl`); the perf chunk 2 rows are three interleaved boots per cell at
 e9214c8, old and new compiler each with its own warm cache after a warm-up boot, the log off (`natemu-raw/perf2-20261103-01/`,
-perf plan "Measured (chunk 2)"); the other rows are R2's.)
+perf plan "Measured (chunk 2)"); the perf chunk 4 rows likewise, before (a24c785) and after (the uncommitted reuse across
+load addresses) each with its own warm cache (`natemu-raw/perf4-20261103-01/`, perf plan "Measured (chunk 4)"); the
+other rows are R2's.)
 
 | To the root-fs panic, wall s (guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
 | --- | --- | --- | --- | --- |
@@ -241,6 +247,8 @@ perf plan "Measured (chunk 2)"); the other rows are R2's.)
 | `natemu-host boot-linux`, cache warm, **series48-lean** (perf chunk 2, mean of 3) | **52.2** (4.40) | | | **37.6** (4.52) |
 | `natemu-host boot-linux`, cache off, series47-seg (perf chunk 2, mean of 3) | 67.9 (7.09) | | | 53.6 (9.60) |
 | `natemu-host boot-linux`, cache off, **series48-lean** (perf chunk 2, mean of 3) | **49.3** (5.13) | | | **37.6** (6.32) |
+| `natemu-host boot-linux`, cache warm, series48-lean, **reuse across addresses** (perf chunk 4, mean of 3) | **26.2** (2.95) | | | **18.8** (3.08) |
+| `natemu-host boot-linux`, cache off, series48-lean, **reuse across addresses** (perf chunk 4, mean of 3) | **27.7** (4.00) | | | **22.8** (5.43) |
 | `natemu` stub and `boot-linux` at 16b0576, warm or off | never (hangs after "Run /init", see below) | never | | never |
 | QEMU TCG `thread=multi` | 7.27 (2.24) | 5.55 (1.79) | 5.55 (1.86) | 5.46 (1.83) |
 | QEMU TCG default (multi-threaded) | 7.42 (2.28) | | | 5.43 (1.81) |
@@ -319,6 +327,14 @@ controls), `delivery` 0 failures, `run_x3.py` (9/9, 4/4, 24/24, 6/6, 10/10, 54/5
 `run_l3.py` 0 failures, `run_l4a.py` (13/13, 4/4, 2/2, 2/2, 1/1), `run_l4b.py` (5/5, 2/2, 3/3, 11/11, 7/7, 1/1),
 `run_m3.py` 0 failures, `run_m2.py` 112/112 at 2 GiB and at 4 MiB, `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative
 controls flagged), and the initrd boots to "Select a language" at N = 1 and 4 (§4 table).
+
+**Rerun with reuse across load addresses** (perf plan "Measured (chunk 4)"; `natemu-raw/perf4-20261103-01/suite/`, 2 GiB,
+a24c785 plus the uncommitted change, series48-lean; the program driver's `--code-shape` now also compiles every answer
+reused at another RIP and requires it equal): `cargo test` 157 + 1 ignored, also with `FEXC` set; the same runners and
+counts as the series48-lean rerun below (fixtures 64, seed 44, I8 136, I8b 329 + the same 7 QEMU departures, I9 120, I9-big
+5, I10 88, REX 37, 66-on-branches 12, I7 69, at both block sizes; faults 7,912 and 6,313 at both; ASM 1,875 / 0 / 48 / 347;
+`run_x1.py` 6/6 and 196/196; i10 faults 296; `run_i5c.py` 255; `run_boot_smoke.py` 4/4; `run_r1.py` 7/7 and 12/12); one
+installer boot with `--check-reuse` (919,666 reused answers compiled again, all equal); all 51 boots reached the dialog.
 
 **Rerun on series48-lean** (`natemu-raw/perf2-20261103-01/suite/` and `checks/`, 2 GiB, e9214c8 plus the uncommitted
 change; perf plan "Measured (chunk 2)"; its objects equal series47-seg's on a boot's 1.14 M recorded requests): `cargo test` 152 + 1 ignored, also with `FEXC` set; fexc
@@ -558,8 +574,9 @@ deviation, or a contained corner.
   against QEMU's 7.3 s; user code at randomized addresses compiles again per process (§4, translation latency); next
   chunk (owner decision 1).
 - **medium**, performance: each vCPU's in-memory compile cache is its own (`execution::Compiler::cache`; only the disk
-  cache is shared), wholesale-reset at 65,536 entries (`execution.rs`, ponytail); the disk cache evicts oldest-written
-  first (`compile_cache.rs`).
+  cache is shared); since perf chunk 4 it keeps two generations of 262,144 answers or 128 MiB each (at most 256 MiB per
+  vCPU; the installer keeps about 127 k, 80 MB per vCPU), relocating answers to other RIPs of the same half and page offset (`relocation.rs`); the disk cache
+  evicts oldest-written first (`compile_cache.rs`).
 - **medium**, performance: uncached (UC/UC-) RAM costs about 4.3-4.8 us per access (§4, M2 addendum 2); device pages a
   host round trip per access (M3).
 - **medium**, API: the library's public surface is wide (about 190 public items (functions, types, constants) across `execution`, `memory`, `vm`,

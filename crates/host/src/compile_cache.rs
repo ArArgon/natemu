@@ -1,9 +1,11 @@
 //! The persistent compile cache (P3): fexc's raw answers on disk, shared by runs and by concurrent natemu processes.
 //!
 //! An entry is keyed by SHA-256 over the fexc binary's own SHA-256 (its build: FEX pin, patch series, shim, fexc.cpp) and
-//! the exact request body (arguments: profile, RIP, block limit, features, gating; then the guest bytes), and holds what
-//! fexc answered (code, extent, arguments read, the JSON for an answer without code, the object). A hit is handled exactly
-//! as a reply from the server: the object goes through admission's mandatory validation like a fresh one, so the cache is
+//! the request body (arguments: profile, RIP, block limit, features, gating; then the guest bytes) with the RIP replaced by
+//! its half and page offset (perf chunk 4), and holds the RIP it was compiled at and what fexc answered (code, extent,
+//! arguments read, the JSON for an answer without code, the object). A hit is handled exactly as a reply from the server,
+//! relocated to the requested RIP when it was compiled at another (`Compiler`, `relocation`): the object goes through
+//! admission's mandatory validation like a fresh one, so the cache is
 //! no more trusted than fexc's pipe (see `Compiler`). Each entry also carries SHA-256(key, payload): a damaged one is a miss.
 //!
 //! Layout: `DIR/{k,u}-*.pack`, immutable files written whole under a temporary name and renamed (atomic, so concurrent
@@ -180,7 +182,7 @@ fn tag(identity: &[u8; 32]) -> String {
 }
 
 fn key(identity: &[u8; 32], body: &[u8]) -> [u8; 32] {
-    sha256(&[b"natemu-fexc-cache-1\0", identity, body])
+    sha256(&[b"natemu-fexc-cache-2\0", identity, body])
 }
 
 impl DiskCache {
