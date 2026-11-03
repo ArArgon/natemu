@@ -193,11 +193,13 @@ a warm-up boot, off = `NATEMU_COMPILE_CACHE=off`. Raw records `natemu-raw/r2-202
 beside it; the natemu rows to "Select a language" were rerun on the build with the review fixes (e6b2bf5 plus them; a
 warm-up boot first), `natemu-raw/r2-final-20261102-01/boot/boots.jsonl`. R2's rows labelled "with the fix" for
 `boot-linux` and the cache-off stub came from the scratch rebind experiment, not the committed fix; these replace them,
-and agree with them within 0.6 s.)
+and agree with them within 0.6 s. The `natemu` stub cache-warm rows were remeasured on series47-seg at 335c070, the stub
+built alone with `-p natemu` and signed, the same method, after a warm-up boot at N = 1 without and with the initrd, one boot per cell
+(`natemu-raw/final-suite-20261103-01/boot/boots.jsonl`); the other rows are R2's.)
 
 | To the root-fs panic, wall s (guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
 | --- | --- | --- | --- | --- |
-| `natemu` stub, cache warm | 2.28 (1.19) | 2.06 (1.38) | 2.20 (1.49) | 2.31 (1.63) |
+| `natemu` stub, cache warm (series47-seg, 335c070) | 2.40 (1.26) | 2.19 (1.43) | 2.26 (1.54) | 2.36 (1.61) |
 | `natemu-host boot-linux`, cache warm | 2.46 (1.19) | 2.04 (1.34) | 2.19 (1.47) | 2.26 (1.55) |
 | `natemu` stub, cache off | 4.15 (2.83) | 4.68 (3.70) | 5.33 (4.32) | 5.70 (4.65) |
 | `natemu-host boot-linux`, cache off | 4.51 (3.12) | 5.24 (4.13) | 5.58 (4.48) | 6.06 (5.03) |
@@ -207,7 +209,7 @@ and agree with them within 0.6 s.)
 
 | To "Select a language" (initrd), wall s ("Run /init" guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
 | --- | --- | --- | --- | --- |
-| `natemu` stub, cache warm | 67.3 (5.12) | | | 49.1 (5.47) |
+| `natemu` stub, cache warm (series47-seg, 335c070) | 68.2 (5.24) | 53.4 (5.26) | | 50.2 (5.51) |
 | `natemu-host boot-linux`, cache warm | 67.3 (5.15) | | | 49.5 (5.39) |
 | `natemu` stub, cache off | 67.8 (7.12) | | | 53.1 (9.47) |
 | `natemu-host boot-linux`, cache off | 68.0 (7.22) | | | 52.5 (8.95) |
@@ -315,22 +317,22 @@ plan, Built (R2 review fixes)): green but the 7 known i8b departures at both blo
 `run_r1.py r1a` 7/7 and `r1b` 12/12, `run_boot_smoke.py` 3/3 (with `cancel`); at 4 MiB the three relocated runners
 (above); the installer boots (§4 table).
 
-**Full suite on the final build** (series46-br66 at HEAD 8cbbfd1, clean tree; `natemu-raw/final-suite-20261102-02/`: `2g/` and
-`4m/` each hold `results.txt` (exit code and seconds per command) and `logs/`, `extra/` the reruns; per-case outputs
+**Full suite on the final build** (series47-seg at HEAD 335c070, clean tree; `natemu-raw/final-suite-20261103-01/`: `2g/` and
+`4m/` each hold `results.txt` (exit code and seconds per command) and `logs/`, `extra/` the reruns, `boot/` the boots; per-case outputs
 deleted): every command of the block below, one VM runner at a time with no other `natemu-host` running, once at 2 GiB
-(74 commands) and once at 4 MiB (`NATEMU_RAM=0x400000`, the 65 VM commands; `run_boot_smoke.py`, which sets its own RAM, runs at
+(78 commands) and once at 4 MiB (`NATEMU_RAM=0x400000`, the 69 VM commands; `run_boot_smoke.py`, which sets its own RAM, runs at
 the default only). Everything passed but the 7 known i8b departures (they flag `i8-forms-001`, `-045` and
 `i8-random-067`, `-077`, `-097`, `-111`, `-126`; the runner exits 1; rerun alone once at both block sizes: the same 7, also `cargo test` with `FEXC` set: 151 + 1 ignored).
 
 | Runner | 2 GiB | 4 MiB |
 | --- | --- | --- |
 | `cargo test` (also with `FEXC` set), `check_resident_stack.py`, Python | 151 + 1 ignored in both, `ok`, 317 | not run |
-| `run_slice1_vm.py` fixtures / seed / REX / 66-on-branches / I8 / I9 / I9-big / I10 (default and `--max-block 1`) | 64 / 44 / 37 / 12 / 136 / 120 / 5 / 88, 0 fail | same |
+| `run_slice1_vm.py` fixtures / seed / REX / 66-on-branches / I7 / I8 / I9 / I9-big / I10 (default and `--max-block 1`) | 64 / 44 / 37 / 12 / 69 / 136 / 120 / 5 / 88, 0 fail | same |
 | `run_slice1_vm.py` I8b | 329 match, 7 known departures | same |
-| `run_slice1_faults.py`, `run_slice2_*` | 7,912; flow 64, loops 846 (x3 block sizes), probes 83; 0 fail | same |
+| `run_slice1_faults.py` (also on the I7 corpus), `run_slice2_*` | 7,912 (I7: 6,313); flow 64, loops 846 (x3 block sizes), probes 83; 0 fail | same |
 | `run_asm.py` | 1,875 pass / 0 fail / 48 deviations / 347 unsupported | same |
 | `run_slice3_vm.py` (all 12 modes) | 0 failures; `contain` 423 controls | same |
-| `run_i6_faults.py`, `run_i8_faults.py`, `run_i9_faults.py`, `run_i10_faults.py`, `run_i5b.py`, `run_i5c.py` | 275, 851, 586, 296, 411, 255 as expected | same |
+| `run_i6_faults.py`, `run_i8_faults.py`, `run_i9_faults.py`, `run_i10_faults.py`, `run_i5b.py`, `run_i5c.py` | 275, 851, 586, 296, 445, 255 as expected | same |
 | `run_i6b.py` corpus / cases | 112 / 129 | same |
 | `run_m3.py`, `run_k1.py`, `run_k2.py`, `run_s4.py` | 0 failures | same |
 | `run_x1.py`, `run_x3.py`, `run_x4.py` | 6/6 + 196/196; 9/9, 4/4, 24/24, 6/6, 10/10, 54/54; 33/33, 28/28, 6/6 | same |
