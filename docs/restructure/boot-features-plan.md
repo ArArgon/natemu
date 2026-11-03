@@ -349,7 +349,7 @@ processor** (applied first to segment prefixes on near direct branches: Built (R
 choice matches the processor as far as known (QEMU's or the documented behaviour) and is to be re-verified on real x86
 hardware in the correctness pass (after the performance phase; owner, November 2: with large-scale differential fuzzing
 and real workloads):
-**To verify on real x86 hardware, correctness pass (after the performance phase)** (each made from QEMU's or inferred processor behaviour, none run on an Intel part):
+**Owner decision (November 2, reference machine):** the x86 machine for this list is `ubuntu@192.168.12.11`, an AMD Ryzen 7 8845HS in a VM with nested SVM (`/dev/kvm` present; the `ubuntu` user is not yet in the `kvm` group). Where the Intel SDM defines a behaviour, natemu follows the SDM (the profile is GenuineIntel); where the SDM is open or reserved, this AMD machine is the reference, accepting vendor differences. **To verify on real x86 hardware, correctness pass (after the performance phase)** (each made from QEMU's or inferred processor behaviour, none run on an Intel part):
 segment prefixes (26/2E/36/3E/64/65) on near direct branches ignored (R2 review); the Reserved-NOP cells of `0f 0d` and
 `0f 18..1d` executing as NOPs (X1c, pinned QEMU's sweep); F2 (BND) on near CALL/RET/JMP/Jcc ignored without MPX (X1c);
 `0f 0d` with a register operand #UD (X1c, QEMU's 12 encodings); INCSSP without CET #UD (owner decision 5: the SDM, where
