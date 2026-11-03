@@ -233,6 +233,63 @@ the I7 corpus's 6,313 at both; ASM 1,875 / 0 fail / 48 / 347; `run_x1.py` 6/6 an
 measurement boots reached the dialog. Not rerun (no fexc change can reach them beyond the objects shown identical): the
 rest of the suite.
 
+### Measured (chunk 3: relocation proof, November 3; analysis on bc0c934, series48-lean, no code change)
+
+**Question.** Can fexc's answer for bytes B at RIP r become the answer for B at r' (same page offset, half and arguments
+but `--rip`) by its relocation records alone? **Answer: yes, with three refusals the relocator checks; no FEX change.**
+
+**Method** (`natemu-raw/perf3-20261103-01/`: `tools/reloc_proof.py`, `proof.json` with up to 5 examples per class,
+`proof.out`, `rec/`). One N = 1 cache-off installer boot recorded its request stream in front of a series48-lean server
+(`rec/fexc`; 1,143,801 requests, 2.76 GB, deleted after the analysis). Every request was compiled again at its RIP (the
+fresh answer). A request is a reuse candidate when an earlier answer has the same arguments but `--rip`, the same half
+(bit 63) and page offset, and matches its bytes as `Entry::matches` does (bytes to the extent a prefix, or equal when the
+extent reached their end). The candidate relocator turns the kept raw object into the object for r': `guest_rip := r'`;
+every `guest_rip_literal` and `guest_rip_move` value + (r' - r); each move's words re-encoded at their offset by FEX's
+`LoadConstant` (NOPAD, 64-bit; a Python copy, checked on all 2,235,105 moves of the fresh objects: 0 mismatches). The
+result is compared byte for byte with the fresh object, and no-code answers by status, end reason, end RIP - RIP, the cut
+fields, extent and args_read. Then each of the 20,785 answers met at two or more RIPs was compiled at 13 synthetic RIPs
+of the same half and page offset (± 4 KiB, + 64 KiB, + 1.14 MiB, both sides of a 2 MiB and a 1 GiB boundary, bits 31:12
+clear, bit 40 flipped, the half's edges, below 4 GiB, and for the kernel -2 GiB): 269,966 compiles. Every difference
+was classified until none was left unexplained.
+
+**Boot** (real pairs): 129,859 distinct answers; 914,403 requests (79.9%) met an answer kept at another RIP and 99,539
+one kept at the same RIP (compiled again after the host's memory cache reset at 65,536 entries, `execution.rs:842`).
+
+| Class (cause in FEX) | Boot pairs | Synthetic | Relocator |
+| --- | --- | --- | --- |
+| Object byte-identical after relocation | 898,394 | 201,481 | reuse |
+| No code, equal (`system_instruction`, `partial_decode`) | 12,680 + 2,710 | 2,480 | reuse |
+| Move length: `LoadConstant` picks movz/movk by the value's non-zero halfwords (also `orr` bitmask and `movn` forms); e.g. `0x7f94c6322000` (movz+movk+movk) at r' becomes `0x7f8faffa0000` (movz+movk) | 595 | 42,111 | refuses (word count) |
+| 32-bit move form (`movzw+movkw`): the value is below 4 GiB, possibly a 32-bit `EntrypointOffset` FEX masks (`ALUOps.cpp:56`, `JIT.cpp:748`), which an added shift would not mask | 24 | 19,173 | refuses |
+| Canonicality: a direct branch to a non-canonical target is cut at decode (`fexc_slice1.inc` 819-873, end reason `unsupported_form`): the block ends earlier (1,045), a move holds another exit (43), the first instruction gives no code (53); a window across the edge is an fexc error (57); plus 3,523 equal or move-length cases | 0 | 4,721 | refuses (non-canonical value) |
+
+Every synthetic difference outside the 4 GiB next to a canonical edge is a move-length change or a 32-bit form; every canonicality case is
+caught by the canonical rule. Not seen: a RIP constant folded without a relocation record, a site or PC-table entry, the
+JITCodeTail (its RIP is a `guest_rip_literal`, zeroed), a branch-range choice (FEX's ADRP/ADR path is disabled; the code
+holds no PC-relative reference to a guest address), split or alignment stubs (they depend on the low 12 bits only), extent
+or args_read, a no-code answer's end. The relocator refuses 619 of the boot's 914,403 pairs (0.068%).
+
+**Relocator** (next chunk, host). Inputs: a kept raw answer, its RIP r, the requested RIP r' (same arguments but `--rip`,
+same half and page offset, bytes matching per `Entry::matches`). For an object, with d = r' - r: write `guest_rip` = r';
+add d to the value of each reloc of kind 1 (literal; its slot stays zero, admission fills it) and kind 3 (move); for each
+move, take its words by admission's `move_sequence`, encode the new value with `LoadConstant`'s rules, and write them.
+Nothing else is touched (sites, PC table, kind 2 and 4 relocs, tail). It refuses (and the request is compiled at r') when
+a move's word count changes, a move's old or new words are a 32-bit form, or a new value, r' or r' + `guest_bytes` is not
+canonical. No-code answers are reused only for reasons decoded from the bytes (`system_instruction`, `partial_decode`,
+`instruction_too_long`, `end_of_input`; the host's `system::decode` and `system_cut` stay exact: end RIP - RIP is the same),
+never `unsupported_form` (its cut depends on the absolute target). **Keys**: in memory, context (limit, gating read),
+half, page offset and a hash of the leading bytes, then `Entry::matches`; on disk, the SHA-256 of the body with the
+`--rip` value replaced by half and offset. The relocated object goes through admission at r' as a fresh one does; an
+admission refusal of a relocated object falls back to a compile, counted and logged (expected 0: every accepted
+relocation above equals the fresh object byte for byte, and admission depends only on object, RIP and bytes); a fresh
+object's refusal stays a host error. Under `--code-shape` each reused answer is also compiled and compared.
+
+**Expected.** 913,784 of 1,143,801 compiles (79.9%) become relocated hits at N = 1 cache off. At series48-lean's 16.3 us
+round trip against about 1 us of relocation, about 14 s of the 49.3 s wall (bound: all round trips, 18.6 s); a cache
+that keeps its 129,859 answers instead of resetting adds the 99.5 k same-RIP repeats (about 1.5 s). No FEX change is
+needed; a fixed four-word guest-RIP move would remove the 0.07% refusals at the cost of a word per move, not worth it. A
+KASLR kernel's relocated text still differs in bytes (chunk 1) and is not covered.
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
@@ -253,7 +310,7 @@ fresh object's refusal stays a host error. **No-code answers** are reused only w
 `system::branch(bytes, rip)` (`execution.rs:891-895`), is compiled at the real RIP. *Correctness risk:* a RIP-derived
 constant FEX folds without a relocation is invisible to admission. First a proof: replay a logged request set through
 fexc at RIP and RIP + k * 4 KiB (several k, each half), requiring objects equal but for relocation values; each
-difference is a fexc patch before reuse ships. Under the suites' code-shape option each reused answer is also compiled
+difference is a fexc patch before reuse ships (done, chunk 3: no patch; the relocator refuses three classes). Under the suites' code-shape option each reused answer is also compiled
 fresh and compared. *Expected:* about 1 M compiles become hits that still cost a host round trip (4-6 us): roughly 25
 of the 35 s. KASLR: the decompressor's relocations change bytes holding absolute addresses; the kernel's gain is
 measured. *Decides:* reuse bound, proof differences, fallback rate.
