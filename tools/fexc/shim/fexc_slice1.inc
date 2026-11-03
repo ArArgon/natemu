@@ -693,7 +693,6 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   // and by policy F2 on movs/stos/lods (hardware repeats as with REP; the SDM calls it reserved).
   const bool string = primary && ((op >= 0xA4 && op <= 0xA7) || (op >= 0xAA && op <= 0xAF));
   const bool compare = string && (op == 0xA6 || op == 0xA7 || op == 0xAE || op == 0xAF);
-  const bool source = string && (op <= 0xA7 || op == 0xAC || op == 0xAD);   // movs, cmps, lods: DS:RSI
   if ((f & DecodeFlags::FLAG_REP_PREFIX) && (f & DecodeFlags::FLAG_REPNE_PREFIX)) return Uns("REP and REPNE prefixes together");
   // X1c (owner decision, November 2): F2 on a near CALL, RET, JMP or Jcc is MPX's BND prefix, ignored where MPX is not
   // enumerated (as on the modelled processor; pinned QEMU agrees): FEX compiles the branch as without it. Not on
@@ -703,46 +702,14 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   // rep ret is a ret; F3 90 (no REX.B: that would be xchg r8, rax) is PAUSE, FEX's `yield`.
   if ((f & DecodeFlags::FLAG_REP_PREFIX) && !string && !(primary && (op == 0xC3 || (op == 0x90 && !(f & DecodeFlags::FLAG_REX_XGPR_B)))))
     return Uns("REP prefix");
-  // Segment prefixes in 64-bit mode (I7). FS/GS: FEX adds fs_cached/gs_cached (guest-state page loads) to the effective
-  // address of the explicit memory operand, as x86 adds FS.base/GS.base; never to the implicit stack accesses of push/
-  // pop/call/ret/enter/leave/pushf (SS, which no prefix overrides). CS/DS/ES/SS: base 0 in 64-bit mode, and FEX's decoder
-  // drops them (they never set FLAG_SEGMENTS there), so they only choose the exception for a non-canonical address. The
-  // presented CPU is GenuineIntel, so Intel's rule (SDM Vol. 3A §4.5.1; Vol. 1 §3.3.7.1): #SS(0) only for a reference
-  // that uses SS, implicitly (an RSP/RBP base, no override) or explicitly (an SS prefix, whatever the base); CS/DS/ES
-  // name a DS-class reference, #GP(0) even on an RSP/RBP base. fexc's JoinSites gives the explicit ModRM operand's sites
-  // that class from these bytes (Linux's SMP alternatives turn LOCK into DS on one CPU: `ds btr [rbp+...]`). Refused:
-  //   - several segment prefixes with an FS/GS one (Vol. 2 §2.1.1 gives no rule for two prefixes of one group; FEX keeps
-  //     the last FS/GS prefix and drops CS/DS/ES/SS, QEMU lets the last segment prefix win, a null one included), and SS
-  //     with CS/DS/ES (mixed classes, the same);
-  //   - SS on a moffs or string source operand (JoinSites classes only an explicit ModRM operand);
-  //   - FS/GS on an instruction with no explicit memory operand (nothing to override).
-  // String instructions: ES:RDI takes no override (SDM Vol. 2 MOVS/STOS/CMPS/SCAS); the DS:RSI source of movs/cmps/lods
-  // takes FS/GS and CS/DS/ES (DS-class either way); stos/scas have no overridable operand, so FS/GS there (which hardware
-  // ignores) is refused by policy.
-  {
-    const uint32_t seg = f & DecodeFlags::FLAG_SEGMENTS;
-    const bool fsgs = seg == DecodeFlags::FLAG_FS_PREFIX || seg == DecodeFlags::FLAG_GS_PREFIX;
-    const bool xlat = primary && op == 0xD7;
-    const bool memory = (has_modrm && mod != 3) || (primary && op >= 0xA0 && op <= 0xA3) || source || xlat;
-    const uint8_t* b = fexc_guest_bytes ? fexc_guest_bytes(d.PC, d.InstSize) : nullptr;
-    if (!b) return Uns("segment prefixes: instruction bytes unavailable");
-    int ss = 0, data = 0, high = 0;   // 36; 26/2E/3E; 64/65
-    for (unsigned i = 0; i < d.InstSize; ++i) {
-      const uint8_t x = b[i];
-      if (x == 0x36) ++ss;
-      else if (x == 0x26 || x == 0x2E || x == 0x3E) ++data;
-      else if (x == 0x64 || x == 0x65) ++high;
-      else if (!(x == 0xF0 || x == 0xF2 || x == 0xF3 || x == 0x66 || x == 0x67 || (x >= 0x40 && x <= 0x4F))) break;
-    }
-    // R2 review (owner rule, November 2: where the SDM is underspecified or says reserved, match a real x86 processor):
-    // segment prefixes on a near direct branch (Jcc rel8/rel32, JMP rel8/rel32, CALL rel32, LOOPcc/JrCXZ) are ignored, as
-    // processors and pinned QEMU ignore them (SDM Vol.2 2.1.1 calls them reserved); FEX compiles the branch as without
-    // them (no memory operand takes a base). To be re-verified on x86 hardware (plan, "to verify on real x86 hardware").
-    if (fsgs && !memory && !near_direct) return Uns("FS/GS override on an instruction without a memory operand");
-    if (fsgs && !near_direct && ss + data + high != 1) return Uns("FS/GS override with another segment prefix (no SDM rule for several)");
-    if (memory && ss && data) return Uns("SS with a CS/DS/ES prefix (mixed segment prefixes)");
-    if (ss && memory && !(has_modrm && mod != 3)) return Uns("SS override on a moffs, xlat or string source operand");
-  }
+  // Segment prefixes in 64-bit mode (I7), all admitted. FS/GS: FEX adds fs_cached/gs_cached (guest-state page loads) to the
+  // effective address of the explicit memory operand (ModRM, moffs, XLAT, the DS:RSI source of movs/cmps/lods), as x86 adds
+  // FS.base/GS.base; never to the implicit stack accesses of push/pop/call/ret/enter/leave/pushf (SS) nor to ES:RDI. Owner
+  // decisions (November 3; plan §5: where the SDM does not define it, the reference AMD machine), which FEX's decoder already
+  // implements in 64-bit mode: CS/DS/ES/SS prefixes are ignored, so the operand's default segment decides #SS(0)/#GP(0) for a
+  // non-canonical address (fexc's JoinSites: SS for an RSP/RBP base with no FS/GS prefix); of several FS/GS prefixes the last
+  // applies (FLAG_SEGMENTS is overwritten); an FS/GS prefix on an instruction with no overridable memory operand (a register
+  // form, push/pop of a register, stos/scas, a near direct branch) is ignored.
   // 0x67 (I10): 32-bit address size. FEX computes the effective address in 64 bits, truncates it to 32 bits and zero-extends
   // it before the FS/GS base (Addressing.cpp LoadEffectiveAddress: `Bfe`), RIP-relative included (EIP-relative: RIP + disp
   // truncated); moffs is 4 bytes; strings use ESI/EDI/ECX, LOOP/JECXZ ECX, XLAT EBX + AL (patch 0025); a direct branch, RET and

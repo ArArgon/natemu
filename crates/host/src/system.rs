@@ -11,10 +11,9 @@
 //! `/5`), RDRAND (`0f c7 /6`, register), INVD/WBINVD/WBNOINVD (`0f 08`, `0f 09`, `f3 0f 09`), CLFLUSH m (`0f ae /7`); L3:
 //! IN/OUT (`e4..e7`, `ec..ef`) and INS/OUTS (`6c..6f`; F3 = REP, 0x67); I5b: FXSAVE/FXRSTOR/XSAVE/XRSTOR m (`0f ae /0 /1 /4
 //! /5`), XGETBV/XSETBV (`0f 01 d0`, `d1`); and forms the presented CPU raises #UD for whatever their operands (unadvertised or VMX/SVM-only instructions). Anything
-//! else (other system instructions, F2/F3 prefixes on other forms, a 66 prefix on a far transfer, segment
-//! prefixes of different classes or an FS/GS override on INVLPG) is `None`: the vCPU stops with fexc's reason, as for code it cannot
-//! compile.
-use natemu_abi::execution::{SREG_DS, SREG_FS, SREG_GS, SREG_SS, System, system};
+//! else (other system instructions, F2/F3 prefixes on other forms, a 66 prefix on a far transfer, an FS/GS override on
+//! INVLPG) is `None`: the vCPU stops with fexc's reason, as for code it cannot compile.
+use natemu_abi::execution::{SREG_FS, SREG_GS, System, system};
 
 /// fexc's opcode maps (`FEXC_MAP_PRIMARY`, `FEXC_MAP_TWO`). The two-byte map is reported as 1 even with a 66 prefix (the
 /// 66 overlay, map 4, is not reported for these opcodes).
@@ -46,13 +45,10 @@ pub(crate) fn opcode_at(insn: &[u8]) -> (usize, u8) {
 /// Decodes the instruction at the start of `bytes`, which fexc cut as a system instruction with opcode map `map` and
 /// opcode `opcode`.
 pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
+    // `segment`: the last FS/GS prefix (0x64, 0x65), else 0. CS/DS/ES/SS prefixes are ignored in 64-bit mode (owner decision,
+    // November 3: as on the reference AMD machine), so the operand's default segment decides a non-canonical address's
+    // exception (the resident's `segments::noncanonical`); of several FS/GS prefixes the last applies (the same machine).
     let (mut at, mut lock, mut segment, mut address_size, mut operand16, mut rep) = (0, false, 0, false, false, 0);
-    // Segment prefixes of different classes (SS; CS/DS/ES; FS; GS): no SDM rule for several of one group, refused below.
-    let class = |p: u8| match p {
-        0x26 | 0x2e | 0x3e => 0x3e,
-        p => p,
-    };
-    let mut mixed = false;
     let mut rex = 0;
     loop {
         match *bytes.get(at)? {
@@ -65,10 +61,8 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
             0xf0 => lock = true,
             0x66 => operand16 = true,
             0x67 => address_size = true,
-            s @ (0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65) => {
-                mixed |= segment != 0 && class(segment) != class(s);
-                segment = s
-            }
+            s @ (0x64 | 0x65) => segment = s,
+            0x26 | 0x2e | 0x36 | 0x3e => {}
             // F2/F3 (mandatory-prefix overlays): only the forms that name them below (`rep_used`) take them.
             p @ (0xf2 | 0xf3) => rep = p,
             _ => break,
@@ -297,7 +291,7 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         // L3: IN/OUT (`e4..e7` imm8, `ec..ef` DX; bit 1 OUT, bit 0 the wide form) and INS/OUTS (`6c..6f`). The wide forms
         // are 16-bit with 66 and 32-bit otherwise: REX.W does not promote port I/O (SDM Vol.2 IN/OUT/INS/OUTS: 8, 16 or 32
         // bits). Segment overrides and 0x67 do not apply to IN/OUT; INS writes ES:RDI (no override); OUTS reads DS:RSI with
-        // an FS/GS override (CS/DS/ES are null; SS, whose non-canonical fault would be #SS, is not decoded, as I2's MOVS).
+        // an FS/GS override (CS/DS/ES/SS are ignored: DS-class whatever they are, as MOVS's source).
         // F3 is REP on INS/OUTS; F2 there (reserved, SDM Vol.2 REP) and F2/F3 on IN/OUT are not decoded.
         (MAP_PRIMARY, 0xe4..=0xe7 | 0xec..=0xef | 0x6c..=0x6f) => {
             let string = opcode < 0x70;
@@ -312,10 +306,8 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
                 rep_used = rep == 0xf3;
                 s.prefixes = if rep_used { system::REP } else { 0 } | if address_size { system::ADDRESS32 } else { 0 };
                 s.segment = match segment {
-                    _ if mixed => return None,
                     0x64 if s.kind == system::OUTS => SREG_FS as u32,
                     0x65 if s.kind == system::OUTS => SREG_GS as u32,
-                    0x36 if s.kind == system::OUTS => return None,
                     _ => 0,
                 };
             } else if opcode & 8 == 0 {
@@ -423,18 +415,12 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         if address_size {
             s.prefixes |= system::ADDRESS32;
         }
-        // CS/DS/ES/SS (base 0 in 64-bit mode) only choose the exception for a non-canonical address. The presented CPU is
-        // GenuineIntel, so Intel's rule (SDM Vol. 3A 4.5.1): an SS prefix makes the reference SS-class (#SS(0)) whatever the
-        // base, CS/DS/ES DS-class (#GP(0)) even on an RSP/RBP base; fexc's sites follow the same rule (a BT* form found
-        // aligned under alignment checking is stepped compiled by it). INVLPG faults on nothing: they are dropped there.
+        // The FS/GS override adds its base; with none the default segment decides the class (SS for an RSP/RBP base, as
+        // fexc's sites: a BT* form found aligned under alignment checking is stepped compiled by it).
         s.segment = match segment {
-            _ if mixed => return None,
-            0 => 0,
             0x64 => SREG_FS as u32,
             0x65 => SREG_GS as u32,
-            _ if s.kind == system::INVLPG => 0,
-            0x36 => SREG_SS as u32,
-            _ => SREG_DS as u32,
+            _ => 0,
         };
     }
     s.length = at as u32;
@@ -865,12 +851,13 @@ mod tests {
         assert_eq!(p("ca1000", 0xca), Some(System { kind: RET_FAR, size: 4, disp: 0x10, length: 3, ..System::NONE })); // lret 0x10
         assert_eq!(p("48cf", 0xcf), Some(System { kind: IRET, size: 8, length: 2, ..System::NONE })); // iretq
         assert_eq!(p("f048cf", 0xcf), Some(System { kind: IRET, size: 8, length: 3, lock: 1, ..System::NONE })); // #UD
-        assert_eq!(p("2e8e18", 0x8e).map(|s| s.segment), Some(SREG_DS as u32)); // mov ds, cs:[rax]
-        assert_eq!(p("368e5d08", 0x8e).map(|s| s.segment), Some(SREG_SS as u32)); // mov ds, ss:[rbp+8]
+        assert_eq!(p("2e8e18", 0x8e).map(|s| s.segment), Some(0)); // mov ds, cs:[rax]: CS ignored
+        assert_eq!(p("368e5d08", 0x8e).map(|s| s.segment), Some(0)); // mov ds, ss:[rbp+8]: SS ignored (RBP: SS by default)
         // I10: 0x67 on a memory operand (mov ds, [eax]; lgdt [eip+0x80]).
         assert_eq!(p("678e18", 0x8e), Some(System { cr: 3, size: 4, prefixes: ADDRESS32, ..mem(MOV_TO_SREG, 0, 0, 3) }));
         assert_eq!(d("670f011580000000", 0x01), Some(System { prefixes: ADDRESS32, ..mem(LGDT, RIP, 0x80, 8) }));
-        for (hex, op) in [("66cb", 0xcb), ("66ff28", 0xff), ("ff20", 0xff), ("362e8e18", 0x8e), ("8ed8", 0x8c)] {
+        assert_eq!(p("362e8e18", 0x8e).map(|s| s.segment), Some(0)); // two null prefixes: ignored
+        for (hex, op) in [("66cb", 0xcb), ("66ff28", 0xff), ("ff20", 0xff), ("8ed8", 0x8c)] {
             assert_eq!(p(hex, op), None, "{hex}");
         }
         for hex in ["ffe8", "ffd8", "66ffe8"] {
@@ -941,17 +928,17 @@ mod tests {
         let w = super::decode(&[0x48, 0x0f, 0xab, 0x0b], MAP_TWO, 0xab).unwrap();
         let h = super::decode(&[0x66, 0x0f, 0xab, 0x0b], MAP_TWO, 0xab).unwrap();
         assert_eq!((w.size, h.size, w.well_formed(), h.well_formed()), (8, 2, true, true));
-        // CS/DS/ES/SS overrides add nothing in 64-bit mode but name the reference's class (Intel: SS or DS); FS/GS add their
-        // base. Prefixes of two classes are not decoded.
-        for (prefix, class) in [(0x26, SREG_DS), (0x2e, SREG_DS), (0x36, SREG_SS), (0x3e, SREG_DS)] {
+        // CS/DS/ES/SS overrides are ignored in 64-bit mode (the default segment decides the class); FS/GS add their base,
+        // the last of several applies, a null prefix before or after it changes nothing (owner decisions, November 3).
+        for prefix in [0x26, 0x2e, 0x36, 0x3e] {
             let p = super::decode(&[prefix, 0x0f, 0xa3, 0x4b, 0x01], MAP_TWO, 0xa3).unwrap();
-            assert_eq!((p.kind, p.segment, p.disp, p.length), (BT_ALIGNED, class as u32, 1, 5));
+            assert_eq!((p.kind, p.segment, p.disp, p.length), (BT_ALIGNED, 0, 1, 5));
         }
         assert_eq!(super::decode(&[0x64, 0x0f, 0xa3, 0x4b, 0x01], MAP_TWO, 0xa3).unwrap().segment, SREG_FS as u32);
-        assert_eq!(d("3e480fb39540050000", 0xb3).map(|s| (s.kind, s.base, s.segment)), Some((BT_ALIGNED, 5, SREG_DS as u32))); // ds btr [rbp+0x540], rdx
-        assert_eq!(d("2e3e0fa34b01", 0xa3).map(|s| s.segment), Some(SREG_DS as u32)); // two of one class
-        for hex in ["363e0fa34b01", "3e640fa34b01", "64650fa34b01"] {
-            assert_eq!(d(hex, 0xa3), None, "{hex}");
+        assert_eq!(d("3e480fb39540050000", 0xb3).map(|s| (s.kind, s.base, s.segment)), Some((BT_ALIGNED, 5, 0))); // ds btr [rbp+0x540], rdx
+        for (hex, segment) in [("2e3e0fa34b01", 0), ("363e0fa34b01", 0), ("3e640fa34b01", SREG_FS), ("643e0fa34b01", SREG_FS), ("64650fa34b01", SREG_GS),
+                               ("65640fa34b01", SREG_FS), ("6564360fa34b01", SREG_FS)] {
+            assert_eq!(d(hex, 0xa3).map(|s| s.segment), Some(segment as u32), "{hex}");
         }
         assert_eq!(d("360f0138", 0x01).map(|s| s.segment), Some(0)); // invlpg ss:[rax]: faults on nothing
     }
@@ -1104,8 +1091,10 @@ mod tests {
         assert_eq!(p("646e", 0x6e), string(OUTS, 1, 0, SREG_FS as u32, 2)); // outsb fs:[rsi]
         assert_eq!(p("656c", 0x6c), string(INS, 1, 0, 0, 2)); // INS: ES only, the override is ignored
         assert_eq!(p("3e6f", 0x6f), string(OUTS, 4, 0, 0, 2)); // a null DS override
-        for (hex, op) in [("f26c", 0x6c), ("f3ec", 0xec), ("f2e480", 0xe4), ("366e", 0x6e), ("ec", 0xed)] {
-            assert_eq!(p(hex, op), None, "{hex}"); // REPNE, F3 on IN, SS on OUTS, FEX's opcode differs
+        assert_eq!(p("366e", 0x6e), string(OUTS, 1, 0, 0, 2)); // SS ignored: DS:RSI
+        assert_eq!(p("64656e", 0x6e), string(OUTS, 1, 0, SREG_GS as u32, 3)); // the last FS/GS applies
+        for (hex, op) in [("f26c", 0x6c), ("f3ec", 0xec), ("f2e480", 0xe4), ("ec", 0xed)] {
+            assert_eq!(p(hex, op), None, "{hex}"); // REPNE, F3 on IN, FEX's opcode differs
         }
         assert_eq!(super::decode(&[0xe4], MAP_PRIMARY, 0xe4), None); // truncated imm8
     }

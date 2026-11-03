@@ -4,9 +4,11 @@ Status: November 2, 2026, end of the boot-features phase (chunk R2 of the
 [boot-features plan](boot-features-plan.md), "the plan" below; its §4 checklist says what is met). Emulator code at
 e6b2bf5 (the fix of the blocking interrupt defect found at R2, §4) plus the fixes of the independent phase-end review,
 uncommitted on e6b2bf5 (plan, Built (R2 review fixes)); the
-compiler is fexc **series46-br66** (series45-r2fix plus patch 0029 and its shim change: 66 on near direct branches ignored
-as on Intel; series45-r2fix is series44-r2, byte-identical to the hand-built series43-x1, plus the review's shim change:
-segment prefixes on near direct branches ignored; §6), built by `tools/fexc/build.sh`.
+compiler is fexc **series47-seg** (November 3: series46-br66's patches with the owner's segment-prefix decisions in the shim
+and `fexc.cpp`: CS/DS/ES/SS prefixes ignored, the last FS/GS prefix applies, FS/GS with no memory operand ignored; plan §5
+and Built (segment prefixes, November 3); series46-br66 is series45-r2fix plus patch 0029 and its shim change: 66 on near
+direct branches ignored as on Intel; series45-r2fix is series44-r2, byte-identical to the hand-built series43-x1, plus the
+review's shim change: segment prefixes on near direct branches ignored; §6), built by `tools/fexc/build.sh`.
 This page is enough to start the boot integration: how to build and run a boot, what a boot takes as input, what is
 known to cost or differ, and the standing suite. The plan's "Built (...)" paragraphs hold the detail and the evidence;
 the [contract inventory](contracts.md) maps each contract to its check. No performance tuning was done beyond the
@@ -23,7 +25,7 @@ cargo +1.97.0 build --offline --locked --release -p natemu-runtime --target aarc
 tools/fexc/build.sh ../natemu-raw/fexc-$(date +%Y%m%d)-01                  # a fresh directory: it must not exist (about 30 s)
 ```
 
-series46-br66 already exists, so `build.sh` refuses it: build into a new directory and pass its `obj/fexc` (§6). Build the stub with `-p natemu` alone: a whole-workspace build unifies the driver's `testing` feature (raw record and
+series47-seg already exists, so `build.sh` refuses it: build into a new directory and pass its `obj/fexc` (§6). Build the stub with `-p natemu` alone: a whole-workspace build unifies the driver's `testing` feature (raw record and
 code-cache writes, the hook's reply/object/compile-server calls) into it (plan, Built (L0), review round). The runners
 build and sign `natemu-host` themselves.
 
@@ -31,7 +33,7 @@ build and sign `natemu-host` themselves.
 
 ```sh
 R=target/aarch64-unknown-none/release/natemu-runtime
-F=../natemu-raw/fexc-native-20261026-01/series46-br66/obj/fexc
+F=../natemu-raw/fexc-native-20261026-01/series47-seg/obj/fexc
 K=../natemu-raw/kernel-census-20261028-01/dl/linux               # Debian 6.12.107 bzImage
 I=../natemu-raw/kernel-census-20261028-01/dl/initrd.gz           # Debian installer initrd
 target/release/natemu "$R" "$F" "$K" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr' --vcpus 4
@@ -151,7 +153,9 @@ with 0x67, 16-bit BSWAP/SHLD/SHRD, ENTER with nesting, 66 on PUSHF/ENTER/LEAVE/R
 undocumented x87 aliases (`tools/fexc/shim/fexc_slice1.inc`; segment prefixes on near direct branches, reserved by the
 SDM, are ignored as processors do since series45-r2fix: plan §5, owner rule, and its list to verify on x86 hardware; 66 on
 near direct branches is ignored as the SDM defines for 64-bit mode since series46-br66: plan, Built (66 on near direct
-branches)); `no_code` `spill_area` for a block fexc can
+branches); no segment-prefix form is refused since series47-seg: CS/DS/ES/SS ignored, so the default segment decides #SS/#GP,
+the last FS/GS prefix applies, FS/GS with no memory operand ignored, owner decisions of November 3 from the reference AMD
+machine, plan §5); `no_code` `spill_area` for a block fexc can
 only compile with a spill area at one instruction (admission verifies no spill-slot code; a longer block is translated
 again with half its instructions first, as for `code_too_large`; fexc spilled on no corpus and no boot). CR0.NE = 0 stays the named stop `unsupported_ferr`
 and INCSSP without CET is #UD per the SDM, not QEMU's behaviour (owner decisions, November 2, phase end). Not built:
@@ -286,6 +290,14 @@ controls), `delivery` 0 failures, `run_x3.py` (9/9, 4/4, 24/24, 6/6, 10/10, 54/5
 `run_m3.py` 0 failures, `run_m2.py` 112/112 at 2 GiB and at 4 MiB, `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative
 controls flagged), and the initrd boots to "Select a language" at N = 1 and 4 (§4 table).
 
+**Rerun on series47-seg** (`natemu-raw/seg-check-20261103-01/green/`, 2 GiB, HEAD 4a56356 plus the uncommitted change;
+plan, Built (segment prefixes, November 3)): `cargo test` 151 + 1 ignored (also with `FEXC` set), `check_resident_stack.py`
+`ok`, Python 317, fexc `test_slice1.py` 35 and `check_sites.py --slice1` 64; fixtures 64, REX 37, 66-on-branches 12, I10 88
+and the new I7 corpus 69 (also at CPL 0) at both block sizes; faults 7,912 and the I7 corpus's page mutations 6,313 at both;
+probes 83; `contain` 0 failures; `run_x1.py` 6/6 and 196/196; i10 faults 296 at both; `run_i5b.py` 445/445 (255 `segment-*`);
+ASM 1,875 / 0 fail / 48 / 347; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7, `r1b` 12/12; the installer to "Select a
+language" at N = 2 in 57.2 s. The rest of the suite below ran on series46-br66 or earlier.
+
 **Rerun on series46-br66** (`natemu-raw/br66-check-20261102-01/rerun/`; plan, Built (66 on near direct branches)): the
 66 corpus 12/12 at both block sizes (series45-r2fix: 12 unsupported), `cargo test` 151 + 1 ignored, the REX corpus 37/37 and I10 corpus
 88/88 at both, `run_x1.py` 6/6 and 196/196, i10 faults 296/296 at both, faults 7,912 at both, probes 83/83, ASM 1,875 / 0
@@ -368,7 +380,7 @@ Full suite (about 25 minutes of runner time per pass on the M4 at R2, waits for 
 ```sh
 # From the repository root; zsh or bash. Wait until no other natemu-host runs (timing-sensitive cases: kicks, l4b,
 # x3 stress) and rerun alone any timing failure before calling it.
-F=../natemu-raw/fexc-native-20261026-01/series46-br66/obj/fexc    # tools/fexc/build.sh rebuilds it (patches 0001-0029 + the shim)
+F=../natemu-raw/fexc-native-20261026-01/series47-seg/obj/fexc    # tools/fexc/build.sh rebuilds it (patches 0001-0029 + the shim)
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 I8=../natemu-raw/i8-corpus-20261030-01      # gen_i8.py programs and their QEMU 7.2 results
@@ -379,6 +391,7 @@ BIG=../natemu-raw/i9-big-20261030-01        # PDEP/PEXT/PCMPISTRI runs over a bl
 I10=../natemu-raw/i10-corpus-20261030-01    # gen_i10.py: 0x67 forms, XLAT, strings/LOOP with ECX
 REX=../natemu-raw/rex-corpus-20261102-02    # gen_rex.py: REX chains (the census's last sites), segment-prefixed branches
 BR66=../natemu-raw/br66-corpus-20261102-01  # gen_br66.py: 66 on near direct branches (expected: QEMU on the 3E twins)
+I7=../natemu-raw/i7-corpus-20261103-01      # gen_i7.py: FS/GS overrides, and the November 3 segment-prefix rules (2 edge programs)
 O=../natemu-raw/suite-$(date +%Y%m%d-%H%M%S)
 s3() { tools/with-env python3 tools/run_slice3_vm.py --fexc "$F" "$@"; }
 cargo +1.97.0 build --offline --locked
@@ -445,6 +458,10 @@ tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/rex" "$REX/p
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/rex-1" --max-block 1 "$REX/programs.json" "$REX/expected.json"
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/br66" "$BR66/programs.json" "$BR66/expected.json"
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/br66-1" --max-block 1 "$BR66/programs.json" "$BR66/expected.json"
+tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i7" "$I7/programs.json" "$I7/expected.json"
+tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i7-1" --max-block 1 "$I7/programs.json" "$I7/expected.json"
+tools/with-env python3 tools/run_slice1_faults.py --fexc "$F" --out "$O/i7-faults" --no-probes "$I7/programs.json"   # #PF at base + EA
+tools/with-env python3 tools/run_slice1_faults.py --fexc "$F" --out "$O/i7-faults-1" --no-probes --max-block 1 "$I7/programs.json"
 tools/with-env python3 tools/run_i10_faults.py --fexc "$F" --out "$O/i10-faults"               # I10: 0x67 faults, #UD forms, CET NOPs
 tools/with-env python3 tools/run_i10_faults.py --fexc "$F" --out "$O/i10-faults-1" --max-block 1
 tools/with-env python3 tools/run_s4.py --fexc "$F" --out "$O/s4"   # S4: TF single-step, INT1, instruction breakpoints, DR6/DR7 vs the SDM's logs and QEMU
@@ -458,6 +475,12 @@ tools/with-env python3 tools/run_r1.py r1b --fexc "$F" --out "$O/r1b"   # R1b: m
 ```
 
 ## 6. Compiler reproducibility
+
+**series47-seg** (the owner's segment-prefix decisions, November 3): `tools/fexc/build.sh
+../natemu-raw/fexc-native-20261026-01/series47-seg` (21 s wall) applies `patches/0001-0029` to the pinned FEX commit with the
+working tree's shim and `fexc.cpp` (no patch changed: FEX's 64-bit decoder already ignores CS/DS/ES/SS and keeps the last
+FS/GS prefix); `obj/fexc` SHA-256 `c4de5da07fabda7595a27ce4833961e297f34e4753e80cce3454a32aeb69f91a`; its compile-cache
+entries are its own. Before it:
 
 **series46-br66** (66 on near direct branches): `tools/fexc/build.sh ../natemu-raw/fexc-native-20261026-01/series46-br66`
 (20 s wall) applies `patches/0001-0029` to the pinned FEX commit with the working tree's shim (66 admitted on near direct
@@ -494,10 +517,11 @@ deviation, or a contained corner.
 - **medium**, API: the library's public surface is wide (about 190 public items (functions, types, constants) across `execution`, `memory`, `vm`,
   `owners`, `irq`, `devices`, ...; `crates/host/src/lib.rs`): the test driver's needs, not a curated integration API; the
   raw-memory paths are `unsafe` or behind `testing` since the review, but the rest is not reviewed as a stable interface.
-- **low**, correctness pass (after the performance phase): large-scale differential fuzzing, real workloads, and
-  re-verification on real x86 hardware of the decisions taken from QEMU's or inferred processor behaviour (plan §5,
-  "To verify on real x86 hardware": segment prefixes and BND on branches, Reserved-NOP cells, `0f 0d` register #UD,
-  INCSSP, prefixed EMMS/SHA cells, REX before a legacy prefix, lowest-priority arbitration, undefined MTRR overlaps).
+- **low**, correctness pass (after the performance phase): large-scale differential fuzzing and real workloads. The
+  user-mode items of plan §5's "To verify on real x86 hardware" were run on the reference AMD machine on November 2-3 and
+  agree (segment prefixes and BND on branches, Reserved-NOP cells, `0f 0d` register #UD, INCSSP, prefixed EMMS/SHA
+  cells, REX before a legacy prefix; plan §5, "Hardware check"); still to run, with a kernel-mode harness: lowest-priority
+  arbitration, undefined MTRR overlaps.
 - **low**, boot: Linux's `quick_pit_calibrate` fails when first-time blocks fall inside its 24 us windows (§4); the evidence
   boots take the TSC rate from the profile and never need it.
 - **low**, refusals: `spill_area` (a block fexc can only compile with a spill area at one instruction; never seen); the other typed

@@ -59,16 +59,10 @@ UNSUPPORTED = {
     'lfence modrm e9': '0faee9',
     # I3: LOCK with a REP prefix (XACQUIRE/XRELEASE without HLE), an operand-size prefix on cmpxchg8b/16b (no SDM meaning)
     'rep lock add [rax],rcx': 'f3f0480108', 'repne lock xadd [rax],ecx': 'f2f00fc108', 'o16 cmpxchg8b': '660fc708',
-    # I2: string forms outside the allowlist (REPNE only on cmps/scas, never with REP; FS/GS and SS rules)
+    # I2: string forms outside the allowlist (REPNE only on cmps/scas, never with REP)
     'repne movsb': 'f2a4', 'repne stosq': 'f248ab', 'rep repne cmpsb': 'f3f2a6',
-    'fs stosb (ES:RDI only)': '64aa', 'gs rep scasq': '65f348af', 'ss lodsb': '36ac', 'fs gs movsb': '6465a4',
-    # I10: 0x67 on BT/BTS/BTR/BTC m, r (no SDM rule for the register's offset with a 32-bit address); SS on xlat
-    'addr32 bt [eax],ecx': '670fa308', 'addr32 bts [eax],rcx': '67480fab08', 'ss xlat': '36d7',
-    # I7: an FS/GS override with nothing to override, or with a second segment prefix (no SDM rule; FEX and QEMU differ)
-    'fs mov rax,rcx': '644889c8', 'gs push rax': '6550', 'gs ret': '65c3', 'fs leave': '64c9', 'gs pushf': '659c',
-    'fs cs mov rax,[rax]': '642e488b00', 'ds gs mov rax,[rax]': '3e65488b00', 'fs gs mov rax,[rax]': '6465488b00', 'fs fs mov [rax],rcx': '6464894808',
-    # Intel's class since series27; still cut: SS with CS/DS/ES (mixed classes), SS on a moffs operand
-    'ss ds mov rax,[rbx] (mixed)': '363e488b03', 'ss movabs rax,[moffs]': '3648a10102030405060708',
+    # I10: 0x67 on BT/BTS/BTR/BTC m, r (no SDM rule for the register's offset with a 32-bit address)
+    'addr32 bt [eax],ecx': '670fa308', 'addr32 bts [eax],rcx': '67480fab08',
     'maskmovq (I9: a masked store)': '0ff7c1', 'maskmovdqu': '660ff7c1', 'f3 66 movss': 'f3660f10c1',
     'insertps m32 zeroing its element': '660f3a21000f',
     # I8: AVX forms FEX cannot do exactly (I10: the encodings x86 makes #UD are in UD)
@@ -192,6 +186,12 @@ ALLOWED = {
     # series27: Intel's class (SDM Vol. 3A 4.5.1): SS on a DS-default operand (#SS), CS/DS/ES on an RSP/RBP one (#GP)
     'ss mov rax,[rbx]': '36488b03', 'ds mov rax,[rbp]': '3e488b4500', 'cs mov [rsp+8],rcx': '2e48894c2408',
     'ss mov rax,[rip]': '36488b0500000000', 'es push [rbp+8]': '26ff7508', 'ds btr [rbp+0x540],rdx (Linux)': '3e480fb39540050000',
+    # series47-seg (owner decisions, November 3; the AMD machine): null prefixes ignored, the last FS/GS applies, FS/GS with
+    # no overridable operand ignored
+    'fs stosb (ES:RDI only)': '64aa', 'ss lodsb': '36ac', 'fs gs movsb': '6465a4', 'ss xlat': '36d7',
+    'fs mov rax,rcx': '644889c8', 'gs push rax': '6550', 'fs leave': '64c9', 'gs pushf': '659c',
+    'fs cs mov rax,[rax]': '642e488b00', 'ds gs mov rax,[rax]': '3e65488b00', 'fs gs mov rax,[rax]': '6465488b00', 'fs fs mov [rax],rcx': '6464894808',
+    'ss ds mov rax,[rbx]': '363e488b03', 'ss movabs rax,[moffs]': '3648a10102030405060708',
     'fld st0 (I6, reduced precision)': 'd9c0',
     # I2: string instructions without a repeat prefix (one element)
     'movsb': 'a4', 'movsq': '48a5', 'o16 cmpsw': '66a7', 'stosq': '48ab', 'stosd': 'ab', 'lodsb': 'ac', 'scasb': 'ae', 'cmpsb': 'a6',
@@ -204,7 +204,8 @@ LOCK_NEGS = {'lock neg [rax]': 'f0f718', 'lock neg byte [rax+8]': 'f0f65808', 'l
 # I2: REP/REPE/REPNE string instructions end their block (they exit to their own RIP until RCX is 0).
 REPS = {'rep movsb': 'f3a4', 'rep movsq': 'f348a5', 'rep stosq': 'f348ab', 'rep stosb': 'f3aa', 'rep lodsw': '66f3ad', 'repe cmpsb': 'f3a6',
         'repne cmpsd': 'f2a7', 'repe scasq': 'f348af', 'repne scasb': 'f2ae', 'fs rep movsq': '64f348a5', 'gs repe cmpsb': '65f3a6',
-        'addr32 rep movsb': '67f3a4', 'addr32 rep stosq': '67f348ab', 'addr32 repne scasb': '67f2ae', 'fs addr32 rep movsd': '6467f3a5'}
+        'addr32 rep movsb': '67f3a4', 'addr32 rep stosq': '67f348ab', 'addr32 repne scasb': '67f2ae', 'fs addr32 rep movsd': '6467f3a5',
+        'gs (ignored, series47-seg) rep scasq': '65f348af'}
 
 # (name, hex, translated-instruction count): control transfers end the block with their normal exit.
 BRANCHES = {
@@ -219,7 +220,7 @@ BRANCHES = {
     # 66 on a near direct branch: ignored as on Intel, rel8/rel32 kept (patch 0029; SDM Vol.2 CALL/JMP/Jcc, Appendix A "f64")
     'o16 jmp rel32': '66e905000000', 'o16 call rel32': '66e805000000', 'o16 jne rel32': '660f8505000000', 'o16 jne rel8': '667505',
     'o16 jmp rel8': '66eb05', 'o16 loop': '66e205', 'o16 jrcxz': '66e305', 'o16 rex.w call rel32': '6648e805000000', 'fs o16 jb rel32': '64660f8205000000',
-    'ret': 'c3', 'rep ret': 'f3c3', 'ret 8': 'c20800', 'jmp rax': 'ffe0', 'call rax': 'ffd0', 'jmp [rax]': 'ff20', 'call [rax]': 'ff10',
+    'ret': 'c3', 'gs ret (ignored, series47-seg)': '65c3', 'rep ret': 'f3c3', 'ret 8': 'c20800', 'jmp rax': 'ffe0', 'call rax': 'ffd0', 'jmp [rax]': 'ff20', 'call [rax]': 'ff10',
 }
 
 

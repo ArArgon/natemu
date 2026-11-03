@@ -361,11 +361,11 @@ def check_program(p, tmp):
         if s['kind'] in ('store', 'push', 'push_pair') and s['intent'] != 'write':
             problems.append(('ERROR', f'store without write intent at {s["native_offset"]}'))
         # I7: an FS/GS-overridden operand is FS/GS (#GP), whatever its base; the implicit stack accesses stay SS. An explicit
-        # operand is SS with an SS override, or with an RSP/RBP base and no override (CS/DS/ES: DS-class; Intel Vol. 3A 4.5.1).
+        # operand is SS with an RSP/RBP base (CS/DS/ES/SS prefixes are ignored: owner decision of November 3).
         seg = re.search(r'\b([cdefgs]s):\[', a)
         seg = seg and seg[1]
         ss = s['kind'] in ('push', 'pop', 'push_pair', 'pop_pair') or \
-            bool((seg == 'ss' or (not seg and re.search(r'\[(rsp|rbp)\b', a))) and s['kind'] in ('load', 'store', 'swap', 'atomic', 'load_pair', 'store_pair')) or \
+            bool((seg not in ('fs', 'gs') and re.search(r'\[(rsp|rbp)\b', a)) and s['kind'] in ('load', 'store', 'swap', 'atomic', 'load_pair', 'store_pair')) or \
             (mn == 'leave' and s['kind'] == 'load')
         if (s['segment'] == 'ss') != ss:
             problems.append(('ERROR', f'guest +{s["guest_offset"]} "{a}": segment {s["segment"]}'))

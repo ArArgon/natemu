@@ -142,14 +142,10 @@ pub(super) fn address(c: &Cpu, i: &System) -> u64 {
     let ea = if i.prefixes & system::ADDRESS32 != 0 { ea as u32 as u64 } else { ea };
     ea.wrapping_add(segment)
 }
-/// A non-canonical memory operand: #SS(0) for an SS-class reference (an SS override, or an RSP or RBP base with no
-/// override), else #GP(0) (a CS/DS/ES override even on an RSP/RBP base; FS/GS, I7): Intel SDM Vol. 3A 4.5.1.
+/// A non-canonical memory operand: #SS(0) for an SS-class reference (an RSP or RBP base with no FS/GS override: the
+/// host ignores CS/DS/ES/SS prefixes, owner decision of November 3), else #GP(0) (FS/GS, I7).
 pub(super) fn noncanonical(i: &System) -> Exception {
-    match i.segment as usize {
-        SREG_SS => SS0,
-        0 if matches!(i.base, 4 | 5) => SS0,
-        _ => GP0,
-    }
+    if i.segment == 0 && matches!(i.base, 4 | 5) { SS0 } else { GP0 }
 }
 
 /// Copies between `buf` and linear `va` for the instruction at RIP: an explicit access at the CPL, or an implicit

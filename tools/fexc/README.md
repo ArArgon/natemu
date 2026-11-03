@@ -29,7 +29,12 @@ jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never 
 (series applied as twenty-nine commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series46-br66` (November 2: series45-r2fix plus
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series47-seg` (November 3: series46-br66's patches
+with the shim and `fexc.cpp` changed for the owner's segment-prefix decisions: CS/DS/ES/SS prefixes ignored, so a site's
+class is its operand's default segment (`JoinSites`: SS for an RSP/RBP base without FS/GS; `NullSegment` gone); the last of
+several FS/GS prefixes applies; an FS/GS prefix with no overridable memory operand ignored; every segment-prefix refusal of
+the allowlist removed; boot-features plan, Built (segment prefixes, November 3); `obj/fexc` SHA-256
+`c4de5da07fabda7595a27ce4833961e297f34e4753e80cce3454a32aeb69f91a`). Before it, series46-br66 (November 2: series45-r2fix plus
 patch 0029 and the shim admitting 66 on near direct branches, ignored as on Intel (below, "The patch series"); boot-features
 plan, Built (66 on near direct branches)). Before it, series45-r2fix (November 2, after the R2 review:
 series44-r2 plus the shim admitting segment prefixes on near direct branches, ignored as processors do; boot-features plan,
@@ -110,7 +115,7 @@ the tree's shim and `fexc.cpp`. I5b's review fixes (the PTWRITE cut reason) and 
 prefix on any explicit ModRM operand. They add no base; `JoinSites` takes the class of the explicit operand's sites from
 the raw prefix bytes (`NullSegment`): SS with an SS prefix, or with an RSP/RBP base and no prefix, else DS, so a
 non-canonical address is #SS(0) or #GP(0) as on Intel. Still cut: SS with CS/DS/ES (mixed classes) and SS on a moffs or
-string source operand. Linux 6.12's `ds btr %rdx, 0x540(%rbp)` (its SMP alternatives turn LOCK into DS on one CPU) now
+string source operand (series47-seg replaced this rule: every CS/DS/ES/SS prefix ignored, nothing cut). Linux 6.12's `ds btr %rdx, 0x540(%rbp)` (its SMP alternatives turn LOCK into DS on one CPU) now
 compiles, its sites DS-class. Previous: `series26-i5b` (I5b: the FXSAVE/XSAVE family cut as system instructions). Previous:
 `series25` (I6 after review and M3, October 29: patches
 0001-0019 and the tree's shim, which holds I6's hunks and M3's `fexc_mmio.inc` completion records. Previous:

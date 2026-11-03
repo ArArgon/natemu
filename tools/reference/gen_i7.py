@@ -129,6 +129,36 @@ NEAR = [('absolute-rip-near', {'rax': 0x1122334455667788, 'rcx': 0xdeadbeef}, 0,
    f'cmp word ptr gs:[rip + {{{0x10 + 0x50}}}], 0x7fff', 'setl byte ptr gs:[0x60]'])]
 
 
+# Owner decisions (November 3; plan §5): CS/DS/ES/SS prefixes are ignored (the operand's default segment decides #SS/#GP),
+# the last of several FS/GS prefixes applies, an FS/GS prefix on an instruction with no memory operand is ignored. Canonical
+# forms, each FS/GS prefix list ending in the one that applies (an FS/GS prefix followed by a null one, and the non-canonical
+# forms, are tools/run_i5b.py's `segment-*` cases, against QEMU 11.1.2 and the hardware probes). `.byte` lines: unannotated.
+B = lambda *x: '.byte ' + ', '.join(f'{v:#x}' for v in x)
+Q = lambda a: list(a.to_bytes(8, 'little'))
+PREFIX = [
+ ('prefix-null', {'rbx': DATA + 0x100, 'rbp': DATA + 0x200, 'rsi': DATA + 0x300, 'rdi': DATA + 0x400, 'rax': 0x1122334455667788, 'rcx': 0x0f0f}, 0,
+  ['mov rax, qword ptr ss:[rbx + 8]', 'add qword ptr ds:[rbp + 8], rax', 'mov qword ptr es:[rsp + 8], rax', 'mov rcx, qword ptr cs:[rsp]',
+   'xor qword ptr ss:[rsi + r8*2], rcx', 'push qword ptr ds:[rbp + 0x18]', 'pop qword ptr ss:[rbx + 0x20]', 'sub qword ptr es:[rbp + 0x28], rcx',
+   B(0x36, 0x3e, 0x48, 0x8b, 0x13), B(0x3e, 0x36, 0x48, 0x01, 0x4d, 0x10), B(0x36, 0x48, 0xa1, *Q(DATA + 0x500)), 'mov al, 3', B(0x36, 0xd7),
+   B(0x36, 0x48, 0xad), B(0x26, 0x48, 0xa5), B(0x36, 0x48, 0xa7), B(0x2e, 0x36, 0x48, 0xa5), 'add rax, rcx']),
+ ('prefix-fsgs', {'r12': F(DATA + 0x800), 'r13': G(DATA + 0x900), 'rax': 0x8877665544332211, 'rcx': 0x0102030405060708, 'r9': 0x5a5a,
+                  'rsi': F(DATA + 0xa00), 'rdi': DATA + 0xb00}, 0,
+  [B(0x64, 0x65, 0x49, 0x8b, 0x45, 0x00), B(0x65, 0x64, 0x4d, 0x89, 0x0c, 0x24), B(0x64, 0x65, 0x64, 0x49, 0x01, 0x4c, 0x24, 0x08),
+   B(0x3e, 0x65, 0x49, 0x8b, 0x55, 0x10), B(0x36, 0x64, 0x49, 0x8b, 0x5c, 0x24, 0x18), B(0x65, 0x64, 0x48, 0xa5), B(0x3e, 0x65, 0x64, 0x48, 0xad),
+   B(0x64, 0x48, 0xab), B(0x65, 0x48, 0xaf), B(0x64, 0x48, 0x01, 0xc8), B(0x65, 0x50), B(0x64, 0x65, 0x41, 0x59), B(0x65, 0x9c), B(0x64, 0x5e),
+   B(0x64, 0x48, 0x89, 0xca), 'add rax, rcx'])]
+
+
+def prefix_program(spec, rng):
+    name, regs, rflags, lines = spec; p = Prog('i7-edge-' + name, rng, FS0, GS0); gpr, _ = g.initial(rng)
+    gpr = [0x0101010101010101 * (i + 1) if i not in g.PTRS + [g.INDEX, 4] else gpr[i] for i in range(16)]
+    for r, v in regs.items(): gpr[g.R64.index(r)] = v
+    for l in lines:
+        if l.startswith('.byte'): p.lines.append(l); p.insns.append({'op': 'mov', 'width': 64})
+        else: p.emit(l)
+    return finish(p, gpr, rflags, rng) | {'unannotated': True}
+
+
 def edge_program(spec, rng, fs=FS0, gs=GS0):
     name, regs, rflags, lines = spec; p = Prog('i7-edge-' + name, rng, fs, gs); gpr, _ = g.initial(rng)
     gpr = [0x0101010101010101 * (i + 1) if i not in g.PTRS + [g.INDEX, 4] else gpr[i] for i in range(16)]
@@ -145,7 +175,7 @@ def main():
     ap.add_argument('--seed', type=int, default=20261028); ap.add_argument('--random', type=int, default=60)
     a = ap.parse_args(); rng = random.Random(a.seed)
     progs = [edge_program(e, rng) for e in EDGES] + [edge_program(e, rng, NEAR_FS, NEAR_GS) for e in NEAR] + \
-        [random_program(rng.getrandbits(64), n) for n in range(a.random)]
+        [random_program(rng.getrandbits(64), n) for n in range(a.random)] + [prefix_program(e, rng) for e in PREFIX]
     clang = subprocess.run(['clang', '--version'], capture_output=True, text=True).stdout.splitlines()[0]
     a.output.write_text(json.dumps({'generator': {'script': 'tools/reference/gen_i7.py', 'seed': a.seed, 'assembler': clang,
         'layout': {'code': hex(g.CODE), 'data': hex(DATA), 'stack': hex(g.STACK)}}, 'programs': progs}, indent=1) + '\n')

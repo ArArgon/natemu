@@ -358,6 +358,30 @@ QEMU ignores the prefix (X1c review); a REX followed by a legacy prefix ignored 
 QEMU does not follow); lowest-priority delivery to the lowest-numbered enabled APIC (X3: model specific); an MTRR overlap the
 SDM leaves undefined taken as UC (R2 fix). Not on the list: 66 on a near direct branch, which the SDM defines (ignored in 64-bit mode;
 Built (66 on near direct branches)).
+**Hardware check (November 2-3, the reference AMD machine, user mode; `natemu-raw/hwcheck-20261103-01/` `probe.c`,
+`probe-output.txt`, `table.md`, and `hwcheck-20261103-02/` `probe2.c`, `probe2-output.txt` for the segment-prefix forms
+below).** Verified, the machine agreeing with natemu: segment prefixes and two of them on Jcc/JMP/CALL/LOOP/JrCXZ ignored
+(`probe-output.txt` lines 5-55, 48/48 and 2 pairs as unprefixed); the Reserved-NOP cells of `0f 0d` and `0f 18..1d` (and `0f
+1e`, `0f 1f`) as NOPs with no access, valid and non-canonical `[rax]`, every 66/F2/F3/NP and /0../7, and LOCK on them #UD
+(lines 290-337, 1,080/1,080); `0f 0d` with a register operand #UD (same sweep); F2 (BND) on near CALL/RET/JMP/Jcc and
+indirect JMP/CALL ignored (lines 91-103); REX chains (the last REX counts) and a REX followed by a legacy prefix ignored
+(lines 104-133); 66/F2/F3 on EMMS and the SHA cells #UD (lines 134-241); INCSSPD/Q #UD, RDSSPD/Q a NOP keeping its register,
+ENDBR64 a NOP, SAVEPREVSSP/SETSSBSY/RSTORSSP/CLRSSBSY/WRSS #UD (lines 242-266). Differences, natemu unchanged because the SDM
+defines them: 66 on near direct branches (the machine decodes rel16, AMD's rule; lines 57-90); WRUSSQ at CPL 3 #GP there
+(that kernel sets CR4.CET; natemu has CR4.CET = 0, #UD by the SDM; lines 267-268); unprefixed SHA and GFNI run there (the
+profile does not advertise them). Not run (need a kernel-mode harness): lowest-priority delivery, the MTRR overlap taken as
+UC. Differences changed by the owner (below): the four segment-prefix refusals or classes.
+**Owner decisions (November 3, segment prefixes; the reference machine's behaviour, applied in fexc series47-seg: Built
+(segment prefixes, November 3)):** (1) CS/DS/ES/SS prefixes on a memory operand in 64-bit mode are ignored: the operand's
+default segment (SS for an RSP/RBP base or a stack instruction, DS otherwise) decides #SS(0) or #GP(0) for a non-canonical
+address. Intel Vol. 1 §3.3.7.1's sentence suggesting #SS for an SS override is treated as not defining it, so the AMD
+machine is the reference (`probe-output.txt` lines 270-280: an SS prefix on `[rax]` #GP, DS/ES on `[rbp]` #SS;
+`probe2-output.txt` lines 10-46: two null prefixes, `[rsp + rbx]`, CS on `[rbp]`, moffs, PUSH/POP m, XLAT and the string
+sources likewise). This replaces the October 29 coordinator's Intel-class rule (Built (I7), revised). (2) Of two or more FS/GS
+prefixes the last applies (`probe-output.txt` lines 283-286; `probe2-output.txt` lines 48-60, a null prefix before or
+after them changing nothing). (3) An FS/GS prefix on an instruction with no memory operand is ignored (`probe-output.txt`
+lines 287-288; `probe2-output.txt` lines 62-82: STOS/SCAS's ES:RDI, PUSH/POP of a register, a register form; the DS:RSI
+source of MOVS/LODS takes FS/GS, which the SDM defines).
 
 **Owner decisions (October 28):** kernel = Debian 6.12 (32-bit stays deferred); fetching the Debian kernel,
 config and initramfs into natemu-raw is allowed (nothing committed); mitigations are booted off on the command line
@@ -538,7 +562,8 @@ changes where `jmp`/`call [mem]` load the target. CS/DS/ES/SS prefixes were alre
 drops them in 64-bit mode); now they are admitted only naming the operand's default segment. Refused (`unsupported_form`,
 vendors differ and the SDM gives no rule): FS/GS with a second segment prefix or with no memory operand; SS on a
 DS-default operand and CS/DS/ES on an RSP/RBP one (#SS versus #GP: AMD APM Vol. 3 §1.2.4 makes CS/DS/ES/SS null
-prefixes in 64-bit mode, so the default segment decides, while Intel Vol. 1 §3.3.7.1 suggests #SS for an SS override). Checks: `tools/reference/gen_i7.py` corpus (67
+prefixes in 64-bit mode, so the default segment decides, while Intel Vol. 1 §3.3.7.1 suggests #SS for an SS override;
+these refusals are all lifted since series47-seg: Built (segment prefixes, November 3)). Checks: `tools/reference/gen_i7.py` corpus (67
 programs, bases near, far, negative and 0; QEMU sets them with WRFSBASE/WRGSBASE) 67/67 at CPL 3 and 0, block sizes
 default and 1; faults: 252 `segment_probes` and 979 page-mutation cases on that corpus (#PF at base + EA), all match;
 `verify_precision.py` matrix and adversarial programs with FS/GS forms clean; on the corpus it finds one defect that is
@@ -546,7 +571,8 @@ I1's, not I7's (also on series14 with the prefixes removed): after a 16-bit regi
 FEX leaves AF's x27 write out, so a fault at a later access in the block would bank a stale AF (P6, program
 `i7-random-45`). Census FS/GS class: kernel 36,958 → 0,
 initramfs 27,599 → 2. FEX ASM suite unchanged (its FS/GS tests need WRFSBASE/WRGSBASE or SSE).
-*Revised (October 29, fexc series27; coordinator's decision): CS/DS/ES/SS prefixes follow Intel.* The presented CPU is
+*Revised (October 29, fexc series27; coordinator's decision): CS/DS/ES/SS prefixes follow Intel* (superseded by the owner's
+decisions of November 3, §5: Built (segment prefixes, November 3)). The presented CPU is
 GenuineIntel, so Intel's rule decides the exception for a non-canonical address, Intel SDM Vol. 3A §4.5.1 (Vol. 1
 §3.3.7.1): #SS(0) only for a reference that uses SS, implicitly (an RSP/RBP base, no override; the stack instructions) or
 explicitly (an SS prefix, whatever the base); a CS/DS/ES prefix makes even an RSP/RBP-based operand a DS-class reference,
@@ -567,6 +593,43 @@ non-canonical and straddling addresses; BTS under alignment checking at CPL 3: a
 the class's exception; the kernel's own bytes), all as expected, QEMU agreeing on every #GP case and raising #GP for the 36
 #SS ones; `run_slice1_faults.py` `null_segment_probes` (108: DS/ES/CS on RBP/RSP and SS on RBX/RSI for load, store, RMW,
 LOCK, BT*, XCHG at the I7 targets) match at both block sizes.
+*Built (segment prefixes, November 3; fexc series47-seg):* the owner's three decisions (§5, from the reference AMD
+machine). The forms changed were of two kinds: series46-br66 *admitted* SS on a DS-default operand and CS/DS/ES on an
+RSP/RBP one with Intel's class (the October 29 revision above; the hardware check's table lists them as refused, which was
+I7's original rule), and *refused* (`unsupported_form`) the rest: SS with CS/DS/ES, SS on a moffs, XLAT or string source,
+FS/GS with any second segment prefix, FS/GS with no memory operand (STOS/SCAS's ES:RDI, register forms, push/pop/ret/
+leave/pushf). Now nothing about segment prefixes is cut. fexc: the allowlist's segment block is gone (FEX's 64-bit decoder
+already drops CS/DS/ES/SS and keeps the last FS/GS prefix in `FLAG_SEGMENTS`; it adds the FS/GS base exactly where x86
+does: ModRM, moffs, XLAT and the DS:RSI source, never the stack's accesses or ES:RDI, so an ignored FS/GS adds nothing),
+`JoinSites` makes an explicit operand SS-class only for an RSP/RBP base without FS/GS (`NullSegment` removed). Host
+(`system.rs` `decode`): only the last FS/GS prefix is kept, CS/DS/ES/SS skipped, so `System::segment` is 0, `SREG_FS` or
+`SREG_GS` (the ABI's `well_formed` now refuses `SREG_SS`/`SREG_DS`); OUTS takes the last FS/GS (SS no longer refused);
+INVLPG with FS/GS is still not decoded (not part of the decisions). Resident: `segments::noncanonical` is #SS(0) for an
+RSP/RBP base without FS/GS, else #GP(0). Admission is unchanged: the site class is trusted metadata choosing #SS or #GP,
+and the base is FEX's guest-state load, which admission already lets x28 read and never write. Canonical accesses are the
+same accesses (CS/DS/ES/SS add no base). Checks, red on series46-br66 and green on series47-seg
+(`natemu-raw/seg-check-20261103-01/red/`, `green/`): the I7 corpus regenerated with two QEMU-compared edge programs
+appended (`gen_i7.py` `PREFIX`: SS on `[rbx]`/`[rsi + r8*2]`, DS/ES/CS on `[rbp]`/`[rsp]`, PUSH/POP m, two null prefixes,
+SS on moffs, XLAT, LODS/MOVS/CMPS; `64 65`, `65 64`, `64 65 64`, `3e 65`, `36 64` on loads, stores, RMW and MOVS/LODS
+sources, FS/GS on STOS/SCAS, ADD r, PUSH/POP r, PUSHF; `natemu-raw/i7-corpus-20261103-01`, the first 67 programs identical
+to October 28's): series46-br66 67 match + 2 `unsupported`, series47-seg 69/69 at CPL 3 and 0, block sizes default and 1;
+`run_i5b.py` `segment-*` 255 cases at both block sizes (the series27 cases with the default-segment expectation, the
+kernel's `ds btr` non-canonical now #SS(0), plus 34 new: those forms, non-canonical and canonical, host-decoded LDMXCSR/
+FXSAVE among them, several FS/GS prefixes with bases chosen so only the applied one reaches mapped canonical memory, FS on
+STOS/SCAS with a base that would make a non-canonical RDI canonical): series46-br66 116 not as expected, series47-seg all,
+QEMU 11.1.2 agreeing except the #SS(0) cases (expected from the probe lines cited in §5 and in `run_i5b.py`), including an
+FS/GS prefix followed by a null one; `run_slice1_faults.py` `null_segment_probes` (108, the model now the default segment):
+series46-br66 68 fail, series47-seg all match at both block sizes; host unit tests (`system.rs`: classes, several FS/GS,
+OUTS; ABI: `SREG_SS` not well formed); `test_slice1.py` (the 16 forms moved from `UNSUPPORTED` to `ALLOWED`/`REPS`/
+`BRANCHES`; 35 tests pass; series46-br66: 17 failures); `check_sites.py --slice1` (its class rule likewise) 64 programs, 0 errors. The
+kernel census classifier (`experiments/track03/kernel-census/census.py`) drops its segment rules likewise (selftest updated).
+Standing suite on series47-seg (`green/results.txt`, 2 GiB, one VM runner at a time): `cargo test` 151 + 1 ignored (also
+with `FEXC` set), `check_resident_stack.py` `ok`, Python 317, `test_fexc.py` 10; fixtures 64, REX 37, 66-on-branches 12,
+I10 88, each at both block sizes; `run_slice1_faults.py` 7,912 at both; the I7 corpus's page mutations 6,313 at both (the
+two `.byte` edge programs skipped: the fault model cannot read raw bytes); `run_slice2_probes.py` 83; `contain` 0 failures
+(423 controls); `run_x1.py` 6/6 + 196/196; `run_i10_faults.py` 296 at both; `run_i5b.py` 445/445; FEX ASM 1,875 pass / 0
+fail / 48 deviations / 347 unsupported; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7, `r1b` 12/12; the installer initrd
+to "Select a language" at N = 2 in 57.2 s wall ("Run /init" at 8.40 s guest; `green/boot/`).
 *Built (S2a, control and debug registers):* the bank (`Cpu`) gains CR2, CR8 and DR0-3/DR6/DR7 (`Cpu::dr`, reset
 `DR_RESET`: DR6 FFFF0FF0H, DR7 400H). MOV CR0 accepts every bit of the profile (PE MP EM TS ET NE WP AM NW CD PG), with
 the existing #GP rules (bits 63:32, PG without PE, NW without CD, PG or PE cleared in 64-bit mode); reserved low bits are
@@ -623,7 +686,8 @@ exit), and set RF from it on delivery. A REP string instruction ends its block
 proves the self-exit target from the guest bytes (`admission::rep_string`: the block's last instruction is a REP string).
 Refused (`unsupported_form`): 0x67 (32-bit addressing), LOCK (#UD), REP with REPNE, SS on the DS:RSI source, and by policy,
 not by an x86 rule, REPNE on MOVS/STOS/LODS (hardware repeats as with REP; the SDM calls the combination reserved) and
-FS/GS on STOS/SCAS (hardware ignores it: ES:RDI takes no override); FS/GS (alone) and CS/DS/ES are
+FS/GS on STOS/SCAS (hardware ignores it: ES:RDI takes no override; SS on the source and FS/GS on STOS/SCAS are admitted
+since series47-seg, Built (segment prefixes, November 3)); FS/GS (alone) and CS/DS/ES are
 admitted on the source of MOVS/LODS/CMPS (FEX's non-REP LODS ignored the prefix and its MOVS stepped RSI from base + RSI;
 `FexcStringOp` does neither). A MOVS's load and store are two operands, not an RMW pair (`fexc_movs`): its load is read
 intent, so a read-only source does not fault (the fault cases found this). Part 0 (I1 carry-over): the stale-AF report

@@ -17,8 +17,10 @@ program cut before the instruction (GPRs, XMM, MXCSR, the x87 report, the data r
 case needs no paging mutation or CPL change QEMU runs it too and must raise the same exception (QEMU_DIFFERS lists the
 cases it does not, with the reason). Choices recorded in `crates/runtime/src/execution/xsave.rs`: misalignment is #GP,
 never #AC; #UD (no CR4.OSXSAVE) before #NM (CR0.TS); FXSAVE/FXRSTOR move XMM/MXCSR whatever CR4.OSFXSR; XINUSE all ones.
-`mmio-xsave-*`: an XSAVE whose stores reach a device page stops before storing anything. `segment-*` (fexc series27):
-CS/DS/ES/SS prefixes by Intel's class for a non-canonical address (`segment_cases`); QEMU never raises #SS(0) there.
+`mmio-xsave-*`: an XSAVE whose stores reach a device page stops before storing anything. `segment-*` (fexc series47-seg, owner
+decisions of November 3): CS/DS/ES/SS prefixes ignored, so the operand's default segment decides #SS(0)/#GP(0) for a
+non-canonical address; the last of several FS/GS prefixes applies; FS/GS on an instruction with no memory operand is ignored
+(`segment_cases`). QEMU never raises #SS(0); where it differs the expectation is the reference AMD machine's (probe lines).
 """
 import argparse, json, pathlib, struct, subprocess, sys, time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -157,10 +159,14 @@ PF = lambda cr2, write, present=False, user=False: (14, (1 if present else 0) | 
 GP, NM, UD, SS = (13, 0, 0), (7, 0, 0), (6, 0, 0), (12, 0, 0)
 NONCANON = 0x0000_8000_0000_0000
 GP_AT = lambda rip: (13, 0, rip, 0)
-# QEMU 11.1.2 (TCG, system mode) raises #GP(0) for every non-canonical data address, never #SS(0): an RSP/RBP base with no
-# override and an SS override alike (its controls are `segment-none-*`). Its #GP for CS/DS/ES on RSP/RBP agrees with Intel
-# only because it never raises #SS; those cases are judged by the SDM rule.
-QEMU_NO_SS = 'QEMU 11.1.2 raises #GP(0) for every non-canonical data address, never #SS(0) (Intel SDM Vol. 3A 4.5.1: #SS(0) for an SS-class reference)'
+# QEMU 11.1.2 (TCG, system mode) raises #GP(0) for every non-canonical data address, never #SS(0), even for an RSP/RBP base
+# with no prefix (the controls `segment-none-*`). The #SS(0) of an RSP/RBP base under a CS/DS/ES/SS prefix is the reference
+# AMD machine's (natemu-raw/hwcheck-20261103-01/probe-output.txt lines 277-280: DS/ES on [rbp]; hwcheck-20261103-02/
+# probe2-output.txt lines 15-18 (two null prefixes on [rbp]), 23-26 (DS on [rsp + rbx], CS on [rbp]), 29-32 (PUSH/POP [rbp]
+# with DS)): the default segment decides. Its #GP(0) for an SS prefix on a DS-default operand agrees with that machine
+# (probe-output.txt lines 273-274; probe2-output.txt lines 11-14, 27-28, 33-36, 41-46).
+QEMU_NO_SS = 'QEMU 11.1.2 raises #GP(0) for every non-canonical data address, never #SS(0) (the AMD machine: #SS(0), the default segment SS)'
+# An FS/GS prefix before a null one still applies (the AMD machine: probe2-output.txt lines 49-54, 59-60; QEMU 11.1.2 agrees).
 QEMU_DIFFERS = {
     'ts-xsave': 'QEMU 11.1.2 never raises #NM for XSAVE/XRSTOR under CR0.TS (SDM Vol.2 XSAVE, XRSTOR: #NM if CR0.TS = 1)',
     'ts-xrstor': 'as ts-xsave',
@@ -287,15 +293,15 @@ def fault_cases():
     return out + segment_cases()
 
 
-# Segment prefixes in 64-bit mode (CS/DS/ES/SS add no base): the reference's class decides a non-canonical address's
-# exception, by Intel's rule (the presented CPU is GenuineIntel; SDM Vol. 3A 4.5.1): #SS(0) for an SS override whatever
-# the base, #GP(0) for CS/DS/ES even on an RSP/RBP base. fexc's forms (load, store, read-modify-write, LOCK, BT*, Linux's
+# Segment prefixes in 64-bit mode (CS/DS/ES/SS add no base and are ignored, owner decision of November 3: the reference AMD
+# machine's rule where Intel's SDM does not define it): the operand's default segment decides a non-canonical address's
+# exception, #SS(0) for an RSP/RBP base, #GP(0) otherwise, whatever CS/DS/ES/SS prefix it has. fexc's forms (load, store, read-modify-write, LOCK, BT*, Linux's
 # `ds btr` from its SMP alternatives) and the host's (LDMXCSR, FXSAVE, XSAVE; a BT* form under alignment checking at CPL 3),
 # canonical (runs) and not. The RSP base is [rsp + rbx] with RSP itself canonical, so QEMU can deliver the exception.
 SEGMENT_FORMS = [('load', 'mov rax, qword ptr {s}:[{b}]'), ('store', 'mov qword ptr {s}:[{b}], rcx'), ('rmw', 'add qword ptr {s}:[{b}], 1'),
                  ('lock', 'lock add qword ptr {s}:[{b}], rcx'), ('btr', 'btr qword ptr {s}:[{b}], rdx'), ('lock-bts', 'lock bts qword ptr {s}:[{b}], 5'),
                  ('ldmxcsr', 'ldmxcsr dword ptr {s}:[{b}]'), ('fxsave', 'fxsave {s}:[{b}]'), ('xsave', 'xsave {s}:[{b}]')]
-SEGMENT_BASES = [('ds', 'rbp', GP), ('es', 'rbp', GP), ('cs', 'rbp', GP), ('ds', 'rsp + rbx', GP), ('ss', 'rbx', SS), ('ss', 'rsi + 8', SS),
+SEGMENT_BASES = [('ds', 'rbp', SS), ('es', 'rbp', SS), ('cs', 'rbp', SS), ('ds', 'rsp + rbx', SS), ('ss', 'rbx', GP), ('ss', 'rsi + 8', GP),
                  ('none', 'rbp', SS), ('none', 'rsp + rbx', SS), ('none', 'rbx', GP)]      # the defaults, as controls
 
 
@@ -325,10 +331,55 @@ def segment_cases():
             out.append({'name': f'segment-{s}-{b.replace(" + ", "-")}-ac-bts-{tname}', 'lines': setup(b, target) + [operand('bts qword ptr {s}:[{b}], 5', s, b)],
                         'want': want, 'setup': [], 'd': data(), 'cpl3': 'ac', 'qemu': False, 'prefix': prelude()})
     # Linux 6.12's `ds btr %rdx, 0x540(%rbp)` (its SMP alternatives' DS in place of LOCK on one CPU), as the kernel has it.
-    for tname, rbp, want in (('canonical', D + 0x1000 - 0x540, None), ('noncanonical', NONCANON - 0x540, GP)):
+    for tname, rbp, want in (('canonical', D + 0x1000 - 0x540, None), ('noncanonical', NONCANON - 0x540, SS)):
         out.append({'name': f'segment-linux-ds-btr-{tname}', 'lines': [f'mov rbp, {rbp % 2 ** 64:#x}', 'mov edx, 0x45',
                     '.byte 0x3e, 0x48, 0x0f, 0xb3, 0x95, 0x40, 0x05, 0x00, 0x00'], 'want': want, 'setup': [], 'd': data(), 'cpl3': False,
-                    'qemu': True, 'prefix': prelude()})
+                    'qemu': True, 'prefix': prelude(), 'qemu_differs_if': QEMU_NO_SS if want == SS else None})
+    # Forms refused before series47-seg, each canonical (runs) and not: two null prefixes, SS on moffs/XLAT/string sources,
+    # PUSH/POP m with DS on RBP, several FS/GS prefixes (the bases make only the applied one's address canonical), an FS/GS
+    # prefix after or before a null one, FS/GS on forms with no overridable operand (STOS/SCAS's ES:RDI, a register form).
+    B = lambda *x: '.byte ' + ', '.join(f'{v:#x}' for v in x)
+    top = (D + 0x1000 - NONCANON) % 2 ** 64                        # a canonical FS base taking NONCANON to D + 0x1000
+    FSB = 0x7fff_ffff_f000                                         # an FS base taking any small offset past the canonical top
+    # FS.base by WRMSR (the QEMU stub's capture needs its own GS base: GS is only read, by RDMSR, never written).
+    def fs(v): return [f'mov ecx, {0xc0000100:#x}', f'mov eax, {v & 0xffffffff:#x}', f'mov edx, {v >> 32:#x}', 'wrmsr']
+    via = {'gs': ['mov ecx, 0xc0000101', 'rdmsr', 'shl rdx, 32', 'or rax, rdx', f'mov rbx, {D + 0x1000:#x}', 'sub rbx, rax'],
+           'fs': [f'mov rbx, {(D + 0x1000 - FSB) % 2 ** 64:#x}']}  # RBX = D + 0x1000 - the base that must apply
+    mxcsr = ['mov ecx, 0x1f80', 'mov dword ptr [rdi + 0x1000], ecx']
+    pair = lambda nc: (('canonical', D + 0x1000, None), ('noncanonical', NONCANON, nc))
+    reg = (('canonical', 0, None),)
+    extra = [   # (name, register set to each variant's value, lines before, instruction, variants (name, value, want), FS.base, QEMU's difference)
+        ('ss-ds-rbx-load', 'rbx', [], B(0x36, 0x3e, 0x48, 0x8b, 0x03), pair(GP), 0, None),
+        ('ds-ss-rbp-load', 'rbp', [], B(0x3e, 0x36, 0x48, 0x8b, 0x45, 0x00), pair(SS), 0, QEMU_NO_SS),
+        ('ds-ss-rbp-fxsave', 'rbp', [], B(0x3e, 0x36, 0x0f, 0xae, 0x45, 0x00), pair(SS), 0, QEMU_NO_SS),
+        ('ss-xlat', 'rbx', ['mov eax, 3'], B(0x36, 0xd7), pair(GP), 0, None),
+        ('ss-lods', 'rsi', [], B(0x36, 0x48, 0xad), pair(GP), 0, None),
+        ('ss-movs', 'rsi', ['lea rdi, [rdi + 0x1800]'], B(0x36, 0x48, 0xa5), pair(GP), 0, None),
+        ('ss-cmps', 'rsi', ['lea rdi, [rdi + 0x1800]'], B(0x36, 0x48, 0xa7), pair(GP), 0, None),
+        ('ds-rbp-push', 'rbp', [], B(0x3e, 0xff, 0x75, 0x00), pair(SS), 0, QEMU_NO_SS),
+        ('ds-rbp-pop', 'rbp', ['push rcx'], B(0x3e, 0x8f, 0x45, 0x00), pair(SS), 0, QEMU_NO_SS),
+        # Several FS/GS prefixes, and one with a null prefix: RBX reaches D + 0x1000 only through the base that must apply (the
+        # other takes it past the canonical top, or to an unmapped page).
+        ('fs-gs-last', None, via['gs'], B(0x64, 0x65, 0x48, 0x8b, 0x03), reg, FSB, None),
+        ('gs-fs-last', None, via['fs'], B(0x65, 0x64, 0x48, 0x8b, 0x03), reg, FSB, None),
+        ('fs-gs-fs-last', None, via['fs'], B(0x64, 0x65, 0x64, 0x48, 0x8b, 0x03), reg, FSB, None),
+        ('gs-fs-gs-last', None, via['gs'], B(0x65, 0x64, 0x65, 0x48, 0x8b, 0x03), reg, FSB, None),
+        ('ds-fs-last', None, via['fs'], B(0x3e, 0x64, 0x48, 0x8b, 0x03), reg, FSB, None),
+        ('fs-ds-last', None, via['fs'], B(0x64, 0x3e, 0x48, 0x8b, 0x03), reg, FSB, None),
+        ('gs-ss-last', None, via['gs'], B(0x65, 0x36, 0x48, 0x8b, 0x03), reg, FSB, None),
+        ('fs-gs-ldmxcsr', None, via['gs'], B(0x64, 0x65, 0x0f, 0xae, 0x13), reg, FSB, None),
+        ('gs-fs-ldmxcsr', None, via['fs'], B(0x65, 0x64, 0x0f, 0xae, 0x13), reg, FSB, None),
+        # FS on forms with no overridable operand: ignored (FS.base would take NONCANON to D + 0x1000).
+        ('fs-stos', 'rdi', [], B(0x64, 0x48, 0xab), pair(GP), top, None),
+        ('fs-scas', 'rdi', [], B(0x64, 0x48, 0xaf), pair(GP), top, None),
+        ('fs-gs-reg', None, [], B(0x64, 0x65, 0x48, 0x01, 0xc8), reg, top, None),
+        ('fs-push-reg', None, [], B(0x64, 0x50), reg, top, None),
+        ('fs-pop-reg', None, ['push rcx'], B(0x64, 0x59), reg, top, None)]
+    for name, r, before, insn, variants, fsbase, differs in extra:
+        for tname, target, want in variants:
+            lines = fs(fsbase) + mxcsr + before + ([f'mov {r}, {target:#x}'] if r else []) + [insn]
+            out.append({'name': f'segment-{name}-{tname}', 'lines': lines, 'want': want, 'setup': [], 'd': data(), 'cpl3': False, 'qemu': True,
+                        'prefix': prelude(), 'qemu_differs_if': differs if want == SS else None})
     return out
 
 
@@ -453,8 +504,11 @@ def run_faults(a, host, runtime, stub, results):
             elif differs: problems.append('QEMU_DIFFERS lists it but QEMU agrees')
         elif c['qemu'] and not a.no_qemu and c['want'] is None:
             full = qemu(prog, stub, a.out / 'qemu' / c['name'], timeout=30)
-            if full is None or full['cpus'][0].get('fault') is not None:
-                problems.append(f"QEMU: {full and full['cpus'][0].get('fault')} (the SDM rule: no fault)")
+            qf = full and full['cpus'][0].get('fault')
+            if full is None or qf is not None:
+                if c.get('qemu_differs_if') and qf is not None: c['qemu_differs'] = f"{qf}: {c['qemu_differs_if']}"
+                else: problems.append(f"QEMU: {qf} (the rule: no fault)")
+            elif c.get('qemu_differs_if'): problems.append('qemu_differs_if set but QEMU agrees')
         bad += bool(problems)
         results.append({'group': 'faults', 'name': c['name'], 'ok': not problems, 'problems': problems, 'qemu_differs': c.get('qemu_differs')})
         print(f"{c['name']}: {'ok' if not problems else 'FAIL'}" + (f" (QEMU differs: {c['qemu_differs']})" if c.get('qemu_differs') else ''),

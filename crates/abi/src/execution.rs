@@ -1098,10 +1098,9 @@ pub struct System {
     /// Operand size in bytes where the form has one: a register written by MOV r, Sreg / SLDT / STR (2: its low 16 bits;
     /// 4, 8: the selector zero-extended), the offset of a far pointer and the width of RET far / IRET pops (4 or 8).
     pub size: u32,
-    /// A segment override on the memory operand: [`SREG_FS`], [`SREG_GS`] (its base is added); [`SREG_SS`] (an SS prefix)
-    /// or [`SREG_DS`] (CS, DS or ES), which add nothing in 64-bit mode but make the reference SS- or DS-class for a
-    /// non-canonical address (#SS(0) or #GP(0), Intel SDM Vol. 3A 4.5.1); else 0 (the operand's default: SS for an RSP or
-    /// RBP base).
+    /// A segment override on the memory operand: [`SREG_FS`], [`SREG_GS`] (its base is added; the last FS/GS prefix);
+    /// else 0, the operand's default (SS for an RSP or RBP base, else DS), which decides #SS(0) or #GP(0) for a non-canonical
+    /// address: CS/DS/ES/SS prefixes are ignored in 64-bit mode (owner decision of November 3, the reference AMD machine).
     pub segment: u32,
     /// L3, INS/OUTS: [`system::REP`] (an F3 prefix) and [`system::ADDRESS32`] (a 0x67 prefix: ESI/EDI and ECX); else 0.
     pub prefixes: u32,
@@ -1286,7 +1285,7 @@ pub mod system {
                 && (reg(self.index) || self.index == NO_REG)
                 && self.scale <= 3
                 && (self.base != RIP || self.index == NO_REG)
-                && matches!(self.segment as usize, 0 | super::SREG_SS | super::SREG_DS | super::SREG_FS | super::SREG_GS);
+                && matches!(self.segment as usize, 0 | super::SREG_FS | super::SREG_GS);
             let rm = if self.memory == 1 { address } else { self.memory == 0 && reg(self.reg) && self.segment == 0 };
             (1..=15).contains(&self.length)
                 && self.lock <= 1
@@ -1910,7 +1909,8 @@ mod tests {
             System { kind: system::LGDT, ..mov }, // no memory operand
             System { kind: system::IRET, size: 2, ..mov },
             System { kind: system::MOV_FROM_SREG, size: 8, memory: 0, reg: 16, ..mov },
-            System { kind: system::JMP_FAR, size: 8, memory: 1, segment: 1, ..mov }, // CS: decoded as SREG_DS
+            System { kind: system::JMP_FAR, size: 8, memory: 1, segment: 1, ..mov }, // CS: never decoded (ignored)
+            System { kind: system::JMP_FAR, size: 8, memory: 1, segment: SREG_SS as u32, ..mov }, // SS: never decoded (ignored)
             System { kind: system::MOV_FROM_DR, cr: 16, ..mov },
             System { length: 0, ..mov },
             System { length: 16, ..mov },
