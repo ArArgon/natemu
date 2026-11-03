@@ -27,7 +27,12 @@
 //! one per write ([`Loaded::writes`]; guest RAM is zero elsewhere). `--stop-at ADDR` ends the run when the BSP is about to
 //! execute linear ADDR (the execution mode's stop RIP: a block boundary, nothing fetched there). `--save` writes guest-physical
 //! bytes after the run. Prints one JSON object: the placement (kernel, window, zero page, command line, initrd, e820,
-//! entry state) and, after a run, the stop and the final state.
+//! entry state) and, after a run, the stop and the final state. SIGINT or SIGTERM cancels the run (the library's
+//! canceller; the report is still printed), a second one exits 130 at once, as the `natemu` stub.
+//!
+//! Performance phase (perf plan §2): `NATEMU_PERF_LOG=FILE` turns on the library's timing log (`natemu::perf`): process
+//! phases and one line per vCPU in FILE, one line per translation request in FILE.vN. The resident's buckets need a
+//! runtime built with `--features perf` (else they read zero and `"magic":false`).
 use super::super::*;
 use crate::boot::{self, Inputs, Layout, Loaded};
 use crate::execution::{self, Stop};
@@ -49,6 +54,10 @@ fn number(text: &str) -> Result<u64> {
 }
 
 pub(crate) fn run(args: &[String]) -> Result<()> {
+    if let Some(path) = std::env::var_os("NATEMU_PERF_LOG") {
+        natemu::perf::enable(path)?;
+        natemu::perf::mark("main");
+    }
     let [_, resident, _, fexc, image, options @ ..] = args else {
         return Err(USAGE.into());
     };
@@ -122,7 +131,12 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     if let Some(path) = &serial {
         boot.serial = Some(Box::new(fs::File::create(path).map_err(|e| format!("{path}: {e}"))?));
     }
+    let trace = match &trace {
+        Some(path) => Some(std::io::BufWriter::new(fs::File::create(path).map_err(|e| format!("{path}: {e}"))?)),
+        None => None,
+    };
     let prepared = boot.prepare()?;
+    natemu::perf::mark("prepared");
     let (backing, loaded, board, devices) = (prepared.backing(), prepared.loaded(), prepared.board(), prepared.devices());
     // SAFETY: `guest` is used only while `prepared` lives (this function).
     let guest = unsafe { prepared.guest() };
@@ -133,9 +147,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     // L5: `--clock-trace FILE`, every 20 ms: TSC ns since the VM's epoch (the guest's TSC), then the PIT's and RTC's tick
     // counts (`clock::TickStats`) and the LAPIC timer's expiries taken, merged and reinjected (its record, read racily).
     let tracing = std::sync::atomic::AtomicBool::new(trace.is_some());
+    prepared.canceller().on_signals();
     let outcome = std::thread::scope(|scope| -> Result<_> {
-        if let Some(path) = &trace {
-            let mut file = std::io::BufWriter::new(fs::File::create(path).map_err(|e| format!("{path}: {e}"))?);
+        if let Some(mut file) = trace {
             let tracing = &tracing;
             scope.spawn(move || {
                 use std::io::Write as _;
@@ -182,6 +196,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         }
         fs::write(path, bytes).map_err(|e| format!("{path}: {e}"))?;
     }
+    natemu::perf::mark("report");
     let s: State = backing.vcpu(0).read_record(exec::STATE_OFFSET);
     let lapic_end = execution::lapic(backing.vcpu(0));
     // M1 pool use: the code cache and metadata arena filled since the last flush, and the shadow pool's resets.
@@ -235,6 +250,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         first_json,
         vcpu_json.join(",")
     );
+    natemu::perf::mark("exit");
     Ok(())
 }
 

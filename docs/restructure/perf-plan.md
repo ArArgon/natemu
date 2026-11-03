@@ -63,6 +63,117 @@ for 30 s of user space; in the guest, the log's CR3 groups compiles by address s
 Guest-RIP sampling only if guest execution exceeds a quarter of wall at either N. Gate: the owner sees the tables and
 ranked candidates before any optimisation, and sets the phase's target.
 
+### Measured (chunk 1, November 3; uncommitted on a73b858, series47-seg)
+
+**Built.** Host: `crates/host/src/perf.rs` (`NATEMU_PERF_LOG=FILE` on `natemu-host boot-linux` and the `natemu` stub;
+handoff §1 "Performance log"): process phase marks; per vCPU thread, every stretch of its service loop charged to a
+named part (bookkeeping around each entry, `hv_vcpu_run`, the exit read, each request kind, the log's own line), the
+request's parts (bytes copy, memory lookup, body + SHA-256 + pack read, fexc round trip, put, admission, decode, staging,
+keeping the answer), thread CPU (`CLOCK_THREAD_CPUTIME_ID`), the fexc server's CPU from `wait4` after its stdin is
+closed, and one line per request (CR3, RIP, guest-physical page, result, answer source, bytes read and their hash,
+parts). Resident: `crates/runtime/src/perf.rs`, feature `perf`: every CNTVCT tick from the resident's start is charged to
+one of 24 buckets (generated code; host exit; HLT park; mailbox wait; resident entries by kind from `returned`; inside
+them, exclusively: `enter`, block lookup, exit patching, placement, system instruction, TLB flush, delivery,
+revalidation walk, shadow-miss walk, fetch walk, shootdown wait, L1 clear), with entry counts; record at
+`STATE_OFFSET + 0xe40`; an entry is charged to its kind from `returned`'s first instructions (the stop disarm and a
+watch step included). Off, the resident's `.text` is byte-identical to a73b858's (only panic line numbers in `.rodata`
+move); the host's off path is a test per lap and per request part. `boot-linux` now cancels on SIGINT/SIGTERM like the
+stub (the report prints; both through `Canceller::on_signals`). After review: log write failures counted and reported,
+1 GiB cap per request file, a warning when a `perf` resident runs with the log off, the server's `wait4` bounded (killed
+after 1 s), the request line's byte hash moved out of the keep part (into the residual), and the entry kind charged from
+`returned`'s start (before, the prelude and the stop disarm went to guest code). The table below was measured before
+these changes; one instrumented installer boot at N = 1 cache off after them (`review/`) gives 68.34 s and every row
+within 1-3% of the table's range (guest 4.04, enter 4.62, misses 4.57, linker 3.23, L1 2.99, fexc 35.6, unattributed
+0.46%). Not built: fexc-side per-request stamps (they change the compiler binary, so its cache identity
+and the standing compiler); `wait4` CPU and the sampling profile stand in (IPC and wake-up = round trip - fexc CPU).
+Harness, analysis, summaries: `natemu-raw/perf1-20261103-01/` (`campaign.sh`, `boot.py`, `analyze.py`, `aggregate.py`,
+`tables.md`, `tables.json`, `runs/*.summary.json`, `profile/`, `checks/`; per-request logs deleted after analysis).
+
+**Method.** Debian 6.12.107, 2 GiB, `mitigations=off nokaslr` unless KASLR, `natemu-host boot-linux`, wall from spawn to
+the end-point line (serial polled every 50 ms, as §5), one VM at a time, three interleaved rounds after a warm-up boot.
+Instrumented runs use the `perf` resident and the log; uninstrumented runs the default resident, no log. Every part below
+is measured; HVF entry and exit is `hv_vcpu_run` time minus the resident's in-VM ticks, and equals the resident's
+host-exit bucket minus the host's own gap time to the millisecond in every run (same clock both sides). Acceptance met:
+unattributed is at most 0.59% of the window for the process and every thread of all 24 instrumented runs.
+
+| s (mean of 3 runs, instrumentation on) | Inst. N=1 warm | Inst. N=1 off | Inst. N=4 warm (vCPU 0) | Inst. N=4 off (vCPU 0) | Kernel N=1 warm | Kernel N=1 KASLR |
+| --- | --- | --- | --- | --- | --- | --- |
+| Process start to vCPU 0 entry (exec, `Boot::prepare`, VM/vCPU setup, compiler and persistent-cache open) | 0.13 | 0.07 | 0.19 | 0.06 | 0.17 | 0.07 |
+| Host, fexc round trip (server start included) | 33.33 | 36.06 | 11.20 | 12.19 | 0.05 | 2.14 |
+| Host, request body and persistent get (SHA-256 key, pack read) | 3.88 | 2.00 | 1.37 | 0.63 | 0.27 | 0.22 |
+| Host, admission | 1.36 | 1.38 | 0.48 | 0.43 | 0.08 | 0.09 |
+| Host, rest of the request (bytes copy, memory lookup, keep, staging, put, decode) | 2.01 | 1.38 | 0.74 | 0.43 | 0.06 | 0.11 |
+| Host, exit/entry bookkeeping (watchdog and stop signalling, exit read, devices) | 1.31 | 0.95 | 0.55 | 0.42 | 0.14 | 0.15 |
+| Host, the log's own request line | 0.40 | 0.40 | 0.15 | 0.11 | 0.02 | 0.03 |
+| HVF entry and exit (run - in-VM) | 1.73 | 1.76 | 0.61 | 0.55 | 0.13 | 0.15 |
+| VM, guest code (EL0) | 4.20 | 4.13 | 1.60 | 1.41 | 0.49 | 0.52 |
+| VM, halted (HLT park) and AP mailbox wait | 0.00 | 0.00 | 25.99 | 31.17 | 0.00 | 0.00 |
+| VM, entering blocks (`enter`) | 4.80 | 4.71 | 1.78 | 1.38 | 0.29 | 0.28 |
+| VM, dispatcher misses (own: bank, events, L1 fill) | 4.66 | 4.57 | 1.77 | 1.21 | 0.04 | 0.05 |
+| VM, linker entries (own: bank, `block_at`, checks) | 3.28 | 3.24 | 1.20 | 1.16 | 0.31 | 0.32 |
+| VM, L1 clears at code-context changes | 3.07 | 3.02 | 1.17 | 0.69 | 0.00 | 0.00 |
+| VM, block lookup, exit patching, placement | 1.09 | 1.06 | 0.36 | 0.33 | 0.07 | 0.07 |
+| VM, address-space work: TLB flushes (CR3 loads), shadow misses (abort + walk), revalidation walks, #PF and other deliveries | 3.02 | 2.93 | 0.59 | 0.62 | 0.37 | 0.37 |
+| VM, system instructions, fetch walks, IRQs, stops, helpers | 0.96 | 0.93 | 0.40 | 0.38 | 0.12 | 0.12 |
+| Unattributed (loop end after its last lap; request time outside its parts) | 0.28 | 0.30 | 0.09 | 0.09 | 0.01 | 0.02 |
+| **Sum = process start to vCPU 0's loop end** | **69.48** | **68.89** | **50.24** | **53.25** | **2.64** | **4.71** |
+| Unattributed share, process / worst thread (worst of 3 runs) | 0.40% / 0.40% | 0.43% / 0.43% | 0.19% / 0.19% | 0.18% / 0.22% | 0.59% / 0.59% | 0.37% / 0.37% |
+| Wall to the end point, on (off) | 69.47 (68.33) | 68.89 (68.48) | 50.23 (49.78) | 53.24 (53.94) | 2.62 (2.43) | 4.70 |
+
+The loop end follows the end point by 0.01-0.02 s (the SIGINT cancel). Kernel N = 4 (2.50 s, KASLR 6.50 s) and every row
+at full detail, the all-thread sums at N = 4 and the min-max spreads: `tables.md`. **The log's own cost** (on - off, mean of
+3): installer +1.1 s (1.7%) warm and +0.4 s off at N = 1, +0.45 s and -0.7 s (inside the spread) at N = 4; kernel +0.19 s
+(8%: about 1.2 M resident entries and 80 k request lines on 2.4 s).
+
+**Findings** (installer at N = 1, cache off, unless named):
+
+1. *First-time compiles*: 1,143,628 compiles, a fexc round trip of 31.5 us each (36.1 s, 52% of wall). fexc's CPU is
+   31.2 s (27.3 us per compile), so pipes and wake-ups cost 4.8 s (4.2 us each). The sampling profile of one server (30 s)
+   puts at least half of its request CPU in building the JSON report (52% under `Json::kv` and `Hex64` alone, more in
+   string appends) and 18% in FEX's `CompileCode`; the host keeps no JSON for an object (`Reply::payload`, `Answer::new`). On the host every request costs
+   about 4.1 us more: the request body's formatting 1.8 us (3.3 us with the SHA-256 key and pack read of a warm cache),
+   admission 1.2, keeping the answer 0.5, bytes copy 0.5, staging 0.2.
+2. *Reuse across load addresses*: 902,851 of the compiles (79%) read bytes that an earlier compile read at another RIP
+   with the same page offset, 902,211 from the same guest-physical page; the run reads only 126 k distinct byte strings
+   (44 k with a warm cache, whose 972 k compiles hold 902 k such repeats). 99% of them are user code (kernel compiles:
+   180 k cache off, 9.5 k warm). A KASLR kernel compiles 61.5 k blocks of which 121 repeat bytes: its relocated text
+   differs in bytes, so byte-keyed reuse does not cover it (4.70 s against 2.62 s, +2.1 s of compiles).
+3. *The warm cache does not pay on the installer*: 171 k disk hits (4.2 us of get each) against 972 k misses that pay the
+   SHA-256 key (+1.5 us) and a put; N = 1 warm 68.3 s, off 68.5 s uninstrumented.
+4. *The resident's own work is about 20 s*, five times the guest's 4.1 s: 21.6 M block entries through `enter` (0.22 us
+   each, 4.7 s), 14.7 M dispatcher misses (0.31 us own, 4.6 s), 6.9 M linker entries for 3.9 M links (0.47 us own,
+   3.2 s), and 262 k L1 clears at 11.5 us each (3.0 s): L1 is cleared at every code-context change (`select_l1`), and the
+   misses (56 per clear) refill it. The kernel-only boot clears it 4 times.
+5. *Address-space work* is 2.9 s (4.3%): 30.6 k CR3 loads at 29 us each in the TLB flush (0.88 s; 4.4 us in the
+   kernel-only boot: it grows with the cache), 2.94 M shadow misses 1.79 s, 2.99 M revalidation walks 0.17 s, 52 k #PF
+   (69 k deliveries in all) 0.09 s. HVF entry and exit 1.76 s (1.24 M exits, 1.4 us each); exit/entry bookkeeping
+   0.95 s (the watchdog channel's two sends per exit); 533 uncached steps (negligible).
+6. *N = 4*: vCPU 0 is halted 26-31 s; the four threads together are halted 118 s of 213 s (off). 1.33 M compiles at
+   37.3 us (four servers contend), 202 k of them (15%) of bytes at a RIP another vCPU had compiled; 49.6 s of round trips
+   over the threads. Guest code is 5.6 s of thread time, under a quarter of wall: no guest-RIP sampling.
+7. Process: natemu-host's `wait4` CPU 71.4 s (it appears to include its reaped servers: threads 37.7 + fexc 31.2);
+   `DiskCache::open` 0.14-0.16 s of the warm start; the first exec after `codesign` costs about 0.23 s once.
+
+**Candidates, by the bound these numbers give** (seconds of the N = 1 wall; they overlap: reuse removes compiles the
+report change would shorten): host reuse across load addresses up to about 30 s (903 k compiles at 35.9 us becoming
+memory hits at about 2-3 us; the relocation proof decides); fexc's per-object report about 16 s (52% of 31.2 s of fexc
+CPU, from one profile: to be confirmed by measurement) plus up to 4.8 s of IPC; the resident's L1 clears and the entries
+they cause up to about 11 s (3.0 s of clears, 4.6 s of misses, 0.4 s lookups, a share of the 4.7 s of `enter`); the
+host's per-request work about 4.7 s; address-space switches 2.9 s; shared cache only at N > 1 (202 k compiles, about 7 s
+of thread time at N = 4 off). **Recommended next**: the fexc report for objects (per-block overhead: §4 item 6's 5% bar
+is met many times over; small, the objects must stay byte-identical) together with the relocation proof (§4 item 2),
+then host reuse; the L1-clear finding goes to the owner's ranking with the resident-entry candidate (not one of §3's
+named mechanisms).
+
+**Checks** (`checks/`): `cargo test` 152 + 1 ignored without and with `FEXC` (one new test: `wait4` reaps the server with
+its CPU time); `check_resident_stack.py` `ok` on the default resident (19,168 / 23,312 / 12,832, as before) and on the
+`perf` one (19,184 / 23,328 / 12,848); with the instrumentation off and on (the runners' resident built with the feature
+through `CARGO_TARGET_AARCH64_UNKNOWN_NONE_RUSTFLAGS` = the config's flags plus `--cfg feature="perf"`, into
+`target/perf`; the stub's log on): `run_boot_smoke.py` 4/4 both, `run_slice1_faults.py --max-block 1` 7,912 match both,
+`run_slice3_vm.py contain` 0 failures (423 controls) both; and all 40 measurement boots reached their end point. (A
+first "on" pass set `RUSTFLAGS`, which replaces the config's linker flags: every run refused the resident ELF; rerun as
+above.)
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite

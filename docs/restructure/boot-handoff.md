@@ -66,7 +66,28 @@ mapped while the VM exists. `Boot::run()` is both. The compile cache is off unle
 **Test driver boot** (`crates/driver/src/drivers/linux.rs`): `natemu-host RUNTIME boot-linux FEXC BZIMAGE` with the
 stub's options plus `--rsdp`, `--code-cache`, `--watchdog-ms` (default 60,000), `--max-block`, `--stop-at`,
 `--load-only`, `--dump`, `--save`, `--strict-unassigned`, `--lost-ticks`, `--clock-trace`; prints one JSON report (the
-placement, the BSP's stop, state and stats, each vCPU's stop and counters). Same `Boot` underneath.
+placement, the BSP's stop, state and stats, each vCPU's stop and counters). Same `Boot` underneath. SIGINT or SIGTERM
+cancels its run as the stub's does (the report is still printed; a second one exits 130; both use
+`Canceller::on_signals`).
+
+**Performance log** (perf plan §2, "Measured (chunk 1)"; off by default): `NATEMU_PERF_LOG=FILE` on `natemu-host
+boot-linux` or the `natemu` stub turns on the library's timing log (`crates/host/src/perf.rs`, `natemu::perf::enable`
+for an embedder): FILE gets one `mark NAME NS` line per process phase (both entries: `main`, `run`, `disk_open`,
+`server_startN`, `first_entryN`, `cancel`, `disk_written`, `destroyed`; `boot-linux` only: `prepared`, `report`, `exit`) and one `vcpu {JSON}` line per
+vCPU at its end (host time by loop part and exit kind, the translation-request parts, thread CPU, its fexc server's CPU
+from `wait4`, the resident's buckets, K1 statistics, counters); FILE.vN one line per translation request of vCPU N (CR3,
+RIP, guest-physical page, result, answer source, bytes read and their hash, nanoseconds per part), at most 1 GiB per
+file (later lines counted as `dropped`); failed writes are counted, the first reported on standard error, and both
+appear in each vCPU's line (`"log"`) and as a warning at its end. A resident built with `perf` but run with the log off
+draws a warning after the run. Times are
+`CLOCK_UPTIME_RAW` nanoseconds (= `mach_absolute_time` = the guest's CNTVCT). The resident's buckets need the runtime
+built with its `perf` feature, into its own target directory so the default build stays as it is:
+`CARGO_TARGET_DIR=target/perf cargo +1.97.0 build --offline --locked --release -p natemu-runtime --target
+aarch64-unknown-none --features perf` (without it they read zero, `"magic":false`); a runner that builds its own
+resident gets it with `CARGO_TARGET_DIR=target/perf` and `CARGO_TARGET_AARCH64_UNKNOWN_NONE_RUSTFLAGS` set to
+`.cargo/config.toml`'s flags plus `--cfg feature="perf"` (not `RUSTFLAGS`: it replaces the linker script flag). The default runtime's `.text` is
+byte-identical with and without this code (only panic-location line numbers in `.rodata` move). The harness and
+analysis (`boot.py`, `analyze.py`, `aggregate.py`, `campaign.sh`) are in `natemu-raw/perf1-20261103-01/`.
 
 ## 2. Manifest inputs
 

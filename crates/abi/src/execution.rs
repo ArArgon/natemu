@@ -1733,6 +1733,70 @@ const _: () = assert!(MMIO_OFFSET + core::mem::size_of::<Mmio>() <= STATE_OFFSET
 const _: () = assert!(STATE_OFFSET + 4096 <= FRAME_OFFSET);
 const _: () = assert!(STAGING_OFFSET + STAGING_BYTES <= crate::resident::TEXT_OFFSET);
 
+/// Performance phase, first chunk (`docs/restructure/perf-plan.md` §2): where a vCPU's time goes inside the VM, kept by
+/// a resident built with its `perf` feature (the default build has none of it: no code, no record writes). Every
+/// moment from the resident's start belongs to one bucket: `current` is charged CNTVCT ticks up to each switch, so the
+/// buckets add up to the time since `since` was first set. A switch to an entry kind counts it. The host reads the
+/// record after the run (all zero from a default resident). A record of its own in the state page.
+pub mod perf {
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct Perf {
+        /// [`MAGIC`] once a `perf` resident started.
+        pub magic: u64,
+        /// CNTVCT of the last switch and the bucket charged since.
+        pub since: u64,
+        pub current: u64,
+        pub ticks: [u64; BUCKETS],
+        pub count: [u64; BUCKETS],
+    }
+    pub const MAGIC: u64 = 0x7065_7266_0001;
+    pub const BUCKETS: usize = 24;
+    pub const OFFSET: usize = super::STATE_OFFSET + 0xe40;
+    pub const VA: u64 = crate::PRIVATE + OFFSET as u64;
+    const _: () = assert!(super::MMIO_OFFSET + size_of::<super::Mmio>() <= OFFSET);
+    const _: () = assert!(OFFSET + size_of::<Perf>() <= super::STATE_OFFSET + 4096);
+    /// The resident's start to its first block; generated code (EL0); a host exit (`hvc` to the next instruction after
+    /// it: HVF's exit and entry and the host's work); HLT parked (`wfi` and its wake-up loop); an AP's mailbox wait.
+    pub const START: u64 = 0;
+    pub const GUEST: u64 = 1;
+    pub const HOST: u64 = 2;
+    pub const HALTED: u64 = 3;
+    pub const MAILBOX: u64 = 4;
+    /// Resident entries from generated code, by kind (`returned`): a literal exit (linker), a dispatcher miss, a 128/64
+    /// division, an x87 or string helper, a patched-exit stop, a doorbell, an abort (shadow misses, faults, traps).
+    pub const LINK: u64 = 5;
+    pub const MISS: u64 = 6;
+    pub const DIVISION: u64 = 7;
+    pub const HELPER: u64 = 8;
+    pub const STOP: u64 = 9;
+    pub const IRQ: u64 = 10;
+    pub const ABORT: u64 = 11;
+    /// Work inside those (each charged alone, not to the entry around it): placing a block or decode; a system
+    /// instruction's transaction; a TLB flush (CR3 load, global flush: shadow reset and blocks no longer current); an
+    /// event's delivery through the IDT (#PF and every other); a revalidation walk of a block no longer current; a
+    /// shadow-miss walk; a fetch walk for a request (with its page mark); waiting for peers' shadow resets at a mark.
+    pub const PLACE: u64 = 12;
+    pub const SYSTEM: u64 = 13;
+    pub const TLB: u64 = 14;
+    pub const DELIVERY: u64 = 15;
+    pub const REVALIDATE: u64 = 16;
+    pub const SHADOW: u64 = 17;
+    pub const FETCH: u64 = 18;
+    pub const SHOOTDOWN: u64 = 19;
+    /// The block search of a miss or exit (`cache::lookup`, revalidation walks not included); patching an exit to its
+    /// target (`cache::link`, cache maintenance included); entering a block from the bank (`enter`: flag bytes, frame,
+    /// state record, shadow-space selection).
+    pub const LOOKUP: u64 = 20;
+    pub const PATCH: u64 = 21;
+    pub const ENTER: u64 = 22;
+    /// Clearing the dispatcher's L1 (its code rewritten and synchronized) when the code context changes (`select_l1`).
+    pub const L1: u64 = 23;
+    pub const NAMES: [&str; BUCKETS] = ["start", "guest", "host", "halted", "mailbox", "link", "miss", "division", "helper",
+        "stop", "irq", "abort", "place", "system", "tlb", "delivery", "revalidate", "shadow", "fetch", "shootdown",
+        "lookup", "patch", "enter", "l1"];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

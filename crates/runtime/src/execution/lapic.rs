@@ -166,7 +166,9 @@ fn controller(s: &mut State, eoi: bool, value: u64) -> u64 {
         write_record(exchange, Mmio { write: u64::from(eoi), value, completed: saved.completed, ..Mmio::default() });
         (s.request, s.reply) = (REQUEST_IRQ, NONE);
         copy_record(record().cast(), (&raw const *s).cast(), bytes);
+        let p = crate::perf::enter(crate::perf::HOST);
         asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
+        crate::perf::leave(p);
         copy_record((&raw mut *s).cast(), record().cast(), bytes);
         s.request = NONE;
         let m = read_record(exchange);

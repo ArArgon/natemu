@@ -261,7 +261,9 @@ pub fn fill_head(dispatcher: &[u8]) {
 pub fn select_l1(context: u64) {
     let c = control();
     if c.l1_context != context {
+        let p = crate::perf::enter(crate::perf::L1);
         clear_l1();
+        crate::perf::leave(p);
         c.l1_context = context;
     }
 }

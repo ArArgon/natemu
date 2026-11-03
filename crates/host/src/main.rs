@@ -5,23 +5,10 @@
 //!
 //! COM1's output goes to `--serial FILE` (default standard output). The stop of the vCPU that ended the run is written to
 //! standard error. Exits 0 when the guest powered off, 2 at any other stop (SIGINT or SIGTERM cancels the run: `Cancelled`;
-//! a second one exits 130 at once), 1 on a host error (a failed serial write included).
+//! a second one exits 130 at once), 1 on a host error (a failed serial write included). `NATEMU_PERF_LOG=FILE` turns on
+//! the library's timing log (`natemu::perf`).
 use natemu::execution::Stop;
 use natemu::linux::Boot;
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
-
-const SIGINT: i32 = 2;
-const SIGTERM: i32 = 15;
-unsafe extern "C" {
-    fn signal(signal: i32, handler: extern "C" fn(i32)) -> usize;
-    fn _exit(status: i32) -> !;
-}
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-extern "C" fn interrupted(_: i32) {
-    if INTERRUPTED.swap(true, SeqCst) {
-        unsafe { _exit(130) };
-    }
-}
 
 const USAGE: &str = "usage: natemu RUNTIME.elf FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--vcpus N] [--serial FILE]";
 /// Largest image or initrd read (the boot protocol's 32-bit sizes).
@@ -39,6 +26,11 @@ fn boot(args: &[String]) -> natemu::Result<Stop> {
     let [_, runtime, fexc, image, options @ ..] = args else {
         return Err(USAGE.into());
     };
+    // Performance phase (perf plan §2): the library's timing log (`natemu::perf`), off unless set.
+    if let Some(path) = std::env::var_os("NATEMU_PERF_LOG") {
+        natemu::perf::enable(path)?;
+        natemu::perf::mark("main");
+    }
     let mut boot = Boot::new(runtime, fexc, natemu::memory::read_input(image, MAX_INPUT)?);
     boot.compile_cache = natemu::compile_cache::Config::from_env()?;
     boot.serial = Some(Box::new(std::io::stdout()));
@@ -54,19 +46,9 @@ fn boot(args: &[String]) -> natemu::Result<Stop> {
             _ => return Err(USAGE.into()),
         }
     }
-    // SIGINT/SIGTERM cancel the run (a second one exits at once); the handler only sets a flag, a thread acts on it.
+    // SIGINT/SIGTERM cancel the run (a second one exits at once).
     let prepared = boot.prepare()?;
-    let canceller = prepared.canceller();
-    unsafe {
-        signal(SIGINT, interrupted);
-        signal(SIGTERM, interrupted);
-    }
-    std::thread::spawn(move || {
-        while !INTERRUPTED.load(SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        canceller.cancel();
-    });
+    prepared.canceller().on_signals();
     // The stop of the vCPU whose end ended the run (any vCPU may power off), else the BSP's.
     let mut outcome = prepared.run()?;
     if let Some(e) = prepared.serial_error() {

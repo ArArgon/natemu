@@ -339,6 +339,7 @@ impl Drop for DiskCache {
         if let Some(t) = self.thread.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = t.join();
         }
+        crate::perf::mark("disk_written");
     }
 }
 
@@ -415,6 +416,7 @@ pub fn shared(fexc: &Path, config: &Config) -> Result<Option<Arc<DiskCache>>, St
     }
     match DiskCache::open(dir, fexc, cap) {
         Ok(cache) => {
+            crate::perf::mark("disk_open");
             eprintln!("compile cache: {} ({} entries, {:.1} MiB, cap {} MiB)", dir.display(), cache.entries, cache.bytes as f64 / 1048576.0, cap >> 20);
             let cache = Arc::new(cache);
             *shared = (Arc::downgrade(&cache), Some(wanted));

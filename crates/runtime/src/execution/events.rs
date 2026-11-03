@@ -183,6 +183,7 @@ pub(super) fn bit_test(s: &mut State, i: System) -> Result<(), Exception> {
 /// frame holds the RIP after the HLT). Each wake acknowledges every pending doorbell (IRQs stay masked at EL1; a pending
 /// one still ends `wfi`) and takes this vCPU's invalidations. The host's end request stops the vCPU `halted` here.
 pub(super) fn park(s: &mut State) {
+    let p = crate::perf::enter(crate::perf::HALTED);
     // A stop a doorbell asked for while this vCPU ran to its HLT is served here, at the boundary after the HLT.
     served(s);
     unsafe { write_record(record(), *s) };
@@ -216,6 +217,7 @@ pub(super) fn park(s: &mut State) {
         lapic::wait(s);
     }
     halted.store(0, SeqCst);
+    crate::perf::leave(p);
 }
 /// Doorbells that woke a waiting vCPU count as one stop taken at a resident entry (the others merged into it): the host's
 /// kickers wait for one, so it is made visible at once.
@@ -246,6 +248,7 @@ fn doorbells(s: &mut State) {
 /// after the wakeup); the host's end request is read before the mailbox, so a command written before the decision to
 /// end (by a vCPU that then halted) is still served.
 pub(super) fn wait_mailbox(s: &mut State) {
+    let from = crate::perf::enter(crate::perf::MAILBOX);
     let gpa = s.mailbox;
     let Some(p) = guest_ram().range(gpa, 16).filter(|_| gpa % 4096 == 0) else { halt(s, stop::UNSUPPORTED_MODE) };
     let (halted, posts, end) = (word(s, core::mem::offset_of!(Events, halted)), word(s, core::mem::offset_of!(Events, posts)),
@@ -280,6 +283,7 @@ pub(super) fn wait_mailbox(s: &mut State) {
             }
             unsafe { core::sync::atomic::AtomicU16::from_ptr(p.cast()) }.store(0, SeqCst);
             cache::rechecked(gpa);
+            crate::perf::leave(from);
             return;
         }
         if ending {

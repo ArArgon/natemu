@@ -201,7 +201,9 @@ fn refill(s: &mut State) {
     let bytes = size_of::<State>();
     unsafe {
         copy_record(record().cast(), (&raw const *s).cast(), bytes);
+        let p = crate::perf::enter(crate::perf::HOST);
         asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
+        crate::perf::leave(p);
         copy_record((&raw mut *s).cast(), record().cast(), bytes);
     }
     s.request = NONE;

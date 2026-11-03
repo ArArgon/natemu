@@ -89,6 +89,7 @@ fn halt(s: &State, reason: u64) -> ! {
 }
 
 pub unsafe fn start() -> ! {
+    crate::perf::start();
     let mut s = unsafe { load() };
     if s.cpu.control().is_none() || s.request != NONE || s.vcpu >= s.vcpus || s.vcpus as usize > cache::MAX_VCPUS {
         // Before anything is shadowed or marked (and before the vCPU number is known to be valid).
@@ -175,7 +176,10 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
         }
         let context = s.cpu.code_context();
         cache::select_l1(context);
-        let block = match cache::lookup(s.cpu.rip, context, |b| mapped(s, b)) {
+        let p = crate::perf::enter(crate::perf::LOOKUP);
+        let found = cache::lookup(s.cpu.rip, context, |b| mapped(s, b));
+        crate::perf::leave(p);
+        let block = match found {
             // K2: a system instruction's decode, kept when it was translated: executed with no host exit.
             Some(b) if b.flags & cache::SYSTEM != 0 => {
                 s.l2_hits += 1;
@@ -191,7 +195,10 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
             None => match (s.generation, unsafe { request(s, REQUEST_TRANSLATE) }) {
                 (missed, Reply::Block(h)) => {
                     s.requests += 1;
-                    let Some(block) = cache::place(&h, STAGING_VA as *const u8, context, s.source_gpa, s.link_points, s.dispatch_exit, s.rep_exits) else {
+                    let p = crate::perf::enter(crate::perf::PLACE);
+                    let placed = cache::place(&h, STAGING_VA as *const u8, context, s.source_gpa, s.link_points, s.dispatch_exit, s.rep_exits);
+                    crate::perf::leave(p);
+                    let Some(block) = placed else {
                         // Full: flush (which also drops this vCPU's marks) and miss again; an empty cache holds any block.
                         if flushed {
                             halt(s, stop::BAD_REPLY)
@@ -213,7 +220,10 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
                         // Crossing into a second page: at least up to its first byte, so INVLPG of either page covers it
                         // (some kinds, e.g. #UD forms, do not use `length`).
                         let bytes = if s.source_gpa[1] == u64::MAX { instruction.length } else { instruction.length.max(4097 - (s.cpu.rip & 4095) as u32) };
-                        let Some(record) = cache::place_system(s.cpu.rip, context, s.source_gpa, bytes, &instruction) else {
+                        let p = crate::perf::enter(crate::perf::PLACE);
+                        let placed = cache::place_system(s.cpu.rip, context, s.source_gpa, bytes, &instruction);
+                        crate::perf::leave(p);
+                        let Some(record) = placed else {
                             if flushed {
                                 halt(s, stop::BAD_REPLY)
                             }
@@ -435,7 +445,12 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             Some(_) if target.flags & cache::STEP != 0 => {}
             // S4: nor a block at an armed instruction breakpoint.
             Some(_) if at_breakpoint(&s.cpu, target) => {}
-            Some(source) => match cache::link(source, target) {
+            Some(source) => match {
+                let p = crate::perf::enter(crate::perf::PATCH);
+                let linked = cache::link(source, target);
+                crate::perf::leave(p);
+                linked
+            } {
                 cache::Link::Linked(n) => s.links += n,
                 cache::Link::Full => s.full_links += 1,
                 cache::Link::Bad => halt(&s, stop::BAD_LINK),
@@ -475,7 +490,9 @@ unsafe fn request(s: &mut State, kind: u64) -> Reply {
             s.request = kind;
             s.reply = NONE;
             write_record(record(), *s);
+            let p = crate::perf::enter(crate::perf::HOST);
             asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
+            crate::perf::leave(p);
             *s = load();
         }
         if s.reply != REPLY_NEXT_PAGE {
@@ -557,6 +574,7 @@ fn link_point(h: &Header, p: &LinkPoint) -> bool {
 /// Walks the fetch of `va` (its page) for a request into `s.fetch[i]` (or its failure into `s.fetch_fault`); for a block,
 /// marks it ([`mark`]).
 fn fetch_page(s: &mut State, va: u64, i: usize, block: bool) {
+    let p = crate::perf::enter(crate::perf::FETCH);
     match fetch_walk(s, va) {
         Ok((gpa, _)) => {
             s.fetch[i] = gpa;
@@ -566,6 +584,7 @@ fn fetch_page(s: &mut State, va: u64, i: usize, block: bool) {
         }
         Err(fault) => s.fetch_fault = fault,
     }
+    crate::perf::leave(p);
 }
 /// The guest-physical page `va` is fetched from and whether its leaf is global (the walk sets A bits like the CPU's), or
 /// why not ([`fetch`]). A walk
@@ -591,6 +610,12 @@ fn fetch_walk(s: &mut State, va: u64) -> Result<(u64, bool), [u64; 3]> {
 /// after a TLB miss: A bits set, any fault meaning no): `Some(global)`, global when every leaf is and CR4.PGE is set.
 /// The walk's A writes may invalidate `b` ([`cache::lookup`] looks again).
 fn mapped(s: &mut State, b: &Block) -> Option<bool> {
+    let p = crate::perf::enter(crate::perf::REVALIDATE);
+    let current = revalidated(s, b);
+    crate::perf::leave(p);
+    current
+}
+fn revalidated(s: &mut State, b: &Block) -> Option<bool> {
     let mut global = s.cpu.cr4 & CR4_PGE != 0;
     for (k, &gpa) in b.source_gpa.iter().enumerate() {
         if gpa != u64::MAX {
@@ -639,10 +664,12 @@ fn mark(s: &mut State, gpa: u64) {
         }
         s.shootdowns += 1;
         cache::ask_shadows(p);
+        let from = crate::perf::enter(crate::perf::SHOOTDOWN);
         while cache::resets_of(p) == count && cache::marked(gpa) {
             take_invalidations(s);
             core::hint::spin_loop();
         }
+        crate::perf::leave(from);
     }
 }
 
@@ -675,6 +702,7 @@ fn flush(s: &mut State) {
 /// K1: a TLB flush (a CR3 load; `global`: a paging control change or an MTRR write, global entries too): every shadow
 /// goes (the data TLB) and blocks no longer current leave L1 and their links ([`cache::tlb`]); no translation is dropped.
 fn tlb(s: &mut State, global: bool) {
+    let p = crate::perf::enter(crate::perf::TLB);
     let t0 = ticks();
     match cache::tlb(global) {
         Some(n) => s.unlinks += n,
@@ -682,6 +710,7 @@ fn tlb(s: &mut State, global: bool) {
     }
     reset_shadows(s);
     cache::control().tlb_ticks += ticks() - t0;
+    crate::perf::leave(p);
 }
 fn ticks() -> u64 {
     let t: u64;
@@ -713,6 +742,7 @@ fn reset_shadows(s: &mut State) {
 /// every entry and never read back, so the bank stays authoritative: a guest store into the page (the documented
 /// deviation) changes only what that vCPU's own prefixed accesses use until the next `enter`.
 unsafe fn enter(mut s: State, block: &Block) -> ! {
+    crate::perf::enter(crate::perf::ENTER);
     uncached_end(&mut s);
     served(&mut s);
     s.mid_string = 0; // the next resident entry is at another boundary
@@ -753,6 +783,7 @@ unsafe fn enter(mut s: State, block: &Block) -> ! {
         let entry = &raw mut (*shared()).initial;
         write_record(entry, f);
         tables::select(s.cpu.cpl);
+        crate::perf::enter(crate::perf::GUEST);
         enter_allocated(entry, block.entry(), BLOCK_SPSR | nzcv, alignment_check(&s.cpu))
     }
 }
@@ -766,6 +797,17 @@ pub unsafe fn returned(frame: &NativeFrame, kind: u64) -> ! {
         let (esr, far, elr, spsr): (u64, u64, u64, u64);
         asm!("mrs {0}, esr_el1", "mrs {1}, far_el1", "mrs {2}, elr_el1", "mrs {3}, spsr_el1",
              out(reg) esr, out(reg) far, out(reg) elr, out(reg) spsr);
+        // The performance log: this entry's kind, charged from here (the disarm and a watch step included).
+        #[cfg(feature = "perf")]
+        crate::perf::enter(match (kind, esr >> 26, (esr & 0xffff) as u16) {
+            (3, ..) => crate::perf::IRQ,
+            (_, 0x3c, imm) if imm == STOP_IMM as u16 => crate::perf::STOP,
+            (_, 0x15, svc::LINK) => crate::perf::LINK,
+            (_, 0x15, svc::MISS) if elr == cache::CODE_VA + cache::DISPATCH_MISS as u64 + 4 => crate::perf::MISS,
+            (_, 0x15, svc::DIV_U | svc::DIV_S) => crate::perf::DIVISION,
+            (_, 0x15, svc::X87 | svc::STRING) => crate::perf::HELPER,
+            _ => crate::perf::ABORT,
+        });
         if !from_el0(spsr) {
             resident_fault([esr, far, elr])
         }
@@ -854,6 +896,7 @@ unsafe fn resume(s: &State, frame: *const NativeFrame, pc: u64, spsr: u64) -> ! 
         cache::control().rearms += 1;
     }
     tables::select(s.cpu.cpl);
+    crate::perf::enter(crate::perf::GUEST);
     unsafe { resume_exception(frame, pc, spsr, alignment_check(&s.cpu)) }
 }
 /// A wanted stop is served by a resident entry at a block boundary (the resident drained or will drain before the
@@ -950,6 +993,7 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
     tables::select(s.cpu.cpl);
     unsafe {
         write_record(record(), s);
+        crate::perf::enter(crate::perf::GUEST);
         resume_exception(&raw const (*shared()).captured, elr, spsr, alignment_check(&s.cpu))
     }
 }
@@ -1035,6 +1079,7 @@ const GP: [u64; 3] = [13, 0, 0];
 /// set for a general-detect #DB); INT n and INT3 are delivered as software interrupts, INTO (64-bit mode) and UD0/1/2
 /// raise #UD. IRET releases NMI blocking once past the LOCK #UD check, even when it then faults (SDM Vol.3 7.7.2).
 fn system(s: &mut State, i: System) {
+    let p = crate::perf::enter(crate::perf::SYSTEM);
     s.systems += 1;
     // A shadow covers this instruction and ends with it (X2: MOV SS and STI set theirs again in the transaction); the
     // boundary is not between REP iterations. A BT* form under alignment checking does not complete here (it is stepped).
@@ -1044,6 +1089,7 @@ fn system(s: &mut State, i: System) {
     if let Err(e) = transaction(s, i) {
         deliver(s, Event::Exception(e))
     }
+    crate::perf::leave(p);
 }
 /// [`system`]'s checks and effect: `Err` with the exception due at the instruction.
 fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
@@ -1919,7 +1965,10 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
     // among them (walked, so every fault it owes came first) takes the device path instead of a retry.
     let (mut device, mut uncached) = ([None; 2], false);
     for (k, va) in touched.into_iter().flatten().enumerate() {
-        match translate(&mut s, f, b, site, va, access) {
+        let p = crate::perf::enter(crate::perf::SHADOW);
+        let translated = translate(&mut s, f, b, site, va, access);
+        crate::perf::leave(p);
+        match translated {
             None => unsafe {
                 write_record(record(), s);
                 resume(&s, &raw const (*shared()).captured, elr, spsr)
@@ -1985,7 +2034,9 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
         guest_fault(s, f, b, stub, [17, 0, 0])
     }
     // A contended walk resumes at the stub, which takes this path again.
+    let p = crate::perf::enter(crate::perf::SHADOW);
     let gpa = [first, second].map(|va| translate(&mut s, f, b, stub, va, Access::Write));
+    crate::perf::leave(p);
     let [Some((gpa0, uc0)), Some((gpa1, uc1))] = gpa else {
         unsafe {
             write_record(record(), s);

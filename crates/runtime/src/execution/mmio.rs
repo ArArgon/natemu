@@ -86,7 +86,9 @@ unsafe fn page(s: &mut State, gpa: u64) -> u64 {
         write_record(exchange(), Mmio { gpa, completed, ..Mmio::default() });
         (s.request, s.reply) = (REQUEST_PAGE, NONE);
         write_record(record(), *s);
+        let p = crate::perf::enter(crate::perf::HOST);
         asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
+        crate::perf::leave(p);
         *s = load();
         s.request = NONE;
         if s.reply != REPLY_PAGE {
@@ -129,7 +131,9 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
             (s.request, s.reply) = (REQUEST_DEVICE, NONE);
             write_record(record(), s);
             // Every earlier access of this vCPU is complete before the device sees this one (x86 UC ordering).
+            let p = crate::perf::enter(crate::perf::HOST);
             asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
+            crate::perf::leave(p);
             s = load();
             s.request = NONE;
             let m = read_record(exchange());

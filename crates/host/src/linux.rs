@@ -160,6 +160,36 @@ impl Canceller {
     pub fn cancel(&self) {
         owners::cancel_owners(&self.0);
     }
+    /// SIGINT and SIGTERM cancel the run from now on (a second one exits the process at once with 130): the handler only
+    /// sets a flag, a detached thread acts on it (`cancel` in the performance log). For a process's command-line entry
+    /// (the `natemu` stub, the test driver's `boot-linux`); once per process.
+    pub fn on_signals(self) {
+        static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+        extern "C" fn interrupted(_: i32) {
+            unsafe extern "C" {
+                fn _exit(status: i32) -> !;
+            }
+            if INTERRUPTED.swap(true, SeqCst) {
+                unsafe { _exit(130) };
+            }
+        }
+        unsafe extern "C" {
+            fn signal(signal: i32, handler: extern "C" fn(i32)) -> usize;
+        }
+        const SIGINT: i32 = 2;
+        const SIGTERM: i32 = 15;
+        unsafe {
+            signal(SIGINT, interrupted);
+            signal(SIGTERM, interrupted);
+        }
+        std::thread::spawn(move || {
+            while !INTERRUPTED.load(SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            crate::perf::mark("cancel");
+            self.cancel();
+        });
+    }
 }
 
 /// How a run ended.
@@ -183,6 +213,7 @@ impl Prepared {
         if self.ran.swap(true, SeqCst) {
             return Err("this boot already ran: prepare a new one".into());
         }
+        crate::perf::mark("run");
         let (backing, vcpus) = (&self.backing, self.backing.n);
         let machine = Machine::create(backing.memory.clone())?;
         self.irqs.attach(machine.doorbell());
@@ -195,24 +226,48 @@ impl Prepared {
         };
         let ended_first = AtomicUsize::new(usize::MAX);
         let body = |v: usize, cpu: &Vcpu, cancelled: &AtomicBool| -> Result<(Stop, u64)> {
+            let start = crate::perf::now();
             let mut compiler = Compiler::new(&self.fexc, cpu, self.max_block)?;
             compiler.disk = compile_cache::shared(&self.fexc, &self.compile_cache)?; // P3: the persistent compile cache
+            compiler.perf = crate::perf::Recorder::new(v, start)?;
             let mut requests = execution::Requests { devices: Some(self.devices.clone()), ..Default::default() };
             let stop_at = if v == 0 { self.stop_at } else { None };
             let stop = execution::run(cpu, backing.vcpu(v), &mut compiler, stop_at, self.watchdog, &mut requests, &stops, cancelled, &mut ());
+            let end = crate::perf::now();
             stops.end(v);
             // X4: one vCPU's end ends the machine's run; the first to end (not cancelled) is reported as the run's cause.
             if !matches!(stop, Ok(Stop::Cancelled)) {
                 let _ = ended_first.compare_exchange(usize::MAX, v, SeqCst, SeqCst);
             }
             owners::cancel_owners(cancelled);
+            if let Some(log) = compiler.perf.take() {
+                let fexc = compiler.finish();
+                let area = backing.vcpu(v);
+                let s: State = area.read_record(exec::STATE_OFFSET);
+                let state = format!(
+                    "{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"invalidations\":{},\"steps\":{},\"shootdowns\":{},\"systems\":{},\"halts\":{},\"interrupts\":{},\"deliveries\":{},\"stops\":{},\"shadow_resets\":{},\"compiles\":{},\"hits\":{},\"disk_hits\":{}}}",
+                    s.blocks, s.l2_hits, s.requests, s.retries, s.upgrades, s.evictions, s.linker, s.links, s.unlinks, s.invalidations, s.steps,
+                    s.shootdowns, s.systems, s.halts, s.interrupts, s.deliveries, s.stops, execution::shadow_resets(area), compiler.compiles,
+                    compiler.hits, compiler.disk_hits
+                );
+                match log.finish(end, fexc, &area.read_record(exec::perf::OFFSET), &execution::k1_stats(area), &state) {
+                    (0, 0) => {}
+                    (failed, dropped) => eprintln!("natemu: performance log of vCPU {v}: {failed} failed writes so far, {dropped} request lines past the cap"),
+                }
+            }
             Ok((stop?, compiler.compiles))
         };
         let supervision = owners::supervise(vcpus, &prepare, &body, &self.cancel);
         self.end();
         let destroyed = machine.destroy();
+        crate::perf::mark("destroyed");
         let supervision = supervision?;
         hv(destroyed, "destroy VM")?;
+        // A resident built with its `perf` feature keeps its accounting on every entry whether or not anything reads it:
+        // say so when the log is off (read after the run, never on its path).
+        if !crate::perf::on() && (0..vcpus).any(|v| backing.vcpu(v).read_record::<exec::perf::Perf>(exec::perf::OFFSET).magic == exec::perf::MAGIC) {
+            eprintln!("natemu: the resident was built with its `perf` feature but the performance log is off (NATEMU_PERF_LOG): its accounting slows every resident entry");
+        }
         if let Some(e) = supervision.error {
             return Err(e);
         }

@@ -535,8 +535,11 @@ pub enum Stop {
 /// One `fexc --serve` process (protocol in tools/fexc/fexc.cpp): length-prefixed requests and replies on its stdin/stdout.
 struct Server {
     child: Child,
-    stdin: ChildStdin,
+    /// `None` once [`Server::finish`] closed it.
+    stdin: Option<ChildStdin>,
     stdout: ChildStdout,
+    /// [`Server::finish`] reaped it.
+    reaped: bool,
 }
 impl Server {
     fn start(fexc: &Path) -> Result<Self> {
@@ -556,14 +559,16 @@ impl Server {
             .spawn()
             .map_err(|e| format!("fexc --serve: {e}"))?;
         let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
-        Ok(Self { child, stdin, stdout })
+        crate::perf::mark(&format!("server_start{}", std::thread::current().name().unwrap_or("").trim_start_matches("vcpu-")));
+        Ok(Self { child, stdin: Some(stdin), stdout, reaped: false })
     }
     /// The server's reply to one request body; a `TimedOut` error when the whole reply has not arrived by `deadline`. (The
     /// request itself is written without a deadline: a body is at most a few KiB, which the pipe takes whether or not the
     /// server reads.)
     fn request(&mut self, body: &[u8], deadline: Instant) -> std::io::Result<Reply> {
-        self.stdin.write_all(&(body.len() as u32).to_le_bytes())?;
-        self.stdin.write_all(body)?;
+        let stdin = self.stdin.as_mut().ok_or_else(|| std::io::Error::other("fexc --serve: closed"))?;
+        stdin.write_all(&(body.len() as u32).to_le_bytes())?;
+        stdin.write_all(body)?;
         let mut word = [0; 4];
         self.read_by(&mut word, deadline)?;
         let mut reply = vec![0; u32::from_le_bytes(word) as usize];
@@ -623,10 +628,50 @@ impl Server {
         format!("fexc --serve (pid {pid}) failed, still running: {e}")
     }
 }
+impl Server {
+    /// Closes its stdin (EOF ends `fexc --serve`) and reaps it: its user and system CPU nanoseconds and maximum resident
+    /// bytes (`wait4`'s rusage; the performance log).
+    fn finish(&mut self) -> Option<(u64, u64, u64)> {
+        #[repr(C)]
+        struct Rusage {
+            user: [i64; 2],
+            system: [i64; 2],
+            max_rss: i64,
+            rest: [i64; 13],
+        }
+        unsafe extern "C" {
+            fn wait4(pid: i32, status: *mut i32, options: i32, rusage: *mut Rusage) -> i32;
+        }
+        const WNOHANG: i32 = 1;
+        self.stdin = None;
+        let (pid, mut status, mut r) = (self.child.id() as i32, 0, Rusage { user: [0; 2], system: [0; 2], max_rss: 0, rest: [0; 13] });
+        // EOF ends it at once; one that does not end within a second is killed (its CPU time is still reported).
+        let mut waited = 0;
+        loop {
+            match unsafe { wait4(pid, &mut status, if waited < 1000 { WNOHANG } else { 0 }, &mut r) } {
+                0 => {
+                    if waited == 1000 {
+                        let _ = self.child.kill();
+                    } else {
+                        std::thread::sleep(Duration::from_millis(1));
+                        waited += 1;
+                    }
+                }
+                n if n == pid => break,
+                _ => return None,
+            }
+        }
+        self.reaped = true;
+        let ns = |t: [i64; 2]| t[0] as u64 * 1_000_000_000 + (t[1] as i32) as u64 * 1000;
+        Some((ns(r.user), ns(r.system), r.max_rss as u64))
+    }
+}
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -750,6 +795,8 @@ pub struct Compiler {
     /// The vCPU's x87 gating and rounding (I6, [`x87_args`]) and its unmasked floating-point exceptions (I5c): fexc's
     /// `--x87-gated`, `--wait-gated`, `--x87-fpcr`, `--simd-unmasked` and `--x87-unmasked` arguments.
     pub(crate) x87: Vec<String>,
+    /// The performance log's record of this vCPU (`perf::on`; [`Compiler::finish`]).
+    pub perf: Option<Box<crate::perf::Recorder>>,
 }
 /// fexc's x87 arguments for `cpu` (I6; SDM Vol.3 Table 2-2): every x87 form #NM under CR0.EM or CR0.TS, WAIT/FWAIT under CR0.TS
 /// with CR0.MP; x87 arithmetic under its own FPCR when FCW.RC or MXCSR's flush-to-zero/DAZ differ ([`exec::x87_fpcr`]); and
@@ -789,6 +836,20 @@ pub(crate) fn avx_gated(cpu: &exec::Cpu) -> bool {
 /// (S3h: at most 13.4 ms, server start included, over 6,080 vCPU runs of the corpora at N = 4 and N = 2 with block size 1).
 pub const COMPILE_DEADLINE: Duration = Duration::from_secs(30);
 impl Compiler {
+    /// Now, when the performance log records this vCPU (else 0, unread).
+    fn stamp(&self) -> u64 {
+        if self.perf.is_some() { crate::perf::now() } else { 0 }
+    }
+    /// Charges the time since `since` to the current request's part `k` ([`crate::perf::Recorder::add`]).
+    fn charge(&mut self, k: usize, since: u64) {
+        if let Some(r) = &mut self.perf {
+            r.add(k, since);
+        }
+    }
+    /// The run's end for the performance log: its server's CPU time (its stdin closed, reaped by `wait4`).
+    pub fn finish(&mut self) -> Option<(u64, u64, u64)> {
+        self.server.as_mut().and_then(Server::finish)
+    }
     pub fn new(fexc: &Path, cpu: &Vcpu, max_instructions: Option<u32>) -> Result<Self> {
         let mut id = [0; admission::ID_REGISTERS.len()];
         for (value, (name, reg)) in id.iter_mut().zip(admission::ID_REGISTERS) {
@@ -798,7 +859,7 @@ impl Compiler {
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
         Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), cached: 0, disk: None, compiles: 0, hits: 0, disk_hits: 0,
-               deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![] }
+               deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![], perf: None }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
     /// `rip` the resident executes, or fexc's end reason when it produced no code.
@@ -832,13 +893,22 @@ impl Compiler {
     /// than its n guest instructions ([`admission::retry`]).
     fn compile_once(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>, hook: &mut impl Hook) -> Result<std::result::Result<Code, (u32, &'static str)>> {
         let (key, gating) = ((rip, limit), self.gating());
-        let index = match self.cache.get(&key).and_then(|v| v.iter().position(|e| e.matches(bytes, &gating))) {
+        let t = self.stamp();
+        let found = self.cache.get(&key).and_then(|v| v.iter().position(|e| e.matches(bytes, &gating)));
+        self.charge(crate::perf::LOOKUP, t);
+        let index = match found {
             Some(i) => {
                 self.hits += 1;
+                if let Some(r) = &mut self.perf {
+                    let prefix = &self.cache[&key][i].prefix;
+                    r.sources[0] += 1;
+                    r.read = (hash(prefix), prefix.len() as u32);
+                }
                 i
             }
             None => {
                 let reply = self.ask(bytes, rip, limit, hook)?;
+                let t = self.stamp();
                 // ponytail: wholesale reset at a size cap; a real eviction policy when runs outgrow it
                 if self.cached >= 1 << 16 {
                     self.cache.clear();
@@ -849,9 +919,24 @@ impl Compiler {
                 let entries = self.cache.entry(key).or_default();
                 entries.push(Entry { read, gating, prefix, whole, answer: Answer::new(reply, rip)? });
                 self.cached += 1;
-                entries.len() - 1
+                let kept = entries.len() - 1;
+                self.charge(crate::perf::KEEP, t);
+                if let Some(r) = &mut self.perf {
+                    let prefix = &self.cache[&key][kept].prefix;
+                    r.read = (hash(prefix), prefix.len() as u32);
+                }
+                kept
             }
         };
+        let t = self.stamp();
+        let code = self.answered(key, index, bytes, rip, hook);
+        let part = if matches!(code, Ok(Ok(Code::Block(_)))) { crate::perf::ADMIT } else { crate::perf::DECODE };
+        self.charge(part, t);
+        code
+    }
+    /// [`Compiler::compile_once`]'s use of the answer kept at `index` under `key`: admitted, or decoded.
+    #[cfg_attr(not(feature = "testing"), allow(unused_variables))]
+    fn answered(&mut self, key: (u64, Option<u32>), index: usize, bytes: &[u8], rip: u64, hook: &mut impl Hook) -> Result<std::result::Result<Code, (u32, &'static str)>> {
         Ok(match &self.cache[&key][index].answer {
             Answer::Object(object) => match admission::retry(object) {
                 Some(n) => Err(n),
@@ -926,12 +1011,19 @@ impl Compiler {
     }
     /// fexc's reply to the request for `bytes` at `rip`: from the persistent cache, else from the server (then stored).
     fn ask(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>, _hook: &mut impl Hook) -> Result<Reply> {
+        let t = self.stamp();
         let body = self.body(bytes, rip, limit);
         let stored = self.disk.as_ref().filter(|d| !d.is_empty()).and_then(|d| d.get(&d.key(&body)));
-        if let Some(reply) = stored.and_then(|p| Reply::from_payload(&p)).filter(|r| r.code < 2) {
+        let stored = stored.and_then(|p| Reply::from_payload(&p)).filter(|r| r.code < 2);
+        self.charge(crate::perf::DISK_GET, t);
+        if let Some(reply) = stored {
             self.disk_hits += 1;
+            if let Some(r) = &mut self.perf {
+                r.sources[1] += 1;
+            }
             return Ok(reply);
         }
+        let t = self.stamp();
         if self.server.is_none() {
             self.server = Some(Server::start(&self.fexc)?);
         }
@@ -949,14 +1041,27 @@ impl Compiler {
         };
         self.slowest = self.slowest.max(began.elapsed());
         self.compiles += 1;
+        self.charge(crate::perf::FEXC, t);
+        if let Some(r) = &mut self.perf {
+            r.sources[2] += 1;
+        }
         if reply.code >= 2 {
             return Err(format!("fexc failed at {rip:#x}: {}", String::from_utf8_lossy(&reply.json)));
         }
+        let t = self.stamp();
         if let Some(disk) = &self.disk {
             disk.put(body, rip >> 63 != 0, reply.payload());
         }
+        self.charge(crate::perf::DISK_PUT, t);
         Ok(reply)
     }
+}
+/// The performance log's hash of the guest bytes an answer read.
+fn hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
 }
 /// `guest.end.reason` of fexc's report.
 fn end_reason(json: &crate::json::Value) -> Option<&str> {
@@ -1144,15 +1249,24 @@ fn serve(
     // The host's own stop, once decided: the vCPU was told to park (it drops its shadows first).
     let mut parked = None;
     let v = area.vcpu;
+    // The performance log: each part of the loop is charged to its kind (`perf::Recorder::lap`).
+    let lap = |compiler: &mut Compiler, k: usize| {
+        if let Some(r) = &mut compiler.perf {
+            r.lap(k);
+        }
+    };
     loop {
         if cancelled.load(SeqCst) {
             return Ok(Stop::Cancelled);
         }
         let _ = running.send(true);
         stops.in_host[v].store(false, SeqCst);
+        lap(compiler, crate::perf::SIGNAL);
         let exit = cpu.run_until_exit();
+        lap(compiler, crate::perf::RUN);
         stops.in_host[v].store(true, SeqCst);
         let _ = running.send(false);
+        lap(compiler, crate::perf::SIGNAL);
         let exit = match exit? {
             vm::Exit::Hvc(immediate) => immediate,
             vm::Exit::Cancelled if cancelled.load(SeqCst) => return Ok(Stop::Cancelled),
@@ -1178,6 +1292,7 @@ fn serve(
         }
         refill_entropy(area);
         let mut state: State = area.read_record(exec::STATE_OFFSET);
+        lap(compiler, crate::perf::EXIT);
         let step = match state.request {
             exec::REQUEST_TRANSLATE => false,
             exec::REQUEST_STEP => true,
@@ -1191,6 +1306,7 @@ fn serve(
                 #[cfg(feature = "testing")]
                 hook.reply(ReplyKind::Device, area, &mut state);
                 area.write_record(exec::STATE_OFFSET, state);
+                lap(compiler, crate::perf::DEVICE);
                 continue;
             }
             // L3 (amendment): a read reached a non-RAM page: claimed by a device, or unassigned (all-ones shadow, counted).
@@ -1200,6 +1316,7 @@ fn serve(
                 }
                 crate::devices::serve_page(area, &mut state, requests.devices.as_deref());
                 area.write_record(exec::STATE_OFFSET, state);
+                lap(compiler, crate::perf::PAGE);
                 continue;
             }
                         // L3: a port access, made once on the port bus (never parked).
@@ -1209,6 +1326,7 @@ fn serve(
                 }
                 crate::devices::serve_port(area, &mut state, requests.devices.as_deref());
                 area.write_record(exec::STATE_OFFSET, state);
+                lap(compiler, crate::perf::PORT);
                 // L4b: power off or reset ends the run here (the driver cancels the other vCPUs).
                 match requests.devices.as_deref().map_or(0, |d| d.power()) {
                     0 => {}
@@ -1223,6 +1341,7 @@ fn serve(
                 }
                 crate::irq::serve(area, &mut state, requests.devices.as_deref());
                 area.write_record(exec::STATE_OFFSET, state);
+                lap(compiler, crate::perf::IRQ);
                 continue;
             }
             // K2: an RDRAND found the pool empty; it was topped up above.
@@ -1230,10 +1349,12 @@ fn serve(
                 requests.entropy += 1;
                 state.reply = exec::REPLY_ENTROPY;
                 area.write_record(exec::STATE_OFFSET, state);
+                lap(compiler, crate::perf::ENTROPY);
                 continue;
             }
             _ => return Err("translation exit without a request".into()),
         };
+        let (began, cr3, rip, gpa) = (compiler.stamp(), state.cpu.cr3, state.cpu.rip, state.fetch[0]);
         state.reply = match translation(area, compiler, &mut state, step, stop_at, requests, hook)? {
             Ok(reply) => reply,
             Err(stop) => {
@@ -1246,6 +1367,11 @@ fn serve(
             hook.reply(ReplyKind::Translation, area, &mut state);
         }
         area.write_record(exec::STATE_OFFSET, state);
+        lap(compiler, if step { crate::perf::STEP } else { crate::perf::TRANSLATE });
+        if let Some(r) = &mut compiler.perf {
+            r.request(cr3, rip, gpa, state.reply, crate::perf::now() - began);
+        }
+        lap(compiler, crate::perf::LOG_LINE);
     }
 }
 /// Serves one request: stages the admitted block, or decodes the system instruction at RIP, and fills `state`'s
@@ -1281,7 +1407,10 @@ fn translation(
     let mut breakpoints: Vec<u64> = state.cpu.code_breakpoints().filter(|&b| b > rip).collect();
     let (code, more, next_fault) = loop {
         let limit = breakpoints.iter().copied().chain(hooks).min();
-        let Fetched { bytes, more, next_fault } = match fetched(area, state, limit)? {
+        let t = compiler.stamp();
+        let fetched = fetched(area, state, limit)?;
+        compiler.charge(crate::perf::FETCH, t);
+        let Fetched { bytes, more, next_fault } = match fetched {
             Ok(fetched) => fetched,
             // RIP's page faults: the resident delivers it (`state.fetch_fault`); nothing is compiled.
             Err(Stop::FetchFault(Fault::Page { .. } | Fault::Noncanonical)) => return Ok(Ok(exec::REPLY_FETCH_FAULT)),
@@ -1329,6 +1458,7 @@ fn translation(
     if step && (block.guest_insns != 1 || block.guest_bytes > 15) {
         return Err(format!("step at {rip:#x}: {} instructions, {} bytes", block.guest_insns, block.guest_bytes));
     }
+    let t = compiler.stamp();
     area.copy(exec::STAGING_OFFSET, &block.object);
     state.system = exec::System::NONE;
     if !step {
@@ -1339,6 +1469,7 @@ fn translation(
     state.link_points[..block.links.len()].copy_from_slice(&block.links);
     state.dispatch_exit = block.dispatch_exit.map_or(0, u64::from);
     state.rep_exits = block.links.iter().enumerate().filter(|(_, p)| Some(p.target) == block.rep_self).fold(0, |m, (k, _)| m | 1 << k);
+    compiler.charge(crate::perf::STAGE, t);
     Ok(Ok(exec::REPLY_ADMITTED))
 }
 
@@ -1466,6 +1597,19 @@ mod tests {
         let e = block(&mut c).unwrap_err();
         assert!(e.contains("refused") && c.compiles == 0, "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// With `FEXC` set (perf plan §2): finishing reaps the server by `wait4` with its CPU time; a compiler that never
+    /// started one has none.
+    #[test]
+    fn finishing_reaps_the_server_with_its_cpu_time() {
+        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        assert_eq!(c.finish(), None);
+        assert!(matches!(c.compile(&[0x48, 0x01, 0xd8, 0xc3], 0x1000, false, &mut ()).unwrap(), Code::Block(_)));
+        let (user, system, rss) = c.finish().unwrap();
+        assert!(user + system > 0 && rss > 0, "{user} {system} {rss}");
+        assert!(c.server.as_ref().unwrap().reaped);
     }
 
     #[test]

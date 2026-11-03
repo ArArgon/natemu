@@ -75,7 +75,9 @@ fn access(s: &mut State, port: u64, size: u64, data: Option<u64>) -> u64 {
         (s.request, s.reply) = (REQUEST_PORT, NONE);
         write_record(record(), *s);
         // Every earlier access of this vCPU is complete before the device sees this one.
+        let p = crate::perf::enter(crate::perf::HOST);
         asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
+        crate::perf::leave(p);
         *s = load();
         s.request = NONE;
         let m = read_record(exchange);

@@ -11,6 +11,7 @@ use natemu_abi::guest_memory::{GuestRam, GuestTables};
 use record::*;
 mod cache;
 mod execution;
+mod perf;
 mod record;
 mod tables;
 
@@ -39,6 +40,7 @@ fn stop(status: u64, detail: u64) -> ! {
     unsafe {
         ptr::write_volatile(&raw mut (*shared()).detail, detail);
         ptr::write_volatile(&raw mut (*shared()).status, status);
+        perf::enter(perf::HOST);
         asm!("dsb sy", "hvc #0x49", "b .", options(noreturn));
     }
 }

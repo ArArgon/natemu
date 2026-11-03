@@ -20,6 +20,7 @@ mod json;
 pub mod linux;
 pub mod memory;
 pub mod owners;
+pub mod perf;
 mod pic;
 mod pit;
 pub mod pm;

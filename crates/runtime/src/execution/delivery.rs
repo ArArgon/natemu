@@ -59,7 +59,12 @@ fn class(e: Event) -> Class {
 /// Delivers `event` from the banked state; on return the bank is at the handler. A shutdown halts. Not inlined: one
 /// frame for every caller (the resident's stack bound, tools/check_resident_stack.py).
 #[inline(never)]
-pub(super) fn deliver(s: &mut State, mut event: Event) {
+pub(super) fn deliver(s: &mut State, event: Event) {
+    let p = crate::perf::enter(crate::perf::DELIVERY);
+    delivery(s, event);
+    crate::perf::leave(p);
+}
+fn delivery(s: &mut State, mut event: Event) {
     // S4: an instruction that faults or interrupts (INT n, INT3, INTO, INT1) owes no single-step trap, nor the data
     // breakpoints its unfinished accesses met.
     s.debug &= debug::TRAP;
