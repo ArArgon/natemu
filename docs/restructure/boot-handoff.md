@@ -1,68 +1,249 @@
-# Boot-phase handoff
+# Boot integration handoff
 
-Status: October 28, 2026, end of the restructuring phase ([vm-restructure.md](../vm-restructure.md), phase boundary).
-This page is enough to start the next phase (stock-kernel boot, I5); the slice contracts and the
-[contract inventory](contracts.md) hold the detail and the evidence. No performance tuning was done in this phase.
+Status: November 2, 2026, end of the boot-features phase (chunk R2 of the
+[boot-features plan](boot-features-plan.md), "the plan" below; its §4 checklist says what is met). Emulator code at 9730c4d (16b0576 adds only the R1b runner); the
+compiler is fexc **series44-r2**, rebuilt by `tools/fexc/build.sh` and byte-identical to the hand-built series43-x1 (§6).
+This page is enough to start the boot integration: how to build and run a boot, what a boot takes as input, what is
+known to cost or differ, and the standing suite. The plan's "Built (...)" paragraphs hold the detail and the evidence;
+the [contract inventory](contracts.md) maps each contract to its check. No performance tuning was done beyond the
+owner's K1 and P3 decisions.
 
-## 1. What exists
+## 1. Boot commands
 
-x86-64 guest code runs as FEX-compiled ARM64 blocks inside one Hypervisor.framework VM, at EL0 since E2, under a small
-resident runtime at EL1 that owns translation, faults, the code cache and system instructions. Every private page is
-EL1-only except the code area, which EL0 may only execute; shadows of guest pages are EL0 read/write or read-only. The host compiles and supervises; it
-never runs guest code.
-
-| Piece | What it does | Where |
-| --- | --- | --- |
-| Compiler (fexc) | Native macOS build of FEX's decoder, IR, optimizer, allocator and emitter. Takes x86 bytes, RIP and CPU context; returns ARM64 code with every guest-memory access site, exits, link points and relocations (code object v4; since E1 the code touches no emulator data: exits by `svc`/a relocated `b`, division by `svc`; since E1b no stop check; since E3 no address guard: a non-canonical access faults in hardware at its site). Cuts a block before any system instruction or unsupported form. One `fexc --serve` child process per vCPU. | `tools/fexc/` (build, patch series, shims), `third_party/FEX` (pinned submodule); binary: `../natemu-raw/fexc-native-20261026-01/series22/obj/fexc` (X2: series21-s3, which cut group 9's register forms, plus `--alignment-gated`) |
-| Admission | Object validation of each block before it reaches the VM: header, profile, features against the vCPU's ID registers, offsets, sites and their words, relocations, exits and link points, x25/x28 rules, control flow. Since E3 the code-shape check (instruction allowlist, sp, literals, every memory word a site, split/branch-target/#DE check forms) is a debug option (the program driver's `--code-shape`, passed by the test runners except `contain`). | `crates/host/src/admission.rs`, `admission/structure.rs`; format `crates/abi/src/code_object.rs` |
-| Host | VM, GIC and vCPU lifecycle (`vm.rs`), guest RAM and the resident image (`memory.rs`), one thread per vCPU with start barrier, cancellation and join-before-destroy (`owners.rs`), the per-vCPU service loop: compile requests, system-instruction decode, kicks (doorbells), watchdog (`execution.rs`, `system.rs`); the boot entry (`linux.rs`). Since L0 a library (package `natemu`) with the boot stub `natemu`; the test driver is its own crate. | `crates/host/src/` (library), `crates/driver/src/` (test driver) |
-| Resident | Boots each vCPU's private address space, banks x86 state, walks guest page tables (four-level, A/D by compare-exchange), installs owner-private shadows (native stage-1 tables, one space per x86 privilege class: supervisor and user, each with its own roots and ASID, two ASIDs per vCPU; the CPL's space is loaded at every entry into generated code, U1), places and links blocks, recovers faults precisely, executes system instructions, drains invalidations. | `crates/runtime/src/` (`execution.rs`, `cache.rs`, `tables.rs`, `gates.S`); shared layouts `crates/abi/src/` (`execution.rs`, `paging.rs`, `shadow.rs`, `guest_memory.rs`) |
-| Code cache, dispatch, linking | Per vCPU: code area (16 MiB default, up to 128 MiB) with a write alias, metadata arena, L1 (4,096 entries by RIP, as code in the code area since E1) and L2 (key = RIP, CR3, CPL, mode and controls). The dispatcher (copied into the code area) branches into L1 from generated code; a miss enters the resident (`svc`), which looks up L2 or requests a compile. Literal exits go to the linker (`svc`) once and are then patched to branch directly. Overflow or any context change flushes the whole cache. | `runtime/src/cache.rs`, `gates.S` (`dispatch_template`); [slice-2 contract](slice2-contract.md) |
-| Precise faults | Every guest-memory access is a registered site. A native abort is matched to its site first (else halt `trapped`, `private_access`, `unknown_abort` or `site_mismatch`); a non-canonical address at a site, the private window included, is #GP/#SS, except the documented guest-state page (`0xffff_4000_0000_1000`, x86 non-canonical with bit 63 set, outside the window since the G1 fix; one 4 KiB page per vCPU, EL0 read/write since I1: an access there reaches the vCPU's own guest state; boot-features plan, Built (I1, G1 minimum) and G1 fix); the resident walks with the access's intent and retries, splits a page-crossing store, or banks the exact pre-instruction state and stops with the guest fault (vector, error, CR2). | `runtime/src/execution.rs` (`aborted`, `access_aborted`, `split`); [slice-1 contract](slice1-contract.md) |
-| Precise stop | Since E1b, by doorbell and unlinking, all in the VM: the HVF in-kernel GIC (macOS 15+) gives each vCPU an SPI (host kicks, `hv_gic_set_spi`) and SGI 1 (peers' residents, `ICC_SGI1R_EL1`). Generated code runs with IRQs unmasked; the resident's IRQ handler (`interrupted`) acknowledges, then stops at once when interrupted in the dispatcher, L1 or at a block's first word, else patches every exit of the interrupted block to `brk #6` (`cache::arm`); the block stops at its exit with the exit's exact state (`stopped`), or at its next resident entry; patched words are restored at every resident entry (`cache::disarm`). No host exit; nothing on the hot path. `hv_vcpus_exit` stays the watchdog/cancellation; `hv_vm_protect` is no longer used. | `runtime/src/execution.rs`, `cache.rs`, `gates.S` `irq_gate`; `host/src/vm.rs` (GIC); boot-features plan §5 |
-| System instructions | Host decodes (FEX decoder) once per translation, from the bytes fexc was given; since K2 the resident keeps the decode in its code cache as a record without code (filed, keyed and invalidated as a block of those bytes) and later runs it with no host exit; resident executes as a transaction: MOV to/from CR0/CR3/CR4 (WP, PGE, SMEP), INVLPG, RDMSR/WRMSR EFER; #UD/#GP per SDM, else commit. Since K1 a CR3 load, a paging-control change or an MTRR write resets the shadows and makes blocks not current (a fetch walk revalidates them; global ones survive a CR3 load), INVLPG and a #PF do so for their range, and no translation is dropped (boot-features plan, Built (K1)). | `runtime/src/execution.rs` `system`, `host/src/system.rs`; slice-3 §4 S3c |
-| Cross-vCPU coherence | Global per-page code and writable masks, one invalidation record and a shadow-reset counter per vCPU (atomic RMWs only). A write to a page with code bits posts the page to the holders and kicks them; marking a new code page shoots down peers' writable shadows synchronously; drains at every resident entry and after placing a block (a killed block steps one instruction). Shadows stay per vCPU: x86 TLB semantics, INVLPG/CR3 per vCPU. | `runtime/src/cache.rs`, `abi/src/execution.rs` (`cache`); slice-3 §1 |
-| Ordering | Hardware TSO (ACTLR_EL1.EnTSO, checked at start) for admitted single-register loads and stores; fences as `dmb`; memory XCHG as `swpal` at `swap` sites; since I3 every LOCK read-modify-write as one LSE acquire-release atomic (`ldaddal`, `ldclral`, `ldeoral`, `ldsetal`, `casal`, `caspal`) at `atomic` sites, LOCK CMPXCHG* with `dmb ish` before its CAS. Since M2 addendum 2 UC RAM is strongly ordered: never shadowed while a block runs on, each access runs its instruction alone in the step block with `dmb ish` before and after (the resident's own UC accesses likewise). | slice-3 §2; boot-features plan, Built (M2 addendum 2) |
-| Containment | Any resident halt or host error cancels every vCPU; vCPUs are destroyed before the VM; per-vCPU watchdog (10 s default) reports where it stopped; compile requests have a 30 s deadline; every run prints a `teardown:` line (joined, destroyed, children left). | `host/src/owners.rs`, `execution.rs`; slice-3 §4 S3h |
-
-Entry points (since L0, the host split). The library `natemu` (`crates/host`) has the integration entry
-`natemu::linux::Boot` (fields with defaults from `Boot::new(runtime, fexc, kernel)`; `prepare()` loads the kernel,
-initrd and ACPI tables and builds the devices, `Prepared::run()` runs the VM, `Outcome` gives each vCPU's stop and the vCPU
-that ended the run; the compile cache is off unless the caller sets `compile_cache::Config::from_env()`), and the boot
-stub `natemu RUNTIME FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--vcpus N] [--serial FILE]` over it
-(serial to standard output by default; exit 0 on poweroff, 2 on any other stop, 1 on a host error; it opts into the
-compile cache). The test driver `natemu-host` (`crates/driver`, the package name and binary path the runners use) has
-`run-program DESCRIPTION` (`crates/driver/src/drivers/program.rs`: tables, bytes and initial state per vCPU from a
-description; its tampers, logging IDT, CPL switches and event sources are its `execution::Hook`, which the library calls
-only at host exits, `()` for no hook) and `boot-linux` (`drivers/linux.rs`, over `Boot`, plus the load-only path, dump,
-clock trace, saves and JSON); the M3 test device and L4a's test interrupt source are in `drivers/test_devices.rs`. Raw record and code-cache writes and the hook's
-reply/object/compile-server calls exist only with the library feature `testing` (only the driver enables it); build the
-stub alone (`-p natemu`) so it is left out.
-Build and sign the stub (the runners build and sign `natemu-host` themselves):
+**Build and sign** (from the repository root; Rust 1.97.0, offline, locked):
 
 ```sh
-cargo +1.97.0 build --offline --locked --release -p natemu --bin natemu
+cargo +1.97.0 build --offline --locked --release -p natemu --bin natemu      # the stub alone: no `testing` feature
 codesign --force --sign - --entitlements crates/host/entitlements.plist target/release/natemu
 cargo +1.97.0 build --offline --locked --release -p natemu-runtime --target aarch64-unknown-none
-target/release/natemu target/aarch64-unknown-none/release/natemu-runtime "$F" BZIMAGE --cmdline 'console=ttyS0'
+tools/fexc/build.sh ../natemu-raw/fexc-native-20261026-01/series44-r2    # once; the directory must not exist (about 30 s)
 ```
 
-**Runners and checks** (all `--fexc FEXC --out DIR`, under `./tools/with-env`; each builds and signs the release host
-and runtime; contract-by-contract mapping: [contracts.md](contracts.md), "General-path check per contract"):
+Build the stub with `-p natemu` alone: a whole-workspace build unifies the driver's `testing` feature (raw record and
+code-cache writes, the hook's reply/object/compile-server calls) into it (plan, Built (L0), review round). The runners
+build and sign `natemu-host` themselves.
 
-| Runner | Checks |
+**Boot stub** (`crates/host/src/main.rs`):
+
+```sh
+R=target/aarch64-unknown-none/release/natemu-runtime
+F=../natemu-raw/fexc-native-20261026-01/series44-r2/obj/fexc
+K=../natemu-raw/kernel-census-20261028-01/dl/linux               # Debian 6.12.107 bzImage
+I=../natemu-raw/kernel-census-20261028-01/dl/initrd.gz           # Debian installer initrd
+target/release/natemu "$R" "$F" "$K" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr' --vcpus 4
+target/release/natemu "$R" "$F" "$K" --initrd "$I" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr'
+```
+
+At 16b0576 the initrd boot hangs after "Run /init" (no user-space console output): §4, "Blocking defect found at R2".
+
+`natemu RUNTIME FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--vcpus N] [--serial FILE]`: COM1's output
+to standard output (or `--serial FILE`) as it is sent; the stop of the vCPU that ended the run on standard error; exit 0
+when the guest powered off (ACPI S5), 2 at any other stop (reset, a typed stop, a watchdog), 1 on a host error. It opts
+into the persistent compile cache from the environment (§2).
+
+**Library entry** (`crates/host/src/linux.rs`, package `natemu`): `natemu::linux::Boot` (every manifest field below,
+defaults from `Boot::new(runtime, fexc, kernel)`), `Boot::prepare()` (guest RAM, loader, ACPI tables, each vCPU's state,
+LAPIC and mailbox, COM1, I/O APIC and 8259 pair, PIT/RTC/PM) returning `Prepared`, `Prepared::run()` (creates the VM,
+one thread per vCPU, the first vCPU whose run ends ends the run, the others are cancelled; joined and destroyed before
+it returns; once only) returning `Outcome` (each vCPU's `Stop` and compile count, `ended_first`). `Prepared` also gives
+the loader's placement, the devices and the count of serial bytes sent (`serial_bytes`). `Boot::run()` is both. The compile cache is off unless the caller sets
+`compile_cache::Config::from_env()`. No hook, fixture or tamper code is in the library (plan, Built (L0)).
+
+**Test driver boot** (`crates/driver/src/drivers/linux.rs`): `natemu-host RUNTIME boot-linux FEXC BZIMAGE` with the
+stub's options plus `--rsdp`, `--code-cache`, `--watchdog-ms` (default 60,000), `--max-block`, `--stop-at`,
+`--load-only`, `--dump`, `--save`, `--strict-unassigned`, `--lost-ticks`, `--clock-trace`; prints one JSON report (the
+placement, the BSP's stop, state and stats, each vCPU's stop and counters). Same `Boot` underneath.
+
+## 2. Manifest inputs
+
+| Input | Field / option | Default and limits |
+| --- | --- | --- |
+| Kernel | `Boot::kernel`, BZIMAGE | a bzImage of the 64-bit boot protocol (2.12+), entered at `startup_64` (+0x200) in long mode, LA57 = 0, flat CS 0x10/DS 0x18, IF = 0, RSI = boot_params; checked against the independent `tools/models/bootproto.py` (`run_l1.py`); loader errors are typed codes (`BAD_LAYOUT`, `KERNEL_DOES_NOT_FIT`, `INITRD_DOES_NOT_FIT`, ...; `crates/host/src/boot.rs`) |
+| Initrd | `initrd`, `--initrd` | none; placed by the loader, `ramdisk_image/size` and the ext fields set |
+| Command line | `cmdline`, `--cmdline` | empty; the user's choice (the evidence boots use `console=ttyS0 earlyprintk=serial mitigations=off nokaslr`, owner decision October 28: mitigations off) |
+| Guest RAM | `ram`, `--ram` | 2 GiB; a 2 MiB multiple above 16 MiB (the map's RAM start) up to 3 GiB (`execution::MAX_GUEST_RAM_BYTES`); no RAM above 4 GiB |
+| vCPUs | `vcpus`, `--vcpus` | 1; 1-4 (`cache::MAX_VCPUS`); vCPU 0 is the BSP, the others wait on the ACPI wakeup mailbox (X4) |
+| Memory map | built from `ram` (`boot::Layout::e820`) | e820: reserved page 0, RAM to 0xA0000, the legacy hole (unassigned: all-ones reads), loader page tables at 1 MiB, ACPI NVS 0x600000-0x1000000 (tables, mailbox, AP boot scratch), RAM 16 MiB to R, reserved R to 4 GiB (the device range: I/O APIC, LAPIC) |
+| Firmware tables | `rsdp` (default 0x600000) | ACPI 6.5 RSDP, XSDT, FADT, FACS, DSDT, MADT with the version-0 wakeup mailbox for N processors (`crates/host/src/boot/acpi.rs`; no `_CST`/P_BLK, HPET, MCFG or EFI); `acpi_rsdp_addr` in boot_params. MTRRs as the virtual firmware leaves them: all RAM WB, the hole and [R, 4 GiB) UC (plan, Built (M2 addendum 1)) |
+| CPU profile | built in (`crates/abi/src/cpu_profile.rs` from `tools/models/cpu_profile.json`) | the accepted Intel Haswell-class profile (INV-03-01 CLM-03-01-16/-17): SSE to SSE4.2, AVX/AVX2/FMA/F16C, XSAVE (XCR0 7), MOVBE, AES-NI/PCLMULQDQ, BMI1/2, RDRAND, x2APIC; no PCID, 1 GiB pages, LA57, SMAP, TSC-deadline, PMU, MPX/CET/AVX-512 |
+| Compiler | `fexc`, FEXC | the path of a fexc binary; one `fexc --serve` child per vCPU; each answer is validated by admission |
+| Compile cache | `compile_cache` (`Config::from_env`) | `NATEMU_COMPILE_CACHE=DIR|off` (default `~/Library/Caches/natemu/fexc`), `NATEMU_COMPILE_CACHE_MB` (default 512); keyed by the fexc binary's SHA-256 and the exact request, so a rebuilt identical fexc reuses it; past 3/4 of the cap other builds' packs, then user, then kernel packs are evicted (`crates/host/src/compile_cache.rs`) |
+| Code cache | `code_bytes`, `--code-cache` | 128 MiB less its head per vCPU (`CODE_BYTES_MAX`) |
+| Serial | `serial`, `--serial` | the stub: standard output; the library: none (the UART keeps the bytes; `Prepared::serial_bytes` counts them) |
+| Other | `strict_unassigned`, `lost_ticks`, `watchdog`, `max_block`, `stop_at` | off; PIT reinject, RTC and LAPIC discard (QEMU's defaults, `clock::LostTicks::DEFAULT`); 60 s; fexc's own; none |
+
+## 3. What runs
+
+x86-64 guest code runs as FEX-compiled ARM64 blocks at EL0 inside one Hypervisor.framework VM, under a resident runtime
+at EL1 per vCPU that owns translation (four-level walks, A/D, shadows per x86 CPL class), the code cache, faults and
+exception delivery, interrupts, and system instructions; the host compiles (fexc), decodes system instructions once per
+translation, and runs the devices. Pieces: compiler `tools/fexc/` (patch series `patches/0001-0028`, shim, pinned
+submodule `third_party/FEX`); admission `crates/host/src/admission.rs`; host `crates/host/src/` (`vm.rs`, `memory.rs`,
+`owners.rs`, `execution.rs`, `system.rs`, devices `uart.rs`, `ioapic.rs`, `pic.rs`, `pit.rs`, `rtc.rs`, `pm.rs`,
+`clock.rs`, loader `boot.rs`, `boot/acpi.rs`); resident `crates/runtime/src/` (`execution.rs` and `execution/`:
+delivery, events, segments, syscalls, lapic, mmio, ports, sse, x87, xsave, watch, helpers; `cache.rs`, `tables.rs`, `gates.S`); shared
+layouts `crates/abi/src/`. Everything the boot path needs is built and checked (but the library entry has the blocking
+interrupt defect of §4): delivery of every exception and
+interrupt through the IDT (X1a-X1c, X2), LAPIC timer and IPIs (X3), mailbox AP start (X4), descriptors, SYSCALL/SYSRET,
+SWAPGS, MSRs, CPUID (S1-S3), TF and breakpoints (S4), SSE/AVX/x87/XSAVE (I5-I10), REP and LOCK forms (I2, I3), memory
+types (M2), devices (M3, L1-L4b), translations kept across CR3 and INVLPG (K1), system instructions in the resident
+(K2), in-process compiles and the compile cache (P3). The plan's §1 inventory maps every boot requirement to a
+composite or a named check (plan §4, "R1 coverage").
+
+## 4. Known limits and costs
+
+**Address-space changes (K1).** A MOV to CR3 (any value) no longer drops code: blocks are filed by guest-physical
+pages and revalidated by a fetch walk when no longer current; global blocks survive a CR3 load. It still resets the
+vCPU's data shadows (the data TLB: no PCID is advertised and there is one shadow set per CPL class), so each CR3 load
+costs its reset plus a shadow miss per page touched afterwards. Measured over the Debian boot to the root-fs panic: 18,557
+CR3 loads and 38 global flushes in 81 ms (about 4.4 us each), 70,227 INVLPGs in 24 ms, about 456 k shadow-miss retries
+(plan, Built (K1)). With PTI (`mitigations=off` not given) every kernel entry and exit is a CR3 load, so a
+syscall-heavy guest pays a shadow reset each way; the evidence boots run with mitigations off (owner decision, October
+28). CR0.PG/WP, CR4.PGE/PAE/SMEP and EFER.NXE changes and MTRR writes are global flushes (every block revalidated); the
+only full code flushes left are a full pool and a host write to guest RAM (load time only).
+
+**Uncached RAM** (M2 addendum 2, owner decision November 2): UC/UC- RAM is strongly ordered: each access runs its
+instruction alone in the step block between two `dmb ish`, about 4.3-4.8 us per access against 7-11 ns on WB
+(`run_m2.py cost`). Linux's `cache_disable` window costs about 533 such instructions at boot. WB, WT, WP and WC RAM run
+natively. Device pages complete each MOV-family access once through the host (M3), about one host round trip each.
+
+**x87 at reduced precision** (owner direction; plan, Built (I6) deviations 1-12, Built (I6b) deviations, Built (I5c)
+deviations): every ST(i) is a double (53-bit significand and the double's exponent range whatever FCW.PC), so inexact
+results, their comparisons and integer conversions, PE/OE/UE and C1's round-up bit may differ from an 80-bit x87;
+FLD m80/FRSTOR round, FSTP m80/FNSAVE/FXSAVE widen exactly; FIP/FDP/FOP read 0; transcendentals are double libm results
+computed by the resident. MMX aliasing of the x87 registers is not exact (plan, Built (I9) deviations 1-2).
+
+**Declared deviations still in force:** the guest-state page `0xffff_4000_0000_1000` (one 4 KiB page per vCPU,
+non-canonical: a guest data access there reaches the vCPU's own DF, FS/GS bases, MXCSR, x87, MMX and YMM upper halves
+instead of #GP/#SS; needs no LA57 and no LAM; plan, Built (I1, G1 minimum), owner decision October 28); LOCK BTS/BTR/BTC
+as a byte atomic (plan, Built (I3)); no #AC for a misaligned BT unit past the canonical top (Built (X2)); FXSAVE/XSAVE
+image bytes 10-15 of each ST slot zero (Built (I5b)); the recorded choices where the SDM leaves room (implicit
+supervisor accesses never hit data breakpoints, Built (S4); Reserved-NOP cells and BND on near branches execute,
+Built (X1b, X1c); the TSC is CNTVCT scaled to 1 GHz, Built (S1), L5). Aligned 16-byte vector moves are one LDP/STP, so
+no tearing is declared any more (Built (I5a)).
+
+**Typed refusals** (a stop naming the reason, never a silent wrong result; `crates/abi/src/execution.rs` stop kinds):
+`unsupported_atomic` for a LOCKed access or an unlocked CMPXCHG8B crossing 16 bytes (split locks; owner decision);
+`unsupported_mode` for CPL 1/2, compatibility-mode code (far transfers or SYSRET/SYSEXIT into 32-bit code), 32-bit and
+paging-off modes (owner decision 3), page tables outside guest RAM; `unsupported_system` for call gates, an ICR INIT/start-up IPI or
+any delivery mode but fixed, lowest priority and NMI (the mailbox is the AP start; `execution/lapic.rs`), a LAPIC base moved onto RAM, DR7 R/W = 10 without
+CR4.DE, more data breakpoints than the host offers; `unsupported_mmio` for RMW, atomic, pair, page-crossing, string and
+vector forms on a device page; `unsupported_ferr` for a pending x87 exception with CR0.NE = 0; `unsupported_port` for
+an SLP_TYP other than S5; `fetch_not_ram` for code on a non-RAM page; `unsupported_form` for forms fexc refuses and the
+SDM gives no exception for: VEX gathers, MASKMOVQ, MASKMOVDQU, VMASKMOV/VPMASKMOV (owner decision October 30 (2): 10
+gather sites in `libmvec.so.1`, 0 masked stores in the census), VCVTPS2PH m, scalar VEX.L = 1 forms, RCL/RCR m, BT* m, r
+with 0x67, 16-bit BSWAP/SHLD/SHRD, ENTER with nesting, 66 on PUSHF/ENTER/LEAVE/branches/CMPXCHG8B, FBLD/FBSTP and
+undocumented x87 aliases (`tools/fexc/shim/fexc_slice1.inc`). CR0.NE = 0 stays the named stop `unsupported_ferr`
+and INCSSP without CET is #UD per the SDM, not QEMU's behaviour (owner decisions, November 2, phase end). Not built:
+RAM above 3 GiB, more than 4 vCPUs (4-bit masks per page), 1 GiB pages, PCID, LA57, TSC-deadline, CPU offlining
+(mailbox version 1).
+
+**Deferred past this phase** (owner decisions, November 2, phase end; plan §5): faster first-time code (parallel
+compiling, translating ahead of use, translations reusable across load addresses) is the next chunk, measured first;
+an AES-based random-number generator inside the VM, seeded from the host (RDRAND/RDSEED refills are host exits today,
+K2); raising and testing guest RAM beyond 3 GiB and vCPUs beyond 4.
+
+**Translation latency.** Every distinct block is a compile on first use (about 0.04 ms in process, P3); the compile
+cache keeps answers across runs (a boot without initrd stores about 36 MiB, the initrd boot to the installer fills the
+512 MiB cap). User code at randomized addresses is compiled again per process (the RIP is in every key): the initrd
+boot makes about 1.14 M compiles, 140 k with `norandmaps`. In the R2 boots Linux takes the TSC rate from the profile
+("tsc: Detected 1000.000 MHz", no PIT calibration line) and never marks the TSC unstable; where `quick_pit_calibrate`
+runs, first-time blocks inside its 24 us windows make it fail (plan, Built (P3)).
+
+**Other measured costs** (not tuned): `ret` goes through the dispatcher (about 15 words); a peer storing to data on the
+page a vCPU runs from makes that vCPU step each instruction; a PTE stored with no pause starves the walker's
+compare-exchange (contained by the watchdog); a system instruction is a resident round trip of about 0.4 us (K2); a
+stop is a GIC doorbell taking effect at the next block boundary (p50 5-8 us, a host-scheduling tail to 5-8 ms); a
+compile stall delays cancellation up to the 30 s request deadline. **Resident stack** (`check_resident_stack.py` on
+the final runtime, R2): the deepest gate path 19,168 of the 32,768-byte exception stack (SP_EL1; 13,600 bytes margin),
+23,312 with one nested entry to its halt (9,456 margin), the boot path 12,832 of 32,768 (SP_EL0); the dispatcher template
+uses no SP and no literal; `ok`. An overflow is contained to its vCPU but overwrites its boot/block stack before it
+halts; new resident paths must be re-checked.
+
+**Boots at R2** (Debian 6.12.107 bzImage and installer initrd, 2 GiB, `console=ttyS0 earlyprintk=serial
+mitigations=off nokaslr`; release builds, series44-r2; one VM at a time. Wall time is from process start to the end-point
+line appearing in the serial file (polled every 50 ms), the same for both emulators, so natemu's post-panic watchdog is
+not included; guest time is the kernel's printk timestamp at the panic, or at "Run /init". End points: "VFS: Unable to
+mount root fs" without initrd, the installer's "Select a language" dialog with it. Warm = the default compile cache after
+a warm-up boot, off = `NATEMU_COMPILE_CACHE=off`. Raw records `natemu-raw/r2-20261102-01/boot/boots.jsonl`, serial logs
+beside it.)
+
+| To the root-fs panic, wall s (guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
+| --- | --- | --- | --- | --- |
+| `natemu` stub, cache warm | 2.28 (1.19) | 2.06 (1.38) | 2.20 (1.49) | 2.31 (1.63) |
+| `natemu-host boot-linux`, cache warm | 2.46 (1.19) | 2.04 (1.34) | 2.19 (1.47) | 2.26 (1.55) |
+| `natemu` stub, cache off | 4.15 (2.83) | 4.68 (3.70) | 5.33 (4.32) | 5.70 (4.65) |
+| `natemu-host boot-linux`, cache off | 4.51 (3.12) | 5.24 (4.13) | 5.58 (4.48) | 6.06 (5.03) |
+| QEMU 11.1.2 TCG, `thread=multi` | 1.97 (1.24) | 1.70 (1.01) | 1.60 (0.94) | 1.70 (0.99) |
+| QEMU TCG default (is multi-threaded here) | 2.01 (1.29) | | | 1.72 (1.00) |
+| QEMU TCG `thread=single` | 1.95 (1.26) | | | 1.86 (1.09) |
+
+| To "Select a language" (initrd), wall s ("Run /init" guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
+| --- | --- | --- | --- | --- |
+| `natemu` stub and `boot-linux` at 16b0576, warm or off | never (hangs after "Run /init", see below) | never | | never |
+| stub with the experimental fix below, cache warm | 67.4 (5.20) | | | 49.2 (5.40) |
+| `boot-linux` with the fix, cache warm | 67.4 (5.26) | | | 48.9 (5.41) |
+| stub with the fix, cache off | 67.5 (7.08) | | | 53.8 (9.51) |
+| `boot-linux` with the fix, cache off | 67.8 (7.17) | | | 53.1 (9.50) |
+| QEMU TCG `thread=multi` | 7.27 (2.24) | 5.55 (1.79) | 5.55 (1.86) | 5.46 (1.83) |
+| QEMU TCG default (multi-threaded) | 7.42 (2.28) | | | 5.43 (1.81) |
+| QEMU TCG `thread=single` | 7.25 (2.22) | | | 7.62 (2.28) |
+
+QEMU ran `-machine pc -cpu Haswell,-pcid,-hle,-rtm,-invpcid -m 2048 -smp N -kernel -initrd -append` with `-serial
+file:`. With `-accel tcg,thread=multi` QEMU printed no memory-ordering warning, only "TCG doesn't support requested
+feature: CPUID[eax=01h].ECX.tsc-deadline" once per vCPU, and it did run multi-threaded: at N = 4 the process has 8
+threads and uses about 127% CPU against 5 threads and 99% with `thread=single`. Plain `-accel tcg` behaves as
+`thread=multi` (8 threads), so QEMU 11.1.2 already defaults to MTTCG for this guest on this host; the single-threaded
+rows use `thread=single`. Without initrd natemu is within 1.1-1.4x of QEMU with a warm cache and 2.1-3.4x with it off; to
+the installer (with the fix) it is 9-10x slower than multi-threaded QEMU, mostly first-time compiles of user code at randomized addresses (the cache barely
+helps there: §4, translation latency).
+
+**Blocking defect found at R2: device interrupts after `Boot::prepare` go through a dangling pointer.**
+`irq::install` keeps `Lapics::memory: *const Memory` pointing at `backing.memory` (`crates/host/src/irq.rs:31-50`),
+but `Boot::prepare` (`crates/host/src/linux.rs`) calls it on its local `backing` and then moves `backing` into the
+returned `Prepared`, so every interrupt a device raises later (`Lapics::memory()` in posting and ringing) reads the
+`Memory` through a stale stack address: undefined behaviour in the host. Seen as: no user-space console output (the
+8250's THRE interrupt, IRQ 4, is never taken: 6 IIR reads against 14 before the split), so the installer's init blocks
+in its first tty write and never prints; `rdinit=/bin/busybox -- echo r2hello` prints nothing on natemu at 16b0576 at
+N = 1 and 2, prints on 959e430 (before the host split L0, 3c12567) and on QEMU. The kernel's own console is polled, so
+the boots to the root-fs panic still reach it. The test driver's `run-program` keeps its backing in place, so the
+suite's interrupt tests (`r1-serial`, `run_l4a.py`, `run_x3.py`) cannot see it, and L0's checks booted only to a
+`poweroff -f` init. Experimental fix (scratch build only, not in the repository;
+`natemu-raw/r2-20261102-01/diag/rebind-experiment.diff`): `Prepared::run` re-points the pointer at `self.backing.memory`
+before the VM starts; with it the echo prints and both boot paths reach the installer dialog (table above). A real fix
+should not store a pointer into a movable `Backing` (keep `Memory`'s raw base by value, or pin the backing), and the
+suite needs a library-path boot check with interrupt-driven console output.
+
+## 5. Standing suite
+
+Every runner takes `--fexc FEXC --out DIR` under `./tools/with-env`, builds and signs the release `natemu-host` and
+runtime itself, and judges against pinned QEMU (`tools/reference/ref.py` pins the container image; Homebrew
+`qemu-system-x86_64` for SMP programs) and the independent models in `tools/models/`. Guest RAM for every
+`run-program` runner is `NATEMU_RAM` (hex, default 2 GiB; `NATEMU_PLACE` moves the driver's page placement); `run_m1.py`,
+`run_m2.py firmware`, `run_l1.py`, `run_l2.py` and `run_l2_iasl.py` set their own sizes. Contract-by-contract
+mapping: [contracts.md](contracts.md), "General-path check per contract".
+
+**Results at R2** (series44-r2, both RAM sizes, every command below plus `run_r1.py r1b`; raw summaries
+`natemu-raw/r2-20261102-01/suite-{4m,2g}/`): at 2 GiB everything green but the 7 known i8b QEMU two-NaN departures at
+both block sizes. At 4 MiB the same, except four runners that cannot run at that size by construction: `run_x4.py` and
+`run_l3.py` identity-map pages at 0x500000 and 0x400000 (the driver refuses a page outside guest RAM), `run_m1.py`'s
+code-near-the-top cases place at 0x7ff00000, and `run_m2.py types` adds variable MTRR ranges whose overlap with the
+4 MiB firmware's UC range the SDM leaves undefined (its model raises `KeyError`). `cargo test` 147 + 1 ignored, Python
+unit tests 317.
+
+| Runner | Checks (counts at R2) |
 | --- | --- |
-| `tools/run_slice1_vm.py` | 64 fixtures and seeded corpora (seed 4242: 44 programs) against pinned QEMU; `--max-block 1` too |
-| `tools/run_slice1_faults.py` | 7,912 precise-fault cases (paging cells, access forms, probes) against QEMU prefix runs; since M2 every paging cell also sets memory-type bits in its page's walk (a rotation of PAT indices 0-7 and upper-level PWT/PCD) |
-| `tools/run_slice2_vm.py`, `run_slice2_faults.py`, `run_slice2_probes.py` | control flow (64 × 3 block sizes), faults inside loops (846 × 3), code-cache/SMC probes (85) |
-| `tools/fexc/upstream_tests/run_asm.py` | FEX's ASM suite (235 admitted tests; 372 since I1, 376 after I7, 443 since I2, 480 since I3, 781 since I5a, 1,603 since I8) |
+| `tools/run_slice1_vm.py` | 64 fixtures and seeded corpora (seed 4242: 44 programs) against pinned QEMU; `--max-block 1` too; also runs the I8/I9/I10 QEMU 7.2 corpora (136, 329 + 7 known QEMU two-NaN departures, 120, 5, 88) |
+| `tools/run_slice1_faults.py` | 7,912 precise-fault cases (paging cells, access forms, probes) against QEMU prefix runs, each delivered through the driver's logging IDT and rebuilt by `delivery_check.py`; since M2 every paging cell also sets memory-type bits in its page's walk (a rotation of PAT indices 0-7 and upper-level PWT/PCD) |
+| `tools/run_slice2_vm.py`, `run_slice2_faults.py`, `run_slice2_probes.py` | control flow (64 × 3 block sizes), faults inside loops (846 × 3), code-cache/SMC probes (83) |
+| `tools/fexc/upstream_tests/run_asm.py` | FEX's ASM suite: 2,270 tests, 1,875 pass, 0 fail, 48 x87 precision deviations (reduced precision), 347 unsupported, each with its reason (forms not advertised by the profile, typed refusals, FEX's known failures) |
 | `tools/run_slice3_vm.py MODE` | `corpora`, `smp`, `limits`, `kicks`, `system`, `coherence`, `sharedpt`, `litmus`, `contain`, `privilege` (U1), `delivery` (X1a; X1c: the Table 7-4/7-5 matrix, faults during delivery, triple fault), `events` (X2: interrupt eligibility, shadows, POPF, HLT, NMI, #AC; QEMU x2APIC programs, natemu-only cases, random-time stress) |
 | `tools/run_i6_faults.py` | I6 x87: gating (#NM), precise faults with the x87 state unchanged, refusals, FXAM classes, FIST indefinite, MXCSR isolation, Linux's FPU probes (SDM rules; `--max-block 1` too); the x87 QEMU corpus is `tools/reference/gen_i6.py` + `ref.py` + `run_slice1_vm.py` |
 | `tools/run_k2.py` | K2 resident system path: cost per CLI/STI/POPF/SWAPGS/RDTSC/CPUID/WRMSR/FLD+FSTP m80 loop iteration (decode exits must not grow with N), RDRAND beyond the pool, cross-modifying code at a system instruction (the x86 protocol: after the writer's flag and a CPUID the new instruction runs, every rewrite checked; deterministic) |
 | `tools/run_x3.py` | X3 local APIC: register read-backs (xAPIC MMIO, x2APIC), priority/TPR/EOI with nested self IPIs, CR8, the x2APIC #GP rules and x2APIC IPIs at 2-4 vCPUs vs QEMU and the SDM model; xAPIC IPIs at 2/4 vCPUs, one-shot/periodic/masked/HLT timers (exact model from TSC and CNTFRQ), random IPI + timer stress at 2/4 vCPUs, HLT across peers (the driver's end rule), driver fault and typed-stop cases; `--only cost` for APIC access costs |
 | `tools/run_k1.py` | K1 code cache across CR3/INVLPG/control changes, each CPU with its own tables: remap + INVLPG or CR3 reload, CR3 ping-pong with different bytes at one address, a write to an idle block, linked direct jumps, an instruction crossing into a remapped page and across a 2 MiB boundary, vs QEMU at 1-4 vCPUs (block sizes default and 1); natemu-only by the TLB rules: no-INVLPG either-or, global pages kept across CR3 (asserted), a revalidation walk killing its own block, #PF then remap; translation requests must not grow with CR3 rounds (`--base-host/--base-runtime` reports another build beside) (boot-features plan, Built (K1)) |
 | `tools/run_m1.py` | M1 guest RAM: tables and data in RAM's top MiB at 4 MiB, 2 GiB and 3 GiB, the device page at R, placement across 0xA0000, cross- and self-modifying code at 0x7ff00000; any runner runs at another size or placement with `NATEMU_RAM`/`NATEMU_PLACE` |
-| `tools/run_m3.py` | M3 device pages: MOV-family corpus vs QEMU (on RAM) and `tools/models/mmio_model.py`, fault priority, refused forms, exactly-once under kicks at 1-4 vCPUs, a tampered reply, cross-modifying code at a device access (needs series23-m3) |
+| `tools/run_m3.py` | M3 device pages: MOV-family corpus vs QEMU (on RAM) and `tools/models/mmio_model.py`, fault priority, refused forms, exactly-once under kicks at 1-4 vCPUs, a tampered reply, cross-modifying code at a device access |
 | `tools/run_l1.py`, `tools/run_l1_smoke.py` | L1 boot-protocol loader: Debian and synthetic bzImages judged by `tools/models/bootproto.py`, every header and loader refusal with the model's codes (no VM); the smoke test (Debian decompressor to its jump into vmlinux vs QEMU) runs in-tree at 2 GiB since M1 (boot-features plan, Built (L1), Built (M1)) |
 | `tools/run_l2.py`, `tools/run_l2_iasl.py` | L2 ACPI tables at N = 1..4 from load-only dumps: the independently written checker `tools/models/acpi_model.py` (structure, AML, CPUID/LAPIC/e820/device-set agreement; controls in `test_acpi_model.py`), and ACPICA `iasl` (Homebrew `acpica`): `-d` clean except the version-0 wakeup structure, the DSDT recompiled from its disassembly and the RSDP from iasl's template byte-equal (no VM; boot-features plan, Built (L2)) |
 | `tools/run_l3.py` | L3 port I/O, UART and the unassigned rule (programs `tools/bench/smp/ports.py`): `qemu` UART widths, Linux's 8250 probe and earlyprintk sequences, unassigned ports, REP INS/OUTS with faults midway, CPL 3 IOPL/TSS-bitmap configurations vs pinned QEMU (COM1 = `-serial file`); `stress` events between string elements; `cases` strict switch, PCI probes, wrap, refusals; `pages` unassigned pages (hole, above RAM, above 4 GiB, IOAPIC page) on the all-ones shadow, writes, refusals, strict, SMP, the xAPIC page (boot-features plan, Built (L3)) |
@@ -79,19 +260,26 @@ and runtime; contract-by-contract mapping: [contracts.md](contracts.md), "Genera
 | `tools/run_i5c.py` | I5c unmasked floating-point exceptions, judged by the SDM (QEMU 7.2 raises no #XM and delivers #MF only at FWAIT without leaving operands unaltered: it cannot judge them): 47 SSE/AVX/FMA/F16C forms each masked, with each raised flag unmasked (#XM at the instruction, destination and RFLAGS unchanged, MXCSR by the pre/post-computation precedence) and with the others unmasked; exact tiny results, FTZ under an unmasked UE, DAZ, DPPS steps, YMM, #UD without OSXMMEXCPT, LDMXCSR/VLDMXCSR/FXRSTOR re-keying; x87: #MF at 18 kinds of waiting instruction (MMX, the resident's FLDCW/FLDENV/FRSTOR/m80 and helper forms included), none at FNSTSW/FNSTCW/FNCLEX/FNINIT/FNSTENV/FNSAVE/FXSAVE, aborted IE/DE/ZE, stack faults, FST/FIST stores, PE/OE stores, CR0.NE = 0 (`unsupported_ferr`) (boot-features plan, Built (I5c)) |
 | `tools/run_x1.py` | X1b/X1c (programs `tools/bench/smp/entry.py`): `qemu` `x1-entry@1/2/4` vs pinned QEMU and delivery_model: frames on RSP0 and IST1..7 (CPL 3 -> 0 and 0 -> 0), IRETQ to CPL 3, normal (SWAPGS) and paranoid (RDGSBASE, LSL of a CPU/node descriptor, WRGSBASE) entries of NMI/#DF/#DB/0x12, #DF from CPL 3 and 0, NMI blocking until IRETQ; `x1-sreg@1` PUSH/POP FS/GS and the PREFETCHW/CLDEMOTE hints vs QEMU and the SDM; `x1-rnop@1` the Reserved-NOP cells vs QEMU; `cases` refused-but-defined forms now delivered (SDM rules): #UD encodings (64-bit-invalid opcodes, Table A-2/A-3/A-6 blanks, register operands of memory-only forms, GETSEC, RSM, VMX group 9, unprefixed 0f 38/0f 3a), direct branches (LOOPcc/JrCXZ and 0x67 included) to a non-canonical target (#GP(0) when taken), PUSH/POP FS/GS faults, the split-lock and fetch-from-non-RAM typed stops, CLTS, SMSW, LMSW, SYSENTER, SYSEXIT (boot-features plan, Built (X1b, X1c)) |
 | `tools/run_r1.py r1a` | R1a single-vCPU composites (one program each, feature chains already built): `r1-boot` (64-bit entry into a kernel-head sequence: 4-level tables with a kernel map, CR4/CR3, LGDT/LRETQ to __KERNEL_CS, EFER SCE and NX, CR0_STATE, early IDT fixing up UD2, back to the identity map), `r1-demand` (#PF handler mapping on demand from zeroed pools: read, write, fetch, REP STOSQ faulting twice), `r1-int3` (Linux's `int3_selftest`), `r1-poke` (`__text_poke` through a poking address under a second CR3, `sync_core`, the `text_poke_bp` INT3 protocol, a static-call NOP5 -> JMP), `r1-syscall` (SYSCALL/SYSRET with SWAPGS, a PTI CR3 switch each way and VERW), `r1-timer` (LAPIC one-shot waking `sti; hlt`), `r1-serial` (8250 THRE transmit driven by IRQ4 through the I/O APIC); each vs pinned QEMU at block sizes default and 1 and by the SDM's expected state; a negative control each (boot-features plan, Built (R1a)) |
+| `tools/run_r1.py r1b` | R1b multi-vCPU composites at N = 2, 3, 4 (block sizes default and 1): `r1b-mpstart` (APs started through the ACPI MP-wakeup mailbox, each running a kernel-head-shaped sequence: own GDT/IDT, GS base, stack, arrival check-in; natemu wakes via the mailbox, QEMU's stub starts them at the same vector), `r1b-poke` (the `text_poke_bp` INT3 protocol across CPUs while peers execute the site, the sync IPI's IRETQ as `sync_core`, each peer's #BP handler emulating the new instruction), `r1b-nmi` (NMI by x2APIC IPI on an IST stack, the paranoid handler reading its CPU number by LSL of a per-CPU descriptor with RDGSBASE/WRGSBASE/SWAPGS), `r1b-ipiload` (all-to-all fixed-vector IPIs under memory-heavy loops: per-pair counts exact, EOI leaving the ISR clear, the loop checksums); vs pinned QEMU (x2APIC) with peers by exact counts, per-CPU end state and SDM invariants, plus a negative control each (boot-features plan, Built (R1b)) |
 | `tools/check_resident_stack.py` | resident stack bound and gate/ERET binary shape of the built runtime |
 | `tools/models/` | independent ordering, coherence, PAE and modes models (used by the runners) |
 
-Full suite (about 10 minutes on the M4 at the phase end; the reduced `kicks`/`sharedpt`/`litmus` settings below are
-the phase-end ones):
+Full suite (about 25 minutes of runner time per pass on the M4 at R2, waits for other VM users excluded; the reduced
+`kicks`/`sharedpt`/`litmus` settings are the phase's):
 
 ```sh
-# From the repository root; works in zsh and bash (no word-splitting of variables; run in full under zsh and
-# argument-checked under bash at the phase end).
-F=../natemu-raw/fexc-native-20261026-01/series43-x1/obj/fexc   # tools/fexc/build.sh rebuilds it; LOOPcc/JrCXZ to a non-canonical target cut, PREFETCHW/CLDEMOTE compiled, the Reserved-NOP cells cut and BND (F2) on near branches compiled (X1c addendum and review, shim changes) need series43-x1 (series42-i5c's patches + those shim changes); the I5c review fixes (DBL_MIN not tiny, CVT(T)PS2PI's two lanes) need series42-i5c (series40-i5c-add + patch 0028); CVTPI2PS m64's MMX transition (I9 addendum) needs series40-i5c-add (series39-i5c + patch 0027); unmasked SIMD/x87 exceptions (I5c: the check stubs, `--simd-unmasked`/`--x87-unmasked`) need series39-i5c (series36 + patch 0026 + shim changes; the host passes the new arguments only when a mask is clear, so masked runs also work with series36); 0x67 address-size forms, XLAT, #UD for reserved/unadvertised encodings (`cut_ud`, fetched first, WAITPKG) and the CET hint space (I10) need series36; the host needs series33 or later (P3: the server's reply reports what each compile read); MOVBE, MMX, AES-NI/PCLMULQDQ, PDEP/PEXT, FFREEP and the ADX/SHA #UD cuts (I9) need series32; the x87 helper forms and PCMPxSTRx by svc (I6b) need series31; VEX AVX/AVX2/FMA/F16C forms (I8) need series29, its review fixes (HADD order, UNORD flags, VLDMXCSR, the upper-half cache) series30; instructions straddling a page end and over 15 bytes (#GP) need series28; CS/DS/ES/SS prefixes by Intel's class (Linux's `ds btr`) need series27; I5b's FXSAVE/XSAVE cuts need series26-i5b or later; S3's `system` programs (RDRAND/RDSEED/RDPID) need series21-s3 or later, X2's BT* #AC cases series22; since I6 the host passes x87 arguments; series25 is the combined I6 + M3 build
+# From the repository root; zsh or bash. Wait until no other natemu-host runs (timing-sensitive cases: kicks, l4b,
+# x3 stress) and rerun alone any timing failure before calling it.
+F=../natemu-raw/fexc-native-20261026-01/series44-r2/obj/fexc   # tools/fexc/build.sh rebuilds it (patches 0001-0028 + the X1c shim)
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
-O=../natemu-raw/suite-$(date +%Y%m%d-%H%M%S)                  # a fresh output directory
+I8=../natemu-raw/i8-corpus-20261030-01      # gen_i8.py programs and their QEMU 7.2 results
+I8B=../natemu-raw/i8-corpus-20261030-02     # I8 review corpus: 7 known QEMU two-NaN departures (plan, Built (I8) review)
+I6B=../natemu-raw/i6b-corpus-20261030-01    # gen_i6b.py: PCMPxSTRx every imm8, x87 helper forms
+I9=../natemu-raw/i9-corpus-20261030-01      # gen_i9.py: MOVBE, MMX, AES/PCLMULQDQ, PDEP/PEXT, FFREEP
+BIG=../natemu-raw/i9-big-20261030-01        # PDEP/PEXT/PCMPISTRI runs over a block's 32 KiB
+I10=../natemu-raw/i10-corpus-20261030-01    # gen_i10.py: 0x67 forms, XLAT, strings/LOOP with ECX
+O=../natemu-raw/suite-$(date +%Y%m%d-%H%M%S)
 s3() { tools/with-env python3 tools/run_slice3_vm.py --fexc "$F" "$@"; }
 cargo +1.97.0 build --offline --locked
 cargo +1.97.0 test --offline --locked
@@ -135,28 +323,22 @@ tools/with-env python3 tools/run_l3.py --fexc "$F" --out "$O/l3"   # L3: port I/
 tools/with-env python3 tools/run_l4a.py --fexc "$F" --out "$O/l4a"   # L4a: I/O APIC, 8259, routing vs QEMU; async lines, the halted veto, LINT0/LINT1
 tools/with-env python3 tools/run_l4b.py --fexc "$F" --out "$O/l4b"   # L4b: PIT, RTC, PM block, S5/reset vs QEMU; halted veto, stress, typed stops, clock agreement
 tools/with-env python3 tools/run_i5b.py --fexc "$F" --out "$O/i5b"   # I5b: FXSAVE/XSAVE images vs QEMU (Haswell model), the fault matrix by the SDM rules
-I8=../natemu-raw/i8-corpus-20261030-01                             # I8: gen_i8.py programs and their QEMU 7.2 results
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i8" "$I8/programs.json" "$I8/expected.json"
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i8-1" --max-block 1 "$I8/programs.json" "$I8/expected.json"
-I8B=../natemu-raw/i8-corpus-20261030-02                            # I8 review: every template k = 2 times per width and group, legacy SSE mixed in, shifts/flags/addressing kinds
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i8b" "$I8B/programs.json" "$I8B/expected.json"          # 7 known QEMU two-NaN departures (plan, Built (I8) review)
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i8b-1" --max-block 1 "$I8B/programs.json" "$I8B/expected.json"
 tools/with-env python3 tools/run_i8_faults.py --fexc "$F" --out "$O/i8-faults"               # I8: AVX faults, gating, refusals, XSAVE round trip, DE
 tools/with-env python3 tools/run_i8_faults.py --fexc "$F" --out "$O/i8-faults-1" --max-block 1
-I6B=../natemu-raw/i6b-corpus-20261030-01                          # I6b: gen_i6b.py programs (PCMPxSTRx every imm8, x87 helper forms) and their QEMU 7.2 results
 tools/with-env python3 tools/run_i6b.py corpus --fexc "$F" --out "$O/i6b" "$I6B/programs.json" "$I6B/expected.json"
 tools/with-env python3 tools/run_i6b.py corpus --fexc "$F" --out "$O/i6b-1" --max-block 1 "$I6B/programs.json" "$I6B/expected.json"
 tools/with-env python3 tools/run_i6b.py cases --fexc "$F" --out "$O/i6b-cases"                 # I6b: C2, FPREM bits/partial, stack faults, flags, PCMPxSTRx faults, 64-bit lengths
 tools/with-env python3 tools/run_i6b.py cases --fexc "$F" --out "$O/i6b-cases-1" --max-block 1
-I9=../natemu-raw/i9-corpus-20261030-01                             # I9: gen_i9.py programs (MOVBE, MMX, AES/PCLMULQDQ, PDEP/PEXT, FFREEP) and their QEMU 7.2 results
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i9" "$I9/programs.json" "$I9/expected.json"
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i9-1" --max-block 1 "$I9/programs.json" "$I9/expected.json"
-BIG=../natemu-raw/i9-big-20261030-01                             # I9 review: PDEP/PEXT/PCMPISTRI runs over a block's 32 KiB (the host's halving retry)
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i9-big" "$BIG/programs.json" "$BIG/expected.json"
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i9-big-1" --max-block 1 "$BIG/programs.json" "$BIG/expected.json"
 tools/with-env python3 tools/run_i9_faults.py --fexc "$F" --out "$O/i9-faults"                 # I9: faults with the x87/MMX state, gating, #UD, #AC, refusals
 tools/with-env python3 tools/run_i9_faults.py --fexc "$F" --out "$O/i9-faults-1" --max-block 1
-I10=../natemu-raw/i10-corpus-20261030-01                           # I10: gen_i10.py programs (0x67 forms, XLAT, strings/LOOP with ECX) and their QEMU 7.2 results
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i10" "$I10/programs.json" "$I10/expected.json"
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i10-1" --max-block 1 "$I10/programs.json" "$I10/expected.json"
 tools/with-env python3 tools/run_i10_faults.py --fexc "$F" --out "$O/i10-faults"               # I10: 0x67 faults, #UD forms, CET NOPs
@@ -167,129 +349,24 @@ tools/with-env python3 tools/run_i5c.py --fexc "$F" --out "$O/i5c"   # I5c: #XM/
 tools/with-env python3 tools/run_i5c.py --fexc "$F" --out "$O/i5c-1" --max-block 1
 tools/with-env python3 tools/run_x1.py --fexc "$F" --out "$O/x1"   # X1b/X1c: CPL 3 frames, IST1..7, paranoid entries, NMI blocking vs QEMU and delivery_model; refused-but-defined forms delivered
 tools/with-env python3 tools/run_r1.py r1a --fexc "$F" --out "$O/r1a"   # R1a: single-vCPU composites (boot head, on-demand #PF, int3_selftest, text_poke, syscall/PTI/VERW, timer HLT wake, serial IRQ4) vs QEMU at both block sizes; negative controls
+tools/with-env python3 tools/run_r1.py r1b --fexc "$F" --out "$O/r1b"   # R1b: multi-vCPU composites (mailbox AP start, cross-CPU text_poke_bp, NMI by IPI on an IST with LSL, IPIs under load) vs QEMU at N = 2..4, both block sizes; negative controls
 ```
 
-QEMU references run in the pinned container image (`tools/reference/ref.py` holds the pins) or Homebrew
-`qemu-system-x86_64` for SMP programs; the no-Linux-VM rule covers compilation only.
+## 6. Compiler reproducibility
 
-## 2. Supported subset and declared limits
+`tools/fexc/build.sh ../natemu-raw/fexc-native-20261026-01/series44-r2` (R2, 21 s wall) applies `patches/0001-0028` to
+the pinned FEX commit `48d71752` and builds with the shim and `fexc.cpp` at 9730c4d. Its `obj/fexc` is byte-identical
+to series43-x1's, which was built by hand with cmake from the same patches and shim (SHA-256
+`6c282011...a7c293d` both); the source trees are identical too. Only `libfexcore.a` differs (archive member
+timestamps), which does not reach the linked binary. Series43-x1 and series44-r2 are therefore the same compiler, and
+the compile cache's entries (keyed by the binary's hash) serve both.
 
-| Area | Supported | Not supported (refused, never silently wrong) |
-| --- | --- | --- |
-| Mode | 64-bit long mode, CPL 0 and 3 | 32-bit, compatibility, paging off, real mode (owner decision 3); non-flat segments |
-| ISA | Integer, loads/stores 1–8 bytes at any alignment, control flow (incl. `loop`/`jrcxz`, indirect, call/ret), 128/64 division (resident helper), LFENCE/MFENCE/SFENCE, memory XCHG, PAUSE; since I1 CLC/STC/CMC, CLD/STD (DF in the guest-state page), LAHF/SAHF, PUSHF, ENTER (level 0)/LEAVE, SHLD/SHRD (32/64), CMPXCHG/XADD without LOCK, POPCNT/TZCNT/LZCNT, BMI1/BMI2 (PDEP/PEXT since I9), PREFETCHh, MOVNTI; since I7 FS/GS overrides on memory operands (base + EA, bases in the bank) and CS/DS/ES/SS prefixes naming the default segment; since I2 MOVS/STOS/LODS/SCAS/CMPS alone and with REP/REPE/REPNE, one element per pass (boot-features plan, Built (I2)); since I3 every lockable memory form with LOCK (one LSE atomic; LOCK NEG one compare-and-swap per pass) and CMPXCHG8B/16B locked or not, LOCK elsewhere #UD (boot-features plan, Built (I3)) | SSE/AVX/x87, 32-bit-address (0x67) and REPNE-on-move string forms, LOCKed accesses crossing 16 bytes (split locks, also an unlocked CMPXCHG8B: `unsupported_atomic`), F2/F3 with LOCK and 66/F2/F3 on CMPXCHG8B/16B, FS/GS with no memory operand or a second segment prefix, CS/DS/ES/SS naming a non-default segment (`unsupported_form` / `unsupported_atomic`) |
-| System | MOV CR0 (WP), CR3, CR4 (PGE, SMEP), MOV from CR0/CR3/CR4, INVLPG, RDMSR/WRMSR EFER | Everything else: §3 (`unsupported_system`, #GP or #UD per the model) |
-| Paging | Four-level, 4 KiB and 2 MiB pages, WP, NXE, SMEP, A/D per SDM with a declared fault-path policy (leaf A only after the permission check); since M2 PWT/PCD/PAT and the MTRRs give each page its memory type: WB, WT, WP and WC RAM run natively, UC RAM keeps strong ordering (each access runs its instruction alone between full barriers; owner decision, November 2) | 1 GiB pages, PCID, SMAP, LA57, MAXPHYADDR above 40 |
-| vCPUs | 1–4 (`MAX_VCPUS`). N = 0 cannot be described; `execution::prepare` refuses it (unit test); 5 is refused (`limits`) | APIC, IPIs, INIT/SIPI |
-| Memory | Guest RAM of a run-time size since M1 (2 MiB multiples to 3 GiB, default 2 GiB, `--ram`); 288 shadow-table pool pages per vCPU (reset on exhaustion, counted); since M3 device pages above RAM: MOV-family loads and stores of 1-8 bytes completed once from their sites' completion records through the host's device registry (fexc series23-m3; boot-features plan, Built (M3)) | Other forms on device pages (`unsupported_mmio`), holes; host writes only with every vCPU stopped |
-| Faults | Precise guest faults reported as a stop (vector, error, CR2, banked state) | Delivery to the guest (no IDT); the run ends at the fault |
-| Atomicity | Aligned 1–8 bytes and unaligned within 16 bytes single-copy atomic | Non-LOCKed access crossing 16 bytes inside a line may tear for peers (owner decision 2) |
+## 7. Open items before or during integration
 
-### ISA coverage measured (October 28, after the phase)
-
-Admission takes about 151 of 256 primary-map slots and about 70 two-byte slots, all integer: roughly 85–90% of the
-legacy integer ISA, under 10% of all x86-64 forms. Refused entirely: SSE/MMX, AVX, x87, string and REP, every LOCK form
-but memory XCHG, `popf`, CPUID, RDTSC. Since I1 (series14) admitted: the flag moves, `lahf`/`sahf`, `pushf`, `enter`
-(level 0)/`leave`, `shld`/`shrd` (32/64), `cmpxchg`/`xadd` without LOCK, `popcnt`/`lzcnt`/`tzcnt`, BMI1/BMI2 but
-`pdep`/`pext`, `prefetch`h, `movnti` (the ISA row above); still refused of these families: `pdep`/`pext`, `prefetchw`,
-`cmpxchg8b`/`16b`, 16-bit `shld`/`shrd`, `enter` with a nesting level, 66-prefixed `pushf`/`enter`/`leave`.
-
-| Measure | Result |
-| --- | --- |
-| FEX ASM suite | 235 / 2,270 pass (10.4%), 0 fail (I3, series17: 480 pass, 0 fail; 45 split-lock stops (FEX's Atomics tests cross 16 bytes on purpose) and 6 cmpxchg8b/16b with 66/F2/F3 refused. I1, series14: 372 pass, 0 fail; remaining I1-class refusals: 16-bit shld/shrd 19, cmpxchg8b/16b, popf, o16 enter/leave, enter with a nesting level). First refused instruction of the 2,035 unsupported tests: AVX 726, SSE/MMX/AES/SHA 480, x87 401, flag moves 205 (mostly test set-up), LOCK/cmpxchg/xadd 90, system 41, BMI 38, shld/shrd 17, other 37 |
-| Static share of admitted instructions in macOS x86-64 binaries | bash 97.5%, ls 97.7%, ld 92.3%: the rest is almost all SSE (`movaps`/`movups`/`xorps` from compiler copies and zeroing, scalar SSE float), present in nearly every function, so most real functions fail |
-
-Suggested order for the ISA track: flag moves and small integer forms (cheap), REP strings with partial progress (44),
-LOCK forms, CPUID/RDTSC and system registers, SSE (state in the frame, vector sites in admission/recovery, ordering
-cells, OSFXSR/XSAVE), then x87 (FEX's soft-float helpers must run in the resident) and AVX (only if CPUID advertises it).
-
-## 3. Boot-phase prerequisites and handoff items
-
-| Item | State now | Origin |
-| --- | --- | --- |
-| Interrupt and exception delivery: IDT, IRET, error-code push, vector priority, IF/interrupt shadow; IPIs (cross-vCPU INVLPG/TLB shootdown is guest software over IPIs) | Faults stop the run; no IDT; no IPIs | contract 49; slice-3 §1 ("IPIs: boot phase") |
-| 64-bit FS/GS bases (Linux per-CPU data via `%gs`), SWAPGS, KERNEL_GS_BASE, STAR/LSTAR/SFMASK, PAT, TSC/APIC-base and other MSRs Linux reads | Every MSR but EFER #GPs; FS/GS overrides admitted since I7 (bases from the bank, set by the driver's `fsbase`/`gsbase` until S3) | owner decision 1 note; S3c1 review |
-| MOV from CR2 (the #PF handler reads it); MOV CR8 | Refused `unsupported_system` | S3c1 review |
-| CR4 bits Linux sets: OSFXSR, OSXMMEXCPT, OSXSAVE, FSGSBASE, UMIP; CR0 TS/MP/NE/AM changes; CR4 profile bits (VMXE, SMXE, PKE, UMIP) must become reserved per the CPUID profile | Refused today | S3c1 review |
-| LGDT/LIDT/LTR (and SGDT/SIDT/STR, segment register loads) | Cut as system instructions by fexc, refused by the host decode (`unsupported_system`) | slice-1 contract S1c (system classes); `host/src/system.rs` decodes only MOV CR, INVLPG, RDMSR/WRMSR |
-| CLI/STI/HLT (IF and the interrupt shadow, halt until an interrupt) | Cut and refused; `hlt` ends a test program | slice-1 contract S1c; contract 49; slice-2 contract S2f (`hlt` ends a test) |
-| SYSCALL/SYSRET (with STAR/LSTAR/SFMASK; SWAPGS) | Cut and refused | slice-1 contract S1c |
-| RDTSC/RDTSCP (a TSC source and its relation to the timer) | Cut and refused | slice-1 contract §2 ("CPUID/RDTSC ... are cut") |
-| IN/OUT (port I/O for the console and legacy devices) | Cut and refused | slice-1 contract S1c; devices: phase boundary |
-| MOV to/from debug registers | Refused by the host decode | `host/src/system.rs` (test `unsupported_forms_are_refused`) |
-| TF single-step and debug breakpoints: dispatch and block linking must be bypassed while TF or a breakpoint is active (FEX's CheckTF) | Not implemented: no TF handling, no #DB | slice-2 contract §2 (dispatcher) and S2f boot-phase notes |
-| CPUID, SERIALIZE and IRET as draining entries (cross-modified code is seen at a serializing instruction); CPUID must report Page1GB = 0, LA57 = 0 and only what is implemented | CPUID ends a block and is refused (`unsupported_system`) | slice-3 §1, S3a2 walker note |
-| Memory types: the walker treated any PWT/PCD/PAT bit as non-write-back and halted (`shadow status=1 detail=7`). No 1 GiB pages | Built (M2): PAT/PWT/PCD/MTRR evaluated, the firmware's MTRRs cover the VM's RAM as WB (addendum 1), WB/WT/WP/WC RAM runs natively, UC RAM strongly ordered (addendum 2: each access runs its instruction alone between full barriers, about 5 us), device pages by M3; 1 GiB pages still not advertised | S3a2 "Walker refusals"; boot-features plan, Built (M2) |
-| LOCKed accesses crossing a 16-byte boundary (split locks; an unlocked CMPXCHG8B too) | Stop `unsupported_atomic` before any effect (owner decision); every other LOCK form built in I3 | slice-3 §2, S3e, boot-features plan Built (I3) |
-| REP string operations with partial progress (RCX/RSI/RDI per element, RIP at the REP) | Not admitted | contract 44 |
-| LFENCE register capture (the old completion sink); SSE/x87/AVX state and instructions | LFENCE admitted as `dmb ld` only; no vector state | contract 51; slice-3 §3 |
-| 32-bit and paging-off modes, compatibility mode, far transfers, descriptor loads, legacy/PAE walking | Deleted; start from [s3g-plan.md](s3g-plan.md) (transaction list S3g1–S3g3); the legacy walker `crates/abi/src/paging32.rs` is in commit 4902ee5; the 32-bit families in `8d529f9` | owner decision 3 |
-| Segment bases and limits, A20, 16-bit code, device/hole resolver | Deleted; build only if the boot path needs them | owner decision 1 |
-| Tearing across 16 bytes inside a line | Documented deviation; a diagnostic may count such stores | owner decision 2 |
-| A guest access to the guest-state page (`0xffff_4000_0000_1000`, non-canonical: #GP on x86; until the G1 fix `PRIVATE + 0x24000`, which a user pointer could make the guest kernel store into) | Documented deviation: it reaches the vCPU's own guest state; one 4 KiB page per vCPU, straddles into it fault; bit 63 is set, so Linux's user-access paths refuse it (-EFAULT) and only a kernel bug or privileged BPF reads reach it from the kernel; needs 48-bit linear addresses (no LA57) and no LAM; the resident reads back only DF (since I7 it also writes the FS/GS bases there at every entry). Since I6 the x87 state lives there (I6 deviation 12) and since I5b the AVX upper halves (YMM_Hi128, `frame::AVX_HIGH` C0H, outside `GUEST_STATE`): a guest data access to the page reaches that vCPU's own copy | G1 minimum (I1); boot-features plan, Built (I1, G1 minimum) |
-| Kernel not pinned: Debian 6.12.107 (64-bit boot protocol, ACPI-mailbox APs: no 32-bit or paging-off instruction runs with LA57 = 0) or Ubuntu 6.8 (its AP trampoline always goes 64 → compatibility → paging off → PAE/LME/PG → 64, so it needs the 32-bit items and LOCK BTS) | Choose first | s3g-plan.md §1, owner decision 3 |
-| Guest RAM beyond 4 MiB, a loader (bzImage, boot params, initramfs), devices, timer (APIC timer or TSC deadline), console (serial) | None | phase boundary |
-| Host writes to guest RAM (DMA, loader) | Only with every vCPU stopped; each sets FLUSH in every record | slice-3 §1 |
-
-## 4. Known performance and limits from this phase
-
-No tuning was done (owner, October 27). Latest measurement (S2g, October 27; tools/bench, two back-to-back pairs,
-single vCPU) against `qemu-system-x86_64` TCG on the same host:
-
-| Workload | natemu time vs QEMU TCG |
-|---|---|
-| int | 0.97× |
-| mem64 | 0.29× |
-| mem4096 | 2.59× |
-| call | 0.21× |
-| branchy | 0.70× |
-| mixed | 0.29× |
-
-mem4096's slowdown follows its power-of-two stride (cache-set conflicts, also native); a VM-only extra of 2–4 ns per
-iteration is unexplained. Known costs and limits:
-
-- **`ret` goes through the dispatcher:** about 15 dispatcher words per `ret` (call: 6.0 words per guest instruction;
-  the dispatcher is about 20% of `call`). Return-address prediction or `ret` linking would remove it.
-- **Data on a running code page:** a peer storing continuously to data on the page a vCPU runs from makes that vCPU
-  step every instruction (each shootdown is answered by the next store): `data@4` takes about 120,000 steps for 20,000
-  loop rounds.
-- **Walker CAS starvation:** a CPU storing to a PTE with no pause at all starves the walker's compare-exchange to about
-  200 walks/s; the watchdog contains it. x86's locked A/D update cannot be starved this way; no kernel stores this fast.
-- **Host round trip per system instruction** (until K2: since then one decode per translation, then a resident round
-  trip, about 0.4 us; boot-features plan, Built (K2)), and a **full cache and shadow flush per CR3 load** (no PCID): correct,
-  costly on context switches.
-- **INVLPG leaves spurious code bits:** it drops the vCPU's blocks of the 2 MiB range but keeps their pages' code-mask
-  bits, so later writes there still take the code-write path until the next flush (conservative).
-- **Stop latency tail:** since E1b a stop is a GIC doorbell (no `hv_vm_protect`); it takes effect at the interrupted
-  block's next boundary. Ring to stop, hot loop (E2, `kicks --kicks 1000`): p50 5–8 µs, p99 9–59 µs, with a
-  host-scheduling tail to about 5–8 ms (max per vCPU, 1 and 4 vCPUs).
-- **Doorbell ring cost:** `hv_gic_set_spi` takes 0.4 µs with one kicker and 5.5–6.9 µs on average with four kicking at
-  once (same run); acknowledging an IRQ in the resident (IAR to EOI) about 2.2–4 µs.
-- **Cancellation during a compile stall:** cancellation does not interrupt a pending compile request; a vCPU whose
-  compile server is alive but silent is released only at the request deadline (30 s default, `--compile-deadline-ms`).
-  A resident wait on a peer also counts that peer's compile time into the waiter's watchdog span.
-- **Resident stack:** 14,176 bytes at the deepest gate path, 19,616 with one nested entry to its halt, of a 32 KiB
-  exception stack (13,152 bytes margin; boot path 7,728 of 16 KiB; `tools/check_resident_stack.py`, E2). New resident paths (delivery, devices) must be
-  re-checked. An overflow is contained to the vCPU but overwrites its boot/block stack before it halts.
-- **Compile latency:** every distinct block is a host round trip on first use: since P3 about 0.04 ms per block (the
-  server compiles in process; 0.45-0.5 ms forked before), the host keeps answers by what fexc read (bytes to the
-  compile's extent, gating arguments consulted) and `boot-linux` keeps them across runs on disk
-  (`crates/host/src/compile_cache.rs`; `natemu` and `boot-linux` opt in by `Config::from_env`): `NATEMU_COMPILE_CACHE=DIR|off` (default `~/Library/Caches/natemu/fexc`),
-  `NATEMU_COMPILE_CACHE_MB` (default 512: a boot without initrd takes about 36 MiB, the initrd boot to the installer
-  658 MiB, mostly user code; past the cap a run stores nothing more; an open above 3/4 of the cap evicts other fexc
-  builds' packs, then user packs, then kernel ones, down to 3/4, so a run always has room). Test drivers never open it (`run_l1_smoke.py` sets it off). User-space code at randomized addresses is compiled
-  again per process (the RIP is part of each block): the initrd boot to the installer makes about 1.14 M compiles,
-  140 k with `norandmaps`.
-
-## 5. Open questions for the owner or the next phase
-
-1. Which kernel: Debian 6.12.107 (no 32-bit code on the planned boot) or Ubuntu 6.8 (32-bit AP trampoline, LOCK BTS)?
-   This decides whether S3g's 32-bit work returns.
-2. Exception delivery design: deliver in the resident (IDT walk, stack switch, IRET) as a system transaction, with
-   interrupts recognized only at block boundaries and drains? IPIs between vCPUs then need a host or resident path.
-3. Guest RAM size and layout: 4 MiB today; the boot needs at least tens of MiB, a firmware map and possibly holes or
-   MMIO, which the deleted resolver (owner decision 1) handled.
-4. Which CPUID profile to report (Intel vendor profile, no LA57, no PCID, no 1 GiB pages, no SSE until it is admitted?)
-   and how Linux behaves without SSE/XSAVE (it requires SSE2 on x86-64, so SSE admission is likely the first ISA item).
-5. Whether the dispatcher `ret` cost and the per-CR3 full flush (both measured, not tuned) need work before boot timings
-   matter, or stay deferred with the performance rule.
+- **Blocking:** the dangling interrupt-controller pointer in the library boot entry (§4, "Blocking defect found at
+  R2"): fix, add a library-path boot check with user-space console output to the standing suite, then rerun the
+  installer boots.
+- The C0 census half of plan §4's second item: after I10 the initramfs still has 15 refused sites not attributed to a
+  chunk (`pushq` 11, `xorl` 2, `subb` 2; plan, Built (I10), Census) and no census was rerun after X1c.
+- P1's outcome and the deferred optimisation list (plan Q5: P2's options A/B) have no owner record.
+- The independent review of the whole path (the plan's R2 row) is the orchestrator's.

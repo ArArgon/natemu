@@ -1,7 +1,8 @@
 # Boot-features phase plan
 
 Status: proposal, October 28, 2026, revised after independent review (ACCEPT-WITH-FIXES; read-only design, no code
-changed). Scope is the owner's next-phase direction ([vm-restructure.md](../vm-restructure.md), "Next phase scope",
+changed); built October 28 - November 2 (each chunk's "Built" note in §5); phase-end audit R2 November 2 (§4, and the
+integration handoff [boot-handoff.md](boot-handoff.md)). Scope is the owner's next-phase direction ([vm-restructure.md](../vm-restructure.md), "Next phase scope",
 October 28): build every feature a stock-kernel boot needs, each checked on the general path at this project's bar;
 the end-to-end boot itself is **not** in scope; x87 may use FEX's reduced-precision mode. Starting point:
 [boot-handoff.md](boot-handoff.md) (H), the [slice-3 contract](slice3-contract.md) §5 decisions D1–D3, the
@@ -123,13 +124,18 @@ The census C0 (§3) lists the forms the real binaries contain; rows below are th
 generated-code word, the address guard stays because it gives exact non-canonical #GP/#SS, and dispatch, faults and
 linked edges cost the same at both levels (P2 "Answer in brief", §5). Nothing in §1 therefore depends on the privilege
 level; the plan proceeds at EL1. P2's options A (EL0 with guards kept, defence in depth) and B (`ldtr`/`sttr` guest
-accesses from EL1, removing the guard for scalar accesses) are owner items for the deferred list (Q5).
+accesses from EL1, removing the guard for scalar accesses) are owner items for the deferred list (Q5). *Superseded
+(owner, October 28, §5 "adopt hardware-only checking first"):* translated code runs at EL0 with the address guard
+removed (E1-E3 built); the resident stays at EL1.
 
 **Remaining design choice (X2/L5):** how a pending interrupt reaches a vCPU running linked code — the existing precise
 stop (host kick via `hv_vm_protect`, slice-3 §1) or an in-VM native timer for local LAPIC deadlines. X2 builds on the
-precise stop; L5 measures whether timer kicks need the second route.
+precise stop; L5 measures whether timer kicks need the second route. *Decided (owner, October 28, §5):* the HVF
+in-kernel GIC is the doorbell for every asynchronous event and the stop is IRQ-triggered unlinking (E1b);
+`hv_vm_protect` is gone.
 
-**Decision point P1 (performance diagnosis, reported; independent replication pending; `experiments/track03/perf-diagnosis/`).**
+**Decision point P1 (performance diagnosis, reported and independently replicated, INV-03-01 "Next phase";
+`experiments/track03/perf-diagnosis/`).**
 The owner decides which measured costs, if any, enter this phase; the performance rule holds otherwise. Placed before
 the chunks most exposed to those costs (S3 syscall/PTI CR3 switches, X3 IPIs); no result is presumed.
 
@@ -216,24 +222,63 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 
 ## 4. Phase end: ready for boot integration
 
+Audit at R2 (November 2; HEAD 16b0576, fexc series44-r2 = series43-x1 byte for byte; raw summaries
+`natemu-raw/r2-20261102-01/`, "R2" below). An item is ticked only with the evidence named.
+
 - [ ] P2's recommendation and P1's outcome recorded by the owner; the deferred list holds options A/B if chosen (Q5).
+      *Open:* P2 is settled by the owner's later decision (§5, October 28: hardware-only checking, translated code at
+      EL0, E1-E3 built), and P1 returned and was independently replicated (INV-03-01 "Next phase"); but no owner record
+      states P1's outcome, and Q5 (the deferred list with P2's options A/B) is unanswered in §5.
 - [ ] Every §1 row maps to an R1 composite or a named check, and every refused form in the C0 census is implemented or
-      an accepted typed refusal.
-- [ ] CPUID/MSR profile as recorded (CPU 9/16/17 or the owner's variant), unit-tested leaf by leaf and MSR by MSR;
-      fault-model profile rederived independently.
-- [ ] Exceptions and interrupts delivered, not stopped: migrated fault corpora pass through the logging IDT; contracts
-      44 and 49 have general-path checks in [contracts.md](contracts.md).
-- [ ] LAPIC (xAPIC MMIO), timer, IPIs and the mailbox AP start work at N = 1..4.
-- [ ] Loader output passes the independent boot.rst checker for the chosen image; ACPI tables disassemble cleanly and
-      agree with CPUID/MADT/mailbox.
-- [ ] UART, port I/O (incl. the unassigned-port rule), PIC/IOAPIC, PIT, RTC and PM timer match QEMU on the cited
-      sequences; PM timer and TSC agree in rate.
-- [ ] Guest RAM at 2 GiB with the M69 holes; standing suite green at 4 MiB and 2 GiB.
-- [ ] ISA: ASM suite 0 fail with SSE, XSAVE, x87 (`X87_F64`), REP, LOCK and flag-move tests passing or refused with
-      reason; AVX per Q3.
-- [ ] R1a/R1b match QEMU at N = 1..4, block sizes default and 1.
-- [ ] Standing suite green; `check_resident_stack.py` passes on the final binary; nothing staged.
-- [ ] Integration handoff page: boot command, manifest inputs, known limits and costs (incl. PTI CR3 flushes).
+      an accepted typed refusal. *Half met:* the mapping is complete ("R1 coverage" and its R1b addendum below: no row
+      without a check). *Open:* the last census (I10, `natemu-raw/kernel-census-i10-20261030-01`) leaves 15 initramfs
+      sites unattributed (`pushq` 11, `xorl` 2, `subb` 2; Built (I10), Census) and no census was rerun after X1c; the
+      gathers and masked stores are accepted typed refusals (owner decision October 30 (2)).
+- [x] CPUID/MSR profile as recorded (CPU 9/16/17 or the owner's variant), unit-tested leaf by leaf and MSR by MSR;
+      fault-model profile rederived independently. Built (S1): `crates/abi/src/cpu_profile.rs` generated from
+      `tools/models/cpu_profile.json`, the abi tests replaying `cpu_profile.py`'s answers per leaf and MSR (`cargo test`
+      147 pass at R2), `tools/models/test_cpu_profile.py` and `test_cpu_profile_rs.py` (Python 317 pass at R2);
+      `tools/system_fault_model.py` written from the SDM, not natemu's code, over the same profile; `system` 0 failures.
+- [x] Exceptions and interrupts delivered, not stopped: migrated fault corpora pass through the logging IDT; contracts
+      44 and 49 have general-path checks in [contracts.md](contracts.md). Built (X1a, X1b, X1c, X2); at R2 faults 7,912
+      at both block sizes, loop faults 846 x 3, `delivery`, `events`, `run_x1.py` 6/6 and 188/188 green; contracts.md
+      rows 44 (I2 corpus, mid-string faults, `kicks` `rep@N`) and 49 (`events` judged by `delivery_model.py`).
+- [x] LAPIC (xAPIC MMIO), timer, IPIs and the mailbox AP start work at N = 1..4. At R2: `run_x3.py` (QEMU 9/9, IPIs
+      4/4, timers 24/24, stress 6/6, halt 10/10, cases 54/54), `run_x4.py` (33/33, 28/28, trampoline 6/6 at 2-4
+      vCPUs), `run_r1.py r1a` `r1-timer` (N = 1) and `r1b` (mailbox start, IPIs under load, NMI by IPI at N = 2-4), and
+      Debian booting at N = 1..4 with every CPU brought up ([boot-handoff.md](boot-handoff.md) §4).
+- [x] Loader output passes the independent boot.rst checker for the chosen image; ACPI tables disassemble cleanly and
+      agree with CPUID/MADT/mailbox. At R2: `run_l1.py` checks 12/12 and rejections 41/41 (`tools/models/bootproto.py`),
+      `run_l2.py` N = 1..4 pass (`acpi_model.py`), `run_l2_iasl.py` pass.
+- [x] UART, port I/O (incl. the unassigned-port rule), PIC/IOAPIC, PIT, RTC and PM timer match QEMU on the cited
+      sequences; PM timer and TSC agree in rate. At R2: `run_l3.py` 0 failures, `run_l4a.py` (QEMU 13/13 and the
+      rest), `run_l4b.py` (QEMU 5/5, cases 11/11, modes 7/7, `clocks` 1/1: PM/PIT/LAPIC/RTC against the TSC).
+- [ ] Guest RAM at 2 GiB with the M69 holes; standing suite green at 4 MiB and 2 GiB. *Met at 2 GiB* (Built (M1), the
+      legacy hole Built (L3); the suite below). *At 4 MiB* every runner that can run there is green, but four cannot
+      by construction: `run_x4.py` and `run_l3.py` identity-map pages at 0x500000/0x400000, `run_m1.py`'s high cases
+      place at 0x7ff00000, `run_m2.py types` builds an MTRR overlap the SDM leaves undefined at that size (its model
+      raises). Not an emulator result; open until those runners skip or resize at small RAM, or the owner accepts it.
+- [x] ISA: ASM suite 0 fail with SSE, XSAVE, x87 (`X87_F64`), REP, LOCK and flag-move tests passing or refused with
+      reason; AVX per Q3. At R2: 2,270 tests, 1,875 pass, 0 fail, 48 x87 precision deviations (the reduced-precision
+      class), 347 unsupported with reasons; AVX/AVX2/FMA/F16C kept by the owner (§5, October 28) and built (I8).
+- [x] R1a/R1b match QEMU at N = 1..4, block sizes default and 1. R1a 7/7 at N = 1 (Built (R1a),
+      `natemu-raw/r1-20261102-01/`), R1b 4 programs at N = 2, 3, 4 (Built (R1b), `natemu-raw/r1-20261102-01/r1b/`);
+      rerun at R2 at 4 MiB and 2 GiB: R1a 7/7 and R1b 12/12 each, both block sizes, negative controls flagged.
+- [x] Standing suite green; `check_resident_stack.py` passes on the final binary; nothing staged. At R2 at 2 GiB: every
+      command of [boot-handoff.md](boot-handoff.md) §5 green but the 7 recorded i8b QEMU two-NaN departures (Built (I8)
+      review) at both block sizes; the stack check `ok` (gate 19,168 of 32,768 bytes, nested 23,312, boot 12,832);
+      `git status`: only the R2 documentation changes, unstaged.
+- [x] Integration handoff page: boot command, manifest inputs, known limits and costs (incl. PTI CR3 flushes).
+      [boot-handoff.md](boot-handoff.md), rewritten at R2: K1 keeps code across CR3 loads; each still resets the data
+      shadows (no PCID), the PTI cost with mitigations on.
+
+**Blocking for integration (found at R2):** the library boot entry (`natemu` stub and `boot-linux`, both through
+`natemu::linux::Boot`) delivers device interrupts through a dangling pointer: `irq::Lapics::memory` points at the local
+`backing` of `Boot::prepare`, which is then moved into `Prepared` (L0, 3c12567). User-space console output is lost (IRQ 4
+never taken) and the installer initrd hangs after "Run /init" at N = 1, 2 and 4, warm cache or off; 959e430 (before L0)
+and QEMU print. A scratch fix re-pointing it in `Prepared::run` reaches the dialog. Details, evidence and the boot
+tables: [boot-handoff.md](boot-handoff.md) §4. The standing suite cannot see it (`run-program` does not move its
+backing); it needs a library-path boot check.
 
 **R1 coverage (R1a, November 2).** Each §1 row with the R1a composite that exercises it (if any) and the named checks
 that judge it. *1a:* IDT delivery: `r1-demand`, `r1-int3`, `r1-boot` (#UD); `run_slice3_vm.py delivery`. TSS.RSP0/IST:
@@ -261,10 +306,24 @@ I5a corpora. AVX: `run_i8_faults.py`, the I8 corpora. x87: `run_i6_faults.py`, `
 `run_l2_iasl.py`. Port I/O and the 16550A: `r1-serial`; `run_l3.py`. Legacy island: `run_l4a.py`, `run_l4b.py`.
 Virtual time: the L5 unit tests (`cargo test`), `run_l4b.py clocks`. Shutdown: `run_l4b.py` (S5). **Rows without any
 check:** none. Partial: the decompressor's LA57 probe is not transcribed (CPUID.7.ECX[16] = 0 and CR4.LA57 reserved are
-unit-tested); a CPL 3 -> 0 stack switch, NMI, IPIs and the mailbox start appear in no R1a composite (single vCPU, CPL 0
-start) and are R1b's; the C0 census half of the first checkbox is open.
+unit-tested); the C0 census half of the second checkbox is open.
+
+**R1 coverage addendum (R1b, November 2).** The multi-vCPU rows R1a left open now have a composite. Mailbox AP start:
+`r1b-mpstart` (and `run_x4.py`). Cross-vCPU code coherence / kernel self-modifying code at N > 1: `r1b-poke` (the
+`text_poke_bp` INT3 protocol with peers executing the site, the sync IPI's IRETQ as `sync_core`; and `run_k1.py`,
+`coherence`). NMI by IPI, the paranoid LSL/RDGSBASE/WRGSBASE/SWAPGS entry on an IST stack: `r1b-nmi` (and
+`run_x1.py qemu`'s paranoid entries, which already cover a CPL 3 -> 0 and CPL 0 -> 0 stack switch through TSS.RSP0 and
+every IST index). IPIs and EOI under concurrent load, per-pair exactness: `r1b-ipiload` (and `run_x3.py`, `run_l4a.py`).
+A CPL 3 -> 0 stack switch and IST delivery are judged by the existing X1b checks (`run_x1.py qemu`); the R1b composites
+start at CPL 0, as a kernel does after `secondary_startup_64`.
 
 ## 5. Owner questions and recorded decisions
+
+**Owner decisions (November 2, phase end):** (1) faster first-time code (parallel compiling, translating ahead of
+use, translations reusable across load addresses) is the next chunk after this phase, measured first; (2) an AES-based
+random-number generator inside the VM, seeded from the host, is after this phase; (3) raising and testing guest RAM
+beyond 3 GiB and vCPUs beyond 4 is after this phase; (4) CR0.NE = 0 (x87 external-error mode) stays a named stop
+(`unsupported_ferr`); (5) INCSSP without CET follows the SDM (#UD), not QEMU. (1)-(3) are on the deferred list below.
 
 **Owner decisions (October 28):** kernel = Debian 6.12 (32-bit stays deferred); fetching the Debian kernel,
 config and initramfs into natemu-raw is allowed (nothing committed); mitigations are booted off on the command line
@@ -421,9 +480,9 @@ RDMSR/WRMSR with the profile's #GP rules before any effect; MISC_ENABLE bit 22 l
 UCODE_REV latch with virtual revision 0, FS/GS_BASE are the bank's `Cpu::fs_base/gs_base` (I7), an MTRR write drops the vCPU's code and shadows (CPU 9),
 PAT and MTRRs are recorded for M2. The MSRs live in their own record after `State` (`execution::MSRS_OFFSET`), written by
 the host at reset (vCPU 0 is the BSP). CR4: bits outside the profile's 0x1507bc are #GP; PSE and TSD are implemented;
-DE, PCE, OSFXSR, OSXMMEXCPT, FSGSBASE, OSXSAVE stay refused. IA32_APIC_BASE: the BSP flag (bit 8) is R/W (SDM Vol.4
+DE, PCE, OSFXSR, OSXMMEXCPT, FSGSBASE, OSXSAVE stay refused (since S2a, I5a and I5b each is implemented: Built (S2a), (I5a), (I5b)). IA32_APIC_BASE: the BSP flag (bit 8) is R/W (SDM Vol.4
 Table 2-2; the profile's mask was corrected after review, so the BSP may write back what it reads); a write changing
-EN, EXTD or the base is refused (no LAPIC yet; the profile notes the x2APIC -> xAPIC and disabled -> x2APIC #GP rules
+EN, EXTD or the base is refused (until X3, which built the LAPIC: Built (X3); then no LAPIC yet; the profile notes the x2APIC -> xAPIC and disabled -> x2APIC #GP rules
 for that chunk). After review also: the leaf 4 terminator is all zeros at any vCPU count; IA32_FMASK 63:32 are reserved
 (#GP; SDM Vol.4 Table 2-2), SYSENTER_CS keeps all 64 bits ("not used, can be read and written"). TSC is provisional
 (L5): CNTVCT scaled to 1 GHz plus a per-vCPU offset, which the host sets from one CNTVCT sample per VM, so every TSC
@@ -487,7 +546,7 @@ is not observable there), DR7.GD a #DB fault (vector 1) before the access with D
 kept; the SDM lets either happen), then #GP for a 1 in bits 63:32 of DR6/DR7; DR0-3 take any 64-bit value; DR6 keeps
 B0-3/BD/BS/BT, DR7 L0-G3/LE/GE/GD/R/W/LEN, the other bits read as fixed (no RTM, no bus-lock detection; `system_fault_model.dr_write` models the read-back). RDPMC (`0f 33`):
 #GP(0) at CPL > 0 without CR4.PCE, and at any CPL otherwise, since the profile has no counters (CPUID.0AH = 0: every ECX is
-invalid). Choices: **AM/AC** — alignment checking is not built; the state CR0.AM ∧ RFLAGS.AC ∧ CPL 3 is refused as a mode
+invalid). Choices: **AM/AC** (superseded: X2 built #AC, Built (X2)) — alignment checking is not built; the state CR0.AM ∧ RFLAGS.AC ∧ CPL 3 is refused as a mode
 (`Cpu::control` is `None`, stop `unsupported_mode`, the record holding the new CR0/CPL and the old RIP) wherever it would
 begin: driver start, a CR0 write (`commit`'s mode check) and every CPL change (`set_cpl` makes the same check). The future
 RFLAGS writers (POPF, IRET, SYSRET) must use the same check. AM or AC alone, or both at CPL 0, run. Building #AC (alignment
@@ -2024,7 +2083,7 @@ by VEX map, pp, L, W and reserved vvvv and by operand kind (SDM Vol.2 per instru
 AVX2 integer forms, VPERMD/VPERMPS/VPERMQ/VPERMPD, VPERM2F128/VPERM2I128, VINSERT/VEXTRACT F128/I128, VBROADCASTSS/SD/F128/
 I128, VPBROADCASTB/W/D/Q, VPBLENDD, VPSLLV/VPSRLV/VPSRAV, VPERMILPS/PD, VTESTPS/PD, FMA (packed, scalar, ADDSUB/SUBADD in
 the three orders), VCVTPH2PS and VCVTPS2PH (register destination), VZEROUPPER/VZEROALL. Scalar ("LIG") forms are admitted
-with VEX.L = 0 only (policy). The BMI1/BMI2 forms are as I1 (`pdep`/`pext` still refused). Refused with their reason
+with VEX.L = 0 only (policy). The BMI1/BMI2 forms are as I1 (`pdep`/`pext` still refused; built in I9). Refused with their reason
 (`unsupported_form`, before any effect): VGATHER*/VPGATHER* (FEX's element loop), VMASKMOVPS/PD, VPMASKMOVD/Q and
 VMASKMOVDQU (FEX's masked load/store loops or a full store), VLDMXCSR/VSTMXCSR (the resident's MXCSR transaction decodes the
 legacy forms only), VCVTPS2PH to memory (its conversion raises MXCSR flags before the store, which may fault),
@@ -2074,7 +2133,7 @@ keeps a NaN under FPCR.AH = 1, selected per lane. FMA is Arm's fused multiply-ad
 flags matched QEMU on the corpus. F16C follows the SDM where QEMU 7.2 does not: VCVTPS2PH ignores MXCSR.FTZ (FPCR.FZ16
 stays clear: a tiny result is a half denormal, UE and PE when inexact) and VCVTPH2PS ignores DAZ and reports no DE. DE as
 I5a (IDC unless DAZ), judged by hand cases below.
-**Deviations** (I8): (1) the SDM's #UD encodings of VEX forms (reserved VEX.L/W/vvvv, wrong operand kind, unadvertised VEX
+**Deviations** (I8; (1), the 0x67 part of (6) and VLDMXCSR/VSTMXCSR, VPCMPxSTRx and VEX AES/PCLMULQDQ in (3) were resolved later: Built (I8) review, (I6b), (I9), (I10)): (1) the SDM's #UD encodings of VEX forms (reserved VEX.L/W/vvvv, wrong operand kind, unadvertised VEX
 forms such as AVX-VNNI) are typed refusals, not delivered #UD; (2) scalar LIG forms with VEX.L = 1 are refused (hardware
 runs them); (3) gathers, masked moves (so the SDM's non-faulting masked-off element is not built), VLDMXCSR/VSTMXCSR,
 VCVTPS2PH m, VPCMPxSTRx and VEX AES/PCLMULQDQ are refused; (4) a 32-byte vector access that is 8-byte aligned under
@@ -3431,6 +3490,40 @@ HLT itself. **Program note:** an undefined flag must not reach compared state: X
 (default block size) sets it where QEMU clears it; `r1-boot` therefore writes its gate before `popfq` and zeroes R14
 with MOV (not an emulator defect). No emulator defect found.
 
+*Built (R1b, multi-vCPU composites; checks only, no emulator or fexc change, series43-x1, on 9730c4d):* `tools/run_r1.py r1b`
+runs four programs at N = 2, 3, 4, block sizes default and 1. Three (`r1b-poke`, `r1b-nmi`, `r1b-ipiload`) are one program
+run by pinned QEMU (its BSP is x2APIC with peers, so the IPI and NMI programs use x2APIC) and natemu; `r1b-mpstart` needs a
+natemu build (the BSP wakes APs through the ACPI mailbox) and a QEMU build (its stub starts the APs at the same vector),
+as `run_x4.py` does. With peers the delivery logs (which vector landed when, the TSC) are not deterministic, so only
+exact counts, the per-CPU end registers (cleared to a known value at each body's end so timing-dependent loop state does
+not leak), and deterministic captured memory are compared; SDM invariants (LSL = the CPU number, no lost or duplicated
+IPI, EOI leaving the ISR clear) are judged on both machines. Every address is below 4 MiB and clear of the smp stub's
+reserved ranges; programs that change the GS base restore the start-up value by MSR before the end, since QEMU's stub
+capture is GS-relative. **`r1b-mpstart`:** the BSP wakes each AP (ACPI MP-wakeup mailbox, `events::wait_mailbox`); each AP,
+from its wakeup vector in the firmware wake state, sets a valid RSP, loads its own GDT (LRETQ to 0x08), own IDT, GS base
+(IA32_GS_BASE) onto a per-CPU block, reads its APIC id by CPUID, stamps `[gs:0]`, and `lock inc`s an arrival counter;
+every AP's recorded APIC id, GDT/IDT base, GS base, RSP and CS, and the arrival count, are compared (QEMU's stub brings
+the APs up to the same vector). **`r1b-poke`:** CPU 0 patches a shared run-time code function by the `text_poke_bp`
+protocol (INT3 on the opcode byte; a sync IPI to every peer, whose handler's IRETQ is the serializing `sync_core`; the
+imm tail; sync; the real opcode; sync) while the peers call it in a loop with a short compute delay between calls (a
+continuous hammer on the page would make natemu step every instruction, H section 4); each peer's #BP handler emulates
+the new instruction. Every peer ends reading the new value (K2), never a torn value, and the final function bytes are the
+patched instruction. **`r1b-nmi`:** CPU 0 sends N_K NMIs (x2APIC ICR, NMI delivery mode, physical) to each peer,
+handshaked so none coalesces; each peer takes them on IST1 through a paranoid handler that RDGSBASEs the saved base, reads
+its CPU number with LSL of a per-CPU "CPU/node" descriptor, WRGSBASEs the canonical per-CPU base, does a SWAPGS pair, and
+restores; every peer's NMI count and LSL-derived CPU number are exact. **`r1b-ipiload`:** every CPU runs an LCG sweep over
+its private page while sending IL_K fixed-vector IPIs to every other CPU (one distinct vector per ordered pair,
+handshaked so counts are exact); each ordered pair's delivery count equals IL_K, every CPU's ISR and PPR are clear at the
+end (every delivery EOIed), and each CPU's loop checksum matches QEMU. **Results** (`natemu-raw/r1-20261102-01/`): 4 of 4
+match QEMU and the SDM invariants at N = 2, 3, 4 and both block sizes; two further no-negative repeats 12 of 12.
+**Negative controls** (a wrong natemu variant against the correct program's QEMU state; each flagged): every AP uses
+CPU 0's per-CPU block for its GS base (the recorded bases diverge); the restored opcode is `mov ecx` not `mov eax` (peers
+never read K2); every CPU/node descriptor limit is 0 (LSL yields 0, not the CPU number); CPU 0 sends one fewer IPI toward
+CPU 1 (that pair's count is short). **Construction notes** (not emulator defects): a mailbox-woken AP starts with RSP = 0,
+so RSP must be set before the far return; the AP reads its APIC id by CPUID, not the x2APIC MSR, since the stub leaves
+peers in xAPIC mode; the handshake reads a delivery count before sending, not after, or a delivery between send and read
+would make the wait target unreachable. No emulator defect found.
+
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 
 **Owner decision (October 29, amendment after L3):** unassigned memory pages (including the legacy hole 0xA0000–0x100000) are mapped read-only and non-executable onto one shared all-ones page, so every read form (compare, checksum, string, SSE) runs natively and exactly; reads are counted per page on first touch (shadow fill), writes stay counted per access and complete as ignored for MOV forms (other write forms keep their typed refusals); fetch stays a typed stop; the strict switch still turns all of it into stops. Context: Linux's `reserve_ibft_region`, `probe_roms`, DMI and `smp_scan_config` scan 0x80000–0xFFFFF with CMP/checksum/string loops. Pages a device claims stay unshadowed (M3); the LAPIC's possible page is always a device page.
@@ -3439,6 +3532,9 @@ with MOV (not an emulator defect). No emulator defect found.
 **Deferred (owner, October 28):** replacing the host's minimal JSON reader (`crates/host/src/json.rs`, used only for
 fexc's per-compile report: end reason and cut opcode) by carrying those fields in the code-object header; no registry
 dependency (serde_json) is added.
+**Deferred (owner, November 2, phase end):** faster first-time code (parallel compiling, translating ahead of use,
+translations reusable across load addresses; the next chunk, measured first); an AES-based in-VM random-number generator
+seeded from the host; guest RAM beyond 3 GiB and more than 4 vCPUs, raised and tested.
 
 **Decided from evidence (recorded, not questions):** guest RAM default 2 GiB, tests choose their own size (M69);
 INIT/SIPI deferred, unused with the mailbox (`K kernel/smpboot.c:877-928`; M64 keeps the definition); legacy devices
