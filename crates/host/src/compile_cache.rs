@@ -381,15 +381,21 @@ pub struct Config {
 impl Config {
     pub const OFF: Self = Self { dir: None, cap: 0 };
     /// The configuration from the environment (callers opt in): `NATEMU_COMPILE_CACHE` = a directory or `off` (default
-    /// `~/Library/Caches/natemu/fexc`), `NATEMU_COMPILE_CACHE_MB` = the cap (default 512).
-    pub fn from_env() -> Self {
+    /// `~/Library/Caches/natemu/fexc`), `NATEMU_COMPILE_CACHE_MB` = the cap (default 512; anything but a whole number of
+    /// MiB is an error, not the default).
+    pub fn from_env() -> Result<Self, String> {
         let dir = match std::env::var_os("NATEMU_COMPILE_CACHE") {
             Some(v) if v == "off" => None,
             Some(v) => Some(PathBuf::from(v)),
             None => std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Caches/natemu/fexc")),
         };
-        let cap = std::env::var("NATEMU_COMPILE_CACHE_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(512) << 20;
-        Self { dir, cap }
+        let cap = match std::env::var_os("NATEMU_COMPILE_CACHE_MB") {
+            None => 512 << 20,
+            Some(v) => v.to_str().and_then(|v| v.parse::<u64>().ok()).and_then(|mb| mb.checked_mul(1 << 20)).ok_or_else(|| {
+                format!("NATEMU_COMPILE_CACHE_MB={}: a whole number of MiB", v.to_string_lossy())
+            })?,
+        };
+        Ok(Self { dir, cap })
     }
 }
 

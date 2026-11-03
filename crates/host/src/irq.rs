@@ -232,6 +232,15 @@ impl Irqs {
     pub fn attach(&self, doorbell: Doorbell) {
         self.lock().lapics.doorbell = Some(doorbell);
     }
+    /// Before the machine goes: no delivery rings its doorbells any more (rings happen under the chipset lock, so none is
+    /// in progress when this returns; one could otherwise reach a destroyed VM, or the SPIs of the process's next one).
+    pub fn detach(&self) {
+        self.lock().lapics.doorbell = None;
+    }
+    /// A machine's doorbells are attached.
+    pub fn attached(&self) -> bool {
+        self.lock().lapics.doorbell.is_some()
+    }
     /// A LAPIC's EOI of level-triggered `vector` (the broadcast to the I/O APIC).
     fn eoi(&self, vector: u64) {
         let mut c = self.lock();

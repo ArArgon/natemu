@@ -42,9 +42,11 @@ from programs import STACK, asm  # noqa: E402
 from run_slice3_vm import driver, per_vcpu_checks, smp_description  # noqa: E402
 from models import mailbox_model  # noqa: E402
 
-MB = 0x500000                                  # the mailbox page
-SLOT = lambda i: 0x510000 + 0x100 * i          # what AP i saw at its first instructions
-R = 0x520000                                   # the BSP's results: ACK[k] at +0, T0[k] at +0x100, T1[k] at +0x200, its CR3 and CS at +0x700; table at +0x800
+# Below 4 MiB (owner decision 7, November 2: the 4 MiB suite runs every runner; the mailbox's address is the program's
+# choice, nothing here depends on it), clear of the driver's identity-space stacks and logging pages (0x3e0000-0x3eefff).
+MB = 0x300000                                  # the mailbox page
+SLOT = lambda i: 0x310000 + 0x100 * i          # what AP i saw at its first instructions
+R = 0x320000                                   # the BSP's results: ACK[k] at +0, T0[k] at +0x100, T1[k] at +0x200, its CR3 and CS at +0x700; table at +0x800
 V = lambda i: 0x130000 + 0x1000 * i            # AP i's vector
 VA = lambda i: 0x140000 + 0x1000 * i           # a second vector for AP i (never to be run)
 BSP = 0x110000
@@ -235,7 +237,7 @@ def cmd_units(a, report):
 
 
 # ---- the review's adversarial cases ------------------------------------------------------------------------------------
-ALIAS = 0x5f0000           # a second linear page onto the mailbox page (its PTE's address bits cleared: 0x5f0000 -> 0x500000)
+ALIAS = 0x3f0000           # a second linear page onto the mailbox page (its PTE's address bits cleared: 0x3f0000 -> 0x300000)
 
 
 def wait_ack(mb, k):

@@ -27,6 +27,22 @@ const MAP_0F3A: u8 = 6;
 /// fexc's VEX map (`FEXC_MAP_VEX`, I8): the opcode byte after the VEX prefix.
 const MAP_VEX: u8 = 8;
 
+/// The legacy prefixes as x86 reads them, with REX bytes among them: the opcode's index in `insn` and the REX in force
+/// (0: none). Only a REX immediately before the opcode counts, the last of several; one followed by a legacy prefix is
+/// ignored (SDM Vol.2 2.2.1, "other placements are ignored"; FEX's `DecodeREXIfValid` does the same). OpenSSL's
+/// CRYPTOGAMS strings in `.text` decode as such chains (census, R2 review).
+pub(crate) fn opcode_at(insn: &[u8]) -> (usize, u8) {
+    let mut rex = 0;
+    for (i, &b) in insn.iter().enumerate() {
+        match b {
+            0x40..=0x4f => rex = b,
+            0xf0 | 0xf2 | 0xf3 | 0x66 | 0x67 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 => rex = 0,
+            _ => return (i, rex),
+        }
+    }
+    (insn.len(), rex)
+}
+
 /// Decodes the instruction at the start of `bytes`, which fexc cut as a system instruction with opcode map `map` and
 /// opcode `opcode`.
 pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
@@ -37,8 +53,15 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         p => p,
     };
     let mut mixed = false;
+    let mut rex = 0;
     loop {
         match *bytes.get(at)? {
+            // REX bytes among the prefixes: the last one before the opcode counts ([`opcode_at`]).
+            r @ 0x40..=0x4f => {
+                rex = r;
+                at += 1;
+                continue;
+            }
             0xf0 => lock = true,
             0x66 => operand16 = true,
             0x67 => address_size = true,
@@ -50,16 +73,10 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
             p @ (0xf2 | 0xf3) => rep = p,
             _ => break,
         }
+        rex = 0;
         at += 1;
     }
     let mut rep_used = false;
-    let mut rex = match bytes[at] {
-        r @ 0x40..=0x4f => {
-            at += 1;
-            r
-        }
-        _ => 0,
-    };
     let (w, r) = (rex & 8 != 0, u32::from(rex >> 2 & 1) << 3);
     match map {
         MAP_TWO if *bytes.get(at)? == 0x0f && *bytes.get(at + 1)? == opcode => at += 2,
@@ -428,7 +445,7 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
 /// instruction that is not lockable as a system instruction, and LOCK on a system instruction is #UD too (SDM Vol.2
 /// "LOCK"), so no operand needs decoding.
 pub(crate) fn lock_ud(bytes: &[u8]) -> Option<System> {
-    let prefixes = bytes.iter().take_while(|b| matches!(b, 0xf0 | 0xf2 | 0xf3 | 0x66 | 0x67 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65));
+    let prefixes = bytes[..opcode_at(bytes).0].iter();
     prefixes.take(14).any(|&b| b == 0xf0).then_some(System { kind: system::LOCK_UD, lock: 1, length: 1, ..System::NONE })
 }
 
@@ -526,12 +543,9 @@ pub(crate) fn undefined(bytes: &[u8]) -> Option<System> {
         match *bytes.get(at)? {
             0x66 => p66 = true,
             p @ (0xf2 | 0xf3) => rep = p,
-            0x67 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 => {}
+            0x67 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x40..=0x4f => {}
             _ => break,
         }
-        at += 1;
-    }
-    if matches!(bytes[at], 0x40..=0x4f) {
         at += 1;
     }
     let modrm = |k: usize| bytes.get(at + k).map(|m| (m >> 6 == 3, m >> 3 & 7));
@@ -599,11 +613,8 @@ pub(crate) fn undefined(bytes: &[u8]) -> Option<System> {
 pub(crate) fn branch(bytes: &[u8], rip: u64) -> Option<System> {
     let mut at = 0;
     let mut a32 = false;
-    while let Some(&p @ (0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf2 | 0xf3)) = bytes.get(at) {
+    while let Some(&p @ (0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf2 | 0xf3 | 0x40..=0x4f)) = bytes.get(at) {
         a32 |= p == 0x67;
-        at += 1;
-    }
-    if matches!(bytes.get(at), Some(0x40..=0x4f)) {
         at += 1;
     }
     let op = *bytes.get(at)?;
@@ -743,12 +754,13 @@ mod lock_tests {
     }
     #[test]
     fn lock_prefix_anywhere_in_the_legacy_prefixes() {
-        for bytes in [&[0xf0, 0x89, 0x03][..], &[0x66, 0xf0, 0x01, 0xd8], &[0xf3, 0xf0, 0x0f, 0x1e, 0xfa], &[0x64, 0xf0, 0xf4]] {
+        // R2 review: a REX before F0 is ignored, the F0 is still a prefix (SDM Vol.2 2.2.1).
+        for bytes in [&[0xf0, 0x89, 0x03][..], &[0x66, 0xf0, 0x01, 0xd8], &[0xf3, 0xf0, 0x0f, 0x1e, 0xfa], &[0x64, 0xf0, 0xf4], &[0x48, 0xf0, 0x89, 0x03]] {
             let s = super::lock_ud(bytes).unwrap();
             assert!(s.well_formed() && s.lock == 1 && s.kind == super::system::LOCK_UD, "{bytes:x?}");
         }
-        // No LOCK, or an f0 byte after the REX/opcode (a ModRM or immediate) is no prefix.
-        for bytes in [&[0x89, 0x03][..], &[0x48, 0xf0], &[0xb0, 0xf0], &[]] {
+        // No LOCK, or an f0 byte after the opcode (a ModRM or immediate) is no prefix.
+        for bytes in [&[0x89, 0x03][..], &[0x48, 0x89, 0xf0], &[0xb0, 0xf0], &[]] {
             assert!(super::lock_ud(bytes).is_none(), "{bytes:x?}");
         }
     }
@@ -800,6 +812,19 @@ fn rm(bytes: &[u8], at: &mut usize, rex: u8, s: &mut System) -> Option<u32> {
 mod tests {
     use super::*;
     use system::*;
+
+    /// R2 review: REX bytes among the prefixes, the last before the opcode in force (SDM Vol.2 2.2.1).
+    #[test]
+    fn rex_chains() {
+        assert_eq!(opcode_at(&[0x4f, 0x47, 0x41, 0x4d, 0x53]), (4, 0x4d)); // CRYPTOGAMS: push r11
+        assert_eq!(opcode_at(&[0x48, 0x66, 0x89, 0xc0]), (2, 0)); // the REX before 66 is ignored
+        assert_eq!(opcode_at(&[0x66, 0x48]), (2, 0x48));
+        // mov cr3, r8 with a W/X chain before its REX.B; mov rax, cr0 with a REX.B before an F0 (ignored: rax, not r8)
+        let crs = |s: Option<System>| s.map(|s| (s.kind, s.cr, s.reg, s.length, s.lock));
+        assert_eq!(crs(d("49410f22d8", 0x22)), crs(d("410f22d8", 0x22)).map(|(k, c, r, l, x)| (k, c, r, l + 1, x)));
+        assert_eq!(crs(d("41f00f20c0", 0x20)), crs(d("f00f20c0", 0x20)).map(|(k, c, r, l, x)| (k, c, r, l + 1, x)));
+        assert!(lock_ud(&[0x48, 0xf0, 0x0f, 0x22, 0xd8]).is_some());
+    }
 
     fn d(hex: &str, opcode: u8) -> Option<System> {
         let bytes: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();

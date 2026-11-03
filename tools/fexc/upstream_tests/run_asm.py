@@ -229,6 +229,10 @@ def mnemonic(binary, address):
     r = subprocess.run(['ndisasm', '-b', '64', '-o', hex(CODE), '-e', str(address - CODE), '/dev/stdin'], input=binary, capture_output=True)
     first = r.stdout.decode(errors='replace').splitlines()[:1]
     words = first[0].split()[2:] if first else []
+    if words and words[0].startswith('rex'):
+        # R2 review: ndisasm prints a REX that is not the last before the opcode as an instruction of its own; x86 ignores
+        # it (SDM Vol.2 2.2.1), so the instruction is the one after it (FEX_bugs/REX/0F_38.asm: `4f 66 48 0f 38 f6`, adcx).
+        return mnemonic(binary, address + 1)
     return ' '.join(words[:2] if words and words[0] in PREFIXES else words[:1]) or '?'
 
 

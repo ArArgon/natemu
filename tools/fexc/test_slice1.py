@@ -65,7 +65,7 @@ UNSUPPORTED = {
     # I10: 0x67 on BT/BTS/BTR/BTC m, r (no SDM rule for the register's offset with a 32-bit address); SS on xlat
     'addr32 bt [eax],ecx': '670fa308', 'addr32 bts [eax],rcx': '67480fab08', 'ss xlat': '36d7',
     # I7: an FS/GS override with nothing to override, or with a second segment prefix (no SDM rule; FEX and QEMU differ)
-    'fs mov rax,rcx': '644889c8', 'gs push rax': '6550', 'gs ret': '65c3', 'fs leave': '64c9', 'gs pushf': '659c', 'fs jmp rel8': '64eb00',
+    'fs mov rax,rcx': '644889c8', 'gs push rax': '6550', 'gs ret': '65c3', 'fs leave': '64c9', 'gs pushf': '659c',
     'fs cs mov rax,[rax]': '642e488b00', 'ds gs mov rax,[rax]': '3e65488b00', 'fs gs mov rax,[rax]': '6465488b00', 'fs fs mov [rax],rcx': '6464894808',
     # Intel's class since series27; still cut: SS with CS/DS/ES (mixed classes), SS on a moffs operand
     'ss ds mov rax,[rbx] (mixed)': '363e488b03', 'ss movabs rax,[moffs]': '3648a10102030405060708',
@@ -209,7 +209,7 @@ REPS = {'rep movsb': 'f3a4', 'rep movsq': 'f348a5', 'rep stosq': 'f348ab', 'rep 
 # (name, hex, translated-instruction count): control transfers end the block with their normal exit.
 BRANCHES = {
     'jmp rel8': 'eb05', 'jmp rel32': 'e905000000', 'jne rel8': '7505', 'je rel32': '0f8405000000', 'call rel32': 'e805000000',
-    'ds jne rel8 (hint, ignored)': '3e7505', 'gs jmp [rax+8]': '65ff6008', 'fs call [rip+0x10]': '64ff1510000000',
+    'ds jne rel8 (hint, ignored)': '3e7505', 'fs jmp rel8 (ignored as by processors, R2 review)': '64eb00', 'gs jb rel8': '657205', 'fs gs jmp rel32': '6465e905000000', 'gs jmp [rax+8]': '65ff6008', 'fs call [rip+0x10]': '64ff1510000000',
     'loop rel8': 'e205', 'loope rel8': 'e105', 'loopne rel8': 'e005', 'jrcxz rel8': 'e305',
     # I10: 0x67: ECX for LOOP/JECXZ, ignored by direct branches (a relaxed `addr32 call`), the memory operand's address
     'addr32 loop': '67e205', 'jecxz': '67e305', 'addr32 call rel32': '67e805000000', 'addr32 jmp rel8': '67eb05', 'addr32 jne rel32': '670f8505000000',
@@ -566,7 +566,7 @@ class Slice1Exits(unittest.TestCase):
                     d, rc = run(PRE + x)
                     self.assertEqual(rc, 0)
                     n, _ = check_exits(self, d, tmp, name)
-                    self.assertEqual(n, 2 if name in ('jne rel8', 'bnd jne rel8', 'ds jne rel8 (hint, ignored)', 'je rel32', 'loop rel8', 'loope rel8', 'loopne rel8', 'jrcxz rel8',
+                    self.assertEqual(n, 2 if name in ('jne rel8', 'bnd jne rel8', 'ds jne rel8 (hint, ignored)', 'gs jb rel8', 'je rel32', 'loop rel8', 'loope rel8', 'loopne rel8', 'jrcxz rel8',
                                                      'addr32 loop', 'jecxz', 'addr32 jne rel32') else 1, name)   # taken and fall-through gates
             for name, x in (('fall off the window', PRE), ('cut before cr3 write', PRE + SYSTEM['mov cr3,rax'])):
                 with self.subTest(name):

@@ -58,10 +58,14 @@ def two(op, plain, modrm):
 
 def parse(b):
     """-> dict(prefixes, rex, kind('vex'|'xop'|'p'|'0f'|'0f38'|'0f3a'), op, modrm) or None"""
-    i, pre = 0, set()
-    while i < len(b) and b[i] in LEGACY: pre.add(b[i]); i += 1
-    rex = 0
-    if i < len(b) and 0x40 <= b[i] <= 0x4F: rex = b[i]; i += 1
+    # R2 review: any run of legacy prefixes and REX bytes; only a REX immediately before the opcode counts, the last of
+    # several (SDM Vol.2 2.2.1: other placements are ignored; FEX's DecodeREXIfValid). OpenSSL's CRYPTOGAMS strings in
+    # .text decode as such chains (`4f 47 41 4d 53`, push r11).
+    i, pre, rex = 0, set(), 0
+    while i < len(b) and (b[i] in LEGACY or 0x40 <= b[i] <= 0x4F):
+        if b[i] in LEGACY: pre.add(b[i]); rex = 0
+        else: rex = b[i]
+        i += 1
     if i >= len(b): return None
     o = b[i]
     g = lambda k: b[i + k] if i + k < len(b) else 0
@@ -238,6 +242,8 @@ def segment(b, k, op):
     pre = leading(b)
     ss, data, high = pre.count(0x36), sum(pre.count(x) for x in (0x26, 0x2E, 0x3E)), pre.count(0x64) + pre.count(0x65)
     memory, base = mem_base(b, k, op)
+    # R2 review: segment prefixes on a near direct branch are ignored (as processors do; fexc compiles it unprefixed)
+    if k == 'p' and (0x70 <= op <= 0x7F or 0xE0 <= op <= 0xE3 or op in (0xE8, 0xE9, 0xEB)) or k == '0f' and 0x80 <= op <= 0x8F: return None
     if high and not memory: return 'FS/GS', 'FS/GS override without a memory operand'
     if high and ss + data + high != 1: return 'FS/GS', 'FS/GS override with another segment prefix'
     if not high and memory and ss + data and (bool(ss) != (base in (4, 5))):
@@ -392,6 +398,16 @@ def classify(b, mnem):
     # I10 addendum: TPAUSE/UMONITOR/UMWAIT (66/F3/F2 0f ae /6 register): WAITPKG not advertised, #UD
     if k == '0f' and op == 0xAE and modrm is not None and modrm >> 6 == 3 and (modrm >> 3) & 7 == 6 and set(leading(b)) & {0x66, 0xF2, 0xF3}:
         return 'system', 'tpause/umonitor/umwait (WAITPKG not advertised: #UD)'
+    # X1c: PREFETCHW m8 (NP 0f 0d /1), PREFETCHh (0f 18 /0../3 m, no F2/F3) and CLDEMOTE (NP 0f 1c /0 m) compiled; 0f 0d with a
+    # register operand #UD; every other cell of 0f 0d and 0f 18..1d a Reserved-NOP (system: the host decodes, the resident completes)
+    if k == '0f' and (op == 0x0D or 0x18 <= op <= 0x1D) and modrm is not None:
+        lead = set(leading(b)); mod, reg = modrm >> 6, (modrm >> 3) & 7
+        prefixed, rep = bool(lead & {0x66, 0xF2, 0xF3}), bool(lead & {0xF2, 0xF3})
+        if 0xF0 in lead: return 'LOCK', 'LOCK on a form that is not lockable (#UD)'
+        if op == 0x0D and mod == 3: return 'system', '0f 0d register form (#UD)'
+        if (op == 0x0D and reg == 1 and not prefixed) or (op == 0x18 and mod != 3 and reg <= 3 and not rep) or (op == 0x1C and mod != 3 and reg == 0 and not prefixed):
+            return segment(b, k, op) or ('admitted', '')
+        return 'system', 'Reserved-NOP cell (X1c)'
     # I10: INCSSP (F3 0f ae /5 register): #UD with CR4.CET = 0
     if k == '0f' and op == 0xAE and modrm is not None and modrm >> 6 == 3 and (modrm >> 3) & 7 == 5 and 0xF3 in leading(b) and 0xF2 not in leading(b):
         return 'system', 'incssp (#UD: CET not advertised)'
@@ -440,7 +456,8 @@ def classify(b, mnem):
         if k == '0f' and op == 0x1E and 0xF0 not in pre: return 'admitted', ''   # I10: the CET hint space
     else:
         if 0xF0 in pre and not lockable(k, op, modrm): return 'LOCK', 'LOCK on a form that is not lockable (#UD)'   # I3
-        if 0xF2 in pre: return 'other', 'REPNE/bnd prefix on an admitted opcode'
+        # X1c: F2 on a near CALL/RET/JMP/Jcc is MPX's BND, ignored (not on LOOP/LOOPcc/JrCXZ)
+        if 0xF2 in pre and not (br and not (k == 'p' and 0xE0 <= op <= 0xE3)): return 'other', 'REPNE prefix on an admitted opcode'
         if 0xF3 in pre and not (k == 'p' and (op == 0xC3 or (op == 0x90 and not (p['rex'] & 1)))) and not (k == '0f' and op in (0xB8, 0xBC, 0xBD)):
             return 'other', 'REP prefix on an admitted opcode'
         seg = segment(b, k, op)      # I7: FS/GS overrides admitted on memory operands
@@ -567,15 +584,15 @@ def selftest():
              ('6548ff0425f0ff0000', 'incq %gs:', 'admitted'), ('644889c8', 'fs mov reg', 'FS/GS'), ('642e488b00', 'fs cs mov', 'FS/GS'),
              ('36488b03', 'ss mov (%rbx)', 'FS/GS'), ('36488b0424', 'ss mov (%rsp)', 'admitted'), ('3e488b4500', 'ds mov (%rbp)', 'FS/GS'),
              ('3e48ff24c500000000', 'notrack jmp *tbl', 'admitted'), ('65c4e2f0f200', 'andn %gs:', 'admitted'), ('f065480fc108', 'lock xadd %gs:', 'admitted'),
-             ('65c3', 'gs ret', 'FS/GS'), ('3e4c8b2424', 'ds mov (%rsp),%r12', 'FS/GS'), ('3e498b0424', 'ds mov (%r12)', 'admitted'),
+             ('65c3', 'gs ret', 'FS/GS'), ('657279', 'gs jb', 'admitted'), ('64e800000000', 'fs call', 'admitted'), ('3e4c8b2424', 'ds mov (%rsp),%r12', 'FS/GS'), ('3e498b0424', 'ds mov (%r12)', 'admitted'),
              ('0f22d8', 'mov %cr3', 'system'), ('0f28c1', 'movaps', 'admitted'), ('0f6fc1', 'movq mm', 'admitted'), ('0ff7c1', 'maskmovq', 'SSE'), ('0f77', 'emms', 'admitted'), ('480f38f007', 'movbe m', 'admitted'), ('480f38f0c1', 'movbe reg', 'system'), ('66480f38f6c1', 'adcx', 'system'), ('0f38cbc1', 'sha256rnds2', 'system'), ('660f38dcc1', 'aesenc', 'admitted'), ('c4e271dcc2', 'vaesenc', 'admitted'), ('c4e275dcc2', 'vaesenc ymm', 'system'), ('dfc1', 'ffreep', 'admitted'), ('660f3a63c100', 'pcmpistri', 'admitted'), ('0fae10', 'ldmxcsr', 'system'), ('f20f38f1c1', 'crc32', 'admitted'), ('66f30f10c1', 'movss 66', 'SSE'), ('660f73f804', 'pslldq', 'admitted'), ('c5f877', 'vzeroupper', 'admitted'), ('c5f96efe', 'vmovd', 'admitted'), ('c4e27d78ff', 'vpbroadcastb', 'admitted'),
              ('c4e27d90040f', 'vpgatherdd', 'AVX'), ('c5f8ae5c2404', 'vstmxcsr', 'system'), ('66c5f877', 'vzeroupper 66', 'system'), ('c5fc28c1', 'vmovaps', 'admitted'),
              ('c4e2fd78ff', 'vpbroadcastb W1', 'system'), ('c5f877c5fc77', 'vzeroupper', 'admitted'), ('d9c0', 'fld', 'admitted'), ('d9fe', 'fsin', 'admitted'), ('dbe3', 'fninit', 'system'),
              ('f3480fb8c1', 'popcnt', 'admitted'), ('f0480fb10a', 'lock cmpxchg', 'admitted'), ('f0480fc70e', 'lock cmpxchg16b', 'admitted'),
              ('f04801c8', 'lock add reg', 'LOCK'), ('f0488908', 'lock mov', 'LOCK'), ('f2f0480108', 'xacquire lock add', 'other'),
-             ('f0f71b', 'lock neg', 'admitted'), ('f0480fba2b05', 'lock bts', 'admitted'), ('f0480fba2305', 'lock bt', 'LOCK'), ('480fa4c10c', 'shld', 'admitted'), ('f2c3', 'bnd ret', 'other'),
+             ('f0f71b', 'lock neg', 'admitted'), ('f0480fba2b05', 'lock bts', 'admitted'), ('f0480fba2305', 'lock bt', 'LOCK'), ('480fa4c10c', 'shld', 'admitted'), ('f2c3', 'bnd ret', 'admitted'),
              ('fc', 'cld', 'admitted'), ('9c', 'pushfq', 'admitted'), ('9d', 'popfq', 'system'), ('c8100001', 'enter', 'small-int'), ('c9', 'leave', 'admitted'),
-             ('480fc70e', 'cmpxchg16b', 'admitted'), ('66480fc70e', 'o16 cmpxchg16b', 'LOCK'), ('0f0d08', 'prefetchw', 'small-int'), ('0f1808', 'prefetcht0', 'admitted'), ('660fa4c10c', 'shldw', 'small-int'),
+             ('480fc70e', 'cmpxchg16b', 'admitted'), ('66480fc70e', 'o16 cmpxchg16b', 'LOCK'), ('0f0d08', 'prefetchw', 'admitted'), ('0f0dc8', 'prefetchw reg', 'system'), ('0f0d00', 'prefetch /0', 'system'), ('0f1c00', 'cldemote', 'admitted'), ('0f1900', 'nop cell', 'system'), ('f2e2fe', 'bnd loop', 'other'), ('0f1808', 'prefetcht0', 'admitted'), ('660fa4c10c', 'shldw', 'small-int'),
              ('c4e2fbf5c1', 'pdep', 'admitted'), ('c4e27cf2c1', 'andn', 'system'), ('c4e278f2c1', 'andn', 'admitted'), ('f3480fbc00', 'tzcnt', 'admitted'),
              ('f3c3', 'rep ret', 'admitted'), ('c3', 'ret', 'admitted'), ('cc', 'int3', 'int3'), ('3effe0', 'notrack jmp', 'admitted'), ('0f05', 'syscall', 'system'),
              ('c5f8f7c1', 'bmi?', 'system'), ('c4e260f7c1', 'shlx', 'admitted'), ('c4e2f8f7c1', 'shlxq', 'admitted'),
@@ -585,7 +602,10 @@ def selftest():
              ('8fe878c2c005', 'vprotd', 'system'), ('c7f800000000', 'xbegin', 'system'), ('c6f805', 'xabort', 'system'), ('0fa7c0', 'xstorerng', 'system'),
              ('f3480f1ec8', 'rdsspq', 'admitted'), ('f30faee8', 'incsspd', 'system'), ('f30f38f000', 'f3 movbe', 'system'), ('62f17d48efc0', 'evex', 'system'),
              ('c4e27950e1', 'vpdpbusd', 'system'), ('c5fe58c1', 'vaddss L1', 'AVX'), ('0f7110', 'psrlw m', 'system'), ('27', 'daa', 'system'),
-             ('660faef0', 'tpause', 'system'), ('0faef0', 'mfence', 'admitted')]
+             ('660faef0', 'tpause', 'system'), ('0faef0', 'mfence', 'admitted'),
+             # R2 review: REX chains (the last REX before the opcode counts) and a REX before a legacy prefix (ignored)
+             ('4f47414d53', 'pushq %r11', 'admitted'), ('47462832', 'subb %r14b, (%rdx)', 'admitted'), ('48413120', 'xorl %esp, (%r8)', 'admitted'),
+             ('406688e0', 'mov %ah, %al', 'admitted')]
     for hx, mn, want in cases:
         got = classify(h(hx), mn if mn != 'shlx' else 'shlxq')[0]
         if mn in ('popcnt', 'pdep', 'andn', 'tzcnt'): got = classify(h(hx), mn)[0]

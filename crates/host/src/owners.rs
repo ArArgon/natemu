@@ -35,12 +35,13 @@ pub fn cancel_owners(cancelled: &AtomicBool) {
 /// which a body may also call itself); running vCPUs are then forced out
 /// repeatedly until every body returned. Every vCPU is destroyed on its own thread
 /// before this returns, so the caller may destroy the VM next.
+/// `cancelled` is the run's flag: a caller's [`cancel_owners`] on it from any thread (before or during the run) cancels it.
 pub fn supervise<T: Send>(
     n: usize,
     prepare: &(dyn Fn(usize) -> Result<Vcpu> + Sync),
     body: &(dyn Fn(usize, &Vcpu, &AtomicBool) -> Result<T> + Sync),
+    cancelled: &AtomicBool,
 ) -> Result<Supervision<T>> {
-    let cancelled = AtomicBool::new(false);
     thread::scope(|scope| {
         let (prepared_tx, prepared_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
@@ -49,7 +50,6 @@ pub fn supervise<T: Send>(
         let mut releases = Vec::new();
         let mut owners = Vec::new();
         for id in 0..n {
-            let cancelled = &cancelled;
             let (start_tx, start_rx) = mpsc::channel::<()>();
             let (release_tx, release_rx) = mpsc::channel::<()>();
             let prepared = prepared_tx.clone();
@@ -110,7 +110,7 @@ pub fn supervise<T: Send>(
                     completed += 1;
                     if let Err(e) = result {
                         error.get_or_insert(e);
-                        cancel_owners(&cancelled);
+                        cancel_owners(cancelled);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -120,7 +120,7 @@ pub fn supervise<T: Send>(
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             if (error.is_some() || cancelled.load(Ordering::Acquire)) && completed < n {
-                cancel_owners(&cancelled);
+                cancel_owners(cancelled);
                 // Repeat cancellation: an owner may still be in its declared
                 // pre-entry delay when an earlier cancellation is issued.
                 exit_vcpus(&mut ids);

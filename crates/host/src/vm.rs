@@ -116,9 +116,14 @@ const MPIDR_EL1: u16 = 0xc005;
 pub struct Machine {
     /// The first SPI: vCPU v's host doorbell is `spi + v`.
     spi: u32,
+    /// The mapped backing, owned while the VM maps it (R2 review: a borrow could end, and `mem::forget` of the machine
+    /// would leave the VM mapping freed memory; an owned `Arc` leaks with it instead).
+    memory: std::sync::Arc<Memory>,
+    /// The VM exists (not yet destroyed).
+    live: bool,
 }
 impl Machine {
-    pub fn create(memory: &Memory) -> Result<Self> {
+    pub fn create(memory: std::sync::Arc<Memory>) -> Result<Self> {
         unsafe {
             let config = hv_vm_config_create();
             // M1: the IPA space must hold the whole backing (guest RAM included); HVF's default IPA size (36 bits on
@@ -139,6 +144,11 @@ impl Machine {
             let created = hv(hv_vm_create(config), "hv_vm_create");
             os_release(config);
             created?;
+        }
+        // From here on every early return destroys the VM (Drop).
+        let mut machine = Self { spi: 0, memory, live: true };
+        let (base, bytes) = (machine.memory.0, machine.memory.1);
+        unsafe {
             // After the VM, before any vCPU (hv_gic.h).
             let gic = hv_gic_config_create();
             let created = hv(hv_gic_config_set_distributor_base(gic, GIC_DISTRIBUTOR), "GIC distributor base")
@@ -152,7 +162,7 @@ impl Machine {
         if (count as usize) < natemu_abi::execution::cache::MAX_VCPUS {
             return Err(format!("{count} GIC SPIs: one per vCPU needed"));
         }
-        let machine = Self { spi };
+        machine.spi = spi;
         // Affinity routing, both groups enabled.
         let ctlr = machine.distributor(GICD_CTLR)?;
         machine.set_distributor(GICD_CTLR, ctlr | 0x13)?;
@@ -170,7 +180,7 @@ impl Machine {
         for n in spis {
             machine.set_distributor(gicd(GICD_ISENABLER, n, 1), 1 << (n % 32))?;
         }
-        unsafe { hv(hv_vm_map(memory.0.cast(), IPA, memory.1, MAPPED), "hv_vm_map")? };
+        unsafe { hv(hv_vm_map(base.cast(), IPA, bytes, MAPPED), "hv_vm_map")? };
         // L3 (amendment): the shared all-ones page that shadows of unassigned guest-physical pages map, read-only here too.
         // ponytail: one page per VM leaked for the process (a VM per process today); free it with the VM if VMs come and go.
         let ones = unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(ALL_ONES as usize, ALL_ONES as usize).unwrap()) };
@@ -217,8 +227,15 @@ impl Machine {
         Ok(self.distributor(gicd(GICD_ISPENDR, n, 1))? >> (n % 32) & 1 != 0)
     }
     /// Destroys the VM now and returns the framework status.
-    pub fn destroy(self) -> i32 {
-        std::mem::forget(self);
+    pub fn destroy(mut self) -> i32 {
+        self.vm_destroy()
+    }
+    /// Under the GIC lock: no doorbell ring runs during the destroy (vm.rs `GIC`).
+    fn vm_destroy(&mut self) -> i32 {
+        if !std::mem::replace(&mut self.live, false) {
+            return 0;
+        }
+        let _gic = gic();
         unsafe { hv_vm_destroy() }
     }
 }
@@ -234,11 +251,16 @@ impl Doorbell {
         unsafe { hv(hv_gic_set_spi(self.spi + v as u32, true), "hv_gic_set_spi") }
     }
 }
+#[cfg(test)]
+impl Doorbell {
+    /// A doorbell of no machine (unit tests that never ring it).
+    pub(crate) fn none() -> Self {
+        Doorbell { spi: 0 }
+    }
+}
 impl Drop for Machine {
     fn drop(&mut self) {
-        unsafe {
-            hv_vm_destroy();
-        }
+        self.vm_destroy();
     }
 }
 

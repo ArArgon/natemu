@@ -930,7 +930,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
     let backing = execution::prepare(resident, code_bytes, n, ram_bytes as usize)?;
     require_vcpus(n)?;
-    let mut builder = Builder { ram: backing.ram, next: place, top: ram_bytes, reserved: Default::default() };
+    // SAFETY: the builder and the tables it makes are dropped before `backing` (this function owns both).
+    let mut builder = Builder { ram: unsafe { backing.ram() }, next: place, top: ram_bytes, reserved: Default::default() };
     // Identity-mapped pages first: the allocator never hands them out (the logging pages of identity spaces too).
     for c in d.cpus.iter().filter(|c| d.spaces[c.space].identity) {
         for page in identity_pages(&d.spaces[c.space], c.rip) {
@@ -959,9 +960,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let uart = Arc::new(Mutex::new(crate::uart::Uart::new()));
     registry.register_ports(crate::boot::acpi::platform::COM1_PORT.into(), 8, uart.clone())?;
     // L4a: the I/O APIC, the 8259 pair and their wires; the UART's IRQ4 into them.
-    let irqs = crate::irq::install(&mut registry, &backing.memory, n, &uart)?;
+    let irqs = crate::irq::install(&mut registry, backing.memory(), n, &uart)?;
     // L4b: the PIT and port 61H, the RTC, the ACPI PM block and reset register.
-    crate::clock::install(&mut registry, &irqs, lost)?;
+    let board = crate::clock::install(&mut registry, &irqs, lost)?;
     if let Some(port) = irq_source {
         let mut source = super::test_devices::TestSource::new(&irqs);
         source.veto = irq_veto;
@@ -999,7 +1000,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         t.copy_in(base, &gdt);
         t.copy_in(base + 0x1000, &idt);
     }
-    execution::guest_ram_written(&backing.memory);
+    execution::guest_ram_written(backing.memory());
     for (v, c) in d.cpus.iter().enumerate() {
         // 4-level paging; user mode, NX and WP on unless the section says otherwise.
         let bit = |on: bool, value: u64| if on { value } else { 0 };
@@ -1042,7 +1043,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         backing.vcpu(v).write_record(exec::STATE_OFFSET, state);
     }
 
-    let machine = Machine::create(&backing.memory)?;
+    let machine = Machine::create(backing.memory().clone())?;
     irqs.attach(machine.doorbell());
     let stops = execution::Stops::new(&backing);
     // vCPU v passed the start barrier: every vCPU exists. A kicker waits for it: an SPI rung while vCPUs are being
@@ -1125,7 +1126,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                         let area = backing.vcpu(v);
                         let taken = stops.taken(area);
                         if !kick_events.is_empty() && !stops.ended(v) {
-                            let _ = execution::post(&backing.memory, v, kick_events[(rng >> 33) as usize % kick_events.len()], false);
+                            let _ = execution::post(backing.memory(), v, kick_events[(rng >> 33) as usize % kick_events.len()], false);
                         }
                         if !stops.kick(machine, v)? {
                             break;
@@ -1172,7 +1173,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             let mut asked = vec![false; n];
             while !all_ended.load(SeqCst) {
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                let read = || (0..n).map(|v| (!stops.ended(v)).then(|| execution::park_state(&backing.memory, v))).collect::<Vec<_>>();
+                let read = || (0..n).map(|v| (!stops.ended(v)).then(|| execution::park_state(backing.memory(), v))).collect::<Vec<_>>();
                 let (first, second) = (read(), read());
                 let halted: Vec<usize> = (0..n).filter(|&v| first[v].is_some()).collect();
                 // The vetoes are read after the two reads (L4a): a source that may still fire (a kicker, or an
@@ -1185,14 +1186,14 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 let vetoed = kickers_left.load(SeqCst) != 0 || irqs.live() != 0;
                 if !vetoed && !halted.is_empty() && halted.iter().all(|&v| first[v] == second[v] && first[v].is_some_and(execution::idle)) {
                     for &v in halted.iter().filter(|&&v| !std::mem::replace(&mut asked[v], true)) {
-                        execution::end_when_halted(&backing.memory, v);
+                        execution::end_when_halted(backing.memory(), v);
                         stops.kick(machine, v)?;
                     }
                 }
             }
             Ok(())
         });
-        let supervision = owners::supervise(n, &prepare, &body);
+        let supervision = owners::supervise(n, &prepare, &body, &AtomicBool::new(false));
         all_ended.store(true, SeqCst);
         let idle = idle.join().unwrap_or(Err("idle watcher panicked".into()));
         for v in 0..n {
@@ -1204,7 +1205,10 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let kicked = kicked.and_then(|()| (0..n).try_for_each(|v| stops.pending_at_end(&machine, v)));
         (kicked, supervision)
     });
-    // Every vCPU is destroyed (or never created): the VM goes next, then the host reads the backing.
+    // Every vCPU is destroyed (or never created): the VM goes next (no device rings it after this), then the host reads
+    // the backing.
+    irqs.detach();
+    board.stop();
     let destroyed = machine.destroy();
     eprintln!("{}", teardown(n, supervision.as_ref().ok(), destroyed));
     let supervision = supervision?;

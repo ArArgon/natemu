@@ -40,7 +40,8 @@ pub struct Boot {
     pub rsdp: u64,
     /// Each vCPU's code cache (default the largest, `CODE_BYTES_MAX` less its head).
     pub code_bytes: usize,
-    /// Where COM1's output goes as it is sent (default nowhere; it is also kept, [`Prepared::serial_bytes`]).
+    /// Where COM1's output goes as it is sent (default none: the UART keeps it; [`Prepared::serial_bytes`] counts it either
+    /// way, [`Prepared::serial_error`] reports a failed write).
     pub serial: Option<Box<dyn Write + Send>>,
     /// An unassigned port or page access is a typed stop instead of all-ones (L3; default off).
     pub strict_unassigned: bool,
@@ -121,6 +122,7 @@ impl Boot {
             watchdog: self.watchdog,
             compile_cache: self.compile_cache,
             ran: AtomicBool::new(false),
+            cancel: Arc::default(),
         })
     }
 
@@ -145,6 +147,19 @@ pub struct Prepared {
     compile_cache: compile_cache::Config,
     /// [`Prepared::run`] has started: the backing is used.
     ran: AtomicBool,
+    /// The run's cancellation flag ([`Prepared::canceller`]).
+    cancel: Arc<AtomicBool>,
+}
+
+/// Stops a [`Prepared::run`] from any thread (an integrator's stop button, the stub's SIGINT): every vCPU stops at its next
+/// host exit (the supervisor forces running ones out) and the run returns with each stop `Cancelled`; a run not yet
+/// started ends at once.
+#[derive(Clone)]
+pub struct Canceller(Arc<AtomicBool>);
+impl Canceller {
+    pub fn cancel(&self) {
+        owners::cancel_owners(&self.0);
+    }
 }
 
 /// How a run ended.
@@ -169,7 +184,7 @@ impl Prepared {
             return Err("this boot already ran: prepare a new one".into());
         }
         let (backing, vcpus) = (&self.backing, self.backing.n);
-        let machine = Machine::create(&backing.memory)?;
+        let machine = Machine::create(backing.memory.clone())?;
         self.irqs.attach(machine.doorbell());
         let stops = execution::Stops::new(backing);
         let prepare = |v: usize| -> Result<Vcpu> {
@@ -193,7 +208,8 @@ impl Prepared {
             owners::cancel_owners(cancelled);
             Ok((stop?, compiler.compiles))
         };
-        let supervision = owners::supervise(vcpus, &prepare, &body);
+        let supervision = owners::supervise(vcpus, &prepare, &body, &self.cancel);
+        self.end();
         let destroyed = machine.destroy();
         let supervision = supervision?;
         hv(destroyed, "destroy VM")?;
@@ -205,8 +221,23 @@ impl Prepared {
         }
         Ok(Outcome { each: supervision.outputs, ended_first: ended_first.load(SeqCst) })
     }
-    pub fn guest(&self) -> &GuestRam {
-        &self.backing.ram
+    /// The run's end, before the VM is destroyed (under the GIC lock, `Machine::destroy`). R2 review: no source may ring
+    /// this VM's doorbells once it is gone (they would reach the process's next VM): the chipset detaches them under its
+    /// lock, and the PIT/RTC/PM threads end.
+    fn end(&self) {
+        self.irqs.detach();
+        self.board.stop();
+    }
+    /// A handle that cancels this boot's run ([`Canceller`]).
+    pub fn canceller(&self) -> Canceller {
+        Canceller(self.cancel.clone())
+    }
+    /// Guest RAM through the host's alias (the loaded image, a dump).
+    ///
+    /// # Safety
+    /// As [`Backing::ram`]: the value and its copies must not be used once this `Prepared` is dropped.
+    pub unsafe fn guest(&self) -> GuestRam {
+        self.backing.ram
     }
     pub fn loaded(&self) -> &Loaded {
         &self.loaded
@@ -222,7 +253,11 @@ impl Prepared {
     }
     /// The bytes COM1 has sent so far.
     pub fn serial_bytes(&self) -> usize {
-        self.uart.lock().unwrap_or_else(|e| e.into_inner()).output.len()
+        self.uart.lock().unwrap_or_else(|e| e.into_inner()).sent as usize
+    }
+    /// The serial sink's write error, if one failed (it is dropped then: COM1's later output goes nowhere).
+    pub fn serial_error(&self) -> Option<String> {
+        self.uart.lock().unwrap_or_else(|e| e.into_inner()).sink_error.clone()
     }
 }
 
@@ -235,6 +270,32 @@ mod tests {
     #[inline(never)]
     fn clobber_stack() {
         std::hint::black_box([0u8; 64 << 10]);
+    }
+
+    /// R2 review: the end of a run detaches the doorbells and stops the timer threads (a PIT programmed at 1 kHz rises no
+    /// more). No VM: the doorbell is never rung (nothing routes IRQ 0 to a LAPIC).
+    #[test]
+    fn the_end_of_a_run_detaches_and_stops_the_timers() {
+        let resident = std::env::temp_dir().join(format!("natemu-linux-end-{}.elf", std::process::id()));
+        std::fs::write(&resident, crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)])).unwrap();
+        let mut boot = Boot::new(&resident, "fexc", boot::tests::image(0x1000));
+        (boot.ram, boot.code_bytes) = (64 << 20, exec::cache::MAX_BLOCK_BYTES);
+        let prepared = boot.prepare();
+        std::fs::remove_file(&resident).unwrap();
+        let prepared = prepared.unwrap();
+        prepared.irqs.attach(crate::vm::Doorbell::none());
+        // PIT channel 0, lobyte/hibyte, mode 2, count 1193 (1 kHz).
+        for (port, value) in [(0x43, 0x34), (0x40, 0xa9), (0x40, 0x04)] {
+            prepared.devices().port(0, port, 1, Some(value)).unwrap();
+        }
+        let rises = || prepared.board().pit.rises.load(SeqCst);
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(rises() > 5, "the PIT runs: {}", rises());
+        prepared.end();
+        assert!(!prepared.irqs.attached());
+        let at_end = rises();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(rises(), at_end);
     }
 
     /// R2's blocker: the chipset must post into the guest memory of the `Prepared` it ends up in, after `prepare`

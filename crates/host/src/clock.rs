@@ -51,6 +51,19 @@ struct Inner<T> {
     changed: Condvar,
     stop: AtomicBool,
 }
+/// Ends a [`Timer`]'s thread without dropping the device: the port bus still reaches it, each access first taking the
+/// events due ([`Timer::access`]), but nothing fires asynchronously any more (R2 review: a run's end).
+pub(crate) trait Halt: Send + Sync {
+    fn halt(&self);
+}
+impl<T: Timed + 'static> Halt for Inner<T> {
+    fn halt(&self) {
+        self.stop.store(true, SeqCst);
+        // Under the lock: the thread is either waiting (and is woken) or has not yet looked at `stop`.
+        drop(self.device.lock().unwrap_or_else(|e| e.into_inner()));
+        self.changed.notify_one();
+    }
+}
 /// The shortest time between two turns of a device's thread.
 const GAP_US: u64 = 20;
 /// A [`Timed`] device and its thread: the port bus reaches the device through it (an access that moves the next event
@@ -95,6 +108,10 @@ impl<T: Timed + 'static> Timer<T> {
             .expect("timer thread");
         Self { inner, thread: Some(thread) }
     }
+    /// Its thread's off switch.
+    pub(crate) fn halter(&self) -> Arc<dyn Halt> {
+        self.inner.clone()
+    }
     /// The device, locked (its thread waits meanwhile).
     pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
         self.inner.device.lock().unwrap_or_else(|e| e.into_inner())
@@ -128,10 +145,7 @@ impl<T: Timed + 'static> Device for Timer<T> {
 }
 impl<T: Timed + 'static> Drop for Timer<T> {
     fn drop(&mut self) {
-        self.inner.stop.store(true, SeqCst);
-        // Under the lock: the thread is either waiting (and is woken) or has not yet looked at `stop`.
-        drop(self.lock());
-        self.inner.changed.notify_one();
+        self.inner.halt();
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -223,6 +237,14 @@ impl TickStats {
 pub struct Board {
     pub pit: Arc<TickStats>,
     pub rtc: Arc<TickStats>,
+    /// The PIT's, RTC's and PM block's threads ([`Board::stop`]).
+    timers: Vec<Arc<dyn Halt>>,
+}
+impl Board {
+    /// Ends the timed devices' threads (a run's end: no source fires any more; the devices stay readable).
+    pub fn stop(&self) {
+        self.timers.iter().for_each(|t| t.halt());
+    }
 }
 
 /// L4b: puts the board's timed devices on `devices`, wired into `irqs`: the PIT at ports 40H-43H and 61H, the RTC at
@@ -234,18 +256,24 @@ pub fn install(devices: &mut crate::devices::Devices, irqs: &crate::irq::Irqs, l
     let f = frequency();
     let pit_device = crate::pit::Pit::new(irqs, f, lost.pit);
     let pit_stats = pit_device.stats.clone();
-    let pit: Shared = Arc::new(Mutex::new(Timer::new(pit_device, "pit")));
+    let pit = Timer::new(pit_device, "pit");
+    let mut timers = vec![pit.halter()];
+    let pit: Shared = Arc::new(Mutex::new(pit));
     devices.register_ports(0x40, 4, pit.clone())?;
     devices.register_ports(0x61, 1, Arc::new(Mutex::new(At(pit, crate::pit::PORT_61))))?;
     let r = crate::rtc::Rtc::new(irqs, f, lost.rtc);
     let rtc_stats = r.stats.clone();
-    let rtc: Shared = Arc::new(Mutex::new(Timer::new(r, "rtc")));
+    let rtc = Timer::new(r, "rtc");
+    timers.push(rtc.halter());
+    let rtc: Shared = Arc::new(Mutex::new(rtc));
     devices.register_ports(p::RTC_PORT.into(), p::RTC_PORT_LEN.into(), rtc)?;
-    let pm: Shared = Arc::new(Mutex::new(Timer::new(crate::pm::Pm::new(irqs, f, devices.power.clone()), "pm")));
+    let pm = Timer::new(crate::pm::Pm::new(irqs, f, devices.power.clone()), "pm");
+    timers.push(pm.halter());
+    let pm: Shared = Arc::new(Mutex::new(pm));
     let at = |offset: u64| -> Shared { Arc::new(Mutex::new(At(pm.clone(), offset))) };
     devices.register_ports(p::PM1A_EVT.into(), p::PM1_EVT_LEN.into(), at(0))?;
     devices.register_ports(p::PM1A_CNT.into(), p::PM1_CNT_LEN.into(), at(crate::pm::CNT))?;
     devices.register_ports(p::PM_TMR.into(), p::PM_TMR_LEN.into(), at(crate::pm::TIMER))?;
     devices.register_ports(p::RESET_PORT.into(), 1, at(crate::pm::RESET_REG))?;
-    Ok(Board { pit: pit_stats, rtc: rtc_stats })
+    Ok(Board { pit: pit_stats, rtc: rtc_stats, timers })
 }

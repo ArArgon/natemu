@@ -223,17 +223,22 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 ## 4. Phase end: ready for boot integration
 
 Audit at R2 (November 2; HEAD 16b0576, fexc series44-r2 = series43-x1 byte for byte; raw summaries
-`natemu-raw/r2-20261102-01/`, "R2" below). An item is ticked only with the evidence named.
+`natemu-raw/r2-20261102-01/`, "R2" below), updated after the independent phase-end review's fixes (uncommitted on
+e6b2bf5; Built (R2 review fixes), `natemu-raw/r2-final-20261102-01/`). An item is ticked only with the evidence named.
 
-- [ ] P2's recommendation and P1's outcome recorded by the owner; the deferred list holds options A/B if chosen (Q5).
-      *Open:* P2 is settled by the owner's later decision (§5, October 28: hardware-only checking, translated code at
-      EL0, E1-E3 built), and P1 returned and was independently replicated (INV-03-01 "Next phase"); but no owner record
-      states P1's outcome, and Q5 (the deferred list with P2's options A/B) is unanswered in §5.
-- [ ] Every §1 row maps to an R1 composite or a named check, and every refused form in the C0 census is implemented or
-      an accepted typed refusal. *Half met:* the mapping is complete ("R1 coverage" and its R1b addendum below: no row
-      without a check). *Open:* the last census (I10, `natemu-raw/kernel-census-i10-20261030-01`) leaves 15 initramfs
-      sites unattributed (`pushq` 11, `xorl` 2, `subb` 2; Built (I10), Census) and no census was rerun after X1c; the
-      gathers and masked stores are accepted typed refusals (owner decision October 30 (2)).
+- [x] P2's recommendation and P1's outcome recorded by the owner; the deferred list holds options A/B if chosen (Q5).
+      Owner decision 6 (§5, November 2): P1's outcome is accepted as recorded in INV-03-01's "Next phase" row and
+      carried into the performance phase; P2's options A/B are superseded by the October 28 decision (translated code
+      at EL0, hardware-only checking), so Q5 adds nothing to the deferred list.
+- [x] Every §1 row maps to an R1 composite or a named check, and every refused form in the C0 census is implemented or
+      an accepted typed refusal. The mapping is complete ("R1 coverage" and its R1b addendum below: no row without a
+      check). Census rerun after the review fixes (`natemu-raw/kernel-census-r2-20261102-01/`, the classifier with the
+      REX-chain and X1c rules; `experiments/track03/kernel-census/README.md`, R2 review re-check): the kernel side
+      refuses nothing (`prefetchw` 17 compiled since X1c; 3 undecodable bytes in the 32-bit decompressor head, never
+      run); the initramfs's 15 unattributed sites were REX chains in OpenSSL strings, which fexc compiles and the host now
+      decodes (Built (R2 review fixes), A); left are the 10 VEX gathers (owner decision October 30 (2)) and 2 GS-prefixed
+      `jb` in an OpenSSL string, a reserved encoding (SDM Vol.2 2.1.1), compiled as the unprefixed branch since the owner's
+      rule (§5, November 2: match the processor; series45-r2fix): census rerun, initramfs left only the gathers.
 - [x] CPUID/MSR profile as recorded (CPU 9/16/17 or the owner's variant), unit-tested leaf by leaf and MSR by MSR;
       fault-model profile rederived independently. Built (S1): `crates/abi/src/cpu_profile.rs` generated from
       `tools/models/cpu_profile.json`, the abi tests replaying `cpu_profile.py`'s answers per leaf and MSR (`cargo test`
@@ -253,13 +258,13 @@ Audit at R2 (November 2; HEAD 16b0576, fexc series44-r2 = series43-x1 byte for b
 - [x] UART, port I/O (incl. the unassigned-port rule), PIC/IOAPIC, PIT, RTC and PM timer match QEMU on the cited
       sequences; PM timer and TSC agree in rate. At R2: `run_l3.py` 0 failures, `run_l4a.py` (QEMU 13/13 and the
       rest), `run_l4b.py` (QEMU 5/5, cases 11/11, modes 7/7, `clocks` 1/1: PM/PIT/LAPIC/RTC against the TSC).
-- [ ] Guest RAM at 2 GiB with the M69 holes; standing suite green at 4 MiB and 2 GiB. *Met at 2 GiB* (Built (M1), the
-      legacy hole Built (L3); the suite below). *At 4 MiB* every runner that can run there is green; three cannot
-      by construction (fixed guest-physical addresses at or above 4 MiB, refused by the driver): `run_x4.py` and
-      `run_l3.py` identity-map pages at 0x500000/0x400000, `run_m1.py`'s high cases place at 0x7ff00000.
-      `run_m2.py`, which raised at R2 on an MTRR overlap the SDM leaves undefined at that size, is 112/112 there since
-      the R2 fix (Built (R2 fix)). Not an emulator result; open until those three skip or resize at small RAM, or the
-      owner accepts the statement as it stands ([boot-handoff.md](boot-handoff.md) §5).
+- [x] Guest RAM at 2 GiB with the M69 holes; standing suite green at 4 MiB and 2 GiB. At 2 GiB: Built (M1), the legacy
+      hole Built (L3), the suite below. At 4 MiB (the small-RAM suite, owner decision 7): every runner green at R2 except
+      three whose programs used fixed addresses at or above 4 MiB; they were relocated below 4 MiB, keeping what each
+      tests (`run_x4.py`'s mailbox page, `run_l3.py`'s RAM buffer and RAM's last page, `run_m1.py`'s top-of-RAM
+      placement from `NATEMU_RAM`; [boot-handoff.md](boot-handoff.md) §5) and are green there (x4 33/33, 28/28, 6/6; l3
+      0 failures; m1 20/20, `natemu-raw/r2-final-20261102-01/small-4m/`); `run_m2.py` 112/112 at 4 MiB since the R2
+      fix.
 - [x] ISA: ASM suite 0 fail with SSE, XSAVE, x87 (`X87_F64`), REP, LOCK and flag-move tests passing or refused with
       reason; AVX per Q3. At R2: 2,270 tests, 1,875 pass, 0 fail, 48 x87 precision deviations (the reduced-precision
       class), 347 unsupported with reasons; AVX/AVX2/FMA/F16C kept by the owner (§5, October 28) and built (I8).
@@ -268,8 +273,10 @@ Audit at R2 (November 2; HEAD 16b0576, fexc series44-r2 = series43-x1 byte for b
       rerun at R2 at 4 MiB and 2 GiB: R1a 7/7 and R1b 12/12 each, both block sizes, negative controls flagged.
 - [x] Standing suite green; `check_resident_stack.py` passes on the final binary; nothing staged. At R2 at 2 GiB: every
       command of [boot-handoff.md](boot-handoff.md) §5 green but the 7 recorded i8b QEMU two-NaN departures (Built (I8)
-      review) at both block sizes; the stack check `ok` (gate 19,168 of 32,768 bytes, nested 23,312, boot 12,832);
-      `git status`: only the R2 documentation changes, unstaged.
+      review) at both block sizes; the stack check `ok` (gate 19,168 of 32,768 bytes, nested 23,312, boot 12,832).
+      Rerun after the review fixes (every §5 command at 2 GiB, both block sizes, `natemu-raw/r2-final-20261102-01/suite-2g/`;
+      Built (R2 review fixes)): the same, plus the REX corpus 25/25 at both and `run_boot_smoke.py` 3/3; `cargo test`
+      151 + 1 ignored; `git status`: the review fixes and documentation, unstaged, nothing staged.
 - [x] Integration handoff page: boot command, manifest inputs, known limits and costs (incl. PTI CR3 flushes).
       [boot-handoff.md](boot-handoff.md), rewritten at R2: K1 keeps code across CR3 loads; each still resets the data
       shadows (no PCID), the PTI cost with mitigations on.
@@ -328,7 +335,29 @@ start at CPL 0, as a kernel does after `secondary_startup_64`.
 use, translations reusable across load addresses) is the next chunk after this phase, measured first; (2) an AES-based
 random-number generator inside the VM, seeded from the host, is after this phase; (3) raising and testing guest RAM
 beyond 3 GiB and vCPUs beyond 4 is after this phase; (4) CR0.NE = 0 (x87 external-error mode) stays a named stop
-(`unsupported_ferr`); (5) INCSSP without CET follows the SDM (#UD), not QEMU. (1)-(3) are on the deferred list below.
+(`unsupported_ferr`); (5) INCSSP without CET follows the SDM (#UD), not QEMU; (6) P1's (performance diagnosis) outcome
+is accepted as recorded in INV-03-01's "Next phase" row and carried into the performance phase; P2's options A/B are
+superseded by the October 28 decision (translated code at EL0, hardware-only checking); (7) the runners that could not
+run at 4 MiB (`run_x4.py`, `run_l3.py`, `run_m1.py`) either move their programs below 4 MiB, so they run in the 4 MiB
+suite, or, where relocation would change what they test, run in the small-RAM suite at the smallest RAM that fits
+(applied: all three relocated, §4); (8) finish rule: the phase closes when the §4 checklist is met with evidence, no
+known blocking defect remains (wrong results on the boot path, unsoundness, containment holes, crashes), suites and boots
+are green, and every other known issue is on one tracked list for the next phase ([boot-handoff.md](boot-handoff.md),
+"Known issues"). (1)-(3) are on the deferred list below.
+**Owner rule (November 2, phase end): where the SDM is underspecified or calls an encoding reserved, match a real x86
+processor** (applied first to segment prefixes on near direct branches: Built (R2 review fixes), round 2). Each such
+choice matches the processor as far as known (QEMU's or the documented behaviour) and is to be re-verified on real x86
+hardware in the correctness pass (after the performance phase; owner, November 2: with large-scale differential fuzzing
+and real workloads):
+**To verify on real x86 hardware, correctness pass (after the performance phase)** (each made from QEMU's or inferred processor behaviour, none run on an Intel part):
+segment prefixes (26/2E/36/3E/64/65) on near direct branches ignored (R2 review); the Reserved-NOP cells of `0f 0d` and
+`0f 18..1d` executing as NOPs (X1c, pinned QEMU's sweep); F2 (BND) on near CALL/RET/JMP/Jcc ignored without MPX (X1c);
+`0f 0d` with a register operand #UD (X1c, QEMU's 12 encodings); INCSSP without CET #UD (owner decision 5: the SDM, where
+QEMU differs); 66/F3/F2 on EMMS (`0f 77`) and on the SHA cells (`0f 38 c8..cd`, `0f 3a cc`) #UD by the blank cells where
+QEMU ignores the prefix (X1c review); a REX followed by a legacy prefix ignored (R2 review: the SDM's rule, which pinned
+QEMU does not follow); 66 on a near direct branch (Intel ignores it, FEX decodes rel16 as AMD does; refused,
+`unsupported_form`); lowest-priority delivery to the lowest-numbered enabled APIC (X3: model specific); an MTRR overlap the
+SDM leaves undefined taken as UC (R2 fix).
 
 **Owner decisions (October 28):** kernel = Debian 6.12 (32-bit stays deferred); fetching the Debian kernel,
 config and initramfs into natemu-raw is allowed (nothing committed); mitigations are booted off on the command line
@@ -3529,13 +3558,13 @@ so RSP must be set before the far return; the AP reads its APIC id by CPUID, not
 peers in xAPIC mode; the handshake reads a delivery count before sending, not after, or a delivery between send and read
 would make the wait target unreachable. No emulator defect found.
 
-*Built (R2 fix, the dangling interrupt-controller pointer; no fexc change, series44-r2, on b3f6841, uncommitted):*
+*Built (R2 fix, the dangling interrupt-controller pointer; no fexc change, series44-r2, on b3f6841; committed as e6b2bf5):*
 **Root cause** (confirmed): `irq::install` stored `Lapics::memory: *const Memory` pointing at `Boot::prepare`'s local
 `backing`, which `prepare` then moved into `Prepared` (L0, 3c12567); every later post and ring read a stale stack
 `Memory`. **Fix:** `execution::Backing::memory` is `Arc<Memory>`; `irq::install` takes `&Arc<Memory>` and `Lapics` keeps a
 clone (the raw pointer, its SAFETY comment and `unsafe impl Send for Lapics` removed; `Memory` gains `unsafe impl Send`:
-the mapping may be unmapped from any thread). The chipset now keeps the mapping alive itself, so the bug cannot be
-written again without `unsafe`. The vCPU path is unchanged (`Area` still borrows `&Memory`, derefed once when the area
+the mapping may be unmapped from any thread). The chipset now keeps the mapping alive itself (the review found that
+other safe paths still could outlive it: Built (R2 review fixes), C). The vCPU path is unchanged (`Area` still borrows `&Memory`, derefed once when the area
 is made). **Other captures audited** (none dangle after the move): the UART's IRQ hook, the chipset views, PIT/RTC/PM
 and `Devices.irqs` hold `Irqs` (`Arc`s); `Devices` is moved into its `Arc` after registration and nothing points into
 it; `GuestRam` and the watchdog's `halted` word address the mmap, which does not move with `Memory`; the doorbell,
@@ -3555,6 +3584,60 @@ run at 4 MiB and why; `tools/fexc/README.md` names series44-r2. **Rerun:** `carg
 `run_l4b.py`, `run_m3.py` green, `run_m2.py` 112/112 at 2 GiB and 4 MiB, `run_r1.py r1a` 7/7 and `r1b` 12/12; the installer
 initrd to "Select a language" through the stub with a warm cache: N = 1 67.5 s ("Run /init" at guest 5.18 s), N = 4
 48.7 s (5.44 s), as the R2 scratch fix (67.4 and 49.2 s).
+
+*Built (R2 review fixes; the independent phase-end review of e6b2bf5; no fexc change, series44-r2; uncommitted on
+e6b2bf5; raw `natemu-raw/r2-final-20261102-01/`):* **A, census.** The 15 initramfs sites I10 left were REX chains (OpenSSL
+CRYPTOGAMS strings in `.text`, e.g. `4f 47 41 4d 53` = push r11): defined, only the last REX before the opcode counts
+(SDM Vol.2 2.2.1). fexc decodes them so (FEX's `DecodeREXIfValid`); the census classifier and, a real defect, the
+host's own byte decoders read one REX: admission's div/idiv, x87-helper, PCMPxSTRx, LOCK CMPXCHG/NEG and REP-string
+proofs and `system::decode`/`lock_ud`/`undefined`/`branch` now share `system::opcode_at` (legacy prefixes and REX bytes
+in any order; a REX followed by a legacy prefix ignored). Check: `tools/reference/gen_rex.py` (25 programs: the census
+sites byte for byte, 24 random slice-1 programs with 1-3 REX bytes inserted before each REX-encoded instruction, 461
+chains; QEMU 7.2 expected, `natemu-raw/rex-corpus-20261102-01/`): at e6b2bf5 16/25 at both block sizes (9 "object
+refused: division ..." host errors), with the fix 25/25 at both; unit tests `system::tests::rex_chains` and the
+admission decoder cases. Census rerun (§4). **B, boot table** rerun on this build (boot-handoff §4). **C, sound public
+API.** `Prepared::guest` and `Backing::ram` (a `Copy` `GuestRam` over the mapping) are `unsafe fn`s with the lifetime
+rule as their safety contract; `Backing::memory` is `pub(crate)` with a `memory()` getter; `vm::Machine::create` takes
+and keeps the `Arc<Memory>` (a `mem::forget` of the machine leaks the mapping instead of leaving the VM on freed
+memory). **D, lifecycle.** `Prepared::run` ends with `Irqs::detach` (under the chipset lock, where every ring happens)
+and `Board::stop` (each timer thread's `Halt`; the devices stay readable, catching up at each access) before
+`Machine::destroy`, which, like its `Drop`, takes the GIC lock; the driver detaches too. Check
+`linux::tests::the_end_of_a_run_detaches_and_stops_the_timers` (a 1 kHz PIT rises no more after the end; red with
+either call removed). **E, external stop.** `Prepared::canceller()` -> `Canceller::cancel()` (the supervisor's flag is
+now the caller's: `owners::supervise(.., cancelled)`); the stub wires SIGINT/SIGTERM to it (a second signal exits 130).
+Check: `run_boot_smoke.py` `cancel` (4 vCPUs, SIGINT 1.5 s in: exit 2, `Cancelled`, 0.02 s after the signal; e6b2bf5
+installs no handler and has no stop entry, so the signal's default action kills it with no stop reported). **F, spill area.** `admission::retry` sends an object with a spill
+area back like an oversized one: translated again with half its instructions, `no_code` `spill_area` at one. Check
+`execution::tests::spill_areas_retry_then_stop` (with `FEXC`; cached answers given `spill_bytes` 8: 4 -> 2
+instructions, then the stop; at e6b2bf5 "object refused: code layout", a host error). **G.** The UART keeps output only
+without a sink, counts every byte (`sent`) and keeps the sink's first write error (`Prepared::serial_error`; the stub
+exits 1 on it); `NATEMU_COMPILE_CACHE_MB` that is not a whole number is an error; the I/O APIC's dropped vectors 0-15
+and SMI/INIT modes are declared deviations (boot-handoff §4: the target's ESR is the resident's, INIT has no model).
+**H.** The watchdog is a scoped thread borrowing the `halted` word (joined on a panic too); `Machine::create` destroys
+the VM on any failure after `hv_vm_create` (the machine exists from then on); handoff and plan status text, build line,
+memory map, runner statement fixed. **Small-RAM suite** (owner decision 7): `run_x4.py`, `run_l3.py`, `run_m1.py`
+relocated below 4 MiB (§4). **Round 2** (the fixes' independent review, nothing blocking; compiler **series45-r2fix**:
+series44-r2's patches and the shim change below, `tools/fexc/build.sh`, `obj/fexc` SHA-256 `354cab22...ba56f3`): the
+`fexc --serve` children start in their own process group (`process_group(0)`), so a terminal's Ctrl-C reaches only the
+stub (red before: `run_boot_smoke.py`'s new `cancel-group` case, SIGINT to the whole group, exit 1 "fexc --serve ...
+exited (signal: 2)"; green after); segment prefixes on near direct branches are ignored, as processors and QEMU do (owner
+rule, §5): the shim admits them on Jcc rel8/rel32, JMP rel8/rel32, CALL rel32, LOOPcc/JrCXZ and admission's branch-target
+proof skips FS/GS (66 there stays refused: FEX decodes a rel16 operand); `gen_rex.py` gains 12 `seg-branches-*` programs
+(backward Jcc/LOOP loops and rel-0 forward branches with 1-2 random segment prefixes; QEMU 7.2 expected,
+`natemu-raw/rex-corpus-20261102-02/`): series44-r2 12 unsupported, series45-r2fix 37/37 at both block sizes; compiler
+slice-1 tests 34 pass (6 red on series44-r2); the retry loop halves the smaller of the reply's instruction count and the
+limit asked, so it ends even if fexc ignored the limit; the driver's `run-program` stops its timer threads too, and
+`boot-linux` reports `serial_error`. Rerun on series45-r2fix (`natemu-raw/r2-final-20261102-01/rerun2/`): `cargo test`
+151 + 1 ignored (with `FEXC`), the REX corpus 37/37 at both block sizes, faults 7,912 at both, `contain` 0 failures,
+`run_x1.py` 6/6 and 188/188, i10 faults 296/296 at both, ASM 1,875 pass / 0 fail / 48 / 347, `run_boot_smoke.py` 4/4
+(`cancel-group` included), `run_r1.py r1a` 7/7 and `r1b` 12/12; census rerun (§4). **Rerun:** the full standing suite of boot-handoff §5 at 2 GiB, both block sizes (`suite-2g/`, every command):
+all green but the 7 known i8b QEMU two-NaN departures at both block sizes; `cargo test` 151 + 1 ignored (with `FEXC`
+set too), `check_resident_stack.py` `ok` (gate 19,168, nested 23,312, boot 12,832 of 32,768: no resident change),
+Python 317, faults 7,912 x 2, ASM 1,875 pass / 0 fail / 48 / 347 (the runner's `mnemonic` now skips an ignored REX:
+`FEX_bugs/REX/0F_38.asm`, whose chained ADCX was a host-undecoded stop before, is the profile's #UD now), the REX corpus
+25/25 x 2, `run_x3.py`, `run_x4.py`, `run_l3.py`, `run_l4a.py`, `run_l4b.py`, `run_m1.py`, `run_m2.py` 112/112, `run_x1.py`
+6/6 and 188/188, `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative controls flagged), `run_boot_smoke.py` 3/3 (the
+`cancel` case included); at 4 MiB the three relocated runners (`small-4m/`); the installer boots (boot-handoff §4).
 
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 

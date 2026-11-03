@@ -731,8 +731,14 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
       else if (x == 0x64 || x == 0x65) ++high;
       else if (!(x == 0xF0 || x == 0xF2 || x == 0xF3 || x == 0x66 || x == 0x67 || (x >= 0x40 && x <= 0x4F))) break;
     }
-    if (fsgs && !memory) return Uns("FS/GS override on an instruction without a memory operand");
-    if (fsgs && ss + data + high != 1) return Uns("FS/GS override with another segment prefix (no SDM rule for several)");
+    // R2 review (owner rule, November 2: where the SDM is underspecified or says reserved, match a real x86 processor):
+    // segment prefixes on a near direct branch (Jcc rel8/rel32, JMP rel8/rel32, CALL rel32, LOOPcc/JrCXZ) are ignored, as
+    // processors and pinned QEMU ignore them (SDM Vol.2 2.1.1 calls them reserved); FEX compiles the branch as without
+    // them (no memory operand takes a base). To be re-verified on x86 hardware (plan, "to verify on real x86 hardware").
+    const bool direct = (primary && ((op >= 0x70 && op <= 0x7F) || (op >= 0xE0 && op <= 0xE3) || op == 0xE8 || op == 0xE9 || op == 0xEB)) ||
+                        (d.FexcMap == FEXC_MAP_TWO && op >= 0x80 && op <= 0x8F);
+    if (fsgs && !memory && !direct) return Uns("FS/GS override on an instruction without a memory operand");
+    if (fsgs && !direct && ss + data + high != 1) return Uns("FS/GS override with another segment prefix (no SDM rule for several)");
     if (memory && ss && data) return Uns("SS with a CS/DS/ES prefix (mixed segment prefixes)");
     if (ss && memory && !(has_modrm && mod != 3)) return Uns("SS override on a moffs, xlat or string source operand");
   }

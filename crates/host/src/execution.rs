@@ -14,6 +14,7 @@ use natemu_abi::paging::Fault;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
@@ -25,17 +26,30 @@ use std::time::{Duration, Instant};
 /// (never mapped, so never backed): every vCPU maps block 0's. Guest RAM (M1: `ram_bytes`, chosen at prepare) follows
 /// the last block, at `n * stride`; only the pages the guest or the host touch are ever backed.
 pub struct Backing {
-    /// Shared (not borrowed) by whatever outlives a move of the Backing: the chipset's LAPIC view ([`crate::irq`]).
-    pub memory: Arc<Memory>,
+    /// Shared (not borrowed) by whatever outlives a move of the Backing: the chipset's LAPIC view ([`crate::irq`]) and the
+    /// VM ([`Machine`]). Not public: replacing it would leave `ram` pointing into a mapping that is gone.
+    pub(crate) memory: Arc<Memory>,
     pub(crate) n: usize,
     stride: usize,
-    /// Guest-physical RAM through the host's alias.
-    pub ram: GuestRam,
+    /// Guest-physical RAM through the host's alias: valid while `memory` is mapped, so never handed out by value in safe
+    /// code (`GuestRam` is `Copy`: a copy would outlive the backing; R2 review).
+    pub(crate) ram: GuestRam,
     /// One CNTVCT sample (the host's `mach_absolute_time`: every vCPU's virtual counter has offset 0) taken when the VM
     /// was prepared: each vCPU's TSC starts from it, so all start near 0 and agree.
     epoch: u64,
 }
 impl Backing {
+    /// The backing's mapping (shared: whoever holds a clone keeps it mapped).
+    pub fn memory(&self) -> &Arc<Memory> {
+        &self.memory
+    }
+    /// Guest RAM through the host's alias.
+    ///
+    /// # Safety
+    /// The value (and every copy) must not be used after this backing is dropped: it addresses the backing's mapping.
+    pub unsafe fn ram(&self) -> GuestRam {
+        self.ram
+    }
     /// vCPU `v`'s view.
     pub fn vcpu(&self, v: usize) -> Area<'_> {
         assert!(v < self.n);
@@ -532,10 +546,13 @@ impl Server {
         // deadline or the peers' watchdogs (seen with `lsof` in the compile-server-kill runs).
         static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _spawn = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+        // Its own process group (R2 review): a terminal's Ctrl-C goes to the foreground group, and must reach only the
+        // embedder (the stub cancels the run), not kill the server under a compile.
         let mut child = Command::new(fexc)
             .arg("--serve")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .process_group(0)
             .spawn()
             .map_err(|e| format!("fexc --serve: {e}"))?;
         let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
@@ -788,13 +805,15 @@ impl Compiler {
     fn compile(&mut self, bytes: &[u8], rip: u64, step: bool, hook: &mut impl Hook) -> Result<Code> {
         // I9 review: a block whose code is over `MAX_BLOCK_BYTES` (PDEP/PEXT, PCMPxSTRx and other long lowerings in numbers)
         // is translated again from the same RIP with half its instructions, until it fits; one instruction too large for a
-        // block stops `code_too_large`.
+        // block stops `code_too_large`. R2 review: the same for a block with a spill area (`spill_area`).
         let mut limit = if step { Some(1) } else { self.max_instructions };
         loop {
             match self.compile_once(bytes, rip, limit, hook)? {
                 Ok(code) => return Ok(code),
-                Err(n) if n > 1 => limit = Some(n / 2),
-                Err(_) => return Ok(Code::None("code_too_large".into())),
+                // Halving the smaller of the reply's count and the limit asked: the limit falls every turn even if fexc
+                // answered with more instructions than asked (the loop always ends).
+                Err((n, _)) if limit.map_or(n, |l| n.min(l)) > 1 => limit = Some(limit.map_or(n, |l| n.min(l)) / 2),
+                Err((_, reason)) => return Ok(Code::None(reason.into())),
             }
         }
     }
@@ -809,9 +828,9 @@ impl Compiler {
         [self.sse_gated.into(), self.avx_gated.into(), self.alignment_gated.into(), flag("--x87-gated"), flag("--wait-gated"),
          value("--x87-fpcr"), value("--simd-unmasked"), value("--x87-unmasked")]
     }
-    /// [`Compiler::compile`] with an instruction limit; `Err(n)`: the object's code is too large for a block (n guest
-    /// instructions translated).
-    fn compile_once(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>, hook: &mut impl Hook) -> Result<std::result::Result<Code, u32>> {
+    /// [`Compiler::compile`] with an instruction limit; `Err((n, why))`: the object must be translated again with fewer
+    /// than its n guest instructions ([`admission::retry`]).
+    fn compile_once(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>, hook: &mut impl Hook) -> Result<std::result::Result<Code, (u32, &'static str)>> {
         let (key, gating) = ((rip, limit), self.gating());
         let index = match self.cache.get(&key).and_then(|v| v.iter().position(|e| e.matches(bytes, &gating))) {
             Some(i) => {
@@ -834,7 +853,7 @@ impl Compiler {
             }
         };
         Ok(match &self.cache[&key][index].answer {
-            Answer::Object(object) => match admission::oversized(object) {
+            Answer::Object(object) => match admission::retry(object) {
                 Some(n) => Err(n),
                 None => {
                     #[cfg_attr(not(feature = "testing"), allow(unused_mut))]
@@ -1086,30 +1105,30 @@ pub fn run(
     let (running, events) = std::sync::mpsc::channel::<bool>();
     let id = cpu.id();
     // A halted vCPU (X2: parked in the VM by HLT) is idle, not stuck: the watchdog waits on; the driver decides when a
-    // halted vCPU can never wake ([`end_when_halted`]). The word lives in the backing, which outlives this thread.
-    let halted = event_word(area.memory, area.vcpu, std::mem::offset_of!(cache::Events, halted)) as *const AtomicU64 as usize;
-    let dog = std::thread::spawn(move || {
-        use std::sync::mpsc::RecvTimeoutError::Timeout;
-        // SAFETY: see above (joined before `run` returns).
-        let halted = unsafe { &*(halted as *const AtomicU64) };
-        while let Ok(true) = events.recv() {
-            let mut limit = watchdog;
-            // Repeated while the vCPU stays in: a request racing its entry into `hv_vcpu_run` might not stop it.
-            while events.recv_timeout(limit) == Err(Timeout) {
-                if halted.load(SeqCst) != 0 {
-                    continue;
+    // halted vCPU can never wake ([`end_when_halted`]). A scoped thread (R2 review): it borrows the word, and is joined
+    // even when `serve` panics (unwinding drops `running` first, which ends it).
+    let halted: &AtomicU64 = event_word(area.memory, area.vcpu, std::mem::offset_of!(cache::Events, halted));
+    std::thread::scope(move |scope| {
+        scope.spawn(move || {
+            use std::sync::mpsc::RecvTimeoutError::Timeout;
+            while let Ok(true) = events.recv() {
+                let mut limit = watchdog;
+                // Repeated while the vCPU stays in: a request racing its entry into `hv_vcpu_run` might not stop it.
+                while events.recv_timeout(limit) == Err(Timeout) {
+                    if halted.load(SeqCst) != 0 {
+                        continue;
+                    }
+                    exit_vcpus(&mut [id]);
+                    limit = Duration::from_millis(100);
                 }
-                exit_vcpus(&mut [id]);
-                limit = Duration::from_millis(100);
             }
-        }
-    });
-    let stop = serve(cpu, area, compiler, stop_at, requests, stops, &running, cancelled, hook);
-    // ponytail: a cancel the watchdog sent just as the guest exited stays pending on the vCPU and would end its next
-    // `hv_vcpu_run` at once; harmless while a vCPU serves one run. Drain it (a zero-length run) if vCPUs get reused.
-    drop(running);
-    let _ = dog.join();
-    stop
+        });
+        let stop = serve(cpu, area, compiler, stop_at, requests, stops, &running, cancelled, hook);
+        // ponytail: a cancel the watchdog sent just as the guest exited stays pending on the vCPU and would end its next
+        // `hv_vcpu_run` at once; harmless while a vCPU serves one run. Drain it (a zero-length run) if vCPUs get reused.
+        drop(running);
+        stop
+    })
 }
 fn serve(
     cpu: &Vcpu,
@@ -1326,6 +1345,36 @@ fn translation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// With `FEXC` set (R2 review): an answer with a spill area is not a host error. The block is translated again with half
+    /// its instructions; a spill area at one instruction is the typed stop `spill_area`. fexc spills on none of the corpora,
+    /// so the cached answers are given a spill area (header `spill_bytes`).
+    #[test]
+    fn spill_areas_retry_then_stop() {
+        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        let code = [0x48, 0x01, 0xd8, 0x48, 0x01, 0xd8, 0x48, 0x01, 0xd8, 0xc3]; // add rax, rbx x3; ret
+        let spill = |c: &mut super::Compiler| {
+            for entries in c.cache.values_mut() {
+                for e in entries {
+                    if let Answer::Object(o) = &mut e.answer {
+                        o[60..64].copy_from_slice(&8u32.to_le_bytes());
+                    }
+                }
+            }
+        };
+        let insns = |c: &mut super::Compiler| match c.compile(&code, 0x1000, false, &mut ()).unwrap() {
+            Code::Block(b) => Ok(b.guest_insns),
+            Code::None(reason) => Err(reason),
+            Code::System(_) => panic!("system"),
+        };
+        assert_eq!(insns(&mut c), Ok(4));
+        spill(&mut c);
+        assert_eq!(insns(&mut c), Ok(2)); // translated again at 2
+        c.compile(&code, 0x1000, true, &mut ()).unwrap(); // the step translation (limit 1) cached too
+        spill(&mut c);
+        assert_eq!(insns(&mut c), Err("spill_area".into()));
+    }
+
     /// With `FEXC` set: a repeated request is answered from the cache, a different RIP, bytes or block limit is compiled.
     #[test]
     fn compiler_keys_answers_by_what_fexc_read() {
@@ -1356,8 +1405,8 @@ mod tests {
         assert_eq!(decoded(&mut c, 0x3000), Some(s));
         assert_eq!((c.compiles, c.hits), (5, 2));
         assert!(matches!(c.compile(&[0xf4], 0x3000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::HLT)); // X2
-        // A system instruction the host does not decode (SYSENTER) is no code.
-        assert!(matches!(c.compile(&[0x0f, 0x34], 0x3000, false, &mut ()).unwrap(), Code::None(r) if r == "system_instruction"));
+        // SYSENTER is decoded since X1c (the resident delivers its fault); this test predates it (it expected no code).
+        assert!(matches!(c.compile(&[0x0f, 0x34], 0x3000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::SYSENTER));
         // Longer than 15 bytes (fexc series28): #GP(0) through the resident.
         let long = [&[0x66; 4][..], &[0x4a, 0xc7, 0x84, 0x83, 0, 1, 0, 0, 0, 0, 0, 0]].concat();
         assert!(matches!(c.compile(&long, 0x3000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::TOO_LONG));

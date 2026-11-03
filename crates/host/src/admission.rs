@@ -95,13 +95,18 @@ pub(crate) fn feature_overrides(supported: u64) -> Vec<String> {
         .collect()
 }
 
-/// I9 review: the guest instructions of an object whose code is over [`MAX_BLOCK_BYTES`] (the host translates the RIP again
-/// with fewer), or `None` (including an object too short to hold a header: [`admit`] refuses it).
-pub(crate) fn oversized(bytes: &[u8]) -> Option<u32> {
-    (bytes.len() >= std::mem::size_of::<Header>())
-        .then(|| record::<Header>(bytes, 0))
-        .filter(|h| h.code_size as usize > MAX_BLOCK_BYTES)
-        .map(|h| h.guest_insns)
+/// An object the host translates again from the same RIP with fewer guest instructions: its instruction count and why, the
+/// typed stop's reason when one instruction is still too much. I9 review: code over [`MAX_BLOCK_BYTES`] (`code_too_large`).
+/// R2 review: a spill area (`spill_area`; admission verifies no spill-slot code, so a block that needs one is refused; fewer
+/// instructions have fewer live values). `None` otherwise (including an object too short to hold a header: [`admit`]
+/// refuses it).
+pub(crate) fn retry(bytes: &[u8]) -> Option<(u32, &'static str)> {
+    let h = (bytes.len() >= std::mem::size_of::<Header>()).then(|| record::<Header>(bytes, 0))?;
+    match () {
+        _ if h.code_size as usize > MAX_BLOCK_BYTES => Some((h.guest_insns, "code_too_large")),
+        _ if h.spill_bytes != 0 => Some((h.guest_insns, "spill_area")),
+        _ => None,
+    }
 }
 fn record<T: Copy>(bytes: &[u8], offset: usize) -> T {
     assert!(offset + size_of::<T>() <= bytes.len());
@@ -145,9 +150,11 @@ pub(crate) struct Admitted {
 /// 0x67 (I10) may too: the target is RIP + rel in 64-bit mode whatever the address size (it selects only ECX for
 /// LOOP/JECXZ); linkers relax `call *f@GOTPCREL(%rip)` to `addr32 call f`.
 /// X1c: F2 too: MPX's BND prefix on CALL/RET/JMP/Jcc, ignored without MPX (fexc compiles such a branch as without it).
-/// FS/GS (their use with a branch is reserved) and 66 (rel16 operand size) are not skipped: such a branch is not proven.
+/// R2 review: FS/GS too (reserved with a branch by the SDM; processors ignore them, and fexc compiles the branch as
+/// without them). 66 (FEX decodes a rel16 operand, as AMD does; Intel ignores it) is not skipped: such a branch is not
+/// proven (fexc refuses it).
 fn branch_target(insn: &[u8], end: u64) -> Option<u64> {
-    let start = insn.iter().position(|&b| b & 0xf0 != 0x40 && !matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0x67 | 0xf2))?;
+    let start = insn.iter().position(|&b| b & 0xf0 != 0x40 && !matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x67 | 0xf2))?;
     let rel = match &insn[start..] {
         [0xeb | 0x70..=0x7f | 0xe0..=0xe3, r] => *r as i8 as i64,
         [0xe9 | 0xe8, r @ ..] | [0x0f, 0x80..=0x8f, r @ ..] if r.len() == 4 => i32::from_le_bytes(r.try_into().unwrap()) as i64,
@@ -157,25 +164,21 @@ fn branch_target(insn: &[u8], end: u64) -> Option<u64> {
 }
 
 /// Whether `insn` is a REP/REPE/REPNE string instruction (movs, cmps, stos, lods, scas): legacy prefixes including F2 or
-/// F3, an optional REX, then a4-a7/aa-af as the instruction's last byte. Such an instruction ends its block and exits to its own RIP while RCX is
+/// F3 (and REX bytes, [`crate::system::opcode_at`]), then a4-a7/aa-af as the instruction's last byte. Such an instruction ends its block and exits to its own RIP while RCX is
 /// not 0 (I2), so that RIP is a proven literal-exit target.
 fn rep_string(insn: &[u8]) -> bool {
-    let start = insn.iter().position(|b| !matches!(b, 0xf0 | 0xf2 | 0xf3 | 0x66 | 0x67 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65));
-    let Some(start) = start else { return false };
-    let opcode = insn[start..].iter().position(|b| b & 0xf0 != 0x40).map(|i| start + i);
-    let rep = insn[..start].iter().any(|&b| b == 0xf2 || b == 0xf3);
-    rep && opcode.is_some_and(|o| o <= start + 1 && o + 1 == insn.len() && matches!(insn[o], 0xa4..=0xa7 | 0xaa..=0xaf))
+    let (o, _) = crate::system::opcode_at(insn);
+    let rep = insn[..o].iter().any(|&b| b == 0xf2 || b == 0xf3);
+    rep && o + 1 == insn.len() && matches!(insn[o], 0xa4..=0xa7 | 0xaa..=0xaf)
 }
 
-/// Whether `insn` is exactly one LOCK NEG with a memory operand (legacy prefixes including F0, an optional REX, f6/f7 /3,
+/// Whether `insn` is exactly one LOCK NEG with a memory operand (legacy prefixes including F0 and REX bytes, f6/f7 /3,
 /// mod != 3, its SIB and displacement bytes). Its compare-and-swap exits to its own RIP when it loses a race (I3, fexc
 /// patch 0016), and it ends its block, so that RIP is a proven literal-exit target. Other legacy prefixes (F2/F3 included,
 /// which fexc refuses with LOCK) are accepted here: this only proves the exit target from the bytes, never that the form
 /// is admitted (the allowlist decides that).
 fn lock_neg(insn: &[u8]) -> bool {
-    let start = insn.iter().position(|b| !matches!(b, 0xf0 | 0xf2 | 0xf3 | 0x66 | 0x67 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65));
-    let Some(start) = start else { return false };
-    let o = if insn[start] & 0xf0 == 0x40 { start + 1 } else { start };
+    let (o, _) = crate::system::opcode_at(insn);
     let (Some(&op), Some(&modrm)) = (insn.get(o), insn.get(o + 1)) else { return false };
     let (mode, reg, rm) = (modrm >> 6, modrm >> 3 & 7, modrm & 7);
     let sib = usize::from(mode != 3 && rm == 4);
@@ -186,7 +189,7 @@ fn lock_neg(insn: &[u8]) -> bool {
         2 => 4,
         _ => return false,
     };
-    insn[..start].contains(&0xf0) && matches!(op, 0xf6 | 0xf7) && reg == 3 && o + 2 + sib + disp == insn.len()
+    insn[..o].contains(&0xf0) && matches!(op, 0xf6 | 0xf7) && reg == 3 && o + 2 + sib + disp == insn.len()
 }
 
 /// Admits `bytes`, an fexc `--object` compiled at `rip` from `source` (the guest
@@ -265,8 +268,9 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
         || h.body_offset < ENTRY_OFFSET
         || h.body_offset > region
         || h.end_marker_offset != object::NONE32
-        // ponytail: no spill area (fexc never spilled on the slice-1 corpora); admitting one needs the sp
-        // prologue/epilogue and spill-slot accesses verified on every path.
+        // ponytail: no spill area (fexc never spilled on the slice-1 corpora or the boots); admitting one needs the sp
+        // prologue/epilogue and spill-slot accesses verified on every path. The host retries such a block with fewer
+        // instructions first and stops `spill_area` at one ([`retry`]), so this refusal is reached only through a tamper.
         || h.spill_bytes != 0
         || h.guest_bytes == 0
         || h.guest_bytes as usize > source.len()
@@ -591,24 +595,28 @@ mod tests {
     fn lock_neg_forms() {
         // lock neg [rbx]; lock neg qword [rax+rcx*8+0x10]; lock neg byte [rip+x]; fs lock neg word [rsp]; [rbp+0] (mod 1).
         for insn in [&[0xf0, 0xf7, 0x1b][..], &[0xf0, 0x48, 0xf7, 0x5c, 0xc8, 0x10], &[0xf0, 0xf6, 0x1d, 1, 2, 3, 4], &[0x64, 0x66, 0xf0, 0xf7, 0x1c, 0x24],
-                     &[0xf0, 0xf7, 0x5d, 0x00], &[0xf0, 0xf7, 0x1c, 0x25, 0, 0x10, 0, 0]] {
+                     &[0xf0, 0xf7, 0x5d, 0x00], &[0xf0, 0xf7, 0x1c, 0x25, 0, 0x10, 0, 0],
+                     // R2 review: two REX bytes (the last counts) and a REX before F0 (ignored) are one instruction too.
+                     &[0xf0, 0x48, 0x48, 0xf7, 0x1b], &[0x48, 0xf0, 0xf7, 0x1b]] {
             assert!(super::lock_neg(insn), "{insn:x?}");
         }
-        // No LOCK, a register operand, /2 (not), a short or long span, two REX bytes.
+        // No LOCK, a register operand, /2 (not), a short or long span.
         for insn in [&[0xf7, 0x1b][..], &[0xf0, 0xf7, 0xdb], &[0xf0, 0xf7, 0x13], &[0xf0, 0xf7, 0x5b], &[0xf0, 0xf7, 0x1b, 0x90],
-                     &[0xf0, 0x48, 0x48, 0xf7, 0x1b], &[0xf0], &[]] {
+                     &[0xf0], &[]] {
             assert!(!super::lock_neg(insn), "{insn:x?}");
         }
     }
 
     #[test]
     fn rep_string_forms() {
-        for insn in [&[0xf3, 0x48, 0xab][..], &[0xf3, 0xa4], &[0xf2, 0xae], &[0xf3, 0x66, 0xa7], &[0x64, 0xf3, 0x48, 0xa5], &[0xf3, 0x65, 0xac]] {
+        // R2 review: two REX bytes (the last counts) and a REX before F3 (ignored) too.
+        for insn in [&[0xf3, 0x48, 0xab][..], &[0xf3, 0xa4], &[0xf2, 0xae], &[0xf3, 0x66, 0xa7], &[0x64, 0xf3, 0x48, 0xa5], &[0xf3, 0x65, 0xac],
+                     &[0xf3, 0x48, 0x48, 0xab], &[0x48, 0xf3, 0xab]] {
             assert!(super::rep_string(insn), "{insn:x?}");
         }
-        // No repeat prefix, a REP on a non-string opcode (rep ret, pause), two REX bytes, a ModRM-like tail, or bytes after the
-        // opcode (the span must be exactly one instruction) is not one.
-        for insn in [&[0x48, 0xab][..], &[0xa4], &[0xf3, 0xc3], &[0xf3, 0x90], &[0xf3, 0x48, 0x48, 0xab], &[0xf3, 0x0f, 0xa4], &[0xf3], &[],
+        // No repeat prefix, a REP on a non-string opcode (rep ret, pause), a ModRM-like tail, or bytes after the opcode (the
+        // span must be exactly one instruction) is not one.
+        for insn in [&[0x48, 0xab][..], &[0xa4], &[0xf3, 0xc3], &[0xf3, 0x90], &[0xf3, 0x0f, 0xa4], &[0xf3], &[],
                      &[0xf3, 0xab, 0x90], &[0xf3, 0xa4, 0x75, 0x40]] {
             assert!(!super::rep_string(insn), "{insn:x?}");
         }
@@ -752,10 +760,12 @@ mod tests {
         assert_eq!(branch_target(&[0x67, 0x66, 0xe8, 1, 0, 0, 0], 0x10), None);
         assert_eq!(branch_target(&[0x2e, 0x74, 0x02], 0x10), Some(0x12));
         assert_eq!(branch_target(&[0x26, 0x36, 0x48, 0xe9, 0, 0, 0, 0], 0x10), Some(0x10));
-        // Not proven: 66 (rel16), FS/GS, and an indirect CS-prefixed call.
+        // R2 review: FS/GS ignored as by processors (the census's `65 72 79`).
+        assert_eq!(branch_target(&[0x64, 0xe8, 1, 0, 0, 0], 0x10), Some(0x11));
+        assert_eq!(branch_target(&[0x65, 0xeb, 1], 0x10), Some(0x11));
+        assert_eq!(branch_target(&[0x65, 0x72, 0x79], 0x10), Some(0x89));
+        // Not proven: 66 (rel16 in FEX's decode), and an indirect CS-prefixed call.
         assert_eq!(branch_target(&[0x66, 0xe8, 1, 0], 0x10), None);
-        assert_eq!(branch_target(&[0x64, 0xe8, 1, 0, 0, 0], 0x10), None);
-        assert_eq!(branch_target(&[0x65, 0xeb, 1], 0x10), None);
         assert_eq!(branch_target(&[0x2e, 0xff, 0xd0], 0x10), None);
     }
 

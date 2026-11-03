@@ -12,14 +12,15 @@
   the run completes).
 - `legacy-*` (L3 + M1's patch: 0xA0000-0xFFFFF is not RAM): an unassigned page there reads all-ones (counted), a test
   device registers there, and an identity page there is refused by the driver.
-- `xmc-high`: cross-modifying and self-modifying code in a code page near the top of 2 GiB (`--place 0x7ff00000`: the
-  code page's mask word and its invalidation-record summary bits are the highest ones). vCPU 1 rewrites the immediate
+- `xmc-high`: cross-modifying and self-modifying code in a code page near the top of RAM (`--place R - 1 MiB`, R =
+  NATEMU_RAM, default 2 GiB: 0x7ff00000; the code page's mask word and its invalidation-record summary bits are the
+  highest ones for that RAM). vCPU 1 rewrites the immediate
   of X (`mov esi, 1` -> 2) after a delay, then sets a flag; vCPU 0 runs X in a loop until it sees the flag, executes
   CPUID (serializing) and runs X once more: RSI must be 2. Alone: vCPU 0 runs X, rewrites it and runs it again: RSI 2.
   Block sizes default and 1.
 
 Writes DIR/m1.json; exit status 1 on any failure."""
-import argparse, json, pathlib, subprocess, sys
+import argparse, json, os, pathlib, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference')]
@@ -93,13 +94,14 @@ def cases(a):
     alone = asm(f'lea r13, [rip + once]\nmov rax, {X:#x}\njmp rax\nonce:\nmov byte ptr [{X + 1:#x}], 2\n'
                 f'lea r13, [rip + done]\nmov rax, {X:#x}\njmp rax\ndone:').hex()
     space = f'body {X:#x} {x}\nmemory 0x100f00 00\nregion {FLAG:#x} 0x1000\n'
+    high = int(os.environ.get('NATEMU_RAM', '0x80000000'), 16) - MIB
     for block in (None, 1):
         limit = [str(block)] if block else []
         out = run(a, f'xmc-high-{block}', f'body {CODE:#x} {c0}\nbody {PEER:#x} {c1}\n{space}cpu\nrip {CODE:#x}\nrflags 0x2\ncpl 0\n'
-                  f'cpu\nrip {PEER:#x}\nrflags 0x2\ncpl 0\n', [*limit, '--place', 0x7ff0_0000])
+                  f'cpu\nrip {PEER:#x}\nrflags 0x2\ncpl 0\n', [*limit, '--place', high])
         ok = 'cpus' in out and all(c['stop'] == 'reached' for c in out['cpus']) and int(out['cpus'][0]['gpr'][6], 0) == 2
         yield f'xmc-high-{block}', ok, out.get('cpus', out)
-        out = run(a, f'smc-high-{block}', f'body {CODE:#x} {alone}\n{space}rip {CODE:#x}\nrflags 0x2\ncpl 0\n', [*limit, '--place', 0x7ff0_0000])
+        out = run(a, f'smc-high-{block}', f'body {CODE:#x} {alone}\n{space}rip {CODE:#x}\nrflags 0x2\ncpl 0\n', [*limit, '--place', high])
         c = first(out)
         yield f'smc-high-{block}', c['stop'] == 'reached' and int(c['gpr'][6], 0) == 2, c
 

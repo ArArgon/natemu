@@ -1263,12 +1263,10 @@ impl Verifier<'_> {
     }
 }
 
-/// Legacy prefixes including LOCK, an optional REX, then cmpxchg (0f b0/b1) or cmpxchg8b/16b (0f c7 /1).
+/// Legacy prefixes including LOCK (and REX bytes, [`crate::system::opcode_at`]), then cmpxchg (0f b0/b1) or cmpxchg8b/16b (0f c7 /1).
 fn lock_cmpxchg(insn: &[u8]) -> bool {
-    let start = insn.iter().position(|b| !matches!(b, 0xf0 | 0xf2 | 0xf3 | 0x66 | 0x67 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65));
-    let Some(start) = start else { return false };
-    let o = if insn[start] & 0xf0 == 0x40 { start + 1 } else { start };
-    insn[..start].contains(&0xf0)
+    let (o, _) = crate::system::opcode_at(insn);
+    insn[..o].contains(&0xf0)
         && insn.get(o) == Some(&0x0f)
         && match insn.get(o + 1) {
             Some(0xb0 | 0xb1) => true,
@@ -1291,29 +1289,22 @@ fn normalize(w: u32) -> u32 {
 
 /// (signed, operand width) of an x86 `div`/`idiv` (F6/F7 /6, /7), else `None`.
 fn x86_divide(insn: &[u8]) -> Option<(bool, u32)> {
-    let mut i = 0;
-    let mut size16 = false;
-    while let Some(&b @ (0x66 | 0x67 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0xf0 | 0xf2 | 0xf3)) = insn.get(i) {
-        size16 |= b == 0x66;
-        i += 1;
-    }
-    let mut rex_w = false;
-    if let Some(&b @ 0x40..=0x4f) = insn.get(i) {
-        rex_w = b & 8 != 0;
-        i += 1;
-    }
+    let (i, rex) = crate::system::opcode_at(insn);
+    let size16 = insn[..i].contains(&0x66);
     let (op, reg) = (*insn.get(i)?, insn.get(i + 1)? >> 3 & 7);
     if !matches!(op, 0xf6 | 0xf7) || reg < 6 {
         return None;
     }
-    Some((reg == 7, if op == 0xf6 { 8 } else if rex_w { 64 } else if size16 { 16 } else { 32 }))
+    Some((reg == 7, if op == 0xf6 { 8 } else if rex & 8 != 0 { 64 } else if size16 { 16 } else { 32 }))
 }
 
 /// I6b: the helper function of an x87 transcendental, remainder, scale or extract instruction, the D9 opcode's second byte (F0..F5,
 /// F8, F9, FB, FD..FF), after segment, address-size and REX prefixes (fexc refuses 66, F2 and F3 on x87 forms).
 fn x86_x87_helper(insn: &[u8]) -> Option<u32> {
-    let mut i = insn.iter().take_while(|b| matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x67)).count();
-    i += usize::from(matches!(insn.get(i), Some(0x40..=0x4f)));
+    let (i, _) = crate::system::opcode_at(insn);
+    if !insn[..i].iter().all(|b| matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x67 | 0x40..=0x4f)) {
+        return None;
+    }
     match insn.get(i..)? {
         [0xd9, m @ (0xf0..=0xf5 | 0xf8 | 0xf9 | 0xfb | 0xfd..=0xff)] => Some(u32::from(*m)),
         _ => None,
@@ -1322,12 +1313,14 @@ fn x86_x87_helper(insn: &[u8]) -> Option<u32> {
 /// I6b: the control word of PCMPESTRM/PCMPESTRI/PCMPISTRM/PCMPISTRI (66 [REX] 0F 3A 60..63 or VEX.128.66.0F3A 60..63): imm8 (the
 /// instruction's last byte), and for the explicit-length forms (60, 61) REX.W/VEX.W << 8 and 1 << 9.
 fn x86_string_compare(insn: &[u8]) -> Option<u32> {
-    let i = insn.iter().take_while(|b| matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x67 | 0x66)).count();
-    let opsize = insn[..i].contains(&0x66);
+    let (i, rex) = crate::system::opcode_at(insn);
+    if !insn[..i].iter().all(|b| matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x67 | 0x66 | 0x40..=0x4f)) {
+        return None;
+    }
+    let (opsize, any_rex) = (insn[..i].contains(&0x66), insn[..i].iter().any(|b| b & 0xf0 == 0x40));
     let (w, op) = match insn.get(i..)? {
-        [0xc4, p1, p2, op, ..] if !opsize && p1 & 0x1f == 3 && p2 & 7 == 1 => (p2 >> 7, *op), // map 0F3A, L = 0, pp = 66
-        [rex @ 0x40..=0x4f, 0x0f, 0x3a, op, ..] if opsize => (rex >> 3 & 1, *op),
-        [0x0f, 0x3a, op, ..] if opsize => (0, *op),
+        [0xc4, p1, p2, op, ..] if !opsize && !any_rex && p1 & 0x1f == 3 && p2 & 7 == 1 => (p2 >> 7, *op), // map 0F3A, L = 0, pp = 66
+        [0x0f, 0x3a, op, ..] if opsize => (rex >> 3 & 1, *op),
         _ => return None,
     };
     let imm = u32::from(*insn.last()?);
@@ -1436,6 +1429,14 @@ mod tests {
         assert_eq!(x86_divide(&[0x66, 0x41, 0xf7, 0xf9]), Some((true, 16)));
         assert_eq!(x86_divide(&[0xf6, 0x33]), Some((false, 8)));
         assert_eq!(x86_divide(&[0xf7, 0xe1]), None); // mul ecx
+        // R2 review: a REX chain (the last REX counts) and a REX before a legacy prefix (ignored), SDM Vol.2 2.2.1.
+        assert_eq!(x86_divide(&[0x48, 0x41, 0xf7, 0xf1]), Some((false, 32))); // div r9d
+        assert_eq!(x86_divide(&[0x41, 0x4c, 0xf7, 0xf9]), Some((true, 64))); // idiv rcx
+        assert_eq!(x86_divide(&[0x48, 0x66, 0xf7, 0xf1]), Some((false, 16))); // div cx
+        assert!(lock_cmpxchg(&[0xf0, 0x41, 0x48, 0x0f, 0xb1, 0x0a]));
+        assert_eq!(x86_x87_helper(&[0x41, 0x40, 0xd9, 0xfe]), Some(0xfe));
+        assert_eq!(x86_string_compare(&[0x66, 0x41, 0x4c, 0x0f, 0x3a, 0x60, 0xca, 0x7f]), Some(0x7f | 1 << 8 | natemu_abi::strings::EXPLICIT));
+        assert_eq!(x86_string_compare(&[0x66, 0x41, 0xc4, 0xe3, 0x79, 0x63, 0xca, 0x7f]), None); // REX before VEX: #UD, not this
     }
 
     #[test]

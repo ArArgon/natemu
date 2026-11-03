@@ -114,6 +114,21 @@ system 16,803 -> 16,815 (with the review round's `tpause` 1: WAITPKG not adverti
 XLAT 1 admitted; left `pushq` 11, `xorl` 2, `subb` 2, none I10's), BMI 6 -> 0 (`addr32 mulx`), AVX 218,126 -> 10 (EVEX 205,405 and
 unadvertised VEX 12,715 #UD; left: the 10 VEX gathers, owner decision), admitted 4,702,372 -> 4,703,831, system 8,266 -> 226,564.
 Masked stores (MASKMOVQ, MASKMOVDQU, VMASKMOV/VPMASKMOV, owner decision: refused): 0 sites in kernel and initramfs.
+**R2 review re-check (November 2).** `census.py` now reads any run of legacy prefixes and REX bytes as x86 does (only a
+REX immediately before the opcode counts, the last of several; one followed by a legacy prefix is ignored: SDM Vol.2
+2.2.1, FEX's `DecodeREXIfValid`) and ports X1c (PREFETCHW m8 and CLDEMOTE m8 compiled, 0f 0d with a register operand #UD,
+every other 0f 0d / 0f 18..1d cell a Reserved-NOP, BND on near branches ignored). The 15 initramfs sites I10 left
+(`pushq` 11, `xorl` 2, `subb` 2) were REX chains, bytes of OpenSSL's CRYPTOGAMS strings inside `.text` (`4f 47 41 4d 53`
+"OGAMS" = push r11; `47 46 28 32` subb %r14b,(%rdx); `48 41 31 20` xorl %esp,(%r8)): fexc compiles them correctly, the
+classifier read one REX only. Running them showed a real host defect, fixed with this re-check: admission's div/idiv,
+x87-helper, PCMPxSTRx, LOCK CMPXCHG/NEG and REP-string decoders and the host's system-instruction decode read one REX
+(9 of 25 programs of `tools/reference/gen_rex.py`'s corpus refused at HEAD, a host error; 25/25 against QEMU at both block
+sizes after). Rerun on HEAD's classifier with the fix into `natemu-raw/kernel-census-r2-20261102-01/` (`x` linked to the C0
+data; report in its `report/`). Kernel: `prefetchw` 17 -> admitted (X1c); nothing refused (3 `bad` decodes in the 32-bit
+decompressor head, which natemu never runs: entry is `startup_64`). Initramfs: other 15 -> 0; left the 10 VEX gathers
+(owner decision October 30 (2)) and 2 `jb` with a GS prefix (`65 72 79`, "ery" of "Montgomery Multiplication" in
+`ossl-modules/fips.so`): a segment override on a branch is reserved (SDM Vol.2 2.1.1), the typed refusal
+`unsupported_form`.
 Files here: `extract.py`, `census.py`, `report.py`, `results.md` (every table, generated), `forms-kernel.tsv` (every refused
 form of the decompressor and vmlinux, one row per mnemonic + operand shape, first-use order). The same for the
 initramfs is `RAW/forms-initrd.tsv`; `RAW/census.json` holds every row.

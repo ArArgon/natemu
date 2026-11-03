@@ -116,7 +116,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         watchdog: std::time::Duration::from_millis(watchdog_ms),
         max_block,
         stop_at,
-        compile_cache: crate::compile_cache::Config::from_env(),
+        compile_cache: crate::compile_cache::Config::from_env()?,
         ..natemu::linux::Boot::new(resident, fexc, image)
     };
     if let Some(path) = &serial {
@@ -124,7 +124,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
     let prepared = boot.prepare()?;
     let (backing, loaded, board, devices) = (prepared.backing(), prepared.loaded(), prepared.board(), prepared.devices());
-    let guest = *prepared.guest();
+    // SAFETY: `guest` is used only while `prepared` lives (this function).
+    let guest = unsafe { prepared.guest() };
     if let Some(path) = &dump {
         write_dump(path, &guest, loaded)?;
     }
@@ -201,7 +202,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         other => (format!("{other:?}").split(['(', ' ', '{']).next().unwrap().to_lowercase(), format!("{other:?}")),
     };
     println!(
-        "{},\"stop\":\"{kind}\",\"reason\":\"{}\",\"state\":{},\"stats\":{{\"blocks\":{},\"compiles\":{compiles},\"systems\":{},\"flushes\":{},\"interrupts\":{},\"evictions\":{},\"retries\":{},\"shadow_resets\":{},\"cache\":{{\"code_used\":{},\"code_bytes\":{},\"meta_used\":{},\"blocks\":{}}},\"seconds\":{:.3},\"requests\":{},\"invalidations\":{},\"steps\":{},\"links\":{},\"unlinks\":{},\"k1\":{}}},{},\"serial_bytes\":{},\"ticks\":{{\"pit\":{},\"rtc\":{},\"lapic\":{{\"fired\":{},\"missed\":{},\"reinjected\":{}}}}},\"ended_first\":{},\"vcpus\":[{}]}}",
+        "{},\"stop\":\"{kind}\",\"reason\":\"{}\",\"state\":{},\"stats\":{{\"blocks\":{},\"compiles\":{compiles},\"systems\":{},\"flushes\":{},\"interrupts\":{},\"evictions\":{},\"retries\":{},\"shadow_resets\":{},\"cache\":{{\"code_used\":{},\"code_bytes\":{},\"meta_used\":{},\"blocks\":{}}},\"seconds\":{:.3},\"requests\":{},\"invalidations\":{},\"steps\":{},\"links\":{},\"unlinks\":{},\"k1\":{}}},{},\"serial_bytes\":{},\"serial_error\":{},\"ticks\":{{\"pit\":{},\"rtc\":{},\"lapic\":{{\"fired\":{},\"missed\":{},\"reinjected\":{}}}}},\"ended_first\":{},\"vcpus\":[{}]}}",
         placement(&loaded, &layout),
         reason.replace('"', "'"),
         cpu_json(&s.cpu),
@@ -225,6 +226,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         execution::k1_stats(backing.vcpu(0)),
         devices.report(),
         prepared.serial_bytes(),
+        prepared.serial_error().map_or("null".into(), |e| format!("\"{}\"", e.replace('"', "'"))),
         board.pit.json(),
         board.rtc.json(),
         lapic_end.fired,

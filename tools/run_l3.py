@@ -29,7 +29,7 @@ plan, L3; programs in tools/bench/smp/ports.py).
   page (refused before the port is read), INS #AC and #PF at CPL 3 (the port not read), CPL 3 with the driver's TSS (no
   bitmap: #GP(0)), and CS/DS-prefixed near branches (admission).
 - `pages` (natemu only, the owner's rule of October 29 and its amendment; a CPL 0 program on its own tables): unassigned
-  pages (the legacy hole, 0xC0000000 above 2 GiB of RAM, 0x80_0000_0000 above 4 GiB, 0xFED00000) read through the
+  pages (the legacy hole, 0xC0000000 above RAM (2 GiB, or 4 MiB), 0x80_0000_0000 above 4 GiB, 0xFED00000) read through the
   shared all-ones shadow by CMP, LODS, REPE CMPSB, MOVUPS and a load-op ADD (one fill each, counted), MOV writes ignored and
   counted, RMW/XCHG/STOS refused, strict read and write stops; a read crossing from RAM's last page; two vCPUs each filling;
   the xAPIC page disabled and in x2APIC mode (all-ones from the LAPIC, never shadowed, not counted) and a device at
@@ -37,7 +37,7 @@ plan, L3; programs in tools/bench/smp/ports.py).
   RAM, RAM to hole), an APIC base moved onto a filled page, and two vCPUs with different APIC bases.
 
 Writes DIR/l3.json; exit status 1 on any failure."""
-import argparse, json, pathlib, sys
+import argparse, json, os, pathlib, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
@@ -324,9 +324,10 @@ def cmd_cases(a, report):
 
 
 # ---- unassigned pages (owner decision, October 29, and its amendment after L3) -------------------------------------
-# A CPL 0 program on its own tables (identity space, CR3 = TABLES): 0-4 MiB in 2 MiB pages, then 4 KiB pages: BUF (RAM,
-# 0xff bytes), and at WINDOW + 0x1000 k the guest-physical pages of PAGES[k].
-TABLES, BUF, WINDOW, RAM_END = 0x300000, 0x400000, 0x500000, 2 << 30
+# A CPL 0 program on its own tables (identity space, CR3 = TABLES): 0-4 MiB in 2 MiB pages, then 4 KiB pages: linear
+# 0x400000 onto BUF (RAM, 0xff bytes), and at WINDOW + 0x1000 k the guest-physical pages of PAGES[k]. Every RAM page is
+# below 4 MiB and RAM's last page follows NATEMU_RAM (owner decision 7, November 2: the 4 MiB suite runs every runner).
+TABLES, BUF, WINDOW, RAM_END = 0x300000, 0x3d0000, 0x500000, int(os.environ.get('NATEMU_RAM', '0x80000000'), 16)
 PAGES = {'last-ram': RAM_END - 0x1000, 'above-ram': 0xC000_0000, 'above-4g': 0x80_0000_0000, 'hole': 0xE_0000,
          'hpet': 0xFED0_0000, 'ioapic': 0xFEC0_0000, 'xapic': 0xFEE0_0000}
 VA = {k: WINDOW + 0x1000 * i for i, k in enumerate(PAGES)}

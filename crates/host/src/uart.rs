@@ -76,10 +76,14 @@ pub struct Uart {
     /// The FIFO timeout's deadline (QEMU's `fifo_timeout_timer`), and the time of one character.
     timeout_at: Option<Instant>,
     char_time: Duration,
-    /// Every byte transmitted outside loopback, in order.
+    /// Every byte transmitted outside loopback, in order, while there is no sink (with one, nothing is kept: R2 review).
     pub output: Vec<u8>,
-    /// Where transmitted bytes also go (the driver's `--serial`).
+    /// Where transmitted bytes go instead (the stub's standard output, `--serial`).
     pub sink: Option<Box<dyn Write + Send>>,
+    /// Bytes transmitted outside loopback.
+    pub sent: u64,
+    /// The sink's first write error (the sink is dropped then; later bytes are counted, not kept).
+    pub sink_error: Option<String>,
     /// The interrupt output's level.
     pub(crate) line: bool,
     /// L4a's hook (`irq::install`: ISA IRQ 4): called with the new level whenever the interrupt output changes.
@@ -107,6 +111,8 @@ impl Uart {
             char_time: Duration::from_nanos(1_000_000_000 / 9600 * 10),
             output: Vec::new(),
             sink: None,
+            sent: 0,
+            sink_error: None,
             line: false,
             irq: None,
         }
@@ -193,9 +199,16 @@ impl Uart {
         if self.mcr & MCR_LOOP != 0 {
             self.receive(byte, now);
         } else {
-            self.output.push(byte);
-            if let Some(sink) = &mut self.sink {
-                let _ = sink.write_all(&[byte]).and_then(|_| sink.flush());
+            self.sent += 1;
+            match &mut self.sink {
+                Some(sink) => {
+                    if let Err(e) = sink.write_all(&[byte]).and_then(|_| sink.flush()) {
+                        self.sink_error = Some(e.to_string());
+                        self.sink = None;
+                    }
+                }
+                None if self.sink_error.is_none() => self.output.push(byte),
+                None => {}
             }
         }
         self.lsr |= LSR_TEMT;

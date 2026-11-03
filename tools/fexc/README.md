@@ -29,7 +29,9 @@ jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never 
 (series applied as twenty-eight commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series44-r2` (November 2, R2: patches 0001-0028 and
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series45-r2fix` (November 2, after the R2 review:
+series44-r2 plus the shim admitting segment prefixes on near direct branches, ignored as processors do; boot-features plan,
+Built (R2 review fixes), round 2). Before it, series44-r2 (November 2, R2: patches 0001-0028 and
 the X1c shim, built by `tools/fexc/build.sh`; its `obj/fexc` is byte-identical to the hand-built series43-x1, so they are the
 same compiler: [boot-handoff.md](../../docs/restructure/boot-handoff.md) §6). Between it and series36: series39-i5c (patch
 0026), series40-i5c-add (0027), series42-i5c (0028), series43-x1 (the X1c shim changes); boot-features plan, Built (I5c),

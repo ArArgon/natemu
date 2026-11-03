@@ -5,6 +5,10 @@
 which waits for COM1's transmit interrupt (IRQ 4 through the I/O APIC), so the marker on serial shows device interrupts
 reach the vCPUs after `prepare` returned and its value moved (at R2 they went through a dangling pointer and nothing
 user space wrote appeared). Pass at each N: the marker on serial and exit 0 (ACPI S5 from `poweroff -f`).
+`cancel` (R2 review: the library's `Prepared::canceller`, which the stub wires to SIGINT): the bzImage alone at 4 vCPUs,
+SIGINT 1.5 s in (the kernel is booting), to the stub alone and (`cancel-group`) to its whole process group as a terminal's
+Ctrl-C (the fexc servers run in their own groups); pass: the stub ends within 5 s of the signal with exit 2 and the stop
+`Cancelled`.
 
     tools/with-env python3 tools/run_boot_smoke.py --fexc FEXC --out DIR [--vcpus 1 4] [--kernel BZIMAGE] [--initrd FILE]
         [--timeout SECONDS]
@@ -51,6 +55,31 @@ def boot(stub, runtime, a, n):
                 wall_s=round(time.monotonic() - t0, 2), stop=err.strip().splitlines()[-1:] if err else [])
 
 
+def cancel(stub, runtime, a, group=False):
+    """`group`: SIGINT to the stub's whole process group, as a terminal's Ctrl-C does (the fexc servers must not get it)."""
+    name = 'cancel-group' if group else 'cancel'
+    serial = a.out / f'{name}.serial'
+    cmd = [stub, runtime, a.fexc, a.kernel, '--cmdline', 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr', '--vcpus', '4',
+           '--serial', serial]
+    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=group)
+    time.sleep(1.5)
+    running = p.poll() is None
+    t0 = time.monotonic()
+    if group:
+        os.killpg(p.pid, signal.SIGINT)
+    else:
+        p.send_signal(signal.SIGINT)
+    try:
+        _, err = p.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        _, err = p.communicate()
+    stop = err.strip().splitlines()[-1:] if err else []
+    sent = serial.stat().st_size if serial.exists() else 0
+    ok = running and p.returncode == 2 and stop == ['natemu: Cancelled'] and sent > 0
+    return dict(case=name, vcpus=4, rc=p.returncode, serial_bytes=sent, ok=ok, after_signal_s=round(time.monotonic() - t0, 2), stop=stop)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--fexc', required=True)
@@ -66,6 +95,10 @@ def main():
     results = []
     for n in a.vcpus:
         r = boot(stub, runtime, a, n)
+        print(json.dumps(r), flush=True)
+        results.append(r)
+    for group in (False, True):
+        r = cancel(stub, runtime, a, group)
         print(json.dumps(r), flush=True)
         results.append(r)
     (a.out / 'smoke.json').write_text(json.dumps(results, indent=1) + '\n')
