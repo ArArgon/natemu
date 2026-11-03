@@ -4,7 +4,8 @@ Status: November 2, 2026, end of the boot-features phase (chunk R2 of the
 [boot-features plan](boot-features-plan.md), "the plan" below; its §4 checklist says what is met). Emulator code at
 e6b2bf5 (the fix of the blocking interrupt defect found at R2, §4) plus the fixes of the independent phase-end review,
 uncommitted on e6b2bf5 (plan, Built (R2 review fixes)); the
-compiler is fexc **series47-seg** (November 3: series46-br66's patches with the owner's segment-prefix decisions in the shim
+compiler is fexc **series48-lean** (November 3, perf plan "Measured (chunk 2)": series47-seg with the compile server sending
+only what the host reads; objects, extent and args_read byte-identical; series47-seg is series46-br66's patches with the owner's segment-prefix decisions in the shim
 and `fexc.cpp`: CS/DS/ES/SS prefixes ignored, the last FS/GS prefix applies, FS/GS with no memory operand ignored; plan §5
 and Built (segment prefixes, November 3); series46-br66 is series45-r2fix plus patch 0029 and its shim change: 66 on near
 direct branches ignored as on Intel; series45-r2fix is series44-r2, byte-identical to the hand-built series43-x1, plus the
@@ -25,7 +26,7 @@ cargo +1.97.0 build --offline --locked --release -p natemu-runtime --target aarc
 tools/fexc/build.sh ../natemu-raw/fexc-$(date +%Y%m%d)-01                  # a fresh directory: it must not exist (about 30 s)
 ```
 
-series47-seg already exists, so `build.sh` refuses it: build into a new directory and pass its `obj/fexc` (§6). Build the stub with `-p natemu` alone: a whole-workspace build unifies the driver's `testing` feature (raw record and
+series48-lean already exists, so `build.sh` refuses it: build into a new directory and pass its `obj/fexc` (§6). Build the stub with `-p natemu` alone: a whole-workspace build unifies the driver's `testing` feature (raw record and
 code-cache writes, the hook's reply/object/compile-server calls) into it (plan, Built (L0), review round). The runners
 build and sign `natemu-host` themselves.
 
@@ -33,7 +34,7 @@ build and sign `natemu-host` themselves.
 
 ```sh
 R=target/aarch64-unknown-none/release/natemu-runtime
-F=../natemu-raw/fexc-native-20261026-01/series47-seg/obj/fexc
+F=../natemu-raw/fexc-native-20261026-01/series48-lean/obj/fexc
 K=../natemu-raw/kernel-census-20261028-01/dl/linux               # Debian 6.12.107 bzImage
 I=../natemu-raw/kernel-census-20261028-01/dl/initrd.gz           # Debian installer initrd
 target/release/natemu "$R" "$F" "$K" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr' --vcpus 4
@@ -216,7 +217,9 @@ warm-up boot first), `natemu-raw/r2-final-20261102-01/boot/boots.jsonl`. R2's ro
 `boot-linux` and the cache-off stub came from the scratch rebind experiment, not the committed fix; these replace them,
 and agree with them within 0.6 s. The `natemu` stub cache-warm rows were remeasured on series47-seg at 335c070, the stub
 built alone with `-p natemu` and signed, the same method, after a warm-up boot at N = 1 without and with the initrd, one boot per cell
-(`natemu-raw/final-suite-20261103-01/boot/boots.jsonl`); the other rows are R2's.)
+(`natemu-raw/final-suite-20261103-01/boot/boots.jsonl`); the perf chunk 2 rows are three interleaved boots per cell at
+e9214c8, old and new compiler each with its own warm cache after a warm-up boot, the log off (`natemu-raw/perf2-20261103-01/`,
+perf plan "Measured (chunk 2)"); the other rows are R2's.)
 
 | To the root-fs panic, wall s (guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
 | --- | --- | --- | --- | --- |
@@ -234,6 +237,10 @@ built alone with `-p natemu` and signed, the same method, after a warm-up boot a
 | `natemu-host boot-linux`, cache warm | 67.3 (5.15) | | | 49.5 (5.39) |
 | `natemu` stub, cache off | 67.8 (7.12) | | | 53.1 (9.47) |
 | `natemu-host boot-linux`, cache off | 68.0 (7.22) | | | 52.5 (8.95) |
+| `natemu-host boot-linux`, cache warm, series47-seg (perf chunk 2, mean of 3) | 68.0 (5.25) | | | 49.8 (5.53) |
+| `natemu-host boot-linux`, cache warm, **series48-lean** (perf chunk 2, mean of 3) | **52.2** (4.40) | | | **37.6** (4.52) |
+| `natemu-host boot-linux`, cache off, series47-seg (perf chunk 2, mean of 3) | 67.9 (7.09) | | | 53.6 (9.60) |
+| `natemu-host boot-linux`, cache off, **series48-lean** (perf chunk 2, mean of 3) | **49.3** (5.13) | | | **37.6** (6.32) |
 | `natemu` stub and `boot-linux` at 16b0576, warm or off | never (hangs after "Run /init", see below) | never | | never |
 | QEMU TCG `thread=multi` | 7.27 (2.24) | 5.55 (1.79) | 5.55 (1.86) | 5.46 (1.83) |
 | QEMU TCG default (multi-threaded) | 7.42 (2.28) | | | 5.43 (1.81) |
@@ -312,6 +319,16 @@ controls), `delivery` 0 failures, `run_x3.py` (9/9, 4/4, 24/24, 6/6, 10/10, 54/5
 `run_l3.py` 0 failures, `run_l4a.py` (13/13, 4/4, 2/2, 2/2, 1/1), `run_l4b.py` (5/5, 2/2, 3/3, 11/11, 7/7, 1/1),
 `run_m3.py` 0 failures, `run_m2.py` 112/112 at 2 GiB and at 4 MiB, `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative
 controls flagged), and the initrd boots to "Select a language" at N = 1 and 4 (§4 table).
+
+**Rerun on series48-lean** (`natemu-raw/perf2-20261103-01/suite/` and `checks/`, 2 GiB, e9214c8 plus the uncommitted
+change; perf plan "Measured (chunk 2)"; its objects equal series47-seg's on a boot's 1.14 M recorded requests): `cargo test` 152 + 1 ignored, also with `FEXC` set; fexc
+`test_slice1.py` 35, `test_fexc.py` 10, `check_sites.py --slice1` 64 programs (779 sites, 0 errors), `verify_precision.py`
+PASS, `test_serve.py` (both modes and against series47-seg's CLI); `run_slice1_vm.py` at both block sizes: fixtures 64, seed 44, I8 136, I8b 329 + the 7 known
+QEMU two-NaN departures (the same 7 programs), I9 120, I9-big 5, I10 88, REX 37, 66-on-branches 12, I7 69; faults 7,912 and
+the I7 corpus's 6,313 at both; ASM 1,875 / 0 fail / 48 / 347; `run_x1.py` 6/6 and 196/196; i10 faults 296 at both;
+`run_i5c.py` 255 at both; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7, `r1b` 12/12 (negative controls flagged); all 52
+measurement boots reached the dialog. Not rerun (no fexc change can reach them beyond the objects shown identical): the
+rest of the suite. The rest of the suite below ran on series47-seg.
 
 **Rerun on series47-seg** (`natemu-raw/seg-check-20261103-01/green/`, 2 GiB, HEAD 4a56356 plus the uncommitted change;
 plan, Built (segment prefixes, November 3)): `cargo test` 151 + 1 ignored (also with `FEXC` set), `check_resident_stack.py`
@@ -403,7 +420,7 @@ Full suite (about 25 minutes of runner time per pass on the M4 at R2, waits for 
 ```sh
 # From the repository root; zsh or bash. Wait until no other natemu-host runs (timing-sensitive cases: kicks, l4b,
 # x3 stress) and rerun alone any timing failure before calling it.
-F=../natemu-raw/fexc-native-20261026-01/series47-seg/obj/fexc    # tools/fexc/build.sh rebuilds it (patches 0001-0029 + the shim)
+F=../natemu-raw/fexc-native-20261026-01/series48-lean/obj/fexc   # tools/fexc/build.sh rebuilds it (patches 0001-0029 + the shim)
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 I8=../natemu-raw/i8-corpus-20261030-01      # gen_i8.py programs and their QEMU 7.2 results
@@ -498,6 +515,14 @@ tools/with-env python3 tools/run_r1.py r1b --fexc "$F" --out "$O/r1b"   # R1b: m
 ```
 
 ## 6. Compiler reproducibility
+
+**series48-lean** (perf plan "Measured (chunk 2)", November 3): `tools/fexc/build.sh
+../natemu-raw/fexc-native-20261026-01/series48-lean` applies `patches/0001-0029` to the pinned FEX commit with the working
+tree's shim (as series47-seg) and `fexc.cpp`, whose `--serve` now sends only what the host reads (no JSON report for an
+object, `guest.end` for no code; `--serve --report` for `test_serve.py`); `obj/fexc` SHA-256
+`8c8bd6594a5cbe557d8928c483f2f6c3887f9c68b8797d84e83e1912fda4f592` (a fresh `build.sh` into a scratch directory gave the
+same); its compile-cache entries are its own. Its objects, extents and args_read equal series47-seg's on an installer boot's
+1,142,279 recorded requests. Before it:
 
 **series47-seg** (the owner's segment-prefix decisions, November 3): `tools/fexc/build.sh
 ../natemu-raw/fexc-native-20261026-01/series47-seg` (21 s wall) applies `patches/0001-0029` to the pinned FEX commit with the

@@ -174,6 +174,65 @@ through `CARGO_TARGET_AARCH64_UNKNOWN_NONE_RUSTFLAGS` = the config's flags plus 
 first "on" pass set `RUSTFLAGS`, which replaces the config's linker flags: every run refused the resident ELF; rerun as
 above.)
 
+### Measured (chunk 2: fexc's report off the serve path, November 3; uncommitted on e9214c8, series48-lean)
+
+**Built.** `tools/fexc/fexc.cpp`: the server (`fexc --serve`) no longer builds the JSON report. Its reply's JSON is what the
+host reads (`Reply::payload`, `Answer::new`, `end_reason`, `system_cut`): `{"status":"ok"}` for an object; for no code the
+status and `guest.end`, or, when FEX emitted nothing, the report without its header (status, error, `guest`, diagnostics).
+`fexc --serve --report` keeps the full report (less the hex dumps, as before) for `test_serve.py`; the one-shot CLI is
+unchanged. Everything the object and the cache key depend on was computed inside the report and now comes before it: the
+zeroed relocation literal slots, the end marker and the end reason (with its two `InWindow` checks, so `extent` is the same).
+`test_serve.py` also runs a server without `--report` beside the reporting one and requires the same code, object, extent and
+args_read and only the host's fields in its JSON. Compiler **series48-lean** (`obj/fexc` SHA-256 `8c8bd659...fda4f592`,
+reproduced by a fresh `build.sh`); handoff §6. Host unchanged.
+
+**Identity.** The N = 1 cache-off installer boot's request stream on series47-seg, recorded by a `tee` in front of the server
+(`natemu-raw/perf2-20261103-01/rec/fexc`): 1,142,279 requests (1,125,127 objects, 17,152 without code, no error), replayed in
+order and in lockstep through a series47-seg server (full report) and a series48-lean one (`replay.py`): 0 differences in
+code, object bytes, extent, args_read, status and every `guest.end` field (the host reads reason, RIP, `cut_opcode_map`,
+`cut_opcode`, `cut_gated`, `cut_ud`); the objects' JSON was 8.13 GB of replies against 25.1 MB. `test_serve.py` (fixtures,
+seed corpus, memory-form matrix, adversarial orders: 2,058 requests) identical in reuse and fork mode and against
+series47-seg's CLI. The stream was deleted after the replay (about 2.8 GB; `rec/fexc` records it again).
+
+**Measured** (method of chunk 1: `natemu-host boot-linux`, installer to "Select a language", 2 GiB, `mitigations=off
+nokaslr`, one VM at a time; three interleaved rounds of every cell, old and new compiler each with its own warm cache after a
+warm-up boot; log on = perf resident and `NATEMU_PERF_LOG`; mean, min-max; `tables2.md`, `tables2.json`, `runs/`):
+
+| Installer | fexc | wall s, log off | wall s, log on | fexc round trip s (vCPU 0) | fexc CPU us / compile | round trip us / compile | compiles |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| N=1 warm | series47-seg | 68.00 (67.44-68.54) | 70.08 (69.40-70.72) | 33.28 | 30.3 | 34.5 | 0.964 M |
+| N=1 warm | series48-lean | **52.15** (51.85-52.47) | 53.52 (53.37-53.71) | 17.67 | 14.4 | 18.3 | 0.965 M |
+| N=1 off | series47-seg | 67.86 (67.09-68.30) | 69.34 (68.73-69.65) | 36.02 | 27.3 | 31.5 | 1.144 M |
+| N=1 off | series48-lean | **49.32** (49.21-49.39) | 49.84 (49.79-49.93) | 18.61 | 12.7 | 16.3 | 1.143 M |
+| N=4 warm | series47-seg | 49.82 (49.69-49.98) | 51.91 (50.77-54.07) | 10.77 | 33.6 | 39.3 | 1.082 M |
+| N=4 warm | series48-lean | **37.55** (37.26-37.81) | 38.99 (38.27-40.01) | 5.57 | 16.3 | 21.7 | 1.085 M |
+| N=4 off | series47-seg | 53.61 (52.85-54.04) | 53.86 (52.77-54.43) | 11.92 | 32.3 | 37.7 | 1.321 M |
+| N=4 off | series48-lean | **37.56** (37.32-37.81) | 38.46 (38.15-38.84) | 7.48 | 15.4 | 20.7 | 1.324 M |
+
+fexc CPU is the servers' `wait4` user + system over all threads' compiles; at N = 4 the per-compile figures are over all
+four servers. Replayed alone through one server, the recorded stream costs 28.6 us of fexc CPU per request on series47-seg
+and 12.3 us on series48-lean (two runs each, `replay-cpu.jsonl`). **Ship threshold met**: every cell is 12-19 s faster
+(-23% to -30%), against run-to-run spreads of at most 1.2 s, and none is slower; the guest's "Run /init" stamp moves earlier
+too (N = 1 off 7.09 to 5.13 s). Pipes and wake-ups (round trip - fexc CPU) stay about 3.6-5.7 us per compile. The warm cache
+still does not pay at N = 1 (52.2 s against 49.3 s off: its SHA-256 key, get and put now outweigh a 16 us compile); at N = 4
+warm and off are equal.
+
+**Profile** (`profile/`: `sample` of the fexc server for 30 s, 20 s into an N = 1 cache-off boot): busy 5,997 of 23,504
+samples (26%; series47-seg 10,394 of 23,579, 44%); the report's code (`Json::`, `Hex64`, its string appends) 103 samples
+(4,870 or more before); FEX's `CompileCode` 2,398 (40% of the busy samples, 16% before). The rest is per-request fixed cost:
+argument parsing and string compares (about 500), `FeatureTable` and its `std::function`s rebuilt per request (about 190),
+the reply write (493), Config's rebuild (about 140), allocation: the next per-block-overhead candidate (§3), each at most a
+few us per compile.
+
+**Checks** (`checks/`, `suite/` on series48-lean, 2 GiB): `cargo test` 152 + 1 ignored, also with `FEXC` set; fexc
+`test_slice1.py` 35, `test_fexc.py` 10, `check_sites.py --slice1` 64 programs (779 sites, 0 errors), `verify_precision.py`
+PASS, `test_serve.py` (above); `run_slice1_vm.py` at both block sizes: fixtures 64, seed 44, I8 136, I8b 329 + the 7 known
+QEMU two-NaN departures (the same 7 programs), I9 120, I9-big 5, I10 88, REX 37, 66-on-branches 12, I7 69; faults 7,912 and
+the I7 corpus's 6,313 at both; ASM 1,875 / 0 fail / 48 / 347; `run_x1.py` 6/6 and 196/196; i10 faults 296 at both;
+`run_i5c.py` 255 at both; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7, `r1b` 12/12 (negative controls flagged); all 52
+measurement boots reached the dialog. Not rerun (no fexc change can reach them beyond the objects shown identical): the
+rest of the suite.
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
@@ -229,7 +288,8 @@ walk: valid only while no page-table page on its walk was written, tracked as K1
 included). *Risk:* TLB semantics; new SMP cases in `run_k1.py`. *Decides:* CR3-load and shadow-miss ticks.
 
 **Per-block overhead.** As the profile shows: fexc's fixed cost (Config rebuilt per request since P3's leak fix,
-`fexc.cpp:463`; a JSON report the host drops for objects, `execution.rs:646`); IPC by pipes and `poll` (564-611), a
+`fexc.cpp:463`; the JSON report the host dropped for objects: removed in chunk 2; argument parsing and the feature table
+per request, chunk 2's profile); IPC by pipes and `poll` (564-611), a
 shared-memory ring with a native wait only if material; staging, placement; admission's quadratic site scans.
 
 **Resident entry cost.** About 0.36 us fixed per entry, 0.167 us the cheapest (plan, P2 row). Ticks in `bank`

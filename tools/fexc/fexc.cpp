@@ -305,6 +305,7 @@ static const char* StatusName(int s) {
 // A served request's result (--serve): exit code as the CLI would return it, the JSON report and the binary object.
 struct Reply { int code = 0; std::string json; std::vector<uint8_t> object; uint32_t extent = 0, args_read = 0; };
 static Reply* Served = nullptr;   // set while a --serve request is compiled
+static bool ServeReport = false;  // --serve --report: each reply carries the full JSON report (test_serve.py)
 
 static int Fail(const std::string& msg, int code = 2) {
   if (Served) Served->json = msg; else fprintf(stderr, "fexc: %s\n", msg.c_str());
@@ -522,31 +523,36 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
   }
 
   // ---- describe
-  Json j;
-  j.open('{');
-  j.kv("format", "natemu-fexc-v2");
-  j.obj("producer").kv("tool", "fexc").kv("fex_commit", "48d71752e2a363d5535181f803b0b0e9666c1825").kv("host", "macos-arm64-native").end_obj();
+  // The report: always for the CLI; from --serve only with --report. Otherwise the server sends what the host reads: nothing
+  // for an object, `guest.end` (and the status) for no code. The object, extent and args_read do not depend on it.
+  const bool report = !rep || ServeReport;
   // --serve leaves the hex dumps out (input bytes, each instruction's, the code): its caller has the bytes, the object has the
   // code, and dumping them was most of a request's fixed cost.
   const bool dumps = !rep;
-  j.obj("input");
-  if (dumps) j.kv("bytes_hex", Hex(bytes.data(), bytes.size()));
-  j.kv("size", bytes.size()).kv("rip", Hex64(rip)).kv("bitness", bitness);
-  if (st.max_insts > 0) j.kv("max_instructions", st.max_insts); else j.null("max_instructions");
-  j.end_obj();
-  j.obj("settings").kv("profile", st.profile).kv("block_cutting", slice1 ? "allowlist" : "none")
-   .kv("exits", slice1 ? "dispatcher_gate" : "linked").kv("tso", st.tso).kv("multiblock", st.multiblock).kv("dense_pc_table", st.dense_pc).kv("end_marker", st.end_marker)
-   .kv("fresh_context_per_request", true);   // (a kept context holds nothing of earlier requests: see the compile above)
-  if (!configs.empty()) {   // only when given: output without --config is unchanged
-    j.obj("config");
-    for (auto& c : configs) j.kv(c.first.c_str(), c.second);
+  Json j;
+  j.open('{');
+  if (report) {
+    j.kv("format", "natemu-fexc-v2");
+    j.obj("producer").kv("tool", "fexc").kv("fex_commit", "48d71752e2a363d5535181f803b0b0e9666c1825").kv("host", "macos-arm64-native").end_obj();
+    j.obj("input");
+    if (dumps) j.kv("bytes_hex", Hex(bytes.data(), bytes.size()));
+    j.kv("size", bytes.size()).kv("rip", Hex64(rip)).kv("bitness", bitness);
+    if (st.max_insts > 0) j.kv("max_instructions", st.max_insts); else j.null("max_instructions");
     j.end_obj();
+    j.obj("settings").kv("profile", st.profile).kv("block_cutting", slice1 ? "allowlist" : "none")
+     .kv("exits", slice1 ? "dispatcher_gate" : "linked").kv("tso", st.tso).kv("multiblock", st.multiblock).kv("dense_pc_table", st.dense_pc).kv("end_marker", st.end_marker)
+     .kv("fresh_context_per_request", true);   // (a kept context holds nothing of earlier requests: see the compile above)
+    if (!configs.empty()) {   // only when given: output without --config is unchanged
+      j.obj("config");
+      for (auto& c : configs) j.kv(c.first.c_str(), c.second);
+      j.end_obj();
+    }
+    j.end_obj();
+    j.obj("features").kv("profile", "old-producer-compat+m4").kv("required_by_settings_profile", slice1 ? "flagm" : "none").kv("dcache_line_log2", uint64_t(st.dcache_line_log2));
+    j.obj("host_features");
+    for (auto& f : table) j.kv(f.name, f.get(hf));
+    j.end_obj().end_obj();
   }
-  j.end_obj();
-  j.obj("features").kv("profile", "old-producer-compat+m4").kv("required_by_settings_profile", slice1 ? "flagm" : "none").kv("dcache_line_log2", uint64_t(st.dcache_line_log2));
-  j.obj("host_features");
-  for (auto& f : table) j.kv(f.name, f.get(hf));
-  j.end_obj().end_obj();
 
   if (!Cap.fired) {
     j.kv("status", "no_code").kv("error", fexc_cut.reason ? "no native code: the first instruction is outside the profile's allowlist or could not be fetched"
@@ -575,142 +581,26 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
   // Relocation slots hold process-specific host pointers (dispatcher entry) or guest RIPs.
   // The code is exported with literal slots zeroed; the emitted values are listed per relocation.
   std::vector<uint8_t> code = c;
-  j.kv("status", Cap.info.TotalInstructions ? "ok" : "no_instructions_translated");
-  j.obj("code");
+  for (auto& r : Cap.relocs) {
+    using T = CPU::RelocationTypes;
+    const uint64_t off = r.Header.Offset;
+    if ((r.Header.Type == T::RELOC_NAMED_SYMBOL_LITERAL || r.Header.Type == T::RELOC_GUEST_RIP_LITERAL ||
+         r.Header.Type == T::RELOC_GUEST_PATCHABLE_RIP_LITERAL) && off + 8 <= code.size())
+      std::memset(code.data() + off, 0, 8);
+  }
   // layout
   uint64_t marker = UINT64_MAX;
   for (size_t o = 4; o + 4 <= (layout_ok ? tail_off : c.size()); o += 4) {
     uint32_t w; std::memcpy(&w, c.data() + o, 4);
     if (w == 0x0000420f) { marker = o; break; } // udf #0x420f
   }
-  j.arr("relocations");
-  for (auto& r : Cap.relocs) {
-    using T = CPU::RelocationTypes;
-    uint64_t off = r.Header.Offset;
-    j.elem_obj().kv("offset", off);
-    auto literal = [&](const char* kind) {
-      uint64_t v = 0; if (off + 8 <= c.size()) std::memcpy(&v, c.data() + off, 8);
-      j.kv("kind", kind).kv("size", 8).kv("emitted_value", Hex64(v));
-      if (off + 8 <= code.size()) std::memset(code.data() + off, 0, 8);
-    };
-    switch (r.Header.Type) {
-    case T::RELOC_NAMED_SYMBOL_LITERAL:
-      literal("named_symbol_literal");
-      j.kv("symbol", r.NamedSymbolLiteral.Symbol == CPU::RelocNamedSymbolLiteral::NamedSymbol::SYMBOL_LITERAL_EXITFUNCTION_LINKER
-                       ? "exit_function_linker" : "unknown");
-      j.kv("meaning", "host address of FEX's dispatcher block-linker; the resident runtime supplies its own");
-      break;
-    case T::RELOC_GUEST_RIP_LITERAL: literal("guest_rip_literal"); j.kv("guest_rip", Hex64(r.GuestRIP.GuestRIP)); break;
-    case T::RELOC_GUEST_PATCHABLE_RIP_LITERAL:
-      literal("guest_patchable_rip_literal"); j.kv("site_address", Hex64(r.GuestPatchableData.SiteAddress)).kv("value_size", int(r.GuestPatchableData.ValueSize)); break;
-    case T::RELOC_GUEST_RIP_MOVE:
-      j.kv("kind", "guest_rip_move").kv("register", int(r.GuestRIP.RegisterIndex)).kv("guest_rip", Hex64(r.GuestRIP.GuestRIP)).null("size");
-      break;
-    case T::RELOC_NAMED_THUNK_MOVE: j.kv("kind", "named_thunk_move").kv("register", int(r.NamedThunkMove.RegisterIndex)).null("size"); break;
-    case T::RELOC_GUEST_PATCHABLE_DATA_MOVE: j.kv("kind", "guest_patchable_data_move").kv("register", int(r.GuestPatchableData.RegisterIndex)).null("size"); break;
-    case T::RELOC_GUEST_PATCHABLE_RIP_MOVE: j.kv("kind", "guest_patchable_rip_move").kv("register", int(r.GuestPatchableData.RegisterIndex)).null("size"); break;
-    case T::RELOC_GUEST_PATCHABLE_CRC_MOVE: j.kv("kind", "guest_patchable_crc_move").kv("register", int(r.GuestPatchableData.RegisterIndex)).null("size"); break;
-    default: j.kv("kind", "unknown").kv("type", uint64_t(r.Header.Type)); break;
-    }
-    j.end_obj();
-  }
-  for (auto o : Cap.dispatch_exits)
-    j.elem_obj().kv("offset", uint64_t(o)).kv("kind", "dispatch_branch").null("size")
-     .kv("meaning", "placeholder `b .`: the resident relocates it to its dispatcher when it places the block").end_obj();
-  j.end_arr();
-  // (relocations written inside "code" object after we know zeroed bytes; hex goes last)
-  j.kv("size", code.size());
-  j.kv("alignment", 16);
-  j.obj("layout");
-  j.obj("header").kv("offset", 0).kv("size", 4).kv("note", "JITCodeHeader: u32 offset to tail");
-  j.end_obj();
-  j.arr("entries");
-  for (auto& p : Cap.prologues) {
-    uint64_t native = 0;
-    for (auto& g : Cap.pcs) if (g.first == p.first) { native = g.second; break; }
-    j.elem_obj().kv("guest_offset", p.first).kv("entry_native_offset", native).kv("body_native_offset", p.second)
-     .kv("note", "[entry, body) is the entry prologue (slice1: the stop `bl` to the pad)").end_obj();
-  }
-  j.end_arr();
-  j.kv("spill_bytes", Cap.spill_bytes); // the entry prologue subtracts this from sp; ResetStack restores it
-  if (marker != UINT64_MAX) j.kv("end_marker_offset", marker).kv("end_marker", "udf #0x420f"); else j.null("end_marker_offset");
-  if (layout_ok) {
-    j.obj("tail").kv("offset", tail_off).kv("size", sizeof(tail)).kv("rip", Hex64(tail.RIP)).kv("guest_size", tail.GuestSize)
-     .kv("single_inst", bool(tail.SingleInst)).kv("rip_entry_count", uint64_t(tail.NumberOfRIPEntries))
-     .kv("rip_entries_offset", tail_off + tail.OffsetToRIPEntries).kv("note", "JITCodeTail then FEX-encoded (vl64) PC entries; both are runtime-recovery data of FEX's own format").end_obj();
-    j.kv("code_region_begin", 4).kv("code_region_end", tail_off);
-  } else {
-    j.null("tail");
-  }
-  j.end_obj(); // layout
-  if (dumps) {
-    j.kv("hex", Hex(code.data(), code.size()));
-    j.kv("hex_note", "relocation literal slots are zeroed; emitted values are in relocations[]");
-  }
-  j.end_obj(); // code
-
-  j.obj("state_abi").kv("state_register", "x28").kv("state_struct", "FEXCore::Core::CpuStateFrame");
-  j.arr("static_registers_gpr_order_rax_rcx_rdx_rbx_rsp_rbp_rsi_rdi_r8_to_r15_then_pf_af");
-  for (auto g : Cap.sra_gpr) { j.sep(); j.s += std::to_string(g); }
-  j.end_arr();
-  j.arr("static_registers_xmm0_up");
-  for (auto g : Cap.sra_fpr) { j.sep(); j.s += std::to_string(g); }
-  j.end_arr();
-#define OFF(n, expr) j.kv(n, uint64_t(offsetof(Core::CpuStateFrame, expr)))
-  j.obj("state_offsets");
-  OFF("rip", State.rip); OFF("gregs", State.gregs); OFF("xmm", State.xmm); OFF("flags", State.flags); OFF("pf_raw", State.pf_raw);
-  OFF("af_raw", State.af_raw); OFF("mxcsr", State.mxcsr); OFF("fs_cached", State.fs_cached); OFF("gs_cached", State.gs_cached);
-  OFF("pointers", Pointers); OFF("exit_function_linker", Pointers.ExitFunctionLinker); OFF("dispatcher_loop_top", Pointers.DispatcherLoopTop);
-  if (slice1) j.kv("natemu_pre_nzcv_register", 25); // x25: incoming NZCV for nzcv=saved sites (`mrs x25, nzcv` at the instruction start)
-  j.end_obj();
-  // External references that are not relocations: helper/dispatch pointers loaded from the state frame.
-  j.arr("state_pointer_loads");
-  {
-    const uint64_t pb = offsetof(Core::CpuStateFrame, Pointers), pe = pb + sizeof(Core::JITPointers);
-    struct Named { const char* n; uint64_t o; };
-#define P(f) {#f, offsetof(Core::CpuStateFrame, Pointers.f)}
-    const Named named[] = {P(PrintValue), P(PrintVectorValue), P(PrintMsgValue), P(ThreadRemoveCodeEntryFromJIT), P(CPUIDObj), P(CPUIDFunction),
-      P(XCRFunction), P(SyscallHandlerObj), P(SyscallHandlerFunc), P(ExitFunctionLink), P(MonoBackpatcherWrite), P(LUDIV), P(LDIV),
-      P(RDRANDFallback), P(ThunkCallbackRet), P(ExitFunctionEC), P(DispatcherLoopTop), P(DispatcherLoopTopFillSRA), P(ExitFunctionLinker),
-      P(ThreadStopHandlerSpillSRA), P(ThreadPauseHandlerSpillSRA), P(GuestSignal_SIGILL), P(GuestSignal_SIGTRAP), P(GuestSignal_SIGSEGV),
-      P(SignalReturnHandler), P(SignalReturnHandlerRT), P(L2Pointer), P(LUDIVHandler), P(LDIVHandler), P(F64SinHandler), P(F64CosHandler),
-      P(F64TanHandler), P(F64F2XM1Handler), P(F64ScaleHandler), P(F64AtanHandler), P(F64FYL2XHandler), P(F64FYL2XP1Handler), P(F64FPREMHandler),
-      P(F64FPREM1Handler)};
-    const size_t end = layout_ok ? tail_off : c.size();
-    for (size_t o = 4; o + 4 <= end; o += 4) {
-      uint32_t w; std::memcpy(&w, c.data() + o, 4);
-      if ((w & 0xFFC00000u) != 0xF9400000u || ((w >> 5) & 31) != 28) continue; // ldr Xt, [x28, #imm]
-      uint64_t off = uint64_t((w >> 10) & 0xFFF) * 8;
-      if (off < pb || off >= pe) continue;
-      const char* nm = nullptr;
-      for (auto& n : named) if (n.o == off) nm = n.n;
-      j.elem_obj().kv("native_offset", o).kv("state_offset", off).kv("dest_register", int(w & 31));
-      if (nm) j.kv("pointer", nm); else j.kv("pointer", "indexed_table_entry (fallback handlers / vector constants / telemetry)");
-      j.end_obj();
-    }
-  }
-  j.end_arr().end_obj();
-
-  j.obj("guest");
-  j.kv("instructions_translated", Cap.info.TotalInstructions).kv("bytes_translated", Cap.info.TotalLength)
-   .kv("decoded_start", Hex64(Cap.info.DecodedStart)).kv("decoded_length", Cap.info.DecodedLength);
-  j.arr("blocks");
-  for (auto& b : Cap.blocks)
-    j.elem_obj().kv("entry", Hex64(b.entry)).kv("size", b.size).kv("instructions", b.count).kv("status", StatusName(b.status)).kv("is_entry_point", b.entry_point).end_obj();
-  j.end_arr();
-  j.arr("instructions");
-  uint64_t idx = 0;
-  for (auto& i : Cap.insts) {
-    j.elem_obj().kv("translated", idx++ < Cap.info.TotalInstructions).kv("rip", Hex64(i.pc)).kv("offset", i.pc - rip).kv("size", i.size).kv("name", i.name).kv("ends_block", i.block_end).kv("sets_rip", i.sets_rip);
-    if (dumps && InWindow(i.pc, i.size)) j.kv("bytes_hex", Hex(W.bytes + (i.pc - rip), i.size));
-    j.end_obj();
-  }
-  j.end_arr();
-  // Why translation stopped.
+  // Why translation stopped (guest.end; its reason is also in the object).
+  std::string end_detail;
+  const uint64_t end_rip = rip + Cap.info.TotalLength;
   {
     const auto& lb = Cap.blocks.back();
-    std::string reason, detail;
-    uint64_t end_rip = rip + Cap.info.TotalLength;
+    std::string& reason = end_reason_str;
+    std::string& detail = end_detail;
     // FEX appends a placeholder "instruction" (no table entry) for whatever stopped the decode.
     if (fexc_cut.reason) {
       reason = CutReasonName(); detail = CutDetail();
@@ -732,81 +622,212 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     else if (Cap.info.TotalInstructions >= uint64_t(Config::Get_MAXINST())) { reason = "fex_instruction_limit"; detail = "FEX's per-block default (MAXINST)"; }
     else if (!InWindow(end_rip, 1)) { reason = "end_of_input"; detail = "last instruction ends at the end of the supplied bytes"; }
     else reason = "other"; // e.g. dispatcher-requested block end (system/exception instruction) or FEX's own limit
-    end_reason_str = reason;
-    j.obj("end").kv("rip", Hex64(end_rip)).kv("reason", reason).kv("detail", detail);
+  }
+  const auto end_json = [&] {
+    j.obj("end").kv("rip", Hex64(end_rip)).kv("reason", end_reason_str).kv("detail", end_detail);
     if (fexc_cut.reason && fexc_cut.reason != FEXC_CUT_STRING) j.kv("cut_opcode_map", int(fexc_cut.map)).kv("cut_opcode", int(fexc_cut.opcode)).kv("cut_fex_name", fexc_cut.name);
     j.end_obj();
-  }
-  j.end_obj(); // guest
+  };
 
-  j.obj("pc_table").kv("density", st.dense_pc ? "every_guest_instruction" : "fex_default_instructions_that_can_fault_or_have_side_effects")
-   .kv("note", "FEX's DebugData.GuestOpcodes: guest offset from block RIP -> native offset from code start, in emission order; an entry marks the native instruction where the guest instruction's translation begins");
-  j.arr("entries");
-  for (auto& p : Cap.pcs) {
-    j.elem_obj().kv("guest_offset", p.first).kv("native_offset", p.second);
-    int cf = CfInverted(p.first, p.second);
-    if (cf < 0) j.null("cf_inverted"); else j.kv("cf_inverted", cf != 0);
-    j.end_obj();
-  }
-  j.end_arr().end_obj();
-  j.arr("subblocks");
-  for (auto& s : Cap.subblocks) j.elem_obj().kv("native_offset", s.first).kv("size", s.second).end_obj();
-  j.end_arr();
-
-  // Access sites: every native instruction FEX emitted for a guest memory access, recorded at emission.
-  j.arr("sites");
-  for (auto& s : Cap.sites) {
-    j.elem_obj().kv("native_offset", s.native_offset).kv("guest_offset", s.guest_offset);
-    if (s.guest_offset2 != FEXC_NONE32) j.kv("guest_offset2", s.guest_offset2); else j.null("guest_offset2");
-    if (const uint32_t m = MmioRecord(s, rip)) j.kv("mmio", m);   // M3
-    j.kv("insn_native_offset", s.insn_native_offset).kv("ir_op", s.ir_op).kv("kind", KindName[s.kind]).kv("width", int(s.width))
-     .kv("intent", s.intent ? "write" : "read").kv("rmw", RmwName[s.rmw]).kv("segment", s.segment ? "ss" : "ds")
-     .kv("base_reg", int(s.base_reg));
-    if (s.index_reg != 0xff) j.kv("index_reg", int(s.index_reg)); else j.null("index_reg");
-    j.kv("extend", ExtendName[s.extend]).kv("shift", int(s.shift)).kv("imm", s.imm);
-    j.arr("data_regs"); j.sep(); j.s += std::to_string(s.data_reg[0]);
-    if (s.kind == FEXC_SITE_LOAD_PAIR || s.kind == FEXC_SITE_STORE_PAIR || s.kind == FEXC_SITE_PUSH_PAIR || s.kind == FEXC_SITE_POP_PAIR ||
-        s.kind == FEXC_SITE_SWAP || s.kind == FEXC_SITE_ATOMIC) { j.sep(); j.s += std::to_string(s.data_reg[1]); }
-    j.end_arr();
-    j.kv("data_class", s.data_class ? "fpr" : "gpr").kv("writeback", WritebackName[s.writeback]).kv("writeback_delta", int(s.writeback_delta))
-     .kv("ordering", OrderingName[s.ordering]).kv("nzcv", s.nzcv ? "saved" : "pstate").kv("cf_inverted", bool(s.cf_inverted))
-     .kv("flags_written_before_site", bool(s.flags_written_before))
-     .kv("completed_effects", s.completed_effects ? "unverified" : "none").kv("located", bool(s.located));
-    if (slice1) {
-      if (s.access_native_offset != FEXC_NONE32) j.kv("access_native_offset", s.access_native_offset); else j.null("access_native_offset");
-    }
-    const Capture::Inst* in = nullptr;
-    for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) { if (i.mem.present) in = &i; break; }
-    if (in && (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP || s.kind == FEXC_SITE_ATOMIC)) {
-      const auto* m = &in->mem;
-      j.obj("x86").kv("rip_relative", m->rip_relative).kv("base", m->base).kv("index", m->index).kv("scale", m->scale).kv("disp", m->disp);
-      if (in->seg) j.kv("segment_override", in->seg == 4 ? "fs" : "gs"); else j.null("segment_override");
-      j.end_obj();
-    } else j.null("x86");
-    j.end_obj();
-  }
-  j.end_arr();
-
-  j.obj("recovery");
-  j.kv("per_access", "present: sites[] (native offset, guest instruction, kind, width, intent, address registers and offset form, segment, writeback, data registers)");
-  if (slice1) {
-    j.kv("flag_location_at_site", "nzcv=pstate (PSTATE) or nzcv=saved (in register state_abi.state_offsets.natemu_pre_nzcv_register, saved at the instruction start), with cf_inverted at the guest instruction start");
-    j.kv("guest_state_at_fault", "present (precision patches 2-5): at each site with completed_effects=none, static registers, PF/AF and NZCV (per nzcv) hold the state before the site's guest instruction; checked on the code by verify_precision.py. Guard sites (brk stubs): the check of every indirect branch target (base_reg = target register, #GP(0)); no address guard (E3: a non-canonical access faults in hardware at its site); split sites: a store wider than 1 byte (read-modify-write included) crossing a 4 KiB page (the runtime completes it all-or-nothing and resumes after access_native_offset). Same state at a stub as at its access; checked by verify_precision.py");
-    j.kv("committed_effects", "completed_effects=none per site (unverified if the recorder saw an earlier store site or an unsaved NZCV write in the instruction)");
+  j.kv("status", Cap.info.TotalInstructions ? "ok" : "no_instructions_translated");
+  if (!report) {
+    if (!Cap.info.TotalInstructions) { j.obj("guest"); end_json(); j.end_obj(); }
   } else {
-    j.kv("flag_location_at_site", "nzcv=pstate with cf_inverted at the guest instruction start, plus flags_written_before_site; the saved copy (nzcv=saved) is absent until the precision patches");
-    j.kv("guest_state_at_fault", "absent: not guaranteed (no precision patches yet: flag elimination, static-register hoisting, push/pop fusion and the address guard are unmodified)");
-    j.kv("committed_effects", "unverified: completed_effects=unverified on every site");
+    j.obj("code");
+    j.arr("relocations");
+    for (auto& r : Cap.relocs) {
+      using T = CPU::RelocationTypes;
+      uint64_t off = r.Header.Offset;
+      j.elem_obj().kv("offset", off);
+      auto literal = [&](const char* kind) {
+        uint64_t v = 0; if (off + 8 <= c.size()) std::memcpy(&v, c.data() + off, 8);
+        j.kv("kind", kind).kv("size", 8).kv("emitted_value", Hex64(v));
+      };
+      switch (r.Header.Type) {
+      case T::RELOC_NAMED_SYMBOL_LITERAL:
+        literal("named_symbol_literal");
+        j.kv("symbol", r.NamedSymbolLiteral.Symbol == CPU::RelocNamedSymbolLiteral::NamedSymbol::SYMBOL_LITERAL_EXITFUNCTION_LINKER
+                         ? "exit_function_linker" : "unknown");
+        j.kv("meaning", "host address of FEX's dispatcher block-linker; the resident runtime supplies its own");
+        break;
+      case T::RELOC_GUEST_RIP_LITERAL: literal("guest_rip_literal"); j.kv("guest_rip", Hex64(r.GuestRIP.GuestRIP)); break;
+      case T::RELOC_GUEST_PATCHABLE_RIP_LITERAL:
+        literal("guest_patchable_rip_literal"); j.kv("site_address", Hex64(r.GuestPatchableData.SiteAddress)).kv("value_size", int(r.GuestPatchableData.ValueSize)); break;
+      case T::RELOC_GUEST_RIP_MOVE:
+        j.kv("kind", "guest_rip_move").kv("register", int(r.GuestRIP.RegisterIndex)).kv("guest_rip", Hex64(r.GuestRIP.GuestRIP)).null("size");
+        break;
+      case T::RELOC_NAMED_THUNK_MOVE: j.kv("kind", "named_thunk_move").kv("register", int(r.NamedThunkMove.RegisterIndex)).null("size"); break;
+      case T::RELOC_GUEST_PATCHABLE_DATA_MOVE: j.kv("kind", "guest_patchable_data_move").kv("register", int(r.GuestPatchableData.RegisterIndex)).null("size"); break;
+      case T::RELOC_GUEST_PATCHABLE_RIP_MOVE: j.kv("kind", "guest_patchable_rip_move").kv("register", int(r.GuestPatchableData.RegisterIndex)).null("size"); break;
+      case T::RELOC_GUEST_PATCHABLE_CRC_MOVE: j.kv("kind", "guest_patchable_crc_move").kv("register", int(r.GuestPatchableData.RegisterIndex)).null("size"); break;
+      default: j.kv("kind", "unknown").kv("type", uint64_t(r.Header.Type)); break;
+      }
+      j.end_obj();
+    }
+    for (auto o : Cap.dispatch_exits)
+      j.elem_obj().kv("offset", uint64_t(o)).kv("kind", "dispatch_branch").null("size")
+       .kv("meaning", "placeholder `b .`: the resident relocates it to its dispatcher when it places the block").end_obj();
+    j.end_arr();
+    // (relocations written inside "code" object after we know zeroed bytes; hex goes last)
+    j.kv("size", code.size());
+    j.kv("alignment", 16);
+    j.obj("layout");
+    j.obj("header").kv("offset", 0).kv("size", 4).kv("note", "JITCodeHeader: u32 offset to tail");
+    j.end_obj();
+    j.arr("entries");
+    for (auto& p : Cap.prologues) {
+      uint64_t native = 0;
+      for (auto& g : Cap.pcs) if (g.first == p.first) { native = g.second; break; }
+      j.elem_obj().kv("guest_offset", p.first).kv("entry_native_offset", native).kv("body_native_offset", p.second)
+       .kv("note", "[entry, body) is the entry prologue (slice1: the stop `bl` to the pad)").end_obj();
+    }
+    j.end_arr();
+    j.kv("spill_bytes", Cap.spill_bytes); // the entry prologue subtracts this from sp; ResetStack restores it
+    if (marker != UINT64_MAX) j.kv("end_marker_offset", marker).kv("end_marker", "udf #0x420f"); else j.null("end_marker_offset");
+    if (layout_ok) {
+      j.obj("tail").kv("offset", tail_off).kv("size", sizeof(tail)).kv("rip", Hex64(tail.RIP)).kv("guest_size", tail.GuestSize)
+       .kv("single_inst", bool(tail.SingleInst)).kv("rip_entry_count", uint64_t(tail.NumberOfRIPEntries))
+       .kv("rip_entries_offset", tail_off + tail.OffsetToRIPEntries).kv("note", "JITCodeTail then FEX-encoded (vl64) PC entries; both are runtime-recovery data of FEX's own format").end_obj();
+      j.kv("code_region_begin", 4).kv("code_region_end", tail_off);
+    } else {
+      j.null("tail");
+    }
+    j.end_obj(); // layout
+    if (dumps) {
+      j.kv("hex", Hex(code.data(), code.size()));
+      j.kv("hex_note", "relocation literal slots are zeroed; emitted values are in relocations[]");
+    }
+    j.end_obj(); // code
+
+    j.obj("state_abi").kv("state_register", "x28").kv("state_struct", "FEXCore::Core::CpuStateFrame");
+    j.arr("static_registers_gpr_order_rax_rcx_rdx_rbx_rsp_rbp_rsi_rdi_r8_to_r15_then_pf_af");
+    for (auto g : Cap.sra_gpr) { j.sep(); j.s += std::to_string(g); }
+    j.end_arr();
+    j.arr("static_registers_xmm0_up");
+    for (auto g : Cap.sra_fpr) { j.sep(); j.s += std::to_string(g); }
+    j.end_arr();
+  #define OFF(n, expr) j.kv(n, uint64_t(offsetof(Core::CpuStateFrame, expr)))
+    j.obj("state_offsets");
+    OFF("rip", State.rip); OFF("gregs", State.gregs); OFF("xmm", State.xmm); OFF("flags", State.flags); OFF("pf_raw", State.pf_raw);
+    OFF("af_raw", State.af_raw); OFF("mxcsr", State.mxcsr); OFF("fs_cached", State.fs_cached); OFF("gs_cached", State.gs_cached);
+    OFF("pointers", Pointers); OFF("exit_function_linker", Pointers.ExitFunctionLinker); OFF("dispatcher_loop_top", Pointers.DispatcherLoopTop);
+    if (slice1) j.kv("natemu_pre_nzcv_register", 25); // x25: incoming NZCV for nzcv=saved sites (`mrs x25, nzcv` at the instruction start)
+    j.end_obj();
+    // External references that are not relocations: helper/dispatch pointers loaded from the state frame.
+    j.arr("state_pointer_loads");
+    {
+      const uint64_t pb = offsetof(Core::CpuStateFrame, Pointers), pe = pb + sizeof(Core::JITPointers);
+      struct Named { const char* n; uint64_t o; };
+  #define P(f) {#f, offsetof(Core::CpuStateFrame, Pointers.f)}
+      const Named named[] = {P(PrintValue), P(PrintVectorValue), P(PrintMsgValue), P(ThreadRemoveCodeEntryFromJIT), P(CPUIDObj), P(CPUIDFunction),
+        P(XCRFunction), P(SyscallHandlerObj), P(SyscallHandlerFunc), P(ExitFunctionLink), P(MonoBackpatcherWrite), P(LUDIV), P(LDIV),
+        P(RDRANDFallback), P(ThunkCallbackRet), P(ExitFunctionEC), P(DispatcherLoopTop), P(DispatcherLoopTopFillSRA), P(ExitFunctionLinker),
+        P(ThreadStopHandlerSpillSRA), P(ThreadPauseHandlerSpillSRA), P(GuestSignal_SIGILL), P(GuestSignal_SIGTRAP), P(GuestSignal_SIGSEGV),
+        P(SignalReturnHandler), P(SignalReturnHandlerRT), P(L2Pointer), P(LUDIVHandler), P(LDIVHandler), P(F64SinHandler), P(F64CosHandler),
+        P(F64TanHandler), P(F64F2XM1Handler), P(F64ScaleHandler), P(F64AtanHandler), P(F64FYL2XHandler), P(F64FYL2XP1Handler), P(F64FPREMHandler),
+        P(F64FPREM1Handler)};
+      const size_t end = layout_ok ? tail_off : c.size();
+      for (size_t o = 4; o + 4 <= end; o += 4) {
+        uint32_t w; std::memcpy(&w, c.data() + o, 4);
+        if ((w & 0xFFC00000u) != 0xF9400000u || ((w >> 5) & 31) != 28) continue; // ldr Xt, [x28, #imm]
+        uint64_t off = uint64_t((w >> 10) & 0xFFF) * 8;
+        if (off < pb || off >= pe) continue;
+        const char* nm = nullptr;
+        for (auto& n : named) if (n.o == off) nm = n.n;
+        j.elem_obj().kv("native_offset", o).kv("state_offset", off).kv("dest_register", int(w & 31));
+        if (nm) j.kv("pointer", nm); else j.kv("pointer", "indexed_table_entry (fallback handlers / vector constants / telemetry)");
+        j.end_obj();
+      }
+    }
+    j.end_arr().end_obj();
+
+    j.obj("guest");
+    j.kv("instructions_translated", Cap.info.TotalInstructions).kv("bytes_translated", Cap.info.TotalLength)
+     .kv("decoded_start", Hex64(Cap.info.DecodedStart)).kv("decoded_length", Cap.info.DecodedLength);
+    j.arr("blocks");
+    for (auto& b : Cap.blocks)
+      j.elem_obj().kv("entry", Hex64(b.entry)).kv("size", b.size).kv("instructions", b.count).kv("status", StatusName(b.status)).kv("is_entry_point", b.entry_point).end_obj();
+    j.end_arr();
+    j.arr("instructions");
+    uint64_t idx = 0;
+    for (auto& i : Cap.insts) {
+      j.elem_obj().kv("translated", idx++ < Cap.info.TotalInstructions).kv("rip", Hex64(i.pc)).kv("offset", i.pc - rip).kv("size", i.size).kv("name", i.name).kv("ends_block", i.block_end).kv("sets_rip", i.sets_rip);
+      if (dumps && InWindow(i.pc, i.size)) j.kv("bytes_hex", Hex(W.bytes + (i.pc - rip), i.size));
+      j.end_obj();
+    }
+    j.end_arr();
+    end_json();
+    j.end_obj(); // guest
+
+    j.obj("pc_table").kv("density", st.dense_pc ? "every_guest_instruction" : "fex_default_instructions_that_can_fault_or_have_side_effects")
+     .kv("note", "FEX's DebugData.GuestOpcodes: guest offset from block RIP -> native offset from code start, in emission order; an entry marks the native instruction where the guest instruction's translation begins");
+    j.arr("entries");
+    for (auto& p : Cap.pcs) {
+      j.elem_obj().kv("guest_offset", p.first).kv("native_offset", p.second);
+      int cf = CfInverted(p.first, p.second);
+      if (cf < 0) j.null("cf_inverted"); else j.kv("cf_inverted", cf != 0);
+      j.end_obj();
+    }
+    j.end_arr().end_obj();
+    j.arr("subblocks");
+    for (auto& s : Cap.subblocks) j.elem_obj().kv("native_offset", s.first).kv("size", s.second).end_obj();
+    j.end_arr();
+
+    // Access sites: every native instruction FEX emitted for a guest memory access, recorded at emission.
+    j.arr("sites");
+    for (auto& s : Cap.sites) {
+      j.elem_obj().kv("native_offset", s.native_offset).kv("guest_offset", s.guest_offset);
+      if (s.guest_offset2 != FEXC_NONE32) j.kv("guest_offset2", s.guest_offset2); else j.null("guest_offset2");
+      if (const uint32_t m = MmioRecord(s, rip)) j.kv("mmio", m);   // M3
+      j.kv("insn_native_offset", s.insn_native_offset).kv("ir_op", s.ir_op).kv("kind", KindName[s.kind]).kv("width", int(s.width))
+       .kv("intent", s.intent ? "write" : "read").kv("rmw", RmwName[s.rmw]).kv("segment", s.segment ? "ss" : "ds")
+       .kv("base_reg", int(s.base_reg));
+      if (s.index_reg != 0xff) j.kv("index_reg", int(s.index_reg)); else j.null("index_reg");
+      j.kv("extend", ExtendName[s.extend]).kv("shift", int(s.shift)).kv("imm", s.imm);
+      j.arr("data_regs"); j.sep(); j.s += std::to_string(s.data_reg[0]);
+      if (s.kind == FEXC_SITE_LOAD_PAIR || s.kind == FEXC_SITE_STORE_PAIR || s.kind == FEXC_SITE_PUSH_PAIR || s.kind == FEXC_SITE_POP_PAIR ||
+          s.kind == FEXC_SITE_SWAP || s.kind == FEXC_SITE_ATOMIC) { j.sep(); j.s += std::to_string(s.data_reg[1]); }
+      j.end_arr();
+      j.kv("data_class", s.data_class ? "fpr" : "gpr").kv("writeback", WritebackName[s.writeback]).kv("writeback_delta", int(s.writeback_delta))
+       .kv("ordering", OrderingName[s.ordering]).kv("nzcv", s.nzcv ? "saved" : "pstate").kv("cf_inverted", bool(s.cf_inverted))
+       .kv("flags_written_before_site", bool(s.flags_written_before))
+       .kv("completed_effects", s.completed_effects ? "unverified" : "none").kv("located", bool(s.located));
+      if (slice1) {
+        if (s.access_native_offset != FEXC_NONE32) j.kv("access_native_offset", s.access_native_offset); else j.null("access_native_offset");
+      }
+      const Capture::Inst* in = nullptr;
+      for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) { if (i.mem.present) in = &i; break; }
+      if (in && (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP || s.kind == FEXC_SITE_ATOMIC)) {
+        const auto* m = &in->mem;
+        j.obj("x86").kv("rip_relative", m->rip_relative).kv("base", m->base).kv("index", m->index).kv("scale", m->scale).kv("disp", m->disp);
+        if (in->seg) j.kv("segment_override", in->seg == 4 ? "fs" : "gs"); else j.null("segment_override");
+        j.end_obj();
+      } else j.null("x86");
+      j.end_obj();
+    }
+    j.end_arr();
+
+    j.obj("recovery");
+    j.kv("per_access", "present: sites[] (native offset, guest instruction, kind, width, intent, address registers and offset form, segment, writeback, data registers)");
+    if (slice1) {
+      j.kv("flag_location_at_site", "nzcv=pstate (PSTATE) or nzcv=saved (in register state_abi.state_offsets.natemu_pre_nzcv_register, saved at the instruction start), with cf_inverted at the guest instruction start");
+      j.kv("guest_state_at_fault", "present (precision patches 2-5): at each site with completed_effects=none, static registers, PF/AF and NZCV (per nzcv) hold the state before the site's guest instruction; checked on the code by verify_precision.py. Guard sites (brk stubs): the check of every indirect branch target (base_reg = target register, #GP(0)); no address guard (E3: a non-canonical access faults in hardware at its site); split sites: a store wider than 1 byte (read-modify-write included) crossing a 4 KiB page (the runtime completes it all-or-nothing and resumes after access_native_offset). Same state at a stub as at its access; checked by verify_precision.py");
+      j.kv("committed_effects", "completed_effects=none per site (unverified if the recorder saw an earlier store site or an unsaved NZCV write in the instruction)");
+    } else {
+      j.kv("flag_location_at_site", "nzcv=pstate with cf_inverted at the guest instruction start, plus flags_written_before_site; the saved copy (nzcv=saved) is absent until the precision patches");
+      j.kv("guest_state_at_fault", "absent: not guaranteed (no precision patches yet: flag elimination, static-register hoisting, push/pop fusion and the address guard are unmodified)");
+      j.kv("committed_effects", "unverified: completed_effects=unverified on every site");
+    }
+    j.kv("pc_table", st.dense_pc ? "present_dense" : "present_sparse");
+    j.kv("static_register_map", "present").kv("flag_representation", "NZCV in PSTATE with carry inverted per cf_inverted; PF/AF in x26/x27 (see state_abi)");
+    j.kv("spill_bytes", "present: code.layout.spill_bytes");
+    j.kv("note", slice1 ? "Sites are recorded from the final IR after register allocation, so each is exact for the emitted code. Profile slice1 adds the precision patches, block cutting, single-gate exits, branch-target and split stubs."
+                         : "Sites are recorded from the final IR after register allocation, so each is exact for the emitted code. What is still absent is the guarantee that guest state at a site equals the state before its guest instruction (slice-1 chunk S1b), the address guard and split-store check, and block cutting/exits (S1c).");
+    j.end_obj();
+    j.arr("diagnostics");
+    for (auto& d : Diagnostics) { j.sep(); j.s += '"' + Json::esc(d) + '"'; }
+    j.end_arr();
   }
-  j.kv("pc_table", st.dense_pc ? "present_dense" : "present_sparse");
-  j.kv("static_register_map", "present").kv("flag_representation", "NZCV in PSTATE with carry inverted per cf_inverted; PF/AF in x26/x27 (see state_abi)");
-  j.kv("spill_bytes", "present: code.layout.spill_bytes");
-  j.kv("note", slice1 ? "Sites are recorded from the final IR after register allocation, so each is exact for the emitted code. Profile slice1 adds the precision patches, block cutting, single-gate exits, branch-target and split stubs."
-                       : "Sites are recorded from the final IR after register allocation, so each is exact for the emitted code. What is still absent is the guarantee that guest state at a site equals the state before its guest instruction (slice-1 chunk S1b), the address guard and split-store check, and block cutting/exits (S1c).");
-  j.end_obj();
-  j.arr("diagnostics");
-  for (auto& d : Diagnostics) { j.sep(); j.s += '"' + Json::esc(d) + '"'; }
-  j.end_arr();
   j.end_obj();
 
   std::string o = j.s + "\n";
@@ -874,10 +895,12 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
 // ---------------------------------------------------------------- --serve
 // Framing, all integers little-endian u32. Request: len, then payload = args_len, args (NUL-terminated strings, the CLI's
 // arguments without --hex/--file/--out/--object), then the guest bytes. Reply: len, then payload = code (i32, the CLI's exit
-// code: 0 object, 1 no code (json = report), >=2 error (json = message)), json_len, object_len, extent, args_read, json, object.
+// code: 0 object, 1 no code (json: below), >=2 error (json = message)), json_len, object_len, extent, args_read, json, object.
 // extent: the compile read or checked only guest bytes [0, extent) and, if extent < the bytes' length, would be the same for
 // any longer input with that prefix (saturating). args_read: bit i set if the compile read the gating argument FEXC_ARG_* i;
-// it is the same under any value of the others. Both are 0 for an error. The JSON leaves out the CLI's hex dumps.
+// it is the same under any value of the others. Both are 0 for an error. json: with --report, the CLI's report less its hex
+// dumps; without (the host's server), only what the host reads: {"status":"ok"} for an object, the status and guest.end for
+// no code (with the CLI's status, error and diagnostics when FEX emitted nothing). The object, extent and args_read are the same.
 // EOF on stdin ends the server. One request at a time, in order.
 static bool ReadAll(int fd, void* p, size_t n) {
   for (auto* c = static_cast<char*>(p); n;) { ssize_t r = read(fd, c, n); if (r <= 0) return false; c += r; n -= size_t(r); }
@@ -927,8 +950,14 @@ static int Serve(const std::string& mode) {
 }
 
 int main(int argc, char** argv) {
-  if (argc >= 2 && std::string(argv[1]) == "--serve") {
-    std::string mode = argc >= 4 && std::string(argv[2]) == "--serve-mode" ? argv[3] : "reuse";
+  if (argc >= 2 && std::string(argv[1]) == "--serve") {   // fexc --serve [--serve-mode reuse|fork] [--report]
+    std::string mode = "reuse";
+    for (int i = 2; i < argc; ++i) {
+      const std::string a = argv[i];
+      if (a == "--serve-mode" && i + 1 < argc) mode = argv[++i];
+      else if (a == "--report") ServeReport = true;
+      else return Fail("--serve [--serve-mode reuse|fork] [--report]");
+    }
     if (mode != "fork" && mode != "reuse") return Fail("--serve-mode reuse|fork");
     return Serve(mode);   // stdin EOF; contexts are never torn down (see Ctx), so leave without destructors
   }

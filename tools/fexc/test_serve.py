@@ -7,8 +7,10 @@ Inputs: the 64 fixture programs, every --corpus (gen_slice1.py format, e.g. `--s
 scan_skips.py memory-form matrix, each under profile slice1 and default, plus 32-bit, --max-insts, --feature, --config and
 error requests. One server process answers all of them, then the whole list again in reverse order (same RIPs with
 other bytes in between: a context that kept FEX's block cache would answer from it), then an adversarial set at one RIP
-(several byte strings x settings) in six shuffled orders. Exit status 1 on any difference. The server's JSON lacks the CLI's
-hex dumps (input bytes, each instruction's, the code), which are dropped from the CLI's before comparing.
+(several byte strings x settings) in six shuffled orders. Exit status 1 on any difference. That server runs with --report:
+its JSON lacks only the CLI's hex dumps (input bytes, each instruction's, the code), dropped from the CLI's before comparing.
+A second server without --report (the host's) answers every request too: same code, object, extent and args_read, and
+its JSON is only what the host reads (`lean_ok`).
 --time prints mean/p95 compile latency of the CLI and of the server."""
 import argparse, json, os, random, statistics, struct, subprocess, sys, tempfile, time
 from pathlib import Path
@@ -21,8 +23,9 @@ FIXED = ['--profile', 'slice1']
 
 
 class Server:
-    def __init__(self, fexc, mode):
-        self.p = subprocess.Popen([fexc, '--serve', '--serve-mode', mode], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    def __init__(self, fexc, mode, report=True):
+        self.p = subprocess.Popen([fexc, '--serve', '--serve-mode', mode] + (['--report'] if report else []),
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 
     def compile(self, args, code):
         a = b''.join(x.encode() + b'\0' for x in args)
@@ -60,6 +63,24 @@ def norm(r):
         for i in d.get('guest', {}).get('instructions', []): i.pop('bytes_hex', None)
         js = json.dumps(d, sort_keys=True).encode()
     return code, js, obj
+
+
+HEADER = ('format', 'producer', 'input', 'settings', 'features')
+
+
+def lean_ok(lean, full):
+    """The host's server (no --report) against the --report one: code, object, extent and args_read the same; the JSON
+    {"status":"ok"} for an object, the status and guest.end for no code (when FEX emitted nothing, the report without its
+    header: status, error, guest, diagnostics), the message for an error."""
+    (c, js, obj, ext), (fc, fjs, fobj, fext) = lean, full
+    if (c, obj, ext) != (fc, fobj, fext):
+        return False
+    if c >= 2:
+        return js == fjs
+    f = json.loads(fjs)
+    want = {'status': 'ok'} if c == 0 else {k: v for k, v in f.items() if k not in HEADER} if 'error' in f else \
+        {'status': f['status'], 'guest': {'end': f['guest']['end']}}
+    return json.loads(js) == want
 
 
 def requests(corpora):
@@ -119,12 +140,22 @@ def main():
         expect = []
         for label, args, code in reqs:
             t0 = time.perf_counter(); expect.append(cli(a.cli or a.fexc, args, code, tmp)); t_cli.append(time.perf_counter() - t0)
-        s = Server(a.fexc, a.mode)
+        s, lean = Server(a.fexc, a.mode), Server(a.fexc, a.mode, report=False)
+
+        bad_lean = 0
+
+        def check_lean(got, args, code, label):
+            nonlocal bad_lean
+            mine = lean.compile(args, code) + ((lean.extent, lean.args_read),)
+            if not lean_ok(mine, got + ((s.extent, s.args_read),)):
+                bad_lean += 1
+                if bad_lean <= 10: print(f'LEAN DIFF {label}')
         for rnd, order in enumerate((range(len(reqs)), reversed(range(len(reqs))))):
             for i in order:
                 label, args, code = reqs[i]
                 t0 = time.perf_counter(); got = s.compile(args, code)
                 if rnd == 0: t_srv.append(time.perf_counter() - t0)
+                check_lean(got, args, code, f'round {rnd} {label}')
                 if norm(got) != norm(expect[i]):
                     bad += 1
                     if bad <= 10: print(f'DIFF round {rnd} {label}: code {got[0]}/{expect[i][0]} json {len(got[1])}/{len(expect[i][1])} object {len(got[2])}/{len(expect[i][2])} equal json {norm(got)[1] == norm(expect[i])[1]} object {got[2] == expect[i][2]}')
@@ -135,13 +166,16 @@ def main():
             random.Random(seed).shuffle(order)
             for i in order:
                 got = s.compile(adv[i][1], adv[i][2])
+                check_lean(got, adv[i][1], adv[i][2], f'adversarial pass {seed} {adv[i][0]}')
                 if norm(got) != norm(want[i]):
                     bad += 1
                     if bad <= 10: print(f'DIFF adversarial pass {seed} {adv[i][0]}: code {got[0]}/{want[i][0]}')
         reqs += adv; expect += want   # (only for the counts below)
-        s.close()
+        s.close(); lean.close()
     ok = sum(1 for e in expect if e[0] == 0)
-    print(f'{len(reqs)} requests ({ok} with an object), mode {a.mode}, both orders: {"identical" if not bad else f"{bad} DIFFERENCES"}')
+    print(f'{len(reqs)} requests ({ok} with an object), mode {a.mode}, both orders: {"identical" if not bad else f"{bad} DIFFERENCES"}; '
+          f'server without --report: {"same answers, host fields only" if not bad_lean else f"{bad_lean} DIFFERENCES"}')
+    bad += bad_lean
     if a.time:
         ms = lambda v: f'mean {statistics.mean(v) * 1e3:.2f} ms p95 {p95(v) * 1e3:.2f} ms'
         print(f'latency per compile: CLI {ms(t_cli)}; server {ms(t_srv)}')

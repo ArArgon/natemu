@@ -29,7 +29,10 @@ jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never 
 (series applied as twenty-nine commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series47-seg` (November 3: series46-br66's patches
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series48-lean` (November 3, perf plan "Measured
+(chunk 2)": series47-seg's patches and shim with `fexc.cpp`'s server sending only what the host reads, below "Compile
+server"; objects, extent and args_read byte-identical to series47-seg's; `obj/fexc` SHA-256
+`8c8bd6594a5cbe557d8928c483f2f6c3887f9c68b8797d84e83e1912fda4f592`). Before it, series47-seg (November 3: series46-br66's patches
 with the shim and `fexc.cpp` changed for the owner's segment-prefix decisions: CS/DS/ES/SS prefixes ignored, so a site's
 class is its operand's default segment (`JoinSites`: SS for an RSP/RBP base without FS/GS; `NullSegment` gone); the last of
 several FS/GS prefixes applies; an FS/GS prefix with no overridable memory operand ignored; every segment-prefix refusal of
@@ -275,11 +278,16 @@ as AMD does; its lowering already used a 64-bit push and target.
 
 One persistent process answers compile requests, length-prefixed (u32 little-endian) on stdin/stdout; EOF on stdin ends it.
 Request: `len`, `args_len`, the CLI arguments as NUL-terminated strings (without `--hex/--file/--out/--object`), then the
-guest bytes. Reply: `len`, `code` (i32: the CLI's exit code), `json_len`, `object_len`, `extent`, `args_read`, JSON report
-(error text for `code >= 2`), binary object (always produced for `code 0`). The object equals the one-shot CLI's; so does
-the JSON, less the CLI's hex dumps (`input.bytes_hex`, each instruction's `bytes_hex`, `code.hex`), which the server leaves
-out (its caller has the bytes, the object the code; building them was most of a request's fixed cost), and the one value
-that differs between two CLI runs, the dispatcher's host address `emitted_value`.
+guest bytes. Reply: `len`, `code` (i32: the CLI's exit code), `json_len`, `object_len`, `extent`, `args_read`, JSON
+(error text for `code >= 2`), binary object (always produced for `code 0`). The object equals the one-shot CLI's. The JSON
+is, by default (the host's server, since series48-lean), only what the host reads: `{"status":"ok"}` for an object; for no
+code the status and `guest.end` (reason, RIP, detail, `cut_*`), or, when FEX emitted nothing, the CLI's report without its
+header (status, error, `guest`, diagnostics). Building the full report was over half of a request's CPU (perf plan,
+"Measured (chunk 1)"; 28.6 to 12.3 us per request on an installer boot's 1.14 M requests, "Measured (chunk 2)").
+`fexc --serve --report` (`test_serve.py`) sends the CLI's report instead, less the CLI's hex dumps (`input.bytes_hex`, each
+instruction's `bytes_hex`, `code.hex`: the caller has the bytes, the object the code) and the one value that differs
+between two CLI runs, the dispatcher's host address `emitted_value`. The report never decides the object, extent or
+args_read: the end reason, the zeroed relocation slots and the end marker are computed before it.
 
 `extent` and `args_read` say what the compile depended on, for the caller's cache key (the host's `Compiler`). Every look
 at the guest bytes or at the input's size goes through `InWindow` (FEX's decoder learns the size from
@@ -304,8 +312,10 @@ on this macOS, CNTFRQ_EL0 reads 1 GHz in a normal process and 24 MHz in a forked
 profile the code FEX emits for RDTSC and CPUID leaf 15H, which reads it, differs between fork mode and the CLI or the
 in-process server. Profile slice1 does not use it (both are system instructions the resident runs), so slice1 objects are
 the same in every mode. `test_serve.py FEXC [--mode M] [--corpus C.json]` checks either mode against the CLI (requests at one RIP with
-other bytes and settings in shuffled orders included); the P3 replay of a boot's 76,610 logged requests found no
-difference from series32's fork mode.
+other bytes and settings in shuffled orders included), and a second server without `--report` against the first (same
+code, object, extent, args_read; only the host's fields in its JSON); the P3 replay of a boot's 76,610 logged requests found no
+difference from series32's fork mode, and chunk 2's replay of an installer boot's 1,142,279 recorded requests through
+series47-seg and series48-lean none in code, object, extent, args_read or `guest.end`.
 
 ## What builds
 
