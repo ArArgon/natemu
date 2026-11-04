@@ -167,11 +167,23 @@ pub fn reset() {
     // A `checked` of 0 is never current.
     (c.epoch, c.global_epoch) = (c.epoch.max(1), c.global_epoch.max(1));
     (c.regions, c.large_regions) = ([0; 16], [0; 16]);
-    // Block numbers start again: the dispatcher's table is emptied (it keeps its context), the others hold none.
+    // Block numbers start again: the current table is emptied (it keeps its context), the others hold none. Perf chunk
+    // 12: no block is left to exit to a slot, so every slot is free again (each bound one made to miss), then the current
+    // table's context takes one.
     let now = c.l1_table as usize;
     clear_l1(now);
     for t in (0..area::L1_TABLES).filter(|&t| t != now) {
         (c.l1_contexts[t], c.l1_used[t]) = (area::NO_CONTEXT, 0);
+    }
+    for k in 1..area::DISPATCH_SLOTS {
+        if c.slot_contexts[k] != area::NO_CONTEXT {
+            write_slot(k, None);
+            c.slot_contexts[k] = area::NO_CONTEXT;
+        }
+    }
+    c.l1_slots = [0; area::L1_TABLES];
+    if c.l1_contexts[now] != area::NO_CONTEXT {
+        bind_slot(now, c.l1_contexts[now]);
     }
     unsafe { ptr::write_bytes(lookup_area::<u8>(area::L2), 0, area::L2_ENTRIES * 16) };
     unsafe { ptr::write_bytes(lhead(0), 0, area::LINEAR_BUCKETS) };
@@ -268,51 +280,114 @@ fn clear_l1(t: usize) {
 fn synchronize_l1(t: usize) {
     synchronize_code(area::CODE_WRITE_VA + l1_entry(t, 0), area::CODE_VA + l1_entry(t, 0), area::L1_TABLE_BYTES);
 }
-/// The dispatcher's `adr x2` (its second word) to L1 table `t`.
-const DISPATCH_ADR: u64 = area::DISPATCH as u64 + 4;
-fn dispatch_adr(t: usize) -> u32 {
-    let imm = l1_entry(t, 0).wrapping_sub(DISPATCH_ADR) as u32;
+/// Code-area offset of dispatcher slot `k` ([`area::DISPATCH`]; slot 0 is the dispatcher itself).
+fn slot_at(k: usize) -> u64 {
+    (area::DISPATCH + k * area::DISPATCH_SLOT_BYTES) as u64
+}
+/// The `adr x2` at code-area offset `at` (a dispatcher's second word) to L1 table `t`.
+fn dispatch_adr(at: u64, t: usize) -> u32 {
+    let imm = l1_entry(t, 0).wrapping_sub(at) as u32;
     0x1000_0002 | (imm & 3) << 29 | (imm >> 2 & 0x7_ffff) << 5
 }
 
-/// Fills the code area's head once, before any block runs: the dispatcher's code. False if its `adr` is not the form
-/// [`select_l1`] rewrites (to L1 table 0), or if any table's `adr` does not decode to that table.
+/// Fills the code area's head once, before any block runs: the dispatcher's code (slot 0) and every other slot unbound
+/// (`b` to the miss). False if the dispatcher's `adr` is not the form the slots copy (to L1 table 0), or if any slot's
+/// `adr` to any table does not decode to that table.
 pub fn fill_head(dispatcher: &[u8]) -> bool {
     unsafe { copy_record((area::CODE_WRITE_VA + area::DISPATCH as u64) as *mut u8, dispatcher.as_ptr(), dispatcher.len()) };
-    synchronize_code(area::CODE_WRITE_VA + area::DISPATCH as u64, area::DISPATCH_VA, dispatcher.len());
+    let c = control();
+    for k in 1..area::DISPATCH_SLOTS {
+        let words = [branch(slot_at(k), area::DISPATCH_MISS as u64), 0, 0, 0, 0, 0, 0, 0];
+        unsafe { copy_record((area::CODE_WRITE_VA + slot_at(k)) as *mut u8, words.as_ptr().cast(), area::DISPATCH_SLOT_BYTES) };
+        c.slot_contexts[k] = area::NO_CONTEXT;
+    }
+    (c.slot_contexts[0], c.l1_slots) = (area::NO_CONTEXT, [0; area::L1_TABLES]);
+    synchronize_code(area::CODE_WRITE_VA + area::DISPATCH as u64, area::DISPATCH_VA, area::DISPATCH_BYTES);
     // ADR: immlo bits 30:29, immhi bits 23:5, a signed 21-bit offset from the instruction.
-    let target = |w: u32| DISPATCH_ADR.wrapping_add(((((w >> 29 & 3) | (w >> 5 & 0x7_ffff) << 2) << 11) as i32 >> 11) as u64);
-    control().l1_table == 0
-        && word(DISPATCH_ADR) == dispatch_adr(0)
-        && (0..area::L1_TABLES).all(|t| dispatch_adr(t) & 0x9f00_001f == 0x1000_0002 && target(dispatch_adr(t)) == l1_entry(t, 0))
+    let target = |at: u64, w: u32| at.wrapping_add(((((w >> 29 & 3) | (w >> 5 & 0x7_ffff) << 2) << 11) as i32 >> 11) as u64);
+    let adr = |k: usize, t: usize| (slot_at(k) + 4, dispatch_adr(slot_at(k) + 4, t));
+    c.l1_table == 0
+        && word(slot_at(0) + 4) == dispatch_adr(slot_at(0) + 4, 0)
+        && (0..area::DISPATCH_SLOTS).all(|k| (0..area::L1_TABLES).all(|t| {
+            let (at, w) = adr(k, t);
+            w & 0x9f00_001f == 0x1000_0002 && target(at, w) == l1_entry(t, 0)
+        }))
+}
+/// Perf chunk 12: slot `k` names L1 table `t` (the dispatcher's words with its own `adr`), or misses (`None`).
+fn write_slot(k: usize, t: Option<usize>) {
+    let at = slot_at(k);
+    let words = match t {
+        Some(t) => [word(slot_at(0)), dispatch_adr(at + 4, t), word(slot_at(0) + 8), word(slot_at(0) + 12)],
+        None => [branch(at, area::DISPATCH_MISS as u64), 0, 0, 0],
+    };
+    unsafe { copy_record((area::CODE_WRITE_VA + at) as *mut u8, words.as_ptr().cast(), size_of_val(&words)) };
+    synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, size_of_val(&words));
+    control().slot_writes += 1;
+}
+/// Perf chunk 12: table `t` now holds `context`'s entries: its slot (bound before, else a free one; none free: 0, its
+/// blocks exit to the miss) names `t`.
+fn bind_slot(t: usize, context: u64) {
+    let c = control();
+    let k = (1..area::DISPATCH_SLOTS)
+        .find(|&k| c.slot_contexts[k] == context)
+        .or_else(|| (1..area::DISPATCH_SLOTS).find(|&k| c.slot_contexts[k] == area::NO_CONTEXT))
+        .unwrap_or(0);
+    if k != 0 {
+        c.slot_contexts[k] = context;
+        write_slot(k, Some(t));
+        // No other table names it any more (a context holds one table).
+        for other in (0..area::L1_TABLES).filter(|&o| o != t) {
+            if c.l1_slots[other] == k as u64 {
+                c.l1_slots[other] = 0;
+            }
+        }
+    }
+    c.l1_slots[t] = k as u64;
+}
+/// Perf chunk 12: the code-area offset a computed exit of a block of `context` placed now branches to: the slot of the
+/// current table's context when that is `context` ([`select_l1`] ran for it), else the miss.
+pub fn dispatcher_for(context: u64) -> u64 {
+    let c = control();
+    let t = c.l1_table as usize;
+    match c.l1_slots[t] as usize {
+        k if k != 0 && c.l1_contexts[t] == context && c.slot_contexts[k] == context => slot_at(k),
+        _ => area::DISPATCH_MISS as u64,
+    }
 }
 
-/// L1 is keyed by RIP alone, so each table holds entries of one context, and the dispatcher probes the table of the
-/// current one: a change of context switches tables (the dispatcher's `adr` rewritten), so no block is entered from L1
-/// under another context than its own. A context with no table takes the least recently left one, cleared first. Every
-/// table's entries are kept as exact as the current one's: a TLB flush, an invalidation or a reset reaches them all.
+/// L1 is keyed by RIP alone, so each table holds entries of one context, and a block's computed exit probes the table of
+/// its own context through its context's dispatcher slot (perf chunk 12; [`area::DISPATCH`]): a block runs only in its
+/// context, so no block is entered from L1 under another context than its own, and a change of context switches tables
+/// with no code written (before, the one dispatcher's `adr` was rewritten at every change, about 90 ns). A context
+/// with no table takes the least recently left one, cleared first: the old context's slot then misses (its blocks exit
+/// to the resident until it takes a table again) and the new one's names the table. Every table's entries are kept as
+/// exact as the current one's: a TLB flush, an invalidation or a reset reaches them all.
 pub fn select_l1(context: u64) {
     let c = control();
     let now = c.l1_table as usize;
     if c.l1_contexts[now] == context {
         return;
     }
-    let p = crate::perf::enter(crate::perf::L1);
     c.l1_switches += 1;
     c.l1_used[now] = c.l1_switches;
     let t = match (0..area::L1_TABLES).find(|&t| c.l1_contexts[t] == context) {
         Some(t) => t,
         None => {
+            let p = crate::perf::enter(crate::perf::L1);
             let t = (0..area::L1_TABLES).min_by_key(|&t| c.l1_used[t]).unwrap_or(0);
+            // Before the table changes hands: the old context's blocks reach no entry of the new one.
+            if c.l1_slots[t] != 0 {
+                write_slot(c.l1_slots[t] as usize, None);
+            }
             clear_l1(t);
             c.l1_contexts[t] = context;
             c.l1_clears += 1;
+            bind_slot(t, context);
+            crate::perf::leave(p);
             t
         }
     };
     c.l1_table = t as u64;
-    rewrite(DISPATCH_ADR, dispatch_adr(t));
-    crate::perf::leave(p);
 }
 /// Enters `block` for `rip` in the dispatcher's L1 table if the block's context is the table's ([`select_l1`] ran for
 /// it before the lookup that found it); otherwise nothing is entered (the block is still entered from the resident).
@@ -380,11 +455,16 @@ pub fn tlb(global: bool) -> Option<u64> {
     if global {
         c.global_epoch = c.epoch;
         c.global_flushes += 1;
-        // No block is current: the dispatcher's table is emptied, the others hold no context any more.
+        // No block is current: the dispatcher's table is emptied, the others hold no context any more (perf chunk 12: their
+        // contexts' slots miss until those take a table again, as at a reset).
         let now = c.l1_table as usize;
         clear_l1(now);
         for t in (0..area::L1_TABLES).filter(|&t| t != now) {
             (c.l1_contexts[t], c.l1_used[t]) = (area::NO_CONTEXT, 0);
+            if c.l1_slots[t] != 0 {
+                write_slot(c.l1_slots[t] as usize, None);
+                c.l1_slots[t] = 0;
+            }
         }
     } else {
         c.cr3_loads += 1;
@@ -457,7 +537,7 @@ pub fn place(
     unsafe {
         // Copied above the fill point first: nothing refers to it until the record is filed.
         copy_record((area::CODE_WRITE_VA + code) as *mut u8, object.add(h.code_offset as usize), h.code_size as usize);
-        relocate(code, dispatch_exit, area::DISPATCH);
+        relocate(code, dispatch_exit, dispatcher_for(context));
         synchronize_code(area::CODE_WRITE_VA + code, area::CODE_VA + code, h.code_size as usize);
         let placed = file(record, object.add(h.sites_offset as usize), size_of::<Site>() * h.sites_count as usize, 4 * count as usize)?;
         // In increasing order (insertion sort: at most 255; fexc lists them in emission order already).
@@ -509,7 +589,7 @@ pub fn copy(b: &Block, rip: u64, source_gpa: [u64; 2], walked: u32) -> Result<Op
         copy_record((area::CODE_WRITE_VA + code) as *mut u8, (area::CODE_WRITE_VA + u64::from(b.code)) as *const u8, b.code_size as usize);
         let at = core::slice::from_raw_parts_mut((area::CODE_WRITE_VA + code) as *mut u8, b.code_size as usize);
         natemu_abi::execution::relocate_code(at, relocs(b), &mut links, b.rip, rip, b.guest_bytes)?;
-        relocate(code, u64::from(b.dispatch_exit), area::DISPATCH);
+        relocate(code, u64::from(b.dispatch_exit), dispatcher_for(b.context));
         synchronize_code(area::CODE_WRITE_VA + code, area::CODE_VA + code, b.code_size as usize);
     }
     let record = Block {
@@ -643,7 +723,7 @@ pub fn place_step(
         at.write(record);
         copy_record(at.add(1).cast(), object.add(h.sites_offset as usize), sites);
         copy_record(SLOT_WRITE_VA as *mut u8, object.add(h.code_offset as usize), h.code_size as usize);
-        relocate(SLOT as u64, dispatch_exit, DISPATCH_MISS);
+        relocate(SLOT as u64, dispatch_exit, DISPATCH_MISS as u64);
         synchronize_code(SLOT_WRITE_VA, SLOT_VA, h.code_size as usize);
         Some(&*at)
     }
@@ -684,12 +764,12 @@ fn branch(from: u64, to: u64) -> u32 {
     0x1400_0000 | (to.wrapping_sub(from) >> 2) as u32 & 0x03ff_ffff
 }
 /// Relocates the placeholder of the block just copied to code-area offset `code` (before its code is synchronized):
-/// its computed exit (at `dispatch_exit`, 0 for none) becomes `b` to the dispatcher. (The placeholder was checked at
-/// the reply.)
-fn relocate(code: u64, dispatch_exit: u64, to: usize) {
+/// its computed exit (at `dispatch_exit`, 0 for none) becomes `b` to `to` (its context's dispatcher slot, or the miss,
+/// [`dispatcher_for`]). (The placeholder was checked at the reply.)
+fn relocate(code: u64, dispatch_exit: u64, to: u64) {
     if dispatch_exit != 0 {
         let at = code + dispatch_exit;
-        unsafe { ((area::CODE_WRITE_VA + at) as *mut u32).write_volatile(branch(at, to as u64)) };
+        unsafe { ((area::CODE_WRITE_VA + at) as *mut u32).write_volatile(branch(at, to)) };
     }
 }
 
@@ -1099,6 +1179,13 @@ pub fn block_at(pc: u64) -> Option<&'static Block> {
     }
     let offset = pc.checked_sub(area::CODE_VA)?;
     let count = control().blocks as usize;
+    let holds = |b: &Block| u64::from(b.code) <= offset && offset < u64::from(b.code) + u64::from(b.code_size);
+    // Perf chunk 12: the block found at this word last ([`Control::pc_hints`]).
+    let hint = (offset >> 2) as usize % area::PC_HINTS;
+    let n = control().pc_hints[hint] as usize;
+    if n < count && holds(block(n)) {
+        return Some(block(n));
+    }
     // The last block starting at or below `offset` (placement order is address order).
     let (mut lo, mut hi) = (0, count);
     while lo < hi {
@@ -1109,8 +1196,13 @@ pub fn block_at(pc: u64) -> Option<&'static Block> {
             hi = mid;
         }
     }
-    let b = block(lo.checked_sub(1)?);
-    (offset < u64::from(b.code) + u64::from(b.code_size)).then_some(b)
+    let n = lo.checked_sub(1)?;
+    let b = block(n);
+    if !holds(b) {
+        return None;
+    }
+    control().pc_hints[hint] = n as u32;
+    Some(b)
 }
 
 /// Marks `gpa`'s page as holding this vCPU's translations, before its bytes are copied for a block: from here on a
@@ -1170,7 +1262,13 @@ pub fn shadows_reset() {
 /// page ([`invalidate`], whose `None` this returns) unless the whole cache goes anyway. Returns the pending bits;
 /// the caller flushes on [`FLUSH`] and resets its shadows on [`SHADOWS`].
 pub fn drain() -> Option<u64> {
-    let pending = record_word(vcpu(), None).swap(0, SeqCst);
+    // Perf chunk 12: a load first, the swap only when something is pending (a swap returning 0 changes nothing; a bit
+    // posted after the load is taken at the next drain, as one posted after a swap).
+    let word = record_word(vcpu(), None);
+    if word.load(SeqCst) == 0 {
+        return Some(0);
+    }
+    let pending = word.swap(0, SeqCst);
     if pending & PAGES != 0 {
         for k in 0..pages().div_ceil(64 * 64) {
             let summary = summary_word(vcpu(), k);

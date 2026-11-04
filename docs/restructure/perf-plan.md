@@ -1,6 +1,6 @@
 # Performance phase plan (draft)
 
-Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review; chunks 1-11 measured below (chunk 5 uncommitted on d89bc4c, chunk 7 on 0da552a, chunk 6 on ea11225, chunk 8 on 1c4d8b9, chunk 9 on 9ba60d5, chunk 10 on 851cbd2, chunk 11 (phase 2, November 4) on 245700d). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
+Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review; chunks 1-12 measured below (chunk 5 uncommitted on d89bc4c, chunk 7 on 0da552a, chunk 6 on ea11225, chunk 8 on 1c4d8b9, chunk 9 on 9ba60d5, chunk 10 on 851cbd2, chunk 11 (phase 2, November 4) on 245700d, chunk 12 on f6e8820). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
 code, measured first; the correctness pass follows. Principles: measure first; native mechanisms; nothing keyed to
 Linux (a KASLR boot must gain too); every object still admitted; checks green; no debt.
 
@@ -977,6 +977,95 @@ at both block sizes; faults 7,912 at both; `run_slice3_vm.py` `contain`, `smp`, 
 `run_k2.py` all ok; `run_boot_smoke.py` 4/4; `run_r1.py r1a` and `r1b` ok (negative controls flagged). Not rerun: `run_s4.py`,
 `run_x1.py`, `delivery` (the change is in the link records, which these exercise only as the cases above do).
 
+### Measured (chunk 12: block exits into system instructions, November 4; uncommitted on f6e8820, series49-sha)
+
+**Cause** (`natemu-raw/sysfast-20261104-01/measure/`; the perf resident with new per-kind counters, `hackbench` N = 1, 50.9 s):
+114.5 M system instructions, 98.5 M linker entries and 16.0 M dispatcher misses into them, 115.8 M block entries. By kind: SWAPGS
+32.2 M, CLI 16.7 M, STI 16.5 M, RDTSC 16.1 M, SYSCALL 16.0 M, SYSRET 16.0 M (Linux's syscall path: `entry_SYSCALL_64` is
+`endbr64; swapgs`, the exit `swapgs; 7 NOPs; sysretq`, RDTSC is the kernel-stack offset), everything else 0.9 M; the installer
+N = 1: 2.5 M (CLI 24%, STI 21%, MOV from Sreg 13%, SWAPGS 11%, IRET 8%, RDTSC 6%). Cost per system instruction, from
+temporary sub-buckets (`prof`, `prof2` runs): transaction 75 ns (SWAPGS 92, SYSCALL 126, SYSRET 97, CLI 34: two or three
+copies of the 800-byte bank each), the boundary checks of `find` 35 ns per pass (two passes; the pending word's SeqCst
+swap and the LAPIC poll's `isb`), `block_at`'s binary search 29 ns, the state load and bank 22 ns, `enter` 50 ns, the L1
+table switch at each CPL change 88 ns (32 M per run: the dispatcher's `adr` rewritten with cache maintenance), plus the
+exception gate and `eret` in `guest`. `run_k2.py cost` (N = 1 M): CLI 0.211 us, SWAPGS 0.272, RDTSC 0.233, `svc #DIV`
+0.096 per iteration.
+
+**Built** (resident, host, abi; each measured on hackbench N = 1 with the perf resident, 50.9 s before):
+1. Transactions without bank copies: SWAPGS, SYSCALL, SYSRET, SYSENTER/SYSEXIT, RD/WR FS/GS BASE, RDRAND, WBINVD, CLFLUSH,
+   CLI/STI/POPF and RDTSC/RDTSCP (an early arm) make every check before their first write, so a fault leaves the bank as it
+   was; only LAR..VERW keep the rollback copy. 2. `drain` loads the pending word before swapping it (swap only when
+   non-zero); `lapic::poll` reads CNTVCT without `isb` (an expiry is seen at that boundary or the next; its doorbell stops
+   the vCPU anyway). 3. `block_at` tries a per-vCPU hint by code word (`Control::pc_hints`, 2 Ki), used only when the hinted
+   block's code still holds the word (ranges never overlap). Together 50.9 -> 36.8 s: transaction 27.7 ns average, the
+   boundary checks 14 ns per pass, `block_at` 2.2 ns. 4. **NOP runs** (`system::NOP_RUN`): a translate request whose block
+   fexc cut before a system instruction and which holds only no-operation instructions (host `system::nops`: `90`, `66 90`,
+   `0f 1f /0` with 66, CS/DS/ES/SS and REX prefixes, ENDBR64/32; LOCK, F2/F3, 0x67, FS/GS, PAUSE, `41 90` refused; the bytes and
+   count are fexc's) is answered as one system decode of those bytes, kept as a K2 record and committed as one transaction,
+   so `find` runs the next system instruction in the same resident entry: `endbr64; swapgs` and `swapgs; nops; sysretq` take
+   one entry each instead of two (115.8 M -> 83.9 M block entries; 36.8 -> 32.4 s). It is never a step (`kept_system` refuses
+   it: under TF, an interrupt shadow or a held data trap the host steps the first instruction alone). 5. **A dispatcher per
+   code context**: the head holds 127 copies of the dispatcher ("slots"); a context gets one when it first takes an L1 table
+   (until the next flush), its slot's `adr` names that table, and its blocks' computed exits branch to it (`dispatcher_for`
+   at placement, copies too); a table taken by another context makes the old one's slot miss (`b` to the miss) and binds the
+   new one's; a global TLB flush and a reset unbind the tables they empty. A context change then writes no code (it wrote the
+   dispatcher's `adr`, 88 ns): 14 slot writes for 32.0 M switches (32.4 -> 29.2 s). No context without a slot is ever
+   entered through L1: its blocks exit to the miss. Rejected after measuring: linking a block's exit straight into a kept
+   system record (a stub entering the transaction): with the hint the linker's own cost before `find` is about 20 ns of a
+   system instruction's 200 ns and the first lookup 7 ns, not worth a new entry kind; translating CLI/STI/SWAPGS inline needs
+   fexc changes and emulator state in the guest-state page.
+
+Per x86 rule (SDM Vol.2 instruction pages, Vol.3 6.8.3, 7.8.3, 18.3.1), and where it is kept: SWAPGS #UD with LOCK, #GP(0) at
+CPL > 0; SYSCALL #UD without EFER.SCE, RCX/R11, RFLAGS & ~FMASK, CS/SS from STAR, CPL 0, a TF at its start traps after it;
+SYSRET #UD without SCE, #GP(0) at CPL > 0 or a non-canonical RCX (before any write), RFLAGS from R11; CLI/STI #GP(0) at
+CPL > IOPL, STI's shadow only when IF was 0; RDTSC/RDTSCP #GP(0) with CR4.TSD at CPL > 0, RDTSCP's ECX: all unchanged, every
+check still before the first write (the reason the copies could go). Interrupt windows: `find` takes events at every
+boundary between chained instructions, NOP runs included; a shadow with an event pending steps one instruction (never a
+NOP run). TF: every traced instruction is stepped alone. Instruction breakpoints: blocks are cut at armed ones and arming
+flushes, so no NOP run spans one; RF ends after the run as after a block. Faults: NOPs take none (their memory operand is
+not accessed). Cross-modifying code: a NOP run is a K2 record of its bytes, invalidated as any.
+
+**Tests.** `run_s4.py` `s4-nops` (a 20-byte run before CLI made plain, then run under TF: each NOP-class instruction, CLI and RET
+trap after themselves; an instruction breakpoint inside the run faults there), judged by the SDM and equal to QEMU at both
+block sizes; `run_slice3_vm.py events` `ev-sti-nops` (STI with an interrupt pending before a kept run: taken after the first
+NOP) at 1, 2, 4 vCPUs, judged by `delivery_model` and QEMU; `run_k2.py` coherence `G-nop-run-own-write` (the run's own write
+makes STC of its second NOP: the next visit sets CF); host unit test `nop_runs`. Negative controls (scratch residents,
+`t/nc*`): `kept_system` not refusing NOP runs: `s4-nops` red (11 entries) and `ev-sti-nops` red (14); a slot not renamed when
+its context takes a table again (and no miss at hand-over): `k1 contexts` red (60 failures). Making the old slot miss at a
+hand-over is defence in depth: a context's blocks run only while it is current, and taking a table always binds its slot
+(that mutant alone stayed green). Independent review (read-only, of the diff): no blocking defect; applied its two
+performance findings (a global flush left tables pointing at slots, so a later hand-over could make a live context miss
+until its table changed hands; the head filled after the start's reset, leaving the current context without a slot) and a
+comment.
+
+**Measured** (`natemu-raw/sysfast-20261104-01/`, `campaign.py`, `runs/`, `inst/`, `perf/`, `ab/`; the `natemu` stub, cache off,
+`mitigations=off nokaslr`, 2 GiB, one VM at a time, base and fix interleaved, every run verified, runs another agent's VM
+overlapped discarded (`clean.py` retries them); median (min-max) of three, START to END seconds):
+
+| Benchmark | N | before (f6e8820) | after | QEMU multi |
+| --- | --- | --- | --- | --- |
+| `hackbench` | 1 | 51.17 (50.01-51.55) | **30.10** (29.61-30.10) | 16.4 |
+| | 4 | 15.36 (15.15-15.59) | **9.57** (9.45-9.63) | 5.08 |
+| `locks` | 4 | 6.42 (6.40-6.44) | **5.35** (5.18-5.35) | 27.5 |
+| `build` | 1 | 20.89 (20.76-21.12, five) | **20.39** (20.19-24.07, seven: five in 20.19-20.51, then 21.60 and 24.07) | 28.3 |
+| Installer, cache off | 1 | 8.97 (8.70-9.06) | **8.46** (8.36-8.49) | 6.10 |
+
+"after" is the campaign's build; the build with the review's fixes (`fix2`) gave `hackbench` N = 1 30.35-30.50, `build` N = 1
+20.23-24.07 (the `build` row holds its five), `locks` N = 4 5.17 against the campaign build's 5.21-5.24 and the base's 6.02-7.33
+in one interleaved set (`ab/`). Perf boot after (fix2, hackbench N = 1): 147.1 M system instructions of which 32.5 M NOP runs and
+64.6 M chained (no block between), 66.5 M linker entries, 83.9 M block entries; buckets `guest` 11.9, `link` 6.9, `enter` 5.0,
+`system` 3.8, `lookup` 1.8, `miss` 1.4 s; `l1` gone (14 slot writes). N = 4 per vCPU: `link` 1.9-2.0 s (4.1-4.3 before), `system`
+1.0-1.1 (2.5). `hackbench` is still 1.8-1.9x QEMU: each syscall is five resident round trips of about 0.2 us.
+
+**Checks** (`suite/`, `suite12.sh`, series49-sha, the final tree, one VM runner at a time, each case's output deleted as it ended):
+`cargo test` 164 + 1 ignored, also with `FEXC` set (one new); `check_resident_stack.py` `ok` (16,560 / 20,736 / 8,800 bytes, -96 /
+-96 / -112); fixtures 64 and seed 44 at both block sizes; faults 7,912 at both; `run_slice3_vm.py` `system`, `delivery`,
+`events` (`ev-sti-nops` included), `contain`, `smp` 0 failures; `run_k1.py` 288 runs, no failure; `run_k2.py` all ok (`G`
+included); `run_s4.py` all ok (`s4-nops` included; QEMU's known departures as before); `run_x1.py` 6/6 and 196/196; `run_x3.py`
+all ok; `run_l4a.py` all ok; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7 and `r1b` ok (negative controls flagged). Not rerun:
+`sharedpt`, `coherence`, `run_m1.py`, `run_x4.py` (the change is in system transactions, the boundary checks, block placement and
+the dispatcher, which the runs above exercise).
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
@@ -1042,7 +1131,8 @@ shared-memory ring with a native wait only if material; staging, placement; admi
 (`runtime/src/execution.rs:1502`), `sse::bank` (`sse.rs:28`), `block_at`, `enter` (715-757), `tables::select`
 (`tables.rs:67`); then copy only what changed, skip `tables::select` when CPL and root are unchanged, link exits into
 kept system records. (Chunk 9: the copies cut, 0.19 to 0.044 us of `enter` per entry; `tables::select` already
-skipped; copying only what changed dropped, it would put exact fault state at risk for about 10 ns.)
+skipped; copying only what changed dropped, it would put exact fault state at risk for about 10 ns. Chunk 12: system instructions' own costs cut and the L1 switch removed; a direct link into a kept system record measured
+not worth it.)
 
 **Uncached RAM.** About 4.5 us per UC access through the step block; the boot's `cache_disable` window is about 533
 accesses (2.5 ms). If `uncached_steps` makes it material: keep step translations in the resident.

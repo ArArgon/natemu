@@ -42,7 +42,7 @@ Then, as the numbers dictate:
    PTI address-space work (`natemu-raw/mitig-20261103-01/`). The ordinary benchmark case is "not vulnerable"; once PCID is
    built, a PTI-on boot joins the standing benchmarks (owner).
 7. **Remaining exits and per-request costs**: fast paths for the commonest system instructions (~2.5 M entries per
-   installer boot), fexc's fixed per-request setup (argument parsing, feature table and Config per request), in-process FEX
+   installer boot; done for the syscall path in perf chunk 12: `hackbench` N = 1 51.2 -> 30.1 s), fexc's fixed per-request setup (argument parsing, feature table and Config per request), in-process FEX
    (removes the pipe, gives up process isolation; admission stays), an in-VM random-number generator or the Arm RNDR if the
    VM sees it (owner: after batch 1), a cheaper disk-cache key (fast hash plus stored request bytes), huge pages for the code
    area.
@@ -100,6 +100,7 @@ per-vCPU breakdowns): `natemu-raw/bench-baseline-20261104-01/` (`table.md`, `run
 | --- | --- | --- | --- | --- | --- |
 | `build` | natemu | **did not finish** (>2400 s) | 59.3 (48-121) | 73.9 (41-88) | 51.1 (35-119) |
 | | natemu, chunk 11 | **21.25** | **15.84** | **13.67** | **13.93** |
+| | natemu, chunk 12 | 20.39 | - | - | - |
 | | QEMU multi | 28.3 | 15.3 | 13.5 | 12.5 |
 | | native | 2.61 | 1.40 | 1.20 | 1.09 |
 | `zstd` (all phases) | natemu | 2.26 | 1.74 | 1.63 | 1.71 |
@@ -107,10 +108,12 @@ per-vCPU breakdowns): `natemu-raw/bench-baseline-20261104-01/` (`table.md`, `run
 | | native | 1.06 | 0.69 | 0.58 | 0.50 |
 | `hackbench` | natemu | 53.8 | 27.9 | 19.6 | 15.2 |
 | | natemu, chunk 11 | 52.7 | - | - | 15.2 |
+| | natemu, chunk 12 | **30.1** | - | - | **9.57** |
 | | QEMU multi | 16.4 | 8.87 | 6.41 | 5.08 |
 | | native | 3.88 | 2.08 | 1.65 | 1.65 |
 | `locks` | natemu | 16.7 | 8.90 | 6.62 | 5.81 |
 | | natemu, chunk 11 | 16.3 | - | - | 6.07 |
+| | natemu, chunk 12 | - | - | - | **5.35** |
 | | QEMU multi | 11.0 | 33.2 | 26.1 | 27.5 |
 | | native | 2.11 | 1.32 | 3.59 | 4.20 |
 
@@ -121,7 +124,9 @@ QEMU show); `build` none (no N = 1). natemu / QEMU multi time ratio: `zstd` 0.13
 1.4-7.9x. QEMU `thread=single` at N = 4: `build` 30.2, `zstd` 20.4, `hackbench` 22.7, `locks` 11.1 s.
 
 Rows "chunk 11": after the link-record fix ([perf-plan.md](perf-plan.md), "Measured (chunk 11)", November 4, 245700d plus
-the change; `natemu-raw/linkfix-20261104-01/`, same harness and rules, median of three; `-`: not rerun).
+the change; `natemu-raw/linkfix-20261104-01/`, same harness and rules, median of three; `-`: not rerun). Rows "chunk 12":
+after the system-instruction fast paths ([perf-plan.md](perf-plan.md), "Measured (chunk 12)", f6e8820 plus the change,
+`natemu-raw/sysfast-20261104-01/`; its own before, f6e8820: `build` N = 1 20.89, `hackbench` 51.17 / 15.36, `locks` N = 4 6.42).
 
 **Findings.**
 1. (Fixed by perf chunk 11: `build` now finishes, 21.3 s at N = 1 against QEMU's 28.3 s, 13.7-15.8 s at N = 2-4, run to run

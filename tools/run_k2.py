@@ -214,7 +214,8 @@ def coherence(a, report):
     and the next visit must run the new instruction: A the vCPU's own write from another page, B its own write on X's
     page in a loop, C a remap of X's linear page with INVLPG, or with a CR3 reload, D a write through another linear
     alias of X's frame, E a SWAPGS crossing 0x200000 whose second page alone is remapped (to RDTSCP's byte) and INVLPGed,
-    F a peer's rewrite, then a flag, then CPUID (serializing). Also BTS under alignment checking (a kept BT_ALIGNED
+    F a peer's rewrite, then a flag, then CPUID (serializing), G (perf chunk 12) a run of NOPs kept as one record, its
+    second NOP rewritten by the vCPU's own store. Also BTS under alignment checking (a kept BT_ALIGNED
     record): aligned five times (stepped plain each time), then misaligned: #AC(0) at the BTS; all aligned: completes.
     Block sizes default and 1."""
     asm, failures, runs = ref.assemble, [], []
@@ -250,6 +251,10 @@ def coherence(a, report):
                                        (CODE1 + 0x4000, asm(cr3 + f'1: cmp qword ptr [{FLAG + 8:#x}], 1000\njb 1b\nmov byte ptr [{X:#x}], 0xfb\n'
                                                             f'mov byte ptr [{FLAG:#x}], 1\n'), [])],
            tables({}) + [(X, asm('cli') + JMP), (FLAG, bytes(16))], IF, 0x40) for r in range(3)],
+        # Perf chunk 12: a run of NOPs before CLI, kept as one NOP_RUN record; its own write turns the second NOP into STC:
+        # the next visit runs STC (CF = 1), not the kept run.
+        ('G-nop-run-own-write', [(CODE1, asm(cr3 + go(X, 0) + go(X, 1) + f'mov byte ptr [{X + 1:#x}], 0xf9\nclc\n' + go(X, 2)), [])],
+         tables({}) + [(X, asm('nop\nnop\nxchg ax, ax\ncli') + JMP)], lambda c: int(c['rflags'], 16) & 1 == 1, 0x79),
     ]
     for block in (None, 1):
         for name, cpus, memory, judge, old in cases:
@@ -259,7 +264,8 @@ def coherence(a, report):
             _, out, err = driver(a, '\n'.join(lines) + '\n', a.out / 'coherence' / f'{name}-{block}', [block] if block else [])
             c = out and (out['cpus'] if 'cpus' in out else [out])[0]
             decodes = c and c['stats']['decodes'].get(f'{old:#x}')
-            ok = bool(c) and c['stop'] == 'reached' and judge(c) and decodes == 1
+            # (At block size 1 no block holds more than one instruction, so no NOP_RUN is made: its CF is judged alone.)
+            ok = bool(c) and c['stop'] == 'reached' and judge(c) and decodes == (None if block == 1 and old == 0x79 else 1)
             runs.append({'case': name, 'block': block, 'ok': ok, 'stop': c and c['stop'], 'old_decodes': decodes,
                          **({k: c['stats'][k] for k in ('systems', 'decode_exits', 'steps', 'invalidations')} if c else {'error': err})})
             print(json.dumps(runs[-1]), flush=True)

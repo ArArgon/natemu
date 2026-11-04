@@ -65,24 +65,26 @@ fn flat(selector: u16, attributes: u16) -> Segment {
 /// Executes `i` (SWAPGS ..= CLFLUSH, SYSENTER, SYSEXIT). `Ok(None)`: committed, RIP moves past it; `Ok(Some(rip))`: SYSCALL or SYSRET
 /// committed to `rip`. On `Err` nothing changed.
 pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception> {
-    let c = s.cpu;
+    // Perf chunk 12: the fields read, not a copy of the bank (every value is read before the first write).
+    let (cpl, efer, cr4, rip, rflags) = (s.cpu.cpl, s.cpu.efer, s.cpu.cr4, s.cpu.rip, s.cpu.rflags);
     match i.kind {
         system::SWAPGS => {
-            if c.cpl != 0 {
+            if cpl != 0 {
                 return Err(GP0);
             }
             let at = slot(cpu::MSR_KERNEL_GS_BASE);
+            let gs_base = s.cpu.gs_base;
             s.cpu.gs_base = msr_get(at);
-            msr_set(at, c.gs_base);
+            msr_set(at, gs_base);
         }
         system::SYSCALL => {
-            if c.efer & EFER_SCE == 0 {
+            if efer & EFER_SCE == 0 {
                 return Err(UD);
             }
             let selector = (msr_get(slot(cpu::MSR_STAR)) >> 32) as u16;
-            s.cpu.gpr[1] = c.rip.wrapping_add(u64::from(i.length));
-            s.cpu.gpr[11] = c.rflags;
-            s.cpu.rflags = c.rflags & !msr_get(slot(cpu::MSR_FMASK)) | 2;
+            s.cpu.gpr[1] = rip.wrapping_add(u64::from(i.length));
+            s.cpu.gpr[11] = rflags;
+            s.cpu.rflags = rflags & !msr_get(slot(cpu::MSR_FMASK)) | 2;
             s.cpu.seg[SREG_CS] = flat(selector & 0xfffc, CS64);
             s.cpu.seg[SREG_SS] = flat(selector.wrapping_add(8), SS_FLAT);
             set_cpl(s, 0);
@@ -90,18 +92,18 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             return Ok(Some(msr_get(slot(cpu::MSR_LSTAR))));
         }
         system::SYSRET => {
-            if c.efer & EFER_SCE == 0 {
+            if efer & EFER_SCE == 0 {
                 return Err(UD);
             }
-            if c.cpl != 0 {
+            if cpl != 0 {
                 return Err(GP0);
             }
             let wide = i.size == 8;
-            let rip = if wide { c.gpr[1] } else { c.gpr[1] & 0xffff_ffff };
+            let rip = if wide { s.cpu.gpr[1] } else { s.cpu.gpr[1] & 0xffff_ffff };
             if !paging::canonical(rip) {
                 return Err(GP0);
             }
-            let rflags = c.gpr[11] & SYSRET_FLAGS | 2;
+            let rflags = s.cpu.gpr[11] & SYSRET_FLAGS | 2;
             let base = (msr_get(slot(cpu::MSR_STAR)) >> 48) as u16;
             s.cpu.rflags = rflags;
             s.cpu.seg[SREG_CS] = flat(base.wrapping_add(if wide { 16 } else { 0 }) | 3, if wide { CS64 } else { CS32 } | DPL3);
@@ -115,7 +117,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             if cs == 0 {
                 return Err(GP0);
             }
-            s.cpu.rflags = c.rflags & !(RFLAGS_VM | RFLAGS_IF);
+            s.cpu.rflags = rflags & !(RFLAGS_VM | RFLAGS_IF);
             s.cpu.gpr[4] = msr_get(slot(cpu::MSR_SYSENTER_ESP));
             s.cpu.seg[SREG_CS] = flat(cs, CS64);
             s.cpu.seg[SREG_SS] = flat(cs.wrapping_add(8), SS_FLAT);
@@ -124,12 +126,12 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
         }
         system::SYSEXIT => {
             let cs = msr_get(slot(cpu::MSR_SYSENTER_CS)) as u16;
-            if cs & 0xfffc == 0 || c.cpl != 0 {
+            if cs & 0xfffc == 0 || cpl != 0 {
                 return Err(GP0);
             }
             let wide = i.size == 8;
             let mask = if wide { u64::MAX } else { 0xffff_ffff };
-            let (rsp, rip) = (c.gpr[1] & mask, c.gpr[2] & mask);
+            let (rsp, rip) = (s.cpu.gpr[1] & mask, s.cpu.gpr[2] & mask);
             if !paging::canonical(rsp) || !paging::canonical(rip) {
                 return Err(GP0);
             }
@@ -141,15 +143,15 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             return Ok(Some(rip));
         }
         system::RDFSBASE..=system::WRGSBASE => {
-            if c.cr4 & CR4_FSGSBASE == 0 {
+            if cr4 & CR4_FSGSBASE == 0 {
                 return Err(UD);
             }
             let mask = if i.size == 8 { u64::MAX } else { 0xffff_ffff };
             let fs = matches!(i.kind, system::RDFSBASE | system::WRFSBASE);
             if i.kind <= system::RDGSBASE {
-                s.cpu.gpr[i.reg as usize] = if fs { c.fs_base } else { c.gs_base } & mask;
+                s.cpu.gpr[i.reg as usize] = if fs { s.cpu.fs_base } else { s.cpu.gs_base } & mask;
             } else {
-                let v = c.gpr[i.reg as usize] & mask;
+                let v = s.cpu.gpr[i.reg as usize] & mask;
                 if !paging::canonical(v) {
                     return Err(GP0);
                 }
@@ -178,16 +180,17 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
                 4 => v & 0xffff_ffff,
                 _ => v,
             };
-            s.cpu.rflags = c.rflags & !ARITHMETIC_FLAGS | u64::from(value.is_some());
+            s.cpu.rflags = rflags & !ARITHMETIC_FLAGS | u64::from(value.is_some());
         }
         system::WBINVD => {
-            if c.cpl != 0 {
+            if cpl != 0 {
                 return Err(GP0);
             }
         }
         system::CLFLUSH => {
             // The walk of a byte load (its faults; M3: a device page passes, uncached, nothing to flush).
-            segments::pages(s, segments::address(&c, &i), 1, false, false, segments::noncanonical(&i))?;
+            let address = segments::address(&s.cpu, &i);
+            segments::pages(s, address, 1, false, false, segments::noncanonical(&i))?;
         }
         _ => halt(s, stop::BAD_REPLY),
     }

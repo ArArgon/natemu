@@ -93,6 +93,13 @@ fn base() -> u64 {
 fn publish(s: &State) {
     event_word(s.vcpu, core::mem::offset_of!(Events, apic)).store(apic::published(base(), lapic(), s.vcpu), SeqCst);
 }
+/// V without a barrier (see [`poll`]).
+fn count() -> u64 {
+    let v: u64;
+    // SAFETY: reads the virtual count.
+    unsafe { asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack)) };
+    v
+}
 fn now() -> u64 {
     let v: u64;
     // SAFETY: reads the virtual count.
@@ -255,7 +262,9 @@ fn timer(s: &mut State) {
 /// next owed one once the last was accepted.
 pub(super) fn poll(s: &mut State) {
     let d = lapic().deadline;
-    if d != u64::MAX && now() >= d {
+    // Perf chunk 12: the count read without `now`'s barrier (at every boundary): it may be read a few cycles early, so an
+    // expiry is seen at this boundary or the next one; its doorbell stops the vCPU in any case.
+    if d != u64::MAX && count() >= d {
         timer(s)
     }
     if lapic().backlog != 0 {

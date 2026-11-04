@@ -758,6 +758,49 @@ mod lock_tests {
     }
 }
 
+/// Perf chunk 12: the number of instructions in `bytes` when it is wholly a run of no-operation instructions
+/// ([`system::NOP_RUN`]): NOP (`90`, with 66 prefixes), NOP r/m (`0f 1f /0`, register or memory: never accessed, SDM Vol.2
+/// NOP) after 66, CS/DS/ES/SS (ignored in 64-bit mode) and REX prefixes, and ENDBR64/ENDBR32 (`f3 0f 1e fa`/`fb`; the
+/// profile has no CET, so they execute as NOPs, SDM Vol.1 18.3.3), each at most 15 bytes. Anything else (LOCK, F2/F3,
+/// 0x67, FS/GS, PAUSE, `41 90` = XCHG R8, EAX, a ModRM.reg other than 0) is `None`. 64-bit mode only (REX bytes are REX:
+/// the resident runs no other mode, `Cpu::control`).
+pub(crate) fn nops(bytes: &[u8]) -> Option<u32> {
+    let (mut at, mut n) = (0, 0);
+    while at < bytes.len() {
+        let b = &bytes[at..];
+        let length = if b.starts_with(&[0xf3, 0x0f, 0x1e, 0xfa]) || b.starts_with(&[0xf3, 0x0f, 0x1e, 0xfb]) {
+            4
+        } else {
+            let mut k = b.iter().take_while(|&&p| p == 0x66).count();
+            if b.get(k) == Some(&0x90) {
+                k + 1
+            } else {
+                k += b[k..].iter().take_while(|&&p| matches!(p, 0x66 | 0x2e | 0x3e | 0x26 | 0x36)).count();
+                let rex = match b.get(k) {
+                    Some(&r @ 0x40..=0x4f) => {
+                        k += 1;
+                        r
+                    }
+                    _ => 0,
+                };
+                if b.get(k..k + 2)? != [0x0f, 0x1f] {
+                    return None;
+                }
+                k += 2;
+                if rm(b, &mut k, rex, &mut System { ..System::NONE })? != 0 {
+                    return None;
+                }
+                k
+            }
+        };
+        if length > 15 {
+            return None;
+        }
+        (at, n) = (at + length, n + 1);
+    }
+    Some(n)
+}
+
 /// Decodes the ModRM (with SIB and displacement) at `at` into `s`: a register r/m (`s.reg`, `s.memory` = 0) or a memory
 /// operand (`s.base`, `s.index`, `s.scale`, `s.disp`, `s.memory` = 1). Returns ModRM.reg (without REX.R).
 fn rm(bytes: &[u8], at: &mut usize, rex: u8, s: &mut System) -> Option<u32> {
@@ -804,6 +847,21 @@ fn rm(bytes: &[u8], at: &mut usize, rex: u8, s: &mut System) -> Option<u32> {
 mod tests {
     use super::*;
     use system::*;
+
+    /// Perf chunk 12: runs of no-operation instructions, counted; anything else refused.
+    #[test]
+    fn nop_runs() {
+        let h = |hex: &str| -> Vec<u8> { (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect() };
+        for (hex, n) in [("f30f1efa", 1), ("90909090909090", 7), ("6690", 1), ("0f1f00", 1), ("0f1f4000", 1), ("0f1f440000", 1),
+                         ("660f1f440000", 1), ("0f1f8000000000", 1), ("0f1f840000000000", 1), ("662e0f1f840000000000", 1),
+                         ("66662e0f1f840000000000", 1), ("480f1fc0", 1), ("f30f1efb900f1f00", 3), ("0f1f0525000000", 1)] {
+            assert_eq!(nops(&h(hex)), Some(n), "{hex}");
+        }
+        for hex in ["4190", "f390", "f00f1f00", "0f1f08", "670f1f00", "640f1f00", "f20f1f00", "0f1f", "0f1f44", "90cc", "f30f1efc",
+                    "6666666666666666666666662e0f1f840000000000", "0f18c0"] {
+            assert_eq!(nops(&h(hex)), None, "{hex}");
+        }
+    }
 
     /// R2 review: REX bytes among the prefixes, the last before the opcode in force (SDM Vol.2 2.2.1).
     #[test]

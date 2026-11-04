@@ -449,10 +449,43 @@ y_k2:
     wrmsr
 """
 USER = 'nop\nsyscall\n'
+# Perf chunk 12: a run of no-operation instructions before a system instruction (CLI) is kept as one NOP_RUN record. It runs
+# whole when n_fn is called plain; under TF each of its instructions traps after itself (the record is never a step: the
+# resident steps its first instruction alone); an instruction breakpoint inside the run (armed after the record was made:
+# the DR7 write drops this vCPU's code) faults there.
+NOPS = """    call n_fn
+    call n_fn
+""" + TF_ON + """    call n_fn
+n_r:
+""" + TF_OFF + """    lea rax, [rel n_c]
+    mov dr0, rax
+    mov eax, 1
+    mov dr7, rax
+    call n_fn
+    xor eax, eax
+    mov dr7, rax
+    call n_fn
+    jmp n_go
+n_fn:
+    nop
+n_b:
+    db 0x66, 0x90
+n_c:
+    db 0x0f, 0x1f, 0x00
+n_d:
+    db 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00
+n_e:
+    db 0xf3, 0x0f, 0x1e, 0xfa
+n_f:
+    cli
+n_g:
+    ret
+n_go:
+"""
 
 PROGRAMS = {'s4-step': (STEP, None, 0), 's4-popf-iret': (POPF_IRET, None, 0), 's4-movss': (MOVSS, None, 0), 's4-soft': (SOFT, None, 0),
             's4-faults': (FAULTS, None, 0), 's4-xbp': (XBP, None, 0), 's4-dr': (DR, None, 0), 's4-sticky': (STICKY, None, 1),
-            's4-sysret': (SYSRET, USER, 0)}
+            's4-sysret': (SYSRET, USER, 0), 's4-nops': (NOPS, None, 0)}
 
 
 def program(name):
@@ -555,6 +588,12 @@ def expect(prog):
     if name == 's4-sticky':
         return [db(L['k_n']), db(L['k_n2'])] + off(L['k_n2']) + [
                 (1, L['k_x'], 8, 0, DR6_FIXED | BS | 1), (1, L['k_after'], 8, 0, DR6_FIXED | BS | 1)]
+    if name == 's4-nops':
+        # under TF: CALL, each NOP-class instruction, CLI and RET trap after themselves; then the breakpoint at n_c (a fault,
+        # RF set by the handler)
+        b = lambda at, bits: (1, at, 8, 0, DR6_FIXED | bits)
+        steps = [db(L[k]) for k in ('n_fn', 'n_b', 'n_c', 'n_d', 'n_e', 'n_f', 'n_g', 'n_r')]
+        return steps + off(L['n_r']) + [b(L['n_c'], 1)]
     if name == 's4-sysret':
         return [db(u, cs=0x23), db(u + 1, cs=0x23), db(L['y_k1']), db(L['y_k1m'])] + off(L['y_k1m']) + [db(u, cs=0x23), db(u + 1, cs=0x23)]
     raise KeyError(name)

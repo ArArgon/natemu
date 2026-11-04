@@ -319,8 +319,11 @@ pub fn k1_stats(area: Area) -> String {
     let c: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
     const NAMES: [&str; 8] = ["UC", "WC", "2", "3", "WT", "WP", "WB", "UC-"];
     let types: Vec<String> = (0..8).filter(|&t| c.memory_types[t] != 0).map(|t| format!("\"{}\":{}", NAMES[t], c.memory_types[t])).collect();
+    // Perf chunk 12: system instructions by kind ([count, transaction us]) and by the resident bucket that reached them.
+    let kinds: Vec<String> = (0..128).filter(|&k| c.system_counts[k] != 0).map(|k| format!("\"{k:#x}\":[{},{}]", c.system_counts[k], ticks_ns(c.system_ticks[k]) / 1000)).collect();
+    let from: Vec<String> = (0..32).filter(|&b| c.system_from[b] != 0).map(|b| format!("\"{}\":{}", natemu_abi::execution::perf::NAMES.get(b).unwrap_or(&"?"), c.system_from[b])).collect();
     format!(
-        "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}}}}",
+        "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}},\"slot_writes\":{},\"systems\":{{\"kinds\":{{{}}},\"from\":{{{}}},\"chained\":{}}}}}",
         c.cr3_loads, c.global_flushes, c.invlpgs, c.revalidated, c.remapped, c.capacity_flushes, c.killed, c.unvalidated,
         ticks_ns(c.tlb_ticks) / 1000, ticks_ns(c.invlpg_ticks) / 1000, c.page_faults, ticks_ns(c.page_fault_ticks) / 1000, c.scanned,
         types.join(","),
@@ -342,7 +345,11 @@ pub fn k1_stats(area: Area) -> String {
         c.reclaimed,
         c.reuse_copies,
         c.reuse_refused,
-        c.reuse_checks
+        c.reuse_checks,
+        c.slot_writes,
+        kinds.join(","),
+        from.join(","),
+        c.system_chained
     )
 }
 /// Guest RAM was written by the host (only while every vCPU is stopped): each vCPU drops its cached code before it
@@ -1678,7 +1685,7 @@ fn translation(
     // S4: and before every armed instruction breakpoint, so each is the first instruction of a block (the resident checks
     // it there); one inside an instruction on this path is never reached and is passed over.
     let mut breakpoints: Vec<u64> = state.cpu.code_breakpoints().filter(|&b| b > rip).collect();
-    let (code, more, next_fault, cut, bytes_len) = loop {
+    let (code, more, next_fault, cut, bytes_len, nop_run) = loop {
         let limit = breakpoints.iter().copied().chain(hooks).min();
         let t = compiler.stamp();
         let fetched = fetched(area, state, limit)?;
@@ -1699,7 +1706,18 @@ fn translation(
             Code::None(reason) if reason == "partial_decode" && limit != hooks && limit == Some(rip + bytes.len() as u64) => {
                 breakpoints.retain(|&b| Some(b) != limit)
             }
-            _ => break (code, more, next_fault, cut, bytes.len()),
+            _ => {
+                // Perf chunk 12: a translate request whose block is only no-operation instructions before a system
+                // instruction is answered as their run ([`exec::system::NOP_RUN`]): the resident commits it and runs the
+                // system instruction in the same entry. The bytes are those fexc translated, and so is the count.
+                let nop_run = match &code {
+                    Code::Block(b) if !step && b.end_reason == natemu_abi::code_object::end_reason::SYSTEM_INSTRUCTION && b.guest_bytes <= exec::system::MAX_NOP_RUN => {
+                        bytes.get(..b.guest_bytes as usize).and_then(crate::system::nops).is_some_and(|n| n == b.guest_insns).then_some(b.guest_bytes)
+                    }
+                    _ => None,
+                };
+                break (code, more, next_fault, cut, bytes.len(), nop_run);
+            }
         }
     };
     let ran_out = match &code {
@@ -1709,6 +1727,11 @@ fn translation(
     };
     if more && ran_out {
         return Ok(Ok(exec::REPLY_NEXT_PAGE));
+    }
+    if let Some(length) = nop_run {
+        *requests.decodes.entry(exec::system::NOP_RUN).or_default() += 1;
+        state.system = exec::System { kind: exec::system::NOP_RUN, length, ..exec::System::NONE };
+        return Ok(Ok(exec::REPLY_SYSTEM));
     }
     let block = match code {
         Code::Block(block) => block,

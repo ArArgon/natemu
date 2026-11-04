@@ -153,13 +153,19 @@ pub mod cache {
     pub const SLOT_BYTES: usize = 0x10000;
     pub const SLOT_VA: u64 = CODE_VA + SLOT as u64;
     pub const SLOT_WRITE_VA: u64 = CODE_WRITE_VA + SLOT as u64;
-    /// The dispatcher, copied from the resident: computed exits branch here with the next RIP in x0 (each one's `b`
-    /// relocated at placement); it branches to the RIP's L1 entry ([`L1_CODE`]). Its `svc #MISS` at [`DISPATCH_MISS`]
-    /// enters the resident.
+    /// The dispatcher, copied from the resident: it branches to the RIP's L1 entry ([`L1_CODE`]) with the next RIP in x0.
+    /// Its `svc #MISS` at [`DISPATCH_MISS`] enters the resident. Perf chunk 12: copies of its first four words follow in
+    /// [`DISPATCH_SLOTS`] - 1 slots of [`DISPATCH_SLOT_BYTES`] (slot k at `DISPATCH + k * DISPATCH_SLOT_BYTES`, k >= 1), one
+    /// per code context seen since the last flush ([`Control::slot_contexts`]): a block's computed exit branches to its
+    /// context's slot (its `b` relocated at placement), whose `adr` names the L1 table holding that context, or which
+    /// starts with `b` to [`DISPATCH_MISS`] while no table does; a context without a slot exits to [`DISPATCH_MISS`]. So
+    /// a change of context rewrites no code: only giving a table to another context does (two slots).
     pub const DISPATCH: usize = SLOT + SLOT_BYTES;
     pub const DISPATCH_BYTES: usize = 0x1000;
     pub const DISPATCH_VA: u64 = CODE_VA + DISPATCH as u64;
     pub const DISPATCH_MISS: usize = DISPATCH + 16;
+    pub const DISPATCH_SLOT_BYTES: usize = 32;
+    pub const DISPATCH_SLOTS: usize = DISPATCH_BYTES / DISPATCH_SLOT_BYTES;
     /// L1 as code: [`L1_TABLES`] tables of direct-mapped entries of [`L1_ENTRY_BYTES`] indexed by `rip & L1_MASK` (FEX
     /// `L1Pointer/L1Mask`), so the dispatcher reads no data. A filled entry is `movz/movk x2, #rip` (4 words); `sub x2, x2,
     /// x0`; `cbnz x2, miss`; `b entry`; an empty one starts with `b miss`. Only the resident writes them. Each table holds
@@ -375,7 +381,27 @@ pub mod cache {
         pub reuse_copies: u64,
         pub reuse_refused: [u64; 5],
         pub reuse_checks: u64,
+        /// Perf chunk 12 (written by a `perf` resident only): system instructions executed, by kind
+        /// ([`super::System::kind`] modulo 128), with the CNTVCT ticks of their transactions; by the perf bucket current
+        /// when each began (the resident entry that reached it: `link`, `miss`, ...; modulo 32); and those that followed
+        /// another system instruction in the same block search (no block between them).
+        pub system_counts: [u64; 128],
+        pub system_ticks: [u64; 128],
+        pub system_from: [u64; 32],
+        pub system_chained: u64,
+        /// Perf chunk 12: [`PC_HINTS`] block numbers by native code word (code-area offset / 4, modulo), each the last
+        /// block `block_at` found holding that word: tried first, used only when its code still holds the word (block
+        /// code ranges never overlap, so a stale number, or one of a block placed since a reset, is then still right).
+        pub pc_hints: [u32; PC_HINTS],
+        /// Perf chunk 12: the code context each dispatcher slot serves ([`DISPATCH`]; [`NO_CONTEXT`]: free; slot 0 is the
+        /// dispatcher itself, never a context's), bound when a context first takes a table and freed only at a flush (no
+        /// block then exits to it); the slot of each L1 table's context (0: none, its blocks exit to the miss); and the
+        /// slot rewrites (a table given to another context: the old context's slot made to miss, the new one's to name it).
+        pub slot_contexts: [u64; DISPATCH_SLOTS],
+        pub l1_slots: [u64; L1_TABLES],
+        pub slot_writes: u64,
     }
+    pub const PC_HINTS: usize = 2048;
     /// [`Control::reuse`].
     pub const REUSE_OFF: u64 = 0;
     pub const REUSE_ON: u64 = 1;
@@ -1567,6 +1593,14 @@ pub mod system {
     /// (SDM Vol.2 A.1 "may behave as NOP on certain processors"; pinned QEMU agrees). Its ModRM is decoded for `length`;
     /// the memory operand is never accessed.
     pub const RESERVED_NOP: u32 = 0x78;
+    /// Perf chunk 12: a run of no-operation instructions that fexc translated as a block ending before a system instruction
+    /// (host `system::nops`: NOP `90`, `66 90`, NOP r/m `0f 1f /0` with 66, segment and REX prefixes, ENDBR64/ENDBR32
+    /// `f3 0f 1e fa`/`fb`, which the profile's CPU executes as NOPs: no CET), `length` its bytes (at most
+    /// [`MAX_NOP_RUN`]): committed as one transaction (RIP past them, RF ends), so the system instruction after it runs in
+    /// the same resident entry. Never run as a single-instruction step (the resident asks the host for one instruction
+    /// then); a translate request only.
+    pub const NOP_RUN: u32 = 0x79;
+    pub const MAX_NOP_RUN: u32 = 4096;
     /// [`super::System::prefixes`] bits. I10: [`ADDRESS32`] on any memory operand (0x67): the effective address is truncated
     /// to 32 bits and zero-extended before the FS/GS base.
     pub const REP: u32 = 1;
@@ -1584,7 +1618,7 @@ pub mod system {
                 && (self.base != RIP || self.index == NO_REG)
                 && matches!(self.segment as usize, 0 | super::SREG_FS | super::SREG_GS);
             let rm = if self.memory == 1 { address } else { self.memory == 0 && reg(self.reg) && self.segment == 0 };
-            (1..=15).contains(&self.length)
+            ((1..=15).contains(&self.length) || (self.kind == NOP_RUN && (1..=MAX_NOP_RUN).contains(&self.length)))
                 && self.lock <= 1
                 && (self.prefixes == 0 || matches!(self.kind, INS | OUTS) || (self.memory == 1 && self.prefixes == ADDRESS32))
                 && match self.kind {
@@ -1608,6 +1642,7 @@ pub mod system {
                     SYSEXIT => matches!(self.size, 4 | 8),
                     BRANCH => self.cr <= 21 && matches!(self.size, 4 | 8),
                     RESERVED_NOP => true,
+                    NOP_RUN => self.lock == 0,
                     PUSH_SREG | POP_SREG => matches!(self.cr as usize, super::SREG_FS | super::SREG_GS) && matches!(self.size, 2 | 8),
                     SYSRET => matches!(self.size, 4 | 8),
                     RDFSBASE..=WRGSBASE => self.memory == 0 && reg(self.reg) && self.segment == 0 && matches!(self.size, 4 | 8),

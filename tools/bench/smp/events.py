@@ -327,6 +327,28 @@ SIGNAL 0x40
     'ev-movss-ret': dict(body=ROUNDS.format(xfer="    lea rax, [rel target]\n    push rax\n    mov dx, ss\n    sti\n    mov ss, dx\nafter_movss:\n    ret"),
                          events=[(0x40, 'intr', {}, [('other', None), ('other', None), ('other', None), ('sti', None), ('mov_ss', 'after_movss'),
                                                      ('other', 'target')])] * 3),
+    # Perf chunk 12: STI with an interrupt pending, then a run of no-operation instructions before CLI (kept as one NOP_RUN
+    # record from round 0, which signals nothing): the STI shadow covers the first NOP alone, so the interrupt is taken
+    # after it, not after the run (the record is never run as a step).
+    'ev-sti-nops': dict(body="""    xor r9d, r9d
+again:
+    cli
+    mov r12, r9
+    test r9, r9
+    jz quiet
+SIGNAL 0x40
+quiet:
+    sti
+    nop
+after_nop1:
+    db 0x66, 0x90
+    db 0x0f, 0x1f, 0x44, 0x00, 0x00
+    db 0xf3, 0x0f, 0x1e, 0xfa
+    cli
+    inc r9
+    cmp r9, 3
+    jb again
+    cli""", events=[(0x40, 'intr', {}, [('sti', None), ('other', 'after_nop1')])] * 2),
 }
 
 

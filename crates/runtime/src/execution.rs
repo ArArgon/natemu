@@ -103,10 +103,11 @@ pub unsafe fn start() -> ! {
     if dispatcher().len() + cache::DISPATCH != cache::DISPATCH_MISS + 4 {
         halt(&s, stop::UNSUPPORTED_MODE)
     }
-    cache::reset();
+    // The head first: the reset then binds the current table's context to a dispatcher slot (perf chunk 12).
     if !cache::fill_head(dispatcher()) {
         halt(&s, stop::UNSUPPORTED_MODE)
     }
+    cache::reset();
     lapic::init();
     // The GIC CPU interface: system registers on, every priority unmasked, group 1 (the doorbells) enabled.
     unsafe {
@@ -141,6 +142,8 @@ unsafe fn dispatch(s: &mut State) -> ! {
 /// may be for a later RIP than the one asked for).
 unsafe fn find(s: &mut State) -> Option<&'static Block> {
     let mut flushed = false;
+    #[cfg(feature = "perf")]
+    let mut chained = false;
     loop {
         take_invalidations(s);
         // X3: the LAPIC timer's expiries due by now (its virtual-timer doorbell only stopped the vCPU).
@@ -187,6 +190,11 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
             // K2: a system instruction's decode, kept when it was translated: executed with no host exit.
             Some(b) if b.flags & cache::SYSTEM != 0 => {
                 s.l2_hits += 1;
+                #[cfg(feature = "perf")]
+                {
+                    cache::control().system_chained += chained as u64;
+                    chained = true;
+                }
                 match unsafe { executed(s, cache::system_of(b)) } {
                     Some(block) => return Some(block),
                     None => continue,
@@ -385,7 +393,8 @@ fn kept_system(s: &mut State) -> Option<System> {
     if s.plain_step != 0 {
         return None;
     }
-    Some(cache::system_of(b))
+    // Perf chunk 12: a run of no-operation instructions is several instructions: a step runs the first alone (the host's).
+    Some(cache::system_of(b)).filter(|i| i.kind != system::NOP_RUN)
 }
 
 /// The instruction at `s.cpu.rip` alone, placed in the step slot (X2: after a shadow-setting instruction with an event
@@ -668,9 +677,9 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
             let code = |k: u64| unsafe { ((natemu_abi::execution::cache::CODE_WRITE_VA + u64::from(copy.code) + 4 * k) as *const u32).read_volatile() };
             let staged = |k: u64| staged_word(&h, 4 * k);
             let sites = cache::sites(copy);
-            // The computed exit's word is `b` to the dispatcher from the copy's place.
+            // The computed exit's word is `b` to its context's dispatcher slot from the copy's place (perf chunk 12).
             let at = u64::from(copy.code) + u64::from(copy.dispatch_exit);
-            let dispatch = copy.dispatch_exit == 0 || code(u64::from(copy.dispatch_exit) / 4) == 0x1400_0000 | ((cache::DISPATCH as u64).wrapping_sub(at) >> 2) as u32 & 0x03ff_ffff;
+            let dispatch = copy.dispatch_exit == 0 || code(u64::from(copy.dispatch_exit) / 4) == 0x1400_0000 | (cache::dispatcher_for(copy.context).wrapping_sub(at) >> 2) as u32 & 0x03ff_ffff;
             // The template's relocations it carries are the host's answer's (each packable one of the staged table is among
             // them, as many), and the host found its answer a template too.
             let reloc = |i: u32| unsafe { ((STAGING_VA + u64::from(h.relocs_offset)) as *const object::Reloc).add(i as usize).read_unaligned() };
@@ -1240,10 +1249,27 @@ fn system(s: &mut State, i: System) {
     if i.kind != system::BT_ALIGNED {
         (s.cpu.mov_ss, s.sti_shadow, s.mid_string) = (0, 0, 0);
     }
+    #[cfg(feature = "perf")]
+    let t0 = perf_ticks();
     if let Err(e) = transaction(s, i) {
         deliver(s, Event::Exception(e))
     }
+    #[cfg(feature = "perf")]
+    {
+        let c = cache::control();
+        let k = (i.kind & 127) as usize;
+        c.system_counts[k] += 1;
+        c.system_ticks[k] += perf_ticks().wrapping_sub(t0);
+        c.system_from[(p & 31) as usize] += 1;
+    }
     crate::perf::leave(p);
+}
+/// CNTVCT without a barrier (accounting only).
+#[cfg(feature = "perf")]
+fn perf_ticks() -> u64 {
+    let t: u64;
+    unsafe { asm!("mrs {}, cntvct_el0", out(reg) t, options(nomem, nostack)) };
+    t
 }
 /// [`system`]'s checks and effect: `Err` with the exception due at the instruction.
 fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
@@ -1254,7 +1280,6 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         set_cpl(s, u64::from(i.cr));
         return Ok(commit(s, i, false));
     }
-    let c = s.cpu;
     let unsupported = |s: &State| -> ! { halt(s, stop::UNSUPPORTED_SYSTEM) };
     let moves = matches!(i.kind, system::MOV_TO_CR | system::MOV_FROM_CR);
     let debug = matches!(i.kind, system::MOV_TO_DR | system::MOV_FROM_DR);
@@ -1283,6 +1308,8 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         system::INTO | system::UD => return Err(UD),
         // X1c: a Reserved-NOP cell: completes, nothing accessed (LOCK was #UD above).
         system::RESERVED_NOP => return Ok(commit(s, i, false)),
+        // Perf chunk 12: no-operation instructions before a system instruction, completed at once (`find` goes on at it).
+        system::NOP_RUN => return Ok(commit(s, i, false)),
         system::TOO_LONG => return Err(GP),
         // X1c: a direct branch to a non-canonical target (host `system::branch`): #GP(0) when taken, with nothing changed
         // (a fault, SDM Vol.3 7.5: LOOP's count is not decremented; CALL checks before its push); not taken, it completes
@@ -1367,9 +1394,11 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         // L3: port I/O ([`ports`]): each checks its own privilege (IOPL, the TSS I/O bitmap) and commits itself (a REP
         // INS/OUTS stays at the instruction between elements).
         system::IN..=system::OUTS => return ports::transaction(s, i),
-        // S3: each checks its own privilege ([`syscalls`]); SYSCALL/SYSRET commit to their target RIP.
+        // S3: each checks its own privilege ([`syscalls`]); SYSCALL/SYSRET commit to their target RIP. Perf chunk 12: each
+        // makes every check before its first write, so an exception leaves the bank as it was, but LAR..VERW, which
+        // `segments::inspect` may fail after a write: only they keep a copy of the bank to restore.
         system::SWAPGS..=system::CLFLUSH | system::SYSENTER | system::SYSEXIT => {
-            let c = s.cpu;
+            let saved = matches!(i.kind, system::LAR..=system::VERW).then_some(s.cpu);
             return match syscalls::execute(s, i) {
                 Ok(None) => Ok(commit(s, i, false)),
                 Ok(Some(rip)) => {
@@ -1377,13 +1406,30 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                     Ok(commit(s, System { length: 0, ..i }, false))
                 }
                 Err(e) => {
-                    s.cpu = c;
+                    if let Some(c) = saved {
+                        s.cpu = c;
+                    }
                     Err(e)
                 }
             };
         }
+        // Perf chunk 12: before the bank's copy below (none needed: nothing is written before the check). CR4.TSD makes
+        // them #GP at CPL > 0 (SDM Vol.2 RDTSC, RDTSCP).
+        system::RDTSC | system::RDTSCP => {
+            if s.cpu.cpl != 0 && s.cpu.cr4 & CR4_TSD != 0 {
+                return Err(GP);
+            }
+            let t = tsc();
+            (s.cpu.gpr[0], s.cpu.gpr[2]) = (t & 0xffff_ffff, t >> 32);
+            if i.kind == system::RDTSCP {
+                s.cpu.gpr[1] = msr_get(cpu::msr(cpu::MSR_TSC_AUX).unwrap()) & 0xffff_ffff;
+            }
+            return Ok(commit(s, i, false));
+        }
         _ => {}
     }
+    // The bank before the instruction (the checks below compare against it; the segment forms restore it on a fault).
+    let c = s.cpu;
     // CPUID runs at any CPL; RDTSC/RDTSCP at CPL > 0 unless CR4.TSD, RDPMC with CR4.PCE; SGDT/SIDT/SLDT/STR (CR4.UMIP is
     // not in the profile), segment register moves and far transfers at any CPL; the rest at CPL 0 only.
     let unprivileged = match i.kind {
@@ -1391,7 +1437,6 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         system::SGDT | system::SIDT | system::SLDT | system::STR => true,
         system::MOV_TO_SREG | system::MOV_FROM_SREG | system::JMP_FAR | system::CALL_FAR | system::RET_FAR | system::IRET => true,
         system::PUSH_SREG | system::POP_SREG => true,
-        system::RDTSC | system::RDTSCP => c.cr4 & CR4_TSD == 0,
         system::RDPMC => c.cr4 & CR4_PCE != 0,
         _ => false,
     };
@@ -1555,14 +1600,6 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             [0, 3, 1, 2].into_iter().zip([eax, ebx, ecx, edx]).for_each(|(r, v)| s.cpu.gpr[r] = u64::from(v));
             if gpr(0) as u32 == 1 {
                 msr_set(slot(cpu::MSR_UCODE_REV), 0); // CPUID.1 reloads the latch with virtual revision 0 (CPU 17)
-            }
-            false
-        }
-        system::RDTSC | system::RDTSCP => {
-            let t = tsc();
-            (s.cpu.gpr[0], s.cpu.gpr[2]) = (t & 0xffff_ffff, t >> 32);
-            if i.kind == system::RDTSCP {
-                s.cpu.gpr[1] = msr_get(slot(cpu::MSR_TSC_AUX)) & 0xffff_ffff;
             }
             false
         }
