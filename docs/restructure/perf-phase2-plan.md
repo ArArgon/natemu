@@ -52,7 +52,12 @@ Then, as the numbers dictate:
    (removes the pipe, gives up process isolation; admission stays), an in-VM random-number generator or the Arm RNDR if the
    VM sees it (owner: after batch 1), a cheaper disk-cache key (fast hash plus stored request bytes), huge pages for the code
    area.
-8. **Generated-code quality** (guest code ~2.3 s on the installer at batch-1 start): larger FEX compile regions, careful
+8. **More benchmarks** (owner, November 4: use existing implementations, not our own; timing is the orchestrator's call):
+   a run-time code generator (e.g. LuaJIT with its benchmarks), heavy memory use (e.g. stress-ng or will-it-scale's
+   page-fault, mmap and fork cases), floating-point/vector compute (e.g. c-ray or SciMark). Each test-run on the AMD machine
+   and timed against QEMU like the existing ones; added before generated-code quality, which needs them. Per-change checks
+   stay on a small subset; the full set runs at batch end.
+9. **Generated-code quality** (guest code ~2.3 s on the installer at batch-1 start): larger FEX compile regions, careful
    relaxation of precision rules where nothing observes the difference. Last, and only if steady-state benchmarks point here.
 
 Not in this phase: virtio devices and interrupt coalescing (integration); the correctness pass (after performance).
