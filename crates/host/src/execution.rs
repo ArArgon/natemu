@@ -320,7 +320,7 @@ pub fn k1_stats(area: Area) -> String {
     const NAMES: [&str; 8] = ["UC", "WC", "2", "3", "WT", "WP", "WB", "UC-"];
     let types: Vec<String> = (0..8).filter(|&t| c.memory_types[t] != 0).map(|t| format!("\"{}\":{}", NAMES[t], c.memory_types[t])).collect();
     format!(
-        "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}]}}",
+        "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}}}}",
         c.cr3_loads, c.global_flushes, c.invlpgs, c.revalidated, c.remapped, c.capacity_flushes, c.killed, c.unvalidated,
         ticks_ns(c.tlb_ticks) / 1000, ticks_ns(c.invlpg_ticks) / 1000, c.page_faults, ticks_ns(c.page_fault_ticks) / 1000, c.scanned,
         types.join(","),
@@ -339,7 +339,10 @@ pub fn k1_stats(area: Area) -> String {
         cache::META_BYTES,
         cache::MAX_BLOCKS,
         c.reclaims,
-        c.reclaimed
+        c.reclaimed,
+        c.reuse_copies,
+        c.reuse_refused,
+        c.reuse_checks
     )
 }
 /// Guest RAM was written by the host (only while every vCPU is stopped): each vCPU drops its cached code before it
@@ -890,6 +893,10 @@ pub struct Compiler {
     pub(crate) x87: Vec<String>,
     /// The performance log's record of this vCPU (`perf::on`; [`Compiler::finish`]).
     pub perf: Option<Box<crate::perf::Recorder>>,
+    /// The last compile's answer: how many guest bytes it read (fexc's extent, at most the bytes given), and whether a
+    /// halving retry made it ([`Compiler::compile`]); the template rule of reuse inside the resident (perf chunk 10).
+    read: usize,
+    halved: bool,
 }
 /// fexc's x87 arguments for `cpu` (I6; SDM Vol.3 Table 2-2): every x87 form #NM under CR0.EM or CR0.TS, WAIT/FWAIT under CR0.TS
 /// with CR0.MP; x87 arithmetic under its own FPCR when FCW.RC or MXCSR's flush-to-zero/DAZ differ ([`exec::x87_fpcr`]); and
@@ -953,7 +960,7 @@ impl Compiler {
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
         Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: Cache::default(), old: Cache::default(), cached: 0, cached_bytes: 0, disk: None, compiles: 0, hits: 0, disk_hits: 0,
                relocated: 0, relocation_refused: 0, relocation_fallbacks: 0, reuse_checks: 0, check_reuse: false,
-               deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![], perf: None }
+               deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![], perf: None, read: 0, halved: false }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
     /// `rip` the resident executes, or fexc's end reason when it produced no code.
@@ -962,6 +969,7 @@ impl Compiler {
         // is translated again from the same RIP with half its instructions, until it fits; one instruction too large for a
         // block stops `code_too_large`. R2 review: the same for a block with a spill area (`spill_area`).
         let mut limit = if step { Some(1) } else { self.max_instructions };
+        self.halved = false;
         loop {
             match self.compile_once(bytes, rip, limit, hook)? {
                 Ok(code) => return Ok(code),
@@ -969,6 +977,7 @@ impl Compiler {
                 // answered with more instructions than asked (the loop always ends).
                 Err((n, _)) if limit.map_or(n, |l| n.min(l)) > 1 => {
                     limit = Some(limit.map_or(n, |l| n.min(l)) / 2);
+                    self.halved = true;
                     if let Some(r) = &mut self.perf {
                         r.halved = true;
                     }
@@ -998,6 +1007,7 @@ impl Compiler {
         if let Some((key, i)) = found {
             if let Some(code) = self.reuse(key, i, bytes, rip, limit, hook)? {
                 self.hits += 1;
+                self.read = self.cache[&key][i].prefix.len();
                 if let Some(r) = &mut self.perf {
                     let prefix = &self.cache[&key][i].prefix;
                     r.sources[0] += 1;
@@ -1016,6 +1026,7 @@ impl Compiler {
             let (read, prefix) = (reply.read, bytes[..end].to_vec());
             let entry = Entry { rip: at, read, gating, prefix, whole, answer: Answer::new(reply, at)? };
             let (key, i) = self.insert(limit, entry);
+            self.read = end;
             self.charge(crate::perf::KEEP, t);
             if let Some(r) = &mut self.perf {
                 let prefix = &self.cache[&key][i].prefix;
@@ -1288,6 +1299,8 @@ struct Fetched {
     more: bool,
     /// The fetch fault of the next page, when its walk failed (the block is cut before it).
     next_fault: Option<Fault>,
+    /// The limit cut them (before the end of a page fetched).
+    cut: bool,
 }
 /// The bytes at `state.cpu.rip` up to the end of its page, continuing through the next page when the resident walked
 /// it, never past `limit` (when it lies ahead); or the vCPU's stop, when the walk of RIP's page failed.
@@ -1318,15 +1331,17 @@ fn fetched(area: Area, state: &State, limit: Option<u64>) -> Result<std::result:
         true => Ok(()),
         false => Err(format!("code at {rip:#x} is outside guest RAM")),
     };
-    let (length, cut) = span(rip);
+    let (length, mut cut) = span(rip);
     copy(state.fetch[0] | rip & 4095, length)?;
     // The last page of the address space has no next page.
     let next = rip.checked_add(length).filter(|_| !cut);
     if let (Some(va), true) = (next, state.fetch[1] != u64::MAX) {
-        copy(state.fetch[1], span(va).0)?;
+        let (length, second) = span(va);
+        copy(state.fetch[1], length)?;
+        cut = second;
     }
     let walked = state.fetch[1] != u64::MAX || state.fetch_fault[0] != exec::fetch::NONE;
-    Ok(Ok(Fetched { bytes, more: next.is_some() && !walked, next_fault: fault }))
+    Ok(Ok(Fetched { bytes, more: next.is_some() && !walked, next_fault: fault, cut }))
 }
 /// Appends guest RAM's `length` bytes at `gpa` to `out` (false: not all RAM), as `GuestRam::copy_out` reads them (volatile
 /// loads: other vCPUs may write them) but eight at a time where aligned (perf chunk 7: its byte loop and the zeroed buffer
@@ -1380,6 +1395,11 @@ pub trait Hook {
     fn boundary(&self, _rip: u64) -> Option<u64> {
         None
     }
+    /// Every RIP [`Hook::at`] may answer and every [`Hook::boundary`] (perf chunk 10: the resident copies no block whose
+    /// fetch would reach one, so each is still the host's to answer or cut at).
+    fn fences(&self) -> Vec<std::ops::Range<u64>> {
+        Vec::new()
+    }
     /// Each admitted object, before it is staged.
     #[cfg(feature = "testing")]
     fn admitted(&mut self, _object: &mut [u8]) {}
@@ -1428,6 +1448,17 @@ pub fn run(
     let mut state: State = area.read_record(exec::STATE_OFFSET);
     state.stop_at = stop_at.unwrap_or(u64::MAX);
     area.write_record(exec::STATE_OFFSET, state);
+    // Perf chunk 10: reuse inside the resident, checked against the host's answers under the reuse check, and never into
+    // a range the hook answers at (off when there are more of them than the resident keeps).
+    let mut fences = [[0u64; 2]; 4];
+    let ranges = hook.fences();
+    for (f, r) in fences.iter_mut().zip(&ranges) {
+        *f = [r.start, r.end];
+    }
+    let mode = if ranges.len() > fences.len() { cache::REUSE_OFF } else if compiler.check_reuse { cache::REUSE_CHECK } else { cache::REUSE_ON };
+    let control = cache::LOOKUP_OFFSET + cache::CONTROL;
+    area.write_record(control + std::mem::offset_of!(cache::Control, reuse), mode);
+    area.write_record(control + std::mem::offset_of!(cache::Control, reuse_fences), fences);
     // When the vCPU last entered the guest (`perf::now`), 0 while it is in the host: two stores per exit, which the watchdog
     // samples (perf chunk 7; a channel send at each entry and exit woke it twice per exit). Dropping `done` ends it.
     let entered = &AtomicU64::new(0);
@@ -1646,12 +1677,12 @@ fn translation(
     // S4: and before every armed instruction breakpoint, so each is the first instruction of a block (the resident checks
     // it there); one inside an instruction on this path is never reached and is passed over.
     let mut breakpoints: Vec<u64> = state.cpu.code_breakpoints().filter(|&b| b > rip).collect();
-    let (code, more, next_fault, cut_at, bytes_len) = loop {
+    let (code, more, next_fault, cut, bytes_len) = loop {
         let limit = breakpoints.iter().copied().chain(hooks).min();
         let t = compiler.stamp();
         let fetched = fetched(area, state, limit)?;
         compiler.charge(crate::perf::FETCH, t);
-        let Fetched { bytes, more, next_fault } = match fetched {
+        let Fetched { bytes, more, next_fault, cut } = match fetched {
             Ok(fetched) => fetched,
             // RIP's page faults: the resident delivers it (`state.fetch_fault`); nothing is compiled.
             Err(Stop::FetchFault(Fault::Page { .. } | Fault::Noncanonical)) => return Ok(Ok(exec::REPLY_FETCH_FAULT)),
@@ -1667,7 +1698,7 @@ fn translation(
             Code::None(reason) if reason == "partial_decode" && limit != hooks && limit == Some(rip + bytes.len() as u64) => {
                 breakpoints.retain(|&b| Some(b) != limit)
             }
-            _ => break (code, more, next_fault, limit, bytes.len()),
+            _ => break (code, more, next_fault, cut, bytes.len()),
         }
     };
     let ran_out = match &code {
@@ -1699,12 +1730,16 @@ fn translation(
     if step && (block.guest_insns != 1 || block.guest_bytes > 15) {
         return Err(format!("step at {rip:#x}: {} instructions, {} bytes", block.guest_insns, block.guest_bytes));
     }
+    // Perf chunk 10, a template for reuse inside the resident (chunk 6's count): fexc's answer here is its answer for the
+    // same bytes at any RIP of this half and page offset (the relocation proof) when it depended only on bytes of the
+    // block's own pages before their end (so the frames say which), no limit cut them and no halving retry made it.
+    let last = rip.wrapping_add(u64::from(block.guest_bytes).max(1) - 1) >> 12;
+    let template = !step && !cut && !compiler.halved && block.end_reason != natemu_abi::code_object::end_reason::UNSUPPORTED_FORM
+        && compiler.read < bytes_len && rip.wrapping_add(compiler.read.max(1) as u64 - 1) >> 12 <= last;
     if let Some(r) = &mut compiler.perf {
-        // Perf chunk 6, the in-VM reuse count: what the answer read stays inside the block's pages, short of its bytes' end.
-        let (read, last) = (u64::from(r.read.1), rip.wrapping_add(u64::from(block.guest_bytes).max(1) - 1) >> 12);
-        r.template = !step && cut_at.is_none() && !r.halved && block.end_reason != natemu_abi::code_object::end_reason::UNSUPPORTED_FORM
-            && (r.read.1 as usize) < bytes_len && rip.wrapping_add(read.max(1) - 1) >> 12 <= last;
+        r.template = template;
     }
+    state.relocatable = u64::from(template);
     let t = compiler.stamp();
     area.copy(exec::STAGING_OFFSET, &block.object);
     state.system = exec::System::NONE;

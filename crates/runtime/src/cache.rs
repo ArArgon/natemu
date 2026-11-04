@@ -13,14 +13,15 @@
 //! the interrupted block by patching its exits to [`STOP_WORD`] ([`arm`], [`disarm`]). Blocks and L1 are this
 //! vCPU's own (its code area is backed by its own memory), so a patch stops no other vCPU.
 use super::*;
-use natemu_abi::code_object::{Header, Site};
+use natemu_abi::code_object::{Header, Reloc, Site};
 use core::mem::align_of;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use natemu_abi::execution::{
     ENTRY_OFFSET, KICK_SGI, LinkPoint, MAX_LINK_POINTS, STATE_VA, STOP_WORD, State, System,
     cache::{self as area, Control, LinkRecord, Record, SLOT, SLOT_BYTES, SLOT_VA, SLOT_WRITE_VA},
 };
-pub use natemu_abi::execution::cache::{Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL, HEAD_BYTES, INBOUND, LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, SHADOWS, STEP, SYSTEM};
+pub use natemu_abi::execution::cache::{Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL, HEAD_BYTES, INBOUND, LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, RELOCATABLE, REUSE_CHECK, REUSE_OFF, SHADOWS, STEP, SYSTEM};
+use natemu_abi::execution::cache::{MAX_RELOCS, RELOCS_SHIFT};
 /// L1's code (the dispatcher's head ends there).
 pub const L1_VA: u64 = CODE_VA + area::L1_CODE as u64;
 
@@ -49,6 +50,13 @@ pub fn sites(b: &Block) -> &'static [Site] {
     unsafe { core::slice::from_raw_parts(at, b.sites_count as usize) }
 }
 const _: () = assert!(size_of::<Block>() % align_of::<Site>() == 0);
+/// A [`RELOCATABLE`] block's packed guest-RIP relocations (perf chunk 10; they follow its sites).
+pub fn relocs(b: &Block) -> &'static [u32] {
+    let at = sites(b).as_ptr_range().end.cast::<u32>();
+    let n = if b.flags & RELOCATABLE != 0 { b.flags >> RELOCS_SHIFT & MAX_RELOCS } else { 0 };
+    unsafe { core::slice::from_raw_parts(at, n as usize) }
+}
+const _: () = assert!(size_of::<Site>() % 4 == 0);
 
 fn lookup_area<T>(offset: usize) -> *mut T {
     (area::LOOKUP_VA + offset as u64) as *mut T
@@ -412,8 +420,17 @@ pub fn place(
     links: [LinkPoint; MAX_LINK_POINTS],
     dispatch_exit: u64,
     rep_exits: u64,
+    relocatable: bool,
 ) -> Option<&'static Block> {
     let c = control();
+    // Perf chunk 10: a template keeps its guest-RIP relocations (packed after its sites); one that cannot be packed is none.
+    let reloc = |i: u32| unsafe { object.add(h.relocs_offset as usize + i as usize * size_of::<Reloc>()).cast::<Reloc>().read_unaligned() };
+    let packed = || (0..h.relocs_count).filter_map(move |i| natemu_abi::execution::pack_reloc(&reloc(i), h.code_size)?);
+    let relocatable = relocatable
+        && c.reuse != REUSE_OFF
+        && h.relocs_count <= MAX_RELOCS
+        && (0..h.relocs_count).all(|i| natemu_abi::execution::pack_reloc(&reloc(i), h.code_size).is_some());
+    let count = if relocatable { packed().count() as u32 } else { 0 };
     let code = c.code_used.next_multiple_of(CODE_ALIGN);
     let code_end = code + u64::from(h.code_size);
     if code_end > c.code_bytes {
@@ -432,7 +449,7 @@ pub fn place(
         sites_count: h.sites_count,
         guest_bytes: h.guest_bytes,
         number: 0,
-        flags: walked & (GLOBAL | LARGE),
+        flags: walked & (GLOBAL | LARGE) | if relocatable { RELOCATABLE | count << RELOCS_SHIFT } else { 0 },
         dispatch_exit: dispatch_exit as u32,
         rep_exits: rep_exits as u32,
         links,
@@ -442,10 +459,77 @@ pub fn place(
         copy_record((area::CODE_WRITE_VA + code) as *mut u8, object.add(h.code_offset as usize), h.code_size as usize);
         relocate(code, dispatch_exit, area::DISPATCH);
         synchronize_code(area::CODE_WRITE_VA + code, area::CODE_VA + code, h.code_size as usize);
-        let placed = file(record, object.add(h.sites_offset as usize), size_of::<Site>() * h.sites_count as usize)?;
+        let placed = file(record, object.add(h.sites_offset as usize), size_of::<Site>() * h.sites_count as usize, 4 * count as usize)?;
+        // In increasing order (insertion sort: at most 255; fexc lists them in emission order already).
+        let table = sites(placed).as_ptr_range().end.cast::<u32>().cast_mut();
+        for (i, r) in packed().take(count as usize).enumerate() {
+            let mut j = i;
+            while j > 0 && table.add(j - 1).read() > r {
+                table.add(j).write(table.add(j - 1).read());
+                j -= 1;
+            }
+            table.add(j).write(r);
+        }
         c.code_used = code_end;
         Some(placed)
     }
+}
+/// Perf chunk 10: the template the hint table holds for guest-physical page `gpa` (its frame), `rip`'s half and page
+/// offset and `context`, if its record still says so: live, [`RELOCATABLE`] (never a step or system record), from that
+/// frame at that offset and half, in that context. Any such block is a template, whichever hint led to it.
+pub fn template(rip: u64, gpa: u64, context: u64) -> Option<&'static Block> {
+    let n = unsafe { hint(gpa, rip, context).read() }.checked_sub(1)? as usize;
+    if n >= control().blocks as usize {
+        return None;
+    }
+    let b = block(n);
+    let fits = b.flags & (DEAD | SYSTEM | STEP | RELOCATABLE) == RELOCATABLE && b.source_gpa[0] == gpa && b.context == context;
+    (fits && (b.rip ^ rip) & (1 << 63 | 0xfff) == 0).then_some(b)
+}
+/// The hint table's entry for (`gpa`'s frame, `rip`'s half and page offset, `context`).
+fn hint(gpa: u64, rip: u64, context: u64) -> *mut u32 {
+    let key = (gpa & !0xfff | rip & 0xfff) ^ (rip >> 63) << 62 ^ context.rotate_left(29);
+    let i = (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - area::HINT_ENTRIES.trailing_zeros())) as usize;
+    lookup_area::<u32>(area::HINTS).wrapping_add(i)
+}
+/// Perf chunk 10: places a copy of template `b` for `rip` (same half and page offset; `source_gpa` its frames now, the
+/// first `b`'s, the second checked by the caller; `walked` as for [`place`]), its code rewritten for `rip` by the shared
+/// re-check ([`natemu_abi::execution::relocate_code`]) above the fill point, then filed as an ordinary block (with `b`'s
+/// sites and relocations). `Ok(None)` when full (as [`place`]); `Err(kind)`: the re-check refused (nothing filed).
+pub fn copy(b: &Block, rip: u64, source_gpa: [u64; 2], walked: u32) -> Result<Option<&'static Block>, usize> {
+    let c = control();
+    let code = c.code_used.next_multiple_of(CODE_ALIGN);
+    let code_end = code + u64::from(b.code_size);
+    if code_end > c.code_bytes {
+        c.full[0] += 1;
+        return Ok(None);
+    }
+    let mut links = b.links;
+    unsafe {
+        copy_record((area::CODE_WRITE_VA + code) as *mut u8, (area::CODE_WRITE_VA + u64::from(b.code)) as *const u8, b.code_size as usize);
+        let at = core::slice::from_raw_parts_mut((area::CODE_WRITE_VA + code) as *mut u8, b.code_size as usize);
+        natemu_abi::execution::relocate_code(at, relocs(b), &mut links, b.rip, rip, b.guest_bytes)?;
+        relocate(code, u64::from(b.dispatch_exit), area::DISPATCH);
+        synchronize_code(area::CODE_WRITE_VA + code, area::CODE_VA + code, b.code_size as usize);
+    }
+    let record = Block {
+        rip,
+        checked: c.epoch,
+        source_gpa,
+        next: [0; 2],
+        lnext: [0; 2],
+        code: code as u32,
+        number: 0,
+        flags: walked & (GLOBAL | LARGE) | b.flags & (RELOCATABLE | MAX_RELOCS << RELOCS_SHIFT),
+        links,
+        ..*b
+    };
+    let tail = size_of::<Site>() * b.sites_count as usize + 4 * relocs(b).len();
+    let placed = unsafe { file(record, sites(b).as_ptr().cast(), tail, 0) };
+    if placed.is_some() {
+        c.code_used = code_end;
+    }
+    Ok(placed)
 }
 /// K2: enters the host's decode `i` of the system instruction at `rip` (`guest_bytes` long, from `source_gpa`; `walked` as
 /// for [`place`]) in the cache for `context` as a [`SYSTEM`] record (no code); `None` when the metadata arena or the
@@ -455,19 +539,20 @@ pub fn place_system(rip: u64, context: u64, source_gpa: [u64; 2], walked: u32, g
     let code = control().code_used as u32;
     let links = [LinkPoint::NONE; MAX_LINK_POINTS];
     let record = Block { rip, context, checked: control().epoch, source_gpa, next: [0; 2], lnext: [0; 2], code, code_size: 0, sites_count: 0, guest_bytes, number: 0, flags: SYSTEM | walked & (GLOBAL | LARGE), dispatch_exit: 0, rep_exits: 0, links };
-    unsafe { file(record, (i as *const System).cast(), size_of::<System>()) }
+    unsafe { file(record, (i as *const System).cast(), size_of::<System>(), 0) }
 }
 /// The decode a [`SYSTEM`] record holds.
 pub fn system_of(b: &Block) -> System {
     unsafe { (b as *const Block).add(1).cast::<System>().read() }
 }
 const _: () = assert!(size_of::<Block>() % align_of::<System>() == 0);
-/// Files `record` (its number assigned here) with `tail_bytes` from `tail` after it (sites, or a decode) in the metadata
-/// arena, the block index and L2; `None` when either is full.
-unsafe fn file(record: Block, tail: *const u8, tail_bytes: usize) -> Option<&'static Block> {
+/// Files `record` (its number assigned here) with `tail_bytes` from `tail` after it (sites, or a decode) and `extra` bytes
+/// the caller writes after them (a template's relocations) in the metadata arena, the block index and L2 (and, when
+/// [`RELOCATABLE`], the hint table); `None` when either is full.
+unsafe fn file(record: Block, tail: *const u8, tail_bytes: usize, extra: usize) -> Option<&'static Block> {
     let c = control();
     let meta = c.meta_used.next_multiple_of(align_of::<Block>() as u64);
-    let meta_end = meta + (size_of::<Block>() + tail_bytes) as u64;
+    let meta_end = meta + (size_of::<Block>() + tail_bytes + extra) as u64;
     if meta_end > area::META_BYTES as u64 || c.blocks as usize >= area::MAX_BLOCKS {
         c.full[if meta_end > area::META_BYTES as u64 { 1 } else { 2 }] += 1;
         return None;
@@ -506,6 +591,9 @@ unsafe fn file(record: Block, tail: *const u8, tail_bytes: usize) -> Option<&'st
             i = (i + 1) & (area::L2_ENTRIES - 1);
         }
         l2(i).write([record.rip, n as u64 + 1]);
+        if record.flags & RELOCATABLE != 0 {
+            hint(record.source_gpa[0], record.rip, record.context).write(n as u32 + 1);
+        }
         (c.meta_used, c.blocks) = (meta_end, n as u64 + 1);
         Some(&*at)
     }

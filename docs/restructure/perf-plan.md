@@ -1,6 +1,6 @@
 # Performance phase plan (draft)
 
-Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review; chunks 1-9 measured below (chunk 5 uncommitted on d89bc4c, chunk 7 on 0da552a, chunk 6 on ea11225, chunk 8 on 1c4d8b9, chunk 9 on 9ba60d5). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
+Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review; chunks 1-10 measured below (chunk 5 uncommitted on d89bc4c, chunk 7 on 0da552a, chunk 6 on ea11225, chunk 8 on 1c4d8b9, chunk 9 on 9ba60d5, chunk 10 on 851cbd2). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
 code, measured first; the correctness pass follows. Principles: measure first; native mechanisms; nothing keyed to
 Linux (a KASLR boot must gain too); every object still admitted; checks green; no debt.
 
@@ -774,6 +774,113 @@ filled it); after space was freed `suite9.sh` reran from `system` on (`FROM=syst
 ended (`results-pass1.txt` keeps the first pass). Per-case outputs and the
 per-request logs deleted after analysis.
 
+### Measured (chunk 10: reuse inside the resident, November 3; uncommitted on 851cbd2, series48-lean)
+
+**Built** (resident, abi, host; fexc unchanged; the design study of chunk 6's question 2, with chunk 8's records). A block miss
+whose translation another block of this vCPU already holds at another RIP is placed by the resident itself, with no host exit:
+- *Template (host).* `translation` sets `State::relocatable` when fexc's answer at the RIP is its answer for the same bytes at
+  every RIP of that half and page offset (chunk 3's proof) and depends only on bytes of the block's own pages: not a step, no
+  limit (breakpoint, hook, stop RIP) cut the fetched bytes, no halving retry, not `unsupported_form`, fexc's extent short of the
+  bytes' end and on the block's pages (chunk 6's rule; now kept per compile, not only with the log). `place` keeps the
+  admitted object's guest-RIP literals and moves after the block's sites, packed u32 (offset, move bit, register; at most
+  255, count in `Block::flags`), and marks the block `RELOCATABLE`.
+- *Hint table* (`cache::HINTS`, 1 MiB of the lookup area per vCPU, which grows from 14 to 16 MiB): u32 block number + 1 by a
+  hash of (frame, page offset and half, context), written at every `RELOCATABLE` filing. A hint is only a candidate:
+  `cache::template` checks the record (live, `RELOCATABLE`, not a step or system record, same frame, offset, half, context),
+  so flushes never clear it.
+- *Miss path* (`execution::reused`, before the request): RIP's page is walked and marked as for a request. With a template, and
+  no instruction breakpoint, no stop RIP and no host fence (`Control::reuse_fences`: the test driver's hook RIPs and handler
+  range) in the bytes the host would fetch, a crossing template's second page is walked and marked too; pending invalidations
+  are taken; the template must still be live and, when it crosses, its second frame the one walked. `cache::copy` copies its
+  code above the fill point and rewrites it with `natemu_abi::execution::relocate_code`; it is filed as an ordinary block
+  (chained on its frames, linear pages, L2, hint) and kept by `kept` as a host placement is. Anything refused goes to the host
+  with the walk already made (the second page's walk undone), counted (`Control::reuse_refused`, by kind).
+- *The re-check* (`relocate_code`, abi, about 60 lines; the host's relocator now uses the same encoder and move rule): the RIP's
+  half and page offset are the template's and the RIP and block end canonical; the relocations are in offset order, none
+  starting inside the one before (`place` keeps them sorted; admission refuses no duplicated or overlapping record, and a move
+  rewritten twice would hold + 2d); link points are restored to their admitted words;
+  each literal slot gets + d and must stay canonical; each move is re-encoded by FEX's `LoadConstant` rules
+  (`relocate_move`, shared with `relocation::object`): a 64-bit form before and after, the new value canonical, as many words,
+  and the new words with the next word decoding to the new value in as many words; each link point gets its move's new first
+  word and target + d and must be a link point after (`link_point`, shared with the reply check). Every other admission rule
+  reads offsets, bytes or values that move with d (design study, section 2).
+- *Check mode* (`Control::reuse` = `REUSE_CHECK`, set by `boot-linux --check-reuse` and the program driver's `--code-shape` or
+  `--check-reuse`, so by every suite runner): each copy is also asked of the host at its RIP (through the walks it was made
+  from) and must equal its staged answer: code (the computed exit's word `b` to the dispatcher from the copy), sites, link
+  points, exits, pages, the relocations it carries and the host's template bit;
+  otherwise the vCPU stops `reuse_mismatch` (64).
+- Counters: the K1 statistics' `reuse` (copies, refusals by kind, checks), the boot report's per-vCPU `requests` and `reuse`;
+  perf bucket `reuse` (26 buckets; the second page's walk stays in `fetch`).
+
+**Tests.** Unit (`relocation.rs`): the re-check turns the block admitted at one fixture RIP into the one admission gives fexc's
+object at the other, both ways, its links linked first; each refusal (another offset or half, a non-canonical RIP or block end,
+another word count, a 32-bit form, a move outside the code or at no move, a literal outside the code or made non-canonical, a
+move or literal listed twice, a literal starting inside another, the relocations out of order, a link point no move rewrote
+or with another target; the duplicated move is red without the order check) and the move rule's. K1 (`run_k1.py`, natemu only, 1-4 vCPUs, both block
+sizes, values asserted and least copies and refusals): `reuse-alias` (a frame at RV1 in table A and RV2 in B, above 4 GiB:
+the second runs copies, with its own `lea [rel]` and return-address values), `reuse-write` (the frame written after a copy: the
+copy dies with its template, a third alias is not copied from the dead ones), `reuse-remap` (B's alias remapped to another
+frame with INVLPG: its own bytes), `reuse-cross` (a block crossing into a second page: copied where both frames are the
+template's, not where the second differs). Each red under its mutation (`natemu-raw/perf10-20261103-01/mut/`: `build.py`, `run.py` and their logs; scratch residents), with the suites' check on
+and off: moves and link targets not rewritten (`reuse-alias`: `reuse_mismatch`; off: RV1's values, or a fault), a copy left off
+its frames' chains and a dead template copied (`reuse-write` r10/r14 = 1), the frame left out of the hint and the check
+(`reuse-remap` r10 = 1), the second frame not compared (`reuse-cross` r14 = 0x100). Literal slots not rewritten is red only
+under the check (`reuse_mismatch`): no guest-visible value reads them in these programs (FEX's tail holds the block RIP).
+
+**Check runs** (`natemu-raw/perf10-20261103-01/check/`, `boot-linux --check-reuse`, installer, cache off): N = 1 849,848
+copies, each also answered by the host and equal; N = 4 (vCPU 0) 211,439 copies checked; 0 mismatches, both reached the
+dialog. Every suite runner below ran with the check on (the suites' `--code-shape`): no `reuse_mismatch`.
+
+**Measured** (`natemu-raw/perf10-20261103-01/`: `campaign10.sh`, `one.sh`, `boot.py`, `runs/`; installer to "Select a
+language", 2 GiB, `mitigations=off nokaslr`, cache off, one VM at a time, a warm-up boot per build, three interleaved rounds at
+N = 1, one boot each at N = 4 and one log-on boot (perf resident) per build at N = 1; mean, min-max):
+
+| Installer, cache off | before (851cbd2) | after |
+| --- | --- | --- |
+| N = 1 wall s, log off | 10.71 (10.65-10.78) | **8.57** (8.55-8.61) |
+| N = 4 wall s, log off (one boot) | 10.98 | **9.37** |
+| "Run /init" guest s, N = 1 / N = 4 | 2.64 / 4.14 | 2.42 / 3.98 |
+| Host block requests, N = 1 (all four vCPUs at N = 4) | 1,155.6 k | 302.0 k (446.2 k) |
+| Copies in the resident / refused (move word count; own: fence, second frame, dead), N = 1 | | 850.1-860.1 k / 0.84-1.0 k; 4-90 |
+| Copies at N = 4, all vCPUs / refused | | 890.4 k / 636; 5 |
+| Log on, vCPU 0 s: host exits (count) / `hv_vcpu_run` / host translate (of it admission, relocation) | 5.78 (1.248 M) / 6.84 / 4.00 (0.93, 0.24) | 3.31 (0.386 M) / 5.93 / 2.69 (0.29, 0.02) |
+| Log on, vCPU 0 s: resident `reuse` (count) / `place` | - / 0.174 | 0.268 (850.9 k) / 0.060 |
+| Max RSS MB, N = 1 / N = 4 | 612 / 1,201 | 610 / 1,187 |
+
+**Ship threshold met**: -2.14 s (-20%) at N = 1 against spreads of at most 0.12 s, -1.61 s (-15%) at N = 4 (one boot each);
+nothing slower; every boot reached the dialog. Host requests avoided: 853.6 k at N = 1 (74%; chunk 6 bounded 870 k), 890 k at
+N = 4. Fallbacks: about 0.1% of the templates found, nearly all a move needing another word count (as the host relocator's
+refusals). Resident time added: 0.27 s of `reuse` for 851 k copies (0.31 us each, re-check and placement included) against
+0.11 s less host placement; the host gives back 2.5 s of exit and request time (fexc's 2.0 s unchanged: the compiles are
+the same 126 k). Memory: 4 bytes per guest-RIP relocation of a template in the arena (packed only when reuse is on) and the
+hint table's 1 MiB per vCPU (the lookup area 14 to 16 MiB of backing; RSS unchanged).
+
+**Independent review** (read-only, of the diff): no blocking defect. Applied: the fence test no longer wraps at the top of
+the address space; the check compares the code's first word when there is no computed exit; a write posted while the check's
+host request ran (the host may have read the new bytes) now kills the copy and steps instead of halting `reuse_mismatch`;
+relocations are packed only when reuse is on; the reply check bounds the staged relocation table as it does the sites.
+After the coordinator's containment review (nothing blocking): the order and overlap rule above and the check's dispatch word,
+relocations and template bit; rerun (`followup/`): `cargo test` 162 + 1 ignored with `FEXC` set, the four reuse programs (32
+runs) green, a `--check-reuse` installer boot at N = 1 851,238 copies checked, 0 mismatches, 968 + 7 refused (as before).
+Noted, not changed: a refused crossing copy leaves its second page marked and walked (A bits; conservative); and, before this
+chunk, the host ignores a limit at the first byte of the next page (`fetched`'s `span`), which in-VM reuse cannot reach (it
+refuses at any armed breakpoint and fence).
+
+The measurements are of the build before these changes (none is on the boot's path but the check's); the final build, in two
+interleaved rounds with the measured one later (the machine then a little slower): N = 1 8.78 and 8.87 s against 8.76 and 8.81 s.
+On the final build, with the check (`check/final-*`): N = 1 848,442 copies, N = 4 871,600 over the four vCPUs, all equal to the
+host's answers; without it 840.7 k and 866.1 k copies, 301.6 k and 449.2 k host block requests.
+
+**Checks** (`suite/` on the build before the review's changes and `final/` on the shipped tree, `suite10.sh`, the same
+commands, series48-lean, 2 GiB, one VM runner at a time, each case's output deleted as it ended; both passes green):
+`cargo test` 162 + 1 ignored, also with `FEXC` set (2 new); `check_resident_stack.py` `ok` (16,656 / 20,832 / 8,912 bytes: +288,
++320, +240 on chunk 9's); fixtures 64 and seed 44 at both block sizes; faults 7,912 at both; `run_slice3_vm.py` `contain` (423
+controls), `smp`, `sharedpt`, `coherence`, `delivery` 0 failures; `run_k1.py` 280 runs (the four new programs at 1-4 vCPUs and
+both block sizes), no failure, 14 and 14 requests at K and 2K rounds; `run_k2.py`, `run_s4.py` all ok; `run_x1.py` 6/6 and
+196/196; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative controls flagged); every installer boot
+reached the dialog. Not rerun: the rest of the standing suite (the change is in the resident's miss path and placement, which
+these exercise, every one with the reuse check on).
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
@@ -807,6 +914,7 @@ the resident copies it, applies the shift, checks canonicality and move fit, els
 words admission classified as RIP moves or literal slots change: no branch, exit or access is created. This is
 admission-equivalent code and gets its own review. *Expected:* up to 1 M x 4-6 us. *Decides:* exits left after host
 reuse (chunk 6: at most 870 k requests at N = 1 and 900 k at N = 4 find a live template, above the design study's 0.5 M bar).
+(Built in chunk 10, by a hint table by frame instead of the reverse map: 854 k requests avoided at N = 1, -20% wall.)
 
 **Shared in-memory cache and compiler pool.** *Hypothesis:* at N > 1 vCPUs compile the same blocks again; the cache
 resets wholesale at 65,536 entries (`execution.rs:842-846`). *Mechanism:* one cache per VM (sharded locks), keyed on

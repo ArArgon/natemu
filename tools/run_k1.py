@@ -53,6 +53,12 @@ Perf chunk 8 (links kept across TLB events):
 - the independent review's adversarial programs (`adv_setup`: NX, SMEP and U/S changes, code remapping its own page,
   one frame at two linear addresses rewritten, global/non-global crossings, a fetch #PF then remap), against QEMU but
   `pf-fetch` (either outcome by the TLB rules).
+Perf chunk 10 (reuse inside the resident, natemu only; aliases above 4 GiB, values and least copies asserted):
+- `reuse-alias`: a frame at RV1 in table A and RV2 in B: RV2's blocks are copies, with RV2's `lea [rel]` and return address.
+- `reuse-write`: the frame written after a copy: the copy dies with its template; a third alias is not copied from a dead one.
+- `reuse-remap`: B's alias remapped to another frame with INVLPG: its own bytes, not a copy of the first frame's block.
+- `reuse-cross`: a block crossing into a second page is copied where both frames are the template's, not where the second
+  differs (a refusal counted).
 - `counts`: `cr3-switch` at K and 2K rounds on 1 vCPU: the resident's translation requests and the host's compiles must
   not grow with the rounds (K1: a CR3 load keeps translations); with `--base-host/--base-runtime` the same counts for
   another build (before K1) are reported beside them.
@@ -155,6 +161,7 @@ def bodies(k, i=0, n=1):
                      + ''.join(ctx_call(5 + j, d, j + 2) for j in range(3)) + '    dec ecx\n    jnz .l\n'
                      + ctx_call(8, d, 0) + ctx_kept(i) + '    jmp .end\n' + CTX_HANDLERS + '.end:\n'),
         **links_bodies(k, i, n),
+        **reuse_bodies(i),
     }
 
 
@@ -229,6 +236,88 @@ def links_memory(name, i, n):
         return [{'addr': f'0x{d + F1 + LW:x}', 'data': s.hex()}] + ([dict(P.zero(FLAGS, 0x100), capture=False)] if i == 0 else [])
     return []
 
+# Perf chunk 10 (reuse inside the resident, natemu only): per CPU, frames RL (and RL2, RLC) and linear aliases RV1 and RV3
+# in table A, RV2 in table B, all of the same page offset: a block placed at one alias is copied to another of the same
+# frame, rewritten for its RIP (`lea [rel]` and `call` values), never across another frame.
+RL, RL2, RLC = 0x9000, 0xa000, 0xc000
+# The aliases lie above 4 GiB (below it FEX's guest-RIP moves are the 32-bit form, which reuse refuses), in a 2 MiB region
+# HIGH each table maps through three more table pages of its own (its PML4 entry, PDPT and PD at +0x5000, +0x6000, +0x7000).
+HIGH = 0x7f12_3440_0000
+RV1, RV2, RV3 = HIGH + 0xb000, HIGH + 0xd000, HIGH + 0xf000
+RX = 0xff7                       # `reuse-cross`: `lea rdx, [rel 0]` at RX, then `mov eax, imm32` across the page end
+LIB = lambda k: P.asm(f'mov ebx, {k}\nlea rax, [rel $$]\ncall .n\n.n:\npop rsi\njmp r13')   # rsi = alias + 17
+
+
+def reuse_bodies(i):
+    d = P.SYS_D(i)
+    put_b = lambda va, frame: f'    mov rax, {frame | P.LEAF:#x}\n    mov [{high_leaf(i, 1, va):#x}], rax\n'
+    cr3 = lambda t: f'    mov rax, {{{t}:#x}}\n    mov cr3, rax\n'
+    save = lambda *regs: ''.join(f'    mov {r}, {s}\n' for r, s in regs)
+    return {
+        # A library frame at RV1 (A) and RV2 (B): RV2's blocks are copies of RV1's, with their own RIP's values.
+        'reuse-alias': (call('r0', f'{RV1:#x}') + save(('r8', 'rax'), ('r9', 'rsi')) + cr3('tb') + call('r1', f'{RV2:#x}')
+                        + save(('r10', 'rax'), ('r12', 'rsi')) + cr3('ta')),
+        # The frame written after a copy (through its identity address): the copy dies with its template, and a third
+        # alias placed after the write is not copied from either.
+        'reuse-write': (call('w0', f'{RV1:#x}') + save(('r8', 'rbx')) + cr3('tb') + call('w1', f'{RV2:#x}') + save(('r9', 'rbx'))
+                        + cr3('ta') + f'    mov byte [{d + RL + 1:#x}], 2\n' + call('w2', f'{RV3:#x}') + save(('r10', 'rbx'), ('r12', 'rax'))
+                        + cr3('tb') + call('w3', f'{RV2:#x}') + save(('r14', 'rbx')) + cr3('ta')),
+        # One alias remapped (B's RV2 to frame RL2, `mov ebx, 2`, with INVLPG): its block is not copied from RL's.
+        'reuse-remap': (call('m0', f'{RV1:#x}') + save(('r8', 'rbx')) + cr3('tb') + call('m1', f'{RV2:#x}') + save(('r9', 'rbx'))
+                        + put_b(RV2, d + RL2) + f'    mov rax, {RV2:#x}\n    invlpg [rax]\n' + call('m2', f'{RV2:#x}')
+                        + save(('r10', 'rbx'), ('r12', 'rax')) + cr3('ta')),
+        # A block crossing into a second page: RV1 and RV2 in A map RL then RL2 (`imm32` 0x100), RV2 in B RL then RLC
+        # (0x200): A's RV2 block is a copy of RV1's, B's is not (its second frame differs).
+        'reuse-cross': (call('x0', f'{RV1 + RX:#x}') + save(('r8', 'rax'), ('r9', 'rdx')) + call('x1', f'{RV2 + RX:#x}')
+                        + save(('r10', 'rax'), ('r12', 'rdx')) + cr3('tb') + call('x2', f'{RV2 + RX:#x}') + save(('r14', 'rax'), ('r15', 'rdx'))
+                        + cr3('ta')),
+    }
+
+
+def high_leaf(i, k, va):
+    """Address of the PTE of `va` (in HIGH's 2 MiB) in CPU i's table k."""
+    return P.SYS_T(i, k) + 0x7000 + (va >> 12 & 511) * 8
+
+
+def reuse_tables(name, i):
+    """Per table (A, B): the linear page -> frame offset of the reuse programs' aliases."""
+    if name == 'reuse-cross':
+        return {RV1: RL, RV1 + 0x1000: RL2, RV2: RL, RV2 + 0x1000: RL2}, {RV2: RL, RV2 + 0x1000: RLC}
+    return {RV1: RL, RV3: RL}, {RV2: RL}
+
+
+def reuse_memory(name, i):
+    d = P.SYS_D(i)
+    q = lambda x: x.to_bytes(8, 'little').hex()
+    entry = lambda at, value: {'addr': f'0x{at:x}', 'data': q(value), 'capture': False}
+    tables = []
+    for k, aliases in enumerate(reuse_tables(name, i)):
+        base = P.SYS_T(i, k)
+        tables += [entry(base + 8 * (HIGH >> 39 & 511), (base + 0x5000) | 0x27), entry(base + 0x5000 + 8 * (HIGH >> 30 & 511), (base + 0x6000) | 0x27),
+                   entry(base + 0x6000 + 8 * (HIGH >> 21 & 511), (base + 0x7000) | 0x27)]
+        tables += [entry(high_leaf(i, k, va), (d + f) | P.LEAF) for va, f in aliases.items()]
+    if name == 'reuse-cross':
+        first = bytearray(0x1000)
+        first[RX:] = P.asm('lea rdx, [rel $+7]') + b'\xb8\x00'
+        return tables + [{'addr': f'0x{d + RL:x}', 'data': first.hex()}, {'addr': f'0x{d + RL2:x}', 'data': TAIL(1).hex()},
+                         {'addr': f'0x{d + RLC:x}', 'data': TAIL(2).hex()}]
+    return tables + [{'addr': f'0x{d + RL:x}', 'data': LIB(1).hex()}, {'addr': f'0x{d + RL2:x}', 'data': LIB(2).hex()}]
+
+
+# Each reuse program's values and its least resident copies and refusals (a fence, another second frame, a dead template:
+# `refused[0]`) per CPU.
+def reuse_either(name):
+    def judge(i, k):
+        d = P.SYS_D(i)
+        return {
+            'reuse-alias': {'r8': {RV1}, 'r9': {RV1 + 17}, 'r10': {RV2}, 'r12': {RV2 + 17}},
+            'reuse-write': {'r8': {1}, 'r9': {1}, 'r10': {2}, 'r12': {RV3}, 'r14': {2}},
+            'reuse-remap': {'r8': {1}, 'r9': {1}, 'r10': {2}, 'r12': {RV2}},
+            'reuse-cross': {'r8': {0x100}, 'r9': {RV1 + 0xffe}, 'r10': {0x100}, 'r12': {RV2 + 0xffe}, 'r14': {0x200}, 'r15': {RV2 + 0xffe}},
+        }[name]
+    return judge
+REUSE = {'reuse-alias': (1, 0), 'reuse-write': (1, 0), 'reuse-remap': (1, 0), 'reuse-cross': (1, 1)}
+
 IDT = 0x3000
 CX, CD = 0x9000, 0xa000                       # `contexts`: its code page and its MXCSR values (A, C, D, E, F)
 CTX_MXCSR = (0x1f80, 0x0f80, 0x1780, 0x1d80, 0x1e80)
@@ -279,6 +368,7 @@ EITHER = {
     'invlpg-page': {'r8': {3}, 'r9': {3}, 'r10': {2}},
     'local-gpa': {'r9': {2}, 'r10': {1}},
     'invlpg-large': {'r8': {1}, 'rbx': {0x22}, 'r9': {2}, 'r10': {1}},
+    **{name: reuse_either(name) for name in REUSE},
 }
 
 
@@ -319,7 +409,7 @@ def program(name, n, k):
                       {'addr': f'0x{d + CW1:x}', 'data': P.asm('mov eax, 2\njmp r13').hex()}, {'addr': f'0x{d + CW2:x}', 'data': P.asm('mov eax, 4\njmp r13').hex()}]
         out['memory'] += P.sys_tables(i, 0, n, a) + tb + [
             P.zero(d, 0x1000), {'addr': f'0x{d + F1:x}', 'data': CODE(1).hex()}, {'addr': f'0x{d + F2:x}', 'data': CODE(2).hex()},
-            {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + extra + links_memory(name, i, n)
+            {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE else [])
     return out
 
 
@@ -477,6 +567,11 @@ def main():
                             problems.append(f"cpu{v} L1 tables cleared {k1['l1_clears']} times of {k1['l1_switches']} switches")
                 if out and want:
                     problems += s3.smp.compare(prog, s3.vm_state(prog, out), want)
+                # Perf chunk 10: the copies the reuse programs must make, and the refusals.
+                for v, c in enumerate(out['cpus'] if out and name in REUSE else []):
+                    reuse = c['stats']['k1']['reuse']
+                    if reuse['copies'] < REUSE[name][0] or reuse['refused'][0] < REUSE[name][1]:
+                        problems.append(f"cpu{v} reuse {reuse}, at least {REUSE[name]} (copies, refused[0])")
                 seen = {}
                 if out and name in EITHER:
                     for v, c in enumerate(out['cpus']):

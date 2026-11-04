@@ -774,6 +774,10 @@ impl execution::Hook for ProgramHook {
         let after = |m: &BTreeMap<u64, u64>| m.range((Excluded(rip), Unbounded)).next().map(|(&r, _)| r);
         after(&self.switches).into_iter().chain(after(&self.posts)).min()
     }
+    fn fences(&self) -> Vec<std::ops::Range<u64>> {
+        let points = self.switches.keys().chain(self.posts.keys()).map(|&r| r..r + 1);
+        std::iter::once(self.handlers.clone()).chain(points).collect()
+    }
     fn admitted(&mut self, object: &mut [u8]) {
         if self.forge_exit {
             forge_exit(object);

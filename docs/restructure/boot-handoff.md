@@ -25,7 +25,13 @@ cache off 13.6 s, N = 4 12.4 s (15.6 and 13.4 s before, in the same rounds). Sin
 a resident entry copies less: the state passes by reference to `dispatch`, `enter` and `step`, records are copied 32 bytes a
 step, the entry frame is built in place in `Shared::initial` (its unwritten rest stays zero; the host checks it at every
 resident stop) and the linker searches the block index once (perf plan "Measured (chunk 9)"): installer N = 1 cache off
-10.8 s, N = 4 11.0 s (13.1 and 12.5 s before, in the same rounds).
+10.8 s, N = 4 11.0 s (13.1 and 12.5 s before, in the same rounds). Since perf chunk 10 (uncommitted on 851cbd2) the resident
+places most blocks the host would only relocate itself: a miss whose frame, page offset and context a live block of this
+vCPU holds at another RIP copies that block and rewrites its RIP-dependent words by the host relocator's rules
+(`natemu_abi::execution::relocate_code`, a hint table by frame in the lookup area, `execution::reused`), refusing to the host
+whatever it cannot prove; `--check-reuse` (and the suites' `--code-shape`) asks the host for every copy too and stops
+`reuse_mismatch` on any difference (perf plan "Measured (chunk 10)"): installer N = 1 cache off 8.6 s, N = 4 9.4 s (10.7
+and 11.0 s before, in the same rounds), 854 k of 1.16 M host requests avoided at N = 1.
 Perf chunk 6 (uncommitted on ea11225) measured the whole-cache flushes and left the cache as it is: only 123 k requests per
 installer boot (N = 1) refill blocks placed before a flush, and a record arena and index sized for the code area were no
 faster (+261 MiB); the performance log gains four request-line fields, and up to 870 k requests at N = 1 could reuse a block
@@ -107,7 +113,7 @@ from `wait4`, the resident's buckets, K1 statistics, counters); FILE.vN one line
 RIP, guest-physical page, result, answer source, bytes read and their hash, nanoseconds per part), at most 1 GiB per
 file (later lines counted as `dropped`); failed writes are counted, the first reported on standard error, and both
 appear in each vCPU's line (`"log"`) and as a warning at its end. A resident built with `perf` but run with the log off
-draws a warning after the run. Since perf chunk 5 the K1 statistics carry `l1_switches` (code-context changes) and `l1_clears` (L1 tables cleared for a context that had none), and the resident's `l1` bucket times the switches; since perf chunk 8 `reclaims` (the link records found full: how often, and the local links into blocks not current then undone); since perf chunk 9 the resident's `enter_copy` bucket holds the copies inside `enter` (25 buckets). Since perf chunk 7 the vCPU line's parts carry `relocate` (an answer kept for another RIP relocated) and `admit` is admission alone; the request line keeps its nine parts. Since perf chunk 6 the request line ends with four more fields: the resident's flush generation when it asked, the code context (`Cpu::code_context`, hex), 1 if the block could be an in-VM reuse template (not a step, no address or halving cut, its answer read neither to its bytes' end nor beyond the block's pages, not `unsupported_form`) else 0, and the fetch's second guest-physical page (`ffffffffffffffff`: none); `natemu-raw/perf6-20261103-02/refill6.py` classifies refills and reuse candidates from them. Times are
+draws a warning after the run. Since perf chunk 5 the K1 statistics carry `l1_switches` (code-context changes) and `l1_clears` (L1 tables cleared for a context that had none), and the resident's `l1` bucket times the switches; since perf chunk 8 `reclaims` (the link records found full: how often, and the local links into blocks not current then undone); since perf chunk 9 the resident's `enter_copy` bucket holds the copies inside `enter` (25 buckets); since perf chunk 10 `reuse` (copies made in the resident, refusals by kind, checks; also per vCPU in the `boot-linux` report with its `requests`) and the resident's `reuse` bucket (26 buckets). Since perf chunk 7 the vCPU line's parts carry `relocate` (an answer kept for another RIP relocated) and `admit` is admission alone; the request line keeps its nine parts. Since perf chunk 6 the request line ends with four more fields: the resident's flush generation when it asked, the code context (`Cpu::code_context`, hex), 1 if the block could be an in-VM reuse template (not a step, no address or halving cut, its answer read neither to its bytes' end nor beyond the block's pages, not `unsupported_form`) else 0, and the fetch's second guest-physical page (`ffffffffffffffff`: none); `natemu-raw/perf6-20261103-02/refill6.py` classifies refills and reuse candidates from them. Times are
 `CLOCK_UPTIME_RAW` nanoseconds (= `mach_absolute_time` = the guest's CNTVCT). The resident's buckets need the runtime
 built with its `perf` feature, into its own target directory so the default build stays as it is:
 `CARGO_TARGET_DIR=target/perf cargo +1.97.0 build --offline --locked --release -p natemu-runtime --target
@@ -289,6 +295,7 @@ likewise at N = 1 and one boot each at N = 4, log off, before (1c4d8b9) and afte
 | `natemu-host boot-linux`, cache off, series48-lean, **host per-request cleanups** (perf chunk 7, mean of 3; 0da552a in the same rounds: 17.8 (3.62), 15.7 (5.00)) | **15.9** (3.29) | | | **13.6** (4.51) |
 | `natemu-host boot-linux`, cache off, series48-lean, **links kept across TLB events** (perf chunk 8, N = 1 mean of 3, N = 4 one boot; 1c4d8b9 in the same rounds: 15.6 (3.22), 13.4 (4.45)) | **13.6** (3.10) | | | **12.4** (4.29) |
 | `natemu-host boot-linux`, cache off, series48-lean, **cheaper resident entry** (perf chunk 9, N = 1 mean of 3, N = 4 one boot; 9ba60d5 in the same rounds: 13.1 (3.02), 12.5 (4.42)) | **10.8** (2.66) | | | **11.0** (4.16) |
+| `natemu-host boot-linux`, cache off, series48-lean, **reuse inside the resident** (perf chunk 10, N = 1 mean of 3, N = 4 one boot; 851cbd2 in the same rounds: 10.7 (2.64), 11.0 (4.14)) | **8.6** (2.42) | | | **9.4** (3.98) |
 | `natemu` stub and `boot-linux` at 16b0576, warm or off | never (hangs after "Run /init", see below) | never | | never |
 
 The QEMU rows these tables held until November 3 (R2's harness: `-machine pc` with its default devices and HPET,
@@ -422,6 +429,13 @@ and 196/196. One installer boot with `boot-linux --code-shape` (N = 1, cache off
 that ends the run); admission took 112 against 85 ms without the option on a kernel-only boot, so the check ran
 (`natemu-raw/audit-fix-20261103-01/code-shape/`). The rest of the block was not rerun: the change reaches only the host's
 system decode (66/F2 `0f 78/79`, F2/F3 SMSW), the ASM runner and the boot driver's option.
+
+**Rerun with reuse inside the resident** (perf plan "Measured (chunk 10)"; `natemu-raw/perf10-20261103-01/final/`, 2 GiB,
+851cbd2 plus the uncommitted change, series48-lean, every runner with the reuse check on): `cargo test` 162 + 1 ignored, also
+with `FEXC` set; `check_resident_stack.py` `ok` (16,656 / 20,832 / 8,912 bytes); fixtures 64, seed 44, faults 7,912, each at
+both block sizes; `contain` (423 controls), `smp`, `sharedpt`, `coherence`, `delivery` 0 failures; `run_k1.py` 280 runs (four
+reuse programs new); `run_k2.py`; `run_s4.py`; `run_x1.py` 6/6 and 196/196; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7,
+`r1b` 12/12; installer boots with `--check-reuse` at N = 1 and 4: 0 mismatches; every boot reached the dialog.
 
 **Rerun with the cheaper resident entry** (perf plan "Measured (chunk 9)"; `natemu-raw/perf9-20261103-01/suite/`, 2 GiB,
 9ba60d5 plus the uncommitted change, series48-lean): `cargo test` 160 + 1 ignored, also with `FEXC` set;

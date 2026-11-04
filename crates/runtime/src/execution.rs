@@ -196,12 +196,31 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
                 s.l2_hits += 1;
                 b
             }
-            None => match (s.generation, unsafe { request(s, REQUEST_TRANSLATE) }) {
-                (missed, Reply::Block(h)) => {
+            None => match (s.generation, unsafe { reused(s, context) }) {
+                // Perf chunk 10: a copy of a template on the same frame, placed in the resident.
+                (missed, Err(Some(copy))) => {
+                    if !kept(s, copy, missed) {
+                        return None;
+                    }
+                    if cache::control().reuse == cache::REUSE_CHECK && !unsafe { checked(s, copy) } {
+                        return None;
+                    }
+                    copy
+                }
+                (_, Err(None)) => {
+                    if flushed {
+                        halt(s, stop::BAD_REPLY)
+                    }
+                    cache::control().capacity_flushes += 1;
+                    flush(s);
+                    flushed = true;
+                    continue;
+                }
+                (missed, Ok(Reply::Block(h))) => {
                     s.requests += 1;
                     let p = crate::perf::enter(crate::perf::PLACE);
                     let walked = walked(s);
-                    let placed = cache::place(&h, STAGING_VA as *const u8, context, s.source_gpa, walked, s.link_points, s.dispatch_exit, s.rep_exits);
+                    let placed = cache::place(&h, STAGING_VA as *const u8, context, s.source_gpa, walked, s.link_points, s.dispatch_exit, s.rep_exits, s.relocatable != 0);
                     crate::perf::leave(p);
                     let Some(block) = placed else {
                         // Full: flush (which also drops this vCPU's marks) and miss again; an empty cache holds any block.
@@ -220,7 +239,7 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
                 }
                 // K2: the decode is kept as the translation of its bytes (a test driver's hooks are not instructions:
                 // they are answered at every request), under the rule a block's placement keeps ([`cache::place_system`]).
-                (missed, Reply::System(instruction)) => {
+                (missed, Ok(Reply::System(instruction))) => {
                     if !matches!(instruction.kind, system::SET_CPL | system::EVENT_HOOK) {
                         // Crossing into a second page: at least up to its first byte, so INVLPG of either page covers it
                         // (some kinds, e.g. #UD forms, do not use `length`).
@@ -246,7 +265,7 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
                         None => continue,
                     }
                 }
-                (_, Reply::Fault(fault)) => {
+                (_, Ok(Reply::Fault(fault))) => {
                     deliver(s, Event::Exception(fault));
                     continue;
                 }
@@ -484,8 +503,11 @@ enum Reply {
 /// marks nothing (see [`code_written`]). A walk's fault goes to the host with the request (the host ends the run with
 /// it, or cuts the block before the next page). The block's source pages are those its bytes reach.
 unsafe fn request(s: &mut State, kind: u64) -> Reply {
-    let block = kind == REQUEST_TRANSLATE;
-    let page = s.cpu.rip & !4095;
+    fetch_first(s, kind == REQUEST_TRANSLATE);
+    unsafe { ask(s, kind) }
+}
+/// [`request`]'s walk of RIP's page (`block`: marked).
+fn fetch_first(s: &mut State, block: bool) {
     (s.fetch, s.fetch_fault) = ([u64::MAX; 2], [fetch::NONE; 3]);
     cache::control().fetched = 0;
     // The host stops the run at its stop RIP: nothing there is fetched.
@@ -493,6 +515,11 @@ unsafe fn request(s: &mut State, kind: u64) -> Reply {
         // Walked at RIP itself: a fault's CR2 is the fetched address, not its page.
         fetch_page(s, s.cpu.rip, 0, block);
     }
+}
+/// [`request`] after [`fetch_first`] (and the next page's walk, if made).
+unsafe fn ask(s: &mut State, kind: u64) -> Reply {
+    let block = kind == REQUEST_TRANSLATE;
+    let page = s.cpu.rip & !4095;
     loop {
         unsafe {
             s.request = kind;
@@ -535,6 +562,8 @@ unsafe fn request(s: &mut State, kind: u64) -> Reply {
     }
     let h = staged();
     let table_end = (h.sites_offset as usize).checked_add(h.sites_count as usize * size_of::<Site>());
+    // (Perf chunk 10: a template's relocations are read from the staged table too.)
+    let relocs_end = (h.relocs_offset as usize).checked_add(h.relocs_count as usize * size_of::<object::Reloc>());
     let crosses = (s.cpu.rip & 4095) + u64::from(h.guest_bytes) > 4096;
     s.source_gpa = [s.fetch[0], if crosses { s.fetch[1] } else { u64::MAX }];
     if s.reply != REPLY_ADMITTED
@@ -545,6 +574,7 @@ unsafe fn request(s: &mut State, kind: u64) -> Reply {
         || h.code_size as usize > natemu_abi::execution::cache::MAX_BLOCK_BYTES
         || h.code_offset as usize + h.code_size as usize > STAGING_BYTES
         || table_end.is_none_or(|end| end > STAGING_BYTES)
+        || (s.relocatable != 0 && relocs_end.is_none_or(|end| end > STAGING_BYTES))
         // Host-supplied link points name words the linker may rewrite: each whole exit inside the code, as admitted (a
         // move of the point's target into x0 starting with the point's word, `svc #LINK` right after it).
         || s.link_points.iter().any(|p| p.offset != 0 && !link_point(&h, p))
@@ -559,25 +589,122 @@ unsafe fn request(s: &mut State, kind: u64) -> Reply {
     s.request = NONE;
     Reply::Block(h)
 }
+/// Perf chunk 10, reuse inside the resident: after RIP's page is walked and marked (as for a request), the block for
+/// `s.cpu.rip` copied from a template found by the hint table: a live block of this vCPU from the same frame at the same
+/// page offset and half, in the same context ([`cache::template`]), which the host found a template (its answer depended
+/// only on bytes of its pages before their end, nothing cut it). For a template crossing into a second page that page is
+/// walked and marked too, and its frame must be the template's. Then pending invalidations are taken: a template still
+/// live after its pages were marked again holds the bytes those frames hold now (any write since it was placed killed it,
+/// or was posted and is drained here). The copy is rewritten for the RIP by the re-check every RIP-dependent admission
+/// rule needs ([`cache::copy`]) and is then an ordinary block (the caller keeps it as a host-placed one, [`kept`]).
+/// Not when the vCPU's stop RIP or one of the host's fences ([`cache::Control::reuse_fences`]) lies in the bytes the host
+/// would fetch, or an instruction breakpoint is armed (blocks start at each). `Err(Some)`: the copy; `Err(None)`: full
+/// (the caller flushes); `Ok`: the host's reply to the request ([`ask`], with the walk already made).
+unsafe fn reused(s: &mut State, context: u64) -> Result<Reply, Option<&'static Block>> {
+    fetch_first(s, true);
+    let rip = s.cpu.rip;
+    let c = cache::control();
+    let template = (c.reuse != cache::REUSE_OFF && s.fetch[0] != u64::MAX && s.cpu.dr[5] & DR7_ENABLES == 0)
+        .then(|| cache::template(rip, s.fetch[0], context))
+        .flatten();
+    if let Some(b) = template {
+        let p = crate::perf::enter(crate::perf::REUSE);
+        let crosses = (rip & 4095) + u64::from(b.guest_bytes) > 4096;
+        // The bytes the host would fetch: to the page's end, or the next page's when the block crosses (`last` its last byte:
+        // no wrap at the top of the address space).
+        let last = (rip & !4095).wrapping_add(if crosses { 8191 } else { 4095 });
+        let fenced = |(start, stop): (u64, u64)| start <= last && rip < stop;
+        let mut refused = c.reuse_fences.iter().any(|&[a, b]| fenced((a, b))) || fenced((s.stop_at, s.stop_at.wrapping_add(1)));
+        let generation = s.generation;
+        if !refused && crosses {
+            fetch_page(s, (rip & !4095).wrapping_add(4096), 1, true);
+        }
+        if !refused {
+            take_invalidations(s);
+        }
+        let template = cache::template(rip, s.fetch[0], context).filter(|t| core::ptr::eq(*t, b));
+        refused |= s.generation != generation || template.is_none() || (crosses && s.fetch[1] != b.source_gpa[1]);
+        let kind = if refused {
+            Some(0)
+        } else {
+            s.source_gpa = [s.fetch[0], if crosses { s.fetch[1] } else { u64::MAX }];
+            match cache::copy(b, rip, s.source_gpa, walked(s)) {
+                Ok(placed) => {
+                    crate::perf::leave(p);
+                    if placed.is_some() {
+                        cache::control().reuse_copies += 1;
+                    }
+                    return Err(placed);
+                }
+                Err(kind) => Some(kind),
+            }
+        };
+        if let Some(k) = kind {
+            cache::control().reuse_refused[k] += 1;
+        }
+        // The host is asked as if no template had been looked at: the next page only if it asks for it.
+        if s.fetch_fault[0] != fetch::NONE && s.fetch[0] != u64::MAX {
+            s.fetch_fault = [fetch::NONE; 3];
+        }
+        s.fetch[1] = u64::MAX;
+        cache::control().fetched &= 0xff;
+        crate::perf::leave(p);
+    }
+    Ok(unsafe { ask(s, REQUEST_TRANSLATE) })
+}
+/// Perf chunk 10, the check of reuse inside the resident ([`cache::REUSE_CHECK`]): the host is asked for the block at the
+/// copy's RIP (through the walks the copy was made from) and its answer must be the copy: the same code (the computed exit's
+/// word `b` to the dispatcher from the copy), sites, link points, exits, pages, relocations and template bit. Halts [`stop::REUSE_MISMATCH`] otherwise. A write posted
+/// meanwhile (the host may have copied the new bytes) kills the copy: it is not compared, and `false` says to step (as for
+/// [`kept`]).
+unsafe fn checked(s: &mut State, copy: &Block) -> bool {
+    let p = crate::perf::enter(crate::perf::REUSE);
+    cache::control().reuse_checks += 1;
+    let generation = s.generation;
+    let reply = unsafe { ask(s, REQUEST_TRANSLATE) };
+    take_invalidations(s);
+    if s.generation != generation || copy.flags & cache::DEAD != 0 {
+        crate::perf::leave(p);
+        return false;
+    }
+    let same = match reply {
+        Reply::Block(h) => {
+            let code = |k: u64| unsafe { ((natemu_abi::execution::cache::CODE_WRITE_VA + u64::from(copy.code) + 4 * k) as *const u32).read_volatile() };
+            let staged = |k: u64| staged_word(&h, 4 * k);
+            let sites = cache::sites(copy);
+            // The computed exit's word is `b` to the dispatcher from the copy's place.
+            let at = u64::from(copy.code) + u64::from(copy.dispatch_exit);
+            let dispatch = copy.dispatch_exit == 0 || code(u64::from(copy.dispatch_exit) / 4) == 0x1400_0000 | ((cache::DISPATCH as u64).wrapping_sub(at) >> 2) as u32 & 0x03ff_ffff;
+            // The template's relocations it carries are the host's answer's (each packable one of the staged table is among
+            // them, as many), and the host found its answer a template too.
+            let reloc = |i: u32| unsafe { ((STAGING_VA + u64::from(h.relocs_offset)) as *const object::Reloc).add(i as usize).read_unaligned() };
+            let packed = (0..h.relocs_count).filter_map(|i| natemu_abi::execution::pack_reloc(&reloc(i), h.code_size).flatten());
+            let relocs = cache::relocs(copy);
+            let inherited = s.relocatable == 1 && packed.clone().count() == relocs.len() && packed.into_iter().all(|r| relocs.binary_search(&r).is_ok());
+            let staged_sites = unsafe { core::slice::from_raw_parts((STAGING_VA + u64::from(h.sites_offset)) as *const Site, h.sites_count as usize) };
+            (h.code_size, h.sites_count, h.guest_bytes) == (copy.code_size, copy.sites_count, copy.guest_bytes)
+                && (0..u64::from(h.code_size) / 4).all(|k| (copy.dispatch_exit != 0 && 4 * k == u64::from(copy.dispatch_exit)) || code(k) == staged(k))
+                && sites == staged_sites
+                && (s.link_points, s.dispatch_exit, s.rep_exits, s.source_gpa) == (copy.links, u64::from(copy.dispatch_exit), u64::from(copy.rep_exits), copy.source_gpa)
+                && dispatch
+                && inherited
+        }
+        _ => false,
+    };
+    crate::perf::leave(p);
+    if !same {
+        s.native = [copy.rip, u64::from(copy.code), 0];
+        halt(s, stop::REUSE_MISMATCH)
+    }
+    true
+}
 /// The staged block's code word at `offset` (inside its code).
 fn staged_word(h: &Header, offset: u64) -> u32 {
     unsafe { ((STAGING_VA + u64::from(h.code_offset) + offset) as *const u32).read_unaligned() }
 }
-/// `p` names an exit of the staged block as admission returns it: its word is in the code and is `p.word`, the first
-/// of a move (`movz|movn|orr` from the zero register, then `movk`s; at most four words) building `p.target` in x0, and
-/// an `svc #LINK` follows the move (inside the code).
+/// `p` names an exit of the staged block as admission returns it ([`natemu_abi::execution::link_point`]).
 fn link_point(h: &Header, p: &LinkPoint) -> bool {
-    let at = u64::from(p.offset);
-    let svc_link = 0xd400_0001 | u32::from(svc::LINK) << 5;
-    if at % 4 != 0 || at < u64::from(ENTRY_OFFSET) || at + 8 > u64::from(h.code_size) || staged_word(h, at) != p.word {
-        return false;
-    }
-    let mut words = [0u32; 5];
-    let n = ((u64::from(h.code_size) - at) / 4).min(5) as usize;
-    for (k, w) in words[..n].iter_mut().enumerate() {
-        *w = staged_word(h, at + 4 * k as u64);
-    }
-    matches!(move_value(&words[..n], 0), Some((k, value)) if k <= 4 && k < n && words[k] == svc_link && value == p.target)
+    natemu_abi::execution::link_point(|at| staged_word(h, at), h.code_size, p)
 }
 /// Walks the fetch of `va` (its page) for a request into `s.fetch[i]` and its leaf's flags into byte i of
 /// `Control::fetched` (or its failure into `s.fetch_fault`); for a block, marks it ([`mark`]).

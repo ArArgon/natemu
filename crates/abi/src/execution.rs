@@ -183,7 +183,7 @@ pub mod cache {
     pub const META_VA: u64 = PRIVATE + 0x3000_0000;
     pub const META_BYTES: usize = 64 * MIB;
     pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
-    pub const LOOKUP_BYTES: usize = (LINEAR_HEADS + 4 * LINEAR_BUCKETS).next_multiple_of(BLOCK);
+    pub const LOOKUP_BYTES: usize = (HINTS + 4 * HINT_ENTRIES).next_multiple_of(BLOCK);
     pub const GLOBAL_VA: u64 = PRIVATE + 0x3c00_0000;
     pub const GLOBAL_BYTES: usize = 2 * MIB;
     /// Mapping granule of the areas.
@@ -228,6 +228,11 @@ pub mod cache {
     /// blocks hashed to its pages. Dead blocks leave a chain when a walk of it meets them.
     pub const LINEAR_HEADS: usize = PAGE_BLOCKS + 4 * super::MAX_GUEST_PAGES;
     pub const LINEAR_BUCKETS: usize = 1 << 16;
+    /// Perf chunk 10, reuse inside the resident: a direct-mapped table of [`HINT_ENTRIES`] u32 (block number + 1) by a hash
+    /// of (guest-physical page, page offset, context), written for every [`RELOCATABLE`] block placed. A hint is only a
+    /// candidate: it is checked against the block's record on use, so nothing ever clears the table.
+    pub const HINTS: usize = LINEAR_HEADS + 4 * LINEAR_BUCKETS;
+    pub const HINT_ENTRIES: usize = 1 << 18;
 
     /// Global area layout, shared by all vCPUs and updated only by atomic read-modify-writes (host and resident): one
     /// shadow-reset counter (u64) per vCPU and the per-vCPU [`Events`] in its first 64 KiB; then the per-page structures,
@@ -355,7 +360,23 @@ pub mod cache {
         /// into them was before chunk 8), and how many.
         pub reclaims: u64,
         pub reclaimed: u64,
+        /// Perf chunk 10, reuse inside the resident, set by the host before the vCPU runs: [`REUSE_OFF`], [`REUSE_ON`] or
+        /// [`REUSE_CHECK`] (each copy is also asked of the host and must equal its answer); and up to four linear ranges
+        /// `[start, end)` the host answers or cuts blocks at (a test driver's hooks): no copy is made whose fetch would
+        /// reach one (the vCPU's stop RIP is checked as such a range too).
+        pub reuse: u64,
+        pub reuse_fences: [[u64; 2]; 4],
+        /// Blocks copied from a template instead of asked of the host; templates found but refused, by kind
+        /// ([`crate::execution::refusal`]; 0: a fence, a second page of another frame, a template that died); copies the
+        /// host's answer was compared with ([`REUSE_CHECK`]).
+        pub reuse_copies: u64,
+        pub reuse_refused: [u64; 5],
+        pub reuse_checks: u64,
     }
+    /// [`Control::reuse`].
+    pub const REUSE_OFF: u64 = 0;
+    pub const REUSE_ON: u64 = 1;
+    pub const REUSE_CHECK: u64 = 2;
     /// A block placed in the cache: its record in the metadata arena (at the offset `INDEX` lists), its access sites
     /// ([`crate::code_object::Site`]) right after it.
     #[repr(C)]
@@ -411,6 +432,12 @@ pub mod cache {
     pub const LARGE: u32 = 32;
     /// Perf chunk 8: a local link (records `[Control::links_tlb, Control::links)`) may enter it (never cleared: only its death prunes those links).
     pub const LOCAL_INBOUND: u32 = 64;
+    /// Perf chunk 10: the block may be copied to another RIP of its half and page offset (the host's template rule, kept
+    /// for its copies): its packed relocations ([`crate::execution::RELOC_MOVE`]) follow its sites, as many as its flags
+    /// hold at [`RELOCS_SHIFT`].
+    pub const RELOCATABLE: u32 = 128;
+    pub const RELOCS_SHIFT: u32 = 16;
+    pub const MAX_RELOCS: u32 = 0xff;
     impl Block {
         /// Its `JITCodeHeader` in the executable alias.
         pub fn code_va(&self) -> u64 {
@@ -504,7 +531,7 @@ pub mod cache {
     const _: () = assert!((CODE_VA | CODE_WRITE_VA | META_VA | LOOKUP_VA | GLOBAL_VA) % BLOCK as u64 == 0);
     const _: () = assert!(CODE_OFFSET % BLOCK == 0 && META_BYTES % BLOCK == 0);
     const _: () = assert!(core::mem::size_of::<Control>() <= L1_OWNERS && L1_OWNERS + 4 * L1_ENTRIES * L1_TABLES <= L2 && L2 + L2_ENTRIES * 16 <= INDEX);
-    const _: () = assert!(WRITABLE_SUMMARY + SUMMARY_BYTES <= PAGE_BLOCKS && PAGE_BLOCKS + 4 * super::MAX_GUEST_PAGES <= LINEAR_HEADS && LINEAR_HEADS + 4 * LINEAR_BUCKETS <= LOOKUP_BYTES);
+    const _: () = assert!(WRITABLE_SUMMARY + SUMMARY_BYTES <= PAGE_BLOCKS && PAGE_BLOCKS + 4 * super::MAX_GUEST_PAGES <= LINEAR_HEADS && LINEAR_HEADS + 4 * LINEAR_BUCKETS <= HINTS && HINTS + 4 * HINT_ENTRIES <= LOOKUP_BYTES);
     // The dispatcher's form; its `adr` and each entry's `cbnz` to the miss reach ±1 MiB.
     const _: () = assert!(L1_MASK == 0xfff && L1_ENTRY_BYTES == 32 && L1_CODE + L1_TABLES * L1_TABLE_BYTES - DISPATCH < 1 << 20);
     const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= LINKS);
@@ -659,6 +686,206 @@ pub fn move_value(words: &[u32], reg: u32) -> Option<(usize, u64)> {
         value = (value & !(0xffff << sh) | imm << sh) & mask;
     }
     Some((n, value))
+}
+
+/// A canonical linear address (48 bits).
+pub fn canonical(a: u64) -> bool {
+    a >> 47 == 0 || a >> 47 == 0x1ffff
+}
+/// The logical-immediate fields (N, immr, imms) of `v` as a `width`-bit bitmask, if it is one.
+pub fn logical_immediate(v: u64, width: u32) -> Option<(u32, u32, u32)> {
+    let mask = if width == 64 { u64::MAX } else { (1 << width) - 1 };
+    if v & !mask != 0 || v == 0 || v == mask {
+        return None;
+    }
+    let mut e = width;
+    while e > 2 && (v ^ v >> (e / 2)) & ((1 << (e / 2)) - 1) == 0 {
+        e /= 2;
+    }
+    let emask = if e == 64 { u64::MAX } else { (1 << e) - 1 };
+    let elem = v & emask;
+    let ones = elem.count_ones();
+    let run = if ones == 64 { u64::MAX } else { (1 << ones) - 1 };
+    // elem = ROR(run, r): find r by rotating elem left until it is the run at the bottom.
+    let r = (0..e).find(|&r| (elem << r | elem >> ((e - r) % e)) & emask == run)?;
+    let n = u32::from(e == 64);
+    Some((n, r, (!(2 * e - 1) & 0x3f) | (ones - 1)))
+}
+/// FEX's `Arm64Emitter::LoadConstant(i64, reg, c, NOPAD)` (series48-lean): the words that build `c` in `reg`, and how many.
+pub fn load_constant(c: u64, reg: u8) -> ([u32; 4], usize) {
+    let rd = u32::from(reg);
+    let mov = |op: u32, sf: u32, imm: u64, hw: u32| op | sf << 31 | hw << 21 | ((imm & 0xffff) as u32) << 5 | rd;
+    const MOVN: u32 = 0x1280_0000;
+    const MOVZ: u32 = 0x5280_0000;
+    const MOVK: u32 = 0x7280_0000;
+    if !c >> 16 == 0 {
+        return ([mov(MOVN, 1, !c, 0), 0, 0, 0], 1);
+    }
+    let (sf, segments) = if c >> 32 == 0 { (0, 2) } else { (1, 4) };
+    if sf == 0 && !c & 0xffff_0000 == 0 {
+        return ([mov(MOVN, 0, !c, 0), 0, 0, 0], 1);
+    }
+    let part = |i: u32| c >> (16 * i) & 0xffff;
+    if (0..segments).filter(|&i| part(i) != 0).count() > 1 {
+        if let Some((n, immr, imms)) = logical_immediate(c, if sf == 1 { 64 } else { 32 }) {
+            return ([0x3200_0000 | sf << 31 | n << 22 | immr << 16 | imms << 10 | 31 << 5 | rd, 0, 0, 0], 1);
+        }
+    }
+    if sf == 1 && !c >> 32 == 0 {
+        return ([mov(MOVN, 1, !c, 0), mov(MOVK, 1, c >> 16, 1), 0, 0], 2);
+    }
+    let (mut words, mut n) = ([0; 4], 0);
+    for i in (0..segments).filter(|&i| part(i) != 0) {
+        words[n] = mov(if n == 0 { MOVZ } else { MOVK }, sf, part(i), i);
+        n += 1;
+    }
+    if n == 0 {
+        (words[0], n) = (mov(MOVZ, sf, 0, 0), 1);
+    }
+    (words, n)
+}
+/// Reuse across load addresses (perf chunks 4 and 10), the one rule the host's relocator and the resident's copies share
+/// for a guest-RIP move: the 64-bit move into `reg` at the start of `words` (its first word, then the word after it, which
+/// must not join it) re-encoded by FEX's rules for its value plus `d`. Returns the new words (as many as before), their
+/// count and the old value; `None` when fexc's answer at the new RIP would not be these words: a 32-bit form before or
+/// after (conservative: slice1 is 64-bit only), a non-canonical new value, another word count, or a decode of the new
+/// words that is not the new value in as many words (an encoder fault caught here).
+pub fn relocate_move(words: &[u32], reg: u32, d: u64) -> Option<([u32; 4], usize, u64)> {
+    let (n, old) = move_value(words, reg)?;
+    let value = old.wrapping_add(d);
+    if words[0] >> 31 == 0 || !canonical(value) || reg > 30 {
+        return None;
+    }
+    let (new, k) = load_constant(value, reg as u8);
+    if k != n || new[0] >> 31 == 0 {
+        return None;
+    }
+    let mut check = [0; 5];
+    check[..n].copy_from_slice(&new[..n]);
+    let len = match words.get(n) {
+        Some(&next) => {
+            check[n] = next;
+            n + 1
+        }
+        None => n,
+    };
+    (move_value(&check[..len], reg) == Some((n, value))).then_some((new, n, old))
+}
+/// `p` names an exit of the code whose words `word` reads (`code_size` bytes) as admission returns it: its word is in the
+/// code and is `p.word`, the first of a move (`movz|movn|orr` from the zero register, then `movk`s; at most four words)
+/// building `p.target` in x0, and an `svc #LINK` follows the move (inside the code).
+pub fn link_point(word: impl Fn(u64) -> u32, code_size: u32, p: &LinkPoint) -> bool {
+    let at = u64::from(p.offset);
+    let svc_link = 0xd400_0001 | u32::from(svc::LINK) << 5;
+    if at % 4 != 0 || at < u64::from(ENTRY_OFFSET) || at + 8 > u64::from(code_size) || word(at) != p.word {
+        return false;
+    }
+    let mut words = [0u32; 5];
+    let n = ((u64::from(code_size) - at) / 4).min(5) as usize;
+    for (k, w) in words[..n].iter_mut().enumerate() {
+        *w = word(at + 4 * k as u64);
+    }
+    matches!(move_value(&words[..n], 0), Some((k, value)) if k <= 4 && k < n && words[k] == svc_link && value == p.target)
+}
+
+/// Perf chunk 10, reuse inside the resident: a placed block keeps its admitted object's guest-RIP relocations after its
+/// sites, one u32 each: the code offset / 4 above [`RELOC_MOVE`], a move's register below it (literal slots have 0), in
+/// increasing order (so by offset: [`relocate_code`] refuses any other order, and any overlap).
+pub const RELOC_MOVE: u32 = 1 << 5;
+/// The packed form of `r` (a guest-RIP literal or move of a block of `code_size` bytes); `Some(None)` for a kind no RIP
+/// is in (named symbol, dispatch branch); `None` for one that cannot be packed (it is then no template).
+pub fn pack_reloc(r: &crate::code_object::Reloc, code_size: u32) -> Option<Option<u32>> {
+    use crate::code_object as o;
+    let fits = |bytes: u32| r.offset % 4 == 0 && r.offset.checked_add(bytes).is_some_and(|e| e <= code_size);
+    match r.kind {
+        o::RELOC_GUEST_RIP_LITERAL if fits(8) => Some(Some(r.offset / 4 << 6)),
+        o::RELOC_GUEST_RIP_MOVE if fits(4) && r.register < 31 => Some(Some(r.offset / 4 << 6 | RELOC_MOVE | u32::from(r.register))),
+        o::RELOC_NAMED_SYMBOL_LITERAL | o::RELOC_DISPATCH_BRANCH => Some(None),
+        _ => None,
+    }
+}
+/// Why [`relocate_code`] refused (the index of `Control::reuse_refused`; 0 is the resident's own: a fence, a second page
+/// whose frame differs, a template that died).
+pub mod refusal {
+    /// Another half or page offset, or a non-canonical new RIP or block end.
+    pub const PLACE: usize = 1;
+    /// A literal slot outside the code or a non-canonical new value.
+    pub const LITERAL: usize = 2;
+    /// A move [`super::relocate_move`] refuses (its form, value, word count) or outside the code.
+    pub const MOVE: usize = 3;
+    /// A link point no move of x0 rewrote, or one that is not one after ([`super::link_point`]).
+    pub const LINK: usize = 4;
+}
+/// Perf chunk 10: rewrites `code`, the copied code of a block placed for `from` (its link points `links`, admitted for
+/// `from`; packed relocations `relocs`; `guest_bytes` long), into the block admission gives for the same bytes at `to`
+/// (same half and page offset), and `links` into its link points there. Under the relocation proof (perf plan chunk 3)
+/// only these change with the RIP: each literal slot's value and each move's words by `to - from`, and each link point's
+/// first word and target. Every rule of admission that reads the RIP is checked again here, the rest move with it
+/// (design study, "Which admission checks depend on the RIP"): the block's place, the relocations in offset order and
+/// none overlapping, each new value canonical, each move
+/// re-encoded in as many 64-bit words ([`relocate_move`]), each link point still a move of its new target into x0 and
+/// `svc #LINK` ([`link_point`]). Link points are first restored to their admitted words (a copy may be linked). `Err`:
+/// the [`refusal`] kind (nothing else may be assumed of `code` then).
+pub fn relocate_code(code: &mut [u8], relocs: &[u32], links: &mut [LinkPoint; MAX_LINK_POINTS], from: u64, to: u64, guest_bytes: u32) -> Result<(), usize> {
+    let d = to.wrapping_sub(from);
+    if (from ^ to) & (1 << 63 | 0xfff) != 0 || !canonical(to) || !to.checked_add(guest_bytes.into()).is_some_and(canonical) {
+        return Err(refusal::PLACE);
+    }
+    let size = code.len();
+    let word = |code: &[u8], at: usize| u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]);
+    for p in links.iter().filter(|p| p.offset != 0) {
+        let at = p.offset as usize;
+        if at % 4 != 0 || at + 4 > size {
+            return Err(refusal::LINK);
+        }
+        code[at..at + 4].copy_from_slice(&p.word.to_le_bytes());
+    }
+    let mut moved = [false; MAX_LINK_POINTS];
+    // Each relocation is rewritten once, in place: they must be in offset order, none starting inside the words or slot
+    // of the one before (admission does not refuse a duplicated or overlapping record; one moved twice would be + 2d).
+    let mut free = 0;
+    for &r in relocs {
+        let at = (r >> 6) as usize * 4;
+        if r & RELOC_MOVE == 0 {
+            if at < free || at + 8 > size {
+                return Err(refusal::LITERAL);
+            }
+            free = at + 8;
+            let value = u64::from_le_bytes(code[at..at + 8].try_into().unwrap()).wrapping_add(d);
+            if !canonical(value) {
+                return Err(refusal::LITERAL);
+            }
+            code[at..at + 8].copy_from_slice(&value.to_le_bytes());
+            continue;
+        }
+        if at < free || at + 4 > size {
+            return Err(refusal::MOVE);
+        }
+        let mut words = [0; 5];
+        let n = ((size - at) / 4).min(5);
+        for (k, w) in words[..n].iter_mut().enumerate() {
+            *w = word(code, at + 4 * k);
+        }
+        let reg = r & 31;
+        let Some((new, k, _)) = relocate_move(&words[..n], reg, d) else { return Err(refusal::MOVE) };
+        free = at + 4 * k;
+        for (j, w) in new[..k].iter().enumerate() {
+            code[at + 4 * j..at + 4 * j + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        for (i, p) in links.iter_mut().enumerate().filter(|(_, p)| p.offset != 0 && p.offset as usize == at) {
+            if reg != 0 || moved[i] {
+                return Err(refusal::LINK);
+            }
+            (p.word, p.target, moved[i]) = (new[0], p.target.wrapping_add(d), true);
+        }
+    }
+    let size = size as u32;
+    for (i, p) in links.iter().enumerate().filter(|(_, p)| p.offset != 0) {
+        if !moved[i] || !link_point(|at| word(code, at as usize), size, p) {
+            return Err(refusal::LINK);
+        }
+    }
+    Ok(())
 }
 /// The placeholder fexc emits for the resident to relocate when it places a block: a computed exit's branch (`b .`,
 /// becomes `b` to [`cache::DISPATCH`]).
@@ -1456,6 +1683,9 @@ pub mod stop {
     /// strict switch, or `device`): a precise stop with the state at the instruction (for a REP INS/OUTS, after the elements
     /// it completed), the access not made.
     pub const UNSUPPORTED_PORT: u64 = 49;
+    /// (Perf chunk 10, numbered apart.) Under the host's check of reuse inside the resident ([`super::cache::REUSE_CHECK`]),
+    /// a block copied from a template is not the host's answer at its RIP (code, sites, link points, exits or pages).
+    pub const REUSE_MISMATCH: u64 = 64;
 
     pub fn name(code: u64) -> &'static str {
         match code {
@@ -1477,6 +1707,7 @@ pub mod stop {
             HALTED => "halted",
             UNSUPPORTED_MMIO => "unsupported_mmio",
             UNSUPPORTED_PORT => "unsupported_port",
+            REUSE_MISMATCH => "reuse_mismatch",
             _ => "none",
         }
     }
@@ -1614,6 +1845,10 @@ pub struct State {
     /// step mark, set while the instruction at RIP runs alone because RFLAGS.TF was 1 at its start (SDM Vol.3 18.3.1.4;
     /// SYSCALL and SYSRET set it from the TF they leave).
     pub debug: u64,
+    /// With a block reply (perf chunk 10): 1 when the host found the block a template for reuse inside the resident (not a
+    /// step; no breakpoint, hook or stop cut its bytes and no halving retry; fexc's answer read neither to its bytes' end
+    /// nor beyond the block's pages; not `unsupported_form`), else 0.
+    pub relocatable: u64,
 }
 /// S4: [`State::debug`]'s fields.
 pub mod debug {
@@ -1697,6 +1932,7 @@ impl State {
             mailbox_acked: 0,
             mailbox_mark_ticks: 0,
             debug: 0,
+            relocatable: 0,
         }
     }
 }
@@ -1809,7 +2045,7 @@ pub mod perf {
         pub count: [u64; BUCKETS],
     }
     pub const MAGIC: u64 = 0x7065_7266_0001;
-    pub const BUCKETS: usize = 25;
+    pub const BUCKETS: usize = 26;
     pub const OFFSET: usize = super::STATE_OFFSET + 0xe40;
     pub const VA: u64 = crate::PRIVATE + OFFSET as u64;
     const _: () = assert!(super::MMIO_OFFSET + size_of::<super::Mmio>() <= OFFSET);
@@ -1854,9 +2090,12 @@ pub mod perf {
     /// Inside `enter`: the copies (the state record into its page, the native frame it is entered with: zeroing, building
     /// and copying, as far as they are copies); `enter` is the rest.
     pub const ENTER_COPY: u64 = 24;
+    /// Perf chunk 10: reuse inside the resident (a template's checks, its copy and the re-check; the second page's walk is
+    /// `fetch`, the host's answer under the check `host`).
+    pub const REUSE: u64 = 25;
     pub const NAMES: [&str; BUCKETS] = ["start", "guest", "host", "halted", "mailbox", "link", "miss", "division", "helper",
         "stop", "irq", "abort", "place", "system", "tlb", "delivery", "revalidate", "shadow", "fetch", "shootdown",
-        "lookup", "patch", "enter", "l1", "enter_copy"];
+        "lookup", "patch", "enter", "l1", "enter_copy", "reuse"];
 }
 
 #[cfg(test)]

@@ -186,9 +186,11 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         .map(|(v, (stop, compiles))| {
             let s: State = backing.vcpu(v).read_record(exec::STATE_OFFSET);
             let acked = if s.mailbox_acked == 0 { 0 } else { execution::ticks_ns(s.mailbox_acked) - execution::ticks_ns(backing.vcpu(v).epoch()) };
+            // Perf chunk 10: its host requests and its blocks copied in the resident (refused by kind, checked).
+            let c: exec::cache::Control = backing.vcpu(v).read_record(exec::cache::LOOKUP_OFFSET + exec::cache::CONTROL);
             format!(
-                "{{\"stop\":\"{}\",\"rip\":{},\"blocks\":{},\"compiles\":{compiles},\"halts\":{},\"interrupts\":{},\"mailbox\":[{},{},{acked},{}],\"shootdowns\":{},\"fault\":\"{:x?}\",\"state\":{}}}",
-                stop.replace('"', "'"), hex(s.cpu.rip), s.blocks, s.halts, s.interrupts, hex(s.mailbox), s.mailbox_wakes,
+                "{{\"stop\":\"{}\",\"rip\":{},\"blocks\":{},\"compiles\":{compiles},\"requests\":{},\"reuse\":[{},{:?},{}],\"halts\":{},\"interrupts\":{},\"mailbox\":[{},{},{acked},{}],\"shootdowns\":{},\"fault\":\"{:x?}\",\"state\":{}}}",
+                stop.replace('"', "'"), hex(s.cpu.rip), s.blocks, s.requests, c.reuse_copies, c.reuse_refused, c.reuse_checks, s.halts, s.interrupts, hex(s.mailbox), s.mailbox_wakes,
                 execution::ticks_ns(s.mailbox_mark_ticks) / 1000, s.shootdowns, s.fault, cpu_json(&s.cpu)
             )
         })
