@@ -1306,6 +1306,83 @@ optimistic); bytes and gating taken equal at the same guest-physical address (an
 compiles, are never counted as served: conservative); four busy loops stood in for the vCPUs in the cost replay; the
 worker's admission (to read the links) is not timed.
 
+### Measured (chunk 16, November 4; uncommitted on d2a3b0d, series52-adox66)
+
+**Outcome: not shipped.** The pool missed the ship threshold, so its code was not committed; the patch is kept at
+`natemu-raw/ahead-20261104-02/chunk16-pool.patch` (896 lines, against d2a3b0d) for a later ahead-of-use placement step, which
+would need its own gate. `NATEMU_AHEAD` below refers to that patch, not to the committed tree.
+
+**Built** (compile ahead, step 1 of the design: host only; `crates/host/src/execution/ahead.rs`, `execution.rs`, `linux.rs`).
+A pool of `fexc --serve` workers (each its own server at the utility class through `taskpolicy -c utility`, worker threads at
+`QOS_CLASS_UTILITY`, a 1 s compile deadline) per run's shared answers. After a request that compiled a block (not a step, no
+limit cut, no halving), the vCPU queues the block's exits (link targets, a call's return site) that lie in the bytes it
+copied (RIP through the walked pages; no guest walk, nothing marked), on a 64-job newest-first stack (a push past it drops the
+oldest, a RIP already waiting is not pushed again; an idle worker only is woken). A worker skips a job whose answer is kept or
+in flight, compiles the slice from the target to its page's end under the requesting vCPU's gating, arguments and block limit
+then, keeps it as an ordinary entry (`ahead`, `used` marked at first use) and, below the depth, admits it only to read its
+exits and queues those on the same bytes. Use is unchanged: `Entry::matches` at the vCPU's request, then relocation and
+admission at its RIP with its bytes. A vCPU whose block a worker is compiling from the same bytes and gating waits for that
+answer (in-flight table, at most 1 ms) instead of compiling it. Failures (fexc errors, dead servers) are dropped and counted,
+never the run's; `stop` discards waiting jobs and joins the workers. Under `--check-reuse` every ahead answer used is also
+compiled fresh and compared. Perf log: an `ahead` line (handoff, "Performance log"). **Off by default** (`NATEMU_AHEAD=on`, 2
+workers depth 3, or `WORKERS:DEPTH`): it did not pass the ship threshold.
+
+**Tests** (`ahead.rs`): the stack's bound, order, repeats and the stop's discard; job slices at page ends; a vCPU waits only
+for the same limit, bytes and gating, until the job lands, also when the worker panics (nothing kept, it compiles), and gives
+up at its bound; a worker whose server dies drops the job and restarts it next time; with `FEXC`, a worker compiles a block's
+exits to depth 2, a vCPU uses them without compiling (each counted served once, each checked against a fresh compile), and
+an ahead answer whose bytes changed before the request is not used.
+
+**Measured** (`natemu-raw/ahead-20261104-02/`: `campaign.sh`, `fill.sh`, `summ.py`, `runs/`, `inst/`, `log/`, `tune/`, `qos/`;
+the `natemu` stub, cache off, `mitigations=off nokaslr`, 2 GiB; base d2a3b0d and c16 (pool 2:3) interleaved, three rounds, one VM
+at a time, a run another VM overlapped rerun; every boot reached and benchmark verified; median (min-max), seconds; CPU and RSS
+the natemu process's):
+
+| Benchmark | N | before s | after s | change | CPU s before / after | RSS MB before / after |
+| --- | --- | --- | --- | --- | --- | --- |
+| installer | 1 | 8.10 (7.74-9.27) | 8.06 (7.68-8.11) | -0.4% | 8.1 / 11.0 | 557 / 605 |
+| installer | 4 | 6.54 (6.38-6.57) | 6.34 (6.22-6.40) | -3.0% | 10.1 / 13.2 | 926 / 973 |
+| `build` | 1 | 20.01 (19.90-20.78) | 20.24 (19.90-20.48) | +1.1% | 23.2 / 28.3 | 1114 / 1181 |
+| `build` | 4 | 9.28 (9.24-9.38) | 9.34 (9.23-9.49) | +0.7% | 31.9 / 37.6 | 1552 / 1596 |
+
+**Ship threshold not met**: installer N = 4 -3.0% with touching ranges, the other cells within spread, `build` N = 1 slightly
+slower; CPU +3-6 s a run, RSS +45-70 MB. The default is off; the code stays for step 2 (owner's call).
+
+**Counters** (one log run per cell, `log/`):
+
+| Run | vCPU compiles (base log) | ahead compiled | served | waited, then served (mean wait) | late | wasted | worker CPU (servers + threads) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| installer N = 1 | 57.0 k (126.6 k) | 129.7 k | 38.8 k | 30.8 k (21 us) | 14.9 k | 60 k | 2.0 + 1.4 s |
+| installer N = 4 | 84.7 k (132 k, gate) | 113.0 k | 33.2 k | 13.5 k (44 us) | 20.1 k | 66 k | 3.4 + 2.3 s |
+| `build` N = 1 | 99.0 k (229.6 k, gate) | 221.1 k | 67.3 k | 63.6 k (21 us) | 27.6 k | 90 k | 3.5 + 2.4 s |
+| `build` N = 4 | 158.2 k (249.3 k, gate) | 201.4 k | 62.3 k | 28.8 k (41 us) | 41.8 k | 110 k | 5.9 + 4.3 s |
+
+Waits gave up at 1 ms 3-6 times a run (longest 1.5-2.8 ms); no job failed; drops only at N = 4 (14-20 k); servers' maximum
+RSS 6-7 MB; kept answers at the installer's end 187 k (117 MB). **Why the wall does not follow:** the vCPU's request time
+(installer N = 1, log runs) falls only 2.95 -> 2.52 s: fexc 2.19 -> 1.20 s, but the waits add 0.65 s (lookup 0.07 -> 0.72 s) and
+the compiles a vCPU still makes slow from 17.3 to 20-22 us each with any pool (1:1, 1:3, 2:2, 2:3, 4:3: 2.5-2.9 s of
+requests), the servers interfering on the same cores. A wait costs about a compile (21 us): a depth-1 job starts about when
+its predecessor is admitted and is asked for 4 us later; only depth 2-3 jobs land in time (31% of base compiles served at
+N = 1, the gate's simulation at 32 us: 34%). Tuning (`tune/`, `qos/`, one run each): depth 2 or 3, 1-4 workers, the wait
+bound 0, 30 us or 1 ms, and the default class instead of utility (waits still 22 us) all landed within the base runs' noise (7.6-8.5 s; one default-class run 9.3 s).
+
+**Checks** (`suite/`, the final tree, one VM runner at a time, outputs deleted as each case ended): `cargo test` 176 + 1
+ignored, also with `FEXC` set; the resident stack audit; `run_slice1_vm.py`, `run_slice1_faults.py` (default block size),
+`run_slice3_vm.py contain` and `smp`, `run_k1.py`, `run_boot_smoke.py` 4/4, `run_r1.py r1a` and `r1b` all ok, and
+`run_boot_smoke.py` and `r1b` again with `NATEMU_AHEAD=on` ok; `boot-linux --check-reuse --code-shape` installer boots with the
+pool on at N = 1 and 4 reached with no mismatch (63.7 k and 69.9 k vCPU compiles; `check/`).
+
+**Independent review** (read-only): no blocking defect (argument identity between vCPU and worker requests, slices, the
+excluded cases, lock order, wakeups, shutdown checked). Applied: a long wait bound in the wait test (it could time out under
+load), a 1 s worker compile deadline (a hung server would hold the run's end up to 30 s), the first failure reported on
+standard error, a test comment that overclaimed. Noted: duplicate jobs are keyed by RIP and limit only (a stale job can
+shadow a newer one: lost hits, not wrong answers); workers also fill the persistent cache with speculative answers; ahead
+answers share the in-memory generation bounds.
+
+**Next** (from the evidence): step 2 (placing ahead answers in the VM) saves the 4 us request on top of the compile, but only
+for answers in time (about a third here) and keeps the interference; it needs its own gate on these counts first. Otherwise
+the syscall path and single-thread code generation, as chunk 14 found.
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
@@ -1352,7 +1429,8 @@ kept: installer N = 4 -28%, `build` N = 4 -28%.)
 **Translating ahead of use.** After admission, queue the block's link targets (1339) on pages this request fetched (no
 host walk of guest tables) to idle pool servers; answers enter the shared cache keyed by bytes read, used only if the
 resident's bytes match (695). Worst case a wasted compile; bounded queue; host cores are the risk. *Decides:* share of
-requests at a predecessor's target on a fetched page, then the speculative hit rate.
+requests at a predecessor's target on a fetched page, then the speculative hit rate. (Built in chunk 16, off by default:
+31% of compiles served ahead and half the rest waited for, but no wall gain beyond the spread.)
 
 **Placing successors in the resident ahead of use.** A translate reply may carry admitted successors on pages the
 resident marked for this request; it places each under the block's race rule (`kept`: a write since the mark kills

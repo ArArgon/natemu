@@ -113,6 +113,7 @@ per-vCPU breakdowns): `natemu-raw/bench-baseline-20261104-01/` (`table.md`, `run
 | | natemu, chunk 12 | 20.39 | - | - | - |
 | | natemu, chunk 13 | - | - | - | **9.26** |
 | | natemu, chunk 14 | 20.29 | 13.08 | 10.31 | 9.23 |
+| | natemu, chunk 16 pool on (not shipped) | 20.24 | - | - | 9.34 |
 | | QEMU multi | 28.3 | 15.3 | 13.5 | 12.5 |
 | | native | 2.61 | 1.40 | 1.20 | 1.09 |
 | `zstd` (all phases) | natemu | 2.26 | 1.74 | 1.63 | 1.71 |
@@ -143,6 +144,10 @@ Rows "chunk 14" (every cell rerun): after the kept global shadows and the vCPU Q
 "Measured (chunk 14)", edfcee9 plus the change, series52-adox66, `natemu-raw/mcore-20261104-01/`; its own before, edfcee9, in
 the same interleaved campaign: `build` 20.67 / 13.11 / 10.46 / 9.61, `zstd` 2.13 / 1.45 / 1.28 / 1.24, `hackbench` 30.32 / 16.17 /
 11.55 / 9.41, `locks` 11.01 / 5.87 / 4.55 / 5.00). Speedup N = 1 to 4 now: `zstd` 1.87, `hackbench` 3.35, `locks` 2.33, `build` 2.20.
+
+Rows "chunk 16": the compile-ahead pool on (`NATEMU_AHEAD=on`; [perf-plan.md](perf-plan.md), "Measured (chunk 16)", d2a3b0d
+plus the change, `natemu-raw/ahead-20261104-02/`); its own before, d2a3b0d: `build` 20.01 / 9.28; installer cache off N = 1
+8.10 -> 8.06, N = 4 6.54 -> 6.34. Within spread: the pool is off by default, so the shipped tree's numbers are chunk 14's.
 
 Rows "chunk 11": after the link-record fix ([perf-plan.md](perf-plan.md), "Measured (chunk 11)", November 4, 245700d plus
 the change; `natemu-raw/linkfix-20261104-01/`, same harness and rules, median of three; `-`: not rerun). Rows "chunk 12":
