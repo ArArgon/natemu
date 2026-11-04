@@ -610,11 +610,8 @@ unsafe fn reused(s: &mut State, context: u64) -> Result<Reply, Option<&'static B
     if let Some(b) = template {
         let p = crate::perf::enter(crate::perf::REUSE);
         let crosses = (rip & 4095) + u64::from(b.guest_bytes) > 4096;
-        // The bytes the host would fetch: to the page's end, or the next page's when the block crosses (`last` its last byte:
-        // no wrap at the top of the address space).
-        let last = (rip & !4095).wrapping_add(if crosses { 8191 } else { 4095 });
-        let fenced = |(start, stop): (u64, u64)| start <= last && rip < stop;
-        let mut refused = c.reuse_fences.iter().any(|&[a, b]| fenced((a, b))) || fenced((s.stop_at, s.stop_at.wrapping_add(1)));
+        let fenced = |fence| natemu_abi::execution::reuse_fenced(rip, crosses, fence);
+        let mut refused = c.reuse_fences.iter().any(|&f| fenced(f)) || fenced([s.stop_at, s.stop_at.wrapping_add(1)]);
         let generation = s.generation;
         if !refused && crosses {
             fetch_page(s, (rip & !4095).wrapping_add(4096), 1, true);

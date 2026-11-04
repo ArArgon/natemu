@@ -1318,11 +1318,12 @@ fn fetched(area: Area, state: &State, limit: Option<u64>) -> Result<std::result:
             None => Ok(Err(Stop::NoCode("fetch_not_ram".into()))),
         };
     }
-    // Bytes of [va, the end of its page), cut at the limit when it lies inside; and whether it did.
+    // Bytes of [va, the end of its page), cut at the limit when it lies inside or at the page's end (a limit at the next
+    // page's first byte must stop the next page from being fetched or asked for); and whether it did.
     let span = |va: u64| {
         let rest = 4096 - (va & 4095);
         match limit {
-            Some(l) if l > va && l - va < rest => (l - va, true),
+            Some(l) if l > va && l - va <= rest => (l - va, true),
             _ => (rest, false),
         }
     };
@@ -2000,6 +2001,15 @@ mod tests {
         (s.fetch, s.fetch_fault) = ([0x5000, 0x9000], [exec::fetch::NONE; 3]);
         let f = fetched(area, &s, Some(0x2004)).unwrap().unwrap();
         assert_eq!((&f.bytes[14..], f.more), (&[0xaa, 0xaa, 0xbb, 0xbb, 0xbb, 0xbb][..], false));
+        // A limit exactly at the next page's first byte: nothing of that page, walked or not, and it is not asked for.
+        let f = fetched(area, &s, Some(0x2000)).unwrap().unwrap();
+        assert_eq!((f.bytes, f.more, f.cut), (vec![0xaa; 16], false, true));
+        s.fetch = [0x5000, u64::MAX];
+        let f = fetched(area, &s, Some(0x2000)).unwrap().unwrap();
+        assert_eq!((f.bytes.len(), f.more, f.cut), (16, false, true));
+        // Past the page: not a cut.
+        let f = fetched(area, &s, Some(0x2001)).unwrap().unwrap();
+        assert_eq!((f.bytes.len(), f.more, f.cut), (16, true, false));
         (s.fetch, s.fetch_fault) = ([u64::MAX; 2], exec::fetch::encode(Fault::Noncanonical));
         assert!(matches!(fetched(area, &s, None), Ok(Err(Stop::FetchFault(Fault::Noncanonical)))));
         // The word copy (perf chunk 7) equals the byte copy at every alignment and length around a word, and refuses past RAM.

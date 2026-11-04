@@ -863,8 +863,12 @@ After the coordinator's containment review (nothing blocking): the order and ove
 relocations and template bit; rerun (`followup/`): `cargo test` 162 + 1 ignored with `FEXC` set, the four reuse programs (32
 runs) green, a `--check-reuse` installer boot at N = 1 851,238 copies checked, 0 mismatches, 968 + 7 refused (as before).
 Noted, not changed: a refused crossing copy leaves its second page marked and walked (A bits; conservative); and, before this
-chunk, the host ignores a limit at the first byte of the next page (`fetched`'s `span`), which in-VM reuse cannot reach (it
-refuses at any armed breakpoint and fence).
+chunk, the host ignored a limit at the first byte of the next page (`fetched`'s `span`), which in-VM reuse cannot reach (it
+refuses at any armed breakpoint and fence). Fixed after 87c40c1: a limit at a page's end now cuts its bytes there, so the next
+page is neither fetched nor asked for (before, a block starting on the previous page ran past a breakpoint, hook or stop RIP at
+the next page's first byte); the resident's fence test is `natemu_abi::execution::reuse_fenced`, unit-tested at the page
+boundaries and the top of the address space. Rerun (`span/`): `cargo test` 163 + 1 ignored with `FEXC` set, fixtures 64,
+faults 7,912, `run_k1.py` 280 runs, `run_s4.py`, `run_x1.py` 6/6 and 196/196, `run_boot_smoke.py` 4/4.
 
 The measurements are of the build before these changes (none is on the boot's path but the check's); the final build, in two
 interleaved rounds with the measured one later (the machine then a little slower): N = 1 8.78 and 8.87 s against 8.76 and 8.81 s.

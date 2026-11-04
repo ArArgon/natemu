@@ -804,6 +804,15 @@ pub fn pack_reloc(r: &crate::code_object::Reloc, code_size: u32) -> Option<Optio
         _ => None,
     }
 }
+/// Perf chunk 10: whether the host's limit range `[start, stop)` (a hook's RIP or range, the stop RIP) lies in the bytes the
+/// host would fetch for a block at `rip` (to its page's end, through the next page's when the block `crosses`): the host
+/// would cut there, so no copy is made. A limit at the next page's first byte reaches only a crossing block (the host cuts
+/// a page's bytes at a limit at its end too, `execution::fetched`); `last` is the last byte, so nothing wraps at the top of
+/// the address space.
+pub fn reuse_fenced(rip: u64, crosses: bool, [start, stop]: [u64; 2]) -> bool {
+    let last = (rip & !4095).wrapping_add(if crosses { 8191 } else { 4095 });
+    start <= last && rip < stop
+}
 /// Why [`relocate_code`] refused (the index of `Control::reuse_refused`; 0 is the resident's own: a fence, a second page
 /// whose frame differs, a template that died).
 pub mod refusal {
@@ -2100,6 +2109,24 @@ pub mod perf {
 
 #[cfg(test)]
 mod tests {
+
+    /// A fence at the next page's first byte reaches a block crossing into that page only; one at the RIP always; one
+    /// ending at the RIP, or past the bytes, never; and nothing wraps at the top of the address space.
+    #[test]
+    fn reuse_fences_reach_the_bytes_fetched() {
+        let rip = 0x7f00_0000_1ff0;
+        assert!(!reuse_fenced(rip, false, [0x7f00_0000_2000, 0x7f00_0000_2001]));
+        assert!(reuse_fenced(rip, true, [0x7f00_0000_2000, 0x7f00_0000_2001]));
+        assert!(reuse_fenced(rip, false, [0x7f00_0000_1fff, 0x7f00_0000_2000]));
+        assert!(!reuse_fenced(rip, true, [0x7f00_0000_3000, 0x7f00_0000_3001]));
+        assert!(reuse_fenced(rip, false, [rip, rip + 1]) && !reuse_fenced(rip, false, [rip - 16, rip]));
+        assert!(reuse_fenced(rip, true, [0, u64::MAX]));
+        let top = 0xffff_ffff_ffff_f800;
+        assert!(reuse_fenced(top, false, [0xffff_ffff_ffff_fff0, 0xffff_ffff_ffff_fff1]));
+        assert!(reuse_fenced(0xffff_ffff_ffff_e800, true, [0xffff_ffff_ffff_f000, 0xffff_ffff_ffff_f001]));
+        // No stop RIP (`u64::MAX`): its range [MAX, 0) is empty.
+        assert!(!reuse_fenced(top, false, [u64::MAX, 0]));
+    }
     /// The entry frame's unwritten rest: zero passes; a written field may hold anything; any other field fails.
     #[test]
     fn entry_frame_rest() {
