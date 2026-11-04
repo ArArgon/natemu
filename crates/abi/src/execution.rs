@@ -668,6 +668,18 @@ pub const MAX_LINK_POINTS: usize = 4;
 /// The static-register map (FEX `x64::SRA`) admission pins for every block: native registers of RAX..R15, then PF
 /// and AF. Guest state is in these registers at every block entry and exit.
 pub const SRA: [u8; 18] = [4, 7, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 29, 26, 27];
+/// The native frame a block is entered with (`Shared::initial`) is built in place: at every entry the resident writes
+/// the static registers ([`SRA`]: GPRs, PF, AF), x28, SP, v16..v31, FPCR and FPSR, and nothing writes the rest, which
+/// the host zeroes and the resident's start zeroes again. Whether that rest is zero (the host checks it at every stop).
+pub fn entry_frame_rest_zero(f: &crate::NativeFrame) -> bool {
+    let mut rest = *f;
+    for &r in &SRA {
+        rest.x[r as usize] = 0;
+    }
+    (rest.x[28], rest.sp, rest.fpcr, rest.fpsr) = (0, 0, 0, 0);
+    rest.q[XMM_VREG..].fill([0; 16]);
+    rest == crate::NativeFrame::ZERO
+}
 
 /// Guest RFLAGS bits slice-1 code computes (CF PF AF ZF SF OF).
 pub const ARITHMETIC_FLAGS: u64 = 0x8d5;
@@ -1797,7 +1809,7 @@ pub mod perf {
         pub count: [u64; BUCKETS],
     }
     pub const MAGIC: u64 = 0x7065_7266_0001;
-    pub const BUCKETS: usize = 24;
+    pub const BUCKETS: usize = 25;
     pub const OFFSET: usize = super::STATE_OFFSET + 0xe40;
     pub const VA: u64 = crate::PRIVATE + OFFSET as u64;
     const _: () = assert!(super::MMIO_OFFSET + size_of::<super::Mmio>() <= OFFSET);
@@ -1839,13 +1851,31 @@ pub mod perf {
     /// Switching the dispatcher's L1 table when the code context changes (`select_l1`; a table cleared for a context that
     /// had none included).
     pub const L1: u64 = 23;
+    /// Inside `enter`: the copies (the state record into its page, the native frame it is entered with: zeroing, building
+    /// and copying, as far as they are copies); `enter` is the rest.
+    pub const ENTER_COPY: u64 = 24;
     pub const NAMES: [&str; BUCKETS] = ["start", "guest", "host", "halted", "mailbox", "link", "miss", "division", "helper",
         "stop", "irq", "abort", "place", "system", "tlb", "delivery", "revalidate", "shadow", "fetch", "shootdown",
-        "lookup", "patch", "enter", "l1"];
+        "lookup", "patch", "enter", "l1", "enter_copy"];
 }
 
 #[cfg(test)]
 mod tests {
+    /// The entry frame's unwritten rest: zero passes; a written field may hold anything; any other field fails.
+    #[test]
+    fn entry_frame_rest() {
+        let mut f = crate::NativeFrame::ZERO;
+        assert!(entry_frame_rest_zero(&f));
+        (f.x[4], f.x[28], f.sp, f.fpcr, f.q[16], f.q[31]) = (1, 2, 3, 4, [5; 16], [6; 16]);
+        assert!(entry_frame_rest_zero(&f));
+        let pokes: [fn(&mut crate::NativeFrame); 6] =
+            [|f| f.x[0] = 1, |f| f.x[18] = 1, |f| f.x[30] = 1, |f| f.q[15][0] = 1, |f| f.nzcv = 1 << 30, |f| f.reserved = 1];
+        for poke in pokes {
+            let mut g = f;
+            poke(&mut g);
+            assert!(!entry_frame_rest_zero(&g));
+        }
+    }
     /// Reserved logical immediates are `None`, among them N = 0 with imms = 63 (no element size).
     #[test]
     fn bitmask_reserved_encodings() {

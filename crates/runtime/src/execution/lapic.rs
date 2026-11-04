@@ -163,7 +163,7 @@ fn controller(s: &mut State, eoi: bool, value: u64) -> u64 {
     let bytes = size_of::<State>();
     unsafe {
         let saved = read_record(exchange);
-        write_record(exchange, Mmio { write: u64::from(eoi), value, completed: saved.completed, ..Mmio::default() });
+        write_record(exchange, &Mmio { write: u64::from(eoi), value, completed: saved.completed, ..Mmio::default() });
         (s.request, s.reply) = (REQUEST_IRQ, NONE);
         copy_record(record().cast(), (&raw const *s).cast(), bytes);
         let p = crate::perf::enter(crate::perf::HOST);
@@ -175,7 +175,7 @@ fn controller(s: &mut State, eoi: bool, value: u64) -> u64 {
         if s.reply != REPLY_IRQ || m.status != natemu_abi::execution::mmio::DONE {
             halt(s, stop::BAD_REPLY)
         }
-        write_record(exchange, saved);
+        write_record(exchange, &saved);
         m.value & 0xff
     }
 }

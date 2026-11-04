@@ -1,6 +1,6 @@
 # Performance phase plan (draft)
 
-Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review; chunks 1-8 measured below (chunk 5 uncommitted on d89bc4c, chunk 7 on 0da552a, chunk 6 on ea11225, chunk 8 on 1c4d8b9). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
+Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review; chunks 1-9 measured below (chunk 5 uncommitted on d89bc4c, chunk 7 on 0da552a, chunk 6 on ea11225, chunk 8 on 1c4d8b9, chunk 9 on 9ba60d5). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
 code, measured first; the correctness pass follows. Principles: measure first; native mechanisms; nothing keyed to
 Linux (a KASLR boot must gain too); every object still admitted; checks green; no debt.
 
@@ -706,6 +706,74 @@ flagged), all 0 failures; every measurement boot reached the dialog. The reworke
 block sizes, red under the 2 MiB mutation (r9 6). Not rerun: the rest of the standing suite (the change is in the resident's
 link and TLB bookkeeping, which these exercise).
 
+### Measured (chunk 9: cheaper resident entry, November 3; uncommitted on 9ba60d5, series48-lean)
+
+**Cause first** (design study on 0da552a: about 550 of the about 990 cycles of an `enter` were copies; measured here with a
+new perf bucket `enter_copy`, the copies inside `enter`, the rest staying in `enter`). Before (9ba60d5), N = 1 cache off, log
+on, all threads: 6.39 M entries, `enter` 0.21 s plus `enter_copy` 0.98 s (0.15 us of copying per entry: an 800-byte
+`memset` of the frame, a 1,408-byte `memcpy` of the state into `write_record`'s argument, then the volatile copies of the
+state and the frame, 8 bytes a step). Around it, each dispatcher miss loaded the state and `memcpy`d it into `dispatch`, which
+`memcpy`d it into `enter`; the linker likewise, and searched the block index twice for the same `svc`. `run_k2.py cost`
+(N = 1 M, 5 reps): CLI 0.48 us per iteration, the `svc #DIV` round trip 0.151 us.
+
+**Built** (resident; `crates/runtime/src/record.rs`, `execution.rs`; abi; host one check), in the study's order, each step
+measured below:
+1. `dispatch`, `enter` and `step` take the state by reference, `write_record` takes `&T`: every call site passes its own
+   local (the callees never return), so the copies only went. The fault and step helpers that take a copy keep theirs.
+2. `copy_record` copies 32 bytes a step (two `ldp`/`stp` pairs in an `asm!`, which the compiler treats as touching any
+   memory, so the copy stays ordered as the volatile one was), then 8: the state record is 44 steps, a frame 25.
+3. The entry frame is built in place in `Shared::initial`: `enter` writes the static registers (`SRA`: GPRs, PF, AF), x28,
+   SP, v16..v31, FPCR and FPSR at every entry, as it wrote them into a zeroed frame before; nothing writes the rest, which
+   the host zeroes and `start` zeroes again. No `memset`, no frame copy.
+4. `linker` calls `block_at` once (nothing between the two calls changed the cache).
+
+`tables::select` already returns after one `mrs` when CPL is unchanged (not touched). The perf bucket `enter_copy` (25
+buckets, record still at `STATE_OFFSET + 0xe40`) stays. Generated code, the record layouts and the frame's contents are
+unchanged. Disassembly (release resident): `enter` no longer calls `memset` or `memcpy` (before: one each, plus the two
+volatile copies), `missed`, `dispatch` and `linker` no `memcpy` (before: 1, 2 and 2), `linker` one `block_at` (before 2).
+`check_resident_stack.py` `ok`: gate bound 16,368 bytes (before 19,184), with a nested entry 20,512 (23,328), boot 8,672
+(12,848).
+
+**Exactness.** The state record and every banked value are written as before; only how many times the bytes are moved
+changed. The frame equals the old one when its unwritten rest is zero: `natemu_abi::execution::entry_frame_rest_zero`, which
+the host checks at every resident stop (a host error otherwise; unit test with each kind of field). A diagnostic build
+(`variant.py diag`, removed) also built the old frame at every entry and halted on any difference: the installer boot at
+N = 1 (12.6 s) and N = 4, faults 7,912 at both block sizes, `run_i5a_faults.py` 454 and `delivery` 0 failures, no halt.
+Negative controls (`nc/`): `enter` also writing x0 makes every `run_k2.py cost` program a host error ("the resident's entry
+frame holds a field it does not write"; 10 of 10, the unchanged build 0); v16 left unwritten makes `run_i5a_faults.py` red
+(329 of 454 not as expected).
+
+**Measured** (`natemu-raw/perf9-20261103-01/`: `campaign9.sh`, `one.sh`, `boot.py`, `runs/`, `table9.txt`; installer to
+"Select a language", 2 GiB, `mitigations=off nokaslr`, cache off, one VM at a time, a warm-up boot per build, three
+interleaved rounds over the five builds; N = 4 one boot each; one log-on boot per build; mean, min-max; no other VM ran):
+
+| Installer, cache off | before (9ba60d5) | 1. by reference | 2. 32-byte copies | 3. frame in place | 4. one `block_at` (**after**) |
+| --- | --- | --- | --- | --- | --- |
+| N = 1 wall s, log off | 13.09 (13.03-13.20) | 12.19 (12.09-12.25) | 11.10 (11.02-11.18) | 10.89 (10.81-11.00) | **10.82** (10.78-10.87) |
+| "Run /init" guest s, N = 1 | 3.02 | 2.87 | 2.72 | 2.68 | 2.66 |
+| N = 4 wall s, log off (one boot) | 12.54 | | | | **11.01** |
+| Log on, all threads s: `enter` / `enter_copy` | 0.21 / 0.98 | 0.20 / 0.64 | 0.20 / 0.29 | 0.20 / 0.08 | 0.20 / 0.08 |
+| Log on: misses / linker entries / guest code / aborts s | 0.82 / 1.68 / 2.03 / 0.73 | 0.56 / 1.42 / 1.99 / 0.62 | 0.45 / 1.18 / 1.84 / 0.47 | 0.44 / 1.17 / 1.81 / 0.47 | 0.43 / 1.09 / 1.81 / 0.46 |
+| `run_k2.py cost` us per iteration: CLI / POPF / CPUID / `svc #DIV` | 0.476 / 0.532 / 0.483 / 0.151 | 0.364 / 0.425 / 0.369 / 0.150 | 0.256 / 0.311 / 0.262 / 0.097 | 0.221 / 0.274 / 0.227 / 0.096 | **0.216 / 0.270 / 0.224 / 0.097** |
+
+**Ship threshold met**: -2.27 s (-17%) at N = 1 against spreads of at most 0.17 s, -1.53 s (-12%) at N = 4 (one boot each);
+every step faster, nothing slower; all 31 boots (29 here, 2 diagnostic) reached the dialog. An entry now costs 0.044 us in `enter` (0.19 before);
+the resident's buckets fall 2.35 s on the log-on boots (`enter` 0.91, linker 0.58, misses 0.38, aborts 0.27, guest code
+0.21: `finish`'s frame capture runs before the entry kind is charged), about the wall's gain. A system instruction's round
+trip falls from 0.48 to 0.22 us, the division's from 0.151 to 0.097.
+
+**Checks** (`suite/`, `suite9.sh`, on the shipped tree, series48-lean, 2 GiB): `cargo test` 160 + 1 ignored, also with `FEXC`
+set; `check_resident_stack.py` `ok` (16,368 / 20,512 / 8,672 bytes: 2,816, 2,816 and 4,176 less than chunk 8's); fixtures 64
+and seed 44 at both block sizes; faults 7,912 at both; `run_slice3_vm.py` `delivery`, `events`, `system`, `contain` (423
+controls) and `smp` 0 failures; `run_k1.py` 248 runs, no failure, 14 and 14 requests at K and 2K rounds; `run_k2.py`;
+`run_s4.py` (QEMU's two known aborts on `s4-d-stack` recorded as departures, as before); `run_x1.py` 6/6 and 196/196;
+`run_x3.py` 9/9, 4/4, 24/24, 6/6, 10/10, 54/54; `run_i5a_faults.py` 454; `run_i5c.py` 255 at both block sizes;
+`run_i6b.py` corpus 112 and cases 129 at both; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative
+controls flagged); all 0 failures. The first pass ran out of disk at `system` (earlier suites' per-case outputs had
+filled it); after space was freed `suite9.sh` reran from `system` on (`FROM=system`), deleting each case's output as it
+ended (`results-pass1.txt` keeps the first pass). Per-case outputs and the
+per-request logs deleted after analysis.
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
@@ -769,7 +837,8 @@ shared-memory ring with a native wait only if material; staging, placement; admi
 **Resident entry cost.** About 0.36 us fixed per entry, 0.167 us the cheapest (plan, P2 row). Ticks in `bank`
 (`runtime/src/execution.rs:1502`), `sse::bank` (`sse.rs:28`), `block_at`, `enter` (715-757), `tables::select`
 (`tables.rs:67`); then copy only what changed, skip `tables::select` when CPL and root are unchanged, link exits into
-kept system records.
+kept system records. (Chunk 9: the copies cut, 0.19 to 0.044 us of `enter` per entry; `tables::select` already
+skipped; copying only what changed dropped, it would put exact fault state at risk for about 10 ns.)
 
 **Uncached RAM.** About 4.5 us per UC access through the step block; the boot's `cache_disable` window is about 533
 accesses (2.5 ms). If `uncached_steps` makes it material: keep step translations in the resident.

@@ -71,9 +71,9 @@ fn access(s: &mut State, port: u64, size: u64, data: Option<u64>) -> u64 {
     unsafe {
         let completed = read_record(exchange).completed;
         let request = Mmio { gpa: port, width: size, write: u64::from(data.is_some()), value: data.unwrap_or(0), completed, ..Mmio::default() };
-        write_record(exchange, request);
+        write_record(exchange, &request);
         (s.request, s.reply) = (REQUEST_PORT, NONE);
-        write_record(record(), *s);
+        write_record(record(), s);
         // Every earlier access of this vCPU is complete before the device sees this one.
         let p = crate::perf::enter(crate::perf::HOST);
         asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);

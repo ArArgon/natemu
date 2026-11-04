@@ -84,17 +84,19 @@ fn halt(s: &State, reason: u64) -> ! {
     served(&mut s);
     reset_shadows(&mut s);
     s.stop = reason;
-    unsafe { write_record(record(), s) };
+    unsafe { write_record(record(), &s) };
     stop(SUCCESS, reason)
 }
 
 pub unsafe fn start() -> ! {
     crate::perf::start();
+    // The entry frame's fields `enter` never writes are zero ([`enter`]).
+    unsafe { (*shared()).initial = NativeFrame::ZERO };
     let mut s = unsafe { load() };
     if s.cpu.control().is_none() || s.request != NONE || s.vcpu >= s.vcpus || s.vcpus as usize > cache::MAX_VCPUS {
         // Before anything is shadowed or marked (and before the vCPU number is known to be valid).
         s.stop = stop::UNSUPPORTED_MODE;
-        unsafe { write_record(record(), s) };
+        unsafe { write_record(record(), &s) };
         stop(SUCCESS, s.stop)
     }
     // The dispatcher's miss is its last word, where L1 entries branch to.
@@ -117,12 +119,12 @@ pub unsafe fn start() -> ! {
     if s.mailbox != 0 {
         events::wait_mailbox(&mut s);
     }
-    unsafe { dispatch(s) }
+    unsafe { dispatch(&mut s) }
 }
 
 /// Enters the block for `s.cpu.rip`, or steps its first instruction when a write killed it as it was placed.
-unsafe fn dispatch(mut s: State) -> ! {
-    match unsafe { find(&mut s) } {
+unsafe fn dispatch(s: &mut State) -> ! {
+    match unsafe { find(s) } {
         Some(block) => unsafe { enter(s, block) },
         None => step(s),
     }
@@ -416,14 +418,16 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
         bank(&mut s.cpu, frame, frame.nzcv, true);
         s.cpu.rip = frame.x[0];
         s.linker += 1;
+        // The block that ran the `svc` (one search: nothing below changes the cache before `find`).
+        let ran = cache::block_at(elr.wrapping_sub(4));
         // A REP string's self-exit (X2): the boundary is between two of its iterations.
-        if let Some(b) = cache::block_at(elr.wrapping_sub(4)).filter(|b| link_point_of(b, elr.wrapping_sub(4)).is_some_and(|o| b.rep_exit(o))) {
+        if let Some(b) = ran.filter(|b| link_point_of(b, elr.wrapping_sub(4)).is_some_and(|o| b.rep_exit(o))) {
             rep_exited(&mut s, b);
         }
         completed(&mut s);
         // The RIP must be one of the block's link targets (its `svc #LINK` follows that target's move).
         let target = |b: &Block| b.links.iter().any(|p| p.offset != 0 && p.target == s.cpu.rip);
-        let source = match cache::block_at(elr.wrapping_sub(4)) {
+        let source = match ran {
             Some(b) if b.flags & cache::STEP != 0 && target(b) => None,
             Some(b) if b.flags & cache::DEAD == 0 && target(b) => Some(b),
             _ => {
@@ -437,7 +441,7 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             if source.is_some() {
                 s.stale_links += 1;
             }
-            step(s)
+            step(&mut s)
         };
         match source {
             // Flushed, or its page invalidated (queued), while the target was found.
@@ -460,7 +464,7 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             },
             None => {}
         }
-        enter(s, target)
+        enter(&mut s, target)
     }
 }
 
@@ -493,7 +497,7 @@ unsafe fn request(s: &mut State, kind: u64) -> Reply {
         unsafe {
             s.request = kind;
             s.reply = NONE;
-            write_record(record(), *s);
+            write_record(record(), s);
             let p = crate::perf::enter(crate::perf::HOST);
             asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
             crate::perf::leave(p);
@@ -766,10 +770,10 @@ fn reset_shadows(s: &mut State) {
 /// `fs_cached`/`gs_cached`, which every FS-/GS-prefixed access adds) written from the bank. The bases are rewritten at
 /// every entry and never read back, so the bank stays authoritative: a guest store into the page (the documented
 /// deviation) changes only what that vCPU's own prefixed accesses use until the next `enter`.
-unsafe fn enter(mut s: State, block: &Block) -> ! {
+unsafe fn enter(s: &mut State, block: &Block) -> ! {
     crate::perf::enter(crate::perf::ENTER);
-    uncached_end(&mut s);
-    served(&mut s);
+    uncached_end(s);
+    served(s);
     s.mid_string = 0; // the next resident entry is at another boundary
     // X2: a shadow still set here covers the block's first instruction with no event pending (else `find` stepped it).
     // Every later resident entry follows a completed instruction but a stop at this block's first word, which arms
@@ -792,7 +796,9 @@ unsafe fn enter(mut s: State, block: &Block) -> ! {
     for at in [frame::SIMD_FLAGS, frame::X87_PENDING] {
         unsafe { (FRAME_VA as *mut u8).add(at as usize).write_volatile(0) };
     }
-    let mut f = NativeFrame::ZERO;
+    // The frame generated code is entered with, built in place: these fields are written unconditionally at every
+    // entry (never on some paths only: the zero check cannot see a stale one), and nothing writes the others, so they stay zero (zeroed at `start`; the host checks it at every stop, `entry_frame_rest_zero`).
+    let f = unsafe { &mut (*shared()).initial };
     for (&reg, &value) in SRA.iter().zip(&s.cpu.gpr) {
         f.x[reg as usize] = value;
     }
@@ -801,15 +807,15 @@ unsafe fn enter(mut s: State, block: &Block) -> ! {
     f.x[SRA[17] as usize] = af;
     f.x[28] = FRAME_POINTER;
     f.sp = STACK_TOP;
-    sse::fill(&mut f, &s.cpu);
+    sse::fill(f, &s.cpu);
     s.blocks += 1;
     unsafe {
+        let c = crate::perf::enter(crate::perf::ENTER_COPY);
         write_record(record(), s);
-        let entry = &raw mut (*shared()).initial;
-        write_record(entry, f);
+        crate::perf::leave(c);
         tables::select(s.cpu.cpl);
         crate::perf::enter(crate::perf::GUEST);
-        enter_allocated(entry, block.entry(), BLOCK_SPSR | nzcv, alignment_check(&s.cpu))
+        enter_allocated(f, block.entry(), BLOCK_SPSR | nzcv, alignment_check(&s.cpu))
     }
 }
 
@@ -871,7 +877,7 @@ unsafe fn missed(frame: &NativeFrame) -> ! {
     bank(&mut s.cpu, frame, frame.nzcv, true);
     completed(&mut s);
     s.cpu.rip = frame.x[0];
-    unsafe { dispatch(s) }
+    unsafe { dispatch(&mut s) }
 }
 /// Halts with `native` in the record.
 #[inline(never)]
@@ -987,7 +993,7 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
         } else {
             s.stops_l1 += 1;
         }
-        unsafe { dispatch(s) }
+        unsafe { dispatch(&mut s) }
     }
     let Some(b) = cache::block_at(elr).filter(|b| b.flags & cache::DEAD == 0) else { bad(s) };
     s.irqs_step += u64::from(b.flags & cache::STEP != 0);
@@ -1002,9 +1008,9 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
         // The step block is entered again (see [`stopped`]).
         if b.flags & cache::STEP != 0 {
             take_invalidations(&mut s);
-            unsafe { enter(s, b) }
+            unsafe { enter(&mut s, b) }
         }
-        unsafe { dispatch(s) }
+        unsafe { dispatch(&mut s) }
     }
     if s.stop_wanted != 0 {
         s.merged += 1;
@@ -1017,7 +1023,7 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
     }
     tables::select(s.cpu.cpl);
     unsafe {
-        write_record(record(), s);
+        write_record(record(), &s);
         crate::perf::enter(crate::perf::GUEST);
         resume_exception(&raw const (*shared()).captured, elr, spsr, alignment_check(&s.cpu))
     }
@@ -1061,7 +1067,7 @@ unsafe fn stopped(frame: &NativeFrame, elr: u64, spsr: u64, (armed, n): ([u32; M
     s.stop_wanted = 0;
     s.stops_exit += 1;
     taken(&mut s);
-    unsafe { dispatch(s) }
+    unsafe { dispatch(&mut s) }
 }
 
 /// CR0 bits (SDM vol. 3 §2.5): those defined; the others in 31:0 are reserved and ignored on a load (they stay clear),
@@ -1631,7 +1637,7 @@ fn link_point_of(b: &Block, svc: u64) -> Option<u64> {
 fn guest_fault(mut s: State, f: &NativeFrame, b: &Block, site: &Site, [vector, cr2, error]: [u64; 3]) -> ! {
     bank_at(&mut s, f, b, site);
     deliver(&mut s, Event::Exception([vector, error, cr2]));
-    unsafe { dispatch(s) }
+    unsafe { dispatch(&mut s) }
 }
 /// Banks the exact state at the start of `site`'s guest instruction in `b` (see [`guest_fault`]).
 fn bank_at(s: &mut State, f: &NativeFrame, b: &Block, site: &Site) {
@@ -1661,19 +1667,19 @@ fn code_written(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, gpa: u64
 /// dropped: it wrote nothing yet).
 fn step_from(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
     bank_at(&mut s, f, b, site);
-    step(s)
+    step(&mut s)
 }
 /// Runs the instruction at `s.cpu.rip` (the bank holds the state at its start) alone, as an uncached one-instruction
 /// block in the slot, which marks no source page. A write it makes to a page holding translations takes
 /// [`code_written`]'s invalidation path and completes; its exit goes to the next instruction, which the next miss
 /// compiles from the new bytes (SDM vol. 3, "Handling Self- and Cross-Modifying Code").
-fn step(mut s: State) -> ! {
+fn step(s: &mut State) -> ! {
     loop {
         s.steps += 1;
         // A system instruction whose decode is kept runs from it (K2), as a decoded reply below does.
-        let reply = match kept_system(&mut s) {
+        let reply = match kept_system(s) {
             Some(i) => Reply::System(i),
-            None => unsafe { request(&mut s, REQUEST_STEP) },
+            None => unsafe { request(s, REQUEST_STEP) },
         };
         s.plain_step = 0;
         let h = match reply {
@@ -1681,8 +1687,8 @@ fn step(mut s: State) -> ! {
             // Its fetch faults (a peer changed the tables): delivered, and the handler's first instruction is stepped.
             // (Then the handler's first instruction is a boundary like any: `find`'s checks, breakpoints included.)
             Reply::Fault(fault) => {
-                deliver(&mut s, Event::Exception(fault));
-                match unsafe { find(&mut s) } {
+                deliver(s, Event::Exception(fault));
+                match unsafe { find(s) } {
                     Some(block) => unsafe { enter(s, block) },
                     None => continue,
                 }
@@ -1691,12 +1697,12 @@ fn step(mut s: State) -> ! {
             // as `find` executes it, then the next boundary is `find`'s (events a POPF, IRET or STI made eligible, invalidations),
             // unless a BT* form found aligned must run itself, compiled plain.
             Reply::System(instruction) => {
-                system(&mut s, instruction);
+                system(s, instruction);
                 if s.plain_step != 0 {
                     continue;
                 }
                 // (In this loop, not through `dispatch`, which would recurse into `step`: `None` steps the next instruction.)
-                match unsafe { find(&mut s) } {
+                match unsafe { find(s) } {
                     Some(block) => unsafe { enter(s, block) },
                     None => continue,
                 }
@@ -1705,7 +1711,7 @@ fn step(mut s: State) -> ! {
         let context = s.cpu.code_context();
         match cache::place_step(&h, STAGING_VA as *const u8, context, s.source_gpa, s.link_points, s.dispatch_exit, s.rep_exits) {
             Some(block) => unsafe { enter(s, block) },
-            None => halt(&s, stop::BAD_REPLY),
+            None => halt(s, stop::BAD_REPLY),
         }
     }
 }
@@ -1911,7 +1917,7 @@ fn fp_exception(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
             x87::exception(s.cpu.fcw, f.x[0]);
             s.cpu.rip = s.cpu.rip.wrapping_add(u64::from(site.width));
             completed(&mut s);
-            unsafe { dispatch(s) }
+            unsafe { dispatch(&mut s) }
         }
         _ => match x87::pending(&s) {
             Err(e) => e,
@@ -1919,7 +1925,7 @@ fn fp_exception(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
         },
     };
     deliver(&mut s, Event::Exception(e));
-    unsafe { dispatch(s) }
+    unsafe { dispatch(&mut s) }
 }
 
 /// A data abort at an access site: a shadow miss to retry, or a guest fault.
@@ -1995,7 +2001,7 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
         crate::perf::leave(p);
         match translated {
             None => unsafe {
-                write_record(record(), s);
+                write_record(record(), &s);
                 resume(&s, &raw const (*shared()).captured, elr, spsr)
             },
             Some((gpa, _)) if !mmio::ram(gpa) => device[k] = Some(gpa),
@@ -2019,7 +2025,7 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
     s.last_retry = [elr, far, tables::descriptor(s.cpu.cpl, far), s.shadow_generation];
     s.retries += 1;
     unsafe {
-        write_record(record(), s);
+        write_record(record(), &s);
         resume(&s, &raw const (*shared()).captured, elr, spsr)
     }
 }
@@ -2064,7 +2070,7 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
     crate::perf::leave(p);
     let [Some((gpa0, uc0)), Some((gpa1, uc1))] = gpa else {
         unsafe {
-            write_record(record(), s);
+            write_record(record(), &s);
             resume(&s, &raw const (*shared()).captured, b.code_va() + stub.native_offset as u64, spsr)
         }
     };
@@ -2120,7 +2126,7 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
             }
         }
         s.splits += 1;
-        write_record(record(), s);
+        write_record(record(), &s);
         self::resume(&s, resume, b.code_va() + access.native_offset as u64 + 4, spsr)
     }
 }

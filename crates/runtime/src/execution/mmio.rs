@@ -33,7 +33,7 @@ fn exchange() -> *mut Mmio {
 fn stop_with(s: &State, why: u64) -> ! {
     unsafe {
         let m = read_record(exchange());
-        write_record(exchange(), Mmio { status: why, completed: m.completed, ..Mmio::default() });
+        write_record(exchange(), &Mmio { status: why, completed: m.completed, ..Mmio::default() });
     }
     halt(s, stop::UNSUPPORTED_MMIO)
 }
@@ -83,9 +83,9 @@ pub(super) fn ones(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, touch
 unsafe fn page(s: &mut State, gpa: u64) -> u64 {
     unsafe {
         let completed = read_record(exchange()).completed;
-        write_record(exchange(), Mmio { gpa, completed, ..Mmio::default() });
+        write_record(exchange(), &Mmio { gpa, completed, ..Mmio::default() });
         (s.request, s.reply) = (REQUEST_PAGE, NONE);
-        write_record(record(), *s);
+        write_record(record(), s);
         let p = crate::perf::enter(crate::perf::HOST);
         asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
         crate::perf::leave(p);
@@ -127,9 +127,9 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
         None => unsafe {
             let done = read_record(exchange()).completed;
             let request = Mmio { gpa, width, write: u64::from(c.store), value: data.unwrap_or(0), completed: done, ..Mmio::default() };
-            write_record(exchange(), request);
+            write_record(exchange(), &request);
             (s.request, s.reply) = (REQUEST_DEVICE, NONE);
-            write_record(record(), s);
+            write_record(record(), &s);
             // Every earlier access of this vCPU is complete before the device sees this one (x86 UC ordering).
             let p = crate::perf::enter(crate::perf::HOST);
             asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
@@ -168,7 +168,7 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
     unsafe {
         let mut m = read_record(exchange());
         (m.status, m.completed) = (status::DONE, m.completed + 1);
-        write_record(exchange(), m);
-        dispatch(s)
+        write_record(exchange(), &m);
+        dispatch(&mut s)
     }
 }

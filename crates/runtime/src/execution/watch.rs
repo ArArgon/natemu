@@ -82,7 +82,7 @@ pub(super) fn hit(mut s: State, f: &NativeFrame, b: &Block, site: &Site, elr: u6
         step_from(s, f, b, site)
     }
     s.debug |= data_hits(&s.cpu.dr, site_address(site, f), u64::from(site.width), writes(site)) << debug::HITS;
-    unsafe { write_record(record(), s) };
+    unsafe { write_record(record(), &s) };
     // The one Arm access with watchpoints off: MDE clear, a software step of the next instruction from EL0, IRQs masked.
     // SAFETY: debug control of this PE; `resume` erets with the given SPSR.
     unsafe { asm!("mrs {t}, mdscr_el1", "bic {t}, {t}, #{mde}", "orr {t}, {t}, #{ss}", "msr mdscr_el1, {t}", "isb", t = out(reg) _, mde = const MDSCR_MDE, ss = const MDSCR_SS) };

@@ -186,7 +186,7 @@ pub(super) fn park(s: &mut State) {
     let p = crate::perf::enter(crate::perf::HALTED);
     // A stop a doorbell asked for while this vCPU ran to its HLT is served here, at the boundary after the HLT.
     served(s);
-    unsafe { write_record(record(), *s) };
+    unsafe { write_record(record(), s) };
     let halted = word(s, core::mem::offset_of!(Events, halted));
     let posts = word(s, core::mem::offset_of!(Events, posts));
     let mut parked = false;
@@ -226,7 +226,7 @@ fn doorbells(s: &mut State) {
     if n > 0 {
         taken(s);
         (s.stops_resident, s.merged) = (s.stops_resident + 1, s.merged + n - 1);
-        unsafe { write_record(record(), *s) };
+        unsafe { write_record(record(), s) };
     }
 }
 

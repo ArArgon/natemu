@@ -1519,6 +1519,9 @@ fn serve(
             0x49 => {
                 let s: Shared = area.read_record(SHARED_OFFSET);
                 let state: State = area.read_record(exec::STATE_OFFSET);
+                if !exec::entry_frame_rest_zero(&s.initial) {
+                    return Err("the resident's entry frame holds a field it does not write".into());
+                }
                 return match parked.take() {
                     Some(stop) if state.stop == exec::stop::PARKED => Ok(stop),
                     _ if state.stop == exec::stop::PARKED => Err("vCPU parked unasked".into()),
