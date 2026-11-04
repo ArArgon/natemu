@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Relaxed, SeqCst}};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -769,7 +769,7 @@ fn key(limit: Option<u32>, rip: u64, lead: &[u8]) -> Key {
 /// The memory cache's hash (perf chunk 7; SipHash's was about 25 ns a probe): Thorup's strongly universal multiply-shift for
 /// vectors of words ("High Speed Hashing for Integers and Strings", 2015, 3.4) under random keys per map. The guest chooses
 /// the keys (its bytes, RIPs) but never sees a hash, so they collide no more than by chance: no quadratic buckets.
-type Cache = HashMap<Key, Vec<Entry>, Universal>;
+type Cache = HashMap<Key, Vec<Arc<Entry>>, Universal>;
 #[derive(Clone)]
 struct Universal([u128; 4]);
 impl Default for Universal {
@@ -804,14 +804,19 @@ impl std::hash::Hasher for Words {
         ((self.sum >> 64) as u64).reverse_bits()
     }
 }
-/// Answers per generation of the memory cache ([`Compiler::insert`]): the installer boot keeps about 130 k.
+/// Answers per generation of the memory cache ([`Shard::insert`]), over all its shards: the installer boot keeps about 130 k.
 const GENERATION: usize = 1 << 18;
 /// And bytes per generation (about 80 MB for the installer's answers).
 const GENERATION_BYTES: usize = 128 << 20;
+/// The memory cache's shards (perf chunk 13), each locked alone and bounded at a sixteenth of the generation bounds.
+const SHARDS: usize = 16;
 /// A kept answer and what it was compiled from: its RIP, the gating values (those with a bit in `read` matter) and the guest
-/// bytes before the compile's extent (`whole`: the extent reached their end, so their length matters too).
+/// bytes before the compile's extent (`whole`: the extent reached their end, so their length matters too); `owner`: the vCPU
+/// that put it in the map (a compile or a disk answer). Kept by reference (perf chunk 13): another vCPU's insert may drop it
+/// from the map between a lookup and its use, which keeps its own reference.
 struct Entry {
     rip: u64,
+    owner: u8,
     read: u32,
     gating: [u64; GATING],
     prefix: Vec<u8>,
@@ -829,6 +834,131 @@ impl Entry {
         self.read >> GATING == 0
             && (0..GATING).all(|i| self.read & 1 << i == 0 || self.gating[i] == gating[i])
             && if self.whole { bytes == self.prefix } else { bytes.starts_with(&self.prefix) }
+    }
+}
+/// One shard of the kept answers in two generations ([`Shard::insert`]): `cache` the newer (`cached` entries), `old` the older.
+#[derive(Default)]
+struct Shard {
+    cache: Cache,
+    old: Cache,
+    cached: usize,
+    cached_bytes: usize,
+}
+impl Shard {
+    /// The kept answer matching `bytes` at `rip` (generation, key, index), from either generation: one kept for `rip`
+    /// itself in any bucket first, then one for another RIP. Keys hold the leading bytes the answer read (at most
+    /// [`LEAD`]), so each length is tried; one pass, each bucket looked up once.
+    fn find(&self, bytes: &[u8], rip: u64, limit: Option<u32>, gating: &[u64; GATING]) -> Option<(bool, Key, usize)> {
+        let mut other = None;
+        for n in (0..=LEAD.min(bytes.len())).rev() {
+            let key = key(limit, rip, &bytes[..n]);
+            for newer in [true, false] {
+                let Some(v) = (if newer { &self.cache } else { &self.old }).get(&key) else { continue };
+                let mut matching = v.iter().enumerate().filter(|(_, e)| e.matches(bytes, gating));
+                let Some((first, _)) = matching.next() else { continue };
+                let own = if v[first].rip == rip { Some(first) } else { matching.find(|(_, e)| e.rip == rip).map(|(i, _)| i) };
+                match own {
+                    Some(i) => return Some((newer, key, i)),
+                    None => other = other.or(Some((newer, key, first))),
+                }
+            }
+        }
+        other
+    }
+    fn at(&self, (newer, key, i): (bool, Key, usize)) -> &Arc<Entry> {
+        &(if newer { &self.cache } else { &self.old })[&key][i]
+    }
+    /// The entry [`Shard::find`] gave; one in the older generation moves to the newer (with the generation it may drop,
+    /// [`Shard::insert`]).
+    fn take(&mut self, (newer, key, i): (bool, Key, usize), limit: Option<u32>) -> (Arc<Entry>, Option<Cache>) {
+        if newer {
+            return (self.cache[&key][i].clone(), None);
+        }
+        let entry = self.old.get_mut(&key).unwrap().swap_remove(i);
+        let dropped = self.insert(limit, entry.clone());
+        (entry, dropped)
+    }
+    /// Keeps `entry` in the newer generation; when that holds a [`SHARDS`]th of [`GENERATION`] answers or of
+    /// [`GENERATION_BYTES`] it becomes the older one (the older is dropped): every answer used or made in the shard's last
+    /// generation is kept, at most twice the bound (2 x 128 MiB over the shards). Returns the dropped generation, for the
+    /// caller to free after unlocking the shard (up to 16 k answers).
+    fn insert(&mut self, limit: Option<u32>, entry: Arc<Entry>) -> Option<Cache> {
+        let mut dropped = None;
+        if self.cached >= GENERATION / SHARDS || self.cached_bytes >= GENERATION_BYTES / SHARDS {
+            dropped = Some(std::mem::replace(&mut self.old, std::mem::take(&mut self.cache)));
+            (self.cached, self.cached_bytes) = (0, 0);
+        }
+        let key = key(limit, entry.rip, &entry.prefix[..LEAD.min(entry.prefix.len())]);
+        self.cached_bytes += entry.size();
+        self.cache.entry(key).or_default().push(entry);
+        self.cached += 1;
+        dropped
+    }
+}
+/// fexc's answers kept in memory (perf chunk 13): one map for every vCPU of a run whose compilers present the same
+/// features (`supported`, which the key leaves out and fexc's request carries), in [`SHARDS`] shards chosen by the block
+/// limit and the RIP's half and page offset, so that every lead length of one request is in one shard (one lock a lookup).
+/// Each vCPU still relocates and admits every answer at its own RIP, with its own bytes.
+pub struct Answers {
+    supported: u64,
+    pick: Universal,
+    shards: [Mutex<Shard>; SHARDS],
+    /// Per shard: nanoseconds waited for its lock and the waits (a lock taken at the first try is not timed).
+    waits: [[AtomicU64; 2]; SHARDS],
+}
+impl Answers {
+    pub(crate) fn new(supported: u64) -> Arc<Self> {
+        Arc::new(Self { supported, pick: Universal::default(), shards: std::array::from_fn(|_| Mutex::default()), waits: Default::default() })
+    }
+    /// The shard of `limit` and `rip`, locked, and the nanoseconds waited for it.
+    fn lock(&self, limit: Option<u32>, rip: u64) -> (std::sync::MutexGuard<'_, Shard>, u64) {
+        let k = key(limit, rip, &[]);
+        let i = std::hash::BuildHasher::hash_one(&self.pick, (k.0, k.1)) as usize % SHARDS;
+        match self.shards[i].try_lock() {
+            Ok(g) => (g, 0),
+            Err(std::sync::TryLockError::Poisoned(e)) => (e.into_inner(), 0),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let t = crate::perf::now();
+                let g = self.shards[i].lock().unwrap_or_else(|e| e.into_inner());
+                let waited = crate::perf::now() - t;
+                self.waits[i][0].fetch_add(waited, Relaxed);
+                self.waits[i][1].fetch_add(1, Relaxed);
+                (g, waited)
+            }
+        }
+    }
+    /// The kept answer matching `bytes` at `rip` ([`Shard::find`]; an older one moves to the newer generation).
+    fn find(&self, bytes: &[u8], rip: u64, limit: Option<u32>, gating: &[u64; GATING]) -> (Option<Arc<Entry>>, u64) {
+        let (mut shard, waited) = self.lock(limit, rip);
+        let Some(f) = shard.find(bytes, rip, limit, gating) else { return (None, waited) };
+        let (entry, dropped) = shard.take(f, limit);
+        drop(shard);
+        drop(dropped); // freed unlocked
+        (Some(entry), waited)
+    }
+    /// Keeps `entry`, made for `bytes` at `rip`; returns the owner of a matching answer the map held already (perf chunk 13:
+    /// after a lookup that found none, one made meanwhile by another vCPU) and the nanoseconds waited.
+    fn insert(&self, limit: Option<u32>, entry: Arc<Entry>, bytes: &[u8], rip: u64) -> (Option<u8>, u64) {
+        let (mut shard, waited) = self.lock(limit, rip);
+        let held = shard.find(bytes, rip, limit, &entry.gating).map(|f| shard.at(f).owner);
+        let dropped = shard.insert(limit, entry);
+        drop(shard);
+        drop(dropped); // freed unlocked
+        (held, waited)
+    }
+    /// Bytes and entries kept.
+    fn kept(&self) -> (usize, usize) {
+        self.shards.iter().fold((0, 0), |(b, n), s| {
+            let s = s.lock().unwrap_or_else(|e| e.into_inner());
+            let all = || s.cache.values().chain(s.old.values()).flatten();
+            (b + all().map(|e| e.size()).sum::<usize>(), n + all().count())
+        })
+    }
+    /// The performance log's line for the run: each shard's lock waits, `[ns, count]`, and the bytes and answers kept.
+    pub fn report(&self) -> String {
+        let w: Vec<String> = self.waits.iter().map(|[ns, n]| format!("[{},{}]", ns.load(Relaxed), n.load(Relaxed))).collect();
+        let (bytes, answers) = self.kept();
+        format!("answers {{\"lock_waits\":[{}],\"kept_bytes\":{bytes},\"kept_answers\":{answers}}}", w.join(","))
     }
 }
 /// What [`Compiler::compile`] gives the service loop.
@@ -855,11 +985,10 @@ pub struct Compiler {
     supported: u64,
     /// Block size limit in guest instructions (fexc's own limit when `None`).
     max_instructions: Option<u32>,
-    /// Kept answers in two generations ([`Compiler::insert`]): `cache` the newer (`cached` entries), `old` the older.
-    cache: Cache,
-    old: Cache,
-    cached: usize,
-    cached_bytes: usize,
+    /// Kept answers: its own, or the run's ([`Compiler::share`]).
+    answers: Arc<Answers>,
+    /// This vCPU, the owner of the answers it keeps (perf chunk 13).
+    pub vcpu: u8,
     /// The persistent cache (`boot-linux` sets it; test drivers never do).
     pub disk: Option<std::sync::Arc<crate::compile_cache::DiskCache>>,
     /// Requests that reached fexc.
@@ -867,6 +996,12 @@ pub struct Compiler {
     /// Requests answered from the cache in memory, and from the persistent one.
     pub(crate) hits: u64,
     pub(crate) disk_hits: u64,
+    /// Perf chunk 13: memory hits by the vCPU that kept the answer (this one's own included); compiles whose answer another
+    /// vCPU made while this one compiled (nothing matched before, a match was kept at the insert); nanoseconds waited for
+    /// shard locks, and the waits.
+    pub hits_by_source: [u64; cache::MAX_VCPUS],
+    pub duplicates: u64,
+    pub lock_wait: (u64, u64),
     /// Answers kept for another RIP and used at this one (perf chunk 4: [`crate::relocation`]); answers that could not be
     /// (compiled instead); relocated objects admission refused (compiled instead, logged; none expected); fresh compiles
     /// made by the reuse check.
@@ -965,7 +1100,8 @@ impl Compiler {
         Ok(Self::with_features(fexc, admission::supported_features(&id), max_instructions))
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
-        Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: Cache::default(), old: Cache::default(), cached: 0, cached_bytes: 0, disk: None, compiles: 0, hits: 0, disk_hits: 0,
+        Self { fexc: fexc.into(), server: None, supported, max_instructions, answers: Answers::new(supported), vcpu: 0, disk: None, compiles: 0, hits: 0, disk_hits: 0,
+               hits_by_source: [0; cache::MAX_VCPUS], duplicates: 0, lock_wait: (0, 0),
                relocated: 0, relocation_refused: 0, relocation_fallbacks: 0, reuse_checks: 0, check_reuse: false,
                deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![], perf: None, read: 0, halved: false }
     }
@@ -1009,16 +1145,17 @@ impl Compiler {
     fn compile_once(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>, hook: &mut impl Hook) -> Result<std::result::Result<Code, (u32, &'static str)>> {
         let gating = self.gating();
         let t = self.stamp();
-        let found = self.find(bytes, rip, limit, &gating);
+        let (found, waited) = self.answers.find(bytes, rip, limit, &gating);
+        self.waited(waited);
         self.charge(crate::perf::LOOKUP, t);
-        if let Some((key, i)) = found {
-            if let Some(code) = self.reuse(key, i, bytes, rip, limit, hook)? {
+        if let Some(e) = &found {
+            if let Some(code) = self.reuse(e, bytes, rip, limit, hook)? {
                 self.hits += 1;
-                self.read = self.cache[&key][i].prefix.len();
+                self.hits_by_source[usize::from(e.owner)] += 1;
+                self.read = e.prefix.len();
                 if let Some(r) = &mut self.perf {
-                    let prefix = &self.cache[&key][i].prefix;
                     r.sources[0] += 1;
-                    r.read = (hash(prefix), prefix.len() as u32);
+                    r.read = (hash(&e.prefix), e.prefix.len() as u32);
                 }
                 return Ok(code);
             }
@@ -1027,72 +1164,48 @@ impl Compiler {
         // case (it is keyed as memory is, so it would hold the same answer).
         let mut disk = found.is_none();
         loop {
+            let compiles = self.compiles;
             let (reply, at) = self.ask(bytes, rip, limit, disk, hook)?;
             let t = self.stamp();
             let (whole, end) = (reply.extent as usize >= bytes.len(), bytes.len().min(reply.extent as usize));
             let (read, prefix) = (reply.read, bytes[..end].to_vec());
-            let entry = Entry { rip: at, read, gating, prefix, whole, answer: Answer::new(reply, at)? };
-            let (key, i) = self.insert(limit, entry);
+            let entry = Arc::new(Entry { rip: at, owner: self.vcpu, read, gating, prefix, whole, answer: Answer::new(reply, at)? });
+            let (held, waited) = self.answers.insert(limit, entry.clone(), bytes, rip);
+            self.waited(waited);
+            // Perf chunk 13: the lookup found nothing and another vCPU kept a matching answer while this one compiled.
+            if disk && self.compiles > compiles && held.is_some_and(|o| o != self.vcpu) {
+                self.duplicates += 1;
+            }
             self.read = end;
             self.charge(crate::perf::KEEP, t);
             if let Some(r) = &mut self.perf {
-                let prefix = &self.cache[&key][i].prefix;
-                r.read = (hash(prefix), prefix.len() as u32);
+                r.read = (hash(&entry.prefix), entry.prefix.len() as u32);
             }
-            match self.reuse(key, i, bytes, rip, limit, hook)? {
+            match self.reuse(&entry, bytes, rip, limit, hook)? {
                 Some(code) => return Ok(code),
                 None => disk = false, // a disk answer for another RIP that is not fexc's here
             }
         }
     }
-    /// The kept answer matching `bytes` at `rip`, from either generation (an older one is moved to the newer): one kept for
-    /// `rip` itself in any bucket first, then one for another RIP. Keys hold the leading bytes the answer read (at most
-    /// [`LEAD`]), so each length is tried; one pass, each bucket looked up once.
-    fn find(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>, gating: &[u64; GATING]) -> Option<(Key, usize)> {
-        let mut other = None;
-        for n in (0..=LEAD.min(bytes.len())).rev() {
-            let key = key(limit, rip, &bytes[..n]);
-            for newer in [true, false] {
-                let Some(v) = (if newer { &self.cache } else { &self.old }).get(&key) else { continue };
-                let mut matching = v.iter().enumerate().filter(|(_, e)| e.matches(bytes, gating));
-                let Some((first, _)) = matching.next() else { continue };
-                let own = if v[first].rip == rip { Some(first) } else { matching.find(|(_, e)| e.rip == rip).map(|(i, _)| i) };
-                match own {
-                    Some(i) => return Some(self.found(newer, key, i, limit)),
-                    None => other = other.or(Some((newer, key, first))),
-                }
-            }
+    fn waited(&mut self, ns: u64) {
+        if ns > 0 {
+            self.lock_wait = (self.lock_wait.0 + ns, self.lock_wait.1 + 1);
         }
-        other.map(|(newer, key, i)| self.found(newer, key, i, limit))
     }
-    /// The entry at `i` under `key` in the newer generation or (`!newer`) the older one, which moves it to the newer.
-    fn found(&mut self, newer: bool, key: Key, i: usize, limit: Option<u32>) -> (Key, usize) {
-        if newer {
-            return (key, i);
+    /// Uses the run's `answers` (perf chunk 13: one map for its vCPUs; the first compiler makes it) when they were made for
+    /// this compiler's features; else keeps its own.
+    pub fn share(&mut self, answers: &std::sync::OnceLock<Arc<Answers>>) {
+        let shared = answers.get_or_init(|| self.answers.clone());
+        if shared.supported == self.supported {
+            self.answers = shared.clone();
+        } else {
+            eprintln!("natemu: vCPU {} presents other features than the run's first compiler: it keeps its own answers", self.vcpu);
         }
-        let entry = self.old.get_mut(&key).unwrap().swap_remove(i);
-        self.insert(limit, entry)
     }
-    /// Keeps `entry` in the newer generation; when that holds [`GENERATION`] answers or [`GENERATION_BYTES`] it becomes the
-    /// older one (the older is dropped): every answer used or made in the last generation is kept, at most twice the bound
-    /// (2 x 128 MiB per vCPU).
-    fn insert(&mut self, limit: Option<u32>, entry: Entry) -> (Key, usize) {
-        if self.cached >= GENERATION || self.cached_bytes >= GENERATION_BYTES {
-            self.old = std::mem::take(&mut self.cache);
-            (self.cached, self.cached_bytes) = (0, 0);
-        }
-        let key = key(limit, entry.rip, &entry.prefix[..LEAD.min(entry.prefix.len())]);
-        self.cached_bytes += entry.size();
-        let v = self.cache.entry(key).or_default();
-        v.push(entry);
-        self.cached += 1;
-        (key, v.len() - 1)
-    }
-    /// The answer kept at `i` under `key`, used at `rip`: as it is for its own RIP; for another, relocated (`None`: it
-    /// would not be fexc's at `rip`, or admission refused the relocated object; logged; the caller compiles).
-    fn reuse(&mut self, key: Key, i: usize, bytes: &[u8], rip: u64, limit: Option<u32>, hook: &mut impl Hook) -> Result<Option<std::result::Result<Code, (u32, &'static str)>>> {
+    /// The kept answer `e`, used at `rip`: as it is for its own RIP; for another, relocated (`None`: it would not be fexc's
+    /// at `rip`, or admission refused the relocated object; logged; the caller compiles).
+    fn reuse(&mut self, e: &Entry, bytes: &[u8], rip: u64, limit: Option<u32>, hook: &mut impl Hook) -> Result<Option<std::result::Result<Code, (u32, &'static str)>>> {
         let t = self.stamp();
-        let e = &self.cache[&key][i];
         let (from, read) = (e.rip, (e.read, e.whole, e.prefix.len()));
         let code = if from == rip {
             self.answered(&e.answer, bytes, rip, hook)?
@@ -1139,11 +1252,6 @@ impl Compiler {
             return Err(format!("reuse check: the answer relocated from {from:#x} is not fexc's at {rip:#x}"));
         }
         Ok(())
-    }
-    /// Bytes and entries of the kept answers (the run's report).
-    pub fn kept(&self) -> (usize, usize) {
-        let all = || self.cache.values().chain(self.old.values()).flatten();
-        (all().map(Entry::size).sum(), all().count())
     }
     /// [`Compiler::compile_once`]'s use of an answer: admitted, or decoded.
     #[cfg_attr(not(feature = "testing"), allow(unused_variables))]
@@ -1784,6 +1892,132 @@ fn translation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Changes every answer `c` keeps (no other reference is held between compiles).
+    fn edit(c: &mut Compiler, f: impl Fn(&mut Entry)) {
+        for s in &c.answers.shards {
+            let s = &mut *s.lock().unwrap();
+            for e in s.cache.values_mut().chain(s.old.values_mut()).flatten() {
+                f(Arc::get_mut(e).unwrap());
+            }
+        }
+    }
+    fn hit(a: &Answers, bytes: &[u8], rip: u64, limit: Option<u32>, gating: &[u64; GATING]) -> Option<Arc<Entry>> {
+        a.find(bytes, rip, limit, gating).0
+    }
+    fn entry(rip: u64, owner: u8, prefix: &[u8], read: u32, gating: [u64; GATING]) -> Arc<Entry> {
+        Arc::new(Entry { rip, owner, read, gating, prefix: prefix.into(), whole: false, answer: Answer::Object(prefix.into()) })
+    }
+
+    /// Perf chunk 13: entries under one key (same limit, half, page offset and lead bytes) are told apart by the rest of
+    /// what fexc read (later bytes, consulted gating values), never confused with another half, offset or limit; the
+    /// answer kept for the requested RIP comes first.
+    #[test]
+    fn shared_answers_keep_colliding_keys_apart() {
+        let a = Answers::new(u64::MAX);
+        let g = [0; GATING];
+        let sse = [1, 0, 0, 0, 0, 0, 0, 0];
+        a.insert(None, entry(0x1100, 0, &[1, 2, 3, 4, 5], 0, g), &[1, 2, 3, 4, 5], 0x1100);
+        a.insert(None, entry(0x2100, 1, &[1, 2, 3, 4, 6], 0, g), &[1, 2, 3, 4, 6], 0x2100);
+        a.insert(None, entry(0x3100, 2, &[1, 2, 3, 4, 7], 1, sse), &[1, 2, 3, 4, 7], 0x3100); // read SSE gating 1
+        let owner = |bytes: &[u8], rip, limit, gating: &[u64; GATING]| hit(&a, bytes, rip, limit, gating).map(|e| (e.owner, e.rip));
+        assert_eq!(owner(&[1, 2, 3, 4, 5, 9], 0x9100, None, &g), Some((0, 0x1100)));
+        assert_eq!(owner(&[1, 2, 3, 4, 6], 0x9100, None, &g), Some((1, 0x2100)));
+        assert_eq!(owner(&[1, 2, 3, 4, 7], 0x9100, None, &g), None); // other SSE gating
+        assert_eq!(owner(&[1, 2, 3, 4, 7], 0x9100, None, &sse), Some((2, 0x3100)));
+        assert_eq!(owner(&[1, 2, 3, 4, 8], 0x9100, None, &g), None);
+        assert_eq!(owner(&[1, 2, 3, 4, 5], 0x9200, None, &g), None); // another page offset
+        assert_eq!(owner(&[1, 2, 3, 4, 5], 1 << 63 | 0x1100, None, &g), None); // the other half
+        assert_eq!(owner(&[1, 2, 3, 4, 5], 0x1100, Some(1), &g), None); // another limit
+        // A second answer for the same bytes kept for the requested RIP is preferred; a duplicate's insert names the holder.
+        let (held, _) = a.insert(None, entry(0x9100, 3, &[1, 2, 3, 4, 5], 0, g), &[1, 2, 3, 4, 5], 0x9100);
+        assert_eq!(held, Some(0));
+        assert_eq!(owner(&[1, 2, 3, 4, 5], 0x9100, None, &g), Some((3, 0x9100)));
+        assert_eq!(owner(&[1, 2, 3, 4, 5], 0x5100, None, &g), Some((0, 0x1100)));
+    }
+
+    /// Perf chunk 13: an answer dropped from the map by later inserts (two generation flips of its shard) between a lookup
+    /// and its use stays whole for the holder; the map no longer finds it.
+    #[test]
+    fn an_answer_evicted_between_lookup_and_use_stays_whole() {
+        let a = Answers::new(u64::MAX);
+        let g = [0; GATING];
+        a.insert(None, entry(0x1100, 0, &[0xaa; 32], 0, g), &[0xaa; 32], 0x1100);
+        let held = hit(&a, &[0xaa; 32], 0x1100, None, &g).unwrap();
+        // Same limit and page offset: the same shard; distinct bytes.
+        for i in 0..2 * GENERATION / SHARDS + 1 {
+            let b = (i as u64).to_le_bytes();
+            a.insert(None, entry(0x1100 + (i as u64 + 1) * 0x1000, 1, &b, 0, g), &b, 0x1100);
+        }
+        assert!(hit(&a, &[0xaa; 32], 0x1100, None, &g).is_none());
+        assert_eq!((held.rip, held.prefix.as_slice(), Arc::strong_count(&held)), (0x1100, &[0xaa; 32][..], 1));
+        assert!(matches!(&held.answer, Answer::Object(o) if o == &[0xaa; 32]));
+    }
+
+    /// Perf chunk 13: four threads insert and look up in one hot shard (every RIP at one page offset) while it flips
+    /// generations many times: every answer found is one kept for the bytes asked, answers kept by other threads are found,
+    /// a reference held across the flips stays whole, and the shard stays within its bound.
+    #[test]
+    fn shared_answers_under_concurrent_insert_lookup_and_eviction() {
+        let a = Answers::new(u64::MAX);
+        let g = [0; GATING];
+        let bound = GENERATION / SHARDS;
+        // The lead bytes are the count's, so the keys differ (no long bucket); the thread's number follows.
+        let bytes = |t: u64, i: u64| [i.to_le_bytes(), t.to_le_bytes()].concat();
+        let rip = |t: u64, i: u64| 0x7f00_0000_0100 + (t << 32) + (i << 12);
+        let n = 3 * bound as u64;
+        let cross = AtomicU64::new(0);
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                let (a, cross) = (&a, &cross);
+                s.spawn(move || {
+                    let mut held = None;
+                    for i in 0..n {
+                        let b = bytes(t, i);
+                        a.insert(None, entry(rip(t, i), t as u8, &b, 0, g), &b, rip(t, i));
+                        // Another thread's answer at about the same point of its run, looked up at this thread's RIP.
+                        let (o, j) = ((t + 1) % 4, i.saturating_sub(8));
+                        let ob = bytes(o, j);
+                        if let Some(e) = hit(a, &ob, rip(t, j), None, &g) {
+                            assert!(e.matches(&ob, &g) && e.prefix == ob && e.owner == o as u8 && e.rip == rip(o, j));
+                            cross.fetch_add(1, Relaxed);
+                            held.get_or_insert(e);
+                        }
+                    }
+                    let e = held.expect("no cross-thread hit");
+                    assert!(e.owner == ((t + 1) % 4) as u8 && matches!(&e.answer, Answer::Object(o) if *o == e.prefix));
+                });
+            }
+        });
+        let (_, kept) = a.kept();
+        // 4n = 12 bounds inserted into one shard: it flipped at least four times and keeps at most two generations.
+        assert!(cross.load(Relaxed) > 0 && kept <= 2 * bound && kept < 4 * n as usize, "{} {kept}", cross.load(Relaxed));
+        let k = key(None, rip(0, 0), &[]);
+        let one = std::hash::BuildHasher::hash_one(&a.pick, (k.0, k.1)) as usize % SHARDS;
+        let s = a.shards[one].lock().unwrap();
+        // Since its last flip the shard holds at least a generation's answers (hits only move them to the newer one).
+        assert!(!s.old.is_empty() && s.cached <= bound && kept >= bound, "{} {}", s.old.len(), s.cached);
+    }
+
+    /// With `FEXC` set (perf chunk 13): two compilers sharing one map on two threads: the second's request at another RIP is
+    /// the first's answer, relocated and admitted at its own RIP (checked against its own compile), counted by source.
+    #[test]
+    fn compilers_share_answers_across_threads() {
+        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let answers = std::sync::OnceLock::new();
+        let user = include_bytes!("../tests/relocation/user.src");
+        let run = |v: u8, rip: u64| {
+            let mut c = Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+            (c.vcpu, c.check_reuse) = (v, true);
+            c.share(&answers);
+            let Code::Block(b) = c.compile(user, rip, false, &mut ()).unwrap() else { panic!("no block") };
+            (b, c.compiles, c.relocated, c.reuse_checks, c.hits_by_source)
+        };
+        let (a, ..) = std::thread::scope(|s| s.spawn(|| run(0, 0x7f12_3456_7100)).join().unwrap());
+        let (b, compiles, relocated, checks, by) = std::thread::scope(|s| s.spawn(|| run(1, 0x7f12_3456_8100)).join().unwrap());
+        assert_eq!((a.guest_insns, b.guest_insns, compiles, relocated, checks, by), (4, 4, 0, 1, 1, [1, 0, 0, 0]));
+        assert_ne!(a.object, b.object);
+        assert_eq!(answers.get().unwrap().kept().1, 1);
+    }
     /// With `FEXC` set (R2 review): an answer with a spill area is not a host error. The block is translated again with half
     /// its instructions; a spill area at one instruction is the typed stop `spill_area`. fexc spills on none of the corpora,
     /// so the cached answers are given a spill area (header `spill_bytes`).
@@ -1793,13 +2027,11 @@ mod tests {
         let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
         let code = [0x48, 0x01, 0xd8, 0x48, 0x01, 0xd8, 0x48, 0x01, 0xd8, 0xc3]; // add rax, rbx x3; ret
         let spill = |c: &mut super::Compiler| {
-            for entries in c.cache.values_mut() {
-                for e in entries {
-                    if let Answer::Object(o) = &mut e.answer {
-                        o[60..64].copy_from_slice(&8u32.to_le_bytes());
-                    }
+            edit(c, |e| {
+                if let Answer::Object(o) = &mut e.answer {
+                    o[60..64].copy_from_slice(&8u32.to_le_bytes());
                 }
-            }
+            })
         };
         let insns = |c: &mut super::Compiler| match c.compile(&code, 0x1000, false, &mut ()).unwrap() {
             Code::Block(b) => Ok(b.guest_insns),
@@ -1915,7 +2147,7 @@ mod tests {
             let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
             c.check_reuse = check;
             assert!(matches!(c.compile(user, 0x7f12_3456_7100, false, &mut ()), Ok(Code::Block(_))));
-            for e in c.cache.values_mut().flatten() {
+            edit(&mut c, |e| {
                 if let Answer::Object(o) = &mut e.answer {
                     let word = |o: &[u8], at: usize| u32::from_le_bytes(o[at..at + 4].try_into().unwrap()) as usize;
                     let (at, n) = (word(o, 80), word(o, 84));
@@ -1923,7 +2155,7 @@ mod tests {
                     let v = u64::from_le_bytes(o[literal + 8..literal + 16].try_into().unwrap());
                     o[literal + 8..literal + 16].copy_from_slice(&(v + 0x10).to_le_bytes());
                 }
-            }
+            });
             let r = c.compile(user, 0x7f12_3456_8100, false, &mut ());
             if check {
                 assert!(r.as_ref().is_err_and(|e| e.contains("reuse check")), "{:?}", r.err());

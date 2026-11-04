@@ -23,7 +23,9 @@ work, guest code); at N = 4 the extra vCPUs mostly idle and per-vCPU caches dupl
    on natemu and QEMU (multi- and single-threaded), one emulator at a time, plus the installer at N = 1-4. A full kernel
    build is too slow for routine use (owner).
 2. **Shared host-side answer cache across vCPUs**: one (sharded) map instead of one per vCPU; removes the duplicate
-   compiles (about 318 k compiles at N = 4 against 128 k at N = 1 on the installer).
+   compiles (about 318 k compiles at N = 4 against 128 k at N = 1 on the installer). Built in perf chunk 13
+   ([perf-plan.md](perf-plan.md), "Measured (chunk 13)"): installer N = 4 compiles 307.6 k -> 130.9 k, wall 9.17 -> 6.63 s;
+   `build` N = 4 12.95 -> 9.26 s; an in-flight table was measured too and not kept (no wall gain).
 3. **Shared in-VM code cache**, only if the multi-threaded benchmarks justify it (placement, links, invalidation and
    revalidation become shared, so synchronisation cost must be measured).
 4. **The N = 4 slowdown**: per-vCPU breakdown, code re-placed after a process migrates between vCPUs, whether vCPU threads
@@ -104,6 +106,7 @@ per-vCPU breakdowns): `natemu-raw/bench-baseline-20261104-01/` (`table.md`, `run
 | `build` | natemu | **did not finish** (>2400 s) | 59.3 (48-121) | 73.9 (41-88) | 51.1 (35-119) |
 | | natemu, chunk 11 | **21.25** | **15.84** | **13.67** | **13.93** |
 | | natemu, chunk 12 | 20.39 | - | - | - |
+| | natemu, chunk 13 | - | - | - | **9.26** |
 | | QEMU multi | 28.3 | 15.3 | 13.5 | 12.5 |
 | | native | 2.61 | 1.40 | 1.20 | 1.09 |
 | `zstd` (all phases) | natemu | 2.26 | 1.74 | 1.63 | 1.71 |
@@ -112,6 +115,7 @@ per-vCPU breakdowns): `natemu-raw/bench-baseline-20261104-01/` (`table.md`, `run
 | `hackbench` | natemu | 53.8 | 27.9 | 19.6 | 15.2 |
 | | natemu, chunk 11 | 52.7 | - | - | 15.2 |
 | | natemu, chunk 12 | **30.1** | - | - | **9.57** |
+| | natemu, chunk 13 | - | - | - | **9.34** |
 | | QEMU multi | 16.4 | 8.87 | 6.41 | 5.08 |
 | | native | 3.88 | 2.08 | 1.65 | 1.65 |
 | `locks` | natemu | 16.7 | 8.90 | 6.62 | 5.81 |
@@ -130,6 +134,9 @@ Rows "chunk 11": after the link-record fix ([perf-plan.md](perf-plan.md), "Measu
 the change; `natemu-raw/linkfix-20261104-01/`, same harness and rules, median of three; `-`: not rerun). Rows "chunk 12":
 after the system-instruction fast paths ([perf-plan.md](perf-plan.md), "Measured (chunk 12)", f6e8820 plus the change,
 `natemu-raw/sysfast-20261104-01/`; its own before, f6e8820: `build` N = 1 20.89, `hackbench` 51.17 / 15.36, `locks` N = 4 6.42).
+Rows "chunk 13": after the shared answer cache ([perf-plan.md](perf-plan.md), "Measured (chunk 13)", 18ee440 plus the change,
+`natemu-raw/shared-20261104-01/`; its own before, 18ee440: `build` N = 4 12.95, `hackbench` N = 4 9.60; installer cache off
+N = 1 8.65 -> 8.70, N = 4 9.17 -> 6.63).
 
 **Findings.**
 1. (Fixed by perf chunk 11: `build` now finishes, 21.3 s at N = 1 against QEMU's 28.3 s, 13.7-15.8 s at N = 2-4, run to run

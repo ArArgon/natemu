@@ -1083,6 +1083,91 @@ new bytes; red when runs are on no page's chain, which also breaks own writes). 
 (block size 1 green under the mutants). `--check-reuse --code-shape` installer boots, cache off: N = 1 852,497 copies checked,
 N = 4 (vCPU 0) 205,825, no halt, both reached the dialog.
 
+### Measured (chunk 13: one answer cache for every vCPU, November 4; uncommitted on 18ee440, series49-sha)
+
+**Built** (host only: `execution.rs`, `linux.rs`; relocation, admission, the disk cache and the resident unchanged; the design
+study of the phase-2 plan's item 2). `Answers`: fexc's answers as kept before (raw reply, the RIP compiled at, the bytes to the
+extent, the gating values read), in 16 shards, each a `Mutex` around today's two generations at a sixteenth of the bounds
+(16,384 answers or 8 MiB per generation and shard; at most 256 MiB in all). The shard is chosen by a separately keyed
+`Universal` hash of the block limit and the RIP's half and page offset, so every lead length of one request is in one shard and
+a lookup takes one lock; a lock taken at the first `try_lock` is not timed. Entries are `Arc<Entry>`: a lookup returns a
+reference, and relocation and admission run outside the lock, so a peer's generation flip between lookup and use only drops the
+map's reference. `boot-linux` (`Prepared::run`) makes one map per run; each vCPU's `Compiler::share` takes it when its
+`supported` features equal the map's (the key leaves them out, fexc's request carries them), else keeps its own and says so (never
+seen). Each vCPU keeps its own `fexc --serve` and relocates and admits every answer at its own RIP with its own bytes; the
+`--check-reuse` check, the disk-cache order and the tamper hook (on the admitted copy) are unchanged. The program driver keeps
+one map per vCPU (its hooks count per-vCPU compiles). Counters (performance log, vCPU `state`): `hits_by_source` (memory hits by
+the vCPU that kept the answer), `duplicates` (a compile after a lookup that found nothing whose insert finds a matching answer
+another vCPU kept meanwhile), `lock_wait` (ns, waits); the run line `answers {"lock_waits": [[ns, waits] per shard],
+"kept_bytes", "kept_answers"}` (the map's totals; the vCPU line no longer has them). A generation a flip drops is freed after
+the shard is unlocked.
+
+**Tests** (`execution.rs`): colliding keys (one key, other later bytes or consulted gating: told apart; another half, offset or
+limit: no match; the requested RIP's answer first; a duplicate's insert names the holder); an answer evicted by two flips of its
+shard between lookup and use stays whole for the holder and is gone from the map; four threads inserting and looking up across
+generation flips (every answer found is one kept for the bytes asked, cross-thread hits found); with `FEXC`, two compilers on two
+threads sharing one map (the second's request at another RIP is the first's answer, relocated, checked against its own compile,
+0 compiles, counted by source). The existing reuse tests edit kept entries through `Arc::get_mut`.
+
+**Check run** (`check/check-n4-log`, `natemu-host boot-linux --check-reuse`, installer N = 4, cache off, log on): 966,430 memory
+hits used at another RIP, each also compiled there and equal (629 refused, 0 fallbacks), 861,825 resident copies checked, 0
+mismatches; 132.2 k compiles; the dialog reached.
+
+**Measured** (`natemu-raw/shared-20261104-01/`: `campaign.py`, `run1.sh`, `bench.py`, `boot.py` (now reaping with `wait4`:
+process CPU and max RSS, the fexc children not included), `summ.py`, `table.txt`, `inst/`, `runs/`, `log/`; the `natemu` stub,
+cache off, `mitigations=off nokaslr`, 2 GiB, one VM at a time, base (18ee440) and fix interleaved, every run uncontended and
+reached or verified; median (min-max) of three; installer to "Select a language", benchmarks START to END; both stubs built
+with the test driver, so with the host's `testing` hooks):
+
+| Run | N | wall s before | wall s after | process CPU s before / after | max RSS MB before / after |
+| --- | --- | --- | --- | --- | --- |
+| Installer | 1 | 8.65 (8.65-8.72) | 8.70 (8.54-8.82) | 8.70 / 8.72 | 611 / 556 |
+| Installer | 4 | 9.17 (9.06-9.19) | **6.63** (6.57-6.69) | 15.07 / 10.40 | 1,206 / 925 |
+| `build` | 4 | 12.95 (12.14-13.21) | **9.26** (9.19-9.34) | 43.94 / 31.85 | 2,235 / 1,545 |
+| `hackbench` | 4 | 9.60 (9.54-9.61) | **9.34** (9.24-9.37) | 43.59 / 40.66 | 1,044 / 889 |
+
+Counts (`log/`, one log-on run per cell; compiles over all vCPUs; fexc CPU from the servers' `wait4`):
+
+| Run | compiles before | compiles after | memory hits after (from another vCPU) | simultaneous duplicates | kept MB before / after | fexc CPU s before / after |
+| --- | --- | --- | --- | --- | --- | --- |
+| Installer N = 1 | 126.4 k | 126.8 k | 193.6 k (0) | 0 | 82 / 82 | 1.69 / 1.72 |
+| Installer N = 2 | 198.6 k | 129.6 k | 253.5 k (151.6 k) | 513 (0.40%) | 128 / 84 | 2.79 / 1.82 |
+| Installer N = 3 | 254.6 k | 130.7 k | 301.1 k (226.4 k) | 1,206 (0.92%) | 164 / 84 | 3.51 / 1.84 |
+| Installer N = 4 | 307.6 k | 130.9 k | 317.6 k (261.0 k) | 1,415 (1.08%) | 199 / 84 | 4.35 / 1.87 |
+| `build` N = 4 | 724.1 k | 248.2 k | 1,052.7 k (886.4 k) | 13,979 (5.63%) | 462 / 158 | 10.61 / 3.50 |
+| `hackbench` N = 4 | 179.6 k | 85.9 k | 122.9 k (103.9 k) | 1,298 (1.51%) | 117 / 56 | 2.55 / 1.22 |
+
+Lock waits are negligible: installer N = 4 526 waits, 1.1 ms in all (the worst shard 0.11 ms); `build` N = 4 2,452 waits, 5.4 ms
+(0.47 ms). **Ship threshold met**: installer N = 4 -2.54 s (-28%), `build` N = 4 -3.69 s (-28%), `hackbench` N = 4 -0.26 s (-2.7%,
+ranges apart), N = 1 unchanged within its spread; process CPU -4.7 s and -12.1 s at N = 4, max RSS -281 and -690 MB. At N = 4 the
+installer now compiles what N = 1 compiles; it is faster than N = 1 (6.6 against 8.7 s; QEMU multi 4.81 s).
+
+**Step 2, an in-flight table: built, measured, not kept** (`build`'s simultaneous duplicates passed 5%). A lookup that found nothing
+registered a flight (limit, half and offset, all gating values, the first 64 bytes) under the shard lock; a vCPU missing alike
+waited on it (condvar; the flight landed when its answer was kept or on any error), then looked again. Measured (`campaign2.py`,
+`table2.txt`, `inst2/`, `runs2/`, step 1 against step 2 interleaved, three rounds, the contended runs of another agent's VM
+dropped): installer N = 4 6.79 (6.62-6.86) against 7.01 (6.75-7.11); `build` N = 4 9.41 (9.40-9.80) against 9.49 (9.43-9.55,
+two); `hackbench` N = 4 9.48 (9.34-9.62, two) against 9.42 (9.36-9.67). Duplicates fell to 0 everywhere, and every one of
+`build`'s 15,767 waits ended in a hit, but a wait (22.8 us average, 359 ms in all) costs what the compile it saves does
+(compiles 248.2 k to 233.8 k, fexc CPU 3.50 to 3.36 s): no wall gain, so it was reverted (`step2-full.patch`); the shipped tree is
+step 1 (its stub's code is byte-identical to the measured one).
+
+**Checks** (`suite/`, `suite13.sh`, series49-sha, the final tree, one VM runner at a time, each case's output deleted as it ended):
+`cargo test` 168 + 1 ignored, also with `FEXC` set (4 new); fixtures 64 and seed 44 at both block sizes; faults 7,912 at both;
+`run_slice3_vm.py` `contain` (423 controls), `smp`, `sharedpt`, `coherence` 0 failures; `run_k1.py` 296 runs, no problem;
+`run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative controls flagged); every installer boot of the campaigns
+reached the dialog and every benchmark run verified. Not rerun: the rest of the standing suite (the change is in the host's
+answer map, which only `boot-linux` shares; the program driver's runs above use it per vCPU).
+
+**Independent review** (read-only, of the diff): no blocking defect (key complete, one lock per operation, containment
+unchanged). Applied: a flip's dropped generation (up to 16 k answers) is freed after the shard is unlocked; the kept totals moved
+from every vCPU line to the run's `answers` line; the concurrency test now puts every RIP in one shard with distinct keys, so its
+four threads look up across at least four flips of that hot shard, hold a reference across them, and the bound (two generations)
+and the evictions are asserted (before, its bound could not fail and a flip depended on the hash). Re-measured for the per-shard
+bounds (a sixteenth of the old per-vCPU bound; `runs3/`, `log3/`, `table3.txt`): `build` N = 1, base against the reviewed tree,
+three interleaved rounds: 19.76 (19.73-19.77) against 19.78 (19.65-19.91) s, process CPU 23.07 against 23.06 s, max RSS 1,300
+against 1,117 MB; compiles 229.8 k both (no extra compile from hot-shard flips). `cargo test` 168 + 1 ignored, also with `FEXC`.
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
@@ -1123,6 +1208,8 @@ resets wholesale at 65,536 entries (`execution.rs:842-846`). *Mechanism:* one ca
 `supported` too, holding the admitted form so a hit skips re-admission (every object still admitted for its RIP);
 second-chance eviction instead of the reset; the `fexc --serve` children (536) become a pool. *Risk:* the tamper hook
 (862) must act on a copy. *Decides:* duplicate-key share, admission time.
+(Built in chunk 13 as one sharded map of fexc's raw answers, each still relocated and admitted per vCPU, one server per vCPU
+kept: installer N = 4 -28%, `build` N = 4 -28%.)
 
 **Translating ahead of use.** After admission, queue the block's link targets (1339) on pages this request fetched (no
 host walk of guest tables) to idle pool servers; answers enter the shared cache keyed by bytes read, used only if the

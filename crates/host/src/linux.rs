@@ -235,11 +235,15 @@ impl Prepared {
             Ok(cpu)
         };
         let ended_first = AtomicUsize::new(usize::MAX);
+        // Perf chunk 13: one map of fexc's answers for every vCPU.
+        let answers = std::sync::OnceLock::new();
         let body = |v: usize, cpu: &Vcpu, cancelled: &AtomicBool| -> Result<(Stop, u64)> {
             let start = crate::perf::now();
             let mut compiler = Compiler::new(&self.fexc, cpu, self.max_block)?;
             compiler.disk = compile_cache::shared(&self.fexc, &self.compile_cache)?; // P3: the persistent compile cache
             compiler.perf = crate::perf::Recorder::new(v, start)?;
+            compiler.vcpu = v as u8;
+            compiler.share(&answers);
             compiler.check_reuse = self.check_reuse;
             compiler.shape = self.code_shape;
             let mut requests = execution::Requests { devices: Some(self.devices.clone()), ..Default::default() };
@@ -256,13 +260,13 @@ impl Prepared {
                 let fexc = compiler.finish();
                 let area = backing.vcpu(v);
                 let s: State = area.read_record(exec::STATE_OFFSET);
-                let (kept_bytes, kept_answers) = compiler.kept();
                 let state = format!(
-                    "{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"invalidations\":{},\"steps\":{},\"shootdowns\":{},\"systems\":{},\"halts\":{},\"interrupts\":{},\"deliveries\":{},\"stops\":{},\"shadow_resets\":{},\"compiles\":{},\"hits\":{},\"disk_hits\":{},\"relocated\":{},\"relocation_refused\":{},\"relocation_fallbacks\":{},\"reuse_checks\":{},\"kept_bytes\":{},\"kept_answers\":{}}}",
+                    "{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"invalidations\":{},\"steps\":{},\"shootdowns\":{},\"systems\":{},\"halts\":{},\"interrupts\":{},\"deliveries\":{},\"stops\":{},\"shadow_resets\":{},\"compiles\":{},\"hits\":{},\"disk_hits\":{},\"relocated\":{},\"relocation_refused\":{},\"relocation_fallbacks\":{},\"reuse_checks\":{},\"hits_by_source\":{:?},\"duplicates\":{},\"lock_wait\":[{},{}]}}",
                     s.blocks, s.l2_hits, s.requests, s.retries, s.upgrades, s.evictions, s.linker, s.links, s.unlinks, s.invalidations, s.steps,
                     s.shootdowns, s.systems, s.halts, s.interrupts, s.deliveries, s.stops, execution::shadow_resets(area), compiler.compiles,
                     compiler.hits, compiler.disk_hits, compiler.relocated, compiler.relocation_refused, compiler.relocation_fallbacks,
-                    compiler.reuse_checks, kept_bytes, kept_answers
+                    compiler.reuse_checks, compiler.hits_by_source, compiler.duplicates, compiler.lock_wait.0,
+                    compiler.lock_wait.1
                 );
                 match log.finish(end, fexc, &area.read_record(exec::perf::OFFSET), &execution::k1_stats(area), &state) {
                     (0, 0) => {}
@@ -272,6 +276,9 @@ impl Prepared {
             Ok((stop?, compiler.compiles))
         };
         let supervision = owners::supervise(vcpus, &prepare, &body, &self.cancel);
+        if let Some(a) = answers.get() {
+            crate::perf::line(&a.report());
+        }
         self.end();
         let destroyed = machine.destroy();
         crate::perf::mark("destroyed");
