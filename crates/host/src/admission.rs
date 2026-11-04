@@ -255,6 +255,11 @@ fn interrupt_flag(source: &[u8], starts: &[u32], end: u32, rip: u64, cpl0: bool)
         if insn.get(o..o + 2) == Some(&[0x0f, 0x31]) && (!cpl0 || insn.len() != 2) {
             return Err(format!("object refused: RDTSC translated at guest offset {g:#x} outside a CPL-0 block or with a prefix"));
         }
+        // Perf chunk 17: likewise a translated SWAPGS is the plain three-byte form in a CPL-0 block (no #GP there; LOCK, its #UD,
+        // is a prefix).
+        if insn.get(o..o + 3) == Some(&[0x0f, 0x01, 0xf8]) && (!cpl0 || insn.len() != 3) {
+            return Err(format!("object refused: SWAPGS translated at guest offset {g:#x} outside a CPL-0 block or with a prefix"));
+        }
         if !matches!(insn.get(o), Some(0xfa | 0xfb)) {
             continue;
         }
@@ -663,6 +668,13 @@ mod tests {
                                     (&[0x90, 0xfb], &[0, 1], true), (&[0x90, 0x66, 0xfb, 0x90], &[0, 1, 3], true), (&[0xf0, 0xfa, 0x90], &[0, 2], true),
                                     (&[0x90, 0xfb, 0xf3, 0xaa], &[0, 1, 2], true), (&[0x90, 0xfb, 0xf0, 0xf7, 0x18], &[0, 1, 2], true)] {
             assert!(f(src, starts, cpl0).is_err(), "{src:02x?}");
+        }
+        // Perf chunk 17: a translated SWAPGS only plain and in a CPL-0 block, first or not; 0f 01 f9 (RDTSCP) is no SWAPGS.
+        assert_eq!(f(&[0x0f, 0x01, 0xf8, 0x90], &[0, 3], true), Ok(vec![]));
+        assert_eq!(f(&[0x90, 0x0f, 0x01, 0xf8], &[0, 1], true), Ok(vec![]));
+        assert_eq!(f(&[0x0f, 0x01, 0xf9], &[0], false), Ok(vec![]));
+        for (src, cpl0) in [(&[0x0f, 0x01, 0xf8][..], false), (&[0x48, 0x0f, 0x01, 0xf8], true), (&[0x66, 0x0f, 0x01, 0xf8], true), (&[0xf0, 0x0f, 0x01, 0xf8], true)] {
+            assert!(f(src, &[0], cpl0).is_err_and(|e| e.contains("SWAPGS")), "{src:02x?}");
         }
     }
     #[test]

@@ -816,6 +816,11 @@ inline bool PlainFlag(const DecodedInst& d, uint8_t op) {
 inline bool PlainRdtsc(const DecodedInst& d) {
   return d.FexcMap == FEXC_MAP_TWO && d.OPRaw == 0x31 && d.InstSize == 2;
 }
+// Perf chunk 17: the plain SWAPGS (0f 01 f8, no prefix), translated inline in a CPL-0 request (patch 0033): at CPL 0 it never
+// faults (#GP(0) needs CPL > 0; LOCK, its only #UD, is a prefix); every other form stays the resident's.
+inline bool PlainSwapgs(const DecodedInst& d) {
+  return d.FexcMap == FEXC_MAP_TWO && d.OPRaw == 0x01 && d.ModRM == 0xF8 && d.InstSize == 3;
+}
 // Whether `n` (the instruction after an STI, `failed`: its decode ended the block with an error) is translated in the block:
 // an inline CLI or RDTSC, or an admitted form other than a REP string, a LOCK NEG and a direct branch to a non-canonical target (the
 // checks `Cut` makes after the verdict).
@@ -823,6 +828,7 @@ inline bool Follows(const DecodedInst* n, bool failed) {
   if (!n || failed || !n->TableInfo) return false;
   if (PlainFlag(*n, 0xFA)) return true;
   if (PlainRdtsc(*n)) return fexc_tsc;
+  if (PlainSwapgs(*n)) return true;   // only reached under --cpl0 (an inline STI)
   if (Classify(*n, true).kind != ALLOW) return false;
   const uint8_t op = n->OPRaw;
   const bool primary = n->FexcMap == FEXC_MAP_PRIMARY;
@@ -857,6 +863,7 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
       (d.OPRaw == 0xFA || (!first && Follows(next, next_last && status != S::SUCCESS))))
     return false;
   if (decoded && PlainRdtsc(d) && fexc_tsc) return false;
+  if (decoded && PlainSwapgs(d) && fexc_cpl0) return false;
   Verdict v = Classify(d, decoded);
   // I10 review: a #UD encoding FEX did not decode (it stops at the byte it does not know) is #UD once the instruction is
   // fetched: its bytes through the ModRM (FexcUdLength) must be in the supplied bytes, else `partial_decode` (the host fetches

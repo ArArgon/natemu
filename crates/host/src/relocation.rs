@@ -167,14 +167,14 @@ mod tests {
         }
     }
 
-    /// With `FEXC` set (perf chunk 15 review): a CPL-0 block whose STI exits to its own RIP (and a RIP-relative LEA) is fexc's
-    /// object at another RIP once relocated, by the host's relocator and by the resident's re-check (link points included:
-    /// the STI's exit goes to the STI at the new RIP), and is admitted there as a CPL-0 block.
+    /// With `FEXC` set (perf chunk 15 review): a CPL-0 block whose STI exits to its own RIP (and a RIP-relative LEA and, perf
+    /// chunk 17, an inline SWAPGS) is fexc's object at another RIP once relocated, by the host's relocator and by the resident's
+    /// re-check (link points included: the STI's exit goes to the STI at the new RIP), and is admitted there as a CPL-0 block.
     #[test]
     fn cpl0_sti_exit_is_relocated() {
         let Some(fexc) = std::env::var_os("FEXC") else { return };
-        // lea rax, [rip + 0x10]; cli; sti; inc rax; ret
-        let source = [0x48, 0x8d, 0x05, 0x10, 0, 0, 0, 0xfa, 0xfb, 0x48, 0xff, 0xc0, 0xc3];
+        // lea rax, [rip + 0x10]; swapgs; cli; sti; inc rax; ret
+        let source = [0x48, 0x8d, 0x05, 0x10, 0, 0, 0, 0x0f, 0x01, 0xf8, 0xfa, 0xfb, 0x48, 0xff, 0xc0, 0xc3];
         let compile = |rip: u64| {
             let dir = std::env::temp_dir().join(format!("natemu-reloc-{}-{rip:x}", std::process::id()));
             let hex: String = source.iter().map(|b| format!("{b:02x}")).collect();
@@ -190,7 +190,7 @@ mod tests {
         let (oa, ob) = (compile(a), compile(b));
         assert_eq!(object(&oa, a, b).as_deref(), Some(&ob[..]));
         let admitted = crate::admission::admit(&ob, b, &source, u64::MAX, true, true).unwrap();
-        assert!(admitted.links.iter().any(|p| p.target == b + 8), "the STI's exit at the new RIP");
+        assert!(admitted.links.iter().any(|p| p.target == b + 11), "the STI's exit at the new RIP (after the inline SWAPGS)");
         let (mut code, relocs, mut links, bytes) = placed_at(&oa, a, &source, true);
         assert_eq!(relocate_code(&mut code, &relocs, &mut links, a, b, bytes), Ok(()));
         let h: Header = read(&admitted.object, 0).unwrap();

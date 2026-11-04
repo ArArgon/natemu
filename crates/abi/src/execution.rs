@@ -87,7 +87,9 @@ pub const FRAME_VA: u64 = PRIVATE + FRAME_OFFSET as u64;
 /// acts as CLI/STI would; a CPL-3 one changes nothing). Perf chunk 15 adds two resident-written fields CPL 3 may read there:
 /// the event-pending byte (whether an interrupt is pending, which the vCPU's own code sees anyway when IF is set) and the
 /// TSC offset (useless without the count: admission refuses counter reads outside a CPL-0 RDTSC, and RDTSC at CPL 3 stays
-/// the resident's, which faults under CR4.TSD). Needs 48-bit linear addresses and no LAM: with LA57 it would be canonical,
+/// the resident's, which faults under CR4.TSD). Perf chunk 17: IA32_KERNEL_GS_BASE ([`frame::KERNEL_GS_BASE`], 0 at CPL 3)
+/// and the GS base are read back after CPL-0 code (a CPL-0 store into either acts as SWAPGS's writes would; a CPL-3 one
+/// changes neither). Needs 48-bit linear addresses and no LAM: with LA57 it would be canonical,
 /// with LAM_SUP it would alias a canonical kernel address (neither is advertised).
 pub const GUEST_STATE_VA: u64 = 0xffff_4000_0000_1000;
 pub const FRAME_POINTER: u64 = GUEST_STATE_VA;
@@ -612,9 +614,15 @@ pub mod frame {
     pub const TSC_OFFSET: u32 = 0xb8;
     /// FEX's `gs_cached` and `fs_cached` (`CPUState`, right before the flag bytes): the GS and FS bases FEX adds to every
     /// GS-/FS-prefixed address in 64-bit mode (`OpDispatchBuilder::GetSegment`), 8 bytes each, written by the resident
-    /// from the bank at every block entry (I7).
+    /// from the bank at every block entry (I7); the GS base is read back after CPL-0 code (perf chunk 17: an inline SWAPGS
+    /// writes it, [`KERNEL_GS_BASE`]).
     pub const GS_BASE: u32 = FLAGS - 16;
     pub const FS_BASE: u32 = FLAGS - 8;
+    /// Perf chunk 17: IA32_KERNEL_GS_BASE while a CPL-0 block runs, 8 bytes in FEX's `L1Pointer` (no generated code uses it),
+    /// written by the resident at every entry (0 at CPL > 0, so CPL 3 never reads the kernel's value there). A CPL-0
+    /// translation's inline SWAPGS exchanges it with [`GS_BASE`] (admission allows those loads and stores only in a CPL-0
+    /// block, with the code shape only inside a SWAPGS), and the resident banks both after every CPL-0 exit and fault.
+    pub const KERNEL_GS_BASE: u32 = 0xa0;
     /// x87 (I6, FEX's reduced-precision mode): FEX's flag bytes for FSW.IE (only FEX's own IE: its other exception flags
     /// are in [`X87_EXCEPTIONS`]), C0, C1, C2, C3 (each 0/1) and TOP (0..7); ST(i) as a double in the low 8 bytes of the
     /// 16-byte `mm[(TOP + i) & 7]` (the high 8 are unused); FCW (written from the bank at every block entry, never read back);
@@ -2317,6 +2325,10 @@ mod tests {
             assert!(inside(&frame::GUEST_STATE, at) && !inside(&frame::GUEST_STATE_WRITABLE, at), "{at:#x}");
         }
         assert!(!inside(&frame::GUEST_STATE, frame::TSC_OFFSET - 1) && !inside(&frame::GUEST_STATE_WRITABLE, frame::IF));
+        // Perf chunk 17: IA32_KERNEL_GS_BASE in FEX's `L1Pointer` (CPUState 0xa0: 16 bytes of header and PF/AF, RIP, 16 GPRs),
+        // in neither list (admission allows it only in a CPL-0 block's SWAPGS), 8-aligned for one `ldr`/`str`.
+        assert_eq!((frame::KERNEL_GS_BASE, frame::KERNEL_GS_BASE % 8), (0x18 + 8 + 16 * 8, 0));
+        assert!((frame::KERNEL_GS_BASE..frame::KERNEL_GS_BASE + 8).all(|b| !inside(&frame::GUEST_STATE, b)));
     }
 
     /// I6: x87 arithmetic runs under MXCSR's FPCR when FCW.RC equals MXCSR.RC and neither FTZ nor DAZ is set, else under its own.

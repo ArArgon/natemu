@@ -9,7 +9,8 @@
 //!   names neither x25 nor x28 in any register field ([`screened`]); x28 (FEX's guest-state base, the guest-state page)
 //!   is never written and addresses only FEX's guest-state fields: loads of `frame::GUEST_STATE`, stores only to
 //!   `frame::GUEST_STATE_WRITABLE` (DF), and in a CPL-0 block to IF's byte (perf chunk 15: its CLI and STI, which the code
-//!   shape checks); x25 is written only by `mrs x25,
+//!   shape checks) and to the GS base and IA32_KERNEL_GS_BASE's field, which it may also load (perf chunk 17: its SWAPGS,
+//!   likewise); x25 is written only by `mrs x25,
 //!   nzcv` (the pre-NZCV save the resident reads at `nzcv=saved` sites); the only `svc`s are `#LINK`, `#DIV_U`,
 //!   `#DIV_S`, `#X87` and `#STRING`; direct branches go forward to a word of the code region; no word falls through into a literal slot, a
 //!   check stub or past the region. So every path ends at an exit the resident knows (a link point or the dispatch
@@ -726,7 +727,14 @@ impl<'a> Verifier<'a> {
             let insn = self.instruction(at).map(|(g, _)| self.guest_insn(g));
             !m.load && self.c.cpl0 && (offset, m.size) == (i64::from(frame::IF), 1) && (!self.c.shape || matches!(insn, Some([0xfa] | [0xfb])))
         };
-        if matches!(m.form, Form::Unsigned | Form::Pair) && (fields.iter().any(inside) || flag()) {
+        // Perf chunk 17: a CPL-0 block's SWAPGS loads and stores IA32_KERNEL_GS_BASE's field and stores GS.base (with the code
+        // shape: only inside a SWAPGS), each as one 8-byte access.
+        let swapgs = || {
+            let insn = self.instruction(at).map(|(g, _)| self.guest_insn(g));
+            let field = (offset, m.size) == (i64::from(frame::KERNEL_GS_BASE), 8) || (!m.load && (offset, m.size) == (i64::from(frame::GS_BASE), 8));
+            self.c.cpl0 && field && (!self.c.shape || insn == Some(&[0x0f, 0x01, 0xf8][..]))
+        };
+        if matches!(m.form, Form::Unsigned | Form::Pair) && (fields.iter().any(inside) || flag() || (m.form == Form::Unsigned && swapgs())) {
             Ok(())
         } else {
             Err(format!("frame access {:#010x} at {at:#x}: not a guest-state field", self.word(at)))
@@ -1394,8 +1402,12 @@ mod tests {
         admit_with(fixture, true)
     }
     fn admit_with((object, source): (&[u8], &[u8]), shape: bool) -> Result<(), String> {
+        admit_at((object, source), shape, false)
+    }
+    /// `cpl0`: as a CPL-0 request's object (perf chunks 15, 17).
+    fn admit_at((object, source): (&[u8], &[u8]), shape: bool, cpl0: bool) -> Result<(), String> {
         let h: Header = super::super::record(object, 0);
-        super::super::admit(object, h.guest_rip, source, u64::MAX, shape, false).map(|_| ())
+        super::super::admit(object, h.guest_rip, source, u64::MAX, shape, cpl0).map(|_| ())
     }
     /// `fixture` with the code word at `at` (which must be `old`) replaced by `new`.
     fn patched(fixture: (&[u8], &[u8]), at: u32, old: u32, new: u32) -> Vec<u8> {
@@ -1799,6 +1811,25 @@ mod tests {
         }
         refused(ADDRESS, at, old, 0x3950_1f95, "frame access"); // ldrb w21, [x28, #0x407]: past the flags
         refused(ADDRESS, at, old, 0x3910_1b94, "frame access"); // strb w20, [x28, #0x406]: the event-pending byte is the resident's
+        // Perf chunk 17: IA32_KERNEL_GS_BASE's field and a store of GS.base only in a CPL-0 block's SWAPGS (these fixtures are not
+        // CPL 0: the cpl0_translates_swapgs_inline test admits fexc's).
+        refused(ADDRESS, at, old, 0xf940_5395, "frame access"); // ldr x21, [x28, #0xa0]
+        refused(ADDRESS, at, old, 0xf900_5394, "frame access"); // str x20, [x28, #0xa0]
+        refused(ADDRESS, at, old, 0xf901_f395, "frame access"); // str x21, [x28, #0x3e0]
+        for word in [0xf940_5395, 0xf900_5394, 0xf901_f395] {
+            validated(ADDRESS, at, old, word, Some("frame access")); // without the code shape too
+        }
+        // ... and in a CPL-0 block: admitted without the code shape, refused with it outside a SWAPGS (this fixture holds none);
+        // a 4-byte, pair or unscaled access to the field is refused either way.
+        let cpl0 = |word: u32, shape: bool| admit_at((&patched(ADDRESS, at, old, word), ADDRESS.1), shape, true);
+        for word in [0xf940_5395, 0xf900_5394, 0xf901_f395] {
+            assert_eq!(cpl0(word, false), Ok(()), "{word:#010x}");
+            assert!(cpl0(word, true).is_err_and(|e| e.contains("frame access")), "{word:#010x}");
+        }
+        // ldr w21, [x28, #0xa0]; ldp x20, x21, [x28, #0xa0]; ldur x21, [x28, #0xa0]; str x21, [x28, #0x3e8] (the FS base: never written)
+        for word in [0xb940_a395, 0xa94a_5794, 0xf84a_0395, 0xf901_f795] {
+            assert!(cpl0(word, false).is_err_and(|e| e.contains("frame access")), "{word:#010x}");
+        }
         // I7: the segment bases (gs_cached 992, fs_cached 1000) are loads only.
         admitted(0xf941_f794); // ldr x20, [x28, #1000]: an FS-prefixed access reads FS.base
         admitted(0xf941_f394); // ldr x20, [x28, #992]: GS.base

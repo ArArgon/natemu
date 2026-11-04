@@ -1417,6 +1417,9 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
     // I8: YMM0..15's upper halves (the guest-state page's avx_high, two quadwords per register).
     let ymmh: Vec<u64> = (0..32).map(|q| u64::from_le_bytes(frame[(exec::frame::AVX_HIGH + 8 * q) as usize..][..8].try_into().unwrap())).collect();
     let _ = write!(out, ",\"ymmh\":[{}]", list(&ymmh));
+    // Perf chunk 17: GS.base (the bank's) and IA32_KERNEL_GS_BASE (the MSR record's), which an inline SWAPGS exchanges.
+    let msrs: natemu_abi::cpu::Msrs = area.read_record(exec::MSRS_OFFSET);
+    let _ = write!(out, ",\"gs_base\":\"{:#x}\",\"kernel_gs_base\":\"{:#x}\"", s.cpu.gs_base, msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_KERNEL_GS_BASE).unwrap()]);
     let l = execution::lapic(area);
     let _ = write!(out, ",\"lapic\":{{\"cntfrq\":{},\"svr\":\"{:#x}\",\"tpr\":\"{:#x}\",\"isr\":[{}],\"esr\":\"{:#x}\"}}", l.frequency, l.svr, s.cpu.cr8, list(&l.isr), l.esr);
     out += ",\"pages\":[";
@@ -1529,10 +1532,12 @@ fn kick_report(area: Area, stops: &execution::Stops) -> String {
 }
 
 /// The FEX frame holds nothing outside its guest-state fields (guest code cannot have written private memory there; I8:
-/// YMM_Hi128 is one of them).
+/// YMM_Hi128 is one of them; perf chunk 17: IA32_KERNEL_GS_BASE's field, which the resident writes at every entry and only a
+/// CPL-0 block's SWAPGS may access).
 fn frame_intact(area: Area) -> bool {
     let frame: [u8; exec::frame::BYTES] = area.read_record(exec::FRAME_OFFSET);
-    let admitted = |i: usize| exec::frame::GUEST_STATE.iter().any(|&(at, len)| (at as usize..(at + len) as usize).contains(&i));
+    let kernel_gs = exec::frame::KERNEL_GS_BASE as usize..exec::frame::KERNEL_GS_BASE as usize + 8;
+    let admitted = |i: usize| kernel_gs.contains(&i) || exec::frame::GUEST_STATE.iter().any(|&(at, len)| (at as usize..(at + len) as usize).contains(&i));
     frame.iter().enumerate().all(|(i, &b)| b == 0 || admitted(i))
 }
 

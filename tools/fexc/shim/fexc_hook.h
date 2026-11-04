@@ -161,6 +161,10 @@ constexpr unsigned FEXC_EVENT_PENDING_LOC = 22;
 // `_pad1`, which no FEX code uses; the resident writes it at every entry: frame::TSC_OFFSET on the host).
 inline FexcArg<bool, FEXC_ARG_TSC> fexc_tsc;
 constexpr uint32_t FEXC_TSC_OFFSET = 0xb8;
+// Profile slice1 (perf chunk 17): with `--cpl0` the plain SWAPGS (0f 01 f8) is translated inline (patch 0033), exchanging FEX's
+// gs_cached with IA32_KERNEL_GS_BASE, which the resident keeps at FEXC_KERNEL_GS_BASE (FEX's `L1Pointer`, which no generated
+// code uses) while a CPL-0 block runs (frame::KERNEL_GS_BASE on the host).
+constexpr uint32_t FEXC_KERNEL_GS_BASE = 0xa0;
 // Profile slice1 (I3), recorded by the dispatcher: guest RIP of each LOCK CMPXCHG / CMPXCHG8B / CMPXCHG16B, whose casal/caspal
 // the JIT precedes with `dmb ish` (x86 orders a failing locked compare; a failing Arm CAS writes nothing, acquire only).
 inline std::set<uint64_t> fexc_lock_cas;

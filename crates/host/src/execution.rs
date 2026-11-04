@@ -2187,6 +2187,36 @@ mod tests {
         assert!(admission::admit(&o, 0x1000, &source, u64::MAX, false, false).err().unwrap().contains("CLI/STI"));
     }
 
+    /// With `FEXC` set (perf chunk 17, fexc patch 0033): at CPL 0 the plain SWAPGS is translated inline, first or not, twice in
+    /// one block, and as the instruction after an inline STI; with REX, LOCK or 66 it is the resident's, and a CPL-3 request
+    /// cuts it (never reusing the CPL-0 answer). Admission refuses the inline form, and its accesses to the KERNEL_GS_BASE
+    /// field, outside a CPL-0 block.
+    #[test]
+    fn cpl0_translates_swapgs_inline() {
+        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        (c.shape, c.cpl0) = (true, true);
+        let block = |c: &mut super::Compiler, code: &[u8]| match c.compile(code, 0x1000, false, &mut ()).unwrap() {
+            Code::Block(b) => Ok(b),
+            Code::System(s) => Err(s.kind),
+            Code::None(r) => panic!("{r}"),
+        };
+        // endbr64; swapgs; mov rax, gs:[16]; swapgs; nop dword [rax]; ret (Linux's entry and exit shapes)
+        let linux = [0xf3, 0x0f, 0x1e, 0xfa, 0x0f, 0x01, 0xf8, 0x65, 0x48, 0x8b, 0x04, 0x25, 0x10, 0, 0, 0, 0x0f, 0x01, 0xf8, 0x0f, 0x1f, 0x00, 0xc3];
+        assert_eq!(block(&mut c, &linux).unwrap().guest_insns, 6);
+        assert_eq!(block(&mut c, &[0x0f, 0x01, 0xf8, 0xc3]).unwrap().guest_insns, 2); // first
+        assert_eq!(block(&mut c, &[0x90, 0xfb, 0x0f, 0x01, 0xf8, 0xc3]).unwrap().guest_insns, 4); // sti; swapgs: both inline
+        for kept in [&[0x48, 0x0f, 0x01, 0xf8, 0xc3][..], &[0xf0, 0x0f, 0x01, 0xf8, 0xc3], &[0x66, 0x0f, 0x01, 0xf8, 0xc3]] {
+            assert_eq!(block(&mut c, kept).err(), Some(exec::system::SWAPGS), "{kept:02x?}");
+        }
+        c.cpl0 = false;
+        assert_eq!(block(&mut c, &[0x0f, 0x01, 0xf8, 0xc3]).err(), Some(exec::system::SWAPGS));
+        assert_eq!(block(&mut c, &linux).unwrap().guest_insns, 1); // endbr64, cut before the SWAPGS
+        let Answer::Object(o) = c.answers.find(&linux, 0x1000, None, &{ let mut g = c.gating(); g[8] = 1; g }).0.unwrap().answer.clone() else { panic!() };
+        assert!(admission::admit(&o, 0x1000, &linux, u64::MAX, true, true).is_ok());
+        assert!(admission::admit(&o, 0x1000, &linux, u64::MAX, false, false).err().unwrap().contains("SWAPGS"));
+    }
+
     /// With `FEXC` set (perf chunk 4): answers are reused at other RIPs of the same half and page offset, under the reuse
     /// check (each also compiled and compared); the relocator's refusals are compiled, the reverse canonical case included.
     #[test]

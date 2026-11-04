@@ -46,7 +46,9 @@ Then, as the numbers dictate:
    PTI address-space work (`natemu-raw/mitig-20261103-01/`). The ordinary benchmark case is "not vulnerable"; once PCID is
    built, a PTI-on boot joins the standing benchmarks (owner).
 7. **Remaining exits and per-request costs**: fast paths for the commonest system instructions (~2.5 M entries per
-   installer boot; done for the syscall path in perf chunk 12: `hackbench` N = 1 51.2 -> 30.1 s), fexc's fixed per-request setup (argument parsing, feature table and Config per request), in-process FEX
+   installer boot; done for the syscall path in perf chunk 12: `hackbench` N = 1 51.2 -> 30.1 s; CLI, STI, RDTSC inline at CPL 0 in
+   chunk 15; SWAPGS inline at CPL 0 in chunk 17: `hackbench` N = 1 16.3 -> 13.8 s, `locks` N = 4 7.29 -> 6.54 s, [perf-plan.md](perf-plan.md),
+   "Measured (chunk 17)"; SYSCALL and SYSRET remain two resident trips per system call), fexc's fixed per-request setup (argument parsing, feature table and Config per request), in-process FEX
    (removes the pipe, gives up process isolation; admission stays), an in-VM random-number generator or the Arm RNDR if the
    VM sees it (owner: after batch 1), a cheaper disk-cache key (fast hash plus stored request bytes), huge pages for the code
    area.
@@ -66,6 +68,9 @@ full matrix at batch end; cold cache for comparisons with QEMU; per-case outputs
 - Judging models written from memory (segment, syscall, delivery, ACPI) re-derived with SDM page citations.
 - i8b: coverage after the first two-NaN operation; MIN/MAX under DAZ.
 - Narrow the library's public interface (about 190 items).
+- The linker halts with `bad_link` when a fault or interrupt delivered at its target boundary changes CPL and the handler
+  sits at the target RIP (legal x86, e.g. a CPL-3 jump to a supervisor-only page that is its own #PF handler; found in
+  the chunk-17 review, older than it): skip linking when the code contexts differ, as for steps and breakpoints.
 
 ## Integration (separate phase)
 

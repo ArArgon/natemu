@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: natemu <natemu@example.invalid>
+Date: Wed, 4 Nov 2026 12:41:25 -0800
+Subject: [PATCH 33/33] FEXCore: slice1 perf chunk 17: SWAPGS inline at CPL 0
+
+---
+ .../Source/Interface/Core/OpcodeDispatcher.cpp   | 16 ++++++++++++++++
+ FEXCore/Source/Interface/Core/OpcodeDispatcher.h |  1 +
+ .../Core/OpcodeDispatcher/SecondaryModRMTables.h |  2 +-
+ 3 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index cc297fa..449c18b 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -5411,6 +5411,22 @@ void OpDispatchBuilder::FexcInterruptFlagOp(OpcodeArgs) {
+   _StoreContextGPR(OpSize::i8Bit, Constant(1), IF);
+ }
+ 
++// natemu slice1 (perf chunk 17): SWAPGS translated inline, only where the allowlist lets it through (fexc_slice1.inc : a
++// CPL-0 request, the plain three-byte form 0f 01 f8). At CPL 0 it cannot fault (#GP(0) needs CPL > 0; LOCK, the only #UD,
++// is a prefix). It exchanges GS.base (FEX's gs_cached, which every GS-prefixed access adds) with IA32_KERNEL_GS_BASE, which
++// the resident keeps in FEXC_KERNEL_GS_BASE (FEX's State.L1Pointer, which no generated code uses) while a CPL-0 block runs,
++// writing both at every entry and banking both back after every CPL-0 exit and fault.
++void OpDispatchBuilder::FexcSwapGSOp(OpcodeArgs) {
++  if (!fexc_slice1) {
++    return PermissionRestrictedOp(Op);
++  }
++  static_assert(offsetof(Core::CPUState, L1Pointer) == FEXC_KERNEL_GS_BASE);
++  auto GS = _LoadContextGPR(OpSize::i64Bit, offsetof(Core::CPUState, gs_cached));
++  auto Kernel = _LoadContextGPR(OpSize::i64Bit, FEXC_KERNEL_GS_BASE);
++  _StoreContextGPR(OpSize::i64Bit, Kernel, offsetof(Core::CPUState, gs_cached));
++  _StoreContextGPR(OpSize::i64Bit, GS, FEXC_KERNEL_GS_BASE);
++}
++
+ void OpDispatchBuilder::PermissionRestrictedOp(OpcodeArgs) {
+   BreakOp(Op, FEXCore::IR::BreakDefinition {
+                 .ErrorRegister = 0,
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 2d24ceb..8c76cae 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -416,6 +416,7 @@ public:
+   void MOVSegOp(OpcodeArgs, bool ToSeg);
+   void FLAGControlOp(OpcodeArgs);
+   void FexcInterruptFlagOp(OpcodeArgs);
++  void FexcSwapGSOp(OpcodeArgs);
+   void MOVOffsetOp(OpcodeArgs);
+   void CMOVOp(OpcodeArgs);
+   void CPUIDOp(OpcodeArgs);
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryModRMTables.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryModRMTables.h
+index 7386847..26b4332 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryModRMTables.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryModRMTables.h
+@@ -15,7 +15,7 @@ constexpr DispatchTableEntry OpDispatch_SecondaryModRMTables[] = {
+   {((2 << 3) | 7), 1, &OpDispatchBuilder::PermissionRestrictedOp},
+ 
+   // REG /7
+-  {((3 << 3) | 0), 1, &OpDispatchBuilder::PermissionRestrictedOp},
++  {((3 << 3) | 0), 1, &OpDispatchBuilder::FexcSwapGSOp},
+   {((3 << 3) | 1), 1, &OpDispatchBuilder::RDTSCPOp},
+   {((3 << 3) | 4), 1, &OpDispatchBuilder::CLZeroOp},
+ };
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """K2 checks: system instructions run from the decoded record kept in the code cache (boot-features plan, K2).
 
-    tools/with-env python3 tools/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence,rollback,nopruns,tsc] [--n 100000] [--reps 3]
+    tools/with-env python3 tools/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence,rollback,nopruns,tsc,swapgs] [--n 100000] [--reps 3]
         [--xmc-rewrites N] [--host HOST --runtime RUNTIME]
 
 - `cost`: microseconds per loop iteration of one system instruction (CLI, STI, PUSHFQ+POPFQ, SWAPGS, RDTSC, CPUID,
   WRMSR KERNEL_GS_BASE, FLD+FSTP m80) at CPL 0 on 1 vCPU, as the slope (t(2N) - t(N)) / N of the driver's wall time
   (start-up and compiles fall into the intercept); every run must reach its end. With the stats `decode_exits` per
-  run: after K2 a loop's decode exits do not grow with N.
+  run: after K2 a loop's decode exits do not grow with N. Perf chunk 17: `syscall`, one SYSCALL -> kernel -> SYSRET round trip
+  from a CPL-3 loop, the kernel side shaped as Linux's (`endbr64; swapgs; ...; swapgs; 7-byte NOP; sysretq`).
 - `rdrand`: 4,000 RDRANDs in a loop (the pool holds 32): all succeed, about one entropy refill exit per 32, values differ.
 - `xmc`: cross-modifying code at a system instruction, by the x86 protocol (deterministic: see `xmc`): vCPU 1 rewrites
   one byte of X (CLI <-> NOP, CLI <-> STI, SWAPGS <-> RDTSCP, FLD m80 <-> FILD m32, CLI -> INT3) paced by vCPU 0's
@@ -22,6 +23,8 @@
   and rewritten by a peer vCPU, at 1-4 vCPUs (see `nopruns`).
 - `tsc` (perf chunk 15): RDTSC translated inline at CPL 0 agrees with the resident's RDTSCP (one clock), follows a WRMSR of
   the TSC, and never runs backwards across vCPUs (see `tsc`).
+- `swapgs` (perf chunk 17): SWAPGS translated inline at CPL 0 exchanges GS.base and IA32_KERNEL_GS_BASE as the resident's
+  does, across a fault, precise stops and interrupts, and CPL 3 can neither read nor forge the kernel's value (see `swapgs`).
 
 Writes DIR/k2.json; exit status 1 on any failure."""
 import argparse, json, pathlib, statistics, subprocess, sys, time
@@ -51,7 +54,29 @@ COSTS = {
     # Reference: one resident round trip with no system instruction: a 128/64 division with RDX != 0 (fexc's helper,
     # `svc #DIV_U`; with RDX = 0 it divides inline).
     'div': ('mov edx, 1\nmov eax, 7\ndiv r9', {9: 2}),
+    # Perf chunk 17: a SYSCALL -> kernel -> SYSRET round trip (`syscall_program`).
+    'syscall': (None, {}),
 }
+USER_GS, KERNEL_GS, KERNEL_RIP = 0x2a0000, 0x2b0000, 0x200000
+# Linux's entry_SYSCALL_64 and its SYSRET exit, in shape: ENDBR64; SWAPGS; the user RSP saved and the kernel's loaded through
+# GS; ...; SWAPGS; a 7-byte NOP; SYSRETQ.
+LINUX_KERNEL = ('endbr64\nswapgs\nmov gs:[16], rsp\nmov rsp, gs:[24]\npush rcx\npop rcx\nmov rsp, gs:[16]\nswapgs\n'
+                '.byte 0x0f,0x1f,0x80,0,0,0,0\nsysretq')
+
+
+def wrmsr(index, value):
+    return f'mov ecx, {index:#x}\nmov eax, {value & 0xffffffff:#x}\nmov edx, {value >> 32:#x}\nwrmsr\n'
+
+
+def syscall_program(user, kernel, regs, extra=''):
+    """A CPL-0 start that sets EFER.SCE, STAR, LSTAR (KERNEL_RIP), FMASK (Linux's 0x47700), GS.base (USER_GS) and
+    IA32_KERNEL_GS_BASE (KERNEL_GS, whose quadword 24 holds the kernel stack), then SYSRETs to `user` (CPL 3, IF = 1);
+    `kernel` at LSTAR."""
+    code = ref.assemble('mov ecx, 0xc0000080\nrdmsr\nor eax, 1\nwrmsr\n' + wrmsr(0xc0000081, 0x23 << 48 | 0x10 << 32) + wrmsr(0xc0000082, KERNEL_RIP)
+                        + wrmsr(0xc0000084, 0x47700) + wrmsr(0xc0000101, USER_GS) + wrmsr(0xc0000102, KERNEL_GS)
+                        + f'mov qword ptr [{KERNEL_GS + 24}], {STACK - 0x100}\nlea rcx, [rip + user]\nmov r11d, 0x202\nsysretq\nuser:\n' + user)
+    return (f'rip {CODE:#x}\nrflags 0x2\n{gprs(regs)}\ncode {code.hex()}\nbody {KERNEL_RIP:#x} {ref.assemble(kernel).hex()}\ncpl 0\nif 0\n'
+            f'memory {USER_GS:#x} {bytes(32).hex()}\nmemory {KERNEL_GS:#x} {bytes(32).hex()}\nregion 0x3e0000 0x10000\n{extra}')
 
 
 def driver(a, text, work, extra=()):
@@ -74,12 +99,12 @@ def gprs(values):
 def cost(a, report):
     failures, rows = [], {}
     for name, (body, regs) in COSTS.items():
-        code = ref.assemble(f'1: {body}\ndec r8\njnz 1b')
+        code = ref.assemble(f'1: {body}\ndec r8\njnz 1b') if body else None
         times, stats = {a.n: [], 2 * a.n: []}, {}
         for rep in range(a.reps + 1):
             for n in (a.n, 2 * a.n):
                 text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({8: n, **regs})}\ncode {code.hex()}\ncpl 0\nif 0\n'
-                        f'memory {DATA:#x} {F80_ONE.hex()}\nregion 0x3e0000 0x10000\n')
+                        f'memory {DATA:#x} {F80_ONE.hex()}\nregion 0x3e0000 0x10000\n') if body else syscall_program('1: syscall\ndec r8\njnz 1b', LINUX_KERNEL, {8: n})
                 dt, out, err = driver(a, text, a.out / 'cost' / f'{name}-{n}')
                 if out is None or out['stop'] != 'reached' or int(out['gpr'][8], 0) != 0:
                     failures.append(f"cost {name} n={n}: {err if out is None else (out['stop'], out['reason'])}")
@@ -221,7 +246,8 @@ def coherence(a, report):
     the instruction at X from its kept record (two visits: its old kind decoded once), changes X the architectural way,
     and the next visit must run the new instruction: A the vCPU's own write from another page, B its own write on X's
     page in a loop, C a remap of X's linear page with INVLPG, or with a CR3 reload, D a write through another linear
-    alias of X's frame, E a SWAPGS crossing 0x200000 whose second page alone is remapped (to RDTSCP's byte) and INVLPGed,
+    alias of X's frame, E a SWAPGS crossing 0x200000 whose second page alone is remapped (to RDTSCP's byte) and INVLPGed
+    (perf chunk 17: with a REX.W prefix, which keeps it the resident's at CPL 0: fexc translates only the plain form inline),
     F a peer's rewrite, then a flag, then CPUID (serializing), G (perf chunk 12) a run of NOPs kept as one record, its
     second NOP rewritten by the vCPU's own store. Also BTS under alignment checking (a kept BT_ALIGNED
     record): aligned five times (stepped plain each time), then misaligned: #AC(0) at the BTS; all aligned: completes.
@@ -235,7 +261,7 @@ def coherence(a, report):
     go = lambda at, k: f'lea r13, [rip + v{k}]\nmov rax, {at:#x}\njmp rax\nv{k}:\n'
     cr3 = f'mov rax, {TA:#x}\nmov cr3, rax\n'
     L, F1, F2, ALIAS, FLAG = P.SYS_D(I), P.SYS_D(I) + 0x1000, P.SYS_D(I) + 0x2000, P.SYS_D(I) + 0x3000, P.SYS_D(I) + 0x4000
-    XC, P2, P2NEW = 0x1ffffe, 0x200000, 0x230000
+    XC, P2, P2NEW = 0x1ffffd, 0x200000, 0x230000
     IF = lambda c: int(c['rflags'], 16) & 0x200 != 0
     gpr = lambda c, n: int(c['gpr'][n], 16)
     # Perf chunk 15: the probed CLI/STI carry a 66 prefix (ignored), which keeps them the resident's at CPL 0 (fexc translates
@@ -254,7 +280,7 @@ def coherence(a, report):
         ('E-crossing-second-page', [(CODE1, asm(cr3 + go(XC, 0) + go(XC, 1) + f'mov rax, {P2NEW | LEAF:#x}\nmov qword ptr [{pte(P2):#x}], rax\n'
                                                 f'mov rax, {P2:#x}\ninvlpg [rax]\nmov rcx, 0x5555\n' + go(XC, 2)
                                                 + 'mov r10, rcx\nmov ecx, 0xc0000101\nrdmsr\nmov r9, rax\n'), ['gsbase 0x1234'])],
-         tables({}) + [(pte(0x1ff000), (0x1ff000 | LEAF).to_bytes(8, 'little')), (0x1ff000, bytes(0xffe) + bytes.fromhex('0f01')),
+         tables({}) + [(pte(0x1ff000), (0x1ff000 | LEAF).to_bytes(8, 'little')), (0x1ff000, bytes(0xffd) + bytes.fromhex('480f01')),
                        (P2, bytes.fromhex('f8') + JMP), (P2NEW, bytes.fromhex('f9') + JMP)],
          lambda c: gpr(c, 9) == 0x1234 and gpr(c, 10) != 0x5555, 0x22),     # two SWAPGS, then RDTSCP (RCX := TSC_AUX)
         *[(f'F-peer-then-cpuid-{r}', [(CODE1, asm(cr3 + f'1:\nlea r13, [rip + 2f]\nmov rax, {X:#x}\njmp rax\n2: inc qword ptr [{FLAG + 8:#x}]\n'
@@ -471,11 +497,81 @@ done:''')
     return failures
 
 
+def swapgs(a, report):
+    """Perf chunk 17: SWAPGS at CPL 0 is translated inline (no decode of it) and exchanges GS.base with IA32_KERNEL_GS_BASE
+    (SDM Vol.2 SWAPGS), which the resident keeps in the guest-state page while CPL-0 code runs and banks after it. Judged by
+    the SDM (natemu only), with the driver's `gs_base` and `kernel_gs_base` (the bank's and the MSR record's at the stop):
+    - `msr` (block sizes default and 1): GS.base A, KERNEL_GS_BASE B; SWAPGS; load GS:[0] (B's marker); SWAPGS; load
+      GS:[0] (A's); SWAPGS; RDMSR of both (B, A); the stop's bases B and A.
+    - `fault`: SWAPGS then, in the same block, a load from an unmapped page: #PF there with GS.base B and KERNEL_GS_BASE A.
+    - `kicks`: 200,000 SYSCALL round trips from CPL 3, the kernel side `swapgs; inc qword gs:[0]; jmp 2f; 2: swapgs; sysretq`
+      (a block boundary between the SWAPGSs, where a stop banks the swapped bases) and the user side `inc qword gs:[8]`,
+      under 20,000 precise stops at random times (a host kicker): both counts exact.
+    - `events`: 4,000,000 rounds of a CPL-0 loop `swapgs; inc qword gs:[0]; jmp 2f; 2: swapgs; inc qword gs:[8]` with IF = 1
+      and an IDT, under interrupts posted at random times (vector 0x40, whose handler counts it and ends it with an x2APIC EOI): both counts exact, some
+      interrupts taken.
+    - `contain`: CPL 3 loads the guest-state page's KERNEL_GS_BASE field (the recorded deviation's alias: it must read 0, not
+      the kernel's value), stores a forged value there, then SYSCALLs; the kernel's SWAPGS must load the real
+      KERNEL_GS_BASE (GS:[0] is B's marker) and RDMSR must read B."""
+    asm, failures, runs = ref.assemble, [], []
+    A, B, N = USER_GS, KERNEL_GS, 200000
+    markers = f'memory {A:#x} {(0xaaaa).to_bytes(32, "little").hex()}\nmemory {B:#x} {(0xbbbb).to_bytes(32, "little").hex()}\n'
+    def run(name, text, extra, check):
+        _, out, err = driver(a, text, a.out / 'swapgs' / name, extra)
+        problems = [f'driver: {err}'] if not out else check(out, [int(v, 0) for v in out['gpr']])
+        if out and out['stats']['decodes'].get('0x22'): problems.append(f"SWAPGS decoded {out['stats']['decodes']['0x22']} times: not inline")
+        runs.append({'case': name, 'ok': not problems, 'problems': problems})
+        print(json.dumps(runs[-1]), flush=True)
+        if problems: failures.append(f'swapgs {name}: {problems}')
+    def mem(out, at):
+        return next((int.from_bytes(bytes.fromhex(m['data'])[at - int(m['addr'], 0):][:8], 'little') for m in out['memory']
+                     if int(m['addr'], 0) <= at < int(m['addr'], 0) + len(m['data']) // 2), None)
+    def bases(out, gs, kernel):
+        got = (int(out['gs_base'], 0), int(out['kernel_gs_base'], 0))
+        return [] if got == (gs, kernel) else [f'GS.base, KERNEL_GS_BASE {[hex(x) for x in got]}, want {hex(gs)}, {hex(kernel)}']
+    head = 'cpl 0\nif 0\nrflags 0x2\nregion 0x3e0000 0x10000\n' + markers
+    msr = asm(wrmsr(0xc0000101, A) + wrmsr(0xc0000102, B) + 'nop\nswapgs\nmov rsi, gs:[0]\nswapgs\nmov rdi, gs:[0]\nswapgs\n'
+              'mov ecx, 0xc0000101\nrdmsr\nshl rdx, 32\nor rax, rdx\nmov r8, rax\nmov ecx, 0xc0000102\nrdmsr\nshl rdx, 32\nor rax, rdx\nmov r9, rax')
+    for block in (None, 1):
+        run(f'msr-{block}', f'rip {CODE:#x}\n{gprs({})}\ncode {msr.hex()}\n{head}', [block] if block else [],
+            lambda out, g: ([] if out['stop'] == 'reached' and (g[6], g[7], g[8], g[9]) == (0xbbbb, 0xaaaa, B, A) else
+                            [f"stop {out['stop']} rsi {g[6]:#x} rdi {g[7]:#x} r8 {g[8]:#x} r9 {g[9]:#x}"]) + bases(out, B, A))
+    fault, lab = asm(wrmsr(0xc0000101, A) + wrmsr(0xc0000102, B) + 'nop\nswapgs\nmov rsi, gs:[0]\nx: mov rax, [0x7000000]\nnop', labels=True)
+    run('fault', f'rip {CODE:#x}\n{gprs({})}\ncode {fault.hex()}\n{head}', [],
+        lambda out, g: ([] if out['stop'] == 'guest_fault' and int(out['fault'][0], 0) == 14 and int(out['rip'], 0) == CODE + lab['x'] and g[6] == 0xbbbb
+                        else [f"stop {out['stop']} {out['reason']} fault {out.get('fault')} rip {out['rip']} rsi {g[6]:#x}"]) + bases(out, B, A))
+    kicks = syscall_program('1: inc qword ptr gs:[8]\nsyscall\ndec r8\njnz 1b', 'swapgs\ninc qword ptr gs:[0]\njmp 2f\n2: swapgs\nsysretq', {8: N}, markers)
+    run('kicks', kicks, ['--kick-vcpu', '0', '--kicks', '20000', '--kick-every-us', '2', '--kick-jitter-us', '6'],
+        lambda out, g: ([] if out['stop'] == 'reached' and (mem(out, A + 8), mem(out, B)) == (N, 0xbbbb + N) else
+                        [f"stop {out['stop']} {out['reason']} counts {mem(out, A + 8)} {mem(out, B) - 0xbbbb}"]) + bases(out, A, B)
+        + ([] if out['kicks']['stops'] > 1000 else [f"only {out['kicks']['stops']} stops"]))
+    idt, idtr, count = 0x300000, 0x300800, 0x300810
+    events, lab = asm(f'lidt [{idtr:#x}]\nmov ecx, 0x1b\nmov eax, 0xfee00d00\nxor edx, edx\nwrmsr\nmov ecx, 0x80f\nmov eax, 0x1ff\nwrmsr\n'
+                      + wrmsr(0xc0000101, A) + wrmsr(0xc0000102, B) + 'sti\nnop\n1: swapgs\ninc qword ptr gs:[0]\njmp 2f\n2: swapgs\ninc qword ptr gs:[8]\ndec r8\njnz 1b\ncli\njmp done\n'
+                      f'h: push rax\npush rcx\npush rdx\ninc qword ptr [{count:#x}]\nmov ecx, 0x80b\nxor eax, eax\nxor edx, edx\nwrmsr\npop rdx\npop rcx\npop rax\niretq\ndone:', labels=True)
+    h = CODE + lab['h']
+    gate = (h & 0xffff | 0x08 << 16 | 0x8e << 40 | (h >> 16 & 0xffff) << 48).to_bytes(8, 'little') + (h >> 32).to_bytes(8, 'little')
+    run('events', f'rip {CODE:#x}\n{gprs({8: 20 * N})}\ncode {events.hex()}\n{head}svr 0x1ff\nmemory {idt:#x} {(bytes(16 * 0x40) + gate).hex()}\n'
+        f'memory {idtr:#x} {((0x41 * 16 - 1).to_bytes(2, "little") + idt.to_bytes(8, "little") + bytes(6) + bytes(8)).hex()}\n',
+        ['--kick-vcpu', '0', '--kicks', '5000', '--kick-every-us', '5', '--kick-jitter-us', '10', '--kick-events', '0x40'],
+        lambda out, g: ([] if out['stop'] == 'reached' and (mem(out, A + 8), mem(out, B)) == (20 * N, 0xbbbb + 20 * N) and mem(out, count) > 100 else
+                        [f"stop {out['stop']} {out['reason']} counts {mem(out, A + 8)} {mem(out, B) - 0xbbbb} interrupts {mem(out, count)}"]) + bases(out, A, B))
+    field = 0xffff_4000_0000_1000 + 0xa0
+    contain = syscall_program(f'mov rax, {field:#x}\nmov r10, [rax]\nmov qword ptr [rax], 0x123000\nsyscall',
+                              'mov r13, rcx\nswapgs\nmov r9, gs:[0]\nswapgs\nmov ecx, 0xc0000102\nrdmsr\nshl rdx, 32\nor rax, rdx\nmov r12, rax\nmov rcx, r13\nsysretq',
+                              {}, markers)
+    run('contain', contain, [],
+        lambda out, g: ([] if out['stop'] == 'reached' and (g[10], g[9], g[12]) == (0, 0xbbbb, B) else
+                        [f"stop {out['stop']} {out['reason']} CPL-3 read {g[10]:#x} kernel GS:[0] {g[9]:#x} RDMSR {g[12]:#x}"]) + bases(out, A, B))
+    report['swapgs'] = {'runs': runs, 'failures': failures}
+    return failures
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
-    ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc'])
+    ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc', 'swapgs'])
     ap.add_argument('--n', type=int, default=100_000)
     ap.add_argument('--reps', type=int, default=3)
     ap.add_argument('--xmc-rewrites', type=int, default=2000, help='xmc: rewrites, each checked (one per XMC_K or more iterations of vCPU 0)')
@@ -492,6 +588,7 @@ def main():
     if 'rollback' in a.only: failures += rollback(a, report)
     if 'nopruns' in a.only: failures += nopruns(a, report)
     if 'tsc' in a.only: failures += tsc(a, report)
+    if 'swapgs' in a.only: failures += swapgs(a, report)
     (a.out / 'k2.json').write_text(json.dumps(report, indent=1) + '\n')
     for f in failures: print('FAIL', f)
     sys.exit(1 if failures else 0)

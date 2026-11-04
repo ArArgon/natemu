@@ -912,8 +912,10 @@ fn reset_shadows(s: &mut State) {
 /// Enters `block` from the bank: GPRs and PF/AF in their static registers, NZCV with C = !CF, the guest-state page in
 /// x28 with its flag bytes (TF, IF, DF, IOPL, NT, AC, VIF, VIP, ID; RF and VM as 0) and the FS/GS bases (FEX's
 /// `fs_cached`/`gs_cached`, which every FS-/GS-prefixed access adds) written from the bank. The bases are rewritten at
-/// every entry and never read back, so the bank stays authoritative: a guest store into the page (the documented
-/// deviation) changes only what that vCPU's own prefixed accesses use until the next `enter`.
+/// every entry, so a guest store into the page (the documented deviation) changes only what that vCPU's own prefixed
+/// accesses use until the next `enter`; the FS base is never read back, and the GS base (with IA32_KERNEL_GS_BASE, perf
+/// chunk 17) only after CPL-0 code, whose inline SWAPGS exchanges them ([`bank`]), so a CPL-0 store into either acts as
+/// SWAPGS's writes would.
 unsafe fn enter(s: &mut State, block: &Block) -> ! {
     crate::perf::enter(crate::perf::ENTER);
     uncached_end(s);
@@ -933,7 +935,11 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
         // SAFETY: as above; the fields are 8-byte aligned (abi `guest_state_page_layout`).
         unsafe { (FRAME_VA as *mut u64).byte_add(at as usize).write_volatile(base) };
     }
-    // I6: FCW, which FNSTCW reads there; like the bases, never read back.
+    // Perf chunk 17: IA32_KERNEL_GS_BASE, which a CPL-0 block's inline SWAPGS exchanges with GS.base (both banked back after
+    // CPL-0 code, [`bank`]); 0 at CPL > 0, so a CPL-3 block never finds the kernel's value in the page.
+    let kernel_gs = if s.cpu.cpl == 0 { msr_get(cpu::msr(cpu::MSR_KERNEL_GS_BASE).unwrap()) } else { 0 };
+    unsafe { (FRAME_VA as *mut u64).byte_add(frame::KERNEL_GS_BASE as usize).write_volatile(kernel_gs) };
+    // I6: FCW, which FNSTCW reads there; like the FS base, never read back.
     unsafe { (FRAME_VA as *mut u16).byte_add(frame::X87_FCW as usize).write_volatile(s.cpu.fcw as u16) };
     // Perf chunk 15: the TSC offset an inline RDTSC adds ([`tsc`]); never read back (WRMSR of the TSC is a transaction).
     unsafe { (FRAME_VA as *mut u64).byte_add(frame::TSC_OFFSET as usize).write_volatile(msr_get(cpu::msr(cpu::MSR_TSC).unwrap())) };
@@ -1769,6 +1775,13 @@ fn bank(cpu: &mut Cpu, f: &NativeFrame, nzcv: u64, cf_inverted: bool) {
     let df = if frame::df(byte(frame::DF)) { RFLAGS_DF } else { 0 };
     let interrupts = if cpu.cpl != 0 { cpu.rflags & RFLAGS_IF } else if byte(frame::IF) != 0 { RFLAGS_IF } else { 0 };
     cpu.rflags = guest_flags(cpu.rflags, nzcv, reg(16), reg(17), cf_inverted) & !(RFLAGS_DF | RFLAGS_IF) | df | interrupts;
+    // Perf chunk 17: GS.base and IA32_KERNEL_GS_BASE, which a CPL-0 block's inline SWAPGS exchanges, likewise only after CPL-0
+    // code ([`enter`] writes both; a CPL-3 store into the page changes neither).
+    if cpu.cpl == 0 {
+        let base = |at: u32| unsafe { (FRAME_VA as *const u64).byte_add(at as usize).read_volatile() };
+        cpu.gs_base = base(frame::GS_BASE);
+        msr_set(cpu::msr(cpu::MSR_KERNEL_GS_BASE).unwrap(), base(frame::KERNEL_GS_BASE));
+    }
     sse::bank(cpu, f);
 }
 const RFLAGS_DF: u64 = 1 << 10;

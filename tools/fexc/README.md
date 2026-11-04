@@ -29,7 +29,11 @@ jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never 
 (series applied as thirty commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series54-inline-tsc` (November 4, perf plan "Measured
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series55-swapgs` (November 4, perf plan "Measured
+(chunk 17)"): patches 0001-0033 (0033: the plain SWAPGS translated inline for a CPL-0 request, exchanging `gs_cached` with
+IA32_KERNEL_GS_BASE, which the resident keeps at FEX's `L1Pointer`) and the shim's `Cut` rule for it (`--cpl0`, the
+three-byte form only); `obj/fexc` SHA-256 `4a50bda9ac5231db9faa2ce7f5e901da840666a435215f7b8aa47654baa8ecae`. Before it,
+`/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series54-inline-tsc` (November 4, perf plan "Measured
 (chunk 15)"): patches 0001-0032 (0031: CLI and STI translated inline for a CPL-0 request, `--cpl0`; 0032: RDTSC inline with
 the resident's 24 MHz formula, `--tsc`) and the shim's rules for them in `Cut` (one-byte CLI anywhere; one-byte STI neither
 first nor last in its block, never before a REP string or LOCK NEG; two-byte RDTSC); `obj/fexc` SHA-256

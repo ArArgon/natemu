@@ -1565,6 +1565,118 @@ both reached the dialog.
 about 13 ns for the event-pending look (SWAPGS's cost row); the remaining trips per system call are SYSCALL and SYSRET
 (design study option (c+) next).
 
+### Measured (chunk 17: SWAPGS inline at CPL 0, November 4; uncommitted on 114c9eb, series55-swapgs)
+
+**Measured first** (`natemu-raw/sysfast2-20261104-01/meas/`; HEAD 114c9eb, series54-inline-tsc). `rtcost.py` (one vCPU, the
+slope of the driver's wall time as `run_k2.py cost`): a SYSCALL -> kernel -> SYSRET round trip from a CPL-3 loop costs
+0.69 us with a kernel side shaped as Linux's (`endbr64; swapgs; ...; swapgs; 7-byte NOP; sysretq`: two resident entries
+carrying six system instructions: SYSCALL, NOP run, SWAPGS; SWAPGS, NOP run, SYSRET), 0.29 us with a bare `sysretq` (one
+entry, SYSCALL and SYSRET chained), 0.39 us with `swapgs; swapgs; sysretq` (one entry, four chained). So an entry costs
+about 0.2 us and each instruction chained into it about 0.05 us. One perf `hackbench` N = 1 run (16.0 s; whole run, boot
+included): 16.0 M SYSCALL, 16.0 M SYSRET, 32.1 M SWAPGS and 32.0 M NOP runs; 33.7 M linker entries (32.0 M of them the
+two trips of each system call), 34.7 M block entries, 32.0 M L1 context switches with 14 slot writes (the switch is a slot
+selection, no code write). A second run with temporary sub-buckets (`meas/subbuckets.diff`, not kept; 16.0 s), costs per
+resident entry: the gate's entry kind and the linker's own work 31 ns, `load` and `bank` 23 ns, `block_at` and the
+link-point checks 7 ns; per `find` pass (3.8 per entry) the boundary checks (invalidations, LAPIC poll, debug and event
+checks, L1 slot selection) 12 ns and `lookup` 7 ns; per system instruction (transaction and accounting) 27 ns; in `enter`
+the flag bytes, bases, TSC offset and event look 18 ns, the native frame 10 ns, the record copy 12 ns and the shadow-space
+switch (`tables::select`, a CPL change at nearly every entry) 31 ns; the transactions themselves are a few ns each. A
+Linux system call therefore spends about 0.58 us in the resident (2 entries x 61 ns, 8 passes x 19 ns, 6 instructions x
+27 ns, 2 x 42 ns of `enter`, 2 x 31 ns of space switch) plus the gate and `eret` (in `guest`): about 9.3 s of the run's
+17.9 s vCPU time. The four SWAPGS and NOP-run steps are about 0.18 us of it (4 x (27 + 19) ns), the two entries the rest.
+The floor stays two entries per system call: SYSCALL and SYSRET change the CPL, so the shadow space (TTBR) and the code
+context, which only EL1 can switch.
+
+**Built** (fexc patch 0033 and the shim; host admission; resident; abi; the test driver's output):
+1. **SWAPGS** (fexc series55-swapgs). A CPL-0 translate request (`--cpl0`, as for CLI and STI; never a step) translates the
+   plain three-byte SWAPGS (`0f 01 f8`, no prefix) inline anywhere in a block: it loads FEX's `gs_cached` (the GS base every
+   GS-prefixed access adds) and IA32_KERNEL_GS_BASE from the guest-state page and stores them exchanged. KERNEL_GS_BASE lives
+   in FEX's `State.L1Pointer` (`frame::KERNEL_GS_BASE`, 0xa0, which no generated code uses). Prefixed forms (LOCK: #UD; REX,
+   66) and every CPL-3 request stay the resident's (at CPL 3 SWAPGS is #GP(0)); the request key records that fexc read the
+   CPL-0 argument, so a CPL-3 request never reuses a CPL-0 answer. An inline STI may now be followed by an inline SWAPGS.
+2. **Resident.** `enter` writes the field from the MSR record when entering CPL-0 code and 0 at CPL 3 (a user process never
+   finds the kernel's value there); `bank`, after CPL-0 code only (as for IF), reads the GS base and the field back into the
+   bank and the MSR record. Every block exit, fault and stop banks through `bank`; a doorbell inside a block arms a stop and
+   resumes without banking (the exit it stops at banks); a device access (`mmio::device`) banks at its site and dispatches.
+   Mid-block resident work that resumes the block (helpers, divisions, shadow misses, splits) computes addresses from
+   registers, never from the bank's GS base, and does not rewrite the page.
+3. **Admission.** A translated SWAPGS must be the plain form in a CPL-0 block (`interrupt_flag`); 8-byte loads and stores of
+   the KERNEL_GS_BASE field and 8-byte stores of the GS base are allowed only in a CPL-0 block, and with the code shape only
+   inside a SWAPGS. *Containment:* a CPL-3 block can neither load nor store the field; a CPL-3 store through the guest-state
+   alias (the recorded deviation) is overwritten at the next CPL-0 entry, which every CPL change passes through, and the
+   bank never reads it after CPL-3 code; a CPL-0 store into either field acts as SWAPGS's writes would (without WRMSR's
+   canonical check: recorded in abi `GUEST_STATE_VA` and the boot-features plan).
+
+Per x86 rule (SDM Vol.2 SWAPGS): at CPL 0 SWAPGS cannot fault (#GP(0) needs CPL > 0; #UD only with LOCK, a prefix the inline
+form excludes); it exchanges GS.base with IA32_KERNEL_GS_BASE and nothing else, is not serialising and has no interrupt
+shadow, so events and stops around it need nothing new: an event arriving inside the block is taken at its next exit with
+the exchanged bases banked. Blocks never run with TF (every traced instruction is stepped, and steps are compiled without
+`--cpl0`); instruction breakpoints cut the block. SYSCALL and SYSRET are unchanged.
+
+**Tests.** Host (with `FEXC`): `cpl0_translates_swapgs_inline` (first, twice in one block, after an inline STI; REX, LOCK,
+66 and CPL-3 requests the resident's; admission refuses the CPL-0 object as a CPL-3 block) and `cpl0_sti_exit_is_relocated`
+with an inline SWAPGS; `guest_state_fields_and_i1_words` refuses the field's loads and stores and a GS-base store in a
+non-CPL-0 block, with and without the code shape, and (review) in a CPL-0 block admits them without the code shape, refuses
+them with it outside a SWAPGS, and refuses 4-byte, pair and unscaled accesses to the field; `interrupt_flag_forms` (review)
+refuses a SWAPGS with REX, 66 or LOCK, or in a CPL-3 block; abi layout test. `run_k2.py swapgs` (natemu, by the SDM; the driver now
+reports the bank's GS base and the MSR record's KERNEL_GS_BASE): `msr` (exchange, GS:[0] loads and RDMSR of both, block
+sizes default and 1), `fault` (#PF after an inline SWAPGS in the same block: the bases exchanged), `kicks` (200,000 SYSCALL
+round trips under 20,000 precise stops at random times, a block boundary between the kernel's SWAPGSs: both counters
+exact), `events` (4,000,000 rounds of `swapgs; inc gs:[0]; jmp; swapgs; inc gs:[8]` with IF = 1 under interrupts posted at
+random times, several hundred taken: both counters exact), `contain` (CPL 3 reads the field as 0, stores a forged value, SYSCALLs:
+the kernel's SWAPGS loads the real value, RDMSR reads it); every run checks that no SWAPGS was decoded. `run_k2.py cost` gains
+a `syscall` row (the Linux-shaped round trip). Negative controls (scratch builds, then reverted;
+`natemu-raw/sysfast2-20261104-01/nc/`): `bank` not reading the bases back: `msr` (both), `fault` and `events` red; `bank`
+reading them at every CPL: `kicks` and `contain` red; `enter` writing the field at every CPL: `contain` red (CPL 3 reads the
+kernel's base); `enter` not writing it: every case red; admission without the CPL-0 condition on the fields:
+`guest_state_fields_and_i1_words` red; without it on the SWAPGS form: `cpl0_translates_swapgs_inline` and
+`interrupt_flag_forms` red; (review) the form check without its prefix test, or the field access without its code-shape
+test or its 8-byte size: `interrupt_flag_forms`, resp. `guest_state_fields_and_i1_words` red. The field access's
+Unsigned-form condition is held by the size test too (a pair is 16 bytes): dropping it alone stays green. Each mutant's
+output is in `nc/red-*.txt` (`nc/README.md`).
+
+**Measured** (`natemu-raw/sysfast2-20261104-01/`: `campaign.sh`, `run1.sh`, `summ17.py`, `runs/`, `inst/`, `k2/`; the
+`natemu` stub, cache off, `mitigations=off nokaslr`, 2 GiB, base (114c9eb, series54-inline-tsc) and chunk 17
+(series55-swapgs) interleaved, three rounds (the installer at N = 4 once), one VM at a time, every run verified or reached
+and uncontended; median (min-max), seconds):
+
+| Benchmark | N | before | after | change | CPU s before / after | QEMU multi |
+| --- | --- | --- | --- | --- | --- | --- |
+| `hackbench` | 1 | 16.31 (15.64-16.33) | **13.76** (13.71-13.82) | -15.6% | 19.4 / 16.8 | 15.7 |
+| | 4 | 4.96 (4.86-5.32) | **4.51** (4.28-4.99) | -9.1% | 23.2 / 21.4 | 5.3 |
+| `locks` | 1 | 6.11 (5.85-6.21) | **5.58** (5.45-5.62) | -8.7% | 9.2 / 8.6 | 10.7 |
+| | 4 | 7.29 (7.02-7.34) | **6.54** (6.54-6.55) | -10.3% | 32.4 / 29.2 | 26.9 |
+| `build` | 1 | 19.83 (19.46-19.86) | 19.84 (19.64-19.88) | +0.1% | 22.9 / 23.0 | 28.3 |
+| | 4 | 9.28 (9.10-9.40) | 9.26 (8.99-9.29) | -0.2% | 31.7 / 31.7 | 12.5 |
+| Installer, cache off | 1 | 7.65 (7.47-7.86) | 7.67 (7.57-7.75) | +0.2% | 7.7 / 7.7 | 6.10 |
+| | 4 (one run) | 6.31 | 6.26 | -0.7% | 9.9 / 9.6 | 4.81 |
+
+`run_k2.py cost` (three runs each, us per iteration): SWAPGS at CPL 0 0.214 -> 0.000, the `syscall` round trip 0.738 ->
+0.587; every other row unchanged (CLI, RDTSC 0.00, STI starting its block 0.224/0.225, CPUID 0.241/0.238, `div` 0.091).
+Perf runs (`meas/`, whole run with boot, one each): `hackbench` N = 1 16.0 -> 13.4 s, system instructions 97.7 M -> 33.5 M
+(SWAPGS and NOP runs gone, chained 64.1 M -> 17 k), `find` lookups 132.4 M -> 68.3 M, the `link` bucket 3.70 -> 2.70 s,
+`system` 2.69 -> 1.57 s, `lookup` 0.98 -> 0.51 s, entries unchanged (33.7 M linker, 34.7 M block entries), generated code
+6.11 -> 6.01 s; `locks` N = 1 6.0 -> 5.4 s. `build` and the installer make few system calls (their trips are elsewhere).
+`locks` N = 4 is still slower than before chunk 15 (4.84 s): each system call still costs two resident entries.
+
+**Checks** (`suite17.sh`, `suite/`, the working tree, series55-swapgs, one VM runner at a time, each case's output deleted as
+it ended): `cargo test` 106 + 1 ignored (host), abi 65, also with `FEXC` set; the resident
+stack audit `ok`; the Python unit tests; fixtures 64 and seed 44 at both block sizes; the i7 corpus at CPL 0 69 at both; faults 7,912
+at both; `run_k1.py` no problem; `run_slice3_vm.py` `delivery`, `events`, `contain`, `smp` 0 failures; `run_x3.py` 54/54 and
+every group, `run_x4.py` 33/28/6, `run_l4a.py`, `run_l4b.py`, `run_s4.py` all ok; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7,
+`r1b` 12/12 (negative controls flagged); FEX ASM 2,270: 1,898 pass, 48 precision deviations, 324 unsupported, no failure.
+The first pass (`suite/results-pass1.txt`) found two test expectations the change made stale, both fixed in the tests:
+`run_k2.py coherence` case E probed a kept SWAPGS record, now inline (it now probes a REX.W SWAPGS, the resident's, as chunk 15
+moved its CLI/STI probes to the 66 forms), and `system`'s `sys-msr-syscall` failed the driver's `frame_intact` check, which
+allowed no non-zero byte outside the guest-state fields (it now admits the KERNEL_GS_BASE field). Rerun on the final tree
+(`suite17b.sh`): `cargo test` (with `FEXC` too), the stack audit, `run_k2.py` all ok (`swapgs` included), `system`,
+`delivery`, `events`, `contain`, `smp` 0 failures. `--check-reuse --code-shape` installer boots, cache off (`checkboot17.py`,
+`check/`): N = 1 850,795 copies checked, N = 4 873,847 over four vCPUs, no halt, both reached the dialog.
+
+**Not done.** SYSCALL and SYSRET stay resident trips: each Linux system call is now two entries of about 0.2 us plus the
+shadow-space switch (the `syscall` row's 0.59 us). Making them lighter needs a shorter resident path (no state copy in and
+out, one `find` pass), not translation: the CPL, and with it TTBR and the code context, changes only at EL1.
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
