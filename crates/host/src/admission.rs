@@ -141,6 +141,8 @@ pub(crate) struct Admitted {
     /// X2: the RIP of the REP string instruction that ends the block (proven from the guest bytes): its self-exits are
     /// the link points to it.
     pub rep_self: Option<u64>,
+    /// The guest offset of its last instruction (the performance log reads it for a call's return site).
+    pub last: u32,
 }
 
 /// Direct branch target of the x86 instruction `insn` ending at `end`
@@ -375,7 +377,7 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
         }
     }
     let admitted =
-        Admitted { object: out, guest_bytes: h.guest_bytes, guest_insns: h.guest_insns, end_reason: h.end_reason, links: Vec::new(), dispatch_exit: None, rep_self: None };
+        Admitted { object: out, guest_bytes: h.guest_bytes, guest_insns: h.guest_insns, end_reason: h.end_reason, links: Vec::new(), dispatch_exit: None, rep_self: None, last: last as u32 };
     let tail = &source[last..h.guest_bytes as usize];
     let own = (rep_string(tail) || lock_neg(tail)).then_some(rip.wrapping_add(last as u64));
     let admitted = Admitted { rep_self: own.filter(|_| rep_string(tail)), ..admitted };

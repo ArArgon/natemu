@@ -1270,6 +1270,42 @@ writable bits can force a peer's shootdown and a full reset where a CR3 load use
 **Next** (from the evidence): the syscall path (`locks` N = 1 sys 2 us per `sched_yield`, `hackbench`'s linker/entry/system
 buckets), single-thread codegen (`zstd`'s decompress 0.16-0.24 s and verify 0.28 s against 0.07-0.09 natively), then PCID.
 
+### Measured (compile-ahead gate, November 4; uncommitted on 1d2719c, series52-adox66)
+
+The gate before building compile-ahead (design: a host pool of fexc servers compiling the exits of each admitted block
+ahead into the shared answers; version 1 only targets on pages the request fetched; 2 workers, a 64-job newest-first
+stack, depth 2-3). **Log change:** the request line gains the request's start, a step flag, the block's guest bytes, a call
+flag and the block's exit candidates with an on-fetched-page flag (handoff, "Performance log"); computed only with the log
+on (`Admitted::last` is the one field added outside it). **Runs** (`natemu-raw/ahead-20261104-01/`, the `natemu` stub,
+cache off, log on, one VM at a time): installer N = 1 8.31 s and N = 4 6.67 s, `build` N = 1 20.02 s and N = 4 9.33 s.
+**fexc on an efficiency core** (the installer N = 1 compile stream, 126 k requests, replayed through one server, wall per
+compile with the pipe): 16 us at default or utility on an idle machine (performance cores), 32 us at utility with the four
+performance cores busy, 77 us at background (two at once 82 us).
+
+**Analysis** (`ahead.py`; addresses guest-physical, as answers are kept by bytes):
+- 82-88% of compiles are depth-1 successors of an earlier compiled block, on its fetched pages; 18-23% of candidates lie off
+  them. But the successor is asked for 4.0-4.4 us (median) after its predecessor's reply; only 26-29% have more than 15 us.
+  Counting the earliest predecessor at depth <= 3 the median lead is 67-85 us, and 86-89% have more than 30 us.
+- Simulated pool, share of compiles served before they were asked for (fexc time saved on the vCPUs' path):
+
+| Run (worker cost) | depth 1 | depth 2 | depth 3 | ahead compiles wasted, depth 3 |
+| --- | --- | --- | --- | --- |
+| installer N = 1 (16 us) | 24.4% (0.49 s) | 35.3% (0.72 s) | 45.4% (0.92 s) | 80 k of 138 k |
+| installer N = 4 (32 us) | 20.6% (0.49 s) | 28.7% (0.68 s) | 34.2% (0.80 s) | 69 k of 114 k |
+| `build` N = 1 (16 us) | 23.2% (0.85 s) | 33.2% (1.21 s) | 43.4% (1.58 s) | 141 k of 240 k |
+| `build` N = 4 (32 us) | 19.3% (0.95 s) | 26.8% (1.31 s) | 32.2% (1.56 s) | 117 k of 197 k |
+| any, background (77 us) | 14-15% | 18-20% | 20-23% | |
+
+**Gate passed** at depth 2-3 with the workers at utility QoS: installer N = 1 35-45% served, 0.72-0.92 s of its 2.06 s of fexc
+round trips (9-11% of the run); `build` N = 1 33-43%, 1.2-1.6 s (6-8%); at N = 4 27-34%, 0.7-1.6 s summed over the vCPUs
+(roughly a quarter of that in wall time, spread over four vCPUs). It fails at depth 1 and at background QoS: the design's background class at N >= 3
+must be utility. 58-61% of ahead compiles are wasted (at 16 us about 1.3 s of extra fexc CPU and 50 MB of answers for the
+installer). 35-48 k compiles a run are *late* (the worker had started); a vCPU that waited for an in-flight ahead compile
+instead of compiling would recover part of them. Limits: the recorded timeline (a faster vCPU shortens the leads:
+optimistic); bytes and gating taken equal at the same guest-physical address (answers at a re-requested address, 1-7% of
+compiles, are never counted as served: conservative); four busy loops stood in for the vCPUs in the cost replay; the
+worker's admission (to read the links) is not timed.
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite

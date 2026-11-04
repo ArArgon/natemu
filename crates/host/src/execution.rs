@@ -1762,7 +1762,7 @@ fn serve(
         area.write_record(exec::STATE_OFFSET, state);
         lap(compiler, if step { crate::perf::STEP } else { crate::perf::TRANSLATE });
         if let Some(r) = &mut compiler.perf {
-            r.request(cr3, rip, gpa, state.reply, crate::perf::now() - began, state.generation, state.cpu.code_context(), gpa2);
+            r.request(cr3, rip, gpa, state.reply, began, step, state.generation, state.cpu.code_context(), gpa2);
         }
         lap(compiler, crate::perf::LOG_LINE);
     }
@@ -1798,7 +1798,7 @@ fn translation(
     // S4: and before every armed instruction breakpoint, so each is the first instruction of a block (the resident checks
     // it there); one inside an instruction on this path is never reached and is passed over.
     let mut breakpoints: Vec<u64> = state.cpu.code_breakpoints().filter(|&b| b > rip).collect();
-    let (code, more, next_fault, cut, bytes_len, nop_run) = loop {
+    let (code, more, next_fault, cut, bytes_len, nop_run, call) = loop {
         let limit = breakpoints.iter().copied().chain(hooks).min();
         let t = compiler.stamp();
         let fetched = fetched(area, state, limit)?;
@@ -1829,7 +1829,15 @@ fn translation(
                     }
                     _ => None,
                 };
-                break (code, more, next_fault, cut, bytes.len(), nop_run);
+                // Compile-ahead measurement (log on only): the block ends in a call (e8, or ff /2), so its end is a return site.
+                let call = match &code {
+                    Code::Block(b) if compiler.perf.is_some() => bytes.get(b.last as usize..b.guest_bytes as usize).is_some_and(|t| {
+                        let (o, _) = crate::system::opcode_at(t);
+                        matches!(t.get(o..), Some([0xe8, ..])) || matches!(t.get(o..), Some([0xff, m, ..]) if m >> 3 & 7 == 2)
+                    }),
+                    _ => false,
+                };
+                break (code, more, next_fault, cut, bytes.len(), nop_run, call);
             }
         }
     };
@@ -1875,6 +1883,16 @@ fn translation(
         && compiler.read < bytes_len && rip.wrapping_add(compiler.read.max(1) as u64 - 1) >> 12 <= last;
     if let Some(r) = &mut compiler.perf {
         r.template = template;
+        // Compile-ahead measurement: the block's exits (its link targets and a call's return site), and whether each lies
+        // on a page this request fetched (RIP's, or the next one when it was walked).
+        let end = rip.wrapping_add(u64::from(block.guest_bytes));
+        let fetched = |t: u64| t >> 12 == rip >> 12 || (state.fetch[1] != u64::MAX && t >> 12 == (rip >> 12).wrapping_add(1));
+        r.block = (block.guest_bytes, call);
+        for t in block.links.iter().map(|l| l.target).chain(call.then_some(end)) {
+            if !r.candidates.iter().any(|&(u, _)| u == t) {
+                r.candidates.push((t, fetched(t)));
+            }
+        }
     }
     state.relocatable = u64::from(template);
     let t = compiler.stamp();
