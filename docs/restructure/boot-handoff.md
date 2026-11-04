@@ -32,6 +32,11 @@ vCPU holds at another RIP copies that block and rewrites its RIP-dependent words
 whatever it cannot prove; `--check-reuse` (and the suites' `--code-shape`) asks the host for every copy too and stops
 `reuse_mismatch` on any difference (perf plan "Measured (chunk 10)"): installer N = 1 cache off 8.6 s, N = 4 9.4 s (10.7
 and 11.0 s before, in the same rounds), 854 k of 1.16 M host requests avoided at N = 1.
+Since perf chunk 15 (uncommitted on e2f8aba, fexc series54-inline-tsc) a CPL-0 translation runs the one-byte CLI and STI
+and the two-byte RDTSC inline instead of a resident round trip each: IF lives in its guest-state byte (banked at every
+exit), an inline STI reads the resident's event-pending byte and, with an event pending, exits to its own RIP so the
+resident's STI (shadow, delivery) runs; STI is never first or last in its block; RDTSC computes the resident's TSC from
+the virtual count, which EL0 may now read (CNTKCTL_EL1.EL0VCTEN only; perf plan "Measured (chunk 15)").
 Performance batch 1 ended at 4ed8e3a (November 3): the whole standing suite green at both RAM sizes (§5 "Full suite at the end of performance batch 1"), the §4 comparison rerun with the stub: installer N = 1 and 4 cache off 8.85 and 9.39 s, warm 6.89 and 5.80 s, against QEMU `thread=multi` 6.10 and 4.81 s.
 Perf chunk 6 (uncommitted on ea11225) measured the whole-cache flushes and left the cache as it is: only 123 k requests per
 installer boot (N = 1) refill blocks placed before a flush, and a record arena and index sized for the code area were no
@@ -64,7 +69,7 @@ build and sign `natemu-host` themselves.
 
 ```sh
 R=target/aarch64-unknown-none/release/natemu-runtime
-F=../natemu-raw/fexc-native-20261026-01/series52-adox66/obj/fexc
+F=../natemu-raw/fexc-native-20261026-01/series54-inline-tsc/obj/fexc
 K=../natemu-raw/kernel-census-20261028-01/dl/linux               # Debian 6.12.107 bzImage
 I=../natemu-raw/kernel-census-20261028-01/dl/initrd.gz           # Debian installer initrd
 target/release/natemu "$R" "$F" "$K" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr' --vcpus 4
@@ -607,7 +612,7 @@ Full suite (about 25 minutes of runner time per pass on the M4 at R2, waits for 
 # From the repository root; zsh or bash. Wait until no other natemu-host runs (timing-sensitive cases: kicks, l4b,
 # x3 stress). A timing failure may be rerun alone once, never more: the results record the first run's result and the
 # rerun's beside it; a failed rerun is a failure.
-F=../natemu-raw/fexc-native-20261026-01/series52-adox66/obj/fexc  # tools/fexc/build.sh rebuilds it (patches 0001-0030 + the shim)
+F=../natemu-raw/fexc-native-20261026-01/series54-inline-tsc/obj/fexc  # tools/fexc/build.sh rebuilds it (patches 0001-0032 + the shim)
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 I8=../natemu-raw/i8-corpus-20261030-01      # gen_i8.py programs and their QEMU 7.2 results
@@ -711,6 +716,13 @@ tools/with-env python3 tools/run_r1.py r1b --fexc "$F" --out "$O/r1b"   # R1b: m
 ```
 
 ## 6. Compiler reproducibility
+
+**series54-inline-tsc** (November 4; perf plan "Measured (chunk 15)"): `patches/0001-0032` (new 0031: CLI and STI inline,
+the STI's exit to its own RIP on the event-pending byte, the next decoded instruction passed to the allowlist's `Cut`; new
+0032: RDTSC inline, floor(V x 125 / 3) + the TSC offset) on the pinned FEX commit with the shim's `--cpl0` and `--tsc`
+arguments (FEXC_ARG_CPL0, FEXC_ARG_TSC) and their `Cut` rules; `obj/fexc` SHA-256
+`81fa0932da3a89e3fffd14889c48a42803d9ee7c635651fe25f5c3a6c8eab134`. Its predecessor in this work, not kept as a reference:
+series53-inline (0031 only). Built as `build.sh` does (a worktree of the submodule). Before it:
 
 **series52-adox66** (November 4; boot-features plan, Built (ADX), Built (XSAVEOPT, XSAVEC)): `patches/0001-0030` (new 0030: ADOX
 with a 66 prefix decoded as ADOX, 66 ignored, as on the reference AMD machine) on the pinned FEX commit with the shim admitting

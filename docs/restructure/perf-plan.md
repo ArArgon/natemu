@@ -1383,6 +1383,188 @@ answers share the in-memory generation bounds.
 for answers in time (about a third here) and keeps the interference; it needs its own gate on these counts first. Otherwise
 the syscall path and single-thread code generation, as chunk 14 found.
 
+### Measured (chunk 15: CLI, STI and RDTSC inline at CPL 0, November 4; uncommitted on e2f8aba, measured on 1d2719c, series54-inline-tsc)
+
+**Measured first** (`natemu-raw/inline-20261104-01/`; the syscall design study's option (b), `meas/`): `run_k2.py --only cost` at
+HEAD: CLI 0.194 us, NOP 0.002, so a full trip costs 0.19 us; `div` (a helper trip, no transaction) 0.104 us, the light-trip
+floor. One perf `hackbench` N = 1 run with temporary counters (`meas/counters.diff`, not kept; 27.9 s): CLI 16.83 M, STI 16.70
+M, RDTSC 16.13 M, every one at CPL 0; through the dispatcher's miss CLI 16.15 M (96%: Linux's `cli` follows a `ret`), STI
+0.10 M, RDTSC 1; first instruction of what would be its block (a branch target or right after another system instruction)
+CLI 16.26 M, STI 0.15 M (0.9%), RDTSC 0.11 M; STI setting IF with an event pending 1,941 (0.012%, the inline STI's slow
+path); STI right before another system instruction 0. The go rule held (trip >= 0.15 us, all at CPL 0, slow path under 5%).
+
+**Built** (fexc patches 0031, 0032 and the shim; host admission and request flags; resident; abi):
+1. **CLI and STI.** A translate request at CPL 0 (never a step) passes `--cpl0` (gating argument 8, read only when a CLI or
+   STI is decoded; the CPL is in `Cpu::code_context`). fexc translates the one-byte CLI anywhere: a store of 0 to IF's flag
+   byte (`frame::IF`, FEX's flags[9]), which every exit and fault after a CPL-0 block banks (`bank` reads it as it reads DF,
+   but only at CPL 0, so a CPL-3 store into the page, the recorded deviation, cannot change IF; `enter` writes it from the
+   bank). The one-byte STI only where its shadow stays inside the block: never its block's first instruction and
+   never its last (the next decoded instruction must be translated: an admitted form or an inline CLI or RDTSC, not a REP
+   string or LOCK NEG, whose exits to their own RIP would put a resident boundary in the shadow; FEX's Core.cpp now passes
+   it to `Cut`). An inline STI loads the resident's event-pending byte (`frame::EVENT_PENDING`, FEX's unused flags[22]): set,
+   it takes a literal exit to its own RIP, where the block begins with the STI, which the host decodes and the resident runs
+   as today (shadow, step, delivery); clear, it stores IF = 1. The byte is written before generated code runs: at every
+   `enter` (0 when IF is set there: `find` took every event a boundary with IF set may take), every `resume` and every
+   doorbell's return in `interrupted` (`events::held`: an unblocked NMI, the ExtINT or an APIC interrupt pending, one relaxed
+   look at the event record in the common case). A post after the look rings the doorbell, which writes it again, or, past
+   the STI, arms a stop at the block's next exit as for any event. `held` does not see a LAPIC timer expiry that is due but
+   not yet polled, nor reinject's backlog (both reach the IRR at the next boundary's poll): such an interrupt, due while
+   IF = 0, is taken at the first block exit after the STI's next instruction instead of right after it, later than for an
+   interrupt already pending, which the SDM permits for one recognised after the STI.
+2. **RDTSC.** With `--cpl0` and a host counter at 24 MHz (`clock::frequency`), `--tsc` (gating argument 9): the two-byte
+   RDTSC is translated as the resident computes it: V by `isb; mrs cntvct_el0`, the resident's own read (FEX's
+   self-synchronising read; CNTVCTSS_EL0 instead where the vCPU presents FEAT_ECV, which HVF's does not),
+   floor(V x 125 / 3) as 125a + 41r + (r >> 1) with a = umulh(V, 0xAAAA..AB) >> 1 and r = V - 3a, plus the TSC offset
+   (`frame::TSC_OFFSET`, FEX's unused `_pad1` at 0xb8, written from the TSC MSR's slot at every `enter`), EDX:EAX with the
+   upper halves zero. EL0 may read the virtual count: CNTKCTL_EL1 = EL0VCTEN (was 0).
+3. **Admission** (`admit(.., cpl0)`): a translated CLI, STI or RDTSC must be its plain form in a CPL-0 block, an STI neither
+   first nor last nor right before a REP string or LOCK NEG (checked on the guest bytes at the instruction boundaries of
+   fexc's PC table, which admission already checks against the code), and each STI's RIP is a literal-exit target; IF's byte is writable only in a CPL-0 block (with the code shape: only inside a CLI or STI); the event-pending
+   byte and the TSC offset are readable, never writable; `mrs xT, cntvct_el0 | cntvctss_el0` only inside a CPL-0 block's
+   RDTSC, with or without the code shape, and `isb` there too (elsewhere the code shape still refuses it). *Containment:* IF's byte is guest state the resident uses only to decide which
+   events to take (as DF decides string direction); the STI's exit goes to a RIP of the block's own bytes through the
+   linker's usual checks; the two new readable fields hold only this vCPU's own state; EL0VCTEN exposes only reads of
+   CNTVCT_EL0, CNTVCTSS_EL0 and CNTFRQ_EL0, the virtual count (the host's `mach_absolute_time`, vtimer offset 0) that RDTSC
+   already gives the guest at any CPL without CR4.TSD, scaled and offset; the physical count (EL0PCTEN), both timers'
+   registers (EL0VTEN, EL0PTEN) and the event stream stay trapped (`contain` now forges `mrs cntpct`, `msr`/`mrs` of the
+   virtual timer, `msr cntp_ctl` and `msr cntkctl_el1`: `trapped`; E2's blocking hole was the debug channel, MDSCR_EL1.TDCC,
+   unchanged). A CPL-3 RDTSC (CR4.TSD) and RDTSCP stay the resident's.
+
+Per x86 rule (SDM Vol.2 CLI, STI, RDTSC; Vol.3 7.8.3, 7.9 Table 7-2): at CPL 0 neither CLI nor STI faults (CPL <= IOPL; no
+VME/PVI in 64-bit mode) and RDTSC's TSD check does not apply; prefixed forms (LOCK: #UD) stay the resident's. STI's shadow
+only when it sets IF: an event pending at an inline STI exits there and the resident's STI sets the shadow, steps the next
+instruction and delivers after it; an STI after a MOV SS, or as a branch target, starts its block and is the resident's;
+STI; HLT and STI; MOV SS keep STI the resident's (the next instruction is a cut); TF: blocks never run with TF (every
+instruction is a step, and steps are compiled without `--cpl0`); instruction breakpoints cut the bytes, so an STI before one
+is last and the resident's. An event arriving while IF = 0 inside a block is held (banked IF = 0 at the stop) and either
+marked for the block's STI or taken at its next exit after IF is set: never inside the shadow, never with IF = 0.
+
+**Tests.** Host: `cpl0_translates_cli_and_sti_inline` (with `FEXC`: CLI first or not, STI mid-block with its exit link point,
+STI first, before HLT, a REP string, LOCK NEG, last, or prefixed: the resident's; RDTSC with `--tsc` only, not with REX; a
+CPL-3 request cuts both and never takes the CPL-0 answer; admission refuses the CPL-0 objects outside a CPL-0 block),
+`interrupt_flag_forms` (with STI before REP STOSB and before LOCK NEG), `cpl0_sti_exit_is_relocated` (with `FEXC`: a
+CPL-0 block with an STI exit and a RIP-relative LEA is fexc's object at another RIP after the host's relocator and after
+the resident's re-check, link points included), the frame fields and counter words in `guest_state_fields_and_i1_words` (refused, with and without
+the code shape, outside an RDTSC); abi `inline_tsc_formula_is_exact` (patch 0032's arithmetic against `clock::tsc` for 10^6
+random and every edge V) and the layout test. `run_slice3_vm.py events`: `ev-cli-inline` (an inline CLI holds an
+interrupt raised after it; the inline STI mid-block takes it after the next instruction) and `ev-sti-cli` (STI; CLI with an
+interrupt pending: held through the CLI, taken after the next STI's shadow) at 1, 2, 4 vCPUs against QEMU and
+`delivery_model`; x2 `x2-cpl3-if-byte` (review: a CPL-3 store of 0 to IF's byte, then CPUID: PUSHFQ sees IF = 1 and an
+interrupt posted after it is taken; red with `bank` reading the byte at every CPL: IF = 0, the interrupt never taken); the
+existing STI programs (`ev-sti-shadow`, `-ret`, `-jmp`, `-nops`, `ev-hlt-wake`, `ev-mov-ss*`) now
+run the inline forms; stress `ev-window` (2,000 random-time events into 24-instruction IF = 0 windows inside one block at
+1-4 vCPUs, judged by `stress_check`: never in the shadow, never with IF = 0, none lost; QEMU equal without events; at the
+default block size 7-15 of about 100 deliveries per run came through an inline STI's exit); x2 `x2-cli-sti-pushf-cpl0`.
+`run_k2.py tsc` (inline RDTSC alternating with the resident's RDTSCP never decreases and all values lie on one lattice
+floor(125V/3) + offset; WRMSR TSC then RDTSC; a token ring at 2-4 vCPUs never sees the TSC go back; no RDTSC decode) and a
+`nop_sti` cost row; `coherence` and `nopruns` now probe a 66-prefixed CLI/STI (the resident's at CPL 0). `contain` forges
+the counter and timer words above. Negative controls (scratch builds, then reverted): the pending byte always 0: 15 of the
+21 event runs red (`ev-sti-shadow`, `-ret`, `-jmp`, `ev-cli-inline`, `ev-sti-cli`); `bank` ignoring IF's byte: 12 red
+(`ev-sti-ret`, `-jmp`, `ev-cli-inline`, `ev-sti-nops`); the TSC offset not written: `tsc one` red (2,000 decreases, the WRMSR
+value); patch 0032 with `r >> 2` for `r >> 1`: `tsc one` red (off the lattice). Not red by construction: a doorbell inside a
+block not writing the pending byte (the event is then taken at the block's next exit, which the SDM also permits for an
+event that arrives after the STI): it only moves deliveries later (`ev-window`'s inline-STI exits).
+
+**Measured** (`natemu-raw/inline-20261104-01/`: `campaign.sh`, `run1.sh`, `summ15.py`, `runs/`, `inst/`, `k2/`; the `natemu`
+stub, cache off, `mitigations=off nokaslr`, 2 GiB, base (1d2719c, series52-adox66) and chunk 15 (series54-inline-tsc)
+interleaved, three rounds, one VM at a time, every run verified or reached and uncontended; median (min-max), seconds):
+
+| Benchmark | N | before | after | change | CPU s before / after | QEMU multi |
+| --- | --- | --- | --- | --- | --- | --- |
+| `hackbench` | 1 | 28.59 (28.44-28.99) | **16.87** (16.87-16.87) | -41.0% | 31.8 / 20.0 | 15.7 |
+| | 4 | 8.36 (8.35-8.37) | **4.79** (4.73-5.38) | -42.7% | 36.8 / 22.5 | 5.3 |
+| `locks` | 1 | 11.03 (11.01-11.05) | **6.24** (6.22-6.26) | -43.4% | 14.2 / 9.4 | 10.7 |
+| | 4 | 4.84 (4.83-4.94) | 7.17 (7.01-7.27) | +48.1% | 23.0 / 31.8 | 26.9 |
+| Installer, cache off | 1 | 8.25 (8.22-8.60) | **7.90** (7.84-8.35) | -4.2% | 8.3 / 7.9 | 6.10 |
+
+`run_k2.py cost` (three runs each, us per iteration): CLI 0.196 -> 0.000, RDTSC 0.227 -> 0.000 (18 ns in one run alone: the
+counter read), STI after a NOP 0.255 -> 0.000; STI starting its block (the resident's either way) 0.227 -> 0.225; SWAPGS
+0.212 -> 0.225 (each entry with IF = 0 now looks at the event record: about 13 ns); CPUID, WRMSR, POPF, `div` unchanged.
+
+**`locks` N = 4 is slower because the guest's threads contend more, as they do natively; no interrupt or TSC defect**
+(`natemu-raw/locks-20261104-01/`: `lk.sh`, `lkstat.py`, `bisect.sh`, `delay.sh`, `summ.py` and `summary.txt`, `native.sh`
+and `native.txt`, `probe/`, `runs/`; the perf resident, one VM at a time, an initramfs whose `/init` also prints the guest's
+`/proc/interrupts` and context-switch count around the timed span, `mkov.sh`; median (min-max) of three runs, seconds).
+Work fixed (200 M rounds, a `sched_yield` every 64) and verified. Futex calls: the guest's SYSCALL count less the 3,125,922
+of a one-thread run (the `sched_yield` calls and boot), per 1,000 rounds. The two switches leave out fexc's `--cpl0` (CLI
+and STI stay the resident's) or `--tsc` (RDTSC does) in this chunk's tree; the waits are a busy wait in the resident at every
+SYSCALL, with all three forms inline (scratch builds, not kept):
+
+| `locks`, N = 4 | wall | futex calls / 1,000 rounds | guest remote-wakeup IPIs | guest context switches |
+| --- | --- | --- | --- | --- |
+| before (1d2719c) | 4.49 (4.33-4.79) | 15.1 (13.9-19.2) | 1,018 | 3,682 |
+| this chunk, none inline | 4.76 (4.72-4.86) | 18.4 (17.2-18.7) | 1,313 | 3,655 |
+| RDTSC inline only | 5.16 (4.84-5.23) | 30.3 (27.4-32.4) | 3,428 | 7,011 |
+| CLI and STI inline only | 6.58 (6.52-6.67) | 64.4 (62.2-65.5) | 24,160 | 48,550 |
+| all three (this chunk) | 7.64 (7.52-7.68) | 102 (101.6-103.1) | 56,250 | 112,700 |
+| all three, 0.5 us wait at every SYSCALL | 7.08 (6.74-7.42) | 59.4 (55.6-63.6) | 16,450 | 33,020 |
+| all three, 1.0 us wait | 7.04 (6.99-7.08) | 41.8 (41.5-43.0) | 7,536 | 16,400 |
+| all three, 1.5 us wait | 5.94 (5.93-6.50) | 21.6 (21.4-26.4) | 3,698 | 8,274 |
+| all three, 2.0 us wait (one run) | 5.15 | 11.4 | 1,826 | 3,761 |
+| native, AMD reference, CPUs 0-3 | 4.17 (4.17-4.18) | not countable in user mode | 568,600 | 1,202,700 |
+
+The extra interrupts are function-call IPIs, which Linux sends to wake a task on another CPU: they follow the context
+switches (about one per two). In every natemu row timer interrupts ran at the guest's tick rate (250 per second per vCPU)
+and rescheduling IPIs stayed at 21-28 a run. At N = 1 the 1.5 us wait gives 10.48 s, against 6.17 s with all three inline and 10.76 s
+with none: it adds back about what the inline forms save per system call, and at N = 4 the count then falls to 21.6, near the
+none-inline 18.4, with every inline form still in place. RDTSC alone, with CLI and STI the resident's, raises the count too.
+In one run each, halted time was 0.07-0.18 s per vCPU in both trees; with all three inline each vCPU spent 3.1 s in
+generated code (1.9 s with none) and 1.1 s in system instructions (0.5 s), for 23.5 M guest system calls (6.9 M).
+
+The native comparison was wrong before: voluntary context switches count only the futex waits that sleep. A probe with the
+same loop and glibc's low-level lock written out and counted (`probe/locks2.c`, one static binary built on the AMD machine;
+in the guest its futex count equals the resident's SYSCALL count, 72.08 against 72.1), per 1,000 rounds at 4 threads:
+
+| `locks2`, N = 4 | guest time s | slow-path entries | futex calls | waits that slept | waits returning EAGAIN | wakes |
+| --- | --- | --- | --- | --- | --- | --- |
+| native (three runs) | 3.92-3.95 | 59.3-59.6 | 145.6-146.3 | 2.18-2.21 | 50.9-51.2 | 92.5-92.9 |
+| natemu before (1d2719c, two runs) | 4.57, 4.74 | 6.7, 7.6 | 20.6, 21.9 | 0.01, 0.02 | 9.7, 10.2 | 10.9, 11.7 |
+| natemu this chunk, none inline (two) | 4.22, 4.36 | 5.8, 6.1 | 16.7, 18.2 | 0.01, 0.01 | 7.7, 8.5 | 9.0, 9.7 |
+| natemu this chunk (two) | 5.45, 6.01 | 21.5, 23.6 | 72.1, 82.7 | 0.17, 0.19 | 33.8, 38.8 | 38.1, 43.8 |
+
+Natively `locks` itself makes 600 k voluntary switches a run (`locks2` 437 k) and 568 k remote-wakeup IPIs (`locks2`
+413 k). So every count moved toward native, which contends more than natemu still does; the benchmark's default mutex has
+no spin phase, and neither has the probe's lock. Nothing in this chunk was changed for it. The cell stays slower: about 17 M
+more futex calls a run, each through natemu's system-call path (SYSCALL and SYSRET are still resident trips).
+
+The wait test alone does not tell contention from late interrupt delivery (a slower SYSCALL lowers the count under both);
+the probe does: only 0.17-0.19 of the futex calls per 1,000 rounds sleep, and the rise is in waits that return EAGAIN at
+once and wakes that find no waiter, neither of which involves an interrupt; native shows the same shape at a higher level.
+The "native" rows are the AMD reference machine, a 4-vCPU KVM guest, not bare metal.
+
+**Independent replication** (`natemu-raw/locks-20261104-01/replication/`: own builds of e2f8aba plus this patch and the
+switch diff, one VM at a time): native `locks` 4.16-4.21 s, `locks2` 145.6-146.0 futex calls per 1,000 rounds; counted
+natively with `perf stat` tracepoints, `sched_yield` is exactly 3,125,000 and futex 95.9 (`locks`) and 100.2 (`locks2`,
+its own count 100.17) per 1,000 rounds, tracing itself lowering the count from 146. natemu N = 4, three runs each: none
+inline 4.71 s, 18.1; all three 7.41 s, 100.2; all three with the 1.5 us wait 5.86 s, 21.4; timer interrupts at the tick
+rate, rescheduling IPIs about 25, function-call IPIs about one per two context switches (native about 1:2.1). No flaw found.
+
+**Checks** (`suite15.sh`, `suite/`, the final tree, series54-inline-tsc, one VM runner at a time, each case's output deleted as
+it ended): `cargo test` 104 + 1 ignored (host), abi 65, also with `FEXC` set; the resident stack audit `ok`; the Python unit
+tests; fixtures 64 and seed 44 at both block sizes; the i7 corpus at CPL 0 (`--cpl 0`) 69 at both; faults 7,912 at both;
+`run_k1.py` no problem; `run_k2.py` all ok (`tsc` included); `run_slice3_vm.py` `delivery`, `events`, `contain`, `smp` 0
+failures, `system` 1: `sysfault-cr4-umip` ("the model expects no fault"), which fails the same at 1d2719c (UMIP advertised
+since edfcee9; not this chunk's); `run_x3.py` 54/54 and every group, `run_x4.py` 33/28/6, `run_l4a.py`, `run_l4b.py`,
+`run_s4.py` all ok; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7, `r1b` 12/12 (negative controls flagged); FEX ASM 2,270:
+1,898 pass, 48 precision deviations, 324 unsupported, no failure. The first pass found the code-shape check refusing the
+`isb` of an inline RDTSC on a vCPU without FEAT_ECV (`system`'s `profile`, `x3`, `x4`, `l4a`); admission now allows it there
+and the cases from `system` on were run again (the stub, which runs without the code shape, and so the campaign, were
+unaffected).
+
+**Independent review** (read-only, of the diff): one blocking defect, fixed: `bank` read IF's byte after every block, so a
+CPL-3 store into the guest-state page (the recorded deviation) could set or clear IF; it now reads it only at CPL 0 (test
+`x2-cpl3-if-byte` and its negative control above; the deviation record in abi `GUEST_STATE_VA` and the boot-features plan
+now says a CPL-0 store acts as CLI/STI and what CPL 3 can read). Also applied: admission refuses an STI right before a REP
+string or LOCK NEG; `held`'s timer caveat stated; a CPL-0 relocation test; the `locks` comparison with native counts (since replaced by the measured one above).
+Rerun on the fixes, rebased on e2f8aba (`review/`): `cargo test` with `FEXC` (105 + 1 ignored, abi 65), the stack audit,
+`run_k2.py`, `events` (the new case included), `contain` and `system` (0 failures: e2f8aba dropped the stale UMIP case), and
+`--check-reuse --code-shape` installer boots, cache off: N = 1 852,075 and N = 4 219,815 resident copies checked, no halt,
+both reached the dialog.
+
+**Not done.** RDTSCP stays the resident's (TSC_AUX); a CPL-3 RDTSC too (CR4.TSD). Each resident entry with IF = 0 now pays
+about 13 ns for the event-pending look (SWAPGS's cost row); the remaining trips per system call are SYSCALL and SYSRET
+(design study option (c+) next).
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite

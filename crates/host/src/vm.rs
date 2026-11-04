@@ -384,7 +384,10 @@ impl Vcpu {
             hv(hv_vcpu_set_trap_debug_reg_accesses(self.id, false), "hv_vcpu_set_trap_debug_reg_accesses")?;
             hv(hv_vcpu_set_trap_debug_exceptions(self.id, false), "hv_vcpu_set_trap_debug_exceptions")?;
         }
-        self.set_sys(CNTKCTL_EL1, 0)?;
+        // EL0 may read the virtual count (EL0VCTEN, bit 1: CNTVCT_EL0, CNTVCTSS_EL0 and CNTFRQ_EL0, read-only; perf chunk 15's
+        // inline RDTSC, which admission allows only there): the value the guest already reads, scaled, by RDTSC. Everything
+        // else traps to EL1 (`trapped`): the physical count (EL0PCTEN), both timers (EL0VTEN, EL0PTEN), the event stream.
+        self.set_sys(CNTKCTL_EL1, 1 << 1)?;
         self.set_sys(CNTV_CTL_EL0, 0)
     }
     /// Runs until the next exit: an HVC or a forced exit ([`exit_vcpus`]); any other exit is an error reporting the

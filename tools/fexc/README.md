@@ -29,7 +29,12 @@ jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never 
 (series applied as thirty commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series52-adox66` (November 4, owner decision of
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series54-inline-tsc` (November 4, perf plan "Measured
+(chunk 15)"): patches 0001-0032 (0031: CLI and STI translated inline for a CPL-0 request, `--cpl0`; 0032: RDTSC inline with
+the resident's 24 MHz formula, `--tsc`) and the shim's rules for them in `Cut` (one-byte CLI anywhere; one-byte STI neither
+first nor last in its block, never before a REP string or LOCK NEG; two-byte RDTSC); `obj/fexc` SHA-256
+`81fa0932da3a89e3fffd14889c48a42803d9ee7c635651fe25f5c3a6c8eab134` (`series53-inline`: 0031 only). Before it,
+`/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series52-adox66` (November 4, owner decision of
 November 3: ADX, CLFLUSHOPT/CLWB, XSAVEOPT/XSAVEC; boot-features plan, Built (ADX), Built (CLFLUSHOPT, CLWB), Built (XSAVEOPT,
 XSAVEC)): patches 0001-0030 (0030: ADOX with a 66 prefix decoded as ADOX, 66 ignored, as on the reference AMD machine) and
 `fexc.cpp` with the shim admitting ADCX/ADOX (66 or F3 0f 38 f6, ADOX also with 66; never with F2) and its cut reasons naming

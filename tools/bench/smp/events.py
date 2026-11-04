@@ -327,6 +327,32 @@ SIGNAL 0x40
     'ev-movss-ret': dict(body=ROUNDS.format(xfer="    lea rax, [rel target]\n    push rax\n    mov dx, ss\n    sti\n    mov ss, dx\nafter_movss:\n    ret"),
                          events=[(0x40, 'intr', {}, [('other', None), ('other', None), ('other', None), ('sti', None), ('mov_ss', 'after_movss'),
                                                      ('other', 'target')])] * 3),
+    # Perf chunk 15 (CLI and STI translated inline at CPL 0): an inline CLI's IF = 0 holds an interrupt raised after it (the
+    # signal is a block boundary, where the resident banks IF from the block); the inline STI two instructions later, mid-block,
+    # finds it pending and lets the resident run the STI: taken after the next instruction (the shadow), not before, not later.
+    'ev-cli-inline': dict(body="""    sti
+    mov r12, 1
+    cli
+    mov r12, 2
+SIGNAL 0x40
+    mov r12, 3
+    sti
+    mov r12, 4
+after_shadow:
+    mov r12, 5
+    cli""", events=[(0x40, 'intr', {}, [('other', None), ('sti', None), ('other', 'after_shadow')])]),
+    # STI then CLI with an interrupt pending: the shadow covers the CLI, so it is not taken there; the next STI (inline, the
+    # block entered with IF = 0 and the interrupt pending) takes it after its own next instruction.
+    'ev-sti-cli': dict(body="""SIGNAL 0x40
+    mov r12, 2
+    sti
+    cli
+    mov r12, 3
+    sti
+    mov r12, 4
+after_shadow:
+    mov r12, 5
+    cli""", events=[(0x40, 'intr', {}, [('other', None), ('sti', None), ('cli', None), ('other', None), ('sti', None), ('other', 'after_shadow')])]),
     # Perf chunk 12: STI with an interrupt pending, then a run of no-operation instructions before CLI (kept as one NOP_RUN
     # record from round 0, which signals nothing): the STI shadow covers the first NOP alone, so the interrupt is taken
     # after it, not after the run (the record is never run as a step).
@@ -447,6 +473,21 @@ after_shadow_2:
     dec r8
     jnz stress_loop
     cli"""
+# Perf chunk 15: long IF = 0 windows inside one block (inline CLI and STI at CPL 0): an event posted while IF = 0 is held (a
+# doorbell inside the block arms a stop and marks it pending, so the STI lets the resident run it) and taken right after
+# the shadowed instruction or at a later boundary, never inside the shadow, never with IF = 0, none lost.
+STRESS_WINDOW = """    mov r8, {iterations}
+    xor r9d, r9d
+    xor r10d, r10d
+window_loop:
+    cli
+""" + '    add r9, r8\n    rol r9, 7\n' * 12 + """    sti
+window_shadow:
+    add r10, r9
+after_shadow_3:
+""" + '    xor r10, r8\n    ror r10, 3\n' * 12 + """    dec r8
+    jnz window_loop
+    cli"""
 STRESS_HLT = """    mov r8, {iterations}
     sti
 hlt_loop:
@@ -456,13 +497,13 @@ after_hlt:
     jnz hlt_loop
     cli"""
 REPS = {'rep_stosb': 2000, 'rep_movsq': 250}
-SHADOWED = ('sti_shadow', 'mov_ss_shadow')
+SHADOWED = ('sti_shadow', 'mov_ss_shadow', 'window_shadow')
 STRESS_LOG = 0x20000                         # 2,048 entries: every delivery of 2,000 events is logged
 STRESS_LOG_AT = lambda i: 0x340000 + STRESS_LOG * i
 
 
 def stress(name, n, iterations):
-    body = (STRESS_BODY if name == 'stress' else STRESS_HLT).replace('{iterations}', str(iterations))
+    body = {'stress': STRESS_BODY, 'window': STRESS_WINDOW, 'hlt': STRESS_HLT}[name].replace('{iterations}', str(iterations))
     data = lambda i: [{'addr': f'0x{DATA(i):x}', 'size': 0x2000, 'fill': 'lcg', 'seed': 7 + i}]
     return build(f'ev-{name}', body, n, log_size=STRESS_LOG, memory_extra=data, log_at=STRESS_LOG_AT)
 
@@ -505,6 +546,7 @@ def stress_check(prog, i, entries, count, coverage, shadow_steps=0):
         mid = rip in reps and 0 < rcx < reps[rip]
         coverage['nmi' if vector == 2 else 'interrupt'] += 1
         coverage['mid_rep' if mid else 'rep_start' if rip in reps else 'after_hlt' if rip == labels.get('after_hlt') else
+                 'after_shadow' if rip in {a for k, a in labels.items() if k.startswith('after_shadow_')} else
                  'in_handler' if rip >= labels['ev_common'] and rip != labels['ev_end'] else 'other'] += 1
         if rf != int(mid): problems.append(f'cpu{i}: vector {vector:#x} at {where} RCX {rcx}: RF {rf}, the rule {int(mid)}')
         if vector not in (2, 0x40, 0x41, 0x50): problems.append(f'cpu{i}: vector {vector:#x} (error {error:#x}) at {where}')

@@ -98,9 +98,9 @@ mod tests {
         assert_eq!(object(USER_A.0, USER_A.1, USER_B.1).as_deref(), Some(USER_B.0));
         assert_eq!(object(USER_B.0, USER_B.1, USER_A.1).as_deref(), Some(USER_A.0));
         let moved = object(USER_A.0, USER_A.1, USER_B.1).unwrap();
-        assert!(crate::admission::admit(&moved, USER_B.1, USER, u64::MAX, true).is_ok());
+        assert!(crate::admission::admit(&moved, USER_B.1, USER, u64::MAX, true, false).is_ok());
         // Not at the RIP it was not made for (admission's own check).
-        assert!(crate::admission::admit(&moved, USER_A.1, USER, u64::MAX, true).is_err());
+        assert!(crate::admission::admit(&moved, USER_A.1, USER, u64::MAX, true, false).is_err());
     }
 
     #[test]
@@ -131,7 +131,10 @@ mod tests {
     /// Perf chunk 10: a placed block's code as the resident holds it (the admitted object's code, its link points linked:
     /// a `b` in each first word), its packed relocations and link points.
     fn placed(o: &[u8], rip: u64, source: &[u8]) -> (Vec<u8>, Vec<u32>, [LinkPoint; MAX_LINK_POINTS], u32) {
-        let a = crate::admission::admit(o, rip, source, u64::MAX, true).unwrap();
+        placed_at(o, rip, source, false)
+    }
+    fn placed_at(o: &[u8], rip: u64, source: &[u8], cpl0: bool) -> (Vec<u8>, Vec<u32>, [LinkPoint; MAX_LINK_POINTS], u32) {
+        let a = crate::admission::admit(o, rip, source, u64::MAX, true, cpl0).unwrap();
         let h: Header = read(&a.object, 0).unwrap();
         let mut code = a.object[h.code_offset as usize..][..h.code_size as usize].to_vec();
         let mut relocs: Vec<u32> = (0..h.relocs_count as usize)
@@ -155,13 +158,46 @@ mod tests {
             assert!(relocs.iter().any(|r| r & RELOC_MOVE != 0) && relocs.iter().any(|r| r & RELOC_MOVE == 0) && links[0].offset != 0);
             assert_eq!(relocate_code(&mut code, &relocs, &mut links, from.1, to.1, bytes), Ok(()));
             // The copy's link points are unlinked, as admitted.
-            let a = crate::admission::admit(to.0, to.1, USER, u64::MAX, true).unwrap();
+            let a = crate::admission::admit(to.0, to.1, USER, u64::MAX, true, false).unwrap();
             let mut want_links = [LinkPoint::NONE; MAX_LINK_POINTS];
             let h: Header = read(&a.object, 0).unwrap();
             assert_eq!(code, a.object[h.code_offset as usize..][..h.code_size as usize]);
             want_links[..a.links.len()].copy_from_slice(&a.links);
             assert_eq!(links, want_links);
         }
+    }
+
+    /// With `FEXC` set (perf chunk 15 review): a CPL-0 block whose STI exits to its own RIP (and a RIP-relative LEA) is fexc's
+    /// object at another RIP once relocated, by the host's relocator and by the resident's re-check (link points included:
+    /// the STI's exit goes to the STI at the new RIP), and is admitted there as a CPL-0 block.
+    #[test]
+    fn cpl0_sti_exit_is_relocated() {
+        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        // lea rax, [rip + 0x10]; cli; sti; inc rax; ret
+        let source = [0x48, 0x8d, 0x05, 0x10, 0, 0, 0, 0xfa, 0xfb, 0x48, 0xff, 0xc0, 0xc3];
+        let compile = |rip: u64| {
+            let dir = std::env::temp_dir().join(format!("natemu-reloc-{}-{rip:x}", std::process::id()));
+            let hex: String = source.iter().map(|b| format!("{b:02x}")).collect();
+            let st = std::process::Command::new(&fexc)
+                .args(["--hex", &hex, "--rip", &format!("{rip:#x}"), "--profile", "slice1", "--cpl0", "--object"]).arg(&dir)
+                .stdout(std::process::Stdio::null()).status().unwrap();
+            assert!(st.success());
+            let o = std::fs::read(&dir).unwrap();
+            std::fs::remove_file(&dir).unwrap();
+            o
+        };
+        let (a, b) = (0xffff_ffff_8100_0100u64, 0xffff_ffff_8123_4100u64);
+        let (oa, ob) = (compile(a), compile(b));
+        assert_eq!(object(&oa, a, b).as_deref(), Some(&ob[..]));
+        let admitted = crate::admission::admit(&ob, b, &source, u64::MAX, true, true).unwrap();
+        assert!(admitted.links.iter().any(|p| p.target == b + 8), "the STI's exit at the new RIP");
+        let (mut code, relocs, mut links, bytes) = placed_at(&oa, a, &source, true);
+        assert_eq!(relocate_code(&mut code, &relocs, &mut links, a, b, bytes), Ok(()));
+        let h: Header = read(&admitted.object, 0).unwrap();
+        assert_eq!(code, admitted.object[h.code_offset as usize..][..h.code_size as usize]);
+        let mut want = [LinkPoint::NONE; MAX_LINK_POINTS];
+        want[..admitted.links.len()].copy_from_slice(&admitted.links);
+        assert_eq!(links, want);
     }
 
     /// Each refusal of the re-check, and the shared move rule's.

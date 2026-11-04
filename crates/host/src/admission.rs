@@ -195,9 +195,10 @@ fn lock_neg(insn: &[u8]) -> bool {
 }
 
 /// Admits `bytes`, an fexc `--object` compiled at `rip` from `source` (the guest
-/// bytes given to fexc), for a vCPU executing `supported` feature bits; `shape` adds the code-shape check.
-pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64, shape: bool) -> Result<Admitted, String> {
-    let (mut admitted, parts) = admit_records(bytes, rip, source, supported)?;
+/// bytes given to fexc), for a vCPU executing `supported` feature bits; `shape` adds the code-shape check; `cpl0`: the
+/// request was at CPL 0 (perf chunk 15: its CLI and STI may be translated, [`interrupt_flag`]).
+pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64, shape: bool, cpl0: bool) -> Result<Admitted, String> {
+    let (mut admitted, parts) = admit_records(bytes, rip, source, supported, cpl0)?;
     let h = &parts.header;
     let code = &admitted.object[h.code_offset as usize..][..h.code_region_end as usize];
     let split = parts.sites.iter().position(is_stub).unwrap_or(parts.sites.len());
@@ -214,6 +215,7 @@ pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64, shape
         guest_bytes: h.guest_bytes,
         targets: &parts.targets,
         shape,
+        cpl0,
     };
     let (links, dispatch_exit) = structure::check(&c).map_err(|e| format!("object refused: {e}"))?;
     if links.len() > MAX_LINK_POINTS {
@@ -235,8 +237,43 @@ struct Parts {
     targets: Vec<u64>,
 }
 
+/// Perf chunk 15: the translated CLI and STI of a block (`starts`: its instructions' guest offsets, ascending, from fexc's PC
+/// table; `end` its guest bytes): each must be the one-byte form in a CPL-0 block (fexc translates no other: at CPL 0
+/// neither faults, and a prefix makes it the resident's), and an STI neither the block's first instruction nor its last,
+/// nor right before a REP string or LOCK NEG (whose exits to their own RIP would put a resident boundary inside the
+/// shadow), so the boundary its shadow covers is inside the block (a doorbell there arms a stop at a later exit) and an
+/// entry at the STI runs the resident's. Returns the STIs' RIPs: each one's exit to its own RIP (taken when an event is pending) is a literal-exit
+/// target. Containment: IF's flag byte is guest state the resident banks like DF (it decides only which events are taken),
+/// and the exit is to a RIP of the block's own bytes. Likewise a translated RDTSC is the two-byte form in a CPL-0 block (no
+/// CR4.TSD check is needed there), the only place its counter read may be ([`structure`]).
+fn interrupt_flag(source: &[u8], starts: &[u32], end: u32, rip: u64, cpl0: bool) -> Result<Vec<u64>, String> {
+    let mut sti = Vec::new();
+    for (k, &g) in starts.iter().enumerate() {
+        let next = starts.get(k + 1).copied().unwrap_or(end);
+        let insn = &source[g as usize..next as usize];
+        let (o, _) = crate::system::opcode_at(insn);
+        if insn.get(o..o + 2) == Some(&[0x0f, 0x31]) && (!cpl0 || insn.len() != 2) {
+            return Err(format!("object refused: RDTSC translated at guest offset {g:#x} outside a CPL-0 block or with a prefix"));
+        }
+        if !matches!(insn.get(o), Some(0xfa | 0xfb)) {
+            continue;
+        }
+        if !cpl0 || insn.len() != 1 {
+            return Err(format!("object refused: CLI/STI translated at guest offset {g:#x} outside a CPL-0 block or with a prefix"));
+        }
+        if insn[0] == 0xfb {
+            let after = &source[next as usize..starts.get(k + 2).copied().unwrap_or(end) as usize];
+            if g == 0 || next == end || rep_string(after) || lock_neg(after) {
+                return Err(format!("object refused: STI at guest offset {g:#x} first or last in its block, or before a self-exit"));
+            }
+            sti.push(rip.wrapping_add(u64::from(g)));
+        }
+    }
+    Ok(sti)
+}
+
 /// Everything but the code: header, tables, site records, relocations.
-fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Result<(Admitted, Parts), String> {
+fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64, cpl0: bool) -> Result<(Admitted, Parts), String> {
     let fail = |what: &str| Err(format!("object refused: {what}"));
     if bytes.len() < size_of::<Header>() || bytes.len() > STAGING_BYTES {
         return fail("size");
@@ -381,7 +418,10 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Resul
     let tail = &source[last..h.guest_bytes as usize];
     let own = (rep_string(tail) || lock_neg(tail)).then_some(rip.wrapping_add(last as u64));
     let admitted = Admitted { rep_self: own.filter(|_| rep_string(tail)), ..admitted };
-    let targets = [Some(end), target, own].into_iter().flatten().collect();
+    let mut starts: Vec<u32> = pcs.iter().map(|p| p.guest_offset).filter(|&g| g < h.guest_bytes).collect();
+    starts.dedup();
+    let sti = interrupt_flag(source, &starts, h.guest_bytes, rip, cpl0)?;
+    let targets = [Some(end), target, own].into_iter().flatten().chain(sti).collect();
     Ok((admitted, Parts { header: h, sites, pcs, relocs, literals, targets }))
 }
 
@@ -489,7 +529,7 @@ mod tests {
 
     /// The record checks only: the synthetic object's code is no real block (`structure` tests use fexc output).
     fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Result<Admitted, String> {
-        admit_records(bytes, rip, source, supported).map(|(a, _)| a)
+        admit_records(bytes, rip, source, supported, false).map(|(a, _)| a)
     }
 
     const RIP: u64 = 0x10_0000;
@@ -609,6 +649,22 @@ mod tests {
         }
     }
 
+    /// Perf chunk 15: translated CLI/STI only in one-byte form in a CPL-0 block, STI neither first nor last; each STI's RIP
+    /// is an exit target; 0f fa (PSUBD) is no CLI.
+    #[test]
+    fn interrupt_flag_forms() {
+        let f = |src: &[u8], starts: &[u32], cpl0| super::interrupt_flag(src, starts, src.len() as u32, 0x1000, cpl0);
+        assert_eq!(f(&[0x90, 0xfb, 0x90], &[0, 1, 2], true), Ok(vec![0x1001]));
+        assert_eq!(f(&[0xfa, 0x90, 0xfb, 0xfa], &[0, 1, 2, 3], true), Ok(vec![0x1002]));
+        assert_eq!(f(&[0x0f, 0xfa, 0xc1, 0x90], &[0, 3], false), Ok(vec![]));
+        assert_eq!(f(&[0x0f, 0x31, 0xfb, 0x90], &[0, 2, 3], true), Ok(vec![0x1002])); // rdtsc; sti; nop
+        assert!(f(&[0x0f, 0x31], &[0], false).is_err() && f(&[0x48, 0x0f, 0x31], &[0], true).is_err());
+        for (src, starts, cpl0) in [(&[0xfa, 0x90][..], &[0, 1][..], false), (&[0x90, 0xfb, 0x90], &[0, 1, 2], false), (&[0xfb, 0x90], &[0, 1], true),
+                                    (&[0x90, 0xfb], &[0, 1], true), (&[0x90, 0x66, 0xfb, 0x90], &[0, 1, 3], true), (&[0xf0, 0xfa, 0x90], &[0, 2], true),
+                                    (&[0x90, 0xfb, 0xf3, 0xaa], &[0, 1, 2], true), (&[0x90, 0xfb, 0xf0, 0xf7, 0x18], &[0, 1, 2], true)] {
+            assert!(f(src, starts, cpl0).is_err(), "{src:02x?}");
+        }
+    }
     #[test]
     fn rep_string_forms() {
         // R2 review: two REX bytes (the last counts) and a REX before F3 (ignored) too.
@@ -680,7 +736,7 @@ mod tests {
         // Review E4: a STORE_PAIR record over a single-register store with a split stub (the resident would have
         // written two registers) is refused; since I5a by the code check (a pair record needs an `ldp`/`stp` word), as a
         // 16-byte LOAD_PAIR record over that `ldr` is.
-        let full = |bytes: &[u8]| super::admit(bytes, RIP, &SOURCE, ALL, false).map(|_| ());
+        let full = |bytes: &[u8]| super::admit(bytes, RIP, &SOURCE, ALL, false, false).map(|_| ());
         let pair = Site { kind: object::kind::STORE_PAIR, intent: object::INTENT_WRITE, data_reg: [4, 5], width: 16, ..load_site(8) };
         let split = Site { native_offset: 20, kind: object::kind::SPLIT, guest_offset2: 8, ..pair };
         assert!(full(&with(object_with(&[pair, split]), 128 + 20, |w: &mut u32| *w = 0xd420_0040)).is_err());
@@ -852,7 +908,7 @@ mod tests {
             let (bytes, source) = (std::fs::read(obj).unwrap(), std::fs::read(obj.with_extension("src")).unwrap());
             let h: Header = record(&bytes, 0);
             let t = std::time::Instant::now();
-            let r = super::admit(&bytes, h.guest_rip, &source, ALL, true);
+            let r = super::admit(&bytes, h.guest_rip, &source, ALL, true, true);
             time += t.elapsed();
             n += 1;
             words += h.code_region_end as u64 / 4;

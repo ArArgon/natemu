@@ -802,7 +802,41 @@ inline unsigned FexcUdLength(uint64_t rip) {
   return n + (mod == 1 ? 1 : mod == 2 ? 4 : 0) + imm;
 }
 
-inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, bool first, const DecodedInst& d, uint64_t rip) {
+// Perf chunk 15: the one-byte CLI (fa) and STI (fb) of a CPL-0 request are translated inline (patch 0031). At CPL 0 neither
+// faults (#GP(0) needs CPL > IOPL; 64-bit mode has no VME/PVI); with any prefix they stay the resident's (LOCK: #UD; the
+// others: the host's decode). STI only where its shadow stays inside the block: never as its first instruction (an entry at
+// the STI, as its own exit with an event pending, after a MOV SS or by a branch, runs the resident's STI) nor its last: the
+// next instruction is translated in the same block ([`Follows`]), so no block boundary falls where the shadow holds events.
+// Never before a REP string or LOCK NEG either: their exits to their own RIP would put a resident boundary inside the shadow.
+inline bool PlainFlag(const DecodedInst& d, uint8_t op) {
+  return d.FexcMap == FEXC_MAP_PRIMARY && d.OPRaw == op && d.InstSize == 1;
+}
+// The two-byte RDTSC (0f 31), translated inline under `--tsc` (a CPL-0 request: no #GP whatever CR4.TSD; a 24 MHz counter,
+// the formula patch 0032 hard-codes); with a prefix it stays the resident's.
+inline bool PlainRdtsc(const DecodedInst& d) {
+  return d.FexcMap == FEXC_MAP_TWO && d.OPRaw == 0x31 && d.InstSize == 2;
+}
+// Whether `n` (the instruction after an STI, `failed`: its decode ended the block with an error) is translated in the block:
+// an inline CLI or RDTSC, or an admitted form other than a REP string, a LOCK NEG and a direct branch to a non-canonical target (the
+// checks `Cut` makes after the verdict).
+inline bool Follows(const DecodedInst* n, bool failed) {
+  if (!n || failed || !n->TableInfo) return false;
+  if (PlainFlag(*n, 0xFA)) return true;
+  if (PlainRdtsc(*n)) return fexc_tsc;
+  if (Classify(*n, true).kind != ALLOW) return false;
+  const uint8_t op = n->OPRaw;
+  const bool primary = n->FexcMap == FEXC_MAP_PRIMARY;
+  const bool string = primary && ((op >= 0xA4 && op <= 0xA7) || (op >= 0xAA && op <= 0xAF)) &&
+                      (n->Flags & (DecodeFlags::FLAG_REP_PREFIX | DecodeFlags::FLAG_REPNE_PREFIX));
+  const bool lock_neg = primary && (op == 0xF6 || op == 0xF7) && ((n->ModRM >> 3) & 7) == 3 && (n->Flags & DecodeFlags::FLAG_LOCK);
+  const bool rel = (primary && ((op >= 0x70 && op <= 0x7F) || (op >= 0xE0 && op <= 0xE3) || op == 0xE8 || op == 0xE9 || op == 0xEB)) ||
+                   (n->FexcMap == FEXC_MAP_TWO && op >= 0x80 && op <= 0x8F);
+  const uint64_t target = n->PC + n->InstSize + n->Src[0].Literal();
+  return !string && !lock_neg && (!rel || uint64_t(int64_t(target << 16) >> 16) == target);
+}
+
+inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, bool first, const DecodedInst& d, uint64_t rip,
+                const DecodedInst* next, bool next_last) {
   using S = Frontend::Decoder::DecodedBlockStatus;
   // A REP string instruction (I2) or a LOCK NEG (I3) ends its block: the next instruction starts the next block.
   if (first) fexc_after_rep = 0;
@@ -819,6 +853,10 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
     return true;
   }
   const bool decoded = !failed && d.TableInfo != nullptr;
+  if (decoded && (PlainFlag(d, 0xFA) || PlainFlag(d, 0xFB)) && fexc_cpl0 &&
+      (d.OPRaw == 0xFA || (!first && Follows(next, next_last && status != S::SUCCESS))))
+    return false;
+  if (decoded && PlainRdtsc(d) && fexc_tsc) return false;
   Verdict v = Classify(d, decoded);
   // I10 review: a #UD encoding FEX did not decode (it stops at the byte it does not know) is #UD once the instruction is
   // fetched: its bytes through the ModRM (FexcUdLength) must be in the supplied bytes, else `partial_decode` (the host fetches

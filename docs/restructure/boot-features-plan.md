@@ -521,7 +521,11 @@ hardware's: the alias's slot maps exactly one page, and an x0 outside it faults 
 instead of #GP, as before. A user-mode access reaches only what that vCPU's own state already is: the bases and flag
 bytes it may write are rewritten at the next resident entry, and every CPL change (SYSCALL, interrupt, exception, IRET)
 passes through the resident, so the kernel never runs with a value a user process stored there; a user DF or x87 value
-stored there is that task's own state. A kernel path reaches the page only through a kernel bug (an unchecked
+stored there is that task's own state. Since perf chunk 15 the resident also reads back IF's byte, but only after a CPL-0
+block: a kernel store into the page acts as CLI/STI would, a user store changes nothing. A user process may read two more
+resident-written fields there: the event-pending byte (whether an interrupt is pending for its vCPU) and the TSC offset,
+useless without the virtual count, whose reads admission refuses outside a CPL-0 RDTSC (a CPL-3 RDTSC stays the
+resident's and faults under CR4.TSD). A kernel path reaches the page only through a kernel bug (an unchecked
 `__get_user`/`__put_user`/`unsafe_*_user` on a user pointer, which x86 would turn into #GP) or privileged BPF direct
 loads (`BPF_PROBE_MEM`, which read only, needing CAP_BPF/CAP_PERFMON). **Constraint for later:** never advertise LA57
 or more than 48 linear-address bits (CPUID 7.ECX[16], 80000008H.EAX[15:8] = 48): with 57-bit linear addresses the

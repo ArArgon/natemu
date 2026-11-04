@@ -67,6 +67,22 @@ fn next(s: &State) -> Option<Next> {
     }
 }
 
+/// Perf chunk 15: an event is pending that would be taken at a boundary with RFLAGS.IF set and no shadow (an NMI not blocked,
+/// the ExtINT or an APIC interrupt [`next`] takes): the resident's event-pending byte, which an inline STI reads. The common
+/// case (no vector, ExtINT or unblocked NMI posted) is one relaxed look at the record's words: a post this misses rings the
+/// doorbell after its store (the sender's order), whose IRQ is taken once generated code runs and writes the byte again.
+/// Not seen here: a LAPIC timer expiry that is due but not yet polled, and reinject's backlog (both enter the IRR at the
+/// next boundary's `lapic::poll`). Such an interrupt, with IF = 0 when it fell due, is taken at the first block exit after
+/// the inline STI's next instruction rather than right after it: later than an interrupt already pending would be, which
+/// the SDM permits for one recognised after the STI (the timer's expiry is asynchronous to the instruction stream).
+pub(super) fn held(s: &State) -> bool {
+    use core::mem::offset_of;
+    let w = |field: usize| word(s, field).load(core::sync::atomic::Ordering::Relaxed);
+    let v = offset_of!(Events, vectors);
+    let nmi = s.nmi_blocked == 0 && w(offset_of!(Events, nmi)) != 0;
+    nmi || (w(v) | w(v + 8) | w(v + 16) | w(v + 24) | w(offset_of!(Events, lint0)) != 0 && (lapic::extint(s) || lapic::deliverable(s).is_some()))
+}
+
 /// Takes every event this boundary may take, delivering each (the handler's first instruction is a boundary too).
 /// True when an event is pending that a shadow alone blocks: the caller runs exactly one instruction next.
 pub(super) fn take(s: &mut State) -> bool {

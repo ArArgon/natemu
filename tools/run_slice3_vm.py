@@ -1162,6 +1162,22 @@ def x2_cases():
     # POPF setting TF (S4): the trap follows the next instruction (#DB, RIP after the NOP). LOCK CLI: #UD.
     popf_tf = ref.assemble('push 0x102\npopfq\nnop\nnop')
     cases.append(('x2-popf-tf', f'cpl 0\nrip {base:#x}\n{stack}code {popf_tf.hex()}\n', fault(1, base + 7)))
+    # Perf chunk 15: at CPL 0, PUSHFQ reads the IF an inline CLI or STI just wrote (one block).
+    flags = ref.assemble('nop\ncli\npushfq\npop rbx\nnop\nsti\npushfq\npop rcx\ncli\ncmp r11, r11')
+    cases.append(('x2-cli-sti-pushf-cpl0', f'cpl 0\nrflags 0x202\nrip {base:#x}\n{stack}code {flags.hex()}\n', reached(rbx=0x2, rcx=0x202)))
+    # Perf chunk 15 review: a CPL-3 store to IF's byte in the guest-state page (the recorded deviation, abi GUEST_STATE_VA)
+    # changes nothing: the resident banks that byte only after a CPL-0 block. After the store and a block boundary (CPUID),
+    # PUSHFQ sees IF = 1 and an interrupt posted then is taken (frame IF = 1).
+    va = 0xffff_4000_0000_13f9
+    user, lab = ref.assemble(f'nop\nu: nop\nmov rax, {va:#x}\nmov byte ptr [rax], 0\nxor eax, eax\ncpuid\npushfq\npop rbx\nh: nop\nnop\ncmp r11, r11', labels=True)
+
+    def taken_with_if(out):
+        f = [smp.num(x) for x in out.get('fault') or []]
+        rbx = smp.num(out['gpr'][smp.REGS.index('rbx')])
+        ok = out['stop'] == 'guest_fault' and f[:1] == [0x40] and smp.num(out['rflags']) & 0x200 and rbx & 0x200
+        return [] if ok else [f"{out['stop']} {out['reason']} at {out['rip']} fault {f} rflags {out.get('rflags')} rbx {rbx:#x}"]
+    cases.append(('x2-cpl3-if-byte', f"cpl 0\nrflags 0x202\nrip {base:#x}\nswitch {base + lab['u']:#x} 3\n{stack}svr 0x1ff\npost {base + lab['h']:#x} 0x40\n"
+                  f"code {user.hex()}\n", taken_with_if))
     lock_cli = bytes([0x90, 0xf0, 0xfa]) + ref.assemble('cmp r11, r11')
     cases.append(('x2-lock-cli', f'cpl 0\nrip {base:#x}\ncode {lock_cli.hex()}\n', fault(6, base + 1)))
     # HLT with no event that can wake it: IF = 0 and an interrupt pending (masked, model A10), or nothing pending. The
@@ -1306,12 +1322,12 @@ def events_stress(a, host, runtime, stub, report):
     import events
     failures = []
     kicks = a.kicks or 2000
-    for name, iterations in (('stress', 400), ('hlt', kicks // 2)):
+    for name, iterations in (('stress', 400), ('window', 2_000_000), ('hlt', kicks // 2)):
         for n in (1, 2, 4):
             prog = events.stress(name, n, iterations)
             label = f'ev-{name}@{n}'
             want = None
-            if name == 'stress':
+            if name != 'hlt':
                 rc, err, dump, _ = smp.run_image(prog['qemu'], smp.build_image(prog['qemu'], stub), a.out / 'qemu' / label, 'multi', timeout=120)
                 want = smp.parse_dump(prog['qemu'], dump) if rc == 1 else None
                 if want is None: failures.append(f'{label}: QEMU run failed ({rc} {err})')
@@ -1937,9 +1953,12 @@ EL0_FORGED = [('msr-daifset', 'd50342df', 'trapped'), ('msr-ttbr0', 'd5182000', 
               ('mrs-sctlr', 'd5381000', 'trapped'), ('mrs-ctr', 'd53b0020', 'trapped'), ('tlbi', 'd508871f', 'trapped'),
               ('dc-civac', 'd50b7e20', 'trapped'), ('ic-ivau', 'd50b7520', 'trapped'), ('eret', 'd69f03e0', 'trapped'),
               ('wfi', 'd503207f', 'trapped'), ('hvc', 'd4000002', 'trapped'),
-              # The debug channel (MDSCR_EL1.TDCC), counters and timers (CNTKCTL_EL1 = 0), DC ZVA (SCTLR_EL1.DZE).
+              # The debug channel (MDSCR_EL1.TDCC), counters and timers (CNTKCTL_EL1: only EL0VCTEN since perf chunk 15, so
+              # the physical count and both timers trap; the virtual count is EL0-readable, the inline RDTSC's), DC ZVA
+              # (SCTLR_EL1.DZE).
               ('mrs-mdccsr', 'd5330100', 'trapped'), ('msr-dbgdtrtx', 'd5130500', 'trapped'), ('mrs-dbgdtrrx', 'd5330500', 'trapped'),
-              ('mrs-cntvct', 'd53be040', 'trapped'), ('msr-cntv-ctl', 'd51be320', 'trapped'), ('dc-zva', 'd50b743c', 'trapped'), ('mrs-pmccntr', 'd53b9d00', 'trapped'),
+              ('mrs-cntpct', 'd53be020', 'trapped'), ('msr-cntv-ctl', 'd51be320', 'trapped'), ('mrs-cntv-cval', 'd53be340', 'trapped'),
+              ('msr-cntp-ctl', 'd51be220', 'trapped'), ('msr-cntkctl', 'd518e100', 'trapped'), ('dc-zva', 'd50b743c', 'trapped'), ('mrs-pmccntr', 'd53b9d00', 'trapped'),
               # A literal exit to a RIP none of the block's link points targets: the linker's own check.
               ('link-forged', 'd2824680,d4000021', 'bad_link'),
               # x28 is the guest-state page's EL0 alias (G1: EL0 may read and write it, abi GUEST_STATE_VA, outside the

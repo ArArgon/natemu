@@ -8,7 +8,8 @@
 //! - Words: a word the decoder does not know is admitted only if it is no branch or exception-generating word and
 //!   names neither x25 nor x28 in any register field ([`screened`]); x28 (FEX's guest-state base, the guest-state page)
 //!   is never written and addresses only FEX's guest-state fields: loads of `frame::GUEST_STATE`, stores only to
-//!   `frame::GUEST_STATE_WRITABLE` (DF); x25 is written only by `mrs x25,
+//!   `frame::GUEST_STATE_WRITABLE` (DF), and in a CPL-0 block to IF's byte (perf chunk 15: its CLI and STI, which the code
+//!   shape checks); x25 is written only by `mrs x25,
 //!   nzcv` (the pre-NZCV save the resident reads at `nzcv=saved` sites); the only `svc`s are `#LINK`, `#DIV_U`,
 //!   `#DIV_S`, `#X87` and `#STRING`; direct branches go forward to a word of the code region; no word falls through into a literal slot, a
 //!   check stub or past the region. So every path ends at an exit the resident knows (a link point or the dispatch
@@ -117,6 +118,12 @@ enum Insn {
     Dispatch,
     Brk,
     Udf,
+    /// Perf chunk 15: a read of the virtual count (`mrs xT, cntvct_el0 | cntvctss_el0`: fexc emits `isb; mrs cntvct_el0`, or the
+    /// self-synchronising CNTVCTSS where the vCPU presents FEAT_ECV): EL0 may read the count (CNTKCTL_EL1.EL0VCTEN), admitted
+    /// only in a CPL-0 RDTSC.
+    Counter(Option<u8>),
+    /// `isb`: in a CPL-0 RDTSC (before its count read); elsewhere, as before, an unknown word (the code shape refuses it).
+    Isb,
     /// A word the decoder does not know, admitted by [`screened`] with the code-shape check off: no branch, no x25/x28.
     Other,
 }
@@ -125,7 +132,7 @@ impl Insn {
     fn writes(&self) -> u32 {
         let bit = |r: u8| if r == 31 { 0 } else { 1 << r };
         match *self {
-            Insn::Data(Some(r)) => 1 << r,
+            Insn::Data(Some(r)) | Insn::Counter(Some(r)) => 1 << r,
             Insn::Mem(m) => {
                 let wb = if matches!(m.form, Form::Pre | Form::Post) { 1 << m.addr.base } else { 0 };
                 wb | if m.load && !m.vector { bit(m.rt) | m.rt2.map_or(0, bit) } else { 0 }
@@ -192,6 +199,8 @@ fn decode(w: u32, at: u32) -> Option<Insn> {
             Atomic { op: AtomicOp::Casp, size: 8 << (w >> 30 & 1), rs: reg(16), rt: reg(0), rn: reg(5) }
         }
         _ if w & 0xffff_ffe0 == 0xd53b_4200 => Data(zr(rd)), // mrs xT, nzcv
+        _ if w & 0xffff_ffe0 == 0xd53b_e040 || w & 0xffff_ffe0 == 0xd53b_e0c0 => Counter(zr(rd)), // mrs xT, cntvct_el0 | cntvctss_el0
+        0xd503_3fdf => Isb,
         _ if w & 0xffff_ffe0 == 0xd51b_4200 => Data(None),   // msr nzcv, xT
         0xd500_401f => Data(None),                           // cfinv
         _ if w & 0xffe0_7c10 == 0xba00_0400 => Data(None),   // rmif
@@ -389,6 +398,8 @@ pub(super) struct Code<'a> {
     pub targets: &'a [u64],
     /// Also run the code-shape check (debug).
     pub shape: bool,
+    /// The request was at CPL 0 (perf chunk 15): IF's flag byte is writable, by CLI and STI only ([`Verifier::frame_access`]).
+    pub cpl0: bool,
 }
 
 pub(super) fn canonical(a: u64) -> bool {
@@ -643,6 +654,16 @@ impl<'a> Verifier<'a> {
                 Insn::Svc(svc::LINK | svc::DIV_U | svc::DIV_S | svc::X87 | svc::STRING) => {}
                 Insn::Svc(_) => return fail(at, "svc"),
                 Insn::Brk if shape && self.c.stubs.binary_search_by_key(&at, |s| s.native_offset).is_err() => return fail(at, "brk"),
+                // Perf chunk 15: the virtual count, read at EL0 since CNTKCTL_EL1.EL0VCTEN (the value RDTSC gives the guest at
+                // any CPL without CR4.TSD, scaled), only inside a CPL-0 block's RDTSC.
+                Insn::Counter(_) | Insn::Isb if !(self.c.cpl0 && self.instruction(at).is_some_and(|(g, _)| self.guest_insn(g) == [0x0f, 0x31])) => {
+                    if matches!(i, Insn::Counter(_)) {
+                        return fail(at, "counter read outside a CPL-0 RDTSC");
+                    }
+                    if shape {
+                        return Err(format!("unrecognised instruction {w:#010x} at {at:#x}"));
+                    }
+                }
                 _ => {}
             }
             if i.falls_through() && self.insn(at + 4).is_none() {
@@ -700,7 +721,12 @@ impl<'a> Verifier<'a> {
         let (offset, end) = (m.addr.imm, m.addr.imm + m.size as i64);
         let inside = |&(field, len): &(u32, u32)| offset >= field as i64 && end <= (field + len) as i64;
         let fields: &[(u32, u32)] = if m.load { &frame::GUEST_STATE } else { &frame::GUEST_STATE_WRITABLE };
-        if matches!(m.form, Form::Unsigned | Form::Pair) && fields.iter().any(inside) {
+        // Perf chunk 15: a CPL-0 block's CLI and STI store IF's byte (with the code shape: only inside those instructions).
+        let flag = || {
+            let insn = self.instruction(at).map(|(g, _)| self.guest_insn(g));
+            !m.load && self.c.cpl0 && (offset, m.size) == (i64::from(frame::IF), 1) && (!self.c.shape || matches!(insn, Some([0xfa] | [0xfb])))
+        };
+        if matches!(m.form, Form::Unsigned | Form::Pair) && (fields.iter().any(inside) || flag()) {
             Ok(())
         } else {
             Err(format!("frame access {:#010x} at {at:#x}: not a guest-state field", self.word(at)))
@@ -1369,7 +1395,7 @@ mod tests {
     }
     fn admit_with((object, source): (&[u8], &[u8]), shape: bool) -> Result<(), String> {
         let h: Header = super::super::record(object, 0);
-        super::super::admit(object, h.guest_rip, source, u64::MAX, shape).map(|_| ())
+        super::super::admit(object, h.guest_rip, source, u64::MAX, shape, false).map(|_| ())
     }
     /// `fixture` with the code word at `at` (which must be `old`) replaced by `new`.
     fn patched(fixture: (&[u8], &[u8]), at: u32, old: u32, new: u32) -> Vec<u8> {
@@ -1529,7 +1555,7 @@ mod tests {
         refused(ADDRESS, at, old, DISPATCH_PLACEHOLDER, "not forward");
         // Admission returns the dispatch branch.
         let h: Header = super::super::record(CALL.0, 0);
-        let a = super::super::admit(CALL.0, h.guest_rip, CALL.1, u64::MAX, false).unwrap();
+        let a = super::super::admit(CALL.0, h.guest_rip, CALL.1, u64::MAX, false, false).unwrap();
         assert_eq!((a.dispatch_exit, a.links.len()), (Some(0x38), 0));
     }
 
@@ -1541,7 +1567,7 @@ mod tests {
     #[test]
     fn link_points_are_returned() {
         let h: Header = super::super::record(JCC.0, 0);
-        let a = super::super::admit(JCC.0, h.guest_rip, JCC.1, u64::MAX, false).unwrap();
+        let a = super::super::admit(JCC.0, h.guest_rip, JCC.1, u64::MAX, false, false).unwrap();
         let point = |offset, word, target| LinkPoint { offset, word, target };
         assert_eq!(a.links, [point(LINK_FT, MOV_W0_5, h.guest_rip + 5), point(0x1c, 0x5280_08a0, h.guest_rip + 0x45)]);
         assert_eq!(a.dispatch_exit, None);
@@ -1760,10 +1786,19 @@ mod tests {
         admitted(0x394f_e795); // ldrb w21, [x28, #0x3f9]: pushf reads IF
         admitted(0x398f_eb95); // ldrsb x21, [x28, #0x3fa]: pushf reads DF
         admitted(0x3950_1795); // ldrb w21, [x28, #0x405]: pushf reads ID
-        refused(ADDRESS, at, old, 0x390f_e794, "frame access"); // strb w20, [x28, #0x3f9]: IF is the resident's
+        refused(ADDRESS, at, old, 0x390f_e794, "frame access"); // strb w20, [x28, #0x3f9]: IF is the resident's (but in a CPL-0 CLI/STI)
         refused(ADDRESS, at, old, 0x390f_f394, "frame access"); // strb w20, [x28, #0x3fc]: IOPL
         refused(ADDRESS, at, old, 0x394f_ef95, "frame access"); // ldrb w21, [x28, #0x3fb]: no field
-        refused(ADDRESS, at, old, 0x3950_1b95, "frame access"); // ldrb w21, [x28, #0x406]: past the flags
+        admitted(0x3950_1b95); // ldrb w21, [x28, #0x406]: an inline STI reads the event-pending byte (perf chunk 15)
+        admitted(0xf940_5f95); // ldr x21, [x28, #0xb8]: an inline RDTSC reads the TSC offset (perf chunk 15)
+        refused(ADDRESS, at, old, 0xf900_5f95, "frame access"); // str x21, [x28, #0xb8]: the resident's
+        // Perf chunk 15: the virtual count only in a CPL-0 RDTSC (EL0 may read it), with or without the code shape.
+        for word in [0xd53b_e0d4, 0xd53b_e054] {
+            refused(ADDRESS, at, old, word, "counter read"); // mrs x20, cntvctss_el0 | cntvct_el0
+            validated(ADDRESS, at, old, word, Some("counter read"));
+        }
+        refused(ADDRESS, at, old, 0x3950_1f95, "frame access"); // ldrb w21, [x28, #0x407]: past the flags
+        refused(ADDRESS, at, old, 0x3910_1b94, "frame access"); // strb w20, [x28, #0x406]: the event-pending byte is the resident's
         // I7: the segment bases (gs_cached 992, fs_cached 1000) are loads only.
         admitted(0xf941_f794); // ldr x20, [x28, #1000]: an FS-prefixed access reads FS.base
         admitted(0xf941_f394); // ldr x20, [x28, #992]: GS.base

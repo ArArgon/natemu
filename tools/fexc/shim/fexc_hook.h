@@ -149,7 +149,18 @@ struct FexcArg {
   FexcArg& operator=(T v) { value = v; return *this; }
 };
 enum : int { FEXC_ARG_SSE_GATED, FEXC_ARG_AVX_GATED, FEXC_ARG_ALIGNMENT_GATED, FEXC_ARG_X87_GATED, FEXC_ARG_WAIT_GATED, FEXC_ARG_X87_FPCR,
-             FEXC_ARG_SIMD_UNMASKED, FEXC_ARG_X87_UNMASKED };
+             FEXC_ARG_SIMD_UNMASKED, FEXC_ARG_X87_UNMASKED, FEXC_ARG_CPL0, FEXC_ARG_TSC };
+// Profile slice1 (perf chunk 15): the request is at CPL 0 (`--cpl0`, from the host; never for a single-instruction step):
+// the one-byte CLI and STI are translated inline (patch 0031, `FexcInterruptFlagOp`; the rules are `Cut`'s).
+inline FexcArg<bool, FEXC_ARG_CPL0> fexc_cpl0;
+// The flag byte (FEX's flags[22], no FEX code uses it) the resident sets when an interrupt would be taken were IF set: an
+// inline STI reads it (frame::EVENT_PENDING on the host).
+constexpr unsigned FEXC_EVENT_PENDING_LOC = 22;
+// Profile slice1 (perf chunk 15): a CPL-0 request on a host whose counter runs at 24 MHz (`--tsc`): the two-byte RDTSC is
+// translated inline (patch 0032, the resident's exact formula), reading the vCPU's TSC offset at FEXC_TSC_OFFSET (FEX's
+// `_pad1`, which no FEX code uses; the resident writes it at every entry: frame::TSC_OFFSET on the host).
+inline FexcArg<bool, FEXC_ARG_TSC> fexc_tsc;
+constexpr uint32_t FEXC_TSC_OFFSET = 0xb8;
 // Profile slice1 (I3), recorded by the dispatcher: guest RIP of each LOCK CMPXCHG / CMPXCHG8B / CMPXCHG16B, whose casal/caspal
 // the JIT precedes with `dmb ish` (x86 orders a failing locked compare; a failing Arm CAS writes nothing, acquire only).
 inline std::set<uint64_t> fexc_lock_cas;

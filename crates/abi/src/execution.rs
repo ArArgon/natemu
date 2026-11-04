@@ -83,7 +83,11 @@ pub const FRAME_VA: u64 = PRIVATE + FRAME_OFFSET as u64;
 /// naming the page faults there, as on x86, instead of the kernel storing into it. Documented deviation: a guest access
 /// inside this page reaches the vCPU's own guest state instead of #GP; every other address of its table slot faults (#GP).
 /// The page holds nothing but guest state (the resident rewrites the flag bytes and the FS/GS bases from its bank at
-/// every block entry and reads back only DF). Needs 48-bit linear addresses and no LAM: with LA57 it would be canonical,
+/// every block entry and reads back only DF, and, after a CPL-0 block, IF: perf chunk 15, so a CPL-0 store into the page
+/// acts as CLI/STI would; a CPL-3 one changes nothing). Perf chunk 15 adds two resident-written fields CPL 3 may read there:
+/// the event-pending byte (whether an interrupt is pending, which the vCPU's own code sees anyway when IF is set) and the
+/// TSC offset (useless without the count: admission refuses counter reads outside a CPL-0 RDTSC, and RDTSC at CPL 3 stays
+/// the resident's, which faults under CR4.TSD). Needs 48-bit linear addresses and no LAM: with LA57 it would be canonical,
 /// with LAM_SUP it would alias a canonical kernel address (neither is advertised).
 pub const GUEST_STATE_VA: u64 = 0xffff_4000_0000_1000;
 pub const FRAME_POINTER: u64 = GUEST_STATE_VA;
@@ -596,6 +600,16 @@ pub mod frame {
     /// (FEX: 1 = clear, -1 = set).
     pub const FLAGS: u32 = 0x3f0;
     pub const DF: u32 = FLAGS + 10;
+    /// IF's byte (0/1). Perf chunk 15: a CPL-0 translation's inline CLI and STI write it (admission allows that store only
+    /// in such a block and in those instructions); the resident banks it at every exit, as DF.
+    pub const IF: u32 = FLAGS + 9;
+    /// Perf chunk 15: a byte of FEX's flag array FEX's code never uses (flags[22]), the resident's: 1 when an interrupt would
+    /// be taken were IF set (written at every entry into generated code, every resume and after every doorbell). An inline STI
+    /// reads it and, when set, exits to its own RIP so the resident runs the STI (its shadow and the delivery after it).
+    pub const EVENT_PENDING: u32 = FLAGS + 22;
+    /// Perf chunk 15: the vCPU's TSC offset (its TSC MSR slot, `runtime::tsc`), 8 bytes in FEX's `_pad1` (no FEX code uses
+    /// it), written by the resident at every entry; a CPL-0 translation's inline RDTSC adds it to the scaled count.
+    pub const TSC_OFFSET: u32 = 0xb8;
     /// FEX's `gs_cached` and `fs_cached` (`CPUState`, right before the flag bytes): the GS and FS bases FEX adds to every
     /// GS-/FS-prefixed address in 64-bit mode (`OpDispatchBuilder::GetSegment`), 8 bytes each, written by the resident
     /// from the bank at every block entry (I7).
@@ -636,12 +650,13 @@ pub mod frame {
     pub const AVX_HIGH: u32 = 0xc0;
     /// Guest-state fields `(offset, bytes)` admitted code may read through x28: the segment bases, the RFLAGS bytes
     /// above, the x87 state (I6) and the YMM upper halves (I8). MXCSR is the bank's. Every other x28 access is refused.
-    pub const GUEST_STATE: [(u32, u32); 14] = [
-        (AVX_HIGH, 256), (GS_BASE, 8), (FS_BASE, 8), (FLAGS + 8, 3), (FLAGS + 12, 1), (FLAGS + 14, 1), (FLAGS + 16, 6),
+    pub const GUEST_STATE: [(u32, u32); 16] = [
+        (TSC_OFFSET, 8), (AVX_HIGH, 256), (GS_BASE, 8), (FS_BASE, 8), (FLAGS + 8, 3), (FLAGS + 12, 1), (FLAGS + 14, 1), (FLAGS + 16, 6), (EVENT_PENDING, 1),
         (X87_IE, 1), (SIMD_FLAGS, 2), (X87_PE, 2), (X87_C0, 4), (X87_C3, 1), (X87_MM, 128), (X87_FCW, 8),
     ];
-    /// The fields admitted code may also write: DF, the x87 state but FCW, and the YMM upper halves. TF, IF, IOPL, NT, AC, VIF,
-    /// VIP and ID are the resident's, and so is FCW (FLDCW, FNINIT, FLDENV, FRSTOR are transactions).
+    /// The fields admitted code may also write: DF, the x87 state but FCW, and the YMM upper halves. TF, IOPL, NT, AC, VIF,
+    /// VIP and ID are the resident's, and so is FCW (FLDCW, FNINIT, FLDENV, FRSTOR are transactions); IF too but in a CPL-0
+    /// block's CLI and STI ([`IF`]).
     pub const GUEST_STATE_WRITABLE: [(u32, u32); 9] =
         [(AVX_HIGH, 256), (DF, 1), (X87_IE, 1), (SIMD_FLAGS, 2), (X87_PE, 2), (X87_C0, 4), (X87_C3, 1), (X87_MM, 128), (X87_FTW, 6)];
     pub const BYTES: usize = 4096;
@@ -2294,7 +2309,14 @@ mod tests {
         assert!([frame::SIMD_FLAGS, frame::X87_PENDING].iter().all(|&b| inside(&frame::GUEST_STATE_WRITABLE, b)));
         // I8: FEX's avx_high[16][2] (the pinned CPUState), readable and writable, nothing around it.
         assert!((frame::AVX_HIGH..frame::AVX_HIGH + 256).all(|b| inside(&frame::GUEST_STATE_WRITABLE, b)));
-        assert!(!inside(&frame::GUEST_STATE, frame::AVX_HIGH - 1) && !inside(&frame::GUEST_STATE, frame::AVX_HIGH + 256));
+        assert!(!inside(&frame::GUEST_STATE, frame::AVX_HIGH + 256));
+        // Perf chunk 15: the TSC offset right below them (FEX's `_pad1`), readable, never writable; the event-pending byte
+        // (flags[22]) likewise; nothing below the offset.
+        assert_eq!((frame::TSC_OFFSET + 8, frame::EVENT_PENDING), (frame::AVX_HIGH, 0x406));
+        for at in [frame::TSC_OFFSET, frame::TSC_OFFSET + 7, frame::EVENT_PENDING] {
+            assert!(inside(&frame::GUEST_STATE, at) && !inside(&frame::GUEST_STATE_WRITABLE, at), "{at:#x}");
+        }
+        assert!(!inside(&frame::GUEST_STATE, frame::TSC_OFFSET - 1) && !inside(&frame::GUEST_STATE_WRITABLE, frame::IF));
     }
 
     /// I6: x87 arithmetic runs under MXCSR's FPCR when FCW.RC equals MXCSR.RC and neither FTZ nor DAZ is set, else under its own.

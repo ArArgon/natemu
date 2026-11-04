@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """K2 checks: system instructions run from the decoded record kept in the code cache (boot-features plan, K2).
 
-    tools/with-env python3 tools/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence,rollback,nopruns] [--n 100000] [--reps 3]
+    tools/with-env python3 tools/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence,rollback,nopruns,tsc] [--n 100000] [--reps 3]
         [--xmc-rewrites N] [--host HOST --runtime RUNTIME]
 
 - `cost`: microseconds per loop iteration of one system instruction (CLI, STI, PUSHFQ+POPFQ, SWAPGS, RDTSC, CPUID,
@@ -20,6 +20,8 @@
   state unchanged (see `rollback`).
 - `nopruns` (perf chunk 12): a kept run of no-operation instructions crossing into a page made not present, then remapped,
   and rewritten by a peer vCPU, at 1-4 vCPUs (see `nopruns`).
+- `tsc` (perf chunk 15): RDTSC translated inline at CPL 0 agrees with the resident's RDTSCP (one clock), follows a WRMSR of
+  the TSC, and never runs backwards across vCPUs (see `tsc`).
 
 Writes DIR/k2.json; exit status 1 on any failure."""
 import argparse, json, pathlib, statistics, subprocess, sys, time
@@ -37,6 +39,8 @@ OBS_IF = 'pushfq\npop rax\nshr eax, 9\nand eax, 1'
 COSTS = {
     'cli': ('cli', {}),
     'sti': ('sti', {}),
+    # Perf chunk 15: STI mid-block at CPL 0 is translated inline (the row above starts its block: the resident's).
+    'nop_sti': ('nop\nsti', {}),
     'popf': ('pushfq\npopfq', {}),
     'swapgs': ('swapgs', {}),
     'rdtsc': ('rdtsc', {}),
@@ -234,16 +238,19 @@ def coherence(a, report):
     XC, P2, P2NEW = 0x1ffffe, 0x200000, 0x230000
     IF = lambda c: int(c['rflags'], 16) & 0x200 != 0
     gpr = lambda c, n: int(c['gpr'][n], 16)
+    # Perf chunk 15: the probed CLI/STI carry a 66 prefix (ignored), which keeps them the resident's at CPL 0 (fexc translates
+    # only the one-byte forms inline); the rewrites change their opcode byte, the second.
+    cli, sti = bytes.fromhex('66fa'), bytes.fromhex('66fb')
     cases = [  # name, vCPUs [(address, code, items)], memory, judge, (old kind, decoded once)
-        ('A-own-write-other-page', [(CODE1, asm(cr3 + go(X, 0) + go(X, 1) + f'mov byte ptr [{X:#x}], 0xfb\n' + go(X, 2)), [])],
-         tables({}) + [(X, asm('cli') + JMP)], IF, 0x40),
-        ('B-own-write-same-page', [(CODE1, asm(cr3 + 'mov ecx, 4\n1: x: cli\ncmp ecx, 2\njne 2f\nmov byte ptr [rip + x], 0xfb\n2: dec ecx\njnz 1b\n'), [])],
+        ('A-own-write-other-page', [(CODE1, asm(cr3 + go(X, 0) + go(X, 1) + f'mov byte ptr [{X + 1:#x}], 0xfb\n' + go(X, 2)), [])],
+         tables({}) + [(X, cli + JMP)], IF, 0x40),
+        ('B-own-write-same-page', [(CODE1, asm(cr3 + 'mov ecx, 4\n1: .byte 0x66\nx: cli\ncmp ecx, 2\njne 2f\nmov byte ptr [rip + x], 0xfb\n2: dec ecx\njnz 1b\n'), [])],
          tables({}), IF, 0x40),
         *[(f'C-remap-{n}', [(CODE1, asm(cr3 + go(L, 0) + go(L, 1) + f'mov rax, {F2 | LEAF:#x}\nmov qword ptr [{pte(L):#x}], rax\n' + change + go(L, 2)), [])],
-           tables({L: F1 | LEAF}) + [(F1, asm('cli') + JMP), (F2, asm('sti') + JMP)], IF, 0x40)
+           tables({L: F1 | LEAF}) + [(F1, cli + JMP), (F2, sti + JMP)], IF, 0x40)
           for n, change in (('invlpg', f'mov rax, {L:#x}\ninvlpg [rax]\n'), ('cr3', cr3))],
-        ('D-alias-write', [(CODE1, asm(cr3 + go(X, 0) + go(X, 1) + f'mov byte ptr [{ALIAS:#x}], 0xfb\n' + go(X, 2)), [])],
-         tables({ALIAS: X | LEAF}) + [(X, asm('cli') + JMP)], IF, 0x40),
+        ('D-alias-write', [(CODE1, asm(cr3 + go(X, 0) + go(X, 1) + f'mov byte ptr [{ALIAS + 1:#x}], 0xfb\n' + go(X, 2)), [])],
+         tables({ALIAS: X | LEAF}) + [(X, cli + JMP)], IF, 0x40),
         ('E-crossing-second-page', [(CODE1, asm(cr3 + go(XC, 0) + go(XC, 1) + f'mov rax, {P2NEW | LEAF:#x}\nmov qword ptr [{pte(P2):#x}], rax\n'
                                                 f'mov rax, {P2:#x}\ninvlpg [rax]\nmov rcx, 0x5555\n' + go(XC, 2)
                                                 + 'mov r10, rcx\nmov ecx, 0xc0000101\nrdmsr\nmov r9, rax\n'), ['gsbase 0x1234'])],
@@ -252,13 +259,13 @@ def coherence(a, report):
          lambda c: gpr(c, 9) == 0x1234 and gpr(c, 10) != 0x5555, 0x22),     # two SWAPGS, then RDTSCP (RCX := TSC_AUX)
         *[(f'F-peer-then-cpuid-{r}', [(CODE1, asm(cr3 + f'1:\nlea r13, [rip + 2f]\nmov rax, {X:#x}\njmp rax\n2: inc qword ptr [{FLAG + 8:#x}]\n'
                                                   f'cmp byte ptr [{FLAG:#x}], 0\nje 1b\nxor eax, eax\ncpuid\n' + go(X, 9)), []),
-                                       (CODE1 + 0x4000, asm(cr3 + f'1: cmp qword ptr [{FLAG + 8:#x}], 1000\njb 1b\nmov byte ptr [{X:#x}], 0xfb\n'
+                                       (CODE1 + 0x4000, asm(cr3 + f'1: cmp qword ptr [{FLAG + 8:#x}], 1000\njb 1b\nmov byte ptr [{X + 1:#x}], 0xfb\n'
                                                             f'mov byte ptr [{FLAG:#x}], 1\n'), [])],
-           tables({}) + [(X, asm('cli') + JMP), (FLAG, bytes(16))], IF, 0x40) for r in range(3)],
+           tables({}) + [(X, cli + JMP), (FLAG, bytes(16))], IF, 0x40) for r in range(3)],
         # Perf chunk 12: a run of NOPs before CLI, kept as one NOP_RUN record; its own write turns the second NOP into STC:
         # the next visit runs STC (CF = 1), not the kept run.
         ('G-nop-run-own-write', [(CODE1, asm(cr3 + go(X, 0) + go(X, 1) + f'mov byte ptr [{X + 1:#x}], 0xf9\nclc\n' + go(X, 2)), [])],
-         tables({}) + [(X, asm('nop\nnop\nxchg ax, ax\ncli') + JMP)], lambda c: int(c['rflags'], 16) & 1 == 1, 0x79),
+         tables({}) + [(X, asm('nop\nnop\nxchg ax, ax') + cli + JMP)], lambda c: int(c['rflags'], 16) & 1 == 1, 0x79),
     ]
     for block in (None, 1):
         for name, cpus, memory, judge, old in cases:
@@ -336,11 +343,11 @@ def nopruns(a, report):
     a page and across vCPUs, at 1-4 vCPUs (each its own run, one shared table: `coherence`'s) and block sizes default and 1.
     Judged by the SDM (natemu only: the outcome is fixed by the architecture, so no QEMU run is needed to judge it).
     - `cross`: vCPU i's run `nop; nop; nop; nop dword [rax]` from A - 4 (A = 0x2a1000 + 0x4000i), the 0F 1F 00 crossing into
-      page A, then `nop; cli; jmp r13`, run twice (kept); A made not present (PTE P = 0) and INVLPGed: the next visit runs
+      page A, then `nop; cli; jmp r13` (CLI with a 66 prefix since perf chunk 15: the resident's), run twice (kept); A made not present (PTE P = 0) and INVLPGed: the next visit runs
       the three NOPs and takes #PF at the crossing NOP (SDM Vol.3 4.7: RIP A - 1, CR2 = A, error code 0x10: a supervisor
       fetch, NXE), whose handler restores the PTE and returns (the run completes); a visit more; then A remapped (PTE to
       another frame whose third byte is STC, not NOP) and INVLPGed: after CLC the next visit sets CF (the new bytes).
-    - `peer`: vCPU j visits its run X_j (`nop; nop; xchg ax, ax; cli; jmp r13`) in a loop until vCPU (j + 1) % N has made
+    - `peer`: vCPU j visits its run X_j (`nop; nop; xchg ax, ax; cli; jmp r13`, the 66-prefixed CLI) in a loop until vCPU (j + 1) % N has made
       its second NOP STC and raised j's flag (only after j's 1,000th visit), and j has done the same for vCPU (j - 1) % N;
       then CPUID (serializing), CLC and one visit: CF must be 1 (SDM Vol.3 9.1.3, cross-modifying code; at N = 1 the
       vCPU's own write).
@@ -358,9 +365,9 @@ def nopruns(a, report):
     gate = (handler & 0xffff | 0x08 << 16 | 1 << 32 | 0x8e << 40 | (handler >> 16 & 0xffff) << 48).to_bytes(8, 'little') + (handler >> 32).to_bytes(8, 'little')
     idt_items = [(idt, bytes(16 * 14) + gate), (idtr, (15 * 16 - 1).to_bytes(2, 'little') + idt.to_bytes(8, 'little'))]
     page = lambda i: 0x2a1000 + 0x4000 * i                        # A; its alternative frame A + 0x1000
-    tail, tail_new = bytes.fromhex('1f0090fa41ffe5'), bytes.fromhex('1f00f9fa41ffe5')
+    tail, tail_new = bytes.fromhex('1f009066fa41ffe5'), bytes.fromhex('1f00f966fa41ffe5')   # (66 fa: the resident's CLI, chunk 15)
     x_at, count, flag = (lambda j: 0x11a000 + 0x1000 * j), (lambda j: 0x2b8000 + 0x40 * j), (lambda j: 0x2b8008 + 0x40 * j)
-    run = asm('nop\nnop\nxchg ax, ax\ncli\njmp r13')
+    run = asm('nop\nnop\nxchg ax, ax') + bytes.fromhex('66fa') + asm('jmp r13')
 
     def cross(i, n):
         A = page(i)
@@ -406,11 +413,69 @@ def nopruns(a, report):
     return failures
 
 
+def tsc(a, report):
+    """Perf chunk 15: RDTSC at CPL 0 is translated inline (no decode of it); its value is the resident's TSC (SDM Vol.2 RDTSC:
+    EDX:EAX, the upper halves zero; Vol.3 18.17: the TSC MSR's write moves it; one invariant, synchronized TSC), judged in the
+    guest and here, at block sizes default and 1:
+    - `one`: 2,000 alternations of an inline RDTSC and the resident's RDTSCP never decrease (r9 counts decreases), and every
+      value lies on one lattice floor(V x 125 / 3) + offset (TSC 1 GHz from the 24 MHz count V; the guest records each value
+      mod 125 in r12:r13, which must fit {o, o + 41, o + 83} for one o); then WRMSR TSC := X and RDTSC (r14) is in
+      [X, X + 10^9).
+    - `ring`: N = 2..4 vCPUs pass a token 2,000 times each; its holder's inline RDTSC must not be below the previous holder's
+      (r9 counts the decreases; x86-TSO message passing: the value is read after the token is seen)."""
+    asm, failures, runs = ref.assemble, [], []
+    X = 0x0123_4567_89ab_cdef
+    one = asm(f'''xor r9d, r9d\nxor r10d, r10d\nxor r12d, r12d\nxor r13d, r13d\nmov r8, 2000
+1: rdtsc\nshl rdx, 32\nor rax, rdx\ncmp rax, r10\njae 2f\ninc r9
+2: mov r10, rax\ncall residue\nrdtscp\nshl rdx, 32\nor rax, rdx\ncmp rax, r10\njae 3f\ninc r9
+3: mov r10, rax\ncall residue\ndec r8\njnz 1b
+mov ecx, 0x10\nmov eax, {X & 0xffffffff:#x}\nmov edx, {X >> 32:#x}\nwrmsr\nrdtsc\nshl rdx, 32\nor rax, rdx\nmov r14, rax\njmp done
+residue: xor edx, edx\nmov ecx, 125\ndiv rcx\ncmp edx, 64\njae 4f\nbts r12, rdx\nret
+4: sub edx, 64\nbts r13, rdx\nret
+done:''')
+    for block in (None, 1):
+        text = f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {one.hex()}\ncpl 0\nif 0\nregion 0x3e0000 0x10000\n'
+        _, out, err = driver(a, text, a.out / 'tsc' / f'one-{block}', [block] if block else [])
+        problems = [] if out else [f'driver: {err}']
+        if out:
+            g = [int(v, 0) for v in out['gpr']]
+            seen = {r for r in range(125) if (g[12] | g[13] << 64) >> r & 1}
+            if out['stop'] != 'reached': problems.append(f"stop {out['stop']} {out['reason']}")
+            if g[9]: problems.append(f'{g[9]} decreases')
+            if not any(seen <= {o % 125, (o + 41) % 125, (o + 83) % 125} for o in range(125)): problems.append(f'values off one lattice: residues {sorted(seen)}')
+            if not X <= g[14] < X + 10**9: problems.append(f'after WRMSR TSC := {X:#x}: {g[14]:#x}')
+            if out['stats']['decodes'].get('0x8'): problems.append(f"RDTSC decoded {out['stats']['decodes']['0x8']} times: not inline")
+        runs.append({'case': 'one', 'block': block, 'ok': not problems, 'problems': problems})
+        print(json.dumps(runs[-1]), flush=True)
+        if problems: failures.append(f'tsc one block={block}: {problems}')
+    turn, last, code_at = 0x2b8000, 0x2b8040, (lambda i: 0x110000 + 0x1000 * i)
+    for n in (2, 3, 4):
+        made = [asm(f'''xor r9d, r9d\nmov r8, 2000
+1: mov rax, [{turn:#x}]\ncmp rax, {i}\njne 1b\nrdtsc\nshl rdx, 32\nor rax, rdx\ncmp rax, [{last:#x}]\njae 2f\ninc r9
+2: mov [{last:#x}], rax\nmov qword ptr [{turn:#x}], {(i + 1) % n}\ndec r8\njnz 1b''') for i in range(n)]
+        lines = ['identity'] + [f'body {code_at(i):#x} {c.hex()}' for i, c in enumerate(made)] + [f'memory {turn:#x} {bytes(0x80).hex()}']
+        for i in range(n):
+            lines += ['cpu', f'rip {code_at(i):#x}', 'cpl 0', 'if 0']
+        for block in (None, 1):
+            _, out, err = driver(a, '\n'.join(lines) + '\n', a.out / 'tsc' / f'ring-{n}-{block}', [block] if block else [])
+            problems = [] if out else [f'driver: {err}']
+            for i, c in enumerate(out['cpus'] if out else []):
+                g = [int(v, 0) for v in c['gpr']]
+                if c['stop'] != 'reached': problems.append(f"cpu{i} stop {c['stop']} {c['reason']}")
+                if g[9]: problems.append(f'cpu{i}: {g[9]} decreases')
+                if c['stats']['decodes'].get('0x8'): problems.append(f'cpu{i}: RDTSC decoded: not inline')
+            runs.append({'case': 'ring', 'vcpus': n, 'block': block, 'ok': not problems, 'problems': problems})
+            print(json.dumps(runs[-1]), flush=True)
+            if problems: failures.append(f'tsc ring vcpus={n} block={block}: {problems}')
+    report['tsc'] = {'runs': runs, 'failures': failures}
+    return failures
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
-    ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns'])
+    ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc'])
     ap.add_argument('--n', type=int, default=100_000)
     ap.add_argument('--reps', type=int, default=3)
     ap.add_argument('--xmc-rewrites', type=int, default=2000, help='xmc: rewrites, each checked (one per XMC_K or more iterations of vCPU 0)')
@@ -426,6 +491,7 @@ def main():
     if 'coherence' in a.only: failures += coherence(a, report)
     if 'rollback' in a.only: failures += rollback(a, report)
     if 'nopruns' in a.only: failures += nopruns(a, report)
+    if 'tsc' in a.only: failures += tsc(a, report)
     (a.out / 'k2.json').write_text(json.dumps(report, indent=1) + '\n')
     for f in failures: print('FAIL', f)
     sys.exit(1 if failures else 0)

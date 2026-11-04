@@ -61,6 +61,21 @@ mod tests {
     /// The M4's CNTFRQ and other rates a host could report.
     const RATES: [u64; 5] = [24_000_000, 19_200_000, 25_000_000, 1_000_000_000, 54_000_000];
 
+    /// Perf chunk 15: fexc patch 0032's inline RDTSC (a 24 MHz count): V = 3a + r with a = umulh(V, 0xAAAA..AB) >> 1,
+    /// then 125a + 41r + (r >> 1), all modulo 2^64, is [`tsc`]'s floor(V x 1e9 / 24e6) for every V.
+    #[test]
+    fn inline_tsc_formula_is_exact() {
+        let inline = |v: u64| {
+            let a = ((u128::from(v) * 0xAAAA_AAAA_AAAA_AAAB) >> 64) as u64 >> 1;
+            let r = v.wrapping_sub(a.wrapping_mul(3));
+            a.wrapping_mul(125).wrapping_add(r.wrapping_mul(41).wrapping_add(r >> 1))
+        };
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let edges = (0..10_000u64).chain((0..64).flat_map(|b| [1u64 << b, (1u64 << b) - 1, (1u64 << b) + 1])).chain([u64::MAX, u64::MAX - 1, u64::MAX - 2]);
+        for v in edges.chain((0..1_000_000).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x })) {
+            assert_eq!(inline(v), tsc(v, 24_000_000), "{v:#x}");
+        }
+    }
     #[test]
     fn profile_rates() {
         assert_eq!(CRYSTAL_HZ, 24_000_000);

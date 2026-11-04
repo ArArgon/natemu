@@ -762,7 +762,7 @@ impl Answer {
     }
 }
 /// The number of fexc's gating arguments (`FEXC_ARG_*`, [`Compiler::gating`]).
-const GATING: usize = 8;
+const GATING: usize = 10;
 /// The memory cache's key (perf chunk 4): the block limit, the RIP's half (bit 63) and page offset, and the first bytes the
 /// answer read (at most [`LEAD`], with their count): an answer is found at every RIP of that half and offset. As words
 /// ([`Universal`]); no limit is `1 << 32`.
@@ -1038,6 +1038,12 @@ pub struct Compiler {
     /// The vCPU's x87 gating and rounding (I6, [`x87_args`]) and its unmasked floating-point exceptions (I5c): fexc's
     /// `--x87-gated`, `--wait-gated`, `--x87-fpcr`, `--simd-unmasked` and `--x87-unmasked` arguments.
     pub(crate) x87: Vec<String>,
+    /// Perf chunk 15: a translate request at CPL 0 (never a step): fexc's `--cpl0`, under which it translates the one-byte
+    /// CLI and STI inline (the CPL is part of `Cpu::code_context`, so such a block runs only at CPL 0).
+    pub(crate) cpl0: bool,
+    /// Perf chunk 15: a CPL-0 translate request on a host whose counter runs at 24 MHz ([`crate::clock::frequency`], fexc's
+    /// `--tsc`): RDTSC is translated inline with the resident's formula for that rate.
+    pub(crate) tsc: bool,
     /// The performance log's record of this vCPU (`perf::on`; [`Compiler::finish`]).
     pub perf: Option<Box<crate::perf::Recorder>>,
     /// The last compile's answer: how many guest bytes it read (fexc's extent, at most the bytes given), and whether a
@@ -1108,7 +1114,7 @@ impl Compiler {
         Self { fexc: fexc.into(), server: None, supported, max_instructions, answers: Answers::new(supported), vcpu: 0, disk: None, compiles: 0, hits: 0, disk_hits: 0,
                hits_by_source: [0; cache::MAX_VCPUS], duplicates: 0, lock_wait: (0, 0),
                relocated: 0, relocation_refused: 0, relocation_fallbacks: 0, reuse_checks: 0, check_reuse: false,
-               deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![], perf: None, read: 0, halved: false }
+               deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![], cpl0: false, tsc: false, perf: None, read: 0, halved: false }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
     /// `rip` the resident executes, or fexc's end reason when it produced no code.
@@ -1134,8 +1140,8 @@ impl Compiler {
             }
         }
     }
-    /// The gating arguments' values, in fexc's `FEXC_ARG_*` order: SSE, AVX, alignment, x87, WAIT, x87 FPCR, and (I5c) the
-    /// unmasked SIMD and x87 exceptions.
+    /// The gating arguments' values, in fexc's `FEXC_ARG_*` order: SSE, AVX, alignment, x87, WAIT, x87 FPCR, (I5c) the
+    /// unmasked SIMD and x87 exceptions, and (perf chunk 15) CPL 0 and the inline TSC.
     fn gating(&self) -> [u64; GATING] {
         let flag = |a: &str| u64::from(self.x87.iter().any(|x| x == a));
         let value = |a: &str| {
@@ -1143,7 +1149,7 @@ impl Compiler {
             v.and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0)
         };
         [self.sse_gated.into(), self.avx_gated.into(), self.alignment_gated.into(), flag("--x87-gated"), flag("--wait-gated"),
-         value("--x87-fpcr"), value("--simd-unmasked"), value("--x87-unmasked")]
+         value("--x87-fpcr"), value("--simd-unmasked"), value("--x87-unmasked"), self.cpl0.into(), self.tsc.into()]
     }
     /// [`Compiler::compile`] with an instruction limit; `Err((n, why))`: the object must be translated again with fewer
     /// than its n guest instructions ([`admission::retry`]).
@@ -1266,7 +1272,7 @@ impl Compiler {
                 Some(n) => Err(n),
                 None => {
                     #[cfg_attr(not(feature = "testing"), allow(unused_mut))]
-                    let mut admitted = admission::admit(object, rip, bytes, self.supported, self.shape)?;
+                    let mut admitted = admission::admit(object, rip, bytes, self.supported, self.shape, self.cpl0)?;
                     #[cfg(feature = "testing")]
                     hook.admitted(&mut admitted.object);
                     Ok(Code::Block(admitted))
@@ -1335,6 +1341,12 @@ impl Compiler {
             args.push("--alignment-gated".into());
         }
         args.extend(self.x87.iter().cloned());
+        if self.cpl0 {
+            args.push("--cpl0".into());
+        }
+        if self.tsc {
+            args.push("--tsc".into());
+        }
         let args: Vec<u8> = args.iter().flat_map(|a| a.bytes().chain([0])).collect();
         let mut body = (args.len() as u32).to_le_bytes().to_vec();
         body.extend(args);
@@ -1813,6 +1825,8 @@ fn translation(
         compiler.avx_gated = avx_gated(&state.cpu);
         compiler.x87 = x87_args(&state.cpu);
         compiler.alignment_gated = state.cpu.bit_tests_cut() && !(step && state.plain_step != 0);
+        compiler.cpl0 = state.cpu.cpl == 0 && !step;
+        compiler.tsc = compiler.cpl0 && crate::clock::frequency() == 24_000_000;
         let code = compiler.compile(&bytes, rip, step, hook)?;
         match &code {
             // The instruction at RIP runs past a breakpoint the bytes were cut at.
@@ -1938,7 +1952,7 @@ mod tests {
     fn shared_answers_keep_colliding_keys_apart() {
         let a = Answers::new(u64::MAX);
         let g = [0; GATING];
-        let sse = [1, 0, 0, 0, 0, 0, 0, 0];
+        let sse = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         a.insert(None, entry(0x1100, 0, &[1, 2, 3, 4, 5], 0, g), &[1, 2, 3, 4, 5], 0x1100);
         a.insert(None, entry(0x2100, 1, &[1, 2, 3, 4, 6], 0, g), &[1, 2, 3, 4, 6], 0x2100);
         a.insert(None, entry(0x3100, 2, &[1, 2, 3, 4, 7], 1, sse), &[1, 2, 3, 4, 7], 0x3100); // read SSE gating 1
@@ -2126,6 +2140,51 @@ mod tests {
         c.sse_gated = false;
         object(&mut c, &movaps, 0x2000);
         assert_eq!((c.compiles, c.hits), (5, 2));
+    }
+
+    /// With `FEXC` set (perf chunk 15): at CPL 0 the one-byte CLI is translated inline anywhere and STI where it is neither
+    /// the first nor the last instruction of its block (its exit to its own RIP a link point); a prefix, a following system
+    /// instruction, REP string or LOCK NEG keeps it the resident's; a CPL-3 request cuts both, and never reuses a CPL-0
+    /// answer that read the flag; admission refuses the inline forms outside a CPL-0 block.
+    #[test]
+    fn cpl0_translates_cli_and_sti_inline() {
+        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        (c.shape, c.cpl0) = (true, true);
+        let block = |c: &mut super::Compiler, code: &[u8]| match c.compile(code, 0x1000, false, &mut ()).unwrap() {
+            Code::Block(b) => Ok(b),
+            Code::System(s) => Err(s.kind),
+            Code::None(r) => panic!("{r}"),
+        };
+        let inline = block(&mut c, &[0x90, 0xfa, 0xfb, 0x48, 0xff, 0xc0, 0xc3]).unwrap(); // nop; cli; sti; inc rax; ret
+        assert_eq!(inline.guest_insns, 5);
+        assert!(inline.links.iter().any(|p| p.target == 0x1002), "the STI's exit to its own RIP");
+        assert_eq!(block(&mut c, &[0xfa, 0xc3]).unwrap().guest_insns, 2); // CLI first
+        assert_eq!(block(&mut c, &[0x90, 0xfb, 0xfa, 0xc3]).unwrap().guest_insns, 4); // sti; cli
+        assert_eq!(block(&mut c, &[0xfb, 0x90, 0xc3]).err(), Some(exec::system::STI)); // STI first
+        for kept in [&[0x90, 0xfb, 0xf4][..], &[0x90, 0xfb, 0xf3, 0xaa], &[0x90, 0xfb, 0xf0, 0xf7, 0x18], &[0x90, 0x66, 0xfb, 0x90, 0xc3], &[0x90, 0xfb]] {
+            assert_eq!(block(&mut c, kept).unwrap().guest_insns, 1, "{kept:02x?}"); // sti; hlt / rep stosb / lock neg / 66 sti / last
+        }
+        // RDTSC with `--tsc` (CPL 0, a 24 MHz counter), first or not; with REX, or without the flag, the resident's.
+        c.tsc = true;
+        assert_eq!(block(&mut c, &[0x0f, 0x31, 0xc3]).unwrap().guest_insns, 2);
+        assert_eq!(block(&mut c, &[0x90, 0x0f, 0x31, 0xfb, 0x90, 0xc3]).unwrap().guest_insns, 5); // rdtsc; sti inline too
+        assert_eq!(block(&mut c, &[0x48, 0x0f, 0x31, 0xc3]).err(), Some(exec::system::RDTSC));
+        let Answer::Object(o) = c.answers.find(&[0x0f, 0x31, 0xc3], 0x1000, None, &c.gating()).0.unwrap().answer.clone() else { panic!() };
+        assert!(admission::admit(&o, 0x1000, &[0x0f, 0x31, 0xc3], u64::MAX, true, false).err().unwrap().contains("RDTSC"));
+        // A vCPU without FEAT_ECV (feature 22, `ecv`): fexc reads the count by `isb; mrs cntvct_el0`, admitted with the shape.
+        let mut d = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX & !(1 << 22), None);
+        (d.shape, d.cpl0, d.tsc) = (true, true, true);
+        assert_eq!(block(&mut d, &[0x0f, 0x31, 0xc3]).unwrap().guest_insns, 2);
+        c.tsc = false;
+        assert_eq!(block(&mut c, &[0x0f, 0x31, 0xc3]).err(), Some(exec::system::RDTSC));
+        c.cpl0 = false;
+        assert_eq!(block(&mut c, &[0x90, 0xfa, 0xfb, 0x48, 0xff, 0xc0, 0xc3]).unwrap().guest_insns, 1);
+        assert_eq!(block(&mut c, &[0xfa, 0xc3]).err(), Some(exec::system::CLI));
+        let Answer::Object(o) = c.answers.find(&[0x90, 0xfa, 0xfb, 0x48, 0xff, 0xc0, 0xc3], 0x1000, None, &{ let mut g = c.gating(); g[8] = 1; g[9] = 0; g }).0.unwrap().answer.clone() else { panic!() };
+        let source = [0x90, 0xfa, 0xfb, 0x48, 0xff, 0xc0, 0xc3];
+        assert!(admission::admit(&o, 0x1000, &source, u64::MAX, true, true).is_ok());
+        assert!(admission::admit(&o, 0x1000, &source, u64::MAX, false, false).err().unwrap().contains("CLI/STI"));
     }
 
     /// With `FEXC` set (perf chunk 4): answers are reused at other RIPs of the same half and page offset, under the reuse

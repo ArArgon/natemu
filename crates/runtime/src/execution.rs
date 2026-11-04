@@ -935,11 +935,14 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
     }
     // I6: FCW, which FNSTCW reads there; like the bases, never read back.
     unsafe { (FRAME_VA as *mut u16).byte_add(frame::X87_FCW as usize).write_volatile(s.cpu.fcw as u16) };
+    // Perf chunk 15: the TSC offset an inline RDTSC adds ([`tsc`]); never read back (WRMSR of the TSC is a transaction).
+    unsafe { (FRAME_VA as *mut u64).byte_add(frame::TSC_OFFSET as usize).write_volatile(msr_get(cpu::msr(cpu::MSR_TSC).unwrap())) };
     // I5c: the SIMD flag byte (banked into MXCSR at every resident entry) and the x87 instruction's pending flags (an
     // instruction that did not complete leaves its own there) start empty.
     for at in [frame::SIMD_FLAGS, frame::X87_PENDING] {
         unsafe { (FRAME_VA as *mut u8).add(at as usize).write_volatile(0) };
     }
+    post_pending(s, true);
     // The frame generated code is entered with, built in place: these fields are written unconditionally at every
     // entry (never on some paths only: the zero check cannot see a stale one), and nothing writes the others, so they stay zero (zeroed at `start`; the host checks it at every stop, `entry_frame_rest_zero`).
     let f = unsafe { &mut (*shared()).initial };
@@ -1070,6 +1073,7 @@ unsafe fn resume(s: &State, frame: *const NativeFrame, pc: u64, spsr: u64) -> ! 
         }
         cache::control().rearms += 1;
     }
+    post_pending(s, false);
     tables::select(s.cpu.cpl);
     crate::perf::enter(crate::perf::GUEST);
     unsafe { resume_exception(frame, pc, spsr, alignment_check(&s.cpu)) }
@@ -1165,6 +1169,8 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
     if !cache::arm(b) {
         bad(s)
     }
+    // Perf chunk 15: an inline STI later in this block sees the event and lets the resident run it (its shadow).
+    post_pending(&s, false);
     tables::select(s.cpu.cpl);
     unsafe {
         write_record(record(), &s);
@@ -1723,7 +1729,8 @@ fn msr_set(at: usize, value: u64) {
 /// The vCPU's TSC (L5, `natemu_abi::clock`): the profile's rate (`cpu_profile::TSC_HZ`, 1 GHz = the 24 MHz crystal x
 /// 125 / 3, CPUID.15H) from V = CNTVCT_EL0 at CNTFRQ_EL0, exactly, plus the vCPU's offset (the TSC MSR's slot: the host
 /// sets it from one CNTVCT sample shared by all vCPUs, so every TSC starts near 0 at VM creation and the vCPUs agree; a
-/// WRMSR of the TSC moves it).
+/// WRMSR of the TSC moves it). Perf chunk 15: a CPL-0 translation's inline RDTSC computes the same value at a 24 MHz count
+/// (fexc patch 0032; the offset from [`frame::TSC_OFFSET`], which [`enter`] writes).
 fn tsc() -> u64 {
     let (count, hz): (u64, u64);
     unsafe { asm!("isb", "mrs {c}, cntvct_el0", "mrs {f}, cntfrq_el0", c = out(reg) count, f = out(reg) hz) };
@@ -1747,18 +1754,36 @@ pub fn set_cpl(s: &mut State, cpl: u64) {
 
 /// Guest GPRs and arithmetic flags from the native state: the static-register map,
 /// PF/AF registers and `nzcv` (PSTATE layout) with the given CF inversion.
-/// DF from the guest-state page (`cld`/`std` write it; the other flag bytes are the bank's own, never written by code).
+/// DF and IF from the guest-state page (`cld`/`std` write DF; perf chunk 15: a CPL-0 block's inline CLI and STI write IF, any
+/// value but 0 being set; the other flag bytes are the bank's own, never written by code). Every exit and fault banks
+/// through here, and every entry ([`enter`]) writes both bytes from the bank, so the page holds the instruction stream's IF.
+/// IF only at CPL 0 (the CPL of the code that ran: no CPL changes inside a block): only CPL-0 blocks may write it, and a
+/// CPL-3 store into the page (the recorded deviation, `GUEST_STATE_VA`) must not change IF, which CPL 3 may not.
 fn bank(cpu: &mut Cpu, f: &NativeFrame, nzcv: u64, cf_inverted: bool) {
     let reg = |i: usize| f.x[SRA[i] as usize];
     for (i, value) in cpu.gpr.iter_mut().enumerate() {
         *value = reg(i);
     }
     // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA.
-    let df = frame::df(unsafe { (FRAME_VA as *const u8).add(frame::DF as usize).read_volatile() });
-    cpu.rflags = guest_flags(cpu.rflags, nzcv, reg(16), reg(17), cf_inverted) & !RFLAGS_DF | if df { RFLAGS_DF } else { 0 };
+    let byte = |at: u32| unsafe { (FRAME_VA as *const u8).add(at as usize).read_volatile() };
+    let df = if frame::df(byte(frame::DF)) { RFLAGS_DF } else { 0 };
+    let interrupts = if cpu.cpl != 0 { cpu.rflags & RFLAGS_IF } else if byte(frame::IF) != 0 { RFLAGS_IF } else { 0 };
+    cpu.rflags = guest_flags(cpu.rflags, nzcv, reg(16), reg(17), cf_inverted) & !(RFLAGS_DF | RFLAGS_IF) | df | interrupts;
     sse::bank(cpu, f);
 }
 const RFLAGS_DF: u64 = 1 << 10;
+const RFLAGS_IF: u64 = 1 << 9;
+/// Perf chunk 15: writes the event-pending byte ([`frame::EVENT_PENDING`], which an inline STI reads) before generated code
+/// runs: at every entry, resume and doorbell's return ([`enter`], [`resume`], [`interrupted`]). An event posted after it rings
+/// this vCPU's doorbell, which writes it again (or, past the STI, arms a stop at the block's next exit as for any event).
+/// `entry`: at [`enter`], whose bank is current: with IF set nothing is held, since every event a boundary with IF set may
+/// take was taken by [`find`]'s look at this boundary (the step block, entered with an event a shadow holds, has no inline
+/// STI: steps are compiled without `--cpl0`).
+fn post_pending(s: &State, entry: bool) {
+    let pending = u8::from(!(entry && s.cpu.rflags & RFLAGS_IF != 0) && events::held(s));
+    // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA; the byte lies inside it.
+    unsafe { (FRAME_VA as *mut u8).add(frame::EVENT_PENDING as usize).write_volatile(pending) };
+}
 /// An instruction completed: RF (an IRET's frame may set it) ends (SDM Vol.3 "RF": cleared after every instruction but
 /// IRET). Applied where the resident sees an instruction complete: a block's exit (linker, dispatcher miss or a stop in the
 /// dispatcher or L1, armed exit) and a committed system instruction; a stop at a block's entry or a fault at its first
