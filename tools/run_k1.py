@@ -32,6 +32,24 @@ These eight run at block sizes default and 1 and are compared with QEMU system m
 - `contexts` (natemu only, perf chunk 5): one block called through the dispatcher under six code contexts in turn (MXCSR
   masks, CR0.TS), more than the dispatcher's L1 tables: each runs, or takes #NM or #XM, by its own context only; then an
   INVLPG, a code write and a CR3 reload made under one context reach the block another context's table holds.
+Perf chunk 8 (links kept across TLB events):
+- `place-global` (natemu only): a block placed from a global page under CR4.PGE is global at once: V remapped with no
+  INVLPG and a CR3 reload, natemu keeps the old frame (the architecture allows either; r9 = 1 asserted); INVLPG: the new.
+  A block crossing from a global page into a non-global one placed, its second page remapped with no INVLPG, a CR3
+  reload: the new bytes (rsi = 0x200, required). PGE off: a block placed from a page with G set is not global (rbp = 1).
+- `invlpg-page` (natemu only): INVLPG of one 4 KiB page leaves the blocks and links of another page in its 2 MiB region:
+  three calls of N from one jump site (linked), N remapped with no INVLPG, INVLPG of V, three more calls through the kept
+  link run the old frame (r9 = 3; the architecture allows 3-6); INVLPG of N: the new.
+- `invlpg-large` (natemu only): code in a 2 MiB page, its PDE changed with no INVLPG of the code's page, INVLPG of another
+  4 KiB address in the large page: a load and the call both see the new frame (rbx = 0x22, r9 = 2; every TLB entry of the
+  large page goes, SDM Vol.3 4.10.4.1). QEMU 11.1.2 loads 0x22 but runs the old block (r9 = 1): its jump cache keeps it.
+- `cross-link`: `cross` through a direct jump from the first page into the crossing instruction: the link is not local (its
+  target has a page its source lacks) and goes at the INVLPG of the second page alone.
+- `local-gpa` (natemu only): a link from S into T on S's page made after the page was remapped with no INVLPG (S from F1,
+  T from F2); back to F1 with no INVLPG and a CR3 reload: S runs and must reach F1's T (r10 = 1): the link is not local.
+- `local-write`: V global (PGE), three linked calls R -> S -> T from one jump site R (S and T on V's page); INVLPG of V
+  (S -> T stays, local; R -> S goes); three calls; a CR3 reload (R -> S stays: S global); CPU (i + 1) % N rewrites T's
+  immediate (CPU i's own at N = 1) and the CPUs hand over (CPUID after): three calls from R must run the new bytes.
 - the independent review's adversarial programs (`adv_setup`: NX, SMEP and U/S changes, code remapping its own page,
   one frame at two linear addresses rewritten, global/non-global crossings, a fetch #PF then remap), against QEMU but
   `pf-fetch` (either outcome by the TLB rules).
@@ -74,7 +92,7 @@ def walk_at(i):
     return q, pte, q + pte - 2
 
 
-def bodies(k, i=0):
+def bodies(k, i=0, n=1):
     d = P.SYS_D(i)
     leaf = lambda va: P.sys_leaf(i, 0, va)
     put = lambda va, frame: f'    mov rax, {frame | P.LEAF:#x}\n    mov [{leaf(va):#x}], rax\n'
@@ -136,7 +154,80 @@ def bodies(k, i=0):
                      + '    mov rax, cr0\n    bts rax, 3\n    mov cr0, rax\n' + ctx_call(4, d, None) + '    clts\n'
                      + ''.join(ctx_call(5 + j, d, j + 2) for j in range(3)) + '    dec ecx\n    jnz .l\n'
                      + ctx_call(8, d, 0) + ctx_kept(i) + '    jmp .end\n' + CTX_HANDLERS + '.end:\n'),
+        **links_bodies(k, i, n),
     }
+
+
+def links_bodies(k, i, n):
+    """Perf chunk 8's programs (module docstring)."""
+    d = P.SYS_D(i)
+    leaf = lambda va: P.sys_leaf(i, 0, va)
+    put = lambda va, frame: f'    mov rax, {frame | P.LEAF:#x}\n    mov [{leaf(va):#x}], rax\n'
+    put_g = lambda va, frame: f'    mov rax, {frame | P.LEAF | G:#x}\n    mov [{leaf(va):#x}], rax\n'
+    inv = lambda va: f'    mov rax, {va:#x}\n    invlpg [rax]\n'
+    cr3 = '    mov rax, {ta:#x}\n    mov cr3, rax\n'
+    pge = lambda on: f'    mov rax, cr4\n    {"bts" if on else "btr"} rax, 7\n    mov cr4, rax\n'
+    to = lambda off: f'    lea r13, [rel .c{{tag}}]\n    jmp $$+{{{{Vrel:#x}}}}-0x234+{off:#x}\n.c{{tag}}:\n'
+    jump = lambda tag, off: to(off).format(tag=tag)
+    rounds = lambda tag, off, reg: ''.join(jump(f'{tag}{r}', off) + f'    add {reg}, rax\n' for r in range(3))
+    loop = lambda tag, reg: f'    mov ecx, 3\n.{tag}:\n    call .sub\n    add {reg}, rax\n    dec ecx\n    jnz .{tag}\n'
+    pde = lambda frame: f'    mov rax, {frame | 0x80 | P.LEAF:#x}\n    mov [{P.SYS_T(i, 0) + 0x2000 + 8 * (LP >> 21):#x}], rax\n'
+    j = (i + 1) % n
+    hand = (f'    mov qword [{FLAGS + 8 * i:#x}], 1\n.h1:\n    pause\n    cmp qword [{FLAGS + 8 * j:#x}], 1\n    jne .h1\n'
+            f'    mov byte [{P.SYS_D(j) + F1 + LW + 0x41:#x}], 3\n    mov qword [{FLAGS + 0x40 + 8 * j:#x}], 1\n'
+            f'.h2:\n    pause\n    cmp qword [{FLAGS + 0x40 + 8 * i:#x}], 1\n    jne .h2\n    xor eax, eax\n    cpuid\n'
+            '    xor ebx, ebx\n    xor ecx, ecx\n    xor edx, edx\n')
+    return {
+        'place-global': (pge(True) + call('g0') + '    mov r8, rax\n' + put_g(d, d + F2) + cr3 + call('g1') + '    mov r9, rax\n'
+                         + inv(d) + call('g2') + '    mov r10, rax\n'
+                         + call('g3', f'{d + 0x3ffe:#x}') + '    mov r12, rax\n' + put(d + 0x4000, d + XB) + cr3
+                         + call('g4', f'{d + 0x3ffe:#x}') + '    mov rsi, rax\n'
+                         + pge(False) + put_g(d, d + F3) + inv(d) + call('g5') + '    mov rdi, rax\n' + put_g(d, d + F1) + cr3
+                         + call('g6') + '    mov rbp, rax\n'),
+        # One jump site (`.sub`), so the second loop takes the link kept from the first.
+        'invlpg-page': ('    jmp .over\n.sub:\n' + to(NP).format(tag='s') + '    ret\n.over:\n' + loop('p0', 'r8') + put(d + NP, d + NP2) + inv(d)
+                        + loop('p1', 'r9') + inv(d + NP) + call('p2', f'{d + NP:#x}') + '    mov r10, rax\n'),
+        'invlpg-large': (call('l0', f'{LP + LX:#x}') + '    mov r8, rax\n' + pde(LF2) + inv(LP + 0x5000) + f'    mov rbx, [{LP + LX + 0x800:#x}]\n' + call('l1', f'{LP + LX:#x}')
+                         + '    mov r9, rax\n' + pde(LF1) + inv(LP + 0x1ff000) + call('l2', f'{LP + LX:#x}') + '    mov r10, rax\n'),
+        'cross-link': rounds('x0', 0x3f00, 'r8') + put(d + 0x4000, d + XB) + inv(d + 0x4000) + rounds('x1', 0x3f00, 'r9'),
+        'local-gpa': ('    xor r14d, r14d\n' + call('a0', f'{d + LS:#x}') + put(d, d + F2) + '    mov r14d, 1\n' + call('a1', f'{d + LS:#x}')
+                      + '    mov r9, rax\n' + put(d, d + F1) + cr3 + call('a2', f'{d + LS:#x}') + '    mov r10, rax\n'),
+        # One jump site (`.sub`) in every phase, so a link kept into a dead block would be taken.
+        'local-write': (pge(True) + '    jmp .over\n.sub:\n' + to(LW).format(tag='s') + '    ret\n.over:\n' + loop('w0', 'r8') + inv(d)
+                        + loop('w1', 'r9') + cr3 + hand + loop('w2', 'r10')),
+    }
+
+G = 0x100
+F3 = 0xf000                      # `place-global`: V's third frame (`mov eax, 3`)
+NP, NP2 = 0xd000, 0xe000         # `invlpg-page`: N (another page of V's 2 MiB region) and its second frame
+# `invlpg-large`: linear 2 MiB page LP (table A's PDE 2) maps frame LF1 or LF2 (the images end at 4 MiB); code at LP + LX
+LP, LF1, LF2, LX = 0x400000, 0x200000, 0x0, 0x1f1000
+LS = 0x100                       # `local-gpa`: S at V + LS (`test r14, r14; jnz T; jmp r13`), T at V + LS + 0x40
+LW = 0x200                       # `local-write`: S at V + LW (`jmp T`), T at V + LW + 0x40 (`mov eax, 1; jmp r13`)
+FLAGS = P.SYS_D(0) + 0xe000      # `local-write`: per CPU a ready word, then (+ 0x40) a written word
+
+
+def links_memory(name, i, n):
+    """The memory perf chunk 8's programs add for CPU i (code shared by every CPU only from CPU 0)."""
+    d = P.SYS_D(i)
+    code = lambda va, text: {'addr': f'0x{va:x}', 'data': P.asm(text).hex()}
+    if name == 'place-global':
+        return [{'addr': f'0x{d + F3:x}', 'data': CODE(3).hex()}]
+    if name == 'invlpg-page':
+        return [code(d + NP, 'mov eax, 1\njmp r13'), code(d + NP2, 'mov eax, 2\njmp r13')]
+    if name == 'invlpg-large':
+        return ([{'addr': f'0x{P.SYS_T(i, 0) + 0x2000 + 8 * (LP >> 21):x}', 'data': (LF1 | 0x80 | P.LEAF).to_bytes(8, 'little').hex(), 'capture': False}]
+                + ([code(LF1 + LX, 'mov eax, 1\njmp r13\ntimes 0x800-($-$$) nop\ndq 0x11'),
+                    code(LF2 + LX, 'mov eax, 2\njmp r13\ntimes 0x800-($-$$) nop\ndq 0x22')] if i == 0 else []))
+    if name == 'cross-link':
+        return [{'addr': f'0x{d + 0x3f00:x}', 'data': b'\xe9\xf9\x00\x00\x00'.hex()}]
+    if name == 'local-gpa':
+        s = lambda k: P.asm(f'test r14, r14\njnz $$+0x40\njmp r13\ntimes 0x40-($-$$) nop\nmov eax, {k}\njmp r13')
+        return [{'addr': f'0x{d + f + LS:x}', 'data': s(k).hex()} for k, f in ((1, F1), (2, F2))]
+    if name == 'local-write':
+        s = P.asm('jmp $$+0x40\ntimes 0x40-($-$$) nop\nmov eax, 1\njmp r13')
+        return [{'addr': f'0x{d + F1 + LW:x}', 'data': s.hex()}] + ([dict(P.zero(FLAGS, 0x100), capture=False)] if i == 0 else [])
+    return []
 
 IDT = 0x3000
 CX, CD = 0x9000, 0xa000                       # `contexts`: its code page and its MXCSR values (A, C, D, E, F)
@@ -183,6 +274,11 @@ EITHER = {
     'pf-remap': {'r8': {1}, 'r14': {1}, 'r9': {2}},
     # K rounds of five runs, one #NM and two #XM, then a last run under A.
     'contexts': lambda i, k: {'r8': {5 * k + 1}, 'r14': {k}, 'r15': {2 * k}, 'r9': {2}, 'r10': {3}, 'r12': {4}},
+    # Perf chunk 8: natemu's choice where the architecture allows either (r9 of `place-global`, `invlpg-page`, `local-gpa`).
+    'place-global': {'r8': {1}, 'r9': {1}, 'r10': {2}, 'r12': {0x100}, 'rsi': {0x200}, 'rdi': {3}, 'rbp': {1}},
+    'invlpg-page': {'r8': {3}, 'r9': {3}, 'r10': {2}},
+    'local-gpa': {'r9': {2}, 'r10': {1}},
+    'invlpg-large': {'r8': {1}, 'rbx': {0x22}, 'r9': {2}, 'r10': {1}},
 }
 
 
@@ -190,11 +286,13 @@ def program(name, n, k):
     out = {'format': 'natemu-smp-v1', 'name': f'k1-{name}@{n}', 'ncpu': n, 'system': True, 'bodies': [], 'cpus': [], 'memory': [], 'params': {}}
     for i in range(n):
         d = P.SYS_D(i)
-        a = {d: (d + F1) | P.LEAF | (0x100 if name == 'global' else 0), d + 0x4000: (d + XA) | P.LEAF}
+        a = {d: (d + F1) | P.LEAF | (0x100 if name in ('global', 'place-global', 'local-write') else 0), d + 0x4000: (d + XA) | P.LEAF}
+        if name == 'place-global':
+            a[d + 0x3000] = (d + 0x3000) | P.LEAF | G
         if name == 'straddle':
             a[0x200000] = (d + XA) | P.LEAF
         b = {d: (d + F2) | P.LEAF}
-        out['bodies'].append(P.body(P.SYS_CODE(i), P.sys_text(i, bodies(k, i)[name])))
+        out['bodies'].append(P.body(P.SYS_CODE(i), P.sys_text(i, bodies(k, i, n)[name])))
         out['cpus'].append(dict(P.cpu(i, P.SYS_CODE(i)), cpl=0))
         tb = P.sys_tables(i, 1, n, b)
         extra = []
@@ -221,7 +319,7 @@ def program(name, n, k):
                       {'addr': f'0x{d + CW1:x}', 'data': P.asm('mov eax, 2\njmp r13').hex()}, {'addr': f'0x{d + CW2:x}', 'data': P.asm('mov eax, 4\njmp r13').hex()}]
         out['memory'] += P.sys_tables(i, 0, n, a) + tb + [
             P.zero(d, 0x1000), {'addr': f'0x{d + F1:x}', 'data': CODE(1).hex()}, {'addr': f'0x{d + F2:x}', 'data': CODE(2).hex()},
-            {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + extra
+            {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + extra + links_memory(name, i, n)
     return out
 
 

@@ -2346,7 +2346,7 @@ address) and `GLOBAL` (every source leaf has G, with CR4.PGE). **TLB model** (pe
 keeps global entries, SDM Vol.3 4.10.4.1). Lookup takes a current candidate; any other is revalidated by a fetch walk of
 each source page (A bits set, as the CPU's TLB miss; a fault means no): on a match `checked` moves up and `GLOBAL` is
 recomputed, else the next candidate is tried, so blocks of other address spaces at the same RIP stay for when their
-mapping returns. New blocks start current and not global. A PTE change without invalidation keeps the old translation
+mapping returns. New blocks start current and not global (since perf chunk 8, global when their placement walk found every leaf global with CR4.PGE; perf plan "Measured (chunk 8)"). A PTE change without invalidation keeps the old translation
 (TLB-stale-legal), as the shadows already do. The dispatcher's L1 and block-to-block links run with no check, so every
 way a block stops being current also cuts them: L1 records each entry's block (`L1_OWNERS`) and `prune()` undoes every
 link into a block not current or dead and out of a dead one; links out of a block only not current stay (it runs again
@@ -2357,7 +2357,7 @@ only after a revalidating lookup). The linker links only to a target `find` just
 | MOV to CR3 (any value, the same too) | all reset | epoch + 1: non-global ones stop being current |
 | CR0.PG/WP, CR4.PGE/PAE/SMEP/SMAP/PCIDE/LA57, EFER.NXE/LME/LMA change; MTRR write | all reset | global flush: `global_epoch` = epoch + 1, none current |
 | Other CR0/CR4/EFER bits (TS, EM, MP, OSFXSR, OSXSAVE, AM, TSD, ...), XSETBV, FCW/MXCSR | none | none: the context keys what code depends on |
-| INVLPG | the 2 MiB-aligned range (one walk, `unmap_large`) | blocks with bytes in the range: `checked` 0 |
+| INVLPG | the 2 MiB-aligned range (one walk, `unmap_large`) | blocks with bytes in the range: `checked` 0 (since perf chunk 8: on the named 4 KiB page, and blocks from a 2 MiB leaf in the range) |
 | #PF delivered (SDM Vol.3 4.10.4.1; a gap before K1 too) | none (the miss had none) | blocks with bytes on CR2's page: `checked` 0 |
 | Guest, peer or walker write to a page with translations | as before | the page's blocks killed (reverse map) |
 | Pool full; the host's `FLUSH` (guest RAM written while stopped: only at load) | as before | **the only full flushes left** |

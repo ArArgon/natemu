@@ -341,6 +341,20 @@ pub mod cache {
         pub flush_ticks: u64,
         pub full: [u64; 3],
         pub peak: [u64; 3],
+        /// Perf chunk 8: the link records' segments. `[0, links_cr3)` are links from another page into non-global targets
+        /// (a CR3 load looks at them), `[links_cr3, links_tlb)` from another page into [`GLOBAL`] targets (every other
+        /// TLB event looks at both), `[links_tlb, links)` local links: each linear page of the target is a page of the source
+        /// translated from the same guest-physical page (only a death or a flush looks at them).
+        pub links_cr3: u64,
+        pub links_tlb: u64,
+        /// The linear 2 MiB regions (bit r % 1024) a live [`LARGE`] block's guest bytes may lie in (as `regions`).
+        pub large_regions: [u64; 16],
+        /// The last request's fetch walks: byte i holds page i's leaf's [`GLOBAL`] (its G bit) and [`LARGE`].
+        pub fetched: u64,
+        /// Perf chunk 8: the link records found full, so the local links into blocks not current were undone (as every link
+        /// into them was before chunk 8), and how many.
+        pub reclaims: u64,
+        pub reclaimed: u64,
     }
     /// A block placed in the cache: its record in the metadata arena (at the offset `INDEX` lists), its access sites
     /// ([`crate::code_object::Site`]) right after it.
@@ -389,9 +403,14 @@ pub mod cache {
     /// K1: every source page was mapped global (PTE.G with CR4.PGE) when it was last checked: it stays current across
     /// CR3 loads.
     pub const GLOBAL: u32 = 8;
-    /// K1: a link may enter it (set when one is made, cleared when the block is cut and the links into it pruned), so
-    /// making blocks not current, or dead, prunes the link records only when one of them may be a target.
+    /// K1: a link from another page may enter it (set when one is made, cleared when the block is cut and the links into
+    /// it pruned), so making blocks not current, or dead, prunes the link records only when one of them may be a target.
     pub const INBOUND: u32 = 16;
+    /// Perf chunk 8: a source leaf was larger than 4 KiB when it was last checked: an INVLPG anywhere in its 2 MiB
+    /// region reaches it (SDM Vol.3 4.10.4.1).
+    pub const LARGE: u32 = 32;
+    /// Perf chunk 8: a local link (records `[Control::links_tlb, Control::links)`) may enter it (never cleared: only its death prunes those links).
+    pub const LOCAL_INBOUND: u32 = 64;
     impl Block {
         /// Its `JITCodeHeader` in the executable alias.
         pub fn code_va(&self) -> u64 {

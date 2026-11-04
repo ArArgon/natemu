@@ -17,7 +17,11 @@ change switches tables instead of clearing L1 (`crates/runtime/src/cache.rs` `se
 installer N = 1 cache off 17.4 s, N = 4 15.6 s. Since perf chunk 7 (uncommitted on 0da552a) the host's per-request work
 is leaner: the watchdog samples an entry-time word instead of being woken by two channel sends per exit, the block RIP set
 is kept only for the program driver, guest bytes are copied a word at a time, and the memory cache is looked up in one pass
-under a universal hash (perf plan "Measured (chunk 7)"): installer N = 1 cache off 15.9 s, N = 4 13.6 s.
+under a universal hash (perf plan "Measured (chunk 7)"): installer N = 1 cache off 15.9 s, N = 4 13.6 s. Since perf
+chunk 8 (uncommitted on 1c4d8b9) fewer block links are undone at TLB events: a block placed from global pages is global at
+once, a link within one page and frame (`cache::local`) stays across CR3 loads, global flushes and INVLPGs, and INVLPG (and
+a #PF) reaches only its 4 KiB page and blocks from a 2 MiB leaf around it (perf plan "Measured (chunk 8)"): installer N = 1
+cache off 13.6 s, N = 4 12.4 s (15.6 and 13.4 s before, in the same rounds).
 Perf chunk 6 (uncommitted on ea11225) measured the whole-cache flushes and left the cache as it is: only 123 k requests per
 installer boot (N = 1) refill blocks placed before a flush, and a record arena and index sized for the code area were no
 faster (+261 MiB); the performance log gains four request-line fields, and up to 870 k requests at N = 1 could reuse a block
@@ -94,7 +98,7 @@ from `wait4`, the resident's buckets, K1 statistics, counters); FILE.vN one line
 RIP, guest-physical page, result, answer source, bytes read and their hash, nanoseconds per part), at most 1 GiB per
 file (later lines counted as `dropped`); failed writes are counted, the first reported on standard error, and both
 appear in each vCPU's line (`"log"`) and as a warning at its end. A resident built with `perf` but run with the log off
-draws a warning after the run. Since perf chunk 5 the K1 statistics carry `l1_switches` (code-context changes) and `l1_clears` (L1 tables cleared for a context that had none), and the resident's `l1` bucket times the switches. Since perf chunk 7 the vCPU line's parts carry `relocate` (an answer kept for another RIP relocated) and `admit` is admission alone; the request line keeps its nine parts. Since perf chunk 6 the request line ends with four more fields: the resident's flush generation when it asked, the code context (`Cpu::code_context`, hex), 1 if the block could be an in-VM reuse template (not a step, no address or halving cut, its answer read neither to its bytes' end nor beyond the block's pages, not `unsupported_form`) else 0, and the fetch's second guest-physical page (`ffffffffffffffff`: none); `natemu-raw/perf6-20261103-02/refill6.py` classifies refills and reuse candidates from them. Times are
+draws a warning after the run. Since perf chunk 5 the K1 statistics carry `l1_switches` (code-context changes) and `l1_clears` (L1 tables cleared for a context that had none), and the resident's `l1` bucket times the switches; since perf chunk 8 `reclaims` (the link records found full: how often, and the local links into blocks not current then undone). Since perf chunk 7 the vCPU line's parts carry `relocate` (an answer kept for another RIP relocated) and `admit` is admission alone; the request line keeps its nine parts. Since perf chunk 6 the request line ends with four more fields: the resident's flush generation when it asked, the code context (`Cpu::code_context`, hex), 1 if the block could be an in-VM reuse template (not a step, no address or halving cut, its answer read neither to its bytes' end nor beyond the block's pages, not `unsupported_form`) else 0, and the fetch's second guest-physical page (`ffffffffffffffff`: none); `natemu-raw/perf6-20261103-02/refill6.py` classifies refills and reuse candidates from them. Times are
 `CLOCK_UPTIME_RAW` nanoseconds (= `mach_absolute_time` = the guest's CNTVCT). The resident's buckets need the runtime
 built with its `perf` feature, into its own target directory so the default build stays as it is:
 `CARGO_TARGET_DIR=target/perf cargo +1.97.0 build --offline --locked --release -p natemu-runtime --target
@@ -237,7 +241,10 @@ perf plan "Measured (chunk 2)"); the perf chunk 4 rows likewise, before (a24c785
 load addresses) each with its own warm cache (`natemu-raw/perf4-20261103-01/`, perf plan "Measured (chunk 4)"); the
 perf chunk 5 row is three interleaved boots per cell, cache off, before (d89bc4c) and after (the per-context L1 tables)
 (`natemu-raw/perf5-20261103-01/step3/`, perf plan "Measured (chunk 5)"); the perf chunk 7 row likewise, before (0da552a) and
-after (the host cleanups) (`natemu-raw/perf7-20261103-01/runs/`, perf plan "Measured (chunk 7)"); the other rows are R2's.)
+after (the host cleanups) (`natemu-raw/perf7-20261103-01/runs/`, perf plan "Measured (chunk 7)"); the perf chunk 8 row
+likewise at N = 1 and one boot each at N = 4, log off, before (1c4d8b9) and after (links kept across TLB events)
+(`natemu-raw/perf8-20261103-01/runs2/`, perf plan
+"Measured (chunk 8)"); the other rows are R2's.)
 
 | To the root-fs panic, wall s (guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
 | --- | --- | --- | --- | --- |
@@ -263,6 +270,7 @@ after (the host cleanups) (`natemu-raw/perf7-20261103-01/runs/`, perf plan "Meas
 | `natemu-host boot-linux`, cache off, series48-lean, **reuse across addresses** (perf chunk 4, mean of 3) | **27.7** (4.00) | | | **22.8** (5.43) |
 | `natemu-host boot-linux`, cache off, series48-lean, **per-context L1 tables** (perf chunk 5, mean of 3; d89bc4c in the same rounds: 27.7 (4.04), 22.6 (5.38)) | **17.4** (3.57) | | | **15.6** (5.05) |
 | `natemu-host boot-linux`, cache off, series48-lean, **host per-request cleanups** (perf chunk 7, mean of 3; 0da552a in the same rounds: 17.8 (3.62), 15.7 (5.00)) | **15.9** (3.29) | | | **13.6** (4.51) |
+| `natemu-host boot-linux`, cache off, series48-lean, **links kept across TLB events** (perf chunk 8, N = 1 mean of 3, N = 4 one boot; 1c4d8b9 in the same rounds: 15.6 (3.22), 13.4 (4.45)) | **13.6** (3.10) | | | **12.4** (4.29) |
 | `natemu` stub and `boot-linux` at 16b0576, warm or off | never (hangs after "Run /init", see below) | never | | never |
 | QEMU TCG `thread=multi` | 7.27 (2.24) | 5.55 (1.79) | 5.55 (1.86) | 5.46 (1.83) |
 | QEMU TCG default (multi-threaded) | 7.42 (2.28) | | | 5.43 (1.81) |
@@ -441,7 +449,7 @@ the default only). Everything passed but the 7 known i8b departures (they flag `
 | `tools/run_i6_faults.py` | I6 x87: gating (#NM), precise faults with the x87 state unchanged, refusals, FXAM classes, FIST indefinite, MXCSR isolation, Linux's FPU probes (SDM rules; `--max-block 1` too); the x87 QEMU corpus is `tools/reference/gen_i6.py` + `ref.py` + `run_slice1_vm.py` |
 | `tools/run_k2.py` | K2 resident system path: cost per CLI/STI/POPF/SWAPGS/RDTSC/CPUID/WRMSR/FLD+FSTP m80 loop iteration (decode exits must not grow with N), RDRAND beyond the pool, cross-modifying code at a system instruction (the x86 protocol: after the writer's flag and a CPUID the new instruction runs, every rewrite checked; deterministic) |
 | `tools/run_x3.py` | X3 local APIC: register read-backs (xAPIC MMIO, x2APIC), priority/TPR/EOI with nested self IPIs, CR8, the x2APIC #GP rules and x2APIC IPIs at 2-4 vCPUs vs QEMU and the SDM model; xAPIC IPIs at 2/4 vCPUs, one-shot/periodic/masked/HLT timers (exact model from TSC and CNTFRQ), random IPI + timer stress at 2/4 vCPUs, HLT across peers (the driver's end rule), driver fault and typed-stop cases; `--only cost` for APIC access costs |
-| `tools/run_k1.py` | K1 code cache across CR3/INVLPG/control changes, each CPU with its own tables: remap + INVLPG or CR3 reload, CR3 ping-pong with different bytes at one address, a write to an idle block, linked direct jumps, an instruction crossing into a remapped page and across a 2 MiB boundary, vs QEMU at 1-4 vCPUs (block sizes default and 1); natemu-only by the TLB rules: no-INVLPG either-or, global pages kept across CR3 (asserted), a revalidation walk killing its own block, #PF then remap; translation requests must not grow with CR3 rounds (`--base-host/--base-runtime` reports another build beside) (boot-features plan, Built (K1)) |
+| `tools/run_k1.py` | K1 code cache across CR3/INVLPG/control changes, each CPU with its own tables: remap + INVLPG or CR3 reload, CR3 ping-pong with different bytes at one address, a write to an idle block, linked direct jumps, an instruction crossing into a remapped page and across a 2 MiB boundary, vs QEMU at 1-4 vCPUs (block sizes default and 1); natemu-only by the TLB rules: no-INVLPG either-or, global pages kept across CR3 (asserted), a revalidation walk killing its own block, #PF then remap; translation requests must not grow with CR3 rounds (`--base-host/--base-runtime` reports another build beside) (boot-features plan, Built (K1)); perf chunk 8's links kept across TLB events: global at placement, INVLPG of one page or of a 2 MiB page, local links (frame check, crossing pages, code writes by self and a peer through a kept link) (perf plan "Measured (chunk 8)") |
 | `tools/run_m1.py` | M1 guest RAM: tables and data in RAM's top MiB at 4 MiB, 2 GiB and 3 GiB, the device page at R, placement across 0xA0000, cross- and self-modifying code at 0x7ff00000; any runner runs at another size or placement with `NATEMU_RAM`/`NATEMU_PLACE` |
 | `tools/run_m3.py` | M3 device pages: MOV-family corpus vs QEMU (on RAM) and `tools/models/mmio_model.py`, fault priority, refused forms, exactly-once under kicks at 1-4 vCPUs, a tampered reply, cross-modifying code at a device access |
 | `tools/run_l1.py`, `tools/run_l1_smoke.py` | L1 boot-protocol loader: Debian and synthetic bzImages judged by `tools/models/bootproto.py`, every header and loader refusal with the model's codes (no VM); the smoke test (Debian decompressor to its jump into vmlinux vs QEMU) runs in-tree at 2 GiB since M1 (boot-features plan, Built (L1), Built (M1)) |

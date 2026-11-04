@@ -20,7 +20,7 @@ use natemu_abi::execution::{
     ENTRY_OFFSET, KICK_SGI, LinkPoint, MAX_LINK_POINTS, STATE_VA, STOP_WORD, State, System,
     cache::{self as area, Control, LinkRecord, Record, SLOT, SLOT_BYTES, SLOT_VA, SLOT_WRITE_VA},
 };
-pub use natemu_abi::execution::cache::{Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL, HEAD_BYTES, INBOUND, MAX_VCPUS, PAGES, SHADOWS, STEP, SYSTEM};
+pub use natemu_abi::execution::cache::{Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL, HEAD_BYTES, INBOUND, LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, SHADOWS, STEP, SYSTEM};
 /// L1's code (the dispatcher's head ends there).
 pub const L1_VA: u64 = CODE_VA + area::L1_CODE as u64;
 
@@ -155,10 +155,10 @@ pub fn reset() {
     for (p, used) in c.peak.iter_mut().zip([c.code_used, c.meta_used, c.blocks]) {
         *p = (*p).max(used);
     }
-    (c.code_used, c.meta_used, c.blocks, c.links) = (area::HEAD_BYTES as u64, 0, 0, 0);
+    (c.code_used, c.meta_used, c.blocks, c.links, c.links_cr3, c.links_tlb) = (area::HEAD_BYTES as u64, 0, 0, 0, 0, 0);
     // A `checked` of 0 is never current.
     (c.epoch, c.global_epoch) = (c.epoch.max(1), c.global_epoch.max(1));
-    c.regions = [0; 16];
+    (c.regions, c.large_regions) = ([0; 16], [0; 16]);
     // Block numbers start again: the dispatcher's table is emptied (it keeps its context), the others hold none.
     let now = c.l1_table as usize;
     clear_l1(now);
@@ -330,10 +330,10 @@ pub fn current(b: &Block) -> bool {
     b.checked == c.epoch || (b.flags & GLOBAL != 0 && b.checked >= c.global_epoch)
 }
 /// The block cached for (`rip`, `context`) whose source pages are where `rip` is fetched from now: a current one, or one
-/// `mapped` finds so (it walks the fetch of each source page's linear page: `Some(global)` when each maps to the block's
-/// page; the walk may write an A bit, so the block is looked at again). Blocks of other address spaces at the same RIP
-/// stay for when their mapping returns.
-pub fn lookup(rip: u64, context: u64, mut mapped: impl FnMut(&Block) -> Option<bool>) -> Option<&'static Block> {
+/// `mapped` finds so (it walks the fetch of each source page's linear page: `Some(flags)` when each maps to the block's
+/// page, [`GLOBAL`] and [`LARGE`] as the walk found them; the walk may write an A bit, so the block is looked at again).
+/// Blocks of other address spaces at the same RIP stay for when their mapping returns.
+pub fn lookup(rip: u64, context: u64, mut mapped: impl FnMut(&Block) -> Option<u32>) -> Option<&'static Block> {
     let mut i = hash(rip, context);
     loop {
         let [key, number] = unsafe { l2(i).read() };
@@ -347,12 +347,15 @@ pub fn lookup(rip: u64, context: u64, mut mapped: impl FnMut(&Block) -> Option<b
             if current(&b) {
                 return Some(block(n));
             }
-            let global = mapped(&b);
+            let walked = mapped(&b);
             let c = control();
-            if let Some(global) = global.filter(|_| block(n).flags & DEAD == 0) {
+            if let Some(walked) = walked.filter(|_| block(n).flags & DEAD == 0) {
                 c.revalidated += 1;
                 unsafe { (*block_ptr(n)).checked = c.epoch };
-                unsafe { (*block_ptr(n)).flags = (*block_ptr(n)).flags & !GLOBAL | if global { GLOBAL } else { 0 } };
+                unsafe { (*block_ptr(n)).flags = (*block_ptr(n)).flags & !(GLOBAL | LARGE) | walked & (GLOBAL | LARGE) };
+                if walked & LARGE != 0 {
+                    mark_regions(&mut c.large_regions, &b);
+                }
                 return Some(block(n));
             }
             c.remapped += 1;
@@ -361,8 +364,8 @@ pub fn lookup(rip: u64, context: u64, mut mapped: impl FnMut(&Block) -> Option<b
     }
 }
 /// K1: a TLB flush of this vCPU (`global`: global entries too): the epoch moves, and every L1 entry (of every table) and link into a block
-/// no longer current goes (the blocks stay, found again by [`lookup`] after a fetch walk). Returns the links undone;
-/// `None` if a record does not describe its word (as [`unlink_all`]).
+/// no longer current goes but local ones (the blocks stay, found again by [`lookup`] after a fetch walk). Returns the
+/// links undone; `None` if a record does not describe its word (as [`unlink_all`]).
 pub fn tlb(global: bool) -> Option<u64> {
     let c = control();
     c.epoch += 1;
@@ -391,18 +394,21 @@ pub fn tlb(global: bool) -> Option<u64> {
             }
         }
     }
-    prune()
+    // A CR3 load leaves global blocks current: only the links into non-global ones are looked at.
+    prune(if global { TLB } else { CR3 }, false)
 }
 
 /// Places the admitted object at `object` (header `h`) for (`h.guest_rip`, `context`) with its guest-physical
 /// source pages and link points, relocates its computed exit's `b` (at `dispatch_exit`, 0 for none;
-/// the reply was checked to hold the placeholders there), and enters it in L2. `None` when the code area, the metadata arena or the
-/// block index is full (the caller flushes and places again).
+/// the reply was checked to hold the placeholders there), and enters it in L2. `walked`: [`GLOBAL`] and [`LARGE`] as its
+/// fetch walks found them (the placement is checked at this epoch, as a revalidation). `None` when the code area, the
+/// metadata arena or the block index is full (the caller flushes and places again).
 pub fn place(
     h: &Header,
     object: *const u8,
     context: u64,
     source_gpa: [u64; 2],
+    walked: u32,
     links: [LinkPoint; MAX_LINK_POINTS],
     dispatch_exit: u64,
     rep_exits: u64,
@@ -426,7 +432,7 @@ pub fn place(
         sites_count: h.sites_count,
         guest_bytes: h.guest_bytes,
         number: 0,
-        flags: 0,
+        flags: walked & (GLOBAL | LARGE),
         dispatch_exit: dispatch_exit as u32,
         rep_exits: rep_exits as u32,
         links,
@@ -441,13 +447,14 @@ pub fn place(
         Some(placed)
     }
 }
-/// K2: enters the host's decode `i` of the system instruction at `rip` (`guest_bytes` long, from `source_gpa`) in the
-/// cache for `context` as a [`SYSTEM`] record (no code); `None` when the metadata arena or the block index is full.
-pub fn place_system(rip: u64, context: u64, source_gpa: [u64; 2], guest_bytes: u32, i: &System) -> Option<&'static Block> {
+/// K2: enters the host's decode `i` of the system instruction at `rip` (`guest_bytes` long, from `source_gpa`; `walked` as
+/// for [`place`]) in the cache for `context` as a [`SYSTEM`] record (no code); `None` when the metadata arena or the
+/// block index is full.
+pub fn place_system(rip: u64, context: u64, source_gpa: [u64; 2], walked: u32, guest_bytes: u32, i: &System) -> Option<&'static Block> {
     // `code` at the fill point keeps the records in address order ([`block_at`]); a size of 0 holds no PC.
     let code = control().code_used as u32;
     let links = [LinkPoint::NONE; MAX_LINK_POINTS];
-    let record = Block { rip, context, checked: control().epoch, source_gpa, next: [0; 2], lnext: [0; 2], code, code_size: 0, sites_count: 0, guest_bytes, number: 0, flags: SYSTEM, dispatch_exit: 0, rep_exits: 0, links };
+    let record = Block { rip, context, checked: control().epoch, source_gpa, next: [0; 2], lnext: [0; 2], code, code_size: 0, sites_count: 0, guest_bytes, number: 0, flags: SYSTEM | walked & (GLOBAL | LARGE), dispatch_exit: 0, rep_exits: 0, links };
     unsafe { file(record, (i as *const System).cast(), size_of::<System>()) }
 }
 /// The decode a [`SYSTEM`] record holds.
@@ -488,9 +495,9 @@ unsafe fn file(record: Block, tail: *const u8, tail_bytes: usize) -> Option<&'st
             lhead(b1).write(n as u32 + 1);
         }
         at.write(Block { number: n as u32, next, lnext, ..record });
-        for r in [record.rip >> 21, record.rip.wrapping_add(u64::from(record.guest_bytes).max(1) - 1) >> 21] {
-            let (w, bit) = region(r);
-            c.regions[w] |= bit;
+        mark_regions(&mut c.regions, &record);
+        if record.flags & LARGE != 0 {
+            mark_regions(&mut c.large_regions, &record);
         }
         copy_record(at.add(1).cast(), tail, tail_bytes);
         index(n).write(meta as u32);
@@ -668,7 +675,9 @@ pub enum Link {
     Bad,
 }
 /// Links every link point of `source` to `target.rip` (in the same context) to `target`: its first word becomes `b`
-/// to the target's entry, recorded with the original word. Link points already branching there stay.
+/// to the target's entry, recorded with the original word in the segment of its kind ([`Control::links_tlb`]: local,
+/// else by the target's [`GLOBAL`], which stays as it is while the target is current, that is while the link is there).
+/// Link points already branching there stay.
 pub fn link(source: &Block, target: &Block) -> Link {
     let c = control();
     let points = || source.links.iter().filter(|p| p.offset != 0 && p.target == target.rip);
@@ -686,17 +695,71 @@ pub fn link(source: &Block, target: &Block) -> Link {
         }
     }
     if c.links as usize + todo > area::MAX_LINKS {
-        return Link::Full;
+        // Local links outlive their targets' currency: those into blocks not current go first (the rule before chunk 8).
+        c.reclaims += 1;
+        match prune(LOCAL, true) {
+            Some(n) => control().reclaimed += n,
+            None => return Link::Bad,
+        }
+        if control().links as usize + todo > area::MAX_LINKS {
+            return Link::Full;
+        }
     }
+    let (segment, inbound) = if local(target, source) {
+        (LOCAL, LOCAL_INBOUND)
+    } else if target.flags & GLOBAL != 0 {
+        (TLB, INBOUND)
+    } else {
+        (CR3, INBOUND)
+    };
     for p in points().filter(|p| unlinked(source, p)) {
         let at = u64::from(source.code) + u64::from(p.offset);
         let original = word(at);
         rewrite(at, branch(at, entry));
-        unsafe { record(c.links as usize).write(LinkRecord { source: source.number, offset: p.offset, original, target: target.number }) };
-        unsafe { (*block_ptr(target.number as usize)).flags |= INBOUND };
-        c.links += 1;
+        insert(LinkRecord { source: source.number, offset: p.offset, original, target: target.number }, segment);
+        unsafe { (*block_ptr(target.number as usize)).flags |= inbound };
     }
     Link::Linked(todo as u64)
+}
+/// Perf chunk 8: a link from `source` into `target` is local when every linear page of `target` is a page of `source`
+/// translated from the same guest-physical page. It may then stay while `target` is not current: `source` runs only
+/// under a translation of its pages that is valid now (it was entered current, or by a local link from a block that
+/// was), and `target` reads only those pages, through the same frames, in the same context (CPL and gating).
+fn local(target: &Block, source: &Block) -> bool {
+    let pages = |b: &Block| [(b.rip >> 12, b.source_gpa[0]), ((b.rip >> 12).wrapping_add(1), b.source_gpa[1])];
+    pages(target).iter().all(|&(p, g)| g == u64::MAX || pages(source).contains(&(p, g)))
+}
+/// The link records' segments ([`Control::links_cr3`], `links_tlb`, `links`), by which events look at them.
+const CR3: usize = 0;
+const TLB: usize = 1;
+const LOCAL: usize = 2;
+fn ends(c: &mut Control) -> [&mut u64; 3] {
+    [&mut c.links_cr3, &mut c.links_tlb, &mut c.links]
+}
+/// Appends `r` to segment `k`: each later segment's first record moves to that segment's end.
+fn insert(r: LinkRecord, k: usize) {
+    let mut ends = ends(control());
+    let mut hole = *ends[LOCAL];
+    for j in (k + 1..=LOCAL).rev() {
+        let first = *ends[j - 1];
+        unsafe { record(hole as usize).write(record(first as usize).read()) };
+        hole = first;
+    }
+    unsafe { record(hole as usize).write(r) };
+    for e in &mut ends[k..] {
+        **e += 1;
+    }
+}
+/// Drops record `i` of segment `k`: its segment's last record fills it, then each later segment's last record fills the
+/// slot so freed.
+fn remove(i: u64, k: usize) {
+    let ends = ends(control());
+    let mut hole = i;
+    for e in ends.into_iter().skip(k) {
+        *e -= 1;
+        unsafe { record(hole as usize).write(record(*e as usize).read()) };
+        hole = *e;
+    }
 }
 /// Restores every linked point's original word and drops every record (the invalidation of all blocks at a flush).
 /// `None` if a record does not describe its word (it is not left as is).
@@ -706,7 +769,7 @@ pub fn unlink_all() -> Option<u64> {
         unlink(unsafe { record(i).read() })?;
     }
     let n = c.links;
-    c.links = 0;
+    (c.links, c.links_cr3, c.links_tlb) = (0, 0, 0);
     Some(n)
 }
 /// Restores the original word of the link point `r` describes, if it holds the branch `r` says.
@@ -795,25 +858,38 @@ pub fn discard(b: &Block) -> Option<u64> {
 fn region(r: u64) -> (usize, u64) {
     ((r % 1024 / 64) as usize, 1 << (r % 64))
 }
-/// A guest INVLPG (or a #PF) of the linear range `[start, start + bytes)` (K1; inside one 2 MiB region): every live
-/// block of this vCPU with guest bytes in it is no longer current (`checked` 0, global or not): out of L1, every link
-/// into it undone; it stays in L2 and is found again only after a fetch walk ([`lookup`]). Its code-page bits stay: they
-/// only say it may hold translations. Blocks are looked for only when a 2 MiB region the range touches may hold one
-/// ([`Control::regions`]), then on the linear map's chains of the range's pages ([`area::LINEAR_HEADS`]).
-pub fn invalidate_linear(start: u64, bytes: u64) -> Option<u64> {
-    let c = control();
-    let held = |r: u64| {
+/// Sets the bits of `b`'s 2 MiB regions (its first and last byte's) in `regions`.
+fn mark_regions(regions: &mut [u64; 16], b: &Block) {
+    for r in [b.rip >> 21, b.rip.wrapping_add(u64::from(b.guest_bytes).max(1) - 1) >> 21] {
         let (w, bit) = region(r);
-        c.regions[w] & bit != 0
+        regions[w] |= bit;
+    }
+}
+/// A guest INVLPG of `address`, or a #PF at it (K1; SDM Vol.3 4.10.4.1: the TLB entries for its page, global ones too,
+/// and all of them for a page larger than 4 KiB): every live block of this vCPU with guest bytes on its 4 KiB page, and
+/// every [`LARGE`] one with bytes in its 2 MiB region, is no longer current (`checked` 0, global or not): out of L1, every
+/// link from another page into it undone; it stays in L2 and is found again only after a fetch walk ([`lookup`]). Other
+/// blocks keep their translations (a 4 KiB TLB entry of another page is not one for this page). Its code-page bits
+/// stay: they only say it may hold translations. Blocks are looked for only when the address's 2 MiB region may hold
+/// one ([`Control::regions`], [`Control::large_regions`]), then on the linear map's chains of the pages
+/// ([`area::LINEAR_HEADS`]).
+pub fn invlpg(address: u64) -> Option<u64> {
+    let c = control();
+    let r = address >> 21;
+    let held = |regions: &[u64; 16]| {
+        let (w, bit) = region(r);
+        regions[w] & bit != 0
     };
-    if !held(start >> 21) && !held(start.wrapping_add(bytes - 1) >> 21) {
-        return Some(0);
-    }
     let mut inbound = false;
-    for page in start >> 12..=start.wrapping_add(bytes - 1) >> 12 {
-        on_linear_page(page, |n| inbound |= cut_one(n, false));
+    if held(&c.regions) {
+        on_linear_page(address >> 12, |n| inbound |= cut_one(n, false).is_some());
     }
-    if inbound { prune() } else { Some(0) }
+    if held(&c.large_regions) {
+        for page in r << 9..(r + 1) << 9 {
+            on_linear_page(page, |n| inbound |= block(n).flags & LARGE != 0 && cut_one(n, false).is_some());
+        }
+    }
+    if inbound { prune(TLB, false) } else { Some(0) }
 }
 /// Takes block `n`'s entry out of L2 (linear probing's backward-shift deletion), so probes never pass dead blocks: a
 /// page rewritten over and over leaves no trail of dead copies at its RIPs. A [`lookup`] under way (its walk may kill)
@@ -849,25 +925,32 @@ fn l2_remove(n: usize) {
     }
 }
 /// Kills (`dead`) the blocks numbered `doomed`, or makes them no longer current: each leaves L1; then one pass over the
-/// link records undoes every link into a block no longer current or dead and out of a dead one (links out of a block
-/// only not current stay: they run only once it is entered, which needs a fetch walk first). Dead blocks leave L2 (as
+/// link records undoes every link into a dead block and out of one, and every link from another page into a block no
+/// longer current ([`prune`]; links out of a block only not current stay: they run only once it is entered, which needs
+/// a fetch walk first, and so do local links into it). Dead blocks leave L2 (as
 /// [`lookup`] skips them). Returns the links undone; `None` if a record does not describe its word.
 fn cut(doomed: impl Iterator<Item = usize>, dead: bool) -> Option<u64> {
-    let mut prune_needed = false;
+    let mut scope = None;
     for n in doomed {
-        prune_needed |= cut_one(n, dead);
+        scope = scope.max(cut_one(n, dead));
     }
-    if prune_needed { prune() } else { Some(0) }
+    scope.map_or(Some(0), |k| prune(k, false))
 }
-/// [`cut`]'s work on block `n` but the link records: whether they need a pass (a link may enter it, or it is dead and
-/// links may leave it).
-fn cut_one(n: usize, dead: bool) -> bool {
+/// [`cut`]'s work on block `n` but the link records: the segments that need a pass, if any (links from other pages may
+/// enter it: up to [`TLB`]; it is dead and local links may enter it, or links may leave it: all).
+fn cut_one(n: usize, dead: bool) -> Option<usize> {
     let c = control();
     let b = *block(n);
     if b.flags & DEAD != 0 || (!dead && b.checked == 0) {
-        return false;
+        return None;
     }
-    let linked = b.flags & INBOUND != 0 || (dead && b.links.iter().any(|p| p.offset != 0));
+    let scope = if dead && (b.flags & LOCAL_INBOUND != 0 || b.links.iter().any(|p| p.offset != 0)) {
+        Some(LOCAL)
+    } else if b.flags & INBOUND != 0 {
+        Some(TLB)
+    } else {
+        None
+    };
     unsafe { (*block_ptr(n)).flags &= !INBOUND };
     if dead {
         unsafe { (*block_ptr(n)).flags |= DEAD };
@@ -885,26 +968,32 @@ fn cut_one(n: usize, dead: bool) -> bool {
             synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, 4);
         }
     }
-    linked
+    scope
 }
-/// Undoes every link whose target is no longer current or dead, or whose source is dead, and drops its record.
-fn prune() -> Option<u64> {
-    let c = control();
+/// In the link records of segments up to `scope` ([`CR3`], [`TLB`], [`LOCAL`]), undoes every link whose source or target
+/// is dead, or, from another page (or any, if `strict`), whose target is no longer current (a local link may stay: see
+/// [`local`]), and drops its record. The caller names every segment such a link may be in.
+fn prune(scope: usize, strict: bool) -> Option<u64> {
     let mut unlinked = 0;
-    let mut i = 0;
-    while i < c.links {
+    let (mut i, mut k) = (0, 0);
+    loop {
+        let c = control();
+        while k <= scope && i >= *ends(c)[k] {
+            k += 1;
+        }
+        if k > scope {
+            return Some(unlinked);
+        }
         let r = unsafe { record(i as usize).read() };
         let target = block(r.target as usize);
-        if current(target) && target.flags & DEAD == 0 && block(r.source as usize).flags & DEAD == 0 {
+        if target.flags & DEAD == 0 && block(r.source as usize).flags & DEAD == 0 && ((k == LOCAL && !strict) || current(target)) {
             i += 1;
             continue;
         }
         unlink(r)?;
         unlinked += 1;
-        c.links -= 1;
-        unsafe { record(i as usize).write(record(c.links as usize).read()) };
+        remove(i, k);
     }
-    Some(unlinked)
 }
 /// Self-check: every link point of every placed block holds its admitted word (after [`unlink_all`]).
 pub fn links_restored() -> bool {

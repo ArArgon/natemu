@@ -1,6 +1,6 @@
 # Performance phase plan (draft)
 
-Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review; chunks 1-7 measured below (chunk 5 uncommitted on d89bc4c, chunk 7 on 0da552a, chunk 6 on ea11225). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
+Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review; chunks 1-8 measured below (chunk 5 uncommitted on d89bc4c, chunk 7 on 0da552a, chunk 6 on ea11225, chunk 8 on 1c4d8b9). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
 code, measured first; the correctness pass follows. Principles: measure first; native mechanisms; nothing keyed to
 Linux (a KASLR boot must gain too); every object still admitted; checks green; no debt.
 
@@ -457,7 +457,7 @@ N = 1 (likely: no 128 KiB of L1 code rewritten and evicted from the caches at ev
 (`tlb_us` 0.61 to 0.65 s at N = 1).
 
 **Largest resident cost left** (N = 1, vCPU 0): linker entries 2.40 s (5.66 M for 3.15 M links; 3.13 M links are undone when their targets stop being current (CR3 loads, INVLPG, #PF;
-the split was not measured) or die, and are made again after the revalidation walk), guest
+the split: chunk 8) or die, and are made again after the revalidation walk), guest
 code 2.32 s, `enter` 1.87 s (8.3 M at 0.23 us), the host's fexc 2.14 s and admission 1.36 s, address-space work 2.0 s.
 Proposed next: keep links into a block across a CR3 load while the block is revalidated unchanged (an epoch per address
 space, as the "Address-space switches" candidate keeps shadows per CR3 root), bounded by the linker's 2.4 s plus a share of
@@ -598,6 +598,111 @@ review (nothing blocking): `run_l4a.py halt` gains the halt program with a 20 ms
 (the halted vCPU must reach its end, not be forced out): green, 3/3; red with the watchdog kicking halted vCPUs too (cpu0
 stopped `watchdog`, no delivery; `natemu-raw/perf7-20261103-01/review/`). With `--check-reuse`, the check's fexc round trip
 is in `fexc` and its comparison in no part (it was inside `admit` before). Not rerun: the rest of the standing suite.
+
+### Measured (chunk 8: links kept across TLB events, November 3; uncommitted on 1c4d8b9, series48-lean)
+
+**Cause first** (a temporary diagnostic, `natemu-raw/perf8-20261103-01/diag/diag.patch`, removed: each undone link counted
+by the event that undid it and classified; one boot each, cache off, log off). At N = 1 3.03 M links are undone:
+
+| Event | Undone | Target CPL 0 | Target new since placement | Of them placed from global pages (A) | Target on the source's pages, same frames (B) | INVLPG: target off the named 4 KiB page, no large leaf (C) | Any of A-C |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| CR3 load (23.2 k) | 2,300 k | 136 k | 699 k | 134 k | 1,890 k | - | 1,911 k |
+| Global flush (78) | 121 k | 119 k | 17 k | 0 | 88 k | - | 88 k |
+| INVLPG (80.1 k) | 497 k | 0 | 320 k | 0 | 428 k | 497 k | 497 k |
+| #PF (52.6 k) | 0 | | | | | | |
+| Death (code write) / flush | 19 k / 96 k | | | | | | |
+
+At N = 4 (vCPU 0) the same shape: CR3 347 k (B 286 k, A 61 k), INVLPG 154 k (all C), global 109 k. The prune over every
+record at each event scanned 185 M records in 0.60 s (most of `tlb_us` 0.62 s); INVLPG's 2 MiB scan cost 0.44 s. User
+code is most of it: a CR3 load undoes the links of every non-global block, though most of them jump within one page of one
+frame; an INVLPG (a COW, an munmap) cut every block of the 2 MiB around it.
+
+**Built** (resident; `crates/abi/src/execution.rs`, `crates/runtime/src/cache.rs`, `execution.rs`; host: two K1 fields).
+- *A, global at placement.* The placement's fetch walk is a TLB fill: its leaves' G and size go to `Control::fetched`;
+  a block or system record is placed `GLOBAL` when every source leaf is global and CR4.PGE is set (`leaves`, as revalidation
+  computes it) and `LARGE` when a leaf is 2 MiB (both recomputed at each revalidation). Before, a new block was never
+  global, so each new kernel block lost its links at the next CR3 load.
+- *B, local links.* A link from S into T is *local* when every linear page of T is a page of S translated from the same
+  guest-physical page (`cache::local`). It stays while T is not current: S runs only under a translation of its pages that
+  is valid now (entered current by lookup, L1 or a link into a current block, or by a local link from a block that was:
+  induction), and T fetches only those pages through the same frames in the same context. The frame check matters: after a
+  PTE change with no invalidation S and T may come from different frames at one linear page in one epoch.
+  The link records are three contiguous segments (`Control::links_cr3`, `links_tlb`, `links`): links from another page into
+  non-global targets, into global ones, and local ones (`insert` and `remove` move at most one record per later segment). A
+  target's `GLOBAL` cannot change while a cross link into it exists (links go only to current targets; `GLOBAL` is rewritten
+  only when a non-current block is revalidated). So a CR3 load prunes the first segment only, a global flush, INVLPG and #PF
+  the first two, and a death all of them when the dead block has link points or `LOCAL_INBOUND` (set by a local link, never
+  cleared but by a flush), else the first two if `INBOUND`. A local link's source shares every page of its target, so it
+  dies with it; the flag is a second guard. Local links outlive their targets' currency, so the 64 Ki records filled
+  (a first build stalled at 65,536 links: 150 s, never at the dialog); when full, the local links into blocks not current are
+  undone first (`reclaims` in the K1 statistics: count, links). 256 Ki records were no faster (13.45 against 13.42 s, one
+  pair of boots: the 4-5 capacity flushes undo every link anyway); the area stays 64 Ki.
+- *C, INVLPG by page* (`cache::invlpg`, also for #PF): the blocks with bytes on the named 4 KiB page, and `LARGE` ones with
+  bytes in its 2 MiB region (`Control::large_regions`, as `regions`), stop being current, global or not (SDM Vol.3 4.10.4.1:
+  the entries for the page, all of them for a page larger than 4 KiB). A 4 KiB entry of another page is no entry for this
+  page, so other blocks keep theirs. Data shadows still drop the 2 MiB (unchanged). The #PF case gains the large-page rule.
+
+**Exactness.** K1's rule holds: a block runs only under a translation valid now (A: the placement walk is the check B and
+revalidation already rely on; B: the induction above; C: the SDM's INVLPG reach). Every kept link is still undone when its
+target dies or its page is written, on every vCPU: links are per vCPU, each vCPU's death of a page (its own write, a peer's
+post drained at its next entry) prunes every segment. Tests (`tools/run_k1.py`, at 1-4 vCPUs and block sizes default and 1;
+natemu-only cases assert natemu's choice where x86 allows either): `place-global` (a global page remapped with no INVLPG and
+a CR3 reload keeps the old frame; a block crossing into a non-global page, and one placed with PGE off, must not),
+`invlpg-page` (INVLPG of V leaves three linked calls of N, another page of its region, on N's old frame), `invlpg-large`
+(INVLPG of another 4 KiB address of a 2 MiB page reaches its code: a load and the call see the new frame; QEMU 11.1.2 loads
+the new data but runs the old block, so the case is natemu-only), `cross-link` (QEMU: a direct jump into an instruction
+crossing into a page remapped with INVLPG of that page alone), `local-gpa` (S's link into T made after a remap with no
+INVLPG, so from another frame; back with a CR3 reload, S must reach the old frame's T), `local-write` (QEMU: R -> S -> T from
+one jump site, S global; INVLPG, calls, CR3 reload, then CPU (i + 1) % N, or itself at N = 1, rewrites T: the calls run the new
+bytes). 48 runs green. Each red under its mutation (scratch residents, `k1-mut/`): placement not global (`place-global` r9 2),
+global from the first page alone (rsi 0x100), PGE ignored (rbp 3); INVLPG over the 2 MiB (`invlpg-page` r9 6), the large rule
+dropped (`invlpg-large` r9 1); local without the frame check (`local-gpa` r10 2), with the first page only (`cross-link` r9
+0x300 for 0x600); a death pruning only the first segment (`local-write` r10 3 for 9: the stale bytes ran, at N = 1, 2, 4,
+where a peer wrote), links into dead blocks kept (a `bad_link` stop). Not testable by a mutation: dropping `LOCAL_INBOUND`
+(the co-dying source always forces the full pass).
+
+**Measured** (`natemu-raw/perf8-20261103-01/`; installer to "Select a language", 2 GiB, `mitigations=off nokaslr`, cache
+off, one VM at a time; mean, min-max). The record: `runs2/` (`one.sh`), log off, three interleaved rounds at N = 1 before
+(1c4d8b9) and after, then one boot each at N = 4, with the machine idle (checked for other VMs and QEMU after each boot):
+N = 1 **15.56 (15.27-15.84) to 13.55 (13.51-13.58) s**, N = 4 **13.39 to 12.42 s**. The parts below are from the full
+campaign before it (`campaign8.sh`, `table8.py`, `table8.txt`, `tables8.json`, `runs/`: chunk 1's method, a warm-up boot each,
+three interleaved rounds, log on and off at N = 1 and 4): another session's QEMU probe overlapped one of its boots for up to
+about 2 minutes (not seen by the campaign's poll, which looked for `natemu-host` only), so its walls are indicative only:
+
+| Installer, cache off | N = 1 before | N = 1 after | N = 4 before | N = 4 after |
+| --- | --- | --- | --- | --- |
+| Wall s, log off | 16.90 (16.82-16.98) | **14.64** (14.58-14.67) | 14.21 (14.12-14.34) | **13.33** (13.23-13.50) |
+| Wall s, log on | 17.87 | 15.46 | 15.11 | 14.17 |
+| "Run /init" guest s | 3.51 | 3.36 | 4.76 | 4.73 |
+| Links made / undone / reclaimed, all threads (M) | 3.15 / 3.13 / - | 1.50 / 0.71 / 0.75 | 3.05 / 2.97 / - | 1.69 / 0.67 / 0.84 |
+| Linker entries / block entries, all threads (M) | 5.64 / 8.27 | 3.95 / 6.45 | 5.65 / 8.35 | 4.27 / 6.87 |
+| Revalidations / made not current by INVLPG or #PF (M) | 2.18 / 1.01 | 0.63 / 0.05 | 1.89 / 0.97 | 0.59 / 0.03 |
+| vCPU 0: linker entries / `enter` / TLB flushes / revalidation s | 2.41 / 1.94 / 0.69 / 0.13 | 1.83 / 1.31 / 0.29 / 0.04 | 0.91 / 0.68 / 0.16 / 0.05 | 0.79 / 0.50 / 0.05 / 0.01 |
+| INVLPG time, all threads s | 0.47 | 0.04 | 0.64 | 0.04 |
+
+**Ship threshold met** on the record: -2.01 s (-13%) at N = 1 against spreads of at most 0.57 s, -0.97 s (-7%) at N = 4 (one
+boot each; the campaign's three rounds -0.88 s, spreads 0.3 s); nothing slower; all boots reached the dialog. Prune, timed in a diagnostic boot of the new build (N = 1): 23 k CR3 prunes 46 ms,
+2.8 k TLB-scope 38 ms, 1.8 k deaths 31 ms, 18 reclaims 91 ms, against 0.60 s before. The links still made are mostly first
+links of new blocks (1.16 M placed) and the reclaimed ones; the rest of the address-space work is the shadows (unchanged).
+Memory unchanged.
+
+**Independent review** (read-only, of the diff): no blocking defect; it traced `insert`, `remove` and `prune` for every
+segment (records stay contiguous in `[0, links)`, which the host's link check reads), the `GLOBAL` invariant, local-link
+soundness over every entry path (L1, lookup, cross and local links, the step block, breakpoints, `disarm`, REP self-links,
+system records) and INVLPG/#PF. Applied: `invlpg-page` now calls N through one jump site, so the second loop takes the link
+kept from the first (before, each call site ran once and the case showed only that N stayed current); a comment.
+Noted, not changed: `large_regions` bits stay set until a reset and alias modulo 1024 regions, as `regions` do (an INVLPG
+there scans the region's 512 chains, as every INVLPG did before).
+
+**Checks** (`suite/`, `suite8.sh`, on the shipped tree, series48-lean, 2 GiB): `cargo test` 159 + 1 ignored, also with `FEXC`
+set; `check_resident_stack.py` `ok` (19,184 / 23,328 / 12,848 bytes: +16 each, within the budget); fixtures 64 and seed 44 at
+both block sizes; faults 7,912 at both; `run_slice3_vm.py` `contain` 0 failures (423 controls), `smp`, `sharedpt`,
+`coherence` 0 failures; `run_k1.py` 248 runs (the six new programs included), no failure, counts 14 and 14 requests at K and
+2K rounds; `run_k2.py`, `run_m1.py` 20 cases, `run_s4.py` (QEMU's two known aborts on `s4-d-stack` recorded as departures, as
+before), `run_x1.py` 6/6 and 196/196, `run_boot_smoke.py` 4/4, `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative controls
+flagged), all 0 failures; every measurement boot reached the dialog. The reworked `invlpg-page`: green at 1-4 vCPUs and both
+block sizes, red under the 2 MiB mutation (r9 6). Not rerun: the rest of the standing suite (the change is in the resident's
+link and TLB bookkeeping, which these exercise).
 
 ## 3. Candidate chunks
 

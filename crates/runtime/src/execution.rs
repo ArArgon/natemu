@@ -198,7 +198,8 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
                 (missed, Reply::Block(h)) => {
                     s.requests += 1;
                     let p = crate::perf::enter(crate::perf::PLACE);
-                    let placed = cache::place(&h, STAGING_VA as *const u8, context, s.source_gpa, s.link_points, s.dispatch_exit, s.rep_exits);
+                    let walked = walked(s);
+                    let placed = cache::place(&h, STAGING_VA as *const u8, context, s.source_gpa, walked, s.link_points, s.dispatch_exit, s.rep_exits);
                     crate::perf::leave(p);
                     let Some(block) = placed else {
                         // Full: flush (which also drops this vCPU's marks) and miss again; an empty cache holds any block.
@@ -223,7 +224,7 @@ unsafe fn find(s: &mut State) -> Option<&'static Block> {
                         // (some kinds, e.g. #UD forms, do not use `length`).
                         let bytes = if s.source_gpa[1] == u64::MAX { instruction.length } else { instruction.length.max(4097 - (s.cpu.rip & 4095) as u32) };
                         let p = crate::perf::enter(crate::perf::PLACE);
-                        let placed = cache::place_system(s.cpu.rip, context, s.source_gpa, bytes, &instruction);
+                        let placed = cache::place_system(s.cpu.rip, context, s.source_gpa, walked(s), bytes, &instruction);
                         crate::perf::leave(p);
                         let Some(record) = placed else {
                             if flushed {
@@ -482,6 +483,7 @@ unsafe fn request(s: &mut State, kind: u64) -> Reply {
     let block = kind == REQUEST_TRANSLATE;
     let page = s.cpu.rip & !4095;
     (s.fetch, s.fetch_fault) = ([u64::MAX; 2], [fetch::NONE; 3]);
+    cache::control().fetched = 0;
     // The host stops the run at its stop RIP: nothing there is fetched.
     if s.cpu.rip != s.stop_at {
         // Walked at RIP itself: a fault's CR2 is the fetched address, not its page.
@@ -573,12 +575,13 @@ fn link_point(h: &Header, p: &LinkPoint) -> bool {
     }
     matches!(move_value(&words[..n], 0), Some((k, value)) if k <= 4 && k < n && words[k] == svc_link && value == p.target)
 }
-/// Walks the fetch of `va` (its page) for a request into `s.fetch[i]` (or its failure into `s.fetch_fault`); for a block,
-/// marks it ([`mark`]).
+/// Walks the fetch of `va` (its page) for a request into `s.fetch[i]` and its leaf's flags into byte i of
+/// `Control::fetched` (or its failure into `s.fetch_fault`); for a block, marks it ([`mark`]).
 fn fetch_page(s: &mut State, va: u64, i: usize, block: bool) {
     let p = crate::perf::enter(crate::perf::FETCH);
     match fetch_walk(s, va) {
-        Ok((gpa, _)) => {
+        Ok((gpa, flags)) => {
+            cache::control().fetched |= u64::from(flags) << (8 * i);
             s.fetch[i] = gpa;
             if block {
                 mark(s, gpa);
@@ -588,12 +591,12 @@ fn fetch_page(s: &mut State, va: u64, i: usize, block: bool) {
     }
     crate::perf::leave(p);
 }
-/// The guest-physical page `va` is fetched from and whether its leaf is global (the walk sets A bits like the CPU's), or
-/// why not ([`fetch`]). A walk
+/// The guest-physical page `va` is fetched from and its leaf's [`cache::GLOBAL`] (its G bit) and [`cache::LARGE`] (a
+/// 2 MiB leaf) (the walk sets A bits like the CPU's), or why not ([`fetch`]). A walk
 /// losing its A/D races to peers walks again, as x86 does (the watchdog contains a livelock). No block of this vCPU runs
 /// now (a step's source block is abandoned, and the linker checks that its source is not dead after finding the
 /// target), so an A write into a page holding translations just invalidates it ([`cache::written`]).
-fn fetch_walk(s: &mut State, va: u64) -> Result<(u64, bool), [u64; 3]> {
+fn fetch_walk(s: &mut State, va: u64) -> Result<(u64, u32), [u64; 3]> {
     let Some(control) = s.cpu.control() else {
         halt(s, stop::UNSUPPORTED_MODE)
     };
@@ -601,7 +604,10 @@ fn fetch_walk(s: &mut State, va: u64) -> Result<(u64, bool), [u64; 3]> {
         let mut tables = GuestTables::observed(guest_ram(), CodeWrites(FetchWrites(s)));
         match paging::walk(&mut tables, control, va, Access::Fetch) {
             // M2: guest RAM of any memory type (code may run from UC memory, SDM Vol.3 14.3.3).
-            Ok(t) if guest_ram().range(t.gpa & !4095, 4096).is_some() => return Ok((t.gpa & !4095, t.global)),
+            Ok(t) if guest_ram().range(t.gpa & !4095, 4096).is_some() => {
+                let flags = if t.global { cache::GLOBAL } else { 0 } | if t.leaf_bytes > 4096 { cache::LARGE } else { 0 };
+                return Ok((t.gpa & !4095, flags));
+            }
             Ok(_) => return Err([fetch::NOT_RAM, 0, 0]),
             Err(Fault::Contended) => {}
             Err(f) => return Err(fetch::encode(f)),
@@ -609,23 +615,35 @@ fn fetch_walk(s: &mut State, va: u64) -> Result<(u64, bool), [u64; 3]> {
     }
 }
 /// K1: whether `b`'s source pages are where its linear pages are fetched from now (a fetch walk of each, as the CPU's
-/// after a TLB miss: A bits set, any fault meaning no): `Some(global)`, global when every leaf is and CR4.PGE is set.
-/// The walk's A writes may invalidate `b` ([`cache::lookup`] looks again).
-fn mapped(s: &mut State, b: &Block) -> Option<bool> {
+/// after a TLB miss: A bits set, any fault meaning no): `Some(flags)` ([`leaves`]). The walk's A writes may invalidate
+/// `b` ([`cache::lookup`] looks again).
+fn mapped(s: &mut State, b: &Block) -> Option<u32> {
     let p = crate::perf::enter(crate::perf::REVALIDATE);
     let current = revalidated(s, b);
     crate::perf::leave(p);
     current
 }
-fn revalidated(s: &mut State, b: &Block) -> Option<bool> {
-    let mut global = s.cpu.cr4 & CR4_PGE != 0;
+fn revalidated(s: &mut State, b: &Block) -> Option<u32> {
+    let mut flags = [cache::GLOBAL; 2];
     for (k, &gpa) in b.source_gpa.iter().enumerate() {
         if gpa != u64::MAX {
-            let (_, g) = fetch_walk(s, (b.rip & !4095).wrapping_add(4096 * k as u64)).ok().filter(|&(at, _)| at == gpa)?;
-            global &= g;
+            flags[k] = fetch_walk(s, (b.rip & !4095).wrapping_add(4096 * k as u64)).ok().filter(|&(at, _)| at == gpa)?.1;
         }
     }
-    Some(global)
+    Some(leaves(s, flags))
+}
+/// A translation's flags from its source pages' leaves (`GLOBAL`, `LARGE` each; an unused page `GLOBAL` alone): global
+/// when every leaf is and CR4.PGE is set (SDM Vol.3 4.10.2.4), large when any leaf is.
+fn leaves(s: &State, [a, b]: [u32; 2]) -> u32 {
+    let global = s.cpu.cr4 & CR4_PGE != 0 && a & b & cache::GLOBAL != 0;
+    (if global { cache::GLOBAL } else { 0 }) | (a | b) & cache::LARGE
+}
+/// The flags of the translation the last request's fetch walks made for `s.source_gpa` ([`fetch_page`]): a placement
+/// is a TLB fill, as a revalidation.
+fn walked(s: &State) -> u32 {
+    let f = cache::control().fetched;
+    let second = if s.source_gpa[1] == u64::MAX { cache::GLOBAL } else { (f >> 8) as u32 & 0xff };
+    leaves(s, [f as u32 & 0xff, second])
 }
 /// The fetch walk's code-page writes (see [`fetch_walk`]).
 struct FetchWrites<'a>(&'a mut State);
@@ -724,10 +742,11 @@ fn ticks() -> u64 {
     t
 }
 /// K1: a #PF invalidates the TLB entries of its linear address (SDM Vol.3 4.10.4.1): the blocks with bytes on `cr2`'s
-/// page stop being current (its shadow, if any, is the faulting access's miss: none to drop).
+/// page, or in its 2 MiB page, stop being current, as for INVLPG ([`cache::invlpg`]; its shadow, if any, is the faulting
+/// access's miss: none to drop).
 pub(super) fn page_faulted(s: &mut State, cr2: u64) {
     let t0 = ticks();
-    match cache::invalidate_linear(cr2 & !4095, 4096) {
+    match cache::invlpg(cr2) {
         Some(n) => s.unlinks += n,
         None => halt(s, stop::BAD_LINK),
     }
@@ -1075,8 +1094,8 @@ const GP: [u64; 3] = [13, 0, 0];
 /// global ones at a CR3 load; a block is run again only after a fetch walk finds its source pages where its RIP is
 /// fetched from ([`cache::lookup`]), so no translation is dropped. Other control bits change no walk; those a
 /// translation depends on are in its context ([`Cpu::code_context`]). INVLPG drops the shadows (both spaces) of the 2
-/// MiB-aligned range holding the address (a superset of its page in either page size) and makes the blocks with bytes
-/// there not current. Only this vCPU's state, cache and shadows change. Forms and operand values the resident does not
+/// MiB-aligned range holding the address (a superset of its page in either page size) and makes not current the blocks
+/// with bytes on its 4 KiB page and the blocks translated through a 2 MiB leaf covering it. Only this vCPU's state, cache and shadows change. Forms and operand values the resident does not
 /// implement stop it (`unsupported_system`) before any effect. A test driver's [`system::SET_CPL`] changes the CPL
 /// ([`set_cpl`]) at any CPL. CPUID, RDMSR/WRMSR, RDTSC and RDTSCP answer from the presented CPU ([`natemu_abi::cpu`]).
 /// CPUID is serialising: like every system instruction it is a draining entry, since [`find`] drains this vCPU's
@@ -1386,7 +1405,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                     halt(s, stop::SHADOW)
                 }
                 cache::control().invlpgs += 1;
-                match cache::invalidate_linear(start, LARGE_PAGE) {
+                match cache::invlpg(address) {
                     Some(n) => s.unlinks += n,
                     None => halt(s, stop::BAD_LINK),
                 }
