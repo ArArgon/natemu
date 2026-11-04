@@ -129,6 +129,10 @@ decompressor head, which natemu never runs: entry is `startup_64`). Initramfs: o
 (owner decision October 30 (2)) and 2 `jb` with a GS prefix (`65 72 79`, "ery" of "Montgomery Multiplication" in
 `ossl-modules/fips.so`): a segment override on a branch is reserved (SDM Vol.2 2.1.1), the typed refusal
 `unsupported_form`.
+**SHA re-check (November 3).** `census.py` admits SHA1*/SHA256* (NP 0f 38 c8..cd, NP 0f 3a cc; owner decision, CPUID.7.0:EBX.SHA
+advertised; fexc series49-sha). Rerun into `natemu-raw/kernel-census-sha-20261103-01/` (`x` linked to the C0 data; report
+in its `report/`): initramfs `system` 226,564 -> 225,267, the 1,297 SHA sites (SHA256RNDS2 326, SHA1NEXTE 204, SHA1RNDS4
+203, SHA1MSG2 162, SHA1MSG1 160, SHA256MSG2 122, SHA256MSG1 120) admitted; nothing else moved; the kernel has none.
 Files here: `extract.py`, `census.py`, `report.py`, `results.md` (every table, generated), `forms-kernel.tsv` (every refused
 form of the decompressor and vmlinux, one row per mnemonic + operand shape, first-use order). The same for the
 initramfs is `RAW/forms-initrd.tsv`; `RAW/census.json` holds every row.

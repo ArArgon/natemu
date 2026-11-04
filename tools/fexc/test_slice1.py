@@ -31,9 +31,9 @@ SYSTEM = {
     # X1c: Reserved-NOP cells (owner decision: NOPs, the resident's RESERVED_NOP)
     '0f 0d /0 m': '0f0d00', 'prefetch /4 m': '0f1820', 'prefetch reg': '0f18c0', 'f3 prefetchnta': 'f30f1800', '0f 19 m': '0f1900',
     '66 0f 1a m (bndmov form)': '660f1a00', 'f2 0f 1b reg': 'f20f1bc0', '0f 1c reg': '0f1cc0', '66 cldemote': '660f1c00', '0f 1d m': '0f1d00',
-    # I9: #UD the host decodes (MOVBE with a register operand; ADX, CET_SS and SHA not advertised)
+    # I9: #UD the host decodes (MOVBE with a register operand; ADX and CET_SS not advertised)
     'movbe rax,rcx (#UD)': '480f38f0c1', 'movbe cx,ax (#UD)': '660f38f1c1', 'adcx rax,rcx (#UD)': '66480f38f6c1', 'adox (#UD)': 'f3480f38f6c1',
-    'sha256rnds2 (#UD)': '0f38cbc1', 'sha1rnds4 (#UD)': '0f3accc101', 'wrussq (#UD)': '66480f38f508',
+    'wrussq (#UD)': '66480f38f508',
     'mov cr0,rax': '0f22c0', 'mov cr3,rax': '0f22d8', 'mov cr4,rax': '0f22e0', 'mov cr8,rax': '440f22c0',
     'mov rax,cr0': '0f20c0', 'mov rax,cr3': '0f20d8', 'mov rax,cr4': '0f20e0', 'mov dr7,rax': '0f23f8', 'mov rax,dr0': '0f21c0',
     'lgdt [rax]': '0f0110', 'lidt [rax]': '0f0118', 'sgdt [rax]': '0f0100', 'ltr ax': '0f00d8', 'lldt ax': '0f00d0',
@@ -129,6 +129,10 @@ ALLOWED = {
     'aesenc xmm1,xmm2': '660f38dcca', 'aesdeclast xmm1,[rax]': '660f38df08', 'aesimc': '660f38dbca', 'aeskeygenassist': '660f3adfca07',
     'pclmulqdq': '660f3a44ca11', 'vaesenc': 'c4e271dcc2', 'vaesimc': 'c4e279dbca', 'vpclmulqdq': 'c4e37144c201',
     'vaeskeygenassist': 'c4e379dfca07', 'pdep': 'c4e2fbf5c1', 'pext': 'c4e2faf5c1', 'pext ecx,edx,[rax]': 'c4e26af508', 'ffreep st1': 'dfc1',
+    # SHA (November 3, CPUID.7.0:EBX.SHA[29] advertised): all seven, register and memory, REX, 0x67, a segment prefix
+    'sha1nexte': '0f38c8ca', 'sha1msg1 [rax]': '0f38c908', 'sha1msg2 xmm9,xmm2': '440f38caca', 'sha256rnds2 xmm1,xmm10': '410f38cbca',
+    'sha256rnds2 xmm1,[r8+rcx*8+16]': '410f38cb4cc810', 'sha256msg1 rex.w': '480f38ccca', 'sha256msg2 [eax] addr32': '670f38cd08',
+    'sha1rnds4 xmm1,xmm2,0': '0f3accca00', 'sha1rnds4 xmm15,[rip+8],0xff': '440f3acc3d08000000ff', 'fs sha1msg1': '640f38c908',
     # I6b: the resident's helper forms (`svc #X87`, `svc #STRING`)
     'pcmpistri xmm0,[rax],0x12': '660f3a630012', 'rex.w pcmpestri': '66480f3a61c14c', 'pcmpestrm xmm1,xmm2,0x40': '660f3a60ca40',
     'vpcmpistrm xmm1,[rax+1],0': 'c4e37962480100', 'vex.w1 vpcmpestri': 'c4e3f961ca01', 'fsin': 'd9fe', 'fcos': 'd9ff', 'fsincos': 'd9fb',
@@ -335,6 +339,14 @@ class Slice1Cutting(unittest.TestCase):
                 self.assertEqual(moves, sorted([hex(at), hex(at + len(x) // 2)]), name)    # its own RIP (retry) and the next
                 sites = [(s['kind'], s['rmw'], s['intent']) for s in d['sites']]
                 self.assertEqual(sites, [('load', 'load', 'write'), ('atomic', 'store', 'write')], name)
+
+    def test_sha_follows_the_profile(self):
+        # fexc has no profile input: the shim admits SHA because cpu_profile.json advertises it. Clearing the bit needs the
+        # shim's #UD cut back (fexc_slice1.inc `Undefined0F38`, before November 3); the host's decode and `undefined` follow it.
+        leaf = next(e for e in json.loads((REPO / 'tools/models/cpu_profile.json').read_text())['cpuid']
+                    if e['leaf'] == '0x7' and e.get('subleaf') == 0)
+        self.assertEqual(leaf['fields']['ebx']['29'], {'name': 'SHA', 'state': 'advertised'})
+        self.assertIn('sha1rnds4 xmm1,xmm2,0', ALLOWED)
 
     def test_unsupported_forms(self):
         for name, x in UNSUPPORTED.items():

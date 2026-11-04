@@ -64,7 +64,7 @@ build and sign `natemu-host` themselves.
 
 ```sh
 R=target/aarch64-unknown-none/release/natemu-runtime
-F=../natemu-raw/fexc-native-20261026-01/series48-lean/obj/fexc
+F=../natemu-raw/fexc-native-20261026-01/series49-sha/obj/fexc
 K=../natemu-raw/kernel-census-20261028-01/dl/linux               # Debian 6.12.107 bzImage
 I=../natemu-raw/kernel-census-20261028-01/dl/initrd.gz           # Debian installer initrd
 target/release/natemu "$R" "$F" "$K" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr' --vcpus 4
@@ -135,7 +135,7 @@ analysis (`boot.py`, `analyze.py`, `aggregate.py`, `campaign.sh`) are in `natemu
 | vCPUs | `vcpus`, `--vcpus` | 1; 1-4 (`cache::MAX_VCPUS`); vCPU 0 is the BSP, the others wait on the ACPI wakeup mailbox (X4) |
 | Memory map | built from `ram` (`boot::Layout::e820`) | e820: reserved page 0, RAM to 0xA0000, the legacy hole (unassigned: all-ones reads), loader page tables at 1 MiB (reserved to 0x200000), reserved 0x200000-0x600000 (the normal map's hole), ACPI NVS 0x600000-0x1000000 (tables, mailbox, AP boot scratch), RAM 16 MiB to R, reserved R to 4 GiB (the device range: I/O APIC, LAPIC) |
 | Firmware tables | `rsdp` (default 0x600000) | ACPI 6.5 RSDP, XSDT, FADT, FACS, DSDT, MADT with the version-0 wakeup mailbox for N processors (`crates/host/src/boot/acpi.rs`; no `_CST`/P_BLK, HPET, MCFG or EFI); `acpi_rsdp_addr` in boot_params. MTRRs as the virtual firmware leaves them: all RAM WB, the hole and [R, 4 GiB) UC (plan, Built (M2 addendum 1)) |
-| CPU profile | built in (`crates/abi/src/cpu_profile.rs` from `tools/models/cpu_profile.json`) | the accepted Intel Haswell-class profile (INV-03-01 CLM-03-01-16/-17): SSE to SSE4.2, AVX/AVX2/FMA/F16C, XSAVE (XCR0 7), MOVBE, AES-NI/PCLMULQDQ, BMI1/2, RDRAND, x2APIC; no PCID, 1 GiB pages, LA57, SMAP, TSC-deadline, PMU, MPX/CET/AVX-512 |
+| CPU profile | built in (`crates/abi/src/cpu_profile.rs` from `tools/models/cpu_profile.json`) | the accepted Intel Haswell-class profile (INV-03-01 CLM-03-01-16/-17): SSE to SSE4.2, AVX/AVX2/FMA/F16C, XSAVE (XCR0 7), MOVBE, AES-NI/PCLMULQDQ, SHA (owner, November 3), BMI1/2, RDRAND, x2APIC; no PCID, 1 GiB pages, LA57, SMAP, TSC-deadline, PMU, MPX/CET/AVX-512 |
 | Compiler | `fexc`, FEXC | the path of a fexc binary; one `fexc --serve` child per vCPU; each answer is validated by admission |
 | Compile cache | `compile_cache` (`Config::from_env`) | `NATEMU_COMPILE_CACHE=DIR|off` (default `~/Library/Caches/natemu/fexc`), `NATEMU_COMPILE_CACHE_MB` (default 512; not a whole number: an error, not the default); keyed by the fexc binary's SHA-256 and the exact request, so a rebuilt identical fexc reuses it; past 3/4 of the cap other builds' packs, then user, then kernel packs are evicted (`crates/host/src/compile_cache.rs`) |
 | Code cache | `code_bytes`, `--code-cache` | 128 MiB less its head per vCPU (`CODE_BYTES_MAX`) |
@@ -316,7 +316,8 @@ mitigations=off` with and without `nokaslr`; three interleaved rounds, one VM at
 default is 60 s), warm = its own compile cache per KASLR setting after a warm-up boot, off = `NATEMU_COMPILE_CACHE=off`.
 QEMU 11.1.2: `-nodefaults -machine pc,hpet=off,i8042=off,vmport=off` (COM1 only; the board's PIC, PIT, RTC, I/O APIC and
 PIIX4 PM block stay; its fixed PIIX3 IDE and floppy controllers have no drives), `-cpu
-Haswell,-pcid,-hle,-rtm,-invpcid,-tsc-deadline,-erms,-mca,-mce`, whose `/proc/cpuinfo` flags equal natemu's but three: QEMU
+Haswell,-pcid,-hle,-rtm,-invpcid,-tsc-deadline,-erms,-mca,-mce` (`+sha-ni` added on November 3 with the profile's SHA,
+in `qcmp-20261103-01/boot.py` and `bench-20261103-01/scripts/bench.py`; QEMU 11.1.2's TCG implements it, 7.2's does not), whose `/proc/cpuinfo` flags equal natemu's but three: QEMU
 keeps `xsaveopt` (without it TCG's boot hangs after "SRBDS"), and lacks `nonstop_tsc` and `tsc_known_freq` (TCG offers no
 invariant TSC and no leaf 15H, so Linux calibrates against the PIT there); `-accel tcg,thread=multi|single`. Cells: mean
 (min-max; guest s at the panic or at "Run /init"). The aggregator fails on any boot that did not reach its end point; all
@@ -581,7 +582,8 @@ the default only). Everything passed but the 7 known i8b departures (they flag `
 | `tools/run_i8_faults.py`, `tools/reference/gen_i8.py` | I8 AVX/AVX2/FMA/F16C: the QEMU 7.2 corpus (`gen_i8.py`, VEX.128 and VEX.256 forms, every rounding mode, FTZ/DAZ; run with `run_slice1_vm.py`), and the fault matrix by the SDM rules against the run cut before the instruction: #PF on 32-byte crossings with no partial update, alignment #GP (16/32), non-canonical #GP/#SS, #UD/#NM gating (OSXSAVE, XCR0, TS; EM/OSFXSR/BMI not gated; legacy prefixes before VEX; XSETBV re-keying), refusals, device and all-ones pages, the XSAVE round trip with live YMM state, DE/MXCSR hand cases (boot-features plan, Built (I8)) |
 | `tools/run_i6b.py`, `tools/reference/gen_i6b.py` | I6b PCMPxSTRx and the x87 transcendental, remainder, scale and extract forms (resident `svc`): `corpus` against QEMU 7.2 (every imm8 in every form, legacy/VEX, REX.W/VEX.W lengths where QEMU agrees; x87 results QEMU computes in 80 bits within 2 ulps), `cases` by the SDM (C2 at and around 2^63, FPREM/FPREM1 quotient bits and partial remainders, stack underflow/overflow responses, IE/ZE/OE/UE/PE, PCMPxSTRx #PF/#GP/#SS with no partial update, no alignment fault, 64-bit lengths against an SDM model) (boot-features plan, Built (I6b)) |
 | `tools/run_x4.py` | X4 AP start through the ACPI wakeup mailbox: `units` OS scripts at 2-4 vCPUs (each AP in turn, in reverse, an absent or the BSP's APIC ID and a reserved command ignored, a second wakeup for a woken AP ignored) judged by the independently written `tools/models/mailbox_model.py` (outcome and trace; the vector read before the acknowledgement is a code-inspected invariant, no test sees it) plus the ACPI wake state, block sizes default and 1, wake latency reported; `adversarial` the X4 review's cases (command before APIC ID, a Wakeup before any vCPU runs, the mailbox through an alias page, stores into the page's OS area, two Wakeups without waiting); `trampoline` Linux 6.12's `trampoline_start64` 64-bit branch and the `secondary_startup_64` prefix to the lock release, transcribed, run by every AP at 2-4 vCPUs vs pinned QEMU (its stub starts the APs at the same vector) (boot-features plan, Built (X4)) |
-| `tools/run_i9_faults.py`, `tools/reference/gen_i9.py` | I9 MOVBE, MMX, AES-NI/PCLMULQDQ (legacy and VEX.128), PDEP/PEXT, FFREEP: the QEMU 7.2 corpus (`gen_i9.py`; run with `run_slice1_vm.py`), and the fault matrix by the SDM rules against the run cut before the instruction, the x87/MMX state included (#PF/#GP/#SS, m32 PUNPCKL*, alignment of the legacy m128 forms, MMX gating #UD/#NM, #UD for MOVBE register forms and ADX/SHA, #AC, MASKMOVQ refused) (boot-features plan, Built (I9)) |
+| `tools/run_i9_faults.py`, `tools/reference/gen_i9.py` | I9 MOVBE, MMX, AES-NI/PCLMULQDQ (legacy and VEX.128), PDEP/PEXT, FFREEP: the QEMU 7.2 corpus (`gen_i9.py`; run with `run_slice1_vm.py`), and the fault matrix by the SDM rules against the run cut before the instruction, the x87/MMX state included (#PF/#GP/#SS, m32 PUNPCKL*, alignment of the legacy m128 forms, MMX gating #UD/#NM, #UD for MOVBE register forms and ADX, #AC, MASKMOVQ refused; since November 3 the SHA forms' faults, alignment, gating and 66/F2/F3 #UD) (boot-features plan, Built (I9), Built (SHA)) |
+| `tools/reference/gen_sha.py`, `tools/reference/ref_native.py` | SHA (November 3): 60 programs, all seven instructions, every SHA1RNDS4 imm8, register and memory forms with REX, 0x67 and ignored prefixes; the reference is the AMD machine running each program's ELF natively (`ref_native.py`; pinned QEMU 7.2 has no SHA), checked against the SDM pseudocode (`gen_sha.py --check`); run with `run_slice1_vm.py` (boot-features plan, Built (SHA)) |
 | `tools/run_i10_faults.py`, `tools/reference/gen_i10.py` | I10 0x67 address size, XLAT, #UD forms, CET hint space: the QEMU 7.2 corpus (`gen_i10.py`: EA forms with garbage upper halves and 4 GiB wrap, FS-based, EIP-relative, moffs32, XLAT, addr32 call/jmp, strings with ESI/EDI/ECX, LOOP/JECXZ; run with `run_slice1_vm.py`), and the case matrix by the SDM rules against the run cut before the instruction (#PF at the truncated address, no #GP for garbage upper halves, FS.base + EA non-canonical #GP, EIP wrap, host-decoded forms with 0x67, #AC, zero-extended ESI/EDI/ECX at a midway REP fault, LOOP/JECXZ on ECX, BT* m, r refused, every #UD form, #UD before #NM, the 0f 1e NOPs) (boot-features plan, Built (I10)) |
 | `tools/run_i5b.py` | I5b FXSAVE/FXRSTOR, XSAVE/XRSTOR, XGETBV/XSETBV: `images` (FXSAVE/XSAVE/XRSTOR images and XCR0/CPUID.0DH sequences byte by byte against QEMU's Haswell model, block sizes default and 1, declared differences compared on natemu's side), `faults` (alignment, #PF at page boundaries with no partial update, #NM/#UD gating, XSETBV/XGETBV and XRSTOR header #GP, refusals, #AC never; SDM rules, QEMU where it can run the case) (boot-features plan, Built (I5b)) |
 | `tools/run_s4.py` | S4 debug: `programs` (tools/bench/smp/debug.py: TF through mixed instructions, REP strings, CALL/RET, CPUID; POPF/IRETQ/SYSRET/SYSCALL with TF; MOV SS; INT3/INT n/INT1 under TF; UD2/#GP/#PF under TF; instruction breakpoints mid-block, at a loop head, at a kept system instruction, inside an instruction, after MOV SS, at a REP, by CALL RAX, armed over translated code; DR6/DR7 read-back, DR4/DR5, DR7.GD, sticky DR6; data breakpoints for every R/W x LEN at range edges, RMW/LOCK/XCHG/CMPXCHG, BT units, x87/SSE/AVX, string and stack forms, IRETQ/POPF, an exception frame, MOV SS, a page-crossing store; I/O breakpoints on IN/OUT/INS/OUTS) judged by the SDM's expected event logs and against pinned QEMU, block sizes default and 1; `cases` HLT under TF, device-page accesses, per-vCPU registers, R/W 10 without CR4.DE refused (boot-features plan, Built (S4)) |
@@ -601,13 +603,14 @@ Full suite (about 25 minutes of runner time per pass on the M4 at R2, waits for 
 # From the repository root; zsh or bash. Wait until no other natemu-host runs (timing-sensitive cases: kicks, l4b,
 # x3 stress). A timing failure may be rerun alone once, never more: the results record the first run's result and the
 # rerun's beside it; a failed rerun is a failure.
-F=../natemu-raw/fexc-native-20261026-01/series48-lean/obj/fexc   # tools/fexc/build.sh rebuilds it (patches 0001-0029 + the shim)
+F=../natemu-raw/fexc-native-20261026-01/series49-sha/obj/fexc    # tools/fexc/build.sh rebuilds it (patches 0001-0029 + the shim)
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 I8=../natemu-raw/i8-corpus-20261030-01      # gen_i8.py programs and their QEMU 7.2 results
 I8B=../natemu-raw/i8-corpus-20261030-02     # I8 review corpus: 7 known QEMU two-NaN departures (plan, Built (I8) review)
 I6B=../natemu-raw/i6b-corpus-20261030-01    # gen_i6b.py: PCMPxSTRx every imm8, x87 helper forms
 I9=../natemu-raw/i9-corpus-20261030-01      # gen_i9.py: MOVBE, MMX, AES/PCLMULQDQ, PDEP/PEXT, FFREEP
+SHA=../natemu-raw/sha-corpus-20261103-01    # gen_sha.py: SHA1*/SHA256*, expected from the AMD machine (ref_native.py)
 BIG=../natemu-raw/i9-big-20261030-01        # PDEP/PEXT/PCMPISTRI runs over a block's 32 KiB
 I10=../natemu-raw/i10-corpus-20261030-01    # gen_i10.py: 0x67 forms, XLAT, strings/LOOP with ECX
 REX=../natemu-raw/rex-corpus-20261102-02    # gen_rex.py: REX chains (the census's last sites), segment-prefixed branches
@@ -671,6 +674,8 @@ tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i9" "$I9/pro
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i9-1" --max-block 1 "$I9/programs.json" "$I9/expected.json"
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i9-big" "$BIG/programs.json" "$BIG/expected.json"
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i9-big-1" --max-block 1 "$BIG/programs.json" "$BIG/expected.json"
+tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/sha" "$SHA/programs.json" "$SHA/expected.json"
+tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/sha-1" --max-block 1 "$SHA/programs.json" "$SHA/expected.json"
 tools/with-env python3 tools/run_i9_faults.py --fexc "$F" --out "$O/i9-faults"                 # I9: faults with the x87/MMX state, gating, #UD, #AC, refusals
 tools/with-env python3 tools/run_i9_faults.py --fexc "$F" --out "$O/i9-faults-1" --max-block 1
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/i10" "$I10/programs.json" "$I10/expected.json"
@@ -696,6 +701,12 @@ tools/with-env python3 tools/run_r1.py r1b --fexc "$F" --out "$O/r1b"   # R1b: m
 ```
 
 ## 6. Compiler reproducibility
+
+**series49-sha** (SHA advertised, owner decision November 3; boot-features plan, Built (SHA)): `patches/0001-0029`
+(unchanged) on the pinned FEX commit with the shim admitting SHA1*/SHA256* (`Sse`) and its #UD cut removed; `obj/fexc`
+SHA-256 `fe1631cbea73342f32a3a3689593c6bf5f9263577e0691e68f3b76d9208e1f61`. Built as `build.sh` does but from
+`git archive` trees of the submodule and its three externals (no worktree in the repository's git directory); the same
+procedure on HEAD's shim gives series48-lean's `8c8bd659...a91a` exactly. Before it:
 
 **series48-lean** (perf plan "Measured (chunk 2)", November 3): `tools/fexc/build.sh
 ../natemu-raw/fexc-native-20261026-01/series48-lean` applies `patches/0001-0029` to the pinned FEX commit with the working

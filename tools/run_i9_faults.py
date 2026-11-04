@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Precise faults, gating, #AC and refusals of the I9 forms: MOVBE, MMX, AES-NI/PCLMULQDQ, PDEP/PEXT, FFREEP and the
-unadvertised ADX/SHA forms (boot-features plan, chunk I9), judged by the SDM rules below and against natemu's own run of the
+"""Precise faults, gating, #AC and refusals of the I9 forms: MOVBE, MMX, AES-NI/PCLMULQDQ, PDEP/PEXT, FFREEP, SHA (advertised
+since November 3) and the unadvertised ADX forms (boot-features plan, chunk I9), judged by the SDM rules below and against natemu's own run of the
 same program cut before the instruction (run_i8_faults' harness; QEMU user mode cannot set CR0/CR4 and its fault state lacks
 the x87/MMX registers).
 
@@ -12,10 +12,12 @@ Expected (SDM Vol.2 per instruction; Vol.3 Table 12-1 and 6.15):
     data region and the x87/MMX state (MM0..7, TOP, the tag byte, the condition codes and exception flags) equal the run cut
     before the instruction (an MMX instruction's TOP = 0 and all-valid tags are written only after its accesses: patch 0024);
     PUNPCKL* mm, m32 reads 4 bytes (no fault on the next page), MOVD 4, PINSRW 2;
-  - #GP(0) for a misaligned legacy AESENC/PCLMULQDQ m128 and CVTPD2PI m128 (exception class 4 / 2), none for VEX.128 forms;
+  - #GP(0) for a misaligned legacy AESENC/PCLMULQDQ/SHA* m128 and CVTPD2PI m128 (exception class 4 / 2), none for VEX.128 forms;
   - MMX gating: CR0.EM #UD, else CR0.TS #NM (EMMS too), not CR4.OSFXSR; the MMX forms with an XMM operand (CVTPI2PS...) gate
     like SSE (#UD without OSFXSR); MOVBE, PDEP/PEXT are not gated; FFREEP is x87 (#NM under EM or TS);
-  - #UD for MOVBE with a register operand and for ADCX/ADOX and SHA (not advertised), whatever their operands;
+  - SHA gates like SSE (#NM under CR0.TS, #UD without CR4.OSFXSR);
+  - #UD for MOVBE with a register operand and for ADCX/ADOX (not advertised), whatever their operands, and for SHA with a 66
+    or F3 prefix (blank cells of Table A-4);
   - #AC(0) at CPL 3 with CR0.AM and RFLAGS.AC for a misaligned MOVBE (2/4/8), MOVQ/MOVD/PINSRW MMX operand (8/4/2);
   - MASKMOVQ refused (`unsupported_form`) before any effect.
 """
@@ -44,7 +46,10 @@ FORMS = [('movbe16', 'movbe cx, word ptr [{a}]', 2, 0, False), ('movbe32', 'movb
          ('aesenc', 'aesenc xmm1, xmmword ptr [{a}]', 16, 16, False), ('aeskeygenassist', 'aeskeygenassist xmm1, xmmword ptr [{a}], 7', 16, 16, False),
          ('pclmulqdq', 'pclmulqdq xmm1, xmmword ptr [{a}], 0x11', 16, 16, False),
          ('vaesdec', 'vaesdec xmm1, xmm2, xmmword ptr [{a}]', 16, 0, False), ('vpclmulqdq', 'vpclmulqdq xmm1, xmm2, xmmword ptr [{a}], 1', 16, 0, False),
-         ('pdep64', 'pdep rcx, rdx, qword ptr [{a}]', 8, 0, False), ('pext32', 'pext ecx, edx, dword ptr [{a}]', 4, 0, False)]
+         ('pdep64', 'pdep rcx, rdx, qword ptr [{a}]', 8, 0, False), ('pext32', 'pext ecx, edx, dword ptr [{a}]', 4, 0, False)] + [
+         (g.split()[0], g, 16, 16, False) for g in ['sha1nexte xmm1, xmmword ptr [{a}]', 'sha1msg1 xmm1, xmmword ptr [{a}]',
+         'sha1msg2 xmm1, xmmword ptr [{a}]', 'sha256rnds2 xmm1, xmmword ptr [{a}]', 'sha256msg1 xmm1, xmmword ptr [{a}]',
+         'sha256msg2 xmm1, xmmword ptr [{a}]', 'sha1rnds4 xmm1, xmmword ptr [{a}], 2']]
 
 
 def mmx_shift(op, v, c):
@@ -112,19 +117,23 @@ def cases():
         out.append(case(f'ts-{g.split()[0]}', g, [], NM, prelude=ts, cpl=0))
         out.append(case(f'em-{g.split()[0]}', g, [], UD, prelude=em, cpl=0))
         out.append(case(f'noosfxsr-{g.split()[0]}', g, [], UD, sse=False, ymmh=False, xcr0=0))
-    for g in ['aesenc xmm1, xmm2', 'pclmulqdq xmm1, xmm2, 0']:
+    for g in ['aesenc xmm1, xmm2', 'pclmulqdq xmm1, xmm2, 0', 'sha256rnds2 xmm1, xmm2', 'sha1rnds4 xmm1, xmm2, 3']:
         out.append(case(f'ts-{g.split()[0]}', g, [], NM, prelude=ts, cpl=0))
         out.append(case(f'noosfxsr-{g.split()[0]}', g, [], UD, sse=False, ymmh=False, xcr0=0))
+    out.append(case('em-sha1nexte', 'sha1nexte xmm1, xmm2', [], UD, prelude=em, cpl=0))
     out.append(case('ts-vaesenc', 'vaesenc xmm1, xmm2, xmm3', [], NM, prelude=ts, cpl=0))
     out.append(case('noosxsave-vaesenc', 'vaesenc xmm1, xmm2, xmm3', [], UD, xcr0=0))
     for g in ['movbe ecx, dword ptr [rax]', 'pdep rcx, rdx, rsi', 'pext ecx, edx, esi']:
         out.append(case(f'ts-em-{g.split()[0]}-runs', g, [], None, prelude=emts, cpl=0))
     out.append(case('ts-ffreep', 'ffreep st(0)', [], NM, prelude=['fld1'] + ts, cpl=0))
     out.append(case('em-ffreep', 'ffreep st(0)', [], NM, prelude=['fld1'] + em, cpl=0))
-    # #UD: MOVBE with a register operand (REX.W 0f 38 f0 c1, 66 0f 38 f1 c8), ADX, SHA (not advertised).
-    for tag, b in [('movbe-reg', '0x48, 0x0f, 0x38, 0xf0, 0xc1'), ('movbe-reg-st16', '0x66, 0x0f, 0x38, 0xf1, 0xc8')]:
+    # #UD: MOVBE with a register operand (REX.W 0f 38 f0 c1, 66 0f 38 f1 c8), ADX (not advertised), SHA with 66 or F3.
+    for tag, b in [('movbe-reg', '0x48, 0x0f, 0x38, 0xf0, 0xc1'), ('movbe-reg-st16', '0x66, 0x0f, 0x38, 0xf1, 0xc8'),
+                   ('sha256rnds2-66', '0x66, 0x0f, 0x38, 0xcb, 0xca'), ('sha1msg1-f3', '0xf3, 0x0f, 0x38, 0xc9, 0xca'),
+                   ('sha256msg2-f2', '0xf2, 0x0f, 0x38, 0xcd, 0xca'),
+                   ('sha1rnds4-66', '0x66, 0x0f, 0x3a, 0xcc, 0xca, 0x01')]:
         out.append(case(tag, f'.byte {b}', [], UD))
-    for g in ['adcx rcx, rdx', 'adox rcx, qword ptr [rax]', 'sha1msg1 xmm1, xmm2', 'sha256rnds2 xmm1, xmm2', 'sha1rnds4 xmm1, xmm2, 3']:
+    for g in ['adcx rcx, rdx', 'adox rcx, qword ptr [rax]']:
         out.append(case(f'ud-{g.split()[0]}', g, [], UD, prelude=['mov eax, 0x200100']))
     # #AC at CPL 3 (CR0.AM, RFLAGS.AC): the operand's size (SDM Vol.3 6.15 Interrupt 17).
     head = ['mov rax, cr0', 'bts rax, 18', 'mov cr0, rax']

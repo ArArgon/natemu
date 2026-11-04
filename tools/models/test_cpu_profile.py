@@ -54,7 +54,7 @@ class Cpuid(unittest.TestCase):
         self.assertEqual(P.cpuid(0xB, 9, vcpu=2), (0, 0, 9, 2))
 
     def test_leaf7_and_extended_state(self):
-        self.assertEqual(P.cpuid(7, 0), (0, bitset(0, 3, 5, 7, 8), 0, 0))   # FSGSBASE BMI1 AVX2 SMEP BMI2 only
+        self.assertEqual(P.cpuid(7, 0), (0, bitset(0, 3, 5, 7, 8, 29), 0, 0))   # FSGSBASE BMI1 AVX2 SMEP BMI2 SHA only
         self.assertEqual(P.cpuid(7, 1), (0, 0, 0, 0))
         self.assertEqual(P.cpuid(0xD, 0, xcr0=7), (7, 832, 832, 0))
         self.assertEqual(P.cpuid(0xD, 0, xcr0=3)[1], 576)

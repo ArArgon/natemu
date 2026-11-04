@@ -369,7 +369,9 @@ inline Verdict Mmx(uint8_t map, uint8_t pfx, uint8_t op, bool has_modrm, uint8_t
 // Refused: MMX-register forms (x87/MMX state is I6's: cvtpi2ps/pd, cvt(t)ps2pi/pd2pi, movq2dq, movdq2q, the no-prefix 0f 38/
 // 0f 3a and 0f 60..7f/c4/c5/d0..ff forms), maskmovdqu (a byte-masked store FEX lowers as a load, select and store of all
 // 16 bytes: it would fault and write where x86 does not), SSE4a (not advertised). I9: AES and PCLMULQDQ (CPUID.1:ECX 25, 1)
-// through FEX's Arm crypto lowering (AESE/AESD/AESMC/AESIMC with a zero round key and an EOR; PMULL/PMULL2). Memory-operand sizes and alignment: SDM Vol.2 per instruction and
+// through FEX's Arm crypto lowering (AESE/AESD/AESMC/AESIMC with a zero round key and an EOR; PMULL/PMULL2). SHA (November 3,
+// CPUID.7.0:EBX 29; NP 0f 38 c8..cd, NP 0f 3a cc) through FEX's FEAT_SHA1/FEAT_SHA256 lowering (SHA1C/P/M, SHA1H, SHA1SU1,
+// SHA256H/H2, SHA256SU0/SU1 with lane shuffles; SHA256RNDS2 reads XMM0). Memory-operand sizes and alignment: SDM Vol.2 per instruction and
 // 2.5 (exception classes 1, 2, 4: a 16-byte operand must be 16-byte aligned, except movups/movupd/movdqu/lddqu).
 inline Verdict Sse(uint8_t map, uint8_t pfx, uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
   const Verdict none {UNSUPPORTED, false, nullptr};
@@ -412,6 +414,8 @@ inline Verdict Sse(uint8_t map, uint8_t pfx, uint8_t op, bool has_modrm, uint8_t
     else if ((op >= 0x08 && op <= 0x0f && op != 0x0a && op != 0x0b) || (op >= 0x40 && op <= 0x42)) form = M128;
     else if (op == 0x44 || op == 0xdf) form = M128;        // pclmulqdq, aeskeygenassist (I9: exception class 4, aligned)
     else if (op >= 0x60 && op <= 0x63) form = UNALIGNED;   // pcmpestrm/i, pcmpistrm/i: no alignment (SDM); I6b: svc #STRING
+  } else if ((map == 5 && pfx == 0 && op >= 0xc8 && op <= 0xcd) || (map == 6 && pfx == 0 && op == 0xcc)) {
+    form = M128;   // SHA1NEXTE/MSG1/MSG2, SHA256RNDS2/MSG1/MSG2, SHA1RNDS4 (CPUID.7.0:EBX.SHA[29]; class 4, aligned): Arm SHA1*/SHA256*
   }
   if (form == NO) {
     if (map == 1 && pfx == 0x66 && op == 0xf7) return Uns("maskmovdqu: FEX stores all 16 bytes (a masked store needs its own lowering)");
@@ -498,21 +502,18 @@ inline bool Lockable(const DecodedInst& d, bool has_modrm, uint8_t mod, uint8_t 
 
 // I9: 0f 38 / 0f 3a forms the presented CPU raises #UD for whatever their operands (cpu_profile.json): ADCX (66 0f 38 f6) and
 // ADOX (F3 0f 38 f6; CPUID.7.0:EBX.ADX[19] = 0), WRSS (NP 0f 38 f6) and WRUSS (66 0f 38 f5; CPUID.7.0:ECX.CET_SS[7] = 0) and the
-// rest of 0f 38 f5/f6, SHA (NP 0f 38 c8..cd, NP 0f 3a cc; CPUID.7.0:EBX.SHA[29] = 0), and MOVBE with a register operand (SDM
-// MOVBE: #UD). The prefixes from the decoder's flags (set before a decode failure too). The host decodes each as `system::UD`;
+// rest of 0f 38 f5/f6, and MOVBE with a register operand (SDM MOVBE: #UD; SHA is advertised since November 3: `Sse`). The prefixes from the decoder's flags (set before a decode failure too). The host decodes each as `system::UD`;
 // I10: F3 0f 38 f0/f1 (MOVBE with REP: #UD) is a `ud` cut (FEX's decode fails before its ModRM).
 inline Verdict Undefined0F38(const DecodedInst& d, bool has_modrm, uint8_t mod) {
   const uint8_t op = d.OPRaw;
   const uint32_t f = d.Flags;
-  const bool p66 = f & DecodeFlags::FLAG_OPERAND_SIZE, pf2 = f & DecodeFlags::FLAG_REPNE_PREFIX, pf3 = f & DecodeFlags::FLAG_REP_PREFIX;
+  const bool pf2 = f & DecodeFlags::FLAG_REPNE_PREFIX, pf3 = f & DecodeFlags::FLAG_REP_PREFIX;
   if (d.FexcMap == FEXC_MAP_0F38) {
     if ((op == 0xF0 || op == 0xF1) && !pf2 && !pf3 && has_modrm && mod == 3) return Sys("movbe with a register operand (#UD)");
     // I10: SDM MOVBE "#UD ... If REP (F3H) prefix is used" (FEX's decoder fails before the ModRM: any operand).
     if ((op == 0xF0 || op == 0xF1) && pf3) return Ud("movbe with an F3 prefix (#UD)");
     if (op == 0xF5 || op == 0xF6) return Sys("adcx/adox, wrss/wruss (ADX, CET_SS not advertised: #UD)");
-    if (op >= 0xC8 && op <= 0xCD && !p66 && !pf2 && !pf3) return Sys("sha1*/sha256* (SHA not advertised: #UD)");
   }
-  if (d.FexcMap == FEXC_MAP_0F3A && op == 0xCC && !p66 && !pf2 && !pf3) return Sys("sha1rnds4 (SHA not advertised: #UD)");
   return {UNSUPPORTED, false, nullptr};
 }
 

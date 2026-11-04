@@ -214,7 +214,7 @@ error bits in some RMW and never-mapped cases (`docs/restructure/slice2-contract
 | **I6** x87 reduced precision | FEX reduced mode; 80-bit images; helper inventory | `X87_F64`; QEMU exact-by-construction | ASM | 0 fail; deviation recorded |
 | **I6b** x87 helper forms without a helper library | Research (Oct 29, read-only): no general in-VM helper library (needs an EL0 stack page and an EL0 rodata page, helper code outside admission, IRQ/stop handling inside helpers; pays off only for full 80-bit mode, which the owner did not choose). Instead: FSIN/FCOS/FSINCOS/FPTAN/FPATAN/F2XM1/FYL2X/FYL2XP1/FSCALE/FPREM/FPREM1 by `svc` to the resident (division precedent), computed with the toolchain's compiler_builtins libm, with x87's C2 out-of-range rule and FPREM's quotient bits and partial remainder (FEX has neither); PCMPISTRI/PCMPESTRI (I5c) the same way, porting FEX's pure C++; FLD/FSTP m80 cost goes with K2, then inline conversion in fexc only if still hot (one 10-byte crossing check before the first store) | x87 corpus extended with these forms; SDM C2/quotient-bit cases; census | ASM, faults | refused forms executed or refused with reason |
 | **I8** AVX/AVX2 (if Q3 keeps them) | YMM ops | FEX ASM VEX tests | ASM | as I5a |
-| **I9** remaining advertised forms | MOVBE, MMX (x87 aliasing decided), AES-NI/PCLMULQDQ, PDEP/PEXT, FFREEP; #UD for unadvertised ADX/SHA | QEMU corpus; fault matrix with the x87/MMX state; FEX ASM; census | ASM, faults | every advertised form executed or refused with reason |
+| **I9** remaining advertised forms | MOVBE, MMX (x87 aliasing decided), AES-NI/PCLMULQDQ, PDEP/PEXT, FFREEP; #UD for unadvertised ADX/SHA (SHA advertised since November 3: Built (SHA)) | QEMU corpus; fault matrix with the x87/MMX state; FEX ASM; census | ASM, faults | every advertised form executed or refused with reason |
 | **I10** remaining architectural refusals (owner, October 30) | 0x67 address size in 64-bit mode (every memory form, strings, LOOP/JECXZ, moffs, EIP-relative, XLAT); XLAT; #UD for unadvertised/reserved encodings (XOP, RTM, PadLock, reserved VEX/MMX, F3 MOVBE...); CET hint space as NOPs; gathers/masked stores stay refused | QEMU corpus at both block sizes; fault/#UD/NOP case matrix by the SDM; FEX ASM; census; Debian boot | standing suite | every 0x67 form exact with exact fault sites; every listed #UD delivered |
 | **R1a** single-vCPU composites (~1 run) | Decompressor entry; kernel head (`head_64.S:37-405`); early #PF table building; `int3_selftest`; alternatives/static-call patching through a second mapping under another CR3; syscall round trip with PTI CR3 switch and VERW; timer tick into `sti; hlt`; serial write with IRQ4 | QEMU system mode with the same programs | all | each matches at block sizes default/1 |
 | **R1b** SMP composites (~1 run) | Mailbox AP start into the head; `text_poke_bp` + IPI `sync_core`; paranoid NMI with `lsl`; IPIs under load | QEMU at N = 2..4 | all | each matches at N = 2..4 |
@@ -2552,7 +2552,7 @@ FCW.RC/PC, MOVBE, AES/SHA/PCLMULQDQ/ADX, MMX.
 *Built (I9, the remaining advertised forms user space hits: MOVBE, MMX, AES-NI/PCLMULQDQ, PDEP/PEXT, FFREEP; and #UD for the
 unadvertised ADX/SHA/CET_SS forms; fexc series32 = series31 + patch 0024 + shim changes):* **Profile** (`cpu_profile.json`):
 CPUID.1:ECX advertises MOVBE (22), AES (25), PCLMULQDQ (1); CPUID.1:EDX MMX (23); CPUID.7.0:EBX = 1A9H: BMI1, AVX2, SMEP, BMI2
-(8) and FSGSBASE, not ADX (19), SHA (29), ERMS or AVX-512; CPUID.7.0:ECX = 0 (no VAES, VPCLMULQDQ, GFNI, CET_SS); no 3DNow!.
+(8) and FSGSBASE, not ADX (19), SHA (29; advertised since November 3, EBX = 200001A9H: Built (SHA)), ERMS or AVX-512; CPUID.7.0:ECX = 0 (no VAES, VPCLMULQDQ, GFNI, CET_SS); no 3DNow!.
 **MOVBE** (0f 38 f0/f1, none or 66): admitted with memory operands at 16, 32 and 64 bits. FEX lowers it to a plain load or store
 plus REV (REV16 for a 16-bit store; a 16-bit load is REV32 and a BFXIL into the register), so the access is an ordinary recorded
 site: #PF/#GP/#SS precise, a crossing store completed by the resident, #AC natively (SCTLR.A at CPL 3 under CR0.AM/RFLAGS.AC, X2).
@@ -3729,6 +3729,35 @@ both, probes 83/83, ASM 1,875 pass / 0 fail / 48 / 347 (FEX's disabled `Primary/
 natemu takes the Intel rel32 target and faults there, at 0x6ec0017/0x7ec0017 as computed from the bytes; `run_asm.py` files
 them unsupported, as the refusal did before), `run_boot_smoke.py` 4/4. Removed from the to-verify list (§5): the SDM
 defines this.
+
+*Built (SHA, owner decision November 3; compiler **series49-sha** = patches 0001-0029 + shim change; uncommitted on 21517f2, whose code is d3e1a5b's):*
+**Profile:** CPUID.7.0:EBX = 200001A9H (SHA, bit 29, advertised; `cpu_profile.json`, the generated `cpu_profile.rs`, the
+Python vectors). **Shim:** NP 0f 38 c8..cd and NP 0f 3a cc are SSE forms in `Sse` (exception class 4: an m128 is 16-byte
+aligned, #GP(0) before any walk; gated as SSE); I9's #UD cut is gone. 66/F2/F3 cells stay blank (Table A-4/A-5), #UD by
+the host's `undefined()`; the host's SHA decode arm is gated by `advertised(SHA)`. fexc has no profile input:
+`test_slice1.py` fails if the bit is cleared without restoring the cut. **Lowering:** FEX's, on the M4's FEAT_SHA1/
+FEAT_SHA256 instructions (SHA1C/P/M with a zero E and K added to W, SHA1H, SHA1SU1, SHA256H/H2 on XMM0[63:0] doubled, of
+whose four rounds the upper halves are x86's two, SHA256SU0, SHA256SU1 with a zero accumulator; lane reversals by TBL/ZIP/
+REV64); no software path. **Checks:** `tools/reference/gen_sha.py` (60 programs, 960 instructions: all seven, every
+SHA1RNDS4 imm8, XMM0..15 with destination = source, memory absolute/RBX/R13/R12 + R8*8/RIP-relative/0x67, REX.W and
+ignored DS/ES/CS/SS raw-encoded). Pinned QEMU 7.2's TCG has no SHA (its `TCG_7_0_EBX_FEATURES` lacks SHA_NI, no helpers),
+so `tools/reference/ref_native.py` runs each program's ELF natively on the reference AMD machine (Ryzen 7 8845HS,
+`sha_ni`): `natemu-raw/sha-corpus-20261103-01/`; the AMD results equal the SDM pseudocode transcribed in `gen_sha.py`
+(`--check`: 960/960; a one-bit error in any instruction's model is caught). natemu 60/60 at block sizes default and 1;
+red on series48-lean + HEAD (60 #UD). The independent review's simulation of FEX's IR on the Arm pseudocode: 20,000
+random cases and SHA-1/SHA-256("abc") exact. `run_i9_faults.py` 586 -> 662 (each form: #PF, crossing #GP, mis8 #GP,
+noncanonical #GP/#SS, straddle; #NM under TS, #UD under EM and without OSFXSR; #UD for 66/F2/F3), 662/662 at both block
+sizes; FEX ASM 1,876 -> 1,891 pass (against the batch-end run on HEAD: the 7 H0F38/H0F3A and 5 SSELanePreservation SHA tests,
+FEX_bugs/H0F3AREXBug, nzcv_spill_enderlilies, modrm_oob/H0F3A), 0 fail, 48, 346 -> 331 unsupported; I9
+corpus 120/120 and I10 88/88 at both sizes, i10 faults 296 at both, `run_x1.py` 6/6 + 196/196, `test_slice1.py` +
+`test_fexc.py` 46, `cargo test` 163 + 1 ignored, Python 299 (3 skipped), `run_boot_smoke.py` 4/4. Census
+(`natemu-raw/kernel-census-sha-20261103-01`): initramfs `system` 226,564 -> 225,267, the 1,297 SHA sites admitted, nothing
+else moved; the kernel has none. **Deviation from the reference machine (not from the SDM):** the AMD machine runs a
+misaligned SHA m128 (`sha-corpus-20261103-01/probe-output.txt`; PADDD/AESENC/PSHUFB with the same operand fault there);
+natemu raises #GP(0) as the SDM's class 4 says. **Cost (bench initramfs, `bench=zstd`, 1 vCPU, N = 1, cache off;
+`natemu-raw/sha-20261103-01/bench/`):** verify (busybox `sha256sum`, which takes its SHA-NI path when CPUID has SHA)
+0.745 -> 0.314 s host; compress 1.64 -> 1.60, decompress 0.23 -> 0.29, whole 2.62 -> 2.20 s; both verified. QEMU 11.1.2
+(control now `+sha-ni`, its TCG implements SHA): verify 1.71 -> 0.83 s, whole 17.5 -> 17.2 s. Native: 0.080 s.
 
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 

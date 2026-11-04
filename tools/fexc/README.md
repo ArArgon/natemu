@@ -29,7 +29,10 @@ jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never 
 (series applied as twenty-nine commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series48-lean` (November 3, perf plan "Measured
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series49-sha` (November 3, owner decision: SHA
+advertised; boot-features plan, Built (SHA)): series48-lean's patches and `fexc.cpp` with the shim admitting SHA1*/SHA256*
+(NP 0f 38 c8..cd, NP 0f 3a cc) as aligned-m128 SSE forms instead of cutting them as #UD; `obj/fexc` SHA-256
+`fe1631cbea73342f32a3a3689593c6bf5f9263577e0691e68f3b76d9208e1f61`. Before it, `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series48-lean` (November 3, perf plan "Measured
 (chunk 2)": series47-seg's patches and shim with `fexc.cpp`'s server sending only what the host reads, below "Compile
 server"; objects, extent and args_read byte-identical to series47-seg's; `obj/fexc` SHA-256
 `8c8bd6594a5cbe557d8928c483f2f6c3887f9c68b8797d84e83e1912fda4f592`). Before it, series47-seg (November 3: series46-br66's patches

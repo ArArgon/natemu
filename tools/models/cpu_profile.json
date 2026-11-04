@@ -641,7 +641,7 @@
    "leaf": "0x7",
    "subleaf": 0,
    "eax": "0x0",
-   "ebx": "0x1a9",
+   "ebx": "0x200001a9",
    "ecx": "0x0",
    "edx": "0x0",
    "source": "CPU 16 (CLM-03-01-16)",
@@ -737,7 +737,7 @@
      },
      "29": {
       "name": "SHA",
-      "state": "clear"
+      "state": "advertised"
      }
     },
     "ecx": {
@@ -861,7 +861,7 @@
      }
     }
    },
-   "note": "EAX (max subleaf) = 0: \"no further structured-feature subleaf\" (CPU 16). Other subleaves: all zero (hole)."
+   "note": "EAX (max subleaf) = 0: \"no further structured-feature subleaf\" (CPU 16). Other subleaves: all zero (hole). EBX.SHA[29] advertised by owner decision Nov 3 (boot-features plan, Built (SHA)): SHA1*/SHA256* run through FEX's Arm FEAT_SHA1/FEAT_SHA256 lowering."
   },
   {
    "leaf": "0xb",

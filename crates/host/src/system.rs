@@ -237,8 +237,8 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         (MAP_TWO_F3..=MAP_TWO_66, 0x78 | 0x79) if !advertised(SSE4A) => (s.kind, rep_used) = (system::UD, true),
         // I9: MOVBE with a register operand (SDM MOVBE: #UD); F2 is CRC32, F3 is refused by fexc and a memory MOVBE is
         // admitted, none ever cut. ADCX (66 0f 38 f6) and ADOX (F3; ADX not advertised), WRSS (NP 0f 38 f6) and WRUSS (66 0f 38
-        // f5; CET_SS not advertised) and the rest of 0f 38 f5/f6, SHA (NP 0f 38 c8..cd, NP 0f 3a cc; not advertised): #UD
-        // whatever their operands.
+        // f5; CET_SS not advertised) and the rest of 0f 38 f5/f6: #UD whatever their operands; SHA (NP 0f 38 c8..cd, NP 0f 3a
+        // cc) likewise only while the profile does not advertise it (advertised since November 3: fexc compiles it, no cut).
         (MAP_0F38, 0xf0 | 0xf1) => {
             rm(bytes, &mut at, rex, &mut s)?;
             if rep != 0 || s.memory != 0 {
@@ -247,7 +247,7 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
             (s.kind, rep_used) = (system::UD, true);
         }
         (MAP_0F38, 0xf5 | 0xf6) => (s.kind, rep_used) = (system::UD, true),
-        (MAP_0F38, 0xc8..=0xcd) | (MAP_0F3A, 0xcc) if !operand16 && rep == 0 => s.kind = system::UD,
+        (MAP_0F38, 0xc8..=0xcd) | (MAP_0F3A, 0xcc) if !operand16 && rep == 0 && !advertised(SHA.unwrap()) => s.kind = system::UD,
         (MAP_PRIMARY, 0x8c | 0x8e) => {
             s.cr = rm(bytes, &mut at, rex, &mut s)?;
             s.kind = if opcode == 0x8c { system::MOV_FROM_SREG } else { system::MOV_TO_SREG };
@@ -1152,15 +1152,17 @@ mod tests {
         assert_eq!(super::decode(&[0xf2, 0x0f, 0x78, 0xc1, 0x00, 0x3f], 3, 0x78), k(UD, 3));
         assert_eq!(super::decode(&[0xf2, 0x41, 0x0f, 0x79, 0xc0], 3, 0x79), k(UD, 4));
         assert_eq!(super::decode(&[0x66, 0x0f, 0x38, 0x82, 0x00, 0x90], MAP_0F38, 0x82), k(UD, 4)); // invpcid
-        // I9: MOVBE register forms, ADCX/ADOX, WRUSS, SHA: #UD; a memory MOVBE and CRC32 are never decoded here.
+        // I9: MOVBE register forms, ADCX/ADOX, WRUSS: #UD; a memory MOVBE and CRC32 are never decoded here. SHA: #UD exactly
+        // while the profile does not advertise it.
         assert_eq!(super::decode(&[0x48, 0x0f, 0x38, 0xf0, 0xc1], MAP_0F38, 0xf0), k(UD, 5));
         assert_eq!(super::decode(&[0x66, 0x0f, 0x38, 0xf1, 0xc8], MAP_0F38, 0xf1), k(UD, 5));
         assert_eq!(super::decode(&[0x0f, 0x38, 0xf0, 0x07], MAP_0F38, 0xf0), None);
         assert_eq!(super::decode(&[0xf2, 0x0f, 0x38, 0xf0, 0xc1], MAP_0F38, 0xf0), None);
         assert_eq!(super::decode(&[0x66, 0x48, 0x0f, 0x38, 0xf6, 0xc1], MAP_0F38, 0xf6), k(UD, 5));
         assert_eq!(super::decode(&[0xf3, 0x48, 0x0f, 0x38, 0xf6, 0x07], MAP_0F38, 0xf6), k(UD, 5));
-        assert_eq!(super::decode(&[0x0f, 0x38, 0xcb, 0xc1], MAP_0F38, 0xcb), k(UD, 3));
-        assert_eq!(super::decode(&[0x0f, 0x3a, 0xcc, 0xc1, 0x01], MAP_0F3A, 0xcc), k(UD, 3));
+        let sha = if super::advertised(super::SHA.unwrap()) { None } else { k(UD, 3) };
+        assert_eq!(super::decode(&[0x0f, 0x38, 0xcb, 0xc1], MAP_0F38, 0xcb), sha);
+        assert_eq!(super::decode(&[0x0f, 0x3a, 0xcc, 0xc1, 0x01], MAP_0F3A, 0xcc), sha);
         assert_eq!(super::decode(&[0x66, 0x0f, 0x3a, 0xcc, 0xc1, 0x01], MAP_0F3A, 0xcc), None);
         assert_eq!(d("f00f01f8", 0x01).map(|s| (s.kind, s.lock)), Some((SWAPGS, 1))); // #UD by LOCK
     }

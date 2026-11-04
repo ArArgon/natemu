@@ -55,8 +55,8 @@ GPR = {'RAX': 0, 'RCX': 1, 'RDX': 2, 'RBX': 3, 'RSP': 4, 'RBP': 5, 'RSI': 6, 'RD
 # instructions architecturally (plan S2b) against the driver's start-up descriptor tables (GDTR base 0, limit FFFFH), so the
 # selectors fault or SGDT reads other values: counted unsupported with this reason.
 NOT_ADVERTISED = {'rdpid', 'rdseed', 'clflushopt', 'clzero', 'clwb', 'serialize', 'rdpkru', 'wrpkru', 'monitorx', 'mwaitx', 'rdpru',
-                  # I9: ADX and SHA (CPUID.7.0:EBX bits 19, 29 = 0)
-                  'adcx', 'adox', 'sha1msg1', 'sha1msg2', 'sha1nexte', 'sha1rnds4', 'sha256msg1', 'sha256msg2', 'sha256rnds2',
+                  # I9: ADX (CPUID.7.0:EBX bit 19 = 0; SHA, bit 29, advertised since November 3)
+                  'adcx', 'adox',
                   # I10: delivered #UD (not refused): 3DNow! (CPUID.80000001H:EDX[31] = 0), VAES/VPCLMULQDQ at 256 bits (their VEX.128
                   # forms run: a #UD at these names is the VEX.L = 1 one), AVX-VNNI (objdump prints its VEX form as `{vex} vpdp...`)
                   'pi2fw', 'pi2fd', 'pf2iw', 'pf2id', 'pfrcpv', 'pfrsqrtv', 'pfnacc', 'pfpnacc', 'pfcmpge', 'pfmin', 'pfrcp', 'pfrsqrt',
