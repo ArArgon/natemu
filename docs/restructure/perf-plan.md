@@ -1,6 +1,6 @@
 # Performance phase plan (draft)
 
-Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review; chunks 1-5 and 7 measured below (chunk 5 uncommitted on d89bc4c, chunk 7 on 0da552a). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
+Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review; chunks 1-7 measured below (chunk 5 uncommitted on d89bc4c, chunk 7 on 0da552a, chunk 6 on ea11225). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
 code, measured first; the correctness pass follows. Principles: measure first; native mechanisms; nothing keyed to
 Linux (a KASLR boot must gain too); every object still admitted; checks green; no debt.
 
@@ -473,7 +473,9 @@ vCPU at N = 4); its cost is the refill: at N = 1 the boot makes 1.16 M translati
 43 k of the 1.06 M memory hits follow a kill or a remap (39 k blocks killed, 4 k remapped), so about 1.0 M (4 x 255 k) are
 blocks placed again after a flush, each a host exit and a memory hit (about 2.1 us of request plus about 1.4 us of exit and
 bookkeeping) and a placement, linking and L1 fill again: about 3.5-4.5 s of the 17.4 s at N = 1 (an estimate from the per-request
-means, not measured directly); at N = 4 230-310 k memory hits per vCPU. Candidates: a larger arena and index with L2 to match
+means, not measured directly); at N = 4 230-310 k memory hits per vCPU. (Corrected November 3, chunk 6, measured: only about 123 k of the
+1.18 M placed requests at N = 1 are at a RIP placed before the last flush; about 1.03 M are at a RIP never asked before,
+0.91 M of them memory hits relocated from another address (chunk 4). The refill bounds at about 0.4-0.5 s, not 3.5-4.5 s.) Candidates: a larger arena and index with L2 to match
 (the code area is two thirds empty), smaller records (sites dominate), or evicting part of the cache instead of all of it.
 
 **Checks** (`suite/`: the handoff §5 block, every command at 2 GiB, both block sizes, on the build with the review's
@@ -485,6 +487,57 @@ controls), `run_x1.py` 6/6 and 196/196, `run_i5c.py` 255, `run_r1.py r1a` 7/7 an
 `run_boot_smoke.py` 4/4, and the rest of the block with exit 0. On the final build: `cargo test` both ways, the stack check,
 `run_k1.py` (200 cases, with the extended `contexts`), `run_k2.py`, fixtures at both block sizes, `run_boot_smoke.py` 4/4; all 33 installer boots of `step1/`, `step3/`
 and `flush/` reached the dialog.
+
+### Measured (chunk 6: whole-cache flushes, November 3; uncommitted on ea11225, series48-lean)
+
+**Question 1, the refill** (`natemu-raw/perf6-20261103-02/`: `campaign6.sh`, `boot.py`, `refill6.py`, `table6.py`, `runs/`;
+installer to "Select a language", 2 GiB, `mitigations=off nokaslr`, cache off, one VM at a time, a warm-up boot each, three
+interleaved rounds per build; the request line now carries the resident's flush generation, the code context, a template bit
+and the second fetch page, handoff §1). Placed requests (blocks and system decodes) by RIP, mean of three log-on runs, all
+vCPUs: at N = 1, 1,176.9 k, of which 1,033.2 k at a RIP never asked before on that vCPU, **123.1 k (10.5%) at a RIP whose
+block was placed before the last flush** (0.18 s of host request time) and 20.6 k at a RIP asked earlier in the same
+generation (killed, remapped); at N = 4, 1,363.9 k: 1,253.9 k new, 86.8 k before a flush, 23.3 k same generation. Every
+capacity flush is the metadata arena (4 per boot at N = 1, one per vCPU at N = 4; `full` [0, 4, 0]). Chunk 5's "about 1.0 M
+placed again" was wrong (corrected there): most of those are first placements at new linear addresses, of which 913.5 k
+were memory hits relocated by chunk 4's reuse. The refill bounds at about 0.4-0.5 s of 16.0 s (123 k x about 3 us of request,
+exit and placement), under §4's 5% bar.
+
+**Question 2, reuse inside the resident** (`refill6.py`; the host marks a block a template when it is not a step, has no
+address or halving cut, its answer read neither to its bytes' end nor beyond the block's pages, and does not end
+`unsupported_form`: 99.6% of blocks). Block requests whose guest-physical page, page offset, context, bytes read (length and
+hash; and the second page when the bytes cross into it) a template placed earlier on the same vCPU, in the same generation, at
+another RIP had: **870.2 k at N = 1** (887.4 k with one flush), 900.4 k at N = 4 over the four vCPUs. This is an upper bound:
+a template killed by a write whose page later holds the same bytes again still counts (39 k blocks are killed per boot), and
+the design's direct-mapped hint table is not modelled. Above the design's 0.5 M: reuse inside the resident is worth building.
+
+**Tried: right-sizing the arena and index** (the inherited partial patch, built and measured; not shipped). Per block the
+installer averages about 160 bytes of code and 263 of record: the 152-byte `Block` (64 of them four inline `LinkPoint`s of 16)
+and about 2.8 access sites of 40 bytes (FEX's site records, copied as admitted). A 256 MiB arena after the writable alias, a
+1 Mi block index and L2 of 2 Mi entries (+192 MiB and +24 MiB of address space per vCPU) leave the code area as the limit: at
+N = 1 one flush at 844 k blocks (127 MiB of code, 211 MiB of records), 31.1 k refills instead of 123.1 k. Log off, mean
+(min-max) of three: N = 1 **16.43 s (16.08-16.81) against 16.04 s (15.75-16.32)** before, no faster (host request time
+-0.23 s, `hv_vcpu_run` +0.28 s on vCPU 0, likely the first touches of the larger areas; not measured further); max RSS 871 MiB
+against 610 MiB. At N = 4 all six boots hung: vCPU 3's window lay past IPA + 1 GiB, outside the 1 GiB identity alias `_start`
+enables the MMU through (host `memory::private_space`), so it faulted at its first instruction and never came up. A
+compile-time check now holds every vCPU's window inside that alias (`abi execution.rs`, after `BACKING_BYTES`; it rejects
+the patch's layout). **Not shipped**: no gain beyond the spread, +261 MiB at N = 1. Not built either: smaller records (link
+points out of line, compact sites: perhaps 100 bytes of 263; memory only, since capacity measured no gain) and incremental
+(generational or 2Q) eviction, bounded by the same 0.4-0.5 s. **Memory budget unchanged**: per vCPU a 64 MiB arena, 256 Ki
+blocks, up to 128 MiB of code and its lookup area (L2 8 MiB).
+
+**Built.** Host performance log only (`perf.rs`, `execution.rs`): the four request-line fields above. `abi`: the window
+check. `run_slice2_probes.py`: two cases with more blocks than the records hold, at the largest code cache, two trips each:
+300,000 one-instruction ADDs fill the block index (`full` [0, 0, 2], 600,007 requests for 300,003 RIPs, 3 flushes) and
+810,000 `add rax, [rsi]` in blocks of three (three sites each) fill the arena first (`full` [0, 2, 0], peak 246,777 blocks);
+both match their x86-derived results. Negative controls (`cap/`): the index bound raised by 4,096 makes the index case a host
+error (index entries overwrite link records); the arena bound raised by 1 MiB makes the arena case a resident abort.
+
+**Checks** (`suite/`, `suite6.sh`, on the shipped tree, series48-lean, 2 GiB): `cargo test` 159 + 1 ignored, also with `FEXC`
+set; `check_resident_stack.py` `ok` (depths unchanged); Python 317; fixtures 64 and faults 7,912 at both block sizes;
+`run_slice2_probes.py` 85 match (with the two new cases); `run_k1.py` 200 cases, no problem; `run_k2.py` all ok; `contain` 0
+failures (423 controls); `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative controls flagged); all 18
+before-build boots and the after build's 6 at N = 1 reached the dialog. Not rerun: the rest of the standing suite (the resident
+is unchanged). Per-request logs deleted after analysis (also the inherited `perf6-20261103-01/refill/`).
 
 ### Measured (chunk 7: host per-request cleanups, November 3; uncommitted on 0da552a, series48-lean)
 
@@ -578,7 +631,7 @@ warm-cache speed-up, not the cold boot). *Decides:* reuse bound, proof differenc
 the resident copies it, applies the shift, checks canonicality and move fit, else asks the host. Only immediates of
 words admission classified as RIP moves or literal slots change: no branch, exit or access is created. This is
 admission-equivalent code and gets its own review. *Expected:* up to 1 M x 4-6 us. *Decides:* exits left after host
-reuse.
+reuse (chunk 6: at most 870 k requests at N = 1 and 900 k at N = 4 find a live template, above the design study's 0.5 M bar).
 
 **Shared in-memory cache and compiler pool.** *Hypothesis:* at N > 1 vCPUs compile the same blocks again; the cache
 resets wholesale at 65,536 entries (`execution.rs:842-846`). *Mechanism:* one cache per VM (sharded locks), keyed on

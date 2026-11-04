@@ -18,6 +18,10 @@ installer N = 1 cache off 17.4 s, N = 4 15.6 s. Since perf chunk 7 (uncommitted 
 is leaner: the watchdog samples an entry-time word instead of being woken by two channel sends per exit, the block RIP set
 is kept only for the program driver, guest bytes are copied a word at a time, and the memory cache is looked up in one pass
 under a universal hash (perf plan "Measured (chunk 7)"): installer N = 1 cache off 15.9 s, N = 4 13.6 s.
+Perf chunk 6 (uncommitted on ea11225) measured the whole-cache flushes and left the cache as it is: only 123 k requests per
+installer boot (N = 1) refill blocks placed before a flush, and a record arena and index sized for the code area were no
+faster (+261 MiB); the performance log gains four request-line fields, and up to 870 k requests at N = 1 could reuse a block
+of the same physical page inside the resident (perf plan "Measured (chunk 6)").
 This page is enough to start the boot integration: how to build and run a boot, what a boot takes as input, what is
 known to cost or differ, and the standing suite. The plan's "Built (...)" paragraphs hold the detail and the evidence;
 the [contract inventory](contracts.md) maps each contract to its check. No performance tuning was done beyond the
@@ -90,7 +94,7 @@ from `wait4`, the resident's buckets, K1 statistics, counters); FILE.vN one line
 RIP, guest-physical page, result, answer source, bytes read and their hash, nanoseconds per part), at most 1 GiB per
 file (later lines counted as `dropped`); failed writes are counted, the first reported on standard error, and both
 appear in each vCPU's line (`"log"`) and as a warning at its end. A resident built with `perf` but run with the log off
-draws a warning after the run. Since perf chunk 5 the K1 statistics carry `l1_switches` (code-context changes) and `l1_clears` (L1 tables cleared for a context that had none), and the resident's `l1` bucket times the switches. Since perf chunk 7 the vCPU line's parts carry `relocate` (an answer kept for another RIP relocated) and `admit` is admission alone; the request line keeps its nine parts. Times are
+draws a warning after the run. Since perf chunk 5 the K1 statistics carry `l1_switches` (code-context changes) and `l1_clears` (L1 tables cleared for a context that had none), and the resident's `l1` bucket times the switches. Since perf chunk 7 the vCPU line's parts carry `relocate` (an answer kept for another RIP relocated) and `admit` is admission alone; the request line keeps its nine parts. Since perf chunk 6 the request line ends with four more fields: the resident's flush generation when it asked, the code context (`Cpu::code_context`, hex), 1 if the block could be an in-VM reuse template (not a step, no address or halving cut, its answer read neither to its bytes' end nor beyond the block's pages, not `unsupported_form`) else 0, and the fetch's second guest-physical page (`ffffffffffffffff`: none); `natemu-raw/perf6-20261103-02/refill6.py` classifies refills and reuse candidates from them. Times are
 `CLOCK_UPTIME_RAW` nanoseconds (= `mach_absolute_time` = the guest's CNTVCT). The resident's buckets need the runtime
 built with its `perf` feature, into its own target directory so the default build stays as it is:
 `CARGO_TARGET_DIR=target/perf cargo +1.97.0 build --offline --locked --release -p natemu-runtime --target
@@ -337,6 +341,13 @@ controls), `delivery` 0 failures, `run_x3.py` (9/9, 4/4, 24/24, 6/6, 10/10, 54/5
 `run_l3.py` 0 failures, `run_l4a.py` (13/13, 4/4, 2/2, 2/2, 1/1), `run_l4b.py` (5/5, 2/2, 3/3, 11/11, 7/7, 1/1),
 `run_m3.py` 0 failures, `run_m2.py` 112/112 at 2 GiB and at 4 MiB, `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative
 controls flagged), and the initrd boots to "Select a language" at N = 1 and 4 (§4 table).
+
+**Rerun with the chunk-6 log fields, window check and capacity cases** (perf plan "Measured (chunk 6)";
+`natemu-raw/perf6-20261103-02/suite/`, 2 GiB, ea11225 plus the uncommitted change, series48-lean): `cargo test` 159 + 1 ignored,
+also with `FEXC` set; `check_resident_stack.py` `ok`; Python 317; fixtures 64 and faults 7,912 at both block sizes;
+`run_slice2_probes.py` 85 (two new cases fill the block index and the metadata arena at the largest code cache and still match;
+negative controls red); `run_k1.py` 200 cases; `run_k2.py`; `contain` 0 failures (423 controls); `run_boot_smoke.py` 4/4;
+`run_r1.py r1a` 7/7, `r1b` 12/12. The rest of the block was not rerun.
 
 **Rerun with the host per-request cleanups** (perf plan "Measured (chunk 7)"; `natemu-raw/perf7-20261103-01/suite/`, 2 GiB,
 0da552a plus the uncommitted change, series48-lean): `cargo test` 159 + 1 ignored, also with `FEXC` set; `run_boot_smoke.py`

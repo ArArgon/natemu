@@ -503,6 +503,10 @@ pub mod cache {
 
 /// Bytes of a vCPU's block of the backing before its code area: its window and the cache's fixed areas.
 pub const BACKING_BYTES: usize = cache::CODE_OFFSET;
+// Every vCPU's window starts below IPA + 1 GiB: `_start` runs with the MMU just enabled through the host's temporary
+// identity alias, one 1 GiB block at [IPA, IPA + 1 GiB) (host `memory::private_space`). Perf chunk 6: a 256 MiB arena put
+// vCPU 3's window past it, and that vCPU faulted at its first instruction (an AP that never comes up at N = 4).
+const _: () = assert!((cache::MAX_VCPUS - 1) * (BACKING_BYTES + cache::CODE_BYTES_MAX) + 2 * crate::RAM_SIZE <= 1 << 30);
 
 /// FEX `CpuStateFrame` fields admitted code may access (pinned FEX build).
 pub mod frame {

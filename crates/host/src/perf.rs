@@ -120,6 +120,11 @@ pub struct Recorder {
     part: [u64; PARTS.len()],
     pub(crate) sources: [u32; 3],
     pub(crate) read: (u64, u32),
+    /// Perf chunk 6: the request's block could be the resident's reuse template (design: not a step, no address or
+    /// halving cut, the answer read neither to the end of its bytes nor beyond the block's pages, not `unsupported_form`);
+    /// `halved`: its compile was retried with fewer instructions.
+    pub(crate) template: bool,
+    pub(crate) halved: bool,
     results: [u64; 5],
     by_source: [u64; 3],
 }
@@ -146,6 +151,8 @@ impl Recorder {
             part: [0; PARTS.len()],
             sources: [0; 3],
             read: (0, 0),
+            template: false,
+            halved: false,
             results: [0; 5],
             by_source: [0; 3],
         })))
@@ -167,8 +174,11 @@ impl Recorder {
     }
     /// The served request's line: vCPU, CR3, RIP, guest-physical page, result (B block, S system decode, N next page,
     /// F fetch fault, P park), answers from memory/disk/fexc, bytes read and their hash, then nanoseconds of each part
-    /// ([`PARTS`] order) and of the whole request.
-    pub(crate) fn request(&mut self, cr3: u64, rip: u64, gpa: u64, reply: u64, total: u64) {
+    /// ([`PARTS`] order) and of the whole request; then (perf chunk 6) the resident's cache flushes before it
+    /// (`State::generation`), the code context, 1 if the block could be a reuse template ([`Self::template`]) else 0, and
+    /// the fetch's second guest-physical page (`ffffffffffffffff`: none).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn request(&mut self, cr3: u64, rip: u64, gpa: u64, reply: u64, total: u64, generation: u64, context: u64, gpa2: u64) {
         use natemu_abi::execution as exec;
         let result = match reply {
             exec::REPLY_ADMITTED => 0,
@@ -185,8 +195,9 @@ impl Recorder {
         }
         let p = self.part;
         let line = format!(
-            "{} {cr3:x} {rip:x} {gpa:x} {} {} {} {} {} {:x} {} {} {} {} {} {} {} {} {} {total}",
-            self.vcpu, ["B", "S", "N", "F", "P"][result], s[0], s[1], s[2], self.read.1, self.read.0, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]
+            "{} {cr3:x} {rip:x} {gpa:x} {} {} {} {} {} {:x} {} {} {} {} {} {} {} {} {} {total} {generation} {context:x} {} {gpa2:x}",
+            self.vcpu, ["B", "S", "N", "F", "P"][result], s[0], s[1], s[2], self.read.1, self.read.0, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8],
+            u8::from(self.template)
         );
         if self.written + line.len() as u64 + 1 > REQUEST_BYTES {
             self.dropped += 1;
@@ -198,7 +209,7 @@ impl Recorder {
         for (t, q) in self.parts.iter_mut().zip(p) {
             *t += q;
         }
-        (self.part, self.sources, self.read) = ([0; PARTS.len()], [0; 3], (0, 0));
+        (self.part, self.sources, self.read, self.template, self.halved) = ([0; PARTS.len()], [0; 3], (0, 0), false, false);
     }
     /// The vCPU's line: `end` = its service loop's end; `fexc` = its server's (user, system) CPU ns and maximum resident
     /// bytes; `resident` = the resident's record and the K1 statistics (`execution::k1_stats`).

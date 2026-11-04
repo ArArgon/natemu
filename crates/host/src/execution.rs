@@ -965,7 +965,12 @@ impl Compiler {
                 Ok(code) => return Ok(code),
                 // Halving the smaller of the reply's count and the limit asked: the limit falls every turn even if fexc
                 // answered with more instructions than asked (the loop always ends).
-                Err((n, _)) if limit.map_or(n, |l| n.min(l)) > 1 => limit = Some(limit.map_or(n, |l| n.min(l)) / 2),
+                Err((n, _)) if limit.map_or(n, |l| n.min(l)) > 1 => {
+                    limit = Some(limit.map_or(n, |l| n.min(l)) / 2);
+                    if let Some(r) = &mut self.perf {
+                        r.halved = true;
+                    }
+                }
                 Err((_, reason)) => return Ok(Code::None(reason.into())),
             }
         }
@@ -1585,7 +1590,7 @@ fn serve(
             }
             _ => return Err("translation exit without a request".into()),
         };
-        let (began, cr3, rip, gpa) = (compiler.stamp(), state.cpu.cr3, state.cpu.rip, state.fetch[0]);
+        let (began, cr3, rip, gpa, gpa2) = (compiler.stamp(), state.cpu.cr3, state.cpu.rip, state.fetch[0], state.fetch[1]);
         state.reply = match translation(area, compiler, &mut state, step, stop_at, requests, hook)? {
             Ok(reply) => reply,
             Err(stop) => {
@@ -1600,7 +1605,7 @@ fn serve(
         area.write_record(exec::STATE_OFFSET, state);
         lap(compiler, if step { crate::perf::STEP } else { crate::perf::TRANSLATE });
         if let Some(r) = &mut compiler.perf {
-            r.request(cr3, rip, gpa, state.reply, crate::perf::now() - began);
+            r.request(cr3, rip, gpa, state.reply, crate::perf::now() - began, state.generation, state.cpu.code_context(), gpa2);
         }
         lap(compiler, crate::perf::LOG_LINE);
     }
@@ -1636,7 +1641,7 @@ fn translation(
     // S4: and before every armed instruction breakpoint, so each is the first instruction of a block (the resident checks
     // it there); one inside an instruction on this path is never reached and is passed over.
     let mut breakpoints: Vec<u64> = state.cpu.code_breakpoints().filter(|&b| b > rip).collect();
-    let (code, more, next_fault) = loop {
+    let (code, more, next_fault, cut_at, bytes_len) = loop {
         let limit = breakpoints.iter().copied().chain(hooks).min();
         let t = compiler.stamp();
         let fetched = fetched(area, state, limit)?;
@@ -1657,7 +1662,7 @@ fn translation(
             Code::None(reason) if reason == "partial_decode" && limit != hooks && limit == Some(rip + bytes.len() as u64) => {
                 breakpoints.retain(|&b| Some(b) != limit)
             }
-            _ => break (code, more, next_fault),
+            _ => break (code, more, next_fault, limit, bytes.len()),
         }
     };
     let ran_out = match &code {
@@ -1688,6 +1693,12 @@ fn translation(
     // A step reply is exactly one instruction (the resident refuses anything else too).
     if step && (block.guest_insns != 1 || block.guest_bytes > 15) {
         return Err(format!("step at {rip:#x}: {} instructions, {} bytes", block.guest_insns, block.guest_bytes));
+    }
+    if let Some(r) = &mut compiler.perf {
+        // Perf chunk 6, the in-VM reuse count: what the answer read stays inside the block's pages, short of its bytes' end.
+        let (read, last) = (u64::from(r.read.1), rip.wrapping_add(u64::from(block.guest_bytes).max(1) - 1) >> 12);
+        r.template = !step && cut_at.is_none() && !r.halved && block.end_reason != natemu_abi::code_object::end_reason::UNSUPPORTED_FORM
+            && (r.read.1 as usize) < bytes_len && rip.wrapping_add(read.max(1) - 1) >> 12 <= last;
     }
     let t = compiler.stamp();
     area.copy(exec::STAGING_OFFSET, &block.object);

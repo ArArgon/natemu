@@ -101,12 +101,15 @@ def alu_body(seed, n):
     return out
 
 
-def add_chain(count, trips, rax=0):
-    """`count` distinct `add rax, imm32` in a counted loop of `trips` (straight-line for `trips=None`), and the state
-    they leave, derived from x86 semantics (ADD, DEC; SDM vol. 2) because the QEMU reference cannot run programs
-    this long: (looping program description, expected result in ref.py's format, end RIP)."""
-    imms = [0x10000 + 977 * i for i in range(count)]
-    lines = [f'add rax, {v:#x}' for v in imms]
+def add_chain(count, trips, rax=0, step=977, load=None):
+    """`count` distinct `add rax, imm32` (immediates `step` apart; with `step=0` all equal; with `load`, `count` equal
+    `add rax, [rsi]` of the qword 0x10000 at address `load`) in a counted loop of `trips` (straight-line for
+    `trips=None`), and the state they leave, derived from x86 semantics (ADD, DEC; SDM vol. 2) because the QEMU
+    reference cannot run programs this long: (looping program description, expected result in ref.py's format, end RIP)."""
+    step = 0 if load else step
+    imms = [0x10000 + step * i for i in range(count)]
+    same = 'add rax, [rsi]' if load else 'add rax, 0x10000'
+    lines = [f'.rept {count}', same, '.endr'] if step == 0 else [f'add rax, {v:#x}' for v in imms]
     lines = [f'mov ecx, {trips}', '1:'] + lines + ['dec ecx', 'jnz 1b'] if trips else lines
     code = ref.assemble('\n'.join(lines))
     gpr, mask = gprs(rax=rax), 2**64 - 1
@@ -118,8 +121,11 @@ def add_chain(count, trips, rax=0):
     if trips:     # the last `dec ecx` (1 -> 0) sets ZF PF, clears SF OF AF; CF stays the last add's
         gpr[1], zf, sf, pf, af, of = 0, 1, 0, 1, 0, 0
     rflags = 0x202 | cf | pf << 2 | af << 4 | zf << 6 | sf << 7 | of << 11
-    program = {'name': f'adds-{count}x{trips}', 'code': code.hex(), 'rip': CODE, 'gpr': gprs(rax=rax), 'rflags': 0, 'memory': []}
-    result = {'qemu': {'gpr': [hex(v) for v in gpr], 'rflags': hex(rflags), 'rip': hex(CODE + len(code)), 'memory': []},
+    regs, memory = (gprs(rax=rax, rsi=load), [{'addr': load, 'data': (0x10000).to_bytes(8, 'little').hex()}]) if load else (gprs(rax=rax), [])
+    if load:
+        gpr[ref.REGS.index('rsi')] = load
+    program = {'name': f"adds-{count}x{trips}{'-load' if load else ''}", 'code': code.hex(), 'rip': CODE, 'gpr': regs, 'rflags': 0, 'memory': memory}
+    result = {'qemu': {'gpr': [hex(v) for v in gpr], 'rflags': hex(rflags), 'rip': hex(CODE + len(code)), 'memory': memory},
               'rflags_compare_mask': hex(0x8d5)}
     return program, result, CODE + len(code)
 
@@ -296,6 +302,28 @@ def main():
         failures += bool(diffs)
         out.append({'name': program['name'], 'args': args, 'stats': state and state['stats'], 'diffs': diffs, 'stderr': err})
         print(f"{program['name']} {' '.join(args)}: {'fail' if diffs else 'match'} {state and state['stats']} {'; '.join(diffs)[:300]}")
+
+    # Perf chunk 6: more blocks than the cache's records hold, at the largest code cache (as boots run): two trips, so the
+    # second finds the blocks placed after the last flush and asks again for the others. 300,000 one-instruction ADDs fill
+    # the block index (`MAX_BLOCKS`, 262,144) first; 810,000 `add rax, [rsi]` in blocks of three (270,000 blocks, three access sites each,
+    # 272 bytes of record) fill the 64 MiB metadata arena first (at about 246,700). Equal bytes, so the host reuses one
+    # compile per page offset: the case is about placement. Both flush when full and still match.
+    code_max = str(128 * 2**20 - (0x11000 + 4 * 4096 * 32))     # CODE_BYTES_MAX - HEAD_BYTES
+    for count, block, load, full in ((300_000, '1', None, 2), (810_000, '3', 0x1000_0000, 1)):
+        program, result, end = add_chain(count, 2, step=0, load=load)
+        args = [block, '--code-cache', code_max, '--watchdog-ms', '60000']
+        state, err = run(program['name'], program, args)
+        diffs = [f'host error: {err}'] if state is None else ref.compare(result, [ref.num(v) for v in state['gpr']],
+                 ref.num(state['rflags']), ref.num(state['rip']), state['memory'])
+        if state is not None:
+            st, filled = state['stats'], state['stats']['k1']['full']
+            if state['stop'] != 'reached' or ref.num(state['rip']) != end: diffs.insert(0, f"stopped {state['stop']} at {state['rip']}")
+            if st['flushes'] < 3 or not filled[full] or any(filled[k] for k in range(3) if k != full) or st['requests'] <= st['distinct']:
+                diffs.append(f"expected flushes at a full {['code area', 'arena', 'index'][full]}: flushes {st['flushes']}, full {filled}, requests {st['requests']} for {st['distinct']} blocks")
+        failures += bool(diffs)
+        out.append({'name': program['name'], 'args': args, 'stats': state and state['stats'], 'diffs': diffs, 'stderr': err})
+        print(f"{program['name']} {' '.join(args)}: {'fail' if diffs else 'match'} {state and {k: state['stats'][k] for k in ('requests', 'distinct', 'flushes')}} "
+              f"{state and state['stats']['k1']['full']} {'; '.join(diffs)[:300]}")
 
     # A code cache smaller than the largest block is refused at setup.
     program, _, _ = add_chain(1, None)
