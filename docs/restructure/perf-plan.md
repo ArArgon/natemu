@@ -885,6 +885,34 @@ both block sizes), no failure, 14 and 14 requests at K and 2K rounds; `run_k2.py
 reached the dialog. Not rerun: the rest of the standing suite (the change is in the resident's miss path and placement, which
 these exercise, every one with the reuse check on).
 
+### Batch 1 result (November 3, HEAD 4ed8e3a, series48-lean)
+
+Chunks 1-10 against the starting point and QEMU, rerun at the batch's end: the `natemu` stub (built alone, signed) and QEMU 11.1.2
+TCG in the like-for-like harness of §5 (handoff §4; `natemu-raw/batch1-final-20261103-01/timing/`: 149 boots, every one reached
+its end point, none contended), `nokaslr`, 2 GiB, wall s mean of 3, one VM at a time. Start = the handoff's stub rows at 335c070
+(one boot per cell, R2's harness; the plan's §1 table differs by up to 0.1 s). The standing suite is green at both RAM sizes
+(handoff §5, "Full suite at the end of performance batch 1"; the 7 known i8b departures only; `--check-reuse` installer boots
+0 mismatches).
+
+| Wall s | start (335c070) | end (4ed8e3a) | QEMU multi | QEMU single | end / QEMU multi |
+| --- | --- | --- | --- | --- | --- |
+| Installer N = 1, cache off | 67.8 | **8.85** | 6.10 | 6.12 | 1.45x |
+| Installer N = 4, cache off | 53.1 | **9.39** | 4.81 | 6.26 | 1.95x |
+| Installer N = 1, cache warm | 68.2 | **6.89** | 6.10 | 6.12 | 1.13x |
+| Installer N = 4, cache warm | 50.2 | **5.80** | 4.81 | 6.26 | 1.21x |
+| Kernel only N = 1, cache off | 4.15 | **2.69** | 1.93 | 1.93 | 1.39x |
+| Kernel only N = 4, cache off | 5.70 | **3.31** | 1.66 | 1.85 | 1.99x |
+| Kernel only N = 1, cache warm | 2.40 | **1.69** | 1.93 | 1.93 | 0.88x |
+| Kernel only N = 4, cache warm | 2.36 | **1.57** | 1.66 | 1.85 | 0.95x |
+
+Installer, cache off, per step (each chunk's own before and after in its rounds, N = 1 / N = 4 wall s): chunk 2 (fexc's report off the
+serve path) 67.9 to 49.3 / 53.6 to 37.6; chunk 4 (reuse across load addresses, in the host) 49.2 to 27.7 / 37.6 to 22.8; chunk 5
+(one L1 table per code context) 27.7 to 17.4 / 22.6 to 15.6; chunk 7 (host per-request cleanups) 17.8 to 15.9 / 15.7 to 13.6; chunk 8
+(links kept across TLB events) 15.6 to 13.6 / 13.4 to 12.4; chunk 9 (cheaper resident entry) 13.1 to 10.8 / 12.5 to 11.0; chunk 10 (reuse
+inside the resident) 10.7 to 8.6 / 11.0 to 9.4. Chunks 1 (instrumentation), 3 (relocation proof) and 6 (whole-cache flushes) changed no
+wall time. Chunks 2, 4 and 5 account for 50 of the 59 s at N = 1; the later four, each about 2 s, bring it from 17.4 to 8.6 s. At N = 4
+the installer is no faster than at N = 1 with the cache off (9.39 against 8.85 s): the next phase's focus is multi-core.
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite

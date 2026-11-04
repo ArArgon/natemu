@@ -32,6 +32,7 @@ vCPU holds at another RIP copies that block and rewrites its RIP-dependent words
 whatever it cannot prove; `--check-reuse` (and the suites' `--code-shape`) asks the host for every copy too and stops
 `reuse_mismatch` on any difference (perf plan "Measured (chunk 10)"): installer N = 1 cache off 8.6 s, N = 4 9.4 s (10.7
 and 11.0 s before, in the same rounds), 854 k of 1.16 M host requests avoided at N = 1.
+Performance batch 1 ended at 4ed8e3a (November 3): the whole standing suite green at both RAM sizes (§5 "Full suite at the end of performance batch 1"), the §4 comparison rerun with the stub: installer N = 1 and 4 cache off 8.85 and 9.39 s, warm 6.89 and 5.80 s, against QEMU `thread=multi` 6.10 and 4.81 s.
 Perf chunk 6 (uncommitted on ea11225) measured the whole-cache flushes and left the cache as it is: only 123 k requests per
 installer boot (N = 1) refill blocks placed before a flush, and a record arena and index sized for the code area were no
 faster (+261 MiB); the performance log gains four request-line fields, and up to 870 k requests at N = 1 could reuse a block
@@ -278,6 +279,8 @@ likewise at N = 1 and one boot each at N = 4, log off, before (1c4d8b9) and afte
 | `natemu-host boot-linux`, cache warm | 2.46 (1.19) | 2.04 (1.34) | 2.19 (1.47) | 2.26 (1.55) |
 | `natemu` stub, cache off | 4.15 (2.83) | 4.68 (3.70) | 5.33 (4.32) | 5.70 (4.65) |
 | `natemu-host boot-linux`, cache off | 4.51 (3.12) | 5.24 (4.13) | 5.58 (4.48) | 6.06 (5.03) |
+| `natemu` stub, cache warm, **batch 1 end** (4ed8e3a, series48-lean; like-for-like harness below, mean of 3, `nokaslr`) | **1.69** (0.82) | **1.59** (1.10) | **1.51** (1.01) | **1.57** (1.06) |
+| `natemu` stub, cache off, **batch 1 end** (same) | **2.69** (1.68) | **2.80** (2.13) | **3.05** (2.40) | **3.31** (2.62) |
 
 | To "Select a language" (initrd), wall s ("Run /init" guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
 | --- | --- | --- | --- | --- |
@@ -296,53 +299,59 @@ likewise at N = 1 and one boot each at N = 4, log off, before (1c4d8b9) and afte
 | `natemu-host boot-linux`, cache off, series48-lean, **links kept across TLB events** (perf chunk 8, N = 1 mean of 3, N = 4 one boot; 1c4d8b9 in the same rounds: 15.6 (3.22), 13.4 (4.45)) | **13.6** (3.10) | | | **12.4** (4.29) |
 | `natemu-host boot-linux`, cache off, series48-lean, **cheaper resident entry** (perf chunk 9, N = 1 mean of 3, N = 4 one boot; 9ba60d5 in the same rounds: 13.1 (3.02), 12.5 (4.42)) | **10.8** (2.66) | | | **11.0** (4.16) |
 | `natemu-host boot-linux`, cache off, series48-lean, **reuse inside the resident** (perf chunk 10, N = 1 mean of 3, N = 4 one boot; 851cbd2 in the same rounds: 10.7 (2.64), 11.0 (4.14)) | **8.6** (2.42) | | | **9.4** (3.98) |
+| `natemu` stub, cache warm, series48-lean, **batch 1 end** (4ed8e3a, like-for-like harness, mean of 3) | **6.89** (1.50) | | | **5.80** (1.78) |
+| `natemu` stub, cache off, series48-lean, **batch 1 end** (4ed8e3a, same) | **8.85** (2.51) | | | **9.39** (3.78) |
 | `natemu` stub and `boot-linux` at 16b0576, warm or off | never (hangs after "Run /init", see below) | never | | never |
 
 The QEMU rows these tables held until November 3 (R2's harness: `-machine pc` with its default devices and HPET,
-`-cpu Haswell,-pcid,-hle,-rtm,-invpcid`, and `ps -M` thread polling on the QEMU side only) are replaced by the like-for-like
-comparison below (integrity audit, November 3; `natemu-raw/qcmp-20261103-01/`: `boot.py`, `campaign.py`, `aggregate.py`,
-`runs/boots.jsonl`, `runs/table.md`, `cpu/` in `natemu-raw/audit-fix-20261103-01/`). One harness for both emulators: wall
-from process start to the end-point line, serial polled every 50 ms, nothing else polled but a check every 0.5 s for a
-foreign VM process (none seen); Debian 6.12.107, 2 GiB, `console=ttyS0 earlyprintk=serial mitigations=off` with and
-without `nokaslr`; three interleaved rounds, one VM at a time. natemu: `boot-linux` at 1c4d8b9 plus the audit's change,
-series48-lean, warm = its own compile cache per KASLR setting after a warm-up boot, off = `NATEMU_COMPILE_CACHE=off`.
+`-cpu Haswell,-pcid,-hle,-rtm,-invpcid`, and `ps -M` thread polling on the QEMU side only) were replaced by a like-for-like
+comparison (integrity audit, November 3; `natemu-raw/qcmp-20261103-01/`: `boot.py`, `campaign.py`, `aggregate.py`), and
+the tables below are that comparison rerun at the end of performance batch 1 (November 3, **HEAD 4ed8e3a**, clean tree,
+series48-lean, Rust 1.97.0; `natemu-raw/batch1-final-20261103-01/timing/`: `boot.py`, `campaign.py`, `aggregate.py`, `runs/boots.jsonl`,
+serial logs, `table.md`; the audit's `cpu/` flag lists are in `natemu-raw/audit-fix-20261103-01/`). One harness for both
+emulators: wall from process start to the end-point line, serial polled every 50 ms, nothing else polled but a check every
+0.5 s for a foreign VM process (none seen in 149 boots); Debian 6.12.107, 2 GiB, `console=ttyS0 earlyprintk=serial
+mitigations=off` with and without `nokaslr`; three interleaved rounds, one VM at a time. natemu is now the `natemu` stub
+(`-p natemu --bin natemu` alone, signed per §1; the audit's table used `boot-linux`; the stub reads no watchdog option, its
+default is 60 s), warm = its own compile cache per KASLR setting after a warm-up boot, off = `NATEMU_COMPILE_CACHE=off`.
 QEMU 11.1.2: `-nodefaults -machine pc,hpet=off,i8042=off,vmport=off` (COM1 only; the board's PIC, PIT, RTC, I/O APIC and
 PIIX4 PM block stay; its fixed PIIX3 IDE and floppy controllers have no drives), `-cpu
 Haswell,-pcid,-hle,-rtm,-invpcid,-tsc-deadline,-erms,-mca,-mce`, whose `/proc/cpuinfo` flags equal natemu's but three: QEMU
 keeps `xsaveopt` (without it TCG's boot hangs after "SRBDS"), and lacks `nonstop_tsc` and `tsc_known_freq` (TCG offers no
 invariant TSC and no leaf 15H, so Linux calibrates against the PIT there); `-accel tcg,thread=multi|single`. Cells: mean
-(min-max; guest s at the panic or at "Run /init"). The aggregator fails on any boot that did not reach its end point and
-does fail on one: QEMU `thread=single`, N = 1, KASLR, round 3, where the installer's `main-menu` segfaulted at 5.1 s (in
-QEMU; its serial log beside the record) and the dialog never came; that cell is the mean of the other two.
+(min-max; guest s at the panic or at "Run /init"). The aggregator fails on any boot that did not reach its end point; all
+149 boots reached theirs (the audit's QEMU `thread=single` installer segfault did not recur).
 
 | To the root-fs panic: wall s mean (min-max; guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
 | --- | --- | --- | --- | --- |
-| natemu `boot-linux`, cache warm, `nokaslr` | 2.25 (2.21-2.32; 1.10) | 2.06 (1.83-2.52; 1.38) | 1.90 (1.89-1.91; 1.25) | 2.01 (2.00-2.02; 1.34) |
-| natemu `boot-linux`, cache off, `nokaslr` | 3.27 (3.21-3.39; 1.98) | 3.21 (3.15-3.25; 2.39) | 3.51 (3.47-3.56; 2.67) | 3.76 (3.73-3.78; 2.93) |
-| QEMU TCG `thread=multi`, `nokaslr` | 1.96 (1.93-1.98; 1.26) | 1.71 (1.69-1.73; 1.02) | 1.66 (1.62-1.68; 0.95) | 1.65 (1.62-1.67; 0.96) |
-| QEMU TCG `thread=single`, `nokaslr` | 1.92 (1.91-1.94; 1.24) |  |  | 1.86 (1.80-1.91; 1.17) |
-| natemu `boot-linux`, cache warm, KASLR | 3.30 (3.24-3.39; 1.97) | 3.48 (3.44-3.54; 2.60) | 3.83 (3.78-3.87; 2.92) | 4.28 (4.20-4.39; 3.34) |
-| natemu `boot-linux`, cache off, KASLR | 3.20 (3.19-3.22; 1.95) | 3.24 (3.23-3.25; 2.40) | 3.51 (3.50-3.52; 2.68) | 3.78 (3.71-3.81; 2.94) |
-| QEMU TCG `thread=multi`, KASLR | 1.96 (1.95-1.96; 1.25) | 1.70 (1.65-1.73; 0.99) | 1.65 (1.61-1.69; 0.95) | 1.66 (1.66-1.67; 0.95) |
-| QEMU TCG `thread=single`, KASLR | 1.96 (1.94-1.98; 1.26) |  |  | 1.85 (1.81-1.88; 1.14) |
+| `natemu` stub, cache warm, `nokaslr` | 1.69 (1.67-1.75; 0.82) | 1.59 (1.38-2.01; 1.10) | 1.51 (1.50-1.51; 1.01) | 1.57 (1.50-1.62; 1.06) |
+| `natemu` stub, cache off, `nokaslr` | 2.69 (2.65-2.73; 1.68) | 2.80 (2.78-2.82; 2.13) | 3.05 (3.00-3.11; 2.40) | 3.31 (3.28-3.35; 2.62) |
+| QEMU TCG `thread=multi`, `nokaslr` | 1.93 (1.93-1.94; 1.24) | 1.69 (1.67-1.71; 0.96) | 1.62 (1.58-1.68; 0.93) | 1.66 (1.65-1.67; 0.95) |
+| QEMU TCG `thread=single`, `nokaslr` | 1.93 (1.91-1.95; 1.23) |  |  | 1.85 (1.78-1.91; 1.13) |
+| `natemu` stub, cache warm, KASLR | 2.72 (2.67-2.76; 1.67) | 3.02 (2.93-3.11; 2.33) | 3.40 (3.35-3.49; 2.66) | 3.30 (2.49-3.78; 2.58) |
+| `natemu` stub, cache off, KASLR | 2.75 (2.71-2.79; 1.69) | 2.76 (2.71-2.79; 2.11) | 3.06 (3.01-3.08; 2.38) | 3.27 (3.17-3.37; 2.60) |
+| QEMU TCG `thread=multi`, KASLR | 1.91 (1.87-1.94; 1.23) | 1.67 (1.66-1.69; 0.97) | 1.61 (1.58-1.66; 0.93) | 1.66 (1.64-1.67; 0.94) |
+| QEMU TCG `thread=single`, KASLR | 1.92 (1.89-1.94; 1.22) |  |  | 1.83 (1.78-1.89; 1.14) |
 
 | To "Select a language" (initrd): wall s mean (min-max; guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
 | --- | --- | --- | --- | --- |
-| natemu `boot-linux`, cache warm, `nokaslr` | 13.88 (13.81-13.95; 2.30) |  |  | 10.13 (9.90-10.61; 2.48) |
-| natemu `boot-linux`, cache off, `nokaslr` | 16.04 (15.89-16.18; 3.33) |  |  | 13.67 (13.47-13.87; 4.63) |
-| QEMU TCG `thread=multi`, `nokaslr` | 6.28 (6.26-6.31; 2.17) | 5.00 (4.97-5.04; 1.74) | 4.92 (4.87-5.02; 1.72) | 4.89 (4.79-5.01; 1.69) |
-| QEMU TCG `thread=single`, `nokaslr` | 6.15 (6.11-6.18; 2.16) |  |  | 6.37 (6.32-6.46; 2.18) |
-| natemu `boot-linux`, cache warm, KASLR | 16.27 (15.55-16.77; 3.40) |  |  | 14.13 (13.16-14.82; 4.83) |
-| natemu `boot-linux`, cache off, KASLR | 16.12 (15.98-16.19; 3.33) |  |  | 13.87 (13.81-13.90; 4.66) |
-| QEMU TCG `thread=multi`, KASLR | 6.20 (6.19-6.23; 2.17) | 5.06 (4.99-5.09; 1.76) | 4.86 (4.77-4.92; 1.68) | 4.85 (4.81-4.89; 1.71) |
-| QEMU TCG `thread=single`, KASLR | 6.23 (6.23-6.23; 2.19) **1 of 3 did not reach** |  |  | 6.33 (6.11-6.47; 2.19) |
+| `natemu` stub, cache warm, `nokaslr` | 6.89 (6.82-6.94; 1.50) |  |  | 5.80 (5.63-6.09; 1.78) |
+| `natemu` stub, cache off, `nokaslr` | 8.85 (8.76-8.94; 2.51) |  |  | 9.39 (9.32-9.48; 3.78) |
+| QEMU TCG `thread=multi`, `nokaslr` | 6.10 (6.07-6.13; 2.14) | 4.96 (4.87-5.01; 1.73) | 4.78 (4.75-4.81; 1.65) | 4.81 (4.79-4.83; 1.68) |
+| QEMU TCG `thread=single`, `nokaslr` | 6.12 (6.09-6.17; 2.13) |  |  | 6.26 (6.20-6.29; 2.15) |
+| `natemu` stub, cache warm, KASLR | 8.95 (8.24-9.44; 2.55) |  |  | 9.92 (8.58-10.65; 4.26) |
+| `natemu` stub, cache off, KASLR | 8.96 (8.89-9.05; 2.53) |  |  | 9.44 (9.27-9.61; 3.91) |
+| QEMU TCG `thread=multi`, KASLR | 6.21 (6.19-6.22; 2.17) | 5.03 (4.99-5.08; 1.76) | 4.87 (4.80-4.96; 1.70) | 4.83 (4.81-4.85; 1.73) |
+| QEMU TCG `thread=single`, KASLR | 6.14 (6.07-6.20; 2.15) |  |  | 6.25 (6.20-6.28; 2.15) |
 
-Without initrd and with `nokaslr`, natemu with a warm cache is 1.14-1.22x QEMU `thread=multi` (N = 1-4) and 1.7-2.3x with
-the cache off; with KASLR the warm cache gains nothing for the kernel (the decompressor's relocations change its bytes every
-boot, so the persistent cache misses: §6a), and is slower than cache off at N >= 2 (4.28 against 3.78 s at N = 4: the
-misses' disk lookups), 1.7-2.6x QEMU. To the installer natemu is 2.2x (N = 1) and 2.1x (N = 4) multi-threaded QEMU with a
-warm cache and `nokaslr`, 2.6x and 2.8-2.9x with KASLR or the cache off. QEMU's own KASLR and `nokaslr` rows agree within
-0.1 s.
+Without initrd and with `nokaslr`, the stub with a warm cache is 0.88-0.95x QEMU `thread=multi` (N = 1-4: faster) and 1.4-2.0x
+with the cache off; with KASLR the warm cache still gains little for the kernel (the decompressor's relocations change its
+bytes every boot, so the persistent cache misses: §6a; warm N = 4 ranges 2.49-3.78 s) and is 1.4-2.1x QEMU, as is cache off
+(1.4-2.0x). To the installer the stub is 1.13x (N = 1) and 1.21x (N = 4) multi-threaded QEMU with a warm cache and `nokaslr`
+(0.93x single-threaded QEMU at N = 4), 1.45x and 1.95x with the cache off, 1.44-2.05x with KASLR. QEMU's own KASLR and
+`nokaslr` rows agree within 0.1 s. Against the audit's table (1c4d8b9, `boot-linux`: installer N = 1 and 4 cache off 16.04 and
+13.67 s, warm 13.88 and 10.13 s; kernel only warm 2.25 and 2.01 s, off 3.27 and 3.76 s), the end of batch 1 is 8.85 and 9.39 s,
+6.89 and 5.80 s, 1.69 and 1.57 s, 2.69 and 3.31 s (the audit's build predates perf chunks 8-10; the rows now use the stub, not `boot-linux`).
 
 **Blocking defect found at R2 (resolved): device interrupts after `Boot::prepare` went through a dangling pointer.**
 `irq::install` keeps `Lapics::memory: *const Memory` pointing at `backing.memory` (`crates/host/src/irq.rs:31-50`),
@@ -429,6 +438,22 @@ and 196/196. One installer boot with `boot-linux --code-shape` (N = 1, cache off
 that ends the run); admission took 112 against 85 ms without the option on a kernel-only boot, so the check ran
 (`natemu-raw/audit-fix-20261103-01/code-shape/`). The rest of the block was not rerun: the change reaches only the host's
 system decode (66/F2 `0f 78/79`, F2/F3 SMSW), the ASM runner and the boot driver's option.
+
+**Full suite at the end of performance batch 1** (HEAD 4ed8e3a, clean tree, series48-lean (SHA-256 `8c8bd659...fda4f592`), Rust 1.97.0, the
+blocks of this section exactly, with `FEXC` set for `cargo test` and the Python tests; `natemu-raw/batch1-final-20261103-01/`:
+`suite/2g/` and `suite/4m/` each hold `results.txt` (exit code and seconds per command, with a rerun's beside it), `logs/`
+and the commands; `check/` the installer boots; `timing/` the §4 comparison; per-case outputs deleted as each case ended; one
+VM runner at a time, none of `natemu-host`, the stub or QEMU seen alongside): 79 commands at 2 GiB and 69 at 4 MiB
+(`NATEMU_RAM=0x400000`; `run_boot_smoke.py` sets its own RAM and runs at the default only). **Everything passed but the 7 known
+i8b departures** (`i8-forms-001`, `-045`, `i8-random-067`, `-077`, `-097`, `-111`, `-126`, at both block sizes and both RAM sizes;
+the runner exits 1, rerun once each: the same 7). No timing failure, so no other rerun. The same counts as the table of "Full
+suite on the final build" above, but for: `cargo test` 163 + 1 ignored (also with `FEXC` set: the same), `check_resident_stack.py`
+`ok` (16,656 / 20,832 / 8,912 bytes), Python 317 (`OK`, 0 skipped, `FEXC` set), `run_slice2_probes.py` 85, ASM 1,876 / 0 fail /
+48 deviations / 346 unsupported (the audit's counts) at both RAM sizes, I7 faults 6,313, `run_x1.py` 6/6 and 196/196, `run_boot_smoke.py` 4/4,
+`run_r1.py r1a` 7/7 and `r1b` 12/12 (negative controls flagged), `contain` 423 controls 0 failures, `run_l1.py` 12/12 + 41/41, `run_l2.py`
+and `run_l2_iasl.py` N = 2..4 pass. Installer boots with `boot-linux --check-reuse --code-shape` (cache off, `nokaslr`, to "Select a
+language"): N = 1 852,326 resident copies each also answered by the host and equal, 0 mismatches (refused: 18 word count,
+1,008 second frame), 31.1 s; N = 4 vCPU 0 149,013 copies and checks, 0 mismatches, every vCPU ended `Cancelled`, 25.2 s.
 
 **Rerun with reuse inside the resident** (perf plan "Measured (chunk 10)"; `natemu-raw/perf10-20261103-01/final/`, 2 GiB,
 851cbd2 plus the uncommitted change, series48-lean, every runner with the reuse check on): `cargo test` 162 + 1 ignored, also
