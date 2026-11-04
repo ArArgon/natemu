@@ -262,8 +262,10 @@ fn timer(s: &mut State) {
 /// next owed one once the last was accepted.
 pub(super) fn poll(s: &mut State) {
     let d = lapic().deadline;
-    // Perf chunk 12: the count read without `now`'s barrier (at every boundary): it may be read a few cycles early, so an
-    // expiry is seen at this boundary or the next one; its doorbell stops the vCPU in any case.
+    // Perf chunk 12: the count read without `now`'s barrier (at every boundary): it may be read early and miss an expiry
+    // just due. None is lost: `cntv` (ending in an `isb`) leaves the virtual timer armed at the deadline, and its IRQ's
+    // `timer_irq` reads the count with the barrier, re-arming it if early; once due, the IRQ's exception entry is a
+    // context synchronization, so this read at any boundary after it sees the deadline passed.
     if d != u64::MAX && count() >= d {
         timer(s)
     }

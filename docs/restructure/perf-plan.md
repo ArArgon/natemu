@@ -992,11 +992,13 @@ exception gate and `eret` in `guest`. `run_k2.py cost` (N = 1 M): CLI 0.211 us, 
 0.096 per iteration.
 
 **Built** (resident, host, abi; each measured on hackbench N = 1 with the perf resident, 50.9 s before):
-1. Transactions without bank copies: SWAPGS, SYSCALL, SYSRET, SYSENTER/SYSEXIT, RD/WR FS/GS BASE, RDRAND, WBINVD, CLFLUSH,
-   CLI/STI/POPF and RDTSC/RDTSCP (an early arm) make every check before their first write, so a fault leaves the bank as it
-   was; only LAR..VERW keep the rollback copy. 2. `drain` loads the pending word before swapping it (swap only when
-   non-zero); `lapic::poll` reads CNTVCT without `isb` (an expiry is seen at that boundary or the next; its doorbell stops
-   the vCPU anyway). 3. `block_at` tries a per-vCPU hint by code word (`Control::pc_hints`, 2 Ki), used only when the hinted
+1. Transactions without bank copies: SWAPGS, SYSCALL, SYSRET, SYSENTER/SYSEXIT, RD/WR FS/GS BASE, RDRAND, WBINVD and
+   CLFLUSH make every check before their first write, so a fault leaves the bank as it was: their rollback copy goes (only
+   LAR..VERW keep it). RDTSC/RDTSCP (now an early arm) and CLI/STI/POPF never restored a copy (each checks before it
+   writes): they only lose the copy `transaction` made before its arms, which they never used. 2. `drain` loads the
+   pending word before swapping it (swap only when non-zero); `lapic::poll` reads CNTVCT without `isb` (an early read can
+   miss an expiry just due; none is lost: `cntv`, ending in an `isb`, leaves the virtual timer armed at the deadline, and
+   its IRQ's `timer_irq` reads the count with the barrier, so a boundary after that IRQ sees it). 3. `block_at` tries a per-vCPU hint by code word (`Control::pc_hints`, 2 Ki), used only when the hinted
    block's code still holds the word (ranges never overlap). Together 50.9 -> 36.8 s: transaction 27.7 ns average, the
    boundary checks 14 ns per pass, `block_at` 2.2 ns. 4. **NOP runs** (`system::NOP_RUN`): a translate request whose block
    fexc cut before a system instruction and which holds only no-operation instructions (host `system::nops`: `90`, `66 90`,
@@ -1019,8 +1021,8 @@ Per x86 rule (SDM Vol.2 instruction pages, Vol.3 6.8.3, 7.8.3, 18.3.1), and wher
 CPL > 0; SYSCALL #UD without EFER.SCE, RCX/R11, RFLAGS & ~FMASK, CS/SS from STAR, CPL 0, a TF at its start traps after it;
 SYSRET #UD without SCE, #GP(0) at CPL > 0 or a non-canonical RCX (before any write), RFLAGS from R11; CLI/STI #GP(0) at
 CPL > IOPL, STI's shadow only when IF was 0; RDTSC/RDTSCP #GP(0) with CR4.TSD at CPL > 0, RDTSCP's ECX: all unchanged, every
-check still before the first write (the reason the copies could go). Interrupt windows: `find` takes events at every
-boundary between chained instructions, NOP runs included; a shadow with an event pending steps one instruction (never a
+check still before the first write (the reason the syscall group's rollback copies could go; RDTSC/RDTSCP and CLI/STI never
+restored one). Interrupt windows: `find` takes events at every boundary between chained instructions, NOP runs included; a shadow with an event pending steps one instruction (never a
 NOP run). TF: every traced instruction is stepped alone. Instruction breakpoints: blocks are cut at armed ones and arming
 flushes, so no NOP run spans one; RF ends after the run as after a block. Faults: NOPs take none (their memory operand is
 not accessed). Cross-modifying code: a NOP run is a K2 record of its bytes, invalidated as any.
@@ -1065,6 +1067,21 @@ included); `run_s4.py` all ok (`s4-nops` included; QEMU's known departures as be
 all ok; `run_l4a.py` all ok; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7 and `r1b` ok (negative controls flagged). Not rerun:
 `sharedpt`, `coherence`, `run_m1.py`, `run_x4.py` (the change is in system transactions, the boundary checks, block placement and
 the dispatcher, which the runs above exercise).
+
+**Follow-up tests** (after an independent review of 330e014, no blocking defect; `natemu-raw/sysfast-followup-20261104-01/`,
+series52-adox66, HEAD 18ee440; each with a scratch mutant, `mutant-*.diff`, that turned it red, then reverted):
+`run_k2.py rollback` (SYSRET with a non-canonical RCX, WRGSBASE with a non-canonical value: #GP(0) with the frame's RIP, CS
+and RFLAGS, RCX and the GS base as before; red when SYSRET writes RFLAGS, or WRGSBASE the base, before the check);
+`run_k1.py hint-reset` (a flush between rounds renumbers blocks at the same code addresses; 1-4 vCPUs green; red with the
+hint unvalidated, everything then naming block 0, and with any recorded hint trusted, from the round after a renumbering,
+as do `link-full` and, at block size 1, `contexts`); `run_slice3_vm.py events` `ev-movss-db-nops` (MOV SS whose
+load meets a data breakpoint, before a kept run: #DB after the first NOP, delivery_model; QEMU takes it before the NOP, listed
+in `QEMU_EVENTS_DIFFER`; red, with `ev-sti-nops`, when `kept_system` returns NOP runs); `run_k2.py nopruns` at 1-4 vCPUs:
+`cross` (a run crossing into a page made not present: #PF at the crossing NOP, CR2 the page, error 0x10; then remapped: the new
+bytes; red when a run's record omits its second page) and `peer` (vCPU (j + 1) % N rewrites j's run, then a flag, CPUID: the
+new bytes; red when runs are on no page's chain, which also breaks own writes). NOP runs exist only at the default block size
+(block size 1 green under the mutants). `--check-reuse --code-shape` installer boots, cache off: N = 1 852,497 copies checked,
+N = 4 (vCPU 0) 205,825, no halt, both reached the dialog.
 
 ## 3. Candidate chunks
 

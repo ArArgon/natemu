@@ -1103,6 +1103,9 @@ def cpl3_cases():
 # ---- X2: events (interrupt eligibility, shadows, POPF, IRETQ, HLT, NMI) ---------------------------------------------------
 QEMU_EVENTS_RF = ('QEMU pushes RF = 1 in the frame of every external interrupt and NMI; the SDM (and delivery_model) push '
                   'the current RF (1 only between REP iterations): QEMU frames are judged without RF')
+# Event programs whose QEMU log departs from delivery_model (natemu is judged by the model alone; QEMU must still depart).
+QEMU_EVENTS_DIFFER = {'ev-movss-db-nops': 'QEMU takes the data breakpoint of a MOV SS load right after the MOV SS; SDM Vol.3 7.8.3, '
+                                          '18.3.1.2: the shadow holds it until after the next instruction'}
 
 
 def event_logs(prog, cpus_memory):
@@ -1255,6 +1258,8 @@ def cmd_events(a, host, runtime):
             else:
                 qlogs = [[(e[0], e[1], e[2], e[3] & ~events.RF, *e[4:]) for e in events.log(m['data'])] for m in want['memory'][:n]]
                 entry['qemu'] = events.judge(prog, qlogs)
+                if name in QEMU_EVENTS_DIFFER:
+                    entry['qemu_differs'], entry['qemu'] = (entry['qemu'], []) if entry['qemu'] else (None, [f'listed in QEMU_EVENTS_DIFFER but QEMU agrees'])
                 failures += [f'{label}: QEMU vs delivery_model: {d}' for d in entry['qemu']]
             for limit in ([], [1]):
                 text = events.description(prog['natemu'], prog['hooks'])
@@ -1287,9 +1292,9 @@ def cmd_events(a, host, runtime):
             failures += [f'{name}: {p}' for p in problems]
     if not a.programs or 'stress' in a.programs:
         failures += events_stress(a, host, runtime, stub, report)
-    print(QEMU_EVENTS_RF)
+    print(QEMU_EVENTS_RF, *[f'{k}: {v}' for k, v in QEMU_EVENTS_DIFFER.items()], sep='\n')
     for f in failures: print(f)
-    (a.out / 'events.json').write_text(json.dumps({'report': report, 'failures': failures, 'qemu_differs': QEMU_EVENTS_RF}, indent=1, default=str) + '\n')
+    (a.out / 'events.json').write_text(json.dumps({'report': report, 'failures': failures, 'qemu_differs': [QEMU_EVENTS_RF, QEMU_EVENTS_DIFFER]}, indent=1, default=str) + '\n')
     return len(failures)
 
 

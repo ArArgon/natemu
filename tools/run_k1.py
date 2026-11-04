@@ -67,6 +67,10 @@ Perf chunk 11 (natemu only):
 - `counts`: `cr3-switch` at K and 2K rounds on 1 vCPU: the resident's translation requests and the host's compiles must
   not grow with the rounds (K1: a CR3 load keeps translations); with `--base-host/--base-runtime` the same counts for
   another build (before K1) are reported beside them.
+Perf chunk 12 (natemu only):
+- `hint-reset`: the linker's hint by code word after a flush renumbers the blocks at the same code addresses (four rounds
+  of a new instruction breakpoint, never reached, then three linked calls to V; odd rounds also run CLI, a kept record that
+  takes a number and no code): every call runs (r8 = 12).
 
 Writes DIR/k1.json; exit status 1 on any failure."""
 import argparse, json, pathlib, sys
@@ -168,6 +172,14 @@ def bodies(k, i=0, n=1):
         **links_bodies(k, i, n),
         **reuse_bodies(i),
         'link-full': full_body(i, n),
+        # Perf chunk 12: four rounds, each arming a new instruction breakpoint at an address never run (the DR7 write
+        # flushes the cache: blocks are numbered from 0 again) and then making three linked calls to V; odd rounds first
+        # run CLI, a kept record with a number and no code, so every block after it has the same code address as in the
+        # round before but another number: the linker's hint by code word ([`block_at`]) then names a block that no longer
+        # holds that word and must not be used.
+        'hint-reset': ('    mov ecx, 4\n.l:\n    mov rax, {d:#x}+0x7f00\n    add rax, rcx\n    mov dr0, rax\n    mov eax, 1\n    mov dr7, rax\n'
+                       '    test ecx, 1\n    jz .e\n    cli\n.e:\n    mov edx, 3\n.a:\n' + direct(0) + '    add r8, rax\n    dec edx\n    jnz .a\n'
+                       '    dec ecx\n    jnz .l\n    xor eax, eax\n    mov dr7, rax\n'),
     }
 
 
@@ -418,6 +430,7 @@ EITHER = {
     'invlpg-large': {'r8': {1}, 'rbx': {0x22}, 'r9': {2}, 'r10': {1}},
     **{name: reuse_either(name) for name in REUSE},
     'link-full': {'r8': {3}, 'r9': {6}, 'r10': {12}, 'r12': {6}},
+    'hint-reset': {'r8': {12}},
 }
 
 

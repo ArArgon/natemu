@@ -77,7 +77,7 @@ ev_out:
     iretq
 """
 ERROR_VECTORS = (8, 10, 11, 12, 13, 14, 17)
-STUB_VECTORS = (2, 6, 13, 17, 0x40, 0x41, 0x50, 0x80)
+STUB_VECTORS = (1, 2, 6, 13, 17, 0x40, 0x41, 0x50, 0x80)
 
 
 def stubs():
@@ -349,6 +349,36 @@ after_nop1:
     cmp r9, 3
     jb again
     cli""", events=[(0x40, 'intr', {}, [('sti', None), ('other', 'after_nop1')])] * 2),
+    # Perf chunk 12: MOV SS whose load meets a data breakpoint (DR0, read/write, 2 bytes, on the SS image) right before a
+    # run of no-operation instructions kept as one NOP_RUN record (from round 0, which jumps over the MOV SS): the shadow
+    # holds the #DB trap for exactly one instruction (SDM Vol.3 7.8.3, 18.3.1.2), so it is taken after the first NOP, not
+    # after the run; the handler resumes at r13 (after_nop1), and the run completes.
+    'ev-movss-db-nops': dict(body="""    mov word [{data}], 0x10
+    mov rax, {data}
+    mov dr0, rax
+    mov eax, 0x70001
+    mov dr7, rax
+    xor r9d, r9d
+again:
+    cli
+    mov r12, r9
+    lea r13, [rel after_nop1]
+    test r9, r9
+    jz quiet
+    mov ss, [{data}]
+quiet:
+    nop
+after_nop1:
+    db 0x66, 0x90
+    db 0x0f, 0x1f, 0x44, 0x00, 0x00
+    db 0xf3, 0x0f, 0x1e, 0xfa
+    cli
+    inc r9
+    cmp r9, 3
+    jb again
+    xor eax, eax
+    mov dr7, rax""", events=[(1, 'data_breakpoint', {}, [('mov_ss', None), ('other', 'after_nop1')])] * 2,
+                             memory=lambda i: [{'addr': f'0x{DATA(i):x}', 'size': 0x1000, 'fill': 'zero', 'capture': False}]),
 }
 
 
@@ -358,7 +388,7 @@ def flag(i): return EV(i) + 0x1018
 def make(name, n):
     """The program `name` on n CPUs (each CPU runs the same text with its own IDT, log and NMI flag)."""
     p = PROGRAMS[name]
-    return build(name, p['body'], n, p.get('nmi_action', ''), expect=p['events'])
+    return build(name, p['body'], n, p.get('nmi_action', ''), expect=p['events'], memory_extra=p.get('memory', lambda i: []))
 
 
 def judge(prog, logs):
