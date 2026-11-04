@@ -57,6 +57,10 @@ Then, as the numbers dictate:
    page-fault, mmap and fork cases), floating-point/vector compute (e.g. c-ray or SciMark). Each test-run on the AMD machine
    and timed against QEMU like the existing ones; added before generated-code quality, which needs them. Per-change checks
    stay on a small subset; the full set runs at batch end.
+   QEMU is reported twice from now on (owner, November 4): like-for-like (CPU features matched to natemu's, so the guest
+   does the same work) and at its best (`-cpu max`, every feature TCG offers). QEMU does not change between our chunks, so
+   both are measured once per benchmark set or QEMU version, not per change. A feature that makes QEMU faster goes on
+   natemu's candidate list.
 9. **Generated-code quality** (guest code ~2.3 s on the installer at batch-1 start): larger FEX compile regions, careful
    relaxation of precision rules where nothing observes the difference. Last, and only if steady-state benchmarks point here.
 
