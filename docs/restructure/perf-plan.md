@@ -10,10 +10,12 @@ From [boot-handoff.md](boot-handoff.md) §4 (Debian 6.12.107, 2 GiB, `nokaslr`, 
 
 | Wall s | natemu warm | natemu cache off | QEMU multi | QEMU single |
 | --- | --- | --- | --- | --- |
-| Kernel only (root-fs panic), N = 1 | 2.28 | 4.15 | 1.97 | 1.95 |
-| Kernel only, N = 4 | 2.31 | 5.70 | 1.70 | 1.86 |
-| Installer ("Select a language"), N = 1 | 67.3 | 67.8 | 7.27 | 7.25 |
-| Installer, N = 4 | 49.1 | 53.1 | 5.46 | 7.62 |
+| Kernel only (root-fs panic), N = 1 | 2.28 | 4.15 | 1.96 | 1.92 |
+| Kernel only, N = 4 | 2.31 | 5.70 | 1.65 | 1.86 |
+| Installer ("Select a language"), N = 1 | 67.3 | 67.8 | 6.28 | 6.15 |
+| Installer, N = 4 | 49.1 | 53.1 | 4.89 | 6.37 |
+
+(QEMU columns: the like-for-like rerun of §5, `nokaslr`, replacing R2's 1.97/1.95, 1.70/1.86, 7.27/7.25, 5.46/7.62.)
 
 Known (plan, Built (P3)): cache off, the installer makes 1,142,555 compiles and waits 35.4 s of 68.0 s for fexc
 (7a2f714); a first-time block costs about 35 us cold, 20 us on a disk hit, 4-6 us on a memory
@@ -791,12 +793,38 @@ has an independent reviewer.
 
 ## 5. Comparison with QEMU and records
 
-Same end points, harness and QEMU command as the handoff §4 (wall from process start to the end-point line, serial
-polled every 50 ms; guest printk time); QEMU 11.1.2 `thread=single` and `thread=multi`; N = 1 and 4 (2, 3 for kernel
+Same end points and harness as the handoff §4's like-for-like table (wall from process start to the end-point line, serial
+polled every 50 ms, nothing else polled on either side; guest printk time; QEMU `-nodefaults` with natemu's devices and the
+closest CPU model TCG boots; the aggregator fails on a boot that missed its end point); QEMU 11.1.2 `thread=single` and `thread=multi`; N = 1 and 4 (2, 3 for kernel
 only); both emulators with and without `nokaslr`; natemu cache warm and off; three runs, one VM at a time. Raw data in
 `natemu-raw/perf-YYYYMMDD-NN/` (`boots.jsonl`, serial and perf logs, profiles, commit, fexc SHA-256). Each chunk's
 "Built" note holds before/after tables; the handoff's boot tables and INV-03-01's "Next phase" row are updated. Claims
 beyond development results get pre-execution review and replication.
+
+**Measured like for like** (integrity audit, November 3; `natemu-raw/qcmp-20261103-01/`, natemu at 1c4d8b9 plus the audit's
+change, series48-lean; method and the one QEMU boot that missed its end point in the handoff §4):
+
+| To the root-fs panic: wall s mean (min-max; guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
+| --- | --- | --- | --- | --- |
+| natemu `boot-linux`, cache warm, `nokaslr` | 2.25 (2.21-2.32; 1.10) | 2.06 (1.83-2.52; 1.38) | 1.90 (1.89-1.91; 1.25) | 2.01 (2.00-2.02; 1.34) |
+| natemu `boot-linux`, cache off, `nokaslr` | 3.27 (3.21-3.39; 1.98) | 3.21 (3.15-3.25; 2.39) | 3.51 (3.47-3.56; 2.67) | 3.76 (3.73-3.78; 2.93) |
+| QEMU TCG `thread=multi`, `nokaslr` | 1.96 (1.93-1.98; 1.26) | 1.71 (1.69-1.73; 1.02) | 1.66 (1.62-1.68; 0.95) | 1.65 (1.62-1.67; 0.96) |
+| QEMU TCG `thread=single`, `nokaslr` | 1.92 (1.91-1.94; 1.24) |  |  | 1.86 (1.80-1.91; 1.17) |
+| natemu `boot-linux`, cache warm, KASLR | 3.30 (3.24-3.39; 1.97) | 3.48 (3.44-3.54; 2.60) | 3.83 (3.78-3.87; 2.92) | 4.28 (4.20-4.39; 3.34) |
+| natemu `boot-linux`, cache off, KASLR | 3.20 (3.19-3.22; 1.95) | 3.24 (3.23-3.25; 2.40) | 3.51 (3.50-3.52; 2.68) | 3.78 (3.71-3.81; 2.94) |
+| QEMU TCG `thread=multi`, KASLR | 1.96 (1.95-1.96; 1.25) | 1.70 (1.65-1.73; 0.99) | 1.65 (1.61-1.69; 0.95) | 1.66 (1.66-1.67; 0.95) |
+| QEMU TCG `thread=single`, KASLR | 1.96 (1.94-1.98; 1.26) |  |  | 1.85 (1.81-1.88; 1.14) |
+
+| To "Select a language" (initrd): wall s mean (min-max; guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
+| --- | --- | --- | --- | --- |
+| natemu `boot-linux`, cache warm, `nokaslr` | 13.88 (13.81-13.95; 2.30) |  |  | 10.13 (9.90-10.61; 2.48) |
+| natemu `boot-linux`, cache off, `nokaslr` | 16.04 (15.89-16.18; 3.33) |  |  | 13.67 (13.47-13.87; 4.63) |
+| QEMU TCG `thread=multi`, `nokaslr` | 6.28 (6.26-6.31; 2.17) | 5.00 (4.97-5.04; 1.74) | 4.92 (4.87-5.02; 1.72) | 4.89 (4.79-5.01; 1.69) |
+| QEMU TCG `thread=single`, `nokaslr` | 6.15 (6.11-6.18; 2.16) |  |  | 6.37 (6.32-6.46; 2.18) |
+| natemu `boot-linux`, cache warm, KASLR | 16.27 (15.55-16.77; 3.40) |  |  | 14.13 (13.16-14.82; 4.83) |
+| natemu `boot-linux`, cache off, KASLR | 16.12 (15.98-16.19; 3.33) |  |  | 13.87 (13.81-13.90; 4.66) |
+| QEMU TCG `thread=multi`, KASLR | 6.20 (6.19-6.23; 2.17) | 5.06 (4.99-5.09; 1.76) | 4.86 (4.77-4.92; 1.68) | 4.85 (4.81-4.89; 1.71) |
+| QEMU TCG `thread=single`, KASLR | 6.23 (6.23-6.23; 2.19) **1 of 3 did not reach** |  |  | 6.33 (6.11-6.47; 2.19) |
 
 ## 6. Non-goals
 

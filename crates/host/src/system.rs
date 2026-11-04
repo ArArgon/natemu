@@ -74,8 +74,9 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
     let (w, r) = (rex & 8 != 0, u32::from(rex >> 2 & 1) << 3);
     match map {
         MAP_TWO if *bytes.get(at)? == 0x0f && *bytes.get(at + 1)? == opcode => at += 2,
-        // X1c: a Reserved-NOP cell under a mandatory-prefix overlay map (F3, F2, 66): the same two-byte opcode.
-        MAP_TWO_F3..=MAP_TWO_66 if matches!(opcode, 0x0d | 0x18..=0x1d) && *bytes.get(at)? == 0x0f && *bytes.get(at + 1)? == opcode => at += 2,
+        // X1c: a Reserved-NOP cell under a mandatory-prefix overlay map (F3, F2, 66): the same two-byte opcode; also FEX's
+        // SSE4a overlays of 0f 78/79 (66 EXTRQ, F2 INSERTQ).
+        MAP_TWO_F3..=MAP_TWO_66 if matches!(opcode, 0x0d | 0x18..=0x1d | 0x78 | 0x79) && *bytes.get(at)? == 0x0f && *bytes.get(at + 1)? == opcode => at += 2,
         MAP_PRIMARY if *bytes.get(at)? == opcode => at += 1,
         MAP_0F38 if bytes.get(at..at + 3)? == [0x0f, 0x38, opcode] => at += 3,
         MAP_0F3A if bytes.get(at..at + 3)? == [0x0f, 0x3a, opcode] => at += 3,
@@ -151,8 +152,10 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
                     system::UD
                 }
                 // X1c: SMSW r/m16, r32, r64 (`size`; a memory destination is always 16 bits) and LMSW r/m16.
+                // F2/F3 on SMSW (reserved, SDM Vol.2 2.1.1) are ignored, as on the reference AMD machine (owner rule; user-mode
+                // probe, November 3: every F2/F3 form took the UMIP #GP of plain SMSW, none #UD; plan §5).
                 4 => {
-                    s.size = size;
+                    (s.size, rep_used) = (size, true);
                     system::SMSW
                 }
                 6 => system::LMSW,
@@ -228,8 +231,10 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
             };
             s.size = size;
         }
-        // VMREAD/VMWRITE outside VMX operation; INVEPT/INVVPID (likewise) and INVPCID (not advertised): #UD.
+        // VMREAD/VMWRITE outside VMX operation; INVEPT/INVVPID (likewise) and INVPCID (not advertised): #UD. 66/F2 0f 78/79
+        // are AMD's SSE4a EXTRQ/INSERTQ (CPUID.80000001H:ECX.SSE4A[6] = 0 on the profile; blank in Intel's Table A-3): #UD.
         (MAP_TWO, 0x78 | 0x79) | (MAP_0F38, 0x80..=0x82) => (s.kind, rep_used) = (system::UD, true),
+        (MAP_TWO_F3..=MAP_TWO_66, 0x78 | 0x79) if !advertised(SSE4A) => (s.kind, rep_used) = (system::UD, true),
         // I9: MOVBE with a register operand (SDM MOVBE: #UD); F2 is CRC32, F3 is refused by fexc and a memory MOVBE is
         // admitted, none ever cut. ADCX (66 0f 38 f6) and ADOX (F3; ADX not advertised), WRSS (NP 0f 38 f6) and WRUSS (66 0f 38
         // f5; CET_SS not advertised) and the rest of 0f 38 f5/f6, SHA (NP 0f 38 c8..cd, NP 0f 3a cc; not advertised): #UD
@@ -465,6 +470,7 @@ const SSSE3: Option<Feature> = Some((1, 0, 2, 9));
 const SSE4_1: Option<Feature> = Some((1, 0, 2, 19));
 const SSE4_2: Option<Feature> = Some((1, 0, 2, 20));
 const PCLMULQDQ: Option<Feature> = Some((1, 0, 2, 1));
+const SSE4A: Feature = (0x8000_0001, 0, 2, 6);
 const AES: Option<Feature> = Some((1, 0, 2, 25));
 const MOVBE: Option<Feature> = Some((1, 0, 2, 22));
 const ADX: Option<Feature> = Some((7, 0, 1, 19));
@@ -863,9 +869,7 @@ mod tests {
         for hex in ["ffe8", "ffd8", "66ffe8"] {
             assert_eq!(p(hex, 0xff).map(|s| s.kind), Some(UD), "{hex}"); // X1c: far JMP/CALL with a register operand
         }
-        for (hex, op) in [("f30f0120", 0x01), ("f30f00e0", 0x00)] {
-            assert_eq!(d(hex, op), None, "{hex}"); // f3 smsw, f3 verr (X1c: smsw and 0f 00 /7 decode, `x1c_forms`)
-        }
+        assert_eq!(d("f30f00e0", 0x00), None); // f3 verr (X1c: 0f 00 /7 decodes, `x1c_forms`)
     }
 
     #[test]
@@ -1025,7 +1029,6 @@ mod tests {
     fn unsupported_forms_are_refused() {
         let bytes = |hex: &str| -> Vec<u8> { (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect() };
         for (hex, map, op) in [
-            ("f30f01e0", MAP_TWO, 0x01), // F3 smsw: no SDM form
             ("0fb218", MAP_TWO, 0xb2),   // lss m16:32: not built
             ("650f0138", MAP_TWO, 0x01), // GS override
             ("f30f22d8", MAP_TWO, 0x22), // F3
@@ -1062,6 +1065,11 @@ mod tests {
         assert_eq!(sys("660f01e3", MAP_TWO, 0x01), Some((SMSW, 2, 0, 3, 4))); // smsw bx
         assert_eq!(sys("490f01e1", MAP_TWO, 0x01), Some((SMSW, 8, 0, 9, 4))); // smsw r9
         assert_eq!(sys("0f0120", MAP_TWO, 0x01).map(|s| (s.0, s.2)), Some((SMSW, 1))); // smsw [rax]
+        // F2/F3 ignored (the reference AMD machine): rep smsw rsp, repne smsw rbp, rep smsw r9w, rep smsw [rax].
+        assert_eq!(sys("f3480f01e4", MAP_TWO, 0x01), Some((SMSW, 8, 0, 4, 5)));
+        assert_eq!(sys("f2480f01e5", MAP_TWO, 0x01), Some((SMSW, 8, 0, 5, 5)));
+        assert_eq!(sys("f366410f01e1", MAP_TWO, 0x01), Some((SMSW, 2, 0, 9, 6)));
+        assert_eq!(sys("f30f0120", MAP_TWO, 0x01).map(|s| (s.0, s.2)), Some((SMSW, 1)));
         assert_eq!(sys("0f01f0", MAP_TWO, 0x01).map(|s| (s.0, s.3)), Some((LMSW, 0))); // lmsw ax
         assert_eq!(sys("0f0130", MAP_TWO, 0x01).map(|s| (s.0, s.2)), Some((LMSW, 1))); // lmsw [rax]
         assert_eq!(kind("0f01c0", MAP_TWO, 0x01), Some(UD)); // ENCLV/VMX: unchanged
@@ -1138,6 +1146,11 @@ mod tests {
             assert_eq!(d(hex, 0x01), k(UD, hex.len() as u32 / 2), "{hex}");
         }
         assert_eq!(d("0f78c0", 0x78), k(UD, 2));
+        // SSE4a EXTRQ (66, FEX's 66 overlay) and INSERTQ (F2, its F2 overlay, map 3): not advertised, #UD.
+        assert_eq!(super::decode(&[0x66, 0x0f, 0x78, 0xc0, 0x00, 0x00], MAP_TWO_66, 0x78), k(UD, 3));
+        assert_eq!(super::decode(&[0x66, 0x41, 0x0f, 0x79, 0xc0], MAP_TWO_66, 0x79), k(UD, 4));
+        assert_eq!(super::decode(&[0xf2, 0x0f, 0x78, 0xc1, 0x00, 0x3f], 3, 0x78), k(UD, 3));
+        assert_eq!(super::decode(&[0xf2, 0x41, 0x0f, 0x79, 0xc0], 3, 0x79), k(UD, 4));
         assert_eq!(super::decode(&[0x66, 0x0f, 0x38, 0x82, 0x00, 0x90], MAP_0F38, 0x82), k(UD, 4)); // invpcid
         // I9: MOVBE register forms, ADCX/ADOX, WRUSS, SHA: #UD; a memory MOVBE and CRC32 are never decoded here.
         assert_eq!(super::decode(&[0x48, 0x0f, 0x38, 0xf0, 0xc1], MAP_0F38, 0xf0), k(UD, 5));

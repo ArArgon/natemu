@@ -57,6 +57,8 @@ pub struct Boot {
     pub compile_cache: compile_cache::Config,
     /// Debug: every answer used at another RIP than its own is compiled there too and must equal it (`Compiler::check_reuse`).
     pub check_reuse: bool,
+    /// Debug: admission's code-shape check on every object (`Compiler::shape`; the test driver's `boot-linux --code-shape`).
+    pub code_shape: bool,
 }
 
 impl Boot {
@@ -79,6 +81,7 @@ impl Boot {
             stop_at: None,
             compile_cache: compile_cache::Config::OFF,
             check_reuse: false,
+            code_shape: false,
         }
     }
 
@@ -125,6 +128,7 @@ impl Boot {
             watchdog: self.watchdog,
             compile_cache: self.compile_cache,
             check_reuse: self.check_reuse,
+            code_shape: self.code_shape,
             ran: AtomicBool::new(false),
             cancel: Arc::default(),
         })
@@ -150,6 +154,7 @@ pub struct Prepared {
     watchdog: Duration,
     compile_cache: compile_cache::Config,
     check_reuse: bool,
+    code_shape: bool,
     /// [`Prepared::run`] has started: the backing is used.
     ran: AtomicBool,
     /// The run's cancellation flag ([`Prepared::canceller`]).
@@ -236,6 +241,7 @@ impl Prepared {
             compiler.disk = compile_cache::shared(&self.fexc, &self.compile_cache)?; // P3: the persistent compile cache
             compiler.perf = crate::perf::Recorder::new(v, start)?;
             compiler.check_reuse = self.check_reuse;
+            compiler.shape = self.code_shape;
             let mut requests = execution::Requests { devices: Some(self.devices.clone()), ..Default::default() };
             let stop_at = if v == 0 { self.stop_at } else { None };
             let stop = execution::run(cpu, backing.vcpu(v), &mut compiler, stop_at, self.watchdog, &mut requests, &stops, cancelled, &mut ());

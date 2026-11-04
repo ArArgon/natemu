@@ -4,10 +4,11 @@
 //!
 //!   natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--rsdp ADDR]
 //!       [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]
-//!       [--check-reuse] [--serial FILE] [--strict-unassigned]
+//!       [--check-reuse] [--code-shape] [--serial FILE] [--strict-unassigned]
 //!
 //! `--check-reuse` (perf chunk 4, debug): every translation reused at another RIP than its own is compiled there too and the
-//! two must be equal (`Compiler::check_reuse`).
+//! two must be equal (`Compiler::check_reuse`). `--code-shape` (debug, off by default): admission's code-shape check on every
+//! object, as the program driver's option (which also turns on `--check-reuse`; here they are separate).
 //!
 //! L4a: and the I/O APIC and 8259 pair ([`crate::irq`]). L4b: the PIT, the RTC and the ACPI PM block ([`crate::clock::install`]);
 //! S5 or the reset register end the run with the stop `poweroff` or `reset`. L5: `--lost-ticks pit=reinject|discard,rtc=..,
@@ -44,7 +45,7 @@ use natemu_abi::guest_memory::GuestRam;
 use std::fmt::Write as _;
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] \
-                     [--rsdp ADDR] [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N] [--check-reuse] [--serial FILE] [--strict-unassigned] [--lost-ticks SPEC] [--clock-trace FILE]";
+                     [--rsdp ADDR] [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N] [--check-reuse] [--code-shape] [--serial FILE] [--strict-unassigned] [--lost-ticks SPEC] [--clock-trace FILE]";
 /// Largest image or initrd read (the protocol's 32-bit sizes).
 const MAX_INPUT: usize = 1 << 32;
 
@@ -67,7 +68,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let (mut initrd, mut cmdline, mut ram, mut rsdp, mut load_only, mut dump) = (None, String::new(), None, boot::ACPI_NVS.0, false, None);
     let mut vcpus = 1;
     let (mut stop_at, mut saves, mut watchdog_ms, mut max_block) = (None, Vec::new(), 60_000, None);
-    let mut check_reuse = false;
+    let (mut check_reuse, mut code_shape) = (false, false);
     let mut code_bytes = exec::cache::CODE_BYTES_MAX - exec::cache::HEAD_BYTES;
     let (mut serial, mut strict) = (None, false);
     let (mut lost, mut trace) = (crate::clock::LostTicks::DEFAULT, None);
@@ -83,6 +84,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             "--code-cache" => code_bytes = number(value()?)? as usize,
             "--load-only" => load_only = true,
             "--check-reuse" => check_reuse = true,
+            "--code-shape" => code_shape = true,
             "--serial" => serial = Some(value()?.clone()),
             "--strict-unassigned" => strict = true,
             "--lost-ticks" => lost = crate::clock::LostTicks::parse(value()?)?,
@@ -132,6 +134,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         stop_at,
         compile_cache: crate::compile_cache::Config::from_env()?,
         check_reuse,
+        code_shape,
         ..natemu::linux::Boot::new(resident, fexc, image)
     };
     if let Some(path) = &serial {

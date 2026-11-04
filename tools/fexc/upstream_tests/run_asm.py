@@ -22,12 +22,13 @@ Source/Tools/TestHarnessRunner, CommonTools/HarnessHelpers.h) and checked agains
     with its own feature table; Env switches such as x87 reduced precision only matter for x87/SSE code).
 Outcome per test:
   pass         ran to the hlt and every GPR/RIP expectation matches (vector expectations, if any, are separate: see below)
-  unsupported  with a reason: an instruction outside the slice's allowlist (fexc unsupported_form / system_instruction at a
-               RIP before the hlt, with the instruction's mnemonic), 32-bit mode,
+  unsupported  with a reason: a form natemu refuses by a documented decision (fexc's `unsupported_form` stop at a RIP before
+               the hlt whose instruction is in REFUSED, the handoff's list of typed refusals), 32-bit mode,
                region beyond guest RAM, expectations on vector/x87/segment state natemu does not model (the GPR part had
                matched), ...
-  fail         anything else: registers differ, a guest fault, the driver or nasm erred. Each is diagnosed by hand (see the
-               report); none is silently ignored.
+  fail         anything else: registers differ, a guest fault, any other no-code stop (an `unsupported_form` not in REFUSED,
+               `system_instruction`, `fetch_not_ram`, `partial_decode`, ...), the driver or nasm erred. Each is diagnosed by
+               hand (see the report); none is silently ignored.
 x87 (I6): natemu runs x87 in FEX's reduced-precision mode (doubles; owner direction). A test whose `Env` does not set
 FEX_X87REDUCEDPRECISION expects FEX's 80-bit mode; when such a test runs to the hlt and every differing value is an x87
 value that is exactly the 80-bit expectation rounded to 53 bits under some rounding mode (see `x87_value_ok`: MMn, or an
@@ -62,8 +63,9 @@ NOT_ADVERTISED = {'rdpid', 'rdseed', 'clflushopt', 'clzero', 'clwb', 'serialize'
                   'pfsub', 'pfadd', 'pfcmpgt', 'pfmax', 'pfrcpit1', 'pfrsqit1', 'pfsubr', 'pfacc', 'pfcmpeq', 'pfmul', 'pfrcpit2',
                   'pmulhrwa', 'pswapd', 'pavgusb', 'femms', 'vaesenc', 'vaesenclast', 'vaesdec', 'vaesdeclast', 'vpclmullqlqdq',
                   'vpclmulhqlqdq', 'vpclmullqhqdq', 'vpclmulhqhqdq', 'vpclmulqdq', '{vex}',
-                  # X1c: AMD's SSE4a MOVNTSS/MOVNTSD (F3/F2 0f 2b): blank cells of Intel's Table A-3 on the GenuineIntel profile
-                  'movntss', 'movntsd'}
+                  # X1c: AMD's SSE4a MOVNTSS/MOVNTSD (F3/F2 0f 2b), EXTRQ/INSERTQ (66/F2 0f 78/79; CPUID.80000001H:ECX.SSE4A[6] = 0):
+                  # blank cells of Intel's Table A-3 on the GenuineIntel profile
+                  'movntss', 'movntsd', 'extrq', 'insertq'}
 # I9: tests whose expectation needs the 80-bit aliasing of MMX and x87 registers (an MMX write's bits 79:64 = FFFFH, an MMX read
 # of an x87 register's 64-bit significand, FNSAVE tags of MMX values), which natemu does not build: MMn is the slot's low 64 bits
 # and the reduced-precision x87 value is a double there (plan I9, MMX deviations); their MMX-only results match.
@@ -80,6 +82,12 @@ FEX_EXPECTS_ITS_BUG = {'X87/FXAM_Simple.asm': "expects FEX's FXAM of +0 (its com
                                        "log2(3) to give 8.0 (FEX lists the test as disabled); natemu gives 23.77",
                       'VEX/vldmxcsr.asm': "expects FEX's VSTMXCSR, which masks off the exception flags (FFC0H); x86 stores MXCSR as "
                                           "VLDMXCSR loaded it, FFFFH (SDM STMXCSR; natemu's is the resident's transaction, I8 review)"}
+# Tests whose expectation is Linux's UMIP emulation of SMSW (FEX's tests ran under it): its fixed CR0 80050033H, and a
+# 32-bit destination's bits 63:32 kept. Checked instead against the SDM (SMSW, 64-bit mode: r16 and m16 take CR0[15:0], r32
+# CR0[31:0] zero-extended, r64 CR0) with the driver's CR0 at CPL 3, 80010011H; each 66/F2/F3-prefixed form must equal its
+# plain one (F2/F3 ignored as on the reference AMD machine, plan §5; 66 with REX.W: 64 bits).
+SDM_EXPECTED = {'Secondary/07_XX_04.asm': {**dict.fromkeys(['RAX', 'RBX', 'RDI', 'RSP', 'RBP'], [0x80010011]),
+                                           **dict.fromkeys(['RCX', 'RDX', 'R8', 'R9', 'R10'], [0x4142434445460011])}}
 # Tests of AMD's 66 on a near direct branch (rel16, IP truncated to 16 bits; FEX lists both as disabled, "can't test this in a
 # real environment"). Intel ignores 66 in 64-bit mode (SDM Vol.2 CALL/JMP; fexc patch 0029): the rel32 that the following bytes
 # form is taken and the fetch there faults (#PF at 0x6ec0017 and 0x7ec0017, the Intel targets).
@@ -87,6 +95,64 @@ AMD_REL16 = {'Primary/Primary_E8.asm', 'Primary/Primary_E9.asm'}
 NEEDS_OS = {'syscall'}   # #UD with EFER.SCE = 0: no OS has set up SYSCALL here
 OS_SEGMENTS = {'Primary/Primary_8C.asm', 'Primary/Primary_8C_2.asm', 'Primary/Primary_CF.asm', 'PrimaryGroup/5_FF_05.asm',
                'PrimaryGroup/5_FF_05_03_o64.asm', 'PrimaryGroup/5_FF_05_03_o64_imm.asm', 'Secondary/07_XX_00.asm'}
+
+# The forms natemu refuses (`unsupported_form`, a typed stop) by a recorded decision, as the handoff lists them
+# (docs/restructure/boot-handoff.md §4, "Typed refusals", where each has its SDM status): (name there, test on the
+# instruction's legacy prefixes, REX, the bytes from its opcode on, and ndisasm's mnemonic). An `unsupported_form` stop at
+# any other instruction fails, as does every other no-code stop.
+LEGACY = {0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x66, 0x67, 0xf0, 0xf2, 0xf3}
+def split(code):
+    """The legacy prefixes (a set), the REX in force (0: none) and the bytes from the opcode on."""
+    i, p, rex = 0, set(), 0
+    while i < len(code) and (code[i] in LEGACY or 0x40 <= code[i] <= 0x4f):
+        rex = code[i] if code[i] >= 0x40 and code[i] <= 0x4f else 0
+        p |= {code[i]} & LEGACY
+        i += 1
+    return p, rex, code[i:] + bytes(6)
+def x87_alias(op, m):
+    """fexc's undocumented or reserved x87 encodings (the shim's `X87`), FENI/FDISI/FSETPM included."""
+    mod, reg = m >> 6, m >> 3 & 7
+    if mod != 3: return (op, reg) in {(0xd9, 1), (0xdb, 4), (0xdb, 6), (0xdd, 5)}
+    return {0xd9: 0xd1 <= m <= 0xdf or m in (0xe2, 0xe3, 0xe6, 0xe7, 0xef), 0xda: reg > 3 and m != 0xe9,
+            0xdb: reg in (4, 7) and m not in (0xe2, 0xe3), 0xdc: reg in (2, 3), 0xdd: reg == 1 or reg >= 6,
+            0xde: reg == 2 or (reg == 3 and m != 0xd9), 0xdf: reg in (1, 2, 3, 4, 7) and m != 0xe0}.get(op, False)
+def vex(op):
+    """(L, ModRM.mod, map, pp, opcode) of a VEX instruction, else None."""
+    if op[0] == 0xc5: return op[1] >> 2 & 1, op[3] >> 6, 1, op[1] & 3, op[2]
+    if op[0] == 0xc4: return op[2] >> 2 & 1, op[4] >> 6, op[1] & 31, op[2] & 3, op[3]
+    return None
+def scalar_l1(op):
+    """VEX.L = 1 on a scalar LIG form: the shim's `lig`, `fma_scalar` and `rmwlig` sets."""
+    v = vex(op)
+    if not v or not v[0]: return False
+    _, _, m, pp, o = v
+    return (m == 1 and o in (0x10, 0x11, 0x2a, 0x2c, 0x2d, 0x2e, 0x2f, 0x51, 0x52, 0x53, 0x58, 0x59, 0x5a, 0x5c, 0x5d, 0x5e, 0x5f, 0xc2)
+            and (pp >= 2 or (o in (0x2e, 0x2f) and pp <= 1))) or \
+           (m == 2 and pp == 1 and o in (0x99, 0x9b, 0x9d, 0x9f, 0xa9, 0xab, 0xad, 0xaf, 0xb9, 0xbb, 0xbd, 0xbf)) or (m == 3 and pp == 1 and o in (0x0a, 0x0b))
+REFUSED = [
+    ('VEX gathers', lambda p, rex, op, w: re.match(r'vp?gather', w)),
+    ('MASKMOVQ, MASKMOVDQU, VMASKMOV/VPMASKMOV', lambda p, rex, op, w: re.match(r'v?p?maskmov', w) and not p & {0xf2, 0xf3}),
+    ('VCVTPS2PH m', lambda p, rex, op, w: w == 'vcvtps2ph' and vex(op)[1] != 3),
+    ('scalar VEX.L = 1 forms', lambda p, rex, op, w: scalar_l1(op)),
+    ('RCL/RCR m', lambda p, rex, op, w: op[0] in (0xc0, 0xc1, 0xd0, 0xd1, 0xd2, 0xd3) and op[1] >> 6 != 3 and op[1] >> 3 & 7 in (2, 3)),
+    ('BT* m, r with 0x67', lambda p, rex, op, w: 0x67 in p and op[0] == 0x0f and op[1] in (0xa3, 0xab, 0xb3, 0xbb) and op[2] >> 6 != 3),
+    ('16-bit BSWAP/SHLD/SHRD', lambda p, rex, op, w: 0x66 in p and op[0] == 0x0f and (op[1] in (0xa4, 0xa5, 0xac, 0xad) or (0xc8 <= op[1] <= 0xcf and not rex & 8))),
+    ('ENTER with nesting', lambda p, rex, op, w: op[0] == 0xc8 and op[3] & 0x1f),
+    ('66 on PUSHF/ENTER/LEAVE/RET/indirect branches/CMPXCHG8B/16B', lambda p, rex, op, w: 0x66 in p and (
+        op[0] in (0x9c, 0xc8, 0xc9, 0xc2, 0xc3) or (op[0] == 0xff and 2 <= op[1] >> 3 & 7 <= 5) or (op[0] == 0x0f and op[1] == 0xc7 and op[2] >> 3 & 7 == 1))),
+    ('FBLD/FBSTP and undocumented x87 aliases', lambda p, rex, op, w: (op[0] == 0xdf and op[1] >> 6 != 3 and op[1] >> 3 & 7 in (4, 6)) or x87_alias(op[0], op[1])),
+    ('REPNE on MOVS/STOS/LODS', lambda p, rex, op, w: 0xf2 in p and op[0] in (0xa4, 0xa5, 0xaa, 0xab, 0xac, 0xad)),
+    ('REP/REPNE on BT*, INC/DEC, CMPXCHG8B/16B', lambda p, rex, op, w: p & {0xf2, 0xf3} and (
+        (op[0] in (0xfe, 0xff) and op[1] >> 3 & 7 <= 1) or
+        (op[0] == 0x0f and (op[1] in (0xa3, 0xab, 0xb3, 0xbb) or (op[1] == 0xba and op[2] >> 3 & 7 >= 4) or (op[1] == 0xc7 and op[2] >> 3 & 7 == 1))))),
+    ('66 with F2/F3 on an SSE form', lambda p, rex, op, w: 0x66 in p and p & {0xf2, 0xf3} and op[0] == 0x0f and
+        (0x10 <= op[1] <= 0x7f or op[1] >= 0xc2 or op[1] in (0x38, 0x3a))),
+]
+def refused(code, at):
+    """The REFUSED name of the instruction at the start of `code` (`at`: its ndisasm mnemonic), or None."""
+    p, rex, op = split(code)
+    w = at.split()[-1] if at else ''
+    return next((name for name, test in REFUSED if test(p, rex, op, w)), None)
 
 
 # I6: x87 values against 80-bit expectations, as tight as the recorded deviations. A test's differences are a precision
@@ -260,6 +326,7 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
             return {**rec, 'outcome': 'fail', 'reason': 'harness: nasm failed', 'detail': n.stderr[-500:]}
         binary = (work / 't.bin').read_bytes()
         want = {k.upper(): [int(v, 0) for v in (vals if isinstance(vals, list) else [vals])] for k, vals in h.get('REGDATA', {}).items()}
+        want.update(SDM_EXPECTED.get(name, {}))
         # Expectations natemu cannot check: XMM16+ (AVX-512). MMn is x87/MMX (I6); XMM0..15 with four values a YMM register
         # (I8: the upper half from the report's `ymmh`).
         vector = sorted(k for k in want if k not in GPR and k != 'RIP' and not (re.fullmatch(r'XMM\d+', k) and int(k[3:]) < 16)
@@ -269,7 +336,6 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
         if run.returncode:
             err = run.stderr.strip()[-300:]
             if 'guest RAM exhausted' in err: return {**rec, 'outcome': 'unsupported', 'reason': 'region beyond 4 MiB guest RAM'}
-            if 'object refused: code layout' in err: return {**rec, 'outcome': 'unsupported', 'reason': 'block over the 32 KiB code-block limit (admission: code layout)'}
             return {**rec, 'outcome': 'fail', 'reason': 'harness: driver error', 'detail': err}
         s = json.loads(run.stdout)
         rip = int(s['rip'], 0)
@@ -281,8 +347,10 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
             rec['stop'] = f"{s['stop']} {s['reason']} rip={rip:#x}"
             if CODE <= rip < CODE + len(binary): rec['at'] = mnemonic(binary, rip); rec['bytes'] = binary[rip - CODE:rip - CODE + 8].hex()
             if s['stop'] == 'no_code':
-                # fexc's end reason; the instruction is the one at RIP
-                return {**rec, 'outcome': 'unsupported', 'reason': f"{s['reason']}: {rec.get('at', '?')}"}
+                # fexc's end reason; the instruction is the one at RIP. Unsupported only for a documented refusal.
+                form = s['reason'] == 'unsupported_form' and 'at' in rec and refused(binary[rip - CODE:rip - CODE + 15], rec['at'])
+                if form: return {**rec, 'outcome': 'unsupported', 'reason': f"refused form (handoff §4): {form}: {rec['at']}"}
+                return {**rec, 'outcome': 'fail', 'reason': f"no code: {s['reason']}", 'detail': rec['stop']}
             if s['stop'] == 'resident' and s['reason'].startswith('unsupported_atomic'):
                 # A memory xchg whose operand crosses 16 bytes (a split lock): stopped before any effect (S3e, boot phase)
                 return {**rec, 'outcome': 'unsupported', 'reason': f"split lock: {rec.get('at', '?')}"}
@@ -362,25 +430,7 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
 
 def category(reason):
     """Coarse family of an unsupported reason, for the summary."""
-    if not reason.startswith(('unsupported_form', 'system_instruction')): return reason.split(' (')[0]
-    kind, text = reason.split(': ', 1)
-    if kind == 'system_instruction': return 'system instruction (cpuid, segment/cr moves, pushf/popf, rdtsc, ...)'
-    w = text.split()
-    pre = w[0] if w[0] in PREFIXES else None
-    base = w[1] if pre and len(w) > 1 else w[0]
-    if base.startswith('v'): return 'AVX (VEX-encoded)'
-    if base == 'db': return 'x87: undocumented alias or reserved encoding'
-    if base in ('f2xm1', 'fyl2x', 'fyl2xp1', 'fptan', 'fpatan', 'fsin', 'fcos', 'fsincos', 'fprem', 'fprem1', 'fscale'):
-        return 'x87: transcendental, remainder or scale (FEX host libm helper)'
-    if base in ('fbld', 'fbstp'): return 'x87: BCD (FEX host helper)'
-    if base.startswith('f') and base != 'femms': return 'x87: ' + base
-    if re.match(r'^(movap[sd]|movup[sd]|movdq[au]|movntdqa|movss|movsd|movq|movd|p[a-z0-9]+|cvt.*|round.*|aes.*|sha.*|lddqu|[ls]dmxcsr|emms|femms|pf.*|pi2f.*)$', base):
-        return 'MMX/SSE/3DNow/AES/SHA vector'
-    if pre == 'lock' or base in ('xchg', 'cmpxchg', 'xadd', 'cmpxchg8b', 'cmpxchg16b'): return 'atomics: lock prefix, xchg/cmpxchg/xadd on memory'
-    if base in ('cld', 'std', 'stc', 'clc', 'lahf', 'sahf'): return 'flag moves: cld std stc clc lahf sahf'
-    if base in ('shld', 'shrd'): return 'shld/shrd'
-    if base in ('popcnt', 'lzcnt', 'tzcnt', 'crc32', 'movbe', 'adox', 'blsr', 'blsi', 'blsmsk', 'bextr', 'bzhi', 'pdep', 'pext', 'mulx', 'rorx', 'sarx', 'shlx', 'shrx', 'andn', 'rdrand', 'rdseed', 'rdpid', 'clwb'): return 'BMI/ABM/other ISA extensions'
-    return 'other: ' + text
+    return reason.split(': ')[1] if reason.startswith('refused form') else reason.split(' (')[0]
 
 
 SELFTEST = {   # synthetic tests: (source, expected outcome, reason prefix)
@@ -404,7 +454,9 @@ SELFTEST = {   # synthetic tests: (source, expected outcome, reason prefix)
     'range_ok.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0x8000000000000000","0x478f"]}}\n%endif\nfld tword [rel v]\nhlt\nv: dq 0x8000000000000000\ndw 0x478f\n', 'precision deviation', '80-bit'),
     'hole_range.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0x8000000000000000","0x478f"]}}\n%endif\nfld1\nhlt\n', 'fail', 'registers differ'),
     'mm_far.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0x8000000000000000","0x4000"]}}\n%endif\nfld1\nhlt\n', 'fail', 'registers differ'),
-    'vector_insn.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0"}}\n%endif\nxor eax,eax\nmaskmovq mm0, mm1\nhlt\n', 'unsupported', 'unsupported_form'),
+    'vector_insn.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0"}}\n%endif\nxor eax,eax\nmaskmovq mm0, mm1\nhlt\n', 'unsupported', 'refused form'),
+    # An `unsupported_form` outside REFUSED fails: INSERTPS m32 whose zero mask clears the inserted element (fexc refuses it).
+    'unlisted_form.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0"}}\n%endif\nxor eax,eax\ninsertps xmm0, [rel v], 0x01\nhlt\nv: dd 0\n', 'fail', 'no code: unsupported_form'),
     'xmm.asm': ('%ifdef CONFIG\n{"RegData":{"XMM0":["0x1","0x0"],"XMM1":["0x0","0x0","0x0","0x0"]}}\n%endif\nmov eax, 1\nmovd xmm0, eax\nhlt\n', 'pass', ''),
     'xmm_wrong.asm': ('%ifdef CONFIG\n{"RegData":{"XMM0":["0x2","0x0"]}}\n%endif\nmov eax, 1\nmovd xmm0, eax\nhlt\n', 'fail', 'registers differ'),
     'bits32.asm': ('%ifdef CONFIG\n{"Mode":"32BIT","RegData":{"RAX":"0"}}\n%endif\nhlt\n', 'unsupported', '32-bit'),

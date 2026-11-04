@@ -26,6 +26,9 @@ Perf chunk 6 (uncommitted on ea11225) measured the whole-cache flushes and left 
 installer boot (N = 1) refill blocks placed before a flush, and a record arena and index sized for the code area were no
 faster (+261 MiB); the performance log gains four request-line fields, and up to 870 k requests at N = 1 could reuse a block
 of the same physical page inside the resident (perf plan "Measured (chunk 6)").
+The integrity audit of November 3 (uncommitted on 1c4d8b9) tightened the ASM runner (unsupported only for a documented
+refusal), made SSE4a EXTRQ/INSERTQ #UD and F2/F3 on SMSW ignored, added `boot-linux --code-shape`, listed the reserved forms
+refused (§4), and replaced the QEMU comparison by a like-for-like one (§4 boots, §5 "Rerun with the integrity-audit fixes").
 This page is enough to start the boot integration: how to build and run a boot, what a boot takes as input, what is
 known to cost or differ, and the standing suite. The plan's "Built (...)" paragraphs hold the detail and the evidence;
 the [contract inventory](contracts.md) maps each contract to its check. No performance tuning was done beyond the
@@ -84,7 +87,9 @@ mapped while the VM exists. `Boot::run()` is both. The compile cache is off unle
 stub's options plus `--rsdp`, `--code-cache`, `--watchdog-ms` (default 60,000), `--max-block`, `--stop-at`,
 `--load-only`, `--dump`, `--save`, `--strict-unassigned`, `--lost-ticks`, `--clock-trace`, `--check-reuse` (perf chunk 4,
 debug: every translation reused at another RIP is also compiled there and must be byte-equal, else a host error; the
-program driver's `--code-shape` turns the same check on); prints one JSON report (the
+program driver's `--code-shape` turns the same check on), `--code-shape` (debug, off by default: admission's code-shape
+check on every object, as the suites run it; here without `--check-reuse`, which it can be combined with; the library's
+`Boot::code_shape`, not in the stub; one installer boot passed it, §5 "Rerun with the integrity-audit fixes"); prints one JSON report (the
 placement, the BSP's stop, state and stats, each vCPU's stop and counters). Same `Boot` underneath. SIGINT or SIGTERM
 cancels its run as the stub's does (the report is still printed; a second one exits 130; both use
 `Canceller::on_signals`).
@@ -195,9 +200,19 @@ SDM, are ignored as processors do since series45-r2fix: plan §5, owner rule, an
 near direct branches is ignored as the SDM defines for 64-bit mode since series46-br66: plan, Built (66 on near direct
 branches); no segment-prefix form is refused since series47-seg: CS/DS/ES/SS ignored, so the default segment decides #SS/#GP,
 the last FS/GS prefix applies, FS/GS with no memory operand ignored, owner decisions of November 3 from the reference AMD
-machine, plan §5); `no_code` `spill_area` for a block fexc can
+machine, plan §5); and forms the SDM leaves reserved (Vol.2 2.1.1: "use of repeat prefixes and/or undefined opcodes
+with other Intel 64 or IA-32 instructions is reserved", and it gives 66 next to a mandatory F2/F3 prefix no meaning), refused by
+policy and not checked on hardware: REPNE (F2) on MOVS/STOS/LODS (the REP page defines only F3 there; hardware repeats as with
+REP), REP or REPNE on a form that defines neither (not a string, mandatory-prefix, BND, PAUSE or `rep ret` form; the
+suites reach BT*, INC/DEC and CMPXCHG8B/16B), and 66 with F2/F3 on an SSE form (`66 f3 0f 2c`, CVTTSS2SI), 66 on CMPXCHG16B as on CMPXCHG8B; `no_code` `spill_area` for a block fexc can
 only compile with a spill area at one instruction (admission verifies no spill-slot code; a longer block is translated
-again with half its instructions first, as for `code_too_large`; fexc spilled on no corpus and no boot). CR0.NE = 0 stays the named stop `unsupported_ferr`
+again with half its instructions first, as for `code_too_large`; fexc spilled on no corpus and no boot). The ASM runner
+(`tools/fexc/upstream_tests/run_asm.py`, `REFUSED`) counts a test unsupported only at a form of this list; an `unsupported_form`
+stop anywhere else, or any other no-code stop, fails it (integrity audit, November 3). Since that audit, F2/F3 on SMSW are ignored
+(reserved by 2.1.1; owner rule: the reference AMD machine, a user-mode probe where Linux enables UMIP: every F2/F3 and 66
+register and memory form took plain SMSW's UMIP #GP, none #UD; `natemu-raw/audit-fix-20261103-01/probe/`) and AMD's SSE4a
+EXTRQ/INSERTQ (66/F2 `0f 78/79`, not advertised: CPUID.80000001H:ECX[6] = 0) are #UD (the host's system decode,
+`crates/host/src/system.rs`), as MOVNTSS/MOVNTSD already were. CR0.NE = 0 stays the named stop `unsupported_ferr`
 and INCSSP without CET is #UD per the SDM, not QEMU's behaviour (owner decisions, November 2, phase end). Not built:
 RAM above 3 GiB, more than 4 vCPUs (4-bit masks per page), 1 GiB pages, PCID, LA57, TSC-deadline, CPU offlining
 (mailbox version 1).
@@ -252,9 +267,6 @@ likewise at N = 1 and one boot each at N = 4, log off, before (1c4d8b9) and afte
 | `natemu-host boot-linux`, cache warm | 2.46 (1.19) | 2.04 (1.34) | 2.19 (1.47) | 2.26 (1.55) |
 | `natemu` stub, cache off | 4.15 (2.83) | 4.68 (3.70) | 5.33 (4.32) | 5.70 (4.65) |
 | `natemu-host boot-linux`, cache off | 4.51 (3.12) | 5.24 (4.13) | 5.58 (4.48) | 6.06 (5.03) |
-| QEMU 11.1.2 TCG, `thread=multi` | 1.97 (1.24) | 1.70 (1.01) | 1.60 (0.94) | 1.70 (0.99) |
-| QEMU TCG default (is multi-threaded here) | 2.01 (1.29) | | | 1.72 (1.00) |
-| QEMU TCG `thread=single` | 1.95 (1.26) | | | 1.86 (1.09) |
 
 | To "Select a language" (initrd), wall s ("Run /init" guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
 | --- | --- | --- | --- | --- |
@@ -272,18 +284,52 @@ likewise at N = 1 and one boot each at N = 4, log off, before (1c4d8b9) and afte
 | `natemu-host boot-linux`, cache off, series48-lean, **host per-request cleanups** (perf chunk 7, mean of 3; 0da552a in the same rounds: 17.8 (3.62), 15.7 (5.00)) | **15.9** (3.29) | | | **13.6** (4.51) |
 | `natemu-host boot-linux`, cache off, series48-lean, **links kept across TLB events** (perf chunk 8, N = 1 mean of 3, N = 4 one boot; 1c4d8b9 in the same rounds: 15.6 (3.22), 13.4 (4.45)) | **13.6** (3.10) | | | **12.4** (4.29) |
 | `natemu` stub and `boot-linux` at 16b0576, warm or off | never (hangs after "Run /init", see below) | never | | never |
-| QEMU TCG `thread=multi` | 7.27 (2.24) | 5.55 (1.79) | 5.55 (1.86) | 5.46 (1.83) |
-| QEMU TCG default (multi-threaded) | 7.42 (2.28) | | | 5.43 (1.81) |
-| QEMU TCG `thread=single` | 7.25 (2.22) | | | 7.62 (2.28) |
 
-QEMU ran `-machine pc -cpu Haswell,-pcid,-hle,-rtm,-invpcid -m 2048 -smp N -kernel -initrd -append` with `-serial
-file:`. With `-accel tcg,thread=multi` QEMU printed no memory-ordering warning, only "TCG doesn't support requested
-feature: CPUID[eax=01h].ECX.tsc-deadline" once per vCPU, and it did run multi-threaded: at N = 4 the process has 8
-threads and uses about 127% CPU against 5 threads and 99% with `thread=single`. Plain `-accel tcg` behaves as
-`thread=multi` (8 threads), so QEMU 11.1.2 already defaults to MTTCG for this guest on this host; the single-threaded
-rows use `thread=single`. Without initrd natemu is within 1.1-1.4x of QEMU with a warm cache and 2.1-3.4x with it off; to
-the installer it is 9-10x slower than multi-threaded QEMU, mostly first-time compiles of user code at randomized addresses (the cache barely
-helps there: §4, translation latency).
+The QEMU rows these tables held until November 3 (R2's harness: `-machine pc` with its default devices and HPET,
+`-cpu Haswell,-pcid,-hle,-rtm,-invpcid`, and `ps -M` thread polling on the QEMU side only) are replaced by the like-for-like
+comparison below (integrity audit, November 3; `natemu-raw/qcmp-20261103-01/`: `boot.py`, `campaign.py`, `aggregate.py`,
+`runs/boots.jsonl`, `runs/table.md`, `cpu/` in `natemu-raw/audit-fix-20261103-01/`). One harness for both emulators: wall
+from process start to the end-point line, serial polled every 50 ms, nothing else polled but a check every 0.5 s for a
+foreign VM process (none seen); Debian 6.12.107, 2 GiB, `console=ttyS0 earlyprintk=serial mitigations=off` with and
+without `nokaslr`; three interleaved rounds, one VM at a time. natemu: `boot-linux` at 1c4d8b9 plus the audit's change,
+series48-lean, warm = its own compile cache per KASLR setting after a warm-up boot, off = `NATEMU_COMPILE_CACHE=off`.
+QEMU 11.1.2: `-nodefaults -machine pc,hpet=off,i8042=off,vmport=off` (COM1 only; the board's PIC, PIT, RTC, I/O APIC and
+PIIX4 PM block stay; its fixed PIIX3 IDE and floppy controllers have no drives), `-cpu
+Haswell,-pcid,-hle,-rtm,-invpcid,-tsc-deadline,-erms,-mca,-mce`, whose `/proc/cpuinfo` flags equal natemu's but three: QEMU
+keeps `xsaveopt` (without it TCG's boot hangs after "SRBDS"), and lacks `nonstop_tsc` and `tsc_known_freq` (TCG offers no
+invariant TSC and no leaf 15H, so Linux calibrates against the PIT there); `-accel tcg,thread=multi|single`. Cells: mean
+(min-max; guest s at the panic or at "Run /init"). The aggregator fails on any boot that did not reach its end point and
+does fail on one: QEMU `thread=single`, N = 1, KASLR, round 3, where the installer's `main-menu` segfaulted at 5.1 s (in
+QEMU; its serial log beside the record) and the dialog never came; that cell is the mean of the other two.
+
+| To the root-fs panic: wall s mean (min-max; guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
+| --- | --- | --- | --- | --- |
+| natemu `boot-linux`, cache warm, `nokaslr` | 2.25 (2.21-2.32; 1.10) | 2.06 (1.83-2.52; 1.38) | 1.90 (1.89-1.91; 1.25) | 2.01 (2.00-2.02; 1.34) |
+| natemu `boot-linux`, cache off, `nokaslr` | 3.27 (3.21-3.39; 1.98) | 3.21 (3.15-3.25; 2.39) | 3.51 (3.47-3.56; 2.67) | 3.76 (3.73-3.78; 2.93) |
+| QEMU TCG `thread=multi`, `nokaslr` | 1.96 (1.93-1.98; 1.26) | 1.71 (1.69-1.73; 1.02) | 1.66 (1.62-1.68; 0.95) | 1.65 (1.62-1.67; 0.96) |
+| QEMU TCG `thread=single`, `nokaslr` | 1.92 (1.91-1.94; 1.24) |  |  | 1.86 (1.80-1.91; 1.17) |
+| natemu `boot-linux`, cache warm, KASLR | 3.30 (3.24-3.39; 1.97) | 3.48 (3.44-3.54; 2.60) | 3.83 (3.78-3.87; 2.92) | 4.28 (4.20-4.39; 3.34) |
+| natemu `boot-linux`, cache off, KASLR | 3.20 (3.19-3.22; 1.95) | 3.24 (3.23-3.25; 2.40) | 3.51 (3.50-3.52; 2.68) | 3.78 (3.71-3.81; 2.94) |
+| QEMU TCG `thread=multi`, KASLR | 1.96 (1.95-1.96; 1.25) | 1.70 (1.65-1.73; 0.99) | 1.65 (1.61-1.69; 0.95) | 1.66 (1.66-1.67; 0.95) |
+| QEMU TCG `thread=single`, KASLR | 1.96 (1.94-1.98; 1.26) |  |  | 1.85 (1.81-1.88; 1.14) |
+
+| To "Select a language" (initrd): wall s mean (min-max; guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
+| --- | --- | --- | --- | --- |
+| natemu `boot-linux`, cache warm, `nokaslr` | 13.88 (13.81-13.95; 2.30) |  |  | 10.13 (9.90-10.61; 2.48) |
+| natemu `boot-linux`, cache off, `nokaslr` | 16.04 (15.89-16.18; 3.33) |  |  | 13.67 (13.47-13.87; 4.63) |
+| QEMU TCG `thread=multi`, `nokaslr` | 6.28 (6.26-6.31; 2.17) | 5.00 (4.97-5.04; 1.74) | 4.92 (4.87-5.02; 1.72) | 4.89 (4.79-5.01; 1.69) |
+| QEMU TCG `thread=single`, `nokaslr` | 6.15 (6.11-6.18; 2.16) |  |  | 6.37 (6.32-6.46; 2.18) |
+| natemu `boot-linux`, cache warm, KASLR | 16.27 (15.55-16.77; 3.40) |  |  | 14.13 (13.16-14.82; 4.83) |
+| natemu `boot-linux`, cache off, KASLR | 16.12 (15.98-16.19; 3.33) |  |  | 13.87 (13.81-13.90; 4.66) |
+| QEMU TCG `thread=multi`, KASLR | 6.20 (6.19-6.23; 2.17) | 5.06 (4.99-5.09; 1.76) | 4.86 (4.77-4.92; 1.68) | 4.85 (4.81-4.89; 1.71) |
+| QEMU TCG `thread=single`, KASLR | 6.23 (6.23-6.23; 2.19) **1 of 3 did not reach** |  |  | 6.33 (6.11-6.47; 2.19) |
+
+Without initrd and with `nokaslr`, natemu with a warm cache is 1.14-1.22x QEMU `thread=multi` (N = 1-4) and 1.7-2.3x with
+the cache off; with KASLR the warm cache gains nothing for the kernel (the decompressor's relocations change its bytes every
+boot, so the persistent cache misses: §6a), and is slower than cache off at N >= 2 (4.28 against 3.78 s at N = 4: the
+misses' disk lookups), 1.7-2.6x QEMU. To the installer natemu is 2.2x (N = 1) and 2.1x (N = 4) multi-threaded QEMU with a
+warm cache and `nokaslr`, 2.6x and 2.8-2.9x with KASLR or the cache off. QEMU's own KASLR and `nokaslr` rows agree within
+0.1 s.
 
 **Blocking defect found at R2 (resolved): device interrupts after `Boot::prepare` went through a dangling pointer.**
 `irq::install` keeps `Lapics::memory: *const Memory` pointing at `backing.memory` (`crates/host/src/irq.rs:31-50`),
@@ -349,6 +395,27 @@ controls), `delivery` 0 failures, `run_x3.py` (9/9, 4/4, 24/24, 6/6, 10/10, 54/5
 `run_l3.py` 0 failures, `run_l4a.py` (13/13, 4/4, 2/2, 2/2, 1/1), `run_l4b.py` (5/5, 2/2, 3/3, 11/11, 7/7, 1/1),
 `run_m3.py` 0 failures, `run_m2.py` 112/112 at 2 GiB and at 4 MiB, `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative
 controls flagged), and the initrd boots to "Select a language" at N = 1 and 4 (§4 table).
+
+**Rerun with the integrity-audit fixes** (`natemu-raw/audit-fix-20261103-01/suite/`, 2 GiB, 1c4d8b9 plus the uncommitted
+change, series48-lean; no fexc change): `cargo test` 159 + 1 ignored, also with `FEXC` set; Python 317 run, 0 skipped (with
+`FEXC` set, a release `natemu-host` and the loader dump; without them `test_fexc.py` and `test_slice1.py` skip, and
+`test_acpi_model.py`'s 18 tests count as one skipped module: 299 + 1 skipped in a copy with no `../natemu-raw`); ASM
+1,876 pass / 0 fail / 48 deviations / 346 unsupported at both block sizes (selftest ok, with a new case: an
+`unsupported_form` outside `REFUSED` fails; rerun with the same counts after the independent review made the scalar
+VEX.L = 1, 66-with-F2/F3 and masked-move tests match the shim's sets byte for byte). Under the new rule the old 347 held 9 failures: the 8 SSE4a EXTRQ/INSERTQ tests
+(`system_instruction` stops, now #UD as not advertised) and `Secondary/07_XX_04` (`rep smsw`, now ignored F2/F3; its
+expectation is Linux's UMIP emulation, 80050033H with a 32-bit destination's upper half kept, so the runner checks it
+against the SDM with the driver's CR0, `SDM_EXPECTED`: pass). The 346 by reason: refused forms of §4 201 (VEX gathers 97,
+REPNE on MOVS/STOS/LODS 29, 16-bit SHLD/SHRD 20, FBLD/FBSTP and x87 aliases 14, masked moves 11, VCVTPS2PH m 10, REP/REPNE on
+BT*/INC/CMPXCHG8B/16B 9, 66 on PUSHF/ENTER/LEAVE/CMPXCHG8B/16B 7, RCL/RCR m 2, `66 f3 0f 2c` 1, ENTER with nesting 1), #UD
+for an instruction the profile does not advertise 83, split locks (`unsupported_atomic`) 45, FEX's Linux descriptor tables 7,
+FEX-only expectations 5 (AMD's 66 rel16 2, FXAM of +0, VSTMXCSR, FYL2XP1 out of range), 80-bit MMX/x87 aliasing 2, `int 0x80`
+delivered 1, a region beyond guest RAM 1, SYSCALL with EFER.SCE = 0 1. i10 faults 296 at both block sizes; `run_x1.py` 6/6
+and 196/196. One installer boot with `boot-linux --code-shape` (N = 1, cache off) reached "Select a language" in 15.5 s:
+1,160,065 translation requests, every object admitted with the code-shape check and none refused (a refusal is a host error
+that ends the run); admission took 112 against 85 ms without the option on a kernel-only boot, so the check ran
+(`natemu-raw/audit-fix-20261103-01/code-shape/`). The rest of the block was not rerun: the change reaches only the host's
+system decode (66/F2 `0f 78/79`, F2/F3 SMSW), the ASM runner and the boot driver's option.
 
 **Rerun with the chunk-6 log fields, window check and capacity cases** (perf plan "Measured (chunk 6)";
 `natemu-raw/perf6-20261103-02/suite/`, 2 GiB, ea11225 plus the uncommitted change, series48-lean): `cargo test` 159 + 1 ignored,
@@ -444,7 +511,7 @@ the default only). Everything passed but the 7 known i8b departures (they flag `
 | `tools/run_slice1_vm.py` | 64 fixtures and seeded corpora (seed 4242: 44 programs) against pinned QEMU; `--max-block 1` too; also runs the I8/I9/I10 QEMU 7.2 corpora (136, 329 + 7 known QEMU two-NaN departures, 120, 5, 88) and the R2 review's REX-chain corpus (`gen_rex.py`, 25: the census's CRYPTOGAMS sites byte for byte, random programs with 1-3 REX bytes before each REX-encoded instruction); the 66-on-branches corpus (`gen_br66.py`, 12: expected from pinned QEMU on twins with 3E for 66, since QEMU decodes rel16) |
 | `tools/run_slice1_faults.py` | 7,912 precise-fault cases (paging cells, access forms, probes) against QEMU prefix runs, each delivered through the driver's logging IDT and rebuilt by `delivery_check.py`; since M2 every paging cell also sets memory-type bits in its page's walk (a rotation of PAT indices 0-7 and upper-level PWT/PCD) |
 | `tools/run_slice2_vm.py`, `run_slice2_faults.py`, `run_slice2_probes.py` | control flow (64 × 3 block sizes), faults inside loops (846 × 3), code-cache/SMC probes (83) |
-| `tools/fexc/upstream_tests/run_asm.py` | FEX's ASM suite: 2,270 tests, 1,875 pass, 0 fail, 48 x87 precision deviations (reduced precision), 347 unsupported, each with its reason (forms not advertised by the profile, typed refusals, FEX's known failures) |
+| `tools/fexc/upstream_tests/run_asm.py` | FEX's ASM suite: 2,270 tests, 1,875 pass, 0 fail, 48 x87 precision deviations (reduced precision), 347 unsupported, each with its reason (forms not advertised by the profile, typed refusals, FEX's known failures); since the integrity audit 1,876 / 0 / 48 / 346, unsupported only for a §4 refused form (`REFUSED`), a #UD the profile gives, a split lock or a listed FEX-only expectation; any other no-code stop fails |
 | `tools/run_slice3_vm.py MODE` | `corpora`, `smp`, `limits`, `kicks`, `system`, `coherence`, `sharedpt`, `litmus`, `contain`, `privilege` (U1), `delivery` (X1a; X1c: the Table 7-4/7-5 matrix, faults during delivery, triple fault), `events` (X2: interrupt eligibility, shadows, POPF, HLT, NMI, #AC; QEMU x2APIC programs, natemu-only cases, random-time stress) |
 | `tools/run_i6_faults.py` | I6 x87: gating (#NM), precise faults with the x87 state unchanged, refusals, FXAM classes, FIST indefinite, MXCSR isolation, Linux's FPU probes (SDM rules; `--max-block 1` too); the x87 QEMU corpus is `tools/reference/gen_i6.py` + `ref.py` + `run_slice1_vm.py` |
 | `tools/run_k2.py` | K2 resident system path: cost per CLI/STI/POPF/SWAPGS/RDTSC/CPUID/WRMSR/FLD+FSTP m80 loop iteration (decode exits must not grow with N), RDRAND beyond the pool, cross-modifying code at a system instruction (the x86 protocol: after the writer's flag and a CPUID the new instruction runs, every rewrite checked; deterministic) |
@@ -478,7 +545,8 @@ Full suite (about 25 minutes of runner time per pass on the M4 at R2, waits for 
 
 ```sh
 # From the repository root; zsh or bash. Wait until no other natemu-host runs (timing-sensitive cases: kicks, l4b,
-# x3 stress) and rerun alone any timing failure before calling it.
+# x3 stress). A timing failure may be rerun alone once, never more: the results record the first run's result and the
+# rerun's beside it; a failed rerun is a failure.
 F=../natemu-raw/fexc-native-20261026-01/series48-lean/obj/fexc   # tools/fexc/build.sh rebuilds it (patches 0001-0029 + the shim)
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
@@ -497,7 +565,7 @@ cargo +1.97.0 build --offline --locked
 cargo +1.97.0 test --offline --locked
 cargo +1.97.0 build --offline --locked --release -p natemu-runtime --target aarch64-unknown-none
 python3 tools/check_resident_stack.py
-python3 -B -m unittest discover -s tools -p 'test_*.py'
+FEXC="$F" python3 -B -m unittest discover -s tools -p 'test_*.py'   # record "Ran N" with its skip count: test_fexc.py and test_slice1.py skip without a fexc, test_acpi_model.py without target/release/natemu-host and ../natemu-raw (or L2_DUMP)
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/fix"
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/fix-1" --max-block 1
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/seed" "$SEED/programs.json" "$SEED/expected.json"
@@ -614,7 +682,7 @@ deviation, or a contained corner.
 
 - The next phase is performance (owner decision 1); the correctness pass comes after it.
 - **medium**, performance: installer to "Select a language" 15.9 s at N = 1 and 13.6 s at N = 4, cache off (perf chunk 7),
-  against QEMU's 7.3 s and 5.5 s; at R2 it was 67 s, mostly first-time compiles of user code at randomized addresses,
+  against like-for-like QEMU's 6.3 s and 4.9 s (`thread=multi`, §4; R2's harness gave QEMU 7.3 s and 5.5 s); at R2 it was 67 s, mostly first-time compiles of user code at randomized addresses,
   which chunks 2 and 4 removed; the resident's own work now leads (perf plan "Measured (chunk 5)"); of the host's, full
 admission of relocated hits is about 0.8 s at N = 1 (perf plan "Measured (chunk 7)", admission split).
 - **medium**, performance: each vCPU's in-memory compile cache is its own (`execution::Compiler::cache`; only the disk
@@ -625,9 +693,10 @@ admission of relocated hits is about 0.8 s at N = 1 (perf plan "Measured (chunk 
   flushes per boot at N = 1, one per vCPU at N = 4, each followed by about 255 k blocks requested and placed again (about
   1.0 M of the boot's 1.16 M requests at N = 1, an estimated 3.5-4.5 s of 17.4 s); the code area is a third full then (perf
   plan "Measured (chunk 5)", whole-cache flushes).
-- **low**, performance: with KASLR the kernel's address is chosen once per boot and does not move within it, so the
+- **medium**, performance: with KASLR the kernel's address is chosen once per boot and does not move within it, so the
   in-memory and in-VM caches work as with `nokaslr`; only the persistent cache misses for the kernel across boots (the
-  decompressor's relocations change its bytes): the warm-cache speed-up is lost for kernel code, the cold boot is unaffected.
+  decompressor's relocations change its bytes): the warm-cache speed-up is lost for kernel code, and the misses' lookups
+  make a warm KASLR boot slower than cache off at N >= 2 (kernel only, N = 4: 4.28 against 3.78 s; §4 like-for-like table).
 - **medium**, performance: uncached (UC/UC-) RAM costs about 4.3-4.8 us per access (§4, M2 addendum 2); device pages a
   host round trip per access (M3).
 - **medium**, API: the library's public surface is wide (about 190 public items (functions, types, constants) across `execution`, `memory`, `vm`,
@@ -652,6 +721,13 @@ admission of relocated hits is about 0.8 s at N = 1 (perf plan "Measured (chunk 
 - **low**, tooling: the census classifier is a Python port of the shim and drifts when the shim changes (X1c's rules
   arrived only at the R2 review); admission's per-access linear scans are quadratic in a block's sites
   (`admission/structure.rs`, ponytail).
+- **low**, correctness pass (deferred by the integrity audit, November 3): models written from memory with no source snapshot
+  in the repository: `tools/models/segment_model.py`, `syscall_model.py`, `delivery_model.py` and `acpi_model.py`'s
+  `qemu_flags` (line 34, QEMU's FADT flags); each rule needs its SDM (or source) page, and each `QEMU_DIFFERS` entry
+  (`run_slice3_vm.py`, `run_s4.py`) the SDM page that makes natemu right.
+- **low**, correctness pass (same audit): the 7 i8b programs with QEMU two-NaN departures are flagged whole, so what they
+  compute after their first two-NaN operation is not judged; to do: NaN-free twins against QEMU, or judging the two-NaN
+  results by SDM Vol.1 Table 4-7; MIN/MAX under DAZ is untested.
 - **deferred by the owner** (plan §5): RAM above 3 GiB, more than 4 vCPUs, an in-VM AES RNG (RDRAND/RDSEED refills exit
   to the host), 1 GiB pages, PCID, LA57, TSC-deadline, CPU offlining; x87 at reduced precision (owner direction).
 
