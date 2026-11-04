@@ -861,6 +861,10 @@ fn flush(s: &mut State) {
 }
 /// K1: a TLB flush (a CR3 load; `global`: a paging control change or an MTRR write, global entries too): every shadow
 /// goes (the data TLB) and blocks no longer current leave L1 and their links ([`cache::tlb`]); no translation is dropped.
+/// Perf chunk 14: a CR3 load keeps the supervisor space's upper-half shadows when every one of them shadows a global
+/// translation (as the TLB keeps global entries, SDM Vol.3 4.10.4.1; [`tables::reset_cr3`]). This vCPU's writable bits
+/// then stay as they were (a superset of its writable shadows; a peer's mark may ask it for a full reset it did not need)
+/// and its reset counter does not move (a peer waiting for its writable shadows to go waits for a full reset).
 fn tlb(s: &mut State, global: bool) {
     let p = crate::perf::enter(crate::perf::TLB);
     let t0 = ticks();
@@ -868,7 +872,12 @@ fn tlb(s: &mut State, global: bool) {
         Some(n) => s.unlinks += n,
         None => halt(s, stop::BAD_LINK),
     }
-    reset_shadows(s);
+    if global || tables::reset_cr3() {
+        reset_shadows(s);
+    } else {
+        cache::control().kept_resets += 1;
+        s.shadow_generation += 1;
+    }
     cache::control().tlb_ticks += ticks() - t0;
     crate::perf::leave(p);
 }
@@ -878,13 +887,16 @@ fn ticks() -> u64 {
     t
 }
 /// K1: a #PF invalidates the TLB entries of its linear address (SDM Vol.3 4.10.4.1): the blocks with bytes on `cr2`'s
-/// page, or in its 2 MiB page, stop being current, as for INVLPG ([`cache::invlpg`]; its shadow, if any, is the faulting
-/// access's miss: none to drop).
+/// page, or in its 2 MiB page, stop being current, as for INVLPG ([`cache::invlpg`]), and its shadow goes from both
+/// spaces (perf chunk 14: a read-only shadow a write faulted through; a kept global one outlives CR3 loads).
 pub(super) fn page_faulted(s: &mut State, cr2: u64) {
     let t0 = ticks();
     match cache::invlpg(cr2) {
         Some(n) => s.unlinks += n,
         None => halt(s, stop::BAD_LINK),
+    }
+    if tables::unmap(cr2).is_err() {
+        halt(s, stop::SHADOW)
     }
     let c = cache::control();
     c.page_faults += 1;
@@ -1969,7 +1981,7 @@ fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, ac
             if writable && old & 1 != 0 && old & READ_ONLY != 0 {
                 s.upgrades += 1;
             }
-            install(s, va, t.gpa, writable);
+            install(s, va, t.gpa, writable, t.global && s.cpu.cr4 & CR4_PGE != 0);
             // Recorded once per page (an upgrade to writable or a re-install after a reset installs it again).
             let c = cache::control();
             let recorded = c.uncached_count.min(c.uncached.len() as u64) as usize;
@@ -2308,8 +2320,8 @@ fn install_ones(s: &mut State, va: u64) {
 /// table capacity exhaustion evicts every shadow once and retries. The eviction clears the writable bits: the bit is
 /// set again and the marks read again, and a page marked meanwhile is shadowed read-only (the access faults again and
 /// takes the code-write path).
-fn install(s: &mut State, va: u64, gpa: u64, writable: bool) {
-    match tables::install(s.cpu.cpl, va, &guest_ram(), gpa, writable) {
+fn install(s: &mut State, va: u64, gpa: u64, writable: bool, global: bool) {
+    match tables::install(s.cpu.cpl, va, &guest_ram(), gpa, writable, global) {
         Ok(()) => {}
         Err(shadow::Error::Capacity) => {
             reset_shadows(s);
@@ -2318,7 +2330,7 @@ fn install(s: &mut State, va: u64, gpa: u64, writable: bool) {
                 !cache::translated(gpa)
             };
             s.evictions += 1;
-            if tables::install(s.cpu.cpl, va, &guest_ram(), gpa, writable).is_err() {
+            if tables::install(s.cpu.cpl, va, &guest_ram(), gpa, writable, global).is_err() {
                 halt(s, stop::SHADOW)
             }
         }

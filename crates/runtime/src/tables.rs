@@ -88,11 +88,16 @@ fn native(va: u64) -> Option<u64> {
 }
 
 /// Shadow guest linear page `va` with guest-physical page `gpa` of `ram` in the space of `cpl` (whose rights the walk
-/// granted), read-only unless `writable` (the walk granted W and D is set).
-pub fn install(cpl: u64, va: u64, ram: &GuestRam, gpa: u64, writable: bool) -> Result<(), Error> {
+/// granted), read-only unless `writable` (the walk granted W and D is set); `global`: the walk's translation is global
+/// (its leaf's G with CR4.PGE), so the shadow may outlive a CR3 load ([`reset_cr3`]).
+pub fn install(cpl: u64, va: u64, ram: &GuestRam, gpa: u64, writable: bool, global: bool) -> Result<(), Error> {
     let page = ram.range(gpa & !4095, 4096).ok_or(Error::OutsideRam)?;
     let ipa = native(page as u64).ok_or(Error::OutsideRam)?;
-    space(user(cpl)).map(va & !4095, ipa, writable)
+    let mut space = space(user(cpl));
+    match global {
+        true => space.map_global(va & !4095, ipa, writable),
+        false => space.map(va & !4095, ipa, writable),
+    }
 }
 /// L3 (amendment): shadow guest linear page `va`, which maps an unassigned guest-physical page, read-only onto the shared
 /// all-ones page (`natemu_abi::ALL_ONES_IPA`, read-only at stage 2 too; never executable: `PAGE` has PXN/UXN).
@@ -123,6 +128,11 @@ pub fn unmap(va: u64) -> Result<(), Error> {
 /// Removes every shadow of both spaces.
 pub fn reset() {
     space(false).reset()
+}
+/// Perf chunk 14: a CR3 load's reset (`Space::reset_cr3`): the supervisor space's global upper-half shadows stay when
+/// they are all global. Whether every shadow went.
+pub fn reset_cr3() -> bool {
+    space(false).reset_cr3()
 }
 /// The native leaf descriptor shadowing `va` in the space of `cpl` (0 when none).
 pub fn descriptor(cpl: u64, va: u64) -> u64 {

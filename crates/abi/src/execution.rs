@@ -400,6 +400,8 @@ pub mod cache {
         pub slot_contexts: [u64; DISPATCH_SLOTS],
         pub l1_slots: [u64; L1_TABLES],
         pub slot_writes: u64,
+        /// Perf chunk 14: CR3 loads that kept the supervisor space's global upper-half shadows (the rest reset them all).
+        pub kept_resets: u64,
     }
     pub const PC_HINTS: usize = 2048;
     /// [`Control::reuse`].
@@ -542,6 +544,9 @@ pub mod cache {
         /// L4a: the level of the LINT0 input (1: the 8259's INT output is asserted), kept current by the host's chipset;
         /// the resident applies its LVT LINT0 entry (ExtINT: the vector from the PIC's INTA cycle, `REQUEST_IRQ`).
         pub lint0: u64,
+        /// Perf chunk 14: the CNTVCT of the first post since a `perf` resident cleared it as it parked (senders set it only
+        /// while 0; the wake latency of [`crate::execution::perf::Wakes`]). No semantics: nothing but the accounting reads it.
+        pub rung: u64,
     }
     /// `Events::halted`: the shift of the `posts` count the vCPU had seen.
     pub const HALTED_SEEN_SHIFT: u32 = 8;
@@ -2146,6 +2151,29 @@ pub mod perf {
     /// Perf chunk 10: reuse inside the resident (a template's checks, its copy and the re-check; the second page's walk is
     /// `fetch`, the host's answer under the check `host`).
     pub const REUSE: u64 = 25;
+    /// Perf chunk 14: a `perf` resident's halt wake-ups (`events::park`), each kind's count, summed and largest CNTVCT ticks
+    /// and a histogram by microseconds (bins `< 1, < 4, < 16, < 64, < 256, < 1024, >= 1024`). Kinds: [`POST_WAKE`] a post
+    /// (IPI or host interrupt, from `Events::rung`) to the first return from the wait after it; [`POST_RUN`] the same post to
+    /// the park's end (the event is taken next); [`TIMER_RUN`] the vCPU's own LAPIC timer expiry to the park's end, when no
+    /// post came.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct Wakes {
+        pub count: [u64; WAKE_KINDS],
+        pub ticks: [u64; WAKE_KINDS],
+        pub max: [u64; WAKE_KINDS],
+        pub bins: [[u64; WAKE_BINS]; WAKE_KINDS],
+    }
+    pub const WAKE_KINDS: usize = 3;
+    pub const WAKE_BINS: usize = 7;
+    pub const POST_WAKE: usize = 0;
+    pub const POST_RUN: usize = 1;
+    pub const TIMER_RUN: usize = 2;
+    pub const WAKE_NAMES: [&str; WAKE_KINDS] = ["post_wake", "post_run", "timer_run"];
+    pub const WAKES_OFFSET: usize = super::STATE_OFFSET + 0xd08;
+    pub const WAKES_VA: u64 = crate::PRIVATE + WAKES_OFFSET as u64;
+    const _: () = assert!(super::ENTROPY_OFFSET + size_of::<super::Entropy>() <= WAKES_OFFSET);
+    const _: () = assert!(WAKES_OFFSET + size_of::<Wakes>() <= super::MMIO_OFFSET);
     pub const NAMES: [&str; BUCKETS] = ["start", "guest", "host", "halted", "mailbox", "link", "miss", "division", "helper",
         "stop", "irq", "abort", "place", "system", "tlb", "delivery", "revalidate", "shadow", "fetch", "shootdown",
         "lookup", "patch", "enter", "l1", "enter_copy", "reuse"];

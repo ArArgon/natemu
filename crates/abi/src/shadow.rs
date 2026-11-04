@@ -14,6 +14,14 @@
 //! switches roots instead of dropping shadows. Both spaces share the pool;
 //! [`Space::reset`] empties both, and unmapping is per space (callers unmap a
 //! page in both, as for INVLPG).
+//!
+//! Perf chunk 14: a CR3 load without PCID keeps global translations (SDM Vol.3
+//! 4.10.4.1), and so do the shadows ([`Space::reset_cr3`]): the supervisor
+//! space's upper half (the "kept half", where a 64-bit kernel's global pages
+//! live) survives a CR3 load while every shadow in it came from a global
+//! translation ([`Space::map_global`]); any other shadow there makes the next
+//! CR3 load a full reset. Its tables come from the top of the pool, every other
+//! table from the bottom, so a CR3 load returns the bottom part alone.
 pub const HIGH_BASE: u64 = 0xffff_8000_0000_0000;
 pub const WINDOW_BYTES: u64 = 0x20_0000;
 pub const LOWER_ROOT: usize = 0x10000;
@@ -27,8 +35,12 @@ pub const USER_LOWER_ROOT: usize = 0x1c000;
 pub const USER_UPPER_ROOT: usize = 0x1d000;
 /// `[lower, upper]` roots of the supervisor (index 0) and user (index 1) spaces.
 pub const ROOTS: [[usize; 2]; 2] = [[LOWER_ROOT, UPPER_ROOT], [USER_LOWER_ROOT, USER_UPPER_ROOT]];
-/// Pool allocation count (one u64) in its own private page.
+/// Pool allocation counts in their own private page: word 0 the bottom of the pool, word 1 the top (the kept half's
+/// tables); word 2 nonzero once the kept half holds a shadow of a non-global translation.
 pub const STATE_OFFSET: usize = 0x1b000;
+const BOTTOM: usize = 0;
+const TOP: usize = 1;
+const NOT_ALL_GLOBAL: usize = 2;
 /// Intermediate/leaf table pages allocated on demand; never freed except by `reset` (a full pool resets: the vCPU's
 /// `evictions`). M1: 288 pages, to the end of the window's 2 MiB (the execution mode's block owns it; the leaf maps it),
 /// so the shadows of a kernel's working set (one leaf table per 2 MiB of linear addresses) span up to ~560 MiB.
@@ -115,23 +127,31 @@ impl<M: Maintenance> Space<M> {
     fn set(&self, table: usize, index: usize, value: u64) {
         unsafe { self.slot(table, index).write_volatile(value) }
     }
-    fn allocated(&self) -> usize {
-        self.get(STATE_OFFSET, 0) as usize
+    fn count(&self, end: usize) -> usize {
+        self.get(STATE_OFFSET, end) as usize
     }
     /// Table pages taken from the pool.
     pub fn used(&self) -> usize {
-        self.allocated()
+        self.count(BOTTOM) + self.count(TOP)
     }
-    fn allocate(&mut self) -> Result<usize, Error> {
-        let used = self.allocated();
-        if used >= self.pool_pages {
+    /// Whether `va`'s tables are the kept half's: the supervisor space's upper half.
+    fn kept(&self, va: u64) -> bool {
+        !self.user && va >> 47 != 0
+    }
+    /// A zeroed table page from the pool: from its top for the kept half, else from its bottom.
+    fn allocate(&mut self, kept: bool) -> Result<usize, Error> {
+        let (bottom, top) = (self.count(BOTTOM), self.count(TOP));
+        if bottom.saturating_add(top) >= self.pool_pages {
             return Err(Error::Capacity);
         }
-        let table = POOL_OFFSET + used * 4096;
+        let (table, end, used) = match kept {
+            true => (POOL_OFFSET + (self.pool_pages - 1 - top) * 4096, TOP, top),
+            false => (POOL_OFFSET + bottom * 4096, BOTTOM, bottom),
+        };
         for index in 0..512 {
             self.set(table, index, 0);
         }
-        self.set(STATE_OFFSET, 0, used as u64 + 1);
+        self.set(STATE_OFFSET, end, used as u64 + 1);
         Ok(table)
     }
     fn root(&self, va: u64) -> Result<usize, Error> {
@@ -157,6 +177,12 @@ impl<M: Maintenance> Space<M> {
             .checked_sub(POOL_OFFSET)
             .is_some_and(|o| o / 4096 < pages)
     }
+    /// Whether `offset` is an allocated pool table page (either end).
+    fn allocated(&self, offset: usize) -> bool {
+        offset.checked_sub(POOL_OFFSET).map(|o| o / 4096).is_some_and(|page| {
+            page < self.count(BOTTOM) || (page < self.pool_pages && self.pool_pages.checked_sub(self.count(TOP)).is_some_and(|first| page >= first))
+        })
+    }
     /// The table a descriptor links to, `None` when invalid. Only shadow
     /// table pages qualify, so a corrupt link never reaches private pages.
     fn next(&self, descriptor: u64) -> Result<Option<usize>, Error> {
@@ -167,7 +193,7 @@ impl<M: Maintenance> Space<M> {
         // The host pre-links its windows in the supervisor space only.
         let table = (!self.user && LOWER_TABLES.contains(&offset))
             || (!self.user && self.upper && UPPER_TABLES.contains(&offset))
-            || self.pool(offset, self.allocated());
+            || self.allocated(offset);
         if descriptor & 3 != TABLE || !table {
             return Err(Error::Corrupt);
         }
@@ -181,7 +207,7 @@ impl<M: Maintenance> Space<M> {
             table = match self.next(self.get(table, index))? {
                 Some(next) => next,
                 None if allocate => {
-                    let next = self.allocate()?;
+                    let next = self.allocate(self.kept(va))?;
                     // The zeroed table is complete before the walker can reach it.
                     self.tlb.publish();
                     self.set(table, index, (self.ipa + next as u64) | TABLE);
@@ -197,6 +223,13 @@ impl<M: Maintenance> Space<M> {
     /// valid entry is broken first: store 0, invalidate `va`, then store the
     /// new entry (break-before-make); this covers read-only → writable.
     pub fn map(&mut self, va: u64, target: u64, writable: bool) -> Result<(), Error> {
+        self.install(va, target, writable, false)
+    }
+    /// [`Space::map`] of a global translation (its leaf's G with CR4.PGE): in the kept half it survives a CR3 load.
+    pub fn map_global(&mut self, va: u64, target: u64, writable: bool) -> Result<(), Error> {
+        self.install(va, target, writable, true)
+    }
+    fn install(&mut self, va: u64, target: u64, writable: bool, global: bool) -> Result<(), Error> {
         if va & 4095 != 0 || target & !OUTPUT != 0 {
             return Err(Error::Misaligned);
         }
@@ -205,6 +238,10 @@ impl<M: Maintenance> Space<M> {
             return Err(Error::Private);
         }
         let (table, index) = self.leaf(va, true)?.ok_or(Error::Corrupt)?;
+        // Before the entry: a CR3 load that sees the entry sees the word too (one CPU, program order).
+        if !global && self.kept(va) {
+            self.set(STATE_OFFSET, NOT_ALL_GLOBAL, 1);
+        }
         let new = target | PAGE | NOT_GLOBAL | if writable { 0 } else { READ_ONLY };
         let old = self.get(table, index);
         if old == new {
@@ -258,8 +295,28 @@ impl<M: Maintenance> Space<M> {
                 self.set(root, index, 0);
             }
         }
-        self.set(STATE_OFFSET, 0, 0);
+        for word in [BOTTOM, TOP, NOT_ALL_GLOBAL] {
+            self.set(STATE_OFFSET, word, 0);
+        }
         self.tlb.invalidate_all();
+    }
+    /// A CR3 load (no PCID): every shadow goes but the kept half's while it holds global translations only (else
+    /// everything goes, [`Space::reset`]); the bottom of the pool returns. Whether everything went.
+    pub fn reset_cr3(&mut self) -> bool {
+        if self.get(STATE_OFFSET, NOT_ALL_GLOBAL) != 0 || !self.upper {
+            self.reset();
+            return true;
+        }
+        let [lower, _] = ROOTS[0];
+        let [user_lower, user_upper] = ROOTS[1];
+        for (root, indices) in [(lower, 0..256), (user_lower, 0..256), (user_upper, 256..512)] {
+            for index in indices {
+                self.set(root, index, 0);
+            }
+        }
+        self.set(STATE_OFFSET, BOTTOM, 0);
+        self.tlb.invalidate_all();
+        false
     }
 }
 
@@ -353,8 +410,10 @@ mod tests {
         assert_eq!(s.descriptor(HIGH_BASE + 0x10_0abc), 0x4007_0000 | LEAF);
         assert_eq!(s.descriptor(0x10_2000), 0);
         drop(s);
-        // Lower: root[0] -> pool 0 -> pool 1 -> pool 2; upper: root[256] -> pool 3..5.
+        // Lower: root[0] -> pool 0 -> pool 1 -> pool 2; upper (the kept half): root[256] -> the pool's last three pages.
         let table = |page: usize| (IPA + (POOL_OFFSET + page * 4096) as u64) | 3;
+        assert_eq!(word(&m, UPPER_ROOT + 256 * 8), table(POOL_PAGES - 1));
+        assert_eq!(word(&m, POOL_OFFSET + (POOL_PAGES - 1) * 4096), table(POOL_PAGES - 2));
         assert_eq!(word(&m, LOWER_ROOT), table(0));
         assert_eq!(word(&m, POOL_OFFSET), table(1));
         assert_eq!(word(&m, POOL_OFFSET + 4096), table(2));
@@ -362,7 +421,6 @@ mod tests {
             word(&m, POOL_OFFSET + 2 * 4096 + 256 * 8),
             0x4007_0000 | LEAF | READ_ONLY
         );
-        assert_eq!(word(&m, UPPER_ROOT + 256 * 8), table(3));
         // Nothing reaches the private half or the gap.
         assert_eq!(word(&m, LOWER_ROOT + 256 * 8), 0);
         assert!((0..256).all(|i| word(&m, UPPER_ROOT + i * 8) == 0));
@@ -553,5 +611,74 @@ mod tests {
         }
         s.map(0x20_0000, IPA + 0x7_0000, true)
             .unwrap_or_else(|e| panic!("{e:?}"));
+    }
+
+    /// Perf chunk 14: a CR3 load keeps the supervisor space's upper half while every shadow there is global, with its
+    /// tables at the top of the pool; everything else goes and the bottom of the pool returns.
+    #[test]
+    fn cr3_reset_keeps_global_upper_shadows_only() {
+        let mut m = window();
+        let mut s = space(&mut m, POOL_PAGES);
+        let kernel = HIGH_BASE + 0x10_0000;
+        s.map_global(kernel, 0x4007_0000, true).unwrap();
+        s.map_global(0x10_0000, 0x4008_0000, true).unwrap(); // global, but the lower half: not kept
+        s.user = true;
+        s.map(0x20_0000, 0x4009_0000, false).unwrap();
+        s.map_global(HIGH_BASE + 0x40_0000, 0x400a_0000, false).unwrap(); // the user space's upper half: not kept
+        s.user = false;
+        assert_eq!(s.used(), 12);
+        s.tlb.0.clear();
+        assert!(!s.reset_cr3());
+        assert_eq!(s.tlb.0, [ALL]);
+        assert_eq!(s.used(), 3);
+        assert_eq!(s.descriptor(kernel), 0x4007_0000 | LEAF);
+        assert_eq!(s.descriptor(0x10_0000), 0);
+        s.user = true;
+        assert_eq!((s.descriptor(0x20_0000), s.descriptor(HIGH_BASE + 0x40_0000)), (0, 0));
+        // The bottom is reused; it never meets the kept tables.
+        s.map(0x20_0000, 0x4009_0000, false).unwrap();
+        s.user = false;
+        assert_eq!(s.used(), 6);
+        assert_eq!(s.descriptor(kernel), 0x4007_0000 | LEAF);
+        // An INVLPG reaches a kept shadow.
+        s.map_global(kernel + 0x1000, 0x4007_1000, false).unwrap();
+        s.unmap_large(kernel).unwrap();
+        assert_eq!((s.descriptor(kernel), s.descriptor(kernel + 0x1000)), (0, 0));
+        s.map_global(kernel, 0x4007_0000, true).unwrap();
+        // A non-global shadow in the kept half: the next CR3 load resets everything, and the one after keeps again.
+        s.map(HIGH_BASE + 0x80_0000, 0x400b_0000, false).unwrap();
+        assert!(s.reset_cr3());
+        assert_eq!((s.used(), s.descriptor(kernel)), (0, 0));
+        s.map_global(kernel, 0x4007_0000, false).unwrap();
+        assert!(!s.reset_cr3());
+        assert_eq!(s.descriptor(kernel), 0x4007_0000 | LEAF | READ_ONLY);
+        // A full reset returns the top of the pool too.
+        assert_eq!(s.used(), 3);
+        s.reset();
+        assert_eq!((s.used(), s.descriptor(kernel)), (0, 0));
+        // A full reset clears the mark too.
+        s.map(HIGH_BASE + 0x80_0000, 0x400b_0000, false).unwrap();
+        s.reset();
+        s.map_global(kernel, 0x4007_0000, false).unwrap();
+        assert!(!s.reset_cr3());
+        // Without the upper half there is nothing to keep: a full reset.
+        s.upper = false;
+        assert!(s.reset_cr3());
+    }
+    /// Perf chunk 14: the two ends of the pool share its capacity, and a link into the gap between them is corrupt.
+    #[test]
+    fn pool_ends_share_capacity() {
+        let mut m = window();
+        let mut s = space(&mut m, 5);
+        s.map_global(HIGH_BASE, 0x4000_0000, true).unwrap(); // 3 from the top
+        assert_eq!(s.map(0, 0x4000_0000, true), Err(Error::Capacity)); // 2 of 3 from the bottom
+        assert_eq!(s.used(), 5);
+        assert!(!s.reset_cr3());
+        assert_eq!(s.used(), 3);
+        drop(s);
+        // The bottom's pages went back at the reset: a link to one is corrupt.
+        m[LOWER_ROOT / 8] = (IPA + POOL_OFFSET as u64) | 3;
+        let mut s = space(&mut m, 5);
+        assert_eq!(s.map(0x1000, 0x4000_0000, true), Err(Error::Corrupt));
     }
 }

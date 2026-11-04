@@ -30,6 +30,8 @@ work, guest code); at N = 4 the extra vCPUs mostly idle and per-vCPU caches dupl
    revalidation become shared, so synchronisation cost must be measured).
 4. **The N = 4 slowdown**: per-vCPU breakdown, code re-placed after a process migrates between vCPUs, whether vCPU threads
    land on efficiency cores (QoS).
+   Measured in perf chunk 14 ([perf-plan.md](perf-plan.md), "Measured (chunk 14)"): wakes and core placement cost little;
+   CR3 loads dropping the kernel's global shadows did (fixed); vCPU threads now run at the user-interactive QoS class.
 
 Then, as the numbers dictate:
 
@@ -39,7 +41,7 @@ Then, as the numbers dictate:
    cache entries keyed by the bytes read and admitted at use; accuracy (fraction used) measured. Also fixes Linux's quick PIT
    calibration. Tiering: quick first translation, a better one for hot blocks.
 6. **PCID and INVPCID on Arm ASIDs** (owner: a later phase; this is where it fits), with the shared kernel (global) shadow
-   entries merged into it (owner) and accurate IA32_ARCH_CAPABILITIES "not vulnerable" bits (owner: both). Measured cost of
+   entries (built early in chunk 14, owner decision November 4; PCID reuses them) and accurate IA32_ARCH_CAPABILITIES "not vulnerable" bits (owner: both). Measured cost of
    Linux's default mitigations today: installer 11.96 → 24.93 s on natemu (2.1×) vs 6.53 → 8.92 s on QEMU (1.4×), almost all
    PTI address-space work (`natemu-raw/mitig-20261103-01/`). The ordinary benchmark case is "not vulnerable"; once PCID is
    built, a PTI-on boot joins the standing benchmarks (owner).
@@ -110,20 +112,24 @@ per-vCPU breakdowns): `natemu-raw/bench-baseline-20261104-01/` (`table.md`, `run
 | | natemu, chunk 11 | **21.25** | **15.84** | **13.67** | **13.93** |
 | | natemu, chunk 12 | 20.39 | - | - | - |
 | | natemu, chunk 13 | - | - | - | **9.26** |
+| | natemu, chunk 14 | 20.29 | 13.08 | 10.31 | 9.23 |
 | | QEMU multi | 28.3 | 15.3 | 13.5 | 12.5 |
 | | native | 2.61 | 1.40 | 1.20 | 1.09 |
 | `zstd` (all phases) | natemu | 2.26 | 1.74 | 1.63 | 1.71 |
+| | natemu, chunk 14 | 2.13 | 1.42 | 1.27 | 1.14 |
 | | QEMU multi | 17.5 | 11.5 | 8.65 | 7.29 |
 | | native | 1.06 | 0.69 | 0.58 | 0.50 |
 | `hackbench` | natemu | 53.8 | 27.9 | 19.6 | 15.2 |
 | | natemu, chunk 11 | 52.7 | - | - | 15.2 |
 | | natemu, chunk 12 | **30.1** | - | - | **9.57** |
 | | natemu, chunk 13 | - | - | - | **9.34** |
+| | natemu, chunk 14 | **28.27** | **14.86** | **10.39** | **8.45** |
 | | QEMU multi | 16.4 | 8.87 | 6.41 | 5.08 |
 | | native | 3.88 | 2.08 | 1.65 | 1.65 |
 | `locks` | natemu | 16.7 | 8.90 | 6.62 | 5.81 |
 | | natemu, chunk 11 | 16.3 | - | - | 6.07 |
 | | natemu, chunk 12 | - | - | - | **5.35** |
+| | natemu, chunk 14 | 10.97 | 5.83 | 4.60 | 4.71 |
 | | QEMU multi | 11.0 | 33.2 | 26.1 | 27.5 |
 | | native | 2.11 | 1.32 | 3.59 | 4.20 |
 
@@ -132,6 +138,11 @@ Speedup N = 1 to N = 4 (natemu / QEMU multi / native): `zstd` 1.33 / 2.41 / 2.10
 QEMU show); `build` none (no N = 1). natemu / QEMU multi time ratio: `zstd` 0.13-0.23 (natemu 4-8x faster), `hackbench`
 3.0-3.3, `locks` 1.52 at N = 1 then 0.2-0.3, `build` 3.9-5.5. natemu / native: `zstd` 2.1-3.4x, `hackbench` 9-14x, `locks`
 1.4-7.9x. QEMU `thread=single` at N = 4: `build` 30.2, `zstd` 20.4, `hackbench` 22.7, `locks` 11.1 s.
+
+Rows "chunk 14" (every cell rerun): after the kept global shadows and the vCPU QoS class ([perf-plan.md](perf-plan.md),
+"Measured (chunk 14)", edfcee9 plus the change, series52-adox66, `natemu-raw/mcore-20261104-01/`; its own before, edfcee9, in
+the same interleaved campaign: `build` 20.67 / 13.11 / 10.46 / 9.61, `zstd` 2.13 / 1.45 / 1.28 / 1.24, `hackbench` 30.32 / 16.17 /
+11.55 / 9.41, `locks` 11.01 / 5.87 / 4.55 / 5.00). Speedup N = 1 to 4 now: `zstd` 1.87, `hackbench` 3.35, `locks` 2.33, `build` 2.20.
 
 Rows "chunk 11": after the link-record fix ([perf-plan.md](perf-plan.md), "Measured (chunk 11)", November 4, 245700d plus
 the change; `natemu-raw/linkfix-20261104-01/`, same harness and rules, median of three; `-`: not rerun). Rows "chunk 12":
@@ -162,3 +173,14 @@ N = 1 8.65 -> 8.70, N = 4 9.17 -> 6.63).
    is not known. vCPU thread CPU is 2.4-3.8 s of 10 s wall (halted 4.8-5.5 s). Whether threads land on efficiency cores
    cannot be seen without root (`powermetrics`); the machine has 4 performance and 6 efficiency cores, and at N = 4 the four
    vCPU threads and up to four compile servers compete for the four performance cores.
+5. (Perf chunk 14, measured at edfcee9 within the START-END window; [perf-plan.md](perf-plan.md), "Measured (chunk 14)".)
+   Finding 3's halted times included the 3-4 s boot. In the window, vCPUs rarely halt: `hackbench` and `locks` N = 4 0.1-0.3 s
+   of 5-10 s per vCPU, `zstd` compress 0.19-0.24 of 0.73 s (the guest's own time: 74% busy), decompress and verify one
+   thread; a wake costs 8-9 us to the end of `wfi` and 12-14 us to the event, over a few hundred wakes per vCPU. Threads sit
+   on performance cores 93-100% of their CPU time without a QoS class (`proc_pid_rusage`), 100% with user-interactive.
+   `zstd`'s weaker scaling is its single-thread phases (0.44 of 1.2 s at N = 4; compress alone scales 2.34x, native 2.54x).
+   `locks` gets faster with N because its N = 1 time is mostly guest system time (6.4 of 11.2 s: 3.1 M `sched_yield` calls
+   at about 2 us), which parallelises; its contention shows (guest CPU 11.2 -> 21.2 s at N = 4) and its counts verify.
+   `hackbench` N = 4 is CPU-bound (3.9 of 4 cores); per vCPU the costs of N = 1 (generated code 3.3 s, linker 1.8, entries
+   1.0, system instructions 1.0 of 9.7 s with the perf resident) plus shadow misses after CR3 loads (0.9 s), 94% of them
+   kernel (global) pages a CR3 load dropped: fixed in chunk 14.

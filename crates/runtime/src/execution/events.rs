@@ -189,7 +189,12 @@ pub(super) fn park(s: &mut State) {
     unsafe { write_record(record(), s) };
     let halted = word(s, core::mem::offset_of!(Events, halted));
     let posts = word(s, core::mem::offset_of!(Events, posts));
-    let mut parked = false;
+    // Perf chunk 14 (`perf` resident only): the wake latency, from the first post after this point (`Events::rung`).
+    let rung = word(s, core::mem::offset_of!(Events, rung));
+    if crate::perf::ON {
+        rung.store(0, SeqCst);
+    }
+    let (mut parked, mut woke, mut deadline) = (false, false, u64::MAX);
     loop {
         doorbells(s);
         take_invalidations(s);
@@ -214,7 +219,23 @@ pub(super) fn park(s: &mut State) {
             s.halts += 1; // it waits: an event it could take at once never parks it
         }
         // L5: `wfi`, woken on time for the timer's next expiry.
+        deadline = lapic::deadline();
         lapic::wait(s);
+        if crate::perf::ON && !woke {
+            let r = rung.load(SeqCst);
+            if r != 0 {
+                woke = true;
+                crate::perf::wake(crate::perf::POST_WAKE, lapic::now().saturating_sub(r));
+            }
+        }
+    }
+    if crate::perf::ON && parked {
+        let (r, t) = (rung.load(SeqCst), lapic::now());
+        if r != 0 {
+            crate::perf::wake(crate::perf::POST_RUN, t.saturating_sub(r));
+        } else if deadline <= t {
+            crate::perf::wake(crate::perf::TIMER_RUN, t - deadline);
+        }
     }
     halted.store(0, SeqCst);
     crate::perf::leave(p);

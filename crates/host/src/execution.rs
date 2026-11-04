@@ -272,6 +272,10 @@ pub fn post(memory: &Memory, v: usize, event: u64, level: bool) -> bool {
             event_word(memory, v, std::mem::offset_of!(cache::Events, vectors) + w).fetch_or(1 << (event % 64), SeqCst);
         }
     }
+    // Perf chunk 14: the post's time, for a `perf` resident's wake latency (kept only while 0: the first since it parked).
+    if crate::perf::on() {
+        let _ = event_word(memory, v, std::mem::offset_of!(cache::Events, rung)).compare_exchange(0, unsafe { mach_absolute_time() }, SeqCst, SeqCst);
+    }
     event_word(memory, v, std::mem::offset_of!(cache::Events, posts)).fetch_add(1, SeqCst);
     true
 }
@@ -323,7 +327,7 @@ pub fn k1_stats(area: Area) -> String {
     let kinds: Vec<String> = (0..128).filter(|&k| c.system_counts[k] != 0).map(|k| format!("\"{k:#x}\":[{},{}]", c.system_counts[k], ticks_ns(c.system_ticks[k]) / 1000)).collect();
     let from: Vec<String> = (0..32).filter(|&b| c.system_from[b] != 0).map(|b| format!("\"{}\":{}", natemu_abi::execution::perf::NAMES.get(b).unwrap_or(&"?"), c.system_from[b])).collect();
     format!(
-        "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}},\"slot_writes\":{},\"systems\":{{\"kinds\":{{{}}},\"from\":{{{}}},\"chained\":{}}}}}",
+        "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}},\"slot_writes\":{},\"kept_resets\":{},\"systems\":{{\"kinds\":{{{}}},\"from\":{{{}}},\"chained\":{}}}}}",
         c.cr3_loads, c.global_flushes, c.invlpgs, c.revalidated, c.remapped, c.capacity_flushes, c.killed, c.unvalidated,
         ticks_ns(c.tlb_ticks) / 1000, ticks_ns(c.invlpg_ticks) / 1000, c.page_faults, ticks_ns(c.page_fault_ticks) / 1000, c.scanned,
         types.join(","),
@@ -347,6 +351,7 @@ pub fn k1_stats(area: Area) -> String {
         c.reuse_refused,
         c.reuse_checks,
         c.slot_writes,
+        c.kept_resets,
         kinds.join(","),
         from.join(","),
         c.system_chained

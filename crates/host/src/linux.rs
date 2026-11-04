@@ -238,6 +238,14 @@ impl Prepared {
         // Perf chunk 13: one map of fexc's answers for every vCPU.
         let answers = std::sync::OnceLock::new();
         let body = |v: usize, cpu: &Vcpu, cancelled: &AtomicBool| -> Result<(Stop, u64)> {
+            // Perf chunk 14: the vCPU thread (`hv_vcpu_run` runs on it) at the user-interactive QoS class, so macOS keeps
+            // it on a performance core (default class: 93-99% there at N = 4, `locks` N = 4 4% slower). The fexc servers
+            // keep the default class: a vCPU waits for its server's reply, so a lower class only delays the vCPU.
+            unsafe extern "C" {
+                fn pthread_set_qos_class_self_np(class: u32, priority: i32) -> i32;
+            }
+            const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+            unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
             let start = crate::perf::now();
             let mut compiler = Compiler::new(&self.fexc, cpu, self.max_block)?;
             compiler.disk = compile_cache::shared(&self.fexc, &self.compile_cache)?; // P3: the persistent compile cache
@@ -268,14 +276,43 @@ impl Prepared {
                     compiler.reuse_checks, compiler.hits_by_source, compiler.duplicates, compiler.lock_wait.0,
                     compiler.lock_wait.1
                 );
-                match log.finish(end, fexc, &area.read_record(exec::perf::OFFSET), &execution::k1_stats(area), &state) {
+                match log.finish(end, fexc, &area.read_record(exec::perf::OFFSET), &area.read_record(exec::perf::WAKES_OFFSET), &execution::k1_stats(area), &state) {
                     (0, 0) => {}
                     (failed, dropped) => eprintln!("natemu: performance log of vCPU {v}: {failed} failed writes so far, {dropped} request lines past the cap"),
                 }
             }
             Ok((stop?, compiler.compiles))
         };
-        let supervision = owners::supervise(vcpus, &prepare, &body, &self.cancel);
+        // Perf chunk 14: with the log on, every 5 ms each vCPU's resident time so far by bucket (the current one counted to
+        // now; zero without a `perf` resident): `snap NS` and `perf::BUCKETS` ns values per vCPU.
+        let sampling = AtomicBool::new(crate::perf::on());
+        let supervision = std::thread::scope(|scope| {
+            if sampling.load(SeqCst) {
+                scope.spawn(|| {
+                    use exec::perf as rp;
+                    while sampling.load(SeqCst) {
+                        let t = crate::perf::now();
+                        let mut text = format!("snap {t}");
+                        for v in 0..vcpus {
+                            let p: rp::Perf = backing.vcpu(v).read_record(rp::OFFSET);
+                            let mut ticks = p.ticks;
+                            let now = crate::clock::now();
+                            if p.magic == rp::MAGIC && (p.current as usize) < rp::BUCKETS {
+                                ticks[p.current as usize] += now.saturating_sub(p.since);
+                            }
+                            for x in ticks {
+                                text += &format!(" {}", execution::ticks_ns(x));
+                            }
+                        }
+                        crate::perf::line(&text);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                });
+            }
+            let supervision = owners::supervise(vcpus, &prepare, &body, &self.cancel);
+            sampling.store(false, SeqCst);
+            supervision
+        });
         if let Some(a) = answers.get() {
             crate::perf::line(&a.report());
         }

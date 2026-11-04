@@ -214,7 +214,7 @@ impl Recorder {
     /// The vCPU's line: `end` = its service loop's end; `fexc` = its server's (user, system) CPU ns and maximum resident
     /// bytes; `resident` = the resident's record and the K1 statistics (`execution::k1_stats`).
     /// Returns the log's failed writes so far (this line's included) and the request lines this vCPU dropped at the cap.
-    pub(crate) fn finish(mut self, end: u64, fexc: Option<(u64, u64, u64)>, resident: &natemu_abi::execution::perf::Perf, k1: &str, state: &str) -> (u64, u64) {
+    pub(crate) fn finish(mut self, end: u64, fexc: Option<(u64, u64, u64)>, resident: &natemu_abi::execution::perf::Perf, wakes: &natemu_abi::execution::perf::Wakes, k1: &str, state: &str) -> (u64, u64) {
         if let Err(e) = self.requests.flush() {
             write_failed(&e);
         }
@@ -227,8 +227,14 @@ impl Recorder {
         use natemu_abi::execution::perf as rp;
         let ticks: Vec<u64> = resident.ticks.iter().map(|&t| crate::execution::ticks_ns(t)).collect();
         let buckets = pairs(&rp::NAMES, &ticks, &resident.count);
+        // Perf chunk 14: halt wake-ups, [count, total ns, max ns, [bins]] by kind.
+        let ns = crate::execution::ticks_ns;
+        let wakes = (0..rp::WAKE_KINDS)
+            .map(|k| format!("\"{}\":[{},{},{},{:?}]", rp::WAKE_NAMES[k], wakes.count[k], ns(wakes.ticks[k]), ns(wakes.max[k]), wakes.bins[k]))
+            .collect::<Vec<_>>()
+            .join(",");
         line(&format!(
-            "vcpu {{\"vcpu\":{},\"start\":{},\"created\":{},\"last\":{},\"end\":{end},\"done\":{done},\"cpu_ns\":{cpu},\"host\":{{{}}},\"parts\":{{{}}},\"results\":{:?},\"sources\":{:?},\"fexc\":{fexc},\"resident\":{{\"magic\":{},\"since\":{},\"current\":{},\"buckets\":{{{buckets}}}}},\"k1\":{k1},\"state\":{state},\"log\":{{\"failed\":{},\"dropped\":{}}}}}",
+            "vcpu {{\"vcpu\":{},\"start\":{},\"created\":{},\"last\":{},\"end\":{end},\"done\":{done},\"cpu_ns\":{cpu},\"host\":{{{}}},\"parts\":{{{}}},\"results\":{:?},\"sources\":{:?},\"fexc\":{fexc},\"resident\":{{\"magic\":{},\"since\":{},\"current\":{},\"buckets\":{{{buckets}}},\"wakes\":{{{wakes}}}}},\"k1\":{k1},\"state\":{state},\"log\":{{\"failed\":{},\"dropped\":{}}}}}",
             self.vcpu, self.start, self.created, self.last, pairs(&HOST, &self.host, &self.exits), parts.join(","), self.results, self.by_source,
             resident.magic == rp::MAGIC, crate::execution::ticks_ns(resident.since), resident.current, failed(), self.dropped
         ));

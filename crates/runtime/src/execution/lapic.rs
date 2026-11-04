@@ -100,7 +100,7 @@ fn count() -> u64 {
     unsafe { asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack)) };
     v
 }
-fn now() -> u64 {
+pub(super) fn now() -> u64 {
     let v: u64;
     // SAFETY: reads the virtual count.
     unsafe { asm!("isb", "mrs {}, cntvct_el0", out(reg) v) };
@@ -320,6 +320,10 @@ pub(super) fn wait(s: &State) {
     cntv(Some(n + (d - n) / 2));
     unsafe { asm!("dsb sy", "wfi") };
     cntv(Some(d));
+}
+/// The V of the timer's next expiry (`u64::MAX`: none).
+pub(super) fn deadline() -> u64 {
+    lapic().deadline
 }
 /// The longest a halted vCPU spins for its timer instead of waiting ([`wait`]).
 const SPIN_US: u64 = 25;
@@ -593,6 +597,9 @@ fn send(s: &mut State, icr: u64, x2apic: bool) {
     };
     // Counted after the bit is set, before the doorbell (`Events::posts`: the host's rule for ending halted vCPUs).
     let ring = |t: u64| {
+        if crate::perf::ON {
+            let _ = event_word(t, core::mem::offset_of!(Events, rung)).compare_exchange(0, now(), SeqCst, SeqCst);
+        }
         event_word(t, core::mem::offset_of!(Events, posts)).fetch_add(1, SeqCst);
         if t != me {
             cache::kick(t as usize)

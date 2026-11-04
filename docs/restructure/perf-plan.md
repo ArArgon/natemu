@@ -1168,6 +1168,108 @@ bounds (a sixteenth of the old per-vCPU bound; `runs3/`, `log3/`, `table3.txt`):
 three interleaved rounds: 19.76 (19.73-19.77) against 19.78 (19.65-19.91) s, process CPU 23.07 against 23.06 s, max RSS 1,300
 against 1,117 MB; compiles 229.8 k both (no extra compile from hot-shard flips). `cargo test` 168 + 1 ignored, also with `FEXC`.
 
+### Measured (chunk 14: multi-core costs, November 4; uncommitted on edfcee9, series52-adox66)
+
+**Measurement** (`natemu-raw/mcore-20261104-01/`: `bench.py` now samples `proc_pid_rusage` v6 at each marker (CPU, CPU on
+performance cores, runnable time; `tools/prusage.c`, `usage.py`); the perf log gains a 5 ms per-vCPU bucket sampler (`snap`
+lines, `snaps.py` cuts them at the markers) and the perf resident a wake record (`resident.wakes`: post to the end of `wfi`,
+post to the end of the park, own timer expiry to the end of the park; the sender stamps `Events::rung`). Diagnosis runs at HEAD
+0df11b8/edfcee9 with series49-sha (`meas/`, `perf/`, `try/`), campaign with series52-adox66.)
+1. **Wakes and halted time.** The phase-2 finding of 3 s halted in `zstd` N = 4 was the boot. Within START-END, `hackbench` and
+   `locks` N = 4 halt 0.08-0.28 s of 6.4-9.7 s per vCPU; `zstd` compress 0.19-0.24 of 0.73 s (busybox `time`: 74% of the vCPUs
+   busy; zstd's own serial work), decompress and verify run one thread. Parks are 500-900 per vCPU per run, boot included; a
+   post wakes the vCPU in 8-10 us average (97% under 16 us; max 77 us) and the event is taken 12-15 us after the post (max 3.4 ms
+   once); the timer wakes 5-7 us late. At most about 10 ms per vCPU per run: no faster wakeup path was built, and no halt
+   polling (it would spin host cores for the same 10 ms).
+2. **Core placement.** Without a QoS class (machine otherwise idle), vCPU threads spend 93-100% of their CPU on performance
+   cores and wait runnable 0.01-0.33 s per run; the fexc servers 93-97%. With `QOS_CLASS_USER_INTERACTIVE` on the vCPU threads
+   (three interleaved runs, series49-sha, `qos/`): `locks` N = 4 5.00 (4.82-5.06) -> 4.79 (4.69-4.81) s, `zstd` N = 4 1.18
+   (1.16-1.18) -> 1.14 (1.09-1.17), `build` N = 4 9.36 (9.26-9.37) -> 9.32 (9.23-9.67); vCPUs 100% on performance cores, while
+   one `build` run moved its servers to 86%. Servers keep the default class: a vCPU waits for its server's reply, so a lower class
+   only delays it (and std's `Command` cannot set a spawn QoS; a raise is not measured).
+3. **`locks`.** Correct: the program checks both counters (mutex-protected and atomic) and exits 1 on a mismatch; every run
+   verified. MONITOR/MWAIT are not advertised (CPUID.1:ECX[3] = 0: the guest idles with HLT); PAUSE is Arm `yield` (a hint, no
+   exit). It speeds up with N because at N = 1 6.4 of 11.2 s are guest system time: 3.1 M `sched_yield` calls (one per 64
+   rounds) at about 2 us each (QEMU 0.8 us), which divide over the vCPUs. Contention is there and costs: guest CPU 11.2 s at
+   N = 1, 21.2 s at N = 4 (user 4.7 -> 10.2 s, futex system time 6.4 -> 10.9 s). Natively and under QEMU the same contention
+   costs several times their base per-round time; here the system-call path dominates. No hidden defect; the real cost is the
+   syscall path (single-thread work).
+4. **`hackbench` N = 4** is CPU-bound (natemu CPU 37.7 s in 9.6 s: 3.9 cores). Per vCPU (perf resident, 9.7 s): generated code
+   3.3 s, linker entries 1.76, `enter` 1.0, system instructions 1.0, shadow walks 0.5 and aborts 0.45, lookup 0.48, miss 0.37,
+   TLB 0.39; N = 1 has the same buckets. The N = 4 excess is shadow misses after CR3 loads: 2.2-2.5 M per vCPU (5.6 M at N = 1),
+   about 130 per CR3 load, and **94% of them supervisor accesses to the upper half** (a temporary count by space and half:
+   kernel pages, global under `nopti`), because a CR3 load dropped every data shadow.
+
+**Built.**
+1. **Global shadows kept across CR3 loads** (abi `shadow.rs`, runtime `tables.rs`, `execution.rs`). A CR3 load without PCID
+   keeps global TLB entries (SDM Vol.3 4.10.4.1). The shadow pool now has two ends: the supervisor space's upper half (the kept
+   half) takes its tables from the top, everything else from the bottom. `Space::map_global` installs the shadow of a global
+   translation (leaf G with CR4.PGE, from the data walk); any other install in the kept half (`map`, the all-ones page included)
+   sets a word that makes the next CR3 load a full reset. `Space::reset_cr3` (from `tlb(s, false)`, the CR3 load) then drops both
+   lower halves and the user space's upper half, returns the bottom of the pool and invalidates both ASIDs; the kept half
+   stays. Everything else is a full reset as before (paging-control changes including PGE, MTRR writes, capacity, a peer's
+   request, the APIC base move); INVLPG reaches kept shadows (`unmap_large`), and a #PF now unmaps CR2's shadow in both spaces
+   (x86 drops its TLB entries; before, the next CR3 load did). A kept reset leaves the vCPU's writable bits (a superset of its
+   writable shadows) and does not move its reset counter, so a peer marking a page waits for a real full reset. Counter: K1
+   `kept_resets`. Effect (`try/`, one log run each, `hackbench` N = 4): shadow retries 2.2-2.4 M -> 0.20-0.27 M per vCPU, every
+   CR3 load kept, shootdowns 1-4 -> 5-8 per vCPU (stale writable bits), no evictions; `build` N = 4 retries -30%.
+2. **vCPU threads at the user-interactive QoS class** (`linux.rs`, the `boot-linux` body; item 2 above).
+3. The measurement above (perf log and perf resident only; the host stamps `rung` only with the log on).
+
+**Tests** (abi `shadow.rs`): kept half survives `reset_cr3` while lower halves, the user space's upper half and global lower
+shadows go; reuse of the bottom never meets the kept tables; a non-global kept-half shadow makes the next load full, then
+keeping resumes; INVLPG reaches a kept shadow; a full reset returns the top and clears the word; both ends share the
+capacity; a link into a returned page is corrupt. The existing pool test now expects the kept half's tables at the top.
+
+**Measured** (`campaign.sh`, `summ.py`, `table.txt`, `runs/`, `inst/`; the `natemu` stub, cache off, `mitigations=off nokaslr`,
+2 GiB, series52-adox66, base (edfcee9) and c14 interleaved, three rounds, one VM at a time, every run verified or reached and
+uncontended; median (min-max), seconds):
+
+| Benchmark | N | before s | after s | change | CPU s base / c14 |
+| --- | --- | --- | --- | --- | --- |
+| installer | 1 | 8.65 (8.32-8.76) | 8.05 (8.04-8.30) | -6.9% | 8.7 / 8.1 |
+| installer | 4 | 6.67 (6.46-6.81) | 6.44 (6.38-6.65) | -3.4% | 10.5 / 10.0 |
+| zstd | 1 | 2.13 (2.12-2.14) | 2.13 (2.07-2.16) | +0.1% | 5.6 / 5.4 |
+| zstd | 2 | 1.45 (1.43-1.49) | 1.42 (1.36-1.46) | -2.1% | 5.8 / 5.7 |
+| zstd | 3 | 1.28 (1.27-1.32) | 1.27 (1.26-1.28) | -0.9% | 6.2 / 6.1 |
+| zstd | 4 | 1.24 (1.17-1.28) | 1.14 (1.12-1.18) | -7.4% | 6.6 / 6.5 |
+| hackbench | 1 | 30.32 (29.96-30.42) | 28.27 (28.20-28.36) | -6.8% | 33.7 / 31.5 |
+| hackbench | 2 | 16.17 (16.15-16.32) | 14.86 (14.75-14.89) | -8.1% | 35.6 / 33.0 |
+| hackbench | 3 | 11.55 (11.33-11.75) | 10.39 (10.34-10.46) | -10.0% | 38.1 / 34.6 |
+| hackbench | 4 | 9.41 (9.29-9.71) | 8.45 (8.39-8.46) | -10.2% | 41.0 / 37.2 |
+| locks | 1 | 11.01 (10.98-11.04) | 10.97 (10.97-11.04) | -0.3% | 14.4 / 14.2 |
+| locks | 2 | 5.87 (5.82-5.90) | 5.83 (5.77-5.94) | -0.8% | 15.0 / 14.9 |
+| locks | 3 | 4.55 (4.50-4.68) | 4.60 (4.53-4.82) | +1.1% | 17.1 / 17.1 |
+| locks | 4 | 5.00 (4.69-5.01) | 4.71 (4.64-4.97) | -5.9% | 23.2 / 22.2 |
+| build | 1 | 20.67 (20.41-20.80) | 20.29 (20.29-20.33) | -1.9% | 24.2 / 23.6 |
+| build | 2 | 13.11 (13.11-13.37) | 13.08 (13.04-13.21) | -0.2% | 27.1 / 27.0 |
+| build | 3 | 10.46 (10.43-10.60) | 10.31 (10.24-10.68) | -1.4% | 29.6 / 29.1 |
+| build | 4 | 9.61 (9.34-9.62) | 9.23 (9.12-9.55) | -4.0% | 32.2 / 31.7 |
+
+**Ship threshold met**: `hackbench` -6.8% at N = 1 to -10.2% at N = 4, the installer N = 1 -6.9% and N = 4 -3.4%, `zstd` N = 4
+-7.4%, `locks` N = 4 -5.9%, `build` N = 4 -4.0%, each with ranges apart or nearly; N = 1 elsewhere unchanged within spread (`build`
+-1.9%, `zstd` +0.1%, `locks` -0.3%); `locks` N = 3 +1.1% and `build` N = 3 -1.4% within spread. QEMU's control flags gained
+`+smep,+umip` in `bench-20261103-01/scripts/bench.py` and `qcmp-20261103-01/boot.py` (no QEMU run in this chunk).
+
+**The final tree** (after the review's changes below; `confirm.sh`, `runs2/`, `inst2/`, three runs each): installer N = 1 8.19
+(8.08-8.22), N = 4 6.43 (6.41-6.52); `hackbench` N = 1 28.40 (28.19-28.50), N = 4 8.41 (8.40-8.46); `build` N = 1 20.20
+(20.17-20.22), N = 4 9.20 (8.99-9.26); `locks` N = 4 4.84 (4.71-5.04); `zstd` N = 4 1.20 (1.19-1.25): as measured above within
+spread (`zstd` N = 4 is the noisiest cell).
+
+**Checks** (`suite14.sh`, `suite/`, the final tree, series52-adox66, one VM runner at a time, each case's output deleted as it
+ended): `cargo test` 171 + 1 ignored, also with `FEXC` set; the resident stack audit; `run_x3.py` 54/54 cases; `run_x4.py` 33
+units, 28 adversarial, 6 trampoline; `run_l4a.py`, `run_l4b.py` all ok; `run_slice3_vm.py` `smp`, `events`, `kicks`, `delivery`,
+`sharedpt`, `coherence` 0 failures; `run_k1.py` 296 runs, no problem; `run_boot_smoke.py` 4/4; `run_r1.py r1b` 12/12 (negative
+controls flagged); every campaign boot reached and every benchmark verified.
+
+**Independent review** (read-only, of the diff): no blocking defect (every flush path, the writable-bit protocol, pool links and
+the ASID-wide invalidation checked). Applied: the #PF unmap of CR2's shadow, checked arithmetic in the pool's end checks, the
+host's `rung` stamp only with the log on, two more tests (INVLPG of a kept shadow, a full reset returning the top). Noted: stale
+writable bits can force a peer's shootdown and a full reset where a CR3 load used to clear them (measured: 5-8 per vCPU per run).
+
+**Next** (from the evidence): the syscall path (`locks` N = 1 sys 2 us per `sched_yield`, `hackbench`'s linker/entry/system
+buckets), single-thread codegen (`zstd`'s decompress 0.16-0.24 s and verify 0.28 s against 0.07-0.09 natively), then PCID.
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
@@ -1225,6 +1327,8 @@ exec-heavy installer. *Mechanism:* keep a few data-shadow sets tagged by CR3 roo
 (no PCID offered to the guest). A CR3 load without PCID flushes non-global entries, so a kept shadow must equal a fresh
 walk: valid only while no page-table page on its walk was written, tracked as K1 tracks code pages (an A bit cleared
 included). *Risk:* TLB semantics; new SMP cases in `run_k1.py`. *Decides:* CR3-load and shadow-miss ticks.
+(Chunk 14 built the global part: the supervisor upper half's global shadows survive CR3 loads, 94% of `hackbench`'s misses;
+per-CR3 sets of the non-global part remain a candidate, with PCID.)
 
 **Per-block overhead.** As the profile shows: fexc's fixed cost (Config rebuilt per request since P3's leak fix,
 `fexc.cpp:463`; the JSON report the host dropped for objects: removed in chunk 2; argument parsing and the feature table
