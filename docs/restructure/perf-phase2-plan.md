@@ -86,4 +86,4 @@ Move the FEX patch series (tools/fexc/patches, 0001-0029 applied with `git am`) 
 commit per patch, rebased onto upstream on a fixed cadence with the standing suite after each rebase; the submodule pins the
 fork's commit; the shim and fexc front end stay in natemu; the first fork build must be byte-identical to the current compiler;
 general fixes offered upstream. Needs the owner to create the fork (this session's GitHub access covers arargon/natemu only).
-After the multi-core phase.
+Not scheduled (owner, November 4): deferred until the owner or the orchestrator judges it necessary.
