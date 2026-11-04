@@ -15967,47 +15967,6 @@
  },
  {
   "format": "natemu-smp-v1",
-  "name": "sysfault-cr4-umip@1",
-  "ncpu": 1,
-  "system": true,
-  "bodies": [
-   {
-    "addr": "0x110000",
-    "code": "bb34120000be785600000f20e0480fbae80b4839f30f22e0"
-   }
-  ],
-  "cpus": [
-   {
-    "rip": "0x110000",
-    "gpr": [
-     "0x0",
-     "0x0",
-     "0x0",
-     "0x0",
-     "0x3e1800",
-     "0x0",
-     "0x0",
-     "0x0",
-     "0x0",
-     "0x0",
-     "0x0",
-     "0x0",
-     "0x0",
-     "0x0",
-     "0x0",
-     "0x0"
-    ],
-    "rflags": 0,
-    "cpl": 0
-   }
-  ],
-  "memory": [],
-  "params": {
-   "fault_at": "0x110015"
-  }
- },
- {
-  "format": "natemu-smp-v1",
   "name": "sysfault-cr4-la57@1",
   "ncpu": 1,
   "system": true,
