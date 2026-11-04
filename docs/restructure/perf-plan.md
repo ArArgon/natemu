@@ -1,6 +1,6 @@
 # Performance phase plan (draft)
 
-Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review; chunks 1-10 measured below (chunk 5 uncommitted on d89bc4c, chunk 7 on 0da552a, chunk 6 on ea11225, chunk 8 on 1c4d8b9, chunk 9 on 9ba60d5, chunk 10 on 851cbd2). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
+Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review; chunks 1-11 measured below (chunk 5 uncommitted on d89bc4c, chunk 7 on 0da552a, chunk 6 on ea11225, chunk 8 on 1c4d8b9, chunk 9 on 9ba60d5, chunk 10 on 851cbd2, chunk 11 (phase 2, November 4) on 245700d). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
 code, measured first; the correctness pass follows. Principles: measure first; native mechanisms; nothing keyed to
 Linux (a KASLR boot must gain too); every object still admitted; checks green; no debt.
 
@@ -912,6 +912,70 @@ serve path) 67.9 to 49.3 / 53.6 to 37.6; chunk 4 (reuse across load addresses, i
 inside the resident) 10.7 to 8.6 / 11.0 to 9.4. Chunks 1 (instrumentation), 3 (relocation proof) and 6 (whole-cache flushes) changed no
 wall time. Chunks 2, 4 and 5 account for 50 of the 59 s at N = 1; the later four, each about 2 s, bring it from 17.4 to 8.6 s. At N = 4
 the installer is no faster than at N = 1 with the cache off (9.39 against 8.85 s): the next phase's focus is multi-core.
+
+### Measured (chunk 11: link records at capacity, November 4; uncommitted on 245700d, series49-sha)
+
+**Cause** (phase-2 baseline, [perf-phase2-plan.md](perf-phase2-plan.md) "Baseline (November 4)"; reproduced here,
+`natemu-raw/linkfix-20261104-01/repro/`: `build` at N = 1, perf resident, 60 s cap: `patch` 52.9 of 57.6 s of thread CPU, 252,731
+fills). No record leaked: every dead block's links were pruned, and a fill's strict prune found nothing to free. The 64 Ki
+records filled with links that stay valid: into `GLOBAL` kernel blocks (current across every CR3 load until one of the run's
+60 global flushes) and local links into current blocks. Chunk 8's rule at a fill (undo the local links into blocks not current,
+then link if room) then freed about one record per pass (234 k records over 449 k fills in the baseline's 100 s), so almost every
+later linker entry scanned all 64 Ki records, linked nothing, and its exit came back to the linker the next time.
+
+**Built** (resident `cache::link`, abi). A link can always be dropped: its point then enters the linker again. At a fill, the
+strict prune runs first (chunk 8); if that leaves less than a quarter of the area free, every link is undone (`unlink_all`, as at a
+flush, the blocks kept). Each fill then costs at most two passes over the area and is followed by at least a quarter of the area's
+links before the next one: amortised O(1) per link, and no linker entry scans the area unless it fills. `Link::Full` is gone (the
+State field `full_links` stays, always 0). Capacity: `MAX_LINKS` = `MAX_BLOCKS` (256 Ki records, 4 MiB; 64 Ki before), so the
+metadata arena (64 MiB, about 238 Ki of `build`'s blocks) fills before the records do: at 64 Ki with the new rule, `build` N = 1
+filled 73 times (3.70 M links dropped, 4.89 M made, 22.85 s); at 256 Ki never (2.12 M made, 21.01 s; one perf boot each,
+`diag/`). The lookup area grows by 2-3 MiB per vCPU (2 MiB-rounded); every layout assertion holds. Kept: K1 exactness and
+chunk 8's invariants (links are only removed; a restored point goes back through the linker's currency-checked lookup; the
+records stay contiguous in `[0, links)`; `INBOUND` and `LOCAL_INBOUND` may stay set, which only costs a pass).
+
+**Test** (`tools/run_k1.py` `link-full`, natemu only, 1-4 vCPUs, both block sizes): per CPU a chain of 70 pages above 4 GiB of
+`jz $+2` (286,720 link points against 262,144 records), three passes per phase: as placed; after CPU (i - 1) % N rewrote a
+page late in the chain (its links live then); after a page remapped with a CR3 reload; back with INVLPG. Every value exact (r8 3,
+r9 6, r10 12, r12 6), the area filled in every pass with no flush, and fills at most 1 + 4 links / `MAX_LINKS` (13 for 3.44 M
+links); about 25 s per run. Negative controls (scratch residents, `k1-mut/`): chunk 8's rule kept at 256 Ki: 135 k fills (bound
+9), 142 s against 48 s for both block sizes; a fill that drops the records without restoring the words: the host's link check
+fails (24,583 records for 286,725 linked points). A death that prunes only the first two segments stays green: every local
+link's source dies with its target (chunk 8's note).
+
+**Measured** (`natemu-raw/linkfix-20261104-01/`, `campaign.py`, `runs/`, `inst/`, `perf/`; the `natemu` stub, cache off,
+`mitigations=off nokaslr`, 2 GiB, one VM at a time, none contended, every run verified; median (min-max) of three, START to END
+seconds; before = the baseline of the same day):
+
+| Benchmark | N | before | after | QEMU multi |
+| --- | --- | --- | --- | --- |
+| `build` | 1 | did not finish (>2400) | **21.25** (20.89-21.25) | 28.3 |
+| | 2 | 59.3 (48-121) | **15.84** (15.53-15.88) | 15.3 |
+| | 3 | 73.9 (41-88) | **13.67** (13.54-14.55) | 13.5 |
+| | 4 | 51.1 (35-119) | **13.93** (12.61-14.43) | 12.5 |
+| `hackbench` | 1 | 53.81 (53.53-56.34) | 52.73 (52.33-53.19) | 16.4 |
+| | 4 | 15.20 (15.17-15.25) | 15.21 (14.93-15.32) | 5.08 |
+| `locks` | 1 | 16.69 (16.58-17.24) | 16.30 (16.28-16.35) | 11.0 |
+| | 4 | 5.81 (5.75-5.82) | 6.07 (5.99-6.09) | 27.5 |
+| `locks` (interleaved) | 4 | 6.10 (5.69-6.14) | 5.91 (5.79-6.36) | |
+| Installer N = 1 (interleaved) | 1 | 8.80 (8.74-8.83) | 8.83 (8.75-9.01) | 6.10 |
+
+`build` perf boots: N = 1 `patch` under 0.3 s (not in the top eight buckets), no fill, 2.15 M links made; N = 4 no fill, `link`
+0.59-0.68 s per vCPU (14.5-17.8 s of `patch` before). `hackbench` and `locks` spend their `link` bucket in linker entries whose
+target is a system instruction (hackbench N = 1: 98.6 M entries, 114.6 M system instructions, 0.2 M links, no fill): nothing to
+link there; that is phase 2's item 7 (system-instruction fast paths), not the records.
+
+**Independent review** (read-only, of the diff): no blocking defect; it traced `unlink_all` inside `link` (contiguity, flags,
+armed stops, REP self-links, the host's check), the recount, the amortisation bound and the layout. Applied: the rewritten page
+moved late in the chain (page 20 had no live links when written), CPU (i - 1) % N in the comments, a doc wording. Noted: the larger
+area could lengthen CR3 and strict prunes (measured: no slowdown above; `tlb` 0.35 s over the whole N = 1 build).
+
+**Checks** (`suite/`, `suite11.sh`, series49-sha, one VM runner at a time, each case's output deleted as it ended): `cargo test` 163 + 1
+ignored, also with `FEXC` set; `check_resident_stack.py` `ok` (16,656 / 20,832 / 8,912 bytes, unchanged); fixtures 64 and seed 44
+at both block sizes; faults 7,912 at both; `run_slice3_vm.py` `contain`, `smp`, `sharedpt`, `coherence` 0 failures; `run_k1.py`
+288 runs (`link-full` at 1-4 vCPUs and both block sizes: 13 fills each), no failure, 14 and 14 requests at K and 2K rounds;
+`run_k2.py` all ok; `run_boot_smoke.py` 4/4; `run_r1.py r1a` and `r1b` ok (negative controls flagged). Not rerun: `run_s4.py`,
+`run_x1.py`, `delivery` (the change is in the link records, which these exercise only as the cases above do).
 
 ## 3. Candidate chunks
 

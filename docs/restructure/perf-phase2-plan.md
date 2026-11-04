@@ -99,15 +99,18 @@ per-vCPU breakdowns): `natemu-raw/bench-baseline-20261104-01/` (`table.md`, `run
 | Benchmark, seconds | | N = 1 | N = 2 | N = 3 | N = 4 |
 | --- | --- | --- | --- | --- | --- |
 | `build` | natemu | **did not finish** (>2400 s) | 59.3 (48-121) | 73.9 (41-88) | 51.1 (35-119) |
+| | natemu, chunk 11 | **21.25** | **15.84** | **13.67** | **13.93** |
 | | QEMU multi | 28.3 | 15.3 | 13.5 | 12.5 |
 | | native | 2.61 | 1.40 | 1.20 | 1.09 |
 | `zstd` (all phases) | natemu | 2.26 | 1.74 | 1.63 | 1.71 |
 | | QEMU multi | 17.5 | 11.5 | 8.65 | 7.29 |
 | | native | 1.06 | 0.69 | 0.58 | 0.50 |
 | `hackbench` | natemu | 53.8 | 27.9 | 19.6 | 15.2 |
+| | natemu, chunk 11 | 52.7 | - | - | 15.2 |
 | | QEMU multi | 16.4 | 8.87 | 6.41 | 5.08 |
 | | native | 3.88 | 2.08 | 1.65 | 1.65 |
 | `locks` | natemu | 16.7 | 8.90 | 6.62 | 5.81 |
+| | natemu, chunk 11 | 16.3 | - | - | 6.07 |
 | | QEMU multi | 11.0 | 33.2 | 26.1 | 27.5 |
 | | native | 2.11 | 1.32 | 3.59 | 4.20 |
 
@@ -117,8 +120,12 @@ QEMU show); `build` none (no N = 1). natemu / QEMU multi time ratio: `zstd` 0.13
 3.0-3.3, `locks` 1.52 at N = 1 then 0.2-0.3, `build` 3.9-5.5. natemu / native: `zstd` 2.1-3.4x, `hackbench` 9-14x, `locks`
 1.4-7.9x. QEMU `thread=single` at N = 4: `build` 30.2, `zstd` 20.4, `hackbench` 22.7, `locks` 11.1 s.
 
+Rows "chunk 11": after the link-record fix ([perf-plan.md](perf-plan.md), "Measured (chunk 11)", November 4, 245700d plus
+the change; `natemu-raw/linkfix-20261104-01/`, same harness and rules, median of three; `-`: not rerun).
+
 **Findings.**
-1. `build` at N = 1 does not finish in 40 minutes, and at N = 2-4 takes 35-121 s for the same work (run to run). Cause, from the perf resident: the per-vCPU link table (64 K records) fills, and each new link
+1. (Fixed by perf chunk 11: `build` now finishes, 21.3 s at N = 1 against QEMU's 28.3 s, 13.7-15.8 s at N = 2-4, run to run
+   within 2 s.) `build` at N = 1 does not finish in 40 minutes, and at N = 2-4 takes 35-121 s for the same work (run to run). Cause, from the perf resident: the per-vCPU link table (64 K records) fills, and each new link
    then runs `prune` over every record (551 k reclaims in 120 s at N = 1); `cache::link` is 111.7 of 117.6 s of the vCPU
    thread's CPU (bucket `patch`). At N = 4 the bucket is 14.5-17.8 s of each vCPU's 26-29 s CPU. Fixing this comes before
    any other multi-core item: it is larger than every cost below.

@@ -428,7 +428,7 @@ unsafe fn step_here(s: &mut State) -> Option<&'static Block> {
 /// at a dispatcher exit. The `svc` names the block that ran it (ELR is the word after it): a live cache block with a
 /// link point to the RIP, or the step block; anything else halts. The target is
 /// found as by the dispatcher; the exit is linked to it unless the cache was flushed meanwhile (the source may be
-/// gone: FEX re-checks the same way) or the link records are full, then the target is entered. A block run from the
+/// gone: FEX re-checks the same way), then the target is entered. A block run from the
 /// single-step slot is never linked. A target killed as it was placed ([`find`]) is stepped, not linked (`stale_links`).
 #[inline(never)] // its frame stays out of `returned` (the nested-entry stack bound)
 unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
@@ -478,7 +478,6 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
                 linked
             } {
                 cache::Link::Linked(n) => s.links += n,
-                cache::Link::Full => s.full_links += 1,
                 cache::Link::Bad => halt(&s, stop::BAD_LINK),
             },
             None => {}

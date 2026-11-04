@@ -207,9 +207,11 @@ pub mod cache {
     pub const INDEX: usize = L2 + 16 * L2_ENTRIES;
     /// At most half of L2, so probes stay short.
     pub const MAX_BLOCKS: usize = L2_ENTRIES / 2;
-    /// Link records ([`LinkRecord`]), one per patched link point; a full area means no new links.
+    /// Link records ([`LinkRecord`]), one per patched link point; a full area drops links (`cache::link`). Perf chunk 11:
+    /// one per block of the index (64 Ki before): the `build` benchmark's metadata arena fills (about 238 Ki blocks) before
+    /// it does, while 64 Ki filled with links into current kernel blocks.
     pub const LINKS: usize = INDEX + 4 * MAX_BLOCKS;
-    pub const MAX_LINKS: usize = 64 * 1024;
+    pub const MAX_LINKS: usize = MAX_BLOCKS;
     /// The single-step block's record (its code is in the slot, `SLOT_VA`) and its access sites after it.
     pub const STEP_RECORD: usize = LINKS + 16 * MAX_LINKS;
     pub const STEP_RECORD_BYTES: usize = 0x3_c000;
@@ -357,7 +359,8 @@ pub mod cache {
         /// The last request's fetch walks: byte i holds page i's leaf's [`GLOBAL`] (its G bit) and [`LARGE`].
         pub fetched: u64,
         /// Perf chunk 8: the link records found full, so the local links into blocks not current were undone (as every link
-        /// into them was before chunk 8), and how many.
+        /// into them was before chunk 8), and how many; since perf chunk 11 every link is undone too when that leaves less
+        /// than a quarter of [`MAX_LINKS`] free (counted with them).
         pub reclaims: u64,
         pub reclaimed: u64,
         /// Perf chunk 10, reuse inside the resident, set by the host before the vCPU runs: [`REUSE_OFF`], [`REUSE_ON`] or
@@ -1769,8 +1772,8 @@ pub struct State {
     pub evictions: u64,
     pub splits: u64,
     /// Linker entries (literal exits not yet linked); link points patched and restored; linker entries that did not
-    /// link because the cache was flushed while the target was found or requested, or because the link records were
-    /// full.
+    /// link because the cache was flushed while the target was found or requested (`full_links`: none since perf
+    /// chunk 11, a full record area drops links instead).
     pub linker: u64,
     pub links: u64,
     pub unlinks: u64,

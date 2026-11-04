@@ -757,15 +757,13 @@ fn unlinked(b: &Block, p: &LinkPoint) -> bool {
 pub enum Link {
     /// This many link points now branch to the target.
     Linked(u64),
-    /// No room for their records: nothing linked.
-    Full,
     /// `source` has no link point to the target, or one holds a word the cache did not put there.
     Bad,
 }
 /// Links every link point of `source` to `target.rip` (in the same context) to `target`: its first word becomes `b`
 /// to the target's entry, recorded with the original word in the segment of its kind ([`Control::links_tlb`]: local,
 /// else by the target's [`GLOBAL`], which stays as it is while the target is current, that is while the link is there).
-/// Link points already branching there stay.
+/// Link points already branching there stay, unless the record area is full: then links are dropped first.
 pub fn link(source: &Block, target: &Block) -> Link {
     let c = control();
     let points = || source.links.iter().filter(|p| p.offset != 0 && p.target == target.rip);
@@ -773,25 +771,24 @@ pub fn link(source: &Block, target: &Block) -> Link {
         return Link::Bad;
     }
     let entry = u64::from(target.code) + u64::from(ENTRY_OFFSET);
-    let mut todo = 0;
     for p in points() {
         let at = u64::from(source.code) + u64::from(p.offset);
-        if unlinked(source, p) {
-            todo += 1;
-        } else if word(at) != branch(at, entry) {
+        if !unlinked(source, p) && word(at) != branch(at, entry) {
             return Link::Bad;
         }
     }
-    if c.links as usize + todo > area::MAX_LINKS {
-        // Local links outlive their targets' currency: those into blocks not current go first (the rule before chunk 8).
+    if c.links as usize + MAX_LINK_POINTS > area::MAX_LINKS {
+        // Full (perf chunk 11): any link may go, its point then enters the linker again. Local links outlive their
+        // targets' currency, so those into blocks not current go first (chunk 8); if that leaves less than a quarter
+        // free, every link goes. Each such pass is followed by at least a quarter of the area's links: amortised O(1)
+        // per link (before, a pass that freed nothing was repeated at every linker entry).
         c.reclaims += 1;
-        match prune(LOCAL, true) {
-            Some(n) => control().reclaimed += n,
-            None => return Link::Bad,
+        let Some(mut n) = prune(LOCAL, true) else { return Link::Bad };
+        if control().links as usize > area::MAX_LINKS - area::MAX_LINKS / 4 {
+            let Some(all) = unlink_all() else { return Link::Bad };
+            n += all;
         }
-        if control().links as usize + todo > area::MAX_LINKS {
-            return Link::Full;
-        }
+        control().reclaimed += n;
     }
     let (segment, inbound) = if local(target, source) {
         (LOCAL, LOCAL_INBOUND)
@@ -800,14 +797,16 @@ pub fn link(source: &Block, target: &Block) -> Link {
     } else {
         (CR3, INBOUND)
     };
+    let mut linked = 0;
     for p in points().filter(|p| unlinked(source, p)) {
         let at = u64::from(source.code) + u64::from(p.offset);
         let original = word(at);
         rewrite(at, branch(at, entry));
         insert(LinkRecord { source: source.number, offset: p.offset, original, target: target.number }, segment);
         unsafe { (*block_ptr(target.number as usize)).flags |= inbound };
+        linked += 1;
     }
-    Link::Linked(todo as u64)
+    Link::Linked(linked)
 }
 /// Perf chunk 8: a link from `source` into `target` is local when every linear page of `target` is a page of `source`
 /// translated from the same guest-physical page. It may then stay while `target` is not current: `source` runs only

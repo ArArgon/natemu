@@ -59,6 +59,11 @@ Perf chunk 10 (reuse inside the resident, natemu only; aliases above 4 GiB, valu
 - `reuse-remap`: B's alias remapped to another frame with INVLPG: its own bytes, not a copy of the first frame's block.
 - `reuse-cross`: a block crossing into a second page is copied where both frames are the template's, not where the second
   differs (a refusal counted).
+Perf chunk 11 (natemu only):
+- `link-full`: more links than the record area holds (a chain of 286,720 link points through 70 pages above 4 GiB),
+  three passes per phase: as placed; after CPU (i - 1) % N rewrote one of its pages; after a page remapped with a CR3
+  reload; back with INVLPG: every pass counts exactly, the area filled without a flush, and each fill cost at most two
+  passes over it (`reclaims` at most 1 + 4 links / MAX_LINKS).
 - `counts`: `cr3-switch` at K and 2K rounds on 1 vCPU: the resident's translation requests and the host's compiles must
   not grow with the rounds (K1: a CR3 load keeps translations); with `--base-host/--base-runtime` the same counts for
   another build (before K1) are reported beside them.
@@ -162,6 +167,7 @@ def bodies(k, i=0, n=1):
                      + ctx_call(8, d, 0) + ctx_kept(i) + '    jmp .end\n' + CTX_HANDLERS + '.end:\n'),
         **links_bodies(k, i, n),
         **reuse_bodies(i),
+        'link-full': full_body(i, n),
     }
 
 
@@ -274,6 +280,48 @@ def reuse_bodies(i):
     }
 
 
+# Perf chunk 11 (`link-full`, natemu only): more links than the record area holds. FM linear pages from HIGH (table A)
+# map frame FC of 2048 `jz $+2` (two link points each, both to the next RIP: 2 * 2048 * FM records > MAX_LINKS; the
+# pages but one are copies of the first's blocks), page FW its copy FWC, then page FE (`inc ebx; jmp r13`). A pass adds
+# 1 to ebx, and 1 per `inc ebx` in the chain. Phases of three passes: (r8) as placed; (r9) FWC + 0x800 rewritten to
+# `inc ebx` by CPU (i - 1) % N, so the links into its blocks die on CPU i; (r10) page FH remapped to FC2 (`inc ebx` at
+# 0x400 and 0x404) with a CR3 reload; (r12) back to FC with INVLPG. Each pass runs every link point through links kept,
+# dropped and remade; the record area fills in every pass, and each fill costs at most two passes over it (`reclaims`
+# bounded by the links made).
+FM, FW, FH = 70, 60, 35          # FW late in the chain: its links are live when it is written (a fill keeps the chain's tail)
+FC, FWC, FC2, FE = 0x9000, 0xa000, 0xb000, 0xc000
+MAX_LINKS = 256 * 1024                    # natemu_abi::execution::cache::MAX_LINKS
+FULL_CODE = ['--code-cache', str(96 << 20)]  # 2 * 2048 * FM + blocks of FEX code: more than the default 16 MiB
+
+
+def full_body(i, n):
+    d, j = P.SYS_D(i), (i + 1) % n
+    leaf = lambda frame: f'    mov rax, {(d + frame) | P.LEAF:#x}\n    mov [{high_leaf(i, 0, HIGH + FH * 0x1000):#x}], rax\n'
+    phase = lambda tag, reg: (f'    xor ebx, ebx\n    mov ecx, 3\n.{tag}:\n    call .run\n    dec ecx\n    jnz .{tag}\n    mov {reg}, rbx\n')
+    hand = (f'    mov qword [{FLAGS + 8 * i:#x}], 1\n.h1:\n    pause\n    cmp qword [{FLAGS + 8 * j:#x}], 1\n    jne .h1\n'
+            f'    mov word [{P.SYS_D(j) + FWC + 0x800:#x}], 0xc3ff\n    mov qword [{FLAGS + 0x40 + 8 * j:#x}], 1\n'
+            f'.h2:\n    pause\n    cmp qword [{FLAGS + 0x40 + 8 * i:#x}], 1\n    jne .h2\n    xor eax, eax\n    cpuid\n')
+    return (f'    jmp .over\n.run:\n    lea r13, [rel .back]\n    mov rax, {HIGH:#x}\n    jmp rax\n.back:\n    ret\n.over:\n'
+            + phase('f0', 'r8') + hand + phase('f1', 'r9') + leaf(FC2) + '    mov rax, {ta:#x}\n    mov cr3, rax\n' + phase('f2', 'r10')
+            + leaf(FC) + f'    mov rax, {HIGH + FH * 0x1000:#x}\n    invlpg [rax]\n' + phase('f3', 'r12'))
+
+
+def full_memory(i):
+    d = P.SYS_D(i)
+    base = P.SYS_T(i, 0)
+    q = lambda at, value: {'addr': f'0x{at:x}', 'data': value.to_bytes(8, 'little').hex(), 'capture': False}
+    tables = [q(base + 8 * (HIGH >> 39 & 511), (base + 0x5000) | 0x27), q(base + 0x5000 + 8 * (HIGH >> 30 & 511), (base + 0x6000) | 0x27),
+              q(base + 0x6000 + 8 * (HIGH >> 21 & 511), (base + 0x7000) | 0x27)]
+    ptes = b''.join(((d + (FWC if k == FW else FC)) | P.LEAF).to_bytes(8, 'little') for k in range(FM)) + ((d + FE) | P.LEAF).to_bytes(8, 'little')
+    chain = bytearray(b'\x74\x00' * 2048)
+    chain2 = bytearray(chain)
+    chain2[0x400:0x402] = chain2[0x404:0x406] = b'\xff\xc3'
+    return tables + [{'addr': f'0x{high_leaf(i, 0, HIGH):x}', 'data': ptes.hex(), 'capture': False},
+                     {'addr': f'0x{d + FC:x}', 'data': chain.hex()}, {'addr': f'0x{d + FWC:x}', 'data': chain.hex()},
+                     {'addr': f'0x{d + FC2:x}', 'data': chain2.hex()},
+                     {'addr': f'0x{d + FE:x}', 'data': P.asm('inc ebx\njmp r13').hex()}] + ([dict(P.zero(FLAGS, 0x100), capture=False)] if i == 0 else [])
+
+
 def high_leaf(i, k, va):
     """Address of the PTE of `va` (in HIGH's 2 MiB) in CPU i's table k."""
     return P.SYS_T(i, k) + 0x7000 + (va >> 12 & 511) * 8
@@ -369,6 +417,7 @@ EITHER = {
     'local-gpa': {'r9': {2}, 'r10': {1}},
     'invlpg-large': {'r8': {1}, 'rbx': {0x22}, 'r9': {2}, 'r10': {1}},
     **{name: reuse_either(name) for name in REUSE},
+    'link-full': {'r8': {3}, 'r9': {6}, 'r10': {12}, 'r12': {6}},
 }
 
 
@@ -409,7 +458,8 @@ def program(name, n, k):
                       {'addr': f'0x{d + CW1:x}', 'data': P.asm('mov eax, 2\njmp r13').hex()}, {'addr': f'0x{d + CW2:x}', 'data': P.asm('mov eax, 4\njmp r13').hex()}]
         out['memory'] += P.sys_tables(i, 0, n, a) + tb + [
             P.zero(d, 0x1000), {'addr': f'0x{d + F1:x}', 'data': CODE(1).hex()}, {'addr': f'0x{d + F2:x}', 'data': CODE(2).hex()},
-            {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE else [])
+            {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + (extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE else [])
+            + (full_memory(i) if name == 'link-full' else []))
     return out
 
 
@@ -520,7 +570,8 @@ def adv_program(name, n):
 
 def run(a, prog, extra, host=None, runtime=None, tag=''):
     work = a.out / 'work' / f"{prog['name']}{tag}{'-1' if extra else ''}"
-    rc, out, err = s3.driver(host or a.host, runtime or a.runtime, a.fexc, s3.smp_description(prog), work, extra, timeout=300)
+    options = FULL_CODE if prog['name'].startswith('k1-link-full@') else []
+    rc, out, err = s3.driver(host or a.host, runtime or a.runtime, a.fexc, s3.smp_description(prog), work, options + extra, timeout=300)
     problems = [] if rc == 0 else [f'driver exit {rc}: {err.strip()[-300:]}']
     for v, c in enumerate(out['cpus'] if out else []):
         end = s3.body_end(prog, smp.num(prog['cpus'][v]['rip']))
@@ -572,6 +623,12 @@ def main():
                     reuse = c['stats']['k1']['reuse']
                     if reuse['copies'] < REUSE[name][0] or reuse['refused'][0] < REUSE[name][1]:
                         problems.append(f"cpu{v} reuse {reuse}, at least {REUSE[name]} (copies, refused[0])")
+                # Perf chunk 11: the record area filled (more links made than it holds, no flush but the driver's first)
+                # and each fill cost at most two passes over it, each followed by at least a quarter of the area's links.
+                for v, c in enumerate(out['cpus'] if out and name == 'link-full' else []):
+                    count, links, flushes = c['stats']['k1']['reclaims'][0], c['stats']['links'], c['stats']['flushes']
+                    if not (links > MAX_LINKS and count >= 1 and count <= 1 + 4 * links // MAX_LINKS and flushes == 1):
+                        problems.append(f'cpu{v} links {links}, full {count} times (at most {1 + 4 * links // MAX_LINKS}), flushes {flushes}')
                 seen = {}
                 if out and name in EITHER:
                     for v, c in enumerate(out['cpus']):
