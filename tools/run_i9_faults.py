@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Precise faults, gating, #AC and refusals of the I9 forms: MOVBE, MMX, AES-NI/PCLMULQDQ, PDEP/PEXT, FFREEP, SHA (advertised
-since November 3) and the unadvertised ADX forms (boot-features plan, chunk I9), judged by the SDM rules below and against natemu's own run of the
+"""Precise faults, gating, #AC and refusals of the I9 forms: MOVBE, MMX, AES-NI/PCLMULQDQ, PDEP/PEXT, FFREEP, SHA and ADX
+(advertised since November 3) (boot-features plan, chunk I9), judged by the SDM rules below and against natemu's own run of the
 same program cut before the instruction (run_i8_faults' harness; QEMU user mode cannot set CR0/CR4 and its fault state lacks
 the x87/MMX registers).
 
@@ -16,8 +16,10 @@ Expected (SDM Vol.2 per instruction; Vol.3 Table 12-1 and 6.15):
   - MMX gating: CR0.EM #UD, else CR0.TS #NM (EMMS too), not CR4.OSFXSR; the MMX forms with an XMM operand (CVTPI2PS...) gate
     like SSE (#UD without OSFXSR); MOVBE, PDEP/PEXT are not gated; FFREEP is x87 (#NM under EM or TS);
   - SHA gates like SSE (#NM under CR0.TS, #UD without CR4.OSFXSR);
-  - #UD for MOVBE with a register operand and for ADCX/ADOX (not advertised), whatever their operands, and for SHA with a 66
-    or F3 prefix (blank cells of Table A-4);
+  - #UD for MOVBE with a register operand, for SHA with a 66 or F3 prefix and for 0f 38 f6 with F2 (blank cells of Table
+    A-4), LOCK ADCX/ADOX; ADCX/ADOX memory forms fault as a load of their size (#PF, #GP/#SS, #AC at CPL 3), not gated;
+    66 with F3 on 0f 38 f6 (either order) is ADOX with 66 ignored, as on the AMD machine; F2 then F3 is refused (a `no_code`
+    stop, `system_instruction`; the AMD machine runs it as ADOX), F3 then F2 #UD;
   - #AC(0) at CPL 3 with CR0.AM and RFLAGS.AC for a misaligned MOVBE (2/4/8), MOVQ/MOVD/PINSRW MMX operand (8/4/2);
   - MASKMOVQ refused (`unsupported_form`) before any effect.
 """
@@ -49,7 +51,9 @@ FORMS = [('movbe16', 'movbe cx, word ptr [{a}]', 2, 0, False), ('movbe32', 'movb
          ('pdep64', 'pdep rcx, rdx, qword ptr [{a}]', 8, 0, False), ('pext32', 'pext ecx, edx, dword ptr [{a}]', 4, 0, False)] + [
          (g.split()[0], g, 16, 16, False) for g in ['sha1nexte xmm1, xmmword ptr [{a}]', 'sha1msg1 xmm1, xmmword ptr [{a}]',
          'sha1msg2 xmm1, xmmword ptr [{a}]', 'sha256rnds2 xmm1, xmmword ptr [{a}]', 'sha256msg1 xmm1, xmmword ptr [{a}]',
-         'sha256msg2 xmm1, xmmword ptr [{a}]', 'sha1rnds4 xmm1, xmmword ptr [{a}], 2']]
+         'sha256msg2 xmm1, xmmword ptr [{a}]', 'sha1rnds4 xmm1, xmmword ptr [{a}], 2']] + [
+         ('adcx32', 'adcx ecx, dword ptr [{a}]', 4, 0, False), ('adcx64', 'adcx rcx, qword ptr [{a}]', 8, 0, False),
+         ('adox32', 'adox ecx, dword ptr [{a}]', 4, 0, False), ('adox64', 'adox rcx, qword ptr [{a}]', 8, 0, False)]
 
 
 def mmx_shift(op, v, c):
@@ -123,18 +127,26 @@ def cases():
     out.append(case('em-sha1nexte', 'sha1nexte xmm1, xmm2', [], UD, prelude=em, cpl=0))
     out.append(case('ts-vaesenc', 'vaesenc xmm1, xmm2, xmm3', [], NM, prelude=ts, cpl=0))
     out.append(case('noosxsave-vaesenc', 'vaesenc xmm1, xmm2, xmm3', [], UD, xcr0=0))
-    for g in ['movbe ecx, dword ptr [rax]', 'pdep rcx, rdx, rsi', 'pext ecx, edx, esi']:
+    for g in ['movbe ecx, dword ptr [rax]', 'pdep rcx, rdx, rsi', 'pext ecx, edx, esi', 'adcx rcx, qword ptr [rax]', 'adox ecx, edx']:
         out.append(case(f'ts-em-{g.split()[0]}-runs', g, [], None, prelude=emts, cpl=0))
     out.append(case('ts-ffreep', 'ffreep st(0)', [], NM, prelude=['fld1'] + ts, cpl=0))
     out.append(case('em-ffreep', 'ffreep st(0)', [], NM, prelude=['fld1'] + em, cpl=0))
-    # #UD: MOVBE with a register operand (REX.W 0f 38 f0 c1, 66 0f 38 f1 c8), ADX (not advertised), SHA with 66 or F3.
+    # #UD: MOVBE with a register operand (REX.W 0f 38 f0 c1, 66 0f 38 f1 c8), SHA with 66 or F3, 0f 38 f6 with F2 (alone or
+    # with 66: blank; the AMD machine agrees) and LOCK ADCX/ADOX (not lockable). 66 with F3 runs as ADOX on the AMD machine:
+    # natemu refuses it (the host's stop), below.
     for tag, b in [('movbe-reg', '0x48, 0x0f, 0x38, 0xf0, 0xc1'), ('movbe-reg-st16', '0x66, 0x0f, 0x38, 0xf1, 0xc8'),
                    ('sha256rnds2-66', '0x66, 0x0f, 0x38, 0xcb, 0xca'), ('sha1msg1-f3', '0xf3, 0x0f, 0x38, 0xc9, 0xca'),
                    ('sha256msg2-f2', '0xf2, 0x0f, 0x38, 0xcd, 0xca'),
-                   ('sha1rnds4-66', '0x66, 0x0f, 0x3a, 0xcc, 0xca, 0x01')]:
+                   ('sha1rnds4-66', '0x66, 0x0f, 0x3a, 0xcc, 0xca, 0x01'), ('f2-0f38f6', '0xf2, 0x48, 0x0f, 0x38, 0xf6, 0xca'),
+                   ('66f2-0f38f6', '0x66, 0xf2, 0x0f, 0x38, 0xf6, 0xca'), ('lock-adcx-m', '0xf0, 0x66, 0x0f, 0x38, 0xf6, 0x08'),
+                   ('lock-adox-m', '0xf0, 0xf3, 0x48, 0x0f, 0x38, 0xf6, 0x08')]:
         out.append(case(tag, f'.byte {b}', [], UD))
-    for g in ['adcx rcx, rdx', 'adox rcx, qword ptr [rax]']:
-        out.append(case(f'ud-{g.split()[0]}', g, [], UD, prelude=['mov eax, 0x200100']))
+    # 66 with F3 (either order) is ADOX with 66 ignored (the AMD machine): m32 reads 4 bytes (the page's last 4 run), m16 is not it.
+    for tag, b in [('66f3', '0x66, 0xf3'), ('f366', '0xf3, 0x66')]:
+        out.append(case(f'{tag}-adox-m32-last4', f'.byte {b}, 0x0f, 0x38, 0xf6, 0x0c, 0x25, 0xfc, 0x0f, 0x20, 0x00', [f'unmap {D + 0x1000:#x}'], None))
+        out.append(case(f'{tag}-adox-m32-cross', f'.byte {b}, 0x0f, 0x38, 0xf6, 0x0c, 0x25, 0xfe, 0x0f, 0x20, 0x00', [f'unmap {D + 0x1000:#x}'], PF(D + 0x1000, False, False)))
+    out.append(case('f2f3-0f38f6-refused', '.byte 0xf2, 0xf3, 0x0f, 0x38, 0xf6, 0xca', [], ['nocode', 'system_instruction']))   # cut, not decoded: a stop
+    out.append(case('f3f2-0f38f6', '.byte 0xf3, 0xf2, 0x0f, 0x38, 0xf6, 0xca', [], UD))
     # #AC at CPL 3 (CR0.AM, RFLAGS.AC): the operand's size (SDM Vol.3 6.15 Interrupt 17).
     head = ['mov rax, cr0', 'bts rax, 18', 'mov cr0, rax']
     nop_at = CODE + len(ref.assemble('\n'.join(i8.YMMH + head)))
@@ -143,7 +155,9 @@ def cases():
                           ('movbe32-st-2', 'movbe dword ptr [rdi + 2], ecx', True), ('movq-mm-4', 'movq mm1, qword ptr [rdi + 4]', True),
                           ('movq-mm-8', 'movq mm1, qword ptr [rdi + 8]', False), ('movd-mm-2', 'movd mm1, dword ptr [rdi + 2]', True),
                           ('paddb-mm-4', 'paddb mm1, qword ptr [rdi + 4]', True), ('pinsrw-1', 'pinsrw mm1, word ptr [rdi + 1], 0', True),
-                          ('pinsrw-2', 'pinsrw mm1, word ptr [rdi + 2], 0', False), ('movq-mm-st-4', 'movq qword ptr [rdi + 4], mm1', True)]:
+                          ('pinsrw-2', 'pinsrw mm1, word ptr [rdi + 2], 0', False), ('movq-mm-st-4', 'movq qword ptr [rdi + 4], mm1', True),
+                          ('adcx32-2', 'adcx ecx, dword ptr [rdi + 2]', True), ('adox64-4', 'adox rcx, qword ptr [rdi + 4]', True),
+                          ('adcx64-8', 'adcx rcx, qword ptr [rdi + 8]', False)]:
         out.append(case(f'ac-{tag}', insn, ['rflags 0x40202', f'switch {nop_at:#x} 3'], AC if ac else None, prelude=head + ['nop'] + X87PRE, cpl=0))
     # The MMX transition (TOP = 0, all tags valid): SDM CVTPI2PD "For operands xmm, m64: the instruction does not cause a
     # transition to MMX technology"; CVTPI2PS makes it for both operand forms (its page has no such exception; I9 addendum:

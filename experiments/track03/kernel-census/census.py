@@ -41,10 +41,10 @@ def two(op, plain, modrm):
     if op == 0xAE:
         if mod != 3 and reg == 7: return SYS, False
         if mod == 3 and reg < 4: return SYS, False
-        if mod != 3 and (reg <= 1 or 4 <= reg <= 6): return SYS, False     # I5b: fxsave/fxrstor/xsave/xrstor (xsaveopt/clwb: #UD)
+        if mod != 3 and (reg <= 1 or 4 <= reg <= 6): return SYS, False     # I5b: fxsave/fxrstor/xsave/xrstor, xsaveopt/clwb (Nov 3)
         return UNS, False
     if op == 0xC7 and mod == 3 and reg >= 6: return SYS, False                                      # S3: rdrand, rdseed, rdpid
-    if op == 0xC7 and mod != 3 and 3 <= reg <= 5: return SYS, False                                 # I5b: xrstors/xsavec/xsaves (#UD)
+    if op == 0xC7 and mod != 3 and 3 <= reg <= 5: return SYS, False                                 # I5b: xrstors/xsaves (#UD), xsavec (Nov 3)
     if op in (0xA6, 0xA7, 0x0F): return SYS, False                    # I10: VIA PadLock, 3DNow! (not advertised: #UD)
     if not plain: return UNS, False
     if op in (0x1F, 0xA3, 0xAB, 0xB3, 0xBB, 0xAF, 0xB6, 0xB7, 0xBE, 0xBF, 0xBC, 0xBD): return ALLOW, False
@@ -345,12 +345,14 @@ def classify(b, mnem):
     if k == 'p' and (0xA4 <= op <= 0xA7 or 0xAA <= op <= 0xAF): return string(leading(b), op)     # I2
     if k == '0f' and op == 0x77 and not (set(leading(b)) & {0x66, 0xF2, 0xF3, 0x67}):   # I9: EMMS
         return ('LOCK', 'LOCK on a form that is not lockable (#UD)') if 0xF0 in leading(b) else ('admitted', '')
-    # I9: unadvertised forms (#UD, the host's UD): MOVBE with a register operand, 0f 38 f5/f6 (WRUSS 66 f5, WRSS NP f6, ADCX 66 f6,
-    # ADOX F3 f6). (F3 MOVBE: refused, fexc's decoder fails before the ModRM.) SHA is advertised since November 3 (`sse_form`).
+    # I9: unadvertised forms (#UD, the host's UD): MOVBE with a register operand, 0f 38 f5/f6 (WRUSS 66 f5, WRSS NP f6; F2 f6
+    # blank; F2 before F3 the host's stop). (F3 MOVBE: refused, fexc's decoder fails before the ModRM.) SHA and ADX (ADCX 66 f6,
+    # ADOX F3 f6, with 66 too) are advertised since November 3.
     if k in ('0f38', '0f3a') and modrm is not None:
         lead = leading(b)
         if k == '0f38' and op in (0xF0, 0xF1) and 0xF2 not in lead and 0xF3 not in lead and modrm >> 6 == 3: return 'system', 'movbe register form (#UD)'
-        if k == '0f38' and op in (0xF5, 0xF6): return 'system', 'adcx/adox, wrss/wruss (not advertised: #UD)'
+        if k == '0f38' and op == 0xF6 and 0xF2 not in lead and (0x66 in lead or 0xF3 in lead): return 'admitted', ''   # ADX (66 F3: ADOX)
+        if k == '0f38' and op in (0xF5, 0xF6): return 'system', 'wrss/wruss (not advertised: #UD), 0f 38 f6 with F2 or 66 and F3'
         if k == '0f38' and op in (0xF0, 0xF1) and 0xF3 in lead: return 'system', 'movbe with F3 (#UD)'   # I10
     # I10 addendum: TPAUSE/UMONITOR/UMWAIT (66/F3/F2 0f ae /6 register): WAITPKG not advertised, #UD
     if k == '0f' and op == 0xAE and modrm is not None and modrm >> 6 == 3 and (modrm >> 3) & 7 == 6 and set(leading(b)) & {0x66, 0xF2, 0xF3}:
@@ -538,7 +540,7 @@ def selftest():
              ('36488b03', 'ss mov (%rbx)', 'admitted'), ('36488b0424', 'ss mov (%rsp)', 'admitted'), ('3e488b4500', 'ds mov (%rbp)', 'admitted'),
              ('3e48ff24c500000000', 'notrack jmp *tbl', 'admitted'), ('65c4e2f0f200', 'andn %gs:', 'admitted'), ('f065480fc108', 'lock xadd %gs:', 'admitted'),
              ('65c3', 'gs ret', 'admitted'), ('657279', 'gs jb', 'admitted'), ('64e800000000', 'fs call', 'admitted'), ('3e4c8b2424', 'ds mov (%rsp),%r12', 'admitted'), ('3e498b0424', 'ds mov (%r12)', 'admitted'),
-             ('0f22d8', 'mov %cr3', 'system'), ('0f28c1', 'movaps', 'admitted'), ('0f6fc1', 'movq mm', 'admitted'), ('0ff7c1', 'maskmovq', 'SSE'), ('0f77', 'emms', 'admitted'), ('480f38f007', 'movbe m', 'admitted'), ('480f38f0c1', 'movbe reg', 'system'), ('66480f38f6c1', 'adcx', 'system'), ('0f38cbc1', 'sha256rnds2', 'admitted'), ('660f38dcc1', 'aesenc', 'admitted'), ('c4e271dcc2', 'vaesenc', 'admitted'), ('c4e275dcc2', 'vaesenc ymm', 'system'), ('dfc1', 'ffreep', 'admitted'), ('660f3a63c100', 'pcmpistri', 'admitted'), ('0fae10', 'ldmxcsr', 'system'), ('f20f38f1c1', 'crc32', 'admitted'), ('66f30f10c1', 'movss 66', 'SSE'), ('660f73f804', 'pslldq', 'admitted'), ('c5f877', 'vzeroupper', 'admitted'), ('c5f96efe', 'vmovd', 'admitted'), ('c4e27d78ff', 'vpbroadcastb', 'admitted'),
+             ('0f22d8', 'mov %cr3', 'system'), ('0f28c1', 'movaps', 'admitted'), ('0f6fc1', 'movq mm', 'admitted'), ('0ff7c1', 'maskmovq', 'SSE'), ('0f77', 'emms', 'admitted'), ('480f38f007', 'movbe m', 'admitted'), ('480f38f0c1', 'movbe reg', 'system'), ('66480f38f6c1', 'adcx', 'admitted'), ('f3480f38f6c1', 'adox', 'admitted'), ('66f30f38f6c1', 'adox 66', 'admitted'), ('f2f30f38f6c1', 'adox f2', 'system'), ('480f38f6c1', 'wrss', 'system'), ('0f38cbc1', 'sha256rnds2', 'admitted'), ('660f38dcc1', 'aesenc', 'admitted'), ('c4e271dcc2', 'vaesenc', 'admitted'), ('c4e275dcc2', 'vaesenc ymm', 'system'), ('dfc1', 'ffreep', 'admitted'), ('660f3a63c100', 'pcmpistri', 'admitted'), ('0fae10', 'ldmxcsr', 'system'), ('f20f38f1c1', 'crc32', 'admitted'), ('66f30f10c1', 'movss 66', 'SSE'), ('660f73f804', 'pslldq', 'admitted'), ('c5f877', 'vzeroupper', 'admitted'), ('c5f96efe', 'vmovd', 'admitted'), ('c4e27d78ff', 'vpbroadcastb', 'admitted'),
              ('c4e27d90040f', 'vpgatherdd', 'AVX'), ('c5f8ae5c2404', 'vstmxcsr', 'system'), ('66c5f877', 'vzeroupper 66', 'system'), ('c5fc28c1', 'vmovaps', 'admitted'),
              ('c4e2fd78ff', 'vpbroadcastb W1', 'system'), ('c5f877c5fc77', 'vzeroupper', 'admitted'), ('d9c0', 'fld', 'admitted'), ('d9fe', 'fsin', 'admitted'), ('dbe3', 'fninit', 'system'),
              ('f3480fb8c1', 'popcnt', 'admitted'), ('f0480fb10a', 'lock cmpxchg', 'admitted'), ('f0480fc70e', 'lock cmpxchg16b', 'admitted'),

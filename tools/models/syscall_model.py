@@ -304,10 +304,17 @@ def clflush(state, addr, stack=False):
 
 
 def clflushopt(state, addr, stack=False):
-    """Vol. 2A CLFLUSHOPT: #UD (CPUID.07H:EBX.CLFLUSHOPT = 0 in the profile)."""
-    return _run(state, lambda s, bus, alts: _ud_unless('7.0.ebx.CLFLUSHOPT'))
+    """Vol. 2A CLFLUSHOPT: #UD without CPUID.07H:EBX.CLFLUSHOPT (advertised since November 3), else CLFLUSH's faults (those of
+    a byte load at the CPL); ordered only by fences and locked instructions, which this model has no use for."""
+    def body(s, bus, alts):
+        _ud_unless('7.0.ebx.CLFLUSHOPT')
+        _operand(s, bus, addr, 1, stack=stack)
+    return _run(state, body)
 
 
 def clwb(state, addr, stack=False):
-    """Vol. 2A CLWB: #UD (CPUID.07H:EBX.CLWB = 0 in the profile)."""
-    return _run(state, lambda s, bus, alts: _ud_unless('7.0.ebx.CLWB'))
+    """Vol. 2A CLWB: #UD without CPUID.07H:EBX.CLWB (advertised since November 3), else the faults of a byte load."""
+    def body(s, bus, alts):
+        _ud_unless('7.0.ebx.CLWB')
+        _operand(s, bus, addr, 1, stack=stack)
+    return _run(state, body)

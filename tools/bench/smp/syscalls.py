@@ -274,6 +274,9 @@ CACHE_BODY = """    mov qword [{c:#x}+0x50], 0x1234
     mov rdi, [rax]
     clflush [rsp]
     clflush [rel $]
+    db 0x66, 0x0f, 0xae, 0x38           ; clflushopt [rax] (advertised since November 3)
+    db 0x66, 0x0f, 0xae, 0x70, 0x08     ; clwb [rax+8]
+    db 0x66, 0x0f, 0xae, 0x3c, 0x24     ; clflushopt [rsp]
 """
 
 
@@ -327,7 +330,11 @@ def cases():
         # Unadvertised group 7 forms: #UD from the profile's feature bits (syscall_model's helpers).
         ('enclv', '', None, 'db 0x0f, 0x01, 0xc0', lambda: sc._run(state(0), lambda s, bus, alts: sc._ud_unless('7.0.ebx.SGX')), 0),
         ('xresldtrk-cpl3', '', '', 'db 0xf2, 0x0f, 0x01, 0xe9', lambda: sc._run(state(3), lambda s, bus, alts: sc._ud_unless('7.0.edx.TSXLDTRK')), 3),
-        ('clflushopt', '', None, 'clflushopt [rsp]', lambda: sc.clflushopt(state(0), 0), 0),
+        ('clflushopt', f'    mov rax, {code0:#x}\n', None, 'clflushopt [rax]', lambda: sc.clflushopt(_code_page(state(0)), code0), 0),
+        ('clflushopt-noncanonical', f'    mov rax, {NONCANONICAL:#x}\n', None, 'clflushopt [rax]', lambda: sc.clflushopt(state(0), NONCANONICAL), 0),
+        ('clflushopt-supervisor-cpl3', '', f'    mov rax, {code0:#x}\n', 'clflushopt [rax]', lambda: sc.clflushopt(_code_page(state(3)), code0), 3),
+        ('clwb-noncanonical-rbp', f'    mov rbp, {NONCANONICAL:#x}\n', None, 'clwb [rbp]', lambda: sc.clwb(state(0), NONCANONICAL, stack=True), 0),
+        ('clwb-supervisor-cpl3', '', f'    mov rax, {code0:#x}\n', 'clwb [rax]', lambda: sc.clwb(_code_page(state(3)), code0), 3),
         ('clflush-noncanonical-rbp', f'    mov rbp, {NONCANONICAL:#x}\n', None, 'clflush [rbp]', lambda: sc.clflush(state(0), NONCANONICAL, stack=True), 0),
     ]
     return [x if len(x) == 7 else x + (None,) for x in c]

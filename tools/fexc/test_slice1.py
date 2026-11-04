@@ -31,9 +31,10 @@ SYSTEM = {
     # X1c: Reserved-NOP cells (owner decision: NOPs, the resident's RESERVED_NOP)
     '0f 0d /0 m': '0f0d00', 'prefetch /4 m': '0f1820', 'prefetch reg': '0f18c0', 'f3 prefetchnta': 'f30f1800', '0f 19 m': '0f1900',
     '66 0f 1a m (bndmov form)': '660f1a00', 'f2 0f 1b reg': 'f20f1bc0', '0f 1c reg': '0f1cc0', '66 cldemote': '660f1c00', '0f 1d m': '0f1d00',
-    # I9: #UD the host decodes (MOVBE with a register operand; ADX and CET_SS not advertised)
-    'movbe rax,rcx (#UD)': '480f38f0c1', 'movbe cx,ax (#UD)': '660f38f1c1', 'adcx rax,rcx (#UD)': '66480f38f6c1', 'adox (#UD)': 'f3480f38f6c1',
-    'wrussq (#UD)': '66480f38f508',
+    # I9: #UD the host decodes (MOVBE with a register operand; CET_SS not advertised); 0f 38 f6 with F2 before F3 (the host's
+    # stop) or F2 last (blank)
+    'movbe rax,rcx (#UD)': '480f38f0c1', 'movbe cx,ax (#UD)': '660f38f1c1', 'wrussq (#UD)': '66480f38f508', 'wrssq (#UD)': '480f38f6c1',
+    'f2 f3 0f 38 f6': 'f2f30f38f6c1', 'f2 0f 38 f6': 'f20f38f6c1', 'f3 f2 0f 38 f6': 'f3f20f38f6c1',
     'mov cr0,rax': '0f22c0', 'mov cr3,rax': '0f22d8', 'mov cr4,rax': '0f22e0', 'mov cr8,rax': '440f22c0',
     'mov rax,cr0': '0f20c0', 'mov rax,cr3': '0f20d8', 'mov rax,cr4': '0f20e0', 'mov dr7,rax': '0f23f8', 'mov rax,dr0': '0f21c0',
     'lgdt [rax]': '0f0110', 'lidt [rax]': '0f0118', 'sgdt [rax]': '0f0100', 'ltr ax': '0f00d8', 'lldt ax': '0f00d0',
@@ -102,7 +103,7 @@ UD = {
 LOCK_UD = {
     'lock xchg rax,rcx': 'f04887c1', 'lock add rax,rcx': 'f04801c8', 'lock mov [rax],rcx': 'f0488908', 'lock cmp [rax],1': 'f048833801',
     'lock bt [rax],1': 'f0480fba2001', 'lock nop': 'f090', 'lock movsb': 'f0a4', 'lock andn': 'f0c4e278f2c1', 'lock inc rax': 'f048ffc0',
-    'lock cmpxchg rcx,rdx': 'f0480fb1d1', 'lock lea rax,[rax]': 'f0488d00', 'lock movaps': 'f00f2800', 'lock endbr64': 'f0f30f1efa',
+    'lock adcx ecx,[rax]': 'f0660f38f608', 'lock adox rcx,[rax]': 'f0f3480f38f608', 'lock cmpxchg rcx,rdx': 'f0480fb1d1', 'lock lea rax,[rax]': 'f0488d00', 'lock movaps': 'f00f2800', 'lock endbr64': 'f0f30f1efa',
 }
 
 # I8: a 66, F2 or F3 prefix before VEX, or a REX right before it, is #UD whatever the instruction (a system cut, the host's vex_ud).
@@ -129,6 +130,10 @@ ALLOWED = {
     'aesenc xmm1,xmm2': '660f38dcca', 'aesdeclast xmm1,[rax]': '660f38df08', 'aesimc': '660f38dbca', 'aeskeygenassist': '660f3adfca07',
     'pclmulqdq': '660f3a44ca11', 'vaesenc': 'c4e271dcc2', 'vaesimc': 'c4e279dbca', 'vpclmulqdq': 'c4e37144c201',
     'vaeskeygenassist': 'c4e379dfca07', 'pdep': 'c4e2fbf5c1', 'pext': 'c4e2faf5c1', 'pext ecx,edx,[rax]': 'c4e26af508', 'ffreep st1': 'dfc1',
+    # ADX (November 3, CPUID.7.0:EBX.ADX[19] advertised): ADCX/ADOX r32/r64, register and memory, 0x67, a segment prefix
+    'adcx eax,ecx': '660f38f6c1', 'adcx rax,rcx': '66480f38f6c1', 'adcx r9,[rax]': '664c0f38f608', 'adox edx,[rbx+8]': 'f30f38f65308',
+    'adox rax,rcx': 'f3480f38f6c1', 'adox r15d,[eax] addr32': '67f3440f38f638', 'gs adcx rcx,[rax]': '6566480f38f608',
+    '66 f3 adox (66 ignored)': '66f30f38f6c1', 'f3 66 adox rcx,[rax]': 'f366480f38f608',
     # SHA (November 3, CPUID.7.0:EBX.SHA[29] advertised): all seven, register and memory, REX, 0x67, a segment prefix
     'sha1nexte': '0f38c8ca', 'sha1msg1 [rax]': '0f38c908', 'sha1msg2 xmm9,xmm2': '440f38caca', 'sha256rnds2 xmm1,xmm10': '410f38cbca',
     'sha256rnds2 xmm1,[r8+rcx*8+16]': '410f38cb4cc810', 'sha256msg1 rex.w': '480f38ccca', 'sha256msg2 [eax] addr32': '670f38cd08',
@@ -339,6 +344,14 @@ class Slice1Cutting(unittest.TestCase):
                 self.assertEqual(moves, sorted([hex(at), hex(at + len(x) // 2)]), name)    # its own RIP (retry) and the next
                 sites = [(s['kind'], s['rmw'], s['intent']) for s in d['sites']]
                 self.assertEqual(sites, [('load', 'load', 'write'), ('atomic', 'store', 'write')], name)
+
+    def test_adx_follows_the_profile(self):
+        # As SHA: the shim admits ADCX/ADOX because cpu_profile.json advertises ADX; clearing the bit needs the shim's cut back
+        # (`Undefined0F38` cut every 0f 38 f6 before November 3).
+        leaf = next(e for e in json.loads((REPO / 'tools/models/cpu_profile.json').read_text())['cpuid']
+                    if e['leaf'] == '0x7' and e.get('subleaf') == 0)
+        self.assertEqual(leaf['fields']['ebx']['19'], {'name': 'ADX', 'state': 'advertised'})
+        self.assertIn('adox rax,rcx', ALLOWED)
 
     def test_sha_follows_the_profile(self):
         # fexc has no profile input: the shim admits SHA because cpu_profile.json advertises it. Clearing the bit needs the

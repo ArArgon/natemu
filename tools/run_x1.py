@@ -216,14 +216,14 @@ def cases():
             # Reserved-NOP cells with LOCK, and 0f 0d with a register operand (PREFETCHW takes m8; pinned QEMU: #UD too)
             'lock-0f19': 'f00f1900', 'lock-0f18-4': 'f00f1820', 'lock-0f1d-reg': 'f00f1dc0', '0f0d-reg': '0f0dc0', '66-0f0d-reg': '660f0dc8',
             # Review: JMPE and the blank 66/F2 0f b8 cells, blank mandatory-prefix cells of Tables A-3/A-4, operand types of
-            # register-only/memory-only SIMD forms, the 66 SHA cell, unadvertised GFNI/ADX/MOVDIRI cells, PTWRITE (Intel PT not advertised)
+            # register-only/memory-only SIMD forms, the 66 SHA cell, the F2 0f 38 f6 cell, unadvertised GFNI/MOVDIRI cells, PTWRITE (Intel PT not advertised)
             'jmpe': '0fb8c0', '66-0fb8': '660fb8c0', 'f2-0fb8': 'f20fb800', 'np-0fd0': '0fd0c0', 'np-0fd6': '0fd6c0', 'np-0fe6': '0fe6c0',
             'np-0ff0-m': '0ff000', 'np-0f7c': '0f7cc0', 'f3-0f54': 'f30f54c0', 'f2-0f54': 'f20f54c0', 'f3-0f2b-m': 'f30f2b00',
             'f2-0f2b-m': 'f20f2b00', 'f2-0f5b': 'f20f5bc0', '66-0f52': '660f52c0', 'f3-0f6f-like-f2': 'f20f6fc0', '66-0f77': '660f77c0',
             'np-0f6c': '0f6cc0', 'f3-0fc6': 'f30fc6c000', '66-0f12-reg': '660f12c0', '0f50-m': '0f5000', '0fd7-m': '0fd700',
             'f3-0fd6-m': 'f30fd600', '0f71-m': '0f711000', '0f73-3-np': '0f73d800', '66-0f3850': '660f3850c0', 'f3-0f3800': 'f30f3800c0',
             '66-0f3a00': '660f3a00c000', 'sha256rnds2-66': '660f38cbc0', 'sha1msg1-f3': 'f30f38c9c0', 'gf2p8mulb': '660f38cfc0',
-            'adox': 'f30f38f6c0', 'movdiri': '0f38f900', 'ptwrite-m': 'f30fae20', 'ptwrite-r': 'f30faee0'}
+            'f2-0f38f6': 'f20f38f6c0', 'movdiri': '0f38f900', 'ptwrite-m': 'f30fae20', 'ptwrite-r': 'f30faee0'}
     for name, hexcode in uds.items():
         out.append((f'ud-{name}', b'\x90' + bytes.fromhex(hexcode) + b'\x90', '', ud_at(CODE + 1)))
 

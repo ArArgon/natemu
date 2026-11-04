@@ -36,7 +36,10 @@
 //!   instruction each is a draining entry ([`find`]).
 //! - CLFLUSH m8 has the faults of a byte load at the CPL (SDM Vol.2 CLFLUSH: "subject to all permission checking and
 //!   faults associated with a byte load"): #GP(0)/#SS(0) when not canonical, #PF from the walk (which sets A bits as a
-//!   load does); the flush itself has nothing to do.
+//!   load does); the flush itself has nothing to do. CLFLUSHOPT and CLWB (66 0f ae /7, /6; advertised since November 3)
+//!   are this transaction too: the same faults (SDM Vol.2 each), nothing to flush or write back, and as a draining entry
+//!   each is ordered more strongly than their pages require (only by fences, locked instructions and older writes to
+//!   the line).
 use super::*;
 use segments::Exception;
 

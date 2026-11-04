@@ -1561,6 +1561,10 @@ pub mod system {
     pub const XRSTOR: u32 = 0x6b;
     pub const XGETBV: u32 = 0x6c;
     pub const XSETBV: u32 = 0x6d;
+    /// XSAVEC m (`0f c7 /4`, NP; REX.W's XSAVEC64 the same here; advertised since November 3: CPUID.(EAX=0DH,ECX=1):EAX[1]),
+    /// the compacted format; EDX:EAX the instruction mask. XSAVEOPT (`0f ae /6`, NP) is decoded as [`XSAVE`]: with XINUSE
+    /// and XMODIFIED all ones it stores what XSAVE does (SDM Vol.1 13.9).
+    pub const XSAVEC: u32 = 0x6e;
     /// Port I/O (L3, numbered apart; SDM Vol.2 IN, OUT, INS, OUTS; Vol.1 19): `size` 1, 2 or 4 (66: 2; REX.W does not
     /// promote); IN/OUT name their port by DX (`reg` 2) or an imm8 (`reg` [`NO_REG`], the port in `cr`); INS/OUTS move one
     /// element per transaction between DX's port and ES:RDI (INS) or DS:RSI (OUTS; `segment` an FS/GS override), with
@@ -1657,7 +1661,7 @@ pub mod system {
                     X87_GATED | FNINIT | FNCLEX => true,
                     FLDCW | FLD80 | FSTP80 => self.memory == 1 && address,
                     FLDENV..=FNSAVE => self.memory == 1 && address && matches!(self.size, 2 | 4),
-                    FXSAVE..=XRSTOR => self.memory == 1 && address,
+                    FXSAVE..=XRSTOR | XSAVEC => self.memory == 1 && address,
                     XGETBV | XSETBV => self.memory == 0,
                     IN | OUT => self.memory == 0 && matches!(self.size, 1 | 2 | 4) && (self.reg == 2 || (self.reg == NO_REG && self.cr < 256)),
                     INS => self.memory == 0 && matches!(self.size, 1 | 2 | 4) && self.prefixes < 4 && self.segment == 0,

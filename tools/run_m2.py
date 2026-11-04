@@ -116,7 +116,7 @@ MTRR_MASK = 0xff_fffc_f800                              # 4 KiB, bits 17:16 igno
 def access(a, tag):
     """Data accesses of every kind at linear `a`, then a call to the code at a + 0xf00 (`add r11, k; jmp r13`)."""
     return (f'    mov rbx, {a:#x}\n    mov rax, [rbx]\n    add r8, rax\n    mov [rbx + 8], r8\n    lock xadd [rbx + 16], r8\n'
-            f'    xchg [rbx + 24], r9\n    add r9, r8\n    movnti [rbx + 32], r9\n    sfence\n    clflush [rbx + 40]\n'
+            f'    xchg [rbx + 24], r9\n    add r9, r8\n    movnti [rbx + 32], r9\n    sfence\n    clflush [rbx + 40]\n    clflushopt [rbx + 41]\n    clwb [rbx + 42]\n'
             f'    lea rdi, [rbx + 0x40]\n    mov ecx, 32\n    mov eax, 0x5a\n    rep stosb\n    lea rsi, [rbx + 0x38]\n    lodsq\n'
             f'    add r10, rax\n    mfence\n    add r10, [rbx + 0x800]\n    inc qword [rbx + 0x808]\n'
             f'    lea r13, [rel .r{tag}]\n    mov rax, {a + 0xf00:#x}\n    jmp rax\n.r{tag}:\n')
@@ -288,6 +288,8 @@ def uc_body(i):
     movnti [rbx+0x700], r8
     sfence
     clflush [rbx+0x708]
+    clflushopt [rbx+0x709]
+    clwb [rbx+0x70a]
     mfence
     lea r13, [rel .r]
     mov rax, {u0 + 0xf00:#x}

@@ -133,6 +133,10 @@ decompressor head, which natemu never runs: entry is `startup_64`). Initramfs: o
 advertised; fexc series49-sha). Rerun into `natemu-raw/kernel-census-sha-20261103-01/` (`x` linked to the C0 data; report
 in its `report/`): initramfs `system` 226,564 -> 225,267, the 1,297 SHA sites (SHA256RNDS2 326, SHA1NEXTE 204, SHA1RNDS4
 203, SHA1MSG2 162, SHA1MSG1 160, SHA256MSG2 122, SHA256MSG1 120) admitted; nothing else moved; the kernel has none.
+**ADX re-check (November 4).** `census.py` admits ADCX/ADOX (0f 38 f6 with exactly one of 66/F3; fexc series50-adx). Rerun into
+`natemu-raw/kernel-census-cpufeat-20261104-01/` (`x` linked to the C0 data; report in its `report/`): initramfs `system` 225,267 ->
+223,899, the 1,368 ADX sites (`adcxq` 736, `adoxq` 632, in libcrypto and fips.so) admitted; nothing else moved; the kernel has none.
+XSAVEOPT, CLWB, CLFLUSHOPT and XSAVEC stay `system` (the resident's).
 Files here: `extract.py`, `census.py`, `report.py`, `results.md` (every table, generated), `forms-kernel.tsv` (every refused
 form of the decompressor and vmlinux, one row per mnemonic + operand shape, first-use order). The same for the
 initramfs is `RAW/forms-initrd.tsv`; `RAW/census.json` holds every row.

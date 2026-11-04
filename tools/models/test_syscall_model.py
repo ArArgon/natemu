@@ -209,8 +209,14 @@ class Misc(unittest.TestCase):
         self.assertEqual(done(self, m.clflush(machine(), 0x2010))['cpl'], 0)            # read-only page: a read
         self.assertEqual(m.clflush(u, 0x0000_8000_0000_0000)['fault'], GP)
         self.assertEqual(m.clflush(u, 0x0000_8000_0000_0000, stack=True)['fault'], SS)
-        self.assertEqual(m.clflushopt(u, 0x5000)['fault'], UD)
-        self.assertEqual(m.clwb(u, 0x5000)['fault'], UD)
+        # CLFLUSHOPT and CLWB (advertised since November 3): CLFLUSH's faults, or #UD where the profile clears the bit.
+        for f, bit in ((m.clflushopt, 'CLFLUSHOPT'), (m.clwb, 'CLWB')):
+            if not m.PROFILE.feature(f'7.0.ebx.{bit}'):
+                self.assertEqual(f(u, 0x5000)['fault'], UD); continue
+            self.assertEqual(done(self, f(u, 0x5123)), u)
+            self.assertEqual(f(u, 0x2010)['fault'], (PF, 5, 0x2010))
+            self.assertEqual(f(machine(), 0x9000)['fault'], (PF, 0, 0x9000))
+            self.assertEqual(f(u, 0x0000_8000_0000_0000, stack=True)['fault'], SS)
 
 
 if __name__ == '__main__':

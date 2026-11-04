@@ -26,10 +26,17 @@ three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`,
 checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
 into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
 jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as twenty-nine commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
+(series applied as thirty commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series49-sha` (November 3, owner decision: SHA
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series52-adox66` (November 4, owner decision of
+November 3: ADX, CLFLUSHOPT/CLWB, XSAVEOPT/XSAVEC; boot-features plan, Built (ADX), Built (CLFLUSHOPT, CLWB), Built (XSAVEOPT,
+XSAVEC)): patches 0001-0030 (0030: ADOX with a 66 prefix decoded as ADOX, 66 ignored, as on the reference AMD machine) and
+`fexc.cpp` with the shim admitting ADCX/ADOX (66 or F3 0f 38 f6, ADOX also with 66; never with F2) and its cut reasons naming
+XSAVEOPT, CLWB, CLFLUSHOPT and XSAVEC as the resident's; `obj/fexc` SHA-256
+`bef4081c9444d030413448159e0c02d197d2bbf50c6f53b543a0f5479c7e9fe8`. Before it (intermediate builds of the same work):
+`series51-xsave` (`9600ebd1...1892`, no patch 0030), `series50-adx` (`8a25ab6c...196e`), `series50-adx-r0` (refused ADOX by the
+REP-prefix rule), and `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series49-sha` (November 3, owner decision: SHA
 advertised; boot-features plan, Built (SHA)): series48-lean's patches and `fexc.cpp` with the shim admitting SHA1*/SHA256*
 (NP 0f 38 c8..cd, NP 0f 3a cc) as aligned-m128 SSE forms instead of cutting them as #UD; `obj/fexc` SHA-256
 `fe1631cbea73342f32a3a3689593c6bf5f9263577e0691e68f3b76d9208e1f61`. Before it, `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series48-lean` (November 3, perf plan "Measured
@@ -270,7 +277,9 @@ Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in
 include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then
 `git -C BUILD_DIR/src format-patch --no-signature --zero-commit -o tools/fexc/patches 48d7175..HEAD`.
 
-Patches 0023-0028 are described in "Current tree" above and the plan's Built notes. 0029 (series46-br66): under slice1 in
+Patches 0023-0028 are described in "Current tree" above and the plan's Built notes. 0030 (series52-adox66, November 4): FEX's
+0F 38 table has no slot for 66 with F3; for opcode F6 that prefix pair is decoded as ADOX with the 66 dropped (the reference AMD
+machine runs 66 F3 and F3 66 0F 38 F6 as ADOX at the unchanged operand size; boot-features plan, Built (ADX)). 0029 (series46-br66): under slice1 in
 64-bit mode, 66 on a near direct branch (Jcc rel8/rel32, JMP rel8/rel32, CALL rel32, LOOP/LOOPcc, JrCXZ) no longer narrows
 the decode: the operand size stays 64 bits and the displacement rel8/rel32, as Intel processors do (SDM Vol.2 CALL: "the
 operand size for near call (and all near branches) is forced to 64-bits" and "In 64-bit mode the relative offset is always

@@ -11,7 +11,11 @@ bits, where natemu's slot must be that value rounded to a double by FCW.RC (I6 d
 nothing into bytes 10..15 of an FXSAVE ST slot, natemu writes zeros (the SDM's reserved bytes): those 48 bytes are
 compared only where the program pre-zeroed them (a declared difference; every other byte is compared).
 
-`faults`: each case is judged by the SDM rules (Vol.2 FXSAVE, FXRSTOR, XSAVE, XRSTOR, XGETBV, XSETBV; Vol.1 13.7-13.8):
+XSAVEOPT (advertised since November 3) is compared like XSAVE (QEMU's is XSAVE with every component in use, as natemu's).
+XSAVEC and the compacted form of XRSTOR (since November 3) have no TCG implementation in QEMU 11.1.2: their images are the
+reference AMD machine's (`tools/reference/gen_xsave.py`, `ref_native.py`); here their faults by the SDM rules, natemu only.
+
+`faults`: each case is judged by the SDM rules (Vol.2 FXSAVE, FXRSTOR, XSAVE, XSAVEOPT, XSAVEC, XRSTOR, XGETBV, XSETBV; Vol.1 13.7-13.10):
 the exception (vector, error code, RIP of the instruction, CR2), and the state at it equal to natemu's own run of the
 program cut before the instruction (GPRs, XMM, MXCSR, the x87 report, the data region: no partial update). Where the
 case needs no paging mutation or CPL change QEMU runs it too and must raise the same exception (QEMU_DIFFERS lists the
@@ -31,7 +35,7 @@ import ref, smp, run_slice1_vm as vm1  # noqa: E402
 # QEMU's Haswell (11.1.2 TCG): leaf 0DH sub-leaves 0 and 2 and leaf 1 ECX equal the profile's; sub-leaf 1 also advertises
 # XSAVEOPT (EAX bit 0), which no comparison here executes or reads: with `-xsaveopt` this QEMU loops in vmexit(-1) right after a
 # MOV to CR4 that sets OSXSAVE (its `-d int` log), so the model keeps it.
-QCPU = 'Haswell,-pcid,-hle,-rtm,-invpcid'
+QCPU = 'Haswell,-pcid,-hle,-rtm,-invpcid,+clflushopt,+clwb'   # +clflushopt/+clwb (November 4): the profile's, TCG has both
 CODE, D, SIZE, STACK = 0x110000, 0x200000, 0x4000, 0x3e1800
 A, B, C = D + 0x1000, D + 0x1400, D + 0x1800          # image areas (64-byte aligned), C crosses into D + 0x2000 for some
 CR4_ON = ['mov rax, cr4', 'or rax, 0x40600', 'mov cr4, rax']            # OSFXSR | OSXMMEXCPT | OSXSAVE
@@ -128,6 +132,16 @@ def image_cases():
         qemu_mxcsr = [(0x1018, 8, struct.pack('<II', 0x3f80, 0xffff))] if rfbm & 6 == 4 else []
         case(f'xsave-rfbm{rfbm}', prelude() + [f'mov eax, {rfbm}', 'xor edx, edx', 'xsave [rdi + 0x1000]'], mask=fxm(0x1000, rfbm & 1) + qemu_mxcsr)
     case('xsave64-all-xcr0-3', prelude(xcr0=3) + ['mov eax, -1', 'mov edx, -1', 'xsave64 [rdi + 0x1000]'], mask=fxm(0x1000))
+    # XSAVEOPT (November 3) under every RFBM, after an XRSTOR from another area loaded AVX state: XSAVE's image (natemu and QEMU
+    # keep every component in use and use no modified optimization), its XSTATE_BV pattern merged the same way.
+    for rfbm in range(8):
+        d = data(); d[0x1800:0x1800 + 832] = xsave_image(7)
+        qemu_mxcsr = [(0x1018, 8, struct.pack('<II', 0x5fa1, 0xffff))] if rfbm & 6 == 4 else []
+        case(f'xsaveopt-rfbm{rfbm}', prelude() + ['mov eax, 7', 'xor edx, edx', 'xrstor [rdi + 0x1800]', f'mov eax, {rfbm}', 'xsaveopt [rdi + 0x1000]'],
+             d, mask=fxm(0x1000, rfbm & 1) + qemu_mxcsr)
+    d = data(); d[0x1200:0x1240] = bytes(64)      # a header XSAVE leaves valid for the XRSTOR (bytes 8..23 zero)
+    case('xsaveopt64-same-area', prelude() + ['mov eax, 7', 'xor edx, edx', 'xsave [rdi + 0x1000]', 'xrstor [rdi + 0x1000]', 'pxor xmm5, xmm5',
+                                              'xsaveopt64 [rdi + 0x1000]'], d, mask=fxm(0x1000))
     # XRSTOR of crafted images (x87, SSE, AVX all differing from the prelude's state) under (XSTATE_BV, RFBM), then XSAVE of
     # everything and FNSTENV/STMXCSR.
     for bv, rfbm in ((7, 7), (0, 7), (1, 7), (2, 7), (4, 7), (5, 3), (7, 1), (7, 2), (7, 4), (3, 6), (6, 5), (0, 0), (1, 2)):
@@ -170,21 +184,24 @@ QEMU_NO_SS = 'QEMU 11.1.2 raises #GP(0) for every non-canonical data address, ne
 QEMU_DIFFERS = {
     'ts-xsave': 'QEMU 11.1.2 never raises #NM for XSAVE/XRSTOR under CR0.TS (SDM Vol.2 XSAVE, XRSTOR: #NM if CR0.TS = 1)',
     'ts-xrstor': 'as ts-xsave',
+    'ts-xsaveopt': 'as ts-xsave',
     'xrstor-mxcsr-reserved-sse': 'QEMU 11.1.2 loads MXCSR without the reserved-bit #GP(0) (SDM Vol.2 XRSTOR, FXRSTOR)',
     'xrstor-mxcsr-reserved-avx': 'as xrstor-mxcsr-reserved-sse (and it does not load MXCSR for RFBM = AVX alone)',
     'fxrstor-mxcsr-reserved': 'as xrstor-mxcsr-reserved-sse',
-    'unadvertised-xsaveopt': "QEMU's model advertises XSAVEOPT (see QCPU), so it runs it",
 }
 
 
 def fault_cases():
     out = []
     def case(name, lines, want, setup=(), d=None, cpl3=False, qemu=True, prefix=None):
+        # QEMU 11.1.2's TCG has no XSAVEC and no compacted XRSTOR (it raises #UD, #GP): natemu only, by the SDM.
+        qemu = qemu and not any('xsavec' in l for l in lines) and 'compacted' not in name
         out.append({'name': name, 'lines': lines, 'want': want, 'setup': list(setup), 'd': d if d is not None else data(), 'cpl3': cpl3,
                     'qemu': qemu and not setup and not cpl3, 'prefix': prefix if prefix is not None else prelude()})
     full = ['mov eax, 7', 'xor edx, edx']
     # Alignment: #GP(0) for FX* at 16, X* at 64 bytes, before the walk (the misaligned page is not even present).
-    for insn, off in (('fxsave', 8), ('fxrstor', 8), ('fxsave64', 4), ('xsave', 0x10), ('xsave', 0x20), ('xrstor', 0x30), ('xrstor', 0x8), ('xsave64', 0x1)):
+    for insn, off in (('fxsave', 8), ('fxrstor', 8), ('fxsave64', 4), ('xsave', 0x10), ('xsave', 0x20), ('xrstor', 0x30), ('xrstor', 0x8), ('xsave64', 0x1),
+                      ('xsaveopt', 0x10), ('xsavec', 0x20), ('xsavec64', 0x8)):
         case(f'align-{insn}-{off:#x}', full + [f'{insn} [rdi + {0x1000 + off:#x}]'], GP)
         case(f'align-{insn}-{off:#x}-notpresent', full + [f'{insn} [rdi + {0x1000 + off:#x}]'], GP, [f'unmap {A:#x}'])
     # #PF: the image across a page boundary at each offset, the second (or first) page not present or read-only. Nothing of
@@ -214,7 +231,18 @@ def fault_cases():
             want = PF(max(at + 512, D + 0x2000), False) if off < need else None     # the header is read first
             case(f'pf-xrstor-rfbm{rfbm}-cross-{off:#x}', [f'mov eax, {rfbm}', 'xor edx, edx', f'xrstor [rdi + {at - D:#x}]'], want,
                  [f'unmap {D + 0x2000:#x}'], d)
+            # XSAVEC: the header's 16 bytes (XSTATE_BV, XCOMP_BV) and AVX at 576 (the compacted format, RFBM[2]).
+            reach = {7: 832, 1: 528, 3: 528}[rfbm]
+            case(f'pf-xsavec-rfbm{rfbm}-cross-{off:#x}', [f'mov eax, {rfbm}', 'xor edx, edx', f'xsavec [rdi + {at - D:#x}]'],
+                 PF(D + 0x2000, True) if off < reach else None, [f'unmap {D + 0x2000:#x}'])
+            # The compacted XRSTOR reads its header first, then what it restores (AVX at 576).
+            d = data(); d[at - D:at - D + 832] = xsave_image(7, 1 << 63 | 7)
+            need = 832 if rfbm & 4 else 536
+            case(f'pf-xrstor-compacted-rfbm{rfbm}-cross-{off:#x}', [f'mov eax, {rfbm}', 'xor edx, edx', f'xrstor [rdi + {at - D:#x}]'],
+                 PF(max(at + 512, D + 0x2000), False) if off < need else None, [f'unmap {D + 0x2000:#x}'], d)
         case(f'pf-xsave-readonly-{off:#x}', full + [f'xsave [rdi + {at - D:#x}]'], PF(D + 0x2000, True, True), [f'readonly {D + 0x2000:#x}'])
+        case(f'pf-xsaveopt-readonly-{off:#x}', full + [f'xsaveopt [rdi + {at - D:#x}]'], PF(D + 0x2000, True, True), [f'readonly {D + 0x2000:#x}'])
+        case(f'pf-xsavec-first-{off:#x}', full + [f'xsavec [rdi + {at - D:#x}]'], PF(at, True), [f'unmap {D + 0x1000:#x}'])
         case(f'pf-xsave-first-{off:#x}', full + [f'xsave [rdi + {at - D:#x}]'], PF(at, True), [f'unmap {D + 0x1000:#x}'])
     # XRSTOR with RFBM = 0 and x87-only: the legacy page is read only for what it restores.
     for rfbm, bv, want in ((0, 1, None), (1, 0, None), (1, 1, PF(D + 0xe00, False)), (2, 0, PF(D + 0xe00 + 24, False))):
@@ -222,7 +250,7 @@ def fault_cases():
         case(f'pf-xrstor-rfbm{rfbm}-bv{bv}-legacy-absent', [f'mov eax, {rfbm}', 'xor edx, edx', 'xrstor [rdi + 0xe00]'], want,
              [f'unmap {D:#x}'], d, prefix=CR4_ON + XCR0(7))
     # Non-canonical operands: #GP(0), #SS(0) through RSP/RBP.
-    for insn in ('fxsave', 'fxrstor', 'xsave', 'xrstor'):
+    for insn in ('fxsave', 'fxrstor', 'xsave', 'xrstor', 'xsaveopt', 'xsavec'):
         case(f'noncanonical-{insn}', full + [f'mov rbx, {NONCANON:#x}', f'{insn} [rbx]'], GP)
         # (natemu only. RSP: QEMU's stub cannot take an exception at CPL 0 on that RSP. Straddle: QEMU maps no page below
         # the canonical gap, so its #PF there says nothing of the order; natemu checks each accessed range's canonical form
@@ -235,10 +263,10 @@ def fault_cases():
     cr0 = lambda bits: ['mov rax, cr0', f'or rax, {bits}', 'mov cr0, rax']
     no_osxsave = ['mov rax, cr4', 'btr rax, 18', 'mov cr4, rax']
     d = data(); d[0x1000:0x1000 + 832] = xsave_image(7)
-    for insn, ts, em in (('fxsave', NM, NM), ('fxrstor', NM, NM), ('xsave', NM, None), ('xrstor', NM, None)):
+    for insn, ts, em in (('fxsave', NM, NM), ('fxrstor', NM, NM), ('xsave', NM, None), ('xrstor', NM, None), ('xsaveopt', NM, None), ('xsavec', NM, None)):
         case(f'ts-{insn}', full + cr0(8) + [f'{insn} [rdi + 0x1000]'], ts, d=d)
         case(f'em-{insn}', full + cr0(4) + [f'{insn} [rdi + 0x1000]'], em, d=d)
-    for insn in ('xsave [rdi + 0x1000]', 'xrstor [rdi + 0x1000]', 'xgetbv', 'xsetbv'):
+    for insn in ('xsave [rdi + 0x1000]', 'xrstor [rdi + 0x1000]', 'xsaveopt [rdi + 0x1000]', 'xsavec [rdi + 0x1000]', 'xgetbv', 'xsetbv'):
         tag = insn.split()[0]
         case(f'no-osxsave-{tag}', full + no_osxsave + ['xor ecx, ecx', insn], UD, d=d)
     case('ts-no-osxsave-xsave', full + no_osxsave + cr0(8) + ['xsave [rdi + 0x1000]'], UD, d=d)
@@ -248,9 +276,9 @@ def fault_cases():
     case('lock-fxsave', ['.byte 0xf0, 0x0f, 0xae, 0x07'], UD)
     case('lock-xsetbv', ['xor ecx, ecx', 'mov eax, 7', '.byte 0xf0, 0x0f, 0x01, 0xd1'], UD)
     # Forms the profile does not advertise: #UD.
-    for tag, insn in (('xsaveopt', 'xsaveopt [rdi + 0x1000]'), ('xsavec', 'xsavec [rdi + 0x1000]'), ('xsaves', 'xsaves [rdi + 0x1000]'),
-                      ('xrstors', 'xrstors [rdi + 0x1000]'), ('clwb', 'clwb [rdi + 0x1000]')):
+    for tag, insn in (('xsaves', 'xsaves [rdi + 0x1000]'), ('xrstors', 'xrstors [rdi + 0x1000]')):
         case(f'unadvertised-{tag}', full + [insn], UD)
+    case('clwb-runs', full + ['clwb [rdi + 0x1000]'], None)   # CLWB (66 0f ae /6), advertised since November 3
     # XSETBV/XGETBV #GP: ECX != 0 (XGETBV ECX = 1: XGETBV1 not advertised), bit 0 clear, XCR0[2:1] = 10b, unsupported bits,
     # CPL 3 (XSETBV only).
     for tag, ecx, edx, eax in (('ecx1', 1, 0, 7), ('ecx2', 2, 0, 7), ('x87-clear', 0, 0, 6), ('zero', 0, 0, 0), ('avx-no-sse', 0, 0, 5),
@@ -260,17 +288,34 @@ def fault_cases():
     case('xsetbv-cpl3', ['xor ecx, ecx', 'mov eax, 3', 'xor edx, edx', 'xsetbv'], GP, cpl3=True)
     case('xgetbv-cpl3-runs', ['xor ecx, ecx', 'xgetbv'], None, cpl3=True)
     case('xsave-cpl3-runs', full + ['xsave [rdi + 0x1000]'], None, cpl3=True)
+    case('xsaveopt-cpl3-runs', full + ['xsaveopt [rdi + 0x1000]'], None, cpl3=True)
+    case('xsavec-cpl3-runs', full + ['xsavec [rdi + 0x1000]'], None, cpl3=True)
+    case('lock-xsavec', ['.byte 0xf0, 0x0f, 0xc7, 0x27'], UD)
+    case('lock-xsaveopt', ['.byte 0xf0, 0x0f, 0xae, 0x37'], UD)
     # XRSTOR's header and MXCSR #GP; and what is not checked.
+    # Compacted (XCOMP_BV[63], since November 3): XCOMP_BV[62:0] within XCR0, XSTATE_BV within XCOMP_BV[62:0] (XSTATE_BV[63],
+    # reserved, is #GP(0) as on the reference AMD machine: natemu-raw/xsave-corpus-20261104-01/xs_probe.out), header bytes
+    # 16..63 zero.
     for tag, bv, comp, extra, want in (('bv-bit3', 0xf, 0, b'', GP), ('bv-not-in-xcr0', 7, 0, b'', GP), ('compacted', 7, 1 << 63, b'', GP),
-                                       ('compacted-xcomp', 3, 0x8000000000000003, b'', GP), ('xcomp-low', 7, 1, b'', GP),
+                                       ('compacted-xcomp', 3, 0x8000000000000003, b'', None), ('xcomp-low', 7, 1, b'', GP),
+                                       ('compacted-xcomp-not-in-xcr0', 3, 1 << 63 | 7, b'', GP), ('compacted-bv-outside', 5, 1 << 63 | 1, b'', GP),
+                                       ('compacted-xcomp-bit3', 7, 1 << 63 | 0xf, b'', GP), ('compacted-bv-bit63', 1 << 63 | 7, 1 << 63 | 7, b'', GP),
+                                       ('compacted-reserved-16', 7, 1 << 63 | 7, b'\x01' + bytes(47), GP),
+                                       ('compacted-reserved-24', 7, 1 << 63 | 7, bytes(8) + b'\x01' + bytes(39), GP),
+                                       ('compacted-reserved-63', 7, 1 << 63 | 7, bytes(47) + b'\x80', GP), ('compacted-bv0-xcomp0', 0, 1 << 63, b'', None),
                                        ('reserved-16', 7, 0, b'\x01' + bytes(47), GP), ('reserved-23', 7, 0, bytes(7) + b'\x80' + bytes(40), GP),
                                        ('reserved-24', 7, 0, bytes(8) + b'\x01' + bytes(39), None), ('bv-bit63', 1 << 63 | 7, 0, b'', GP)):
         d = data(); d[0x1000:0x1000 + 832] = xsave_image(bv, comp, extra)
         case(f'xrstor-{tag}', ['mov eax, 7', 'xor edx, edx', 'xrstor [rdi + 0x1000]'], want, d=d,
-             prefix=prelude(xcr0=3 if tag == 'bv-not-in-xcr0' else 7))
+             prefix=prelude(xcr0=3 if tag in ('bv-not-in-xcr0', 'compacted-xcomp-not-in-xcr0') else 7))
     for tag, rfbm, want in (('sse', 2, GP), ('avx', 4, GP), ('x87-only', 1, None), ('none', 0, None)):
         d = data(); d[0x1000:0x1000 + 832] = xsave_image(0, mxcsr=0x11f80)
         case(f'xrstor-mxcsr-reserved-{tag}', [f'mov eax, {rfbm}', 'xor edx, edx', 'xrstor [rdi + 0x1000]'], want, d=d)
+    # The compacted form loads MXCSR only with SSE state (XSTATE_BV[1] and RFBM[1]; RFBM[2] plays no part), else 1F80H for
+    # RFBM[1]: a reserved bit is #GP(0) only when loaded.
+    for tag, bv, rfbm, want in (('sse', 2, 2, GP), ('avx-only', 6, 4, None), ('sse-init', 4, 6, None), ('none', 7, 0, None)):
+        d = data(); d[0x1000:0x1000 + 832] = xsave_image(bv, 1 << 63 | 7, mxcsr=0x11f80)
+        case(f'xrstor-compacted-mxcsr-reserved-{tag}', [f'mov eax, {rfbm}', 'xor edx, edx', 'xrstor [rdi + 0x1000]'], want, d=d)
     d = data(); d[0x1000:0x11a0] = legacy_image(mxcsr=0x21f80)
     case('fxrstor-mxcsr-reserved', ['fxrstor [rdi + 0x1000]'], GP, d=d)
     # Images clearing a mask load (I5c: unmasked exceptions are built, tools/run_i5c.py).
@@ -287,7 +332,7 @@ def fault_cases():
     for off, rfbm, want in ((0x240, 7, ('stop', 'unsupported_mmio')), (0x100, 1, ('stop', 'unsupported_mmio')), (0x340, 1, None)):
         case(f'mmio-xsave-rfbm{rfbm}-{off:#x}', [f'mov eax, {rfbm}', 'xor edx, edx', f'xsave [rdi + {SIZE - off:#x}]'], want, dev)
     # #AC is never raised: CPL 3 with CR0.AM and RFLAGS.AC, a misaligned operand is #GP(0); an aligned one runs.
-    for insn, off, want in (('fxsave', 8, GP), ('fxsave', 0, None), ('xsave', 0x20, GP), ('xrstor', 0x8, GP)):
+    for insn, off, want in (('fxsave', 8, GP), ('fxsave', 0, None), ('xsave', 0x20, GP), ('xrstor', 0x8, GP), ('xsavec', 0x10, GP), ('xsaveopt', 0x4, GP)):
         d = data(); d[0x1000:0x1000 + 832] = xsave_image(7)
         case(f'ac-{insn}-{off:#x}', full + [f'{insn} [rdi + {0x1000 + off:#x}]'], want, d=d, cpl3='ac')
     return out + segment_cases()

@@ -1,0 +1,38 @@
+From 14657d9278da7e652ca0def9bca5f663facbd447 Mon Sep 17 00:00:00 2001
+From: natemu <natemu@example.invalid>
+Date: Wed, 4 Nov 2026 04:46:04 -0800
+Subject: [PATCH] FEXCore: decode ADOX with a 66 prefix as ADOX (66 ignored)
+
+The reference AMD machine runs 66 F3 0F 38 F6 and F3 66 0F 38 F6 as
+ADOX with the operand size unchanged (natemu's owner rule: an encoding
+the SDM leaves open follows that machine). FEX's 0F 38 table has no
+entry for 66 with F3; map that prefix pair to F3 for opcode F6 only and
+drop the 66 as an operand-size prefix.
+---
+ FEXCore/Source/Interface/Core/Frontend.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index 9434da4..fa67395 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -936,7 +936,15 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstructionImpl(uint64_t PC) {
+           Prefix |= PF_38_F3;
+         }
+ 
+-        uint16_t LocalOp = (Prefix << 8) | ReadByte();
++        const uint8_t Op38 = ReadByte();
++        // natemu: ADOX (F3 0F 38 F6) with a 66 prefix too, in either order, runs as ADOX with 66 ignored on the reference AMD
++        // machine (owner rule: an encoding the SDM leaves open follows that machine); F2 with it stays undecoded.
++        if (Op38 == 0xF6 && Prefix == (PF_38_66 | PF_38_F3)) {
++          Prefix = PF_38_F3;
++          DecodeInst->Flags &= ~DecodeFlags::FLAG_OPERAND_SIZE;
++          DecodeFlags::PopOpAddrIf(&DecodeInst->Flags, DecodeFlags::FLAG_OPERAND_SIZE_LAST);
++        }
++        uint16_t LocalOp = (Prefix << 8) | Op38;
+ 
+         bool NoOverlay66 = (FEXCore::X86Tables::H0F38TableOps[LocalOp].Flags & InstFlags::FLAGS_NO_OVERLAY66) != 0;
+         if (LastEscapePrefix == 0x66 && NoOverlay66) { // Operand Size
+-- 
+2.50.1 (Apple Git-155)
+

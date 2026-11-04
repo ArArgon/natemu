@@ -290,7 +290,8 @@ pub fn cpuid(leaf: u32, sub: u32, d: &Dynamic) -> [u32; 4] {
                 ecx = sub & 0xff;
             }
         }
-        0xd if sub == 0 => ebx = if d.xcr0 & 4 != 0 { 832 } else { 576 },
+        // 0xD.1 EBX with XSAVEC and no XSAVES (EAX = 3): XSAVEC's area size for XCR0, the standard one (SDM Vol.1 13.2).
+        0xd if sub == 0 || (sub == 1 && eax & 2 != 0) => ebx = if d.xcr0 & 4 != 0 { 832 } else { 576 },
         0x8000_0001 => edx |= 1 << 11, // SYSCALL: 64-bit mode
         _ => {}
     }

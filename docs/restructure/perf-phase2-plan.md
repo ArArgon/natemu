@@ -79,6 +79,9 @@ before/after on the installer and the phase-2 benchmarks); the like-for-like QEM
 profile change. Order is the orchestrator's: ADX, CLFLUSHOPT/CLWB and XSAVEOPT/XSAVEC first (cheap); SMEP and UMIP next
 (fetch-walk and resident checks); SMAP last and only if its cost is acceptable — translated kernel code runs at EL0, so
 Arm PAN does not apply directly and STAC/CLAC (around every user copy) would switch shadow spaces.
+Built November 4 (boot-features plan, Built (ADX), Built (CLFLUSHOPT, CLWB), Built (XSAVEOPT, XSAVEC)): ADX, CLFLUSHOPT/CLWB and
+XSAVEOPT/XSAVEC, each judged by the AMD machine; installer N = 1 cache off 9.51 -> 8.93 s, zstd N = 1 unchanged; the QEMU control
+gains `+adx,+clflushopt,+clwb` (its TCG has no XSAVEC). Next: SMEP and UMIP.
 
 ## FEX maintenance (owner, November 4: later)
 

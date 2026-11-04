@@ -108,7 +108,7 @@ class Profile:
             edx = vcpu
             if sub == 1: eax, ebx = (n - 1).bit_length(), n
             if sub >= 2: ecx = sub & 0xFF
-        elif l == 0xD and sub == 0:
+        elif l == 0xD and (sub == 0 or (sub == 1 and eax & 2)):     # 0xD.1 EBX: XSAVEC's size for XCR0 (no XSAVES)
             ebx = 832 if xcr0 >> 2 & 1 else 576
         elif l == 0x80000001:
             edx |= mode64 << 11
@@ -267,6 +267,14 @@ class Profile:
             if self.feature('1.ecx.OSXSAVE'): err('OSXSAVE must be dynamic, not static')
             if (self.cpuid(1, cr4=1 << 18)[2] >> 27 & 1) != 1 or (self.cpuid(1)[2] >> 27 & 1): err('OSXSAVE not dynamic')
             if self.cpuid(0xD, 0, xcr0=7)[1] != 832 or self.cpuid(0xD, 0, xcr0=3)[1] != 576: err('0xD.0 EBX size')
+            c1 = self.cpuid(0xD, 1)[0]
+            if c1 & 8: err('XSAVES/IA32_XSS not modelled')
+            # XSAVEC without XSAVES: 0xD.1 EBX is the compacted size for XCR0 (SDM Vol.1 13.2); with AVX the only extended
+            # component, unaligned (0xD.2 ECX[1] = 0), compacted equals standard. Without XSAVEC, EBX = 0.
+            for v in (1, 3, 7):
+                want = (576 + (256 if v & 4 else 0)) if c1 & 2 else 0
+                if self.cpuid(0xD, 1, xcr0=v)[1] != want: err(f'0xD.1 EBX for XCR0 {v}')
+            if c1 & 2 and self.cpuid(0xD, 2)[2] & 2: err('compacted AVX alignment: the sizes above assume ECX[1] = 0')
         elif sm != 1 or (0xD, 0) in self.leaves and _i(self.leaves[(0xD, 0)]['eax']): err('no XSAVE but XCR0/leaf 0xD present')
         avx = self.feature('1.ecx.AVX')
         if avx != bool(sm & 4): err('AVX advertised <-> XCR0 bit 2')

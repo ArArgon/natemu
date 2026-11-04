@@ -3759,6 +3759,78 @@ natemu raises #GP(0) as the SDM's class 4 says. **Cost (bench initramfs, `bench=
 0.745 -> 0.314 s host; compress 1.64 -> 1.60, decompress 0.23 -> 0.29, whole 2.62 -> 2.20 s; both verified. QEMU 11.1.2
 (control now `+sha-ni`, its TCG implements SHA): verify 1.71 -> 0.83 s, whole 17.5 -> 17.2 s. Native: 0.080 s.
 
+*Built (ADX, owner decision November 3; compiler **series52-adox66** = patches 0001-0030 + the shim; uncommitted on 1be744d):*
+**Profile:** CPUID.7.0:EBX bit 19 (ADX) advertised (`cpu_profile.json`, the generated `cpu_profile.rs`). **Shim:** ADCX (66 0f 38 f6)
+and ADOX (F3 0f 38 f6) compile, prefixes read from the bytes (FEX's decoder clears ADCX's 66 flag) (`Classify`; ADOX exempt from
+the REP-prefix refusal). ADOX with a 66 too, in either order, is open in the SDM; the AMD machine runs it as ADOX with 66 ignored
+(32 bits without REX.W, `adx_probe2.out`), so natemu does (coordinator's ruling under the owner rule, November 4): new patch 0030
+maps FEX's 66|F3 0F 38 F6 table slot to ADOX and drops the 66. `Undefined0F38` still cuts NP f6 (WRSS) and any F2. **Host:** 0f 38
+f6 with F2 before F3 is not decoded (a stop; the AMD machine runs it as ADOX, FEX's decoder does not), F2 last (alone, with 66 or
+after F3) and NP are #UD (the AMD machine agrees); the `undefined()` cells follow the profile (`undefined_follows_the_profile`); `test_slice1.py` fails if the
+bit is cleared without restoring the cut. LOCK is the shim's non-lockable cut (#UD). **Lowering:** FEX's `ADXOp`: an Arm ADC whose
+carry-in is CF (ADCX) or OF moved into C by CCMP (ADOX), then RMIF restores N, Z and C or V from the NZCV saved before it, so only
+CF or OF changes and PF/AF (separate registers) are untouched; 32-bit forms zero-extend. ADOX's CCMP reads the host flags before the
+cached NZCV is flushed; that is safe because FEX flushes the cache before every instruction (Core.cpp `FlushRegisterCache`), noted
+by the independent review as a latent dependency. **Checks:** `tools/reference/gen_adx.py` (56 programs: 16 `adx-model-*`
+replayed through the SDM's Operation by `--check`, 16/16, and a negative control with ADOX modelled as ADCX fails 15; 16
+`adx-chain-*` MULX + two interleaved carry chains with PUSHFQ between; 24 `adx-mix-*` after random flag producers; 32/64 bits,
+register, memory near and across the page boundary, 0x67, REX.W and ignored DS/ES/CS/SS raw-encoded), judged by the AMD machine
+(`ref_native.py --require-flag adx`; `natemu-raw/adx-corpus-20261104-01/`); natemu 56/56 at block sizes default and 1. Pinned
+QEMU 7.2 cannot judge it: its TCG ADX (before 8.0's "fix ADOX followed by ADCX") ends program 0 with an `IOPL(dc) == iopl`
+assertion and others with SIGTRAP (`expected-qemu72.json` not written). Probe (`adx_probe.c`/`.out`): all four CF/OF inputs of
+ADCX/ADOX at 32 and 64 bits, 66 F3 and F3 66 run as ADOX at the instruction's own size, F2 then F3 as ADOX, F3 then F2, F2 and 66
+F2 #UD, LOCK #UD. The corpus has 10 ADOX forms with a 66 before or after F3. `run_i9_faults.py` 662 -> 714 (ADCX/ADOX m32/m64: #PF,
+crossing, end of page, non-canonical #GP/#SS, straddle; not gated by CR0.EM/TS; #AC at CPL 3 for misaligned m32/m64; F2, 66 F2, F3
+F2, LOCK #UD; 66 F3 and F3 66 m32 reading 4 bytes; F2 F3 refused), the 710 before the 66 F3 change green at both block sizes; FEX ASM 1,891 -> 1,896 of the run below (`H0F38/adcx`, `adox`,
+`FEX_bugs/adcx_size`, `REX/0F_38`, `modrm_oob/H0F38`); `run_x1.py` 6/6 + 196/196 (the F2 cell replaces ADOX's #UD); census
+(`natemu-raw/kernel-census-cpufeat-20261104-01`): initramfs `system` 225,267 -> 223,899, the 1,368 ADX sites (ADCX 736, ADOX 632,
+all in libcrypto/fips.so) admitted, nothing else moved; the kernel has none.
+
+*Built (CLFLUSHOPT, CLWB, owner decision November 3; no compiler change):* **Profile:** CPUID.7.0:EBX bits 23 and 24 advertised
+(EBX = 218801A9H). **Host:** 66 0f ae /7 m (CLFLUSHOPT) and 66 0f ae /6 m (CLWB) decode as the resident's CLFLUSH transaction (fexc
+already cut both as system instructions); CLFLUSHOPT with F2/F3 #UD (its page), CLWB with F3 is CLRSSBSY (#UD, CET not advertised).
+**Semantics (SDM Vol.2 each):** the faults of a byte load at the CPL (#PF with a read error code, A set but not D, #GP(0)/#SS(0)
+non-canonical; no write permission needed); RAM is coherent write-back with no cache model, so there is nothing to flush or write
+back; a device page passes (uncached, M3) and UC RAM takes the M2 barrier in `segments::pages` as CLFLUSH did; as a draining entry
+each is ordered more strongly than its page requires (fences, locked instructions, older writes to the line). Code-page
+invalidation is unaffected: neither writes memory. **Checks:** `syscall_model.py` models both (CLFLUSH's faults, #UD only where the
+profile clears the bit); `run_slice3_vm.py system` 0 failures with `sc-cache` running CLFLUSHOPT/CLWB vs QEMU and four new fault
+cases (non-canonical, CPL 3 on a supervisor page; QEMU makes no access for them, so judged by the model); `run_m2.py qemu,faults` 39/39
+with CLFLUSHOPT/CLWB on every memory type and UC page; `run_i5b.py` `clwb-runs`; FEX ASM `Secondary/CLFLUSHOPT`, `Secondary/CLWB` pass.
+
+*Built (XSAVEOPT, XSAVEC, owner decision November 3; compiler **series52-adox66**, whose shim also names the resident's forms;
+uncommitted on 1be744d):* **Profile:** CPUID.(EAX=0DH,ECX=1):EAX = 3 (XSAVEOPT, XSAVEC with the compaction extensions), EBX = XSAVEC's
+size for XCR0 (576 or 832; SDM Vol.1 13.2 with EAX[3] = 0), ECX:EDX 0; 0DH.2 ECX[1] = 0, so compacted AVX sits at 576 and both
+sizes equal the standard ones (`cpu_profile.py` checks this). **Host:** NP 0f ae /6 m decodes as XSAVE; NP 0f c7 /4 m as XSAVEC
+(kind 0x6e; with 66/F2/F3 a stop, as XSAVE's); XSAVES/XRSTORS stay #UD. **Resident (`execution/xsave.rs`):** XSAVEOPT is XSAVE:
+natemu implements neither the init nor the modified optimization, so XINUSE and XMODIFIED are all ones (Vol.1 13.6, 13.8.3) and
+XSAVEOPT saves every RFBM component, sets those XSTATE_BV bits and writes no other header byte, which is XSAVE's image. XSAVEC
+(13.10): the same component bytes, MXCSR/MXCSR_MASK only with RFBM[1], AVX at 576, XSTATE_BV := RFBM, XCOMP_BV := 2^63 | RFBM,
+header bytes 16..63 untouched, XSTATE_BV not read. XRSTOR reads the whole 64-byte header; XCOMP_BV[63] selects the compacted form
+(13.8.2): #GP(0) for XCOMP_BV[62:0] outside XCR0, XSTATE_BV outside XCOMP_BV[62:0], or header bytes 16..63 nonzero; components of
+RFBM outside XCOMP_BV are initialized; MXCSR is loaded only with SSE state, else 1F80H for RFBM[1] (RFBM[2] plays no part); every
+read and the MXCSR check precede any change. **Follows the reference machine:** XSTATE_BV[63] = 1 in a compacted image is #GP(0): the SDM
+defines no non-fault for this reserved bit and the AMD machine faults (coordinator's ruling under the owner rule, November 4). **Linux:** the installer boot logs "Enabled xstate features 0x7, context size is 832 bytes, using 'compacted' format" (was
+'standard'): 6.12 now uses XSAVEC and the compacted XRSTOR for task state. **Checks:** `tools/reference/gen_xsave.py` (56
+programs: XSAVEC and XSAVEOPT under random RFBM with XSAVEC64, 0x67 and DS forms, areas within a page and across it; XSAVEC then
+compacted XRSTOR under edited XSTATE_BV and each RFBM; XSAVEC with an RFBM subset then XRSTOR with RFBM 7; every component in use,
+so the AMD machine's init optimization writes what natemu writes; MXCSR_MASK, 0002FFFFH there, ANDed with FFFFH), judged byte for
+byte by the AMD machine (`natemu-raw/xsave-corpus-20261104-01/`); natemu 56/56 at both block sizes. QEMU 11.1.2's TCG has no XSAVEC
+or compacted XRSTOR. Probe `xs_probe.c`/`.out` (AMD): ST reserved bytes, FOP/FIP/FDP written 0, bytes 416..511 and header 16..63
+never written, XSAVEOPT/XSAVEC skip init components there, the compacted #GP cases and MXCSR rules above. `run_i5b.py` 445 -> 528
+(XSAVEOPT images under every RFBM vs QEMU's Haswell, whose XSAVEOPT is XSAVE too; XSAVEC/compacted XRSTOR: alignment, #PF
+crossings with nothing written, non-canonical, #NM/#UD gating, LOCK, CPL 3, the compacted header and MXCSR #GP rules), 528/528.
+**Cost (installer, 2 GiB, N = 1, cache off, three interleaved rounds; `natemu-raw/cpufeat-20261104-01/measure/`):** before
+(1be744d) 9.51 s (8.95-10.56), +ADX 9.32 (8.93-10.07), +CLFLUSHOPT/CLWB 9.08 (8.92-9.37), +XSAVEOPT/XSAVEC 8.93 (8.83-9.02); zstd
+bench N = 1 (two runs each, verified) 2.19-2.21 / 2.19-2.24 / 2.21-2.26 / 2.18-2.19 s. No regression. **QEMU control:** `+adx,
++clflushopt,+clwb` (TCG implements them; Haswell already has `xsaveopt`); TCG has no XSAVEC, so the control lacks `xsavec` and its
+Linux uses XSAVEOPT and the standard format: the control cannot match natemu in this one flag (`xsavec`); the harness patch is
+applied together with these changes.
+**Suite (series51-xsave = series52-adox66 without patch 0030 and the 66 F3 shim change; this tree):** `cargo test` 163 + 1 ignored, Python 299 (1 skipped), `test_slice1.py` + `test_fexc.py` 47,
+`check_resident_stack.py` ok (gate bound 16,656), FEX ASM 2,270: 1,898 pass / 0 fail / 48 / 324 (was 1,891 / 331: the five ADX tests
+and CLFLUSHOPT/CLWB), I9 corpus 120, I10 88, SHA 60, fixtures 64 (both block sizes), i9 faults 710, i10 faults 296 at both,
+`run_x1.py` 6/6 + 196/196, `run_slice3_vm.py system` 0 failures, `run_boot_smoke.py` 4/4.
+
 **Owner decision (October 29): unassigned I/O ports and device addresses behave as on a PC.** A read of a port or a device-range address that no device claims returns all-ones at the access width; a write is ignored; every such access is counted in the run report (by port or page). A strict debug switch turns them into typed stops. This is the PC platform convention (and QEMU's), and it is what lets Linux and other kernels probe for absent hardware; it is not kernel-specific. Context: the Debian 6.12 kernel at 2 GiB now runs into `setup_arch` and first stops at port I/O, a PCI configuration read (`out dx,eax` to 0xcf8 then `in` from 0xcfc, bus 0 device 2 function 0, `snb_gfx_workaround_needed`). Applies to L3 (ports, including 0xcf8/0xcfc with no PCI devices) and to M3's `unassigned` pages.
 
 **Owner decision (October 29, amendment after L3):** unassigned memory pages (including the legacy hole 0xA0000–0x100000) are mapped read-only and non-executable onto one shared all-ones page, so every read form (compare, checksum, string, SSE) runs natively and exactly; reads are counted per page on first touch (shadow fill), writes stay counted per access and complete as ignored for MOV forms (other write forms keep their typed refusals); fetch stays a typed stop; the strict switch still turns all of it into stops. Context: Linux's `reserve_ibft_region`, `probe_roms`, DMI and `smp_scan_config` scan 0x80000–0xFFFFF with CMP/checksum/string loops. Pages a device claims stay unshadowed (M3); the LAPIC's possible page is always a device page.

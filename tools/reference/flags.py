@@ -52,7 +52,8 @@ def step(insn, undefined):
     """
     op, width = insn['op'], insn.get('width', 64)
     reads = 0
-    if op in ('adc', 'sbb'): reads = CF
+    if op in ('adc', 'sbb', 'adcx'): reads = CF
+    elif op == 'adox': reads = OF                                    # ADX (SDM Vol.2 ADCX/ADOX): the one flag each reads and writes
     elif op in ('setcc', 'cmovcc', 'jcc'): reads = CC_READS[insn['cc']]
     elif op in ('loope', 'loopne'): reads = ZF
     elif op == 'cmc': reads = CF
@@ -75,6 +76,8 @@ def step(insn, undefined):
     # I8: their VEX forms, and VTESTPS/VTESTPD, likewise.
     if insn.get('sse'): return undefined & ~ALL6 if op.removeprefix('v') in ('comiss', 'ucomiss', 'comisd', 'ucomisd', 'ptest', 'testps', 'testpd') else undefined
     if op in NO_FLAGS | NO_FLAGS_I1 | STRING_MOVES | {'lahf', 'pushf'}: return undefined
+    if op == 'adcx': return undefined & ~CF                         # the other five flags unmodified
+    if op == 'adox': return undefined & ~OF
     if op in STRING_COMPARES: return undefined if insn.get('count') == 0 else undefined & ~ALL6
     if op in ('clc', 'stc', 'cmc'): return undefined & ~CF
     if op == 'sahf': return undefined & ~(SF | ZF | AF | PF | CF)    # OF unaffected

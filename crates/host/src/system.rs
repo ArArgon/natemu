@@ -219,8 +219,14 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         // RDRAND (/6; F2/F3 #UD), RDSEED and RDPID (/7, f3), neither advertised: #UD.
         (MAP_TWO, 0xc7) => {
             let reg = rm(bytes, &mut at, rex, &mut s)?;
-            // I5b: XRSTORS, XSAVEC, XSAVES m (/3, /4, /5): not advertised (CPUID.(EAX=0DH,ECX=1):EAX = 0), #UD.
-            (s.kind, rep_used) = if s.memory != 0 && (3..=5).contains(&reg) {
+            // I5b: XRSTORS, XSAVES m (/3, /5): not advertised (CPUID.(EAX=0DH,ECX=1):EAX[3] = 0), #UD. XSAVEC m (/4, NP; since
+            // November 3, EAX[1]): the resident's; with 66/F2/F3 not decoded (a stop, as XSAVE's), #UD while not advertised.
+            (s.kind, rep_used) = if s.memory != 0 && reg == 4 && advertised(XSAVEC_BIT.unwrap()) {
+                if operand16 || rep != 0 {
+                    return None;
+                }
+                (system::XSAVEC, false)
+            } else if s.memory != 0 && (3..=5).contains(&reg) {
                 (system::UD, true)
             } else if s.memory != 0 || reg < 6 {
                 return None; // cmpxchg8b/16b (admitted) and other memory forms are never cut
@@ -236,9 +242,11 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         (MAP_TWO, 0x78 | 0x79) | (MAP_0F38, 0x80..=0x82) => (s.kind, rep_used) = (system::UD, true),
         (MAP_TWO_F3..=MAP_TWO_66, 0x78 | 0x79) if !advertised(SSE4A) => (s.kind, rep_used) = (system::UD, true),
         // I9: MOVBE with a register operand (SDM MOVBE: #UD); F2 is CRC32, F3 is refused by fexc and a memory MOVBE is
-        // admitted, none ever cut. ADCX (66 0f 38 f6) and ADOX (F3; ADX not advertised), WRSS (NP 0f 38 f6) and WRUSS (66 0f 38
-        // f5; CET_SS not advertised) and the rest of 0f 38 f5/f6: #UD whatever their operands; SHA (NP 0f 38 c8..cd, NP 0f 3a
-        // cc) likewise only while the profile does not advertise it (advertised since November 3: fexc compiles it, no cut).
+        // admitted, none ever cut. WRSS (NP 0f 38 f6) and WRUSS (66 0f 38 f5; CET_SS not advertised) and the rest of 0f 38
+        // f5/f6: #UD whatever their operands; ADCX (66 0f 38 f6) and ADOX (F3) and SHA (NP 0f 38 c8..cd, NP 0f 3a cc) likewise
+        // only while the profile does not advertise them (both advertised since November 3: fexc compiles them, no cut). With
+        // ADX, 0f 38 f6 with F2 before F3 is cut but not decoded (a stop: the AMD machine runs it as ADOX; FEX does not decode
+        // it); with F2 last (alone or with 66) it is a blank cell, #UD.
         (MAP_0F38, 0xf0 | 0xf1) => {
             rm(bytes, &mut at, rex, &mut s)?;
             if rep != 0 || s.memory != 0 {
@@ -246,6 +254,9 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
             }
             (s.kind, rep_used) = (system::UD, true);
         }
+        // (ADCX/ADOX, ADOX with 66 included, are never cut; cut with F3 last: F2 before F3, which the AMD machine runs as ADOX;
+        // F2 last, alone or with 66, is #UD there.)
+        (MAP_0F38, 0xf6) if advertised(ADX.unwrap()) && (rep == 0xf3 || (operand16 && rep == 0)) => return None,
         (MAP_0F38, 0xf5 | 0xf6) => (s.kind, rep_used) = (system::UD, true),
         (MAP_0F38, 0xc8..=0xcd) | (MAP_0F3A, 0xcc) if !operand16 && rep == 0 && !advertised(SHA.unwrap()) => s.kind = system::UD,
         (MAP_PRIMARY, 0x8c | 0x8e) => {
@@ -343,7 +354,8 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         // UD1/UD0's ModRM is not decoded: #UD leaves RIP at the instruction, its length is never used.
         (MAP_TWO, 0x0b | 0xb9 | 0xff) => s.kind = system::UD,
         // I5a: LDMXCSR/STMXCSR m32 (`0f ae /2`, `/3`); with a 66 prefix or a register operand another instruction. S3:
-        // CLFLUSH m8 (`/7`; with 66 CLFLUSHOPT, not advertised: #UD); f3 with a register operand RDFSBASE, RDGSBASE,
+        // CLFLUSH m8 (`/7`; since November 3 with 66 CLFLUSHOPT and `/6` with 66 CLWB, both advertised: the same transaction,
+        // the faults of a byte load, SDM Vol.2 each; CLFLUSHOPT with F2/F3 #UD); f3 with a register operand RDFSBASE, RDGSBASE,
         // WRFSBASE, WRGSBASE (`/0../3`), whose register forms without f3 are #UD.
         // I6: the x87 forms the resident executes: FNINIT, FNCLEX (`db e3`, `db e2`), FLDCW m16 (`d9 /5`), FLDENV/FNSTENV m
         // (`d9 /4`, `/6`) and FRSTOR/FNSAVE m (`dd /4`, `/6`), whose image is the 16-bit one with a 66 prefix (`size` 2, else 4),
@@ -386,14 +398,18 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
                 (_, 4) if rep == 0xf3 && !operand16 && !advertised(PT.unwrap()) => system::UD,
                 (1, 2) if !operand16 => system::LDMXCSR,
                 (1, 3) if !operand16 => system::STMXCSR,
-                // I5b: FXSAVE, FXRSTOR, XSAVE, XRSTOR (NP); /6 is XSAVEOPT (CPUID.(EAX=0DH,ECX=1):EAX.XSAVEOPT = 0) or with
-                // 66 CLWB (CPUID.7.0:EBX.CLWB = 0): #UD.
+                // I5b: FXSAVE, FXRSTOR, XSAVE, XRSTOR (NP); /6 is XSAVEOPT (CPUID.(EAX=0DH,ECX=1):EAX.XSAVEOPT, since November 3:
+                // XSAVE's transaction, which is what it stores with XINUSE and XMODIFIED all ones, SDM Vol.1 13.9) or with 66
+                // CLWB (CPUID.7.0:EBX.CLWB; with F2/F3 #UD here: F3 is CLRSSBSY, CET not advertised).
                 (1, 0) if !operand16 => system::FXSAVE,
                 (1, 1) if !operand16 => system::FXRSTOR,
                 (1, 4) if !operand16 => system::XSAVE,
                 (1, 5) if !operand16 => system::XRSTOR,
+                (1, 6) if operand16 && rep == 0 && advertised(CLWB.unwrap()) => system::CLFLUSH,
+                (1, 6) if !operand16 && rep == 0 && advertised(XSAVEOPT_BIT.unwrap()) => system::XSAVE,
                 (1, 6) => system::UD,
-                (1, 7) if operand16 => system::UD,
+                (1, 7) if operand16 && (rep != 0 || !advertised(CLFLUSHOPT.unwrap())) => system::UD,
+                (1, 7) if operand16 => system::CLFLUSH,
                 (1, 7) => system::CLFLUSH,
                 (0, 0..=3) if operand16 => return None, // 66 there: no SDM encoding (a stop, not a guess)
                 (0, 0..=3) if rep == 0xf3 => {
@@ -475,6 +491,10 @@ const AES: Option<Feature> = Some((1, 0, 2, 25));
 const MOVBE: Option<Feature> = Some((1, 0, 2, 22));
 const ADX: Option<Feature> = Some((7, 0, 1, 19));
 const SHA: Option<Feature> = Some((7, 0, 1, 29));
+const CLFLUSHOPT: Option<Feature> = Some((7, 0, 1, 23));
+const CLWB: Option<Feature> = Some((7, 0, 1, 24));
+const XSAVEOPT_BIT: Option<Feature> = Some((0xd, 1, 0, 0));
+const XSAVEC_BIT: Option<Feature> = Some((0xd, 1, 0, 1));
 const CET_SS: Option<Feature> = Some((7, 0, 2, 7));
 const GFNI: Option<Feature> = Some((7, 0, 2, 8));
 const KL: Option<Feature> = Some((7, 0, 2, 23));
@@ -1051,10 +1071,20 @@ mod tests {
         assert_eq!(d("0fae4e10", 0xae), Some(mem(FXRSTOR, 6, 0x10, 4))); // fxrstor [rsi+0x10]
         assert_eq!(d("0fae2424", 0xae), Some(mem(XSAVE, 4, 0, 4))); // xsave [rsp]
         assert_eq!(d("650fae2f", 0xae), Some(System { segment: 5, ..mem(XRSTOR, 7, 0, 4) })); // xrstor gs:[rdi]
-        assert_eq!(d("0fae30", 0xae), Some(System { kind: UD, length: 3, ..System::NONE })); // xsaveopt: not advertised
-        assert_eq!(d("660fae30", 0xae), Some(System { kind: UD, length: 4, ..System::NONE })); // clwb: not advertised
-        for hex in ["0fc718", "0fc720", "480fc728"] {
-            assert_eq!(d(hex, 0xc7).map(|s| s.kind), Some(UD), "{hex}"); // xrstors, xsavec, xsaves64
+        let xsaveopt = if super::advertised(super::XSAVEOPT_BIT.unwrap()) { Some(mem(XSAVE, 0, 0, 3)) } else { Some(System { kind: UD, length: 3, ..System::NONE }) };
+        assert_eq!(d("0fae30", 0xae), xsaveopt); // xsaveopt [rax]: XSAVE's transaction
+        assert_eq!(d("480fae7708", 0xae).map(|s| s.kind), xsaveopt.map(|s| s.kind)); // xsaveopt64 [rdi+8]
+        assert_eq!(d("f20fae30", 0xae).map(|s| s.kind), Some(UD));
+        let xsavec = super::advertised(super::XSAVEC_BIT.unwrap());
+        assert_eq!(d("0fc727", 0xc7), if xsavec { Some(System { size: 4, ..mem(XSAVEC, 7, 0, 3) }) } else { Some(System { kind: UD, length: 3, ..System::NONE }) }); // xsavec [rdi]
+        assert_eq!(d("480fc7642408", 0xc7).map(|s| s.kind), Some(if xsavec { XSAVEC } else { UD })); // xsavec64 [rsp+8]
+        assert_eq!(d("660fc727", 0xc7).map(|s| s.kind), if xsavec { None } else { Some(UD) }); // 66: not decoded
+        let ud4 = Some(System { kind: UD, length: 4, ..System::NONE });
+        let clwb = if super::advertised(super::CLWB.unwrap()) { Some(System { prefixes: 0, ..mem(CLFLUSH, 0, 0, 4) }) } else { ud4 };
+        assert_eq!(d("660fae30", 0xae), clwb); // clwb [rax]
+        assert_eq!(d("f3660fae30", 0xae).map(|s| s.kind), Some(UD)); // F3: CLRSSBSY (CET not advertised)
+        for hex in ["0fc718", "480fc728"] {
+            assert_eq!(d(hex, 0xc7).map(|s| s.kind), Some(UD), "{hex}"); // xrstors, xsaves64
         }
         assert_eq!(d("0fc708", 0xc7), None); // cmpxchg8b stays admitted
         for hex in ["660fae00", "f20fae28"] {
@@ -1199,7 +1229,10 @@ mod tests {
         assert_eq!(d("f20f09", 0x09), None);
         assert_eq!(d("0fae3b", 0xae), Some(mem(CLFLUSH, 3, 0, 3))); // clflush [rbx]
         assert_eq!(d("650fae7808", 0xae), Some(System { segment: 5, ..mem(CLFLUSH, 0, 8, 5) })); // clflush gs:[rax+8]
-        assert_eq!(d("660fae38", 0xae), k(UD, 4)); // clflushopt
+        let clflushopt = if super::advertised(super::CLFLUSHOPT.unwrap()) { Some(mem(CLFLUSH, 0, 0, 4)) } else { k(UD, 4) };
+        assert_eq!(d("660fae38", 0xae), clflushopt); // clflushopt [rax]
+        assert_eq!(d("f2660fae38", 0xae).map(|s| s.kind), Some(UD)); // SDM CLFLUSHOPT: #UD with F2/F3
+        assert_eq!(d("66f30fae38", 0xae).map(|s| s.kind), Some(UD));
         for hex in ["0f01c0", "0f01c5", "0f01c6", "f20f01e9", "0f01ca", "0f01cb", "0f01c8", "0f01c9", "0f01e8", "0f01ee", "0f01ef", "0f01c1", "0f01d9", "660f01cc", "f30f01fe", "f20f01ff", "f30f01ea", "f30f01e8", "f30f012b"] {
             assert_eq!(d(hex, 0x01), k(UD, hex.len() as u32 / 2), "{hex}");
         }
@@ -1210,14 +1243,19 @@ mod tests {
         assert_eq!(super::decode(&[0xf2, 0x0f, 0x78, 0xc1, 0x00, 0x3f], 3, 0x78), k(UD, 3));
         assert_eq!(super::decode(&[0xf2, 0x41, 0x0f, 0x79, 0xc0], 3, 0x79), k(UD, 4));
         assert_eq!(super::decode(&[0x66, 0x0f, 0x38, 0x82, 0x00, 0x90], MAP_0F38, 0x82), k(UD, 4)); // invpcid
-        // I9: MOVBE register forms, ADCX/ADOX, WRUSS: #UD; a memory MOVBE and CRC32 are never decoded here. SHA: #UD exactly
-        // while the profile does not advertise it.
+        // I9: MOVBE register forms, WRUSS: #UD; a memory MOVBE and CRC32 are never decoded here. ADCX/ADOX and SHA: #UD
+        // exactly while the profile does not advertise them.
         assert_eq!(super::decode(&[0x48, 0x0f, 0x38, 0xf0, 0xc1], MAP_0F38, 0xf0), k(UD, 5));
         assert_eq!(super::decode(&[0x66, 0x0f, 0x38, 0xf1, 0xc8], MAP_0F38, 0xf1), k(UD, 5));
         assert_eq!(super::decode(&[0x0f, 0x38, 0xf0, 0x07], MAP_0F38, 0xf0), None);
         assert_eq!(super::decode(&[0xf2, 0x0f, 0x38, 0xf0, 0xc1], MAP_0F38, 0xf0), None);
-        assert_eq!(super::decode(&[0x66, 0x48, 0x0f, 0x38, 0xf6, 0xc1], MAP_0F38, 0xf6), k(UD, 5));
-        assert_eq!(super::decode(&[0xf3, 0x48, 0x0f, 0x38, 0xf6, 0x07], MAP_0F38, 0xf6), k(UD, 5));
+        let adx = |n| if super::advertised(super::ADX.unwrap()) { None } else { k(UD, n) };
+        assert_eq!(super::decode(&[0x66, 0x48, 0x0f, 0x38, 0xf6, 0xc1], MAP_0F38, 0xf6), adx(5));
+        assert_eq!(super::decode(&[0xf3, 0x48, 0x0f, 0x38, 0xf6, 0x07], MAP_0F38, 0xf6), adx(5));
+        assert_eq!(super::decode(&[0x66, 0xf3, 0x0f, 0x38, 0xf6, 0xc1], MAP_0F38, 0xf6), adx(5));
+        assert_eq!(super::decode(&[0x0f, 0x38, 0xf6, 0xc1], MAP_0F38, 0xf6), k(UD, 3)); // wrss (NP; CET_SS not advertised)
+        assert_eq!(super::decode(&[0xf2, 0x0f, 0x38, 0xf6, 0xc1], MAP_0F38, 0xf6), k(UD, 4)); // a blank cell
+        assert_eq!(super::decode(&[0x66, 0xf2, 0x0f, 0x38, 0xf6, 0xc1], MAP_0F38, 0xf6), k(UD, 5)); // #UD on the AMD machine too
         let sha = if super::advertised(super::SHA.unwrap()) { None } else { k(UD, 3) };
         assert_eq!(super::decode(&[0x0f, 0x38, 0xcb, 0xc1], MAP_0F38, 0xcb), sha);
         assert_eq!(super::decode(&[0x0f, 0x3a, 0xcc, 0xc1, 0x01], MAP_0F3A, 0xcc), sha);

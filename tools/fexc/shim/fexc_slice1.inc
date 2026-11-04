@@ -109,17 +109,18 @@ inline Verdict Two(uint8_t op, bool plain, bool has_modrm, uint8_t mod, uint8_t 
   case 0xA2: return Sys("cpuid");
   case 0xB2: case 0xB4: case 0xB5: return Sys("lss/lfs/lgs");
   case 0xAE:
-    if (has_modrm && mod != 3 && reg == 7) return Sys("clflush/clflushopt (cache maintenance)");
+    if (has_modrm && mod != 3 && reg == 7) return Sys("clflush/clflushopt (cache maintenance: the resident's)");
     if (has_modrm && mod == 3 && reg < 4) return Sys("rd/wr fs/gs base");
-    // I5b: fxsave/fxrstor and xsave/xrstor m (the resident's transactions); /6 m is xsaveopt, (66) clwb or (F3) clrssbsy,
-    // none advertised (#UD). With F3, /4 m is ptwrite (not advertised either), which the host does not decode (a stop).
+    // I5b: fxsave/fxrstor and xsave/xrstor m (the resident's transactions); /6 m is xsaveopt and (66) clwb (both advertised
+    // since November 3: the resident's) or (F3) clrssbsy (#UD). With F3, /4 m is ptwrite (not advertised), which the host
+    // does not decode (a stop).
     if (has_modrm && mod != 3 && (reg <= 1 || (reg >= 4 && reg <= 6)))
-      return Sys("fxsave/fxrstor/xsave/xrstor m, xsaveopt/clwb/clrssbsy m (#UD), or (F3 /4) ptwrite (not decoded)");
+      return Sys("fxsave/fxrstor/xsave/xrstor/xsaveopt/clwb m (the resident's), clrssbsy m (#UD), or (F3 /4) ptwrite (not decoded)");
     return Uns("ldmxcsr/stmxcsr with a prefix, a fence with another ModRM");
   // rdrand (/6), rdseed and rdpid (/7, F3): the entropy service and TSC_AUX are the resident's (S3).
   case 0xC7:
     if (has_modrm && mod == 3 && reg >= 6) return Sys("rdrand/rdseed/rdpid");
-    if (has_modrm && mod != 3 && reg >= 3 && reg <= 5) return Sys("xrstors/xsavec/xsaves (not advertised: #UD)");
+    if (has_modrm && mod != 3 && reg >= 3 && reg <= 5) return Sys("xsavec (the resident's), xrstors/xsaves (not advertised: #UD)");
     break;
   default: break;
   }
@@ -500,19 +501,29 @@ inline bool Lockable(const DecodedInst& d, bool has_modrm, uint8_t mod, uint8_t 
   return false;
 }
 
-// I9: 0f 38 / 0f 3a forms the presented CPU raises #UD for whatever their operands (cpu_profile.json): ADCX (66 0f 38 f6) and
-// ADOX (F3 0f 38 f6; CPUID.7.0:EBX.ADX[19] = 0), WRSS (NP 0f 38 f6) and WRUSS (66 0f 38 f5; CPUID.7.0:ECX.CET_SS[7] = 0) and the
-// rest of 0f 38 f5/f6, and MOVBE with a register operand (SDM MOVBE: #UD; SHA is advertised since November 3: `Sse`). The prefixes from the decoder's flags (set before a decode failure too). The host decodes each as `system::UD`;
-// I10: F3 0f 38 f0/f1 (MOVBE with REP: #UD) is a `ud` cut (FEX's decode fails before its ModRM).
-inline Verdict Undefined0F38(const DecodedInst& d, bool has_modrm, uint8_t mod) {
+// I9: 0f 38 / 0f 3a forms the presented CPU raises #UD for whatever their operands (cpu_profile.json): WRSS (NP 0f 38 f6) and
+// WRUSS (66 0f 38 f5; CPUID.7.0:ECX.CET_SS[7] = 0) and the rest of 0f 38 f5/f6, and MOVBE with a register operand (SDM MOVBE:
+// #UD; SHA is advertised since November 3: `Sse`). ADX (CPUID.7.0:EBX.ADX[19]) is advertised since November 3: ADCX (66 0f 38
+// f6) and ADOX (F3 0f 38 f6; with 66 too, in either order: 66 ignored, as on the reference AMD machine, patch 0030) compile
+// (`Classify`); with F2 still cut (the host decodes F2 before F3 as a stop, F2 last and NP as #UD). The prefixes from the decoder's flags (set before a decode failure
+// too). The host decodes each as `system::UD`; I10: F3 0f 38 f0/f1 (MOVBE with REP: #UD) is a `ud` cut (FEX's decode fails
+// before its ModRM).
+inline Verdict Undefined0F38(const DecodedInst& d, bool decoded, bool has_modrm, uint8_t mod) {
   const uint8_t op = d.OPRaw;
   const uint32_t f = d.Flags;
   const bool pf2 = f & DecodeFlags::FLAG_REPNE_PREFIX, pf3 = f & DecodeFlags::FLAG_REP_PREFIX;
   if (d.FexcMap == FEXC_MAP_0F38) {
+    // ADCX/ADOX (advertised): `Classify`. The prefixes from the bytes (FEX's decoder clears FLAG_OPERAND_SIZE for ADCX's 66).
+    if (op == 0xF6 && decoded) {
+      const uint8_t* b = fexc_guest_bytes ? fexc_guest_bytes(d.PC, d.InstSize) : nullptr;
+      bool b66 = false, bf2 = false, bf3 = false;
+      for (unsigned i = 0; b && i < d.InstSize && b[i] != 0x0F; ++i) { b66 |= b[i] == 0x66; bf2 |= b[i] == 0xF2; bf3 |= b[i] == 0xF3; }
+      if (b && !bf2 && (b66 || bf3)) return {UNSUPPORTED, false, nullptr};
+    }
     if ((op == 0xF0 || op == 0xF1) && !pf2 && !pf3 && has_modrm && mod == 3) return Sys("movbe with a register operand (#UD)");
     // I10: SDM MOVBE "#UD ... If REP (F3H) prefix is used" (FEX's decoder fails before the ModRM: any operand).
     if ((op == 0xF0 || op == 0xF1) && pf3) return Ud("movbe with an F3 prefix (#UD)");
-    if (op == 0xF5 || op == 0xF6) return Sys("adcx/adox, wrss/wruss (ADX, CET_SS not advertised: #UD)");
+    if (op == 0xF5 || op == 0xF6) return Sys("wrss/wruss (CET_SS not advertised: #UD), 0f 38 f6 with F2 or with 66 and F3");
   }
   return {UNSUPPORTED, false, nullptr};
 }
@@ -528,7 +539,7 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   // its ModRM when that was decoded, else only from an opcode no lockable form has.
   if ((f & DecodeFlags::FLAG_LOCK) && (decoded || has_modrm ? !Lockable(d, has_modrm, mod, reg) : !Lockable(d, false, 0, 0, true)))
     return Sys("LOCK prefix on an instruction that is not lockable (#UD)");
-  Verdict v = Undefined0F38(d, has_modrm, mod);
+  Verdict v = Undefined0F38(d, decoded, has_modrm, mod);
   if (v.why) return v;
   {
     // I10, #UD whatever the gating (decode faults come first, SDM Vol.3 Table 6-2):
@@ -573,11 +584,15 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
     // I9: MOVBE m (CPUID.1:ECX.MOVBE[22]; 0f 38 f0 load, f1 store, 66 for 16 bits): FEX's plain load or store plus REV, so the
     // site, #PF/#GP/#SS and (natively, SCTLR.A) #AC are an ordinary access's. Not gated by CR0/CR4 (a general-register form).
     if (map == 5 && !pf2 && !pf3 && (op == 0xF0 || op == 0xF1) && has_modrm && mod != 3) v = Allow();
+    // ADX (November 3, CPUID.7.0:EBX.ADX[19]): ADCX (66 0f 38 f6) and ADOX (F3 0f 38 f6), r32/r64 (REX.W), r/m: FEX's ADXOp, an
+    // Arm ADC whose carry-in is CF (ADCX) or OF moved into C (ADOX); the other flags are restored from the NZCV before it (RMIF),
+    // PF/AF untouched. A general-register form (not gated by CR0/CR4); LOCK is #UD (above, not lockable).
+    else if (map == 5 && op == 0xF6 && !pf2 && (p66 || pf3) && has_modrm) v = Allow();
     else if (v = Mmx(map, pfx, op, has_modrm, mod, reg); v.why == nullptr) v = Sse(map, pfx, op, has_modrm, mod, reg);
     else if (v.mmx && v.kind != ALLOW && fexc_x87_gated) { v = Sys("MMX gated by CR0.EM/TS (#UD/#NM)"); v.mmx = true; v.gated = true; return v; }
     if (v.why == nullptr) v = {UNSUPPORTED, false, nullptr};
     // (FEX decodes the 0f 71..73 shift groups through its group table, keyed by the prefix itself, and reports map 1.)
-    else if (v.kind == ALLOW && ((pf2 && pf3) || ((pf2 || pf3) && p66)))
+    else if (v.kind == ALLOW && ((pf2 && pf3) || ((pf2 || pf3) && p66)) && !(map == 5 && op == 0xF6))
       v = Uns("SSE form with several mandatory prefixes (66 with F2/F3, or F2 with F3)");
     else if (v.kind == ALLOW && map == 1 && fexpfx != pfx && !(op >= 0x71 && op <= 0x73))
       v = Uns("SSE form FEX decoded under another mandatory prefix");
@@ -700,8 +715,9 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   // LOOP/LOOPcc/JrCXZ (BND does not apply there).
   const bool bnd = v.branch && !(primary && d.OPRaw >= 0xE0 && d.OPRaw <= 0xE3);
   if ((f & DecodeFlags::FLAG_REPNE_PREFIX) && !compare && !bnd) return Uns(string ? "REPNE prefix on movs/stos/lods" : "REPNE prefix");
-  // rep ret is a ret; F3 90 (no REX.B: that would be xchg r8, rax) is PAUSE, FEX's `yield`.
-  if ((f & DecodeFlags::FLAG_REP_PREFIX) && !string && !(primary && (op == 0xC3 || (op == 0x90 && !(f & DecodeFlags::FLAG_REX_XGPR_B)))))
+  // rep ret is a ret; F3 90 (no REX.B: that would be xchg r8, rax) is PAUSE, FEX's `yield`; F3 0f 38 f6 is ADOX (mandatory).
+  const bool adox = d.FexcMap == FEXC_MAP_0F38 && op == 0xF6;   // admitted above only with F3 alone
+  if ((f & DecodeFlags::FLAG_REP_PREFIX) && !string && !adox && !(primary && (op == 0xC3 || (op == 0x90 && !(f & DecodeFlags::FLAG_REX_XGPR_B)))))
     return Uns("REP prefix");
   // Segment prefixes in 64-bit mode (I7), all admitted. FS/GS: FEX adds fs_cached/gs_cached (guest-state page loads) to the
   // effective address of the explicit memory operand (ModRM, moffs, XLAT, the DS:RSI source of movs/cmps/lods), as x86 adds

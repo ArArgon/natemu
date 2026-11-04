@@ -1385,9 +1385,9 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             x87::transaction(s, i)?;
             return Ok(commit(s, i, false));
         }
-        // I5b: FXSAVE/FXRSTOR, XSAVE/XRSTOR, XGETBV/XSETBV ([`xsave`]; XSETBV checks its CPL). No flush: FCW and MXCSR are
-        // keyed in `Cpu::code_context`, and XCR0 gates no admitted form.
-        system::FXSAVE..=system::XSETBV => {
+        // I5b: FXSAVE/FXRSTOR, XSAVE/XRSTOR, XGETBV/XSETBV, XSAVEC ([`xsave`]; XSETBV checks its CPL). No flush: FCW and MXCSR
+        // are keyed in `Cpu::code_context`, and XCR0 gates no admitted form.
+        system::FXSAVE..=system::XSAVEC => {
             xsave::transaction(s, i)?;
             return Ok(commit(s, i, false));
         }

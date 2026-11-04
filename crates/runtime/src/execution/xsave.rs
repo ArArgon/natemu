@@ -1,6 +1,12 @@
-//! FXSAVE/FXRSTOR, XSAVE/XRSTOR and XGETBV/XSETBV (I5b; SDM Vol.1 10.5 and 13, Vol.2 each instruction), as the profile
-//! advertises them (CPU 16): XSAVE with XCR0 ⊆ x87 | SSE | AVX (CPUID.0DH.0:EAX = 7), the standard format only (CPUID.0DH.1:EAX
-//! = 0: no XSAVEOPT, XSAVEC, XGETBV with ECX = 1, XSAVES; those forms are #UD by the host's decode). The images:
+//! FXSAVE/FXRSTOR, XSAVE/XRSTOR, XSAVEOPT, XSAVEC and XGETBV/XSETBV (I5b; SDM Vol.1 10.5 and 13, Vol.2 each instruction), as
+//! the profile advertises them (CPU 16): XSAVE with XCR0 ⊆ x87 | SSE | AVX (CPUID.0DH.0:EAX = 7); since November 3 XSAVEOPT and
+//! the compaction extensions (CPUID.0DH.1:EAX = 3: XSAVEC, the compacted form of XRSTOR); no XGETBV with ECX = 1, XSAVES or
+//! XRSTORS (#UD by the host's decode). XSAVEOPT is XSAVE's transaction (the host decodes it so): XINUSE and XMODIFIED are all
+//! ones (a processor that does not implement the init and modified optimizations "implicitly maintains" them so, Vol.1 13.6,
+//! 13.8.3), so it saves every component of RFBM and sets those XSTATE_BV bits, exactly XSAVE (MXCSR with RFBM[1] or RFBM[2]
+//! for both, 13.9). XSAVEC (13.10) stores the same component bytes, with MXCSR/MXCSR_MASK only for RFBM[1], AVX at 576 (the
+//! first and only extended component; CPUID.0DH.2:ECX[1] = 0), XSTATE_BV := RFBM and XCOMP_BV := 2^63 | RFBM, and no other
+//! header byte; it does not read XSTATE_BV. The images:
 //! - legacy region (FXSAVE's 512 bytes, XSAVE's first 512): FCW, FSW, the abridged tag byte (byte 5 0), FOP/FIP/FCS/FDP/FDS 0
 //!   (not modelled, plan I6 deviation 8: so FXSAVE and REX.W's FXSAVE64 store the same bytes), MXCSR, MXCSR_MASK FFFFH,
 //!   ST0..ST7 as 80-bit values widened exactly from the doubles at 32 + 16i (bytes 10..15 of each slot 0), XMM0..15 at 160;
@@ -28,6 +34,17 @@ const LEGACY: usize = 416;
 const HEADER: usize = 512;
 const AVX: usize = 576;
 const AREA: usize = AVX + 256;
+const COMPACTED: u64 = 1 << 63;
+/// CPUID.(EAX=0DH,ECX=1):EAX.XSAVEC[1] of the generated profile: the compacted form of XRSTOR is #GP(0) without it.
+const XSAVEC: bool = {
+    let (mut k, mut on) = (0, false);
+    while k < cpu_profile::CPUID.len() {
+        let (leaf, sub, regs) = cpu_profile::CPUID[k];
+        on |= leaf == 0xd && sub == 1 && regs[0] & 2 != 0;
+        k += 1;
+    }
+    on
+};
 
 /// Executes FXSAVE ..= XSETBV (any CPL but XSETBV's; LOCK is #UD before this). `Ok`: committed, RIP moves past it.
 #[inline(never)]
@@ -38,7 +55,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     if !fx && cr4 & CR4_OSXSAVE == 0 {
         return Err(UD);
     }
-    if matches!(i.kind, system::FXSAVE..=system::XRSTOR) && cr0 & if fx { CR0_TS | CR0_EM } else { CR0_TS } != 0 {
+    if matches!(i.kind, system::FXSAVE..=system::XRSTOR | system::XSAVEC) && cr0 & if fx { CR0_TS | CR0_EM } else { CR0_TS } != 0 {
         return Err(NM);
     }
     let rfbm = xcr0 & (rdx << 32 | rax & 0xffff_ffff);
@@ -49,8 +66,8 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     }
     // The canonical check (#GP(0), or #SS(0) for an SS-class reference; a range wrapping past 2^64 is non-canonical) is
     // made on each range below before its walk, by `linear` and `pages`: FX* bytes 0..415, XSAVE the span from its first
-    // to its last stored byte, XRSTOR first the base through the header (the base checked though only the header is read
-    // then), then each part it restores.
+    // to its last stored byte, XRSTOR first the base through the header's 64 bytes (the base checked though only the header
+    // is read then), then each part it restores.
     let mut img = [0u8; AREA];
     let word = |img: &[u8], at: usize| u64::from_le_bytes(img[at..at + 8].try_into().unwrap());
     match i.kind {
@@ -65,18 +82,20 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             s.cpu.mxcsr = mxcsr;
             load_xmm(&mut s.cpu, Some(&img));
         }
-        system::XSAVE => {
+        system::XSAVE | system::XSAVEC => {
+            let compact = i.kind == system::XSAVEC;
             legacy(&s.cpu, &mut img);
             for q in 0..32 {
                 img[AVX + 8 * q..AVX + 8 * q + 8].copy_from_slice(&ymm_hi(q).to_le_bytes());
             }
-            // The parts RFBM selects (MXCSR and MXCSR_MASK with SSE or AVX), then XSTATE_BV.
+            // The parts RFBM selects (MXCSR and MXCSR_MASK with SSE or, for XSAVE, AVX), then XSTATE_BV (and XSAVEC's
+            // XCOMP_BV).
             let parts: [(bool, usize, usize); 6] = [
                 (rfbm & 1 != 0, 0, 24),
                 (rfbm & 1 != 0, 32, 160),
-                (rfbm & 6 != 0, 24, 32),
+                (rfbm & if compact { 2 } else { 6 } != 0, 24, 32),
                 (rfbm & 2 != 0, 160, LEGACY),
-                (true, HEADER, HEADER + 8),
+                (true, HEADER, HEADER + if compact { 16 } else { 8 }),
                 (rfbm & 4 != 0, AVX, AREA),
             ];
             let (lo, hi) = parts.iter().filter(|p| p.0).fold((AREA, 0), |(lo, hi), p| (lo.min(p.1), hi.max(p.2)));
@@ -88,8 +107,13 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             if !mmio::ram(gpa[0]) || (crosses && !mmio::ram(gpa[1])) {
                 mmio::system_access(s)
             }
-            linear(s, va.wrapping_add(HEADER as u64), &mut img[HEADER..HEADER + 8], false, false, nc)?;
-            let bv = word(&img, HEADER) | rfbm;
+            let bv = if compact {
+                img[HEADER + 8..HEADER + 16].copy_from_slice(&(COMPACTED | rfbm).to_le_bytes());
+                rfbm
+            } else {
+                linear(s, va.wrapping_add(HEADER as u64), &mut img[HEADER..HEADER + 8], false, false, nc)?;
+                word(&img, HEADER) | rfbm
+            };
             img[HEADER..HEADER + 8].copy_from_slice(&bv.to_le_bytes());
             for &(on, from, to) in &parts {
                 if on {
@@ -98,29 +122,40 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             }
         }
         system::XRSTOR => {
-            // The header is read first, but its canonical check starts at the area's base: a non-canonical base is
-            // #GP/#SS before a #PF on the header's page.
-            let last = va.wrapping_add(HEADER as u64 + 23);
+            // The header (all 64 bytes, in the area's first page with the 64-byte alignment) is read first, but its canonical
+            // check starts at the area's base: a non-canonical base is #GP/#SS before a #PF on the header's page.
+            let last = va.wrapping_add(HEADER as u64 + 63);
             if !paging::canonical(va) || !paging::canonical(last) || last < va {
                 return Err(nc);
             }
-            linear(s, va.wrapping_add(HEADER as u64), &mut img[HEADER..HEADER + 24], false, false, nc)?;
+            linear(s, va.wrapping_add(HEADER as u64), &mut img[HEADER..AVX], false, false, nc)?;
             let (bv, comp, reserved) = (word(&img, HEADER), word(&img, HEADER + 8), word(&img, HEADER + 16));
-            // Standard form only (XCOMP_BV[63] = 1 is the compacted form: #GP without XSAVEC); XSTATE_BV within XCR0, header
-            // bytes 23:8 zero.
-            if bv & !xcr0 != 0 || comp != 0 || reserved != 0 {
+            let compact = comp & COMPACTED != 0;
+            // Standard form (13.8.1): XSTATE_BV within XCR0, header bytes 23:8 zero (24..63 not checked). Compacted form
+            // (13.8.2; #GP without XSAVEC): XCOMP_BV[62:0] within XCR0, XSTATE_BV within XCOMP_BV[62:0], bytes 63:16 zero.
+            // XSTATE_BV[63] (a reserved bit; the SDM's "including bit 63" read literally lets it pass, since XCOMP_BV[63] is
+            // set) is #GP(0), as on the reference AMD machine (gen_xsave.py's probe).
+            if if compact {
+                !XSAVEC || comp & !COMPACTED & !xcr0 != 0 || bv & !(comp & !COMPACTED) != 0 || img[HEADER + 16..AVX].iter().any(|&b| b != 0)
+            } else {
+                bv & !xcr0 != 0 || comp != 0 || reserved != 0
+            } {
                 return Err(GP);
             }
-            let restore = rfbm & bv;
-            let lo = if restore & 1 != 0 { 0 } else if rfbm & 6 != 0 { 24 } else { LEGACY };
-            let hi = if restore & 2 != 0 { LEGACY } else if restore & 1 != 0 { 160 } else if rfbm & 6 != 0 { 32 } else { LEGACY };
+            // Compacted: a component of RFBM outside XCOMP_BV is initialized (FORCE_INIT); AVX, the only extended one, is
+            // at 576 when XCOMP_BV has it. MXCSR is SSE state there: loaded with it, else 1F80H when SSE is initialized
+            // (RFBM[2] plays no part); the standard form loads it for RFBM[1] or RFBM[2] whatever XSTATE_BV.
+            let restore = rfbm & bv & if compact { comp } else { !0 };
+            let mx = if compact { restore & 2 != 0 } else { rfbm & 6 != 0 };
+            let lo = if restore & 1 != 0 { 0 } else if mx { 24 } else { LEGACY };
+            let hi = if restore & 2 != 0 { LEGACY } else if restore & 1 != 0 { 160 } else if mx { 32 } else { LEGACY };
             if lo < hi {
                 linear(s, va.wrapping_add(lo as u64), &mut img[lo..hi], false, false, nc)?;
             }
             if restore & 4 != 0 {
                 linear(s, va.wrapping_add(AVX as u64), &mut img[AVX..AREA], false, false, nc)?;
             }
-            let mxcsr = if rfbm & 6 != 0 { Some(mxcsr(&img)?) } else { None };
+            let mxcsr = if mx { Some(mxcsr(&img)?) } else if compact && rfbm & 2 != 0 { Some(MXCSR_RESET) } else { None };
             if restore & 1 != 0 {
                 load_x87(s, &img);
             } else if rfbm & 1 != 0 {
