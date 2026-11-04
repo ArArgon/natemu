@@ -87,3 +87,53 @@ commit per patch, rebased onto upstream on a fixed cadence with the standing sui
 fork's commit; the shim and fexc front end stay in natemu; the first fork build must be byte-identical to the current compiler;
 general fixes offered upstream. Needs the owner to create the fork (this session's GitHub access covers arargon/natemu only).
 Not scheduled (owner, November 4): deferred until the owner or the orchestrator judges it necessary.
+
+## Baseline (November 4)
+
+HEAD 1be744d (clean), the `natemu` stub (`-p natemu`, signed), series49-sha, cache off, `mitigations=off nokaslr`, 2 GiB; QEMU
+11.1.2 TCG with the like-for-like flags (`+sha-ni`); the benchmarks of `natemu-raw/bench-20261103-01/`; wall seconds from the
+START to the END line on the serial console (boot excluded), median of three runs, one emulator at a time (none contended,
+every run's VERIFY line ok). Records, scripts and the full table (ranges, QEMU `thread=single` at N = 1 and 4, zstd phases,
+per-vCPU breakdowns): `natemu-raw/bench-baseline-20261104-01/` (`table.md`, `runs.jsonl`, `perf/`, `dupes.json`).
+
+| Benchmark, seconds | | N = 1 | N = 2 | N = 3 | N = 4 |
+| --- | --- | --- | --- | --- | --- |
+| `build` | natemu | **did not finish** (>2400 s) | 59.3 (48-121) | 73.9 (41-88) | 51.1 (35-119) |
+| | QEMU multi | 28.3 | 15.3 | 13.5 | 12.5 |
+| | native | 2.61 | 1.40 | 1.20 | 1.09 |
+| `zstd` (all phases) | natemu | 2.26 | 1.74 | 1.63 | 1.71 |
+| | QEMU multi | 17.5 | 11.5 | 8.65 | 7.29 |
+| | native | 1.06 | 0.69 | 0.58 | 0.50 |
+| `hackbench` | natemu | 53.8 | 27.9 | 19.6 | 15.2 |
+| | QEMU multi | 16.4 | 8.87 | 6.41 | 5.08 |
+| | native | 3.88 | 2.08 | 1.65 | 1.65 |
+| `locks` | natemu | 16.7 | 8.90 | 6.62 | 5.81 |
+| | QEMU multi | 11.0 | 33.2 | 26.1 | 27.5 |
+| | native | 2.11 | 1.32 | 3.59 | 4.20 |
+
+Speedup N = 1 to N = 4 (natemu / QEMU multi / native): `zstd` 1.33 / 2.41 / 2.10 (compress alone 1.65 → 1.00 s, 1.65x);
+`hackbench` 3.54 / 3.23 / 2.36; `locks` 2.87 / 0.40 / 0.50 (natemu does not show the contention slowdown that native and
+QEMU show); `build` none (no N = 1). natemu / QEMU multi time ratio: `zstd` 0.13-0.23 (natemu 4-8x faster), `hackbench`
+3.0-3.3, `locks` 1.52 at N = 1 then 0.2-0.3, `build` 3.9-5.5. natemu / native: `zstd` 2.1-3.4x, `hackbench` 9-14x, `locks`
+1.4-7.9x. QEMU `thread=single` at N = 4: `build` 30.2, `zstd` 20.4, `hackbench` 22.7, `locks` 11.1 s.
+
+**Findings.**
+1. `build` at N = 1 does not finish in 40 minutes, and at N = 2-4 takes 35-121 s for the same work (run to run). Cause, from the perf resident: the per-vCPU link table (64 K records) fills, and each new link
+   then runs `prune` over every record (551 k reclaims in 120 s at N = 1); `cache::link` is 111.7 of 117.6 s of the vCPU
+   thread's CPU (bucket `patch`). At N = 4 the bucket is 14.5-17.8 s of each vCPU's 26-29 s CPU. Fixing this comes before
+   any other multi-core item: it is larger than every cost below.
+2. `zstd` compress scales 1.65x at N = 4 against 2.5x natively; decompress (one thread) is 0.27-0.33 s against 0.07 s
+   natively; the verify phase (0.34-0.39 s) is 4-5x native; the run is 2.1-3.4x native overall. Boot to START is 3.4-4.9 s
+   (QEMU 2.1-3.0 s).
+3. Per-vCPU at N = 4 (the perf runs include the 3-5 s boot): halted time is 2.2-2.4 s of 20 s wall in `hackbench`, 2.3-2.7 s
+   of 10.8 s in `locks`, 3.0-3.4 s of 6.5 s in `zstd`, 7.5-9.5 s of 40 s in `build`; thread CPU 15.9-16.9 s (hackbench),
+   6.3-7.6 s (locks), 1.5-2.3 s (zstd vCPUs 1-3). Biggest resident buckets: `hackbench` `link` 4.1-4.3 s and `system` 2.5 s
+   per vCPU, `locks` `link` 1.7 s, `build` `patch` 14.5-17.8 s (finding 1), `zstd` almost none (the vCPUs wait). Host
+   requests 33-85 k and compiles 33-68 k per vCPU in `hackbench` and `locks` (translation 0.75-1.5 s of host time each);
+   vCPU 0 makes 1.5-2x the requests and compiles of vCPUs 1-3 everywhere.
+4. Installer, N = 4, cache off (10.09 s with the log): 306,755 compiles; 133,439 (43%) compile a block (same RIP, bytes,
+   context) that another vCPU compiled too, 172,765 (56%) by the reuse key ignoring the RIP; 174,507 placements are the
+   later vCPUs' first placement of a template another vCPU already holds; the logs have no start times, so overlap in time
+   is not known. vCPU thread CPU is 2.4-3.8 s of 10 s wall (halted 4.8-5.5 s). Whether threads land on efficiency cores
+   cannot be seen without root (`powermetrics`); the machine has 4 performance and 6 efficiency cores, and at N = 4 the four
+   vCPU threads and up to four compile servers compete for the four performance cores.
