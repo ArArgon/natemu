@@ -70,3 +70,12 @@ Disks, network and console input as virtio devices with interrupt coalescing.
 ## Owner-deferred items
 
 Raising and testing RAM beyond 3 GiB and vCPUs beyond 4.
+
+## CPU profile additions (owner, November 3)
+
+SHA-NI (in progress), then ADX, CLFLUSHOPT/CLWB, XSAVEOPT/XSAVEC, and SMEP, SMAP, UMIP: each exact per the SDM, tested
+against the reference AMD machine, added only with adequate Arm-side support and without severe regression (measured
+before/after on the installer and the phase-2 benchmarks); the like-for-like QEMU control's `-cpu` flags follow every
+profile change. Order is the orchestrator's: ADX, CLFLUSHOPT/CLWB and XSAVEOPT/XSAVEC first (cheap); SMEP and UMIP next
+(fetch-walk and resident checks); SMAP last and only if its cost is acceptable — translated kernel code runs at EL0, so
+Arm PAN does not apply directly and STAC/CLAC (around every user copy) would switch shadow spaces.
