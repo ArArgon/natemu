@@ -22,8 +22,9 @@ tools/bench/smp/irqs.py).
   line routed to its neighbour, K edge then K level rounds each with a pseudo-random 0..255 us delay: every target counts
   exactly K + K deliveries of each source and K + K completions (no edge lost or doubled, one delivery per level
   assertion window with its EOI).
-- `halt` (natemu only): X3's rule for ending halted vCPUs with an asynchronous source: a vCPU halted until a 50 ms request
-  fires reaches its end (the request vetoes the decision); the negative control `--irq-source-no-veto` ends it `halted`.
+- `halt` (natemu only): X3's rule for ending halted vCPUs with an asynchronous source: a vCPU halted until a 60 ms request
+  fires reaches its end (the request vetoes the decision); the negative control `--irq-source-no-veto` ends it `halted`;
+  and with `--watchdog-ms 20` it still reaches its end (the watchdog never forces a halted vCPU out).
 - `lint1` (natemu only): the board's NMI input (LINT1) pulsed by the test source: an NMI with LVT LINT1 unmasked in NMI
   mode, none while it is masked (2 NMIs of 3 pulses).
 
@@ -188,9 +189,10 @@ def cmd_stress(a, report):
 def cmd_halt(a, report):
     failures = []
     prog, _ = irqs.halt_program()
-    for veto in (True, False):
-        label = f"{prog['name']}-{'veto' if veto else 'no-veto'}"
-        extra = ['--irq-source', hex(irqs.SOURCE)] + ([] if veto else ['--irq-source-no-veto'])
+    # Perf chunk 7 review: and with a 20 ms watchdog, shorter than the 60 ms halt: a halted vCPU is idle, never forced out.
+    for veto, watchdog in ((True, None), (False, None), (True, 20)):
+        label = f"{prog['name']}-{'veto' if veto else 'no-veto'}" + (f'-watchdog{watchdog}' if watchdog else '')
+        extra = ['--irq-source', hex(irqs.SOURCE)] + ([] if veto else ['--irq-source-no-veto']) + (['--watchdog-ms', str(watchdog)] if watchdog else [])
         out, problems = run_natemu(a, prog, a.out / 'work' / label, extra, reached=veto)
         if out is not None:
             c0 = out['cpus'][0]

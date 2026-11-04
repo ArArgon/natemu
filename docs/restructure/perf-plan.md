@@ -1,6 +1,6 @@
 # Performance phase plan (draft)
 
-Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review; chunks 1-5 measured below (chunk 5 uncommitted on d89bc4c). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
+Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review; chunks 1-5 and 7 measured below (chunk 5 uncommitted on d89bc4c, chunk 7 on 0da552a). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
 code, measured first; the correctness pass follows. Principles: measure first; native mechanisms; nothing keyed to
 Linux (a KASLR boot must gain too); every object still admitted; checks green; no debt.
 
@@ -485,6 +485,66 @@ controls), `run_x1.py` 6/6 and 196/196, `run_i5c.py` 255, `run_r1.py r1a` 7/7 an
 `run_boot_smoke.py` 4/4, and the rest of the block with exit 0. On the final build: `cargo test` both ways, the stack check,
 `run_k1.py` (200 cases, with the extended `contexts`), `run_k2.py`, fixtures at both block sizes, `run_boot_smoke.py` 4/4; all 33 installer boots of `step1/`, `step3/`
 and `flush/` reached the dialog.
+
+### Measured (chunk 7: host per-request cleanups, November 3; uncommitted on 0da552a, series48-lean)
+
+**Built** (host only; fexc and the resident unchanged; the study is the per-request host work at 0da552a, chunk 5's
+breakdown). `execution::run`: the watchdog no longer gets a channel send at every entry and exit (each woke its thread:
+a cross-core wake twice per exit). The vCPU stores its entry time (`perf::now`) into an atomic before `hv_vcpu_run` and 0
+after; the watchdog thread sleeps until that entry's deadline (entry + `watchdog`) and, if the same entry is still in the
+guest and the vCPU is not halted, forces it out and repeats every 100 ms, as before (halted: it waits `watchdog`, then
+100 ms after a first kick, again, as before); in the host it looks again after `watchdog` (at least 1 ms); the run's end
+drops a channel sender, which wakes and ends it. `Requests::rips` (a set of every block RIP, about 1 M entries on the
+installer) is kept only when the caller asks (`Some`: the program driver, which reports it). The guest bytes are copied
+with volatile 8-byte loads where aligned into one buffer, not a zeroed `Vec` per page and a volatile byte loop
+(`copy_out`, checked against `GuestRam::copy_out` at every alignment). The memory cache: one pass over the leading-byte
+lengths (each bucket of each generation looked up once, an answer kept for the requested RIP still first), the entry
+looked up once in `reuse`, and its hash is Thorup's strongly universal multiply-shift for vectors (128-bit keys from a
+`RandomState` per map) instead of SipHash: the keys are guest-chosen (bytes, page offsets), but the guest never sees a
+hash, so they collide no more than by chance (no quadratic buckets). Performance log: a part `relocate` (relocating an
+answer kept for another RIP), so `admit` is admission alone (in the vCPU line; the request line keeps its nine parts).
+Every object still goes through full admission. Not changed (measured small): the x87 argument `Vec` and the breakpoint
+`Vec` (empty, so no allocation, on the boots), the `State` record's copies (the whole exit read is 0.08 s at N = 1).
+
+**Measured** (chunk 1's method and scripts, `natemu-raw/perf7-20261103-01/`: `campaign7.sh`, `runs/`, `table7.txt`;
+installer to "Select a language", 2 GiB, `mitigations=off nokaslr`, cache off, one VM at a time, a warm-up boot each, three
+interleaved rounds before (0da552a) and after; mean, min-max; parts in s, log on):
+
+| Installer, cache off | N = 1 before | N = 1 after | N = 4 before | N = 4 after |
+| --- | --- | --- | --- | --- |
+| Wall s, log off | 17.76 (17.60-17.83) | **15.85** (15.72-15.96) | 15.68 (15.43-15.96) | **13.56** (13.45-13.63) |
+| Wall s, log on | 19.03 | 17.01 | 16.61 | 14.28 |
+| "Run /init" guest s (log off) | 3.62 | 3.29 | 5.00 | 4.51 |
+| Exit bookkeeping (`signal`), all threads | 0.855 | 0.042 | 1.475 | 0.060 |
+| Bytes copy (`fetch`), all threads | 0.466 | 0.200 | 0.589 | 0.274 |
+| Memory lookup, all threads | 0.386 | 0.235 | 0.488 | 0.293 |
+| Staging (the RIP set was inside it), all threads | 0.147 | 0.016 | 0.172 | 0.021 |
+| Admission (before: with relocation) / relocation, all threads | 1.323 / - | 0.970 / 0.249 | 1.785 / - | 1.270 / 0.285 |
+| vCPU 0 `hv_vcpu_run` (in VM and HVF) | 12.49 | 12.15 | 12.74 | 11.56 |
+
+**Ship threshold met**: -1.91 s (-11%) at N = 1 and -2.12 s (-14%) at N = 4 against spreads of at most 0.5 s; nothing slower;
+all 26 boots reached the dialog; unattributed at most 2.6% of the window (process and every thread). Beyond the host parts
+(about 1.5 s at N = 1), the guest side gains too (N = 4 vCPU 0's time in `hv_vcpu_run` -1.2 s; likely: no watchdog wake-ups
+competing for cores; not measured). Max RSS -30 MB at N = 1 (the RIP set).
+
+**Admission split** (log on, all threads, mean of 3): at N = 1, 1,160.8 k admissions take 0.970 s (0.84 us each) and
+928.7 k relocations 0.249 s (0.27 us each; 787 refused); at N = 4, 1,339.5 k admissions 1.270 s (0.95 us) and 946.1 k
+relocations 0.285 s (0.30 us). A relocated hit therefore costs about 1.1 us of host work, of which its full admission is
+about 0.84: the relocated-hit re-check (study 1b: only the RIP-dependent rules on an answer whose admission is kept)
+bounds at about 0.78 s at N = 1 (0.93 M x 0.84 us) plus part of the relocation's copies; not built (every object is still
+admitted in full).
+
+**Checks** (`natemu-raw/perf7-20261103-01/suite/`, the scratch copy with this change, series48-lean, 2 GiB): `cargo test` 159 + 1 ignored, also with `FEXC` set (the
+fetch test extended to the word copy); `run_boot_smoke.py` 4/4; `run_slice3_vm.py contain` 0 failures (423 controls; its
+watchdog cases: a 300 ms watchdog stops a spinning vCPU at 0.32 s, unacked shootdowns at 1.02 s);
+`run_slice1_faults.py` 7,912 match (default block size); `run_slice2_probes.py` 74 match (`spin --watchdog-ms 300` stopped
+by the watchdog); `run_x3.py` 9/9, 4/4, 24/24, 6/6, 10/10, 54/54; `run_x4.py` 33/33, 28/28, 6/6; `run_l4a.py` 13/13, 4/4,
+2/2, 2/2, 1/1; `run_l4b.py` 5/5, 2/2, 3/3, 11/11, 7/7, 1/1. Measured on the build before one change (the watchdog's
+in-host poll floored at 1 ms, which only a watchdog under 1 ms reaches); the checks ran on the final build. After the independent
+review (nothing blocking): `run_l4a.py halt` gains the halt program with a 20 ms watchdog, shorter than its 60 ms halt
+(the halted vCPU must reach its end, not be forced out): green, 3/3; red with the watchdog kicking halted vCPUs too (cpu0
+stopped `watchdog`, no delivery; `natemu-raw/perf7-20261103-01/review/`). With `--check-reuse`, the check's fexc round trip
+is in `fexc` and its comparison in no part (it was inside `admit` before). Not rerun: the rest of the standing suite.
 
 ## 3. Candidate chunks
 

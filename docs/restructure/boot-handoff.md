@@ -14,7 +14,10 @@ chunk 4 (uncommitted on a24c785) the host reuses a translation at every RIP of t
 relocation records (`crates/host/src/relocation.rs`; perf plan "Measured (chunk 4)"): installer N = 1 cache off 27.7 s.
 Since perf chunk 5 (uncommitted on d89bc4c) the resident keeps four dispatcher L1 tables, one per code context, and a CPL
 change switches tables instead of clearing L1 (`crates/runtime/src/cache.rs` `select_l1`; perf plan "Measured (chunk 5)"):
-installer N = 1 cache off 17.4 s, N = 4 15.6 s.
+installer N = 1 cache off 17.4 s, N = 4 15.6 s. Since perf chunk 7 (uncommitted on 0da552a) the host's per-request work
+is leaner: the watchdog samples an entry-time word instead of being woken by two channel sends per exit, the block RIP set
+is kept only for the program driver, guest bytes are copied a word at a time, and the memory cache is looked up in one pass
+under a universal hash (perf plan "Measured (chunk 7)"): installer N = 1 cache off 15.9 s, N = 4 13.6 s.
 This page is enough to start the boot integration: how to build and run a boot, what a boot takes as input, what is
 known to cost or differ, and the standing suite. The plan's "Built (...)" paragraphs hold the detail and the evidence;
 the [contract inventory](contracts.md) maps each contract to its check. No performance tuning was done beyond the
@@ -87,7 +90,7 @@ from `wait4`, the resident's buckets, K1 statistics, counters); FILE.vN one line
 RIP, guest-physical page, result, answer source, bytes read and their hash, nanoseconds per part), at most 1 GiB per
 file (later lines counted as `dropped`); failed writes are counted, the first reported on standard error, and both
 appear in each vCPU's line (`"log"`) and as a warning at its end. A resident built with `perf` but run with the log off
-draws a warning after the run. Since perf chunk 5 the K1 statistics carry `l1_switches` (code-context changes) and `l1_clears` (L1 tables cleared for a context that had none), and the resident's `l1` bucket times the switches. Times are
+draws a warning after the run. Since perf chunk 5 the K1 statistics carry `l1_switches` (code-context changes) and `l1_clears` (L1 tables cleared for a context that had none), and the resident's `l1` bucket times the switches. Since perf chunk 7 the vCPU line's parts carry `relocate` (an answer kept for another RIP relocated) and `admit` is admission alone; the request line keeps its nine parts. Times are
 `CLOCK_UPTIME_RAW` nanoseconds (= `mach_absolute_time` = the guest's CNTVCT). The resident's buckets need the runtime
 built with its `perf` feature, into its own target directory so the default build stays as it is:
 `CARGO_TARGET_DIR=target/perf cargo +1.97.0 build --offline --locked --release -p natemu-runtime --target
@@ -229,7 +232,8 @@ e9214c8, old and new compiler each with its own warm cache after a warm-up boot,
 perf plan "Measured (chunk 2)"); the perf chunk 4 rows likewise, before (a24c785) and after (the uncommitted reuse across
 load addresses) each with its own warm cache (`natemu-raw/perf4-20261103-01/`, perf plan "Measured (chunk 4)"); the
 perf chunk 5 row is three interleaved boots per cell, cache off, before (d89bc4c) and after (the per-context L1 tables)
-(`natemu-raw/perf5-20261103-01/step3/`, perf plan "Measured (chunk 5)"); the other rows are R2's.)
+(`natemu-raw/perf5-20261103-01/step3/`, perf plan "Measured (chunk 5)"); the perf chunk 7 row likewise, before (0da552a) and
+after (the host cleanups) (`natemu-raw/perf7-20261103-01/runs/`, perf plan "Measured (chunk 7)"); the other rows are R2's.)
 
 | To the root-fs panic, wall s (guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
 | --- | --- | --- | --- | --- |
@@ -254,6 +258,7 @@ perf chunk 5 row is three interleaved boots per cell, cache off, before (d89bc4c
 | `natemu-host boot-linux`, cache warm, series48-lean, **reuse across addresses** (perf chunk 4, mean of 3) | **26.2** (2.95) | | | **18.8** (3.08) |
 | `natemu-host boot-linux`, cache off, series48-lean, **reuse across addresses** (perf chunk 4, mean of 3) | **27.7** (4.00) | | | **22.8** (5.43) |
 | `natemu-host boot-linux`, cache off, series48-lean, **per-context L1 tables** (perf chunk 5, mean of 3; d89bc4c in the same rounds: 27.7 (4.04), 22.6 (5.38)) | **17.4** (3.57) | | | **15.6** (5.05) |
+| `natemu-host boot-linux`, cache off, series48-lean, **host per-request cleanups** (perf chunk 7, mean of 3; 0da552a in the same rounds: 17.8 (3.62), 15.7 (5.00)) | **15.9** (3.29) | | | **13.6** (4.51) |
 | `natemu` stub and `boot-linux` at 16b0576, warm or off | never (hangs after "Run /init", see below) | never | | never |
 | QEMU TCG `thread=multi` | 7.27 (2.24) | 5.55 (1.79) | 5.55 (1.86) | 5.46 (1.83) |
 | QEMU TCG default (multi-threaded) | 7.42 (2.28) | | | 5.43 (1.81) |
@@ -332,6 +337,12 @@ controls), `delivery` 0 failures, `run_x3.py` (9/9, 4/4, 24/24, 6/6, 10/10, 54/5
 `run_l3.py` 0 failures, `run_l4a.py` (13/13, 4/4, 2/2, 2/2, 1/1), `run_l4b.py` (5/5, 2/2, 3/3, 11/11, 7/7, 1/1),
 `run_m3.py` 0 failures, `run_m2.py` 112/112 at 2 GiB and at 4 MiB, `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative
 controls flagged), and the initrd boots to "Select a language" at N = 1 and 4 (§4 table).
+
+**Rerun with the host per-request cleanups** (perf plan "Measured (chunk 7)"; `natemu-raw/perf7-20261103-01/suite/`, 2 GiB,
+0da552a plus the uncommitted change, series48-lean): `cargo test` 159 + 1 ignored, also with `FEXC` set; `run_boot_smoke.py`
+4/4; `contain` 0 failures (423 controls); faults 7,912; `run_slice2_probes.py` 74; `run_x3.py`, `run_x4.py`, `run_l4a.py`,
+`run_l4b.py` all green (the counts above; `run_l4a.py halt` now also runs the halt program under a 20 ms watchdog, 3/3, red
+when the watchdog kicks halted vCPUs); all 26 installer boots reached the dialog. The rest of the block was not rerun.
 
 **Rerun with per-context L1 tables** (perf plan "Measured (chunk 5)"; `natemu-raw/perf5-20261103-01/suite/` and `final/`, 2 GiB,
 d89bc4c plus the uncommitted change, series48-lean): every command of the block below at both block sizes, green but the 7
@@ -425,7 +436,7 @@ the default only). Everything passed but the 7 known i8b departures (they flag `
 | `tools/run_l1.py`, `tools/run_l1_smoke.py` | L1 boot-protocol loader: Debian and synthetic bzImages judged by `tools/models/bootproto.py`, every header and loader refusal with the model's codes (no VM); the smoke test (Debian decompressor to its jump into vmlinux vs QEMU) runs in-tree at 2 GiB since M1 (boot-features plan, Built (L1), Built (M1)) |
 | `tools/run_l2.py`, `tools/run_l2_iasl.py` | L2 ACPI tables at N = 1..4 from load-only dumps: the independently written checker `tools/models/acpi_model.py` (structure, AML, CPUID/LAPIC/e820/device-set agreement; controls in `test_acpi_model.py`), and ACPICA `iasl` (Homebrew `acpica`): `-d` clean except the version-0 wakeup structure, the DSDT recompiled from its disassembly and the RSDP from iasl's template byte-equal (no VM; boot-features plan, Built (L2)) |
 | `tools/run_l3.py` | L3 port I/O, UART and the unassigned rule (programs `tools/bench/smp/ports.py`): `qemu` UART widths, Linux's 8250 probe and earlyprintk sequences, unassigned ports, REP INS/OUTS with faults midway, CPL 3 IOPL/TSS-bitmap configurations vs pinned QEMU (COM1 = `-serial file`); `stress` events between string elements; `cases` strict switch, PCI probes, wrap, refusals; `pages` unassigned pages (hole, above RAM, above 4 GiB, IOAPIC page) on the all-ones shadow, writes, refusals, strict, SMP, the xAPIC page (boot-features plan, Built (L3)) |
-| `tools/run_l4a.py` | L4a I/O APIC, 8259 pair and routing (programs `tools/bench/smp/irqs.py`): `qemu` register read-backs, IRQ4 edge and level (Remote IRR, TMR, EOI broadcast, masked -> unmasked, EOI register), the 8259 (Linux's probe and init, OCW3, ELCR, ExtINT via LINT0, poll, auto-EOI, rotation), the TMR across triggers, destinations at 2-4 CPUs, all vs QEMU and the model; `xapic` destinations in xAPIC mode, LINT0 fixed and the disabled-APIC pass-through; `stress` asynchronous edge and level lines at 4 and 2 CPUs; `halt` the busy-guard veto and its negative control; `lint1` the NMI input |
+| `tools/run_l4a.py` | L4a I/O APIC, 8259 pair and routing (programs `tools/bench/smp/irqs.py`): `qemu` register read-backs, IRQ4 edge and level (Remote IRR, TMR, EOI broadcast, masked -> unmasked, EOI register), the 8259 (Linux's probe and init, OCW3, ELCR, ExtINT via LINT0, poll, auto-EOI, rotation), the TMR across triggers, destinations at 2-4 CPUs, all vs QEMU and the model; `xapic` destinations in xAPIC mode, LINT0 fixed and the disabled-APIC pass-through; `stress` asynchronous edge and level lines at 4 and 2 CPUs; `halt` the busy-guard veto and its negative control, and the halted vCPU under a 20 ms watchdog (never forced out); `lint1` the NMI input |
 | `tools/run_l4b.py` | L4b PIT/61H, RTC, ACPI PM block, S5, reset register (programs `tools/bench/smp/timers.py`): `qemu` PIT (latches, access modes, 61H, Linux's `pit_calibrate_tsc` and `quick_pit_calibrate`, IRQ0 rate, PIT-disable sequence), RTC (formats, SET, rollover, UIP, periodic/update/alarm IRQ 8), PM (PM1, PM timer, SCI) and S5 vs QEMU and the exact model, PIT modes 1/4/5 and the RTC's period change (`l4b-more`); `halt` the PIT as a vetoing source; `stress` IRQ0 + IRQ8 broadcast with HLT at 1/2/4 CPUs; `cases` typed stops, refusals and the review's `frozen` probe; `modes` PIT modes 6/7 and the lost-tick policies (reinject/discard per source); `clocks` PM/PIT/LAPIC/RTC against the TSC over 10 s |
 | `tools/run_i8_faults.py`, `tools/reference/gen_i8.py` | I8 AVX/AVX2/FMA/F16C: the QEMU 7.2 corpus (`gen_i8.py`, VEX.128 and VEX.256 forms, every rounding mode, FTZ/DAZ; run with `run_slice1_vm.py`), and the fault matrix by the SDM rules against the run cut before the instruction: #PF on 32-byte crossings with no partial update, alignment #GP (16/32), non-canonical #GP/#SS, #UD/#NM gating (OSXSAVE, XCR0, TS; EM/OSFXSR/BMI not gated; legacy prefixes before VEX; XSETBV re-keying), refusals, device and all-ones pages, the XSAVE round trip with live YMM state, DE/MXCSR hand cases (boot-features plan, Built (I8)) |
 | `tools/run_i6b.py`, `tools/reference/gen_i6b.py` | I6b PCMPxSTRx and the x87 transcendental, remainder, scale and extract forms (resident `svc`): `corpus` against QEMU 7.2 (every imm8 in every form, legacy/VEX, REX.W/VEX.W lengths where QEMU agrees; x87 results QEMU computes in 80 bits within 2 ulps), `cases` by the SDM (C2 at and around 2^63, FPREM/FPREM1 quotient bits and partial remainders, stack underflow/overflow responses, IE/ZE/OE/UE/PE, PCMPxSTRx #PF/#GP/#SS with no partial update, no alignment fault, 64-bit lengths against an SDM model) (boot-features plan, Built (I6b)) |
@@ -583,9 +594,10 @@ Severity: **medium** = a real cost or gap an integrator will meet, **low** = a l
 deviation, or a contained corner.
 
 - The next phase is performance (owner decision 1); the correctness pass comes after it.
-- **medium**, performance: installer to "Select a language" 17.4 s at N = 1 and 15.6 s at N = 4, cache off (perf chunk 5),
+- **medium**, performance: installer to "Select a language" 15.9 s at N = 1 and 13.6 s at N = 4, cache off (perf chunk 7),
   against QEMU's 7.3 s and 5.5 s; at R2 it was 67 s, mostly first-time compiles of user code at randomized addresses,
-  which chunks 2 and 4 removed; the resident's own work now leads (perf plan "Measured (chunk 5)").
+  which chunks 2 and 4 removed; the resident's own work now leads (perf plan "Measured (chunk 5)"); of the host's, full
+admission of relocated hits is about 0.8 s at N = 1 (perf plan "Measured (chunk 7)", admission split).
 - **medium**, performance: each vCPU's in-memory compile cache is its own (`execution::Compiler::cache`; only the disk
   cache is shared); since perf chunk 4 it keeps two generations of 262,144 answers or 128 MiB each (at most 256 MiB per
   vCPU; the installer keeps about 127 k, 80 MB per vCPU), relocating answers to other RIPs of the same half and page offset (`relocation.rs`); the disk cache

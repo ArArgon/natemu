@@ -1058,7 +1058,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         // The suites' code-shape option also checks every answer reused at another RIP (perf chunk 4).
         compiler.check_reuse = code_shape || check_reuse;
         let handlers = log_base(d.spaces[d.cpus[v].space].identity) + LOG_HANDLERS;
-        let mut requests = execution::Requests { devices: Some(registry.clone()), ..Default::default() };
+        let mut requests = execution::Requests { devices: Some(registry.clone()), rips: Some(Default::default()), ..Default::default() };
         let mut hook = ProgramHook {
             switches: d.cpus[v].switches.iter().copied().collect(),
             posts: d.cpus[v].posts.iter().copied().collect(),
@@ -1091,7 +1091,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         if !finished(&stop) {
             owners::cancel_owners(cancelled);
         }
-        Ok(Ran { stop, compiles: compiler.compiles, slowest: compiler.slowest, blocks: requests.blocks, rips: requests.rips, tampered: hook.tampered, decodes: requests.decodes, entropy: requests.entropy })
+        Ok(Ran { stop, compiles: compiler.compiles, slowest: compiler.slowest, blocks: requests.blocks, rips: requests.rips.unwrap_or_default(), tampered: hook.tampered, decodes: requests.decodes, entropy: requests.entropy })
     };
     // HVF's GIC calls never race vCPU create/destroy (`vm.rs`, one lock).
     let prepare = |v: usize| -> Result<Vcpu> {

@@ -747,11 +747,50 @@ impl Answer {
 /// The number of fexc's gating arguments (`FEXC_ARG_*`, [`Compiler::gating`]).
 const GATING: usize = 8;
 /// The memory cache's key (perf chunk 4): the block limit, the RIP's half (bit 63) and page offset, and the first bytes the
-/// answer read (at most [`LEAD`], with their count): an answer is found at every RIP of that half and offset.
-type Key = (Option<u32>, u64, u64);
+/// answer read (at most [`LEAD`], with their count): an answer is found at every RIP of that half and offset. As words
+/// ([`Universal`]); no limit is `1 << 32`.
+type Key = (u64, u64, u64);
 const LEAD: usize = 4;
 fn key(limit: Option<u32>, rip: u64, lead: &[u8]) -> Key {
-    (limit, rip & (1 << 63 | 0xfff), lead.iter().fold(lead.len() as u64, |v, &b| v << 8 | u64::from(b)))
+    (limit.map_or(1 << 32, u64::from), rip & (1 << 63 | 0xfff), lead.iter().fold(lead.len() as u64, |v, &b| v << 8 | u64::from(b)))
+}
+/// The memory cache's hash (perf chunk 7; SipHash's was about 25 ns a probe): Thorup's strongly universal multiply-shift for
+/// vectors of words ("High Speed Hashing for Integers and Strings", 2015, 3.4) under random keys per map. The guest chooses
+/// the keys (its bytes, RIPs) but never sees a hash, so they collide no more than by chance: no quadratic buckets.
+type Cache = HashMap<Key, Vec<Entry>, Universal>;
+#[derive(Clone)]
+struct Universal([u128; 4]);
+impl Default for Universal {
+    fn default() -> Self {
+        let s = std::collections::hash_map::RandomState::new();
+        let r = |i: u64| u128::from(std::hash::BuildHasher::hash_one(&s, 2 * i)) << 64 | u128::from(std::hash::BuildHasher::hash_one(&s, 2 * i + 1));
+        Self([r(0), r(1), r(2), r(3)])
+    }
+}
+impl std::hash::BuildHasher for Universal {
+    type Hasher = Words;
+    fn build_hasher(&self) -> Words {
+        Words { keys: self.0, sum: self.0[3], i: 0 }
+    }
+}
+/// The sum of key i times word i (mod 2^128) plus the last key; the hash is its top 64 bits, reversed (hashbrown indexes by
+/// the low bits, and the top ones are the universal ones). Words only: the three of a [`Key`].
+struct Words {
+    keys: [u128; 4],
+    sum: u128,
+    i: usize,
+}
+impl std::hash::Hasher for Words {
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("the memory cache hashes its keys' words");
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.sum = self.sum.wrapping_add(self.keys[self.i].wrapping_mul(u128::from(x)));
+        self.i += 1;
+    }
+    fn finish(&self) -> u64 {
+        ((self.sum >> 64) as u64).reverse_bits()
+    }
 }
 /// Answers per generation of the memory cache ([`Compiler::insert`]): the installer boot keeps about 130 k.
 const GENERATION: usize = 1 << 18;
@@ -805,8 +844,8 @@ pub struct Compiler {
     /// Block size limit in guest instructions (fexc's own limit when `None`).
     max_instructions: Option<u32>,
     /// Kept answers in two generations ([`Compiler::insert`]): `cache` the newer (`cached` entries), `old` the older.
-    cache: HashMap<Key, Vec<Entry>>,
-    old: HashMap<Key, Vec<Entry>>,
+    cache: Cache,
+    old: Cache,
     cached: usize,
     cached_bytes: usize,
     /// The persistent cache (`boot-linux` sets it; test drivers never do).
@@ -910,7 +949,7 @@ impl Compiler {
         Ok(Self::with_features(fexc, admission::supported_features(&id), max_instructions))
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
-        Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: HashMap::new(), old: HashMap::new(), cached: 0, cached_bytes: 0, disk: None, compiles: 0, hits: 0, disk_hits: 0,
+        Self { fexc: fexc.into(), server: None, supported, max_instructions, cache: Cache::default(), old: Cache::default(), cached: 0, cached_bytes: 0, disk: None, compiles: 0, hits: 0, disk_hits: 0,
                relocated: 0, relocation_refused: 0, relocation_fallbacks: 0, reuse_checks: 0, check_reuse: false,
                deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![], perf: None }
     }
@@ -983,22 +1022,31 @@ impl Compiler {
     }
     /// The kept answer matching `bytes` at `rip`, from either generation (an older one is moved to the newer): one kept for
     /// `rip` itself in any bucket first, then one for another RIP. Keys hold the leading bytes the answer read (at most
-    /// [`LEAD`]), so each length is tried.
+    /// [`LEAD`]), so each length is tried; one pass, each bucket looked up once.
     fn find(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>, gating: &[u64; GATING]) -> Option<(Key, usize)> {
-        for own in [true, false] {
-            for n in (0..=LEAD.min(bytes.len())).rev() {
-                let key = key(limit, rip, &bytes[..n]);
-                let pick = |v: &Vec<Entry>| v.iter().position(|e| (!own || e.rip == rip) && e.matches(bytes, gating));
-                if let Some(i) = self.cache.get(&key).and_then(pick) {
-                    return Some((key, i));
-                }
-                if let Some(i) = self.old.get(&key).and_then(pick) {
-                    let entry = self.old.get_mut(&key).unwrap().swap_remove(i);
-                    return Some(self.insert(limit, entry));
+        let mut other = None;
+        for n in (0..=LEAD.min(bytes.len())).rev() {
+            let key = key(limit, rip, &bytes[..n]);
+            for newer in [true, false] {
+                let Some(v) = (if newer { &self.cache } else { &self.old }).get(&key) else { continue };
+                let mut matching = v.iter().enumerate().filter(|(_, e)| e.matches(bytes, gating));
+                let Some((first, _)) = matching.next() else { continue };
+                let own = if v[first].rip == rip { Some(first) } else { matching.find(|(_, e)| e.rip == rip).map(|(i, _)| i) };
+                match own {
+                    Some(i) => return Some(self.found(newer, key, i, limit)),
+                    None => other = other.or(Some((newer, key, first))),
                 }
             }
         }
-        None
+        other.map(|(newer, key, i)| self.found(newer, key, i, limit))
+    }
+    /// The entry at `i` under `key` in the newer generation or (`!newer`) the older one, which moves it to the newer.
+    fn found(&mut self, newer: bool, key: Key, i: usize, limit: Option<u32>) -> (Key, usize) {
+        if newer {
+            return (key, i);
+        }
+        let entry = self.old.get_mut(&key).unwrap().swap_remove(i);
+        self.insert(limit, entry)
     }
     /// Keeps `entry` in the newer generation; when that holds [`GENERATION`] answers or [`GENERATION_BYTES`] it becomes the
     /// older one (the older is dropped): every answer used or made in the last generation is kept, at most twice the bound
@@ -1018,37 +1066,34 @@ impl Compiler {
     /// The answer kept at `i` under `key`, used at `rip`: as it is for its own RIP; for another, relocated (`None`: it
     /// would not be fexc's at `rip`, or admission refused the relocated object; logged; the caller compiles).
     fn reuse(&mut self, key: Key, i: usize, bytes: &[u8], rip: u64, limit: Option<u32>, hook: &mut impl Hook) -> Result<Option<std::result::Result<Code, (u32, &'static str)>>> {
-        let from = self.cache[&key][i].rip;
         let t = self.stamp();
-        let moved = if from == rip {
-            None
+        let e = &self.cache[&key][i];
+        let (from, read) = (e.rip, (e.read, e.whole, e.prefix.len()));
+        let code = if from == rip {
+            self.answered(&e.answer, bytes, rip, hook)?
         } else {
-            match self.cache[&key][i].answer.at(from, rip) {
-                Some(answer) => Some(answer),
-                None => {
-                    self.relocation_refused += 1;
-                    return Ok(None);
-                }
+            let Some(answer) = e.answer.at(from, rip) else {
+                self.relocation_refused += 1;
+                return Ok(None);
+            };
+            // Admission's share of a relocated hit is timed apart from the relocation (perf chunk 7).
+            self.charge(crate::perf::RELOCATE, t);
+            if self.check_reuse {
+                self.check(&answer, read, bytes, rip, limit, from, hook)?;
             }
-        };
-        if let (Some(answer), true) = (&moved, self.check_reuse) {
-            let e = &self.cache[&key][i];
-            let read = (e.read, e.whole, e.prefix.len());
-            self.check(answer, read, bytes, rip, limit, from, hook)?;
-        }
-        let code = match &moved {
-            None => self.answered(&self.cache[&key][i].answer, bytes, rip, hook)?,
-            Some(answer) => match self.answered(answer, bytes, rip, hook) {
+            let t = self.stamp();
+            match self.answered(&answer, bytes, rip, hook) {
                 Ok(code) => {
                     self.relocated += 1;
-                    code
+                    self.charge(if matches!(code, Ok(Code::Block(_))) { crate::perf::ADMIT } else { crate::perf::DECODE }, t);
+                    return Ok(Some(code));
                 }
                 Err(e) => {
                     self.relocation_fallbacks += 1;
                     eprintln!("natemu: the answer relocated from {from:#x} to {rip:#x} was refused ({e}); compiled at {rip:#x}");
                     return Ok(None);
                 }
-            },
+            }
         };
         self.charge(if matches!(code, Ok(Code::Block(_))) { crate::perf::ADMIT } else { crate::perf::DECODE }, t);
         Ok(Some(code))
@@ -1261,22 +1306,40 @@ fn fetched(area: Area, state: &State, limit: Option<u64>) -> Result<std::result:
             _ => (rest, false),
         }
     };
-    let copy = |gpa: u64, length: u64| -> Result<Vec<u8>> {
-        let mut chunk = vec![0; length as usize];
-        if !ram.copy_out(gpa, &mut chunk) {
-            return Err(format!("code at {rip:#x} is outside guest RAM"));
-        }
-        Ok(chunk)
+    let mut bytes = Vec::with_capacity(8192);
+    let mut copy = |gpa: u64, length: u64| match copy_out(&ram, gpa, length, &mut bytes) {
+        true => Ok(()),
+        false => Err(format!("code at {rip:#x} is outside guest RAM")),
     };
     let (length, cut) = span(rip);
-    let mut bytes = copy(state.fetch[0] | rip & 4095, length)?;
+    copy(state.fetch[0] | rip & 4095, length)?;
     // The last page of the address space has no next page.
     let next = rip.checked_add(length).filter(|_| !cut);
     if let (Some(va), true) = (next, state.fetch[1] != u64::MAX) {
-        bytes.extend(copy(state.fetch[1], span(va).0)?);
+        copy(state.fetch[1], span(va).0)?;
     }
     let walked = state.fetch[1] != u64::MAX || state.fetch_fault[0] != exec::fetch::NONE;
     Ok(Ok(Fetched { bytes, more: next.is_some() && !walked, next_fault: fault }))
+}
+/// Appends guest RAM's `length` bytes at `gpa` to `out` (false: not all RAM), as `GuestRam::copy_out` reads them (volatile
+/// loads: other vCPUs may write them) but eight at a time where aligned (perf chunk 7: its byte loop and the zeroed buffer
+/// were about 0.4 us a request).
+fn copy_out(ram: &GuestRam, gpa: u64, length: u64, out: &mut Vec<u8>) -> bool {
+    let Some(p) = ram.range(gpa, length) else { return false };
+    let n = length as usize;
+    let head = (p as usize).wrapping_neg() % 8;
+    let words = n.saturating_sub(head) / 8;
+    out.reserve(n);
+    // SAFETY: `range` gives `n` bytes of the RAM's mapping at `p`, word-aligned from `p + head`.
+    unsafe {
+        let byte = |i: usize| std::ptr::read_volatile(p.add(i));
+        out.extend((0..head.min(n)).map(byte));
+        for w in 0..words {
+            out.extend_from_slice(&std::ptr::read_volatile(p.add(head + 8 * w).cast::<u64>()).to_ne_bytes());
+        }
+        out.extend((head.min(n) + 8 * words..n).map(byte));
+    }
+    true
 }
 
 /// What [`Hook::at`] makes of the translation request at a RIP.
@@ -1325,9 +1388,10 @@ impl Hook for () {}
 /// Host exits of one [`run`].
 #[derive(Default)]
 pub struct Requests {
-    /// Translation requests answered with a block, and the distinct RIPs among them (single-step requests not included).
+    /// Translation requests answered with a block, and the distinct RIPs among them when the caller asks (`Some`; the program
+    /// driver: a boot's million-entry set cost about 0.1 us a request); single-step requests not included.
     pub blocks: u64,
-    pub rips: std::collections::HashSet<u64>,
+    pub rips: Option<std::collections::HashSet<u64>>,
     /// M3: the VM's device ranges (shared by every vCPU thread; see [`crate::devices`]).
     pub devices: Option<std::sync::Arc<crate::devices::Devices>>,
     /// K2: system-instruction decodes answered ([`exec::REPLY_SYSTEM`], by kind; the test hooks not included), and
@@ -1357,32 +1421,48 @@ pub fn run(
     let mut state: State = area.read_record(exec::STATE_OFFSET);
     state.stop_at = stop_at.unwrap_or(u64::MAX);
     area.write_record(exec::STATE_OFFSET, state);
-    // `true`: the vCPU enters the guest; `false`: it is back in the host. Dropping the sender ends the watchdog.
-    let (running, events) = std::sync::mpsc::channel::<bool>();
+    // When the vCPU last entered the guest (`perf::now`), 0 while it is in the host: two stores per exit, which the watchdog
+    // samples (perf chunk 7; a channel send at each entry and exit woke it twice per exit). Dropping `done` ends it.
+    let entered = &AtomicU64::new(0);
+    let (done, ended) = std::sync::mpsc::channel::<()>();
     let id = cpu.id();
     // A halted vCPU (X2: parked in the VM by HLT) is idle, not stuck: the watchdog waits on; the driver decides when a
-    // halted vCPU can never wake ([`end_when_halted`]). A scoped thread (R2 review): it borrows the word, and is joined
-    // even when `serve` panics (unwinding drops `running` first, which ends it).
+    // halted vCPU can never wake ([`end_when_halted`]). A scoped thread (R2 review): it borrows the words, and is joined
+    // even when `serve` panics (unwinding drops `done` first, which ends it).
     let halted: &AtomicU64 = event_word(area.memory, area.vcpu, std::mem::offset_of!(cache::Events, halted));
     std::thread::scope(move |scope| {
         scope.spawn(move || {
-            use std::sync::mpsc::RecvTimeoutError::Timeout;
-            while let Ok(true) = events.recv() {
-                let mut limit = watchdog;
-                // Repeated while the vCPU stays in: a request racing its entry into `hv_vcpu_run` might not stop it.
-                while events.recv_timeout(limit) == Err(Timeout) {
-                    if halted.load(SeqCst) != 0 {
-                        continue;
+            let limit = u64::try_from(watchdog.as_nanos()).unwrap_or(u64::MAX);
+            // The entry last seen, when it is next checked, and the wait after a check that found it still in the guest:
+            // `limit`, then 100 ms (a request racing its entry into `hv_vcpu_run` might not stop it).
+            let (mut seen, mut due, mut again) = (0, 0, limit);
+            loop {
+                let (t, now) = (entered.load(SeqCst), crate::perf::now());
+                if t != seen {
+                    (seen, due, again) = (t, t.saturating_add(limit), limit);
+                }
+                // In the host it looks again after `limit` (at least 1 ms); an entry it then finds is checked at entry + `limit`.
+                let wait = if t == 0 {
+                    limit.max(1_000_000)
+                } else if now < due {
+                    due - now
+                } else {
+                    if halted.load(SeqCst) == 0 {
+                        exit_vcpus(&mut [id]);
+                        again = 100_000_000;
                     }
-                    exit_vcpus(&mut [id]);
-                    limit = Duration::from_millis(100);
+                    due = now.saturating_add(again);
+                    again
+                };
+                if ended.recv_timeout(Duration::from_nanos(wait)) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                    break;
                 }
             }
         });
-        let stop = serve(cpu, area, compiler, stop_at, requests, stops, &running, cancelled, hook);
+        let stop = serve(cpu, area, compiler, stop_at, requests, stops, entered, cancelled, hook);
         // ponytail: a cancel the watchdog sent just as the guest exited stays pending on the vCPU and would end its next
         // `hv_vcpu_run` at once; harmless while a vCPU serves one run. Drain it (a zero-length run) if vCPUs get reused.
-        drop(running);
+        drop(done);
         stop
     })
 }
@@ -1393,7 +1473,7 @@ fn serve(
     stop_at: Option<u64>,
     requests: &mut Requests,
     stops: &Stops,
-    running: &std::sync::mpsc::Sender<bool>,
+    entered: &AtomicU64,
     cancelled: &AtomicBool,
     hook: &mut impl Hook,
 ) -> Result<Stop> {
@@ -1410,13 +1490,13 @@ fn serve(
         if cancelled.load(SeqCst) {
             return Ok(Stop::Cancelled);
         }
-        let _ = running.send(true);
+        entered.store(crate::perf::now(), SeqCst);
         stops.in_host[v].store(false, SeqCst);
         lap(compiler, crate::perf::SIGNAL);
         let exit = cpu.run_until_exit();
         lap(compiler, crate::perf::RUN);
         stops.in_host[v].store(true, SeqCst);
-        let _ = running.send(false);
+        entered.store(0, SeqCst);
         lap(compiler, crate::perf::SIGNAL);
         let exit = match exit? {
             vm::Exit::Hvc(immediate) => immediate,
@@ -1614,7 +1694,9 @@ fn translation(
     state.system = exec::System::NONE;
     if !step {
         requests.blocks += 1;
-        requests.rips.insert(rip);
+        if let Some(rips) = &mut requests.rips {
+            rips.insert(rip);
+        }
     }
     state.link_points = [exec::LinkPoint::NONE; exec::MAX_LINK_POINTS];
     state.link_points[..block.links.len()].copy_from_slice(&block.links);
@@ -1869,6 +1951,15 @@ mod tests {
         assert_eq!((&f.bytes[14..], f.more), (&[0xaa, 0xaa, 0xbb, 0xbb, 0xbb, 0xbb][..], false));
         (s.fetch, s.fetch_fault) = ([u64::MAX; 2], exec::fetch::encode(Fault::Noncanonical));
         assert!(matches!(fetched(area, &s, None), Ok(Err(Stop::FetchFault(Fault::Noncanonical)))));
+        // The word copy (perf chunk 7) equals the byte copy at every alignment and length around a word, and refuses past RAM.
+        let pattern: Vec<u8> = (0..64).map(|i| i as u8 ^ 0x5a).collect();
+        assert!(ram.copy_in(0x7000, &pattern));
+        for (at, n) in (0..9).flat_map(|a| (0..26).map(move |n| (a, n))) {
+            let (mut words, mut bytes) = (vec![1], vec![0; n]);
+            assert!(copy_out(&ram, 0x7000 + at, n as u64, &mut words) && ram.copy_out(0x7000 + at, &mut bytes));
+            assert_eq!(words[1..], bytes[..]);
+        }
+        assert!(!copy_out(&ram, (2 << 20) - 4, 8, &mut vec![]));
     }
 
     #[test]

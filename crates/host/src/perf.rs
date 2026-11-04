@@ -86,7 +86,8 @@ const HOST: [&str; 11] = ["signal", "run", "exit", "translate", "step", "device"
 /// Parts of a translation request: the guest bytes' copy, the in-memory cache's lookup, the persistent cache's get (the
 /// request body and its SHA-256 key included), fexc's round trip (its server's start included), the persistent put (a
 /// send to its writer thread), admission, a system instruction's decode, staging (the object and its link points), and
-/// keeping a new answer in memory (its bytes copied, a no-code report parsed).
+/// keeping a new answer in memory (its bytes copied, a no-code report parsed), and (perf chunk 7) relocating an answer kept
+/// for another RIP (`admit` is then the relocated object's admission alone; not in the request line, which predates it).
 pub const FETCH: usize = 0;
 pub const LOOKUP: usize = 1;
 pub const DISK_GET: usize = 2;
@@ -96,7 +97,8 @@ pub const ADMIT: usize = 5;
 pub const DECODE: usize = 6;
 pub const STAGE: usize = 7;
 pub const KEEP: usize = 8;
-const PARTS: [&str; 9] = ["fetch", "lookup", "disk_get", "fexc", "disk_put", "admit", "decode", "stage", "keep"];
+pub const RELOCATE: usize = 9;
+const PARTS: [&str; 10] = ["fetch", "lookup", "disk_get", "fexc", "disk_put", "admit", "decode", "stage", "keep", "relocate"];
 
 /// One vCPU's log while it runs (`Compiler::perf`).
 pub struct Recorder {
