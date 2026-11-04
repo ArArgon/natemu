@@ -12,6 +12,9 @@ direct branches ignored as on Intel; series45-r2fix is series44-r2, byte-identic
 review's shim change: segment prefixes on near direct branches ignored; §6), built by `tools/fexc/build.sh`. Since perf
 chunk 4 (uncommitted on a24c785) the host reuses a translation at every RIP of the same half and page offset by its
 relocation records (`crates/host/src/relocation.rs`; perf plan "Measured (chunk 4)"): installer N = 1 cache off 27.7 s.
+Since perf chunk 5 (uncommitted on d89bc4c) the resident keeps four dispatcher L1 tables, one per code context, and a CPL
+change switches tables instead of clearing L1 (`crates/runtime/src/cache.rs` `select_l1`; perf plan "Measured (chunk 5)"):
+installer N = 1 cache off 17.4 s, N = 4 15.6 s.
 This page is enough to start the boot integration: how to build and run a boot, what a boot takes as input, what is
 known to cost or differ, and the standing suite. The plan's "Built (...)" paragraphs hold the detail and the evidence;
 the [contract inventory](contracts.md) maps each contract to its check. No performance tuning was done beyond the
@@ -84,7 +87,7 @@ from `wait4`, the resident's buckets, K1 statistics, counters); FILE.vN one line
 RIP, guest-physical page, result, answer source, bytes read and their hash, nanoseconds per part), at most 1 GiB per
 file (later lines counted as `dropped`); failed writes are counted, the first reported on standard error, and both
 appear in each vCPU's line (`"log"`) and as a warning at its end. A resident built with `perf` but run with the log off
-draws a warning after the run. Times are
+draws a warning after the run. Since perf chunk 5 the K1 statistics carry `l1_switches` (code-context changes) and `l1_clears` (L1 tables cleared for a context that had none), and the resident's `l1` bucket times the switches. Times are
 `CLOCK_UPTIME_RAW` nanoseconds (= `mach_absolute_time` = the guest's CNTVCT). The resident's buckets need the runtime
 built with its `perf` feature, into its own target directory so the default build stays as it is:
 `CARGO_TARGET_DIR=target/perf cargo +1.97.0 build --offline --locked --release -p natemu-runtime --target
@@ -225,7 +228,8 @@ built alone with `-p natemu` and signed, the same method, after a warm-up boot a
 e9214c8, old and new compiler each with its own warm cache after a warm-up boot, the log off (`natemu-raw/perf2-20261103-01/`,
 perf plan "Measured (chunk 2)"); the perf chunk 4 rows likewise, before (a24c785) and after (the uncommitted reuse across
 load addresses) each with its own warm cache (`natemu-raw/perf4-20261103-01/`, perf plan "Measured (chunk 4)"); the
-other rows are R2's.)
+perf chunk 5 row is three interleaved boots per cell, cache off, before (d89bc4c) and after (the per-context L1 tables)
+(`natemu-raw/perf5-20261103-01/step3/`, perf plan "Measured (chunk 5)"); the other rows are R2's.)
 
 | To the root-fs panic, wall s (guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
 | --- | --- | --- | --- | --- |
@@ -249,6 +253,7 @@ other rows are R2's.)
 | `natemu-host boot-linux`, cache off, **series48-lean** (perf chunk 2, mean of 3) | **49.3** (5.13) | | | **37.6** (6.32) |
 | `natemu-host boot-linux`, cache warm, series48-lean, **reuse across addresses** (perf chunk 4, mean of 3) | **26.2** (2.95) | | | **18.8** (3.08) |
 | `natemu-host boot-linux`, cache off, series48-lean, **reuse across addresses** (perf chunk 4, mean of 3) | **27.7** (4.00) | | | **22.8** (5.43) |
+| `natemu-host boot-linux`, cache off, series48-lean, **per-context L1 tables** (perf chunk 5, mean of 3; d89bc4c in the same rounds: 27.7 (4.04), 22.6 (5.38)) | **17.4** (3.57) | | | **15.6** (5.05) |
 | `natemu` stub and `boot-linux` at 16b0576, warm or off | never (hangs after "Run /init", see below) | never | | never |
 | QEMU TCG `thread=multi` | 7.27 (2.24) | 5.55 (1.79) | 5.55 (1.86) | 5.46 (1.83) |
 | QEMU TCG default (multi-threaded) | 7.42 (2.28) | | | 5.43 (1.81) |
@@ -327,6 +332,14 @@ controls), `delivery` 0 failures, `run_x3.py` (9/9, 4/4, 24/24, 6/6, 10/10, 54/5
 `run_l3.py` 0 failures, `run_l4a.py` (13/13, 4/4, 2/2, 2/2, 1/1), `run_l4b.py` (5/5, 2/2, 3/3, 11/11, 7/7, 1/1),
 `run_m3.py` 0 failures, `run_m2.py` 112/112 at 2 GiB and at 4 MiB, `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative
 controls flagged), and the initrd boots to "Select a language" at N = 1 and 4 (§4 table).
+
+**Rerun with per-context L1 tables** (perf plan "Measured (chunk 5)"; `natemu-raw/perf5-20261103-01/suite/` and `final/`, 2 GiB,
+d89bc4c plus the uncommitted change, series48-lean): every command of the block below at both block sizes, green but the 7
+known i8b departures; `cargo test` 159 + 1 ignored, also with `FEXC` set; `check_resident_stack.py` `ok` (same depths);
+Python 317; `run_k1.py` gains `contexts` (one block called through the dispatcher under six code contexts, more than the
+four L1 tables, then an INVLPG, a code write and a CR3 reload made under one context reaching the block another context's
+table holds; its negative controls, no table switch, an evicted table reused uncleared, and invalidation or the CR3-load scan
+limited to the dispatcher's table, fail as they must).
 
 **Rerun with reuse across load addresses** (perf plan "Measured (chunk 4)"; `natemu-raw/perf4-20261103-01/suite/`, 2 GiB,
 a24c785 plus the uncommitted change, series48-lean; the program driver's `--code-shape` now also compiles every answer
@@ -570,13 +583,20 @@ Severity: **medium** = a real cost or gap an integrator will meet, **low** = a l
 deviation, or a contained corner.
 
 - The next phase is performance (owner decision 1); the correctness pass comes after it.
-- **medium**, performance: first-time compiles dominate user space: installer to "Select a language" 67 s at N = 1
-  against QEMU's 7.3 s; user code at randomized addresses compiles again per process (§4, translation latency); next
-  chunk (owner decision 1).
+- **medium**, performance: installer to "Select a language" 17.4 s at N = 1 and 15.6 s at N = 4, cache off (perf chunk 5),
+  against QEMU's 7.3 s and 5.5 s; at R2 it was 67 s, mostly first-time compiles of user code at randomized addresses,
+  which chunks 2 and 4 removed; the resident's own work now leads (perf plan "Measured (chunk 5)").
 - **medium**, performance: each vCPU's in-memory compile cache is its own (`execution::Compiler::cache`; only the disk
   cache is shared); since perf chunk 4 it keeps two generations of 262,144 answers or 128 MiB each (at most 256 MiB per
   vCPU; the installer keeps about 127 k, 80 MB per vCPU), relocating answers to other RIPs of the same half and page offset (`relocation.rs`); the disk cache
   evicts oldest-written first (`compile_cache.rs`).
+- **medium**, performance: the resident's metadata arena (64 MiB, about 255 k blocks) fills on the installer: 4 whole-cache
+  flushes per boot at N = 1, one per vCPU at N = 4, each followed by about 255 k blocks requested and placed again (about
+  1.0 M of the boot's 1.16 M requests at N = 1, an estimated 3.5-4.5 s of 17.4 s); the code area is a third full then (perf
+  plan "Measured (chunk 5)", whole-cache flushes).
+- **low**, performance: with KASLR the kernel's address is chosen once per boot and does not move within it, so the
+  in-memory and in-VM caches work as with `nokaslr`; only the persistent cache misses for the kernel across boots (the
+  decompressor's relocations change its bytes): the warm-cache speed-up is lost for kernel code, the cold boot is unaffected.
 - **medium**, performance: uncached (UC/UC-) RAM costs about 4.3-4.8 us per access (§4, M2 addendum 2); device pages a
   host round trip per access (M3).
 - **medium**, API: the library's public surface is wide (about 190 public items (functions, types, constants) across `execution`, `memory`, `vm`,

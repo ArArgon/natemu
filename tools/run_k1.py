@@ -29,6 +29,9 @@ These eight run at block sizes default and 1 and are compared with QEMU system m
   the instruction's immediate: the block dies in its own lookup and the new bytes run.
 - `pf-remap` (natemu only): V made not present without INVLPG, a load faults, the handler maps F2 without INVLPG: the #PF
   invalidated V, so the call runs F2's bytes.
+- `contexts` (natemu only, perf chunk 5): one block called through the dispatcher under six code contexts in turn (MXCSR
+  masks, CR0.TS), more than the dispatcher's L1 tables: each runs, or takes #NM or #XM, by its own context only; then an
+  INVLPG, a code write and a CR3 reload made under one context reach the block another context's table holds.
 - the independent review's adversarial programs (`adv_setup`: NX, SMEP and U/S changes, code remapping its own page,
   one frame at two linear addresses rewritten, global/non-global crossings, a fetch #PF then remap), against QEMU but
   `pf-fetch` (either outcome by the TLB rules).
@@ -122,16 +125,64 @@ def bodies(k, i=0):
                      + call(0) + '    mov r8, rax\n' + f'    mov rax, {(d + F1) | P.LEAF & ~1:#x}\n    mov [{leaf(d):#x}], rax\n'
                      + f'    mov rbx, [{d:#x}]\n' + call(1) + '    mov r9, rax\n    jmp .end\n'
                      + f'.h:\n    mov rax, {(d + F2) | P.LEAF:#x}\n    mov [{leaf(d):#x}], rax\n    inc r14\n    add rsp, 8\n    iretq\n.end:\n'),
+        # Code contexts (perf chunk 5): one block at linear d + CX (`addss` of an inexact sum, then `mov eax, 1`) called
+        # through the dispatcher under six contexts, K rounds of A, C, A, C (two tables kept, switched between), B, then D,
+        # E, F (more contexts than L1 tables: tables evicted and reused). A (MXCSR 0x1f80) runs; C (PM clear) #XM; B (CR0.TS)
+        # #NM; D, E, F (UM, ZM, DM clear: nothing raised) run. A block entered under another context than its own shows as
+        # a wrong count (r8 runs, r14 #NM, r15 #XM). Then V's block, kept in A's table, is made stale under C (`ctx_kept`).
+        'contexts': (ctx_idt(d) + f'    mov rax, cr4\n    or rax, 0x600\n    mov cr4, rax\n    xor r8d, r8d\n    xor r14d, r14d\n    xor r15d, r15d\n'
+                     f'    mov eax, 0x3f800000\n    movd xmm0, eax\n    mov eax, 0x0da24260\n    movd xmm1, eax\n    mov ecx, {k}\n.l:\n'
+                     + ''.join(ctx_call(j, d, m) for j, m in enumerate((0, 1, 0, 1)))
+                     + '    mov rax, cr0\n    bts rax, 3\n    mov cr0, rax\n' + ctx_call(4, d, None) + '    clts\n'
+                     + ''.join(ctx_call(5 + j, d, j + 2) for j in range(3)) + '    dec ecx\n    jnz .l\n'
+                     + ctx_call(8, d, 0) + ctx_kept(i) + '    jmp .end\n' + CTX_HANDLERS + '.end:\n'),
     }
 
 IDT = 0x3000
+CX, CD = 0x9000, 0xa000                       # `contexts`: its code page and its MXCSR values (A, C, D, E, F)
+CTX_MXCSR = (0x1f80, 0x0f80, 0x1780, 0x1d80, 0x1e80)
+
+
+def ctx_idt(d):
+    """`contexts`: an IDT at d + IDT with #NM (7, handler .h7) and #XM (19, .h19)."""
+    gate = lambda v: (f'    lea rax, [rel .h{v}]\n    mov [{d + IDT + 16 * v:#x}], ax\n    mov word [{d + IDT + 16 * v + 2:#x}], 8\n'
+                      f'    mov word [{d + IDT + 16 * v + 4:#x}], 0x8e00\n    shr rax, 16\n    mov [{d + IDT + 16 * v + 6:#x}], ax\n'
+                      f'    shr rax, 16\n    mov [{d + IDT + 16 * v + 8:#x}], eax\n')
+    return (gate(7) + gate(19) + f'    mov word [{d + IDT + 0x800:#x}], 0xfff\n    mov rax, {d + IDT:#x}\n    mov [{d + IDT + 0x802:#x}], rax\n'
+            f'    lidt [{d + IDT + 0x800:#x}]\n')
+
+
+def ctx_call(tag, d, mxcsr):
+    """`contexts`: LDMXCSR of value `mxcsr` (an index into CTX_MXCSR; None: none), then the call; r8 += 1 if it ran."""
+    load = '' if mxcsr is None else f'    ldmxcsr [{d + CD + 4 * mxcsr:#x}]\n'
+    return load + f'    xor eax, eax\n' + call(f'x{tag}', f'{d + CX:#x}') + '    add r8, rax\n'
+
+def ctx_kept(i):
+    """`contexts`, after the rounds: under C (another L1 table), V is remapped to frame W1 with INVLPG, then W1's bytes are
+    rewritten, then V is remapped to W2 with a CR3 reload (no INVLPG); after each, V is called under A, whose table still
+    held V's entry: it must run the new bytes (r9 = 2, r10 = 3, r12 = 4)."""
+    d = P.SYS_D(i)
+    V, W1, W2 = d + CX, d + CW1, d + CW2
+    load = lambda m: f'    ldmxcsr [{d + CD + 4 * m:#x}]\n'
+    put = lambda frame: f'    mov rax, {frame | P.LEAF:#x}\n    mov [{P.sys_leaf(i, 0, V):#x}], rax\n'
+    run = lambda tag, reg: load(0) + '    xor eax, eax\n' + call(f'k{tag}', f'{V:#x}') + f'    mov {reg}, rax\n'
+    return (load(1) + put(W1) + f'    mov rax, {V:#x}\n    invlpg [rax]\n' + run(0, 'r9')
+            + load(1) + f'    mov byte [{W1 + 1:#x}], 3\n' + run(1, 'r10')
+            + load(1) + put(W2) + '    mov rax, cr3\n    mov cr3, rax\n' + run(2, 'r12'))
+
+CW1, CW2 = 0xb000, 0xc000                     # `contexts`: V's other frames (`mov eax, 2` and `mov eax, 4`)
+
+# #NM and #XM: counted, and the call returns (r13) with RAX 0 (its `mov eax, 1` not run).
+CTX_HANDLERS = '.h7:\n    inc r14\n    xor eax, eax\n    mov [rsp], r13\n    iretq\n.h19:\n    inc r15\n    xor eax, eax\n    mov [rsp], r13\n    iretq\n'
 # Natemu-only programs: (register, allowed values) per CPU; a function of the CPU for `walk`. In `global` the architecture
 # allows either frame for r9 and r10 (a kept global entry, or a miss); natemu keeps the block found global (K1), so 1.
 EITHER = {
     'no-invlpg': {'r8': {1}, 'r9': {1, 2}, 'r10': {2}},
     'global': {'r8': {1}, 'rbx': {1}, 'r9': {1}, 'r10': {1}, 'r12': {2}, 'rsi': {1}, 'rdi': {1, 2}, 'rbp': {2}},
-    'walk': lambda i: {'r8': {walk_at(i)[0] | 7}, 'r9': {walk_at(i)[0] | 0x27}, 'r10': {walk_at(i)[0] | 0x27}},
+    'walk': lambda i, k: {'r8': {walk_at(i)[0] | 7}, 'r9': {walk_at(i)[0] | 0x27}, 'r10': {walk_at(i)[0] | 0x27}},
     'pf-remap': {'r8': {1}, 'r14': {1}, 'r9': {2}},
+    # K rounds of five runs, one #NM and two #XM, then a last run under A.
+    'contexts': lambda i, k: {'r8': {5 * k + 1}, 'r14': {k}, 'r15': {2 * k}, 'r9': {2}, 'r10': {3}, 'r12': {4}},
 }
 
 
@@ -164,6 +215,10 @@ def program(name, n, k):
             extra += [{'addr': '0x1ffffe', 'data': 'b800', 'capture': False}] if i == 0 else []   # shared by every CPU
         if name == 'pf-remap':
             extra += [dict(P.zero(d + IDT, 0x1000), capture=False)]
+        if name == 'contexts':
+            extra += [dict(P.zero(d + IDT, 0x1000), capture=False), {'addr': f'0x{d + CX:x}', 'data': P.asm('addss xmm0, xmm1\nmov eax, 1\njmp r13').hex()},
+                      {'addr': f'0x{d + CD:x}', 'data': b''.join(m.to_bytes(4, 'little') for m in CTX_MXCSR).hex(), 'capture': False},
+                      {'addr': f'0x{d + CW1:x}', 'data': P.asm('mov eax, 2\njmp r13').hex()}, {'addr': f'0x{d + CW2:x}', 'data': P.asm('mov eax, 4\njmp r13').hex()}]
         out['memory'] += P.sys_tables(i, 0, n, a) + tb + [
             P.zero(d, 0x1000), {'addr': f'0x{d + F1:x}', 'data': CODE(1).hex()}, {'addr': f'0x{d + F2:x}', 'data': CODE(2).hex()},
             {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + extra
@@ -315,12 +370,19 @@ def main():
                     continue
             for extra in ([], [1]):
                 out, problems = run(a, prog, extra)
+                if name == 'contexts':  # its blocks are translated once per context, not once per RIP (the check's count)
+                    problems = [p for p in problems if 'host requests' not in p]
+                    # The L1 tables of the A/C alternation are kept and switched between, not cleared at every change.
+                    for v, c in enumerate(out['cpus'] if out else []):
+                        k1 = c['stats']['k1']
+                        if not k1['l1_clears'] < k1['l1_switches'] - a.k:
+                            problems.append(f"cpu{v} L1 tables cleared {k1['l1_clears']} times of {k1['l1_switches']} switches")
                 if out and want:
                     problems += s3.smp.compare(prog, s3.vm_state(prog, out), want)
                 seen = {}
                 if out and name in EITHER:
                     for v, c in enumerate(out['cpus']):
-                        allowed = EITHER[name](v) if callable(EITHER[name]) else EITHER[name]
+                        allowed = EITHER[name](v, a.k) if callable(EITHER[name]) else EITHER[name]
                         got = {r: smp.num(c['gpr'][P.REGS.index(r)]) for r in allowed}
                         seen[v] = got
                         problems += [f'cpu{v} {r} = {got[r]:#x}, allowed {[hex(x) for x in sorted(ok)]}' for r, ok in allowed.items() if got[r] not in ok]

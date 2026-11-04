@@ -102,7 +102,9 @@ pub unsafe fn start() -> ! {
         halt(&s, stop::UNSUPPORTED_MODE)
     }
     cache::reset();
-    cache::fill_head(dispatcher());
+    if !cache::fill_head(dispatcher()) {
+        halt(&s, stop::UNSUPPORTED_MODE)
+    }
     lapic::init();
     // The GIC CPU interface: system registers on, every priority unmasked, group 1 (the doorbells) enabled.
     unsafe {
@@ -691,11 +693,15 @@ fn take_invalidations(s: &mut State) {
 /// Drops every block (capacity, or an invalidation request), with nothing generated live and the state banked: first
 /// undoes every link and checks that every link point holds its admitted word again.
 fn flush(s: &mut State) {
+    let t0 = ticks();
     match cache::unlink_all() {
         Some(n) if cache::links_restored() => s.unlinks += n,
         _ => halt(s, stop::BAD_LINK),
     }
     cache::reset();
+    let c = cache::control();
+    c.flushes += 1;
+    c.flush_ticks += ticks() - t0;
     s.generation += 1;
     s.shadow_generation += 1;
 }

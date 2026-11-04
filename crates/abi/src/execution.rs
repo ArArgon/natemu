@@ -160,15 +160,21 @@ pub mod cache {
     pub const DISPATCH_BYTES: usize = 0x1000;
     pub const DISPATCH_VA: u64 = CODE_VA + DISPATCH as u64;
     pub const DISPATCH_MISS: usize = DISPATCH + 16;
-    /// L1 as code: direct-mapped entries of [`L1_ENTRY_BYTES`] indexed by `rip & L1_MASK` (FEX `L1Pointer/L1Mask`),
-    /// so the dispatcher reads no data. A filled entry is `movz/movk x2, #rip` (4 words); `sub x2, x2, x0`; `cbnz x2,
-    /// miss`; `b entry`; an empty one starts with `b miss`. Only the resident writes them.
+    /// L1 as code: [`L1_TABLES`] tables of direct-mapped entries of [`L1_ENTRY_BYTES`] indexed by `rip & L1_MASK` (FEX
+    /// `L1Pointer/L1Mask`), so the dispatcher reads no data. A filled entry is `movz/movk x2, #rip` (4 words); `sub x2, x2,
+    /// x0`; `cbnz x2, miss`; `b entry`; an empty one starts with `b miss`. Only the resident writes them. Each table holds
+    /// entries of one code context ([`Control::l1_contexts`]); the dispatcher's `adr` names the current one (perf chunk 5:
+    /// a CPL change switches tables instead of clearing one).
     pub const L1_CODE: usize = DISPATCH + DISPATCH_BYTES;
     pub const L1_ENTRIES: usize = 4096;
     pub const L1_MASK: u64 = L1_ENTRIES as u64 - 1;
     pub const L1_ENTRY_BYTES: usize = 32;
+    pub const L1_TABLES: usize = 4;
+    pub const L1_TABLE_BYTES: usize = L1_ENTRIES * L1_ENTRY_BYTES;
+    /// [`Control::l1_contexts`]: a table that holds no context's entries (it is cleared before it takes one).
+    pub const NO_CONTEXT: u64 = u64::MAX;
     /// Blocks are placed from here.
-    pub const HEAD_BYTES: usize = L1_CODE + L1_ENTRIES * L1_ENTRY_BYTES;
+    pub const HEAD_BYTES: usize = L1_CODE + L1_TABLES * L1_TABLE_BYTES;
     /// The largest block admitted; the code area holds at least one.
     pub const MAX_BLOCK_BYTES: usize = 32 * 1024;
     /// Pool sizes: the Debian kernel's early boot averaged 261 code and 230 metadata bytes per block (M1), so the arena
@@ -191,8 +197,8 @@ pub mod cache {
 
     /// Lookup area layout: [`Control`], L1's owners, L2, block index (L1 is code, [`L1_CODE`]).
     pub const CONTROL: usize = 0;
-    /// K1: the block each L1 entry enters (u32 block number + 1; 0: empty), so a CR3 load empties only the entries of
-    /// blocks it makes stale.
+    /// K1: the block each L1 entry enters (u32 block number + 1; 0: empty; table t's at `L1_OWNERS + 4 * L1_ENTRIES * t`),
+    /// so a CR3 load empties only the entries of blocks it makes stale.
     pub const L1_OWNERS: usize = 0x1_0000;
     /// L2: open-addressed {guest RIP, block number + 1} table keyed by (RIP, context).
     pub const L2: usize = 0x2_0000;
@@ -251,8 +257,12 @@ pub mod cache {
         pub code_used: u64,
         pub meta_used: u64,
         pub blocks: u64,
-        /// The context word ([`super::Cpu::code_context`]) L1 was filled under.
-        pub l1_context: u64,
+        /// The L1 table the dispatcher probes; per table, the context word ([`super::Cpu::code_context`]) its entries were
+        /// filled under ([`NO_CONTEXT`]: none) and the `l1_switches` count when it was last left (the least recent is
+        /// reused first).
+        pub l1_table: u64,
+        pub l1_contexts: [u64; L1_TABLES],
+        pub l1_used: [u64; L1_TABLES],
         /// Link records in use.
         pub links: u64,
         /// The armed stop ([`super::STOP_WORD`]): `armed` words of the interrupted block, each (code-area offset, its
@@ -320,6 +330,17 @@ pub mod cache {
         /// system instructions, event frames, split stores).
         pub uncached_steps: u64,
         pub uncached_resident: u64,
+        /// Perf chunk 5: code-context changes (L1 table switches) and the tables cleared for a context that had none.
+        pub l1_switches: u64,
+        pub l1_clears: u64,
+        /// Whole-cache flushes (every reason: capacity, an invalidation request's [`FLUSH`], a new instruction breakpoint)
+        /// and their CNTVCT ticks (links undone, the reset); the placements that found the code area, the metadata arena or
+        /// the block index full (`full`, in that order); and the most of each used before a reset (`peak`: code bytes,
+        /// metadata bytes, blocks).
+        pub flushes: u64,
+        pub flush_ticks: u64,
+        pub full: [u64; 3],
+        pub peak: [u64; 3],
     }
     /// A block placed in the cache: its record in the metadata arena (at the offset `INDEX` lists), its access sites
     /// ([`crate::code_object::Site`]) right after it.
@@ -463,9 +484,10 @@ pub mod cache {
     const _: () = assert!(MAX_BLOCK_BYTES <= SLOT_BYTES && HEAD_BYTES % 64 == 0);
     const _: () = assert!((CODE_VA | CODE_WRITE_VA | META_VA | LOOKUP_VA | GLOBAL_VA) % BLOCK as u64 == 0);
     const _: () = assert!(CODE_OFFSET % BLOCK == 0 && META_BYTES % BLOCK == 0);
-    const _: () = assert!(core::mem::size_of::<Control>() <= L1_OWNERS && L1_OWNERS + 4 * L1_ENTRIES <= L2 && L2 + L2_ENTRIES * 16 <= INDEX);
+    const _: () = assert!(core::mem::size_of::<Control>() <= L1_OWNERS && L1_OWNERS + 4 * L1_ENTRIES * L1_TABLES <= L2 && L2 + L2_ENTRIES * 16 <= INDEX);
     const _: () = assert!(WRITABLE_SUMMARY + SUMMARY_BYTES <= PAGE_BLOCKS && PAGE_BLOCKS + 4 * super::MAX_GUEST_PAGES <= LINEAR_HEADS && LINEAR_HEADS + 4 * LINEAR_BUCKETS <= LOOKUP_BYTES);
-    const _: () = assert!(L1_MASK == 0xfff && L1_ENTRY_BYTES == 32 && L1_CODE - DISPATCH < 1 << 20); // the dispatcher's form
+    // The dispatcher's form; its `adr` and each entry's `cbnz` to the miss reach ±1 MiB.
+    const _: () = assert!(L1_MASK == 0xfff && L1_ENTRY_BYTES == 32 && L1_CODE + L1_TABLES * L1_TABLE_BYTES - DISPATCH < 1 << 20);
     const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= LINKS);
     const _: () = assert!(LINKS + MAX_LINKS * core::mem::size_of::<LinkRecord>() <= STEP_RECORD);
     const _: () = assert!(STEP_RECORD + STEP_RECORD_BYTES <= CODE_SUMMARY && STEP_RECORD % core::mem::align_of::<Block>() == 0);
@@ -1791,7 +1813,8 @@ pub mod perf {
     pub const LOOKUP: u64 = 20;
     pub const PATCH: u64 = 21;
     pub const ENTER: u64 = 22;
-    /// Clearing the dispatcher's L1 (its code rewritten and synchronized) when the code context changes (`select_l1`).
+    /// Switching the dispatcher's L1 table when the code context changes (`select_l1`; a table cleared for a context that
+    /// had none included).
     pub const L1: u64 = 23;
     pub const NAMES: [&str; BUCKETS] = ["start", "guest", "host", "halted", "mailbox", "link", "miss", "division", "helper",
         "stop", "irq", "abort", "place", "system", "tlb", "delivery", "revalidate", "shadow", "fetch", "shootdown",

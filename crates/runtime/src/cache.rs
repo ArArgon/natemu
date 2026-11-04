@@ -152,11 +152,19 @@ fn hash(rip: u64, context: u64) -> usize {
 /// Called with no generated code live and the state banked (links already undone, see [`unlink_all`]).
 pub fn reset() {
     let c = control();
+    for (p, used) in c.peak.iter_mut().zip([c.code_used, c.meta_used, c.blocks]) {
+        *p = (*p).max(used);
+    }
     (c.code_used, c.meta_used, c.blocks, c.links) = (area::HEAD_BYTES as u64, 0, 0, 0);
     // A `checked` of 0 is never current.
     (c.epoch, c.global_epoch) = (c.epoch.max(1), c.global_epoch.max(1));
     c.regions = [0; 16];
-    clear_l1();
+    // Block numbers start again: the dispatcher's table is emptied (it keeps its context), the others hold none.
+    let now = c.l1_table as usize;
+    clear_l1(now);
+    for t in (0..area::L1_TABLES).filter(|&t| t != now) {
+        (c.l1_contexts[t], c.l1_used[t]) = (area::NO_CONTEXT, 0);
+    }
     unsafe { ptr::write_bytes(lookup_area::<u8>(area::L2), 0, area::L2_ENTRIES * 16) };
     unsafe { ptr::write_bytes(lhead(0), 0, area::LINEAR_BUCKETS) };
     // The reverse map's heads: only pages this vCPU marked (its code summary) can hold one.
@@ -213,9 +221,9 @@ fn on_linear_page(page: u64, mut f: impl FnMut(usize)) {
 fn head(page: usize) -> *mut u32 {
     lookup_area::<u32>(area::PAGE_BLOCKS).wrapping_add(page)
 }
-/// Code-area offset of L1 entry `i`.
-fn l1_entry(i: usize) -> u64 {
-    (area::L1_CODE + i * area::L1_ENTRY_BYTES) as u64
+/// Code-area offset of entry `i` of L1 table `t`.
+fn l1_entry(t: usize, i: usize) -> u64 {
+    (area::L1_CODE + t * area::L1_TABLE_BYTES + i * area::L1_ENTRY_BYTES) as u64
 }
 /// The L1 entry at `at` for `rip`, entering code-area offset `entry`: `movz/movk x2, #rip; sub x2, x2, x0; cbnz x2,
 /// miss; b entry` (the dispatcher's miss), then `udf`.
@@ -233,43 +241,80 @@ fn l1_words(at: u64, rip: u64, entry: u64) -> [u32; 8] {
         0,
     ]
 }
-/// L1 entry `i`'s owner: the block it enters, number + 1 (0: empty).
-fn l1_owner(i: usize) -> *mut u32 {
-    lookup_area::<u32>(area::L1_OWNERS).wrapping_add(i)
+/// Entry `i` of L1 table `t`'s owner: the block it enters, number + 1 (0: empty).
+fn l1_owner(t: usize, i: usize) -> *mut u32 {
+    lookup_area::<u32>(area::L1_OWNERS).wrapping_add(t * area::L1_ENTRIES + i)
 }
-/// Empties L1 entry `i` (its first word branches to the dispatcher's miss); the caller synchronizes the code.
-fn empty_l1(i: usize) {
-    unsafe { l1_owner(i).write(0) };
-    let at = l1_entry(i);
+/// Empties entry `i` of L1 table `t` (its first word branches to the dispatcher's miss); the caller synchronizes the code.
+fn empty_l1(t: usize, i: usize) {
+    unsafe { l1_owner(t, i).write(0) };
+    let at = l1_entry(t, i);
     unsafe { ((area::CODE_WRITE_VA + at) as *mut u32).write_volatile(branch(at, area::DISPATCH_MISS as u64)) };
 }
-fn clear_l1() {
+fn clear_l1(t: usize) {
     for i in 0..area::L1_ENTRIES {
-        empty_l1(i);
+        empty_l1(t, i);
     }
-    let bytes = area::L1_ENTRIES * area::L1_ENTRY_BYTES;
-    synchronize_code(area::CODE_WRITE_VA + l1_entry(0), area::CODE_VA + l1_entry(0), bytes);
+    synchronize_l1(t);
+}
+fn synchronize_l1(t: usize) {
+    synchronize_code(area::CODE_WRITE_VA + l1_entry(t, 0), area::CODE_VA + l1_entry(t, 0), area::L1_TABLE_BYTES);
+}
+/// The dispatcher's `adr x2` (its second word) to L1 table `t`.
+const DISPATCH_ADR: u64 = area::DISPATCH as u64 + 4;
+fn dispatch_adr(t: usize) -> u32 {
+    let imm = l1_entry(t, 0).wrapping_sub(DISPATCH_ADR) as u32;
+    0x1000_0002 | (imm & 3) << 29 | (imm >> 2 & 0x7_ffff) << 5
 }
 
-/// Fills the code area's head once, before any block runs: the dispatcher's code.
-pub fn fill_head(dispatcher: &[u8]) {
+/// Fills the code area's head once, before any block runs: the dispatcher's code. False if its `adr` is not the form
+/// [`select_l1`] rewrites (to L1 table 0), or if any table's `adr` does not decode to that table.
+pub fn fill_head(dispatcher: &[u8]) -> bool {
     unsafe { copy_record((area::CODE_WRITE_VA + area::DISPATCH as u64) as *mut u8, dispatcher.as_ptr(), dispatcher.len()) };
     synchronize_code(area::CODE_WRITE_VA + area::DISPATCH as u64, area::DISPATCH_VA, dispatcher.len());
+    // ADR: immlo bits 30:29, immhi bits 23:5, a signed 21-bit offset from the instruction.
+    let target = |w: u32| DISPATCH_ADR.wrapping_add(((((w >> 29 & 3) | (w >> 5 & 0x7_ffff) << 2) << 11) as i32 >> 11) as u64);
+    control().l1_table == 0
+        && word(DISPATCH_ADR) == dispatch_adr(0)
+        && (0..area::L1_TABLES).all(|t| dispatch_adr(t) & 0x9f00_001f == 0x1000_0002 && target(dispatch_adr(t)) == l1_entry(t, 0))
 }
 
-/// L1 is keyed by RIP alone, so it holds entries of one context: switching clears it.
+/// L1 is keyed by RIP alone, so each table holds entries of one context, and the dispatcher probes the table of the
+/// current one: a change of context switches tables (the dispatcher's `adr` rewritten), so no block is entered from L1
+/// under another context than its own. A context with no table takes the least recently left one, cleared first. Every
+/// table's entries are kept as exact as the current one's: a TLB flush, an invalidation or a reset reaches them all.
 pub fn select_l1(context: u64) {
     let c = control();
-    if c.l1_context != context {
-        let p = crate::perf::enter(crate::perf::L1);
-        clear_l1();
-        crate::perf::leave(p);
-        c.l1_context = context;
+    let now = c.l1_table as usize;
+    if c.l1_contexts[now] == context {
+        return;
     }
+    let p = crate::perf::enter(crate::perf::L1);
+    c.l1_switches += 1;
+    c.l1_used[now] = c.l1_switches;
+    let t = match (0..area::L1_TABLES).find(|&t| c.l1_contexts[t] == context) {
+        Some(t) => t,
+        None => {
+            let t = (0..area::L1_TABLES).min_by_key(|&t| c.l1_used[t]).unwrap_or(0);
+            clear_l1(t);
+            c.l1_contexts[t] = context;
+            c.l1_clears += 1;
+            t
+        }
+    };
+    c.l1_table = t as u64;
+    rewrite(DISPATCH_ADR, dispatch_adr(t));
+    crate::perf::leave(p);
 }
+/// Enters `block` for `rip` in the dispatcher's L1 table if the block's context is the table's ([`select_l1`] ran for
+/// it before the lookup that found it); otherwise nothing is entered (the block is still entered from the resident).
 pub fn fill_l1(rip: u64, block: &Block) {
-    unsafe { l1_owner((rip & area::L1_MASK) as usize).write(block.number + 1) };
-    let at = l1_entry((rip & area::L1_MASK) as usize);
+    let t = control().l1_table as usize;
+    if control().l1_contexts[t] != block.context {
+        return;
+    }
+    unsafe { l1_owner(t, (rip & area::L1_MASK) as usize).write(block.number + 1) };
+    let at = l1_entry(t, (rip & area::L1_MASK) as usize);
     let words = l1_words(at, rip, block.entry() - area::CODE_VA);
     // Already there (a resident entry that ends at the same block again, e.g. after a system instruction): no code change.
     if (0..words.len()).all(|k| unsafe { ((area::CODE_WRITE_VA + at) as *const u32).add(k).read_volatile() } == words[k]) {
@@ -315,7 +360,7 @@ pub fn lookup(rip: u64, context: u64, mut mapped: impl FnMut(&Block) -> Option<b
         i = (i + 1) & (area::L2_ENTRIES - 1);
     }
 }
-/// K1: a TLB flush of this vCPU (`global`: global entries too): the epoch moves, and every L1 entry and link into a block
+/// K1: a TLB flush of this vCPU (`global`: global entries too): the epoch moves, and every L1 entry (of every table) and link into a block
 /// no longer current goes (the blocks stay, found again by [`lookup`] after a fetch walk). Returns the links undone;
 /// `None` if a record does not describe its word (as [`unlink_all`]).
 pub fn tlb(global: bool) -> Option<u64> {
@@ -324,19 +369,26 @@ pub fn tlb(global: bool) -> Option<u64> {
     if global {
         c.global_epoch = c.epoch;
         c.global_flushes += 1;
-        clear_l1();
+        // No block is current: the dispatcher's table is emptied, the others hold no context any more.
+        let now = c.l1_table as usize;
+        clear_l1(now);
+        for t in (0..area::L1_TABLES).filter(|&t| t != now) {
+            (c.l1_contexts[t], c.l1_used[t]) = (area::NO_CONTEXT, 0);
+        }
     } else {
         c.cr3_loads += 1;
-        let mut emptied = false;
-        for i in 0..area::L1_ENTRIES {
-            let owner = unsafe { l1_owner(i).read() };
-            if owner != 0 && !current(block(owner as usize - 1)) {
-                empty_l1(i);
-                emptied = true;
+        for t in (0..area::L1_TABLES).filter(|&t| c.l1_contexts[t] != area::NO_CONTEXT) {
+            let mut emptied = false;
+            for i in 0..area::L1_ENTRIES {
+                let owner = unsafe { l1_owner(t, i).read() };
+                if owner != 0 && !current(block(owner as usize - 1)) {
+                    empty_l1(t, i);
+                    emptied = true;
+                }
             }
-        }
-        if emptied {
-            synchronize_code(area::CODE_WRITE_VA + l1_entry(0), area::CODE_VA + l1_entry(0), area::L1_ENTRIES * area::L1_ENTRY_BYTES);
+            if emptied {
+                synchronize_l1(t);
+            }
         }
     }
     prune()
@@ -359,6 +411,7 @@ pub fn place(
     let code = c.code_used.next_multiple_of(CODE_ALIGN);
     let code_end = code + u64::from(h.code_size);
     if code_end > c.code_bytes {
+        c.full[0] += 1;
         return None;
     }
     let record = Block {
@@ -409,6 +462,7 @@ unsafe fn file(record: Block, tail: *const u8, tail_bytes: usize) -> Option<&'st
     let meta = c.meta_used.next_multiple_of(align_of::<Block>() as u64);
     let meta_end = meta + (size_of::<Block>() + tail_bytes) as u64;
     if meta_end > area::META_BYTES as u64 || c.blocks as usize >= area::MAX_BLOCKS {
+        c.full[if meta_end > area::META_BYTES as u64 { 1 } else { 2 }] += 1;
         return None;
     }
     let n = c.blocks as usize;
@@ -710,7 +764,7 @@ pub fn kick(v: usize) {
 }
 
 /// Invalidates every live block of this vCPU translated from `gpa`'s page (the page is about to be written, or was):
-/// each leaves L1 and L2, every link into or out of it is undone and its record dropped, and it is marked dead. Then
+/// each leaves L1 (every table) and L2, every link into or out of it is undone and its record dropped, and it is marked dead. Then
 /// this vCPU's bit for the page is cleared. Returns the links undone; `None` if a record does not describe its word
 /// (as [`unlink_all`]). K1: the blocks are found from the page's chain ([`area::PAGE_BLOCKS`]), which then empties (every
 /// block on it is dead).
@@ -824,10 +878,12 @@ fn cut_one(n: usize, dead: bool) -> bool {
         c.unvalidated += 1;
     }
     let i = (b.rip & area::L1_MASK) as usize;
-    let at = l1_entry(i);
-    if unsafe { l1_owner(i).read() } == b.number + 1 {
-        empty_l1(i);
-        synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, 4);
+    for t in 0..area::L1_TABLES {
+        if unsafe { l1_owner(t, i).read() } == b.number + 1 {
+            empty_l1(t, i);
+            let at = l1_entry(t, i);
+            synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, 4);
+        }
     }
     linked
 }

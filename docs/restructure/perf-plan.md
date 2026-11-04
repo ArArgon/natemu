@@ -1,6 +1,6 @@
 # Performance phase plan (draft)
 
-Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review. Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
+Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review; chunks 1-5 measured below (chunk 5 uncommitted on d89bc4c). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
 code, measured first; the correctness pass follows. Principles: measure first; native mechanisms; nothing keyed to
 Linux (a KASLR boot must gain too); every object still admitted; checks green; no debt.
 
@@ -136,8 +136,12 @@ at full detail, the all-thread sums at N = 4 and the min-max spreads: `tables.md
 2. *Reuse across load addresses*: 902,851 of the compiles (79%) read bytes that an earlier compile read at another RIP
    with the same page offset, 902,211 from the same guest-physical page; the run reads only 126 k distinct byte strings
    (44 k with a warm cache, whose 972 k compiles hold 902 k such repeats). 99% of them are user code (kernel compiles:
-   180 k cache off, 9.5 k warm). A KASLR kernel compiles 61.5 k blocks of which 121 repeat bytes: its relocated text
-   differs in bytes, so byte-keyed reuse does not cover it (4.70 s against 2.62 s, +2.1 s of compiles).
+   180 k cache off, 9.5 k warm). A KASLR kernel with a warm cache compiles 61.5 k blocks of which 121 repeat bytes (4.70 s against 2.62 s, +2.1 s of
+   compiles): KASLR picks the kernel's address once per boot, and the decompressor's relocations change the bytes that
+   hold absolute addresses, so the persistent disk cache, written by an earlier boot at another address, misses.
+   (Corrected November 3, chunk 5: within a run the kernel does not move, so the in-memory and in-VM caches work as with
+   `nokaslr`; runtime text patching is independent of KASLR and handled by per-page invalidation. KASLR costs only the
+   warm-cache speed-up, never the cold-boot comparison with QEMU.)
 3. *The warm cache does not pay on the installer*: 171 k disk hits (4.2 us of get each) against 972 k misses that pay the
    SHA-256 key (+1.5 us) and a put; N = 1 warm 68.3 s, off 68.5 s uninstrumented.
 4. *The resident's own work is about 20 s*, five times the guest's 4.1 s: 21.6 M block entries through `enter` (0.22 us
@@ -287,8 +291,9 @@ object's refusal stays a host error. Under `--code-shape` each reused answer is 
 **Expected.** 913,784 of 1,143,801 compiles (79.9%) become relocated hits at N = 1 cache off. At series48-lean's 16.3 us
 round trip against about 1 us of relocation, about 14 s of the 49.3 s wall (bound: all round trips, 18.6 s); a cache
 that keeps its 129,859 answers instead of resetting adds the 99.5 k same-RIP repeats (about 1.5 s). No FEX change is
-needed; a fixed four-word guest-RIP move would remove the 0.07% refusals at the cost of a word per move, not worth it. A
-KASLR kernel's relocated text still differs in bytes (chunk 1) and is not covered.
+needed; a fixed four-word guest-RIP move would remove the 0.07% refusals at the cost of a word per move, not worth it.
+KASLR is not a reuse problem within a run (the kernel stays at the address chosen at boot); across boots its relocated text
+differs in bytes, so only the persistent cache's hits for the kernel are lost (chunk 1, corrected).
 
 ### Measured (chunk 4: reuse across load addresses, November 3; uncommitted on a24c785, series48-lean)
 
@@ -371,13 +376,123 @@ ASM 1,875 / 0 fail / 48 / 347; `run_x1.py` 6/6 and 196/196; i10 faults 296 at bo
 `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7, `r1b` 12/12 (negative controls flagged); all 51 boots (50 measured, 1 check) reached the dialog.
 Not rerun: fexc's own tests (fexc unchanged) and the suite's other runners.
 
+### Measured (chunk 5: one L1 table per code context, November 3; uncommitted on d89bc4c, series48-lean)
+
+**Breakdown on d89bc4c** (chunk 1's method and scripts, `natemu-raw/perf5-20261103-01/`: `campaign5.sh`, `boot.py`,
+`analyze.py`, `aggregate.py`; installer to "Select a language", 2 GiB, `mitigations=off nokaslr`, cache off, one VM at a time,
+three rounds after a warm-up boot; `step1/` alone, `step3/` interleaved with the fix; s of vCPU 0's window, mean of 3, log on):
+
+| s, vCPU 0 (log on) | N=1 d89bc4c (step1) | N=1 d89bc4c (step3) | N=1 **after** | N=4 d89bc4c (step1) | N=4 d89bc4c (step3) | N=4 **after** |
+| --- | --- | --- | --- | --- | --- | --- |
+| Host, fexc round trip | 2.16 | 2.13 | 2.14 | 1.86 | 1.98 | 1.91 |
+| Host, admission / rest of the request / bookkeeping / log line | 1.28 / 1.00 / 0.82 / 0.45 | 1.33 / 1.01 / 0.84 / 0.46 | 1.36 / 1.03 / 0.87 / 0.51 | 0.45 / 0.34 / 0.41 / 0.16 | 0.43 / 0.33 / 0.40 / 0.15 | 0.51 / 0.39 / 0.47 / 0.19 |
+| HVF entry and exit | 1.22 | 1.25 | 1.29 | 0.44 | 0.43 | 0.50 |
+| VM, guest code | 3.51 | 3.56 | 2.32 | 1.21 | 1.00 | 0.90 |
+| VM, halted and mailbox | 0 | 0 | 0 | 12.62 | 13.45 | 8.13 |
+| VM, entering blocks (`enter`) | 4.10 | 4.15 | 1.87 | 1.28 | 1.08 | 0.69 |
+| VM, dispatcher misses (own) | 4.00 | 4.07 | 0.89 | 1.17 | 0.93 | 0.29 |
+| VM, linker entries (own) | 2.62 | 2.66 | 2.40 | 0.97 | 0.93 | 0.96 |
+| VM, L1 at code-context changes | 2.76 | 2.80 | **0.02** | 0.72 | 0.57 | **0.01** |
+| VM, block lookup, exit patching, placement | 0.90 | 0.93 | 0.76 | 0.31 | 0.29 | 0.28 |
+| VM, address-space work (TLB flushes, shadow misses, aborts, revalidation, deliveries) | 2.12 | 2.16 | 2.01 | 0.54 | 0.53 | 0.55 |
+| VM, system instructions, fetch walks, IRQs, helpers | 0.79 | 0.80 | 0.84 | 0.32 | 0.30 | 0.35 |
+| Unattributed | 0.49 | 0.49 | 0.49 | 0.26 | 0.27 | 0.27 |
+| **Window (process start to vCPU 0's loop end)** | **28.25** | **28.68** | **18.83** | **23.09** | **23.08** | **16.42** |
+| Dispatcher misses / block entries / linker entries, all threads (M) | 13.08 / 19.35 / 6.20 | 13.10 / 19.40 / 6.22 | 2.57 / 8.29 / 5.66 | 13.33 / 19.40 / 5.95 | 13.28 / 19.36 / 5.97 | 2.62 / 8.41 / 5.69 |
+
+Unattributed is at most 2.64% of the window (process and every thread, all 18 log-on runs). With reuse (chunk 4) the
+compiles are 128 k at N = 1 (2.1 s of round trips): the resident's own work is now the largest share, and of it L1 clears and
+the misses and entries refilling L1 were about 11 s.
+
+**Cause** (a temporary diagnostic, `diag/diag.patch`, removed: in `select_l1`, the changed context bits, the last
+cause before the change and the contexts seen; one boot each, `diag/`): at N = 1, 244,980 changes, every one but 4 at
+start-up between exactly two context words, 0x22804 (CPL 0) and 0x22807 (CPL 3): bits 0-1 (CPL) only. Causes: SYSCALL
+67,343, SYSRET 66,460, IRETQ 56,028, exception deliveries from CPL 3 51,967 (#PF mostly), other events 3,178; CR0.TS, MXCSR,
+FCW, CR4, XCR0 never change after start-up (Linux 6.12 has no lazy FPU; MXCSR and FCW stay at their masked defaults). vCPU
+0 at N = 4: 89,050, the same two words. Each change emptied L1's 4,096 entries (11.5 us: a word per entry, then cache
+maintenance of 128 KiB), because L1 is keyed by RIP alone: the kernel's and user code's entries never collide by RIP, but
+exactness (K1: a block never runs under other gating than it was compiled for, e.g. a CPL 0 block entered at CPL 3) needs the
+context in the key, and no L1 entry carried it.
+
+**Built** (resident; `crates/abi/src/execution.rs` cache layout, `crates/runtime/src/cache.rs`). L1 is four tables
+(`L1_TABLES`, 128 KiB each after the dispatcher; the head grows by 384 KiB of the 128 MiB code area; their owners fill the
+lookup area's existing 64 KiB), each tagged with the context word its entries were filled under (`Control::l1_contexts`,
+`NO_CONTEXT` for none). The dispatcher is unchanged (`and; adr; add; br`, no data read: no hot-path cost); `select_l1`
+switches tables by rewriting its `adr` word (one word and its cache maintenance), to the table tagged with the new context,
+or, if none is, to the least recently left table cleared first. Every table stays exact: a CR3 load scans every tagged
+table's owners as it scanned L1's (blocks no longer current leave); an invalidation or INVLPG (`cut_one`) empties a block's
+entry in every table; a global flush and a reset clear the dispatcher's table and untag the others (cleared before reuse);
+`fill_l1` enters a block only into a table of its own context. `fill_head` checks that the template's `adr` is the encoding
+`select_l1` writes (else `UNSUPPORTED_MODE`). The K1 statistics gain `l1_switches` and `l1_clears`; the perf `l1` bucket
+times the switches. After an independent review (no blocking defect): `reset` keeps the dispatcher's table tagged (one
+clear, not two), `fill_l1`'s tag check, the test's switch/clear assertion; the measurements are of the build before these
+(off the boot's path but for one clear at start-up).
+
+**Test** (`tools/run_k1.py contexts`, natemu only, 1-4 vCPUs, both block sizes): one block called through the dispatcher
+(`mov rax, V; jmp rax`, its `jmp r13` back) K = 50 rounds of A, C, A, C (two tables kept and switched between), B, D, E, F:
+A MXCSR 0x1f80 runs, C (PM clear) takes #XM, B (CR0.TS) #NM, D/E/F (UM, ZM, DM clear) run; six contexts for four tables, so
+tables are evicted and reused. Expected per CPU: 251 runs, 50 #NM, 100 #XM, and fewer L1 clears than switches less K; green.
+Negative controls (`k1-contexts-nc1/`, `-nc2/`): no switch (the table re-tagged in place) gives 401 runs, 0 #NM, 0 #XM; an
+evicted table reused uncleared 299 runs, 1 #NM, 101 #XM: both red. After the coordinator's review (no CR3 load, INVLPG or code
+write had reached a table other than the dispatcher's in any K1 case), the case ends with V's block kept in A's table and,
+under C, V remapped to another frame with INVLPG, that frame's bytes rewritten, V remapped again with a CR3 reload (no
+INVLPG); each followed by a call under A that must run the new bytes (2, 3, 4). Green at 1-4 vCPUs and both block sizes;
+red with `cut_one` limited to the dispatcher's table (1, 1, 4; with `--max-block 1` the stale block triple-faults), with the
+CR3-load scan so limited (2, 3, 3) and with both (1, 1, 1) (`k1-kept*/`). `fill_head` also checks that every table's `adr`
+decodes to that table.
+
+**Measured** (`step3/`, three interleaved rounds before and after, log off; mean, min-max):
+
+| Installer, cache off | d89bc4c | after | change |
+| --- | --- | --- | --- |
+| N = 1 wall s | 27.65 (27.61-27.71) | **17.38** (17.27-17.45) | -10.27 s (-37%) |
+| N = 4 wall s | 22.59 (22.49-22.67) | **15.56** (15.50-15.66) | -7.03 s (-31%) |
+| N = 1 / N = 4, log on | 28.68 / 23.08 | 18.82 / 16.41 | |
+| "Run /init" guest s, N = 1 / 4 | 4.04 / 5.38 | 3.57 / 5.05 | |
+| L1 clears per boot, N = 1 (vCPU 0) | 244.7 k | 21 (240.5 k switches) | |
+
+**Ship threshold met**: -7.0 and -10.3 s against spreads of at most 0.2 s. Beyond the clears, misses fall 13.1 M to
+2.6 M and block entries 19.4 M to 8.3 M (each L1 refill was a miss and a resident entry); guest code also runs 1.2 s faster at
+N = 1 (likely: no 128 KiB of L1 code rewritten and evicted from the caches at every system call; not measured). A CR3 load's scan covers two tagged tables
+(`tlb_us` 0.61 to 0.65 s at N = 1).
+
+**Largest resident cost left** (N = 1, vCPU 0): linker entries 2.40 s (5.66 M for 3.15 M links; 3.13 M links are undone when their targets stop being current (CR3 loads, INVLPG, #PF;
+the split was not measured) or die, and are made again after the revalidation walk), guest
+code 2.32 s, `enter` 1.87 s (8.3 M at 0.23 us), the host's fexc 2.14 s and admission 1.36 s, address-space work 2.0 s.
+Proposed next: keep links into a block across a CR3 load while the block is revalidated unchanged (an epoch per address
+space, as the "Address-space switches" candidate keeps shadows per CR3 root), bounded by the linker's 2.4 s plus a share of
+`enter`; then the "Resident entry cost" items (about 0.23 us per entry).
+
+**Whole-cache flushes** (counted after the measurements above: `Control::flushes`, `flush_ticks`, `full`, `peak`, in the K1
+statistics as `flushes`, `flush_us`, `full`, `used`, `peak`, `capacity`; two boots at N = 1 and two at N = 4, cache off,
+log on, `flush/`; not fixed in this chunk). Every capacity flush is the **metadata arena** filling (64 MiB): at N = 1
+4 capacity flushes per boot (and one more of another reason, 5 in all), at N = 4 one per vCPU (2 in all). At each, the arena
+is at 64 MiB with about 254-255 k blocks (about 263 bytes of record and sites per block), the block index at 97% of its
+262,144, the code area at 40.5-41.0 MiB of 128 MiB (32%). The flush itself is cheap (19-21 ms per boot at N = 1, 8-11 ms per
+vCPU at N = 4); its cost is the refill: at N = 1 the boot makes 1.16 M translation requests for 127 k compiles, and only about
+43 k of the 1.06 M memory hits follow a kill or a remap (39 k blocks killed, 4 k remapped), so about 1.0 M (4 x 255 k) are
+blocks placed again after a flush, each a host exit and a memory hit (about 2.1 us of request plus about 1.4 us of exit and
+bookkeeping) and a placement, linking and L1 fill again: about 3.5-4.5 s of the 17.4 s at N = 1 (an estimate from the per-request
+means, not measured directly); at N = 4 230-310 k memory hits per vCPU. Candidates: a larger arena and index with L2 to match
+(the code area is two thirds empty), smaller records (sites dominate), or evicting part of the cache instead of all of it.
+
+**Checks** (`suite/`: the handoff §5 block, every command at 2 GiB, both block sizes, on the build with the review's
+changes; `final/` after the flush counters): `cargo test` 159 + 1 ignored, also with `FEXC` set; `check_resident_stack.py`
+`ok` (19,168 / 23,312 / 12,832, as before); Python 317; everything green but the 7 known i8b QEMU two-NaN departures at both
+block sizes (the same 7 programs): fixtures 64, seed 44, faults 7,912 at both, ASM 1,875 / 0 / 48 / 347, `run_k1.py` 200
+cases with `contexts` (none failing, counts unchanged by rounds), `run_k2.py`, every `run_slice3_vm.py` mode (`contain` 423
+controls), `run_x1.py` 6/6 and 196/196, `run_i5c.py` 255, `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative controls flagged),
+`run_boot_smoke.py` 4/4, and the rest of the block with exit 0. On the final build: `cargo test` both ways, the stack check,
+`run_k1.py` (200 cases, with the extended `contexts`), `run_k2.py`, fixtures at both block sizes, `run_boot_smoke.py` 4/4; all 33 installer boots of `step1/`, `step3/`
+and `flush/` reached the dialog.
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
 at both RAM sizes and the boots of §5.
 
 **Translations reusable across load addresses (host).** *Hypothesis:* most compiles are the same bytes at another
-page-aligned base (shared libraries, PIE, a KASLR kernel). *RIP dependence today:* the memory key `(rip, limit)`
+page-aligned base (shared libraries, PIE; a KASLR kernel only across boots, through the persistent cache). *RIP dependence today:* the memory key `(rip, limit)`
 (`execution.rs:723`, 834); the disk key, SHA-256 of the whole body with `--rip` and the bytes to the page end
 (`compile_cache.rs:182`, `execution.rs:929-930`); in the object, `guest_rip`, literal slots (block RIP, end, branch
 target) and RIP moves (return addresses, RIP-relative operands). Split and alignment stubs of RIP-addressed accesses
@@ -393,8 +508,9 @@ constant FEX folds without a relocation is invisible to admission. First a proof
 fexc at RIP and RIP + k * 4 KiB (several k, each half), requiring objects equal but for relocation values; each
 difference is a fexc patch before reuse ships (done, chunk 3: no patch; the relocator refuses three classes; built in chunk 4). Under the suites' code-shape option each reused answer is also compiled
 fresh and compared. *Expected:* about 1 M compiles become hits that still cost a host round trip (4-6 us): roughly 25
-of the 35 s. KASLR: the decompressor's relocations change bytes holding absolute addresses; the kernel's gain is
-measured. *Decides:* reuse bound, proof differences, fallback rate.
+of the 35 s. KASLR: the kernel's address is fixed for the run, so in-run reuse is as with `nokaslr`; the decompressor's
+relocations change bytes holding absolute addresses, so only the persistent cache across boots misses for the kernel (the
+warm-cache speed-up, not the cold boot). *Decides:* reuse bound, proof differences, fallback rate.
 
 **Reuse inside the resident.** *Hypothesis:* about 1 M exits then remain because the resident looks up by linear RIP
 (plan, Built (K1)) though the physical page is translated at another base. *Mechanism:* on a miss the reverse map
