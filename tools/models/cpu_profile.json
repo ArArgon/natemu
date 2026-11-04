@@ -642,9 +642,9 @@
    "subleaf": 0,
    "eax": "0x0",
    "ebx": "0x218801a9",
-   "ecx": "0x0",
+   "ecx": "0x4",
    "edx": "0x0",
-   "source": "CPU 16 (CLM-03-01-16)",
+   "source": "CPU 16 (CLM-03-01-16); ECX.UMIP by owner decision November 3 (boot-features plan, Built (UMIP))",
    "fields": {
     "ebx": {
      "0": {
@@ -743,7 +743,7 @@
     "ecx": {
      "2": {
       "name": "UMIP",
-      "state": "clear"
+      "state": "advertised"
      },
      "3": {
       "name": "PKU",
@@ -1253,7 +1253,7 @@
     "UMIP": {
      "bit": 11,
      "gate": "7.0.ecx.UMIP",
-     "valid": false
+     "valid": true
     },
     "LA57": {
      "bit": 12,

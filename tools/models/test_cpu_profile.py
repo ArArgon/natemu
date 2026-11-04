@@ -54,7 +54,7 @@ class Cpuid(unittest.TestCase):
         self.assertEqual(P.cpuid(0xB, 9, vcpu=2), (0, 0, 9, 2))
 
     def test_leaf7_and_extended_state(self):
-        self.assertEqual(P.cpuid(7, 0), (0, bitset(0, 3, 5, 7, 8, 19, 23, 24, 29), 0, 0))   # FSGSBASE BMI1 AVX2 SMEP BMI2 ADX CLFLUSHOPT CLWB SHA only
+        self.assertEqual(P.cpuid(7, 0), (0, bitset(0, 3, 5, 7, 8, 19, 23, 24, 29), bitset(2), 0))   # FSGSBASE BMI1 AVX2 SMEP BMI2 ADX CLFLUSHOPT CLWB SHA; UMIP only
         self.assertEqual(P.cpuid(7, 1), (0, 0, 0, 0))
         self.assertEqual(P.cpuid(0xD, 0, xcr0=7), (7, 832, 832, 0))
         self.assertEqual(P.cpuid(0xD, 0, xcr0=3)[1], 576)
@@ -96,10 +96,10 @@ class Cpuid(unittest.TestCase):
 class ControlBits(unittest.TestCase):
     def test_masks(self):
         self.assertEqual(P.cr0_valid_mask(), bitset(0, 1, 2, 3, 4, 5, 16, 18, 29, 30, 31))
-        # plan section 1 CR4 row: DE TSD PSE PAE PGE PCE OSFXSR OSXMMEXCPT FSGSBASE OSXSAVE SMEP
-        self.assertEqual(P.cr4_valid_mask(), bitset(2, 3, 4, 5, 7, 8, 9, 10, 16, 18, 20))
+        # plan section 1 CR4 row: DE TSD PSE PAE PGE PCE OSFXSR OSXMMEXCPT FSGSBASE OSXSAVE SMEP; UMIP (November 3)
+        self.assertEqual(P.cr4_valid_mask(), bitset(2, 3, 4, 5, 7, 8, 9, 10, 11, 16, 18, 20))
         self.assertEqual(P.efer_valid_mask(), bitset(0, 8, 10, 11))
-        for name in ('VME', 'PVI', 'MCE', 'UMIP', 'LA57', 'VMXE', 'SMXE', 'PCIDE', 'SMAP', 'PKE', 'CET', 'PKS', 'UINTR', 'KL'):
+        for name in ('VME', 'PVI', 'MCE', 'LA57', 'VMXE', 'SMXE', 'PCIDE', 'SMAP', 'PKE', 'CET', 'PKS', 'UINTR', 'KL'):
             self.assertFalse(RAW['control']['cr4']['bits'][name]['valid'], name)
 
     def test_xcr0(self):
@@ -194,8 +194,10 @@ class Consistency(unittest.TestCase):
         self.assertTrue(any('XCR0' in m for m in self.mutate(g)))
 
     def test_cr4_bit_without_feature(self):
-        def f(d): d['control']['cr4']['bits']['UMIP']['valid'] = True
-        self.assertTrue(any('UMIP' in m for m in self.mutate(f)))
+        def f(d): d['control']['cr4']['bits']['LA57']['valid'] = True
+        self.assertTrue(any('LA57' in m for m in self.mutate(f)))
+        def h(d): self.leaf(d, 7, 0)['ecx'] = '0x0'                                             # UMIP off, CR4.UMIP still valid
+        self.assertTrue(any('UMIP' in m for m in self.mutate(h)))
         def g(d): self.leaf(d, 1)['ecx'] = hex(int(self.leaf(d, 1)['ecx'], 16) & ~(1 << 26))   # XSAVE off, OSXSAVE still valid
         self.assertTrue(any('OSXSAVE' in m for m in self.mutate(g)))
 

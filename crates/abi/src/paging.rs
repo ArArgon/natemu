@@ -289,6 +289,36 @@ mod tests {
             })
         );
     }
+    /// SMEP (SDM Vol.3 4.6.1): a supervisor-mode fetch faults (#PF P | I/D, I/D also without NXE, 4.7) from a linear
+    /// address whose user-mode access is allowed, i.e. U/S = 1 at every level of the walk, 4 KiB or 2 MiB leaf; one
+    /// supervisor entry at any level lets it run. Data accesses and CPL 3 fetches are not affected; SMEP off: no fault.
+    #[test]
+    fn smep_needs_user_at_every_level() {
+        for large in [false, true] {
+            let (mut m, mut c) = setup();
+            if large {
+                m.0[1024] = 0x20_0000 | 0x87; // the PDE of 0x100000: a 2 MiB leaf at 0x200000
+            }
+            let levels: &[usize] = if large { &[0, 512, 1024] } else { &[0, 512, 1024, 1792] };
+            let fault = Err(Fault::Page { address: 0x100000, error: 0x11 });
+            for (smep, nxe) in [(0, 1), (1, 1), (1, 0)] {
+                (c.smep, c.nxe) = (smep, nxe);
+                assert_eq!(walk(&mut m, c, 0x100000, Access::Fetch).is_ok(), smep == 0, "large {large} smep {smep}");
+                if smep != 0 {
+                    assert_eq!(walk(&mut m, c, 0x100000, Access::Fetch), fault);
+                }
+                assert!(walk(&mut m, c, 0x100000, Access::Read).is_ok() && walk(&mut m, c, 0x100000, Access::Write).is_ok());
+                for &at in levels {
+                    m.0[at] &= !4;
+                    assert!(walk(&mut m, c, 0x100000, Access::Fetch).is_ok(), "large {large} U/S clear at {at}");
+                    m.0[at] |= 4;
+                }
+                c.cpl = 3;
+                assert!(walk(&mut m, c, 0x100000, Access::Fetch).is_ok());
+                c.cpl = 0;
+            }
+        }
+    }
     /// M2: SDM Vol.3 5.9.2 and Table 14-11: the page's PAT index is 4*PAT + 2*PCD + PWT of the entry that maps it (PAT: bit 7 of
     /// a PTE, bit 12 of a 2 MiB PDE); the PWT/PCD of the entries above select only the type of the next table's read.
     #[test]

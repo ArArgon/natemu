@@ -1168,6 +1168,8 @@ pub const CR4_SMAP: u64 = 1 << 21;
 pub const CR4_LA57: u64 = 1 << 12;
 pub const CR4_PGE: u64 = 1 << 7;
 pub const CR4_PCIDE: u64 = 1 << 17;
+/// User-mode instruction prevention: SGDT, SIDT, SLDT, SMSW and STR raise #GP(0) at CPL > 0 (SDM Vol.3 2.5).
+pub const CR4_UMIP: u64 = 1 << 11;
 /// Debug extensions: MOV DR4/DR5 raise #UD instead of aliasing DR6/DR7 (SDM Vol.3 17.2.2).
 pub const CR4_DE: u64 = 1 << 3;
 /// RDPMC allowed at CPL > 0.

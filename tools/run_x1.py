@@ -14,7 +14,7 @@
 - `cases`: X1c's refused-but-defined cases, now delivered (SDM rules, natemu only; each was a stop before X1c):
   the #UD encodings (PUSH/POP ES/CS/SS/DS, CALL/JMP ptr16:32 in 64-bit mode, LSS/LFS/LGS with a register operand, the
   0f 01 register forms no advertised feature defines, 0f 01 /5 m without F3, 0f 00 /7) and CLTS, SMSW, LMSW, SYSENTER,
-  SYSEXIT with their faults and effects.
+  SYSEXIT with their faults and effects; CR4.UMIP (`umip-*`): SGDT, SIDT, SLDT, SMSW, STR run at CPL 0 and #GP(0) at CPL 3.
 
 Writes DIR/x1.json; exit status 1 on any failure."""
 import argparse, json, pathlib, sys
@@ -257,6 +257,31 @@ def cases():
     head3 = ref.assemble('mov r15, cr0')
     out.append(('smsw-cpl3', head3 + sw + ref.assemble('smsw eax'), f'switch {CODE + len(head3):#x} 3\n',
                 reached(lambda o: [] if reg(o, 'rax') == reg(o, 'r15') & 0xffffffff else [f"smsw at CPL 3 {reg(o, 'rax'):#x}, CR0 {reg(o, 'r15'):#x}"])))
+    # UMIP (CPUID.7.0:ECX[2], CR4 bit 11; SDM Vol.2 SGDT, SIDT, SLDT, SMSW, STR: "#GP(0) If CR4.UMIP = 1 and CPL > 0", every
+    # form; Vol.3 2.5). At CPL 0 each runs; at CPL 3 each form is #GP(0) at its RIP with its destination unwritten, before
+    # any operand access (an unmapped operand still #GP, as pinned QEMU checks it at translation); with UMIP set then cleared
+    # each runs at CPL 3. The reference AMD machine's CPL 3 probe: natemu-raw/umip-20261104-01/probe.
+    umip_on = 'mov rax, cr4\nbts rax, 11\nmov cr4, rax\nmov r13, cr4\n'
+    out.append(('umip-cpl0', umip_on + 'mov r15, cr0\nmov qword ptr [0x500000], -1\nmov qword ptr [0x500008], -1\nsgdt [0x500000]\n'
+                'sidt [0x500010]\nmov rax, -1\nsldt eax\nmov rbx, -1\nstr ebx\nsmsw rcx\nmov r14, 1', '',
+                reached(lambda o: [] if reg(o, 'r13') >> 11 & 1 and reg(o, 'r14') == 1 and reg(o, 'rcx') == reg(o, 'r15')
+                        and reg(o, 'rax') >> 32 == 0 and reg(o, 'rbx') >> 32 == 0
+                        else [f"CR4 {reg(o, 'r13'):#x}, smsw {reg(o, 'rcx'):#x} (CR0 {reg(o, 'r15'):#x}), sldt {reg(o, 'rax'):#x}, str {reg(o, 'rbx'):#x}"])))
+    umip_forms = {'sgdt': 'sgdt [0x500000]', 'sidt': 'sidt [0x500000]', 'sldt-r': 'sldt eax', 'sldt-m': 'sldt word ptr [0x500000]',
+                  'str-r': 'str eax', 'str-m': 'str word ptr [0x500000]', 'smsw-r16': 'smsw ax', 'smsw-r32': 'smsw eax',
+                  'smsw-r64': 'smsw rax', 'smsw-m': 'smsw word ptr [0x500000]', 'f3-smsw': b'\xf3\x48\x0f\x01\xe0',
+                  'sgdt-unmapped': 'sgdt [0x7f0000]', 'smsw-unmapped': 'smsw word ptr [0x7f0000]'}
+    head = ref.assemble(umip_on + 'mov rax, -1\nmov qword ptr [0x500000], -1')
+
+    def umip_gp(at):
+        return lambda o: gp_at(at)(o) + ([] if reg(o, 'rax') == m else [f"RAX {reg(o, 'rax'):#x} written"])
+    for name, insn in umip_forms.items():
+        code = insn if isinstance(insn, bytes) else ref.assemble(insn)
+        out.append((f'umip-cpl3-{name}', head + sw + code, f'switch {CODE + len(head):#x} 3\n', umip_gp(CODE + len(head) + 1)))
+    # UMIP set then cleared (MOV CR4 at CPL 0): every form runs at CPL 3 again.
+    off = ref.assemble(umip_on + 'btr rax, 11\nmov cr4, rax')
+    body = b''.join(ref.assemble(x) if isinstance(x, str) else x for k, x in umip_forms.items() if 'unmapped' not in k) + ref.assemble('mov r14, 1')
+    out.append(('umip-off-cpl3', off + sw + body, f'switch {CODE + len(off):#x} 3\n', reached(lambda o: [] if reg(o, 'r14') == 1 else ['r14 not set'])))
     # SYSENTER/SYSEXIT in IA-32e mode (SDM Vol.2 SYSENTER, SYSEXIT): #GP(0) when IA32_SYSENTER_CS[15:2] = 0, SYSEXIT also at
     # CPL > 0 and (REX.W) for a non-canonical RCX or RDX; SYSENTER: CS = SYSENTER_CS & FFFCH (64-bit, DPL 0), SS = CS + 8,
     # RSP = SYSENTER_ESP, RIP = SYSENTER_EIP, RFLAGS.VM/IF cleared, CPL 0; SYSEXIT (REX.W): CS = SYSENTER_CS + 32 | 3,

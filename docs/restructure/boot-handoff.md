@@ -318,7 +318,7 @@ QEMU 11.1.2: `-nodefaults -machine pc,hpet=off,i8042=off,vmport=off` (COM1 only;
 PIIX4 PM block stay; its fixed PIIX3 IDE and floppy controllers have no drives), `-cpu
 Haswell,-pcid,-hle,-rtm,-invpcid,-tsc-deadline,-erms,-mca,-mce` (`+sha-ni` added on November 3 with the profile's SHA,
 in `qcmp-20261103-01/boot.py` and `bench-20261103-01/scripts/bench.py`; QEMU 11.1.2's TCG implements it, 7.2's does not; `+adx,+clflushopt,+clwb`
-follow the November 4 profile, in both harness files since November 4), whose `/proc/cpuinfo` flags equal natemu's but three: QEMU
+follow the November 4 profile, in both harness files since November 4, and `+smep,+umip` too (plan, Built (SMEP, UMIP); Haswell already has `smep`; patch `umip-20261104-01/harness/`)), whose `/proc/cpuinfo` flags equal natemu's but three: QEMU
 lacks `xsavec` (natemu's since November 4; QEMU 11.1.2's TCG implements no XSAVEC, so the control cannot match natemu in this one flag and its Linux
 uses XSAVEOPT and the standard format; before, QEMU kept `xsaveopt`,
 without which TCG's boot hangs after "SRBDS", and natemu had none), `nonstop_tsc` and `tsc_known_freq` (TCG offers no

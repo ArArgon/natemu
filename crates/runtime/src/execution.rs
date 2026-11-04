@@ -1214,7 +1214,7 @@ const CR0_CD: u64 = 1 << 30;
 const CR0_NW: u64 = 1 << 29;
 /// CR4: a bit outside the presented CPU's valid set (`cpu_profile::CR4_VALID`: its CPUID feature is advertised, SDM
 /// Vol.3 2.5) is reserved (#GP); every valid bit is accepted. PAE is fixed in long mode; PGE, SMEP are the walker's; PSE
-/// has no effect with 4-level paging (SDM Vol.3 4.1); TSD makes RDTSC/RDTSCP #GP at CPL > 0, PCE allows RDPMC there
+/// has no effect with 4-level paging (SDM Vol.3 4.1); UMIP makes SGDT/SIDT/SLDT/SMSW/STR #GP at CPL > 0; TSD makes RDTSC/RDTSCP #GP at CPL > 0, PCE allows RDPMC there
 /// (which then #GPs for want of counters), DE makes DR4/DR5 #UD. OSFXSR, OSXMMEXCPT, OSXSAVE (CPUID.1:ECX.OSXSAVE
 /// follows it) gate SSE and XSAVE forms (I5); FSGSBASE gates RDFSBASE..WRGSBASE ([`syscalls`]).
 const CR4_TSD: u64 = 1 << 2;
@@ -1430,11 +1430,12 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
     }
     // The bank before the instruction (the checks below compare against it; the segment forms restore it on a fault).
     let c = s.cpu;
-    // CPUID runs at any CPL; RDTSC/RDTSCP at CPL > 0 unless CR4.TSD, RDPMC with CR4.PCE; SGDT/SIDT/SLDT/STR (CR4.UMIP is
-    // not in the profile), segment register moves and far transfers at any CPL; the rest at CPL 0 only.
+    // CPUID runs at any CPL; RDTSC/RDTSCP at CPL > 0 unless CR4.TSD, RDPMC with CR4.PCE; SGDT/SIDT/SLDT/SMSW/STR, every
+    // form, unless CR4.UMIP (SDM Vol.2 each, "#GP(0) If CR4.UMIP = 1 and CPL > 0": before any operand access); segment
+    // register moves and far transfers at any CPL; the rest at CPL 0 only.
     let unprivileged = match i.kind {
-        system::CPUID | system::SMSW => true,
-        system::SGDT | system::SIDT | system::SLDT | system::STR => true,
+        system::CPUID => true,
+        system::SGDT | system::SIDT | system::SLDT | system::SMSW | system::STR => c.cr4 & CR4_UMIP == 0,
         system::MOV_TO_SREG | system::MOV_FROM_SREG | system::JMP_FAR | system::CALL_FAR | system::RET_FAR | system::IRET => true,
         system::PUSH_SREG | system::POP_SREG => true,
         system::RDPMC => c.cr4 & CR4_PCE != 0,
@@ -1500,8 +1501,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             // K1: a change of a bit the walks depend on flushes the TLBs; the gating and rounding bits are in the context.
             (s.cpu.cr0 ^ c.cr0) & (CR0_PG | CR0_WP) != 0 || (s.cpu.cr4 ^ c.cr4) & CR4_PAGING != 0
         }
-        // X1c (SDM Vol.2 CLTS, SMSW, LMSW; CLTS and LMSW at CPL 0 only, above, SMSW at any CPL: CR4.UMIP is not in the
-        // profile): CLTS clears CR0.TS; SMSW stores CR0[15:0] to m16, or CR0 into a register at its operand size (16 bits
+        // X1c (SDM Vol.2 CLTS, SMSW, LMSW; CLTS and LMSW at CPL 0 only, above, SMSW at any CPL unless CR4.UMIP): CLTS clears CR0.TS; SMSW stores CR0[15:0] to m16, or CR0 into a register at its operand size (16 bits
         // merge, 32 and 64 zero-extend, "defined by the following examples" for 64-bit mode); LMSW loads CR0[3:0] from the
         // source's low 4 bits, except that it never clears PE. TS, EM and MP are in the code context (no flush).
         system::CLTS => {

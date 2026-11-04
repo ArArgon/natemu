@@ -32,11 +32,12 @@ class SystemFaultModel(unittest.TestCase):
         self.check('0f22d8', GP, cpl=3, rax=0x1000)
 
     def test_cr4_features_the_profile_lacks(self):
-        # Rederived from the CPUID profile (CPU 16): VME/PVI (CPUID.1.EDX.VME), MCE (MCE/MCA not exposed), UMIP, LA57, PKE,
-        # CET (CPUID.7), VMXE, SMXE (CPUID.1.ECX) were valid in the previous hand-written list and are now reserved.
-        for name, bit in (('VME', 0), ('PVI', 1), ('MCE', 6), ('UMIP', 11), ('LA57', 12), ('VMXE', 13), ('SMXE', 14), ('PKE', 22), ('CET', 23)):
+        # Rederived from the CPUID profile (CPU 16): VME/PVI (CPUID.1.EDX.VME), MCE (MCE/MCA not exposed), LA57, PKE,
+        # CET (CPUID.7), VMXE, SMXE (CPUID.1.ECX) were valid in the previous hand-written list and are now reserved. UMIP is
+        # valid since CPUID.7.0:ECX.UMIP is advertised (owner decision November 3).
+        for name, bit in (('VME', 0), ('PVI', 1), ('MCE', 6), ('LA57', 12), ('VMXE', 13), ('SMXE', 14), ('PKE', 22), ('CET', 23)):
             self.check('0f22e0', GP, rax=CR4 | 1 << bit)
-        for bit in (2, 3, 4, 7, 8, 9, 10, 16, 18, 20):        # TSD DE PSE PGE PCE OSFXSR OSXMMEXCPT FSGSBASE OSXSAVE SMEP
+        for bit in (2, 3, 4, 7, 8, 9, 10, 11, 16, 18, 20):    # TSD DE PSE PGE PCE OSFXSR OSXMMEXCPT UMIP FSGSBASE OSXSAVE SMEP
             self.check('0f22e0', None, rax=CR4 | 1 << bit)
 
     def test_s2a_control_registers(self):

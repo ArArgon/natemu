@@ -83,7 +83,10 @@ profile change. Order is the orchestrator's: ADX, CLFLUSHOPT/CLWB and XSAVEOPT/X
 Arm PAN does not apply directly and STAC/CLAC (around every user copy) would switch shadow spaces.
 Built November 4 (boot-features plan, Built (ADX), Built (CLFLUSHOPT, CLWB), Built (XSAVEOPT, XSAVEC)): ADX, CLFLUSHOPT/CLWB and
 XSAVEOPT/XSAVEC, each judged by the AMD machine; installer N = 1 cache off 9.51 -> 8.93 s, zstd N = 1 unchanged; the QEMU control
-gains `+adx,+clflushopt,+clwb` (its TCG has no XSAVEC). Next: SMEP and UMIP.
+gains `+adx,+clflushopt,+clwb` (its TCG has no XSAVEC). Built November 4 (boot-features plan, Built (SMEP, UMIP)): SMEP was
+already advertised and enforced by the walker (tests added); UMIP advertised, SGDT/SIDT/SLDT/SMSW/STR #GP(0) at CPL > 0 in the
+resident, Linux activates it; installer N = 1 cache off 8.42 -> 8.32 s, hackbench N = 1 29.9 -> 30.0 s; the QEMU control gains
+`+smep,+umip`. Next: SMAP (only if its cost is acceptable).
 
 ## FEX maintenance (owner, November 4: later)
 

@@ -481,6 +481,6 @@ mod tests {
         }
         assert_eq!(v::RESET.len(), profile::MSRS.iter().filter(|m| read_ok(m)).count());
         // CR4: the profile's mask (bits whose CPUID feature is advertised).
-        assert_eq!(profile::CR4_VALID, 0x1507bc);
+        assert_eq!(profile::CR4_VALID, 0x150fbc);
     }
 }
