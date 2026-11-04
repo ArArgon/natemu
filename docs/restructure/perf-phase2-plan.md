@@ -79,3 +79,11 @@ before/after on the installer and the phase-2 benchmarks); the like-for-like QEM
 profile change. Order is the orchestrator's: ADX, CLFLUSHOPT/CLWB and XSAVEOPT/XSAVEC first (cheap); SMEP and UMIP next
 (fetch-walk and resident checks); SMAP last and only if its cost is acceptable — translated kernel code runs at EL0, so
 Arm PAN does not apply directly and STAC/CLAC (around every user copy) would switch shadow spaces.
+
+## FEX maintenance (owner, November 4: later)
+
+Move the FEX patch series (tools/fexc/patches, 0001-0029 applied with `git am`) to a FEX fork with a `natemu` branch, one
+commit per patch, rebased onto upstream on a fixed cadence with the standing suite after each rebase; the submodule pins the
+fork's commit; the shim and fexc front end stay in natemu; the first fork build must be byte-identical to the current compiler;
+general fixes offered upstream. Needs the owner to create the fork (this session's GitHub access covers arargon/natemu only).
+After the multi-core phase.
