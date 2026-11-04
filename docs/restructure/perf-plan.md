@@ -1677,6 +1677,144 @@ allowed no non-zero byte outside the guest-state fields (it now admits the KERNE
 shadow-space switch (the `syscall` row's 0.59 us). Making them lighter needs a shorter resident path (no state copy in and
 out, one `find` pass), not translation: the CPL, and with it TTBR and the code context, changes only at EL1.
 
+### Measured (chunk 18: breakdown at HEAD, November 4; analysis on 1d75dc7, series55-swapgs, no code change kept)
+
+**Question.** Where the time goes now on the two workloads that still trail QEMU or did not move: the installer boot (cache
+off, N = 1 7.67 s against QEMU 6.10 s; N = 4 6.26 against 4.81) and `build` (19.8 / 9.3 s, flat under chunks 15 and 17; QEMU
+28.3 / 12.5); then what each candidate could save, from these numbers.
+
+**Method** (`natemu-raw/breakdown-20261104-01/`, README there). HEAD's `natemu` stub, cache off, `mitigations=off nokaslr`,
+2 GiB, one VM at a time; three interleaved rounds of the four cells with the perf resident and `NATEMU_PERF_LOG`, then one
+uninstrumented run per cell. Window: the installer from process start to the end-point line, `build` from its START to its
+END line (boot excluded), both on the log's clock (the harness now records them there). Per vCPU, the resident's buckets over
+the window come from the log's 5 ms snapshots, which cover every tick from the resident's start; time outside the VM (its
+`host` bucket) is split into the translation requests that began in the window (their request lines) and the rest (HVF entry
+and exit, exit bookkeeping, ports, devices, the log's own lines). Counts over the window (entries by kind, CR3 loads, faults,
+system instructions by kind) come from a scratch build whose snapshot thread also writes them every 100-150 ms (not kept; the
+default resident of that build is byte-identical to HEAD's). Three further scratch builds counted one thing each, one run per
+workload: page-fault region scans, what a dispatcher miss found in its L1 entry, and whether a larger L1 separates the two
+RIPs of a conflict. fexc: the installer's compile stream recorded and replayed through one server, alone and under the macOS
+`sample` profiler.
+
+**Checks.** By chunk 1's method over each whole run, the loop's laps cover every thread's window to 0.01-0.05 ms, the two
+measures of HVF entry and exit agree to 0.02-0.04 ms, and request time outside the request's named parts (reply to block,
+relocation; with the log on, its bytes' hash and exit list) is 1.8-3.3% of the window, under the 5% bar. In the window table
+the parts add up to the window by construction. Every `build` run verified, every installer run reached the dialog, none
+contended. The log's cost: one uninstrumented run per cell gave 7.96, 6.20, 19.42 and 9.34 s against 7.73, 6.38, 19.88 and
+9.22 s logged (chunk 17's medians 7.67, 6.26, 19.84, 9.26): within the spread; its request lines take 0.23, 0.35, 0.56 and
+0.84 thread-seconds inside "the rest outside the VM".
+
+| Seconds of the window, mean (min-max) of 3 runs, log on | Installer N = 1 | Installer N = 4, 4 threads | Installer N = 4, vCPU 0 | `build` N = 1 | `build` N = 4, 4 threads | `build` N = 4, vCPU 0 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Before the resident ran (process start, image load, VM setup; APs before their start) | 0.05 (0.02-0.07) | 0.13 (0.08-0.25) | 0.03 (0.02-0.06) | 0.02 (0.00-0.03) | 0.05 (0.00-0.12) | 0.01 (0.00-0.03) |
+| Host, fexc round trip (compiles) | 2.04 (2.03-2.05) | 2.39 (2.37-2.43) | 1.00 (0.85-1.17) | 2.43 (2.41-2.43) | 3.40 (3.38-3.42) | 0.95 (0.69-1.35) |
+| Host, admission | 0.32 | 0.49 | 0.21 (0.17-0.24) | 0.67 (0.66-0.67) | 1.00 (0.98-1.01) | 0.28 (0.20-0.40) |
+| Host, bytes copy, memory lookup, staging, keeping the answer | 0.17 | 0.25 | 0.11 (0.09-0.12) | 0.37 | 0.57 (0.56-0.58) | 0.16 (0.12-0.23) |
+| Host, request outside its parts (reply to block, relocation; with the log, its hash and exit list) | 0.27 | 0.34 | 0.14 (0.12-0.17) | 0.36 | 0.48 (0.47-0.49) | 0.13 (0.10-0.19) |
+| Host, the rest outside the VM: HVF entry/exit, exit bookkeeping, ports, devices, steps' rest, log lines | 0.69 | 0.99 (0.99-1.00) | 0.34 (0.31-0.37) | 1.27 (1.26-1.27) | 1.84 (1.82-1.87) | 0.51 (0.50-0.54) |
+| VM, generated guest code | 1.48 (1.47-1.49) | 1.96 (1.93-1.97) | 0.55 (0.42-0.65) | 7.08 (7.02-7.14) | 8.76 (8.69-8.84) | 2.08 (1.84-2.23) |
+| VM, halted and AP mailbox wait | 0.00 | 15.66 (15.45-15.77) | 3.01 (2.62-3.52) | 0.00 | 8.89 (8.66-9.03) | 1.98 (1.70-2.16) |
+| VM, linker entries (own work) | 0.66 | 0.87 (0.85-0.89) | 0.26 (0.24-0.27) | 0.98 (0.96-1.00) | 1.54 (1.51-1.55) | 0.39 (0.37-0.41) |
+| VM, dispatcher misses (own work) | 0.37 | 0.50 (0.50-0.51) | 0.12 (0.09-0.15) | 2.54 (2.52-2.56) | 3.44 (3.38-3.51) | 0.95 (0.91-0.98) |
+| VM, entering blocks (`enter`, its copies) | 0.22 | 0.25 | 0.08 (0.07-0.09) | 0.76 (0.76-0.77) | 0.89 (0.88-0.89) | 0.24 (0.23-0.24) |
+| VM, block lookup (`find`) | 0.11 | 0.14 | 0.04 | 0.35 | 0.50 (0.48-0.54) | 0.12 (0.11-0.13) |
+| VM, link patching and placement | 0.19 | 0.27 | 0.08 | 0.35 (0.34-0.35) | 0.49 (0.48-0.50) | 0.13 (0.13-0.14) |
+| VM, in-VM reuse (copies of kept templates) | 0.27 | 0.35 (0.34-0.36) | 0.08 (0.07-0.08) | 0.16 | 0.20 | 0.05 (0.04-0.06) |
+| VM, system instructions | 0.13 | 0.14 | 0.09 | 0.07 | 0.11 | 0.03 |
+| VM, CR3 loads and other TLB flushes | 0.24 | 0.14 | 0.03 | 0.19 | 0.27 (0.26-0.27) | 0.07 (0.06-0.08) |
+| VM, shadow misses (abort + walk) | 0.29 (0.28-0.30) | 0.32 (0.28-0.35) | 0.12 (0.10-0.14) | 0.26 (0.25-0.27) | 0.40 (0.39-0.41) | 0.09 (0.08-0.10) |
+| VM, revalidation and fetch walks | 0.14 | 0.19 | 0.05 | 0.22 | 0.29 (0.28-0.30) | 0.07 (0.07-0.08) |
+| VM, deliveries (faults, interrupts) and IRQ polls | 0.09 (0.08-0.10) | 0.12 | 0.03 (0.02-0.04) | 1.57 (1.53-1.60) | 3.51 (3.37-3.60) | 0.90 (0.74-1.09) |
+| VM, helpers, divisions, stops, L1 switches, shootdowns | 0.00 | 0.01 | 0.00 | 0.24 | 0.27 | 0.08 (0.07-0.08) |
+| **Sum of the parts** | **7.73 (7.70-7.75)** | **25.53 (25.29-25.82)** | **6.38 (6.32-6.46)** | **19.88 (19.83-19.97)** | **36.87 (36.73-37.03)** | **9.22 (9.18-9.26)** |
+| Window (wall START->END, or spawn->end point) x threads | 7.73 (7.70-7.75) | 25.53 (25.29-25.82) | 6.38 (6.32-6.46) | 19.88 (19.83-19.97) | 36.87 (36.73-37.03) | 9.22 (9.18-9.26) |
+
+| Over the window (all threads), mean of 3 | Installer N = 1 | Installer N = 4 | `build` N = 1 | `build` N = 4 |
+| --- | --- | --- | --- | --- |
+| Block entries / linker entries / dispatcher misses, M | 4.79 / 2.62 / 2.11 | 5.03 / 2.78 / 2.17 | 18.75 / 2.88 / 15.78 | 19.05 / 3.12 / 15.84 |
+| Host exits, k (HVF entry and exit 1.0 us each, bookkeeping 0.1 us) | 381 | 524 | 746 | 1,000 |
+| System-instruction entries, k (largest kinds) | 1,279 (MOV from a segment register 323, STI run by the resident 314, IRET 205, INVLPG 80, SYSCALL and SYSRET 66 each) | 1,317 | 670 (STI 268, IRET 88, MOV from CR 83) | 688 |
+| CR3 loads, k (K1 time per load) | 22 (10.6 us) | 2.6 (51 us) | 0.9 (200 us) | 0.9 (300 us) |
+| Page faults delivered, k (K1 invalidation time) | 53 (0.05 s) | 52 (0.04 s) | 83 (**1.53 s**) | 84 (**3.45 s**) |
+| Shadow-miss aborts / revalidation walks / in-VM reuse copies, k | 538 / 464 / 843 | 604 / 457 / 847 | 709 / 1,111 / 457 | 783 / 1,057 / 441 |
+| Whole-cache flushes (metadata arena full), time | 4, 0.09 s | 4, 0.10 s | 5, 0.12 s | 4, 0.10 s |
+| Translation requests, k | 328 | 475 | 752 | 1,004 |
+| compiles (distinct bytes; repeats on the same vCPU; raced on another vCPU) | 126.5 (125.6; 0.8; 0) | 130.7 (128.6; 0.2; 2.0) | 152.0 (151.4; 0.6; 0) | 169.0 (152.9; 0.2; 15.9) |
+| shared-cache hits (of them repeats after a whole-cache flush, one run) | 191 (98) | 334 (77) | 590 (497) | 825 (359) |
+| Per compile, us: request / fexc round trip / fexc server CPU / pipe and wake-ups / admission / outside the parts | 19.8 / 16.1 / 12.6 / 3.5 / 1.25 / 1.8 | 22.4 / 18.3 / 14.5 / 3.8 / 1.30 / 2.0 | 19.5 / 16.0 / 12.5 / 3.5 / 1.16 / 1.7 | 23.9 / 20.1 / 15.3 / 4.8 / 1.17 / 1.9 |
+| Per shared-cache hit, us: request / admission | 1.47 / 0.83 | 1.67 / 0.97 | 1.45 / 0.83 | 1.70 / 0.97 |
+
+(System instructions, all kinds per workload, and the full tables with ranges: `tables.md`.)
+
+**What the numbers say.**
+1. *Installer, N = 1* (7.73 s logged): translation requests 2.80 s, of which fexc 2.04 s (126.5 k compiles, all but 0.8 k of
+   bytes never compiled before, 16.1 us each: 12.6 us of server CPU and 3.5 us of pipe and wake-ups), admission 0.32 s and
+   191 k shared-cache hits at 1.47 us; the rest outside the VM 0.69 s (381 k exits); generated code 1.48 s; the resident
+   2.70 s spread over a dozen items of 0.1-0.66 s (linker entries 0.66 s, half of them system-instruction trips; shadow misses
+   0.29; in-VM reuse 0.27; CR3 loads 0.24; misses 0.37). At N = 4 the four threads spend 15.7 of 25.5 s halted; vCPU 0's 6.38 s
+   holds 1.46 s of requests and 3.0 s halted.
+2. *`build`, N = 1* (19.88 s): generated code 7.08 s (36%); translation requests 3.83 s (fexc 2.43 s for 152 k compiles; 590 k
+   shared-cache hits 0.86 s); the rest outside the VM 1.27 s; the resident 7.69 s, led by two items that are not inherent:
+   **dispatcher misses 2.54 s** (15.8 M, plus their lookups and entries) and **page-fault invalidation 1.53 s** (83 k faults,
+   18 us each against 0.8 us on the installer). At N = 4 (36.9 thread-seconds, 8.9 halted) the same two are 3.44 and 3.45
+   thread-seconds; vCPU 0 has 0.95 and 0.90 s of them.
+3. *Page faults.* A #PF (as an INVLPG) invalidates the blocks on its page, and, when its 2 MiB region's bit is set in the set
+   of regions holding blocks fetched through 2 MiB pages, walks the linear map's chains of all 512 pages of the region
+   (`cache::invlpg`). The set is 1,024 bits indexed by region number modulo 1,024, set by any such block (the kernel's text)
+   and cleared only at a whole-cache flush. Scratch count, `build` N = 1, whole run: 5,840 such scans visited 69.7 M blocks
+   (about 12 k each) and **2** of them met a block from a 2 MiB page; #PF invalidation 1.50 s. The installer: 117 scans.
+4. *Dispatcher misses.* The dispatcher's L1 is 4,096 direct-mapped entries per code context, indexed by the RIP's low 12 bits.
+   Scratch count at each miss, whole run: the entry held **another block** in 15.73 M of `build`'s 16.12 M misses (97.6%; empty
+   0.35 M, this block 41 k) and in 1.70 M of the installer's 2.09 M (81%). In `build`, blocks placed, which bound a conflict with an
+   earlier block for the same RIP, were 0.83 M: the rest are two hot RIPs at the same page offset. In 95.1% (`build`) and
+   94.4% (installer) of these conflicts the two RIPs differ in bits 12-15, so a 65,536-entry table indexed by the low 16 bits
+   would hold both (first order: conflicts new to the larger table are not counted).
+5. *Whole-cache flushes.* Every flush is the 64 MiB metadata arena filling (as chunk 6 found); after it each block is asked
+   for again and answered from the shared cache: 497 k of `build` N = 1's 590 k hits (5 flushes in the window), 98 k of the
+   installer's 191 k.
+6. *fexc.* The installer's stream through one server alone: 12.2-12.4 us of CPU per request (three replays). Busy samples
+   (4,603 of 7,011 over 9 s of a six-fold replay): FEX's compile 39.3%; per-request setup 41.1% (argument parsing and string
+   handling 24.9, allocation 6.3, the feature table 5.1, Config 3.5, JSON 1.3); the request function's own lines 6.6%
+   (unclassified); reply write 8.0%; object packaging 4.1% (`profile/classify.txt`).
+7. *Successors.* Of the shared-cache hits, 124 k (installer N = 1) and 494 k (`build` N = 1) were exits a predecessor's
+   request listed on a page it fetched, with the answer already kept when that reply left; they were asked for a median
+   2.7 us later. Most are the flush refills of item 5. Listed candidates never asked for: 175 k and 348 k.
+
+**Candidates** (estimates, not measurements; arithmetic in `estimates.txt`). N = 4: thread-seconds divided by the cell's busy
+(not halted) thread-seconds per wall second, 1.53 (installer) and 3.03 (`build`), an assumption that the saving is spread as the
+busy time is. An exit outside a request is taken as 1.1 us (HVF 1.0 + bookkeeping 0.1, log off).
+
+| Candidate: arithmetic | Installer N = 1 | Installer N = 4 | `build` N = 1 | `build` N = 4 |
+| --- | --- | --- | --- | --- |
+| (g) **Dispatcher L1 conflicts**: misses x conflict share x share a 64 Ki table separates x resident cost per miss (miss, its lookup and entry: 0.22-0.30 us); upper, first order | 0.38 | 0.33 | **3.22** | **1.40** |
+| (g) **Page-fault region scans**: #PF invalidation time - faults x 0.8 us (the installer's cost per fault, 0.8-0.9 us) | 0.01 | 0 | **1.47** | **1.12** |
+| (g) **Whole-cache flush refills**: repeats x (hit request + exit + placement, 2.7-3.0 us) + flush time; chunk 6 measured a 4x arena no faster on the installer (first touches) | 0.36 | 0.22 | 1.48 | 0.39 |
+| (b) **fexc's per-request setup**: compiles x server CPU per compile x 41.1-47.7% | 0.66-0.76 | 0.51-0.59 | 0.78-0.91 | 0.35-0.41 |
+| (c) **In-process FEX**: compiles x (round trip - server CPU + reply write 8% of server CPU) | 0.57 | 0.42 | 0.68 | 0.34 |
+| (a) **Ahead-of-use placement**: answers compiled ahead in time (chunk 16's served counts) x 1.8 us, plus kept answers placed with the predecessor's reply x 1.5-1.6 us less the listed candidates never asked for x 0.24-1.3 us; most of the second part is the flush refills above | 0.07 + 0-0.15 | 0.04 + 0.03-0.20 | 0.12 + 0.31-0.68 | 0.04 + 0.18-0.34 |
+| (g) System-instruction trips, all kinds: entries x about 0.2 us (chunk 17) | 0.26 | 0.17 | 0.13 | 0.05 |
+| (h) CR3 loads (K1 time; `build`'s 200-300 us each walk the linked blocks) | 0.23 | 0.09 | 0.19 | 0.09 |
+| (h) Raced compiles at N = 4: 15.9 k (`build`) x 20 us; chunk 13's in-flight table measured no wall gain | - | 0.03 | - | 0.10 |
+| (d) Cheaper disk-cache key: with the cache off no key is computed (`ask` builds it only with a cache; 8 ns a request) | 0 | 0 | 0 | 0 |
+| (e) Huge pages for the code area: the code area is already mapped with 2 MiB blocks (`memory::map_private` above the window's first 2 MiB); the second stage is HVF's | 0 | 0 | 0 | 0 |
+| (f) Generated code: the whole bucket, a bound only (no experiment) | 1.48 | 1.28 | 7.08 | 2.89 |
+
+Admission of shared-cache hits (0.16 / 0.32 / 0.49 / 0.80 thread-seconds) stays: every object is admitted at its RIP.
+
+**Recommendation.** Next chunk: the two resident lookup costs that `build` shows, measured first and shipped only on the
+usual rule. (1) The page-fault and INVLPG region test made exact (the regions that really hold blocks from 2 MiB pages, not a
+1,024-bit hash cleared only at a flush): about 1.5 s of `build` N = 1 (7%) and 1.1 s at N = 4 (12%), nothing elsewhere. (2) A
+larger dispatcher L1 (65,536 entries, the low 16 bits; 2 MiB of the code area per table, four tables, and a clear that costs
+16 times more but happens 6-14 times a run): at most 3.2 s of `build` N = 1 and 1.4 s at N = 4, 0.3-0.4 s of the installer;
+its first step is a scratch build with the larger table to measure the misses that remain. Both are small resident changes
+with no new mechanism. For the installer's gap to QEMU (1.57 s at N = 1, 1.45 s at N = 4), the next after that is fexc's
+per-request setup with in-process FEX (together about 1.2-1.3 s at N = 1, 0.9-1.0 s at N = 4), then the flush refills (0.36 s;
+the arena-size result of chunk 6 says to measure the first-touch cost first). Ahead-of-use placement is not worth its own
+chunk on these numbers (at most 0.2 s on the installer), and generated code has no estimate without an experiment.
+
+**Not done.** No optimisation built; no instrumentation kept (the four scratch diffs are in the evidence directory; the
+tree is HEAD's). Not measured: the share of HVF's second-stage TLB misses in generated code (no counter reachable).
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
