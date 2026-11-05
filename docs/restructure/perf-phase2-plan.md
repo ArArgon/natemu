@@ -139,6 +139,31 @@ Warm against off: `build` -4% (N = 1) and -11% (N = 4) with or without KASLR; th
 only CPL-3 code (kernel-mode code neither looked up nor stored), measured as its own chunk. Done in perf chunk 27
 (`natemu-raw/diskcache2-20261105-01/`): KASLR installer warm -1.4% / -1.5% against off, `build` -3.7% / -9.4%.
 
+## Phase result (November 5, 82462c2, `natemu-raw/batch2-final-20261105-01/`)
+
+All 11 benchmarks and the installer, N = 1 and 4, three rounds each, every run verified; compile cache off, `mitigations=off
+nokaslr`; QEMU 11.1.2 like-for-like; AMD native from bench-20261105-03. natemu cold, seconds (QEMU cold; native):
+
+| Benchmark | N = 1 | N = 4 |
+| --- | --- | --- |
+| build | 11.48 (29.34; 2.61) | 5.44 (12.35; 1.09) |
+| zstd | 3.07 (29.78; 2.12) | 1.49 (11.09; 0.97) |
+| hackbench | 11.86 (16.34; 3.87) | 3.69 (5.39; 1.72) |
+| locks | 3.90 (11.08; 2.12) | 7.20 (27.55; 4.21) |
+| luajit | 4.10 (18.38; 1.80) | 1.48 (5.32; 0.60) |
+| luajit-interp | 4.19 (30.34; 2.29) | 1.29 (9.05; 0.64) |
+| mem | 7.93 (16.64; 4.69) | 2.64 (4.99; 1.44) |
+| cray | 3.26 (130.35; 3.66) | 1.12 (42.14; 1.08) |
+| 7zip | 4.00 (20.80; 3.03) | 1.84 (6.44; 1.29) |
+| sqlite | 7.39 (22.82; 2.38) | 7.47 (22.76; 2.45) |
+| avx | 8.87 (45.12; 2.90) | 3.55 (16.56; 1.12) |
+| installer | 5.42 (6.33; -) | 4.48 (4.89; -) |
+
+natemu is faster than QEMU on every cell (0.02-0.92x of its time); against native, cold runs are 0.89-4.40x at N = 1 and
+1.04-5.00x at N = 4 (closest: cray, zstd, 7zip, mem; furthest: build, sqlite, hackbench, avx). Warm runs are 1-5% shorter
+for most cells, up to 31% (build N = 4). Phase 2 began (batch 1 end) at installer N = 1 7.9 s cache off; the batch-1
+benchmarks then: build 20.3 / 9.2, hackbench 16.9 / 4.8, locks 6.2 / 7.2 s.
+
 ## Benchmark conventions (audit, November 5, `natemu-raw/audit-generic-20261105-01/`)
 
 All comparisons boot with `mitigations=off nokaslr` (owner decision; a default command line costs the installer about 2.1x
