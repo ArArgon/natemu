@@ -2066,6 +2066,158 @@ not measured again. The recorded streams were deleted afterwards (0.83 GB; `rec/
 **Not done.** The shim's recorder containers are still freed and refilled per request (`ResetGlobals`, 4% of the new
 server's busy time), and the host still formats the argument strings for every request (host side, unchanged).
 
+### Measured (chunk 21: a shared-memory channel to the compile server, November 4; uncommitted on af2acf6, series58-channel-r1)
+
+Evidence: `natemu-raw/shmchan-20261104-01/` (README there). Setup as chunk 18: the `natemu` stub, cache off,
+`mitigations=off nokaslr`, 2 GiB, one VM at a time. Old: HEAD af2acf6 with compiler series57-fork over the pipe. New: the
+working tree with **series58-channel** (`obj/fexc` SHA-256 `da337021...87315c`, reproduced by a second `build.sh`), measured;
+after the independent review **series58-channel-r1** (`8bd3b7ea...a83e59`, reproduced likewise; below, "Review"). fexc stays a
+separate process; no FEX change.
+
+**Breakdown first.** In the VM, at HEAD (perf resident and log, two installer and two `build` N = 1 runs): a compile's round
+trip took 11.24-11.40 us, of which the server's CPU (wait4) 7.80-7.84 us and the rest, pipe and wake-ups, 3.44-3.56 us. After
+a reply the vCPU asked for its next compile a median 7.5-7.6 us later (85-86% within 10 us, 94-95% within 20 us); 99.6% of
+round trips took at most 30 us. The parts, from a two-process model of the transport (`transport/chan.c`: fixed-work loops,
+a compile of 8 us of CPU and the installer's measured gaps replayed, 100,000 requests, two rounds, nothing else running), us
+per request:
+
+| Transport, N = 1 | Round trip less the server's work | Host's send | To the server holding the request (its wake, its reads) | Server's reply send to the host's wake (the send call itself) | Host's receive |
+| --- | --- | --- | --- | --- | --- |
+| Pipe (today's calls: two writes; two reads; one `writev`; poll, read, poll, read) | 4.37 / 4.08 | 0.70 / 0.67 | 1.25 / 1.16 | 1.61 / 1.48 (0.58 / 0.53) | 0.82 / 0.78 |
+| Shared mapping, both sides sleep at once (`os_sync_wait_on_address`) | 3.52 / 3.42 | 0.63 / 0.61 | 1.13 / 1.10 | 1.72 / 1.68 (0.62 / 0.59) | 0.04 |
+| Shared mapping, only the host spins (20 us) | 5.00 / 4.89 | 0.63 / 0.61 | 4.26 / 4.18 | 0.08 | 0.03 |
+| Shared mapping, only the server spins (20 us) | 4.82 / 4.79 | 0.08 | 0.13 / 0.12 | 4.57 / 4.54 | 0.04 |
+| Shared mapping, both spin (host 20 us, server 20 us) | 0.44 / 0.43 | 0.08 | 0.25 | 0.08 | 0.02 |
+
+Without spinning the channel saves about 0.9 us of the 4.1-4.4 (about 0.11 s of the installer N = 1, under the 3% bar); a
+spin on one side makes the other side's wake-up slower (4.2-4.6 us) than the pipe's; both spinning removes almost all of it,
+at about 7 us more CPU per request on each side (host 24.0-24.4 against 17.1-17.3 us per request with the gap's work, server
+17.3-17.6 against 10.0-10.3). Four pairs at once (N = 4): pipe 11.0 us, both sleeping 9.3, both spinning 0.9.
+
+**Built.** `fexc --serve --channel FD` (`tools/fexc/fexc.cpp`): the same request and reply payloads through a 16 MiB mapping
+(request word and length at 0 and 4, reply word and length at 64 and 68, request payload at 4 KiB, at most 1 MiB, reply
+payload after it, at most 15 MiB less 4 KiB; a larger reply is an error reply). Request n is posted by writing its payload and
+length, then n << 1 into the request word; the reply likewise into the reply word. Bit 0 of a word says its reader sleeps; the
+poster wakes it (`os_sync_wake_by_address_any`) only then. The server spins 20 us for the next request, then sleeps in 100 ms
+slices and leaves when stdin reaches EOF; an empty request ends it. Fork mode, `--report` and the pipe protocol are unchanged
+(every mode works with either transport); the one-shot CLI is unchanged. The layout carries a magic word ("CHN1"; the host
+writes it at 8, the server checks it at start and writes it at 72, the host checks that with every reply). Host (`crates/host/src/execution.rs`, `Server`,
+`Channel`): the mapping is `shm_open`ed (its name unlinked at once), sized and mapped per server, and inherited by the server
+as an open fd, close-on-exec except during that spawn (under the existing spawn lock). The host must never fork while a VM runs:
+the spawn takes no `pre_exec`, `uid` or `gid`, which would make std fork instead of `posix_spawn` (see the defect below). The host spins 30 us for the reply, then
+sleeps in 5 ms slices until the request's deadline; after each slice it polls the server's stdout, which carries nothing in
+channel mode, so EOF means the server died (`UnexpectedEof`, as the pipe gave) and any byte is refused. The reply length is
+bounds-checked (20 bytes to the reply area's size) and the payload copied out of the mapping before it is parsed by the same
+checks as before; nothing the host trusts lives in the mapping. Deadline expiry still kills the server (`TimedOut`), and
+`finish` posts the empty request before closing stdin and reaping it.
+
+*Spin bounds* (scratch builds with the bounds set from the environment, installer N = 1 and 4, `build` N = 1 and 4,
+interleaved; `var/`, `var2/`): neither side spinning: no wall change (installer N = 1 6.43 against 6.48 s); one side only:
+no gain and more CPU (host 30 us only 6.32 s, CPU 7.35 against 6.51 s; server 20 us only 6.41 s, 7.71); both: 5.27-5.63 s at
+N = 1 and 4.58-4.70 s at N = 4 for every pair tried (host 30 or 100 us, server 10, 20 or 50 us), within each other's spread.
+Kept: host 30 us, server 20 us. These scratch builds, like the first campaign below, spawned the server through `pre_exec`:
+their walls against `base` (HEAD) carry that fork's cost, so only the variant-against-variant comparisons are fair.
+
+*A defect found by the suite and fixed.* The first build passed the fd as fd 3 through `Command::pre_exec`, which makes std fork
+instead of `posix_spawn`. With it `run_x3.py` stress (`apic-stress-x2@4`) and `run_l4a.py` stress (`l4a-stress-x@4`) failed,
+twice: a vCPU stopped receiving interrupts and its peers' watchdogs fired. The guest RAM is a private anonymous mapping, which a
+fork makes copy-on-write in the parent while the VM runs. With the fd inherited instead both pass (6/6 and 2/2) and the suite
+below is clean. Every measurement in the tables below is of the fixed build; the replays and walls of the first build are kept
+in `camp-fork*/`, `final-fork/`.
+
+**Identity (blocking gate).** An installer N = 1 boot's compile stream (125,882 requests) and a `build` N = 1 run's (229,774),
+recorded at HEAD by a `tee` in front of the server, replayed in lockstep through series57-fork over the pipe and
+series58-channel over the channel driven by the host's own `Server` (natemu's ignored test `channel_replay_matches_the_pipe`):
+**every reply byte-identical** (code, JSON, object, extent, args_read); also the installer stream with `--report` and with
+`--serve-mode fork` on both: 0 differences. Over the pipe on both sides (`replay20.py`, series57-fork against
+series58-channel): 0 differences in all four. `test_serve.py` (1,978 requests) identical in reuse and fork mode and against
+series57-fork's CLI.
+
+**Robustness.** New host tests with a stand-in server (`fake_server`, a Python script on the mapping):
+`channel_refuses_malformed_replies` (a length past the reply area, 0xffffffff, under the 20-byte header, a header whose JSON
+and object lengths do not add up, one with a wrapping JSON length, a byte on stdout: each refused, and a well-formed reply
+after a refused one read as usual) and `channel_detects_a_dead_or_hung_server` (a server that kills itself holding the
+request: `UnexpectedEof` in under 2 s against a 30 s deadline, its exit named `signal: 9`; one that never answers: `TimedOut`
+at the 300 ms deadline). In the VM, `run_slice3_vm.py contain`'s cases kill a vCPU's server before its 51st request and stop
+another with SIGSTOP: the runs fail at once naming the server, and at the compile deadline, as before. Negative controls
+(`nc/`), each red: the length bound removed (`channel_refuses_malformed_replies` fails), the death check removed (both tests
+fail, the killed server's request waiting 30 s for its deadline), the deadline ignored (the hung test never ends; stopped at
+180 s), the reply copied one byte short (replay: 77,341 of 125,882 replies differ), the server copying its JSON one byte short
+(replay: 125,880 differ).
+
+**Per compile in the VM** (perf resident and log, installer and `build` N = 1, one run each of old and new taken one after the
+other; `final/analysis.jsonl`): round trip **13.07 to 5.46 us** (installer) and **13.53 to 5.18 us** (`build`); the server's CPU
+per compile 9.08 to 12.89 and 9.30 to 12.35 us, of which spinning for the next request is about 7.6 and 7.3 us (the mean of
+the gap to the next request, capped at 20 us), so its compile CPU fell to about 5.3 and 5.1 us; the vCPU threads' CPU 6.10 to
+6.19 s and 15.90 to 15.55 s. The round trip is now below the old server CPU per compile: what fell is not only the transport.
+(The HEAD runs of the breakdown, earlier in the day, measured 11.24-11.40 us round trip and 7.80-7.84 us server CPU.)
+
+**Measured** (wall s, uninstrumented; `camp/summary.md`; three interleaved rounds, old first in each; installer N = 4 once;
+`build`, `hackbench`, `locks`, `zstd` from START to END, boot excluded; CPU = the process's user + system, its reaped
+servers included; every run verified or reached the dialog, none contended):
+
+| Workload | N | wall s, old | wall s, new | change of means | CPU s, old | CPU s, new |
+| --- | --- | --- | --- | --- | --- | --- |
+| installer (spawn to the dialog) | 1 | 7.05 (6.99-7.17) | **5.85** (5.71-6.13) | -1.20 s (-17.0%) | 7.08 | 7.28 |
+| installer | 4 | 5.84 (one run) | **4.78** (one run) | -1.06 s (-18.2%) | 9.20 | 9.38 |
+| `build` | 1 | 14.47 (14.38-14.52) | **12.81** (12.79-12.84) | -1.66 s (-11.5%) | 17.32 | 17.48 |
+| `build` | 4 | 6.64 (6.52-6.71) | **5.57** (5.40-5.66) | -1.07 s (-16.1%) | 22.78 | 23.31 |
+| `hackbench` | 1 | 14.00 (13.98-14.02) | 13.92 (13.86-13.95) | -0.08 s | 16.75 | 16.83 |
+| `hackbench` | 4 | 3.90 (3.77-3.98) | 3.82 (3.77-3.92) | -0.08 s | 18.84 | 18.83 |
+| `locks` | 1 | 5.83 (5.79-5.86) | 5.73 (5.71-5.77) | -0.10 s | 8.61 | 8.62 |
+| `locks` | 4 | 6.99 (6.88-7.21) | 6.82 (6.54-7.01) | -0.17 s | 30.70 | 30.73 |
+| `zstd` | 1 | 2.03 (1.98-2.08) | **1.94** (1.91-1.96) | -0.09 s (-4.4%) | 4.87 | 4.92 |
+| `zstd` | 4 | 1.18 (1.15-1.20) | **1.06** (1.04-1.09) | -0.12 s (-10.2%) | 6.20 | 6.37 |
+
+Every benchmark's boot to its START line is 0.73-0.80 s shorter (N = 1 2.72-2.74 to 1.92-1.94 s; N = 4 2.78-2.81 to
+2.03-2.08). With the order reversed (three rounds new first, `camp-extra/`): `hackbench` N = 4 4.14 (4.03-4.22) old against
+3.95 (3.78-4.16) new, `locks` N = 4 7.16 (6.78-7.44) against 6.79 (6.49-6.96), `zstd` N = 4 1.16 (1.12-1.19) against 1.09
+(1.04-1.14); `hackbench` N = 4 four more rounds alternating (`camp-extra2/`): 3.88 (3.83-3.98) against 3.96 (3.81-4.08), so
+`hackbench` and `locks` are unchanged. The CPU added is 0.2 s on the installer N = 1 (+2.8%), 0.2 s on `build` N = 1 (+0.9%)
+and 0.5 s at N = 4 (+2.0-2.3%); at N = 4 that assumes spare cores (four vCPU threads and four servers, eight busy threads on
+this machine's ten). The installer and `build` N = 1 savings (1.20 and 1.66 s) are above the transport's bound
+(3.5 us x compiles: 0.44 s and 0.8 s), as the per-compile numbers show. This session's machine ran slower than chunk 20's
+(old installer N = 1 7.05 against 6.53 s then); the comparisons are interleaved. **Ship threshold met**: installer, `build`
+and `zstd` faster beyond the spread at both sizes, nothing slower.
+
+**Checks** (`suite21.sh`, `suite/`, the final tree with series58-channel, one VM runner at a time, each case's output deleted
+as it ended): `cargo test` 108 + 2 ignored (host; the two new tests and the
+ignored replay), abi 65, also with `FEXC` set; the resident stack audit `ok`; the Python unit tests 317; fixtures 64 and seed
+44 at both block sizes; the i7 corpus at CPL 0 69 at both; faults 7,912 at both; `run_k1.py` 336 runs, no problem; `run_k2.py`
+all ok, and `run_k2.py --only swapgs` (its `msr` at both block sizes, `fault`, `kicks`, `events`, `contain`) all ok;
+`run_slice3_vm.py` `system`, `delivery`, `events`, `contain` (the killed server's runs fail in 0.02 s, the stopped one's at its
+2 s deadline), `smp` 0 failures; `run_x3.py` 54/54 and every group (stress 6/6), `run_x4.py` 33/28/6, `run_l4a.py` (stress 2/2),
+`run_l4b.py`, `run_s4.py` all ok; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7, `r1b` 12/12 (negative controls flagged); FEX
+ASM 2,270: 1,898 pass, 48 precision deviations, 324 unsupported, no failure. The compiler's own checks (`checks/`): `test_serve.py` above, `test_fexc.py`,
+`test_slice1.py`, `check_sites.py --slice1`, `verify_precision.py` all pass.
+
+**Review** (independent, of the diff: no blocking defect). Applied, as series58-channel-r1: `os_sync` waits that fail with
+EINTR, ENOMEM or EFAULT are retried on both sides (the header's advice; the deadline still bounds the host); the host polls
+the server's stdout after every sleep that ends without the reply, not only on a timeout; the server takes stdin as closed only
+when `poll` returns > 0; the host copies the request in and the reply out with volatile accesses to the mapping; the magic word
+above; the server sums a reply's size in 64 bits and refuses one over the cap (or, on the pipe, over 2^32 - 1) with an error
+reply; `--channel` takes a decimal fd only, and `--channel-reply-cap N` (tests only) lowers the reply cap. New tests:
+`channel_caps_requests` (an empty request and one over 1 MiB refused, one of exactly 1 MiB posted), `channel_wakes_both_sides`
+(with the real server: a server asleep after 30 ms idle answers within 10 ms, a host asleep through fork mode's 0.5 ms compiles
+has its replies within 2.5 ms, a 1 MiB request reaches the server), a magic case in `channel_refuses_malformed_replies`, and
+`tools/fexc/test_channel.py` (the server's side: 10 replies equal the pipe's in reuse and fork mode with the server asleep before
+each; the over-cap error reply; exit on an empty request, on stdin's EOF while asleep, and with 3 on a request over 1 MiB; bad
+`--channel` values, a small mapping and a wrong magic refused at start). New negative controls, red: the host's wake removed
+(a sleeping server answered in 66 ms), the server's wake removed (the host's replies took 5.0-6.3 ms, its sleep slice); the
+earlier ones again on r1 (the length bound removed: a crash reading past the mapping; the death check removed: both tests fail;
+the deadline ignored: the test never ends; the reply copied one byte short: 77,394 replay differences). Rerun on r1: the
+installer (126,369 requests) and `build` (229,738) streams recorded again at HEAD and replayed through the pipe and the channel,
+also the installer's with `--report` and in fork mode: **0 differences** in each, and 0 over the pipe on both sides
+(`replay20.py`); `test_serve.py` reuse, fork, against series57-fork's CLI; `test_channel.py`; `test_fexc.py`, `test_slice1.py`,
+`check_sites.py --slice1`, `verify_precision.py`; `cargo test` 110 + 2 ignored (host), abi 65, with and without `FEXC`;
+`run_x3.py` stress 6/6, `run_l4a.py` stress 2/2, `run_slice3_vm.py contain` 0 failures. Replies byte-identical, so the walls
+were not measured again.
+
+**Not done.** The channel's region size and spin bounds are constants (no setting); the pipe protocol stays for `test_serve.py`,
+the replays and debugging, and the host no longer uses it. `test_serve.py` runs over the pipe only; the channel is covered by
+the replays, `test_channel.py`, the unit tests and every VM run. No test guards against a fork on the spawn (one would have to
+read the source); the stress cases are what caught it.
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
@@ -2129,7 +2281,7 @@ per-CR3 sets of the non-global part remain a candidate, with PCID.)
 
 **Per-block overhead.** As the profile shows: fexc's fixed cost (Config rebuilt per request since P3's leak fix; the JSON report the host dropped for objects: removed in chunk 2; argument parsing and the feature table
 per request, chunk 2's profile; Config, arguments, feature table and reply copies: removed in chunk 20); IPC by pipes and `poll` (564-611), a
-shared-memory ring with a native wait only if material; staging, placement; admission's quadratic site scans.
+shared-memory ring with a native wait only if material (chunk 21: a shared channel with both sides spinning, installer -17%); staging, placement; admission's quadratic site scans.
 
 **Resident entry cost.** About 0.36 us fixed per entry, 0.167 us the cheapest (plan, P2 row). Ticks in `bank`
 (`runtime/src/execution.rs:1502`), `sse::bank` (`sse.rs:28`), `block_at`, `enter` (715-757), `tables::select`

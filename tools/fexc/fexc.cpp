@@ -22,12 +22,18 @@
 #include <FEXCore/fextl/memory.h>
 #include <fexc_hook.h>
 
+#include <os/os_sync_wait_on_address.h>
+#include <mach/mach_time.h>
+#include <poll.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <bit>
+#include <climits>
 #include <unordered_map>
 #include <map>
 #include <stdexcept>
@@ -960,6 +966,49 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
 // dumps; without (the host's server), only what the host reads: {"status":"ok"} for an object, the status and guest.end for
 // no code (with the CLI's status, error and diagnostics when FEX emitted nothing). The object, extent and args_read are the same.
 // EOF on stdin ends the server. One request at a time, in order.
+//
+// --channel FD (perf chunk 21; the host's server): the same payloads through a shared mapping of FD (the host's, at least
+// kChanBytes) instead of stdin and stdout, which then carry nothing (stdin's EOF still ends the server). Layout: at 0 the
+// request word, at 4 the request's payload length, at 8 the host's kChanMagic (the layout's version, checked at start); at 64
+// the reply word, at 68 the reply's payload length, at 72 kChanMagic (written at start, checked by the host); the request
+// payload at kReqAt (at most kReqCap bytes), the reply payload at kRepAt (at most kRepCap). Request n (n = 1, 2, ... mod
+// 2^31) is posted by storing its payload and length, then n << 1 in the request word; the server answers with its payload
+// and length, then n << 1 in the reply word. Bit 0 of a word: its reader sleeps (os_sync_wait_on_address) and the poster
+// wakes it; a reader first spins (kServerSpinNs here, the host its own). A request of length 0 ends the server. A reply over
+// kRepCap is an error reply (code 2) instead. The host treats the mapping as untrusted input, as it does the pipe.
+// --channel-reply-cap N (tests only, test_channel.py): a smaller reply cap, to reach that error reply.
+static constexpr uint32_t kChanMagic = 0x314e4843;   // "CHN1"; the host's Channel::MAGIC
+static constexpr size_t kChanBytes = 16u << 20, kReqAt = 4096, kReqCap = 1u << 20, kRepAt = kReqAt + kReqCap, kRepCap = kChanBytes - kRepAt;
+// The host's next compile request follows a reply within 20 us in about 95% of cases (perf chunk 21). Both sides spin: with
+// either one asleep the woken side's wake-up costs about as much as the pipe did, the gain is the wake-ups avoided.
+static constexpr uint64_t kServerSpinNs = 20000;
+static uint8_t* Chan = nullptr;
+static size_t ChanRepCap = kRepCap;
+static uint32_t* ChanWord(size_t at) { return reinterpret_cast<uint32_t*>(Chan + at); }
+static uint64_t NowNs() {
+  static const double scale = [] { mach_timebase_info_data_t t; mach_timebase_info(&t); return double(t.numer) / t.denom; }();
+  return uint64_t(double(mach_absolute_time()) * scale);
+}
+// Waits for request `n`; false when the host is gone (stdin at EOF: checked whenever a sleep times out, every 100 ms).
+static bool AwaitRequest(uint32_t n) {
+  uint32_t* const w = ChanWord(0);
+  const uint32_t want = n & 0x7fffffff;
+  for (const uint64_t spin = NowNs() + kServerSpinNs;;) {
+    uint32_t v = __atomic_load_n(w, __ATOMIC_ACQUIRE);
+    if (v >> 1 == want) return true;
+    if (NowNs() < spin) continue;
+    if (!(v & 1) && !__atomic_compare_exchange_n(w, &v, v | 1, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) continue;
+    if (os_sync_wait_on_address_with_timeout(w, v | 1, 4, OS_SYNC_WAIT_ON_ADDRESS_SHARED, OS_CLOCK_MACH_ABSOLUTE_TIME, 100000000) < 0) {
+      // EINTR, ENOMEM and EFAULT (a failed copyin of a valid address) are retried, as os/os_sync_wait_on_address.h says.
+      if (errno == ETIMEDOUT) { pollfd p {0, POLLIN, 0}; if (poll(&p, 1, 0) > 0) return false; }
+      else if (errno != EINTR && errno != ENOMEM && errno != EFAULT) _exit(3);
+    }
+  }
+}
+static void PostReply(uint32_t n) {
+  if (__atomic_exchange_n(ChanWord(64), (n & 0x7fffffff) << 1, __ATOMIC_SEQ_CST) & 1)
+    os_sync_wake_by_address_any(ChanWord(64), 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
+}
 static bool ReadAll(int fd, void* p, size_t n) {
   for (auto* c = static_cast<char*>(p); n;) { ssize_t r = read(fd, c, n); if (r <= 0) return false; c += r; n -= size_t(r); }
   return true;
@@ -967,10 +1016,22 @@ static bool ReadAll(int fd, void* p, size_t n) {
 static void WriteAll(int fd, const void* p, size_t n) {
   for (auto* c = static_cast<const char*>(p); n;) { ssize_t r = write(fd, c, n); if (r <= 0) _exit(3); c += r; n -= size_t(r); }
 }
-static void SendReply(const Reply& r) {   // the header, JSON and object in one writev, without copying them together
+// Reply `n`: through the channel when there is one (header, JSON and object copied in), else one writev to stdout.
+static void SendReply(const Reply& r, uint32_t n) {
   static_assert(std::endian::native == std::endian::little);
-  const uint32_t h[6] = {uint32_t(20 + r.json.size() + r.object.size()), uint32_t(r.code), uint32_t(r.json.size()), uint32_t(r.object.size()),
+  const uint64_t total = 20 + uint64_t(r.json.size()) + uint64_t(r.object.size());   // no wrap: each part is under 2^63
+  if (total > (Chan ? uint64_t(ChanRepCap) : uint64_t(UINT32_MAX))) {
+    Reply e; e.code = 2; e.json = "reply of " + std::to_string(total) + (Chan ? " bytes exceeds the channel" : " bytes exceeds the protocol");
+    return SendReply(e, n);
+  }
+  const uint32_t h[6] = {uint32_t(total), uint32_t(r.code), uint32_t(r.json.size()), uint32_t(r.object.size()),
                          r.code < 2 ? r.extent : 0, r.code < 2 ? r.args_read : 0};
+  if (Chan) {
+    uint8_t* p = Chan + kRepAt;
+    memcpy(p, h + 1, 20); memcpy(p + 20, r.json.data(), r.json.size()); memcpy(p + 20 + r.json.size(), r.object.data(), r.object.size());
+    __atomic_store_n(ChanWord(68), h[0], __ATOMIC_RELAXED);
+    return PostReply(n);
+  }
   iovec v[3] = {{const_cast<uint32_t*>(h), sizeof h}, {const_cast<char*>(r.json.data()), r.json.size()},
                 {const_cast<uint8_t*>(r.object.data()), r.object.size()}};
   iovec *p = v, *const e = v + 3;
@@ -1038,35 +1099,60 @@ static void Compile(const char* a, size_t alen, const uint8_t* bytes, size_t siz
 static int Serve(const std::string& mode) {
   std::vector<uint8_t> req;   // reused: no allocation per request once it has held the largest
   Reply r;
-  for (;;) {
+  for (uint32_t n = 1;; ++n) {
     uint32_t len;
-    if (!ReadAll(0, &len, 4)) return 0;
-    req.resize(len);
-    if (!ReadAll(0, req.data(), len) || len < 4) return 3;
+    if (Chan) {
+      if (!AwaitRequest(n)) return 0;
+      len = __atomic_load_n(ChanWord(4), __ATOMIC_RELAXED);
+      if (!len) return 0;
+      if (len > kReqCap) return 3;
+      req.assign(Chan + kReqAt, Chan + kReqAt + len);
+    } else {
+      if (!ReadAll(0, &len, 4)) return 0;
+      req.resize(len);
+      if (!ReadAll(0, req.data(), len)) return 3;
+    }
+    if (len < 4) return 3;
     uint32_t alen = req[0] | req[1] << 8 | req[2] << 16 | uint32_t(req[3]) << 24;
     if (alen > len - 4 || (alen && req[3 + alen]) ) return 3;   // the arguments end with a NUL
     const char* args = reinterpret_cast<const char*>(req.data() + 4);
     const uint8_t* bytes = req.data() + 4 + alen;
     if (mode == "fork") {
       pid_t pid = fork();
-      if (pid == 0) { Compile(args, alen, bytes, len - 4 - alen, r); SendReply(r); _exit(0); }
+      if (pid == 0) { Compile(args, alen, bytes, len - 4 - alen, r); SendReply(r, n); _exit(0); }
       int status = 0;
       waitpid(pid, &status, 0);
-      if (!WIFEXITED(status) || WEXITSTATUS(status)) { r = {}; r.code = 4; r.json = "fexc child died, status " + std::to_string(status); SendReply(r); }
-    } else { Compile(args, alen, bytes, len - 4 - alen, r); SendReply(r); }
+      if (!WIFEXITED(status) || WEXITSTATUS(status)) { r = {}; r.code = 4; r.json = "fexc child died, status " + std::to_string(status); SendReply(r, n); }
+    } else { Compile(args, alen, bytes, len - 4 - alen, r); SendReply(r, n); }
   }
 }
 
 int main(int argc, char** argv) {
-  if (argc >= 2 && std::string(argv[1]) == "--serve") {   // fexc --serve [--serve-mode reuse|fork] [--report]
+  if (argc >= 2 && std::string(argv[1]) == "--serve") {   // fexc --serve [--serve-mode reuse|fork] [--report] [--channel FD]
     std::string mode = "reuse";
+    long channel = -1, cap = -1;
+    const auto number = [](const char* v, long& out) { char* e; errno = 0; out = strtol(v, &e, 10); return !errno && *v && !*e && out >= 0; };
     for (int i = 2; i < argc; ++i) {
       const std::string a = argv[i];
       if (a == "--serve-mode" && i + 1 < argc) mode = argv[++i];
       else if (a == "--report") ServeReport = true;
-      else return Fail("--serve [--serve-mode reuse|fork] [--report]");
+      else if (a == "--channel" && i + 1 < argc && number(argv[i + 1], channel) && channel <= INT_MAX) ++i;
+      else if (a == "--channel-reply-cap" && i + 1 < argc && number(argv[i + 1], cap)) ++i;
+      else return Fail("--serve [--serve-mode reuse|fork] [--report] [--channel FD [--channel-reply-cap N]]");
     }
     if (mode != "fork" && mode != "reuse") return Fail("--serve-mode reuse|fork");
+    if (cap >= 0 && (channel < 0 || cap < 20 || size_t(cap) > kRepCap)) return Fail("--channel-reply-cap: 20 to " + std::to_string(kRepCap) + ", with --channel");
+    if (channel >= 0) {
+      struct stat st;
+      if (fstat(int(channel), &st) || st.st_size < off_t(kChanBytes)) return Fail("--channel: not a mapping of at least " + std::to_string(kChanBytes) + " bytes");
+      void* m = mmap(nullptr, kChanBytes, PROT_READ | PROT_WRITE, MAP_SHARED, int(channel), 0);
+      if (m == MAP_FAILED) return Fail(std::string("--channel: mmap: ") + strerror(errno));
+      close(int(channel));
+      Chan = static_cast<uint8_t*>(m);
+      if (__atomic_load_n(ChanWord(8), __ATOMIC_ACQUIRE) != kChanMagic) return Fail("--channel: not a natemu channel (magic)");
+      __atomic_store_n(ChanWord(72), kChanMagic, __ATOMIC_RELEASE);
+      if (cap >= 0) ChanRepCap = size_t(cap);
+    }
     return Serve(mode);   // stdin EOF; contexts are never torn down (see Ctx), so leave without destructors
   }
   ResetGlobals();

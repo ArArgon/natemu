@@ -12,7 +12,7 @@ use natemu_abi::execution::{self as exec, Cpu, State, cache};
 use natemu_abi::guest_memory::GuestRam;
 use natemu_abi::paging::Fault;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -561,7 +561,8 @@ pub enum Stop {
     Power(u8),
 }
 
-/// One `fexc --serve` process (protocol in tools/fexc/fexc.cpp): length-prefixed requests and replies on its stdin/stdout.
+/// One `fexc --serve` process (protocol in tools/fexc/fexc.cpp): length-prefixed requests and replies through a mapping
+/// shared with it ([`Channel`], perf chunk 21); its stdin and stdout carry nothing, but stdout's EOF says it died.
 struct Server {
     child: Child,
     /// `None` once [`Server::finish`] closed it.
@@ -569,39 +570,227 @@ struct Server {
     stdout: ChildStdout,
     /// [`Server::finish`] reaped it.
     reaped: bool,
+    channel: Channel,
+}
+unsafe extern "C" {
+    fn shm_open(name: *const std::ffi::c_char, flags: i32, ...) -> i32;
+    fn shm_unlink(name: *const std::ffi::c_char) -> i32;
+    fn ftruncate(fd: i32, length: i64) -> i32;
+    fn mmap(address: *mut c_void, length: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut c_void;
+    fn munmap(address: *mut c_void, length: usize) -> i32;
+    fn close(fd: i32) -> i32;
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    fn os_sync_wait_on_address_with_timeout(addr: *mut u8, value: u64, size: usize, flags: u32, clock: u32, timeout_ns: u64) -> i32;
+    fn os_sync_wake_by_address_any(addr: *mut u8, size: usize, flags: u32) -> i32;
+}
+/// Perf chunk 21: a server's requests and replies, through a mapping it shares with the host (layout and protocol in
+/// tools/fexc/fexc.cpp, `--channel`). The server can write any byte of it at any time, so the host reads nothing there
+/// it has not bounds-checked and copied out first, and nothing it trusts lives there.
+struct Channel {
+    base: *mut u8,
+    fd: i32,
+    /// The last request's number.
+    n: u32,
+}
+// The mapping is the channel's own; one thread uses it at a time (`&mut Server`).
+unsafe impl Send for Channel {}
+impl Channel {
+    const BYTES: usize = 16 << 20;
+    const REQUEST: usize = 4096;
+    const REQUEST_CAP: usize = 1 << 20;
+    const REPLY: usize = Self::REQUEST + Self::REQUEST_CAP;
+    const REPLY_CAP: usize = Self::BYTES - Self::REPLY;
+    /// The layout's magic (and version), "CHN1": the host writes it at 8 when it makes the mapping, the server checks it and
+    /// writes it at 72 before it answers; the host checks that with every reply (fexc.cpp's kChanMagic).
+    const MAGIC: u32 = 0x314e_4843;
+    /// How long the host spins for a reply before it sleeps: 99.6% of chunk 21's round trips took at most 30 us. (The server
+    /// spins 20 us for the next request; with only one side spinning the other's wake-up costs what the pipe did.)
+    const SPIN: Duration = Duration::from_micros(30);
+    /// A sleep's longest stretch: then the host checks whether the server died (and its deadline).
+    const SLICE_NS: u64 = 5_000_000;
+    /// A new mapping (close-on-exec: `shm_open` takes no O_CLOEXEC; its name is unlinked at once).
+    fn new() -> Result<Self> {
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        const O_RDWR: i32 = 2;
+        const O_CREAT: i32 = 0x200;
+        const O_EXCL: i32 = 0x800;
+        let name = std::ffi::CString::new(format!("/natemu.{}.{}", std::process::id(), COUNT.fetch_add(1, Relaxed))).unwrap();
+        const F_SETFD: i32 = 2;
+        const FD_CLOEXEC: i32 = 1;
+        let fd = unsafe { shm_open(name.as_ptr(), O_RDWR | O_CREAT | O_EXCL, 0o600 as std::ffi::c_uint) };
+        if fd < 0 {
+            return Err(format!("fexc channel: shm_open: {}", std::io::Error::last_os_error()));
+        }
+        unsafe { shm_unlink(name.as_ptr()) };
+        const PROT_RW: i32 = 3;
+        const MAP_SHARED: i32 = 1;
+        let base = match unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 && ftruncate(fd, Self::BYTES as i64) == 0 } {
+            true => unsafe { mmap(std::ptr::null_mut(), Self::BYTES, PROT_RW, MAP_SHARED, fd, 0) as *mut u8 },
+            false => usize::MAX as *mut u8,
+        };
+        if base as usize == usize::MAX {
+            let e = std::io::Error::last_os_error();
+            unsafe { close(fd) };
+            return Err(format!("fexc channel: {e}"));
+        }
+        let channel = Self { base, fd, n: 0 };
+        channel.word(8).store(Self::MAGIC, Relaxed);
+        Ok(channel)
+    }
+    fn word(&self, at: usize) -> &std::sync::atomic::AtomicU32 {
+        unsafe { &*(self.base.add(at) as *const std::sync::atomic::AtomicU32) }
+    }
+    /// Posts a request payload: copied in, its length, then its number in the request word (waking a sleeping server).
+    fn post(&mut self, body: &[u8]) -> std::io::Result<()> {
+        if body.is_empty() || body.len() > Self::REQUEST_CAP {
+            return Err(std::io::Error::other(format!("a request of {} bytes does not fit the fexc channel", body.len())));
+        }
+        self.n = self.n.wrapping_add(1) & 0x7fff_ffff;
+        unsafe { channel_copy(self.base.add(Self::REQUEST), body.as_ptr() as *mut u8, body.len(), true) };
+        self.word(4).store(body.len() as u32, Relaxed);
+        self.publish();
+        Ok(())
+    }
+    /// The request word: request `n` posted; a sleeping server woken.
+    fn publish(&self) {
+        const SHARED: u32 = 1;
+        if self.word(0).swap(self.n << 1, SeqCst) & 1 != 0 {
+            unsafe { os_sync_wake_by_address_any(self.base, 4, SHARED) };
+        }
+    }
+    /// Ends the server: an empty request.
+    fn end(&mut self) {
+        self.n = self.n.wrapping_add(1) & 0x7fff_ffff;
+        self.word(4).store(0, Relaxed);
+        self.publish();
+    }
+    /// Waits for the reply to the last request (spin, then sleep in slices), checking `dead` after every sleep that ends without
+    /// it and `deadline` throughout; then its payload, bounds-checked and copied out.
+    fn reply(&self, deadline: Instant, mut dead: impl FnMut() -> std::io::Result<()>) -> std::io::Result<Vec<u8>> {
+        const SHARED: u32 = 1;
+        const MACH_ABSOLUTE_TIME: u32 = 32;
+        // Retried, as os/os_sync_wait_on_address.h says (spurious wake-up, kernel memory, a failed copyin of a valid address).
+        const ETIMEDOUT: i32 = 60;
+        const EINTR: i32 = 4;
+        const ENOMEM: i32 = 12;
+        const EFAULT: i32 = 14;
+        let w = self.word(64);
+        let spin = Instant::now() + Self::SPIN;
+        loop {
+            let v = w.load(std::sync::atomic::Ordering::Acquire);
+            if v >> 1 == self.n {
+                break;
+            }
+            let now = Instant::now();
+            if now < spin {
+                std::hint::spin_loop();
+                continue;
+            }
+            if now >= deadline {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            if v & 1 == 0 && w.compare_exchange(v, v | 1, SeqCst, SeqCst).is_err() {
+                continue;
+            }
+            let left = (deadline - now).as_nanos().min(Self::SLICE_NS as u128) as u64;
+            let ns = unsafe { os_sync_wait_on_address_with_timeout(self.base.add(64), (v | 1) as u64, 4, SHARED, MACH_ABSOLUTE_TIME, left.max(1)) };
+            if ns < 0 {
+                let e = std::io::Error::last_os_error();
+                if !matches!(e.raw_os_error(), Some(ETIMEDOUT | EINTR | ENOMEM | EFAULT)) {
+                    return Err(e);
+                }
+            }
+            if w.load(std::sync::atomic::Ordering::Acquire) >> 1 != self.n {
+                dead()?;
+            }
+        }
+        let magic = self.word(72).load(Relaxed);
+        if magic != Self::MAGIC {
+            return Err(std::io::Error::other(format!("malformed fexc reply: channel magic {magic:#x}")));
+        }
+        let len = self.word(68).load(Relaxed) as usize;
+        if !(20..=Self::REPLY_CAP).contains(&len) {
+            return Err(std::io::Error::other(format!("malformed fexc reply: length {len}")));
+        }
+        let mut reply = vec![0; len];
+        unsafe { channel_copy(self.base.add(Self::REPLY), reply.as_mut_ptr(), len, false) };
+        Ok(reply)
+    }
+}
+/// Copies `len` bytes into (`into`) or out of the channel's mapping at `at`, which the server may write at any time: volatile
+/// accesses to the mapping, eight bytes at a time where they fit (both areas start 4 KiB-aligned), so a racing writer can only
+/// make the copy's bytes wrong, which the reply's checks then see; `buf` is the host's own memory.
+unsafe fn channel_copy(at: *mut u8, buf: *mut u8, len: usize, into: bool) {
+    unsafe {
+        let words = len / 8;
+        for i in 0..words {
+            let (m, b) = ((at as *mut u64).add(i), buf.add(i * 8) as *mut u64);
+            if into { m.write_volatile(b.read_unaligned()) } else { b.write_unaligned(m.read_volatile()) }
+        }
+        for i in words * 8..len {
+            if into { at.add(i).write_volatile(*buf.add(i)) } else { *buf.add(i) = at.add(i).read_volatile() }
+        }
+    }
+}
+impl Drop for Channel {
+    fn drop(&mut self) {
+        unsafe {
+            munmap(self.base as *mut c_void, Self::BYTES);
+            close(self.fd);
+        }
+    }
 }
 impl Server {
     fn start(fexc: &Path) -> Result<Self> {
+        Self::spawn(fexc, &[])
+    }
+    /// `start` with further server options (tests: `--report`, `--serve-mode fork`).
+    fn spawn(fexc: &Path, extra: &[&str]) -> Result<Self> {
         // One spawn at a time in the process. On macOS, std makes a child's pipes with `pipe` and only then marks them
         // close-on-exec, so a server spawned by another owner in between inherits this one's pipe end: a server holding
         // a killed sibling's stdout hides its death (no EOF) until the holder exits, and the request waits for its
         // deadline or the peers' watchdogs (seen with `lsof` in the compile-server-kill runs).
         static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _spawn = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+        let channel = Channel::new()?;
         // Its own process group (R2 review): a terminal's Ctrl-C goes to the foreground group, and must reach only the
-        // embedder (the stub cancels the run), not kill the server under a compile.
-        let mut child = Command::new(fexc)
-            .arg("--serve")
+        // embedder (the stub cancels the run), not kill the server under a compile. The channel's fd is inherited: it is
+        // not close-on-exec only for this spawn (under SPAWN). The host must never fork while a VM runs: no `pre_exec`,
+        // `uid`, `gid` or anything else that makes std fork instead of `posix_spawn` here. A fork makes the private guest
+        // RAM copy-on-write under the running VM; with it the multi-vCPU stress cases (`run_x3.py`, `run_l4a.py` stress)
+        // lost interrupts (perf chunk 21).
+        const F_SETFD: i32 = 2;
+        const FD_CLOEXEC: i32 = 1;
+        if unsafe { fcntl(channel.fd, F_SETFD, 0) } < 0 {
+            return Err(format!("fexc channel: {}", std::io::Error::last_os_error()));
+        }
+        let child = Command::new(fexc)
+            .args(["--serve", "--channel", &channel.fd.to_string()])
+            .args(extra)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .process_group(0)
-            .spawn()
-            .map_err(|e| format!("fexc --serve: {e}"))?;
+            .spawn();
+        let cloexec = unsafe { fcntl(channel.fd, F_SETFD, FD_CLOEXEC) };
+        let mut child = child.map_err(|e| format!("fexc --serve: {e}"))?;
+        if cloexec < 0 {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("fexc channel: {}", std::io::Error::last_os_error()));
+        }
         let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
         crate::perf::mark(&format!("server_start{}", std::thread::current().name().unwrap_or("").trim_start_matches("vcpu-")));
-        Ok(Self { child, stdin: Some(stdin), stdout, reaped: false })
+        Ok(Self { child, stdin: Some(stdin), stdout, reaped: false, channel })
     }
-    /// The server's reply to one request body; a `TimedOut` error when the whole reply has not arrived by `deadline`. (The
-    /// request itself is written without a deadline: a body is at most a few KiB, which the pipe takes whether or not the
-    /// server reads.)
+    /// The server's reply to one request body; a `TimedOut` error when the whole reply has not arrived by `deadline`, an
+    /// `UnexpectedEof` one when the server died first (its stdout closed; seen within [`Channel::SLICE_NS`]).
     fn request(&mut self, body: &[u8], deadline: Instant) -> std::io::Result<Reply> {
-        let stdin = self.stdin.as_mut().ok_or_else(|| std::io::Error::other("fexc --serve: closed"))?;
-        stdin.write_all(&(body.len() as u32).to_le_bytes())?;
-        stdin.write_all(body)?;
-        let mut word = [0; 4];
-        self.read_by(&mut word, deadline)?;
-        let mut reply = vec![0; u32::from_le_bytes(word) as usize];
-        self.read_by(&mut reply, deadline)?;
+        if self.stdin.is_none() {
+            return Err(std::io::Error::other("fexc --serve: closed"));
+        }
+        self.channel.post(body)?;
+        let stdout = &mut self.stdout;
+        let mut reply = self.channel.reply(deadline, || Self::alive(stdout))?;
         let field = |at: usize| u32::from_le_bytes(reply[at..at + 4].try_into().unwrap());
         if reply.len() < 20 || reply.len() != 20 + field(4) as usize + field(8) as usize {
             return Err(std::io::Error::other("malformed fexc reply"));
@@ -611,8 +800,9 @@ impl Server {
         let json = reply.split_off(20);
         Ok(Reply { code, json, object, extent, read })
     }
-    /// Fills `buf` from the server's stdout, waiting (poll) at most until `deadline`.
-    fn read_by(&mut self, buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
+    /// Whether the server still runs: its stdout carries nothing in channel mode, so readable means EOF (it died) or a
+    /// protocol error.
+    fn alive(stdout: &mut ChildStdout) -> std::io::Result<()> {
         #[repr(C)]
         struct PollFd {
             fd: i32,
@@ -623,25 +813,14 @@ impl Server {
             fn poll(fds: *mut PollFd, count: u32, timeout_ms: i32) -> i32;
         }
         const POLLIN: i16 = 1;
-        let mut done = 0;
-        while done < buf.len() {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let mut fd = PollFd { fd: std::os::fd::AsRawFd::as_raw_fd(&self.stdout), events: POLLIN, revents: 0 };
-            match unsafe { poll(&mut fd, 1, left.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32) } {
-                0 => return Err(std::io::ErrorKind::TimedOut.into()),
-                n if n < 0 => {
-                    let e = std::io::Error::last_os_error();
-                    if e.kind() != std::io::ErrorKind::Interrupted {
-                        return Err(e);
-                    }
-                }
-                _ => match self.stdout.read(&mut buf[done..])? {
-                    0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
-                    n => done += n,
-                },
-            }
+        let mut fd = PollFd { fd: std::os::fd::AsRawFd::as_raw_fd(stdout), events: POLLIN, revents: 0 };
+        if unsafe { poll(&mut fd, 1, 0) } <= 0 {
+            return Ok(());
         }
-        Ok(())
+        match stdout.read(&mut [0; 64])? {
+            0 => Err(std::io::ErrorKind::UnexpectedEof.into()),
+            _ => Err(std::io::Error::other("fexc --serve wrote to its stdout")),
+        }
     }
     /// A failed request's error, naming the server and, if it has exited, how (its pipes close as it exits, so a dead
     /// server is normally reaped here at once; wait briefly for the exit status).
@@ -658,7 +837,7 @@ impl Server {
     }
 }
 impl Server {
-    /// Closes its stdin (EOF ends `fexc --serve`) and reaps it: its user and system CPU nanoseconds and maximum resident
+    /// Ends it (an empty request; its stdin closed too) and reaps it: its user and system CPU nanoseconds and maximum resident
     /// bytes (`wait4`'s rusage; the performance log).
     fn finish(&mut self) -> Option<(u64, u64, u64)> {
         #[repr(C)]
@@ -672,6 +851,7 @@ impl Server {
             fn wait4(pid: i32, status: *mut i32, options: i32, rusage: *mut Rusage) -> i32;
         }
         const WNOHANG: i32 = 1;
+        self.channel.end();
         self.stdin = None;
         let (pid, mut status, mut r) = (self.child.id() as i32, 0, Rusage { user: [0; 2], system: [0; 2], max_rss: 0, rest: [0; 13] });
         // EOF ends it at once; one that does not end within a second is killed (its CPU time is still reported).
@@ -2331,6 +2511,165 @@ mod tests {
         let (user, system, rss) = c.finish().unwrap();
         assert!(user + system > 0 && rss > 0, "{user} {system} {rss}");
         assert!(c.server.as_ref().unwrap().reaped);
+    }
+
+    /// Perf chunk 21: a stand-in for `fexc --serve --channel FD` (a Python script; no wakes, so the host sees each reply
+    /// at its next slice) that answers request 1 with `reply` (Python statements on `m`, the mapping, and `n`, the
+    /// request number) and request 2 and later with a well-formed empty reply.
+    fn fake_server(name: &str, reply: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("natemu-fake-fexc-{name}-{}.py", std::process::id()));
+        let script = format!(
+            "#!/usr/bin/python3\nimport mmap, os, signal, struct, sys, time\nassert sys.argv[1:3] == ['--serve', '--channel'] and len(sys.argv) == 4, sys.argv\n\
+             m = mmap.mmap(int(sys.argv[3]), {bytes})\nREP = {rep}\nassert struct.unpack_from('<I', m, 8)[0] == {magic}\n\
+             struct.pack_into('<I', m, 72, {magic})\nfor n in range(1, 1 << 30):\n    while struct.unpack_from('<I', m, 0)[0] >> 1 != n: time.sleep(0.0002)\n\
+             \x20   if struct.unpack_from('<I', m, 4)[0] == 0: sys.exit(0)\n    if n == 1:\n{reply}\n    else:\n\
+             \x20       struct.pack_into('<IIIIII', m, REP, 1, 0, 0, 0, 0, 0); struct.pack_into('<II', m, 68, 20, {magic})\n\
+             \x20   struct.pack_into('<I', m, 64, n << 1)\n",
+            bytes = Channel::BYTES,
+            rep = Channel::REPLY,
+            magic = Channel::MAGIC,
+            reply = reply.lines().map(|l| format!("        {l}\n")).collect::<String>()
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Perf chunk 21: the channel's reply is untrusted input. A length past the reply area or under the header, a header
+    /// whose JSON and object lengths do not add up to it, or a wrong layout magic is refused (an error, nothing read beyond
+    /// the area); the server's stray output on stdout is refused too; a well-formed reply after a refused one is read as usual.
+    #[test]
+    fn channel_refuses_malformed_replies() {
+        let cases = [
+            ("over", format!("struct.pack_into('<I', m, 68, {})", Channel::REPLY_CAP + 1), "length"),
+            ("huge", "struct.pack_into('<I', m, 68, 0xffffffff)".to_string(), "length"),
+            ("short", "struct.pack_into('<I', m, 68, 19)".to_string(), "length"),
+            ("sum", "struct.pack_into('<IIIIII', m, REP, 0, 8, 8, 0, 0, 0); struct.pack_into('<I', m, 68, 28)".to_string(), "malformed fexc reply"),
+            ("wrap", "struct.pack_into('<IIIIII', m, REP, 0, 0xfffffff0, 0x20, 0, 0, 0); struct.pack_into('<I', m, 68, 36)".to_string(), "malformed fexc reply"),
+            ("stdout", "os.write(1, b'x'); time.sleep(0.05); struct.pack_into('<I', m, 68, 20)".to_string(), "wrote to its stdout"),
+            ("magic", "struct.pack_into('<IIIIII', m, REP, 1, 0, 0, 0, 0, 0); struct.pack_into('<II', m, 68, 20, 0)".to_string(), "channel magic"),
+        ];
+        for (name, reply, want) in cases {
+            let path = fake_server(name, &reply);
+            let mut server = Server::start(&path).unwrap();
+            let e = server.request(b"\0\0\0\0", Instant::now() + Duration::from_secs(10)).err().unwrap();
+            assert!(e.to_string().contains(want), "{name}: {e}");
+            if name != "stdout" {
+                let r = server.request(b"\0\0\0\0", Instant::now() + Duration::from_secs(10)).unwrap();
+                assert_eq!((r.code, r.json.len(), r.object.len()), (1, 0, 0), "{name}");
+                assert!(server.finish().is_some(), "{name}: the empty request ends it");
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    /// Perf chunk 21: the host posts nothing empty (the empty request ends the server) and nothing over the request area.
+    #[test]
+    fn channel_caps_requests() {
+        let mut c = Channel::new().unwrap();
+        assert_eq!(c.word(8).load(Relaxed), Channel::MAGIC);
+        for len in [0, Channel::REQUEST_CAP + 1] {
+            assert!(c.post(&vec![7; len]).err().unwrap().to_string().contains("does not fit"), "{len}");
+        }
+        c.post(&vec![7; Channel::REQUEST_CAP]).unwrap();
+        assert_eq!((c.word(0).load(Relaxed), c.word(4).load(Relaxed) as usize), (2, Channel::REQUEST_CAP));
+    }
+
+    /// Perf chunk 21: both wakes, with the real server. A server asleep (idle past its 20 us spin; its own sleeps end every
+    /// 100 ms) answers a request within 10 ms, so the host woke it; a host asleep (fork mode's compiles take about 0.5 ms,
+    /// past the host's 30 us spin; its sleeps end every 5 ms) has each reply within 2.5 ms (median), so the server woke it.
+    /// A request of the whole request area reaches the server (an error reply: no arguments).
+    #[test]
+    fn channel_wakes_both_sides() {
+        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let c = super::Compiler::with_features(Path::new(&fexc), u64::MAX, None);
+        let body = c.body(&[0x48, 0x01, 0xd8, 0xc3], 0x1000, None);
+        let deadline = || Instant::now() + Duration::from_secs(10);
+        let mut server = Server::start(Path::new(&fexc)).unwrap();
+        assert_eq!(server.request(&body, deadline()).unwrap().code, 0);
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(30));
+            let t = Instant::now();
+            assert_eq!(server.request(&body, deadline()).unwrap().code, 0);
+            assert!(t.elapsed() < Duration::from_millis(10), "a sleeping server answered in {:?}", t.elapsed());
+        }
+        let mut whole = vec![0; Channel::REQUEST_CAP];
+        whole[..4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(server.request(&whole, deadline()).unwrap().code, 2);
+        let mut fork = Server::spawn(Path::new(&fexc), &["--serve-mode", "fork"]).unwrap();
+        assert_eq!(fork.request(&body, deadline()).unwrap().code, 0);
+        let mut took: Vec<Duration> = (0..11)
+            .map(|_| {
+                let t = Instant::now();
+                assert_eq!(fork.request(&body, deadline()).unwrap().code, 0);
+                t.elapsed()
+            })
+            .collect();
+        took.sort();
+        assert!(took[5] < Duration::from_micros(2500), "a sleeping host had its replies in {took:?}");
+    }
+
+    /// Perf chunk 21: a server that dies holding a request fails it promptly (stdout's EOF, seen within a slice), well
+    /// before the deadline; one that never answers fails it at the deadline.
+    #[test]
+    fn channel_detects_a_dead_or_hung_server() {
+        let path = fake_server("killed", "os.kill(os.getpid(), signal.SIGKILL)");
+        let mut server = Server::start(&path).unwrap();
+        let t = Instant::now();
+        let e = server.request(b"\0\0\0\0", t + Duration::from_secs(30)).err().unwrap();
+        assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof, "{e}");
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert!(server.failed(e).contains("signal: 9"));
+        std::fs::remove_file(path).unwrap();
+        let path = fake_server("hung", "time.sleep(3600)");
+        let mut server = Server::start(&path).unwrap();
+        let t = Instant::now();
+        let e = server.request(b"\0\0\0\0", t + Duration::from_millis(300)).err().unwrap();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+        assert!((Duration::from_millis(300)..Duration::from_secs(2)).contains(&t.elapsed()), "{:?}", t.elapsed());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Perf chunk 21's identity gate (`NATEMU_REPLAY` = a recorded request stream, u32 length + body as the host wrote
+    /// them; `NATEMU_REPLAY_OLD` = a compiler run over the pipe, `FEXC` = one run over the channel as the host runs it;
+    /// `NATEMU_REPLAY_ARGS`: server options for both, e.g. `--report`): every reply identical (code, JSON, object, extent,
+    /// args_read: the whole payload).
+    #[test]
+    #[ignore]
+    fn channel_replay_matches_the_pipe() {
+        use std::io::Write;
+        let (Some(stream), Some(old), Some(new)) = (std::env::var_os("NATEMU_REPLAY"), std::env::var_os("NATEMU_REPLAY_OLD"), std::env::var_os("FEXC")) else {
+            panic!("NATEMU_REPLAY, NATEMU_REPLAY_OLD and FEXC")
+        };
+        let extra = std::env::var("NATEMU_REPLAY_ARGS").unwrap_or_default();
+        let extra: Vec<&str> = extra.split_whitespace().collect();
+        let mut pipe = Command::new(old).arg("--serve").args(&extra).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let (mut to, mut from) = (pipe.stdin.take().unwrap(), pipe.stdout.take().unwrap());
+        let mut server = Server::spawn(Path::new(&new), &extra).unwrap();
+        let mut input = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(stream).unwrap());
+        let (mut n, mut differ, mut word) = (0u64, 0u64, [0u8; 4]);
+        while input.read_exact(&mut word).is_ok() {
+            let mut body = vec![0; u32::from_le_bytes(word) as usize];
+            input.read_exact(&mut body).unwrap();
+            to.write_all(&word).unwrap();
+            to.write_all(&body).unwrap();
+            from.read_exact(&mut word).unwrap();
+            let mut want = vec![0; u32::from_le_bytes(word) as usize];
+            from.read_exact(&mut want).unwrap();
+            let r = server.request(&body, Instant::now() + COMPILE_DEADLINE).unwrap();
+            let got: Vec<u8> = [r.code as u32, r.json.len() as u32, r.object.len() as u32, r.extent, r.read].iter().flat_map(|w| w.to_le_bytes()).chain(r.json).chain(r.object).collect();
+            n += 1;
+            if got != want {
+                differ += 1;
+                if differ <= 10 {
+                    eprintln!("request {n}: pipe {:02x?} channel {:02x?}", &want[..20.min(want.len())], &got[..20]);
+                }
+            }
+        }
+        drop(to);
+        pipe.wait().unwrap();
+        eprintln!("replay: {n} requests, {differ} differences");
+        assert!(n > 0 && differ == 0);
     }
 
     #[test]

@@ -36,7 +36,13 @@ The fork is the source of truth for the patches (November 4: moved from `tools/f
 `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series57-fork`, has the same `obj/fexc` SHA-256 as series56-setup-r1
 (`a81a2f24...1fd8`); an installer N = 1 stream of 126,017 requests replayed through both gave no difference.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series57-fork` (November 4, the same bytes as series56-setup-r1, built from the fork; above), which is `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series56-setup-r1` (November 4, perf plan "Measured
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series58-channel-r1` (November 4, perf plan "Measured
+(chunk 21)", after its review): series57-fork's patches and shim with `fexc.cpp`'s server answering through a shared channel
+(`--serve --channel FD`, below "Compile server"); every reply byte-identical to series57-fork's over the pipe on an installer
+and a `build` boot's recorded streams; `obj/fexc` SHA-256 `8bd3b7eaff3ef4c2cb101ffb34b55d2e83aa7f6747e22a186b65e493aca83e59`
+(reproduced by a second build). The host since chunk 21 needs it (it starts the server with `--channel` and checks the
+layout's magic). Before it, `series58-channel` (`da337021...87315c`, before the review). Before it,
+`/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series57-fork` (November 4, the same bytes as series56-setup-r1, built from the fork; above), which is `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series56-setup-r1` (November 4, perf plan "Measured
 (chunk 20)", after its review): series55-swapgs's patches and shim with `fexc.cpp`'s server parsing and configuring once per
 distinct argument list less the RIP (below, "Compile server"); every reply byte-identical to series55-swapgs's on an
 installer and a `build` boot's recorded request streams; `obj/fexc` SHA-256 `a81a2f241b6bf368cd7b6e8b87c5892efacd9747127f6f8dea97ae936add1fd8`. Before it,
@@ -311,6 +317,12 @@ as AMD does; its lowering already used a 64-bit push and target.
 ### Compile server (`fexc --serve`, S2a; P3)
 
 One persistent process answers compile requests, length-prefixed (u32 little-endian) on stdin/stdout; EOF on stdin ends it.
+The host's server (since series58-channel, perf plan "Measured (chunk 21)") is `fexc --serve --channel FD`: the same request
+and reply payloads (below, without the leading `len`, which goes in a length word) through a 16 MiB mapping whose fd FD the
+server inherits, a sequence word per direction, both sides spinning briefly before sleeping on the word (`os_sync_wait_on_address`); stdin
+and stdout then carry nothing (stdin's EOF still ends it, and the host reads stdout's EOF as the server's death). Layout and
+protocol in `fexc.cpp` (`--channel`); every mode below works with either transport. `test_channel.py FEXC` checks the server's
+side of it (`--channel-reply-cap N`, for that test only, lowers the reply cap).
 Request: `len`, `args_len`, the CLI arguments as NUL-terminated strings (without `--hex/--file/--out/--object`), then the
 guest bytes. Reply: `len`, `code` (i32: the CLI's exit code), `json_len`, `object_len`, `extent`, `args_read`, JSON
 (error text for `code >= 2`), binary object (always produced for `code 0`). The object equals the one-shot CLI's. The JSON

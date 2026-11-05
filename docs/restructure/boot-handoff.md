@@ -73,7 +73,7 @@ build and sign `natemu-host` themselves.
 
 ```sh
 R=target/aarch64-unknown-none/release/natemu-runtime
-F=../natemu-raw/fexc-native-20261026-01/series56-setup-r1/obj/fexc
+F=../natemu-raw/fexc-native-20261026-01/series58-channel-r1/obj/fexc
 K=../natemu-raw/kernel-census-20261028-01/dl/linux               # Debian 6.12.107 bzImage
 I=../natemu-raw/kernel-census-20261028-01/dl/initrd.gz           # Debian installer initrd
 target/release/natemu "$R" "$F" "$K" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr' --vcpus 4
@@ -616,7 +616,7 @@ Full suite (about 25 minutes of runner time per pass on the M4 at R2, waits for 
 # From the repository root; zsh or bash. Wait until no other natemu-host runs (timing-sensitive cases: kicks, l4b,
 # x3 stress). A timing failure may be rerun alone once, never more: the results record the first run's result and the
 # rerun's beside it; a failed rerun is a failure.
-F=../natemu-raw/fexc-native-20261026-01/series56-setup-r1/obj/fexc  # tools/fexc/build.sh rebuilds it from the fork pin (series57-fork has the same bytes)
+F=../natemu-raw/fexc-native-20261026-01/series58-channel-r1/obj/fexc  # tools/fexc/build.sh rebuilds it from the fork pin
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 I8=../natemu-raw/i8-corpus-20261030-01      # gen_i8.py programs and their QEMU 7.2 results
@@ -720,6 +720,13 @@ tools/with-env python3 tools/run_r1.py r1b --fexc "$F" --out "$O/r1b"   # R1b: m
 ```
 
 ## 6. Compiler reproducibility
+
+**series58-channel-r1** (November 4; perf plan "Measured (chunk 21)", after its review): series57-fork's patches and shim;
+`fexc.cpp`'s server also answers through a shared mapping (`--serve --channel FD`, with a layout magic), which the host now
+requires; every reply byte-identical to series57-fork's over the pipe on recorded installer and `build` streams; `obj/fexc`
+SHA-256 `8bd3b7eaff3ef4c2cb101ffb34b55d2e83aa7f6747e22a186b65e493aca83e59` (reproduced by a second `build.sh`). Before it,
+series58-channel (`da3370217403f5c314a75263f78aee075b9b387e7ddf8cd2ddf9e470b687315c`, before the review; measured). Before it,
+series57-fork (built from the fork, the same bytes as series56-setup-r1). Before it:
 
 **series56-setup-r1** (November 4; perf plan "Measured (chunk 20)", after its review): series55-swapgs's patches and shim;
 `fexc.cpp`'s server parses, checks and configures once per distinct argument list less the `--rip` value and writes each
