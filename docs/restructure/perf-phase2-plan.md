@@ -48,8 +48,8 @@ Then, as the numbers dictate:
 7. **Remaining exits and per-request costs**: fast paths for the commonest system instructions (~2.5 M entries per
    installer boot; done for the syscall path in perf chunk 12: `hackbench` N = 1 51.2 -> 30.1 s; CLI, STI, RDTSC inline at CPL 0 in
    chunk 15; SWAPGS inline at CPL 0 in chunk 17: `hackbench` N = 1 16.3 -> 13.8 s, `locks` N = 4 7.29 -> 6.54 s, [perf-plan.md](perf-plan.md),
-   "Measured (chunk 17)"; SYSCALL and SYSRET remain two resident trips per system call), fexc's fixed per-request setup (argument parsing, feature table and Config per request), in-process FEX
-   (removes the pipe, gives up process isolation; admission stays), an in-VM random-number generator or the Arm RNDR if the
+   "Measured (chunk 17)"; SYSCALL and SYSRET remain two resident trips per system call), fexc's fixed per-request setup (argument parsing, feature table and Config per request), a shared-memory request channel to the
+   compile server in place of the pipe (keeps the process boundary; most of chunk 18's 3.5 us per compile is pipe and wake-up), an in-VM random-number generator or the Arm RNDR if the
    VM sees it (owner: after batch 1), a cheaper disk-cache key (fast hash plus stored request bytes), huge pages for the code
    area.
 8. **More benchmarks** (owner, November 4: use existing implementations, not our own; timing is the orchestrator's call):
@@ -108,6 +108,13 @@ gains `+adx,+clflushopt,+clwb` (its TCG has no XSAVEC). Built November 4 (boot-f
 already advertised and enforced by the walker (tests added); UMIP advertised, SGDT/SIDT/SLDT/SMSW/STR #GP(0) at CPL > 0 in the
 resident, Linux activates it; installer N = 1 cache off 8.42 -> 8.32 s, hackbench N = 1 29.9 -> 30.0 s; the QEMU control gains
 `+smep,+umip`. Next: SMAP (only if its cost is acceptable).
+
+## Backlog (owner, November 4)
+
+- In-process FEX: about 0.6 s installer N = 1 and 0.7 s `build` N = 1 (chunk 20 estimate), but four concurrent compiles in
+  one process share FEX's global Config and the shim's globals (a lock serialises N = 4; per-thread state needs FEX patches),
+  a hung compile can no longer be killed, and a FEX memory bug lands in the host process. Not now; only when necessary or
+  when the owner asks.
 
 ## FEX maintenance (owner, November 4: later)
 
