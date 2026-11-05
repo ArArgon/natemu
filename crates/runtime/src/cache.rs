@@ -166,7 +166,7 @@ pub fn reset() {
     (c.code_used, c.meta_used, c.blocks, c.links, c.links_cr3, c.links_tlb) = (area::HEAD_BYTES as u64, 0, 0, 0, 0, 0);
     // A `checked` of 0 is never current.
     (c.epoch, c.global_epoch) = (c.epoch.max(1), c.global_epoch.max(1));
-    (c.regions, c.large_regions) = ([0; 16], [0; 16]);
+    (c.regions, c.large_regions, c.large_count) = ([0; 16], [0; 16], 0);
     // Block numbers start again: the current table is emptied (it keeps its context), the others hold none. Perf chunk
     // 12: no block is left to exit to a slot, so every slot is free again (each bound one made to miss), then the current
     // table's context takes one.
@@ -246,35 +246,46 @@ fn l1_entry(t: usize, i: usize) -> u64 {
     (area::L1_CODE + t * area::L1_TABLE_BYTES + i * area::L1_ENTRY_BYTES) as u64
 }
 /// The L1 entry at `at` for `rip`, entering code-area offset `entry`: `movz/movk x2, #rip; sub x2, x2, x0; cbnz x2,
-/// miss; b entry` (the dispatcher's miss), then `udf`.
+/// +8; b entry; b miss` (the dispatcher's miss; perf chunk 19: a `b`, as the tables lie beyond `cbnz`'s ±1 MiB).
 fn l1_words(at: u64, rip: u64, entry: u64) -> [u32; 8] {
     let half = |k: u32| ((rip >> (16 * k)) & 0xffff) as u32;
-    let miss = area::DISPATCH_MISS as u64;
     [
         0xd280_0002 | half(0) << 5,
         0xf2a0_0002 | half(1) << 5,
         0xf2c0_0002 | half(2) << 5,
         0xf2e0_0002 | half(3) << 5,
         0xcb00_0042,
-        0xb500_0002 | ((miss.wrapping_sub(at + 20) >> 2) as u32 & 0x7_ffff) << 5,
+        0xb500_0002 | 2 << 5,
         branch(at + 24, entry),
-        0,
+        branch(at + 28, area::DISPATCH_MISS as u64),
     ]
 }
-/// Entry `i` of L1 table `t`'s owner: the block it enters, number + 1 (0: empty).
+/// Entry `i` of L1 table `t`'s owner: the block it enters, number + 1 (0: empty), and [`area::L1_LISTED`].
 fn l1_owner(t: usize, i: usize) -> *mut u32 {
     lookup_area::<u32>(area::L1_OWNERS).wrapping_add(t * area::L1_ENTRIES + i)
 }
-/// Empties entry `i` of L1 table `t` (its first word branches to the dispatcher's miss); the caller synchronizes the code.
+/// The block entry `i` of L1 table `t` enters, number + 1 (0: empty).
+fn l1_block(t: usize, i: usize) -> u32 {
+    unsafe { l1_owner(t, i).read() & !area::L1_LISTED }
+}
+/// Slot `k` of L1 table `t`'s list ([`area::L1_LISTS`]).
+fn l1_list(t: usize, k: usize) -> *mut u32 {
+    lookup_area::<u32>(area::L1_LISTS).wrapping_add(t * area::L1_ENTRIES + k)
+}
+/// Empties entry `i` of L1 table `t` (its first word branches to the dispatcher's miss; it stays on its table's list
+/// if it was); the caller synchronizes the code.
 fn empty_l1(t: usize, i: usize) {
-    unsafe { l1_owner(t, i).write(0) };
+    unsafe { l1_owner(t, i).write(l1_owner(t, i).read() & area::L1_LISTED) };
     let at = l1_entry(t, i);
     unsafe { ((area::CODE_WRITE_VA + at) as *mut u32).write_volatile(branch(at, area::DISPATCH_MISS as u64)) };
 }
+/// Empties every entry of L1 table `t` and its list.
 fn clear_l1(t: usize) {
     for i in 0..area::L1_ENTRIES {
         empty_l1(t, i);
+        unsafe { l1_owner(t, i).write(0) };
     }
+    control().l1_listed[t] = 0;
     synchronize_l1(t);
 }
 fn synchronize_l1(t: usize) {
@@ -284,17 +295,20 @@ fn synchronize_l1(t: usize) {
 fn slot_at(k: usize) -> u64 {
     (area::DISPATCH + k * area::DISPATCH_SLOT_BYTES) as u64
 }
-/// The `adr x2` at code-area offset `at` (a dispatcher's second word) to L1 table `t`.
+/// The `adrp x2` at code-area offset `at` (a dispatcher's second word) to L1 table `t` (page aligned; the code area is).
 fn dispatch_adr(at: u64, t: usize) -> u32 {
-    let imm = l1_entry(t, 0).wrapping_sub(at) as u32;
-    0x1000_0002 | (imm & 3) << 29 | (imm >> 2 & 0x7_ffff) << 5
+    let imm = (l1_entry(t, 0) >> 12).wrapping_sub(at >> 12) as u32;
+    0x9000_0002 | (imm & 3) << 29 | (imm >> 2 & 0x7_ffff) << 5
 }
 
-/// Fills the code area's head once, before any block runs: the dispatcher's code (slot 0) and every other slot unbound
-/// (`b` to the miss). False if the dispatcher's `adr` is not the form the slots copy (to L1 table 0), or if any slot's
-/// `adr` to any table does not decode to that table.
+/// Fills the code area's head once, before any block runs: the dispatcher's code (slot 0, its `adrp` written here to L1
+/// table 0: the template's page offset in the resident is not the copy's) and every other slot unbound (`b` to the
+/// miss). False if the dispatcher's second word is not an `adrp x2`, or if any slot's `adrp` to any table does not
+/// decode to that table.
 pub fn fill_head(dispatcher: &[u8]) -> bool {
     unsafe { copy_record((area::CODE_WRITE_VA + area::DISPATCH as u64) as *mut u8, dispatcher.as_ptr(), dispatcher.len()) };
+    let form = word(slot_at(0) + 4) & 0x9f00_001f == 0x9000_0002;
+    unsafe { ((area::CODE_WRITE_VA + slot_at(0) + 4) as *mut u32).write_volatile(dispatch_adr(slot_at(0) + 4, 0)) };
     let c = control();
     for k in 1..area::DISPATCH_SLOTS {
         let words = [branch(slot_at(k), area::DISPATCH_MISS as u64), 0, 0, 0, 0, 0, 0, 0];
@@ -303,17 +317,17 @@ pub fn fill_head(dispatcher: &[u8]) -> bool {
     }
     (c.slot_contexts[0], c.l1_slots) = (area::NO_CONTEXT, [0; area::L1_TABLES]);
     synchronize_code(area::CODE_WRITE_VA + area::DISPATCH as u64, area::DISPATCH_VA, area::DISPATCH_BYTES);
-    // ADR: immlo bits 30:29, immhi bits 23:5, a signed 21-bit offset from the instruction.
-    let target = |at: u64, w: u32| at.wrapping_add(((((w >> 29 & 3) | (w >> 5 & 0x7_ffff) << 2) << 11) as i32 >> 11) as u64);
+    // ADRP: immlo bits 30:29, immhi bits 23:5, a signed 21-bit count of 4 KiB pages from the instruction's page.
+    let target = |at: u64, w: u32| (at & !0xfff).wrapping_add((((((w >> 29 & 3) | (w >> 5 & 0x7_ffff) << 2) << 11) as i32 >> 11) as i64 as u64) << 12);
     let adr = |k: usize, t: usize| (slot_at(k) + 4, dispatch_adr(slot_at(k) + 4, t));
     c.l1_table == 0
-        && word(slot_at(0) + 4) == dispatch_adr(slot_at(0) + 4, 0)
+        && form
         && (0..area::DISPATCH_SLOTS).all(|k| (0..area::L1_TABLES).all(|t| {
             let (at, w) = adr(k, t);
-            w & 0x9f00_001f == 0x1000_0002 && target(at, w) == l1_entry(t, 0)
+            w & 0x9f00_001f == 0x9000_0002 && target(at, w) == l1_entry(t, 0)
         }))
 }
-/// Perf chunk 12: slot `k` names L1 table `t` (the dispatcher's words with its own `adr`), or misses (`None`).
+/// Perf chunk 12: slot `k` names L1 table `t` (the dispatcher's words with its own `adrp`), or misses (`None`).
 fn write_slot(k: usize, t: Option<usize>) {
     let at = slot_at(k);
     let words = match t {
@@ -396,8 +410,15 @@ pub fn fill_l1(rip: u64, block: &Block) {
     if control().l1_contexts[t] != block.context {
         return;
     }
-    unsafe { l1_owner(t, (rip & area::L1_MASK) as usize).write(block.number + 1) };
-    let at = l1_entry(t, (rip & area::L1_MASK) as usize);
+    let i = (rip & area::L1_MASK) as usize;
+    let mut listed = unsafe { l1_owner(t, i).read() } & area::L1_LISTED;
+    if listed == 0 && block.flags & GLOBAL == 0 {
+        let c = control();
+        unsafe { l1_list(t, c.l1_listed[t] as usize).write(i as u32) };
+        (c.l1_listed[t], listed) = (c.l1_listed[t] + 1, area::L1_LISTED);
+    }
+    unsafe { l1_owner(t, i).write(listed | (block.number + 1)) };
+    let at = l1_entry(t, i);
     let words = l1_words(at, rip, block.entry() - area::CODE_VA);
     // Already there (a resident entry that ends at the same block again, e.g. after a system instruction): no code change.
     if (0..words.len()).all(|k| unsafe { ((area::CODE_WRITE_VA + at) as *const u32).add(k).read_volatile() } == words[k]) {
@@ -437,7 +458,7 @@ pub fn lookup(rip: u64, context: u64, mut mapped: impl FnMut(&Block) -> Option<u
                 unsafe { (*block_ptr(n)).checked = c.epoch };
                 unsafe { (*block_ptr(n)).flags = (*block_ptr(n)).flags & !(GLOBAL | LARGE) | walked & (GLOBAL | LARGE) };
                 if walked & LARGE != 0 {
-                    mark_regions(&mut c.large_regions, &b);
+                    mark_large(&b);
                 }
                 return Some(block(n));
             }
@@ -468,18 +489,37 @@ pub fn tlb(global: bool) -> Option<u64> {
         }
     } else {
         c.cr3_loads += 1;
-        for t in (0..area::L1_TABLES).filter(|&t| c.l1_contexts[t] != area::NO_CONTEXT) {
-            let mut emptied = false;
-            for i in 0..area::L1_ENTRIES {
-                let owner = unsafe { l1_owner(t, i).read() };
+        // Perf chunk 19: a CR3 load moves `epoch`, not `global_epoch`, so every global block stays current: only the
+        // listed entries (filled with a non-global block) are looked at. Each one emptied is cleaned to the point of
+        // unification; after one barrier its instructions are invalidated as the list is compacted (an entry still
+        // filled stays listed, the rest leave it).
+        for t in 0..area::L1_TABLES {
+            let listed = c.l1_listed[t] as usize;
+            if c.l1_contexts[t] == area::NO_CONTEXT || listed == 0 {
+                continue;
+            }
+            for k in 0..listed {
+                let i = unsafe { l1_list(t, k).read() } as usize;
+                let owner = l1_block(t, i);
                 if owner != 0 && !current(block(owner as usize - 1)) {
                     empty_l1(t, i);
-                    emptied = true;
+                    unsafe { asm!("dc cvau, {0}", in(reg) area::CODE_WRITE_VA + l1_entry(t, i)) };
                 }
             }
-            if emptied {
-                synchronize_l1(t);
+            unsafe { asm!("dsb ish") };
+            let mut kept = 0;
+            for k in 0..listed {
+                let i = unsafe { l1_list(t, k).read() } as usize;
+                if l1_block(t, i) != 0 {
+                    unsafe { l1_list(t, kept).write(i as u32) };
+                    kept += 1;
+                } else {
+                    unsafe { l1_owner(t, i).write(0) };
+                    unsafe { asm!("ic ivau, {0}", in(reg) area::CODE_VA + l1_entry(t, i)) };
+                }
             }
+            unsafe { asm!("dsb ish", "isb") };
+            c.l1_listed[t] = kept as u64;
         }
     }
     // A CR3 load leaves global blocks current: only the links into non-global ones are looked at.
@@ -662,7 +702,7 @@ unsafe fn file(record: Block, tail: *const u8, tail_bytes: usize, extra: usize) 
         at.write(Block { number: n as u32, next, lnext, ..record });
         mark_regions(&mut c.regions, &record);
         if record.flags & LARGE != 0 {
-            mark_regions(&mut c.large_regions, &record);
+            mark_large(&record);
         }
         copy_record(at.add(1).cast(), tail, tail_bytes);
         index(n).write(meta as u32);
@@ -1032,13 +1072,35 @@ fn mark_regions(regions: &mut [u64; 16], b: &Block) {
         regions[w] |= bit;
     }
 }
+/// Records `b`'s 2 MiB regions as [`mark_regions`] does, in [`Control::large_regions`] and, by whole region number, in
+/// [`Control::large_list`] (perf chunk 19: the bits alias modulo 1024, so a #PF in a region sharing a bit with one that
+/// held large blocks scanned 512 chains for nothing).
+fn mark_large(b: &Block) {
+    let c = control();
+    mark_regions(&mut c.large_regions, b);
+    for r in [b.rip >> 21, b.rip.wrapping_add(u64::from(b.guest_bytes).max(1) - 1) >> 21] {
+        let listed = (c.large_count as usize).min(area::LARGE_REGIONS);
+        if !c.large_list[..listed].contains(&r) {
+            if listed < area::LARGE_REGIONS {
+                c.large_list[listed] = r;
+            }
+            c.large_count += 1;
+        }
+    }
+}
+/// Region `r` may hold a [`LARGE`] block: its bit is set and, while the list is complete, it is listed.
+fn large_held(c: &Control, r: u64) -> bool {
+    let (w, bit) = region(r);
+    c.large_regions[w] & bit != 0
+        && (c.large_count as usize > area::LARGE_REGIONS || c.large_list[..c.large_count as usize].contains(&r))
+}
 /// A guest INVLPG of `address`, or a #PF at it (K1; SDM Vol.3 4.10.4.1: the TLB entries for its page, global ones too,
 /// and all of them for a page larger than 4 KiB): every live block of this vCPU with guest bytes on its 4 KiB page, and
 /// every [`LARGE`] one with bytes in its 2 MiB region, is no longer current (`checked` 0, global or not): out of L1, every
 /// link from another page into it undone; it stays in L2 and is found again only after a fetch walk ([`lookup`]). Other
 /// blocks keep their translations (a 4 KiB TLB entry of another page is not one for this page). Its code-page bits
 /// stay: they only say it may hold translations. Blocks are looked for only when the address's 2 MiB region may hold
-/// one ([`Control::regions`], [`Control::large_regions`]), then on the linear map's chains of the pages
+/// one ([`Control::regions`]; for large blocks [`large_held`]), then on the linear map's chains of the pages
 /// ([`area::LINEAR_HEADS`]).
 pub fn invlpg(address: u64) -> Option<u64> {
     let c = control();
@@ -1051,7 +1113,7 @@ pub fn invlpg(address: u64) -> Option<u64> {
     if held(&c.regions) {
         on_linear_page(address >> 12, |n| inbound |= cut_one(n, false).is_some());
     }
-    if held(&c.large_regions) {
+    if large_held(c, r) {
         for page in r << 9..(r + 1) << 9 {
             on_linear_page(page, |n| inbound |= block(n).flags & LARGE != 0 && cut_one(n, false).is_some());
         }
@@ -1129,7 +1191,7 @@ fn cut_one(n: usize, dead: bool) -> Option<usize> {
     }
     let i = (b.rip & area::L1_MASK) as usize;
     for t in 0..area::L1_TABLES {
-        if unsafe { l1_owner(t, i).read() } == b.number + 1 {
+        if l1_block(t, i) == b.number + 1 {
             empty_l1(t, i);
             let at = l1_entry(t, i);
             synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, 4);

@@ -28,7 +28,7 @@ global_asm!(include_str!("gates.S"),
     exception_stack_top=const EXCEPTION_STACK_TOP,
     identity_entry=const PRIVATE+0x11008,
     upper_root_pages=const (shadow::UPPER_ROOT-shadow::LOWER_ROOT)/4096,
-    l1_code_delta=const natemu_abi::execution::cache::L1_CODE-natemu_abi::execution::cache::DISPATCH-4,
+    l1_mask=const natemu_abi::execution::cache::L1_MASK,
     svc_miss=const natemu_abi::execution::svc::MISS,
 );
 

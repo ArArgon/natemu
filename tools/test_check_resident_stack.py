@@ -91,8 +91,8 @@ class Binary(unittest.TestCase):
             'a stack switch outside the gates': (r'^(\s*[0-9a-f]+:\s+)mov\tx8, sp$', r'\1mov\tsp, x8'),
             # `returned`'s frame (its size follows the state's layout), made larger than the exception stack.
             'a frame beyond a reserve': (r'(<natemu_runtime::execution::returned>:\n(?:.*\n)*?.*\tsub\tsp, sp, #)0x[0-9a-f]+$', r'\g<1>0x5000'),
-            'a stack use in the dispatcher': (r'^(\s*[0-9a-f]+:\s+)and\tx1, x0, #0xfff$', r'\1str\tx0, [sp, #-0x10]!'),
-            'a literal load in the dispatcher': (r'^(\s*[0-9a-f]+:\s+)and\tx1, x0, #0xfff$', r'\1ldr\tx1, 0x1000 <_start>'),
+            'a stack use in the dispatcher': (r'^(\s*[0-9a-f]+:\s+)and\tx1, x0, #0xffff$', r'\1str\tx0, [sp, #-0x10]!'),
+            'a literal load in the dispatcher': (r'^(\s*[0-9a-f]+:\s+)and\tx1, x0, #0xffff$', r'\1ldr\tx1, 0x1000 <_start>'),
             'a vector to the wrong place': (r'(<vectors>:\n\s*[0-9a-f]+:\s+b\t)0x[0-9a-f]+ <exception_capture>',
                                             r'\g<1>0x8000400a5000 <irq_gate>'),
         }

@@ -31,7 +31,9 @@ These eight run at block sizes default and 1 and are compared with QEMU system m
   invalidated V, so the call runs F2's bytes.
 - `contexts` (natemu only, perf chunk 5): one block called through the dispatcher under six code contexts in turn (MXCSR
   masks, CR0.TS), more than the dispatcher's L1 tables: each runs, or takes #NM or #XM, by its own context only; then an
-  INVLPG, a code write and a CR3 reload made under one context reach the block another context's table holds.
+  INVLPG, a code write and a CR3 reload made under one context reach the block another context's table holds. Perf
+  chunk 19: two RIPs sharing one L1 entry (the same low 16 bits) called in turn each run their own code, and a CR3 reload
+  under another context reaches the entry's last owner.
 Perf chunk 8 (links kept across TLB events):
 - `place-global` (natemu only): a block placed from a global page under CR4.PGE is global at once: V remapped with no
   INVLPG and a CR3 reload, natemu keeps the old frame (the architecture allows either; r9 = 1 asserted); INVLPG: the new.
@@ -43,6 +45,15 @@ Perf chunk 8 (links kept across TLB events):
 - `invlpg-large` (natemu only): code in a 2 MiB page, its PDE changed with no INVLPG of the code's page, INVLPG of another
   4 KiB address in the large page: a load and the call both see the new frame (rbx = 0x22, r9 = 2; every TLB entry of the
   large page goes, SDM Vol.3 4.10.4.1). QEMU 11.1.2 loads 0x22 but runs the old block (r9 = 1): its jump cache keeps it.
+- `pf-large` (natemu only, perf chunk 19): `invlpg-large` with a #PF instead of the INVLPG: the PDE made not present (no
+  INVLPG), a load from another 4 KiB page of the large page faults, the handler maps LF2 (no INVLPG): the call runs LF2's
+  code (r14 = 1, r9 = 2; a #PF invalidates the entries for the faulting address, every one of a larger page).
+- `large-alias` (natemu only, perf chunk 19): a large block at LP + 2 GiB (the same bit of `Control::large_regions`) placed
+  before LP's: an INVLPG of another page of LP still cuts LP's block (r9 = 2).
+- `large-reval` (natemu only, perf chunk 19): LP mapped by 4 KiB pages, then by the large page of the same frames with a CR3
+  reload: the block is revalidated as large, and an INVLPG of another page of LP cuts it (r9 = 2).
+- `large-64`, `large-65` (natemu only, perf chunk 19): large blocks in 64 and 65 regions (as many as `Control::large_list`
+  holds, and one more): an INVLPG of another page of the last region cuts its block (r8 = 64 or 65, r9 = 2).
 - `cross-link`: `cross` through a direct jump from the first page into the crossing instruction: the link is not local (its
   target has a page its source lacks) and goes at the INVLPG of the second page alone.
 - `local-gpa` (natemu only): a link from S into T on S's page made after the page was remapped with no INVLPG (S from F1,
@@ -196,7 +207,7 @@ def links_bodies(k, i, n):
     jump = lambda tag, off: to(off).format(tag=tag)
     rounds = lambda tag, off, reg: ''.join(jump(f'{tag}{r}', off) + f'    add {reg}, rax\n' for r in range(3))
     loop = lambda tag, reg: f'    mov ecx, 3\n.{tag}:\n    call .sub\n    add {reg}, rax\n    dec ecx\n    jnz .{tag}\n'
-    pde = lambda frame: f'    mov rax, {frame | 0x80 | P.LEAF:#x}\n    mov [{P.SYS_T(i, 0) + 0x2000 + 8 * (LP >> 21):#x}], rax\n'
+    pde = lambda frame, j=0, present=1: f'    mov rax, {frame | 0x80 | P.LEAF & ~(1 - present):#x}\n    mov [{P.SYS_T(i, 0) + 0x2000 + 8 * ((LP >> 21) + j):#x}], rax\n'
     j = (i + 1) % n
     hand = (f'    mov qword [{FLAGS + 8 * i:#x}], 1\n.h1:\n    pause\n    cmp qword [{FLAGS + 8 * j:#x}], 1\n    jne .h1\n'
             f'    mov byte [{P.SYS_D(j) + F1 + LW + 0x41:#x}], 3\n    mov qword [{FLAGS + 0x40 + 8 * j:#x}], 1\n'
@@ -214,6 +225,25 @@ def links_bodies(k, i, n):
                         + loop('p1', 'r9') + inv(d + NP) + call('p2', f'{d + NP:#x}') + '    mov r10, rax\n'),
         'invlpg-large': (call('l0', f'{LP + LX:#x}') + '    mov r8, rax\n' + pde(LF2) + inv(LP + 0x5000) + f'    mov rbx, [{LP + LX + 0x800:#x}]\n' + call('l1', f'{LP + LX:#x}')
                          + '    mov r9, rax\n' + pde(LF1) + inv(LP + 0x1ff000) + call('l2', f'{LP + LX:#x}') + '    mov r10, rax\n'),
+        # Perf chunk 19 (the large-region test made exact). A load from another 4 KiB page of the 2 MiB code page, its PDE
+        # made not present with no INVLPG, faults; the handler maps LF2 (no INVLPG): the #PF took the large page's entries.
+        'pf-large': (adv_idt(d) + call('f0', f'{LP + LX:#x}') + '    mov r8, rax\n' + pde(LF2, present=0)
+                     + f'    mov rbx, [{LP + 0x5000:#x}]\n' + call('f1', f'{LP + LX:#x}') + '    mov r9, rax\n    jmp .end\n'
+                     + '.h:\n' + pde(LF2) + '    inc r14\n    add rsp, 8\n    iretq\n.end:\n'),
+        # LP's region shares its bit with LP + 2 GiB (1024 regions apart), whose large block is placed first: LP's own
+        # large block must still be found by an INVLPG of another page of LP.
+        'large-alias': (call('a0', f'{LA + LX:#x}') + '    mov r10, rax\n' + call('a1', f'{LP + LX:#x}') + '    mov r8, rax\n' + pde(LF2)
+                        + inv(LP + 0x5000) + call('a2', f'{LP + LX:#x}') + '    mov r9, rax\n'),
+        # LP first mapped by 4 KiB pages (a block not large), then by the large page of the same frames with a CR3 reload:
+        # the block, revalidated, is large now, and an INVLPG of another page of LP must cut it.
+        'large-reval': (call('r0', f'{LP + LX:#x}') + '    mov r8, rax\n' + pde(LF1) + cr3 + call('r1', f'{LP + LX:#x}') + '    mov r10, rax\n'
+                        + pde(LF2) + inv(LP + 0x5000) + call('r2', f'{LP + LX:#x}') + '    mov r9, rax\n'),
+        # Large blocks in m regions, exactly as many as the exact list holds and one more: an INVLPG of another page of
+        # the last region cuts its block (the list's last slot, then the first region it cannot hold).
+        **{f'large-{m}': (f'    xor edx, edx\n.m:\n    mov rsi, rdx\n    shl rsi, 21\n    lea rax, [rsi + {LP + LX:#x}]\n'
+                          '    lea r13, [rel .cm]\n    jmp rax\n.cm:\n    add r8, rax\n    inc edx\n'
+                          f'    cmp edx, {m}\n    jb .m\n' + pde(LF2, m - 1) + inv(LP + (m - 1 << 21) + 0x5000)
+                          + call('m1', f'{LP + (m - 1 << 21) + LX:#x}') + '    mov r9, rax\n') for m in LM},
         'cross-link': rounds('x0', 0x3f00, 'r8') + put(d + 0x4000, d + XB) + inv(d + 0x4000) + rounds('x1', 0x3f00, 'r9'),
         'local-gpa': ('    xor r14d, r14d\n' + call('a0', f'{d + LS:#x}') + put(d, d + F2) + '    mov r14d, 1\n' + call('a1', f'{d + LS:#x}')
                       + '    mov r9, rax\n' + put(d, d + F1) + cr3 + call('a2', f'{d + LS:#x}') + '    mov r10, rax\n'),
@@ -227,6 +257,8 @@ F3 = 0xf000                      # `place-global`: V's third frame (`mov eax, 3`
 NP, NP2 = 0xd000, 0xe000         # `invlpg-page`: N (another page of V's 2 MiB region) and its second frame
 # `invlpg-large`: linear 2 MiB page LP (table A's PDE 2) maps frame LF1 or LF2 (the images end at 4 MiB); code at LP + LX
 LP, LF1, LF2, LX = 0x400000, 0x200000, 0x0, 0x1f1000
+LA, LM = LP + (1 << 31), (64, 65)  # perf chunk 19: `large-alias`'s second region (LP's bit); `large-64`/`-65`'s regions
+                                   # from LP (64: Control::large_list's length)
 LS = 0x100                       # `local-gpa`: S at V + LS (`test r14, r14; jnz T; jmp r13`), T at V + LS + 0x40
 LW = 0x200                       # `local-write`: S at V + LW (`jmp T`), T at V + LW + 0x40 (`mov eax, 1; jmp r13`)
 FLAGS = P.SYS_D(0) + 0xe000      # `local-write`: per CPU a ready word, then (+ 0x40) a written word
@@ -244,6 +276,20 @@ def links_memory(name, i, n):
         return ([{'addr': f'0x{P.SYS_T(i, 0) + 0x2000 + 8 * (LP >> 21):x}', 'data': (LF1 | 0x80 | P.LEAF).to_bytes(8, 'little').hex(), 'capture': False}]
                 + ([code(LF1 + LX, 'mov eax, 1\njmp r13\ntimes 0x800-($-$$) nop\ndq 0x11'),
                     code(LF2 + LX, 'mov eax, 2\njmp r13\ntimes 0x800-($-$$) nop\ndq 0x22')] if i == 0 else []))
+    q = lambda at, values: {'addr': f'0x{at:x}', 'data': b''.join(v.to_bytes(8, 'little') for v in values).hex(), 'capture': False}
+    pd, large = P.SYS_T(i, 0) + 0x2000 + 8 * (LP >> 21), LF1 | 0x80 | P.LEAF
+    if name == 'pf-large':
+        return links_memory('invlpg-large', i, n) + [dict(P.zero(d + IDT, 0x1000), capture=False)]
+    if name == 'large-alias':
+        # LA's GiB (PDPT entry 2) through a page directory of its own at table A + 0x5000.
+        t = P.SYS_T(i, 0)
+        return links_memory('invlpg-large', i, n) + [q(t + 0x1000 + 8 * (LA >> 30), [(t + 0x5000) | 0x27]), q(t + 0x5000 + 8 * (LA >> 21 & 511), [large])]
+    if name == 'large-reval':
+        # LP's page table at table A + 0x6000: LP + o -> LF1 + o.
+        t = P.SYS_T(i, 0)
+        return links_memory('invlpg-large', i, n)[1:] + [q(pd, [(t + 0x6000) | 0x27]), q(t + 0x6000, [(LF1 + (o << 12)) | P.LEAF for o in range(512)])]
+    if name in (f'large-{m}' for m in LM):
+        return links_memory('invlpg-large', i, n) + [q(pd, [large] * int(name[6:]))]
     if name == 'cross-link':
         return [{'addr': f'0x{d + 0x3f00:x}', 'data': b'\xe9\xf9\x00\x00\x00'.hex()}]
     if name == 'local-gpa':
@@ -406,11 +452,20 @@ def ctx_kept(i):
     load = lambda m: f'    ldmxcsr [{d + CD + 4 * m:#x}]\n'
     put = lambda frame: f'    mov rax, {frame | P.LEAF:#x}\n    mov [{P.sys_leaf(i, 0, V):#x}], rax\n'
     run = lambda tag, reg: load(0) + '    xor eax, eax\n' + call(f'k{tag}', f'{V:#x}') + f'    mov {reg}, rax\n'
+    # Perf chunk 19 (L1 indexed by 16 RIP bits): Q1 and Q2 (LP + 0x1f1000 and + 0x1d1000, one entry of every table) called
+    # in turn under A three times: each runs its own code (rbx = 3, rsi = 0x30); under C, LP's large page remapped to
+    # LF2 with a CR3 reload (no INVLPG); Q2 called under A must run LF2's code (rdi = 0x20): the reload reaches A's entry.
+    q = lambda tag, at, reg: call(f'q{tag}', f'{LP + at:#x}') + f'    add {reg}, rax\n'
+    pde = f'    mov rax, {LF2 | 0x80 | P.LEAF:#x}\n    mov [{P.SYS_T(i, 0) + 0x2000 + 8 * (LP >> 21):#x}], rax\n'
     return (load(1) + put(W1) + f'    mov rax, {V:#x}\n    invlpg [rax]\n' + run(0, 'r9')
             + load(1) + f'    mov byte [{W1 + 1:#x}], 3\n' + run(1, 'r10')
-            + load(1) + put(W2) + '    mov rax, cr3\n    mov cr3, rax\n' + run(2, 'r12'))
+            + load(1) + put(W2) + '    mov rax, cr3\n    mov cr3, rax\n' + run(2, 'r12')
+            + load(0) + '    xor ebx, ebx\n    xor esi, esi\n    xor edi, edi\n'
+            + ''.join(q(f'{r}a', CQ1, 'rbx') + q(f'{r}b', CQ2, 'rsi') for r in range(3))
+            + load(1) + pde + '    mov rax, cr3\n    mov cr3, rax\n' + load(0) + q('c', CQ2, 'rdi'))
 
 CW1, CW2 = 0xb000, 0xc000                     # `contexts`: V's other frames (`mov eax, 2` and `mov eax, 4`)
+CQ1, CQ2 = 0x1f1000, 0x1d1000                 # `contexts`: Q1 and Q2 in LP (the same low 16 bits)
 
 # #NM and #XM: counted, and the call returns (r13) with RAX 0 (its `mov eax, 1` not run).
 CTX_HANDLERS = '.h7:\n    inc r14\n    xor eax, eax\n    mov [rsp], r13\n    iretq\n.h19:\n    inc r15\n    xor eax, eax\n    mov [rsp], r13\n    iretq\n'
@@ -422,12 +477,16 @@ EITHER = {
     'walk': lambda i, k: {'r8': {walk_at(i)[0] | 7}, 'r9': {walk_at(i)[0] | 0x27}, 'r10': {walk_at(i)[0] | 0x27}},
     'pf-remap': {'r8': {1}, 'r14': {1}, 'r9': {2}},
     # K rounds of five runs, one #NM and two #XM, then a last run under A.
-    'contexts': lambda i, k: {'r8': {5 * k + 1}, 'r14': {k}, 'r15': {2 * k}, 'r9': {2}, 'r10': {3}, 'r12': {4}},
+    'contexts': lambda i, k: {'r8': {5 * k + 1}, 'r14': {k}, 'r15': {2 * k}, 'r9': {2}, 'r10': {3}, 'r12': {4}, 'rbx': {3}, 'rsi': {0x30}, 'rdi': {0x20}},
     # Perf chunk 8: natemu's choice where the architecture allows either (r9 of `place-global`, `invlpg-page`, `local-gpa`).
     'place-global': {'r8': {1}, 'r9': {1}, 'r10': {2}, 'r12': {0x100}, 'rsi': {0x200}, 'rdi': {3}, 'rbp': {1}},
     'invlpg-page': {'r8': {3}, 'r9': {3}, 'r10': {2}},
     'local-gpa': {'r9': {2}, 'r10': {1}},
     'invlpg-large': {'r8': {1}, 'rbx': {0x22}, 'r9': {2}, 'r10': {1}},
+    'pf-large': {'r8': {1}, 'r14': {1}, 'r9': {2}},
+    'large-alias': {'r10': {1}, 'r8': {1}, 'r9': {2}},
+    'large-reval': {'r8': {1}, 'r10': {1}, 'r9': {2}},
+    **{f'large-{m}': {'r8': {m}, 'r9': {2}} for m in LM},
     **{name: reuse_either(name) for name in REUSE},
     'link-full': {'r8': {3}, 'r9': {6}, 'r10': {12}, 'r12': {6}},
     'hint-reset': {'r8': {12}},
@@ -468,7 +527,10 @@ def program(name, n, k):
         if name == 'contexts':
             extra += [dict(P.zero(d + IDT, 0x1000), capture=False), {'addr': f'0x{d + CX:x}', 'data': P.asm('addss xmm0, xmm1\nmov eax, 1\njmp r13').hex()},
                       {'addr': f'0x{d + CD:x}', 'data': b''.join(m.to_bytes(4, 'little') for m in CTX_MXCSR).hex(), 'capture': False},
-                      {'addr': f'0x{d + CW1:x}', 'data': P.asm('mov eax, 2\njmp r13').hex()}, {'addr': f'0x{d + CW2:x}', 'data': P.asm('mov eax, 4\njmp r13').hex()}]
+                      {'addr': f'0x{d + CW1:x}', 'data': P.asm('mov eax, 2\njmp r13').hex()}, {'addr': f'0x{d + CW2:x}', 'data': P.asm('mov eax, 4\njmp r13').hex()},
+                      {'addr': f'0x{P.SYS_T(i, 0) + 0x2000 + 8 * (LP >> 21):x}', 'data': (LF1 | 0x80 | P.LEAF).to_bytes(8, 'little').hex(), 'capture': False}]
+            extra += [{'addr': f'0x{f + at:x}', 'data': P.asm(f'mov eax, {k}\njmp r13').hex()}
+                      for f, at, k in ((LF1, CQ1, 1), (LF1, CQ2, 0x10), (LF2, CQ2, 0x20))] if i == 0 else []
         out['memory'] += P.sys_tables(i, 0, n, a) + tb + [
             P.zero(d, 0x1000), {'addr': f'0x{d + F1:x}', 'data': CODE(1).hex()}, {'addr': f'0x{d + F2:x}', 'data': CODE(2).hex()},
             {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + (extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE else [])

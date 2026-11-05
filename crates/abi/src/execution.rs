@@ -163,7 +163,7 @@ pub mod cache {
     /// Its `svc #MISS` at [`DISPATCH_MISS`] enters the resident. Perf chunk 12: copies of its first four words follow in
     /// [`DISPATCH_SLOTS`] - 1 slots of [`DISPATCH_SLOT_BYTES`] (slot k at `DISPATCH + k * DISPATCH_SLOT_BYTES`, k >= 1), one
     /// per code context seen since the last flush ([`Control::slot_contexts`]): a block's computed exit branches to its
-    /// context's slot (its `b` relocated at placement), whose `adr` names the L1 table holding that context, or which
+    /// context's slot (its `b` relocated at placement), whose `adrp` names the L1 table holding that context, or which
     /// starts with `b` to [`DISPATCH_MISS`] while no table does; a context without a slot exits to [`DISPATCH_MISS`]. So
     /// a change of context rewrites no code: only giving a table to another context does (two slots).
     pub const DISPATCH: usize = SLOT + SLOT_BYTES;
@@ -174,11 +174,13 @@ pub mod cache {
     pub const DISPATCH_SLOTS: usize = DISPATCH_BYTES / DISPATCH_SLOT_BYTES;
     /// L1 as code: [`L1_TABLES`] tables of direct-mapped entries of [`L1_ENTRY_BYTES`] indexed by `rip & L1_MASK` (FEX
     /// `L1Pointer/L1Mask`), so the dispatcher reads no data. A filled entry is `movz/movk x2, #rip` (4 words); `sub x2, x2,
-    /// x0`; `cbnz x2, miss`; `b entry`; an empty one starts with `b miss`. Only the resident writes them. Each table holds
-    /// entries of one code context ([`Control::l1_contexts`]); the dispatcher's `adr` names the current one (perf chunk 5:
-    /// a CPL change switches tables instead of clearing one).
+    /// x0`; `cbnz x2, +8`; `b entry`; `b miss`; an empty one starts with `b miss`. Only the resident writes them. Each
+    /// table holds entries of one code context ([`Control::l1_contexts`]); the dispatcher's `adrp` names the current one
+    /// (perf chunk 5: a CPL change switches tables instead of clearing one). Perf chunk 19: [`L1_BITS`] RIP bits index a
+    /// table (12 before: most misses were two hot RIPs at the same page offset).
     pub const L1_CODE: usize = DISPATCH + DISPATCH_BYTES;
-    pub const L1_ENTRIES: usize = 4096;
+    pub const L1_BITS: u32 = 16;
+    pub const L1_ENTRIES: usize = 1 << L1_BITS;
     pub const L1_MASK: u64 = L1_ENTRIES as u64 - 1;
     pub const L1_ENTRY_BYTES: usize = 32;
     pub const L1_TABLES: usize = 4;
@@ -212,8 +214,14 @@ pub mod cache {
     /// K1: the block each L1 entry enters (u32 block number + 1; 0: empty; table t's at `L1_OWNERS + 4 * L1_ENTRIES * t`),
     /// so a CR3 load empties only the entries of blocks it makes stale.
     pub const L1_OWNERS: usize = 0x1_0000;
+    /// Perf chunk 19: per L1 table, the indices of its entries filled with a non-[`GLOBAL`] block since the table was
+    /// last cleared or a CR3 load last looked at them (u32 each, `Control::l1_listed[t]` of them, table t's at
+    /// `L1_LISTS + 4 * L1_ENTRIES * t`; an owner word's [`L1_LISTED`] bit says its index is on the list, so it is there
+    /// once). A CR3 load leaves every global block current, so these are the only entries it may have to empty.
+    pub const L1_LISTS: usize = L1_OWNERS + 4 * L1_ENTRIES * L1_TABLES;
+    pub const L1_LISTED: u32 = 1 << 31;
     /// L2: open-addressed {guest RIP, block number + 1} table keyed by (RIP, context).
-    pub const L2: usize = 0x2_0000;
+    pub const L2: usize = (L1_LISTS + 4 * L1_ENTRIES * L1_TABLES).next_multiple_of(0x1_0000);
     pub const L2_ENTRIES: usize = 1 << 19;
     /// Block index: metadata offsets of the blocks in placement (= code address) order.
     pub const INDEX: usize = L2 + 16 * L2_ENTRIES;
@@ -408,7 +416,17 @@ pub mod cache {
         pub slot_writes: u64,
         /// Perf chunk 14: CR3 loads that kept the supervisor space's global upper-half shadows (the rest reset them all).
         pub kept_resets: u64,
+        /// Perf chunk 19: the linear 2 MiB regions (whole region numbers) a [`LARGE`] block's guest bytes may lie in since
+        /// the last reset, the first [`LARGE_REGIONS`] of them. `large_count` is the number listed while it is at most
+        /// [`LARGE_REGIONS`]; above that some region was not listed (each such recording adds one, so it may count a region
+        /// more than once), the list is incomplete and only `large_regions` filters (as before). Never shrinks but at a reset: a region
+        /// whose large blocks died stays listed (only more scans, never a missed cut).
+        pub large_list: [u64; LARGE_REGIONS],
+        pub large_count: u64,
+        /// Perf chunk 19: the length of each L1 table's list ([`L1_LISTS`]).
+        pub l1_listed: [u64; L1_TABLES],
     }
+    pub const LARGE_REGIONS: usize = 64;
     pub const PC_HINTS: usize = 2048;
     /// [`Control::reuse`].
     pub const REUSE_OFF: u64 = 0;
@@ -570,10 +588,13 @@ pub mod cache {
     const _: () = assert!(MAX_BLOCK_BYTES <= SLOT_BYTES && HEAD_BYTES % 64 == 0);
     const _: () = assert!((CODE_VA | CODE_WRITE_VA | META_VA | LOOKUP_VA | GLOBAL_VA) % BLOCK as u64 == 0);
     const _: () = assert!(CODE_OFFSET % BLOCK == 0 && META_BYTES % BLOCK == 0);
-    const _: () = assert!(core::mem::size_of::<Control>() <= L1_OWNERS && L1_OWNERS + 4 * L1_ENTRIES * L1_TABLES <= L2 && L2 + L2_ENTRIES * 16 <= INDEX);
+    const _: () = assert!(core::mem::size_of::<Control>() <= L1_OWNERS && L1_LISTS + 4 * L1_ENTRIES * L1_TABLES <= L2 && L2 + L2_ENTRIES * 16 <= INDEX);
+    const _: () = assert!(MAX_BLOCKS < L1_LISTED as usize);
     const _: () = assert!(WRITABLE_SUMMARY + SUMMARY_BYTES <= PAGE_BLOCKS && PAGE_BLOCKS + 4 * super::MAX_GUEST_PAGES <= LINEAR_HEADS && LINEAR_HEADS + 4 * LINEAR_BUCKETS <= HINTS && HINTS + 4 * HINT_ENTRIES <= LOOKUP_BYTES);
-    // The dispatcher's form; its `adr` and each entry's `cbnz` to the miss reach ±1 MiB.
-    const _: () = assert!(L1_MASK == 0xfff && L1_ENTRY_BYTES == 32 && L1_CODE + L1_TABLES * L1_TABLE_BYTES - DISPATCH < 1 << 20);
+    // The dispatcher's form: its `and` takes the mask as a logical immediate, its `adrp` names a table by its page, and
+    // each entry's `b` to the miss reaches ±128 MiB.
+    const _: () = assert!(L1_MASK == (1 << L1_BITS) - 1 && L1_BITS <= 16 && L1_ENTRY_BYTES == 32);
+    const _: () = assert!(L1_CODE % 4096 == 0 && L1_TABLE_BYTES % 4096 == 0 && HEAD_BYTES < 1 << 27);
     const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= LINKS);
     const _: () = assert!(LINKS + MAX_LINKS * core::mem::size_of::<LinkRecord>() <= STEP_RECORD);
     const _: () = assert!(STEP_RECORD + STEP_RECORD_BYTES <= CODE_SUMMARY && STEP_RECORD % core::mem::align_of::<Block>() == 0);

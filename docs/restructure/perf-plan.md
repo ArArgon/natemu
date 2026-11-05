@@ -1815,6 +1815,145 @@ chunk on these numbers (at most 0.2 s on the installer), and generated code has 
 **Not done.** No optimisation built; no instrumentation kept (the four scratch diffs are in the evidence directory; the
 tree is HEAD's). Not measured: the share of HVF's second-stage TLB misses in generated code (no counter reachable).
 
+### Measured (chunk 19: exact large-page regions and a larger dispatcher L1, November 4; uncommitted on f74c3ea, series55-swapgs)
+
+Evidence: `natemu-raw/lookup-20261104-01/` (README there). Setup as chunk 18: the `natemu` stub, cache off,
+`mitigations=off nokaslr`, 2 GiB, compiler series55-swapgs (unchanged), one VM at a time. Walls are uninstrumented runs
+(default resident, no log), interleaved; counts come from single runs with the perf resident and its log (whole run, the
+log's final per-vCPU lines). The two fixes were built and measured one after the other: fix 1 against HEAD, then fix 2 on
+top of fix 1 against fix 1 alone.
+
+**Fix 1: the page-fault and INVLPG region test made exact.**
+*Measured first* (scratch counters, `scratch-s1count.diff`, not kept; one run each, whole run): of `build` N = 1's 85.0 k
+page faults, 4,386 found their 2 MiB region's bit set in the 1,024-bit set; with the exact test below 129 of them scan the
+region, and the same 2 scans as before meet a block from a 2 MiB page. At most 8 regions were recorded at once. The
+installer N = 1: 276 bit hits, 2 scans. `build` N = 4, vCPU 0: 1,009 and 186. Page-fault time of `build` N = 1 fell from
+1.60 s (chunk 18's scratch run of HEAD) to 0.13 s.
+
+*Built* (resident `cache.rs`; abi `Control`). Besides the 1,024-bit set, the cache now keeps the whole numbers of the
+regions holding a block fetched through a 2 MiB leaf, up to 64 (`Control::large_list`, `large_count`), recorded
+where the bit is set (placement and a revalidation that finds a large leaf, both regions of the block's first and last byte)
+and cleared only at a whole-cache reset. An INVLPG or #PF scans a region's 512 chains when its bit is set and the region is
+listed; past 64 regions the list is incomplete and the bit alone decides, as before. A record is never removed while its
+blocks live, so it can only cause a scan, never miss one: the set of blocks cut is the same as chunk 8's (SDM Vol.3
+4.10.4.1). Every scan the list removes was at a region whose bit another region had set (a bit is set only where its region is
+listed, and the list never filled): region numbers alias modulo 1,024.
+
+*Tests* (`tools/run_k1.py`, natemu only, 1-4 vCPUs, both block sizes, 48 runs green): `pf-large` (a #PF on another 4 KiB
+page of a 2 MiB code page, the PDE remapped by the handler with no INVLPG: the code runs from the new frame), `large-alias`
+(a large block 2 GiB above, in the same bit, placed first: an INVLPG of another page of the region still cuts the region's
+own block), `large-reval` (a block placed through 4 KiB pages, then revalidated through a 2 MiB page of the same frames
+after a CR3 reload, then cut by an INVLPG elsewhere in the 2 MiB), `large-64` and `large-65` (large blocks in exactly as
+many regions as the list holds, and one more: an INVLPG in the last region cuts its block). Each red under a scratch mutation (`nc/`, outputs kept): the region test always false (`invlpg-large`,
+`pf-large` r9 1), a region not listed when its bit was already set (`large-alias` r9 1), a revalidation that does not record
+(`large-reval` r9 1), the list taken as complete past 64 (`large-65` r9 1), the list's last entry not looked at
+(`large-64` r9 1), the overflow threshold raised by two (`large-65`: r9 0 and resident stops, status 4).
+A list one slot shorter or a threshold one higher stays correct (each block records two bytes, so past a full list the
+count rises by two) and was not counted as a control.
+
+| Wall s, mean (min-max) | HEAD | fix 1 | change |
+| --- | --- | --- | --- |
+| `build` N = 1 | 19.67 (19.37-19.90) | 18.22 (18.07-18.35) | -1.45 (-7.4%) |
+| `build` N = 4 | 9.06 (8.92-9.22) | 8.38 (8.34-8.44) | -0.67 (-7.4%) |
+| `hackbench` N = 1 (6 runs each) | 13.55 (13.09-13.77) | 13.76 (13.57-13.87) | +0.21 |
+| `hackbench` N = 4 (6 runs each) | 4.41 (4.04-4.77) | 4.46 (4.18-4.72) | +0.05 |
+| `locks` N = 1 / N = 4 | 5.47 / 6.56 | 5.52 / 6.57 | +0.05 / +0.02 |
+| Installer N = 1 (6 runs each) | 7.60 (7.46-7.73) | 7.66 (7.50-7.79) | +0.05 |
+| Installer N = 4 (one run each) | 6.04 | 6.20 | +0.16 |
+
+(`camp1/`.) The other cells move within their spreads. `hackbench` N = 1, two perf runs each (`camp1/perf/`): page-fault
+time 15 ms and INVLPG time 21 ms in both builds, logged walls 14.25-14.35 s in both: the fix does not reach it.
+
+**Fix 2: a 65,536-entry dispatcher L1.**
+*Measured first* (scratch builds of the table at 16 and 14 index bits with nothing else changed, `scratch-l1s16.diff`; a CR3
+load there still scanned every entry; one perf run each): dispatcher misses at 4,096 / 16,384 / 65,536 entries, `build`
+N = 1 16.11 / 6.30 / 2.10 M (resident miss time 2.60 / 1.10 / 0.46 s), the installer N = 1 2.11 / 1.31 / 0.63 M. The full
+scan of the larger tables at each CR3 load cost 2.25 s (`build`) and 2.62 s (installer) against 0.33 and 0.24 s: a CR3 load
+must not visit every entry.
+
+*Built* (abi cache layout, resident `cache.rs`, `gates.S`):
+- L1 is indexed by the RIP's low 16 bits (`L1_BITS`): four tables of 2 MiB in the code area's head (8.07 MiB, from 0.57),
+  the owners 1 MiB of the lookup area. The tables lie beyond the reach of `adr` and `cbnz`, so the dispatcher names a
+  table with `adrp` (the tables are page aligned; the resident writes the dispatcher's own `adrp` at fill time, and checks
+  every slot's for every table, as it checked the `adr`), and an entry is `movz/movk x2, #rip; sub; cbnz x2, +8; b entry;
+  b miss` (a hit runs the same instructions as before; a miss one more `b`).
+- CR3 loads through fill lists. A CR3 load moves `epoch` and not `global_epoch`, so every global block stays current: only
+  the entries filled with a non-global block can need emptying. Each table keeps the indices of those entries
+  (`L1_LISTS`, 1 MiB; an owner bit marks an index as listed, so it is listed once); a CR3 load visits that list, empties
+  the stale entries (each cleaned to the point of unification, one barrier, then its instructions invalidated) and keeps
+  only the entries still filled. A global flush, a reset and a table taken by another context clear the whole table as
+  before.
+- Not changed: the miss path, `fill_l1`'s rule (a block enters only its own context's table), the invalidation of one
+  block's entry in every table. The vCPU windows stay inside the 1 GiB identity map (the compile-time check: 650 of
+  1,024 MiB). Linux runs give blocks 120 MiB of code area instead of 127.5 MiB (the peak used: 38 MiB on `build`).
+
+*Costs* (one perf run each, whole run). A table clear takes about 0.24 ms: the clears of a table taken by a new context, 11
+on `build` N = 1 and 13 on the installer, took 2.6 and 2.9 ms (0.16 and 0.19 ms before); CR3 loads and global flushes together 0.21 s on `build` N = 1 and 0.08 s on the
+installer, against 0.33 and 0.24 s with the 4,096-entry tables scanned whole. Max RSS +6 to +11 MiB at N = 1 and +19 to
++29 MiB at N = 4. Misses: `build` N = 1 2.13 M (16.11 M), installer 0.63 M (2.11 M); resident block entries 6.00 M and
+3.36 M (19.95 M and 4.80 M); generated code 6.51 s and 1.42 s (7.68 and 1.53 s).
+
+*Tests* (`run_k1.py contexts`, extended): two RIPs with the same low 16 bits called in turn three times under one
+context each run their own code, then the large page under them is remapped under another context with a CR3 reload and
+no INVLPG, and the second RIP called under the first context runs the new code (the reload reached another context's
+table). Green at 1-4 vCPUs and both block sizes. Red under scratch mutations (`nc/`): the CR3 load looking at the current
+table only (`contexts` r12, rdi), entries never listed and only global ones listed (`remap-cr3`, `cr3-switch`), the entry's
+RIP comparison removed (`contexts` rsi 3 for 0x30); the listed bit left set where an index leaves its list at a CR3 load
+(`cr3-switch` r8 0x63 for 0x32, also `remap-cr3`, `dormant-write`, `mixed-g0`, `mixed-g1`) and at a table clear
+(`contexts` r12 3 for 4).
+
+| Wall s, mean (min-max) | fix 1 | fix 1 + 2 | change |
+| --- | --- | --- | --- |
+| `build` N = 1 | 18.26 (17.97-18.42) | 14.39 (14.19-14.53) | -3.87 (-21.2%) |
+| `build` N = 4 | 8.28 (8.06-8.59) | 6.96 (6.82-7.14) | -1.31 (-15.8%) |
+| `hackbench` N = 1 | 13.87 (13.47-14.17) | 13.44 (13.35-13.49) | -0.43 (-3.1%) |
+| `hackbench` N = 4 | 4.42 (4.33-4.62) | 3.93 (3.80-4.11) | -0.50 (-11.2%) |
+| Installer N = 1 (6 runs each) | 7.71 (7.45-7.88) | 7.13 (7.04-7.26) | -0.58 (-7.6%) |
+| Installer N = 4 (one run each) | 6.15 | 5.92 | -0.23 |
+| `locks` N = 1 | 5.58 (5.53-5.64) | 5.63 (5.61-5.65) | +0.04 |
+| **`locks` N = 4** | 6.53 (6.50-6.57) | **7.00 (6.55-7.26)** | **+0.47 (+7.2%)** |
+
+(`camp2/`.) Against HEAD, across the two campaigns (`camp1`'s HEAD column): `build` N = 1 19.67 to 14.39 s, N = 4 9.06 to
+6.96 s, the installer N = 1 7.60 to 7.13 s.
+
+*Size* (`size/`, three interleaved rounds of the four builds): wall s, mean.
+
+| | 4,096 (fix 1) | 16,384 | 32,768 | 65,536 |
+| --- | --- | --- | --- | --- |
+| `build` N = 1 | 18.53 | 15.73 | 14.89 | 14.61 |
+| `hackbench` N = 4 | 4.38 | 3.95 | 4.08 | 4.15 (3.80-4.39) |
+| Installer N = 1 | 7.79 | 7.38 | 7.35 | 7.32 |
+| `locks` N = 4 | 6.48 | 6.93 | 7.03 | 7.10 |
+
+65,536 entries kept: `build` gains 1.1 s more than at 16,384; the others do not separate beyond their spreads.
+
+*`locks` N = 4 is slower at every larger size: shipped as a measured exception* (the coordinator's decision after the
+independent review; the cell is contention-sensitive, chunk 15). The same build at 4,096 entries (fill lists and the new entry form, the
+table size alone unchanged: `c19b12`) ran 6.60, 6.65, 6.56 s against fix 1's 6.63, 6.59, 6.30 and 64 Ki's 7.22, 7.12, 7.18
+(`size/runs12/`): the cost comes with the index, not with the lists or the entry form. Three perf runs each (`locks/`,
+`locksum.py`): per resident entry the costs are the same (generated code 0.230 against 0.231 us per entry, linker entries
+0.089 against 0.089 us), but the guest does more: SYSCALL and SYSRET 23.2 M each against 25.4 M (+9%), block entries
++5% and linker entries +9%, halts 6 k against 35 k, dispatcher misses 7.8 M against 6.6 M. The benchmark is four threads on
+one mutex (futex wait and wake). What triggers the extra SYSCALLs and halts was not identified.
+
+**Checks** (`suite19.sh`, `suite/`, the final tree, one VM runner at a time, each case's output deleted as it ended):
+`cargo test` 106 + 1 ignored (host), abi 65, also with `FEXC` set; the resident stack audit `ok`; the Python unit tests 317
+(the first pass failed the stack audit's own test, whose mutation looked for the dispatcher's `and x1, x0, #0xfff`; now
+`#0xffff`, rerun green); fixtures 64 and seed 44 at both block sizes; the i7 corpus at CPL 0 69 at both; faults 7,912 at
+both; `run_k1.py` 328 runs, no problem (the new cases and the extended `contexts` included); `run_k2.py` all ok (`swapgs`
+included); `run_slice3_vm.py` `system`, `delivery`, `events`, `contain`, `smp` 0 failures; `run_x3.py` 54/54 and every
+group, `run_x4.py` 33/28/6, `run_l4a.py`, `run_l4b.py`, `run_s4.py` all ok; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7,
+`r1b` 12/12 (negative controls flagged); FEX ASM 2,270: 1,898 pass, 48 precision deviations, 324 unsupported, no failure.
+`--check-reuse --code-shape` installer boots, cache off (`checkboot19.py`, `check/`): N = 1 856,622 copies checked, N = 4
+871,772 over four vCPUs, no halt, both reached the dialog. Every measurement run verified or reached the dialog. After the
+independent review (`suite/r1/`: comment changes, the dispatcher template's unused `adrp` offset dropped, `large-many`
+replaced by `large-64` and `large-65`, five more controls): `cargo test` with and without `FEXC`, the stack audit and its
+test, `run_k1.py` 336 runs, all green.
+
+**Not done.** The `locks` N = 4 exception is not resolved (above). Blocks from 1 GiB pages: not reachable (the walker
+treats PS at level 3 as reserved and the profile does not advertise 1 GiB pages); revisit if they are added (the region test
+covers 2 MiB regions only).
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
