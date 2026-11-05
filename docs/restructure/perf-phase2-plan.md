@@ -61,6 +61,11 @@ Then, as the numbers dictate:
    does the same work) and at its best (`-cpu max`, every feature TCG offers). QEMU does not change between our chunks, so
    both are measured once per benchmark set or QEMU version, not per change. A feature that makes QEMU faster goes on
    natemu's candidate list.
+   First pass (`natemu-raw/qemumax-20261104-01/`, QEMU 11.1.2, three alternated rounds): `-cpu max` is slower than
+   like-for-like in 9 of 10 cells (build +5%, zstd +9-11%, hackbench +10-22%, installer +15-21%); only `locks` N = 4 is
+   faster (27.33 -> 25.29 s), and single-feature runs tie that to SMAP (like + SMAP 24.84 s). ERMS/FSRM account for much
+   of the hackbench and installer slowdown. Under `max` the guest also runs 5-level paging and sees an AMD vendor. The
+   faster of the two QEMU columns is the one natemu is compared against per cell.
 9. **Generated-code quality** (guest code ~2.3 s on the installer at batch-1 start): larger FEX compile regions, careful
    relaxation of precision rules where nothing observes the difference. Last, and only if steady-state benchmarks point here.
 
