@@ -828,6 +828,16 @@ inline bool PlainRdtsc(const DecodedInst& d) {
 inline bool PlainSwapgs(const DecodedInst& d) {
   return d.FexcMap == FEXC_MAP_TWO && d.OPRaw == 0x01 && d.ModRM == 0xF8 && d.InstSize == 3;
 }
+// Perf chunk 26: MOV r64, CR2 (0f 20 /r with reg 2 and mod 11; no prefix but a REX without R, which would name CR10, #UD),
+// translated inline in a CPL-0 request (FEX's FexcMovFromCROp: a load of FEXC_CR2): at CPL 0 it never faults (#GP(0) needs CPL
+// > 0; LOCK, 66, F2 or F3 and every other control register stay the resident's, as does a ModRM with mod other than 11,
+// which the hardware treats as 11).
+inline bool PlainMovFromCr2(const DecodedInst& d) {
+  if (d.FexcMap != FEXC_MAP_TWO || d.OPRaw != 0x20 || d.ModRM >> 3 != 0x1A) return false;
+  if (d.InstSize == 3) return true;
+  const uint8_t* b = fexc_guest_bytes(d.PC, d.InstSize);
+  return d.InstSize == 4 && b && (b[0] & 0xF4) == 0x40;
+}
 // Whether `n` (the instruction after an STI, `failed`: its decode ended the block with an error) is translated in the block:
 // an inline CLI or RDTSC, or an admitted form other than a REP string, a LOCK NEG and a direct branch to a non-canonical target (the
 // checks `Cut` makes after the verdict).
@@ -871,6 +881,7 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
     return false;
   if (decoded && PlainRdtsc(d) && fexc_tsc) return false;
   if (decoded && PlainSwapgs(d) && fexc_cpl0) return false;
+  if (decoded && PlainMovFromCr2(d) && fexc_cpl0) return false;
   Verdict v = Classify(d, decoded);
   // I10 review: a #UD encoding FEX did not decode (it stops at the byte it does not know) is #UD once the instruction is
   // fetched: its bytes through the ModRM (FexcUdLength) must be in the supplied bytes, else `partial_decode` (the host fetches

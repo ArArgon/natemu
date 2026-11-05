@@ -1102,6 +1102,13 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
     // CPL-0 code, [`bank`]); 0 at CPL > 0, so a CPL-3 block never finds the kernel's value in the page.
     let kernel_gs = if s.cpu.cpl == 0 { msr_get(cpu::msr(cpu::MSR_KERNEL_GS_BASE).unwrap()) } else { 0 };
     unsafe { (FRAME_VA as *mut u64).byte_add(frame::KERNEL_GS_BASE as usize).write_volatile(kernel_gs) };
+    // Perf chunk 26: CR2, which a CPL-0 block's inline MOV r64, CR2 reads there; 0 at CPL > 0; never read back (only the
+    // resident changes CR2: a #PF delivery or MOV to CR2, each followed by an entry).
+    let cr2 = if s.cpu.cpl == 0 { s.cpu.cr2 } else { 0 };
+    unsafe { (FRAME_VA as *mut u64).byte_add(frame::CR2 as usize).write_volatile(cr2) };
+    // Perf chunk 26: IA32_MISC_ENABLE's fast-string bit, which a bulk REP STOS tests (WRMSR is a transaction: an entry follows).
+    let fast = (msr_get(cpu::msr(cpu::MSR_MISC_ENABLE).unwrap()) & 1) as u8;
+    unsafe { (FRAME_VA as *mut u8).add(frame::FAST_STRINGS as usize).write_volatile(fast) };
     // I6: FCW, which FNSTCW reads there; like the FS base, never read back.
     unsafe { (FRAME_VA as *mut u16).byte_add(frame::X87_FCW as usize).write_volatile(s.cpu.fcw as u16) };
     // Perf chunk 25: MXCSR, which a translated STMXCSR reads there with the flags raised since (FPSR is cleared and the SIMD
@@ -2176,7 +2183,10 @@ fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, ac
         // every TSO outcome. UC is strongly ordered (a UC- PAT entry gives UC unless the MTRRs say WC, Table 14-7): see above.
         Ok(t) => {
             let kind = cpu::memory_type(msrs(), t.gpa, t.pat);
-            let uncached = kind == cpu::memory_type::UC;
+            // Perf chunk 26: and a write to WT or WP RAM, which REP STOS must also make element by element (SDM Vol.1 7.3.9.3,
+            // Vol.3 11.2.4.1: fast strings, which group iterations, only on WB and WC memory): its page is shadowed for reads
+            // only, and each write runs its instruction alone, as for UC (an ordering at least as strong as WT's and WP's).
+            let uncached = kind == cpu::memory_type::UC || (access == Access::Write && matches!(kind, cpu::memory_type::WT | cpu::memory_type::WP));
             let shadow = !uncached || b.flags & cache::STEP != 0;
             let writable = access == Access::Write && t.writable && t.dirty;
             // As a mark is set before the writable bits are read ([`mark`]), the writable bit is set before the marks

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """K2 checks: system instructions run from the decoded record kept in the code cache (boot-features plan, K2).
 
-    tools/with-env python3 tools/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence,rollback,nopruns,tsc,swapgs,sysfast,stifirst,stmxcsr] [--n 100000] [--reps 3]
+    tools/with-env python3 tools/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence,rollback,nopruns,tsc,swapgs,sysfast,stifirst,stmxcsr,repbulk,cr2] [--n 100000] [--reps 3]
         [--xmc-rewrites N] [--host HOST --runtime RUNTIME]
 
 - `cost`: microseconds per loop iteration of one system instruction (CLI, STI, PUSHFQ+POPFQ, SWAPGS, RDTSC, CPUID,
@@ -35,6 +35,11 @@
   or CPL 3, and under interrupts and NMIs at random times (see `stifirst`).
 - `stmxcsr` (perf chunk 25): STMXCSR and VSTMXCSR, translated, store MXCSR with the sticky flags the code before them raised,
   as the resident's FXSAVE (its bank) does and as the SDM gives them, at both CPLs and block sizes (see `stmxcsr`).
+- `repbulk` (perf chunk 26): REP STOS stored in bulk inside a page keeps the SDM's semantics: every width, alignment, count,
+  page crossing and DF; faults mid-string; interrupts at random times; TF; a data breakpoint; UC memory; writes into
+  translated code (see `repbulk`).
+- `cr2` (perf chunk 26): MOV r64, CR2 translated inline at CPL 0 reads CR2 after #PF deliveries (nested too), MOV to CR2, under
+  TF; at CPL 3 it is #GP(0) and the guest-state page holds no CR2 (see `cr2`).
 
 Writes DIR/k2.json; exit status 1 on any failure."""
 import argparse, json, pathlib, statistics, subprocess, sys, time
@@ -66,6 +71,9 @@ COSTS = {
     'div': ('mov edx, 1\nmov eax, 7\ndiv r9', {9: 2}),
     # Perf chunk 17: a SYSCALL -> kernel -> SYSRET round trip (`syscall_program`).
     'syscall': (None, {}),
+    # Perf chunk 26: 4 KiB of REP STOSQ and REP STOSB (RDI page-aligned), one iteration each.
+    'stosq_4k': ('mov edi, 0x300000\nmov ecx, 512\nrep stosq', {}),
+    'stosb_4k': ('mov edi, 0x300000\nmov ecx, 4096\nrep stosb', {}),
 }
 USER_GS, KERNEL_GS, KERNEL_RIP = 0x2a0000, 0x2b0000, 0x200000
 # The guest-state page's alias (abi `GUEST_STATE_VA`, the recorded deviation): IF's byte at +0x3f9, the event-pending byte at +0x406.
@@ -111,6 +119,7 @@ def gprs(values):
 def cost(a, report):
     failures, rows = [], {}
     for name, (body, regs) in COSTS.items():
+        if a.cost_rows and name not in a.cost_rows: continue
         code = ref.assemble(f'1: {body}\ndec r8\njnz 1b') if body else None
         times, stats = {a.n: [], 2 * a.n: []}, {}
         for rep in range(a.reps + 1):
@@ -1266,13 +1275,399 @@ def stmxcsr(a, report):
     return failures
 
 
+def repbulk(a, report):
+    """Perf chunk 26: REP STOS in 64-bit addressing stores the part of its string inside RDI's page in bulk (16-byte stores,
+    RCX/RDI updated after each). Judged by the SDM (STOS, REP: Vol.2; RF and single-step: Vol.3 18.3.1.4, 18.2.4; #PF and
+    CR2: Vol.3 4.7; self-modifying code: Vol.3 9.1.3), natemu only, at block sizes default and 1:
+    - `fill-w`: STOSB/W/D/Q of RAX's low bytes, with RDI at offsets 0, 8, 3, 0xff8, 0xff0, 0x10 and counts 0, 1, one short
+      of a 16-byte chunk, a chunk, one more, 100, two pages and 3; DF = 1 twice; 0x67 (EDI/ECX) once: RCX 0, RDI the end,
+      exactly the string's bytes written (the bytes around it keep 0xEE).
+    - `fault`: REP STOSQ from D+0xf00 with D+0x2000 not present; REP STOSB from a read-only page's start; REP STOSB from
+      D+0x1003 into a read-only D+0x2000: #PF with CR2 the faulting element's address, RIP the REP's, RCX/RDI at that element,
+      every earlier element written.
+    - `kicks-wN` (every width, both block sizes) and `kicks-w1/w8-misc-off` (review: IA32_MISC_ENABLE bit 0 cleared): 20,000
+      rounds of 64 KiB REP STOS (round r stores r * 0x0101010101010101) under interrupts posted at random times
+      (`--kick-events`): at each one taken at the REP, RCX + (RDI - BUF) / w = 65536 / w, the element before RDI holds this
+      round's low byte and the one at RDI the last round's, and RF is set in the frame once an element ran; more than 50 taken
+      there. With fast strings on none lies in a page's interior (16 to 4079 bytes in: a pass stores in bulk to the page's end
+      or its last chunk, then one element); with the bit cleared more than half do (every iteration a boundary).
+    - `wt-wp` (review): REP STOSQ over a WT and a WP page (PAT entries 1 and 2): every element run alone.
+    - `cpl3-us`, `cpl3-rsvd`, `noncanonical`, `into-noncanonical` (review): #PF P|W|U and P|W|U|RSVD at a page reached in bulk,
+      #GP(0) with RCX/RDI unchanged, and #GP(0) after the last canonical page's 512 elements.
+    - `tso` (review): a second vCPU reads a flag a bulk REP STOSQ's vCPU stores after it, then the buffer: never older.
+    - `tf`: REP STOSQ of 5 under TF: #DB after each iteration (RCX 4, 3, 2, 1 at the REP, 0 after it).
+    - `watch`: a data breakpoint (DR0, write, 8 bytes) on the second quadword of a 64-quadword REP STOSQ: one #DB after that
+      iteration, at the REP with RCX 62 and RDI past it, DR6.B0.
+    - `uc`: REP STOSQ over a UC page (PCD|PWT): written, every element run alone (`uncached.steps` >= 512).
+    - `smc-other`, `smc-own`: REP STOSB of NOPs over code already run on another (writable) page, and over code after the
+      REP on its own page: the new code runs.
+    - `linked`: N and 2N calls of `mov ecx, 511; xor eax, eax; rep stosq; ret` (Linux's clear_page with an odd count, its
+      last element left to the one-element pass): the linker entries do not grow with N (the last element ends the
+      instruction by a branch, not by an exit to its own RIP with RCX = 0, which is never linked)."""
+    asm, failures, runs = ref.assemble, [], []
+    D, RES, PAT = 0x400000, 0x3c0000, 0x1122334455667788
+    EE3 = (b'\xee' * 0x3000).hex()
+    def record(tag, problems, extra=None):
+        runs.append({'case': tag, 'ok': not problems, 'problems': problems, **(extra or {})})
+        print(json.dumps(runs[-1]), flush=True)
+        if problems: failures.append(f'repbulk {tag}: {problems}')
+    def go(tag, text, block, extra=()):
+        _, out, err = driver(a, text, a.out / 'repbulk' / f'{tag}-{block}', [*([block] if block else []), '--watchdog-ms', '120000', *extra])
+        return out, err
+    def mem(out, addr, n=8):
+        for m in out['memory']:
+            lo = int(m['addr'], 0)
+            if lo <= addr and addr + n <= lo + len(m['data']) // 2:
+                return int.from_bytes(bytes.fromhex(m['data'])[addr - lo:addr - lo + n], 'little')
+        return None
+    def membytes(out, addr, n):
+        return b''.join(mem(out, addr + k, 1).to_bytes(1, 'little') for k in range(n))
+    for block in (None, 1):
+        # fill-w: one program per width, each fill into its own three pages of 0xEE.
+        for w, sfx in ((1, 'b'), (2, 'w'), (4, 'd'), (8, 'q')):
+            e = 16 // w
+            fills = [(0, 0, 0), (0, 1, 0), (0, e - 1, 0), (0, e, 0), (0, e + 1, 0), (8, 100, 0), (3, 100, 0), (0xff8, 64 // w + 1, 0),
+                     (0xff0, 5, 0), (0x10, 0x2000 // w + 3, 0), (0x1800, 300 // w + 7, 1), (0x1004, 9, 1)] + ([(0x20, 50, 2)] if w == 4 else [])
+            body = f'mov rax, {PAT:#x}\n'
+            for i, (o, n, mode) in enumerate(fills):
+                base = D + 0x3000 * i
+                op = f'.byte 0x67, 0xf3, 0xab' if mode == 2 else f'rep stos{sfx}'
+                body += (f'mov rdi, {base + o:#x}\nmov rcx, {n}\n' + ('std\n' if mode == 1 else '') + op + '\n' + ('cld\n' if mode == 1 else '')
+                         + f'mov [{RES + 16 * i:#x}], rdi\nmov [{RES + 16 * i + 8:#x}], rcx\n')
+            code = asm(body + 'nop')
+            text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nmemory {RES:#x} {bytes(16 * len(fills)).hex()}\n'
+                    + ''.join(f'memory {D + 0x3000 * i:#x} {EE3}\n' for i in range(len(fills))))
+            tag = f'fill-w{w}-{block}'
+            out, err = go(f'fill-w{w}', text, block)
+            problems = [f'driver: {err}'] if not out else ([] if out['stop'] == 'reached' else [f"stop {out['stop']} {out.get('reason')}"])
+            if out and not problems:
+                elem = (PAT & ((1 << 8 * w) - 1)).to_bytes(w, 'little')
+                for i, (o, n, mode) in enumerate(fills):
+                    base = D + 0x3000 * i
+                    start, end = (base + o, base + o + n * w) if mode != 1 else (base + o - (n - 1) * w, base + o + w)
+                    want = bytearray(b'\xee' * 0x3000)
+                    want[start - base:end - base] = elem * n
+                    rdi = base + o + (n * w if mode != 1 else -n * w)
+                    if mem(out, RES + 16 * i) != rdi or mem(out, RES + 16 * i + 8) != 0:
+                        problems.append(f'fill {i} {(o, n, mode)}: RDI {mem(out, RES + 16 * i):#x} RCX {mem(out, RES + 16 * i + 8)}, want {rdi:#x} 0')
+                    got = membytes(out, base, 0x3000)
+                    if got != bytes(want):
+                        k = next(k for k in range(0x3000) if got[k] != want[k])
+                        problems.append(f'fill {i} {(o, n, mode)}: byte {base + k:#x} {got[k]:#x}, want {want[k]:#x}')
+            record(tag, problems)
+        # fault: three programs, each stopping at its #PF.
+        for name, w, o, n, mut, cr2 in (('fault-unmapped', 8, 0xf00, 1024, 'unmap', D + 0x2000), ('fault-first', 1, 0x1000, 0x1800, 'readonly', D + 0x1000),
+                                         ('fault-misaligned', 1, 0x1003, 0x2000, 'readonly', D + 0x2000)):
+            code, lab = asm(f'mov rax, {PAT:#x}\nmov rdi, {D + o:#x}\nmov rcx, {n}\nx: rep stos{"q" if w == 8 else "b"}\nnop', labels=True)
+            text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nmemory {D:#x} {EE3}\n{mut} {cr2:#x}\n')
+            out, err = go(name, text, block)
+            done = (cr2 - D - o) // w
+            problems = [f'driver: {err}'] if not out else []
+            if out:
+                g = [int(x, 0) for x in out['gpr']]
+                fault = [int(x, 0) for x in out['fault']]
+                if out['stop'] != 'guest_fault' or fault[0] != 14 or cr2 not in fault[1:] or int(out['rip'], 0) != CODE + lab['x']:
+                    problems.append(f"stop {out['stop']} {out.get('reason')} fault {out.get('fault')} rip {out.get('rip')}")
+                if (g[1], g[7]) != (n - done, cr2):
+                    problems.append(f'RCX {g[1]} RDI {g[7]:#x}, want {n - done} {cr2:#x}')
+                elem = (PAT & ((1 << 8 * w) - 1)).to_bytes(w, 'little')
+                lo = max(D, D + o - 0x100)
+                got = membytes(out, lo, min(cr2, D + 0x3000) - lo) if mut != 'unmap' else membytes(out, lo, cr2 - lo)
+                want = b'\xee' * (D + o - lo) + elem * done
+                if got != want:
+                    problems.append('memory before the faulting element is not exactly the elements done')
+            record(f'{name}-{block}', problems, {'fault': out and out.get('fault')})
+        # uc: a UC page (PCD|PWT in its PTE: PAT entry 3 at reset, UC).
+        code = asm(f'mov rax, {PAT:#x}\nmov rdi, {D:#x}\nmov ecx, 512\nrep stosq\nnop')
+        out, err = go('uc', f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nmemory {D:#x} {bytes(0x1000).hex()}\nentry {D:#x} 1 set 0x18\n', block)
+        problems = [f'driver: {err}'] if not out else []
+        if out:
+            steps = out['stats'].get('k1', {}).get('uncached', {}).get('steps', 0)
+            if out['stop'] != 'reached' or membytes(out, D, 0x1000) != PAT.to_bytes(8, 'little') * 512 or steps < 512:
+                problems.append(f"stop {out['stop']} uncached steps {steps}")
+        record(f'uc-{block}', problems)
+        # smc-other: code at X run, then overwritten by 64 NOPs (it then slides to `mov eax, 2`); smc-own: the REP's own page.
+        X = 0x200000
+        xcode = asm('mov eax, 1\nret\n.fill 58, 1, 0xcc\nmov eax, 2\nret')
+        code = asm(f'mov eax, {X:#x}\ncall rax\nmov r12d, eax\nmov rdi, {X:#x}\nmov ecx, 64\nmov al, 0x90\nrep stosb\nmov eax, {X:#x}\ncall rax\nmov r13d, eax\nnop')
+        out, err = go('smc-other', f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nbody {X:#x} {xcode.hex()}\nentry {X:#x} 1 set 2\nregion 0x3e0000 0x10000\n', block)
+        problems = [f'driver: {err}'] if not out else []
+        if out:
+            g = [int(x, 0) for x in out['gpr']]
+            if out['stop'] != 'reached' or (g[12], g[13]) != (1, 2): problems.append(f"stop {out['stop']} r12 {g[12]} r13 {g[13]}")
+        record(f'smc-other-{block}', problems)
+        code = asm('lea rdi, [rip + t]\nmov ecx, 64\nmov al, 0x90\nrep stosb\n.p2align 4\nt: mov eax, 1\njmp d\n.fill 57, 1, 0xcc\nmov eax, 2\nd: nop')
+        out, err = go('smc-own', f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nentry {CODE:#x} 1 set 2\n', block)
+        problems = [f'driver: {err}'] if not out else []
+        if out:
+            g = [int(x, 0) for x in out['gpr']]
+            if out['stop'] != 'reached' or g[0] != 2: problems.append(f"stop {out['stop']} {out.get('reason')} rax {g[0]}")
+        record(f'smc-own-{block}', problems)
+    code = asm('lea rbx, [rip + cp]\nmov r12d, 0x400000\n1: mov rdi, r12\ncall rbx\nadd r12, 4096\ncmp r12, 0x500000\njb 2f\n'
+               'mov r12d, 0x400000\n2: dec r8\njnz 1b\njmp done\ncp: mov ecx, 511\nxor eax, eax\nrep stosq\nret\ndone: nop')
+    entries = {}
+    for n in (2000, 4000):
+        out, err = go(f'linked-{n}', f'rip {CODE:#x}\nrflags 0x2\n{gprs({8: n})}\ncode {code.hex()}\nregion 0x3e0000 0x10000\nregion {D:#x} 0x100000\n', None)
+        entries[n] = out and out['stop'] == 'reached' and out['stats']['linker']
+    record('linked', [] if entries[2000] and entries[2000] == entries[4000] else [f'linker entries {entries}'], {'linker': entries})
+    # CPL 0 with the program's own IDT (#DB 1, 0x40), as `stifirst`: tf, watch, kicks.
+    TABLES, IDTR, DBG, CNT = 0x300000, 0x300800, 0x300900, 0x300b00
+    BUF = 0x500000
+    def idt_text(code, lab, extra_lines=''):
+        at = lambda l: CODE + lab[l]
+        gates = bytearray(16 * 0x41)
+        for v in (1, 0x40):
+            h = at(f'h{v}')
+            gates[16 * v:16 * v + 16] = (h & 0xffff | 0x08 << 16 | 0x8e << 40 | (h >> 16 & 0xffff) << 48).to_bytes(8, 'little') + (h >> 32).to_bytes(8, 'little')
+        tables = bytes(gates) + bytes(IDTR - TABLES - len(gates)) + (0x41 * 16 - 1).to_bytes(2, 'little') + TABLES.to_bytes(8, 'little')
+        tables += bytes(CNT + 0x40 - TABLES - len(tables))
+        return (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nif 0\nsvr 0x1ff\nmemory {TABLES:#x} {tables.hex()}\n'
+                f'region 0x3e0000 0x10000\n{extra_lines}')
+    setup = 'lidt [0x300800]\nmov ecx, 0x1b\nmov eax, 0xfee00d00\nxor edx, edx\nwrmsr\nmov ecx, 0x80f\nmov eax, 0x1ff\nwrmsr\n'
+    # #DB: up to 8 records of (frame RIP, RCX, RDI, frame RFLAGS, DR6); with `clear`, DR7 cleared at the first.
+    def h1(clear):
+        return (f'h1:\npush rax\npush rbx\nmov rbx, [{CNT:#x}]\ncmp rbx, 8\njae 2f\nshl rbx, 6\nmov rax, [rsp + 16]\nmov [{DBG:#x} + rbx], rax\n'
+                f'mov [{DBG + 8:#x} + rbx], rcx\nmov [{DBG + 16:#x} + rbx], rdi\nmov rax, [rsp + 32]\nmov [{DBG + 24:#x} + rbx], rax\n'
+                f'mov rax, dr6\nmov [{DBG + 32:#x} + rbx], rax\n2: inc qword ptr [{CNT:#x}]\nxor eax, eax\nmov dr6, rax\n'
+                + ('mov dr7, rax\n' if clear else '') + 'pop rbx\npop rax\niretq\n')
+    for block in (None, 1):
+        code, lab = asm(setup + f'mov rax, {PAT:#x}\nmov rdi, {D:#x}\nmov ecx, 5\npushfq\nor qword ptr [rsp], 0x100\npopfq\nx: rep stosq\n'
+                        'y: pushfq\nand qword ptr [rsp], -0x101\npopfq\njmp done\n' + h1(False) + 'h64:\niretq\ndone: nop', labels=True)
+        out, err = go('tf', idt_text(code, lab, f'memory {D:#x} {bytes(64).hex()}\n'), block)
+        problems = [f'driver: {err}'] if not out else []
+        if out:
+            got = [(mem(out, DBG + 64 * k), mem(out, DBG + 64 * k + 8)) for k in range(5)]
+            want = [(CODE + lab['x'], 4), (CODE + lab['x'], 3), (CODE + lab['x'], 2), (CODE + lab['x'], 1), (CODE + lab['y'], 0)]
+            if out['stop'] != 'reached' or got != want: problems.append(f"stop {out['stop']} #DB (RIP, RCX) {[(hex(r or 0), c) for r, c in got]}")
+        record(f'tf-{block}', problems)
+        code, lab = asm(setup + f'mov rax, {D + 0x808:#x}\nmov dr0, rax\nmov eax, 0xd0001\nmov dr7, rax\nmov rax, {PAT:#x}\nmov rdi, {D + 0x800:#x}\n'
+                        'mov ecx, 64\nx: rep stosq\njmp done\n' + h1(True) + 'h64:\niretq\ndone: nop', labels=True)
+        out, err = go('watch', idt_text(code, lab, f'memory {D:#x} {bytes(0x1000).hex()}\n'), block)
+        problems = [f'driver: {err}'] if not out else []
+        if out:
+            got = (mem(out, CNT), mem(out, DBG), mem(out, DBG + 8), mem(out, DBG + 16), (mem(out, DBG + 32) or 0) & 1)
+            want = (1, CODE + lab['x'], 62, D + 0x810, 1)
+            if out['stop'] != 'reached' or got != want or membytes(out, D + 0x800, 512) != PAT.to_bytes(8, 'little') * 64:
+                problems.append(f"stop {out['stop']} #DB (count, RIP, RCX, RDI, B0) {got}, want {want}")
+        record(f'watch-{block}', problems)
+    # kicks: rounds of 64 KiB REP STOS of every width under 0x40 at random times, both block sizes; and (review) with
+    # IA32_MISC_ENABLE's fast-string bit cleared, where every iteration is an interrupt boundary again.
+    R, STEP = 20_000, 0x0101010101010101
+    SFX = {1: 'b', 2: 'w', 4: 'd', 8: 'q'}
+    def kicks(w, block, misc_off):
+        n = 65536 // w
+        h64 = (f'h64:\npush rax\npush rbx\npush rdx\ninc qword ptr [{CNT:#x}]\nlea rbx, [rip + x]\ncmp rbx, [rsp + 24]\njne 9f\n'
+               f'inc qword ptr [{CNT + 8:#x}]\nmov rbx, rdi\nsub rbx, {BUF:#x}\nshr rbx, {w.bit_length() - 1}\nadd rbx, rcx\ncmp rbx, {n}\njne 81f\n'
+               f'cmp rdi, {BUF:#x}\nje 3f\nmov rdx, [rsp + 16]\ncmp byte ptr [rdi - {w}], dl\njne 82f\ntest qword ptr [rsp + 40], 0x10000\njz 83f\n'
+               f'mov rbx, rdi\nsub rbx, {BUF:#x}\nand ebx, 4095\ncmp ebx, 16\njb 3f\ncmp ebx, 4080\njae 3f\ninc qword ptr [{CNT + 24:#x}]\n'
+               f'3: test rcx, rcx\njz 9f\nmov rdx, [rsp + 16]\ndec dl\ncmp byte ptr [rdi], dl\nje 9f\n'
+               f'jmp 8f\n81: inc qword ptr [{CNT + 32:#x}]\njmp 8f\n82: inc qword ptr [{CNT + 40:#x}]\njmp 8f\n83: inc qword ptr [{CNT + 48:#x}]\n'
+               f'8: inc qword ptr [{CNT + 16:#x}]\n9: push rcx\nmov ecx, 0x80b\nxor eax, eax\nxor edx, edx\nwrmsr\npop rcx\npop rdx\npop rbx\npop rax\niretq\n')
+        off = 'mov ecx, 0x1a0\nrdmsr\nand eax, -2\nwrmsr\n' if misc_off else ''
+        code, lab = asm(setup + off + f'sti\nxor r15d, r15d\nxor eax, eax\n1: mov rbx, {STEP:#x}\nadd rax, rbx\nmov rdi, {BUF:#x}\nmov ecx, {n}\n'
+                        f'x: rep stos{SFX[w]}\ninc r15\ncmp r15, {R}\njb 1b\ncli\njmp done\n' + h1(False) + h64 + 'done: nop', labels=True)
+        tag = f'kicks-w{w}{"-misc-off" if misc_off else ""}'
+        out, err = go(tag, idt_text(code, lab, f'region {BUF:#x} 0x10000\n'), block,
+                      ['--kick-vcpu', '0', '--kick-events', '0x40', '--kicks', '3000', '--kick-every-us', '20', '--kick-jitter-us', '200'])
+        problems = [f'driver: {err}'] if not out else []
+        taken = {}
+        if out:
+            taken = {'all': mem(out, CNT), 'at_rep': mem(out, CNT + 8), 'bad': mem(out, CNT + 16), 'mid_page': mem(out, CNT + 24),
+                     'bad_count': mem(out, CNT + 32), 'bad_before': mem(out, CNT + 40), 'bad_rf': mem(out, CNT + 48)}
+            at_rep, mid = taken['at_rep'] or 0, taken['mid_page'] or 0
+            # Fast strings on: a pass stores in bulk to its page's end (or the last 16-byte chunk before it) and one element
+            # more, so every boundary taken inside the REP lies within 16 bytes of a page boundary; off: boundaries anywhere,
+            # nearly all in a page's interior.
+            grouping = mid > at_rep // 2 if misc_off else mid == 0
+            if out['stop'] != 'reached' or int(out['gpr'][15], 0) != R or taken['bad'] or at_rep < 50 or not grouping:
+                problems.append(f"stop {out['stop']} {out.get('reason')} r15 {out['gpr'][15]} taken {taken}")
+        record(f'{tag}-{block}', problems, {'taken': taken})
+    for block in (None, 1):
+        for w in (1, 2, 4, 8):
+            kicks(w, block, False)
+    for w in (1, 8):
+        kicks(w, None, True)
+    # Review: WT and WP RAM (PAT entries 1 and 2 made WT and WP; the pages' PWT / PCD select them): every element alone.
+    code = asm(f'mov ecx, 0x277\nmov eax, 0x00050406\nmov edx, 0x00070406\nwrmsr\nmov rax, {PAT:#x}\nmov rdi, {D:#x}\nmov ecx, 1024\nrep stosq\nnop')
+    for block in (None, 1):
+        out, err = go('wt-wp', f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nmemory {D:#x} {bytes(0x2000).hex()}\n'
+                      f'entry {D:#x} 1 set 0x8\nentry {D + 0x1000:#x} 1 set 0x10\n', block)
+        problems = [f'driver: {err}'] if not out else []
+        if out:
+            k1 = out['stats'].get('k1', {})
+            steps, types = k1.get('uncached', {}).get('steps', 0), k1.get('memory_types', {})
+            if out['stop'] != 'reached' or membytes(out, D, 0x2000) != PAT.to_bytes(8, 'little') * 1024 or steps < 1024 or not (types.get('WT') and types.get('WP')):
+                problems.append(f"stop {out['stop']} {out.get('reason')} uncached steps {steps} types {types}")
+        record(f'wt-wp-{block}', problems)
+    # Review: faults at CPL 3 (U/S cleared, a reserved bit set in D+0x1000's PTE: #PF P|W|U, RSVD), a non-canonical RDI (#GP(0),
+    # RCX and RDI unchanged) and a string running from the last canonical page into the non-canonical half (#GP(0) after the
+    # page's 512 elements).
+    TOP = 0x7ffffffff000
+    for name, rdi, count, extra, want in (
+            ('cpl3-us', D + 0xf00, 1024, f'entry {D + 0x1000:#x} 1 clear 0x4\n', (14, D + 0x1000, 0x7, 1024 - 32, D + 0x1000)),
+            ('cpl3-rsvd', D + 0xf00, 1024, f'entry {D + 0x1000:#x} 1 set 0x8000000000000\n', (14, D + 0x1000, 0xf, 1024 - 32, D + 0x1000)),
+            ('noncanonical', 0x800000000000, 100, '', (13, 0, 0, 100, 0x800000000000)),
+            ('into-noncanonical', TOP, 513, f'memory {TOP:#x} {bytes(0x1000).hex()}\n', (13, 0, 0, 1, 0x800000000000))):
+        code, lab = asm(f'mov rax, {PAT:#x}\nmov rdi, {rdi:#x}\nmov rcx, {count}\nx: rep stosq\nnop', labels=True)
+        for block in (None, 1):
+            out, err = go(name, f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nmemory {D:#x} {EE3}\n{extra}', block)
+            problems = [f'driver: {err}'] if not out else []
+            if out:
+                g = [int(x, 0) for x in out['gpr']]
+                f = [int(x, 0) for x in out['fault']] if out.get('fault') else []
+                got = (f[0] if f else None, f[1] if f else None, f[2] if f else None, g[1], g[7])
+                written = membytes(out, TOP, 0x1000) == PAT.to_bytes(8, 'little') * 512 if name == 'into-noncanonical' else True
+                if out['stop'] != 'guest_fault' or got != want or int(out['rip'], 0) != CODE + lab['x'] or not written:
+                    problems.append(f"stop {out['stop']} {out.get('reason')} (vector, CR2, error, RCX, RDI) {[hex(v) if v is not None else None for v in got]}, want {[hex(v) for v in want]}, page written {written}")
+            record(f'{name}-{block}', problems)
+    # Review: TSO as a second vCPU sees it: vCPU 0 stores round r over 16 KiB by REP STOSQ, then r into FLAG; vCPU 1 reads FLAG
+    # (f) and then every quadword of the buffer, which must all be >= f (x86 orders each store before the later flag store).
+    FLAG, R2 = 0x3c0000, 20_000
+    c0 = asm(f'xor eax, eax\n1: inc rax\nmov rdi, {BUF:#x}\nmov ecx, 2048\nrep stosq\nmov [{FLAG:#x}], rax\ncmp rax, {R2}\njb 1b\nnop')
+    c1 = asm(f'xor r9d, r9d\nxor r10d, r10d\n1: mov rbx, [{FLAG:#x}]\ntest rbx, rbx\njz 1b\nmov rsi, {BUF:#x}\nmov ecx, 2048\n'
+             f'2: cmp [rsi], rbx\njae 3f\ninc r9\n3: add rsi, 8\ndec ecx\njnz 2b\ninc r10\ncmp rbx, {R2}\njb 1b\nnop')
+    for block in (None, 1):
+        text = (f'body {CODE:#x} {c0.hex()}\nbody 0x110000 {c1.hex()}\nregion {BUF:#x} 0x4000\nmemory {FLAG:#x} {bytes(8).hex()}\nregion 0x3e0000 0x10000\n'
+                f'cpu\nrip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncpu\nrip 0x110000\nrflags 0x2\n{gprs({4: STACK - 0x8000})}\n')
+        out, err = go('tso', text, block)
+        problems = [f'driver: {err}'] if not out else []
+        if out:
+            c, peer = out['cpus']
+            stale, scans = int(peer['gpr'][9], 0), int(peer['gpr'][10], 0)
+            if c['stop'] != 'reached' or peer['stop'] != 'reached' or stale or scans < 10:
+                problems.append(f"stops {c['stop']} / {peer['stop']} stale quadwords {stale} scans {scans}")
+        record(f'tso-{block}', problems)
+    report['repbulk'] = {'runs': runs, 'failures': failures}
+    return failures
+
+
+def cr2(a, report):
+    """Perf chunk 26: MOV r64, CR2 at CPL 0 is translated inline (a load of the guest-state field the resident writes at every
+    entry into a CPL-0 block). Judged by the SDM (MOV from CR: Vol.2; CR2: Vol.3 2.5, 4.7, 7.15 #PF), natemu only, at block
+    sizes default and 1, CPL 0 with the program's own IDT (#PF, #DB):
+    - `value`: loads from two not-present pages fault; the #PF handler reads CR2 into RBX and R9 (REX.B), records both, skips
+      the 7-byte load and returns: each pair the faulting address.
+    - `nested`: the #PF handler reads CR2, touches a third not-present page (a nested #PF, whose handler only skips), reads
+      CR2 again: the outer fault's address, then the inner's.
+    - `mov-to-cr2`: MOV to CR2 of a value, then MOV r64, CR2 (in the next block, and after a JMP in a later one): that value.
+    - `tf`: under TF, MOV r64, CR2 (stepped, the resident's): the value, #DB after it.
+    - `cpl3`: a CPL-0 MOV to CR2, a switch to CPL 3, the guest-state page's CR2 field (the alias, readable there) read as 0,
+      then MOV r64, CR2: #GP(0) at it.
+    - `mod-cpl3`, `mod-cpl0` (review): MOV r64, CRn with mod other than 11 as a page's last three bytes, the next page not
+      mapped (the hardware ignores mod): #GP(0) at it at CPL 3; MOV RBP, CR2 then a fetch #PF at the next page at CPL 0.
+    - `cr3` (review): MOV r64, CR3 at CPL 0 reads CR3, not CR2.
+    - `smp` (review): two vCPUs take 20,000 #PFs each at their own address through one IDT; the handler's inline CR2 always
+      equals its own vCPU's address."""
+    asm, failures, runs = ref.assemble, [], []
+    TABLES, IDTR, LOG, P = 0x300000, 0x300800, 0x300900, 0x500000
+    def record(tag, problems):
+        runs.append({'case': tag, 'ok': not problems, 'problems': problems})
+        print(json.dumps(runs[-1]), flush=True)
+        if problems: failures.append(f'cr2 {tag}: {problems}')
+    def program(body, handlers, extra=''):
+        code, lab = asm('lidt [0x300800]\n' + body + '\njmp done\n' + handlers + 'done: nop', labels=True)
+        gates = bytearray(16 * 16)
+        for v in (1, 14):
+            h = CODE + lab.get(f'h{v}', lab['h14'])
+            gates[16 * v:16 * v + 16] = (h & 0xffff | 0x08 << 16 | 0x8e << 40 | (h >> 16 & 0xffff) << 48).to_bytes(8, 'little') + (h >> 32).to_bytes(8, 'little')
+        tables = bytes(gates) + bytes(IDTR - TABLES - len(gates)) + (16 * 16 - 1).to_bytes(2, 'little') + TABLES.to_bytes(8, 'little')
+        tables += bytes(LOG + 0x100 - TABLES - len(tables))
+        return (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nif 0\nmemory {TABLES:#x} {tables.hex()}\n'
+                f'region 0x3e0000 0x10000\nmemory {P:#x} {bytes(0x4000).hex()}\nunmap {P + 0x1000:#x}\nunmap {P + 0x2000:#x}\nunmap {P + 0x3000:#x}\n{extra}'), lab
+    def logged(out, n):
+        memory = out['memory'] if 'memory' in out else out['cpus'][0]['memory']
+        return [next((int.from_bytes(bytes.fromhex(m['data'])[LOG + 8 * k - int(m['addr'], 0):][:8], 'little') for m in memory
+                      if int(m['addr'], 0) <= LOG + 8 * k < int(m['addr'], 0) + len(m['data']) // 2), None) for k in range(n)]
+    # #PF: the log index in [LOG]; each entry two quadwords (CR2 by RBX, by R9); skip the 7-byte `mov rax, [abs32]`.
+    h14 = ('h14:\npush rbx\npush r9\npush rcx\nmov rcx, [0x300900]\nmov rbx, cr2\nmov r9, cr2\nmov [0x300908 + rcx * 8], rbx\n'
+           'mov [0x300910 + rcx * 8], r9\nadd qword ptr [0x300900], 2\npop rcx\npop r9\npop rbx\nadd qword ptr [rsp + 8], 8\nadd rsp, 8\niretq\n')
+    for block in (None, 1):
+        extra = [block] if block else []
+        def go(name, text, n, want, stop='reached'):
+            _, out, err = driver(a, text, a.out / 'cr2' / f'{name}-{block}', extra)
+            problems = [f'driver: {err}'] if not out else []
+            if out:
+                got = logged(out, n)
+                if out['stop'] != stop or got != want:
+                    problems.append(f"stop {out['stop']} {out.get('reason')} fault {out.get('fault')} log {[hex(x or 0) for x in got]}, want {[hex(x) for x in want]}")
+            record(f'{name}-{block}', problems)
+            return out
+        # The handler pops the error code by `add rsp, 8` after fixing RIP at [rsp + 8] (RIP sits above the error code).
+        text, lab = program(f'mov rax, qword ptr [{P + 0x1123:#x}]\nmov rax, qword ptr [{P + 0x2ff8:#x}]', h14)
+        go('value', text, 5, [4, P + 0x1123, P + 0x1123, P + 0x2ff8, P + 0x2ff8])
+        nested = ('h14:\npush rbx\ncmp qword ptr [0x300900], 0\njne 1f\ninc qword ptr [0x300900]\nmov rbx, cr2\nmov [0x300908], rbx\n'
+                  f'mov rbx, qword ptr [{P + 0x3010:#x}]\nmov rbx, cr2\nmov [0x300910], rbx\njmp 2f\n1: inc qword ptr [0x300918]\n'
+                  '2: pop rbx\nadd qword ptr [rsp + 8], 8\nadd rsp, 8\niretq\n')
+        text, lab = program(f'mov rax, qword ptr [{P + 0x1040:#x}]', nested)
+        go('nested', text, 4, [1, P + 0x1040, P + 0x3010, 1])
+        text, lab = program('mov rax, 0x123456789abc\nmov cr2, rax\nmov rbx, cr2\nmov [0x300900], rbx\njmp 1f\n1: mov r10, cr2\nmov [0x300908], r10', h14)
+        go('mov-to-cr2', text, 2, [0x123456789abc, 0x123456789abc])
+        h1 = 'h1:\ninc qword ptr [0x300910]\niretq\n'
+        text, lab = program('mov rax, 0xfedc000\nmov cr2, rax\npushfq\nor qword ptr [rsp], 0x100\npopfq\nmov rbx, cr2\npushfq\nand qword ptr [rsp], -0x101\npopfq\n'
+                            'mov [0x300900], rbx', h1 + h14)
+        go('tf', text, 3, [0xfedc000, 0, 4])   # #DB after the MOV, the PUSHFQ, the AND, the POPFQ (TF cleared by it)
+        # CPL 3: the alias's CR2 field reads 0, then MOV r64, CR2 is #GP(0).
+        code, lab = asm(f'mov rax, 0xabc000\nmov cr2, rax\nsw: nop\nmov rdx, {GUEST_STATE_VA + 0xa8:#x}\nmov rbx, qword ptr [rdx]\nx: mov rcx, cr2\nnop', labels=True)
+        text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nswitch {CODE + lab["sw"]:#x} 3\nregion 0x3e0000 0x10000\n')
+        _, out, err = driver(a, text, a.out / 'cr2' / f'cpl3-{block}', extra)
+        problems = [f'driver: {err}'] if not out else []
+        if out:
+            g = [int(x, 0) for x in out['gpr']]
+            if out['stop'] != 'guest_fault' or int(out['fault'][0], 0) != 13 or int(out['rip'], 0) != CODE + lab['x'] or g[3] != 0 or g[1] != 0:
+                problems.append(f"stop {out['stop']} {out.get('reason')} fault {out.get('fault')} rip {out.get('rip')} rbx {g[3]:#x} rcx {g[1]:#x}")
+        record(f'cpl3-{block}', problems)
+    # Review: MOV r64, CRn with mod other than 11 (the hardware ignores mod: three bytes) as the last bytes of a page whose
+    # successor is not mapped: at CPL 3 #GP(0) at it (not a fetch #PF); at CPL 0 `0f 20 15` is MOV RBP, CR2, then the fetch of
+    # the next page faults. And MOV r64, CR3 at CPL 0 reads CR3 (never CR2).
+    END = 0x1ffffd
+    for block in (None, 1):
+        extra = [block] if block else []
+        _, out, err = driver(a, f'rip {END:#x}\nrflags 0x2\n{gprs({})}\nbody {END:#x} 0f2005\nregion 0x3e0000 0x10000\n', a.out / 'cr2' / f'mod-cpl3-{block}', extra)
+        ok = out and out['stop'] == 'guest_fault' and [int(x, 0) for x in out['fault']][0] == 13 and int(out['rip'], 0) == END
+        record(f'mod-cpl3-{block}', [] if ok else [f"driver: {err}" if not out else f"stop {out['stop']} {out.get('reason')} fault {out.get('fault')} rip {out.get('rip')}"])
+        code = asm(f'mov rax, 0x5555000\nmov cr2, rax\nmov eax, {END:#x}\njmp rax')
+        _, out, err = driver(a, f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nbody {END:#x} 0f2015\ncpl 0\nregion 0x3e0000 0x10000\n',
+                             a.out / 'cr2' / f'mod-cpl0-{block}', extra)
+        ok = out and out['stop'] == 'guest_fault' and [int(x, 0) for x in out['fault']][:2] == [14, END + 3] and int(out['gpr'][5], 0) == 0x5555000
+        record(f'mod-cpl0-{block}', [] if ok else [f"driver: {err}" if not out else f"stop {out['stop']} {out.get('reason')} fault {out.get('fault')} rbp {out['gpr'][5]}"])
+        code = asm('mov rax, 0x777000\nmov cr2, rax\nmov rbx, cr3\nmov rcx, cr2\nnop')
+        _, out, err = driver(a, f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nregion 0x3e0000 0x10000\n', a.out / 'cr2' / f'cr3-{block}', extra)
+        ok = out and out['stop'] == 'reached' and int(out['gpr'][3], 0) not in (0, 0x777000) and int(out['gpr'][3], 0) & 0xfff == 0 and int(out['gpr'][1], 0) == 0x777000
+        record(f'cr3-{block}', [] if ok else [f"driver: {err}" if not out else f"stop {out['stop']} {out.get('reason')} rbx (CR3) {out['gpr'][3]} rcx (CR2) {out['gpr'][1]}"])
+    # Review: CR2 per vCPU: two vCPUs fault 20,000 times each on their own not-present address (R12) through one IDT; the
+    # handler compares CR2 (read inline) with R12 and counts mismatches at [R13].
+    hs = ('h14:\npush rbx\nmov rbx, cr2\ncmp rbx, r12\nje 2f\ninc qword ptr [r13]\n2: inc qword ptr [r13 + 8]\npop rbx\n'
+          'add qword ptr [rsp + 8], 4\nadd rsp, 8\niretq\n')
+    for block in (None, 1):
+        code, lab = asm('lidt [0x300800]\nmov r15d, 20000\n1: mov rax, qword ptr [r12]\ndec r15\njnz 1b\njmp done\n' + hs + 'done: nop', labels=True)
+        h = CODE + lab['h14']
+        gates = bytearray(16 * 16)
+        gates[16 * 14:16 * 15] = (h & 0xffff | 0x08 << 16 | 0x8e << 40 | (h >> 16 & 0xffff) << 48).to_bytes(8, 'little') + (h >> 32).to_bytes(8, 'little')
+        tables = bytes(gates) + bytes(IDTR - TABLES - len(gates)) + (16 * 16 - 1).to_bytes(2, 'little') + TABLES.to_bytes(8, 'little')
+        tables += bytes(LOG + 0x100 - TABLES - len(tables))
+        text = (f'body {CODE:#x} {code.hex()}\nmemory {TABLES:#x} {tables.hex()}\nregion 0x3e0000 0x10000\nmemory {P:#x} {bytes(0x4000).hex()}\n'
+                f'unmap {P + 0x1000:#x}\nunmap {P + 0x2000:#x}\n'
+                f'cpu\nrip {CODE:#x}\nrflags 0x2\n{gprs({12: P + 0x1100, 13: LOG})}\ncpl 0\nif 0\n'
+                f'cpu\nrip {CODE:#x}\nrflags 0x2\n{gprs({12: P + 0x2208, 13: LOG + 0x40, 4: STACK - 0x8000})}\ncpl 0\nif 0\n')
+        _, out, err = driver(a, text, a.out / 'cr2' / f'smp-{block}', [block] if block else [])
+        problems = [f'driver: {err}'] if not out else []
+        if out:
+            got = [(m, n) for m, n in (logged(out, 10)[0:2], logged(out, 10)[8:10])]
+            if any(c['stop'] != 'reached' for c in out['cpus']) or got != [(0, 20000), (0, 20000)]:
+                problems.append(f"stops {[c['stop'] for c in out['cpus']]} (mismatches, faults) per vCPU {got}")
+        record(f'smp-{block}', problems)
+    report['cr2'] = {'runs': runs, 'failures': failures}
+    return failures
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
-    ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc', 'swapgs', 'sysfast', 'stifirst', 'stmxcsr'])
+    ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc', 'swapgs', 'sysfast', 'stifirst', 'stmxcsr', 'repbulk', 'cr2'])
     ap.add_argument('--n', type=int, default=100_000)
     ap.add_argument('--reps', type=int, default=3)
+    ap.add_argument('--cost-rows', type=lambda s: s.split(','), default=None, help='cost: only these rows')
     ap.add_argument('--xmc-rewrites', type=int, default=2000, help='xmc: rewrites, each checked (one per XMC_K or more iterations of vCPU 0)')
     ap.add_argument('--host', type=pathlib.Path, help='the host binary, or the directory holding it (keeps its name out of the command line)')
     ap.add_argument('--runtime', type=pathlib.Path)
@@ -1292,6 +1687,8 @@ def main():
     if 'sysfast' in a.only: failures += sysfast(a, report)
     if 'stifirst' in a.only: failures += stifirst(a, report)
     if 'stmxcsr' in a.only: failures += stmxcsr(a, report)
+    if 'repbulk' in a.only: failures += repbulk(a, report)
+    if 'cr2' in a.only: failures += cr2(a, report)
     (a.out / 'k2.json').write_text(json.dumps(report, indent=1) + '\n')
     for f in failures: print('FAIL', f)
     sys.exit(1 if failures else 0)

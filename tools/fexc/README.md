@@ -36,7 +36,13 @@ The fork is the source of truth for the patches (November 4: moved from `tools/f
 `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series57-fork`, has the same `obj/fexc` SHA-256 as series56-setup-r1
 (`a81a2f24...1fd8`); an installer N = 1 stream of 126,017 requests replayed through both gave no difference.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series61-chunk25-r1` (November 5, perf plan "Measured
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series64-chunk26-r1` (November 5, perf plan "Measured
+(chunk 26)", after its review): the fork clone's local branch `natemu-chunk26` at 0430dc8a6 (on `natemu` ab62c7e06: REP STOS in
+bulk inside a page with `--bulk`, `FexcRepStos`, only while IA32_MISC_ENABLE's fast-string bit is set; MOV r64, CR2 inline
+under `--cpl0`, `FexcMovFromCROp`, 0f 20's ModRM decoded register-only) and this tree's shim; `obj/fexc` SHA-256
+`71c8349f5258352c01246ebfda3eb9d535192870a74c559df433f353e505ba6c`. (Before the review: `series63-cr2`, FEX 57323cdd3,
+SHA-256 `f2b735938d23d8fdc71cbdafdb6d85b4a77dbfee378152cecd537425f3f34f9e`.)
+Before it, `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series61-chunk25-r1` (November 5, perf plan "Measured
 (chunk 25)"): the fork's `natemu` branch at ab62c7e06 (an inline STI may start its block; STMXCSR/VSTMXCSR stored inline
 by `FexcMxcsr`) and this tree's shim; `obj/fexc` SHA-256 `c906217071ee7258d832d10a90706c2e0497f02e1637e77c7f044cf50bb43906`.
 Before it, `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series58-channel-r1` (November 4, perf plan "Measured

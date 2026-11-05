@@ -15,6 +15,9 @@ inline bool GuestMemOp(FEXCore::IR::IROps Op) {
   switch (Op) {
   case OP_LOADMEM: case OP_LOADMEMTSO: case OP_STOREMEM: case OP_STOREMEMTSO: case OP_LOADMEMPAIR: case OP_STOREMEMPAIR:
   case OP_PUSH: case OP_PUSHTWO: case OP_POP: case OP_POPTWO: case OP_ATOMICSWAP: return true;
+  // Perf chunk 26: a bulk REP STOS's stores (a site); it also writes RCX's and RDI's static registers itself, so as for every
+  // access no value is coalesced into a static register across it, and the incoming flags stay live there.
+  case OP_FEXCREPSTOS: return true;
   // LOCK read-modify-writes (I3)
   case OP_ATOMICFETCHADD: case OP_ATOMICFETCHSUB: case OP_ATOMICFETCHAND: case OP_ATOMICFETCHCLR: case OP_ATOMICFETCHOR:
   case OP_ATOMICFETCHXOR: case OP_ATOMICFETCHNEG: case OP_CAS: case OP_CASPAIR: return true;

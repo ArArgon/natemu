@@ -640,6 +640,10 @@ pub mod frame {
     /// be taken were IF set (written at every entry into generated code, every resume and after every doorbell). An inline STI
     /// reads it and, when set, exits to its own RIP so the resident runs the STI (its shadow and the delivery after it).
     pub const EVENT_PENDING: u32 = FLAGS + 22;
+    /// Perf chunk 26: a byte of FEX's flag array FEX's code never uses (flags[23]), the resident's: IA32_MISC_ENABLE's
+    /// fast-string bit (bit 0), written at every entry. A bulk REP STOS reads it and stores element by element while it is 0
+    /// (SDM Vol.1 7.3.9.3: fast-string operation, which groups iterations, only with that bit set).
+    pub const FAST_STRINGS: u32 = FLAGS + 23;
     /// Perf chunk 15: the vCPU's TSC offset (its TSC MSR slot, `runtime::tsc`), 8 bytes in FEX's `_pad1` (no FEX code uses
     /// it), written by the resident at every entry; a CPL-0 translation's inline RDTSC adds it to the scaled count.
     pub const TSC_OFFSET: u32 = 0xb8;
@@ -654,6 +658,11 @@ pub mod frame {
     /// translation's inline SWAPGS exchanges it with [`GS_BASE`] (admission allows those loads and stores only in a CPL-0
     /// block, with the code shape only inside a SWAPGS), and the resident banks both after every CPL-0 exit and fault.
     pub const KERNEL_GS_BASE: u32 = 0xa0;
+    /// Perf chunk 26: CR2 while a CPL-0 block runs, 8 bytes in FEX's `L1Mask` (no generated code uses it), written by the
+    /// resident at every entry (0 at CPL > 0, so CPL 3 never finds the kernel's value there) and never read back: CR2 changes
+    /// only in the resident (a #PF delivery, MOV to CR2), each followed by an entry. A CPL-0 translation's inline MOV r64, CR2
+    /// loads it (admission allows that load only in a CPL-0 block, with the code shape only inside that instruction).
+    pub const CR2: u32 = 0xa8;
     /// Perf chunk 25: MXCSR at the block's entry (the bank's: its controls and the exception flags banked so far), 4 bytes in
     /// FEX's `CPUState::mxcsr` (no generated code but STMXCSR's reads it), written by the resident at every entry and never read
     /// back. A translated STMXCSR/VSTMXCSR stores it with the flags FPSR and [`SIMD_FLAGS`] gathered since, as the bank would.
@@ -694,8 +703,9 @@ pub mod frame {
     /// Guest-state fields `(offset, bytes)` admitted code may read through x28: the segment bases, the RFLAGS bytes
     /// above, the x87 state (I6) and the YMM upper halves (I8). MXCSR is the bank's (perf chunk 25: its entry value readable,
     /// [`MXCSR`]). Every other x28 access is refused.
-    pub const GUEST_STATE: [(u32, u32); 17] = [
+    pub const GUEST_STATE: [(u32, u32); 18] = [
         (TSC_OFFSET, 8), (AVX_HIGH, 256), (MXCSR, 4), (GS_BASE, 8), (FS_BASE, 8), (FLAGS + 8, 3), (FLAGS + 12, 1), (FLAGS + 14, 1), (FLAGS + 16, 6), (EVENT_PENDING, 1),
+        (FAST_STRINGS, 1),
         (X87_IE, 1), (SIMD_FLAGS, 2), (X87_PE, 2), (X87_C0, 4), (X87_C3, 1), (X87_MM, 128), (X87_FCW, 8),
     ];
     /// The fields admitted code may also write: DF, the x87 state but FCW, and the YMM upper halves. TF, IOPL, NT, AC, VIF,
@@ -2369,6 +2379,9 @@ mod tests {
         // in neither list (admission allows it only in a CPL-0 block's SWAPGS), 8-aligned for one `ldr`/`str`.
         assert_eq!((frame::KERNEL_GS_BASE, frame::KERNEL_GS_BASE % 8), (0x18 + 8 + 16 * 8, 0));
         assert!((frame::KERNEL_GS_BASE..frame::KERNEL_GS_BASE + 8).all(|b| !inside(&frame::GUEST_STATE, b)));
+        // Perf chunk 26: CR2 in FEX's `L1Mask`, right after it, likewise in neither list (only a CPL-0 MOV r64, CR2 loads it).
+        assert_eq!(frame::CR2, frame::KERNEL_GS_BASE + 8);
+        assert!((frame::CR2..frame::CR2 + 8).all(|b| !inside(&frame::GUEST_STATE, b) && !inside(&frame::GUEST_STATE_WRITABLE, b)));
     }
 
     /// I6: x87 arithmetic runs under MXCSR's FPCR when FCW.RC equals MXCSR.RC and neither FTZ nor DAZ is set, else under its own.

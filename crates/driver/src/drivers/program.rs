@@ -1533,11 +1533,11 @@ fn kick_report(area: Area, stops: &execution::Stops) -> String {
 
 /// The FEX frame holds nothing outside its guest-state fields (guest code cannot have written private memory there; I8:
 /// YMM_Hi128 is one of them; perf chunk 17: IA32_KERNEL_GS_BASE's field, which the resident writes at every entry and only a
-/// CPL-0 block's SWAPGS may access).
+/// CPL-0 block's SWAPGS may access; perf chunk 26: CR2's, likewise written at every entry, loaded only by a CPL-0 MOV r64, CR2).
 fn frame_intact(area: Area) -> bool {
     let frame: [u8; exec::frame::BYTES] = area.read_record(exec::FRAME_OFFSET);
-    let kernel_gs = exec::frame::KERNEL_GS_BASE as usize..exec::frame::KERNEL_GS_BASE as usize + 8;
-    let admitted = |i: usize| kernel_gs.contains(&i) || exec::frame::GUEST_STATE.iter().any(|&(at, len)| (at as usize..(at + len) as usize).contains(&i));
+    let field = |at: u32| at as usize..at as usize + 8;
+    let admitted = |i: usize| field(exec::frame::KERNEL_GS_BASE).contains(&i) || field(exec::frame::CR2).contains(&i) || exec::frame::GUEST_STATE.iter().any(|&(at, len)| (at as usize..(at + len) as usize).contains(&i));
     frame.iter().enumerate().all(|(i, &b)| b == 0 || admitted(i))
 }
 

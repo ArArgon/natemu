@@ -144,6 +144,8 @@ pub(crate) struct Admitted {
     /// Perf chunk 25: its first instruction is a translated STI ([`interrupt_flag`]): the resident runs that STI itself
     /// where the block's slow path would exit to the block's own start, and never links that exit.
     pub sti_first: bool,
+    /// Perf chunk 26: it holds a bulk REP STOS loop (fexc's `--bulk`; the host refuses one it did not ask for).
+    pub bulk: bool,
     /// The guest offset of its last instruction (the performance log reads it for a call's return site).
     pub last: u32,
 }
@@ -220,11 +222,11 @@ pub(crate) fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64, shape
         shape,
         cpl0,
     };
-    let (links, dispatch_exit) = structure::check(&c).map_err(|e| format!("object refused: {e}"))?;
+    let (links, dispatch_exit, bulk) = structure::check(&c).map_err(|e| format!("object refused: {e}"))?;
     if links.len() > MAX_LINK_POINTS {
         return Err(format!("object refused: {} literal exits, at most {MAX_LINK_POINTS}", links.len()));
     }
-    (admitted.links, admitted.dispatch_exit) = (links, dispatch_exit);
+    (admitted.links, admitted.dispatch_exit, admitted.bulk) = (links, dispatch_exit, bulk);
     Ok(admitted)
 }
 
@@ -424,7 +426,7 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64, cpl0: bo
         }
     }
     let admitted =
-        Admitted { object: out, guest_bytes: h.guest_bytes, guest_insns: h.guest_insns, end_reason: h.end_reason, links: Vec::new(), dispatch_exit: None, rep_self: None, sti_first: false, last: last as u32 };
+        Admitted { object: out, guest_bytes: h.guest_bytes, guest_insns: h.guest_insns, end_reason: h.end_reason, links: Vec::new(), dispatch_exit: None, rep_self: None, sti_first: false, bulk: false, last: last as u32 };
     let tail = &source[last..h.guest_bytes as usize];
     let own = (rep_string(tail) || lock_neg(tail)).then_some(rip.wrapping_add(last as u64));
     let admitted = Admitted { rep_self: own.filter(|_| rep_string(tail)), ..admitted };

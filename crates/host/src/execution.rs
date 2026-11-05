@@ -942,7 +942,7 @@ impl Answer {
     }
 }
 /// The number of fexc's gating arguments (`FEXC_ARG_*`, [`Compiler::gating`]).
-const GATING: usize = 10;
+const GATING: usize = 11;
 /// The memory cache's key (perf chunk 4): the block limit, the RIP's half (bit 63) and page offset, and the first bytes the
 /// answer read (at most [`LEAD`], with their count): an answer is found at every RIP of that half and offset. As words
 /// ([`Universal`]); no limit is `1 << 32`.
@@ -1224,6 +1224,11 @@ pub struct Compiler {
     /// Perf chunk 15: a CPL-0 translate request on a host whose counter runs at 24 MHz ([`crate::clock::frequency`], fexc's
     /// `--tsc`): RDTSC is translated inline with the resident's formula for that rate.
     pub(crate) tsc: bool,
+    /// Perf chunk 26: a translate request (never a step) without alignment checking or a data breakpoint (`alignment_gated`
+    /// off, which is part of `Cpu::code_context`): fexc's `--bulk`, under which REP STOS stores the part of its string inside
+    /// RDI's page in bulk (each store a site at an iteration boundary). A step runs one element: TF traps after each
+    /// iteration, and the watchpoint, UC and code-write paths step the element that met them.
+    pub(crate) bulk: bool,
     /// The performance log's record of this vCPU (`perf::on`; [`Compiler::finish`]).
     pub perf: Option<Box<crate::perf::Recorder>>,
     /// The last compile's answer: how many guest bytes it read (fexc's extent, at most the bytes given), and whether a
@@ -1294,7 +1299,7 @@ impl Compiler {
         Self { fexc: fexc.into(), server: None, supported, max_instructions, answers: Answers::new(supported), vcpu: 0, disk: None, compiles: 0, hits: 0, disk_hits: 0,
                hits_by_source: [0; cache::MAX_VCPUS], duplicates: 0, lock_wait: (0, 0),
                relocated: 0, relocation_refused: 0, relocation_fallbacks: 0, reuse_checks: 0, check_reuse: false,
-               deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![], cpl0: false, tsc: false, perf: None, read: 0, halved: false }
+               deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![], cpl0: false, tsc: false, bulk: false, perf: None, read: 0, halved: false }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
     /// `rip` the resident executes, or fexc's end reason when it produced no code.
@@ -1321,7 +1326,7 @@ impl Compiler {
         }
     }
     /// The gating arguments' values, in fexc's `FEXC_ARG_*` order: SSE, AVX, alignment, x87, WAIT, x87 FPCR, (I5c) the
-    /// unmasked SIMD and x87 exceptions, and (perf chunk 15) CPL 0 and the inline TSC.
+    /// unmasked SIMD and x87 exceptions, (perf chunk 15) CPL 0 and the inline TSC, and (perf chunk 26) bulk REP STOS.
     fn gating(&self) -> [u64; GATING] {
         let flag = |a: &str| u64::from(self.x87.iter().any(|x| x == a));
         let value = |a: &str| {
@@ -1329,7 +1334,7 @@ impl Compiler {
             v.and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0)
         };
         [self.sse_gated.into(), self.avx_gated.into(), self.alignment_gated.into(), flag("--x87-gated"), flag("--wait-gated"),
-         value("--x87-fpcr"), value("--simd-unmasked"), value("--x87-unmasked"), self.cpl0.into(), self.tsc.into()]
+         value("--x87-fpcr"), value("--simd-unmasked"), value("--x87-unmasked"), self.cpl0.into(), self.tsc.into(), self.bulk.into()]
     }
     /// [`Compiler::compile`] with an instruction limit; `Err((n, why))`: the object must be translated again with fewer
     /// than its n guest instructions ([`admission::retry`]).
@@ -1453,6 +1458,10 @@ impl Compiler {
                 None => {
                     #[cfg_attr(not(feature = "testing"), allow(unused_mut))]
                     let mut admitted = admission::admit(object, rip, bytes, self.supported, self.shape, self.cpl0)?;
+                    // Perf chunk 26: a bulk REP STOS only where asked for (never a step: TF traps after each iteration).
+                    if admitted.bulk && !self.bulk {
+                        return Err(format!("object refused: a bulk REP STOS loop in a request without --bulk at {rip:#x}").into());
+                    }
                     #[cfg(feature = "testing")]
                     hook.admitted(&mut admitted.object);
                     Ok(Code::Block(admitted))
@@ -1526,6 +1535,9 @@ impl Compiler {
         }
         if self.tsc {
             args.push("--tsc".into());
+        }
+        if self.bulk {
+            args.push("--bulk".into());
         }
         let args: Vec<u8> = args.iter().flat_map(|a| a.bytes().chain([0])).collect();
         let mut body = (args.len() as u32).to_le_bytes().to_vec();
@@ -2007,6 +2019,7 @@ fn translation(
         compiler.alignment_gated = state.cpu.bit_tests_cut() && !(step && state.plain_step != 0);
         compiler.cpl0 = state.cpu.cpl == 0 && !step;
         compiler.tsc = compiler.cpl0 && crate::clock::frequency() == 24_000_000;
+        compiler.bulk = !step && !compiler.alignment_gated;
         let code = compiler.compile(&bytes, rip, step, hook)?;
         match &code {
             // The instruction at RIP runs past a breakpoint the bytes were cut at.
@@ -2133,7 +2146,7 @@ mod tests {
     fn shared_answers_keep_colliding_keys_apart() {
         let a = Answers::new(u64::MAX);
         let g = [0; GATING];
-        let sse = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let sse = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         a.insert(None, entry(0x1100, 0, &[1, 2, 3, 4, 5], 0, g), &[1, 2, 3, 4, 5], 0x1100);
         a.insert(None, entry(0x2100, 1, &[1, 2, 3, 4, 6], 0, g), &[1, 2, 3, 4, 6], 0x2100);
         a.insert(None, entry(0x3100, 2, &[1, 2, 3, 4, 7], 1, sse), &[1, 2, 3, 4, 7], 0x3100); // read SSE gating 1
@@ -2328,6 +2341,55 @@ mod tests {
     /// `sti_first`); a prefix, a following system
     /// instruction, REP string or LOCK NEG keeps it the resident's; a CPL-3 request cuts both, and never reuses a CPL-0
     /// answer that read the flag; admission refuses the inline forms outside a CPL-0 block.
+    /// Perf chunk 26: `--bulk` gives REP STOS (64-bit addressing) its bulk loop and nothing else changes; without it no loop;
+    /// the answer is keyed by the flag (fexc reads it only for such a REP STOS), and a bulk object admitted for a request
+    /// without the flag (a step, or under alignment gating) is refused.
+    /// Perf chunk 26: MOV r64, CR2 of a CPL-0 request is translated (a load of CR2's guest-state field, also into R9 by REX.B);
+    /// with REX.R (CR10), another control register, a 66 prefix, or at CPL 3 it stays the resident's; admission refuses the
+    /// field's load in an object admitted as a CPL-3 request's.
+    #[test]
+    fn cpl0_translates_mov_from_cr2() {
+        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        (c.shape, c.cpl0) = (true, true);
+        let compile = |c: &mut super::Compiler, code: &[u8]| c.compile(code, 0x1000, false, &mut ()).unwrap();
+        for code in [&[0x0f, 0x20, 0xd0, 0xc3][..], &[0x41, 0x0f, 0x20, 0xd1, 0xc3], &[0x48, 0x0f, 0x20, 0xd0, 0xc3]] {
+            assert!(matches!(compile(&mut c, code), Code::Block(b) if b.guest_insns == 2), "{code:02x?}");
+        }
+        for code in [&[0x44, 0x0f, 0x20, 0xd0, 0xc3][..], &[0x0f, 0x20, 0xd8, 0xc3], &[0x66, 0x0f, 0x20, 0xd0, 0xc3]] {
+            assert!(matches!(compile(&mut c, code), Code::System(_)), "{code:02x?}");
+        }
+        let code = [0x0f, 0x20, 0xd0, 0xc3];
+        let Answer::Object(o) = c.answers.find(&code, 0x1000, None, &c.gating()).0.unwrap().answer.clone() else { panic!() };
+        assert!(admission::admit(&o, 0x1000, &code, u64::MAX, true, true).is_ok());
+        assert!(admission::admit(&o, 0x1000, &code, u64::MAX, false, false).err().unwrap().contains("frame access"));
+        c.cpl0 = false;
+        assert!(matches!(compile(&mut c, &code), Code::System(_)));
+    }
+
+    #[test]
+    fn bulk_rep_stos_only_when_asked() {
+        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        c.shape = true;
+        let block = |c: &mut super::Compiler, code: &[u8]| match c.compile(code, 0x1000, false, &mut ()).unwrap() {
+            Code::Block(b) => b,
+            _ => panic!("{code:02x?}"),
+        };
+        let stos = [0xf3, 0x48, 0xab];
+        c.bulk = true;
+        assert!(block(&mut c, &stos).bulk && block(&mut c, &[0x66, 0xf3, 0xab]).bulk && block(&mut c, &[0xf3, 0xaa]).bulk);
+        // 0x67 (EDI/ECX), MOVS, and other code: no loop.
+        for code in [&[0x67, 0xf3, 0x48, 0xab][..], &[0xf3, 0x48, 0xa5], &[0x48, 0xab, 0xc3], &[0x90, 0xc3]] {
+            assert!(!block(&mut c, code).bulk, "{code:02x?}");
+        }
+        let Answer::Object(o) = c.answers.find(&stos, 0x1000, None, &c.gating()).0.unwrap().answer.clone() else { panic!() };
+        c.bulk = false;
+        assert!(!block(&mut c, &stos).bulk);
+        let e = c.answered(&Answer::Object(o), &stos, 0x1000, &mut ()).err().unwrap();
+        assert!(e.contains("--bulk"), "{e}");
+    }
+
     #[test]
     fn cpl0_translates_cli_and_sti_inline() {
         let Some(fexc) = std::env::var_os("FEXC") else { return };

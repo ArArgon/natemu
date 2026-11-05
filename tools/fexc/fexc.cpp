@@ -370,7 +370,7 @@ static void ResetGlobals() {
   fexc_sites.clear(); fexc_insns.clear(); fexc_cf_inverted.clear(); fexc_spill_bytes = 0; fexc_cut = {}; fexc_after_rep = 0;
   fexc_rip_relative.clear(); fexc_target_check.clear(); fexc_div_width.clear(); fexc_movs.clear(); fexc_lock_cas.clear();
   fexc_align16.clear(); fexc_align32.clear(); fexc_avx_gated = false; fexc_sse_gated = false; fexc_alignment_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear(); fexc_mmio.clear();
-  fexc_x87_gated = false; fexc_wait_gated = false; fexc_cpl0 = false; fexc_tsc = false; fexc_x87_fpcr = 0; fexc_x87.clear();
+  fexc_x87_gated = false; fexc_wait_gated = false; fexc_cpl0 = false; fexc_tsc = false; fexc_bulk = false; fexc_x87_fpcr = 0; fexc_x87.clear();
   fexc_simd_unmasked = 0; fexc_x87_unmasked = 0; fexc_x87_waiting.clear(); fexc_x87_store.clear(); fexc_x87_length.clear(); fexc_simd_checked.clear(); fexc_x87_extra.clear();
   fexc_args_read = 0; Extent = 0;
 }
@@ -392,7 +392,7 @@ struct Setup {
   std::vector<std::pair<std::string, bool>> overrides;
   std::vector<std::pair<std::string, std::string>> configs;   // --config NAME=VALUE, applied after fexc's own Config::Set calls
   // The gating arguments (shim FexcArg values; Arm sets them for each request).
-  bool sse_gated = false, avx_gated = false, alignment_gated = false, x87_gated = false, wait_gated = false, cpl0 = false, tsc = false;
+  bool sse_gated = false, avx_gated = false, alignment_gated = false, x87_gated = false, wait_gated = false, cpl0 = false, tsc = false, bulk = false;
   uint64_t x87_fpcr = 0, simd_unmasked = 0, x87_unmasked = 0;
   std::vector<std::pair<Config::ConfigOption, std::string>> sets;   // the Config values (ParseArgs)
   // Configure:
@@ -428,6 +428,7 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
     else if (a == "--alignment-gated") s.alignment_gated = true;   // slice1 (X2): alignment checking on: BT* memory forms are system cuts
     else if (a == "--x87-gated") s.x87_gated = true;   // slice1 (I6): CR0.EM or CR0.TS: x87 forms are system cuts (#NM)
     else if (a == "--cpl0") s.cpl0 = true;             // slice1 (perf chunk 15): a CPL-0 request: CLI/STI inline (Cut)
+    else if (a == "--bulk") s.bulk = true;             // slice1 (perf chunk 26): not a step, no alignment gating: bulk REP STOS
     else if (a == "--tsc") s.tsc = true;               // slice1 (perf chunk 15): CPL 0, a 24 MHz counter: RDTSC inline
     else if (a == "--wait-gated") s.wait_gated = true; // slice1 (I6): CR0.TS and CR0.MP: WAIT/FWAIT is a system cut (#NM)
     else if (a == "--x87-fpcr") s.x87_fpcr = strtoull(next(), nullptr, 0);   // slice1 (I6): FPCR of x87 arithmetic when MXCSR's differs
@@ -440,7 +441,7 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
     else return Fail("unknown argument " + a);
   }
   if (!missing.empty()) return Fail(missing + " needs a value");
-  if (!s.have_rip || (!serve && s.hex.empty() == s.file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--avx-gated] [--alignment-gated] [--x87-gated] [--wait-gated] [--cpl0] [--tsc] [--x87-fpcr V] [--simd-unmasked M] [--x87-unmasked M] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
+  if (!s.have_rip || (!serve && s.hex.empty() == s.file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--avx-gated] [--alignment-gated] [--x87-gated] [--wait-gated] [--cpl0] [--tsc] [--bulk] [--x87-fpcr V] [--simd-unmasked M] [--x87-unmasked M] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
   if (s.bitness != 32 && s.bitness != 64) return Fail("--bitness must be 32 or 64");
   s.slice1 = st.profile == "slice1";
   if (s.slice1 && s.bitness != 64) return Fail("profile slice1 is 64-bit only");
@@ -475,7 +476,7 @@ static int CheckWindow(uint64_t rip, uint64_t bitness, size_t size) {
 // handlers. Set for every request (ResetGlobals clears the gating arguments).
 static void Arm(const Setup& s) {
   fexc_sse_gated = s.sse_gated; fexc_avx_gated = s.avx_gated; fexc_alignment_gated = s.alignment_gated; fexc_x87_gated = s.x87_gated;
-  fexc_cpl0 = s.cpl0; fexc_tsc = s.tsc; fexc_wait_gated = s.wait_gated; fexc_x87_fpcr = s.x87_fpcr; fexc_simd_unmasked = s.simd_unmasked;
+  fexc_cpl0 = s.cpl0; fexc_tsc = s.tsc; fexc_bulk = s.bulk; fexc_wait_gated = s.wait_gated; fexc_x87_fpcr = s.x87_fpcr; fexc_simd_unmasked = s.simd_unmasked;
   fexc_x87_unmasked = s.x87_unmasked;
   LogMan::Throw::InstallHandler(AssertHandler);
   LogMan::Msg::InstallHandler(MsgHandler);

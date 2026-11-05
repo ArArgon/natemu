@@ -12,9 +12,10 @@
 //!   shape checks) and to the GS base and IA32_KERNEL_GS_BASE's field, which it may also load (perf chunk 17: its SWAPGS,
 //!   likewise); x25 is written only by `mrs x25,
 //!   nzcv` (the pre-NZCV save the resident reads at `nzcv=saved` sites); the only `svc`s are `#LINK`, `#DIV_U`,
-//!   `#DIV_S`, `#X87` and `#STRING`; direct branches go forward to a word of the code region; no word falls through into a literal slot, a
-//!   check stub or past the region. So every path ends at an exit the resident knows (a link point or the dispatch
-//!   branch, which a precise stop patches) or at a check stub.
+//!   `#DIV_S`, `#X87` and `#STRING`; direct branches go forward to a word of the code region, but the one back edge of a
+//!   bulk REP STOS loop (perf chunk 26, [`Verifier::bulk_loop`]: its exact words, whose count is at most 256); no word falls
+//!   through into a literal slot, a check stub or past the region. So every path ends at an exit the resident knows (a link
+//!   point or the dispatch branch, which a precise stop patches) or at a check stub.
 //! - Sites: each access site lies inside its guest instruction and its word is a load, store, swap or LOCK atomic
 //!   (`ld{add,clr,eor,set}al`, `casal`, `caspal`) exactly as recorded
 //!   (the resident computes the faulting address and completes split stores from the record).
@@ -34,7 +35,7 @@
 //! - Words: only the decoded classes (no system, SIMD, `ret`, `bl`, `br` or `blr` word; `brk` only at stubs); sp is
 //!   neither written nor accessed; no literal loads; every load and store is an access site; a swap or fetch-and-op
 //!   atomic keeps its result (with XZR there the architecture drops the acquire).
-//! - Split: every store wider than one byte has `add x0, xA, #w-1; eor x0, x0, xA; tbnz w0, #12, S` on exactly its
+//! - Split: every store wider than one byte but a bulk REP STOS loop's (which stays inside its page by its words) has `add x0, xA, #w-1; eor x0, x0, xA; tbnz w0, #12, S` on exactly its
 //!   address (xA its base, or x1 computed as exactly its address: `add|sub x1, base, #imm`, `add x1, base, index{, ext
 //!   #s}`, or a mov/movk constant into x1 and `add x1, base, x1`), only x0/x1 written between it and the store
 //!   (guest-RIP-addressed: `b S` iff it crosses a page, nothing entering between the move and the access).
@@ -364,6 +365,90 @@ const CBZ_W: u32 = 0x3400_0000;
 const CBNZ_X: u32 = 0xb500_0000;
 const CBNZ_W: u32 = 0x3500_0000;
 
+/// Perf chunk 26: MOV r64, CR2 as fexc translates it (`--cpl0`): an optional REX without R (CR10 is #UD), 0f 20, ModRM
+/// with mod 11 and reg 2.
+fn x86_mov_from_cr2(insn: &[u8]) -> bool {
+    match insn {
+        [0x0f, 0x20, m] => m >> 3 == 0b11_010,
+        [rex, 0x0f, 0x20, m] => rex & 0xf4 == 0x40 && m >> 3 == 0b11_010,
+        _ => false,
+    }
+}
+/// Perf chunk 26: the element width of a REP STOS in 64-bit addressing (legacy prefixes with F3, no 67; 66 for words; REX.W
+/// for quadwords), or `None`.
+fn x86_rep_stos(insn: &[u8]) -> Option<u32> {
+    let (o, rex) = crate::system::opcode_at(insn);
+    let prefixes = &insn[..o];
+    if !prefixes.contains(&0xf3) || prefixes.contains(&0xf2) || prefixes.contains(&0x67) || o + 1 != insn.len() {
+        return None;
+    }
+    match insn[o] {
+        0xaa => Some(1),
+        0xab if rex & 8 != 0 => Some(8),
+        0xab if prefixes.contains(&0x66) => Some(2),
+        0xab => Some(4),
+        _ => None,
+    }
+}
+/// How a word of [`bulk_words`] is compared: exactly, or as a cbz/cbnz/tbnz whose offset is to the sequence's end (a skip)
+/// or back to its `stp` (the loop's back edge).
+#[derive(Clone, Copy)]
+enum Bulk {
+    Word,
+    Skip,
+    Back,
+}
+/// The cbz/cbnz/tbz/tbnz `w` (offset field zero) branching `delta` bytes.
+fn with_offset(w: u32, delta: i64) -> u32 {
+    let imm = (delta / 4) as u32;
+    if w & 0x7e00_0000 == 0x3600_0000 { w | (imm & 0x3fff) << 5 } else { w | (imm & 0x7_ffff) << 5 }
+}
+/// FexcRepStos's words for `w`-byte elements (RCX x7, RDI x11, RAX x4: the static register map admission requires; see
+/// `fexc_sites.inc`).
+fn bulk_words(w: u32) -> Vec<(u32, Bulk)> {
+    use Bulk::*;
+    let mut v = vec![
+        (0x3940_0000 | frame::FAST_STRINGS << 10 | 28 << 5, Word), // ldrb w0, [x28, #fast_strings]
+        (0x3400_0000, Skip),                                        // cbz w0, S
+        (0x3940_0000 | frame::DF << 10 | 28 << 5, Word), // ldrb w0, [x28, #df]
+        (0x3638_0000 | 1 << 24, Skip),                    // tbnz w0, #7, S
+    ];
+    if w > 1 {
+        v.extend([(0x9240_0960, Word), (0xb500_0000, Skip)]); // and x0, x11, #7; cbnz x0, S
+    }
+    let s = 4 - w.trailing_zeros();
+    v.extend([
+        (0xd340_fce1 | s << 16, Word), // lsr x1, x7, #s
+        (0x9240_2d60, Word),           // and x0, x11, #0xfff
+        (0x5282_0002, Word),           // movz w2, #0x1000
+        (0xcb00_0040, Word),           // sub x0, x2, x0
+        (0xd344_fc00, Word),           // lsr x0, x0, #4
+        (0xcb00_0022, Word),           // sub x2, x1, x0
+        (0x8a82_fc42, Word),           // and x2, x2, x2, asr #63
+        (0x8b02_0001, Word),           // add x1, x0, x2
+        (0xb400_0001, Skip),           // cbz x1, S
+    ]);
+    let d = match w {
+        8 => 4,
+        4 => {
+            v.extend([(0x2a04_03e2, Word), (0xaa02_8042, Word)]); // mov w2, w4; orr x2, x2, x2, lsl #32
+            2
+        }
+        _ => {
+            v.push((if w == 2 { 0x9240_3c82 } else { 0x9240_1c82 }, Word)); // and x2, x4, #0xffff | #0xff
+            v.extend((0..).map(|k| 8 * w << k).take_while(|&b| b < 64).map(|b| (0xaa02_0042 | b << 10, Word))); // orr x2, x2, x2, lsl #b
+            2
+        }
+    };
+    v.extend([
+        (0xa900_0160 | d << 10 | d, Word),     // stp xD, xD, [x11]
+        (0x9100_416b, Word),                   // add x11, x11, #16
+        (0xd100_00e7 | (16 / w) << 10, Word), // sub x7, x7, #16/w
+        (0xd100_0421, Word),                   // sub x1, x1, #1
+        (0xb500_0001, Back),                   // cbnz x1, L
+    ]);
+    v
+}
 /// How a stub is reached: the words `start..=end` end in its branch; `cond` is the normalized conditional branch
 /// (the far form `!cond +8; b stub` normalized to `cond`), `None` for a plain `b`.
 #[derive(Clone, Copy)]
@@ -421,11 +506,13 @@ struct Verifier<'a> {
     links: Vec<LinkPoint>,
     /// The computed exit's dispatch branch (a dispatch relocation).
     dispatch: Option<u32>,
+    /// Perf chunk 26: the bulk REP STOS loops, as the native range of each one's words ([`Verifier::bulk_loop`]).
+    bulk: Vec<Range<u32>>,
 }
 
-/// Verifies the code (object validation, and the code-shape check when `c.shape`); returns its link points and its
-/// computed exit's dispatch branch.
-pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>), String> {
+/// Verifies the code (object validation, and the code-shape check when `c.shape`); returns its link points, its computed
+/// exit's dispatch branch and whether it holds a bulk REP STOS loop (perf chunk 26).
+pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>, bool), String> {
     let mut v = Verifier::new(c)?;
     v.words()?;
     v.exits()?;
@@ -439,7 +526,7 @@ pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>), String> {
             return Err(format!("stub at {:#x} is reached by no check of its kind", c.stubs[i].native_offset));
         }
     }
-    Ok((v.links, v.dispatch))
+    Ok((v.links, v.dispatch, !v.bulk.is_empty()))
 }
 
 impl<'a> Verifier<'a> {
@@ -468,18 +555,28 @@ impl<'a> Verifier<'a> {
             insns[at / 4] = Some(Insn::Dispatch);
             dispatch = Some(r.offset);
         }
-        let mut branches: Vec<(u32, u32)> = (insns.iter().enumerate())
+        let all: Vec<(u32, i64)> = (insns.iter().enumerate())
             .filter_map(|(i, x)| match x {
                 Some(Insn::B(t) | Insn::Cond(t)) => Some((i as u32 * 4, *t)),
                 _ => None,
             })
-            .map(|(at, t)| match u32::try_from(t) {
-                Ok(t) if t > at && insns.get(t as usize / 4).is_some_and(|x| x.is_some()) => Ok((at, t)),
-                _ => Err(format!("branch at {at:#x} to {t:#x}: not forward to an instruction of the code region")),
-            })
-            .collect::<Result<_, _>>()?;
+            .collect();
+        let mut branches = Vec::new();
+        let mut back = Vec::new();
+        for (at, t) in all {
+            match u32::try_from(t) {
+                Ok(t) if t > at && insns.get(t as usize / 4).is_some_and(|x| x.is_some()) => branches.push((at, t)),
+                // Perf chunk 26: a backward branch only as a bulk REP STOS loop's back edge (checked below).
+                Ok(t) if t < at && t >= ENTRY_OFFSET => back.push((at, t)),
+                _ => return Err(format!("branch at {at:#x} to {t:#x}: not forward to an instruction of the code region")),
+            }
+        }
         branches.sort_by_key(|&(_, t)| t);
-        let mut v = Verifier { c, insns, branches, moves: Vec::new(), checks: Vec::new(), claimed: vec![false; c.stubs.len()], links: Vec::new(), dispatch };
+        let mut v = Verifier { c, insns, branches, moves: Vec::new(), checks: Vec::new(), claimed: vec![false; c.stubs.len()], links: Vec::new(), dispatch, bulk: Vec::new() };
+        for (at, t) in back {
+            let words = v.bulk_loop(at, t).ok_or(format!("branch at {at:#x} to {t:#x}: not forward to an instruction of the code region"))?;
+            v.bulk.push(words);
+        }
         for r in c.relocs.iter().filter(|r| r.kind == object::RELOC_GUEST_RIP_MOVE) {
             let (words, value) = v.move_sequence(r.offset, r.register).ok_or(format!("guest-RIP move at {:#x}", r.offset))?;
             // A literal exit's move (into x0, right before `svc #LINK`) holds its target, which `exits` checks.
@@ -496,6 +593,34 @@ impl<'a> Verifier<'a> {
             }
         }
         Ok(v)
+    }
+
+    /// Perf chunk 26: the backward branch at `at` to `to` is the back edge of a bulk REP STOS loop (fexc_sites.inc
+    /// `FexcRepStos`): the words before and after it are exactly that sequence for the element width of the REP STOS (F3,
+    /// 64-bit addressing) holding them, its `stp` is that instruction's recorded site, and no branch from outside enters it
+    /// (its own skips go to its end). Returns the sequence's native range. So its count x1 is min(RCX's whole 16-byte chunks,
+    /// the chunks before RDI's page end) <= 256, decremented once a round and written by nothing else: the loop ends, and each
+    /// store stays inside RDI's page (no split check is needed: at a fault RCX/RDI are an iteration boundary's).
+    fn bulk_loop(&self, at: u32, to: u32) -> Option<Range<u32>> {
+        let (g, _) = self.instruction(at)?;
+        let words = bulk_words(x86_rep_stos(self.guest_insn(g))?);
+        let n = words.len() as u32 * 4;
+        let start = (at + 4).checked_sub(n).filter(|&s| s >= ENTRY_OFFSET)?;
+        let (end, stp) = (start + n, start + n - 20);
+        let exact = words.iter().enumerate().all(|(i, &(w, to))| {
+            let o = start + 4 * i as u32;
+            self.word(o) == match to {
+                Bulk::Word => w,
+                Bulk::Skip => with_offset(w, end as i64 - o as i64),
+                Bulk::Back => with_offset(w, stp as i64 - o as i64),
+            }
+        });
+        let site = self.c.accesses.binary_search_by_key(&stp, |s| s.native_offset).ok().map(|i| &self.c.accesses[i]);
+        // One instruction holds every word; a branch into the sequence comes from inside it and goes to its end.
+        let inside = (start..end).step_by(4).all(|o| self.instruction(o).is_some_and(|(h, _)| h == g));
+        let sealed = self.branches.iter().all(|&(src, t)| !(start < t && t < end) && !(start <= src && src < end && t != end));
+        (exact && to == stp && inside && sealed && site.is_some_and(|s| s.kind == object::kind::STORE_PAIR && s.guest_offset == g))
+            .then_some(start..end)
     }
 
     /// Code shape: how each stub is reached (exactly one branch).
@@ -734,7 +859,12 @@ impl<'a> Verifier<'a> {
             let field = (offset, m.size) == (i64::from(frame::KERNEL_GS_BASE), 8) || (!m.load && (offset, m.size) == (i64::from(frame::GS_BASE), 8));
             self.c.cpl0 && field && (!self.c.shape || insn == Some(&[0x0f, 0x01, 0xf8][..]))
         };
-        if matches!(m.form, Form::Unsigned | Form::Pair) && (fields.iter().any(inside) || flag() || (m.form == Form::Unsigned && swapgs())) {
+        // Perf chunk 26: a CPL-0 block's MOV r64, CR2 loads CR2's field (with the code shape: only inside that instruction).
+        let cr2 = || {
+            let insn = self.instruction(at).map(|(g, _)| self.guest_insn(g));
+            m.load && self.c.cpl0 && (offset, m.size) == (i64::from(frame::CR2), 8) && (!self.c.shape || insn.is_some_and(x86_mov_from_cr2))
+        };
+        if matches!(m.form, Form::Unsigned | Form::Pair) && (fields.iter().any(inside) || flag() || (m.form == Form::Unsigned && (swapgs() || cr2()))) {
             Ok(())
         } else {
             Err(format!("frame access {:#010x} at {at:#x}: not a guest-state field", self.word(at)))
@@ -977,8 +1107,9 @@ impl<'a> Verifier<'a> {
                 }
                 _ => return fail("several alignment stubs"),
             }
-            // Split check on every store wider than a byte.
-            match (store && size > 1, &splits[..]) {
+            // Split check on every store wider than a byte (perf chunk 26: but a bulk REP STOS loop's, inside its page).
+            let bulk = self.bulk.iter().any(|r| r.contains(&at));
+            match (store && size > 1 && !bulk, &splits[..]) {
                 (false, []) => {}
                 (true, &[x]) => {
                     let (st, c) = (self.c.stubs[x], self.checks[x]);
@@ -1585,6 +1716,51 @@ mod tests {
         assert_eq!(a.dispatch_exit, None);
     }
 
+    /// Perf chunk 26: a bulk REP STOS loop (fexc `--bulk`: `xor rax, rax; rep stosq`, `mov al, 0xa5; rep stosb`) is admitted
+    /// with and without the code shape; its back edge only with every word of FexcRepStos exact for the instruction's width.
+    #[test]
+    fn bulk_rep_stos_loops_are_pinned() {
+        const STOSQ: (&[u8], &[u8]) = fixture!("rep-stosq-bulk");
+        const STOSB: (&[u8], &[u8]) = fixture!("rep-stosb-bulk");
+        let find = |f: (&[u8], &[u8]), word: u32| -> u32 {
+            let h: Header = super::super::record(f.0, 0);
+            let code = &f.0[h.code_offset as usize..][..h.code_region_end as usize];
+            (0..code.len() as u32).step_by(4).find(|&o| code[o as usize..o as usize + 4] == word.to_le_bytes()).expect("word")
+        };
+        for f in [STOSQ, STOSB] {
+            admit(f).unwrap();
+            admit_with(f, false).unwrap();
+            // The count decremented by 2 (it could step over zero), the page room in 8-byte units (a store past the page),
+            // RDI stepped by 32, the back edge to the `add`, a skip into the loop: refused by object validation.
+            let back = find(f, 0xd100_0421) + 4;
+            for (at, old, new) in [
+                (find(f, 0xd100_0421), 0xd100_0421, 0xd100_0821),
+                (find(f, 0xd344_fc00), 0xd344_fc00, 0xd343_fc00),
+                (find(f, 0x9100_416b), 0x9100_416b, 0x9100_816b),
+                (back, 0xb5ff_ff81, 0xb5ff_ffa1),
+            ] {
+                validated(f, at, old, new, Some("not forward"));
+            }
+        }
+        // The tbnz on DF retargeted to the `stp` (past the count): refused.
+        let tbnz = find(STOSQ, 0x3940_0000 | frame::DF << 10 | 28 << 5) + 4;
+        let stp = find(STOSQ, 0xa900_1164);
+        validated(STOSQ, tbnz, 0x3738_0220, 0x3738_0000 | ((stp - tbnz) / 4) << 5, Some("not forward"));
+        // The loop under another width's bytes (REX.W made REX: `rep stosd`, four elements a chunk, not two): refused.
+        let stosd = [0x48, 0x31, 0xc0, 0xf3, 0x40, 0xab];
+        let e = admit_with((STOSQ.0, &stosd), false).unwrap_err();
+        assert!(e.contains("not forward"), "{e}");
+        // The stp moved off its site (`stp x4, x4, [x11, #16]`): its record no longer describes it.
+        validated(STOSQ, stp, 0xa900_1164, 0xa901_1164, Some("not forward"));
+        // Review: a forward branch from before the sequence (the XOR's word) into the loop body; the `cbz x1` (no chunk)
+        // removed; min made max (`bic` for `and`, so the room no longer bounds the count); the fast-string test removed.
+        let before = find(STOSQ, 0x3940_0000 | frame::FAST_STRINGS << 10 | 28 << 5) - 4;
+        validated(STOSQ, before, 0x5280_0004, 0x1400_0000 | (stp - before) / 4, Some("not forward"));
+        validated(STOSQ, find(STOSQ, 0xb400_00c1), 0xb400_00c1, NOP, Some("not forward"));
+        validated(STOSQ, find(STOSQ, 0x8a82_fc42), 0x8a82_fc42, 0x8aa2_fc42, Some("not forward"));
+        let fast = find(STOSQ, 0x3940_0000 | frame::FAST_STRINGS << 10 | 28 << 5) + 4;
+        validated(STOSQ, fast, 0x3400_0260, NOP, Some("not forward"));
+    }
     #[test]
     fn link_point_form_is_pinned() {
         let at = LINK_FT;
@@ -1809,7 +1985,10 @@ mod tests {
             refused(ADDRESS, at, old, word, "counter read"); // mrs x20, cntvctss_el0 | cntvct_el0
             validated(ADDRESS, at, old, word, Some("counter read"));
         }
-        refused(ADDRESS, at, old, 0x3950_1f95, "frame access"); // ldrb w21, [x28, #0x407]: past the flags
+        refused(ADDRESS, at, old, 0x3950_2395, "frame access"); // ldrb w21, [x28, #0x408]: past the flags
+        // Perf chunk 26: the fast-string byte (flags[23]) is readable, never writable.
+        validated(ADDRESS, at, old, 0x3950_1f95, None); // ldrb w21, [x28, #0x407]
+        refused(ADDRESS, at, old, 0x3910_1f94, "frame access"); // strb w20, [x28, #0x407]
         refused(ADDRESS, at, old, 0x3910_1b94, "frame access"); // strb w20, [x28, #0x406]: the event-pending byte is the resident's
         // Perf chunk 17: IA32_KERNEL_GS_BASE's field and a store of GS.base only in a CPL-0 block's SWAPGS (these fixtures are not
         // CPL 0: the cpl0_translates_swapgs_inline test admits fexc's).

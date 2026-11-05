@@ -208,6 +208,57 @@ DEF_OP(FexcMxcsr) {
   bic(ARMEmitter::Size::i32Bit, TMP1, TMP1, Dst, ARMEmitter::ShiftType::LSR, 6);
   orr(ARMEmitter::Size::i32Bit, Dst, Dst, TMP1, ARMEmitter::ShiftType::LSL, 1);
 }
+// Perf chunk 26: REP STOS in bulk inside RDI's page (FEX's `FexcRepStos`, before the one-element pass of FexcStringOp; only with
+// `--bulk`, in 64-bit addressing). With IA32_MISC_ENABLE's fast-string bit set (its flag byte, which the resident writes at
+// every entry: fast strings group iterations only then, SDM Vol.1 7.3.9.3), DF = 0, RDI 8-aligned (any for bytes: every 8-byte half of a store then holds whole,
+// naturally aligned elements, each written single-copy atomically) and RCX holding n >= 1 whole 16-byte chunks: min(n, the
+// chunks that fit before RDI's page end, <= 256) stores of AL/AX/EAX/RAX repeated to 16 bytes, RDI + 16 and RCX - 16 / w after
+// each, so at every store (the site) RCX/RDI are those of an iteration boundary and no element after it is written. No flags
+// change (no flag-setting word); only x0-x2, RCX and RDI are written. Admission pins these words (structure.rs, `bulk_loop`).
+//   ldrb w0, [x28, #fast_strings]; cbz w0, S; ldrb w0, [x28, #df]; tbnz w0, #7, S; [w > 1: and x0, x11, #7; cbnz x0, S;] lsr x1, x7, #(4 - log2 w);
+//   and x0, x11, #0xfff; movz w2, #0x1000; sub x0, x2, x0; lsr x0, x0, #4; sub x2, x1, x0; and x2, x2, x2, asr #63;
+//   add x1, x0, x2; cbz x1, S; [the pattern into x2: w 4 `mov w2, w4; orr x2, x2, x2, lsl #32`, w 2 `and x2, x4, #0xffff`
+//   then lsl #16 and #32, w 1 `and x2, x4, #0xff` then lsl #8, #16, #32;]
+//   L: stp xD, xD, [x11]; add x11, x11, #16; sub x7, x7, #16/w; sub x1, x1, #1; cbnz x1, L; S:
+DEF_OP(FexcRepStos) {
+  const auto Op = IROp->C<IR::IROp_FexcRepStos>();
+  const uint32_t W = Op->Width;
+  const auto RCX = StaticRegisters[X86State::REG_RCX].X(), RDI = StaticRegisters[X86State::REG_RDI].X(), RAX = StaticRegisters[X86State::REG_RAX].X();
+  constexpr auto X = ARMEmitter::Size::i64Bit;
+  ARMEmitter::ForwardLabel Skip;
+  ARMEmitter::BackwardLabel Loop;
+  ldrb(TMP1.W(), STATE, offsetof(FEXCore::Core::CPUState, flags[FEXC_FAST_STRINGS_LOC]));
+  (void)cbz(ARMEmitter::Size::i32Bit, TMP1, &Skip);
+  ldrb(TMP1.W(), STATE, offsetof(FEXCore::Core::CPUState, flags[X86State::RFLAG_DF_RAW_LOC]));
+  (void)tbnz(TMP1, 7, &Skip);
+  if (W > 1) {
+    and_(X, TMP1, RDI, 7);
+    (void)cbnz(X, TMP1, &Skip);
+  }
+  lsr(X, TMP2, RCX, 4 - FEXCore::ilog2(W));
+  and_(X, TMP1, RDI, 0xfff);
+  movz(ARMEmitter::Size::i32Bit, TMP3, 0x1000);
+  sub(X, TMP1, TMP3, TMP1);
+  lsr(X, TMP1, TMP1, 4);
+  sub(X, TMP3, TMP2, TMP1);
+  and_(X, TMP3, TMP3, TMP3, ARMEmitter::ShiftType::ASR, 63);
+  add(X, TMP2, TMP1, TMP3);
+  (void)cbz(X, TMP2, &Skip);
+  auto D = RAX;
+  if (W < 8) {
+    if (W == 4) mov(ARMEmitter::Size::i32Bit, TMP3, RAX);
+    else and_(X, TMP3, RAX, W == 2 ? 0xffff : 0xff);
+    for (uint32_t b = 8 * W; b < 64; b *= 2) orr(X, TMP3, TMP3, TMP3, ARMEmitter::ShiftType::LSL, b);
+    D = TMP3;
+  }
+  (void)Bind(&Loop);
+  stp<ARMEmitter::IndexType::OFFSET>(D, D, RDI);
+  add(X, RDI, RDI, 16);
+  sub(X, RCX, RCX, 16 / W);
+  sub(X, TMP2, TMP2, 1);
+  (void)cbnz(X, TMP2, &Loop);
+  (void)Bind(&Skip);
+}
 // DPPS's first add level, between VFAddV's two `faddp` (SDM DPPS: "Exceptions are determined separately for each add and
 // multiply operation, in the order of their execution"; the multiply has its own check op, PlaceFPChecks): the two sums'
 // exact-tiny test and their check. Nothing of the instruction is committed yet, so the state before it holds here too.
@@ -462,6 +513,9 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
   case IROps::OP_CASPAIR:
     S.kind = FEXC_SITE_ATOMIC; S.width = uint8_t(2 * IR::OpSizeToSize(IROp->ElementSize)); S.intent = 1;
     break;
+  case IROps::OP_FEXCREPSTOS:   // perf chunk 26: the bulk loop's `stp` (found below), at an iteration boundary
+    S.kind = FEXC_SITE_STORE_PAIR; S.width = 16; S.intent = 1; S.data_class = 0;
+    break;
   case IROps::OP_ATOMICFETCHNEG: {
     if (!fexc_slice1) { S.kind = FEXC_SITE_OTHER; break; }   // FEX's CAS loop
     // FexcLockNeg: `ldr` (the read-modify-write load, recorded here) then `casal` (the atomic site, found below).
@@ -518,8 +572,10 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
     fexc_sites[FexcLoadSite].rmw = 1; fexc_sites[FexcLoadSite].intent = 1; S.rmw = 2;
   }
   if (S.kind == FEXC_SITE_PUSH_PAIR || S.kind == FEXC_SITE_POP_PAIR) FexcPendingFused.push_back(size_t(Index));
-  if (S.kind == FEXC_SITE_STORE || S.kind == FEXC_SITE_STORE_PAIR || S.kind == FEXC_SITE_PUSH || S.kind == FEXC_SITE_PUSH_PAIR ||
-      S.kind == FEXC_SITE_OTHER || S.kind == FEXC_SITE_SWAP || S.kind == FEXC_SITE_ATOMIC) FexcStoreSeen = true;
+  // (Perf chunk 26: a bulk REP STOS's stores leave RCX/RDI at an iteration boundary, so the one-element pass after them still
+  // starts from the state at the instruction: they do not count as committed effects.)
+  if ((S.kind == FEXC_SITE_STORE || S.kind == FEXC_SITE_STORE_PAIR || S.kind == FEXC_SITE_PUSH || S.kind == FEXC_SITE_PUSH_PAIR ||
+       S.kind == FEXC_SITE_OTHER || S.kind == FEXC_SITE_SWAP || S.kind == FEXC_SITE_ATOMIC) && IROp->Op != IROps::OP_FEXCREPSTOS) FexcStoreSeen = true;
   fexc_sites.push_back(S);
 }
 

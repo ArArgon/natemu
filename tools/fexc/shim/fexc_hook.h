@@ -149,13 +149,20 @@ struct FexcArg {
   FexcArg& operator=(T v) { value = v; return *this; }
 };
 enum : int { FEXC_ARG_SSE_GATED, FEXC_ARG_AVX_GATED, FEXC_ARG_ALIGNMENT_GATED, FEXC_ARG_X87_GATED, FEXC_ARG_WAIT_GATED, FEXC_ARG_X87_FPCR,
-             FEXC_ARG_SIMD_UNMASKED, FEXC_ARG_X87_UNMASKED, FEXC_ARG_CPL0, FEXC_ARG_TSC };
+             FEXC_ARG_SIMD_UNMASKED, FEXC_ARG_X87_UNMASKED, FEXC_ARG_CPL0, FEXC_ARG_TSC, FEXC_ARG_BULK };
+// Profile slice1 (perf chunk 26): the host asks for bulk REP STOS (`--bulk`: never for a single-instruction step, nor while
+// alignment checking or a data breakpoint gates the block): FexcStringOp stores the part of the string inside RDI's page
+// first (FEX's `FexcRepStos`, JIT form in fexc_sites.inc).
+inline FexcArg<bool, FEXC_ARG_BULK> fexc_bulk;
 // Profile slice1 (perf chunk 15): the request is at CPL 0 (`--cpl0`, from the host; never for a single-instruction step):
 // the one-byte CLI and STI are translated inline (patch 0031, `FexcInterruptFlagOp`; the rules are `Cut`'s).
 inline FexcArg<bool, FEXC_ARG_CPL0> fexc_cpl0;
 // The flag byte (FEX's flags[22], no FEX code uses it) the resident sets when an interrupt would be taken were IF set: an
 // inline STI reads it (frame::EVENT_PENDING on the host).
 constexpr unsigned FEXC_EVENT_PENDING_LOC = 22;
+// Perf chunk 26: the flag byte (FEX's flags[23], no FEX code uses it) holding IA32_MISC_ENABLE's fast-string bit, which the
+// resident writes at every entry (frame::FAST_STRINGS on the host); a bulk REP STOS stores in bulk only while it is 1.
+constexpr unsigned FEXC_FAST_STRINGS_LOC = 23;
 // Profile slice1 (perf chunk 15): a CPL-0 request on a host whose counter runs at 24 MHz (`--tsc`): the two-byte RDTSC is
 // translated inline (patch 0032, the resident's exact formula), reading the vCPU's TSC offset at FEXC_TSC_OFFSET (FEX's
 // `_pad1`, which no FEX code uses; the resident writes it at every entry: frame::TSC_OFFSET on the host).
@@ -165,6 +172,10 @@ constexpr uint32_t FEXC_TSC_OFFSET = 0xb8;
 // gs_cached with IA32_KERNEL_GS_BASE, which the resident keeps at FEXC_KERNEL_GS_BASE (FEX's `L1Pointer`, which no generated
 // code uses) while a CPL-0 block runs (frame::KERNEL_GS_BASE on the host).
 constexpr uint32_t FEXC_KERNEL_GS_BASE = 0xa0;
+// Profile slice1 (perf chunk 26): with `--cpl0` MOV r64, CR2 (0f 20 /r, reg 2, mod 11, no prefix but a REX without R) is
+// translated inline, a load of CR2 from FEXC_CR2 (FEX's `L1Mask`, which no generated code uses), which the resident writes
+// at every entry while a CPL-0 block runs (frame::CR2 on the host).
+constexpr uint32_t FEXC_CR2 = 0xa8;
 // Profile slice1 (I3), recorded by the dispatcher: guest RIP of each LOCK CMPXCHG / CMPXCHG8B / CMPXCHG16B, whose casal/caspal
 // the JIT precedes with `dmb ish` (x86 orders a failing locked compare; a failing Arm CAS writes nothing, acquire only).
 inline std::set<uint64_t> fexc_lock_cas;

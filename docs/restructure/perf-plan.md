@@ -2924,6 +2924,223 @@ target the block's start) would need admission to mark the link point by its pla
 after MOV SS of an STI that starts a block now asks the host for the step's decode (the kept decode at that RIP is a block),
 a host round trip only in that rare case. `locks` N = 4 is slower (more guest contention, as after chunk 15).
 
+### Measured (chunk 26: REP STOS in bulk inside a page, and MOV r64, CR2 inline at CPL 0, November 5; uncommitted on 625df3c, series64-chunk26-r1)
+
+Evidence: `natemu-raw/repfault-20261105-01/` (README there). FEX: three commits on the fork clone's local branch `natemu-chunk26`
+(from `natemu` ab62c7e06, not pushed): 5188b9fa0 (REP STOS in bulk, `FexcRepStos`; the bulk pass's last element ends the
+instruction by a branch), 57323cdd3 (MOV r64, CR2: 0f 20 decoded with its ModRM, `FexcMovFromCROp`) and, after the review,
+0430dc8a6 (0f 20's ModRM decoded register-only; `FexcMovFromCROp` checks its form). Final compiler series64-chunk26-r1 (below,
+"Review round"). Compilers
+series62-repstos (5188b9fa0, the shim without the CR2 rule) and series63-cr2 (57323cdd3, this tree's shim); natemu's
+submodule pin is unchanged. 625df3c only added the suite runner: the code measured against is 3dd4fb5's.
+
+**Measured first.** REP strings (chunk 24's sampler, `breakdown-20261105-01/prof/profcls.json`, and the I2 throughput rows of the
+boot-features plan): REP-string blocks are 17% of `mem`'s generated-code samples (the kernel's `clear_page`, `rep stosq` of a
+page: 18% of block samples), 3.7% of `hackbench`'s (`rep movsq` 2.0%, `rep stosq` 1.2% of block samples: the kernel's user
+copies and page clears), 3.8% of `zstd`'s (`rep movsb`), 2.9% of the installer's, 2.1% of `build`'s, 1.1% of `luajit`'s; no
+CMPS/SCAS block is among any cell's sampled blocks. In the VM a 4 KiB `rep stosq` takes 151-174 ns, `rep movsq` 166 ns, `rep
+movsb` 1,049 ns: the pass loop runs at the speed of the same loop natively (`loops.c` on the host, ns per 4 KiB, a page in
+L1 / a 256 MiB stream: today's stosq pass 178 / 176, a tight `str` loop 139 / 139, `stp` of two quadwords 75 / 83, `stp` of
+two Q registers twice 33 / 82, `dc zva` 72 / 45; movsb's pass 1,147 / 1,169, a tight byte loop 1,076 / 1,098, 16 bytes a
+round 74 / 139). So only wider stores pay (not removing the pass's re-entry): STOS in 16-byte stores about halves `mem`'s
+0.83 s of REP time (about 0.4 s, 5% of 8.5 s), 0.04 s on `hackbench`; MOVS in 16-byte chunks would save about 0.05 s on
+`hackbench` (0.5%), 0.04 s on `zstd` (2%), under 0.1 s elsewhere: under 3% on every workload, so MOVS (and CMPS/SCAS) are
+not built. Page faults (chunk 24's tables, `mem` N = 1, window): 1.24 M faults, each a MOV from CR2 (1,242 k MOV from CR) and
+an IRET (1,245 k) run by the resident at about 0.235 us a trip (0.29 s each, 3.4% of `mem`), the delivery 0.47 s, and 6.43 M
+shadow installs at 0.31 us (the abort 0.97 s, the walk and install 1.06 s). MOV from CR2 elsewhere: `build` 83 k, installer 54 k,
+`luajit` 26 k, `hackbench` 3 k. So MOV from CR2 inline (only `mem` above 3%, by its trips alone) is built; an IRET fast path
+would keep its resident trip (the frame pops, the CPL change) and save part of it (about 0.1 s, 1.2% of `mem`, if half the
+trip goes): not built; cheaper shadow installs: below.
+
+**Built.**
+1. **REP STOS in bulk** (FEX 5188b9fa0, shim `FexcRepStos`, fexc `--bulk`, host, admission).
+   - fexc: with `--bulk`, a REP STOS in 64-bit addressing (no 0x67) first runs `FexcRepStos`, then I2's one-element pass. The op:
+     `ldrb w0, [x28, #df]; tbnz w0, #7, S` (DF = 1: nothing), for words and wider `and x0, x11, #7; cbnz x0, S` (RDI not
+     8-aligned: nothing), x1 = min(RCX / (16 / w), (4096 - (RDI & 4095)) / 16) without flags (`lsr`, `and`, `movz`, `sub`,
+     `lsr`, `sub`, `and .., asr #63`, `add`), `cbz x1, S`, the element replicated to 64 bits in x2 (RAX itself for
+     quadwords), then `L: stp xD, xD, [x11]; add x11, x11, #16; sub x7, x7, #16/w; sub x1, x1, #1; cbnz x1, L; S:`. The `stp` is
+     a recorded store-pair site of 16 bytes. The pass after it: RCX = 0 ends the instruction (the existing `cbz x7`); else one
+     element, then, new, `cbz x7` to the instruction's end when that was the last element, else the exit to its own RIP.
+   - Host: `--bulk` on every translate request but steps, and not while `alignment_gated` (alignment checking or a data
+     breakpoint armed, part of `Cpu::code_context`: such blocks never run in the other context); in the answer cache's gating
+     key (`GATING` 11: fexc reads the flag only for such a REP STOS, so no other answer depends on it); an object holding a bulk
+     loop from a request without the flag is refused.
+   - Admission (`bulk_loop`, object validation): the one backward branch admitted is the `cbnz x1` of exactly these words for
+     the width of the REP STOS holding them (F3, no F2 or 0x67; the guest bytes decide the width), every skip to the
+     sequence's end, the `stp` the instruction's recorded store-pair site, no branch from outside into the sequence. So the
+     loop runs at most 256 rounds (x1 is written by nothing else) and every store stays inside RDI's page: the code shape
+     exempts that store from the split check.
+2. **MOV r64, CR2 inline at CPL 0** (FEX 57323cdd3, shim, abi, admission, resident).
+   - fexc: under `--cpl0` MOV r64, CR2 (0f 20 with ModRM mod 11 and reg 2, no prefix but a REX without R) is translated as a
+     load of `frame::CR2` (FEX's `L1Mask`, 0xa8, which no generated code used) into ModRM.rm's register; every other control
+     register, a REX.R (CR10), LOCK, 66, F2, F3 or another mod stays the resident's; at CPL 3 it is a system cut as before.
+     FEX's decoder now reads the ModRM of 0f 20 (it decoded two bytes), register-only (review round: mod is ignored by the
+     hardware, so a mod other than 11 is not decoded and stays the resident's).
+   - The resident writes CR2 into that field at every `enter` (0 at CPL > 0: the guest-state alias is readable at CPL 3) and
+     never reads it back. Admission lets a block load it only if the request was at CPL 0, with the code shape only inside such
+     a MOV.
+
+**Why it is exact.**
+- *REP STOS.* The SDM's REP STOS is element by element: ES:[RDI] gets AL/AX/EAX/RAX, RDI steps by the size and DF, RCX
+  counts down, and a fault, trap or interrupt between iterations leaves RCX/RDI at that boundary, RIP at the instruction and
+  RF set (Vol.2 REP, STOS; Vol.3 RF). Grouping iterations, as the bulk part does for interrupts (below), is the SDM's
+  fast-string operation, which it permits only under two conditions (Vol.1 7.3.9.3, Vol.3 11.2.4.1): IA32_MISC_ENABLE bit 0
+  set, and WB or WC memory. Both are kept (review round): the bulk part runs only while the fast-string byte the resident
+  writes from bit 0 at every entry is 1 (WRMSR is a resident transaction, an entry follows), and a write to WT or WP RAM, as
+  to UC RAM, is never made through a shadow by a block: its instruction runs alone, one element (WB and WC run natively). The bulk part runs only with DF = 0 and stores the elements in order, each `stp` holding
+  16 / w whole elements, RCX and RDI updated after each, so at every store the registers are those of the boundary before its
+  first element, and every element before it is written. Each `stp` lies inside RDI's page, which the x86 elements it holds
+  share: a page fault (not present, read-only, U/S, a reserved bit) or a canonical fault is the same for all of them as for its
+  first, so a fault at the store is the first element's: the resident's site path (as for the element's `str`) reports #PF with
+  CR2 the store's address (RDI), a write's error code, RIP the REP's, nothing of it written (the page's translation refuses the
+  store, so no byte of it there is written). A shadow miss retries the store; nothing in the loop is in a register the retry loses (x0-x2 are in the
+  captured frame). With w >= 2 RDI is 8-aligned, so each 8-byte half is single-copy atomic and holds whole naturally aligned
+  elements (as x86 writes each); bytes are atomic anyway. Interrupts and stops: the loop is at most 256 rounds and has no exit;
+  a stop or event arms at the next exit, which the pass reaches after it, so events are taken at iteration boundaries only
+  (later by at most one page's stores, as a fast string groups them: Vol.1 7.3.9.3). Data breakpoints and alignment checking:
+  bulk blocks never run with either (code context); TF: steps never get the bulk part, so each iteration traps. UC RAM: a
+  store to a UC page aborts (never shadowed for a block) and the resident runs the instruction alone from the site's state, in
+  a step: one element, then back (M2's rule, element by element); WT and WP RAM likewise for writes (review round: their pages
+  are shadowed for reads only, `translate`). A device page: a pair site is refused as a REP string's
+  element was (no completion record): the same stop. Code writes: a store into a page holding translations aborts (shadowed
+  read-only); into the block's own source page the instruction is stepped from the store's state (one element, then the new
+  bytes are compiled), into another page that page is invalidated first, as for the element's store. The new `cbz x7` after
+  the element is the instruction ending with RCX = 0, where the exit to its own RIP would have ended it (`rep_exited`).
+- *MOV r64, CR2.* At CPL 0 it never faults (#GP needs CPL > 0; #UD needs CR10+, LOCK or another register, all left to the
+  resident), it writes the 64-bit register with CR2 (REX.W ignored in 64-bit mode) and its flags are undefined (Vol.2 MOV:
+  Move to/from Control Registers): the resident's MOV left them unchanged, and so does the load. CR2 changes only in the
+  resident (a #PF delivery, MOV to CR2), and every return from the resident into generated code after one is an `enter`
+  (`sys_fast` and the linker end in it too), which writes the field, so the field equals CR2 wherever a CPL-0 block runs.
+  Under TF the instruction is stepped and run by the resident as before.
+
+**Admission and code shape.** Host tests (with `FEXC`): `bulk_rep_stos_only_when_asked` (the loop with `--bulk` for stosq,
+stosw, stosb; none for 0x67, MOVS or other code; none without the flag; a bulk object refused for a request without it),
+`cpl0_translates_mov_from_cr2` (RAX and R9 forms and REX.W translated; REX.R, CR3, 66 and CPL 3 the resident's; the field's
+load refused in an object admitted as a CPL-3 request's); `bulk_rep_stos_loops_are_pinned` (fixtures `rep-stosq-bulk`,
+`rep-stosb-bulk`: admitted with and without the shape; the count decremented by 2, the page room in 8-byte units, RDI stepped
+by 32, the back edge to the `add`, the DF skip into the loop, the bytes of another width, the `stp` moved off its site: each
+refused by object validation). Both host tests fail against HEAD's compiler (`nc/red-host-tests-old-compiler.txt`).
+Containment: the loop is pinned word for word and bounded; it stores only through RDI, at EL0, like the element's store; the
+CR2 field is the vCPU's own state, readable only by CPL-0 code (0 in the page while CPL 3 runs).
+
+**Tests.** `run_k2.py repbulk` (new, judged by the SDM, natemu only, block sizes default and 1): `fill-w1/2/4/8` (offsets
+0, 8, 3, 0xff8, 0xff0, 0x10, counts 0, 1, a chunk less one, a chunk, one more, 100, two pages and 3, DF = 1 twice, 0x67
+once: RCX 0, RDI the end, exactly the string's bytes), `fault-unmapped` (REP STOSQ from D+0xf00, D+0x2000 not present: #PF
+with CR2 D+0x2000, error 6, RCX 480, RDI D+0x2000, the 0x1100 bytes before written), `fault-first` (a read-only page's start:
+nothing written), `fault-misaligned` (REP STOSB from D+0x1003 into a read-only page: RCX 4099 at D+0x2000), `uc` (a UC page:
+written, every element alone), `smc-other`, `smc-own` (NOPs over code run before on another page, and over the code after the
+REP on its page: the new code runs), `linked` (an odd-count clear_page called N and 2N times: linker entries equal), `tf`
+(#DB after each of 5 iterations, RCX 4..0), `watch` (a write breakpoint on the second quadword: one #DB at the REP with RCX
+62), `kicks` (100,000 rounds of 64 KiB under interrupts at random times: 597 of 653 taken at the REP, each with RCX + (RDI - BUF)/8
+the count, the quadword below RDI this round's, the one at RDI the last's, RF set; none bad). `run_k2.py cr2` (new): `value`
+(two #PFs, CR2 read by RBX and R9 in the handler), `nested` (a #PF inside the #PF handler: CR2 the outer's, then the
+inner's), `mov-to-cr2` (MOV to CR2 then reads in the next block and after a JMP), `tf`, `cpl3` (the alias's field 0 at CPL 3,
+MOV r64, CR2 #GP(0) there). The I2 corpus against QEMU (484 programs, both block sizes), its fault flow form, M2 (UC) and M3
+(devices) also run the new forms (Checks).
+
+Negative controls (`nc/mutant-*.diff`, `nc/red-*.txt`; scratch builds, reverted): RCX stepped before the store: 3 fault cases,
+`uc` and `smc-own` red (RCX a chunk short at the fault); no DF test: `fill` red at every width (DF = 1 stored upwards); the page
+room in 8-byte units: `fault-unmapped` and `fault-misaligned` red (a store straddling the page end, the fault at the earlier
+boundary); bulk in steps too: `tf` and `uc` red (a page in one step); CR2's field not written at entry: `value`, `nested`,
+`mov-to-cr2` red; written at every CPL: `cpl3` red (CPL 3 reads the kernel's CR2).
+
+**Measured** (`camp/`: `campaign26.sh`, `summ26.py`; the `natemu` stub, cache off, `mitigations=off nokaslr`, 2 GiB,
+bench-20261104-02's initramfs; base: HEAD's code with series61-chunk25-r1; change 1: REP STOS in bulk (series62-repstos);
+change 2: both changes (series63-cr2); interleaved, the order rotating; three rounds of every cell, three more of the cells
+slower by median and of `mem` N = 4; every run verified or reached and uncontended; median (min-max), seconds; CPU s the
+process's with its fexc servers, mean):
+
+| Benchmark | N | base | change 1 (REP STOS bulk) | changes 1 and 2 (+ CR2 inline) | change 1 | change 2 | CPU s base / 1 / 1+2 | runs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `mem` | 1 | 8.46 (8.33-8.51) | 8.15 (8.15-8.23) | 7.83 (7.78-7.83) | -3.6% | -3.9% | 11.3 / 11.1 / 10.8 | 3 each |
+|  | 4 | 2.75 (2.68-2.78) | 2.69 (2.62-2.74) | 2.58 (2.53-2.61) | -1.9% | -4.4% | 13.8 / 13.5 / 13.1 | 6 each |
+| `hackbench` | 1 | 11.73 (11.51-11.74) | 11.64 (11.57-11.64) | 11.62 (11.61-11.65) | -0.8% | -0.2% | 14.4 / 14.4 / 14.4 | 3 each |
+| `build` | 1 | 11.36 (11.27-11.41) | 11.34 (11.27-11.43) | 11.35 (11.27-11.43) | -0.2% | +0.1% | 15.8 / 15.8 / 15.9 | 6 each |
+| Installer, cache off | 1 | 5.37 (5.29-5.47) | 5.31 (5.28-5.47) | 5.36 (5.29-5.41) | -1.1% | +0.9% | 6.8 / 6.8 / 6.8 | 6 each |
+| `zstd` | 1 | 1.92 (1.89-1.96) | 1.90 (1.84-1.93) | 1.88 (1.84-1.93) | -1.3% | -0.8% | 4.8 / 4.8 / 4.8 | 6 each |
+| `locks` | 1 | 3.81 (3.79-3.82) | 3.85 (3.79-3.88) | 3.83 (3.76-3.86) | +1.2% | -0.7% | 6.6 / 6.6 / 6.6 | 6 each |
+| `luajit` | 1 | 4.10 (4.04-4.15) | 4.08 (4.07-4.11) | 4.08 (4.06-4.11) | -0.4% | -0.1% | 7.2 / 7.2 / 7.2 | 3 each |
+| `cray` | 1 | 0.42 (0.41-0.43) | 0.43 (0.40-0.44) | 0.42 (0.39-0.43) | +3.2% | -1.3% | 3.2 / 3.2 / 3.2 | 6 each |
+
+Change 1: `mem` N = 1 -3.6% (8.46 to 8.15 s, ranges apart) and N = 4 -1.9% (overlapping); every other cell within 1.3% by
+median with overlapping ranges, but `cray` (+3.2%, 0.42 s, its ranges overlapping; it runs no REP STOS in its window). The 4
+KiB rows of `run_k2.py cost` (`cost/`, N = 100,000, slope of N and 2N, median of 3): `rep stosq` 0.174 -> 0.067 us, `rep
+stosb` 1.009 -> 0.061 us. Change 2: `mem` -3.9% and -4.4%, beyond the spreads (estimate 3.4%); every other cell within 1% by
+median. Both: `mem` N = 1 8.46 -> 7.83 s (-7.4%), N = 4 2.75 -> 2.58 s (-6.2%).
+Found on the way (`camp-v1/`, `diag/`): the first build of change 1 made `mem` 12% slower (linker entries 4.4 M -> 10.5 M, the
+linker's time 0.33 -> 0.73 s with the perf resident): a pass's bulk part usually left the last element alone, whose exit to
+the REP's own RIP with RCX = 0 is a boundary past the instruction (`rep_exited`), which the resident never links, so 6.09 M
+passes entered the linker (a scratch count by the exiting block, `diag/scratch-linker.diff`). The pass now ends the
+instruction by a branch after its last element (5188b9fa0), and `repbulk`'s `linked` case pins it.
+
+**Applies to.** Change 1: every OS's page zeroing by REP STOS in 64-bit code: Linux's `clear_page` (`rep stosq`, and `rep stosb`
+with ERMS) on every anonymous page fault, page-table page, `__GFP_ZERO` allocation and page-cache fill of a hole; Windows' and
+the BSDs' page zeroing where it uses REP STOS; `memset`/`bzero` in kernels and firmware built to REP STOS (GCC and MSVC
+inline it at -Os, glibc uses `rep stosb` for large sizes when ERMS is set); the condition is architectural (64-bit addressing,
+DF = 0, RDI's alignment, the count, the page end; no alignment checking or data breakpoint). Measured here on `mem` (fault and
+mmap churn); the others clear fewer pages. Change 2: every page-fault handler that reads CR2 at CPL 0 (Linux's `exc_page_fault`,
+every 64-bit OS's #PF entry), so every page-fault-heavy workload: fork and exec, mmap/munmap churn, first touches, copy on write.
+
+**Checks** (`suite26.sh`, `suite/`, the final tree, series63-cr2, one VM runner at a time, each case's output deleted as it
+ended): `cargo test` 114 + 2 ignored (host), abi 65, also with `FEXC` set; the resident stack audit `ok`; the Python unit
+tests 317 OK; fixtures 64 and seed 44 at both block sizes; the i7 corpus at CPL 0 at both; faults (`run_slice1_faults.py`) at
+both; the I2 corpus against QEMU 484/484 at both block sizes and its fault flow form 4,356/4,356 at sizes default and 1 (1,271
+faulting, inside REP strings among them); `run_m2.py` 112 cases, `run_m3.py` 0 failures; `run_k2.py` all ok (the new
+`repbulk` and `cr2` included) and `stifirst`, `stmxcsr`, `sysfast`, `swapgs`, `repbulk`, `cr2` again; `run_slice3_vm.py`
+`system`, `delivery`, `events`, `contain`, `smp` 0 failures; `run_x3.py`, `run_x4.py`, `run_l4a.py`, `run_l4b.py`, `run_s4.py`,
+`run_boot_smoke.py`, `run_r1.py r1a`, `r1b` ok; FEX ASM 2,270: 1,898 pass, 48 precision deviations, 324 unsupported, no
+failure; `test_fexc.py` and `test_slice1.py` 47 OK. `run_k1.py` failed once (`adv-pf-fetch@4`: "FEX frame changed"): the test
+driver's frame check did not know CR2's field, which a CPL-0 entry after a #PF fills; with the field admitted there
+(`program.rs` `frame_intact`, as for IA32_KERNEL_GS_BASE's) `run_k1.py` passes, and `cargo test` again (both ways).
+`--check-reuse --code-shape` boots, cache off (`checkboot26.py`, `check/`): installer N = 1 (872,426 resident copies checked
+against the host) and N = 4 reached the dialog; `mem` and `build` at N = 1 verified; no halt, no admission refusal.
+
+**Review round** (independent review: no blocking defect; two SDM gaps fixed and hardening, `-r1`: FEX 0430dc8a6 on the
+two commits above, compiler series64-chunk26-r1, `obj/fexc` SHA-256 `71c8349f...05ba6c`, `bin/r1`, patch
+`chunk26-repfault-625df3c-r1.patch`):
+1. Fast-string conditions (SDM Vol.1 7.3.9.3, Vol.3 11.2.4.1: grouping iterations needs IA32_MISC_ENABLE bit 0 and WB or WC
+   memory; natemu lets the guest clear bit 0 and runs WT/WP RAM natively). The resident writes bit 0 into a flag byte of the
+   guest-state page (`frame::FAST_STRINGS`, FEX's flags[23], which FEX never used) at every entry; `FexcRepStos` starts with
+   `ldrb w0, [x28, #fast_strings]; cbz w0, S` (admission's template too; the byte is readable, never writable). A write to WT
+   or WP RAM is handled as one to UC RAM: never through a block's shadow (its page shadowed for reads only), its instruction
+   run alone (`translate`). No deviation recorded.
+2. FEX 57323cdd3 decoded 0f 20 with a memory operand for mod other than 11 (a SIB and displacement: `0f 20 05` as seven bytes,
+   so near a page end a fetch #PF where the SDM gives #GP; the hardware ignores mod): 0f 20 is now decoded register-only
+   (`FLAGS_SF_MOD_REG_ONLY`), so such a form is not decoded by FEX and stays the resident's (the host's decode already took
+   it as three bytes).
+3. `FexcMovFromCROp` itself requires mod 11, reg 2, no REX.R and `--cpl0`; anything else is FEX's PermissionRestrictedOp
+   (which admission refuses), whatever the allowlist let through.
+4. `FexcRepStos` is a guest-memory op for the precision passes (`fexc_precision.h` `GuestMemOp`): no value is coalesced into a
+   static register across it (it writes RCX's and RDI's itself), and the incoming flags stay live at it.
+5. Tests (`run_k2.py`, all at block sizes default and 1 unless noted): `repbulk` `kicks-w1/w2/w4/w8` (every width under random
+   interrupts: element and RF checks; with fast strings on no boundary taken inside a REP lies in a page's interior, 16 to 4079
+   bytes in) and `kicks-w1/w8-misc-off` (bit 0 cleared: 2,969 of 2,998 and 452 of 455 there), `wt-wp`, `cpl3-us` (#PF error 7),
+   `cpl3-rsvd` (error 0xf), `noncanonical` (#GP(0), RCX and RDI unchanged), `into-noncanonical` (the last canonical page's 512
+   elements, then #GP(0) with RCX 1), `tso` (a second vCPU never sees a buffer element older than the flag stored after the
+   REP STOSQ); `cr2` `mod-cpl3` (#GP(0) at `0f 20 05` ending a page, the next not mapped), `mod-cpl0` (`0f 20 15`: RBP = CR2,
+   then the fetch #PF), `cr3`, `smp` (two vCPUs, 20,000 #PFs each, CR2 always the vCPU's own); admission's pinning test
+   also refuses a forward branch from before the sequence into the loop, `cbz x1` removed, min made max (`bic`) and the
+   fast-string test removed; `guest_state_fields_and_i1_words`: the fast-string byte loadable, not storable. Each new guard red
+   under its mutation (`nc/mutant-r1-*.diff`, `.fex.diff`, `nc/red-r1-*.txt`): the fast-string test removed: both
+   `misc-off` kicks red (no boundary mid-page); WT/WP writes native: `wt-wp` red (no element run alone); FEX's memory decode of
+   0f 20 back: `mod-cpl3` red (a partial-decode stop at the page end instead of #GP) and `mod-cpl0` red (the fetch #PF before
+   the MOV, RBP 0); the allowlist slipped to every control register with the dispatcher's check removed: `cr3` red (MOV RBX,
+   CR3 gave CR2); the slip alone: the object refused (PermissionRestrictedOp's `br`), never a CR2 value. The precision barrier
+   has no control by construction (no translation today coalesces across the op; it guards later edits).
+6. Checks (`suite-r1/`, `python3 tools/run_suite.py --fexc series64-chunk26-r1`, now with `repbulk` and `cr2` in its k2 list):
+   113/113 passed (`privilege` and every k2 group included), then `k2-repbulk` and `k2-cr2` 65 cases ok; `cargo test` 114 + 2
+   ignored, abi 65, with and without `FEXC`; `--check-reuse --code-shape` boots on `bin/r1` (`check-r1/`): installer N = 1
+   reached, `mem` and `build` N = 1 verified. Re-measured, as the pass gained two words (`camp-r1/`, three interleaved rounds,
+   base against r1): `mem` N = 1 8.32 (8.28-8.39) -> 7.76 (7.71-7.77) s, -6.7%; N = 4 2.74 (2.68-2.79) -> 2.55 (2.54-2.55) s, -6.9%
+   (the campaign above: -7.4% and -6.2%).
+
+**Not done.** MOVS, CMPS, SCAS stay one element a pass (under 3% everywhere, above); STOS with DF = 1, misaligned words and
+wider, and 0x67 stay one element a pass. An IRET fast path (1.25 M on `mem`, at most about 0.1 s) is not built. Shadow
+installs (6.43 M on `mem`, 2.01 s) were not made cheaper: a fault-around that installs a missing page's neighbours would need,
+to stay exact, only leaf entries already present with A set (writable only with D set and R/W), no A/D write, and the same
+INVLPG/CR3 invalidation as today; whether it pays depends on how many of `mem`'s installs a neighbour's would have served,
+which needs a census of the installs (user or kernel, the neighbours' A bits, refaults after INVLPG) first.
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
