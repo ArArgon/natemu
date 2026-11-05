@@ -1726,9 +1726,11 @@ def priv_cpu(i, n, text, wp=1):
                                                                          la=programs.sys_leaf(i, 0, d + PRIV_V), F2=d + PRIV_F2)
     code, labels = ref.assemble(text.format(**fields), labels=True)
     switches = [(PRIV_CODE(i) + off, int(name.rsplit('_', 1)[1])) for name, off in labels.items() if name.startswith('sw')]
-    # Control writes (MOV to CR): each resets the shadows once.
-    controls = len(re.findall(r'\bmov cr\d', text))
-    return {'addr': PRIV_CODE(i), 'code': code, 'controls': controls, 'labels': {k: PRIV_CODE(i) + v for k, v in labels.items()},
+    # Control writes (MOV to CR): each resets the shadows once, but a CR3 load keeps the supervisor space's upper half
+    # while it holds global shadows only (perf chunk 14; here it holds none) and counts in k1.kept_resets instead.
+    controls, cr3s = len(re.findall(r'\bmov cr\d', text)), len(re.findall(r'\bmov cr3', text))
+    return {'addr': PRIV_CODE(i), 'code': code, 'controls': controls, 'cr3s': cr3s,
+            'labels': {k: PRIV_CODE(i) + v for k, v in labels.items()},
             'memory': memory, 'switches': switches, 'wp': wp, 'fields': fields}
 
 
@@ -1838,8 +1840,9 @@ def cmd_privilege(a, host, runtime):
     at one CPL and then the other (WP 0 and 1), each case alone (1 vCPU) and four at once (4 vCPUs, one case each); the
     probe's #PF or success is the SDM rule at the new CPL (`priv_pf`), never the first access's shadow. (2) INVLPG and a CR3
     load drop both spaces (each CPL reads the new frame); SMEP still faults a CPL0 fetch from the user page after a CPL3
-    phase. (3) A loop of 2 CPL changes per round: the same shadow resets (the CR3 load and the final halt) and retries at
-    10 and 1,000 rounds: no flush per change. Block sizes default and 1; every run also passes the per-vCPU checks."""
+    phase. (3) A loop of 2 CPL changes per round: the same shadow resets (the CR3 load, kept, and the final halt) and
+    retries at 10 and 1,000 rounds: no flush per change. Block sizes default and 1; every run also passes the per-vCPU
+    checks."""
     failures, report = [], []
     named = priv_programs(0)
     loops = {f'loop{n}': (*priv_loop(n), n) for n in (10, 1000)}
@@ -1856,10 +1859,13 @@ def cmd_privilege(a, host, runtime):
                 diffs.append(f"cpu{v} stopped {cpu['stop']} {cpu['reason']} at {cpu['rip']}")
             for r, want in regs.items():
                 if smp.num(cpu['gpr'][r]) != want: diffs.append(f"cpu{v} gpr{r} {cpu['gpr'][r]} != {want:#x}")
-            # Every switch reached is one system transaction; resets: the controls written (CR3, CR4) and the final halt.
-            controls = c['controls']
-            if cpu['stats']['shadow_resets'] != controls + 1:
-                diffs.append(f"cpu{v} shadow resets {cpu['stats']['shadow_resets']} != {controls + 1}")
+            # Every switch reached is one system transaction; resets: the controls written but CR3 (CR4) and the final
+            # halt; each CR3 load a kept reset (its upper half holds no shadow; the lower half and the user space go).
+            resets, kept = c['controls'] - c['cr3s'] + 1, c['cr3s']
+            if cpu['stats']['shadow_resets'] != resets:
+                diffs.append(f"cpu{v} shadow resets {cpu['stats']['shadow_resets']} != {resets}")
+            if cpu['stats']['k1'].get('kept_resets') != kept:
+                diffs.append(f"cpu{v} kept resets {cpu['stats']['k1'].get('kept_resets')} != {kept}")
             diffs += [f'cpu{v} ' + d for d in per_vcpu_checks(cpu)]
             if extra_checks: diffs += extra_checks(v, cpu)
         stats = out and [{k: (c['stats'] if 'cpus' in out else out['stats'])[k] for k in ('systems', 'retries', 'shadow_resets', 'flushes')}
