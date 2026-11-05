@@ -1160,7 +1160,8 @@ pub(crate) enum Code {
 /// gating arguments it consulted. A request equal in those gets it (fexc is deterministic and would read the same), so a
 /// block is not compiled again because later bytes on its page or an unrelated control bit changed; at another RIP the
 /// answer is relocated ([`crate::relocation`], perf chunk 4), or compiled when it cannot be. On disk, answers are kept by
-/// the request with its RIP as half and page offset, with that RIP, and the fexc build (`compile_cache`).
+/// the request with its RIP as half and page offset, with that RIP, and the fexc build, for CPL-3 requests only
+/// (`compile_cache`).
 /// Every object, from fexc or a cache, goes through admission's mandatory validation when it is used: a damaged or forged
 /// cache entry can at worst be refused (a stop) or give the guest the effects of other x86 code inside its own containment,
 /// as a faulty fexc could; it cannot give code a way out of it.
@@ -1174,7 +1175,7 @@ pub struct Compiler {
     answers: Arc<Answers>,
     /// This vCPU, the owner of the answers it keeps (perf chunk 13).
     pub vcpu: u8,
-    /// The persistent cache (`boot-linux` sets it; test drivers never do).
+    /// The persistent cache (`boot-linux` sets it; test drivers never do), used only by requests with `cpl3` set.
     pub disk: Option<std::sync::Arc<crate::compile_cache::DiskCache>>,
     /// Requests that reached fexc.
     pub compiles: u64,
@@ -1224,6 +1225,9 @@ pub struct Compiler {
     /// Perf chunk 15: a CPL-0 translate request on a host whose counter runs at 24 MHz ([`crate::clock::frequency`], fexc's
     /// `--tsc`): RDTSC is translated inline with the resident's formula for that rate.
     pub(crate) tsc: bool,
+    /// Perf chunk 27: a request at CPL 3, translate or step: only these look up and store answers in the persistent cache
+    /// (`compile_cache`); the cache in memory serves every CPL.
+    pub(crate) cpl3: bool,
     /// Perf chunk 26: a translate request (never a step) without alignment checking or a data breakpoint (`alignment_gated`
     /// off, which is part of `Cpu::code_context`): fexc's `--bulk`, under which REP STOS stores the part of its string inside
     /// RDI's page in bulk (each store a site at an iteration boundary). A step runs one element: TF traps after each
@@ -1299,7 +1303,7 @@ impl Compiler {
         Self { fexc: fexc.into(), server: None, supported, max_instructions, answers: Answers::new(supported), vcpu: 0, disk: None, compiles: 0, hits: 0, disk_hits: 0,
                hits_by_source: [0; cache::MAX_VCPUS], duplicates: 0, lock_wait: (0, 0),
                relocated: 0, relocation_refused: 0, relocation_fallbacks: 0, reuse_checks: 0, check_reuse: false,
-               deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![], cpl0: false, tsc: false, bulk: false, perf: None, read: 0, halved: false }
+               deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![], cpl0: false, tsc: false, cpl3: false, bulk: false, perf: None, read: 0, halved: false }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
     /// `rip` the resident executes, or fexc's end reason when it produced no code.
@@ -1546,11 +1550,13 @@ impl Compiler {
         body
     }
     /// fexc's reply to the request for `bytes` at `rip` and the RIP it was compiled at: from the persistent cache when `disk`
-    /// (an answer for any RIP of that half and offset, stored with its RIP), else from the server (then stored).
+    /// (an answer for any RIP of that half and offset, stored with its RIP), else from the server (then stored); the
+    /// persistent cache only at CPL 3 (`cpl3`).
     fn ask(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>, disk: bool, _hook: &mut impl Hook) -> Result<(Reply, u64)> {
         let t = self.stamp();
-        let key = self.disk.as_ref().filter(|d| disk && !d.is_empty()).map(|d| d.key(&self.disk_body(bytes, rip, limit)));
-        let stored = key.and_then(|k| self.disk.as_ref().unwrap().get(&k));
+        let cache = self.disk.clone().filter(|_| self.cpl3);
+        let key = cache.as_ref().filter(|d| disk && !d.is_empty()).map(|d| d.key(&self.disk_body(bytes, rip, limit)));
+        let stored = key.and_then(|k| cache.as_ref().unwrap().get(&k));
         let stored = stored.and_then(|p| Some((Reply::from_payload(p.get(8..)?)?, u64::from_le_bytes(p.get(..8)?.try_into().unwrap()))));
         self.charge(crate::perf::DISK_GET, t);
         if let Some((reply, at)) = stored.filter(|(r, _)| r.code < 2) {
@@ -1587,8 +1593,8 @@ impl Compiler {
             return Err(format!("fexc failed at {rip:#x}: {}", String::from_utf8_lossy(&reply.json)));
         }
         let t = self.stamp();
-        if let Some(disk) = &self.disk {
-            disk.put(self.disk_body(bytes, rip, limit), rip >> 63 != 0, [&rip.to_le_bytes()[..], &reply.payload()].concat());
+        if let Some(disk) = &cache {
+            disk.put(self.disk_body(bytes, rip, limit), [&rip.to_le_bytes()[..], &reply.payload()].concat());
         }
         self.charge(crate::perf::DISK_PUT, t);
         Ok((reply, rip))
@@ -2019,6 +2025,7 @@ fn translation(
         compiler.alignment_gated = state.cpu.bit_tests_cut() && !(step && state.plain_step != 0);
         compiler.cpl0 = state.cpu.cpl == 0 && !step;
         compiler.tsc = compiler.cpl0 && crate::clock::frequency() == 24_000_000;
+        compiler.cpl3 = state.cpu.cpl == 3;
         compiler.bulk = !step && !compiler.alignment_gated;
         let code = compiler.compile(&bytes, rip, step, hook)?;
         match &code {
@@ -2589,7 +2596,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let open = |d: &str| Some(std::sync::Arc::new(crate::compile_cache::DiskCache::open(&dir.join(d), &fexc, 1 << 30).unwrap()));
         let code = [0x48, 0x01, 0xd8, 0xc3];
-        let new = |disk| super::Compiler { disk, ..super::Compiler::with_features(&fexc, u64::MAX, None) };
+        let new = |disk| super::Compiler { disk, cpl3: true, ..super::Compiler::with_features(&fexc, u64::MAX, None) };
         let block = |c: &mut super::Compiler| match c.compile(&code, 0x5000, false, &mut ()) {
             Ok(Code::Block(b)) => Ok(b.object),
             Ok(_) => Err("no block".to_string()),
@@ -2613,12 +2620,33 @@ mod tests {
         let at = word(&reply.object, 40) + word(&reply.object, 48);
         reply.object[at..at + 4].copy_from_slice(&0xd61f_0380u32.to_le_bytes()); // br x28
         let forged = open("forged").unwrap();
-        forged.put(body.clone(), false, [&stored[..8], &reply.payload()[..]].concat());
+        forged.put(body.clone(), [&stored[..8], &reply.payload()[..]].concat());
         drop(forged);
         let mut c = new(open("forged"));
         let e = block(&mut c).unwrap_err();
         assert!(e.contains("refused") && c.compiles == 0, "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Perf chunk 27: only CPL-3 requests use the persistent cache. A CPL-0 one is neither stored nor looked up (it reaches
+    /// fexc even when a CPL-3 request stored the same answer); a CPL-3 one is stored and answered from the cache.
+    #[test]
+    fn persistent_cache_serves_cpl3_requests_only() {
+        let empty = format!("struct.pack_into('<IIIIII', m, REP, 1, 0, 0, 0, 0, 0); struct.pack_into('<II', m, 68, 20, {})", Channel::MAGIC);
+        let fexc = fake_server("cpl3", &empty);
+        let dir = std::env::temp_dir().join(format!("natemu-cpl3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ask = |cpl3| {
+            let disk = Some(std::sync::Arc::new(crate::compile_cache::DiskCache::open(&dir, &fexc, 1 << 30).unwrap()));
+            let mut c = super::Compiler { disk, cpl3, ..super::Compiler::with_features(&fexc, u64::MAX, None) };
+            c.ask(&[0x90], 0x1000, None, true, &mut ()).unwrap();
+            (c.compiles, c.disk_hits) // dropped: the cache writes what it was given
+        };
+        assert_eq!([ask(false), ask(false)], [(1, 0), (1, 0)]);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0); // nothing stored
+        assert_eq!([ask(true), ask(true), ask(false)], [(1, 0), (0, 1), (1, 0)]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_file(fexc).unwrap();
     }
 
     /// With `FEXC` set (perf plan §2): finishing reaps the server by `wait4` with its CPU time; a compiler that never

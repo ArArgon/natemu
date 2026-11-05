@@ -2805,7 +2805,7 @@ and decodes system instructions again from the current bytes. **Persistent cache
 default 512): key SHA-256(fexc binary's SHA-256, exact request), value fexc's raw reply with a SHA-256 of key and payload
 (a damaged entry is a miss); immutable packs written by rename by a writer thread off the compile path (each key once per
 process, a pack per 4 MiB or 2 s, so a run killed by a signal loses at most 2 s), `k-` packs for kernel-half RIPs and `u-`
-for the rest; nothing is written past the cap, and an open over 3/4 of it evicts down to 3/4: other fexc builds' packs first (pack names carry the build's identity), then user packs, then kernel ones, oldest first (November 2 fix: an open evicted only over the full cap, so a cache filled just under it never had room again, and old builds' packs were never dropped first).
+for the rest; nothing is written past the cap, and an open over 3/4 of it evicts down to 3/4: other fexc builds' packs first (pack names carry the build's identity), then user packs, then kernel ones, (superseded by perf chunk 27, November 5: only CPL-3 code is cached on disk, packs are no longer split, and eviction takes other builds' packs, then the oldest), oldest first (November 2 fix: an open evicted only over the full cap, so a cache filled just under it never had room again, and old builds' packs were never dropped first).
 SHA-256 uses the Armv8 instructions (FEAT_SHA256), the portable code as fallback, checked equal at lengths 0-600 and
 across part splits. Every object, from fexc or a cache, goes through admission's mandatory validation when used: a forged
 entry is refused (`cargo test`: code jumping through x28), never staged; a writer of the cache directory can change guest

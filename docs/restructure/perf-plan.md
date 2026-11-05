@@ -3141,6 +3141,57 @@ to stay exact, only leaf entries already present with A set (writable only with 
 INVLPG/CR3 invalidation as today; whether it pays depends on how many of `mem`'s installs a neighbour's would have served,
 which needs a census of the installs (user or kernel, the neighbours' A bits, refaults after INVLPG) first.
 
+### Measured (chunk 27: the persistent compile cache for CPL-3 code only, November 5; on 6b2905b, series64-chunk26-r1)
+
+Evidence: `natemu-raw/diskcache2-20261105-01/` (README there; the harness of `diskcache-20261105-01/`, the phase-2 plan's
+"Disk cache").
+
+**Why.** The disk-cache study found the cache helps `build` with or without KASLR but costs the installer 8-10% under the
+default KASLR: the kernel moves every boot, so its lookups miss, and each boot wrote about 50 MB of kernel entries that never
+hit again. User programs are position-independent and the key ignores where they load, so their entries do hit.
+
+**Built** (host only). A request looks up and stores answers on disk only when it runs at CPL 3 (translate or step;
+`Compiler::cpl3`, set from the vCPU's CPL with the other per-request flags). Kernel-mode requests still use the in-memory
+answer cache shared by the vCPUs. With no kernel entries written, the kernel/user pack split and its eviction order (user
+packs before kernel packs) had nothing left to order and are removed: one pending pack per process, eviction takes other
+builds' packs first, then the oldest. Packs are now named by the fexc identity alone (`IDENTITY-PID-NANOS-N.pack`), so the
+old `k-`/`u-` packs count as another build's: never read, evicted first. The key and the entry format are unchanged.
+
+**Tests.** `persistent_cache_serves_cpl3_requests_only` (no `FEXC` needed; a stand-in compile server): two CPL-0 requests
+both reach the server and leave the directory empty; a CPL-3 request is stored and the next is answered from disk; a CPL-0
+request for the same body after that still reaches the server. It fails with the CPL condition removed. The compile-cache
+tests now also check that a pack under the old naming is not read; the eviction test checks oldest-first.
+
+**Measured** (the `natemu` stub, `mitigations=off`, 2 GiB; installer to "Select a language", `build` its benchmark window;
+a warm-up boot per cell, then three interleaved rounds of off / cold / warm; median (min-max), seconds; all 78 runs reached
+or verified and uncontended):
+
+| Cell | off | cold | warm | warm vs off | before (all CPLs cached) |
+| --- | --- | --- | --- | --- | --- |
+| Installer N = 1, KASLR | 5.26 (5.25-5.33) | 5.58 (5.53-5.64) | 5.19 (5.13-5.28) | -1.4% | +8.0% |
+| Installer N = 4, KASLR | 4.47 (4.40-4.52) | 4.58 (4.56-4.60) | 4.40 (4.39-4.49) | -1.5% | +10.1% |
+| Installer N = 1, `nokaslr` | 5.35 (5.17-5.40) | 5.55 (5.51-5.65) | 5.16 (5.15-5.34) | -3.7% | -6.4% |
+| Installer N = 4, `nokaslr` | 4.42 (4.38-4.55) | 4.59 (4.55-4.65) | 4.42 (4.33-4.48) | 0.0% | -8.3% |
+| `build` N = 1, KASLR | 11.35 (11.32-11.52) | 12.06 (12.05-12.10) | 10.93 (10.89-10.95) | -3.7% | -3.8% |
+| `build` N = 4, KASLR | 5.41 (5.36-5.48) | 5.70 (5.57-5.80) | 4.90 (4.83-4.96) | -9.4% | -10.8% |
+
+("Before" is the disk-cache study's, on an older tree and compiler.) With KASLR the installer's warm boot no longer loses:
+it is about as fast as without the cache. `build` keeps its gain. Without KASLR the installer gives up the kernel hits it
+had (-3.7% and 0% instead of -6% and -8%); the default boot uses KASLR. A cold first boot still costs 2-6% (writing). The
+warm installer answers 30% of what memory misses from disk, `build` 66-67%. Cache directory: the installer's is 22.4 MB after
+the warm-up and 22.7 MB after three more KASLR boots (before: 74 MB, of which 51 MB kernel code, growing to 206 MB at
+N = 1); `build`'s 89 MB, flat across boots.
+
+**Applies to.** Every user-mode program the guest runs again in a later boot: shells, compilers, interpreters, installers,
+package managers, test runners, whatever a boot or a CI loop repeats; position-independent executables and shared libraries
+hit wherever ASLR loads them. The condition is architectural (the request's CPL), nothing workload-specific. Kernel code is
+no longer kept across runs, under KASLR or not.
+
+**Checks** (`suite/` there). `python3 tools/run_suite.py --fexc series64-chunk26-r1` from this tree: 114 of 115 steps
+passed; `cargo test` 115 + 2 ignored (host), abi 65, with and without `FEXC`. The one failure, a Python setup test, compares
+the default raw directory with its resolved path: the worktree reached `natemu-raw` through a symlink, which resolves
+elsewhere. Without the symlink the Python tests pass (299, the ones needing raw files skipped).
+
 ### Measured (chunk 28: three generated-code shapes, November 5; analysis on 6b2905b, series64-chunk26-r1, no code change kept)
 
 **Question.** Of three costs every block pays, which is largest across workloads and can be made cheaper exactly: (a) the

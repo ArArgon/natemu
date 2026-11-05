@@ -136,7 +136,8 @@ resident, Linux activates it; installer N = 1 cache off 8.42 -> 8.32 s, hackbenc
 
 Warm against off: `build` -4% (N = 1) and -11% (N = 4) with or without KASLR; the installer -6 to -8% with `nokaslr` but
 +8% with KASLR (kernel lookups miss; about 50 MB of useless kernel packs per boot). Next change after perf chunk 26: cache
-only CPL-3 code (kernel-mode code neither looked up nor stored), measured as its own chunk.
+only CPL-3 code (kernel-mode code neither looked up nor stored), measured as its own chunk. Done in perf chunk 27
+(`natemu-raw/diskcache2-20261105-01/`): KASLR installer warm -1.4% / -1.5% against off, `build` -3.7% / -9.4%.
 
 ## Backlog (owner, November 4)
 
