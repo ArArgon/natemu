@@ -304,12 +304,13 @@ def main():
         print(f"{program['name']} {' '.join(args)}: {'fail' if diffs else 'match'} {state and state['stats']} {'; '.join(diffs)[:300]}")
 
     # Perf chunk 6: more blocks than the cache's records hold, at the largest code cache (as boots run): two trips, so the
-    # second finds the blocks placed after the last flush and asks again for the others. 300,000 one-instruction ADDs fill
-    # the block index (`MAX_BLOCKS`, 262,144) first; 810,000 `add rax, [rsi]` in blocks of three (270,000 blocks, three access sites each,
-    # 272 bytes of record) fill the 64 MiB metadata arena first (at about 246,700). Equal bytes, so the host reuses one
-    # compile per page offset: the case is about placement. Both flush when full and still match.
-    code_max = str(128 * 2**20 - (0x11000 + 4 * 4096 * 32))     # CODE_BYTES_MAX - HEAD_BYTES
-    for count, block, load, full in ((300_000, '1', None, 2), (810_000, '3', 0x1000_0000, 1)):
+    # second finds the blocks placed after the last flush and asks again for the others. Perf chunk 23 (the arena and the
+    # index doubled): 800,000 one-instruction ADDs fill the block index (`MAX_BLOCKS`, 524,288) first; 2,400,000
+    # `add rax, [rsi]` in blocks of three (800,000 blocks, three access sites each, 280 bytes of record: 160 plus 40 per site) fill the 128 MiB
+    # metadata arena first (at about 479,500). Each at least three times over the two trips. Equal bytes, so the host
+    # reuses one compile per page offset: the case is about placement. Both flush when full and still match.
+    code_max = str(128 * 2**20 - (0x11000 + 4 * 65536 * 32))    # CODE_BYTES_MAX - HEAD_BYTES (perf chunk 19: 64 Ki L1 entries)
+    for count, block, load, full in ((800_000, '1', None, 2), (2_400_000, '3', 0x1000_0000, 1)):
         program, result, end = add_chain(count, 2, step=0, load=load)
         args = [block, '--code-cache', code_max, '--watchdog-ms', '60000']
         state, err = run(program['name'], program, args)
@@ -320,6 +321,10 @@ def main():
             if state['stop'] != 'reached' or ref.num(state['rip']) != end: diffs.insert(0, f"stopped {state['stop']} at {state['rip']}")
             if st['flushes'] < 3 or not filled[full] or any(filled[k] for k in range(3) if k != full) or st['requests'] <= st['distinct']:
                 diffs.append(f"expected flushes at a full {['code area', 'arena', 'index'][full]}: flushes {st['flushes']}, full {filled}, requests {st['requests']} for {st['distinct']} blocks")
+            # Perf chunk 23: filled to its end (the arena within one record: 280 bytes here), not short of it.
+            peak, cap = st['k1']['peak'][full], st['k1']['capacity'][full]
+            if not cap - (280 if full == 1 else 0) <= peak <= cap:
+                diffs.append(f"expected the {['code area', 'arena', 'index'][full]} filled to its capacity {cap}, peak {peak}")
         failures += bool(diffs)
         out.append({'name': program['name'], 'args': args, 'stats': state and state['stats'], 'diffs': diffs, 'stderr': err})
         print(f"{program['name']} {' '.join(args)}: {'fail' if diffs else 'match'} {state and {k: state['stats'][k] for k in ('requests', 'distinct', 'flushes')}} "

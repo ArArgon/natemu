@@ -2436,6 +2436,105 @@ SCTLR_EL1.EOS makes ERET one; not built, unmeasured). `bank`'s and `enter`'s XMM
 is, but the frame is rebuilt from the bank). A SYSCALL reached by a computed exit (through the dispatcher's miss) takes the
 general path.
 
+### Measured (chunk 23: a metadata arena and block index twice as large, November 5; uncommitted on 5554c12, series58-channel-r1)
+
+Evidence: `natemu-raw/flush-20261105-01/` (README there). Setup as chunk 18: the `natemu` stub, cache off,
+`mitigations=off nokaslr`, 2 GiB, compiler series58-channel-r1 (unchanged), one VM at a time; the initramfs of
+`bench-20261104-02`. Counts come from single runs with the perf resident and its log (request lines kept for the analysis,
+then deleted); walls from uninstrumented runs.
+
+**Measured first** (HEAD, with scratch counters: `scratch-census.diff`, not kept; at each whole-cache flush the resident
+walks its block records and the host prints them; `refill.py` classes each translation request of the window by whether
+this vCPU asked for the same key, RIP, bytes and context, in an earlier flush generation).
+
+| At HEAD, one perf run each | `build` N = 1 | `build` N = 4 (per vCPU) | Installer N = 1 | Installer N = 4 (per vCPU) | `luajit` N = 1 | `mem` N = 1 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Whole-cache flushes in the window, cause | 5, the metadata arena full each time | 1 each, the arena | 4, the arena | 1 each, the arena | 0 | 0 |
+| Blocks at each flush (records 64 MiB; code of 120 MiB) | 238-244 k (35-36 MiB) | 241-242 k (35-36 MiB) | 240-241 k (36 MiB) | - | - | - |
+| Dead blocks at each flush | 37.8 k (9.6 MiB) at the first, **0** at the other four | 0.9-34 k | 38.8 k at the first, 0-3 at the others | - | - | - |
+| Live, not current / current | 186-222 k / 15-23 k | 194-225 k / 14-24 k | 191-225 k / 12-26 k | - | - | - |
+| Requests repeating a key of an earlier generation (refills), host request time | **498.6 k, 0.73 s** (99.8% from the shared cache) | 487.0 k over the four, 0.83 thread-s | 99.0 k, 0.15 s | 76.9 k over the four, 0.13 thread-s | 0 | 0 |
+| New keys in the window / distinct keys over the run | 246 k / 328 k | 647 k / 197-221 k per vCPU | 211 k / - | 379 k / - | 27 k / 111 k | 19 k / 103 k |
+
+Every capacity flush is the arena (as chunks 6 and 18 found). The index (256 Ki blocks) would fill a few thousand blocks
+later; the code area holds a third of its room. Nothing is dead after the boot's first flush: `build`'s programs stay in
+the page cache, so no code page is ever written, and the nine in ten blocks not current are other processes' code (the
+compiler and the shell), asked for again by the next process after each flush. Reclaiming dead records or compacting the
+arena would free nothing; evicting what is not current would drop exactly what comes back. A whole-cache flush replayed on
+`build` N = 1's request stream (`simflush.py`; it counts only requests, so a capacity of 150 k stands for the 64 MiB
+arena: it gives 492 k refills against the 498.6 k measured) leaves 128 k refills at 1.5 times the capacity, 72 k with one
+flush at twice and none at 2.7 times; at N = 4 each vCPU's stream has no flush at twice the capacity.
+
+**Built** (abi `cache`; no resident, host or compiler code change): the metadata arena 64 to **128 MiB** (all the address
+room below the lookup area) and L2 1 to 2 Mi entries, so the index holds **512 Ki blocks** (half of L2, as before); the
+link records stay at 256 Ki (`MAX_LINKS` no longer follows the index). The lookup area grows from 20 to 30 MiB per vCPU;
+every vCPU's window stays inside the 1 GiB identity map (the compile-time check: 872 of 1,024 MiB, from 650). Block numbers,
+arena offsets and code offsets still fit their 32-bit fields. Every invalidation rule is unchanged: the cache keeps more
+blocks, by the same rules, and still flushes whole when the arena, the index or the code area is full.
+Tried and not kept: four times the linear map's buckets (64 Ki to 256 Ki): `build` N = 1's page-fault time 216 to 199 ms,
+the chains it walks 1.95 to 1.59 M blocks (with the larger cache; 0.40 M at HEAD): most of a chain is blocks on the same
+linear page.
+
+**After** (one perf run each): `build` N = 1 flushes once (at 4.05 s of 11.6 s, 486 k blocks, 128 MiB of records, 80 MiB
+of code), refills 138.3 k (0.21 s of host request time); `build` N = 4 no flush; the installer N = 1 two flushes, refills
+48.8 k (0.08 s); N = 4 no flush. Costs seen on `build` N = 1: page-fault time 140 to 216 ms (the linear chains walked 0.40
+to 1.95 M blocks), two link-record fills (456 k links undone, as chunk 11 bounds them), flush time 124 to 38 ms; CR3 loads
+and TLB flushes 218 to 211 ms.
+
+**Measured** (wall s, uninstrumented; `camp/`, `camp-extra/`, `campaign.sh`, `summ23.py`: three interleaved rounds, the
+order alternating, plus three more of the cells slower by median; installer N = 4 once; `build` and the benchmarks from
+START to END; CPU = the process's user + system, its servers included, mean; max RSS the process's, mean; every run
+verified or reached the dialog, none contended):
+
+| Workload | N | wall s, HEAD | wall s, chunk 23 | change of medians | CPU s, HEAD / 23 | max RSS MiB, HEAD / 23 | runs |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `build` | 1 | 12.63 (12.55-12.70) | **11.39** (11.39-11.51) | -1.24 s (-9.8%) | 17.1 / 15.9 | 1,192 / 1,304 | 3 / 3 |
+| `build` | 4 | 5.62 (5.56-5.96) | **5.43** (5.36-5.48) | -0.19 s (-3.3%) | 23.4 / 21.7 | 1,656 / 1,799 | 3 / 3 |
+| installer | 1 | 5.52 (5.46-5.67) | 5.42 (5.32-5.58) | -1.7% | 7.0 / 6.9 | 564 / 676 | 6 / 6 |
+| installer | 4 | 4.60 (one run) | 4.50 (one run) | -2.2% | 9.0 / 8.9 | 955 / 1,116 | 1 / 1 |
+| `luajit` | 1 | 5.35 (5.29-5.44) | 5.37 (5.34-5.43) | +0.2% | 8.5 / 8.5 | 1,059 / 1,069 | 6 / 6 |
+| `mem` | 1 | 9.59 (9.54-9.66) | 9.56 (9.54-9.69) | -0.3% | 12.6 / 12.6 | 1,021 / 1,027 | 3 / 3 |
+| `hackbench` | 1 | 11.72 (11.54-11.81) | 11.70 (11.58-11.89) | -0.1% | 14.4 / 14.5 | 870 / 878 | 3 / 3 |
+| `locks` | 1 | 5.25 (5.24-5.28) | 5.20 (5.16-5.33) | -1.0% | 8.0 / 8.0 | 868 / 876 | 3 / 3 |
+| `zstd` | 1 | 1.91 (1.90-1.96) | 1.91 (1.88-1.96) | -0.1% | 4.8 / 4.8 | 984 / 992 | 6 / 6 |
+| `cray` | 1 | 0.41 (0.37-0.43) | 0.42 (0.37-0.43) | +0.4% | 3.2 / 3.2 | 874 / 882 | 6 / 6 |
+
+`build` is faster beyond its spread at both sizes; the installer's medians are lower with overlapping ranges; the other
+cells move within their spreads (`luajit` and `cray`, slower by median after three rounds, were given three more).
+**Resident memory**: +112 MiB at N = 1 and +143 to +161 MiB at N = 4 where the arena now fills past 64 MiB (`build`,
+the installer: more records, more code kept, the larger L2), +6 to +10 MiB elsewhere (the larger L2, cleared at each reset).
+The walls were measured with `bin/a`, the tree before its comments were written (the shipped tree's resident differs only
+in symbol hashes).
+
+**Tests.** `run_slice2_probes.py`'s two capacity cases, resized (800,000 one-instruction ADDs fill the index first,
+2,400,000 `add rax, [rsi]` in blocks of three the arena first, each three or more times over two trips) and now also
+requiring the full structure filled to its capacity (the arena within one record); their code-cache argument corrected
+for chunk 19's 8 MiB head (it was refused at setup since then: the runner is not in the standing suite). Green
+(`cap/green.txt`): the index case 1,600,008 requests, 4 flushes, `full` [0, 0, 3], peak 524,288 blocks; the arena case 4
+flushes, `full` [0, 3, 0], peak 134,217,632 bytes (479,470 blocks, 70 MiB of code). Negative controls (`nc/`, each a
+one-line change to the resident's bound, built and run by `cap23.py`), each red on its own case only: the index bound
+raised by 4,096 (a host error, "misaligned record": the extra index entries lie in the link records' area), the arena
+bound raised by 1 MiB (a host error: a record read out of the area's bounds), the index bound lowered by 4,096 (peak 520,192, not filled), the arena bound lowered by
+1 MiB (peak 133,169,016, not filled).
+
+**Checks** (`suite23.sh`, `suite/`, the final tree, one VM runner at a time, each case's output deleted as it ended):
+`cargo +1.97.0 test --offline --locked` 110 + 2 ignored (host), abi 65, also with `FEXC` set; the resident stack audit
+`ok`; the Python unit tests OK; fixtures 64 and seed 44 at both block sizes; the i7 corpus at CPL 0 69 at both; faults 7,912
+at both; `run_k1.py` 336 runs, no problem; `run_k2.py` all ok (74 cases), and `--only sysfast,swapgs` 22 of 22;
+`run_slice3_vm.py` `system`, `delivery`, `events`, `contain` (453 controls), `smp` 0 failures; `run_x3.py` 54/54 and every
+group, `run_x4.py` 33/28/6, `run_l4a.py`, `run_l4b.py`, `run_s4.py` all ok; `run_boot_smoke.py` 4/4; `run_r1.py r1a`,
+`r1b` ok (negative controls flagged); FEX ASM 2,270: 1,898 pass, 48 precision deviations, 324 unsupported, no failure;
+`run_slice2_probes.py` 85 match (the two capacity cases above included).
+
+**Seen once, not explained.** One installer boot (HEAD's resident with the census counters, perf build, the chunk's first
+run) did not reach the dialog: the guest's `main-menu` died of a segfault right after `localechooser` was selected (its
+serial is kept, `census/census-inst-n1.serial`); the same build's next boot and the 22 other installer boots of this chunk,
+both builds (campaigns and perf runs), reached it. Not reproduced or investigated further.
+
+**Not done.** `build` N = 1 still flushes once (138 k refills, 0.21 s of host request time): holding its whole run needs
+about 2.7 times HEAD's arena and index, past the identity map's room at four vCPUs. Smaller records (a block averages 276
+bytes, sites 40 bytes each) or an eviction by age would be the next step; neither is built.
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite

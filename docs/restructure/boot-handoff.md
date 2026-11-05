@@ -796,6 +796,12 @@ Severity: **medium** = a real cost or gap an integrator will meet, **low** = a l
 deviation, or a contained corner.
 
 - The next phase is performance (owner decision 1); the correctness pass comes after it.
+- **low**, guest (not natemu): an installer boot can miss "Select a language" because the Debian installer's own two
+  `main-menu` copies (serial console and tty1) race on `/var/lib/dpkg/status` while `udpkg` renames it; the serial copy
+  reads NULL and faults: "segfault at 8 ... error 4 in main-menu[3335,...]". Timing-dependent: 0/50 boots at N = 1 and
+  0/25 at N = 4 with the default resident, 4/50 with the perf log on; widening the rename gap makes QEMU fail the same way
+  (6/6, control 0/6). A miss with exactly that fault counts as the installer's race, not a natemu failure
+  (`natemu-raw/segv-20261105-01/`, November 5).
 - **medium**, performance: installer to "Select a language" 15.9 s at N = 1 and 13.6 s at N = 4, cache off (perf chunk 7),
   against like-for-like QEMU's 6.3 s and 4.9 s (`thread=multi`, §4; R2's harness gave QEMU 7.3 s and 5.5 s); at R2 it was 67 s, mostly first-time compiles of user code at randomized addresses,
   which chunks 2 and 4 removed; the resident's own work now leads (perf plan "Measured (chunk 5)"); of the host's, full

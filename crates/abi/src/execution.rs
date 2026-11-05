@@ -193,9 +193,12 @@ pub mod cache {
     pub const MAX_BLOCK_BYTES: usize = 32 * 1024;
     /// Pool sizes: the Debian kernel's early boot averaged 261 code and 230 metadata bytes per block (M1), so the arena
     /// holds about [`MAX_BLOCKS`] (K1: 256 Ki, after the reverse map ended invalidation's scan of every block; a boot
-    /// into user space overflowed 128 Ki) blocks, which fill about 68 MiB of code.
+    /// into user space overflowed 128 Ki) blocks, which fill about 68 MiB of code. Perf chunk 23: 128 MiB and 512 Ki
+    /// (the VA room up to [`LOOKUP_VA`]). The `build` benchmark filled the 64 MiB arena five times at N = 1 with about
+    /// 243 Ki blocks, every one live (none dead, nine in ten not current: other processes' code, asked for again after
+    /// each flush); the arena and the index now fill together at about 490 Ki blocks (about 270 bytes of record each).
     pub const META_VA: u64 = PRIVATE + 0x3000_0000;
-    pub const META_BYTES: usize = 64 * MIB;
+    pub const META_BYTES: usize = 128 * MIB;
     pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
     pub const LOOKUP_BYTES: usize = (HINTS + 4 * HINT_ENTRIES).next_multiple_of(BLOCK);
     pub const GLOBAL_VA: u64 = PRIVATE + 0x3c00_0000;
@@ -222,16 +225,17 @@ pub mod cache {
     pub const L1_LISTED: u32 = 1 << 31;
     /// L2: open-addressed {guest RIP, block number + 1} table keyed by (RIP, context).
     pub const L2: usize = (L1_LISTS + 4 * L1_ENTRIES * L1_TABLES).next_multiple_of(0x1_0000);
-    pub const L2_ENTRIES: usize = 1 << 19;
+    pub const L2_ENTRIES: usize = 1 << 20;
     /// Block index: metadata offsets of the blocks in placement (= code address) order.
     pub const INDEX: usize = L2 + 16 * L2_ENTRIES;
     /// At most half of L2, so probes stay short.
     pub const MAX_BLOCKS: usize = L2_ENTRIES / 2;
     /// Link records ([`LinkRecord`]), one per patched link point; a full area drops links (`cache::link`). Perf chunk 11:
     /// one per block of the index (64 Ki before): the `build` benchmark's metadata arena fills (about 238 Ki blocks) before
-    /// it does, while 64 Ki filled with links into current kernel blocks.
+    /// it does, while 64 Ki filled with links into current kernel blocks. Perf chunk 23: kept at 256 Ki when the index
+    /// doubled (`build` N = 1 then fills it twice a run, each fill amortised as above).
     pub const LINKS: usize = INDEX + 4 * MAX_BLOCKS;
-    pub const MAX_LINKS: usize = MAX_BLOCKS;
+    pub const MAX_LINKS: usize = 256 * 1024;
     /// The single-step block's record (its code is in the slot, `SLOT_VA`) and its access sites after it.
     pub const STEP_RECORD: usize = LINKS + 16 * MAX_LINKS;
     pub const STEP_RECORD_BYTES: usize = 0x3_c000;
