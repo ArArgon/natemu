@@ -164,6 +164,12 @@ natemu is faster than QEMU on every cell (0.02-0.92x of its time); against nativ
 for most cells, up to 31% (build N = 4). Phase 2 began (batch 1 end) at installer N = 1 7.9 s cache off; the batch-1
 benchmarks then: build 20.3 / 9.2, hackbench 16.9 / 4.8, locks 6.2 / 7.2 s.
 
+Closed (owner, November 5): the performance phase ends here. Backlog from it: a per-exit-site cache for computed jumps and a
+stack-alignment guard for the store page-crossing check (chunk 28), bulk MOVS/CMPS/SCAS and an IRET fast path (under 3%,
+chunk 26), page-table-copy fault-around after a census (chunk 26), an adaptive kernel disk cache (audit). Next: the PCID
+phase (PCID/INVPCID on Arm ASIDs, the not-vulnerable flags, a PTI-on boot in the standing benchmarks), then the correctness
+pass.
+
 ## Benchmark conventions (audit, November 5, `natemu-raw/audit-generic-20261105-01/`)
 
 All comparisons boot with `mitigations=off nokaslr` (owner decision; a default command line costs the installer about 2.1x
