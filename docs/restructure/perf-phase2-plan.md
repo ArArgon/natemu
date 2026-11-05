@@ -148,7 +148,9 @@ count a benchmark run only when it is verified (not merely reached). The CPL-3-o
 architectural condition but was chosen because KASLR (Linux's and Windows' default) defeats kernel hits; a kernel that does
 not move loses its hits too (installer `nokaslr` warm -6.4/-8.3% → -3.7/0%); a generic alternative — stop storing kernel
 entries only once they stop hitting — is recorded, not built. The audit found no condition keyed on a program, guest
-address, OS symbol, kernel layout, benchmark or command line.
+address, OS symbol, kernel layout, benchmark or command line. One layout-dependent gain, kept (owner, November 5): kernel global shadows
+survive a CR3 load only in the supervisor space's upper (canonical) half (`crates/abi/src/shadow.rs`, chunk 14); exact
+either way, faster only when the OS maps its global pages there, as Linux, Windows, the BSDs and XNU do.
 
 ## Backlog (owner, November 4)
 
