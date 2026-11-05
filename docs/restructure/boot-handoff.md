@@ -397,7 +397,7 @@ before). Evidence `natemu-raw/r2-fix-20261102-01/` (`red-on-head/`, the reruns, 
 ## 5. Standing suite
 
 Every VM runner takes `--fexc FEXC --out DIR` under `./tools/with-env`, builds and signs the release `natemu-host` and
-runtime itself (`run_boot_smoke.py` the `natemu` stub), and judges against pinned QEMU (`tools/reference/ref.py` pins the container image; Homebrew
+runtime itself unless `NATEMU_PREBUILT=1` (`tools/run_suite.py`, below; `run_boot_smoke.py` builds the `natemu` stub), and judges against pinned QEMU (`tools/reference/ref.py` pins the container image; Homebrew
 `qemu-system-x86_64` for SMP programs) and the independent models in `tools/models/`. Guest RAM for every
 `run-program` runner is `NATEMU_RAM` (hex, default 2 GiB; `NATEMU_PLACE` moves the driver's page placement); `run_m1.py`,
 `run_m2.py firmware` set their own sizes. `run_l1.py`, `run_l2.py` and `run_l2_iasl.py` run no VM: `--out DIR` only
@@ -608,6 +608,56 @@ the default only). Everything passed but the 7 known i8b departures (they flag `
 | `tools/run_boot_smoke.py` | `cancel` and `cancel-group`: the bzImage at 4 vCPUs, SIGINT 1.5 s in to the stub, then to its whole process group (a terminal's Ctrl-C): exit 2, `Cancelled`, within 5 s; the library boot path (the `natemu` stub, built alone): the Debian bzImage and installer initrd with `rdinit=/bin/busybox -- sh -c "echo MARKER; poweroff -f"` at N = 1 and 4 (`--vcpus`); pass: the marker on its own serial line (busybox's console write goes through the 8250's THRE interrupt, IRQ 4 via the I/O APIC) and exit 0 (S5). Needs `natemu-raw/kernel-census-20261028-01/dl/{linux,initrd.gz}`; compile cache off unless `NATEMU_COMPILE_CACHE` is set; about 25 s. Guards R2's blocker (§4), which `run-program` runners cannot see |
 | `tools/check_resident_stack.py` | resident stack bound and gate/ERET binary shape of the built runtime |
 | `tools/models/` | independent ordering, coherence, PAE and modes models (used by the runners) |
+
+**Runner** (`tools/run_suite.py`, November 5): runs every command of the block below, plus I7 at CPL 0 at both block
+sizes, with the same arguments and the same pass/fail rule (exit status 0; `i8b` passes when it fails exactly the 7 known
+departures), in three phases:
+
+```sh
+python3 tools/run_suite.py                       # all steps; -j N (default: performance cores), --out DIR (default ../natemu-raw/suite-DATE)
+python3 tools/run_suite.py --list                # steps, phase, internal parallelism, why serial
+python3 tools/run_suite.py --only 'k1-*,fix'     # or --skip; names or fnmatch patterns; --fexc FEXC (default: F below)
+NATEMU_RAM=0x400000 python3 tools/run_suite.py   # the 4 MiB suite: the environment passes through
+```
+
+1. One at a time: the cargo builds and tests, `run_l1.py`, `run_l2.py`, `run_l2_iasl.py` (they run cargo), then every
+   binary the runners build, signed. Later steps run with `NATEMU_PREBUILT=1`, under which `run_slice1_vm.build()` (every VM
+   runner's) uses those binaries without cargo or `codesign`: a cargo build, even a no-op one, links
+   `target/release/natemu-host` and the runtime afresh from `deps/` (the host without its entitlements until the codesign
+   after it), so a runner building while another starts the host or opens the runtime breaks that one (`hv_vm_create:
+   0xfae94007`, HV_DENIED, or the runtime missing). This, not a VM limit, explains the earlier `0xfae94007` "collisions
+   with another agent's VMs": two agents running runners in one tree. (16 concurrent 1-vCPU VMs, or 12 of 4 vCPUs, start cleanly on the M4.)
+2. N steps at once, a step with its own `--parallel`/`--jobs` counting as that many (`corpora`, `asm`, `m3` 4; `smp`,
+   `coherence`, `sharedpt`, `litmus` 2), the longest first; each with its own `--out` directory and TMPDIR. Split where a
+   runner already selects a part: `run_k1.py` and `run_r1.py r1b` per `--cpus` value, `run_slice2_faults.py` per `--sizes`
+   value, `run_i5b.py --group`, `run_k2.py`, `run_x3.py` and `run_m2.py` per `--only` group. Not split: `run_slice1_faults.py`
+   (its variant rotation runs across programs, so a subset changes the cases), `corpora` (each `--cpus` part redoes its QEMU
+   references: slower than one run), `system` and `probes`.
+3. One at a time, alone (exclusive lock, after waiting until no other `natemu-host`, stub or QEMU runs), each rerun once
+   alone on failure (recorded beside the first result; the rerun decides): `kicks` (host kickers; timing-sensitive),
+   `contain` (each failing run ends within 10 s, a killed server within 2 s), `l4b` (IRQ0 at most 2 ms late, 10 ms
+   calibration windows, clocks against the TSC), `run_x3.py` `timers` (lateness bounded by 2 ms) and `stress`, `run_k2.py`
+   `sysfast` (`apic-timer`: deliveries 0.5-1.5 periods apart, the count the periods elapsed +-1) and `cost` (reported
+   microseconds), `run_m2.py` `litmus` (the WB control must show the non-SC outcome) and `cost`, `run_boot_smoke.py`
+   (Ctrl-C ends the stub within 5 s); and two moved here because they failed only in the parallel phase: `run_l4a.py`
+   `stress` (twice at `-j 4`: a vCPU stopped by the guest watchdog; also once alone in the last run, green on its rerun) and `run_k1.py --cpus 4` (at `-j 6`:
+   `link-full@4` at block size 1 outlived the runner's 300 s kill; green at `-j 4` three times and alone, 160 s).
+
+Phases 1-2 hold a shared `flock` on `../natemu-raw/.vm.lock`, each serial step an exclusive one; `/usr/bin/lockf -k`
+(benchmarks, the per-command suite scripts) takes it exclusively, so they and the parallel phase exclude each other
+(checked: `lockf -k -t 0` fails while a Python `LOCK_SH` is held, a second `LOCK_SH` is granted). `DIR/results.txt`: one
+line per step as it ends (phase, PASS/FAIL, exit code, seconds, log), then the wall time per phase; `DIR/logs/` every
+step's output; a passing step's `--out` and temporary directories are deleted, a failing step's kept; exit 1 on any
+failure.
+
+Validation at HEAD 4920f47 (a clean export of HEAD with the generated `fixtures/slice1` files,
+`natemu-raw/suite-runner-20261105-01/`, series58-channel-r1; each directory's `results.txt`): the old way (`serial.sh`:
+this block one command at a time, plus I7 at CPL 0; 87 commands) took 2,628 s of runner time, 2,949 s with lock waits.
+The runner at `-j 4`: 1,290 s (`par1`: pre 7, parallel 1,149, serial 122) and 1,316 s (`par2`: 7, 1,169, 140); with both
+moves above (`par4`) 1,495 s (7, 1,112, 376 with waits for other agents' benchmarks; 305 s of steps). At `-j 6` 1,110 s
+(`par3-j6`: 7, 952, 151), with the `k1` timeout above. Each run gave every command the serial run's result: all pass but
+`run_slice3_vm.py privilege` (250 `shadow resets N != M` at HEAD, in the serial run too) and `i8b` (the 7 known
+departures, a pass for the runner).
 
 Full suite (about 25 minutes of runner time per pass on the M4 at R2, waits for other VM users excluded; the reduced
 `kicks`/`sharedpt`/`litmus` settings are the phase's):

@@ -33,11 +33,16 @@ def at_hlt(out, rip):
             or (out['stop'] == 'resident' and out['reason'].startswith('halted') and r == rip + 1))
 
 def build():
+    """The release host (signed) and runtime. NATEMU_PREBUILT=1 (tools/run_suite.py, which builds them once first): use them
+    as built. Every cargo build, even a no-op one, links target/release/natemu-host and the runtime afresh from deps/ (the
+    host unsigned until the codesign below), so a runner building while another starts them breaks that one
+    (`hv_vm_create: 0xfae94007`, HV_DENIED; the runtime missing)."""
+    target = pathlib.Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target'))  # cargo's own output directory
+    host = target / 'release/natemu-host'
+    if os.environ.get('NATEMU_PREBUILT') == '1': return host, target / 'aarch64-unknown-none/release/natemu-runtime'
     cargo = ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release']
     subprocess.run(cargo + ['-p', 'natemu-host'], cwd=ROOT, check=True)
     subprocess.run(cargo + ['-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], cwd=ROOT, check=True)
-    target = pathlib.Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target'))  # cargo's own output directory
-    host = target / 'release/natemu-host'
     subprocess.run(['codesign', '--force', '--sign', '-', '--entitlements', ROOT / 'crates/host/entitlements.plist', host], check=True)
     return host, target / 'aarch64-unknown-none/release/natemu-runtime'
 
