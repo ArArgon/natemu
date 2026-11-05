@@ -433,6 +433,32 @@ pub fn current(b: &Block) -> bool {
     let c = control();
     b.checked == c.epoch || (b.flags & GLOBAL != 0 && b.checked >= c.global_epoch)
 }
+/// Perf chunk 22: the live block cached for (`rip`, `context`) that is current now ([`current`]), looked up with no walk:
+/// a TLB entry in use, as the CPU fetches through one without walking (never one of another address space: it is not
+/// current). `None` also when only blocks not current are cached; [`lookup`] is then the one to revalidate them.
+pub fn current_at(rip: u64, context: u64) -> Option<&'static Block> {
+    cached_at(rip, context, true)
+}
+#[cfg(feature = "perf")]
+/// Perf chunk 22 (`perf` accounting): the first live block cached for (`rip`, `context`), current or not, with no walk.
+#[cfg(feature = "perf")]
+pub fn kept_at(rip: u64, context: u64) -> Option<&'static Block> {
+    cached_at(rip, context, false)
+}
+fn cached_at(rip: u64, context: u64, current_only: bool) -> Option<&'static Block> {
+    let mut i = hash(rip, context);
+    loop {
+        let [key, number] = unsafe { l2(i).read() };
+        if number == 0 {
+            return None;
+        }
+        let b = block(number as usize - 1);
+        if key == rip && b.rip == rip && b.context == context && b.flags & DEAD == 0 && (!current_only || current(b)) {
+            return Some(b);
+        }
+        i = (i + 1) & (area::L2_ENTRIES - 1);
+    }
+}
 /// The block cached for (`rip`, `context`) whose source pages are where `rip` is fetched from now: a current one, or one
 /// `mapped` finds so (it walks the fetch of each source page's linear page: `Some(flags)` when each maps to the block's
 /// page, [`GLOBAL`] and [`LARGE`] as the walk found them; the walk may write an A bit, so the block is looked at again).
@@ -1318,6 +1344,10 @@ pub fn shadows_reset() {
     resets(vcpu()).fetch_add(1, SeqCst);
 }
 
+/// Perf chunk 22: [`drain`] would find something pending (its first load).
+pub fn pending() -> bool {
+    record_word(vcpu(), None).load(SeqCst) != 0
+}
 /// Takes this vCPU's pending invalidations: swaps `pending` to 0, then each summary word and each stale word it names
 /// (a word that loads 0 is skipped unwritten: a bit set after that load comes with a later `pending`, as its producer
 /// sets the stale bit, then the summary bit, then `pending`), and invalidates each listed

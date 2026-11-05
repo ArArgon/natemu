@@ -67,6 +67,12 @@ fn next(s: &State) -> Option<Next> {
     }
 }
 
+/// Perf chunk 22: [`take`] would take nothing at this boundary and no shadow step is owed (no event it may take, none a
+/// shadow holds).
+pub(super) fn none(s: &State) -> bool {
+    next(s).is_none()
+}
+
 /// Perf chunk 15: an event is pending that would be taken at a boundary with RFLAGS.IF set and no shadow (an NMI not blocked,
 /// the ExtINT or an APIC interrupt [`next`] takes): the resident's event-pending byte, which an inline STI reads. The common
 /// case (no vector, ExtINT or unblocked NMI posted) is one relaxed look at the record's words: a post this misses rings the

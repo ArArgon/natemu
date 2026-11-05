@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """K2 checks: system instructions run from the decoded record kept in the code cache (boot-features plan, K2).
 
-    tools/with-env python3 tools/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence,rollback,nopruns,tsc,swapgs] [--n 100000] [--reps 3]
+    tools/with-env python3 tools/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence,rollback,nopruns,tsc,swapgs,sysfast] [--n 100000] [--reps 3]
         [--xmc-rewrites N] [--host HOST --runtime RUNTIME]
 
 - `cost`: microseconds per loop iteration of one system instruction (CLI, STI, PUSHFQ+POPFQ, SWAPGS, RDTSC, CPUID,
@@ -25,6 +25,11 @@
   the TSC, and never runs backwards across vCPUs (see `tsc`).
 - `swapgs` (perf chunk 17): SWAPGS translated inline at CPL 0 exchanges GS.base and IA32_KERNEL_GS_BASE as the resident's
   does, across a fault, precise stops and interrupts, and CPL 3 can neither read nor forge the kernel's value (see `swapgs`).
+- `sysfast` (perf chunk 22): kept SYSCALL/SYSRET run by the resident's fast path stay exact at both boundaries: an interrupt
+  SYSRET makes takeable, a TF it loads, instruction breakpoints at IA32_LSTAR and the return RIP, a data breakpoint before
+  the SYSCALL, EFER.SCE cleared, a non-canonical RCX, interrupts at random times (see `sysfast`); and (see `sysfast_more`)
+  an A-bit write into the code's own page after a CR3 reload, a user-side spin only an interrupt ends, a peer's code
+  write, the LAPIC timer, a REP MOVSB at the return RIP, NMI blocking across SYSRET, a division (#DE or not) after SYSRET.
 
 Writes DIR/k2.json; exit status 1 on any failure."""
 import argparse, json, pathlib, statistics, subprocess, sys, time
@@ -567,18 +572,403 @@ def swapgs(a, report):
     return failures
 
 
+def sysfast(a, report):
+    """Perf chunk 22: the resident's SYSCALL/SYSRET fast path (a kept SYSCALL or SYSRET at a literal exit runs on the state
+    record in place and enters its target's block directly) is exact at both boundaries. Judged by the SDM (natemu only).
+    Every case is N SYSCALL round trips from a CPL-3 loop (`inc [UC]; syscall; dec r8; jnz`) into a Linux-shaped kernel side
+    (`endbr64; swapgs; ...; inc [KC]; dec r9; jnz plain; SPECIAL; plain: ...; swapgs; 7-byte NOP; sysretq`, FMASK 0x47700:
+    IF = 0 in the kernel), STAR naming the driver's GDT (SYSCALL CS 0x08, SYSRET CS 0x23), with the program's own IDT
+    (gates on IST 1, the driver's TSS): handlers for #DB, #UD, #GP and vector 0x40 count, record their first frame (RIP,
+    CS, RFLAGS; DR6 or the error code) and return. SPECIAL runs once, in round K (the records and blocks kept by then):
+    - `sysret-irq`: posts vector 0x40 with IF = 0 (a hook `nop`); the SYSRET sets IF: taken at the first CPL-3 boundary
+      (frame RIP the return RIP, CS 0x23, IF = 1), once (SDM Vol.3 7.9: recognised at the boundary after the instruction
+      that sets IF; SYSRET has no shadow).
+    - `sysret-tf`: R11 with TF: #DB (BS) before the first CPL-3 instruction (frame RIP the return RIP), once.
+    - `lstar-break`, `ret-break` (no SPECIAL): an instruction breakpoint (DR0, DR7 L0) at IA32_LSTAR, resp. at the return RIP:
+      a #DB fault there (B0) at every one of the N round trips (Vol.3 18.3.1.1; the handler sets RF).
+    - `watch` (no SPECIAL): a data breakpoint on the quadword the loop writes right before its SYSCALL: a #DB trap (B0) with
+      frame RIP the SYSCALL's, every round (Vol.3 18.3.1.2: after the writing instruction, before the SYSCALL). In these
+      four #DB cases every delivery's frame RIP is checked, not only the first one's (the first round runs the slow path).
+    - `syscall-sce0`: the kernel clears EFER.SCE and returns by IRETQ: the next SYSCALL is #UD at CPL 3 (its handler sets SCE
+      and retries it), once. `sysret-sce0`: the kernel clears SCE before its SYSRET: #UD at the SYSRET (CPL 0), once.
+    - `sysret-noncanonical`: RCX = 2^47 at the SYSRET: #GP(0) there at CPL 0 (the handler restores RCX and retries), once.
+    - `kicks-events`: no SPECIAL, 200,000 rounds under vector 0x40 posted at random times (the driver's kicker): every
+      delivery at CPL 3 with IF = 1 (none in the kernel's IF = 0 span), several hundred taken.
+    Every case reaches its end with UC = KC = N."""
+    asm, failures, runs = ref.assemble, [], []
+    N, K, KSTACK = 2000, 1000, STACK - 0x100
+    TABLES, IDTR = 0x300000, 0x300800
+    SLOT = {1: 0x300900, 6: 0x300940, 13: 0x300980, 0x40: 0x3009c0}
+    BAD, W, UC, KC, EXP1 = 0x300a00, 0x300a08, 0x300a10, 0x300a18, 0x300a20
+    def handler(v):
+        s, frame = SLOT[v], 16 if v == 13 else 8     # the frame's RIP after `push rax` (and #GP's error code)
+        first = (f'mov rax, [rsp + {frame}]\nmov [{s + 8:#x}], rax\nmov rax, [rsp + {frame + 8}]\nmov [{s + 16:#x}], rax\n'
+                 f'mov rax, [rsp + {frame + 16}]\nmov [{s + 24:#x}], rax\n'
+                 + ('mov rax, dr6\n' if v == 1 else 'mov rax, [rsp + 8]\n' if v == 13 else 'xor eax, eax\n') + f'mov [{s + 32:#x}], rax\n')
+        check = (f'cmp qword ptr [rsp + 16], 0x23\njne 3f\ntest qword ptr [rsp + 24], 0x200\njnz 4f\n3: inc qword ptr [{BAD:#x}]\n4:\n'
+                 if v == 0x40 else
+                 # Every #DB's frame RIP is the case's (EXP1, when set), not only the first one's.
+                 f'mov rax, [{EXP1:#x}]\ntest rax, rax\njz 4f\ncmp rax, [rsp + 8]\nje 4f\ninc qword ptr [{BAD:#x}]\n4:\n' if v == 1 else '')
+        tail = {1: f'and qword ptr [rsp + 24], -0x101\nor qword ptr [rsp + 24], 0x10000\n',
+                6: 'push rcx\npush rdx\nmov ecx, 0xc0000080\nrdmsr\nor eax, 1\nwrmsr\npop rdx\npop rcx\n',
+                13: 'mov rcx, r10\n',
+                0x40: 'push rcx\npush rdx\nmov ecx, 0x80b\nxor eax, eax\nxor edx, edx\nwrmsr\npop rdx\npop rcx\n'}[v]
+        return (f'h{v}:\npush rax\ninc qword ptr [{s:#x}]\n{check}cmp qword ptr [{s:#x}], 1\njne 2f\n{first}2:\n{tail}pop rax\n'
+                + ('add rsp, 8\n' if v == 13 else '') + 'iretq\n')
+    clear_sce = 'mov r10, rcx\nmov ecx, 0xc0000080\nrdmsr\nand eax, 0xfffffffe\nwrmsr\nmov rcx, r10\n'
+    specials = {
+        'sysret-irq': 'hook: nop\n', 'sysret-tf': 'or r11, 0x100\n', 'lstar-break': '', 'ret-break': '', 'watch': '',
+        'syscall-sce0': clear_sce + 'mov rsp, gs:[16]\nswapgs\nmov rax, rsp\npush 0x1b\npush rax\npush r11\npush 0x23\npush rcx\niretq\n',
+        'sysret-sce0': clear_sce, 'sysret-noncanonical': f'mov r10, rcx\nmov rcx, {1 << 47:#x}\n', 'kicks-events': ''}
+    for name, special in specials.items():
+        kernel, kl = asm('endbr64\nswapgs\nmov gs:[16], rsp\nmov rsp, gs:[24]\n'
+                         f'inc qword ptr [{KC:#x}]\ndec r9\njnz plain\n{special}plain:\nmov rsp, gs:[16]\nswapgs\n'
+                         '.byte 0x0f,0x1f,0x80,0,0,0,0\nsysret_at: sysretq', labels=True)
+        n = 200_000 if name == 'kicks-events' else N
+        dr = {'lstar-break': (KERNEL_RIP, 1), 'watch': (W, 0xd0001)}.get(name)
+        setup = (f'lidt [{IDTR:#x}]\nmov ecx, 0x1b\nmov eax, 0xfee00d00\nxor edx, edx\nwrmsr\nmov ecx, 0x80f\nmov eax, 0x1ff\nwrmsr\n'
+                 'mov ecx, 0xc0000080\nrdmsr\nor eax, 1\nwrmsr\n' + wrmsr(0xc0000081, 0x10 << 48 | 0x08 << 32) + wrmsr(0xc0000082, KERNEL_RIP)
+                 + wrmsr(0xc0000084, 0x47700) + wrmsr(0xc0000101, USER_GS) + wrmsr(0xc0000102, KERNEL_GS)
+                 + f'mov qword ptr [{KERNEL_GS + 24}], {KSTACK:#x}\n'
+                 + ('lea rax, [rip + ret_here]\nmov dr0, rax\nmov eax, 1\nmov dr7, rax\n' if name == 'ret-break' else
+                    f'mov rax, {dr[0]:#x}\nmov dr0, rax\nmov eax, {dr[1]:#x}\nmov dr7, rax\n' if dr else ''))
+        code, lab = asm(setup + 'lea rcx, [rip + user]\nmov r11d, 0x202\nsysretq\n'
+                        f'user:\n1: inc qword ptr [{UC:#x}]\nmov [{W:#x}], r8\nsc: syscall\nret_here: dec r8\njnz 1b\njmp done\n'
+                        + ''.join(handler(v) for v in SLOT) + 'done:', labels=True)
+        gates = bytearray(16 * 0x41)
+        for v in SLOT:
+            h = CODE + lab[f'h{v}']
+            gates[16 * v:16 * v + 16] = ((h & 0xffff | 0x08 << 16 | 1 << 32 | 0x8e << 40 | (h >> 16 & 0xffff) << 48).to_bytes(8, 'little')
+                                         + (h >> 32).to_bytes(8, 'little'))
+        tables = bytes(gates) + bytes(IDTR - TABLES - len(gates)) + (0x41 * 16 - 1).to_bytes(2, 'little') + TABLES.to_bytes(8, 'little')
+        tables += bytes(KC + 8 - TABLES - len(tables))
+        exp1 = {'watch': CODE + lab['sc'], 'lstar-break': KERNEL_RIP, 'ret-break': CODE + lab['ret_here'], 'sysret-tf': CODE + lab['ret_here']}.get(name, 0)
+        tables += exp1.to_bytes(8, 'little')
+        text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({8: n, 9: K})}\ncode {code.hex()}\nbody {KERNEL_RIP:#x} {kernel.hex()}\ncpl 0\nif 0\nsvr 0x1ff\n'
+                f'memory {USER_GS:#x} {bytes(32).hex()}\nmemory {KERNEL_GS:#x} {bytes(32).hex()}\nmemory {TABLES:#x} {tables.hex()}\nregion 0x3e0000 0x10000\n'
+                + (f'post {KERNEL_RIP + kl["hook"]:#x} 0x40\n' if 'hook' in kl else ''))
+        extra = ['--kick-vcpu', '0', '--kicks', '5000', '--kick-every-us', '5', '--kick-jitter-us', '10', '--kick-events', '0x40'] if name == 'kicks-events' else []
+        _, out, err = driver(a, text, a.out / 'sysfast' / name, extra)
+        def mem(at):
+            return next((int.from_bytes(bytes.fromhex(m['data'])[at - int(m['addr'], 0):][:8], 'little') for m in out['memory']
+                         if int(m['addr'], 0) <= at < int(m['addr'], 0) + len(m['data']) // 2), None)
+        problems = []
+        if not out:
+            problems.append(f'driver: {err}')
+        else:
+            g = [int(x, 0) for x in out['gpr']]
+            if out['stop'] != 'reached' or g[8] != 0 or (mem(UC), mem(KC)) != (n, n):
+                problems.append(f"stop {out['stop']} {out.get('reason')} r8 {g[8]} UC {mem(UC)} KC {mem(KC)} (want {n})")
+            ret, sysret = CODE + lab['ret_here'], KERNEL_RIP + kl['sysret_at']
+            # vector: (count, RIP, CS, a bit the RFLAGS or DR6 field must hold, error code) of the first delivery
+            want = {'sysret-irq': {0x40: (1, ret, 0x23, ('rflags', 0x200))}, 'sysret-tf': {1: (1, ret, 0x23, ('extra', 0x4000))},
+                    'lstar-break': {1: (n, KERNEL_RIP, 0x08, ('extra', 1))}, 'ret-break': {1: (n, ret, 0x23, ('extra', 1))},
+                    'watch': {1: (n, CODE + lab['sc'], 0x23, ('extra', 1))}, 'syscall-sce0': {6: (1, CODE + lab['sc'], 0x23, None)},
+                    'sysret-sce0': {6: (1, sysret, 0x08, None)}, 'sysret-noncanonical': {13: (1, sysret, 0x08, ('error', 0))},
+                    'kicks-events': {}}[name]
+            for v, s in SLOT.items():
+                count, rip, cs, rflags, extra_ = (mem(s + 8 * k) for k in range(5))
+                if v not in want:
+                    if count and not (name == 'kicks-events' and v == 0x40):
+                        problems.append(f'vector {v:#x} delivered {count} times')
+                    continue
+                c, r, cs_want, field = want[v]
+                if (count, rip, cs) != (c, r, cs_want):
+                    problems.append(f'vector {v:#x}: count {count} first RIP {rip:#x} CS {cs:#x}, want {c} {r:#x} {cs_want:#x}')
+                if field and ((field[0] == 'error' and extra_ != field[1]) or (field[0] != 'error' and not {'rflags': rflags, 'extra': extra_}[field[0]] & field[1])):
+                    problems.append(f'vector {v:#x}: {field[0]} {rflags if field[0] == "rflags" else extra_:#x} lacks {field[1]:#x}')
+            if name == 'kicks-events' and (mem(SLOT[0x40]) < 100 or mem(BAD)):
+                problems.append(f'kicks-events: {mem(SLOT[0x40])} interrupts, {mem(BAD)} outside CPL 3 or with IF = 0')
+            elif mem(BAD):
+                problems.append(f'{mem(BAD)} deliveries at the wrong place (vector 0x40: outside CPL 3 or with IF = 0; #DB: another RIP than the first one\'s)')
+        runs.append({'case': name, 'ok': not problems, 'problems': problems})
+        print(json.dumps(runs[-1]), flush=True)
+        if problems: failures.append(f'sysfast {name}: {problems}')
+    sysfast_more(a, runs, failures)
+    report['sysfast'] = {'runs': runs, 'failures': failures}
+    return failures
+
+
+def sysfast_more(a, runs, failures):
+    """Perf chunk 22, the review's further `sysfast` cases (judged by the SDM, natemu only). Each is N = 2,000 SYSCALL round
+    trips (`apic-timer`, `peer-write`: as many as they take) into a Linux-shaped kernel side (IF = 0 there, FMASK 0x47700)
+    that counts its rounds in KC, runs a case's SPECIAL in the round it names, and returns by SYSRET; the program's own IDT
+    (gates on IST 1) where a case takes events. Every case ends with UC = KC (= N where fixed):
+    - `walk-ad` (identity space, the guest's own tables): the PTE of L2, a second linear page of the user code's frame F,
+      lies in F itself once round K points L2's PDE at F (A = 0 there), then reloads CR3. The user loop at L1 = F ends with a
+      direct JMP to the SYSCALL at L2 (a literal exit; the kernel returns to L1), so the first SYSCALL after the reload
+      finds its kept decode not current, and the fetch walk that revalidates it writes that A bit into F, killing the
+      decode and the block that exited (the SDM's A-bit write, Vol.3 4.8; the code-modification rule). Every round
+      completes (the fast path's decode lookup, if it walked, would leave the linker a dead block: a halt).
+    - `user-spin`: vector 0x40 posted in the kernel of round K (IF = 0); after the SYSRET the user side spins on a flag the
+      handler sets, with no system instruction, at most 50,000,000 times. The interrupt must be taken at the first CPL-3
+      boundary (Vol.3 7.9; SYSRET has no shadow), so the spin ends at once; running out is a failure.
+    - `peer-write` (2 vCPUs): vCPU 0 makes round trips whose return RIP X is `mov eax, imm32`; vCPU 1 flips X's immediate
+      (0x11 <-> 0x22) after every 20 of vCPU 0's rounds, raises a flag and waits for vCPU 0 to acknowledge it, 300 times.
+      vCPU 0, on seeing the flag, runs CPUID (the SDM's serialising step, Vol.3 9.1.3) and its next X must load the new
+      value (before the CPUID either is allowed).
+    - `apic-timer`: the LAPIC timer periodic at 10 ms (crystal / 16, initial count 15,000) for about 0.1 s of round trips,
+      the kernel side holding a two-instruction IF = 1 window (`sti; nop; inc; cli`). Every timer interrupt is taken at
+      CPL 3 with IF = 1 or at one of the window's two interruptible boundaries (the instruction after STI is in its shadow,
+      Vol.3 7.9) with IF = 1; none is missed: each delivery comes 0.5-1.5 periods after the previous one (the first
+      after the start), and their number by the end is the periods elapsed, +-1 (the TSC rate from CPUID 0x15).
+    - `rep-target`: every round's SYSRET returns to a REP MOVSB (so its block is kept by round K); vector 0x40 posted in
+      round K's kernel, whose SYSRET returns to that REP MOVSB (RCX, its count, the return
+      RIP 0x1000): the interrupt is taken before its first iteration (frame RIP the REP, RCX, RSI, RDI untouched; Vol.3
+      7.9, Vol.2 REP: iterations are interruptible, none has run), and the 4 KiB copy then completes.
+    - `nmi-sysret`: an NMI posted in round K's kernel is taken at the next boundary (CPL 0, IF = 0 in the frame); its
+      handler posts a second NMI, which is blocked (Vol.3 6.7.1), and returns without IRET, so NMIs stay blocked across
+      that SYSRET and every round trip after it until round K2 = 1,500's kernel executes an IRETQ to itself: the second
+      NMI is taken right after that IRETQ (frame RIP its target), and only then.
+    - `div-frame`: the return RIP is `div r10` (RDX:RAX / 3, fexc's division helper: RDX != 0): RDX = 1 (no fault) or,
+      every 4th round, 5 (#DE: the quotient overflows). The #DE frame names the DIV (a fault: RIP, CS 0x23, IF, RSP) with
+      RAX, RDX unchanged and the other registers live (r12, the round, read back from memory); the handler skips the DIV;
+      the quotients and remainders sum to the SDM's values and r12 survives every division."""
+    asm = ref.assemble
+    N, K, K2, KSTACK = 2000, 1000, 1500, STACK - 0x100
+    D = 0x300000                              # one page, read back: IDT, IDTR (D + 0x800), the slots below
+    IDTR = D + 0x800
+    UC, KC, BAD, CNT, FLAG, SPINFAIL, QSUM, RSUM = (D + 0x900 + 8 * k for k in range(8))
+    F1, F2, M = D + 0x980, D + 0x9c0, D + 0xa00   # first and second frames (RIP, CS, RFLAGS, KC); misc slots M + 8k
+    SAVE, RESUME, START, DEADLINE, LAST, END, KW, KIRQ = (D + 0xa80 + 8 * k for k in range(8))
+    TS = D + 0xc00                            # apic-timer: the TSC at each of the first 64 deliveries
+    gate = lambda h: ((h & 0xffff | 0x08 << 16 | 1 << 32 | 0x8e << 40 | (h >> 16 & 0xffff) << 48).to_bytes(8, 'little')
+                      + (h >> 32).to_bytes(8, 'little'))
+    eoi = 'push rcx\npush rdx\nmov ecx, 0x80b\nxor eax, eax\nxor edx, edx\nwrmsr\npop rdx\npop rcx\n'   # (rax saved by the caller)
+
+    def frame(slot, at):
+        """The handler's frame (RIP, CS, RFLAGS at rsp + at) and KC into `slot` (rax scratch)."""
+        return ''.join(f'mov rax, [rsp + {at + 8 * k}]\nmov [{slot + 8 * k:#x}], rax\n' for k in range(3)) + f'mov rax, [{KC:#x}]\nmov [{slot + 24:#x}], rax\n'
+
+    def kernel(specials, before=''):
+        """The kernel side at KERNEL_RIP: `specials` {round: code} run in that round, `before` in every round before the exit."""
+        jumps = ''.join(f'cmp qword ptr [{KC:#x}], {k}\nje s{k}\n' for k in specials)
+        return asm(f'endbr64\nswapgs\nmov gs:[16], rsp\nmov rsp, gs:[24]\ninc qword ptr [{KC:#x}]\n{jumps}plain:\n{before}'
+                   'mov rsp, gs:[16]\nswapgs\n.byte 0x0f,0x1f,0x80,0,0,0,0\nsysret_at: sysretq\n'
+                   + ''.join(f's{k}:\n{code}jmp plain\n' for k, code in specials.items()), labels=True)
+
+    def setup(kstack, idt):
+        return ((f'lidt [{IDTR:#x}]\nmov ecx, 0x1b\nmov eax, 0xfee00d00\nxor edx, edx\nwrmsr\nmov ecx, 0x80f\nmov eax, 0x1ff\nwrmsr\n' if idt else '')
+                + 'mov ecx, 0xc0000080\nrdmsr\nor eax, 1\nwrmsr\n' + wrmsr(0xc0000081, 0x10 << 48 | 0x08 << 32) + wrmsr(0xc0000082, KERNEL_RIP)
+                + wrmsr(0xc0000084, 0x47700) + wrmsr(0xc0000101, USER_GS) + wrmsr(0xc0000102, KERNEL_GS)
+                + f'mov qword ptr [{KERNEL_GS + 24}], {kstack:#x}\n')
+
+    def program(user, handlers, extra=''):
+        """CPL-0 setup, then SYSRET to `user` (CPL 3, IF = 1); `handlers` h<vector>; ends at `done`."""
+        return asm(setup(KSTACK, True) + extra + f'lea rcx, [rip + user]\nmov r11d, 0x202\nsysretq\nuser:\n{user}jmp done\n{handlers}done:', labels=True)
+
+    def page(lab, vectors):
+        p = bytearray(0x1000)
+        for v in vectors:
+            p[16 * v:16 * v + 16] = gate(CODE + lab[f'h{v}'])
+        p[0x800:0x80a] = (16 * (max(vectors, default=0) + 1) - 1).to_bytes(2, 'little') + D.to_bytes(8, 'little')
+        return p
+
+    def text(code, kern, lab, vectors, items='', regs=None):
+        return (f'rip {CODE:#x}\nrflags 0x2\n{gprs({8: N, **(regs or {})})}\ncode {code.hex()}\nbody {KERNEL_RIP:#x} {kern.hex()}\ncpl 0\nif 0\nsvr 0x1ff\n'
+                f'memory {USER_GS:#x} {bytes(32).hex()}\nmemory {KERNEL_GS:#x} {bytes(32).hex()}\nmemory {D:#x} {page(lab, vectors).hex()}\n'
+                f'region 0x3e0000 0x10000\n{items}')
+
+    def memory(c, at, n=8):
+        for m in c['memory']:
+            base, data = int(m['addr'], 0), bytes.fromhex(m['data'])
+            if base <= at and at + n <= base + len(data):
+                return data[at - base:at - base + n]
+        return None
+
+    def word(c, at):
+        b = memory(c, at)
+        return None if b is None else int.from_bytes(b, 'little')
+
+    def common(c, n=N):
+        g = [int(x, 0) for x in c['gpr']]
+        uc, kc = word(c, UC), word(c, KC)
+        ok = c['stop'] == 'reached' and uc == kc and (n is None or uc == n)
+        return [] if ok else [f"stop {c['stop']} {c.get('reason')} fault {c.get('fault')} rip {c['rip']} r8 {g[8]} UC {uc} KC {kc} (want {n})"]
+
+    def run(name, text_, extra, judge):
+        _, out, err = driver(a, text_, a.out / 'sysfast' / name, extra)
+        problems = [f'driver: {err}'] if not out else judge(out)
+        runs.append({'case': name, 'ok': not problems, 'problems': problems})
+        print(json.dumps(runs[-1]), flush=True)
+        if problems: failures.append(f'sysfast {name}: {problems}')
+
+    def first(c, slot, count, rip, cs, flag_if):
+        got = (word(c, CNT), word(c, slot), word(c, slot + 8))
+        want = (count, rip, cs)
+        p = [] if got == want else [f'count, first RIP, CS {got}, want {want}']
+        rf = word(c, slot + 16) or 0
+        return p + ([] if bool(rf & 0x200) == flag_if else [f'frame RFLAGS {rf:#x}: IF should be {int(flag_if)}'])
+
+    # walk-ad: identity space; the guest's tables (PML4 -> PDPT -> PD; PD[0] -> PT0, PD[1] -> PT1, PD[3] -> PT3).
+    L1, L2, S, SC = 0x100000, 0x7ff000, 0x104000, 0x800
+    PML4, PDPT, PD, PT0, PT1, PT3 = 0x110000, 0x111000, 0x112000, 0x113000, 0x114000, 0x115000
+    WSTACK, NONLEAF = 0x3d0000, P.P | P.RW | P.US | P.A
+    s_code = asm(f'mov eax, {PML4:#x}\nmov cr3, rax\n' + setup(WSTACK - 0x100, False) + f'mov ecx, {L1:#x}\nmov r11d, 0x202\nsysretq\n')
+    end = S + len(s_code)
+    user, ul = asm(f'1: inc qword ptr [{UC:#x}]\nj: .byte 0xe9,0,0,0,0\nret1: dec r8\njnz 1b\nmov eax, {end:#x}\njmp rax\n', labels=True)
+    rel = (L2 + SC) - (L1 + ul['j'] + 5)
+    user = user[:ul['j']] + b'\xe9' + rel.to_bytes(4, 'little', signed=True) + user[ul['j'] + 5:]
+    assert len(user) < SC
+    # F: the user code, the SYSCALL at offset SC (run through L2 only), PTE(L2) at 0xff8 (P, RW, US; A = 0) for round K.
+    f_page = user + bytes(SC - len(user)) + asm('syscall') + bytes(0xff8 - SC - 2) + (L1 | P.P | P.RW | P.US).to_bytes(8, 'little')
+    kern, kl = kernel({K: f'mov eax, {L1 | NONLEAF:#x}\nmov [{PD + 8 * 3:#x}], rax\nmov rax, cr3\nmov cr3, rax\n'}, f'mov ecx, {L1 + ul["ret1"]:#x}\n')
+    tables = {PML4: {0: PDPT | NONLEAF}, PDPT: {0: PD | NONLEAF}, PD: {0: PT0 | NONLEAF, 1: PT1 | NONLEAF, 3: PT3 | NONLEAF},
+              PT0: {(v >> 12) & 511: v | P.LEAF for v in (L1, S, PD)},
+              PT1: {(v >> 12) & 511: v | P.LEAF for v in [KERNEL_RIP, USER_GS, KERNEL_GS, D, *range(0x3c0000, WSTACK, 0x1000),
+                                                          *(0x3e8000 + o for o in (0, 0x1000, 0x3000, 0x4000, 0x5000, 0x6000))]},
+              PT3: {(L2 >> 12) & 511: L1 | P.LEAF}}
+    table_items = ''.join(f'memory {t:#x} {b"".join(e.get(i, 0).to_bytes(8, "little") for i in range(512)).hex()}\n' for t, e in tables.items())
+    run('walk-ad', (f'identity\nrip {S:#x}\nrflags 0x2\n{gprs({4: WSTACK, 8: N})}\ncpl 0\nif 0\nbody {S:#x} {s_code.hex()}\nbody {L1:#x} {f_page.hex()}\n'
+                    f'body {KERNEL_RIP:#x} {kern.hex()}\nmemory {USER_GS:#x} {bytes(32).hex()}\nmemory {KERNEL_GS:#x} {bytes(32).hex()}\n'
+                    f'memory {D:#x} {bytes(0x1000).hex()}\n{table_items}region 0x3c0000 {WSTACK - 0x3c0000:#x}\n'), [],
+        lambda c: common(c))
+
+    # user-spin
+    SPIN = 50_000_000
+    kern, kl = kernel({K: 'spin_hook: nop\n'})
+    code, lab = program(f'1: inc qword ptr [{UC:#x}]\nsyscall\nret_here: cmp qword ptr [{KC:#x}], {K}\njne 2f\nmov ebx, {SPIN}\n'
+                        f'3: cmp qword ptr [{FLAG:#x}], 0\njne 2f\ndec rbx\njnz 3b\ninc qword ptr [{SPINFAIL:#x}]\n2: dec r8\njnz 1b\n',
+                        f'h64: push rax\ninc qword ptr [{CNT:#x}]\ncmp qword ptr [{CNT:#x}], 1\njne 2f\n{frame(F1, 8)}'
+                        f'2: mov qword ptr [{FLAG:#x}], 1\n{eoi}pop rax\niretq\n')
+    run('user-spin', text(code, kern, lab, [0x40], f'post {KERNEL_RIP + kl["spin_hook"]:#x} 0x40\n'), [],
+        lambda c: common(c) + first(c, F1, 1, CODE + lab['ret_here'], 0x23, True)
+        + ([f'the spin ran out {word(c, SPINFAIL)} times: the interrupt was not taken'] if word(c, SPINFAIL) else []))
+
+    # peer-write (vCPU 0's slots: ACK M, the flag M + 8, SEEN M + 16)
+    ACK, PFLAG, SEEN, REWRITES, PACE = M, M + 8, M + 16, 300, 20
+    kern, kl = kernel({})
+    c0, l0 = asm(setup(KSTACK, False) + 'lea rcx, [rip + user]\nmov r11d, 0x202\nsysretq\nuser:\n'
+                 f'''xor r9d, r9d\nxor r10d, r10d\nxor r12d, r12d\nxor r14d, r14d
+1: inc qword ptr [{UC:#x}]\nsyscall
+x: mov eax, 0x11
+test r14, r14\njz 2f\ninc r12\nxor r14d, r14d\nmov [{SEEN:#x}], r10\ncmp eax, r13d\nje 2f\ninc r9
+2: inc qword ptr [{ACK:#x}]\nmov rax, [{PFLAG:#x}]\ncmp rax, r10\nje 4f\nmov r10, rax\nxor eax, eax\ncpuid
+mov r13d, 0x11\ntest r10b, 1\njz 3f\nmov r13d, 0x22\n3: mov r14d, 1
+4: cmp r12, {REWRITES}\njb 1b\njmp done\ndone:''', labels=True)
+    assert len(c0) < 0xff0
+    PEER = 0x108000
+    c1 = asm(f'''xor ecx, ecx
+1: mov r8, [{ACK:#x}]
+2: mov rax, [{ACK:#x}]\nsub rax, r8\ncmp rax, {PACE}\njae 3f\npause\njmp 2b
+3: inc ecx\nmov al, 0x11\ntest cl, 1\njz 5f\nmov al, 0x22
+5: mov byte ptr [{CODE + l0["x"] + 1:#x}], al\nmov [{PFLAG:#x}], rcx\ncmp ecx, {REWRITES}\njae 9f
+6: cmp [{SEEN:#x}], rcx\nje 1b\npause\njmp 6b
+9: nop''')
+
+    def peer_judge(out):
+        v0, v1 = out['cpus']
+        g0, g1 = [int(x, 0) for x in v0['gpr']], [int(x, 0) for x in v1['gpr']]
+        p = common(v0, None)
+        if g0[9]: p.append(f'{g0[9]} of {g0[12]} checks ran the old X after the flag and CPUID')
+        if (g0[12], g1[1]) != (REWRITES, REWRITES): p.append(f'{g0[12]} checks, {g1[1]} rewrites, {REWRITES} wanted')
+        return p + ([] if v1['stop'] == 'reached' else [f"vCPU 1 stop {v1['stop']} {v1.get('reason')}"])
+    # (The `memory` item on X's page makes it writable for the peer.)
+    run('peer-write', (f'body {CODE:#x} {c0.hex()}\nbody {KERNEL_RIP:#x} {kern.hex()}\nbody {PEER:#x} {c1.hex()}\nmemory {CODE + 0xff0:#x} 00\n'
+                       f'memory {USER_GS:#x} {bytes(32).hex()}\nmemory {KERNEL_GS:#x} {bytes(32).hex()}\nmemory {D:#x} {bytes(0x1000).hex()}\n'
+                       f'region 0x3e0000 0x10000\ncpu\nrip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncpl 0\nif 0\n'
+                       f'cpu\nrip {PEER:#x}\nrflags 0x2\n{gprs({4: STACK - 0x8000})}\n'), [], peer_judge)
+
+    # apic-timer: vector 0x41, LVT timer periodic, divide by 16 (DCR 3), initial count 15,000: a 10 ms period.
+    DIVIDE, INITIAL = 16, 15000
+    kern, kl = kernel({}, f'sti\nnop\nk1: inc qword ptr [{KW:#x}]\nk2: cli\nrdtsc\nshl rdx, 32\nor rax, rdx\nmov [{LAST:#x}], rax\n')
+    window = (KERNEL_RIP + kl['k1'], KERNEL_RIP + kl['k2'])
+    timer = (f'mov eax, 0x15\ncpuid\nmov r12d, eax\nmov r13d, ebx\nmov r14d, ecx\nmov [{M:#x}], r12\nmov [{M + 8:#x}], r13\nmov [{M + 16:#x}], r14\n'
+             'mov rax, r14\nimul rax, r13\nxor edx, edx\ndiv r12\nxor edx, edx\nmov ecx, 10\ndiv rcx\nmov r15, rax\n'   # r15: TSC ticks in 0.1 s
+             'mov ecx, 0x83e\nmov eax, 3\nxor edx, edx\nwrmsr\nmov ecx, 0x832\nmov eax, 0x20041\nwrmsr\n'
+             f'mov ecx, 0x838\nmov eax, {INITIAL}\nwrmsr\nrdtsc\nshl rdx, 32\nor rax, rdx\nmov [{START:#x}], rax\nadd rax, r15\nmov [{DEADLINE:#x}], rax\n')
+    code, lab = program(f'1: inc qword ptr [{UC:#x}]\nsyscall\nmov rax, [{LAST:#x}]\ncmp rax, [{DEADLINE:#x}]\njb 1b\nmov [{END:#x}], rax\n',
+                        f'''h65: push rax\npush rcx\npush rdx\nmov rcx, [{CNT:#x}]\ncmp rcx, 64\njae 1f\nrdtsc\nshl rdx, 32\nor rax, rdx\nmov [{TS:#x} + rcx * 8], rax
+1: inc qword ptr [{CNT:#x}]\ntest qword ptr [rsp + 40], 0x200\njz 8f\ncmp qword ptr [rsp + 32], 0x23\nje 9f\nmov rax, [rsp + 24]
+cmp rax, {window[0]:#x}\nje 7f\ncmp rax, {window[1]:#x}\nje 7f
+8: inc qword ptr [{BAD:#x}]\njmp 9f
+7: inc qword ptr [{KIRQ:#x}]
+9: mov ecx, 0x80b\nxor eax, eax\nxor edx, edx\nwrmsr\npop rdx\npop rcx\npop rax\niretq\n''', timer)
+
+    def timer_judge(c):
+        p = common(c, None)
+        den, num, count, start, finish = word(c, M), word(c, M + 8), word(c, CNT), word(c, START), word(c, END)
+        if not (den and num and count and finish):
+            return p + [f'CPUID 0x15 {den} {num}, {count} interrupts, end {finish}']
+        period = DIVIDE * INITIAL * num / den                   # TSC ticks (TSC = crystal x num / den)
+        ts = [word(c, TS + 8 * i) for i in range(min(count, 64))]
+        by_end, expected = sum(t <= finish for t in ts), int((finish - start) / period)
+        if abs(by_end - expected) > 1: p.append(f'{by_end} interrupts by the end, {expected} periods elapsed')
+        gaps = [(t - u) / period for u, t in zip([start] + ts, ts)]
+        if not all(0.5 < g < 1.5 for g in gaps): p.append(f'delivery gaps (periods) {[round(g, 2) for g in gaps]}: one missed or extra')
+        if word(c, BAD): p.append(f'{word(c, BAD)} interrupts outside CPL 3 and the IF = 1 window, or with IF = 0')
+        runs_info.update({'interrupts': count, 'in_window': word(c, KIRQ), 'rounds': word(c, UC)})
+        return p
+    runs_info = {}
+    run('apic-timer', text(code, kern, lab, [0x41]), [], timer_judge)
+    runs[-1].update(runs_info)
+
+    # rep-target: round K's SYSRET returns to REP (RCX = 0x1000, the REP's count) with RSI, RDI the user side's.
+    REP, SRC, DST = 0x1000, 0x320000, 0x330000
+    pattern = bytes((37 * i + 11) & 0xff for i in range(0x1000))
+    kern, kl = kernel({K: 'rep_hook: nop\n'}, before=f'mov ecx, {REP:#x}\n')
+    code, lab = program(f'1: inc qword ptr [{UC:#x}]\nmov esi, {SRC:#x}\nmov edi, {DST:#x}\nsyscall\nret_here: dec r8\njnz 1b\n',
+                        f'h64: push rax\ninc qword ptr [{CNT:#x}]\ncmp qword ptr [{CNT:#x}], 1\njne 2f\n{frame(F1, 8)}'
+                        f'mov [{M:#x}], rcx\nmov [{M + 8:#x}], rsi\nmov [{M + 16:#x}], rdi\n2: {eoi}pop rax\niretq\n')
+    rep = asm(f'rep movsb\nmov eax, {CODE + lab["ret_here"]:#x}\njmp rax')
+    run('rep-target', text(code, kern, lab, [0x40], f'body {REP:#x} {rep.hex()}\nmemory {SRC:#x} {pattern.hex()}\nmemory {DST:#x} {bytes(0x1000).hex()}\n'
+                                                 f'post {KERNEL_RIP + kl["rep_hook"]:#x} 0x40\n'), [],
+        lambda c: common(c) + first(c, F1, 1, REP, 0x23, True)
+        + ([] if (word(c, M), word(c, M + 8), word(c, M + 16)) == (REP, SRC, DST) else
+           [f'RCX, RSI, RDI at the interrupt {[hex(word(c, M + 8 * k) or 0) for k in range(3)]}, want the REP\'s start {[hex(REP), hex(SRC), hex(DST)]}'])
+        + ([] if memory(c, DST, 0x1000) == pattern else ['the copy is wrong']))
+
+    # nmi-sysret
+    kern, kl = kernel({K: 'nmi_hook: nop\n',
+                       K2: 'mov rax, rsp\npush 0x10\npush rax\npushfq\npush 0x08\nlea rax, [rip + iret_to]\npush rax\niretq\niret_to: nop\n'})
+    code, lab = program(f'1: inc qword ptr [{UC:#x}]\nsyscall\ndec r8\njnz 1b\n',
+                        f'''h2: mov [{SAVE:#x}], rax\ninc qword ptr [{CNT:#x}]\ncmp qword ptr [{CNT:#x}], 1\njne 5f\n{frame(F1, 0)}nmi_hook2: nop
+mov eax, 1000\n6: dec eax\njnz 6b
+mov rax, [rsp]\nmov [{RESUME:#x}], rax\npush qword ptr [rsp + 16]\npopfq\nmov rsp, [rsp + 24]\nmov rax, [{SAVE:#x}]\njmp qword ptr [{RESUME:#x}]
+5: {frame(F2, 0)}mov rax, [{SAVE:#x}]\niretq\n''')
+
+    def nmi_judge(c):
+        p = common(c) + first(c, F1, 2, KERNEL_RIP + kl['nmi_hook'] + 1, 0x08, False)
+        if word(c, F1 + 24) != K: p.append(f'first NMI in round {word(c, F1 + 24)}, want {K}')
+        got, want = (word(c, F2), word(c, F2 + 8), word(c, F2 + 24)), (KERNEL_RIP + kl['iret_to'], 0x08, K2)
+        return p + ([] if got == want else [f'second NMI RIP, CS, round {got}, want {want} (right after the IRETQ)'])
+    run('nmi-sysret', text(code, kern, lab, [2], f'nmi {KERNEL_RIP + kl["nmi_hook"]:#x}\nnmi {CODE + lab["nmi_hook2"]:#x}\n'), [], nmi_judge)
+
+    # div-frame
+    kern, kl = kernel({})
+    code, lab = program(f'''mov r10d, 3
+1: inc qword ptr [{UC:#x}]\nmov r12, [{UC:#x}]\nmov rax, r12\nmov edx, 1\ntest r12b, 3\njnz 2f\nmov edx, 5
+2: syscall
+ret_here: div r10
+cmp r12, [{UC:#x}]\nje 3f\ninc qword ptr [{BAD:#x}]
+3: add [{QSUM:#x}], rax\nadd [{RSUM:#x}], rdx\ncmp qword ptr [{UC:#x}], {N}\njb 1b\n''',
+                        f'''h0: push rbx\ninc qword ptr [{CNT:#x}]\nlea rbx, [rip + ret_here]\ncmp [rsp + 8], rbx\njne 8f\ncmp qword ptr [rsp + 16], 0x23\njne 8f
+test qword ptr [rsp + 24], 0x200\njz 8f\ncmp qword ptr [rsp + 32], {STACK:#x}\njne 8f\ncmp rax, r12\njne 8f\ncmp rdx, 5\njne 8f
+cmp r12, [{UC:#x}]\nje 9f
+8: inc qword ptr [{BAD:#x}]
+9: add qword ptr [rsp + 8], 3\nxor eax, eax\nxor edx, edx\npop rbx\niretq\n''')
+    assert code[lab['ret_here']:lab['ret_here'] + 3] == bytes.fromhex('49f7f2')    # the 3 bytes the handler skips
+    live = [k for k in range(1, N + 1) if k % 4]
+    want_q, want_r = sum(((1 << 64) + k) // 3 for k in live) % (1 << 64), sum(((1 << 64) + k) % 3 for k in live)
+    run('div-frame', text(code, kern, lab, [0]), [],
+        lambda c: common(c)
+        + ([] if (word(c, CNT), word(c, BAD)) == (N // 4, 0) else [f'{word(c, CNT)} #DE (want {N // 4}), {word(c, BAD)} with a wrong frame or registers'])
+        + ([] if (word(c, QSUM), word(c, RSUM)) == (want_q, want_r) else [f'quotient, remainder sums {word(c, QSUM)}, {word(c, RSUM)}, want {want_q}, {want_r}']))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
-    ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc', 'swapgs'])
+    ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc', 'swapgs', 'sysfast'])
     ap.add_argument('--n', type=int, default=100_000)
     ap.add_argument('--reps', type=int, default=3)
     ap.add_argument('--xmc-rewrites', type=int, default=2000, help='xmc: rewrites, each checked (one per XMC_K or more iterations of vCPU 0)')
-    ap.add_argument('--host', type=pathlib.Path)
+    ap.add_argument('--host', type=pathlib.Path, help='the host binary, or the directory holding it (keeps its name out of the command line)')
     ap.add_argument('--runtime', type=pathlib.Path)
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
+    if a.host and a.host.is_dir(): a.host = a.host / 'natemu-host'
     if not (a.host and a.runtime): a.host, a.runtime = vm.build()
     report, failures = {}, []
     if 'cost' in a.only: failures += cost(a, report)
@@ -589,6 +979,7 @@ def main():
     if 'nopruns' in a.only: failures += nopruns(a, report)
     if 'tsc' in a.only: failures += tsc(a, report)
     if 'swapgs' in a.only: failures += swapgs(a, report)
+    if 'sysfast' in a.only: failures += sysfast(a, report)
     (a.out / 'k2.json').write_text(json.dumps(report, indent=1) + '\n')
     for f in failures: print('FAIL', f)
     sys.exit(1 if failures else 0)

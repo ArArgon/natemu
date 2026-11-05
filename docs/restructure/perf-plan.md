@@ -2218,6 +2218,224 @@ the replays and debugging, and the host no longer uses it. `test_serve.py` runs 
 the replays, `test_channel.py`, the unit tests and every VM run. No test guards against a fork on the spawn (one would have to
 read the source); the stress cases are what caught it.
 
+### Measured (chunk 22: a SYSCALL/SYSRET fast path in the resident, November 4; branch perf22-sysfast on 71aae61, series58-channel-r1)
+
+Evidence and harness: `natemu-raw/sysfast3-20261104-01/` (README there). Base: 71aae61 (chunk 21) with its resident; the
+change: this branch, the same host binaries (chunk 22 changes only the resident and `run_k2.py`). Compiler series58-channel-r1
+for both; the `natemu` stub, cache off, `mitigations=off nokaslr`, 2 GiB, one VM at a time.
+
+**The two trips today** (each guest system call is a SYSCALL trip and a SYSRET trip; costs per resident entry from chunk 17's
+sub-buckets, a perf build, so with its accounting). A CPL-3 block ends before its SYSCALL with a literal exit to the
+SYSCALL's RIP, which is never linked (its target is a system instruction), so every SYSCALL enters the resident; the kernel's
+exit block (`...; swapgs; 7-byte NOP`) likewise ends with a literal exit to its SYSRET.
+1. Gate and entry kind (31 ns with the linker's own work): `exception_capture` saves the native state (31 GPRs, 32 Q
+   registers, FPCR, FPSR); `finish` copies the 800-byte frame into `Shared::captured` (before the bucket switch: the perf
+   build charges it to `guest`); `returned` reads ESR/FAR/ELR/SPSR, disarms (nothing armed: one load), cancels a watch step
+   and dispatches to the linker.
+2. `load` and `bank` (23 ns): the whole state record (about 1.4 KiB) copied to the stack, then 16 GPRs, the flags (NZCV,
+   PF/AF, DF; IF from the page at CPL 0), the GS bases at CPL 0, XMM0-15 and MXCSR's flags from the frame.
+3. `block_at` and the link-point checks (7 ns): the block that ran the `svc` (PC hint), its REP self-exit, RF ends, the RIP
+   is one of its link targets.
+4. `find`, first pass: the boundary checks (12 ns: drain's load, the LAPIC poll, the trap/TF/DR7 test, `events::take`, the
+   breakpoint and step tests, the code context, `select_l1`), the lookup (7 ns: the kept decode), then the instruction
+   (27 ns with its accounting: `system`, `transaction`'s common checks, `syscalls::execute`, `commit`).
+5. `find`, second pass at the target (IA32_LSTAR, or the return RIP): the same boundary checks (12 ns) and lookup (7 ns),
+   the L1 table of the new context selected and the entry filled (already there).
+6. The linker's link step: nothing to link (the target follows a system instruction).
+7. `enter` (40 ns + 31 ns): the shadow, flag bytes, FS/GS bases, KERNEL_GS_BASE, FCW, TSC offset, SIMD and x87 bytes and
+   the event-pending byte (18 ns); the native frame (10 ns); the state record written back (12 ns); the shadow-space switch
+   at the CPL change (`tables::select`: TCR.EPD1 set, ISB, TTBR1, TTBR0, ISB, TCR restored, ISB; 31 ns); `resume_exception`
+   and ERET.
+
+Avoidable for these two kinds: the record's copy out and back (2 and 7: about 24 ns), the second pass's boundary checks (5:
+12 ns, less the checks the instruction needs, a few ns), the captured frame (1: an 800-byte copy no literal exit or
+dispatcher miss reads). Not avoidable: the gate, `bank` and the native frame (the instruction reads and writes GPRs and flags
+and the target is entered from the frame), both lookups (the decode and the target must be current: the fetch-walk rule;
+the fast path takes the decode only when it is current with no walk, see below),
+`enter`'s per-entry writes (each is rewritten at every entry by the containment rules), and the shadow-space switch (the CPL
+change switches TTBR, which only EL1 can do; each of its three ISBs orders a step the next relies on). Estimate, unmeasured:
+about 40 ns per trip, 80 ns per system call, about 1.3 s of `hackbench` N = 1 (16 M system calls).
+
+**Built** (resident only: `execution.rs`, `main.rs`, `cache.rs`, `execution/events.rs`, `execution/lapic.rs`; no abi, host
+or compiler change):
+1. **`sys_fast`**, called by `returned` for every `svc #LINK` before the linker. It works on the state record in place (the
+   record is this vCPU's, EL1-only; nothing else reads it while the resident runs, and nothing on this path exits to the
+   host), so it neither loads nor writes back a copy (`enter` skips the record write when given the record itself). It goes
+   on only when, at the exit's boundary, `find`'s pass would find nothing to do: `State::debug` zero (no pending trap, step
+   mark or data-breakpoint hits), TF clear, DR7 arming nothing (no instruction breakpoint, no watchpoint programmed), no MOV
+   SS or STI shadow, not between REP iterations, no plain step, no wanted stop, nothing posted for this vCPU (drain's first
+   load), no LAPIC expiry due and no reinjection backlog (`lapic::due`, `poll`'s test), no event `events::take` would take
+   (`events::none`, after the bank, so IF is the block's); the exit is an ordinary one of a live block (not the step block,
+   not a REP self-exit, the RIP one of its link targets); and the kept decode at the RIP is a SYSCALL or a SYSRET that is
+   current, looked up with no walk (`cache::current_at`: a TLB entry in use, as the CPU fetches through one; after a CR3 load
+   or TLB flush it is not current and the linker, which walks, runs it), and commits (EFER.SCE, no LOCK; SYSRET at CPL 0 with
+   REX.W and a canonical RCX). Otherwise it returns and the linker runs as before; what it changed is what the linker then
+   does again to the same effect (the bank from the same frame and page, RIP, RF cleared). Nothing before the commit walks
+   or writes guest memory (the review's B1: with the walking lookup first built, a fetch walk writing an A bit into a page
+   holding the exiting block killed it, and on a fall-back the linker then halted on a dead source, `bad_link`). The
+   instruction runs as every system instruction does (`system`, `syscalls::execute`). Then, in place of `find`'s next pass, only what the instruction can change is looked
+   at: the debug state (a TF SYSRET loads from R11 owes its trap before the first CPL-3 instruction) and the takeable events
+   (SYSRET may set IF); either, or a target that is not a kept block (a miss, or a system instruction at the target),
+   continues as `find` does after a system instruction (`after_system`: the record loaded, `find` from the next boundary, the
+   linker's `stale_links` count for a target killed as placed or an exiting block gone). Otherwise the block at the target RIP
+   (the lookup in the new context, as `find`'s: it may walk, after the commit) is put in the context's L1 table and entered
+   (`enter`; `stale_links` counted as the linker counts it when that walk killed the exiting block).
+2. **No captured frame for literal exits and dispatcher misses**: `finish` copies the gate's frame into `Shared::captured`
+   only when the entry is not an `svc #LINK` or `svc #MISS` (`frame_only`): their services (`linker`, `sys_fast`, `missed`, a
+   halt) read only the gate's frame; `captured` is read only by the paths that resume generated code mid-block (division,
+   doorbell, aborts, splits, helpers, watch steps), which still get it. Every literal exit and miss gains, not only these two.
+3. `perf` resident only: `Control::system_from` slot 26 (past the buckets; the host prints it as `"?"`) counts the trips the
+   fast path ran to the end, and `Control::system_counts` slots 0x7c-0x7f (past every kind; the host prints them as kinds
+   `0x7c`..`0x7f` in `k1.systems.kinds`) count why it did not: 0x7c no current decode (a CR3 load or TLB flush since its last
+   use), 0x7d the boundary before it had something to do or the exit was not an ordinary one, 0x7e the decode current but not
+   committing, 0x7f after the instruction a trap or event to take or a target not kept (`after_system`). Before the
+   instruction a decline is counted only when the exit's RIP holds a kept SYSCALL or SYSRET decode, current or not (looked up
+   with no walk, `cache::kept_at`). The default resident has no counter.
+
+**Why it is exact** (SDM Vol.2 SYSCALL, SYSRET; Vol.3 7.9, 18.3.1; the cross-modifying-code rule). The instruction itself is
+the same transaction as before (RCX/R11, RFLAGS & ~IA32_FMASK, the STAR selectors with the fixed attributes, CPL, IA32_LSTAR;
+SYSRET's RFLAGS from R11, its CS/SS, CPL 3); the fast path only decides, before it, that it commits (a #UD without SCE or
+with LOCK, SYSRET's #GP(0) at CPL > 0 or for a non-canonical RCX, and SYSRETL's refusal all leave by the linker, so no fault
+is ever delivered on the in-place path). The boundary before it is checked as `find` checks it, with nothing to do: the same
+predicates (trap, TF, breakpoint, shadow, events, timer, invalidations), so the same instruction runs at the same boundary.
+The decode is used only when current with no walk; one not current (a CR3 load or TLB flush since) goes to the linker,
+whose lookup walks the fetch and sets its A bits as the CPU's TLB fill would.
+At the boundary after it, `find` would take a trap the instruction left (SYSRET loading TF: the debug state; SYSCALL leaves TF
+only if it was set, which the first check excludes) and events now takeable: these are checked and fall back. What the fast
+path does not repeat there is the drain and the LAPIC poll: neither instruction posts, writes memory or arms the timer, and
+anything posted or falling due after the first check rings this vCPU's doorbell (every post is followed by a kick; the
+virtual timer is armed at the deadline), which is masked in the resident and taken when the target block starts: at its
+first word the vCPU stops there at once and `find` drains and polls at that boundary, as for any post landing after `find`'s
+last look before an entry today (a block starting with a REP string arms a stop instead, as today). Neither SYSCALL nor
+SYSRET is serializing, so a peer's code write may become visible at any later boundary. No event can become takeable by the
+instruction but through IF (SYSCALL can only clear it; NMI blocking, TPR and the shadows are untouched), which is checked.
+Instruction breakpoints at either target and data breakpoints anywhere keep DR7 non-zero, so the fast path never runs while
+one is armed; TF at the SYSCALL's start, or a trap pending from the instruction before it, keeps the debug state non-zero.
+
+**Tests.** `run_k2.py sysfast` (natemu, judged by the SDM): N = 2,000 SYSCALL round trips from CPL 3 into a
+Linux-shaped kernel side, with the program's own IDT (gates on IST 1 of the driver's TSS), its handlers counting and recording
+their first frame; one special round K = 1,000, when every record and block is kept: `sysret-irq` (an interrupt posted
+while IF = 0 in the kernel: taken at the first CPL-3 boundary after the SYSRET, frame RIP the return RIP, once),
+`sysret-tf` (R11 with TF: #DB with BS before the first CPL-3 instruction), `lstar-break` and `ret-break` (instruction
+breakpoints at IA32_LSTAR and at the return RIP: a #DB fault at every round), `watch` (a data breakpoint on the quadword the
+loop writes right before its SYSCALL: the trap at the SYSCALL's RIP every round), `syscall-sce0` and `sysret-sce0` (EFER.SCE
+cleared: #UD at the next SYSCALL at CPL 3, resp. at the SYSRET at CPL 0, once), `sysret-noncanonical` (RCX = 2^47: #GP(0) at
+the SYSRET, once), `kicks-events` (200,000 rounds under interrupts posted at random times: every delivery at CPL 3 with IF =
+1, several hundred); every case ends with both counters at N. Added after the review (`sysfast_more`): `walk-ad` (identity
+space, the guest's own tables: after round K points a second linear page L2 of the user code's frame F at F itself as its
+page table, PTE(L2) with A = 0 there, and reloads CR3, the user loop at L1 jumps directly to the SYSCALL at L2; the walk
+that revalidates its decode writes the A bit into F, killing the decode and the exiting block: every round must complete),
+`user-spin` (an interrupt posted with IF = 0 in round K's kernel; after the SYSRET the user side spins, with no system
+instruction, on a flag only the handler sets, at most 50 M times: the interrupt must be taken at the first CPL-3 boundary),
+`peer-write` (2 vCPUs: vCPU 1 flips the immediate of the `mov eax` at vCPU 0's return RIP every 20 rounds, 300 times, raises
+a flag and waits for it to be seen; vCPU 0, on the flag, runs CPUID and its next round must load the new value, SDM Vol.3
+9.1.3), `apic-timer` (the LAPIC timer periodic at 10 ms for 0.1 s of round trips with a two-instruction IF = 1 window in the
+kernel: every interrupt at CPL 3 or at the window's two interruptible boundaries, with IF = 1; consecutive deliveries 0.5-1.5
+periods apart and their number the periods elapsed +-1), `rep-target` (every round's SYSRET returns to a REP MOVSB, kept from round 2 on; in round K, RCX = its
+return RIP 0x1000 the count, with an interrupt posted in the kernel: taken before the first iteration, RCX, RSI, RDI
+untouched, the 4 KiB copy then right), `nmi-sysret` (an NMI posted in round K's kernel taken at the next boundary; its
+handler posts a second one and returns without IRET: the second stays blocked across the SYSRET and every later round trip
+until round 1,500's kernel IRETQs to itself, and is taken right after that IRETQ), `div-frame` (the return RIP is a
+`div r10` through fexc's division helper, every 4th round with RDX = 5: #DE with the frame naming the DIV at CPL 3, RAX and
+RDX unchanged, the other registers live; the sums of quotients and remainders the SDM's). Existing cases that now run the fast path: `run_k2.py swapgs
+kicks` (200,000 round trips under 20,000 precise stops), `rollback`, the `syscall` cost row, `run_s4.py s4-sysret`,
+`run_slice3_vm.py system`'s S3 programs. Negative controls (`nc/mutant-*.diff`, expected red): the event check after the
+instruction removed (`sysret-irq`: the interrupt taken before the next SYSCALL), the debug check after it removed
+(`sysret-tf`), DR7 not looked at (`lstar-break`, `ret-break`: one #DB, not N), no debug state and the step block's exit
+taken (`watch`: the trap after the SYSCALL); and the review's two (`nc/mutant-frame-copy-skipped.diff`: `frame_only` also
+skips the captured frame for the division helper's entry, so its resume restores a stale frame: `div-frame`;
+`nc/mutant-walking-lookup.diff`: the decode looked up with the walking `cache::lookup` again: `walk-ad`, a `bad_link`
+halt). Also expected red with the event check after the instruction removed: `user-spin` (the spin runs out) and
+`rep-target` (the interrupt not taken before the first iteration). Not controls by construction: the commit pre-checks (the transaction makes the
+same checks and would deliver the fault in place, which they only keep off this path), the pre-instruction event check (a
+post during the block stops it at a patched exit, which enters `stopped`, not the linker; one landing just as its `svc` is
+taken is not reproducible on demand), the STEP and stop-wanted tests
+(defence in depth: the other conditions already exclude those exits).
+
+**Test results** (`tests/`, `suite/`; the first pass of the chunk's cases is kept in `tests-pass1/`). `run_k2.py --only
+sysfast,rollback,swapgs`: 26 of 26 ok with this branch and 26 of 26 with the base (the cases are SDM behaviour); `run_s4.py`
+and `run_slice3_vm.py system` ok. Negative controls, each run under `run_k2.py --only sysfast`, every expected case red and
+every other green: event check after the instruction removed: `sysret-irq` (taken at the next SYSCALL), `user-spin` and
+`rep-target` (taken after the REP had run: RCX 0); debug check after it removed: `sysret-tf`; DR7 not looked at: `lstar-break`,
+`ret-break` (one #DB, not 2,000); no debug state and the step block's exit taken: `watch` (1,999 of 2,000 traps after the
+SYSCALL), `lstar-break`, `ret-break`; `frame_only` skipping the division helper's frame: `div-frame` (2,499 wrong frames or
+registers); the walking pre-commit lookup restored: `walk-ad` (`bad_link` at round 1,001). The first pass found two cases that
+could not catch their control: `watch` recorded only the first #DB frame, and the first round runs the slow path (the
+mutant's 1,999 wrong traps passed: perf counters showed 1,999 fall-backs after the SYSCALL); `rep-target` returned to the REP
+only in round K, so its block was new there and the fast path fell back before entering it (one fall-back, counted). Both
+cases were strengthened (every #DB frame's RIP checked; the REP the return target in every round) and the whole set rerun.
+Standing suite (`suite22.sh`, then `suite22b.sh` for the cases the worktree lacked inputs for: the generated slice-1 fixtures,
+copied from the main tree, manifest identical, and FEX's ASM tests, read from the main tree): `cargo test` 110 + 2 ignored
+(host), abi 65, also with `FEXC`; the resident stack audit `ok` (16,560 / 20,736 / 8,800 bytes, unchanged); the Python unit
+tests 299 OK (1 skipped); fixtures 64 and seed 44 at both block sizes; the i7 corpus at CPL 0 69 at both; faults 7,912 at
+both; `run_k1.py` 336 runs, no problem; `run_k2.py` all ok (the 16 `sysfast` cases twice); `run_slice3_vm.py` `system`,
+`delivery`, `events`, `contain`, `smp` 0 failures; `run_x3.py` 54/54, `run_x4.py` 33/28/6, `run_l4a.py`, `run_l4b.py`,
+`run_s4.py` all ok; `run_boot_smoke.py` 4/4; `run_r1.py r1a`, `r1b` ok (negative controls flagged); FEX ASM 2,270: 1,898
+pass, 48 precision deviations, 324 unsupported, no failure.
+
+**Measured** (`meas/`). Round trip (`rtcost.py`, one vCPU, slope of the driver's wall time, three repetitions, us per trip),
+base / chunk 22: Linux-shaped kernel side 0.689 / 0.565, bare SYSRET 0.374 / 0.344, two SWAPGS 0.693 / 0.552 (the `work` row
+stops with a delivered fault in both builds: a defect of that row's program, not looked into). `run_k2.py cost` `syscall`
+row 0.668 / 0.570 us; the other rows unchanged (CPUID 0.261 / 0.264, `div` 0.117 / 0.110). Perf resident, `hackbench` N = 1,
+whole run: 31,976,288 of the 32.0 M SYSCALLs and SYSRETs ran the fast path to the end (99.9%); declines: no current decode
+28,949 (after CR3 loads: each then takes the old path once), the boundary had something to do 557, not committing 0, a
+fall-back after the instruction 158. `locks` N = 1: 6,250,774 of 6.26 M; declines 663, 107, 0 and 93. Logged wall (perf
+resident) `hackbench` N = 1 15.04 -> 13.09 s, `locks` N = 1 6.16 -> 5.72 s. Sub-buckets, `hackbench` N = 1 (seconds of the
+whole run, base / chunk 22): the record write in `enter` 0.50 / 0.03, `find`'s boundary checks and the fast path's checks
+after the instruction 1.22 / 0.47, `load` and `bank` 0.92 / 0.76, the linker's own work 0.78 / 0.65, generated code (it
+carries the gate's frame copy) 7.04 / 6.62, the shadow-space switch 1.26 / 1.30, the transactions 1.82 / 1.83; vCPU CPU
+17.06 / 15.22 s, about 57 ns less per trip over 32.0 M trips.
+
+Benchmarks (`camp/`, `campaign22.sh`, `summ22.py`: three interleaved rounds, order alternating, every run verified or
+reached and uncontended; median (min-max), seconds; CPU s the process's, its fexc servers included, mean):
+
+| Benchmark | N | before (71aae61) | after | change | CPU s before / after |
+| --- | --- | --- | --- | --- | --- |
+| `hackbench` | 1 | 13.85 (13.80-14.14) | **12.19** (11.85-12.24) | -12.0% | 16.9 / 15.0 |
+| | 4 | 3.88 (3.83-3.91) | 3.78 (3.44-3.85) | -2.7% | 19.0 / 18.4 |
+| `locks` | 1 | 5.81 (5.77-5.90) | **5.47** (5.32-5.49) | -5.9% | 8.7 / 8.3 |
+| | 4 | 7.00 (6.96-7.06) | 6.84 (6.77-6.96) | -2.4% | 31.3 / 30.8 |
+| Installer, cache off | 1 | 5.80 (5.76-5.91) | 5.87 (5.72-6.12) | +1.2% | 7.3 / 7.4 |
+| `build` | 1 | 12.84 (12.79-13.12) | 13.11 (12.89-13.22) | +2.2% | 17.5 / 17.8 |
+| `zstd` | 1 | 1.91 (1.90-1.99) | 1.96 (1.90-1.97) | +2.7% | 4.9 / 5.0 |
+| `luajit` | 1 | 5.49 (5.39-5.59) | 5.67 (5.58-5.74) | +3.3% | 8.7 / 9.0 |
+| `mem` | 1 | 9.89 (9.84-10.12) | 10.25 (9.92-10.29) | +3.6% | 13.0 / 13.2 |
+| `cray` | 1 | 0.42 (0.41-0.43) | 0.41 (0.40-0.43) | -2.4% | 3.3 / 3.3 |
+
+`hackbench` and `locks` at N = 1 are faster beyond their spreads; at N = 4 both medians are lower with overlapping ranges. The
+five other cells but `cray` have higher medians (+1.2% to +3.6%), each range overlapping the base's. Every literal exit,
+not only one to a SYSCALL or SYSRET, now runs `sys_fast`'s checks first (the bank and an event check among them, before the
+decode lookup) and then, for any other target, the linker's own path as before.
+
+**Decode first** (a24fc30): the decode is probed before anything else, so every other literal exit declines after one
+probe and goes to the linker. Tests rerun (`tests2/`): `run_k2.py --only sysfast,rollback,swapgs` 26/26; each of the six
+variants rebuilt on it turns only its expected cases red. Benchmarks, base 71aae61 against a24fc30 (`camp2/` rounds 1-2,
+`camp3/` rounds 3-5, `camp4/` ten more `cray` and four more installer rounds; `camp2`'s third round stopped when its run was
+interrupted, its two finished base runs kept; every run verified or reached and uncontended; median (min-max), seconds):
+
+| Benchmark | N | before (71aae61) | after (a24fc30) | change | CPU s before / after | runs |
+| --- | --- | --- | --- | --- | --- | --- |
+| `hackbench` | 1 | 13.57 (13.13-13.85) | **11.56** (11.49-11.70) | -14.8% | 16.3 / 14.4 | 6 / 5 |
+| | 4 | 4.02 (3.89-4.12) | **3.62** (3.25-3.71) | -10.0% | 19.5 / 17.8 | 5 / 5 |
+| `locks` | 1 | 5.63 (5.46-5.77) | **5.20** (5.17-5.28) | -7.7% | 8.4 / 8.0 | 5 / 5 |
+| | 4 | 7.07 (6.90-7.24) | 7.08 (6.92-7.22) | +0.2% | 31.7 / 31.7 | 5 / 5 |
+| Installer, cache off | 1 | 5.50 (5.46-5.73) | 5.53 (5.47-5.92) | +0.5% | 7.0 / 7.0 | 10 / 9 |
+| `build` | 1 | 12.55 (12.33-12.64) | 12.55 (12.46-12.61) | 0.0% | 17.0 / 17.0 | 5 / 5 |
+| `zstd` | 1 | 1.92 (1.92-1.93) | 1.91 (1.90-1.96) | -0.3% | 4.8 / 4.8 | 5 / 5 |
+| `luajit` | 1 | 5.40 (5.30-5.41) | 5.34 (5.31-5.38) | -1.1% | 8.5 / 8.5 | 5 / 5 |
+| `mem` | 1 | 9.71 (9.52-9.84) | 9.65 (9.49-9.66) | -0.5% | 12.6 / 12.6 | 5 / 5 |
+| `cray` | 1 | 0.41 (0.36-0.43) | 0.41 (0.38-0.43) | +0.2% | 3.2 / 3.2 | 15 / 15 |
+
+`hackbench` at N = 1 and 4 and `locks` at N = 1 are faster beyond their spreads; nothing is slower (the other cells within
+0.5% by median, ranges overlapping). Ship threshold met. The suite above ran on 742d949; a24fc30 only reorders `sys_fast`'s
+checks (the probe first) and was judged by the `sysfast`/`rollback`/`swapgs` groups, the variants and an independent review
+of the reordering.
+
+**Not done.** The shadow-space switch keeps its three ISBs (the last could rely on ERET's context synchronization where
+SCTLR_EL1.EOS makes ERET one; not built, unmeasured). `bank`'s and `enter`'s XMM moves stay (the instruction leaves XMM as it
+is, but the frame is rebuilt from the bank). A SYSCALL reached by a computed exit (through the dispatcher's miss) takes the
+general path.
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite

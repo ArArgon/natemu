@@ -273,6 +273,11 @@ pub(super) fn poll(s: &mut State) {
         reinject(s)
     }
 }
+/// Perf chunk 22: whether [`poll`] has anything to do now (a due expiry, as `poll` reads the count, or a backlog).
+pub(super) fn due() -> bool {
+    let d = lapic().deadline;
+    (d != u64::MAX && count() >= d) || lapic().backlog != 0
+}
 /// L5 reinject: one owed expiry, raised when the vector's IRR bit is clear (the previous one accepted), as KVM's PIT
 /// injects its next pending tick on the acknowledge of the last; a masked or periodic-off timer owes nothing.
 fn reinject(s: &mut State) {

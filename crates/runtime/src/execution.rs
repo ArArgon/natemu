@@ -140,10 +140,18 @@ unsafe fn dispatch(s: &mut State) -> ! {
 /// either posted the page to this vCPU (a peer's) or invalidates its blocks at once (its own, [`code_written`]). A
 /// system instruction at the RIP is executed ([`system`]) and the search goes on at the next RIP (so the block found
 /// may be for a later RIP than the one asked for).
+#[inline(always)]
 unsafe fn find(s: &mut State) -> Option<&'static Block> {
+    unsafe { find_from(s, false) }
+}
+/// [`find`]; `after_system`: the search goes on right after a system instruction run outside it ([`sys_fast`]), so a
+/// system instruction found first is counted as chained (`perf`), as `find` counts it.
+unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block> {
     let mut flushed = false;
     #[cfg(feature = "perf")]
-    let mut chained = false;
+    let mut chained = after_system;
+    #[cfg(not(feature = "perf"))]
+    let _ = after_system;
     loop {
         take_invalidations(s);
         // X3: the LAPIC timer's expiries due by now (its virtual-timer doorbell only stopped the vCPU).
@@ -492,6 +500,145 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             None => {}
         }
         enter(&mut s, target)
+    }
+}
+
+/// Perf chunk 22: the fast path of a literal exit to a kept SYSCALL or SYSRET (the two resident trips of a guest system
+/// call). It works on the state record in place (no [`load`], no record copy in [`enter`]) and, where [`linker`] and
+/// [`find`] would make two passes (the instruction, then its target), makes the one boundary check before the
+/// instruction and only what the instruction can change after it. Taken only when, at the exit's boundary, `find`'s pass
+/// would find nothing to do (no debug trap, step mark, TF, armed breakpoint or watchpoint (DR7), shadow, REP boundary,
+/// plain step, wanted stop, posted invalidation, LAPIC expiry or backlog, takeable event), the exit is an ordinary one of
+/// a live block, and the decode at its RIP is a kept SYSCALL or SYSRET that is current (looked up without a walk,
+/// [`cache::current_at`]) and commits (EFER.SCE, no LOCK; SYSRET: CPL 0, REX.W, a canonical RCX: the transaction's own
+/// checks, so it never faults here; compatibility mode cannot reach it, the bank is in 64-bit mode). Else it returns
+/// having changed only what `linker` then does again to the same effect (the bank from the same frame and page, RIP, RF
+/// cleared): nothing before the commit walks or writes guest memory, so no A-bit write can kill the block that ran (the
+/// linker would then find it dead). The instruction runs as [`system`] runs it ([`syscalls::execute`]). After it,
+/// `find`'s next pass is replaced by what the instruction can change: the debug state (a TF it leaves: SYSRET from R11)
+/// and the events now takeable (SYSRET may set IF); either, or a target that is not a kept block, continues as `find`
+/// does after a system instruction ([`after_system`]). Its drain and LAPIC poll are not repeated: neither instruction
+/// posts or arms anything, and a post or expiry since the check rings this vCPU's doorbell (a kick after each post, the
+/// virtual timer at the deadline), masked here, so it stops the target block at its first word, as at any block entry
+/// after `find`'s last look.
+///
+/// The decode is probed first, before anything else: every other literal exit (its target not a current SYSCALL or SYSRET
+/// decode) leaves after that one probe and goes to the linker, which does all its own work. The probe's code context is the
+/// bank's (generated code changes none of its inputs: CPL, the control registers, MXCSR's and FCW's masks, XCR0, RFLAGS.AC,
+/// DR7), and nothing between the probe and the commit changes the cache (no walk, no write), so the decode is the one a
+/// probe right before the commit would find.
+///
+/// In place: `s` is the record itself. Nothing called here may copy the record out and back around it (`ask`'s
+/// `write_record(record(), s); ..; *s = load()`, a host exit): none does (no request, no delivery, no device access; a
+/// halt copies `s` once and never returns). The only other accesses to the record while `s` lives are volatile reads
+/// of `State::vcpu` ([`cache`]'s `vcpu`, which nothing writes after the start).
+#[inline(never)] // its frame stays out of `returned` (the nested-entry stack bound); it holds no state copy
+unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
+    // SAFETY: the record is this vCPU's (EL1-only); see the contract above.
+    let s = unsafe { &mut *record() };
+    let rip = frame.x[0];
+    let p = crate::perf::enter(crate::perf::LOOKUP);
+    let found = cache::current_at(rip, s.cpu.code_context());
+    crate::perf::leave(p);
+    let Some(i) = found.filter(|b| b.flags & cache::SYSTEM != 0).map(cache::system_of).filter(|i| matches!(i.kind, system::SYSCALL | system::SYSRET)) else {
+        return declined(s, rip, DECLINED_NOT_CURRENT);
+    };
+    let debugging = s.debug != 0 || s.cpu.rflags & RFLAGS_TF != 0 || s.cpu.dr[5] & DR7_ENABLES != 0;
+    if debugging || s.cpu.mov_ss | s.sti_shadow | s.mid_string | s.plain_step | s.stop_wanted != 0 || cache::pending() || lapic::due() {
+        return declined(s, rip, DECLINED_BOUNDARY);
+    }
+    let svc = elr.wrapping_sub(4);
+    let Some(ran) = cache::block_at(svc) else { return declined(s, rip, DECLINED_BOUNDARY) };
+    let ordinary = ran.flags & (cache::STEP | cache::DEAD) == 0 && !link_point_of(ran, svc).is_some_and(|o| ran.rep_exit(o));
+    if !ordinary || !ran.links.iter().any(|p| p.offset != 0 && p.target == rip) {
+        return declined(s, rip, DECLINED_BOUNDARY);
+    }
+    bank(&mut s.cpu, frame, frame.nzcv, true);
+    s.cpu.rip = rip;
+    completed(s);
+    if !events::none(s) {
+        return declined(s, rip, DECLINED_BOUNDARY);
+    }
+    let commits = i.lock == 0
+        && s.cpu.efer & EFER_SCE != 0
+        && match i.kind {
+            system::SYSCALL => true,
+            system::SYSRET => s.cpu.cpl == 0 && i.size == 8 && paging::canonical(s.cpu.gpr[1]),
+            _ => false,
+        };
+    if !commits {
+        return declined(s, rip, DECLINED_OTHER);
+    }
+    let generation = s.generation;
+    s.linker += 1;
+    s.l2_hits += 1;
+    system(s, i);
+    if s.debug != 0 || s.cpu.rflags & RFLAGS_TF != 0 || !events::none(s) {
+        declined(s, rip, DECLINED_AFTER);
+        unsafe { after_system(ran, generation) }
+    }
+    let context = s.cpu.code_context();
+    cache::select_l1(context);
+    let p = crate::perf::enter(crate::perf::LOOKUP);
+    let found = cache::lookup(s.cpu.rip, context, |b| mapped(s, b));
+    crate::perf::leave(p);
+    let Some(target) = found.filter(|b| b.flags & cache::SYSTEM == 0) else {
+        declined(s, rip, DECLINED_AFTER);
+        unsafe { after_system(ran, generation) }
+    };
+    s.l2_hits += 1;
+    // As `linker` counts it: the exit's block killed meanwhile (an A write of the target's revalidation walk).
+    if s.generation != generation || ran.flags & cache::DEAD != 0 {
+        s.stale_links += 1;
+    }
+    // (DR7 arms nothing: no block is at a breakpoint.)
+    cache::fill_l1(s.cpu.rip, target);
+    #[cfg(feature = "perf")]
+    {
+        cache::control().system_from[SYS_FAST] += 1;
+    }
+    unsafe { enter(s, target) }
+}
+/// Perf chunk 22, `perf` resident: [`Control::system_from`]'s slot (past the buckets) counting the system calls'
+/// SYSCALLs and SYSRETs [`sys_fast`] ran to the end (the host reports it as `"?"`).
+#[cfg(feature = "perf")]
+const SYS_FAST: usize = crate::perf::BUCKETS;
+/// Perf chunk 22, `perf` resident: why a literal exit to a kept SYSCALL or SYSRET did not run [`sys_fast`] to the end, in
+/// [`Control::system_counts`] slots past every kind (the host prints them as kinds 0x7c..0x7f): no current decode (a CR3
+/// load or TLB flush since it was last used); the boundary before it had something to do, or the exit was not an
+/// ordinary one; the decode current but not committing; after the instruction, a trap or event to take or a target not
+/// kept (`after_system`). An exit whose target holds no kept SYSCALL or SYSRET decode is not counted.
+const DECLINED_NOT_CURRENT: usize = 0x7c;
+const DECLINED_BOUNDARY: usize = 0x7d;
+const DECLINED_OTHER: usize = 0x7e;
+const DECLINED_AFTER: usize = 0x7f;
+/// Counts a decline (`perf` resident only); before the instruction, only when the exit's RIP holds a kept SYSCALL or
+/// SYSRET decode (current or not; looked up without a walk). The default resident does nothing here.
+#[inline(always)]
+fn declined(s: &State, rip: u64, reason: usize) {
+    #[cfg(feature = "perf")]
+    {
+        let syscall = |b: &Block| b.flags & cache::SYSTEM != 0 && matches!(cache::system_of(b).kind, system::SYSCALL | system::SYSRET);
+        if reason == DECLINED_AFTER || cache::kept_at(rip, s.cpu.code_context()).is_some_and(syscall) {
+            cache::control().system_counts[reason] += 1;
+        }
+    }
+    #[cfg(not(feature = "perf"))]
+    let _ = (s, rip, reason);
+}
+/// [`sys_fast`] after its instruction committed: the state is in the record; `find` goes on from its next boundary, and
+/// the rest is the linker's (`ran`, the block whose exit it was; `generation`, the cache's before the instruction).
+#[inline(never)]
+unsafe fn after_system(ran: &Block, generation: u64) -> ! {
+    let mut s = unsafe { load() };
+    let found = unsafe { find_from(&mut s, true) };
+    // As `linker` counts them: a target killed as it was placed (stepped), or the exit's block gone meanwhile.
+    if found.is_none() || s.generation != generation || ran.flags & cache::DEAD != 0 {
+        s.stale_links += 1;
+    }
+    match found {
+        Some(target) => unsafe { enter(&mut s, target) },
+        None => step(&mut s),
     }
 }
 
@@ -963,9 +1110,12 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
     sse::fill(f, &s.cpu);
     s.blocks += 1;
     unsafe {
-        let c = crate::perf::enter(crate::perf::ENTER_COPY);
-        write_record(record(), s);
-        crate::perf::leave(c);
+        // Perf chunk 22: [`sys_fast`] works on the record itself (no copy, none charged).
+        if !core::ptr::eq(s, record()) {
+            let c = crate::perf::enter(crate::perf::ENTER_COPY);
+            write_record(record(), s);
+            crate::perf::leave(c);
+        }
         tables::select(s.cpu.cpl);
         crate::perf::enter(crate::perf::GUEST);
         enter_allocated(f, block.entry(), BLOCK_SPSR | nzcv, alignment_check(&s.cpu))
@@ -1012,7 +1162,10 @@ pub unsafe fn returned(frame: &NativeFrame, kind: u64) -> ! {
         }
         let miss = cache::CODE_VA + cache::DISPATCH_MISS as u64 + 4;
         match (esr & 0xffff) as u16 {
-            svc::LINK => linker(frame, elr),
+            svc::LINK => {
+                sys_fast(frame, elr);
+                linker(frame, elr)
+            }
             svc::MISS if elr == miss => missed(frame),
             imm @ (svc::DIV_U | svc::DIV_S) => division(imm == svc::DIV_S, frame, elr, spsr),
             svc::X87 => helpers::x87(frame, elr, spsr),
@@ -1021,6 +1174,13 @@ pub unsafe fn returned(frame: &NativeFrame, kind: u64) -> ! {
         }
         halt_native([esr, 0, elr], stop::UNKNOWN_ABORT)
     }
+}
+/// Perf chunk 22: the synchronous exception being taken is an `svc #LINK` or `svc #MISS` (ESR_EL1: EC 0x15 and its
+/// immediate), whose service ([`linker`], [`missed`], or a halt) reads only the gate's frame, never `Shared::captured`.
+pub fn frame_only() -> bool {
+    let esr: u64;
+    unsafe { asm!("mrs {0}, esr_el1", out(reg) esr) };
+    esr >> 26 == 0x15 && matches!((esr & 0xffff) as u16, svc::LINK | svc::MISS)
 }
 /// A block exit to the dispatcher's miss: guest state is in the static registers, NZCV (CF inverted) and PF/AF registers.
 /// Not inlined, as [`halt_native`]: `returned` holds no state copy (the nested-entry stack bound).
