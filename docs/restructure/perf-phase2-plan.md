@@ -81,6 +81,11 @@ Then, as the numbers dictate:
 9. **Generated-code quality** (guest code ~2.3 s on the installer at batch-1 start): larger FEX compile regions, careful
    relaxation of precision rules where nothing observes the difference. Last, and only if steady-state benchmarks point here.
 
+Applicability (owner, November 5): every change fixes a generic inefficiency, conditioned only on architectural state
+(never on program names, guest addresses, OS symbols or benchmark binaries); each "Measured" section names the common
+software patterns that hit the path beyond the benchmark that motivated it; a read-only audit for workload-specific code
+runs at each batch end.
+
 Not in this phase: virtio devices and interrupt coalescing (integration); the correctness pass (after performance).
 Measurement rules: one VM at a time; routine per-step set (N = 1 cache off, three interleaved runs, plus N = 4 once), the
 full matrix at batch end; cold cache for comparisons with QEMU; per-case outputs deleted as each runner finishes.
