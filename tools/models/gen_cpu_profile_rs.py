@@ -135,6 +135,8 @@ def render():
     w(f'pub const APIC_BASE_BSP_RESET: u64 = {apic["reset_bsp"]};')
     w(f'/// IA32_MISC_ENABLE bits a write commits; the others keep their reset value (CPU 17).')
     w(f'pub const MISC_ENABLE_COMMITTED: u64 = {p.msr(0x1a0)["committed_bits"]};')
+    w('/// IA32_ARCH_CAPABILITIES bits the host adds at start-up when it reports FEAT_CSV3 (`crate::cpu::arch_capabilities`).')
+    w(f'pub const ARCH_CAPABILITIES_CSV3: u64 = {p.msr(0x10a)["host_bits"]["mask"]};')
     st = p.mtrr_state()
     w(f'/// The virtual firmware\'s MTRR state (`parameters.mtrr_initial`, selected "{d["parameters"]["mtrr_initial"]["selected"]}":')
     w('/// RAM write-back, devices uncached; owner decision October 28), applied over the architectural reset.')

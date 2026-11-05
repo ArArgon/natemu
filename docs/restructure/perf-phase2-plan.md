@@ -130,7 +130,10 @@ XSAVEOPT/XSAVEC, each judged by the AMD machine; installer N = 1 cache off 9.51 
 gains `+adx,+clflushopt,+clwb` (its TCG has no XSAVEC). Built November 4 (boot-features plan, Built (SMEP, UMIP)): SMEP was
 already advertised and enforced by the walker (tests added); UMIP advertised, SGDT/SIDT/SLDT/SMSW/STR #GP(0) at CPL > 0 in the
 resident, Linux activates it; installer N = 1 cache off 8.42 -> 8.32 s, hackbench N = 1 29.9 -> 30.0 s; the QEMU control gains
-`+smep,+umip`. Next: SMAP (only if its cost is acceptable).
+`+smep,+umip`. Next: SMAP (only if its cost is acceptable). Built November 5 (PCID plan P1, "Measured (P1)"): IA32_ARCH_CAPABILITIES, read-only, with the accurate
+not-vulnerable bits, plus a page-walk speculation-barrier switch (off by default); RDCL_NO is advertised only with the
+switch on and host FEAT_CSV3, so a default boot keeps PTI (owner, Nov 5: PCID not built, the switch covers fast default
+boots). MDS_NO and MD_CLEAR 0 (owner). The QEMU control is unchanged (TCG 11.1.2 refuses CPUID.(7,0):EDX.arch-capabilities).
 
 ## Disk cache (November 5, `natemu-raw/diskcache-20261105-01/`)
 

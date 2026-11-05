@@ -24,7 +24,7 @@ pub const CPUID: [(u32, u32, [u32; 4]); 27] = [
     (0x4, 3, [0x163, 0x3c0003f, 0x1fff, 0x1]),
     (0x4, 4, [0x0, 0x0, 0x0, 0x0]),
     (0x6, ANY, [0x4, 0x0, 0x0, 0x0]),
-    (0x7, 0, [0x0, 0x218801a9, 0x4, 0x0]),
+    (0x7, 0, [0x0, 0x218801a9, 0x4, 0x20000000]),
     (0xb, 0, [0x0, 0x1, 0x100, 0x0]),
     (0xb, 1, [0x0, 0x0, 0x201, 0x0]),
     (0xb, 2, [0x0, 0x0, 0x2, 0x0]),
@@ -74,13 +74,14 @@ pub struct Msr {
     pub reset: u64,
     pub writable: u64,
 }
-pub const MSRS: [Msr; 49] = [
+pub const MSRS: [Msr; 50] = [
     Msr { index: 0x10, last: 0x10, access: access::RW, rules: 0, reset: 0x0, writable: 0xffffffffffffffff }, // IA32_TIME_STAMP_COUNTER
     Msr { index: 0x17, last: 0x17, access: access::RO, rules: 0, reset: 0x0, writable: 0 }, // IA32_PLATFORM_ID
     Msr { index: 0x1b, last: 0x1b, access: access::RW, rules: rule::APIC_BASE_EXTD_NEEDS_EN, reset: 0xfee00800, writable: 0xfffffffd00 }, // IA32_APIC_BASE
     Msr { index: 0x79, last: 0x79, access: access::NONE, rules: 0, reset: 0x0, writable: 0 }, // IA32_BIOS_UPDT_TRIG
     Msr { index: 0x8b, last: 0x8b, access: access::RW, rules: 0, reset: 0x0, writable: 0xffffffff00000000 }, // IA32_BIOS_SIGN_ID (UCODE_REV)
     Msr { index: 0xfe, last: 0xfe, access: access::RO, rules: 0, reset: 0x508, writable: 0 }, // IA32_MTRRCAP
+    Msr { index: 0x10a, last: 0x10a, access: access::RO, rules: 0, reset: 0x400000000c00e140, writable: 0 }, // IA32_ARCH_CAPABILITIES
     Msr { index: 0x174, last: 0x174, access: access::RW, rules: 0, reset: 0x0, writable: 0xffffffffffffffff }, // IA32_SYSENTER_CS
     Msr { index: 0x175, last: 0x175, access: access::RW, rules: rule::CANONICAL, reset: 0x0, writable: 0xffffffffffffffff }, // IA32_SYSENTER_ESP
     Msr { index: 0x176, last: 0x176, access: access::RW, rules: rule::CANONICAL, reset: 0x0, writable: 0xffffffffffffffff }, // IA32_SYSENTER_EIP
@@ -129,6 +130,8 @@ pub const MSRS: [Msr; 49] = [
 pub const APIC_BASE_BSP_RESET: u64 = 0xfee00900;
 /// IA32_MISC_ENABLE bits a write commits; the others keep their reset value (CPU 17).
 pub const MISC_ENABLE_COMMITTED: u64 = 0x400001;
+/// IA32_ARCH_CAPABILITIES bits the host adds at start-up when it reports FEAT_CSV3 (`crate::cpu::arch_capabilities`).
+pub const ARCH_CAPABILITIES_CSV3: u64 = 0x1;
 /// The virtual firmware's MTRR state (`parameters.mtrr_initial`, selected "enabled":
 /// RAM write-back, devices uncached; owner decision October 28), applied over the architectural reset.
 pub const MTRR_INITIAL: [(u32, u64); 14] = [(0x200, 0x80000000), (0x201, 0xff80000800), (0x250, 0x606060606060606), (0x258, 0x606060606060606), (0x259, 0x0), (0x268, 0x0), (0x269, 0x0), (0x26a, 0x0), (0x26b, 0x0), (0x26c, 0x0), (0x26d, 0x0), (0x26e, 0x0), (0x26f, 0x0), (0x2ff, 0xc06)];
@@ -266,7 +269,7 @@ pub mod vectors {
         (0x6, 0, 1, 0, 0x0, true, 0x401801, 1, [0xff01, 0x0, 0x0, 0x0]),
         (0x6, 5, 1, 0, 0x0, true, 0x1801, 1, [0x4, 0x0, 0x0, 0x0]),
         (0x6, 5, 1, 0, 0x0, true, 0x401801, 1, [0xff01, 0x0, 0x0, 0x0]),
-        (0x7, 0, 1, 0, 0x0, true, 0x1801, 1, [0x0, 0x218801a9, 0x4, 0x0]),
+        (0x7, 0, 1, 0, 0x0, true, 0x1801, 1, [0x0, 0x218801a9, 0x4, 0x20000000]),
         (0x7, 0, 1, 0, 0x0, true, 0x401801, 1, [0xff01, 0x0, 0x0, 0x0]),
         (0x7, 1, 1, 0, 0x0, true, 0x1801, 1, [0x0, 0x0, 0x0, 0x0]),
         (0x7, 1, 1, 0, 0x0, true, 0x401801, 1, [0xff01, 0x0, 0x0, 0x0]),
@@ -535,7 +538,7 @@ pub mod vectors {
         (0xce, false, 0x0),
         (0xcf, false, 0x0),
         (0xfe, true, 0x0),
-        (0x10a, false, 0x0),
+        (0x10a, true, 0x0),
         (0x119, false, 0x0),
         (0x123, false, 0x0),
         (0x140, false, 0x0),
@@ -606,12 +609,13 @@ pub mod vectors {
     /// IA32_MISC_ENABLE: accepted write -> value read back
     pub const MISC_ENABLE: [(u64, u64); 6] = [(0x0, 0x1800), (0x1, 0x1801), (0x80, 0x1800), (0x800, 0x1800), (0x1801, 0x1801), (0x401801, 0x401801)];
     /// Readable MSR -> value after reset and the firmware MTRR state: (index, AP, BSP)
-    pub const RESET: [(u32, u64, u64); 47] = [
+    pub const RESET: [(u32, u64, u64); 48] = [
         (0x10, 0x0, 0x0),
         (0x17, 0x0, 0x0),
         (0x1b, 0xfee00800, 0xfee00900),
         (0x8b, 0x0, 0x0),
         (0xfe, 0x508, 0x508),
+        (0x10a, 0x400000000c00e140, 0x400000000c00e140),
         (0x174, 0x0, 0x0),
         (0x175, 0x0, 0x0),
         (0x176, 0x0, 0x0),

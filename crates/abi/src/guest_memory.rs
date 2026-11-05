@@ -305,7 +305,7 @@ mod tests {
     fn walk_sets_accessed_dirty_through_ram() {
         let mut b = tables();
         let mut t = GuestTables::new(b.ram());
-        let r = paging::walk(&mut t, CONTROL, 0x10_0000, Access::Write).unwrap();
+        let r = paging::walk(&mut t, CONTROL, 0x10_0000, Access::Write, true).unwrap();
         assert_eq!(r.gpa, 0x10_0000);
         assert_eq!(b.0[0], 0x2027);
         assert_eq!(b.0[1536 + 256], 0x10_0067);
@@ -360,7 +360,7 @@ mod tests {
                 racer,
             };
             let mut t = GuestTables::observed(ram, observer);
-            let r = paging::walk(&mut t, CONTROL, 0x10_0000, Access::Read);
+            let r = paging::walk(&mut t, CONTROL, 0x10_0000, Access::Read, true);
             assert_eq!(r.map(|r| r.gpa), Ok(0x10_0000));
             assert_eq!(t.observer.writes, writes + 3);
             assert_eq!(b.0[0], root);
@@ -380,7 +380,7 @@ mod tests {
         let ram = b.ram();
         let mut t = GuestTables::observed(ram, Always(ram));
         assert_eq!(
-            paging::walk(&mut t, CONTROL, 0x10_0000, Access::Read),
+            paging::walk(&mut t, CONTROL, 0x10_0000, Access::Read, true),
             Err(Fault::Contended)
         );
     }
@@ -402,7 +402,7 @@ mod tests {
         let mut b = tables();
         let mut t = GuestTables::observed(b.ram(), Log::default());
         assert_eq!(
-            paging::walk(&mut t, CONTROL, 0x10_0000, Access::Read),
+            paging::walk(&mut t, CONTROL, 0x10_0000, Access::Read, true),
             Err(Fault::Unsupported)
         );
         assert_eq!((t.observer.0, t.observer.1), (1, 1));
@@ -412,7 +412,7 @@ mod tests {
             b.0[i] |= paging::ACCESSED;
         }
         let mut t = GuestTables::observed(b.ram(), Log::default());
-        assert!(paging::walk(&mut t, CONTROL, 0x10_0000, Access::Write).is_err());
+        assert!(paging::walk(&mut t, CONTROL, 0x10_0000, Access::Write, true).is_err());
         assert_eq!((t.observer.0, t.observer.1), (4, 1));
     }
 
@@ -443,7 +443,7 @@ mod tests {
         let mut b = tables();
         let peer = Peer { code: [0x1000, 0x4000], events: [(0, 0); 8], n: 0 };
         let mut t = GuestTables::observed(b.ram(), CodeWrites(peer));
-        assert_eq!(paging::walk(&mut t, CONTROL, 0x10_0000, Access::Read).map(|r| r.gpa), Ok(0x10_0000));
+        assert_eq!(paging::walk(&mut t, CONTROL, 0x10_0000, Access::Read, true).map(|r| r.gpa), Ok(0x10_0000));
         let p = &t.observer.0;
         let want = [(b'c', 0x1000), (b'r', 0x1000), (b'r', 0x2000), (b'r', 0x3000), (b'c', 0x4800), (b'r', 0x4800)];
         assert_eq!(&p.events[..p.n], &want);

@@ -175,8 +175,27 @@ pub fn prepare(resident: &str, code_bytes: usize, n: usize, ram_bytes: usize) ->
     let ram = unsafe { exec::guest_ram(ram_bytes as u64, memory.0 as u64 + ram_offset as u64) };
     Ok(Backing { memory: Arc::new(memory), n, stride, ram, epoch: unsafe { mach_absolute_time() } })
 }
-/// Sets the vCPU's initial architectural state (before it first runs).
-pub fn set_cpu(area: Area, cpu: Cpu) {
+/// Whether this host reports Arm feature `name` (`sysctl hw.optional.arm.<name>` = 1; absent or unreadable: no).
+pub fn host_feature(name: &str) -> bool {
+    unsafe extern "C" {
+        fn sysctlbyname(name: *const std::ffi::c_char, old: *mut std::ffi::c_void, len: *mut usize, new: *mut std::ffi::c_void, newlen: usize) -> i32;
+    }
+    let key = std::ffi::CString::new(format!("hw.optional.arm.{name}")).expect("no NUL in a feature name");
+    let (mut value, mut len) = (0i32, size_of::<i32>());
+    // SAFETY: `value` and `len` describe a writable 4-byte buffer; no new value is set.
+    let rc = unsafe { sysctlbyname(key.as_ptr(), (&raw mut value).cast(), &mut len, std::ptr::null_mut(), 0) };
+    rc == 0 && len == size_of::<i32>() && value == 1
+}
+/// Whether `NATEMU_SPECULATION_BARRIERS` is set to a truthy value (`1`, `on`, `true`, `yes`; case-insensitive): the
+/// environment switch for the page-walk barriers. The stub reads this only (its parser takes a value after every
+/// option); the `boot-linux` test driver reads it too and also accepts `--speculation-barriers`.
+pub fn env_speculation_barriers() -> bool {
+    std::env::var("NATEMU_SPECULATION_BARRIERS").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
+}
+/// Sets the vCPU's initial architectural state (before it first runs). `speculation_barriers` turns on the resident's
+/// page-walk barriers (PCID plan P1) and, together with the host's FEAT_CSV3, is the sole condition for advertising
+/// RDCL_NO: a guest never sees "not susceptible to Meltdown" without the barriers that make it true.
+pub fn set_cpu(area: Area, cpu: Cpu, speculation_barriers: bool) {
     let mut state = State::new(area.vcpu as u64, cpu);
     state.vcpus = area.vcpus as u64;
     area.write_record(exec::STATE_OFFSET, state);
@@ -185,8 +204,14 @@ pub fn set_cpu(area: Area, cpu: Cpu) {
     let mut msrs = natemu_abi::cpu::reset_msrs(area.vcpu == 0);
     msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_TSC).unwrap()] = ticks_ns(area.epoch).wrapping_neg();
     // The virtual firmware's MTRRs cover the guest RAM this VM has (M1's run-time size, set at prepare).
-    let control: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+    let mut control: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+    control.speculation_barriers = u64::from(speculation_barriers);
+    area.write_record(cache::LOOKUP_OFFSET + cache::CONTROL, control);
     natemu_abi::cpu::firmware_mtrrs(&mut msrs, control.ram_bytes);
+    // IA32_ARCH_CAPABILITIES: RDCL_NO only with the barriers on AND a host whose own loads do not pass faulting data on
+    // (FEAT_CSV3). Off by default, so a default-command-line guest keeps PTI (owner decision, November 5).
+    let rdcl_no = speculation_barriers && host_feature("FEAT_CSV3");
+    msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_ARCH_CAPABILITIES).unwrap()] = natemu_abi::cpu::arch_capabilities(rdcl_no);
     area.write_record(exec::MSRS_OFFSET, msrs);
     area.write_record(exec::ENTROPY_OFFSET, exec::Entropy { taken: exec::ENTROPY_WORDS as u64, words: [0; exec::ENTROPY_WORDS] });
     refill_entropy(area);

@@ -224,7 +224,7 @@ pub(super) fn pages(s: &mut State, va: u64, n: u64, write: bool, supervisor: boo
     let mut gpa = [0u64; 2];
     for (k, at) in [va, last & !4095].into_iter().enumerate().take(1 + usize::from(crosses)) {
         gpa[k] = loop {
-            match paging::walk(&mut GuestTables::observed(guest_ram(), CodeWrites(FetchWrites(s))), control, at, access) {
+            match paging::walk(&mut GuestTables::observed(guest_ram(), CodeWrites(FetchWrites(s))), control, at, access, cache::control().speculation_barriers != 0) {
                 Ok(t) => {
                     let c = cache::control();
                     // A UC access made since the last boundary (an instruction run alone, or the resident's own) is

@@ -73,6 +73,7 @@ def steps(F, O):
     # What the runners' own build() calls make and sign, last: NATEMU_PREBUILT=1 makes later build() calls use them.
     add('release', ['python3', '-c', "import sys; sys.path[:0] = ['tools']; import run_slice1_vm as v, run_boot_smoke as b; v.build(); b.build()"], 'pre')
     add('stack', ['python3', 'tools/check_resident_stack.py'])
+    add('barriers', ['python3', 'tools/check_resident_barriers.py'])   # PCID plan P1: the page walk's speculation barriers
     add('pytests', ['env', f'FEXC={F}', 'python3', '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_*.py'], est=10)
     corpora = {'seed': 's1d1-seed4242', 'i8': 'i8-corpus-20261030-01', 'i8b': 'i8-corpus-20261030-02', 'i9': 'i9-corpus-20261030-01',
                'i9-big': 'i9-big-20261030-01', 'sha': 'sha-corpus-20261103-01', 'adx': 'adx-corpus-20261104-01',

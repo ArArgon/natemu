@@ -1036,6 +1036,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 idtr: exec::Table { base: log_base(d.spaces[c.space].identity) + 0x1000, limit: 0xfff },
                 mov_ss: 0,
             },
+            false, // the program driver's slice tests never run the speculation barriers
         );
         execution::set_lapic(backing.vcpu(v), natemu_abi::lapic::Lapic { svr: c.svr, reinject: u64::from(lost.lapic), ..natemu_abi::lapic::RESET });
         let mut state: State = backing.vcpu(v).read_record(exec::STATE_OFFSET);

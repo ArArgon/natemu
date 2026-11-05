@@ -59,6 +59,10 @@ pub struct Boot {
     pub check_reuse: bool,
     /// Debug: admission's code-shape check on every object (`Compiler::shape`; the test driver's `boot-linux --code-shape`).
     pub code_shape: bool,
+    /// PCID plan P1 (owner, November 5): turn on the resident's page-walk speculation barriers. Off by default; on, the
+    /// host must have FEAT_SB (checked in [`Boot::prepare`]) and IA32_ARCH_CAPABILITIES advertises RDCL_NO when the host
+    /// also has FEAT_CSV3, so a default command line then boots with PTI off. `--speculation-barriers` / `NATEMU_SPECULATION_BARRIERS`.
+    pub speculation_barriers: bool,
 }
 
 impl Boot {
@@ -82,11 +86,16 @@ impl Boot {
             compile_cache: compile_cache::Config::OFF,
             check_reuse: false,
             code_shape: false,
+            speculation_barriers: false,
         }
     }
 
     /// Loads everything into a new backing and builds the devices; nothing runs yet.
     pub fn prepare(self) -> Result<Prepared> {
+        // PCID plan P1: the barriers' leaf SB needs FEAT_SB; refuse to turn them on without it (default off needs nothing).
+        if self.speculation_barriers && !execution::host_feature("FEAT_SB") {
+            return Err("--speculation-barriers: this host lacks FEAT_SB (sysctl hw.optional.arm.FEAT_SB)".into());
+        }
         let layout = Layout { low_end: self.ram, high: 0 };
         layout.e820().map_err(|e| e.to_string())?; // before allocating the RAM
         let backing = execution::prepare(&self.runtime.to_string_lossy(), self.code_bytes, self.vcpus, layout.low_end as usize)?;
@@ -97,7 +106,7 @@ impl Boot {
         execution::guest_ram_written(&backing.memory);
         let lost = self.lost_ticks;
         for v in 0..self.vcpus {
-            execution::set_cpu(backing.vcpu(v), if v == 0 { loaded.cpu } else { loaded.ap });
+            execution::set_cpu(backing.vcpu(v), if v == 0 { loaded.cpu } else { loaded.ap }, self.speculation_barriers);
             execution::set_lapic(backing.vcpu(v), natemu_abi::lapic::Lapic { reinject: u64::from(lost.lapic), ..natemu_abi::lapic::RESET });
             if v > 0 {
                 let mut state: State = backing.vcpu(v).read_record(exec::STATE_OFFSET);

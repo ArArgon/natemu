@@ -315,6 +315,10 @@ pub mod cache {
         pub rearms: u64,
         /// The VM's guest RAM, R (M1; set by the host at prepare, last so the resident's fields keep their places).
         pub ram_bytes: u64,
+        /// PCID plan P1: 1 when the host turned the page-walk speculation barriers on (RDCL_NO is then advertised); set
+        /// by the host at prepare (`set_cpu`), read by the resident at each `paging::walk` to pick the barrier-on or
+        /// barrier-off form. Default 0 (off).
+        pub speculation_barriers: u64,
         /// K1: this vCPU's TLB epochs. `epoch` moves at every CR3 load and every global TLB flush (a paging control
         /// change, an MTRR write); `global_epoch` is the `epoch` of the last global flush. A block is current (its source
         /// mapping may be used as a TLB entry) when [`Block::checked`] is `epoch`, or, for a [`GLOBAL`] block, at least

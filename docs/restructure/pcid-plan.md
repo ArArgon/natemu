@@ -1,5 +1,8 @@
 # PCID phase plan: PCID and INVPCID on Arm ASIDs, accurate "not vulnerable" bits, a cheap exact VERW, PTI-on benchmarks
 
+**Status (owner, Nov 5): PCID not built; the phase is P1 (accurate bits, speculation-barrier switch) and P2 (exact inline VERW); P3-P8 kept as a record for a later revisit.**
+
+
 Status: plan, November 5, 2026, at 28eca9a (branch `restructure`), revised after an independent review the same day and
 after the owner's MDS decision (below). Nothing here is built or measured yet. Inputs: [perf-phase2-plan.md](perf-phase2-plan.md)
 (item 6, "Phase result", the backlog, "Applicability", "Benchmark conventions"); [perf-plan.md](perf-plan.md) "Measured
@@ -57,9 +60,9 @@ gate's numbers; criteria 1, 2 and 5 apply only when PCID is built.
 ## 2. What the SDM requires
 
 Vol.3A citations are to the local snapshot `artifacts/research/track01/source-snapshots/2026-09-03/intel-sdm-vol3a.txt`
-(edition 253668-092US), where paging is chapter 5. Vol.2 (INVPCID, MOV CR, VERR/VERW, CPUID) and Vol.4 (Table 2-2) are not in
-the snapshot; they are cited from the current SDM, and P1 adds those pages to the snapshot before anything is coded from
-them. Where the SDM leaves an order or a behaviour open, the reference AMD machine decides (owner rule) if P3 finds it can run a
+(edition 253668-092US), where paging is chapter 5. P1 added `source-snapshots/2026-11-05/` (edition 093, September 2026):
+all of Vol.4, Vol.1 Table 21-21 (the CPUID leaf-7 bit lists, moved from Vol.2A to Vol.1 chapter 21 in 093) and Vol.2B/2D
+RDMSR/WRMSR. Vol.2 INVPCID, MOV CR and VERR/VERW are not saved yet: P2 and P4 add them before anything is coded from them. Where the SDM leaves an order or a behaviour open, the reference AMD machine decides (owner rule) if P3 finds it can run a
 ring-0 probe. That machine is itself a VM (a KVM guest), so a probe there shows the hardware under its hypervisor.
 
 Code comments to correct in a later code chunk (they cite chapter-4 numbers of an older edition; paging is chapter 5 in 092):
@@ -135,29 +138,46 @@ space per privilege class, each copy needs a third ASID (3.3's budget).
 ### 2.4 IA32_ARCH_CAPABILITIES bits (Vol.4 Table 2-2, MSR 10AH)
 
 Today MSR 10AH is #GP and CPUID.(7,0):EDX is 0, so Linux assumes the bugs its tables give a Haswell (family 6, model 3CH,
-natemu's presented CPU) in a VM. Bit positions are those of Vol.4 Table 2-2 as Linux names them (`msr-index.h`); P1 checks
-each against the SDM pages it adds to the snapshot. The owner's policy is accurate bits: every bit true of natemu as it runs is set, every other one is 0; P1
+natemu's presented CPU) in a VM. Bit positions and names are Vol.4 Table 2-2's; P1 checked each against it and the
+CPUID-enumeration document (sources below the table). The owner's policy is accurate bits: every bit true of natemu as it runs is set, every other one is 0; P1
 re-confirms each against its source (Intel's "CPUID Enumeration and Architectural MSRs" document and the per-flaw guidance)
 and records the reason per bit; host
 properties are checked, not assumed. Host facts (this Mac, `sysctl hw.optional.arm`, November 5): Apple M4; FEAT_CSV3 = 1,
 FEAT_CSV2 = 1, FEAT_SB = 1, FEAT_SSBS = 0.
 
-| Bit | Name | Value | Why |
+| Bit | Name | Value (P1, built) | Meaning (source) and why it holds for natemu |
 | --- | --- | --- | --- |
-| 0 | RDCL_NO (Meltdown) | 1, only with host FEAT_CSV3 and after P1's audit | Translated CPL-3 code runs with the user shadow space, which holds only translations the walker granted at CPL 3: a supervisor page has no Arm mapping there. The same Arm tables map the resident's private region (with the guest-RAM alias) EL1-only; FEAT_CSV3 keeps faulting-load data from feeding speculative address use. The resident itself, running a CPL-3 access on the guest's behalf at EL1 through the alias (`segments::linear` → `pages` → `copy_out`, string and MMIO completion, emulated system instructions), could load before its permission result is resolved; P1 audits those paths and puts SB (host FEAT_SB) or masking after the permission result. The bit is filled in at startup from CSV3 (0 without it). |
-| (L1TF) | none; Linux skips L1TF when RDCL_NO is set | follows bit 0 | A not-present or reserved guest PTE produces no shadow. |
+| 0 | RDCL_NO | 1 only when the speculation-barrier switch is ON **and** the host reports FEAT_CSV3 (both; default switch OFF so 0) | "not susceptible to Rogue Data Cache Load" (CE, V4). Translated CPL-3 code runs at EL0 in the user shadow space, which holds only translations the walker granted at CPL 3 (a supervisor page has no EL0 mapping); the resident's private region with the guest-RAM alias is EL1-only; FEAT_CSV3 keeps a faulting load's data from feeding speculative execution. The resident's own accesses on the guest's behalf all use an address `paging::walk` returned; with the switch on the walk masks each non-leaf level's next-table base (a conditional select to 0 plus CSDB, checking present, the reserved bits 51:40 and PS) and ends the leaf's paging permission check in an Arm SB (the audit, Measured (P1)). **Coupled** (owner, Nov 5): advertised only when the barriers run, so a guest that reads "not susceptible to Meltdown" is always protected. Default off -> 0, and Linux chooses PTI on a default command line (expected). **Scope and known gap:** the barriers cover the walk's own descent and A/D loads and its paging permission checks; a caller reading `Translation::gpa` from an `Err` under a mispredicted branch, and the non-paging limit checks in `segments::descriptor` and the TSS I/O-bitmap (Spectre-v1-shaped, older than P1, outside RDCL's paging definition), are recorded for the correctness pass (boot-handoff 6a). |
+| (L1TF) | none; Linux skips L1TF when RDCL_NO is set | follows bit 0 | A not-present or reserved guest entry produces no shadow; with the switch on, the walk's non-leaf mask (present, reserved 51:40 and PS checked) keeps a not-present or 2 MiB-leaf entry's frame bits from addressing the next read, and the leaf SB precedes the returned frame's use. With the switch off, L1TF follows RDCL_NO = 0 (Linux keeps PTE inversion). |
+| 1 | IBRS_ALL | 0 | Enhanced IBRS (CE, V4): no IA32_SPEC_CTRL. |
+| 2, 19 | RSBA, RRSBA | 0 | **Not evaluated (owner, November 5: out of scope).** 0 is what Linux saw before; no truth claim is made either way. |
+| 3 | SKIP_L1DFL_VMENTRY | 0 | A hypervisor hint (CE, V4); VMX is not presented. |
+| 4 | SSB_NO | 0 | Speculative store bypass is general out-of-order behaviour of the host; FEAT_SSBS = 0. |
 | 5 | MDS_NO | **0 (owner decision)** | See the decision at the top. MD_CLEAR (CPUID.(7,0):EDX[10]) also stays 0: VERW clears nothing on the host. |
-| 8 | TAA_NO | 1 | TAA needs TSX; RTM/HLE are not advertised and TSX_CTRL is 0. True architecturally. |
-| 6 | IF_PSCHANGE_MC_NO | 1 | No machine check on a page-size change (MCE/MCA not advertised, no VMX). True architecturally. |
-| 2, 19 | RSBA, RRSBA | P1 measures; probably RSBA = 1 | 0 would assert that RET is predicted only from a return stack. natemu translates RET as a computed exit through the dispatcher, i.e. a host indirect branch predicted by the host's indirect predictor; if P1 confirms that, RSBA = 1 is the accurate value (and RRSBA follows its definition). |
-| 13, 14, 15 | SBDR_SSDP_NO, FBSDP_NO, PSDP_NO (MMIO stale data) | 1 | MMIO is an exit to natemu's device models and mapped RAM is ordinary memory: there is no uncore buffer through which MMIO could read or propagate stale data. The general host value-predictor question is MDS_NO's (kept 0). |
-| 26, 27 | GDS_NO, RFDS_NO | 1 | natemu has no gather unit (AVX2 gathers are emulated as ordinary loads) and no Atom register file; the general host value-predictor question is MDS_NO's (kept 0). |
-| 62 | ITS_NO | 1 | Intel designates this bit for hypervisors to tell a guest it is not affected by ITS, a flaw of Intel's branch-target selection; Spectre v2 stays reported (no predictor claim), so Linux keeps its Spectre v2 mitigation and drops only the ITS thunks. |
-| 4 | SSB_NO | 0 | Speculative store bypass is general out-of-order behaviour; the host has no SSBS control (FEAT_SSBS = 0). |
+| 6 | IF_PSCHANGE_MC_NO | 1 | "not susceptible to a machine check error due to modifying the size of a code page without TLB invalidation" (CE, V4). natemu raises no machine check (MCE/MCA not presented); a page-size change is handled by the shadow and code caches. Linux: `itlb_multihit` becomes "Not affected". |
+| 7 | TSX_CTRL | 0 | Enumerates IA32_TSX_CTRL (V4): TSX is not presented. |
+| 8 | TAA_NO | 1 | TAA needs Intel TSX: "CPUs that do not support Intel TSX are not affected" (TAA page); RTM and HLE are not presented. |
+| 13, 14, 15 | SBDR_SSDP_NO, FBSDP_NO, PSDP_NO | 1 | "not affected by" the shared-buffer read and the three stale-data propagators (CE, V4, MMIO page). MMIO is an exit to natemu's device models, which return computed values, and mapped RAM is ordinary memory: no uncore, fill or primary buffer through which an MMIO access reads or propagates stale data. Whether host buffers can be sampled at all is MDS_NO's question (kept 0). Linux needs all three for "MMIO Stale Data: Not affected". |
+| 17, 28 | FB_CLEAR, RFDS_CLEAR | 0 | VERW clears nothing on the host. |
+| 18, 25 | FB_CLEAR_CTRL, GDS_CTRL | 0 | Controls of IA32_MCU_OPT_CTRL, which natemu does not have. |
 | 20, 24 | BHI_NO, PBRSB_NO | 0 | Host predictor behaviour, not claimed. |
-| 1, 3, 7, 17, 18, 25, 28 | IBRS_ALL, SKIP_L1DFL_VMENTRY, TSX_CTRL, FB_CLEAR, FB_CLEAR_CTRL, GDS_CTRL, RFDS_CLEAR | 0 | Controls or VMX features natemu does not have. |
+| 26 | GDS_NO | 1 | "not vulnerable to Gather Data Sampling" (CE, V4): GDS is the gather unit transiently forwarding stale vector-register data; natemu has none (AVX2 gathers are translated to ordinary loads). Linux already printed "Not affected" for this model. |
+| 27 | RFDS_NO | 1 | "not affected by Register File Data Sampling" (CE, V4): a flaw of Intel Atom register files; the guest's registers live in host registers and memory. Linux already printed "Not affected". |
+| 62 | ITS_NO | 1 | The ITS page (Migration Pools, its own table): "If 1, the hypervisor indicates that the system is not affected"; "the VMM should synthesize ITS_NO for VMs unless the VM could run on an affected host". The CPUID-enumeration document (8.0) and SDM Vol.4 (093) print the two values' meanings swapped; the ITS page, the bit's name and Linux (`ARCH_CAP_ITS_NO` makes the CPU not vulnerable) agree on 1 = not affected, which natemu follows. ITS is a flaw of Intel's branch-target selection; Spectre v2 stays reported, so Linux keeps its Spectre v2 mitigation and drops only the ITS thunks. |
+| 9-12, 16, 21-23, 29-61, 63 | enumerations of MSRs and controls; reserved | 0 | Not presented. Bit 21 (XAPIC_DISABLE_STATUS) 0 keeps Linux from reading MSR 0BDH. |
 
-The MSR is read-only (writes #GP), with CPUID.(7,0):EDX[29] = 1.
+Sources (P1, saved with SHA-256 and URLs in `artifacts/research/track01/source-snapshots/2026-11-05/``MANIFEST.md`): CE = Intel "CPUID Enumeration and
+Architectural MSRs", version 8.0 (October 22, 2026); V4 = SDM Vol.4 335592-093 (September 2026), Table 2-2, 10AH ("R/O");
+SDM Vol.1 Table 21-21 (CPUID.(7,0):EDX: bit 10 MD_CLEAR, bit 29 "supports the IA32_ARCH_CAPABILITIES MSR"; in edition 093
+the leaf-7 bit lists are in Vol.1 chapter 21) and Vol.2B/2D RDMSR/WRMSR (#GP(0) for a reserved or unimplemented MSR);
+Intel's TAA (11/12/2019), MMIO stale data (6/14/2022), GDS (12/5/2024), RFDS (7/22/2025), ITS (5/13/2025), RDCL
+(1/3/2018) and BHI/RRSBA (2.6, 5/12/2025) pages. Each bit's position agrees between CE and V4. CE and V4 disagree on bit 9
+(CE: reserved; V4: MCU_CONTROL) and bit 63 (CE: MSR_VIRTUAL_ENUMERATION_SUPPORTED; V4: reserved); natemu sets neither. The
+per-bit reasons are also in `tools/models/cpu_profile.json` (the MSR's `bits`).
+
+The MSR is read-only (writes #GP(0): SDM Vol.4 marks it R/O; the WRMSR page itself does not name read-only MSRs, so this is the
+reading of R/O natemu applies to its other read-only MSRs), with CPUID.(7,0):EDX[29] = 1; no other enumeration is required
+for the bits set (none of them names another MSR or control).
 
 **What Linux does with them (motivating only; Debian 6.12.107, from its boot log).** Without the MSR it enables PTI, VERW
 buffer clearing ("MDS: Vulnerable: Clear CPU buffers attempted, no microcode"), reports MMIO stale data and SRBDS as unknown and
@@ -388,8 +408,8 @@ a branch and measures it; its gate decides whether any per-PCID copy is built. I
 second check after P5b can still stop it (P5b).
 
 **P1: the IA32_ARCH_CAPABILITIES bits, and the resident's speculation audit.**
-- Measure first: the default-command-line installer N = 1 on HEAD (three runs) with its mitigation lines; how RET is translated
-  (FEX's output for `ret` blocks: a computed exit through the dispatcher, a host indirect `br`), deciding RSBA/RRSBA.
+- Measure first: the default-command-line installer N = 1 on HEAD (three runs) with its mitigation lines. (How RET is
+  translated, which would have decided RSBA/RRSBA, is dropped: owner, November 5, RSBA out of scope; both stay 0.)
 - Audit: every resident path that performs a CPL-3 access on the guest's behalf through the guest-RAM alias (`segments::linear`
   → `pages` → `copy_out`, string and MMIO completion, emulated system instructions): after the permission result, an SB (or an
   address mask depending on it) before the first load or store through the alias. Measured on `hackbench` and `mem` N = 1.
@@ -500,6 +520,112 @@ gain. Applicability: every rule here is conditioned on CR0, CR3, CR4,
 EFER, PCIDs and G bits only; the patterns beyond Linux that hit it are kernels that tag address spaces with PCIDs (Windows' KVA
 shadow and FreeBSD's PTI use PCID by their published descriptions; not tested here). The one layout-dependent gain stays chunk
 14's (global pages in the upper half), now decided per top-level entry within it.
+
+## Measured (P1), November 5, 2026
+
+Built at 42feb9f plus P1 (uncommitted; the owner-decision records 95e104b and 8a33c05 on top are docs only, so the
+emulator baseline is unchanged). Evidence in `natemu-raw/pcid-p1-20261105-01/` (README). Host: Apple M4, FEAT_CSV3 =
+FEAT_CSV2 = FEAT_SB = 1, FEAT_SSBS = 0 (`sysctl hw.optional.arm`). Sources in
+`artifacts/research/track01/source-snapshots/2026-11-05/` (`MANIFEST.md`, SHA-256 and URLs); per-bit verdicts and reasons
+in section 2.4 and `tools/models/cpu_profile.json`. **Applies to:** any guest that reads IA32_ARCH_CAPABILITIES (Linux
+does when CPUID.(7,0):EDX[29] = 1; keyed only on architectural state). RSBA and RRSBA are left 0, not evaluated (owner,
+November 5: out of scope).
+
+### Built
+
+- **IA32_ARCH_CAPABILITIES (MSR 10AH), read-only** (WRMSR #GP(0)), CPUID.(7,0):EDX[29] = 1, EDX[10] (MD_CLEAR) = 0. Its
+  always-on bits are `0x400000000c00e140` (6, 8, 13, 14, 15, 26, 27, 62); **bit 0 (RDCL_NO) is added only when the
+  speculation-barrier switch is on and the host has FEAT_CSV3** (`cpu::arch_capabilities`, host `set_cpu`). `cpu_profile.json`,
+  `cpu_profile.py` and the generated `cpu_profile.rs` carry the MSR, its per-bit reasons and the conditional bit;
+  regenerated and `--check`-clean.
+- **The speculation-barrier switch (owner, November 5: a feature, OFF by default).** One option, `Boot::speculation_barriers`,
+  set from `--speculation-barriers` on the `boot-linux` test driver or `NATEMU_SPECULATION_BARRIERS=1` (truthy) on either
+  the driver or the stub (`natemu::execution::env_speculation_barriers`). It is written into the vCPU's `cache::Control`
+  at prepare; the resident's `paging::walk` reads it and picks, once per walk, the barrier-on (`walk_once::<_, true>`) or
+  barrier-off (`walk_once::<_, false>`) monomorphisation of one source function (no two drifting code paths). With the
+  switch on the host must have FEAT_SB (`Boot::prepare` refuses otherwise); off (the default) needs nothing.
+- **Honesty coupling.** RDCL_NO is advertised iff the switch is on and FEAT_CSV3 (host `set_cpu`): a guest never reads
+  "not susceptible to Meltdown" without the barriers that make it true. With the default (off), RDCL_NO = 0 and Linux
+  turns PTI on for a default command line — expected. All other confirmed bits are independent of the switch.
+
+### The audit (RDCL_NO, barrier-on path)
+
+Every resident path that accesses the guest-RAM alias on a CPL-3 instruction's behalf resolves its guest-physical address
+through `natemu_abi::paging::walk`: the system-instruction transactions (`segments::linear` -> `pages`, descriptor-table
+and TSS reads via `segments::descriptor`/`atomic_byte`, INS completion in `ports.rs`, the implicit accesses in
+`delivery`/`events`/`xsave`/`x87`/`sse`), the data-abort shadow fill and the page-crossing-store completion
+(`translate`/`split`), and the fetch walk (`fetch_walk`). The walk is the single choke point, so the barrier lives there.
+In the barrier-on monomorphisation each non-leaf level, after its present/reserved/PS check, produces the next table's
+base through a conditional select to 0 plus an Arm CSDB (`descend_base`, Linux's `array_index_nospec` form; its mask
+`0x000fff0000000080` covers the reserved bits 51:40 **and** PS, bit 7, so a 2 MiB leaf mispredicted as a descent cannot be
+read as a level-1 table — review B1), and the leaf's paging permission check ends in an Arm SB before the A/D write and
+the return. So no load through the EL1 alias issues
+speculatively before the check that permits it has resolved. `tools/check_resident_barriers.py` (suite step `barriers`,
+style of `check_resident_stack.py`) disassembles the resident and requires every `walk_once::<_, true>` instance to carry
+a barrier on each entry-read -> sink path (a store whose base is not the result pointer or SP is a sink too) and to
+materialise the mask constant with its PS and reserved bits (a `movk #0x80` and `#0xfff0000000000`), and every
+`walk_once::<_, false>` instance to carry none; green on P1, red on HEAD, with the leaf SB removed, the non-leaf mask
+removed, the PS bit removed (B1), or a barrier added to the off copy (`natemu-raw/pcid-p1-20261105-01/negative/`, README).
+Unit test `tools/test_check_resident_barriers.py` (9 cases).
+
+### Barrier form (the masking experiment, owner-requested; now lower priority as the switch is off by default)
+
+Three variants, mem/build N=1, three interleaved rounds (`runs/bench`, rounds r31-33; the machine was ~8% busier this
+round than the earlier attribution, so read the within-round differences, not the absolutes):
+
+| cell | masking (CSDB non-leaf + SB leaf) | SB at both levels | no barrier |
+| --- | --- | --- | --- |
+| mem N=1 cold | 9.12 (9.09-9.14) | 9.14 (9.03-9.18) | 8.45 (8.37-8.52) |
+| build N=1 cold | 12.62 (12.58-12.66) | 12.59 (12.55-12.63) | 12.40 (12.35-12.46) |
+
+Masking is **not** cheaper than SB here (mem: both about +0.67 s / +8% over no barrier; the earlier clean attribution put
+the non-leaf SB alone at +6%, the leaf SB at +0.9%). On M4 a CSDB on the walk's hot per-level path costs about what an SB
+does, so masking did not reach the leaf-only figure. The build kept the masking form (non-leaf CSDB, leaf SB); since the
+barriers are off by default the choice no longer affects a default boot.
+
+### Default (off): matches HEAD
+
+mem/build N=1, three interleaved rounds against HEAD (no P1), same rounds (`runs/bench`, r41-43):
+
+| cell | P1 default (barriers off) | HEAD | P1/HEAD |
+| --- | --- | --- | --- |
+| mem N=1 cold | 8.45 (8.44-8.49) | 8.40 (8.38-8.45) | 1.005 |
+| build N=1 cold | 12.40 (12.36-12.40) | 12.39 (12.34-12.43) | 1.000 |
+
+Within run-to-run range: the off monomorphisation and the per-walk `Control` read add nothing measurable.
+
+### Switch on: the fast default boot is kept
+
+Default-command-line installer N=1 with `NATEMU_SPECULATION_BARRIERS=1`, three rounds (`runs/inst`): 6.20 s (6.05-6.27).
+The machine was ~10% busier this round (HEAD's `mitigations=off` installer measured 5.34 s in a quieter round, and `mem`
+8.45 here vs 7.7 then), so this is ~5.6 s de-contended, in line with the ~5.4 s PCID-plan target and far below the
+PTI-on default (13.94 s). RDCL_NO off PTI is what makes a default command line fast.
+
+### Boot logs (the coupling, `runs/vulns`)
+
+| file / bug | default (switch off) | switch on, default cmdline |
+| --- | --- | --- |
+| meltdown | Mitigation: PTI | **Not affected** (PTI off) |
+| l1tf | Mitigation: PTE Inversion | **Not affected** |
+| PTI kernel line | "page tables isolation: enabled" | (none; PTI off) |
+| mmio_stale_data | Not affected | Not affected (always on) |
+| indirect_target_selection | Not affected | Not affected (always on) |
+| mds | Vulnerable: Clear CPU buffers attempted | unchanged (MDS_NO/MD_CLEAR 0, owner) |
+| `bugs:` line | `cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs srbds bhi` | `spectre_v1 spectre_v2 spec_store_bypass mds swapgs srbds bhi` |
+
+So even with the switch off the always-on bits (TAA, the three MMIO, GDS, RFDS, ITS, IF_PSCHANGE_MC) already drop the
+MMIO/ITS/itlb-multihit mitigations; only Meltdown/L1TF and PTI follow the switch. `--speculation-barriers` with `pti=on`
+forces PTI back on while meltdown still reads "Not affected". QEMU TCG 11.1.2 cannot take the bits (it warns
+`EDX.arch-capabilities [bit 29]` and `MSR(10Ah).its-no [bit 62]` unsupported), so its guest is unchanged; the like-for-like
+`-cpu` string is not changed (`runs/qemu-flags.txt`, `runs/vulns/qemu-*.serial`).
+
+### Tests
+
+abi unit tests (66) pass, including `arch_capabilities_is_read_only_and_rdcl_no_follows_csv3` and the walk tests exercising
+the barrier-on monomorphisation; the Python model tests and `gen_cpu_profile_rs.py --check` pass; the barrier checker and
+its negative controls behave as above; `stack` is unchanged. `python3 tools/run_suite.py` (series64-chunk26-r1) on P1-r2: 116/116 passed, including `cargo test` with and
+without FEXC, `stack`, `barriers` and `system` (`natemu-raw/pcid-p1-20261105-01/suite-results.txt`; default off, the
+`barriers` step verifies the on-path statically).
 
 ## 6. Owner decisions needed
 

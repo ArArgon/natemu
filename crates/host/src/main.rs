@@ -34,6 +34,7 @@ fn boot(args: &[String]) -> natemu::Result<Stop> {
     let mut boot = Boot::new(runtime, fexc, natemu::memory::read_input(image, MAX_INPUT)?);
     boot.compile_cache = natemu::compile_cache::Config::from_env()?;
     boot.serial = Some(Box::new(std::io::stdout()));
+    boot.speculation_barriers = natemu::execution::env_speculation_barriers();
     let mut options = options.iter();
     while let Some(option) = options.next() {
         let value = options.next().ok_or(USAGE)?;

@@ -16,9 +16,10 @@ RULES = {'canonical', 'reserved_gp', 'apic_base_extd_needs_en', 'ucode_low32_zer
          'mtrr_type_all_bytes', 'pat_type_all_bytes', 'efer', 'always_gp', 'always_gp_on_write', 'lapic_owner'}
 # feature bit -> MSRs that must exist when it is advertised / must be absent when it is clear
 FEATURE_MSRS = {'1.edx.SEP': (0x174, 0x175, 0x176), '1.edx.MTRR': (0xfe, 0x2ff, 0x200, 0x201, 0x250, 0x268),
-                '1.edx.PAT': (0x277,), '1.edx.APIC': (0x1b,), '0x80000001.edx.RDTSCP': (0xC0000103,)}
+                '1.edx.PAT': (0x277,), '1.edx.APIC': (0x1b,), '0x80000001.edx.RDTSCP': (0xC0000103,),
+                '7.0.edx.ARCH_CAPABILITIES': (0x10a,)}
 ABSENT_WHEN_CLEAR = {'7.0.ebx.TSC_ADJUST': 0x3b, '1.ecx.TSC_DEADLINE': 0x6e0, '13.1.eax.XSAVES': 0xda0, '13.1.eax.XFD': 0x1c4,
-                     '7.0.edx.SPEC_CTRL': 0x48, '7.0.edx.ARCH_CAPABILITIES': 0x10a, '7.0.ecx.CET_SS': 0x6a2, '1.edx.MCA': 0x179}
+                     '7.0.edx.SPEC_CTRL': 0x48, '7.0.ecx.CET_SS': 0x6a2, '1.edx.MCA': 0x179}
 
 
 def _i(x):
@@ -203,6 +204,12 @@ class Profile:
         if 'apic_base_extd_needs_en' in rules and value >> 10 & 1 and not value >> 11 & 1: return False
         return True
 
+    def arch_capabilities(self, csv3):
+        """IA32_ARCH_CAPABILITIES as a host presents it: the profile's value, plus `host_bits` (RDCL_NO) when the host
+        reports FEAT_CSV3 (`csv3`)."""
+        e = self.msr(0x10a)
+        return _i(e['reset']) | (_i(e['host_bits']['mask']) if csv3 else 0)
+
     def misc_enable_after_write(self, value):
         """IA32_MISC_ENABLE after an accepted write: bits 0 and 22 committed, bits 7/11/12 fixed 0/1/1 (CPU 17)."""
         e = self.msr(0x1a0)
@@ -306,6 +313,13 @@ class Profile:
         if self._msr[0xfe]['reset'] != '0x508' and _i(self._msr[0xfe]['reset']) & 0xFF != 8: err('MTRRCAP VCNT != 8')
         pat = _i(self._msr[0x277]['reset'])
         if any(t not in PAT_TYPES for t in pat.to_bytes(8, 'little')): err('PAT reset has invalid types')
+        ac = self._msr.get(0x10a)
+        if ac:
+            ones = sum(1 << int(b) for b, v in ac['bits'].items() if b.isdigit() and v['value'] == 1)
+            if ones != _i(ac['reset']): err('IA32_ARCH_CAPABILITIES reset != its bits marked 1')
+            if _i(ac['host_bits']['mask']) & _i(ac['reset']) or ac['host_bits']['condition'] != 'speculation-barrier switch on AND FEAT_CSV3': err('IA32_ARCH_CAPABILITIES host bits')
+            if ac['access'] != 'ro': err('IA32_ARCH_CAPABILITIES is read-only (SDM Vol.4 Table 2-2)')
+            if self.feature('7.0.edx.MD_CLEAR') or _i(ac['reset']) >> 5 & 1: err('MD_CLEAR/MDS_NO set (owner decision November 5: both 0)')
         me = self._msr[0x1a0]
         if _i(me['reset']) != 0x1801 or _i(me['committed_bits']) != 1 << 0 | 1 << 22: err('MISC_ENABLE reset/committed bits')
         # 7 kernel sites

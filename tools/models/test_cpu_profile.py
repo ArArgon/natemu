@@ -54,7 +54,7 @@ class Cpuid(unittest.TestCase):
         self.assertEqual(P.cpuid(0xB, 9, vcpu=2), (0, 0, 9, 2))
 
     def test_leaf7_and_extended_state(self):
-        self.assertEqual(P.cpuid(7, 0), (0, bitset(0, 3, 5, 7, 8, 19, 23, 24, 29), bitset(2), 0))   # FSGSBASE BMI1 AVX2 SMEP BMI2 ADX CLFLUSHOPT CLWB SHA; UMIP only
+        self.assertEqual(P.cpuid(7, 0), (0, bitset(0, 3, 5, 7, 8, 19, 23, 24, 29), bitset(2), bitset(29)))   # FSGSBASE BMI1 AVX2 SMEP BMI2 ADX CLFLUSHOPT CLWB SHA; UMIP; ARCH_CAPABILITIES only
         self.assertEqual(P.cpuid(7, 1), (0, 0, 0, 0))
         self.assertEqual(P.cpuid(0xD, 0, xcr0=7), (7, 832, 832, 0))
         self.assertEqual(P.cpuid(0xD, 0, xcr0=3)[1], 576)
@@ -110,8 +110,16 @@ class Msrs(unittest.TestCase):
     def ok(self, idx, val, **kw): self.assertTrue(P.msr_write_ok(idx, val, **kw), hex(idx))
     def gp(self, idx, val, **kw): self.assertFalse(P.msr_write_ok(idx, val, **kw), hex(idx))
 
+    def test_arch_capabilities(self):
+        # PCID plan P1: read-only; the profile's bits (TAA_NO, IF_PSCHANGE_MC_NO, the three MMIO bits, GDS_NO, RFDS_NO,
+        # ITS_NO), RDCL_NO only from the host's FEAT_CSV3; MDS_NO, RSBA and RRSBA 0.
+        self.assertTrue(P.msr_read_ok(0x10a))
+        for v in (0, P.arch_capabilities(True), cp.MASK64): self.gp(0x10a, v)
+        self.assertEqual(P.arch_capabilities(False), bitset(6, 8, 13, 14, 15, 26, 27, 62))
+        self.assertEqual(P.arch_capabilities(True), bitset(0, 6, 8, 13, 14, 15, 26, 27, 62))
+
     def test_absent_is_gp(self):
-        for idx in (0xce, 0x140, 0x79, 0x3b, 0x6e0, 0xda0, 0x48, 0x10a, 0x1d9, 0x179, 0x12345678, 0xc0000104):
+        for idx in (0xce, 0x140, 0x79, 0x3b, 0x6e0, 0xda0, 0x48, 0x1d9, 0x179, 0x12345678, 0xc0000104):
             self.assertFalse(P.msr_read_ok(idx), hex(idx))
             self.gp(idx, 0)
 

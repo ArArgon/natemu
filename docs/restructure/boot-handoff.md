@@ -144,7 +144,7 @@ analysis (`boot.py`, `analyze.py`, `aggregate.py`, `campaign.sh`) are in `natemu
 | vCPUs | `vcpus`, `--vcpus` | 1; 1-4 (`cache::MAX_VCPUS`); vCPU 0 is the BSP, the others wait on the ACPI wakeup mailbox (X4) |
 | Memory map | built from `ram` (`boot::Layout::e820`) | e820: reserved page 0, RAM to 0xA0000, the legacy hole (unassigned: all-ones reads), loader page tables at 1 MiB (reserved to 0x200000), reserved 0x200000-0x600000 (the normal map's hole), ACPI NVS 0x600000-0x1000000 (tables, mailbox, AP boot scratch), RAM 16 MiB to R, reserved R to 4 GiB (the device range: I/O APIC, LAPIC) |
 | Firmware tables | `rsdp` (default 0x600000) | ACPI 6.5 RSDP, XSDT, FADT, FACS, DSDT, MADT with the version-0 wakeup mailbox for N processors (`crates/host/src/boot/acpi.rs`; no `_CST`/P_BLK, HPET, MCFG or EFI); `acpi_rsdp_addr` in boot_params. MTRRs as the virtual firmware leaves them: all RAM WB, the hole and [R, 4 GiB) UC (plan, Built (M2 addendum 1)) |
-| CPU profile | built in (`crates/abi/src/cpu_profile.rs` from `tools/models/cpu_profile.json`) | the accepted Intel Haswell-class profile (INV-03-01 CLM-03-01-16/-17): SSE to SSE4.2, AVX/AVX2/FMA/F16C, XSAVE (XCR0 7) with XSAVEOPT and XSAVEC (owner, November 3), MOVBE, AES-NI/PCLMULQDQ, SHA, ADX, CLFLUSHOPT/CLWB (owner, November 3), BMI1/2, RDRAND, x2APIC; no PCID, 1 GiB pages, LA57, SMAP, TSC-deadline, PMU, MPX/CET/AVX-512 |
+| CPU profile | built in (`crates/abi/src/cpu_profile.rs` from `tools/models/cpu_profile.json`) | the accepted Intel Haswell-class profile (INV-03-01 CLM-03-01-16/-17): SSE to SSE4.2, AVX/AVX2/FMA/F16C, XSAVE (XCR0 7) with XSAVEOPT and XSAVEC (owner, November 3), MOVBE, AES-NI/PCLMULQDQ, SHA, ADX, CLFLUSHOPT/CLWB (owner, November 3), BMI1/2, RDRAND, x2APIC, IA32_ARCH_CAPABILITIES (read-only, CPUID.(7,0):EDX[29]; PCID plan P1, November 5: TAA_NO, IF_PSCHANGE_MC_NO, the three MMIO stale-data bits, GDS_NO, RFDS_NO, ITS_NO always; RDCL_NO only with the speculation-barrier switch on and host FEAT_CSV3; MDS_NO and MD_CLEAR 0, owner); no PCID, 1 GiB pages, LA57, SMAP, TSC-deadline, PMU, MPX/CET/AVX-512. The page-walk speculation barriers are off by default (`--speculation-barriers` / `NATEMU_SPECULATION_BARRIERS`; RDCL_NO coupled to them, so a default command line keeps PTI; FEAT_SB required when on) |
 | Compiler | `fexc`, FEXC | the path of a fexc binary; one `fexc --serve` child per vCPU; each answer is validated by admission |
 | Compile cache | `compile_cache` (`Config::from_env`) | `NATEMU_COMPILE_CACHE=DIR|off` (default `~/Library/Caches/natemu/fexc`), `NATEMU_COMPILE_CACHE_MB` (default 512; not a whole number: an error, not the default); keyed by the fexc binary's SHA-256 and the exact request, so a rebuilt identical fexc reuses it; CPL-3 requests only (kernel code moves with KASLR); past 3/4 of the cap other builds' packs, then the oldest, are evicted (`crates/host/src/compile_cache.rs`) |
 | Code cache | `code_bytes`, `--code-cache` | 128 MiB less its head per vCPU (`CODE_BYTES_MAX`) |
@@ -257,7 +257,8 @@ compile stall delays cancellation up to the 30 s request deadline. **Resident st
 the final runtime, R2): the deepest gate path 19,168 of the 32,768-byte exception stack (SP_EL1; 13,600 bytes margin),
 23,312 with one nested entry to its halt (9,456 margin), the boot path 12,832 of 32,768 (SP_EL0); the dispatcher template
 uses no SP and no literal; `ok`. An overflow is contained to its vCPU but overwrites its boot/block stack before it
-halts; new resident paths must be re-checked.
+halts; new resident paths must be re-checked. **Speculation barriers** (PCID plan P1, off by default): `check_resident_barriers.py` (suite step `barriers`) checks
+that in the barrier-on `walk_once::<_, true>` every entry-read -> sink path passes an Arm SB or CSDB, and the off one none.
 
 **Boots at R2** (Debian 6.12.107 bzImage and installer initrd, 2 GiB, `console=ttyS0 earlyprintk=serial
 mitigations=off nokaslr`; release builds, series44-r2; one VM at a time. Wall time is from process start to the end-point
@@ -852,6 +853,13 @@ Severity: **medium** = a real cost or gap an integrator will meet, **low** = a l
 deviation, or a contained corner.
 
 - The next phase is performance (owner decision 1); the correctness pass comes after it.
+- **low**, correctness pass (PCID plan P1, speculation-barrier switch, off by default): the page-walk barriers cover the
+  walk's own descent and A/D loads and its paging permission checks (checked by `tools/check_resident_barriers.py`). Two
+  Spectre-v1-shaped reads sit outside RDCL's paging definition and are not covered, both older than P1: (1) a caller that
+  reads `Translation::gpa` from an `Err` result under a mispredicted `Ok`/`Err` branch (`paging::retrying` and the callers
+  `segments::pages`, `execution::translate`/`fetch_walk`); (2) the non-paging software limit checks before a guest-memory
+  read — `segments::descriptor`'s GDT/LDT limit and the TSS I/O-bitmap limit in `ports`. Masking or barriering these is
+  deferred to the correctness pass; RDCL_NO (advertised only with the switch on) makes no claim about them.
 - **low**, guest (not natemu): an installer boot can miss "Select a language" because the Debian installer's own two
   `main-menu` copies (serial console and tty1) race on `/var/lib/dpkg/status` while `udpkg` renames it; the serial copy
   reads NULL and faults: "segfault at 8 ... error 4 in main-menu[3335,...]". Timing-dependent: 0/50 boots at N = 1 and

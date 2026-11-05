@@ -785,6 +785,9 @@ def profile_program(n):
     # The firmware's MTRRs follow the VM's guest RAM (the driver's `--ram`/NATEMU_RAM, hex; default 2 GiB).
     ram = int(os.environ.get('NATEMU_RAM', '0x80000000').removeprefix('0x'), 16)
     reset = {**{m: cp._i(P.msr(m)['reset']) for m in readable}, **P.mtrr_state(ram)}
+    # IA32_ARCH_CAPABILITIES: RDCL_NO is advertised only with the speculation-barrier switch on (and host FEAT_CSV3); the
+    # program driver runs it off (PCID plan P1, "Measured (P1)"), so RDCL_NO is 0 here whatever the host.
+    reset[0x10a] = P.arch_capabilities(False)
 
     def judge(datas):
         order = [int.from_bytes(d[o:o + 8], 'little') for d, lay in zip(datas, layouts) for kind, _, o in lay if kind == 'order']

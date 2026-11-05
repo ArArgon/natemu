@@ -901,7 +901,7 @@ fn fetch_walk(s: &mut State, va: u64) -> Result<(u64, u32), [u64; 3]> {
     };
     loop {
         let mut tables = GuestTables::observed(guest_ram(), CodeWrites(FetchWrites(s)));
-        match paging::walk(&mut tables, control, va, Access::Fetch) {
+        match paging::walk(&mut tables, control, va, Access::Fetch, cache::control().speculation_barriers != 0) {
             // M2: guest RAM of any memory type (code may run from UC memory, SDM Vol.3 14.3.3).
             Ok(t) if guest_ram().range(t.gpa & !4095, 4096).is_some() => {
                 let flags = if t.global { cache::GLOBAL } else { 0 } | if t.leaf_bytes > 4096 { cache::LARGE } else { 0 };
@@ -2173,7 +2173,7 @@ fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, ac
     let Some(control) = s.cpu.control() else {
         halt(s, stop::UNSUPPORTED_MODE)
     };
-    let walk = paging::walk(&mut GuestTables::observed(guest_ram(), CodeWrites(DataWrites { s: &mut *s, f, b, site })), control, va, access);
+    let walk = paging::walk(&mut GuestTables::observed(guest_ram(), CodeWrites(DataWrites { s: &mut *s, f, b, site })), control, va, access, cache::control().speculation_barriers != 0);
     match walk {
         // M3: a page that is not guest RAM is a device page whatever its memory type (device ranges are uncached): never
         // shadowed; the caller completes the access through the device path ([`mmio::device`]).

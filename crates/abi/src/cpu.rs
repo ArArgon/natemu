@@ -10,6 +10,7 @@ pub const MSR_SYSENTER_CS: u32 = 0x174;
 pub const MSR_SYSENTER_ESP: u32 = 0x175;
 pub const MSR_SYSENTER_EIP: u32 = 0x176;
 pub const MSR_UCODE_REV: u32 = 0x8b;
+pub const MSR_ARCH_CAPABILITIES: u32 = 0x10a;
 pub const MSR_MISC_ENABLE: u32 = 0x1a0;
 pub const MSR_PAT: u32 = 0x277;
 pub const MSR_MTRR_DEF_TYPE: u32 = 0x2ff;
@@ -224,6 +225,13 @@ pub fn canonical(v: u64) -> bool {
 pub fn misc_enable_after_write(value: u64) -> u64 {
     let reset = profile::MSRS[msr(MSR_MISC_ENABLE).unwrap()].reset;
     value & profile::MISC_ENABLE_COMMITTED | reset & !profile::MISC_ENABLE_COMMITTED
+}
+/// IA32_ARCH_CAPABILITIES as this host presents it (`cpu_profile.json`, its entry's per-bit reasons): the profile's
+/// always-on value, plus RDCL_NO when `rdcl_no` holds. The caller (host `set_cpu`) passes the coupling the owner set
+/// (November 5): the speculation-barrier switch is on AND the host reports FEAT_CSV3, so RDCL_NO is advertised only when
+/// the page-walk barriers that make it true are running (PCID plan P1).
+pub const fn arch_capabilities(rdcl_no: bool) -> u64 {
+    profile::MSRS[slot(MSR_ARCH_CAPABILITIES)].reset | if rdcl_no { profile::ARCH_CAPABILITIES_CSV3 } else { 0 }
 }
 /// A vCPU's MSRs after reset (vCPU 0 is the BSP) with the virtual firmware's MTRR state applied.
 pub const fn reset_msrs(bsp: bool) -> Msrs {
@@ -470,6 +478,24 @@ mod tests {
                 assert_eq!([ram - 0x1000, ram, 0xfec0_0000, 0xfee0_0000, 0xffff_f000].map(|g| mtrr_type(&m, g)), [WB, UC, UC, UC, UC]);
             }
         }
+    }
+
+    /// IA32_ARCH_CAPABILITIES (PCID plan P1): read-only (WRMSR #GP for every value), RDCL_NO (bit 0) only with the host's
+    /// FEAT_CSV3, the other bits the profile's; CPUID.(7,0):EDX[29] enumerates it, MD_CLEAR (EDX[10]) stays clear.
+    #[test]
+    fn arch_capabilities_is_read_only_and_rdcl_no_follows_csv3() {
+        let m = profile::MSRS[slot(MSR_ARCH_CAPABILITIES)];
+        assert!(read_ok(&m));
+        for &v in v::VALUES.iter().chain(&[0, arch_capabilities(true), arch_capabilities(false)]) {
+            assert!(!write_ok(&m, v, v::CR0, v::EFER), "{v:#x}");
+        }
+        assert_eq!(arch_capabilities(false) & 1, 0, "no RDCL_NO without CSV3");
+        assert_eq!(arch_capabilities(true), arch_capabilities(false) | 1);
+        // TAA_NO 8, IF_PSCHANGE_MC_NO 6, SBDR_SSDP_NO 13, FBSDP_NO 14, PSDP_NO 15, GDS_NO 26, RFDS_NO 27, ITS_NO 62.
+        assert_eq!(arch_capabilities(false), [6, 8, 13, 14, 15, 26, 27, 62].iter().map(|b| 1u64 << b).sum::<u64>());
+        let d = Dynamic { vcpus: 1, vcpu: 0, cr4: 0, apic_base: 0xfee0_0900, misc_enable: 0x1801, xcr0: 1 };
+        let edx = cpuid(7, 0, &d)[3];
+        assert_eq!((edx >> 29 & 1, edx >> 10 & 1), (1, 0));
     }
 
     #[test]

@@ -643,8 +643,8 @@
    "eax": "0x0",
    "ebx": "0x218801a9",
    "ecx": "0x4",
-   "edx": "0x0",
-   "source": "CPU 16 (CLM-03-01-16); ECX.UMIP by owner decision November 3 (boot-features plan, Built (UMIP))",
+   "edx": "0x20000000",
+   "source": "CPU 16 (CLM-03-01-16); ECX.UMIP by owner decision November 3 (boot-features plan, Built (UMIP)); EDX.ARCH_CAPABILITIES[29] by the PCID plan P1 (owner policy: accurate not-vulnerable bits, November 5)",
    "fields": {
     "ebx": {
      "0": {
@@ -849,7 +849,7 @@
      },
      "29": {
       "name": "ARCH_CAPABILITIES",
-      "state": "clear"
+      "state": "advertised"
      },
      "30": {
       "name": "CORE_CAPABILITIES",
@@ -1507,6 +1507,152 @@
     "K kernel/cpu/mtrr/mtrr.c:587"
    ],
    "note": "VCNT = 8, FIX = 1, WC = 1, SMRR = 0"
+  },
+  {
+   "index": "0x10a",
+   "name": "IA32_ARCH_CAPABILITIES",
+   "scope": "per_vcpu",
+   "access": "ro",
+   "reset": "0x400000000c00e140",
+   "writable_mask": null,
+   "write_rules": [
+    "always_gp_on_write"
+   ],
+   "side_effects": [
+    "the host sets RDCL_NO (bit 0, `host_bits`) at start-up only when the page-walk speculation-barrier switch is on AND the host reports FEAT_CSV3 (sysctl hw.optional.arm.FEAT_CSV3 = 1); off by default (owner, November 5)"
+   ],
+   "host_bits": {
+    "mask": "0x1",
+    "condition": "speculation-barrier switch on AND FEAT_CSV3"
+   },
+   "bits": {
+    "0": {
+     "name": "RDCL_NO",
+     "value": "1 only with the speculation-barrier switch on and host FEAT_CSV3 (both; default switch off so 0)",
+     "why": "\"not susceptible to Rogue Data Cache Load\". Translated CPL-3 code runs at EL0 in the user shadow space, which holds only translations the walker granted at CPL 3 (a supervisor page has no EL0 mapping); the resident's private region with the guest-RAM alias is EL1-only; FEAT_CSV3 keeps a faulting load's data from feeding speculative execution. With the barrier switch on, every resident access on the guest's behalf uses an address paging::walk returned, and walk masks each non-leaf level's next-table base with a conditional select to 0 plus CSDB (checking present, the reserved bits 51:40 and PS) and ends the leaf's permission check in an Arm SB. Coupled (owner, Nov 5): advertised only when the barriers run, and off by default, so a default command line keeps PTI (expected). See the PCID plan P1 'Measured (P1)' and tools/check_resident_barriers.py."
+    },
+    "1": {
+     "name": "IBRS_ALL",
+     "value": 0,
+     "why": "no IA32_SPEC_CTRL (enhanced IBRS is a control natemu does not have)"
+    },
+    "2": {
+     "name": "RSBA",
+     "value": 0,
+     "why": "not evaluated (owner, November 5: out of scope); 0 as Linux saw it before"
+    },
+    "3": {
+     "name": "SKIP_L1DFL_VMENTRY",
+     "value": 0,
+     "why": "VMX not presented"
+    },
+    "4": {
+     "name": "SSB_NO",
+     "value": 0,
+     "why": "speculative store bypass is general out-of-order behaviour of the host; the host has no SSBS control (FEAT_SSBS = 0)"
+    },
+    "5": {
+     "name": "MDS_NO",
+     "value": 0,
+     "why": "owner decision November 5 (PCID plan): the host's load value and address predictors (FLOP, SLAP) are not published as tagged by ASID or exception level, and an emulated VERW cannot clear them"
+    },
+    "6": {
+     "name": "IF_PSCHANGE_MC_NO",
+     "value": 1,
+     "why": "no machine check is ever raised (MCE/MCA not presented); a code page's size change without invalidation is handled by the shadow and code caches, never a machine check"
+    },
+    "7": {
+     "name": "TSX_CTRL",
+     "value": 0,
+     "why": "no IA32_TSX_CTRL (TSX not presented)"
+    },
+    "8": {
+     "name": "TAA_NO",
+     "value": 1,
+     "why": "TAA needs Intel TSX; RTM and HLE are not presented (Intel TAA guidance: CPUs that do not support Intel TSX are not affected)"
+    },
+    "13": {
+     "name": "SBDR_SSDP_NO",
+     "value": 1,
+     "why": "MMIO is an exit to natemu's device models and mapped RAM is ordinary memory: no shared (uncore) buffer an MMIO read could return stale data from"
+    },
+    "14": {
+     "name": "FBSDP_NO",
+     "value": 1,
+     "why": "as SBDR_SSDP_NO: no fill-buffer stale-data propagation through MMIO; host buffer sampling in general is MDS_NO's question (kept 0)"
+    },
+    "15": {
+     "name": "PSDP_NO",
+     "value": 1,
+     "why": "as FBSDP_NO, for the primary stale-data propagator"
+    },
+    "17": {
+     "name": "FB_CLEAR",
+     "value": 0,
+     "why": "VERW clears nothing on the host (MD_CLEAR also 0)"
+    },
+    "18": {
+     "name": "FB_CLEAR_CTRL",
+     "value": 0,
+     "why": "no IA32_MCU_OPT_CTRL"
+    },
+    "19": {
+     "name": "RRSBA",
+     "value": 0,
+     "why": "not evaluated (owner, November 5: out of scope); 0 as Linux saw it before"
+    },
+    "20": {
+     "name": "BHI_NO",
+     "value": 0,
+     "why": "host branch-predictor behaviour, not claimed"
+    },
+    "24": {
+     "name": "PBRSB_NO",
+     "value": 0,
+     "why": "host return-predictor behaviour, not claimed"
+    },
+    "25": {
+     "name": "GDS_CTRL",
+     "value": 0,
+     "why": "no IA32_MCU_OPT_CTRL"
+    },
+    "26": {
+     "name": "GDS_NO",
+     "value": 1,
+     "why": "GDS is the gather unit forwarding stale vector-register data; natemu has no gather unit: AVX2 gathers are translated to ordinary loads"
+    },
+    "27": {
+     "name": "RFDS_NO",
+     "value": 1,
+     "why": "RFDS is a flaw of Intel Atom register files; the guest's registers live in host registers and memory, no such register file"
+    },
+    "28": {
+     "name": "RFDS_CLEAR",
+     "value": 0,
+     "why": "VERW clears nothing on the host"
+    },
+    "62": {
+     "name": "ITS_NO",
+     "value": 1,
+     "why": "Intel designates the bit for a hypervisor to tell a guest it is not affected by Indirect Target Selection (Intel ITS guidance, Migration Pools: 1 = not affected; the CPUID-enumeration document 8.0 and SDM Vol.4 093 print the two values' meanings swapped, the ITS page, the bit's name and Linux read 1 as not affected); ITS is a flaw of Intel's branch-target selection, which no host predictor implements. Spectre v2 stays reported, so Linux keeps its Spectre v2 mitigation"
+    },
+    "other": {
+     "value": 0,
+     "why": "controls, MSR enumerations and reserved bits natemu does not have (9-12, 16, 21-23, 29-61, 63)"
+    }
+   },
+   "source": [
+    "PCID plan P1 (owner policy: accurate bits; MDS_NO decision November 5; RSBA/RRSBA out of scope)",
+    "Intel CPUID Enumeration and Architectural MSRs 8.0 (10/22/2026), artifacts/research/track01/source-snapshots/2026-11-05/cpuid-enum.txt",
+    "SDM Vol.4 335592-093 Table 2-2 10AH (R/O), artifacts/research/track01/source-snapshots/2026-11-05/sdm-vol4-table2-2-ia32-arch-capabilities.txt",
+    "Intel guidance pages TAA, MMIO stale data, GDS, RFDS, ITS, RDCL (artifacts/research/track01/source-snapshots/2026-11-05/MANIFEST.md)"
+   ],
+   "kernel": [
+    "K kernel/cpu/common.c:1320-1321 (read when CPUID.7.0:EDX[29])",
+    "kernel/cpu/common.c cpu_set_bug_bits",
+    "kernel/apic/apic.c:1696-1700 (XAPIC_DISABLE_STATUS only with bit 21)"
+   ],
+   "note": "Read-only (SDM Vol.4: R/O): WRMSR #GP(0). RDCL_NO (bit 0) is the only host-conditional bit; it needs the speculation-barrier switch on and host FEAT_CSV3. Known gap for the correctness pass (not RDCL's paging definition): a caller reading Translation.gpa from an Err result under a mispredicted Ok/Err branch, and the non-paging limit checks in segments::descriptor and the TSS I/O-bitmap (Spectre-v1-shaped, older than P1) are not covered by the walk's barriers."
   },
   {
    "index": "0x174",
@@ -2484,15 +2630,6 @@
    ]
   },
   {
-   "index": "0x10a",
-   "name": "IA32_ARCH_CAPABILITIES",
-   "reason": "CPUID.7.0.EDX[29] clear",
-   "source": "CPU 16 (CLM-03-01-16)",
-   "kernel": [
-    "K kernel/cpu/common.c:1320-1321 (gated)"
-   ]
-  },
-  {
    "index": "0x119",
    "name": "MSR_IA32_BBL_CR_CTL",
    "reason": "CPUID.1.EDX.PSN clear",
@@ -2827,7 +2964,7 @@
    "site": "kernel/apic/apic.c:1700",
    "msr": "0xbd",
    "safe": false,
-   "gate": "7.0.edx.ARCH_CAPABILITIES"
+   "gate": "cond:IA32_ARCH_CAPABILITIES.XAPIC_DISABLE_STATUS (bit 21), clear"
   },
   {
    "site": "kernel/apic/apic.c:1713-1729",
@@ -3060,9 +3197,9 @@
   {
    "slug": "speculation-mitigations",
    "feature": "7.0.edx.ARCH_CAPABILITIES, SPEC_CTRL, MD_CLEAR",
-   "state": "clear",
+   "state": "ARCH_CAPABILITIES advertised (PCID plan P1); SPEC_CTRL, MD_CLEAR clear",
    "census": "verw x17, wbinvd x23 (system class).",
-   "meaning": "No ARCH_CAPABILITIES, so Linux marks the family 6 model 0x3c identity vulnerable (plan row VERW); the owner boots with mitigations=off, but VERW (a descriptor-checking instruction) is still in the kernel text. IA32_SPEC_CTRL, ARCH_CAPABILITIES, PRED_CMD are absent (#GP); Linux reads them only under feature guards.",
+   "meaning": "No ARCH_CAPABILITIES, so Linux marks the family 6 model 0x3c identity vulnerable (plan row VERW); the owner boots with mitigations=off, but VERW (a descriptor-checking instruction) is still in the kernel text. IA32_SPEC_CTRL, ARCH_CAPABILITIES, PRED_CMD are absent (#GP); Linux reads them only under feature guards. Since the PCID plan P1, IA32_ARCH_CAPABILITIES is read-only with the accurate bits (the profile entry gives each bit's reason); MD_CLEAR stays clear (owner decision November 5).",
    "audience": "implementers (VERW), owner"
   },
   {
