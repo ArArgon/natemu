@@ -74,6 +74,10 @@ Then, as the numbers dictate:
    faster (27.33 -> 25.29 s), and single-feature runs tie that to SMAP (like + SMAP 24.84 s). ERMS/FSRM account for much
    of the hackbench and installer slowdown. Under `max` the guest also runs 5-level paging and sees an AMD vendor. The
    faster of the two QEMU columns is the one natemu is compared against per cell.
+   Dropped from standing runs (owner, November 4): `max` was slower in 9 of 10 cells and on all three new benchmarks, so
+   like-for-like is the QEMU column from now on; the recorded `max` numbers stay as reference, rerun only if the QEMU version
+   changes. Per-change measurement: the cells the change targets plus installer N = 1 and one canary per benchmark family,
+   three interleaved runs; QEMU is never rerun per change; the full matrix only at batch end.
 9. **Generated-code quality** (guest code ~2.3 s on the installer at batch-1 start): larger FEX compile regions, careful
    relaxation of precision rules where nothing observes the difference. Last, and only if steady-state benchmarks point here.
 
