@@ -3141,6 +3141,83 @@ to stay exact, only leaf entries already present with A set (writable only with 
 INVLPG/CR3 invalidation as today; whether it pays depends on how many of `mem`'s installs a neighbour's would have served,
 which needs a census of the installs (user or kernel, the neighbours' A bits, refaults after INVLPG) first.
 
+### Measured (chunk 28: three generated-code shapes, November 5; analysis on 6b2905b, series64-chunk26-r1, no code change kept)
+
+**Question.** Of three costs every block pays, which is largest across workloads and can be made cheaper exactly: (a) the
+page-crossing check before each store wider than a byte, (b) a SIMD load into a scratch register and then a 128-bit move to
+the guest register, (c) the dispatcher's code for computed exits. Build the largest exact one only if it clearly pays.
+
+**Method** (`natemu-raw/codeq-20261105-01/`, README there). Chunk 24's PC sampler (`scratch-prof28.diff`: the same diff, plus
+the code-area offset of each dispatcher sample), built from HEAD and removed again (the default resident's loaded sections
+byte-identical to HEAD's), one run per cell, `build`, `zstd`, `cray`, `luajit`, `hackbench` at N = 1, with series64-chunk26-r1;
+`codeq28.py` classes each sampled native word (the sample's PC is the oldest instruction not yet retired). Two shares per shape,
+of EL0 samples (blocks plus dispatcher): *held*, the samples on the shape's words; *words*, the shape's share of each block's
+words times the block's samples (as if every word cost the same). Then two measurements: a ceiling for (a), a scratch
+compiler with every split check removed (`scratch-nosplit.diff`, inexact, timing only; three interleaved rounds against base),
+and `disp28.c`, a host microbenchmark of the computed-exit lookup on this M4.
+
+| Share of EL0 samples, % (held / words) | `build` | `zstd` | `cray` | `luajit` | `hackbench` |
+| --- | --- | --- | --- | --- | --- |
+| EL0 samples in the window | 18,716 | 5,794 | 1,026 | 8,578 | 11,633 |
+| (a) split check (`[add/sub x1;] add x0, A, #w-1; eor; tbnz #12`) | 4.4 / 4.7 | 5.9 / 7.9 | 0.1 / 0.1 | 7.0 / 11.7 | 11.9 / 12.4 |
+| of which before a push (`str x, [x8, #-8]!`), % of (a)'s held | 66 | 18 | - | 46 | 83 |
+| (b) SIMD load then `mov v.16b` | 0 / 0 | 0.2 / 0.2 | 19.2 / 4.8 | 1.2 / 0.6 | 0 / 0 |
+| (c) dispatcher head and L1 entries (+ the exits' target check) | 15.0 (16.5) | 3.7 (4.6) | 0.6 | 5.4 (7.7) | 9.0 (12.8) |
+| of the dispatcher's samples: L1 entry's first word / dispatcher's first word, % | 77 / 20 | 80 / 15 | - | 51 / 41 | 59 / 38 |
+
+**Estimates** (share x chunk 24's generated-code seconds, `build` 6.14, `zstd` 1.73, `cray` 0.31, `luajit` 3.10, `hackbench`
+5.35): (c) is the largest: `build` 1.01 s, `hackbench` 0.68, `luajit` 0.24, `zstd` 0.08 (about 2.0 s over the five); (a) by
+words `build` 0.29, `zstd` 0.14, `luajit` 0.36, `hackbench` 0.66 (about 1.45 s); (b) `cray` 0.06 by its held samples (0.015 by
+words), `luajit` 0.04, nothing elsewhere (about 0.1 s).
+
+**Ceiling of (a)** (`ceil/`, every split check removed, three interleaved rounds, median (min-max) s; every run verified):
+
+| Benchmark, N = 1 | base | no split checks | change |
+| --- | --- | --- | --- |
+| `build` | 11.51 (11.45-11.52) | 11.08 (11.03-11.12) | -3.7% |
+| `zstd` | 1.91 (1.89-1.96) | 1.78 (1.77-1.79) | -6.7% |
+| `luajit` | 4.12 (4.12-4.15) | 3.86 (3.83-3.90) | -6.5% |
+| `hackbench` | 11.89 (11.86-11.94) | 12.02 (11.88-12.08) | +1.1% |
+
+So the samples at `hackbench`'s push checks (12%) are not the checks' cost (removing them gains nothing there, the ranges
+overlapping); removing every check gains 3.7-6.7% on the other three.
+
+**Dispatcher microbenchmark** (`disp28.txt`; K blocks of ten instructions, each ending in a computed exit; ns per exit over
+the 0.56 ns of a block reached by a direct branch; K = 16 / 256 / 1,024):
+- the next block predictable (each exit site always goes to the same block): today's code L1 0.95 / 1.03 / 2.38; a data table
+  (`ldp` of tag and target, `br`) 0.70 / 0.71 / 0.74; a one-entry inline cache per exit site (its RIP's compare, a direct `b`) 0;
+- the next block random: code L1 4.91 / 5.36 / 5.40; data table 5.89 / 6.24 / 6.26; inline cache (missing to today's path)
+  4.83 / 5.60 / 5.97.
+
+**Nothing built.**
+- (c), the largest, is mostly the indirect branch itself: the samples sit on the first word reached after the dispatcher's
+  `b` and its `br`, not on the tag compare (under 1% of the dispatcher's samples), so a shorter compare saves nothing. A
+  data table saves 0.25-1.6 ns on a predictable exit (the code L1's instruction-cache footprint at 1,024 targets) and costs
+  about 1 ns on an unpredictable one (its load sits before the branch resolves), and it needs an EL0-readable page in the
+  private window: a guest load at that non-canonical address would read the table instead of #GP, a new deviation like the
+  guest-state alias's (owner decision). An inline cache removes a monomorphic site's cost entirely but is linker-scale work:
+  a multi-word patch per computed exit, filled from a resident trip, unlinked with the direct links, and admitted. Neither is
+  one time-boxed experiment, and which pays depends on the mix of predictable and unpredictable exits, which nothing measures yet.
+- (a) has no cheaper exact form for a general store: three words is the shortest flag-free test of "crosses 4 KiB". Where the
+  check is provably redundant, after an aligned SSE/AVX store's alignment check on the same address (`alignsplit28.py`), it
+  holds at most 0.15% of EL0 samples (`luajit`; 0.03% or less elsewhere). The exact elision the ceiling points to is an 8-aligned stack: an 8-byte push, or an RSP-relative store whose
+  offset is a multiple of its width, cannot cross a page while RSP is 8-aligned; one guard per block (`and x0, x8, #7; cbnz`)
+  could replace the checks of every such store after it while RSP changes only by multiples of 8, the guard's stub stepping
+  the instruction otherwise (a performance cliff for misaligned stacks, exact). It needs a new stub kind, its resident path,
+  and an admission proof over RSP's writes; by the pushes' share of the split samples, at most about 2.4% of `build`, 3% of
+  `luajit`, 1% of `zstd` (other RSP-relative stores not separated): not built in this experiment.
+- (b) is not about upper bits: the load goes to a scratch register because after a synchronous abort a load's destination
+  is UNKNOWN (DDI0487 D1.4.1.4; `fexc_precision.h` `LoadsInto`), so a direct load could corrupt the guest register at a #PF.
+  It cannot be dropped exactly, and it is at most 0.1 s anyway.
+
+**Applies to.** Nothing changed. The findings apply to every workload: computed exits are every `ret`, indirect `call` and
+`jmp` (switch tables, virtual calls, interpreters, PLT stubs); split checks every store wider than a byte, pushes and calls
+included; the load-then-move every SIMD load.
+
+**Next, if wanted.** For (c): a scratch count of computed exits per site (how many targets each site has) decides between an
+inline cache (monomorphic sites) and nothing; the data table needs the owner's decision on the readable page first. For (a):
+the aligned-stack guard, measured against the ceiling's 3.7% on `build`.
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
