@@ -29,7 +29,13 @@ jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never 
 (series applied as thirty commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
 `git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series55-swapgs` (November 4, perf plan "Measured
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series56-setup-r1` (November 4, perf plan "Measured
+(chunk 20)", after its review): series55-swapgs's patches and shim with `fexc.cpp`'s server parsing and configuring once per
+distinct argument list less the RIP (below, "Compile server"); every reply byte-identical to series55-swapgs's on an
+installer and a `build` boot's recorded request streams; `obj/fexc` SHA-256 `a81a2f241b6bf368cd7b6e8b87c5892efacd9747127f6f8dea97ae936add1fd8`. Before it,
+`series56-setup` (`d3222fda...7db064`, the same change before the review's fixes: the guest window set before a new
+context, the reply's extent and args_read cleared per request, the Config values derived at parse time).
+Before it, `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series55-swapgs` (November 4, perf plan "Measured
 (chunk 17)"): patches 0001-0033 (0033: the plain SWAPGS translated inline for a CPL-0 request, exchanging `gs_cached` with
 IA32_KERNEL_GS_BASE, which the resident keeps at FEX's `L1Pointer`) and the shim's `Cut` rule for it (`--cpl0`, the
 three-byte form only); `obj/fexc` SHA-256 `4a50bda9ac5231db9faa2ce7f5e901da840666a435215f7b8aa47654baa8ecae`. Before it,
@@ -321,9 +327,15 @@ the shim tests the form before the flag, so a block without a gated form reads n
 **Requests run in this process** (`--serve-mode reuse`, the default since P3): one FEX context per configuration (Config
 values, host features, profile), kept, and nothing of a request left in it: the compile is FEX's `CompileBlock` without
 its caches (the block never enters the context's lookup cache, its relocations are cleared, the code buffer is emptied
-after the hook copies the code), FEX's process-global Config is rebuilt from nothing per request (`Config::Shutdown`, then
-`Initialize`; a plain `Initialize` kept an earlier request's `--config` values) and the recorders are reset
-(`ResetGlobals`). About 0.04 ms per request against 0.45 ms forked (the boot's request set). Server memory is bounded
+after the hook copies the code), FEX's process-global Config is rebuilt from nothing (`Config::Shutdown`, then `Initialize`;
+a plain `Initialize` kept an earlier request's `--config` values) whenever a request needs other values than the last one
+applied (nothing in FEX changes a value after it is built: the reader only caches its conversion), and the recorders are reset (`ResetGlobals`). Since series56-setup
+(perf plan, "Measured (chunk 20)") the server parses a request's arguments, checks them and derives its Config values, host
+features and kept context once per distinct argument list less the `--rip` value (`Setups`, `Compile`): a request whose
+arguments equal a kept list but for that value is compiled with the kept setup and its own RIP (the parse would consume the
+same tokens, and only the window check reads the RIP); a list whose first `--rip` token is not the one the parse uses (two
+`--rip`, `--rip` as another option's value) is parsed every time. The guest window, the gating arguments, the shim's hooks and
+Config are set from the setup for every request, before a new setup's context is created (`Prepare`). The reply goes out in one `writev` from the request's own buffers. About 0.04 ms per request against 0.45 ms forked (the boot's request set). Server memory is bounded
 by the number of configurations, not of requests: about 10 MiB with the host's one (1.34 M requests of a boot), 22-29 MiB
 with the many of `test_serve.py` (each kept context holds a thread, its JIT and dispatcher). Contexts are never torn down
 (FEX's destructors assume a running emulator thread), so the earlier context per request leaked about 145 KiB each

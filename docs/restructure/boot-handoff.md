@@ -73,7 +73,7 @@ build and sign `natemu-host` themselves.
 
 ```sh
 R=target/aarch64-unknown-none/release/natemu-runtime
-F=../natemu-raw/fexc-native-20261026-01/series55-swapgs/obj/fexc
+F=../natemu-raw/fexc-native-20261026-01/series56-setup-r1/obj/fexc
 K=../natemu-raw/kernel-census-20261028-01/dl/linux               # Debian 6.12.107 bzImage
 I=../natemu-raw/kernel-census-20261028-01/dl/initrd.gz           # Debian installer initrd
 target/release/natemu "$R" "$F" "$K" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr' --vcpus 4
@@ -616,7 +616,7 @@ Full suite (about 25 minutes of runner time per pass on the M4 at R2, waits for 
 # From the repository root; zsh or bash. Wait until no other natemu-host runs (timing-sensitive cases: kicks, l4b,
 # x3 stress). A timing failure may be rerun alone once, never more: the results record the first run's result and the
 # rerun's beside it; a failed rerun is a failure.
-F=../natemu-raw/fexc-native-20261026-01/series55-swapgs/obj/fexc  # tools/fexc/build.sh rebuilds it (patches 0001-0033 + the shim)
+F=../natemu-raw/fexc-native-20261026-01/series56-setup-r1/obj/fexc  # tools/fexc/build.sh rebuilds it (patches 0001-0033 + the shim)
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 I8=../natemu-raw/i8-corpus-20261030-01      # gen_i8.py programs and their QEMU 7.2 results
@@ -720,6 +720,12 @@ tools/with-env python3 tools/run_r1.py r1b --fexc "$F" --out "$O/r1b"   # R1b: m
 ```
 
 ## 6. Compiler reproducibility
+
+**series56-setup-r1** (November 4; perf plan "Measured (chunk 20)", after its review): series55-swapgs's patches and shim;
+`fexc.cpp`'s server parses, checks and configures once per distinct argument list less the `--rip` value and writes each
+reply with one `writev` (every reply byte-identical to series55-swapgs's on recorded installer and `build` streams);
+`obj/fexc` SHA-256 `a81a2f241b6bf368cd7b6e8b87c5892efacd9747127f6f8dea97ae936add1fd8`. Before it, series56-setup (`d3222fda2d06f0f4771b51c8ab24c33c61a4db456ed136b972cc6f76fc7db064`,
+the change before the review's fixes, reproduced by a second `build.sh`; measured). Before it:
 
 **series55-swapgs** (November 4; perf plan "Measured (chunk 17)"): `patches/0001-0033` (new 0033: SWAPGS inline, exchanging
 `gs_cached` with IA32_KERNEL_GS_BASE at FEX's `L1Pointer`) on the pinned FEX commit with the shim's `Cut` rule for the plain

@@ -22,10 +22,13 @@
 #include <FEXCore/fextl/memory.h>
 #include <fexc_hook.h>
 
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <bit>
+#include <unordered_map>
 #include <map>
 #include <stdexcept>
 #include <cstdio>
@@ -48,13 +51,14 @@ using namespace FEXCore;
 // LSE, preserve_all on) are pinned to the old values; every other bit is Apple M4's ID-register view.
 struct FeatureDef {
   const char* name;
-  std::function<void(HostFeatures&, bool)> set;
-  std::function<bool(const HostFeatures&)> get;
+  void (*set)(HostFeatures&, bool);
+  bool (*get)(const HostFeatures&);
   bool value; // profile default
 };
 #define FEAT(field, json, dflt) {json, [](HostFeatures& h, bool v) { h.field = v; }, [](const HostFeatures& h) { return bool(h.field); }, dflt}
-static std::vector<FeatureDef> FeatureTable() {
-  return {
+// Built once (perf chunk 20: it was rebuilt for every request); a request's overrides go to a copy of the values (Configure).
+static const std::vector<FeatureDef>& FeatureTable() {
+  static const std::vector<FeatureDef> table = {
     // Needed to match the old producer exactly (rpres and wfxt off as well).
     FEAT(SupportsAtomics, "atomics_lse", true), FEAT(SupportsRCPC, "lrcpc", false), FEAT(SupportsTSOImm9, "lrcpc2", false),
     FEAT(SupportsSVE128, "sve128", false), FEAT(SupportsSVE256, "sve256", false), FEAT(SupportsPreserveAllABI, "preserve_all_abi", true),
@@ -72,6 +76,7 @@ static std::vector<FeatureDef> FeatureTable() {
     FEAT(SupportsAVX, "x86_avx", true), FEAT(SupportsAES256, "x86_aes256", true), FEAT(Supports3DNow, "x86_3dnow", true),
     FEAT(SupportsSSE4a, "x86_sse4a", false),
   };
+  return table;
 }
 // Profile "slice1" (slice-1 contract §2): 64-bit only, hardware TSO (FEX TSO emulation off), no end marker, dense PC table,
 // multiblock off, FlagM required; block cutting at an allowlist (fexc_slice1.inc) and every exit through the resident
@@ -364,31 +369,43 @@ static void ResetGlobals() {
   fexc_args_read = 0; Extent = 0;
 }
 
-// The CLI's body. `args` are the command-line arguments (args[0] is the program name); `given` replaces --hex/--file with the
-// bytes themselves and `rep` collects the outputs instead of stdout/--out/--object (both set only by --serve).
 // One FEX context per configuration (everything fixed at its creation: the Config values set below, the host features, the
 // profile), created at its first request and kept: a context is never torn down (FEX's destructors assume a running emulator
 // thread). A request leaves nothing behind in it (see the compile below), so a kept context compiles exactly as a new one.
 struct Ctx { fextl::unique_ptr<Context::Context> ctx; Core::InternalThreadState* thread = nullptr; Handler handler; Signals signals; Core::CPUState::gdt_segment gdt[32] {}; };
-static int CompileRequest(const std::vector<std::string>& args, const std::vector<uint8_t>* given, Reply* rep) {
-  Served = rep;
-  ResetGlobals();
-  const int argc = int(args.size());
+
+// Everything a request's arguments decide (ParseArgs, with the Config values), and what follows from them alone (Configure: the
+// host features, the kept context). --serve keeps one per distinct argument list less the --rip value (Serve, perf chunk 20).
+struct Setup {
   std::string hex, file, out, object;
   bool have_rip = false;
   uint64_t rip = 0, bitness = 64;
+  int rip_arg = 0;   // index in args of the --rip value used (the last --rip's)
   Settings st;
-  bool sparse_flag = false;
+  bool sparse_flag = false, slice1 = false;
   std::vector<std::pair<std::string, bool>> overrides;
   std::vector<std::pair<std::string, std::string>> configs;   // --config NAME=VALUE, applied after fexc's own Config::Set calls
+  // The gating arguments (shim FexcArg values; Arm sets them for each request).
+  bool sse_gated = false, avx_gated = false, alignment_gated = false, x87_gated = false, wait_gated = false, cpl0 = false, tsc = false;
+  uint64_t x87_fpcr = 0, simd_unmasked = 0, x87_unmasked = 0;
+  std::vector<std::pair<Config::ConfigOption, std::string>> sets;   // the Config values (ParseArgs)
+  // Configure:
+  HostFeatures hf {};
+  Ctx* kc = nullptr;
+};
+
+// The CLI's arguments (args[0] is the program name) into `s`: 0, or Fail's code. `serve`: from --serve (no --hex/--file).
+static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve) {
+  const int argc = int(args.size());
+  Settings& st = s.st;
   std::string missing;
   for (int i = 1; i < argc && missing.empty(); ++i) {
-    std::string a = args[i];
+    const std::string& a = args[i];
     auto next = [&]() -> const char* { if (i + 1 >= argc) { missing = a; return ""; } return args[++i].c_str(); };
-    if (a == "--hex") hex = next();
-    else if (a == "--file") file = next();
-    else if (a == "--rip") { rip = strtoull(next(), nullptr, 0); have_rip = true; }
-    else if (a == "--bitness") bitness = strtoull(next(), nullptr, 0);
+    if (a == "--hex") s.hex = next();
+    else if (a == "--file") s.file = next();
+    else if (a == "--rip") { s.rip = strtoull(next(), nullptr, 0); s.have_rip = true; s.rip_arg = i; }
+    else if (a == "--bitness") s.bitness = strtoull(next(), nullptr, 0);
     else if (a == "--max-insts") st.max_insts = strtoll(next(), nullptr, 0);
     else if (a == "--profile") {
       st.profile = next();
@@ -397,98 +414,117 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     }
     else if (a == "--multiblock") st.multiblock = true;
     else if (a == "--dense-pc") st.dense_pc = true; // default since v2
-    else if (a == "--sparse-pc") { st.dense_pc = false; sparse_flag = true; } // diagnostic only: an instruction without a GuestOpcode (e.g. moffs movabs) is then attributed to the previous one
+    else if (a == "--sparse-pc") { st.dense_pc = false; s.sparse_flag = true; } // diagnostic only: an instruction without a GuestOpcode (e.g. moffs movabs) is then attributed to the previous one
     else if (a == "--no-end-marker") st.end_marker = false;
     else if (a == "--no-tso") st.tso = false;
-    else if (a == "--sse-gated") fexc_sse_gated = true;   // slice1 (I5a): CR0.EM/TS or no CR4.OSFXSR: SSE forms are system cuts
-    else if (a == "--avx-gated") fexc_avx_gated = true;   // slice1 (I8): no OSXSAVE, XCR0[2:1] != 11b or CR0.TS: VEX AVX forms are system cuts
-    else if (a == "--alignment-gated") fexc_alignment_gated = true;   // slice1 (X2): alignment checking on: BT* memory forms are system cuts
-    else if (a == "--x87-gated") fexc_x87_gated = true;   // slice1 (I6): CR0.EM or CR0.TS: x87 forms are system cuts (#NM)
-    else if (a == "--cpl0") fexc_cpl0 = true;             // slice1 (perf chunk 15): a CPL-0 request: CLI/STI inline (Cut)
-    else if (a == "--tsc") fexc_tsc = true;               // slice1 (perf chunk 15): CPL 0, a 24 MHz counter: RDTSC inline
-    else if (a == "--wait-gated") fexc_wait_gated = true; // slice1 (I6): CR0.TS and CR0.MP: WAIT/FWAIT is a system cut (#NM)
-    else if (a == "--x87-fpcr") fexc_x87_fpcr = strtoull(next(), nullptr, 0);   // slice1 (I6): FPCR of x87 arithmetic when MXCSR's differs
-    else if (a == "--simd-unmasked") fexc_simd_unmasked = strtoull(next(), nullptr, 0) & 0x3f;   // slice1 (I5c): MXCSR's unmasked exceptions
-    else if (a == "--x87-unmasked") fexc_x87_unmasked = strtoull(next(), nullptr, 0) & 0x3f;     // slice1 (I5c): FCW's unmasked exceptions
-    else if (a == "--feature") { std::string v = next(); auto eq = v.find('='); if (eq == std::string::npos) return Fail("--feature NAME=0|1"); overrides.push_back({v.substr(0, eq), v.substr(eq + 1) != "0"}); }
-    else if (a == "--config") { std::string v = next(); auto eq = v.find('='); Config::ConfigOption o; if (eq == std::string::npos || !ConfigOptionByName(v.substr(0, eq), o)) return Fail("--config NAME=VALUE (NAME: a FEX config option, e.g. X87REDUCEDPRECISION)"); configs.push_back({v.substr(0, eq), v.substr(eq + 1)}); }
-    else if (a == "--out") out = next();
-    else if (a == "--object") object = next();
+    else if (a == "--sse-gated") s.sse_gated = true;   // slice1 (I5a): CR0.EM/TS or no CR4.OSFXSR: SSE forms are system cuts
+    else if (a == "--avx-gated") s.avx_gated = true;   // slice1 (I8): no OSXSAVE, XCR0[2:1] != 11b or CR0.TS: VEX AVX forms are system cuts
+    else if (a == "--alignment-gated") s.alignment_gated = true;   // slice1 (X2): alignment checking on: BT* memory forms are system cuts
+    else if (a == "--x87-gated") s.x87_gated = true;   // slice1 (I6): CR0.EM or CR0.TS: x87 forms are system cuts (#NM)
+    else if (a == "--cpl0") s.cpl0 = true;             // slice1 (perf chunk 15): a CPL-0 request: CLI/STI inline (Cut)
+    else if (a == "--tsc") s.tsc = true;               // slice1 (perf chunk 15): CPL 0, a 24 MHz counter: RDTSC inline
+    else if (a == "--wait-gated") s.wait_gated = true; // slice1 (I6): CR0.TS and CR0.MP: WAIT/FWAIT is a system cut (#NM)
+    else if (a == "--x87-fpcr") s.x87_fpcr = strtoull(next(), nullptr, 0);   // slice1 (I6): FPCR of x87 arithmetic when MXCSR's differs
+    else if (a == "--simd-unmasked") s.simd_unmasked = strtoull(next(), nullptr, 0) & 0x3f;   // slice1 (I5c): MXCSR's unmasked exceptions
+    else if (a == "--x87-unmasked") s.x87_unmasked = strtoull(next(), nullptr, 0) & 0x3f;     // slice1 (I5c): FCW's unmasked exceptions
+    else if (a == "--feature") { std::string v = next(); auto eq = v.find('='); if (eq == std::string::npos) return Fail("--feature NAME=0|1"); s.overrides.push_back({v.substr(0, eq), v.substr(eq + 1) != "0"}); }
+    else if (a == "--config") { std::string v = next(); auto eq = v.find('='); Config::ConfigOption o; if (eq == std::string::npos || !ConfigOptionByName(v.substr(0, eq), o)) return Fail("--config NAME=VALUE (NAME: a FEX config option, e.g. X87REDUCEDPRECISION)"); s.configs.push_back({v.substr(0, eq), v.substr(eq + 1)}); }
+    else if (a == "--out") s.out = next();
+    else if (a == "--object") s.object = next();
     else return Fail("unknown argument " + a);
   }
   if (!missing.empty()) return Fail(missing + " needs a value");
-  if (!have_rip || (!given && hex.empty() == file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--avx-gated] [--alignment-gated] [--x87-gated] [--wait-gated] [--cpl0] [--tsc] [--x87-fpcr V] [--simd-unmasked M] [--x87-unmasked M] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
-  if (bitness != 32 && bitness != 64) return Fail("--bitness must be 32 or 64");
-  const bool slice1 = st.profile == "slice1";
-  if (slice1 && bitness != 64) return Fail("profile slice1 is 64-bit only");
-  if (slice1 && sparse_flag) return Fail("profile slice1 needs the dense PC table (sites would be attributed to the previous instruction)");
-  if (slice1 && (st.tso || st.multiblock || st.end_marker)) return Fail("profile slice1 fixes TSO emulation off, multiblock off and no end marker");
-  for (auto& c : configs) {   // slice1 (I6): x87 runs in reduced precision only (the resident's state model is doubles)
+  if (!s.have_rip || (!serve && s.hex.empty() == s.file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--avx-gated] [--alignment-gated] [--x87-gated] [--wait-gated] [--cpl0] [--tsc] [--x87-fpcr V] [--simd-unmasked M] [--x87-unmasked M] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
+  if (s.bitness != 32 && s.bitness != 64) return Fail("--bitness must be 32 or 64");
+  s.slice1 = st.profile == "slice1";
+  if (s.slice1 && s.bitness != 64) return Fail("profile slice1 is 64-bit only");
+  if (s.slice1 && s.sparse_flag) return Fail("profile slice1 needs the dense PC table (sites would be attributed to the previous instruction)");
+  if (s.slice1 && (st.tso || st.multiblock || st.end_marker)) return Fail("profile slice1 fixes TSO emulation off, multiblock off and no end marker");
+  for (auto& c : s.configs) {   // slice1 (I6): x87 runs in reduced precision only (the resident's state model is doubles)
     Config::ConfigOption o;
-    if (slice1 && ConfigOptionByName(c.first, o) && o == Config::CONFIG_X87REDUCEDPRECISION && c.second != "1")
+    if (s.slice1 && ConfigOptionByName(c.first, o) && o == Config::CONFIG_X87REDUCEDPRECISION && c.second != "1")
       return Fail("profile slice1 fixes X87REDUCEDPRECISION=1");
   }
-
-  std::vector<uint8_t> bytes;
-  if (given) bytes = *given;
-  else if (!file.empty()) {
-    std::ifstream f(file, std::ios::binary);
-    if (!f) return Fail("cannot read " + file);
-    bytes.assign(std::istreambuf_iterator<char>(f), {});
-  } else {
-    if (hex.size() % 2) return Fail("odd-length hex");
-    for (size_t i = 0; i < hex.size(); i += 2) {
-      char b[3] = {hex[i], hex[i + 1], 0}; char* e;
-      unsigned v = strtoul(b, &e, 16);
-      if (*e) return Fail("bad hex");
-      bytes.push_back(uint8_t(v));
-    }
-  }
-  if (bytes.empty() || bytes.size() > 65536) return Fail("input must be 1..65536 bytes");
-  // Window must lie inside the guest address space of the chosen mode.
-  if (bitness == 32 ? (rip > 0xffffffffull || bytes.size() > 0x100000000ull - rip)
-                    : (bytes.size() > UINT64_MAX - rip || (rip >> 47 != 0 && rip >> 47 != 0x1ffff) ||
-                       ((rip + bytes.size() - 1) >> 47 != 0 && (rip + bytes.size() - 1) >> 47 != 0x1ffff) || ((rip >> 47) != ((rip + bytes.size() - 1) >> 47))))
-    return Fail("RIP window is outside the guest address space (non-canonical, wraps, or exceeds 32 bits)");
-  W = {rip, bytes.size(), bytes.data()};
-
-  // ---- configure FEX. Config is process-global: rebuilt from nothing for every request, so no earlier request's values
-  // (e.g. a --config) remain; a context reads it at its creation, the compile reads some options again.
-  std::vector<std::pair<Config::ConfigOption, std::string>> sets = {
-    {Config::CONFIG_IS64BIT_MODE, bitness == 64 ? "1" : "0"}, {Config::CONFIG_DISABLETELEMETRY, "1"},
+  s.sets = {
+    {Config::CONFIG_IS64BIT_MODE, s.bitness == 64 ? "1" : "0"}, {Config::CONFIG_DISABLETELEMETRY, "1"},
     {Config::CONFIG_MULTIBLOCK, st.multiblock ? "1" : "0"}, {Config::CONFIG_TSOENABLED, st.tso ? "1" : "0"},
     {Config::CONFIG_VECTORTSOENABLED, st.tso ? "1" : "0"}, {Config::CONFIG_MEMCPYSETTSOENABLED, st.tso ? "1" : "0"}};
   // slice1 (I6): x87 in FEX's reduced-precision mode (doubles; owner direction, boot-features plan I6).
-  if (slice1) sets.push_back({Config::CONFIG_X87REDUCEDPRECISION, "1"});
-  for (auto& c : configs) { Config::ConfigOption o; ConfigOptionByName(c.first, o); sets.push_back({o, c.second}); }
+  if (s.slice1) s.sets.push_back({Config::CONFIG_X87REDUCEDPRECISION, "1"});
+  for (auto& c : s.configs) { Config::ConfigOption o; ConfigOptionByName(c.first, o); s.sets.push_back({o, c.second}); }
+  return 0;
+}
+
+// The input window must lie inside the guest address space of the chosen mode: 0, or Fail's code.
+static int CheckWindow(uint64_t rip, uint64_t bitness, size_t size) {
+  if (size == 0 || size > 65536) return Fail("input must be 1..65536 bytes");
+  if (bitness == 32 ? (rip > 0xffffffffull || size > 0x100000000ull - rip)
+                    : (size > UINT64_MAX - rip || (rip >> 47 != 0 && rip >> 47 != 0x1ffff) ||
+                       ((rip + size - 1) >> 47 != 0 && (rip + size - 1) >> 47 != 0x1ffff) || ((rip >> 47) != ((rip + size - 1) >> 47))))
+    return Fail("RIP window is outside the guest address space (non-canonical, wraps, or exceeds 32 bits)");
+  return 0;
+}
+
+// The process-wide state a compile (and a context's creation) reads from `s`: the shim's gating arguments and hooks, the log
+// handlers. Set for every request (ResetGlobals clears the gating arguments).
+static void Arm(const Setup& s) {
+  fexc_sse_gated = s.sse_gated; fexc_avx_gated = s.avx_gated; fexc_alignment_gated = s.alignment_gated; fexc_x87_gated = s.x87_gated;
+  fexc_cpl0 = s.cpl0; fexc_tsc = s.tsc; fexc_wait_gated = s.wait_gated; fexc_x87_fpcr = s.x87_fpcr; fexc_simd_unmasked = s.simd_unmasked;
+  fexc_x87_unmasked = s.x87_unmasked;
   LogMan::Throw::InstallHandler(AssertHandler);
   LogMan::Msg::InstallHandler(MsgHandler);
+  fexc_compile_hook = Hook;
+  fexc_guest_bytes = [](uint64_t a, uint64_t n) -> const uint8_t* { return InWindow(a, n) ? W.bytes + (a - W.base) : nullptr; };
+  fexc_dense_pc_table = s.st.dense_pc;
+  fexc_slice1 = s.slice1;
+}
+
+// FEX's Config is process-global: rebuilt from nothing (Shutdown, Initialize, then `sets`) whenever a request needs other values
+// than the last one applied, so no earlier request's values (e.g. a --config) remain. Nothing in FEX changes a value after it
+// is built (Config::Set is called only here; the reader only caches its conversion of a stored string, GetConv), so values
+// left from the previous request with the same `sets` are the same values.
+// A context reads it at its creation, the compile reads some options again.
+static void ApplyConfig(const std::vector<std::pair<Config::ConfigOption, std::string>>& sets) {
+  static std::vector<std::pair<Config::ConfigOption, std::string>> applied;
+  static bool any = false;
+  if (any && sets == applied) return;
   Config::Shutdown();
   Config::Initialize();
   for (auto& c : sets) Config::Set(c.first, c.second);
+  applied = sets; any = true;
+}
 
+// Everything process-wide a request's compile (and, on a setup's first request, the context's creation) reads: the guest window,
+// the shim's state (Arm) and FEX's Config. Run once per request, before Configure and CompileRequest.
+static void Prepare(const Setup& s, uint64_t rip, const uint8_t* data, size_t size) {
+  W = {rip, size, data};
+  Arm(s);
+  ApplyConfig(s.sets);
+}
+
+// The host features and kept context of `s`: 0, or Fail's code.
+static int Configure(Setup& s) {   // (Prepare has run for this request)
+  const Settings& st = s.st;
   HostFeatures hf {};
-  auto table = FeatureTable();
-  for (auto& o : overrides) {
+  const auto& table = FeatureTable();
+  std::vector<bool> value;
+  for (auto& f : table) value.push_back(f.value);
+  for (auto& o : s.overrides) {
     bool found = false;
-    for (auto& f : table) if (o.first == f.name) { f.value = o.second; found = true; }
+    for (size_t i = 0; i < table.size(); ++i) if (o.first == table[i].name) { value[i] = o.second; found = true; }
     if (!found) return Fail("unknown feature " + o.first);
   }
-  if (slice1) for (auto& f : table) if (std::string(f.name) == "flagm" && !f.value) return Fail("profile slice1 requires flagm");
-  for (auto& f : table) f.set(hf, f.value);
+  if (s.slice1) for (size_t i = 0; i < table.size(); ++i) if (std::string(table[i].name) == "flagm" && !value[i]) return Fail("profile slice1 requires flagm");
+  for (size_t i = 0; i < table.size(); ++i) table[i].set(hf, value[i]);
   hf.DCacheLineLog2 = st.dcache_line_log2;
   hf.IsInstCountCI = st.end_marker;
   hf.HostType = HostFeatures::HostTypeEnum::Linux;
-
-  fexc_compile_hook = Hook;
-  fexc_guest_bytes = [](uint64_t a, uint64_t n) -> const uint8_t* { return InWindow(a, n) ? W.bytes + (a - W.base) : nullptr; };
-  fexc_dense_pc_table = st.dense_pc;
-  fexc_slice1 = slice1;
+  s.hf = hf;
 
   static std::map<std::string, Ctx*> kept;
   std::string key = st.profile + (st.dense_pc ? "|d" : "|s") + (st.end_marker ? "e|" : "n|") + std::to_string(st.dcache_line_log2) + "|";
   for (auto& f : table) key += f.get(hf) ? '1' : '0';
-  for (auto& c : sets) key += "|" + std::to_string(int(c.first)) + "=" + c.second;
+  for (auto& c : s.sets) key += "|" + std::to_string(int(c.first)) + "=" + c.second;
   Ctx*& kc = kept[key];
   if (!kc) {
     kc = new Ctx;
@@ -498,6 +534,26 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     if (!kc->ctx->InitCore()) { kept.erase(key); return Fail("InitCore failed", 3); }
     kc->thread = kc->ctx->CreateThread();
   }
+  s.kc = kc;
+  return 0;
+}
+
+// The JSON document `j` (closed) as the CLI's stdout or --out, or the reply's.
+static void Emit(Json& j, Reply* rep, const std::string& out) {
+  j.s += '\n';
+  if (rep) rep->json.swap(j.s); else if (out.empty()) fwrite(j.s.data(), 1, j.s.size(), stdout); else std::ofstream(out) << j.s;
+}
+
+// One compile of `size` guest bytes at `rip` under the configured setup `s` (ResetGlobals has run; ParseArgs, CheckWindow,
+// Prepare and Configure passed). `rep` collects the outputs instead of stdout/--out/--object (set only by --serve).
+static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, size_t size, Reply* rep) {
+  const Settings& st = s.st;
+  const uint64_t bitness = s.bitness;
+  const bool slice1 = s.slice1;
+  const auto& table = FeatureTable();
+  const HostFeatures& hf = s.hf;
+  const auto& configs = s.configs;
+  Ctx* kc = s.kc;
   auto* thread = kc->thread;
   {
     // Code segment as a flat user CS (same setup FEX's CodeSizeValidation uses).
@@ -537,8 +593,8 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     j.kv("format", "natemu-fexc-v2");
     j.obj("producer").kv("tool", "fexc").kv("fex_commit", "48d71752e2a363d5535181f803b0b0e9666c1825").kv("host", "macos-arm64-native").end_obj();
     j.obj("input");
-    if (dumps) j.kv("bytes_hex", Hex(bytes.data(), bytes.size()));
-    j.kv("size", bytes.size()).kv("rip", Hex64(rip)).kv("bitness", bitness);
+    if (dumps) j.kv("bytes_hex", Hex(data, size));
+    j.kv("size", size).kv("rip", Hex64(rip)).kv("bitness", bitness);
     if (st.max_insts > 0) j.kv("max_instructions", st.max_insts); else j.null("max_instructions");
     j.end_obj();
     j.obj("settings").kv("profile", st.profile).kv("block_cutting", slice1 ? "allowlist" : "none")
@@ -566,8 +622,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     }
     j.arr("diagnostics"); for (auto& d : Diagnostics) { j.sep(); j.s += '"' + Json::esc(d) + '"'; } j.end_arr();
     j.end_obj();
-    std::string o = j.s + "\n";
-    if (rep) rep->json = o; else if (out.empty()) fwrite(o.data(), 1, o.size(), stdout); else std::ofstream(out) << o;
+    Emit(j, rep, s.out);
     return 1;
   }
 
@@ -832,13 +887,14 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
   }
   j.end_obj();
 
-  std::string o = j.s + "\n";
-  if (rep) rep->json = o; else if (out.empty()) fwrite(o.data(), 1, o.size(), stdout); else std::ofstream(out) << o;
+  Emit(j, rep, s.out);
 
   // Binary object (crates/abi/src/code_object.rs): header, code with zeroed relocation slots, then the tables.
   // Only for a successful compile (status ok): nothing is written for a block without translated instructions.
-  if ((rep || !object.empty()) && layout_ok && !Cap.prologues.empty() && Cap.info.TotalInstructions) {
-    std::vector<uint8_t> f(128, 0);
+  if ((rep || !s.object.empty()) && layout_ok && !Cap.prologues.empty() && Cap.info.TotalInstructions) {
+    std::vector<uint8_t> file;
+    auto& f = rep ? rep->object : file;   // --serve: built in the reply (whose buffer the server reuses)
+    f.assign(128, 0);
     auto put = [&](size_t at, uint64_t v, int n) { for (int i = 0; i < n; ++i) f[at + i] = uint8_t(v >> (8 * i)); };
     auto pad = [&](size_t a) { while (f.size() % a) f.push_back(0); };
     auto push = [&](uint64_t v, int n) { for (int i = 0; i < n; ++i) f.push_back(uint8_t(v >> (8 * i))); };
@@ -889,7 +945,7 @@ static int CompileRequest(const std::vector<std::string>& args, const std::vecto
     put(112, fbits, 8); f[120] = uint8_t(table.size()); f[121] = uint8_t(st.dcache_line_log2);
     put(124, slice1 ? 25u : 0xFFFFFFFFu, 4);   // = JSON natemu_pre_nzcv_register
     put(16, f.size(), 4);
-    if (rep) rep->object = f; else std::ofstream(object, std::ios::binary).write(reinterpret_cast<const char*>(f.data()), std::streamsize(f.size()));
+    if (!rep) std::ofstream(s.object, std::ios::binary).write(reinterpret_cast<const char*>(f.data()), std::streamsize(f.size()));
   }
   return Cap.info.TotalInstructions ? 0 : 1;
 }
@@ -911,18 +967,68 @@ static bool ReadAll(int fd, void* p, size_t n) {
 static void WriteAll(int fd, const void* p, size_t n) {
   for (auto* c = static_cast<const char*>(p); n;) { ssize_t r = write(fd, c, n); if (r <= 0) _exit(3); c += r; n -= size_t(r); }
 }
-static void SendReply(const Reply& r) {
-  std::vector<uint8_t> f(24);
-  auto put = [&](size_t at, uint32_t v) { for (int i = 0; i < 4; ++i) f[at + i] = uint8_t(v >> (8 * i)); };
-  put(4, uint32_t(r.code)); put(8, uint32_t(r.json.size())); put(12, uint32_t(r.object.size()));
-  if (r.code < 2) { put(16, r.extent); put(20, r.args_read); }
-  f.insert(f.end(), r.json.begin(), r.json.end());
-  f.insert(f.end(), r.object.begin(), r.object.end());
-  put(0, uint32_t(f.size() - 4));
-  WriteAll(1, f.data(), f.size());
+static void SendReply(const Reply& r) {   // the header, JSON and object in one writev, without copying them together
+  static_assert(std::endian::native == std::endian::little);
+  const uint32_t h[6] = {uint32_t(20 + r.json.size() + r.object.size()), uint32_t(r.code), uint32_t(r.json.size()), uint32_t(r.object.size()),
+                         r.code < 2 ? r.extent : 0, r.code < 2 ? r.args_read : 0};
+  iovec v[3] = {{const_cast<uint32_t*>(h), sizeof h}, {const_cast<char*>(r.json.data()), r.json.size()},
+                {const_cast<uint8_t*>(r.object.data()), r.object.size()}};
+  iovec *p = v, *const e = v + 3;
+  while (p != e) {
+    const ssize_t n = writev(1, p, int(e - p));
+    if (n <= 0) _exit(3);
+    for (size_t k = size_t(n); p != e && k; ) {   // skip what was written; a part written in part starts later
+      const size_t d = std::min(k, p->iov_len);
+      p->iov_base = static_cast<char*>(p->iov_base) + d; p->iov_len -= d; k -= d;
+      if (!p->iov_len) ++p;
+    }
+    while (p != e && !p->iov_len) ++p;
+  }
 }
-static void Compile(const std::vector<std::string>& args, const std::vector<uint8_t>& bytes, Reply& r) {
-  r.code = CompileRequest(args, &bytes, &r);
+
+// --serve's parsed setups (perf chunk 20): one per distinct argument list less the --rip value, kept for the server's life (the
+// host sends a handful: profile, gating arguments, feature overrides, block limit). A request whose arguments equal a kept list
+// everywhere but that one value is parsed and configured exactly as that list was, but for its RIP: the parse consumes the same
+// tokens in the same order (none of its choices depends on --rip's value), CheckWindow is the only check that reads the RIP,
+// and everything Configure derives depends on the setup alone. The key is the argument bytes before and after the value of the
+// first "--rip" token, with that value's offset; a list is kept only when that token is the value the parse used (the last
+// --rip's), so an unusual list (two --rip, "--rip" as another option's value) is parsed every time, as before.
+// ponytail: unbounded map; a server sees as many entries as the host has distinct settings (6 in an installer boot).
+static std::unordered_map<std::string, Setup> Setups;
+
+// One request: the argument strings (NUL-terminated, a[alen - 1] == 0 when alen) and the guest bytes.
+static void Compile(const char* a, size_t alen, const uint8_t* bytes, size_t size, Reply& r) {
+  Served = &r;
+  ResetGlobals();
+  r.code = 0; r.json.clear(); r.object.clear(); r.extent = r.args_read = 0;
+  size_t vo = SIZE_MAX, ve = 0;
+  int guess = 0;   // the index in args (args[0] = "fexc") of the token after the first "--rip"
+  for (size_t i = 0, t = 1; i < alen; ++t) {
+    const size_t e = i + strlen(a + i);
+    if (e - i == 5 && !memcmp(a + i, "--rip", 5) && e + 1 < alen) { vo = e + 1; ve = vo + strlen(a + vo); guess = int(t + 1); break; }
+    i = e + 1;
+  }
+  static std::string key;
+  if (vo != SIZE_MAX) { key.assign(a, vo); key.append(a + ve, alen - ve); key.append(reinterpret_cast<const char*>(&vo), sizeof vo); }
+  Setup* s = nullptr;
+  uint64_t rip = 0;
+  if (auto it = vo == SIZE_MAX ? Setups.end() : Setups.find(key); it != Setups.end()) {
+    s = &it->second;
+    rip = strtoull(a + vo, nullptr, 0);
+    if ((r.code = CheckWindow(rip, s->bitness, size))) return;
+    Prepare(*s, rip, bytes, size);
+  } else {
+    std::vector<std::string> args {"fexc"};
+    for (size_t i = 0; i < alen; i += args.back().size() + 1) args.push_back(a + i);
+    Setup fresh;
+    if ((r.code = ParseArgs(args, fresh, true)) || (r.code = CheckWindow(fresh.rip, fresh.bitness, size))) return;
+    Prepare(fresh, fresh.rip, bytes, size);
+    if ((r.code = Configure(fresh))) return;
+    rip = fresh.rip;
+    if (vo != SIZE_MAX && fresh.rip_arg == guess) s = &Setups.emplace(key, std::move(fresh)).first->second;
+    else { static Setup once; once = std::move(fresh); s = &once; }
+  }
+  r.code = CompileRequest(*s, rip, bytes, size, &r);
   r.extent = uint32_t(std::min<uint64_t>(Extent, UINT32_MAX));
   r.args_read = fexc_args_read;
 }
@@ -930,24 +1036,24 @@ static void Compile(const std::vector<std::string>& args, const std::vector<uint
 // "fork" (debugging): each request in a forked child of a server that never compiles, so nothing at all crosses requests and
 // a crash costs one request (about 0.5 ms more per request).
 static int Serve(const std::string& mode) {
+  std::vector<uint8_t> req;   // reused: no allocation per request once it has held the largest
+  Reply r;
   for (;;) {
     uint32_t len;
     if (!ReadAll(0, &len, 4)) return 0;
-    std::vector<uint8_t> req(len);
+    req.resize(len);
     if (!ReadAll(0, req.data(), len) || len < 4) return 3;
     uint32_t alen = req[0] | req[1] << 8 | req[2] << 16 | uint32_t(req[3]) << 24;
     if (alen > len - 4 || (alen && req[3 + alen]) ) return 3;   // the arguments end with a NUL
-    std::vector<std::string> args {"fexc"};
-    for (size_t i = 4; i < 4 + alen; i += args.back().size() + 1) args.push_back(reinterpret_cast<const char*>(&req[i]));
-    std::vector<uint8_t> bytes(req.begin() + 4 + alen, req.end());
-    Reply r;
+    const char* args = reinterpret_cast<const char*>(req.data() + 4);
+    const uint8_t* bytes = req.data() + 4 + alen;
     if (mode == "fork") {
       pid_t pid = fork();
-      if (pid == 0) { Compile(args, bytes, r); SendReply(r); _exit(0); }
+      if (pid == 0) { Compile(args, alen, bytes, len - 4 - alen, r); SendReply(r); _exit(0); }
       int status = 0;
       waitpid(pid, &status, 0);
       if (!WIFEXITED(status) || WEXITSTATUS(status)) { r = {}; r.code = 4; r.json = "fexc child died, status " + std::to_string(status); SendReply(r); }
-    } else { Compile(args, bytes, r); SendReply(r); }
+    } else { Compile(args, alen, bytes, len - 4 - alen, r); SendReply(r); }
   }
 }
 
@@ -963,7 +1069,26 @@ int main(int argc, char** argv) {
     if (mode != "fork" && mode != "reuse") return Fail("--serve-mode reuse|fork");
     return Serve(mode);   // stdin EOF; contexts are never torn down (see Ctx), so leave without destructors
   }
-  int code = CompileRequest(std::vector<std::string>(argv, argv + argc), nullptr, nullptr);
+  ResetGlobals();
+  Setup s;
+  int code = ParseArgs(std::vector<std::string>(argv, argv + argc), s, false);
+  std::vector<uint8_t> bytes;
+  if (!code && !s.file.empty()) {
+    std::ifstream f(s.file, std::ios::binary);
+    if (!f) code = Fail("cannot read " + s.file);
+    else bytes.assign(std::istreambuf_iterator<char>(f), {});
+  } else if (!code) {
+    if (s.hex.size() % 2) code = Fail("odd-length hex");
+    for (size_t i = 0; !code && i < s.hex.size(); i += 2) {
+      char b[3] = {s.hex[i], s.hex[i + 1], 0}; char* e;
+      unsigned v = strtoul(b, &e, 16);
+      if (*e) code = Fail("bad hex");
+      bytes.push_back(uint8_t(v));
+    }
+  }
+  if (!code) code = CheckWindow(s.rip, s.bitness, bytes.size());
+  if (!code) { Prepare(s, s.rip, bytes.data(), bytes.size()); code = Configure(s); }
+  if (!code) code = CompileRequest(s, s.rip, bytes.data(), bytes.size(), nullptr);
   // Do not tear the context down: FEX's destructors assume a running emulator thread.
   fflush(nullptr);
   _exit(code);

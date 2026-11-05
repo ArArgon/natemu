@@ -1954,6 +1954,118 @@ test, `run_k1.py` 336 runs, all green.
 treats PS at level 3 as reserved and the profile does not advertise 1 GiB pages); revisit if they are added (the region test
 covers 2 MiB regions only).
 
+### Measured (chunk 20: fexc's per-request setup, November 4; uncommitted on 5d80597, series56-setup)
+
+Evidence: `natemu-raw/fexsetup-20261104-01/` (README there). Setup as chunk 18: the `natemu` stub at HEAD 5d80597, cache
+off, `mitigations=off nokaslr`, 2 GiB, one VM at a time. Old compiler series55-swapgs, new series56-setup. Host and
+resident unchanged.
+
+**Profile first.** An installer N = 1 boot's compile stream (125,799 requests) and a `build` N = 1 run's (229,676), recorded
+by a `tee` in front of the server, as in chunk 18. Each holds 6 distinct argument lists once the RIP is left out (profile,
+12 feature overrides, gating arguments, an occasional `--max-insts 1`). Through one series55-swapgs server alone the
+installer stream cost 12.4 us of server CPU per request (12.38-12.57, three replays) and `build`'s 12.2 (12.13-12.28).
+`sample` of the server replaying the installer stream six times (`profile/old.*`): of the busy samples, FEX's compile
+40.9%, argument parsing and string handling 22.0% (each argument copied and compared with every option name; each of the
+12 overrides compared by name with every one of the 33 features), allocation 6.9%, the feature table and its 66
+`std::function`s rebuilt 4.7%, Config torn down and rebuilt 3.7%, JSON 1.1%, the reply write 7.7%, the request function's
+own lines 7.7%, object packaging 4.0%. This confirms chunk 18's breakdown.
+
+**Built** (`tools/fexc/fexc.cpp`; no FEX patch). The request is split into `ParseArgs` (arguments into a `Setup`),
+`CheckWindow` (the input size and RIP window), `Configure` (Config values, host features, the kept context) and
+`CompileRequest` (the compile and the reply). The server keeps one parsed and configured `Setup` per distinct argument list
+less the `--rip` value. The key is the argument bytes before and after the value of the first `--rip` token, with that
+value's offset. A list is kept only when that token is the RIP the parse used, so a list with two `--rip` (the last
+applies) or with `--rip` as another option's value is parsed every time, as before. A request whose list matches a kept
+one compiles with the kept setup at its own RIP: the parse would have consumed the same tokens in the same order, none of
+its choices depends on the RIP's value, and the window check, the one check that reads the RIP, runs for every request.
+What is kept, and what invalidates it:
+- *Per argument list (never invalidated; a different list is a different entry):* every option's value (profile, block
+  limit, bitness, TSO, multiblock, PC-table density, end marker, the gating arguments `--sse-gated` ... `--x87-unmasked`,
+  `--cpl0`, `--tsc`, feature overrides, `--config`), the Config values derived from them, the host features and the kept
+  context (already one per configuration since P3).
+- *Per request:* the RIP, the guest bytes and the window check; `ResetGlobals`; then, once (`Prepare`, before a new setup's
+  context is created), the guest window, the shim's gating arguments, hooks, PC-table and profile flags and the log handlers
+  set from the setup, and Config, so a request never sees another list's flags.
+- *Config:* rebuilt from nothing (`Shutdown`, `Initialize`, the values) only when a request's values differ from the last
+  ones applied. Nothing in FEX changes a value after it is built (`Config::Set` is called only by fexc; the reader only caches its
+  conversion of a stored string), so the values left from
+  the previous request are the same values.
+- *Feature table:* built once, with plain function pointers; a request's overrides go to a copy of the defaults (only when
+  a list is first configured).
+- *Reply:* one `writev` of the header, JSON and object from their own buffers; the object is built in the reply, whose
+  buffers, like the request buffer, the server reuses.
+The one-shot CLI runs the same four steps once; `--serve --report` and `--serve-mode fork` are unchanged (in fork mode the
+child parses and configures; nothing is kept in the server). `test_serve.py` gains eight cases for the key's edges: two
+`--rip` with either value differing, `--rip` as an option's value, a kept list at other RIPs and at a RIP outside the
+address space. Compiler **series56-setup** (`obj/fexc` SHA-256 `d3222fda...7db064`, reproduced by a second `build.sh`),
+measured below; after the independent review (no blocking defect) **series56-setup-r1** (`a81a2f24...add1fd8`): the guest
+window set before a new setup's context is created (one `Prepare` per request; the Config values derived when the
+arguments are parsed), the reused reply's extent and args_read cleared at each request's start, comments; handoff §6.
+
+**Identity (blocking gate).** Both recorded streams replayed in order, in lockstep, through series55-swapgs and
+series56-setup servers run as the host runs them (`replay20.py`): **every reply byte-identical**, so 0 differences in code,
+object, extent, args_read, status and `guest.end` (installer: 125,105 objects, 694 without code; `build`: 228,773 and
+903). The installer stream also with `--report` on both (the full report) and with `--serve-mode fork` on both: 0
+differences. `test_serve.py` (now 1,978 requests: fixtures, seed corpus, memory-form matrix, adversarial orders, the new
+cases) identical in reuse and fork mode and against series55-swapgs's CLI. Negative controls (`nc/`), each red in
+`test_serve.py`: a hit compiling at the kept list's RIP (3,028 differences), keeping a list whose first `--rip` is not the
+one used (6, the two-`--rip` cases), not setting the gating arguments on a hit (2,843). `--check-reuse --code-shape`
+installer boots with series56-setup, cache off: N = 1 852,252 resident copies checked, N = 4 871,499 over four vCPUs, no
+mismatch, both reached the dialog.
+
+**Server CPU** (each stream alone through one server, three replays each): installer 12.47 us per request (12.38-12.57) to
+**8.08** (8.01-8.15), `build` 12.23 (12.13-12.28) to **7.92** (7.91-7.94): -4.4 us (-35%). Profile of the new server
+(`profile/new.*`, busy samples): FEX's compile 68.6%, the reply write (the `writev` system call itself) 13.8%, the request
+functions' own lines 7.1%, `ResetGlobals` (freeing the previous request's recorder containers) 4.2%, allocation 2.2%,
+arguments and strings 1.8% (the key and its lookup), feature table, Config, JSON and packaging 0.4-0.5% each.
+
+**Measured** (wall s, uninstrumented; `camp/summary.md`; three interleaved rounds, old first in each; installer N = 4 once;
+`build`, `hackbench`, `locks`, `zstd` from START to END, boot excluded; CPU = the process's user + system, its reaped
+servers included; every run verified or reached the dialog, none contended):
+
+| Workload | N | wall s, series55-swapgs | wall s, series56-setup | change of means | CPU s, old | CPU s, new |
+| --- | --- | --- | --- | --- | --- | --- |
+| installer (spawn to the dialog) | 1 | 7.16 (7.05-7.27) | **6.53** (6.44-6.65) | -0.63 s (-8.8%) | 7.18 | 6.54 |
+| installer | 4 | 6.00 (one run) | **5.51** (one run) | -0.49 s (-8.2%) | 9.49 | 8.54 |
+| `build` | 1 | 14.37 (14.26-14.45) | **13.63** (13.52-13.71) | -0.74 s (-5.1%) | 17.31 | 16.21 |
+| `build` | 4 | 6.91 (6.76-7.18) | **6.71** (6.61-6.82) | -0.20 s (-2.9%) | 23.29 | 22.05 |
+| `hackbench` | 1 | 13.47 (13.40-13.53) | 13.48 (13.44-13.52) | +0.01 s | 16.37 | 15.98 |
+| `hackbench` | 4 | 3.87 (3.83-3.89) | 3.83 (3.78-3.89) | -0.04 s | 18.89 | 18.44 |
+| `locks` | 1 | 5.65 (5.64-5.66) | 5.69 (5.67-5.71) | +0.04 s | 8.54 | 8.17 |
+| `locks` | 4 | 6.94 (6.89-7.02) | 7.03 (6.98-7.11) | +0.08 s | 31.01 | 31.06 |
+| `zstd` | 1 | 2.05 (2.04-2.06) | **1.98** (1.95-2.00) | -0.07 s (-3.5%) | 4.99 | 4.54 |
+| `zstd` | 4 | 1.17 (1.14-1.20) | **1.11** (1.08-1.13) | -0.06 s (-5.1%) | 6.39 | 5.90 |
+
+Every benchmark's boot to its START line is 0.37-0.41 s shorter (N = 1 2.87-2.88 to 2.48-2.50 s; N = 4 2.93-2.97 to
+2.53-2.57). `locks` with the order reversed (three more rounds, new first; `camp-extra/`): N = 1 5.68 (5.55-5.76) old
+against 5.56 (5.43-5.65) new, N = 4 7.08 (7.00-7.18) against 7.05 (6.80-7.25): the sign follows the order, so `locks` is
+unchanged; `hackbench` is unchanged too. The installer N = 1 and `build` N = 1 savings (0.63 and 0.74 s) are 0.03-0.16 s
+under chunk 18's estimates (0.66-0.76 and 0.78-0.91), N = 4 installer at its lower end (0.49 against 0.51-0.59) and `build`
+N = 4 under it (0.20 against 0.35-0.41). **Ship threshold met**: installer, `build` and `zstd` faster beyond the spread at
+both sizes, nothing slower.
+
+**What in-process FEX would add** (estimate on these numbers, not built: it changes the isolation posture and needs an owner
+decision): per compile, the pipe and wake-ups (round trip less server CPU, 3.5 us in chunk 18) plus the reply write (13.8%
+of 8.1 us, 1.1 us), about 4.6 us: about 0.58 s on the installer N = 1 (126.5 k compiles) and 0.70 s on `build` N = 1
+(152 k).
+
+**Checks** (`suite20.sh`, `suite/`, the final tree with series56-setup, one VM runner at a time, each case's output deleted
+as it ended): `cargo test` 106 + 1 ignored (host), abi 65, also with `FEXC` set;
+the resident stack audit `ok`; the Python unit tests 317; fixtures 64 and seed 44 at both block sizes; the i7 corpus at CPL 0
+69 at both; faults 7,912 at both; `run_k1.py` 336 runs, no problem; `run_k2.py` all ok, and `run_k2.py --only swapgs` (its
+`msr` at both block sizes, `fault`, `kicks`, `events`, `contain`) all ok; `run_slice3_vm.py` `system`, `delivery`, `events`,
+`contain`, `smp` 0 failures; `run_x3.py` 54/54 and every group, `run_x4.py` 33/28/6, `run_l4a.py`, `run_l4b.py`,
+`run_s4.py` all ok; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7, `r1b` 12/12 (negative controls flagged); FEX ASM 2,270:
+1,898 pass, 48 precision deviations, 324 unsupported, no failure. The compiler's own checks (`checks/`): `test_fexc.py` 10,
+`test_slice1.py` 37, `check_sites.py --slice1` 64 programs (779 sites, 0 errors), `verify_precision.py` PASS,
+`test_serve.py` above. Rerun on series56-setup-r1 after the review (`review/`): both recorded streams as the host runs the
+server and the installer's with `--report`, 0 differences against series55-swapgs; `test_serve.py` identical in reuse and
+fork mode; `test_fexc.py` 10; `cargo test` with `FEXC` 106 + 1 ignored, abi 65. Replies byte-identical, so the walls were
+not measured again. The recorded streams were deleted afterwards (0.83 GB; `rec/fexc` records them again).
+
+**Not done.** The shim's recorder containers are still freed and refilled per request (`ResetGlobals`, 4% of the new
+server's busy time), and the host still formats the argument strings for every request (host side, unchanged).
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
@@ -2015,9 +2127,8 @@ included). *Risk:* TLB semantics; new SMP cases in `run_k1.py`. *Decides:* CR3-l
 (Chunk 14 built the global part: the supervisor upper half's global shadows survive CR3 loads, 94% of `hackbench`'s misses;
 per-CR3 sets of the non-global part remain a candidate, with PCID.)
 
-**Per-block overhead.** As the profile shows: fexc's fixed cost (Config rebuilt per request since P3's leak fix,
-`fexc.cpp:463`; the JSON report the host dropped for objects: removed in chunk 2; argument parsing and the feature table
-per request, chunk 2's profile); IPC by pipes and `poll` (564-611), a
+**Per-block overhead.** As the profile shows: fexc's fixed cost (Config rebuilt per request since P3's leak fix; the JSON report the host dropped for objects: removed in chunk 2; argument parsing and the feature table
+per request, chunk 2's profile; Config, arguments, feature table and reply copies: removed in chunk 20); IPC by pipes and `poll` (564-611), a
 shared-memory ring with a native wait only if material; staging, placement; admission's quadratic site scans.
 
 **Resident entry cost.** About 0.36 us fixed per entry, 0.167 us the cheapest (plan, P2 row). Ticks in `bank`

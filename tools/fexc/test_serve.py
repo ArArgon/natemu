@@ -100,7 +100,18 @@ def requests(corpora):
             ('syscall', FIXED + ['--rip', '0x1000'], bytes.fromhex('0f05')),
             ('bad feature', ['--feature', 'nope=1', '--rip', '0x1000'], code),
             ('bad bitness', ['--bitness', '16', '--rip', '0x1000'], code),
-            ('slice1 32-bit', FIXED + ['--bitness', '32', '--rip', '0x1000'], code)]
+            ('slice1 32-bit', FIXED + ['--bitness', '32', '--rip', '0x1000'], code),
+            # Perf chunk 20: the server keeps a parsed setup per argument list less the first --rip's value; lists where that
+            # token is not the RIP used (two --rip: the last applies; "--rip" as another option's value) are parsed each time,
+            # and a kept list answers at any other RIP.
+            ('two rip', FIXED + ['--rip', '0x2000', '--rip', '0x1000'], code),
+            ('two rip again', FIXED + ['--rip', '0x2000', '--rip', '0x3000'], code),
+            ('two rip, other first', FIXED + ['--rip', '0x4000', '--rip', '0x1000'], code),
+            ('rip as a value', FIXED + ['--x87-fpcr', '--rip', '--rip', '0x1000'], code),
+            ('rip as a value again', FIXED + ['--x87-fpcr', '--rip', '--rip', '0x5000'], code),
+            ('kept list', FIXED + ['--rip', '0x1000', '--sse-gated'], bytes.fromhex('0f28c1c3')),
+            ('kept list, other rip', FIXED + ['--rip', '0x7ffffffff000', '--sse-gated'], bytes.fromhex('0f28c1c3')),
+            ('kept list, bad rip', FIXED + ['--rip', '0x7ffffffffffe', '--sse-gated'], bytes.fromhex('0f28c1c3'))]
     return out
 
 
