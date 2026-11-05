@@ -132,6 +132,12 @@ already advertised and enforced by the walker (tests added); UMIP advertised, SG
 resident, Linux activates it; installer N = 1 cache off 8.42 -> 8.32 s, hackbench N = 1 29.9 -> 30.0 s; the QEMU control gains
 `+smep,+umip`. Next: SMAP (only if its cost is acceptable).
 
+## Disk cache (November 5, `natemu-raw/diskcache-20261105-01/`)
+
+Warm against off: `build` -4% (N = 1) and -11% (N = 4) with or without KASLR; the installer -6 to -8% with `nokaslr` but
++8% with KASLR (kernel lookups miss; about 50 MB of useless kernel packs per boot). Next change after perf chunk 26: cache
+only CPL-3 code (kernel-mode code neither looked up nor stored), measured as its own chunk.
+
 ## Backlog (owner, November 4)
 
 - In-process FEX: about 0.6 s installer N = 1 and 0.7 s `build` N = 1 (chunk 20 estimate), but four concurrent compiles in
