@@ -2535,6 +2535,184 @@ both builds (campaigns and perf runs), reached it. Not reproduced or investigate
 about 2.7 times HEAD's arena and index, past the identity map's room at four vCPUs. Smaller records (a block averages 276
 bytes, sites 40 bytes each) or an eviction by age would be the next step; neither is built.
 
+### Measured (chunk 24: breakdown at HEAD, November 5; analysis on 4afd86a, series58-channel-r1, no code change kept)
+
+**Question.** Where the time goes at HEAD on the installer and the seven benchmarks, and three gates: per-address-space
+copies (PCID), compiling a page's region in one request, and compiling ahead on idle cores; then a ranked list.
+
+**Method** (`natemu-raw/breakdown-20261105-01/`, README there). HEAD's `natemu` stub, cache off, `mitigations=off nokaslr`,
+2 GiB, bench-20261104-02's initramfs, one VM at a time. Chunk 18's method: three rounds of 14 cells (installer and `build`,
+`hackbench`, `luajit`, `mem`, `cray` at N = 1 and 4; `zstd`, `locks` at N = 1) with the perf resident and `NATEMU_PERF_LOG`
+(window: the installer from spawn to the end-point line, a benchmark from START to END), then one uninstrumented run per
+cell. Three scratch builds, each with the default resident's loaded sections byte-identical to HEAD's (diffs kept, tree
+restored): `count` (chunk 18's 100 ms counters, plus a perf-resident-only record of each CR3 load's root, each shadow install
+and each revalidation), `count2` (the same with the corrections the PCID gate needed, below; one run per cell, and an
+installer boot with Linux's default mitigations, PTI), and `prof` (a host PC sampler: each running vCPU forced out of the VM
+every 150-250 us, the exit PC mapped to its block; default resident, no log; one run per N = 1 cell). Requests were analysed
+from the request logs, which were then deleted.
+
+**Checks.** Whole-run unattributed time (request time outside its named parts, chunk 1's method) is 1.0-3.8% of the worst
+thread's window in every cell but `cray` N = 1 (5.6%: its whole run is nearly all boot; its window is 0.42 s); in the window
+table the parts add up to the window by construction. Every run verified or reached the dialog, none contended. The log's
+cost (uninstrumented against logged walls): installer 5.87 / 5.77 s (N = 1), 4.46 / 4.77 (N = 4); `build` 11.44 / 11.81,
+5.36 / 5.75; `hackbench` 11.77 / 11.63, 3.35 / 3.43; `luajit` 5.34 / 5.56, 1.75 / 1.75; `mem` 9.74 / 9.76, 3.09 / 3.24;
+`cray` 0.43 / 0.42, 0.24 / 0.25; `zstd` 1.93 / 1.95; `locks` 5.30 / 5.28.
+
+| Seconds of the window, mean of 3 (N = 4: four vCPU threads summed) | inst 1 | inst 4 | build 1 | build 4 | hackb 1 | hackb 4 | luajit 1 | luajit 4 | mem 1 | mem 4 | cray 1 | cray 4 | zstd 1 | locks 1 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Wall, window (log on) | 5.77 (5.71-5.82) | 4.77 (4.70-4.85) | 11.81 (11.70-11.86) | 5.75 (5.63-5.83) | 11.63 (11.55-11.69) | 3.43 (3.34-3.51) | 5.56 (5.48-5.61) | 1.75 (1.74-1.77) | 9.76 (9.64-9.83) | 3.24 (3.20-3.28) | 0.42 | 0.25 (0.23-0.29) | 1.95 (1.94-1.98) | 5.28 (5.21-5.33) |
+| Host: compile round trips (fexc) | 0.65 | 0.92 | 0.75 | 1.68 | 0.01 | 0.04 | 0.16 | 0.49 | 0.10 | 0.23 | 0.02 | 0.04 | 0.05 | 0.02 |
+| Host: rest of the requests (admission, copies, staging, relocation, log hash) | 0.57 | 0.81 | 0.73 | 1.26 | 0.01 | 0.03 | 0.18 | 0.27 | 0.06 | 0.16 | 0.02 | 0.07 | 0.02 | 0.01 |
+| Host: rest outside the VM (HVF entry/exit, exits, devices, log) | 0.54 | 0.76 | 0.57 | 1.08 | 0.01 | 0.03 | 0.18 | 0.25 | 0.06 | 0.17 | 0.02 | 0.07 | 0.02 | 0.01 |
+| VM: generated guest code | 1.42 | 1.85 | 6.14 | 7.35 | 5.35 | 6.03 | 3.10 | 3.30 | 4.90 | 5.64 | 0.31 | 0.35 | 1.73 | 3.08 |
+| VM: halted (and AP mailbox) | 0 | 11.55 | 0 | 6.81 | 0 | 0.27 | 0 | 0.61 | 0 | 1.34 | 0 | 0.37 | 0 | 0 |
+| VM: linker entries, own work | 0.74 | 0.94 | 0.93 | 1.38 | 1.88 | 2.10 | 0.57 | 0.63 | 0.70 | 0.78 | 0.01 | 0.03 | 0.02 | 0.34 |
+| VM: dispatcher misses, own work | 0.13 | 0.16 | 0.40 | 0.51 | 0.03 | 0.05 | 0.05 | 0.05 | 0.04 | 0.05 | 0 | 0 | 0 | 0.47 |
+| VM: entering blocks and block lookup | 0.29 | 0.32 | 0.45 | 0.54 | 2.61 | 2.86 | 0.35 | 0.35 | 0.73 | 0.77 | 0 | 0.01 | 0.01 | 0.95 |
+| VM: link patching, placement, in-VM reuse | 0.56 | 0.67 | 0.55 | 0.64 | 0.01 | 0.02 | 0.06 | 0.07 | 0.02 | 0.04 | 0 | 0.01 | 0 | 0 |
+| VM: system instructions (transactions) | 0.13 | 0.14 | 0.08 | 0.09 | 1.47 | 1.61 | 0.32 | 0.31 | 0.58 | 0.58 | 0 | 0 | 0.01 | 0.35 |
+| VM: CR3 loads and TLB flushes | 0.10 | 0.19 | 0.20 | 0.27 | 0.04 | 0.11 | 0.04 | 0.03 | 0.02 | 0.02 | 0 | 0 | 0 | 0 |
+| VM: shadow misses (abort and walk) | 0.38 | 0.38 | 0.31 | 0.45 | 0.15 | 0.37 | 0.52 | 0.59 | 2.01 | 2.45 | 0 | 0 | 0.06 | 0 |
+| VM: revalidation and fetch walks | 0.11 | 0.13 | 0.19 | 0.23 | 0.01 | 0.02 | 0.03 | 0.03 | 0.01 | 0.02 | 0 | 0 | 0 | 0 |
+| VM: deliveries and IRQ polls | 0.09 | 0.13 | 0.25 | 0.35 | 0.02 | 0.03 | 0.02 | 0.02 | 0.47 | 0.54 | 0 | 0 | 0.01 | 0 |
+| Before the resident ran; helpers, divisions, stops, L1 switches, shootdowns | 0.05 | 0.11 | 0.28 | 0.37 | 0.03 | 0.15 | 0 | 0 | 0.05 | 0.15 | 0.02 | 0.04 | 0 | 0.05 |
+
+| Over the window, all threads, mean of 3 | inst 1 | inst 4 | build 1 | build 4 | hackb 1 | hackb 4 | luajit 1 | luajit 4 | mem 1 | mem 4 | cray 1 | cray 4 | zstd 1 | locks 1 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Compiles, k (distinct bytes; raced on another vCPU) | 126.0 (125.4; 0) | 129.7 (128.3; 1.1) | 149.3 (148.9; 0) | 163.0 (151.9; 10.9) | 2.5 | 4.3 (4.1; 0.2) | 26.6 (25.6; 0) | 31.6 (26.6; 5.0) | 20.2 | 24.3 (19.9; 4.4) | 3.7 | 4.9 (4.6; 0.3) | 7.4 | 3.3 |
+| Shared-cache hits, k | 121.9 | 229.0 | 176.3 | 423.4 | 1.0 | 9.7 | 77.6 | 104.8 | 1.0 | 53.9 | 7.3 | 31.5 | 0.1 | 0.5 |
+| Block entries / linker entries / dispatcher misses, M | 3.26 / 2.60 / 0.60 | 3.48 / 2.75 / 0.65 | 4.77 / 2.71 / 1.98 | 4.97 / 2.87 / 2.01 | 32.87 / 32.72 / 0.15 | 33.51 / 33.21 / 0.29 | 4.82 / 4.55 / 0.25 | 4.83 / 4.56 / 0.25 | 9.56 / 8.06 / 0.26 | 9.17 / 7.76 / 0.24 | 0.02 / 0.01 / 0 | 0.03 / 0.02 / 0.01 | 0.17 / 0.14 / 0.03 | 12.33 / 6.17 / 6.16 |
+| System-instruction entries, M (largest kinds) | 1.27 (MOV from Sreg 0.32, STI 0.31, IRET 0.20) | 1.32 | 0.64 (STI 0.26) | 0.65 | 32.70 (SYSCALL, SYSRET 15.97 each) | 33.16 | 4.25 (VSTMXCSR 4.00) | 4.23 | 8.03 (STI 4.53, IRET 1.25, MOV from CR 1.24) | 7.65 | 0 | 0 | 0.13 | 12.33 (STI 6.16, SYSCALL, SYSRET 3.08 each) |
+| Shadow installs, k | 598 | 590 | 692 | 756 | 244 | 551 | 1,167 | 1,187 | 6,431 | 6,756 | 1 | 1 | 228 | 1 |
+| CR3 loads / page faults, k | 21.7 / 53.4 | 2.6 / 53.9 | 1.0 / 82.7 | 0.8 / 83.2 | 26.9 / 3.2 | 63.0 / 3.2 | 4.6 / 25.3 | 4.6 / 25.1 | 3.6 / 1,241 | 3.6 / 1,180 | 0 / 0.3 | 0 / 0.2 | 0.2 / 4.4 | 0 / 0.2 |
+| Code-write invalidations / blocks killed / recompiles (new bytes at a RIP compiled before), k | 1.9 / 38.8 / 0.7 | 2.1 / 40.2 / 0.7 | 0 / 0.2 / 0.4 | 0 / 0.1 / 0.4 | 0 | 0 | 1.1 / 86.5 / 1.3 | 1.0 / 82.0 / 1.3 | 0 / 0.3 / 0.1 | 0 / 0 / 0.1 | 0 | 0 | 0 / 1.0 / 0 | 0 |
+| Host exits (resident side), k; HVF entry and exit per exit, us | 313; 0.94 | 425; 0.97 | 332; 0.93 | 593; 0.98 | 5; 0.92 | 11; 0.93 | 104; 0.91 | 134; 0.95 | 31; 0.93 | 85; 0.96 | 8; 0.91 | 22; 0.94 | 10; 0.92 | 3; 0.91 |
+
+Per compile request (installer N = 1; the other cells within 1 us at N = 1): 8.25 us, of which the fexc round trip 5.16,
+admission 0.94, copies, lookup, staging and keeping 0.57, the rest 1.59 (relocation; with the log, the bytes' hash and exit
+list); at N = 4 the round trip is 7.1 (installer) to 15.5 us (`luajit`). The servers' CPU per compile (wait4) is 11.9-12.2 us
+at N = 1, of which their idle spin is about 4.0-4.9 us (the gap to the vCPU's next compile, capped at the 20 us spin bound);
+FEX's own compile, from chunks 20 and 21's profiles, is about 3.6-4.7 us of the round trip. Shared-cache hit: 1.2-2.4 us.
+All tables with ranges: `tables.md`; system instructions by kind there.
+
+**What the numbers say.**
+1. *Installer* (5.77 s): host requests 1.22 s (126 k compiles, nearly all of new bytes; 122 k shared hits), the rest outside
+   the VM 0.54 s (313 k exits), generated code 1.42 s, the resident 2.59 s over a dozen items (linker 0.74, patching,
+   placement and reuse 0.56, shadow misses 0.38). At N = 4 the four threads are halted 11.6 of 19.1 thread-seconds.
+2. *`build`* (11.81 s): generated code 6.14 s (52%); requests 1.48 s and exits 0.57 s; the resident 3.6 s (linker 0.93,
+   patching/placement/reuse 0.55, entering and lookup 0.45, misses 0.40). N = 4: halted 6.8 of 23.0 thread-seconds.
+3. *`hackbench`* (11.63 s): 16 M system calls, each a SYSCALL and a SYSRET trip on the resident's fast path (32.7 M entries):
+   linker 1.88, entering and lookup 2.61, transactions 1.47 s; generated code 5.35 s.
+4. *`luajit`* (5.56 s; run-time code generation): code writes are few: 1.1 k code-write invalidations kill 86.5 k blocks, and
+   1.3 k of the 26.6 k compiles are new bytes at a RIP compiled before; 78 k shared hits. The largest resident item is
+   **4.00 M VSTMXCSR**, every one a resident trip (with its linker entry, lookup, entering and transaction, about 0.27 us
+   each: about 1.1 s); shadow misses 0.52 s (1.17 M installs); generated code 3.10 s (56%).
+5. *`mem`* (9.76 s; faults, mmap churn, fork): 1.24 M page faults, each with a delivery, a CR2 read and an IRET trip
+   (deliveries 0.47 s), 6.4 M shadow installs (5.2 per fault; shadow misses 2.01 s), and **4.53 M STI** run by the resident
+   (literal exits to an STI that starts its block: the inline STI of chunk 15 is never a block's first instruction), about
+   1.07 s; generated code 4.90 s, of which the kernel's `clear_page` (`rep stosq`) is 16% of the sampled guest time.
+6. *`cray`* (0.42 s; floating point): 74% generated code, 90% of the samples in blocks, three FP loop blocks 78% of them.
+7. *`zstd`* (1.95 s): 89% generated code. *`locks`* (5.28 s): generated code 3.08 s; **6.16 M STI** run by the resident (via the
+   dispatcher's miss: an STI right after a `ret`), 6.16 M fast-path system calls; misses, entering and lookup 1.4 s.
+
+**Gate 1, PCID: per-address-space copies.** For each CR3 load the scratch counter finds whether its root was used before and
+how recently (Linux keeps 6 dynamic ASIDs per CPU; with PTI it uses two roots per address space), and after it counts what a
+per-root copy would have kept: shadow installs of a page this root filled before to the same frame (refaults), revalidations
+of blocks last checked under the same root (each with the miss or linker entry that reached it), and the links undone and K1
+time of the load. A first pass counted the build's new processes as returns: Linux frees and reuses a root page, so a root
+page whose user-half entries changed is now a new address space (in `build` nearly every new address space, about 290, starts
+on one), and a reload of the same root, a global flush, an INVLPG or a #PF ends what a copy keeps (`mem`'s refaults 2.96 M ->
+21 k). Upper bound (copies cost nothing, and the guest's flushes for a returning address space are not seen).
+
+| `count2`, one run each, window | inst 1 | inst 4 | build 1 | build 4 | hackb 1 | hackb 4 | luajit 1 | luajit 4 | mem 1 | mem 4 | zstd 1 | **inst 1, PTI** |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| CR3 loads to a root used before, among the 6 most recent / 6-11 / 12+, k | 19.9 / 0.3 / 0.1 | 1.0 / 0.1 / 0 | 0.4 / 0 / 0 | 0.3 / 0 / 0 | 0.8 / 1.2 / 24.2 | 24.3 / 16.7 / 36.0 | 4.2 / 0 / 0 | 4.1 / 0 / 0 | 1.5 / 0 / 0 | 1.5 / 0 / 0 | 0.1 | **260.1** / 1.9 / 1.0 |
+| New address spaces / same root again, k | 0.8 / 0.5 | 0.6 / 0.4 | 0.3 / 0.2 | 0.3 / 0.2 | 0.1 / 0.1 | 0.5 / 0.1 | 0.1 / 0.2 | 0.1 / 0.2 | 0.8 / 1.2 | 0.8 / 1.3 | 0 | 1.4 / 0.6 |
+| After a load to one of the 6: refaults user / kernel, k | 35.3 / 12.4 | 20.2 / 11.1 | 7.5 / 0 | 6.0 / 0 | 3.3 / 0 | 109.0 / 0 | 215.3 / 13.4 | 209.0 / 14.4 | 21.5 / 0 | 31.2 / 0 | 0.3 | **1,806 / 5,234** |
+| Revalidations kept, via linker entries / via misses, k | 31.3 / 41.7 | 9.2 / 17.5 | 20.5 / 25.7 | 13.5 / 15.7 | 0.3 / 0.6 | 7.4 / 11.6 | 100.3 / 136.5 | 98.8 / 133.6 | 0.6 / 0.5 | 0.3 / 0.2 | 0.1 / 0.1 | **2,081 / 2,817** |
+| Links undone at those loads, k; their K1 time, ms | 156; 34 | 188; 31 | 441; 86 | 447; 113 | 2; 1 | 48; 22 | 161; 27 | 162; 24 | 77; 11 | 77; 12 | 3; 0 | 3,189; 771 |
+| **Estimate**: refaults x install (0.31-0.68 us) + kept revalidations x (walk + entry, 0.17-0.77 us) + K1 time, s wall | 0.09 | 0.04 | 0.11 | 0.05 | 0.00 | 0.03 | 0.19 | 0.06 | 0.02 | 0.01 | 0.00 | **5.87** |
+
+With mitigations off the gate fails: at most 0.19 s (`luajit`, 3.5%), 0.09 s on the installer (1.6%), 0.11 s on `build`, and
+nothing measurable elsewhere (`cray`, `locks`: no CR3 loads in the window). With Linux's default mitigations (PTI; Linux
+sees no PCID) the installer takes **14.40 s uninstrumented against 5.50 s** with them off (15.40 s with the log); every system
+call and interrupt switches between the two roots of an address space (260 k returning loads in the window), and the
+per-root copies would keep 7.0 M shadow installs and 4.9 M revalidations: about 5.9 s of the 8.9 s PTI adds (upper bound; 9.4 s with the log;
+the PTI boot's shadow misses are 4.62 s against 0.32 s, CR3 loads 0.98 against 0.10 s).
+
+**Gate 2, compiling a page's region in one request.** From each compiled block not itself a pending successor (a root),
+the request pass follows its exits on the root's page (link targets and a call's return site, as admission lists them),
+through later requests of the same vCPU, to any depth; chains rooted in the window only (`count2` runs).
+
+| Window, all threads | inst 1 | inst 4 | build 1 | build 4 | luajit 1 | luajit 4 | mem 1 | mem 4 | others |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Compiled roots / same-page successors asked for (by compile; by shared hit), k | 17.5 / 139 (108; 31) | 19.8 / 130 (110; 20) | 16.6 / 188 (130; 58) | 25.5 / 175 (141; 34) | 2.9 / 55 (23; 32) | 3.9 / 61 (25; 36) | 2.2 / 13 (13; 0) | 3.6 / 19 (17; 3) | <= 4 |
+| Asked after the root's reply: < 10 us / 10-100 us / 0.1-1 ms / 1-10 ms / >= 10 ms, % | 8 / 24 / 26 / 12 / 31 | 9 / 27 / 31 / 16 / 16 | 6 / 17 / 20 / 9 / 49 | 9 / 23 / 30 / 12 / 26 | 4 / 14 / 19 / 22 / 41 | 5 / 11 / 21 / 20 / 44 | 12 / 37 / 29 / 12 / 10 | 13 / 36 / 29 / 13 / 9 | |
+| Same-page candidates never asked for, k | 44.5 | 52.4 | 36.8 | 61.0 | 5.3 | 8.3 | 6.6 | 10.7 | |
+| **Estimate**, s wall: requests saved x fixed cost, less never-asked x 3.6-4.7 us | 0.11-0.49 | 0.17-0.44 | 0.21-0.65 | 0.30-0.49 | 0.09-0.17 | 0.09-0.12 | 0-0.04 | 0.02-0.03 | < 0.03 |
+
+Fixed cost per saved request: the exit (HVF 0.91-0.98 us + 0.1), the resident's request-side work (fetch walk 0.05-0.32 us,
+the cheaper of the miss and linker entry), and the round trip less FEX's compile (5.0-15.5 - 3.6..4.7 us; at N = 4 this
+includes the queueing of four vCPUs) plus the host's fixed parts (0.3 to 2.1-2.5 us); a shared hit saves its request less
+admission (1.9-2.3 us). Admission and placement stay per block. Every successor is assumed to be in the region (the chain
+depth is unbounded: 78% of `build`'s are at depth 4 or more, and 31-49% are asked 10 ms or more after the root). At most 8.5%
+of the installer N = 1 wall and 5.5% of `build`'s.
+
+**Gate 3, compiling ahead on idle cores (N = 4).** Halted against compile wait, thread-seconds of the window: installer 11.55
+against 0.92 (fexc round trips), `build` 6.81 / 1.68, `luajit` 0.61 / 0.49, `mem` 1.34 / 0.23, `cray` 0.37 / 0.04, `hackbench`
+0.27 / 0.04. There is room for the work: chunk 16's pool compiled about 0.87 ahead compiles per compile (at 16 us each:
+1.8 and 2.3 s of CPU for the installer and `build`, well under their halted time). The saving is small: chunk 16 served 25% of
+the compiles at N = 4 in time (installer 33.2 k of 132 k, `build` 62.3 k of 249 k; 58-61% of ahead compiles wasted; a
+depth-1 successor is asked for 4.0-4.4 us after its predecessor's reply, here 5-13% of the N = 4 cells' same-page successors within 10 us).
+**Estimate**: round trips x 0.25 / P (busy threads per wall second): installer 0.15 s, `build` 0.15 s, `luajit` 0.03 s, the
+others under 0.02 s; chunk 16 measured no wall gain when round trips were 2-3 times today's. The gate fails.
+
+**Generated code** (`prof`, one run per N = 1 cell; the sampler's share of EL1 samples is larger than the buckets' resident
+share, so only its EL0 samples are compared). Of the EL0 samples, the dispatcher's table code (computed exits) is 15% on
+`build`, 11-12% on the installer, `mem` and `locks`, 1-10% elsewhere; exits landing on a block-exit `svc` (the trap into the
+resident) 15% on `hackbench`, 11% on `luajit`, 2-9% elsewhere; REP-string blocks 17% on `mem`, 1-4% elsewhere (`profcls.json`).
+Hottest blocks (`prof/*.prof.md`, top 20 each, the top 8 disassembled with FEX's code):
+- *`cray`*: three blocks are 78.5% of block samples (43-47 x86 instructions each, 1.8-1.9 Arm instructions per x86
+  instruction); FEX maps the scalar and packed arithmetic one to one, and loads every `movsd`/`movupd` operand into a scratch
+  register first and then moves all 128 bits to the destination (one `ldr` plus one `mov v.16b` per load).
+- *`zstd`*: the top 20 blocks are 70% of block samples; the largest (165 x86 instructions, 4.3 Arm each) is 13%; in the
+  match-finder loop blocks (3-7 Arm instructions per x86 one) each store carries its page-crossing check (`add`, `eor`, `tbnz`)
+  and flags are materialised for later reads; `rep movsb` copies a byte per 7-instruction iteration (2.3%).
+- *`build`*: flat: the top 20 blocks are 6% of 16 k block samples over 9.2 k distinct blocks; the kernel's `rep stosq` (27 Arm
+  instructions, a 9-instruction loop per 8 bytes: the direction flag reloaded and the page checked every element) is first at
+  1.1%.
+- *`mem`*: that `rep stosq` is 18% of block samples. *`hackbench`*: the top blocks are the exits into SYSCALL and SYSRET.
+  *`locks`*: `lock cmpxchg` is `dmb ish` and `casal`; the sample lands after the `casal`.
+
+**Candidates** (estimates, not measurements; arithmetic in `estimates.txt`; s wall, N = 1 unless stated):
+
+| # | Candidate: arithmetic | Saving, estimate |
+| --- | --- | --- |
+| 1 | **STI that starts its block, inline** (an event pending then needs the resident's slow path without re-entering the same block): resident-run STIs x a system-instruction trip (0.13-0.27 us, the cell's linker, lookup, entering and transaction shares) | `locks` 0.8-1.1 (16-21%), `mem` 1.07 (11%; N = 4 0.32, 10%), installer 0.15 (2.6%), `build` 0.15 (1.2%), `hackbench` 0.08 |
+| 2 | **STMXCSR / VSTMXCSR inline at CPL 3**: 4.00 M x 0.27 us | `luajit` 1.09 (20%; N = 4 0.31, 18%) |
+| 3 | **PCID with per-root copies**, for PTI (gate 1): kept refaults and revalidations | PTI installer 5.9 of 14.4 s (upper); mitigations off <= 0.19 (`luajit`), installer 0.09 |
+| 4 | **REP STOS/MOVS in bulk** (the part of a string inside one page, DF read once): the `rep` blocks' sampled share of generated code x (1 - 1/4 .. 1/8) | `mem` 0.6-0.7 (17% of 4.90 s), `hackbench` 0.15-0.17, `build` 0.08-0.10, `zstd` 0.05, installer 0.03 |
+| 5 | Page-fault path trips (CR2 read and IRET at CPL 0, 1.24 M each) x 0.235 us | `mem` 0.58 (6%) |
+| 6 | Compiling a page's region in one request (gate 2) | installer 0.11-0.49, `build` 0.21-0.65; N = 4 0.17-0.44 and 0.30-0.49; `luajit` 0.09-0.17 |
+| 7 | MOV from a segment register (installer 0.32 M) x 0.48 us | installer 0.15 |
+| 8 | Compiling ahead on idle cores (gate 3) | N = 4: installer, `build` 0.15; others < 0.04 |
+| 9 | Generated code (a bound only): the dispatcher's computed exits, per-store page checks, load-then-move, flags | the guest bucket: `build` 6.14, `hackbench` 5.35, `mem` 4.90, `luajit` 3.10, `locks` 3.08, `zstd` 1.73, installer 1.42, `cray` 0.31 |
+
+**Recommendation.** Next chunk: the two system instructions the new benchmarks make the resident run millions of times, as
+chunk 15 did for CLI, STI and RDTSC: an STI that starts its block, translated inline with a slow path for a pending event,
+and STMXCSR/VSTMXCSR translated at CPL 3 (MXCSR's flags from the native status register and the kept ones): about 1 s each
+on `locks`, `mem` and `luajit` (11-21%), 0.15 s on the installer and `build`; measured first by a scratch count of where the
+resident-run STIs sit (block start after a literal exit or a `ret`) and whose VSTMXCSRs `luajit` runs. The chunk after: REP
+STOS/MOVS in bulk within a page (`mem` 0.6-0.7 s, `hackbench` 0.15 s), or, if the owner brings PTI into the standing runs,
+PCID with per-root copies (the only candidate measured above 1 s on a boot: about 5.9 s of the PTI installer's 14.4 s). Region
+compiles and compile-ahead stay below 0.65 s and 0.15 s and are not recommended now.
+
+**Not done.** No optimisation built; no instrumentation kept (the diffs and the scratch PCID module are in the evidence
+directory; the tree is HEAD's). The PCID copies' own costs (switching per-root shadows, ASID management) are not estimated.
+The sampler's EL1 share disagrees with the resident buckets (`hackbench` 70% against about 50%: a forced exit lands more often
+at EL1), so its numbers are used only within EL0. The fill table of the PCID counter is 64 Ki entries: `mem`'s working set
+overflows it (3.5 M collisions), so its refault count is a lower bound (its first-in-root installs, 79 k, bound the rest).
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite
