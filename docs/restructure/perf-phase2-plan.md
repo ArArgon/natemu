@@ -114,8 +114,9 @@ resident, Linux activates it; installer N = 1 cache off 8.42 -> 8.32 s, hackbenc
 Move the FEX patch series (tools/fexc/patches, 0001-0029 applied with `git am`) to a FEX fork with a `natemu` branch, one
 commit per patch, rebased onto upstream on a fixed cadence with the standing suite after each rebase; the submodule pins the
 fork's commit; the shim and fexc front end stay in natemu; the first fork build must be byte-identical to the current compiler;
-general fixes offered upstream. Needs the owner to create the fork (this session's GitHub access covers arargon/natemu only).
-Not scheduled (owner, November 4): deferred until the owner or the orchestrator judges it necessary.
+general fixes offered upstream. The owner created the fork, https://github.com/ArArgon/natemu-fex (November 4), and approved
+pushing a `natemu` branch: upstream pin 48d71752 plus the patch series as commits; the fork's `main` is left untouched;
+moving to a newer upstream is a separate step. Scheduled right after perf chunk 20 lands (it touches tools/fexc).
 
 ## Baseline (November 4)
 
