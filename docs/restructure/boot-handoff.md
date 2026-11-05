@@ -156,7 +156,7 @@ analysis (`boot.py`, `analyze.py`, `aggregate.py`, `campaign.sh`) are in `natemu
 x86-64 guest code runs as FEX-compiled ARM64 blocks at EL0 inside one Hypervisor.framework VM, under a resident runtime
 at EL1 per vCPU that owns translation (four-level walks, A/D, shadows per x86 CPL class), the code cache, faults and
 exception delivery, interrupts, and system instructions; the host compiles (fexc), decodes system instructions once per
-translation, and runs the devices. Pieces: compiler `tools/fexc/` (patch series `patches/0001-0028`, shim, pinned
+translation, and runs the devices. Pieces: compiler `tools/fexc/` (shim, front end; the patch series 0001-0033 lives in the FEX fork's `natemu` branch, the pinned
 submodule `third_party/FEX`); admission `crates/host/src/admission.rs`; host `crates/host/src/` (`vm.rs`, `memory.rs`,
 `owners.rs`, `execution.rs`, `system.rs`, devices `uart.rs`, `ioapic.rs`, `pic.rs`, `pit.rs`, `rtc.rs`, `pm.rs`,
 `clock.rs`, loader `boot.rs`, `boot/acpi.rs`); resident `crates/runtime/src/` (`execution.rs` and `execution/`:
@@ -616,7 +616,7 @@ Full suite (about 25 minutes of runner time per pass on the M4 at R2, waits for 
 # From the repository root; zsh or bash. Wait until no other natemu-host runs (timing-sensitive cases: kicks, l4b,
 # x3 stress). A timing failure may be rerun alone once, never more: the results record the first run's result and the
 # rerun's beside it; a failed rerun is a failure.
-F=../natemu-raw/fexc-native-20261026-01/series56-setup-r1/obj/fexc  # tools/fexc/build.sh rebuilds it (patches 0001-0033 + the shim)
+F=../natemu-raw/fexc-native-20261026-01/series56-setup-r1/obj/fexc  # tools/fexc/build.sh rebuilds it from the fork pin (series57-fork has the same bytes)
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 I8=../natemu-raw/i8-corpus-20261030-01      # gen_i8.py programs and their QEMU 7.2 results

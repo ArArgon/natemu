@@ -116,14 +116,18 @@ resident, Linux activates it; installer N = 1 cache off 8.42 -> 8.32 s, hackbenc
   a hung compile can no longer be killed, and a FEX memory bug lands in the host process. Not now; only when necessary or
   when the owner asks.
 
-## FEX maintenance (owner, November 4: later)
+## FEX maintenance (owner, November 4: done)
 
-Move the FEX patch series (tools/fexc/patches, 0001-0029 applied with `git am`) to a FEX fork with a `natemu` branch, one
-commit per patch, rebased onto upstream on a fixed cadence with the standing suite after each rebase; the submodule pins the
-fork's commit; the shim and fexc front end stay in natemu; the first fork build must be byte-identical to the current compiler;
-general fixes offered upstream. The owner created the fork, https://github.com/ArArgon/natemu-fex (November 4), and approved
-pushing a `natemu` branch: upstream pin 48d71752 plus the patch series as commits; the fork's `main` is left untouched;
-moving to a newer upstream is a separate step. Scheduled right after perf chunk 20 lands (it touches tools/fexc).
+The FEX patch series moved to the owner's fork, https://github.com/ArArgon/natemu-fex, branch `natemu`: upstream 48d71752 plus
+patches 0001-0033 applied with `git am`, one commit per patch, head **455698b577d343e1c1dc8c776dc39c237e312f85** (tree
+`de278977...`, identical to the patched tree the old build.sh produced; the fork's `main` is untouched). `third_party/FEX`
+is that commit (`.gitmodules` points at the fork, branch `natemu`); `tools/fexc/patches` is gone from natemu; the shim and
+fexc front end stay. Checked: the build from the fork (`natemu-raw/fexc-native-20261026-01/series57-fork`) has `obj/fexc`
+SHA-256 `a81a2f24...1fd8`, byte-identical to series56-setup-r1; `test_serve.py` (reuse, fork), `test_fexc.py`, `test_slice1.py`,
+`check_sites.py --slice1` and `cargo +1.97.0 test --offline --locked` pass with it; a recorded installer N = 1 stream (126,017
+requests) replays through both with 0 differences. Still to do, as the owner decided: rebase `natemu` onto upstream on a
+fixed cadence with the standing suite after each rebase (moving to a newer upstream is a separate step), and offer general
+fixes upstream.
 
 ## Baseline (November 4)
 

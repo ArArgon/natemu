@@ -20,16 +20,23 @@ git submodule update --init --depth 1 third_party/FEX      # build.sh also does 
 tools/fexc/build.sh BUILD_DIR
 ```
 
-`BUILD_DIR` must not exist. FEX comes from the submodule `third_party/FEX`, pinned to upstream commit
-`48d71752e2a363d5535181f803b0b0e9666c1825` (`.gitmodules`: `shallow = true`). The script initialises the submodule and the
-three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`, each shallow at the revision FEX pins),
-checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the three externals
-into it (`git archive`), applies `patches/*.patch` with `git am`, configures `CMakeLists.txt` against that tree, builds with 4
-jobs and runs `fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified; `BUILD_DIR/src` is a git checkout
-(series applied as thirty commits) and is never committed. Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang,
-`git`; no Docker, no Linux VM. Disk: submodule checkout about 50 MB plus 10 MB git data, a build about 70 MB.
+`BUILD_DIR` must not exist. FEX comes from the submodule `third_party/FEX` (`.gitmodules`: the fork
+`https://github.com/ArArgon/natemu-fex`, branch `natemu`, `shallow = true`), pinned to the fork's commit
+`455698b577d343e1c1dc8c776dc39c237e312f85`: upstream `48d71752e2a363d5535181f803b0b0e9666c1825` plus the patch series 0001-0033
+as thirty-three commits, one per patch (tree `de278977...`). The script initialises the submodule (only when it is not already
+at the pin) and the three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`, each shallow at the
+revision FEX pins), checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the
+three externals into it (`git archive`), configures `CMakeLists.txt` against that tree, builds with 4 jobs and runs
+`fexc_linktest --init` and `smoke.py`. `third_party/FEX` is never modified by the build; `BUILD_DIR/src` is never committed.
+Cold build about 30 s. Needs Homebrew `cmake`, `ninja`, Apple clang, `git`; no Docker, no Linux VM. Disk: submodule checkout
+about 50 MB plus 10 MB git data, a build about 70 MB.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series56-setup-r1` (November 4, perf plan "Measured
+The fork is the source of truth for the patches (November 4: moved from `tools/fexc/patches/*.patch`, which no longer exist;
+`git format-patch 48d71752..natemu` in the fork regenerates them). The first build from the fork,
+`/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series57-fork`, has the same `obj/fexc` SHA-256 as series56-setup-r1
+(`a81a2f24...1fd8`); an installer N = 1 stream of 126,017 requests replayed through both gave no difference.
+
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series57-fork` (November 4, the same bytes as series56-setup-r1, built from the fork; above), which is `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series56-setup-r1` (November 4, perf plan "Measured
 (chunk 20)", after its review): series55-swapgs's patches and shim with `fexc.cpp`'s server parsing and configuring once per
 distinct argument list less the RIP (below, "Compile server"); every reply byte-identical to series55-swapgs's on an
 installer and a `build` boot's recorded request streams; `obj/fexc` SHA-256 `a81a2f241b6bf368cd7b6e8b87c5892efacd9747127f6f8dea97ae936add1fd8`. Before it,
@@ -261,7 +268,7 @@ Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--v
 
 ### The patch series
 
-`patches/` is `git format-patch` output on top of the pinned commit (author `natemu`, fixed date), in order:
+The fork's `natemu` branch is, on top of upstream `48d71752` (author the owner), one commit per patch, in order (the number is the commit's position):
 
 | patch | purpose |
 |---|---|
@@ -289,8 +296,8 @@ Result on the pin: all 7,709 InstructionCountCI tests pass, count and text, `--v
 | 0022 | slice1 I8 review: HADDPS/HADDPD (legacy and VEX) high element first, UNORD_Q/ORD_Q with exact flags (integer unordered test, one flag compare), the YMM upper halves written through per instruction and kept cached across register-only vector instructions |
 
 Anything that belongs to us (hook ABI, recorder, allowlist, predicates) stays in `shim/` and `fexc.cpp`; the patches only
-include and call it. To change a patch: `build.sh` into a scratch dir, edit and commit in `BUILD_DIR/src`, then
-`git -C BUILD_DIR/src format-patch --no-signature --zero-commit -o tools/fexc/patches 48d7175..HEAD`.
+include and call it. To change a patch: edit and commit in a clone of the fork on `natemu` (or a rebase of it), push, and move the submodule pin and
+`build.sh`'s `pin` to the new commit.
 
 Patches 0023-0028 are described in "Current tree" above and the plan's Built notes. 0030 (series52-adox66, November 4): FEX's
 0F 38 table has no slot for 66 with F3; for opcode F6 that prefix pair is decoded as ADOX with the 66 dropped (the reference AMD
@@ -388,7 +395,7 @@ Linux and drags in the application layer).
 - Generated files use FEX's own generators (`json_ir_generator.py`,
   `config_generator.py`); `git_version.h` is a fixed stub.
 
-Patch 0001 (`patches/`):
+Patch 0001 (fork commit 1):
 - `SpinWaitLock.h`: `size_t` is `unsigned long` on macOS but `uint64_t` is
   `unsigned long long`; add the missing overloads.
 - `AllocatorHooks.h`: JIT/dispatcher buffers are mapped without PROT_EXEC (macOS
